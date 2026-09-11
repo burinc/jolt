@@ -466,23 +466,32 @@
 (define java-ps (integer->char #x2029))
 
 (define dot-sre-wide `(~ #\newline #\return ,java-nel ,java-ls ,java-ps))
+;; Multiline ^ never matches at the very end of input — not even after a final
+;; terminator, and not on empty input: java.util.regex's Caret returns false at
+;; endIndex before it looks at anything else (Perl's rule, which it cites). So
+;; every branch, the start-of-input one included, wants one more character.
 (define bol-sre-wide
-  `(or bos
-       (seq (look-behind (or #\newline ,java-nel ,java-ls ,java-ps)) (look-ahead any))
-       (seq (look-behind #\return) (look-ahead (~ #\newline)))))
+  `(seq (or bos
+            (look-behind (or #\newline ,java-nel ,java-ls ,java-ps))
+            (seq (look-behind #\return) (look-ahead (~ #\newline))))
+        (look-ahead any)))
+(define bol-sre-unix `(seq bol (look-ahead any)))
 (define eol-sre-wide
   `(or eos
        (look-ahead (or #\return ,java-nel ,java-ls ,java-ps))
        (seq (or bos (look-behind (~ #\return))) (look-ahead #\newline))))
-;; `$` outside MULTILINE, and \Z: end of input, or just before a FINAL terminator.
+;; `$` outside MULTILINE, and \Z: end of input, or just before a FINAL terminator
+;; — where a CRLF is one terminator, so the position between its halves is not
+;; "before a final \n" (Dollar's "No match between \r\n").
 (define final-eol-sre-wide
   `(look-ahead (or eos
                    (seq #\return (? #\newline) eos)
-                   (seq (or #\newline ,java-nel ,java-ls ,java-ps) eos))))
+                   (seq (or ,java-nel ,java-ls ,java-ps) eos)
+                   (seq (or bos (look-behind (~ #\return))) #\newline eos))))
 (define final-eol-sre-unix `(look-ahead (or eos (seq #\newline eos))))
 
 (define (jr-dot-sre flags) (if (jr-flag? flags 'unix-lines) 'nonl dot-sre-wide))
-(define (jr-bol-sre flags) (if (jr-flag? flags 'unix-lines) 'bol bol-sre-wide))
+(define (jr-bol-sre flags) (if (jr-flag? flags 'unix-lines) bol-sre-unix bol-sre-wide))
 (define (jr-eol-sre flags) (if (jr-flag? flags 'unix-lines) '(or eol eos) eol-sre-wide))
 (define (jr-final-eol-sre flags)
   (if (jr-flag? flags 'unix-lines) final-eol-sre-unix final-eol-sre-wide))

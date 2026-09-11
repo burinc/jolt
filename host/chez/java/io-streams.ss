@@ -1024,6 +1024,12 @@
         (lambda (x)
           (cond
             ((in-stream? x) (make-char-reader (transcoded-port (in-stream-source-port x) utf8-tx)))
+            ;; a byte[] is a ByteArrayInputStream decoded as UTF-8 on the JVM.
+            ;; It used to fall through to the seq arm in io.ss and read as the
+            ;; TEXT of its element values, so (line-seq (io/reader (.getBytes
+            ;; "a\nb"))) answered ("971098").
+            ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte))
+             (make-char-reader (transcoded-port (open-bytevector-input-port (na-bytearray->bv x)) utf8-tx)))
             ;; a java.io.Reader the caller wrote: io/reader wraps a non-buffered
             ;; Reader in a BufferedReader on the JVM, and that is what the adapter
             ;; is. Without this arm io/reader refused every reify/proxy Reader.

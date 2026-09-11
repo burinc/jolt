@@ -243,24 +243,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finishes).** A 50-branch union with two unbounded `.*` branches — a retry
   classifier's 873-character pattern — stalled ~5s on its first `re-find` on
   x86_64 and did not terminate at all on aarch64 (#945). The cost was irregex's
-  tagged NFA→DFA conversion, which jolt uses for group-free patterns, and it was
-  wrong in two ways: its "have I built this state already?" test was a linear
-  scan comparing whole multi-state vectors (quadratic, and with 2208 NFA states
-  each comparison walks 2208 slots), and nothing bounded the WORK — a union of
-  unbounded branches explodes multiplicatively, and reaching the state cap only
-  to give up and fall back to the backtracker was itself the entire cost. Ten
-  `a.*b` branches spent 78ms to fail that way; twenty spent 750ms.
+  tagged NFA→DFA conversion, which jolt uses for group-free patterns: nothing
+  bounded the WORK it would spend. A union of unbounded branches explodes
+  multiplicatively — that pattern's DFA has 4113 states over 2208 NFA states
+  and it does complete, after ~5.6s of building — and a pattern one step
+  larger would have reached the state cap only to give up and fall back to the
+  backtracker anyway, with the whole cost already paid (ten `a.*b` branches
+  spent 78ms to fail that way; twenty spent 750ms).
 
-  `host/chez/regex-dfa.ss` now replaces that one vendored procedure: the
-  seen-set test is bucketed by the hash a multi-state already carries, and the
-  conversion runs on a deterministic work budget. Over the budget is the same
-  answer as over the state cap — compile the pattern with the backtracking
-  matcher, which is `java.util.regex`'s own engine, so it is the semantics jolt
-  matches anyway. The pattern above now answers in ~50ms in a release build,
-  and a pattern whose DFA is affordable still gets one. Because the budget
-  counts work rather than time, a pattern compiles to the same engine on every
-  machine. `make regexdfacheck` pins irregex's original so bumping the
-  submodule cannot leave jolt shadowing a stale copy.
+  `host/chez/regex-dfa.ss` now replaces that one vendored procedure with a copy
+  that runs the conversion on a deterministic work budget. Over the budget is
+  the same answer as over the state cap — compile the pattern with the
+  backtracking matcher, which is `java.util.regex`'s own engine, so it is the
+  semantics jolt matches anyway. The pattern above now answers in ~50ms in a
+  release build, and a pattern whose DFA is affordable still gets one. Because
+  the budget counts work rather than time, a pattern compiles to the same engine
+  on every machine. (The copy also buckets the "have I built this state?" test
+  by the hash a multi-state already carries instead of a linear `assoc` over
+  every state; on this pattern that is worth about a tenth — 5.6s to 5.1s with
+  the budget lifted — so the budget is the fix and the bucket a tidy-up.)
+  `make regexdfacheck` pins irregex's original so bumping the submodule cannot
+  leave jolt shadowing a stale copy, and `make regexdfa` gates the budget by
+  which engine a pattern gets, not by a clock.
 
 - **`.`, `^` and `$` use Java's line-terminator set, and `(?d)` means what it
   says.** Java ends a line at `\n`, `\r`, `\r\n`, NEL (U+0085), LS (U+2028) or
@@ -273,7 +277,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it was found: an HTTP header parser where every value came back with one
   attached. All four constructs now read the wide set, `(?d)` selects the
   narrow one, and a CRLF counts as ONE terminator — no anchor matches between
-  its `\r` and its `\n`.
+  its `\r` and its `\n`, so `$` on `"ab\r\n"` matches at 2 and 4 and not at 3.
+  Two edges of the same rule are Java's too and were not jolt's before, under
+  either terminator set: multiline `^` never matches at the very end of input
+  (`(re-seq #"(?m)^" "a\n")` is one match, and `(re-matches #"(?m)^$" "")` is
+  nil), and the JVM agrees.
 
   Getting the anchors right also meant separating two positions irregex had
   conflated. `irregex-search`'s start argument is both where the scan begins
@@ -328,6 +336,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NFKC and NFKD are now direct; `isNormalized` comes with them, and `Form` is
   an enum constant that prints as its name like jolt's other modeled enums.
 
+- **`io/reader` over a `byte[]` decodes it.** `clojure.java.io/reader` took
+  every array for the JVM's `char[]` branch, so a byte array — a
+  `ByteArrayInputStream` read as UTF-8 on the JVM — came back as a reader over
+  the TEXT of its element values: `(line-seq (io/reader (.getBytes "a\nb")))`
+  was `("971098")`. Only a `char[]` takes that branch now; a `byte[]` decodes.
+  And `BufferedReader` over jolt's own `StringReader` is the `StringReader`, so
+  it answers `.lines` and `.ready` itself — `(.lines (BufferedReader.
+  (StringReader. s)))` used to be "No matching field found: lines".
+
 - **`CharsetDecoder` can decode.** `java.nio.charset.CodingErrorAction` had no
   provider and the decoder's method table held only `.charset`, so the
   documented way to decode a stream — a decoder with `CodingErrorAction/REPLACE`
@@ -335,7 +352,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ported app had to hand-roll a byte-carry UTF-8 reassembler instead (#946).
   `java.nio.CharBuffer`, `CodingErrorAction` and `CoderResult` are modeled, and
   the decoder has `decode` in both overloads plus `onMalformedInput`,
-  `onUnmappableCharacter`, `replaceWith`, `flush` and `reset`. What makes the
+  `onUnmappableCharacter`, `replaceWith`, `flush` and `reset` (a fresh decoder
+  reports `REPORT` for both actions, as the JVM's does). What makes the
   chunked idiom work is that `decode(in, out, endOfInput)` leaves a trailing
   PARTIAL sequence in the input buffer and reports `UNDERFLOW`, so a multi-byte
   character split across two reads survives the split; `ByteBuffer.compact` is

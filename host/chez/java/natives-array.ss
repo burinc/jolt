@@ -616,9 +616,14 @@
           'pass))))
 
 ;; clojure.java.io/reader over a char-array reads its chars (the JVM char[] branch).
+;; Only a CHAR array: this used to take every array, so a byte[] — a
+;; ByteArrayInputStream decoded as UTF-8 on the JVM — read as the text of its
+;; element values ((line-seq (io/reader (.getBytes "a\nb"))) was ("971098")).
+;; Every other array kind goes to jolt-io-reader, whose byte[] arm decodes it and
+;; which refuses the rest the way the JVM does.
 (def-var! "clojure.java.io" "reader"
   (lambda (x)
-    (if (jolt-array? x)
+    (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
         (host-new "StringReader"
                   (apply string-append (map jolt-str-render-one (seq->list (jolt-seq x)))))
         (jolt-io-reader x))))

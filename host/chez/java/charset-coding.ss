@@ -225,8 +225,11 @@
 ;; --- java.nio.charset.CharsetDecoder -----------------------------------------
 ;; state #(charset malformed-action unmappable-action replacement).
 (define (decoder-charset d) (vector-ref (jhost-state d) 0))
-(define (decoder-malformed-action d) (vector-ref (jhost-state d) 1))
-(define (decoder-unmappable-action d) (vector-ref (jhost-state d) 2))
+;; A fresh decoder's actions are REPORT on the JVM (an object, not null); the
+;; state slot starts #f because newDecoder is built in host-static-classes.ss,
+;; before this file defines the constants — so the read supplies the default.
+(define (decoder-malformed-action d) (or (vector-ref (jhost-state d) 1) (coding-error-action "REPORT")))
+(define (decoder-unmappable-action d) (or (vector-ref (jhost-state d) 2) (coding-error-action "REPORT")))
 (define (decoder-replacement d) (vector-ref (jhost-state d) 3))
 (define (decoder-action-name a)
   (if (coding-error-action? a) (coding-error-action-name a) "REPORT"))
