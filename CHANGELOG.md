@@ -85,6 +85,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A task that shares a built-in command's name now says so, instead of
+  letting the command answer as if the task were not there.** babashka's
+  `:override-builtin` is what gives a task a command's name, and a task that
+  does not ask for it loses — but it lost in silence, so a project whose
+  `deps.edn` declares a `build` task got `build needs an entry: -m NS` out of
+  `jolt build`, which reads like jolt dropped the task rather than like a
+  collision. The command still wins the name; jolt now names the collision
+  first, along with both ways out of it — `jolt run build`, which reaches the
+  task whatever it is called, or `:override-builtin true` on the task, which
+  takes the name for good. The warning goes to stderr, so `jolt path` in such a
+  project still pipes.
+
 - **`clojure.lang.ARef`'s watch and validator METHODS work through interop.**
   Every watchable reference type was already an `IRef` by class — `(instance?
   clojure.lang.IRef (atom 1))` is true and `(supers clojure.lang.Atom)` lists
