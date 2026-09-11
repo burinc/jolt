@@ -663,12 +663,28 @@
                      (deps/project-tasks (project-dir))))
       (print ((requiring-resolve 'jolt.completions/snippet) what "jolt")))))
 
+;; A task that shares a built-in's name but does not claim it loses the name, and
+;; the built-in then reports in its own terms: in a project whose deps.edn has a
+;; `build` task, `jolt build` fails with "build needs an entry: -m NS", which
+;; reads like jolt lost the task rather than like a collision. Name the collision
+;; before the command runs, and say both ways out of it (jolt-935).
+(defn- warn-shadowed-task! [cmd]
+  (binding [*out* *err*]
+    (println (str "warning: the task `" cmd "` is shadowed by jolt's built-in `"
+                  cmd "` command, which is what runs here."))
+    (println (str "         run the task with `jolt run " cmd
+                  "`, or give it the name by adding :override-builtin true to it."))))
+
 ;; babashka's :override-builtin — a task only displaces the jolt command of the
 ;; same name when it says so. Checked from the :tasks maps directly, so it costs
 ;; a small file read rather than loading the task runner on every command.
+;; A task that does not claim the name is warned about on the way past.
 (defn- builtin-overridden? [cmd]
   (let [t (get (deps/project-tasks (project-dir)) (symbol cmd))]
-    (boolean (and (map? t) (:override-builtin t)))))
+    (cond
+      (nil? t)                             false
+      (and (map? t) (:override-builtin t)) true
+      :else                                (do (warn-shadowed-task! cmd) false))))
 
  ;; build [-m NS | FILE] [-o OUT] [--opt | --dev] [--no-direct-link] — AOT-compile
  ;; the app into a standalone executable. Resolves deps + roots like `run`, then hands

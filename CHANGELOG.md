@@ -85,6 +85,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A task that shares a built-in command's name now says so, instead of
+  letting the command answer as if the task were not there.** babashka's
+  `:override-builtin` is what gives a task a command's name, and a task that
+  does not ask for it loses — but it lost in silence, so a project whose
+  `deps.edn` declares a `build` task got `build needs an entry: -m NS` out of
+  `jolt build`, which reads like jolt dropped the task rather than like a
+  collision. The command still wins the name; jolt now names the collision
+  first, along with both ways out of it — `jolt run build`, which reaches the
+  task whatever it is called, or `:override-builtin true` on the task, which
+  takes the name for good. The warning goes to stderr, so `jolt path` in such a
+  project still pipes.
 - **The `,` flag on `%g` no longer puts a separator in the exponent.** `%g`
   picks between fixed and scientific notation, and the grouping pass ran over
   whichever one it produced — so `(format "%,.1g" 1234.5)`, which lands in the
