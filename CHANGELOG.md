@@ -5,7 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.7] - 2026-09-11
+
+A release build is a third of the bytes and starts in half the time, with no
+flag passed: the runtime half of every binary stops carrying Chez inspector
+information nothing in it reads, `clojure.core` is direct-linked (and still
+redefinable), and a binary that never compiles at run time ships without the
+compiler — the verdict is a reachability walk that counts `eval`, `load-*`, the
+image APIs, a bare `:&` FFI binding, and a `require` whose argument the build
+cannot read. Hello-world went 27.25MB / 110ms / 225MB resident to 8.84MB /
+60ms / 95MB. The other theme is a run of JDK gaps found porting real
+applications, fourteen issues in a week: CRLF line reads, a `reify` `Reader`
+through `io/reader`, `CharsetDecoder`, `Base64` MIME, `Normalizer`, the regex
+engine's line-terminator set and a 50-way alternation that took five seconds
+to match, `java.net.URI`'s component constructors, percent-decoding accessors
+and `resolve`, `ProcessBuilder` `File` redirects, `LinkedBlockingQueue`, the
+rest of `java.util.Formatter`, and Java's integer and double grammars. A
+built binary with a `:jolt/provides` provider split between a git dependency
+and the embedded stdlib emitted the two halves in the wrong order and died
+before `-main`; it loads (#944). A spawned child gets its own stdio and
+nothing else, as `ProcessBuilder`'s does, so a listening socket is no longer
+held open by a subprocess. `jolt -Sgraph` and `-Soutdated` are new, a
+`deps.edn` can vouch for a runtime var lookup so `--tree-shake` proceeds past
+it, and the repository's own tooling is jolt.
 
 ### Added
 
@@ -11138,6 +11160,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
+[0.8.7]: https://github.com/jolt-lang/jolt/compare/v0.8.6...v0.8.7
+[0.8.6]: https://github.com/jolt-lang/jolt/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/jolt-lang/jolt/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/jolt-lang/jolt/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/jolt-lang/jolt/compare/v0.8.2...v0.8.3
