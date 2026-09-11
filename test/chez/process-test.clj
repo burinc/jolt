@@ -460,6 +460,56 @@
 (check-eq "a child does not inherit jolt's blocked SIGINT"
           (:exit @(process ["sh" "-c" "kill -INT $$"] {:out :string :err :inherit})) 130)
 
+;; Nor does it inherit jolt's open FILES AND SOCKETS. A descriptor with no file
+;; action is the parent's own, and posix_spawn hands the child every one of them
+;; unless told otherwise — where the JVM's ProcessBuilder gives a child the three
+;; stdio streams and nothing more. The cost is not tidiness: a child holding a
+;; copy of a listening socket keeps that port BOUND after the parent closes it,
+;; and an orphaned child (parent killed by a test runner's timeout) keeps it for
+;; as long as the orphan lives, so the next run cannot bind the port at all
+;; (#910 — curl children aged hours still pinning fixed callback ports).
+(require 'jolt.socket)
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      child  (process ["sleep" "30"])]
+  (.close server)                       ; the parent is done with the listener…
+  (check-eq "the port a closed listener held is free while a child still runs"
+            (try (.close (java.net.ServerSocket. port)) :bound
+                 (catch java.io.IOException _ :bind-failed))
+            :bound)
+  (p/destroy child)
+  @child)
+
+;; The same thing said exactly, where the OS will show the table: three stdio
+;; pipes, no jolt source file, no socket. Linux-only (/proc); the port case above
+;; is the portable half.
+(when (fs/exists? "/proc/self/fd")
+  (let [child (process ["sleep" "30"])
+        fds   (-> (sh ["ls" (str "/proc/" (.pid (:proc child)) "/fd")]) :out
+                  str/split-lines)]
+    (check-eq "a child's descriptor table is its own stdio and nothing else"
+              (vec (sort (remove str/blank? fds))) ["0" "1" "2"])
+    (p/destroy child)
+    @child))
+
+;; posix_spawn_file_actions_addclosefrom_np is glibc 2.34+, so on this machine
+;; the case above can only ever exercise that one action. Every macOS and every
+;; older glibc — most of the range the released Linux binary targets — takes the
+;; enumeration fallback instead, and it is gated here by re-running the same
+;; question in a child jolt that has the closefrom path switched off.
+(let [exe  (or (System/getenv "JOLT_EXE") (some-> (fs/which "jolt") str) "jolt-not-found:set-JOLT_EXE")
+      expr (str "(require 'jolt.socket)"
+                "(require '[jolt.process :as p])"
+                "(let [s (java.net.ServerSocket. 0) port (.getLocalPort s)"
+                "      c (p/process [\"sleep\" \"30\"])]"
+                "  (.close s)"
+                "  (print (try (.close (java.net.ServerSocket. port)) \"FREE\""
+                "              (catch java.io.IOException _ \"BOUND\")))"
+                "  (p/destroy c) @c nil)")]
+  (check-eq "and the same holds on the enumeration fallback (no closefrom)"
+            (:out (sh [exe "-e" expr] {:extra-env {"JOLT_NO_SPAWN_CLOSEFROM" "1"}}))
+            "FREE"))
+
 ;; A per-thread subprocess — ThreadLocal<Process>, the shape a worker pool uses to
 ;; give each thread its own long-lived helper program. It only works if the child
 ;; threads run initialValue themselves: jolt's ThreadLocal was a Chez thread
