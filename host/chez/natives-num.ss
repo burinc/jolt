@@ -180,17 +180,21 @@
 ;; Double.parseDouble trims surrounding whitespace and accepts a trailing float/
 ;; double type suffix (1.5f / 1.5d / 1.5F / 1.5D). Strip both before the shape
 ;; check so parse-double matches the JVM on those forms.
-(define (pd-ws? c) (or (char=? c #\space) (char=? c #\tab) (char=? c #\newline) (char=? c #\return)))
+;; the trim is String.trim(): every character at or below U+0020, not just the
+;; four common blanks (a form feed or a NUL ahead of the digits is trimmed too)
+(define (pd-ws? c) (char<=? c #\space))
 (define (pd-normalize s)
   (let* ((n (string-length s))
          (a (let loop ((i 0)) (if (and (< i n) (pd-ws? (string-ref s i))) (loop (+ i 1)) i)))
          (b (let loop ((j n)) (if (and (> j a) (pd-ws? (string-ref s (- j 1)))) (loop (- j 1)) j)))
          (t (substring s a b))
          (tn (string-length t)))
-    ;; strip ONE trailing f/F/d/D suffix, but only when a digit precedes it
+    ;; strip ONE trailing f/F/d/D suffix, but only after a digit or a point:
+    ;; "1.f" is 1.0 on the JVM, "f" and "xf" are not numbers (and ".f", left as
+    ;; ".", fails the shape check below as it should)
     (if (and (> tn 1)
              (let ((c (string-ref t (- tn 1)))) (memv c '(#\f #\F #\d #\D)))
-             (char-numeric? (string-ref t (- tn 2))))
+             (let ((b (string-ref t (- tn 2)))) (or (char-numeric? b) (char=? b #\.))))
         (substring t 0 (- tn 1))
         t)))
 ;; Java's HEXADECIMAL floating-point form, the one shape of Double.parseDouble
@@ -222,7 +226,7 @@
                 (dot? (and (< ip n) (char=? (string-ref s ip) #\.)))
                 (fs (if dot? (+ ip 1) ip))
                 (fp (if dot? (skip-hex-digits s fs n) fs)))
-           (and (> fp ds)                       ; at least one hex digit overall
+           (and (or (> ip ds) (> fp fs))        ; at least one hex digit, either side of the point
                 (< fp n)
                 (memv (string-ref s fp) (quote (#\p #\P)))
                 (let* ((es (if (sign-at? s (+ fp 1) n) (+ fp 2) (+ fp 1)))

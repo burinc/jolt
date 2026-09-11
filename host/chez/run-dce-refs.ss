@@ -397,6 +397,39 @@
                    #t)
               #f))
 
+;; --- a require by a computed name is a load from source ----------------------
+;; (require 'a.b) and an ns form's clauses name constants the build walks into the
+;; binary, so the call no-ops at startup; (require (symbol nm)) names a namespace
+;; the build never saw and loads it from source at run time -- the compiler, and
+;; code the graph cannot follow. dce-collect-refs reads the :invoke node and
+;; adds the host entry that does the loading; both lists carry it. `compile`
+;; recompiles unconditionally and is one whatever its argument.
+(let ((refs-of (lambda (src)
+                 (dce-collect-refs '() (analyze (make-analyze-ctx "user") (jolt-ce-read src)))))
+      (dyn "jolt.host/load-namespace"))
+  (gate-check "dynamic load: (require (symbol nm)) refs jolt.host/load-namespace"
+              (and (member dyn (refs-of "(fn [nm] (require (symbol nm)))")) #t) #t)
+  (gate-check "dynamic load: a quoted spec with a computed flag is dynamic too"
+              (and (member dyn (refs-of "(fn [f] (require 'a.b f))")) #t) #t)
+  (gate-check "dynamic load: (use (symbol nm)) is one"
+              (and (member dyn (refs-of "(fn [nm] (use (symbol nm)))")) #t) #t)
+  (gate-check "dynamic load: (compile 'a.b) is one whatever its argument"
+              (and (member dyn (refs-of "(fn [] (compile 'a.b))")) #t) #t)
+  (gate-check "dynamic load: require handed on as a value -- (apply require specs) -- is one"
+              (and (member dyn (refs-of "(fn [specs] (apply require specs))")) #t) #t)
+  (gate-check "dynamic load: (run! require nss) is one"
+              (and (member dyn (refs-of "(fn [nss] (run! require nss))")) #t) #t)
+  (gate-check "dynamic load: a static require's callee is still counted as itself"
+              (and (member "clojure.core/require" (refs-of "(fn [] (require 'a.b))")) #t) #t)
+  (gate-check "dynamic load: (require 'a.b) is baked, not flagged"
+              (and (member dyn (refs-of "(fn [] (require 'a.b))")) #t) #f)
+  (gate-check "dynamic load: an ns form's clauses are baked, not flagged"
+              (and (member dyn (refs-of "(ns gate.x (:require [clojure.string :as str] [clojure.set]))")) #t) #f)
+  (gate-check "dynamic load: (require '[a.b :as c] :reload) is baked, not flagged"
+              (and (member dyn (refs-of "(fn [] (require '[a.b :as c] :reload))")) #t) #f)
+  (gate-check "dynamic load: the ref is in the bail list" (and (member dyn dce-bail-refs) #t) #t)
+  (gate-check "dynamic load: the ref is in the compile list" (and (member dyn dce-compile-refs) #t) #t))
+
 ;; --- the default build's verdict roots every def whose init RUNS at load -----
 ;; Nothing is pruned there, so (def x (eval …)) needs the compiler whether or
 ;; not -main reaches x; a defn's init is a fn literal and only binds, so an

@@ -56,10 +56,12 @@ run_case() {
   app="$examples/$1"; ns="$2"; args="$3"
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >/dev/null 2>&1; then
-    echo "  - $1: FAIL (default build)"; fail=1; return; fi
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >/dev/null 2>&1; then
-    echo "  - $1: FAIL (--tree-shake build)"; fail=1; return; fi
+  # the build's own output is kept, and shown on a failure: a "FAIL (default
+  # build)" with nothing under it once cost a CI round trip to see the reason
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >"$tmp/$1-plain-out" 2>&1; then
+    echo "  - $1: FAIL (default build)"; tail -5 "$tmp/$1-plain-out" | sed 's/^/      /'; fail=1; return; fi
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >"$tmp/$1-shake-out" 2>&1; then
+    echo "  - $1: FAIL (--tree-shake build)"; tail -5 "$tmp/$1-shake-out" | sed 's/^/      /'; fail=1; return; fi
   o0="$(cd "$app" && "$b0" $args 2>&1)"
   o1="$(cd "$app" && "$b1" $args 2>&1)"
   if [ "$o0" != "$o1" ]; then
@@ -106,8 +108,8 @@ run_local_case() {
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
   bdir="$tmp/$1-shake.build"
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >/dev/null 2>&1; then
-    echo "  - $1: FAIL (default build)"; fail=1; return; fi
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >"$tmp/$1-plain-out" 2>&1; then
+    echo "  - $1: FAIL (default build)"; tail -5 "$tmp/$1-plain-out" | sed 's/^/      /'; fail=1; return; fi
   if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >"$tmp/$1-shake-out" 2>"$tmp/$1-shake-err"; then
     echo "  - $1: FAIL (--tree-shake build)"
     cat "$tmp/$1-shake-err" | head -5

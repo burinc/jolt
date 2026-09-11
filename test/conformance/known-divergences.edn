@@ -458,6 +458,23 @@
   ;; underflow). jolt emits a late-bound var-ref in the compiling namespace, so
   ;; the name works once a later eval defines it. That is what nREPL binds the
   ;; var for, and it is the only reading under which the flag is useful.
+  ;; A require cycle on ONE thread — a.core requires b.core, whose top level
+  ;; requires a.core back — is Clojure's "Cyclic load dependency" error,
+  ;; detected off *pending-paths*. jolt's loader is modeled on JLS 12.4.2 class
+  ;; initialization instead (host/chez/loader.ss, ldr-load-ctx): the thread that
+  ;; owns an in-progress load and asks for it again gets the partially loaded
+  ;; namespace and continues, the way a Java class sees its own half-initialized
+  ;; supertype. That is what lets the same machinery detect a CROSS-thread or
+  ;; cross-fiber load deadlock the JVM cannot (ldr-wait-cycle), so it stays.
+  ;; A program that relies on the JVM error to reject its own cycle does not
+  ;; get it; the cycle's second half sees whatever the first has defined so far.
+  {:category :namespace-model
+   :behavior "(require 'a.core) where a.core's ns form requires b.core and b.core's requires a.core"
+   :jvm "throws Exception \"Cyclic load dependency: [ /a/core ]->/b/core->[ /a/core ]\""
+   :jolt "loads: b.core sees a.core's namespace with the vars defined before the require, and both finish"
+   :check :prose
+   :why "needs two source files on a root; the corpus evaluates single forms"
+   :note "Deliberate (loader.ss step 3 of the JLS 12.4.2 procedure). The cross-thread case, which the JVM deadlocks on, raises here instead."}
   {:category :namespace-model
    :behavior "(binding [*allow-unresolved-vars* true] (eval '(defn f [] later))) then (def later 42), (f)"
    :jvm "VerifyError at the defn (UnresolvedVarExpr emits nothing)"

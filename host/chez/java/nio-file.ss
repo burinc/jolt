@@ -160,7 +160,9 @@
                                                      ((file-exists? fp) (make-nio-path (npath-normalize abs)))
                                                      (else (jolt-throw (jolt-ex-info abs empty-pmap)))))))  ; missing path throws
       ((string=? name "toFile")        (list (make-jfile s)))
-      ((string=? name "toUri")         (list (string-append "file:" (jfile-abs s))))
+      ;; a java.net.URI, as File.toURI answers (io.ss jfile->uri) — this was a
+      ;; bare string, with no .getPath, no encoding and no directory slash
+      ((string=? name "toUri")         (list (jfile->uri s)))
       ((string=? name "startsWith")    (list (npath-starts-with self (car rest))))
       ((string=? name "endsWith")      (list (npath-ends-with self (car rest))))
       ((string=? name "isAbsolute")    (list (npath-absolute? s)))

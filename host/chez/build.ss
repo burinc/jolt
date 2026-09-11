@@ -1387,22 +1387,49 @@
     (ei-mark! "startup")
     (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
       (load-namespace entry-ns))
-    (set-ns-loaded-hook! (lambda (name file) #f))
     (ei-mark! "load app from source")
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the
     ;; hook captures dynamic requires the static scan can't see.
     (let* ((graph (bld-require-closure (list entry-ns)))
            (_prof-graph (ei-mark! "require-graph DFS"))
+           ;; reader namespaces with transitive closure
+           (reader-ns-names (bld-data-reader-ns-names))
+           (reader-pairs (bld-require-closure reader-ns-names))
+           ;; Namespaces the CLASS scan pulled in (lib providers like jolt.time)
+           ;; and the data-reader namespaces are in the closure without ever
+           ;; having been loaded in-process: step 1 only loads what the entry's
+           ;; requires reach, and the runtime class-miss autoload fires on USE,
+           ;; which the build never triggers. Load them now, source-only like
+           ;; step 1 and with the hook STILL RECORDING. The strict emit below
+           ;; re-analyzes every source against process ns state, and an unloaded
+           ;; provider has no refer/alias tables, so its own :refer'd names would
+           ;; not resolve — that is why they load at all. They load under the hook
+           ;; because the emit ORDER has to be the order the loader ran them in: a
+           ;; provider's install namespace can depend on a namespace step 1
+           ;; already loaded through another path, and only the hook sees that
+           ;; edge. jolt.time's formatter half (a git dep) calls
+           ;; jolt.time.impl/register-type! at its top level, and impl — the
+           ;; embedded-stdlib half of the same provider — was loaded in step 1 when
+           ;; the entry's def touched LocalDateTime. Placing the never-loaded set
+           ;; in front of walked by the static graph alone put jolt.time.fmt before
+           ;; jolt.time.impl, and the binary died at startup on
+           ;; (impl/register-type! …) with "Attempting to call unbound fn" (#944).
+           (_loaded (begin
+                      (for-each
+                        (lambda (p)
+                          (unless (hashtable-ref loaded-ns (car p) #f)
+                            (parameterize ((ldr-source-only? #t))
+                              (load-namespace (car p)))))
+                        (append graph reader-pairs))
+                      (set-ns-loaded-hook! (lambda (name file) #f))
+                      #t))
            (walked (reverse app-order))
            ;; graph without the entry-ns pair (it goes last)
            (graph-rest (if (and (pair? graph)
                                 (string=? (caar (reverse graph)) entry-ns))
                            (reverse (cdr (reverse graph)))
                            graph))
-           ;; reader namespaces with transitive closure
-           (reader-ns-names (bld-data-reader-ns-names))
-           (reader-pairs (bld-require-closure reader-ns-names))
            ;; only keep reader pairs not already in graph-rest or walked
            (reader-pairs
              (filter (lambda (p)
@@ -1420,10 +1447,11 @@
            ;; built binary died at startup on (impl/register-type! …) with
            ;; "Attempting to call unbound fn".
            ;;
-           ;; A graph-rest entry missing from walked was already loaded before this
-           ;; load-namespace (dep resolution, boot), and so was everything it
-           ;; requires — nothing in walked can be its dependency. Those go in front,
-           ;; keeping bld-require-closure's post-order among themselves.
+           ;; With the closure loaded above, a graph-rest entry missing from walked
+           ;; was already loaded before step 1 (dep resolution, boot), and so was
+           ;; everything it requires — nothing in walked can be its dependency.
+           ;; Those go in front, keeping bld-require-closure's post-order among
+           ;; themselves.
            (pre (remp (lambda (p) (assoc (car p) walked)) graph-rest))
            (merged (append reader-pairs pre walked))
            ;; ensure entry-ns is last
@@ -1435,19 +1463,6 @@
        (when (null? ordered)
          (error 'jolt-build (string-append "no source namespace loaded for " entry-ns
                                            " — is it on the source roots?")))
-       ;; Namespaces the CLASS scan pulled in (lib providers like jolt.time) are in
-       ;; `ordered` without ever being loaded in-process: step 1 only loads what
-       ;; the require graph reaches, and the runtime class-miss autoload fires on
-       ;; USE, which the build never triggers. The strict emit below re-analyzes
-       ;; their source against process ns state — an unloaded provider has no
-       ;; refer/alias tables, so its own :refer'd names would not resolve. Load
-       ;; any still-unloaded ns of the closure now, source-only like step 1.
-       (for-each
-         (lambda (p)
-           (unless (hashtable-ref loaded-ns (car p) #f)
-             (parameterize ((ldr-source-only? #t))
-               (load-namespace (car p)))))
-         ordered)
       ;; 2. emit each app namespace. Every mode but dev runs the inference +
       ;; record-shape setup passes and the inline + flatten + scalar-replace
       ;; fixpoint (set-optimize! below; inlining follows direct-link); release
@@ -2021,8 +2036,13 @@
 ;; that had built before kept serving the old 22MB fasl under the new policy
 ;; — the same source, the same word "release", a different compile — and the
 ;; binary did not shrink until the cache was cleared by hand.
+;; …and on the Chez that compiles it: a fasl is specific to the kernel's version
+;; and host (the machine-type tag, through the adapter), and two jolt binaries
+;; with different bundled kernels share this directory. Identical source text
+;; under a newer kernel must miss.
 (define (bld-runtime-cache-path body)
-  (let ((keyed (string-append (bld-params-bindings bld-runtime-chez-params "\n") body)))
+  (let ((keyed (string-append (scheme-version) " " (sa-host-tag) "\n"
+                              (bld-params-bindings bld-runtime-chez-params "\n") body)))
     (string-append (bld-runtime-cache-dir) "/runtime-"
                    (number->string (string-length body) 16) "-"
                    (number->string (aot-content-hash keyed) 16) ".so")))

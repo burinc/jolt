@@ -436,13 +436,19 @@
 ;; "file:/root" a name replaces the last segment, against "file:/root/" it lands
 ;; inside. The JVM asks the filesystem (File.isDirectory), so a path that is not
 ;; there, or is a plain file, gets no slash.
+;; The directory question is asked of the RESOLVED path: (File. "") is the
+;; working directory, whose raw path "" is no directory to file-directory?.
 (define (jfile-uri-path p)
   (let ((abs (jfile-abs p)))
-    (if (and (file-directory? p)
+    (if (and (file-directory? abs)
              (> (string-length abs) 0)
              (not (char=? (string-ref abs (- (string-length abs) 1)) #\/)))
         (string-append abs "/")
         abs)))
+;; File.toURI / Path.toUri: a java.net.URI over the file: form of the path, its
+;; characters percent-encoded and an existing directory's ending in a slash.
+(define (jfile->uri p)
+  (uri-parse (string-append "file:" (uri-quote-path (jfile-uri-path p)))))
 
 ;; --- canonical paths --------------------------------------------------------
 ;; getCanonicalPath is realpath(3), not "make it absolute": it resolves
@@ -834,7 +840,7 @@
       ((string=? name "getAbsolutePath")(list (jfile-abs fp)))
       ((string=? name "getCanonicalPath")(list (jfile-canonical fp)))
       ;; File.toURI returns a java.net.URI (JVM), not a String.
-      ((string=? name "toURI")          (list (uri-parse (string-append "file:" (uri-quote-path (jfile-uri-path fp))))))
+      ((string=? name "toURI")          (list (jfile->uri fp)))
       ((string=? name "toURL")          (list (make-url (string-append "file:" (jfile-uri-path fp)))))
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))

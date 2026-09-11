@@ -112,9 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build smoke's inner-fn case lost `step-boom` and `app.util/inner-boom` and
   placed `-main` on its `defn` line. `--opt` still turns it off for the app
   half, as before. The runtime-fasl cache is keyed on the parameters as well
-  as the source now: keyed on the mode's name alone, a build on a machine that
-  had built before kept serving the old fasl under the new policy, and the
-  binary did not shrink until the cache was cleared by hand.
+  as the source now, and on the Chez version and machine type that compiled
+  it: keyed on the mode's name alone, a build on a machine that had built
+  before kept serving the old fasl under the new policy, and the binary did
+  not shrink until the cache was cleared by hand.
 
 - **A binary that never compiles at runtime ships without the compiler, by
   default.** The analyzer and back end (1.2MB of fasl, plus the `scheme.boot`
@@ -140,7 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot run over a shaken one. And a kept def that only NAMES a var of the
   dropped half — `jolt.scheme/eval-string` in a program that calls `proc`
   alone — loads: the direct-link hoist binds a stub that raises at the call
-  instead of failing the namespace load. Hello-world,
+  instead of failing the namespace load. A `require`, `use` or `load-libs`
+  whose argument is COMPUTED — `(require (symbol nm))`, a plugin loaded by
+  name — and `compile` keep it too: a namespace the build could not read is
+  not in the binary, so at run time the call is a load from source, where
+  every `(require 'a.b)` and every `ns` clause names a constant the build
+  bakes and the call no-ops at startup. Found in review: such a binary worked
+  under 0.8.6 because every binary carried the compiler, and the verdict had
+  dropped it. Hello-world,
   measured with the runtime half's parameters above: 11.68MB → 9.15MB, 70ms →
   60ms, 132MB → 111MB resident; against 0.8.6's 27.25MB / 110ms / 225MB that
   is a third of the bytes, a little over half the start, and half the memory,
@@ -238,6 +246,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   printing zero.
 
 ### Fixed
+
+- **A built binary no longer dies before `-main` on a provider split across the
+  app's dependencies and jolt's embedded stdlib.** With `io.github.jolt-lang/time`
+  in `deps.edn` and an entry namespace whose top level touched a class the
+  embedded stdlib already serves (`java.time.LocalDateTime/now`), `jolt build`
+  succeeded and the binary raised `Attempting to call unbound fn:
+  #'jolt.time.impl/register-type!` at startup (#944). The build loads the entry
+  namespace from source and records the loader's order, then pulls in every
+  namespace the class scan finds a `:jolt/provides` provider for — the formatter
+  half of jolt.time, from the git dependency — and those were emitted in the
+  static require graph's order, in FRONT of everything the loader had run. The
+  formatter half calls `jolt.time.impl/register-type!` at its top level, and
+  `jolt.time.impl` had been loaded in step one, so the caller was emitted before
+  its callee. Whether a binary worked flipped with unrelated changes to the
+  require graph: a reference to a gitlib-only class (`DateTimeFormatter`) or an
+  explicit `(:require [jolt.time])` happened to load the provider in-process
+  first and hid it. The class-scan and data-reader namespaces now load under
+  the same hook, so the emit order is the loader's order for every namespace in
+  the binary, whichever root a provider's halves came from. A build-smoke
+  fixture builds a `:local/root` provider of the same shape, so the case is
+  gated offline.
+
+- **A libspec's `:rename` and `:exclude` qualify its `:refer`, and `:as`
+  follows `alias`'s collision rule.** `load-lib` hands `refer` every one of
+  `:only`/`:exclude`/`:rename` and calls `alias` for `:as`; here `(require
+  '[clojure.set :refer [union] :rename {union my-union}])` bound `union` and
+  never `my-union`, `(require '[clojure.string :refer :all :exclude
+  [reverse]])` brought `reverse` in anyway — the exclude was honoured only by a
+  `use` that spelled no `:refer` key — and a second `:as` on an alias already
+  pointing at another namespace silently repointed it, where the JVM throws
+  `IllegalStateException: Alias x already exists in namespace …`. All three
+  now do what `load-lib` does. The pre-analysis alias scan that lets `s/foo`
+  resolve in the same top-level form as its `require` registers speculatively
+  and leaves the collision to the require itself, where a `catch` can see it.
+
+- **`Class.cast(null)` is null.** Every target class accepts null on the JVM;
+  jolt's `instance?` answers false for nil, so the cast took its failure arm
+  and died building the message — `(jolt-class nil)` is not a class object.
+  SCI's interpreted call path casts each argument to its declared parameter
+  type, so a nil argument to any such call failed there.
+
+- **`format` refuses the rest of what `java.util.Formatter` refuses.** A flag
+  given twice (`%--5d`, `DuplicateFormatFlagsException`), `+` with space or
+  `-` with `0` together (`IllegalFormatFlagsException`), `-` or `0` with no
+  width to pad to (`MissingFormatWidthException: %-d`), `0` on a general or
+  character conversion (`FormatFlagsConversionMismatchException`), any flag on
+  `%n`, and `(`, `+` or space on a radix conversion of a long — legal there
+  only for a `BigInteger` — all rendered something; each is now the JVM's
+  exception with the JVM's message. `%c` of a code point past U+10FFFF is
+  `IllegalFormatCodePointException` instead of the raw Chez condition no catch
+  could select; a lone surrogate, which a code-point string cannot hold,
+  renders as U+FFFD. `%-5%` pads, as it should — the width was withheld from
+  the literal percent's flag check.
+
+- **`Collection.removeIf` on a non-empty immutable collection asks the
+  predicate.** The JVM default calls `remove()` — the refusal — only for an
+  element the predicate matches, so `(.removeIf [1 2] (constantly false))` is
+  `false`; jolt refused every non-empty call before reading the predicate.
+
+- **`(File. "")` has the directory slash on `toURI`, and `Path.toUri` is a
+  URI.** The directory question was asked of the raw path, and `""` — the
+  working directory — is not a directory to `file-directory?`; it is asked of
+  the resolved path now. `Path.toUri` answered a bare string with no
+  `.getPath`, no percent-encoding and no directory slash where its sibling
+  `File.toURI` had all three; it builds the same object.
+
+- **`Double.parseDouble` trims what `String.trim` trims, takes a type suffix
+  after a point, and refuses a hex float with no digits.** `"1.f"` is `1.0` on
+  the JVM and was rejected; a form feed ahead of the digits is trimmed there
+  and was not; `"0x.p0"` parsed as `0.0` where the JVM throws.
+
+- **`:jolt/tree-shake {:allow-dynamic […]}` unions across the deps.edn
+  chain.** tools.deps' merge of the user and project files is one map level
+  deep, so a project's vouch list was REPLACED by the user file's (or `-Sdeps`'s)
+  rather than joined; the lists union now, in chain order.
+
+- **A `fork-thread` resets the reader's modes and the STM transaction once, at
+  the fork.** The per-thread reader switches are copied to a forked thread from
+  the thread that forks it, and the reset each spawn site did by hand was
+  missing from five of them — core.async's `go`, `thread`, `put!`, `take!` and
+  `timeout`, the subprocess pump, a future's completion callback — so a `go`
+  block started from inside an edn `:readers` fn read every later form on
+  that thread in edn mode, for the life of the thread. The shadowed
+  `fork-thread` every spawn goes through does it now, so the next spawn site
+  cannot miss it either.
 
 - **`java.net.URI`'s component constructors exist.** Only `(URI. String)` was
   registered, so every other JVM arity reached that one-argument procedure and
@@ -559,18 +652,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The spawn now closes everything above the stdio fds in the child:
   `posix_spawn_file_actions_addclosefrom_np` where that entry resolves (glibc
-  2.34+ lowers it to one `close_range(2)`), and elsewhere — macOS, and every
-  older glibc, which is most of the range the released Linux binary targets —
-  by enumerating this process's own open descriptors (`/proc/self/fd`,
-  `/dev/fd`) and adding one close action each, every one of them confirmed open
-  with `fcntl` first, since a file action that fails leaves the child exiting
-  127 instead of exec'ing. The `closefrom` form has no window at all, because
-  the set it closes is decided in the child; the enumerated form takes its
-  snapshot in the parent, so a descriptor another thread opens between the
-  listing and the spawn is still inherited. An INHERIT redirect is untouched —
-  fds 0, 1 and 2 are below the cut and still carry the parent's own
-  descriptors, tty answers and all. `JOLT_NO_SPAWN_CLOSEFROM=1` forces the
-  fallback, so one machine's gate can exercise both paths.
+  2.34+ lowers it to one `close_range(2)`), `POSIX_SPAWN_CLOEXEC_DEFAULT` on
+  macOS — the kernel starts the child with everything closed except what a
+  file action names, and an inherited stdio stream is named with
+  `addinherit_np` — and elsewhere, every older glibc, which is most of the
+  range the released Linux binary targets, by enumerating this process's own
+  open descriptors (`/proc/self/fd`) and adding one close action each, every
+  one of them confirmed open with `fcntl` first, since a file action that fails
+  leaves the child exiting 127 instead of exec'ing. The first two forms have no
+  window at all, because the set they close is decided in the child; the
+  enumerated form takes its snapshot in the parent, so a descriptor another
+  thread opens between the listing and the spawn is still inherited, and one
+  another thread CLOSES in that window leaves a close action on a dead fd —
+  glibc skips it, the Darwin kernel fails the whole spawn with `EBADF`, which
+  is why macOS does not take that tier. An INHERIT redirect is untouched — fds
+  0, 1 and 2 are below the cut and still carry the parent's own descriptors,
+  tty answers and all. `JOLT_NO_SPAWN_CLOSEFROM=1` forces the enumeration
+  fallback, so one machine's gate can exercise every path.
 
 - **A task that shares a built-in command's name now says so, instead of
   letting the command answer as if the task were not there.** babashka's
