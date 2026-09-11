@@ -952,7 +952,14 @@
                 (else (loop (fx+ k 1))))))
       0))
 (define (reflect-method-arity self)
-  (reflect-method-param-count (reflect-method-fn self) (reflect-method-static? self)))
+  (let ((st (jhost-state self)))
+    ;; A method built from a dispatch rule rather than a proc cannot report its
+    ;; parameter count off an arity mask (the rule accepts anything), so it
+    ;; pins the count in a fifth slot. The members jolt enumerates keep four
+    ;; slots and derive the count from the proc, as before.
+    (if (and (fx>? (vector-length st) 4) (not (eq? #f (vector-ref st 4))))
+        (vector-ref st 4)
+        (reflect-method-param-count (reflect-method-fn self) (reflect-method-static? self)))))
 (register-host-methods! "reflect-method"
   (list (cons "getName" (lambda (self) (reflect-method-name self)))
         (cons "getDeclaringClass" (lambda (self) (jolt-class-for (reflect-method-cls self))))
@@ -973,17 +980,24 @@
         (cons "getModifiers" (lambda (self) (->num (if (reflect-method-static? self) 9 1))))
         ;; Method.invoke(obj, Object... args) — from Clojure the varargs arrive as
         ;; one array, so a lone trailing array IS the argument list and gets
-        ;; splatted. Anything else is passed straight through, which is what a
-        ;; caller spelling the arguments out means. A static ignores the target,
-        ;; as the JVM does (Method.invoke takes null there).
+        ;; splatted. A lone nil is the EMPTY argument list: sci.impl.reflector's
+        ;; box-args answers nil for a method with no parameters, and the JVM's
+        ;; Method.invoke treats a null array as none either (it would raise). A
+        ;; caller spelling out arguments passes them straight through.
         (cons "invoke"
               (lambda (self target . args)
                 (let ((as (if (and (= 1 (length args)) (jolt-array? (car args)))
                               (ja->list (car args))
-                              args)))
+                              (if (and (= 1 (length args)) (jolt-nil? (car args)))
+                                  '()
+                                  args))))
                   (if (reflect-method-static? self)
                       (apply (reflect-method-fn self) as)
                       (apply (reflect-method-fn self) target as)))))
+        ;; AccessibleObject.canAccess: jolt's members carry no accessibility
+        ;; state, and every method it reports is public, so a reflective caller
+        ;; that asks (SCI's interpreter is one) is allowed through.
+        (cons "canAccess" (lambda (self target) #t))
         (cons "toString"
               (lambda (self)
                 (jreflect-member-str (if (reflect-method-static? self) 9 1)
@@ -1022,3 +1036,41 @@
      (jhost-tags-for-fqn fqn))
     (for-each (lambda (p) (add! nm (car p) (cdr p) #t)) (class-static-members nm #t))
     (make-jolt-array (list->vector (reverse acc)) 'objects)))
+
+;; ---- Reflector/getMethods (SCI's reflective lookup) -------------------------
+;; SCI's interpreter (sci.impl.reflector) resolves a method call by asking
+;; clojure.lang.Reflector/getMethods for the members matching (name, arity,
+;; static?) and then invoking the one it got. jolt records members as data for a
+;; protocol's methods, a jhost tag's shims and a class's statics — those answer
+;; with the real member. String and the collections model their methods as a
+;; cond over the receiver, so nothing enumerates them: those (and any name the
+;; class does not have, which dispatch reports at the call the way every other
+;; jolt interop miss does) answer with a stand-in that carries the dispatch
+;; RULE instead of a proc. Its arity cannot come off a proc, so it pins one.
+(define (make-dispatch-method cls-name method-name arity static?)
+  (make-jhost
+   "reflect-method"
+   (vector cls-name method-name
+           (if static?
+               (lambda args (apply host-static-call cls-name method-name args))
+               (lambda (self . args)
+                 (record-method-dispatch self method-name (list->cseq args))))
+           static? arity)))
+
+(define (reflect-get-methods cls arity method-name static?)
+  (let* ((want (jnum->exact arity))
+         (name (jolt-str-render-one method-name))
+         (stat? (if (or (eq? static? #f) (jolt-nil? static?)) #f #t))
+         (ms (filter (lambda (m)
+                       (and (string=? (reflect-method-name m) name)
+                            (fx=? want (reflect-method-arity m))
+                            (eq? stat? (reflect-method-static? m))))
+                     (ja->list (class-method-array cls)))))
+    ;; A java.util.List, which is what SCI's caller destructures (.size/.get).
+    (make-arraylist (list (if (pair? ms)
+                              (car ms)
+                              (make-dispatch-method (jclass-name cls) name want stat?))))))
+
+(register-class-statics!
+ "clojure.lang.Reflector"
+ (list (cons "getMethods" reflect-get-methods)))

@@ -266,7 +266,11 @@ dependencies, like any other run.
 
 A built-in command wins a name it shares with a file — `jolt build` is always the
 compiler — which is what `-f` is for. A task loses to one: a file on disk is what
-`jolt greet` means when the project also has a `greet` task.
+`jolt greet` means when the project also has a `greet` task. A task loses to a
+command too, unless it claims the name with `:override-builtin true` — and when
+one does lose, jolt says so, because the command answering in a project that
+declares the task otherwise reads like the task went missing. `jolt run greet`
+reaches the task either way.
 
 Startup is jolt's boot floor — the runtime and compiler image are instantiated on
 every run, which measures ~0.17s against babashka's ~0.01s on the same machine. A
