@@ -2242,8 +2242,12 @@
         ;; through to resolving the class by name, which raised for a name no
         ;; provider supplies (java.lang.Object) — every interpreted call failed
         ;; there before reaching the method.
+        ;; null casts to anything: Class.cast(null) is null for every target
+        ;; class on the JVM, and instance-check answers false for nil, so the
+        ;; nil arm comes first — the failure branch would otherwise ask
+        ;; (jolt-class nil) for a jhost it is not and die on the accessor.
         (cons "cast" (lambda (self o)
-                       (if (instance-check self o)
+                       (if (or (jolt-nil? o) (instance-check self o))
                            o
                            (throw-jvm
                             'ClassCastException

@@ -699,6 +699,20 @@
     (jolt-future-deref
       (jolt-future-call (lambda () (or (rdr-edn-mode) (rdr-scan-mode)))))))
 (ok "15. a thread jolt forks reads in the default modes" (not ts15-inherited))
+;; ...and the reset is the fork itself (lazy-bridge.ss's fork-thread shadow), not
+;; something each spawn site remembers to do: a bare fork-thread from inside a
+;; read starts clean too, which is what covers core.async's go/thread/put!/take!,
+;; the subprocess pump and every spawn site added later.
+(define ts15-bare
+  (parameterize ((rdr-edn-mode #t) (rdr-scan-mode #t) (*txn* 'ts15-txn))
+    (let ((mu (make-mutex)) (cv (make-condition)) (got 'unset))
+      (fork-thread (lambda ()
+                     (let ((v (list (rdr-edn-mode) (rdr-scan-mode) (*txn*))))
+                       (with-mutex mu (set! got v) (condition-broadcast cv)))))
+      (with-mutex mu (let wait () (when (eq? got 'unset) (condition-wait cv mu) (wait))))
+      got)))
+(ok "15. a bare fork-thread starts from the default reader modes and no txn"
+    (equal? ts15-bare '(#f #f #f)))
 
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)

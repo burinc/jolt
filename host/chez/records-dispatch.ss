@@ -560,14 +560,25 @@
       ;; JVM has answered before it can throw: removeFirst / removeLast raise
       ;; NoSuchElementException (the same empty check getFirst / getLast make
       ;; above), removeIf answers false — it removed nothing — and replaceAll and
-      ;; sort are void and do nothing at all.
+      ;; sort are void and do nothing at all. removeIf's default walks the
+      ;; elements and calls remove() only for one the predicate MATCHES, so on a
+      ;; non-empty collection it is the predicate that decides: no match is
+      ;; false, a match is the refusal. (replaceAll and sort call set() for
+      ;; every element and refuse on any non-empty one.)
       ((rd-coll-mutator? obj method-name (length rest))
        (let ((empty? (jolt-nil? (jolt-seq obj))))
          (cond
+           ((string=? method-name "removeIf")
+            (if (and (not empty?)
+                     (let loop ((s (jolt-seq obj)))
+                       (and (not (jolt-nil? s))
+                            (or (jolt-truthy? (jolt-invoke (car rest) (seq-first s)))
+                                (loop (jolt-seq (seq-more s)))))))
+                (throw-jvm 'UnsupportedOperationException "")
+                #f))
            ((not empty?) (throw-jvm 'UnsupportedOperationException ""))
            ((or (string=? method-name "removeFirst") (string=? method-name "removeLast"))
             (throw-jvm 'NoSuchElementException ""))
-           ((string=? method-name "removeIf") #f)
            ((or (string=? method-name "replaceAll") (string=? method-name "sort")) jolt-nil)
            (else (throw-jvm 'UnsupportedOperationException "")))))
       ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /

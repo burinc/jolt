@@ -112,9 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build smoke's inner-fn case lost `step-boom` and `app.util/inner-boom` and
   placed `-main` on its `defn` line. `--opt` still turns it off for the app
   half, as before. The runtime-fasl cache is keyed on the parameters as well
-  as the source now: keyed on the mode's name alone, a build on a machine that
-  had built before kept serving the old fasl under the new policy, and the
-  binary did not shrink until the cache was cleared by hand.
+  as the source now, and on the Chez version and machine type that compiled
+  it: keyed on the mode's name alone, a build on a machine that had built
+  before kept serving the old fasl under the new policy, and the binary did
+  not shrink until the cache was cleared by hand.
 
 - **A binary that never compiles at runtime ships without the compiler, by
   default.** The analyzer and back end (1.2MB of fasl, plus the `scheme.boot`
@@ -140,7 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot run over a shaken one. And a kept def that only NAMES a var of the
   dropped half — `jolt.scheme/eval-string` in a program that calls `proc`
   alone — loads: the direct-link hoist binds a stub that raises at the call
-  instead of failing the namespace load. Hello-world,
+  instead of failing the namespace load. A `require`, `use` or `load-libs`
+  whose argument is COMPUTED — `(require (symbol nm))`, a plugin loaded by
+  name — and `compile` keep it too: a namespace the build could not read is
+  not in the binary, so at run time the call is a load from source, where
+  every `(require 'a.b)` and every `ns` clause names a constant the build
+  bakes and the call no-ops at startup. Found in review: such a binary worked
+  under 0.8.6 because every binary carried the compiler, and the verdict had
+  dropped it. Hello-world,
   measured with the runtime half's parameters above: 11.68MB → 9.15MB, 70ms →
   60ms, 132MB → 111MB resident; against 0.8.6's 27.25MB / 110ms / 225MB that
   is a third of the bytes, a little over half the start, and half the memory,
@@ -259,6 +267,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the binary, whichever root a provider's halves came from. A build-smoke
   fixture builds a `:local/root` provider of the same shape, so the case is
   gated offline.
+
+- **A libspec's `:rename` and `:exclude` qualify its `:refer`, and `:as`
+  follows `alias`'s collision rule.** `load-lib` hands `refer` every one of
+  `:only`/`:exclude`/`:rename` and calls `alias` for `:as`; here `(require
+  '[clojure.set :refer [union] :rename {union my-union}])` bound `union` and
+  never `my-union`, `(require '[clojure.string :refer :all :exclude
+  [reverse]])` brought `reverse` in anyway — the exclude was honoured only by a
+  `use` that spelled no `:refer` key — and a second `:as` on an alias already
+  pointing at another namespace silently repointed it, where the JVM throws
+  `IllegalStateException: Alias x already exists in namespace …`. All three
+  now do what `load-lib` does. The pre-analysis alias scan that lets `s/foo`
+  resolve in the same top-level form as its `require` registers speculatively
+  and leaves the collision to the require itself, where a `catch` can see it.
+
+- **`Class.cast(null)` is null.** Every target class accepts null on the JVM;
+  jolt's `instance?` answers false for nil, so the cast took its failure arm
+  and died building the message — `(jolt-class nil)` is not a class object.
+  SCI's interpreted call path casts each argument to its declared parameter
+  type, so a nil argument to any such call failed there.
+
+- **`format` refuses the rest of what `java.util.Formatter` refuses.** A flag
+  given twice (`%--5d`, `DuplicateFormatFlagsException`), `+` with space or
+  `-` with `0` together (`IllegalFormatFlagsException`), `-` or `0` with no
+  width to pad to (`MissingFormatWidthException: %-d`), `0` on a general or
+  character conversion (`FormatFlagsConversionMismatchException`), any flag on
+  `%n`, and `(`, `+` or space on a radix conversion of a long — legal there
+  only for a `BigInteger` — all rendered something; each is now the JVM's
+  exception with the JVM's message. `%c` of a code point past U+10FFFF is
+  `IllegalFormatCodePointException` instead of the raw Chez condition no catch
+  could select; a lone surrogate, which a code-point string cannot hold,
+  renders as U+FFFD. `%-5%` pads, as it should — the width was withheld from
+  the literal percent's flag check.
+
+- **`Collection.removeIf` on a non-empty immutable collection asks the
+  predicate.** The JVM default calls `remove()` — the refusal — only for an
+  element the predicate matches, so `(.removeIf [1 2] (constantly false))` is
+  `false`; jolt refused every non-empty call before reading the predicate.
+
+- **`(File. "")` has the directory slash on `toURI`, and `Path.toUri` is a
+  URI.** The directory question was asked of the raw path, and `""` — the
+  working directory — is not a directory to `file-directory?`; it is asked of
+  the resolved path now. `Path.toUri` answered a bare string with no
+  `.getPath`, no percent-encoding and no directory slash where its sibling
+  `File.toURI` had all three; it builds the same object.
+
+- **`Double.parseDouble` trims what `String.trim` trims, takes a type suffix
+  after a point, and refuses a hex float with no digits.** `"1.f"` is `1.0` on
+  the JVM and was rejected; a form feed ahead of the digits is trimmed there
+  and was not; `"0x.p0"` parsed as `0.0` where the JVM throws.
+
+- **`:jolt/tree-shake {:allow-dynamic […]}` unions across the deps.edn
+  chain.** tools.deps' merge of the user and project files is one map level
+  deep, so a project's vouch list was REPLACED by the user file's (or `-Sdeps`'s)
+  rather than joined; the lists union now, in chain order.
+
+- **A `fork-thread` resets the reader's modes and the STM transaction once, at
+  the fork.** The per-thread reader switches are copied to a forked thread from
+  the thread that forks it, and the reset each spawn site did by hand was
+  missing from five of them — core.async's `go`, `thread`, `put!`, `take!` and
+  `timeout`, the subprocess pump, a future's completion callback — so a `go`
+  block started from inside an edn `:readers` fn read every later form on
+  that thread in edn mode, for the life of the thread. The shadowed
+  `fork-thread` every spawn goes through does it now, so the next spawn site
+  cannot miss it either.
 
 - **The first match on a large alternation no longer takes seconds (or never
   finishes).** A 50-branch union with two unbounded `.*` branches — a retry

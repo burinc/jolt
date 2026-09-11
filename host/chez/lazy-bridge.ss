@@ -119,6 +119,18 @@
 ;; enters the set as its body starts and leaves when the body returns. This backs
 ;; Thread/getAllStackTraces (io.ss), whose callers are leak checks counting
 ;; threads before and after some work.
+;;
+;; It is also where a new thread's per-thread state is reset. A Chez thread
+;; parameter hands a forked thread the CREATING thread's value, and two of
+;; jolt's are a read's transient state that must not travel: the reader's mode
+;; switches (rdr-edn-mode, rdr-scan-mode, …, reader.ss) and the STM transaction
+;; (*txn*, refs.ss). A go block forked from inside an edn :readers fn used to
+;; read every later form on that thread in edn mode, for the life of the
+;; thread. Every spawn site did its own reset and five of them (core.async's
+;; go/thread/put!/take!/timeout, the subprocess pump, a future's completion
+;; callback) had none; doing it here once is what makes the invariant hold for
+;; the next spawn site too. A site that needs the parent's dynamic bindings
+;; installs them itself, after this (dyn-binding-stack snap).
 (define live-threads (make-eqv-hashtable))
 (define live-threads-mutex (make-mutex))
 (define (live-thread-ids)
@@ -128,6 +140,8 @@
   (jolt-mark-mt!)
   (%ls-orig-fork-thread
    (lambda ()
+     (*txn* #f)
+     (rdr-default-modes!)
      (let ((id (get-thread-id)))
        (jolt-with-mutex live-threads-mutex (hashtable-set! live-threads id #t))
        (dynamic-wind

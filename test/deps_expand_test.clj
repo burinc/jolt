@@ -362,6 +362,22 @@
   (is= "the key without :allow-dynamic is the empty list" []
        (allow-dynamic-entries {:jolt/tree-shake {}})))
 
+;; Two deps.edn sources in the chain both declaring :jolt/tree-shake: the vouch
+;; lists union, in chain order and without duplicates. tools.deps' generic merge
+;; is one level deep, so the later source's {:allow-dynamic [...]} used to
+;; REPLACE the earlier one's and a user-file vouch silently dropped the project's.
+(let [merge-edns (var jolt.deps.edn/merge-edns)]
+  (is= "merge-edns unions :allow-dynamic across sources, in order, deduplicated"
+       {:paths ["src"] :jolt/tree-shake {:allow-dynamic '[a.b/c d.e/f g.h/i]}}
+       (merge-edns [{:jolt/tree-shake {:allow-dynamic '[a.b/c d.e/f]}}
+                    {:paths ["src"] :jolt/tree-shake {:allow-dynamic '[d.e/f g.h/i]}}]))
+  (is= "a source without the key leaves the other's list alone"
+       {:jolt/tree-shake {:allow-dynamic '[a.b/c]}}
+       (merge-edns [{:jolt/tree-shake {:allow-dynamic '[a.b/c]}} {} nil]))
+  (is= "no source with the key means no key"
+       {:paths ["src"]}
+       (merge-edns [{:paths ["src"]} {}])))
+
 ;; The union itself, against the committed shake fixture: the app's own entry
 ;; comes first, the :local/root library's after it, and both arrive — the
 ;; build-level gate (make shakelocal) can only show that the shake ran, not
