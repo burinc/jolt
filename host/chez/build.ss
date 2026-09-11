@@ -1448,10 +1448,11 @@
              (parameterize ((ldr-source-only? #t))
                (load-namespace (car p)))))
          ordered)
-      ;; 2. emit each app namespace. Release and optimized modes enable the
-      ;; inference + record-shape setup passes (inference-enabled?); optimized
-      ;; mode additionally runs the inline + flatten + scalar-replace fixpoint
-      ;; (inline-enabled?). Dev mode gets const-fold + numeric-annotate only.
+      ;; 2. emit each app namespace. Every mode but dev runs the inference +
+      ;; record-shape setup passes and the inline + flatten + scalar-replace
+      ;; fixpoint (set-optimize! below; inlining follows direct-link); release
+      ;; and optimized differ only in the Chez compile parameters. Dev mode
+      ;; gets const-fold + numeric-annotate only.
       ;; direct-link? commits to a closed world: app->app calls bind directly, a
       ;; plain def is frozen in the binary (^:redef/^:dynamic stay var-routed).
       ;; The caller (jolt.main) turns it ON for release and optimized and OFF for

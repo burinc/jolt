@@ -1084,9 +1084,17 @@
 (define var-linked-tbl (make-eq-hashtable))
 (define var-linked-mu (make-mutex))
 (define (var-root-set! c v)
-  (var-cell-root-set! c v)
   (let ((l (hashtable-ref var-linked-tbl c #f)))
-    (when l ((cdr l) v))))
+    (if l
+        ;; The cell and the binding are ONE value, so the two writes are one
+        ;; critical section: two writers of the same linked var (a def racing an
+        ;; alter-var-root, two sessions interning the same name) would otherwise
+        ;; interleave into root=f2 / binding=f1 for good. thread-safety-test.ss
+        ;; row 14 reads the pair under the same mutex.
+        (jolt-with-mutex var-linked-mu
+          (var-cell-root-set! c v)
+          ((cdr l) v))
+        (var-cell-root-set! c v))))
 ;; The jv$ symbol a linked var is bound under, or #f. jolt.host/seed-callable?
 ;; answers it so an app's direct call site applies the binding itself (backend
 ;; emit-invoke) rather than a root hoisted once at load.

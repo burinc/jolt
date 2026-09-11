@@ -482,8 +482,25 @@ fi
 
 # Optimized mode (inference + flatten + scalar-replace) must produce the same
 # result — a sanity check that the passes don't miscompile this app.
-if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.opt" --opt >/dev/null 2>&1; then
-  echo "  FAIL: jolt build --opt exited non-zero"; exit 1
+#
+# And release and --opt compile the runtime half IDENTICALLY (build.ss
+# bld-runtime-chez-params). The runtime-fasl cache is keyed on the Chez
+# parameters and the runtime source, so the two modes share ONE entry when
+# and only when they select the same parameters — the release row growing
+# inspector/procedure-source information back (the 2.3x-binary, 1.6x-startup
+# cost burinc/jolt#3 was about) shows up here as a second entry. Asked of a
+# fresh cache directory rather than by comparing the two build dirs' fasls:
+# with the default cache both dirs are copies of one entry, so cmp could not
+# tell the modes apart, and a fresh Chez compile is not byte-reproducible, so
+# it could not with the cache off either. $out is still the plain release build.
+modecache="$(dirname "$out")/modecache"
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$modecache" "$jolt" build -m app.core -o "$out.rel" >/dev/null 2>&1; then
+  echo "  FAIL: release build into a fresh runtime cache exited non-zero"; exit 1
+fi
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$modecache" JOLT_BUILD_PROFILE=1 "$jolt" build -m app.core -o "$out.opt" --opt 2>"$modecache/prof.log" >/dev/null; then
+  echo "  FAIL: jolt build --opt exited non-zero"
+  sed -n 's/^jolt build: \[profile\]/    /p' "$modecache/prof.log"
+  exit 1
 fi
 got_opt="$(cd / && "$out.opt" alpha bb ccc 2>&1)"
 if [ "$got_opt" != "$want" ]; then
@@ -491,15 +508,11 @@ if [ "$got_opt" != "$want" ]; then
   echo "--- got ----"; echo "$got_opt"
   exit 1
 fi
-# Release and --opt compile the runtime half IDENTICALLY (build.ss
-# bld-chez-params). The runtime half is app-independent, so the two build dirs
-# hold the same fasl when and only when the two modes select the same Chez
-# parameters — the release row growing inspector/procedure-source information
-# back (the 2.3x-binary, 1.6x-startup cost burinc/jolt#3 was about) shows up
-# here as a byte difference. $out is still the plain release build.
-if ! cmp -s "$out.build/runtime.so" "$out.opt.build/runtime.so"; then
+n_rt="$(ls "$modecache"/*.so 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$n_rt" != "1" ] || ! grep -q 'runtime fasl (cached)' "$modecache/prof.log"; then
   echo "  FAIL: release and --opt compiled the runtime half differently"
-  echo "        release: $(wc -c < "$out.build/runtime.so") bytes, --opt: $(wc -c < "$out.opt.build/runtime.so") bytes"
+  echo "        $n_rt runtime fasl(s) in a cache both modes wrote to; --opt $(grep -q 'runtime fasl (cached)' "$modecache/prof.log" && echo reused || echo did not reuse) the release entry"
+  sed -n 's/^jolt build: \[profile\]/    /p' "$modecache/prof.log"
   exit 1
 fi
 
