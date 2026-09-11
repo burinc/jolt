@@ -68,6 +68,27 @@
   ;; the class graph answers modifiers for a name it models; one it does not
   ;; reports PUBLIC alone rather than claiming non-finality it cannot know
   {:suite "reflect-member-model" :expr "(.getModifiers (Class/forName \"java.lang.Thread\"))" :expected "1"}
+  ;; Class.cast is the checked narrowing a reflective caller uses to hand a
+  ;; method its (Object) parameter type; without it the lookup fell through to
+  ;; resolving the class by name, which raised for java.lang.Object.
+  {:suite "reflect-member-model" :expr "(.cast java.lang.Object \"x\")" :expected "\"x\""}
+  {:suite "reflect-member-model" :expr "(try (.cast java.lang.String 42) (catch ClassCastException _ :cce))" :expected ":cce"}
+  ;; Reflector/getMethods answers the reflective interpretation of a method call:
+  ;; the members a class enumerates when it has them, and a name-dispatch member
+  ;; when its methods are a cond over the receiver (String, the collections) —
+  ;; which is what an interpreted call needs and what a getMethods-only caller
+  ;; cannot get from the member model above.
+  {:suite "reflect-member-model" :expr "(let [ms (clojure.lang.Reflector/getMethods String 1 \"indexOf\" false)] [(.size ms) (.getName (.get ms 0))])" :expected "[1 \"indexOf\"]"}
+  {:suite "reflect-member-model" :expr "(.canAccess (.get (clojure.lang.Reflector/getMethods String 1 \"indexOf\" false) 0) \"x\")" :expected "true"}
+  ;; a static resolves through the same lookup, and a zero-parameter one is
+  ;; invoked the way sci.impl.reflector invokes it: a nil argument array
+  {:suite "reflect-member-model" :expr "(.invoke (.get (clojure.lang.Reflector/getMethods Math 1 \"max\" true) 0) nil (into-array Object [2 3]))" :expected "3"}
+  {:suite "reflect-member-model" :expr "(pos? (.invoke (.get (clojure.lang.Reflector/getMethods System 0 \"currentTimeMillis\" true) 0) nil nil))" :expected "true"}
+  ;; a name the class does not have still answers a member: dispatch reports it
+  ;; at the call, with the method named, instead of an empty list
+  {:suite "reflect-member-model" :expr "(try (.invoke (.get (clojure.lang.Reflector/getMethods String 0 \"noSuch\" false) 0) \"x\" nil) (catch Exception e (boolean (re-find #\"noSuch\" (ex-message e)))))" :expected "true"}
+  ;; Util/sneakyThrow: the rethrow a reflective invoke ends every call with
+  {:suite "reflect-member-model" :expr "(try (clojure.lang.Util/sneakyThrow (ex-info \"boom\" {})) (catch Exception e (ex-message e)))" :expected "\"boom\""}
   ;; clojure.reflect over the same registries: the reference JavaReflector is a
   ;; thin layer on getDeclaredFields/Methods/Constructors + getModifiers + bases,
   ;; so the port is the reference apart from the member-set model above.
