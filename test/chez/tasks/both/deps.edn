@@ -4,4 +4,8 @@
  :tasks {donly "echo only-in-deps-edn"
          dtask "echo from-deps-edn-task"
          dmain {:doc "run the app" :main-opts ["-m" "both.core"]}
-         dfail "exit 4"}}
+         dfail "exit 4"
+         ;; a built-in's name, NOT claimed with :override-builtin: the command
+         ;; still wins it, and jolt says so rather than letting the built-in
+         ;; answer as if the task were not there
+         path "echo not-the-builtin"}}
