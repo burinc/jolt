@@ -275,6 +275,12 @@ differs and the deliberate behavioural divergences that are not corpus rows.
 behaviour change either matches the JVM or gets an entry explaining why it
 doesn't.
 
+Commit messages describe the change and nothing else: no AI-assistant
+attribution — no session-link trailer, co-author line, or generated-with footer.
+`make attributioncheck` (part of `make ci`) scans the commits not yet on
+`origin/main`, CI scans every push and PR the same way, and `make hooks`
+installs a `commit-msg` hook that refuses such a message at commit time.
+
 ## Error messages
 
 An error message is read by someone who is stuck. It should let them answer three

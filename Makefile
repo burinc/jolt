@@ -109,7 +109,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status \
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status hooks attributioncheck \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
@@ -166,7 +166,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
@@ -1079,6 +1079,21 @@ makefilesmoke:
 # dev-g<sha>, which no :jolt/min-version floor can misread as a version.
 versionsmoke:
 	@bash test/version-smoke.sh
+
+# No AI-assistant attribution in the commits this tree adds to origin/main: a
+# session-link trailer, a co-author line, a generated-with footer. Commit
+# messages here describe the change and nothing else, and a session link is a
+# private URL. tools/attributioncheck.sh scans origin/main..HEAD (HEAD alone
+# when the remote branch is unknown); the same script is the commit-msg hook
+# `make hooks` installs, and CI's attribution job runs it over the pushed or PR
+# range with full history.
+attributioncheck:
+	@sh tools/attributioncheck.sh
+
+# Install the repository's git hooks into .git/hooks (copies, so a clone that
+# never runs this is unaffected; re-run after a hook changes).
+hooks:
+	@for h in tools/git-hooks/*; do cp "$$h" ".git/hooks/$$(basename "$$h")"; chmod +x ".git/hooks/$$(basename "$$h")"; echo "installed .git/hooks/$$(basename "$$h")"; done
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 # The oracle version is READ from the committed profile, which certify.clj also

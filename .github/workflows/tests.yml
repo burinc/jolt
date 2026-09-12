@@ -93,6 +93,39 @@ jobs:
           JOLT_REQUIRE_BUILDLIB: "1"
         run: make CHEZ=/opt/chez/bin/chez -j"$(nproc)" -Oline test
 
+  # No AI-assistant attribution in what a push or PR adds: tools/attributioncheck.sh
+  # over the pushed range (push) or the PR's commits and its description (PR).
+  # Its own job because it needs history — the test job's checkout is shallow,
+  # so origin/main..HEAD is not there to scan — and needs no Chez.
+  attribution:
+    name: No AI attribution in commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Commits in range
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            range="origin/$BASE_REF..HEAD"
+          elif [ -n "$BEFORE" ] && ! echo "$BEFORE" | grep -q '^0*$' && git cat-file -e "$BEFORE" 2>/dev/null; then
+            range="$BEFORE..HEAD"
+          else
+            range="HEAD~20..HEAD"   # a new branch or a force-push: the recent commits
+          fi
+          echo "scanning $range"
+          sh tools/attributioncheck.sh "$range"
+      - name: PR description
+        if: github.event_name == 'pull_request'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n' "$BODY" | sh tools/attributioncheck.sh --text
+
   windows-deps:
     name: Windows dependency paths
     runs-on: windows-latest
