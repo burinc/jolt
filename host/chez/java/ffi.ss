@@ -121,6 +121,54 @@
 (define (ffi-library-map path)
   (jolt-hash-map (jolt-keyword "path") path))
 
+;; --- Android / Termux: the prefix the OS loader does not search ---------------
+;; A jolt process on Android is launched by /system/bin/linker64, whose default
+;; search path is /system/lib64 and friends -- never the Termux prefix. So a bare
+;; soname does one of two things there, and both are wrong: the versioned name
+;; ($PREFIX/lib/libssl.so.3) is "not found" because nothing looks in the prefix,
+;; and the unversioned one (libssl.so) binds ANDROID'S library of that name.
+;; /system/lib64/libssl.so is BoringSSL: it exports SSL_new but not SSL_ctrl, and
+;; its SSL_CTX layout is not OpenSSL 3's, so a TLS binding that resolves through
+;; it fails at the first call -- or, when the real OpenSSL is also loaded, picks
+;; one library for some symbols and the other for the rest and faults. Both
+;; jolt-lang/crypto and jolt-lang/http-client name those sonames bare, which is
+;; the right thing to write everywhere else.
+;;
+;; So: detect the prefix, and give a BARE name a second try under $PREFIX/lib
+;; after the OS search has had its turn. Fallback ordering is what makes this
+;; safe -- a name that legitimately resolves in /system/lib64 is untouched -- and
+;; it is also what makes it work: the versioned candidates a per-OS spec lists
+;; first exist only in the prefix, so they are the ones that now resolve, ahead
+;; of the unversioned BoringSSL one.
+;;
+;; Detection is by environment, which is how Termux identifies itself: PREFIX is
+;; its install root and TERMUX_VERSION/ANDROID_ROOT say which OS it is on. The
+;; env is also what makes it testable from an ordinary host.
+(define (ffi-getenv name) (guard (e (#t #f)) (getenv name)))
+(define (ffi-termux-lib-dir)
+  (let ((prefix (ffi-getenv "PREFIX")))
+    (and prefix
+         (not (string=? prefix ""))
+         (or (ffi-getenv "TERMUX_VERSION") (ffi-getenv "ANDROID_ROOT"))
+         (string-append prefix "/lib"))))
+
+;; A name with no directory separator -- what dlopen resolves through the OS
+;; search path rather than opening directly.
+(define (ffi-bare-soname? name)
+  (let ((n (string-length name)))
+    (let loop ((i 0))
+      (cond ((fx=? i n) #t)
+            ((or (char=? (string-ref name i) #\/) (char=? (string-ref name i) #\\)) #f)
+            (else (loop (fx+ i 1)))))))
+
+;; The paths jolt-ffi-load-native tries for one name, in order: the name as
+;; given, then the Android fallback above when it applies. One list so the
+;; ordering is data a test can read rather than control flow inside the loader.
+(define (ffi-native-candidates path)
+  (cons path
+        (let ((d (and (ffi-bare-soname? path) (ffi-termux-lib-dir))))
+          (if d (list (string-append d "/" path)) '()))))
+
 ;; (load-system-library "z") -> libz.dylib, libz.so, or z.dll, whichever this
 ;; platform spells it. Answers the same library map as load-library.
 ;;
@@ -131,11 +179,15 @@
 ;; version numbers instead would miss libz.so.1.2.13 and every soname above the
 ;; guess, so this reads the directories rather than inventing names.
 (define (ffi-so-search-dirs)
-  ;; LD_LIBRARY_PATH first (it wins for the loader too), then the standard
-  ;; prefixes, then Debian/Ubuntu multiarch subdirectories, discovered by
-  ;; listing rather than by naming a triple this build cannot know.
+  ;; LD_LIBRARY_PATH first (it wins for the loader too), then the Termux prefix
+  ;; on Android (where it plays the part /usr/lib plays elsewhere and the OS
+  ;; loader never looks), then the standard prefixes, then Debian/Ubuntu
+  ;; multiarch subdirectories, discovered by listing rather than by naming a
+  ;; triple this build cannot know.
   (let* ((env (or (guard (e (#t #f)) (getenv "LD_LIBRARY_PATH")) ""))
          (from-env (if (string=? env "") '() (ffi-split-colons env)))
+         (from-env (let ((d (ffi-termux-lib-dir)))
+                     (if d (append from-env (list d)) from-env)))
          (roots '("/usr/local/lib" "/usr/lib" "/lib" "/usr/lib64" "/lib64"))
          (multi (apply append
                        (map (lambda (root)
@@ -279,15 +331,24 @@
        (cond
          ((hashtable-ref ffi-native-paths path #f) #t)   ; already loaded
          (else
-          (let ((h (ffi-dlopen path ffi-rtld-flags)))
-             (cond
-              ((and h (integer? h) (positive? h))
-               (hashtable-set! ffi-native-paths path #t)
-               (vector-set! ffi-native-handles 0
-                            (append (or (vector-ref ffi-native-handles 0) '())
-                                    (list (cons path h))))
-               h)
-              (else #f)))))))))
+          ;; Each candidate in turn; the one that opens is what the registry
+          ;; records, so a duplicate-symbol report names the file that actually
+          ;; backs the handle and not the soname that was asked for. The name as
+          ;; asked is marked loaded too, so a second request for it is the same
+          ;; no-op it has always been.
+          (let loop ((cs (ffi-native-candidates path)))
+            (if (null? cs)
+                #f
+                (let ((h (ffi-dlopen (car cs) ffi-rtld-flags)))
+                  (cond
+                   ((and h (integer? h) (positive? h))
+                    (hashtable-set! ffi-native-paths path #t)
+                    (hashtable-set! ffi-native-paths (car cs) #t)
+                    (vector-set! ffi-native-handles 0
+                                 (append (or (vector-ref ffi-native-handles 0) '())
+                                         (list (cons (car cs) h))))
+                    h)
+                   (else (loop (cdr cs)))))))))))))
 ;; Every declared native through which `sym` RESOLVES, as (path . address) in
 ;; declaration order. Walking all of them rather than stopping at the first is
 ;; what makes the duplicate below visible; it costs one dlsym per declared
