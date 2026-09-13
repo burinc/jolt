@@ -203,6 +203,16 @@
 (define (find-protocol-method type-tag proto method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (let ((pi (hashtable-ref ti proto #f))) (and pi (hashtable-ref pi method #f))))))
+
+;; The key mark-extend! (below) writes into a protocol's impl table to record
+;; that the type EXTENDED the protocol rather than declaring it inline. It lives
+;; here rather than beside mark-extend! because the two questions this file
+;; answers about a type — what it implements, and what its class declares — both
+;; have to be able to tell the two apart.
+(define extend-mark "__jolt_extend__")
+;; Was this impl table filled by extend/extend-type/extend-protocol?
+(define (extend-impl-table? pi)
+  (and pi (hashtable-ref pi extend-mark #f) #t))
 ;; The impl for METHOD under any protocol this type implements — one ref into
 ;; the by-method index, first registration wins. This is the hot one (every
 ;; record collection op asks it), so it neither locks nor allocates.
@@ -229,14 +239,31 @@
 ;; (instance? clojure.lang.ILookup x), (instance? some.ns.SomeProtocol x). Exact
 ;; first (a host-interface key is spelled the same), then match each of the type's
 ;; protocol keys as an interface name.
+;;
+;; An EXTENDED protocol does not count. On the JVM, extend/extend-type/
+;; extend-protocol only file the implementation in the protocol's own method
+;; table — the target class is never touched, so it gains neither the protocol's
+;; interface nor its methods, and (instance? <the protocol's interface> x) stays
+;; false while satisfies? becomes true. jolt files both kinds of implementation
+;; in one registry, so the extend mark is what keeps the two questions apart.
+;; Code leans on the distinction: sci.impl.types/eval-node? is
+;; (instance? sci.impl.types.Eval x), meant to be true only for the AST nodes
+;; that DECLARE Eval — SCI extends the same protocol onto sci.lang.Var and
+;; friends for the eval function's sake. Answering true there made SCI classify
+;; every resolved var as an AST node, so `resolve` returned nil inside a jolt SCI
+;; context and no defrecord could find its protocol ("Protocol not found: P").
 (define (type-implements-class?-uncached type-tag qname)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
+    (define (declared? k)
+      (let ((pi (hashtable-ref ti k #f)))
+        (and pi (not (extend-impl-table? pi)))))
     (and ti
-         (or (and (hashtable-ref ti qname #f) #t)
+         (or (declared? qname)
              (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
                (let loop ((i 0))
                  (and (fx< i n)
-                      (or (proto-class-match? (vector-ref ks i) qname)
+                      (or (let ((k (vector-ref ks i)))
+                            (and (declared? k) (proto-class-match? k qname)))
                           (loop (fx+ i 1))))))))))
 ;; …and memoized per (type-tag, class-name), because that walk is not cheap and
 ;; instance? asks it repeatedly with the same pair. Every candidate key is run
@@ -699,7 +726,6 @@
 ;; restores it). deftype/defrecord inline impls go through register-inline-method
 ;; and skip the mark: the JVM compiles inline protocol methods into the class, so
 ;; extenders excludes them.
-(define extend-mark "__jolt_extend__")
 (define (mark-extend! tag proto-name)
   (jolt-with-mutex rec-tbl-mu
     (let ((ti (hashtable-ref type-registry tag #f)))

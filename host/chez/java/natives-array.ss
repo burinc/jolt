@@ -1022,12 +1022,19 @@
          (acc '()))
     (define (add! owner name f static?)
       (set! acc (cons (make-jhost "reflect-method" (vector owner name f static?)) acc)))
+    ;; The protocol registry's methods — but only the ones the type DECLARES.
+    ;; An extend/extend-type/extend-protocol implementation is filed in the same
+    ;; registry and is not a member of the class: the JVM's extend writes the
+    ;; protocol's method table and leaves the class alone, so reflection over a
+    ;; type that was merely extended reports nothing new (and never the
+    ;; __jolt_extend__ marker jolt files beside those methods).
     (when ti
       (let-values (((protos impls) (hashtable-entries ti)))
         (vector-for-each
          (lambda (proto pi)
-           (let-values (((names fns) (hashtable-entries pi)))
-             (vector-for-each (lambda (n f) (add! nm n f #f)) names fns)))
+           (unless (extend-impl-table? pi)
+             (let-values (((names fns) (hashtable-entries pi)))
+               (vector-for-each (lambda (n f) (add! nm n f #f)) names fns))))
          protos impls)))
     ;; the shim's instance methods, for a class a jhost tag models. Two tags can
     ;; name one class, so both are walked; a name registered under both surfaces
