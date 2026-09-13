@@ -35,7 +35,40 @@
   (or (hashtable-ref ns-registry name #f)
       (jolt-with-mutex ns-registry-mu
         (or (hashtable-ref ns-registry name #f)
-            (let ((n (make-jns name))) (hashtable-set! ns-registry name n) n)))))
+            (begin
+              ;; interning is the namespace coming into its own -- an `ns` form,
+              ;; in-ns, create-ns -- so it ends any deferral (see ns-deferred?).
+              (hashtable-delete! ns-deferred name)
+              (let ((n (make-jns name))) (hashtable-set! ns-registry name n) n))))))
+
+;; --- partly-seeded namespaces ------------------------------------------------
+;; A namespace the RUNTIME pre-seeds with native vars while its Clojure overlay
+;; is still waiting on a require. clojure.core.async is the one: java/async.ss,
+;; java/fibers-async.ss and java/sm.ss def-var! the channel primitives into it at
+;; boot (chan, <!, >!, go, thread, the buffers -- 34 vars), and
+;; stdlib/clojure/core/async.clj interns the other ~96 (alts!, mult, mix,
+;; pub/sub, pipeline, the sequence operators) when a require pulls it off the
+;; source roots. Those 34 vars alone satisfy the var-derived existence rule
+;; below, so find-ns and all-ns reported the namespace from the first instant,
+;; three-quarters empty.
+;;
+;; Reporting it that way is worse than not reporting it. A caller that SNAPSHOTS
+;; namespaces out of all-ns -- an SCI context built by copying ns-interns, a
+;; completion or doc index -- captures the bootstrap subset and then stands in
+;; for the real namespace with it, while the same program's own (require
+;; '[clojure.core.async :as async]) resolves perfectly well; the mismatch
+;; surfaces later as "Unable to resolve symbol: async/alts!!". Every other
+;; vendored built-in (babashka.fs, babashka.process, clojure.core.rrb-vector) is
+;; simply absent from find-ns until it is required, and this joins them: the
+;; namespace appears when its overlay loads, complete.
+;;
+;; Only the two ENUMERATING/lookup entry points consult this. ns-has-vars? and
+;; chez-ns-exists? keep answering from the var table, so the loader's
+;; already-in-memory arm and the analyzer's "No such namespace" guard are
+;; unchanged and a bare clojure.core.async/chan still compiles.
+(define ns-deferred (make-hashtable string-hash string=?))
+(hashtable-set! ns-deferred "clojure.core.async" #t)
+(define (ns-deferred? nm) (hashtable-ref ns-deferred nm #f))
 ;; The lock covers only the snapshot; callers walk the returned vector outside it.
 (define (ns-registry-names)
   (jolt-with-mutex ns-registry-mu (hashtable-keys ns-registry)))
@@ -371,7 +404,7 @@
 (define (jolt-find-ns desig)
   (let ((nm (ns-desig->name desig)))
     (or (hashtable-ref ns-registry nm #f)
-        (and (ns-has-vars? nm) (intern-ns! nm))
+        (and (ns-has-vars? nm) (not (ns-deferred? nm)) (intern-ns! nm))
         jolt-nil)))
 
 (define (jolt-the-ns desig)
@@ -401,8 +434,10 @@
   (let ((seen (make-hashtable string-hash string=?)))
     (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (ns-registry-names))
     ;; the ns-cells index's keys ARE the namespaces with interned vars — the
-    ;; whole-table cell scan this replaces cost O(total vars) per all-ns call
-    (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (ns-index-names))
+    ;; whole-table cell scan this replaces cost O(total vars) per all-ns call.
+    ;; A deferred namespace is held back until its overlay interns it (above).
+    (vector-for-each (lambda (k) (unless (ns-deferred? k) (hashtable-set! seen k #t)))
+                     (ns-index-names))
     (list->cseq (map intern-ns! (vector->list (hashtable-keys seen))))))
 
 ;; ns-publics / ns-map / ns-interns: a {sym -> var-cell} jolt map built by scanning
