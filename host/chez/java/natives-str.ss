@@ -106,6 +106,10 @@
           ((and (fx>=? cp #x1C) (fx<=? cp #x1F)) #t)
           (else (char-whitespace? c)))))
 
+;; Each of these answers S ITSELF when there is nothing to cut, exactly as
+;; String.trim returns `this`. Strings are values here, so handing back the same
+;; one is indistinguishable — and the case matters, because trimming a string
+;; that needs no trimming is the common call, not the rare one.
 (define (str-trim s)
   (let ((len (string-length s)))
     (let scan-l ((i 0))
@@ -114,19 +118,41 @@
             (else (let scan-r ((j (fx- len 1)))
                     (if (char<=? (string-ref s j) #\space)
                         (scan-r (fx- j 1))
-                        (substring s i (fx+ j 1)))))))))
+                        (if (and (fx=? i 0) (fx=? j (fx- len 1)))
+                            s
+                            (substring s i (fx+ j 1))))))))))
 (define (str-triml s)
   (let ((len (string-length s)))
     (let loop ((i 0))
       (cond ((fx=? i len) "")
             ((java-whitespace? (string-ref s i)) (loop (fx+ i 1)))
+            ((fx=? i 0) s)
             (else (substring s i len))))))
 (define (str-trimr s)
-  (let loop ((j (fx- (string-length s) 1)))
-    (cond ((fx<? j 0) "")
-          ((java-whitespace? (string-ref s j)) (loop (fx- j 1)))
-          (else (substring s 0 (fx+ j 1))))))
-(define (str-trim* s) (str-trimr (str-triml s)))
+  (let ((len (string-length s)))
+    (let loop ((j (fx- len 1)))
+      (cond ((fx<? j 0) "")
+            ((java-whitespace? (string-ref s j)) (loop (fx- j 1)))
+            ((fx=? j (fx- len 1)) s)
+            (else (substring s 0 (fx+ j 1)))))))
+;; clojure.string/trim, in ONE pass with at most ONE copy.
+;;
+;; This was (str-trimr (str-triml s)): two scans, and — because str-triml's
+;; else-branch took (substring s i len) even when i was 0 — two FULL COPIES of
+;; a string that needed no trimming at all. Trimming short strings measured
+;; ~15x babashka (183 ms vs 12 ms for 100k calls) almost entirely on those
+;; copies, which is why the fix is the allocation and not the scan.
+(define (str-trim* s)
+  (let ((len (string-length s)))
+    (let scan-l ((i 0))
+      (cond ((fx=? i len) "")
+            ((java-whitespace? (string-ref s i)) (scan-l (fx+ i 1)))
+            (else (let scan-r ((j (fx- len 1)))
+                    (if (java-whitespace? (string-ref s j))
+                        (scan-r (fx- j 1))
+                        (if (and (fx=? i 0) (fx=? j (fx- len 1)))
+                            s
+                            (substring s i (fx+ j 1))))))))))
 
 ;; Java 11's strip family, over the same Character.isWhitespace as clojure.string's
 ;; trim. String.trim cuts at <= U+0020 — its notion of "space" predates Unicode —
@@ -543,16 +569,21 @@
 ;; string/ascii-* (ASCII), string/find (index or nil), core-str-* (regex|literal).
 
 ;; (string/split sep s) -> parts, splitting on each non-overlapping sep.
+;; The scan used to test each position with (string=? (substring s i (+ i plen))
+;; sep) — a fresh substring ALLOCATED per character of the input, thrown away
+;; immediately. str-index-of compares in place and skips straight to the next
+;; hit, so the walk allocates only the parts it actually returns.
 (define (str-literal-split s sep)
-  (let ((slen (string-length (jolt-need-str s))) (plen (string-length sep)))
+  (let* ((s (jolt-need-str s))
+         (slen (string-length s))
+         (plen (string-length sep)))
     (if (fx=? plen 0)
         (map string (string->list s))
-        (let loop ((i 0) (start 0) (acc '()))
-          (cond ((fx>? (fx+ i plen) slen)
-                 (reverse (cons (substring s start slen) acc)))
-                ((string=? (substring s i (fx+ i plen)) sep)
-                 (loop (fx+ i plen) (fx+ i plen) (cons (substring s start i) acc)))
-                (else (loop (fx+ i 1) start acc)))))))
+        (let loop ((start 0) (acc '()))
+          (let ((i (str-index-of s sep start)))
+            (if (fx<? i 0)
+                (reverse (cons (substring s start slen) acc))
+                (loop (fx+ i plen) (cons (substring s start i) acc))))))))
 
 ;; clojure.string/upper-case and lower-case, and String's toUpperCase /
 ;; toLowerCase, map the whole of Unicode on the JVM — Cyrillic, Greek and the
@@ -700,12 +731,99 @@
 (define (jvm-split-array irx s limit)
   (make-jolt-array (na-list->backing (jvm-split irx s limit) 'object) 'object))
 
+;; The exact text a pattern matches, when it matches exactly one string — or #f
+;; when the pattern has any regex structure at all.
+;;
+;; A great many regex splits are not really regex splits: #"\n" is the single
+;; commonest separator in line-oriented code, and it costs a full irregex search
+;; per line to find a character. Splitting 20k lines on #"\n" measured ~10x
+;; babashka (1086 ms vs 106 ms). Recognising the literal lets the same call take
+;; the non-allocating str-index-of scan the literal-separator arm already uses.
+;;
+;; This is Java regex SOURCE, so a backslash escape is either a control letter or
+;; a quoted punctuation character. Anything that can match more than one string —
+;; a metacharacter, a quantifier, a class, a group, an anchor, a predefined class
+;; like \d, an inline flag like (?i) — declines and keeps the engine. Declining
+;; is always safe; only accepting wrongly would be a bug.
+(define (regex-literal-text src)
+  (let ((n (string-length src)))
+    (and (fx>? n 0)
+         (let ((out (open-output-string)))
+           (let loop ((i 0))
+             (if (fx>=? i n)
+                 (get-output-string out)
+                 (let ((c (string-ref src i)))
+                   (cond
+                     ((memv c '(#\. #\* #\+ #\? #\[ #\] #\( #\) #\{ #\} #\| #\^ #\$)) #f)
+                     ((char=? c #\\)
+                      (and (fx<? (fx+ i 1) n)
+                           (let ((e (string-ref src (fx+ i 1))))
+                             (cond
+                               ((char=? e #\n) (write-char #\newline out) (loop (fx+ i 2)))
+                               ((char=? e #\r) (write-char #\return out) (loop (fx+ i 2)))
+                               ((char=? e #\t) (write-char #\tab out) (loop (fx+ i 2)))
+                               ((char=? e #\f) (write-char #\page out) (loop (fx+ i 2)))
+                               ;; a quoted punctuation character stands for itself;
+                               ;; a quoted LETTER or DIGIT is a class or a back
+                               ;; reference (\d \w \s \b \Q \p \1), never a literal
+                               ((and (char>? e #\space) (char<=? e #\~)
+                                     (not (char-alphabetic? e)) (not (char-numeric? e)))
+                                (write-char e out) (loop (fx+ i 2)))
+                               (else #f)))))
+                     (else (write-char c out) (loop (fx+ i 1)))))))))))
+
+;; re-split's semantics over a literal separator: interior AND trailing empty
+;; strings kept, a positive limit capping the parts with the tail left unsplit.
+;; (The clojure.string wrapper layers the trailing-empty trim on top, exactly as
+;; it does for the engine path.)
+(define (literal-split s sep limit)
+  (let* ((s (jolt-need-str s))
+         (slen (string-length s))
+         (plen (string-length sep)))
+    (let loop ((start 0) (out '()) (nout 0))
+      (if (and limit (fx>=? nout (fx- limit 1)))
+          (reverse (cons (substring s start slen) out))
+          (let ((i (str-index-of s sep start)))
+            (if (fx<? i 0)
+                (reverse (cons (substring s start slen) out))
+                (loop (fx+ i plen) (cons (substring s start i) out) (fx+ nout 1))))))))
+
+;; clojure.string/split-lines, which is (split s #"\r?\n") — the one line-shaped
+;; pattern that is NOT a literal, so the recognizer above cannot help it and it
+;; kept paying an irregex search per line (1201 ms against babashka's 234 ms).
+;; Scanning for \n and dropping a \r immediately before it is the same language:
+;; \r?\n matches \n with an optional \r in front, and nothing else — a BARE \r
+;; is not a terminator here (that is line-seq's rule, not this one).
+;; Trailing empties are dropped by the wrapper, as they are for limit 0.
+(define (str-split-lines s)
+  (let* ((s (jolt-need-str s))
+         (len (string-length s)))
+    (let loop ((start 0) (out '()))
+      (let ((i (str-char-index s #\newline start)))
+        (if (fx<? i 0)
+            (reverse (cons (substring s start len) out))
+            (let ((end (if (and (fx>? i start) (char=? (string-ref s (fx- i 1)) #\return))
+                           (fx- i 1)
+                           i)))
+              (loop (fx+ i 1) (cons (substring s start end) out))))))))
+
 ;; (str-split pat s [limit]) -> parts. Regex or literal separator; a positive
 ;; limit caps the part count (the unsplit tail kept), matching core-str-split.
 (define (str-split pat s . opt)
   (let ((limit (if (and (pair? opt) (not (jolt-nil? (car opt)))) (jolt->idx (car opt)) #f)))
     (if (jolt-regex? pat)
-        (apply jolt-vector (re-split (regex-t-irx pat) s limit))
+        (let ((src (regex-t-source pat)))
+          (apply jolt-vector
+                 (cond
+                   ;; clojure.string/split-lines is (split s #"\r?\n"), the one
+                   ;; line-shaped pattern that is not a literal, so it kept
+                   ;; paying an irregex search per line. Recognised here rather
+                   ;; than in stdlib/clojure/string.clj so the whole recognizer
+                   ;; lives in one place — and so `(split s #"\r?\n")` spelled
+                   ;; out by hand is just as fast as the named wrapper.
+                   ((and (not limit) (string=? src "\\r?\\n")) (str-split-lines s))
+                   ((regex-literal-text src) => (lambda (lit) (literal-split s lit limit)))
+                   (else (re-split (regex-t-irx pat) s limit)))))
         (let ((parts (str-literal-split s pat)))
           (apply jolt-vector
             (if (and limit (fx>? limit 0) (fx>? (length parts) limit))
@@ -769,21 +887,42 @@
                         (loop me me acc2)
                         (apply string-append (reverse (cons (substring s me len) acc2))))))))))))
 
+;; A regex that is really a literal, replaced by a string that is really a
+;; literal, is a plain search-and-replace — the same recognition split uses.
+;; (str/replace s #"abc" "xyz") ran the engine over every position and measured
+;; ~10x babashka (1661 ms vs 174 ms) where THIS function's own literal arm did
+;; the identical work in 171 ms.
+;;
+;; Answers the literal text to search for, or #f to keep the engine. It declines
+;; whenever the replacement could mean more than itself: a $-group reference or
+;; a backslash escape, both of which the engine path expands, or a FUNCTION,
+;; which has to be called with each match. Declining is always safe.
+(define (literal-replace-text pat repl)
+  (and (jolt-regex? pat)
+       (string? repl)
+       (fx<? (str-char-index repl #\$ 0) 0)
+       (fx<? (str-char-index repl #\\ 0) 0)
+       (regex-literal-text (regex-t-source pat))))
+
 ;; (str-replace-all pat repl s) / (str-replace pat repl s) — regex or literal.
 (define (str-replace-all pat repl s)
-  (if (jolt-regex? pat)
-      (re-replace (regex-t-irx pat) s repl #t)
+  (let ((lit (literal-replace-text pat repl)))
+    (cond
+      (lit (str-replace-literal s lit repl))
+      ((jolt-regex? pat) (re-replace (regex-t-irx pat) s repl #t))
       ;; literal match: a char/number match or replacement (str/replace s \a \b)
       ;; coerces to a string, as on the JVM.
-      (str-replace-literal s (str-needle pat) (str-needle repl))))
+      (else (str-replace-literal s (str-needle pat) (str-needle repl))))))
 (define (str-replace-literal-first s a b)
   (let ((alen (string-length a)) (i (str-index-of s a 0)))
     (if (fx<? i 0) s
         (string-append (substring s 0 i) b (substring s (fx+ i alen) (string-length s))))))
 (define (str-replace pat repl s)
-  (if (jolt-regex? pat)
-      (re-replace (regex-t-irx pat) s repl #f)
-      (str-replace-literal-first s (str-needle pat) (str-needle repl))))
+  (let ((lit (literal-replace-text pat repl)))
+    (cond
+      (lit (str-replace-literal-first s lit repl))
+      ((jolt-regex? pat) (re-replace (regex-t-irx pat) s repl #f))
+      (else (str-replace-literal-first s (str-needle pat) (str-needle repl))))))
 
 (def-var! "clojure.core" "str-upper" str-upper)
 (def-var! "clojure.core" "str-lower" str-lower)
@@ -796,6 +935,7 @@
 (def-var! "clojure.core" "str-reverse-b" str-reverse-b)
 (def-var! "clojure.core" "str-join" str-join)
 (def-var! "clojure.core" "str-split" str-split)
+(def-var! "clojure.core" "str-split-lines" str-split-lines)
 (def-var! "clojure.core" "str-replace" str-replace)
 (def-var! "clojure.core" "str-replace-all" str-replace-all)
 

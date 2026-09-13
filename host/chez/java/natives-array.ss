@@ -312,7 +312,16 @@
 ;; dispatchers below — io/reader (extended here) and str/slurp consume the seq.
 (define (na-char-array a . rest)
   (cond
-    ((string? a) (make-jolt-array (list->vector (string->list a)) 'char))
+    ;; straight into the backing: (list->vector (string->list a)) walked the
+    ;; string to build a cons per character and then walked the list again to
+    ;; fill the vector, so .toCharArray on a large string cost two full passes
+    ;; and a list the size of the input before the array existed.
+    ((string? a)
+     (let* ((n (string-length a)) (v (make-vector n #\nul)))
+       (let loop ((i 0))
+         (if (fx=? i n)
+             (make-jolt-array v 'char)
+             (begin (vector-set! v i (string-ref a i)) (loop (fx+ i 1)))))))
     ((number? a) (make-jolt-array (make-vector (exact (na-idx a)) #\nul) 'char))
     (else (make-jolt-array
            (list->vector (map (lambda (c) (if (char? c) c (integer->char (exact (truncate c)))))

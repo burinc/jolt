@@ -1093,6 +1093,19 @@
                     ((jolt-array? src) (apply string-append (map jolt-str-render-one (seq->list (jolt-seq src)))))
                     (else (jolt-str-render-one src)))
               0 0))))
+;; Reader.read(char[]) and Reader.read(char[], int, int) are BOTH overloads on
+;; java.io.Reader, and the one-argument form means "fill the whole array". Only
+;; the three-argument form was destructured here, so `(.read r cbuf)` — the
+;; shorter spelling, and the one a streaming loop reaches for first — died in
+;; `caddr: incorrect list structure` on every reader in this file rather than
+;; reading anything. char-reader (io-streams.ss) already defaulted correctly;
+;; this is the same defaulting, shared by the readers that did not.
+(define (reader-read-buf-args rest)
+  (let ((cbuf (car rest)))
+    (if (>= (length rest) 3)
+        (values cbuf (jnum->exact (cadr rest)) (jnum->exact (caddr rest)))
+        (values cbuf 0 (ja-len cbuf)))))
+
 (define (sr-s self) (vector-ref (jhost-state self) 0))
 (define (sr-pos self) (vector-ref (jhost-state self) 1))
 (define (sr-pos! self p) (vector-set! (jhost-state self) 1 p))
@@ -1108,7 +1121,7 @@
                            (else
                             (let ((slen (string-length s)))
                               (if (>= p slen) -1
-                                  (let ((cbuf (car rest)) (off (jnum->exact (cadr rest))) (len (jnum->exact (caddr rest))))
+                                  (let-values (((cbuf off len) (reader-read-buf-args rest)))
                                     (let ((n (min len (- slen p))))
                                       (let loop ((i 0)) (when (< i n) (ja-set! cbuf (+ off i) (string-ref s (+ p i))) (loop (+ i 1))))
                                       (sr-pos! self (+ p n)) (->num n))))))))))
@@ -1211,7 +1224,7 @@
                 (read1)
                 ;; .read(cbuf, off, len) -> read one code unit at a time into cbuf,
                 ;; return count or -1 at immediate EOF.
-                (let ((off (jnum->exact (cadr rest))) (len (jnum->exact (caddr rest))) (cbuf (car rest)))
+                (let-values (((cbuf off len) (reader-read-buf-args rest)))
                   (let loop ((i 0))
                     (if (>= i len) (->num i)
                         (let ((c (jnum->exact (read1))))
@@ -1351,12 +1364,35 @@
            (let ((p (bytes-slice-for-string (na-bytearray->bv x) rest))) (decode-bytevector (car p) (cdr p))))
           ;; (String. char[] [offset count]) — the whole array or a slice. Buffered
           ;; readers (data.json) build a string from a fill buffer this way.
+          ;; The whole array went through (list->string (ja->list x)) — a cons per
+          ;; character, then a second walk to build the string — and the slice
+          ;; went through ja-ref, which re-reads the checked record accessor and
+          ;; re-tests the backing type on every index. Both showed up as ~21x
+          ;; babashka on the chunked-read path that feeds this (an 8.7 MB
+          ;; char[] cost 457 ms against bb's 22 ms), where a decode loop builds
+          ;; a string from its fill buffer once per chunk.
+          ;;
+          ;; A char array's backing is a plain vector, so reading it once and
+          ;; proving the slice once turns both into a tight string-set! loop.
+          ;; Anything unusual — a promoted backing that is no longer a vector, a
+          ;; slice the caller got wrong — keeps the checked ja-ref path, which
+          ;; raises the JVM's own exception at the offending index.
           ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
-           (if (pair? rest)
-               (let* ((off (jnum->exact (car rest))) (cnt (jnum->exact (cadr rest))) (out (make-string cnt)))
-                 (let loop ((i 0)) (when (fx<? i cnt) (string-set! out i (ja-ref x (fx+ off i))) (loop (fx+ i 1))))
-                 out)
-               (list->string (ja->list x))))
+           (let* ((v (jolt-array-vec x))
+                  (n (ja-len x))
+                  (off (if (pair? rest) (jnum->exact (car rest)) 0))
+                  (cnt (if (pair? rest) (jnum->exact (cadr rest)) n))
+                  (out (make-string cnt)))
+             (if (and (vector? v) (fixnum? off) (fixnum? cnt)
+                      (fx>=? off 0) (fx>=? cnt 0) (fx<=? (fx+ off cnt) n))
+                 (let loop ((i 0))
+                   (if (fx=? i cnt) out
+                       (begin (string-set! out i (vector-ref v (fx+ off i)))
+                              (loop (fx+ i 1)))))
+                 (let loop ((i 0))
+                   (if (fx=? i cnt) out
+                       (begin (string-set! out i (ja-ref x (fx+ off i)))
+                              (loop (fx+ i 1))))))))
           ((string? x) x)
           (else (jolt-str-render-one x)))))
 ;; (BigInteger. s) | (BigInteger. s radix) — parse a string in the given radix

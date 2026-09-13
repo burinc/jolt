@@ -70,7 +70,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`LineNumberingPushbackReader.setLineNumber` and `.atLineStart`**, which
   `clojure.main/renumbering-read` and `repl`'s prompt logic are built on.
 
+### Performance
+
+- **Reading through the `java.io` shim and scanning strings with
+  `clojure.string` cost a fraction of what they did; the worst shape was 42x.**
+  Found profiling a real application's test suite (kmet, 2198 tests) against
+  babashka, where it ran 2.24x slower. The gap was concentrated, not broad: of
+  20.4s of total difference, 16.4s came from five namespaces, and of 117
+  namespaces 8 were already *faster* on jolt. Every regression below is a
+  constant factor on a linear operation — none of them is an algorithm.
+
+  `(read rdr)` over a stream-backed `PushbackReader` drained the reader one
+  character at a time through `record-method-dispatch`, which finds a method
+  table by hashing the jhost tag and a handler by hashing the method *name* —
+  per character — consing each onto a list to reverse and `list->string` at the
+  end. Reading one form out of each of 332 source files cost 3909ms against
+  babashka's 57ms, while the same parse from a *string* cost jolt 52ms against
+  bb's 67ms: the buffering was never the difference, the dispatch was.
+  `drain-reader` now fills in blocks, and that one change took the file-scanning
+  namespace that motivated the work from 8500ms to 872ms. Nothing about the
+  buffering changed — the old path drained the whole reader too, and
+  `host-reader-read-form` already refilled the pushback reader with the
+  unconsumed tail as a `StringReader`, so only the first drain was ever slow.
+
+  `.read(char[])` — the documented way to stream a large input without
+  materializing it — ran the same per-character loop plus a `ja-set!` per
+  character, each of which is a checked record accessor, a bounds test that
+  re-reads the backing length, and a cond over the backing type. 8.7MB cost
+  ~31ms per MB against bb's ~1ms, and the buffer size made no difference
+  because the cost was per character. It was *slower than slurping the whole
+  file*, so the memory-bounded read cost time instead of saving it; that
+  inversion is gone (1509ms against slurp's 2341ms on the same file, where bb
+  reads 166ms and slurps 909ms). `.toCharArray` built a cons per character
+  before the array existed and `(String. char[])` did the mirror image, which a
+  chunked decode loop pays once per chunk; both fill directly now.
+
+  `clojure.string/trim` was `(trimr (triml s))`, and because `triml` took
+  `(substring s i len)` even when `i` was 0, trimming a string that needed no
+  trimming allocated it **twice**. One pass, at most one copy, and `s` itself
+  when there is nothing to cut — as `String.trim` returns `this`.
+
+  A great many regex calls are not regex calls. `#"\n"` is the commonest
+  separator in line-oriented code, and running an irregex search per line to
+  find one character cost ~10x; `#"abc"` as a replace pattern cost ~10x against
+  the literal arm of the very same function. A pattern that matches exactly one
+  string is now recognized and routed to a non-allocating index scan. The
+  recognizer declines on any metacharacter, class, quantifier, group, anchor or
+  `\d`-style class, and `replace` declines further on a `$`-group reference, a
+  backslash escape or a function replacement — anything that could mean more
+  than itself keeps the engine. `split-lines` is `#"\r?\n"`, the one
+  line-shaped pattern that is *not* a literal, so it gets its own scan.
+  `str-literal-split` separately stopped testing each position with
+  `(string=? (substring s i (+ i plen)) sep)`, which allocated a substring per
+  character of input and threw it away.
+
+  Against babashka 1.12, x86_64:
+
+  | operation | before | after | babashka |
+  | --- | --- | --- | --- |
+  | `read` a form off a stream (332 files) | 3909 ms | 93 ms | 57 ms |
+  | `str/split #"\n"` (20k lines) | 1086 ms | 104 ms | 106 ms |
+  | `str/split-lines` | 1200 ms | 56 ms | 234 ms |
+  | `str/replace` with `#"abc"` | 1661 ms | 183 ms | 174 ms |
+  | `str/trim` x100k | 185 ms | 6 ms | 12 ms |
+  | `(String. char[])`, 8.7 MB | 457 ms | 184 ms | 22 ms |
+  | `.read(char[])`, 8.7 MB x20 | 5669 ms | 1509 ms | 166 ms |
+
+  End to end on the suite that motivated it, with the same three pre-existing
+  failures before and after: 35.9s → 28.6s of test time (2.24x → 1.79x of
+  babashka) and 29.6s → 17.6s of user CPU (2.64x → 1.57x), CPU being the honest
+  figure since wall time includes subprocess and network waits neither host
+  controls. `String.`-from-`char[]` and `.read(char[])` keep a residual ~9x:
+  both are the same representational issue — a char array's backing is a Scheme
+  vector, so every character crosses a string/vector boundary — and both would
+  collapse together under a string backing, which is a change of its own.
+
+  `bench/host_io.clj` and `bench/string_scan.clj` cover all of it, each with
+  control arms for the shapes that must *not* change: patterns that genuinely
+  need the engine, and the same parse with the characters already in hand.
+  `make fastpathratio` (in `make ci`) gates them as ratios against a reference
+  arm measured in the same process, which needs no absolute budget and no
+  babashka in CI — a scaling gate cannot see any of these, since they are all
+  linear with a bad constant.
+
 ### Fixed
+
+- **`(.read rdr cbuf)` — the one-argument `Reader.read(char[])` overload —
+  crashed instead of reading.** It raised `caddr: incorrect list structure` on
+  every reader in `host-static-classes.ss`: only the three-argument
+  `read(cbuf, off, len)` form was ever destructured, so the shorter spelling —
+  the one a streaming loop reaches for first, and the one that means "fill the
+  whole array" — died in argument handling. `char-reader` already defaulted
+  correctly; `string-reader` and `pushback-reader` now share that defaulting.
 
 - **`:allow-dynamic` covers a vouched def's computed `require`, so an app with
   a spec shakes again.** 0.8.7 made a `require` of a computed name a bail ref
