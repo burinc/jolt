@@ -526,6 +526,36 @@
                 (cons ldr-unchecked-cell (var-cell-root ldr-unchecked-cell)))
           thunk))))
 
+;; The loader's two compile-from-source entrances -- load-jolt-file* below and
+;; the AOT capture around it (aot-capture-load) -- each refuse BY NAME in a
+;; binary built without the compiler, before either touches a compiler binding.
+;; build.ss drop-compiler? leaves compile-eval.ss out of such a binary, so
+;; jolt-compile-eval-form and the capture parameters both entrances parameterize
+;; are unbound there, and the first one touched died as "variable
+;; jolt-aot-capture-file is not bound": a raw Chez error naming a loader
+;; internal, with nothing pointing at the cause. The one way a compiler-dropped
+;; binary reaches source is a :jolt/tree-shake {:allow-dynamic […]} vouch that
+;; was wrong -- a require, requiring-resolve or compile of a computed name the
+;; vouch said never runs in the binary, or names only what the build baked,
+;; running and naming a namespace whose source is on the roots (dce.ss
+;; dce-bail-scan); the verdict runs on every build, so the default build is as
+;; exposed as a shaken one. Image restore refuses the same way (state-image.ss
+;; image-compile-eval-seam). Probed through sa-baked-global, the seam
+;; aot-runtime-fingerprint already reads a baked global through.
+(define (ldr-need-compiler! path)
+  (unless (procedure? (sa-baked-global 'jolt-compile-eval-form))
+    (jolt-throw (jolt-ex-info
+                  (string-append
+                    "this build has no compiler; cannot load " path " from source."
+                    " The build dropped the compiler because nothing reachable"
+                    " compiles at run time, and a deps.edn :jolt/tree-shake"
+                    " {:allow-dynamic […]} entry vouched for the site that just did"
+                    " -- a require, requiring-resolve or compile of a computed name"
+                    " that never runs in the binary, or names only a namespace the"
+                    " build baked. Drop the entry that covers this site, or require"
+                    " the namespace statically so the build bakes it.")
+                  (jolt-hash-map (keyword #f "file") path)))))
+
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
 
@@ -533,6 +563,7 @@
 ;; Split out so the AOT cache (below) reads source once for both keying and the
 ;; capture load, instead of re-reading inside the loop.
 (define (load-jolt-file* path src)
+  (ldr-need-compiler! path)
   (let ((end (string-length src)))
     ;; parameterize (not a bare set!) so a require nested in this file's ns form
     ;; restores path when control returns to the rest of this file.
@@ -966,6 +997,7 @@
 ;; and reset to #f, dropping this ns's forms AFTER the require (the require's
 ;; target would cache, but the requiring ns's own defs would vanish from its .so).
 (define (aot-capture-load file src)
+  (ldr-need-compiler! file)
   (let ((cap (open-output-string)))
     (parameterize ((jolt-aot-capture cap) (jolt-aot-capture-file file))
       (load-jolt-file* file src)

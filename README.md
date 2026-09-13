@@ -469,9 +469,14 @@ the compiler image is direct-linked against the whole of `clojure.core` and
 cannot run over a pruned one, and the hint never offers a key for such a def.
 
 Vouching wrongly does not fail the build — it moves the failure into the
-binary, where the lookup sees only what the shake kept: a `resolve` of a def
-the shake dropped answers `nil` where the unshaken binary answers the var,
-silently. Name a site only when you can say why it is dead.
+binary, and into the default build as much as a `--closed-world` one, because
+the compiler verdict every build takes reads the same list: a vouched site is
+not a reason to keep the compiler. A `resolve` of a def the shake dropped
+answers `nil` where the unshaken binary answers the var, silently. A `require`
+of a computed name that runs and names a namespace the build did not bake
+fails at the call, by name: the binary has that namespace's source to compile
+and no compiler, and the loader says so, pointing at the vouch. Name a site
+only when you can say why it is dead.
 
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the

@@ -107,6 +107,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the 0.8.7 change. `run-dce-refs.ss` pins the vouched and unvouched
   loads, the verdict that agrees with each, and both hint cases. (#890)
 
+- **A wrong `:allow-dynamic` vouch is refused by name, not on a raw unbound
+  variable.** A binary whose compiler verdict dropped the compiler could still
+  reach the loader's compile-from-source path — through a vouched
+  `requiring-resolve` that runs and names a namespace the build never baked,
+  with its source on the roots, and now through a vouched computed `require`
+  the same way. It died on `variable jolt-aot-capture-file is not bound`, the
+  first compiler parameter the loader touches: a Chez error naming a loader
+  internal, with nothing pointing at the vouch. The loader's two
+  compile-from-source entrances now refuse first, naming the file and the
+  `:allow-dynamic` entry, the way an image restore already refused in a
+  compiler-less build. The default build is as exposed as a shaken one, since
+  the verdict runs on every build, and the README says so now. Fixture
+  `allow-dynamic-wrong-app` runs the vouched site and pins the refusal.
+  (jolt-n2v3)
+
 - **A form `load-string` read carried the calling file's path.** The loader
   binds the reader's file around a whole file load and `load-string` read
   under it, so a diagnostic in the string named the script with a snippet of

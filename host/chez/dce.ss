@@ -66,9 +66,10 @@
 ;; `use` and `load-libs`, and for `compile`, which recompiles unconditionally.
 ;; A built binary that did this worked in 0.8.6 because every binary carried
 ;; the compiler; with the verdict dropping it by default such a program died
-;; at the require on "variable jolt-aot-capture-file is not bound". The ref is
-;; the host entry that does the loading, jolt.host/load-namespace, which both
-;; lists carry.
+;; at the require on "variable jolt-aot-capture-file is not bound" (the loader
+;; refuses by name now, loader.ss ldr-need-compiler!, for the one way left to
+;; get there: a wrong :allow-dynamic vouch). The ref is the host entry that
+;; does the loading, jolt.host/load-namespace, which both lists carry.
 (define dce-kw-invoke (keyword #f "invoke"))
 (define dce-kw-args   (keyword #f "args"))
 (define dce-kw-quote  (keyword #f "quote"))

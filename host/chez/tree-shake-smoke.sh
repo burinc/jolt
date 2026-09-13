@@ -250,5 +250,41 @@ run_local_case allow-dynamic-partial-app app.core "" "" bail "" \
 run_local_case allow-dynamic-eval-app app.core "" "" bail "" \
   "  app.core/compute -> clojure.core/eval"
 
+# …and a WRONG vouch fails by name. allow-dynamic-wrong-app vouches for a
+# dynaload whose computed require RUNS at -main and names a namespace the build
+# never baked, with its source on the roots. The vouch lets every build drop
+# the compiler -- the DEFAULT build too, since the verdict runs on every build,
+# which is why this is the plain build and not --tree-shake -- and the loader
+# then has source to compile and no compiler. It must refuse naming the file
+# and the vouch, not die on the first unbound compiler variable it touches.
+wrong="$root/test/chez/allow-dynamic-wrong-app"
+if [ -d "$wrong" ]; then
+  wb="$tmp/allow-dynamic-wrong-plain"
+  if ! JOLT_PWD="$wrong" "$jolt" build -m app.core -o "$wb" >"$tmp/wrong-out" 2>&1; then
+    echo "  - allow-dynamic-wrong-app: FAIL (default build)"; tail -5 "$tmp/wrong-out" | sed 's/^/      /'; fail=1
+  elif ! grep -q '^jolt build: dropping compiler image' "$tmp/wrong-out"; then
+    echo "  - allow-dynamic-wrong-app: FAIL (the vouched build kept the compiler; the fixture must drop it)"; fail=1
+  else
+    wo="$(cd "$wrong" && "$wb" 2>&1)"; wrc=$?
+    if [ "$wrc" = 0 ]; then
+      echo "  - allow-dynamic-wrong-app: FAIL (a run that compiles source without a compiler exited 0)"
+      echo "$wo" | head -5 | sed 's/^/      /'; fail=1
+    elif ! echo "$wo" | grep -q 'this build has no compiler; cannot load [./]*src/plugin/core\.clj from source'; then
+      echo "  - allow-dynamic-wrong-app: FAIL (the refusal does not name the file and the missing compiler)"
+      echo "$wo" | head -8 | sed 's/^/      /'; fail=1
+    elif ! echo "$wo" | grep -q ':allow-dynamic'; then
+      echo "  - allow-dynamic-wrong-app: FAIL (the refusal does not point at the vouch)"
+      echo "$wo" | head -8 | sed 's/^/      /'; fail=1
+    elif echo "$wo" | grep -q 'is not bound'; then
+      echo "  - allow-dynamic-wrong-app: FAIL (a raw unbound-variable error reached the report)"
+      echo "$wo" | head -8 | sed 's/^/      /'; fail=1
+    else
+      echo "  - allow-dynamic-wrong-app: ok (the wrong vouch is refused by name)"
+    fi
+  fi
+else
+  echo "  - allow-dynamic-wrong-app: skipped (not present)"
+fi
+
 [ "$fail" = 0 ] && echo "shake smoke: passed" || echo "shake smoke: FAILED"
 exit $fail
