@@ -280,9 +280,14 @@
 (defn- kw-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
     (or (= s "Keyword") (= s "clojure.lang.Keyword"))))
+;; StringBuffer is the same store behind a second class name (one jhost tag over
+;; the identical state vector), so the direct-emit bodies — which call sb-append!
+;; / sb-str on that vector — are correct for it unchanged, and the legacy builder
+;; gets the same fast path rather than the slow one for being older.
 (defn- sb-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
-    (or (= s "StringBuilder") (= s "java.lang.StringBuilder"))))
+    (or (= s "StringBuilder") (= s "java.lang.StringBuilder")
+        (= s "StringBuffer") (= s "java.lang.StringBuffer"))))
 (defn- hint-of [ctx sym]
   (let [m (form-sym-meta sym)]
     (cond

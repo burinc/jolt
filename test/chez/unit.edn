@@ -1288,6 +1288,28 @@
   ;; of them must not be what the inline emission calls
   {:suite "sbdirect" :expr "(let [render-piece (fn [_] \"SHADOWED\") sb (StringBuilder.)] (.append sb \"ok\") (.toString sb))" :expected "\"ok\""}
   {:suite "sbdirect" :expr "(let [sb-append! (fn [_ _] nil) sb (StringBuilder.)] (.append sb \"ok\") (.toString sb))" :expected "\"ok\""}
+  ;; StringBuffer is the same store behind a second tag, so it takes the same
+  ;; direct-emit path from the same proof sources — and the generic path must
+  ;; stay indistinguishable from it, which the constructor-in-target-position row
+  ;; and the vector-element row below pin by reaching a builder the analyzer
+  ;; cannot prove.
+  {:suite "sbdirect" :expr "(let [sb (StringBuffer.)] (.append sb \"a\") (.append sb 1) (.append sb nil) (.append sb \\c) (.toString sb))" :expected "\"a1nullc\""}
+  {:suite "sbdirect" :expr "(let [sb (StringBuffer.)] (.toString (.append (.append sb \"a\") \"b\")))" :expected "\"ab\""}
+  {:suite "sbdirect" :expr "(let [sb (StringBuffer. \"abc\")] [(.length sb) (.isEmpty sb) (.charAt sb 1)])" :expected "[3 false \\b]"}
+  {:suite "sbdirect" :expr "((fn [^StringBuffer b] (.append b \"x\") (.toString b)) (StringBuffer. \"p-\"))" :expected "\"p-x\""}
+  {:suite "sbdirect" :expr "(.toString (.append (StringBuffer.) \"lit\"))" :expected "\"lit\""}
+  {:suite "sbdirect" :expr "(let [bs [(StringBuffer.)]] (.append (first bs) \"gen\") (.toString (first bs)))" :expected "\"gen\""}
+  ;; the two builders are distinct classes over one store: sharing the store must
+  ;; not make either answer as the other, on any of the arms that read a tag.
+  {:suite "sbdirect" :expr "[(class (StringBuffer.)) (class (StringBuilder.))]" :expected "[java.lang.StringBuffer java.lang.StringBuilder]"}
+  {:suite "sbdirect" :expr "[(instance? StringBuffer (StringBuffer.)) (instance? StringBuilder (StringBuffer.)) (instance? StringBuffer (StringBuilder.)) (instance? CharSequence (StringBuffer.))]" :expected "[true false false true]"}
+  {:suite "sbdirect" :expr "(let [b (StringBuffer. \"abc\")] [(str b) (count b) (seq b) (.contentEquals \"abc\" b)])" :expected "[\"abc\" 3 (\\a \\b \\c) true]"}
+  ;; the generic-path members, and the ctor's two edge args
+  {:suite "sbdirect" :expr "(let [sb (StringBuffer.)] (.append sb \"abcd\") (.setLength sb 2) [(.toString sb) (.substring (StringBuffer. \"abcd\") 1 3)])" :expected "[\"ab\" \"bc\"]"}
+  {:suite "sbdirect" :expr "(.toString (.append (StringBuffer. 16) \"x\"))" :expected "\"x\""}
+  {:suite "sbdirect" :expr "(StringBuffer. nil)" :expected :throws}
+  ;; a PrintWriter over a StringBuffer forwards into the shared store
+  {:suite "sbdirect" :expr "(let [b (StringBuffer.)] (binding [*out* (java.io.PrintWriter. b)] (print \"hi\")) (str b))" :expected "\"hi\""}
   {:suite "strdirect" :expr "(let [str-trim (fn [_] \"SHADOWED\")] (.trim \"  a  \"))" :expected "\"a\""}
   {:suite "type" :expr "(type 5)" :expected "java.lang.Long"}
   {:suite "type" :expr "(type 5.0)" :expected "java.lang.Double"}
