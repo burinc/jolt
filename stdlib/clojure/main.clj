@@ -16,6 +16,12 @@
 ; on demand. A triage carrying explain-data means spec produced it, so the
 ; library is loaded by the time ex-str needs it.
 ;
+; One more: the repl-read family reads CHARACTERS off *in*, which the reference
+; does through java.io.Reader interop. jolt's *in* is a clojure.core/IReader
+; (50-io.clj) rather than a JVM reader, so those reads go through rdr-read /
+; rdr-unread / rdr-read-line here, which take either kind — a library that binds
+; *in* to a LineNumberingPushbackReader shim still gets the reference behavior.
+;
 ; Two spellings the image forces: report-error names java.nio.file's classes in
 ; full (the mint reads no :import clause, and the nio classes are not default
 ; imports), and load-script resolves load-file at run time (the loader defines
@@ -108,19 +114,46 @@
   []
   (printf "%s=> " (ns-name *ns*)))
 
+;; The reference walks the input with Java interop — .read, .unread, .readLine —
+;; and only one of the two kinds of reader that reach repl-read here answers
+;; those: the host shims (clojure.lang.LineNumberingPushbackReader,
+;; java.io.StringReader) do, while *in* itself — and with-in-str's binding — is
+;; a reify over clojure.core/IReader, whose character ops are -read-char and
+;; -unread-char (50-io.clj). These three seams take either one, so the default
+;; :read hook reads whatever *in* holds. jolt-reader? is also what tells
+;; renumbering-read and repl's :need-prompt default which reader they have.
+(defn- jolt-reader?
+  [s]
+  (satisfies? IReader s))
+
+(defn- rdr-read
+  "One character as a code point, -1 at end of input — .read's contract."
+  [s]
+  (if (jolt-reader? s) (-read-char s) (.read s)))
+
+(defn- rdr-unread
+  "Pushes the character just read back, so the next read sees it again."
+  [s c]
+  (if (jolt-reader? s) (-unread-char s c) (.unread s c)))
+
+(defn- rdr-read-line
+  "The rest of the current line — the callers here read it to discard it."
+  [s]
+  (if (jolt-reader? s) (-read-line s) (.readLine s)))
+
 (defn skip-if-eol
   "If the next character on stream s is a newline, skips it, otherwise
   leaves the stream untouched. Returns :line-start, :stream-end, or :body
   to indicate the relative location of the next character on s. The stream
   must either be an instance of LineNumberingPushbackReader or duplicate
   its behavior of both supporting .unread and collapsing all of CR, LF, and
-  CRLF to a single \\newline."
+  CRLF to a single \\newline, or be a clojure.core/IReader."
   [s]
-  (let [c (.read s)]
+  (let [c (rdr-read s)]
     (cond
      (= c (int \newline)) :line-start
      (= c -1) :stream-end
-     :else (do (.unread s c) :body))))
+     :else (do (rdr-unread s c) :body))))
 
 (defn skip-whitespace
   "Skips whitespace characters on stream s. Returns :line-start, :stream-end,
@@ -130,35 +163,40 @@
   character of lookahead is available. The stream must either be an
   instance of LineNumberingPushbackReader or duplicate its behavior of both
   supporting .unread and collapsing all of CR, LF, and CRLF to a single
-  \\newline."
+  \\newline, or be a clojure.core/IReader."
   [s]
-  (loop [c (.read s)]
+  (loop [c (rdr-read s)]
     (cond
      (= c (int \newline)) :line-start
      (= c -1) :stream-end
-     (= c (int \;)) (do (.readLine s) :line-start)
-     (or (Character/isWhitespace (char c)) (= c (int \,))) (recur (.read s))
-     :else (do (.unread s c) :body))))
+     (= c (int \;)) (do (rdr-read-line s) :line-start)
+     (or (Character/isWhitespace (char c)) (= c (int \,))) (recur (rdr-read s))
+     :else (do (rdr-unread s c) :body))))
 
 (defn renumbering-read
   "Reads from reader, which must be a LineNumberingPushbackReader, while capturing
   the read string. If the read is successful, reset the line number and re-read.
   The line number on re-read is the passed line-number unless :line or
-  :clojure.core/eval-file meta are explicitly set on the read value."
+  :clojure.core/eval-file meta are explicitly set on the read value.
+
+  A clojure.core/IReader is read directly instead: the re-read is there to reset
+  a LineNumberingPushbackReader's line counter, and a jolt reader keeps none."
   {:added "1.10"}
-  ([opts ^LineNumberingPushbackReader reader line-number]
-   (let [pre-line (.getLineNumber reader)
-         [pre-read s] (read+string opts reader)
-         {:keys [clojure.core/eval-file line]} (meta pre-read)
-         re-reader (doto (LineNumberingPushbackReader. (StringReader. s))
-                     (.setLineNumber (if (and line (or eval-file (not= pre-line line))) line line-number)))]
-     (read opts re-reader))))
+  ([opts reader line-number]
+   (if (jolt-reader? reader)
+     (read opts reader)
+     (let [pre-line (.getLineNumber ^LineNumberingPushbackReader reader)
+           [pre-read s] (read+string opts reader)
+           {:keys [clojure.core/eval-file line]} (meta pre-read)
+           re-reader (doto (LineNumberingPushbackReader. (StringReader. s))
+                       (.setLineNumber (if (and line (or eval-file (not= pre-line line))) line line-number)))]
+       (read opts re-reader)))))
 
 (defn repl-read
   "Default :read hook for repl. Reads from *in* which must either be an
   instance of LineNumberingPushbackReader or duplicate its behavior of both
   supporting .unread and collapsing all of CR, LF, and CRLF into a single
-  \\newline. repl-read:
+  \\newline, or be a clojure.core/IReader — which jolt's own *in* is. repl-read:
     - skips whitespace, then
       - returns request-prompt on start of line, or
       - returns request-exit on end of stream, or
@@ -405,6 +443,8 @@ by default when a new command-line REPL is started."} repl-requires
        default: (if (instance? LineNumberingPushbackReader *in*)
                   #(.atLineStart *in*)
                   #(identity true))
+       (a clojure.core/IReader answers -at-line-start?, which is the same
+       question)
 
      - :prompt, function of no arguments, prompts for more input.
        default: repl-prompt
@@ -433,9 +473,11 @@ by default when a new command-line REPL is started."} repl-requires
   [& options]
   (let [{:keys [init need-prompt prompt flush read eval print caught]
          :or {init        #()
-              need-prompt (if (instance? LineNumberingPushbackReader *in*)
+              need-prompt (cond
+                            (jolt-reader? *in*) #(-at-line-start? *in*)
+                            (instance? LineNumberingPushbackReader *in*)
                             #(.atLineStart ^LineNumberingPushbackReader *in*)
-                            #(identity true))
+                            :else #(identity true))
               prompt      repl-prompt
               flush       flush
               read        repl-read

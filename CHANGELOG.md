@@ -403,6 +403,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both are now rejected by jolt, naming the argument and what to pass instead.
   (#973)
 
+- **A nested REPL — `(clojure.main/repl)` at a jolt prompt — threw `No matching
+  field found: read for class clojure.lang.IObj$reify__0` once per prompt,
+  forever.** `repl-read` walks its input a character at a time through
+  `.read` / `.unread` / `.readLine`, and only jolt's host reader shims answer
+  those; `*in*` itself is a `clojure.core/IReader` reify, which had ops for a
+  line and a form but none for a character. `IReader` gained `-read-char`,
+  `-unread-char` and `-at-line-start?` — off the same cursor the line and form
+  ops use, so the three interleave — and `clojure.main`'s `skip-whitespace`,
+  `skip-if-eol`, `renumbering-read` and `repl` route through them for a jolt
+  reader and through the JVM spelling for a host one. A nested REPL now reads,
+  evaluates, prompts and exits at end of input exactly as the reference does,
+  down to the prompt placement for two forms typed on one line. (#981)
+
 - **`String.indexOf` with an empty needle past the end of the string answered
   `-1` instead of the string's length.** `String.indexOf(String,int)` is
   explicit that "if `fromIndex` is greater than the length of this String, and
