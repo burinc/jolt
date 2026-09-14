@@ -308,6 +308,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dependency fetching failed on Android/Termux: every `connect()` got a NULL
+  `sockaddr`.** `jolt.mvn-http` read `struct addrinfo`'s `ai_addr` at an offset
+  chosen from `os.name` — 32 on macOS/Windows, 24 everywhere else — but bionic
+  reports `os.name` as `Linux` while laying the struct out in the BSD order
+  (`ai_canonname` at 24, `ai_addr` at 32). The read returned the NULL
+  `ai_canonname`, `connect()` failed `EFAULT` for every candidate address, and
+  nothing outside the local Maven cache could be resolved. The offset is now
+  probed off the live `getaddrinfo` result instead of guessed from the platform
+  name: the lookup never asks for `AI_CANONNAME`, so the NULL slot is
+  `ai_canonname` and the other is `ai_addr`. An inconclusive node still falls
+  back to what `os.name` implies. Exhausting the candidates also reported
+  `connection refused` whatever the kernel actually said — it now names the
+  captured error (`could not connect to repo.clojars.org:443 (errno 14: Bad
+  address)`), so a bad sockaddr does not read as a network outage. (#979)
+
 - **`String.indexOf` with an empty needle past the end of the string answered
   `-1` instead of the string's length.** `String.indexOf(String,int)` is
   explicit that "if `fromIndex` is greater than the length of this String, and
