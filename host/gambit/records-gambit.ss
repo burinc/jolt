@@ -2727,6 +2727,8 @@
 
 (define arm-priority-agent 45)
 
+(define arm-priority-bigdec 46)
+
 (define (record-method-dispatch obj method-name rest-args)
   (when (jolt-nil? obj)
     (no-method-throw

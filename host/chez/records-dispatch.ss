@@ -711,6 +711,11 @@
 ;; after this one, and the Gambit host does not include it at all. Nothing else
 ;; claims those names, so the tier is only about where the code can live.
 (define arm-priority-agent 45)      ; clojure.lang.Agent's own method surface
+;; java/bigdec.ss registers java.math.BigDecimal's instance members here. A
+;; jbigdec is a record of its own, not a jhost, so the host-type tier above does
+;; not see it and the members need a tier; the file that owns the value model
+;; owns them, and it loads long after this one.
+(define arm-priority-bigdec 46)     ; java.math.BigDecimal's instance members
 ;; A nil receiver is a NullPointerException before any arm looks: the JVM
 ;; cannot invoke anything on null. (.toString nil) used to answer "" and
 ;; (.equals nil 1) false through the universal Object arm.
