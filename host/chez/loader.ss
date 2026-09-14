@@ -1241,6 +1241,9 @@
 (define (ldr-cli-aot? name) (hashtable-ref ldr-cli-aot-ns name #f))
 
 (define (ldr-mark-loaded! name)
+  ;; the overlay has loaded, so a partly-seeded namespace is now complete and
+  ;; joins find-ns / all-ns (ns.ss ns-deferred)
+  (ns-undefer! name)
   (jolt-with-mutex ldr-tbl-mu (hashtable-set! loaded-ns name #t))
   (ldr-libs-update! (lambda (s) (pset-conj s (jolt-symbol #f name)))))
 

@@ -1057,6 +1057,13 @@ check "(do (require 'clojure.core.async) [(some? (find-ns 'clojure.core.async)) 
 # have since they were native: hiding the namespace from the ENUMERATION is the
 # whole change.
 check "(let [c (clojure.core.async/chan 1)] (clojure.core.async/>!! c 42) (clojure.core.async/<!! c))" "42"
+# ...and DESCRIBING one of those vars does not publish the namespace either.
+# (.ns v) and a var's :ns metadata both materialize the jns object for the name,
+# and printing a var goes through them -- so (pr-str (resolve 'clojure.core.async/chan))
+# used to put the three-quarters-empty namespace into all-ns, which is the exact
+# snapshot the deferral exists to prevent. Only a load / in-ns / create-ns lifts it.
+check "(do (pr-str (resolve 'clojure.core.async/chan)) (.ns (resolve 'clojure.core.async/chan)) (:ns (meta (resolve 'clojure.core.async/chan))) [(some? (find-ns 'clojure.core.async)) (boolean (some #(= 'clojure.core.async (ns-name %)) (all-ns)))])" \
+      "[false false]"
 
 # A channel transducer's ex-handler receives the ORIGINAL throwable, so ex-data
 # and ex-message survive. It used to be handed the raw raised condition, which

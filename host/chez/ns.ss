@@ -35,11 +35,7 @@
   (or (hashtable-ref ns-registry name #f)
       (jolt-with-mutex ns-registry-mu
         (or (hashtable-ref ns-registry name #f)
-            (begin
-              ;; interning is the namespace coming into its own -- an `ns` form,
-              ;; in-ns, create-ns -- so it ends any deferral (see ns-deferred?).
-              (hashtable-delete! ns-deferred name)
-              (let ((n (make-jns name))) (hashtable-set! ns-registry name n) n))))))
+            (let ((n (make-jns name))) (hashtable-set! ns-registry name n) n)))))
 
 ;; --- partly-seeded namespaces ------------------------------------------------
 ;; A namespace the RUNTIME pre-seeds with native vars while its Clojure overlay
@@ -69,6 +65,16 @@
 (define ns-deferred (make-hashtable string-hash string=?))
 (hashtable-set! ns-deferred "clojure.core.async" #t)
 (define (ns-deferred? nm) (hashtable-ref ns-deferred nm #f))
+;; What ENDS the deferral: the namespace being declared or loaded, which is
+;; ldr-mark-loaded! (loader.ss), in-ns and create-ns. Deliberately NOT
+;; intern-ns!, which only materializes the jns OBJECT for a name and is reached
+;; by things that are merely describing a var rather than declaring a namespace:
+;; (.ns #'clojure.core.async/chan) and a var's :ns metadata both go through it,
+;; and printing a var goes through THEM -- so
+;; (pr-str (resolve 'clojure.core.async/chan)) used to publish the
+;; three-quarters-empty namespace into all-ns, which is exactly the snapshot
+;; this is meant to prevent. Materializing the object is not a declaration.
+(define (ns-undefer! nm) (hashtable-delete! ns-deferred nm))
 ;; The lock covers only the snapshot; callers walk the returned vector outside it.
 (define (ns-registry-names)
   (jolt-with-mutex ns-registry-mu (hashtable-keys ns-registry)))
@@ -403,23 +409,30 @@
 
 (define (jolt-find-ns desig)
   (let ((nm (ns-desig->name desig)))
-    (or (hashtable-ref ns-registry nm #f)
-        (and (ns-has-vars? nm) (not (ns-deferred? nm)) (intern-ns! nm))
-        jolt-nil)))
+    ;; the deferral answers BEFORE the registry, not after it: a jns object for
+    ;; the name may already exist because something described one of its vars
+    ;; (see ns-undefer!), and that is not the namespace being there.
+    (if (ns-deferred? nm)
+        jolt-nil
+        (or (hashtable-ref ns-registry nm #f)
+            (and (ns-has-vars? nm) (intern-ns! nm))
+            jolt-nil))))
 
 (define (jolt-the-ns desig)
   (if (jns? desig) desig
       (let ((n (jolt-find-ns desig)))
         (if (jns? n) n (throw-jvm (quote Exception) (string-append "No namespace: " (jolt-final-str desig) " found"))))))
 
-(define (jolt-create-ns desig) (intern-ns! (ns-desig->name desig)))
+;; create-ns / in-ns DECLARE the namespace, so both end a deferral (above).
+(define (jolt-create-ns desig)
+  (let ((nm (ns-desig->name desig))) (ns-undefer! nm) (intern-ns! nm)))
 
 ;; in-ns: register + switch the current ns + re-bind *ns* + return the jns. This
 ;; updates only the RUNTIME current ns — subsequent defs in the same program were
 ;; already ns-baked by the analyzer, so it does not redirect them. It is enough
 ;; for *ns* / str-of-ns to track the switch.
 (define (jolt-in-ns desig)
-  (let* ((nm (ns-desig->name desig)) (n (intern-ns! nm)))
+  (let* ((nm (ns-desig->name desig)) (_ (ns-undefer! nm)) (n (intern-ns! nm)))
     ;; set the THREAD-LOCAL current ns; *ns* reads derive from it (dyn-binding.ss),
     ;; so this is per-thread — concurrent nREPL sessions don't clobber each other.
     (set-chez-ns! nm)
@@ -432,7 +445,8 @@
 
 (define (jolt-all-ns)
   (let ((seen (make-hashtable string-hash string=?)))
-    (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (ns-registry-names))
+    (vector-for-each (lambda (k) (unless (ns-deferred? k) (hashtable-set! seen k #t)))
+                     (ns-registry-names))
     ;; the ns-cells index's keys ARE the namespaces with interned vars — the
     ;; whole-table cell scan this replaces cost O(total vars) per all-ns call.
     ;; A deferred namespace is held back until its overlay interns it (above).
