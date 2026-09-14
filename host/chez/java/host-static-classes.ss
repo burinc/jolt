@@ -2364,6 +2364,26 @@
         ;; getModifiers: the JVM bitmask, derived from the class graph (jolt has
         ;; no bytecode to read one out of). Modifier's predicates read it.
         (cons "getModifiers" (lambda (self) (->num (jch-modifiers (jclass-name self)))))
+        ;; ---- annotations ----------------------------------------------------
+        ;; jolt models no annotations: the class graph records supertypes and
+        ;; modifiers, and nothing anywhere carries an annotation to report. So the
+        ;; whole surface answers "none" — which is a real answer, not a gap, and
+        ;; the JVM's own answer for every class that carries no annotation.
+        ;;
+        ;; It has to be answered HERE rather than left to the miss path, because a
+        ;; Class value that does not recognise a member falls through to the
+        ;; STATICS of the class it names (host-static.ss, the imported-token arm):
+        ;; (.isAnnotationPresent c FunctionalInterface) became a lookup for a
+        ;; static named isAnnotationPresent on java.lang.StringBuilder, which
+        ;; reported "No dependency provides java.lang.StringBuilder" for a class
+        ;; jolt fully supplies. SCI asks exactly this of every ^Hint it resolves —
+        ;; sci.impl.reflector/maybe-fi-method, on the way to deciding whether the
+        ;; hinted target is a functional interface to adapt — so a hinted instance
+        ;; call inside SCI could not analyze at all (jolt#983).
+        (cons "isAnnotationPresent" (lambda (self ann) #f))
+        (cons "getAnnotation" (lambda (self ann) jolt-nil))
+        (cons "getAnnotations" (lambda (self) (make-jolt-array (vector) 'objects)))
+        (cons "getDeclaredAnnotations" (lambda (self) (make-jolt-array (vector) 'objects)))
         ;; interned like every other Class token, so (identical? (.getClass String) Class)
         (cons "getClass" (lambda (self) (jolt-class-for "java.lang.Class")))))
 
