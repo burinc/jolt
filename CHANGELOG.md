@@ -95,6 +95,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build would otherwise see an unstamped program and resolve the
   redefinition again.
 
+  The rule holds across a `(load "impl")` inside a namespace too — the
+  multi-file namespace shape, `clojure.core`'s own `(load "core_deftype")` or a
+  library split over `foo.clj` and `foo_impl.clj`. The loaded file's defs claim
+  the ordinal of the form that loaded them, so a reference above the `load`
+  still belongs to `clojure.core` and one below gets the namespace's own name.
+  A build emits the enclosing file and leaves the `load` to run in the binary,
+  so that shape produced the same `ClassCastException` from the other side.
+
 - **`:allow-dynamic` covers a vouched def's computed `require`, so an app with
   a spec shakes again.** 0.8.7 made a `require` of a computed name a bail ref
   and a compile ref, and made a vouch cover a resolution only. spec.gen's

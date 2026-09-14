@@ -411,6 +411,64 @@ if [ "$got_warm" != "$want_fwd" ]; then
   echo "--- jolt run -------"; echo "$want_fwd"; exit 1
 fi
 
+# The same in-order rule across a (load) INSIDE a namespace — the multi-file
+# namespace shape (clojure.core's own (load "core_deftype"), a library split
+# over foo.clj + foo_impl.clj). The loaded file's defs land in the enclosing
+# namespace at the ordinal of the form that loaded it, so a reference ABOVE the
+# (load) still belongs to clojure.core and one below gets the ns-local name.
+# The build emits the enclosing file and leaves the (load) to run in the binary,
+# so pass 1 stamped the loaded file's defs under the loaded file alone and the
+# enclosing file's own forward references were ungated: this app built the same
+# ClassCastException shape as #451 while `jolt run` was fine. Its own fixture —
+# the shared build-app is built ~30 times here, and a top-level (load) changes
+# what every one of those emits.
+echo "build smoke: forward reference across a (load) in the same namespace"
+mfn_app="$(mktemp -d)/mfn-app"
+mkdir -p "$mfn_app/src/mf"
+printf '{:paths ["src"]}\n' > "$mfn_app/deps.edn"
+cat > "$mfn_app/src/mf/util.clj" <<'MFN_EOF'
+(ns mf.util)
+
+;; compiled BEFORE the (load) below, whose file redefines `second`
+(defn fwd-second [coll] (second coll))
+
+(load "util_extra")
+
+;; ...and after it: the ns-local redefinition and the loaded helper both win
+(defn after-load [req] [(second req) (extra-helper 4)])
+MFN_EOF
+cat > "$mfn_app/src/mf/util_extra.clj" <<'MFN_EOF'
+(in-ns 'mf.util)
+
+(defn extra-helper [n] (* n 10))
+(defn second [req] (assoc req :seen-second true))
+MFN_EOF
+cat > "$mfn_app/src/mf/core.clj" <<'MFN_EOF'
+(ns mf.core (:require [mf.util :as u]))
+(defn -main [& _]
+  (println "mfn-second:" (u/fwd-second [7 8]))
+  (println "mfn-after: " (u/after-load {:req "K"})))
+MFN_EOF
+mfn_out="$(dirname "$out")/mfn-bin"
+if ! JOLT_PWD="$mfn_app" "$jolt" build -m mf.core -o "$mfn_out" >/dev/null 2>&1; then
+  echo "  FAIL: multi-file-namespace app build exited non-zero"; exit 1
+fi
+# the binary runs the (load) itself, so the app source outlives this run
+got_mfn="$(cd / && "$mfn_out" 2>&1)"
+want_mfn="$(cd "$mfn_app" && JOLT_PWD="$mfn_app" "$joltabs" run -m mf.core 2>&1)"
+rm -rf "$(dirname "$mfn_app")"
+if [ "$got_mfn" != "$want_mfn" ]; then
+  echo "  FAIL: a (load)ed redefinition resolves differently in the binary and under jolt run"
+  echo "--- binary ----"; echo "$got_mfn"
+  echo "--- jolt run --"; echo "$want_mfn"; exit 1
+fi
+for line in 'mfn-second: 8' 'mfn-after:  [{:req K, :seen-second true} 40]'; do
+  if ! printf '%s' "$got_mfn" | grep -qF "$line"; then
+    echo "  FAIL: (load)ed redefinition — want '$line'"
+    echo "--- got ----"; echo "$got_mfn"; exit 1
+  fi
+done
+
 # A closure returned by a SPLICED callee must still travel in a state image, and
 # the built binary must agree with `jolt run` about it. Only a built binary
 # splices, and the splicer used to drop the fn's source registration -- so the
