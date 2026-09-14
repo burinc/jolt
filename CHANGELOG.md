@@ -324,6 +324,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`java.util.regex.Matcher` had no class identity.** The matcher's behavior
+  was complete — `re-matcher`, `.find`, `.find(int)`, `.matches`, `.group`,
+  `.region` over `matcher-t` — but the type had no *name*: it was absent from
+  the class graph, so `(class (re-matcher #"a" "a"))` was `:object`,
+  `(instance? java.util.regex.Matcher m)` was `false`, and
+  `(Class/forName "java.util.regex.Matcher")` threw `ClassNotFoundException`.
+  Compiled jolt code never noticed, because it resolves neither an `:import`
+  nor a type hint; SCI resolves both at analysis time, so a source that names
+  the class could not be analyzed at all. `clojure.tools.reader`'s
+  `impl/commons.clj` imports `Matcher` and hints `^Matcher` — which took the
+  whole tools.reader family (rewrite-clj's JVM-family reader, edamame, cljfmt)
+  out of reach under SCI, and with it kmet's `clojure` extension. `Matcher` and
+  the `MatchResult` interface it implements are in the class graph now, and a
+  matcher answers the name through `class`, `instance?` and protocol dispatch
+  alike. (#998)
+
+- **`java.net.URLEncoder` and `java.net.URLDecoder` had no class tokens.** Both
+  classes have been implemented since #83 and their statics work from compiled
+  code, but they were registered under their *simple* names alone, and nothing
+  registered either name in the class graph — so `Class/forName`, `:import`, a
+  type hint and `instance?` all missed two classes jolt fully supplies. An
+  interpreter that resolves the qualifier of `java.net.URLDecoder/decode` as a
+  classname before the static never reached the static: under SCI the call was
+  `Unable to resolve symbol`, although the identical call ran in compiled jolt
+  code. kmet's lsp-adapter decodes `file://` URIs that way, so the extension
+  failed to load. Both are registered under their qualified names now (which
+  mirrors to the simple ones) and carry a row in the class graph, as
+  `java.util.Base64` does. (#999)
+
 - **A type-hinted instance call inside SCI reported `No dependency provides
   java.lang.StringBuilder` for a class jolt fully supplies.** SCI resolves a
   `^Hint` to a `Class` at analysis time and then asks that `Class` whether it
