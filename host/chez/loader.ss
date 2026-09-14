@@ -615,17 +615,37 @@
               ;; and the run exited 0. A test file that lost its whole body that
               ;; way still looked like a pass. The JVM raises "Unmatched
               ;; delimiter: )" here (jolt-3amm).
-              (let loop ((i 0))
+              (let loop ((i 0) (ord 0))
                 (when (< i end)
                   (let-values (((form j) (rdr-read-top src i end)))
                     (when (> j i)
-                      (unless (rdr-eof? form)
-                        (when (getenv "JOLT_TRACE_LOAD")
-                          (display "  [load-form] " (current-error-port))
-                          (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
-                        (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
-                                                (chez-current-ns)))
-                      (loop j))))))))))))
+                      ;; ord counts every top-level form read (the ns form
+                      ;; included): it is the def-ordinal clock for the build's
+                      ;; visibility replay — rt.ss var-def-ordinals, stamped via
+                      ;; jolt-load-frames (NOT the gate: fibers share a
+                      ;; parameter cell, and the gate must stay off outside a
+                      ;; build's walks). PUSHED, not set: a file loaded from
+                      ;; inside this form — (load "impl") in a multi-file
+                      ;; namespace — defines vars that become visible to the
+                      ;; rest of THIS file at THIS ordinal, and its own frame
+                      ;; alone cannot say that. The frame carries the namespace
+                      ;; current as the form starts, so a nested REQUIRE's defs
+                      ;; (another namespace) claim no ordinal here. Bound for the
+                      ;; form's whole compile+eval (a macro expanding to defs
+                      ;; stamps at its call form's ordinal), then bumped. One
+                      ;; tail call: an eof placeholder read consumes no ordinal.
+                      (if (rdr-eof? form)
+                          (loop j ord)
+                          (begin
+                            (when (getenv "JOLT_TRACE_LOAD")
+                              (display "  [load-form] " (current-error-port))
+                              (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
+                            (parameterize ((jolt-load-frames
+                                             (cons (make-load-frame path ord (chez-current-ns))
+                                                   (jolt-load-frames))))
+                              (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
+                                                      (chez-current-ns)))
+                            (loop j (fx+ ord 1)))))))))))))))
 
 ;; --- AOT / compile cache for required namespaces ----------------------------
 ;; A disk-backed namespace is recompiled from source on EVERY run (load-jolt-file
@@ -1202,6 +1222,7 @@
          ;; embedded fasl registered but failed to load: fall back to source.
          (load-jolt-file file))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
+          (not (ldr-source-only?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
           ;; there is no key that would be safe to reuse.
@@ -1241,6 +1262,9 @@
 (define (ldr-cli-aot? name) (hashtable-ref ldr-cli-aot-ns name #f))
 
 (define (ldr-mark-loaded! name)
+  ;; the overlay has loaded, so a partly-seeded namespace is now complete and
+  ;; joins find-ns / all-ns (ns.ss ns-deferred)
+  (ns-undefer! name)
   (jolt-with-mutex ldr-tbl-mu (hashtable-set! loaded-ns name #t))
   (ldr-libs-update! (lambda (s) (pset-conj s (jolt-symbol #f name)))))
 

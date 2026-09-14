@@ -64,6 +64,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Pattern.quote` does; `UNICODE_CHARACTER_CLASS` is accepted but `\w` `\d`
   `\s` stay ASCII under it (jolt-janu, also recorded). (#961)
 
+- **`java.io.PushbackInputStream`.** `(PushbackInputStream. in)` and
+  `(PushbackInputStream. in size)` over any InputStream — jolt's own, a
+  process or socket stream, or a `proxy` — with `unread` for an int, a
+  `byte[]` or a range of one, the JVM's fixed capacity (`Push back buffer is
+  full` past it), `available` counting the pushed-back bytes, `close`
+  reaching the wrapped stream, and `markSupported` false. bencode reads a
+  byte to classify a token and puts it back before reading a netstring, which
+  is how `babashka.pods` and nrepl talk to a process; neither could load. The
+  pushed-back bytes live in the stream's own port buffer, so its `read` /
+  `readAllBytes` / `skip`, `slurp`, `io/copy`, a reader over it and
+  `read-line` through a `System/setIn` of it all see them first, and a
+  `read(byte[] …)` that finds fewer pushed-back bytes than it asked for reads
+  the wrapped stream once for the rest, as the JVM's does. (#965)
+
+- **A `proxy` over `java.io.InputStream`, `OutputStream`, `Reader` or
+  `Writer` inherits the class's concrete methods.** `(proxy
+  [java.io.InputStream] [] (read …))` extends the class on the JVM and gets
+  `readAllBytes`, `readNBytes`, `skip`, `transferTo`, `available`, `close`,
+  `mark`, `reset` and `markSupported` for free, each reaching the `read` the
+  proxy wrote; jolt generates no class, so every one of those was `No matching
+  field found`, and `slurp`, `io/reader`, `io/copy`, `spit`, `io/writer`,
+  `with-open` and a `PushbackInputStream` over such a proxy failed with it.
+  The four roots' inherited surfaces are method tables a reify's method miss
+  consults through the classes it declares and their ancestry, the method
+  running against the reify so its calls back into `read` / `write` reach the
+  override as the JVM's virtual dispatch does. An abstract method the body omits raises what the proxy
+  macro's stub raises, `UnsupportedOperationException` naming it. The
+  coercion sites treat such a value as the class it declares, and hand an
+  OutputStream `write(byte[],int,int)` where the JVM's encoders do — a proxy
+  fn stands in for every overload of a name, so one written for `(write [b])`
+  alone sees the same `ArityException` from a writer over it on both hosts.
+
 - **`clojure.core/pr-on`**, the reference's private print entry that nREPL's
   print middleware binds through `@#'clojure.core/pr-on`.
 
@@ -71,6 +103,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `clojure.main/renumbering-read` and `repl`'s prompt logic are built on.
 
 ### Fixed
+
+- **`(str baos)` is the `ByteArrayOutputStream`'s bytes as text**, as `str`
+  is `toString` on the JVM; it rendered as `#object[java.io.OutputStream]`,
+  and transit clients read a payload back with exactly that `str`.
+
+- **An `OutputStream` closed twice, or flushed after close, is a no-op, and
+  a write after close is the JVM's `IOException`.** All three raised a
+  classless `flush-output-port: not permitted on closed port` that no
+  `(catch java.io.IOException …)` could see.
+
+- **The concrete `java.io` stream classes are in the class graph.**
+  `FileInputStream`, `ByteArrayInputStream`, `PipedInputStream`,
+  `FilterInputStream`, `BufferedInputStream`, `PushbackInputStream`,
+  `FileOutputStream`, `ByteArrayOutputStream`, `PipedOutputStream`,
+  `BufferedOutputStream`, `FileReader` and `BufferedWriter` had constructors
+  but no ancestry, so `(isa? java.io.FileInputStream java.io.InputStream)`
+  was false and `(supers java.io.BufferedInputStream)` nil.
+
+- **A built binary resolves a same-namespace forward reference in file order,
+  as `jolt run` and the JVM do.** A bare symbol compiled BEFORE a
+  same-namespace redefinition of a `clojure.core` name bound to the later
+  `def` in the binary and to `clojure.core` everywhere else. http-client/ring
+  shaped helper code is exactly that: `(get env "HTTPS_PROXY")` above a
+  same-ns `(defn get [url opts] ...)`, so the compiled program called the
+  request helper on a map and died with `class java.lang.String cannot be cast
+  to class clojure.lang.Associative` while `jolt run` was fine (reported
+  against kmet on #451). The cause is the build's two passes: pass 1 loads
+  every namespace, then the emit walks re-analyze the SAME source against a
+  process that now holds the whole program, where the redefinition is already
+  in the var table. Each var's FIRST definition now carries the loader's
+  top-level form ordinal, and the emit walks consult it, so form *i* of the
+  second pass sees only what form *i* of the in-order load could see. Outside
+  those walks — the REPL, `jolt run`, the binary at runtime — the gate is off
+  and resolution is untouched, the in-order load being correct by
+  construction. Pass 1 is also held to loading from source, because a
+  namespace restored from the AOT cache defines its vars outside the reader
+  walk that stamps them: with the cache warm (its default in a built jolt,
+  which is why the report said `jolt run` "works fine once aot kicks in") the
+  build would otherwise see an unstamped program and resolve the
+  redefinition again.
+
+  The rule holds across a `(load "impl")` inside a namespace too — the
+  multi-file namespace shape, `clojure.core`'s own `(load "core_deftype")` or a
+  library split over `foo.clj` and `foo_impl.clj`. The loaded file's defs claim
+  the ordinal of the form that loaded them, so a reference above the `load`
+  still belongs to `clojure.core` and one below gets the namespace's own name.
+  A build emits the enclosing file and leaves the `load` to run in the binary,
+  so that shape produced the same `ClassCastException` from the other side.
 
 - **`:allow-dynamic` covers a vouched def's computed `require`, so an app with
   a spec shakes again.** 0.8.7 made a `require` of a computed name a bail ref
