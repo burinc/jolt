@@ -376,6 +376,41 @@ for line in 'fwd-get:   41' 'fwd-first: 7' 'fwd-late:  [{K 5, :url K, :method :g
   fi
 done
 
+# ...and the same with a WARM AOT cache, which is how a user meets this: the
+# cache is on by default in a built jolt, and the report that opened this said
+# "jolt run works fine once aot kicks in". A cached namespace loads from its
+# compiled artifact, and those defs run outside the reader walk that stamps the
+# def ordinals — so pass 1 would hand the emit walk an unstamped program, every
+# var would read as visible from form 0, and the binary would resolve the
+# ns-local redefinition again. Pass 1 loading from SOURCE is what keeps the
+# stamps (ldr-source-only? gates the cache branch, loader.ss); nothing else in
+# this gate builds an app whose cache a run has already warmed, so without this
+# case that gate could be removed and every check above would still pass.
+# Its own cache dir (under the temp dir the trap removes) so the gate neither
+# reads nor writes the user's ~/.jolt cache.
+fwd_cache="$(dirname "$out")/aot-cache"
+warm_out="$(dirname "$out")/app-warm"
+(cd "$app" && JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$fwd_cache" \
+   "$joltabs" run -m app.core --fwdref >/dev/null 2>&1)
+# ...and the run has to have actually cached something, or this case proves
+# nothing while still passing — the failure mode a warm-cache gate is most
+# likely to rot into.
+if ! ls "$fwd_cache"/*/*/app.util-*.so >/dev/null 2>&1; then
+  echo "  FAIL: the warm-cache case is vacuous — no AOT artifact for app.util under $fwd_cache"
+  exit 1
+fi
+if ! JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$fwd_cache" \
+     "$jolt" build -m app.core -o "$warm_out" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build over a warm AOT cache exited non-zero"
+  exit 1
+fi
+got_warm="$(cd / && "$warm_out" --fwdref 2>&1)"
+if [ "$got_warm" != "$want_fwd" ]; then
+  echo "  FAIL: a build over a warm AOT cache resolves forward references differently"
+  echo "--- warm binary ----"; echo "$got_warm"
+  echo "--- jolt run -------"; echo "$want_fwd"; exit 1
+fi
+
 # A closure returned by a SPLICED callee must still travel in a state image, and
 # the built binary must agree with `jolt run` about it. Only a built binary
 # splices, and the splicer used to drop the fn's source registration -- so the

@@ -305,22 +305,23 @@
               ;; def-ordinal visibility replay (rt.ss var-def-ordinals) compares
               ;; a form's analysis against the same stamps the in-order pass-1
               ;; load wrote. Set around the whole dispatch — analysis AND the
-              ;; flag-form evals — then bumped like the loader bumps it.
+              ;; flag-form evals — and, like the loader's, left BEFORE the tail
+              ;; call, so a namespace's forms do not nest one parameterize per
+              ;; form for the length of the file.
               (parameterize ((jolt-form-ordinal ord))
                 (ce-scan-requires! f ns-name)
                 (cond
-                  ((ei-ns-form? f) (loop (cdr forms) (fx+ ord 1)))
+                  ((ei-ns-form? f) #f)
                   ((ce-macro-form? f)
                    ;; macro kind hands proc (fn-form . meta-pmap-or-#f) — the
                    ;; derived :doc/:arglists ride along to the def emission.
                    (let-values (((nm fn-form mmap) (ce-defmacro->fn f)))
-                     (proc ns-name 'macro nm (cons fn-form mmap)))
-                   (loop (cdr forms) (fx+ ord 1)))
+                     (proc ns-name 'macro nm (cons fn-form mmap))))
                   (else
                    (when (ei-flag-set-form? f)
                      (jolt-compile-eval-form f ns-name))
-                   (proc ns-name 'form #f f)
-                   (loop (cdr forms) (fx+ ord 1)))))))))
+                   (proc ns-name 'form #f f))))
+              (loop (cdr forms) (fx+ ord 1))))))
       jolt-ns-load-vars-pop!)))
 
 ;; Count of forms silently dropped during a guarded emit (a source form that
