@@ -349,6 +349,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured error (`could not connect to repo.clojars.org:443 (errno 14: Bad
   address)`), so a bad sockaddr does not read as a network outage. (#979)
 
+- **`(instance? java.lang.Object v)` is true for every non-nil value, including
+  a `java.time` one, and `(.cast Object v)` is the identity.** Every
+  `java.time.*` shim value answered `false` to `(instance? java.lang.Object v)`
+  and `(.cast Object v)` threw `class java.time.ZoneId cannot be cast to class
+  java.lang.Object` (#985). The value-semantics seam `jolt.time` registers
+  through `__register-instance-check!` answers a definitive `false` for any
+  class its value's own set does not list, and the root rule — every non-nil
+  value is an `Object` — was itself just the FIRST-registered arm, hence the
+  last one asked. The root type is now decided in `instance-check` before the
+  registry runs, so no arm can answer it. Compiled code was unaffected, which is
+  what made this hard to place: SCI's `box-arg` casts every interop argument to
+  its reflected parameter type and jolt, carrying no signatures, reports every
+  parameter as `java.lang.Object` — so any interpreted call passing a
+  `java.time` value as an argument died in the cast, while the same expression
+  worked at the (compiled) REPL. Receivers are not boxed, so `(.getId zone)`
+  worked and `(.withZoneSameInstant zdt zone)` did not.
+
 - **`String.indexOf` with an empty needle past the end of the string answered
   `-1` instead of the string's length.** `String.indexOf(String,int)` is
   explicit that "if `fromIndex` is greater than the length of this String, and

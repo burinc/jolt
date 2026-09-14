@@ -32,13 +32,21 @@
   (set! instance-check-registry (cons f instance-check-registry)))
 
 ;; Object / java.lang.Object is the root of the type hierarchy: every non-nil
-;; value is an instance of Object; nil is not an instance of anything.
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (let ((tn (symbol-t-name type-sym)))
-      (if (or (string=? tn "Object") (string=? tn "java.lang.Object"))
-          (not (jolt-nil? val))
-          'pass))))
+;; value is an instance of Object; nil is not an instance of anything. This is
+;; NOT an arm — instance-check decides it BEFORE the registry, so no arm can
+;; answer the root type. An arm that models its own values (the java.time
+;; value-semantics seam registers one through __register-instance-check!)
+;; naturally answers a definitive false for any class its value's set does not
+;; list, and the root rule — registered first, hence asked LAST — never got to
+;; speak. That made (instance? Object <java.time value>) false and, through it,
+;; (.cast Object v) throw: SCI's box-arg casts every interop argument to its
+;; reflected parameter type and jolt reports every parameter as Object, so every
+;; interpreted call passing such a value died in the cast (#985).
+(define (root-object-type? ts)
+  (let ((tn (cond ((symbol-t? ts) (symbol-t-name ts))
+                  ((string? ts) ts)
+                  (else #f))))
+    (and tn (or (string=? tn "Object") (string=? tn "java.lang.Object")))))
 
 (define (instance-check-base type-sym val)
   (let ((tname (symbol-t-name type-sym)))
@@ -83,11 +91,13 @@
                          (not (char=? (string-ref type-sym 0) #\[))))
                 (jolt-symbol #f type-sym)
                 type-sym)))
-    (let loop ((rs instance-check-registry))
-      (if (null? rs)
-          (instance-check-base ts val)
-          (let ((r ((car rs) ts val)))
-            (if (eq? r 'pass) (loop (cdr rs)) r))))))
+    (if (root-object-type? ts)
+        (not (jolt-nil? val))
+        (let loop ((rs instance-check-registry))
+          (if (null? rs)
+              (instance-check-base ts val)
+              (let ((r ((car rs) ts val)))
+                (if (eq? r 'pass) (loop (cdr rs)) r)))))))
 (define (case-string tname val)
   (cond
     ((member tname '("Number" "java.lang.Number")) (number? val))

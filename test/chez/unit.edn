@@ -535,6 +535,20 @@
   {:suite "insttime" :expr "(str (Duration/ofSeconds 90))" :expected "\"PT1M30S\""}
   {:suite "insttime" :expr "(.getMonths (Period/of 1 2 3))" :expected "2"}
   {:suite "insttime" :expr "(str (Year/of 2024))" :expected "\"2024\""}
+  ;; java.lang.Object is the root of the hierarchy, and a java.time value is one
+  ;; like everything else (#985). The value-semantics seam registers an instance?
+  ;; arm that answers a definitive false for any class its value does not list;
+  ;; the root rule has to win over it, or (.cast Object v) throws — which is how
+  ;; every SCI-interpreted interop call passing a java.time value used to die
+  ;; (SCI's box-arg casts each argument to its reflected parameter type, and jolt
+  ;; reports every parameter as Object).
+  {:suite "insttime" :expr "(instance? java.lang.Object (LocalDate/of 2020 3 5))" :expected "true"}
+  {:suite "insttime" :expr "(instance? Object (Duration/ofSeconds 90))" :expected "true"}
+  {:suite "insttime" :expr "(instance? java.lang.Object (Instant/ofEpochMilli 0))" :expected "true"}
+  {:suite "insttime" :expr "(let [d (LocalDate/of 2020 3 5)] (= d (.cast Object d)))" :expected "true"}
+  {:suite "insttime" :expr "(let [d (LocalDate/of 2020 3 5)] (= d (.cast java.lang.Object d)))" :expected "true"}
+  {:suite "insttime" :expr "(instance? java.lang.Object nil)" :expected "false"}
+  {:suite "insttime" :expr "(instance? java.time.LocalTime (LocalDate/of 2020 3 5))" :expected "false"}
   ;; DateTimeFormatter, ZoneOffset/ZoneId and Locale are not core (RFC 0008): a
   ;; provider declares them with :jolt/provides (RFC 0014). With nothing providing
   ;; one, the error says a JDK class has no implementation — and deliberately does
