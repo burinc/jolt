@@ -951,9 +951,58 @@
 ;; NOT announced: the loader reads namespace SOURCE through this too, and those
 ;; are described by the cache key already. slurp-path / io/resource / io/reader —
 ;; the entry points user code reaches — announce for themselves.
+;; 64 KB, the same block the reader drain uses: a single get-string-n! the size
+;; of the whole file measures no better than chunks (the decoder has no bulk win
+;; to give), and chunking keeps one bad length from asking for an absurd string.
+(define slurp-block-size 65536)
+
+;; The text of a file, decoded through the port's own transcoder.
+;;
+;; get-string-all was the whole cost of slurp: it grows its result as it goes,
+;; so an 8.1 MB file cost 1745 ms against 1249 ms for the same decode into a
+;; buffer allocated ONCE — slurp is among the most-called IO functions in
+;; ordinary Clojure, and it was paying ~40% overhead on every call.
+;;
+;; The file's BYTE length is an exact upper bound on its character count (UTF-8
+;; never decodes more characters than it has bytes), so the result buffer can be
+;; allocated once up front. An ASCII file then needs no copy at all — the count
+;; comes back equal to the length and the buffer IS the answer; a file with
+;; multibyte characters decodes to fewer and takes one substring at the end.
+;;
+;; The DECODER IS UNCHANGED, deliberately. Reading the bytes and calling
+;; utf8->string is faster still (665 ms), but it is a different decoder: on an
+;; overlong sequence (C0 AF) the port's transcoder emits two replacement
+;; characters, as Java's CharsetDecoder does, and utf8->string emits one. Slurp
+;; is not the place to trade Java's behavior on malformed input for speed.
+(define (read-file-string-sized p n)
+  (let ((out (make-string n)))
+    (let loop ((at 0))
+      (cond
+        ((fx<? at n)
+         (let ((k (get-string-n! p out at (fxmin slurp-block-size (fx- n at)))))
+           (if (or (eof-object? k) (fx=? k 0))
+               ;; fewer characters than bytes — the file had multibyte content
+               (substring out 0 at)
+               (loop (fx+ at k)))))
+        ;; The bound was reached, which normally means done. A file being
+        ;; APPENDED to while it is read has more, and get-string-all would have
+        ;; taken it, so ask once rather than silently truncating.
+        (else
+         (let ((more (get-string-all p)))
+           (if (or (eof-object? more) (fx=? (string-length more) 0))
+               out
+               (string-append out more))))))))
+
 (define (read-file-string path)
   (with-port (open-input-file path)
-    (lambda (p) (let ((s (get-string-all p))) (if (eof-object? s) "" s)))))
+    (lambda (p)
+      ;; A port with no meaningful length — a fifo, a character device — reports
+      ;; 0 or raises; both fall back to the growing read, which is correct for
+      ;; anything whose size cannot be known in advance.
+      (let ((n (guard (e (#t #f)) (file-length p))))
+        (if (and (fixnum? n) (fx>? n 0))
+            (read-file-string-sized p n)
+            (let ((s (get-string-all p))) (if (eof-object? s) "" s)))))))
 
 ;; Drain a jhost reader (StringReader / PushbackReader): read code units from the
 ;; current position to EOF (-1) and assemble the string. Used by slurp; advances

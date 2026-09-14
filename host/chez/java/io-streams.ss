@@ -181,14 +181,29 @@
                  (let* ((buf (car rest))
                         (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
                         (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (ja-len buf)))
-                        (tmp (make-bytevector (max len 1)))
-                        (n (if (<= len 0) 0 (in-stream-read-some! self port tmp len))))
+                        (v (and (jolt-array? buf) (jolt-array-vec buf))))
                    (cond
                      ((<= len 0) (->num 0))
-                     ((eof-object? n) -1)
-                     ;; the port's bytevector straight into the array's own — one
-                     ;; block move now that a byte array IS a bytevector
-                     (else (ja-bv->bytes! tmp 0 buf off n) (->num n))))))))
+                     ;; STRAIGHT INTO THE ARRAY'S OWN BACKING. A byte array is
+                     ;; backed by a bytevector, which is exactly what the port
+                     ;; fills, so the read needs no buffer of its own: this used
+                     ;; to allocate (make-bytevector len) on EVERY call and then
+                     ;; block-copy it into the array. Under a decoded read that
+                     ;; callback runs once per block for the whole stream, so a
+                     ;; large read allocated and copied the entire input a second
+                     ;; time on its way through.
+                     ((and (bytevector? v) (fixnum? off) (fixnum? len)
+                           (fx>=? off 0) (fx<=? (fx+ off len) (bytevector-length v)))
+                      (let ((n (in-stream-read-some! self port v off len)))
+                        (if (eof-object? n) -1 (->num n))))
+                     ;; a boxed backing (a promoted array, or an older image) or
+                     ;; a range the caller got wrong keeps the buffered path,
+                     ;; where ja-bv->bytes! raises at the offending index
+                     (else
+                      (let* ((tmp (make-bytevector (max len 1)))
+                             (n (in-stream-read-some! self port tmp 0 len)))
+                        (if (eof-object? n) -1
+                            (begin (ja-bv->bytes! tmp 0 buf off n) (->num n)))))))))))
    (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
    (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-live-port self) (jnum->exact n))))
@@ -338,7 +353,10 @@
 (define (char-reader-pending-lf? self) (vector-ref (jhost-state self) 1))
 (define (char-reader-pending-lf! self v) (vector-set! (jhost-state self) 1 v))
 (define (char-reader? x) (and (jhost? x) (string=? (jhost-tag x) "char-reader")))
-(define (make-char-reader port) (make-jhost "char-reader" (vector port #f)))
+;; Slot 2 is the block-read scratch string (see char-reader-read-block!), grown
+;; on demand and reused across calls so a streaming read allocates once rather
+;; than once per call.
+(define (make-char-reader port) (make-jhost "char-reader" (vector port #f #f)))
 ;; One character, minus the \n owed by a \r that ended the last line. Chez's
 ;; get-line splits on \n ALONE, so every line of CRLF input came back with its
 ;; \r still attached and a line-oriented protocol (HTTP headers, SMTP, RESP)
@@ -366,6 +384,124 @@
           ((char=? c #\newline) (get-output-string out))
           ((char=? c #\return) (char-reader-pending-lf! self #t) (get-output-string out))
           (else (write-char c out) (loop #t)))))))
+;; 64 KB: the knee measured on this path. Below it the per-call overhead starts
+;; to show again; above it the scratch stops paying for itself.
+(define char-reader-block-size 65536)
+;; …but a drain starts here and doubles up to it, so reading a small file does
+;; not allocate a 64 KB buffer to hold 200 bytes.
+(define char-reader-scratch-initial 4096)
+(define (char-reader-scratch self want)
+  (let ((cur (vector-ref (jhost-state self) 2)))
+    (if (and (string? cur) (fx>=? (string-length cur) want))
+        cur
+        (let ((s (make-string want)))
+          (vector-set! (jhost-state self) 2 s)
+          s))))
+
+;; One character at a time, through the generic array setter — the shape every
+;; unusual call keeps: a backing that is not a plain vector, or a range the
+;; caller got wrong, where ja-set! raises the JVM's own
+;; ArrayIndexOutOfBoundsException at the offending index.
+(define (char-reader-read-elementwise! self buf off len)
+  (let loop ((i 0))
+    (if (>= i len) (->num i)
+        (let ((c (char-reader-get-char self)))
+          (if (eof-object? c)
+              (if (= i 0) -1 (->num i))
+              (begin (ja-set! buf (+ off i) c) (loop (+ i 1))))))))
+
+;; Fill a char array from the port in ONE port operation instead of one
+;; get-char per character.
+;;
+;; read(char[]) is the documented way to stream a large input without
+;; materializing it, and the per-char loop made it the SLOWEST way to read:
+;; a megabyte of input cost a million get-char calls plus a million ja-set!
+;; calls, each of which is a checked record accessor, a bounds test that
+;; re-reads the backing length, and a cond over the backing type. Measured
+;; against babashka on an 8.7 MB file, jolt spent ~31 ms per MB where bb
+;; spent ~1 ms — 30x — and buffer size made no difference, because the cost
+;; was per character and not per chunk. It was slower than slurping the whole
+;; file (2.4x), so the memory-bounded read cost time instead of saving it.
+;;
+;; A char array's backing IS a Chez string (natives-array.ss), so get-string-n!
+;; fills the caller's buffer IN PLACE: no scratch, no copy, one port operation
+;; per call. That is what char-reader-fill-string! below does, and it is the
+;; whole read now. The vector arm after it is the same block read against the
+;; older boxed backing — a char array that was promoted by a store no character
+;; can hold, or one restored from an image written before the string backing —
+;; which still has to go through a scratch and copy out of it.
+;;
+;; BLOCKING IS UNCHANGED. get-string-n! blocks until the count is available or
+;; the port hits eof, which is exactly what the per-char loop did — it ran to
+;; len or eof too. So a pipe, socket or terminal behaves as it did before; this
+;; is not the JVM's "return what is available" reader, and it never was.
+;;
+;; The pending-\r flag char-reader-line leaves behind sits ABOVE the port, so
+;; it is resolved with one ordinary get-char before the block starts. Without
+;; that, a readLine that stopped on \r followed by a read(char[]) would hand
+;; back the \n that readLine had already accounted for.
+;; The string-backed read: get-string-n! writes straight into the array's own
+;; backing, so nothing is copied and nothing is allocated per call.
+(define (char-reader-fill-string! self v off len)
+  (let* ((pending? (and (char-reader-pending-lf? self) (fx>? len 0)))
+         (first-c (and pending? (char-reader-get-char self))))
+    (if (and pending? (eof-object? first-c))
+        -1
+        (let ((base (if pending? 1 0)))
+          (when pending? (string-set! v off first-c))
+          (let ((want (fx- len base)))
+            (if (fx=? want 0)
+                (->num base)
+                (let ((got (get-string-n! (char-reader-port self) v (fx+ off base) want)))
+                  (cond
+                    ((or (eof-object? got) (fx=? got 0))
+                     (if (fx=? base 0) -1 (->num base)))
+                    ;; a short read is eof, exactly as in the scratch arm below
+                    (else (->num (fx+ base got)))))))))))
+
+(define (char-reader-read-block! self buf off len)
+  (let ((v (and (jolt-array? buf) (jolt-array-vec buf))))
+    (cond
+      ((not (and (fixnum? off) (fixnum? len) (fx>=? off 0) (fx>=? len 0)))
+       (char-reader-read-elementwise! self buf off len))
+      ((and (string? v) (fx<=? (fx+ off len) (string-length v)))
+       (char-reader-fill-string! self v off len))
+      ((not (and (vector? v) (fx<=? (fx+ off len) (vector-length v))))
+       (char-reader-read-elementwise! self buf off len))
+      (else
+        (let* ((pending? (and (char-reader-pending-lf? self) (fx>? len 0)))
+               (first-c (and pending? (char-reader-get-char self))))
+          (if (and pending? (eof-object? first-c))
+              -1
+              (let ((base (if pending? 1 0)))
+                (when pending? (vector-set! v off first-c))
+                (let ((want (fx- len base)))
+                  (if (fx=? want 0)
+                      (->num base)
+                      ;; Chunked against a REUSED scratch rather than one
+                      ;; make-string the size of the request: a 1 MB buffer
+                      ;; allocated per call cost more than the copy it fed
+                      ;; (2679 ms vs 1563 ms for the same bytes at 64 KB), so
+                      ;; a caller who sized its buffer generously paid for it.
+                      (let ((s (char-reader-scratch self (fxmin want char-reader-block-size)))
+                            (port (char-reader-port self)))
+                        (let loop ((done 0))
+                          (if (fx=? done want)
+                              (->num (fx+ base done))
+                              (let* ((n (fxmin (fx- want done) (string-length s)))
+                                     (got (get-string-n! port s 0 n)))
+                                (if (or (eof-object? got) (fx=? got 0))
+                                    (if (fx=? (fx+ base done) 0) -1 (->num (fx+ base done)))
+                                    (let ((start (fx+ (fx+ off base) done)))
+                                      (let copy ((i 0))
+                                        (if (fx=? i got)
+                                            (if (fx<? got n)
+                                                ;; short read means eof
+                                                (->num (fx+ base (fx+ done got)))
+                                                (loop (fx+ done got)))
+                                            (begin (vector-set! v (fx+ start i) (string-ref s i))
+                                                   (copy (fx+ i 1))))))))))))))))))))
+
 (register-host-methods! "char-reader"
   (list
    (cons "read"
@@ -375,12 +511,7 @@
                (let* ((buf (car rest))
                       (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
                       (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (ja-len buf))))
-                 (let loop ((i 0))
-                   (if (>= i len) (->num i)
-                       (let ((c (char-reader-get-char self)))
-                         (if (eof-object? c)
-                             (if (= i 0) -1 (->num i))
-                             (begin (ja-set! buf (+ off i) c) (loop (+ i 1)))))))))))
+                 (char-reader-read-block! self buf off len)))))
    (cons "readLine" (lambda (self) (let ((l (char-reader-line self))) (if (eof-object? l) jolt-nil l))))
    (cons "lines" (lambda (self)
                    (let loop ((acc '()))
@@ -1026,6 +1157,71 @@
 ;; leaves the wrapped stream OPEN — R6RS transcoded-port takes ownership of the
 ;; port it is given, so (io/reader System/in) used to take standard input away
 ;; from System/in, and from read-line with it, the moment it was called.
+;;
+;; THE BUFFER IS REUSED, and each byte is copied ONCE. This callback sits under
+;; every decoded read in the host — (io/reader stream), line-seq, slurp of a
+;; stream, .read(char[]) — and it used to move every byte THREE times and
+;; allocate twice per block: (na-byte-array (make-bytevector count)) built a
+;; bytevector and then COPIED it into a fresh byte array (na-byte-array copies a
+;; bytevector argument, because the caller usually keeps writing into its own),
+;; na-bytearray->bv copied the array back out to a second bytevector, and
+;; bytevector-copy! then moved it into the port's buffer. Only the last of those
+;; was the port's actual business.
+;;
+;; IT BUFFERS, and that is the whole point. A transcoded port reads from the
+;; binary port underneath it in 1024-BYTE units — measured, and not tunable:
+;; custom-port-buffer-size has no effect on it — so serving each of those
+;; requests with its own dispatch meant 7912 round trips per 8.1 MB, each one
+;; consing an argument seq, boxing two numbers, hashing the jhost tag and then
+;; hashing the method NAME. That is ~158k dispatches to read that file twenty
+;; times, and it was the single largest remaining cost in every decoded read.
+;;
+;; So one dispatch fills a 64 KB byte array and the 1024-byte requests are
+;; served out of it — 64x fewer crossings into the method layer. The bytes move
+;; once either way: ja-bytes->bv! copies from the array's backing (a bytevector)
+;; straight into the port's buffer at its offset.
+;;
+;; BLOCKING IS UNCHANGED. The refill asks for 64 KB but the stream's own read
+;; answers as soon as ANY bytes are there — that is InputStream.read(byte[],
+;; int,int)'s contract and what in-stream's get-bytevector-some! implements — so
+;; a pipe, socket or terminal still delivers as data arrives rather than waiting
+;; for a full buffer.
+;; …but it STARTS SMALL and doubles, exactly as char-reader-scratch does, and
+;; for the same reason: a buffer sized to the block rather than to the input
+;; makes every stream pay 64 KB to hold a few hundred bytes. Reading one large
+;; file cannot tell the difference, and a suite that opens many small ones
+;; regresses — that regression has already shipped here once, from the
+;; char-reader drain, and the small-file-drain arm of the fastpath ratio gate
+;; caught this one (1.01 -> 1.57) before it left the branch.
+(define stream-source-block 65536)
+(define stream-source-initial 4096)
+(define (in-stream-source-port in)
+  (let ((arr #f) (cap 0) (pos 0) (lim 0))
+    (make-custom-binary-input-port
+     "stream-source"
+     (lambda (bv start count)
+       (when (fx=? pos lim)
+         ;; grown only between refills, when the buffer holds nothing
+         (let ((want (if (fx=? cap 0)
+                         stream-source-initial
+                         (fxmin stream-source-block (fx* cap 2)))))
+           (when (fx>? want cap)
+             (set! arr (na-byte-array want))
+             (set! cap want)))
+         (let ((n (jnum->exact (record-method-dispatch in "read"
+                                 (list->cseq (list arr (->num 0) (->num cap)))))))
+           (set! pos 0)
+           (set! lim (if (and (fixnum? n) (fx>? n 0)) n 0))))
+       (if (fx=? pos lim)
+           0                                   ; the custom-port way of saying EOF
+           (let ((n (fxmin count (fx- lim pos))))
+             (ja-bytes->bv! arr pos bv start n)
+             (set! pos (fx+ pos n))
+             n)))
+     #f #f (lambda () #f))))
+;; …and one dispatch that fills a caller-supplied range, for the pushback
+;; port below, which asks the wrapped stream for exactly what its own buffer
+;; wants rather than reading ahead of it.
 (define (stream-read-into! in bv start count)
   (let* ((arr (na-byte-array (make-bytevector count)))
          (n (jnum->exact (record-method-dispatch in "read"
@@ -1033,11 +1229,6 @@
     (if (<= n 0)
         0                                   ; the custom-port way of saying EOF
         (begin (bytevector-copy! (na-bytearray->bv arr) 0 bv start n) n))))
-(define (in-stream-source-port in)
-  (make-custom-binary-input-port
-   "stream-source"
-   (lambda (bv start count) (stream-read-into! in bv start count))
-   #f #f (lambda () #f)))
 ;; the rest of a reify/proxy InputStream, through its own read
 (define (user-in-stream-bytes in)
   (let ((bv (get-bytevector-all (in-stream-source-port in))))
@@ -1218,21 +1409,84 @@
 ;; short of LEN the wrapped stream is read ONCE for the rest — so a caller that
 ;; put a header back and asks for header + body in one read gets both, as it
 ;; does on the JVM, instead of the header alone.
-(define (in-stream-read-some! self port tmp len)
+;; START, not always 0: read(byte[] …) fills the caller's array's own backing in
+;; place where it can (the byte-array arm above), so the destination offset is
+;; the caller's off and not a scratch buffer's zero.
+(define (in-stream-read-some! self port bv start len)
   (let ((pb (in-stream-pushback self)))
     (if (and pb (fx>? (pushback-pending pb port) 0))
-        (let ((n (get-bytevector-some! port tmp 0 len)))
+        (let ((n (get-bytevector-some! port bv start len)))
           (if (or (eof-object? n) (fx>=? n len))
               n
-              (let ((more (get-bytevector-some! port tmp n (fx- len n))))
+              (let ((more (get-bytevector-some! port bv (fx+ start n) (fx- len n))))
                 (if (eof-object? more) n (fx+ n more)))))
-        (get-bytevector-some! port tmp 0 len))))
+        (get-bytevector-some! port bv start len))))
 
 ;; --- integration: slurp / line-seq / with-open ------------------------------
 ;; a char-reader joins the reader-jhost set (drain-reader / line-seq read it via
 ;; its .read method).
 (let ((prev reader-jhost?))
   (set! reader-jhost? (lambda (x) (or (char-reader? x) (reader-adapter? x) (prev x)))))
+
+;; Drain a char-reader in BLOCKS.
+;;
+;; drain-reader's general arm (drain-reader-by-dispatch) asks for one character
+;; at a time through record-method-dispatch — which finds the method table by
+;; hashing the jhost's tag and the handler by hashing the method NAME, per
+;; character — and conses each one onto a list to reverse and list->string at
+;; the end. That is what every stream-backed (read rdr) paid: reading one form
+;; out of a file through PushbackReader(InputStreamReader(FileInputStream))
+;; measured ~70x slower than slurp + read-string over the same 332 files
+;; (3909 ms vs 52 ms), and jolt was FASTER than babashka on the string form.
+;;
+;; Nothing about the buffering changes: the general arm drained the whole
+;; reader too, and host-reader-read-form refills the pushback reader with the
+;; unconsumed tail as a StringReader, so every subsequent read already took the
+;; string cursor. Only the first drain was slow, and only because of how it
+;; asked for the characters.
+(define (char-reader-drain self)
+  (let ((out (open-output-string))
+        (port (char-reader-port self)))
+    ;; the pending \r that char-reader-line may have left sits ABOVE the port
+    (when (char-reader-pending-lf? self)
+      (let ((c (char-reader-get-char self)))
+        (unless (eof-object? c) (write-char c out))))
+    ;; The scratch GROWS from small rather than starting at the block size.
+    ;; Draining is what slurp and line-seq do, and most of those calls are small
+    ;; files — a config, a fixture, a source file. Forcing a 64 KB allocation on
+    ;; every one of them cost more than the per-character loop it replaced on a
+    ;; suite that reads many small files (a 900 ms group of kmet namespaces went
+    ;; to 1.8 s). Doubling on each full fill reaches the block size after a few
+    ;; iterations, so large files pay a handful of extra rounds and small ones
+    ;; allocate what they actually use.
+    (let loop ((cap char-reader-scratch-initial))
+      (let* ((s (char-reader-scratch self cap))
+             (n (get-string-n! port s 0 cap)))
+        (if (or (eof-object? n) (fx=? n 0))
+            (get-output-string out)
+            (begin
+              (put-string out s 0 n)
+              (loop (if (fx=? n cap)
+                        (fxmin (fx* cap 2) char-reader-block-size)
+                        cap))))))))
+
+;; …and route drain-reader through it, for a bare char-reader and for the
+;; PushbackReader-over-one that (read rdr) actually hands us. The pushback arm
+;; mirrors io.ss's string-reader arm exactly — pushed characters sit above the
+;; translation, so they are prepended raw and the wrapped rest is folded.
+(let ((prev drain-reader))
+  (set! drain-reader
+        (lambda (r)
+          (cond
+            ((char-reader? r) (char-reader-drain r))
+            ((and (jhost? r) (pushback-reader-tag? (jhost-tag r))
+                  (char-reader? (vector-ref (jhost-state r) 0)))
+             (let* ((st (jhost-state r))
+                    (pushed (pbr-pushed-string r))
+                    (rest (char-reader-drain (vector-ref st 0))))
+               (vector-set! st 1 '())
+               (string-append pushed (if (vector-ref st 2) (pbr-fold-and-count! st rest) rest))))
+            (else (prev r))))))
 
 ;; slurp a char-reader (drain chars) or a byte in-stream (drain bytes -> decode).
 (let ((prev jolt-slurp))

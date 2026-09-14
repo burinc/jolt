@@ -159,7 +159,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -550,6 +550,15 @@ complexity: testbin
 # whole remaining input per item until the [string offset] cursor rework.
 ioscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/io_scaling_test.clj
+
+# The constant-factor fast paths, each judged as a RATIO against a reference arm
+# the same run measures: reading a form off a stream vs off a string, the
+# memory-bounded char[] read vs slurping the file, and the literal-pattern
+# recognition that keeps split/replace off the regex engine. Deliberately not a
+# scaling gate — every regression here is linear with a terrible constant, which
+# a 1x-vs-4x ratio cannot see (see the file's header).
+fastpathratio: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/fastpath_ratio_test.clj
 
 # The 2026-08 sweep's remaining hot-path shapes in one gate: split-with-limit,
 # core.async timeout arming, ArrayDeque/StringTokenizer draining, ns-publics/

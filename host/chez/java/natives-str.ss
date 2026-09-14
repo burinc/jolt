@@ -106,6 +106,10 @@
           ((and (fx>=? cp #x1C) (fx<=? cp #x1F)) #t)
           (else (char-whitespace? c)))))
 
+;; Each of these answers S ITSELF when there is nothing to cut, exactly as
+;; String.trim returns `this`. Strings are values here, so handing back the same
+;; one is indistinguishable — and the case matters, because trimming a string
+;; that needs no trimming is the common call, not the rare one.
 (define (str-trim s)
   (let ((len (string-length s)))
     (let scan-l ((i 0))
@@ -114,19 +118,41 @@
             (else (let scan-r ((j (fx- len 1)))
                     (if (char<=? (string-ref s j) #\space)
                         (scan-r (fx- j 1))
-                        (substring s i (fx+ j 1)))))))))
+                        (if (and (fx=? i 0) (fx=? j (fx- len 1)))
+                            s
+                            (substring s i (fx+ j 1))))))))))
 (define (str-triml s)
   (let ((len (string-length s)))
     (let loop ((i 0))
       (cond ((fx=? i len) "")
             ((java-whitespace? (string-ref s i)) (loop (fx+ i 1)))
+            ((fx=? i 0) s)
             (else (substring s i len))))))
 (define (str-trimr s)
-  (let loop ((j (fx- (string-length s) 1)))
-    (cond ((fx<? j 0) "")
-          ((java-whitespace? (string-ref s j)) (loop (fx- j 1)))
-          (else (substring s 0 (fx+ j 1))))))
-(define (str-trim* s) (str-trimr (str-triml s)))
+  (let ((len (string-length s)))
+    (let loop ((j (fx- len 1)))
+      (cond ((fx<? j 0) "")
+            ((java-whitespace? (string-ref s j)) (loop (fx- j 1)))
+            ((fx=? j (fx- len 1)) s)
+            (else (substring s 0 (fx+ j 1)))))))
+;; clojure.string/trim, in ONE pass with at most ONE copy.
+;;
+;; This was (str-trimr (str-triml s)): two scans, and — because str-triml's
+;; else-branch took (substring s i len) even when i was 0 — two FULL COPIES of
+;; a string that needed no trimming at all. Trimming short strings measured
+;; ~15x babashka (183 ms vs 12 ms for 100k calls) almost entirely on those
+;; copies, which is why the fix is the allocation and not the scan.
+(define (str-trim* s)
+  (let ((len (string-length s)))
+    (let scan-l ((i 0))
+      (cond ((fx=? i len) "")
+            ((java-whitespace? (string-ref s i)) (scan-l (fx+ i 1)))
+            (else (let scan-r ((j (fx- len 1)))
+                    (if (java-whitespace? (string-ref s j))
+                        (scan-r (fx- j 1))
+                        (if (and (fx=? i 0) (fx=? j (fx- len 1)))
+                            s
+                            (substring s i (fx+ j 1))))))))))
 
 ;; Java 11's strip family, over the same Character.isWhitespace as clojure.string's
 ;; trim. String.trim cuts at <= U+0020 — its notion of "space" predates Unicode —
@@ -147,12 +173,95 @@
     (cond ((fx=? j nlen) #t)
           ((char=? (string-ref s (fx+ si j)) (string-ref needle j)) (loop (fx+ j 1)))
           (else #f))))
+;; --- Boyer-Moore-Horspool ----------------------------------------------------
+;; The scan below tests one character per position, which is already the cheap
+;; version. BMH does better by not visiting most positions at all: it compares
+;; the needle's LAST character against the haystack, and on a mismatch skips
+;; ahead by however far that haystack character sits from the end of the needle
+;; — up to the needle's whole length. On a 6.6 MB haystack and a 6-character
+;; needle that is 15.6 ms against 5.9 ms.
+;;
+;; THE SKIP TABLE IS AN FXVECTOR, and that is the whole difference between this
+;; being worth it and not. The same algorithm with an eqv hashtable measured
+;; 15.1 ms — no better than the linear scan — because a hashtable lookup per
+;; mismatch costs about what the comparisons it saves cost.
+;;
+;; ASCII NEEDLES ONLY, and the guard is load-bearing rather than a convenience.
+;; A haystack character with no entry in the table is skipped by the needle's
+;; full length, which is only sound if such a character genuinely cannot appear
+;; in the needle. A 256-entry table cannot answer for a needle holding U+65E5,
+;; and skipping the full length past one silently misses matches — a fuzz of
+;; 40k random cases over the alphabet {a b c é 日} found 174 of them before this
+;; guard went in, and none after.
+(define (str-bmh-table needle nlen)
+  (let loop ((j 0))
+    (cond
+      ((fx=? j nlen)
+       (let ((tbl (make-fxvector 256 nlen)) (lastj (fx- nlen 1)))
+         (do ((k 0 (fx+ k 1))) ((fx=? k lastj) tbl)
+           (fxvector-set! tbl (char->integer (string-ref needle k)) (fx- lastj k)))))
+      ((fx>=? (char->integer (string-ref needle j)) 256) #f)
+      (else (loop (fx+ j 1))))))
+
+;; Search with a table built by str-bmh-table.
+;;
+;; THE HAYSTACK IS NOT ASCII JUST BECAUSE THE NEEDLE IS. str-bmh-table only
+;; establishes that the NEEDLE fits the 256-entry table; the string being
+;; searched can hold anything, so a character code is range-tested before it
+;; indexes the table, and a character outside that range takes the full-length
+;; skip (it cannot be in an ASCII needle).
+;;
+;; Everything here is a CHECKED primitive. The #3% unsafe reads were written
+;; first and measured at 6.17ms against 6.50ms for the checked ones — 5%, on a
+;; loop whose speed came from the algorithm rather than the accessor. That is
+;; not worth an unsafe memory access in a path every string operation runs:
+;; the first version indexed this table with an unchecked fxvector-ref and read
+;; out of bounds on any haystack holding a non-ASCII character, which a fuzz run
+;; surfaced as "fx+: #\nul is not a fixnum". The checked version cannot do that.
+(define (str-index-of/bmh s needle from tbl)
+  (let* ((nlen (string-length needle)) (slen (string-length s))
+         (lastj (fx- nlen 1))
+         (lastc (string-ref needle lastj))
+         (last (fx- slen nlen)))
+    (let loop ((i (fxmax 0 from)))
+      (if (fx>? i last)
+          -1
+          (let ((c (string-ref s (fx+ i lastj))))
+            (if (and (char=? c lastc) (char-by-char-match? s i needle nlen))
+                i
+                (let ((ci (char->integer c)))
+                  (loop (fx+ i (if (fx<? ci 256) (fxvector-ref tbl ci) nlen))))))))))
+
+;; Worth building a table for? It is ~256 stores, so it pays for itself over a
+;; scan of any length but not over a handful of characters, and a 1-character
+;; needle has nothing to skip by.
+(define (str-bmh-worth? slen nlen) (and (fx>=? nlen 2) (fx>=? slen 512)))
+
+;; The FIRST CHARACTER is tested inline, and only a hit calls the full compare.
+;; This scan sits under indexOf, contains, split on a literal, and both literal
+;; replaces, so it runs once per character of every string those touch — and a
+;; procedure call per position is most of what it cost: scanning 6.6 MB for a
+;; needle that never matches took 47 ms through char-by-char-match? alone.
+;; Hoisting the length bound out of the loop matters for the same reason.
 (define (str-index-of s needle from)
   (let ((nlen (string-length needle)) (slen (string-length s)))
-    (let loop ((i (max 0 from)))
-      (cond ((fx>? (fx+ i nlen) slen) -1)
-            ((char-by-char-match? s i needle nlen) i)
-            (else (loop (fx+ i 1)))))))
+    (if (fx=? nlen 0)
+        ;; An empty needle matches AT from, CLAMPED to the string's length —
+        ;; String.indexOf is explicit that "if fromIndex is greater than the
+        ;; length of this String, and the target is the empty string, then the
+        ;; length of this String is returned". The old loop answered -1 there,
+        ;; which is the one place this scan disagreed with Java.
+        (fxmin (fxmax 0 from) slen)
+        (let ((tbl (and (str-bmh-worth? slen nlen) (str-bmh-table needle nlen))))
+          (if tbl
+              (str-index-of/bmh s needle from tbl)
+              (let ((c0 (string-ref needle 0))
+                    (last (fx- slen nlen)))
+                (let loop ((i (fxmax 0 from)))
+                  (cond ((fx>? i last) -1)
+                        ((and (char=? (string-ref s i) c0)
+                              (char-by-char-match? s i needle nlen)) i)
+                        (else (loop (fx+ i 1)))))))))))
 ;; single-char search with no needle allocation — (.indexOf s (int 59)) used to
 ;; build a 1-char string through number->exact->truncate->integer->char->string
 ;; per call (~160ns); honeysql's suspicious? transducer does two per entity.
@@ -170,12 +279,20 @@
              (str-index-of s (str-needle needle) from)))
         ((char? needle) (str-char-index s needle from))
         (else (str-index-of s (str-needle needle) from))))
+;; The backward twin of str-index-of, and it gets the same inline first-character
+;; test for the same reason: a procedure call at every position cost more than
+;; the comparison it was making. An empty needle answers the string's length,
+;; which is what String.lastIndexOf("") returns.
 (define (str-last-index-of s needle)
   (let ((nlen (string-length needle)) (slen (string-length s)))
-    (let loop ((i (fx- slen nlen)) (found -1))
-      (cond ((fx<? i 0) found)
-            ((char-by-char-match? s i needle nlen) i)
-            (else (loop (fx- i 1) found))))))
+    (if (fx=? nlen 0)
+        slen
+        (let ((c0 (string-ref needle 0)))
+          (let loop ((i (fx- slen nlen)))
+            (cond ((fx<? i 0) -1)
+                  ((and (char=? (string-ref s i) c0)
+                        (char-by-char-match? s i needle nlen)) i)
+                  (else (loop (fx- i 1)))))))))
 
 ;; A string argument to a String method: nil is a NullPointerException, as
 ;; String's own methods raise on null (they used to read as the empty string,
@@ -192,7 +309,7 @@
 
 ;; literal replace-all (JVM String.replace(CharSequence,CharSequence)).
 (define (str-replace-literal s a b)
-  (let ((alen (string-length a)) (slen (string-length s)))
+  (let ((alen (string-length a)) (slen (string-length s)) (blen (string-length b)))
     (if (fx=? alen 0)
         ;; JVM String.replace with an empty match inserts the replacement at
         ;; every position 0..slen: "" -> "b", "aaa" -> "bababab".
@@ -203,20 +320,46 @@
                 (begin (display b op)
                        (when (fx<? i slen) (write-char (string-ref s i) op))
                        (loop (fx+ i 1))))))
-        (let ((first-match (str-index-of s a 0)))
-          (if (fx<? first-match 0) s
-              (let ((op (open-output-string)))
-                (let loop ((i 0))
-                  (cond
-                   ((fx>? (fx+ i alen) slen)
-                    (display (substring s i slen) op)
-                    (get-output-string op))
-                   ((char-by-char-match? s i a alen)
-                    (display b op)
-                    (loop (fx+ i alen)))
-                   (else
-                    (write-char (string-ref s i) op)
-                    (loop (fx+ i 1)))))))))))
+        ;; COUNT the matches, then allocate the result once and fill it with
+        ;; block copies. The old loop advanced one CHARACTER at a time — a match
+        ;; probe and a write-char each — which is what made an 8.7 MB replace
+        ;; 5.4x babashka even after a literal pattern stopped reaching the regex
+        ;; engine. Now the walk costs one block move per PART.
+        ;;
+        ;; The pre-sized fill is worth ~2x over writing into an output string
+        ;; port, and the emit is ~74% of a replace with many matches (measured
+        ;; on 6.6 MB with 240k matches: emit through a port 64 ms, the same emit
+        ;; into a pre-sized string 34 ms, whole replace 91 ms). An earlier pass
+        ;; measured those as equal and dropped the pre-sized version; that
+        ;; measurement was taken on a Chez the project does not build with
+        ;; (a system 9.5.4 rather than the pinned 10.4.1), where the two really
+        ;; are within 1%. The result length is exact — slen + n*(blen-alen) —
+        ;; so nothing grows and nothing is copied twice.
+        ;;
+        ;; The BMH table is built ONCE and threaded through both the counting
+        ;; scan and the filling scan, rather than rebuilt per lookup.
+        (let* ((tbl (and (str-bmh-worth? slen alen) (str-bmh-table a alen)))
+               (next-at (lambda (from)
+                          (if tbl (str-index-of/bmh s a from tbl) (str-index-of s a from))))
+               (first-match (next-at 0)))
+          (if (fx<? first-match 0)
+              s                        ; nothing to replace: String.replace returns this
+              (let count ((m first-match) (n 0))
+                (if (fx>=? m 0)
+                    (count (next-at (fx+ m alen)) (fx+ n 1))
+                    (let ((out (make-string (fx+ slen (fx* n (fx- blen alen))))))
+                      (let fill ((i 0) (m first-match) (o 0))
+                        (cond
+                         ((fx<? m 0)
+                          (let ((tail (fx- slen i)))
+                            (when (fx>? tail 0) (string-copy! s i out o tail))
+                            out))
+                         (else
+                          (let ((span (fx- m i)))
+                            (when (fx>? span 0) (string-copy! s i out o span))
+                            (when (fx>? blen 0) (string-copy! b 0 out (fx+ o span) blen))
+                            (let ((nx (fx+ m alen)))
+                              (fill nx (next-at nx) (fx+ o (fx+ span blen))))))))))))))))
 
 ;; A compiled irregex for a plain-string Java-regex pattern (or a jolt-regex).
 (define (str-irx pat) (regex-t-irx (jolt-re-pattern pat)))
@@ -543,16 +686,21 @@
 ;; string/ascii-* (ASCII), string/find (index or nil), core-str-* (regex|literal).
 
 ;; (string/split sep s) -> parts, splitting on each non-overlapping sep.
+;; The scan used to test each position with (string=? (substring s i (+ i plen))
+;; sep) — a fresh substring ALLOCATED per character of the input, thrown away
+;; immediately. str-index-of compares in place and skips straight to the next
+;; hit, so the walk allocates only the parts it actually returns.
 (define (str-literal-split s sep)
-  (let ((slen (string-length (jolt-need-str s))) (plen (string-length sep)))
+  (let* ((s (jolt-need-str s))
+         (slen (string-length s))
+         (plen (string-length sep)))
     (if (fx=? plen 0)
         (map string (string->list s))
-        (let loop ((i 0) (start 0) (acc '()))
-          (cond ((fx>? (fx+ i plen) slen)
-                 (reverse (cons (substring s start slen) acc)))
-                ((string=? (substring s i (fx+ i plen)) sep)
-                 (loop (fx+ i plen) (fx+ i plen) (cons (substring s start i) acc)))
-                (else (loop (fx+ i 1) start acc)))))))
+        (let loop ((start 0) (acc '()))
+          (let ((i (str-index-of s sep start)))
+            (if (fx<? i 0)
+                (reverse (cons (substring s start slen) acc))
+                (loop (fx+ i plen) (cons (substring s start i) acc))))))))
 
 ;; clojure.string/upper-case and lower-case, and String's toUpperCase /
 ;; toLowerCase, map the whole of Unicode on the JVM — Cyrillic, Greek and the
@@ -700,12 +848,99 @@
 (define (jvm-split-array irx s limit)
   (make-jolt-array (na-list->backing (jvm-split irx s limit) 'object) 'object))
 
+;; The exact text a pattern matches, when it matches exactly one string — or #f
+;; when the pattern has any regex structure at all.
+;;
+;; A great many regex splits are not really regex splits: #"\n" is the single
+;; commonest separator in line-oriented code, and it costs a full irregex search
+;; per line to find a character. Splitting 20k lines on #"\n" measured ~10x
+;; babashka (1086 ms vs 106 ms). Recognising the literal lets the same call take
+;; the non-allocating str-index-of scan the literal-separator arm already uses.
+;;
+;; This is Java regex SOURCE, so a backslash escape is either a control letter or
+;; a quoted punctuation character. Anything that can match more than one string —
+;; a metacharacter, a quantifier, a class, a group, an anchor, a predefined class
+;; like \d, an inline flag like (?i) — declines and keeps the engine. Declining
+;; is always safe; only accepting wrongly would be a bug.
+(define (regex-literal-text src)
+  (let ((n (string-length src)))
+    (and (fx>? n 0)
+         (let ((out (open-output-string)))
+           (let loop ((i 0))
+             (if (fx>=? i n)
+                 (get-output-string out)
+                 (let ((c (string-ref src i)))
+                   (cond
+                     ((memv c '(#\. #\* #\+ #\? #\[ #\] #\( #\) #\{ #\} #\| #\^ #\$)) #f)
+                     ((char=? c #\\)
+                      (and (fx<? (fx+ i 1) n)
+                           (let ((e (string-ref src (fx+ i 1))))
+                             (cond
+                               ((char=? e #\n) (write-char #\newline out) (loop (fx+ i 2)))
+                               ((char=? e #\r) (write-char #\return out) (loop (fx+ i 2)))
+                               ((char=? e #\t) (write-char #\tab out) (loop (fx+ i 2)))
+                               ((char=? e #\f) (write-char #\page out) (loop (fx+ i 2)))
+                               ;; a quoted punctuation character stands for itself;
+                               ;; a quoted LETTER or DIGIT is a class or a back
+                               ;; reference (\d \w \s \b \Q \p \1), never a literal
+                               ((and (char>? e #\space) (char<=? e #\~)
+                                     (not (char-alphabetic? e)) (not (char-numeric? e)))
+                                (write-char e out) (loop (fx+ i 2)))
+                               (else #f)))))
+                     (else (write-char c out) (loop (fx+ i 1)))))))))))
+
+;; re-split's semantics over a literal separator: interior AND trailing empty
+;; strings kept, a positive limit capping the parts with the tail left unsplit.
+;; (The clojure.string wrapper layers the trailing-empty trim on top, exactly as
+;; it does for the engine path.)
+(define (literal-split s sep limit)
+  (let* ((s (jolt-need-str s))
+         (slen (string-length s))
+         (plen (string-length sep)))
+    (let loop ((start 0) (out '()) (nout 0))
+      (if (and limit (fx>=? nout (fx- limit 1)))
+          (reverse (cons (substring s start slen) out))
+          (let ((i (str-index-of s sep start)))
+            (if (fx<? i 0)
+                (reverse (cons (substring s start slen) out))
+                (loop (fx+ i plen) (cons (substring s start i) out) (fx+ nout 1))))))))
+
+;; clojure.string/split-lines, which is (split s #"\r?\n") — the one line-shaped
+;; pattern that is NOT a literal, so the recognizer above cannot help it and it
+;; kept paying an irregex search per line (1201 ms against babashka's 234 ms).
+;; Scanning for \n and dropping a \r immediately before it is the same language:
+;; \r?\n matches \n with an optional \r in front, and nothing else — a BARE \r
+;; is not a terminator here (that is line-seq's rule, not this one).
+;; Trailing empties are dropped by the wrapper, as they are for limit 0.
+(define (str-split-lines s)
+  (let* ((s (jolt-need-str s))
+         (len (string-length s)))
+    (let loop ((start 0) (out '()))
+      (let ((i (str-char-index s #\newline start)))
+        (if (fx<? i 0)
+            (reverse (cons (substring s start len) out))
+            (let ((end (if (and (fx>? i start) (char=? (string-ref s (fx- i 1)) #\return))
+                           (fx- i 1)
+                           i)))
+              (loop (fx+ i 1) (cons (substring s start end) out))))))))
+
 ;; (str-split pat s [limit]) -> parts. Regex or literal separator; a positive
 ;; limit caps the part count (the unsplit tail kept), matching core-str-split.
 (define (str-split pat s . opt)
   (let ((limit (if (and (pair? opt) (not (jolt-nil? (car opt)))) (jolt->idx (car opt)) #f)))
     (if (jolt-regex? pat)
-        (apply jolt-vector (re-split (regex-t-irx pat) s limit))
+        (let ((src (regex-t-source pat)))
+          (apply jolt-vector
+                 (cond
+                   ;; clojure.string/split-lines is (split s #"\r?\n"), the one
+                   ;; line-shaped pattern that is not a literal, so it kept
+                   ;; paying an irregex search per line. Recognised here rather
+                   ;; than in stdlib/clojure/string.clj so the whole recognizer
+                   ;; lives in one place — and so `(split s #"\r?\n")` spelled
+                   ;; out by hand is just as fast as the named wrapper.
+                   ((and (not limit) (string=? src "\\r?\\n")) (str-split-lines s))
+                   ((regex-literal-text src) => (lambda (lit) (literal-split s lit limit)))
+                   (else (re-split (regex-t-irx pat) s limit)))))
         (let ((parts (str-literal-split s pat)))
           (apply jolt-vector
             (if (and limit (fx>? limit 0) (fx>? (length parts) limit))
@@ -769,21 +1004,42 @@
                         (loop me me acc2)
                         (apply string-append (reverse (cons (substring s me len) acc2))))))))))))
 
+;; A regex that is really a literal, replaced by a string that is really a
+;; literal, is a plain search-and-replace — the same recognition split uses.
+;; (str/replace s #"abc" "xyz") ran the engine over every position and measured
+;; ~10x babashka (1661 ms vs 174 ms) where THIS function's own literal arm did
+;; the identical work in 171 ms.
+;;
+;; Answers the literal text to search for, or #f to keep the engine. It declines
+;; whenever the replacement could mean more than itself: a $-group reference or
+;; a backslash escape, both of which the engine path expands, or a FUNCTION,
+;; which has to be called with each match. Declining is always safe.
+(define (literal-replace-text pat repl)
+  (and (jolt-regex? pat)
+       (string? repl)
+       (fx<? (str-char-index repl #\$ 0) 0)
+       (fx<? (str-char-index repl #\\ 0) 0)
+       (regex-literal-text (regex-t-source pat))))
+
 ;; (str-replace-all pat repl s) / (str-replace pat repl s) — regex or literal.
 (define (str-replace-all pat repl s)
-  (if (jolt-regex? pat)
-      (re-replace (regex-t-irx pat) s repl #t)
+  (let ((lit (literal-replace-text pat repl)))
+    (cond
+      (lit (str-replace-literal s lit repl))
+      ((jolt-regex? pat) (re-replace (regex-t-irx pat) s repl #t))
       ;; literal match: a char/number match or replacement (str/replace s \a \b)
       ;; coerces to a string, as on the JVM.
-      (str-replace-literal s (str-needle pat) (str-needle repl))))
+      (else (str-replace-literal s (str-needle pat) (str-needle repl))))))
 (define (str-replace-literal-first s a b)
   (let ((alen (string-length a)) (i (str-index-of s a 0)))
     (if (fx<? i 0) s
         (string-append (substring s 0 i) b (substring s (fx+ i alen) (string-length s))))))
 (define (str-replace pat repl s)
-  (if (jolt-regex? pat)
-      (re-replace (regex-t-irx pat) s repl #f)
-      (str-replace-literal-first s (str-needle pat) (str-needle repl))))
+  (let ((lit (literal-replace-text pat repl)))
+    (cond
+      (lit (str-replace-literal-first s lit repl))
+      ((jolt-regex? pat) (re-replace (regex-t-irx pat) s repl #f))
+      (else (str-replace-literal-first s (str-needle pat) (str-needle repl))))))
 
 (def-var! "clojure.core" "str-upper" str-upper)
 (def-var! "clojure.core" "str-lower" str-lower)
@@ -796,6 +1052,10 @@
 (def-var! "clojure.core" "str-reverse-b" str-reverse-b)
 (def-var! "clojure.core" "str-join" str-join)
 (def-var! "clojure.core" "str-split" str-split)
+;; str-split-lines is deliberately NOT def-var!'d: it answers a Scheme list, not
+;; a jolt vector, so an overlay caller would get #object[:object]. str-split
+;; above is its one entry point, and clojure.string/split-lines reaches it by
+;; being (split s #"\r?\n") — the pattern the recognizer picks out.
 (def-var! "clojure.core" "str-replace" str-replace)
 (def-var! "clojure.core" "str-replace-all" str-replace-all)
 

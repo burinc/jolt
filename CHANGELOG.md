@@ -102,7 +102,227 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`LineNumberingPushbackReader.setLineNumber` and `.atLineStart`**, which
   `clojure.main/renumbering-read` and `repl`'s prompt logic are built on.
 
+### Performance
+
+- **Reading through the `java.io` shim and scanning strings with
+  `clojure.string` cost a fraction of what they did; the worst shape was 42x.**
+  Found profiling a real application's test suite (kmet, 2198 tests) against
+  babashka, where it ran 2.24x slower. The gap was concentrated, not broad: of
+  20.4s of total difference, 16.4s came from five namespaces, and of 117
+  namespaces 8 were already *faster* on jolt. Every regression below is a
+  constant factor on a linear operation — none of them is an algorithm.
+
+  `(read rdr)` over a stream-backed `PushbackReader` drained the reader one
+  character at a time through `record-method-dispatch`, which finds a method
+  table by hashing the jhost tag and a handler by hashing the method *name* —
+  per character — consing each onto a list to reverse and `list->string` at the
+  end. Reading one form out of each of 332 source files cost 3909ms against
+  babashka's 57ms, while the same parse from a *string* cost jolt 52ms against
+  bb's 67ms: the buffering was never the difference, the dispatch was.
+  `drain-reader` now fills in blocks, and that one change took the file-scanning
+  namespace that motivated the work from 8500ms to 872ms. Nothing about the
+  buffering changed — the old path drained the whole reader too, and
+  `host-reader-read-form` already refilled the pushback reader with the
+  unconsumed tail as a `StringReader`, so only the first drain was ever slow.
+
+  `.read(char[])` — the documented way to stream a large input without
+  materializing it — ran the same per-character loop plus a `ja-set!` per
+  character, each of which is a checked record accessor, a bounds test that
+  re-reads the backing length, and a cond over the backing type. 8.7MB cost
+  ~31ms per MB against bb's ~1ms, and the buffer size made no difference
+  because the cost was per character. It was *slower than slurping the whole
+  file*, so the memory-bounded read cost time instead of saving it; that
+  inversion is gone (1509ms against slurp's 2341ms on the same file, where bb
+  reads 166ms and slurps 909ms). `.toCharArray` built a cons per character
+  before the array existed and `(String. char[])` did the mirror image, which a
+  chunked decode loop pays once per chunk; both fill directly now.
+
+  `clojure.string/trim` was `(trimr (triml s))`, and because `triml` took
+  `(substring s i len)` even when `i` was 0, trimming a string that needed no
+  trimming allocated it **twice**. One pass, at most one copy, and `s` itself
+  when there is nothing to cut — as `String.trim` returns `this`.
+
+  A great many regex calls are not regex calls. `#"\n"` is the commonest
+  separator in line-oriented code, and running an irregex search per line to
+  find one character cost ~10x; `#"abc"` as a replace pattern cost ~10x against
+  the literal arm of the very same function. A pattern that matches exactly one
+  string is now recognized and routed to a non-allocating index scan. The
+  recognizer declines on any metacharacter, class, quantifier, group, anchor or
+  `\d`-style class, and `replace` declines further on a `$`-group reference, a
+  backslash escape or a function replacement — anything that could mean more
+  than itself keeps the engine. `split-lines` is `#"\r?\n"`, the one
+  line-shaped pattern that is *not* a literal, so it gets its own scan.
+  `str-literal-split` separately stopped testing each position with
+  `(string=? (substring s i (+ i plen)) sep)`, which allocated a substring per
+  character of input and threw it away.
+
+  Against babashka 1.12, x86_64:
+
+  | operation | before | after | babashka |
+  | --- | --- | --- | --- |
+  | `read` a form off a stream (332 files) | 3909 ms | 93 ms | 57 ms |
+  | `str/split #"\n"` (20k lines) | 1086 ms | 104 ms | 106 ms |
+  | `str/split-lines` | 1200 ms | 56 ms | 234 ms |
+  | `str/replace` with `#"abc"` | 1661 ms | 183 ms | 174 ms |
+  | `str/trim` x100k | 185 ms | 6 ms | 12 ms |
+  | `(String. char[])`, 8.7 MB | 457 ms | 184 ms | 22 ms |
+  | `.read(char[])`, 8.7 MB x20 | 5669 ms | 1509 ms | 166 ms |
+
+  End to end on the suite that motivated it, with the same three pre-existing
+  failures before and after: 35.9s → 28.6s of test time (2.24x → 1.79x of
+  babashka) and 29.6s → 17.6s of user CPU (2.64x → 1.57x), CPU being the honest
+  figure since wall time includes subprocess and network waits neither host
+  controls.
+
+  `bench/host_io.clj` and `bench/string_scan.clj` cover all of it, each with
+  control arms for the shapes that must *not* change: patterns that genuinely
+  need the engine, and the same parse with the characters already in hand.
+  `make fastpathratio` (in `make ci`) gates them as ratios against a reference
+  arm measured in the same process, which needs no absolute budget and no
+  babashka in CI — a scaling gate cannot see any of these, since they are all
+  linear with a bad constant.
+
+- **A char array is backed by a Chez string instead of a boxed vector, which
+  is most of what was left in the reading path.** `.read(char[])`,
+  `(String. char[])` and `.toCharArray` each kept a residual ~9x after the work
+  above, and all three were the same representational problem: a `char[]` held
+  its characters in a `vector`, so every character crossed a string/vector
+  boundary on the way in and again on the way out. A backing that already *is*
+  a string removes the crossing rather than optimizing it — a reader fills the
+  caller's buffer with one `get-string-n!` straight into the backing, and
+  `(String. ca)` is a `substring` of it.
+
+  The array layer was built for this: every accessor already dispatched on the
+  *backing* rather than the kind, because an `int[]` widens from an `fxvector`
+  to a boxed vector when it is handed a bignum. A char array widens the same
+  way, and needs to — a Chez string holds Unicode *scalar values*, while a JVM
+  `char` is a UTF-16 *code unit*, so a lone surrogate is a legal `char[]`
+  element that no Chez string can hold. Storing one boxes the array and it
+  behaves exactly as it did before. An integer does *not* box it: `(aset chars
+  0 65)` is the JVM's widening `int`→`char` store, and it now reads back as
+  `\A` where jolt used to answer `65` — the same value babashka gives.
+
+  **The dispatch storm under every decoded read is gone, and it was the single
+  largest cost left.** A Chez transcoded port reads from the binary port beneath
+  it in **1024-byte** units — that size is hardcoded before Chez 9.6.0, and the
+  `transcoded-port-buffer-size` parameter that replaced it sizes the *string*
+  buffer, not the binary read, so on 10.4.1 it changes nothing here (measured:
+  7912 callbacks per 8.1 MB either way). jolt served each of those requests with
+  its own `record-method-dispatch` — consing an argument seq, boxing two
+  numbers, hashing the jhost tag and then hashing the method *name* — which is
+  ~158k dispatches to read one 8.1 MB file twenty times. One dispatch now fills
+  a 64 KB byte array and the 1024-byte requests are served out of it, 64x fewer
+  crossings into the method layer. Blocking is unchanged: the refill asks for
+  64 KB but the stream's own `read` answers as soon as any bytes are there,
+  which is `InputStream.read(byte[],int,int)`'s contract, so a pipe still
+  delivers as data arrives.
+
+  Three allocation bugs on the same path went with it. That same callback moved
+  each byte **three times** and allocated twice per block — it built a
+  bytevector, copied it into a byte array, copied that back out to a second
+  bytevector, and only then filled the port's buffer; and the byte stream's own
+  `read` allocated a fresh buffer on every call. A byte array's backing already
+  *is* a bytevector, so the port reads straight into it. `(String. char[])`
+  stopped using `substring`, which is ~1.5x slower than copying the same
+  characters explicitly (850ms vs 584ms for 8.1M characters, x20) — the backing
+  is a string, so the whole-array case is exactly `string-copy` — and the
+  end-to-end move, 1345ms to 583ms, is 1.44x, which is that ratio and nothing
+  else.
+
+  `slurp` of a path used `get-string-all`, which grows its result as it goes; a
+  file's byte length bounds its character count, so the buffer is allocated
+  once (2094ms → 1245ms for the decode alone, and 1910ms → 1255ms through
+  `slurp` itself). The decoder there is
+  deliberately unchanged. Reading the bytes and calling `utf8->string` is
+  faster, but only by ~8% on Chez 10.4.1 (1153ms against 1245ms), and it emits
+  one replacement character on an overlong sequence where the port's transcoder
+  emits two, as Java's `CharsetDecoder` does — jolt's own byte-side decoder
+  already makes that mistake, which is now tracked as a correctness bug rather
+  than copied into `slurp` for 8%.
+
+  `str/replace` with a **literal** match reached parity with babashka's *regex*
+  replace in the work above, not with its literal one, and bb's literal path is
+  another ~5x faster. The literal arm advanced one character at a time — a
+  match probe and a `write-char` per character — so it now jumps with
+  `str-index-of` and emits whole spans. That exposed `str-index-of` itself,
+  which called a comparison procedure at *every* position; testing the first
+  character inline took a 7.8 MB miss from 56ms to 18ms, and that scan sits
+  under `indexOf`, `contains`, literal `split` and both literal replaces.
+  Then the scan got a real algorithm. **Boyer-Moore-Horspool** compares the
+  needle's *last* character and, on a mismatch, skips ahead by however far that
+  haystack character sits from the end of the needle, so most positions are
+  never visited. Two details decide whether it is worth anything. The skip
+  table has to be an **fxvector** — the same algorithm with an `eqv` hashtable
+  measured 15.1ms against the linear scan's 15.6ms, because a hashtable lookup
+  per mismatch costs about what the comparisons it saves cost. And it is used
+  only for **ASCII needles**, because the skip for a character with no table
+  entry is the needle's whole length, which is sound only if such a character
+  cannot be in the needle.
+
+  The emit side was the larger half all along — on 6.6 MB with 240k matches it
+  is 64ms of a 91ms replace — so the result is now counted, allocated once at
+  its exact length, and filled with block copies. An earlier pass wrote exactly
+  that, measured it at 78.0ms against the output port's 78.7ms, and dropped it
+  as complexity for 0.9%. That measurement was taken against a system Chez
+  9.5.4 rather than the 10.4.1 this project pins and builds with; on the real
+  one the pre-sized fill is 34ms against 64ms, and the conclusion reverses.
+
+  Against babashka 1.12, x86_64 — an 8.1 MB file and a 6.6 MB string, the same
+  payloads on both sides:
+
+  | operation | before | after | babashka |
+  | --- | --- | --- | --- |
+  | `.read(char[])` buf=64KB, x20 | 1405 ms | 423 ms | 152 ms |
+  | `.read(char[])` buf=1MB, x20 | 1635 ms | 478 ms | 174 ms |
+  | `slurp` a path, x20 | 1910 ms | 1255 ms | 619 ms |
+  | `(String. char[])`, x20 | 1345 ms | 583 ms | 148 ms |
+  | `.toCharArray`, 8.7 MB | 225 ms | 48 ms | 21 ms |
+  | `(char-array 1MB)`, x20 | 139 ms | 53 ms | ~0 ms |
+  | `str/replace` literal, 6.6 MB | 152 ms | 67 ms | 16 ms |
+  | `str/replace`, needle absent | 47 ms | 6 ms | 0 ms |
+  | `str/split #"\n"` | 94 ms | 64 ms | 91 ms |
+
+  What remains is representational and is *not* being chased: a Chez string is
+  UTF-32 and a JVM string is compact Latin-1 for ASCII, so producing the same
+  text costs jolt 4x the memory traffic. Draining this file through a raw Chez
+  transcoded port — no jolt in the picture at all — takes 550ms where the whole
+  of babashka's read takes 152ms, and `slurp` now sits at the measured floor for
+  decoding it (1255ms against 1245ms for the same decode into a pre-allocated
+  buffer). `(char-array n)` is 54x babashka rather than 141x for the same reason
+  in reverse — `make-string` writes every element where the JVM's `new char[n]`
+  is handed zero pages by the OS. Chez exposes no uninitialized string
+  allocation, and the one primitive that is 2x cheaper precisely because it
+  does not initialize — `make-bytevector` with no fill, 33.8ms against
+  `make-string`'s 68.3ms for the same bytes — would mean giving back exactly
+  the string backing that made the reads fast. A hand-rolled ASCII decode was
+  tried too, and is 2.4x *slower* than Chez's own. All of these are measured against the Chez
+  jolt actually builds with (10.4.1, provisioned by the Makefile), not a system
+  package that happens to be on `PATH`.
+
+  `test/chez/array-backing-test.ss` pins the representation (71 checks, up from
+  50) including both ways a char array legitimately boxes, and four new arms in
+  `make fastpathratio` gate the rest. Each was negative-tested against the
+  pre-change binary, where all four fail: `chars-copy` 0.59 → 3.41,
+  `string-from-chars` 1.00 → 2.17, `char-alloc` 0.50 → 1.01, `substring-scan`
+  0.80 → 2.43.
+
 ### Fixed
+
+- **`String.indexOf` with an empty needle past the end of the string answered
+  `-1` instead of the string's length.** `String.indexOf(String,int)` is
+  explicit that "if `fromIndex` is greater than the length of this String, and
+  the target is the empty string, then the length of this String is returned";
+  jolt's scan fell out of its bounds test and answered `-1`. Found while
+  checking the rewritten scan against babashka, which returns `5` for
+  `(.indexOf "hello" "" 99)`.
+
+- **`(.read rdr cbuf)` — the one-argument `Reader.read(char[])` overload —
+  crashed instead of reading.** It raised `caddr: incorrect list structure` on
+  every reader in `host-static-classes.ss`: only the three-argument
+  `read(cbuf, off, len)` form was ever destructured, so the shorter spelling —
+  the one a streaming loop reaches for first, and the one that means "fill the
+  whole array" — died in argument handling. `char-reader` already defaulted
+  correctly; `string-reader` and `pushback-reader` now share that defaulting.
 
 - **`(str baos)` is the `ByteArrayOutputStream`'s bytes as text**, as `str`
   is `toString` on the JVM; it rendered as `#object[java.io.OutputStream]`,
