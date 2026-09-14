@@ -93,4 +93,36 @@
             (catch Throwable e
               (if (re-find #"noSuchMethod" (ex-message e)) :threw :wrong-message)))))
 
+
+;; Type-hinted interop. SCI resolves a ^Hint to a Class at ANALYSIS time and
+;; asks that Class whether it is a functional interface to adapt
+;; (sci.impl.analyzer/resolve-tag-class -> reflector/maybe-fi-method ->
+;; .isAnnotationPresent). jolt answered that question by looking for a STATIC of
+;; the hinted class, so a hinted instance call could not be analyzed at all — it
+;; died with RFC 0014's "No dependency provides java.lang.StringBuilder" for a
+;; class jolt fully supplies, and an extension carrying one ^StringBuilder loop
+;; would not load (jolt#983). The unhinted call worked, which is what made it
+;; look like a missing class rather than a missing Class method.
+(defn- hinted-ctx []
+  (let [ctx (sci/init {:classes {:allow :all}})]
+    (sci/add-class! ctx 'java.lang.StringBuilder java.lang.StringBuilder)
+    (sci/add-class! ctx 'StringBuilder java.lang.StringBuilder)
+    ctx))
+
+(check= "hinted instance method" "x"
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [^StringBuilder sb] (.append sb \"x\")) (str (f (StringBuilder.)))"))
+(check= "hinted zero-arg instance method" 3
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [^StringBuilder sb] (.length sb)) (f (StringBuilder. \"abc\"))"))
+(check= "fully-qualified hint" "y"
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [^java.lang.StringBuilder sb] (.append sb \"y\")) (str (f (StringBuilder.)))"))
+(check= "hinted loop binding" "012"
+        (sci/eval-string* (hinted-ctx)
+          "(loop [i 0 ^StringBuilder sb (StringBuilder.)] (if (< i 3) (recur (inc i) (.append sb i)) (str sb)))"))
+(check= "unhinted call still dispatches dynamically" "x"
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [sb] (.append sb \"x\")) (str (f (StringBuilder.)))"))
+
 (println "SCI-FUNCTIONAL-TEST OK")
