@@ -216,9 +216,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which called a comparison procedure at *every* position; testing the first
   character inline took a 7.8 MB miss from 56ms to 18ms, and that scan sits
   under `indexOf`, `contains`, literal `split` and both literal replaces.
-  (Counting the matches first and filling a pre-sized result was written and
-  measured too, and dropped: 78.0ms against 78.7ms — the output port's growth
-  is not the cost, moving the characters is.)
+  Then the scan got a real algorithm. **Boyer-Moore-Horspool** compares the
+  needle's *last* character and, on a mismatch, skips ahead by however far that
+  haystack character sits from the end of the needle, so most positions are
+  never visited. Two details decide whether it is worth anything. The skip
+  table has to be an **fxvector** — the same algorithm with an `eqv` hashtable
+  measured 15.1ms against the linear scan's 15.6ms, because a hashtable lookup
+  per mismatch costs about what the comparisons it saves cost. And it is used
+  only for **ASCII needles**, because the skip for a character with no table
+  entry is the needle's whole length, which is sound only if such a character
+  cannot be in the needle.
+
+  The emit side was the larger half all along — on 6.6 MB with 240k matches it
+  is 64ms of a 91ms replace — so the result is now counted, allocated once at
+  its exact length, and filled with block copies. An earlier pass wrote exactly
+  that, measured it at 78.0ms against the output port's 78.7ms, and dropped it
+  as complexity for 0.9%. That measurement was taken against a system Chez
+  9.5.4 rather than the 10.4.1 this project pins and builds with; on the real
+  one the pre-sized fill is 34ms against 64ms, and the conclusion reverses.
 
   Against babashka 1.12, x86_64 — an 8.1 MB file and a 6.6 MB string, the same
   payloads on both sides:
@@ -231,9 +246,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `(String. char[])`, x20 | 1345 ms | 583 ms | 148 ms |
   | `.toCharArray`, 8.7 MB | 225 ms | 48 ms | 21 ms |
   | `(char-array 1MB)`, x20 | 139 ms | 53 ms | ~0 ms |
-  | `str/replace` literal, 6.6 MB | 147 ms | 91 ms | 16 ms |
-  | `str/replace`, needle absent | 48 ms | 15 ms | 0 ms |
-  | `str/split #"\n"` | 94 ms | 62 ms | 92 ms |
+  | `str/replace` literal, 6.6 MB | 152 ms | 67 ms | 16 ms |
+  | `str/replace`, needle absent | 47 ms | 6 ms | 0 ms |
+  | `str/split #"\n"` | 94 ms | 64 ms | 91 ms |
 
   What remains is representational and is *not* being chased: a Chez string is
   UTF-32 and a JVM string is compact Latin-1 for ASCII, so producing the same
@@ -243,8 +258,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoding it (1255ms against 1245ms for the same decode into a pre-allocated
   buffer). `(char-array n)` is 54x babashka rather than 141x for the same reason
   in reverse — `make-string` writes every element where the JVM's `new char[n]`
-  is handed zero pages by the OS — and a hand-rolled ASCII decode was tried and
-  is 2.4x *slower* than Chez's own. All of these are measured against the Chez
+  is handed zero pages by the OS. Chez exposes no uninitialized string
+  allocation, and the one primitive that is 2x cheaper precisely because it
+  does not initialize — `make-bytevector` with no fill, 33.8ms against
+  `make-string`'s 68.3ms for the same bytes — would mean giving back exactly
+  the string backing that made the reads fast. A hand-rolled ASCII decode was
+  tried too, and is 2.4x *slower* than Chez's own. All of these are measured against the Chez
   jolt actually builds with (10.4.1, provisioned by the Makefile), not a system
   package that happens to be on `PATH`.
 

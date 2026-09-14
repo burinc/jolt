@@ -173,6 +173,70 @@
     (cond ((fx=? j nlen) #t)
           ((char=? (string-ref s (fx+ si j)) (string-ref needle j)) (loop (fx+ j 1)))
           (else #f))))
+;; --- Boyer-Moore-Horspool ----------------------------------------------------
+;; The scan below tests one character per position, which is already the cheap
+;; version. BMH does better by not visiting most positions at all: it compares
+;; the needle's LAST character against the haystack, and on a mismatch skips
+;; ahead by however far that haystack character sits from the end of the needle
+;; — up to the needle's whole length. On a 6.6 MB haystack and a 6-character
+;; needle that is 15.6 ms against 5.9 ms.
+;;
+;; THE SKIP TABLE IS AN FXVECTOR, and that is the whole difference between this
+;; being worth it and not. The same algorithm with an eqv hashtable measured
+;; 15.1 ms — no better than the linear scan — because a hashtable lookup per
+;; mismatch costs about what the comparisons it saves cost.
+;;
+;; ASCII NEEDLES ONLY, and the guard is load-bearing rather than a convenience.
+;; A haystack character with no entry in the table is skipped by the needle's
+;; full length, which is only sound if such a character genuinely cannot appear
+;; in the needle. A 256-entry table cannot answer for a needle holding U+65E5,
+;; and skipping the full length past one silently misses matches — a fuzz of
+;; 40k random cases over the alphabet {a b c é 日} found 174 of them before this
+;; guard went in, and none after.
+(define (str-bmh-table needle nlen)
+  (let loop ((j 0))
+    (cond
+      ((fx=? j nlen)
+       (let ((tbl (make-fxvector 256 nlen)) (lastj (fx- nlen 1)))
+         (do ((k 0 (fx+ k 1))) ((fx=? k lastj) tbl)
+           (fxvector-set! tbl (char->integer (string-ref needle k)) (fx- lastj k)))))
+      ((fx>=? (char->integer (string-ref needle j)) 256) #f)
+      (else (loop (fx+ j 1))))))
+
+;; Search with a table built by str-bmh-table.
+;;
+;; THE HAYSTACK IS NOT ASCII JUST BECAUSE THE NEEDLE IS. str-bmh-table only
+;; establishes that the NEEDLE fits the 256-entry table; the string being
+;; searched can hold anything, so a character code is range-tested before it
+;; indexes the table, and a character outside that range takes the full-length
+;; skip (it cannot be in an ASCII needle).
+;;
+;; Everything here is a CHECKED primitive. The #3% unsafe reads were written
+;; first and measured at 6.17ms against 6.50ms for the checked ones — 5%, on a
+;; loop whose speed came from the algorithm rather than the accessor. That is
+;; not worth an unsafe memory access in a path every string operation runs:
+;; the first version indexed this table with an unchecked fxvector-ref and read
+;; out of bounds on any haystack holding a non-ASCII character, which a fuzz run
+;; surfaced as "fx+: #\nul is not a fixnum". The checked version cannot do that.
+(define (str-index-of/bmh s needle from tbl)
+  (let* ((nlen (string-length needle)) (slen (string-length s))
+         (lastj (fx- nlen 1))
+         (lastc (string-ref needle lastj))
+         (last (fx- slen nlen)))
+    (let loop ((i (fxmax 0 from)))
+      (if (fx>? i last)
+          -1
+          (let ((c (string-ref s (fx+ i lastj))))
+            (if (and (char=? c lastc) (char-by-char-match? s i needle nlen))
+                i
+                (let ((ci (char->integer c)))
+                  (loop (fx+ i (if (fx<? ci 256) (fxvector-ref tbl ci) nlen))))))))))
+
+;; Worth building a table for? It is ~256 stores, so it pays for itself over a
+;; scan of any length but not over a handful of characters, and a 1-character
+;; needle has nothing to skip by.
+(define (str-bmh-worth? slen nlen) (and (fx>=? nlen 2) (fx>=? slen 512)))
+
 ;; The FIRST CHARACTER is tested inline, and only a hit calls the full compare.
 ;; This scan sits under indexOf, contains, split on a literal, and both literal
 ;; replaces, so it runs once per character of every string those touch — and a
@@ -188,13 +252,16 @@
         ;; length of this String is returned". The old loop answered -1 there,
         ;; which is the one place this scan disagreed with Java.
         (fxmin (fxmax 0 from) slen)
-        (let ((c0 (string-ref needle 0))
-              (last (fx- slen nlen)))
-          (let loop ((i (fxmax 0 from)))
-            (cond ((fx>? i last) -1)
-                  ((and (char=? (string-ref s i) c0)
-                        (char-by-char-match? s i needle nlen)) i)
-                  (else (loop (fx+ i 1)))))))))
+        (let ((tbl (and (str-bmh-worth? slen nlen) (str-bmh-table needle nlen))))
+          (if tbl
+              (str-index-of/bmh s needle from tbl)
+              (let ((c0 (string-ref needle 0))
+                    (last (fx- slen nlen)))
+                (let loop ((i (fxmax 0 from)))
+                  (cond ((fx>? i last) -1)
+                        ((and (char=? (string-ref s i) c0)
+                              (char-by-char-match? s i needle nlen)) i)
+                        (else (loop (fx+ i 1)))))))))))
 ;; single-char search with no needle allocation — (.indexOf s (int 59)) used to
 ;; build a 1-char string through number->exact->truncate->integer->char->string
 ;; per call (~160ns); honeysql's suspicious? transducer does two per entity.
@@ -242,7 +309,7 @@
 
 ;; literal replace-all (JVM String.replace(CharSequence,CharSequence)).
 (define (str-replace-literal s a b)
-  (let ((alen (string-length a)) (slen (string-length s)))
+  (let ((alen (string-length a)) (slen (string-length s)) (blen (string-length b)))
     (if (fx=? alen 0)
         ;; JVM String.replace with an empty match inserts the replacement at
         ;; every position 0..slen: "" -> "b", "aaa" -> "bababab".
@@ -253,38 +320,46 @@
                 (begin (display b op)
                        (when (fx<? i slen) (write-char (string-ref s i) op))
                        (loop (fx+ i 1))))))
-        ;; Jump to the next match and emit the whole span between matches, so
-        ;; the walk costs one put-string PER PART rather than a match probe and
-        ;; a write-char per CHARACTER of input. The old loop advanced one
-        ;; character at a time, which made an 8.7 MB replace 8.7M probes and
-        ;; 8.7M single-character writes — that was the 5.4x against babashka
-        ;; that survived teaching a literal pattern to skip the regex engine.
-        ;; Same shape as str-literal-split and str-replace-literal-first, which
-        ;; are already index-driven.
+        ;; COUNT the matches, then allocate the result once and fill it with
+        ;; block copies. The old loop advanced one CHARACTER at a time — a match
+        ;; probe and a write-char each — which is what made an 8.7 MB replace
+        ;; 5.4x babashka even after a literal pattern stopped reaching the regex
+        ;; engine. Now the walk costs one block move per PART.
         ;;
-        ;; Counting the matches first and filling a PRE-SIZED result with
-        ;; string-copy! was written and measured against this, and is not worth
-        ;; it: 78.0 ms vs 78.7 ms on a 6.6 MB replace with 240k matches. The
-        ;; output port's growth is not the cost — moving the characters is — so
-        ;; the second scan and the extra arithmetic buy 0.9%, and this version
-        ;; is the simpler one.
+        ;; The pre-sized fill is worth ~2x over writing into an output string
+        ;; port, and the emit is ~74% of a replace with many matches (measured
+        ;; on 6.6 MB with 240k matches: emit through a port 64 ms, the same emit
+        ;; into a pre-sized string 34 ms, whole replace 91 ms). An earlier pass
+        ;; measured those as equal and dropped the pre-sized version; that
+        ;; measurement was taken on a Chez the project does not build with
+        ;; (a system 9.5.4 rather than the pinned 10.4.1), where the two really
+        ;; are within 1%. The result length is exact — slen + n*(blen-alen) —
+        ;; so nothing grows and nothing is copied twice.
         ;;
-        ;; A string with no match at all answers S ITSELF, allocating nothing,
-        ;; which is what String.replace returns when there is nothing to do.
-        (let ((first-match (str-index-of s a 0)))
+        ;; The BMH table is built ONCE and threaded through both the counting
+        ;; scan and the filling scan, rather than rebuilt per lookup.
+        (let* ((tbl (and (str-bmh-worth? slen alen) (str-bmh-table a alen)))
+               (next-at (lambda (from)
+                          (if tbl (str-index-of/bmh s a from tbl) (str-index-of s a from))))
+               (first-match (next-at 0)))
           (if (fx<? first-match 0)
-              s
-              (let ((op (open-output-string)))
-                (let loop ((i 0) (m first-match))
-                  (cond
-                   ((fx<? m 0)
-                    (when (fx<? i slen) (put-string op s i (fx- slen i)))
-                    (get-output-string op))
-                   (else
-                    (when (fx>? m i) (put-string op s i (fx- m i)))
-                    (put-string op b)
-                    (let ((next (fx+ m alen)))
-                      (loop next (str-index-of s a next))))))))))))
+              s                        ; nothing to replace: String.replace returns this
+              (let count ((m first-match) (n 0))
+                (if (fx>=? m 0)
+                    (count (next-at (fx+ m alen)) (fx+ n 1))
+                    (let ((out (make-string (fx+ slen (fx* n (fx- blen alen))))))
+                      (let fill ((i 0) (m first-match) (o 0))
+                        (cond
+                         ((fx<? m 0)
+                          (let ((tail (fx- slen i)))
+                            (when (fx>? tail 0) (string-copy! s i out o tail))
+                            out))
+                         (else
+                          (let ((span (fx- m i)))
+                            (when (fx>? span 0) (string-copy! s i out o span))
+                            (when (fx>? blen 0) (string-copy! b 0 out (fx+ o span) blen))
+                            (let ((nx (fx+ m alen)))
+                              (fill nx (next-at nx) (fx+ o (fx+ span blen))))))))))))))))
 
 ;; A compiled irregex for a plain-string Java-regex pattern (or a jolt-regex).
 (define (str-irx pat) (regex-t-irx (jolt-re-pattern pat)))
