@@ -292,5 +292,44 @@
       (and (contains-str? string-cb "jolt-ffi-c->string")
            (contains-str? string-cb "jolt-ffi-string->c"))))
 
+;; --- Android / Termux: the prefix the OS loader does not search ---------------
+;; On Android the process is launched by /system/bin/linker64, whose search path
+;; never includes the Termux prefix, so a bare soname either misses (the
+;; versioned name lives only in $PREFIX/lib) or binds Android's own library of
+;; that name -- /system/lib64/libssl.so is BoringSSL, which has no SSL_ctrl. The
+;; runtime gives a bare name a second try under $PREFIX/lib there, AFTER the OS
+;; search, so a name that legitimately resolves in /system/lib64 is untouched.
+;;
+;; Detection is by environment, which is how Termux identifies itself, so this
+;; gate can stand in for an Android process on any host. Kept last in the file:
+;; Chez has putenv but no unsetenv, so the stand-in environment is cleared by
+;; setting PREFIX back to empty rather than removing it.
+(ok "off Android there is no prefix to fall back to" (not (ffi-termux-lib-dir)))
+(ok "and a bare name is tried exactly once"
+    (equal? '("libssl.so") (ffi-native-candidates "libssl.so")))
+
+(putenv "PREFIX" "/data/data/com.termux/files/usr")
+(putenv "TERMUX_VERSION" "0.119.0-beta.3")
+
+(ok "the Termux prefix is detected from the environment"
+    (equal? "/data/data/com.termux/files/usr/lib" (ffi-termux-lib-dir)))
+;; the ORDER is the fix: the OS search first, the prefix as a fallback.
+(ok "a bare soname falls back to $PREFIX/lib, after the OS search"
+    (equal? '("libssl.so.3" "/data/data/com.termux/files/usr/lib/libssl.so.3")
+            (ffi-native-candidates "libssl.so.3")))
+(ok "a path with a directory in it is opened as given"
+    (equal? '("/usr/lib/libssl.so.3") (ffi-native-candidates "/usr/lib/libssl.so.3")))
+(ok "so is a relative one"
+    (equal? '("./libssl.so.3") (ffi-native-candidates "./libssl.so.3")))
+;; load-system-library globs the search directories for versioned sonames; the
+;; prefix has to be one of them, or libz.so.1 in Termux is invisible to it.
+(ok "the prefix joins the directory search too"
+    (and (member "/data/data/com.termux/files/usr/lib" (ffi-so-search-dirs)) #t))
+
+(putenv "PREFIX" "")
+(ok "clearing PREFIX ends the fallback"
+    (and (not (ffi-termux-lib-dir))
+         (equal? '("libssl.so") (ffi-native-candidates "libssl.so"))))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
