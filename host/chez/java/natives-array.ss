@@ -55,9 +55,12 @@
 
 ;; The character a value denotes when it is STORED into a char array, or #f when
 ;; no character does — the test that decides whether a char array can keep its
-;; string backing. A character is itself; an integer is the JVM's widening
-;; int->char store ((aset chars 0 65) puts \A there, which compiles on the JVM
-;; because int->char is widening).
+;; string backing. A character is itself; an integer is the char it denotes,
+;; which is aset-char's own rule on the JVM ((aset-char chars 0 65) puts \A
+;; there). Reference Clojure's generic (aset chars 0 65) is an
+;; IllegalArgumentException rather than that store, and (char-array [65]) a
+;; ClassCastException; jolt accepts both as the character, here as it already
+;; did in the char-array constructor, and this keeps the two spellings agreeing.
 ;;
 ;; A LONE SURROGATE (#xD800-#xDFFF) answers #f, and that is the one real gap
 ;; between the two representations. A JVM char is a UTF-16 CODE UNIT, so half a

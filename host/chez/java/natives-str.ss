@@ -1052,7 +1052,10 @@
 (def-var! "clojure.core" "str-reverse-b" str-reverse-b)
 (def-var! "clojure.core" "str-join" str-join)
 (def-var! "clojure.core" "str-split" str-split)
-(def-var! "clojure.core" "str-split-lines" str-split-lines)
+;; str-split-lines is deliberately NOT def-var!'d: it answers a Scheme list, not
+;; a jolt vector, so an overlay caller would get #object[:object]. str-split
+;; above is its one entry point, and clojure.string/split-lines reaches it by
+;; being (split s #"\r?\n") — the pattern the recognizer picks out.
 (def-var! "clojure.core" "str-replace" str-replace)
 (def-var! "clojure.core" "str-replace-all" str-replace-all)
 
