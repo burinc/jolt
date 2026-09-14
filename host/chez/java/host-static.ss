@@ -828,9 +828,20 @@
 ;; class and sending the reader looking in the wrong place.
 (define (static-miss-message class member)
   (let ((target (or (chez-resolve-alias (chez-current-ns) class) class)))
-    (if (chez-ns-exists? target)
-        (string-append "No such var: " class "/" member)
-        (unknown-class-message class))))
+    (cond
+      ((chez-ns-exists? target)
+       (string-append "No such var: " class "/" member))
+      ;; A class the RUNTIME implements is not a missing dependency, whatever the
+      ;; member lookup did: jolt registers a constructor and an instance method
+      ;; table for java.lang.StringBuilder and no statics at all, so the first
+      ;; StringBuilder/... reference fell off the end of the class table and
+      ;; reported "No dependency provides java.lang.StringBuilder" — advice that
+      ;; cannot be taken, since register-class-provider! refuses a claim on a
+      ;; class the runtime already provides. The miss is the MEMBER's, and that is
+      ;; the same message the class-with-statics path already gives (jolt#983).
+      ((runtime-provides-class? (or (imported-class-fqn class) class))
+       (string-append "No matching field or method: " class "/" member))
+      (else (unknown-class-message class)))))
 
 ;; JVM Clojure resolves (.getName String) — an instance member on a class
 ;; token — as a call on the java.lang.Class OBJECT when the class has no such
