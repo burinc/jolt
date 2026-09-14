@@ -23,6 +23,7 @@ clojure.core.async.flow.impl
 clojure.core.async.flow.impl.graph
 clojure.core.async.flow.spi
 clojure.core.async.impl.dispatch
+clojure.core.async.impl.protocols
 clojure.core.async.lab
 clojure.core.protocols
 clojure.core.rrb-vector
