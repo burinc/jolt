@@ -140,10 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failures before and after: 35.9s → 28.6s of test time (2.24x → 1.79x of
   babashka) and 29.6s → 17.6s of user CPU (2.64x → 1.57x), CPU being the honest
   figure since wall time includes subprocess and network waits neither host
-  controls. `String.`-from-`char[]` and `.read(char[])` keep a residual ~9x:
-  both are the same representational issue — a char array's backing is a Scheme
-  vector, so every character crosses a string/vector boundary — and both would
-  collapse together under a string backing, which is a change of its own.
+  controls.
 
   `bench/host_io.clj` and `bench/string_scan.clj` cover all of it, each with
   control arms for the shapes that must *not* change: patterns that genuinely
@@ -153,7 +150,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   babashka in CI — a scaling gate cannot see any of these, since they are all
   linear with a bad constant.
 
+- **A char array is backed by a Chez string instead of a boxed vector, which
+  is most of what was left in the reading path.** `.read(char[])`,
+  `(String. char[])` and `.toCharArray` each kept a residual ~9x after the work
+  above, and all three were the same representational problem: a `char[]` held
+  its characters in a `vector`, so every character crossed a string/vector
+  boundary on the way in and again on the way out. A backing that already *is*
+  a string removes the crossing rather than optimizing it — a reader fills the
+  caller's buffer with one `get-string-n!` straight into the backing, and
+  `(String. ca)` is a `substring` of it.
+
+  The array layer was built for this: every accessor already dispatched on the
+  *backing* rather than the kind, because an `int[]` widens from an `fxvector`
+  to a boxed vector when it is handed a bignum. A char array widens the same
+  way, and needs to — a Chez string holds Unicode *scalar values*, while a JVM
+  `char` is a UTF-16 *code unit*, so a lone surrogate is a legal `char[]`
+  element that no Chez string can hold. Storing one boxes the array and it
+  behaves exactly as it did before. An integer does *not* box it: `(aset chars
+  0 65)` is the JVM's widening `int`→`char` store, and it now reads back as
+  `\A` where jolt used to answer `65` — the same value babashka gives.
+
+  **The dispatch storm under every decoded read is gone, and it was the single
+  largest cost left.** A Chez transcoded port reads from the binary port beneath
+  it in **1024-byte** units — that size is hardcoded before Chez 9.6.0, and the
+  `transcoded-port-buffer-size` parameter that replaced it sizes the *string*
+  buffer, not the binary read, so on 10.4.1 it changes nothing here (measured:
+  7912 callbacks per 8.1 MB either way). jolt served each of those requests with
+  its own `record-method-dispatch` — consing an argument seq, boxing two
+  numbers, hashing the jhost tag and then hashing the method *name* — which is
+  ~158k dispatches to read one 8.1 MB file twenty times. One dispatch now fills
+  a 64 KB byte array and the 1024-byte requests are served out of it, 64x fewer
+  crossings into the method layer. Blocking is unchanged: the refill asks for
+  64 KB but the stream's own `read` answers as soon as any bytes are there,
+  which is `InputStream.read(byte[],int,int)`'s contract, so a pipe still
+  delivers as data arrives.
+
+  Three allocation bugs on the same path went with it. That same callback moved
+  each byte **three times** and allocated twice per block — it built a
+  bytevector, copied it into a byte array, copied that back out to a second
+  bytevector, and only then filled the port's buffer; and the byte stream's own
+  `read` allocated a fresh buffer on every call. A byte array's backing already
+  *is* a bytevector, so the port reads straight into it. `(String. char[])`
+  stopped using `substring`, which is ~1.5x slower than copying the same
+  characters explicitly (850ms vs 584ms for 8.1M characters, x20) — the backing
+  is a string, so the whole-array case is exactly `string-copy` — and the
+  end-to-end move, 1345ms to 583ms, is 1.44x, which is that ratio and nothing
+  else.
+
+  `slurp` of a path used `get-string-all`, which grows its result as it goes; a
+  file's byte length bounds its character count, so the buffer is allocated
+  once (2094ms → 1245ms for the decode alone, and 1910ms → 1255ms through
+  `slurp` itself). The decoder there is
+  deliberately unchanged. Reading the bytes and calling `utf8->string` is
+  faster, but only by ~8% on Chez 10.4.1 (1153ms against 1245ms), and it emits
+  one replacement character on an overlong sequence where the port's transcoder
+  emits two, as Java's `CharsetDecoder` does — jolt's own byte-side decoder
+  already makes that mistake, which is now tracked as a correctness bug rather
+  than copied into `slurp` for 8%.
+
+  `str/replace` with a **literal** match reached parity with babashka's *regex*
+  replace in the work above, not with its literal one, and bb's literal path is
+  another ~5x faster. The literal arm advanced one character at a time — a
+  match probe and a `write-char` per character — so it now jumps with
+  `str-index-of` and emits whole spans. That exposed `str-index-of` itself,
+  which called a comparison procedure at *every* position; testing the first
+  character inline took a 7.8 MB miss from 56ms to 18ms, and that scan sits
+  under `indexOf`, `contains`, literal `split` and both literal replaces.
+  (Counting the matches first and filling a pre-sized result was written and
+  measured too, and dropped: 78.0ms against 78.7ms — the output port's growth
+  is not the cost, moving the characters is.)
+
+  Against babashka 1.12, x86_64 — an 8.1 MB file and a 6.6 MB string, the same
+  payloads on both sides:
+
+  | operation | before | after | babashka |
+  | --- | --- | --- | --- |
+  | `.read(char[])` buf=64KB, x20 | 1405 ms | 423 ms | 152 ms |
+  | `.read(char[])` buf=1MB, x20 | 1635 ms | 478 ms | 174 ms |
+  | `slurp` a path, x20 | 1910 ms | 1255 ms | 619 ms |
+  | `(String. char[])`, x20 | 1345 ms | 583 ms | 148 ms |
+  | `.toCharArray`, 8.7 MB | 225 ms | 48 ms | 21 ms |
+  | `(char-array 1MB)`, x20 | 139 ms | 53 ms | ~0 ms |
+  | `str/replace` literal, 6.6 MB | 147 ms | 91 ms | 16 ms |
+  | `str/replace`, needle absent | 48 ms | 15 ms | 0 ms |
+  | `str/split #"\n"` | 94 ms | 62 ms | 92 ms |
+
+  What remains is representational and is *not* being chased: a Chez string is
+  UTF-32 and a JVM string is compact Latin-1 for ASCII, so producing the same
+  text costs jolt 4x the memory traffic. Draining this file through a raw Chez
+  transcoded port — no jolt in the picture at all — takes 550ms where the whole
+  of babashka's read takes 152ms, and `slurp` now sits at the measured floor for
+  decoding it (1255ms against 1245ms for the same decode into a pre-allocated
+  buffer). `(char-array n)` is 54x babashka rather than 141x for the same reason
+  in reverse — `make-string` writes every element where the JVM's `new char[n]`
+  is handed zero pages by the OS — and a hand-rolled ASCII decode was tried and
+  is 2.4x *slower* than Chez's own. All of these are measured against the Chez
+  jolt actually builds with (10.4.1, provisioned by the Makefile), not a system
+  package that happens to be on `PATH`.
+
+  `test/chez/array-backing-test.ss` pins the representation (71 checks, up from
+  50) including both ways a char array legitimately boxes, and four new arms in
+  `make fastpathratio` gate the rest. Each was negative-tested against the
+  pre-change binary, where all four fail: `chars-copy` 0.59 → 3.41,
+  `string-from-chars` 1.00 → 2.17, `char-alloc` 0.50 → 1.01, `substring-scan`
+  0.80 → 2.43.
+
 ### Fixed
+
+- **`String.indexOf` with an empty needle past the end of the string answered
+  `-1` instead of the string's length.** `String.indexOf(String,int)` is
+  explicit that "if `fromIndex` is greater than the length of this String, and
+  the target is the empty string, then the length of this String is returned";
+  jolt's scan fell out of its bounds test and answered `-1`. Found while
+  checking the rewritten scan against babashka, which returns `5` for
+  `(.indexOf "hello" "" 99)`.
 
 - **`(.read rdr cbuf)` — the one-argument `Reader.read(char[])` overload —
   crashed instead of reading.** It raised `caddr: incorrect list structure` on

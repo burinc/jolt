@@ -1372,27 +1372,46 @@
           ;; char[] cost 457 ms against bb's 22 ms), where a decode loop builds
           ;; a string from its fill buffer once per chunk.
           ;;
-          ;; A char array's backing is a plain vector, so reading it once and
-          ;; proving the slice once turns both into a tight string-set! loop.
-          ;; Anything unusual — a promoted backing that is no longer a vector, a
-          ;; slice the caller got wrong — keeps the checked ja-ref path, which
-          ;; raises the JVM's own exception at the offending index.
+          ;; A char array's backing IS a Chez string (natives-array.ss), so this
+          ;; whole constructor is one substring — the characters are already
+          ;; laid out the way the result needs them, and nothing is walked. The
+          ;; vector arm below it is the same copy against the older boxed
+          ;; backing (a promoted array, or one restored from an image written
+          ;; before the string backing); anything else — a slice the caller got
+          ;; wrong — keeps the checked ja-ref path, which raises the JVM's own
+          ;; exception at the offending index.
           ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
            (let* ((v (jolt-array-vec x))
                   (n (ja-len x))
                   (off (if (pair? rest) (jnum->exact (car rest)) 0))
                   (cnt (if (pair? rest) (jnum->exact (cadr rest)) n))
-                  (out (make-string cnt)))
-             (if (and (vector? v) (fixnum? off) (fixnum? cnt)
-                      (fx>=? off 0) (fx>=? cnt 0) (fx<=? (fx+ off cnt) n))
-                 (let loop ((i 0))
-                   (if (fx=? i cnt) out
-                       (begin (string-set! out i (vector-ref v (fx+ off i)))
-                              (loop (fx+ i 1)))))
-                 (let loop ((i 0))
-                   (if (fx=? i cnt) out
-                       (begin (string-set! out i (ja-ref x (fx+ off i)))
-                              (loop (fx+ i 1))))))))
+                  (ok? (and (fixnum? off) (fixnum? cnt)
+                            (fx>=? off 0) (fx>=? cnt 0) (fx<=? (fx+ off cnt) n))))
+             (cond
+               ;; NOT substring: Chez's substring is ~2.2x slower than an
+               ;; explicit copy of the same bytes (measured on 8.1M characters,
+               ;; x20: whole 1301ms vs 589ms for string-copy, half 831ms vs
+               ;; 374ms for make-string + string-copy!). Since the backing is
+               ;; already a string, the whole-array case — which is what
+               ;; (String. ca) means — is exactly string-copy.
+               ((and ok? (string? v))
+                (if (and (fx=? off 0) (fx=? cnt (string-length v)))
+                    (string-copy v)
+                    (let ((out (make-string cnt)))
+                      (string-copy! v off out 0 cnt)
+                      out)))
+               ((and ok? (vector? v))
+                (let ((out (make-string cnt)))
+                  (let loop ((i 0))
+                    (if (fx=? i cnt) out
+                        (begin (string-set! out i (vector-ref v (fx+ off i)))
+                               (loop (fx+ i 1)))))))
+               (else
+                (let ((out (make-string cnt)))
+                  (let loop ((i 0))
+                    (if (fx=? i cnt) out
+                        (begin (string-set! out i (ja-ref x (fx+ off i)))
+                               (loop (fx+ i 1))))))))))
           ((string? x) x)
           (else (jolt-str-render-one x)))))
 ;; (BigInteger. s) | (BigInteger. s radix) — parse a string in the given radix

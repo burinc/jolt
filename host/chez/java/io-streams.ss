@@ -162,14 +162,29 @@
                  (let* ((buf (car rest))
                         (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
                         (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (ja-len buf)))
-                        (tmp (make-bytevector (max len 1)))
-                        (n (if (<= len 0) 0 (get-bytevector-some! port tmp 0 len))))
+                        (v (and (jolt-array? buf) (jolt-array-vec buf))))
                    (cond
                      ((<= len 0) (->num 0))
-                     ((eof-object? n) -1)
-                     ;; the port's bytevector straight into the array's own — one
-                     ;; block move now that a byte array IS a bytevector
-                     (else (ja-bv->bytes! tmp 0 buf off n) (->num n))))))))
+                     ;; STRAIGHT INTO THE ARRAY'S OWN BACKING. A byte array is
+                     ;; backed by a bytevector, which is exactly what the port
+                     ;; fills, so the read needs no buffer of its own: this used
+                     ;; to allocate (make-bytevector len) on EVERY call and then
+                     ;; block-copy it into the array. Under a decoded read that
+                     ;; callback runs once per block for the whole stream, so a
+                     ;; large read allocated and copied the entire input a second
+                     ;; time on its way through.
+                     ((and (bytevector? v) (fixnum? off) (fixnum? len)
+                           (fx>=? off 0) (fx<=? (fx+ off len) (bytevector-length v)))
+                      (let ((n (get-bytevector-some! port v off len)))
+                        (if (eof-object? n) -1 (->num n))))
+                     ;; a boxed backing (a promoted array, or an older image) or
+                     ;; a range the caller got wrong keeps the buffered path,
+                     ;; where ja-bv->bytes! raises at the offending index
+                     (else
+                      (let* ((tmp (make-bytevector (max len 1)))
+                             (n (get-bytevector-some! port tmp 0 len)))
+                        (if (eof-object? n) -1
+                            (begin (ja-bv->bytes! tmp 0 buf off n) (->num n)))))))))))
    (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
    (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-live-port self) (jnum->exact n))))
@@ -365,9 +380,13 @@
 ;; was per character and not per chunk. It was slower than slurping the whole
 ;; file (2.4x), so the memory-bounded read cost time instead of saving it.
 ;;
-;; Chez fills a string in one operation, and a char array's backing is a plain
-;; vector, so the copy afterwards is a tight vector-set! loop with the bounds
-;; proved once up front rather than per element.
+;; A char array's backing IS a Chez string (natives-array.ss), so get-string-n!
+;; fills the caller's buffer IN PLACE: no scratch, no copy, one port operation
+;; per call. That is what char-reader-fill-string! below does, and it is the
+;; whole read now. The vector arm after it is the same block read against the
+;; older boxed backing — a char array that was promoted by a store no character
+;; can hold, or one restored from an image written before the string backing —
+;; which still has to go through a scratch and copy out of it.
 ;;
 ;; BLOCKING IS UNCHANGED. get-string-n! blocks until the count is available or
 ;; the port hits eof, which is exactly what the per-char loop did — it ran to
@@ -378,13 +397,35 @@
 ;; it is resolved with one ordinary get-char before the block starts. Without
 ;; that, a readLine that stopped on \r followed by a read(char[]) would hand
 ;; back the \n that readLine had already accounted for.
+;; The string-backed read: get-string-n! writes straight into the array's own
+;; backing, so nothing is copied and nothing is allocated per call.
+(define (char-reader-fill-string! self v off len)
+  (let* ((pending? (and (char-reader-pending-lf? self) (fx>? len 0)))
+         (first-c (and pending? (char-reader-get-char self))))
+    (if (and pending? (eof-object? first-c))
+        -1
+        (let ((base (if pending? 1 0)))
+          (when pending? (string-set! v off first-c))
+          (let ((want (fx- len base)))
+            (if (fx=? want 0)
+                (->num base)
+                (let ((got (get-string-n! (char-reader-port self) v (fx+ off base) want)))
+                  (cond
+                    ((or (eof-object? got) (fx=? got 0))
+                     (if (fx=? base 0) -1 (->num base)))
+                    ;; a short read is eof, exactly as in the scratch arm below
+                    (else (->num (fx+ base got)))))))))))
+
 (define (char-reader-read-block! self buf off len)
   (let ((v (and (jolt-array? buf) (jolt-array-vec buf))))
-    (if (not (and (vector? v)
-                  (fixnum? off) (fixnum? len)
-                  (fx>=? off 0) (fx>=? len 0)
-                  (fx<=? (fx+ off len) (vector-length v))))
-        (char-reader-read-elementwise! self buf off len)
+    (cond
+      ((not (and (fixnum? off) (fixnum? len) (fx>=? off 0) (fx>=? len 0)))
+       (char-reader-read-elementwise! self buf off len))
+      ((and (string? v) (fx<=? (fx+ off len) (string-length v)))
+       (char-reader-fill-string! self v off len))
+      ((not (and (vector? v) (fx<=? (fx+ off len) (vector-length v))))
+       (char-reader-read-elementwise! self buf off len))
+      (else
         (let* ((pending? (and (char-reader-pending-lf? self) (fx>? len 0)))
                (first-c (and pending? (char-reader-get-char self))))
           (if (and pending? (eof-object? first-c))
@@ -416,7 +457,7 @@
                                                 (->num (fx+ base (fx+ done got)))
                                                 (loop (fx+ done got)))
                                             (begin (vector-set! v (fx+ start i) (string-ref s i))
-                                                   (copy (fx+ i 1)))))))))))))))))))
+                                                   (copy (fx+ i 1))))))))))))))))))))
 
 (register-host-methods! "char-reader"
   (list
@@ -939,17 +980,68 @@
 ;; leaves the wrapped stream OPEN — R6RS transcoded-port takes ownership of the
 ;; port it is given, so (io/reader System/in) used to take standard input away
 ;; from System/in, and from read-line with it, the moment it was called.
+;;
+;; THE BUFFER IS REUSED, and each byte is copied ONCE. This callback sits under
+;; every decoded read in the host — (io/reader stream), line-seq, slurp of a
+;; stream, .read(char[]) — and it used to move every byte THREE times and
+;; allocate twice per block: (na-byte-array (make-bytevector count)) built a
+;; bytevector and then COPIED it into a fresh byte array (na-byte-array copies a
+;; bytevector argument, because the caller usually keeps writing into its own),
+;; na-bytearray->bv copied the array back out to a second bytevector, and
+;; bytevector-copy! then moved it into the port's buffer. Only the last of those
+;; was the port's actual business.
+;;
+;; IT BUFFERS, and that is the whole point. A transcoded port reads from the
+;; binary port underneath it in 1024-BYTE units — measured, and not tunable:
+;; custom-port-buffer-size has no effect on it — so serving each of those
+;; requests with its own dispatch meant 7912 round trips per 8.1 MB, each one
+;; consing an argument seq, boxing two numbers, hashing the jhost tag and then
+;; hashing the method NAME. That is ~158k dispatches to read that file twenty
+;; times, and it was the single largest remaining cost in every decoded read.
+;;
+;; So one dispatch fills a 64 KB byte array and the 1024-byte requests are
+;; served out of it — 64x fewer crossings into the method layer. The bytes move
+;; once either way: ja-bytes->bv! copies from the array's backing (a bytevector)
+;; straight into the port's buffer at its offset.
+;;
+;; BLOCKING IS UNCHANGED. The refill asks for 64 KB but the stream's own read
+;; answers as soon as ANY bytes are there — that is InputStream.read(byte[],
+;; int,int)'s contract and what in-stream's get-bytevector-some! implements — so
+;; a pipe, socket or terminal still delivers as data arrives rather than waiting
+;; for a full buffer.
+;; …but it STARTS SMALL and doubles, exactly as char-reader-scratch does, and
+;; for the same reason: a buffer sized to the block rather than to the input
+;; makes every stream pay 64 KB to hold a few hundred bytes. Reading one large
+;; file cannot tell the difference, and a suite that opens many small ones
+;; regresses — that regression has already shipped here once, from the
+;; char-reader drain, and the small-file-drain arm of the fastpath ratio gate
+;; caught this one (1.01 -> 1.57) before it left the branch.
+(define stream-source-block 65536)
+(define stream-source-initial 4096)
 (define (in-stream-source-port in)
-  (make-custom-binary-input-port
-   "stream-source"
-   (lambda (bv start count)
-     (let* ((arr (na-byte-array (make-bytevector count)))
-            (n (jnum->exact (record-method-dispatch in "read"
-                              (list->cseq (list arr (->num 0) (->num count)))))))
-       (if (<= n 0)
+  (let ((arr #f) (cap 0) (pos 0) (lim 0))
+    (make-custom-binary-input-port
+     "stream-source"
+     (lambda (bv start count)
+       (when (fx=? pos lim)
+         ;; grown only between refills, when the buffer holds nothing
+         (let ((want (if (fx=? cap 0)
+                         stream-source-initial
+                         (fxmin stream-source-block (fx* cap 2)))))
+           (when (fx>? want cap)
+             (set! arr (na-byte-array want))
+             (set! cap want)))
+         (let ((n (jnum->exact (record-method-dispatch in "read"
+                                 (list->cseq (list arr (->num 0) (->num cap)))))))
+           (set! pos 0)
+           (set! lim (if (and (fixnum? n) (fx>? n 0)) n 0))))
+       (if (fx=? pos lim)
            0                                   ; the custom-port way of saying EOF
-           (begin (bytevector-copy! (na-bytearray->bv arr) 0 bv start n) n))))
-   #f #f (lambda () #f)))
+           (let ((n (fxmin count (fx- lim pos))))
+             (ja-bytes->bv! arr pos bv start n)
+             (set! pos (fx+ pos n))
+             n)))
+     #f #f (lambda () #f))))
 (reg-ctor! '("InputStreamReader" "java.io.InputStreamReader")
   (lambda (in . _)
     ;; A Reader is already decoded characters, so there is nothing for an

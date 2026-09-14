@@ -53,6 +53,32 @@
 
 (define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) (jolt-need-num i)))
 
+;; The character a value denotes when it is STORED into a char array, or #f when
+;; no character does — the test that decides whether a char array can keep its
+;; string backing. A character is itself; an integer is the JVM's widening
+;; int->char store ((aset chars 0 65) puts \A there, which compiles on the JVM
+;; because int->char is widening).
+;;
+;; A LONE SURROGATE (#xD800-#xDFFF) answers #f, and that is the one real gap
+;; between the two representations. A JVM char is a UTF-16 CODE UNIT, so half a
+;; surrogate pair is a legal char[] element; a Chez string holds Unicode SCALAR
+;; values and integer->char refuses exactly that range. So an array that is
+;; handed one falls back to a boxed vector (ja-promote-chars!) and goes on
+;; holding the raw integer, which is what it did before char arrays had a string
+;; backing. Nothing regresses — that case simply does not get the fast backing.
+(define (na-char-scalar? n)
+  (and (fixnum? n) (fx<=? 0 n #x10FFFF) (not (fx<=? #xD800 n #xDFFF))))
+(define (na-char-of v)
+  (cond ((char? v) v)
+        ((na-char-scalar? v) (integer->char v))
+        ;; a non-fixnum real truncates toward zero first, which is what the char
+        ;; array constructor has always done with one ((char-array [65.0]) is
+        ;; (\A)); a bignum or an out-of-range value answers #f and boxes.
+        ((and (number? v) (real? v))
+         (let ((n (guard (e (#t #f)) (exact (truncate v)))))
+           (and (na-char-scalar? n) (integer->char n))))
+        (else #f)))
+
 ;; --- backings ---------------------------------------------------------------
 ;; An element kind picks the Chez vector type that holds its elements UNBOXED:
 ;;
@@ -100,6 +126,7 @@
     ((_ b) (let ((v b))
              (cond ((fxvector? v) (fxvector-length v))
                    ((vector? v) (vector-length v))
+                   ((string? v) (string-length v))
                    ((bytevector? v) (bytevector-length v))
                    (else (flvector-length v)))))))
 (define (ja-len a) (ja-backing-len (jolt-array-vec a)))
@@ -135,6 +162,7 @@
     ((_ b k) (let ((v b) (i k))
                (cond ((fxvector? v) (fxvector-ref v i))
                      ((vector? v) (vector-ref v i))
+                     ((string? v) (string-ref v i))
                      ((bytevector? v) (bytevector-s8-ref v i))
                      (else (flvector-ref v i)))))))
 (define (ja-ref a i)
@@ -153,10 +181,32 @@
     (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! w i (fxvector-ref v i)))
     (jolt-array-vec-set! a w)
     w))
+;; The char backing's counterpart to ja-promote!, and it exists for the same
+;; reason: a Chez string holds CHARACTERS, and jolt cannot stop a program from
+;; storing something else in a char[]. The JVM cannot either — (aset chars 0 65)
+;; compiles, because 65 is an int and int->char is a widening store — so this is
+;; not a corner the type system rules out. A char store keeps the string; anything
+;; else swaps in a boxed vector and the array behaves exactly as it did before
+;; char arrays got a string backing.
+;;
+;; An INTEGER is the common non-char store and is NOT promoted: it is the JVM's
+;; own char store, so it is narrowed to the character it denotes and the string
+;; backing is kept. Promotion is for values a char[] could never hold on the JVM
+;; at all (nil, a string, a record), which jolt tolerates rather than refuses.
+(define (ja-promote-chars! a)
+  (let* ((v (jolt-array-vec a)) (n (string-length v)) (w (make-vector n #\nul)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! w i (string-ref v i)))
+    (jolt-array-vec-set! a w)
+    w))
 (define (ja-set! a i x)
   (let ((v (jolt-array-vec a)))
     (ja-check v i)
     (cond ((vector? v) (vector-set! v i x))
+          ((string? v)
+           (if (char? x)
+               (string-set! v i x)
+               (let ((c (na-char-of x)))
+                 (if c (string-set! v i c) (vector-set! (ja-promote-chars! a) i x)))))
           ((fxvector? v)
            (if (fixnum? x) (fxvector-set! v i x) (vector-set! (ja-promote! a) i x)))
           ;; -128..127, whatever magnitude the caller spelled: na-byte-of is the
@@ -175,6 +225,7 @@
   (let ((va (jolt-array-vec a)) (vb (jolt-array-vec b)))
     (if (or (and (vector? va) (vector? vb))
             (and (fxvector? va) (fxvector? vb))
+            (and (string? va) (string? vb))
             (and (bytevector? va) (bytevector? vb))
             (and (flvector? va) (flvector? vb)))
         (equal? va vb)
@@ -188,6 +239,7 @@
   (let ((v (jolt-array-vec a)))
     (cond ((vector? v) (vector->list v))
           ((fxvector? v) (fxvector->list v))
+          ((string? v) (string->list v))
           (else (let loop ((i (fx- (ja-backing-len v) 1)) (acc '()))
                   (if (fx<? i 0) acc (loop (fx- i 1) (cons (ja-backing-ref v i) acc))))))))
 ;; A fresh backing holding the same elements — aclone's copy, and the one
@@ -196,6 +248,7 @@
   (let ((v (jolt-array-vec a)))
     (cond ((vector? v) (vector-copy v))
           ((fxvector? v) (fxvector-copy v))
+          ((string? v) (string-copy v))
           ((bytevector? v) (bytevector-copy v))
           (else (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
                   (do ((i 0 (fx+ i 1))) ((fx=? i n) r) (flvector-set! r i (flvector-ref v i))))))))
@@ -208,6 +261,16 @@
     (cond ((na-fl-kind? kind) (make-flvector n (if (flonum? init) init (exact->inexact init))))
           ((na-fx-kind? kind) (if (fixnum? init) (make-fxvector n init) (make-vector n init)))
           ((eq? kind 'byte) (make-bytevector n (na-byte-of init)))
+          ;; A char array is a Chez STRING: the elements are characters and a
+          ;; string is the carrier that holds them unboxed, exactly as an
+          ;; fxvector holds an int array's. It also removes a conversion at
+          ;; every seam a char[] actually meets — a reader fills one straight
+          ;; from the port, (String. chars) is a substring of it — where a
+          ;; boxed vector made each of those a per-character copy. An init the
+          ;; backing cannot hold starts the array boxed, the same rule the
+          ;; fxvector arm above follows.
+          ((eq? kind 'char) (let ((c (na-char-of init)))
+                              (if c (make-string n c) (make-vector n init))))
           (else (make-vector n init)))))
 (define (na-list->backing lst kind)
   (cond ((na-fl-kind? kind)
@@ -215,6 +278,9 @@
            (let loop ((i 0) (l lst))
              (if (null? l) fv (begin (flvector-set! fv i (exact->inexact (car l))) (loop (+ i 1) (cdr l)))))))
         ((and (na-fx-kind? kind) (for-all fixnum? lst)) (list->fxvector lst))
+        ;; every element coercible to a character, or the array starts boxed
+        ((and (eq? kind 'char) (for-all (lambda (c) (na-char-of c)) lst))
+         (list->string (map na-char-of lst)))
         ;; every element narrowed on the way in, so the seq of a byte array
         ;; agrees with what a raw-byte consumer reads out of it
         ((eq? kind 'byte)
@@ -233,6 +299,10 @@
   (let ((sv (jolt-array-vec src)) (dv (jolt-array-vec dst)))
     (cond
       ((and (bytevector? sv) (bytevector? dv)) (bytevector-copy! sv soff dv doff n))
+      ;; string-copy! is specified to act as if through a temporary, so an
+      ;; overlapping region inside one char array is correct without the
+      ;; descending walk below — the same reason the bytevector arm is here.
+      ((and (string? sv) (string? dv)) (string-copy! sv soff dv doff n))
       ((and (eq? sv dv) (< soff doff))
        (let loop ((i (- n 1)))
          (when (>= i 0) (ja-set! dst (+ doff i) (ja-ref src (+ soff i))) (loop (- i 1)))))
@@ -312,20 +382,30 @@
 ;; dispatchers below — io/reader (extended here) and str/slurp consume the seq.
 (define (na-char-array a . rest)
   (cond
-    ;; straight into the backing: (list->vector (string->list a)) walked the
-    ;; string to build a cons per character and then walked the list again to
-    ;; fill the vector, so .toCharArray on a large string cost two full passes
-    ;; and a list the size of the input before the array existed.
-    ((string? a)
-     (let* ((n (string-length a)) (v (make-vector n #\nul)))
-       (let loop ((i 0))
-         (if (fx=? i n)
-             (make-jolt-array v 'char)
-             (begin (vector-set! v i (string-ref a i)) (loop (fx+ i 1)))))))
-    ((number? a) (make-jolt-array (make-vector (exact (na-idx a)) #\nul) 'char))
+    ;; .toCharArray is now a COPY OF THE STRING, not a walk over it: the backing
+    ;; and the source are the same representation, so one string-copy replaces a
+    ;; character-at-a-time fill (and, before that, a cons per character plus a
+    ;; second walk over the list).
+    ((string? a) (make-jolt-array (string-copy a) 'char))
+    ;; (char-array n) — make-string rather than make-vector. This is the whole of
+    ;; the ~140x allocation gap: a boxed vector of n characters is n POINTERS the
+    ;; collector must trace on every major GC, while a string of n characters is
+    ;; a flat, untraced block half the size. It still initializes every element
+    ;; (Chez has no lazily-zeroed allocation the way the JVM's new char[n] gets
+    ;; zero pages from the OS), so parity is not the claim — but the cost falls
+    ;; to what filling a string costs.
+    ((number? a) (make-jolt-array (make-string (exact (na-idx a)) #\nul) 'char))
+    ;; (char-array coll) coerces STRICTLY, and keeps doing so: a character is
+    ;; itself, a number is the character at that code point, and anything else
+    ;; raises out of truncate — which is what this constructor has always done
+    ;; and what the JVM does (a ClassCastException). That is deliberately NOT
+    ;; na-list->backing's rule: into-array is the lenient door and boxes instead,
+    ;; also as before. Routing this through na-list->backing would silently turn
+    ;; (char-array [:k]) from an error into a boxed array holding :k.
     (else (make-jolt-array
-           (list->vector (map (lambda (c) (if (char? c) c (integer->char (exact (truncate c)))))
-                              (seq->list (jolt-seq a)))) 'char))))
+           (list->string (map (lambda (c) (if (char? c) c (integer->char (exact (truncate c)))))
+                              (seq->list (jolt-seq a))))
+           'char))))
 ;; Chez bytevector -> jolt byte-array. The inbound half of the raw-bytes seam:
 ;; every producer of a byte-array from raw bytes — .getBytes, stream reads,
 ;; Files/readAllBytes, Base64, FFI — funnels through here. One block copy now
@@ -556,14 +636,25 @@
                            (vector-ref v j)
                            (na-oob-throw j (vector-length v))))
           ((bytevector? v) (bytevector-s8-ref v j))
+          ;; A char array has a STRING backing and no hint of its own (:chars is
+          ;; not a boxed-akind), so reaching here means a LYING hint — ^objects
+          ;; on a char[]. Take the checked generic path rather than a raw
+          ;; string-ref, whose range condition host-faults.ss cannot tell from
+          ;; any other string operation's.
+          ((string? v) (ja-ref a j))
           (else (flvector-ref v j)))))
 (define (jolt-vaset a i v)
   (let ((bk (jolt-array-vec a)) (j (if (fixnum? i) i (exact (na-idx i)))))
-    (if (fxvector? bk)
-        (if (fixnum? v) (fxvector-set! bk j v) (vector-set! (ja-promote! a) j v))
-        (if (and (fixnum? j) (fx<? -1 j (vector-length bk)))
-            (vector-set! bk j v)
-            (na-oob-throw j (vector-length bk))))
+    (cond ((fxvector? bk)
+           (if (fixnum? v) (fxvector-set! bk j v) (vector-set! (ja-promote! a) j v)))
+          ((vector? bk)
+           (if (and (fixnum? j) (fx<? -1 j (vector-length bk)))
+               (vector-set! bk j v)
+               (na-oob-throw j (vector-length bk))))
+          ;; a lying hint over a string-backed char array — see jolt-vaget. The
+          ;; else arm used to assume a boxed vector and would read
+          ;; (vector-length bk) off a string.
+          (else (ja-set! a j v)))
     v))
 
 ;; (aset ^bytes a i v) — the byte kind's own store target, split from jolt-vaset

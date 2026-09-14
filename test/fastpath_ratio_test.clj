@@ -46,6 +46,36 @@
 ;;                      route and never touches the drain. Holding everything but
 ;;                      the drain constant is what makes the ratio sharp.
 ;;
+;;   chars-copy         a char array's backing IS a Chez string, so .toCharArray
+;;   string-from-chars  is a string copy and (String. ca) is a substring of it.
+;;                      Both used to build a cons per character and then walk the
+;;                      list again — 21x babashka on the chunked-read path that
+;;                      feeds them. The reference arm for both is (subs s 0 n),
+;;                      which copies exactly as many characters by a route that
+;;                      was always a block move. If the backing goes back to a
+;;                      boxed vector, both arms walk again and the ratios jump
+;;                      (measured: 0.68 -> 2.47 and 1.00 -> 1.63).
+;;
+;;   char-alloc         the same backing, seen with no traversal in it at all.
+;;                      A char array of n elements is a flat 4-byte-per-character
+;;                      string the collector never traces; a boxed vector of the
+;;                      same n is n POINTERS at 8 bytes that it traces on every
+;;                      major GC. So allocating a char array must be FASTER than
+;;                      allocating a long array of the same length — the ceiling
+;;                      here is deliberately below 1.0, and a boxed char backing
+;;                      brings it straight back to parity (0.49 -> 1.02).
+;;
+;;   substring-scan     str-index-of is the widest-reach scan in the string
+;;                      layer: indexOf, contains, literal split and both literal
+;;                      replaces all run it once per character. It called
+;;                      char-by-char-match? at EVERY position, so the call cost
+;;                      more than the comparison — testing the first character
+;;                      inline took a 7.8 MB miss from 56 ms to 18 ms. The
+;;                      reference arm is the SAME search with a CHAR needle,
+;;                      which takes str-char-index and never had an inner call,
+;;                      so it is unaffected by the regression and measures 23 ms
+;;                      on both sides (0.80 -> 2.43).
+;;
 ;;   trim-no-copy       clojure.string/trim was (trimr (triml s)), and triml
 ;;                      copied the whole string even with nothing to trim, so
 ;;                      trimming an already-trimmed string allocated it twice.
@@ -166,6 +196,15 @@
 (def ^:private clean-short (apply str (repeat 64 "x")))
 (def ^:private clean-long (apply str (repeat (* 64 64) "x")))
 
+;; ~1.5 MB of text for the char-array and scan arms. Large enough that a
+;; per-character path cannot hide in the noise of one allocation.
+(def ^:private chars-text (apply str (repeat 40000 "abcdefghijklmnopqrstuvwxyz0123456789abc")))
+(def ^:private chars-len (count chars-text))
+(def ^:private chars-array (.toCharArray chars-text))
+;; a needle that is NOT present, so both scan arms run to the end of the string
+(def ^:private absent-str "QZXW")
+(def ^:private absent-char \Q)
+
 (defn -main [& _]
   (spit src-path source-text)
   (spit data-path payload)
@@ -204,6 +243,33 @@
   ;; from one file. Guards per-file overhead — a scratch sized to the block
   ;; rather than the input, an eager buffer, a per-open allocation.
   (judge! "small-file-drain" slurp-many-small-by-path drain-many-small 4.0 9.0)
+
+  ;; A char array is backed by a string, so building one from a string and
+  ;; reading one back out are block moves — each must cost about what copying
+  ;; the same characters with subs costs.
+  (judge! "chars-copy"
+          #(count (subs chars-text 0 chars-len))
+          #(alength (.toCharArray chars-text))
+          1.5 3.0)
+  (judge! "string-from-chars"
+          #(count (subs chars-text 0 chars-len))
+          #(count (String. chars-array))
+          1.35 2.5)
+
+  ;; ...and allocating one must beat allocating a long array of the same length,
+  ;; because its backing is half as wide and is never traced by the collector.
+  (judge! "char-alloc"
+          #(dotimes [_ 200] (alength (long-array 65536)))
+          #(dotimes [_ 200] (alength (char-array 65536)))
+          0.8 1.5)
+
+  ;; Searching for a multi-character needle must cost about what searching for a
+  ;; single CHARACTER costs — the reference arm takes str-char-index, which never
+  ;; had a call per position, so it does not move when str-index-of regresses.
+  (judge! "substring-scan"
+          #(str/index-of chars-text absent-char)
+          #(str/index-of chars-text absent-str)
+          1.5 3.0)
 
   ;; Trimming a string that needs no trimming must not copy it: 64x the length
   ;; must not cost 64x the time. A copying trim is linear here.

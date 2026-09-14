@@ -46,6 +46,18 @@
 (defn split-engine [s]      (count (str/split s #"[\n\r]+")))
 
 (defn replace-literal [s]   (count (str/replace s #"abc" "xyz")))
+;; The same replace spelled with a literal STRING, which never reached the regex
+;; engine — so it isolates the literal arm's OWN cost rather than the question of
+;; whether a literal pattern gets routed there. That arm walked one character at
+;; a time (a match probe and a write-char per character) long after the routing
+;; was fixed, which is why it needs a row of its own.
+(defn replace-literal-str [s] (count (str/replace s "abc" "xyz")))
+;; A needle that is NOT present: all scan, no emit. This is str-index-of alone,
+;; which sits under indexOf, contains, literal split and both literal replaces —
+;; the widest-reach scan in this file, and the one a per-position procedure call
+;; used to dominate.
+(defn replace-absent [s]    (count (str/replace s "qqzzqq" "x")))
+(defn index-of-absent [s]   (if (str/includes? s "qqzzqq") 1 0))
 (defn replace-engine [s]    (count (str/replace s #"[0-9]+" "#")))
 (defn replace-groups [s]    (count (str/replace s #"\"(\w+)\":" "<$1>")))
 
@@ -65,7 +77,11 @@
                 (unchecked-add (split-literal payload) (split-lines* crlf-payload))
                 (unchecked-add (split-literal-str payload) (split-engine crlf-payload)))
                (unchecked-add
-                (unchecked-add (replace-literal payload) (replace-engine payload))
+                (unchecked-add
+                 (unchecked-add (replace-literal payload) (replace-engine payload))
+                 (unchecked-add (replace-literal-str payload)
+                                (unchecked-add (replace-absent payload)
+                                               (index-of-absent payload))))
                 (unchecked-add
                  (unchecked-add (replace-groups payload) (seq-matches payload))
                  (unchecked-add (trim-dirty) (trim-clean)))))))

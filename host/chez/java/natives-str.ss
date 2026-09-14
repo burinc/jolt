@@ -173,12 +173,28 @@
     (cond ((fx=? j nlen) #t)
           ((char=? (string-ref s (fx+ si j)) (string-ref needle j)) (loop (fx+ j 1)))
           (else #f))))
+;; The FIRST CHARACTER is tested inline, and only a hit calls the full compare.
+;; This scan sits under indexOf, contains, split on a literal, and both literal
+;; replaces, so it runs once per character of every string those touch — and a
+;; procedure call per position is most of what it cost: scanning 6.6 MB for a
+;; needle that never matches took 47 ms through char-by-char-match? alone.
+;; Hoisting the length bound out of the loop matters for the same reason.
 (define (str-index-of s needle from)
   (let ((nlen (string-length needle)) (slen (string-length s)))
-    (let loop ((i (max 0 from)))
-      (cond ((fx>? (fx+ i nlen) slen) -1)
-            ((char-by-char-match? s i needle nlen) i)
-            (else (loop (fx+ i 1)))))))
+    (if (fx=? nlen 0)
+        ;; An empty needle matches AT from, CLAMPED to the string's length —
+        ;; String.indexOf is explicit that "if fromIndex is greater than the
+        ;; length of this String, and the target is the empty string, then the
+        ;; length of this String is returned". The old loop answered -1 there,
+        ;; which is the one place this scan disagreed with Java.
+        (fxmin (fxmax 0 from) slen)
+        (let ((c0 (string-ref needle 0))
+              (last (fx- slen nlen)))
+          (let loop ((i (fxmax 0 from)))
+            (cond ((fx>? i last) -1)
+                  ((and (char=? (string-ref s i) c0)
+                        (char-by-char-match? s i needle nlen)) i)
+                  (else (loop (fx+ i 1)))))))))
 ;; single-char search with no needle allocation — (.indexOf s (int 59)) used to
 ;; build a 1-char string through number->exact->truncate->integer->char->string
 ;; per call (~160ns); honeysql's suspicious? transducer does two per entity.
@@ -196,12 +212,20 @@
              (str-index-of s (str-needle needle) from)))
         ((char? needle) (str-char-index s needle from))
         (else (str-index-of s (str-needle needle) from))))
+;; The backward twin of str-index-of, and it gets the same inline first-character
+;; test for the same reason: a procedure call at every position cost more than
+;; the comparison it was making. An empty needle answers the string's length,
+;; which is what String.lastIndexOf("") returns.
 (define (str-last-index-of s needle)
   (let ((nlen (string-length needle)) (slen (string-length s)))
-    (let loop ((i (fx- slen nlen)) (found -1))
-      (cond ((fx<? i 0) found)
-            ((char-by-char-match? s i needle nlen) i)
-            (else (loop (fx- i 1) found))))))
+    (if (fx=? nlen 0)
+        slen
+        (let ((c0 (string-ref needle 0)))
+          (let loop ((i (fx- slen nlen)))
+            (cond ((fx<? i 0) -1)
+                  ((and (char=? (string-ref s i) c0)
+                        (char-by-char-match? s i needle nlen)) i)
+                  (else (loop (fx- i 1)))))))))
 
 ;; A string argument to a String method: nil is a NullPointerException, as
 ;; String's own methods raise on null (they used to read as the empty string,
@@ -229,20 +253,38 @@
                 (begin (display b op)
                        (when (fx<? i slen) (write-char (string-ref s i) op))
                        (loop (fx+ i 1))))))
+        ;; Jump to the next match and emit the whole span between matches, so
+        ;; the walk costs one put-string PER PART rather than a match probe and
+        ;; a write-char per CHARACTER of input. The old loop advanced one
+        ;; character at a time, which made an 8.7 MB replace 8.7M probes and
+        ;; 8.7M single-character writes — that was the 5.4x against babashka
+        ;; that survived teaching a literal pattern to skip the regex engine.
+        ;; Same shape as str-literal-split and str-replace-literal-first, which
+        ;; are already index-driven.
+        ;;
+        ;; Counting the matches first and filling a PRE-SIZED result with
+        ;; string-copy! was written and measured against this, and is not worth
+        ;; it: 78.0 ms vs 78.7 ms on a 6.6 MB replace with 240k matches. The
+        ;; output port's growth is not the cost — moving the characters is — so
+        ;; the second scan and the extra arithmetic buy 0.9%, and this version
+        ;; is the simpler one.
+        ;;
+        ;; A string with no match at all answers S ITSELF, allocating nothing,
+        ;; which is what String.replace returns when there is nothing to do.
         (let ((first-match (str-index-of s a 0)))
-          (if (fx<? first-match 0) s
+          (if (fx<? first-match 0)
+              s
               (let ((op (open-output-string)))
-                (let loop ((i 0))
+                (let loop ((i 0) (m first-match))
                   (cond
-                   ((fx>? (fx+ i alen) slen)
-                    (display (substring s i slen) op)
+                   ((fx<? m 0)
+                    (when (fx<? i slen) (put-string op s i (fx- slen i)))
                     (get-output-string op))
-                   ((char-by-char-match? s i a alen)
-                    (display b op)
-                    (loop (fx+ i alen)))
                    (else
-                    (write-char (string-ref s i) op)
-                    (loop (fx+ i 1)))))))))))
+                    (when (fx>? m i) (put-string op s i (fx- m i)))
+                    (put-string op b)
+                    (let ((next (fx+ m alen)))
+                      (loop next (str-index-of s a next))))))))))))
 
 ;; A compiled irregex for a plain-string Java-regex pattern (or a jolt-regex).
 (define (str-irx pat) (regex-t-irx (jolt-re-pattern pat)))

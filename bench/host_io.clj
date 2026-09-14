@@ -86,10 +86,33 @@
   (reduce (fn [acc p] (+ acc (count (slurp p)))) 0 paths))
 
 ;; --- String <-> char[] round trip (the two 20x shapes) ------------------------
+;; Both ends of this are now one block move: a char array is backed by a Chez
+;; STRING, so .toCharArray is a string copy and (String. ca) is a substring of
+;; the backing. They used to be a cons per character and a second walk over the
+;; list, in both directions.
 (defn char-array-round-trip [^String s]
   (let [ca (.toCharArray s)]
     (+ (count (String. ca))
        (count (String. ca 0 (quot (alength ca) 2))))))
+
+;; --- ALLOCATING a char array --------------------------------------------------
+;; Its own row because it is the one cost here with no decode, no copy and no
+;; traversal in it — just the backing. A boxed vector of n characters is n
+;; POINTERS the collector traces on every major GC; a string of n characters is
+;; a flat untraced block half the size. Nothing else in this file would notice
+;; the difference, because every other row is dominated by what it then does
+;; with the array.
+(defn alloc-char-arrays [^long n ^long size]
+  (loop [i 0 acc 0]
+    (if (< i n) (recur (inc i) (unchecked-add acc (alength (char-array size)))) acc)))
+
+;; --- slurp, by PATH -----------------------------------------------------------
+;; A different code path from every reader row above: slurping a path decodes
+;; the file through the port's own transcoder rather than going through the
+;; char-reader drain. It was reading with get-string-all, which grows its result
+;; as it goes; the file's byte length bounds the character count, so the buffer
+;; can be allocated once.
+(defn slurp-by-path [path] (count (slurp path)))
 
 (defn run [iters src-path small-paths]
   (loop [i 0 acc 0]
@@ -100,9 +123,12 @@
               (unchecked-add
                (unchecked-add (read-form-from-stream src-path)
                               (read-form-from-string source-text))
-               (unchecked-add (drain-chunked tmp-path 65536)
-                              (unchecked-add (char-array-round-trip payload)
-                                             (slurp-many-small small-paths))))))
+               (unchecked-add
+                (unchecked-add (drain-chunked tmp-path 65536)
+                               (unchecked-add (alloc-char-arrays 4 65536)
+                                              (slurp-by-path tmp-path)))
+                (unchecked-add (char-array-round-trip payload)
+                               (slurp-many-small small-paths))))))
       acc)))
 
 (defn -main [& args]

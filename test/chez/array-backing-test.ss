@@ -2,7 +2,7 @@
 ;;   chez --script test/chez/array-backing-test.ss
 ;; Semantics are certified by the corpus; this pins the REPRESENTATION — an
 ;; fxvector for int/long/short, a bytevector for byte, an flvector for
-;; double/float, a boxed vector for the rest — so a regression back to one boxed
+;; double/float, a STRING for char, a boxed vector for the rest — so a regression back to one boxed
 ;; vector for everything fails here even where every value test still passes.
 ;;
 ;; It also pins the two ways a kind's array is legitimately BOXED: a value past
@@ -26,6 +26,7 @@
     (cond ((fxvector? v) 'fxvector)
           ((bytevector? v) 'bytevector)
           ((flvector? v) 'flvector)
+          ((string? v) 'string)
           ((vector? v) 'vector)
           (else 'unknown))))
 (define (backing name src want)
@@ -40,7 +41,7 @@
 (backing "byte-array n"  "(byte-array 4)"               'bytevector)
 (backing "double-array"  "(double-array [1.5])"         'flvector)
 (backing "float-array"   "(float-array 2)"              'flvector)
-(backing "char-array"    "(char-array 2)"               'vector)
+(backing "char-array"    "(char-array 2)"               'string)
 (backing "boolean-array" "(boolean-array 2)"            'vector)
 (backing "object-array"  "(object-array 2)"             'vector)
 ;; every other way in reaches the same table
@@ -53,6 +54,37 @@
 ;; a reference array is boxed whatever it came from
 (backing "into-array untyped" "(into-array [1 2])"      'vector)
 (backing "to-array"      "(to-array [1 2])"             'vector)
+;; every door into a char array reaches the string backing
+(backing "char-array str" "(char-array \"abc\")"         'string)
+(backing "char-array seq" "(char-array [\\a \\b])"         'string)
+(backing ".toCharArray"  "(.toCharArray \"hi\")"          'string)
+(backing "aclone chars"  "(aclone (char-array \"ab\"))"    'string)
+(backing "into-array chars" "(into-array Character/TYPE [\\a])" 'string)
+;; an INTEGER element is the JVM's widening int->char store, so it keeps the
+;; string backing rather than boxing — (aset chars 0 65) puts \A there
+(backing "char-array of ints" "(char-array [65 66])"     'string)
+
+;; --- the char backing's own widening -----------------------------------------
+;; A Chez string holds CHARACTERS, so a char array handed something no character
+;; denotes swaps in a boxed vector, exactly as an fxvector does for a bignum.
+(ok "a non-character store widens the char backing"
+    (let ((a (evv "(doto (char-array 2) (aset 0 :k))")))
+      (and (eq? 'vector (backing-of a)) (eq? 'char (jolt-array-kind a)))))
+(ok "a nil store widens too"
+    (eq? 'vector (backing-of (evv "(doto (char-array 2) (aset 0 nil))"))))
+(ok "an integer store does NOT widen"
+    (eq? 'string (backing-of (evv "(doto (char-array 2) (aset 0 65) (aset 1 \\b))"))))
+;; A LONE SURROGATE is a legal JVM char[] element (a char is a UTF-16 code unit)
+;; but not a Chez string element (integer->char refuses that range), so it is
+;; the one ordinary-looking char store that boxes.
+(ok "a lone surrogate widens rather than raising"
+    (eq? 'vector (backing-of (evv "(doto (char-array 2) (aset 0 0xD800))"))))
+(is "widened chars: read back"
+    "(let [a (char-array 3)] (aset a 0 :k) (aset a 1 \\b) [(aget a 0) (aget a 1) (count a) (alength a)])"
+    "[:k \\b 3 3]")
+(is "widened chars: String. still reads it"
+    "(let [a (char-array 2)] (aset a 0 \\x) (aset a 1 \\y) (String. a))"
+    "xy")
 
 ;; --- widening past the fixnum range ------------------------------------------
 (ok "a bignum store widens the backing"
@@ -99,6 +131,32 @@
 (ok "equals across the two representations"
     (ja-equal? legacy-longs (na-long-array (jolt-vector 1 2))))
 (ok "a boxed long array takes the hinted read" (eqv? 2 (jolt-vaget legacy-longs 1)))
+;; A char array built the way a pre-string-backing image restores one: the
+;; record with a plain vector in it. Every accessor dispatches on the backing,
+;; so it reads, writes and renders as it always did.
+(define legacy-chars (make-jolt-array (vector #\a #\b #\c) 'char))
+(ok "a boxed char array reads" (equal? '(#\a #\b #\c) (ja->list legacy-chars)))
+(ok "a boxed char array counts" (fx=? 3 (ja-len legacy-chars)))
+(ok "a boxed char array writes" (begin (na-array-set! legacy-chars 0 #\z) (eqv? #\z (ja-ref legacy-chars 0))))
+(ok "a boxed char array still answers [C" (string=? "[C" (na-array-class-name legacy-chars)))
+(ok "equals across the two char representations"
+    (ja-equal? (make-jolt-array (vector #\a #\b) 'char) (na-char-array "ab")))
+(ok "a string-backed array copies INTO a boxed one"
+    (let ((dst (make-jolt-array (vector #\space #\space) 'char)))
+      (ja-copy-range! (na-char-array "hi") 0 dst 0 2)
+      (equal? '(#\h #\i) (ja->list dst))))
+(ok "a boxed char array copies into a STRING-backed one"
+    (let ((dst (na-char-array 2)))
+      (ja-copy-range! (make-jolt-array (vector #\o #\k) 'char) 0 dst 0 2)
+      (equal? '(#\o #\k) (ja->list dst))))
+;; the hinted accessors reach a char array only through a LYING hint (:chars is
+;; not a hinted kind), and must not read a string as a vector
+(ok "a lying hinted read on a string-backed char array"
+    (eqv? #\b (jolt-vaget (na-char-array "ab") 1)))
+(ok "a lying hinted store on a string-backed char array"
+    (let ((a (na-char-array "ab")))
+      (jolt-vaset a 0 #\z)
+      (equal? '(#\z #\b) (ja->list a))))
 
 ;; --- byte elements stay signed, whichever door they came in -------------------
 (is "byte narrowing at every entry point"
