@@ -308,6 +308,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A type-hinted instance call inside SCI reported `No dependency provides
+  java.lang.StringBuilder` for a class jolt fully supplies.** SCI resolves a
+  `^Hint` to a `Class` at analysis time and then asks that `Class` whether it
+  is a functional interface to adapt — `.isAnnotationPresent`. jolt's
+  `java.lang.Class` surface had no annotation arms, and a `Class` value that
+  recognises no member falls through to the *statics* of the class it names, so
+  the question became a lookup for a static named `isAnnotationPresent` on
+  `java.lang.StringBuilder` and came back as RFC 0014's "add a dependency" —
+  advice that cannot be taken, since `register-class-provider!` refuses a claim
+  on a class the runtime already provides. `(defn f [^StringBuilder sb]
+  (.append sb "x"))` could not be analyzed at all inside SCI while the unhinted
+  call worked, so an extension carrying one `^StringBuilder` loop failed to
+  load. `Class` now answers the annotation surface — `isAnnotationPresent`,
+  `getAnnotation`, `getAnnotations`, `getDeclaredAnnotations` — with "none",
+  which is jolt's real answer: nothing anywhere carries an annotation to
+  report. (#983)
+
+- **A member miss on a class the runtime implements read as a missing
+  dependency.** jolt registers a constructor and an instance method table for
+  `java.lang.StringBuilder` and no statics at all, so `StringBuilder/anything`
+  fell off the end of the class table and reported "No dependency provides
+  StringBuilder" rather than naming the member. A class the runtime provides
+  now reports `No matching field or method: StringBuilder/anything`, the same
+  message the class-with-statics path already gave; a JDK class nothing
+  supplies still reports RFC 0014. (#983)
+
 - **Dependency fetching failed on Android/Termux: every `connect()` got a NULL
   `sockaddr`.** `jolt.mvn-http` read `struct addrinfo`'s `ai_addr` at an offset
   chosen from `os.name` — 32 on macOS/Windows, 24 everywhere else — but bionic
