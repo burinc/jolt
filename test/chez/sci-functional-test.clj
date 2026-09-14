@@ -93,4 +93,26 @@
             (catch Throwable e
               (if (re-find #"noSuchMethod" (ex-message e)) :threw :wrong-message)))))
 
+
+;; A value with its own value-semantics seam (java.time) as an interop ARGUMENT.
+;; sci.impl.reflector/box-arg casts every argument to its reflected parameter
+;; type, and jolt — carrying no signatures — reports every parameter as
+;; java.lang.Object, so an argument only survives the call if
+;; (.cast java.lang.Object v) is the identity. It was not for java.time values:
+;; their instance? arm answered a definitive false for the root type and the
+;; cast threw ClassCastException, so any interpreted call taking one died (#985).
+;; Receivers are not boxed, which is why (.getYear d) worked all along and only
+;; arguments failed.
+(let [ctx (sci/init {:classes {'java.time.LocalDate java.time.LocalDate
+                               'java.time.Duration java.time.Duration
+                               'java.lang.Object java.lang.Object}
+                     :imports {'LocalDate 'java.time.LocalDate
+                               'Duration 'java.time.Duration}})]
+  (check= "java.time value as an instance-method argument" true
+          (sci/eval-string* ctx "(.isAfter (LocalDate/of 2021 1 1) (LocalDate/of 2020 1 1))"))
+  (check= "java.time values as static-method arguments" "PT24H"
+          (sci/eval-string* ctx "(str (Duration/between (LocalDate/of 2020 1 1) (LocalDate/of 2020 1 2)))"))
+  (check= "a java.time value is an Object" true
+          (sci/eval-string* ctx "(instance? java.lang.Object (LocalDate/of 2020 3 5))")))
+
 (println "SCI-FUNCTIONAL-TEST OK")
