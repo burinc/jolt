@@ -308,6 +308,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A type-hinted instance call inside SCI reported `No dependency provides
+  java.lang.StringBuilder` for a class jolt fully supplies.** SCI resolves a
+  `^Hint` to a `Class` at analysis time and then asks that `Class` whether it
+  is a functional interface to adapt — `.isAnnotationPresent`. jolt's
+  `java.lang.Class` surface had no annotation arms, and a `Class` value that
+  recognises no member falls through to the *statics* of the class it names, so
+  the question became a lookup for a static named `isAnnotationPresent` on
+  `java.lang.StringBuilder` and came back as RFC 0014's "add a dependency" —
+  advice that cannot be taken, since `register-class-provider!` refuses a claim
+  on a class the runtime already provides. `(defn f [^StringBuilder sb]
+  (.append sb "x"))` could not be analyzed at all inside SCI while the unhinted
+  call worked, so an extension carrying one `^StringBuilder` loop failed to
+  load. `Class` now answers the annotation surface — `isAnnotationPresent`,
+  `getAnnotation`, `getAnnotations`, `getDeclaredAnnotations` — with "none",
+  which is jolt's real answer: nothing anywhere carries an annotation to
+  report. (#983)
+
+- **A member miss on a class the runtime implements read as a missing
+  dependency.** jolt registers a constructor and an instance method table for
+  `java.lang.StringBuilder` and no statics at all, so `StringBuilder/anything`
+  fell off the end of the class table and reported "No dependency provides
+  StringBuilder" rather than naming the member. A class the runtime provides
+  now reports `No matching field or method: StringBuilder/anything`, the same
+  message the class-with-statics path already gave; a JDK class nothing
+  supplies still reports RFC 0014. (#983)
+
+- **Dependency fetching failed on Android/Termux: every `connect()` got a NULL
+  `sockaddr`.** `jolt.mvn-http` read `struct addrinfo`'s `ai_addr` at an offset
+  chosen from `os.name` — 32 on macOS/Windows, 24 everywhere else — but bionic
+  reports `os.name` as `Linux` while laying the struct out in the BSD order
+  (`ai_canonname` at 24, `ai_addr` at 32). The read returned the NULL
+  `ai_canonname`, `connect()` failed `EFAULT` for every candidate address, and
+  nothing outside the local Maven cache could be resolved. The offset is now
+  probed off the live `getaddrinfo` result instead of guessed from the platform
+  name: the lookup never asks for `AI_CANONNAME`, so the NULL slot is
+  `ai_canonname` and the other is `ai_addr`. An inconclusive node still falls
+  back to what `os.name` implies. Exhausting the candidates also reported
+  `connection refused` whatever the kernel actually said — it now names the
+  captured error (`could not connect to repo.clojars.org:443 (errno 14: Bad
+  address)`), so a bad sockaddr does not read as a network outage. (#979)
+
+- **`(instance? java.lang.Object v)` is true for every non-nil value, including
+  a `java.time` one, and `(.cast Object v)` is the identity.** Every
+  `java.time.*` shim value answered `false` to `(instance? java.lang.Object v)`
+  and `(.cast Object v)` threw `class java.time.ZoneId cannot be cast to class
+  java.lang.Object` (#985). The value-semantics seam `jolt.time` registers
+  through `__register-instance-check!` answers a definitive `false` for any
+  class its value's own set does not list, and the root rule — every non-nil
+  value is an `Object` — was itself just the FIRST-registered arm, hence the
+  last one asked. The root type is now decided in `instance-check` before the
+  registry runs, so no arm can answer it. Compiled code was unaffected, which is
+  what made this hard to place: SCI's `box-arg` casts every interop argument to
+  its reflected parameter type and jolt, carrying no signatures, reports every
+  parameter as `java.lang.Object` — so any interpreted call passing a
+  `java.time` value as an argument died in the cast, while the same expression
+  worked at the (compiled) REPL. Receivers are not boxed, so `(.getId zone)`
+  worked and `(.withZoneSameInstant zdt zone)` did not.
+
+- **`java.lang.StringBuffer` resolved as a class but could not be built —
+  `(StringBuffer.)` raised `No matching ctor found for class StringBuffer`.**
+  The class graph carried its row and `StringBuilder` was complete, so only the
+  constructor and the shim were missing and the class was inert. It is modeled
+  now over the same store `StringBuilder` uses: the constructors (empty, a
+  `CharSequence`, and the capacity `int` that is a hint rather than content),
+  the whole instance surface (`append` / `toString` / `length` / `charAt` /
+  `setLength` / `substring` / `insert` / `delete` / `deleteCharAt` / `replace` /
+  `reverse` / `indexOf` / `lastIndexOf` / `setCharAt` / `isEmpty` /
+  `subSequence`), and the `str`, `count`, `seq`, `class` and `instance?` arms —
+  under its OWN jhost tag, so a `StringBuffer` reports `java.lang.StringBuffer`
+  and answers `false` to `(instance? StringBuilder …)` rather than borrowing the
+  class of the store it shares. The compiler's direct-emit path for a proven
+  builder receiver covers it too, so the legacy builder is not slower for being
+  older. rewrite-clj's reader builds one per token, so this is what made
+  `cljfmt`'s parser — and a downstream project's `jolt format` /
+  `jolt format-check` — fail. (#978)
+
+- **A `jolt.ffi` callback arriving on a native library's own thread now has a
+  diagnosis, and the two signatures it cannot carry are refused in jolt's own
+  words.** A `:collect-safe` callback reactivates the thread it arrives on, but
+  it still allocates, and an allocation that reaches a trip point has to stop
+  the world — which cannot happen while another thread is parked inside a
+  foreign call that is not `:blocking`, since such a thread stays ACTIVE and
+  never reaches a safe point. When the parked call is itself waiting for that
+  callback's answer (a client read served by the same library's dispatch
+  thread) the two wait for each other, and what surfaces is the call's own
+  timeout, on the first request and the more reliably the more the callback
+  allocates. `jolt.ffi` documents the rule and
+  `test/chez/ffi-foreign-thread-test.sh` gates both halves of it. Reaching for
+  `:blocking` then hit a second wall: Chez refuses a `:string` argument on a
+  `__collect_safe` procedure (and a `:string` result on a `__collect_safe`
+  callable), and its message arrived from inside the macro under a `chi-*`
+  expander trace, naming neither the option that caused it nor the position.
+  Both are now rejected by jolt, naming the argument and what to pass instead.
+  (#973)
+
 - **A nested REPL — `(clojure.main/repl)` at a jolt prompt — threw `No matching
   field found: read for class clojure.lang.IObj$reify__0` once per prompt,
   forever.** `repl-read` walks its input a character at a time through

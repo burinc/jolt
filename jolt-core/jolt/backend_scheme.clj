@@ -1667,6 +1667,24 @@
     (when (and vi (:blocking node))
       (throw (ex-info (str "jolt.ffi: " marker " cannot combine with :blocking")
                       {:argtypes at})))
+    ;; Chez refuses a string ARGUMENT on a __collect_safe procedure: the string
+    ;; is marshalled into collector-owned memory whose address C holds for the
+    ;; whole call, and a DEACTIVATED thread is exactly the one that cannot keep
+    ;; the collector off it. Its own message ("string argument not allowed with
+    ;; __collect_safe procedure") arrives from inside the macro, with a chi-*
+    ;; expander trace and no mention of the option that caused it — and
+    ;; :blocking is the first thing one reaches for after a callback stalls
+    ;; behind a call that pinned the collector (issue #973), so name the
+    ;; argument and what to pass instead. A string RESULT is fine: it is built
+    ;; after the thread is active again.
+    (when (:blocking node)
+      (when-let [i (first (keep-indexed (fn [i type] (when (= "string" type) i)) at))]
+        (throw (ex-info (str "jolt.ffi: :blocking cannot combine with a :string argument"
+                             " (argument " i " of \"" (:csym node) "\") — the collector may"
+                             " move the string while the deactivated thread is inside C."
+                             " Pass a :pointer instead: jolt.ffi/string->ptr, or an"
+                             " arena-owned string, released once the call returns.")
+                        {:argtypes at :argument i}))))
     (when (and vi ret-aggregate?)
       (throw (ex-info (str "jolt.ffi: aggregate returns cannot combine with " marker)
                       {:argtypes at})))
@@ -1825,6 +1843,18 @@
 ;; The wrapper lambda is emitted only when the signature actually mentions
 ;; :string; every other callable reaches sa-foreign-callable exactly as before.
 (defn- emit-ffi-callable [node]
+  ;; The mirror of the :blocking/:string rule in emit-ffi-fn, with the direction
+  ;; swapped: on a __collect_safe CALLABLE it is the string RESULT Chez refuses,
+  ;; because the callable hands C that string's address as it deactivates the
+  ;; thread on the way out. Arguments are fine — C owns those bytes. Same reason
+  ;; for saying it here: Chez's message names neither :collect-safe nor the
+  ;; position, and arrives under an expander trace.
+  (when (and (:collect-safe node) (= "string" (:rettype node)))
+    (throw (ex-info (str "jolt.ffi: a :collect-safe callback cannot return :string —"
+                         " the collector may move it while C holds the pointer."
+                         " Return a :pointer instead: jolt.ffi/string->ptr, or an"
+                         " arena-owned string whose lifetime C's use fits inside.")
+                    {:rettype (:rettype node) :argtypes (:argtypes node)})))
   (let [argtypes (:argtypes node)
         rettype (:rettype node)
         converted? #{"string" "bool"}

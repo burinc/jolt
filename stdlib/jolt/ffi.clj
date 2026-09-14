@@ -1333,7 +1333,15 @@
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
-;; so it's emitted collect-safe and won't pin the garbage collector.
+;; so it's emitted collect-safe and won't pin the garbage collector. It is not
+;; only about latency: a thread inside a call that is NOT :blocking stays ACTIVE
+;; for the whole call, and the stop-the-world collector waits for every active
+;; thread. So if anything else needs to collect while this call is parked in C,
+;; it waits until the call returns — including a :collect-safe callback arriving
+;; on one of the library's own threads, which is how a request/response pair
+;; through one native library wedges itself (see foreign-callable below, and
+;; issue #973). A :string ARGUMENT cannot combine with :blocking; pass a
+;; :pointer (string->ptr, or an arena-owned string) in that position.
 ;; A :& (or :varargs — the same marker, jolt's older spelling) inside the argtype
 ;; vector declares a VARIADIC libc function and marks the boundary: the types
 ;; before it are the fixed (named) parameters, the types after it are the
@@ -1504,6 +1512,22 @@
 ;; that no handler can catch. It costs an activation per call, so leave it off
 ;; for a callback C only ever invokes on the thread that called into C (a qsort
 ;; comparator).
+;;
+;; :collect-safe gets the callback IN. What it cannot do is collect on its
+;; behalf: the reactivated thread allocates like any other, and an allocation
+;; that reaches a trip point has to stop the world. If the thread that called
+;; into C is parked in a foreign call that is NOT :blocking, it never reaches a
+;; safe point, so that collection — and the callback with it — waits for the
+;; call to return. When the call is waiting for the callback's answer (a client
+;; read served by the same library's dispatch thread) the two wait for each
+;; other, and what surfaces is the call's own timeout, on the FIRST request and
+;; the more reliably the more the callback allocates. Mark the outbound call
+;; :blocking and the deadlock cannot form. This is issue #973, and
+;; test/chez/ffi-foreign-thread-test.sh is the shape.
+;;
+;; A :collect-safe callback cannot RETURN :string (it hands C an address as it
+;; deactivates); return a :pointer. A :string ARGUMENT is fine — C owns those
+;; bytes. The restriction is the mirror of :blocking's, which is on arguments.
 ;;   (g-signal-connect button "clicked"
 ;;                     (ffi/foreign-callable on-click [:pointer :pointer] :void :collect-safe)
 ;;                     (ffi/null))

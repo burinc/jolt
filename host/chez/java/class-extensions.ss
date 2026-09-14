@@ -198,7 +198,8 @@
 ;; answered — so no extend registration can ever be the one a direct emit
 ;; shadowed.
 (define class-ext-direct-emit-classes
-  '("java.lang.String" "clojure.lang.Keyword" "java.lang.StringBuilder"))
+  '("java.lang.String" "clojure.lang.Keyword" "java.lang.StringBuilder"
+    "java.lang.StringBuffer"))
 
 (define (class-ext-check-override! cls)
   (let loop ((cs class-ext-direct-emit-classes))

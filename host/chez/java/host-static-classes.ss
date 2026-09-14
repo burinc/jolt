@@ -226,16 +226,17 @@
                  (string-append "start " (number->string start) ", end " (number->string end)
                                 ", length " (number->string n))))))
 
+(define (string-builder-state args)
+  ;; a numeric first arg is a CAPACITY hint, not content; nil is the
+  ;; NullPointerException the JVM's String ctor raises.
+  (vector (cond ((null? args) "")
+                ((jolt-nil? (car args)) (throw-jvm 'NullPointerException "str"))
+                ((number? (car args)) "")
+                (else (render-piece (car args))))
+          '() 0))
 (register-class-ctor! "StringBuilder"
-  (lambda args (make-jhost "string-builder"
-    ;; a numeric first arg is a CAPACITY hint, not content; nil is the
-    ;; NullPointerException the JVM's String ctor raises.
-    (vector (cond ((null? args) "")
-                  ((jolt-nil? (car args)) (throw-jvm 'NullPointerException "str"))
-                  ((number? (car args)) "")
-                  (else (render-piece (car args))))
-            '() 0))))
-(register-host-methods! "string-builder"
+  (lambda args (make-jhost "string-builder" (string-builder-state args))))
+(define string-builder-methods
   (list (cons "append" (lambda (self x . rest) (sb-append! self (append-text x rest)) self))
         (cons "toString" (lambda (self) (sb-str self)))
         (cons "length" (lambda (self) (->num (sb-length self))))
@@ -298,22 +299,42 @@
         (cons "reverse" (lambda (self)
                           (sb-set! self (list->string (reverse (string->list (sb-str self)))))
                           self))))
+(register-host-methods! "string-builder" string-builder-methods)
+
+;; StringBuffer — the legacy synchronized builder, over the SAME store and the
+;; same method set. Nothing in jolt runs two threads into one builder, so the
+;; synchronization is not observable and the only thing that must differ is the
+;; class a value reports: a second tag, not a second ctor onto "string-builder",
+;; because (class (StringBuffer.)) and (instance? StringBuffer x) have to answer
+;; with the class the caller wrote. rewrite-clj's reader (cljfmt's parser) builds
+;; one per token, which is what made the gap load-bearing.
+(register-class-ctor! "StringBuffer"
+  (lambda args (make-jhost "string-buffer" (string-builder-state args))))
+(register-host-methods! "string-buffer" string-builder-methods)
+
 ;; (str sb) / print a StringBuilder -> its accumulated content, like the JVM
 ;; (str calls toString). Without this str renders the opaque host object.
-(define (sb-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "string-builder")))
+;; Both tags answer here: every arm below is about the shared store, so asking
+;; the tag literally at any one of them is how a StringBuffer silently stops
+;; being countable, seqable or printable while a StringBuilder still is.
+(define (sb-builder-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "string-builder")))
+(define (sb-buffer-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "string-buffer")))
+(define (sb-jhost? x) (or (sb-builder-jhost? x) (sb-buffer-jhost? x)))
+(define (sb-class-name x)
+  (if (sb-buffer-jhost? x) "java.lang.StringBuffer" "java.lang.StringBuilder"))
 (register-str-render! sb-jhost? sb-str)
 ;; A StringBuilder IS a java.lang.CharSequence, so it answers (class …),
 ;; instance? through the class graph, and the three RT entry points that name a
 ;; CharSequence — count is its length, seq walks its characters, nth reads one.
 ;; Without the class arm (class sb) leaked the :object placeholder.
-(register-class-arm! sb-jhost? (lambda (x) "java.lang.StringBuilder"))
+(register-class-arm! sb-jhost? sb-class-name)
 ;; An array class reaches instance-check as a raw string ("[C"), not a symbol, and
 ;; this arm is newer than the base taxonomy so it is asked first — hence the
 ;; symbol-t? guard before reading the name.
 (register-instance-check-arm!
   (lambda (type-sym val)
     (if (and (sb-jhost? val) (symbol-t? type-sym))
-        (jch-isa? "java.lang.StringBuilder" (symbol-t-name type-sym))
+        (jch-isa? (sb-class-name val) (symbol-t-name type-sym))
         'pass)))
 (register-count-arm! sb-jhost? (lambda (x) (sb-length x)))
 (register-seq-arm! sb-jhost? (lambda (x) (jolt-seq (sb-str x))))
@@ -520,7 +541,7 @@
     ((and (jhost? target) (string=? (jhost-tag target) "port-writer"))
      (display s (port-writer-port target)))
     ((and (jhost? target) (memv #t (list (string=? (jhost-tag target) "writer")
-                                         (string=? (jhost-tag target) "string-builder"))))
+                                         (sb-jhost? target))))
      (sb-append! target s))
     ;; every other host writer knows how to write itself — a file-backed writer, an
     ;; OutputStreamWriter, a nested PrintWriter. Naming them one by one left
@@ -2364,6 +2385,26 @@
         ;; getModifiers: the JVM bitmask, derived from the class graph (jolt has
         ;; no bytecode to read one out of). Modifier's predicates read it.
         (cons "getModifiers" (lambda (self) (->num (jch-modifiers (jclass-name self)))))
+        ;; ---- annotations ----------------------------------------------------
+        ;; jolt models no annotations: the class graph records supertypes and
+        ;; modifiers, and nothing anywhere carries an annotation to report. So the
+        ;; whole surface answers "none" — which is a real answer, not a gap, and
+        ;; the JVM's own answer for every class that carries no annotation.
+        ;;
+        ;; It has to be answered HERE rather than left to the miss path, because a
+        ;; Class value that does not recognise a member falls through to the
+        ;; STATICS of the class it names (host-static.ss, the imported-token arm):
+        ;; (.isAnnotationPresent c FunctionalInterface) became a lookup for a
+        ;; static named isAnnotationPresent on java.lang.StringBuilder, which
+        ;; reported "No dependency provides java.lang.StringBuilder" for a class
+        ;; jolt fully supplies. SCI asks exactly this of every ^Hint it resolves —
+        ;; sci.impl.reflector/maybe-fi-method, on the way to deciding whether the
+        ;; hinted target is a functional interface to adapt — so a hinted instance
+        ;; call inside SCI could not analyze at all (jolt#983).
+        (cons "isAnnotationPresent" (lambda (self ann) #f))
+        (cons "getAnnotation" (lambda (self ann) jolt-nil))
+        (cons "getAnnotations" (lambda (self) (make-jolt-array (vector) 'objects)))
+        (cons "getDeclaredAnnotations" (lambda (self) (make-jolt-array (vector) 'objects)))
         ;; interned like every other Class token, so (identical? (.getClass String) Class)
         (cons "getClass" (lambda (self) (jolt-class-for "java.lang.Class")))))
 
