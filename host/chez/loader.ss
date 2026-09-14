@@ -526,6 +526,36 @@
                 (cons ldr-unchecked-cell (var-cell-root ldr-unchecked-cell)))
           thunk))))
 
+;; The loader's two compile-from-source entrances -- load-jolt-file* below and
+;; the AOT capture around it (aot-capture-load) -- each refuse BY NAME in a
+;; binary built without the compiler, before either touches a compiler binding.
+;; build.ss drop-compiler? leaves compile-eval.ss out of such a binary, so
+;; jolt-compile-eval-form and the capture parameters both entrances parameterize
+;; are unbound there, and the first one touched died as "variable
+;; jolt-aot-capture-file is not bound": a raw Chez error naming a loader
+;; internal, with nothing pointing at the cause. The one way a compiler-dropped
+;; binary reaches source is a :jolt/tree-shake {:allow-dynamic […]} vouch that
+;; was wrong -- a require, requiring-resolve or compile of a computed name the
+;; vouch said never runs in the binary, or names only what the build baked,
+;; running and naming a namespace whose source is on the roots (dce.ss
+;; dce-bail-scan); the verdict runs on every build, so the default build is as
+;; exposed as a shaken one. Image restore refuses the same way (state-image.ss
+;; image-compile-eval-seam). Probed through sa-baked-global, the seam
+;; aot-runtime-fingerprint already reads a baked global through.
+(define (ldr-need-compiler! path)
+  (unless (procedure? (sa-baked-global 'jolt-compile-eval-form))
+    (jolt-throw (jolt-ex-info
+                  (string-append
+                    "this build has no compiler; cannot load " path " from source."
+                    " The build dropped the compiler because nothing reachable"
+                    " compiles at run time, and a deps.edn :jolt/tree-shake"
+                    " {:allow-dynamic […]} entry vouched for the site that just did"
+                    " -- a require, requiring-resolve or compile of a computed name"
+                    " that never runs in the binary, or names only a namespace the"
+                    " build baked. Drop the entry that covers this site, or require"
+                    " the namespace statically so the build bakes it.")
+                  (jolt-hash-map (keyword #f "file") path)))))
+
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
 
@@ -533,6 +563,7 @@
 ;; Split out so the AOT cache (below) reads source once for both keying and the
 ;; capture load, instead of re-reading inside the loop.
 (define (load-jolt-file* path src)
+  (ldr-need-compiler! path)
   (let ((end (string-length src)))
     ;; parameterize (not a bare set!) so a require nested in this file's ns form
     ;; restores path when control returns to the rest of this file.
@@ -584,17 +615,37 @@
               ;; and the run exited 0. A test file that lost its whole body that
               ;; way still looked like a pass. The JVM raises "Unmatched
               ;; delimiter: )" here (jolt-3amm).
-              (let loop ((i 0))
+              (let loop ((i 0) (ord 0))
                 (when (< i end)
                   (let-values (((form j) (rdr-read-top src i end)))
                     (when (> j i)
-                      (unless (rdr-eof? form)
-                        (when (getenv "JOLT_TRACE_LOAD")
-                          (display "  [load-form] " (current-error-port))
-                          (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
-                        (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
-                                                (chez-current-ns)))
-                      (loop j))))))))))))
+                      ;; ord counts every top-level form read (the ns form
+                      ;; included): it is the def-ordinal clock for the build's
+                      ;; visibility replay — rt.ss var-def-ordinals, stamped via
+                      ;; jolt-load-frames (NOT the gate: fibers share a
+                      ;; parameter cell, and the gate must stay off outside a
+                      ;; build's walks). PUSHED, not set: a file loaded from
+                      ;; inside this form — (load "impl") in a multi-file
+                      ;; namespace — defines vars that become visible to the
+                      ;; rest of THIS file at THIS ordinal, and its own frame
+                      ;; alone cannot say that. The frame carries the namespace
+                      ;; current as the form starts, so a nested REQUIRE's defs
+                      ;; (another namespace) claim no ordinal here. Bound for the
+                      ;; form's whole compile+eval (a macro expanding to defs
+                      ;; stamps at its call form's ordinal), then bumped. One
+                      ;; tail call: an eof placeholder read consumes no ordinal.
+                      (if (rdr-eof? form)
+                          (loop j ord)
+                          (begin
+                            (when (getenv "JOLT_TRACE_LOAD")
+                              (display "  [load-form] " (current-error-port))
+                              (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
+                            (parameterize ((jolt-load-frames
+                                             (cons (make-load-frame path ord (chez-current-ns))
+                                                   (jolt-load-frames))))
+                              (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
+                                                      (chez-current-ns)))
+                            (loop j (fx+ ord 1)))))))))))))))
 
 ;; --- AOT / compile cache for required namespaces ----------------------------
 ;; A disk-backed namespace is recompiled from source on EVERY run (load-jolt-file
@@ -966,6 +1017,7 @@
 ;; and reset to #f, dropping this ns's forms AFTER the require (the require's
 ;; target would cache, but the requiring ns's own defs would vanish from its .so).
 (define (aot-capture-load file src)
+  (ldr-need-compiler! file)
   (let ((cap (open-output-string)))
     (parameterize ((jolt-aot-capture cap) (jolt-aot-capture-file file))
       (load-jolt-file* file src)
@@ -1170,6 +1222,7 @@
          ;; embedded fasl registered but failed to load: fall back to source.
          (load-jolt-file file))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
+          (not (ldr-source-only?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
           ;; there is no key that would be safe to reuse.

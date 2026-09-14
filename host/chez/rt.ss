@@ -1139,6 +1139,10 @@
         (hashtable-set! proc-name-tbl v (cons ns name)))))
   (jolt-with-mutex var-table-mu (hashtable-set! ns-has-vars-set ns #t))
   (let ((c (jolt-var ns name)))
+    ;; first-def stamp for the build's visibility replay (see var-def-ordinals
+    ;; above): the loader's current top-level form ordinal at the moment this
+    ;; def runs. First writer wins.
+    (var-def-ordinal-set! ns name)
     ;; A var this def is REDEFINING -- it already had a value. Recorded because the
     ;; inline pass may not splice such a var's body: a caller compiled between two
     ;; defs would freeze the first one while a later caller splices the second, and
@@ -1173,6 +1177,107 @@
 ;; metadata — all three matching the JVM, where the flag is a field on the Var.
 (define (def-var-plain! ns name v)
   (let ((c (def-var! ns name v))) (var-cell-dynamic?-set! c #f) c))
+
+;; --- def-ordinal visibility (same-ns forward references across build passes) --
+;; A same-ns var is visible to a form only from the top-level form that defined
+;; it onward — the in-order semantics of the loader, the REPL, and the JVM. The
+;; BUILD violates that by construction: pass 1 loads every namespace (so a var
+;; redefined later in a file exists by the end), then the emit walks re-analyze
+;; the SAME source against that completed state, where hc-resolve-cell's ns arm
+;; finds the redefinition for a reference that the in-order pass resolved to
+;; clojure.core — kmet's proxy code shape: (get env "HTTPS_PROXY") before a
+;; same-ns (defn get [url opts] ...), which built to
+;; "class java.lang.String cannot be cast to class clojure.lang.Associative"
+;; while `jolt run` was fine (jolt-lang/jolt#451).
+;;
+;; The fix is a replay, not a new rule: def-var!/declare-var! stamp the var's
+;; FIRST definition with the loader's per-file top-level form counter
+;; (var-def-ordinal-set! below, one stamp per file the def is visible in), and a
+;; build's emit walks set the same counter around each form they analyze
+;; (hc-resolve-cell consults it, host-contract).
+;; Both passes walk identical source through the same reader, so form i of pass
+;; 2 compares against pass-1 stamps at-or-below i — reproducing what the
+;; in-order load resolved. Outside a walk (REPL, jolt run, the binary at
+;; runtime) the gate parameter is #f and resolution is untouched: the in-order
+;; load needs no gate, being correct by construction.
+;; Stamps are keyed by SOURCE FILE, not namespace: one namespace can be backed
+;; by more than one file on the roots (a vendored copy and an m2 cache copy of
+;; grenadine.expander, with different form layouts), and a stamp from one
+;; layout must not gate another's analysis. Unstamped vars (the host .ss
+;; seeding, anything defined outside a file walk) read as ordinal 0 — visible
+;; from every form, exactly their real status of having existed before the file
+;; being walked. First writer wins, so a re-definition keeps the first stamp:
+;; the var is ONE var from its first def, and only its root changes (the value
+;; divergence is the redefined-set's splice concern, rt.ss def-var!).
+(define var-def-ordinals (make-hashtable string-hash string=?))
+;; reader.ss loads at rt.ss's END (rt.ss:~1995) but rt.ss's own def-var! calls
+;; fire before it does — resolve the parameter late (sa-baked-global: a guarded
+;; top-level lookup, the scheme-adapter's portable form), treating its absence
+;; as #f (unstamped = always visible: correct for host-runtime seeding).
+(define (jolt-ordinal-source-file)
+  (let ((p (sa-baked-global 'rdr-source-file)))
+    (and (procedure? p) (p))))
+;; stamps key on the FILE being walked (rdr-source-file — parameterized by the
+;; loader and every emit-walk caller), not the namespace alone: one namespace
+;; can be backed by more than one file on the roots (a vendored copy and an m2
+;; cache copy of grenadine.expander, with different form layouts), and a stamp
+;; from one layout must not gate another's analysis.
+(define (var-def-ordinal-key file ns name)
+  (string-append (or file "*") "\x1;" ns "/" name))
+(define (var-def-ordinal-stamp1! file ns name ord)
+  (let ((k (var-def-ordinal-key file ns name)))
+    (jolt-with-mutex var-table-mu
+      (unless (hashtable-contains? var-def-ordinals k)
+        (hashtable-set! var-def-ordinals k ord)))))
+;; Stamp this def against every load frame it is visible from (jolt-load-frames
+;; below): its own file at its own form, and — for a file pulled in by `load`
+;; from INSIDE another file's form, the multi-file namespace shape
+;; (clojure.core's own (load "core_deftype"), a lib split across
+;; foo.clj + foo_impl.clj) — the enclosing file at the form that did the
+;; loading, since that is where the var becomes visible to the rest of THAT
+;; file. Without the outer stamps the enclosing file's own forward references
+;; were ungated: app.util's (defn fwd-get [env k] (get env k)) above a
+;; (load "util_extra") whose file defines `get` built to the ns-local redef
+;; again, the #451 failure exactly, while `jolt run` was fine. An outer frame
+;; counts only when it was running THIS namespace — a require nested in a form
+;; loads another namespace's defs, and those are not visible to the requiring
+;; file at any ordinal.
+(define (var-def-ordinal-set! ns name)
+  (let loop ((fs (jolt-load-frames)) (inner #t))
+    (unless (null? fs)
+      (let ((f (car fs)))
+        (when (or inner (equal? (load-frame-ns f) ns))
+          (var-def-ordinal-stamp1! (load-frame-file f) ns name (load-frame-ord f)))
+        (loop (cdr fs) #f)))))
+;; The var's first-def ordinal IN THE CURRENT FILE, 0 when never stamped
+;; (defined in another file or outside any walked file — the host runtime
+;; itself): visible from every form, as it would have been in-order.
+(define (var-def-ordinal ns name)
+  (jolt-with-mutex var-table-mu
+    (or (hashtable-ref var-def-ordinals
+         (var-def-ordinal-key (jolt-ordinal-source-file) ns name) #f)
+        0)))
+;; Two clocks, deliberately separate parameters:
+;;   jolt-load-frames — the loader's stack of files being loaded, innermost
+;;     first, one frame per top-level form (load-jolt-file*): the file, that
+;;     form's ordinal, and the namespace current when the form started. Read
+;;     ONLY at stamp time (def-var!/declare-var! above). It is a STACK rather
+;;     than one ordinal because a file can be loaded from inside another file's
+;;     form, and the var it defines becomes visible to both. Jolt fibers are
+;;     continuations on one Chez thread and SHARE a parameter cell, so under
+;;     concurrent requires these stamps can interleave — harmless: they are
+;;     consumed only by same-process build walks, and a build loads its closure
+;;     sequentially before any walk runs.
+;;   jolt-form-ordinal — the GATE, read by hc-resolve-cell (host-contract.ss).
+;;     Set ONLY by a build's walks (ei-for-each-form, bld-wp-infer!), which run
+;;     sequentially. #f everywhere else — REPL, jolt run, concurrent requires,
+;;     the binary at runtime — so resolution there is untouched by this replay.
+(define (make-load-frame file ord ns) (vector file ord ns))
+(define (load-frame-file f) (vector-ref f 0))
+(define (load-frame-ord f) (vector-ref f 1))
+(define (load-frame-ns f) (vector-ref f 2))
+(define jolt-load-frames (make-parameter '()))
+(define jolt-form-ordinal (make-parameter #f))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
@@ -1316,6 +1421,10 @@
 ;; Same double-check as jolt-var, and for the same reason: the insert is a
 ;; var-table mutation and has to be serialized against jolt-var's.
 (define (declare-var! ns name)
+  ;; a declare makes the name resolvable from this form on — stamp the
+  ;; first-def ordinal like def-var! does, so a build's emit walk replays the
+  ;; same visibility window (see var-def-ordinals, above).
+  (var-def-ordinal-set! ns name)
   (let* ((k (string-append ns "/" name))
          (c (hashtable-ref var-table k #f)))
     (if c

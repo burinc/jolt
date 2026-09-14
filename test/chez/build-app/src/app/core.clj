@@ -91,6 +91,16 @@
     (println "dd-apply:" (apply util/dd-caller nil))
     (println "dd-call: " (util/dd-caller))
     (println "dd-late: " (util/dd-late)))
+  ;; --fwdref: a symbol compiled BEFORE a same-ns redefinition must resolve to
+  ;; the clojure.core var in the built binary too — the emit walk re-analyzes
+  ;; against the fully-loaded process where app.util/get already exists, and
+  ;; resolving the ns-local redef made (fwd-get m "K") assoc onto a String
+  ;; (issue #451: kmet's built binary died "class java.lang.String cannot be
+  ;; cast to class clojure.lang.Associative" while `jolt run` was fine).
+  (when (= (first args) "--fwdref")
+    (println "fwd-get:  " (util/fwd-get {"K" 41} "K"))
+    (println "fwd-first:" (util/fwd-first [7 8]))
+    (println "fwd-late: " (util/fwd-late {"K" 5} "K")))
   ;; --closure <path>: write a closure returned by a SPLICED callee to a state
   ;; image, read it back, and call both. `jolt run` and the built binary have to
   ;; agree — they did not, because the splice dropped the fn's source

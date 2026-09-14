@@ -121,6 +121,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but no ancestry, so `(isa? java.io.FileInputStream java.io.InputStream)`
   was false and `(supers java.io.BufferedInputStream)` nil.
 
+- **A built binary resolves a same-namespace forward reference in file order,
+  as `jolt run` and the JVM do.** A bare symbol compiled BEFORE a
+  same-namespace redefinition of a `clojure.core` name bound to the later
+  `def` in the binary and to `clojure.core` everywhere else. http-client/ring
+  shaped helper code is exactly that: `(get env "HTTPS_PROXY")` above a
+  same-ns `(defn get [url opts] ...)`, so the compiled program called the
+  request helper on a map and died with `class java.lang.String cannot be cast
+  to class clojure.lang.Associative` while `jolt run` was fine (reported
+  against kmet on #451). The cause is the build's two passes: pass 1 loads
+  every namespace, then the emit walks re-analyze the SAME source against a
+  process that now holds the whole program, where the redefinition is already
+  in the var table. Each var's FIRST definition now carries the loader's
+  top-level form ordinal, and the emit walks consult it, so form *i* of the
+  second pass sees only what form *i* of the in-order load could see. Outside
+  those walks — the REPL, `jolt run`, the binary at runtime — the gate is off
+  and resolution is untouched, the in-order load being correct by
+  construction. Pass 1 is also held to loading from source, because a
+  namespace restored from the AOT cache defines its vars outside the reader
+  walk that stamps them: with the cache warm (its default in a built jolt,
+  which is why the report said `jolt run` "works fine once aot kicks in") the
+  build would otherwise see an unstamped program and resolve the
+  redefinition again.
+
+  The rule holds across a `(load "impl")` inside a namespace too — the
+  multi-file namespace shape, `clojure.core`'s own `(load "core_deftype")` or a
+  library split over `foo.clj` and `foo_impl.clj`. The loaded file's defs claim
+  the ordinal of the form that loaded them, so a reference above the `load`
+  still belongs to `clojure.core` and one below gets the namespace's own name.
+  A build emits the enclosing file and leaves the `load` to run in the binary,
+  so that shape produced the same `ClassCastException` from the other side.
+
+- **`:allow-dynamic` covers a vouched def's computed `require`, so an app with
+  a spec shakes again.** 0.8.7 made a `require` of a computed name a bail ref
+  and a compile ref, and made a vouch cover a resolution only. spec.gen's
+  `dynaload` is `(require (c/symbol ns))` followed by `(resolve s)` in one def,
+  so no key could ever clear it: the bail printed a paste-ready key naming
+  `dynaload`, and the build with that key bailed again on the same def. Every
+  app with a spec in its graph hit this, which is the case #890 was filed
+  about. The vouch is one assertion for both refs — the site never runs in the
+  built binary, or names only what the build baked — so an allowed def's
+  computed load is spared the bail and the compiler scan, like its resolve. A
+  ref that runs the compiler on code (`eval`, `load-string`, an image restore)
+  stays unvouchable: the compiler image is direct-linked against the whole core
+  and cannot run over a shaken one.
+
+  The hint no longer names a def whose bail includes a ref no key can cover. It
+  offered `dynaload` on the strength of its `resolve` while its `require`
+  blocked the shake, so the printed key was one no paste could satisfy; a def
+  that both resolves and evals was offered the same way.
+
+  The hello world from #890, `spec.alpha 0.5.238`, plain against shaken with
+  the key it prints:
+
+  | build | bytes |
+  | --- | --- |
+  | plain | 14,513,800 |
+  | `--tree-shake`, 0.8.7 (bailed) | 14,427,995 |
+  | `--tree-shake`, with the key | 9,689,311 |
+
+  It keeps 358 of 855 defs and drops the compiler image; `s/valid?` and
+  `s/describe` answer as they do unshaken. The fixture library's `dynaload`
+  does the computed `require` before its `resolve` now, spec.gen's real shape —
+  it mirrored only the `resolve` half, which is why the gate stayed green
+  through the 0.8.7 change. `run-dce-refs.ss` pins the vouched and unvouched
+  loads, the verdict that agrees with each, and both hint cases. (#890)
+
+- **A wrong `:allow-dynamic` vouch is refused by name, not on a raw unbound
+  variable.** A binary whose compiler verdict dropped the compiler could still
+  reach the loader's compile-from-source path — through a vouched
+  `requiring-resolve` that runs and names a namespace the build never baked,
+  with its source on the roots, and now through a vouched computed `require`
+  the same way. It died on `variable jolt-aot-capture-file is not bound`, the
+  first compiler parameter the loader touches: a Chez error naming a loader
+  internal, with nothing pointing at the vouch. The loader's two
+  compile-from-source entrances now refuse first, naming the file and the
+  `:allow-dynamic` entry, the way an image restore already refused in a
+  compiler-less build. The default build is as exposed as a shaken one, since
+  the verdict runs on every build, and the README says so now. Fixture
+  `allow-dynamic-wrong-app` runs the vouched site and pins the refusal.
+  (jolt-n2v3)
+
 - **A form `load-string` read carried the calling file's path.** The loader
   binds the reader's file around a whole file load and `load-string` read
   under it, so a diagnostic in the string named the script with a snippet of
