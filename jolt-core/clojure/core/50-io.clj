@@ -1,13 +1,15 @@
 ;; clojure.core — IO tier: the *in* reader family.
 ;;
-;; *in* is a dynamic var holding a READER: a plain map whose two ops close
-;; over their source — :read-line-fn (next line, newline
-;; stripped, nil at EOF) and :read-fn (next FORM, advancing past exactly that
-;; form; the eof sentinel at end of input). The default *in* reads real stdin
-;; through the host seam __stdin-read-line, with a shared leftover buffer so
-;; read and read-line interleave; with-in-str rebinds *in* to a string reader
-;; over one atom-held buffer, so (read) consumes its form and a following
-;; (read-line) returns the REST of that line — as in Clojure.
+;; *in* is a dynamic var holding a READER: a reify over IReader whose ops close
+;; over their source — a LINE (newline stripped, nil at EOF), a FORM (advancing
+;; past exactly that form; the eof sentinel at end of input), and a CHARACTER
+;; (a code point, -1 at end of input), all off one cursor so they interleave.
+;; clojure.main/repl-read is what wants the character: it skips whitespace one
+;; character at a time before handing the rest to a form read. The default *in*
+;; reads real stdin through the host seam __stdin-read-line, with a shared
+;; leftover buffer; with-in-str rebinds *in* to a string reader over one
+;; atom-held buffer, so (read) consumes its form and a following (read-line)
+;; returns the REST of that line — as in Clojure.
 ;;
 ;; Forms are parsed by the host seam __parse-next-from (one form + the index
 ;; just past it, nil when only whitespace remains). The readers hold a CURSOR
@@ -28,17 +30,38 @@
   (-read-form [rdr] "Next form; the reader-eof sentinel at end of input.")
   (-read+string [rdr eof-error? eof-value]
     "Next form plus the exact text consumed (leading whitespace included), as
-    [form text]. On EOF: throws, or returns [eof-value \"\"] when eof-error? is false."))
+    [form text]. On EOF: throws, or returns [eof-value \"\"] when eof-error? is false.")
+  (-read-char [rdr]
+    "Next character as a code point; -1 at end of input — java.io.Reader's
+    .read contract, which clojure.main/repl-read walks the input with.")
+  (-unread-char [rdr c]
+    "Steps back over the character just read, so the next -read-char,
+    -read-form or -read-line sees it again. A reader here holds a CURSOR into
+    its input rather than a pushback buffer, so unlike .unread on a
+    PushbackReader only the character just read can go back: c is the value
+    -read-char returned, and the step is what actually undoes the read.")
+  (-at-line-start? [rdr]
+    "True before anything is read, and afterwards whether the last read ended
+    a line or hit end of input — clojure.lang.LineNumberingPushbackReader's
+    .atLineStart, which clojure.main/repl asks before re-prompting."))
+
+;; The two slots behind -at-line-start?: what the reader answers now, and what
+;; it answered before the last read, so an unread can put the first back — the
+;; same pair the host PushbackReader shim keeps (host-static-classes.ss).
+(defn- line-start! [a v] (swap! a (fn [st] [v (nth st 0)])) nil)
+(defn- line-start-undo! [a] (swap! a (fn [st] [(nth st 1) (nth st 1)])) nil)
 
 (defn __string-reader
   "A reader over string s (the with-in-str expansion calls this)."
   [s]
-  (let [pos (atom 0)]
+  (let [pos (atom 0)
+        line-start (atom [true true])]
     (reify IReader
       (-read-line [_]
         ;; \n, \r and \r\n all end a line, and none of them is part of it —
         ;; java.io.BufferedReader's rule, which the host seam owns so this
         ;; reader and the port-backed ones cannot disagree about CRLF input.
+        (line-start! line-start true)
         (let [r (__string-line-from s @pos)]
           (when-not (nil? r)
             (reset! pos (nth r 1))
@@ -46,17 +69,34 @@
       (-read-form [_]
         (let [r (__parse-next-from s @pos)]
           (if (nil? r)
-            reader-eof
-            (do (reset! pos (nth r 1)) (nth r 0)))))
+            (do (line-start! line-start true) reader-eof)
+            (do (reset! pos (nth r 1))
+                (line-start! line-start false)
+                (nth r 0)))))
       (-read+string [_ eof-error? eof-value]
         (let [p @pos
               r (__parse-next-from s p)]
           (if (nil? r)
-            (if eof-error?
-              (throw (ex-info "EOF while reading" {}))
-              [eof-value ""])
+            (do (line-start! line-start true)
+                (if eof-error?
+                  (throw (ex-info "EOF while reading" {}))
+                  [eof-value ""]))
             (do (reset! pos (nth r 1))
-                [(nth r 0) (subs s p (nth r 1))])))))))
+                (line-start! line-start false)
+                [(nth r 0) (subs s p (nth r 1))]))))
+      (-read-char [_]
+        (let [p @pos]
+          (if (< p (count s))
+            (let [c (int (get s p))]
+              (reset! pos (inc p))
+              (line-start! line-start (or (= c 10) (= c 13)))
+              c)
+            (do (line-start! line-start true) -1))))
+      (-unread-char [_ _c]
+        (swap! pos (fn [p] (if (pos? p) (dec p) p)))
+        (line-start-undo! line-start)
+        nil)
+      (-at-line-start? [_] (nth @line-start 0)))))
 
 ;; Real stdin: a leftover [buffer cursor] shared by read and read-line. When a
 ;; parse needs another line, the consumed prefix is dropped as the line is
@@ -64,10 +104,12 @@
 ;; still arriving pays a copy and a re-parse per line (the parse seam is not
 ;; incremental), but cost is bounded by that form, never the whole session.
 (def ^:private stdin-buf (atom ["" 0]))
+(def ^:private stdin-line-start (atom [true true]))
 
 (def ^:dynamic *in*
   (reify IReader
     (-read-line [_]
+      (line-start! stdin-line-start true)
       (let [sp @stdin-buf
             s (nth sp 0)
             p (nth sp 1)]
@@ -86,9 +128,11 @@
           (if (nil? r)
             (let [line (__stdin-read-line)]
               (if (nil? line)
-                reader-eof
+                (do (line-start! stdin-line-start true) reader-eof)
                 (do (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
-            (do (reset! stdin-buf [s (nth r 1)]) (nth r 0))))))
+            (do (reset! stdin-buf [s (nth r 1)])
+                (line-start! stdin-line-start false)
+                (nth r 0))))))
     (-read+string [_ eof-error? eof-value]
       (loop []
         (let [sp @stdin-buf
@@ -98,12 +142,41 @@
           (if (nil? r)
             (let [line (__stdin-read-line)]
               (if (nil? line)
-                (if eof-error?
-                  (throw (ex-info "EOF while reading" {}))
-                  [eof-value ""])
+                (do (line-start! stdin-line-start true)
+                    (if eof-error?
+                      (throw (ex-info "EOF while reading" {}))
+                      [eof-value ""]))
                 (do (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
             (do (reset! stdin-buf [s (nth r 1)])
-                [(nth r 0) (subs s p (nth r 1))])))))))
+                (line-start! stdin-line-start false)
+                [(nth r 0) (subs s p (nth r 1))])))))
+    ;; A character comes off the same buffer the form and line ops read, so the
+    ;; three interleave: clojure.main/repl-read skips whitespace character by
+    ;; character, unreads the one that ended the skip, and then reads a form
+    ;; from the very next position. The pull when the buffer runs dry blocks on
+    ;; a line, as .read on the JVM's stdin reader blocks on input.
+    (-read-char [_]
+      (loop []
+        (let [sp @stdin-buf
+              s (nth sp 0)
+              p (nth sp 1)]
+          (if (< p (count s))
+            (let [c (int (get s p))]
+              (reset! stdin-buf [s (inc p)])
+              (line-start! stdin-line-start (or (= c 10) (= c 13)))
+              c)
+            (let [line (__stdin-read-line)]
+              (if (nil? line)
+                (do (line-start! stdin-line-start true) -1)
+                (do (reset! stdin-buf [(str line "\n") 0]) (recur))))))))
+    (-unread-char [_ _c]
+      (let [sp @stdin-buf
+            p (nth sp 1)]
+        (when (pos? p)
+          (reset! stdin-buf [(nth sp 0) (dec p)])))
+      (line-start-undo! stdin-line-start)
+      nil)
+    (-at-line-start? [_] (nth @stdin-line-start 0))))
 
 (defn read-line
   "Reads the next line from the stream that is the current value of *in*.
