@@ -243,7 +243,20 @@
               ;; or clojure.core var — e.g. the compiler ns referencing `set`,
               ;; which late-binds (interns `jolt.backend-scheme/set` undefined)
               ;; and would otherwise hide clojure.core/set on the mint fixpoint.
-              (and c (var-cell-defined? c) c))
+              (and c (var-cell-defined? c)
+                   ;; def-ordinal visibility (rt.ss var-def-ordinals): during a
+                   ;; build's emit walk the process holds the WHOLE program's
+                   ;; defs, but this file's forms were analyzed in order — a
+                   ;; same-ns var first defined by a LATER top-level form was
+                   ;; NOT resolvable when the in-order load compiled the form
+                   ;; being re-analyzed now, so it must not be here either
+                   ;; (fall through to refer / clojure.core, the in-order
+                   ;; answer). Unstamped vars read 0 and pass; the gate is #f
+                   ;; (off) outside the build's walks.
+                   (let ((cur (jolt-form-ordinal)))
+                     (or (not cur)
+                         (fx<=? (var-def-ordinal (chez-actx-cns ctx) nm) cur)))
+                   c))
             ;; a :refer'd name resolves to its source ns
             (let ((ref (chez-resolve-refer (chez-actx-cns ctx) nm)))
               (and ref (var-cell-lookup (car ref) (cdr ref))))

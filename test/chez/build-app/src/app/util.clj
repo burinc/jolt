@@ -135,5 +135,29 @@
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k d] (if (= k :a) :from-valat d)))
 
+;; Forward-reference resolution (issue #451): fwd-get is compiled BEFORE this
+;; namespace redefines `get`, so its bare `get` must resolve to
+;; clojure.core/get — in `jolt run` (in-order load) AND in a built binary
+;; (whose emit walk re-analyzes the source against the fully-loaded process,
+;; where app.util/get already exists). If the binary's second pass resolved
+;; the ns-local redefinition instead, (fwd-get env "K") would call
+;; (get env "K") = (assoc "K" :url env :method :get) — a ClassCastException
+;; (String cannot be cast to Associative) in the built binary only.
+;; The same shape through `first` (redefined further down) pins that the
+;; redef-visible window is "at-or-after the def", not file-wide.
+(defn fwd-get [env k] (get env k))
+
+;; compiled BEFORE the redefinition below: bare `first` is clojure.core/first.
+(defn fwd-first [coll] (first coll))
+
+;; The ns-local redefinitions, http-client / ring style: a helper library that
+;; shadows a core fn with a request-shaped one.
+(defn get [url opts] (assoc opts :url url :method :get))
+(defn first [req] (assoc req :seen-first true))
+
+;; a caller AFTER both redefs: the ns-local fns must win here in every mode
+;; (arguments in the redef's [url opts] order).
+(defn fwd-late [env k] [(get k env) (first {:req k})])
+
 (defn lk-read [t] (:a t))
 (def lk-box (atom nil))

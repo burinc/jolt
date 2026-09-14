@@ -352,6 +352,30 @@ for line in 'dd-apply: second' 'dd-call:  second' 'dd-late:  second'; do
   fi
 done
 
+# A symbol compiled BEFORE a same-ns redefinition must resolve to the
+# clojure.core var in the built binary, exactly as under `jolt run` (the
+# in-order load) and on the JVM. The emit walk re-analyzes app source against
+# the fully-loaded process — where app.util/get already exists — and resolving
+# that ns-local redef made (fwd-get m "K") call the http helper on a map
+# backwards: (assoc "K" :url m ...) — "class java.lang.String cannot be cast to
+# class clojure.lang.Associative" in the compiled binary, fine under `jolt run`
+# (kmet's proxy code is this exact shape; jolt-lang/jolt#451). fwd-first pins
+# the same for a second core fn, and fwd-late pins the complementary half: a
+# caller AFTER the redefs must get the ns-local fns in BOTH modes.
+got_fwd="$(cd / && "$out" --fwdref 2>&1)"
+want_fwd="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --fwdref 2>&1)"
+if [ "$got_fwd" != "$want_fwd" ]; then
+  echo "  FAIL: forward-reference resolution diverges between the binary and jolt run"
+  echo "--- binary ----"; echo "$got_fwd"
+  echo "--- jolt run --"; echo "$want_fwd"; exit 1
+fi
+for line in 'fwd-get:   41' 'fwd-first: 7' 'fwd-late:  [{K 5, :url K, :method :get} {:req K, :seen-first true}]'; do
+  if ! printf '%s' "$got_fwd" | grep -qF "$line"; then
+    echo "  FAIL: forward-ref — want '$line'"
+    echo "--- got ----"; echo "$got_fwd"; exit 1
+  fi
+done
+
 # A closure returned by a SPLICED callee must still travel in a state image, and
 # the built binary must agree with `jolt run` about it. Only a built binary
 # splices, and the splicer used to drop the fn's source registration -- so the
