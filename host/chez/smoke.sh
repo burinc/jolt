@@ -197,6 +197,17 @@ check '(let [c java.time.LocalDate] (str (. c MIN)))' '"-999999999-01-01"'
 # them with the zoned/offset types added). Certified on OpenJDK 20.
 check '(let [ldt (java.time.LocalDateTime/parse "2020-01-02T03:04")] [(str (java.time.LocalDate/from ldt)) (str (java.time.LocalTime/from ldt)) (str (java.time.LocalDateTime/from ldt))])' '["2020-01-02" "03:04" "2020-01-02T03:04"]'
 check '(try (java.time.LocalDate/from (java.time.Instant/parse "2020-01-01T00:00:00Z")) (catch java.time.DateTimeException e :dte))' ':dte'
+# java.lang.Object is the root of the hierarchy, and NO registered instance?
+# arm can answer it — not the java.time value-semantics seam's, not one a
+# library installs through __register-instance-check!. An arm answers a
+# definitive false for every class its own value does not list, so before this
+# the root rule (registered first, hence asked last) never spoke: a java.time
+# value was not an Object and (.cast Object v) threw, which is what killed every
+# SCI-interpreted interop call passing one — box-arg casts each argument to its
+# reflected parameter type, and jolt reports every parameter as Object (#985).
+# Each check is its own process, so the deliberately-wrong arm below cannot leak.
+check '(let [d (java.time.LocalDate/of 2020 3 5)] [(instance? java.lang.Object d) (instance? Object d) (identical? d (.cast Object d))])' '[true true true]'
+check '(do (clojure.core/__register-instance-check! (fn [c v] false)) [(instance? java.lang.Object "x") (instance? Object 1) (instance? java.lang.Object nil)])' '[true true false]'
 # The source a binary serves for a namespace is jolt's own, not a same-named one
 # from a later install root — the vendored Grenadine ships a jolt.deps facade for
 # embedders. Roots are first-wins and the bake matches, but only for source: the

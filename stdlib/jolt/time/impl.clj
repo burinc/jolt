@@ -123,10 +123,18 @@
        (when-not cmp
          (throw (ex-info "compare: unordered time type" {:type (type-of a)})))
        (cmp a b))))
+  ;; java.lang.Object is answered here too, not just by the host's root rule: an
+  ;; arm returns a DEFINITIVE false for any class the value's set does not list,
+  ;; and a host whose root rule is consulted after the arms would otherwise read
+  ;; that false and make (instance? Object v) — and (.cast Object v), which every
+  ;; SCI interop argument goes through — fail (#985). Both spellings: Class.cast
+  ;; passes "java.lang.Object", (instance? Object x) passes "Object".
   (__register-instance-check!
    (fn [class-name v]
      (when (jt? v)
-       (boolean (or (contains? (:classes (spec-of v)) class-name) (contains? #{"java.io.Serializable" "Serializable"} class-name))))))
+       (boolean (or (contains? (:classes (spec-of v)) class-name)
+                    (contains? #{"java.io.Serializable" "Serializable"
+                                 "java.lang.Object" "Object"} class-name))))))
   ;; (class x)/(type x) and — crucially — protocol dispatch on these values, which
   ;; keys on value-host-tags. Without this a value's class is :object and
   ;; (extend-protocol P java.time.X …) never fires (tick extends its protocols this way).
