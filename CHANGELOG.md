@@ -384,6 +384,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cljfmt`'s parser — and a downstream project's `jolt format` /
   `jolt format-check` — fail. (#978)
 
+- **A `jolt.ffi` callback arriving on a native library's own thread now has a
+  diagnosis, and the two signatures it cannot carry are refused in jolt's own
+  words.** A `:collect-safe` callback reactivates the thread it arrives on, but
+  it still allocates, and an allocation that reaches a trip point has to stop
+  the world — which cannot happen while another thread is parked inside a
+  foreign call that is not `:blocking`, since such a thread stays ACTIVE and
+  never reaches a safe point. When the parked call is itself waiting for that
+  callback's answer (a client read served by the same library's dispatch
+  thread) the two wait for each other, and what surfaces is the call's own
+  timeout, on the first request and the more reliably the more the callback
+  allocates. `jolt.ffi` documents the rule and
+  `test/chez/ffi-foreign-thread-test.sh` gates both halves of it. Reaching for
+  `:blocking` then hit a second wall: Chez refuses a `:string` argument on a
+  `__collect_safe` procedure (and a `:string` result on a `__collect_safe`
+  callable), and its message arrived from inside the macro under a `chi-*`
+  expander trace, naming neither the option that caused it nor the position.
+  Both are now rejected by jolt, naming the argument and what to pass instead.
+  (#973)
+
 - **`String.indexOf` with an empty needle past the end of the string answered
   `-1` instead of the string's length.** `String.indexOf(String,int)` is
   explicit that "if `fromIndex` is greater than the length of this String, and

@@ -675,6 +675,12 @@ loaderconf: testbin
 # the babashka.ffi-compatible surface built on it — the four arena kinds and who
 # closes each, arena-owned blocks/strings/callbacks/views, the pointer
 # vocabulary, layout-shaped read and write, places, and the typed array moves.
+# The foreign-thread gate covers the other side of the same collect-safety
+# contract (issue #973): a callback arriving on the library's OWN thread while
+# the caller is parked in an outbound call to that library, where a call that is
+# not :blocking pins the collector the callback needs — and the two signatures
+# the collect-safe convention cannot carry, which jolt must refuse in its own
+# words rather than leave to Chez's expander.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
@@ -683,6 +689,7 @@ ffi:
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-foreign-thread-test.sh
 
 # Escape continuations (jolt.continuations, issue #736): the one-shot contract
 # call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
