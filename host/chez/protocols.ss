@@ -210,9 +210,20 @@
 ;; answers about a type — what it implements, and what its class declares — both
 ;; have to be able to tell the two apart.
 (define extend-mark "__jolt_extend__")
-;; Was this impl table filled by extend/extend-type/extend-protocol?
+;; …and its counterpart, written by register-inline-protocol! for a protocol a
+;; deftype/defrecord DECLARES in its own body. Both marks can sit in one table:
+;; jolt lets a type that already declares a protocol inline be extended with it
+;; afterwards, which the JVM refuses outright ("class T already directly
+;; implements interface P for protocol"). The class question still has the JVM's
+;; answer there — the class declares the interface, so instance? is true and a
+;; later extend cannot take that away — so the inline mark WINS.
+(define inline-mark "__jolt_inline__")
+;; Was this impl table filled by extend/extend-type/extend-protocol ALONE?
 (define (extend-impl-table? pi)
-  (and pi (hashtable-ref pi extend-mark #f) #t))
+  (and pi
+       (hashtable-ref pi extend-mark #f)
+       (not (hashtable-ref pi inline-mark #f))
+       #t))
 ;; The impl for METHOD under any protocol this type implements — one ref into
 ;; the by-method index, first registration wins. This is the hot one (every
 ;; record collection op asks it), so it neither locks nor allocates.
@@ -792,7 +803,10 @@
       (let ((ti (or (hashtable-ref type-registry tag #f)
                     (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry tag h) h))))
         (unless (hashtable-ref ti proto-name #f)
-          (hashtable-set! ti proto-name (make-hashtable string-hash string=?))))))
+          (hashtable-set! ti proto-name (make-hashtable string-hash string=?)))
+        ;; the type DECLARES this protocol, whatever else marks the same table
+        ;; later (see inline-mark): the class carries the interface from here on.
+        (hashtable-set! (hashtable-ref ti proto-name #f) inline-mark #t))))
   ;; the protocol's interface joins the type's class ancestry, spelled like the
   ;; JVM interface. A protocol key carries its defining ns, so "a.b/P" is the
   ;; interface a.b.P wherever the implementing type lives. A dotted host name

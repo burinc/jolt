@@ -2717,6 +2717,20 @@
   {:suite "records" :label "instance? sees a later inline declaration"
    :expr "(do (defprotocol MemoQ (mq [_])) (deftype MemoU [v]) (let [before (instance? user.MemoQ (->MemoU 1))] (eval '(deftype MemoU [v] MemoQ (mq [_] 2))) [before (instance? user.MemoQ (->MemoU 1)) (mq (->MemoU 1))]))"
    :expected "[false true 2]"}
+  ;; …and an INLINE declaration is not undone by a later extend. jolt allows
+  ;; extending a protocol onto a type that already declares it inline; the JVM
+  ;; refuses that outright ("class T already directly implements interface P for
+  ;; protocol"), so there is no JVM answer where the two coexist — but the class
+  ;; question keeps the JVM's: the class carries the interface because it
+  ;; declared it, and instance? cannot be taken away by an extend. Only a type
+  ;; that was MERELY extended answers false.
+  {:suite "records" :label "an inline declaration survives a later extend"
+   :expr "(do (defprotocol MemoR (mr [_])) (deftype MemoV [] MemoR (mr [_] :inline)) (let [before (instance? user.MemoR (->MemoV))] (extend-type MemoV MemoR (mr [_] :extended)) [before (instance? user.MemoR (->MemoV)) (satisfies? MemoR (->MemoV)) (mr (->MemoV))]))"
+   :expected "[true true true :extended]"}
+  ;; neither bookkeeping mark is a member of the class
+  {:suite "records" :label "the extend/inline marks are not reflected methods"
+   :expr "(do (defprotocol MemoS (ms [_])) (deftype MemoW [] MemoS (ms [_] 1)) (deftype MemoX []) (extend-type MemoX MemoS (ms [_] 2)) [(sort (map #(.getName %) (.getDeclaredMethods (class (->MemoW))))) (sort (map #(.getName %) (.getDeclaredMethods (class (->MemoX)))))])"
+   :expected "[(\"ms\") ()]"}
 
   ;; apply on a deftype/record/reify that implements clojure.lang.IFn goes
   ;; through its OWN applyTo, as it does on the JVM for every IFn that is not an

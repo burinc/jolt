@@ -1443,8 +1443,13 @@
 
 (define extend-mark "__jolt_extend__")
 
+(define inline-mark "__jolt_inline__")
+
 (define (extend-impl-table? pi)
-  (and pi (hashtable-ref pi extend-mark #f) #t))
+  (and pi
+       (hashtable-ref pi extend-mark #f)
+       (not (hashtable-ref pi inline-mark #f))
+       #t))
 
 (define (find-method-any-protocol type-tag method)
   (let ((entries (tmi-entries type-tag method)))
@@ -1891,7 +1896,11 @@
           (hashtable-set!
             ti
             proto-name
-            (make-hashtable string-hash string=?))))))
+            (make-hashtable string-hash string=?)))
+        (hashtable-set!
+          (hashtable-ref ti proto-name #f)
+          inline-mark
+          #t))))
   (let ((iface (cond
                  ((proto-key-qualified? proto-name)
                   (proto-iface-name proto-name))
