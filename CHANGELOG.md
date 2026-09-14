@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`clojure.core.async/alt!` and `alt!!`, and `clojure.core.async.impl.protocols`
+  with `ReadPort`.** The two pieces of upstream core.async's surface a ported
+  library reaches for by name and jolt did not ship, so a port had to shadow
+  `clojure.core.async` wholesale to install them. `alt!` and `alt!!` are
+  upstream's macros verbatim (1.6.681) over the `alts!` / `alts!!` already here;
+  they park by capturing, since the CPS pass threads no continuation through
+  `__do-alts`. `impl.protocols` carries `ReadPort` alone and answers the two
+  questions a port asks about a native channel: `register-class-supers!` gives
+  the class name the class-arm already reports a row in the class graph, which is
+  where `value-host-tags` — what protocol dispatch keys on — comes from, so
+  `extend-type` has a tag to file under and `satisfies?` can answer; and
+  `__register-instance-check!` answers `(instance? ReadPort ch)` directly, since
+  instance-check does not consult the class graph and the `:import` loads no
+  namespace. The overlay's ns form requires it, as upstream's does, so a bare
+  `(require 'clojure.core.async)` installs both halves. (#996)
+
 - **`clojure.main`'s exception machinery and reusable REPL, ported from the
   reference.** `ex-triage`, `ex-str`, `err->msg`, `repl-caught`,
   `report-error`, `root-cause`, `stack-element-str`, `with-bindings`,

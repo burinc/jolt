@@ -16,7 +16,11 @@
 ;; superset of the JVM model (no fixed thread pool, no pending-op limit).
 
 (ns clojure.core.async
-  (:refer-clojure :exclude [reduce transduce into merge map take partition partition-by]))
+  (:refer-clojure :exclude [reduce transduce into merge map take partition partition-by])
+  ;; The port protocol the macros and any ported caller ask about, loaded here so
+  ;; a bare (require 'clojure.core.async) installs it — upstream's ns form lists
+  ;; it the same way. It requires nothing back, so there is no cycle.
+  (:require [clojure.core.async.impl.protocols]))
 
 ;; --- go, and the cheap park -------------------------------------------------
 ;; go spawns its body on the backend *go-backend* names, read at spawn time.
@@ -35,7 +39,8 @@
 ;; returns nil and go expands the way it always has.
 ;;
 ;; Not covered: alts! / alt! (threading a continuation through the waiter
-;; registration in __do-alts is its own round), and any park inside a try (the
+;; registration in __do-alts is its own round — the macros below are over those
+;; fns, so they exist and park by capturing), and any park inside a try (the
 ;; rewrite would have to carry the exception frame explicitly).
 
 ;; The park ops, by identity. Resolving the caller's symbol and comparing the VAR
@@ -483,6 +488,93 @@
   thread-backed go both block, and on a fiber both park."
   [ports & {:as opts}]
   (do-alts ports opts))
+
+;; --- alt! / alt!! -----------------------------------------------------------
+;; Upstream's expansion for the two macros, over the alts! above. The pass that
+;; gives a park its cheap representation does not thread a continuation through
+;; __do-alts, so an alt! parks by capturing — correct, just not cheap, the same
+;; fallback every park the pass cannot see takes.
+;;
+;; The clojure.core/ prefixes are load-bearing, not style: this namespace
+;; :refer-clojure :excludes reduce, map and partition, so a bare `reduce` here is
+;; clojure.core.async/reduce, over channels. Upstream's file carries the same
+;; exclusions and spells them the same way. Nothing else do-alt calls is shadowed.
+(defn do-alt [alts clauses]
+  (assert (even? (count clauses)) "unbalanced clauses")
+  (let [clauses (clojure.core/partition 2 clauses)
+        opt? #(keyword? (first %))
+        opts (filter opt? clauses)
+        clauses (remove opt? clauses)
+        [clauses bindings]
+        (clojure.core/reduce
+         (fn [[clauses bindings] [ports expr]]
+           (let [ports (if (vector? ports) ports [ports])
+                 [ports bindings]
+                 (clojure.core/reduce
+                  (fn [[ports bindings] port]
+                    (if (vector? port)
+                      (let [[port val] port
+                            gp (gensym)
+                            gv (gensym)]
+                        [(conj ports [gp gv]) (conj bindings [gp port] [gv val])])
+                      (let [gp (gensym)]
+                        [(conj ports gp) (conj bindings [gp port])])))
+                  [[] bindings] ports)]
+             [(conj clauses [ports expr]) bindings]))
+         [[] []] clauses)
+        gch (gensym "ch")
+        gret (gensym "ret")]
+    `(let [~@(mapcat identity bindings)
+           [val# ~gch :as ~gret] (~alts [~@(apply concat (clojure.core/map first clauses))]
+                                        ~@(apply concat opts))]
+       (cond
+         ~@(mapcat (fn [[ports expr]]
+                     [`(or ~@(clojure.core/map (fn [port]
+                                                 `(= ~gch ~(if (vector? port) (first port) port)))
+                                               ports))
+                      (if (and (seq? expr) (vector? (first expr)))
+                        `(let [~(first expr) ~gret] ~@(rest expr))
+                        expr)])
+                   clauses)
+         (= ~gch :default) val#))))
+
+(defmacro alt!!
+  "Like alt!, except as if by alts!!, will block until completed, and
+  not intended for use in (go ...) blocks."
+
+  [& clauses]
+  (do-alt `alts!! clauses))
+
+(defmacro alt!
+  "Makes a single choice between one of several channel operations,
+  as if by alts!, returning the value of the result expr corresponding
+  to the operation completed. Must be called inside a (go ...) block.
+
+  Each clause takes the form of:
+
+  channel-op[s] result-expr
+
+  where channel-ops is one of:
+
+  take-port - a single port to take
+  [take-port | [put-port put-val] ...] - a vector of ports as per alts!
+  :default | :priority - an option for alts!
+
+  and result-expr is either a list beginning with a vector, whereupon that
+  vector will be treated as a binding for the [val port] return of the
+  operation, else any other expression.
+
+  (alt!
+    [c t] ([val ch] (foo ch val))
+    x ([v] v)
+    [[out val]] :wrote
+    :default 42)
+
+  Each option may appear at most once. The choice and parking
+  characteristics are those of alts!."
+
+  [& clauses]
+  (do-alt `alts! clauses))
 
 (defn poll!
   "Takes a val from port if possible immediately. Never blocks. Returns the value
