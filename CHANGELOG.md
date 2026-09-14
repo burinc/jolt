@@ -72,6 +72,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A built binary resolves a same-namespace forward reference in file order,
+  as `jolt run` and the JVM do.** A bare symbol compiled BEFORE a
+  same-namespace redefinition of a `clojure.core` name bound to the later
+  `def` in the binary and to `clojure.core` everywhere else. http-client/ring
+  shaped helper code is exactly that: `(get env "HTTPS_PROXY")` above a
+  same-ns `(defn get [url opts] ...)`, so the compiled program called the
+  request helper on a map and died with `class java.lang.String cannot be cast
+  to class clojure.lang.Associative` while `jolt run` was fine (reported
+  against kmet on #451). The cause is the build's two passes: pass 1 loads
+  every namespace, then the emit walks re-analyze the SAME source against a
+  process that now holds the whole program, where the redefinition is already
+  in the var table. Each var's FIRST definition now carries the loader's
+  top-level form ordinal, and the emit walks consult it, so form *i* of the
+  second pass sees only what form *i* of the in-order load could see. Outside
+  those walks — the REPL, `jolt run`, the binary at runtime — the gate is off
+  and resolution is untouched, the in-order load being correct by
+  construction. Pass 1 is also held to loading from source, because a
+  namespace restored from the AOT cache defines its vars outside the reader
+  walk that stamps them: with the cache warm (its default in a built jolt,
+  which is why the report said `jolt run` "works fine once aot kicks in") the
+  build would otherwise see an unstamped program and resolve the
+  redefinition again.
+
+  The rule holds across a `(load "impl")` inside a namespace too — the
+  multi-file namespace shape, `clojure.core`'s own `(load "core_deftype")` or a
+  library split over `foo.clj` and `foo_impl.clj`. The loaded file's defs claim
+  the ordinal of the form that loaded them, so a reference above the `load`
+  still belongs to `clojure.core` and one below gets the namespace's own name.
+  A build emits the enclosing file and leaves the `load` to run in the binary,
+  so that shape produced the same `ClassCastException` from the other side.
+
 - **`:allow-dynamic` covers a vouched def's computed `require`, so an app with
   a spec shakes again.** 0.8.7 made a `require` of a computed name a bail ref
   and a compile ref, and made a vouch cover a resolution only. spec.gen's

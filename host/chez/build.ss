@@ -657,41 +657,51 @@
           (dynamic-wind
             jolt-ns-load-vars-push!
             (lambda ()
-          (parameterize ((rdr-source-file (cdr nf)))
-            (jolt-enter-file! (cdr nf))   ; so a failure here names the file
-            (for-each
-              (lambda (f)
-                (ce-scan-requires! f (car nf))
-                (when (ei-flag-set-form? f)
-                  (jolt-compile-eval-form f (car nf)))
-                ;; per-ns is consumed POSITIONALLY by the emit walk
-                ;; (ei-next-cached, one pop per form ei-for-each-form
-                ;; dispatches). The emit walk compiles MACRO forms too, and
-                ;; keeps going past a form this analysis rejects — so both get
-                ;; a #f placeholder (ei-compile-form falls back to a fresh
-                ;; analysis on #f). Skipping them here shifted every later
-                ;; form's cached IR by one: a macro's def-var! captured the
-                ;; NEXT def's emission — invalid Scheme under direct-link, a
-                ;; silently corrupted expander before it. Only the ns form is
-                ;; skipped by BOTH walks.
-                (unless (ei-ns-form? f)
-                  (if (ce-macro-form? f)
-                      (set! per-ns (cons #f per-ns))
-                      ;; a form the analyzer rejects here only loses
-                      ;; whole-program type info (per-form emit still errors
-                      ;; the build if it's truly broken) — but say so, or an
-                      ;; optimized build silently loses inference for the ns.
-                      (guard (e (#t (display (string-append
-                                              "jolt build: note: whole-program inference skipped a form in "
-                                              (car nf) "\n")
-                                             (current-error-port))
-                                    (set! per-ns (cons #f per-ns))))
-                        (let ((n (ei-timed "wp: analyze"
-                                   (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f)))))
-                          (set! nodes (cons n nodes))
-                          (set! per-ns (cons n per-ns)))))))
-              (ei-timed "wp: parse" (lambda () (ei-read-all src))))))
-            jolt-ns-load-vars-pop!)
+           (parameterize ((rdr-source-file (cdr nf)))
+             (jolt-enter-file! (cdr nf))   ; so a failure here names the file
+             (let ((ord 0))
+             (for-each
+               (lambda (f)
+                 ;; ord mirrors the loader's and the emit walk's per-file form
+                 ;; counter (load-jolt-file* / ei-for-each-form): the
+                 ;; def-ordinal visibility replay (rt.ss var-def-ordinals) must
+                 ;; gate THIS analysis too — its cached IR is what the emit walk
+                 ;; pops positionally, so a resolution decided here but not
+                 ;; there (or vice versa) is the exact divergence the replay
+                 ;; exists to prevent.
+                 (parameterize ((jolt-form-ordinal ord))
+                 (ce-scan-requires! f (car nf))
+                 (when (ei-flag-set-form? f)
+                   (jolt-compile-eval-form f (car nf)))
+                 ;; per-ns is consumed POSITIONALLY by the emit walk
+                 ;; (ei-next-cached, one pop per form ei-for-each-form
+                 ;; dispatches). The emit walk compiles MACRO forms too, and
+                 ;; keeps going past a form this analysis rejects — so both get
+                 ;; a #f placeholder (ei-compile-form falls back to a fresh
+                 ;; analysis on #f). Skipping them here shifted every later
+                 ;; form's cached IR by one: a macro's def-var! captured the
+                 ;; NEXT def's emission — invalid Scheme under direct-link, a
+                 ;; silently corrupted expander before it. Only the ns form is
+                 ;; skipped by BOTH walks.
+                 (unless (ei-ns-form? f)
+                   (if (ce-macro-form? f)
+                       (set! per-ns (cons #f per-ns))
+                       ;; a form the analyzer rejects here only loses
+                       ;; whole-program type info (per-form emit still errors
+                       ;; the build if it's truly broken) — but say so, or an
+                       ;; optimized build silently loses inference for the ns.
+                       (guard (e (#t (display (string-append
+                                               "jolt build: note: whole-program inference skipped a form in "
+                                               (car nf) "\n")
+                                              (current-error-port))
+                                     (set! per-ns (cons #f per-ns))))
+                         (let ((n (ei-timed "wp: analyze"
+                                    (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f)))))
+                           (set! nodes (cons n nodes))
+                           (set! per-ns (cons n per-ns))))))
+                 (set! ord (fx+ ord 1))))
+               (ei-timed "wp: parse" (lambda () (ei-read-all src)))))))
+             jolt-ns-load-vars-pop!)
           (set! ns-nodes (cons (cons (car nf) (reverse per-ns)) ns-nodes))))
       ordered)
     (ei-timed "wp: fixpoint"

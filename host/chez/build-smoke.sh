@@ -352,6 +352,123 @@ for line in 'dd-apply: second' 'dd-call:  second' 'dd-late:  second'; do
   fi
 done
 
+# A symbol compiled BEFORE a same-ns redefinition must resolve to the
+# clojure.core var in the built binary, exactly as under `jolt run` (the
+# in-order load) and on the JVM. The emit walk re-analyzes app source against
+# the fully-loaded process — where app.util/get already exists — and resolving
+# that ns-local redef made (fwd-get m "K") call the http helper on a map
+# backwards: (assoc "K" :url m ...) — "class java.lang.String cannot be cast to
+# class clojure.lang.Associative" in the compiled binary, fine under `jolt run`
+# (kmet's proxy code is this exact shape; jolt-lang/jolt#451). fwd-first pins
+# the same for a second core fn, and fwd-late pins the complementary half: a
+# caller AFTER the redefs must get the ns-local fns in BOTH modes.
+got_fwd="$(cd / && "$out" --fwdref 2>&1)"
+want_fwd="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --fwdref 2>&1)"
+if [ "$got_fwd" != "$want_fwd" ]; then
+  echo "  FAIL: forward-reference resolution diverges between the binary and jolt run"
+  echo "--- binary ----"; echo "$got_fwd"
+  echo "--- jolt run --"; echo "$want_fwd"; exit 1
+fi
+for line in 'fwd-get:   41' 'fwd-first: 7' 'fwd-late:  [{K 5, :url K, :method :get} {:req K, :seen-first true}]'; do
+  if ! printf '%s' "$got_fwd" | grep -qF "$line"; then
+    echo "  FAIL: forward-ref — want '$line'"
+    echo "--- got ----"; echo "$got_fwd"; exit 1
+  fi
+done
+
+# ...and the same with a WARM AOT cache, which is how a user meets this: the
+# cache is on by default in a built jolt, and the report that opened this said
+# "jolt run works fine once aot kicks in". A cached namespace loads from its
+# compiled artifact, and those defs run outside the reader walk that stamps the
+# def ordinals — so pass 1 would hand the emit walk an unstamped program, every
+# var would read as visible from form 0, and the binary would resolve the
+# ns-local redefinition again. Pass 1 loading from SOURCE is what keeps the
+# stamps (ldr-source-only? gates the cache branch, loader.ss); nothing else in
+# this gate builds an app whose cache a run has already warmed, so without this
+# case that gate could be removed and every check above would still pass.
+# Its own cache dir (under the temp dir the trap removes) so the gate neither
+# reads nor writes the user's ~/.jolt cache.
+fwd_cache="$(dirname "$out")/aot-cache"
+warm_out="$(dirname "$out")/app-warm"
+(cd "$app" && JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$fwd_cache" \
+   "$joltabs" run -m app.core --fwdref >/dev/null 2>&1)
+# ...and the run has to have actually cached something, or this case proves
+# nothing while still passing — the failure mode a warm-cache gate is most
+# likely to rot into.
+if ! ls "$fwd_cache"/*/*/app.util-*.so >/dev/null 2>&1; then
+  echo "  FAIL: the warm-cache case is vacuous — no AOT artifact for app.util under $fwd_cache"
+  exit 1
+fi
+if ! JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$fwd_cache" \
+     "$jolt" build -m app.core -o "$warm_out" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build over a warm AOT cache exited non-zero"
+  exit 1
+fi
+got_warm="$(cd / && "$warm_out" --fwdref 2>&1)"
+if [ "$got_warm" != "$want_fwd" ]; then
+  echo "  FAIL: a build over a warm AOT cache resolves forward references differently"
+  echo "--- warm binary ----"; echo "$got_warm"
+  echo "--- jolt run -------"; echo "$want_fwd"; exit 1
+fi
+
+# The same in-order rule across a (load) INSIDE a namespace — the multi-file
+# namespace shape (clojure.core's own (load "core_deftype"), a library split
+# over foo.clj + foo_impl.clj). The loaded file's defs land in the enclosing
+# namespace at the ordinal of the form that loaded it, so a reference ABOVE the
+# (load) still belongs to clojure.core and one below gets the ns-local name.
+# The build emits the enclosing file and leaves the (load) to run in the binary,
+# so pass 1 stamped the loaded file's defs under the loaded file alone and the
+# enclosing file's own forward references were ungated: this app built the same
+# ClassCastException shape as #451 while `jolt run` was fine. Its own fixture —
+# the shared build-app is built ~30 times here, and a top-level (load) changes
+# what every one of those emits.
+echo "build smoke: forward reference across a (load) in the same namespace"
+mfn_app="$(mktemp -d)/mfn-app"
+mkdir -p "$mfn_app/src/mf"
+printf '{:paths ["src"]}\n' > "$mfn_app/deps.edn"
+cat > "$mfn_app/src/mf/util.clj" <<'MFN_EOF'
+(ns mf.util)
+
+;; compiled BEFORE the (load) below, whose file redefines `second`
+(defn fwd-second [coll] (second coll))
+
+(load "util_extra")
+
+;; ...and after it: the ns-local redefinition and the loaded helper both win
+(defn after-load [req] [(second req) (extra-helper 4)])
+MFN_EOF
+cat > "$mfn_app/src/mf/util_extra.clj" <<'MFN_EOF'
+(in-ns 'mf.util)
+
+(defn extra-helper [n] (* n 10))
+(defn second [req] (assoc req :seen-second true))
+MFN_EOF
+cat > "$mfn_app/src/mf/core.clj" <<'MFN_EOF'
+(ns mf.core (:require [mf.util :as u]))
+(defn -main [& _]
+  (println "mfn-second:" (u/fwd-second [7 8]))
+  (println "mfn-after: " (u/after-load {:req "K"})))
+MFN_EOF
+mfn_out="$(dirname "$out")/mfn-bin"
+if ! JOLT_PWD="$mfn_app" "$jolt" build -m mf.core -o "$mfn_out" >/dev/null 2>&1; then
+  echo "  FAIL: multi-file-namespace app build exited non-zero"; exit 1
+fi
+# the binary runs the (load) itself, so the app source outlives this run
+got_mfn="$(cd / && "$mfn_out" 2>&1)"
+want_mfn="$(cd "$mfn_app" && JOLT_PWD="$mfn_app" "$joltabs" run -m mf.core 2>&1)"
+rm -rf "$(dirname "$mfn_app")"
+if [ "$got_mfn" != "$want_mfn" ]; then
+  echo "  FAIL: a (load)ed redefinition resolves differently in the binary and under jolt run"
+  echo "--- binary ----"; echo "$got_mfn"
+  echo "--- jolt run --"; echo "$want_mfn"; exit 1
+fi
+for line in 'mfn-second: 8' 'mfn-after:  [{:req K, :seen-second true} 40]'; do
+  if ! printf '%s' "$got_mfn" | grep -qF "$line"; then
+    echo "  FAIL: (load)ed redefinition — want '$line'"
+    echo "--- got ----"; echo "$got_mfn"; exit 1
+  fi
+done
+
 # A closure returned by a SPLICED callee must still travel in a state image, and
 # the built binary must agree with `jolt run` about it. Only a built binary
 # splices, and the splicer used to drop the fn's source registration -- so the
