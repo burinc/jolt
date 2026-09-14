@@ -2207,6 +2207,65 @@
   {:suite "r3-bigdec" :expr "(bigdec ##Inf)" :expected :throws}
   {:suite "r3-bigdec" :expr "(bigdec \"abc\")" :expected :throws}
   {:suite "r3-bigdec" :expr "(bigdec \"\")" :expected :throws}
+  ;; java.math.BigDecimal's INSTANCE members. The value model above is what they
+  ;; are defined over, so these pin Java's scale rules, which is the whole reason
+  ;; a caller reaches for .movePointLeft or .setScale instead of arithmetic.
+  {:suite "bigdec-members" :label "movePointLeft / Right shift the scale"
+   :expr "(let [b (BigDecimal. \"1.50\")] [(.movePointLeft b 1) (.movePointLeft b 2) (.movePointRight b 1) (.movePointRight b 3)])"
+   :expected "[0.150M 0.0150M 15.0M 1500M]"}
+  {:suite "bigdec-members" :label "the reported case: a scale-6 fraction off an integer"
+   :expr "(.movePointLeft (BigDecimal. (Math/round (* 1.5 1000000.0))) 6)"
+   :expected "1.500000M"}
+  {:suite "bigdec-members" :label "scale / precision / signum / unscaledValue / toPlainString"
+   :expr "(let [b (BigDecimal. \"1.50\")] [(.scale b) (.precision b) (.signum b) (.unscaledValue b) (.toPlainString b) (.toString b)])"
+   :expected "[2 3 1 150 \"1.50\" \"1.50\"]"}
+  {:suite "bigdec-members" :label "toPlainString never uses an exponent"
+   :expr "[(.toPlainString (BigDecimal. \"1E+3\")) (.toString (BigDecimal. \"1E+3\")) (.toPlainString (BigDecimal. \"1.5E-7\"))]"
+   :expected "[\"1000\" \"1E+3\" \"0.00000015\"]"}
+  {:suite "bigdec-members" :label "setScale up is exact, down rounds, 1-arg is UNNECESSARY"
+   :expr "(let [b (BigDecimal. \"1.50\")] [(.setScale b 4) (.setScale b 1) (.setScale (BigDecimal. \"1.55\") 1 java.math.RoundingMode/HALF_UP) (.setScale (BigDecimal. \"1.55\") 1 java.math.RoundingMode/HALF_DOWN)])"
+   :expected "[1.5000M 1.5M 1.6M 1.5M]"}
+  {:suite "bigdec-members" :label "a 1-arg setScale that would round raises"
+   :expr "(try (.setScale (BigDecimal. \"1.55\") 1) :no-throw (catch ArithmeticException e (.getMessage e)))"
+   :expected "\"Rounding necessary\""}
+  {:suite "bigdec-members" :label "an unknown rounding mode is named, not silently HALF_UP"
+   :expr "(try (.setScale (BigDecimal. \"1.55\") 1 :bogus) :no-throw (catch IllegalArgumentException e (.getMessage e)))"
+   :expected "\"Invalid rounding mode: :bogus\""}
+  {:suite "bigdec-members" :label "stripTrailingZeros lowers the scale past zero, like Java 8"
+   :expr "[(.stripTrailingZeros (BigDecimal. \"1.50\")) (.stripTrailingZeros (BigDecimal. \"600\")) (.stripTrailingZeros (BigDecimal. \"0.00\"))]"
+   :expected "[1.5M 6E+2M 0M]"}
+  {:suite "bigdec-members" :label "arithmetic keeps the JDK's scales"
+   :expr "(let [b (BigDecimal. \"1.50\") c (BigDecimal. \"2.5\")] [(.add b c) (.subtract b c) (.multiply b c) (.negate b) (.abs (BigDecimal. \"-3.2\")) (.pow b 2)])"
+   :expected "[4.00M -1.00M 3.750M -1.50M 3.2M 2.2500M]"}
+  {:suite "bigdec-members" :label "divide: exact, at this scale, at a named scale"
+   :expr "[(.divide (BigDecimal. \"10\") (BigDecimal. \"4\")) (.divide (BigDecimal. \"10.00\") (BigDecimal. \"3\") java.math.RoundingMode/HALF_UP) (.divide (BigDecimal. \"10\") (BigDecimal. \"3\") 4 java.math.RoundingMode/HALF_UP)]"
+   :expected "[2.5M 3.33M 3.3333M]"}
+  {:suite "bigdec-members" :label "an exact divide with no terminating expansion raises"
+   :expr "(try (.divide (BigDecimal. \"10\") (BigDecimal. \"3\")) :no-throw (catch ArithmeticException e :threw))"
+   :expected ":threw"}
+  {:suite "bigdec-members" :label "remainder, min/max and scaleByPowerOfTen"
+   :expr "[(.remainder (BigDecimal. \"10.5\") (BigDecimal. \"3\")) (.min (BigDecimal. \"1.50\") (BigDecimal. \"2.5\")) (.max (BigDecimal. \"1.50\") (BigDecimal. \"2.5\")) (.scaleByPowerOfTen (BigDecimal. \"1.50\") 2)]"
+   :expected "[1.5M 1.50M 2.5M 150M]"}
+  {:suite "bigdec-members" :label "conversions truncate toward zero; the Exact pair raises instead"
+   :expr "[(.doubleValue (BigDecimal. \"1.50\")) (.longValue (BigDecimal. \"9.99\")) (.toBigInteger (BigDecimal. \"-9.99\")) (.intValueExact (BigDecimal. \"9.00\")) (try (.intValueExact (BigDecimal. \"9.99\")) (catch ArithmeticException e :threw))]"
+   :expected "[1.5 9 -9 9 :threw]"}
+  ;; .equals / .hashCode answer what jolt's = and hash answer -- by VALUE, the
+  ;; way every other bigdec comparison in the runtime does -- rather than the
+  ;; JVM's scale-sensitive pair, which would contradict (= 1.5M 1.50M).
+  {:suite "bigdec-members" :label "equals and hashCode agree with = and hash"
+   :expr "(let [a (BigDecimal. \"1.50\") b (BigDecimal. \"1.5\")] [(.equals a b) (= a b) (= (.hashCode a) (.hashCode b)) (.equals a \"1.50\")])"
+   :expected "[true true true false]"}
+  {:suite "bigdec-members" :label "a M literal answers the same members"
+   :expr "[(.scale 1.50M) (.movePointLeft 1.50M 2) (.compareTo 1.50M 2.5M)]"
+   :expected "[2 0.0150M -1]"}
+  ;; RoundingMode's constants are the enum NAMES, which is what the rounding
+  ;; helpers already dispatch on; BigDecimal's pre-Java-5 ROUND_* ints work too.
+  {:suite "bigdec-members" :label "RoundingMode constants and the legacy ints"
+   :expr "[java.math.RoundingMode/HALF_UP RoundingMode/CEILING BigDecimal/ROUND_HALF_UP (.setScale (BigDecimal. \"1.55\") 1 BigDecimal/ROUND_HALF_UP)]"
+   :expected "[\"HALF_UP\" \"CEILING\" 4 1.6M]"}
+  {:suite "bigdec-members" :label "round takes a MathContext map, and with-precision still rounds divide"
+   :expr "[(.round (BigDecimal. \"123.456\") {:precision 4 :rounding :half-up}) (with-precision 3 (.divide (BigDecimal. \"10\") (BigDecimal. \"3\")))]"
+   :expected "[123.5M 3.33M]"}
   ;; compiler-review R3 stage 3 — == handles BigDecimal operands (predicates.ss
   ;; jolt-num-equiv). Used to throw ClassCastException "== requires numbers" for any
   ;; bigdec; now compares by value across the tower (mirrors compare), while = keeps
