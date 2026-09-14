@@ -1441,6 +1441,16 @@
          (let ((pi (hashtable-ref ti proto #f)))
            (and pi (hashtable-ref pi method #f))))))
 
+(define extend-mark "__jolt_extend__")
+
+(define inline-mark "__jolt_inline__")
+
+(define (extend-impl-table? pi)
+  (and pi
+       (hashtable-ref pi extend-mark #f)
+       (not (hashtable-ref pi inline-mark #f))
+       #t))
+
 (define (find-method-any-protocol type-tag method)
   (let ((entries (tmi-entries type-tag method)))
     (and (pair? entries) (cdar entries))))
@@ -1465,13 +1475,18 @@
 
 (define (type-implements-class?-uncached type-tag qname)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
+    (define (declared? k)
+      (let ((pi (hashtable-ref ti k #f)))
+        (and pi (not (extend-impl-table? pi)))))
     (and ti
-         (or (and (hashtable-ref ti qname #f) #t)
+         (or (declared? qname)
              (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))
                     (n (vector-length ks)))
                (let loop ((i 0))
                  (and (fx< i n)
-                      (or (proto-class-match? (vector-ref ks i) qname)
+                      (or (let ((k (vector-ref ks i)))
+                            (and (declared? k)
+                                 (proto-class-match? k qname)))
                           (loop (fx+ i 1))))))))))
 
 (define type-class-memo
@@ -1815,8 +1830,6 @@
       ((dotted-name? type-name) type-name)
       (else #f))))
 
-(define extend-mark "__jolt_extend__")
-
 (define (mark-extend! tag proto-name)
   (jolt-with-mutex
     rec-tbl-mu
@@ -1883,7 +1896,11 @@
           (hashtable-set!
             ti
             proto-name
-            (make-hashtable string-hash string=?))))))
+            (make-hashtable string-hash string=?)))
+        (hashtable-set!
+          (hashtable-ref ti proto-name #f)
+          inline-mark
+          #t))))
   (let ((iface (cond
                  ((proto-key-qualified? proto-name)
                   (proto-iface-name proto-name))

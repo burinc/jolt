@@ -99,6 +99,16 @@
 ;; every caller resolves before it locks.
 (define mm-tbl-mu (make-mutex))
 
+;; A fresh multimethod value: the dispatch fn, the default dispatch value, the
+;; hierarchy to resolve isa? against (#f = the global one), and the three empty
+;; tables every multifn starts with. Factored out of jolt-defmulti-setup because
+;; `defmulti` is not the only way one gets built — the clojure.lang.MultiFn
+;; constructor (java/host-static-classes.ss) is what code that spells a
+;; multimethod reflectively reaches for, and it must produce the same value.
+(define (make-multifn name dispatch default hierarchy)
+  (make-jolt-multifn name dispatch (new-mm-table) default hierarchy
+                     (new-mm-table) (new-mm-table) -1 #f))
+
 ;; (defmulti-setup 'name dispatch & opts) — opts is a flat :default/:hierarchy plist.
 (define (parse-mm-opts opts)
   (let loop ((o opts) (dk kw-default) (h #f))
@@ -126,8 +136,7 @@
       ;; every method registered on it, instead of starting an empty one
       (if (jolt-multifn? have)
           have
-          (let ((mf (make-jolt-multifn (symbol-t-name name-sym) dispatch
-                                       (new-mm-table) dk h (new-mm-table) (new-mm-table) -1 #f)))
+          (let ((mf (make-multifn (symbol-t-name name-sym) dispatch dk h)))
             (def-var! ns (symbol-t-name name-sym) mf)
             mf)))))
 
@@ -200,19 +209,28 @@
     mf))
 
 ;; --- dispatch ----------------------------------------------------------------
+;; The hierarchy VALUE a multifn resolves against. On the JVM the field is an
+;; IRef that MultiFn.getMethod derefs per dispatch, so an atom and a var both
+;; read their current contents; a plain map is itself. The var arm is what
+;; (new clojure.lang.MultiFn name dispatch default #'clojure.core/global-hierarchy)
+;; hands over — the spelling SCI's defmulti emits.
+(define (mm-hierarchy-value h)
+  (let ((v (if (var-cell? h) (var-cell-deref h) h)))
+    (if (jolt-atom? v) (jolt-atom-val v) v)))
+
 (define (mm-isa? mf)
   ;; the overlay's isa? (the hierarchy system is pure Clojure); a per-mm :hierarchy
-  ;; is an atom (deref each dispatch, like a Clojure var) or a plain map.
+  ;; is an atom or a var (deref each dispatch, like a Clojure IRef) or a plain map.
   (let* ((isa (var-deref "clojure.core" "isa?"))
          (h (jolt-multifn-hierarchy mf))
-         (hval (and h (if (jolt-atom? h) (jolt-atom-val h) h))))
+         (hval (and h (mm-hierarchy-value h))))
     (lambda (x y) (jolt-truthy? (if hval (jolt-invoke isa hval x y) (jolt-invoke isa x y))))))
 
 ;; the parent dispatch values of x in mf's hierarchy, as a Scheme list.
 (define (mm-parents mf)
   (let* ((par (var-deref "clojure.core" "parents"))
          (h (jolt-multifn-hierarchy mf))
-         (hval (and h (if (jolt-atom? h) (jolt-atom-val h) h))))
+         (hval (and h (mm-hierarchy-value h))))
     (lambda (x)
       (let ((r (if hval (jolt-invoke par hval x) (jolt-invoke par x))))
         (if (or (jolt-nil? r) (jolt-nil? (jolt-seq r))) '()
@@ -281,12 +299,8 @@
 ;; prelude loads after this file), exactly as mm-isa? does.
 (define (mm-current-hierarchy mf)
   (let ((h (jolt-multifn-hierarchy mf)))
-    (cond
-      ((not h)
-       (let ((gh (var-deref "clojure.core" "global-hierarchy")))
-         (if (jolt-atom? gh) (jolt-atom-val gh) gh)))
-      ((jolt-atom? h) (jolt-atom-val h))
-      (else h))))
+    (mm-hierarchy-value
+      (or h (var-deref "clojure.core" "global-hierarchy")))))
 
 ;; drop the whole cache if the epoch advanced or the hierarchy value changed.
 ;; The check is re-run under the lock: the clear and the two stamp writes have to

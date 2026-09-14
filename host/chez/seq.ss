@@ -1921,6 +1921,19 @@
     (cond ((fx=? i n) (cons (reverse acc) s))
           ((jolt-nil? s) #f)
           (else (loop (fx+ i 1) (jolt-seq (seq-more s)) (cons (seq-first s) acc))))))
+;; clojure.lang.IFn.applyTo on a deftype/defrecord/reify that DECLARES it: the
+;; JVM's apply is (.applyTo f (seq args)) for every IFn that is not an AFn, which
+;; is the only way such a type can be called with more arguments than it has an
+;; invoke arity for. Without it `apply` re-dispatched through jolt-invoke, which
+;; looks for `invoke` alone and matches it by argument count — so a 21-parameter
+;; varargs invoke was treated as a fixed 21-arg method and anything past it was
+;; an ArityException. sci.lang.Var is exactly such a value, and SCI compiles a
+;; call with 3+ arguments to (apply f args), so no SCI-evaluated call to a
+;; variadic core fn could carry more than 21 arguments.
+(define (jolt-apply-to-method f)
+  (cond ((jrec? f) (find-method-any-protocol (jrec-tag f) "applyTo"))
+        ((reified-methods f) => (lambda (h) (hashtable-ref h "applyTo" #f)))
+        (else #f)))
 (define (jolt-apply f . args)
   (let* ((r (reverse args)) (tail (car r)) (fixed (reverse (cdr r)))
          (v (and (procedure? f) (variadic-fixed-arity-of f))))
@@ -1936,6 +1949,10 @@
                      (append head
                              (list (make-lazy-rest
                                     (fold-right cseq-realized (cdr peeled) spill))))))))
+      ;; a type's own applyTo takes ONE seq of every argument (nil when there are
+      ;; none), so the tail is not realized here either.
+      ((jolt-apply-to-method f)
+       => (lambda (m) (jolt-invoke m f (fold-right cseq-realized (jolt-seq tail) fixed))))
       (else (apply jolt-invoke f (append fixed (seq->list (jolt-seq tail))))))))
 
 ;; ============================================================================

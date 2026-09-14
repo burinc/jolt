@@ -2762,12 +2762,66 @@
   ;; a keyword has no Scheme reading — macroexpansion refuses it
   {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (try (eval '(jolt.scheme/scheme (list :kw))) :no-throw (catch Exception e :threw)))" :expected ":threw"}
 
-  ;; instance? on a protocol is memoized per (type, class-name) under the proto
-  ;; epoch — an extend-protocol AFTER the first query must flip the answer, not
-  ;; serve the cached false.
-  {:suite "records" :label "instance? sees a later extend-protocol"
+  ;; extend-protocol does not make the target an instance? of the protocol's
+  ;; interface. On the JVM `extend` files the implementation in the protocol's
+  ;; own method table and leaves the class untouched, so satisfies? and dispatch
+  ;; flip while instance? stays false — sci.impl.types/eval-node? is exactly that
+  ;; instance? test over a protocol SCI also extends onto concrete types.
+  {:suite "records" :label "extend-protocol leaves instance? false"
    :expr "(do (defprotocol MemoP (mp [_])) (deftype MemoT [v]) (let [t (->MemoT 1) before (instance? user.MemoP t)] (extend-protocol MemoP MemoT (mp [_] 2)) [before (instance? user.MemoP t) (satisfies? MemoP t) (mp t)]))"
-   :expected "[false true true 2]"}
+   :expected "[false false true 2]"}
+  ;; …and the answer IS memoized per (type, class-name) under the proto epoch, so
+  ;; a redefinition that DECLARES the protocol inline — which is what does add the
+  ;; interface to the class, here as on the JVM — must flip the cached false.
+  {:suite "records" :label "instance? sees a later inline declaration"
+   :expr "(do (defprotocol MemoQ (mq [_])) (deftype MemoU [v]) (let [before (instance? user.MemoQ (->MemoU 1))] (eval '(deftype MemoU [v] MemoQ (mq [_] 2))) [before (instance? user.MemoQ (->MemoU 1)) (mq (->MemoU 1))]))"
+   :expected "[false true 2]"}
+  ;; …and an INLINE declaration is not undone by a later extend. jolt allows
+  ;; extending a protocol onto a type that already declares it inline; the JVM
+  ;; refuses that outright ("class T already directly implements interface P for
+  ;; protocol"), so there is no JVM answer where the two coexist — but the class
+  ;; question keeps the JVM's: the class carries the interface because it
+  ;; declared it, and instance? cannot be taken away by an extend. Only a type
+  ;; that was MERELY extended answers false.
+  {:suite "records" :label "an inline declaration survives a later extend"
+   :expr "(do (defprotocol MemoR (mr [_])) (deftype MemoV [] MemoR (mr [_] :inline)) (let [before (instance? user.MemoR (->MemoV))] (extend-type MemoV MemoR (mr [_] :extended)) [before (instance? user.MemoR (->MemoV)) (satisfies? MemoR (->MemoV)) (mr (->MemoV))]))"
+   :expected "[true true true :extended]"}
+  ;; neither bookkeeping mark is a member of the class
+  {:suite "records" :label "the extend/inline marks are not reflected methods"
+   :expr "(do (defprotocol MemoS (ms [_])) (deftype MemoW [] MemoS (ms [_] 1)) (deftype MemoX []) (extend-type MemoX MemoS (ms [_] 2)) [(sort (map #(.getName %) (.getDeclaredMethods (class (->MemoW))))) (sort (map #(.getName %) (.getDeclaredMethods (class (->MemoX)))))])"
+   :expected "[(\"ms\") ()]"}
+
+  ;; apply on a deftype/record/reify that implements clojure.lang.IFn goes
+  ;; through its OWN applyTo, as it does on the JVM for every IFn that is not an
+  ;; AFn — the only entry point such a type has for more arguments than it
+  ;; declares an invoke arity for. sci.lang.Var is one, and SCI compiles a call
+  ;; with 3+ arguments to (apply f args).
+  {:suite "records" :label "apply goes through IFn.applyTo"
+   :expr "(do (defrecord ApplyToR [] clojure.lang.IFn (invoke [this] :zero) (invoke [this a] a) (applyTo [this args] (count args))) (mapv (fn [n] (apply (->ApplyToR) (range n))) [0 1 20 21 22 30]))"
+   :expected "[0 1 20 21 22 30]"}
+  ;; …and a direct call still selects the type's invoke arity, not applyTo.
+  {:suite "records" :label "a direct call still picks invoke"
+   :expr "(do (defrecord ApplyToS [] clojure.lang.IFn (invoke [this] :zero) (invoke [this a] a) (applyTo [this args] (count args))) [((->ApplyToS)) ((->ApplyToS) :v) (apply (->ApplyToS) (range 25))])"
+   :expected "[:zero :v 25]"}
+  {:suite "records" :label "a reify's applyTo answers apply too"
+   :expr "(let [y (reify clojure.lang.IFn (invoke [_ a] a) (applyTo [_ args] (count args)))] [(y 7) (apply y (range 25))])"
+   :expected "[7 25]"}
+
+  ;; clojure.lang.MultiFn's public constructor, MultiFn(String, IFn, Object,
+  ;; IPersistentMap) — what code that builds a multimethod reflectively rather
+  ;; than through defmulti emits (SCI's defprotocol expands to defmulti, which
+  ;; expands to this `new`).
+  {:suite "multifn-ctor"
+   :expr "(let [m (clojure.lang.MultiFn. \"mfc\" identity :default nil)] (.addMethod m :x (fn [_] :got)) [(instance? clojure.lang.MultiFn m) (class m) (m :x)])"
+   :expected "[true clojure.lang.MultiFn :got]"}
+  {:suite "multifn-ctor" :label "the default dispatch value is honoured"
+   :expr "(let [m (clojure.lang.MultiFn. \"mfc\" identity :fallback nil)] (.addMethod m :fallback (fn [_] :fell-through)) (m :anything))"
+   :expected ":fell-through"}
+  ;; the hierarchy argument is an IRef on the JVM, deref'd per dispatch; nil is
+  ;; the global hierarchy, which is what a bare (defmulti …) resolves against.
+  {:suite "multifn-ctor" :label "a var hierarchy resolves isa? dispatch"
+   :expr "(do (derive ::mfc-child ::mfc-parent) (let [m (clojure.lang.MultiFn. \"mfc\" identity :default #'clojure.core/global-hierarchy)] (.addMethod m ::mfc-parent (fn [_] :parent)) (m ::mfc-child)))"
+   :expected ":parent"}
 
   ;; a wrong-arity positional-ctor call is an ArityException naming the ctor var
   ;; (JVM: "Wrong number of args (N) passed to: ns/->Name"); unit-only because the

@@ -2946,6 +2946,23 @@
 (register-class-arm! reader-conditional-value? (lambda (x) "clojure.lang.ReaderConditional"))
 ;; a multimethod reports its JVM class.
 (register-class-arm! (lambda (x) (jolt-multifn? x)) (lambda (x) "clojure.lang.MultiFn"))
+;; …and answers its public constructor, MultiFn(String, IFn, Object,
+;; IPersistentMap). `defmulti` and `defprotocol` written in jolt never reach it —
+;; they expand to defmulti-setup / make-protocol, which build the value directly —
+;; but code that constructs a multimethod REFLECTIVELY spells it this way, and
+;; that is not a corner case: sci.impl.multimethods/multi-fn-impl is
+;; (new clojure.lang.MultiFn name dispatch-fn default hierarchy), and SCI's
+;; defprotocol expands to defmulti, so without this constructor no SCI context
+;; could define a protocol at all ("No matching ctor found for class
+;; clojure.lang.MultiFn"). The hierarchy argument is an IRef on the JVM, deref'd
+;; per dispatch (SCI passes #'clojure.core/global-hierarchy); nil means the
+;; global hierarchy, which is how the multifn record spells "none of my own".
+(let ((multifn-ctor
+       (lambda (name dispatch default hierarchy)
+         (make-multifn (jolt-str-render-one name) dispatch default
+                       (if (jolt-nil? hierarchy) #f hierarchy)))))
+  (register-class-ctor! "MultiFn" multifn-ctor)
+  (register-class-ctor! "clojure.lang.MultiFn" multifn-ctor))
 ;; exact-own-class fallback: (instance? C x) is true when C names x's own class —
 ;; covers checks against a captured (class y) value (transient classes, MultiFn)
 ;; that no interface arm models. Widening only. The class's ANCESTRY needs no
