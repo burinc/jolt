@@ -1341,6 +1341,17 @@
   {:suite "interop / StringReader & StringBuilder" :label "indexOf / lastIndexOf, -1 when absent" :expected "[1 4 4 -1]" :actual "[(.indexOf (StringBuilder. \"abcabc\") \"bc\") (.indexOf (StringBuilder. \"abcabc\") \"bc\" 2) (.lastIndexOf (StringBuilder. \"abcabc\") \"bc\") (.indexOf (StringBuilder. \"abc\") \"zz\")]" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "substring, isEmpty and setCharAt" :expected "[\"cdef\" \"cd\" true \"Zbcdef\"]" :actual "[(.substring (StringBuilder. \"abcdef\") 2) (.substring (StringBuilder. \"abcdef\") 2 4) (.isEmpty (StringBuilder.)) (let [b (StringBuilder. \"abcdef\")] (.setCharAt b 0 \\Z) (str b))]" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "an out-of-range index is a StringIndexOutOfBoundsException" :expected "\"StringIndexOutOfBoundsException\"" :actual "(try (.deleteCharAt (StringBuilder. \"ab\") 5) (catch Exception e (.getSimpleName (class e))))" :portability :jvm}
+  ;; StringBuffer is the legacy synchronized builder. jolt models it over the same
+  ;; store as StringBuilder, so the member surface is pinned the same way — and the
+  ;; class it REPORTS is pinned too, because sharing the store must not make a
+  ;; StringBuffer answer as a StringBuilder. rewrite-clj's reader (cljfmt's parser)
+  ;; builds one per token, which is the shape the second row spells out.
+  {:suite "interop / StringReader & StringBuilder" :label "StringBuffer append" :expected "\"ab1\"" :actual "(.toString (-> (StringBuffer.) (.append \"a\") (.append \\b) (.append 1)))" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "StringBuffer accumulates a char at a time" :expected "\"abc\"" :actual "(let [buf (StringBuffer.)] (doseq [c \"abc\"] (.append buf c)) (.toString buf))" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "StringBuffer reports its own class" :expected "[java.lang.StringBuffer true false]" :actual "[(class (StringBuffer.)) (instance? CharSequence (StringBuffer.)) (instance? StringBuilder (StringBuffer.))]" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "StringBuffer is a CharSequence to str, count and seq" :expected "[\"abc\" 3 [\\a \\b \\c]]" :actual "(let [b (StringBuffer. \"abc\")] [(str b) (count b) (vec (seq b))])" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "StringBuffer edits: delete, insert, reverse, indexOf" :expected "[\"abdef\" \"abcXYdef\" \"fedcba\" 1]" :actual "[(str (.deleteCharAt (StringBuffer. \"abcdef\") 2)) (str (.insert (StringBuffer. \"abcdef\") 3 \"XY\")) (str (.reverse (StringBuffer. \"abcdef\"))) (.indexOf (StringBuffer. \"abcabc\") \"bc\")]" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "StringBuffer capacity arg is not content" :expected "\"x\"" :actual "(.toString (.append (StringBuffer. 16) \"x\"))" :portability :jvm}
   ;; LineNumberingPushbackReader is pushback over java.io.LineNumberReader, so a
   ;; \r, a \n and a \r\n all read as one \n and each counts a line. tools.reader's
   ;; source logging reads through it and reproduces the source text from what it got.

@@ -366,6 +366,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worked at the (compiled) REPL. Receivers are not boxed, so `(.getId zone)`
   worked and `(.withZoneSameInstant zdt zone)` did not.
 
+- **`java.lang.StringBuffer` resolved as a class but could not be built —
+  `(StringBuffer.)` raised `No matching ctor found for class StringBuffer`.**
+  The class graph carried its row and `StringBuilder` was complete, so only the
+  constructor and the shim were missing and the class was inert. It is modeled
+  now over the same store `StringBuilder` uses: the constructors (empty, a
+  `CharSequence`, and the capacity `int` that is a hint rather than content),
+  the whole instance surface (`append` / `toString` / `length` / `charAt` /
+  `setLength` / `substring` / `insert` / `delete` / `deleteCharAt` / `replace` /
+  `reverse` / `indexOf` / `lastIndexOf` / `setCharAt` / `isEmpty` /
+  `subSequence`), and the `str`, `count`, `seq`, `class` and `instance?` arms —
+  under its OWN jhost tag, so a `StringBuffer` reports `java.lang.StringBuffer`
+  and answers `false` to `(instance? StringBuilder …)` rather than borrowing the
+  class of the store it shares. The compiler's direct-emit path for a proven
+  builder receiver covers it too, so the legacy builder is not slower for being
+  older. rewrite-clj's reader builds one per token, so this is what made
+  `cljfmt`'s parser — and a downstream project's `jolt format` /
+  `jolt format-check` — fail. (#978)
+
 - **`String.indexOf` with an empty needle past the end of the string answered
   `-1` instead of the string's length.** `String.indexOf(String,int)` is
   explicit that "if `fromIndex` is greater than the length of this String, and
