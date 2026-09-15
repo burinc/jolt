@@ -2085,6 +2085,9 @@
 ;; GZIPOutputStream shares.
 (load "host/chez/java/zip-out-streams.ss")
 
+;; GZIPInputStream and GZIPOutputStream on those frames.
+(load "host/chez/java/zip-gzip.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss
