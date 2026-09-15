@@ -422,6 +422,7 @@
   {:suite "defn / attr-map" :label "a trailing attr-map wins over the leading one" :expected "\"trail\"" :actual "(do (defn tam4 {:k \"lead\"} ([x] x) {:k \"trail\"}) (:k (meta (var tam4))))" :portability :common}
   {:suite "defn / attr-map" :label ":doc in an attr-map wins over the docstring (JVM conj order)" :expected "\"attr\"" :actual "(do (defn tam5 \"docstring\" {:doc \"attr\"} [x] x) (:doc (meta (var tam5))))" :portability :common}
   {:suite "defn / attr-map" :label "metadata on an arity's param vector does not break the arity" :expected "2" :actual "(do (defn tam6 (^{:x 1} [x] (inc x))) (tam6 1))" :portability :common}
+  {:suite "defn / attr-map" :label "a fn literal in an attr-map is registered, so a macro can splice it out of the var meta" :expected "7" :actual "(do (defn cmeta1 {:inline (fn [x] x)} [x] x) (defmacro cemit1 [] (list (quote def) (quote zz1) (:inline (meta (var cmeta1))))) (cemit1) ((deref (resolve (quote zz1))) 7))" :portability :common}
   ;; The :arglists defn derives is QUOTED in the expansion, as the JVM's is —
   ;; (def ^{:arglists (quote ([x]))} f …). jolt's own def-meta-expr treats the key
   ;; as data either way, so nothing here noticed the bare seq; a consumer that
