@@ -305,7 +305,7 @@
       ;; string-copy! is specified to act as if through a temporary, so an
       ;; overlapping region inside one char array is correct without the
       ;; descending walk below — the same reason the bytevector arm is here.
-      ((and (string? sv) (string? dv)) (string-copy! sv soff dv doff n))
+      ((and (string? sv) (string? dv)) (sa-string-copy-range! dv doff sv soff (+ soff n)))
       ((and (eq? sv dv) (< soff doff))
        (let loop ((i (- n 1)))
          (when (>= i 0) (ja-set! dst (+ doff i) (ja-ref src (+ soff i))) (loop (- i 1)))))

@@ -858,6 +858,10 @@
 ;; (vector-copy! from from-start to to-start count).
 (define (sa-vector-copy-range! to at from start end)
   (vector-copy! from start to at (fx- end start)))
+;; (sa-string-copy-range! to at from start end): the same reorder over Chez's
+;; (string-copy! from from-start to to-start count).
+(define (sa-string-copy-range! to at from start end)
+  (string-copy! from start to at (fx- end start)))
 
 ;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
 ;; is a macro, so it must be defined before this load rather than captured at

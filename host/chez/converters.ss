@@ -129,13 +129,15 @@
 ;; `substring` 4.27us, `(make-string n)` + `string-copy!` 1.17us — and the
 ;; make-string alone is 1.29us of that, so the copy itself is free and what the
 ;; primitive spends is the per-character loop. Out-of-range falls through to
-;; `substring` so the range error stays the one host-faults.ss classifies
-;; (string-index-whos lists `substring`, not `string-copy!`'s shape of it).
+;; `substring` so the range error stays the one host-faults.ss classifies. The
+;; copy goes through the adapter's sa-string-copy-range! rather than a raw
+;; string-copy!: this file is shared with the Gambit host, whose R7RS
+;; string-copy! takes the same five arguments in the opposite direction.
 (define (jolt-substr s start end)
   (if (and (fixnum? start) (fixnum? end)
            (fx>=? start 0) (fx<=? start end) (fx<=? end (string-length s)))
-      (let* ((k (fx- end start)) (d (make-string k)))
-        (string-copy! s start d 0 k)
+      (let ((d (make-string (fx- end start))))
+        (sa-string-copy-range! d 0 s start end)
         d)
       (substring s start end)))
 

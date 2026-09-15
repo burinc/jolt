@@ -4,7 +4,7 @@
 ;; standard-clojure-style (the Clojure port of standard-clojure-style-js), whose
 ;; PERFORMANCE.md measures the same twelve files against the upstream JavaScript
 ;; implementation on V8 — so this row has a non-JVM reference too, and the
-;; numbers say jolt is ~40x V8 on it warm.
+;; numbers say jolt is ~20x V8 on it warm (README.md has the three-way split).
 ;;
 ;; Every axis here is one a formatter, linter, reader or template engine hits,
 ;; and none of the existing rows covers the combination:

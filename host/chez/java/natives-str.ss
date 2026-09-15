@@ -352,12 +352,12 @@
                         (cond
                          ((fx<? m 0)
                           (let ((tail (fx- slen i)))
-                            (when (fx>? tail 0) (string-copy! s i out o tail))
+                            (when (fx>? tail 0) (sa-string-copy-range! out o s i slen))
                             out))
                          (else
                           (let ((span (fx- m i)))
-                            (when (fx>? span 0) (string-copy! s i out o span))
-                            (when (fx>? blen 0) (string-copy! b 0 out (fx+ o span) blen))
+                            (when (fx>? span 0) (sa-string-copy-range! out o s i m))
+                            (when (fx>? blen 0) (sa-string-copy-range! out (fx+ o span) b 0 blen))
                             (let ((nx (fx+ m alen)))
                               (fill nx (next-at nx) (fx+ o (fx+ span blen))))))))))))))))
 

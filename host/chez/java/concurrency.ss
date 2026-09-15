@@ -835,17 +835,21 @@
       ((null? opts) (%pre-conc-deref x))
       (else (jolt-throw (deref-cast-error x opts))))))
 
-;; The ATOM arm, ahead of the whole chain. Reaching an atom used to mean a
-;; rest-arg list allocated on every single call, then a walk down four chained
-;; lambdas (futures -> vars -> volatiles -> atoms) with a predicate at each —
-;; ~60ns to read one record field, and every loop that keeps mutable state in an
-;; atom pays it per iteration (bench/cst-format derefs a per-node atom several
-;; times per node). A `case-lambda` fixed clause allocates nothing and answers
-;; the common case with one record-type test; every other reference type and
-;; arity reaches the general body above completely unchanged.
+;; The ATOM and VOLATILE arms, ahead of the whole chain. Reaching an atom used
+;; to mean a rest-arg list allocated on every single call, then a walk down four
+;; chained lambdas (futures -> vars -> volatiles -> atoms) with a predicate at
+;; each — ~60ns to read one record field, and every loop that keeps mutable
+;; state in an atom pays it per iteration (bench/cst-format derefs a per-node
+;; atom several times per node). A volatile is the same read one step earlier
+;; in that chain, and every stateful transducer (partition-by, take, distinct)
+;; derefs its box per input. A `case-lambda` fixed clause allocates nothing and
+;; answers each with one record-type test; every other reference type and arity
+;; reaches the general body above completely unchanged.
 (set! jolt-deref
   (case-lambda
-    ((x) (if (jolt-atom? x) (jolt-atom-val x) (%conc-deref-general x)))
+    ((x) (cond ((jolt-atom? x) (jolt-atom-val x))
+               ((jvol? x) (jvol-v x))
+               (else (%conc-deref-general x))))
     ((x ms val) (%conc-deref-general x ms val))
     ((x . opts) (apply %conc-deref-general x opts))))
 

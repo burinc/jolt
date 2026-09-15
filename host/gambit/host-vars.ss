@@ -231,6 +231,18 @@
 (register-eq-arm! (lambda (a b) (and (jclass? a) (jclass? b)))
                   (lambda (a b) (string=? (jclass-name a) (jclass-name b))))
 
+;; The auto-imported class tokens as clojure.core vars, the way Chez's
+;; host-static-classes.ss binds them: compiled code reads `Throwable` as
+;; (var-deref "clojure.core" "Throwable"), and the compiler's own diagnostic
+;; wrapper does (instance? Throwable e) — so with these unbound every analysis
+;; error became "symbol-t-name: not an instance of this record type" on the
+;; Unbound sentinel, and the eval gate could not report what actually failed.
+(for-each
+  (lambda (n)
+    (let ((fqn (jolt-default-import-canonical n)))
+      (when (jch-known? fqn) (def-var! "clojure.core" n (jolt-class-for fqn)))))
+  jolt-default-import-names)
+
 ;; ---- absent capabilities ---------------------------------------------------
 
 (degrade-core-vars! '("host-new" "host-static-call" "host-static-ref" "make-proxy")
