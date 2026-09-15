@@ -767,9 +767,10 @@
 ;; --- deref extension --------------------------------------------------------
 ;; Chain the fully-built jolt-deref (atoms/vars/volatiles/reduced) with futures,
 ;; promises, agents, and delays; accept the timed (deref ref ms val) arity for the
-;; blocking ref types.
+;; blocking ref types. This is the GENERAL body — the entry point installed into
+;; jolt-deref is the case-lambda below it, which takes the atom case first.
 (define %pre-conc-deref jolt-deref)
-(set! jolt-deref
+(define %conc-deref-general
   (lambda (x . opts)
     (cond
       ((jolt-future? x)
@@ -795,9 +796,10 @@
       ;; The ms goes through tu-args->ms so the timed arity normalizes its amount
       ;; exactly as the .get(timeout, unit) overload does.
       ;;
-      ;; ONE jhost? test and then the tag, rather than an arm per shim: every deref
-      ;; of an ATOM falls past this whole cond to %pre-conc-deref, so what the
-      ;; common case pays for these two shims is a single record-type predicate.
+      ;; ONE jhost? test and then the tag, rather than an arm per shim: anything
+      ;; that is not one of these shims falls past the whole cond, so what a
+      ;; non-shim pays for them is a single record-type predicate. (An ATOM never
+      ;; gets here at all — the case-lambda entry below answers it first.)
       ((and (jhost? x) (future-shim-get* x))
        => (lambda (get*)
             (if (null? opts)
@@ -832,6 +834,20 @@
       ;; raised a host error whose (class e) was the opaque :object sentinel.
       ((null? opts) (%pre-conc-deref x))
       (else (jolt-throw (deref-cast-error x opts))))))
+
+;; The ATOM arm, ahead of the whole chain. Reaching an atom used to mean a
+;; rest-arg list allocated on every single call, then a walk down four chained
+;; lambdas (futures -> vars -> volatiles -> atoms) with a predicate at each —
+;; ~60ns to read one record field, and every loop that keeps mutable state in an
+;; atom pays it per iteration (bench/cst-format derefs a per-node atom several
+;; times per node). A `case-lambda` fixed clause allocates nothing and answers
+;; the common case with one record-type test; every other reference type and
+;; arity reaches the general body above completely unchanged.
+(set! jolt-deref
+  (case-lambda
+    ((x) (if (jolt-atom? x) (jolt-atom-val x) (%conc-deref-general x)))
+    ((x ms val) (%conc-deref-general x ms val))
+    ((x . opts) (apply %conc-deref-general x opts))))
 
 (define (deref-cast-error x opts)
   (jolt-host-throwable

@@ -536,7 +536,7 @@
 ;; is idempotent, so both callers can hand over whatever they hold.
 (define (jolt-str-split s pat limit)
   (jvm-split-array (str-irx pat) s (if (number? limit) (exact (truncate limit)) 0)))
-(define (jolt-str-sub-sequence s from to) (substring s (jolt->idx from) (jolt->idx to)))
+(define (jolt-str-sub-sequence s from to) (jolt-substr s (jolt->idx from) (jolt->idx to)))
 (define (jolt-str-simple-name s)
   (let ((i (str-last-index-of s "."))) (if (>= i 0) (substring s (+ i 1) (string-length s)) s)))
 
@@ -594,8 +594,8 @@
     ((string=? method "repeat") (jolt-str-repeat s (arg 0)))
     ((string=? method "codePointAt") (jolt-str-code-point-at s (arg 0)))
     ((string=? method "substring")
-     (substring s (jolt->idx (arg 0))
-                (if (fx>? (length rest) 1) (jolt->idx (arg 1)) (string-length s))))
+     (jolt-substr s (jolt->idx (arg 0))
+                  (if (fx>? (length rest) 1) (jolt->idx (arg 1)) (string-length s))))
     ((string=? method "lastIndexOf") (jolt-str-last-index-of s (arg 0)))
     ((string=? method "endsWith")
      (let ((p (str-arg (arg 0))) (slen (string-length s)))
