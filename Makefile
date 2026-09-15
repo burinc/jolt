@@ -169,7 +169,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -1229,7 +1229,7 @@ gambitcheck:
 
 # G2 kernel-test gate (jolt-mj95.4): the full booted manifest on native gsi,
 # driven through the real natives. Same detection-gated shape as gambitcheck;
-# NOT in the ci list. Run from the repo root (boot's irregex load is cwd-relative).
+# a second on gsi. Run from the repo root (boot's irregex load is cwd-relative).
 gambitkernel:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/kernel-test.ss; \
@@ -1287,8 +1287,10 @@ gambitvars-regen:
 
 # Build profiles: generate the reduced repl profile and check that the language
 # still works while an excluded feature reports itself instead of failing as an
-# unbound name. Cheap (a gsi load, no js compile), so it can gate the mechanism.
-gambitprofile:
+# unbound name. Cheap (a gsi load, no js compile), so it gates the mechanism.
+# Ordered after gambitboot: gen-boot.ss rewrites boot-active.ss for every
+# profile, and under -j two writers would race on it.
+gambitprofile: gambitboot
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		$(CHEZ) --script host/gambit/gen-boot.ss repl; \
 		"$(GAMBIT_GSI)" host/gambit/profile-test.ss; \
