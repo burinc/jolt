@@ -2,7 +2,8 @@
 ;; while this file proves that the supported dependency path yields usable,
 ;; persistent SCI contexts.
 (ns sci-functional-test
-  (:require [sci.core :as sci]))
+  (:require [sci.core :as sci]
+            [sci.impl.types]))
 
 (defn- check= [label expected actual]
   (when-not (= expected actual)
@@ -147,4 +148,109 @@
   (check= "a java.time value is an Object" true
           (sci/eval-string* ctx "(instance? java.lang.Object (LocalDate/of 2020 3 5))")))
 
+
+
+
+;; A host protocol shared into an SCI context, implemented from inside it.
+;;
+;; SCI has one model of a protocol: a map {:methods #{multimethod ..} :ns
+;; <sci namespace>} whose methods are multimethods dispatching on
+;; sci.impl.types/type-impl, which is what its defrecord/deftype/extend-type
+;; register into (a defmethod per method). A host protocol var copied in as-is
+;; (sci/copy-var*) is not that shape on ANY host — jolt's map has no :ns and its
+;; methods are plain fns; the JVM's has no :ns either and a :var SCI cannot
+;; alter-var-root — so a record implementing it dies in analysis (jolt#1000).
+;; The embedder shares a host protocol the way babashka shares
+;; clojure.core.protocols: one multimethod per method whose :default answers
+;; through the host protocol, a SCI-side protocol map naming them, and — for the
+;; other direction, a host caller handed a value SCI built — the host protocol
+;; extended to SCI's record and type classes, routing back through the
+;; multimethods. This is that recipe, run end to end on jolt.
+(defprotocol Shape
+  (area [this])
+  (scaled [this k]))
+(defrecord HostSquare [s]
+  Shape
+  (area [_] (* s s))
+  (scaled [_ k] (->HostSquare (* s k))))
+
+;; SCI-side methods: dispatch on SCI's notion of a value's type; a value SCI did
+;; not build (a host record, a string) falls to the host protocol.
+(defmulti sci-area sci.impl.types/type-impl)
+(defmulti sci-scaled sci.impl.types/type-impl)
+(defmethod sci-area :default [x] (area x))
+(defmethod sci-scaled :default [x k] (scaled x k))
+
+;; the other direction: a SCI record or type reaching the HOST protocol answers
+;; through the SCI method its defrecord/deftype registered. Only a method the
+;; type actually registered counts — the :default is the host protocol itself,
+;; and answering through it here would loop.
+(defn- sci-method [mm this]
+  (let [f (get-method mm (sci.impl.types/type-impl this))]
+    (when-not (identical? f (get-method mm :default)) f)))
+(defn- via-sci [mm]
+  (fn [this & args]
+    (if-let [f (sci-method mm this)]
+      (apply f this args)
+      (throw (IllegalArgumentException.
+              (str "No implementation of method: " mm " for SCI type: "
+                   (sci.impl.types/type-impl this)))))))
+(doseq [c [sci.impl.records.SciRecord sci.impl.deftype.SciType]]
+  (extend c Shape {:area (via-sci sci-area) :scaled (via-sci sci-scaled)}))
+
+(def shapes-ns (sci/create-ns 'shapes))
+(def shapes-ctx
+  (sci/init {:classes {:allow :all}
+             :namespaces {'shapes {'Shape (sci/new-var 'shapes/Shape
+                                                       {:methods #{sci-area sci-scaled}
+                                                        :ns shapes-ns
+                                                        :name 'shapes/Shape
+                                                        :protocol Shape}
+                                                       {:ns shapes-ns})
+                                   'area (sci/copy-var* #'sci-area shapes-ns)
+                                   'scaled (sci/copy-var* #'sci-scaled shapes-ns)
+                                   'host-square (sci/copy-var* #'->HostSquare shapes-ns)}}}))
+
+(check= "defrecord implementing the host protocol, called inside SCI" 9
+        (sci/eval-string* shapes-ctx
+          "(defrecord Sq [s] shapes/Shape (area [_] (* s s)) (scaled [_ k] (->Sq (* s k))))
+           (shapes/area (->Sq 3))"))
+(check= "a second method, with an extra argument" 16
+        (sci/eval-string* shapes-ctx "(shapes/area (shapes/scaled (->Sq 2) 2))"))
+;; deftype: SCI emits (do (-create-type ..) ~@(map analyze methods)) and analyzes
+;; each method only as the evaluator reaches it, after the type exists — which
+;; needs ~@ to be as lazy as the JVM's (seq (concat ..)) (corpus "~@ is lazy").
+(check= "deftype implementing the host protocol, called inside SCI" 12
+        (sci/eval-string* shapes-ctx
+          "(deftype Rect [w h] shapes/Shape (area [_] (* w h)) (scaled [_ k] (->Rect (* w k) (* h k))))
+           (shapes/area (->Rect 3 4))"))
+(check= "a host record reaching the SCI method falls to the host protocol" 25
+        (sci/eval-string* shapes-ctx "(shapes/area (shapes/host-square 5))"))
+(check= "extend-type on a host class inside SCI" 3
+        (sci/eval-string* shapes-ctx
+          "(extend-type String shapes/Shape (area [s] (count s)) (scaled [s k] (apply str (repeat k s))))
+           (shapes/area (shapes/scaled \"a\" 3))"))
+(check= "extend-protocol to nil and Object inside SCI" [0 -1]
+        (sci/eval-string* shapes-ctx
+          "(extend-protocol shapes/Shape
+              nil (area [_] 0) (scaled [_ _] nil)
+              Object (area [_] -1) (scaled [o _] o))
+           [(shapes/area nil) (shapes/area 42)]"))
+(check= "satisfies? inside SCI sees the record, the type and the extension" [true true true]
+        (sci/eval-string* shapes-ctx
+          "[(satisfies? shapes/Shape (->Sq 1)) (satisfies? shapes/Shape (->Rect 1 1)) (satisfies? shapes/Shape \"s\")]"))
+
+;; host side: values SCI built, handed to the host protocol
+(let [sq (sci/eval-string* shapes-ctx "(->Sq 3)")
+      rect (sci/eval-string* shapes-ctx "(->Rect 2 5)")]
+  (check= "the host protocol on a SCI record" 9 (area sq))
+  (check= "the host protocol on a SCI type" 10 (area rect))
+  (check= "a host caller scaling a SCI record gets a SCI record back" 36
+          (area (scaled sq 2)))
+  (check= "a SCI record satisfies the host protocol" true (satisfies? Shape sq)))
+(let [other (sci/eval-string* shapes-ctx "(defrecord Plain [x]) (->Plain 1)")]
+  (check= "a SCI record whose type does not implement the protocol is refused, not looped"
+          :refused
+          (try (area other) :answered
+               (catch IllegalArgumentException _ :refused))))
 (println "SCI-FUNCTIONAL-TEST OK")

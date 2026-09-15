@@ -205,6 +205,32 @@
   {:suite "syntax-quote / in a deftype method body" :label "~@unquote-splicing in a deftype method's template splices its items" :expected "\"(user/f x 42 user/end)\"" :actual "(do (in-ns (quote user)) (defprotocol Psp (src2 [this ocr])) (deftype Tsp [l] Psp (src2 [this ocr] `(f ~@[ocr l] end))) (pr-str (src2 (->Tsp 42) (quote x))))" :portability :common}
   {:suite "syntax-quote / in a deftype method body" :label "defrecord and reify method templates agree with deftype's" :expected "[\"(clojure.core/= x 42)\" \"(clojure.core/= x 42)\"]" :actual "(do (defprotocol Prr (src3 [this ocr])) (defrecord Rrr [l] Prr (src3 [this ocr] `(= ~ocr ~l))) [(pr-str (src3 (->Rrr 42) (quote x))) (pr-str (src3 (reify Prr (src3 [this ocr] (let [l 42] `(= ~ocr ~l)))) (quote x)))])" :portability :common}
   {:suite "syntax-quote / in a deftype method body" :label "a mutable field's live-read rewrite still leaves the template's unquotes alone" :expected "\"(clojure.core/+ 1 7)\"" :actual "(do (defprotocol Pmu (src4 [this a])) (deftype Tmu [^:unsynchronized-mutable v] Pmu (src4 [this a] (set! v 7) `(+ ~a ~v))) (pr-str (src4 (->Tmu 0) 1)))" :portability :common}
+  ;; ~@ in a list template is LAZY: the JVM reads `(a ~@xs) as (seq (concat (list
+  ;; 'a) xs)), which realizes the head and nothing of xs until the form is walked
+  ;; past it. jolt built the whole list at quote time, so a macro whose expansion
+  ;; splices a lazily-mapped seq ran that map's side effects — and its analysis —
+  ;; before the top-level do had evaluated the forms ahead of the splice. SCI's
+  ;; deftype relies on exactly that order: it emits (do (-create-type ..) ~@methods)
+  ;; and analyzes each method as the evaluator reaches it, after the type exists.
+  ;; A vector or set template stays eager (the JVM applies vector/hash-set).
+  {:suite "syntax-quote / ~@ is lazy" :label "a spliced lazy seq is not realized by building the template, only by walking to it" :expected "(quote [[] user/a [] 1 [1 2 3]])" :actual "(do (in-ns (quote user)) (let [log (atom []) f (fn [x] (swap! log conj x) x) form `(a b ~@(map f [1 2 3]) c)] [@log (first form) @log (nth form 2) @log]))" :portability :common}
+  ;; Bounded on purpose: `(a ~@(range)) is the same claim, but an eager
+  ;; regression would hang this gate instead of failing it. One chunk realized
+  ;; is what taking three of a chunked map costs on either runtime.
+  {:suite "syntax-quote / ~@ is lazy" :label "taking from a long splice realizes one chunk, not the splice" :expected "(quote [(user/a 0 1) 32])" :actual "(do (in-ns (quote user)) (let [n (atom 0) form `(a ~@(map (fn [x] (swap! n inc) x) (range 1000)))] [(doall (take 3 form)) @n]))" :portability :common}
+  {:suite "syntax-quote / ~@ is lazy" :label "two splices realize in walk order, each only when reached" :expected "(quote [user/b [1 2]])" :actual "(do (in-ns (quote user)) (let [log (atom []) f (fn [x] (swap! log conj x) x) form `(a ~@(map f [1 2]) b ~@(map f [3]))] [(nth form 3) @log]))" :portability :common}
+  {:suite "syntax-quote / ~@ is lazy" :label "walking the whole form realizes everything, in order" :expected "(quote [user/a [] (user/a 1 2 3) [1 2 3]])" :actual "(do (in-ns (quote user)) (let [log (atom []) f (fn [x] (swap! log conj x) x) form `(a ~@(map f [1 2]) ~@(map f [3]))] [(first form) @log (doall form) @log]))" :portability :common}
+  {:suite "syntax-quote / ~@ is lazy" :label "a splice in head position realizes its first chunk to produce the head, as seq does" :expected "[1 2]" :actual "(let [log (atom []) f (fn [x] (swap! log conj x) x) form `(~@(map f [1 2]) z)] @log)" :portability :common}
+  {:suite "syntax-quote / ~@ is lazy" :label "a template that splices only empties is nil, and an empty template is ()" :expected "(quote [true 4 (user/a user/b) nil (user/a) ()])" :actual "(do (in-ns (quote user)) [(seq? `(a ~@[1])) (count `(a ~@[1 2] b)) `(a ~@nil b) `(~@[]) `(~@[] a) `()])" :portability :common}
+  {:suite "syntax-quote / ~@ is lazy" :label "a vector template is eager" :expected "[1 2]" :actual "(let [log (atom []) f (fn [x] (swap! log conj x) x) form `[a ~@(map f [1 2])]] @log)" :portability :common}
+  {:suite "syntax-quote / ~@ is lazy" :label "a set template is eager" :expected "(quote (1 2))" :actual "(let [log (atom []) f (fn [x] (swap! log conj x) x) form `#{a ~@(map f [1 2])}] (sort @log))" :portability :common}
+  {:suite "syntax-quote / ~@ is lazy" :label "a top-level do evaluates the forms ahead of a splice before the splice is realized" :expected ":defined" :actual "(do (defmacro sq-lz4 [] `(do (def sq-lz-w 1) (def sq-lz-r ~@(map (fn [_] (list (quote quote) (if (resolve (quote sq-lz-w)) :defined :undefined))) [1])))) (sq-lz4) sq-lz-r)" :portability :common}
+  ;; The protocol value carries Clojure's :sigs — one entry per method with the
+  ;; declared arglists, docstring and tag — so tooling that enumerates a
+  ;; protocol's methods from its value reads jolt's the way it reads the JVM's.
+  ;; (:tag holds the hint as written, a symbol; the JVM resolves it to a Class.)
+  {:suite "defprotocol / :sigs" :label "each method's signature: name, arglists, doc, tag" :expected "(quote [{:tag nil :name msig :arglists ([this] [this a]) :doc \"m doc\"} (:msig :nsig)])" :actual "(do (defprotocol Psig \"docs\" (msig [this] [this a] \"m doc\") (nsig [this])) [(-> Psig :sigs :msig) (-> Psig :sigs keys sort)])" :portability :common}
+  {:suite "defprotocol / :sigs" :label "a method with neither doc nor tag" :expected "(quote {:tag nil :name m2 :arglists ([this]) :doc nil})" :actual "(do (defprotocol Psig2 :extend-via-metadata true (m2 [this])) (-> Psig2 :sigs :m2))" :portability :common}
   {:suite "walk / eager" :label "clojure.walk is eager over a lazy seq (side effects run now)" :expected "3" :actual "(let [a (atom 0)] (clojure.walk/postwalk (fn [x] (when (number? x) (swap! a inc)) x) (map inc (list 1 2 3))) @a)" :portability :common}
   {:suite "chars / isWhitespace" :label "Character/isWhitespace matches the JVM (Unicode line-sep yes, no-break space no)" :expected "[true true false false]" :actual "(mapv (fn [c] (Character/isWhitespace (char c))) [0x2028 32 0x00A0 65])" :portability :jvm}
   {:suite "deftype / field access" :label ".field reads a deftype field" :expected "7" :actual "(do (deftype FldT [q]) (.q (->FldT 7)))" :portability :jvm}

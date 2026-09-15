@@ -1748,10 +1748,11 @@
       tag)
     ctor))
 
-(define (make-protocol name-str methods)
-  (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
-    (keyword #f "name") (jolt-symbol jolt-nil name-str)
-    (keyword #f "methods") methods))
+(define (make-protocol name-str methods . rest)
+  (let ((sigs (if (null? rest) (jolt-hash-map) (car rest))))
+    (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
+      (keyword #f "name") (jolt-symbol jolt-nil name-str)
+      (keyword #f "methods") methods (keyword #f "sigs") sigs)))
 
 (define (register-protocol-methods! proto-name method-names)
   (let ((ns (chez-current-ns)))
