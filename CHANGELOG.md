@@ -49,6 +49,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#\newline` and `#\return` literals a tool had mangled into `#` + a real
   newline, which Gambit reads as a REPL history reference, so it never trimmed.
 
+- **The Gambit target has an interop tier for the seed's own `Class/member`
+  calls and constructors.** `Long/parseLong`, `Math/floor`, `String/join`,
+  the `clojure.lang.Util` family, `(Object.)`, `(StringBuilder.)` and the rest
+  of what clojure.core and the embedded stdlib call raised "unsupported" on
+  Gambit, so `clojure.pprint`, `cl-format` and `munge` did not run there.
+  `host/gambit/host-statics.ss` carries the registries in Chez's shape and the
+  members the seed reaches; `make gambitstatics` reads every static and
+  constructor the seed emits and fails on one the boot does not resolve, or
+  on a stale allowlist line. The class model (`java/class-model.ss`), the
+  StringBuilder shim (`java/string-builder.ss`), the number-parsing family
+  (`java/java-parse.ss`) and the `.`/`.-field` dispatch arms
+  (`java/dot-forms.ss`) are shared files now, loaded by both boots, so the
+  Gambit copy of the class model is gone. Regex `split` and `replace` on
+  Gambit run the engine (the halves moved to `regex.ss`), `identical?` and
+  `identity` have their eval twins, and `make gambittwins` derives the set of
+  call-position macros that need one.
+
 ## [0.8.8] - 2026-09-15
 
 The theme is SCI on jolt. An embedded interpreter could not evaluate protocol
