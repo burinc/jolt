@@ -2077,6 +2077,10 @@
 ;; java.util.zip.Deflater and its static fields.
 (load "host/chez/java/zip-deflater.ss")
 
+;; InflaterInputStream and DeflaterInputStream: in-streams over custom ports, and
+;; the frame GZIPInputStream and ZipInputStream share.
+(load "host/chez/java/zip-in-streams.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss

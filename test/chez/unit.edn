@@ -3112,4 +3112,7 @@
   {:suite "zip" :expr "(let [i (java.util.zip.Inflater.)] (.end i) [(try (.inflate i (byte-array 1)) (catch NullPointerException e (.getMessage e))) (try (.getBytesRead i) (catch NullPointerException e (.getMessage e))) (.needsInput i) (.getRemaining i) (do (.end i) :again)])" :expected "[\"Inflater has been closed\" \"Inflater has been closed\" true 0 :again]"}
   {:suite "zip" :expr "(let [d (java.util.zip.Deflater.)] (.end d) [(try (.deflate d (byte-array 1)) (catch NullPointerException e (.getMessage e))) (try (.setDictionary d (byte-array 1)) (catch NullPointerException e (.getMessage e))) (.needsInput d) (do (.finish d) (.finished d)) (do (.end d) :again)])" :expected "[\"Deflater has been closed\" \"Deflater has been closed\" true false :again]"}
   {:suite "zip" :expr "(let [d (java.util.zip.Deflater.) b (byte-array 8) in (byte-array 64) f (fn [] (dotimes [_ 10000] (.setInput d in) (.deflate d b)) :done) x (future (f)) y (future (f))] [@x @y])" :expected "[:done :done]"}
+  ;; InflaterInputStream over a reify of java.io.InputStream (zip-in-streams.ss):
+  ;; the stream pulls through the reify's own read.
+  {:suite "zip" :expr "(let [b (java.io.ByteArrayInputStream. (byte-array [120 -100 75 -54 73 -52 72 -126 98 0 31 2 4 -58])) inner (reify java.io.InputStream (read [_] (.read b)) (read [_ buf off len] (.read b buf off len)))] (slurp (java.util.zip.InflaterInputStream. inner)))" :expected "\"blahblahblah\""}
 ]
