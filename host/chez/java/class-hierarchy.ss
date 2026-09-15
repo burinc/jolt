@@ -347,6 +347,8 @@
             "java.nio.file.Path" "java.nio.file.PathMatcher" "java.nio.file.Watchable"
             ;; the typed.clojure rows (probed the same way)
             "java.util.RandomAccess" "java.util.Comparator" "java.util.SequencedCollection"
+            ;; the one interface java.util.regex.Matcher implements (#998)
+            "java.util.regex.MatchResult"
             "clojure.lang.ITransientCollection" "clojure.lang.ITransientAssociative"
             "clojure.lang.ITransientAssociative2" "clojure.lang.ITransientMap"
             "clojure.lang.ITransientVector" "clojure.lang.ITransientSet"))
@@ -408,14 +410,16 @@
             "java.lang.Integer" "java.lang.Long" "java.lang.Math"
             "java.lang.Short" "java.lang.String" "java.lang.StringBuffer"
             "java.lang.StringBuilder"
-            "java.lang.System" "java.net.URI" "java.time.DayOfWeek"
+            "java.lang.System" "java.net.URI" "java.net.URLDecoder"
+            "java.net.URLEncoder" "java.time.DayOfWeek"
             "java.time.Duration" "java.time.format.DateTimeFormatter" "java.time.Instant"
             "java.time.LocalDate" "java.time.LocalDateTime" "java.time.LocalTime"
             "java.time.Month" "java.time.OffsetDateTime" "java.time.OffsetTime"
             "java.time.Period" "java.time.temporal.ChronoField" "java.time.temporal.ChronoUnit"
             "java.time.Year" "java.time.YearMonth" "java.time.zone.ZoneRules"
             "java.time.ZonedDateTime" "java.time.ZoneOffset" "java.util.Base64"
-            "java.util.Locale" "java.util.regex.Pattern" "java.util.UUID"
+            "java.util.Locale" "java.util.regex.Matcher" "java.util.regex.Pattern"
+            "java.util.UUID"
             ;; clojure.lang's final classes, from their declarations
             "clojure.lang.ChunkBuffer" "clojure.lang.Volatile" "clojure.lang.Reduced"
             ;; the nested classes, probed: the four transient classes, the two
@@ -812,7 +816,26 @@
 (jch-register-supers! "clojure.lang.IChunk" '("clojure.lang.Indexed"))
 (jch-register-supers! "clojure.lang.Namespace" '("java.io.Serializable"))
 (jch-register-supers! "java.util.regex.Pattern" '("java.io.Serializable"))
+;; The matcher's BEHAVIOR was complete (re-matcher/.find/.group/.region over
+;; matcher-t, host/chez/regex.ss, #906/#907) but the type had no NAME: (class m)
+;; was :object, instance? was false, and SCI could not analyze a source that
+;; imports or hints Matcher — which clojure.tools.reader's commons.clj does, so
+;; the whole tools.reader family (rewrite-clj, edamame, cljfmt) was unloadable
+;; under SCI. Matcher is final and implements MatchResult; the value arms that
+;; make a matcher-t ANSWER the name are in host-class.ss (class), protocols.ss
+;; (protocol dispatch) and records-interop.ss (instance?). #998.
+(jch-register-supers! "java.util.regex.MatchResult" '())
+(jch-register-supers! "java.util.regex.Matcher" '("java.util.regex.MatchResult"))
 (jch-register-supers! "java.net.URI" '())
+;; The two www-form-urlencoded utility classes. Their statics have worked since
+;; #83 (host-static-classes.ss), but nothing put the NAMES in the graph, so
+;; Class/forName, :import, a type hint and instance? all missed them while the
+;; compiled static call worked — and SCI, which resolves the qualifier of
+;; java.net.URLDecoder/decode as a classname first, could not reach the static at
+;; all (kmet's lsp-adapter). Both are final utility classes whose only super is
+;; Object, like java.util.Base64. #999.
+(jch-register-supers! "java.net.URLEncoder" '())
+(jch-register-supers! "java.net.URLDecoder" '())
 (jch-register-supers! "java.util.ArrayList" '("java.util.List" "java.util.RandomAccess"))
 (jch-register-supers! "java.util.Queue" '("java.util.Collection"))
 ;; the two blocking queues concurrency.ss models: without a row here they were
