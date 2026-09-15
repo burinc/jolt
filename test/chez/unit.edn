@@ -3106,4 +3106,8 @@
   ;; live value the compiler cannot spell, and says so. The reference raises here
   ;; too — analyzing its protocol map as a literal hits the arglists' `this`.
   {:suite "defprotocol-value" :expr "(try (load-string \"(defprotocol Pu7 (mu7 [this])) (defmacro emit-pu7 [] Pu7) (emit-pu7)\") :compiled (catch Throwable e (boolean (re-find #\"Cannot compile this value into code\" (ex-message e)))))" :expected "true"}
+  ;; java.util.zip.Inflater (zip-inflater.ss). JDK 21 answers NullPointerException
+  ;; "Inflater has been closed" after end(); later JDKs changed it, so this is not
+  ;; a corpus row.
+  {:suite "zip" :expr "(let [i (java.util.zip.Inflater.)] (.end i) [(try (.inflate i (byte-array 1)) (catch NullPointerException e (.getMessage e))) (try (.getBytesRead i) (catch NullPointerException e (.getMessage e))) (.needsInput i) (.getRemaining i) (do (.end i) :again)])" :expected "[\"Inflater has been closed\" \"Inflater has been closed\" true 0 :again]"}
 ]

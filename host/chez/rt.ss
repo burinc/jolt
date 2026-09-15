@@ -2071,6 +2071,9 @@
 ;; access, and CRC32 / Adler32. The class rows are in class-hierarchy.ss.
 (load "host/chez/java/zip-base.ss")
 
+;; java.util.zip.Inflater, and the window/output/range helpers Deflater shares.
+(load "host/chez/java/zip-inflater.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss
