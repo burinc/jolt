@@ -3483,10 +3483,18 @@
       ;; write: `(var-get #'x)` saw the new value while a compiled `x` kept
       ;; reading the old one, so `alter-var-root` of a plain app var was
       ;; invisible in a built binary and visible everywhere else (jolt#1009).
-      ;; The cost is one hashtable probe per ROOT WRITE — never per call or per
-      ;; read — and the binding is already assignable in a build (build.ss
-      ;; bld-defer-app-strs rewrites each `(define jv$… init)` to a `(set!)` run
-      ;; from the launcher), so nothing is given up to gain it. Inlining is the
+      ;; In TIME it is one hashtable probe per ROOT WRITE — never per call or
+      ;; per read — and no call site slows down: the binding is already
+      ;; assignable in a build (build.ss bld-defer-app-strs rewrites each
+      ;; `(define jv$… init)` into a `(set!)` run from the launcher), so linking
+      ;; costs it no further optimization. In SPACE it is one setter closure and
+      ;; one eq-hashtable entry per app def, which is NOT free: measured over a
+      ;; generated app, ~42-45 bytes of binary and ~0.6 KB of runtime RSS per
+      ;; def (601 defs: +0.3% binary, +0.3% RSS; 2401 defs: +0.9% / +1.4%). A
+      ;; pathological shape — 20k defs whose inits are all tiny constants, so
+      ;; the setter dominates what it is attached to — costs more: +207 B/def
+      ;; and +1.4 KB/def, +17% binary and +12% RSS. Worth knowing before
+      ;; anything raises the per-def payload again. Inlining is the
       ;; separate closed-world freeze: a body spliced into a call site by the
       ;; inline pass still predates the write, and ^:dynamic/^:redef opt out of
       ;; direct-linking altogether.
