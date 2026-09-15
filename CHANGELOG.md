@@ -308,6 +308,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`~@` in a syntax-quote template realized the spliced seq while building the
+  form.** The reference reads `` `(a ~@xs b) `` as `(seq (concat (list a) xs
+  (list b)))`: building the form realizes its head and nothing of `xs`, whose
+  elements are produced only as the form is walked past `a`. jolt built the
+  whole list at quote time, which is observable wherever a walker evaluates as
+  it goes — the top-level `do`, which evaluates each subform before it reads
+  the next. SCI's `deftype` expands to `(do (-create-type ..) ~@(map analyze
+  methods))` and analyzes each method as the evaluator reaches it, after the
+  type exists; on jolt every method was analyzed at quote time, before the
+  type, so any `(deftype T [] SomeProtocol (m [_] ..))` evaluated inside SCI
+  died with `Unable to resolve symbol: user.T` (`defrecord` takes a different
+  path and worked). A list template now keeps its own items up to the first
+  splice as realized cells and the rest as a lazy tail forced when the walk
+  reaches it, so `(take 3 `(a ~@(range)))` is `(a 0 1)` and a side effect in
+  a spliced `map` runs when the reference runs it; a template with no splice
+  is the eager list it always was. Vector and set templates stay eager, as the
+  reference's `(apply vector ..)` makes them. (#1000)
+
+- **A protocol value carries Clojure's `:sigs`.** `(:sigs P)` is `{:m {:name
+  m :arglists ([this] ..) :doc .. :tag ..}}` per method, as the reference
+  builds it, so tooling that enumerates a protocol's methods from its value
+  reads jolt's the same way. `:tag` holds the hint as written (a symbol); the
+  reference resolves it to a `Class`. (#1000)
+
 - **A type-hinted instance call inside SCI reported `No dependency provides
   java.lang.StringBuilder` for a class jolt fully supplies.** SCI resolves a
   `^Hint` to a `Class` at analysis time and then asks that `Class` whether it

@@ -627,11 +627,16 @@
                             kws field-tags tag)
     ctor))
 
-;; make-protocol: a protocol value the overlay reads via (get p :name)/(get p :methods).
-(define (make-protocol name-str methods)
-  (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
-                 (keyword #f "name") (jolt-symbol jolt-nil name-str)
-                 (keyword #f "methods") methods))
+;; make-protocol: a protocol value the overlay reads via (get p :name)/(get p :methods),
+;; carrying Clojure's :sigs (defprotocol builds it; see the macro) for everyone else.
+;; sigs is optional only so a seed minted before it existed still loads while it
+;; mints the next one: the two-argument call is what its prelude spells.
+(define (make-protocol name-str methods . rest)
+  (let ((sigs (if (null? rest) (jolt-hash-map) (car rest))))
+    (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
+                   (keyword #f "name") (jolt-symbol jolt-nil name-str)
+                   (keyword #f "methods") methods
+                   (keyword #f "sigs") sigs)))
 
 ;; register-protocol-methods!: record each method's var-key -> [proto method] for
 ;; the inference driver (devirtualization). Dispatch itself is by the receiver's

@@ -633,7 +633,11 @@
 ;; The protocol value is built by make-protocol (a fn call) rather than an embedded
 ;; tagged map literal: the interpreter would otherwise self-evaluate such a struct
 ;; instead of evaluating its fields. methods is a {kw {:name str}} map (only :name
-;; is consulted). Each method is a thin dispatch fn over protocol-dispatch.
+;; is consulted). sigs is Clojure's :sigs — {kw {:name sym :arglists (..) :doc
+;; str-or-nil :tag hint-or-nil}} — the value's public description of its methods,
+;; which tooling reads to enumerate them. (The JVM resolves :tag to a Class; here
+;; it is the hint symbol as written.) Each method is a thin dispatch fn over
+;; protocol-dispatch.
 (defmacro defprotocol [pname & sigs]
   ;; Clojure's defprotocol takes an optional docstring and leading keyword
   ;; options (:extend-via-metadata true, honeysql uses it) before the method
@@ -646,12 +650,22 @@
         methods (reduce (fn [m sig]
                           (assoc m (keyword (name (first sig))) {:name (name (first sig))}))
                         {} sigs)
+        sigs-map (reduce (fn [m sig]
+                           (let [mname (first sig)
+                                 args (rest sig)
+                                 doc (when (string? (last args)) (last args))]
+                             (assoc m (keyword (name mname))
+                                    {:tag (:tag (meta mname))
+                                     :name (with-meta mname nil)
+                                     :arglists (apply list (filter vector? args))
+                                     :doc doc})))
+                         {} sigs)
         ;; the protocol's identity: this namespace plus the name (see protocol-key).
         ;; Baked here so the value, the dispatch shims and every later impl
         ;; registration all key on one string.
         pkey (str *ns* "/" (name pname))]
     `(do
-       (def ~pname (make-protocol ~pkey ~methods))
+       (def ~pname (make-protocol ~pkey ~methods (quote ~sigs-map)))
        ;; register method var-keys for devirtualization; the inference
        ;; reads this (via infer-unit!) to resolve a protocol call on a known record
        (register-protocol-methods! ~pkey [~@(map (fn [s] (name (first s))) sigs)])
