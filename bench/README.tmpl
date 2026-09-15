@@ -49,6 +49,16 @@ Reading it:
 - **`compile-forms`** measures jolt compiling, not running. The reference
   builds bytecode and generates no native code at load; jolt asks Chez for
   optimized native code for every form, which is roughly half its time.
+- **`cst-format`** is the one row with a NON-JVM reference. It is the shape of
+  standard-clojure-style — a CST of one small fixed-key map per token, then an
+  atom-per-node mutating walk — and the upstream implementation of that
+  formatter is JavaScript, so the same work can be timed on V8. Measured on one
+  x86_64 Linux box, 57 KB of Clojure source: node 14.4 ms, JVM Clojure 167 ms,
+  jolt 290 ms. Read it as two facts rather than one — the IDIOM costs ~12x V8
+  before jolt is involved (persistent maps, an atom per node, and an output
+  string rebuilt per line, against plain objects, in-place fields and V8's
+  cons-strings), and jolt costs ~1.7x the JVM on top of that. It prints its own
+  parse/format split above `mean:`; `mean:` is the row.
 - **`startup`** is the one whole-process row: the boot image's decode plus the
   runtime's init, which every other row excludes by timing inside a running
   binary. `bench/startup.sh` and `bench/startup-phases.sh` break it down
