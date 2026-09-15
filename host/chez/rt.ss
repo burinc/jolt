@@ -2067,6 +2067,10 @@
 ;; java.util.zip classes load after it.
 (load "host/chez/java/zlib.ss")
 
+;; What the java.util.zip classes share: the JDK's array range check, byte[]
+;; access, and CRC32 / Adler32. The class rows are in class-hierarchy.ss.
+(load "host/chez/java/zip-base.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss
