@@ -2248,6 +2248,26 @@
                            (str "(if jolt-fn-identity-probe " id-nm " " (nth c 1) ")")])
                         clauses)
                   clauses)
+        ;; Clojure's exact fixed arity wins over a variadic arity that also accepts
+        ;; the count; Chez's case-lambda takes the FIRST clause that accepts, so a
+        ;; variadic clause declared before a colliding fixed one shadows it, and a
+        ;; call that the JVM routes to the fixed arity lands in the variadic one.
+        ;;
+        ;; A fixed arity can never exceed the variadic threshold (the JVM rejects
+        ;; that outright: "Can't have fixed arity function with more params than
+        ;; variadic function") nor equal another fixed arity, so the only legal
+        ;; overlap is equality -- exactly the case the JVM resolves toward the fixed
+        ;; clause. Fixed clauses first and the single variadic clause last therefore
+        ;; reproduces JVM selection on every legal input.
+        ;;
+        ;; Reordered on the EMITTED clauses only: `arities` keeps declared order for
+        ;; :arglists and the variadic registration below, and emitting in the
+        ;; original order leaves label allocation (the jfn$/fnvar names) untouched.
+        clauses (let [variadic? (mapv (fn [a] (boolean (:rest a))) arities)
+                      fixed     (keep-indexed (fn [i c] (when-not (nth variadic? i) c))
+                                              clauses)]
+                  (into (vec fixed)
+                        (keep-indexed (fn [i c] (when (nth variadic? i) c)) clauses)))
         lambda (if (= 1 (count clauses))
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
                  (str "(case-lambda "

@@ -1274,6 +1274,11 @@
   {:suite "functions / arity enforcement" :label "variadic above min" :expected "[2 3]" :actual "((fn [x & r] r) 1 2 3)" :portability :common}
   {:suite "functions / arity enforcement" :label "multi-arity no match" :expected :throws :actual "((fn ([x] x) ([x y] y)) 1 2 3)" :portability :common}
   {:suite "functions / arity enforcement" :label "multi-arity variadic below min" :expected :throws :actual "((fn ([x] x) ([x y & r] r)))" :portability :common}
+  {:suite "functions / arity enforcement" :label "exact fixed arity wins when the variadic arity is declared FIRST" :expected ":fixed3" :actual "((fn ([a b k & more] :var) ([a b c] :fixed3)) 1 2 3)" :portability :common}
+  {:suite "functions / arity enforcement" :label "an options-map fixed arity declared after a varargs one takes the 3-arg call" :expected "{:x 1}" :actual "((fn ([a b k & more] :var) ([a b opts] opts)) 1 2 {:x 1})" :portability :common}
+  {:suite "functions / arity enforcement" :label "one past the threshold still takes the variadic arity when it is declared first" :expected ":var" :actual "((fn ([a b k & more] :var) ([a b c] :fixed3)) 1 2 3 4)" :portability :common}
+  {:suite "functions / arity enforcement" :label "exact fixed arity wins through apply when the variadic arity is declared first" :expected ":fixed2" :actual "(apply (fn ([a b & r] :var2) ([a b] :fixed2)) [1 2])" :portability :common}
+  {:suite "functions / arity enforcement" :label "defn: exact fixed arity wins when the variadic arity is declared first" :expected ":fixed2" :actual "(do (defn varord1 ([a b & r] :var2) ([a b] :fixed2)) (varord1 1 2))" :portability :common}
   {:suite "functions / arity enforcement" :label "destructured param counts as one" :expected "3" :actual "((fn [[a b] c] c) [1 2] 3)" :portability :common}
   {:suite "functions / arity enforcement" :label "destructured extra throws" :expected :throws :actual "((fn [[a b]] a) [1 2] [3 4])" :portability :common}
   {:suite "functions / arity enforcement" :label "hof exact arity ok" :expected "[2 4]" :actual "(mapv (fn [x] (* 2 x)) [1 2])" :portability :common}
@@ -1990,6 +1995,7 @@
   {:suite "macros / defmacro multi-arity & attr-map" :label "arity delegates" :expected "[:d nil 9]" :actual "(do (defmacro lg ([m] `(lg :d nil ~m)) ([l t m] (list (quote vector) l t m))) (lg 9))" :portability :common}
   {:suite "macros / defmacro multi-arity & attr-map" :label "doc + attr-map + params" :expected "10" :actual "(do (defmacro am \"doc\" {:arglists (quote ([x]))} [x] (list (quote inc) x)) (am 9))" :portability :common}
   {:suite "macros / defmacro multi-arity & attr-map" :label "doc + attr-map + variadic" :expected "6" :actual "(do (defmacro vg \"d\" {:arglists (quote ([& a]))} [& xs] `(+ ~@xs)) (vg 1 2 3))" :portability :common}
+  {:suite "macros / defmacro multi-arity & attr-map" :label "exact fixed arity wins when the variadic arity is declared first" :expected ":fixed3" :actual "(do (defmacro mva ([a b k & more] :var) ([a b c] :fixed3)) (mva 1 2 3))" :portability :common}
   {:suite "maps / keyword invoke" :label "hit" :expected "1" :actual "(:a {:a 1 :b 2})" :portability :common}
   {:suite "maps / keyword invoke" :label "miss" :expected "nil" :actual "(:z {:a 1})" :portability :common}
   {:suite "maps / keyword invoke" :label "miss with default" :expected ":d" :actual "(:z {:a 1} :d)" :portability :common}
