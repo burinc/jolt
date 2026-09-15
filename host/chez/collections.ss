@@ -1065,6 +1065,16 @@
        (cond ((sa-ufx>=? i n) -1)
              ((let ((x (sa-uvector-ref arr i))) (and (string? x) (string=? x k))) i)
              (else (lp (sa-ufx+ i 2))))))
+    ;; A char key fell to the generic jolt=2 arm, which is what a SCANNER keyed on
+    ;; a set of characters does per input position — #{\space \tab \newline} and
+    ;; friends are how Clojure spells a character class. A char is an immediate, so
+    ;; char=? is a single comparison, and the arm measured ~2.4x off the generic
+    ;; one for a six-element set.
+    ((char? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((let ((x (sa-uvector-ref arr i))) (and (char? x) (char=? x k))) i)
+             (else (lp (sa-ufx+ i 2))))))
     ((symbol-t? k)
      (let* ((kn (symbol-t-name k)) (kl (string-length kn)) (kns (symbol-t-ns k)))
        (let lp ((i 0))

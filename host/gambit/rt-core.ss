@@ -187,6 +187,17 @@
 ;; (measured, Chez 10.4 arm64), and jolt-site! sits on the hot path. Reads are
 ;; ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
+;; --- Clojure fn identity ----------------------------------------------------
+;; The back end gives every non-capturing lambda one free variable to capture so
+;; two evaluations of (fn [x] x) are two objects (see host/chez/rt.ss for why —
+;; Chez shares one static closure otherwise). The emission is not target-gated,
+;; so the two names it references must be bound here too; both are ASSIGNED so
+;; no compiler can fold the capture away, exactly as on Chez.
+(define jolt-fn-identity-seed 0)
+(define jolt-fn-identity-probe #f)
+(set! jolt-fn-identity-seed 1)
+(set! jolt-fn-identity-probe #f)
+
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
 ;; the whole process (16 on every platform jolt targets). jolt claims three, allocated
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
@@ -229,6 +240,13 @@
 ;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
 ;; reporter validates it against the callsite table before splicing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
+;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
+;; when one starts is a returned call's residue — the reporter's validator cannot
+;; tell it from a live pair when the innermost live frame is a host fn (the
+;; loader, the eval loop), which registers no callees. compile-eval.ss clears the
+;; slot when a form starts to compile and again when its compiled code starts to
+;; run, since macroexpansion runs user code in between.
+(define (jolt-site-reset!) (set-virtual-register! jolt-vreg-site 0))
 ;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
 ;; catch-line snapshot when a handler is running, else the raise-time stash.
 ;; #f when unset. The reporter must validate this against the callsite table
@@ -453,6 +471,13 @@
           (mutable dyn-bound?) (mutable dynamic?))
   (nongenerative var-cell-v5))
 (define var-table (make-hashtable string-hash string=?))
+;; The whole-table snapshots host-contract.ss's completion scan reads (mirrors
+;; host/chez/rt.ss: a locked copy, iterated by the caller outside the lock).
+(define var-table-mu (make-mutex))
+(define (var-table-cells) (jolt-with-mutex var-table-mu (hashtable-values var-table)))
+(define (var-table-entries)
+  (jolt-with-mutex var-table-mu
+    (let-values (((ks vs) (hashtable-entries var-table))) (cons ks vs))))
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
@@ -1299,6 +1324,8 @@
 ;; the anon-fn emission registers source forms for image closure capture — a
 ;; no-op keeps those calls inert, matching the image-off degradation.
 (define (image-register-fn-form! . _) #f)
+;; ...and the maker a site attaches to its registration on first call
+(define (image-fn-form-maker! . _) #f)
 ;; the source text a registration carries is (image-fn-form-src "..."): a
 ;; bytevector constant on chez, an inert argument here
 (define (image-fn-form-src s) s)

@@ -146,6 +146,11 @@
    "empty?"      {:call "jolt-empty?"   :arity #(= % 1) :bool? true}
    "peek"        {:call "jolt-peek"    :arity #(= % 1)}
    "pop"         {:call "jolt-pop"     :arity #(= % 1)}
+   ;; @x / (deref x) — the read every loop that keeps state in an atom does, and
+   ;; it was going through a var-cell deref plus a generic invoke to reach a
+   ;; procedure that answers with one record read. Only the 1-arity form lowers:
+   ;; the timed (deref ref ms val) arity is rarer and stays on the var.
+   "deref"       {:call "jolt-deref"   :arity #(= % 1)}
    ;; Java arrays: the hot 1-dim forms lower to the native array-aware ops
    ;; (aget->jolt-nth, alength->jolt-count) and a write helper (aset->jolt-aset3),
    ;; skipping the clojure.core overlay's var-deref + reduce/seq alloc. Multi-dim

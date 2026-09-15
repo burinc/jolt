@@ -89,7 +89,7 @@
                             (str "(fx>=? (str-index-of " t " (str-needle " a0 ") 0) 0)"))
       (= m "concat")      (when (= argc 1) (str "(string-append " t " " a0 ")"))
       (= m "substring")   (when (= argc 2)
-                            (str "(substring " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
+                            (str "(jolt-substr " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
       (= m "replace")     (when (= argc 2)
                              (str "(str-replace-literal " t " (str-needle " a0 ") (str-needle " a1 "))"))
       ;; The rest route to a jolt-str-* native (java/natives-str.ss), which is the

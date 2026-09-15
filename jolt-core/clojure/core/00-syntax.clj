@@ -701,12 +701,16 @@
         mk-const (fn [c] (if (and (or (symbol? c) (seq? c) (vector? c) (map? c) (set? c))
                                   (not (tagged? c)))
                            `(quote ~c) c))
-        ;; a keyword, nil, true or false constant is compared by identity: a
+        ;; a keyword, char, nil, true or false constant is compared by identity: a
         ;; keyword is interned (and re-interned on image restore), and identical?
         ;; is an inline native op where = is a call. That is what the reference
         ;; does for these too (its case hashes then compares identity). Symbols,
         ;; strings and numbers keep = — a symbol is not interned here.
-        ident-const? (fn [c] (or (keyword? c) (nil? c) (true? c) (false? c)))
+        ;; A CHAR is an immediate on the host, so identity IS equality for every
+        ;; code point, and a `case` over characters — the way Clojure spells a
+        ;; scanner state machine — was paying a generic `=` call per arm per
+        ;; input character.
+        ident-const? (fn [c] (or (keyword? c) (char? c) (nil? c) (true? c) (false? c)))
         mk-test1 (fn [c]
                    (if (ident-const? c)
                      `(identical? ~g ~c)

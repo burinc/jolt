@@ -15,8 +15,17 @@
 (define-record-type jvol (fields (mutable v)) (nongenerative chez-jvol-v1))
 (define (jolt-volatile! x) (make-jvol x))
 (define (jolt-vreset! vol x) (jvol-v-set! vol x) x)
-(define (jolt-vswap! vol f . args)
-  (let ((nv (apply jolt-invoke f (jvol-v vol) args))) (jvol-v-set! vol nv) nv))
+;; Fixed 2/3/4-arity clauses for the same reason swap! has them (atoms.ss): every
+;; stateful transducer step is a (vswap! n inc) or (vswap! buf conj x), and a
+;; single `. args` signature charged each one a rest list plus an apply. The
+;; reference's vswap! is a macro and pays neither.
+(define jolt-vswap!
+  (case-lambda
+    ((vol f) (let ((nv (jolt-invoke1 f (jvol-v vol)))) (jvol-v-set! vol nv) nv))
+    ((vol f x) (let ((nv (jolt-invoke2 f (jvol-v vol) x))) (jvol-v-set! vol nv) nv))
+    ((vol f x y) (let ((nv (jolt-invoke3 f (jvol-v vol) x y))) (jvol-v-set! vol nv) nv))
+    ((vol f . args)
+     (let ((nv (apply jolt-invoke f (jvol-v vol) args))) (jvol-v-set! vol nv) nv))))
 (define (jolt-volatile-pred? x) (jvol? x))
 ;; deref reads a volatile too (partition-all/-by transducers @-deref their box).
 (define %xf-deref jolt-deref)

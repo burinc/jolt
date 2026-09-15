@@ -26,12 +26,19 @@
 # shape is Chez-flavored and owned by a later round (noted inline). Verified-still
 # standard names are dropped rather than listed: make-eq-hashtable, make-eqv-
 # hashtable, symbol-hashtable?, list-sort, vector-sort, vector-sort!, guard,
-# string-copy!, time-second, time-nanosecond, eval, environment, exit,
+# time-second, time-nanosecond, eval, environment, exit,
 # command-line, condition-continuation, make-continuation-condition,
 # continuation-condition?, and the fx/fl/bytevector/vector/string R6RS arithmetic
 # are all standard R6RS and deliberately absent. `exit`/`eval` are standard, but
 # the host's Chez-ENV-SPECIFIER call sites ((environment '(chezscheme))) are real
 # migration work — tracked by R8, not by this gate.
+#
+# A name can also be standard on EVERY target and still belong here: string-copy!
+# is (from from-start to to-start count) on Chez and (to at from start end) on
+# R7RS/SRFI-13 (Gambit, Guile). Same arity, opposite direction, so a raw call in
+# shared code compiles on both and on the R7RS target copies the empty
+# destination into the source. It goes through sa-string-copy-range!
+# (CONTRACT.txt), which fixes the R7RS order.
 #
 # tier: ffi
 foreign-procedure
@@ -107,6 +114,7 @@ sort!
 vector-append
 date-and-time
 record-writer
+string-copy!
 #
 # tier: chez-unsafe
 $primitive  # reader artifact for #3%/#% unsafe-primitive syntax — files that use
