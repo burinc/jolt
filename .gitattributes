@@ -1,1 +1,3 @@
 host/chez/stdlib-fasl-manifest.txt text eol=lf
+# java.util.zip fixtures: the bytes as written, on every platform
+test/chez/fixtures/zip/** -text
