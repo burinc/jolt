@@ -50,6 +50,7 @@ extend-class!
 extension-epoch
 extension-has?
 extension-value
+extract-zip!
 fiber-carrier-count
 fiber-carrier-count-set!
 fiber-instance?

@@ -2188,6 +2188,210 @@
 (def-var! "jolt.host" "symlink?"
   (lambda (p) (if (file-symbolic-link? (host-fs-path p)) #t #f)))
 
+;; --- jolt.host/extract-zip! --------------------------------------------------
+;; `unzip -o -q ZIP -d DIR` without the program (jolt issue #988), for
+;; jolt.deps's extract-jar!. It reads with the runtime's ZipInputStream
+;; (java/zip-entries.ss) and answers #t when every entry is extracted, #f when
+;; one is not. It never raises.
+;; - The file must end with an end-of-central-directory record, and the archive
+;;   must hold as many entries as the record counts, no fewer and no more. unzip
+;;   refuses a file with no record ("End-of-central-directory signature not
+;;   found", exit 9), where a ZipInputStream reads a file that is not a zip, or
+;;   whose local headers stop early, as fewer entries.
+;; - A name that is absolute, starts with a drive letter, holds a backslash or
+;;   has a ".." segment refuses the archive at that entry. unzip removes "../"
+;;   instead (unzip(1), option -:); refusing is stricter.
+;; - A path through a symbolic link under DIR refuses the archive. DIR itself is
+;;   the caller's: a symbolic link there is followed, as unzip -d follows one.
+;; - A file goes to a temporary file in its own directory and is then renamed
+;;   over the entry's path. Windows' rename does not replace a file (Chez
+;;   c/windows.c S_windows_rename calls _wrename), so a rename that fails there
+;;   deletes the file at the path and renames again. The rename comes first, so
+;;   the path holds the old file until the new one is whole.
+;; - Entries extracted before a failure stay. The temporary file does not.
+
+;; The number of entries the archive at PATH says it holds, or #f when it does
+;; not say so consistently. The end record (end-of-central-directory, APPNOTE
+;; 6.3.10 section 4.3.16) is 22 bytes and ends the file after its comment: the
+;; entry count sits at offset 10, the central directory's size at 12 and its
+;; offset at 16. A count of 0xFFFF, or a size or offset of 0xFFFFFFFF, is a Zip64
+;; sentinel, and the real value is in the Zip64 end record that the 20-byte
+;; locator before the end record points to (sections 4.3.14-4.3.15).
+;;
+;; The directory is then walked, because the end record alone proves nothing: an
+;; archive whose central directory was cut away keeps its local entries and its
+;; end record, and read as whole until this walk was added (review of this
+;; change, 2026-09-16). The walk requires the directory to begin where the end
+;; record says, to hold exactly the number of records it claims, each with its
+;; own signature, and to end where it says it ends.
+(define (extract-zip-end-record-entries path)
+  (let ((in (open-file-input-port path)))
+    (define size (port-length in))
+    (define (bytes-at pos n)
+      (and (>= pos 0) (>= n 0) (<= (+ pos n) size)
+           (begin
+             (set-port-position! in pos)
+             (let ((bv (get-bytevector-n in n)))
+               (and (bytevector? bv) (= (bytevector-length bv) n) bv)))))
+    (define (u16 bv i) (bytevector-u16-ref bv i (endianness little)))
+    (define (u32 bv i) (bytevector-u32-ref bv i (endianness little)))
+    (define (u64 bv i) (bytevector-u64-ref bv i (endianness little)))
+    ;; (count size offset) with any Zip64 sentinel resolved, or #f
+    (define (directory-fields eocd-at count cd-size cd-at)
+      (if (not (or (= count #xFFFF) (= cd-size #xFFFFFFFF) (= cd-at #xFFFFFFFF)))
+          (list count cd-size cd-at)
+          (let ((loc (bytes-at (- eocd-at 20) 20)))
+            (and loc (= (u32 loc 0) #x07064b50)
+                 (let ((z64 (bytes-at (u64 loc 8) 56)))
+                   (and z64 (= (u32 z64 0) #x06064b50)
+                        (list (u64 z64 32) (u64 z64 40) (u64 z64 48))))))))
+    ;; each record is 46 bytes, then its name, extra field and comment (4.3.12)
+    (define (walk cd-at cd-size count)
+      (let loop ((at cd-at) (left count))
+        (cond
+          ((zero? left) (and (= at (+ cd-at cd-size)) count))
+          ((> at (+ cd-at cd-size)) #f)
+          (else
+           (let ((rec (bytes-at at 46)))
+             (and rec (= (u32 rec 0) #x02014b50)
+                  (loop (+ at 46 (u16 rec 28) (u16 rec 30) (u16 rec 32))
+                        (- left 1))))))))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda ()
+        (let* ((n (min size (+ 22 65535)))
+               (tail (bytes-at (- size n) n)))
+          (and tail
+               (let loop ((i (- n 22)))
+                 (and (>= i 0)
+                      (if (and (= (u32 tail i) #x06054b50)
+                               (= (+ i 22 (u16 tail (+ i 20))) n))
+                          (let* ((eocd-at (+ (- size n) i))
+                                 (got (directory-fields eocd-at
+                                                        (u16 tail (+ i 10))
+                                                        (u32 tail (+ i 12))
+                                                        (u32 tail (+ i 16)))))
+                            (and got
+                                 (let ((count (car got)) (cd-size (cadr got)) (cd-at (caddr got)))
+                                   (and (<= (+ cd-at cd-size) eocd-at)
+                                        (walk cd-at cd-size count)))))
+                          (loop (- i 1))))))))
+      (lambda () (close-port in)))))
+
+;; NAME split at each "/".
+(define (extract-zip-segments name)
+  (let loop ((i 0) (start 0) (acc '()))
+    (cond ((= i (string-length name)) (reverse (cons (substring name start i) acc)))
+          ((char=? (string-ref name i) #\/)
+           (loop (+ i 1) (+ i 1) (cons (substring name start i) acc)))
+          (else (loop (+ i 1) start acc)))))
+
+;; Is NAME refused: absolute, a drive letter, a backslash, or a ".." segment?
+(define (extract-zip-unsafe-name? name)
+  (let ((n (string-length name)))
+    (or (and (> n 0) (char=? (string-ref name 0) #\/))
+        (and (> n 1)
+             (char<=? #\A (char-upcase (string-ref name 0)) #\Z)
+             (char=? (string-ref name 1) #\:))
+        (let loop ((i 0))
+          (and (< i n) (or (char=? (string-ref name i) #\\) (loop (+ i 1)))))
+        (and (member ".." (extract-zip-segments name)) #t))))
+
+;; Does the path from DIR through the segments of NAME pass a symbolic link? An
+;; empty segment ("a//b.txt") is left out here, and the write keeps it; both
+;; name the same file on every system Jolt runs on.
+(define (extract-zip-through-link? dir name)
+  (let loop ((segs (extract-zip-segments name)) (p dir))
+    (and (pair? segs)
+         (let ((next (if (string=? (car segs) "") p (string-append p "/" (car segs)))))
+           (or (file-symbolic-link? next)
+               (loop (cdr segs) next))))))
+
+;; The index of the last "/" in S, which has one.
+(define (extract-zip-last-slash s)
+  (let loop ((i (- (string-length s) 1)))
+    (if (char=? (string-ref s i) #\/) i (loop (- i 1)))))
+
+;; A temporary file name in PARENT: the process id and the monotonic clock.
+(define (extract-zip-temp-name parent)
+  (let ((t (current-time 'time-monotonic)))
+    (string-append parent "/.jolt-extract-" (number->string (get-process-id))
+                   "-" (number->string (time-second t))
+                   "-" (number->string (time-nanosecond t)) ".part")))
+
+;; Copy the current entry of the ZipInputStream ZIS to a new file at PATH,
+;; through BUF. The file must not be there: a temporary name that is already
+;; taken raises, and the archive is refused, instead of two extractions writing
+;; one file.
+(define (extract-zip-copy! zis path buf)
+  (let ((in (in-stream-live-port zis))
+        (out (open-file-output-port path (file-options) (buffer-mode block))))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda ()
+        (let loop ()
+          (let ((n (get-bytevector-some! in buf 0 (bytevector-length buf))))
+            (unless (eof-object? n)
+              (put-bytevector out buf 0 n)
+              (loop)))))
+      (lambda () (close-port out)))))
+
+;; Rename TMP over PATH. Windows' rename does not replace a file, so a failed
+;; rename there deletes the file at PATH and renames again; the file at PATH
+;; stays until the rename that replaces it.
+(define (extract-zip-publish! tmp path)
+  (guard (e (#t (when (and (file-exists? path) (not (file-directory? path)))
+                  (delete-file path #f))
+                (rename-file tmp path)))
+    (rename-file tmp path)))
+
+(define (extract-zip! zip-path dir)
+  (let ((fin #f)
+        (zis #f)
+        (tmp #f)
+        (buf (make-bytevector 65536)))
+    (guard (e (#t (when tmp (delete-file tmp #f)) #f))
+      (dynamic-wind
+        (lambda () #f)
+        (lambda ()
+          (let ((total (and (file-exists? zip-path)
+                            (not (file-directory? zip-path))
+                            (extract-zip-end-record-entries zip-path))))
+            (and total
+                 (mkdirs! dir)
+                 (begin
+                   (set! fin (host-new "java.io.FileInputStream" zip-path))
+                   (set! zis (host-new "java.util.zip.ZipInputStream" fin))
+                   (let loop ((seen 0))
+                     (let ((entry (record-method-dispatch zis "getNextEntry" jolt-nil)))
+                       (if (jolt-nil? entry)
+                           ;; every entry the central directory counts
+                           (= seen total)
+                           (let ((name (record-method-dispatch entry "getName" jolt-nil)))
+                             (and (not (extract-zip-unsafe-name? name))
+                                  (not (extract-zip-through-link? dir name))
+                                  (let ((path (string-append dir "/" name)))
+                                    (if (jolt-truthy? (record-method-dispatch entry "isDirectory" jolt-nil))
+                                        (mkdirs! (substring path 0 (- (string-length path) 1)))
+                                        (let ((parent (substring path 0 (extract-zip-last-slash path))))
+                                          (and (mkdirs! parent)
+                                               (begin
+                                                 (set! tmp (extract-zip-temp-name parent))
+                                                 (extract-zip-copy! zis tmp buf)
+                                                 (extract-zip-publish! tmp path)
+                                                 (set! tmp #f)
+                                                 #t)))))
+                                  (loop (+ seen 1)))))))))))
+        (lambda ()
+          ;; closing the ZipInputStream closes the file; without one, the file
+          ;; is closed here
+          (let ((s (or zis fin)))
+            (when s
+              (guard (e (#t #f)) (record-method-dispatch s "close" jolt-nil)))))))))
+
+(def-var! "jolt.host" "extract-zip!"
+  (lambda (zip dir) (if (extract-zip! (host-fs-path zip) (host-fs-path dir)) #t #f)))
+
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".
 (def-var! "jolt.host" "jolt-version" (lambda () (jolt-version-string)))
