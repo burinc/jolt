@@ -1261,6 +1261,22 @@
            :jvm "\"NO_SOURCE_FILE\""
            :jolt "nil"}
    :note "*file* is nil and *source-path* \"NO_SOURCE_FILE\" inside the load-string on both. A var defined in a loaded FILE carries the file's path on both."}
+  ;; BigDecimal's .equals and .hashCode. The JDK pair is scale-sensitive —
+  ;; (.equals 1.5M 1.50M) is false and the two hash apart — while Clojure's own
+  ;; = and hash on the same values compare by numeric value (BigDecimalOps.equiv
+  ;; is compareTo, hasheq strips trailing zeros), so on the JVM the operator and
+  ;; the method beside it disagree. jolt's BigDecimal members (java/bigdec.ss,
+  ;; #968) answer .equals and .hashCode with what = and hash answer, rather than
+  ;; register a member that contradicts the operator. The same :numeric-model
+  ;; root as the {:a 1}/{:a 1N} entry above. = and hash agree on both runtimes.
+  {:category :numeric-model
+   :behavior "(.equals 1.5M 1.50M)"
+   :jvm "false — BigDecimal.equals compares scale as well as value, and hashCode is 31*unscaled.hashCode()+scale"
+   :jolt "true — the value's = and hash under the Java names"
+   :check {:expr "[(.equals 1.5M 1.50M) (= (.hashCode 1.5M) (.hashCode 1.50M)) (= 1.5M 1.50M) (= (hash 1.5M) (hash 1.50M))]"
+           :jvm "[false false true true]"
+           :jolt "[true true true true]"}
+   :note "Verified against Clojure 1.12.5. Only the two Java-named members diverge; = , ==, hash and compareTo agree."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
