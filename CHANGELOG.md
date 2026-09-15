@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the chunk builder to `natives-transduce.ss`, `jnum->exact` to `seq.ss`, the
   Java `hashCode` helpers and `jolt-java-hashcode` to `natives-misc.ss`,
   `dot-coll-method` to `records-dispatch.ss`, `import` to `ns.ss`), the rest
-  got mirrors and shims, and `host/gambit/class-objects.ss` carries the class
-  model the prelude's own `(import …)` interns through — it has to load before
-  the seed, which also now loads with `clojure.core` current, as `cli.ss` does.
+  got mirrors and shims, and the class model the prelude's own `(import …)`
+  interns through loads before the seed (as `java/class-model.ss`, shared with
+  Chez — see below), which also now loads with `clojure.core` current, as
+  `cli.ss` does.
   Two new gates run in ci beside `gambiteval`: `gambitunbound` asks Gambit's
   own linker for every global the compiled boot references and defines
   nowhere, and `gambitvars` walks the booted var table for cells nothing

@@ -139,7 +139,7 @@
 (check "(locking :x 1)" "1")
 (check "(count (ns-publics (quote clojure.set)))" "12")
 (check "(str (find-var (quote clojure.core/print-method)))" "\"#'clojure.core/print-method\"")
-;; class-objects.ss: the class model core's predicates and isa? read
+;; java/class-model.ss (shared with Chez): the class model core's predicates and isa? read
 (check "[(isa? Long Number) (seqable? 1) (ifn? :a) (class? String) (instance? String \"a\")]"
        "[true false true true true]")
 (check "(count (supers Long))" "4")
