@@ -3014,4 +3014,40 @@
   {:suite "pr-on" :expr "(:private (meta #'clojure.core/pr-on))" :expected "true"}
   ;; an imported short name misses with the JDK-provider message, not "Unknown class"
   {:suite "unknown-class" :expr "(try (load-string \"(ns ucm1 (:import (java.security.cert CertificateFactory))) (CertificateFactory/getInstance \\\"X.509\\\")\") (catch Throwable e (boolean (re-find #\"^No dependency provides java.security.cert.CertificateFactory\" (ex-message e)))))" :expected "true"}
+  ;; jolt-2j3 — the protocol-map keys jolt deliberately does NOT carry. These are
+  ;; jolt-side rows, not corpus rows: the reference DOES set every one of them, so
+  ;; a corpus row here would only be a certified divergence. What they pin is that
+  ;; the omission stays deliberate and stays complete.
+  ;;
+  ;; :on / :on-interface / :method-builders describe the interface the reference's
+  ;; defprotocol generates (my.ns/P yields the interface my.ns.P). jolt generates
+  ;; none — dispatch is by the receiver's type tag (protocols.ss protocol-resolve)
+  ;; — so there is no name to report and no Class to hand back.
+  {:suite "defprotocol-value" :expr "(do (defprotocol Pu1 \"d\" (mu1 [this])) (sort (keys Pu1)))" :expected "(:doc :method-map :methods :name :sigs :var :jolt/type)"}
+  {:suite "defprotocol-value" :expr "(do (defprotocol Pu2 :extend-via-metadata true (mu2 [this])) [(contains? Pu2 :on) (contains? Pu2 :on-interface) (contains? Pu2 :method-builders)])" :expected "[false false false]"}
+  ;; :extend-via-metadata is absent for a different reason: jolt's defprotocol
+  ;; PARSES the option but its dispatch does not consult a value's metadata, so
+  ;; recording the key would advertise a rule that does not hold. These two rows
+  ;; move together — implementing metadata extension means setting the key, and
+  ;; both fail until it does. jolt-2j3.
+  {:suite "defprotocol-value" :expr "(do (defprotocol Pu3 :extend-via-metadata true (mu3 [this])) (contains? Pu3 :extend-via-metadata))" :expected "false"}
+  {:suite "defprotocol-value" :expr "(do (defprotocol Pu4 :extend-via-metadata true (mu4 [this])) (try (mu4 (with-meta {} {(symbol (str *ns*) \"mu4\") (fn [_] :via-meta)})) :honored (catch IllegalArgumentException e :not-honored)))" :expected ":not-honored"}
+  ;; the jolt-only keys the overlay itself reads (protocols.ss make-protocol)
+  {:suite "defprotocol-value" :expr "(do (defprotocol Pu5 (mu5 [this])) [(:name Pu5) (-> Pu5 :methods :mu5 :name)])" :expected "[user/Pu5 \"mu5\"]"}
+  ;; The :jolt/type discriminator is the same keyword every other :jolt/type in the
+  ;; host is — (keyword "jolt" "type"), which is what the reader produces for
+  ;; :jolt/type in source — so it is reachable from Clojure and the tag is LIVE.
+  ;; It was once (keyword #f "jolt/type"), one keyword whose NAME was the whole
+  ;; string: it printed identically, was equal to none of the others, and left
+  ;; (:jolt/type P) nil. jolt-dkz. The middle element pins that the legacy spelling
+  ;; does not come back; the last one, that the key the value actually carries is
+  ;; the one the reader produces.
+  {:suite "defprotocol-value" :expr "(do (defprotocol Pu6 (mu6 [this])) [(:jolt/type Pu6) (get Pu6 (keyword nil \"jolt/type\")) (contains? Pu6 :jolt/type)])" :expected "[:jolt/protocol nil true]"}
+  ;; ...and the tag now does the job it exists for: host-contract.ss hc-map? is
+  ;; "a map form is a pmap with no :jolt/type", so a protocol value a macro put in
+  ;; its expansion is no longer re-analyzed as a map literal (which resolved the
+  ;; :name entry's symbol and died as "Unable to resolve symbol: user/Pq"). It is a
+  ;; live value the compiler cannot spell, and says so. The reference raises here
+  ;; too — analyzing its protocol map as a literal hits the arglists' `this`.
+  {:suite "defprotocol-value" :expr "(try (load-string \"(defprotocol Pu7 (mu7 [this])) (defmacro emit-pu7 [] Pu7) (emit-pu7)\") :compiled (catch Throwable e (boolean (re-find #\"Cannot compile this value into code\" (ex-message e)))))" :expected "true"}
 ]

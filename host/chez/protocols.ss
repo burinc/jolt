@@ -21,8 +21,18 @@
 ;; A key naming a HOST interface (Object, java.util.Map, an :import-ed
 ;; clojure.lang.ILookup) has no defining namespace and stays bare: that is the
 ;; spelling value-host-tags reports.
-(define proto-kw-jtype (keyword #f "jolt/type"))
-(define proto-kw-protocol (keyword #f "jolt/protocol"))
+;;
+;; The discriminator is the SAME keyword every other :jolt/type in the host is —
+;; (keyword "jolt" "type"), namespace "jolt", name "type", which is what the
+;; reader produces for :jolt/type in Clojure source and what host-contract.ss
+;; (hc-kw-jolt-type), host-table.ss (kw-jtype) and natives-meta.ss (ty-kw-jtype)
+;; all spell. It was once (keyword #f "jolt/type") — one keyword whose NAME was
+;; the whole string — which printed identically, compared equal to none of them,
+;; and so left the tag INERT: (:jolt/type P) was nil from source, and hc-map?
+;; ("a map form is a pmap with no :jolt/type") read a protocol value as a plain
+;; map form, re-analyzing a spliced one as a map literal. jolt-dkz.
+(define proto-kw-jtype (keyword "jolt" "type"))
+(define proto-kw-protocol (keyword "jolt" "protocol"))
 (define proto-kw-name (keyword #f "name"))
 (define (jolt-protocol-value? v)
   (and (pmap? v) (eq? (jolt-get v proto-kw-jtype jolt-nil) proto-kw-protocol)))
@@ -629,15 +639,39 @@
     ctor))
 
 ;; make-protocol: a protocol value the overlay reads via (get p :name)/(get p :methods),
-;; carrying Clojure's :sigs (defprotocol builds it; see the macro) for everyone else.
-;; sigs is optional only so a seed minted before it existed still loads while it
-;; mints the next one: the two-argument call is what its prelude spells.
+;; carrying the keys Clojure's protocol map carries for everyone else — :sigs,
+;; :doc and :method-map here, plus :var, which defprotocol assoc's after the def
+;; (the var does not exist yet at this call).
+;;
+;; :doc is PRESENT ONLY WHEN THE PROTOCOL HAS A DOCSTRING, which is what the
+;; reference does: its opts map starts with :on/:on-interface and picks up :doc
+;; only if it reads a leading string, so (contains? P :doc) is false for an
+;; undocumented protocol rather than true-with-nil. jolt-nil is the macro's "no
+;; docstring" signal, so an assoc, not a fixed key.
+;;
+;; The keys the reference has that jolt does NOT set — :on, :on-interface,
+;; :method-builders, :extend-via-metadata — are a deliberate omission, not an
+;; oversight: the first three describe the interface defprotocol generates on
+;; the JVM, and jolt generates none (dispatch is by the receiver's type tag,
+;; protocol-resolve), while :extend-via-metadata would advertise a dispatch rule
+;; jolt does not yet honor. Pinned jolt-side in unit.edn (defprotocol-value) and
+;; written up in the divergence legend; jolt-2j3 tracks metadata extension.
+;;
+;; Each trailing argument is optional only so a seed minted before it existed
+;; still loads while it mints the next one: the arity the OLD prelude spells is
+;; the one that has to keep working.
 (define (make-protocol name-str methods . rest)
-  (let ((sigs (if (null? rest) (jolt-hash-map) (car rest))))
-    (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
-                   (keyword #f "name") (jolt-symbol jolt-nil name-str)
-                   (keyword #f "methods") methods
-                   (keyword #f "sigs") sigs)))
+  (let* ((sigs (if (null? rest) (jolt-hash-map) (car rest)))
+         (rest2 (if (null? rest) '() (cdr rest)))
+         (doc (if (null? rest2) jolt-nil (car rest2)))
+         (rest3 (if (null? rest2) '() (cdr rest2)))
+         (method-map (if (null? rest3) (jolt-hash-map) (car rest3)))
+         (base (jolt-hash-map proto-kw-jtype proto-kw-protocol
+                              proto-kw-name (jolt-symbol jolt-nil name-str)
+                              (keyword #f "methods") methods
+                              (keyword #f "sigs") sigs
+                              (keyword #f "method-map") method-map)))
+    (if (jolt-nil? doc) base (jolt-assoc base (keyword #f "doc") doc))))
 
 ;; register-protocol-methods!: record each method's var-key -> [proto method] for
 ;; the inference driver (devirtualization). Dispatch itself is by the receiver's
