@@ -633,23 +633,52 @@
 ;; The protocol value is built by make-protocol (a fn call) rather than an embedded
 ;; tagged map literal: the interpreter would otherwise self-evaluate such a struct
 ;; instead of evaluating its fields. methods is a {kw {:name str}} map (only :name
-;; is consulted). sigs is Clojure's :sigs — {kw {:name sym :arglists (..) :doc
-;; str-or-nil :tag hint-or-nil}} — the value's public description of its methods,
-;; which tooling reads to enumerate them. (The JVM resolves :tag to a Class; here
-;; it is the hint symbol as written.) Each method is a thin dispatch fn over
-;; protocol-dispatch.
+;; is consulted). The rest of the value is Clojure's protocol map, which tooling
+;; reads to describe a protocol it was handed:
+;;
+;;   :sigs       {kw {:name sym :arglists (..) :doc str-or-nil :tag hint-or-nil}}
+;;               — the public description of the methods. (The JVM resolves :tag
+;;               to a Class; here it is the hint symbol as written.)
+;;   :doc        the protocol's own docstring, and ONLY WHEN IT HAS ONE — the JVM
+;;               leaves the key absent otherwise, so (contains? P :doc) is false
+;;               for an undocumented protocol. Also goes on the var, so (doc P)
+;;               prints it.
+;;   :method-map {kw kw} over the method names, identity on both halves (the JVM
+;;               does not munge either side: :foo-bar maps to :foo-bar).
+;;   :var        the protocol's own var, assoc'd AFTER the def below — it does not
+;;               exist while make-protocol runs. SCI reads this one (sci.core,
+;;               sci.impl.deftype).
+;;
+;; :on / :on-interface / :method-builders are the JVM's generated-interface keys
+;; and are deliberately absent here: jolt generates no interface, dispatching on
+;; the receiver's type tag instead. :extend-via-metadata is absent for a
+;; different reason — jolt PARSES the option (below) but its dispatch does not
+;; honor metadata extension, so recording the key would advertise a rule that
+;; does not hold. See make-protocol's comment, unit.edn's defprotocol-value
+;; suite, and jolt-2j3.
+;;
+;; Each method is a thin dispatch fn over protocol-dispatch.
 (defmacro defprotocol [pname & sigs]
   ;; Clojure's defprotocol takes an optional docstring and leading keyword
   ;; options (:extend-via-metadata true, honeysql uses it) before the method
-  ;; signatures — drop them (metadata extension is a JVM dispatch detail).
-  (let [sigs (loop [s sigs]
-               (cond
-                 (string? (first s))  (recur (rest s))
-                 (keyword? (first s)) (recur (rest (rest s)))
-                 :else s))
+  ;; signatures. The docstring is kept (it is :doc on the value and on the var);
+  ;; the options are read past. A string anywhere in the leading run is the
+  ;; docstring and the last one wins, which is what the JVM's assoc-in-a-loop
+  ;; parse does.
+  (let [parsed (loop [d nil s sigs]
+                 (cond
+                   (string? (first s))  (recur (first s) (rest s))
+                   (keyword? (first s)) (recur d (rest (rest s)))
+                   :else [d s]))
+        pdoc (first parsed)
+        sigs (second parsed)
         methods (reduce (fn [m sig]
                           (assoc m (keyword (name (first sig))) {:name (name (first sig))}))
                         {} sigs)
+        method-map (reduce (fn [m sig]
+                             (let [k (keyword (name (first sig)))]
+                               (assoc m k k)))
+                           {} sigs)
         sigs-map (reduce (fn [m sig]
                            (let [mname (first sig)
                                  args (rest sig)
@@ -665,7 +694,14 @@
         ;; registration all key on one string.
         pkey (str *ns* "/" (name pname))]
     `(do
-       (def ~pname (make-protocol ~pkey ~methods (quote ~sigs-map)))
+       (def ~(if pdoc (with-meta pname (assoc (meta pname) :doc pdoc)) pname)
+         ;; :sigs is nil, not {}, for a protocol with no methods — the JVM's
+         ;; (when sigs ..) leaves the key present and empty-valued.
+         (make-protocol ~pkey ~methods (quote ~(when (seq sigs) sigs-map)) ~pdoc ~method-map))
+       ;; :var is the protocol's own var, so it can only be attached once the def
+       ;; above has made one. alter-var-root, not a second def: a re-def would
+       ;; drop the metadata just written.
+       (alter-var-root (var ~pname) assoc :var (var ~pname))
        ;; register method var-keys for devirtualization; the inference
        ;; reads this (via infer-unit!) to resolve a protocol call on a known record
        (register-protocol-methods! ~pkey [~@(map (fn [s] (name (first s))) sigs)])

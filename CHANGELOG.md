@@ -342,6 +342,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the eager list it always was. Vector and set templates stay eager, as the
   reference's `(apply vector ..)` makes them. (#1000)
 
+- **A protocol value carries the rest of Clojure's protocol map: `:doc`,
+  `:method-map` and `:var`.** Following `:sigs`, the value now answers the keys
+  tooling reads to describe a protocol it was handed. `:doc` is the protocol's
+  docstring and is present *only when it has one*, matching the reference (an
+  undocumented protocol has no `:doc` key rather than a nil one), and it is on
+  the protocol's var too, so `(doc P)` prints it. `:method-map` is `{:m :m}` over
+  the method names, identity on both halves. `:var` is the protocol's own var,
+  which is the key SCI reads. `:sigs` is now `nil` rather than `{}` for a
+  protocol with no methods, as the reference has it.
+
+  The reference's remaining keys — `:on`, `:on-interface` and `:method-builders`
+  — describe the interface its `defprotocol` also generates (`my.ns/P` yields
+  `my.ns.P`), and jolt generates none: a protocol method dispatches on the
+  receiver's type tag. Naming a class that does not exist would move the failure
+  rather than fix it, so those three stay absent, as does
+  `:extend-via-metadata` — jolt reads the option but its dispatch does not
+  consult a value's metadata, and advertising the key would promise a rule that
+  does not hold. Both are gated as documented divergences. (jolt-2j3)
+
 - **A protocol value carries Clojure's `:sigs`.** `(:sigs P)` is `{:m {:name
   m :arglists ([this] ..) :doc .. :tag ..}}` per method, as the reference
   builds it, so tooling that enumerates a protocol's methods from its value

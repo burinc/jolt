@@ -231,6 +231,19 @@
   ;; (:tag holds the hint as written, a symbol; the JVM resolves it to a Class.)
   {:suite "defprotocol / :sigs" :label "each method's signature: name, arglists, doc, tag" :expected "(quote [{:tag nil :name msig :arglists ([this] [this a]) :doc \"m doc\"} (:msig :nsig)])" :actual "(do (defprotocol Psig \"docs\" (msig [this] [this a] \"m doc\") (nsig [this])) [(-> Psig :sigs :msig) (-> Psig :sigs keys sort)])" :portability :common}
   {:suite "defprotocol / :sigs" :label "a method with neither doc nor tag" :expected "(quote {:tag nil :name m2 :arglists ([this]) :doc nil})" :actual "(do (defprotocol Psig2 :extend-via-metadata true (m2 [this])) (-> Psig2 :sigs :m2))" :portability :common}
+  ;; jolt-2j3 — the rest of the reference's protocol map. :doc (only when the
+  ;; protocol HAS a docstring, which is what the reference does), :method-map and
+  ;; :var are supplied and pinned here. The keys jolt deliberately does NOT set —
+  ;; :on / :on-interface / :method-builders, which describe the interface
+  ;; defprotocol generates on the JVM and jolt does not, and
+  ;; :extend-via-metadata, whose dispatch rule jolt does not honor — are pinned
+  ;; jolt-side in unit.edn's defprotocol-value suite instead, since a corpus row
+  ;; would just be a certified divergence.
+  {:suite "defprotocol / protocol value" :label "the docstring is :doc on the value and on the var, and the key is absent without one" :expected "[\"pdoc\" true false nil]" :actual "(do (defprotocol Pdv1 \"pdoc\" (mdv1 [this])) (defprotocol Pdv2 (mdv2 [this])) [(:doc Pdv1) (= (:doc Pdv1) (:doc (meta (var Pdv1)))) (contains? Pdv2 :doc) (:doc (meta (var Pdv2)))])" :portability :jvm}
+  {:suite "defprotocol / protocol value" :label ":method-map maps each method keyword to itself, unmunged, and is {} with no methods" :expected "[true {}]" :actual "(do (defprotocol Pdv3 (mdv3 [this]) (a-b? [this]) (c! [this]) (d* [this])) (defprotocol Pdv3b) [(= (:method-map Pdv3) {:mdv3 :mdv3 :a-b? :a-b? :c! :c! :d* :d*}) (:method-map Pdv3b)])" :portability :jvm}
+  {:suite "defprotocol / protocol value" :label ":var is the protocol's own var, and derefs back to the protocol" :expected "[true true true]" :actual "(do (defprotocol Pdv4 (mdv4 [this])) [(= (:var Pdv4) (var Pdv4)) (var? (:var Pdv4)) (= (deref (:var Pdv4)) Pdv4)])" :portability :jvm}
+  {:suite "defprotocol / protocol value" :label ":sigs is present but nil for a protocol with no methods" :expected "[true nil true true]" :actual "(do (defprotocol Pdv5) (defprotocol Pdv6 (mdv6 [this])) [(contains? Pdv5 :sigs) (:sigs Pdv5) (map? (:sigs Pdv6)) (contains? Pdv5 :method-map)])" :portability :jvm}
+  {:suite "defprotocol / protocol value" :label "a docstring after a leading option is still the docstring" :expected "[\"late\" true true \"md\"]" :actual "(do (defprotocol Pdv7 :extend-via-metadata true \"late\" (mdv7 [this] \"md\")) [(:doc Pdv7) (= (:method-map Pdv7) {:mdv7 :mdv7}) (= (:var Pdv7) (var Pdv7)) (-> Pdv7 :sigs :mdv7 :doc)])" :portability :jvm}
   {:suite "walk / eager" :label "clojure.walk is eager over a lazy seq (side effects run now)" :expected "3" :actual "(let [a (atom 0)] (clojure.walk/postwalk (fn [x] (when (number? x) (swap! a inc)) x) (map inc (list 1 2 3))) @a)" :portability :common}
   {:suite "chars / isWhitespace" :label "Character/isWhitespace matches the JVM (Unicode line-sep yes, no-break space no)" :expected "[true true false false]" :actual "(mapv (fn [c] (Character/isWhitespace (char c))) [0x2028 32 0x00A0 65])" :portability :jvm}
   {:suite "deftype / field access" :label ".field reads a deftype field" :expected "7" :actual "(do (deftype FldT [q]) (.q (->FldT 7)))" :portability :jvm}

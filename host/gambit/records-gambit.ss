@@ -1749,10 +1749,18 @@
     ctor))
 
 (define (make-protocol name-str methods . rest)
-  (let ((sigs (if (null? rest) (jolt-hash-map) (car rest))))
-    (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
-      (keyword #f "name") (jolt-symbol jolt-nil name-str)
-      (keyword #f "methods") methods (keyword #f "sigs") sigs)))
+  (let* ((sigs (if (null? rest) (jolt-hash-map) (car rest)))
+         (rest2 (if (null? rest) '() (cdr rest)))
+         (doc (if (null? rest2) jolt-nil (car rest2)))
+         (rest3 (if (null? rest2) '() (cdr rest2)))
+         (method-map (if (null? rest3) (jolt-hash-map) (car rest3)))
+         (base (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
+                 (keyword #f "name") (jolt-symbol jolt-nil name-str)
+                 (keyword #f "methods") methods (keyword #f "sigs") sigs
+                 (keyword #f "method-map") method-map)))
+    (if (jolt-nil? doc)
+        base
+        (jolt-assoc base (keyword #f "doc") doc))))
 
 (define (register-protocol-methods! proto-name method-names)
   (let ((ns (chez-current-ns)))

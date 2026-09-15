@@ -72,6 +72,41 @@
   ;; (read-string s) a loaded file's own code runs at runtime came back tagged
   ;; with that file, and a read error carried a position into the string rendered
   ;; against it.
+  ;; The protocol VALUE's key set. jolt supplies :sigs, :doc, :method-map and
+  ;; :var — certified rows pin each (corpus "defprotocol / protocol value") — but
+  ;; not the three keys that describe the interface the reference's defprotocol
+  ;; generates. There, my.ns/P also yields an interface named my.ns.P, and :on
+  ;; (its name), :on-interface (the Class) and :method-builders (the fns that
+  ;; build its method implementations) all describe it. jolt generates no
+  ;; interface: a protocol method dispatches on the receiver's type tag
+  ;; (protocols.ss protocol-resolve), so there is no name to report and no Class
+  ;; to hand back. Reporting a name for a class that does not exist would just
+  ;; move the failure from a nil key to a ClassNotFoundException.
+  {:category :host-model
+   :behavior "(contains? P :on) / :on-interface / :method-builders on a protocol value"
+   :jvm "true — defprotocol also generates the interface my.ns.P, and these three keys describe it"
+   :jolt "false — no interface is generated; dispatch is by the receiver's type tag"
+   :check {:expr "(defprotocol Pdoc1 (mdoc1 [this])) (pr-str [(contains? Pdoc1 :on) (contains? Pdoc1 :on-interface) (contains? Pdoc1 :method-builders)])"
+           :jvm "\"[true true true]\""
+           :jolt "\"[false false false]\""}
+   :note "The keys jolt DOES supply are exact: (:doc P) is present only with a docstring, :method-map is identity on the method keywords, :var is the protocol's own var, :sigs is nil for a method-less protocol."}
+  ;; :extend-via-metadata is absent for a different reason from the three above:
+  ;; not "there is nothing to name" but "the rule is not in force". jolt's
+  ;; defprotocol PARSES the option — it has to, to read past it to the method
+  ;; signatures — and then drops it, because protocol-resolve does not consult a
+  ;; value's metadata for an implementation. Recording the key while the dispatch
+  ;; ignores it would be worse than omitting it: a caller testing the key would
+  ;; conclude metadata extension is available and get a no-such-method raise
+  ;; instead. So the key and the behavior are absent together, and they will
+  ;; arrive together. jolt-2j3.
+  {:category :host-model
+   :behavior "(:extend-via-metadata P), and whether metadata on a value can implement a protocol method"
+   :jvm "true, and the metadata implementation is found (direct impls first, then metadata, then extend)"
+   :jolt "nil, and the metadata implementation is not consulted — the call raises"
+   :check {:expr "(defprotocol Pdoc2 :extend-via-metadata true (mdoc2 [this])) (pr-str [(contains? Pdoc2 :extend-via-metadata) (try (mdoc2 (with-meta {} {(symbol (str *ns*) \"mdoc2\") (fn [_] :via-meta)})) (catch IllegalArgumentException e :not-honored))])"
+           :jvm "\"[true :via-meta]\""
+           :jolt "\"[false :not-honored]\""}
+   :note "Both halves move together: implementing metadata extension means setting the key. Pinned jolt-side in unit.edn's defprotocol-value suite."}
   {:category :reader-model
    :behavior "(meta (read-string \"(foo)\"))"
    :jvm "nil — read-string does not record positions"
