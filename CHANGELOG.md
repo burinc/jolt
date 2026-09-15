@@ -5,7 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.8] - 2026-09-15
+
+The theme is SCI on jolt. An embedded interpreter could not evaluate protocol
+code, and every cause was a runtime gap rather than an interpreter one:
+`extend-protocol` made its target an `instance?` of the protocol,
+`clojure.lang.MultiFn` had no constructor, `apply` ignored `applyTo`, a `~@`
+splice realized its seq while the template was built, a protocol value lacked
+`:sigs`, `:doc`, `:method-map` and `:var` and its `:jolt/type` marker was a
+keyword nothing else could equal, a type-hinted call on a class jolt supplies
+read as a missing dependency, and `java.util.regex.Matcher`, the URL codecs and
+`Class`'s annotation surface had no identity to resolve. Reading through the
+`java.io` shim and scanning strings got their constant factors back — a form
+read off a stream cost 3909ms over 332 files against babashka's 57ms and the
+namespace that motivated it went 8500ms → 872ms, `.read(char[])` is no longer
+slower than slurping the file, literal `str/replace` runs Boyer-Moore-Horspool
+— and a `char[]` is a Chez string underneath. `clojure.main`'s REPL and
+exception machinery are ported from the reference, so a nested
+`(clojure.main/repl)` works and a read or compile diagnostic carries the
+reference's `:clojure.error/*` keys; `core.async` has `alt!` and `alt!!`;
+`java.io.PushbackInputStream` and the concrete stream classes exist and a
+`proxy` over an abstract stream inherits its methods; `java.math.BigDecimal`
+answers its instance members. A built binary resolves a same-namespace forward
+reference in file order, and `:allow-dynamic` covers a vouched def's computed
+`require`.
 
 ### Added
 
@@ -117,6 +140,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`LineNumberingPushbackReader.setLineNumber` and `.atLineStart`**, which
   `clojure.main/renumbering-read` and `repl`'s prompt logic are built on.
+
+- **`java.math.BigDecimal`'s instance members, and `java.math.RoundingMode`.**
+  The value was complete — `M` literals, `(BigDecimal. s)`, the statics,
+  arithmetic under the JDK's scale rules — but the class answered no instance
+  member at all: every `(.scale b)`, `(.movePointLeft b 6)` or
+  `(.setScale b 4 RoundingMode/HALF_UP)` ended at `No matching method … for
+  class java.math.BigDecimal`. The JDK's instance API is defined over the
+  unscaled value and the scale, which is what jolt's value carries, so it is
+  now answered under the Java names: `scale`, `precision`, `unscaledValue`,
+  `setScale`, `movePointLeft`/`movePointRight`, `scaleByPowerOfTen`,
+  `stripTrailingZeros`, `round`, `signum`, `negate`, `abs`, `plus`, `add`,
+  `subtract`, `multiply`, `divide` in its three shapes, `remainder`, `pow`,
+  `min`, `max`, `compareTo`, the value projections, `toBigInteger` and the
+  `…Exact` pair, `toString` and `toPlainString`. Java's rules throughout: a
+  one-argument `setScale` is `UNNECESSARY` and raises `ArithmeticException`
+  exactly when the digits it drops are not zero; `stripTrailingZeros` takes
+  the scale below zero as Java 8's does (`600` → `6E+2`). A rounding mode had
+  no spelling before, so `java.math.RoundingMode`'s constants are statics now,
+  beside `BigDecimal`'s pre-Java-5 `ROUND_*` ints; a keyword or symbol is
+  accepted too, the spelling `*math-context*` takes for `:rounding`, and
+  anything else is an `IllegalArgumentException` naming what arrived rather
+  than a silent `HALF_UP`. One divergence, recorded in `known-divergences.edn`:
+  `.equals` and `.hashCode` answer what `=` and `hash` answer (by value, so
+  `(.equals 1.5M 1.50M)` is true here and false on the JVM) rather than
+  register a member that contradicts the operator beside it — `=`, `==`,
+  `hash` and `compareTo` agree on both. (#968)
 
 ### Performance
 
@@ -553,6 +602,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a write after close is the JVM's `IOException`.** All three raised a
   classless `flush-output-port: not permitted on closed port` that no
   `(catch java.io.IOException …)` could see.
+
+- **`extend-protocol` made its target an `instance?` of the protocol, and
+  gave the class a method.** On the JVM `extend`, `extend-type` and
+  `extend-protocol` file the implementation in the protocol's own method table
+  and never touch the class: `satisfies?` and dispatch flip, `instance?` stays
+  false, `Class.getDeclaredMethods` gains nothing. jolt keeps inline and
+  extended implementations in one registry, and both the `instance?` walk and
+  reflection read an extended protocol as a declared one. Where it bit:
+  `sci.impl.types/eval-node?` is `(instance? sci.impl.types.Eval x)`, meant
+  for the AST nodes that *declare* `Eval`, and SCI extends that same protocol
+  onto `sci.lang.Var` — so jolt classified every resolved var as an AST node,
+  `(resolve 'clojure.core/inc)` was `nil` inside SCI, and a `defrecord` could
+  not find its protocol. The extend mark the registry already writes for
+  `extenders` tells the two apart now: an extended protocol is neither an
+  `instance?` nor a reflected method, while a type that declares the protocol
+  inline and is *also* extended with it keeps answering true — the class
+  declares the interface, and an extend cannot take that away. (The JVM
+  refuses that second extend outright; jolt allows it and keeps the class
+  answer.) (#971)
+
+- **`clojure.lang.MultiFn` had no constructor.** `defmulti` and `defprotocol`
+  written in jolt build the value directly, so the class answered `(class x)`
+  and its interop methods but not `new`. `sci.impl.multimethods` spells it
+  `(new clojure.lang.MultiFn name dispatch-fn default hierarchy)`, and SCI's
+  `defprotocol` expands to `defmulti`, so no SCI context on jolt could define a
+  protocol. The constructor is registered under `clojure.lang.MultiFn` and
+  `MultiFn`, and the hierarchy argument may be a var as well as an atom — the
+  JVM derefs an `IRef` per dispatch, and SCI passes
+  `#'clojure.core/global-hierarchy`. (#970)
+
+- **`apply` ignored `IFn.applyTo`.** Every non-procedure callable went to the
+  `invoke` lookup, which selects an arity by argument count, so a type whose
+  widest `invoke` is the 21-parameter varargs one was treated as a fixed
+  21-arg method and anything past it was an `ArityException` — which is what
+  stopped SCI from applying a core fn to more than 21 arguments. On the JVM
+  `apply` is `(.applyTo f (seq args))` for every `IFn` that is not an `AFn`,
+  the one entry point such a type has for more arguments than it declares an
+  arity for. A `deftype`, `defrecord` or `reify` that declares `applyTo` now
+  gets it, with the argument seq unrealized; anything without one keeps the
+  `invoke` dispatch it had. (#969)
+
+- **`clojure.core.async` was in `(all-ns)` before anything required it, three
+  quarters empty.** The channel primitives are native and interned at boot, so
+  the namespace existed from the first instant with 34 of its 130 vars; the
+  other ~96 (`alts!`, `mult`, `pub`/`sub`, `pipeline`, the sequence operators)
+  arrive when a `require` loads the overlay. A caller that snapshots
+  namespaces out of `all-ns` — an SCI context built from `ns-interns`, a
+  completion or doc index — captured the bootstrap subset and then stood in
+  for the real namespace with it, failing far from the cause with `Unable to
+  resolve symbol: async/alts!!` against a namespace the same program had
+  plainly required. `find-ns` and `all-ns` now hold it back until its own `ns`
+  form runs, like every other vendored built-in (`babashka.fs`,
+  `babashka.process`, `clojure.core.rrb-vector`); a fully-qualified
+  `clojure.core.async/chan` still compiles and runs without a `require`, as it
+  has since the primitives became native. Describing one of its vars —
+  `(pr-str (resolve 'clojure.core.async/chan))`, `(.ns v)`, a var's `:ns`
+  metadata — does not publish the namespace either; only `ns`, `in-ns`,
+  `create-ns` or a load does. (#972)
 
 - **The concrete `java.io` stream classes are in the class graph.**
   `FileInputStream`, `ByteArrayInputStream`, `PipedInputStream`,
@@ -11828,6 +11935,7 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
+[0.8.8]: https://github.com/jolt-lang/jolt/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/jolt-lang/jolt/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/jolt-lang/jolt/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/jolt-lang/jolt/compare/v0.8.4...v0.8.5
