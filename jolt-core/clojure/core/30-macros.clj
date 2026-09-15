@@ -631,9 +631,10 @@
        ~tname)))
 
 ;; The protocol value is built by make-protocol (a fn call) rather than an embedded
-;; tagged map literal: the interpreter would otherwise self-evaluate such a struct
-;; instead of evaluating its fields. methods is a {kw {:name str}} map (only :name
-;; is consulted). The rest of the value is Clojure's protocol map, which tooling
+;; tagged map literal: a map carrying :jolt/type is not a map FORM (host-contract.ss
+;; hc-map?), so the analyzer would read such a literal as a live value it cannot
+;; spell instead of evaluating its fields. methods is a {kw {:name str}} map (only
+;; :name is consulted). The rest of the value is Clojure's protocol map, which tooling
 ;; reads to describe a protocol it was handed:
 ;;
 ;;   :sigs       {kw {:name sym :arglists (..) :doc str-or-nil :tag hint-or-nil}}
@@ -657,7 +658,11 @@
 ;; does not hold. See make-protocol's comment, unit.edn's defprotocol-value
 ;; suite, and jolt-2j3.
 ;;
-;; Each method is a thin dispatch fn over protocol-dispatch.
+;; Each method is a thin dispatch fn over protocol-dispatch, def'd with the var
+;; metadata the reference gives it — :arglists, :doc, :protocol (the protocol's
+;; own var) and the name's ^hint as :tag — so (doc a-method) prints a signature
+;; and tooling can tell a protocol method from a plain fn. See the method
+;; emission below.
 (defmacro defprotocol [pname & sigs]
   ;; Clojure's defprotocol takes an optional docstring and leading keyword
   ;; options (:extend-via-metadata true, honeysql uses it) before the method
@@ -696,7 +701,7 @@
     `(do
        (def ~(if pdoc (with-meta pname (assoc (meta pname) :doc pdoc)) pname)
          ;; :sigs is nil, not {}, for a protocol with no methods — the JVM's
-         ;; (when sigs ..) leaves the key present and empty-valued.
+         ;; (when sigs ..) leaves the key present with a nil value.
          (make-protocol ~pkey ~methods (quote ~(when (seq sigs) sigs-map)) ~pdoc ~method-map))
        ;; :var is the protocol's own var, so it can only be attached once the def
        ;; above has made one. alter-var-root, not a second def: a re-def would
@@ -712,8 +717,28 @@
        ;; variadic protocol-dispatch with a vector of the extra args.
        ~@(map (fn [sig]
                 (let [pn pkey
-                      mn (name (first sig))
+                      mnm (first sig)
+                      mn (name mnm)
                       arglists (filter vector? (rest sig))
+                      mdoc (let [args (rest sig)] (when (string? (last args)) (last args)))
+                      ;; the method var's metadata, as the reference sets it:
+                      ;; :arglists and :doc (present with a nil value when the
+                      ;; method has no docstring, as there), :tag, and :protocol
+                      ;; — the protocol's own var, which is what tells tooling a
+                      ;; method belongs to a protocol at all. Without these
+                      ;; (doc a-method) printed a bare name and no arglists.
+                      ;; The values are QUOTED forms: def evaluates the symbol's
+                      ;; metadata map, and the arglists' `this` is a symbol, not a
+                      ;; reference. :tag is NOT set here — it is the method name's
+                      ;; own ^hint, which def already reads and resolves to a Class,
+                      ;; the value both hosts put on (defn ^String f ..). The
+                      ;; reference's defprotocol keeps a resolved SYMBOL instead;
+                      ;; that one difference is a documented divergence.
+                      mmeta (assoc (meta mnm)
+                                   :doc mdoc
+                                   :arglists (list 'quote (when (seq arglists)
+                                                            (apply list arglists)))
+                                   :protocol (list 'var pname))
                       clause (fn [argv]
                                (let [ps (mapv (fn [_] (fresh-sym)) argv)
                                      n (count ps)
@@ -724,8 +749,8 @@
                                    (= n 3) (list ps (list 'protocol-dispatch3 pn mn obj (nth ps 1) (nth ps 2)))
                                    :else   (list ps (list 'protocol-dispatch pn mn obj (vec (rest ps)))))))]
                   (if (seq arglists)
-                    `(def ~(first sig) (fn* ~@(map clause arglists)))
-                    `(def ~(first sig)
+                    `(def ~(with-meta mnm mmeta) (fn* ~@(map clause arglists)))
+                    `(def ~(with-meta mnm mmeta)
                        (fn* [this# & rest#] (protocol-dispatch ~pn ~mn this# rest#))))))
               sigs))))
 

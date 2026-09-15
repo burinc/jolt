@@ -276,8 +276,10 @@
 ;;
 ;; jolt-with-monitor lives in java/concurrency.ss, which rt.ss loads AFTER this file;
 ;; the reference resolves at call time, the same forward reference
-;; jolt-run-interruptible makes to fibers.ss and for the same reason — nothing calls
-;; alter-var-root before the boot finishes loading.
+;; jolt-run-interruptible makes to fibers.ss and for the same reason — the earliest
+;; caller is the seed prelude (defprotocol emits an alter-var-root to attach the
+;; protocol's own :var, and clojure.core's IReader is one), which loads well after
+;; rt.ss has read every host file.
 ;;
 ;; The READ path is deliberately not locked. jolt-asj records the measurement that
 ;; rules it out (70 -> 95 ns on the probe), and nothing here needs it: a lost update

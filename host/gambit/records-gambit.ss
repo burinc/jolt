@@ -1285,9 +1285,9 @@
   "coll?"
   (lambda (x) (or (jrec-collection? x) (jolt-coll-pred? x))))
 
-(define proto-kw-jtype (keyword #f "jolt/type"))
+(define proto-kw-jtype (keyword "jolt" "type"))
 
-(define proto-kw-protocol (keyword #f "jolt/protocol"))
+(define proto-kw-protocol (keyword "jolt" "protocol"))
 
 (define proto-kw-name (keyword #f "name"))
 
@@ -1754,10 +1754,10 @@
          (doc (if (null? rest2) jolt-nil (car rest2)))
          (rest3 (if (null? rest2) '() (cdr rest2)))
          (method-map (if (null? rest3) (jolt-hash-map) (car rest3)))
-         (base (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
-                 (keyword #f "name") (jolt-symbol jolt-nil name-str)
-                 (keyword #f "methods") methods (keyword #f "sigs") sigs
-                 (keyword #f "method-map") method-map)))
+         (base (jolt-hash-map proto-kw-jtype proto-kw-protocol proto-kw-name
+                 (jolt-symbol jolt-nil name-str) (keyword #f "methods")
+                 methods (keyword #f "sigs") sigs (keyword #f "method-map")
+                 method-map)))
     (if (jolt-nil? doc)
         base
         (jolt-assoc base (keyword #f "doc") doc))))

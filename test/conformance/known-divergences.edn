@@ -107,6 +107,21 @@
            :jvm "\"[true :via-meta]\""
            :jolt "\"[false :not-honored]\""}
    :note "Both halves move together: implementing metadata extension means setting the key. Pinned jolt-side in unit.edn's defprotocol-value suite."}
+  ;; A protocol METHOD's var carries the reference's :arglists, :doc and :protocol
+  ;; (corpus "defprotocol / method var" certifies all three). Its :tag names the
+  ;; same type on both and differs only in kind: the reference's defprotocol
+  ;; carries the hint through its own sigs map and interns it as a resolved
+  ;; SYMBOL, where jolt def's the method with the hint on its name and jolt's def
+  ;; resolves a ^tag to a Class — which is what BOTH hosts put on (defn ^String f
+  ;; ..). So this is jolt's def being consistent with itself, not a lost hint.
+  {:category :host-model
+   :behavior "(:tag (meta #'method)) for a ^hinted protocol method"
+   :jvm "a symbol — clojure.lang.Symbol, the hint resolved to java.lang.String"
+   :jolt "a Class — java.lang.Class, the same value (defn ^String f ..) puts on its var on either host"
+   :check {:expr "(defprotocol Pdoc3 (^String mdoc3 [this])) (pr-str (class (:tag (meta (var mdoc3)))))"
+           :jvm "\"clojure.lang.Symbol\""
+           :jolt "\"java.lang.Class\""}
+   :note "Both name java.lang.String; only the kind of value differs. jolt's def is the one seam that resolves a ^tag, and it resolves this one too."}
   {:category :reader-model
    :behavior "(meta (read-string \"(foo)\"))"
    :jvm "nil — read-string does not record positions"

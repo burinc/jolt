@@ -21,8 +21,18 @@
 ;; A key naming a HOST interface (Object, java.util.Map, an :import-ed
 ;; clojure.lang.ILookup) has no defining namespace and stays bare: that is the
 ;; spelling value-host-tags reports.
-(define proto-kw-jtype (keyword #f "jolt/type"))
-(define proto-kw-protocol (keyword #f "jolt/protocol"))
+;;
+;; The discriminator is the SAME keyword every other :jolt/type in the host is —
+;; (keyword "jolt" "type"), namespace "jolt", name "type", which is what the
+;; reader produces for :jolt/type in Clojure source and what host-contract.ss
+;; (hc-kw-jolt-type), host-table.ss (kw-jtype) and natives-meta.ss (ty-kw-jtype)
+;; all spell. It was once (keyword #f "jolt/type") — one keyword whose NAME was
+;; the whole string — which printed identically, compared equal to none of them,
+;; and so left the tag INERT: (:jolt/type P) was nil from source, and hc-map?
+;; ("a map form is a pmap with no :jolt/type") read a protocol value as a plain
+;; map form, re-analyzing a spliced one as a map literal. jolt-dkz.
+(define proto-kw-jtype (keyword "jolt" "type"))
+(define proto-kw-protocol (keyword "jolt" "protocol"))
 (define proto-kw-name (keyword #f "name"))
 (define (jolt-protocol-value? v)
   (and (pmap? v) (eq? (jolt-get v proto-kw-jtype jolt-nil) proto-kw-protocol)))
@@ -656,8 +666,8 @@
          (doc (if (null? rest2) jolt-nil (car rest2)))
          (rest3 (if (null? rest2) '() (cdr rest2)))
          (method-map (if (null? rest3) (jolt-hash-map) (car rest3)))
-         (base (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
-                              (keyword #f "name") (jolt-symbol jolt-nil name-str)
+         (base (jolt-hash-map proto-kw-jtype proto-kw-protocol
+                              proto-kw-name (jolt-symbol jolt-nil name-str)
                               (keyword #f "methods") methods
                               (keyword #f "sigs") sigs
                               (keyword #f "method-map") method-map)))
