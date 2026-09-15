@@ -2081,6 +2081,10 @@
 ;; the frame GZIPInputStream and ZipInputStream share.
 (load "host/chez/java/zip-in-streams.ss")
 
+;; DeflaterOutputStream: an out-stream over a custom port, and the frame
+;; GZIPOutputStream shares.
+(load "host/chez/java/zip-out-streams.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss
