@@ -161,7 +161,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values recordinline corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
+  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
@@ -702,6 +702,12 @@ ffi:
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
+
+# zlib bindings (host/chez/java/zlib.ss): the z_stream layout, entry-point
+# resolution, checksums, round trips, error codes, dictionaries, parameter
+# changes, close, and the guardian drain.
+zlibunit:
+	@$(CHEZ) --script test/chez/zlib-test.ss
 
 # Escape continuations (jolt.continuations, issue #736): the one-shot contract
 # call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber

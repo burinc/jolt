@@ -2062,6 +2062,11 @@
 ;; natives-array.ss (the byte-array <-> bytevector bridge).
 (load "host/chez/java/io-streams.ss")
 
+;; zlib: the entry points java.util.zip binds (jolt_z_* in a built binary, see
+;; host/chez/stub/jolt_zlib.h) and the z_stream they drive. Mechanism only; the
+;; java.util.zip classes load after it.
+(load "host/chez/java/zlib.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss
