@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`clojure.core.async/alt!` and `alt!!`, and `clojure.core.async.impl.protocols`
+  with `ReadPort`.** The two pieces of upstream core.async's surface a ported
+  library reaches for by name and jolt did not ship, so a port had to shadow
+  `clojure.core.async` wholesale to install them. `alt!` and `alt!!` are
+  upstream's macros verbatim (1.6.681) over the `alts!` / `alts!!` already here;
+  they park by capturing, since the CPS pass threads no continuation through
+  `__do-alts`. `impl.protocols` carries `ReadPort` alone and answers the two
+  questions a port asks about a native channel: `register-class-supers!` gives
+  the class name the class-arm already reports a row in the class graph, which is
+  where `value-host-tags` — what protocol dispatch keys on — comes from, so
+  `extend-type` has a tag to file under and `satisfies?` can answer; and
+  `__register-instance-check!` answers `(instance? ReadPort ch)` directly, since
+  instance-check does not consult the class graph and the `:import` loads no
+  namespace. The overlay's ns form requires it, as upstream's does, so a bare
+  `(require 'clojure.core.async)` installs both halves. (#996)
+
 - **`clojure.main`'s exception machinery and reusable REPL, ported from the
   reference.** `ex-triage`, `ex-str`, `err->msg`, `repl-caught`,
   `report-error`, `root-cause`, `stack-element-str`, `with-bindings`,
@@ -331,6 +347,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builds it, so tooling that enumerates a protocol's methods from its value
   reads jolt's the same way. `:tag` holds the hint as written (a symbol); the
   reference resolves it to a `Class`. (#1000)
+
+- **`java.util.regex.Matcher` had no class identity.** The matcher's behavior
+  was complete — `re-matcher`, `.find`, `.find(int)`, `.matches`, `.group`,
+  `.region` over `matcher-t` — but the type had no *name*: it was absent from
+  the class graph, so `(class (re-matcher #"a" "a"))` was `:object`,
+  `(instance? java.util.regex.Matcher m)` was `false`, and
+  `(Class/forName "java.util.regex.Matcher")` threw `ClassNotFoundException`.
+  Compiled jolt code never noticed, because it resolves neither an `:import`
+  nor a type hint; SCI resolves both at analysis time, so a source that names
+  the class could not be analyzed at all. `clojure.tools.reader`'s
+  `impl/commons.clj` imports `Matcher` and hints `^Matcher` — which took the
+  whole tools.reader family (rewrite-clj's JVM-family reader, edamame, cljfmt)
+  out of reach under SCI, and with it kmet's `clojure` extension. `Matcher` and
+  the `MatchResult` interface it implements are in the class graph now, and a
+  matcher answers the name through `class`, `instance?` and protocol dispatch
+  alike. (#998)
+
+- **`java.net.URLEncoder` and `java.net.URLDecoder` had no class tokens.** Both
+  classes have been implemented since #83 and their statics work from compiled
+  code, but they were registered under their *simple* names alone, and nothing
+  registered either name in the class graph — so `Class/forName`, `:import`, a
+  type hint and `instance?` all missed two classes jolt fully supplies. An
+  interpreter that resolves the qualifier of `java.net.URLDecoder/decode` as a
+  classname before the static never reached the static: under SCI the call was
+  `Unable to resolve symbol`, although the identical call ran in compiled jolt
+  code. kmet's lsp-adapter decodes `file://` URIs that way, so the extension
+  failed to load. Both are registered under their qualified names now (which
+  mirrors to the simple ones) and carry a row in the class graph, as
+  `java.util.Base64` does. (#999)
 
 - **A type-hinted instance call inside SCI reported `No dependency provides
   java.lang.StringBuilder` for a class jolt fully supplies.** SCI resolves a

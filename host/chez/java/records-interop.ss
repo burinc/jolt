@@ -117,6 +117,9 @@
     ((member tname '("Atom" "clojure.lang.Atom")) (jolt-atom? val))
     ((member tname '("IFn" "clojure.lang.IFn" "Fn" "clojure.lang.Fn")) (procedure? val))
     ((member tname '("Pattern" "java.util.regex.Pattern")) (regex-t? val))
+    ((member tname '("Matcher" "java.util.regex.Matcher"
+                     "MatchResult" "java.util.regex.MatchResult"))
+     (matcher-t? val))
     ((member tname '("URI" "java.net.URI"))
      (and (jhost? val) (string=? (jhost-tag val) "uri")))
     ((member tname '("File" "java.io.File")) (jfile? val))

@@ -116,6 +116,10 @@
     ((jolt-reduced? x) "clojure.lang.Reduced")
     ((char? x) "java.lang.Character")
     ((regex-t? x) "java.util.regex.Pattern")
+    ;; a stateful matcher (re-matcher) is a java.util.regex.Matcher, as the
+    ;; record's own comment in regex.ss already said — without this arm it fell
+    ;; through to (jolt-type x) and (class m) was :object. #998.
+    ((matcher-t? x) "java.util.regex.Matcher")
     ;; an anonymous / unregistered fn — like the JVM, where (class #(..)) is a
     ;; concrete ns$fn__N subclass. The $fn marker lets clojure.spec.alpha's fn-sym
     ;; recognize it as anonymous and return ::s/unknown. A named fn is registered

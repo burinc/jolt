@@ -1601,8 +1601,16 @@
 (define (u8-list->bytevector lst)
   (let ((bv (make-bytevector (length lst))))
     (let loop ((l lst) (i 0)) (if (null? l) bv (begin (bytevector-u8-set! bv i (car l)) (loop (cdr l) (+ i 1)))))))
-(register-class-statics! "URLEncoder" (list (cons "encode" url-encode)))
-(register-class-statics! "URLDecoder" (list (cons "decode" url-decode)))
+;; Registered under the QUALIFIED name, which mirrors to the short one (see
+;; class-statics-merge!): the short spelling alone left both classes with working
+;; statics and no class TOKEN, because forname-known? consults the statics table
+;; by FQN only. So (Class/forName "java.net.URLDecoder") was a
+;; ClassNotFoundException while (URLDecoder/decode …) worked — and an interpreter
+;; that resolves the qualifier as a classname before the static (SCI, which is how
+;; kmet evaluates extensions) could not reach the static at all. Their rows in the
+;; class graph are in class-hierarchy.ss. #999.
+(register-class-statics! "java.net.URLEncoder" (list (cons "encode" url-encode)))
+(register-class-statics! "java.net.URLDecoder" (list (cons "decode" url-decode)))
 ;; Charset is registered further down, under the qualified name — which mirrors
 ;; to the short one — and answers with a charset OBJECT (charset-for-name, which
 ;; validates the name and carries the encoding). A second short-name registration

@@ -465,6 +465,7 @@
         ;; class graph. A #inst is a java.util.Date (NOT a java.sql.Timestamp — the
         ;; instance? arm in inst-time.ss agrees).
         ((regex-t? obj) (jch-tags "java.util.regex.Pattern"))
+        ((matcher-t? obj) (jch-tags "java.util.regex.Matcher"))
         ((juuid? obj) (jch-tags "java.util.UUID"))
         ((jinst? obj) (jch-tags "java.util.Date"))
         ((jbigdec? obj) (jch-tags "java.math.BigDecimal"))
@@ -670,6 +671,7 @@
                 "Collection" "java.util.Collection" "Iterable" "java.lang.Iterable"
                 "UUID" "BigDecimal" "Date" "Timestamp" "Instant" "java.sql.Date"
                 "Pattern" "java.util.regex.Pattern"
+                "Matcher" "java.util.regex.Matcher" "MatchResult" "java.util.regex.MatchResult"
                 ;; java.time value types (extend-protocol Duration / ZonedDateTime / …)
                 "Duration" "Period" "LocalDate" "LocalTime" "LocalDateTime"
                 "ZonedDateTime" "OffsetDateTime" "OffsetTime" "ZoneId" "ZoneOffset"

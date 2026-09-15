@@ -1621,6 +1621,7 @@
      '("[D" "Object"))
     ((jolt-array? obj) '("[Ljava.lang.Object;" "Object"))
     ((regex-t? obj) (jch-tags "java.util.regex.Pattern"))
+    ((matcher-t? obj) (jch-tags "java.util.regex.Matcher"))
     ((juuid? obj) (jch-tags "java.util.UUID"))
     ((jinst? obj) (jch-tags "java.util.Date"))
     ((jbigdec? obj) (jch-tags "java.math.BigDecimal"))
@@ -1784,10 +1785,12 @@
         "java.util.Collection" "Iterable" "java.lang.Iterable"
         "UUID" "BigDecimal" "Date" "Timestamp" "Instant"
         "java.sql.Date" "Pattern" "java.util.regex.Pattern"
-        "Duration" "Period" "LocalDate" "LocalTime" "LocalDateTime"
-        "ZonedDateTime" "OffsetDateTime" "OffsetTime" "ZoneId"
-        "ZoneOffset" "Clock" "Year" "YearMonth" "Month" "DayOfWeek"
-        "ChronoUnit" "ChronoField" "TemporalAmount" "TemporalUnit"
+        "Matcher" "java.util.regex.Matcher" "MatchResult"
+        "java.util.regex.MatchResult" "Duration" "Period"
+        "LocalDate" "LocalTime" "LocalDateTime" "ZonedDateTime"
+        "OffsetDateTime" "OffsetTime" "ZoneId" "ZoneOffset" "Clock"
+        "Year" "YearMonth" "Month" "DayOfWeek" "ChronoUnit"
+        "ChronoField" "TemporalAmount" "TemporalUnit"
         "TemporalField" "ByteBuffer" "java.nio.ByteBuffer" "[B" "[C"
         "[I" "[J" "[D" "[Ljava.lang.Object;" "Reader"
         "java.io.Reader" "Writer" "java.io.Writer" "StringReader"

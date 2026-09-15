@@ -1836,6 +1836,24 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [ready (a/chan 1) other (a/chan) _ (a/>!! ready :kept)] (try (a/alts!! [ready [other nil]] :priority true) [:no-throw (a/poll! ready)] (catch AssertionError _ [:threw (a/poll! ready)]))))" :expected "[:threw :kept]"}
   ;; 10. mult/tap smoke — proves the dataflow layer still works
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) m (a/mult c) t1 (a/chan) t2 (a/chan)] (a/tap m t1) (a/tap m t2) (a/>!! c :x) [(a/<!! t1) (a/<!! t2)]))" :expected "[:x :x]"}
+  ;; 11. alt! is the go-block macro over alts!: take clause. Buffered channel, so
+  ;; nothing races a timeout.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1)] (a/>!! c :v) (a/<!! (a/go (a/alt! c ([v] [:took v]) (a/timeout 3000) [:timeout])))))" :expected "[:took :v]"}
+  ;; 12. alt! :default returns the default expr without parking when none is ready
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (a/<!! (a/go (a/alt! (a/chan) ([v] [:took v]) :default [:default]))))" :expected "[:default]"}
+  ;; 13. alt! put clause writes through the channel
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1)] (a/<!! (a/go (a/alt! [[c :put]] [:wrote]))) (a/<!! c)))" :expected ":put"}
+  ;; 14. alt!! is the blocking twin: completes outside a go block
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1)] (a/>!! c :sync) (a/alt!! c ([v] [:took v]) (a/timeout 3000) [:timeout])))" :expected "[:took :sync]"}
+  ;; 15. alt! :priority true takes the first ready port in declared order. Options
+  ;; are keyword/value PAIRS in the clause list (do-alt partitions the whole list
+  ;; in twos), so a ports vector still needs its own result expr.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c1 (a/chan 1) c2 (a/chan 1)] (a/>!! c1 :a) (a/>!! c2 :b) (a/alt!! [c1 c2] ([v p] [v (if (= p c1) :c1 :c2)]) :priority true)))" :expected "[:a :c1]"}
+  ;; 16. the protocols half: a ported library asks about ReadPort by import and
+  ;; by satisfies?, and a non-channel must not answer either. (The symbol is
+  ;; spelled in full because instance? reads a LOCAL protocol var as a class
+  ;; value — a separate, pre-existing divergence.)
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a] '[clojure.core.async.impl.protocols]) (let [c (a/chan)] [(satisfies? clojure.core.async.impl.protocols/ReadPort c) (instance? clojure.core.async.impl.protocols/ReadPort c) (satisfies? clojure.core.async.impl.protocols/ReadPort 5) (instance? clojure.core.async.impl.protocols/ReadPort 5)]))" :expected "[true true false false]"}
   ;; clojure.test — instance? in is still reports correctly (instance? is a fn)
   {:suite "clojure.test" :expr "(do (require '[clojure.test :as t]) (t/reset-report!) (t/deftest t1 (t/is (instance? String 5))) (t/run-tests) [(t/n-pass) (t/n-fail)])" :expected "[0 1]"}
   ;; clojure.test — the report map carries :expected (the form as written) and

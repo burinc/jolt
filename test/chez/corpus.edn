@@ -6945,4 +6945,25 @@
   {:suite "clojure.edn / read over a reader" :label "the same non-constituent rejection as read-string" :expected "\"Invalid constituent character: @\"" :actual "(do (require (quote [clojure.edn :as er1])) (try (er1/read (java.io.PushbackReader. (java.io.StringReader. \"garbage!@\"))) (catch RuntimeException e (.getMessage e))))" :portability :jvm}
   {:suite "clojure.edn / read over a reader" :label "an auto-resolved keyword is not edn" :expected "\"Invalid token: ::kw\"" :actual "(do (require (quote [clojure.edn :as er2])) (try (er2/read (java.io.PushbackReader. (java.io.StringReader. \"::kw\"))) (catch RuntimeException e (.getMessage e))))" :portability :jvm}
   {:suite "clojure.edn / read over a reader" :label "end of input is an error without an :eof option, and the option's value with one" :expected "[\"EOF while reading\" :end]" :actual "(do (require (quote [clojure.edn :as er3])) [(try (er3/read (java.io.PushbackReader. (java.io.StringReader. \"\"))) (catch RuntimeException e (.getMessage e))) (er3/read {:eof :end} (java.io.PushbackReader. (java.io.StringReader. \"\")))])" :portability :jvm}
+  ;; #998 — the matcher's class IDENTITY. Its behavior was already complete
+  ;; (the Matcher anchoring / find-from / region suites above), but the type had
+  ;; no name: (class m) was :object, instance? was false, and Class/forName
+  ;; missed it — so SCI could not analyze a source that imports or hints
+  ;; Matcher, which is exactly what clojure.tools.reader's commons.clj does.
+  {:suite "host-interop / Matcher class identity" :label "a matcher reports java.util.regex.Matcher" :expected "\"java.util.regex.Matcher\"" :actual "(.getName (class (re-matcher #\"a\" \"a\")))" :portability :jvm}
+  {:suite "host-interop / Matcher class identity" :label "instance? sees a Matcher and not a Pattern" :expected "[true false]" :actual "(let [m (re-matcher #\"a\" \"a\")] [(instance? java.util.regex.Matcher m) (instance? java.util.regex.Pattern m)])" :portability :jvm}
+  {:suite "host-interop / Matcher class identity" :label "and a Pattern is not a Matcher" :expected "[true false]" :actual "[(instance? java.util.regex.Pattern #\"a\") (instance? java.util.regex.Matcher #\"a\")]" :portability :jvm}
+  {:suite "host-interop / Matcher class identity" :label "Class/forName resolves it" :expected "\"java.util.regex.Matcher\"" :actual "(.getName (Class/forName \"java.util.regex.Matcher\"))" :portability :jvm}
+  {:suite "host-interop / Matcher class identity" :label "it implements MatchResult and extends Object" :expected "[true \"java.lang.Object\"]" :actual "[(contains? (supers java.util.regex.Matcher) java.util.regex.MatchResult) (.getName (.getSuperclass java.util.regex.Matcher))]" :portability :jvm}
+  {:suite "host-interop / Matcher class identity" :label "the tools.reader shape: import the name, hint a parameter with it" :expected "\"12\"" :actual "(do (import (quote (java.util.regex Pattern Matcher))) (let [f (fn [^Matcher m] (when (.find m) (.group m)))] (f (re-matcher #\"\\d+\" \"a12\"))))" :portability :jvm}
+  {:suite "host-interop / Matcher class identity" :label "extend-protocol to Matcher dispatches" :expected "[:matcher :pattern :other]" :actual "(do (defprotocol MTg (mtg [_])) (extend-protocol MTg java.util.regex.Matcher (mtg [_] :matcher) java.util.regex.Pattern (mtg [_] :pattern) Object (mtg [_] :other)) [(mtg (re-matcher #\"a\" \"a\")) (mtg #\"a\") (mtg 1)])" :portability :jvm}
+  ;; #999 — the two www-form-urlencoded utility classes. Their statics worked
+  ;; from compiled code all along; only the class TOKEN was missing, so
+  ;; Class/forName, :import and a qualifier an interpreter resolves as a
+  ;; classname (SCI, kmet's lsp-adapter) all failed on names jolt implements.
+  {:suite "interop / java.net URL codec class tokens" :label "Class/forName resolves both" :expected "[\"java.net.URLEncoder\" \"java.net.URLDecoder\"]" :actual "[(.getName (Class/forName \"java.net.URLEncoder\")) (.getName (Class/forName \"java.net.URLDecoder\"))]" :portability :jvm}
+  {:suite "interop / java.net URL codec class tokens" :label "the class names evaluate to class tokens" :expected "[\"java.net.URLEncoder\" \"java.net.URLDecoder\"]" :actual "[(.getName java.net.URLEncoder) (.getName java.net.URLDecoder)]" :portability :jvm}
+  {:suite "interop / java.net URL codec class tokens" :label "both are utility classes directly on Object" :expected "[\"java.lang.Object\" \"java.lang.Object\"]" :actual "[(.getName (.getSuperclass java.net.URLEncoder)) (.getName (.getSuperclass java.net.URLDecoder))]" :portability :jvm}
+  {:suite "interop / java.net URL codec class tokens" :label "the statics answer through the qualified name" :expected "[\"a+b\" \"a b\"]" :actual "[(java.net.URLEncoder/encode \"a b\" \"UTF-8\") (java.net.URLDecoder/decode \"a%20b\" \"UTF-8\")]" :portability :jvm}
+  {:suite "interop / java.net URL codec class tokens" :label "and through an import of the simple name" :expected "\"a b\"" :actual "(do (import (quote (java.net URLDecoder))) (URLDecoder/decode \"a%20b\" \"UTF-8\"))" :portability :jvm}
 ]
