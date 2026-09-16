@@ -44,8 +44,12 @@
 ;; it (jolt.deps attaches the root), falling back to the project for a spec that
 ;; carries none — a stale cpcache entry, or a caller that built the map itself.
 ;; Without this a dependency's "native/libfoo.so" resolved against the APP's
-;; directory, where it is not.
-(defn- native-root [spec base] (or (:jolt.deps/root spec) base))
+;; directory, where it is not. A RECONCILED spec (jolt.deps folds two
+;; declarations of the same :name into one) carries a per-platform-key root for
+;; every key it took from the other declaration, so those candidates still
+;; resolve against the deps.edn that wrote them.
+(defn- native-root [spec plat base]
+  (or (get (:jolt.deps/roots spec) plat) (:jolt.deps/root spec) base))
 
 ;; A BUILD-TIME path (a :static archive, a -L directory) relative to that root.
 ;; Unlike native-candidate this prefixes a bare filename too: those paths are
@@ -59,6 +63,51 @@
            (not (re-find #"^[A-Za-z]:" p)))
     (str base "/" p)
     p))
+
+;; Does NAME read as a library name — the thing a platform has a conventional
+;; spelling of? A :jolt/native :name is free text ("libc (POSIX sockets)"), and
+;; deriving "libc (POSIX sockets).dll" from one would put noise in the
+;; diagnostic and dlopen nothing.
+(defn- library-name? [n]
+  (and (string? n) (seq n) (re-matches #"[A-Za-z0-9_.+-]+" n)))
+
+;; The candidates SPEC itself declares for PLAT — one string or a list of them.
+(defn- native-declared [spec plat]
+  (let [c (get spec plat)] (if (string? c) [c] (vec c))))
+
+;; The candidates to try for SPEC on PLAT, in order. A spec that declares the
+;; platform's key is taken at its word. One that declares none — every
+;; :darwin/:linux library on Windows, which is all of jolt-lang/crypto and
+;; jolt-lang/http-client — used to yield the empty list, so nothing was dlopen'd
+;; and the failure still read "not found" about a search that never happened
+;; (jolt-lang/jolt#989). Fall back to the platform's conventional spellings of
+;; the :name, which is what load-system-library would have tried; on Windows
+;; that includes the version-suffixed files (libcrypto-3-x64.dll) the OS loader
+;; cannot reach from a bare name.
+(defn- native-candidates [spec plat base]
+  (let [declared (native-declared spec plat)
+        raw (if (seq declared)
+              declared
+              (when (library-name? (:name spec))
+                (vec (jolt.ffi/system-library-candidates (:name spec)))))]
+    (mapv #(native-candidate (native-root spec plat base) %) raw)))
+
+;; What to say when nothing loaded. "tried []" was the tell for a spec with no
+;; key for this platform, and it read as a missing library — it named no search
+;; because none happened, and "(a task may build it)" pointed at a build for a
+;; file that is already on disk. Say which keys the spec DOES declare instead.
+(defn- native-missing-msg [spec plat cands]
+  (let [nm (or (:name spec) (first cands) "?")
+        declared-keys (filterv #(contains? spec %) [:darwin :linux :windows])]
+    (if (seq (native-declared spec plat))
+      (str "required native library " nm " not found — tried " (pr-str cands)
+           " for " (name plat))
+      (str "required native library " nm " has no " plat " candidates"
+           (when (seq declared-keys)
+             (str " (declares " (str/join ", " declared-keys) ")"))
+           (if (seq cands)
+             (str " — tried this platform's conventional names " (pr-str cands))
+             "")))))
 
 ;; strict? false lets a MISSING required library through with a warning instead of
 ;; an error. A task is the one command that may be what PRODUCES the library it
@@ -76,9 +125,7 @@
       (doseq [spec natives]
         (if (:process spec)
           (jolt.ffi/load-library)
-          (let [c (get spec plat)
-                cands (mapv #(native-candidate (native-root spec base) %)
-                            (if (string? c) [c] (vec c)))
+          (let [cands (native-candidates spec plat base)
                 ;; Load the native RTLD_LOCAL and register its handle, so the
                 ;; spec's defcfns resolve from the handle (isolated from the
                 ;; process-global namespace) rather than depending on global
@@ -90,13 +137,16 @@
             ;; skip it rather than fail. Its foreign calls only resolve in a static
             ;; build; document a dynamic candidate too to use it under `run`.
             (when (and (nil? hit) (not (:optional spec)) (not (:static spec)))
-              (let [msg (str "required native library "
-                             (or (:name spec) (first cands) "?")
-                             " not found — tried " (pr-str cands) " for " (name plat))]
+              (let [msg (native-missing-msg spec plat cands)]
                 (if strict?
                   (throw (ex-info msg {:native spec}))
                   (binding [*out* *err*]
-                    (println (str "warning: " msg " (a task may build it)")))))))))))))
+                    ;; a task may still BUILD a library it declared candidates
+                    ;; for; it cannot build one this platform was never told
+                    ;; the name of.
+                    (println (str "warning: " msg
+                                  (when (seq (native-declared spec plat))
+                                    " (a task may build it)"))))))))))))))
 
 ;; Install the :jolt/provides declarations a resolved project collected (RFC 0014).
 ;; An entry is [install-ns lib class ...]; lib is nil for the project's own.
@@ -317,14 +367,29 @@
 ;; directory. This differs from the process directory for the development
 ;; launcher: bin/jolt cd's to its checkout and carries the caller's directory in
 ;; JOLT_PWD so its host Scheme files remain findable.
-(defn- file-arg [x]
+;; The platform is a parameter so the Windows rows are reachable from a POSIX
+;; host (test/chez/file-arg-test.clj); file-arg below binds it to this one.
+(defn- file-arg-for [kind windows? dir x]
   (cond
     (= "-" x) "/dev/stdin"
-    (str/starts-with? x "/") x
+    ;; Only a RELATIVE path belongs to the project directory. POSIX spells an
+    ;; absolute path one way; Windows has drive-absolute (C:/x, C:\x) and UNC
+    ;; (//server/share) as well, plus two rooted-but-not-absolute forms — /x,
+    ;; which the OS resolves against the current drive, and C:x, against that
+    ;; drive's own current directory — that this process cannot resolve any
+    ;; better than the OS can, so they are passed through as given.
+    ;; Matching a leading "/" alone sent `jolt C:/Users/x/hello.clj` down the
+    ;; :else branch, and open-input-file failed on "./C:/Users/x/hello.clj"
+    ;; however correct the path the user typed was (jolt-lang/jolt#992).
+    (not= :relative kind) x
     ;; a ./-prefixed argument is already project-relative: joining it as is
-    ;; reported the file as ././x.clj
-    (str/starts-with? x "./") (str (project-dir) "/" (subs x 2))
-    :else (str (project-dir) "/" x)))
+    ;; reported the file as ././x.clj. .\ is the same argument on Windows.
+    (or (str/starts-with? x "./")
+        (and windows? (str/starts-with? x ".\\"))) (str dir "/" (subs x 2))
+    :else (str dir "/" x)))
+
+(defn- file-arg [x]
+  (file-arg-for (deps/path-kind x) (= :windows (current-platform)) (project-dir) x))
 
 ;; main-opts is a vector like ["-m" "app.core"] or ["-e" "(prn :hi)"] (optionally
 ;; with trailing args). The user-supplied extra args are appended, so an alias's
@@ -714,7 +779,7 @@
           ;; project's own "native/libfoo.a" only worked when the build happened
           ;; to run from the project dir — which bin/jolt, which cd's to the jolt
           ;; tree, never does (jolt-9a8).
-          root (native-root spec base)]
+          root (native-root spec plat base)]
       (cond
         (:archive s) ["archive" (native-build-path root (:archive s))]
         (:lib s)     ["lib" (:lib s) (if-let [d (:libdir s)]
@@ -738,10 +803,8 @@
              (cond
                (:process spec) ["process"]
                static          (into ["static"] static)
-               :else           (let [c (get spec plat)
-                                     cands (mapv #(native-candidate (native-root spec base) %)
-                                                 (if (string? c) [c] (vec c)))]
-                                 (into [(if (:optional spec) "opt" "req")] cands))))))))
+               :else           (into [(if (:optional spec) "opt" "req")]
+                                     (native-candidates spec plat base))))))))
 
 ;; Say which :jolt/native libraries the built binary will still dlopen. A
 ;; `jolt build` is otherwise self-contained — the Clojure, the runtime and every

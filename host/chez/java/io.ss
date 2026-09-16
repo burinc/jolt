@@ -481,57 +481,158 @@
        (let ((buf (make-bytevector 4096 0)))     ; >= PATH_MAX
          (and (not (= 0 (c-realpath p buf))) (jfile-cstr buf)))))
 
-;; "/a/b" -> "/a", "/a" -> "/", "/" -> #f
+;; "/a/b" -> "/a", "/a" -> "/", "/" -> #f. The directory half of an output
+;; path, POSIX-only on purpose: its callers are the AOT cache and the build
+;; driver (loader.ss aot-mkdir-p, build-jolt.ss), which write under paths jolt
+;; itself composed with "/". Canonicalization no longer uses it -- that walk
+;; needs the platform's root form and lives below.
 (define (path-parent p)
   (let loop ((i (- (string-length p) 1)))
     (cond ((< i 0) #f)
           ((char=? (string-ref p i) #\/) (if (= i 0) "/" (substring p 0 i)))
           (else (loop (- i 1))))))
 
+;; --- the lexical half of canonicalization ------------------------------------
+;; Everything below splits a path ONCE into its root and the segments under it,
+;; and rebuilds from that pair. The root is what the POSIX-only version could
+;; not express: it rejoined every segment as "/" + segment, so on Windows a
+;; drive-absolute path came back as "/C:/Users/x/a.txt" — a path resolved
+;; against the CURRENT drive, so reading or writing the canonicalized value
+;; failed as "C:/C:/Users/x/…" (jolt-lang/jolt#991).
+;;
+;; The platform is a parameter rather than a call to sa-os-family so the Windows
+;; rows are gated from a POSIX host (test/chez/win-path-test.ss) — the Windows
+;; build is exactly where realpath is missing and this fallback is the whole of
+;; getCanonicalPath.
+
+;; Is C a separator for this platform? POSIX has one; "\" is an ordinary
+;; filename character there and must stay one. Windows accepts either, and the
+;; fallback receives either — a File built from "C:\Users\x\a.txt" reached
+;; jfile-fold-dots as a single unsplittable segment.
+(define (path-sep-for? windows? c)
+  (or (char=? c #\/) (and windows? (char=? c #\\))))
+
+;; The ROOT of P — the prefix that is not a segment and must be reproduced
+;; verbatim — and the index the segments start at. Rendered with "/" separators,
+;; the spelling getAbsolutePath and babashka.fs/absolutize already answer with
+;; on Windows, so canonicalize agrees with its neighbours and a path's identity
+;; no longer depends on which separator the caller typed.
+;;
+;;   POSIX    "/a/b"                -> "/"                 UNC   "//srv/sh/a" -> "//srv/sh/"
+;;   drive    "C:/a"  "C:\a"        -> "C:/"               rooted "/a"        -> "/"
+;;   drive-relative "C:a"           -> "C:"                relative "a/b"     -> ""
+;;
+;; A drive-relative path keeps its "C:" and gains no separator: it names the
+;; per-drive current directory, which this process cannot see, so the honest
+;; answer is to hand back the same relative meaning the caller passed in rather
+;; than to invent a root. jolt.deps rejects that form outright because it has to
+;; produce a path it can then read; the JVM's canonicalizer resolves it against
+;; the drive, and leaving it alone is the closest we can get to that.
+(define (path-root-end windows? p)
+  (let ((n (string-length p)))
+    (define (sep? i) (and (< i n) (path-sep-for? windows? (string-ref p i))))
+    (cond
+      ((not windows?) (if (sep? 0) 1 0))
+      ((and (>= n 2) (windows-drive-prefix? p)) (if (sep? 2) 3 2))
+      ;; UNC or device: "\\server\share", "\\?\C:\x". The first two segments
+      ;; after the leading pair are part of the root, not children of it.
+      ((and (sep? 0) (sep? 1))
+       (let* ((seg-end (lambda (i)
+                         (let loop ((j i)) (if (or (>= j n) (sep? j)) j (loop (+ j 1))))))
+              (skip-seps (lambda (i) (let loop ((j i)) (if (sep? j) (loop (+ j 1)) j))))
+              (a (seg-end (skip-seps 2)))
+              (b (seg-end (skip-seps a))))
+         b))
+      ((sep? 0) 1)
+      (else 0))))
+
+;; The root as a string, separators normalized to "/" and one trailing "/" kept
+;; when the root is a directory prefix ("C:/", "//srv/sh/", "/") rather than a
+;; drive-relative "C:".
+(define (path-root windows? p)
+  (let* ((end (path-root-end windows? p))
+         (raw (substring p 0 end)))
+    (cond
+      ((= end 0) "")
+      ((and windows? (= end 2) (windows-drive-prefix? p)) raw)  ; "C:" — drive-relative
+      (else
+       (let ((out (make-string (string-length raw))))
+         (do ((i 0 (+ i 1))) ((= i (string-length raw)))
+           (string-set! out i (if (path-sep-for? windows? (string-ref raw i))
+                                  #\/
+                                  (string-ref raw i))))
+         (let ((s (if (char=? (string-ref out (- (string-length out) 1)) #\/)
+                      out
+                      (string-append out "/"))))
+           s))))))
+
+;; The non-empty segments under the root. Empty ones (a doubled separator) are
+;; dropped here, which is what the JVM's normalize does to them anyway.
+(define (path-segments windows? p)
+  (let ((n (string-length p)))
+    (let loop ((i (path-root-end windows? p)) (start (path-root-end windows? p)) (acc '()))
+      (cond
+        ((= i n) (reverse (if (> i start) (cons (substring p start i) acc) acc)))
+        ((path-sep-for? windows? (string-ref p i))
+         (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring p start i) acc) acc)))
+        (else (loop (+ i 1) start acc))))))
+
+(define (path-rebuild root segs)
+  (cond
+    ((null? segs) (if (string=? root "") "." root))
+    (else
+     (let loop ((out root) (ss segs) (first? #t))
+       (if (null? ss)
+           out
+           (loop (string-append out
+                                (if (or first? (string=? out "")) "" "/")
+                                (car ss))
+                 (cdr ss)
+                 #f))))))
+
 ;; Fold "." and ".." lexically. Only ever applied to a part of a path that does
 ;; NOT exist: where a component is real, realpath resolves it instead, because
 ;; POSIX (and the JVM) resolve ".." AFTER following the link before it, and
 ;; folding it lexically there would give a different -- wrong -- directory.
-(define (jfile-fold-dots p)
-  (let loop ((segs (let split ((i 0) (start 0) (acc (quote ())))
-                     (cond ((= i (string-length p))
-                            (reverse (cons (substring p start i) acc)))
-                           ((char=? (string-ref p i) #\/)
-                            (split (+ i 1) (+ i 1) (cons (substring p start i) acc)))
-                           (else (split (+ i 1) start acc)))))
-             (out (quote ())))
+(define (fold-dot-segments segs)
+  (let loop ((ss segs) (out '()))
     (cond
-      ((null? segs)
-       (if (null? out)
-           "/"
-           (apply string-append (map (lambda (s) (string-append "/" s)) (reverse out)))))
-      ((or (string=? (car segs) "") (string=? (car segs) "."))
-       (loop (cdr segs) out))
-      ((string=? (car segs) "..")
-       (loop (cdr segs) (if (null? out) out (cdr out))))
-      (else (loop (cdr segs) (cons (car segs) out))))))
+      ((null? ss) (reverse out))
+      ((string=? (car ss) ".") (loop (cdr ss) out))
+      ((string=? (car ss) "..") (loop (cdr ss) (if (null? out) out (cdr out))))
+      (else (loop (cdr ss) (cons (car ss) out))))))
 
-(define (path-join base segs)
-  (if (null? segs)
-      base
-      (path-join (if (string=? base "/")
-                     (string-append "/" (car segs))
-                     (string-append base "/" (car segs)))
-                 (cdr segs))))
+(define (jfile-fold-dots-for windows? p)
+  (path-rebuild (path-root windows? p)
+                (fold-dot-segments (path-segments windows? p))))
 
 ;; The JVM canonicalizes a path whose tail does not exist -- on a host where
 ;; /tmp is a link, new File("/tmp/nope").getCanonicalPath is
 ;; "/private/tmp/nope" -- while realpath(3) fails outright on ENOENT. So
 ;; resolve the longest existing ancestor and re-attach what is left.
-(define (jfile-canonical p)
-  (let ((abs (jfile-abs p)))
-    (or (jfile-realpath abs)
-        (let loop ((dir (path-parent abs)) (tail (list (path-last-segment abs))))
+;; REALPATH is a parameter (#f-answering, like jfile-realpath) so the walk can
+;; be driven from a test without a filesystem, and so the Windows rows -- where
+;; the host has no realpath at all and this is the entire implementation -- are
+;; reachable from a POSIX host.
+(define (jfile-canonical-for windows? realpath p)
+  (or (realpath p)
+      (let* ((root (path-root windows? p))
+             (segs (path-segments windows? p)))
+        (let loop ((n (- (length segs) 1)))
           (cond
-            ((not dir) (jfile-fold-dots abs))
-            ((jfile-realpath dir)
-             => (lambda (rp) (jfile-fold-dots (path-join rp tail))))
-            (else (loop (path-parent dir) (cons (path-last-segment dir) tail))))))))
+            ((< n 0) (jfile-fold-dots-for windows? p))
+            (else
+             (let ((rp (realpath (path-rebuild root (list-head segs n)))))
+               (if rp
+                   (jfile-fold-dots-for
+                    windows?
+                    (path-rebuild (path-root windows? rp)
+                                  (append (path-segments windows? rp)
+                                          (list-tail segs n))))
+                   (loop (- n 1))))))))))
+
+(define (jfile-canonical p)
+  (jfile-canonical-for (eq? (sa-os-family) 'windows) jfile-realpath (jfile-abs p)))
 
 ;; --- file metadata over Chez filesystem ops ---------------------------------
 ;; byte size of a regular file (0 for a directory or a missing file).

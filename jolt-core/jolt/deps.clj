@@ -216,6 +216,12 @@
 (defn- windows? []
   (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "win"))
 
+;; native-path-kind-for against the RUNNING host, public because the same line
+;; has to be drawn outside the resolver: jolt.main classifies the FILE argument
+;; with it. Recognizing only the POSIX root there read `jolt C:/x/hello.clj` as
+;; project-relative and tried to open "./C:/x/hello.clj" (jolt-lang/jolt#992).
+(defn path-kind [p] (native-path-kind-for (windows?) p))
+
 (defn- windows-drive-prefix? [p]
   (and (>= (count p) 2)
        (ascii-alpha? (nth p 0))
@@ -1013,6 +1019,39 @@
                    (let [paths (vec (sort (mapcat cands native-platform-keys)))]
                      (if (seq paths) paths (dissoc spec :jolt.deps/root))))])))
 
+;; Reconcile two declarations of the same library instead of dropping the second.
+;; dedup-by is winner-takes-all, and the project's own specs come first — so an
+;; app that only wanted to ADD the :windows candidates a dependency is missing
+;; had to restate that dependency's :darwin and :linux lists verbatim, or break
+;; those platforms instead (jolt-lang/jolt#989). The winner still wins every key
+;; it declares; a later spec only fills in the platform keys the winner is
+;; silent about, and the root those filled-in candidates resolve against travels
+;; with them, so a dependency's relative "native/libfoo.so" still resolves
+;; against that dependency rather than against whoever won the identity.
+(defn- overlay-native [a b]
+  (reduce (fn [acc k]
+            (if (or (contains? acc k) (not (contains? b k)))
+              acc
+              (let [acc (assoc acc k (get b k))]
+                (if-let [r (:jolt.deps/root b)]
+                  (assoc acc :jolt.deps/roots (assoc (:jolt.deps/roots acc) k r))
+                  acc))))
+          a
+          native-platform-keys))
+
+(defn- reconcile-natives
+  "dedup-by native-key, but folding each dropped spec's unclaimed platform keys
+  into the one that kept the identity. First-inclusion order is preserved."
+  [specs]
+  (let [[order by-key]
+        (reduce (fn [[order by-key] spec]
+                  (let [k (native-key spec)]
+                    (if (contains? by-key k)
+                      [order (assoc by-key k (overlay-native (get by-key k) spec))]
+                      [(conj order k) (assoc by-key k spec)])))
+                [[] {}] specs)]
+    (mapv by-key order)))
+
 (defn- provides-entries
   "A deps.edn :jolt/provides map as provider-table rows: [install-ns lib class ...].
   lib is the declaring dependency's coordinate, or nil for the project's own."
@@ -1788,13 +1827,15 @@
       ;; (When bb.edn IS the project config the second merge is a no-op.)
       :tasks (not-empty (merge (:tasks edn) (:tasks bb-edn)))
       ;; the project's own specs are rooted at the project, the deps' at their own
-      ;; deps.edn's directory (resolve-deps attached those). Deduped by
+      ;; deps.edn's directory (resolve-deps attached those). Reconciled by
       ;; native-key, which does not read the root — two deps naming the same lib
-      ;; still reconcile to one load, keeping the first one's root.
-      :natives (dedup-by native-key
-                         (concat (map #(assoc % :jolt.deps/root project-dir)
-                                      (:jolt/native edn))
-                                 dep-natives))
+      ;; still reconcile to one load, keeping the first one's root, and each
+      ;; platform key the first is silent about is filled in from the others
+      ;; along with the root it was declared under.
+      :natives (reconcile-natives
+                 (concat (map #(assoc % :jolt.deps/root project-dir)
+                              (:jolt/native edn))
+                         dep-natives))
       ;; the project's own vouched-for defs first, then every dep's, deduped —
       ;; `jolt build --tree-shake` hands the union to the bail scan. The
       ;; project's list is where an app allows a site in a library that has
@@ -1896,8 +1937,8 @@
        (jolt.host/set-source-roots! (into current added)))
      (when (seq natives)
        (info "added deps declare :jolt/native libraries (not auto-loaded): "
-             (pr-str (mapv #(dissoc % :jolt.deps/root)
-                           (dedup-by native-key natives)))))
+             (pr-str (mapv #(dissoc % :jolt.deps/root :jolt.deps/roots)
+                           (reconcile-natives natives)))))
      added)))
 
 (defn- required-host
