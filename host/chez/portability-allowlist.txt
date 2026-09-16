@@ -33,6 +33,7 @@ host/chez/scheme-adapter-runtime.ss maximum-memory-bytes
 host/chez/scheme-adapter-runtime.ss open-process-ports
 host/chez/scheme-adapter-runtime.ss real-time
 host/chez/scheme-adapter-runtime.ss statistics
+host/chez/scheme-adapter-runtime.ss string-copy!
 host/chez/scheme-adapter-runtime.ss top-level-bound?
 host/chez/scheme-adapter-runtime.ss top-level-value
 host/chez/scheme-adapter-runtime.ss unlock-object

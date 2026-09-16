@@ -1419,7 +1419,7 @@
                 (if (and (fx=? off 0) (fx=? cnt (string-length v)))
                     (string-copy v)
                     (let ((out (make-string cnt)))
-                      (string-copy! v off out 0 cnt)
+                      (sa-string-copy-range! out 0 v off (fx+ off cnt))
                       out)))
                ((and ok? (vector? v))
                 (let ((out (make-string cnt)))
