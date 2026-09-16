@@ -1931,6 +1931,16 @@
       (list iface)))
   jolt-nil)
 
+(define (protocol-miss-throw proto-name method-name obj)
+  (throw-jvm
+    'IllegalArgumentException
+    (string-append "No implementation of method: :" method-name
+      " of protocol: #'" proto-name " found for class: "
+      (if (jolt-nil? obj)
+          "nil"
+          (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
+            (if (string? n) n "?"))))))
+
 (define (protocol-resolve proto-name method-name obj)
   (cond
     ((and (jrec? obj)
@@ -1950,18 +1960,14 @@
            (let loop ((tags (value-host-tags obj)))
              (cond
                ((null? tags)
-                (throw-jvm
-                  'IllegalArgumentException
-                  (string-append "No reified method " method-name)))
+                (protocol-miss-throw proto-name method-name obj))
                ((find-protocol-method (car tags) proto-name method-name))
                (else (loop (cdr tags))))))))
     (else
      (let loop ((tags (value-host-tags obj)))
        (cond
          ((null? tags)
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " in " proto-name)))
+          (protocol-miss-throw proto-name method-name obj))
          ((find-protocol-method (car tags) proto-name method-name))
          (else (loop (cdr tags))))))))
 
