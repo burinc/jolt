@@ -95,6 +95,23 @@
               (if (re-find #"noSuchMethod" (ex-message e)) :threw :wrong-message)))))
 
 
+;; Arrays. SCI's aset on a primitive array is clojure.lang.RT/aset (its own aset*
+;; reflects there for a primitive component type), its 2-argument get is
+;; RT/get in newer releases, and its fn adapters cast through RT/longCast: the
+;; clojure.lang.RT value statics are what interpreted code compiles to. jolt had
+;; none of that family, so (aset ^longs a i v) inside SCI died with "No matching
+;; field or method: clojure.lang.RT/aset" (jolt-fn00).
+(let [ctx (sci/init {})]
+  (check= "aset on a long array inside SCI" 5
+          (sci/eval-string* ctx "(let [a (long-array 2)] (aset a 0 5) (aget a 0))"))
+  (check= "aset on a double array inside SCI" 2.5
+          (sci/eval-string* ctx "(let [a (double-array 2)] (aset a 1 2.5) (aget a 1))"))
+  (check= "aset on an object array inside SCI" :x
+          (sci/eval-string* ctx "(let [a (object-array 2)] (aset a 0 :x) (aget a 0))"))
+  (check= "RT/get and RT/aset by name, as an interpreted call site reaches them" [1 :nf 7]
+          (sci/eval-string* (sci/init {:classes {'clojure.lang.RT clojure.lang.RT}})
+            "[(clojure.lang.RT/get {:a 1} :a) (clojure.lang.RT/get {} :a :nf) (let [a (long-array 1)] (clojure.lang.RT/aset a 0 7) (aget a 0))]")))
+
 ;; Type-hinted interop. SCI resolves a ^Hint to a Class at ANALYSIS time and
 ;; asks that Class whether it is a functional interface to adapt
 ;; (sci.impl.analyzer/resolve-tag-class -> reflector/maybe-fi-method ->

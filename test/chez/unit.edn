@@ -532,6 +532,20 @@
   {:suite "insttime" :expr "(str (LocalDate/of 2020 3 5))" :expected "\"2020-03-05\""}
   {:suite "insttime" :expr "(.toMillis (Duration/between (Instant/ofEpochMilli 0) (Instant/ofEpochMilli 5000)))" :expected "5000"}
   {:suite "insttime" :expr "(.toEpochMilli (Instant/parse \"2020-01-01T00:00:00Z\"))" :expected "1577836800000"}
+  ;; A java.time.Instant is an inst through clojure.core's Inst protocol, which
+  ;; jolt.time extends when it loads (core_instant18.clj's extension on the JVM).
+  ;; It used to be a host check on the value's tag that truncated toward zero, so
+  ;; a pre-1970 instant with sub-millisecond nanos was one millisecond off
+  ;; toEpochMilli, which floors: -1s + 1ns is -1000ms, not -999.
+  {:suite "insttime" :expr "[(inst? (Instant/ofEpochMilli 5)) (satisfies? Inst (Instant/ofEpochMilli 5)) (inst-ms (Instant/ofEpochMilli 5)) (inst-ms* (Instant/ofEpochMilli 5))]" :expected "[true true 5 5]"}
+  {:suite "insttime" :expr "[(inst-ms (Instant/ofEpochSecond -1 1)) (.toEpochMilli (Instant/ofEpochSecond -1 1))]" :expected "[-1000 -1000]"}
+  {:suite "insttime" :expr "[(inst? (LocalDate/of 2020 3 5)) (inst? (Duration/ofSeconds 1))]" :expected "[false false]"}
+  ;; satisfies? memoizes its extended walk by the value's tag LIST object. A
+  ;; java.time value's tags come from the library's own class registration, a
+  ;; fresh list per call in set order, so LocalDate and LocalTime share a first
+  ;; tag; keyed by that tag, one answered for the other (tick's new-interval
+  ;; called beginning on a LocalTime). Keyed by the list, neither can.
+  {:suite "insttime" :expr "(do (defprotocol Qsm (qsm [x])) (extend-protocol Qsm java.time.LocalDate (qsm [x] :d)) [(satisfies? Qsm (LocalTime/of 1 0)) (satisfies? Qsm (LocalDate/of 2020 1 1)) (satisfies? Qsm (LocalTime/of 2 0)) (satisfies? Qsm (LocalDate/of 2021 1 1))])" :expected "[false true false true]"}
   {:suite "insttime" :expr "(str (Duration/ofSeconds 90))" :expected "\"PT1M30S\""}
   {:suite "insttime" :expr "(.getMonths (Period/of 1 2 3))" :expected "2"}
   {:suite "insttime" :expr "(str (Year/of 2024))" :expected "\"2024\""}

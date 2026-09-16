@@ -132,6 +132,10 @@
     (hashtable-delete! clone-registry type-tag)))
 
 (define (prune-type-registry! keep?)
+  ;; a registry change like any other to the caches keyed on the epoch (the
+  ;; PICs, satisfies?'s memo): a tag a later definition reuses must not find a
+  ;; pruned type's answer
+  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -841,6 +845,9 @@
 (define (register-inline-protocol! type-name proto-name)
   (let ((tag (string-append (chez-current-ns) "." type-name)))
     (jolt-with-mutex rec-tbl-mu
+      ;; the type gains a protocol: an epoch bump like a method registration,
+      ;; so a memoized satisfies? (records-dispatch.ss) re-asks
+      (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
       (let ((ti (or (hashtable-ref type-registry tag #f)
                     (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry tag h) h))))
         (unless (hashtable-ref ti proto-name #f)

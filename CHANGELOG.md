@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`clojure.core/Inst` is the reference's protocol.** `inst?` and `inst-ms` were
+  two host checks over the `#inst` representation (plus a tag probe for a
+  `java.time.Instant`), so `(extend-protocol Inst MyType ...)` changed nothing,
+  a miss said `inst-ms requires an inst`, and SCI 0.15+, which builds its
+  `clojure.core/Inst` entry from the var at load, could not load at all. `Inst`
+  is now `defprotocol`'d in the seed with `inst-ms*` as its method, `inst-ms`
+  calls it, `inst?` is `satisfies?`, and it is extended to `java.util.Date` (the
+  class every `#inst` and `java.sql` date reports) in core and to
+  `java.time.Instant` by `jolt.time` when it loads, as `core_instant18.clj`
+  does on the JVM. A pre-1970 `Instant` with sub-millisecond nanos read one
+  millisecond high (the tag probe truncated toward zero; `toEpochMilli` floors).
+- **`clojure.lang.RT`'s value statics.** `get`, `nth`, `count`, `seq`, `first`,
+  `next`, `more`, `cons`, `conj`, `assoc`, `dissoc`, `contains`, `find`, `keys`,
+  `vals`, `peek`, `pop`, `subvec`, `aget`, `aset`, `alength`, the primitive
+  casts, `isReduced`, `list`, `vector` and `set` — what the reference's inlined
+  core fns compile to, and what an interpreter reaches for by name: SCI's `aset`
+  on a primitive array is `RT/aset`, so `(aset ^longs a i v)` inside SCI died
+  with `No matching field or method: clojure.lang.RT/aset`, and its newer
+  releases rewrite a two-argument `get` to `RT/get`. Each is the core fn it
+  stands for; `RT/set` checks duplicates like `PersistentHashSet/createWithCheck`,
+  whose own duplicate throw is now the JVM's `IllegalArgumentException` rather
+  than an `ex-info`. Certified against Clojure 1.12.5.
+
+### Changed
+
+- **`satisfies?` memoizes its extended walk.** For a value that is not a record
+  implementing the protocol inline, `satisfies?` walked every tag of the value's
+  class through the protocol registry on every call — twenty string lookups for
+  a map. The walk's answer is a function of the value's concrete tag, so it is
+  now kept per (protocol, tag list) — keyed by the list object the class graph
+  hands out, so a value whose tags are built per call (a library's registered
+  class, whose tags come in set order and share a first element with its
+  siblings) never answers for another — and stamped with the protocol
+  registry's and the class graph's epochs, invalidated by any registration,
+  prune or inline marker the way the per-site dispatch caches are. On a map,
+  1243 → 368 ns; on a string, 382 → 332; on a record, 299 → 281. This is also
+  what keeps `inst?`, now the reference's `(satisfies? Inst x)`, from costing
+  the whole walk: ~370 ns on a map against 155 for the tag probe it replaced
+  (the probe could not see an extension; the difference is the protocol
+  answer).
 - **A protocol dispatch miss is worded as the reference words it.** Calling a
   protocol method on a value nothing extends raised `No method area in
   user/Shape`; the reference's `emit-method-builder` raises `No implementation
