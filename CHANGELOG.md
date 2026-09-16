@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at realistic scale. An inlined direct *call* is the separate closed-world
   freeze and is unchanged; `^:dynamic` / `^:redef` still opt out of
   direct-linking. (#1009)
+- **Multi-arity dispatch takes an exact fixed arity over a variadic one that
+  also accepts the count, whichever was declared first.** `emit-fn` built its
+  `case-lambda` in declared order and Chez selects the first accepting clause,
+  so `((fn ([a b & r] :var) ([a b] :fixed)) 1 2)` answered `:var` where the JVM
+  answers `:fixed`. The fixed clauses are emitted first and the variadic one
+  last; a fixed arity above the variadic threshold is a JVM compile error, so
+  the only legal overlap is equality and the order reproduces JVM selection on
+  every legal input. Declared order is kept for `:arglists` and the variadic
+  registration. (#1023)
 - **A protocol dispatch miss is worded as the reference words it.** Calling a
   protocol method on a value nothing extends raised `No method area in
   user/Shape`; the reference's `emit-method-builder` raises `No implementation

@@ -123,6 +123,10 @@
 (check "(bit-or 1 2 4)" "7")
 (check "(do (defn f2 ([x y] [x y]) ([x y & more] [x y more])) [(f2 1 2) (f2 1 2 3) (apply f2 1 2 [3 4]) (apply f2 1 [2])])"
        "[[1 2] [1 2 (3)] [1 2 (3 4)] [1 2]]")
+;; the same pair declared variadic-first: the emitter orders the fixed clause
+;; ahead of the variadic one before the merge reads them by position
+(check "(do (defn f3 ([x y & more] [x y more]) ([x y] [x y])) [(f3 1 2) (f3 1 2 3) (apply f3 1 [2]) (apply f3 1 2 [3 4])])"
+       "[[1 2] [1 2 (3)] [1 2] [1 2 (3 4)]]")
 ;; for-all / real->flonum (prelude-shims), the chunk builder (natives-transduce.ss)
 (check "(seq (chunk-first (seq (vec (range 40)))))"
        "(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)")

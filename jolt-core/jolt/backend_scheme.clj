@@ -2256,6 +2256,27 @@
                            (str "(if jolt-fn-identity-probe " id-nm " " (nth c 1) ")")])
                         clauses)
                   clauses)
+        ;; Clojure's exact fixed arity wins over a variadic arity that also accepts
+        ;; the count; Chez's case-lambda takes the FIRST clause that accepts, so a
+        ;; variadic clause declared before a colliding fixed one shadows it, and a
+        ;; call that the JVM routes to the fixed arity lands in the variadic one.
+        ;;
+        ;; A fixed arity can never exceed the variadic threshold (the JVM rejects
+        ;; that outright: "Can't have fixed arity function with more params than
+        ;; variadic function") nor equal another fixed arity, so the only legal
+        ;; overlap is equality -- exactly the case the JVM resolves toward the fixed
+        ;; clause. Fixed clauses first and the single variadic clause last therefore
+        ;; reproduces JVM selection on every legal input.
+        ;;
+        ;; Reordered on the EMITTED clauses only: `arities` keeps declared order for
+        ;; :arglists and the variadic registration below, and emitting in the
+        ;; original order leaves label allocation (the jfn$/fnvar names) untouched.
+        ;; From here on a variadic clause, if there is one, is LAST in `clauses`.
+        clauses (let [variadic? (mapv (fn [a] (boolean (:rest a))) arities)
+                      fixed     (keep-indexed (fn [i c] (when-not (nth variadic? i) c))
+                                              clauses)]
+                  (into (vec fixed)
+                        (keep-indexed (fn [i c] (when (nth variadic? i) c)) clauses)))
         ;; Gambit's case-lambda expander (lib/_nonstd.scm ##case-lambda, 4.9.7
         ;; and 4.9.8) appends the rest parameter to the generated lambda's formals
         ;; only when some clause has OPTIONAL parameters — and the two-clause fn
@@ -2268,15 +2289,17 @@
         ;; behaviour under jolt-apply's boxed lazy rest (a one-element list, so
         ;; the variadic body's jolt-rest-seq unwraps it). Nothing else changes —
         ;; a third clause, or a variadic with more required params, expands fine.
+        ;; The reorder above put the fixed clause first and the variadic one
+        ;; last, whichever order they were declared in, so the clauses are read
+        ;; by that position.
         gambit-merge (when (and (= :gambit (target)) (= 2 (count arities)))
                        (let [[a b] arities
                              fixed (cond (and (:rest a) (not (:rest b))) b
                                          (and (:rest b) (not (:rest a))) a)
                              variadic (if (= fixed a) b a)]
                          (when (and fixed (= (count (:params fixed)) (count (:params variadic))))
-                           (let [fi (if (= fixed a) 0 1)
-                                 fbody (nth (nth clauses fi) 1)
-                                 [vformals vbody] (nth clauses (- 1 fi))
+                           (let [fbody (nth (nth clauses 0) 1)
+                                 [vformals vbody] (nth clauses 1)
                                  fps (map munge-name (:params fixed))
                                  vps (map munge-name (:params variadic))
                                  fbody (if (= fps vps)
