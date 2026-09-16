@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produces for the same program — and the `scifunctional` gate now pins both
   next to the supported recipe. (#1006)
 
+- **`line-seq` over a reader is lazy.** It drained the reader whole and split
+  the string, so the first line was not visible until the last had been read —
+  only latency over a file, a hang over a reader whose producer has not stopped
+  (an SSE body, a tailed log, a pipe). It now reads one `readLine` per element,
+  as the JVM's does; the elements are unchanged, since every reader answers
+  `readLine` with the same `\n` / `\r` / `\r\n` rule the drain applied. (#1007)
+
 ## [0.8.8] - 2026-09-15
 
 The theme is SCI on jolt. An embedded interpreter could not evaluate protocol
@@ -5078,7 +5085,6 @@ read after the syscall rather than at it.
   a reason it cannot be one. `certify.clj` verifies the JVM side, `make
   documented` the jolt side, and both reject an entry whose two sides agree.
 
-
 ## [0.7.28] - 2026-08-27
 
 Two things a namespace does constantly — name a class and read a form — were
@@ -8921,7 +8927,6 @@ parser, through a shim registering the commons-fileupload2 class surface ring
 reaches for. The shim is glue: it decides nothing about multipart syntax, which
 is what keeps the suite worth running.
 
-
 ## [0.5.20] - 2026-08-02
 
 A backtrace could show frames from calls that had already finished, and in the
@@ -9116,7 +9121,6 @@ colliding UUIDs, and the UUIDs were guessable even once they were unique.
   means forgeable. Bytes now come from `/dev/urandom`, or `BCryptGenRandom` /
   `RtlGenRandom` on Windows. If a host offers no entropy source at all the
   fallback says so on stderr rather than degrading quietly.
-
 
 - **`(java.util.Random.)` with no seed never worked.** It seeded from
   `(truncate (current-time))`, and `current-time` answers a time object rather
