@@ -40,10 +40,9 @@ ldr-apply-readers
 #
 # The accessors behind the value predicates rt-core.ss answers #f for: an
 # inst, a BigDecimal, an array and a host reader cannot be built here, so the
-# arms that read them (inst-ms, format's %f, the array class tags, the reader
+# arms that read them (format's %f, the array class tags, the reader
 # protocols in post-prelude.ss and clojure.edn/read) are never entered.
 inst-rfc3339
-jinst-ms
 jbigdec->string
 jbigdec-scale
 jbigdec-unscaled

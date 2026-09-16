@@ -1366,6 +1366,7 @@
     (hashtable-delete! clone-registry type-tag)))
 
 (define (prune-type-registry! keep?)
+  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -1554,11 +1555,35 @@
                       acc
                       (cons t acc)))))))))
 
+(define jch-tags-plus-cache
+  (make-hashtable string-hash string=?))
+
 (define (jch-tags-plus name extra)
-  (let ((ts (jch-tags name)))
-    (if (or (null? ts) (null? (cdr ts)))
-        (append ts extra)
-        (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+  (let ((e (hashtable-ref jch-tags-plus-cache name #f)))
+    (if (and e (fx= (car e) jch-graph-epoch))
+        (cdr e)
+        (let* ((epoch jch-graph-epoch)
+               (ts (jch-tags name))
+               (result (if (or (null? ts) (null? (cdr ts)))
+                           (append ts extra)
+                           (cons
+                             (car ts)
+                             (cons (cadr ts) (append extra (cddr ts)))))))
+          (jolt-with-mutex
+            jch-cache-mutex
+            (when (fx= epoch jch-graph-epoch)
+              (hashtable-set!
+                jch-tags-plus-cache
+                name
+                (cons epoch result))))
+          result))))
+
+(define (graph-owned-tags? tags)
+  (and (pair? tags)
+       (let ((head (car tags)))
+         (or (eq? tags (jch-tags head))
+             (let ((e (hashtable-ref jch-tags-plus-cache head #f)))
+               (and e (eq? tags (cdr e))))))))
 
 (define (value-host-tags obj)
   (cond
@@ -1900,6 +1925,7 @@
   (let ((tag (string-append (chez-current-ns) "." type-name)))
     (jolt-with-mutex
       rec-tbl-mu
+      (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
       (let ((ti (or (hashtable-ref type-registry tag #f)
                     (let ((h (make-hashtable string-hash string=?)))
                       (hashtable-set! type-registry tag h)
@@ -1931,6 +1957,16 @@
       (list iface)))
   jolt-nil)
 
+(define (protocol-miss-throw proto-name method-name obj)
+  (throw-jvm
+    'IllegalArgumentException
+    (string-append "No implementation of method: :" method-name
+      " of protocol: #'" proto-name " found for class: "
+      (if (jolt-nil? obj)
+          "nil"
+          (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
+            (if (string? n) n "?"))))))
+
 (define (protocol-resolve proto-name method-name obj)
   (cond
     ((and (jrec? obj)
@@ -1950,18 +1986,14 @@
            (let loop ((tags (value-host-tags obj)))
              (cond
                ((null? tags)
-                (throw-jvm
-                  'IllegalArgumentException
-                  (string-append "No reified method " method-name)))
+                (protocol-miss-throw proto-name method-name obj))
                ((find-protocol-method (car tags) proto-name method-name))
                (else (loop (cdr tags))))))))
     (else
      (let loop ((tags (value-host-tags obj)))
        (cond
          ((null? tags)
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " in " proto-name)))
+          (protocol-miss-throw proto-name method-name obj))
          ((find-protocol-method (car tags) proto-name method-name))
          (else (loop (cdr tags))))))))
 
@@ -2805,6 +2837,8 @@
 
 (define arm-priority-getclass 5)
 
+(define arm-priority-monitor 5)
+
 (define arm-priority-string 6)
 
 (define arm-priority-dotform 30)
@@ -2951,8 +2985,10 @@
       (if (instance-check proto obj) #t #f)
       (jolt-satisfies-protocol? proto obj)))
 
+(define kw-proto-name (keyword #f "name"))
+
 (define (jolt-satisfies-protocol? proto obj)
-  (let* ((pn (jolt-get proto (keyword #f "name") jolt-nil))
+  (let* ((pn (jolt-get proto kw-proto-name jolt-nil))
          (pn-str (if (symbol-t? pn) (symbol-t-name pn) pn)))
     (unless (string? pn-str)
       (throw-jvm
@@ -2973,11 +3009,43 @@
                   (jreify-protos obj))
                 #t))
           (else #f))
-        (let loop ((tags (value-host-tags obj)))
-          (cond
-            ((null? tags) #f)
-            ((type-satisfies? (car tags) pn-str) #t)
-            (else (loop (cdr tags))))))))
+        (let* ((tags (value-host-tags obj))
+               (memo (satisfies-memo-ref pn-str tags)))
+          (if memo
+              (vector-ref memo 2)
+              (let* ((pe jolt-proto-epoch)
+                     (ge jch-graph-epoch)
+                     (ans (let loop ((tags tags))
+                            (cond
+                              ((null? tags) #f)
+                              ((type-satisfies? (car tags) pn-str) #t)
+                              (else (loop (cdr tags)))))))
+                (satisfies-memo-set! pn-str tags pe ge ans)
+                ans))))))
+
+(define satisfies-memo
+  (make-hashtable string-hash string=?))
+
+(define (satisfies-memo-ref pn tags)
+  (let ((inner (hashtable-ref satisfies-memo pn #f)))
+    (and inner
+         (let ((e (hashtable-ref inner tags #f)))
+           (and e
+                (fx= (vector-ref e 0) jolt-proto-epoch)
+                (fx= (vector-ref e 1) jch-graph-epoch)
+                e)))))
+
+(define (satisfies-memo-set! pn tags pe ge ans)
+  (when (graph-owned-tags? tags)
+    (jolt-with-mutex
+      jch-cache-mutex
+      (when (and (fx= pe jolt-proto-epoch)
+                 (fx= ge jch-graph-epoch))
+        (let ((inner (or (hashtable-ref satisfies-memo pn #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! satisfies-memo pn t)
+                           t))))
+          (hashtable-set! inner tags (vector pe ge ans)))))))
 
 (define (last-dot s)
   (let loop ((i (- (string-length s) 1)))
@@ -2994,7 +3062,7 @@
     (else (memp pred (cdr lst)))))
 
 (define (extenders proto)
-  (let* ((pn (jolt-get proto (keyword #f "name") jolt-nil))
+  (let* ((pn (jolt-get proto kw-proto-name jolt-nil))
          (pn-str (if (symbol-t? pn) (symbol-t-name pn) pn))
          (out '()))
     (vector-for-each

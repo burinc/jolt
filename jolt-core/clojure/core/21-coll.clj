@@ -229,11 +229,6 @@
         m (if-let [d (ex-data root)] (assoc m :data d) m)]
     (if-let [phase (:clojure.error/phase (ex-data o))] (assoc m :phase phase) m)))
 
-;; inst-ms: epoch milliseconds of an instant; throws on a non-inst (Clojure
-;; protocol behavior).
-(defn inst-ms [x]
-  (if (inst? x) (get x :ms) (throw (IllegalArgumentException. (str "inst-ms requires an inst, got: " x)))))
-
 ;; Clojure 1.11 map transformers. An empty-map base keeps insertion order;
 ;; transformed keys canonicalize via assoc (collisions: last entry in seq order
 ;; wins, matching the reference).
