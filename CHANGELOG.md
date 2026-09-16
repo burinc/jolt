@@ -31,24 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stands for; `RT/set` checks duplicates like `PersistentHashSet/createWithCheck`,
   whose own duplicate throw is now the JVM's `IllegalArgumentException` rather
   than an `ex-info`. Certified against Clojure 1.12.5.
-
-### Changed
-
-- **`satisfies?` memoizes its extended walk.** For a value that is not a record
-  implementing the protocol inline, `satisfies?` walked every tag of the value's
-  class through the protocol registry on every call — twenty string lookups for
-  a map. The walk's answer is a function of the value's concrete tag, so it is
-  now kept per (protocol, tag list) — keyed by the list object the class graph
-  hands out, so a value whose tags are built per call (a library's registered
-  class, whose tags come in set order and share a first element with its
-  siblings) never answers for another — and stamped with the protocol
-  registry's and the class graph's epochs, invalidated by any registration,
-  prune or inline marker the way the per-site dispatch caches are. On a map,
-  1243 → 368 ns; on a string, 382 → 332; on a record, 299 → 281. This is also
-  what keeps `inst?`, now the reference's `(satisfies? Inst x)`, from costing
-  the whole walk: ~370 ns on a map against 155 for the tag probe it replaced
-  (the probe could not see an extension; the difference is the protocol
-  answer).
 - **A protocol dispatch miss is worded as the reference words it.** Calling a
   protocol method on a value nothing extends raised `No method area in
   user/Shape`; the reference's `emit-method-builder` raises `No implementation
@@ -65,13 +47,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #'sci.impl.types/HasName found for class: nil`) — the strings the JVM
   produces for the same program — and the `scifunctional` gate now pins both
   next to the supported recipe. (#1006)
-
 - **`line-seq` over a reader is lazy.** It drained the reader whole and split
   the string, so the first line was not visible until the last had been read —
   only latency over a file, a hang over a reader whose producer has not stopped
   (an SSE body, a tailed log, a pipe). It now reads one `readLine` per element,
   as the JVM's does; the elements are unchanged, since every reader answers
   `readLine` with the same `\n` / `\r` / `\r\n` rule the drain applied. (#1007)
+
+### Changed
+
+- **`satisfies?` memoizes its extended walk.** For a value that is not a record
+  implementing the protocol inline, `satisfies?` walked every tag of the value's
+  class through the protocol registry on every call — twenty string lookups for
+  a map. The walk's answer is a function of the value's tag list, so it is now
+  kept per (protocol, tag list), keyed by the list object the class graph hands
+  out and stamped with the protocol registry's and the class graph's epochs,
+  invalidated by any registration, prune or inline marker the way the per-site
+  dispatch caches are. Only a list the graph keeps is stored: a value whose
+  tags are built per call (a record, a reify, a library's registered class —
+  whose tags come in set order and share a first element with its siblings)
+  never answers for another and is never cached, and the spliced list a number
+  reports is now cached by the graph too. Against `main` in one session: a miss
+  on a map 1210 → 308 ns, on a Long 556 → 253, on a string 324 → 248, on a
+  record unchanged. `inst?`, now the reference's `(satisfies? Inst x)`, is that
+  walk: 281 ns on a map and 229 on a Long against ~110 for the tag probe it
+  replaced (the probe could not see an extension; the difference is the
+  protocol answer).
 
 ## [0.8.8] - 2026-09-15
 
