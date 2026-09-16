@@ -14,7 +14,8 @@
 #
 # The fix was to do the filesystem work through filesystem calls (jolt.host
 # mkdirs!/rename-file!/delete-file!/delete-tree!/file-mtime/list-dir), leaving
-# the shell for the two things that really are external programs: git and unzip.
+# the shell for the one thing that really is an external program: git. Jars
+# extract in process through jolt.host/extract-zip! (jolt issue #988).
 # That distinction is invisible in the source — a `(sh (str "rm -f " …))` reads
 # exactly like a `(sh (str "git clone " …))` — so it is checked here rather than
 # left to whoever adds the next one to remember which host they are on.
@@ -28,9 +29,10 @@
 set -eu
 cd "$(dirname "$0")/../.."
 
-# The external programs jolt is allowed to run. Both are real dependencies with
-# no in-process equivalent (jolt has neither a git client nor an inflater).
-ALLOWED='git|unzip'
+# The external programs jolt is allowed to run: git, a real dependency with no
+# in-process equivalent (jolt has no git client). unzip left the list when jars
+# began to extract in process (jolt issue #988).
+ALLOWED='git'
 
 fail=0
 

@@ -21,7 +21,8 @@
   in both directions. Grenadine expands the dependency tree, builds effective
   POMs, and compares Maven versions; files are fetched by jolt itself over
   HTTPS (jolt.mvn-http);
-  git and unzip still shell out through jolt.host/sh (nothing here touches the JVM)."
+  git still shells out through jolt.host/sh, and jars extract through
+  jolt.host/extract-zip! (nothing here touches the JVM)."
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [grenadine.expander :as expander]
@@ -47,8 +48,9 @@
 ;; `rm -f`, `rm -rf`, `test -nt`, `find`), which is a POSIX assumption jolt.host/sh
 ;; does not carry: on Windows it runs the string through cmd.exe, where `mkdir -p
 ;; a/b` creates a directory named `-p` and the rest are not commands at all. Every
-;; one of these is now a filesystem call, so the only subprocesses left in this
-;; namespace are the two real external programs, git and unzip.
+;; one of these is now a filesystem call, so the only subprocess left in this
+;; namespace is the one real external program, git. Jars extract in process
+;; through jolt.host/extract-zip!.
 (defn- mkdirs! [p] (jolt.host/mkdirs! p))     ; mkdir -p; true if p ends up a dir
 (defn- rm-f [p] (jolt.host/delete-file! p))   ; absent is success
 (defn- rm-rf [p] (jolt.host/delete-tree! p))
@@ -560,7 +562,7 @@
 
 (defn- cache-fresh?
   "Is the extraction at `dir` still valid for `jar`? The `.jolt-ok` marker is
-  written after a successful unzip; it is stale once the jar is rebuilt/refetched
+  written after a successful extraction; it is stale once the jar is rebuilt/refetched
   (a SNAPSHOT, or the same coord re-installed into ~/.m2), so a jar whose mtime
   is later than the marker's re-extracts. The legacy JOLT_MVNLIBS layout keeps
   no jar, so its extraction is the only copy — trust it. A jar that has since
@@ -573,29 +575,30 @@
              (<= (file-mtime jar) (file-mtime ok))))))
 
 (defn- extract-jar!
-  "Unzip `jar` into `dir` (overwriting), marking `.jolt-ok` only on success so a
-  failed/partial unzip is never trusted as a complete extraction. A stale
-  `.jolt-ok` from a prior extraction is cleared first, so a failed re-extract
-  isn't left looking valid. Returns dir on success, nil on failure (a non-fatal
-  skip). The jar may live inside `dir` (the legacy JOLT_MVNLIBS layout), so `dir`
-  is not wiped."
+  "Extract `jar` into `dir` (overwriting) through jolt.host/extract-zip!, marking
+  `.jolt-ok` only on success so a failed/partial extraction is never trusted as
+  a complete one. A stale `.jolt-ok` from a prior extraction is cleared first, so
+  a failed re-extract isn't left looking valid. Returns dir on success, nil on
+  failure (a non-fatal skip). The jar may live inside `dir` (the legacy
+  JOLT_MVNLIBS layout), so `dir` is not wiped."
   [jar dir]
   (mkdirs! dir)
   (rm-f (str dir "/.jolt-ok"))
-  (if (zero? (sh (str "unzip -o -q " (pr-str jar) " -d " (pr-str dir))))
+  (if (jolt.host/extract-zip! jar dir)
     (do (touch! (str dir "/.jolt-ok")) dir)
     (do (warn "failed to extract " jar) nil)))
 
 (defn- extract-or-note!
   "extract-jar! that records a failed extraction as an unresolvable artifact.
-  The jar is on disk but its source cannot be materialized (unzip missing, disk
-  full) — a failure to OBTAIN the artifact, not a skip. Left silent, the
-  resolution completes without the dep's root and the cpcache persists the
-  degraded roots until the project's .jolt is deleted by hand."
+  The jar is on disk but its source cannot be materialized (not a whole zip
+  archive, an entry jolt refuses, disk full) — a failure to OBTAIN the artifact,
+  not a skip. Left silent, the resolution completes without the dep's root and
+  the cpcache persists the degraded roots until the project's .jolt is deleted
+  by hand."
   [jar dir coord version]
   (or (extract-jar! jar dir)
       (do (note-unresolvable! coord version
-                              (str jar " could not be extracted (is unzip installed?)"))
+                              (str jar " could not be extracted (not a whole zip archive, an entry jolt refuses, or the extraction failed)"))
           nil)))
 
 (defn- ensure-maven

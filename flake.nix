@@ -30,7 +30,6 @@
           version = self.shortRev or "dev";
           runtimePath = pkgs.lib.makeBinPath [
             pkgs.git
-            pkgs.unzip
           ];
           opensslLibraryPath = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
           cacertFile = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
@@ -75,10 +74,10 @@
             runHook postInstall
           '';
 
-          # jolt.deps invokes git and unzip; jolt.mvn-http dlopens OpenSSL at
-          # fetch time through the JOLT_OPENSSL_LIBDIR seam (its macOS built-in
-          # candidates are Homebrew paths, so no loader-path variable could
-          # cover Darwin). Pin all of them to the Nix package closure.
+          # jolt.deps invokes git (jars extract in process); jolt.mvn-http
+          # dlopens OpenSSL at fetch time through the JOLT_OPENSSL_LIBDIR seam
+          # (its macOS built-in candidates are Homebrew paths, so no loader-path
+          # variable could cover Darwin). Pin both to the Nix package closure.
           postFixup = ''
             wrapProgram "$out/bin/jolt" \
               --prefix PATH : "${runtimePath}" \
@@ -128,7 +127,6 @@
 
             # Jolt deps.edn support
             pkgs.git
-            pkgs.unzip
             pkgs.openssl
 
             # Chez/Jolt native-link dependencies

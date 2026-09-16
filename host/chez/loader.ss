@@ -2142,7 +2142,8 @@
 ;; never published, and the classpath cache never hit. Same failure the AOT
 ;; cache hit (aot-mkdir-p above); these are the native equivalents, so the
 ;; resolver never spawns a shell for something the filesystem API does. Only
-;; git and unzip stay subprocesses — those are real external programs.
+;; git stays a subprocess — it is a real external program. Jars extract in
+;; process through extract-zip! below.
 ;;
 ;; A Windows path can arrive with backslashes (a %TEMP%- or %HOME%-derived one
 ;; does), and the separator-splitting walks below know only "/" — which Windows

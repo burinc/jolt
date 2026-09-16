@@ -97,7 +97,7 @@ yn "5: ...and no error/stacktrace" "$(printf '%s' "$out11" | grep -qi 'exception
 
 # 6. a resolution that FAILED to materialize an artifact is never cached.
 #    A :local/root jar that cannot be extracted (corrupt zip — same machinery
-#    as a missing unzip or a full disk) must fail resolution loudly, not
+#    as a cut download or a full disk) must fail resolution loudly, not
 #    silently drop the root; and once the jar is fixed IN PLACE (the cache
 #    material doesn't fold jar bytes) the next run must resolve it, which it
 #    can only do if the degraded result was never written.

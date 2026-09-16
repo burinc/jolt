@@ -108,8 +108,8 @@ make remint                   # iterates host/chez/bootstrap.ss to a byte-fixpoi
 ```
 
 Resolving a project's `deps.edn` needs `git` for git deps, and OpenSSL
-(`libssl`/`libcrypto`, loaded via FFI) plus `unzip` for Maven deps — jolt
-downloads and resolves those itself, with no `curl` and no Java. A dependency
+(`libssl`/`libcrypto`, loaded via FFI) for Maven deps — jolt downloads, resolves
+and extracts those itself, with no `curl`, no `unzip` and no Java. A dependency
 that can't be fetched is skipped, never fatal. See
 [Getting Started](https://jolt-lang.github.io/docs/getting-started.html) for the
 per-platform packages and [deps.edn internals](https://jolt-lang.github.io/docs/tools-deps.html)
