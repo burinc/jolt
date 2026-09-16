@@ -1539,7 +1539,7 @@
              (walk-atom
               (lambda (x path)
                 (if rebuild?
-                    (let ((nx (make-jolt-atom jolt-nil '() jolt-nil (make-mutex))))
+                    (let ((nx (make-jolt-atom jolt-nil '() jolt-nil #f)))
                       (hashtable-set! memo x nx)
                       (image-meta-copy! x nx)
                       (jolt-atom-val-set! nx (walk (jolt-atom-val x) (cons "@" path)))

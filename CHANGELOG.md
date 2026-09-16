@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constant too), so `(identical? (f) (f))` for a `(defn f [] #"a+")` answers
   true and two sites reading alike stay distinct, as on the JVM (four
   certified corpus rows).
+- **Atoms are lock-free.** Every transition — `swap!`, `reset!`,
+  `compare-and-set!`, the `-vals!` pair, `add-watch`/`remove-watch` — is a
+  compare-and-swap on the record field, the JVM's `AtomicReference` shape;
+  the per-atom mutex (a malloc'd pthread mutex and a collector guardian for
+  every atom made) is gone, and the field it filled stays `#f` so the record
+  layout an image carries is unchanged. `(atom x)` 101 → 21 ns, `reset!` 64 →
+  33, `swap! inc` 72 → 39, `compare-and-set!` 54 → 23; eight threads each
+  swapping their own atom run 2.7x slower per thread than one, from 20x before
+  the metadata fix and 2.8x after it.
 - **Four process-wide locks on hot single-value paths are gone, and parallel
   Clojure code scales again.** Eight threads each working on their OWN values
   ran far slower per thread than one: `assoc` 32x, `swap!` 21x, `str` of an
