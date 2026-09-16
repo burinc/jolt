@@ -176,11 +176,17 @@
 ;; append's 3-arg (x, start, end) form and setLength/insert/delete are left to the
 ;; generic path: they are not hot and the range checks are worth more than the
 ;; nanoseconds.
+;;
+;; The 1-arg body is sb-piece, NOT render-piece, for exactly the reason the
+;; paragraph above gives: sb-piece is what the table's append arm calls, and it is
+;; where a char[] becomes its characters rather than "#object[[C]". Open-coding
+;; render-piece here meant a ^StringBuilder-tagged target got the rendering while an
+;; untyped one got the characters.
 (defn- sb-direct-emit [m argc t args]
   (let [a0 (first args)]
     (cond
       (= m "append")    (when (= argc 1)
-                          (str "(begin (sb-append! " t " (render-piece " a0 ")) " t ")"))
+                          (str "(begin (sb-append! " t " (sb-piece " a0 ")) " t ")"))
       (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
       (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
       (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
@@ -888,7 +894,7 @@
                   "str-index-of" "str-index-of-any" "str-replace-literal"
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
-                  "sb-append!" "sb-str" "sb-length" "render-piece" "->num"
+                  "sb-append!" "sb-str" "sb-length" "sb-piece" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).

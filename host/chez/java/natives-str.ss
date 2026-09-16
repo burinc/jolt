@@ -284,15 +284,23 @@
 ;; the comparison it was making. An empty needle answers the string's length,
 ;; which is what String.lastIndexOf("") returns.
 (define (str-last-index-of s needle)
+  (str-last-index-of-from s needle (string-length s)))
+;; The JVM's 2-arg overload: the last occurrence starting at or before FROM. An
+;; empty needle answers FROM clamped into the string, which is what
+;; String.lastIndexOf("", k) returns — and -1 for a negative FROM, since no start
+;; position satisfies it.
+(define (str-last-index-of-from s needle from)
   (let ((nlen (string-length needle)) (slen (string-length s)))
-    (if (fx=? nlen 0)
-        slen
-        (let ((c0 (string-ref needle 0)))
-          (let loop ((i (fx- slen nlen)))
-            (cond ((fx<? i 0) -1)
-                  ((and (char=? (string-ref s i) c0)
-                        (char-by-char-match? s i needle nlen)) i)
-                  (else (loop (fx- i 1)))))))))
+    (cond
+      ((fx<? from 0) -1)
+      ((fx=? nlen 0) (fxmin from slen))
+      (else
+       (let ((c0 (string-ref needle 0)))
+         (let loop ((i (fxmin from (fx- slen nlen))))
+           (cond ((fx<? i 0) -1)
+                 ((and (char=? (string-ref s i) c0)
+                       (char-by-char-match? s i needle nlen)) i)
+                 (else (loop (fx- i 1))))))))))
 
 ;; A string argument to a String method: nil is a NullPointerException, as
 ;; String's own methods raise on null (they used to read as the empty string,
@@ -562,7 +570,48 @@
 (define (jolt-str-cat3 a b c)
   (string-append (jolt-str-nil->empty a) (jolt-str-nil->empty b) (jolt-str-nil->empty c)))
 
+;; The arities String's methods actually have, as a bitmask per name (bit N set =
+;; N arguments), and the reason it is a table and not a check inside each arm: the
+;; cond below reads its arguments POSITIONALLY, so an extra trailing one was never
+;; looked at and (.length "abc" 1) answered 3 where the JVM raises "No matching
+;; method length found taking 1 args". One check at entry cannot be forgotten by
+;; an arm; the arm that forgets is the one that never gets written.
+;;
+;; A name with no entry is unchecked, which is the behaviour every name had before
+;; this table existed — a method added to the cond without one is no worse off than
+;; it was, and the pairing is one screen away.
+(define jolt-string-method-arities
+  (let ((h (make-hashtable string-hash string=?))
+        (mask (lambda (ns) (fold-left (lambda (m n) (bitwise-ior m (bitwise-arithmetic-shift-left 1 n))) 0 ns))))
+    (for-each (lambda (e) (hashtable-set! h (car e) (mask (cdr e))))
+      '(("length" 0) ("charAt" 1) ("toString" 0) ("indexOf" 1 2) ("startsWith" 1 2)
+        ("hashCode" 0) ("toLowerCase" 0 1) ("toUpperCase" 0 1) ("trim" 0)
+        ("isEmpty" 0) ("isBlank" 0) ("repeat" 1) ("codePointAt" 1)
+        ("substring" 1 2) ("lastIndexOf" 1 2) ("endsWith" 1) ("contains" 1)
+        ("concat" 1) ("replace" 2) ("equalsIgnoreCase" 1) ("compareTo" 1)
+        ("compareToIgnoreCase" 1) ("contentEquals" 1) ("regionMatches" 4 5)
+        ("toCharArray" 0) ("strip" 0) ("stripLeading" 0) ("stripTrailing" 0)
+        ("getBytes" 0 1) ("matches" 1) ("replaceAll" 2) ("replaceFirst" 2)
+        ("split" 1 2) ("equals" 1) ("intern" 0) ("getChars" 4) ("subSequence" 2)
+        ;; the Class / Throwable methods that reach a string receiver: a class
+        ;; token is its name string, and a thrown string answers getMessage
+        ("getMessage" 0) ("getLocalizedMessage" 0) ("getName" 0)
+        ("getCanonicalName" 0) ("getSimpleName" 0) ("isArray" 0)))
+    h))
+
 (define (jolt-string-method method s rest)
+  ;; Arity first, and only for a call that HAS arguments: too few is already the
+  ;; JVM's miss through `arg` below, and the zero-argument calls (length, toString,
+  ;; trim) are the hot ones, which this way pay nothing for the check. An arity the
+  ;; method does not have takes the same miss an unknown name takes, so a class
+  ;; extension registered for it still gets its say.
+  (if (and (pair? rest)
+           (let ((m (hashtable-ref jolt-string-method-arities method #f)))
+             (and m (not (bitwise-bit-set? m (length rest))))))
+      (dispatch-miss s method rest)
+      (jolt-string-method-arms method s rest)))
+
+(define (jolt-string-method-arms method s rest)
   ;; A missing argument is the JVM's reflective miss (dispatch-miss: a 0-arg read
   ;; reports as a field, more as a method of that arity), not an index fault from
   ;; reading past the argument list — that left the call uncatchable as the
@@ -582,10 +631,17 @@
     ((string=? method "indexOf")
      (str-index-of-any s (str-arg (arg 0))
                    (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
+    ;; startsWith(prefix) and the JVM's startsWith(prefix, toffset), which asks the
+    ;; same question at an offset and is false — not an error — off either end.
     ((string=? method "startsWith")
-     (let ((p (str-arg (arg 0)))) (and (fx>=? (string-length s) (string-length p))
-                             (string=? (substring s 0 (string-length p)) p))))
+     (let ((p (str-arg (arg 0)))
+           (off (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
+       (and (fx>=? off 0)
+            (fx<=? (fx+ off (string-length p)) (string-length s))
+            (string=? (substring s off (fx+ off (string-length p))) p))))
     ((string=? method "hashCode") (java-string-hash s))
+    ;; The 1-arg forms take a Locale, which jolt drops: case mapping here is the
+    ;; Unicode default, the same choice String/format makes for its Locale.
     ((string=? method "toLowerCase") (string-downcase s))
     ((string=? method "toUpperCase") (string-upcase s))
     ((string=? method "trim") (str-trim s))
@@ -596,7 +652,10 @@
     ((string=? method "substring")
      (jolt-substr s (jolt->idx (arg 0))
                   (if (fx>? (length rest) 1) (jolt->idx (arg 1)) (string-length s))))
-    ((string=? method "lastIndexOf") (jolt-str-last-index-of s (arg 0)))
+    ((string=? method "lastIndexOf")
+     (if (fx>? (length rest) 1)
+         (str-last-index-of-from s (str-needle (arg 0)) (jolt->idx (arg 1)))
+         (jolt-str-last-index-of s (arg 0))))
     ((string=? method "endsWith")
      (let ((p (str-arg (arg 0))) (slen (string-length s)))
        (and (fx>=? slen (string-length p))

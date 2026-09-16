@@ -188,6 +188,27 @@
                  (hashtable-set! host-methods-tbl tag h) h))))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
 
+;; ---- arity, before the member runs ------------------------------------------
+;; The JVM resolves a call by its ARITY before it runs anything: an extra trailing
+;; argument is "No matching method X found taking N args", never a silently
+;; dropped value. A table entry written with a fixed signature already says which
+;; arities it has — procedure-arity-mask reads them straight off the procedure —
+;; so the only thing missing was asking. A `. rest` entry says nothing, which is
+;; how (String/valueOf ca 1 2) came back "abc": valueOf's one arm took the array
+;; and never looked at the offset and count it was handed.
+;;
+;; So a member with overloads writes them as a case-lambda rather than as one
+;; rest-taking arm that picks arguments out of a list — the mask then carries the
+;; overload set, and the two invocation sites below (host-static-call for a
+;; static, the jhost arm for an instance method) enforce it with one bit test. A
+;; member that is genuinely variadic on the JVM — String/format, String/join —
+;; keeps its rest arg and stays unchecked, which is correct rather than lax.
+;;
+;; N is the JAVA argument count; an instance method's procedure also takes the
+;; receiver, which is not one of them.
+(define (host-arity-ok? f n self?)
+  (bitwise-bit-set? (procedure-arity-mask f) (if self? (fx+ n 1) n)))
+
 ;; The comparator seam (natives-seq.ss jolt-comparator-fn) asks whether a value
 ;; is a shim object whose tag registers a `compare` method — a Comparator held
 ;; by the host (String/CASE_INSENSITIVE_ORDER) rather than by a deftype/reify.
@@ -288,7 +309,15 @@
               (f (and mh (hashtable-ref mh method-name #f)))
               (args (if (jolt-nil? rest-args) '() (seq->list rest-args))))
          (cond
-           (f (apply f obj args))
+           ;; A member whose arities do not include this one is not this member:
+           ;; fall to dispatch-miss, so a library extension still gets its say and
+           ;; the report is the JVM's "No matching method … taking N args" rather
+           ;; than whatever the body faulted on reading an argument it wasn't given
+           ;; ((.append sb "x" 1) used to surface Chez's "cadr: incorrect list
+           ;; structure").
+           (f (if (host-arity-ok? f (length args) #t)
+                  (apply f obj args)
+                  (dispatch-miss obj method-name args)))
            ;; (. Foo bar args) where Foo names a class is a STATIC call — that is
            ;; what the form means on the JVM. A dotted name resolves as a class at
            ;; analysis time, but an IMPORTED simple name evaluates to a class
@@ -326,7 +355,31 @@
 ;; java.lang.Number method surface (the boxed-number methods cljc code calls). The
 ;; integer projections wrap modulo their width (ring-codec relies on byteValue
 ;; overflow: (.byteValue 255) => -1); the float projections are identity flonums.
+;;
+;; The arity table is the same device jolt-string-method uses (natives-str.ss) and
+;; is here for the same reason: these arms take `. args` and most never read it, so
+;; (.intValue (int 5) 1) answered 5 where the JVM raises "No matching method
+;; intValue found taking 1 args". A name absent from the table is unchecked.
+(define number-method-arities
+  (let ((h (make-hashtable string-hash string=?))
+        (mask (lambda (ns) (fold-left (lambda (m k) (bitwise-ior m (bitwise-arithmetic-shift-left 1 k))) 0 ns))))
+    (for-each (lambda (e) (hashtable-set! h (car e) (mask (cdr e))))
+      '(("byteValue" 0) ("shortValue" 0) ("intValue" 0) ("longValue" 0)
+        ("doubleValue" 0) ("floatValue" 0) ("toString" 0 1) ("hashCode" 0)
+        ("isNaN" 0) ("isInfinite" 0) ("negate" 0) ("abs" 0) ("bitLength" 0)
+        ("signum" 0) ("shiftLeft" 1) ("shiftRight" 1)))
+    h))
 (define (number-method method n . args)
+  ;; Same shape as jolt-string-method's check, including the (pair? args) guard:
+  ;; too few arguments already faults in the arm that reads one, and the 0-arg
+  ;; projections are what this is called with almost every time.
+  (if (and (pair? args)
+           (let ((m (hashtable-ref number-method-arities method #f)))
+             (and m (not (bitwise-bit-set? m (length args))))))
+      (dispatch-miss n method args)
+      (number-method-arms method n args)))
+
+(define (number-method-arms method n args)
   (cond
     ((string=? method "byteValue") (let ((b (modulo (jnum->exact n) 256))) (->num (if (>= b 128) (- b 256) b))))
     ((string=? method "shortValue") (let ((b (modulo (jnum->exact n) 65536))) (->num (if (>= b 32768) (- b 65536) b))))
@@ -887,7 +940,15 @@
   ;; Applying the field's value used to raise Chez's bare "attempt to apply
   ;; non-procedure" with no message.
   (let ((v (host-static-ref class member)))
-    (cond ((procedure? v) (apply v args))
+    (cond ((procedure? v)
+           (if (host-arity-ok? v (length args) #f)
+               (apply v args)
+               ;; the JVM's reflective miss for a static, which names no class —
+               ;; (String/valueOf ca 0) is "No matching method valueOf found
+               ;; taking 2 args", not valueOf(char[]) with the 0 thrown away.
+               (throw-jvm (quote IllegalArgumentException)
+                 (string-append "No matching method " member " found taking "
+                                (number->string (length args)) " args"))))
           ((null? args) v)
           (else (throw-jvm (quote IllegalArgumentException)
                   (string-append class "/" member " is a static field; it takes no arguments"))))))
