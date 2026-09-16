@@ -32,6 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Record predicates, accessors and constructors are open-coded.** Every
+  collection, seq cell, keyword, symbol, var and record instance in the runtime
+  is a Chez record, and `define-record-type` bound each type's predicate and
+  accessors to top-level variables — so a `(pvec? x)` compiled in a later form
+  was a procedure call, and a kind-dispatch chain paid one per arm. The Chez
+  adapter's `define-record-type` now also binds those names as syntax that
+  expands to the open-coded type test or slot read on the constant rtd (a use as
+  a value still gets the procedure, a wrong arity still fails at run time), and
+  the seven collection layouts moved to values.ss so `=`, `hash` and the
+  collection dispatchers see them before they load. Release binaries, alternating
+  runs: `get` on a small map 12→7 ns, `assoc` 67→52, `conj` on a vector 42→30
+  and on a list 25→17, `rest` of a list 18→7, `count` of a list 57→24, `=` of
+  two vectors 55→37, `hash` of a vector 11→7. standard-clojure-style's
+  twelve-file run 383→337 ms and its 78 KB `parse_ns.clj` 190→146 ms, output
+  byte-identical. Same record tags and fields: no image-format change.
+
 - **A collection's metadata is a field of the collection.** A vector, map,
   set, list cell, `()` and lazy-seq node carry their meta in a slot of their
   own record — the reference's `Obj._meta` — instead of an identity-keyed side

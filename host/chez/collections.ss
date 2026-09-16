@@ -86,14 +86,9 @@
 (define pv-mask 31)
 (define pv-empty-node (vector))
 ;;
-;; `meta` is the vector's metadata, jolt-nil or a map — PersistentVector's _meta.
-;; natives-meta.ss owns every read and write of the slot (it is written only on
-;; an instance nobody else holds yet; see coll-meta-set! there). Image-format
-;; surface: chez-pvec-v4. Instances travel raw in a state image, so the layout
-;; (cnt shift root tail ent hasheq meta) is frozen; chez-pvec-v3 (no meta slot)
-;; restores through state-image.ss's legacy arm.
-(define-record-type (pvec %mk-pvec pvec?)
-  (fields cnt shift root tail ent (mutable hasheq) (mutable meta)) (nongenerative chez-pvec-v4))
+;; The pvec record (cnt shift root tail ent hasheq meta, chez-pvec-v4) is
+;; defined in values.ss with the other collection layouts, ahead of every
+;; dispatcher; mk-pvec fills the hasheq and meta defaults.
 (define (mk-pvec cnt shift root tail ent)
   (%mk-pvec cnt shift root tail ent 0 jolt-nil))
 
@@ -1014,14 +1009,9 @@
 ;; array to hash mode when assoc would grow it past the thresholds below, and
 ;; never back (PersistentHashMap.without does not demote).
 ;;
-;; `meta` is the map's metadata, jolt-nil or a map (natives-meta.ss owns the
-;; slot, as for pvec). Image-format surface: chez-pmap-v6. Instances travel raw
-;; in a state image, so the layout (root cnt hasheq meta) is frozen; the two
-;; previous generations (chez-pmap-v5: root cnt hasheq; chez-pmap-v4: root cnt
-;; order hasheq all-kw, a trie root plus an order list) restore through
-;; state-image.ss's legacy arm.
-(define-record-type (pmap %mk-pmap pmap?)
-  (fields root cnt (mutable hasheq) (mutable meta)) (nongenerative chez-pmap-v6))
+;; The pmap record (root cnt hasheq meta, chez-pmap-v6) is defined in values.ss
+;; with the other collection layouts; make-pmap fills the hasheq and meta
+;; defaults.
 (define (make-pmap root cnt) (%mk-pmap root cnt 0 jolt-nil))
 (define (pmap-array? m) (not (hnode? (pmap-root m))))
 (define amap-no-slots (vector))
@@ -1318,10 +1308,8 @@
   (when (fxodd? (length kvs)) (odd-kvs-error "map entries"))
   (hash-from-kvs kvs))
 
-;; `meta` as for pvec/pmap. Image-format surface: chez-pset-v3 (m hasheq meta);
-;; chez-pset-v2 (no meta slot) restores through state-image.ss's legacy arm.
-(define-record-type (pset %mk-pset pset?)
-  (fields m (mutable hasheq) (mutable meta)) (nongenerative chez-pset-v3))
+;; The pset record (m hasheq meta, chez-pset-v3) is defined in values.ss with
+;; the other collection layouts; make-pset fills the hasheq and meta defaults.
 (define (make-pset m) (%mk-pset m 0 jolt-nil))
 ;; sets are ALWAYS hash-ordered (JVM PersistentHashSet), backed by pmap in hash mode.
 (define empty-pset (make-pset empty-pmap-hash))   ; sets are ALWAYS hash-ordered (JVM PersistentHashSet)

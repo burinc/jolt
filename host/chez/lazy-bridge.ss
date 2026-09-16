@@ -16,17 +16,9 @@
 ;; Loaded LAST (after host-table.ss): %ls-seq then captures the fully-extended
 ;; jolt-seq (sorted-aware), so a lazy body returning a sorted coll still seqs.
 
-(define-record-type jolt-lazyseq
-  (fields (mutable thunk) (mutable val)
-          (mutable realized? jolt-lazyseq-realized-flag jolt-lazyseq-realized-flag-set!)
-          (mutable error? jolt-lazyseq-error-flag jolt-lazyseq-error-flag-set!)
-          (mutable lock) (mutable meta))
-  (nongenerative jolt-lazyseq-v3))
-;; `meta` (last, after the lock so its slot index below is unchanged) is the
-;; node's metadata, jolt-nil or a map — LazySeq's _meta. natives-meta.ss owns the
-;; slot; it is written only on a node nobody else holds yet. The layout travels
-;; raw in a state image (jolt-lazyseq-v3); jolt-lazyseq-v2, without the slot,
-;; restores through state-image.ss's legacy arm.
+;; The jolt-lazyseq record (thunk val realized? error? lock meta,
+;; jolt-lazyseq-v3) is defined in values.ss with the other collection layouts:
+;; hasheq.ss and natives-meta.ss dispatch on it long before this file loads.
 ;; The thunk field is the node's ONE published word, exactly as a cell's tail is
 ;; (seq.ss seq-tail-realized?): the thunk -- a procedure, or a lazy-src
 ;; descriptor -- until the node is forced, and after it the seq (cseq | jolt-nil)

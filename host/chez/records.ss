@@ -73,19 +73,14 @@
          (define (acc k i) (sym "jrec~a-f~a" k i))
          (define (mut k i) (sym "jrec~a-f~a-set!" k i))
          (define (fsyms k) (map fsym (range 0 (- k 1))))
-         ;; hasheq is the defrecord __hasheq slot generalized to the family:
-         ;; 0 = unset; a defrecord caches its structural hash here, a plain
-         ;; deftype its identity hash, and a type with a declared
-         ;; hasheq/hashCode never fills it (records-coll.ss jrec-hasheq-slow).
-         ;; make-jrecN is the raw ctor, so every call passes the slot's 0
-         ;; explicitly — a ctor protocol would keep the old arity but costs two
-         ;; closure hops per construction (measured 40 -> 64 ns). The slot makes
-         ;; the family's layout new image surface: every nongenerative tag
-         ;; bumps, and state-image.ss reads older images through a legacy arm.
-         (define base-def
-           '(define-record-type (jrec make-jrec0 jrec?)
-             (fields (immutable desc) (immutable ext) (mutable hasheq))
-             (nongenerative chez-jrec-v5)))
+         ;; The base type jrec (desc ext hasheq) is defined in values.ss, ahead
+         ;; of the dispatchers that test jrec?; the children inherit its three
+         ;; fields. make-jrecN is the raw ctor, so every call passes the hasheq
+         ;; slot's 0 explicitly — a ctor protocol would keep the old arity but
+         ;; costs two closure hops per construction (measured 40 -> 64 ns). The
+         ;; slot makes the family's layout image surface: every nongenerative
+         ;; tag bumps with it, and state-image.ss reads older images through a
+         ;; legacy arm.
          (define (child-def k)
            `(define-record-type (,(rtname k) ,(mkname k) ,(pred k))
               (parent jrec)
@@ -155,8 +150,7 @@
                            (when ov (vector-set! nv ov ov-val))
                            (make-jrec* desc ext 0 nv)))))))
           (datum->syntax tid
-            `(begin ,base-def
-                    ,@(map child-def (range 1 mn))
+            `(begin ,@(map child-def (range 1 mn))
                     ,spill-def
                     ,nfields-def ,fieldref-def ,fieldset-def ,fieldat-def
                     ,ctor-vec-def ,fromexisting-def)))))))

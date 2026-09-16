@@ -96,14 +96,9 @@
 ;; so adding a flavor above needs no second edit to keep them in step.
 (define sk-count        24)
 
-(define-record-type cseq
-  (fields head (mutable tail) (mutable forced? cseq-forced-flag cseq-forced-flag-set!) kind cvec ci crest (mutable lock) (mutable meta))
-  (nongenerative chez-cseq-v7))
-;; `meta` (last, after the lock so the lock's slot index below is unchanged) is
-;; the cell's metadata, jolt-nil or a map — the _meta of a PersistentList node or
-;; a Cons. natives-meta.ss owns the slot; it is written only on a cell nobody
-;; else holds yet. The layout travels raw in a state image (chez-cseq-v7);
-;; chez-cseq-v6, without the slot, restores through state-image.ss's legacy arm.
+;; The cseq record (head tail forced? kind cvec ci crest lock meta, chez-cseq-v7)
+;; is defined in values.ss with the other collection layouts, ahead of every
+;; dispatcher.
 ;; A cell's tail is ONE published word: the thunk (a procedure or a lazy-src
 ;; descriptor) until it is forced, #f for a vector-backed cell whose tail follows
 ;; from its own fields, and whatever the thunk answered after -- a cseq, jolt-nil,
@@ -415,14 +410,10 @@
            (if (seq-tail-realized? t) t
                (let ((r (cseq-run-tail t))) (cseq-publish-tail! s r) r))))))))
 
-;; The empty seq (Clojure's empty list ()), distinct from nil. Its one field is
-;; its metadata, jolt-nil or a map (EmptyList extends Obj): a metadata-bearing ()
-;; — an `empty`/`pop`/`with-meta` result — is a fresh instance, so the shared
-;; jolt-empty-list never carries any. A fielded record is also what keeps Chez
-;; from interning every () into one object. natives-meta.ss owns the slot; the
-;; layout travels raw in a state image (empty-list-v3), and empty-list-v2
-;; restores through state-image.ss's legacy arm.
-(define-record-type empty-list-t (fields (mutable meta)) (nongenerative empty-list-v3))
+;; The empty seq (Clojure's empty list ()), distinct from nil; the empty-list-t
+;; record (one field, its metadata) is defined in values.ss. A metadata-bearing
+;; () -- an `empty`/`pop`/`with-meta` result -- is a fresh instance, so the
+;; shared jolt-empty-list never carries any.
 (define (fresh-empty-list) (make-empty-list-t jolt-nil))
 (define jolt-empty-list (fresh-empty-list))
 
