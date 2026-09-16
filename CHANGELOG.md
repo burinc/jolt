@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stands for; `RT/set` checks duplicates like `PersistentHashSet/createWithCheck`,
   whose own duplicate throw is now the JVM's `IllegalArgumentException` rather
   than an `ex-info`. Certified against Clojure 1.12.5.
+- **A built binary's app defs are linked, so a root write reaches compiled
+  reads.** `jolt build` direct-links every plain app def, and the def was
+  emitted as a Scheme binding plus an *unlinked* var: every compiled
+  value-position read went to the binding while `alter-var-root`, `with-redefs`
+  and a later `def` wrote the var cell, so the two split on the first root write
+  and never rejoined — `(var-get #'x)` saw the new value while a compiled `x`
+  read the old one for the rest of the process, in a binary only. An app def is
+  now emitted the way the seed's already was (`def-var-linked!`, a setter over
+  the binding), which costs one hashtable probe per root write and nothing per
+  call or read; in space it is ~45 bytes of binary and ~0.6 KB of RSS per def
+  at realistic scale. An inlined direct *call* is the separate closed-world
+  freeze and is unchanged; `^:dynamic` / `^:redef` still opt out of
+  direct-linking. (#1009)
 - **A protocol dispatch miss is worded as the reference words it.** Calling a
   protocol method on a value nothing extends raised `No method area in
   user/Shape`; the reference's `emit-method-builder` raises `No implementation
