@@ -265,3 +265,50 @@ jobs:
           if ($rooted -ne 'true') {
             throw "current-drive-rooted File resolution did not match user.dir's drive"
           }
+
+      # The Windows path defects that the per-platform gates above model but
+      # cannot observe: #992 (a drive-absolute FILE argument read as
+      # project-relative, so the runtime opened "./C:/…") and #991
+      # (getCanonicalPath prefixing "/" to a drive-absolute path, so the value
+      # it returned resolved against the current drive and could not be opened).
+      # PowerShell again, so the drive-rooted spellings reach the runtime as
+      # the user typed them rather than as MSYS translations of them.
+      - name: Drive-absolute FILE argument and canonical paths
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'winpaths'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $script = Join-Path $dir 'hello.clj'
+          Set-Content -NoNewline -Encoding ascii -Path $script -Value '(println :hello-from-file)'
+
+          # JOLT_PWD unset is the prebuilt binary's own arrangement: the project
+          # directory is ".", so a mis-classified absolute path becomes "./C:/…".
+          Remove-Item Env:\JOLT_PWD -ErrorAction SilentlyContinue
+          foreach ($spelling in @(($script -replace '\\','/'), $script)) {
+            $out = (& $scheme --script host\chez\cli.ss $spelling 2>&1 | Out-String)
+            Write-Host "$spelling => $out"
+            if ($LASTEXITCODE -ne 0) { throw "jolt <$spelling> exited $LASTEXITCODE" }
+            if (-not $out.Contains(':hello-from-file')) {
+              throw "a drive-absolute FILE argument did not run: $spelling"
+            }
+          }
+
+          # getCanonicalPath must answer a path that can be written and read
+          # back, and must answer the SAME path for both separator spellings —
+          # the identity comparison it exists for.
+          $probe = 'x'
+          $probe = '(let [d (System/getenv (name (quote WINPATH_DIR)))' +
+                   '      p (str d (char 47) (name (quote out.txt)))' +
+                   '      b (.replace p (char 47) (char 92))' +
+                   '      c (.getCanonicalPath (java.io.File. p))' +
+                   '      c2 (.getCanonicalPath (java.io.File. b))]' +
+                   '  (spit c (name (quote written)))' +
+                   '  (println [(= c c2) (slurp c) (= (char 47) (.charAt c 0))]))'
+          $env:WINPATH_DIR = $dir
+          $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($out -ne '[true written false]') {
+            throw "canonicalized drive-absolute path was not usable/stable: $out"
+          }
