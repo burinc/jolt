@@ -1555,11 +1555,35 @@
                       acc
                       (cons t acc)))))))))
 
+(define jch-tags-plus-cache
+  (make-hashtable string-hash string=?))
+
 (define (jch-tags-plus name extra)
-  (let ((ts (jch-tags name)))
-    (if (or (null? ts) (null? (cdr ts)))
-        (append ts extra)
-        (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+  (let ((e (hashtable-ref jch-tags-plus-cache name #f)))
+    (if (and e (fx= (car e) jch-graph-epoch))
+        (cdr e)
+        (let* ((epoch jch-graph-epoch)
+               (ts (jch-tags name))
+               (result (if (or (null? ts) (null? (cdr ts)))
+                           (append ts extra)
+                           (cons
+                             (car ts)
+                             (cons (cadr ts) (append extra (cddr ts)))))))
+          (jolt-with-mutex
+            jch-cache-mutex
+            (when (fx= epoch jch-graph-epoch)
+              (hashtable-set!
+                jch-tags-plus-cache
+                name
+                (cons epoch result))))
+          result))))
+
+(define (graph-owned-tags? tags)
+  (and (pair? tags)
+       (let ((head (car tags)))
+         (or (eq? tags (jch-tags head))
+             (let ((e (hashtable-ref jch-tags-plus-cache head #f)))
+               (and e (eq? tags (cdr e))))))))
 
 (define (value-host-tags obj)
   (cond
@@ -2951,15 +2975,16 @@
                 e)))))
 
 (define (satisfies-memo-set! pn tags pe ge ans)
-  (jolt-with-mutex
-    jch-cache-mutex
-    (when (and (fx= pe jolt-proto-epoch)
-               (fx= ge jch-graph-epoch))
-      (let ((inner (or (hashtable-ref satisfies-memo pn #f)
-                       (let ((t (make-weak-eq-hashtable)))
-                         (hashtable-set! satisfies-memo pn t)
-                         t))))
-        (hashtable-set! inner tags (vector pe ge ans))))))
+  (when (graph-owned-tags? tags)
+    (jolt-with-mutex
+      jch-cache-mutex
+      (when (and (fx= pe jolt-proto-epoch)
+                 (fx= ge jch-graph-epoch))
+        (let ((inner (or (hashtable-ref satisfies-memo pn #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! satisfies-memo pn t)
+                           t))))
+          (hashtable-set! inner tags (vector pe ge ans)))))))
 
 (define (last-dot s)
   (let loop ((i (- (string-length s) 1)))

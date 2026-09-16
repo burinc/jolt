@@ -907,17 +907,25 @@
 ;; stamped with the two epochs it depends on — the protocol registry's
 ;; (jolt-proto-epoch, bumped by every registration, prune and inline marker) and
 ;; the class graph's (jch-graph-epoch, which changes what a tag list holds).
-;; Keyed by the tag list OBJECT (eq?, weakly held): the lists the class graph
-;; hands out are its cached ones, one per class, so a value of a class seen
-;; before finds its answer without hashing a string; a list built per call (a
-;; record's, a reify's, a __register-class! type's — whose tags come from a
-;; user fn in set order, so the FIRST tag is no identity) simply never hits,
-;; and can never answer for another value. Read unlocked, written under
+;; Keyed by the tag list OBJECT (eq?): the lists the class graph hands out are
+;; its cached ones, one per class, so a value of a class seen before finds its
+;; answer without hashing a string. Only such a list is ever STORED — a list
+;; built per call (a number's through jch-tags-plus, a record's or deftype's
+;; cons onto its ancestry, a reify's, a __register-class! type's — whose tags
+;; come from a user fn in set order, so the FIRST tag is no identity) could
+;; never hit again and never answer for another value, and storing one per call
+;; was worse than the walk it saved: an entry the collector scans and a table
+;; that grows between collections (a record miss went 1921 ns with those
+;; entries against 1716 ns without them, a Long miss 763 against 584 —
+;; main's walk is 1777 / 570). graph-owned-tags? (protocols.ss) is the test,
+;; and jch-tags-plus caching its splice is what makes a number's list owned,
+;; so a Long or Double miss is a memo hit too. Read unlocked, written under
 ;; jch-cache-mutex with both epochs re-checked: the jch-tags pattern
-;; (class-hierarchy.ss). Without it every satisfies? walked every tag of the
-;; value's class through the registry, twenty string lookups for a map: 1243
-;; ns on a map, 368 with the memo (a string 382 -> 332, a record 299 -> 281).
-;; inst? is one such walk now that Inst is a protocol.
+;; (class-hierarchy.ss). Without the memo every satisfies? walked every tag of
+;; the value's class through the registry, twenty string lookups for a map:
+;; 1243 ns on a map, 368 with the memo (a string 382 -> 332, a record whose
+;; type inlines the protocol 299 -> 281). inst? is one such walk now that Inst
+;; is a protocol.
 (define satisfies-memo (make-hashtable string-hash string=?))
 (define (satisfies-memo-ref pn tags)
   (let ((inner (hashtable-ref satisfies-memo pn #f)))
@@ -928,13 +936,14 @@
                 (fx= (vector-ref e 1) jch-graph-epoch)
                 e)))))
 (define (satisfies-memo-set! pn tags pe ge ans)
-  (jolt-with-mutex jch-cache-mutex
-    (when (and (fx= pe jolt-proto-epoch) (fx= ge jch-graph-epoch))
-      (let ((inner (or (hashtable-ref satisfies-memo pn #f)
-                       (let ((t (make-weak-eq-hashtable)))
-                         (hashtable-set! satisfies-memo pn t)
-                         t))))
-        (hashtable-set! inner tags (vector pe ge ans))))))
+  (when (graph-owned-tags? tags)
+    (jolt-with-mutex jch-cache-mutex
+      (when (and (fx= pe jolt-proto-epoch) (fx= ge jch-graph-epoch))
+        (let ((inner (or (hashtable-ref satisfies-memo pn #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! satisfies-memo pn t)
+                           t))))
+          (hashtable-set! inner tags (vector pe ge ans)))))))
 (define (last-dot s)
   (let loop ((i (- (string-length s) 1)))
     (cond ((< i 0) s) ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s))) (else (loop (- i 1))))))
