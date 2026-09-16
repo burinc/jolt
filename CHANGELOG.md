@@ -128,6 +128,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reacquired — so the catch clause runs inside the critical section the wait left.
   (#1011)
 
+- **`java.util.zip`: the compression streams and archive reading, on the zlib
+  every binary already links.** `Inflater`, `Deflater`, `CRC32`, `Adler32`,
+  `InflaterInputStream`, `DeflaterInputStream`, `DeflaterOutputStream`,
+  `GZIPInputStream`, `GZIPOutputStream`, `ZipInputStream`, `ZipEntry`,
+  `ZipException` and `DataFormatException`, translated from JDK 21 with its
+  exception classes and messages. The streams stream: the first byte of a
+  decompressing stream does not wait for the end of its input, and 100 MB
+  through `GZIPOutputStream` or `GZIPInputStream` peaks within 2 MB of 1 MB.
+  `slurp`, `io/copy`, `InputStreamReader`, `with-open`, `proxy` and `reify`
+  streams work with them. Every binary kind registers its zlib under private
+  `jolt_z_*` names when it starts, so a built binary, an app, a tree-shaken app
+  and a `--library` need no zlib on the machine, and a zlib loaded through
+  `:jolt/native` does not replace it. Script mode instead binds the process's
+  own zlib or a system libz, so it is the one mode that needs a zlib on the
+  machine. `ZipOutputStream` and `ZipFile` are not here yet. Where the streams
+  differ from JDK 21 — a Zip64 entry, which is refused, and five smaller
+  cases — `test/conformance/known-divergences.edn` lists them. (#916)
+
 ### Performance
 
 - **Vectors past 32 elements are built in bulk.** `make-pvec` conj'd one
@@ -542,6 +560,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   walk: 281 ns on a map and 229 on a Long against ~110 for the tag probe it
   replaced (the probe could not see an extension; the difference is the
   protocol answer).
+
+- **Dependency resolution extracts jars without `unzip`.**
+  `jolt.host/extract-zip!` reads a jar with `ZipInputStream` and writes each
+  file through a temporary file, so `jolt` resolves a `:mvn/version` dependency
+  on a machine with only `git` installed, and the shell-out check now allows
+  `git` alone. It refuses an archive with an absolute name, a drive letter, a
+  backslash or a `..` segment, or a path through a symbolic link, and a file
+  that is not a whole archive. The `.jolt-ok` marker is still written only after
+  a whole extraction. (#988)
+
+- **Breaking: a library that claims a `java.util.zip` class the runtime now
+  provides no longer loads.** jolt-lang/http-client's `:jolt/provides` claims
+  `GZIPInputStream`, `GZIPOutputStream`, `InflaterInputStream`,
+  `DeflaterInputStream` and `Inflater`; from this release, resolution stops with
+  `IllegalArgumentException: jolt.http.platform claims host classes …, which
+  the runtime already provides.` The claims are http-client's, not yours, so a
+  project cannot work around this in its own `deps.edn`: stay on the previous
+  release until an http-client release drops those five claims.
+
 
 ## [0.8.8] - 2026-09-15
 
