@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A `#"…"` literal is a per-site constant.** The reference reads a regex
+  literal as a `Pattern` object and compiles it as a constant, one object per
+  site built once; jolt rebuilt it every time the literal was reached — a cache
+  lookup and a fresh regex value per `re-find` in a loop. It is hoisted per
+  site like a constant collection now (and a collection literal holding one is
+  constant too), so `(identical? (f) (f))` for a `(defn f [] #"a+")` answers
+  true and two sites reading alike stay distinct, as on the JVM (four
+  certified corpus rows).
 - **Four process-wide locks on hot single-value paths are gone, and parallel
   Clojure code scales again.** Eight threads each working on their OWN values
   ran far slower per thread than one: `assoc` 32x, `swap!` 21x, `str` of an
