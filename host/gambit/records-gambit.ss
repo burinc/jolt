@@ -2585,11 +2585,9 @@
               (string=? method-name "-ns"))
           (intern-ns! (var-cell-ns obj)))
          ((or (string=? method-name "sym")
-              (string=? method-name "-sym")
-              (string=? method-name "name"))
+              (string=? method-name "-sym"))
           (jolt-symbol #f (var-cell-name obj)))
-         ((or (string=? method-name "getName")
-              (string=? method-name "toSymbol"))
+         ((string=? method-name "toSymbol")
           (jolt-symbol (var-cell-ns obj) (var-cell-name obj)))
          ((string=? method-name "toString")
           (string-append
@@ -2610,6 +2608,9 @@
          ((or (string=? method-name "deref")
               (string=? method-name "get"))
           (var-cell-deref obj))
+         ((and (string=? method-name "getThreadBinding")
+               (null? rest))
+          (jolt-var-thread-binding obj))
          ((string=? method-name "setDynamic")
           (var-cell-dynamic?-set!
             obj

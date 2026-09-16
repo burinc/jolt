@@ -232,6 +232,37 @@
 (define (jolt-thread-bound? v)
   (and (var-cell? v) (dyn-find-binding v) #t))
 
+;; Var.getThreadBinding — the Var$TBox for the innermost binding, or nil.
+;;
+;; The JVM's frame is a map var -> TBox, so two reads inside one `binding` hand
+;; back the SAME box, a read from an inner frame hands back a different one, and
+;; a (set! *v* x) through the box's own var leaves the box identical?. jolt's
+;; frame entry is the mutable (cell . value) pair dyn-walk-frames already finds,
+;; and that pair has precisely that identity: one per frame entry, alive as long
+;; as the frame is, mutated in place by jolt-set-var!. So the box is interned OFF
+;; the pair rather than built per call, which is the only way the identical?
+;; behaviour comes out right.
+;;
+;; Interning is lazy and off every hot path. Nothing in jolt or clojure.core calls
+;; getThreadBinding — SCI's IVar does not name it either — so a binding nobody
+;; asks about never allocates a box, and `binding` itself is untouched. The table
+;; is global-behind-a-mutex rather than per-thread because the PAIRS it keys on
+;; are already thread-local (dyn-binding-stack is a thread parameter, and binding
+;; conveyance pushes a frame built from a copied map, not from these pairs) while
+;; the table itself is the one piece that would otherwise be unsynchronized
+;; mutation shared across threads. Weak keys so a popped frame's boxes go with it.
+(define tbox-tbl (make-weak-eq-hashtable))
+(define tbox-mutex (make-mutex))
+(define (jolt-var-thread-binding v)
+  (let ((p (and (var-cell? v) (dyn-find-binding v))))
+    (if (not p)
+        jolt-nil
+        (jolt-with-mutex tbox-mutex
+          (or (hashtable-ref tbox-tbl p #f)
+              (let ((b (make-jolt-var-tbox p)))
+                (hashtable-set! tbox-tbl p b)
+                b))))))
+
 ;; jolt-set-var!: Var.set — the ONE write path behind both the set! special form
 ;; and clojure.core/var-set, which is `(. x (set val))` and nothing else. It
 ;; writes the innermost thread binding; with no binding it throws, because

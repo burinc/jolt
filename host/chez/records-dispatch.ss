@@ -475,19 +475,28 @@
        ;; method-then-field fallback for a no-arg member, (.-ns v) as the field
        ;; itself. Only these two take the dash — (.-getRawRoot v) is a field miss
        ;; on the JVM, so every arm below stays bare-name only and a dashed
-       ;; spelling of one falls through to "No matching field found". `name` is
-       ;; jolt's own alias for sym and is method-only, as it has always been.
+       ;; spelling of one falls through to "No matching field found".
+       ;;
+       ;; `name` and `getName` are deliberately NOT here. They were jolt-only
+       ;; aliases for sym and toSymbol, and Clojure 1.12.5 answers neither —
+       ;; (.name v) and (.getName v) both raise "No matching field found", since
+       ;; Var is not Named and has no getName. Answering where the JVM refuses is
+       ;; the worse half of an interop gap: code written against jolt reads them
+       ;; and then breaks on the JVM, with nothing here to warn it. Both now fall
+       ;; through to dispatch-miss. Nothing reads them — each alias was made to
+       ;; log its receiver and every gate run over it, jolt and clojure.core and
+       ;; the corpus and the lib-conformance suites and the self-host, with no
+       ;; hit (jolt-ggd).
        (cond ((or (string=? method-name "ns") (string=? method-name "-ns"))
               (intern-ns! (var-cell-ns obj)))
-             ((or (string=? method-name "sym") (string=? method-name "-sym")
-                  (string=? method-name "name"))
+             ((or (string=? method-name "sym") (string=? method-name "-sym"))
               (jolt-symbol #f (var-cell-name obj)))
              ;; toSymbol is Var's own qualified name — Symbol.intern of ns.name
              ;; and sym.name. SCI's IVar protocol names it, so an embedder
              ;; extending IVar to clojure.lang.Var (the extension SCI expects a
              ;; host to supply, on jolt exactly as on the JVM) can spell it the
-             ;; way it does there. getName is jolt's own alias for the same read.
-             ((or (string=? method-name "getName") (string=? method-name "toSymbol"))
+             ;; way it does there.
+             ((string=? method-name "toSymbol")
               (jolt-symbol (var-cell-ns obj) (var-cell-name obj)))
              ((string=? method-name "toString") (string-append "#'" (var-cell-ns obj) "/" (var-cell-name obj)))
              ;; getRawRoot is the ROOT value, past any thread binding — how
@@ -510,6 +519,15 @@
              ((string=? method-name "isPublic") (not (rd-var-meta-flag? obj "private")))
              ((string=? method-name "getTag") (rd-var-meta-get obj "tag"))
              ((or (string=? method-name "deref") (string=? method-name "get")) (var-cell-deref obj))
+             ;; getThreadBinding is the box the innermost thread binding lives in,
+             ;; or nil with none in place — the read deref does before falling
+             ;; back to the root. The box is opaque on the JVM (Var$TBox's thread
+             ;; and val fields are package-private, so .val / .-val raise there
+             ;; too), which leaves nil-vs-not, its class, and the fact that two
+             ;; reads of ONE binding are identical?. vars.ss owns the type,
+             ;; dyn-binding.ss the interning that gives it that identity.
+             ((and (string=? method-name "getThreadBinding") (null? rest))
+              (jolt-var-thread-binding obj))
              ;; setMacro sets the flag AND meta :macro, the pair alter-meta! keeps
              ;; together. bindRoot / alterRoot go through alter-var-root so the
              ;; validator and watches see the change; bindRoot also clears the

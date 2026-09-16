@@ -36,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that second seam next to the first. The supported path for sharing a host
   protocol remains the multimethod recipe beside them. (#1031)
 
+- **`Var.getThreadBinding`, and the `clojure.lang.Var$TBox` it answers with.**
+  The last member of the var surface above, left out of it because it is the
+  only one that needed a value type. It hands back the box the innermost thread
+  binding lives in, or `nil` with none in place. The box is deliberately opaque:
+  `Var$TBox`'s `thread` and `val` fields are package-private on the JVM, so
+  `(.val b)` raises "No matching field found" there and now here too, and the
+  only reads are nil-vs-not, `(class b)`, and identity. Identity is the part
+  worth having — on the JVM the frame IS a map of var to box, so two reads
+  inside one `binding` are `identical?`, a read from an inner frame is not, and
+  a `set!` through the var leaves the box the same object. jolt's frame entry is
+  a mutable pair with exactly that lifetime, so the box is interned off the pair
+  rather than built per call. The interning is lazy and behind a mutex, and
+  nothing in jolt or `clojure.core` calls `getThreadBinding`, so a binding
+  nobody asks about never allocates one and `binding` itself is untouched. Six
+  corpus rows certify it against Clojure 1.12.5. (jolt-3ss)
+
 - **`Object.wait`, `.notify` and `.notifyAll`, on every object.** `locking` was
   already a real per-object monitor — reentrant, fiber-aware, shared with
   `monitor-enter` — but the condition-variable half of that monitor was in no host
@@ -245,6 +261,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call-position macros that need one.
 
 ### Changed
+
+- **`(.getName v)` and `(.name v)` on a var now raise, as they do on the JVM.**
+  Both were jolt-only aliases — `getName` for `toSymbol`, `name` for `sym` —
+  and Clojure 1.12.5 answers neither: `clojure.lang.Var` is not `Named` and has
+  no `getName`, so both are "No matching field found" there. Answering where
+  the reference refuses is the worse half of an interop gap, because code
+  written against jolt reads them and then breaks on the JVM with nothing here
+  to have warned it, and the two spellings the JVM does have (`toSymbol` and
+  `.sym`) are both answered. Before removing them each alias was made to log
+  its receiver and every gate run over it — corpus, unit, values, smoke,
+  `scifunctional`, the lib-conformance suites and the self-host — with no hit,
+  so nothing in jolt, `clojure.core` or the vendored libraries reads either.
+  `(name v)` and `(symbol v)`, the portable spellings, are unaffected.
+  (jolt-ggd)
 
 - **`satisfies?` memoizes its extended walk.** For a value that is not a record
   implementing the protocol inline, `satisfies?` walked every tag of the value's
