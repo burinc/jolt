@@ -1158,16 +1158,16 @@
         (else (loop (fx+ i 1) start acc))))))
 ;; line-seq over a host reader is LAZY, one readLine per element, as it is on the
 ;; JVM: (when-let [line (.readLine rdr)] (cons line (lazy-seq (line-seq rdr)))).
-;; It used to drain the reader whole and split the string, which is right for a
-;; file and wrong for a reader over something still arriving — an SSE body, a
-;; tailed log, a pipe — where draining cannot finish until the producer stops,
-;; so the FIRST line was not visible until the LAST one had been read.
+;; Draining the reader and splitting the string is right for a file and wrong
+;; for a reader over something still arriving — an SSE body, a tailed log, a
+;; pipe — where the drain cannot finish until the producer stops, so the FIRST
+;; line is not visible until the LAST one has been read.
 ;;
 ;; Every reader-jhost answers readLine: string-reader and pushback-reader
 ;; (host-static-classes.ss), char-reader and the reader-adapter over a
 ;; hand-written java.io.Reader (io-streams.ss). Each applies the same \n / \r /
-;; \r\n rule and the same nil-at-EOF that chez-lines applied to the drained
-;; string, so the ELEMENTS are unchanged — only when they are read is.
+;; \r\n rule and the same nil-at-EOF as chez-lines, so a string argument and a
+;; reader argument split alike.
 ;;
 ;; The first line is read eagerly, which is what makes (line-seq empty-rdr) nil
 ;; rather than a lazy cell: an unrealized lazyseq that forces to nil still

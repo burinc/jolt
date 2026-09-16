@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`line-seq` over a reader is lazy.** It drained the reader whole and split
+  the string, so the first line was not visible until the last had been read —
+  only latency over a file, a hang over a reader whose producer has not stopped
+  (an SSE body, a tailed log, a pipe). It now reads one `readLine` per element,
+  as the JVM's does; the elements are unchanged, since every reader answers
+  `readLine` with the same `\n` / `\r` / `\r\n` rule the drain applied. (#1007)
+
 ## [0.8.8] - 2026-09-15
 
 The theme is SCI on jolt. An embedded interpreter could not evaluate protocol
