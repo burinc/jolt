@@ -7,8 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Object.wait`, `.notify` and `.notifyAll`, on every object.** `locking` was
+  already a real per-object monitor — reentrant, fiber-aware, shared with
+  `monitor-enter` — but the condition-variable half of that monitor was in no host
+  method table, so the standard idiom (`(locking o (while (not ready?) (.wait o)))`
+  against a `(locking o (.notifyAll o))`) failed at runtime and a consumer had to
+  branch `#?(:jolt …)` onto a queue instead. Each monitor now carries a WAIT SET
+  beside its entry set, and the two queues stay apart: a release wakes contenders,
+  a notify wakes waiters. `wait` releases the monitor outright — however deep it
+  was held, so a nested `locking` does not deadlock its own notifier — and takes it
+  again at the same depth on the way out. The argument handling is the JVM's:
+  `wait()` and `wait(0)` wait indefinitely, a negative timeout or a nanosecond
+  argument outside 0–999999 is an `IllegalArgumentException`, any positive nanos
+  rounds the millisecond up, and a caller that does not own the monitor gets
+  `IllegalMonitorStateException`. The five entry points are a universal dispatch
+  arm rather than a per-type entry, because they are final methods on
+  `java.lang.Object` that no type may shadow. On a fiber the wait PARKS and gives
+  its carrier up, like every other wait in the runtime, and `.interrupt` throws
+  `InterruptedException` with the flag cleared *after* the monitor has been
+  reacquired — so the catch clause runs inside the critical section the wait left.
+  (#1011)
+
 ### Fixed
 
+- **`clojure.core/Inst` is the reference's protocol.** `inst?` and `inst-ms` were
+  two host checks over the `#inst` representation (plus a tag probe for a
+  `java.time.Instant`), so `(extend-protocol Inst MyType ...)` changed nothing,
+  a miss said `inst-ms requires an inst`, and SCI 0.15+, which builds its
+  `clojure.core/Inst` entry from the var at load, could not load at all. `Inst`
+  is now `defprotocol`'d in the seed with `inst-ms*` as its method, `inst-ms`
+  calls it, `inst?` is `satisfies?`, and it is extended to `java.util.Date` (the
+  class every `#inst` and `java.sql` date reports) in core and to
+  `java.time.Instant` by `jolt.time` when it loads, as `core_instant18.clj`
+  does on the JVM. A pre-1970 `Instant` with sub-millisecond nanos read one
+  millisecond high (the tag probe truncated toward zero; `toEpochMilli` floors).
+- **`clojure.lang.RT`'s value statics.** `get`, `nth`, `count`, `seq`, `first`,
+  `next`, `more`, `cons`, `conj`, `assoc`, `dissoc`, `contains`, `find`, `keys`,
+  `vals`, `peek`, `pop`, `subvec`, `aget`, `aset`, `alength`, the primitive
+  casts, `isReduced`, `list`, `vector` and `set` — what the reference's inlined
+  core fns compile to, and what an interpreter reaches for by name: SCI's `aset`
+  on a primitive array is `RT/aset`, so `(aset ^longs a i v)` inside SCI died
+  with `No matching field or method: clojure.lang.RT/aset`, and its newer
+  releases rewrite a two-argument `get` to `RT/get`. Each is the core fn it
+  stands for; `RT/set` checks duplicates like `PersistentHashSet/createWithCheck`,
+  whose own duplicate throw is now the JVM's `IllegalArgumentException` rather
+  than an `ex-info`. Certified against Clojure 1.12.5.
+- **A built binary's app defs are linked, so a root write reaches compiled
+  reads.** `jolt build` direct-links every plain app def, and the def was
+  emitted as a Scheme binding plus an *unlinked* var: every compiled
+  value-position read went to the binding while `alter-var-root`, `with-redefs`
+  and a later `def` wrote the var cell, so the two split on the first root write
+  and never rejoined — `(var-get #'x)` saw the new value while a compiled `x`
+  read the old one for the rest of the process, in a binary only. An app def is
+  now emitted the way the seed's already was (`def-var-linked!`, a setter over
+  the binding), which costs one hashtable probe per root write and nothing per
+  call or read; in space it is ~45 bytes of binary and ~0.6 KB of RSS per def
+  at realistic scale. An inlined direct *call* is the separate closed-world
+  freeze and is unchanged; `^:dynamic` / `^:redef` still opt out of
+  direct-linking. (#1009)
+- **A protocol dispatch miss is worded as the reference words it.** Calling a
+  protocol method on a value nothing extends raised `No method area in
+  user/Shape`; the reference's `emit-method-builder` raises `No implementation
+  of method: :area of protocol: #'user/Shape found for class: java.lang.String`
+  (`nil` for a nil receiver), and library code that matches on that wording —
+  or a fallback that hand-writes it, as jolt's own `IKVReduce` miss did — never
+  saw jolt's. A reify that implements some other protocol reported its own
+  `No reified method` string on the same miss; it is the same message now. Six
+  corpus rows certify the wording against Clojure 1.12.5. Found on jolt#1006,
+  where SCI's refusal of a host protocol copied in as-is surfaces through this
+  miss: `defrecord` over one dies in SCI's `alter-var-root` (`... :getRawRoot of
+  protocol: #'sci.impl.vars/IVar found for class: clojure.lang.Var`) and
+  `extend-type` in its namespace lookup (`... :getName of protocol:
+  #'sci.impl.types/HasName found for class: nil`) — the strings the JVM
+  produces for the same program — and the `scifunctional` gate now pins both
+  next to the supported recipe. (#1006)
+- **`line-seq` over a reader is lazy.** It drained the reader whole and split
+  the string, so the first line was not visible until the last had been read —
+  only latency over a file, a hang over a reader whose producer has not stopped
+  (an SSE body, a tailed log, a pipe). It now reads one `readLine` per element,
+  as the JVM's does; the elements are unchanged, since every reader answers
+  `readLine` with the same `\n` / `\r` / `\r\n` rule the drain applied. (#1007)
 - **The Gambit boot had been dead since 2026-09-02, and two gates now keep it
   alive.** `make gambiteval` sat outside the ci list and every row failed:
   each Chez-side name a shared file or the seed picked up in the meantime was
@@ -48,6 +128,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. `%trim-trailing-newline` in `prelude-shims.ss` compared against
   `#\newline` and `#\return` literals a tool had mangled into `#` + a real
   newline, which Gambit reads as a REPL history reference, so it never trimmed.
+
+### Changed
+
+- **`satisfies?` memoizes its extended walk.** For a value that is not a record
+  implementing the protocol inline, `satisfies?` walked every tag of the value's
+  class through the protocol registry on every call — twenty string lookups for
+  a map. The walk's answer is a function of the value's tag list, so it is now
+  kept per (protocol, tag list), keyed by the list object the class graph hands
+  out and stamped with the protocol registry's and the class graph's epochs,
+  invalidated by any registration, prune or inline marker the way the per-site
+  dispatch caches are. Only a list the graph keeps is stored: a value whose
+  tags are built per call (a record, a reify, a library's registered class —
+  whose tags come in set order and share a first element with its siblings)
+  never answers for another and is never cached, and the spliced list a number
+  reports is now cached by the graph too. Against `main` in one session: a miss
+  on a map 1210 → 308 ns, on a Long 556 → 253, on a string 324 → 248, on a
+  record unchanged. `inst?`, now the reference's `(satisfies? Inst x)`, is that
+  walk: 281 ns on a map and 229 on a Long against ~110 for the tag probe it
+  replaced (the probe could not see an extension; the difference is the
+  protocol answer).
 
 ## [0.8.8] - 2026-09-15
 
@@ -5101,7 +5201,6 @@ read after the syscall rather than at it.
   a reason it cannot be one. `certify.clj` verifies the JVM side, `make
   documented` the jolt side, and both reject an entry whose two sides agree.
 
-
 ## [0.7.28] - 2026-08-27
 
 Two things a namespace does constantly — name a class and read a form — were
@@ -8944,7 +9043,6 @@ parser, through a shim registering the commons-fileupload2 class surface ring
 reaches for. The shim is glue: it decides nothing about multipart syntax, which
 is what keeps the suite worth running.
 
-
 ## [0.5.20] - 2026-08-02
 
 A backtrace could show frames from calls that had already finished, and in the
@@ -9139,7 +9237,6 @@ colliding UUIDs, and the UUIDs were guessable even once they were unique.
   means forgeable. Bytes now come from `/dev/urandom`, or `BCryptGenRandom` /
   `RtlGenRandom` on Windows. If a host offers no entropy source at all the
   fallback says so on stderr rather than degrading quietly.
-
 
 - **`(java.util.Random.)` with no seed never worked.** It seeded from
   `(truncate (current-time))`, and `current-time` answers a time object rather

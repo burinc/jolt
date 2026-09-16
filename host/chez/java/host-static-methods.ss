@@ -302,13 +302,15 @@
 (register-class-statics! "clojure.lang.PersistentList" (list (cons "create" plist-create)))
 
 ;; clojure.lang.PersistentHashSet/createWithCheck: a set from a seq, throwing on a
-;; duplicate element (tools.reader's #{…} reader reports the dup).
+;; duplicate element (tools.reader's #{…} reader reports the dup). The throw is
+;; the JVM's IllegalArgumentException, as PersistentHashMap's is above — it was
+;; an ex-info, which a caller catching the reference's class did not see.
 (define (phs-create-with-check x)
   (let loop ((xs (seq->list (jolt-seq x))) (s (jolt-hash-set)))
     (if (null? xs) s
         (let ((e (car xs)))
           (if (jolt-truthy? (jolt-contains? s e))
-              (jolt-throw (jolt-ex-info (string-append "Duplicate key: " (jolt-str-render-one e)) (jolt-hash-map)))
+              (throw-jvm (quote IllegalArgumentException) (string-append "Duplicate key: " (jolt-str-render-one e)))
               (loop (cdr xs) (jolt-conj1 s e)))))))
 (register-class-statics! "PersistentHashSet" (list (cons "createWithCheck" phs-create-with-check)))
 (register-class-statics! "clojure.lang.PersistentHashSet" (list (cons "createWithCheck" phs-create-with-check)))
@@ -950,6 +952,45 @@
   (list (cons "classForName" class-for-name) (cons "classForNameNonLoading" class-for-name)))
 (register-class-statics! "clojure.lang.RT"
   (list (cons "classForName" class-for-name) (cons "classForNameNonLoading" class-for-name)))
+
+;; clojure.lang.RT's value statics: what the reference's inlined core fns compile
+;; to (count, nth, get, seq, aset, the primitive casts, ...) and so what a
+;; library reaches for by name -- SCI's analyzer rewrites a two-argument (get m k)
+;; call to RT/get, its aset on a primitive array goes through RT/aset, and its fn
+;; adapters cast a return through RT/longCast; (aset ^longs a i v) inside SCI died
+;; here. Each is the native the clojure.core fn it stands for is bound to (ns.ss's
+;; core table), so the answer is that fn's; the seed-defined ones (find, subvec)
+;; go through their var, resolved per call, since the seed loads after this file.
+(define (rt-core-var name)
+  (lambda args (apply jolt-invoke (var-deref "clojure.core" name) args)))
+(define rt-value-statics
+  (list (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
+        (cons "seq" jolt-seq) (cons "first" jolt-first) (cons "next" jolt-next)
+        (cons "more" jolt-rest) (cons "cons" jolt-cons) (cons "conj" jolt-conj)
+        (cons "assoc" jolt-assoc) (cons "dissoc" jolt-dissoc)
+        (cons "contains" jolt-contains?) (cons "find" (rt-core-var "find"))
+        (cons "keys" jolt-keys) (cons "vals" jolt-vals)
+        (cons "peek" jolt-peek) (cons "pop" jolt-pop) (cons "subvec" (rt-core-var "subvec"))
+        ;; one array representation, so the typed aset/aget overloads are one
+        ;; each; aget/alength are the core fns, which know an array (jolt-nth
+        ;; alone does not)
+        (cons "aget" (rt-core-var "aget"))
+        (cons "aset" (lambda (arr i v) (jolt-ref-put! arr (jnum->exact i) v) v))
+        (cons "alength" (rt-core-var "alength"))
+        (cons "booleanCast" jolt-boolean) (cons "charCast" jolt-char)
+        (cons "byteCast" jolt-byte-cast) (cons "shortCast" jolt-short-cast)
+        (cons "intCast" jolt-int-cast) (cons "longCast" jolt-long-cast)
+        (cons "floatCast" jolt-float) (cons "doubleCast" jolt-double)
+        (cons "isReduced" jolt-reduced-pred)
+        ;; list has fixed-arity overloads, so it takes the elements; vector and
+        ;; set are Object... only, an ARRAY to a reflective caller (which is what
+        ;; a static call is), like RT/map
+        (cons "list" jolt-list)
+        (cons "vector" (lambda (arr) (apply jolt-vector (seq->list (jolt-seq arr)))))
+        ;; RT.set is PersistentHashSet.createWithCheck: a duplicate element throws
+        (cons "set" phs-create-with-check)))
+(register-class-statics! "RT" rt-value-statics)
+(register-class-statics! "clojure.lang.RT" rt-value-statics)
 
 ;; ---- System helpers (defined before use above via top-level order) ----------
 ;; os.name reflects the actual platform (Chez's machine-type names it): a *osx

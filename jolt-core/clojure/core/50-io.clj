@@ -376,3 +376,20 @@
   (if (nil? o)
     []
     [(.getClassName o) (.getMethodName o) (.getFileName o) (.getLineNumber o)]))
+
+;; The reference's Inst protocol (core.clj): inst-ms* is its one method, inst-ms
+;; calls it, inst? is satisfies?. So a type that extends Inst is an inst to
+;; both, which the host instance checks these replaced could not answer, and a
+;; miss is the protocol's own message. java.util.Date is the class every #inst
+;; and java.sql date value reports here; java.time.Instant is extended by the
+;; java.time provider when it loads (stdlib/jolt/time/instant.clj), the way
+;; core_instant18.clj does it on the JVM.
+(defprotocol Inst
+  (inst-ms* [inst]))
+
+(extend-protocol Inst
+  java.util.Date
+  (inst-ms* [inst] (.getTime ^java.util.Date inst)))
+
+(defn inst-ms [inst] (inst-ms* inst))
+(defn inst? [x] (satisfies? Inst x))

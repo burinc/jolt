@@ -786,6 +786,11 @@
 ;; has no such arm in the chain at all.
 (define arm-priority-user-override 1)
 (define arm-priority-getclass 5)      ; .getClass — universal Object method, first
+;; .wait / .notify / .notifyAll — final methods on java.lang.Object, so no type may
+;; define one and no type arm may shadow one. Same universal tier as .getClass, and
+;; registered by java/concurrency.ss, which owns the object monitors and loads long
+;; after this file (the Gambit host has no monitors and no such arm).
+(define arm-priority-monitor 5)       ; Object.wait/.notify/.notifyAll — universal too
 (define arm-priority-string 6)       ; string receivers — the base's string? case hoisted
 (define arm-priority-dotform 30)      ; -field accessor + dot-form method dispatch
 (define arm-priority-date 40)         ; java.util.Date (jinst) method surface
@@ -941,8 +946,9 @@
   (if (jclass? proto)
       (if (instance-check proto obj) #t #f)
       (jolt-satisfies-protocol? proto obj)))
+(define kw-proto-name (keyword #f "name"))
 (define (jolt-satisfies-protocol? proto obj)
-  (let* ((pn (jolt-get proto (keyword #f "name") jolt-nil))
+  (let* ((pn (jolt-get proto kw-proto-name jolt-nil))
          (pn-str (if (symbol-t? pn) (symbol-t-name pn) pn)))
     (unless (string? pn-str)
       (throw-jvm (quote IllegalArgumentException)
@@ -962,11 +968,61 @@
       ;; extended: the protocol may be extended to an interface or class the
       ;; value reports — value-host-tags includes a deftype/reify's declared
       ;; interfaces — the same walk dispatch takes. On the JVM one instanceof
-      ;; answers both the direct and the extended case.
-      (let loop ((tags (value-host-tags obj)))
-        (cond ((null? tags) #f)
-              ((type-satisfies? (car tags) pn-str) #t)
-              (else (loop (cdr tags))))))))
+      ;; answers both the direct and the extended case. The walk's answer is a
+      ;; function of the tag LIST, memoized below by the list object itself.
+      (let* ((tags (value-host-tags obj))
+             (memo (satisfies-memo-ref pn-str tags)))
+        (if memo
+            (vector-ref memo 2)
+            (let* ((pe jolt-proto-epoch)
+                   (ge jch-graph-epoch)
+                   (ans (let loop ((tags tags))
+                          (cond ((null? tags) #f)
+                                ((type-satisfies? (car tags) pn-str) #t)
+                                (else (loop (cdr tags)))))))
+              (satisfies-memo-set! pn-str tags pe ge ans)
+              ans))))))
+;; satisfies?'s memo: the extended walk's answer per (protocol, tag list),
+;; stamped with the two epochs it depends on — the protocol registry's
+;; (jolt-proto-epoch, bumped by every registration, prune and inline marker) and
+;; the class graph's (jch-graph-epoch, which changes what a tag list holds).
+;; Keyed by the tag list OBJECT (eq?): the lists the class graph hands out are
+;; its cached ones, one per class, so a value of a class seen before finds its
+;; answer without hashing a string. Only such a list is ever STORED — a list
+;; built per call (a number's through jch-tags-plus, a record's or deftype's
+;; cons onto its ancestry, a reify's, a __register-class! type's — whose tags
+;; come from a user fn in set order, so the FIRST tag is no identity) could
+;; never hit again and never answer for another value, and storing one per call
+;; was worse than the walk it saved: an entry the collector scans and a table
+;; that grows between collections (a record miss went 1921 ns with those
+;; entries against 1716 ns without them, a Long miss 763 against 584 —
+;; main's walk is 1777 / 570). graph-owned-tags? (protocols.ss) is the test,
+;; and jch-tags-plus caching its splice is what makes a number's list owned,
+;; so a Long or Double miss is a memo hit too. Read unlocked, written under
+;; jch-cache-mutex with both epochs re-checked: the jch-tags pattern
+;; (class-hierarchy.ss). Without the memo every satisfies? walked every tag of
+;; the value's class through the registry, twenty string lookups for a map:
+;; 1243 ns on a map, 368 with the memo (a string 382 -> 332, a record whose
+;; type inlines the protocol 299 -> 281). inst? is one such walk now that Inst
+;; is a protocol.
+(define satisfies-memo (make-hashtable string-hash string=?))
+(define (satisfies-memo-ref pn tags)
+  (let ((inner (hashtable-ref satisfies-memo pn #f)))
+    (and inner
+         (let ((e (hashtable-ref inner tags #f)))
+           (and e
+                (fx= (vector-ref e 0) jolt-proto-epoch)
+                (fx= (vector-ref e 1) jch-graph-epoch)
+                e)))))
+(define (satisfies-memo-set! pn tags pe ge ans)
+  (when (graph-owned-tags? tags)
+    (jolt-with-mutex jch-cache-mutex
+      (when (and (fx= pe jolt-proto-epoch) (fx= ge jch-graph-epoch))
+        (let ((inner (or (hashtable-ref satisfies-memo pn #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! satisfies-memo pn t)
+                           t))))
+          (hashtable-set! inner tags (vector pe ge ans)))))))
 (define (last-dot s)
   (let loop ((i (- (string-length s) 1)))
     (cond ((< i 0) s) ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s))) (else (loop (- i 1))))))
@@ -976,7 +1032,7 @@
 ;; protocol, as symbols (extends? reads this). Inline deftype/defrecord impls are
 ;; excluded — only tags carrying the extend mark count, matching the JVM.
 (define (extenders proto)
-  (let* ((pn (jolt-get proto (keyword #f "name") jolt-nil))
+  (let* ((pn (jolt-get proto kw-proto-name jolt-nil))
          (pn-str (if (symbol-t? pn) (symbol-t-name pn) pn))
          (out '()))
     (vector-for-each
