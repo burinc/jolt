@@ -111,7 +111,8 @@ JOLT-TARGETS-NEEDING-DEPS := \
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status hooks attributioncheck \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
-        gambitgen gambitgencheck gambitseedcheck grenadinecheck \
+        gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
+        gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
         fibersbench dynbench \
         fibersresidue
 
@@ -168,7 +169,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -1126,13 +1127,29 @@ certify:
 		echo "certify: clojure not on PATH — skipped"; \
 	fi
 
+# Where the gambit gates find gsi and gsc: GAMBIT_PREFIX/bin, brew's
+# gambit-scheme prefix by default (tests.yml builds 4.9.8 from source into
+# /opt/gambit and passes GAMBIT_PREFIX=/opt/gambit). NEVER bare gsc/gsi (gsc on
+# PATH is Ghostscript): always a prefix's binary. Absolute, because gambitboot
+# and unbound-check.sh cd into host/gambit before running it.
+GAMBIT_PREFIX ?= $(shell brew --prefix gambit-scheme 2>/dev/null)
+GAMBIT_GSI := $(abspath $(GAMBIT_PREFIX))/bin/gsi
+GAMBIT_GSC := $(abspath $(GAMBIT_PREFIX))/bin/gsc
+
+# Every gambit gate is detection-gated like certify: no gambit, clean skip. With
+# JOLT_REQUIRE_GAMBIT set the skip is a failure instead — tests.yml sets it, so
+# an install step that quietly stopped installing cannot turn the gates into
+# no-ops that read as green (the boot ran dead for two weeks with every gambit
+# gate skipping on the runner). $@ names the gate in the message.
+GAMBIT-SKIP = if [ -n "$$JOLT_REQUIRE_GAMBIT" ]; then \
+	  echo "$@: no gambit at $(GAMBIT_PREFIX)/bin and JOLT_REQUIRE_GAMBIT is set" >&2; exit 1; \
+	else \
+	  echo "$@: gambit-scheme not installed (GAMBIT_PREFIX=$(GAMBIT_PREFIX)) — skipped"; \
+	fi
+
 # Gambit adapter gate (G1, jolt-mj95.2): loads host/gambit/{prelude-shims,
 # scheme-adapter-runtime,hasheq}.ss under native gsi and asserts the
-# CONTRACT.txt names + shim behavior. Detection-gated like certify — skips
-# cleanly when gambit-scheme is absent. NEVER bare gsc/gsi (gsc on PATH is
-# Ghostscript): always the brew-prefix binary.
-GAMBIT_GSI := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsi
-GAMBIT_GSC := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsc
+# CONTRACT.txt names + shim behavior.
 
 # host/gambit/records-gambit.ss is GENERATED from the four host/chez records
 # files — records.ss, records-coll.ss, protocols.ss, records-dispatch.ss — (the
@@ -1207,39 +1224,103 @@ gambitcheck:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/gambitcheck.ss; \
 	else \
-		echo "gambitcheck: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # G2 kernel-test gate (jolt-mj95.4): the full booted manifest on native gsi,
 # driven through the real natives. Same detection-gated shape as gambitcheck;
-# NOT in the ci list. Run from the repo root (boot's irregex load is cwd-relative).
+# a second on gsi. Run from the repo root (boot's irregex load is cwd-relative).
 gambitkernel:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/kernel-test.ss; \
 	else \
-		echo "gambitkernel: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # G3 eval gate: real jolt source through jolt-compile-eval on the booted
 # manifest + cross-minted seed, renders pinned to Chez captures. Detection-
-# gated like gambitcheck and NOT in the ci list — it boots the full seed, so
-# it takes about a minute on gsi. Run from the repo root.
+# gated like gambitcheck. In the ci list: it is the only gate that runs
+# emitted code on gsi end to end, and while it sat outside ci every row failed
+# for two weeks (jolt-cw2p) with nothing red. Run from the repo root.
 gambiteval:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/eval-test.ss; \
 	else \
-		echo "gambiteval: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
+
+# Every Scheme global the full-profile boot references is defined — Gambit's
+# own linker report over the compiled boot, minus what the record translator
+# evals at runtime, against host/gambit/unbound-allowlist.txt (untaken paths;
+# a stale line fails). The boot splices most of host/chez, so a Chez-side name
+# reaching a shared file is otherwise an unbound global no Chez gate can see;
+# mirrordrift only compares names defined on BOTH hosts. ~75s: it compiles the
+# seed to js (text only, no C compiler, no node). Detection-gated. Ordered
+# after gambitboot: both regenerate boot-full.ss, and under -j a reader must
+# not open the file mid-rewrite.
+gambitunbound: gambitboot
+	@if [ -x "$(GAMBIT_GSC)" ]; then \
+		JOLT_GSC="$(GAMBIT_GSC)" sh host/gambit/unbound-check.sh; \
+	else \
+		$(GAMBIT-SKIP); \
+	fi
+
+gambitunbound-regen:
+	@JOLT_GSC="$(GAMBIT_GSC)" sh host/gambit/unbound-check.sh --regen
+
+# The jolt half of the same question: every var cell the boot interned is
+# bound. Emitted code reaches a var through its cell, so after the boot the
+# var table holds every var the seed and the compiler image reference — an
+# unbound root is a reference nothing this boot defines (clojure.core/
+# chunk-first, bound by the excluded natives-array.ss, is how every `defn`
+# died). Against host/gambit/unbound-vars-allowlist.txt; a stale line fails.
+# One gsi boot, a few seconds. Detection-gated.
+gambitvars:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		"$(GAMBIT_GSI)" host/gambit/unbound-vars.ss < /dev/null; \
+	else \
+		$(GAMBIT-SKIP); \
+	fi
+
+gambitvars-regen:
+	@JOLT_GAMBITVARS=regen "$(GAMBIT_GSI)" host/gambit/unbound-vars.ss < /dev/null
+
+# The third question: every Class/member call and (new Class) the seed emits
+# resolves in the booted statics/constructor registries. The registries are
+# host-static-methods.ss's on Chez and host/gambit/host-statics.ss's here, and
+# nothing else says which of the seed's statics this target carries — a remint
+# reaching a new one degraded silently (parse-long answered "unsupported" with
+# every gate green). Reads the seed as text, boots, asks the registries; misses
+# against host/gambit/seed-statics-allowlist.txt, a stale line fails. A grep
+# and one gsi boot, a few seconds. Detection-gated.
+gambitstatics:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		JOLT_GSI="$(GAMBIT_GSI)" sh host/gambit/seed-statics.sh; \
+	else \
+		$(GAMBIT-SKIP); \
+	fi
+
+gambitstatics-regen:
+	@JOLT_GSI="$(GAMBIT_GSI)" sh host/gambit/seed-statics.sh --regen
+
+# Every macro the emitter can put in call position (the op registry's :call
+# names, the numeric op tables) has a same-named function in eval-fns.ss:
+# eval'd code on the Gambit boot cannot see unit macros. grep only, so it
+# gates in CI whether or not gambit is installed.
+gambittwins:
+	@sh host/gambit/eval-twins-check.sh
 
 # Build profiles: generate the reduced repl profile and check that the language
 # still works while an excluded feature reports itself instead of failing as an
-# unbound name. Cheap (a gsi load, no js compile), so it can gate the mechanism.
-gambitprofile:
+# unbound name. Cheap (a gsi load, no js compile), so it gates the mechanism.
+# Ordered after gambitboot: gen-boot.ss rewrites boot-active.ss for every
+# profile, and under -j two writers would race on it.
+gambitprofile: gambitboot
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		$(CHEZ) --script host/gambit/gen-boot.ss repl; \
 		"$(GAMBIT_GSI)" host/gambit/profile-test.ss; \
 	else \
-		echo "gambitprofile: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # The full-profile boot comes up on gsi: the js and gsi targets share the boot,
@@ -1256,7 +1337,7 @@ gambitboot:
 	    *) printf '%s\n' "$$out" | tail -20; echo "gambitboot: FAILED — full-profile boot did not reach BOOT-OK" >&2; exit 1;; \
 	  esac; \
 	else \
-	  echo "gambitboot: gambit-scheme not installed (brew) — skipped"; \
+	  $(GAMBIT-SKIP); \
 	fi
 
 # The browser bundle: the whole stack (kernel + seed + compiler + a queue-polling
@@ -1281,7 +1362,7 @@ gambitweb:
 		echo "gambitweb: $(GAMBIT_WEB_OUT) ($$(wc -c < "$$out" | tr -d ' ') bytes,\
  $$(gzip -c "$$out" | wc -c | tr -d ' ') gzipped)"; \
 	else \
-		echo "gambitweb: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # G3 compiler-on-gsi (jolt-mj95.4): cross-mint the Gambit seed from the Chez

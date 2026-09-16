@@ -111,6 +111,85 @@
        "\"class clojure.lang.ArityException\"")
 (check "(str (class 1))" "\"class java.lang.Long\"")
 
+;; ---- jolt-cw2p: the names the boot had lost since 2026-09-02 ------------------
+;; Every row here died on an unbound global or an unbound var while the gate sat
+;; outside ci. gambitunbound / gambitvars pin the names statically; these pin
+;; the paths.
+
+;; Gambit's case-lambda miscompiles the two-clause (fixed n / variadic n) fn —
+;; the emitter merges it on this target (backend_scheme.clj emit-fn), in the
+;; seed (bit-and) and in eval'd code (f2), under jolt-apply's boxed rest too.
+(check "(bit-and 12 10)" "8")
+(check "(bit-or 1 2 4)" "7")
+(check "(do (defn f2 ([x y] [x y]) ([x y & more] [x y more])) [(f2 1 2) (f2 1 2 3) (apply f2 1 2 [3 4]) (apply f2 1 [2])])"
+       "[[1 2] [1 2 (3)] [1 2 (3 4)] [1 2]]")
+;; for-all / real->flonum (prelude-shims), the chunk builder (natives-transduce.ss)
+(check "(seq (chunk-first (seq (vec (range 40)))))"
+       "(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)")
+(check "(* 2 1.5)" "3.0")
+;; the hash caches (hasheq.ss mirrors) and Object.hashCode parity (natives-misc.ss)
+(check "(hash [1 2 3])" "736442005")
+(check "(hash (map inc [1 2]))" "-1504369821")
+(check "[(.hashCode :a) (.hashCode (quote a/b)) (.hashCode \"ab\")]" "[1013910569 -1640525104 3105]")
+(check "(defrecord Q [a])" "#'user/map->Q")
+(check "(= (hash (->Q 1)) (hash (->Q 1)))" "true")
+;; rt-core: indexOf/lastIndexOf on the kernel's own search, object monitors, the
+;; ns-cells index ns.ss reads, proc-name-of for (class a-fn)
+(check "[(.indexOf \"hello\" \"l\") (.indexOf \"hello\" \"l\" 3) (.lastIndexOf \"hello\" \"l\") (.indexOf \"hello\" \\l)]" "[2 3 3 2]")
+(check "(locking :x 1)" "1")
+(check "(count (ns-publics (quote clojure.set)))" "12")
+(check "(str (find-var (quote clojure.core/print-method)))" "\"#'clojure.core/print-method\"")
+;; java/class-model.ss (shared with Chez): the class model core's predicates and isa? read
+(check "[(isa? Long Number) (seqable? 1) (ifn? :a) (class? String) (instance? String \"a\")]"
+       "[true false true true true]")
+(check "(count (supers Long))" "4")
+(check "(do (defmulti m1 (fn [x] (class x))) (defmethod m1 Number [x] :num) (m1 1))" ":num")
+;; the prelude's own (import '(clojure.lang … Sequential …)) binds under
+;; clojure.core now that the boot brackets the prelude in that namespace
+(check "(instance? Sequential (eduction (map inc) [1 2]))" "true")
+(check "(seq (eduction (map inc) [1 2]))" "(2 3)")
+;; host-new builds the typed throwable every core throw site constructs
+(check "(try (zero? \"a\") (catch ClassCastException e (ex-message e)))"
+       "\"class java.lang.String cannot be cast to class java.lang.Number\"")
+;; with-open's close seam, the printer's *out* default, the eval'd-code twins of
+;; the spliced predicates (a catch clause reads jolt-truthy? as a function)
+(check "(with-open [r (reify java.io.Closeable (close [_] nil))] 1)" "1")
+(check "(with-out-str (print \"hi\"))" "\"hi\"")
+(check "(try (throw (ex-info \"x\" {})) (catch Exception e :caught))" ":caught")
+;; A DIVERGENCE this target documents rather than hides: a \\p{…} class is a
+;; PatternSyntaxException (no Unicode categories here; Chez matches).
+(check "(try (re-pattern \"\\\\p{L}\") (catch Exception e (str (class e))))"
+       "\"class java.util.regex.PatternSyntaxException\"")
+
+;; ---- the seed's own statics and constructors (host-statics.ss) ---------------
+;; Every Class/member the seed emits resolves (make gambitstatics); these rows
+;; run the paths behind them. parse-long is Long/parseLong with the throw
+;; caught, munge/demunge are the Compiler statics compile-eval.ss registers,
+;; pprint and cl-format build into a StringBuilder (java/string-builder.ss,
+;; shared with Chez), and (Object.) is the fresh-identity sentinel.
+(check "[(parse-long \"42\") (parse-long \"x\") (parse-long \"-7\")]" "[42 nil -7]")
+(check "(try (Long/parseLong \"zz\") (catch NumberFormatException e (ex-message e)))"
+       "\"For input string: \\\"zz\\\"\"")
+(check "[(munge \"a-b?\") (clojure.lang.Compiler/demunge \"a_b_QMARK_\")]" "[\"a_b_QMARK_\" \"a-b?\"]")
+(check "[(Math/floor 2.5) (Math/abs -3) (String/join \",\" [\"a\" \"b\"]) (Character/isWhitespace \\space) (clojure.lang.Util/equiv 1 1)]"
+       "[2.0 3 \"a,b\" true true]")
+(check "[(= (class (Object.)) Object) (identical? (Object.) (Object.)) (System/getProperty \"line.separator\")]"
+       "[true false \"\\n\"]")
+(check "(let [sb (StringBuilder.)] (.append sb \"a\") (.append sb 1) (.append sb \\c) (str sb))" "\"a1c\"")
+(check "(let [sb (StringBuilder. \"abc\")] [(.length sb) (.charAt sb 1) (str (.reverse sb)) (count sb) (instance? CharSequence sb)])"
+       "[3 \\b \"cba\" 3 true]")
+(check "(with-out-str (clojure.pprint/pprint {:a [1 2] :b \"x\"}))" "\"{:a [1 2], :b \\\"x\\\"}\\n\"")
+(check "(clojure.pprint/cl-format nil \"~5d|~a|~{~a~^,~}\" 42 :x [1 2 3])" "\"   42|:x|1,2,3\"")
+(check "(clojure.pprint/cl-format nil \"~,2f\" 3.14159)" "\"3.14\"")
+(check "(with-out-str (clojure.pprint/print-table [{:a 1 :b 2}]))"
+       "\"\\n| :a | :b |\\n|----+----|\\n|  1 |  2 |\\n\"")
+;; java/class-model.ss (shared with Chez): the Class object's own methods and
+;; the JVM's three spellings of a class
+(check "[(.getName (class 1)) (.getSimpleName String) (.isInterface Sequential) (str (.getSuperclass Long))]"
+       "[\"java.lang.Long\" \"String\" true \"class java.lang.Number\"]")
+(check "[(str (class [])) (str Sequential) (pr-str Long)]"
+       "[\"class clojure.lang.PersistentVector\" \"interface clojure.lang.Sequential\" \"java.lang.Long\"]")
+
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")
 (let ((scm (jolt-analyze-emit-form

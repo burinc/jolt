@@ -133,7 +133,7 @@
         ((has? "uncompil") "analyzer: uncompilable")
         ((has? "Unknown class") "runtime: unknown class")
         ((has? "No constructor") "runtime: no constructor")
-        ((has? "No method") "runtime: no method")
+        ((or (has? "No method") (has? "No implementation of method")) "runtime: no method")
         ((has? "not a fn") "runtime: not a fn")
         ((has? "not seqable") "runtime: not seqable")
         (else (substring m 0 (min 56 (string-length m))))))
