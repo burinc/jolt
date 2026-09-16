@@ -1577,4 +1577,45 @@ if [ "$vgot" != "VERDICT-DYNREQ true" ]; then
   echo "  FAIL: verdict fixture dynreq — want 'VERDICT-DYNREQ true', got \`$vgot\`"; exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict)"
+# java.util.zip in a built app and in a tree-shaken one (#916). The zlib the
+# binary links must be reachable from both. Both builds drop the compiler; the
+# shaken one drops most of the remaining definitions too, and the host's zip
+# classes must survive that.
+echo "build smoke: gzip round trip (plain and --tree-shake)"
+gzapp="$(dirname "$out")/gzip-app"
+mkdir -p "$gzapp/src/gz"
+printf '{:paths ["src"]}\n' > "$gzapp/deps.edn"
+cat > "$gzapp/src/gz/main.clj" <<'EOF'
+(ns gz.main)
+(defn -main [& _]
+  (let [b (java.io.ByteArrayOutputStream.)]
+    (with-open [o (java.util.zip.GZIPOutputStream. b)]
+      (.write o (.getBytes (apply str (repeat 1000 "zip")) "UTF-8")))
+    (let [s (slurp (java.util.zip.GZIPInputStream. (java.io.ByteArrayInputStream. (.toByteArray b))))]
+      (println "GZIP" (count s) (< (.size b) 100)))))
+EOF
+# One mode: build, check the build did what the mode says, then run it. Without
+# the log check a --tree-shake that stopped shaking would pass here, because
+# both modes print the same line.
+gz_case() {
+  gzmode="$1"; shift
+  gzout="$(dirname "$out")/gzip-$gzmode"
+  if ! JOLT_PWD="$gzapp" "$jolt" build -m gz.main -o "$gzout" "$@" >"$gzout.log" 2>&1; then
+    echo "  FAIL: the gzip app ($gzmode) did not build"; tail -5 "$gzout.log"; return 1
+  fi
+  if [ "$gzmode" = shake ]; then
+    if ! grep -q 'tree-shake kept' "$gzout.log"; then
+      echo "  FAIL: the gzip app (shake) was not shaken"; tail -5 "$gzout.log"; return 1
+    fi
+  elif grep -q 'tree-shake kept' "$gzout.log"; then
+    echo "  FAIL: the gzip app (plain) was shaken"; return 1
+  fi
+  gzgot="$(cd / && "$gzout" 2>&1 | tail -1)"
+  if [ "$gzgot" != "GZIP 3000 true" ]; then
+    echo "  FAIL: the gzip app ($gzmode) — want 'GZIP 3000 true', got \`$gzgot\`"; return 1
+  fi
+}
+gz_case plain || exit 1
+gz_case shake --tree-shake || exit 1
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict + gzip-round-trip)"

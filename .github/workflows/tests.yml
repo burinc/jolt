@@ -232,6 +232,21 @@ jobs:
       - name: Gate native dependency paths
         run: make CHEZ=./chez-install/bin/chez depsunit
 
+      # java.util.zip in script mode under MSYS2 (#916). There are no jolt_z_*
+      # names there: zlib.ss binds the process's own zlib if scheme.exe exports
+      # one, else MSYS2's zlib1.dll from /mingw64/bin (mingw-w64-x86_64-zlib,
+      # installed above). The spec makes this a SHOULD until a run shows it, so a
+      # failure here does not fail the job. A run that passes says so in the job
+      # summary: once runs show it works, drop continue-on-error and make it a
+      # MUST (#916).
+      - name: Script mode inflates and deflates (MSYS2)
+        continue-on-error: true
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          got="$(./chez-install/bin/chez --script host/chez/cli.ss -e '(let [b (java.io.ByteArrayOutputStream.)] (with-open [o (java.util.zip.GZIPOutputStream. b)] (.write o (.getBytes (apply str (repeat 1000 "zip")) "UTF-8"))) [(count (slurp (java.util.zip.GZIPInputStream. (java.io.ByteArrayInputStream. (.toByteArray b))))) (< (.size b) 100)])')"
+          test "$got" = "[3000 true]" || { echo "script-mode gzip round trip gave '$got', want [3000 true]"; exit 1; }
+          echo "::notice::script-mode gzip round trip: $got"
+
       # Use PowerShell so JOLT_PWD retains its native drive-rooted spelling.
       # The MSYS shell can translate it before the runtime sees the value,
       # which would make this regression check vacuous.
