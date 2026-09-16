@@ -132,6 +132,10 @@
     (hashtable-delete! clone-registry type-tag)))
 
 (define (prune-type-registry! keep?)
+  ;; a registry change like any other to the caches keyed on the epoch (the
+  ;; PICs, satisfies?'s memo): a tag a later definition reuses must not find a
+  ;; pruned type's answer
+  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -370,11 +374,37 @@
 ;; one exact integer for Long and Integer. jch-tags is (fqn simple ancestors…
 ;; "Object"), so keeping the first two ahead of the extras leaves the concrete
 ;; class outranking both the supersets and the ancestry in dispatch order.
+;;
+;; Cached per name the way jch-tags is (same epoch stamp, same mutex, same
+;; unlocked read), so every Long reports the ONE list rather than a fresh
+;; splice per dispatch — which is also what lets the satisfies? memo
+;; (records-dispatch.ss) keep an answer for a number: it stores only a list the
+;; graph owns, and graph-owned-tags? below is how it asks.
+(define jch-tags-plus-cache (make-hashtable string-hash string=?))
 (define (jch-tags-plus name extra)
-  (let ((ts (jch-tags name)))
-    (if (or (null? ts) (null? (cdr ts)))
-        (append ts extra)
-        (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+  (let ((e (hashtable-ref jch-tags-plus-cache name #f)))
+    (if (and e (fx= (car e) jch-graph-epoch))
+        (cdr e)
+        (let* ((epoch jch-graph-epoch)
+               (ts (jch-tags name))
+               (result (if (or (null? ts) (null? (cdr ts)))
+                           (append ts extra)
+                           (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+          (jolt-with-mutex jch-cache-mutex
+            (when (fx= epoch jch-graph-epoch)
+              (hashtable-set! jch-tags-plus-cache name (cons epoch result))))
+          result))))
+;; Is TAGS a list the class graph hands out and keeps — jch-tags' or
+;; jch-tags-plus' cached list for its own head — as opposed to one built for a
+;; single call (a record's cons onto its ancestry, a reify's, a named fn's)?
+;; A per-call list is never the same object twice, so a cache keyed on the
+;; object must not store it.
+(define (graph-owned-tags? tags)
+  (and (pair? tags)
+       (let ((head (car tags)))
+         (or (eq? tags (jch-tags head))
+             (let ((e (hashtable-ref jch-tags-plus-cache head #f)))
+               (and e (eq? tags (cdr e))))))))
 
 ;; host type-tag candidates for a non-record value (extend-protocol on builtins).
 (define (value-host-tags obj)
@@ -812,7 +842,7 @@
          ;; from another ns by simple name -> its tag via the simple-name index.
          ;; Anything else is "Unable to resolve classname", as the JVM raises at
          ;; load time — never a registration under a tag no value carries, which
-         ;; surfaced as "No method" at the first dispatch instead.
+         ;; surfaced as a dispatch miss at the first call instead.
          (tag (cond (host host)
                     ((hashtable-ref chez-deftype-tag-set local #f) local)
                     ;; a deftype named by its FULLY-QUALIFIED name — the tag
@@ -841,6 +871,9 @@
 (define (register-inline-protocol! type-name proto-name)
   (let ((tag (string-append (chez-current-ns) "." type-name)))
     (jolt-with-mutex rec-tbl-mu
+      ;; the type gains a protocol: an epoch bump like a method registration,
+      ;; so a memoized satisfies? (records-dispatch.ss) re-asks
+      (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
       (let ((ti (or (hashtable-ref type-registry tag #f)
                     (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry tag h) h))))
         (unless (hashtable-ref ti proto-name #f)
@@ -869,6 +902,23 @@
     (jch-register-supers! (string-append (chez-current-ns) "." type-name) (list iface)))
   jolt-nil)
 
+;; A dispatch miss is worded as the reference's emit-method-builder words it —
+;; the method as a keyword, the protocol as its var, the receiver's class by
+;; name, "nil" for nil — so a caller matching on the reference's message (a
+;; library's own miss handling, seq.ss's hand-written IKVReduce miss) reads the
+;; same string here. proto-name is defprotocol's "<ns>/<Name>" key, which is the
+;; var's print form. jolt-class-name is the java host layer's (host-class.ss,
+;; loaded after this file); a receiver it cannot name reports "?".
+(define (protocol-miss-throw proto-name method-name obj)
+  (throw-jvm (quote IllegalArgumentException)
+             (string-append "No implementation of method: :" method-name
+                            " of protocol: #'" proto-name
+                            " found for class: "
+                            (if (jolt-nil? obj)
+                                "nil"
+                                (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
+                                  (if (string? n) n "?"))))))
+
 ;; protocol-resolve: the impl procedure for obj — by record type tag, a reify's
 ;; instance-local method, or the protocol's extended impls over obj's host tags.
 ;; Raises if none implements the method. The dispatchN entry points apply it
@@ -890,12 +940,12 @@
               ;; extended impls over the reify's host tags (e.g. an Object/default
               ;; extension). malli reifies some protocols and leans on the default.
               (let loop ((tags (value-host-tags obj)))
-                (cond ((null? tags) (throw-jvm (quote IllegalArgumentException) (string-append "No reified method " method-name)))
+                (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
                       ((find-protocol-method (car tags) proto-name method-name))
                       (else (loop (cdr tags))))))))
     (else
      (let loop ((tags (value-host-tags obj)))
-       (cond ((null? tags) (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " in " proto-name)))
+       (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
              ((find-protocol-method (car tags) proto-name method-name))
              (else (loop (cdr tags))))))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq

@@ -203,10 +203,6 @@
   ([nm] (keyword nm))
   ([ns nm] (keyword ns nm)))
 
-;; The raw Inst protocol method; jolt insts have one representation, so it is
-;; inst-ms itself.
-(defn inst-ms* [i] (inst-ms i))
-
 ;; Canonical comp — here rather than a host primitive so each stage is invoked with
 ;; jolt call semantics: (comp seq :content) works because the keyword stage
 ;; goes through IFn dispatch.

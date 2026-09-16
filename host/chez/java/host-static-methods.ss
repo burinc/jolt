@@ -302,13 +302,15 @@
 (register-class-statics! "clojure.lang.PersistentList" (list (cons "create" plist-create)))
 
 ;; clojure.lang.PersistentHashSet/createWithCheck: a set from a seq, throwing on a
-;; duplicate element (tools.reader's #{…} reader reports the dup).
+;; duplicate element (tools.reader's #{…} reader reports the dup). The throw is
+;; the JVM's IllegalArgumentException, as PersistentHashMap's is above — it was
+;; an ex-info, which a caller catching the reference's class did not see.
 (define (phs-create-with-check x)
   (let loop ((xs (seq->list (jolt-seq x))) (s (jolt-hash-set)))
     (if (null? xs) s
         (let ((e (car xs)))
           (if (jolt-truthy? (jolt-contains? s e))
-              (jolt-throw (jolt-ex-info (string-append "Duplicate key: " (jolt-str-render-one e)) (jolt-hash-map)))
+              (throw-jvm (quote IllegalArgumentException) (string-append "Duplicate key: " (jolt-str-render-one e)))
               (loop (cdr xs) (jolt-conj1 s e)))))))
 (register-class-statics! "PersistentHashSet" (list (cons "createWithCheck" phs-create-with-check)))
 (register-class-statics! "clojure.lang.PersistentHashSet" (list (cons "createWithCheck" phs-create-with-check)))
@@ -396,7 +398,10 @@
         (cons "setProperty" (lambda (k v) (sys-set-property k v)))
         (cons "clearProperty" (lambda (k) (sys-clear-property k)))
         (cons "getProperties" (lambda () (sys-properties-map)))
-        (cons "getenv" (lambda k (apply sys-getenv k)))
+        ;; getenv() is the whole environment, getenv(name) one variable — and
+        ;; nothing else: spelled as a rest arg, (System/getenv "HOME" 1) answered
+        ;; the variable instead of the JVM's arity miss.
+        (cons "getenv" (case-lambda (() (sys-getenv)) ((k) (sys-getenv k))))
         ;; System/console is nil when there is no attached terminal (piped /
         ;; redirected) — the safe default here; libraries (pretty) use it to
         ;; decide whether to emit ANSI, and a nil means "not a tty".
@@ -694,15 +699,32 @@
 (register-host-methods! "string-ci-comparator"
   (list (cons "compare" (lambda (self a b) (jvm-string-ci-compare a b)))))
 (define string-ci-comparator (make-jhost "string-ci-comparator" #f))
+;; String.valueOf(char[]) is the chars as a string, not the array's own rendering —
+;; it answered "#object[[C]" where (String. ca) already gave "hi". The three-arg
+;; overload is valueOf(char[], offset, count) and nothing else: it USED to be the
+;; one-arg arm with the offset and count dropped on the floor, so (String/valueOf
+;; ca 1 2) answered the whole array. A case-lambda states the two arities, which is
+;; what lets the invocation layer reject any other (host-static.ss host-arity-ok?).
+;;
+;; copyValueOf IS valueOf — the JDK defines the two as the same value at both
+;; arities, and it was simply missing.
+;; char-array-arg? / char-array-chunk are host-static-classes.ss, loaded after this
+;; file and resolved at call time.
+(define string-value-of
+  (case-lambda
+    ((x) (cond ((jolt-nil? x) "null")
+               ((char-array-arg? x) (char-array->string x))
+               (else (jolt-str-render-one x))))
+    ((x offset count)
+     (unless (char-array-arg? x)
+       (throw-jvm (quote ClassCastException)
+                  (string-append "class " (jolt-class-name x) " cannot be cast to class [C")))
+     (char-array-chunk x (jnum->exact offset) (jnum->exact count)
+                       (quote StringIndexOutOfBoundsException)))))
 (register-class-statics! "String"
-  ;; String.valueOf(char[]) is the chars as a string, not the array's own rendering —
-  ;; it answered "#object[[C]" where (String. ca) already gave "hi".
   (list (cons "CASE_INSENSITIVE_ORDER" string-ci-comparator)
-        (cons "valueOf" (lambda (x . _)
-                          (cond ((jolt-nil? x) "null")
-                                ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
-                                 (list->string (ja->list x)))
-                                (else (jolt-str-render-one x)))))
+        (cons "valueOf" string-value-of)
+        (cons "copyValueOf" string-value-of)
         ;; String.join(delim, elems) — elems as a collection or spread as varargs,
         ;; the two shapes the JVM overloads on.
         (cons "join" (lambda (delim . parts)
@@ -951,6 +973,45 @@
 (register-class-statics! "clojure.lang.RT"
   (list (cons "classForName" class-for-name) (cons "classForNameNonLoading" class-for-name)))
 
+;; clojure.lang.RT's value statics: what the reference's inlined core fns compile
+;; to (count, nth, get, seq, aset, the primitive casts, ...) and so what a
+;; library reaches for by name -- SCI's analyzer rewrites a two-argument (get m k)
+;; call to RT/get, its aset on a primitive array goes through RT/aset, and its fn
+;; adapters cast a return through RT/longCast; (aset ^longs a i v) inside SCI died
+;; here. Each is the native the clojure.core fn it stands for is bound to (ns.ss's
+;; core table), so the answer is that fn's; the seed-defined ones (find, subvec)
+;; go through their var, resolved per call, since the seed loads after this file.
+(define (rt-core-var name)
+  (lambda args (apply jolt-invoke (var-deref "clojure.core" name) args)))
+(define rt-value-statics
+  (list (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
+        (cons "seq" jolt-seq) (cons "first" jolt-first) (cons "next" jolt-next)
+        (cons "more" jolt-rest) (cons "cons" jolt-cons) (cons "conj" jolt-conj)
+        (cons "assoc" jolt-assoc) (cons "dissoc" jolt-dissoc)
+        (cons "contains" jolt-contains?) (cons "find" (rt-core-var "find"))
+        (cons "keys" jolt-keys) (cons "vals" jolt-vals)
+        (cons "peek" jolt-peek) (cons "pop" jolt-pop) (cons "subvec" (rt-core-var "subvec"))
+        ;; one array representation, so the typed aset/aget overloads are one
+        ;; each; aget/alength are the core fns, which know an array (jolt-nth
+        ;; alone does not)
+        (cons "aget" (rt-core-var "aget"))
+        (cons "aset" (lambda (arr i v) (jolt-ref-put! arr (jnum->exact i) v) v))
+        (cons "alength" (rt-core-var "alength"))
+        (cons "booleanCast" jolt-boolean) (cons "charCast" jolt-char)
+        (cons "byteCast" jolt-byte-cast) (cons "shortCast" jolt-short-cast)
+        (cons "intCast" jolt-int-cast) (cons "longCast" jolt-long-cast)
+        (cons "floatCast" jolt-float) (cons "doubleCast" jolt-double)
+        (cons "isReduced" jolt-reduced-pred)
+        ;; list has fixed-arity overloads, so it takes the elements; vector and
+        ;; set are Object... only, an ARRAY to a reflective caller (which is what
+        ;; a static call is), like RT/map
+        (cons "list" jolt-list)
+        (cons "vector" (lambda (arr) (apply jolt-vector (seq->list (jolt-seq arr)))))
+        ;; RT.set is PersistentHashSet.createWithCheck: a duplicate element throws
+        (cons "set" phs-create-with-check)))
+(register-class-statics! "RT" rt-value-statics)
+(register-class-statics! "clojure.lang.RT" rt-value-statics)
+
 ;; ---- System helpers (defined before use above via top-level order) ----------
 ;; os.name reflects the actual platform (Chez's machine-type names it): a *osx
 ;; machine is macOS, otherwise Linux. Code that branches on the OS (socket struct
@@ -1140,55 +1201,6 @@
           (if (and allow (not (member name allow))) jolt-nil
               (let ((v (getenv name))) (if v v jolt-nil)))))))
 
-;; ---- StringBuilder ----------------------------------------------------------
-;; state: #(materialised-string pending-chunks-reversed pending-length).
-;;
-;; Appends accumulate as a list of chunks and are joined only when something
-;; reads the buffer. The obvious representation — one string, appended to with
-;; string-append — copies the whole buffer on every append, which makes building
-;; an n-char string O(n^2). That is not theoretical: clojure.data.json reads a
-;; quoted string a character at a time into a StringBuilder, so one 88KB JSON
-;; string value cost 623ms to parse against 30ms for the same bytes spread over
-;; many short values. See test/chez/string-builder-perf.ss.
-;;
-;; Every other method still reads through sb-str, so it flushes first and
-;; behaves exactly as before; only append and the two size reads skip the join.
-(define (sb-str self)
-  (let* ((st (jhost-state self))
-         (pending (vector-ref st 1)))
-    (if (null? pending)
-        (vector-ref st 0)
-        (let* ((base (vector-ref st 0))
-               (blen (string-length base))
-               (out (make-string (+ blen (vector-ref st 2)))))
-          (string-copy! base 0 out 0 blen)
-          (let loop ((cs (reverse pending)) (i blen))
-            (if (null? cs)
-                (begin (vector-set! st 0 out)
-                       (vector-set! st 1 '())
-                       (vector-set! st 2 0)
-                       out)
-                (let* ((c (car cs)) (n (string-length c)))
-                  (string-copy! c 0 out i n)
-                  (loop (cdr cs) (+ i n)))))))))
-(define (sb-set! self s)
-  (let ((st (jhost-state self)))
-    (vector-set! st 0 s)
-    (vector-set! st 1 '())
-    (vector-set! st 2 0)))
-;; O(1): the chunk is retained as-is and nothing is copied until a read.
-(define (sb-append! self piece)
-  (let ((st (jhost-state self)))
-    (vector-set! st 1 (cons piece (vector-ref st 1)))
-    (vector-set! st 2 (+ (vector-ref st 2) (string-length piece)))))
-;; Size without flushing, so the common `while (.length sb) < n: append` shape
-;; does not force a join per iteration and put the O(n^2) straight back.
-(define (sb-length self)
-  (let ((st (jhost-state self)))
-    (+ (string-length (vector-ref st 0)) (vector-ref st 2))))
-(define (render-piece x)
-  (cond ((jolt-nil? x) "null") ((char? x) (string x)) ((string? x) x)
-        (else (jolt-str-render-one x))))
 ;; (Object.) — a fresh value with distinct identity (libraries use it as a lock
 ;; or a unique sentinel). Each call returns a new jhost so identical?/= separate.
 (register-class-ctor! "Object" (lambda _ (make-jhost "object" (vector))))

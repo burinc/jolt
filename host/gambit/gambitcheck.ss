@@ -242,6 +242,14 @@
   (check "sa-vector-copy-range! (R7RS shape)"
          (let ((to (make-vector 5 0))) (sa-vector-copy-range! to 1 (vector 7 8 9) 1 3) to)
          (vector 0 8 9 0 0))
+  ;; the string twin is the subs fast path (converters.ss, shared with this
+  ;; host); the raw string-copy! it replaced has the OPPOSITE argument order
+  ;; here, so a wrong adapter reads back "hello" untouched and a blank span.
+  (check "sa-string-copy-range! (R7RS shape)"
+         (let ((from (string-copy "hello world")) (to (make-string 5 #\-)))
+           (sa-string-copy-range! to 0 from 6 11)
+           (list to from))
+         (list "world" "hello world"))
   (check "bitwise-arithmetic-shift-left (natives-num.ss spelling)" (bitwise-arithmetic-shift-left 1 40) 1099511627776)
   (check "bitwise-arithmetic-shift-right floor on negative" (bitwise-arithmetic-shift-right -7 1) -4))
 

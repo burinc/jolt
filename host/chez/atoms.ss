@@ -93,15 +93,43 @@
 ;; (swap! a f arg*): JVM-style CAS loop — read, compute f OUTSIDE the lock, then
 ;; atomically compare-and-set; retry if another thread changed it. Validate the
 ;; new value before storing, notify watches after.
-(define (jolt-swap! a f . args)
-  (jolt-need-atom a)
-  (let retry ()
-    (let* ((old (jolt-atom-val a))
-           (nv (apply jolt-invoke f old args)))
-      (jolt-atom-validate a nv)
-      (if (jolt-atom-cas! a old nv)
-          (begin (jolt-atom-notify a old nv) nv)
-          (retry)))))
+;; Validate, CAS and notify — the half of swap! that does not depend on how the
+;; new value was computed. #f means the CAS lost and the caller must retry; the
+;; caller returns the new value itself, so a #f new value is not ambiguous here.
+(define (jolt-swap-commit! a old nv)
+  (jolt-atom-validate a nv)
+  (and (jolt-atom-cas! a old nv)
+       (begin (jolt-atom-notify a old nv) #t)))
+
+;; `(swap! a f)`, `(swap! a f x)` and `(swap! a f x y)` are almost every swap! a
+;; program writes — (swap! n inc), (swap! m assoc k v), (swap! v conj x) — and a
+;; single `. args` signature charged each of them a rest-arg list plus an `apply`
+;; to call f. The fixed clauses allocate nothing and call f directly. The retry
+;; loop is spelled out per clause rather than shared through a thunk: a thunk
+;; would trade the rest-arg list for a closure and give the fixed arities back
+;; what they came for. The variadic clause is the original body.
+(define jolt-swap!
+  (case-lambda
+    ((a f)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke1 f old)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))
+    ((a f x)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke2 f old x)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))
+    ((a f x y)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke3 f old x y)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))
+    ((a f . args)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (apply jolt-invoke f old args)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))))
 
 (define (jolt-reset! a v)
   (jolt-need-atom a)

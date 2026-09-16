@@ -89,7 +89,7 @@
                             (str "(fx>=? (str-index-of " t " (str-needle " a0 ") 0) 0)"))
       (= m "concat")      (when (= argc 1) (str "(string-append " t " " a0 ")"))
       (= m "substring")   (when (= argc 2)
-                            (str "(substring " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
+                            (str "(jolt-substr " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
       (= m "replace")     (when (= argc 2)
                              (str "(str-replace-literal " t " (str-needle " a0 ") (str-needle " a1 "))"))
       ;; The rest route to a jolt-str-* native (java/natives-str.ss), which is the
@@ -176,11 +176,17 @@
 ;; append's 3-arg (x, start, end) form and setLength/insert/delete are left to the
 ;; generic path: they are not hot and the range checks are worth more than the
 ;; nanoseconds.
+;;
+;; The 1-arg body is sb-piece, NOT render-piece, for exactly the reason the
+;; paragraph above gives: sb-piece is what the table's append arm calls, and it is
+;; where a char[] becomes its characters rather than "#object[[C]". Open-coding
+;; render-piece here meant a ^StringBuilder-tagged target got the rendering while an
+;; untyped one got the characters.
 (defn- sb-direct-emit [m argc t args]
   (let [a0 (first args)]
     (cond
       (= m "append")    (when (= argc 1)
-                          (str "(begin (sb-append! " t " (render-piece " a0 ")) " t ")"))
+                          (str "(begin (sb-append! " t " (sb-piece " a0 ")) " t ")"))
       (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
       (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
       (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
@@ -209,20 +215,22 @@
 
 ;; DIRECT-LINK MODE. Off for ordinary runs, the seed mint, and `-e`/repl/load-string
 ;; (open world — vars are redefinable). `jolt build` (release/optimized) flips it on
-;; during app emission: a closed-world program where every app def is final, so an
+;; during app emission: a closed-world program whose set of defs is final, so an
 ;; app->app call binds to the def's Scheme binding directly, skipping the var-table
-;; lookup and the generic jolt-invoke dispatch.
+;; lookup and the generic jolt-invoke dispatch. Final in SHAPE, not in value — the
+;; def is emitted linked, so a root write still reaches the binding (see
+;; emit-def-cached); what the closed world freezes is an inlined body.
 (defn set-direct-link! [on] (reset! (:direct-link? (cur)) (boolean on)))
 (defn- direct-link? [] @(:direct-link? (cur)))
 
 ;; SEED-MINT MODE. bootstrap.ss mints clojure.core and the compiler with
 ;; direct-link ON — a core->core call applies the callee's jv$ binding, one
 ;; top-level load in place of var-cell-deref + jolt-invokeN — and this flag says
-;; the emission is the SEED, which differs from a `jolt build` in two ways:
-;; a top-level def is bound with def-var-linked! (rt.ss), which keeps the var's
-;; root and the jv$ binding one value under redefinition, and the seed-callable
-;; arm of emit-invoke is off, because the seed vars that arm would hoist are the
-;; ones being emitted. Nothing is spliced: the inline pass reads the host
+;; the emission is the SEED, which differs from a `jolt build` in that the
+;; seed-callable arm of emit-invoke is off, because the seed vars that arm would
+;; hoist are the ones being emitted. (Both bind a top-level def with
+;; def-var-linked! (rt.ss), which keeps the var's root and the jv$ binding one
+;; value under redefinition.) Nothing is spliced: the inline pass reads the host
 ;; contract's direct-link flag, which the mint leaves off, so a minted core is
 ;; direct-called and still redefinable, as JVM Clojure's direct-linked core is
 ;; not.
@@ -888,7 +896,7 @@
                   "str-index-of" "str-index-of-any" "str-replace-literal"
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
-                  "sb-append!" "sb-str" "sb-length" "render-piece" "->num"
+                  "sb-append!" "sb-str" "sb-length" "sb-piece" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).
@@ -2258,8 +2266,63 @@
                            (str "(if jolt-fn-identity-probe " id-nm " " (nth c 1) ")")])
                         clauses)
                   clauses)
-        lambda (if (= 1 (count clauses))
+        ;; Clojure's exact fixed arity wins over a variadic arity that also accepts
+        ;; the count; Chez's case-lambda takes the FIRST clause that accepts, so a
+        ;; variadic clause declared before a colliding fixed one shadows it, and a
+        ;; call that the JVM routes to the fixed arity lands in the variadic one.
+        ;;
+        ;; A fixed arity can never exceed the variadic threshold (the JVM rejects
+        ;; that outright: "Can't have fixed arity function with more params than
+        ;; variadic function") nor equal another fixed arity, so the only legal
+        ;; overlap is equality -- exactly the case the JVM resolves toward the fixed
+        ;; clause. Fixed clauses first and the single variadic clause last therefore
+        ;; reproduces JVM selection on every legal input.
+        ;;
+        ;; Reordered on the EMITTED clauses only: `arities` keeps declared order for
+        ;; :arglists and the variadic registration below, and emitting in the
+        ;; original order leaves label allocation (the jfn$/fnvar names) untouched.
+        ;; From here on a variadic clause, if there is one, is LAST in `clauses`.
+        clauses (let [variadic? (mapv (fn [a] (boolean (:rest a))) arities)
+                      fixed     (keep-indexed (fn [i c] (when-not (nth variadic? i) c))
+                                              clauses)]
+                  (into (vec fixed)
+                        (keep-indexed (fn [i c] (when (nth variadic? i) c)) clauses)))
+        ;; Gambit's case-lambda expander (lib/_nonstd.scm ##case-lambda, 4.9.7
+        ;; and 4.9.8) appends the rest parameter to the generated lambda's formals
+        ;; only when some clause has OPTIONAL parameters — and the two-clause fn
+        ;; (fn ([x y] …) ([x y & more] …)) has none: both clauses require exactly
+        ;; two. Its dispatch still reads the rest variable, so every call fails
+        ;; with "Unbound variable: #:gN" (bit-and, bit-or and four more seed fns
+        ;; were dead that way; gambitunbound reports the uninterned names). On
+        ;; that target the two clauses are emitted as the one rest lambda the
+        ;; macro should have produced: an empty rest is the fixed arity. Same
+        ;; behaviour under jolt-apply's boxed lazy rest (a one-element list, so
+        ;; the variadic body's jolt-rest-seq unwraps it). Nothing else changes —
+        ;; a third clause, or a variadic with more required params, expands fine.
+        ;; The reorder above put the fixed clause first and the variadic one
+        ;; last, whichever order they were declared in, so the clauses are read
+        ;; by that position.
+        gambit-merge (when (and (= :gambit (target)) (= 2 (count arities)))
+                       (let [[a b] arities
+                             fixed (cond (and (:rest a) (not (:rest b))) b
+                                         (and (:rest b) (not (:rest a))) a)
+                             variadic (if (= fixed a) b a)]
+                         (when (and fixed (= (count (:params fixed)) (count (:params variadic))))
+                           (let [fbody (nth (nth clauses 0) 1)
+                                 [vformals vbody] (nth clauses 1)
+                                 fps (map munge-name (:params fixed))
+                                 vps (map munge-name (:params variadic))
+                                 fbody (if (= fps vps)
+                                         fbody
+                                         (str "(let (" (str/join " " (map (fn [f v] (str "(" f " " v ")")) fps vps))
+                                              ") " fbody ")"))]
+                             (str "(lambda " vformals
+                                  " (if (null? " (munge-name (:rest variadic)) ") " fbody " " vbody "))")))))
+        lambda (cond
+                 (= 1 (count clauses))
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
+                 gambit-merge gambit-merge
+                 :else
                  (str "(case-lambda "
                       (str/join " " (map (fn [c] (str "(" (nth c 0) " " (nth c 1) ")")) clauses))
                       ")"))
@@ -3168,8 +3231,10 @@
     :var (let [core-proc (and (= "clojure.core" (:ns node)) (core-value-procs (:name node)))]
            (cond
              core-proc core-proc
-             ;; direct-linked app var used as a value -> reference its binding (same
-             ;; root as the var cell for a final var; helps DCE keep it live).
+             ;; direct-linked app var used as a value -> reference its binding.
+             ;; The def emitted it linked (def-var-linked!), so the binding and the
+             ;; var cell's root are ONE value under alter-var-root / with-redefs /
+             ;; a later def; it also helps DCE keep the binding live.
              (direct-linkable? (:ns node) (:name node)) (dl-name (:ns node) (:name node))
              (and (stdlib-var? node) (not (prelude-mode?)))
              (throw (ex-info (str "emit: unsupported stdlib ref `" (:ns node) "/" (:name node)
@@ -3479,24 +3544,37 @@
     ;; init (or a form evaluated right after in the same top-level do) may dump a
     ;; closure the init just created.
     (cond
-      ;; the seed mint: a LINKED def. def-var-linked! binds the var the way
-      ;; def-var-with-meta!/def-var-plain! do and records the jv$ symbol with a
-      ;; setter over it, so a later def / alter-var-root of the var writes the
-      ;; new root through to the binding every direct call site applies (rt.ss
-      ;; var-root-set!). That is what keeps a direct-linked core redefinable.
-      (and dl? (seed-mint?))
+      ;; a direct-linked def — the seed mint's core, and every app def a
+      ;; `jolt build` emits — is a LINKED def. def-var-linked! binds the var the
+      ;; way def-var-with-meta!/def-var-plain! do and records the jv$ symbol with
+      ;; a setter over it, so a later def / alter-var-root / with-redefs of the
+      ;; var writes the new root through to the binding (rt.ss var-root-set!) —
+      ;; the one every direct call site applies and every value-position ref
+      ;; reads. Without it the binding and the var cell split on the first root
+      ;; write: `(var-get #'x)` saw the new value while a compiled `x` kept
+      ;; reading the old one, so `alter-var-root` of a plain app var was
+      ;; invisible in a built binary and visible everywhere else (jolt#1009).
+      ;; In TIME it is one hashtable probe per ROOT WRITE — never per call or
+      ;; per read — and no call site slows down: the binding is already
+      ;; assignable in a build (build.ss bld-defer-app-strs rewrites each
+      ;; `(define jv$… init)` into a `(set!)` run from the launcher), so linking
+      ;; costs it no further optimization. In SPACE it is one setter closure and
+      ;; one eq-hashtable entry per app def, which is NOT free: measured over a
+      ;; generated app, ~42-45 bytes of binary and ~0.6 KB of runtime RSS per
+      ;; def (601 defs: +0.3% binary, +0.3% RSS; 2401 defs: +0.9% / +1.4%). A
+      ;; pathological shape — 20k defs whose inits are all tiny constants, so
+      ;; the setter dominates what it is attached to — costs more: +207 B/def
+      ;; and +1.4 KB/def, +17% binary and +12% RSS. Worth knowing before
+      ;; anything raises the per-def payload again. Inlining is the
+      ;; separate closed-world freeze: a body spliced into a call site by the
+      ;; inline pass still predates the write, and ^:dynamic/^:redef opt out of
+      ;; direct-linking altogether.
+      dl?
       (str "(begin" freg " (define " b " " init ") (def-var-linked! "
            (chez-str-lit ns) " " (chez-str-lit nm) " '" b " " b
            " (lambda (v) (set! " b " v)) "
            (if (jmeta-nonempty? (:meta node)) (emit-def-meta node) "#f") ")"
-           (or vreg "") creg ")")
-      dl?
-      (if (jmeta-nonempty? (:meta node))
-        (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "
-             (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
-             (or reg "") (or vreg "") creg ")")
-        (str "(begin" freg " (define " b " " init ") (def-var-plain! "
-             (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg ")"))
+           (or reg "") (or vreg "") creg ")")
       (jmeta-nonempty? (:meta node))
       (if (= (str creg freg) "")
         (str "(def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")")

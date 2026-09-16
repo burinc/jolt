@@ -63,6 +63,12 @@
               "java.time.temporal.TemporalAdjuster" "TemporalAdjuster"
               "java.lang.Comparable" "Comparable"}})
 
+;; clojure.core's Inst protocol, as core_instant18.clj extends it on the JVM once
+;; java.time.Instant exists: inst? and inst-ms answer for an Instant from here.
+(extend-protocol Inst
+  java.time.Instant
+  (inst-ms* [i] (u/floor-div (inst-nanos i) 1000000)))
+
 (__register-class-methods! :jolt.time/instant
   (merge t/generic-methods
     {"getEpochSecond" (fn [x] (u/floor-div (inst-nanos x) nps))
