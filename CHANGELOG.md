@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A protocol dispatch miss is worded as the reference words it.** Calling a
+  protocol method on a value nothing extends raised `No method area in
+  user/Shape`; the reference's `emit-method-builder` raises `No implementation
+  of method: :area of protocol: #'user/Shape found for class: java.lang.String`
+  (`nil` for a nil receiver), and library code that matches on that wording —
+  or a fallback that hand-writes it, as jolt's own `IKVReduce` miss did — never
+  saw jolt's. A reify that implements some other protocol reported its own
+  `No reified method` string on the same miss; it is the same message now. Six
+  corpus rows certify the wording against Clojure 1.12.5. Found on jolt#1006,
+  where SCI's refusal of a host protocol copied in as-is surfaces through this
+  miss: `defrecord` over one dies in SCI's `alter-var-root` (`... :getRawRoot of
+  protocol: #'sci.impl.vars/IVar found for class: clojure.lang.Var`) and
+  `extend-type` in its namespace lookup (`... :getName of protocol:
+  #'sci.impl.types/HasName found for class: nil`) — the strings the JVM
+  produces for the same program — and the `scifunctional` gate now pins both
+  next to the supported recipe. (#1006)
+
 ## [0.8.8] - 2026-09-15
 
 The theme is SCI on jolt. An embedded interpreter could not evaluate protocol

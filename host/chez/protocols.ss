@@ -812,7 +812,7 @@
          ;; from another ns by simple name -> its tag via the simple-name index.
          ;; Anything else is "Unable to resolve classname", as the JVM raises at
          ;; load time — never a registration under a tag no value carries, which
-         ;; surfaced as "No method" at the first dispatch instead.
+         ;; surfaced as a dispatch miss at the first call instead.
          (tag (cond (host host)
                     ((hashtable-ref chez-deftype-tag-set local #f) local)
                     ;; a deftype named by its FULLY-QUALIFIED name — the tag
@@ -869,6 +869,23 @@
     (jch-register-supers! (string-append (chez-current-ns) "." type-name) (list iface)))
   jolt-nil)
 
+;; A dispatch miss is worded as the reference's emit-method-builder words it —
+;; the method as a keyword, the protocol as its var, the receiver's class by
+;; name, "nil" for nil — so a caller matching on the reference's message (a
+;; library's own miss handling, seq.ss's hand-written IKVReduce miss) reads the
+;; same string here. proto-name is defprotocol's "<ns>/<Name>" key, which is the
+;; var's print form. jolt-class-name is the java host layer's (host-class.ss,
+;; loaded after this file); a receiver it cannot name reports "?".
+(define (protocol-miss-throw proto-name method-name obj)
+  (throw-jvm (quote IllegalArgumentException)
+             (string-append "No implementation of method: :" method-name
+                            " of protocol: #'" proto-name
+                            " found for class: "
+                            (if (jolt-nil? obj)
+                                "nil"
+                                (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
+                                  (if (string? n) n "?"))))))
+
 ;; protocol-resolve: the impl procedure for obj — by record type tag, a reify's
 ;; instance-local method, or the protocol's extended impls over obj's host tags.
 ;; Raises if none implements the method. The dispatchN entry points apply it
@@ -890,12 +907,12 @@
               ;; extended impls over the reify's host tags (e.g. an Object/default
               ;; extension). malli reifies some protocols and leans on the default.
               (let loop ((tags (value-host-tags obj)))
-                (cond ((null? tags) (throw-jvm (quote IllegalArgumentException) (string-append "No reified method " method-name)))
+                (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
                       ((find-protocol-method (car tags) proto-name method-name))
                       (else (loop (cdr tags))))))))
     (else
      (let loop ((tags (value-host-tags obj)))
-       (cond ((null? tags) (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " in " proto-name)))
+       (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
              ((find-protocol-method (car tags) proto-name method-name))
              (else (loop (cdr tags))))))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq

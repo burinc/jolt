@@ -181,6 +181,29 @@
 (defmethod sci-area :default [x] (area x))
 (defmethod sci-scaled :default [x k] (scaled x k))
 
+;; The value copied in AS-IS, the way an embedder written against babashka (whose
+;; defprotocol is SCI's) shares every var, is refused at SCI's own seams — and
+;; with the reference's words, since the refusal is a protocol miss in jolt's
+;; dispatcher: SCI alter-var-roots the protocol's :var through its IVar protocol
+;; and names the method namespace through HasName, and a host var and a missing
+;; :ns answer neither. These pin the shape (jolt#1006): the recipe below is the
+;; supported path, and a vendored SCI that starts mirroring host protocols
+;; itself will show up here as the rows going green.
+(let [host-ns (sci/create-ns 'raw)
+      ctx (sci/init {:classes {:allow :all}
+                     :namespaces {'raw {'Shape (sci/copy-var* #'Shape host-ns)
+                                        'area (sci/copy-var* #'area host-ns)
+                                        'scaled (sci/copy-var* #'scaled host-ns)}}})
+      failing (fn [src]
+                (try (sci/eval-string* ctx src) :evaluated
+                     (catch IllegalArgumentException e (ex-message e))))]
+  (check= "defrecord over a host protocol copied as-is dies where the JVM does"
+          "No implementation of method: :getRawRoot of protocol: #'sci.impl.vars/IVar found for class: clojure.lang.Var"
+          (failing "(defrecord Raw [s] raw/Shape (area [_] s) (scaled [_ k] s))"))
+  (check= "extend-type over a host protocol copied as-is dies where the JVM does"
+          "No implementation of method: :getName of protocol: #'sci.impl.types/HasName found for class: nil"
+          (failing "(extend-type String raw/Shape (area [s] (count s)) (scaled [s k] s))")))
+
 ;; the other direction: a SCI record or type reaching the HOST protocol answers
 ;; through the SCI method its defrecord/deftype registered. Only a method the
 ;; type actually registered counts — the :default is the host protocol itself,
