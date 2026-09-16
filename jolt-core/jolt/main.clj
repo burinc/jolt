@@ -32,11 +32,21 @@
 ;; jolt happened to be run from the project root: `bin/jolt` exports JOLT_PWD and
 ;; then cd's to its own tree, so the path resolved against the wrong directory
 ;; and the library read as missing.
+;; A leading backslash is rooted for the same reason "/" is: "\\server\share\x.dll"
+;; (UNC) and "\Windows\System32\x.dll" (rooted on the current drive) are paths the
+;; OS resolves, and joining either to a project directory produces one nothing
+;; can open. That matters now that the Windows fallback COMPOSES candidates from
+;; the loader's own search directories — a UNC entry on PATH would otherwise
+;; come back as "C:/proj/\\srv\share\bin/libcrypto-3-x64.dll".
+(defn- path-rooted? [p]
+  (or (str/starts-with? p "/")
+      (str/starts-with? p "\\")
+      (boolean (re-find #"^[A-Za-z]:" p))))
+
 (defn- native-candidate [base c]
   (if (and base
            (or (str/includes? c "/") (str/includes? c "\\"))
-           (not (str/starts-with? c "/"))
-           (not (re-find #"^[A-Za-z]:" c)))
+           (not (path-rooted? c)))
     (str base "/" c)
     c))
 
@@ -59,8 +69,7 @@
 (defn- native-build-path [base p]
   (if (and base
            (not (str/blank? p))
-           (not (str/starts-with? p "/"))
-           (not (re-find #"^[A-Za-z]:" p)))
+           (not (path-rooted? p)))
     (str base "/" p)
     p))
 

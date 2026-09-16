@@ -79,7 +79,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `:windows` candidates a dependency is missing without restating that
   dependency's `:darwin` and `:linux` lists, and the declaring root travels with
   the candidates it belongs to, so a dependency's relative `native/libfoo.so`
-  still resolves against that dependency. (#989)
+  still resolves against that dependency. A rooted candidate is left for the OS
+  to resolve whatever its spelling, too: only `/` and a drive prefix counted as
+  rooted, so a UNC or current-drive-rooted path (`\\server\share\bin\…`) was
+  joined to the project directory — which the Windows glob can now compose out
+  of a `PATH` entry. (#989)
 
 - **`clojure.core/Inst` is the reference's protocol.** `inst?` and `inst-ms` were
   two host checks over the `#inst` representation (plus a tag probe for a

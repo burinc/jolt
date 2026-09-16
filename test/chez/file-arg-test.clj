@@ -9,6 +9,10 @@
 ;; invalid argument. The Windows rows below are the ones that broke and are
 ;; unreachable from the host CI runs on, so the platform is a parameter.
 ;;
+;; The same line has to be drawn for a :jolt/native candidate path, so
+;; native-candidate's rows are here too — it is the other place the runtime
+;; decides whether a path the user wrote belongs to the project directory.
+;;
 ;; Run: bin/jolt run test/chez/file-arg-test.clj (smoke.sh greps for
 ;; "FILE-ARG OK").
 (ns file-arg-test
@@ -60,6 +64,38 @@
 ;; .\ is the same argument, and cmd.exe tab-completion writes it that way
 (check "windows .\\ joins once" (win "C:/proj" ".\\a.clj") "C:/proj/a.clj")
 (check "windows nested relative" (win "C:/proj" "src\\a.clj") "C:/proj/src\\a.clj")
+
+;; --- :jolt/native candidates: the same rooted/relative line -------------------
+;; native-candidate joins a candidate that names a PATH to the deps.edn that
+;; declared it, and leaves a rooted one to the OS — dlopen's own rule, which is
+;; why a BARE name (no separator) is never joined. Recognizing only "/" and a
+;; drive prefix left the backslash spellings joined to a project directory, and
+;; the Windows fallback now COMPOSES candidates out of PATH entries, which on a
+;; domain-joined host can be UNC.
+(def native-candidate jolt.main/native-candidate)
+
+(check "a bare name is searched for, not joined"
+       (native-candidate "C:/proj" "crypto.dll") "crypto.dll")
+(check "a relative path joins"
+       (native-candidate "C:/proj" "native/libfoo.so") "C:/proj/native/libfoo.so")
+(check "a posix absolute is left alone"
+       (native-candidate "/proj" "/usr/lib/libz.so.1") "/usr/lib/libz.so.1")
+(check "a drive-absolute is left alone"
+       (native-candidate "C:/proj" "C:/Git/mingw64/bin/libcrypto-3-x64.dll")
+       "C:/Git/mingw64/bin/libcrypto-3-x64.dll")
+;; a UNC directory on PATH: "C:/proj/\\srv\share\bin/…" is openable by nothing
+(check "a UNC candidate is left alone"
+       (native-candidate "C:/proj" "\\\\srv\\share\\bin/libcrypto-3-x64.dll")
+       "\\\\srv\\share\\bin/libcrypto-3-x64.dll")
+(check "a current-drive-rooted candidate is left alone"
+       (native-candidate "C:/proj" "\\Windows\\System32/libcrypto-3-x64.dll")
+       "\\Windows\\System32/libcrypto-3-x64.dll")
+;; the build-time half draws the same line, and additionally joins a bare name:
+;; the linker reads "libfoo.a" as a file here, not as a name to search for
+(def native-build-path jolt.main/native-build-path)
+(check "a bare archive joins" (native-build-path "/dep" "libfoo.a") "/dep/libfoo.a")
+(check "a UNC libdir is left alone"
+       (native-build-path "C:/proj" "\\\\srv\\share\\lib") "\\\\srv\\share\\lib")
 
 (if (seq @failures)
   (do (println "FILE-ARG FAILURES:")
