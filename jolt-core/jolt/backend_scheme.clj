@@ -1298,9 +1298,19 @@
 ;; The meta argument to def-var-with-meta!. When the analyzer attached a
 ;; :meta-expr (metadata with values to evaluate, e.g. ^{:a some-fn}), emit it as a
 ;; runtime expression; otherwise the static :meta map as quoted data.
+;;
+;; *fnsrc-def-init?* is cleared here. It means "this literal IS the def's direct
+;; init, which the def's own define names, so the def already registers for it" --
+;; true of the init and of nothing else in the def. But defn always expands to
+;; (def ^{...} name (fn ...)), so the :def arm sets the flag for the WHOLE def, and
+;; a literal inside the attr-map was then skipped as if the define named it. A
+;; ^{:inline (fn ...)} was never registered, so a macro splicing that value out of
+;; (meta #'f) had no source to rebuild it from -- "Cannot compile this value into
+;; code".
 (defn- emit-def-meta [node]
   (if (:meta-expr node)
-    (emit (:meta-expr node))
+    (binding [*fnsrc-def-init?* false]
+      (emit (:meta-expr node)))
     (emit-quoted (:meta node))))
 
 (defn- emit-binding [b]
@@ -3252,7 +3262,7 @@
     ;; runtime (the spine does the same for top-level forms).
     :defmacro (str "(begin (def-var-with-meta! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                    (emit (:fn node)) " "
-                   (if (:meta-expr node) (emit (:meta-expr node)) (emit-quoted (:meta node)))
+                   (emit-def-meta node)
                    ") (mark-macro! " (chez-str-lit (:ns node)) " "
                    (chez-str-lit (:name node)) ") jolt-nil)")
     :host (throw (ex-info (str "emit: unsupported host ref `" (:name node) "`") {}))

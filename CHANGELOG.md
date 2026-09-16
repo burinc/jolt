@@ -76,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the only legal overlap is equality and the order reproduces JVM selection on
   every legal input. Declared order is kept for `:arglists` and the variadic
   registration. (#1023)
+- **A fn literal written in a `defn` attr-map registers its source.** The
+  `:def` arm marked the whole def as "the init is a fn the define names, so it
+  needs no source registration", and `defn` always expands to a `def` with a
+  fn init, so a `{:inline (fn [x] x)}` in the attr-map was skipped as if the
+  define named it — a macro splicing that value out of `(meta #'f)` failed with
+  "Cannot compile this value into code". The flag is cleared while the
+  metadata expression emits, and the `:defmacro` arm emits its metadata through
+  the same helper rather than a copy of the expression. (#1024)
 - **A protocol dispatch miss is worded as the reference words it.** Calling a
   protocol method on a value nothing extends raised `No method area in
   user/Shape`; the reference's `emit-method-builder` raises `No implementation
