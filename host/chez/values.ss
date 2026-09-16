@@ -14,6 +14,39 @@
 
 ;; --- nil ---------------------------------------------------------------------
 (define-record-type jolt-nil-t (fields) (nongenerative jolt-nil-v1))
+;; Has a second OS thread ever been started? #f until the first fork-thread
+;; (lazy-bridge.ss shadows it to flip this), never #f again. The lock-free
+;; paths that are only unsafe under real concurrency — a lazy node's first
+;; force (seq.ss), the metadata table's read (natives-meta.ss) — skip their
+;; fences and claims while it is #f. Defined here, in the first shared file,
+;; because seq.ss and natives-meta.ss load long before lazy-bridge.ss and read
+;; it as soon as they run.
+(define jolt-mt? #f)
+(define (jolt-mark-mt!) (set! jolt-mt? #t))
+
+;; A fixnum's decimal text. Chez's number->string is (format "~d" x): the
+;; general formatter, ~230 ns for a fixnum, and its control-string cache sits
+;; under one process-wide mutex, so eight threads rendering integers ran 17x
+;; slower per thread than one. str, the printer and Long/toString render a
+;; fixnum through this; a bignum still goes to number->string. A negative value
+;; is walked as itself (quotient and remainder toward zero, the remainder
+;; negated per digit) rather than negated up front, so the most negative fixnum
+;; needs no special case.
+(define (jolt-fixnum->string n)
+  (if (fx=? n 0)
+      "0"
+      (let* ((neg? (fx<? n 0))
+             (len (let count ((m n) (k (if neg? 1 0)))
+                    (if (fx=? m 0) k (count (fxquotient m 10) (fx+ k 1)))))
+             (s (make-string len)))
+        (when neg? (string-set! s 0 #\-))
+        (let fill ((m n) (i (fx- len 1)))
+          (if (fx=? m 0)
+              s
+              (let ((d (fxremainder m 10)))
+                (string-set! s i (integer->char (fx+ 48 (if neg? (fx- 0 d) d))))
+                (fill (fxquotient m 10) (fx- i 1))))))))
+
 (define jolt-nil (make-jolt-nil-t))
 ;; SPLICED, not called. Chez compiles each top-level form on its own -- verified:
 ;; (define (f x) (fx+ x 1)) (define (g y) (f y)) in one compiled file, then

@@ -714,6 +714,35 @@
 (ok "15. a bare fork-thread starts from the default reader modes and no txn"
     (equal? ts15-bare '(#f #f #f)))
 
+;; --- 16. the metadata side-table: lock-free reads under racing writers -------
+;; meta-table-get (natives-meta.ss) reads without the mutex and repeats under it
+;; when a writer's generation moved across the lookup, so a conj/assoc that
+;; carries meta forward never LOSES it to a concurrent with-meta rebuilding the
+;; buckets. The property: every thread attaches meta to its own fresh vectors
+;; and reads it back through a carry, while every other thread does the same
+;; (which is what grows and rehashes the one shared table). A dropped carry is
+;; a nil where the thread's own map was expected. Two writers racing was also
+;; the corruption case for this table before its mutex; both halves run here.
+(printf "\n== 16. the metadata table: carries under concurrent with-meta ==\n")
+(define ts16-lost 0)
+(define ts16-lost-mu (make-mutex))
+(define ts16-done
+  (run-threads 8
+    (lambda (tid)
+      (let ((m (jolt-hash-map (keyword #f "t") tid)) (lost 0))
+        (let loop ((i 0))
+          (when (fx<? i 40000)
+            (let* ((v (jolt-with-meta (jolt-vector i tid) m))
+                   (c (jolt-conj v i))            ; carries v's meta onto a fresh vector
+                   (got (jolt-meta c)))
+              (unless (eq? got m) (set! lost (fx+ lost 1))))
+            (loop (fx+ i 1))))
+        (with-mutex ts16-lost-mu (set! ts16-lost (+ ts16-lost lost)))))
+    120 "16. 8 threads x 40k with-meta/conj/meta"))
+(ok "16. no carry lost its meta to a racing writer" (and ts16-done (= ts16-lost 0)))
+(ok "16. a value with no meta still reads nil after the churn"
+    (jolt-nil? (jolt-meta (jolt-vector 1 2 3))))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

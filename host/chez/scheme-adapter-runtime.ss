@@ -411,6 +411,16 @@
                  (loop (fx+ i 1)
                        (cons (let ((vo (io 'ref i))) ((vo 'ref) 'value)) acc))))))))
 
+;; (sa-procedure-code-name p) -> string | #f: the name the procedure's CODE
+;; object carries — the variable its lambda was bound under. Every closure of
+;; one lambda answers the same string, and it survives a build with inspector
+;; information off (it is what #<procedure name> prints), which is what makes
+;; it an identity for a wrapper kind (continuations.ss jolt-escape-fn?). #f
+;; for a procedure whose code carries no name.
+(define (sa-procedure-code-name p)
+  (let ((n (#%$code-name (#%$closure-code p))))
+    (and (string? n) n)))
+
 (define (sa-procedure-info x)
   (guard (e (#t #f))
     (if (sa-introspect-enabled?)

@@ -79,37 +79,25 @@
           (mutable spent jolt-escape-spent? jolt-escape-spent-set!)
           (mutable live jolt-escape-live? jolt-escape-live-set!)))
 
-;; The wrapper procedures handed to jolt, keyed by the procedure itself, so
-;; jolt-escape-fn? can answer for a value that is otherwise an ordinary jolt
-;; callable. An eq?-keyed weak table: an escape that is collected takes its
-;; entry with it, and the table never keeps a spent capture (or its stack
-;; segment) alive. Per-process and not per-thread — escapes are compared by
-;; identity, and a wrapper may legitimately be ASKED about from another thread
-;; even though invoking it there is refused.
+;; The wrapper handed to jolt is an instance of the ONE case-lambda in
+;; jolt-call-cc below, bound under a name no Clojure symbol can spell (`@` is
+;; not a symbol constituent, so no fn a program defines is ever named this), and
+;; a Chez closure's code object carries the name it was bound under. So
+;; jolt-escape-fn? reads the name off the procedure: no registry, no lock, and
+;; nothing per capture for the collector to trace.
 ;;
-;; UNDER THE MUTEX, BOTH DIRECTIONS. This is the same shape as hasheq.ss's
-;; proc-hasheq-tbl and takes the same lock for the same reason: a global weak
-;; table written by two threads at once faults in the collector, and a read
-;; racing a write is no safer than two writes. Captures happen on any thread,
-;; so neither side can be left unguarded.
-;;
-;; WHAT IT COSTS, measured (2M captures, this machine): the bare capture —
-;; call/1cc plus the case-lambda — is 8.5 ns. The weak-table write takes it to
-;; 61 ns, and the mutex to 86 ns. So escape-fn? is not free: it makes a capture
-;; about 10x its floor. It is still far below the exception-based early exit it
-;; replaces, and it is paid per CAPTURE, not per iteration of whatever loop the
-;; capture wraps — but "costs nothing" would be a lie, and the number is
-;; recorded here so the trade can be revisited rather than rediscovered.
-(define jolt-cc-escapes (make-weak-eq-hashtable))
-(define jolt-cc-escapes-mu (make-mutex))
-
-(define (jolt-cc-register! escape e)
-  (jolt-with-mutex jolt-cc-escapes-mu (hashtable-set! jolt-cc-escapes escape e)))
+;; A weak eq table under a process-wide mutex used to hold every escape for this
+;; predicate alone. That cost every capture the table write and the lock (86 ns
+;; against 8.5 for the bare call/1cc), and it serialized every thread that
+;; captures: standard-clojure-style's parser takes a letcc per Choice attempt,
+;; and eight carriers formatting eight files spent more than half their samples
+;; waiting on that one mutex — the formatter's whole-run wall was 2x what the
+;; slowest file takes alone.
+(define jolt-escape-code-name "jolt@escape")
 
 (define (jolt-escape-fn? x)
   (and (procedure? x)
-       (jolt-with-mutex jolt-cc-escapes-mu
-         (and (hashtable-ref jolt-cc-escapes x #f) #t))))
+       (equal? (sa-procedure-code-name x) jolt-escape-code-name)))
 
 ;; The three rules. ORDER IS THE MESSAGE: more than one can be true at once,
 ;; and the caller is told the most actionable of them.
@@ -153,7 +141,10 @@
   (sa-call-with-escape-continuation
    (lambda (k)
      (let ((e (make-jolt-escape k (jolt-cc-thread-id) (jolt-cc-current-fiber) #f #t)))
-       (let ((escape
+       ;; The binding NAME is the escape's identity (jolt-escape-fn? above):
+       ;; Chez names a closure after the variable a lambda is bound to, so
+       ;; every wrapper's code object carries jolt-escape-code-name.
+       (let ((jolt@escape
               (case-lambda
                 (() (jolt-cc-check! e)
                     (jolt-escape-spent-set! e #t)
@@ -161,11 +152,10 @@
                 ((v) (jolt-cc-check! e)
                      (jolt-escape-spent-set! e #t)
                      ((jolt-escape-k e) v)))))
-         (jolt-cc-register! escape e)
          ;; The normal return. An escape never reaches here (k transferred
          ;; control out of this lambda), so clearing live here is exactly the
          ;; "call-cc returned without you" case rule 2 reports.
-         (let ((v (jolt-invoke1 f escape)))
+         (let ((v (jolt-invoke1 f jolt@escape)))
            (jolt-escape-live-set! e #f)
            v))))))
 

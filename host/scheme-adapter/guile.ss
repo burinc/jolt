@@ -102,6 +102,8 @@
 ;;   sa-continuation-frames UNIMPLEMENTED  ?? Guile's call-with-prompt does not expose
 ;;                                        frames; '() permitted (backtrace renders bare).
 ;;   sa-procedure-info      UNIMPLEMENTED  #f permitted by contract.
+;;   sa-procedure-code-name UNIMPLEMENTED  (procedure-name p) is a symbol in Guile;
+;;                                        #f permitted by contract.
 
 ;; ---------------------------------------------------------------------------
 ;; tier: capability-ffi

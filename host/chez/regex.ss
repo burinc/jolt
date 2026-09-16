@@ -91,23 +91,32 @@
                          (if (< i (vector-length x)) (lp (+ i 1) (walk (vector-ref x i) n)) n)))
           (else n))))
 
-;; Two cache stages per source, both under the mutex (dynamic-wind, not a bare
-;; release: a pattern that fails used to leave the mutex held, blocking every
-;; later compile). 'parsed holds the validated SRE; 'irx the built engine.
+;; Two cache stages per source. 'parsed holds the validated SRE; 'irx the built
+;; engine. The HIT is read without the mutex and only a miss takes it, then
+;; re-reads under it: every (jolt-regex "src") — which is what a #"…" literal
+;; evaluates each time it is reached — comes through here, and with the lookup
+;; inside the lock eight threads matching literals ran 24x slower per thread
+;; than one. A string-keyed hashtable read racing a locked writer answers stale
+;; or not-found, never a torn entry (the class-graph caches read the same way),
+;; and a not-found just takes the locked path. The writer holds the mutex under
+;; dynamic-wind, not a bare release: a pattern that fails used to leave it held,
+;; blocking every later compile.
 (define (regex-parsed-entry source)
-  (jolt-lock! regex-cache-mutex)
-  (dynamic-wind
-    (lambda () #f)
-    (lambda ()
-      (or (hashtable-ref regex-cache source #f)
-          (let ((entry (guard (e (#t (regex-syntax-error source e)))
-                         (let-values (((sre opts) (java-pattern->sre source)))
-                           (vector 'parsed sre opts
-                                   (or (sre-has-backref? sre)
-                                       (> (sre-count-submatches sre) 0)))))))
-            (hashtable-set! regex-cache source entry)
-            entry)))
-    (lambda () (jolt-unlock! regex-cache-mutex))))
+  (or (hashtable-ref regex-cache source #f)
+      (begin
+        (jolt-lock! regex-cache-mutex)
+        (dynamic-wind
+          (lambda () #f)
+          (lambda ()
+            (or (hashtable-ref regex-cache source #f)
+                (let ((entry (guard (e (#t (regex-syntax-error source e)))
+                               (let-values (((sre opts) (java-pattern->sre source)))
+                                 (vector 'parsed sre opts
+                                         (or (sre-has-backref? sre)
+                                             (> (sre-count-submatches sre) 0)))))))
+                  (hashtable-set! regex-cache source entry)
+                  entry)))
+          (lambda () (jolt-unlock! regex-cache-mutex))))))
 
 ;; the built engine for source, compiling once on first demand. A capturing
 ;; pattern gets irregex's BACKTRACKING matcher (see the engine note above); a

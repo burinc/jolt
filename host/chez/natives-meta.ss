@@ -10,30 +10,71 @@
 ;; Weak so a collection's metadata is reclaimed with the collection — collection
 ;; ops (conj/assoc/into) carry meta forward onto fresh values, so a strong table
 ;; would retain every meta-bearing intermediate.
+;;
 ;; A Chez hashtable is NOT thread-safe, and this one is written from whatever
 ;; thread calls with-meta or an op that carries meta forward. Unsynchronized
 ;; mutation corrupts the table's internals, and the corruption surfaces later as
 ;; a SIGSEGV inside the collector (`nonrecoverable invalid memory reference`,
 ;; faulting in S_do_gc) or as a hang — never as an error naming this table. So
-;; every touch of meta-table goes through meta-table-mu.
+;; every WRITE goes through meta-table-mu.
 ;;
-;; meta-count keeps the fast path lock-free: it is a plain fixnum box, bumped
-;; under the mutex when an entry is added, and read without one. Programs that
-;; never attach collection metadata therefore pay a single box read per op — and
-;; not the hashtable-size call this used to make, which had to consult the table
-;; itself. It may overcount once entries are collected, which only costs an
-;; unnecessary trip down the slow path.
+;; The READ does not take the mutex, and that matters more than it looks: every
+;; conj / assoc / dissoc / into carries the receiver's meta forward, so this is
+;; the most-called table in the collection layer, and a lock here is a lock on
+;; every collection op in every thread. With the read locked, eight threads
+;; doing assoc on their own maps ran 32x slower PER THREAD than one — a quarter
+;; of a single thread's throughput — and the single-thread cost was a third of
+;; assoc and half of conj (94 -> 62 ns, 67 -> 35 ns without the probe).
+;;
+;; A lock-free read of an eq-hashtable racing a locked writer is memory-safe (a
+;; resize re-threads the existing cells; a walker mid-chain lands in a valid
+;; chain and terminates) but it can MISS the key it is looking for while the
+;; buckets are being rebuilt, and a missed entry here is metadata silently
+;; dropped from a conj. So the read is a seqlock: meta-gen is odd while a writer
+;; is inside and even otherwise, and a reader whose generation changed across
+;; its lookup, or that saw an odd one, repeats the lookup under the mutex. The
+;; fences order the generation stores against the table mutation on a weakly
+;; ordered machine (arm64): without them a reader could see the new generation
+;; before the bucket the writer moved. A writer's fences are unconditional (a
+;; with-meta is rare); a reader's are skipped until a second thread exists.
+;;
+;; The empty-table fast path reads hashtable-size, which Chez keeps current for
+;; a weak table as the collector drops entries (100k dead keys read 0 after a
+;; collection), so a program whose collection metadata is all gone again skips
+;; the lookup. A counter of INSERTIONS used to stand in for it and never came
+;; back down: 66 after the prelude alone with the table already empty, so the
+;; fast path was dead in every real program.
 (define meta-table (make-weak-eq-hashtable))
 (define meta-table-mu (make-mutex))
-(define meta-count (box 0))
+(define meta-gen (box 0))
+(define (meta-gen-bump!) (set-box! meta-gen (fx+ 1 (unbox meta-gen))))
 (define (meta-table-set! k v)
   (jolt-with-mutex meta-table-mu
+    (meta-gen-bump!) (memory-order-release)
     (hashtable-set! meta-table k v)
-    (set-box! meta-count (fx+ 1 (unbox meta-count)))))
+    (memory-order-release) (meta-gen-bump!)))
 (define (meta-table-del! k)
-  (jolt-with-mutex meta-table-mu (hashtable-delete! meta-table k)))
+  (jolt-with-mutex meta-table-mu
+    (meta-gen-bump!) (memory-order-release)
+    (hashtable-delete! meta-table k)
+    (memory-order-release) (meta-gen-bump!)))
+;; Single-threaded (jolt-mt? #f, values.ss) there is no writer to race and the
+;; plain lookup is the whole read; the fences and the generation check are for
+;; a process that has started a second thread.
 (define (meta-table-get k)
-  (jolt-with-mutex meta-table-mu (hashtable-ref meta-table k #f)))
+  (if (not jolt-mt?)
+      (hashtable-ref meta-table k #f)
+      (let ((g (unbox meta-gen)))
+        (if (fxodd? g)
+            (jolt-with-mutex meta-table-mu (hashtable-ref meta-table k #f))
+            (begin
+              (memory-order-acquire)
+              (let ((v (hashtable-ref meta-table k #f)))
+                (memory-order-acquire)
+                (if (fx=? g (unbox meta-gen))
+                    v
+                    (jolt-with-mutex meta-table-mu (hashtable-ref meta-table k #f)))))))))
+(define (meta-table-empty?) (fx=? 0 (hashtable-size meta-table)))
 
 (define (jolt-meta x)
   (cond
@@ -58,8 +99,8 @@
     ((and (jrec? x) (jrec-cl x "meta")) => (lambda (m) (jolt-invoke m x)))
     ;; everything else (collections, fns, reify, atoms/agents and any reference
     ;; type) reads the identity side-table; a value with no entry is nil meta.
-    ;; no metadata anywhere yet: skip the table (and its mutex) entirely
-    ((fx=? 0 (unbox meta-count)) jolt-nil)
+    ;; no collection metadata anywhere: skip the table entirely
+    ((meta-table-empty?) jolt-nil)
     (else (or (meta-table-get x) jolt-nil))))
 
 ;; fresh-identity copy of a metadatable value (so attaching meta doesn't mutate
@@ -125,7 +166,7 @@
 ;; meta() forward. Returns DST. The size check is the fast path: programs that
 ;; never attach collection metadata pay one O(1) check per op, no lookup.
 (define (meta-carry src dst)
-  (if (fx=? 0 (unbox meta-count))
+  (if (meta-table-empty?)
       dst
       (let ((m (meta-table-get src)))
         (if m

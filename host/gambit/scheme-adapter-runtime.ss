@@ -212,6 +212,13 @@
 (define (sa-procedure-info x)
   #f)
 
+;; (sa-procedure-code-name p) -> string | #f. Gambit names a procedure by its
+;; define, not by a let binding, so a closure of an inner lambda answers #f;
+;; the contract permits #f.
+(define (sa-procedure-code-name p)
+  (let ((n (##procedure-name p)))
+    (and (symbol? n) (symbol->string n))))
+
 ;; ---- R7: ffi tier (capability: ffi) — entirely unsupported, all raise -------
 
 ;; (sa-ffi-raise who) -> never returns
