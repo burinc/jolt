@@ -331,5 +331,45 @@
     (and (not (ffi-termux-lib-dir))
          (equal? '("libssl.so") (ffi-native-candidates "libssl.so"))))
 
+;; --- Windows: the soversion is in the FILENAME -------------------------------
+;; The Unix half of load-system-library globs for libz.so.* because a distro may
+;; ship libz.so.1 and no libz.so. Windows has the same gap spelled differently:
+;; OpenSSL's own builds — Git for Windows', which jolt's docs tell a Windows user
+;; to install — are libcrypto-3-x64.dll, so neither "crypto.dll" nor
+;; "libcrypto.dll" names a file that exists, however completely the DLL is on
+;; the loader's search path. That empty search is what left a :jolt/native spec
+;; reporting "not found" about a library sitting beside jolt.exe (#989).
+;;
+;; The matcher is what keeps the glob honest, so it is pinned here rather than
+;; inferred from a directory listing this host does not have.
+(ok "a version-suffixed DLL is matched" (ffi-dll-variant? "libcrypto-3-x64.dll" "crypto"))
+(ok "and the 1.1 spelling too"          (ffi-dll-variant? "libcrypto-1_1-x64.dll" "crypto"))
+(ok "the un-prefixed form matches"      (ffi-dll-variant? "crypto-3-x64.dll" "crypto"))
+(ok "case is not significant"           (ffi-dll-variant? "LIBCRYPTO-3-X64.DLL" "crypto"))
+;; the conventional names are tried first and are not repeated by the glob
+(ok "the bare conventional name is not re-listed" (not (ffi-dll-variant? "libcrypto.dll" "crypto")))
+;; a longer name that merely starts the same way is a different library
+(ok "a longer name is a different library" (not (ffi-dll-variant? "libcryptohelper.dll" "crypto")))
+(ok "another library's file does not match" (not (ffi-dll-variant? "libssl-3-x64.dll" "crypto")))
+(ok "a non-DLL does not match"          (not (ffi-dll-variant? "libcrypto-3-x64.so" "crypto")))
+;; zlib1.dll is NOT a versioned spelling of "z" — no separator after the name —
+;; so libz stays a library that has to declare its Windows candidate itself.
+(ok "zlib1.dll is not derived from \"z\"" (not (ffi-dll-variant? "zlib1.dll" "z")))
+
+;; The candidate list is what load-natives! falls back to for a spec that
+;; declares nothing for the running platform, so its SHAPE is part of the
+;; contract: the conventional spellings first, in the loader's own order.
+(ok "the conventional names lead on this host"
+    (let ((cs (ffi-system-library-candidates "z")))
+      (case (sa-os-family)
+        ((macos)   (equal? (list "libz.dylib" "z.dylib") cs))
+        ((windows) (and (string=? "z.dll" (car cs)) (string=? "libz.dll" (cadr cs))))
+        (else      (string=? "libz.so" (car cs))))))
+;; and load-system-library is that same list, so the two can never drift
+(ok "load-system-library opens one of them"
+    (guard (e (#t #f))
+      (let ((lib (ffi-load-system-library "c")))
+        (and lib #t))))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

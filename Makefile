@@ -166,7 +166,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -1029,6 +1029,15 @@ adaptercheck:
 # not build on, so the table is pinned per tag rather than per running machine.
 hostprops:
 	@$(CHEZ) --script test/chez/host-derived-props-test.ss
+
+# java.io.File/getCanonicalPath's LEXICAL half, per platform (#991). On Windows
+# realpath(3) is not bound, so the fallback IS getCanonicalPath there — and its
+# POSIX-only spelling rejoined every segment as "/" + segment, answering
+# "/C:/Users/x/a.txt" for a drive-absolute path, which no later read or write
+# could open. Like hostprops, the rows that broke are unreachable from the host
+# CI runs on, so the platform (and realpath itself) is a parameter.
+winpath:
+	@$(CHEZ) --script test/chez/win-path-test.ss
 
 # The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
 # enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file

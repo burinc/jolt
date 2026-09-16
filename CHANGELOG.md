@@ -32,6 +32,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows: an absolute FILE argument is no longer read as project-relative.**
+  `file-arg` recognized one absolute spelling — a leading `/` — so `jolt
+  C:/Users/x/hello.clj` (and `jolt run C:\Users\x\hello.clj`, and every UNC
+  path) was joined to the project directory and the prebuilt binary, where
+  `JOLT_PWD` is unset, tried to open `./C:/Users/x/hello.clj`. The argument is
+  now classified the way `jolt.deps` classifies a dependency path: drive-absolute
+  and UNC paths are used as given, as are the two rooted-but-not-absolute forms
+  (`/x`, rooted on the current drive, and `C:x`, on that drive's own current
+  directory) that this process cannot resolve better than the OS can. Only a
+  genuinely relative path is joined to the project directory, and `.\x.clj` is
+  the same argument as `./x.clj` there. (#992)
+
+- **Windows: `File.getCanonicalPath` returns a path that can be opened.**
+  `realpath(3)` is not bound on a Windows build, so canonicalization falls back
+  to folding the path lexically — and that fallback was a POSIX model: it split
+  on `/` only and rejoined *every* segment as `"/" + segment`, so
+  `(.getCanonicalPath (File. "C:/Users/x/a.txt"))` answered `/C:/Users/x/a.txt`.
+  The leading `/` then resolved against the current drive, so reading or writing
+  the value a caller had just canonicalized failed as `C:/C:/Users/x/…` —
+  `babashka.fs/canonicalize` with it, which is the JVM-family idiom for a file's
+  identity. The fallback now splits a path into its root and the segments under
+  it and reproduces the root instead of inventing one: a drive root (`C:/`), a
+  UNC share or device root (`//server/share/`, `//?/C:/`), or the current-drive
+  root (`/`). Both separators are recognized, so a backslash path is no longer
+  one unsplittable segment, and one file has one canonical string however the
+  caller spelled it — which is the identity comparison `getCanonicalPath` exists
+  for. POSIX behaviour is unchanged. (#991)
+
+- **A `:jolt/native` spec with no candidates for the running platform is no
+  longer a silent non-search.** `load-natives!` read exactly the key
+  `current-platform` selected, so a spec declaring `:darwin`/`:linux` only —
+  which is every library `jolt-lang/crypto` and `jolt-lang/http-client` declare —
+  searched for *nothing* on Windows and still failed with `required native
+  library crypto not found — tried []`, about a DLL that was on `PATH` and beside
+  `jolt.exe`. Three changes: a spec that names a library but declares nothing for
+  this platform now falls back to the platform's conventional spellings of that
+  name, the same list `load-system-library` uses — and on Windows that list now
+  also globs the loader's search directories for the version-suffixed files
+  (`libcrypto-3-x64.dll`) that no bare name can reach, mirroring the `libz.so.*`
+  glob the Unix path already had. The diagnostic says what actually happened
+  (`has no :linux candidates (declares :darwin, :windows)`) rather than reporting
+  an empty search as a missing file, and drops the "(a task may build it)" hint
+  for a library no task was told the name of. And two declarations of the same
+  library now reconcile by overlay rather than winner-takes-all: an app can add
+  the `:windows` candidates a dependency is missing without restating that
+  dependency's `:darwin` and `:linux` lists, and the declaring root travels with
+  the candidates it belongs to, so a dependency's relative `native/libfoo.so`
+  still resolves against that dependency. A rooted candidate is left for the OS
+  to resolve whatever its spelling, too: only `/` and a drive prefix counted as
+  rooted, so a UNC or current-drive-rooted path (`\\server\share\bin\…`) was
+  joined to the project directory — which the Windows glob can now compose out
+  of a `PATH` entry. (#989)
+
 - **`clojure.core/Inst` is the reference's protocol.** `inst?` and `inst-ms` were
   two host checks over the `#inst` representation (plus a tag probe for a
   `java.time.Instant`), so `(extend-protocol Inst MyType ...)` changed nothing,
