@@ -2370,6 +2370,16 @@
   {:suite "metadata / collection ops preserve meta" :label "value preserved through conj" :expected "[1 2]" :actual "(conj (with-meta [1] {:k 9}) 2)" :portability :common}
   {:suite "metadata / collection ops preserve meta" :label "empty list singleton unaffected" :expected "nil" :actual "(do (with-meta () {:leak 1}) (meta ()))" :portability :common}
   {:suite "metadata / collection ops preserve meta" :label "empty vector literal unaffected" :expected "nil" :actual "(do (with-meta [] {:leak 1}) (meta []))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "pop on list to empty keeps meta" :expected "{:k 9}" :actual "(meta (pop (with-meta (list 1) {:k 9})))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "pop on list answers the tail's own meta" :expected "[nil nil]" :actual "(let [l (with-meta (list 1 2) {:k 9})] [(meta (pop l)) (meta (rest l))])" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "conj on a cons carries none" :expected "nil" :actual "(meta (conj (with-meta (cons 1 [2]) {:k 9}) 0))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "conj on a lazy seq carries none" :expected "nil" :actual "(meta (conj (with-meta (lazy-seq [1]) {:k 9}) 0))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "into a list carries" :expected "{:k 9}" :actual "(meta (into (with-meta (list 1) {:k 9}) [2]))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "into a cons carries none" :expected "nil" :actual "(meta (into (with-meta (cons 1 [2]) {:k 9}) [3]))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "with-meta forces a lazy seq" :expected "[true true {:k 9} true]" :actual "(let [ls (lazy-seq [1 2]) l2 (with-meta ls {:k 9})] [(realized? ls) (realized? l2) (meta l2) (= [1 2] l2)])" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "vec drops a vector's meta" :expected "nil" :actual "(meta (vec (with-meta [1 2] {:k 9})))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "a carry shares the meta map" :expected "true" :actual "(let [v (with-meta [1] {:k 9})] (identical? (meta v) (meta (conj v 2))))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "with-meta identity shortcut" :expected "[true false]" :actual "(let [m (with-meta {} {:k 9})] [(identical? m (with-meta m (meta m))) (identical? m (with-meta m nil))])" :portability :common}
   {:suite "metadata / def metadata" :label "^:dynamic var binds" :expected "9" :actual "(do (def ^:dynamic *d* 1) (binding [*d* 9] *d*))" :portability :common}
   {:suite "metadata / def metadata" :label "^:private on var" :expected "true" :actual "(do (def ^:private pv 1) (:private (meta (var pv))))" :portability :common}
   {:suite "metadata / def metadata" :label "^Type tag on var" :expected "java.lang.String" :actual "(do (def ^String tv \"a\") (:tag (meta (var tv))))" :portability :jvm}

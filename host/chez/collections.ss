@@ -85,10 +85,17 @@
 (define pv-width 32)
 (define pv-mask 31)
 (define pv-empty-node (vector))
+;;
+;; `meta` is the vector's metadata, jolt-nil or a map — PersistentVector's _meta.
+;; natives-meta.ss owns every read and write of the slot (it is written only on
+;; an instance nobody else holds yet; see coll-meta-set! there). Image-format
+;; surface: chez-pvec-v4. Instances travel raw in a state image, so the layout
+;; (cnt shift root tail ent hasheq meta) is frozen; chez-pvec-v3 (no meta slot)
+;; restores through state-image.ss's legacy arm.
 (define-record-type (pvec %mk-pvec pvec?)
-  (fields cnt shift root tail ent (mutable hasheq)) (nongenerative chez-pvec-v3))
+  (fields cnt shift root tail ent (mutable hasheq) (mutable meta)) (nongenerative chez-pvec-v4))
 (define (mk-pvec cnt shift root tail ent)
-  (%mk-pvec cnt shift root tail ent 0))
+  (%mk-pvec cnt shift root tail ent 0 jolt-nil))
 
 ;; `ent` is the vector's KIND, not just the entry flag: #f = plain vector,
 ;; #t = map entry (above), 'subvec = a subvec view (class
@@ -100,12 +107,12 @@
 ;; (documented above), a subvec stays a subvec — the JVM's SubVector answers
 ;; cons/assocN/pop with a SubVector.
 (define (pv-derived-ent p) (let ((e (pvec-ent p))) (if (eq? e #t) #f e)))
-;; same structure, same cached hash, a different kind (fresh identity: the meta
-;; side-table keys by identity, and a subvec is a fresh nil-meta view anyway)
+;; same structure, same cached hash, a different kind and no metadata (a subvec
+;; is a fresh nil-meta view, RT.subvec's; an entry never carries any)
 (define (pvec-with-ent p e)
   (if (eq? (pvec-ent p) e)
       p
-      (%mk-pvec (pvec-cnt p) (pvec-shift p) (pvec-root p) (pvec-tail p) e (pvec-hasheq p))))
+      (%mk-pvec (pvec-cnt p) (pvec-shift p) (pvec-root p) (pvec-tail p) e (pvec-hasheq p) jolt-nil)))
 ;; the public subvec stamp: a non-empty slice is a SubVector; an empty one is
 ;; RT.subvec's PersistentVector.EMPTY, so it stays plain
 (define (pvec-as-subvec r)
@@ -1007,14 +1014,15 @@
 ;; array to hash mode when assoc would grow it past the thresholds below, and
 ;; never back (PersistentHashMap.without does not demote).
 ;;
-;; Image-format surface: chez-pmap-v5. Instances travel raw in a state image,
-;; so the layout (root cnt hasheq) is frozen; the previous generation
-;; (chez-pmap-v4: root cnt order hasheq all-kw, a trie root plus an order list)
-;; restores through state-image.ss's legacy arm.
-(define-record-type pmap (fields root cnt (mutable hasheq)) (nongenerative chez-pmap-v5))
-(define make-pmap
-  (let ((raw (record-constructor (record-type-descriptor pmap))))
-    (lambda (root cnt) (raw root cnt 0))))
+;; `meta` is the map's metadata, jolt-nil or a map (natives-meta.ss owns the
+;; slot, as for pvec). Image-format surface: chez-pmap-v6. Instances travel raw
+;; in a state image, so the layout (root cnt hasheq meta) is frozen; the two
+;; previous generations (chez-pmap-v5: root cnt hasheq; chez-pmap-v4: root cnt
+;; order hasheq all-kw, a trie root plus an order list) restore through
+;; state-image.ss's legacy arm.
+(define-record-type (pmap %mk-pmap pmap?)
+  (fields root cnt (mutable hasheq) (mutable meta)) (nongenerative chez-pmap-v6))
+(define (make-pmap root cnt) (%mk-pmap root cnt 0 jolt-nil))
 (define (pmap-array? m) (not (hnode? (pmap-root m))))
 (define amap-no-slots (vector))
 (define empty-pmap (make-pmap amap-no-slots 0))            ; {} = the shared empty array map
@@ -1310,10 +1318,11 @@
   (when (fxodd? (length kvs)) (odd-kvs-error "map entries"))
   (hash-from-kvs kvs))
 
-(define-record-type pset (fields m (mutable hasheq)) (nongenerative chez-pset-v2))
-(define make-pset
-  (let ((raw (record-constructor (record-type-descriptor pset))))
-    (lambda (m) (raw m 0))))
+;; `meta` as for pvec/pmap. Image-format surface: chez-pset-v3 (m hasheq meta);
+;; chez-pset-v2 (no meta slot) restores through state-image.ss's legacy arm.
+(define-record-type (pset %mk-pset pset?)
+  (fields m (mutable hasheq) (mutable meta)) (nongenerative chez-pset-v3))
+(define (make-pset m) (%mk-pset m 0 jolt-nil))
 ;; sets are ALWAYS hash-ordered (JVM PersistentHashSet), backed by pmap in hash mode.
 (define empty-pset (make-pset empty-pmap-hash))   ; sets are ALWAYS hash-ordered (JVM PersistentHashSet)
 (define (pset-conj s e) (if (pmap-contains? (pset-m s) e) s (make-pset (pmap-assoc (pset-m s) e e))))
@@ -1411,11 +1420,11 @@
           ;; 1-arity returns the coll untouched — (conj nil) is nil
           ((null? xs) coll)
           ((jolt-nil? coll) (fold-left jolt-conj1 jolt-empty-list xs))
-          (else (meta-carry coll (fold-left jolt-conj1 coll xs)))))))
+          (else (meta-carry-conj coll (fold-left jolt-conj1 coll xs)))))))
 (define jolt-conj2 (lambda (coll x)
   (if (jolt-nil? coll)
       (jolt-conj1 jolt-empty-list x)
-      (meta-carry coll (jolt-conj1 coll x)))))
+      (meta-carry-conj coll (jolt-conj1 coll x)))))
 
 ;; A host shim registers a type's get via register-get-arm! (handler: (coll k d) ->
 ;; value) instead of set!-wrapping jolt-get — disjoint coll types, checked before the
@@ -1704,7 +1713,11 @@
 (define (jolt-pop coll)
   (cond ((jolt-nil? coll) jolt-nil)                                 ; RT.pop(nil) is nil
         ((pvec? coll) (meta-carry coll (pvec-pop coll)))
-        ((and (cseq? coll) (cseq-list? coll)) (meta-carry coll (jolt-rest coll)))
+        ;; PersistentList.pop answers its rest as it stands: EMPTY.withMeta(meta())
+        ;; when that rest is empty, otherwise the shared tail node with the tail's
+        ;; own meta. Carrying onto the shared tail would change (rest l) too.
+        ((and (cseq? coll) (cseq-list? coll))
+         (let ((r (jolt-rest coll))) (if (empty-list-t? r) (meta-carry coll r) r)))
         ((empty-list-t? coll) (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "Can't pop empty list")))
         (else (jolt-stack-throw coll))))
 

@@ -20,8 +20,13 @@
   (fields (mutable thunk) (mutable val)
           (mutable realized? jolt-lazyseq-realized-flag jolt-lazyseq-realized-flag-set!)
           (mutable error? jolt-lazyseq-error-flag jolt-lazyseq-error-flag-set!)
-          (mutable lock))
-  (nongenerative jolt-lazyseq-v2))
+          (mutable lock) (mutable meta))
+  (nongenerative jolt-lazyseq-v3))
+;; `meta` (last, after the lock so its slot index below is unchanged) is the
+;; node's metadata, jolt-nil or a map — LazySeq's _meta. natives-meta.ss owns the
+;; slot; it is written only on a node nobody else holds yet. The layout travels
+;; raw in a state image (jolt-lazyseq-v3); jolt-lazyseq-v2, without the slot,
+;; restores through state-image.ss's legacy arm.
 ;; The thunk field is the node's ONE published word, exactly as a cell's tail is
 ;; (seq.ss seq-tail-realized?): the thunk -- a procedure, or a lazy-src
 ;; descriptor -- until the node is forced, and after it the seq (cseq | jolt-nil)
@@ -36,7 +41,7 @@
 ;; the lock field's position for the claiming CAS (seq.ss force-claimed!),
 ;; checked at load like cseq-lock-index
 (define jolt-lazyseq-lock-index 4)
-(let ((x (make-jolt-lazyseq 'th 'v #f #f #f)))
+(let ((x (make-jolt-lazyseq 'th 'v #f #f #f jolt-nil)))
   (unless (and (sa-record-cas! x jolt-lazyseq-lock-index #f 'probe)
                (eq? (jolt-lazyseq-lock x) 'probe)
                (eq? (jolt-lazyseq-thunk x) 'th) (eq? (jolt-lazyseq-val x) 'v)
@@ -58,11 +63,11 @@
 ;; for the duration (seq.ss force-claimed!) and publishes behind a release
 ;; fence; reads stay free.
 
-(define (jolt-make-lazy-seq thunk) (make-jolt-lazyseq thunk jolt-nil #f #f #f))
+(define (jolt-make-lazy-seq thunk) (make-jolt-lazyseq thunk jolt-nil #f #f #f jolt-nil))
 ;; the descriptor form: a producer that records what it is instead of closing
 ;; over it, so the cell can be written to a state image (seq.ss lazy-src).
 (define (jolt-make-lazy-src fn a b)
-  (make-jolt-lazyseq (make-lazy-src fn a b) jolt-nil #f #f #f))
+  (make-jolt-lazyseq (make-lazy-src fn a b) jolt-nil #f #f #f jolt-nil))
 
 ;; force once and memoize. The thunk is (fn [] (coll->cells body)); coll->cells
 ;; already coerced the body to a seq (cseq | nil) via the live jolt-seq, so the

@@ -606,13 +606,13 @@
 ;; stale values in the lock field
 (define ts12-runs2 0)
 (define ts12-stale
-  (make-cseq 0 (lambda () (set! ts12-runs2 (+ ts12-runs2 1)) (cseq-realized 2 jolt-nil)) #f sk-cons #f 0 #f (make-mutex)))
+  (make-cseq 0 (lambda () (set! ts12-runs2 (+ ts12-runs2 1)) (cseq-realized 2 jolt-nil)) #f sk-cons #f 0 #f (make-mutex) jolt-nil))
 (ok "12. a cell restored with a mutex in its lock field still forces"
     (run-threads 4 (lambda (i) (seq-more ts12-stale)) 30.0 "12. stale mutex"))
 (ok "12. ...once" (and (= 1 ts12-runs2) (= 2 (seq-first (seq-more ts12-stale)))))
 (define ts12-runs3 0)
 (define ts12-foreign
-  (make-cseq 0 (lambda () (set! ts12-runs3 (+ ts12-runs3 1)) (cseq-realized 3 jolt-nil)) #f sk-cons #f 0 #f (list 'forcing)))
+  (make-cseq 0 (lambda () (set! ts12-runs3 (+ ts12-runs3 1)) (cseq-realized 3 jolt-nil)) #f sk-cons #f 0 #f (list 'forcing) jolt-nil))
 (ok "12. a cell restored with another process's claim token still forces"
     (run-threads 4 (lambda (i) (seq-more ts12-foreign)) 30.0 "12. foreign token"))
 (ok "12. ...once" (and (= 1 ts12-runs3) (= 3 (seq-first (seq-more ts12-foreign)))))
@@ -714,16 +714,16 @@
 (ok "15. a bare fork-thread starts from the default reader modes and no txn"
     (equal? ts15-bare '(#f #f #f)))
 
-;; --- 16. the metadata side-table: lock-free reads under racing writers -------
-;; meta-table-get (natives-meta.ss) reads without the mutex and repeats under it
-;; when a writer's generation moved across the lookup, so a conj/assoc that
-;; carries meta forward never LOSES it to a concurrent with-meta rebuilding the
-;; buckets. The property: every thread attaches meta to its own fresh vectors
-;; and reads it back through a carry, while every other thread does the same
-;; (which is what grows and rehashes the one shared table). A dropped carry is
-;; a nil where the thread's own map was expected. Two writers racing was also
-;; the corruption case for this table before its mutex; both halves run here.
-(printf "\n== 16. the metadata table: carries under concurrent with-meta ==\n")
+;; --- 16. collection metadata under concurrent with-meta / carry ---------------
+;; A collection's meta lives in a slot of its own record (natives-meta.ss):
+;; with-meta allocates a copy and a conj that carries meta forward copies the
+;; slot, so no thread shares anything with another here. The property that has
+;; to hold whatever the mechanism: every thread attaches meta to its own fresh
+;; vectors and reads it back through a carry while every other thread does the
+;; same, and no carry is ever LOST — a nil where the thread's own map was
+;; expected. (This was the side-table's seqlock proof when collections read
+;; that table; the side table still serves records, reifies and fns.)
+(printf "\n== 16. collection metadata: carries under concurrent with-meta ==\n")
 (define ts16-lost 0)
 (define ts16-lost-mu (make-mutex))
 (define ts16-done

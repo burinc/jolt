@@ -153,11 +153,13 @@
      (let ((s (jolt-need-string s)))
        (jolt-substr s (jolt->idx start) (jolt->idx end))))))
 
-;; vec: a pvec from any seqable (already-pvec returns itself).
+;; vec: a pvec from any seqable. A vector comes back as itself minus its
+;; metadata — clojure.core/vec's (with-meta coll nil) — so it is a copy only when
+;; it carried some.
 (define (jolt-vec coll)
   (cond
     ((jolt-nil? coll) (jolt-vector))
-    ((pvec? coll) coll)
+    ((pvec? coll) (if (eq? (pvec-meta coll) jolt-nil) coll (coll-with-meta coll jolt-nil)))
     ((string? coll) (apply jolt-vector (string->list coll)))
     ;; a source that drives its own reduce (IReduce/IReduceInit deftype or
     ;; reify) builds the vector by reduction, like LazilyPersistentVector.

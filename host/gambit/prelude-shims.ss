@@ -193,12 +193,13 @@
           #f))
     id))
 
-;; R6RS record runtime introspection over the shim registry. CENSUS (boot
-;; manifest, 2026-08-11): record-constructor + record-type-descriptor only, the
-;; make-pmap/make-pset raw-constructor fast paths in collections.ss. Under the
-;; shim a record type NAME is bound to its registered id (make-jolt-record-type
-;; returns it), so the descriptor is the registry rtd and the raw constructor
-;; is rebuilt from it.
+;; R6RS record runtime introspection over the shim registry: record-constructor
+;; + record-type-descriptor. No shared runtime file calls them any more
+;; (collections.ss names its raw constructors in the record definition, as
+;; pvec always did), so they serve a host file that reaches for the R6RS form.
+;; Under the shim a record type NAME is bound to its registered id
+;; (make-jolt-record-type returns it), so the descriptor is the registry rtd
+;; and the raw constructor is rebuilt from it.
 (define (record-type-descriptor name)
   (if (fixnum? name) (table-ref jolt-record-id-table name #f) #f))
 (define (record-constructor rtd)
