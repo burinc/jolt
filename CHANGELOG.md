@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`clojure.core/Inst` is the reference's protocol.** `inst?` and `inst-ms` were
+  two host checks over the `#inst` representation (plus a tag probe for a
+  `java.time.Instant`), so `(extend-protocol Inst MyType ...)` changed nothing,
+  a miss said `inst-ms requires an inst`, and SCI 0.15+, which builds its
+  `clojure.core/Inst` entry from the var at load, could not load at all. `Inst`
+  is now `defprotocol`'d in the seed with `inst-ms*` as its method, `inst-ms`
+  calls it, `inst?` is `satisfies?`, and it is extended to `java.util.Date` (the
+  class every `#inst` and `java.sql` date reports) in core and to
+  `java.time.Instant` by `jolt.time` when it loads, as `core_instant18.clj`
+  does on the JVM. A pre-1970 `Instant` with sub-millisecond nanos read one
+  millisecond high (the tag probe truncated toward zero; `toEpochMilli` floors).
+- **`clojure.lang.RT`'s value statics.** `get`, `nth`, `count`, `seq`, `first`,
+  `next`, `more`, `cons`, `conj`, `assoc`, `dissoc`, `contains`, `find`, `keys`,
+  `vals`, `peek`, `pop`, `subvec`, `aget`, `aset`, `alength`, the primitive
+  casts, `isReduced`, `list`, `vector` and `set` — what the reference's inlined
+  core fns compile to, and what an interpreter reaches for by name: SCI's `aset`
+  on a primitive array is `RT/aset`, so `(aset ^longs a i v)` inside SCI died
+  with `No matching field or method: clojure.lang.RT/aset`, and its newer
+  releases rewrite a two-argument `get` to `RT/get`. Each is the core fn it
+  stands for; `RT/set` checks duplicates like `PersistentHashSet/createWithCheck`,
+  whose own duplicate throw is now the JVM's `IllegalArgumentException` rather
+  than an `ex-info`. Certified against Clojure 1.12.5.
 - **A protocol dispatch miss is worded as the reference words it.** Calling a
   protocol method on a value nothing extends raised `No method area in
   user/Shape`; the reference's `emit-method-builder` raises `No implementation
@@ -25,13 +47,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #'sci.impl.types/HasName found for class: nil`) — the strings the JVM
   produces for the same program — and the `scifunctional` gate now pins both
   next to the supported recipe. (#1006)
-
 - **`line-seq` over a reader is lazy.** It drained the reader whole and split
   the string, so the first line was not visible until the last had been read —
   only latency over a file, a hang over a reader whose producer has not stopped
   (an SSE body, a tailed log, a pipe). It now reads one `readLine` per element,
   as the JVM's does; the elements are unchanged, since every reader answers
   `readLine` with the same `\n` / `\r` / `\r\n` rule the drain applied. (#1007)
+
+### Changed
+
+- **`satisfies?` memoizes its extended walk.** For a value that is not a record
+  implementing the protocol inline, `satisfies?` walked every tag of the value's
+  class through the protocol registry on every call — twenty string lookups for
+  a map. The walk's answer is a function of the value's tag list, so it is now
+  kept per (protocol, tag list), keyed by the list object the class graph hands
+  out and stamped with the protocol registry's and the class graph's epochs,
+  invalidated by any registration, prune or inline marker the way the per-site
+  dispatch caches are. Only a list the graph keeps is stored: a value whose
+  tags are built per call (a record, a reify, a library's registered class —
+  whose tags come in set order and share a first element with its siblings)
+  never answers for another and is never cached, and the spliced list a number
+  reports is now cached by the graph too. Against `main` in one session: a miss
+  on a map 1210 → 308 ns, on a Long 556 → 253, on a string 324 → 248, on a
+  record unchanged. `inst?`, now the reference's `(satisfies? Inst x)`, is that
+  walk: 281 ns on a map and 229 on a Long against ~110 for the tag probe it
+  replaced (the probe could not see an extension; the difference is the
+  protocol answer).
 
 ## [0.8.8] - 2026-09-15
 

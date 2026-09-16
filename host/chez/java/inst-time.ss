@@ -3,8 +3,9 @@
 ;; A #inst literal lowers (analyzer :inst node -> emit) to (jolt-inst-from-string
 ;; "…"); this file parses the RFC3339 string to epoch-ms and models the value as a
 ;; `jinst` record (one flonum field, ms). Equality / map-key hashing are by the
-;; INSTANT (offset-normalized). The overlay inst?/inst-ms read (get x :jolt/type)/(get x :ms),
-;; so jolt-get answers those off a jinst — the overlay fns then work unchanged.
+;; INSTANT (offset-normalized). jolt-get answers :jolt/type and :ms off a jinst
+;; (the taxonomy keys); inst?/inst-ms themselves are the seed's Inst protocol,
+;; extended to java.util.Date, the class a jinst reports.
 ;;
 ;; This file owns the always-available java.util / java.text layer: java.util.Date,
 ;; java.sql.Date / Timestamp, Calendar, TimeZone, java.text.SimpleDateFormat,
@@ -393,9 +394,6 @@
                ((string=? tn "Timestamp") #f)
                (else 'pass)))
         (else 'pass)))))
-
-;; inst-ms* is a seed native (the overlay inst-ms reads (get x :ms), now answered).
-(def-var! "clojure.core" "inst-ms*" (lambda (i) (jinst-ms i)))
 
 ;; --- java.time bridge from the #inst / java.util layer -----------------------
 ;; ms-of projects a core date value (a #inst, a Calendar, a java.sql.Date) to

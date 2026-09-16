@@ -132,6 +132,10 @@
     (hashtable-delete! clone-registry type-tag)))
 
 (define (prune-type-registry! keep?)
+  ;; a registry change like any other to the caches keyed on the epoch (the
+  ;; PICs, satisfies?'s memo): a tag a later definition reuses must not find a
+  ;; pruned type's answer
+  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -370,11 +374,37 @@
 ;; one exact integer for Long and Integer. jch-tags is (fqn simple ancestors…
 ;; "Object"), so keeping the first two ahead of the extras leaves the concrete
 ;; class outranking both the supersets and the ancestry in dispatch order.
+;;
+;; Cached per name the way jch-tags is (same epoch stamp, same mutex, same
+;; unlocked read), so every Long reports the ONE list rather than a fresh
+;; splice per dispatch — which is also what lets the satisfies? memo
+;; (records-dispatch.ss) keep an answer for a number: it stores only a list the
+;; graph owns, and graph-owned-tags? below is how it asks.
+(define jch-tags-plus-cache (make-hashtable string-hash string=?))
 (define (jch-tags-plus name extra)
-  (let ((ts (jch-tags name)))
-    (if (or (null? ts) (null? (cdr ts)))
-        (append ts extra)
-        (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+  (let ((e (hashtable-ref jch-tags-plus-cache name #f)))
+    (if (and e (fx= (car e) jch-graph-epoch))
+        (cdr e)
+        (let* ((epoch jch-graph-epoch)
+               (ts (jch-tags name))
+               (result (if (or (null? ts) (null? (cdr ts)))
+                           (append ts extra)
+                           (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+          (jolt-with-mutex jch-cache-mutex
+            (when (fx= epoch jch-graph-epoch)
+              (hashtable-set! jch-tags-plus-cache name (cons epoch result))))
+          result))))
+;; Is TAGS a list the class graph hands out and keeps — jch-tags' or
+;; jch-tags-plus' cached list for its own head — as opposed to one built for a
+;; single call (a record's cons onto its ancestry, a reify's, a named fn's)?
+;; A per-call list is never the same object twice, so a cache keyed on the
+;; object must not store it.
+(define (graph-owned-tags? tags)
+  (and (pair? tags)
+       (let ((head (car tags)))
+         (or (eq? tags (jch-tags head))
+             (let ((e (hashtable-ref jch-tags-plus-cache head #f)))
+               (and e (eq? tags (cdr e))))))))
 
 ;; host type-tag candidates for a non-record value (extend-protocol on builtins).
 (define (value-host-tags obj)
@@ -841,6 +871,9 @@
 (define (register-inline-protocol! type-name proto-name)
   (let ((tag (string-append (chez-current-ns) "." type-name)))
     (jolt-with-mutex rec-tbl-mu
+      ;; the type gains a protocol: an epoch bump like a method registration,
+      ;; so a memoized satisfies? (records-dispatch.ss) re-asks
+      (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
       (let ((ti (or (hashtable-ref type-registry tag #f)
                     (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry tag h) h))))
         (unless (hashtable-ref ti proto-name #f)
