@@ -90,14 +90,15 @@
 
 ;; The meta slot of a collection that has one: jolt-nil or a map. #f when X is
 ;; not one of those kinds — jolt-nil is a record and so truthy, which is what
-;; lets a cond arm test the slot and read it in one step.
+;; lets a cond arm test the slot and read it in one step. Kinds in order of how
+;; often an op carries: this runs on every assoc/conj/into.
 (define (coll-meta x)
-  (cond ((pvec? x) (pvec-meta x))
-        ((pmap? x) (pmap-meta x))
-        ((pset? x) (pset-meta x))
+  (cond ((pmap? x) (pmap-meta x))
+        ((pvec? x) (pvec-meta x))
         ((cseq? x) (cseq-meta x))
-        ((empty-list-t? x) (empty-list-t-meta x))
+        ((pset? x) (pset-meta x))
         ((jolt-lazyseq? x) (jolt-lazyseq-meta x))
+        ((empty-list-t? x) (empty-list-t-meta x))
         (else #f)))
 ;; Fill the slot of an instance nobody else holds yet (see the header). The
 ;; callers: coll-with-meta's copy below, and state-image.ss's rebuilt objects.
@@ -214,11 +215,25 @@
 ;; node — and a copy is what keeps an op from changing what everyone else
 ;; holding DST reads. A side-table DST (a record, a sorted collection) is keyed
 ;; as it is, as it always was.
+;;
+;; This runs on every assoc/conj/into, and on this path a call to a top-level
+;; procedure is 4-6 ns (measured: a carry through coll-meta cost a list conj
+;; 12 ns, the same test open-coded 5). So the no-meta answer is ONE call: the
+;; kind test is the record predicate (open-coded by the compiler), the slot
+;; read a field, in order of how often each kind carries; only the side-table
+;; kinds and the rare attach go on to a second call.
+(define-syntax slot-carry
+  (syntax-rules ()
+    ((_ slot dst) (let ((m slot)) (if (eq? m jolt-nil) dst (meta-attach dst m))))))
 (define (meta-carry src dst)
-  (let ((fm (coll-meta src)))
-    (cond (fm (if (eq? fm jolt-nil) dst (meta-attach dst fm)))
-          ((meta-table-empty?) dst)
-          (else (let ((m (meta-table-get src))) (if m (meta-attach dst m) dst))))))
+  (cond ((pmap? src) (slot-carry (pmap-meta src) dst))
+        ((pvec? src) (slot-carry (pvec-meta src) dst))
+        ((cseq? src) (slot-carry (cseq-meta src) dst))
+        ((pset? src) (slot-carry (pset-meta src) dst))
+        ((jolt-lazyseq? src) (slot-carry (jolt-lazyseq-meta src) dst))
+        ((empty-list-t? src) (slot-carry (empty-list-t-meta src) dst))
+        ((meta-table-empty?) dst)
+        (else (let ((m (meta-table-get src))) (if m (meta-attach dst m) dst)))))
 (define (meta-attach dst m)
   (let ((cur (coll-meta dst)))
     (cond (cur (if (eq? cur m) dst (coll-with-meta dst m)))
@@ -226,11 +241,20 @@
 ;; conj's carry: the receiver kinds whose JVM cons threads meta are the
 ;; collections and a PersistentList — a list cell, and (), whose cons builds a
 ;; list with its meta. A Cons, a LazySeq or a vector's seq cons through
-;; ASeq.cons -> new Cons(o, this), with none.
+;; ASeq.cons -> new Cons(o, this), with none. Same one-call shape as above; the
+;; cell arm leads because conj onto a list has the lowest floor (16 ns), where
+;; one failed test ahead of it was a measured 6 ns.
 (define (meta-carry-conj src dst)
-  (if (or (and (cseq? src) (not (cseq-list? src))) (jolt-lazyseq? src))
-      dst
-      (meta-carry src dst)))
+  (cond ((cseq? src)
+         ;; the slot first: the kind only matters once there is meta to carry
+         (let ((m (cseq-meta src)))
+           (if (or (eq? m jolt-nil) (not (fx=? (cseq-kind src) sk-list))) dst (meta-attach dst m))))
+        ((pvec? src) (slot-carry (pvec-meta src) dst))
+        ((pmap? src) (slot-carry (pmap-meta src) dst))
+        ((pset? src) (slot-carry (pset-meta src) dst))
+        ((jolt-lazyseq? src) dst)
+        ((empty-list-t? src) (slot-carry (empty-list-t-meta src) dst))
+        (else (meta-carry src dst))))
 
 ;; (type x) — Clojure's (or (:type (meta x)) (class x)). With no JVM classes the
 ;; "class" is a host taxonomy: a record yields its ns-qualified class-name SYMBOL
