@@ -221,6 +221,45 @@
           "No implementation of method: :getName of protocol: #'sci.impl.types/HasName found for class: nil"
           (failing "(extend-type String raw/Shape (area [s] (count s)) (scaled [s k] s))")))
 
+;; SCI's IVar is a protocol, and a host var is a plain host value to it: neither
+;; SCI nor the JVM extends IVar to clojure.lang.Var, which is why the two rows
+;; above fail on both. An EMBEDDER can supply that extension — and on jolt the
+;; extension has to be spellable with clojure.lang.Var's own methods, the way it
+;; is written on the JVM. toSymbol is the one IVar names that jolt's Var did not
+;; answer (jolt#1031), so this whole form used to fail to compile here.
+;;
+;; It is pinned as an embedder-visible capability, not as a fix for the rows
+;; above: with IVar extended, alter-var-root gets past getRawRoot and the copied
+;; -as-is protocol dies one seam later instead — at the same ExceptionInfo, with
+;; the same message, that Clojure 1.12.5 raises for this exact program. The
+;; supported path remains the multimethod recipe below.
+(extend-type clojure.lang.Var
+  sci.impl.vars/IVar
+  (bindRoot [this v] (.bindRoot this v))
+  (getRawRoot [this] (.getRawRoot this))
+  (toSymbol [this] (.toSymbol this))
+  (isMacro [this] (.isMacro this))
+  (hasRoot [this] (.hasRoot this))
+  (setThreadBound [this _v] nil)
+  (unbind [this] (.unbindRoot this)))
+
+(check= "IVar extended to a host var answers through Var's own methods"
+        ['clojure.core/inc true true]
+        [(sci.impl.vars/toSymbol #'clojure.core/inc)
+         (sci.impl.vars/hasRoot #'clojure.core/inc)
+         (identical? clojure.core/inc (sci.impl.vars/getRawRoot #'clojure.core/inc))])
+
+(let [host-ns (sci/create-ns 'raw2)
+      ctx (sci/init {:classes {:allow :all}
+                     :namespaces {'raw2 {'Shape (sci/copy-var* #'Shape host-ns)
+                                         'area (sci/copy-var* #'area host-ns)
+                                         'scaled (sci/copy-var* #'scaled host-ns)}}})]
+  (check= "with IVar extended, the copied-as-is protocol dies at the JVM's next seam"
+          "Unable to resolve symbol: area"
+          (try (sci/eval-string* ctx "(defrecord Raw2 [s] raw2/Shape (area [_] s) (scaled [_ k] s))")
+               :evaluated
+               (catch clojure.lang.ExceptionInfo e (ex-message e)))))
+
 ;; the other direction: a SCI record or type reaching the HOST protocol answers
 ;; through the SCI method its defrecord/deftype registered. Only a method the
 ;; type actually registered counts — the :default is the host protocol itself,

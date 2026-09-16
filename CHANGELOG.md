@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The rest of `clojure.lang.Var`'s instance surface: `toSymbol`, `unbindRoot`,
+  `set`, `fn`, and the `ns` / `sym` FIELD spellings.** The var shim answered
+  eighteen members but not these, so each raised "No matching field found" — and
+  the one that mattered is `toSymbol`, because SCI's `IVar` protocol names it.
+  Neither SCI nor the JVM extends `IVar` to `clojure.lang.Var`, so an embedder
+  sharing a host var has to supply that extension itself; on the JVM it is seven
+  lines of `clojure.lang.Var` methods, and on jolt it did not compile, leaving
+  the embedder nothing to write. `ns` and `sym` are public final fields there,
+  so the JVM reads each as both `(.ns v)` and `(.-ns v)`; jolt answered only the
+  no-arg member. They now take the dash and nothing else on `Var` does — a
+  dashed spelling of a method is a field read, and the JVM's reflector has no
+  such field. `set` routes through the same one write path as `set!` and
+  `var-set` (validator first, thread binding only, "Can't change/establish root
+  binding" with none in place), `unbindRoot` puts the root back to the var's
+  `Unbound` marker through the pair of calls `ns-unmap` already used, and `fn`
+  is `deref` cast to `IFn`, so a var holding a non-fn reports the cast rather
+  than handing back a value the caller then fails to invoke. Seven corpus rows
+  certify the surface against Clojure 1.12.5.
+
+  This does NOT make a host protocol copied into SCI as-is work, and the
+  `scifunctional` rows that pin that refusal (jolt#1006) are unchanged: with
+  `IVar` extended, `alter-var-root` gets past `getRawRoot` and the copied-as-is
+  protocol dies one seam later at `Unable to resolve symbol`, which is
+  byte-for-byte what Clojure 1.12.5 raises for the same program. The gate pins
+  that second seam next to the first. The supported path for sharing a host
+  protocol remains the multimethod recipe beside them. (#1031)
+
 - **`Object.wait`, `.notify` and `.notifyAll`, on every object.** `locking` was
   already a real per-object monitor — reentrant, fiber-aware, shared with
   `monitor-enter` — but the condition-variable half of that monitor was in no host

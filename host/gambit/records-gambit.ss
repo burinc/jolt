@@ -2581,11 +2581,15 @@
        (lambda (f) (apply f obj rest)))
       ((var-cell? obj)
        (cond
-         ((string=? method-name "ns") (intern-ns! (var-cell-ns obj)))
+         ((or (string=? method-name "ns")
+              (string=? method-name "-ns"))
+          (intern-ns! (var-cell-ns obj)))
          ((or (string=? method-name "sym")
+              (string=? method-name "-sym")
               (string=? method-name "name"))
           (jolt-symbol #f (var-cell-name obj)))
-         ((string=? method-name "getName")
+         ((or (string=? method-name "getName")
+              (string=? method-name "toSymbol"))
           (jolt-symbol (var-cell-ns obj) (var-cell-name obj)))
          ((string=? method-name "toString")
           (string-append
@@ -2635,6 +2639,24 @@
             obj
             (car rest)
             (rd-args->list (cadr rest))))
+         ((and (string=? method-name "unbindRoot") (null? rest))
+          (var-root-set!
+            obj
+            (make-jolt-var-unbound
+              (var-cell-ns obj)
+              (var-cell-name obj)))
+          jolt-nil)
+         ((and (string=? method-name "set") (pair? rest))
+          (jolt-set-var! obj (car rest)))
+         ((and (string=? method-name "fn") (null? rest))
+          (let ((v (var-cell-deref obj)))
+            (if (jolt-fn? v)
+                v
+                (throw-jvm
+                  'ClassCastException
+                  (string-append
+                    (jolt-final-str v)
+                    " cannot be cast to clojure.lang.IFn")))))
          (else (dispatch-miss obj method-name rest))))
       ((condition? obj)
        (cond

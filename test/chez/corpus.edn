@@ -462,6 +462,21 @@
   {:suite "host-interop / Var surface" :label "getTag" :expected "[\"java.lang.String\" nil]" :actual "(do (def ^String vtv \"a\") [(.getName (.getTag (var vtv))) (.getTag (var inc))])" :portability :common}
   {:suite "host-interop / Var surface" :label "setMacro marks the var and its meta" :expected "[true true]" :actual "(do (defn vsm [] 1) (.setMacro (var vsm)) [(.isMacro (var vsm)) (:macro (meta (var vsm)))])" :portability :common}
   {:suite "host-interop / Var surface" :label "bindRoot / alterRoot" :expected "[2 11]" :actual "(do (def vbr 1) (.bindRoot (var vbr) 2) (def var2 1) (.alterRoot (var var2) + (seq [10])) [vbr var2])" :portability :common}
+  ;; The rest of clojure.lang.Var's instance surface (jolt#1031). toSymbol is the
+  ;; one SCI's IVar protocol names, so the IVar extension an embedder supplies
+  ;; for a host var — the same text on the JVM — now compiles on jolt too.
+  {:suite "host-interop / Var surface" :label "toSymbol is the qualified name" :expected "[(quote clojure.core/inc) true]" :actual "[(.toSymbol (var inc)) (= (.toSymbol (var inc)) (symbol \"clojure.core\" \"inc\"))]" :portability :common}
+  ;; ns and sym are public final FIELDS, so each reads under both spellings.
+  {:suite "host-interop / Var surface" :label "ns / sym read as fields and as no-arg members" :expected "[true true \"vfld\"]" :actual "(do (def vfld 7) [(= (.ns (var vfld)) (.-ns (var vfld))) (= (.sym (var vfld)) (.-sym (var vfld))) (name (.-sym (var vfld)))])" :portability :common}
+  ;; ...and nothing else on Var does: a dashed method name is a FIELD read, and
+  ;; the JVM's Reflector has no such field.
+  {:suite "host-interop / Var surface" :label "a dashed spelling of a Var METHOD is a field miss" :expected "\"No matching field found: getRawRoot for class clojure.lang.Var\"" :actual "(try (.-getRawRoot (var inc)) (catch IllegalArgumentException e (ex-message e)))" :portability :common}
+  {:suite "host-interop / Var surface" :label "unbindRoot puts the root back to Unbound" :expected "[false \"class clojure.lang.Var$Unbound\"]" :actual "(do (def vur 1) (.unbindRoot (var vur)) [(.hasRoot (var vur)) (str (class (.getRawRoot (var vur))))])" :portability :common}
+  ;; set writes the innermost THREAD binding and refuses to establish a root.
+  {:suite "host-interop / Var surface" :label "set writes the thread binding" :expected "[9 9]" :actual "(do (def ^:dynamic *vst* 1) (binding [*vst* 0] [(.set (var *vst*) 9) *vst*]))" :portability :common}
+  {:suite "host-interop / Var surface" :label "set with no thread binding refuses the root" :expected "\"Can't change/establish root binding of: vsu with set\"" :actual "(do (def vsu 1) (try (.set (var vsu) 2) (catch IllegalStateException e (ex-message e))))" :portability :common}
+  ;; fn is (IFn) deref() — the cast is observable.
+  {:suite "host-interop / Var surface" :label "fn is the deref cast to IFn" :expected "[true :cce]" :actual "[(= inc (.fn (var inc))) (do (def vfn0 1) (try (.fn (var vfn0)) (catch ClassCastException e :cce)))]" :portability :common}
   {:suite "host-interop / Var surface" :label "Var/find" :expected "[true nil]" :actual "[(= (var inc) (clojure.lang.Var/find (quote clojure.core/inc))) (clojure.lang.Var/find (quote clojure.core/nosuchxx))]" :portability :common}
   {:suite "host-interop / Var surface" :label "Var/find on a missing namespace / an unqualified symbol" :expected "[\"No such namespace: no.such\" \"Symbol must be namespace-qualified\"]" :actual "[(try (clojure.lang.Var/find (quote no.such/x)) (catch IllegalArgumentException e (ex-message e))) (try (clojure.lang.Var/find (quote inc)) (catch IllegalArgumentException e (ex-message e)))]" :portability :common}
   {:suite "host-interop / Var surface" :label "Var/intern by symbols, and by Namespace with a root" :expected "[\"vi2\" false \"vi3\" 3]" :actual "(let [ns (ns-name *ns*) a (clojure.lang.Var/intern ns (quote vi2)) b (clojure.lang.Var/intern (the-ns ns) (quote vi3) 3)] [(name (.sym a)) (.isBound a) (name (.sym b)) (deref b)])" :portability :common}
