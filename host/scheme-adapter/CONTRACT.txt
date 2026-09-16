@@ -159,7 +159,13 @@ sa-gc-install-ceiling!
 # a zero vector; the walker/procedure entry points degrade to '() / #f and
 # the backtrace renders without frames, gated by sa-introspect-enabled?
 # (a dynamic parameter — the degraded-backtrace gate flips it to prove throws
-# still carry type+message).
+# still carry type+message). sa-procedure-code-name is the one entry the
+# runtime reads for IDENTITY rather than for a report: (sa-procedure-code-name
+# p) -> the string the procedure's code object was bound under, the same for
+# every closure of one lambda, or #f; continuations.ss recognises an escape
+# wrapper by it. A target that answers #f there makes escape-fn? answer false,
+# which the contract permits; it must never answer a name for a procedure that
+# was not bound under it.
 sa-host-tag
 sa-os-family
 sa-arch
@@ -168,6 +174,7 @@ sa-stats
 sa-introspect-enabled?
 sa-continuation-frames
 sa-procedure-info
+sa-procedure-code-name
 #
 # tier: capability-ffi
 # OUR OWN definitions in host/chez/scheme-adapter-runtime.ss (loaded FIRST in

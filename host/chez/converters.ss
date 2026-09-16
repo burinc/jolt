@@ -47,7 +47,7 @@
        (if ns
            (string-append ":" ns "/" (keyword-t-name v))
            (string-append ":" (keyword-t-name v)))))
-    ((fixnum? v) (number->string v))
+    ((fixnum? v) (jolt-fixnum->string v))
     ;; numbers and booleans reach the printer without an arm ever claiming them
     ;; (pr-fast-type?, rt.ss); the cases above already cover the rest of that set.
     ((pr-fast-type? v) (jolt-pr-str v))

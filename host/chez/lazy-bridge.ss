@@ -49,15 +49,14 @@
 ;; and because iterate/repeat/cycle and every map/filter chunk tail is a lazy
 ;; node, anything paid per node is paid per element of idiomatic seq pipelines.
 ;;
-;; `jolt-mt?` starts #f and flips to #t the first time a real OS thread is spawned
-;; (fork-thread is shadowed below). This is race-free: a single thread is either
-;; forking or forcing, never both, so no node is being realized on the lock-free
-;; path at the instant the flag turns on; and fork-thread establishes happens-
-;; before, so the spawned child observes the flip. Once multi-threaded, a first
-;; force claims the node by compare-and-swap for the duration (seq.ss
-;; force-claimed!) and publishes behind a release fence; reads stay free.
-(define jolt-mt? #f)
-(define (jolt-mark-mt!) (set! jolt-mt? #t))
+;; `jolt-mt?` (values.ss) starts #f and flips to #t the first time a real OS
+;; thread is spawned (fork-thread is shadowed below). This is race-free: a
+;; single thread is either forking or forcing, never both, so no node is being
+;; realized on the lock-free path at the instant the flag turns on; and
+;; fork-thread establishes happens-before, so the spawned child observes the
+;; flip. Once multi-threaded, a first force claims the node by compare-and-swap
+;; for the duration (seq.ss force-claimed!) and publishes behind a release
+;; fence; reads stay free.
 
 (define (jolt-make-lazy-seq thunk) (make-jolt-lazyseq thunk jolt-nil #f #f #f))
 ;; the descriptor form: a producer that records what it is instead of closing

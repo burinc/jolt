@@ -30,6 +30,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reacquired — so the catch clause runs inside the critical section the wait left.
   (#1011)
 
+### Performance
+
+- **Four process-wide locks on hot single-value paths are gone, and parallel
+  Clojure code scales again.** Eight threads each working on their OWN values
+  ran far slower per thread than one: `assoc` 32x, `swap!` 21x, `str` of an
+  integer 17x, a `#"…"` literal's `re-find` 24x, `hash` of a fresh string 12x,
+  every `letcc` capture serialized — standard-clojure-style's formatter spent
+  more than half its samples on eight carriers waiting for a mutex. The causes,
+  each one a global structure on a per-call path: the metadata side-table was
+  read under its mutex by every `conj`/`assoc` (its "no metadata" fast path
+  counted insertions and never came back down — 66 after the prelude alone,
+  table already empty); every `jolt.continuations` escape was registered in a
+  weak table under a mutex just so `escape-fn?` could answer; a regex literal
+  evaluates to a cache lookup, and the hit took the compile lock; Chez's
+  `number->string` is `(format "~d" x)` behind the formatter's one lock; and the
+  per-thread string-hash cache was weak, so fresh strings left an entry per call
+  for the collector to trace. Now: the metadata read is a seqlock over the table
+  (lock-free, repeats under the mutex only when a writer's generation moved —
+  `make threadsafety` scenario 16 loses a carry 1 run in 3 without it) and its
+  empty check reads the table's live size; an escape is recognised by its code
+  object's name (`sa-procedure-code-name`, a new adapter entry) with no
+  registry; the regex cache hit is read without the lock; integers render
+  through jolt's own digit loop (`str` of a Long 261 → 55 ns single-threaded,
+  `Long/toString` 221 → 98); the string-hash cache is a bounded strong table.
+  Per-thread slowdown at 8 threads after: `assoc` 3.8x, `swap!` 2.8x, `str`
+  1.4x, `re-find` 2.0x, `hash` 2.1x; single-threaded `assoc` 98 → 69 ns, `conj`
+  68 → 42, `meta` 51 → 25. `with-meta` itself still serializes on the table's
+  writer lock; the metadata field the JVM keeps on the collection is the fix
+  for that and is tracked separately. What remains under a profiler on an
+  allocation-heavy parallel workload is Chez's own allocator, which refills a
+  thread's allocation area one 16 KB segment at a time under a global mutex.
+
 ### Fixed
 
 - **Windows: an absolute FILE argument is no longer read as project-relative.**

@@ -486,7 +486,13 @@
         (cons "toHexString" (lambda (x) (string-downcase (number->string (long->u64 (jnum->exact x)) 16))))
         (cons "toOctalString" (lambda (x) (number->string (long->u64 (jnum->exact x)) 8)))
         (cons "toBinaryString" (lambda (x) (number->string (long->u64 (jnum->exact x)) 2)))
-        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))))
+        ;; radix 10 of a fixnum is the digit loop (values.ss jolt-fixnum->string);
+        ;; another radix, or a bignum, is Chez's printer
+        (cons "toString" (lambda (x . r)
+                           (let ((n (jnum->exact x)))
+                             (if (and (null? r) (fixnum? n))
+                                 (jolt-fixnum->string n)
+                                 (string-downcase (number->string n (if (null? r) 10 (jnum->exact (car r)))))))))))
 
 ;; JVM Integer.toHexString/etc. treat the int as 32-bit unsigned.
 (define (int->u32 n) (if (< n 0) (+ n 4294967296) n))
@@ -510,7 +516,13 @@
         (cons "toHexString" (lambda (x) (string-downcase (number->string (int->u32 (jnum->exact x)) 16))))
         (cons "toOctalString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 8)))
         (cons "toBinaryString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 2)))
-        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))
+        ;; radix 10 of a fixnum is the digit loop (values.ss jolt-fixnum->string);
+        ;; another radix, or a bignum, is Chez's printer
+        (cons "toString" (lambda (x . r)
+                           (let ((n (jnum->exact x)))
+                             (if (and (null? r) (fixnum? n))
+                                 (jolt-fixnum->string n)
+                                 (string-downcase (number->string n (if (null? r) 10 (jnum->exact (car r)))))))))
         ;; Integer.max/min (Java 8): plain two-arg integer max/min, not clojure.core's
         ;; variadic ones — orchard calls them.
         (cons "max" (lambda (x y) (->num (max (jnum->exact x) (jnum->exact y)))))

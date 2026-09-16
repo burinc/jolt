@@ -563,7 +563,7 @@
 (define (hasheq-caches)
   (let ((c (virtual-register jolt-vreg-hasheq-caches)))
     (if (eq? c 0)
-        (let ((v (cons (make-weak-eq-hashtable) (make-weak-eq-hashtable))))
+        (let ((v (cons (make-weak-eq-hashtable) (make-eq-hashtable))))
           (set-virtual-register! jolt-vreg-hasheq-caches v)
           v)
         c)))
@@ -615,6 +615,15 @@
 
 ;; The JVM caches String.hashCode in the object; jolt strings are plain Chez
 ;; strings with nowhere to put it, so they use the per-thread table above.
+;;
+;; The table is BOUNDED and STRONG, not weak, for the reason the symbol cache
+;; left weak tables (see symbol-hasheq): a string hashed once and dropped — a
+;; substring cut for one map lookup, a key built by str — misses, is inserted,
+;; and is then an entry every collection must trace and clear. Eight threads
+;; hashing fresh strings ran 12x slower per thread than one under that churn.
+;; A hot working set of keys stays far below the cap; a miss-heavy workload
+;; clears and refills, amortized O(1), and gives the collector nothing to scan.
+(define string-hasheq-cap 2048)
 (define (compute-string-hasheq s)
   (murmur3-hash-int (java-string-hashcode s)))
 
@@ -622,6 +631,7 @@
   (let ((t (cdr (hasheq-caches))))
     (or (hashtable-ref t s #f)
         (let ((h (compute-string-hasheq s)))
+          (when (fx>=? (hashtable-size t) string-hasheq-cap) (hashtable-clear! t))
           (hashtable-set! t s h)
           h))))
 

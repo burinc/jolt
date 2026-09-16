@@ -32,14 +32,6 @@
 ;; first file whose blocker is class (c) (a genuine Chez-only construct with no
 ;; gambit seam) — see REPORT.
 
-;; lazy-bridge forward-shared flags: seq.ss's force path reads jolt-mt? and
-;; seq-more dispatches on it, but lazy-bridge.ss (loaded much later) is what
-;; defines them. Pre-declare so seq.ss's references are bound; lazy-bridge.ss
-;; REDEFINES them with its real implementation (the #f default and the
-;; mark-mt! flip are identical, so the redefinition is a no-op in practice).
-(define jolt-mt? #f)
-(define (jolt-mark-mt!) (set! jolt-mt? #t))
-
 (##include "../chez/values.ss")
 (##include "hasheq.ss")
 (##include "../chez/collections.ss")

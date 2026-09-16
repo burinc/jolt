@@ -1539,6 +1539,7 @@
     ((and (flonum? x) (not (fl= x x))) "##NaN")
     ;; str of a bigint has NO N suffix (BigInt.toString); only the readable
     ;; printer adds it (see jolt-pr-readable-base).
+    ((fixnum? x) (jolt-fixnum->string x))
     ((and (exact? x) (integer? x)) (number->string x))
     ((flonum? x) (jolt-flonum->string x))
     (else (number->string x))))

@@ -3986,6 +3986,11 @@
   {:suite "string / str & basics" :label "str concat" :expected "\"abc\"" :actual "(str \"a\" \"b\" \"c\")" :portability :common}
   {:suite "string / str & basics" :label "str of numbers" :expected "\"12\"" :actual "(str 1 2)" :portability :common}
   {:suite "string / str & basics" :label "str nil is empty" :expected "\"\"" :actual "(str nil)" :portability :common}
+  ;; integers render through jolt's own digit loop (values.ss jolt-fixnum->string),
+  ;; not Chez's number->string: the edges of the fixnum range, both signs, and
+  ;; the exact-integer width where a Long becomes a bignum, in one string
+  {:suite "string / str & basics" :label "str of integers at the edges" :expected "\"0 -1 10 -10 9223372036854775807 -9223372036854775808 1000000000000000000000\"" :actual "(str 0 \" \" -1 \" \" 10 \" \" -10 \" \" Long/MAX_VALUE \" \" Long/MIN_VALUE \" \" 1000000000000000000000N)" :portability :common}
+  {:suite "string / str & basics" :label "pr-str and Long/toString agree with str on an integer" :expected "[\"-1152921504606846976\" \"-1152921504606846976\" \"-1152921504606846976\"]" :actual "[(str -1152921504606846976) (pr-str -1152921504606846976) (Long/toString -1152921504606846976)]" :portability :common}
   {:suite "string / str & basics" :label "str mixed" :expected "\"a1:b\"" :actual "(str \"a\" 1 :b)" :portability :common}
   {:suite "string / str & basics" :label "str of coll" :expected "\"[1 2]\"" :actual "(str [1 2])" :portability :common}
   {:suite "string / str & basics" :label "count" :expected "3" :actual "(count \"abc\")" :portability :common}
