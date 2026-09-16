@@ -197,14 +197,16 @@
                             '("/usr/lib" "/lib")))))
     (append from-env roots multi)))
 
-(define (ffi-split-colons str)
+(define (ffi-split-char str ch)
   (let loop ((cs (string->list str)) (cur '()) (acc '()))
     (cond
       ((null? cs)
        (reverse (if (null? cur) acc (cons (list->string (reverse cur)) acc))))
-      ((char=? (car cs) #\:)
+      ((char=? (car cs) ch)
        (loop (cdr cs) '() (if (null? cur) acc (cons (list->string (reverse cur)) acc))))
       (else (loop (cdr cs) (cons (car cs) cur) acc)))))
+
+(define (ffi-split-colons str) (ffi-split-char str #\:))
 
 (define (ffi-dir-entries dir)
   (guard (e (#t '()))
@@ -229,14 +231,7 @@
   (map (lambda (part) (or (string->number part) -1))
        (ffi-split-dots (substring name (+ 1 (string-length base)) (string-length name)))))
 
-(define (ffi-split-dots str)
-  (let loop ((cs (string->list str)) (cur '()) (acc '()))
-    (cond
-      ((null? cs)
-       (reverse (if (null? cur) acc (cons (list->string (reverse cur)) acc))))
-      ((char=? (car cs) #\.)
-       (loop (cdr cs) '() (if (null? cur) acc (cons (list->string (reverse cur)) acc))))
-      (else (loop (cdr cs) (cons (car cs) cur) acc)))))
+(define (ffi-split-dots str) (ffi-split-char str #\.))
 
 (define (ffi-version>? a b)
   (cond ((and (null? a) (null? b)) #f)
@@ -259,15 +254,85 @@
                                     hits))))
                 (ffi-so-search-dirs)))))
 
+;; --- Windows: the soversion lives in the FILENAME ---------------------------
+;; The Unix glob above exists because a distro may ship libz.so.1 and no libz.so.
+;; Windows has the same gap in a different spelling: OpenSSL's own builds — Git
+;; for Windows', which is what jolt's docs tell a Windows user to install — are
+;; named libcrypto-3-x64.dll and libssl-3-x64.dll, so neither "crypto.dll" nor
+;; "libcrypto.dll" names a file that exists, however completely the DLL is on
+;; the loader's search path. Enumerate the directories the loader searches and
+;; take the versioned spellings, newest first.
+(define (ffi-ends-with-ci? str suffix)
+  (let ((n (string-length str)) (m (string-length suffix)))
+    (and (>= n m) (string-ci=? (substring str (- n m) n) suffix))))
+
+;; <base> followed by a version separator: libcrypto-3-x64.dll is libcrypto's,
+;; libcryptohelper.dll is not. "libcrypto.dll" is deliberately NOT matched — it
+;; is one of the conventional names tried first, and listing it twice only makes
+;; the diagnostic harder to read.
+(define (ffi-dll-variant-of? entry base)
+  (and (> (string-length entry) (string-length base))
+       (string-ci=? (substring entry 0 (string-length base)) base)
+       (memv (string-ref entry (string-length base)) '(#\- #\_))
+       #t))
+
+(define (ffi-dll-variant? entry name)
+  (and (ffi-ends-with-ci? entry ".dll")
+       (or (ffi-dll-variant-of? entry name)
+           (ffi-dll-variant-of? entry (string-append "lib" name)))))
+
+;; The loader's search directories that a process can enumerate: its own
+;; executable's directory (first in the standard Windows search order) and PATH,
+;; which is where Git for Windows puts its DLLs. The system directories are
+;; deliberately absent — a bare name already reaches them, and the versioned
+;; OpenSSL builds are never there.
+(define (ffi-exe-dir)
+  (guard (e (#t #f))
+    (let* ((argv (command-line))
+           (exe (and (pair? argv) (car argv))))
+      (and (string? exe)
+           (let loop ((i (- (string-length exe) 1)))
+             (cond ((< i 0) #f)
+                   ((or (char=? (string-ref exe i) #\/) (char=? (string-ref exe i) #\\))
+                    (substring exe 0 (max i 1)))
+                   (else (loop (- i 1)))))))))
+
+(define (ffi-dll-search-dirs)
+  (let* ((path (or (ffi-getenv "PATH") ""))
+         (dirs (if (string=? path "") '() (ffi-split-char path #\;)))
+         (exe (ffi-exe-dir)))
+    (if exe (cons exe dirs) dirs)))
+
+;; Newest first by plain descending name order: the version is embedded in the
+;; filename with no agreed grammar (libcrypto-3-x64.dll, libcrypto-1_1-x64.dll),
+;; so a string sort is the only ordering that is both total and deterministic —
+;; and it does put 3 ahead of 1_1, which is the case that matters.
+(define (ffi-versioned-dlls name)
+  (apply append
+         (map (lambda (dir)
+                (map (lambda (e) (string-append dir "/" e))
+                     (list-sort (lambda (x y) (string-ci>? x y))
+                                (filter (lambda (e) (ffi-dll-variant? e name))
+                                        (ffi-dir-entries dir)))))
+              (ffi-dll-search-dirs))))
+
+;; The platform's conventional spellings of a bare library NAME, as data: what
+;; load-system-library tries, and what load-natives! falls back to for a
+;; :jolt/native spec that declares no candidates for the running platform
+;; (jolt-lang/jolt#989) — where the candidate list was empty, nothing was
+;; dlopen'd at all, and the failure still read "not found".
+(define (ffi-system-library-candidates n)
+  (case (sa-os-family)
+    ((macos)   (list (string-append "lib" n ".dylib") (string-append n ".dylib")))
+    ((windows) (append (list (string-append n ".dll") (string-append "lib" n ".dll"))
+                       (ffi-versioned-dlls n)))
+    (else      (let ((base (string-append "lib" n ".so")))
+                 (cons base (ffi-versioned-sonames base))))))
+
 (define (ffi-load-system-library name)
-  (let ((n (ffi-str-arg "load-system-library name" name)))
-    (ffi-library-map
-     (ffi-load-candidates
-      (case (sa-os-family)
-        ((macos)   (list (string-append "lib" n ".dylib") (string-append n ".dylib")))
-        ((windows) (list (string-append n ".dll") (string-append "lib" n ".dll")))
-        (else      (let ((base (string-append "lib" n ".so")))
-                     (cons base (ffi-versioned-sonames base)))))))))
+  (ffi-library-map
+   (ffi-load-candidates
+    (ffi-system-library-candidates (ffi-str-arg "load-system-library name" name)))))
 
 ;; Loadable without mutating resolution state: probe with a LOCAL dlopen through
 ;; the scoped loader (registering the handle — a probe that succeeds will be
@@ -1183,6 +1248,11 @@
 (def-var! "jolt.ffi" "defining-libraries" jolt-ffi-defining-libraries)
 (def-var! "jolt.ffi" "dlsym-native" jolt-ffi-dlsym-native)
 (def-var! "jolt.ffi" "load-system-library" ffi-load-system-library)
+;; jolt.main/load-natives! reads it to build the fallback candidates for a spec
+;; that names a library but declares nothing for the running platform (#989).
+(def-var! "jolt.ffi" "system-library-candidates"
+  (lambda (n) (list->cseq (ffi-system-library-candidates
+                           (ffi-str-arg "system-library-candidates name" n)))))
 (def-var! "jolt.ffi" "find-symbol" ffi-find-symbol)
 (def-var! "jolt.ffi" "alloc" ffi-alloc)
 (def-var! "jolt.ffi" "free" ffi-free)

@@ -1269,6 +1269,19 @@ else
   fails=$((fails + 1))
 fi
 
+# The FILE argument's path classification: relative paths belong to the project
+# directory, everything rooted is used as given. The Windows spellings (C:/x,
+# C:\x, //server/share, /x, C:x) are driven per platform — recognizing only a
+# leading "/" made `jolt C:/…/hello.clj` open "./C:/…/hello.clj" (#992).
+filearg_out="$($jolt run test/chez/file-arg-test.clj 2>&1)"
+if printf '%s' "$filearg_out" | grep -q 'FILE-ARG OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: FILE argument path classification"
+  printf '%s\n' "$filearg_out" | tail -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # java.net autoloads jolt.socket, in a FRESH process with no require: a program
 # reaching for InetAddress or NetworkInterface should not have to know which
 # namespace installs them, any more than it does on the JVM. Each of these is a

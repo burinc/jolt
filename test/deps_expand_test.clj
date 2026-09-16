@@ -346,6 +346,55 @@
                         [{:static {:archive "native/libfoo.a"} :jolt.deps/root "/a"}
                          {:static {:archive "native/libfoo.a"} :jolt.deps/root "/b"}]))))
 
+;;;; :jolt/native reconciliation — a second spec fills in the keys the first omits
+
+;; dedup-by is winner-takes-all and the project's own specs run first, so an app
+;; that only wanted to ADD the :windows candidates a dependency never declared
+;; had to restate that dependency's :darwin and :linux lists verbatim — and a
+;; windows-only project entry deduped the dependency away and broke the other
+;; two platforms instead (jolt-lang/jolt#989). reconcile-natives overlays.
+(let [reconcile (var jolt.deps/reconcile-natives)]
+  (let [project {:name "z" :windows ["zlib1.dll"] :jolt.deps/root "/app"}
+        dep     {:name "z" :linux ["libz.so.1"] :darwin ["libz.dylib"]
+                 :jolt.deps/root "/dep"}]
+    (is= "the project adds a platform without restating the others"
+         [{:name "z" :windows ["zlib1.dll"] :jolt.deps/root "/app"
+           :linux ["libz.so.1"] :darwin ["libz.dylib"]
+           :jolt.deps/roots {:linux "/dep" :darwin "/dep"}}]
+         (reconcile [project dep]))
+    ;; the winner still wins every key it declares — an app override is an
+    ;; override, not a merge of candidate lists
+    (is= "a key the winner declares is not overlaid"
+         ["zlib1.dll"]
+         (:windows (first (reconcile [project (assoc dep :windows ["other.dll"])]))))))
+
+;; The root travels with the candidates it belongs to. Without it a dependency's
+;; relative "native/libfoo.so" would resolve against whichever deps.edn won the
+;; identity, which is exactly the directory it is not in.
+(let [reconcile (var jolt.deps/reconcile-natives)]
+  (is= "an overlaid key carries the declaring root"
+       {:linux "/dep"}
+       (:jolt.deps/roots
+        (first (reconcile [{:name "foo" :windows ["foo.dll"] :jolt.deps/root "/app"}
+                           {:name "foo" :linux ["native/libfoo.so"] :jolt.deps/root "/dep"}]))))
+  ;; a rootless spec (an older cpcache entry, or a caller that built the map)
+  ;; contributes its candidates and no root, rather than a nil one
+  (is= "a rootless overlay records no root"
+       nil
+       (:jolt.deps/roots
+        (first (reconcile [{:name "foo" :windows ["foo.dll"]}
+                           {:name "foo" :linux ["libfoo.so"]}]))))
+  ;; first-inclusion order is what the loader loads in, so it is preserved
+  (is= "first-inclusion order is preserved"
+       ["a" "b"]
+       (mapv :name (reconcile [{:name "a" :linux ["liba.so"]}
+                               {:name "b" :linux ["libb.so"]}
+                               {:name "a" :windows ["a.dll"]}])))
+  ;; specs that are not the same library are untouched by any of this
+  (is= "distinct libraries do not merge" 2
+       (count (reconcile [{:name "a" :linux ["liba.so"]}
+                          {:name "b" :windows ["b.dll"]}]))))
+
 ;;;; :jolt/tree-shake {:allow-dynamic […]} → "ns/name" strings
 
 (let [allow-dynamic-entries (var jolt.deps/allow-dynamic-entries)]

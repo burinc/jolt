@@ -708,6 +708,10 @@
        (case (:op n)
          :const true
          :quote true
+         ;; a #"…" literal is a constant object too (the reader hands the
+         ;; reference compiler a Pattern, which lands in the constant pool), so
+         ;; a collection holding one is as constant as one holding scalars
+         :regex true
          :vector (every? const-coll-node? (:items n))
          :set (every? const-coll-node? (:items n))
          :map (every? const-coll-node? (apply concat (:pairs n)))
@@ -3370,8 +3374,14 @@
                      (= :long (:kind node)) (emit-nhint-coerce :long e)
                      :else e))
     :try (emit-try node)
-    ;; regex literal #"…" -> a jolt-regex value (regex.ss, vendored irregex).
-    :regex (str "(jolt-regex " (chez-str-lit (:source node)) ")")
+    ;; regex literal #"…" -> a jolt-regex value (regex.ss, vendored irregex),
+    ;; hoisted per site like a constant collection: the reference reads #"…"
+    ;; as a Pattern object and compiles it as a constant, one object per site
+    ;; built once, where rebuilding here cost a cache lookup and a fresh
+    ;; regex-t every time the literal was reached — measured 320 ns of a 350
+    ;; ns `(re-find #"^\\(defn" s)` with the engine already compiled. Per
+    ;; site, not per form, for the reason the collection literals are.
+    :regex (hoist-const-per-site (str "(jolt-regex " (chez-str-lit (:source node)) ")"))
     ;; #inst / #uuid literals -> runtime inst / uuid values.
     :inst (str "(jolt-inst-from-string " (chez-str-lit (:source node)) ")")
     :uuid (str "(jolt-uuid-from-string " (chez-str-lit (:source node)) ")")
