@@ -508,7 +508,6 @@
 (defn tagged-literal? [x]     (= (get x :jolt/type) :jolt/tagged-literal))
 (defn record? [x]             (some? (get x :jolt/deftype)))
 (defn uuid? [x]               (= (get x :jolt/type) :jolt/uuid))
-(defn inst? [x]               (= (get x :jolt/type) :jolt/inst))
 (defn char? [x]               (= (get x :jolt/type) :jolt/char))
 
 ;; their realization slot; promises/atoms always-realized), error otherwise.

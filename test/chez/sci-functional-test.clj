@@ -95,6 +95,23 @@
               (if (re-find #"noSuchMethod" (ex-message e)) :threw :wrong-message)))))
 
 
+;; Arrays. SCI's aset on a primitive array is clojure.lang.RT/aset (its own aset*
+;; reflects there for a primitive component type), its 2-argument get is
+;; RT/get in newer releases, and its fn adapters cast through RT/longCast: the
+;; clojure.lang.RT value statics are what interpreted code compiles to. jolt had
+;; none of that family, so (aset ^longs a i v) inside SCI died with "No matching
+;; field or method: clojure.lang.RT/aset" (jolt-fn00).
+(let [ctx (sci/init {})]
+  (check= "aset on a long array inside SCI" 5
+          (sci/eval-string* ctx "(let [a (long-array 2)] (aset a 0 5) (aget a 0))"))
+  (check= "aset on a double array inside SCI" 2.5
+          (sci/eval-string* ctx "(let [a (double-array 2)] (aset a 1 2.5) (aget a 1))"))
+  (check= "aset on an object array inside SCI" :x
+          (sci/eval-string* ctx "(let [a (object-array 2)] (aset a 0 :x) (aget a 0))"))
+  (check= "RT/get and RT/aset by name, as an interpreted call site reaches them" [1 :nf 7]
+          (sci/eval-string* (sci/init {:classes {'clojure.lang.RT clojure.lang.RT}})
+            "[(clojure.lang.RT/get {:a 1} :a) (clojure.lang.RT/get {} :a :nf) (let [a (long-array 1)] (clojure.lang.RT/aset a 0 7) (aget a 0))]")))
+
 ;; Type-hinted interop. SCI resolves a ^Hint to a Class at ANALYSIS time and
 ;; asks that Class whether it is a functional interface to adapt
 ;; (sci.impl.analyzer/resolve-tag-class -> reflector/maybe-fi-method ->
@@ -180,6 +197,29 @@
 (defmulti sci-scaled sci.impl.types/type-impl)
 (defmethod sci-area :default [x] (area x))
 (defmethod sci-scaled :default [x k] (scaled x k))
+
+;; The value copied in AS-IS, the way an embedder written against babashka (whose
+;; defprotocol is SCI's) shares every var, is refused at SCI's own seams — and
+;; with the reference's words, since the refusal is a protocol miss in jolt's
+;; dispatcher: SCI alter-var-roots the protocol's :var through its IVar protocol
+;; and names the method namespace through HasName, and a host var and a missing
+;; :ns answer neither. These pin the shape (jolt#1006): the recipe below is the
+;; supported path, and a vendored SCI that starts mirroring host protocols
+;; itself will show up here as the rows going green.
+(let [host-ns (sci/create-ns 'raw)
+      ctx (sci/init {:classes {:allow :all}
+                     :namespaces {'raw {'Shape (sci/copy-var* #'Shape host-ns)
+                                        'area (sci/copy-var* #'area host-ns)
+                                        'scaled (sci/copy-var* #'scaled host-ns)}}})
+      failing (fn [src]
+                (try (sci/eval-string* ctx src) :evaluated
+                     (catch IllegalArgumentException e (ex-message e))))]
+  (check= "defrecord over a host protocol copied as-is dies where the JVM does"
+          "No implementation of method: :getRawRoot of protocol: #'sci.impl.vars/IVar found for class: clojure.lang.Var"
+          (failing "(defrecord Raw [s] raw/Shape (area [_] s) (scaled [_ k] s))"))
+  (check= "extend-type over a host protocol copied as-is dies where the JVM does"
+          "No implementation of method: :getName of protocol: #'sci.impl.types/HasName found for class: nil"
+          (failing "(extend-type String raw/Shape (area [s] (count s)) (scaled [s k] s))")))
 
 ;; the other direction: a SCI record or type reaching the HOST protocol answers
 ;; through the SCI method its defrecord/deftype registered. Only a method the
