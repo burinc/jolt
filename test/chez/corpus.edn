@@ -3986,6 +3986,14 @@
   {:suite "string / str & basics" :label "str concat" :expected "\"abc\"" :actual "(str \"a\" \"b\" \"c\")" :portability :common}
   {:suite "string / str & basics" :label "str of numbers" :expected "\"12\"" :actual "(str 1 2)" :portability :common}
   {:suite "string / str & basics" :label "str nil is empty" :expected "\"\"" :actual "(str nil)" :portability :common}
+  ;; a #"…" literal is a constant per SITE, as the reference's Pattern constant
+  ;; is: one site evaluated twice yields the identical object, two sites that
+  ;; read alike do not, and the object still matches. Sites inside defs: the
+  ;; per-site pool is a def's (a bare top-level form rebuilds per evaluation)
+  {:suite "string / regex literal" :label "one site evaluated twice is the identical Pattern" :expected "true" :actual "(do (defn rxlit1 [] #\"a+\") (identical? (rxlit1) (rxlit1)))" :portability :common}
+  {:suite "string / regex literal" :label "two sites reading alike are distinct Patterns" :expected "false" :actual "(do (defn rxlit2 [] #\"a+\") (defn rxlit3 [] #\"a+\") (identical? (rxlit2) (rxlit3)))" :portability :common}
+  {:suite "string / regex literal" :label "a literal inside a collection literal still matches" :expected "[\"aa\" \"bb\"]" :actual "(do (defn rxlit4 [] [#\"a+\" #\"b+\"]) [(re-find (first (rxlit4)) \"xaay\") (re-find (second (rxlit4)) \"xbby\")])" :portability :common}
+  {:suite "string / regex literal" :label "a hoisted literal in a loop matches every iteration" :expected "3" :actual "(do (defn rxlit5 [] (loop [i 0 n 0] (if (< i 3) (recur (inc i) (if (re-find #\"^\\(defn\" \"(defn f [])\") (inc n) n)) n))) (rxlit5))" :portability :common}
   ;; integers render through jolt's own digit loop (values.ss jolt-fixnum->string),
   ;; not Chez's number->string: the edges of the fixnum range, both signs, and
   ;; the exact-integer width where a Long becomes a bignum, in one string
