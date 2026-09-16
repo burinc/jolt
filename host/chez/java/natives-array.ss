@@ -245,6 +245,39 @@
           ((string? v) (string->list v))
           (else (let loop ((i (fx- (ja-backing-len v) 1)) (acc '()))
                   (if (fx<? i 0) acc (loop (fx- i 1) (cons (ja-backing-ref v i) acc))))))))
+;; ---- char[] as characters ---------------------------------------------------
+;; A char[] is its CHARACTERS to every JVM overload that takes one — Writer.write,
+;; PrintStream.print, StringBuilder.append/insert, String.valueOf — where a
+;; rendering would put "#object[[C]" in the buffer. These are the one conversion
+;; all of those arms share (writer-piece in host-static-classes.ss, sb-piece in
+;; string-builder.ss, String/valueOf in host-static-methods.ss).
+;;
+;; A char array's backing IS a Chez string, so a region is one block copy of its
+;; bytes rather than a walk — which is what keeps (.append sb buf 0 65536) off
+;; the element-at-a-time path. The boxed-vector arm is the older promoted
+;; backing, where an element may be an int the JVM would widen to a char.
+;; char-array-arg? and char-array-chunk's bounds report (jvm-range-check) are
+;; string-builder.ss's, the shared file every target loads.
+(define (char-array-region x off cnt)
+  (let ((v (jolt-array-vec x)))
+    (cond
+      ((and (string? v) (fx=? off 0) (fx=? cnt (string-length v))) (string-copy v))
+      ((string? v)
+       (let ((out (make-string cnt)))
+         (sa-string-copy-range! out 0 v off (fx+ off cnt))
+         out))
+      (else
+       (let ((out (make-string cnt)))
+         (let loop ((i 0))
+           (if (fx=? i cnt)
+               out
+               (let ((c (ja-ref x (fx+ off i))))
+                 (string-set! out i (if (char? c) c (integer->char (jnum->exact c))))
+                 (loop (fx+ i 1))))))))))
+(define (char-array->string x) (char-array-region x 0 (ja-len x)))
+(define (char-array-chunk x off cnt who)
+  (jvm-range-check who (ja-len x) off (+ off cnt))
+  (char-array-region x off cnt))
 ;; A fresh backing holding the same elements — aclone's copy, and the one
 ;; java.util.Arrays hands its copyOf results.
 (define (ja-copy a)
@@ -305,7 +338,7 @@
       ;; string-copy! is specified to act as if through a temporary, so an
       ;; overlapping region inside one char array is correct without the
       ;; descending walk below — the same reason the bytevector arm is here.
-      ((and (string? sv) (string? dv)) (string-copy! sv soff dv doff n))
+      ((and (string? sv) (string? dv)) (sa-string-copy-range! dv doff sv soff (+ soff n)))
       ((and (eq? sv dv) (< soff doff))
        (let loop ((i (- n 1)))
          (when (>= i 0) (ja-set! dst (+ doff i) (ja-ref src (+ soff i))) (loop (- i 1)))))
@@ -477,43 +510,9 @@
 (define (na-byte x) (jolt-byte-cast x))
 (define (na-short x) (jolt-short-cast x))
 
-;; --- chunked seqs -----------------------------------------------------------
-;; The chunked-seq accessors (chunked-seq? / chunk-first / chunk-rest / chunk-next)
-;; live in seq.ss with the cseq core they read; here we only bind them plus the
-;; chunk-builder API (clojure.lang.ChunkBuffer + chunk-cons). chunk-buffer collects
-;; appended items, chunk seals them into a pvec chunk, and chunk-cons prepends that
-;; chunk onto a rest seq as a real ChunkedCons (cseq-chunked) — empty chunk == just
-;; the rest, like clojure.core/chunk-cons.
-;; The buffer is a vector sized by cap (32 everywhere in core) + a fill count, so
-;; an append is one vector-set! — it was a per-item (append items (list x)) list
-;; copy, O(n^2) over a chunk's life with cap ignored (`make chunkscaling` gates
-;; the shape). Appends past cap grow the vector: the JVM ChunkBuffer throws
-;; there, and growing is the documented jolt superset (test/chez/unit.edn
-;; "chunk-builder overflow"). Sealing copies, so the buffer stays appendable
-;; after chunk — matching the list implementation, where the JVM nulls it.
-(define-record-type jolt-chunkbuf (fields (mutable vec) (mutable cnt)) (nongenerative jolt-chunkbuf-v2))
-(define (na-chunk-buffer cap)
-  (make-jolt-chunkbuf (make-vector (if (and (fixnum? cap) (fx>? cap 0)) cap 32)) 0))
-(define (na-chunk-append b x)
-  (let ((v (jolt-chunkbuf-vec b)) (n (jolt-chunkbuf-cnt b)))
-    (let ((v (if (fx=? n (vector-length v))
-                 (let ((w (make-vector (fx* 2 n))))
-                   (let copy ((i 0)) (when (fx<? i n) (vector-set! w i (vector-ref v i)) (copy (fx+ i 1))))
-                   (jolt-chunkbuf-vec-set! b w)
-                   w)
-                 v)))
-      (vector-set! v n x)
-      (jolt-chunkbuf-cnt-set! b (fx+ n 1))))
-  b)
-(define (na-chunk b)
-  (let* ((n (jolt-chunkbuf-cnt b)) (v (jolt-chunkbuf-vec b)) (out (make-vector n)))
-    (let copy ((i 0)) (when (fx<? i n) (vector-set! out i (vector-ref v i)) (copy (fx+ i 1))))
-    (make-pvec out)))
-(define (na-chunk-cons chunk rest)
-  (if (fx=? 0 (pvec-count chunk)) rest (cseq-chunked chunk 0 rest)))
-;; the buffer is clojure.lang.ChunkBuffer, a Counted: count reads its fill
-(register-class-arm! jolt-chunkbuf? (lambda (b) "clojure.lang.ChunkBuffer"))
-(register-count-arm! jolt-chunkbuf? (lambda (b) (jolt-chunkbuf-cnt b)))
+;; (The chunked-seq builder API — chunk-buffer / chunk-append / chunk /
+;; chunk-cons and the accessor bindings — lives in natives-transduce.ss: it is
+;; seq machinery, not arrays, and that file is shared with the Gambit boot.)
 
 ;; --- extend the collection dispatchers to see a jolt-array ------------------
 (register-count-arm! jolt-array? (lambda (c) (ja-len c)))
@@ -749,11 +748,7 @@
     (cons "bytes" na-bytes) (cons "bytes?" na-bytes?)
     (cons "booleans" na-identity) (cons "ints" na-identity) (cons "longs" na-identity)
     (cons "shorts" na-identity) (cons "doubles" na-identity) (cons "floats" na-identity)
-    (cons "chars" na-identity) (cons "byte" na-byte) (cons "short" na-short)
-    (cons "chunk-buffer" na-chunk-buffer) (cons "chunk-append" na-chunk-append)
-    (cons "chunk" na-chunk) (cons "chunk-cons" na-chunk-cons)
-    (cons "chunk-first" na-chunk-first) (cons "chunk-rest" na-chunk-rest)
-    (cons "chunk-next" na-chunk-next) (cons "chunked-seq?" na-chunked-seq?)))
+    (cons "chars" na-identity) (cons "byte" na-byte) (cons "short" na-short)))
 
 ;; --- clojure.java.io/copy ---------------------------------------------------
 ;; Copy src -> dst, JVM-style. Raw bytes (byte-array / bytevector / string) and a

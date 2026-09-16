@@ -143,12 +143,20 @@ Host-specific runtime code sits behind an adapter contract
 capability or degrades it honestly — an absent one raises rather than faking a
 result.
 
-The Gambit targets need `gambit-scheme` (brew) and skip cleanly without it:
+The Gambit targets run the `gsi`/`gsc` under `GAMBIT_PREFIX/bin` — brew's
+`gambit-scheme` prefix by default, `make GAMBIT_PREFIX=/opt/gambit …` for
+another install — and skip cleanly when there is none. CI builds Gambit 4.9.8
+from source and runs them with `JOLT_REQUIRE_GAMBIT=1`, which turns that skip
+into a failure, so the gates cannot silently stop running there:
 
 ```bash
 make gambitcheck              # adapter + shims on native gsi
 make gambitkernel             # the booted kernel and natives (113 checks)
 make gambiteval               # jolt source through the compiler, renders pinned to Chez
+make gambitunbound            # gate: every Scheme global the boot references is defined (~75s)
+make gambitvars               # gate: every var the boot interns is bound
+make gambitstatics            # gate: every Class/member and (new Class) the seed emits resolves
+make gambittwins              # gate: every call-position macro has an eval twin (grep only)
 make gambitseed               # re-mint host/gambit/seed/ (runs on Chez, after a seed change)
 make gambitweb                # => target/gambit/jolt-web.js, the browser bundle
 make gambitweb PROFILE=repl   # a smaller bundle (see Build profiles below)
@@ -168,6 +176,32 @@ make gambitweb GAMBIT_WEB_OUT=../jolt-lang.github.io/resources/static/js/jolt-we
 Some Gambit host files are generated from their Chez counterparts (for example
 `records-gambit.ss` from `records.ss`); run `make gambitgen` after editing the
 source, and `make gambitgencheck` gates the drift.
+
+The boot splices most of `host/chez` into one Gambit unit, so a Chez-only name
+reaching a shared file is an unbound global there that no Chez gate can see.
+`make gambitunbound` compiles the boot with `gsc` and reads the linker's report
+of globals defined nowhere; `make gambitvars` boots on `gsi` and lists the var
+cells nothing bound. Both compare against an allowlist
+(`host/gambit/unbound-allowlist.txt`, `unbound-vars-allowlist.txt`) of paths the
+target never takes, and a line whose name has since been defined fails the
+gate; `make gambitunbound-regen` / `gambitvars-regen` rewrite the lists keeping
+the comments. Bind a new name — a mirror in `rt-core.ss`, a shim in
+`prelude-shims.ss`, a raise naming the absent capability in `host-vars.ss` —
+before reaching for the allowlist.
+
+The seed's own `Class/member` calls and `(Class. …)` constructors resolve
+against `host/gambit/host-statics.ss`, the Gambit target's interop tier: the
+jhost record and the registries in the same shape as Chez's `host-static.ss`,
+plus the members clojure.core and the embedded stdlib reach. `make
+gambitstatics` greps every static and constructor the seed emits and boots to
+ask the registries; a miss is a classified line in
+`host/gambit/seed-statics-allowlist.txt` (`make gambitstatics-regen`), and a
+line that resolves now fails. The java/ files both boots load — `class-model.ss`,
+`string-builder.ss`, `java-parse.ss`, `dot-forms.ss` — register into those
+registries, so a shim written against them runs on both hosts. Compiled code
+the Gambit boot evals cannot see the unit's macros; `make gambittwins` derives
+the call-position macros from the op registry and checks each has a function
+twin in `host/gambit/eval-fns.ss`.
 
 ### Build profiles
 

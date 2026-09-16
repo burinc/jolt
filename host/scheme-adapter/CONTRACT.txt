@@ -297,6 +297,14 @@ sa-uvector-set!
 #     adapter reorders; a target with the R7RS order passes through. A bulk
 #     move in the target's runtime — what beats a Scheme copy loop.
 sa-vector-copy-range!
+#   (sa-string-copy-range! to at from start end) -> unspecified: the same shape
+#     over strings. Chez's string-copy! is (from from-start to to-start count)
+#     while R7RS (Gambit, Guile) is (to at from start end) — the two orders
+#     have the same arity, so a raw string-copy! in shared code compiles on
+#     both targets and on the R7RS one silently copies the empty destination
+#     INTO the source (the first block-copy subs did exactly that on gsi).
+#     string-copy! is blocklisted for that reason.
+sa-string-copy-range!
 #
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are

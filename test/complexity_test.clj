@@ -101,6 +101,10 @@
 
 (defn -main [& _]
   (let [v1 (vec (range n1))            v2 (vec (range n2))
+        ;; source-shaped text: the window rows read a span out of the middle
+        src1 (apply str (repeat (quot n1 8) "(foo bar)"))
+        src2 (apply str (repeat (quot n2 8) "(foo bar)"))
+        anchored #"^[ ,\n\r\t]+"
         s1 (seq v1)                    s2 (seq v2)
         sm1 (into (sorted-map) (map (fn [i] [i i]) (range n1)))
         sm2 (into (sorted-map) (map (fn [i] [i i]) (range n2)))
@@ -141,6 +145,31 @@
            #(first ss1)
            #(first ss2)
            "first on a sorted set is materializing the tree instead of walking to its leftmost node (25-sorted.clj :first)")
+
+    ;; A parser reads its input through a WINDOW: it cuts a fixed span out of the
+    ;; source at the position it has reached, over and over, and the source is the
+    ;; whole file. Both ways of doing that must cost the window, not the file.
+    ;;
+    ;;   subs  — `(subs txt pos (+ pos 2048))`. Chez's `substring` is already
+    ;;           O(span); what this pins is that it stays that way through
+    ;;           jolt-substr's block copy (converters.ss) and through any future
+    ;;           string representation. A shared-slice or rope representation that
+    ;;           normalized on the way out would land here at ~4.0.
+    ;;   re-find — a `^`-anchored pattern over the REST of the input. The engine
+    ;;           must refuse the whole subject at the anchor rather than try each
+    ;;           position, which is what makes matching at an index without
+    ;;           copying viable at all (irx-search-from, regex.ss).
+    ;;
+    ;; bench/cst-format measures both as throughput; these two rows are the shape.
+    (judge "subs window"
+           #(subs src1 (- n1 4096) (- n1 2048))
+           #(subs src2 (- n2 4096) (- n2 2048))
+           "subs is copying (or re-deriving) the whole source string rather than the requested span (jolt-substr, converters.ss)")
+
+    (judge "re-find anchored"
+           #(re-find anchored src1)
+           #(re-find anchored src2)
+           "an anchored re-find is scanning every position of the subject instead of failing at the anchor (regex.ss)")
 
     ;; nth's values, but deliberately NOT its cost.
     ;;

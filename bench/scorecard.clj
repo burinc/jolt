@@ -65,6 +65,9 @@
    "stm" "ref creation, `dosync` `ref-set`/`alter`, `deref` in a loop"
    "executors" "`java.util.concurrent`: fire-and-forget enqueue, submit/get, growth to 64 blocking tasks, four producers on one pool"
    "compile-forms" "**compiling**, not running: `load-string` of 200 top-level defns and of one `deftest` holding 200 `is` forms"
+   "host-io" "reading THROUGH the `java.io` shim: a form off a reader, a chunked `char[]` drain, `String`↔`char[]`"
+   "string-scan" "`clojure.string` over a large payload: split/replace/trim, and whether a literal pattern reaches the regex engine"
+   "cst-format" "the source-formatter shape: a CST of one 10-key map per token, then an atom-per-node mutating walk building the output with `str`"
    "startup" "a built hello-world, whole process from exec to exit, best of 7 (JVM: `java -cp … clojure.main -m hello`)"})
 
 (def run-mode-descriptions

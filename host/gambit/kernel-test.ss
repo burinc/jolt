@@ -109,6 +109,13 @@
   (check "nth vector" (jolt-nth (jolt-vector 10 20 30) 1) 20)
   (check "nth list" (jolt-nth (jolt-list 5 6 7) 2) 7)
   (check "nth string" (jolt-nth "abc" 1) #\b)
+  ;; subs's in-range arm is a block copy through sa-string-copy-range!
+  ;; (converters.ss); a Chez-ordered string-copy! here returned a blank span and
+  ;; wrote it back over the source.
+  (check "subs cuts the span and leaves the source alone"
+    (let ((src (string-copy "hello world")))
+      (list (jolt-subs src 6 11) (jolt-subs src 6) (jolt-subs src 0 0) src))
+    (list "world" "world" "" "hello world"))
   (check "nth out of range -> not-found" (jolt-nth (jolt-vector 10 20) 5 99) 99)
   (check-true "nth out of range raises jolt-throw"
     (guard (e (#t (jolt-throw-condition? e)))
