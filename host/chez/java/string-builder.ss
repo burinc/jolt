@@ -68,6 +68,39 @@
       (render-piece x)
       (substring (render-piece x) (jnum->exact (car rest)) (jnum->exact (cadr rest)))))
 
+;; The bounds every (offset, len) region shares, reported the way the JVM reports
+;; them: the half-open range that was asked for, against the length there was.
+;; WHO is the exception class, which the JDK picks per call site and jolt follows
+;; — StringBuilder.append(char[],off,len) raises the plain IndexOutOfBounds,
+;; .insert and String.valueOf the StringIndexOutOfBounds that extends it.
+(define (jvm-range-check who len off end)
+  ;; generic comparisons, not fx: an offset a caller got wrong can be any integer,
+  ;; and a bignum must report as the out-of-range index it is rather than fault
+  ;; inside a fixnum primitive
+  (when (or (< off 0) (> off end) (> end len))
+    (throw-jvm who
+               (string-append "Range [" (number->string off) ", " (number->string end)
+                              ") out of bounds for length " (number->string len)))))
+;; What StringBuilder.append / .insert put in the buffer. The char[] overloads are
+;; the ones append-text cannot serve: their 3-arg form is (offset, len) over the
+;; ARRAY, where the CharSequence one is (start, end) over the rendering.
+;; char-array->string / char-array-chunk are natives-array.ss's (the char[]
+;; backing lives there); the predicate is here because every target answers it —
+;; one with no arrays answers #f from its jolt-array? and never enters the other
+;; two.
+(define (char-array-arg? x) (and (jolt-array? x) (eq? (jolt-array-kind x) 'char)))
+(define (sb-piece x)
+  ;; string first: this runs on the open-coded .append path (sb-direct-emit), where
+  ;; a string is nearly every argument, and render-piece would reach its own string
+  ;; arm only after two failed tests.
+  (cond ((string? x) x)
+        ((char-array-arg? x) (char-array->string x))
+        (else (render-piece x))))
+(define (sb-piece-range x a b who)
+  (if (char-array-arg? x)
+      (char-array-chunk x (jnum->exact a) (jnum->exact b) who)
+      (append-text x (list a b))))
+
 ;; Every index-taking StringBuilder method reports the same way the JVM does.
 (define (sb-range-check s start end)
   (let ((n (string-length s)))
@@ -87,7 +120,17 @@
 (register-class-ctor! "StringBuilder"
   (lambda args (make-jhost "string-builder" (string-builder-state args))))
 (define string-builder-methods
-  (list (cons "append" (lambda (self x . rest) (sb-append! self (append-text x rest)) self))
+  ;; The overloaded members are case-lambdas, not one rest-taking arm: the arities
+  ;; are the overload set the JVM resolves against, and host-arity-ok? reads them
+  ;; off the procedure (host-static.ss). One arm that picked its extra arguments
+  ;; out of a list is how (.append sb "x" 1) reached `cadr` on a one-element list
+  ;; and reported Chez's "incorrect list structure" for what is an arity error.
+  (list (cons "append"
+              (case-lambda
+                ((self x) (sb-append! self (sb-piece x)) self)
+                ((self x a b)
+                 (sb-append! self (sb-piece-range x a b (quote IndexOutOfBoundsException)))
+                 self)))
         (cons "toString" (lambda (self) (sb-str self)))
         (cons "length" (lambda (self) (->num (sb-length self))))
         (cons "charAt" (lambda (self i) (string-ref (sb-str self) (jnum->exact i))))
@@ -98,20 +141,26 @@
                                                 (string-append cur (make-string (- n (string-length cur)) #\nul)))))
                             jolt-nil))
         (cons "isEmpty" (lambda (self) (= 0 (sb-length self))))
-        (cons "substring" (lambda (self start . rest)
-                            (let* ((cur (sb-str self)) (s (jnum->exact start))
-                                   (e (if (null? rest) (string-length cur) (jnum->exact (car rest)))))
-                              (sb-range-check cur s e)
-                              (substring cur s e))))
+        (cons "substring"
+              (case-lambda
+                ((self start) (let* ((cur (sb-str self)) (s (jnum->exact start)))
+                                (sb-range-check cur s (string-length cur))
+                                (substring cur s (string-length cur))))
+                ((self start end) (let* ((cur (sb-str self)) (s (jnum->exact start))
+                                         (e (jnum->exact end)))
+                                    (sb-range-check cur s e)
+                                    (substring cur s e)))))
         ;; CharSequence.subSequence — AbstractStringBuilder returns substring(a, b),
         ;; i.e. a String, which is itself a CharSequence.
         (cons "subSequence" (lambda (self a b)
                               (let* ((cur (sb-str self)) (s (jnum->exact a)) (e (jnum->exact b)))
                                 (sb-range-check cur s e)
                                 (substring cur s e))))
-        (cons "indexOf" (lambda (self needle . rest)
-                          (->num (str-index-of (sb-str self) (render-piece needle)
-                                               (if (null? rest) 0 (jnum->exact (car rest)))))))
+        (cons "indexOf"
+              (case-lambda
+                ((self needle) (->num (str-index-of (sb-str self) (render-piece needle) 0)))
+                ((self needle from)
+                 (->num (str-index-of (sb-str self) (render-piece needle) (jnum->exact from))))))
         (cons "lastIndexOf" (lambda (self needle)
                               (->num (str-last-index-of (sb-str self) (render-piece needle)))))
         (cons "setCharAt" (lambda (self i ch)
@@ -140,12 +189,38 @@
                             (sb-set! self (string-append (substring cur 0 s) (render-piece txt)
                                                          (substring cur (max s e) n))))
                           self))
-        (cons "insert" (lambda (self offset x . rest)
-                         (let* ((cur (sb-str self)) (n (string-length cur)) (i (jnum->exact offset)))
-                           (sb-range-check cur i i)
-                           (sb-set! self (string-append (substring cur 0 i) (append-text x rest)
-                                                        (substring cur i n))))
-                         self))
+        (cons "insert"
+              (let ((ins (lambda (self offset piece)
+                           (let* ((cur (sb-str self)) (n (string-length cur))
+                                  (i (jnum->exact offset)))
+                             (sb-range-check cur i i)
+                             (sb-set! self (string-append (substring cur 0 i) piece
+                                                          (substring cur i n))))
+                           self)))
+                (case-lambda
+                  ((self offset x) (ins self offset (sb-piece x)))
+                  ((self offset x a b)
+                   (ins self offset
+                        (sb-piece-range x a b (quote StringIndexOutOfBoundsException)))))))
+        ;; .getChars srcBegin srcEnd dst dstBegin — the CharSequence copy-out the
+        ;; String method already had (natives-str.ss). Both ends are checked before
+        ;; anything is written, so a bad request does not leave the destination half
+        ;; filled; the destination's own error is the plain IndexOutOfBounds.
+        (cons "getChars"
+              (lambda (self src-begin src-end dst dst-begin)
+                (let* ((cur (sb-str self))
+                       (s (jnum->exact src-begin)) (e (jnum->exact src-end))
+                       (d (jnum->exact dst-begin)))
+                  (jvm-range-check (quote StringIndexOutOfBoundsException) (string-length cur) s e)
+                  (jvm-range-check (quote IndexOutOfBoundsException) (ja-len dst) d (+ d (- e s)))
+                  (let ((v (jolt-array-vec dst)))
+                    (if (string? v)
+                        (sa-string-copy-range! v d cur s e)
+                        (let loop ((i s) (j d))
+                          (when (fx<? i e)
+                            (ja-set! dst j (string-ref cur i))
+                            (loop (fx+ i 1) (fx+ j 1)))))))
+                jolt-nil))
         (cons "reverse" (lambda (self)
                           (sb-set! self (list->string (reverse (string->list (sb-str self)))))
                           self))))

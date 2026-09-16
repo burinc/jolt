@@ -1202,6 +1202,21 @@
   ;; String/valueOf(char[]) is the chars, not the array's own #object[[C] rendering
   {:suite "str" :expr "(String/valueOf (char-array \"hi\"))" :expected "\"hi\""}
   {:suite "str" :expr "[(String/valueOf 42) (String/valueOf nil)]" :expected "[\"42\" \"null\"]"}
+  ;; copyValueOf IS valueOf, at both of its arities (the JDK defines them so), and
+  ;; the 3-arg overload is valueOf(char[], offset, count): it used to resolve to the
+  ;; 1-arg arm with the offset and count dropped, answering the whole array.
+  {:suite "str" :expr "[(String/copyValueOf (char-array \"hi\")) (String/copyValueOf (char-array \"abc\") 1 2) (String/valueOf (char-array \"abc\") 1 2)]" :expected "[\"hi\" \"bc\" \"bc\"]"}
+  ;; A STATIC resolves by arity too. These are unit rows rather than corpus rows
+  ;; because the JVM compiler rejects the call outright — there is no value for the
+  ;; oracle to source, only a compile error — but the runtime report is the JVM's,
+  ;; which for a static names no class.
+  {:suite "str" :expr "(try (String/valueOf (char-array \"abc\") 0) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method valueOf found taking 2 args\""}
+  {:suite "str" :expr "(try (String/valueOf 5 1 2) (catch ClassCastException e (.getMessage e)))" :expected "\"class java.lang.Long cannot be cast to class [C\""}
+  {:suite "javastatic" :expr "(try (System/getenv \"HOME\" 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method getenv found taking 2 args\""}
+  {:suite "javastatic" :expr "(map? (System/getenv))" :expected "true"}
+  ;; the java.lang.Number surface resolves by arity as well; jolt has one integer
+  ;; type, so the class it names is Long where the JVM names Integer
+  {:suite "javastatic" :expr "(try (.intValue (int 5) 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method intValue found taking 1 args for class java.lang.Long\""}
   ;; String/join over a collection and spread as varargs, the JVM's two overloads
   {:suite "str" :expr "(String/join \",\" [\"a\" \"b\" \"c\"])" :expected "\"a,b,c\""}
   {:suite "str" :expr "[(String/join \"-\" \"a\" \"b\") (String/join \",\" [])]" :expected "[\"a-b\" \"\"]"}
@@ -1335,7 +1350,13 @@
   {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"abcd\") (.substring sb 1 3))" :expected "\"bc\""}
   ;; the emitted heads are shadow-proof (rt-emitted-names): a local named after one
   ;; of them must not be what the inline emission calls
-  {:suite "sbdirect" :expr "(let [render-piece (fn [_] \"SHADOWED\") sb (StringBuilder.)] (.append sb \"ok\") (.toString sb))" :expected "\"ok\""}
+  {:suite "sbdirect" :expr "(let [sb-piece (fn [_] \"SHADOWED\") sb (StringBuilder.)] (.append sb \"ok\") (.toString sb))" :expected "\"ok\""}
+  ;; a char[] is its characters on the PROVEN-target path too: the inline body
+  ;; calls sb-piece, the same converter the method table's append arm calls, so a
+  ;; ^StringBuilder tag cannot get the array's rendering where an untyped target
+  ;; gets its characters.
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb (char-array [\\a \\b \\c])) (.toString sb))" :expected "\"abc\""}
+  {:suite "sbdirect" :expr "((fn [^StringBuilder b] (.append b (char-array \"xy\")) (.toString b)) (StringBuilder.))" :expected "\"xy\""}
   {:suite "sbdirect" :expr "(let [sb-append! (fn [_ _] nil) sb (StringBuilder.)] (.append sb \"ok\") (.toString sb))" :expected "\"ok\""}
   ;; StringBuffer is the same store behind a second tag, so it takes the same
   ;; direct-emit path from the same proof sources — and the generic path must

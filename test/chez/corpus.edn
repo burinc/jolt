@@ -5257,6 +5257,34 @@
   {:suite "interop / String & StringBuilder char ops" :label "str of StringBuilder" :expected "\"hi\"" :actual "(let [sb (StringBuilder.)] (.append sb \"hi\") (str sb))" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "append subsequence" :expected "\"bcd\"" :actual "(let [sb (StringBuilder.)] (.append sb \"abcde\" 1 4) (.toString sb))" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "String.getChars into buffer" :expected "\"abc\"" :actual "(let [a (char-array 4)] (.getChars \"abcd\" 0 3 a 0) (String. a 0 3))" :portability :jvm}
+  ;; A char[] is its CHARACTERS to every overload that takes one. append used to
+  ;; render the array ("#object[[C]") and then SUBSTRING that rendering for the
+  ;; 3-arg form, which is silently wrong for a short range and throws once the
+  ;; requested length runs past it. Note the 3-arg form is (offset, len) over the
+  ;; array, where the CharSequence overload above is (start, end).
+  {:suite "interop / String & StringBuilder char ops" :label "append char[] appends its characters" :expected "[\"abc\" \"ab\" \"bc\"]" :actual "(let [b (char-array [\\a \\b \\c])] [(str (doto (StringBuilder.) (.append b))) (str (doto (StringBuilder.) (.append b 0 2))) (str (doto (StringBuilder.) (.append b 1 2)))])" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "append char[] at a realistic length" :expected "270" :actual "(let [sb (StringBuilder.)] (.append sb (char-array 270) 0 270) (.length sb))" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "append char[] out of range names the range" :expected "\"Range [0, 5) out of bounds for length 3\"" :actual "(try (.append (StringBuilder.) (char-array [\\a \\b \\c]) 0 5) (catch IndexOutOfBoundsException e (.getMessage e)))" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "insert char[] inserts its characters" :expected "[\"xabcy\" \"xby\"]" :actual "[(str (doto (StringBuilder. \"xy\") (.insert 1 (char-array [\\a \\b \\c])))) (str (doto (StringBuilder. \"xy\") (.insert 1 (char-array [\\a \\b \\c]) 1 1)))]" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "StringBuffer appends char[] the same way" :expected "\"abcef\"" :actual "(str (doto (StringBuffer.) (.append (char-array [\\a \\b \\c])) (.append (char-array [\\d \\e \\f]) 1 2)))" :portability :jvm}
+  ;; AbstractStringBuilder.getChars, the copy-out String already had. Both ends are
+  ;; checked, and the JVM reports the source span and the destination region with
+  ;; different classes (the source one extends the other).
+  {:suite "interop / String & StringBuilder char ops" :label "StringBuilder.getChars into a buffer at an offset" :expected "\".abc.\"" :actual "(let [d (char-array \".....\")] (.getChars (StringBuilder. \"abc\") 0 3 d 1) (String. d))" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "StringBuffer.getChars into a buffer" :expected "\"abc\"" :actual "(let [d (char-array 3)] (.getChars (StringBuffer. \"abc\") 0 3 d 0) (String. d))" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "getChars past the source end" :expected "\"StringIndexOutOfBoundsException\"" :actual "(try (let [d (char-array 3)] (.getChars (StringBuilder. \"abc\") 0 5 d 0)) (catch StringIndexOutOfBoundsException e (.getSimpleName (class e))))" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "getChars past the destination end" :expected "\"IndexOutOfBoundsException\"" :actual "(try (let [d (char-array 2)] (.getChars (StringBuilder. \"abc\") 0 3 d 0)) (catch IndexOutOfBoundsException e (.getSimpleName (class e))))" :portability :jvm}
+  ;; copyValueOf IS valueOf at both arities — the JDK defines them as the same value
+  {:suite "interop / String & StringBuilder char ops" :label "String/copyValueOf is String/valueOf" :expected "[\"abc\" \"bc\" \"abc\" \"bc\"]" :actual "(let [b (char-array [\\a \\b \\c])] [(String/copyValueOf b) (String/copyValueOf b 1 2) (String/valueOf b) (String/valueOf b 1 2)])" :portability :jvm}
+  ;; A host method resolves by ARITY before it runs: an extra trailing argument is a
+  ;; miss, not a value silently dropped. (.length "abc" 1) used to answer 3, and
+  ;; (.append sb "x" 1) used to fault inside the shim reading an argument list.
+  {:suite "interop / String & StringBuilder char ops" :label "an extra argument is a miss, not a dropped value" :expected "[\"No matching method length found taking 1 args for class java.lang.String\" \"No matching method substring found taking 3 args for class java.lang.String\"]" :actual "[(try (.length \"abc\" 1) (catch IllegalArgumentException e (.getMessage e))) (try (.substring \"abc\" 0 2 3) (catch IllegalArgumentException e (.getMessage e)))]" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "an extra argument to a StringBuilder method is a miss" :expected "\"No matching method append found taking 2 args for class java.lang.StringBuilder\"" :actual "(try (.append (StringBuilder.) \"x\" 1) (catch IllegalArgumentException e (.getMessage e)))" :portability :jvm}
+  ;; the overloads the arity check makes reachable, and which used to have their
+  ;; extra argument ignored: startsWith at an offset, lastIndexOf before an index
+  {:suite "interop / String & StringBuilder char ops" :label "startsWith at an offset" :expected "[true false false false]" :actual "[(.startsWith \"abcdef\" \"cd\" 2) (.startsWith \"abcdef\" \"cd\" 1) (.startsWith \"abcdef\" \"cd\" -1) (.startsWith \"abcdef\" \"ef\" 9)]" :portability :jvm}
+  {:suite "interop / String & StringBuilder char ops" :label "lastIndexOf at or before an index" :expected "[1 4 -1 1]" :actual "[(.lastIndexOf \"abcabc\" \"bc\" 3) (.lastIndexOf \"abcabc\" \"bc\") (.lastIndexOf \"abcabc\" \"bc\" 0) (.lastIndexOf \"abc\" \"\" 1)]" :portability :jvm}
   {:suite "interop / numbers & classes" :label "Integer/toHexString lowercase" :expected "\"ff\"" :actual "(Integer/toHexString 255)" :portability :jvm}
   {:suite "interop / numbers & classes" :label "Integer/toHexString wide" :expected "\"1234\"" :actual "(Integer/toHexString 4660)" :portability :jvm}
   {:suite "interop / numbers & classes" :label ".isNaN on a double" :expected "true" :actual "(.isNaN (/ 0.0 0.0))" :portability :jvm}

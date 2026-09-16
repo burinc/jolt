@@ -219,11 +219,8 @@
 ;; to render as "#object[[C …]" straight into the stream. A byte[] is NOT handled
 ;; here: print/println have no byte[] overload on the JVM and fall to
 ;; print(Object), so it renders as an object, and only write puts its bytes out.
-(define (char-array-arg? x) (and (jolt-array? x) (eq? (jolt-array-kind x) 'char)))
+;; char-array-arg? is string-builder.ss's, char-array->string natives-array.ss's.
 (define (byte-array-arg? x) (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)))
-(define (char-array->string x)
-  (list->string (map (lambda (c) (if (char? c) c (integer->char (jnum->exact c))))
-                     (ja->list x))))
 (define (writer-piece x)
   (cond ((number? x) (string (integer->char (jnum->exact x))))
         ((char-array-arg? x) (char-array->string x))

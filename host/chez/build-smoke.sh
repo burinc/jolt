@@ -164,7 +164,7 @@ fi
 # that local and route no "append"/"toString" on it through the jhost method table.
 # The negative grep anchors the method name right after the target so unrelated
 # record-method-dispatch lines elsewhere in the closure cannot false-positive.
-if ! grep -qF '(sb-append! sb (render-piece' "$out.build/flat.ss"; then
+if ! grep -qF '(sb-append! sb (sb-piece' "$out.build/flat.ss"; then
   echo "  FAIL: sb-target .append did not lower to the inline sb-append!"; exit 1
 fi
 if ! grep -qF '(sb-str sb)' "$out.build/flat.ss"; then

@@ -398,7 +398,10 @@
         (cons "setProperty" (lambda (k v) (sys-set-property k v)))
         (cons "clearProperty" (lambda (k) (sys-clear-property k)))
         (cons "getProperties" (lambda () (sys-properties-map)))
-        (cons "getenv" (lambda k (apply sys-getenv k)))
+        ;; getenv() is the whole environment, getenv(name) one variable — and
+        ;; nothing else: spelled as a rest arg, (System/getenv "HOME" 1) answered
+        ;; the variable instead of the JVM's arity miss.
+        (cons "getenv" (case-lambda (() (sys-getenv)) ((k) (sys-getenv k))))
         ;; System/console is nil when there is no attached terminal (piped /
         ;; redirected) — the safe default here; libraries (pretty) use it to
         ;; decide whether to emit ANSI, and a nil means "not a tty".
@@ -696,15 +699,32 @@
 (register-host-methods! "string-ci-comparator"
   (list (cons "compare" (lambda (self a b) (jvm-string-ci-compare a b)))))
 (define string-ci-comparator (make-jhost "string-ci-comparator" #f))
+;; String.valueOf(char[]) is the chars as a string, not the array's own rendering —
+;; it answered "#object[[C]" where (String. ca) already gave "hi". The three-arg
+;; overload is valueOf(char[], offset, count) and nothing else: it USED to be the
+;; one-arg arm with the offset and count dropped on the floor, so (String/valueOf
+;; ca 1 2) answered the whole array. A case-lambda states the two arities, which is
+;; what lets the invocation layer reject any other (host-static.ss host-arity-ok?).
+;;
+;; copyValueOf IS valueOf — the JDK defines the two as the same value at both
+;; arities, and it was simply missing.
+;; char-array-arg? / char-array-chunk are host-static-classes.ss, loaded after this
+;; file and resolved at call time.
+(define string-value-of
+  (case-lambda
+    ((x) (cond ((jolt-nil? x) "null")
+               ((char-array-arg? x) (char-array->string x))
+               (else (jolt-str-render-one x))))
+    ((x offset count)
+     (unless (char-array-arg? x)
+       (throw-jvm (quote ClassCastException)
+                  (string-append "class " (jolt-class-name x) " cannot be cast to class [C")))
+     (char-array-chunk x (jnum->exact offset) (jnum->exact count)
+                       (quote StringIndexOutOfBoundsException)))))
 (register-class-statics! "String"
-  ;; String.valueOf(char[]) is the chars as a string, not the array's own rendering —
-  ;; it answered "#object[[C]" where (String. ca) already gave "hi".
   (list (cons "CASE_INSENSITIVE_ORDER" string-ci-comparator)
-        (cons "valueOf" (lambda (x . _)
-                          (cond ((jolt-nil? x) "null")
-                                ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
-                                 (list->string (ja->list x)))
-                                (else (jolt-str-render-one x)))))
+        (cons "valueOf" string-value-of)
+        (cons "copyValueOf" string-value-of)
         ;; String.join(delim, elems) — elems as a collection or spread as varargs,
         ;; the two shapes the JVM overloads on.
         (cons "join" (lambda (delim . parts)
