@@ -1289,8 +1289,12 @@
           (catch :default e
             ;; A failed load leaves no partial namespace behind: the claim is
             ;; held, so whatever is installed under the name was installed by
-            ;; this evaluation.
-            (when (find-ns (symbol ns-name))
+            ;; this evaluation. A failed :reload is the exception — it was
+            ;; re-evaluating the INSTALLED namespace in place, and that
+            ;; namespace is what already-linked code is holding, so dropping
+            ;; the registration would be the destructive choice.
+            (when (and (not (contains? (or *reload-in-place* #{}) [(:id l) ns-name]))
+                       (find-ns (symbol ns-name)))
               (remove-ns (symbol ns-name)))
             (throw e)))))))
 

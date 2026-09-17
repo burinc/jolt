@@ -519,6 +519,18 @@
       ((val-of (l/resolve ctx {:kind :var :name "libmain/reload!"})))
       (chk ":reload re-read the source through the loader"
            (= :two ((val-of (l/resolve ctx {:kind :var :name "libmain/f"})))))
+      ;; a FAILED reload keeps the installed namespace — already-linked code
+      ;; must not lose the registration under it
+      (spit (str d "/libh.clj")
+            "(ns libh) (throw (ex-info \"boom\" {})) (defn thing [] :three)")
+      (let [err (try ((val-of (l/resolve ctx {:kind :var :name "libmain/reload!"})))
+                      nil
+                      (catch :default e e))]
+        (chk "the failed reload throws" (some? err))
+        (chk "and the installed namespace stays registered"
+             (some? (find-ns 'libh)))
+        (chk "so linked code still answers"
+             (= :two ((val-of (l/resolve ctx {:kind :var :name "libmain/f"}))))))
       ;; a requirement the loader cannot serve fails rather than leaking to the
       ;; runtime's global require (the ns-form path's rule, extended to calls)
       (let [d2 (root-dir "reqopts-bad")]

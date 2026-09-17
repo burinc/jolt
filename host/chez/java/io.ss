@@ -1863,8 +1863,15 @@
   ;; TCCL follows the ambient loader the way io/resource's 1-arity does: inside
   ;; `with-loader` it is that context's facade (so a library finding its own
   ;; resources the Java way gets the context's roots), outside one the host
-  ;; singleton. `current-base-loader` answers with the facade itself.
-  (list (cons "getContextClassLoader" (lambda (self) (or (current-base-loader) the-classloader)))
+  ;; singleton. `current-base-loader` answers with the facade itself, and only a
+  ;; classloader-shaped answer (a jhost, or a tagged table like the facade) is
+  ;; taken — a library that rebound RT/baseLoader to something else keeps the
+  ;; historical answer, the rule the resource path above follows too. There is no
+  ;; setContextClassLoader: the getter is ambient-derived, not per-thread state.
+  (list (cons "getContextClassLoader"
+              (lambda (self)
+                (let ((cl (current-base-loader)))
+                  (if (and cl (or (jhost? cl) (htable? cl))) cl the-classloader))))
         (cons "getName" (lambda (self) (jolt-thread-name (thread-handle-id self))))
         (cons "setName" (lambda (self nm)
                           (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
