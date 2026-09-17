@@ -442,7 +442,10 @@
                  (not (identical? home l))
                  (:state home)
                  (nil? (link-of home k)))
-        (install-link! home k hit v))
+        ;; the home gets the namespace link AND its var links: a delegate that
+        ;; only held the namespace would answer `resolve` for none of its vars
+        (install-link! home k hit v)
+        (link-ns-vars! home hit v))
       v)
     (finally
       (finish-claim! l k))))
@@ -635,12 +638,18 @@
 (defonce ^:private private-load-claims (atom {}))
 
 (def ^:private ^:dynamic *reload-in-place*
-  "The [loader-id ns-name] pairs whose next load is a :reload: the installed
-   namespace is KEPT and re-evaluated, so its defs re-intern the vars earlier
-   compiled code links to (Clojure's reload semantics) instead of a fresh
-   namespace's cells. Bound by `preload-for!` around the load, internal — the
-   public request shape stays {:kind :name [:load?]}."
+  "The namespace NAMES whose next load is a :reload: the installed namespace is
+   KEPT and re-evaluated, so its defs re-intern the vars earlier compiled code
+   links to (Clojure's reload semantics) instead of a fresh namespace's cells.
+   Keyed by name, not by loader: whoever serves the namespace — the context's
+   own roots or a delegate's — does the reload. Bound by `preload-for!` around
+   the load; internal, so the public request shape stays
+   {:kind :name [:load?]}."
   nil)
+
+(defn- reloading?
+  [ns-name]
+  (contains? (or *reload-in-place* #{}) ns-name))
 
 (def ^:dynamic *private-loads*
   "Names whose private load is in flight on this thread/fiber."
@@ -1256,7 +1265,7 @@
     (with-private-load-claim
       ns-name
       (fn []
-        (if (contains? (or *reload-in-place* #{}) [(:id l) ns-name])
+        (if (reloading? ns-name)
           (claim-private! l ns-name)
           (mark-private! l ns-name))
         (try
@@ -1293,7 +1302,7 @@
             ;; re-evaluating the INSTALLED namespace in place, and that
             ;; namespace is what already-linked code is holding, so dropping
             ;; the registration would be the destructive choice.
-            (when (and (not (contains? (or *reload-in-place* #{}) [(:id l) ns-name]))
+            (when (and (not (reloading? ns-name))
                        (find-ns (symbol ns-name)))
               (remove-ns (symbol ns-name)))
             (throw e)))))))
@@ -1301,10 +1310,13 @@
 (defn- source-roots-ns-load
   "The backend's namespace reader: a namespace already linked through the home
    loader is re-used, never re-evaluated — sharing by reference is the point of
-   a delegate."
+   a delegate. A :reload bypasses that reuse (the link is what a reload is
+   meant to move past) but keeps the namespace itself: eval-namespace-source
+   re-evaluates in place."
   [home hit req]
-  (or (when-let [h (resolve home {:kind :ns :name (:name hit)})]
-        h)
+  (or (when-not (reloading? (:name hit))
+        (when-let [h (resolve home {:kind :ns :name (:name hit)})]
+          h))
       (eval-namespace-source home (:name hit) (:file hit))))
 
 (defn- source-roots-ns-vars
@@ -1372,7 +1384,7 @@
   [l ns-name dep reload?]
   (if reload?
     (do (forget-dep! l dep)
-        (binding [*reload-in-place* (conj (or *reload-in-place* #{}) [(:id l) dep])]
+        (binding [*reload-in-place* (conj (or *reload-in-place* #{}) dep)]
           (preload-dep! l dep)))
     (preload-dep! l dep))
   (ensure-servable! l ns-name dep))
@@ -1384,11 +1396,11 @@
    like `require`.
 
    :reload re-reads into the INSTALLED namespace so definitions already linked
-   from it pick up the new roots; that is a namespace this loader reads from its
-   own roots. A namespace shared through a delegate reloads in the delegate,
-   which does not know the request came from here, so there it keeps the
-   evict-and-evaluate rule (fresh cells; earlier direct links stay on the old
-   ones)."
+   from it pick up the new roots. It reaches wherever the namespace is served
+   from — this loader's own roots, or a delegate's, which reloads it in place
+   because the intent is keyed by name. The host root is the one exception: it
+   loads through jolt.host's own loaded-mark, so a host namespace's :reload
+   re-links and re-applies the effects without a re-read."
   [loader-id ns-name & specs]
   (let [l (loader-by-id loader-id)
         {:keys [reload? specs]} (spec-flags specs)]

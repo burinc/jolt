@@ -583,7 +583,43 @@
       (chk "as :loader/unreadable" (= :loader/unreadable (:type (ex-data err))))
       (chk "the tag is named" (= ["my/tag"] (:tags (ex-data err))))
       (chk "and the data_readers.clj situation is explained"
-           (some? (re-find #"data_readers" (ex-message err)))))))
+           (some? (re-find #"data_readers" (ex-message err))))))
+  ;; a root without one fails the same way, blaming no file
+  (let [d2 (root-dir "readers-plain")]
+    (spit (str d2 "/libdr2.clj") "(ns libdr2) (def v #nope/tag 1)")
+    (let [err (try (l/load (l/classpath [d2]) {:kind :ns :name "libdr2"})
+                   nil (catch :default e e))]
+      (chk "an unresolved tag without any data_readers.clj still names the tag"
+           (= ["nope/tag"] (:tags (ex-data err))))
+      (chk "and does not blame a file that is not there"
+           (nil? (re-find #"data_readers" (ex-message err)))))))
+
+;; --- 27. :reload through a delegate -----------------------------------------
+;; The reload intent is keyed by NAME, so a namespace the context shares through
+;; a delegate re-reads there — in place, because in-place is what already-linked
+;; code needs — and the delegate's own link table ends up with the namespace's
+;; var links, not just the namespace.
+(defcase 27 ":reload reaches a namespace served by a delegate"
+  (let [pd (root-dir "reload-parent")
+        cd (root-dir "reload-child")]
+    (spit (str pd "/libs.clj") "(ns libs) (defn v [] :old)")
+    (spit (str cd "/libmain.clj")
+          (str "(ns libmain) (require '[libs :as s])"
+               " (defn now [] (s/v))"
+               " (defn bump [] (require 'libs :reload))"))
+    (let [parent (l/classpath [pd] {:parent (l/isolated)})
+          child (l/classpath [cd] {:parent parent})]
+      (l/load child {:kind :ns :name "libmain"})
+      (chk "the delegate serves libs"
+           (= :old ((val-of (l/resolve child {:kind :var :name "libmain/now"})))))
+      (spit (str pd "/libs.clj") "(ns libs) (defn v [] :new)")
+      ((val-of (l/resolve child {:kind :var :name "libmain/bump"})))
+      (chk "the reload reached the delegate and re-read in place"
+           (= :new ((val-of (l/resolve child {:kind :var :name "libmain/now"})))))
+      (chk "the delegate's table has the namespace link"
+           (some? (l/resolve parent {:kind :ns :name "libs"})))
+      (chk "and its var links"
+           (= :new ((val-of (l/resolve parent {:kind :var :name "libs/v"}))))))))
 
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
