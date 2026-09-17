@@ -104,6 +104,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A keyword-invoke site remembers the slot it hit.** `(:k m)` on an array
+  map was `amap-index`'s identity scan — 6.4 ns at the first slot, 10.8 at the
+  tenth — the same loop as `PersistentArrayMap.indexOf`. Every map one literal
+  builds is record-shaped, so a per-site cell holding the last hit index now
+  answers the next call with one `eq?` and one `vector-ref` (2 ns), the shape
+  of a monomorphic inline cache with the slot standing in for the hidden
+  class. It only shortcuts a hit: a different map at the site, a key at another
+  slot, a hash-mode map, a record or nil all take the old path, which re-primes
+  the cell. standard-clojure-style's formatter runs 8.5% faster end to end.
+  The arraymap gate pins the emitted shape, the fallbacks and the ratio.
+- **`clojure.string/last-index-of` scans backward.** It reversed both the
+  subject and the needle (two `list->string` round trips of the whole string)
+  and searched forward, so every call was linear in the subject where
+  `String.lastIndexOf` is a backward scan: a needle at the tail of 50k
+  characters went from 2.4k to 20M calls per second. The complexity gate pins
+  the shape; six corpus rows pin the values against the JVM.
 - **An escape continuation no longer copies the stack.** `jolt.continuations`'s
   `call-cc`/`letcc` checked the escape's owner through four `guard` forms — a
   full `call/cc` each, and a multi-shot capture inside the one-shot's frame

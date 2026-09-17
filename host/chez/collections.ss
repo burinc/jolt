@@ -1448,6 +1448,41 @@
         ((string? coll) (let ((i (->idx k)))
                           (if (and (fixnum? i) (fx>=? i 0) (fx<? i (string-length coll))) (string-ref coll i) d)))
         (else d)))
+;; A keyword-invoke SITE's cell: the slot index its key was last found at in
+;; an array-mode map. Every map one literal builds is record-shaped — the same
+;; key sits at the same slot — so the site's next lookup is one eq? and one
+;; vector-ref instead of amap-index's scan (2 ns against 6-11 for ten keys), the
+;; shape of a monomorphic inline cache with the slot standing in for the hidden
+;; class. It only ever shortcuts a HIT: a different map at the site, or the key
+;; at another slot, misses the eq? and takes the scan, which re-primes the cell.
+;; The cell is a fixnum in a one-slot vector, hoisted once per site by the
+;; emitter (backend_scheme.clj, the :keyword ifn kind); a racing write from
+;; another thread is a fixnum either way, so the worst concurrent outcome is a
+;; miss. A hash-mode map, a record, nil and every other receiver keep jolt-get's
+;; path, so what the site answers is exactly what jolt-get answers.
+(define (jolt-kw-site) (make-vector 1 0))
+(define (jolt-kw-get-site* m k site d)
+  (if (pmap? m)
+      (let ((root (pmap-root m)))
+        (if (hnode? root)
+            (pmap-fast-get m k d)
+            (let ((i (sa-uvector-ref site 0)) (n (vector-length root)))
+              (if (and (fx<? i n) (eq? (sa-uvector-ref root i) k))
+                  (sa-uvector-ref root (sa-ufx+ i 1))
+                  ;; unchecked like amap-index: i steps by 2 below n, and slot
+                  ;; i+1 exists whenever slot i holds a key
+                  (let lp ((j 0))
+                    (cond ((sa-ufx>=? j n) d)
+                          ((eq? (sa-uvector-ref root j) k)
+                           (sa-uvector-set! site 0 j)
+                           (sa-uvector-ref root (sa-ufx+ j 1)))
+                          (else (lp (sa-ufx+ j 2)))))))))
+      (jolt-get-dispatch m k d)))
+(define jolt-kw-get-site
+  (case-lambda
+    ((m k site) (jolt-kw-get-site* m k site jolt-nil))
+    ((m k site d) (jolt-kw-get-site* m k site d))))
+
 ;; jrec? / jrec-ref live in records.ss (loaded later); these are forward references
 ;; resolved at call time. Check concrete types first, then records, then arms.
 (define (jolt-get-dispatch coll k d)

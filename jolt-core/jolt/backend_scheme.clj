@@ -2907,6 +2907,15 @@
         (cond
           dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
           idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit fnode) ")")))
+          ;; Any other receiver: the site lookup over a per-site cell that
+          ;; remembers the array-map slot the key was last found at (collections.ss
+          ;; jolt-kw-get-site — one eq? on a hit, jolt-get's answer on anything
+          ;; else). The cell is a hoisted per-site constant, so only a site with a
+          ;; constant pool (inside a def) gets one; a bare top-level form keeps
+          ;; jolt-get rather than allocate a cell per evaluation.
+          *const-pool*
+          (let [site (hoist-const-per-site "(jolt-kw-site)")]
+            (order-args (fn [as] (str "(jolt-kw-get-site " (first as) " " (emit fnode) " " site (defstr as) ")"))))
           :else (order-args (fn [as] (str "(jolt-get " (first as) " " (emit fnode) (defstr as) ")")))))
       ;; (coll k [default]) -> lookup — coll (fnode) is the callee, evaluated
       ;; before the key/default args. A VECTOR literal invokes as nth (a bad
