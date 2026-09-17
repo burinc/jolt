@@ -1,8 +1,8 @@
-;; The loader conformance suite. These twelve cases ARE the specification of
-;; jolt.loader — per-context roots, isolation, delegation policy, and unload —
-;; the way test/chez/corpus.edn is the specification of clojure.core. They are
-;; written against the public API only, so a rewrite underneath is free as long
-;; as the suite stays green.
+;; The loader conformance suite. These cases ARE the specification of
+;; jolt.loader — per-context roots, isolation, delegation policy, unload,
+;; concurrent loads, and the host root — the way test/chez/corpus.edn is the
+;; specification of clojure.core. They are written against the public API only,
+;; so a rewrite underneath is free as long as the suite stays green.
 ;;
 ;; Run: bin/jolt run test/chez/loaderconf-test.clj  (make loaderconf gates it
 ;; against test/chez/loaderconf-known-failures.txt).
@@ -199,19 +199,31 @@
   (let [d1 (-> (root-dir "def1")
                (write! "dep.clj" "(ns dep) (def which :ctx1)")
                (write! "caller.clj"
-                       "(ns caller)\n(defn peek-dep [] (require 'dep) @(ns-resolve 'dep 'which))"))
+                       (str "(ns caller)\n"
+                            "(defn peek-dep [] (require 'dep) @(ns-resolve 'dep 'which))\n"
+                            "(defn own [] :own)\n"
+                            "(defn peek-own [] ((resolve 'own)))\n"
+                            "(defn peek-own-var [] ((find-var 'own)))")))
         d2 (write! (root-dir "def2") "dep.clj" "(ns dep) (def which :ctx2)")
         c1 (l/classpath [d1] {:parent (l/root)})
         c2 (l/classpath [d2] {:parent (l/root)})]
     (l/load c1 {:kind :ns :name "caller"})
-    (let [f (val-of (l/resolve c1 {:kind :var :name "caller/peek-dep"}))]
+    (let [f (val-of (l/resolve c1 {:kind :var :name "caller/peek-dep"}))
+          own (val-of (l/resolve c1 {:kind :var :name "caller/peek-own"}))
+          own-var (val-of (l/resolve c1 {:kind :var :name "caller/peek-own-var"}))]
       (chk "called from the root, the fn sees its own context's dep" (= :ctx1 (f)))
       (chk "called inside another context, it still sees its own"
            (= :ctx1 (l/with-loader c2 (f))))
       (chk "called from a thread in another context, it still sees its own"
            (= :ctx1 @(future (l/with-loader c2 (f)))))
       (chk "called from a fiber in another context, it still sees its own"
-           (= :ctx1 (async/<!! (async/go (l/with-loader c2 (f)))))))))
+           (= :ctx1 (async/<!! (async/go (l/with-loader c2 (f))))))
+      (chk "an unqualified (resolve 'sym) resolves in the defining context"
+           (= :own (own)))
+      (chk "and so does an unqualified (find-var 'sym)"
+           (= :own (own-var)))
+      (chk "even when called inside another context"
+           (= :own (l/with-loader c2 (own)))))))
 
 ;; --- 10. dispatch follows the value -----------------------------------------
 (defcase 10 "dispatch follows the value: a context-2 value dispatches in context 2"
@@ -268,6 +280,298 @@
       (fs/delete (str d "/libt.clj"))
       (chk "a load whose file vanished after find fails at load, not silently"
            (some? (try (l/load ctx hit) nil (catch :default e e)))))))
+
+;; --- 13. concurrent loads of one name ---------------------------------------
+;; The evict-evaluate window mutates process-global state, so loads of ONE name
+;; are serialized by name across loaders: several contexts racing on the same
+;; name must each end up with their own namespace — not a half-built one, and
+;; not each other's.
+(defcase 13 "concurrent private loads: one name, several contexts, no cross-talk"
+  (let [n 6
+        ctxs (mapv (fn [i]
+                     (l/classpath [(write! (root-dir (str "conc" i)) "libc.clj"
+                                           (str "(ns libc) (Thread/sleep 10)"
+                                                " (defn who [] " i ")"))]
+                                {:parent (l/root)}))
+                   (range n))
+        futures (mapv (fn [c]
+                        (future
+                          (l/load c {:kind :ns :name "libc"})
+                          ((val-of (l/resolve c {:kind :var :name "libc/who"})))))
+                      ctxs)
+        vals (mapv deref futures)
+        cells (mapv #(l/resolve % {:kind :var :name "libc/who"}) ctxs)]
+    (chk "every context loaded and called its own version" (= vals (vec (range n))))
+    (chk "the links are per-context cells"
+         (not (identical? (nth cells 0) (nth cells 1))))))
+
+;; --- 14. unload releases the global slot ------------------------------------
+;; unload! stops new loads AND releases the name this loader installed (while it
+;; is still the loader's), and definitions already resolved stay live: compiled
+;; code holds direct links to the cells.
+(defcase 14 "unload! unmaps what it installed; live definitions stay live"
+  (let [d1 (write! (root-dir "unl-one") "libun.clj" "(ns libun) (defn who [] :one)")
+        d2 (write! (root-dir "unl-two") "libun.clj" "(ns libun) (defn who [] :two)")]
+    (let [c0 (l/classpath [d1] {:parent (l/root)})]
+      (l/load c0 {:kind :ns :name "libun"})
+      (chk "the namespace was installed" (some? (find-ns 'libun)))
+      (let [who (val-of (l/resolve c0 {:kind :var :name "libun/who"}))
+            report (l/unload! c0)]
+        (chk "unload! reports the unmapped namespace"
+             (= 1 (get-in report [:released :namespaces])))
+        (chk "the name is no longer registered" (nil? (find-ns 'libun)))
+        (chk "a definition resolved before the unload still works" (= :one (who)))))
+    (let [c1 (l/classpath [d1] {:parent (l/root)})
+          c2 (l/classpath [d2] {:parent (l/root)})]
+      (l/load c1 {:kind :ns :name "libun"})
+      (l/load c2 {:kind :ns :name "libun"})
+      (let [who2 (val-of (l/resolve c2 {:kind :var :name "libun/who"}))
+            report (l/unload! c1)
+            c3 (l/classpath [d1] {:parent (l/root)})]
+        (chk "context 2's version is the installed one" (= :two (who2)))
+        (chk "context 1's unload released nothing (its slot was replaced)"
+             (= 0 (get-in report [:released :namespaces])))
+        (chk "context 2's registration survived" (some? (find-ns 'libun)))
+        (l/unload! c2)
+        (chk "the last unload unmaps the name" (nil? (find-ns 'libun)))
+        (l/load c3 {:kind :ns :name "libun"})
+        (chk "a fresh context reloads after the unload"
+             (= :one ((val-of (l/resolve c3 {:kind :var :name "libun/who"})))))))))
+
+;; --- 15. a failed load installs nothing -------------------------------------
+;; A private load that throws must not leave a partial namespace registered: the
+;; next load of the name must behave as if it never ran.
+(defcase 15 "a failed private load leaves nothing installed"
+  (let [d (root-dir "failed")
+        _ (write! d "libfail.clj"
+                  "(ns libfail) (def half :defined) (throw (ex-info \"boom\" {}))")
+        ctx (l/classpath [d] {:parent (l/root)})
+        err (try (l/load ctx {:kind :ns :name "libfail"})
+                 nil
+                 (catch :default e e))]
+    (chk "the load threw" (some? err))
+    (chk "no partial namespace was left registered" (nil? (find-ns 'libfail)))
+    (chk "the loader linked nothing" (nil? (l/resolve ctx {:kind :ns :name "libfail"})))
+    (write! d "libfail.clj" "(ns libfail) (def marker :ok)")
+    (l/load ctx {:kind :ns :name "libfail"})
+    (chk "a retry after fixing the source loads"
+         (= :ok (val-of (l/resolve ctx {:kind :var :name "libfail/marker"}))))))
+
+;; --- 16. private names are invisible through the host -----------------------
+;; A context's own namespace is not the host's: while a context owns the name,
+;; the root answers neither the namespace nor a var in it.
+(defcase 16 "private names are hidden from the host root"
+  (let [d (write! (root-dir "priv") "libpriv.clj" "(ns libpriv) (def marker :mine)")
+        ctx (l/classpath [d] {:parent (l/root)})]
+    (l/load ctx {:kind :ns :name "libpriv"})
+    (chk "the context resolves its own namespace"
+         (some? (l/resolve ctx {:kind :ns :name "libpriv"})))
+    (chk "the root does not see the namespace"
+         (empty? (l/find (l/root) {:kind :ns :name "libpriv"})))
+    (chk "the root does not see a var in it"
+         (empty? (l/find (l/root) {:kind :var :name "libpriv/marker"})))
+    (chk "the owner still sees its var"
+         (some? (l/resolve ctx {:kind :var :name "libpriv/marker"})))
+    (l/unload! ctx)
+    (chk "after unload nothing is registered" (nil? (find-ns 'libpriv)))))
+
+;; --- 17. the host loads its own namespaces through the root -----------------
+;; A namespace the host can load but has not loaded yet is located by the root
+;; without reading, then loaded through the host's own loader — the context
+;; links the shared definition instead of the runtime require pulling it in
+;; behind the loader's back.
+(defcase 17 "the root loads host namespaces on demand, linked in the context"
+  (let [roots (jolt.host/source-roots)
+        host-dir (write! (root-dir "hostns") "libhost.clj" "(ns libhost) (def v :host)")]
+    (jolt.host/set-source-roots! (cons host-dir roots))
+    (try
+      (let [ctx (l/classpath [(write! (root-dir "hostapp") "apph.clj"
+                                      "(ns apph (:require [libhost])) (defn f [] libhost/v)")]
+                             {:parent (l/root)})]
+        (chk "the host does not have it loaded yet" (nil? (find-ns 'libhost)))
+        (chk "the root locates it" (seq (l/find (l/root) {:kind :ns :name "libhost"})))
+        (l/load ctx {:kind :ns :name "apph"})
+        (chk "the host loaded it through its own loader" (some? (find-ns 'libhost)))
+        (chk "the context linked the host's namespace"
+             (some? (l/resolve ctx {:kind :ns :name "libhost"})))
+        (chk "the context's code calls it"
+             (= :host ((val-of (l/resolve ctx {:kind :var :name "apph/f"})))))
+        (l/unload! ctx))
+      (finally
+        (remove-ns 'libhost)
+        (jolt.host/set-source-roots! roots)))))
+
+;; --- 18. a requirement must come from the loader -----------------------------
+;; Evaluated source resolves through the loader, not through whatever the
+;; runtime's global require would reach: a requirement the loader cannot serve
+;; fails the load with an actionable error instead of silently compiling against
+;; a definition the context cannot even see.
+(defcase 18 "a requirement the loader cannot serve fails the load"
+  (let [d (write! (root-dir "hermetic-req") "libhq.clj"
+                  (str "(ns libhq (:require [clojure.string]))"
+                       " (defn f [] (clojure.string/upper-case \"x\"))"))
+        ctx (l/classpath [d] {:parent (l/isolated)})
+        err (try (l/load ctx {:kind :ns :name "libhq"})
+                 nil
+                 (catch :default e e))]
+    (chk "the load threw" (some? err))
+    (chk "the error names the requirement" (= "clojure.string" (:name (ex-data err))))
+    (chk "the error is actionable" (string? (ex-message err)))
+    (chk "nothing was installed" (nil? (find-ns 'libhq)))
+    (chk "and the source was not linked"
+         (nil? (l/resolve ctx {:kind :ns :name "libhq"})))))
+
+;; --- 19. dashed namespace names ----------------------------------------------
+;; The runtime maps a namespace to a file the way Clojure does: split on '.',
+;; munge '-'->'_' per segment, join with '/' (loader.ss ns-seg-munge). A root
+;; holding lib_one/core.clj must therefore serve lib-one.core — every namespace
+;; the extension system loads is dashed.
+(defcase 19 "dashed namespace names resolve at their munged paths"
+  (let [d (root-dir "dashed")]
+    (fs/create-dirs (str d "/lib_one"))
+    (spit (str d "/lib_one/core.clj")
+          "(ns lib-one.core) (defn f [] :dashed) (def v :dashed-v)")
+    (let [l (l/classpath [d])]
+      (chk "the munged path locates the namespace"
+           (seq (l/find l {:kind :ns :name "lib-one.core"})))
+      (l/load l {:kind :ns :name "lib-one.core"})
+      (chk "the source loads" (some? (l/resolve l {:kind :ns :name "lib-one.core"})))
+      (chk "its vars link under the dashed name"
+           (= :dashed ((val-of (l/resolve l {:kind :var :name "lib-one.core/f"})))))
+      (chk "and a var request loads through the link"
+           (= :dashed-v (val-of (l/load l {:kind :var :name "lib-one.core/v"})))))
+    ;; an unmunged (dashed) FILE name is not a namespace path: the rule is
+    ;; the runtime's, and Clojure's
+    (fs/create-dirs (str d "/lib_two"))
+    (spit (str d "/lib_two/dep-util.clj")
+          "(ns lib-two.dep-util) (def x :wrong)")
+    (let [l2 (l/classpath [d])]
+      (chk "a dashed file name is not a namespace path"
+           (empty? (l/find l2 {:kind :ns :name "lib-two.dep-util"}))))))
+
+;; --- 20. resources follow the ambient loader ---------------------------------
+;; io/resource's 1-arity is the resource analogue of the TCCL: inside
+;; with-loader it resolves in the bound loader's context — an extension's
+;; (io/resource "x") must find its own bundled files — and outside one it keeps
+;; the host answer.
+(defcase 20 "the 1-arity io/resource follows the ambient loader"
+  (let [d (root-dir "ambient-res")]
+    (spit (str d "/amb.edn") "{:amb true}")
+    (let [ctx (l/classpath [d] {:parent (l/isolated)})]
+      (chk "outside any context the file is not on the host's roots"
+           (nil? (io/resource "amb.edn")))
+      (chk "inside the context it resolves against the context's roots"
+           (= (str (io/as-url (java.io.File. (str d "/amb.edn"))))
+              (str (l/with-loader* ctx (fn [] (io/resource "amb.edn"))))))
+      (chk "and the 2-arity agrees"
+           (= (str (l/with-loader* ctx (fn [] (io/resource "amb.edn"))))
+              (str (io/resource "amb.edn" (l/as-classloader ctx))))))))
+
+;; --- 21. the host root is not unloadable -------------------------------------
+;; The root is the host itself; `unload!` there would leave the process with no
+;; world to load from, so it is refused (a bad request, not a teardown) and the
+;; root stays live.
+(defcase 21 "the host root is not unloadable"
+  (let [r (l/root)
+        err (try (l/unload! r) nil (catch :default e e))]
+    (chk "unload! on the root throws" (some? err))
+    (chk "with an actionable message" (string? (ex-message err)))
+    (chk "and it is a bad request, not a teardown failure"
+         (= :loader/bad-request (:type (ex-data err))))
+    (chk "the root is still live" (false? (l/unloaded? r)))
+    (chk "and still answers"
+         (some? (l/find r {:kind :ns :name "clojure.string"})))))
+
+;; --- 22. the thread context classloader --------------------------------------
+;; TCCL is the resource analogue's sibling: inside with-loader it is the
+;; context's own classloader (a library that finds its resources the Java way
+;; must land in the context's roots), outside one the host singleton.
+(defcase 22 "the thread context classloader follows the ambient loader"
+  (let [d (root-dir "tccl")]
+    (spit (str d "/amb.edn") "{:amb true}")
+    (let [ctx (l/classpath [d])
+          outside (.getContextClassLoader (Thread/currentThread))
+          inside (l/with-loader* ctx (fn [] (.getContextClassLoader (Thread/currentThread))))]
+      (chk "inside a context it is that context's classloader"
+           (identical? (l/as-classloader ctx) inside))
+      (chk "and it resolves the context's own roots"
+           (some? (.getResource inside "amb.edn")))
+      (chk "outside it is not the context's"
+           (and (some? outside) (not (identical? outside inside)))))))
+
+;; --- 23. require's options, and :reload -------------------------------------
+;; A runtime (require …) is a load IN the defining context: its :as/:refer must
+;; materialize there (the rewrite used to preload and drop them), and :reload
+;; must re-read through the loader, not the host.
+(defcase 23 "require's options apply in the defining context, and :reload re-reads"
+  (let [d (root-dir "reqopts")]
+    (spit (str d "/libh.clj") "(ns libh) (defn thing [] :one)")
+    (spit (str d "/libmain.clj")
+          (str "(ns libmain)"
+               " (require '[libh :as h])"
+               " (defn f [] (h/thing))"
+               " (defn reload! [] (require 'libh :reload))"))
+    (let [ctx (l/classpath [d])]
+      (l/load ctx {:kind :ns :name "libmain"})
+      (chk "the alias materialized for later forms"
+           (= :one ((val-of (l/resolve ctx {:kind :var :name "libmain/f"})))))
+      (spit (str d "/libh.clj") "(ns libh) (defn thing [] :two)")
+      ((val-of (l/resolve ctx {:kind :var :name "libmain/reload!"})))
+      (chk ":reload re-read the source through the loader"
+           (= :two ((val-of (l/resolve ctx {:kind :var :name "libmain/f"})))))
+      ;; a requirement the loader cannot serve fails rather than leaking to the
+      ;; runtime's global require (the ns-form path's rule, extended to calls)
+      (let [d2 (root-dir "reqopts-bad")]
+        (spit (str d2 "/libbad.clj") "(ns libbad) (require 'nope.nothing)")
+        (let [err (try (l/load (l/classpath [d2]) {:kind :ns :name "libbad"})
+                       nil (catch :default e e))]
+          (chk "an unservable require fails the load" (some? err))
+          (chk "as :loader/unreadable" (= :loader/unreadable (:type (ex-data err)))))))))
+
+;; --- 24. use and refer ------------------------------------------------------
+(defcase 24 "use and refer load through the loader and act in the defining namespace"
+  (let [d (root-dir "useref")]
+    (spit (str d "/libh.clj") "(ns libh) (defn thing [] :helper) (def other :other)")
+    (spit (str d "/libu.clj") "(ns libu) (use 'libh) (defn f [] (thing))")
+    (spit (str d "/libr.clj")
+          "(ns libr) (refer 'libh :only '[other]) (defn g [] other)")
+    (let [ctx (l/classpath [d])]
+      (l/load ctx {:kind :ns :name "libu"})
+      (l/load ctx {:kind :ns :name "libr"})
+      (chk "use referred the helper in the defining namespace"
+           (= :helper ((val-of (l/resolve ctx {:kind :var :name "libu/f"})))))
+      (chk "refer applied its :only filter there"
+           (= :other ((val-of (l/resolve ctx {:kind :var :name "libr/g"}))))))))
+
+;; --- 25. load / load-file ---------------------------------------------------
+(defcase 25 "load and load-file are refused in evaluated source"
+  (let [d (root-dir "refuse")]
+    (spit (str d "/libl.clj") "(ns libl) (load \"whatever\")")
+    (let [err (try (l/load (l/classpath [d]) {:kind :ns :name "libl"})
+                   nil (catch :default e e))]
+      (chk "the load is refused" (some? err))
+      (chk "with an actionable message"
+           (some? (re-find #"host-file" (ex-message err))))
+      (chk "as :loader/unreadable" (= :loader/unreadable (:type (ex-data err)))))))
+
+;; --- 26. a context's own data_readers.clj ---------------------------------------
+;; Per-context data readers are not supported: the runtime's reader resolves
+;; #tag against the host's *data-readers* before the loader sees the form. That
+;; is a documented limit, not a silent one — the load fails naming the tag and
+;; the reason.
+(defcase 26 "a context's own data_readers.clj fails with the tag named"
+  (let [d (root-dir "readers")]
+    (spit (str d "/data_readers.clj") "{my/tag my.reader/read-tag}")
+    (fs/create-dirs (str d "/my"))
+    (spit (str d "/my/reader.clj") "(ns my.reader) (defn read-tag [_] :tagged)")
+    (spit (str d "/libdr.clj") "(ns libdr) (def v #my/tag 1)")
+    (let [err (try (l/load (l/classpath [d]) {:kind :ns :name "libdr"})
+                   nil (catch :default e e))]
+      (chk "the load fails" (some? err))
+      (chk "as :loader/unreadable" (= :loader/unreadable (:type (ex-data err))))
+      (chk "the tag is named" (= ["my/tag"] (:tags (ex-data err))))
+      (chk "and the data_readers.clj situation is explained"
+           (some? (re-find #"data_readers" (ex-message err)))))))
 
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]

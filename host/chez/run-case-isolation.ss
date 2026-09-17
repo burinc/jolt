@@ -47,6 +47,12 @@
   (vector-for-each (lambda (k) (unless (hashtable-ref zj-loaded-base k #f)
                                  (ldr-unmark-loaded! k)))
                    (hashtable-keys loaded-ns))
+  ;; the loader's own bookkeeping (contexts, facades, ownership) is stdlib
+  ;; state these host tables cannot reach; a row's contexts go with its
+  ;; namespaces. Skipped when jolt.loader was never loaded.
+  (guard (e (#t #f))
+    (let ((f (var-deref "jolt.loader" "reset-context-state!")))
+      (when f (f))))
   (hashtable-clear! ns-alias-table)
   (hashtable-clear! ns-refer-table)
   (hashtable-clear! ns-refer-all-table)

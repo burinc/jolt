@@ -1778,6 +1778,15 @@
                     (hashtable-set! tagged-methods-tbl key nh) nh))))
       (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members))))
 
+;; The method a tagged table would dispatch, or #f. The dispatch arm above is the
+;; caller; this is for runtime code that must ASK whether a library object
+;; answers a method before deciding how to resolve (java/io.ss's io/resource
+;; 2-arity: a loader object with getResource resolves in its own context).
+(define (tagged-method-lookup obj name)
+  (let* ((tag (and (htable? obj) (hashtable-ref (htable-h obj) "jolt/type" #f)))
+         (mh (and tag (hashtable-ref tagged-methods-tbl (tag->method-key tag) #f))))
+    (and mh (hashtable-ref mh name #f))))
+
 ;; htable arm: dispatch (.method obj a*) through the table's tag method registry;
 ;; an unregistered method falls through (sorted colls are htables too).
 (register-method-arm! arm-priority-htable
