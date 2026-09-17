@@ -75,6 +75,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A collection's metadata is a field of the collection.** A vector, map,
+  set, list cell, `()` and lazy-seq node carry their meta in a slot of their
+  own record — the reference's `Obj._meta` — instead of an identity-keyed side
+  table that every `conj`/`assoc`/`into` probed and every `with-meta` wrote
+  under one process-wide mutex. `meta` is a field read, `with-meta` one
+  allocation, and a carry copies the slot, on any thread: eight threads each
+  doing `with-meta` on their own vectors ran 24x slower per thread than one and
+  now run at parity. The side table remains only for records, reifies, fns and
+  sorted collections. State images are format 8; images of format 7 and older
+  still read (a permanent format-7 fixture proves it). Three carries now match
+  the JVM where the table's identity keying could not: `pop` of a list no
+  longer stamps the receiver's meta onto the shared tail (`(rest l)` used to
+  change too), `conj`/`into` onto a Cons or a lazy seq carry none, `vec` of a
+  vector drops it, and `with-meta` on a lazy seq forces it as `LazySeq.withMeta`
+  does; eleven certified corpus rows.
+
 - **A `#"…"` literal is a per-site constant.** The reference reads a regex
   literal as a `Pattern` object and compiles it as a constant, one object per
   site built once; jolt rebuilt it every time the literal was reached — a cache
@@ -123,6 +139,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thread's allocation area one 16 KB segment at a time under a global mutex.
 
 ### Fixed
+
+- **`with-meta` on a seq cell no longer runs its unforced tail twice.** The copy
+  `with-meta` builds shared the cell's tail word as it stood, and a tail still
+  pending — the thunk a lazy `map`/`filter`/`rest` leaves behind — was then run
+  by each cell: `(with-meta (seq (map f xs)) m)` called `f` once per element
+  for the original and again for the copy, where `Cons.withMeta` shares one
+  `_more`. The copy's tail is now a `rest` descriptor over the original cell,
+  so the producer runs once whichever cell is walked first, and the copy still
+  dumps to an image. Two certified corpus rows and an image round-trip.
+
+- **`vec` of a map entry is a plain vector.** `MapEntry` is not `IObj`, so the
+  reference's `vec` builds a `PersistentVector` of the two slots; jolt handed the
+  entry back as itself, still a `MapEntry` to `class` and `instance?`. One
+  certified corpus row.
 
 - **`set!` on a conveyed binding is refused, as `Var.set` refuses it.** A
   binding frame now records who pushed it — the fiber running there, else the

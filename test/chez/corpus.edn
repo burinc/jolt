@@ -2418,6 +2418,23 @@
   {:suite "metadata / collection ops preserve meta" :label "value preserved through conj" :expected "[1 2]" :actual "(conj (with-meta [1] {:k 9}) 2)" :portability :common}
   {:suite "metadata / collection ops preserve meta" :label "empty list singleton unaffected" :expected "nil" :actual "(do (with-meta () {:leak 1}) (meta ()))" :portability :common}
   {:suite "metadata / collection ops preserve meta" :label "empty vector literal unaffected" :expected "nil" :actual "(do (with-meta [] {:leak 1}) (meta []))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "pop on list to empty keeps meta" :expected "{:k 9}" :actual "(meta (pop (with-meta (list 1) {:k 9})))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "pop on list answers the tail's own meta" :expected "[nil nil]" :actual "(let [l (with-meta (list 1 2) {:k 9})] [(meta (pop l)) (meta (rest l))])" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "conj on a cons carries none" :expected "nil" :actual "(meta (conj (with-meta (cons 1 [2]) {:k 9}) 0))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "conj on a lazy seq carries none" :expected "nil" :actual "(meta (conj (with-meta (lazy-seq [1]) {:k 9}) 0))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "into a list carries" :expected "{:k 9}" :actual "(meta (into (with-meta (list 1) {:k 9}) [2]))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "into a cons carries none" :expected "nil" :actual "(meta (into (with-meta (cons 1 [2]) {:k 9}) [3]))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "with-meta forces a lazy seq" :expected "[true true {:k 9} true]" :actual "(let [ls (lazy-seq [1 2]) l2 (with-meta ls {:k 9})] [(realized? ls) (realized? l2) (meta l2) (= [1 2] l2)])" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "vec drops a vector's meta" :expected "nil" :actual "(meta (vec (with-meta [1 2] {:k 9})))" :portability :common}
+  ;; MapEntry is not IObj, so vec of one is LazilyPersistentVector.create: a plain
+  ;; vector, not the entry handed back.
+  {:suite "metadata / collection ops preserve meta" :label "vec of a map entry is a plain vector" :expected "[\"class clojure.lang.PersistentVector\" false true true]" :actual "(let [v (vec (first {:a 1}))] [(str (class v)) (instance? clojure.lang.MapEntry v) (= [:a 1] v) (instance? clojure.lang.MapEntry (first {:a 1}))])" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "a carry shares the meta map" :expected "true" :actual "(let [v (with-meta [1] {:k 9})] (identical? (meta v) (meta (conj v 2))))" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "with-meta identity shortcut" :expected "[true false]" :actual "(let [m (with-meta {} {:k 9})] [(identical? m (with-meta m (meta m))) (identical? m (with-meta m nil))])" :portability :common}
+  ;; Cons.withMeta shares the rest: the tail's producer runs once for the
+  ;; original and the copy together, whichever is walked first.
+  {:suite "metadata / collection ops preserve meta" :label "with-meta on a cons shares its unforced tail (original walked first)" :expected "[3 {:m 1} [1 2 3]]" :actual "(let [a (atom 0) s (seq (map (fn [x] (swap! a inc) x) (list 1 2 3))) t (with-meta s {:m 1})] (doall s) (doall t) [@a (meta t) (vec t)])" :portability :common}
+  {:suite "metadata / collection ops preserve meta" :label "with-meta on a cons shares its unforced tail (copy walked first)" :expected "[3 {:m 1} [1 2 3] [1 2 3]]" :actual "(let [a (atom 0) s (seq (map (fn [x] (swap! a inc) x) (list 1 2 3))) t (with-meta s {:m 1})] (doall t) (doall s) [@a (meta t) (vec t) (vec s)])" :portability :common}
   {:suite "metadata / def metadata" :label "^:dynamic var binds" :expected "9" :actual "(do (def ^:dynamic *d* 1) (binding [*d* 9] *d*))" :portability :common}
   {:suite "metadata / def metadata" :label "^:private on var" :expected "true" :actual "(do (def ^:private pv 1) (:private (meta (var pv))))" :portability :common}
   {:suite "metadata / def metadata" :label "^Type tag on var" :expected "java.lang.String" :actual "(do (def ^String tv \"a\") (:tag (meta (var tv))))" :portability :jvm}

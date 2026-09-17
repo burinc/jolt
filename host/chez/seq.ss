@@ -97,8 +97,13 @@
 (define sk-count        24)
 
 (define-record-type cseq
-  (fields head (mutable tail) (mutable forced? cseq-forced-flag cseq-forced-flag-set!) kind cvec ci crest (mutable lock))
-  (nongenerative chez-cseq-v6))
+  (fields head (mutable tail) (mutable forced? cseq-forced-flag cseq-forced-flag-set!) kind cvec ci crest (mutable lock) (mutable meta))
+  (nongenerative chez-cseq-v7))
+;; `meta` (last, after the lock so the lock's slot index below is unchanged) is
+;; the cell's metadata, jolt-nil or a map — the _meta of a PersistentList node or
+;; a Cons. natives-meta.ss owns the slot; it is written only on a cell nobody
+;; else holds yet. The layout travels raw in a state image (chez-cseq-v7);
+;; chez-cseq-v6, without the slot, restores through state-image.ss's legacy arm.
 ;; A cell's tail is ONE published word: the thunk (a procedure or a lazy-src
 ;; descriptor) until it is forced, #f for a vector-backed cell whose tail follows
 ;; from its own fields, and whatever the thunk answered after -- a cseq, jolt-nil,
@@ -120,7 +125,7 @@
 ;; (force-claimed!, below). Checked at load: a wrong index would corrupt a
 ;; neighbouring field silently.
 (define cseq-lock-index 7)
-(let ((c (make-cseq 'h 't #t 0 #f 0 #f #f)))
+(let ((c (make-cseq 'h 't #t 0 #f 0 #f #f jolt-nil)))
   (unless (and (sa-record-cas! c cseq-lock-index #f 'probe)
                (eq? (cseq-lock c) 'probe)
                (not (sa-record-cas! c cseq-lock-index #f 'again))
@@ -128,11 +133,11 @@
     (error 'seq.ss "cseq-lock-index does not address the lock field")))
 ;; tail already a seq. The /k variants take the flavor; the bare ones are the
 ;; generic cell, which is the overwhelming majority of call sites.
-(define (cseq-realized head tail) (make-cseq head tail #t sk-cons #f 0 #f #f))
-(define (cseq-realized/k head tail kind) (make-cseq head tail #t kind #f 0 #f #f))
-(define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk #f sk-cons #f 0 #f #f))
-(define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk #f kind #f 0 #f #f))
-(define (cseq-list head tail) (make-cseq head tail #t sk-list #f 0 #f #f))   ; a PersistentList node
+(define (cseq-realized head tail) (make-cseq head tail #t sk-cons #f 0 #f #f jolt-nil))
+(define (cseq-realized/k head tail kind) (make-cseq head tail #t kind #f 0 #f #f jolt-nil))
+(define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk #f sk-cons #f 0 #f #f jolt-nil))
+(define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk #f kind #f 0 #f #f jolt-nil))
+(define (cseq-list head tail) (make-cseq head tail #t sk-list #f 0 #f #f jolt-nil))   ; a PersistentList node
 
 ;; --- a lazy cell's thunk, as DATA ---------------------------------------------
 ;; A thunk built in Scheme carries its captured values where nothing can read
@@ -257,7 +262,7 @@
 ;; pvec is a PersistentTreeMap$Seq that happens to be vector-backed. Keeping the
 ;; two independent is what lets the class answer stay right while the O(1)
 ;; count/chunk fast paths keep keying off cvec alone.
-(define (cseq-vec head v i kind) (make-cseq head #f #f kind v i #f #f))
+(define (cseq-vec head v i kind) (make-cseq head #f #f kind v i #f #f jolt-nil))
 ;; A ChunkedCons cell over a standalone chunk pvec: head is chunk[i], walking
 ;; (seq-more) advances within the chunk and then continues into `rest`. `rest` is
 ;; the already-coerced after-chunk seq (cseq | jolt-nil | a jolt-lazyseq), held in
@@ -282,9 +287,9 @@
 ;; A ChunkedCons by default; `kind` lets a producer that chunks say what it really
 ;; is instead (a bounded range chunks, and is a LongRange).
 (define (cseq-chunked chunk i rest)
-  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f sk-chunked-cons chunk i rest #f))
+  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f sk-chunked-cons chunk i rest #f jolt-nil))
 (define (cseq-chunked/k chunk i rest kind)
-  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f kind chunk i rest #f))
+  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f kind chunk i rest #f jolt-nil))
 ;; The tail of a cvec-bearing cell. Two shapes share the field: a ChunkedCons
 ;; (crest set — cvec is a standalone <=32 chunk, and the after-chunk seq follows)
 ;; and a vector-backed index seq (crest #f — cvec is the whole backing vector).
@@ -304,7 +309,7 @@
             (if force? (jolt-seq cr) cr))
         (if (fx>=? i1 (pvec-count v))
             jolt-nil
-            (make-cseq (pvec-nth-d v i1 jolt-nil) #f #f (cseq-kind s) v i1 #f #f)))))
+            (make-cseq (pvec-nth-d v i1 jolt-nil) #f #f (cseq-kind s) v i1 #f #f jolt-nil)))))
 (define (seq-first s) (cseq-head s))
 ;; --- forcing once, without a mutex per cell -----------------------------------
 ;; Reading a cell needs no lock (seq-tail-realized?, above). What still needs
@@ -410,12 +415,15 @@
            (if (seq-tail-realized? t) t
                (let ((r (cseq-run-tail t))) (cseq-publish-tail! s r) r))))))))
 
-;; The empty seq (Clojure's empty list ()), distinct from nil. The (unused) field
-;; defeats Chez's interning of fieldless records, so an empty list carrying
-;; metadata (an `empty`/`pop`/`with-meta` result) is a distinct identity from the
-;; shared jolt-empty-list — otherwise its meta would leak onto every ().
-(define-record-type empty-list-t (fields _) (nongenerative empty-list-v2))
-(define (fresh-empty-list) (make-empty-list-t #f))
+;; The empty seq (Clojure's empty list ()), distinct from nil. Its one field is
+;; its metadata, jolt-nil or a map (EmptyList extends Obj): a metadata-bearing ()
+;; — an `empty`/`pop`/`with-meta` result — is a fresh instance, so the shared
+;; jolt-empty-list never carries any. A fielded record is also what keeps Chez
+;; from interning every () into one object. natives-meta.ss owns the slot; the
+;; layout travels raw in a state image (empty-list-v3), and empty-list-v2
+;; restores through state-image.ss's legacy arm.
+(define-record-type empty-list-t (fields (mutable meta)) (nongenerative empty-list-v3))
+(define (fresh-empty-list) (make-empty-list-t jolt-nil))
 (define jolt-empty-list (fresh-empty-list))
 
 ;; reduced: a box a reducing fn returns to stop reduce early. The
@@ -660,8 +668,8 @@
 ;; The remainder is the test itself and is the price of the distinction.
 (define (jolt-cons x coll)
   (if (jolt-nil? coll)
-      (make-cseq x jolt-nil #t sk-list #f 0 #f #f)
-      (make-cseq x (jolt-seq coll) #t sk-cons #f 0 #f #f)))
+      (make-cseq x jolt-nil #t sk-list #f 0 #f #f jolt-nil)
+      (make-cseq x (jolt-seq coll) #t sk-cons #f 0 #f #f jolt-nil)))
 ;; Scheme list -> a jolt PersistentList. For (list …) and quoted list literals
 ;; (the emitter lowers '(a b) to (jolt-list a b)).
 (define (jolt-list . xs)
@@ -1649,8 +1657,9 @@
     ;; list, and an empty source leaves nil, as on the JVM.
     ((jolt-nil? to)
      (into-fold (lambda (acc x) (jolt-conj1 (if (jolt-nil? acc) jolt-empty-list acc) x)) jolt-nil from))
+    ;; (reduce conj to from): the receiver's meta threads exactly where conj's does
     (else
-     (meta-carry to
+     (meta-carry-conj to
        (into-fold (lambda (acc x) (jolt-conj1 acc x)) to from)))))
 
 ;; zipmap: the reference builds through (transient {}) — a slot buffer of 8

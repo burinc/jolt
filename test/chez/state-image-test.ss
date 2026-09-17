@@ -672,17 +672,17 @@
                    " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
     ":refused")
 
-;; metadata rides to the substituted object: the write side copies the meta
-;; table entry across the transform memo, so collect-meta keys the copy
+;; metadata rides to the substituted object: the write side installs the meta
+;; in the substituted map's own slot, so the sidecar carries nothing for it
 (ev "(def mm (with-meta {:f (fn [x] x)} {:m 1}))")
 (ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mm)"))
 (let* ((b (image-body tmp))
        (g (vector-ref b 0))
        (meta-alist (vector-ref b 1)))
   (ok "the substituted map is a fresh object" (not (eq? g (var-deref "user" "mm"))))
-  (ok "meta rides keyed by the substituted map"
-      (let ((e (assq g meta-alist)))
-        (and e (= 1 (jolt-get (cdr e) (keyword #f "m") jolt-nil))))))
+  (ok "meta rides in the substituted map's slot"
+      (= 1 (jolt-get (pmap-meta g) (keyword #f "m") jolt-nil)))
+  (ok "the sidecar carries no collection meta" (not (assq g meta-alist))))
 
 ;; handlers claim at any depth (not just var roots), procedures and resources
 (ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (= (:res-id x) 7))) (fn [x] {:claimed (:res-id x)}) (fn [d] d))")
@@ -1313,6 +1313,57 @@
 (is "v0.6.8 fixture: its fields read" "[(:a imgrec8/box) (:b imgrec8/box) (count imgrec8/box)]" "[1 two 2]")
 (is "v0.6.8 fixture: a deftype instance prints" "(pr-str imgrec8/pt)" "#imgrec8.Pt{:x 3, :y 4}")
 
+;; --- the same proof for the COLLECTION records and their metadata. Format 7
+;; carried a vector/map/set/list/lazy-seq/() as the slotless records
+;; (chez-pvec-v3, chez-pmap-v5, chez-pset-v2, chez-cseq-v6, jolt-lazyseq-v2,
+;; empty-list-v2) and every collection's meta in the sidecar; format 8 gives
+;; each record a meta slot. The legacy arms re-mint the records and carry the
+;; sidecar entry onto them. Fixture made by the 0.8.8-era build (format 7);
+;; permanent, like the two above.
+(ok "v0.8.8 collection-meta fixture present" (file-exists? "test/chez/fixtures/image-v0.8.8-coll-meta.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.8-coll-meta.image")
+(is "v0.8.8 fixture: imgmeta8/plain" "imgmeta8/plain" "7")
+(is "v0.8.8 fixture: every collection's meta arrives in the slot"
+    "[(meta imgmeta8/vm) (meta imgmeta8/mm) (meta imgmeta8/sm) (meta imgmeta8/lm) (meta imgmeta8/em) (meta imgmeta8/lsm) (meta imgmeta8/nm) (meta (:k imgmeta8/nm)) (meta imgmeta8/bigv) (meta imgmeta8/bigm) (meta (first (keys imgmeta8/mk))) (meta (first imgmeta8/smk)) (meta imgmeta8/bm)]"
+    "[{:m :vec} {:m :map} {:m :set} {:m :list} {:m :empty} {:m :lazy} {:outer 1} {:inner 1} {:m :big} {:m :bigm} {:m :key} {:m :elem} {:m :rec}]")
+(is "v0.8.8 fixture: the values themselves"
+    "[imgmeta8/vm imgmeta8/lm imgmeta8/em imgmeta8/lsm (count imgmeta8/bigv) (nth imgmeta8/bigv 39) (get imgmeta8/bigm 7) (get imgmeta8/mk [1]) (contains? imgmeta8/smk {:x 1}) (:a imgmeta8/bm)]"
+    "[[1 2] (1 2) () (1 2) 40 39 7 :v true 1]")
+(is "v0.8.8 fixture: collections without meta read nil"
+    "[(meta imgmeta8/pv) (meta imgmeta8/pm) (meta imgmeta8/ps) (meta imgmeta8/pl) (meta imgmeta8/pe) (meta imgmeta8/pls)]"
+    "[nil nil nil nil nil nil]")
+(is "v0.8.8 fixture: the re-minted records are the live kinds"
+    "[(vector? imgmeta8/vm) (map? imgmeta8/mm) (set? imgmeta8/sm) (list? imgmeta8/lm) (list? imgmeta8/em) (seq? imgmeta8/lsm) (realized? imgmeta8/lsm)]"
+    "[true true true true true true true]")
+(is "v0.8.8 fixture: ops on the restored collections still carry"
+    "[(meta (conj imgmeta8/vm 3)) (meta (assoc imgmeta8/mm :b 2)) (meta (disj imgmeta8/sm 1)) (meta (conj imgmeta8/lm 0)) (meta (conj imgmeta8/em 0))]"
+    "[{:m :vec} {:m :map} {:m :set} {:m :list} {:m :empty}]")
+
+;; a format-8 image carries collection meta in the record itself: nested and
+;; shared collections round-trip with their meta, and sharing survives.
+(is "collection meta rides the record: value round-trip"
+    (string-append
+      "(let [v (with-meta [1 2] {:m 1})"
+      "      m (with-meta {:a v} {:n 2})"
+      "      _ (jolt.host/image-write! \"" tmp "\" {:v v :m m :l (with-meta (list 1) {:l 3}) :s (with-meta #{v} {:s 4}) :e (with-meta () {:e 5}) :z (doall (with-meta (lazy-seq [7]) {:z 6}))})"
+      "      g (jolt.host/image-read \"" tmp "\")]"
+      "  [(meta (:v g)) (meta (:m g)) (meta (:a (:m g))) (meta (:l g)) (meta (:s g)) (meta (:e g)) (meta (:z g))"
+      "   (identical? (:v g) (:a (:m g))) (:z g) (meta (conj (:v g) 3))])")
+    "[{:m 1} {:n 2} {:m 1} {:l 3} {:s 4} {:e 5} {:z 6} true (7) {:m 1}]")
+
+;; a with-meta copy of a cell whose tail is still pending shares that tail
+;; through the original (natives-meta.ss coll-with-meta): the copy's tail is a
+;; `rest` descriptor over the original cell, so it dumps like any lazy cell and
+;; forces once on either side of the image
+(is "a with-meta copy of a cell with a pending tail dumps, restores, and forces once"
+    (string-append
+      "(let [s (seq (map inc (list 1 2 3)))"
+      "      t (with-meta s {:m 1})"
+      "      _ (jolt.host/image-write! \"" tmp "\" {:t t :s s})"
+      "      g (jolt.host/image-read \"" tmp "\")]"
+      "  [(meta (:t g)) (vec (:t g)) (vec (:s g)) (vec t) (vec s)])")
+    "[{:m 1} [2 3 4] [2 3 4] [2 3 4] [2 3 4]]")
+
 ;; --- refs travel by value (format 3, jolt-867l.11): descriptor on dump,
 ;; re-mint on restore. Value, meta, shared identity, cycles, and STM liveness
 ;; all survive; the raw jolt-ref record never enters the fasl, so its layout
@@ -1330,10 +1381,10 @@
       "   (identical? (:cyc g) (:self (deref (:cyc g))))"
       "   (do (dosync (ref-set (:a g) 100)) (deref (:a g)))])")
     "[99 :hot true true 100]")
-;; format discipline: the new image writes header version 7 (3 added ref
+;; format discipline: the new image writes header version 8 (3 added ref
 ;; descriptors, 4 added image-rekey, 5 the jrec hasheq slot, 6 the image-sync
-;; marker, 7 the flat array-map record), and its bytes carry the descriptor
-;; rtd, never the live ref rtd
+;; marker, 7 the flat array-map record, 8 the collection meta slot), and its
+;; bytes carry the descriptor rtd, never the live ref rtd
 (define (bv-contains? bv s)
   (let* ((sb (string->utf8 s)) (m (bytevector-length sb)) (n (bytevector-length bv)))
     (let scan ((i 0))
@@ -1343,12 +1394,12 @@
                    (and (fx=? (bytevector-u8-ref bv (fx+ i j)) (bytevector-u8-ref sb j))
                         (cmp (fx+ j 1))))) #t)
             (else (scan (fx+ i 1)))))))
-(ok "ref-carrying image is format 7 with no raw jolt-ref rtd"
+(ok "ref-carrying image is format 8 with no raw jolt-ref rtd"
     (let ((port (open-file-input-port tmp)))
       (let* ((h (fasl-read port))
              (rest (get-bytevector-all port)))
         (close-port port)
-        (and (fx=? 7 (vector-ref h 1))
+        (and (fx=? 8 (vector-ref h 1))
              (bv-contains? rest "image-ref")
              (not (bv-contains? rest "jolt-ref-v2"))))))
 ;; an unknown format version refuses with a clean error naming both versions

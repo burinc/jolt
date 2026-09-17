@@ -153,11 +153,19 @@
      (let ((s (jolt-need-string s)))
        (jolt-substr s (jolt->idx start) (jolt->idx end))))))
 
-;; vec: a pvec from any seqable (already-pvec returns itself).
+;; vec: a pvec from any seqable. A vector comes back as itself minus its
+;; metadata — clojure.core/vec's (with-meta coll nil) — so it is a copy only when
+;; it carried some. A map entry is the exception: MapEntry is not IObj, so vec
+;; takes LazilyPersistentVector.create's path there and answers a plain
+;; PersistentVector of the two slots. The entry is a pvec of kind #t here, and
+;; used to come back as itself — still a MapEntry to `class` and `instance?`.
 (define (jolt-vec coll)
   (cond
     ((jolt-nil? coll) (jolt-vector))
-    ((pvec? coll) coll)
+    ((pvec? coll)
+     (cond ((eq? (pvec-ent coll) #t) (pvec-with-ent coll #f))
+           ((eq? (pvec-meta coll) jolt-nil) coll)
+           (else (coll-with-meta coll jolt-nil))))
     ((string? coll) (apply jolt-vector (string->list coll)))
     ;; a source that drives its own reduce (IReduce/IReduceInit deftype or
     ;; reify) builds the vector by reduction, like LazilyPersistentVector.

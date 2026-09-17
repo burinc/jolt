@@ -36,10 +36,19 @@
 ;; slot vector, where formats 6 and older carried a trie root plus an order
 ;; list (chez-pmap-v4). Those restore through image-legacy-pmap? below.
 ;;
-;; This build still READS versions 2 to 6: everything they can contain
+;; Version 8: a collection carries its metadata in a slot of its own record
+;; (chez-pvec-v4, chez-pmap-v6, chez-pset-v3, chez-cseq-v7, jolt-lazyseq-v3,
+;; empty-list-v3), so it travels inside the record; the meta sidecar carries
+;; only what still lives in the side table (records, reifies, fns, sorted
+;; collections). Formats 7 and older carry every collection's meta in the
+;; sidecar and the collections as the slotless records; those restore through
+;; image-legacy-coll? / image-legacy-pmap? below, and the sidecar entry is
+;; carried onto the rebuilt record like any substitution.
+;;
+;; This build still READS versions 2 to 7: everything they can contain
 ;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
-(define jolt-image-format-version 7)
-(define jolt-image-read-versions '(2 3 4 5 6 7))
+(define jolt-image-format-version 8)
+(define jolt-image-read-versions '(2 3 4 5 6 7 8))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -414,15 +423,17 @@
                      (string=? (substring n 0 9) "chez-jrec")))))))
 (define (legacy-ref-val x)
   ((record-accessor (record-rtd x) 0) x))
-;; A map from an image written before the flat array-mode representation
-;; (format <= 6): chez-pmap-v4's layout is (root cnt order hasheq all-kw), where
-;; root is a trie in BOTH modes and `order`, for an array-mode map, the
-;; (key . value) pairs in reverse insertion order (#f in hash mode). The tag
-;; bumped, so the fasl materializes the old rtd and its instances answer #f to
-;; pmap?. Detected by uid prefix like a legacy jrec and rebuilt through the
-;; old rtd's accessors: an array-mode map's pairs become its slot vector, a
-;; hash-mode root is kept as is — hnode/hcoll are unchanged, so it IS a
-;; current trie.
+;; A map from an image written before the meta slot (format <= 7). Two
+;; generations: chez-pmap-v5 (root cnt hasheq) is the current layout minus the
+;; slot; chez-pmap-v4 (root cnt order hasheq all-kw, format <= 6) has a trie
+;; root in BOTH modes and `order`, for an array-mode map, the (key . value)
+;; pairs in reverse insertion order (#f in hash mode). The tags bumped, so the
+;; fasl materializes the old rtd and its instances answer #f to pmap?. Detected
+;; by uid prefix like a legacy jrec and rebuilt through the old rtd's
+;; accessors: a v4 array-mode map's pairs become its slot vector, a hash-mode
+;; root is kept as is — hnode/hcoll are unchanged, so it IS a current trie.
+;; Meta starts nil: the sidecar entry, walked with the body, lands on the
+;; rebuilt map through image-reattach-meta! after the walk.
 (define (image-legacy-pmap? x)
   (and (record? x) (not (pmap? x))
        (let ((uid (record-type-uid (record-rtd x))))
@@ -433,17 +444,46 @@
 (define (legacy-pmap->pmap x)
   (let* ((rtd (record-rtd x))
          (root ((record-accessor rtd 0) x))
-         (cnt ((record-accessor rtd 1) x))
-         (ord ((record-accessor rtd 2) x)))
-    (if (or (pair? ord) (null? ord))
-        (let* ((ps (reverse ord)) (n (length ps)) (arr (make-vector (fx* 2 n))))
-          (let loop ((ps ps) (i 0))
-            (unless (null? ps)
-              (vector-set! arr i (caar ps))
-              (vector-set! arr (fx+ i 1) (cdar ps))
-              (loop (cdr ps) (fx+ i 2))))
-          (make-pmap arr n))
-        (make-pmap root cnt))))
+         (cnt ((record-accessor rtd 1) x)))
+    (if (eq? (record-type-uid rtd) 'chez-pmap-v5)
+        (make-pmap root cnt)
+        (let ((ord ((record-accessor rtd 2) x)))
+          (if (or (pair? ord) (null? ord))
+              (let* ((ps (reverse ord)) (n (length ps)) (arr (make-vector (fx* 2 n))))
+                (let loop ((ps ps) (i 0))
+                  (unless (null? ps)
+                    (vector-set! arr i (caar ps))
+                    (vector-set! arr (fx+ i 1) (cdar ps))
+                    (loop (cdr ps) (fx+ i 2))))
+                (make-pmap arr n))
+              (make-pmap root cnt))))))
+;; The other collections from an image written before the meta slot (format
+;; <= 7): chez-pvec-v3 (cnt shift root tail ent hasheq), chez-pset-v2 (m
+;; hasheq), chez-cseq-v6 (head tail forced? kind cvec ci crest lock),
+;; jolt-lazyseq-v2 (thunk val realized? error? lock) and empty-list-v2 (_).
+;; Each is the current layout minus the slot, so the rebuild is the current
+;; constructor over the old rtd's accessors, meta nil (the sidecar entry lands
+;; through image-reattach-meta! after the walk, as for a legacy pmap). A cell's
+;; or node's lock slot is
+;; started idle (#f) rather than copied: it held a mutex only during a force,
+;; and no force is in progress in an image. The retired uids must never name a
+;; record with a different layout, or these images stop reading.
+(define (image-legacy-coll? x)
+  (and (record? x)
+       (memq (record-type-uid (record-rtd x))
+             '(chez-pvec-v3 chez-pset-v2 chez-cseq-v6 jolt-lazyseq-v2 empty-list-v2))
+       #t))
+(define (legacy-coll->coll x)
+  (let* ((rtd (record-rtd x))
+         (f (lambda (i) ((record-accessor rtd i) x))))
+    (case (record-type-uid rtd)
+      ((chez-pvec-v3) (mk-pvec (f 0) (f 1) (f 2) (f 3) (f 4)))
+      ;; the backing map may itself be a legacy pmap
+      ((chez-pset-v2) (make-pset (let ((m (f 0))) (if (image-legacy-pmap? m) (legacy-pmap->pmap m) m))))
+      ((chez-cseq-v6) (make-cseq (f 0) (f 1) (f 2) (f 3) (f 4) (f 5) (f 6) #f jolt-nil))
+      ((jolt-lazyseq-v2) (make-jolt-lazyseq (f 0) (f 1) (f 2) (f 3) #f jolt-nil))
+      ((empty-list-v2) (fresh-empty-list))
+      (else (error 'legacy-coll->coll "not a legacy collection record" x)))))
 
 ;; A resource the dump could not write (port, thread, non-eq hashtable,
 ;; unregistered closure) that stub mode substitutes in place of a refusal. id
@@ -544,16 +584,29 @@
 (define (image-munge s) (jolt-invoke1 (var-deref "jolt.host" "munge-name") s))
 
 
-;; Carry the meta side-table entry from a rebuilt object's original (the weak
-;; table in natives-meta.ss), so image-collect-meta keys the SUBSTITUTED
-;; objects — the ones fasl-write actually sees.
+;; Carry an original's metadata onto the object rebuilt in its place: into the
+;; meta slot when NEW is a collection that has one (NEW is fresh — the walker
+;; just built it — which is the one case the slot may be written, natives-meta.ss
+;; coll-meta-set!), else the side table, so image-collect-meta keys the
+;; SUBSTITUTED objects — the ones fasl-write actually sees. A dump-side seam:
+;; ORIG is a live object whose meta is in its slot or the side table. On the
+;; restore side the legacy arms carry nothing here — an old image's meta rides
+;; in the sidecar, walked with the body, and image-reattach-meta! installs it on
+;; whatever came out of the walk.
 (define (image-meta-copy! orig new)
   (when (not (eq? orig new))
     (let ((m (call/cc (lambda (k)
               (with-exception-handler (lambda (e) (k jolt-nil))
                 (lambda () (jolt-meta orig)))))))
-      (unless (jolt-nil? m)
-        (meta-table-set! new m)))))
+      (image-carry-meta! new m))))
+;; The same installation for a meta the walk has already been over (the three
+;; container walkers walk the slot like any field): NEW is fresh, M is jolt-nil
+;; or the walked map.
+(define (image-carry-meta! new m)
+  (unless (jolt-nil? m)
+    (if (coll-meta new)
+        (coll-meta-set! new m)
+        (meta-table-set! new m))))
 
 ;; A procedure's substitution decision, shared by both modes so scan and dump
 ;; cannot disagree. Returns the registration (name . (form ns free-names)) for
@@ -956,8 +1009,12 @@
                       (walk-ref-restore (legacy-ref-val x) x path))
                      ((and restore? (image-legacy-jrec? x))
                       (walk-legacy-jrec x path))
-                     ;; a pre-format-7 map, or a set over one, re-minted into
-                     ;; the current representation and then walked like any map
+                     ;; a pre-format-8 collection re-minted into the current
+                     ;; record (meta slot) and then walked like any collection;
+                     ;; a pre-format-7 map, or a set over one, likewise through
+                     ;; its own two-generation arm
+                     ((and restore? (image-legacy-coll? x))
+                      (walk-legacy-coll x path))
                      ((and restore? (image-legacy-pmap? x))
                       (walk-legacy-pmap x path))
                      ((and restore? (pset? x) (image-legacy-pmap? (pset-m x)))
@@ -1283,25 +1340,31 @@
                               (set! dirty (or dirty (not (eq? wk k)) (not (eq? wv v))))
                               acc)))
                         #f)
-                      (if (hashtable-ref memo x #f)
-                          (hashtable-ref memo x #f)
-                          (if rekey
-                              ;; a key's hash depends on a per-process fn id —
-                              ;; substitute the entries record; restore rebuilds
-                              (let ((r (make-image-rekey 'map
-                                         (list->vector (reverse entries)))))
-                                (hashtable-set! memo x r)
-                                (image-meta-copy! x r)
-                                r)
-                          (if dirty
-                              (let ((nx (apply jolt-hash-map
-                                               (apply append
-                                                      (map (lambda (e) (list (car e) (cdr e)))
-                                                           (reverse entries))))))
-                                (hashtable-set! memo x nx)
-                                (image-meta-copy! x nx)
-                                nx)
-                              (begin (hashtable-set! memo x x) x)))))
+                      ;; entries AND the meta slot, on both paths: the slot is a
+                      ;; field of the record (natives-meta.ss), so fasl-write sees
+                      ;; it and the walk has to reach it — the parity rule of the
+                      ;; var cell below. A rebuilt map takes the WALKED meta.
+                      (let* ((m (pmap-meta x))
+                             (wm (if (eq? m jolt-nil) m (walk m (cons "<meta>" path)))))
+                        (if (hashtable-ref memo x #f)
+                            (hashtable-ref memo x #f)
+                            (if rekey
+                                ;; a key's hash depends on a per-process fn id —
+                                ;; substitute the entries record; restore rebuilds
+                                (let ((r (make-image-rekey 'map
+                                           (list->vector (reverse entries)))))
+                                  (hashtable-set! memo x r)
+                                  (image-carry-meta! r wm)
+                                  r)
+                            (if (or dirty (not (eq? wm m)))
+                                (let ((nx (apply jolt-hash-map
+                                                 (apply append
+                                                        (map (lambda (e) (list (car e) (cdr e)))
+                                                             (reverse entries))))))
+                                  (hashtable-set! memo x nx)
+                                  (image-carry-meta! nx wm)
+                                  nx)
+                                (begin (hashtable-set! memo x x) x))))))
                     (begin
                       (hashtable-set! memo x #t)
                       (pmap-fold-fwd x
@@ -1310,6 +1373,8 @@
                           (walk v (cons (image-describe-obj k) path))
                           acc)
                         #f)
+                      (let ((m (pmap-meta x)))
+                        (unless (eq? m jolt-nil) (walk m (cons "<meta>" path))))
                       #t))))
              (walk-pset
               (lambda (x path)
@@ -1331,29 +1396,34 @@
                               (set! dirty (or dirty (not (eq? w e)) (not (eq? wv v))))
                               acc)))
                         #f)
-                      (if (hashtable-ref memo x #f)
-                          (hashtable-ref memo x #f)
-                          (if rekey
-                              (let ((r (make-image-rekey 'set
-                                         (list->vector (reverse pairs)))))
-                                (hashtable-set! memo x r)
-                                (image-meta-copy! x r)
-                                r)
-                          (if dirty
-                              (let ((nx (pset-from-pairs (reverse pairs))))
-                                (hashtable-set! memo x nx)
-                                (image-meta-copy! x nx)
-                                nx)
-                              (begin (hashtable-set! memo x x) x)))))
+                      ;; the meta slot walks with the pairs (see walk-pmap)
+                      (let* ((m (pset-meta x))
+                             (wm (if (eq? m jolt-nil) m (walk m (cons "<meta>" path)))))
+                        (if (hashtable-ref memo x #f)
+                            (hashtable-ref memo x #f)
+                            (if rekey
+                                (let ((r (make-image-rekey 'set
+                                           (list->vector (reverse pairs)))))
+                                  (hashtable-set! memo x r)
+                                  (image-carry-meta! r wm)
+                                  r)
+                            (if (or dirty (not (eq? wm m)))
+                                (let ((nx (pset-from-pairs (reverse pairs))))
+                                  (hashtable-set! memo x nx)
+                                  (image-carry-meta! nx wm)
+                                  nx)
+                                (begin (hashtable-set! memo x x) x))))))
                     (begin
                       (hashtable-set! memo x #t)
                       ;; the split lookup value is its own object, with its own
-                      ;; metadata for image-collect-meta to pick up
+                      ;; metadata slot
                       (pset-fold-pairs x (lambda (e v acc)
                                            (walk e (cons (image-describe-obj e) path))
                                            (unless (eq? v e) (walk v (cons (image-describe-obj v) path)))
                                            acc)
                                        #f)
+                      (let ((m (pset-meta x)))
+                        (unless (eq? m jolt-nil) (walk m (cons "<meta>" path))))
                       #t))))
              (walk-sorted
               (lambda (x path)
@@ -1419,19 +1489,24 @@
                                 (set! items (cons w items))
                                 (set! dirty (or dirty (not (eq? v w))))
                                 (loop (fx+ i 1)))
-                              (or (hashtable-ref memo x #f)
-                                  (if dirty
-                                      (let ((nx (apply jolt-vector (reverse items))))
-                                        (hashtable-set! memo x nx)
-                                        (image-meta-copy! x nx)
-                                        nx)
-                                      (begin (hashtable-set! memo x x) x))))))
+                              ;; the meta slot walks with the items (see walk-pmap)
+                              (let* ((m (pvec-meta x))
+                                     (wm (if (eq? m jolt-nil) m (walk m (cons "<meta>" path)))))
+                                (or (hashtable-ref memo x #f)
+                                    (if (or dirty (not (eq? wm m)))
+                                        (let ((nx (apply jolt-vector (reverse items))))
+                                          (hashtable-set! memo x nx)
+                                          (image-carry-meta! nx wm)
+                                          nx)
+                                        (begin (hashtable-set! memo x x) x)))))))
                       (begin
                         (hashtable-set! memo x #t)
                         (let loop ((i 0))
                           (when (fx<? i n)
                             (walk (pvec-nth-d x i jolt-nil) (cons (number->string i) path))
                             (loop (fx+ i 1))))
+                        (let ((m (pvec-meta x)))
+                          (unless (eq? m jolt-nil) (walk m (cons "<meta>" path))))
                         #t)))))
              ;; root AND meta, on both paths. meta is a FIELD of the cell (rt.ss), so
              ;; fasl-write sees it and the walk has to reach it — same parity rule as
@@ -1615,8 +1690,10 @@
                                      (apply (vector-ref jrec-ctor-vec (length fvals))
                                             desc ext 0 fvals))))
                         (hashtable-set! memo x nx)
-                        (image-meta-copy! x nx)
                         nx)))))
+             ;; The legacy arms do not carry meta: a legacy record's meta is in
+             ;; the image's sidecar, which jolt-image-read walks with the body
+             ;; and re-attaches afterwards keyed by the rebuilt objects.
              (walk-legacy-pmap
               (lambda (x path)
                 (or (hashtable-ref memo x #f)
@@ -1624,7 +1701,18 @@
                                   (walk-pset (make-pset (legacy-pmap->pmap (pset-m x))) path)
                                   (walk-pmap (legacy-pmap->pmap x) path))))
                       (hashtable-set! memo x nx)
-                      (image-meta-copy! x nx)
+                      nx))))
+             ;; a slotless pvec/pset/cell/node/() from a pre-format-8 image:
+             ;; re-minted, then walked as the current kind (a cell or node
+             ;; through the generic record walk, whose rebuild keeps the slot)
+             (walk-legacy-coll
+              (lambda (x path)
+                (or (hashtable-ref memo x #f)
+                    (let* ((c (legacy-coll->coll x))
+                           (nx (cond ((pvec? c) (walk-pvec c path))
+                                     ((pset? c) (walk-pset c path))
+                                     (else (walk-record c path)))))
+                      (hashtable-set! memo x nx)
                       nx))))
              (walk-record
               (lambda (x path)
@@ -1828,10 +1916,12 @@
                   (else (loop (fx+ i 1) acc seen))))))))
 
 ;; --- write / read --------------------------------------------------------------
-;; Metadata lives in a weak side table keyed by object identity (natives-meta.ss),
-;; so it cannot ride on the object itself. It rides in the SAME fasl stream
-;; instead: fasl preserves sharing within one stream, so the objects in this
-;; alist come back eq? to the ones in the graph and the meta can be re-attached.
+;; A collection's metadata rides in its record's meta slot, walked and written
+;; with the record. What still lives in the weak side table keyed by object
+;; identity (natives-meta.ss: records, reifies, fns, sorted collections) cannot
+;; ride on the object, so it rides in the SAME fasl stream instead: fasl
+;; preserves sharing within one stream, so the objects in this alist come back
+;; eq? to the ones in the graph and the meta can be re-attached.
 (define (image-collect-meta v)
   (let ((acc '()))
     (image-walk v (lambda (x path)
@@ -1854,15 +1944,25 @@
                           ;; record's structural hash can embed one through a fn
                           ;; or deftype field. Same rule as the collections.
                           ((jrec? x) (jrec-hasheq-set! x 0)))
-                    (unless (var-cell? x)
+                    (unless (or (var-cell? x) (coll-meta x))
                       (let ((m (call/cc (lambda (k)
                                  (with-exception-handler (lambda (e) (k jolt-nil))
                                    (lambda () (jolt-meta x)))))))
                         (unless (jolt-nil? m) (set! acc (cons (cons x m) acc)))))))
     acc))
 
+;; Runs on the restored graph, after the restore walk has been over the pairs
+;; together with the body (jolt-image-read), so each pair keys the object that
+;; stands in the restored graph — a pre-format-8 image's slotless legacy record
+;; rebuilt into the current kind, a rekey record rebuilt into its map — and its
+;; meta is the restored map. Nothing else holds these objects yet, which is
+;; what lets a collection's slot be written here.
 (define (image-reattach-meta! pairs)
-  (for-each (lambda (p) (meta-table-set! (car p) (cdr p))) pairs))
+  (for-each (lambda (p)
+              (if (coll-meta (car p))
+                  (coll-meta-set! (car p) (cdr p))
+                  (meta-table-set! (car p) (cdr p))))
+            pairs))
 
 (define jolt-image-write!
   (case-lambda
@@ -1951,12 +2051,13 @@
       (close-port port)
       (unless (and (vector? b) (fx=? (vector-length b) 2))
         (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) empty-pmap)))
-      (image-reattach-meta! (vector-ref b 1))
       ;; R3: rebuild what the write side substituted — fn source records become
-      ;; live closures, handler payloads go back through their restore fns.
-      ;; Runs after meta re-attachment so container rebuilds carry meta forward.
-      (let-values (((g stubs) (image-graph-process (vector-ref b 0) 'restore #f)))
-        g))))
+      ;; live closures, handler payloads go back through their restore fns. The
+      ;; meta sidecar rides through the same walk (one memo, so a pair's object
+      ;; is the one standing in the body) and is re-attached to what came out.
+      (let-values (((g stubs) (image-graph-process (vector (vector-ref b 0) (vector-ref b 1)) 'restore #f)))
+        (image-reattach-meta! (vector-ref g 1))
+        (vector-ref g 0)))))
 
 ;; --- whole-world image ----------------------------------------------------------
 ;; The Smalltalk/Common Lisp shape: don't ask which variable to save, save the

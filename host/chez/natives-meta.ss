@@ -1,30 +1,44 @@
-;; metadata — meta / with-meta. Chez values don't
-;; carry metadata, so collections use an identity-keyed side-table: with-meta
-;; returns a fresh COPY of the value (new identity) and records its meta there, so
-;; the original is unchanged (Clojure's immutable-with-meta) and a copy made by a
-;; later op (conj/assoc) drops the meta. Symbols carry meta in their own field.
-;; meta on a non-metadatable value (number/string/keyword) is nil.
+;; metadata — meta / with-meta.
+;;
+;; A collection carries its metadata in a field of its own record, the JVM's Obj
+;; shape (PersistentVector, PersistentHashMap, PersistentHashSet, PersistentList,
+;; Cons, LazySeq and EmptyList all extend Obj and keep an IPersistentMap _meta):
+;; pvec, pmap, pset, a seq cell, () and a lazy-seq node each end in a `meta`
+;; slot (collections.ss, seq.ss, lazy-bridge.ss). Reading meta is a field read
+;; and attaching it is one allocation — with-meta returns a fresh copy with the
+;; new meta (Clojure's immutable-with-meta), and an op that threads its
+;; receiver's meta forward (conj/assoc/dissoc/pop/into) copies it onto the
+;; result. No table, no lock, on any thread.
+;;
+;; The slot is mutable for one reason: the copy with-meta and meta-carry build,
+;; and the object the image walker rebuilds, are filled in before anyone else
+;; can see them. It is never written on a published value — that would change
+;; the meta of every holder of the value, which with-meta returning a copy
+;; exists to prevent. coll-meta-set! is the only writer, and every caller of it
+;; holds a fresh instance.
+;;
+;; Everything else that can carry meta — a defrecord/deftype instance, a reify,
+;; a fn, a sorted collection (host-table.ss) — keeps it in the identity-keyed
+;; side table below: with-meta returns a fresh COPY of the value (new identity)
+;; and records its meta there, so the original is unchanged and a copy made by
+;; a later op drops it. Symbols carry meta in their own field. meta on a value
+;; that carries none (number/string/keyword) is nil.
 ;;
 ;; Loaded after records.ss (jrec) + collections/seq/values (the ctors it copies).
 
-;; Weak so a collection's metadata is reclaimed with the collection — collection
-;; ops (conj/assoc/into) carry meta forward onto fresh values, so a strong table
-;; would retain every meta-bearing intermediate.
+;; Weak so a value's metadata is reclaimed with the value.
 ;;
 ;; A Chez hashtable is NOT thread-safe, and this one is written from whatever
-;; thread calls with-meta or an op that carries meta forward. Unsynchronized
-;; mutation corrupts the table's internals, and the corruption surfaces later as
-;; a SIGSEGV inside the collector (`nonrecoverable invalid memory reference`,
-;; faulting in S_do_gc) or as a hang — never as an error naming this table. So
-;; every WRITE goes through meta-table-mu.
+;; thread calls with-meta on a record, reify or fn, or an op that carries such
+;; meta forward. Unsynchronized mutation corrupts the table's internals, and the
+;; corruption surfaces later as a SIGSEGV inside the collector (`nonrecoverable
+;; invalid memory reference`, faulting in S_do_gc) or as a hang — never as an
+;; error naming this table. So every WRITE goes through meta-table-mu.
 ;;
-;; The READ does not take the mutex, and that matters more than it looks: every
-;; conj / assoc / dissoc / into carries the receiver's meta forward, so this is
-;; the most-called table in the collection layer, and a lock here is a lock on
-;; every collection op in every thread. With the read locked, eight threads
-;; doing assoc on their own maps ran 32x slower PER THREAD than one — a quarter
-;; of a single thread's throughput — and the single-thread cost was a third of
-;; assoc and half of conj (94 -> 62 ns, 67 -> 35 ns without the probe).
+;; The READ does not take the mutex: assoc/conj on a record threads its meta
+;; forward through here, so a lock on the read is a lock on every record op in
+;; every thread (the collections used to read this table on every op too — eight
+;; threads doing assoc on their own maps ran 32x slower per thread than one).
 ;;
 ;; A lock-free read of an eq-hashtable racing a locked writer is memory-safe (a
 ;; resize re-threads the existing cells; a walker mid-chain lands in a valid
@@ -40,10 +54,8 @@
 ;;
 ;; The empty-table fast path reads hashtable-size, which Chez keeps current for
 ;; a weak table as the collector drops entries (100k dead keys read 0 after a
-;; collection), so a program whose collection metadata is all gone again skips
-;; the lookup. A counter of INSERTIONS used to stand in for it and never came
-;; back down: 66 after the prelude alone with the table already empty, so the
-;; fast path was dead in every real program.
+;; collection), so a program whose record metadata is all gone again skips the
+;; lookup.
 (define meta-table (make-weak-eq-hashtable))
 (define meta-table-mu (make-mutex))
 (define meta-gen (box 0))
@@ -76,9 +88,72 @@
                     (jolt-with-mutex meta-table-mu (hashtable-ref meta-table k #f)))))))))
 (define (meta-table-empty?) (fx=? 0 (hashtable-size meta-table)))
 
+;; The meta slot of a collection that has one: jolt-nil or a map. #f when X is
+;; not one of those kinds — jolt-nil is a record and so truthy, which is what
+;; lets a cond arm test the slot and read it in one step. Kinds in order of how
+;; often an op carries: this runs on every assoc/conj/into.
+(define (coll-meta x)
+  (cond ((pmap? x) (pmap-meta x))
+        ((pvec? x) (pvec-meta x))
+        ((cseq? x) (cseq-meta x))
+        ((pset? x) (pset-meta x))
+        ((jolt-lazyseq? x) (jolt-lazyseq-meta x))
+        ((empty-list-t? x) (empty-list-t-meta x))
+        (else #f)))
+;; Fill the slot of an instance nobody else holds yet (see the header). The
+;; callers: coll-with-meta's copy below, and state-image.ss's rebuilt objects.
+(define (coll-meta-set! x m)
+  (cond ((pvec? x) (pvec-meta-set! x m))
+        ((pmap? x) (pmap-meta-set! x m))
+        ((pset? x) (pset-meta-set! x m))
+        ((cseq? x) (cseq-meta-set! x m))
+        ((empty-list-t? x) (empty-list-t-meta-set! x m))
+        ((jolt-lazyseq? x) (jolt-lazyseq-meta-set! x m))
+        (else (error 'coll-meta-set! "not a collection with a meta slot" x))))
+;; A fresh copy of X carrying M — the withMeta constructors. The copy shares the
+;; structure (trie, slot vector, cell head and tail) and the cached hasheq (meta
+;; does not hash): one allocation, no traversal.
+(define (coll-with-meta x m)
+  (cond
+    ((pvec? x) (%mk-pvec (pvec-cnt x) (pvec-shift x) (pvec-root x) (pvec-tail x) (pvec-ent x) (pvec-hasheq x) m))
+    ((pmap? x) (%mk-pmap (pmap-root x) (pmap-cnt x) (pmap-hasheq x) m))
+    ((pset? x) (%mk-pset (pset-m x) (pset-hasheq x) m))
+    ;; Cons.withMeta is new Cons(meta, _first, _more): the copy SHARES the rest.
+    ;; A cell's tail is its own published word (seq.ss), so a tail still pending
+    ;; -- a thunk or a lazy-src descriptor -- cannot be copied as it stands:
+    ;; each cell would run it, and (with-meta (seq (map f xs)) m) then called f
+    ;; once per element for the original and again for the copy. The copy's
+    ;; tail is instead a descriptor that forces X and takes ITS answer (lz-rest,
+    ;; the producer jolt-rest already registers, so the copy still dumps to an
+    ;; image), and the thunk runs once, in X, whichever cell is walked first. A
+    ;; realized tail, or a cvec cell's #f (computed from its own fields, no
+    ;; thunk to run twice), is shared as it is; the mirror flag follows the
+    ;; word. The lock field is #f: it holds a mutex only while a force is in
+    ;; progress, borrowed for that cell alone (seq.ss force-claimed!), and the
+    ;; copy is a different cell.
+    ((cseq? x)
+     (let ((t (cseq-tail x)))
+       (make-cseq (cseq-head x)
+                  (if (force-pending? t) (make-lazy-src lz-rest x #f) t)
+                  (seq-tail-realized? t)
+                  (cseq-kind x) (cseq-cvec x) (cseq-ci x) (cseq-crest x) #f m)))
+    ((empty-list-t? x) (make-empty-list-t m))
+    ;; LazySeq.withMeta is new LazySeq(meta, seq()): the copy is REALIZED and
+    ;; shares the forced seq, so the body runs once for both, and forcing X here
+    ;; raises whatever its body raises, as seq() would. The copy is taken after
+    ;; the force, when the thunk word holds the answer and the mirror fields
+    ;; agree with it (lazy-bridge.ss).
+    ((jolt-lazyseq? x)
+     (jolt-seq x)
+     (make-jolt-lazyseq (jolt-lazyseq-thunk x) (jolt-lazyseq-val x)
+                        (jolt-lazyseq-realized-flag x) (jolt-lazyseq-error-flag x)
+                        #f m))
+    (else (error 'coll-with-meta "not a collection with a meta slot" x))))
+
 (define (jolt-meta x)
   (cond
     ((symbol-t? x) (let ((m (symbol-t-meta x))) (if (jolt-nil? m) jolt-nil m)))
+    ((coll-meta x) => (lambda (m) m))
     ;; a var's meta is {:ns :name} (derived from the cell) + :macro true for a
     ;; macro var (derived from the cell's macro? field, like Var.isMacro reading meta on
     ;; the JVM) + any def-time user meta from the cell's meta field. :ns is the
@@ -97,41 +172,24 @@
     ;; so dispatch to its meta method rather than the identity side-table — which
     ;; the deftype's reconstructed instances would not share.
     ((and (jrec? x) (jrec-cl x "meta")) => (lambda (m) (jolt-invoke m x)))
-    ;; everything else (collections, fns, reify, atoms/agents and any reference
-    ;; type) reads the identity side-table; a value with no entry is nil meta.
-    ;; no collection metadata anywhere: skip the table entirely
+    ;; everything else (records, fns, reify, atoms/agents and any reference type)
+    ;; reads the identity side-table; a value with no entry is nil meta.
+    ;; no such metadata anywhere: skip the table entirely
     ((meta-table-empty?) jolt-nil)
     (else (or (meta-table-get x) jolt-nil))))
 
-;; fresh-identity copy of a metadatable value (so attaching meta doesn't mutate
-;; the original). The copy only needs a distinct identity for the meta side-table;
-;; pvec/jrec share their internal structure with the source (one allocation, no
-;; traversal) rather than deep-copying. cseq/procedure can't be copied meaningfully
-;; — keyed in place.
+;; fresh-identity copy of a side-table value (so attaching meta doesn't mutate
+;; the original). The copy only needs a distinct identity for the side-table;
+;; a jrec shares its internal structure with the source (one allocation, no
+;; traversal). host-table.ss extends this to a sorted collection's table. A
+;; procedure can't be copied meaningfully — keyed in place.
 (define (meta-copy x)
   (cond
-    ((pvec? x) (mk-pvec (pvec-cnt x) (pvec-shift x) (pvec-root x) (pvec-tail x) (pvec-ent x)))
-    ((pmap? x) (make-pmap (pmap-root x) (pmap-cnt x)))
-    ((pset? x) (make-pset (pset-m x)))
     ((jrec? x) (make-jrec-from-existing x #f #f (jrec-ext x)))
     ;; a reify shares its (read-only) method table + protos but gets a fresh
     ;; identity, so attaching meta leaves the original's meta untouched. Every
     ;; Clojure reify implements IObj.
     ((jreify? x) (make-jreify (jreify-methods x) (jreify-protos x) (jreify-delegate x)))
-    ;; () is a shared singleton — a fresh instance keeps meta off every other ().
-    ((empty-list-t? x) (fresh-empty-list))
-    ;; a list/seq node gets a fresh identity too (Clojure's PersistentList is
-    ;; immutable — (with-meta a-list m) returns a NEW list). Keying meta on the
-    ;; original mutated it, so (with-meta xs {:k xs}) built a self-referential
-    ;; cycle that loops *print-meta* printing.
-    ;; The lock field is #f: it holds a mutex only while a force is in progress,
-    ;; borrowed for that cell alone (seq.ss force-claimed!), and the copy
-    ;; is a different cell.
-    ((cseq? x) (make-cseq (cseq-head x) (cseq-tail x) (cseq-forced-flag x)
-                          (cseq-kind x) (cseq-cvec x) (cseq-ci x) (cseq-crest x) #f))
-    ((jolt-lazyseq? x) (make-jolt-lazyseq (jolt-lazyseq-thunk x) (jolt-lazyseq-val x)
-                                          (jolt-lazyseq-realized-flag x) (jolt-lazyseq-error-flag x)
-                                          #f))
     (else x)))                          ; procedure
 
 ;; Obj.withMeta returns `this` when the metadata is unchanged, and the JVM
@@ -147,10 +205,11 @@
 (define (jolt-with-meta x m)
   (cond
     ((symbol-t? x) (if (eq? (jolt-meta x) m) x (symbol-t-with-meta x m)))
+    ((coll-meta x) => (lambda (cur) (if (eq? cur m) x (coll-with-meta x m))))
     ;; a deftype with an explicit clojure.lang.IObj withMeta carries meta in a
     ;; field; dispatch to it (see jolt-meta) so the meta survives reconstruction.
     ((and (jrec? x) (jrec-cl x "withMeta")) => (lambda (meth) (jolt-invoke meth x m)))
-    ((or (pvec? x) (pmap? x) (pset? x) (cseq? x) (empty-list-t? x) (jolt-lazyseq? x) (jrec? x) (jreify? x) (procedure? x))
+    ((or (jrec? x) (jreify? x) (procedure? x))
      (if (eq? (jolt-meta x) m)
          x
          (let ((c (meta-copy x)))
@@ -161,19 +220,55 @@
 (def-var! "clojure.core" "meta" jolt-meta)
 (def-var! "clojure.core" "with-meta" jolt-with-meta)
 
-;; Carry SRC's collection metadata onto DST (a freshly-built collection of the
-;; same kind), as Clojure's ops do — each new collection threads its receiver's
-;; meta() forward. Returns DST. The size check is the fast path: programs that
-;; never attach collection metadata pay one O(1) check per op, no lookup.
+;; Carry SRC's metadata onto DST (a freshly-built collection of the same kind),
+;; as Clojure's ops do — each new collection threads its receiver's meta()
+;; forward. Returns the collection to use: DST itself when there is nothing to
+;; carry or it already carries it (an op that answered its receiver, or a
+;; shared empty), else DST with the meta attached. For a collection with a meta
+;; slot that is a copy: DST may be shared — the () singleton, a list's tail
+;; node — and a copy is what keeps an op from changing what everyone else
+;; holding DST reads. A side-table DST (a record, a sorted collection) is keyed
+;; as it is, as it always was.
+;;
+;; This runs on every assoc/conj/into, and on this path a call to a top-level
+;; procedure is 4-6 ns (measured: a carry through coll-meta cost a list conj
+;; 12 ns, the same test open-coded 5). So the no-meta answer is ONE call: the
+;; kind test is the record predicate (open-coded by the compiler), the slot
+;; read a field, in order of how often each kind carries; only the side-table
+;; kinds and the rare attach go on to a second call.
+(define-syntax slot-carry
+  (syntax-rules ()
+    ((_ slot dst) (let ((m slot)) (if (eq? m jolt-nil) dst (meta-attach dst m))))))
 (define (meta-carry src dst)
-  (if (meta-table-empty?)
-      dst
-      (let ((m (meta-table-get src)))
-        (if m
-            ;; never attach to the shared () singleton — use a fresh instance
-            (let ((d (if (empty-list-t? dst) (fresh-empty-list) dst)))
-              (meta-table-set! d m) d)
-            dst))))
+  (cond ((pmap? src) (slot-carry (pmap-meta src) dst))
+        ((pvec? src) (slot-carry (pvec-meta src) dst))
+        ((cseq? src) (slot-carry (cseq-meta src) dst))
+        ((pset? src) (slot-carry (pset-meta src) dst))
+        ((jolt-lazyseq? src) (slot-carry (jolt-lazyseq-meta src) dst))
+        ((empty-list-t? src) (slot-carry (empty-list-t-meta src) dst))
+        ((meta-table-empty?) dst)
+        (else (let ((m (meta-table-get src))) (if m (meta-attach dst m) dst)))))
+(define (meta-attach dst m)
+  (let ((cur (coll-meta dst)))
+    (cond (cur (if (eq? cur m) dst (coll-with-meta dst m)))
+          (else (meta-table-set! dst m) dst))))
+;; conj's carry: the receiver kinds whose JVM cons threads meta are the
+;; collections and a PersistentList — a list cell, and (), whose cons builds a
+;; list with its meta. A Cons, a LazySeq or a vector's seq cons through
+;; ASeq.cons -> new Cons(o, this), with none. Same one-call shape as above; the
+;; cell arm leads because conj onto a list has the lowest floor (16 ns), where
+;; one failed test ahead of it was a measured 6 ns.
+(define (meta-carry-conj src dst)
+  (cond ((cseq? src)
+         ;; the slot first: the kind only matters once there is meta to carry
+         (let ((m (cseq-meta src)))
+           (if (or (eq? m jolt-nil) (not (fx=? (cseq-kind src) sk-list))) dst (meta-attach dst m))))
+        ((pvec? src) (slot-carry (pvec-meta src) dst))
+        ((pmap? src) (slot-carry (pmap-meta src) dst))
+        ((pset? src) (slot-carry (pset-meta src) dst))
+        ((jolt-lazyseq? src) dst)
+        ((empty-list-t? src) (slot-carry (empty-list-t-meta src) dst))
+        (else (meta-carry src dst))))
 
 ;; (type x) — Clojure's (or (:type (meta x)) (class x)). With no JVM classes the
 ;; "class" is a host taxonomy: a record yields its ns-qualified class-name SYMBOL
