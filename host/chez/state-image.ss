@@ -432,7 +432,8 @@
 ;; by uid prefix like a legacy jrec and rebuilt through the old rtd's
 ;; accessors: a v4 array-mode map's pairs become its slot vector, a hash-mode
 ;; root is kept as is — hnode/hcoll are unchanged, so it IS a current trie.
-;; Meta starts nil; the sidecar entry lands via image-meta-copy!.
+;; Meta starts nil: the sidecar entry, walked with the body, lands on the
+;; rebuilt map through image-reattach-meta! after the walk.
 (define (image-legacy-pmap? x)
   (and (record? x) (not (pmap? x))
        (let ((uid (record-type-uid (record-rtd x))))
@@ -462,7 +463,8 @@
 ;; jolt-lazyseq-v2 (thunk val realized? error? lock) and empty-list-v2 (_).
 ;; Each is the current layout minus the slot, so the rebuild is the current
 ;; constructor over the old rtd's accessors, meta nil (the sidecar entry lands
-;; via image-meta-copy!, as for a legacy pmap). A cell's or node's lock slot is
+;; through image-reattach-meta! after the walk, as for a legacy pmap). A cell's
+;; or node's lock slot is
 ;; started idle (#f) rather than copied: it held a mutex only during a force,
 ;; and no force is in progress in an image. The retired uids must never name a
 ;; record with a different layout, or these images stop reading.
@@ -586,9 +588,11 @@
 ;; meta slot when NEW is a collection that has one (NEW is fresh — the walker
 ;; just built it — which is the one case the slot may be written, natives-meta.ss
 ;; coll-meta-set!), else the side table, so image-collect-meta keys the
-;; SUBSTITUTED objects — the ones fasl-write actually sees. ORIG's meta is read
-;; through jolt-meta, so a legacy slotless record from an older image (its meta
-;; re-attached to the side table by image-reattach-meta!) hands it over too.
+;; SUBSTITUTED objects — the ones fasl-write actually sees. A dump-side seam:
+;; ORIG is a live object whose meta is in its slot or the side table. On the
+;; restore side the legacy arms carry nothing here — an old image's meta rides
+;; in the sidecar, walked with the body, and image-reattach-meta! installs it on
+;; whatever came out of the walk.
 (define (image-meta-copy! orig new)
   (when (not (eq? orig new))
     (let ((m (call/cc (lambda (k)

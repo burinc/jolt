@@ -97,6 +97,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`with-meta` on a seq cell no longer runs its unforced tail twice.** The copy
+  `with-meta` builds shared the cell's tail word as it stood, and a tail still
+  pending — the thunk a lazy `map`/`filter`/`rest` leaves behind — was then run
+  by each cell: `(with-meta (seq (map f xs)) m)` called `f` once per element
+  for the original and again for the copy, where `Cons.withMeta` shares one
+  `_more`. The copy's tail is now a `rest` descriptor over the original cell,
+  so the producer runs once whichever cell is walked first, and the copy still
+  dumps to an image. Two certified corpus rows and an image round-trip.
+
+- **`vec` of a map entry is a plain vector.** `MapEntry` is not `IObj`, so the
+  reference's `vec` builds a `PersistentVector` of the two slots; jolt handed the
+  entry back as itself, still a `MapEntry` to `class` and `instance?`. One
+  certified corpus row.
+
 - **Windows: an absolute FILE argument is no longer read as project-relative.**
   `file-arg` recognized one absolute spelling — a leading `/` — so `jolt
   C:/Users/x/hello.clj` (and `jolt run C:\Users\x\hello.clj`, and every UNC
