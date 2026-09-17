@@ -88,5 +88,62 @@
 (is "big zipmap"        "(count (zipmap (range 200000) (range 200000)))" "200000")
 (is "big array-map source" "(count (persistent! (reduce (fn [t i] (assoc! t i i)) (transient (apply array-map (range 200))) (range 200000))))" "200000")
 
+;; --- a vector built from a flat source is built as a trie, not by conj ------
+;; persistent! hands its buffer to make-pvec, which for more than 32 elements
+;; conj'd one element at a time — each conj a fresh tail copy, so a 26k-element
+;; build allocated 5.5 MB for 210 KB of leaves and took 1 ms. The trie is now
+;; assembled bottom-up: leaves of 32 straight from the source, branches over
+;; them, the last 1..32 as the tail — the shape every conj would have produced,
+;; so nth/conj/pop/subvec/seq read it as any other vector. Bytes are
+;; deterministic: per element, the leaf slot (8) plus the branch and tail
+;; share, well under 16. The same build serves vec, (apply vector …), mapv and
+;; jolt-vector with many arguments.
+(define (bytes-per-element n thunk)
+  (thunk)
+  (let ((b0 (sstats-bytes (statistics))))
+    (do ((i 0 (fx+ i 1))) ((fx= i 20)) (thunk))
+    (quotient (quotient (- (sstats-bytes (statistics)) b0) 20) n)))
+(let* ((n 26000) (src (make-vector n 7))
+       (per (bytes-per-element n (lambda () (make-pvec src)))))
+  (printf "  make-pvec from a flat ~a-element vector: ~a bytes/element\n" n per)
+  (ok "make-pvec builds the trie in bulk (<= 16 bytes per element, was ~210)" (<= per 16)))
+(let* ((n 26000)
+       ;; compiled once; the source is a vector (reduce walks it with no seq cells),
+       ;; so what is measured is conj!'s buffer growth plus persistent!'s trie
+       (build (jolt-compile-eval "(let [v (vec (range 26000))] (fn [] (persistent! (reduce conj! (transient []) v))))" "user"))
+       (per (bytes-per-element n (lambda () (jolt-invoke0 build)))))
+  (printf "  conj! x26k + persistent!: ~a bytes/element\n" per)
+  (ok "a large transient vector build stays under 48 bytes per element (buffer growth + trie)" (<= per 48)))
+;; the bulk-built trie is the conj-built trie: same reads at every boundary
+(let* ((n 1057)   ; 33 full leaves + a 1-element tail: a two-level root
+       (src (let ((v (make-vector n))) (do ((i 0 (fx+ i 1))) ((fx= i n)) (vector-set! v i i)) v))
+       (bulk (make-pvec src))
+       (conjd (let loop ((p empty-pvec) (i 0)) (if (fx= i n) p (loop (pvec-conj p i) (fx+ i 1))))))
+  (ok "bulk build has the conj build's count, shift, tail and root shape"
+      (and (= (pvec-cnt bulk) (pvec-cnt conjd)) (= (pvec-shift bulk) (pvec-shift conjd))
+           (equal? (pvec-tail bulk) (pvec-tail conjd)) (equal? (pvec-root bulk) (pvec-root conjd))))
+  (ok "every element reads back, and conj/pop/nth after the bulk build agree with the list"
+      (and (let lp ((i 0)) (or (fx= i n) (and (= i (pvec-nth-d bulk i #f)) (lp (fx+ i 1)))))
+           (= n (pvec-nth-d (pvec-conj bulk n) n #f))
+           (= (fx- n 1) (pvec-cnt (pvec-pop bulk)))
+           (= (fx- n 2) (pvec-nth-d (pvec-pop bulk) (fx- n 2) #f)))))
+(let* ((n 26000)
+       (mv (jolt-compile-eval "(let [v (vec (range 26000))] (fn [] (mapv inc v)))" "user"))
+       (per (bytes-per-element n (lambda () (jolt-invoke0 mv)))))
+  (printf "  mapv inc over 26k: ~a bytes/element\n" per)
+  (ok "mapv over one collection is the transient fold (<= 48 bytes per element, was ~180)" (<= per 48)))
+(let ((sizes '(33 64 65 1024 1025 1056 1057 33000)))
+  (ok "bulk and conj builds agree at every tail/root boundary"
+      (let loop ((ss sizes))
+        (or (null? ss)
+            (let* ((n (car ss))
+                   (src (let ((v (make-vector n))) (do ((i 0 (fx+ i 1))) ((fx= i n)) (vector-set! v i i)) v))
+                   (bulk (make-pvec src))
+                   (conjd (let lp ((p empty-pvec) (i 0)) (if (fx= i n) p (lp (pvec-conj p i) (fx+ i 1))))))
+              (and (= (pvec-shift bulk) (pvec-shift conjd))
+                   (equal? (pvec-root bulk) (pvec-root conjd))
+                   (equal? (pvec-tail bulk) (pvec-tail conjd))
+                   (loop (cdr ss))))))))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

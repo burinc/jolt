@@ -225,23 +225,29 @@
 
 ;; (conj!) -> fresh transient vector; (conj! coll) -> the 1-arity transducer-
 ;; completion identity (JVM: no transient check). (conj! t x ...) mutates t.
-(define (jolt-conj! . args)
+;;
+;; The two-argument call is every transient build's hot call — (reduce conj!
+;; (transient []) coll), into, and the core fns written that way — and a single
+;; `. args` signature charged each of them a rest list before doing anything
+;; (32 of the 85 bytes a 26k-element build allocated per element). It is a fixed
+;; clause now, with the one-element body the variadic clause folds over.
+(define (jolt-conj-one! t x)
   (cond
-    ((null? args) (jolt-transient-new (jolt-vector)))
-    ((null? (cdr args)) (car args))
+    ((jrec-trans-method t "conj") => (lambda (m) (jolt-invoke m t x)))
     (else
-      (let ((t (car args)) (xs (cdr args)))
-        (cond
-          ((jrec-trans-method t "conj")
-           => (lambda (m) (fold-left (lambda (acc x) (jolt-invoke m acc x)) t xs)))
-          (else
-        (jolt-trans-check t "conj!")
-        (case (jolt-transient-kind t)
-          ((vec) (for-each (lambda (x) (tvec-conj1! t x)) xs))
-          ((set) (for-each (lambda (x) (thash-put! t x x)) xs))
-          ((map) (for-each (lambda (x) (tmap-conj-entry! t x)) xs))
-          (else (jolt-transient-buf-set! t (apply jolt-conj (jolt-transient-buf t) xs))))
-        t))))))
+     (jolt-trans-check t "conj!")
+     (case (jolt-transient-kind t)
+       ((vec) (tvec-conj1! t x))
+       ((set) (thash-put! t x x))
+       ((map) (tmap-conj-entry! t x))
+       (else (jolt-transient-buf-set! t (jolt-conj (jolt-transient-buf t) x))))
+     t)))
+(define jolt-conj!
+  (case-lambda
+    (() (jolt-transient-new (jolt-vector)))
+    ((t) t)
+    ((t x) (jolt-conj-one! t x))
+    ((t . xs) (fold-left jolt-conj-one! t xs))))
 
 ;; assoc! is variadic. JVM: a complete first key/val pair present (>=3 kvs) with a
 ;; trailing lone key fills nil; a lone key alone (1 kv) is a wrong-arity throw.

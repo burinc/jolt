@@ -130,6 +130,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Vectors past 32 elements are built in bulk.** `make-pvec` conj'd one
+  element at a time past the tail, copying the tail each time: a 26k-element
+  vector cost 5.5 MB and 1 ms for 210 KB of leaves. The trie is assembled
+  bottom-up now — 9 bytes per element — and `vec`, `into []`, `(apply vector
+  …)`, `persistent!` and `jolt-vector` with many arguments all end there.
+  `conj!` had a single variadic signature that consed a rest list on the
+  two-argument call every transient build makes; it has fixed arities. With
+  both, the transient fold is the fastest way to build a vector at every size,
+  so `mapv` is Clojure's definition again (0.7 vs 1.6 µs over 32 elements,
+  0.9 vs 4.6 MB over 26k). The transient gate pins the bytes and that the bulk
+  build equals the conj build at every tail and root boundary.
+- **An unhinted method call no longer pays for the arms it passes through.**
+  The dotform, regex and host-type arms converted the argument vector to a
+  list (a seq walk) before testing whether the receiver was theirs, so a
+  2-argument `.region` on a Matcher allocated 576 bytes in dispatch alone.
+  Arms test the receiver first and convert straight from the vector's tail:
+  160 bytes, of which 128 is the call site's own argument vector.
+- **A Matcher owns its match state.** Each find allocated a fresh irregex
+  match vector, a source triple and a chunker pair before matching; the
+  matcher keeps one of each, reset per search (the triple updated in place
+  when the region moves), and the groups vector is built directly. Region +
+  find: 304 → 128 bytes group-free, 1184 → 784 capturing. `.group` still reads
+  the last match and a failed find leaves none, as on the JVM.
+- **A keyword-invoke site remembers the slot it hit.** `(:k m)` on an array
+  map was `amap-index`'s identity scan — 6.4 ns at the first slot, 10.8 at the
+  tenth — the same loop as `PersistentArrayMap.indexOf`. Every map one literal
+  builds is record-shaped, so a per-site cell holding the last hit index now
+  answers the next call with one `eq?` and one `vector-ref` (2 ns), the shape
+  of a monomorphic inline cache with the slot standing in for the hidden
+  class. It only shortcuts a hit: a different map at the site, a key at another
+  slot, a hash-mode map, a record or nil all take the old path, which re-primes
+  the cell. standard-clojure-style's formatter runs 8.5% faster end to end.
+  The arraymap gate pins the emitted shape, the fallbacks and the ratio.
+- **`clojure.string/last-index-of` scans backward.** It reversed both the
+  subject and the needle (two `list->string` round trips of the whole string)
+  and searched forward, so every call was linear in the subject where
+  `String.lastIndexOf` is a backward scan: a needle at the tail of 50k
+  characters went from 2.4k to 20M calls per second. The complexity gate pins
+  the shape; six corpus rows pin the values against the JVM.
+- **An escape continuation no longer copies the stack.** `jolt.continuations`'s
+  `call-cc`/`letcc` checked the escape's owner through four `guard` forms — a
+  full `call/cc` each, and a multi-shot capture inside the one-shot's frame
+  promoted it, so every escape and every normal return copied the stack
+  segment: 4.6 KB and 190 ns per escape against 8 ns for the host's own
+  `call/1cc`. The owner reads are bare now (the fiber slot index is captured
+  once at load). 34 ns and 144 bytes per escape; standard-clojure-style's
+  parser, which takes a `letcc` per `Choice` attempt, parses its own source
+  21% faster. The continuations gate pins the allocation.
+- **A map literal with keyword keys builds its slots directly.** `{:a x :b y}`
+  went through `jolt-hash-map`'s rest-list arity — `length`, the array-mode
+  decision, then an O(n²) duplicate scan the reader had already ruled out —
+  134 ns for a ten-key literal with one runtime value. The emitter now hands
+  the slot vector to the array map when every key is a constant keyword (the
+  reference compiler's `RT.mapUniqueKeys` shape), bounded at the keyword array
+  limit so the mode is unchanged: 12 ns. Values still evaluate left to right.
+- **The process symbol handle is loaded once.** Every `jolt-foreign-proc-safe`
+  site asked Chez for the process's own handle, so its dynamic lookup list
+  held it 57 times by the end of boot, and every `foreign-entry` lookup that
+  misses the process — every `(cs)` internal, every optional-entry probe —
+  walked all 57 with `dlsym`: 2 ms a miss, 4 ms per `inspect/object`. The
+  adapter loads it once; re-requests are no-ops, which also closes the path
+  where re-loading it after a native library re-promoted the process's
+  symbols over the library's.
 - **Record predicates, accessors and constructors are open-coded.** Every
   collection, seq cell, keyword, symbol, var and record instance in the runtime
   is a Chez record, and `define-record-type` bound each type's predicate and
@@ -211,6 +274,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tree-shaken build that keeps the compiler no longer dies at boot.**
+  `--tree-shake`/`--closed-world` of a program that reaches a compile
+  reference without a bail reference — `jolt.image/dump!`,
+  `jolt.scheme/eval-string`, a bare varargs FFI binding — shook clojure.core
+  and inlined the compiler image over it, and the image's own top-level forms
+  hit the first pruned core var (`jolt.op-registry`'s `keep`) before `-main`
+  ran. The compiler image is direct-linked against the whole core, so such a
+  build now prunes the app half only and says so ("core kept whole"). The
+  build smoke gate covers it; its check that a shaken core drops `group-by`
+  had been vacuous since the core moved to `def-var-linked!`.
 - **`with-meta` on a seq cell no longer runs its unforced tail twice.** The copy
   `with-meta` builds shared the cell's tail word as it stood, and a tail still
   pending — the thunk a lazy `map`/`filter`/`rest` leaves behind — was then run

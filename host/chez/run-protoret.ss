@@ -50,7 +50,10 @@
 
 ;; q's impls return R and a number -> joined to non-record -> stays generic (sound).
 (define ge (emit (run-passes g (make-analyze-ctx "user") U)))
-(gate-check "mixed-return protocol keeps generic jolt-get" (gate-sub? ge "jolt-get") #t)
+;; generic = the keyword-invoke site lookup (jolt-kw-get-site, which answers a
+;; record through jolt-get-dispatch), never a static field accessor
+(gate-check "mixed-return protocol keeps the generic keyword lookup"
+            (and (gate-sub? ge "jolt-kw-get-site") (not (gate-sub? ge "jrec1-f0")) (not (gate-sub? ge "jrec-field-at"))) #t)
 (gate-check "mixed-return protocol does not bare-index" (gate-sub? ge "jrec-field-at") #f)
 
 (gate-summary "protoret")

@@ -1322,9 +1322,23 @@
 (define (str-upper s) (string-upcase s))
 (define (str-lower s) (string-downcase s))
 (define (str-reverse-b s) (list->string (reverse (string->list s))))
-(define (str-find needle s)
-  (let ((i (str-index-of s needle 0)))
+(define (str-find needle s . opt)
+  (let ((i (str-index-of s needle (if (pair? opt) (car opt) 0))))
     (if (fx<? i 0) jolt-nil i)))
+;; The Chez twin (java/natives-str.ss str-last-find): String.lastIndexOf(str,
+;; from) — the last occurrence that STARTS at or before FROM, or nil; a negative
+;; FROM is nil, one past the end clamps, an empty needle answers min(from, len).
+(define (str-last-find needle s from)
+  (let* ((needle (str-needle needle))
+         (nlen (string-length needle)) (slen (string-length s)))
+    (cond
+      ((fx<? from 0) jolt-nil)
+      ((fx=? nlen 0) (fxmin from slen))
+      (else
+       (let loop ((i (fxmin from (fx- slen nlen))))
+         (cond ((fx<? i 0) jolt-nil)
+               ((jolt-char-by-char-match? s i needle nlen) i)
+               (else (loop (fx- i 1)))))))))
 (define (str-literal-split s sep)
   (let ((slen (string-length (jolt-need-str s))) (plen (string-length sep)))
     (if (fx=? plen 0)
@@ -1383,6 +1397,7 @@
 (def-var! "clojure.core" "str-triml" str-triml)
 (def-var! "clojure.core" "str-trimr" str-trimr)
 (def-var! "clojure.core" "str-find" str-find)
+(def-var! "clojure.core" "str-last-find" str-last-find)
 (def-var! "clojure.core" "str-reverse-b" str-reverse-b)
 (def-var! "clojure.core" "str-split" str-split)
 (def-var! "clojure.core" "str-replace" str-replace)

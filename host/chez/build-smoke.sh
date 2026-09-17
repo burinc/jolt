@@ -847,11 +847,48 @@ if grep -q '"app.core" "dead"' "$doout.build/flat.ss"; then
   echo "  FAIL: --tree-shake did not drop the unreferenced def app.core/dead"; exit 1
 fi
 [ -f "$doout.build/runtime.ss" ] || { echo "  FAIL: --tree-shake did not emit the shaken core as its own runtime unit"; exit 1; }
-if grep -q 'def-var! "clojure.core" "group-by"' "$doout.build/runtime.ss"; then
+if grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"' "$doout.build/runtime.ss"; then
   echo "  FAIL: --tree-shake kept an unreachable clojure.core fn (group-by)"; exit 1
 fi
 if grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$doout.build/runtime.ss"; then
   echo "  FAIL: --tree-shake kept the compiler image in a no-eval app"; exit 1
+fi
+# A shaken app that KEEPS the compiler without bailing — it writes an image
+# (jolt.image/dump! needs the fasl writer and the backend's munge-name) or
+# evaluates Scheme text (jolt.scheme/eval-string) but never restores or evals
+# jolt code — must still boot. The compiler image is direct-linked against the
+# whole clojure.core, so it can only be inlined over an UNSHAKEN core: such a
+# build prunes the app half and keeps the prelude whole, saying why. It once
+# shook the core anyway and died at boot on jolt.op-registry's `keep`.
+ckapp="$(dirname "$out")/compilekeep"
+mkdir -p "$ckapp/src/ck"
+printf '{:paths ["src"]}\n' > "$ckapp/deps.edn"
+printf '(ns ck.main (:require [jolt.image :as img] [jolt.scheme :as scm]))\n(defn dead [] (group-by odd? [1 2 3]))\n(defn -main [& _]\n  (img/dump! "%s" {:answer 42})\n  (println "scheme:" (scm/eval-string "(+ 40 2)")))\n' "$ckapp/out.img" > "$ckapp/src/ck/main.clj"
+ckout="$(dirname "$out")/compilekeep-bin"
+if ! JOLT_PWD="$ckapp" "$jolt" build -m ck.main -o "$ckout" --tree-shake >"$ckout.log" 2>&1; then
+  echo "  FAIL: jolt build --tree-shake of the image-writing app exited non-zero"; cat "$ckout.log"; exit 1
+fi
+if grep -q 'tree-shake skipped' "$ckout.log"; then
+  echo "  FAIL: an image-writing app has no bail reference and must not skip the shake"; cat "$ckout.log"; exit 1
+fi
+if ! grep -q 'core kept whole' "$ckout.log"; then
+  echo "  FAIL: a shaken build that keeps the compiler must say the core stays whole"; cat "$ckout.log"; exit 1
+fi
+got_ck="$(cd / && "$ckout" 2>&1)"; rc_ck=$?
+if [ "$rc_ck" != "0" ] || [ "$got_ck" != "scheme: 42" ]; then
+  echo "  FAIL: the shaken image-writing binary — want 'scheme: 42' rc 0, got rc $rc_ck:"
+  echo "$got_ck"; exit 1
+fi
+# ...and the image it wrote is a real one: the unshaken jolt reads it back.
+got_img="$(JOLT_PWD="$ckapp" "$jolt" -e "(require 'jolt.image) (println (:answer (jolt.image/read-image \"$ckapp/out.img\")))" 2>&1)"
+if [ "$got_img" != "42" ]; then
+  echo "  FAIL: the image the shaken binary wrote does not read back — got: $got_img"; exit 1
+fi
+if grep -q '"ck.main" "dead"' "$ckout.build/flat.ss"; then
+  echo "  FAIL: the compiler-keeping shake did not prune the app half (ck.main/dead)"; exit 1
+fi
+if ! grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"' "$ckout.build/runtime.ss"; then
+  echo "  FAIL: the compiler-keeping shake pruned the core the compiler image is linked against"; exit 1
 fi
 # A registered data reader that returns a CODE form must be compiled into the
 # binary (the emit path applies it too, not just the interpreted loader): the
@@ -1383,7 +1420,7 @@ fi
 [ -f "$splitout.build/runtime.ss" ] || { echo "  FAIL: no runtime.ss — the split did not happen"; exit 1; }
 # clojure.core lives in the runtime half only; finding it in flat.ss means the app
 # half still carries the runtime and nothing was actually separated.
-if grep -q 'def-var! "clojure.core" "group-by"' "$splitout.build/flat.ss"; then
+if grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"' "$splitout.build/flat.ss"; then
   echo "  FAIL: runtime defs still in flat.ss after the split"; exit 1
 fi
 if [ "$(ls "$cachedir"/*.so 2>/dev/null | wc -l | tr -d ' ')" != "1" ]; then

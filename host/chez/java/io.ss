@@ -990,7 +990,7 @@
 (register-method-arm! arm-priority-file
   (lambda (obj method-name rest-args)
     (if (jfile? obj)
-        (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+        (let* ((rest (method-rest-args->list rest-args))
                (r (jfile-method obj method-name rest)))
           (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
@@ -999,7 +999,7 @@
 (register-method-arm! arm-priority-file
   (lambda (obj method-name rest-args)
     (if (embedded-res? obj)
-        (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+        (let* ((rest (method-rest-args->list rest-args))
                (r (embedded-res-method obj method-name rest)))
           (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
@@ -2143,8 +2143,7 @@
 (register-method-arm! arm-priority-date
   (lambda (obj method-name rest-args)
     (if (juuid? obj)
-        (uuid-method obj method-name
-                     (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+        (uuid-method obj method-name (method-rest-args->list rest-args))
         'pass)))
 ;; (Long. n) / (Long. "n"): a Long is just jolt's integer; return it (parse a string).
 (register-class-ctor! "Long" (lambda (x) (if (string? x) (parse-int-or-throw x 10 "long") (->num (jnum->exact x)))))

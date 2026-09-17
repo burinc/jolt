@@ -22,7 +22,8 @@
 
 (ns continuations-test
   (:require [jolt.continuations :as k]
-            [jolt.fibers :as fib]))
+            [jolt.fibers :as fib]
+            [jolt.scheme]))
 
 (def failures (atom []))
 (defn check [label pred]
@@ -280,6 +281,33 @@
                                                         (escape i))))
                                          :ok))))]
             (distinct (map fib/join fs)))))
+
+;; --- the escape path is one-shot all the way down ----------------------------
+;; A capture and an escape are a call/1cc, a record and a closure: a few dozen
+;; bytes. The three checks (spent / owner / live) are field reads. They once
+;; wrapped get-thread-id and the fiber vreg in a `guard` — a full call/cc each,
+;; which promoted the one-shot continuation to multi-shot so every return
+;; through it COPIED the stack segment: 4.6 KB and ~190 ns per escape, 43% of
+;; standard-clojure-style's parse time (a letcc per Choice attempt). Bytes are
+;; deterministic where nanoseconds are not, so the invariant is allocation:
+;; measured in one process over many iterations against the host's own
+;; call/1cc, an escape may cost a small constant more, never a stack copy.
+
+(defn allocated-total []
+  (jolt.scheme/eval-string "(sstats-bytes (statistics))"))
+(defn bytes-per [n f]
+  (f)
+  (let [before (allocated-total)]
+    (dotimes [_ n] (f))
+    (quot (- (allocated-total) before) n)))
+
+(check "an escape allocates a few objects, not a stack segment"
+       (let [per (bytes-per 20000 (fn [] (k/letcc [escape] (escape 1))))]
+         (or (< per 400) (do (println "  escape allocated" per "bytes") false))))
+
+(check "a normal return through call-cc allocates a few objects, not a stack segment"
+       (let [per (bytes-per 20000 (fn [] (k/letcc [escape] 1)))]
+         (or (< per 400) (do (println "  normal return allocated" per "bytes") false))))
 
 (if (empty? @failures)
   (do (println "CONTINUATIONS-TEST OK") (flush) (System/exit 0))
