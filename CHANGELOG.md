@@ -31,7 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ThreadPoolExecutor`) answers the parent's members without copying its table
   — a copy would freeze the parent as it stood, so a member registered later
   reached one tag and not the other. `derive-host-methods!` names the parent,
-  and dispatch walks the chain on a miss only.
+  and dispatch walks the chain on a miss only. The class graph stays the one
+  source of truth for ancestry: a derivation is refused unless the child's
+  class is a strict descendant of the parent's there, so a layout claim cannot
+  contradict the class claim and two layouts of one class cannot reach each
+  other's procedures. An alias of a derived tag inherits the link, reflection
+  lists a shadowed member once, and `make hostregistry` pins all of it.
 
 - **The rest of `clojure.lang.Var`'s instance surface: `toSymbol`, `unbindRoot`,
   `set`, `fn`, and the `ns` / `sym` FIELD spellings.** The var shim answered

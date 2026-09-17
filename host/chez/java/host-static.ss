@@ -218,47 +218,91 @@
   (lambda (x)
     (and (jhost? x) (host-method-ref (jhost-tag x) "compare") #t)))
 
-;; Point a second tag at an existing tag's method table, sharing the table itself
-;; rather than copying it. A shim that differs from another ONLY in the class it
-;; reports — clojure.lang.LineNumberingPushbackReader over java.io.PushbackReader
-;; — needs its own tag so value-host-tags names the right class, but must not get
-;; its own copy of the methods: a later register-host-methods! on either tag would
-;; then reach only one of them, and the two would silently drift apart.
+;; ---- how two tags relate ----------------------------------------------------
+;; A tag is a REPRESENTATION: the procedures in its table read the state vector
+;; its constructor builds. The class a tag reports is a separate fact, kept in
+;; ONE place (jhost-tag->fqn, class-hierarchy.ss) and answered from the class
+;; graph — instance?, class, the protocol tags. The two relations below are
+;; between representations, and the second is checked against the graph so a
+;; layout claim cannot contradict the class claim.
+;;
+;; alias: a second tag over the SAME table object, for a shim that differs from
+;; another only in the class it reports — clojure.lang.LineNumberingPushbackReader
+;; over java.io.PushbackReader. Sharing rather than copying is the point: a later
+;; register-host-methods! on either tag reaches both, where a copy would let the
+;; two silently drift apart. The alias inherits the original's parent link too,
+;; so an alias of a derived tag answers what the derived tag answers.
+(define host-methods-parent (make-hashtable string-hash string=?))   ; tag -> parent tag
+(define (host-tag-parent tag) (hashtable-ref host-methods-parent tag #f))
 (define (alias-host-methods! tag from)
   (let ((h (or (hashtable-ref host-methods-tbl from #f)
                (error 'alias-host-methods! "no methods registered for tag" from))))
-    (hashtable-set! host-methods-tbl tag h)))
+    (hashtable-set! host-methods-tbl tag h)
+    (let ((p (host-tag-parent from)))
+      (when p (hashtable-set! host-methods-parent tag p)))))
 
-;; A tag whose class EXTENDS another shim's class — ScheduledThreadPoolExecutor
-;; over ThreadPoolExecutor — answers every member the parent tag answers plus its
-;; own. It is neither an alias (the members differ) nor a copy: a copy freezes the
-;; parent's table as it stood when the copy was taken, so a member registered on
-;; the parent afterwards reaches one tag and not the other, which is the drift
-;; alias-host-methods! is written to prevent. The child keeps a table of its own
-;; and names its parent, and host-method-ref walks the chain on a MISS only, so a
-;; hit on the tag's own table costs what it always did.
-(define host-methods-parent (make-hashtable string-hash string=?))   ; tag -> parent tag
+;; derive: a tag whose LAYOUT EXTENDS another's — the scheduled future carries the
+;; j-future's five slots and five more — answers every member the parent tag
+;; answers plus its own. Neither an alias (the members differ) nor a copy (a copy
+;; freezes the parent's table as it stood when it was taken, the drift alias
+;; avoids): the child keeps a table of its own and names its parent, and
+;; host-method-ref walks the chain on a MISS only, so a hit on the tag's own table
+;; costs what it always did.
+;;
+;; CHECKED AGAINST THE CLASS GRAPH, because a parent's procedures reading the
+;; child's state is a claim about the layout, and the layout follows the class:
+;; the child's class must be a strict descendant of the parent's in the modeled
+;; hierarchy, so the graph — already the single answer to instance? — is also the
+;; single answer to "may this tag inherit that one". Two tags of ONE class are
+;; two layouts of it (future-task and j-future are both FutureTask), which is
+;; exactly why the graph cannot drive inheritance by itself: it names classes, not
+;; layouts, and would let the scheduled future reach the future-task table whose
+;; procedures read a different vector. A tag with no class row cannot derive: the
+;; check would have nothing to hold it to.
 (define (derive-host-methods! tag from members)
   (unless (hashtable-ref host-methods-tbl from #f)
     (error 'derive-host-methods! "no methods registered for tag" from))
+  (let ((child (jhost-fqn tag)) (parent (jhost-fqn from)))
+    (unless (and child parent)
+      (error 'derive-host-methods! "both tags must name a class (jhost-tag->fqn)" tag from))
+    (unless (and (not (string=? child parent)) (jch-isa? child parent))
+      (error 'derive-host-methods! "the child's class must extend the parent's" child parent))
+    ;; and the chain must end: a cycle would make host-method-ref loop
+    (let walk ((t from))
+      (when t
+        (when (string=? t tag) (error 'derive-host-methods! "derivation cycle" tag from))
+        (walk (host-tag-parent t)))))
   (hashtable-set! host-methods-parent tag from)
   (register-host-methods! tag members))
-;; The member NAME resolves to on TAG — its own table first, then each parent's —
-;; or #f.
+
+;; The two resolvers, and the only readers of the chain. host-method-ref: the
+;; member NAME resolves to on TAG — its own table first, then each parent's — or
+;; #f; every dispatch goes through it. host-method-entries: every (name . proc)
+;; TAG answers, the child's first and a parent's member SHADOWED by the child's
+;; left out, as getMethods lists an override once; reflection (natives-array.ss)
+;; reads this rather than the tables.
 (define (host-method-ref tag name)
   (let loop ((tag tag))
     (and tag
          (let ((h (hashtable-ref host-methods-tbl tag #f)))
            (or (and h (hashtable-ref h name #f))
-               (loop (hashtable-ref host-methods-parent tag #f)))))))
-;; Every method table TAG answers from, its own first: the reflection walk
-;; (natives-array.ss) lists a class's members from these.
-(define (host-method-tables tag)
-  (let loop ((tag tag) (acc '()))
-    (if tag
-        (loop (hashtable-ref host-methods-parent tag #f)
-              (let ((h (hashtable-ref host-methods-tbl tag #f))) (if h (cons h acc) acc)))
-        (reverse acc))))
+               (loop (host-tag-parent tag)))))))
+(define (host-method-entries tag)
+  (let loop ((tag tag) (seen '()) (acc '()))
+    (if (not tag)
+        (reverse acc)
+        (let ((h (hashtable-ref host-methods-tbl tag #f)))
+          (if (not h)
+              (loop (host-tag-parent tag) seen acc)
+              (let-values (((names procs) (hashtable-entries h)))
+                (let walk ((i 0) (seen seen) (acc acc))
+                  (if (fx=? i (vector-length names))
+                      (loop (host-tag-parent tag) seen acc)
+                      (let ((n (vector-ref names i)))
+                        (if (member n seen)
+                            (walk (fx+ i 1) seen acc)
+                            (walk (fx+ i 1) (cons n seen)
+                                  (cons (cons n (vector-ref procs i)) acc))))))))))))
 
 (define (lookup-class h-tbl name)
   (or (hashtable-ref h-tbl name #f)

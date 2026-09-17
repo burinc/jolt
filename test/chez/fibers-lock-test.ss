@@ -571,9 +571,8 @@
 (jolt-fiber-preempt-ticks-set! #f)
 
 (define (rl-method nm)
-  (let ((h (hashtable-ref host-methods-tbl "reentrant-lock" #f)))
-    (or (and h (hashtable-ref h nm #f))
-        (error 'rl-method "no such reentrant-lock method" nm))))
+  (or (host-method-ref "reentrant-lock" nm)
+      (error 'rl-method "no such reentrant-lock method" nm)))
 (define (rl-new) ((hashtable-ref class-ctors-tbl "ReentrantLock" #f)))
 (define rl-lock (rl-method "lock"))
 (define rl-unlock (rl-method "unlock"))
