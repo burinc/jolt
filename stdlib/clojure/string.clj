@@ -141,19 +141,16 @@
      (when idx (+ from idx)))))
 
 (defn last-index-of
-  
+  "Return last index of value (string or char) in s, optionally
+  searching backward from from-index. Return nil if value not found."
+  ;; String.lastIndexOf: a backward scan (str-last-find, natives-str.ss). The
+  ;; from arity answers the largest k <= from where the match STARTS (the match
+  ;; may extend past from); a negative from is nil, one past the end clamps.
   ([s value]
-   (let [r (str-reverse-b s) sval (str-reverse-b value)
-         idx (str-find sval r)]
-     (when idx (- (count s) (+ idx (count value))))))
+   (let [st (to-str s)]
+     (str-last-find value st (count st))))
   ([s value from]
-   ;; JVM lastIndexOf: largest k <= from where the match STARTS (the match may
-   ;; extend past from), negative from -> nil, from past the end clamps
-   (let [from (min (max -1 (long from)) (dec (count s)))
-         sub (if (neg? from) "" (subs s 0 (min (count s) (+ from (count value)))))
-         r (str-reverse-b sub) sval (str-reverse-b value)
-         idx (str-find sval r)]
-     (when idx (- (count sub) (+ idx (count value)))))))
+   (str-last-find value (to-str s) (long from))))
 
 (defn re-quote-replacement
   "Escape special characters (backslash and dollar) in a regex replacement

@@ -117,7 +117,9 @@
                    (= (first (rseq v1)) (dec n1))
                    (= (last (rseq v1)) 0)
                    (= (first sm1) [0 0]) (= (first ss1) 0)
-                   (= (first (sorted-map)) nil) (= (first (sorted-set)) nil))
+                   (= (first (sorted-map)) nil) (= (first (sorted-set)) nil)
+                   (= (clojure.string/last-index-of src1 "bar)") (- (count src1) 4))
+                   (= (clojure.string/last-index-of src1 "(foo" (- (count src1) 1)) (- (count src1) 9)))
       (println "FAIL complexity: wrong values before timing")
       (System/exit 1))
 
@@ -125,6 +127,21 @@
            #(count s1)
            #(count s2)
            "count is walking a vector-backed seq instead of subtracting its index from the backing vector's count (collections.ss)")
+
+    ;; String.lastIndexOf is a backward scan: a needle at the tail is found in
+    ;; constant time whatever precedes it. The wrapper once reversed BOTH strings
+    ;; (list->string of the whole subject) and ran index-of forward, which is
+    ;; linear in the subject for every call — 2% of a formatter's format pass
+    ;; from the one call per line it makes.
+    (judge "last-index-of tail"
+           #(clojure.string/last-index-of src1 "bar)")
+           #(clojure.string/last-index-of src2 "bar)")
+           "last-index-of is reversing the subject instead of scanning backward (natives-str.ss str-last-index-of-from)")
+
+    (judge "last-index-of from"
+           #(clojure.string/last-index-of src1 "(foo" (- (count src1) 1))
+           #(clojure.string/last-index-of src2 "(foo" (- (count src2) 1))
+           "the from arity of last-index-of copies and reverses the prefix instead of scanning backward from `from`")
 
     (judge "drop vector-seq"
            #(drop (- n1 5) s1)

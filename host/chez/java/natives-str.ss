@@ -761,6 +761,15 @@
 (define (str-find needle s . opt)
   (let ((i (str-index-of s needle (if (pair? opt) (car opt) 0))))
     (if (fx<? i 0) jolt-nil i)))
+;; (str-last-find needle s from) -> exact int index of the last occurrence that
+;; STARTS at or before FROM, or nil: String.lastIndexOf(str, from) — a backward
+;; scan, so a needle near the tail costs nothing for what precedes it (the
+;; wrapper once reversed both strings and searched forward, linear in the subject
+;; on every call). A char needle is the one-char string the JVM's char overload
+;; answers identically for.
+(define (str-last-find needle s from)
+  (let ((i (str-last-index-of-from s (str-needle needle) from)))
+    (if (fx<? i 0) jolt-nil i)))
 
 ;; --- native one-shots for clojure.string's hot wrappers ----------------------
 ;; The prelude's compiled wrappers chain overlay calls per invocation
@@ -954,6 +963,7 @@
 (def-var! "clojure.core" "str-triml" str-triml)
 (def-var! "clojure.core" "str-trimr" str-trimr)
 (def-var! "clojure.core" "str-find" str-find)
+(def-var! "clojure.core" "str-last-find" str-last-find)
 (def-var! "clojure.core" "str-reverse-b" str-reverse-b)
 (def-var! "clojure.core" "str-join" str-join)
 (def-var! "clojure.core" "str-split" str-split)
