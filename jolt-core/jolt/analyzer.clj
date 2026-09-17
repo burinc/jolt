@@ -32,7 +32,7 @@
                                form-var-value? form-var-value-ns form-var-value-name
                                form-class-value? form-class-value-name
                                form-tagged? form-tag-name
-                               unchecked-math? allow-unresolved-vars?
+                               unchecked-math? allow-unresolved-vars? invoke-rewriter
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
@@ -1876,6 +1876,16 @@
           (= hname "unchecked-long") {:kind :long :cast-fn "jolt-unchecked-long"}
           (= hname "unchecked-int")  {:kind :long :cast-fn "jolt-unchecked-int"})))
 
+;; The compile-time hook over calls through a var (jolt.host/invoke-rewriter,
+;; nil unless something bound jolt.host/*invoke-rewrite*): (f var-ns var-name
+;; form) answers the form to analyze instead, or nil. Resolved only when a hook
+;; is bound, so an ordinary call pays one deref, never a resolution.
+(defn- invoke-rewrite [ctx head form]
+  (when-let [f (invoke-rewriter)]
+    (let [r (resolve-global ctx head)]
+      (when (= :var (:kind r))
+        (f (:ns r) (:name r) form)))))
+
 (defn- analyze-list* [ctx form env]
   (let [items (vec (form-elements form))]
     (if (zero? (count items))
@@ -2041,13 +2051,22 @@
                      p (form-position form)]
                  (if p (assoc node :pos p) node))
           :else
-            ;; stamp the list form's source offset onto the :invoke
-            ;; so the success checker can report file:line:col. nil when the
-            ;; reader did not record it (synthetic/macro-built forms).
-            (let [n (invoke (analyze ctx head env)
-                            (mapv #(analyze ctx % env) (rest items)))
-                  p (form-position form)]
-              (if p (assoc n :pos p) n)))))))
+            ;; a call through a var the compile-time hook rewrites (jolt.host/
+            ;; *invoke-rewrite*, bound by jolt.loader around a context's
+            ;; source): the head is a symbol, not a local, and resolves to a
+            ;; var, and the replacement analyzes as if written here. Last, so
+            ;; a macro-emitted (clojure.core/require …) is seen and a special
+            ;; form never is.
+            (if-let [rw (and (form-sym? head) (not shadowed)
+                             (invoke-rewrite ctx head form))]
+              (analyze ctx rw env)
+              ;; stamp the list form's source offset onto the :invoke
+              ;; so the success checker can report file:line:col. nil when the
+              ;; reader did not record it (synthetic/macro-built forms).
+              (let [n (invoke (analyze ctx head env)
+                              (mapv #(analyze ctx % env) (rest items)))
+                    p (form-position form)]
+                (if p (assoc n :pos p) n))))))))
 
 ;; Record `form` as the innermost positioned form while its children are analyzed,
 ;; then put back whatever was there, so a completed sibling subtree cannot leave a

@@ -659,7 +659,7 @@ scifunctional: testbin
 cts: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" bash host/chez/cts.sh
 
-# The loader conformance suite: the twelve cases that specify jolt.loader (roots
+# The loader conformance suite: the cases that specify jolt.loader (roots
 # per context, isolation, delegation policy, unload). Baselined like certify —
 # a case that regresses fails, and a case that starts passing fails until the
 # baseline records it, so nothing green quietly goes red again.

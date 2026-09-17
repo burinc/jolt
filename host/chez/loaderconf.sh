@@ -1,8 +1,8 @@
 #!/bin/sh
 # loaderconf.sh — the loader conformance gate.
 #
-# Runs test/chez/loaderconf-test.clj — the twelve cases that specify jolt.loader
-# — and compares the per-case verdicts against
+# Runs test/chez/loaderconf-test.clj — the cases that specify jolt.loader — and
+# compares the per-case verdicts against
 # test/chez/loaderconf-known-failures.txt. The baseline is exact, the way
 # certify's and cts's are: a case that regresses fails the gate, and a case that
 # starts passing ALSO fails it until the baseline is updated in the same change.

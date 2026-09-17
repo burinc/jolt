@@ -116,6 +116,19 @@
 (define (hc-allow-unresolved-vars?)
   (jolt-truthy? (guard (e (#t #f)) (var-deref "clojure.core" "*allow-unresolved-vars*"))))
 
+;; jolt.host/*invoke-rewrite* read at compile time: a hook over calls through a
+;; VAR. (f var-ns var-name form) answers a replacement form, or nil to leave the
+;; call alone; the analyzer consults it at its invoke arm only for a head that
+;; is a symbol, is not a local, and resolves to a var -- a local named `resolve`
+;; is a local call whatever the hook thinks of clojure.core/resolve -- and after
+;; macro expansion, so a macro-emitted (clojure.core/require ...) is seen like a
+;; hand-written one. nil (the default) costs one deref per var call analyzed.
+;; jolt.loader binds it while evaluating a context's source, so `require` and
+;; its kin carry the loader that owns the code, whoever calls the fn later.
+(define (hc-invoke-rewriter)
+  (let ((f (guard (e (#t #f)) (var-deref "jolt.host" "*invoke-rewrite*"))))
+    (if (or (not f) (jolt-nil? f)) #f f)))
+
 ;; --- form accessors ---------------------------------------------------------
 (define (hc-char-code x) (char->integer x))  ; native Chez char -> codepoint
 (define (hc-sym-name x) (symbol-t-name x))
@@ -933,6 +946,8 @@
   (def-var! "jolt.host" "form-class-value-name" hc-class-value-name)
   (def-var! "jolt.host" "unchecked-math?" hc-unchecked-math?)
   (def-var! "jolt.host" "allow-unresolved-vars?" hc-allow-unresolved-vars?)
+  (def-dynvar! "jolt.host" "*invoke-rewrite*" jolt-nil)
+  (def-var! "jolt.host" "invoke-rewriter" hc-invoke-rewriter)
   (def-var! "jolt.host" "form-bigdec?" hc-bigdec?)
   (def-var! "jolt.host" "form-bigdec-source" hc-bigdec-source)
   (def-var! "jolt.host" "form-bigdec-value?" hc-bigdec-value?)

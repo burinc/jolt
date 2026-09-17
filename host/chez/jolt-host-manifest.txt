@@ -145,6 +145,7 @@ inline-ir
 interpolate-parts
 interrupt!
 interrupted?
+invoke-rewriter
 java-hashcode
 jolt-class-for
 jolt-version

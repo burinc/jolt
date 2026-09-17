@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.loader`: per-context namespaces, vars and resources.** The Loader
+  protocol declared earlier was a surface of throws; this is the
+  implementation behind it, and the conformance suite (`make loaderconf`)
+  passes in full. A namespace located on a loader's own roots is private to
+  that context (two contexts hold one library at two versions, each with its
+  own var cells), a namespace reached through the delegate is shared by
+  reference, a hermetic context sees only its roots, and `unload!` stops new
+  loads while definitions already resolved stay live. Evaluated source
+  resolves through the loader — policies and delegate chain included — and a
+  dependency the loader cannot serve fails the load with an actionable error
+  rather than leaking to the runtime's global `require`. A function loads,
+  requires, refers and aliases in the context that DEFINED it, whoever calls
+  it and across a fiber park: the compiler's new var-call hook
+  (`jolt.host/*invoke-rewrite*`, consulted after macro expansion and only for
+  a head that resolves to the var) rewrites `require`, `use`, `refer`,
+  `resolve`, `ns-resolve`, `find-var`, `load` and `load-file` to their
+  context-carrying forms while a context's source compiles, so a local named
+  `resolve` or a parameter named `load` stays that local's call. The
+  classloader facade is real: `clojure.java.io/resource`'s 2-arity resolves
+  through a loader object that answers `getResource`, the 1-arity and the
+  thread's context classloader follow the ambient loader inside
+  `with-loader`, and `clojure.lang.RT/baseLoader` returns the context's facade
+  there. Known limits are stated in the namespace docstring: private loads
+  mutate the process-global registry, `:class` requests have no backend yet,
+  jar roots are rejected, and a context's source is compiled directly rather
+  than through the AOT cache. (#912, #1039)
 - **`ScheduledExecutorService`: `schedule`, `scheduleAtFixedRate` and
   `scheduleWithFixedDelay` on the scheduled pools.**
   `Executors/newSingleThreadScheduledExecutor` and `newScheduledThreadPool`

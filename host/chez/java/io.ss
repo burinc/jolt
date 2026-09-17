@@ -1664,10 +1664,50 @@
 ;; all rather than degrading. case-lambda rather than a rest argument so the JVM's
 ;; two arities are the only two: (resource n loader extra) is an arity error there
 ;; and has to stay one here.
+;; A loader object with a getResource method — a jolt.loader context facade, or
+;; the host singleton itself — answers in its OWN context: the 2-arity is the
+;; JVM's "resolve against THIS ClassLoader", and a context loader depends on it
+;; for isolation (a resource only the context's roots hold must not fall
+;; through to the host roots). Anything else — nil, a stand-in for a thread's
+;; contextClassLoader, junk — keeps the historical answer.
+;; The getResource a loader object would answer with, or #f: the host's jhost
+;; registry for the host singleton, the library's tagged-table registry for a
+;; jolt.loader context facade.
+(define (loader-object-get-resource loader)
+  (cond
+    ((jhost? loader)
+     (let* ((mh (hashtable-ref host-methods-tbl (jhost-tag loader) #f))
+            (f (and mh (hashtable-ref mh "getResource" #f))))
+       f))
+    ((htable? loader) (tagged-method-lookup loader "getResource"))
+    (else #f)))
+;; The ambient base loader (jolt.loader rebinds clojure.lang.RT/baseLoader to
+;; the loader bound by with-loader; outside one it is the host singleton).
+;; Read through the class-statics table so a library-registered value — the
+;; Clojure fn the loader registers — is what answers, not a stale copy.
+(define (current-base-loader)
+  (let ((m (hashtable-ref class-statics-tbl "clojure.lang.RT" #f)))
+    (and m (let ((f (hashtable-ref m "baseLoader" #f))) (and f (f))))))
 (define jolt-io-resource
   (case-lambda
-    ((name) (resolve-resource name))
-    ((name _loader) (resolve-resource name))))
+    ;; The 1-arity follows the ambient loader: inside `with-loader` a context's
+    ;; facade answers in its own context — the resource analogue of the TCCL, and
+    ;; how an extension's (io/resource "x") finds its own bundled files. Outside
+    ;; one the ambient value is the host singleton, whose getResource is straight
+    ;; through to resolve-resource: the historical answer, unchanged.
+    ((name)
+     (let ((cl (current-base-loader)))
+       (if cl
+           (let ((f (loader-object-get-resource cl)))
+             (if f
+                 (f cl (resource-name-arg name))
+                 (resolve-resource name)))
+           (resolve-resource name))))
+    ((name loader)
+     (let ((f (loader-object-get-resource loader)))
+       (if f
+           (f loader (resource-name-arg name))
+           (resolve-resource name))))))
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.
@@ -1820,7 +1860,18 @@
           "main"
           (string-append "Thread-" (number->string id)))))
 (register-host-methods! "thread"
-  (list (cons "getContextClassLoader" (lambda (self) the-classloader))
+  ;; TCCL follows the ambient loader the way io/resource's 1-arity does: inside
+  ;; `with-loader` it is that context's facade (so a library finding its own
+  ;; resources the Java way gets the context's roots), outside one the host
+  ;; singleton. `current-base-loader` answers with the facade itself, and only a
+  ;; classloader-shaped answer (a jhost, or a tagged table like the facade) is
+  ;; taken — a library that rebound RT/baseLoader to something else keeps the
+  ;; historical answer, the rule the resource path above follows too. There is no
+  ;; setContextClassLoader: the getter is ambient-derived, not per-thread state.
+  (list (cons "getContextClassLoader"
+              (lambda (self)
+                (let ((cl (current-base-loader)))
+                  (if (and cl (or (jhost? cl) (htable? cl))) cl the-classloader))))
         (cons "getName" (lambda (self) (jolt-thread-name (thread-handle-id self))))
         (cons "setName" (lambda (self nm)
                           (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
