@@ -104,6 +104,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **An escape continuation no longer copies the stack.** `jolt.continuations`'s
+  `call-cc`/`letcc` checked the escape's owner through four `guard` forms — a
+  full `call/cc` each, and a multi-shot capture inside the one-shot's frame
+  promoted it, so every escape and every normal return copied the stack
+  segment: 4.6 KB and 190 ns per escape against 8 ns for the host's own
+  `call/1cc`. The owner reads are bare now (the fiber slot index is captured
+  once at load). 34 ns and 144 bytes per escape; standard-clojure-style's
+  parser, which takes a `letcc` per `Choice` attempt, parses its own source
+  21% faster. The continuations gate pins the allocation.
+- **A map literal with keyword keys builds its slots directly.** `{:a x :b y}`
+  went through `jolt-hash-map`'s rest-list arity — `length`, the array-mode
+  decision, then an O(n²) duplicate scan the reader had already ruled out —
+  134 ns for a ten-key literal with one runtime value. The emitter now hands
+  the slot vector to the array map when every key is a constant keyword (the
+  reference compiler's `RT.mapUniqueKeys` shape), bounded at the keyword array
+  limit so the mode is unchanged: 12 ns. Values still evaluate left to right.
+- **The process symbol handle is loaded once.** Every `jolt-foreign-proc-safe`
+  site asked Chez for the process's own handle, so its dynamic lookup list
+  held it 57 times by the end of boot, and every `foreign-entry` lookup that
+  misses the process — every `(cs)` internal, every optional-entry probe —
+  walked all 57 with `dlsym`: 2 ms a miss, 4 ms per `inspect/object`. The
+  adapter loads it once; re-requests are no-ops, which also closes the path
+  where re-loading it after a native library re-promoted the process's
+  symbols over the library's.
 - **Record predicates, accessors and constructors are open-coded.** Every
   collection, seq cell, keyword, symbol, var and record instance in the runtime
   is a Chez record, and `define-record-type` bound each type's predicate and
@@ -185,6 +209,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tree-shaken build that keeps the compiler no longer dies at boot.**
+  `--tree-shake`/`--closed-world` of a program that reaches a compile
+  reference without a bail reference — `jolt.image/dump!`,
+  `jolt.scheme/eval-string`, a bare varargs FFI binding — shook clojure.core
+  and inlined the compiler image over it, and the image's own top-level forms
+  hit the first pruned core var (`jolt.op-registry`'s `keep`) before `-main`
+  ran. The compiler image is direct-linked against the whole core, so such a
+  build now prunes the app half only and says so ("core kept whole"). The
+  build smoke gate covers it; its check that a shaken core drops `group-by`
+  had been vacuous since the core moved to `def-var-linked!`.
 - **`with-meta` on a seq cell no longer runs its unforced tail twice.** The copy
   `with-meta` builds shared the cell's tail word as it stood, and a tail still
   pending — the thunk a lazy `map`/`filter`/`rest` leaves behind — was then run
