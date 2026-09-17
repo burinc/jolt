@@ -69,11 +69,14 @@
     * loading a namespace pre-loads its `(ns … (:require …))` dependencies
       through the loader first, so the compiler resolves the context's own
       version of every dependency.
-    * calls to `require` / `use` / `refer` / `resolve` / `ns-resolve` /
-      `find-var` in evaluated source are rewritten to their context-carrying
-      forms (`__require-in` and friends) before compilation, so a function
-      loads — and requires, refers or aliases — in the context that DEFINED it,
-      not the one that calls it. A libspec's `:as`, `:as-alias`, `:refer`,
+    * a call through `require` / `use` / `refer` / `resolve` / `ns-resolve` /
+      `find-var` in evaluated source compiles to its context-carrying form
+      (`__require-in` and friends): the compiler's var-call hook
+      (jolt.host/*invoke-rewrite*) rewrites the call after macro expansion and
+      only when its head resolves to the clojure.core var — a local named
+      `resolve` or a parameter named `load` is that local's call — so a
+      function loads, requires, refers or aliases in the context that DEFINED
+      it, not the one that calls it. A libspec's `:as`, `:as-alias`, `:refer`,
       `:only`, `:exclude` and `:rename` are applied in the defining namespace,
       and `:reload` re-reads through the loader instead of the host's require.
       `load` and `load-file` are refused: a context reads namespaces through
@@ -143,7 +146,10 @@
 (defn- req-map
   "Validate and normalize X as a request; `:ns` requests get `:load?`
    defaulted to true (require semantics — load the namespace with its
-   dependencies; false means load the one namespace alone)."
+   dependencies; false asks for the one namespace alone). The source-roots
+   backend loads the dependencies either way: compiling a namespace needs
+   them, so the flag is carried for a backend that can honor it, and
+   preload-dep! passes false to say so."
   [x]
   (when-not (map? x)
     (throw (ex-info "loader request must be a map"
@@ -743,9 +749,13 @@
     :var (let [[ns-name var-name] (str/split (:name req) #"/" 2)]
            (when (and ns-name var-name (not (private-ns? ns-name)))
              (let [ns-sym (symbol ns-name)]
+               ;; ns-resolve also answers a CLASS for a capitalized name
+               ;; (clojure.core/String); a :var hit carries a cell, so only a
+               ;; var is one
                (when (find-ns ns-sym)
-                 (when-let [v (ns-resolve ns-sym (symbol var-name))]
-                   [{:kind :var :cell v}])))))
+                 (let [v (ns-resolve ns-sym (symbol var-name))]
+                   (when (var? v)
+                     [{:kind :var :cell v}]))))))
     :resource (when-let [u (host-resource (:name req))]
                 [{:kind :resource :url (str u)}])
     nil))
@@ -899,9 +909,10 @@
     (f)))
 
 (defmacro with-loader
-  "Evaluate `body` with `l` as the ambient loader. The binding is inherited by
-   threads and fibers started inside it, and survives a fiber parking and
-   resuming on another carrier."
+  "Evaluate `body` with `l` as the ambient loader. The binding conveys the way
+   a dynamic binding does — into futures, agents, go blocks and bound-fn'd
+   threads, not a bare Thread — and survives a fiber parking and resuming on
+   another carrier."
   [l & body]
   `(with-loader* ~l (fn [] ~@body)))
 
@@ -1122,14 +1133,21 @@
         :else nil))))
 
 ;; --- the context-carrying forms ------------------------------------------
-;; A compiled function keeps its defining context by calling these: the
-;; evaluation rewrites `(require …)`, `(resolve …)`, `(ns-resolve …)` and
-;; `(find-var …)` in source forms to the `__…-in` spelling below, carrying the
-;; id of the loader that owns the source. A quoted target of `resolve` or
-;; `find-var` is qualified with the defining namespace while the source is still
-;; data — at call time `*ns*` is the caller's, so leaving it bare would resolve
-;; in the wrong place. Linkage then follows the value, not the caller — what
-;; case 9 of the suite requires.
+;; A compiled function keeps its defining context by calling these: while a
+;; context's source is evaluated, the compiler's var-call hook
+;; (jolt.host/*invoke-rewrite*, bound by eval-namespace-source) rewrites a call
+;; through clojure.core's `require`, `use`, `refer`, `load`, `load-file`,
+;; `resolve`, `ns-resolve` or `find-var` to the `__…-in` spelling below,
+;; carrying the id of the loader that owns the source. The hook sees a call
+;; AFTER macro expansion and only when its head resolves to the var — a local
+;; named `resolve` (a promise callback) or a parameter named `load` is that
+;; local's call, a quoted form is data, and the `ns` form's own
+;; (clojure.core/require …) is a var call like any other — none of which a walk
+;; over the source forms could tell apart. A quoted target of `resolve` or
+;; `find-var` is qualified with the defining namespace while the form is still
+;; data: at call time *ns* is the caller's, so leaving it bare would resolve in
+;; the wrong place. Linkage then follows the value, not the caller — what case
+;; 9 of the suite requires.
 
 (def ^:private context-ops
   {'require '__require-in
@@ -1159,59 +1177,31 @@
     (list 'quote (symbol (str ns-name) (str (second arg))))
     arg))
 
-(defn- context-op
-  "The internal op FORM is a call to, or nil. Only the unqualified spelling —
-   `require`, or its qualified `clojure.core/require` — is rewritten; another
-   namespace's `require` is its own function."
-  [head]
-  (when (symbol? head)
-    (let [nm (name head)
-          ns (namespace head)]
-      (when (or (nil? ns) (= ns "clojure.core"))
-        (get context-ops (symbol nm))))))
+(defn- context-rewriter
+  "The var-call hook for a context's source: LOADER-ID owns it, NS-NAME is the
+   namespace it defines. The hook is handed the resolved var's namespace and
+   name and the call form, and answers the context-carrying form or nil.
 
-(defn- rewrite-context-ops
-  "Rewrite context-sensitive calls in FORM to carry LOADER-ID and the defining
-   NS-NAME. Quoted and var-quoted forms are data and stay as they are;
-   containers are walked so calls inside fn bodies are found. Metadata (source
-   positions) is kept."
-  [form loader-id ns-name]
-  (cond
-    (seq? form)
-    (if (or (contains? '#{quote var} (first form))
-            (contains? '#{clojure.core/quote clojure.core/var} (first form)))
-      form
-      (let [op (context-op (first form))
-            meta (meta form)
-            args (rest form)
-            args (if (contains? '#{__resolve-in __find-var-in} op)
-                   (map #(qualify-symbol % ns-name) args)
-                   args)]
-        (with-meta
-          (if op
+   The binding is dynamic, so it is also in force while a host namespace the
+   evaluation pulls in transitively compiles — a requiring-resolve at load
+   time, an :import of an unloaded deftype — and that code, which the AOT tee
+   captures, must stay the host's: a call is rewritten only while the compile
+   namespace is NS-NAME, which a transitive load's never is."
+  [loader-id ns-name]
+  (fn [var-ns var-name form]
+    (when (and (= "clojure.core" var-ns)
+               (= ns-name (str (clojure.core/ns-name *ns*))))
+      (when-let [op (get context-ops (symbol var-name))]
+        (let [args (rest form)
+              args (if (contains? '#{__resolve-in __find-var-in} op)
+                     (map #(qualify-symbol % ns-name) args)
+                     args)]
+          (with-meta
             (apply list
                    (concat [(symbol "jolt.loader" (name op)) (str loader-id)]
                            (when (contains? ns-carrying-ops op) [ns-name])
                            args))
-            (apply list (map #(rewrite-context-ops % loader-id ns-name) form)))
-          meta)))
-
-    (vector? form)
-    (with-meta (mapv #(rewrite-context-ops % loader-id ns-name) form) (meta form))
-
-    (map? form)
-    (with-meta (into (empty form)
-                     (map (fn [[k v]]
-                            [(rewrite-context-ops k loader-id ns-name)
-                             (rewrite-context-ops v loader-id ns-name)]))
-                     form)
-      (meta form))
-
-    (set? form)
-    (with-meta (into (empty form) (map #(rewrite-context-ops % loader-id ns-name) form))
-      (meta form))
-
-    :else form))
+            (meta form)))))))
 
 (defn- declares-data-readers?
   "Do L's own roots ship a data_readers.clj? (Its tags cannot work: the
@@ -1270,9 +1260,10 @@
           (mark-private! l ns-name))
         (try
           (try
-            (binding [*ns* *ns*]
+            (binding [*ns* *ns*
+                      jolt.host/*invoke-rewrite* (context-rewriter (:id l) ns-name)]
               (doseq [f forms]
-                (eval (rewrite-context-ops f (:id l) ns-name))))
+                (eval f)))
             (catch :default e
               ;; an unresolved #tag is the one failure the runtime reports as a
               ;; bare "cannot compile this value" — name the tag and the reason
@@ -1413,7 +1404,8 @@
           (preload-for! l ns-name dep reload?)
           (when-let [a (:as opts)] (alias-lib! ns-name lib a))
           (when-let [r (:refer opts)]
-            (refer-lib! ns-name lib (if (= :all r) {} {:only (vec r)}))))))
+            (refer-lib! ns-name lib (merge (select-keys opts [:exclude :rename])
+                                           (if (= :all r) {} {:only (vec r)})))))))
     nil))
 
 (defn __use-in

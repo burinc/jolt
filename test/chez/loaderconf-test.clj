@@ -621,6 +621,68 @@
       (chk "and its var links"
            (= :new ((val-of (l/resolve parent {:kind :var :name "libs/v"}))))))))
 
+;; --- 28. a local named after a context op is that local -----------------------
+;; The context-carrying rewrite is the compiler's, made where the compiler knows
+;; what a symbol names: a call is rewritten only when its head resolves to the
+;; clojure.core var. A promise-style callback pair binds `resolve`, a parameter
+;; can be called `load`, a let can bind `require` — each is that local's call.
+;; The source walk this replaced turned the first into an arity error, the
+;; second into a refused host-file load and the third into nil.
+(defcase 28 "a local named resolve, load or require is a local, not a context op"
+  (let [d (root-dir "shadow")]
+    (spit (str d "/libsh.clj")
+          (str "(ns libsh)\n"
+               "(defn run-then [f] (let [r (atom nil)]"
+               " (f (fn [v] (reset! r [:ok v])) (fn [e] (reset! r [:err e]))) @r))\n"
+               "(defn via-local [] (run-then (fn [resolve reject] (resolve 42))))\n"
+               "(defn total [load] (load 3))\n"
+               "(defn via-param [] (total (fn [x] (* x 2))))\n"
+               "(defn via-let [] (let [require (fn [x] (inc x))] (require 1)))\n"
+               "(defn own [] :own)\n"
+               "(defn via-var [] ((resolve 'own)))"))
+    (let [ctx (l/classpath [d] {:parent (l/root)})]
+      (l/load ctx {:kind :ns :name "libsh"})
+      (chk "a callback parameter named resolve is the callback"
+           (= [:ok 42] ((val-of (l/resolve ctx {:kind :var :name "libsh/via-local"})))))
+      (chk "a parameter named load is the parameter"
+           (= 6 ((val-of (l/resolve ctx {:kind :var :name "libsh/via-param"})))))
+      (chk "a let-bound require is the let binding"
+           (= 2 ((val-of (l/resolve ctx {:kind :var :name "libsh/via-let"})))))
+      (chk "and the var call next to them still resolves in the defining context"
+           (= :own ((val-of (l/resolve ctx {:kind :var :name "libsh/via-var"}))))))))
+
+;; --- 29. a host namespace pulled in at load time stays the host's ----------------
+;; The rewrite is bound around a context's evaluation, and a load can compile
+;; a HOST namespace inside that extent — requiring-resolve at the top level
+;; reaches the runtime's own loader, whose artifact the AOT cache keeps. That
+;; code must compile as the host's: a `require` in one of its fns aliases in
+;; the CALLER's namespace at call time, never in the context's (which is where
+;; the context-carrying form would put it).
+(defcase 29 "a host namespace compiled inside a context load is not rewritten"
+  (let [roots (jolt.host/source-roots)
+        host-dir (write! (root-dir "hosttrans") "libtrans.clj"
+                         (str "(ns libtrans)"
+                              " (defn r [] (require '[clojure.set :as transalias]) :done)"))]
+    (jolt.host/set-source-roots! (cons host-dir roots))
+    (try
+      (let [ctx (l/classpath [(write! (root-dir "hosttrans-app") "apptrans.clj"
+                                      (str "(ns apptrans)"
+                                           " (def rv (requiring-resolve 'libtrans/r))"))]
+                             {:parent (l/root)})]
+        (chk "the host does not have it loaded yet" (nil? (find-ns 'libtrans)))
+        (l/load ctx {:kind :ns :name "apptrans"})
+        (chk "the load pulled the host namespace in" (some? (find-ns 'libtrans)))
+        (chk "the host fn runs" (= :done (@(val-of (l/resolve ctx {:kind :var :name "apptrans/rv"})))))
+        (chk "its require aliased in the caller's namespace, as the host's does"
+             (some? (get (ns-aliases *ns*) 'transalias)))
+        (chk "and not in the context's namespace"
+             (nil? (get (ns-aliases 'apptrans) 'transalias)))
+        (l/unload! ctx))
+      (finally
+        (ns-unalias *ns* 'transalias)
+        (remove-ns 'libtrans)
+        (jolt.host/set-source-roots! roots)))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])
