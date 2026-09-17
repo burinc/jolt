@@ -1675,7 +1675,10 @@
 ;; once more — a regex-t isn't a jhost.
 (register-method-arm! arm-priority-regex
   (lambda (obj method-name rest-args)
-    (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
+   ;; receiver first, then the cheap conversion — see dot-forms.ss's arm
+   (if (not (or (regex-t? obj) (jolt-matcher? obj)))
+    'pass
+    (let ((rest (method-rest-args->list rest-args)))
       (cond
         ((regex-t? obj)
          (cond ((string=? method-name "split")
@@ -1727,7 +1730,7 @@
                   (if mm (irregex-match-end-index mm (if (pair? rest) (jnum->exact (car rest)) 0))
                       (jolt-matcher-no-match))))
                (else (dispatch-miss obj method-name rest))))
-        (else 'pass)))))
+        (else 'pass))))))
 
 ;; ---- def-var! the registry entry points so emit can also reach them ---------
 (def-var! "clojure.core" "host-static-ref" host-static-ref)

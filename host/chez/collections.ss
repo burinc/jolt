@@ -315,6 +315,35 @@
 
 (define empty-pvec (mk-pvec 0 pv-bits pv-empty-node (vector) #f))
 ;; build a trie pvec from a flat Scheme vector (the public constructor).
+;;
+;; Past the tail the trie is assembled BOTTOM-UP: the leaves are 32-element
+;; copies straight out of the source, each branch level groups the level below
+;; by 32, and the last 1..32 elements are the tail. That is exactly the shape
+;; conj would have produced one element at a time (dense-prefix branches, a
+;; partial last child at every level, the root growing a level per 32 children)
+;; — the transient gate pins the two equal at every boundary — but conj copied
+;; the tail on every element, so a 26k-element build allocated 5.5 MB for
+;; 210 KB of leaves and took 1 ms; this is ~12 bytes per element. vec, (apply
+;; vector …), mapv, into [] (persistent! hands its buffer here) and
+;; jolt-vector with many arguments all end in this call.
+(define (pv-build-trie v n)          ; n > pv-width -> (values root shift tail)
+  (let* ((tail-len (fx+ 1 (fxand (fx- n 1) pv-mask)))
+         (trie-n (fx- n tail-len))
+         (tail (vec-copy-range v trie-n n))
+         (nleaves (fxsra trie-n pv-bits))
+         (leaves (make-vector nleaves)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i nleaves))
+      (vector-set! leaves i (vec-copy-range v (fxsll i pv-bits) (fxsll (fx+ i 1) pv-bits))))
+    (let loop ((nodes leaves) (shift pv-bits))
+      (if (fx<=? (vector-length nodes) pv-width)
+          (values nodes shift tail)
+          (let* ((m (vector-length nodes))
+                 (k (fxsra (fx+ m pv-mask) pv-bits))
+                 (parents (make-vector k)))
+            (do ((j 0 (fx+ j 1))) ((fx=? j k))
+              (vector-set! parents j
+                (vec-copy-range nodes (fxsll j pv-bits) (fxmin m (fxsll (fx+ j 1) pv-bits)))))
+            (loop parents (fx+ shift pv-bits)))))))
 (define make-pvec
   (case-lambda
     ((v) (make-pvec v #f))
@@ -322,8 +351,8 @@
      (let ((n (vector-length v)))
        (if (fx<=? n pv-width)
            (mk-pvec n pv-bits pv-empty-node v ent)   ; fits in the tail
-           (let loop ((p empty-pvec) (i 0))
-             (if (fx=? i n) p (loop (pvec-conj p (vector-ref v i)) (fx+ i 1)))))))))
+           (let-values (((root shift tail) (pv-build-trie v n)))
+             (mk-pvec n shift root tail ent)))))))
 ;; materialize the trie back to a flat Scheme vector (compatibility for callers
 ;; that read the backing array — all one-shot conversions, not hot loops).
 (define (pvec-v p)

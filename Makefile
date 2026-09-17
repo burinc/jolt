@@ -166,7 +166,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -1049,6 +1049,16 @@ hostregistry:
 # loads made each foreign miss (and inspect/object) a 2 ms walk.
 foreignhandles:
 	@$(CHEZ) --script test/chez/foreign-handles-test.ss
+
+# An unhinted method call allocates its argument vector and at most one arg
+# list: no arm converts the rest args before testing the receiver.
+dispatchalloc:
+	@$(CHEZ) --script test/chez/method-dispatch-alloc-test.ss
+
+# A Matcher owns its match vector and source triple: repeated finds allocate
+# the result, not the machinery; .group reads the last match, none after a miss.
+regexmatcher:
+	@$(CHEZ) --script test/chez/regex-matcher-test.ss
 
 # java.io.File/getCanonicalPath's LEXICAL half, per platform (#991). On Windows
 # realpath(3) is not bound, so the fallback IS getCanonicalPath there — and its
