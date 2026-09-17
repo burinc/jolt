@@ -104,6 +104,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Vectors past 32 elements are built in bulk.** `make-pvec` conj'd one
+  element at a time past the tail, copying the tail each time: a 26k-element
+  vector cost 5.5 MB and 1 ms for 210 KB of leaves. The trie is assembled
+  bottom-up now — 9 bytes per element — and `vec`, `into []`, `(apply vector
+  …)`, `persistent!` and `jolt-vector` with many arguments all end there.
+  `conj!` had a single variadic signature that consed a rest list on the
+  two-argument call every transient build makes; it has fixed arities. With
+  both, the transient fold is the fastest way to build a vector at every size,
+  so `mapv` is Clojure's definition again (0.7 vs 1.6 µs over 32 elements,
+  0.9 vs 4.6 MB over 26k). The transient gate pins the bytes and that the bulk
+  build equals the conj build at every tail and root boundary.
+- **An unhinted method call no longer pays for the arms it passes through.**
+  The dotform, regex and host-type arms converted the argument vector to a
+  list (a seq walk) before testing whether the receiver was theirs, so a
+  2-argument `.region` on a Matcher allocated 576 bytes in dispatch alone.
+  Arms test the receiver first and convert straight from the vector's tail:
+  160 bytes, of which 128 is the call site's own argument vector.
+- **A Matcher owns its match state.** Each find allocated a fresh irregex
+  match vector, a source triple and a chunker pair before matching; the
+  matcher keeps one of each, reset per search (the triple updated in place
+  when the region moves), and the groups vector is built directly. Region +
+  find: 304 → 128 bytes group-free, 1184 → 784 capturing. `.group` still reads
+  the last match and a failed find leaves none, as on the JVM.
 - **A keyword-invoke site remembers the slot it hit.** `(:k m)` on an array
   map was `amap-index`'s identity scan — 6.4 ns at the first slot, 10.8 at the
   tenth — the same loop as `PersistentArrayMap.indexOf`. Every map one literal
