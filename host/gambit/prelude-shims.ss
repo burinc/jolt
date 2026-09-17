@@ -758,6 +758,10 @@
 ;; thunk runs. On Chez the scheduler reads it to refuse preempting a fiber that
 ;; holds a lock; this host has no fibers, so the count is kept and nothing
 ;; consults it.
+;; jolt-current-fiber: dyn-binding.ss tags each binding frame with its owner,
+;; the fiber running now or else the thread (dyn-owner). This host has no
+;; fibers, so the owner is always the thread.
+(define (jolt-current-fiber) #f)
 (define (jolt-locks-enter!) (set-virtual-register! 7 (+ 1 (virtual-register 7))))
 (define (jolt-locks-exit!) (set-virtual-register! 7 (- (virtual-register 7) 1)))
 
