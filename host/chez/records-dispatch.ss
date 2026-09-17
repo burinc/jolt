@@ -470,10 +470,33 @@
       ;; clojure.lang.Var: ns -> its Namespace, sym -> the simple-name Symbol.
       ;; clojure.spec.alpha's ->sym reads (.name (.ns v)) and (.sym v).
       ((var-cell? obj)
-       (cond ((string=? method-name "ns") (intern-ns! (var-cell-ns obj)))
-             ((or (string=? method-name "sym") (string=? method-name "name"))
+       ;; ns and sym are public final FIELDS of clojure.lang.Var, so the JVM reads
+       ;; each under BOTH spellings: (.ns v) through the Reflector's
+       ;; method-then-field fallback for a no-arg member, (.-ns v) as the field
+       ;; itself. Only these two take the dash — (.-getRawRoot v) is a field miss
+       ;; on the JVM, so every arm below stays bare-name only and a dashed
+       ;; spelling of one falls through to "No matching field found".
+       ;;
+       ;; `name` and `getName` are deliberately NOT here. They were jolt-only
+       ;; aliases for sym and toSymbol, and Clojure 1.12.5 answers neither —
+       ;; (.name v) and (.getName v) both raise "No matching field found", since
+       ;; Var is not Named and has no getName. Answering where the JVM refuses is
+       ;; the worse half of an interop gap: code written against jolt reads them
+       ;; and then breaks on the JVM, with nothing here to warn it. Both now fall
+       ;; through to dispatch-miss. Nothing reads them — each alias was made to
+       ;; log its receiver and every gate run over it, jolt and clojure.core and
+       ;; the corpus and the lib-conformance suites and the self-host, with no
+       ;; hit (jolt-ggd).
+       (cond ((or (string=? method-name "ns") (string=? method-name "-ns"))
+              (intern-ns! (var-cell-ns obj)))
+             ((or (string=? method-name "sym") (string=? method-name "-sym"))
               (jolt-symbol #f (var-cell-name obj)))
-             ((string=? method-name "getName")
+             ;; toSymbol is Var's own qualified name — Symbol.intern of ns.name
+             ;; and sym.name. SCI's IVar protocol names it, so an embedder
+             ;; extending IVar to clojure.lang.Var (the extension SCI expects a
+             ;; host to supply, on jolt exactly as on the JVM) can spell it the
+             ;; way it does there.
+             ((string=? method-name "toSymbol")
               (jolt-symbol (var-cell-ns obj) (var-cell-name obj)))
              ((string=? method-name "toString") (string-append "#'" (var-cell-ns obj) "/" (var-cell-name obj)))
              ;; getRawRoot is the ROOT value, past any thread binding — how
@@ -496,6 +519,15 @@
              ((string=? method-name "isPublic") (not (rd-var-meta-flag? obj "private")))
              ((string=? method-name "getTag") (rd-var-meta-get obj "tag"))
              ((or (string=? method-name "deref") (string=? method-name "get")) (var-cell-deref obj))
+             ;; getThreadBinding is the box the innermost thread binding lives in,
+             ;; or nil with none in place — the read deref does before falling
+             ;; back to the root. The box is opaque on the JVM (Var$TBox's thread
+             ;; and val fields are package-private, so .val / .-val raise there
+             ;; too), which leaves nil-vs-not, its class, and the fact that two
+             ;; reads of ONE binding are identical?. vars.ss owns the type,
+             ;; dyn-binding.ss the interning that gives it that identity.
+             ((and (string=? method-name "getThreadBinding") (null? rest))
+              (jolt-var-thread-binding obj))
              ;; setMacro sets the flag AND meta :macro, the pair alter-meta! keeps
              ;; together. bindRoot / alterRoot go through alter-var-root so the
              ;; validator and watches see the change; bindRoot also clears the
@@ -519,6 +551,36 @@
               jolt-nil)
              ((string=? method-name "alterRoot")
               (apply jolt-alter-var-root obj (car rest) (rd-args->list (cadr rest))))
+             ;; unbindRoot puts the root back to the var's Unbound marker — the
+             ;; state a bare (def x) leaves. hasRoot goes false and the root reads
+             ;; back as clojure.lang.Var$Unbound, which is what ns-unmap already
+             ;; writes through the same pair of calls.
+             ((and (string=? method-name "unbindRoot") (null? rest))
+              (var-root-set! obj (make-jolt-var-unbound (var-cell-ns obj) (var-cell-name obj)))
+              jolt-nil)
+             ;; set is Var.set: the innermost THREAD binding and never the root.
+             ;; jolt-set-var! is the one write path already behind the set!
+             ;; special form and var-set — validator first, then the binding
+             ;; lookup — so with no binding in place this throws "Can't
+             ;; change/establish root binding of: x with set", as Var.set does.
+             ((and (string=? method-name "set") (pair? rest))
+              (jolt-set-var! obj (car rest)))
+             ;; fn is (IFn) deref(). IFn is what clojure.core/ifn? answers — a
+             ;; fn, a keyword, a symbol, a map, a set, a vector, a var, a
+             ;; callable host object, a deftype with invoke — so a var holding
+             ;; a keyword hands the keyword back, as on the JVM (fn? alone
+             ;; refused it). The cast is the observable half: anything else
+             ;; reports a ClassCastException naming the value's class rather
+             ;; than handing back a value the caller then fails to invoke.
+             ((and (string=? method-name "fn") (null? rest))
+              (let ((v (var-cell-deref obj)))
+                (if (jolt-truthy? (jolt-invoke1 (var-deref "clojure.core" "ifn?") v))
+                    v
+                    (jolt-throw
+                     (jolt-host-throwable
+                      "java.lang.ClassCastException"
+                      (string-append "class " (guard (c (#t "?")) (jolt-class-name v))
+                                     " cannot be cast to class clojure.lang.IFn"))))))
              (else (dispatch-miss obj method-name rest))))
       ;; java.lang.Throwable interop over a Chez condition. A jolt host error
       ;; (`error`/`assertion-violationf`) raises a Chez condition; Clojure code

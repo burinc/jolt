@@ -59,11 +59,16 @@
 ;; --- the probe vars ----------------------------------------------------------
 ;; Real interned cells marked ^:dynamic, so push goes through the same validation
 ;; the product does. Named apart from anything the runtime binds itself.
+;; Through set-var-meta!, the path (def ^:dynamic x) takes, and not a bare
+;; var-cell-meta-set!: a push binds on the cell's dynamic FLAG, which that path
+;; sets beside the metadata, so a cell stamped with the metadata alone refuses
+;; to bind ("Can't dynamically bind non-dynamic var") and the whole bench dies
+;; at its first frame.
 (define dyn-meta (jolt-hash-map (keyword #f "dynamic") #t))
 (define (probe-var i)
-  (let ((c (jolt-var "bench.dyn" (string-append "*p" (number->string i) "*"))))
-    (var-cell-meta-set! c dyn-meta)
-    c))
+  (let ((name (string-append "*p" (number->string i) "*")))
+    (set-var-meta! "bench.dyn" name dyn-meta)
+    (jolt-var "bench.dyn" name)))
 (define probes (let loop ((i 0) (acc '()))
                  (if (fx=? i 64) (reverse acc) (loop (fx+ i 1) (cons (probe-var i) acc)))))
 (define (nth-probe i) (list-ref probes i))

@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The rest of `clojure.lang.Var`'s instance surface: `toSymbol`, `unbindRoot`,
+  `set`, `fn`, and the `ns` / `sym` FIELD spellings.** The var shim answered
+  eighteen members but not these, so each raised "No matching field found" — and
+  the one that mattered is `toSymbol`, because SCI's `IVar` protocol names it.
+  Neither SCI nor the JVM extends `IVar` to `clojure.lang.Var`, so an embedder
+  sharing a host var has to supply that extension itself; on the JVM it is seven
+  lines of `clojure.lang.Var` methods, and on jolt it did not compile, leaving
+  the embedder nothing to write. `ns` and `sym` are public final fields there,
+  so the JVM reads each as both `(.ns v)` and `(.-ns v)`; jolt answered only the
+  no-arg member. They now take the dash and nothing else on `Var` does — a
+  dashed spelling of a method is a field read, and the JVM's reflector has no
+  such field. `set` routes through the same one write path as `set!` and
+  `var-set` (validator first, thread binding only, "Can't change/establish root
+  binding" with none in place), `unbindRoot` puts the root back to the var's
+  `Unbound` marker through the pair of calls `ns-unmap` already used, and `fn`
+  is `deref` cast to `IFn`, so a var holding a non-fn reports the cast rather
+  than handing back a value the caller then fails to invoke. Seven corpus rows
+  certify the surface against Clojure 1.12.5.
+
+  This does NOT make a host protocol copied into SCI as-is work, and the
+  `scifunctional` rows that pin that refusal (jolt#1006) are unchanged: with
+  `IVar` extended, `alter-var-root` gets past `getRawRoot` and the copied-as-is
+  protocol dies one seam later at `Unable to resolve symbol`, which is
+  byte-for-byte what Clojure 1.12.5 raises for the same program. The gate pins
+  that second seam next to the first. The supported path for sharing a host
+  protocol remains the multimethod recipe beside them. (#1031)
+
+- **`Var.getThreadBinding`, and the `clojure.lang.Var$TBox` it answers with.**
+  The last member of the var surface above, left out of it because it is the
+  only one that needed a value type. It hands back the box the innermost thread
+  binding lives in, or `nil` with none in place. The box is deliberately opaque:
+  `Var$TBox`'s `thread` and `val` fields are package-private on the JVM, so
+  `(.val b)` raises "No matching field found" there and now here too, and the
+  only reads are nil-vs-not, `(class b)`, and identity. Identity is the part
+  worth having — on the JVM the frame IS a map of var to box, so two reads
+  inside one `binding` are `identical?`, a read from an inner frame is not, and
+  a `set!` through the var leaves the box the same object. jolt's frame entry is
+  a mutable pair with exactly that lifetime, so the box is interned off the pair
+  rather than built per call. The interning is lazy and behind a mutex, and
+  nothing in jolt or `clojure.core` calls `getThreadBinding`, so a binding
+  nobody asks about never allocates one and `binding` itself is untouched. Six
+  corpus rows certify it against Clojure 1.12.5. (jolt-3ss)
+
 - **`Object.wait`, `.notify` and `.notifyAll`, on every object.** `locking` was
   already a real per-object monitor — reentrant, fiber-aware, shared with
   `monitor-enter` — but the condition-variable half of that monitor was in no host
@@ -80,6 +123,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thread's allocation area one 16 KB segment at a time under a global mutex.
 
 ### Fixed
+
+- **`set!` on a conveyed binding is refused, as `Var.set` refuses it.** A
+  binding frame now records who pushed it — the fiber running there, else the
+  thread, which is what `Var$TBox.thread` holds — and `set!` / `var-set` /
+  `.set` on a binding the current thread did not push raise "Can't set!: x from
+  non-binding thread". Conveyance shares the parent's frames (a future, an agent
+  action and a go block restore the same pairs, exactly as `Frame.clone` shares
+  the JVM's boxes), so before this a future's `set!` wrote straight into the
+  parent's binding, on the parent's thread, with nothing between them; the
+  parent then read the child's value. A body that needs its own copy pushes one
+  (`binding`, `bound-fn`, `with-bindings`) and may `set!` that, as on the JVM.
+  Seven certified corpus rows.
+
+- **`Thread.start` and an `ExecutorService` task begin with no thread
+  bindings.** Both restored the caller's binding stack into the new thread, so
+  `(binding [*v* 2] (.start (Thread. #(… *v*))))` read 2 where the JVM reads the
+  root; only `future`, `send`, `pmap`, `bound-fn` and core.async convey there,
+  through `binding-conveyor-fn`, and those shims still do. Chez hands a forked
+  thread the forking thread's parameter values, so the empty stack is installed
+  explicitly. Five certified corpus rows say which is which.
+
+- **`(.fn v)` on a var answers any `IFn`, not only a fn.** `Var.fn` is
+  `(IFn) deref()`, and a keyword, symbol, map, set or vector is an `IFn`; the
+  arm tested `fn?` and threw the cast for all of them. It now asks
+  `clojure.core/ifn?`, and the cast it throws for anything else names the
+  value's class, as the JVM's does.
 
 - **Windows: an absolute FILE argument is no longer read as project-relative.**
   `file-arg` recognized one absolute spelling — a leading `/` — so `jolt
@@ -267,6 +336,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call-position macros that need one.
 
 ### Changed
+
+- **`(.getName v)` and `(.name v)` on a var now raise, as they do on the JVM.**
+  Both were jolt-only aliases — `getName` for `toSymbol`, `name` for `sym` —
+  and Clojure 1.12.5 answers neither: `clojure.lang.Var` is not `Named` and has
+  no `getName`, so both are "No matching field found" there. Answering where
+  the reference refuses is the worse half of an interop gap, because code
+  written against jolt reads them and then breaks on the JVM with nothing here
+  to have warned it, and the two spellings the JVM does have (`toSymbol` and
+  `.sym`) are both answered. Before removing them each alias was made to log
+  its receiver and every gate run over it — corpus, unit, values, smoke,
+  `scifunctional`, the lib-conformance suites and the self-host — with no hit,
+  so nothing in jolt, `clojure.core` or the vendored libraries reads either.
+  `(name v)` and `(symbol v)`, the portable spellings, are unaffected.
+  (jolt-ggd)
 
 - **`satisfies?` memoizes its extended walk.** For a value that is not a record
   implementing the protocol inline, `satisfies?` walked every tag of the value's
