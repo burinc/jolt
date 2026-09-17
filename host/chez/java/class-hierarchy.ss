@@ -1000,6 +1000,28 @@
 (jch-register-supers! "java.util.concurrent.FutureTask"
                       '("java.util.concurrent.RunnableFuture"
                         "java.util.concurrent.Future" "java.lang.Runnable"))
+;; The scheduled half (concurrency.ss, jolt-hgjo): the two scheduled factories
+;; and the ScheduledThreadPoolExecutor ctor answer a pool that is a
+;; ThreadPoolExecutor AND a ScheduledExecutorService, and what its schedule
+;; methods hand back is the JVM's own nested ScheduledFutureTask — a FutureTask
+;; that is also a Delayed (so Comparable) ScheduledFuture.
+(jch-register-supers! "java.util.concurrent.ScheduledExecutorService"
+                      '("java.util.concurrent.ExecutorService"))
+(jch-mark-interface! "java.util.concurrent.ScheduledExecutorService")
+(jch-register-supers! "java.util.concurrent.ScheduledThreadPoolExecutor"
+                      '("java.util.concurrent.ThreadPoolExecutor"
+                        "java.util.concurrent.ScheduledExecutorService"))
+(jch-register-supers! "java.util.concurrent.Delayed" '("java.lang.Comparable"))
+(jch-mark-interface! "java.util.concurrent.Delayed")
+(jch-register-supers! "java.util.concurrent.ScheduledFuture"
+                      '("java.util.concurrent.Delayed" "java.util.concurrent.Future"))
+(jch-mark-interface! "java.util.concurrent.ScheduledFuture")
+(jch-register-supers! "java.util.concurrent.RunnableScheduledFuture"
+                      '("java.util.concurrent.RunnableFuture" "java.util.concurrent.ScheduledFuture"))
+(jch-mark-interface! "java.util.concurrent.RunnableScheduledFuture")
+(jch-register-supers! "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask"
+                      '("java.util.concurrent.FutureTask"
+                        "java.util.concurrent.RunnableScheduledFuture"))
 ;; locks, latches and the four atomics. Every one of these had a shim with
 ;; methods and NO class row, so (class x) answered the :object placeholder and
 ;; (instance? java.util.concurrent.locks.Lock a-reentrant-lock) was false.
@@ -1116,6 +1138,8 @@
     ;; models, which is why two tags share one FQN here (as the writer tags do).
     ("executor-service" . "java.util.concurrent.ThreadPoolExecutor")
     ("j-future" . "java.util.concurrent.FutureTask")
+    ("scheduled-executor" . "java.util.concurrent.ScheduledThreadPoolExecutor")
+    ("scheduled-future" . "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask")
     ("instant" . "java.time.Instant")
     ("local-date" . "java.time.LocalDate")
     ("local-time" . "java.time.LocalTime")

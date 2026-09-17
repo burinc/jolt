@@ -216,9 +216,7 @@
 ;; by the host (String/CASE_INSENSITIVE_ORDER) rather than by a deftype/reify.
 (set! jhost-compare-method?
   (lambda (x)
-    (and (jhost? x)
-         (let ((h (hashtable-ref host-methods-tbl (jhost-tag x) #f)))
-           (and h (hashtable-ref h "compare" #f) #t)))))
+    (and (jhost? x) (host-method-ref (jhost-tag x) "compare") #t)))
 
 ;; Point a second tag at an existing tag's method table, sharing the table itself
 ;; rather than copying it. A shim that differs from another ONLY in the class it
@@ -230,6 +228,37 @@
   (let ((h (or (hashtable-ref host-methods-tbl from #f)
                (error 'alias-host-methods! "no methods registered for tag" from))))
     (hashtable-set! host-methods-tbl tag h)))
+
+;; A tag whose class EXTENDS another shim's class — ScheduledThreadPoolExecutor
+;; over ThreadPoolExecutor — answers every member the parent tag answers plus its
+;; own. It is neither an alias (the members differ) nor a copy: a copy freezes the
+;; parent's table as it stood when the copy was taken, so a member registered on
+;; the parent afterwards reaches one tag and not the other, which is the drift
+;; alias-host-methods! is written to prevent. The child keeps a table of its own
+;; and names its parent, and host-method-ref walks the chain on a MISS only, so a
+;; hit on the tag's own table costs what it always did.
+(define host-methods-parent (make-hashtable string-hash string=?))   ; tag -> parent tag
+(define (derive-host-methods! tag from members)
+  (unless (hashtable-ref host-methods-tbl from #f)
+    (error 'derive-host-methods! "no methods registered for tag" from))
+  (hashtable-set! host-methods-parent tag from)
+  (register-host-methods! tag members))
+;; The member NAME resolves to on TAG — its own table first, then each parent's —
+;; or #f.
+(define (host-method-ref tag name)
+  (let loop ((tag tag))
+    (and tag
+         (let ((h (hashtable-ref host-methods-tbl tag #f)))
+           (or (and h (hashtable-ref h name #f))
+               (loop (hashtable-ref host-methods-parent tag #f)))))))
+;; Every method table TAG answers from, its own first: the reflection walk
+;; (natives-array.ss) lists a class's members from these.
+(define (host-method-tables tag)
+  (let loop ((tag tag) (acc '()))
+    (if tag
+        (loop (hashtable-ref host-methods-parent tag #f)
+              (let ((h (hashtable-ref host-methods-tbl tag #f))) (if h (cons h acc) acc)))
+        (reverse acc))))
 
 (define (lookup-class h-tbl name)
   (or (hashtable-ref h-tbl name #f)
@@ -273,8 +302,7 @@
   (lambda (obj method-name rest-args)
     (cond
       ((jhost? obj)
-       (let* ((mh (hashtable-ref host-methods-tbl (jhost-tag obj) #f))
-              (f (and mh (hashtable-ref mh method-name #f)))
+       (let* ((f (host-method-ref (jhost-tag obj) method-name))
               (args (if (jolt-nil? rest-args) '() (seq->list rest-args))))
          (cond
            ;; A member whose arities do not include this one is not this member:

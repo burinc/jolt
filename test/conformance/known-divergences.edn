@@ -82,6 +82,31 @@
   ;; (protocols.ss protocol-resolve), so there is no name to report and no Class
   ;; to hand back. Reporting a name for a class that does not exist would just
   ;; move the failure from a nil key to a ClassNotFoundException.
+  ;; The scheduled pools (jolt-hgjo). Three class-model details of
+  ;; java.util.concurrent.ScheduledThreadPoolExecutor that jolt does not
+  ;; reproduce; the schedule methods' behaviour is certified by the corpus rows
+  ;; under "interop / scheduled executor".
+  {:category :host-model
+   :behavior "getMaximumPoolSize of a scheduled pool"
+   :jvm "Integer.MAX_VALUE — newScheduledThreadPool passes it, though the pool never grows past core because its queue is unbounded"
+   :jolt "the core size — the scheduled pool is a fixed pool of n workers, which is the JVM's behaviour with the number it reports for it"
+   :check {:expr "(let [ex (java.util.concurrent.Executors/newScheduledThreadPool 2)] (try (.getMaximumPoolSize ex) (finally (.shutdown ex))))"
+           :jvm "2147483647"
+           :jolt "2"}}
+  {:category :host-model
+   :behavior "(class (Executors/newSingleThreadScheduledExecutor))"
+   :jvm "java.util.concurrent.Executors$DelegatedScheduledExecutorService — a private wrapper that hides the pool's configuration methods"
+   :jolt "java.util.concurrent.ScheduledThreadPoolExecutor — the pool itself, as newSingleThreadExecutor already reports ThreadPoolExecutor rather than its own private wrapper"
+   :check {:expr "(let [ex (java.util.concurrent.Executors/newSingleThreadScheduledExecutor)] (try (.getName (class ex)) (finally (.shutdown ex))))"
+           :jvm "\"java.util.concurrent.Executors$DelegatedScheduledExecutorService\""
+           :jolt "\"java.util.concurrent.ScheduledThreadPoolExecutor\""}}
+  {:category :host-model
+   :behavior "(class (.submit scheduled-pool f))"
+   :jvm "ScheduledThreadPoolExecutor$ScheduledFutureTask — submit and execute on a scheduled pool are schedule with a zero delay, so every task goes through the delay queue"
+   :jolt "FutureTask — an immediate task takes the pool's FIFO queue (O(1)) rather than the due-ordered list; only the three schedule methods hand back a ScheduledFutureTask. invokeAll's futures are plain FutureTasks on both."
+   :check {:expr "(let [ex (java.util.concurrent.Executors/newScheduledThreadPool 1)] (try (.getName (class (.submit ex ^java.util.concurrent.Callable (fn [] 1)))) (finally (.shutdown ex))))"
+           :jvm "\"java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask\""
+           :jolt "\"java.util.concurrent.FutureTask\""}}
   {:category :host-model
    :behavior "(contains? P :on) / :on-interface / :method-builders on a protocol value"
    :jvm "true — defprotocol also generates the interface my.ns.P, and these three keys describe it"

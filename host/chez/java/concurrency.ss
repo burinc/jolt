@@ -1969,10 +1969,13 @@
         (cons "cancel" (lambda (self . _) (j-future-cancel! self)))))
 ;; executor-service state: #(shutdown? queue-box queue-mutex task-cond
 ;; live-workers advisory-queue-capacity core-workers max-workers keep-alive-ms
-;; idle-workers queue-depth term-cond starting-workers) — the capacity is #f
-;; except for a ThreadPoolExecutor built with an ArrayBlockingQueue; .getQueue's
-;; view subtracts the live depth from it. starting-workers is the forked-but-not-
-;; yet-arrived count the growth rule adds to idle-workers; see it for why.
+;; idle-workers queue-depth term-cond starting-workers delayed lead seq) — the
+;; capacity is #f except for a ThreadPoolExecutor built with an ArrayBlockingQueue;
+;; .getQueue's view subtracts the live depth from it. starting-workers is the
+;; forked-but-not-yet-arrived count the growth rule adds to idle-workers; see it
+;; for why. The last three belong to the scheduled pools (further down): the
+;; delayed tasks in due order, the token of the idle worker timing the head of
+;; that list, and the submission counter that orders equal due times.
 ;;
 ;; TWO CONDITIONS, one mutex. task-cond carries "a task is queued, or the pool is
 ;; shutting down" to the WORKERS, which are threads; term-cond carries "shut down
@@ -2026,10 +2029,11 @@
 ;; way, which is why the test is a depth against a count rather than a handoff.
 (define executor-unbounded-workers 2147483647)   ; Integer.MAX_VALUE, as the JVM passes
 (define cached-pool-keep-alive-ms 60000)         ; 60L, TimeUnit.SECONDS, as the JVM passes
-(define (make-executor* core-n max-n keep-alive-ms cap)
-  (let ((self (make-jhost "executor-service"
+(define (make-executor* tag core-n max-n keep-alive-ms cap)
+  (let ((self (make-jhost tag
                           (vector #f (box (cons '() '())) (make-mutex) (make-condition) 0
-                                  cap core-n max-n keep-alive-ms 0 0 (make-condition) 0))))
+                                  cap core-n max-n keep-alive-ms 0 0 (make-condition) 0
+                                  '() #f 0))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -2043,10 +2047,16 @@
 ;; A fixed pool: n eager workers that never retire, and the advisory capacity a
 ;; ThreadPoolExecutor's queue argument contributes to .getQueue's view.
 (define (make-executor n-workers . cap)
-  (make-executor* n-workers n-workers #f (if (null? cap) #f (car cap))))
+  (make-executor* "executor-service" n-workers n-workers #f (if (null? cap) #f (car cap))))
 ;; newCachedThreadPool / newVirtualThreadPerTaskExecutor.
 (define (make-cached-executor)
-  (make-executor* 0 executor-unbounded-workers cached-pool-keep-alive-ms #f))
+  (make-executor* "executor-service" 0 executor-unbounded-workers cached-pool-keep-alive-ms #f))
+;; newScheduledThreadPool / newSingleThreadScheduledExecutor / the
+;; ScheduledThreadPoolExecutor ctor: a fixed pool (the JVM's grows to
+;; Integer.MAX_VALUE on paper and never does in practice, its queue being
+;; unbounded) whose tag adds the three schedule methods.
+(define (make-scheduled-executor n-workers)
+  (make-executor* "scheduled-executor" n-workers n-workers #f #f))
 
 ;; Claim a worker slot, or answer #f because the pool is at max. Called with the
 ;; queue mutex HELD, and the slot is claimed BEFORE the fork rather than counted
@@ -2093,17 +2103,44 @@
       (set-car! q (cdr out))
       (vector-set! st 10 (fx- (vector-ref st 10) 1))
       (car out))))
-;; Park until something changes: a task arrives, the pool shuts down, or (for a
-;; worker above core) the keep-alive deadline passes. The idle count is raised
-;; before the wait releases the mutex and dropped after it retakes it, so the
-;; growth test in executor-enqueue! sees exactly the workers that are available
-;; to take a task.
-(define (executor-idle-wait! st abs-time)
-  (vector-set! st 9 (fx+ (vector-ref st 9) 1))
-  (if abs-time
-      (jolt-condition-wait (vector-ref st 3) (vector-ref st 2) abs-time)
-      (jolt-condition-wait (vector-ref st 3) (vector-ref st 2)))
-  (vector-set! st 9 (fx- (vector-ref st 9) 1)))
+;; Park until something changes: a task arrives, the pool shuts down, a delayed
+;; task comes due, or (for a worker above core) the keep-alive deadline DL (epoch
+;; ms, or #f) passes. The idle count is raised before the wait releases the mutex
+;; and dropped after it retakes it, so the growth test in executor-enqueue! sees
+;; exactly the workers that are available to take a task.
+;;
+;; ONE LEADER times the delayed head; the rest wait untimed. With every idle worker
+;; timing it, a due task woke all of them for the one that takes it — the herd the
+;; two conditions above exist to avoid, once per due time. This is the JVM's own
+;; DelayedWorkQueue leader/follower: the first idle worker to find the head
+;; unclaimed claims it (st 14 holds its token) and waits until the head is due;
+;; every later one, seeing a leader, waits for a signal. The claim is released on
+;; the way out ONLY IF IT IS STILL THIS WORKER'S — a schedule that landed an
+;; earlier head demoted the leader (executor-delayed-add!) and signalled a
+;; replacement, and that replacement's claim must not be cleared by the stale
+;; leader waking on the deadline it was timing.
+(define (executor-idle-wait! st dl)
+  (let* ((head (executor-delayed-head st))
+         (token (and head (not (vector-ref st 14)) (list 'lead)))
+         (wake (cond ((not token) dl)
+                     ((and dl (< dl (sf-due head))) dl)
+                     (else (sf-due head)))))
+    (when token (vector-set! st 14 token))
+    (vector-set! st 9 (fx+ (vector-ref st 9) 1))
+    (if wake
+        (jolt-condition-wait (vector-ref st 3) (vector-ref st 2) (jolt-millis->time wake))
+        (jolt-condition-wait (vector-ref st 3) (vector-ref st 2)))
+    (vector-set! st 9 (fx- (vector-ref st 9) 1))
+    (when (and token (eq? (vector-ref st 14) token)) (vector-set! st 14 #f))))
+;; With the mutex held, by a worker leaving the idle set for a job or for good: if
+;; delayed tasks remain with nobody timing the head, hand the timed wait to one
+;; parked worker. The signalled worker re-polls, finds the head unclaimed and
+;; claims it; signalling with nobody parked would be a wake nobody hears, and the
+;; next worker to finish its job claims the head on its own way through
+;; executor-take-job!.
+(define (executor-lead-handoff! st)
+  (when (and (pair? (vector-ref st 13)) (not (vector-ref st 14)) (fx>? (vector-ref st 9) 0))
+    (jolt-cv-signal-one! (vector-ref st 3))))
 ;; Leave the pool: drop out of the live count and announce it, since
 ;; awaitTermination waits on exactly this reaching zero. Answers #f, the "no job,
 ;; you are done" answer executor-take-job! returns.
@@ -2119,6 +2156,7 @@
 ;; wake sends it back to the queue), one after sees the count without it.
 (define (executor-worker-exit! st)
   (vector-set! st 4 (fx- (vector-ref st 4) 1))
+  (executor-lead-handoff! st)
   ;; Announced on term-cond only, and only to a waiter that can care: what
   ;; awaitTermination waits for is live 0 with the pool shut down, so a keep-alive
   ;; retirement in a RUNNING pool wakes nobody at all. (isTerminated polls.)
@@ -2128,7 +2166,11 @@
 ;; The next task for this worker, or #f meaning it has exited — because the pool
 ;; is shut down and drained, or because this worker is above core and has been
 ;; idle for keep-alive. Runs with the mutex held, and only ever exits with the
-;; queue empty, so no task is left with nobody to run it.
+;; queue empty, so no task is left with nobody to run it. Drained means BOTH
+;; queues: a delayed one-shot still runs after shutdown (the JVM's default
+;; executeExistingDelayedTasksAfterShutdownPolicy), so a worker waits out its
+;; delay rather than leaving it behind; shutdown has already dropped the periodic
+;; tasks, which are the ones that would otherwise keep the pool alive forever.
 ;;
 ;; The keep-alive deadline is absolute and survives the loop, so a broadcast that
 ;; woke every idle worker for one task resumes the losers waiting for what is LEFT
@@ -2136,13 +2178,19 @@
 ;; the waits above carry deadlines rather than durations.
 (define (executor-take-job! st)
   (let poll ((deadline #f))
-    (cond ((fx>? (vector-ref st 10) 0) (executor-dequeue! st))
-          ((vector-ref st 0) (executor-worker-exit! st))   ; shutdown + drained
+    (cond ((fx>? (vector-ref st 10) 0) (executor-lead-handoff! st) (executor-dequeue! st))
+          ((executor-delayed-due? st)                      ; the head's time has come
+           (let ((sf (executor-delayed-pop! st)))
+             (executor-lead-handoff! st)
+             (lambda () (dyn-binding-stack '())          ; no conveyance, as submit
+                        (scheduled-future-run! sf st))))
+          ((and (vector-ref st 0) (null? (vector-ref st 13)))
+           (executor-worker-exit! st))                     ; shutdown + drained
           ((and (vector-ref st 8) (fx>? (vector-ref st 4) (vector-ref st 6)))
            (let ((dl (or deadline (+ (now-millis) (vector-ref st 8)))))
              (if (>= (now-millis) dl)
                  (executor-worker-exit! st)                ; idle past keep-alive
-                 (begin (executor-idle-wait! st (jolt-millis->time dl))
+                 (begin (executor-idle-wait! st dl)
                         (poll dl)))))
           (else (executor-idle-wait! st #f) (poll deadline)))))
 ;; A worker that dies must not take the pool's accounting with it. Everything a
@@ -2181,11 +2229,21 @@
                      (executor-take-job! st))))
           (when job (job) (loop)))))))
 
-;; shutdown: stop accepting, let what is queued drain.
+;; shutdown: stop accepting, let what is queued drain — the delayed one-shots
+;; included, which the workers wait out (executor-take-job!). The periodic tasks
+;; are cancelled and dropped here, as ScheduledThreadPoolExecutor.onShutdown does
+;; under its default policies, and so are the entries a cancel already settled:
+;; the JVM leaves a cancelled entry in the queue until then (removeOnCancel is off
+;; by default), and a pool that waited out a cancelled task's whole delay before
+;; it could terminate would be waiting for nothing.
 (define (executor-shutdown! st)
   (vector-set! st 0 #t)
   (jolt-with-mutex (vector-ref st 2)
-    (jolt-cv-wake! (vector-ref st 3))       ; every idle worker: leave
+    (let ((delayed (vector-ref st 13)))
+      (unless (null? delayed)
+        (for-each (lambda (sf) (when (sf-periodic? sf) (j-future-cancel! sf))) delayed)
+        (vector-set! st 13 (filter (lambda (sf) (not (sf-settled? sf))) delayed))))
+    (jolt-cv-wake! (vector-ref st 3))       ; every idle worker: leave, or re-time the head
     (jolt-cv-wake! (vector-ref st 11))))    ; awaitTermination: re-read the flag
 
 ;; shutdownNow: stop accepting AND drop what is queued, answering the dropped
@@ -2217,7 +2275,12 @@
 (define (executor-shutdown-now! st)
   (vector-set! st 0 #t)
   (let ((dropped (jolt-with-mutex (vector-ref st 2)
-                   (let ((jobs (executor-drain-queue! st)))
+                   ;; the delayed tasks come back too, in due order after the
+                   ;; immediate ones, and come back AS THEY ARE — the JVM hands the
+                   ;; ScheduledFutureTasks over neither cancelled nor done, and each
+                   ;; still answers .run.
+                   (let ((jobs (append (executor-drain-queue! st) (vector-ref st 13))))
+                     (vector-set! st 13 '())
                      (jolt-cv-wake! (vector-ref st 3))
                      (jolt-cv-wake! (vector-ref st 11))
                      jobs))))
@@ -2320,6 +2383,12 @@
       (else (void)))))
 (let ((single (lambda _ (make-executor 1)))
       (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
+      ;; the two scheduled factories: the same fixed pools under the tag that
+      ;; answers schedule (jolt-hgjo). newSingleThreadScheduledExecutor's class
+      ;; is a private delegating wrapper on the JVM, which jolt does not model —
+      ;; it reports the pool it wraps, as newSingleThreadExecutor already does.
+      (scheduled-single (lambda _ (make-scheduled-executor 1)))
+      (scheduled-fixed  (lambda (n . _) (make-scheduled-executor (max 1 (jnum->exact n)))))
       ;; cached / virtual-thread-per-task: the two factories that are UNBOUNDED on
       ;; the JVM. A cached pool is (0, Integer.MAX_VALUE, 60s, SynchronousQueue)
       ;; there, and a virtual thread per task is a thread per task with no pool at
@@ -2347,8 +2416,8 @@
       (stealing (lambda _ (make-executor 32))))
   (for-each (lambda (nm) (register-class-statics! nm
               (list (cons "newSingleThreadExecutor" single)
-                    (cons "newSingleThreadScheduledExecutor" single)
-                    (cons "newFixedThreadPool" fixed) (cons "newScheduledThreadPool" fixed)
+                    (cons "newSingleThreadScheduledExecutor" scheduled-single)
+                    (cons "newFixedThreadPool" fixed) (cons "newScheduledThreadPool" scheduled-fixed)
                     (cons "newVirtualThreadPerTaskExecutor" cached)
                     (cons "newCachedThreadPool" cached) (cons "newWorkStealingPool" stealing))))
             '("Executors" "java.util.concurrent.Executors")))
@@ -2461,7 +2530,8 @@
           jolt-nil))
         (cons "isShutdown" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isTerminated" (lambda (self) (let ((st (jhost-state self)))
-          (and (vector-ref st 0) (fx=? 0 (vector-ref st 10)) (fx=? 0 (vector-ref st 4))))))
+          (and (vector-ref st 0) (fx=? 0 (vector-ref st 10)) (null? (vector-ref st 13))
+               (fx=? 0 (vector-ref st 4))))))
         ;; (timeout, unit) on the JVM. The unit used to be dropped and the amount read
         ;; as milliseconds outright, so (.awaitTermination ex 5 TimeUnit/SECONDS)
         ;; waited five MILLISECONDS and reported the pool still running.
@@ -2677,6 +2747,7 @@
   (let ((tag (jhost-tag x)))
     (cond ((string=? tag "future-task") future-task-get*)
           ((string=? tag "j-future") j-future-get*)
+          ((string=? tag "scheduled-future") j-future-get*)   ; the same five slots (below)
           (else #f))))
 (register-host-methods! "future-task"
   (list (cons "run" (lambda (self) (future-task-run! self)))
@@ -2721,7 +2792,7 @@
                      ;; keepAlive of 0 is the JVM's "retire the moment you are
                      ;; idle" and stays 0.
                      (keep (and (>= (length rest) 2) (tu->ms (car rest) (cadr rest)))))
-                (make-executor* core-n max-n keep
+                (make-executor* "executor-service" core-n max-n keep
                                 (and q (vector-ref (jhost-state q) 0)))))))
           '("ThreadPoolExecutor" "java.util.concurrent.ThreadPoolExecutor"))
 ;; .getQueue answers a live VIEW of the executor's internal queue — size reads
@@ -2729,7 +2800,8 @@
 ;; (Integer/MAX_VALUE without one). Honest for monitoring; not the caller's
 ;; ArrayBlockingQueue instance, which the executor does not use.
 (define (executor-queue-depth ex)
-  (vector-ref (jhost-state ex) 10))
+  (let ((st (jhost-state ex)))
+    (fx+ (vector-ref st 10) (length (vector-ref st 13)))))   ; the delayed tasks are queued too
 (register-host-methods! "executor-queue-view"
   (list (cons "size" (lambda (self) (executor-queue-depth (vector-ref (jhost-state self) 0))))
         (cons "isEmpty" (lambda (self) (fx=? 0 (executor-queue-depth (vector-ref (jhost-state self) 0)))))
@@ -2752,6 +2824,168 @@
             (max 0 (fx- (vector-ref st 4) (vector-ref st 9))))))
         (cons "getCorePoolSize" (lambda (self) (vector-ref (jhost-state self) 6)))
         (cons "getMaximumPoolSize" (lambda (self) (vector-ref (jhost-state self) 7)))))
+
+;; --- ScheduledExecutorService ------------------------------------------------
+;; schedule, scheduleAtFixedRate and scheduleWithFixedDelay on the scheduled pools
+;; (jolt-hgjo). Executors/newSingleThreadScheduledExecutor and newScheduledThreadPool
+;; answered plain pools, so (.schedule ex f 1 TimeUnit/MILLISECONDS) was "No
+;; matching method schedule found taking 3 args".
+;;
+;; THE POOL'S OWN WORKERS RUN THE DELAYED TASKS, as on the JVM, where a scheduled
+;; pool's work queue IS the delay queue (ScheduledThreadPoolExecutor.DelayedWorkQueue)
+;; and the workers block on its head. Here the delayed tasks are a second list on
+;; the executor state (st 13), in due order, that executor-take-job! reads after
+;; the immediate queue and before it parks: a due head is the worker's next job, a
+;; head not yet due is what one idle worker's wait is timed against
+;; (executor-idle-wait!, which explains the leader). No timer thread, no sleeping
+;; thread per task, and the consequences the JVM's design has fall out of it here
+;; too — shutdown lets a delayed one-shot run because the worker attending it does
+;; not leave until the list is empty, and a pool with every worker busy runs a due
+;; task when one frees up, late, rather than growing for it.
+;;
+;; THE FUTURE is the j-future's five slots — status, value, error, mutex, condition
+;; — with five more behind them, so get, deref, cancel, isDone and isCancelled are
+;; the j-future's procedures unchanged:
+;;   5 due      the epoch ms the task is next due
+;;   6 period   0 for a one-shot; >0 for fixed-rate; <0 for fixed-delay — the JVM's
+;;              own encoding of the two periodic kinds, in ms
+;;   7 thunk
+;;   8 seq      the pool's submission number, ordering equal due times FIFO (the
+;;              JVM's sequencer does the same)
+;;   9 pool     the executor state a periodic run re-queues into
+;; A periodic future RUNS AND RESETS: the status goes new -> running -> new around
+;; each run and the future never completes normally — .get on it waits until a
+;; cancel (CancellationException) or a run that threw (ExecutionException), which
+;; also ends the repetition, all as FutureTask.runAndReset has it. cancel therefore
+;; wins against a periodic task that is mid-run (its status is new on the JVM
+;; while running; here the cancel lands on 'running and the reset honours it),
+;; and the run that was in flight finishes and is not re-queued.
+;;
+;; MILLISECONDS are the pool's clock (now-millis, the deadline every wait in this
+;; file takes), so a period is floored at 1ms after conversion: a 500us period on
+;; the JVM runs about two thousand times a second; here it would run without bound.
+(define (make-scheduled-future thunk due period seq pool-st)
+  (make-jhost "scheduled-future"
+              (vector 'new jolt-nil #f (make-mutex) (make-condition) due period thunk seq pool-st)))
+(define (scheduled-future? x) (and (jhost? x) (string=? (jhost-tag x) "scheduled-future")))
+(define (sf-due sf) (vector-ref (jhost-state sf) 5))
+(define (sf-periodic? sf) (not (eqv? 0 (vector-ref (jhost-state sf) 6))))
+(define (sf-settled? sf)
+  (let ((st (jhost-state sf)))
+    (jolt-with-mutex (vector-ref st 3) (j-future-settled? (vector-ref st 0)))))
+;; Queue order: due time, then submission.
+(define (sf-before? a b)
+  (let ((da (sf-due a)) (db (sf-due b)))
+    (or (< da db)
+        (and (= da db) (< (vector-ref (jhost-state a) 8) (vector-ref (jhost-state b) 8))))))
+;; The delayed list (st 13), every operation with the pool's queue mutex HELD.
+(define (executor-delayed-head st)
+  (let ((d (vector-ref st 13))) (and (pair? d) (car d))))
+(define (executor-delayed-due? st)
+  (let ((head (executor-delayed-head st))) (and head (>= (now-millis) (sf-due head)) #t)))
+(define (executor-delayed-pop! st)
+  (let ((d (vector-ref st 13))) (vector-set! st 13 (cdr d)) (car d)))
+;; Insert in due order. A NEW HEAD demotes whoever is timing the old one (their
+;; wait is against a later deadline than this task's) and signals one parked worker
+;; to claim it; with nobody parked, the next worker through executor-take-job!
+;; claims it. The demoted leader wakes on its stale deadline eventually, finds the
+;; claim is not its own, and re-polls like anyone else.
+(define (executor-delayed-add! st sf)
+  (vector-set! st 13
+    (let ins ((d (vector-ref st 13)))
+      (if (or (null? d) (sf-before? sf (car d))) (cons sf d) (cons (car d) (ins (cdr d))))))
+  (when (eq? (car (vector-ref st 13)) sf)
+    (vector-set! st 14 #f)
+    (when (fx>? (vector-ref st 9) 0) (jolt-cv-signal-one! (vector-ref st 3)))))
+;; The next due time of a periodic task after a run: fixed-rate advances from the
+;; time it WAS due (a run that overran is followed by the next at once, the JVM's
+;; catch-up), fixed-delay from the time the run finished.
+(define (sf-advance! sf)
+  (let* ((st (jhost-state sf)) (p (vector-ref st 6)))
+    (vector-set! st 5 (if (> p 0) (+ (vector-ref st 5) p) (+ (now-millis) (- p))))))
+;; Run SF on the calling thread: claim it (a cancelled one is skipped, as
+;; FutureTask.run on a cancelled task does nothing), run, then settle or reset.
+;; The worker installs the empty binding stack before calling this; the .run
+;; member below runs on the caller's own bindings, as FutureTask.run does.
+;; A periodic task re-queues itself UNLESS the pool has shut down meanwhile,
+;; in which case it is cancelled instead — what a periodic task that was mid-run
+;; when shutdown dropped the rest of them from the queue gets on the JVM too
+;; (canRunInCurrentRunState).
+(define (scheduled-future-run! sf pool-st)
+  (let ((st (jhost-state sf)))
+    (when (jolt-with-mutex (vector-ref st 3)
+            (and (eq? (vector-ref st 0) 'new)
+                 (begin (vector-set! st 0 'running) #t)))
+      (let* ((r (guard (e (#t (vector-set! st 2 e) #f)) (jolt-invoke (vector-ref st 7))))
+             (again? (jolt-with-mutex (vector-ref st 3)
+                       (let ((again? (cond ((eq? (vector-ref st 0) 'cancelled) #f)
+                                           ((vector-ref st 2) (vector-set! st 0 'done) #f)
+                                           ((sf-periodic? sf) (vector-set! st 0 'new) #t)
+                                           (else (vector-set! st 1 r) (vector-set! st 0 'done) #f))))
+                         (jolt-cv-wake! (vector-ref st 4))
+                         again?))))
+        (when again?
+          (jolt-with-mutex (vector-ref pool-st 2)
+            (cond ((vector-ref pool-st 0) (j-future-cancel! sf))
+                  ;; queued at most once, at the due time it was queued with: a
+                  ;; .run from the caller's thread on a periodic task the pool
+                  ;; still holds neither adds a twin nor re-times the entry in
+                  ;; place, which would break the list's order
+                  ((memq sf (vector-ref pool-st 13)) (void))
+                  (else (sf-advance! sf) (executor-delayed-add! pool-st sf)))))))))
+;; The three methods' shared entry: reject after shutdown (the JVM's delayedExecute
+;; does, with the same AbortPolicy exception submit gets), else build the future
+;; under the mutex — its sequence number is the pool's counter — and queue it. A
+;; negative delay is now, as on the JVM; a nil task is its NullPointerException.
+(define (executor-schedule! self task delay unit period-ms)
+  (when (jolt-nil? task) (throw-jvm (quote NullPointerException) jolt-nil))
+  (let* ((st (jhost-state self))
+         (thunk (runnable->thunk task))
+         (due (+ (now-millis) (max 0 (tu->ms delay unit))))
+         (sf (jolt-with-mutex (vector-ref st 2)
+               (and (not (vector-ref st 0))
+                    (let ((sf (make-scheduled-future thunk due period-ms (vector-ref st 15) st)))
+                      (vector-set! st 15 (fx+ (vector-ref st 15) 1))
+                      (executor-delayed-add! st sf)
+                      sf)))))
+    (or sf (executor-reject-task! st))))
+;; The period, validated on the amount as GIVEN (the JVM throws a bare
+;; IllegalArgumentException for period <= 0) and floored at the clock's 1ms after
+;; conversion; SIGN is +1 for fixed-rate and -1 for fixed-delay.
+(define (scheduled-period-ms period unit sign)
+  (unless (and (number? period) (> period 0))
+    (throw-jvm (quote IllegalArgumentException) jolt-nil))
+  (* sign (max 1 (tu->ms period unit))))
+(derive-host-methods! "scheduled-executor" "executor-service"
+  (list (cons "schedule" (lambda (self task delay unit)
+          (executor-schedule! self task delay unit 0)))
+        (cons "scheduleAtFixedRate" (lambda (self task initial period unit)
+          (executor-schedule! self task initial unit (scheduled-period-ms period unit 1))))
+        (cons "scheduleWithFixedDelay" (lambda (self task initial delay unit)
+          (executor-schedule! self task initial unit (scheduled-period-ms delay unit -1))))))
+;; ScheduledThreadPoolExecutor ctor: (corePoolSize [factory] [handler]) — at least
+;; one worker, as every pool here (a pool with no worker runs nothing; the JVM's
+;; ensurePrestart starts one on demand for core 0).
+(for-each (lambda (nm) (register-class-ctor! nm
+            (lambda (core-n . _) (make-scheduled-executor (max 1 (jnum->exact core-n))))))
+          '("ScheduledThreadPoolExecutor" "java.util.concurrent.ScheduledThreadPoolExecutor"))
+;; The future's own members over the j-future's: Delayed's getDelay (remaining
+;; time in UNIT, negative once overdue, truncated toward zero as TimeUnit.convert
+;; truncates), Comparable's compareTo (queue order), isPeriodic, and
+;; RunnableScheduledFuture's run — the task on the caller's thread, which is how a
+;; task shutdownNow handed back is run, and which re-queues a periodic one only
+;; into a pool that is still open.
+(derive-host-methods! "scheduled-future" "j-future"
+  (list (cons "getDelay" (lambda (self unit)
+          (let ((ms (- (sf-due self) (now-millis))))
+            (if (time-unit? unit) (quotient (* ms 1000000) (time-unit-scale unit)) ms))))
+        (cons "compareTo" (lambda (self other)
+          (unless (scheduled-future? other)
+            (throw-jvm (quote ClassCastException)
+                       "cannot compare a ScheduledFutureTask with a non-ScheduledFutureTask"))
+          (cond ((eq? self other) 0) ((sf-before? self other) -1) ((sf-before? other self) 1) (else 0))))
+        (cons "isPeriodic" (lambda (self) (sf-periodic? self)))
+        (cons "run" (lambda (self) (scheduled-future-run! self (vector-ref (jhost-state self) 9)) jolt-nil))))
 
 ;; java.util.concurrent.locks.ReentrantLock — a reentrant mutual-exclusion lock.
 ;; State: #(monitor), one MONITOR record of its own (make-monitor above), not the
