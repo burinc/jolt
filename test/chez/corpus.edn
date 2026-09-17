@@ -6228,6 +6228,12 @@
   {:suite "string / last-index-of from" :label "match may start at from and extend past" :expected "4" :actual "(clojure.string/last-index-of \"banana\" \"na\" 4)" :portability :common}
   {:suite "string / last-index-of from" :label "largest start <= from" :expected "1" :actual "(clojure.string/last-index-of \"aaa\" \"a\" 1)" :portability :common}
   {:suite "string / last-index-of from" :label "no match at or before from" :expected "nil" :actual "(clojure.string/last-index-of \"banana\" \"na\" 1)" :portability :common}
+  {:suite "string / last-index-of" :label "last occurrence" :expected "4" :actual "(clojure.string/last-index-of \"banana\" \"na\")" :portability :common}
+  {:suite "string / last-index-of" :label "char value" :expected "5" :actual "(clojure.string/last-index-of \"banana\" \\a)" :portability :common}
+  {:suite "string / last-index-of" :label "absent" :expected "nil" :actual "(clojure.string/last-index-of \"banana\" \"x\")" :portability :common}
+  {:suite "string / last-index-of" :label "empty needle answers the length" :expected "6" :actual "(clojure.string/last-index-of \"banana\" \"\")" :portability :common}
+  {:suite "string / last-index-of from" :label "from past the end clamps" :expected "4" :actual "(clojure.string/last-index-of \"banana\" \"na\" 99)" :portability :common}
+  {:suite "string / last-index-of from" :label "negative from is nil" :expected "nil" :actual "(clojure.string/last-index-of \"banana\" \"b\" -1)" :portability :common}
   {:suite "assert / message" :label "message expression evaluates at failure time" :expected "\"Assert failed: x=3\"" :actual "(try (assert false (str \"x=\" (+ 1 2))) (catch Throwable e (first (clojure.string/split-lines (.getMessage e)))))" :portability :common}
   {:suite "interop / qualified instance method" :label "fully-qualified class (java.util.List/.size coll)" :expected "3" :actual "(java.util.List/.size (java.util.ArrayList. [1 2 3]))" :portability :common}
   {:suite "regex / \\Q..\\E quantifier" :label "quantifier after \\Q..\\E scopes only last char" :expected "\"abbb\"" :actual "(re-find #\"\\Qab\\E+\" \"abbb\")" :portability :common}

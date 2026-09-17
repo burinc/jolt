@@ -49,7 +49,8 @@
 (define hint-emit (emit (run-passes hinted (make-analyze-ctx "user") U)))
 (gate-check "^V param hint direct-accesses field reads" (gate-sub? hint-emit "jrec2-f0") #t)
 (gate-check "^V param hint unboxes arithmetic" (gate-sub? hint-emit "fl*") #t)
-(gate-check "^V param hint leaves no generic jolt-get" (gate-sub? hint-emit "jolt-get") #f)
+(gate-check "^V param hint leaves no generic lookup (jolt-get or the keyword site)"
+            (or (gate-sub? hint-emit "jolt-get") (gate-sub? hint-emit "jolt-kw-get-site")) #f)
 
 ;; an UNTAGGED field whose every ctor site passes a flonum now unboxes too —
 ;; whole-program field-type inference (run-fieldjoin) derives :double from the ctor

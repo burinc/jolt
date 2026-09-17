@@ -2393,9 +2393,7 @@
 
 (define (record-method-dispatch-base obj method-name
          rest-args)
-  (let ((rest (if (jolt-nil? rest-args)
-                  '()
-                  (seq->list rest-args))))
+  (let ((rest (method-rest-args->list rest-args)))
     (cond
       ((and (procedure? obj) (deftype-ctor-tag obj)) =>
        (lambda (tag)

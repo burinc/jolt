@@ -282,7 +282,7 @@
 (define (rd-ref-trim-history r) jolt-nil)
 
 (define (record-method-dispatch-base obj method-name rest-args)
-  (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
+  (let ((rest (method-rest-args->list rest-args)))
     (cond
       ;; a deftype/defrecord TYPE token (its make-deftype-ctor closure) answers the
       ;; java.lang.Class reflection methods off the "ns.Name" tag it carries, so

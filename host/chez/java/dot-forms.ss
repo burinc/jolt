@@ -103,14 +103,29 @@
        (list->cseq (if asc keep (reverse keep)))))
     (else (dispatch-miss obj method rest))))
 
+;; The receivers the arm below answers for — every branch of its cond tests
+;; one of these (a field read tests the receiver inside its own branch). The
+;; arm sits at priority 30, so every receiver the string/getclass arms did not
+;; claim passes through it: a Matcher, a StringBuilder, a File, a Date. It used
+;; to convert the rest args to a list BEFORE the cond — a seq walk, a cseq plus
+;; a cons per argument — so every one of those receivers paid for a conversion
+;; whose result the arm then threw away with 'pass (448 bytes of the 576 an
+;; unhinted (.region m a b) allocated in dispatch). Test the receiver first, and
+;; convert with method-rest-args->list, which reads the argument vector's tail
+;; straight into conses. test/chez/method-dispatch-alloc-test.ss pins it.
+(define (dotform-receiver? obj)
+  (or (jrec? obj) (jolt-multifn? obj) (procedure? obj) (jolt-transient? obj)
+      (dot-coll? obj) (htable-sorted? obj) (jolt-map? obj) (jolt-ex-info-record? obj)))
 (register-method-arm! arm-priority-dotform
   (lambda (obj method-name rest-args)
-    (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
-           (field? (and (> (string-length method-name) 0)
+    (let* ((field? (and (> (string-length method-name) 0)
                         (char=? (string-ref method-name 0) #\-)))
            (mname (if field?
                       (substring method-name 1 (string-length method-name))
                       method-name)))
+     (if (not (or field? (dotform-receiver? obj)))
+      'pass
+      (let ((rest (method-rest-args->list rest-args)))
       (cond
         ;; A FIELD read. Checked FIRST, so no method arm below can claim a dashed
         ;; name — (.-count [1 2]) is not the count, the way the JVM's
@@ -204,4 +219,4 @@
          (cond
            ((dot-object-method obj mname rest) => car)
            (else 'pass)))
-        (else 'pass)))))
+        (else 'pass)))))))

@@ -717,6 +717,19 @@
          :map (every? const-coll-node? (apply concat (:pairs n)))
          false)))
 
+;; A :map literal whose keys are all constant keywords, pairwise distinct
+;; (the reader refuses a repeat; checked anyway, since the direct build below
+;; skips the runtime's scan), and few enough to stay in array mode whatever the
+;; values are: collections.ss pam-literal-kvs? keeps an all-keyword literal in
+;; array mode up to array-map-limit-kw (64) pairs.
+(def ^:private array-map-limit-kw 64)
+(defn- unique-keyword-key-literal? [node]
+  (let [ks (map first (:pairs node))]
+    (and (seq ks)
+         (<= (count ks) array-map-limit-kw)
+         (every? (fn [k] (and (= :const (:op k)) (keyword? (:val k)))) ks)
+         (apply distinct? (map :val ks)))))
+
 (defn- emit-with-cells [emit-thunk]
   (let [cells (atom [])
         pool (atom {})
@@ -2894,6 +2907,15 @@
         (cond
           dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
           idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit fnode) ")")))
+          ;; Any other receiver: the site lookup over a per-site cell that
+          ;; remembers the array-map slot the key was last found at (collections.ss
+          ;; jolt-kw-get-site — one eq? on a hit, jolt-get's answer on anything
+          ;; else). The cell is a hoisted per-site constant, so only a site with a
+          ;; constant pool (inside a def) gets one; a bare top-level form keeps
+          ;; jolt-get rather than allocate a cell per evaluation.
+          *const-pool*
+          (let [site (hoist-const-per-site "(jolt-kw-site)")]
+            (order-args (fn [as] (str "(jolt-kw-get-site " (first as) " " (emit fnode) " " site (defstr as) ")"))))
           :else (order-args (fn [as] (str "(jolt-get " (first as) " " (emit fnode) (defstr as) ")")))))
       ;; (coll k [default]) -> lookup — coll (fnode) is the callee, evaluated
       ;; before the key/default args. A VECTOR literal invokes as nth (a bad
@@ -3301,8 +3323,19 @@
                (if (const-coll-node? node) (hoist-const-per-site s) s))
      :set (let [s (emit-ordered "jolt-hash-set" (:items node))]
             (if (const-coll-node? node) (hoist-const-per-site s) s))
-     :map (let [s (emit-ordered "jolt-hash-map"
-                                (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node)))]
+     ;; A map literal whose keys are all constant keywords hands its slots to the
+     ;; array map as one vector: the reader has already refused a repeated
+     ;; literal key, so there is nothing for jolt-hash-map's duplicate scan over
+     ;; a rest list to find (the reference compiler's RT.mapUniqueKeys for a
+     ;; MapExpr with constant, distinct keys). Bounded at the keyword array
+     ;; limit — past it the literal is hash mode, which the checked constructor
+     ;; still decides. The slot vector is built through ordered-call like any
+     ;; operand list, so values with effects still evaluate left to right.
+     :map (let [kvs (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node))
+                s (if (unique-keyword-key-literal? node)
+                    (ordered-call kvs (mapv emit kvs)
+                      (fn [strs] (str "(amap-slots->pmap (vector " (str/join " " strs) "))")))
+                    (emit-ordered "jolt-hash-map" kvs))]
             (if (const-coll-node? node) (hoist-const-per-site s) s))
     ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
     ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,

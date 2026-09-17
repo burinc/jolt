@@ -103,7 +103,8 @@
 (wp-infer! U (jolt-vector nddef mktree chk chkuse))
 (define chk-e (emit (run-passes chk (make-analyze-ctx "user") U)))
 (gate-check "(e) nilable record param bare-indexes (jrec-field-at)" (gate-sub? chk-e "jrec-field-at") #t)
-(gate-check "(e) nilable record param drops generic jolt-get" (gate-sub? chk-e "jolt-get") #f)
+(gate-check "(e) nilable record param drops the generic lookup (jolt-get or the keyword site)"
+            (or (gate-sub? chk-e "jolt-get") (gate-sub? chk-e "jolt-kw-get-site")) #f)
 ;; ...but stays NIL-SAFE: a nilable receiver must never take the direct accessor,
 ;; which would read a slot off nil.
 (gate-check "(e) nilable record param keeps the nil-safe path (no jrec2-f0)" (gate-sub? chk-e "jrec2-f0") #f)

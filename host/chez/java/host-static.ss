@@ -347,7 +347,7 @@
     (cond
       ((jhost? obj)
        (let* ((f (host-method-ref (jhost-tag obj) method-name))
-              (args (if (jolt-nil? rest-args) '() (seq->list rest-args))))
+              (args (method-rest-args->list rest-args)))
          (cond
            ;; A member whose arities do not include this one is not this member:
            ;; fall to dispatch-miss, so a library extension still gets its say and

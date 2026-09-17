@@ -761,7 +761,24 @@
 ;; and jolt.ffi/load-library must surface that as a clean jolt-level error, not a
 ;; VM abort (verified on Chez: a missing library raises a guardable error and the
 ;; jolt-level message is unchanged).
-(define (sa-load-shared-object name) (load-shared-object name))
+;;
+;; The process handle is loaded ONCE. Chez pushes a handle onto its dynamic
+;; lookup list on every load-shared-object, and every foreign-entry lookup
+;; walks that list with dlsym before it reaches the static "(cs)…" table
+;; (c/foreign.c lookup). rt.ss asks for the process at each
+;; jolt-foreign-proc-safe site — 57 by the end of boot — so a lookup that
+;; misses the process (every Chez-internal "(cs)" entry: inspect/object binds
+;; two per call; every optional-entry probe at boot) walked 57 handles, 2 ms a
+;; miss. And re-loading #f after a native library re-promotes the process's
+;; symbols over the library's (the BoringSSL/OpenSSL EVP_* flip). Named
+;; libraries load as before; test/chez/foreign-handles-test.ss pins this.
+(define sa-process-symbols-loaded? #f)
+(define (sa-load-shared-object name)
+  (if name
+      (load-shared-object name)
+      (unless sa-process-symbols-loaded?
+        (set! sa-process-symbols-loaded? #t)
+        (load-shared-object #f))))
 
 ;; (sa-foreign-entry? name) -> boolean
 ;; Does the named C entry resolve (in the process or a loaded object). Contract:

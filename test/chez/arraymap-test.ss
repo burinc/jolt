@@ -91,5 +91,100 @@
 (is "reduce-kv folds in place" "(reduce-kv (fn [a k v] (if (= k :b) (reduced a) (+ a v))) 0 (array-map :a 1 :b 2 :c 3))" "1")
 (is "count of the seq view" "[(count (seq {:a 1 :b 2 :c 3})) (count (rest (seq {:a 1 :b 2 :c 3}))) (count (keys (hash-map :a 1 :b 2)))]" "[3 2 2]")
 
+;; --- a literal with constant keyword keys builds its slots directly ---------
+;; The reader refuses a repeated literal key, so a literal whose keys are all
+;; constant keywords has nothing for jolt-hash-map's duplicate scan to find:
+;; the emitter hands the slots to the array map as one vector (the reference
+;; compiler's RT.mapUniqueKeys for the same shape), no rest list, no scan. A
+;; 10-key literal with one runtime value measured 134 ns through the scan
+;; (26k of them in one parse of standard-clojure-style's own source); the
+;; direct build is the allocation alone. Values still evaluate left to right,
+;; and a key that is not a constant keyword (a computed key, a string, a
+;; number) keeps the checked constructor. Past the keyword array limit (64)
+;; the literal is hash mode and jolt-hash-map builds it as before.
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
+(define (emitf str)
+  (let-values (((f j) (rdr-read-form str 0 (string-length str))))
+    (let ((ctx (make-analyze-ctx "user")))
+      (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
+(define (kw-literal-direct? src)
+  (let ((e (emitf src)))
+    (and (has? e "(amap-slots->pmap (vector ") (not (has? e "(jolt-hash-map ")))))
+(define (kw-literal-checked? src)
+  (let ((e (emitf src)))
+    (and (has? e "(jolt-hash-map ") (not (has? e "amap-slots->pmap")))))
+(ok "keyword-keyed literal with runtime values emits the direct slot build"
+    (kw-literal-direct? "(fn [x y] {:a x :b y :c 3})"))
+(ok "a computed key keeps the checked constructor"
+    (kw-literal-checked? "(fn [k x] {k x :b 2})"))
+(ok "a non-keyword constant key keeps the checked constructor"
+    (kw-literal-checked? "(fn [x] {\"a\" x :b 2})"))
+(ok "past the keyword array limit the literal is hash mode via the checked constructor"
+    (let ((src (string-append "(fn [x] {"
+                              (apply string-append
+                                     (map (lambda (i) (string-append ":k" (number->string i) " " (if (= i 0) "x" (number->string i)) " "))
+                                          (iota 65)))
+                              "})")))
+      (and (kw-literal-checked? src)
+           (hnode? (pmap-root (jolt-invoke1 (evv src) 0))))))
+(ok "the direct build is an array map with the literal's order and count"
+    (let ((m (jolt-invoke2 (evv "(fn [x y] {:a x :b y :c 3})") 1 2)))
+      (and (pmap? m) (pmap-array? m) (fx=? 3 (pmap-cnt m))
+           (equal? (vector (kw "a") 1 (kw "b") 2 (kw "c") 3) (pmap-root m)))))
+(is "values of a direct build evaluate left to right"
+    "(let [log (atom [])] (let [m {:a (do (swap! log conj 1) 1) :b (do (swap! log conj 2) 2) :c (do (swap! log conj 3) 3)}] [@log (:b m)]))"
+    "[[1 2 3] 2]")
+(is "a direct build past 8 keys stays array mode and answers lookups"
+    "(let [m {:a 1 :b 2 :c 3 :d 4 :e 5 :f 6 :g 7 :h 8 :i (+ 4 5) :j 10}] [(count m) (:i m) (:j m) (keys m)])"
+    "[10 9 10 (:a :b :c :d :e :f :g :h :i :j)]")
+
+;; --- a keyword-invoke site remembers the slot it hit ---------------------
+;; (:k m) on an array map is amap-index's identity scan: 6.4 ns at slot 0 and
+;; 10.8 at slot 9 of ten. Record-shaped maps — every map one literal builds —
+;; put a key at the same slot every time, so a per-site cell holding the last
+;; hit index answers the next call with one eq? and one vector-ref (measured
+;; 2.0 ns), the shape of a monomorphic inline cache without the hidden class:
+;; the cache only shortcuts a HIT, and a stale index (a different map at the
+;; site, a key at another slot) falls back to the scan, which re-primes it. A
+;; hash-mode map, a record, a nil receiver and a default all keep their old
+;; path. Only a site inside a def gets a cell (a bare top-level form has no
+;; constant pool to hold it).
+(ok "a keyword-invoke site inside a def emits the site lookup over a hoisted cell"
+    (let ((e (emitf "(defn kw-site-f [m] (:a m))")))
+      (and (has? e "(jolt-kw-get-site ") (has? e "(jolt-kw-site)"))))
+(ok "a keyword-invoke with a default keeps the default arity"
+    (let ((e (emitf "(defn kw-site-g [m] (:a m 0))")))
+      (has? e "(jolt-kw-get-site ")))
+(is "site lookup: hit, miss, default, nil receiver"
+    "(let [f (fn [m] (:c m)) g (fn [m] (:c m :none))] [(f {:a 1 :b 2 :c 3}) (f {:a 1}) (g {:a 1}) (f nil) (g nil)])"
+    "[3 nil :none nil :none]")
+(is "the same site over maps whose key sits at different slots stays right"
+    "(let [f (fn [m] (:k m))] (mapv f [{:k 1} {:a 0 :k 2} {:a 0 :b 0 :c 0 :k 3} {:k 4} (hash-map :k 5) {:z 9}]))"
+    "[1 2 3 4 5 nil]")
+(is "a record receiver, a vector receiver and a set receiver keep their answers"
+    "(do (defrecord KwSite [c]) (let [f (fn [m] (:c m))] [(f (->KwSite 7)) (f [1 2 3]) (f #{:c}) (f (transient {:c 8}))]))"
+    "[7 nil :c 8]")
+(is "hash-mode maps answer through the trie"
+    "(let [f (fn [m] (:k40 m)) m (into {} (map (fn [i] [(keyword (str \"k\" i)) i]) (range 70)))] [(f m) (f (assoc m :k40 :x))])"
+    "[40 :x]")
+;; the point of the cell, as a ratio inside one process: a monomorphic site on
+;; the tenth slot against the plain scan at that slot
+(ok "a primed site answers in well under the scan's time"
+    (let* ((ks (map (lambda (i) (keyword #f (string-append "k" (number->string i)))) (iota 10)))
+           (m (amap-slots->pmap (list->vector (apply append (map (lambda (k i) (list k i)) ks (iota 10))))))
+           (k9 (list-ref ks 9))
+           (site (jolt-kw-site))
+           (n 2000000)
+           (time-it (lambda (thunk) (let ((t0 (real-time))) (do ((i 0 (fx+ i 1))) ((fx= i n)) (thunk)) (- (real-time) t0))))
+           (scan (time-it (lambda () (jolt-get m k9))))
+           (cached (time-it (lambda () (jolt-kw-get-site m k9 site)))))
+      (printf "  kw site: scan ~a ms, cached ~a ms (ratio ~a, ceiling 0.6)\n" scan cached (if (> scan 0) (/ (round (* 100.0 (/ cached scan))) 100.0) 'n/a))
+      (< cached (* 0.6 scan))))
+
 (printf "arraymap-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

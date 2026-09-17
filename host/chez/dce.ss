@@ -181,13 +181,18 @@
 ;; missing -- so reaching one keeps the compiler AND everything else. The
 ;; converse does not hold: the two lists answer two questions. Bail is "can the
 ;; shake trust the graph"; compile is "does this program compile at run time".
-;; Writing an image needs the fasl writer in scheme.boot and shakes fine; a bare
-;; varargs FFI binding compiles a foreign-procedure per tail shape and shakes
-;; fine. A def :allow-dynamic vouches for is spared the bail for a RESOLUTION
-;; ref and for a load by a COMPUTED name (jolt.host/load-namespace, the one
-;; compile ref a vouch covers): a ref that runs the compiler on code bails
-;; regardless, because the compiler image is direct-linked against the whole
-;; core and cannot run over a shaken one (dce-bail-scan). drop-compiler? is (and (not bail) (not
+;; Writing an image needs the fasl writer in scheme.boot and the back end's
+;; munge-name; a bare varargs FFI binding compiles a foreign-procedure per tail
+;; shape; Scheme text is eval'd by Chez. None of those resolve jolt vars by
+;; name, so the APP half still shakes -- but the compiler image they keep is
+;; direct-linked against the whole clojure.core (its own top-level forms run
+;; core fns at boot: jolt.op-registry's `keep`), so the CORE is kept whole
+;; (dce-shake). It once shook the core under a kept compiler and the binary
+;; died at boot on the first pruned core var. A def :allow-dynamic vouches for
+;; is spared the bail for a RESOLUTION ref and for a load by a COMPUTED name
+;; (jolt.host/load-namespace, the one compile ref a vouch covers): a ref that
+;; runs the compiler on code bails regardless, because eval'd code can name any
+;; core var (dce-bail-scan). drop-compiler? is (and (not bail) (not
 ;; needs-compiler)): a bail keeps the compiler too, since a requiring-resolve
 ;; may load and compile source at runtime.
 (define dce-compile-refs
@@ -522,7 +527,7 @@
 ;; caller of a spliced helper, not the helper — which is why the hint prints the
 ;; name rather than leaving it to the reader to derive.
 (define (dce-bail-scan records reached allow)
-  (let ((bail #f) (why '()) (hint '()) (needs-compiler #f)
+  (let ((bail #f) (why '()) (hint '()) (needs-compiler #f) (compile-why '())
         (bail-ht (make-hashtable string-hash string=?))
         (compile-ht (make-hashtable string-hash string=?))
         (allow-ht (make-hashtable string-hash string=?)))
@@ -569,13 +574,17 @@
               ;; the vouched load is the one compile ref a vouch spares: a site
               ;; that never runs needs no compiler. Every other compile ref
               ;; keeps it, vouched or not.
-              (when (ormap (lambda (ref)
-                             (and (hashtable-ref compile-ht ref #f)
-                                  (not (and allowed? (string=? ref dce-dynamic-load-ref)))))
-                           refs)
-                (set! needs-compiler #t))))))
+              (for-each (lambda (ref)
+                          (when (and (hashtable-ref compile-ht ref #f)
+                                     (not (and allowed? (string=? ref dce-dynamic-load-ref))))
+                            (set! needs-compiler #t)
+                            ;; named in the shake's diagnostic, like a bail's why
+                            (let ((pair (cons (or fqn "<form>") ref)))
+                              (when (and (< (length compile-why) 6) (not (member pair compile-why)))
+                                (set! compile-why (cons pair compile-why))))))
+                        refs)))))
       records)
-    (values bail (reverse why) (reverse hint) needs-compiler)))
+    (values bail (reverse why) (reverse hint) needs-compiler (reverse compile-why))))
 
 ;; Kept records -> (values kept-strings n-defs n-kept-defs).
 (define (dce-partition records reached)
@@ -609,13 +618,17 @@
       ;; that def's init. A defn only binds (dce-def-init-runs?), so a library
       ;; that DEFINES an eval-calling fn nobody reaches drops it still.
       (let ((reached (dce-reachable edges (append (dce-app-init-roots app-records) roots))))
-        (let-values (((bail why hint needs-compiler) (dce-bail-scan all reached allow)))
+        (let-values (((bail why hint needs-compiler compile-why) (dce-bail-scan all reached allow)))
           (or bail needs-compiler))))))
 
-;; Returns (values core-strs app-strs drop-compiler?). core-strs is #f on a bail,
-;; signalling "inline prelude.ss unshaken" + keep the compiler. allow: see
-;; dce-bail-scan. On a bail the diagnostic ends with the deps.edn key that would
-;; allow every def it named, so the path from "skipped" to "kept" is one paste.
+;; Returns (values core-strs app-strs drop-compiler?). core-strs is #f when the
+;; prelude is inlined unshaken: on a bail (everything kept, the compiler too),
+;; and under a kept compiler (the app half pruned, the core whole -- the
+;; compiler image is direct-linked against all of clojure.core and its own
+;; top-level forms call core fns at boot, so it cannot load over a shaken
+;; core). allow: see dce-bail-scan. On a bail the diagnostic ends with the
+;; deps.edn key that would allow every def it named, so the path from
+;; "skipped" to "kept" is one paste.
 (define (dce-shake core-records app-records entry-main allow)
   (let-values (((edges roots spliced)
                 (dce-build-graph (append core-records app-records) entry-main)))
@@ -625,20 +638,30 @@
            (kept (if (null? spliced)
                      reached
                      (dce-reachable edges (append spliced roots)))))
-      (let-values (((bail why hint needs-compiler)
+      (let-values (((bail why hint needs-compiler compile-why)
                     (dce-bail-scan (append core-records app-records) reached allow)))
         (let ((drop-compiler? (and (not bail) (not needs-compiler))))
-          (if bail
-              (begin
-                (display "jolt build: tree-shake skipped (reachable code resolves vars at runtime):\n")
-                (for-each (lambda (w) (display (string-append "  " (car w) " -> " (cdr w) "\n"))) why)
-                (unless (null? hint)
-                  (display "to proceed, if these never run in the built binary, add to deps.edn:\n")
-                  (display (string-append "  :jolt/tree-shake {:allow-dynamic [" (jolt-str-join hint) "]}\n")))
-                (values #f (map dce-rec-str app-records) drop-compiler?))
-              (let-values (((core-strs cn ck) (dce-partition core-records kept))
-                           ((app-strs an ak) (dce-partition app-records kept)))
-                (display (string-append "jolt build: tree-shake kept " (number->string (+ ck ak))
-                                        " of " (number->string (+ cn an)) " defs (core "
-                                        (number->string ck) "/" (number->string cn) ")\n"))
-                (values core-strs app-strs drop-compiler?))))))))
+          (cond
+            (bail
+             (display "jolt build: tree-shake skipped (reachable code resolves vars at runtime):\n")
+             (for-each (lambda (w) (display (string-append "  " (car w) " -> " (cdr w) "\n"))) why)
+             (unless (null? hint)
+               (display "to proceed, if these never run in the built binary, add to deps.edn:\n")
+               (display (string-append "  :jolt/tree-shake {:allow-dynamic [" (jolt-str-join hint) "]}\n")))
+             (values #f (map dce-rec-str app-records) drop-compiler?))
+            (needs-compiler
+             (let-values (((app-strs an ak) (dce-partition app-records kept)))
+               (display "jolt build: tree-shake: core kept whole (the program compiles at run time):\n")
+               (for-each (lambda (w) (display (string-append "  " (car w) " -> " (cdr w) "\n"))) compile-why)
+               (display (string-append "jolt build: tree-shake kept " (number->string ak)
+                                       " of " (number->string an) " app defs (core "
+                                       (number->string (length (filter dce-rec-fqn core-records)))
+                                       " unshaken)\n"))
+               (values #f app-strs drop-compiler?)))
+            (else
+             (let-values (((core-strs cn ck) (dce-partition core-records kept))
+                          ((app-strs an ak) (dce-partition app-records kept)))
+               (display (string-append "jolt build: tree-shake kept " (number->string (+ ck ak))
+                                       " of " (number->string (+ cn an)) " defs (core "
+                                       (number->string ck) "/" (number->string cn) ")\n"))
+               (values core-strs app-strs drop-compiler?)))))))))

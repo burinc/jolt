@@ -159,15 +159,20 @@
 
 ;; An irregex match -> the Clojure result: whole string (no groups) or the
 ;; [whole g1 ... gn] vector (nil for a non-participating group).
+;; The groups vector is built straight into its slot vector: it used to go
+;; through a list and apply (a cons per group plus the list->vector copy) on
+;; every capturing match.
 (define (irx-result m)
   (let ((n (irregex-match-num-submatches m)))
     (if (= n 0)
         (irregex-match-substring m 0)
-        (let loop ((i n) (acc '()))
-          (if (< i 0)
-              (apply jolt-vector acc)
-              (let ((s (irregex-match-substring m i)))
-                (loop (- i 1) (cons (if s s jolt-nil) acc))))))))
+        (let ((out (make-vector (+ n 1))))
+          (let loop ((i 0))
+            (if (> i n)
+                (make-pvec out)
+                (let ((s (irregex-match-substring m i)))
+                  (vector-set! out i (if s s jolt-nil))
+                  (loop (+ i 1)))))))))
 
 (define (jolt-re-matches re s)
   (let* ((s (rx-charseq->string s))
@@ -185,9 +190,56 @@
 ;; as (s from rend), so bos sits at the search origin and eos at the region end.
 ;; The consumer guard below is what keeps ^ from re-anchoring at a resumed scan
 ;; position instead of the region start.
+;; A matcher OWNS its match machinery: one irregex match vector (allocated at
+;; the first search, reset before each — the way irregex-fold reuses its own)
+;; and one (string start end) source triple, rebuilt only when the region
+;; changes. Each find used to allocate both, plus a chunker cons, before any
+;; matching: ~200 bytes per attempt on the call a tokenizer makes per token.
+;; `last` is that same vector after a hit — .group/.start/.end read the LAST
+;; match, as on the JVM — and #f after a miss, so a stale read is a "No match
+;; found" rather than the previous match. test/chez/regex-matcher-test.ss.
 (define-record-type matcher-t
-  (fields irx str (mutable pos) (mutable last) (mutable rstart) (mutable rend))
-  (nongenerative jolt-matcher-v2))
+  (fields irx str (mutable pos) (mutable last) (mutable rstart) (mutable rend)
+          (mutable matches) (mutable src))
+  (nongenerative jolt-matcher-v3))
+(define (matcher-matches! m)
+  (or (matcher-t-matches m)
+      (let ((mm (irregex-new-matches (matcher-t-irx m))))
+        (matcher-t-matches-set! m mm)
+        mm)))
+;; The source triple (string start end) irregex's string chunker reads, and the
+;; (triple . origin) pair the search starts from, allocated once per matcher
+;; and UPDATED IN PLACE when the region moves — a tokenizer sets the region
+;; before every attempt, and a rebuilt triple per attempt was 64 bytes of the
+;; ~200 this file's header counts. In place is sound because irregex reads the
+;; triple only during a search and no search is in flight when the region is
+;; set (a matcher is one thread's cursor, as on the JVM).
+(define (matcher-src! m)
+  (or (matcher-t-src m)
+      (let* ((src (list (matcher-t-str m) (matcher-t-rstart m) (matcher-t-rend m)))
+             (init (cons src (matcher-t-rstart m))))
+        (matcher-t-src-set! m init)
+        init)))
+(define (matcher-region-set! m a b)
+  (matcher-t-rstart-set! m a)
+  (matcher-t-rend-set! m b)
+  (let ((init (matcher-t-src m)))
+    (when init
+      (let ((src (car init)))
+        (set-car! (cdr src) a)
+        (set-car! (cddr src) b)
+        (set-cdr! init a)))))
+;; The matcher's own search: irx-search-from's body over the matcher's reused
+;; vector and triple. Answers the match vector (the matcher's own) or #f.
+(define (matcher-search! m i)
+  (let ((irx (matcher-t-irx m)) (origin (matcher-t-rstart m)))
+    (and (or (= i origin) (not (flag-set? (irregex-flags irx) ~consumer?)))
+         (let* ((init (matcher-src! m))
+                (matches (matcher-matches! m)))
+           (irregex-reset-matches! matches)
+           (irregex-match-chunker-set! matches irregex-basic-string-chunker)
+           (irregex-search/matches irx irregex-basic-string-chunker
+                                   init (car init) i matches)))))
 ;; EVERY regex entry point takes a CharSequence on the JVM, not just a String, and
 ;; a library matching over a WINDOW of a larger string passes its own
 ;; implementation rather than copying — instaparse's Segment is a deftype with
@@ -209,7 +261,7 @@
         (else (jolt-need-str s))))
 (define (jolt-re-matcher re s)
   (let ((s (rx-charseq->string s)))
-    (make-matcher-t (regex-t-irx (jolt-re-pattern re)) s 0 #f 0 (string-length s))))
+    (make-matcher-t (regex-t-irx (jolt-re-pattern re)) s 0 #f 0 (string-length s) #f #f)))
 (define (jolt-matcher? x) (matcher-t? x))
 
 ;; java.util.regex.Pattern.flags(). jolt compiles a pattern from its source alone,
@@ -245,11 +297,9 @@
      (let ((m (irregex-search (regex-t-irx (jolt-re-pattern re)) (rx-charseq->string s))))
        (if m (irx-result m) jolt-nil)))
     ((m)
-     (let* ((str (matcher-t-str m))
-            (end (matcher-t-rend m))
+     (let* ((end (matcher-t-rend m))
             (start (matcher-t-pos m))
-            (mm (and (<= start end)
-                     (irx-search-from (matcher-t-irx m) str start (matcher-t-rstart m) end))))
+            (mm (and (<= start end) (matcher-search! m start))))
        (if mm
            (let ((ms (irregex-match-start-index mm 0))
                  (e (irregex-match-end-index mm 0)))
@@ -307,7 +357,7 @@
   #t)
 (define (jolt-matcher-looking-at m)
   (let* ((origin (matcher-t-rstart m))
-         (mm (irregex-search (matcher-t-irx m) (matcher-t-str m) origin (matcher-t-rend m))))
+         (mm (matcher-search! m origin)))
     (if (and mm (= (irregex-match-start-index mm 0) origin))
         (matcher-note-match! m mm)
         (begin (matcher-t-last-set! m #f) #f))))
@@ -318,8 +368,7 @@
 ;; in terms of on the JVM, and it returns the matcher so .reset chains.
 (define (matcher-reset! m)
   (matcher-t-last-set! m #f)
-  (matcher-t-rstart-set! m 0)
-  (matcher-t-rend-set! m (string-length (matcher-t-str m)))
+  (matcher-region-set! m 0 (string-length (matcher-t-str m)))
   (matcher-t-pos-set! m 0)
   m)
 ;; .find(int from): RESET the matcher — region included, which is why the bounds
@@ -345,8 +394,7 @@
     (when (or (< b 0) (> b n)) (oob "end"))
     (when (> a b) (oob "start > end"))
     (matcher-reset! m)
-    (matcher-t-rstart-set! m a)
-    (matcher-t-rend-set! m b)
+    (matcher-region-set! m a b)
     (matcher-t-pos-set! m a)
     m))
 

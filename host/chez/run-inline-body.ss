@@ -237,7 +237,7 @@
 (let ((e (ilg-emit "(defn ilg-uses-hinted [] (ilg-hinted ilg-pt))")))
   (gate-check "the hinted callee is spliced" (gate-sub? e "ilg-hinted") #f)
   (gate-check "a spliced ^Record param still bare-indexes" (gate-sub? e "jrec2-f0") #t)
-  (gate-check "and leaves no generic lookup behind" (gate-sub? e "jolt-get") #f))
+  (gate-check "and leaves no generic lookup behind" (or (gate-sub? e "jolt-get") (gate-sub? e "jolt-kw-get-site")) #f))
 
 ;; control: the SAME code without the hint. Nothing types the local, so the
 ;; spliced read is generic -- which is what the rows above measure.
@@ -245,7 +245,8 @@
 (ilg-emit "(defn ilg-unhinted [p] (:x p))")
 (let ((e (ilg-emit "(defn ilg-uses-unhinted [] (ilg-unhinted ilg-pt))")))
   (gate-check "control: no hint, no bare index" (gate-sub? e "jrec2-f0") #f)
-  (gate-check "control: no hint, generic lookup" (gate-sub? e "jolt-get") #t))
+  ;; generic = the keyword-invoke site lookup, never a static field accessor
+  (gate-check "control: no hint, generic lookup" (gate-sub? e "jolt-kw-get-site") #t))
 
 ;; --- a spliced fn literal still travels in a state image (jolt-giqc) --------
 ;; A closure is written to an image through its RECORDED SOURCE: the back end
