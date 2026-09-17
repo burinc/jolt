@@ -91,5 +91,57 @@
 (is "reduce-kv folds in place" "(reduce-kv (fn [a k v] (if (= k :b) (reduced a) (+ a v))) 0 (array-map :a 1 :b 2 :c 3))" "1")
 (is "count of the seq view" "[(count (seq {:a 1 :b 2 :c 3})) (count (rest (seq {:a 1 :b 2 :c 3}))) (count (keys (hash-map :a 1 :b 2)))]" "[3 2 2]")
 
+;; --- a literal with constant keyword keys builds its slots directly ---------
+;; The reader refuses a repeated literal key, so a literal whose keys are all
+;; constant keywords has nothing for jolt-hash-map's duplicate scan to find:
+;; the emitter hands the slots to the array map as one vector (the reference
+;; compiler's RT.mapUniqueKeys for the same shape), no rest list, no scan. A
+;; 10-key literal with one runtime value measured 134 ns through the scan
+;; (26k of them in one parse of standard-clojure-style's own source); the
+;; direct build is the allocation alone. Values still evaluate left to right,
+;; and a key that is not a constant keyword (a computed key, a string, a
+;; number) keeps the checked constructor. Past the keyword array limit (64)
+;; the literal is hash mode and jolt-hash-map builds it as before.
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
+(define (emitf str)
+  (let-values (((f j) (rdr-read-form str 0 (string-length str))))
+    (let ((ctx (make-analyze-ctx "user")))
+      (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
+(define (kw-literal-direct? src)
+  (let ((e (emitf src)))
+    (and (has? e "(amap-slots->pmap (vector ") (not (has? e "(jolt-hash-map ")))))
+(define (kw-literal-checked? src)
+  (let ((e (emitf src)))
+    (and (has? e "(jolt-hash-map ") (not (has? e "amap-slots->pmap")))))
+(ok "keyword-keyed literal with runtime values emits the direct slot build"
+    (kw-literal-direct? "(fn [x y] {:a x :b y :c 3})"))
+(ok "a computed key keeps the checked constructor"
+    (kw-literal-checked? "(fn [k x] {k x :b 2})"))
+(ok "a non-keyword constant key keeps the checked constructor"
+    (kw-literal-checked? "(fn [x] {\"a\" x :b 2})"))
+(ok "past the keyword array limit the literal is hash mode via the checked constructor"
+    (let ((src (string-append "(fn [x] {"
+                              (apply string-append
+                                     (map (lambda (i) (string-append ":k" (number->string i) " " (if (= i 0) "x" (number->string i)) " "))
+                                          (iota 65)))
+                              "})")))
+      (and (kw-literal-checked? src)
+           (hnode? (pmap-root (jolt-invoke1 (evv src) 0))))))
+(ok "the direct build is an array map with the literal's order and count"
+    (let ((m (jolt-invoke2 (evv "(fn [x y] {:a x :b y :c 3})") 1 2)))
+      (and (pmap? m) (pmap-array? m) (fx=? 3 (pmap-cnt m))
+           (equal? (vector (kw "a") 1 (kw "b") 2 (kw "c") 3) (pmap-root m)))))
+(is "values of a direct build evaluate left to right"
+    "(let [log (atom [])] (let [m {:a (do (swap! log conj 1) 1) :b (do (swap! log conj 2) 2) :c (do (swap! log conj 3) 3)}] [@log (:b m)]))"
+    "[[1 2 3] 2]")
+(is "a direct build past 8 keys stays array mode and answers lookups"
+    "(let [m {:a 1 :b 2 :c 3 :d 4 :e 5 :f 6 :g 7 :h 8 :i (+ 4 5) :j 10}] [(count m) (:i m) (:j m) (keys m)])"
+    "[10 9 10 (:a :b :c :d :e :f :g :h :i :j)]")
+
 (printf "arraymap-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

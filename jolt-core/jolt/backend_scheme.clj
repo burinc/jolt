@@ -717,6 +717,19 @@
          :map (every? const-coll-node? (apply concat (:pairs n)))
          false)))
 
+;; A :map literal whose keys are all constant keywords, pairwise distinct
+;; (the reader refuses a repeat; checked anyway, since the direct build below
+;; skips the runtime's scan), and few enough to stay in array mode whatever the
+;; values are: collections.ss pam-literal-kvs? keeps an all-keyword literal in
+;; array mode up to array-map-limit-kw (64) pairs.
+(def ^:private array-map-limit-kw 64)
+(defn- unique-keyword-key-literal? [node]
+  (let [ks (map first (:pairs node))]
+    (and (seq ks)
+         (<= (count ks) array-map-limit-kw)
+         (every? (fn [k] (and (= :const (:op k)) (keyword? (:val k)))) ks)
+         (apply distinct? (map :val ks)))))
+
 (defn- emit-with-cells [emit-thunk]
   (let [cells (atom [])
         pool (atom {})
@@ -3301,8 +3314,19 @@
                (if (const-coll-node? node) (hoist-const-per-site s) s))
      :set (let [s (emit-ordered "jolt-hash-set" (:items node))]
             (if (const-coll-node? node) (hoist-const-per-site s) s))
-     :map (let [s (emit-ordered "jolt-hash-map"
-                                (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node)))]
+     ;; A map literal whose keys are all constant keywords hands its slots to the
+     ;; array map as one vector: the reader has already refused a repeated
+     ;; literal key, so there is nothing for jolt-hash-map's duplicate scan over
+     ;; a rest list to find (the reference compiler's RT.mapUniqueKeys for a
+     ;; MapExpr with constant, distinct keys). Bounded at the keyword array
+     ;; limit — past it the literal is hash mode, which the checked constructor
+     ;; still decides. The slot vector is built through ordered-call like any
+     ;; operand list, so values with effects still evaluate left to right.
+     :map (let [kvs (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node))
+                s (if (unique-keyword-key-literal? node)
+                    (ordered-call kvs (mapv emit kvs)
+                      (fn [strs] (str "(amap-slots->pmap (vector " (str/join " " strs) "))")))
+                    (emit-ordered "jolt-hash-map" kvs))]
             (if (const-coll-node? node) (hoist-const-per-site s) s))
     ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
     ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,
