@@ -39,7 +39,9 @@
 ;;
 ;; Only (2) prevents a hang; (1) and (3) would eventually reach the adapter's
 ;; own raise, but they are checked here so the message names the rule instead
-;; of surfacing a host condition. All three are O(1) reads on the escape path.
+;; of surfacing a host condition. All three are O(1) reads on the escape path —
+;; field reads, a vreg read and get-thread-id, nothing that captures a
+;; continuation of its own (see jolt-cc-current-fiber for what that costs).
 ;; They are checked in that order because several can hold at once — see
 ;; jolt-cc-check! for why the ownership answer outranks the lifetime one.
 ;;
@@ -57,17 +59,29 @@
 ;; by eq? is what separates two fibers on the SAME carrier thread, which a
 ;; thread id alone cannot do.
 
-;; The fiber vreg, read the way fibers.ss reads it. Guarded because this file
-;; is loaded from rt.ss after fibers.ss, but the standalone gates load pieces
-;; of the runtime in other orders and a missing fiber layer must degrade to
-;; "not on a fiber" rather than break the capture.
+;; The fiber vreg, read the way fibers.ss reads it. This file is loaded from
+;; rt.ss after fibers.ss, but the standalone gates load pieces of the runtime
+;; in other orders and a missing fiber layer must degrade to "not on a fiber"
+;; rather than break the capture — so the slot INDEX is captured once at load
+;; under a guard (the same guarded-reference pattern fibers.ss uses for its
+;; own late bindings), and the per-call read is a bare vreg read. Not a guard
+;; per call: a `guard` is a full call/cc + handler install (~30 ns and 300
+;; bytes), and a multi-shot capture INSIDE the one-shot's frame promotes that
+;; continuation to multi-shot, after which every return through it copies the
+;; stack segment — the four guards on this path (two at capture, two at
+;; escape) cost each escape 4.6 KB and 190 ns against the 8 ns of call/1cc
+;; itself, 43% of standard-clojure-style's parse time (a letcc per Choice
+;; attempt). The gate pins the allocation.
+(define jolt-cc-fiber-vreg
+  (guard (e (#t #f)) jolt-vreg-current-fiber))
 (define (jolt-cc-current-fiber)
-  (guard (e (#t #f))
-    (let ((r (virtual-register jolt-vreg-current-fiber)))
-      (if (eq? r 0) #f r))))
+  (and jolt-cc-fiber-vreg
+       (let ((r (virtual-register jolt-cc-fiber-vreg)))
+         (if (eq? r 0) #f r))))
 
-(define (jolt-cc-thread-id)
-  (guard (e (#t 0)) (get-thread-id)))
+;; get-thread-id is a Chez primitive on every threaded build, and jolt requires
+;; one (Makefile deps); a non-threaded Chez fails to load rt.ss long before here.
+(define (jolt-cc-thread-id) (get-thread-id))
 
 ;; An escape's identity and state. Kept in a record rather than closed-over
 ;; mutable variables so jolt-escape-fn? can recognise one by its wrapper (see
