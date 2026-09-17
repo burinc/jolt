@@ -565,16 +565,22 @@
              ;; change/establish root binding of: x with set", as Var.set does.
              ((and (string=? method-name "set") (pair? rest))
               (jolt-set-var! obj (car rest)))
-             ;; fn is (IFn) deref(). The cast is the observable half: a var
-             ;; holding a non-fn reports a ClassCastException here rather than
-             ;; handing back a value the caller then fails to invoke.
+             ;; fn is (IFn) deref(). IFn is what clojure.core/ifn? answers — a
+             ;; fn, a keyword, a symbol, a map, a set, a vector, a var, a
+             ;; callable host object, a deftype with invoke — so a var holding
+             ;; a keyword hands the keyword back, as on the JVM (fn? alone
+             ;; refused it). The cast is the observable half: anything else
+             ;; reports a ClassCastException naming the value's class rather
+             ;; than handing back a value the caller then fails to invoke.
              ((and (string=? method-name "fn") (null? rest))
               (let ((v (var-cell-deref obj)))
-                (if (jolt-fn? v)
+                (if (jolt-truthy? (jolt-invoke1 (var-deref "clojure.core" "ifn?") v))
                     v
-                    (throw-jvm (quote ClassCastException)
-                               (string-append (jolt-final-str v)
-                                              " cannot be cast to clojure.lang.IFn")))))
+                    (jolt-throw
+                     (jolt-host-throwable
+                      "java.lang.ClassCastException"
+                      (string-append "class " (guard (c (#t "?")) (jolt-class-name v))
+                                     " cannot be cast to class clojure.lang.IFn"))))))
              (else (dispatch-miss obj method-name rest))))
       ;; java.lang.Throwable interop over a Chez condition. A jolt host error
       ;; (`error`/`assertion-violationf`) raises a Chez condition; Clojure code

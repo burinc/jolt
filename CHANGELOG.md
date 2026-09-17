@@ -75,6 +75,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`set!` on a conveyed binding is refused, as `Var.set` refuses it.** A
+  binding frame now records who pushed it — the fiber running there, else the
+  thread, which is what `Var$TBox.thread` holds — and `set!` / `var-set` /
+  `.set` on a binding the current thread did not push raise "Can't set!: x from
+  non-binding thread". Conveyance shares the parent's frames (a future, an agent
+  action and a go block restore the same pairs, exactly as `Frame.clone` shares
+  the JVM's boxes), so before this a future's `set!` wrote straight into the
+  parent's binding, on the parent's thread, with nothing between them; the
+  parent then read the child's value. A body that needs its own copy pushes one
+  (`binding`, `bound-fn`, `with-bindings`) and may `set!` that, as on the JVM.
+  Seven certified corpus rows.
+
+- **`Thread.start` and an `ExecutorService` task begin with no thread
+  bindings.** Both restored the caller's binding stack into the new thread, so
+  `(binding [*v* 2] (.start (Thread. #(… *v*))))` read 2 where the JVM reads the
+  root; only `future`, `send`, `pmap`, `bound-fn` and core.async convey there,
+  through `binding-conveyor-fn`, and those shims still do. Chez hands a forked
+  thread the forking thread's parameter values, so the empty stack is installed
+  explicitly. Five certified corpus rows say which is which.
+
+- **`(.fn v)` on a var answers any `IFn`, not only a fn.** `Var.fn` is
+  `(IFn) deref()`, and a keyword, symbol, map, set or vector is an `IFn`; the
+  arm tested `fn?` and threw the cast for all of them. It now asks
+  `clojure.core/ifn?`, and the cast it throws for anything else names the
+  value's class, as the JVM's does.
+
 - **Windows: an absolute FILE argument is no longer read as project-relative.**
   `file-arg` recognized one absolute spelling — a leading `/` — so `jolt
   C:/Users/x/hello.clj` (and `jolt run C:\Users\x\hello.clj`, and every UNC

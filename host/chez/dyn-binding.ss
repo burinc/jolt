@@ -2,9 +2,14 @@
 ;; with-local-vars / with-redefs / bound-fn* / get-thread-bindings.
 ;;
 ;; A per-thread dynamic-binding stack: a list of frames, innermost (most recently
-;; pushed) at the HEAD. Each frame is an alist of (var-cell . value) MUTABLE pairs
-;; — so var-set can update the innermost binding in place (set-cdr!), matching
-;; Clojure where var-set targets the current binding, not the root.
+;; pushed) at the HEAD. Each frame is (owner . alist): the alist holds
+;; (var-cell . value) MUTABLE pairs — so var-set can update the innermost binding
+;; in place (set-cdr!), matching Clojure where var-set targets the current
+;; binding, not the root — and `owner` is who pushed it (dyn-owner below), the
+;; JVM's Var$TBox.thread. A frame is SHARED across threads by conveyance (a
+;; future, an agent action, a go block restore the parent's stack, frames and
+;; pairs and all, as Frame.clone shares the TBoxes), so the owner is what lets
+;; Var.set refuse a write from any thread but the one that bound the var.
 ;;
 ;; The binding macro builds a frame as a jolt map (array-map of (var x) -> value);
 ;; push-thread-bindings folds it into the alist. Lookups walk frames by cell
@@ -30,12 +35,18 @@
 ;; not a push: those frames were built by a push that already flagged them.)
 ;; A hand-rolled loop rather than for-each: this is on every push, and the closure
 ;; for-each wants cost a one-var frame ~7 ns of its 140.
+;; The owner of a frame pushed now: the fiber running here, else the OS thread.
+;; A fiber is the unit that binds — its slice carries its own stack, and a fiber
+;; spawned inside a binding conveys the parent's frames exactly as a thread
+;; does — so on a carrier the thread id alone would let one fiber write another's
+;; binding. Gambit has no fibers; its shim answers #f.
+(define (dyn-owner) (or (jolt-current-fiber) (get-thread-id)))
 (define (dyn-push-frame! pairs)
   (let loop ((p pairs))
     (when (pair? p)
       (var-cell-dyn-bound?-set! (caar p) #t)
       (loop (cdr p))))
-  (dyn-binding-stack (cons pairs (dyn-binding-stack))))
+  (dyn-binding-stack (cons (cons (dyn-owner) pairs) (dyn-binding-stack))))
 
 ;; (dyn-with-frame pairs thunk) — THE way to scope a binding frame over a
 ;; dynamic extent. Three sites used to hand-roll it and all three were wrong
@@ -119,8 +130,15 @@
 (define (dyn-walk-frames cell)
   (let loop ((frames (dyn-binding-stack)))
     (and (pair? frames)
-         (or (assq cell (car frames))
+         (or (assq cell (cdar frames))
              (loop (cdr frames))))))
+;; The FRAME holding the innermost binding of CELL, or #f — for the one caller
+;; that needs the owner as well as the pair (jolt-set-var!).
+(define (dyn-find-binding-frame cell)
+  (and (var-cell-dyn-bound? cell)
+       (let loop ((frames (dyn-binding-stack)))
+         (and (pair? frames)
+              (if (assq cell (cdar frames)) (car frames) (loop (cdr frames)))))))
 
 ;; the innermost (cell . value) pair binding CELL, or #f
 (define (dyn-find-binding cell)
@@ -222,7 +240,7 @@
     (if (null? frames)
         m
         (loop (cdr frames)
-              (let frame-loop ((alist (car frames)) (m m))
+              (let frame-loop ((alist (cdar frames)) (m m))
                 (if (null? alist)
                     m
                     (frame-loop (cdr alist)
@@ -247,10 +265,11 @@
 ;; getThreadBinding — SCI's IVar does not name it either — so a binding nobody
 ;; asks about never allocates a box, and `binding` itself is untouched. The table
 ;; is global-behind-a-mutex rather than per-thread because the PAIRS it keys on
-;; are already thread-local (dyn-binding-stack is a thread parameter, and binding
-;; conveyance pushes a frame built from a copied map, not from these pairs) while
-;; the table itself is the one piece that would otherwise be unsynchronized
-;; mutation shared across threads. Weak keys so a popped frame's boxes go with it.
+;; are NOT thread-local: conveyance restores the parent's stack in a future, an
+;; agent action or a go block, frames and pairs and all, so the box for one
+;; binding can be asked for from more than one thread — and on the JVM it is
+;; the same TBox there too, since Frame.clone shares the map. Weak keys so a
+;; popped frame's boxes go with it.
 (define tbox-tbl (make-weak-eq-hashtable))
 (define tbox-mutex (make-mutex))
 (define (jolt-var-thread-binding v)
@@ -274,16 +293,27 @@
 ;; rejects reports the validator rather than the missing binding — the order
 ;; Var.set has, and observable: (var-set #'v bad) on an unbound var says
 ;; "Invalid reference state", not "Can't change/establish root binding".
+;;
+;; A binding found in a frame this thread (or fiber) did not push is a CONVEYED
+;; one — the parent's own pair, shared — and Var.set refuses it: "Can't set!: x
+;; from non-binding thread" (TBox.thread is checked before the write). Without
+;; the check a future's set! wrote straight into the parent's binding, on the
+;; parent's thread, with nothing between them; a body that needs its own copy
+;; pushes one (binding / bound-fn / with-bindings), as it does on the JVM.
 (define (jolt-set-var! v val)
   (if (var-cell? v)
       (begin
         (iref-validate v val)
-        (let ((p (dyn-find-binding v)))
-          (if p
-              (begin (set-cdr! p val) val)
-              (throw-jvm (quote IllegalStateException)
-                         (string-append "Can't change/establish root binding of: "
-                                        (var-cell-name v) " with set")))))
+        (let ((f (dyn-find-binding-frame v)))
+          (cond ((not f)
+                 (throw-jvm (quote IllegalStateException)
+                            (string-append "Can't change/establish root binding of: "
+                                           (var-cell-name v) " with set")))
+                ((not (eqv? (car f) (dyn-owner)))
+                 (throw-jvm (quote IllegalStateException)
+                            (string-append "Can't set!: " (var-cell-name v)
+                                           " from non-binding thread")))
+                (else (set-cdr! (assq v (cdr f)) val) val))))
       (throw-jvm (quote ClassCastException) "set!: not a var")))
 
 ;; alter-var-root: apply f to the current root plus args, atomically.

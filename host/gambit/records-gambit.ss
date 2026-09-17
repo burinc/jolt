@@ -2651,13 +2651,16 @@
           (jolt-set-var! obj (car rest)))
          ((and (string=? method-name "fn") (null? rest))
           (let ((v (var-cell-deref obj)))
-            (if (jolt-fn? v)
+            (if (jolt-truthy?
+                  (jolt-invoke1 (var-deref "clojure.core" "ifn?") v))
                 v
-                (throw-jvm
-                  'ClassCastException
-                  (string-append
-                    (jolt-final-str v)
-                    " cannot be cast to clojure.lang.IFn")))))
+                (jolt-throw
+                  (jolt-host-throwable
+                    "java.lang.ClassCastException"
+                    (string-append
+                      "class "
+                      (guard (c (#t "?")) (jolt-class-name v))
+                      " cannot be cast to class clojure.lang.IFn"))))))
          (else (dispatch-miss obj method-name rest))))
       ((condition? obj)
        (cond
