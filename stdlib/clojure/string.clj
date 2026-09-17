@@ -134,11 +134,12 @@
   ([s value]
    (str-find value (to-str s)))
   ([s value from]
-   ;; JVM String.indexOf clamps: negative from -> 0, from past the end -> nil
+   ;; JVM String.indexOf clamps: negative from -> 0, from past the end -> nil.
+   ;; str-find's third argument is the start index, so the tail is scanned in
+   ;; place rather than copied out first.
    (let [st (to-str s)
-         from (min (max 0 (long from)) (count st))
-         idx (str-find value (subs st from))]
-     (when idx (+ from idx)))))
+         from (min (max 0 (long from)) (count st))]
+     (str-find value st from))))
 
 (defn last-index-of
   "Return last index of value (string or char) in s, optionally

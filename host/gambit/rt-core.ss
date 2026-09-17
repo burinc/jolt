@@ -1322,8 +1322,8 @@
 (define (str-upper s) (string-upcase s))
 (define (str-lower s) (string-downcase s))
 (define (str-reverse-b s) (list->string (reverse (string->list s))))
-(define (str-find needle s)
-  (let ((i (str-index-of s needle 0)))
+(define (str-find needle s . opt)
+  (let ((i (str-index-of s needle (if (pair? opt) (car opt) 0))))
     (if (fx<? i 0) jolt-nil i)))
 ;; The Chez twin (java/natives-str.ss str-last-find): String.lastIndexOf(str,
 ;; from) — the last occurrence that STARTS at or before FROM, or nil; a negative

@@ -118,6 +118,11 @@
                    (= (last (rseq v1)) 0)
                    (= (first sm1) [0 0]) (= (first ss1) 0)
                    (= (first (sorted-map)) nil) (= (first (sorted-set)) nil)
+                   (= (clojure.string/index-of src1 "bar)" 4) 5)
+                   (= (clojure.string/index-of src1 "(foo" 1) 9)
+                   (= (clojure.string/index-of src1 "zzz" 4) nil)
+                   (= (clojure.string/index-of src1 "(foo" -5) 0)
+                   (= (clojure.string/index-of src1 "(foo" 999999) nil)
                    (= (clojure.string/last-index-of src1 "bar)") (- (count src1) 4))
                    (= (clojure.string/last-index-of src1 "(foo" (- (count src1) 1)) (- (count src1) 9)))
       (println "FAIL complexity: wrong values before timing")
@@ -137,6 +142,13 @@
            #(clojure.string/last-index-of src1 "bar)")
            #(clojure.string/last-index-of src2 "bar)")
            "last-index-of is reversing the subject instead of scanning backward (natives-str.ss str-last-index-of-from)")
+
+    ;; ...and index-of's from arity searches the tail in place: it once copied
+    ;; the tail out with subs before scanning it, linear in what follows `from`.
+    (judge "index-of from"
+           #(clojure.string/index-of src1 "bar)" 4)
+           #(clojure.string/index-of src2 "bar)" 4)
+           "index-of's from arity copies the tail (subs) instead of scanning from `from` in place (str-find's start index)")
 
     (judge "last-index-of from"
            #(clojure.string/last-index-of src1 "(foo" (- (count src1) 1))
