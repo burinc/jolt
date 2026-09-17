@@ -1351,6 +1351,19 @@
       "   (identical? (:v g) (:a (:m g))) (:z g) (meta (conj (:v g) 3))])")
     "[{:m 1} {:n 2} {:m 1} {:l 3} {:s 4} {:e 5} {:z 6} true (7) {:m 1}]")
 
+;; a with-meta copy of a cell whose tail is still pending shares that tail
+;; through the original (natives-meta.ss coll-with-meta): the copy's tail is a
+;; `rest` descriptor over the original cell, so it dumps like any lazy cell and
+;; forces once on either side of the image
+(is "a with-meta copy of a cell with a pending tail dumps, restores, and forces once"
+    (string-append
+      "(let [s (seq (map inc (list 1 2 3)))"
+      "      t (with-meta s {:m 1})"
+      "      _ (jolt.host/image-write! \"" tmp "\" {:t t :s s})"
+      "      g (jolt.host/image-read \"" tmp "\")]"
+      "  [(meta (:t g)) (vec (:t g)) (vec (:s g)) (vec t) (vec s)])")
+    "[{:m 1} [2 3 4] [2 3 4] [2 3 4] [2 3 4]]")
+
 ;; --- refs travel by value (format 3, jolt-867l.11): descriptor on dump,
 ;; re-mint on restore. Value, meta, shared identity, cycles, and STM liveness
 ;; all survive; the raw jolt-ref record never enters the fasl, so its layout

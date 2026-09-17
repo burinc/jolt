@@ -118,11 +118,25 @@
     ((pvec? x) (%mk-pvec (pvec-cnt x) (pvec-shift x) (pvec-root x) (pvec-tail x) (pvec-ent x) (pvec-hasheq x) m))
     ((pmap? x) (%mk-pmap (pmap-root x) (pmap-cnt x) (pmap-hasheq x) m))
     ((pset? x) (%mk-pset (pset-m x) (pset-hasheq x) m))
-    ;; The lock field is #f: it holds a mutex only while a force is in progress,
-    ;; borrowed for that cell alone (seq.ss force-claimed!), and the copy is a
-    ;; different cell.
-    ((cseq? x) (make-cseq (cseq-head x) (cseq-tail x) (cseq-forced-flag x)
-                          (cseq-kind x) (cseq-cvec x) (cseq-ci x) (cseq-crest x) #f m))
+    ;; Cons.withMeta is new Cons(meta, _first, _more): the copy SHARES the rest.
+    ;; A cell's tail is its own published word (seq.ss), so a tail still pending
+    ;; -- a thunk or a lazy-src descriptor -- cannot be copied as it stands:
+    ;; each cell would run it, and (with-meta (seq (map f xs)) m) then called f
+    ;; once per element for the original and again for the copy. The copy's
+    ;; tail is instead a descriptor that forces X and takes ITS answer (lz-rest,
+    ;; the producer jolt-rest already registers, so the copy still dumps to an
+    ;; image), and the thunk runs once, in X, whichever cell is walked first. A
+    ;; realized tail, or a cvec cell's #f (computed from its own fields, no
+    ;; thunk to run twice), is shared as it is; the mirror flag follows the
+    ;; word. The lock field is #f: it holds a mutex only while a force is in
+    ;; progress, borrowed for that cell alone (seq.ss force-claimed!), and the
+    ;; copy is a different cell.
+    ((cseq? x)
+     (let ((t (cseq-tail x)))
+       (make-cseq (cseq-head x)
+                  (if (force-pending? t) (make-lazy-src lz-rest x #f) t)
+                  (seq-tail-realized? t)
+                  (cseq-kind x) (cseq-cvec x) (cseq-ci x) (cseq-crest x) #f m)))
     ((empty-list-t? x) (make-empty-list-t m))
     ;; LazySeq.withMeta is new LazySeq(meta, seq()): the copy is REALIZED and
     ;; shares the forced seq, so the body runs once for both, and forcing X here

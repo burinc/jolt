@@ -1753,7 +1753,7 @@
           '("Thread" "java.lang.Thread"))
 (register-host-methods! "user-thread"
   (list (cons "start" (lambda (self)
-          (let ((st (jhost-state self)) (snap (dyn-binding-stack)))
+          (let ((st (jhost-state self)))
             (when (vector-ref st 5)
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
                                                "Thread already started")))
@@ -1773,7 +1773,13 @@
                ;; and register that handle now, so a handle someone else takes for
                ;; this thread before it first asks who it is is the live one
                (current-thread-handle)
-               (dyn-binding-stack snap)
+               ;; Thread.start conveys NOTHING: the new thread begins with no
+               ;; thread bindings on the JVM, and bound-fn is how a body carries
+               ;; the caller's in. Chez hands a forked thread the forking thread's
+               ;; parameter values, so the empty stack is installed explicitly —
+               ;; a snapshot restored here used to make a body read the caller's
+               ;; binding where the JVM reads the root.
+               (dyn-binding-stack '())
                ;; surface a thread body's throw like the JVM's default uncaught-
               ;; exception handler; the thread still completes (isAlive/join
               ;; semantics unchanged). Reporting failures are swallowed.
@@ -2348,9 +2354,14 @@
             '("Executors" "java.util.concurrent.Executors")))
 ;; submit, as a named procedure: invokeAll and invokeAny below are defined in
 ;; terms of it, exactly as the JVM's AbstractExecutorService defines them.
+;; A task runs with NO thread bindings, as on the JVM: ExecutorService conveys
+;; nothing (future, send, pmap and core.async do, each through
+;; binding-conveyor-fn, and each of those shims restores a snapshot). The empty
+;; stack is installed per task rather than left to the worker's own, which Chez
+;; seeded from whoever forked the worker.
 (define (executor-submit self thunk*)
-  (let ((fut (make-j-future)) (snap (dyn-binding-stack)) (thunk (runnable->thunk thunk*)))
-    (executor-enqueue! self (lambda () (dyn-binding-stack snap) (j-future-complete! fut thunk)))
+  (let ((fut (make-j-future)) (thunk (runnable->thunk thunk*)))
+    (executor-enqueue! self (lambda () (dyn-binding-stack '()) (j-future-complete! fut thunk)))
     fut))
 (define (executor-task-list tasks)
   (let ((s (jolt-seq tasks))) (if (jolt-nil? s) '() (seq->list s))))
@@ -2371,12 +2382,11 @@
   (list (cons "submit" executor-submit)
         (cons "execute" (lambda (self thunk*)
           (let ((thunk (runnable->thunk thunk*)))
-          (let ((snap (dyn-binding-stack)))
-            (executor-enqueue! self (lambda () (dyn-binding-stack snap)
+            (executor-enqueue! self (lambda () (dyn-binding-stack '())   ; no conveyance, as submit
               (guard (e (#t (guard (_ (#t #f))
                               (display "Exception in executor task:\n" (current-error-port))
                               (jolt-report-throwable e (current-error-port)))))
-                (jolt-invoke thunk)))))
+                (jolt-invoke thunk))))
           jolt-nil)))
         ;; Shutdown wakes BOTH conditions, and every waiter on each: task-cond so
         ;; that all the idle workers see the flag and leave (the one place a
