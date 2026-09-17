@@ -21,10 +21,6 @@
 ;; (define-syntax define-jrec-family ...) — pre-expanded below
 
 ;; expansion of (define-jrec-family 8)
-(define-record-type (jrec make-jrec0 jrec?)
-  (fields (immutable desc) (immutable ext) (mutable hasheq))
-  (nongenerative chez-jrec-v5))
-
 (define-record-type (jrec1 make-jrec1 jrec1?)
   (parent jrec)
   (fields (mutable f0))

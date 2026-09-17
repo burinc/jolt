@@ -82,6 +82,91 @@
     ((_ e) (not (jolt-nil-t? e)))
     ((_ e ...) (jolt-some?-fn e ...))))
 
+;; --- collection record layouts -------------------------------------------------
+;; The records behind jolt's collections are defined HERE, in the first shared
+;; file, rather than beside their operations. A generated predicate or accessor
+;; is open-coded only in forms compiled after its definition
+;; (scheme-adapter-runtime.ss define-record-type), and jolt=, jolt-hash and
+;; hasheq.ss dispatch on every one of these types before collections.ss, seq.ss,
+;; records.ss and lazy-bridge.ss load. A reference compiled earlier still works,
+;; through the variable, but as a call on every arm. test/chez/record-inline-
+;; test.ss pins the order: the dispatch files name no record op defined in a
+;; file that loads after them. The constructors that fill defaults (mk-pvec,
+;; make-pmap, make-pset, fresh-empty-list, make-jrec) stay with the operations.
+;;
+;; Every layout below travels raw in a state image, so each is image-format
+;; surface: a field change is a new nongenerative tag plus a legacy arm in
+;; state-image.ss.
+
+;; persistent vector (collections.ss): cnt elements in a 32-way trie (root,
+;; height = shift bits) plus a tail chunk; `ent` is the vector's kind (plain /
+;; map entry / subvec); `hasheq` caches the structural hash (0 = unset); `meta`
+;; is the vector's metadata, jolt-nil or a map -- PersistentVector's _meta.
+;; natives-meta.ss owns every read and write of the meta slot (it is written
+;; only on an instance nobody else holds yet; see coll-meta-set! there).
+;; chez-pvec-v3 (no meta slot) restores through state-image.ss's legacy arm.
+(define-record-type (pvec %mk-pvec pvec?)
+  (fields cnt shift root tail ent (mutable hasheq) (mutable meta)) (nongenerative chez-pvec-v4))
+
+;; persistent map (collections.ss): `root` is a slot vector in array mode or an
+;; hnode in hash mode, `cnt` the entry count, `hasheq` the cached hash, `meta`
+;; the map's metadata (natives-meta.ss owns the slot, as for pvec). The two
+;; previous generations (chez-pmap-v5: root cnt hasheq; chez-pmap-v4: root cnt
+;; order hasheq all-kw, a trie root plus an order list) restore through
+;; state-image.ss's legacy arm.
+(define-record-type (pmap %mk-pmap pmap?)
+  (fields root cnt (mutable hasheq) (mutable meta)) (nongenerative chez-pmap-v6))
+
+;; persistent set (collections.ss): `m` is the backing hash-mode pmap; `hasheq`
+;; and `meta` as for pvec/pmap. chez-pset-v2 (no meta slot) restores through
+;; state-image.ss's legacy arm.
+(define-record-type (pset %mk-pset pset?)
+  (fields m (mutable hasheq) (mutable meta)) (nongenerative chez-pset-v3))
+
+;; seq cell (seq.ss): the head; the tail, ONE published word (see seq.ss
+;; seq-tail-realized?); the forced flag; the cell's kind (sk-* in seq.ss); the
+;; chunk fields cvec/ci/crest; the claim lock (slot 7, seq.ss cseq-lock-index,
+;; which is why `meta` comes last); and the cell's metadata, jolt-nil or a map --
+;; the _meta of a PersistentList node or a Cons (natives-meta.ss owns the slot;
+;; written only on a cell nobody else holds yet). chez-cseq-v6, without the meta
+;; slot, restores through state-image.ss's legacy arm.
+(define-record-type cseq
+  (fields head (mutable tail) (mutable forced? cseq-forced-flag cseq-forced-flag-set!) kind cvec ci crest (mutable lock) (mutable meta))
+  (nongenerative chez-cseq-v7))
+
+;; The empty seq (Clojure's empty list ()), distinct from nil. Its one field is
+;; its metadata, jolt-nil or a map (EmptyList extends Obj): a metadata-bearing ()
+;; -- an `empty`/`pop`/`with-meta` result -- is a fresh instance, so the shared
+;; jolt-empty-list (seq.ss) never carries any. A fielded record is also what
+;; keeps Chez from interning every () into one object. natives-meta.ss owns the
+;; slot; empty-list-v2 restores through state-image.ss's legacy arm.
+(define-record-type empty-list-t (fields (mutable meta)) (nongenerative empty-list-v3))
+
+;; deferred seq node (lazy-bridge.ss): `thunk` is the node's ONE published word
+;; (the thunk until the node is forced, then the seq or a lazyseq-fail); val,
+;; realized? and error? are mirrors written before it, for the image; `lock` is
+;; the claim lock (slot 4, which is why `meta` comes last); `meta` is LazySeq's
+;; _meta (natives-meta.ss owns the slot; written only on a node nobody else
+;; holds yet). jolt-lazyseq-v2, without the meta slot, restores through
+;; state-image.ss's legacy arm.
+(define-record-type jolt-lazyseq
+  (fields (mutable thunk) (mutable val)
+          (mutable realized? jolt-lazyseq-realized-flag jolt-lazyseq-realized-flag-set!)
+          (mutable error? jolt-lazyseq-error-flag jolt-lazyseq-error-flag-set!)
+          (mutable lock) (mutable meta))
+  (nongenerative jolt-lazyseq-v3))
+
+;; deftype/defrecord instance base (records.ss): `desc` the type descriptor,
+;; `ext` the extension map, `hasheq` the defrecord __hasheq slot generalized to
+;; the family -- 0 = unset; a defrecord caches its structural hash here, a plain
+;; deftype its identity hash, and a type with a declared hasheq/hashCode never
+;; fills it (records-coll.ss jrec-hasheq-slow). The fielded children jrec1..8
+;; and the spill type jrec* (records.ss define-jrec-family) inherit these three
+;; fields, so desc-keyed dispatch stays uniform across the family.
+(define-record-type (jrec make-jrec0 jrec?)
+  (fields (immutable desc) (immutable ext) (mutable hasheq))
+  (nongenerative chez-jrec-v5))
+
 ;; --- the exit-only-cleanup marker --------------------------------------------
 ;; A fiber park is a continuation escape that is NOT an exit — the computation
 ;; resumes where it left off. try/finally lowers to dynamic-wind, so its

@@ -116,6 +116,143 @@
 (define (sa-real-time-ms)
   (real-time))
 
+;; ---- records: open-coded predicates, accessors, mutators, constructors -------
+;;
+;; A nongenerative type's rtd is a compile-time constant in Chez, and cp0
+;; open-codes (record? v 'rtd), (record-accessor 'rtd i) and (record-constructor
+;; rcd) when the rtd is a constant. What it cannot see through is the top-level
+;; VARIABLE define-record-type binds each generated name to: the runtime is a
+;; sequence of top-level forms, so a (pvec? x) in a later form is a procedure
+;; call through the symbol's value cell (~1.3 ns alone, 4-6 ns per arm inside
+;; a dispatch chain), and the predicate's test cannot merge into the accessor
+;; that follows it.
+;;
+;; This define-record-type keeps the R6RS surface and, after the R6RS form has
+;; bound the generated names as variables, rebinds them as SYNTAX: in operator
+;; position a name expands to the open-coded form on the constant rtd; as a
+;; value it denotes a procedure over the same rtd, kept under a %rec/ alias, so
+;; (map pvec? xs) and the arm registries that take a predicate keep working on
+;; one stable object. (if (pvec? x) (pvec-cnt x) ...) compiles to a
+;; single type test.
+;;
+;; The variable binding stays on purpose: a file loaded EARLIER than the type's
+;; (collections.ss calls jrec? before records.ss loads) compiled its reference
+;; as a variable call, and Chez keeps a symbol's value cell when the name is
+;; later rebound as syntax, so those sites keep working as they did.
+;;
+;; What is kept, and what changes:
+;;   - a wrong-arity call falls through to the procedure, so it fails at run
+;;     time exactly as before rather than as a syntax error;
+;;   - set! of a generated name is rejected at expansion (nothing in the host
+;;     assigns one, and an assignment would silently miss the open-coded sites);
+;;   - a type error from an open-coded accessor or mutator names the ENCLOSING
+;;     procedure as who; the message and the value/type irritants are the same;
+;;   - a generative type, a name spec that is not identifiers, or a field spec
+;;     this parser does not recognise gets the plain R6RS definition; a type
+;;     with a protocol keeps its protocol constructor as a procedure, and so
+;;     does a child type (its constructor arity includes the parent's fields,
+;;     which are not visible here) -- their predicates and accessors are still
+;;     open-coded.
+;; TOP LEVEL ONLY: a body cannot hold both the variable and the syntax binding
+;; of one name, so a define-record-type inside a body fails to expand with
+;; "multiple definitions ... in body" -- write %r6rs-define-record-type there.
+;; Every host record is defined at top level. Gambit has its own
+;; define-record-type (host/gambit/prelude-shims.ss) and never loads this file;
+;; the shared host sources are untouched.
+;;
+;; The import is deliberately this narrow: one binding under a private name,
+;; so nothing here re-exposes Chez's error/warning over rt.ss's shadowing.
+(import (rename (only (rnrs records syntactic) define-record-type)
+                (define-record-type %r6rs-define-record-type)))
+
+;; (%define-record-op name proc (arg ...) body): NAME as syntax -- PROC as a
+;; value, BODY over ARG ... in operator position, PROC again on any other arity.
+(define-syntax %define-record-op
+  (syntax-rules ()
+    ((_ name proc (arg ...) body)
+     (define-syntax name
+       (lambda (x)
+         (syntax-case x ()
+           (id (identifier? #'id) #'proc)
+           ((_ arg ...) #'body)
+           ((_ . rest) #'(proc . rest))))))))
+
+(define-syntax define-record-type
+  (lambda (x)
+    (define (sym . parts)
+      (string->symbol
+       (apply string-append
+              (map (lambda (p) (if (symbol? p) (symbol->string p) p)) parts))))
+    (define (hidden name) (sym "%rec/" name))
+    ;; one field spec -> (accessor mutator-or-#f), or #f when unrecognised
+    (define (field-info type-name fs)
+      (cond ((symbol? fs) (list (sym type-name "-" fs) #f))
+            ((and (pair? fs) (memq (car fs) '(immutable mutable))
+                  (pair? (cdr fs)) (symbol? (cadr fs)))
+             (let* ((f (cadr fs))
+                    (explicit-acc (and (pair? (cddr fs)) (symbol? (caddr fs)) (caddr fs)))
+                    (explicit-mut (and explicit-acc (pair? (cdddr fs)) (symbol? (cadddr fs)) (cadddr fs)))
+                    (acc (or explicit-acc (sym type-name "-" f)))
+                    (mut (and (eq? (car fs) 'mutable)
+                              (or explicit-mut (sym type-name "-" f "-set!")))))
+               (list acc mut)))
+            (else #f)))
+    (syntax-case x ()
+      ((_ spec clause ...)
+       (let* ((d (syntax->datum x))
+              (spec-d (cadr d))
+              (clauses (cddr d))
+              (name (if (pair? spec-d) (car spec-d) spec-d))
+              (ctor (if (pair? spec-d) (cadr spec-d) (sym "make-" name)))
+              (pred (if (pair? spec-d) (caddr spec-d) (sym name "?")))
+              (fields (let ((fc (assq 'fields clauses))) (if fc (cdr fc) '())))
+              (infos (map (lambda (fs) (field-info name fs)) fields))
+              (ok? (and (symbol? name) (symbol? ctor) (symbol? pred)
+                        (assq 'nongenerative clauses)
+                        (not (memq #f infos))))
+              (ctor-inline? (and ok?
+                                 (not (assq 'protocol clauses))
+                                 (not (assq 'parent clauses)))))
+         (if (not ok?)
+             #'(%r6rs-define-record-type spec clause ...)
+             (let* ((ctx (syntax-case #'spec () ((n . _) #'n) (n #'n)))
+                    (ctor-args (map (lambda (i) (sym "a" (number->string i)))
+                                    (iota (length fields))))
+                    ;; (name args inline-form procedure-form) per generated name.
+                    ;; The procedure is rebuilt from the rtd rather than read from
+                    ;; the public name: a top-level begin installs every
+                    ;; definition head before it expands a right-hand side, so
+                    ;; by then the public name is already the syntax below.
+                    (rtd `(record-type-descriptor ,name))
+                    (ops
+                      (append
+                       (list (list pred '(v) `(record? v ,rtd) `(record-predicate ,rtd)))
+                       (if ctor-inline?
+                           (let ((rc `(record-constructor (record-constructor-descriptor ,name))))
+                             (list (list ctor ctor-args `(,rc ,@ctor-args) rc)))
+                           '())
+                       (let loop ((infos infos) (i 0) (acc '()))
+                         (if (null? infos)
+                             (reverse acc)
+                             (let ((a (car (car infos))) (m (cadr (car infos))))
+                               (loop (cdr infos) (+ i 1)
+                                     (append
+                                      (if m
+                                          (list (list m '(v n)
+                                                      `((record-mutator ,rtd ,i) v n)
+                                                      `(record-mutator ,rtd ,i)))
+                                          '())
+                                      (list (list a '(v)
+                                                  `((record-accessor ,rtd ,i) v)
+                                                  `(record-accessor ,rtd ,i)))
+                                      acc))))))))
+               (datum->syntax ctx
+                 `(begin
+                    (%r6rs-define-record-type ,spec-d ,@clauses)
+                    ,@(map (lambda (op) `(define ,(hidden (car op)) ,(cadddr op))) ops)
+                    ,@(map (lambda (op) `(%define-record-op ,(car op) ,(hidden (car op)) ,(cadr op) ,(caddr op)))
+                           ops))))))))))
+
 ;; ---- R5: io remainder (mtime) + the last GC hook -----------------------------
 
 ;; (sa-file-mtime-ms path) -> exact integer
