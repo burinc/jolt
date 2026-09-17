@@ -1140,13 +1140,12 @@
          protos impls)))
     ;; the shim's instance methods, for a class a jhost tag models. Two tags can
     ;; name one class, so both are walked; a name registered under both surfaces
-    ;; twice, as an interface method inherited twice does on the JVM.
+    ;; twice, as an interface method inherited twice does on the JVM. A tag's
+    ;; entries include what it inherits (derive-host-methods!), an override once,
+    ;; as getMethods lists a superclass's public methods on the JVM.
     (for-each
      (lambda (tag)
-       (let ((h (hashtable-ref host-methods-tbl tag #f)))
-         (when h
-           (let-values (((names fns) (hashtable-entries h)))
-             (vector-for-each (lambda (n f) (add! nm n f #f)) names fns)))))
+       (for-each (lambda (e) (add! nm (car e) (cdr e) #f)) (host-method-entries tag)))
      (jhost-tags-for-fqn fqn))
     (for-each (lambda (p) (add! nm (car p) (cdr p) #t)) (class-static-members nm #t))
     (make-jolt-array (list->vector (reverse acc)) 'objects)))

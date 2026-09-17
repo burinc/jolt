@@ -2207,8 +2207,7 @@
 ;; method", which is what lets that arm fall through to its own error.
 (set-rd-class-method-hook!
   (lambda (tag method-name args)
-    (let* ((h (hashtable-ref host-methods-tbl "class" #f))
-           (f (and h (hashtable-ref h method-name #f))))
+    (let ((f (host-method-ref "class" method-name)))
       (and f (list (apply f (jolt-class-for tag) args))))))
 
 ;; (class x) on a jclass value returns java.lang.Class, so (instance? Class

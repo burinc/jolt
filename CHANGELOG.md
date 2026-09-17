@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ScheduledExecutorService`: `schedule`, `scheduleAtFixedRate` and
+  `scheduleWithFixedDelay` on the scheduled pools.**
+  `Executors/newSingleThreadScheduledExecutor` and `newScheduledThreadPool`
+  answered plain pools, so `(.schedule ex f 1 TimeUnit/MILLISECONDS)` was "No
+  matching method schedule found taking 3 args". The pool's own workers now
+  attend a due-ordered delayed queue, the shape of the JVM's
+  `DelayedWorkQueue` (one idle worker times the head, the rest wait for a
+  signal), and the JVM's consequences follow from it: a delayed one-shot still
+  runs after `shutdown`, a periodic task is cancelled there, a periodic task
+  that throws stops and its `get` raises the failure, `shutdownNow` hands the
+  pending delayed tasks back as they are. The future is a
+  `ScheduledFutureTask` — `deref`, `get`, `cancel`, `getDelay`, `compareTo`,
+  `run` — and `ScheduledThreadPoolExecutor.` constructs the pool directly. A
+  plain pool still has no `schedule`. Fifteen corpus rows certify the surface
+  against Clojure 1.12.5; three class-model details it does not reproduce
+  (`getMaximumPoolSize`, the single-thread factory's wrapper class, the class
+  of `submit`'s future) are documented divergences. (jolt-hgjo)
+- **Shim tags can derive from another tag's method table.** A host class
+  that extends another shim's class (`ScheduledThreadPoolExecutor` over
+  `ThreadPoolExecutor`) answers the parent's members without copying its table
+  — a copy would freeze the parent as it stood, so a member registered later
+  reached one tag and not the other. `derive-host-methods!` names the parent,
+  and dispatch walks the chain on a miss only. The class graph stays the one
+  source of truth for ancestry: a derivation is refused unless the child's
+  class is a strict descendant of the parent's there, so a layout claim cannot
+  contradict the class claim and two layouts of one class cannot reach each
+  other's procedures. An alias of a derived tag inherits the link, reflection
+  lists a shadowed member once, and `make hostregistry` pins all of it.
+
 - **The rest of `clojure.lang.Var`'s instance surface: `toSymbol`, `unbindRoot`,
   `set`, `fn`, and the `ns` / `sym` FIELD spellings.** The var shim answered
   eighteen members but not these, so each raised "No matching field found" — and
