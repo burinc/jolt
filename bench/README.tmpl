@@ -46,6 +46,12 @@ Reading it:
   `System/gc` is a hint there and a full collection here.
 - **`*-unhinted`** rows are the same source with the type hints removed — what
   a hint buys, and what unhinted library code pays.
+- **`parallel-colls`** is eight threads doing the same per-call work on their
+  own values, so `mean:` is a wall clock that a lock anywhere on those paths
+  multiplies. It prints its one-thread time and the per-thread slowdown above
+  `mean:`; read the slowdown against the JVM's, which sits near 2× on the same
+  machine because eight threads share one allocator and one memory bus there
+  too. Noisier than a single-threaded row (±10%).
 - **`compile-forms`** measures jolt compiling, not running. The reference
   builds bytecode and generates no native code at load; jolt asks Chez for
   optimized native code for every form, which is roughly half its time.
@@ -149,6 +155,17 @@ What 0.8.6's performance changes are covered by: `byte-arrays` (hinted
 rest, var roots that stream), `compile-forms` and `literals` (the constant
 pool keyed by form identity), `printing` (`format`), and `startup` (the boot
 image codecs and the LZ4 ceiling fallback).
+
+What the 2026-09 round after 0.8.8 is covered by: `parallel-colls` (the four
+process-wide locks that were on per-call paths, the atom's compare-and-swap,
+and metadata as a field — eight threads on their own values, where a shared
+lock shows as a per-thread slowdown), `metadata` (meta in a slot of the
+collection record: `with-meta` is a copy, a carry is a slot read), and
+`coll-dispatch` (the record predicates and accessors in front of every
+collection op open-coded, and the collection layouts loaded ahead of the
+dispatchers so it applies to them; `make recordinline` gates the mechanism,
+the row says what it is worth). `cst-format` is the end-to-end row those
+three feed.
 
 ## A/B against a change
 
