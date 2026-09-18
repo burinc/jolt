@@ -519,6 +519,24 @@
 ;; through the shell, which needed an env program on PATH and, on Windows, a
 ;; command cmd.exe does not have: (System/getenv) answered an empty map and a
 ;; ProcessBuilder child inherited nothing.
+;; The two kernel32 entry points the Windows read uses, resolved ONCE: a
+;; (get . free-or-#f) pair, or #f when kernel32 has no GetEnvironmentStringsW.
+;; load-shared-object prepends a handle to Chez's search list every time it is
+;; called, so loading kernel32 per read — every (System/getenv) map and every
+;; ProcessBuilder child — would lengthen every later foreign-entry lookup and
+;; re-promote kernel32 above each :jolt/native loaded since.
+(define sa-windows-env-entries
+  (let ((resolved #f) (entries #f))
+    (lambda ()
+      (unless resolved
+        (set! resolved #t)
+        (guard (e (#t #f)) (load-shared-object "kernel32.dll"))
+        (when (foreign-entry? "GetEnvironmentStringsW")
+          (set! entries
+                (cons (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f)
+                      (and (foreign-entry? "FreeEnvironmentStringsW")
+                           (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f))))))
+      entries)))
 (define (sa-environment-pairs)
   (define (c-string addr)
     (let loop ((n 0))
@@ -550,11 +568,9 @@
        (foreign-ref 'void* (foreign-entry "environ") 0))
       (else #f)))
   (define (windows-block)
-    (guard (e (#t #f)) (load-shared-object "kernel32.dll"))
-    (and (foreign-entry? "GetEnvironmentStringsW")
-         (let* ((get (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f))
-                (free (and (foreign-entry? "FreeEnvironmentStringsW")
-                           (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f)))
+    (and (sa-windows-env-entries)
+         (let* ((get (car (sa-windows-env-entries)))
+                (free (cdr (sa-windows-env-entries)))
                 (block (get)))
            (and (not (eqv? block 0))
                 (dynamic-wind

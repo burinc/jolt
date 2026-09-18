@@ -171,14 +171,20 @@
                       (cond ((zentry-mtime e) => make-file-time)
                             ((= (zentry-xdostime e) -1) jolt-nil)
                             (else (make-file-time (zentry-time e)))))))
-   (zentry-setter "setLastModifiedTime"
-                  (lambda (e t)
-                    (cond ((jolt-nil? t) (zip-throw "java.lang.NullPointerException" "lastModifiedTime"))
-                          ((file-time? t)
-                           (let ((ms (file-time-ms t)))
-                             (zentry-xdostime-set! e (zip-java->xdostime ms))
-                             (zentry-mtime-set! e ms)))
-                          (else (zip-class-cast t "java.nio.file.attribute.FileTime")))))
+   ;; setLastModifiedTime answers the entry (public ZipEntry setLastModifiedTime),
+   ;; so (-> e (.setLastModifiedTime t) ...) chains as on the JVM; the other
+   ;; setters are void
+   (cons "setLastModifiedTime"
+         (zip-method "setLastModifiedTime" '(1)
+                     (lambda (self t)
+                       (let ((e (zentry-of self)))
+                         (cond ((jolt-nil? t) (zip-throw "java.lang.NullPointerException" "lastModifiedTime"))
+                               ((file-time? t)
+                                (let ((ms (file-time-ms t)))
+                                  (zentry-xdostime-set! e (zip-java->xdostime ms))
+                                  (zentry-mtime-set! e ms)))
+                               (else (zip-class-cast t "java.nio.file.attribute.FileTime"))))
+                       self)))
    ;; the size, compressed size and CRC-32 setters check as lines 262-330 do
    (zentry-setter "setSize"
                   (lambda (e x)

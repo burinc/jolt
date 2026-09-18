@@ -238,8 +238,13 @@
 (define (zstream-open? zs) (not (eqv? 0 (zstream-addr zs))))
 
 ;; The z_stream of an open stream. A closed one throws, as the JDK does after
-;; end(); zip-*.ss check first, so this only stops a read at address 0.
+;; end(); zip-*.ss check first, so this only stops a read at address 0. What is
+;; not a zstream at all is the stub an image restore left where an open stream
+;; was (state-image.ss image-external?): the address never crossed processes.
 (define (zstream-live-addr zs)
+  (unless (zstream? zs)
+    (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException"
+                                     "java.util.zip: the zlib stream was open when its image was written and did not travel; open a new one")))
   (let ((addr (zstream-addr zs)))
     (when (eqv? addr 0)
       (throw-jvm 'NullPointerException "java.util.zip: the zlib stream is closed"))

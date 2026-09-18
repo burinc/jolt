@@ -351,39 +351,56 @@
       close!)))
 
 ;; Raw-deflate BV inflated, expecting SIZE bytes: one zlib stream, fed a window
-;; at a time. A stream that ends early or late is the JDK's ZipException.
+;; at a time and asked for a window at a time. SIZE is the central directory's
+;; claim: it is checked against what came out, never trusted for an allocation
+;; — a damaged or crafted header says 0xFFFFFFFF, and the output grows only as
+;; the stream produces. A stream that ends early or late is the JDK's
+;; ZipException.
+(define zip-output-window 65536)
 (define (zip-inflate-raw bv size)
   (let-values (((zs code msg) (zstream-open 'inflate -15 0 0)))
     (unless zs (zip-throw "java.lang.InternalError" (or msg "inflateInit2 failed")))
     (dynamic-wind
       (lambda () #f)
       (lambda ()
-        (let ((out (make-bytevector size))
-              (len (bytevector-length bv)))
-          (let loop ((pos 0) (written 0))
+        (let ((len (bytevector-length bv)))
+          (define (grown out need)
+            (if (<= need (bytevector-length out))
+                out
+                (let ((bigger (make-bytevector (min size (max need (* 2 (bytevector-length out)))))))
+                  (bytevector-copy! out 0 bigger 0 (bytevector-length out))
+                  bigger)))
+          (define (trimmed out written)
+            (if (= written (bytevector-length out))
+                out
+                (let ((exact (make-bytevector written)))
+                  (bytevector-copy! out 0 exact 0 written)
+                  exact)))
+          (let loop ((pos 0) (written 0) (out (make-bytevector (min size zip-output-window))))
             (let* ((n (min zip-input-window (- len pos)))
                    (in (let ((w (make-bytevector n))) (bytevector-copy! bv pos w 0 n) w)))
               (let-values (((code consumed produced bytes)
-                            (zstream-step! zs z-no-flush in (- size written))))
+                            (zstream-step! zs z-no-flush in (min zip-output-window (- size written)))))
                 (cond
                   ((or (= code z-ok) (= code z-stream-end) (= code z-buf-error))
-                   (bytevector-copy! bytes 0 out written produced)
-                   (let ((written (+ written produced))
-                         (pos (+ pos consumed)))
-                     (cond
-                       ((= code z-stream-end)
-                        (unless (= written size)
-                          (zip-zerror (string-append "invalid entry size (expected "
-                                                     (number->string size) " but got "
-                                                     (number->string written) " bytes)")))
-                        out)
-                       ((and (= pos len) (= produced 0))
-                        (zip-throw "java.io.EOFException" "Unexpected end of ZLIB input stream"))
-                       ((and (= written size) (< pos len))
-                        ;; the JDK's inflater stream stops reading at size;
-                        ;; the rest of the compressed bytes are not looked at
-                        out)
-                       (else (loop pos written)))))
+                   (let ((out (grown out (+ written produced))))
+                     (bytevector-copy! bytes 0 out written produced)
+                     (let ((written (+ written produced))
+                           (pos (+ pos consumed)))
+                       (cond
+                         ((= code z-stream-end)
+                          (unless (= written size)
+                            (zip-zerror (string-append "invalid entry size (expected "
+                                                       (number->string size) " but got "
+                                                       (number->string written) " bytes)")))
+                          (trimmed out written))
+                         ((and (= pos len) (= produced 0))
+                          (zip-throw "java.io.EOFException" "Unexpected end of ZLIB input stream"))
+                         ((and (= written size) (< pos len))
+                          ;; the JDK's inflater stream stops reading at size;
+                          ;; the rest of the compressed bytes are not looked at
+                          (trimmed out written))
+                         (else (loop pos written out))))))
                   ((= code z-data-error)
                    (zip-zerror (or (zstream-message zs) "invalid stored block lengths")))
                   (else (zip-throw "java.lang.InternalError" (zstream-message zs)))))))))

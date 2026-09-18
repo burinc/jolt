@@ -75,6 +75,12 @@
       (and (hashtable? x) (not (image-eq-hashtable? x)))
       (port? x)
       (thread? x)
+      ;; An open zlib stream (java/zlib.ss): a record around a malloc'd z_stream
+      ;; that only this process's zlib knows. Chez would fasl the record and the
+      ;; copy would carry the address verbatim, and the first inflate through it
+      ;; in another process writes through memory zlib never allocated there.
+      ;; A closed one holds address 0 and travels as the closed stream it is.
+      (and (zstream? x) (zstream-open? x))
       ;; A var-rooted multimethod or reify: code, like a named fn, and written the
       ;; same way -- as the var's name through the fn-ref descriptor. code-value?
       ;; is a two-predicate check and runs before the table lookup, so this costs
@@ -573,6 +579,13 @@
   ;; a Chez thread object exposes no identity of its own (get-thread-id names
   ;; the CALLING thread) — the kind string is the honest detail
   (lambda (x) (jolt-hash-map)))
+;; an open zlib stream stubs with its direction (the Inflater or Deflater that
+;; held it names itself through its own class)
+(jolt-image-register-stub-describer!
+  (lambda (x) (zstream? x))
+  (lambda (x)
+    (jolt-hash-map (jolt-keyword "direction")
+                   (jolt-keyword (if (zstream-inflate? x) "inflate" "deflate")))))
 
 ;; backend_scheme.clj's munge-name, exposed so the write side munges registered
 ;; free names with EXACTLY the mapping the emitter used. Deref'd at dump time,

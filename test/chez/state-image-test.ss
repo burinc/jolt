@@ -498,6 +498,14 @@
     "(-> (jolt.host/image-scan {:outer {:p (first raw-holder)}}) first :path string? )" "true")
 (is "scan is empty for a named fn"
     "(count (jolt.host/image-scan {:f inc}))" "0")
+;; an open zlib stream is a process-local address, reported like a port; a
+;; closed one holds none and travels as closed
+(is "scan reports an open Inflater's zlib stream"
+    "(count (jolt.host/image-scan {:i (java.util.zip.Inflater.)}))" "1")
+(is "scan reports an open Deflater's zlib stream at its path"
+    "(-> (jolt.host/image-scan {:d (java.util.zip.Deflater.)}) first :path string?)" "true")
+(is "scan is empty for an ended Inflater"
+    "(count (jolt.host/image-scan {:i (doto (java.util.zip.Inflater.) .end)}))" "0")
 
 ;; --- R2: anonymous closures substitute as image-fnsrc records -------------------
 ;; Write-side only: dump! succeeds where it refused, and the records land in the
