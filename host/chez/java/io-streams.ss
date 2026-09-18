@@ -1683,11 +1683,43 @@
         ((jfile? input) (jolt-slurp input))
         ((input-bytes input) => (lambda (bv) (decode-bytevector bv '())))
         (else (jolt-str-render-one input))))
+;; A byte STREAM source as a binary input port to read a chunk at a time, with
+;; the thunk that releases it, or #f for a source that is not a stream (a byte
+;; array, a string, a shim table — those are already in memory). A jolt
+;; in-stream is its port; a reify/proxy InputStream reads through its own
+;; read(byte[],int,int); a File opens for the copy. This is what keeps a copy
+;; in constant memory: input-bytes drains a source whole, and a 100 MB unzip
+;; through it held 100 MB (test/zip_memory_test.clj, the copy arms).
+(define copy-chunk-bytes 8192)
+(define (stream-source-port input)
+  (cond ((in-stream? input) (values (in-stream-port input) (lambda () #f)))
+        ((user-in-stream? input) (values (in-stream-source-port input) (lambda () #f)))
+        ((jfile? input) (let ((p (open-file-input-port (path-of input))))
+                          (values p (lambda () (close-port p)))))
+        (else (values #f #f))))
+;; Read PORT to its end a chunk at a time, handing each bytevector to SINK!;
+;; the byte count.
+(define (copy-port-chunks! port sink!)
+  (let loop ((total 0))
+    (let ((bv (get-bytevector-n port copy-chunk-bytes)))
+      (if (eof-object? bv)
+          total
+          (begin (sink! bv) (loop (+ total (bytevector-length bv))))))))
+;; INPUT's bytes into SINK! a chunk at a time when it is a stream, else its
+;; bytes (or its text's UTF-8) whole; the byte count.
+(define (copy-bytes-into! input sink!)
+  (let-values (((port release!) (stream-source-port input)))
+    (if port
+        (dynamic-wind (lambda () #f)
+                      (lambda () (copy-port-chunks! port sink!))
+                      release!)
+        (let ((bv (or (input-bytes input) (string->utf8 (input-text input)))))
+          (sink! bv)
+          (bytevector-length bv)))))
 (define (jio-copy input output . opts)
   (cond
     ((out-stream? output)
-     (put-bytevector (out-stream-port output)
-                     (or (input-bytes input) (string->utf8 (input-text input)))))
+     (copy-bytes-into! input (lambda (bv) (put-bytevector (out-stream-port output) bv))))
     ((char-writer? output) (put-string (char-writer-port output) (input-text input)))
     ;; A PrintStream is a java.io.OutputStream, so a byte source reaches it byte
     ;; for byte — (io/copy System/in System/out) is the cat. The other text sinks
@@ -1701,16 +1733,24 @@
     ;; a reify/proxy OutputStream takes bytes through write(byte[],int,int), as
     ;; the JVM's copy loop hands them; a reify/proxy Writer takes the text
     ((user-out-stream? output)
-     (user-out-stream-write! output (or (input-bytes input) (string->utf8 (input-text input)))))
+     (copy-bytes-into! input (lambda (bv) (user-out-stream-write! output bv))))
     ((user-writer? output)
      (record-method-dispatch output "write" (list->cseq (list (input-text input)))))
     ((or (jfile? output) (string? output))
      ;; a string INPUT is its characters (io/copy's text source), never a filename
-     (let ((bv (and (not (string? input)) (input-bytes input))))
-       (if bv
-           (with-port (open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
-             (lambda (port) (put-bytevector port bv)))
-           (jolt-spit output (input-text input)))))
+     (let-values (((src release!) (if (string? input) (values #f #f) (stream-source-port input))))
+       (cond
+         (src
+          (dynamic-wind (lambda () #f)
+                        (lambda ()
+                          (with-port (open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
+                            (lambda (port) (copy-port-chunks! src (lambda (bv) (put-bytevector port bv))))))
+                        release!))
+         ((and (not (string? input)) (input-bytes input))
+          => (lambda (bv)
+               (with-port (open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
+                 (lambda (port) (put-bytevector port bv)))))
+         (else (jolt-spit output (input-text input))))))
     ;; a byte-output-stream shim (a host tagged-table with :jolt/output-stream,
     ;; e.g. http-client's ByteArrayOutputStream): write through its .write method,
     ;; byte-exact for a byte source.
