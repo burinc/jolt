@@ -557,6 +557,21 @@
    :check :prose
    :why "*allow-unresolved-vars* is a jolt-only var, so the JVM cannot evaluate the form at all"
    :note "Deliberate. The JVM's UnresolvedVarExpr is unusable in every position; jolt implements the flag's intent."}
+  ;; A qualified name whose ns half is a bare Capitalized word naming no alias,
+  ;; namespace or registered class — (Nope/foo 1) — is a compile-time "No such
+  ;; namespace" on the JVM (Compiler.macroexpand1 finds no class, resolveIn no
+  ;; namespace). jolt keeps it a late-bound host static: that is the spelling of an
+  ;; :import-ed short name, and a provider's class registers on its first use (RFC
+  ;; 0014 autoload), which may be after the referencing fn compiled; the miss
+  ;; reports at the call ("Unknown class Nope"). A dotted or lowercase ns half
+  ;; that names nothing is rejected at compile time like the JVM's (jolt-d1ip).
+  {:category :namespace-model
+   :behavior "(fn [] (Nope/foo 1)) — a bare Capitalized ns half naming no class, namespace or alias"
+   :jvm "throws at compile time: No such namespace: Nope"
+   :jolt "compiles; the call raises Unknown class Nope when run"
+   :check {:expr "(fn? (eval '(fn [] (Nope/foo 1))))"
+           :jvm "throws RuntimeException"
+           :jolt "true"}}
   ;; a def/defn carries source position (:line/:column/:file) in its var meta, like
   ;; the JVM Compiler, for user code and loaded files. A clojure.core var built
   ;; during the seed mint (native-op or overlay defn) has no reader position, so it

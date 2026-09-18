@@ -1,3 +1,0 @@
-Unhandled exception (IllegalArgumentException): Unknown class str
-  at ./test/errors/runtime/unknown-class-undotted-ns/input.clj:11:1
-exit: 1

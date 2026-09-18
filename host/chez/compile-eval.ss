@@ -359,9 +359,30 @@
             (cadr items) x))
       x))
 
-;; Pre-register any (require ...)/(use ...) :as aliases under `ns` BEFORE analysis,
-;; so a qualified s/foo resolves while compiling (analysis precedes the runtime
-;; require). Walks the whole form (a require may be nested in a do/let).
+;; A bare top-level (do ...) form — head is the unqualified `do` symbol.
+(define (ce-top-do? form)
+  (and (cseq? form)
+       (let ((h (seq-first form)))
+         (and (symbol-t? h) (jolt-nil? (hc-sym-ns h))
+              (string=? (symbol-t-name h) "do")))))
+
+;; Pre-register the :as/:refer a top-level (require ...)/(use ...)/(ns ...) form
+;; establishes under `ns`, for the walks that ANALYZE a namespace's forms without
+;; running them — the build's emit + inference walks and the seed mint — so a
+;; later form's s/foo resolves the way it does under the loader, where the
+;; require ran first. The runtime compile path has no use for it: there the form
+;; runs right after it compiles, and its require registers what it registers.
+;;
+;; Scoped to the compilation unit as Compiler.load delimits it: the top-level form
+;; itself and, through a top-level (do ...), its children — which the reference
+;; compiler evaluates one by one, so a do's require IS in force for the sibling
+;; after it. Nothing else is descended into. A require inside a fn or let body
+;; registers nothing until it runs, and then in whatever *ns* is current at the
+;; call; walking the whole form pre-registered it here in the DEFINING ns at
+;; compile time, so (defn r [] (require '[s :as z]) (z/f)) compiled where the
+;; JVM says "No such namespace: z", and — registered unchecked — a second
+;; (require '[other :as z]) overwrote the alias under the "Alias z already exists"
+;; check the runtime require then found satisfied.
 (define (ce-clause-require? cl)          ; (:require ...) / (:use ...) ns clause
   (and (pair? cl) (keyword? (car cl))
        (let ((kn (keyword-t-name (car cl)))) (or (string=? kn "require") (string=? kn "use")))))
@@ -370,9 +391,7 @@
     (let ((items (seq->list form)))
       (when (pair? items)
         (let* ((h (car items)) (hn (and (symbol-t? h) (symbol-t-name h))))
-          ;; skip quoted data: (quote ...) must not be scanned for require specs
           (cond
-            ((and hn (string=? hn "quote")) #t)
             ;; (require spec...) / (use spec...) — specs are quoted
             ((and hn (or (string=? hn "require") (string=? hn "use")))
              (for-each (lambda (a)
@@ -398,7 +417,10 @@
                                                        (expand-libspec spec)))
                                            (cdr cl))))))
                          (if (pair? (cdr items)) (cddr items) '()))))
-            (else (for-each (lambda (x) (ce-scan-requires! x ns)) items))))))))
+            ;; the compilation-unit rule: a top-level (do ...) is its children,
+            ;; each its own unit. Nothing else is descended into.
+            ((ce-top-do? form)
+             (for-each (lambda (x) (ce-scan-requires! x ns)) (cdr items)))))))))
 
 ;; --- success-type lint (RFC 0006), opt-in via JOLT_CHECK --------------------
 ;; A Carp-inspired surfacing of the existing success-type checker: with JOLT_CHECK
@@ -453,9 +475,10 @@
             (loop (jolt-seq (seq-more s)))))))))
 
 ;; Already-read FORM -> Scheme source string (analyze -> emit on Chez).
-;; `ns` is the compile namespace unqualified symbols resolve against.
+;; `ns` is the compile namespace unqualified symbols resolve against. No require
+;; pre-scan here (ce-scan-requires! is for the walks that never run the form):
+;; the aliases in force are the ones earlier forms registered by RUNNING.
 (define (jolt-analyze-emit-form form ns)
-  (ce-scan-requires! form ns)
   (let* ((ctx (make-analyze-ctx ns))
          (node (jolt-ce-analyze ctx form)))
     (jolt-lint-node! node)
@@ -597,13 +620,6 @@
     (values (symbol-t-name name-sym)
             (apply jolt-list (cons fn-sym (ce-macro-arities after-meta)))
             (ce-defmacro-meta name-sym after-meta attr doc trail))))
-
-;; A bare top-level (do ...) form — head is the unqualified `do` symbol.
-(define (ce-top-do? form)
-  (and (cseq? form)
-       (let ((h (seq-first form)))
-         (and (symbol-t? h) (jolt-nil? (hc-sym-ns h))
-              (string=? (symbol-t-name h) "do")))))
 
 ;; Clojure's compilation-unit rule applies to a top-level MACRO CALL too: the
 ;; form is macroexpanded first, and when the expansion lands on (do ...) its
