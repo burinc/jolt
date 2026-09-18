@@ -35,10 +35,26 @@
 ;; --- the central directory --------------------------------------------------
 (define-record-type zipdir
   (fields path      ; the archive's path, as opened
-          comment   ; the archive comment (string), or #f
+          coder     ; the charset's canonical name for names and comments, or #f for UTF-8
+          comment   ; the archive comment's bytes, or #f — decoded when asked for
           table     ; name -> zdirent
           order)    ; vector of zdirent, in central-directory order
   (nongenerative jolt-zipdir-v1))
+
+;; The archive comment as a string, or #f: ZipFile.getComment decodes the END
+;; record's bytes when it is called, not when the archive opens, so a comment
+;; that is not in the archive's charset (a Latin-1 one on a UTF-8 open) refuses
+;; there — the JDK's IllegalArgumentException — and every entry still reads.
+(define (zipdir-comment-string d)
+  (and (zipdir-comment d)
+       (zip-decode-bytes (zipdir-comment d) 0 (zipdir-coder d))))
+
+;; BV as a string, by FLAG and CODER: UTF-8 when the coder is UTF-8 or the
+;; entry's bit 11 says so, else the charset (JDK 21 ZipCoder).
+(define (zip-decode-bytes bv flag coder)
+  (if (or (not coder) (not (zero? (bitwise-and flag zip-use-utf8))))
+      (zip-decode-utf8 bv)
+      (zip-decode-charset bv coder)))
 
 (define-record-type zdirent
   (fields name method flag crc csize size xdostime extra comment loc-offset)
@@ -199,18 +215,18 @@
                 (zip-zerror "invalid END header (total entries count too large)"))
               (let ((cen (zip-file-bytes in size cenpos cenlen)))
                 (unless cen (zip-zerror "read CEN tables failed"))
+                ;; a name or comment the charset cannot decode is the JDK's
+                ;; refusal of the header (checkAndAddEntry lines 1236-1252)
                 (let ((table (make-hashtable string-hash string=?))
                       (decode (lambda (bv flag)
-                                (if (or (not coder) (not (zero? (bitwise-and flag zip-use-utf8))))
-                                    (zip-decode-utf8 bv)
-                                    (zip-decode-charset bv coder)))))
+                                (guard (e (#t (zip-zerror "invalid CEN header (bad entry name or comment)")))
+                                  (zip-decode-bytes bv flag coder)))))
                   (let loop ((pos 0) (acc '()))
                     (cond
                       ((>= pos cenlen)
                        (unless (= pos cenlen) (zip-zerror "invalid CEN header (bad header size)"))
-                       (make-zipdir path
-                                    (and (> (bytevector-length comment) 0)
-                                         (decode comment 0))
+                       (make-zipdir path coder
+                                    (and (> (bytevector-length comment) 0) comment)
                                     table
                                     (list->vector (reverse acc))))
                       (else
@@ -601,7 +617,7 @@
    (cons "getComment" (zip-method "getComment" '(0)
                         (lambda (self)
                           (zfile-ensure-open self)
-                          (or (zipdir-comment (zfile-dir self)) jolt-nil))))
+                          (or (zipdir-comment-string (zfile-dir self)) jolt-nil))))
    (cons "close" (zip-method "close" '(0) zfile-close))))
 (register-class-statics! "java.util.zip.ZipFile"
   (list (cons "OPEN_READ" (->num zip-open-read))
