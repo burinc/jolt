@@ -328,12 +328,37 @@ jobs:
             throw "canonicalized drive-absolute path was not usable/stable: $out"
           }
 
+          # The byte streams with a forward-slash spelling of a drive-absolute
+          # path — what a download path looks like once a cache directory has
+          # been joined with "/" — write where the native spelling reads, and
+          # both spellings are absolute. (#711: FileOutputStream received
+          # "C:/project/C:/Users/…" before the File shim preserved the drive.)
+          $probe = '(let [d (System/getenv (name (quote WINPATH_DIR)))' +
+                   '      native (str d (char 92) (name (quote bytes.bin)))' +
+                   '      slash (.replace native (char 92) (char 47))]' +
+                   '  (with-open [o (java.io.FileOutputStream. slash)] (.write o (byte-array [90])))' +
+                   '  (with-open [i (java.io.FileInputStream. native)]' +
+                   '    (println [(.isAbsolute (java.io.File. native)) (.isAbsolute (java.io.File. slash)) (.read i)])))'
+          $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($out -ne '[true true 90]') {
+            throw "a forward-slash drive-absolute path did not reach the byte streams: $out"
+          }
+
       # The resolver's HTTPS transport on Windows: ws2_32 sockets and the
-      # OpenSSL DLLs discovered under Git for Windows' mingw64/bin (the runner
-      # image has no other OpenSSL 3). Both separator spellings of the download
-      # path reach FileOutputStream as the user's environment would spell them.
+      # OpenSSL DLLs discovered under Git for Windows' mingw64/bin. The runner
+      # image also has an OpenSSL of its own on PATH, which the bare-name
+      # fallback would find, so a fetch that merely succeeds proves nothing
+      # about the discovery: the smoke asserts that both libraries came from
+      # the Git directory. Both separator spellings of the download path reach
+      # FileOutputStream as a user's environment would spell them.
       - name: Fetch dependencies with forward-slash absolute paths
+        env:
+          JOLT_HTTPS_EXPECT_LIBDIR: Git/mingw64/bin
         run: TMPDIR="$(cygpath -m "$RUNNER_TEMP")" make CHEZ=./chez-install/bin/chez httpsfetch
 
       - name: Fetch dependencies with backslash absolute paths
+        env:
+          JOLT_HTTPS_EXPECT_LIBDIR: Git\mingw64\bin
         run: TMPDIR="$(cygpath -w "$RUNNER_TEMP")" make CHEZ=./chez-install/bin/chez httpsfetch
