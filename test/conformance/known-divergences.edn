@@ -1329,6 +1329,30 @@
            :jvm "5"
            :jolt "\"Zip64 entries are not supported\""}
    :note "Unit rows pin both Zip64 shapes jolt-side (unit.edn suite zip)."}
+  ;; ZipOutputStream writes no Zip64 record: an entry whose size, compressed
+  ;; size or offset reaches 0xFFFFFFFF, or an archive with 0xFFFF entries, is
+  ;; refused at the point JDK 21 would write the Zip64 fields (zip-out-entries.ss
+  ;; zipout-write-loc!, zipout-write-cen!, zipout-write-end!). ZipFile reads a
+  ;; Zip64 central directory; only ZipInputStream (above) and the writer refuse.
+  {:category :restrictive
+   :behavior "putNextEntry of a pre-sized entry whose size is 0xFFFFFFFF"
+   :jvm "writes a Zip64 local header"
+   :jolt "throws ZipException \"Zip64 entries are not supported\""
+   :check {:expr "(try (.putNextEntry (java.util.zip.ZipOutputStream. (java.io.ByteArrayOutputStream.)) (doto (java.util.zip.ZipEntry. \"big\") (.setSize 4294967295) (.setCompressedSize 1) (.setCrc 0))) :put (catch java.util.zip.ZipException e (.getMessage e)))"
+           :jvm ":put"
+           :jolt "\"Zip64 entries are not supported\""}
+   :note "A 4 GiB entry through a stream would take the Zip64 data descriptor as well; corpus rows (java.util.zip / ZipOutputStream) pin the 32-bit shapes."}
+  ;; ZipFile.stream() answers a java.util.stream.Stream on the JVM; jolt has no
+  ;; java.util.stream, so the method is not there and entries() is the way to
+  ;; walk an archive.
+  {:category :host-model
+   :behavior "(.stream zip-file)"
+   :jvm "a Stream of the entries"
+   :jolt "no such method"
+   :check {:expr "(with-open [z (java.util.zip.ZipFile. \"test/chez/fixtures/zip/stored.zip\")] (try (.count (.stream z)) (catch IllegalArgumentException e :no-method)))"
+           :jvm "4"
+           :jolt ":no-method"}
+   :note "entries() enumerates every entry (corpus java.util.zip / ZipFile)."}
   ;; ZipEntry has two one-argument constructors, (String) and (ZipEntry). jolt picks
   ;; one by the argument's runtime value, so a nil takes the String constructor even
   ;; under a ^ZipEntry hint, and its NullPointerException names the other

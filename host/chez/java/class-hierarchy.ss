@@ -807,6 +807,7 @@
 (jch-register-supers! "java.util.zip.ZipFile$ZipFileInflaterInputStream" '("java.util.zip.InflaterInputStream"))
 (jch-register-supers! "java.util.zip.DeflaterOutputStream" '("java.io.FilterOutputStream"))
 (jch-register-supers! "java.util.zip.GZIPOutputStream" '("java.util.zip.DeflaterOutputStream"))
+(jch-register-supers! "java.util.zip.ZipOutputStream" '("java.util.zip.DeflaterOutputStream"))
 (jch-register-supers! "java.io.OutputStreamWriter" '("java.io.Writer"))
 (jch-register-supers! "java.io.FileWriter" '("java.io.OutputStreamWriter"))
 (jch-register-supers! "java.io.InputStreamReader" '("java.io.Reader"))
