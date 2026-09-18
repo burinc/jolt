@@ -441,21 +441,26 @@
       (sa-arch-name->symbol (getenv "PROCESSOR_ARCHITECTURE"))
       (sa-arch-name->symbol (sa-uname-machine))))
 
-;; The `machine` field of uname(2), or #f when it cannot be had. Probe-only and
-;; fully guarded: a statically linked build may not carry the symbol at all, and
-;; a missing arch is a documented degradation rather than a boot failure.
+;; Field N of uname(2) — 0 sysname, 1 nodename, 2 release, 3 version, 4
+;; machine — or #f when it cannot be had. Probe-only and fully guarded: a
+;; statically linked build may not carry the symbol at all, and a missing arch
+;; is a documented degradation rather than a boot failure. struct utsname is
+;; five (Linux: six, with domainname) char arrays of one fixed width each:
+;; _UTSNAME_LENGTH is 65 on glibc, musl and bionic, _SYS_NAMELEN 256 on the
+;; BSDs and macOS.
 ;;
 ;; No sa-load-shared-object here, on sa-fbytes-init!'s reasoning and for its
 ;; reason: the boot took the process-global handle long before anything can ask
 ;; for an arch (rt.ss binds _exit through jolt-foreign-proc-safe at its line
 ;; 135, and the first caller of sa-arch is host-static-methods.ss at 1553), and
 ;; re-taking it would re-promote it above every :jolt/native loaded since.
-(define (sa-uname-machine)
+(define (sa-uname-field n)
   (guard (e (#t #f))
     (and (foreign-entry? "uname")
          (let* ((linux? (eq? (sa-os-family) 'linux))
-                (off (if linux? 260 1024))
-                (size (if linux? 512 2048))
+                (width (if linux? 65 256))
+                (off (* n width))
+                (size (* 6 width))
                 (buf (foreign-alloc size)))
            (dynamic-wind
              (lambda ()
@@ -467,10 +472,112 @@
                (and (= 0 ((foreign-procedure "uname" (void*) int) buf))
                     (let loop ((i 0) (acc '()))
                       (let ((b (foreign-ref 'unsigned-8 buf (fx+ off i))))
-                        (if (or (fx=? b 0) (fx>? i 62))
+                        (if (or (fx=? b 0) (fx>=? i (fx- width 1)))
                             (and (pair? acc) (list->string (reverse acc)))
                             (loop (fx+ i 1) (cons (integer->char b) acc)))))))
              (lambda () (foreign-free buf)))))))
+(define (sa-uname-machine) (sa-uname-field 4))
+
+;; (sa-os-release) -> string | #f
+;; The operating system's own version string, what its version tool prints:
+;; the product version on macOS (sysctl kern.osproductversion, what `sw_vers
+;; -productVersion` reads), the kernel release elsewhere on POSIX (uname(2), what
+;; `uname -r` prints). Contract: that string, or #f where the target does not
+;; know it. Degradation: #f — the caller leaves the property out, which is the
+;; JVM's answer for an os.version it cannot read. Read in process: this used to
+;; run those two programs through the shell, so a machine with an empty PATH,
+;; or Windows, where the shell is cmd.exe, answered nothing.
+(define (sa-os-release)
+  (guard (e (#t #f))
+    (case (sa-os-family)
+      ((macos)
+       (and (foreign-entry? "sysctlbyname")
+            (let* ((f (foreign-procedure "sysctlbyname" (string u8* u8* void* size_t) int))
+                   (out (make-bytevector 64 0))
+                   (len (make-bytevector 8 0)))
+              (bytevector-u64-native-set! len 0 64)
+              (and (= 0 (f "kern.osproductversion" out len 0 0))
+                   (let ((n (let scan ((i 0))
+                              (if (or (fx=? i 64) (fx=? 0 (bytevector-u8-ref out i))) i (scan (fx+ i 1))))))
+                     (and (fx>? n 0)
+                          (let ((bv (make-bytevector n)))
+                            (bytevector-copy! out 0 bv 0 n)
+                            (utf8->string bv))))))))
+      ((windows) #f)
+      (else (sa-uname-field 2)))))
+
+;; (sa-environment-pairs) -> list of (name . value)
+;; The whole process environment, as the R7RS get-environment-variables alist;
+;; the source (getenv "NAME") reads, so the two agree. Contract: that alist, in
+;; the table's order. Degradation: none — every target has an environment. On
+;; Chez it is read from the C runtime's own table: _NSGetEnviron() on macOS
+;; (the form a dylib is documented to use), the environ variable elsewhere on
+;; POSIX (glibc, musl and bionic all export it), and GetEnvironmentStringsW on
+;; Windows, whose block is UTF-16 and double-NUL terminated. An entry with no
+;; "=" or an empty name (the hidden "=C:=C:\…" drive entries Windows keeps) is
+;; dropped, as the JVM's ProcessEnvironment drops it. This used to spawn `env -0`
+;; through the shell, which needed an env program on PATH and, on Windows, a
+;; command cmd.exe does not have: (System/getenv) answered an empty map and a
+;; ProcessBuilder child inherited nothing.
+(define (sa-environment-pairs)
+  (define (c-string addr)
+    (let loop ((n 0))
+      (if (fx=? 0 (foreign-ref 'unsigned-8 addr n))
+          (let ((bv (make-bytevector n)))
+            (sa-foreign-bytes-ref! addr bv n)
+            (utf8->string bv))
+          (loop (fx+ n 1)))))
+  (define (split entry)
+    (let ((i (let scan ((j 0))
+               (cond ((fx=? j (string-length entry)) #f)
+                     ((char=? (string-ref entry j) #\=) j)
+                     (else (scan (fx+ j 1)))))))
+      (and i (fx>? i 0)
+           (cons (substring entry 0 i) (substring entry (fx+ i 1) (string-length entry))))))
+  (define (from-envp envp)
+    (let ((w (foreign-sizeof 'void*)))
+      (let loop ((i 0) (acc '()))
+        (let ((p (foreign-ref 'void* envp (fx* i w))))
+          (if (eqv? p 0)
+              (reverse acc)
+              (let ((kv (split (c-string p))))
+                (loop (fx+ i 1) (if kv (cons kv acc) acc))))))))
+  (define (posix-envp)
+    (cond
+      ((foreign-entry? "_NSGetEnviron")
+       (foreign-ref 'void* ((foreign-procedure "_NSGetEnviron" () void*)) 0))
+      ((foreign-entry? "environ")
+       (foreign-ref 'void* (foreign-entry "environ") 0))
+      (else #f)))
+  (define (windows-block)
+    (guard (e (#t #f)) (load-shared-object "kernel32.dll"))
+    (and (foreign-entry? "GetEnvironmentStringsW")
+         (let* ((get (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f))
+                (free (and (foreign-entry? "FreeEnvironmentStringsW")
+                           (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f)))
+                (block (get)))
+           (and (not (eqv? block 0))
+                (dynamic-wind
+                  (lambda () #f)
+                  (lambda ()
+                    ;; one UTF-16 string per entry, an empty string ends the block
+                    (let loop ((off 0) (acc '()))
+                      (let ((n (let scan ((k 0))
+                                 (if (fx=? 0 (foreign-ref 'unsigned-16 block (fx+ off (fx* 2 k))))
+                                     k
+                                     (scan (fx+ k 1))))))
+                        (if (fx=? n 0)
+                            (reverse acc)
+                            (let ((bv (make-bytevector (fx* 2 n))))
+                              (sa-foreign-bytes-ref! (fx+ block off) bv (fx* 2 n))
+                              (let ((kv (split (utf16->string bv 'little))))
+                                (loop (fx+ off (fx* 2 (fx+ n 1))) (if kv (cons kv acc) acc))))))))
+                  (lambda () (when free (free block))))))))
+  (guard (e (#t '()))
+    (if (eq? (sa-os-family) 'windows)
+        (or (windows-block) '())
+        (let ((envp (posix-envp)))
+          (if envp (from-envp envp) '())))))
 
 ;; (sa-endian) -> 'little | 'big
 ;; Byte order of the host. Contract: the byte order. Degradation: none — the

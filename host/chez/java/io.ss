@@ -267,8 +267,11 @@
 
 ;; chmod 0755 via libc, so the produced binary is executable. load-shared-object
 ;; with #f pulls the running process's own symbols (chmod is in libc, linked into
-;; every Chez binary) — no external toolchain. Falls back to /bin/sh chmod if the
-;; symbol can't be resolved.
+;; every Chez binary) — no external toolchain, and no program: this used to fall
+;; back to a `chmod 755` through the shell, the one thing the runtime ran off
+;; PATH besides git, and a fallback that could never be reached on a POSIX host
+;; (libc always has chmod) while hiding a broken FFI. A libc without it is an
+;; error that says so.
 (define jolt-chmod-755
   (let ((c (jolt-foreign-proc-safe "chmod" '(string int) 'int)))
     (lambda (path)
@@ -276,7 +279,7 @@
         (c (c path #o755))
         ;; Windows has no chmod and needs none (execute is by extension)
         ((eq? (sa-os-family) 'windows) 0)
-        (else (system (string-append "chmod 755 '" path "'")))))))
+        (else (error 'jolt-chmod-755 "chmod does not resolve in this process's libc" path))))))
 
 ;; user.dir — the project dir every user-facing relative path resolves against.
 ;; JOLT_PWD carries it when the launcher moved away from it (bin/jolt exports the

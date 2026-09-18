@@ -1055,30 +1055,18 @@
 ;; user.name: the login name from the environment, as the JVM reports it.
 (define (sys-user-name)
   (or (getenv "USER") (getenv "LOGNAME") (getenv "USERNAME") jolt-nil))
-;; os.version, computed once on first read: the macOS PRODUCT version
-;; (sw_vers, what the JVM reports there — the kernel release is the wrong
-;; number for "which macOS is this"), the kernel release elsewhere. Windows
-;; has neither command: nil. A failed probe caches "" so it is not retried.
+;; os.version, computed once on first read: the macOS PRODUCT version (what
+;; the JVM reports there — the kernel release is the wrong number for "which
+;; macOS is this"), the kernel release elsewhere, nil where the adapter cannot
+;; say (Windows). Read in process (sa-os-release): no program is run for it.
+;; A failed probe caches "" so it is not retried.
 (define sys-os-version-cache #f)
-(define (sys-os-version-probe cmd)
-  (guard (e (#t #f))
-    (call-with-values
-      (lambda () (sa-run-process cmd (native-transcoder)))
-      (lambda (stdin stdout stderr pid)
-        (let ((s (get-line stdout)))
-          (close-port stdin) (close-port stdout) (close-port stderr)
-          (and (string? s) (> (string-length s) 0) s))))))
 (define (sys-os-version)
   (cond
     (sys-os-version-cache
      (if (string=? sys-os-version-cache "") jolt-nil sys-os-version-cache))
-    ((eq? (sa-os-family) 'windows) jolt-nil)
     (else
-     (let ((v (or (if (eq? (sa-os-family) 'macos)
-                      (sys-os-version-probe "sw_vers -productVersion")
-                      #f)
-                  (sys-os-version-probe "uname -r")
-                  "")))
+     (let ((v (or (sa-os-release) "")))
        (set! sys-os-version-cache v)
        (if (string=? v "") jolt-nil v)))))
 ;; runtime-settable system properties (System/setProperty). A set value wins over
@@ -1162,40 +1150,12 @@
       (vector->list (jolt-with-mutex sys-prop-mu (hashtable-cells sys-prop-table))))
     base))
 
-;; full environment as an alist of (name . value), via env -0 (NUL-separated,
-;; fixes multi-line values that the old line-based parse broke).
-(define (all-env-pairs)
-  (call-with-values
-    (lambda () (sa-run-process "env -0" (native-transcoder)))
-    (lambda (stdin stdout stderr pid)
-      (let* ((raw (get-string-all stdout))
-             (s (if (eof-object? raw) "" raw)))
-        (close-port stdin) (close-port stdout) (close-port stderr)
-        (let loop ((i 0) (start 0) (acc '()))
-          (cond ((= i (string-length s))
-                 (reverse (if (> i start)
-                              (let ((eq (let scan ((j start))
-                                          (cond ((= j i) #f)
-                                                ((char=? (string-ref s j) #\=) j)
-                                                (else (scan (+ j 1)))))))
-                                (if eq (cons (cons (substring s start eq)
-                                                   (substring s (+ eq 1) i))
-                                             acc)
-                                    acc))
-                              acc)))
-                ((char=? (string-ref s i) (integer->char 0))
-                 (let ((entry (if (> i start)
-                                  (let ((eq (let scan ((j start))
-                                              (cond ((= j i) #f)
-                                                    ((char=? (string-ref s j) #\=) j)
-                                                    (else (scan (+ j 1)))))))
-                                    (if eq (cons (cons (substring s start eq)
-                                                       (substring s (+ eq 1) i))
-                                                 acc)
-                                        acc))
-                                  acc)))
-                   (loop (+ i 1) (+ i 1) entry)))
-                (else (loop (+ i 1) start acc))))))))
+;; The full environment as an alist of (name . value), read from the process's
+;; own table (sa-environment-pairs) — never by running a program: the `env -0`
+;; this used to spawn needed an env program on PATH, and on Windows it is not
+;; a command, so (System/getenv) answered an empty map and every ProcessBuilder
+;; child started from an empty environment (host/chez/no-external-programs-smoke.sh).
+(define (all-env-pairs) (sa-environment-pairs))
 ;; JOLT_BAKE_ENV_ALLOWLIST: when set, only the listed comma-separated
 ;; names are served; unset (the normal case) reads are live and unfiltered.
 (define (env-allowlist)

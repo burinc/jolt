@@ -38,6 +38,20 @@
 (define (sa-run-process cmd transcoder)
   (error 'sa-run-process "subprocess support is unsupported on the gambit target" cmd))
 
+;; (sa-environment-pairs) -> list of (name . value)
+;; The whole process environment, the alist R7RS get-environment-variables
+;; answers, which Gambit provides. Contract: that alist. Degradation: none.
+(define (sa-environment-pairs)
+  (get-environment-variables))
+
+;; (sa-os-release) -> string | #f
+;; The OS's own version string (the product version on macOS, the kernel
+;; release elsewhere), or #f. Contract: that string or #f. Degradation: #f,
+;; which leaves os.version out of the system properties; the demo target does
+;; not probe the OS.
+(define (sa-os-release)
+  #f)
+
 ;; (sa-gc-collect) -> void
 ;; A full collection hint (every generation) — what the Runtime.gc /
 ;; System.gc callers mean: weak references clear and guardians fire.

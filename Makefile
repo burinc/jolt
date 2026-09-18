@@ -105,7 +105,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
-  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zipextract zlibregistersmoke zlibnativesmoke \
+  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zipextract zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -161,7 +161,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values recordinline corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit zipextract depsnounzip zlibnativesmoke zipmemory \
+  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit zipextract depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
@@ -470,6 +470,13 @@ zlibregistersmoke: testbin
 # java.util.zip uses.
 zlibnativesmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/zlib-native-smoke.sh
+
+# The runtime runs no program off PATH to answer about its own process:
+# (System/getenv) as a map, the environment a ProcessBuilder child inherits and
+# os.version hold with PATH empty (they used to spawn `env -0`, `sw_vers` and
+# `uname -r`). shelloutcheck is the static half of the same rule.
+noexecsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/no-external-programs-smoke.sh
 
 # Duplicate native symbol detection (issue #731): a declared :jolt/native that
 # carries its own static copy of another's code — raygui linked against
