@@ -22,6 +22,7 @@
 (def connect-error-message (var jolt.mvn-http/connect-error-message))
 (def ai-addr-fallback @(var jolt.mvn-http/O-ai-addr-fallback))
 (def max-attempts     @(var jolt.mvn-http/max-attempts))
+(def windows?         @(var jolt.mvn-http/windows?))
 
 (def ^:private fails (atom []))
 (defn- ok= [expected actual label]
@@ -145,12 +146,18 @@
   ;; Exhausting the candidates used to be reported as "connection refused" no
   ;; matter what the kernel said; the bionic bug was really EFAULT, and calling
   ;; it a refusal sent people looking at their network.
-  (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "errno 14")
-       "connect error names the errno it got")
-  (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "repo.clojars.org:443")
-       "connect error names host and port")
-  (ok= false (str/includes? (connect-error-message "h" 443 111) "errno 14")
-       "connect error reports the errno it got, not a fixed one")
+  ;; The code is an errno on POSIX and a WSAGetLastError value on Windows, and
+  ;; the message says which (strerror speaks only errno), so the rows ask for
+  ;; the platform's word; the gate runs on the Windows job too.
+  (let [code-word (if windows? "error" "errno")]
+    (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) (str code-word " 14"))
+         "connect error names the code it got")
+    (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "repo.clojars.org:443")
+         "connect error names host and port")
+    (ok= false (str/includes? (connect-error-message "h" 443 111) (str code-word " 14"))
+         "connect error reports the code it got, not a fixed one")
+    (ok= true (str/includes? (connect-error-message "h" 443 111) (str code-word " 111"))
+         "connect error names the other code the same way"))
   (ok= "could not connect to h:443" (connect-error-message "h" 443 nil)
        "connect error with no captured code stays plain")
 
