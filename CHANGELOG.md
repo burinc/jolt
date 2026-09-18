@@ -274,6 +274,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `require` inside a fn body no longer aliases at compile time.** The
+  compiler pre-scanned every top-level form for `(require '[x :as a])`,
+  fn and let bodies included, and registered the alias in the defining
+  namespace before analysis. `(defn r [] (require '[clojure.set :as s])
+  (s/union …))` compiled where the JVM says "No such namespace: s", the
+  alias sat in `(ns-aliases 'the-ns)` before `r` ever ran, and — registered
+  unchecked — a second `(require '[other :as s])` overwrote an existing alias
+  past the "Alias s already exists" the runtime `require` raises. The scan
+  now sees a compilation unit the way `Compiler.load` does: the top-level
+  form and the children of a top-level `do`, and only in the walks that
+  analyze without running (`jolt build`, the seed mint); the runtime compile
+  path relies on what earlier forms registered by running. With it, a bare
+  lowercase ns half that names no alias, namespace or class (`str/join`
+  before its `require`) is a compile-time "No such namespace" in a fn body
+  too, not a late-bound static that fails at the call. A Capitalized one
+  (`Nope/foo`) stays late-bound for provider-registered imports, recorded in
+  `known-divergences.edn`. Eight certified corpus rows. (jolt-d1ip)
 - **A tree-shaken build that keeps the compiler no longer dies at boot.**
   `--tree-shake`/`--closed-world` of a program that reaches a compile
   reference without a bail reference — `jolt.image/dump!`,

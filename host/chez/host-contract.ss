@@ -491,26 +491,42 @@
 ;; tell the two apart on its own: a qualified sym it cannot resolve comes back
 ;; :unresolved whether it is `Math/sqrt` or `no.such.ns/foo`, and reading the
 ;; second as a class static is what made `(no.such.ns/foo 1)` report "Unknown
-;; class no.such.ns" from inside the call. Paired with jolt.host/ns-loaded? below
-;; (ns.ss chez-ns-exists?, the rule find-ns uses) it fires only on a
-;; namespace-shaped ns that is not loaded AT ALL — the JVM's "No such namespace".
+;; class no.such.ns" from inside the call. Paired with jolt.host/namespace-for
+;; below (an alias in the compile ns, else ns.ss chez-ns-exists?, the rule find-ns
+;; uses) it fires only on a namespace-shaped ns that names nothing loaded AT ALL
+;; — the JVM's "No such namespace".
 ;; A loaded namespace missing only the var must stay late-bound: that is how
 ;; jolt-core reaches this very contract, and which jolt.host vars exist depends on
 ;; which host files the boot loaded, so the guard there is the static one
 ;; (jolt-host-manifest.txt) and the miss reports at the call.
 ;;
-;; NOT merely (not (hc-fq-class-name? nm)): a name with no dot at all is
-;; genuinely ambiguous — `str/join` is an unregistered :as alias, but a bare
-;; `Foo` is how an :import-ed short name is spelled, and its class may not be
-;; registered until its provider autoloads. Those stay with the host-static arm.
-;; Anything but a lowercase LETTER after the last dot is left there too.
+;; NOT merely (not (hc-fq-class-name? nm)): a name with no dot is read by its
+;; FIRST letter, the same convention. Lowercase — `str/join` — is an :as alias
+;; that was never registered, and the JVM's answer is the same "No such
+;; namespace" (the analyzer still asks host-class-name? first: a (defrecord
+;; point …) makes `point/create` a class, on both runtimes). A bare `Foo` is how
+;; an :import-ed short name is spelled, and its class may not be registered until
+;; its provider autoloads, so a Capitalized no-dot name stays with the host-static
+;; arm (documented in known-divergences.edn). Anything but a lowercase LETTER at
+;; the deciding position is left there too.
 (define (hc-ns-shaped-name? nm)
   (let ((n (string-length nm)))
     (let loop ((i (fx- n 1)))
-      (cond ((fx<? i 0) #f)                    ; no dot: ambiguous, not ours to reject
+      (cond ((fx<? i 0) (and (fx>? n 0) (char-lower-case? (string-ref nm 0))))
             ((char=? (string-ref nm i) #\.)
              (and (fx<? (fx+ i 1) n) (char-lower-case? (string-ref nm (fx+ i 1)))))
             (else (loop (fx- i 1)))))))
+
+;; Compiler.namespaceFor: the namespace `nm` names from the compile ns — an :as
+;; alias registered there, else a namespace by that name — as its name string,
+;; or #f when there is neither. The alias half is what keeps a loaded namespace
+;; that merely lacks the var on the late-bound arm above when it is reached
+;; THROUGH an alias (the mint compiles `op-registry/leaf-call-procs` against a
+;; seed that has the alias but not yet the var); the analyzer's "No such
+;; namespace" is this answering #f.
+(define (hc-namespace-for ctx nm)
+  (let ((target (or (chez-resolve-alias (chez-actx-cns ctx) nm) nm)))
+    (and (chez-ns-exists? target) target)))
 
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
@@ -984,7 +1000,7 @@
   (def-var! "jolt.host" "resolvable-names" hc-resolvable-names)
   (def-var! "jolt.host" "host-class-name?" hc-host-class-name?)
   (def-var! "jolt.host" "ns-shaped-name?" hc-ns-shaped-name?)
-  (def-var! "jolt.host" "ns-loaded?" chez-ns-exists?)
+  (def-var! "jolt.host" "namespace-for" hc-namespace-for)
   (def-var! "jolt.host" "host-intern!" hc-intern!)
   (def-var! "jolt.host" "form-syntax-quote-lower" hc-syntax-quote-lower)
   (def-var! "jolt.host" "form-syntax-quote-expand" hc-sq-expand-all)
