@@ -195,7 +195,14 @@
 ;; walk's own, which ends exactly at the record.
 (define (zipdir-read path coder . rest)
   (define name (and (pair? rest) (car rest)))
-  (let ((in (guard (e (#t (zip-throw "java.nio.file.NoSuchFileException" (or name path))))
+  ;; a file that is not there is the JDK's NoSuchFileException (its
+  ;; Files.readAttributes, before the open); one that is there but cannot be
+  ;; opened is the RandomAccessFile's FileNotFoundException, "(Permission
+  ;; denied)" as the JDK spells the EACCES it got
+  (let ((in (guard (e (#t (if (file-exists? path)
+                              (zip-throw "java.io.FileNotFoundException"
+                                         (string-append (or name path) " (Permission denied)"))
+                              (zip-throw "java.nio.file.NoSuchFileException" (or name path)))))
               (open-file-input-port path))))
     (dynamic-wind
       (lambda () #f)
