@@ -37,7 +37,7 @@
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
                                record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
-                               resolve-class-hint host-class-name? ns-shaped-name? ns-loaded?
+                               resolve-class-hint host-class-name? ns-shaped-name? namespace-for
                                jolt-class-for embed-plan ctx-for-ns]]))
 
 (declare analyze)
@@ -1795,7 +1795,11 @@
              ;; yet — so it is the seed's own gates that hold it: manifestcheck
              ;; rejects a namespace-shaped host-static in the minted seed, and
              ;; `make seeddefs` asserts every var the seed defines survives the load.
-             (if (and (ns-shaped-name? ns) (not (ns-loaded? ns)))
+             ;;
+             ;; A registered class wins over the shape: (defrecord point [x]) makes
+             ;; `point/create` a static call however lowercase the name, as the
+             ;; JVM's macroexpand1 finds the class before resolveIn ever runs.
+             (if (and (ns-shaped-name? ns) (not (namespace-for ctx ns)) (not (host-class-name? ns)))
                (analysis-error :analyze/unknown-namespace
                 (str "No such namespace: " ns)
                 {:jolt.error/symbol (str ns "/" nm)

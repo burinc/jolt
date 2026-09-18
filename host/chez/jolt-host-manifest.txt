@@ -168,7 +168,7 @@ monitor-enter
 monitor-exit
 mono-nanos
 munge-name
-ns-loaded?
+namespace-for
 ns-shaped-name?
 park-until-interrupt
 pop
