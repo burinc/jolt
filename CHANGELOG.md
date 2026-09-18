@@ -324,6 +324,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Maven dependencies download on a Windows machine with Git for Windows.**
+  The resolver's HTTPS transport looked for OpenSSL only under
+  `JOLT_OPENSSL_LIBDIR` and the bare DLL names, and Windows has no OpenSSL of
+  its own, so every Central and Clojars fetch failed before the first byte.
+  The transport now tries the OpenSSL 3 that Git for Windows ships
+  (`Git\mingw64\bin` under `ProgramFiles`, `ProgramW6432` and
+  `LOCALAPPDATA\Programs`) — after `JOLT_OPENSSL_LIBDIR` and before the bare
+  names, so a `PATH` that happens to hold some other `libcrypto` does not
+  decide. When nothing loads, the resolver's warning now names the candidates
+  tried and the variable to set instead of "the native TLS transport could not
+  be loaded" alone. The Windows CI job runs the resolver's unit gate and live
+  fetches through the transport with both separator spellings of the download
+  path, asserting that both libraries came from the Git directory (the runner
+  has an OpenSSL of its own on `PATH`, so a fetch that merely succeeds would
+  prove nothing).
+
 - **`(System/getenv)`, a `ProcessBuilder` child's environment and `os.version`
   no longer depend on a program being on `PATH`.** The map came from an
   `env -0` spawned through the shell, so with no `env` on `PATH` it was empty

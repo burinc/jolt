@@ -2,13 +2,15 @@
   "Minimal cert-verifying HTTPS GET-to-file for dependency download. A plain
   TCP socket (getaddrinfo/socket/connect) carries ciphertext; TLS runs against
   in-memory BIOs over the system OpenSSL via jolt.ffi, so no raw fd reaches
-  OpenSSL. libcrypto then libssl lazy-load on first use (candidate lists —
-  a JOLT_OPENSSL_LIBDIR directory first when set, then Homebrew paths on
-  macOS / bare sonames elsewhere). fetch returns true on a 2xx, false on any failure,
-  so jolt.deps falls through to the next repo. HTTPS only; the server
+  OpenSSL. libcrypto then libssl lazy-load on first use, from an ordered
+  candidate list: a JOLT_OPENSSL_LIBDIR directory first when set, then on
+  macOS the Homebrew paths, on Windows the OpenSSL 3 that Git for Windows
+  ships (Git/mingw64/bin, tried BEFORE the bare DLL names so a PATH that
+  happens to hold some other libcrypto does not decide), then the bare
+  sonames the OS loader searches. fetch returns true on a 2xx, false on any
+  failure, so jolt.deps falls through to the next repo. HTTPS only; the server
   certificate is verified (default verify paths + VERIFY_PEER + hostname check).
-  macOS and Linux are validated; the Windows path (ws2_32 + WSAStartup +
-  closesocket) is implemented but not yet tested on a Windows host."
+  On Windows the sockets are ws2_32 + WSAStartup + closesocket."
   (:require [jolt.ffi :as ffi]
             [clojure.string :as str]))
 
@@ -50,39 +52,91 @@
      "/usr/local/opt/openssl@3/lib/libssl.dylib"]
     ssl-names))
 
-;; JOLT_OPENSSL_LIBDIR names a directory whose libcrypto/libssl are tried
-;; before the platform candidates — the seam for an OpenSSL living outside
-;; the built-in paths (Nix, MacPorts, Guix, a nonstandard Homebrew prefix).
-;; The macOS hazard above does not apply to it: the entries are absolute
-;; paths into the named directory, never the bare Apple-shadowed sonames.
-(defn- lib-candidates [libdir names fallbacks]
-  (if (and libdir (not (str/blank? libdir)))
-    (into (mapv #(str libdir "/" %) names) fallbacks)
-    fallbacks))
+;; Windows has no OpenSSL of its own, but Git for Windows ships OpenSSL 3 under
+;; mingw64/bin: the machine-wide install under ProgramFiles (ProgramW6432 is the
+;; same directory as a 32-bit process sees it) and the per-user one under
+;; LOCALAPPDATA/Programs. Pure over its three roots so the gate can pin the
+;; list. One entry per directory: Windows compares paths without case, and a
+;; root may arrive with a trailing separator.
+(defn- windows-openssl-libdirs-for [program-files program-w6432 local-app-data]
+  (let [trimmed (fn [root] (str/replace root #"[\\/]+$" ""))
+        dirs (for [[root suffix] [[program-files "Git\\mingw64\\bin"]
+                                  [program-w6432 "Git\\mingw64\\bin"]
+                                  [local-app-data "Programs\\Git\\mingw64\\bin"]]
+                   :when (not (str/blank? root))]
+               (str (trimmed root) "\\" suffix))]
+    (loop [dirs dirs seen #{} acc []]
+      (if-let [[d & more] (seq dirs)]
+        (let [k (str/lower-case d)]
+          (recur more (conj seen k) (if (seen k) acc (conj acc d))))
+        acc))))
+
+;; The directories whose libcrypto/libssl are tried before the bare names, in
+;; order: JOLT_OPENSSL_LIBDIR when set — the seam for an OpenSSL living outside
+;; the built-in paths (Nix, MacPorts, Guix, a nonstandard Homebrew prefix); the
+;; macOS hazard above does not apply to it, its entries are absolute paths into
+;; the named directory, never the bare Apple-shadowed sonames — then, on
+;; Windows, the Git for Windows directories. Pure over what ensure-native!
+;; reads from the environment, so the gate pins the order.
+(defn- openssl-libdirs-for [explicit windows? program-files program-w6432 local-app-data]
+  (cond-> (if (str/blank? explicit) [] [explicit])
+    windows? (into (windows-openssl-libdirs-for program-files program-w6432 local-app-data))))
+
+(defn- runtime-openssl-libdirs []
+  (openssl-libdirs-for (System/getenv "JOLT_OPENSSL_LIBDIR") windows?
+                       (System/getenv "ProgramFiles")
+                       (System/getenv "ProgramW6432")
+                       (System/getenv "LOCALAPPDATA")))
+
+;; NAME under DIR, joined with the separator DIR itself uses, so a Windows
+;; directory stays one spelling end to end (the loader takes either).
+(defn- dir-join [dir name]
+  (str dir (if (and (str/includes? dir "\\") (not (str/includes? dir "/"))) "\\" "/") name))
+
+;; NAMES under each of LIBDIRS, directory-major (so libcrypto and libssl come
+;; from the same install), then the FALLBACKS. LIBDIRS is a list: a string
+;; would walk character by character and the explicit directory would be
+;; silently lost.
+(defn- lib-candidates [libdirs names fallbacks]
+  (when (string? libdirs)
+    (throw (ex-info "lib-candidates: libdirs is a list of directories" {:libdirs libdirs})))
+  (into (vec (mapcat (fn [libdir] (map #(dir-join libdir %) names)) libdirs))
+        fallbacks))
 
 (def ^:private native-ready? (volatile! false))
-
-(defn- load-one [path]
-  (try (ffi/load-library path) true (catch :default _ false)))
-
-(defn- try-candidates [cs]
-  (loop [cs cs]
-    (cond (empty? cs) false
-          (load-one (first cs)) true
-          :else (recur (rest cs)))))
+;; {:crypto path :ssl path} once loaded — which of the candidates this machine
+;; actually has — and, after a failed attempt, why it failed.
+(def ^:private native-libs (volatile! nil))
+(def ^:private native-failure (volatile! nil))
 
 ;; Windows sockets live in ws2_32.dll and need WSAStartup(2.2) once before any
 ;; socket call; POSIX sockets are process symbols, so this is a no-op there.
-;; UNTESTED on Windows — no Windows machine was available to validate against.
 (ffi/defcfn c-WSAStartup "WSAStartup" [:int :pointer] :int)       ; Windows Winsock init
 
 (defn- init-sockets! []
-  (if-not windows?
-    true
-    (when (or (load-one "ws2_32.dll") (load-one "ws2_32"))
-      (let [wsadata (ffi/alloc 512)]
-        (try (zero? (c-WSAStartup 0x0202 wsadata))
-             (finally (ffi/free wsadata)))))))
+  (when windows?
+    (ffi/load-library ["ws2_32.dll" "ws2_32"])
+    (let [wsadata (ffi/alloc 512)]
+      (try (when-not (zero? (c-WSAStartup 0x0202 wsadata))
+             (throw (ex-info "WSAStartup failed" {})))
+           (finally (ffi/free wsadata))))))
+
+;; ffi/load-library takes the ordered candidates, answers the one that loaded
+;; and raises naming every one it tried when none does.
+(defn- load-native! []
+  (init-sockets!)
+  (let [libdirs (runtime-openssl-libdirs)
+        crypto  (:path (ffi/load-library (lib-candidates libdirs crypto-names crypto-candidates)))
+        ssl     (:path (ffi/load-library (lib-candidates libdirs ssl-names ssl-candidates)))]
+    {:crypto crypto :ssl ssl}))
+
+;; What the resolver's warning says when the transport did not load: the
+;; loader's message names the candidates tried, and the remedy is the
+;; directory variable — without it a Windows machine with no Git for Windows
+;; reports only that the transport could not be loaded.
+(defn- transport-load-error [cause]
+  (str "the native TLS transport could not be loaded: " cause
+       " (JOLT_OPENSSL_LIBDIR names the directory holding libcrypto and libssl)"))
 
 (defn- ensure-native!
   "Lazy-load the native transport on first use: (Windows) ws2_32 + WSAStartup,
@@ -91,12 +145,22 @@
   Returns true once ready; a later fetch retries."
   []
   (or @native-ready?
-      (let [libdir (System/getenv "JOLT_OPENSSL_LIBDIR")]
-        (when (and (init-sockets!)
-                   (try-candidates (lib-candidates libdir crypto-names crypto-candidates))
-                   (try-candidates (lib-candidates libdir ssl-names ssl-candidates)))
-          (vreset! native-ready? true)
-          true))))
+      (try
+        (vreset! native-libs (load-native!))
+        (vreset! native-failure nil)
+        (vreset! native-ready? true)
+        true
+        (catch :default e
+          (vreset! native-failure (or (ex-message e) (str e)))
+          false))))
+
+(defn loaded-native-libraries
+  "The OpenSSL libraries the transport loaded, {:crypto path :ssl path} — which
+  of the candidates this machine has — or nil before the first fetch or when
+  none loaded. The HTTPS smoke asserts on it: a fetch that succeeded says
+  nothing about which directory answered."
+  []
+  @native-libs)
 
 ;; --- BSD socket layer. On POSIX these are the process's own symbols (libc);
 ;; on Windows they live in ws2_32.dll (loaded, with WSAStartup, by ensure-native!
@@ -611,7 +675,7 @@
   Only :ok wrote a file; a failed fetch never leaves a partial one."
   [url out-path]
   (if-not (ensure-native!)
-    {:outcome :failed :error "the native TLS transport could not be loaded"}
+    {:outcome :failed :error (transport-load-error @native-failure)}
     (with-retries
       (fn []
         ;; The catch stays — a fetch must not escape into dependency resolution

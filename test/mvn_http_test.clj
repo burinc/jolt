@@ -17,10 +17,14 @@
 (def classify-status  (var jolt.mvn-http/classify-status))
 (def with-retries     (var jolt.mvn-http/with-retries))
 (def lib-candidates   (var jolt.mvn-http/lib-candidates))
+(def windows-libdirs  (var jolt.mvn-http/windows-openssl-libdirs-for))
+(def openssl-libdirs  (var jolt.mvn-http/openssl-libdirs-for))
+(def transport-error  (var jolt.mvn-http/transport-load-error))
 (def pick-ai-addr-offset (var jolt.mvn-http/pick-ai-addr-offset))
 (def connect-error-message (var jolt.mvn-http/connect-error-message))
 (def ai-addr-fallback @(var jolt.mvn-http/O-ai-addr-fallback))
 (def max-attempts     @(var jolt.mvn-http/max-attempts))
+(def windows?         @(var jolt.mvn-http/windows?))
 
 (def ^:private fails (atom []))
 (defn- ok= [expected actual label]
@@ -110,17 +114,59 @@
   ;; the pure part under test. An explicit lib dir is tried before the
   ;; platform fallbacks; an unset or blank dir leaves the fallbacks untouched.
   (ok= ["/nix/lib/libssl.3.dylib" "/nix/lib/libssl.dylib" "/opt/homebrew/lib/libssl.dylib"]
-       (lib-candidates "/nix/lib" ["libssl.3.dylib" "libssl.dylib"] ["/opt/homebrew/lib/libssl.dylib"])
+       (lib-candidates ["/nix/lib"] ["libssl.3.dylib" "libssl.dylib"] ["/opt/homebrew/lib/libssl.dylib"])
        "lib-candidates: explicit dir entries come first, in name order")
   (ok= ["/d/libcrypto.so.3" "/d/libcrypto.so" "libcrypto.so.3" "libcrypto.so"]
-       (lib-candidates "/d" ["libcrypto.so.3" "libcrypto.so"] ["libcrypto.so.3" "libcrypto.so"])
+       (lib-candidates ["/d"] ["libcrypto.so.3" "libcrypto.so"] ["libcrypto.so.3" "libcrypto.so"])
        "lib-candidates: bare-name fallbacks stay after the dir entries")
   (ok= ["libcrypto.so.3"]
-       (lib-candidates nil ["libcrypto.so.3"] ["libcrypto.so.3"])
-       "lib-candidates: nil dir means fallbacks only")
-  (ok= ["libcrypto.so.3"]
-       (lib-candidates "" ["libcrypto.so.3"] ["libcrypto.so.3"])
-       "lib-candidates: blank dir means fallbacks only")
+       (lib-candidates [] ["libcrypto.so.3"] ["libcrypto.so.3"])
+       "lib-candidates: empty dir list means fallbacks only")
+  (ok= ["/a/x" "/a/y" "/b/x" "/b/y" "z"]
+       (lib-candidates ["/a" "/b"] ["x" "y"] ["z"])
+       "lib-candidates: directory-major, so libcrypto and libssl come from one install")
+  (ok= true
+       (try (lib-candidates "/nix/lib" ["x"] ["z"]) false (catch :default _ true))
+       "lib-candidates: a directory STRING is refused, not walked character by character")
+  (ok= ["C:\\Git\\mingw64\\bin\\libssl-3-x64.dll" "C:/ssl/bin/libssl-3-x64.dll" "libssl-3-x64.dll"]
+       (lib-candidates ["C:\\Git\\mingw64\\bin" "C:/ssl/bin"] ["libssl-3-x64.dll"] ["libssl-3-x64.dll"])
+       "lib-candidates: each candidate keeps its directory's separator")
+
+  ;; Git for Windows' mingw64/bin, from the three roots that place it, with
+  ;; native separators; the machine-wide root usually arrives twice (ProgramFiles
+  ;; and ProgramW6432 name the same directory, and Windows compares paths
+  ;; without case), a trailing separator on a root adds nothing.
+  (ok= ["C:\\Program Files\\Git\\mingw64\\bin"
+        "C:\\Users\\me\\AppData\\Local\\Programs\\Git\\mingw64\\bin"]
+       (windows-libdirs "C:\\Program Files" "c:\\program files\\"
+                        "C:\\Users\\me\\AppData\\Local")
+       "Windows OpenSSL dirs: Git installs, one per directory whatever the spelling")
+  (ok= []
+       (windows-libdirs nil "" nil)
+       "Windows OpenSSL dirs: no roots, no candidates")
+
+  ;; The directory list ensure-native! builds: JOLT_OPENSSL_LIBDIR first when
+  ;; set, then (Windows only) the Git for Windows directories, so the bare
+  ;; names the loader searches PATH for come last.
+  (ok= ["/nix/lib" "C:\\Program Files\\Git\\mingw64\\bin"]
+       (openssl-libdirs "/nix/lib" true "C:\\Program Files" nil nil)
+       "openssl-libdirs: the explicit directory precedes the Git ones")
+  (ok= ["C:\\Program Files\\Git\\mingw64\\bin"]
+       (openssl-libdirs "  " true "C:\\Program Files" nil nil)
+       "openssl-libdirs: a blank JOLT_OPENSSL_LIBDIR is unset")
+  (ok= []
+       (openssl-libdirs nil false "C:\\Program Files" nil nil)
+       "openssl-libdirs: the Git directories are Windows-only")
+
+  ;; What a failed load tells the resolver: the loader's own message (it names
+  ;; every candidate it tried) and the remedy, so the warning under a Windows
+  ;; machine without Git for Windows says what to set.
+  (ok= true
+       (str/includes? (transport-error "jolt.ffi/load-library: cannot load any of a, b") "cannot load any of a, b")
+       "transport error carries the loader's message")
+  (ok= true
+       (str/includes? (transport-error "x") "JOLT_OPENSSL_LIBDIR")
+       "transport error names the remedy")
 
   ;; --- struct addrinfo layout probe (#979) -----------------------------------
   ;; ai_addr sits at 24 under glibc and at 32 under the BSD order, which is what
@@ -142,12 +188,18 @@
   ;; Exhausting the candidates used to be reported as "connection refused" no
   ;; matter what the kernel said; the bionic bug was really EFAULT, and calling
   ;; it a refusal sent people looking at their network.
-  (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "errno 14")
-       "connect error names the errno it got")
-  (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "repo.clojars.org:443")
-       "connect error names host and port")
-  (ok= false (str/includes? (connect-error-message "h" 443 111) "errno 14")
-       "connect error reports the errno it got, not a fixed one")
+  ;; The code is an errno on POSIX and a WSAGetLastError value on Windows, and
+  ;; the message says which (strerror speaks only errno), so the rows ask for
+  ;; the platform's word; the gate runs on the Windows job too.
+  (let [code-word (if windows? "error" "errno")]
+    (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) (str code-word " 14"))
+         "connect error names the code it got")
+    (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "repo.clojars.org:443")
+         "connect error names host and port")
+    (ok= false (str/includes? (connect-error-message "h" 443 111) (str code-word " 14"))
+         "connect error reports the code it got, not a fixed one")
+    (ok= true (str/includes? (connect-error-message "h" 443 111) (str code-word " 111"))
+         "connect error names the other code the same way"))
   (ok= "could not connect to h:443" (connect-error-message "h" 443 nil)
        "connect error with no captured code stays plain")
 
@@ -176,7 +228,30 @@
     (reset! calls 0)
     (ok= :retryable (:outcome (with-retries (attempt (repeat 9 {:outcome :retryable}))))
          "retry: gives up as retryable, never as not-found")
-    (ok= max-attempts @calls "retry: stops at the attempt cap")))
+    (ok= max-attempts @calls "retry: stops at the attempt cap"))
+
+  ;; --- a transport that cannot load, end to end --------------------------------
+  ;; Network-free: with no loadable libcrypto candidate, fetch* fails before any
+  ;; socket, and its :error is what the resolver prints per repository — the
+  ;; candidate the loader tried and the remedy. The candidate vars are put back
+  ;; after; ensure-native! stays unready after a failure, so nothing is cached.
+  (let [cands (var jolt.mvn-http/crypto-candidates)
+        names (var jolt.mvn-http/crypto-names)
+        saved [@cands @names]]
+    (try
+      (alter-var-root cands (constantly ["/nonexistent/jolt-mvn-http/libcrypto.so.3"]))
+      (alter-var-root names (constantly ["libcrypto-jolt-mvn-http-nonexistent.so.3"]))
+      (let [r (jolt.mvn-http/fetch* "https://repo1.maven.org/maven2/x.pom" "/nonexistent/jolt-mvn-http/x.pom")]
+        (ok= :failed (:outcome r) "unloadable transport: the fetch fails")
+        (ok= true (str/includes? (str (:error r)) "/nonexistent/jolt-mvn-http/libcrypto.so.3")
+             "unloadable transport: the error names the candidate tried")
+        (ok= true (str/includes? (str (:error r)) "JOLT_OPENSSL_LIBDIR")
+             "unloadable transport: the error names the remedy")
+        (ok= nil (jolt.mvn-http/loaded-native-libraries)
+             "unloadable transport: nothing is reported as loaded"))
+      (finally
+        (alter-var-root cands (constantly (first saved)))
+        (alter-var-root names (constantly (second saved)))))))
 
 (defn -main [& _]
   (run)
