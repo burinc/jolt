@@ -182,7 +182,7 @@ jobs:
           # dir) are visible inside the msys2 shell
           path-type: inherit
           install: >-
-            git make vim unzip zip
+            git make vim zip
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-lz4
             mingw-w64-x86_64-zlib

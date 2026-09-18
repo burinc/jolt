@@ -109,5 +109,7 @@ jobs:
           file /tmp/libadd-driver-arm64 | grep -q "ARM aarch64"
           got="$(qemu-aarch64-static -L /usr/aarch64-linux-gnu \
             /tmp/libadd-driver-arm64 /tmp/libadd-arm64.so)"
-          test "$got" = "5"
-          echo "cross-library smoke OK: add(2,3)=5 through dlopen+jolt_lookup"
+          # the driver prints add(2,3), point_size() and gzip_ok(): the last is
+          # the gzip round trip through the zlib the cross-built library links
+          test "$got" = "5 8 1"
+          echo "cross-library smoke OK: add(2,3)=5, point_size=8, gzip_ok=1 through dlopen+jolt_lookup"
