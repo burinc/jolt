@@ -123,7 +123,11 @@ system
 # the combined environment for them. Permitted degradation, per entry point:
 # sa-gc-collect may no-op (the JVM gc it maps is only a hint); sa-run-process
 # must raise 'unsupported on targets without subprocess support (no caller
-# tolerates a fake); sa-real-time-ms may use any monotonic ms clock but never
+# tolerates a fake); sa-environment-pairs answers the whole environment as the
+# R7RS get-environment-variables alist and never by running a program (it is
+# what (System/getenv) and a ProcessBuilder child's inherited environment are
+# built from); sa-os-release answers the OS's own version string or #f, and #f
+# leaves os.version out of the system properties; sa-real-time-ms may use any monotonic ms clock but never
 # a constant (callers stamp temp files with it); sa-total-memory-bytes may
 # approximate — callers only display it or subtract sa-bytes-allocated from
 # it; sa-max-memory-bytes is the heap's high-water mark since the last
@@ -137,6 +141,8 @@ system
 # and the caller then reports maxMemory as unbounded rather than promising a
 # bound it does not have.
 sa-run-process
+sa-environment-pairs
+sa-os-release
 sa-gc-collect
 sa-gc-max-generation
 sa-bytes-allocated

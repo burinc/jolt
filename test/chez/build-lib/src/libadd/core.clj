@@ -16,3 +16,17 @@
 ;; set as the library's leaves layout-size interned but UNBOUND at the call.
 (ffi/export! "add" add [:int :int] :int)
 (ffi/export! "point_size" point-size [] :int)
+
+;; gzip_ok answers 1 when a gzip round trip works inside the library (#916):
+;; java.util.zip reaches a working zlib, and the bytes are deflated, not stored.
+;; zlib-register-smoke.sh pins that the zlib is the library's own.
+(defn gzip-ok []
+  (let [b (java.io.ByteArrayOutputStream.)]
+    (with-open [o (java.util.zip.GZIPOutputStream. b)]
+      (.write o (.getBytes (apply str (repeat 1000 "zip")) "UTF-8")))
+    (if (and (= 3000 (count (slurp (java.util.zip.GZIPInputStream.
+                                     (java.io.ByteArrayInputStream. (.toByteArray b))))))
+             (< (.size b) 100))
+      1
+      0)))
+(ffi/export! "gzip_ok" gzip-ok [] :int)

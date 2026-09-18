@@ -1,0 +1,11 @@
+{:paths ["src"]
+
+ ;; A library from before the runtime provided java.util.zip.CRC32, still
+ ;; claiming it — the shape every project pinned to an older jolt-lang/http-client
+ ;; release met when java.util.zip moved into the runtime. The claim on a class
+ ;; the runtime provides is dropped with a warning, not refused: a runtime
+ ;; upgrade must not make every project on an older release of a library fail
+ ;; to resolve. The claim on javax.crypto.SecretKeyFactory, which nothing else
+ ;; provides, stands and still autoloads this namespace.
+ :jolt/provides {provstale.install ["java.util.zip.CRC32"
+                                    "javax.crypto.SecretKeyFactory"]}}

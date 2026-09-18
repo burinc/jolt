@@ -666,6 +666,11 @@
 (jch-register-supers! "java.io.FileNotFoundException" '("java.io.IOException"))
 (jch-register-supers! "java.io.UnsupportedEncodingException" '("java.io.IOException"))
 (jch-register-supers! "java.io.EOFException" '("java.io.IOException"))
+;; java.util.zip's exception classes (JDK 21 ZipException.java,
+;; DataFormatException.java). Here, before host-static-classes.ss, so its
+;; Throwable sweep gives them constructors.
+(jch-register-supers! "java.util.zip.ZipException" '("java.io.IOException"))
+(jch-register-supers! "java.util.zip.DataFormatException" '("java.lang.Exception"))
 (jch-register-supers! "java.nio.file.FileSystemException" '("java.io.IOException"))
 (jch-register-supers! "java.nio.file.FileAlreadyExistsException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.NoSuchFileException" '("java.nio.file.FileSystemException"))
@@ -783,6 +788,26 @@
 ;; hands them to anything taking an OutputStream.
 (jch-register-supers! "java.io.FilterOutputStream" '("java.io.OutputStream"))
 (jch-register-supers! "java.io.PrintStream" '("java.io.FilterOutputStream" "java.lang.Appendable"))
+;; java.util.zip (host/chez/java/zlib.ss and zip-*.ss implement them; JDK 21
+;; class declarations).
+(jch-register-supers! "java.util.zip.Checksum" '())
+(jch-mark-interface! "java.util.zip.Checksum")
+(jch-register-supers! "java.util.zip.CRC32" '("java.util.zip.Checksum"))
+(jch-register-supers! "java.util.zip.Adler32" '("java.util.zip.Checksum"))
+(jch-register-supers! "java.util.zip.Inflater" '())
+(jch-register-supers! "java.util.zip.Deflater" '())
+(jch-register-supers! "java.util.zip.ZipEntry" '("java.lang.Cloneable"))
+(jch-register-supers! "java.util.zip.InflaterInputStream" '("java.io.FilterInputStream"))
+(jch-register-supers! "java.util.zip.DeflaterInputStream" '("java.io.FilterInputStream"))
+(jch-register-supers! "java.util.zip.GZIPInputStream" '("java.util.zip.InflaterInputStream"))
+(jch-register-supers! "java.util.zip.ZipInputStream" '("java.util.zip.InflaterInputStream"))
+(jch-register-supers! "java.util.zip.ZipFile" '("java.io.Closeable"))
+;; the two stream classes ZipFile.getInputStream answers with (ZipFile.java)
+(jch-register-supers! "java.util.zip.ZipFile$ZipFileInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.util.zip.ZipFile$ZipFileInflaterInputStream" '("java.util.zip.InflaterInputStream"))
+(jch-register-supers! "java.util.zip.DeflaterOutputStream" '("java.io.FilterOutputStream"))
+(jch-register-supers! "java.util.zip.GZIPOutputStream" '("java.util.zip.DeflaterOutputStream"))
+(jch-register-supers! "java.util.zip.ZipOutputStream" '("java.util.zip.DeflaterOutputStream"))
 (jch-register-supers! "java.io.OutputStreamWriter" '("java.io.Writer"))
 (jch-register-supers! "java.io.FileWriter" '("java.io.OutputStreamWriter"))
 (jch-register-supers! "java.io.InputStreamReader" '("java.io.Reader"))

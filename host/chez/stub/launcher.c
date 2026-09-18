@@ -18,6 +18,7 @@
  * machine-type), like a native compiler.
  */
 #include "scheme.h"
+#include "jolt_zlib.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -255,7 +256,7 @@ int main(int argc, char *argv[]) {
   Sregister_boot_file_fd_region("jolt", fd, (iptr)boot_off, (iptr)boot_len, 1);
   startup_profile_mark(startup_profile, startup_started, &startup_last,
                        "register boot payload");
-  Sbuild_heap(0, 0);
+  Sbuild_heap(0, jolt_register_zlib);
   startup_profile_mark(startup_profile, startup_started, &startup_last,
                        "Sbuild_heap");
   int status = Sscheme_start(argc, (const char **)argv);

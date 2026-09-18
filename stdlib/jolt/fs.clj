@@ -9,6 +9,6 @@
   (:require [babashka.fs]
             [jolt.util :refer [import-vars]]))
 
-;; zip / gzip need java.util.zip, which Jolt does not shim yet — keep them out
-;; of the public surface rather than exposing operations that fail.
-(import-vars babashka.fs :exclude #{zip unzip gzip gunzip})
+;; The whole surface, zip/unzip/gzip/gunzip included: they run on the runtime's
+;; java.util.zip (host/chez/java/zip-*.ss), which every jolt binary carries.
+(import-vars babashka.fs)

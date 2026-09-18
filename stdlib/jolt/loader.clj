@@ -99,7 +99,9 @@
   own cells. That claim covers the evict/evaluate window, not a reader's view
   of a name another context reloads while unrelated code compiles; a name one
   context reloaded is the name the global registry holds. `:class` requests
-  have no backend on this host yet, and jar roots are rejected.
+  have no backend on this host yet. A root may be a directory or a jar; a jar
+  is read in place through its central directory, as the global roots read
+  one, and never extracted.
 
   One registry also means one slot per name. A private load EVICTS whatever
   the process has under the name — including a host namespace the context is
@@ -345,24 +347,28 @@
   (io/resource nm host-base-loader))
 
 (defn- default-open
-  "Open a resource hit. A file: location opens the file; anything else — the
-   jar:-classed embedded resource a built binary hands out — is re-resolved by
-   name through the host's resolver, which is what produced the location."
+  "Open a resource hit. A file: location opens the file, a jar:file: location
+   streams the entry out of its archive; anything else — the jar:-classed
+   embedded resource a built binary hands out — is re-resolved by name through
+   the host's resolver, which is what produced the location."
   [hit]
   (when-let [url (:url hit)]
-    (if (str/starts-with? url "file:")
-      (io/input-stream (file-url-path url))
-      (io/input-stream (host-resource (:name hit))))))
+    (cond
+      (str/starts-with? url "file:") (io/input-stream (file-url-path url))
+      (str/starts-with? url "jar:file:") (io/input-stream url)
+      :else (io/input-stream (host-resource (:name hit))))))
 
 (defn- hit-url
-  "The URL a resource hit names: the file URL for a file: location, the host
-   resolver's answer (an embedded resource object, as the host's own
-   ClassLoader.getResource answers) for anything else."
+  "The URL a resource hit names: the file URL for a file: location, the jar:
+   URL for an entry of a jar root, the host resolver's answer (an embedded
+   resource object, as the host's own ClassLoader.getResource answers) for
+   anything else."
   [hit]
   (let [url (:url hit)]
-    (if (str/starts-with? url "file:")
-      (io/as-url (java.io.File. (file-url-path url)))
-      (host-resource (:name hit)))))
+    (cond
+      (str/starts-with? url "file:") (io/as-url (java.io.File. (file-url-path url)))
+      (str/starts-with? url "jar:file:") (java.net.URL. url)
+      :else (host-resource (:name hit)))))
 
 (defn- open*
   [l hit]
@@ -950,38 +956,62 @@
 
 ;; ─── The source-roots code backend ─────────────────────────────────────────
 
+(defn- jar-root?
+  "Is ROOT a jar — a .jar or .zip that is a file? The host reads such a root
+   in place (jolt.host/root-file); every other root is a directory."
+  [root]
+  (let [r (str/lower-case (str root))]
+    (and (or (str/ends-with? r ".jar") (str/ends-with? r ".zip"))
+         (not (fs/directory? (fs/file (str root)))))))
+
 (defn- validate-root!
   "Construction is the eager-validation point: a root that is missing, not a
-   directory, or not readable fails here, not at the first load."
+   directory or a whole jar, or not readable fails here, not at the first
+   load."
   [root]
   (let [f (fs/file (str root))]
     (when-not (fs/exists? f)
       (throw (ex-info (str "loader root does not exist: " root)
                       {:type :loader/bad-root :root (str root)})))
-    (when-not (fs/directory? f)
-      (throw (ex-info (str "loader root is not a directory (jar roots are not supported yet): " root)
-                      {:type :loader/bad-root :root (str root)})))
     (when-not (fs/readable? f)
       (throw (ex-info (str "loader root is not readable: " root)
+                      {:type :loader/bad-root :root (str root)})))
+    (cond
+      (fs/directory? f) nil
+      (jar-root? root)
+      (when-not (jolt.host/zip-archive? (str root))
+        (throw (ex-info (str "loader root is not a whole zip archive: " root)
+                        {:type :loader/bad-root :root (str root)})))
+      :else
+      (throw (ex-info (str "loader root is neither a directory nor a jar: " root)
                       {:type :loader/bad-root :root (str root)})))))
+
+(defn- root-file
+  "The location NAME resolves to on ROOT, or nil: an absolute file path under
+   a directory root, a jar: path into a jar root (jolt.host/root-file)."
+  [root name]
+  (when-let [p (jolt.host/root-file (str root) name)]
+    (if (str/starts-with? p "jar:file:") p (str (fs/absolutize (fs/file p))))))
 
 (defn- roots-locate
   "Locate ns sources and resources under ROOTS, in order, without reading
-   them — ns hits carry a file path, resource hits a URL."
+   them — ns hits carry a file path (a jar: path for a jar root), resource
+   hits a URL."
   [roots]
   (fn [req]
     (case (:kind req)
       :ns (into []
                 (for [root roots
                       rel (ns-source-paths (:name req))
-                      :let [f (fs/file root rel)]
-                      :when (fs/exists? f)]
-                  {:kind :ns :file (str (fs/absolutize f))}))
+                      :let [f (root-file root rel)]
+                      :when f]
+                  {:kind :ns :file f}))
       :resource (into []
                       (for [root roots
-                            :let [f (fs/file root (:name req))]
-                            :when (fs/exists? f)]
-                        {:kind :resource :url (str "file:" (fs/absolutize f))}))
+                            :let [f (root-file root (:name req))]
+                            :when f]
+                        {:kind :resource
+                         :url (if (str/starts-with? f "jar:file:") f (str "file:" f))}))
       nil)))
 
 ;; --- reading and evaluating a namespace source ----------------------------
@@ -1260,7 +1290,12 @@
           (mark-private! l ns-name))
         (try
           (try
+            ;; *file* is the source being evaluated, as load binds it, so a
+            ;; def that reads it (a resource path relative to its own file, a
+            ;; jar entry's spelling) sees the context's file and not the
+            ;; program that opened the context
             (binding [*ns* *ns*
+                      *file* file
                       jolt.host/*invoke-rewrite* (context-rewriter (:id l) ns-name)]
               (doseq [f forms]
                 (eval f)))

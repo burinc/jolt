@@ -1139,6 +1139,41 @@
                                  (let ((ia (nio-stat-ino (nfp a))) (ib (nio-stat-ino (nfp b))))
                                    (and ia ib (= ia ib) #t)))))
         (cons "copy" (lambda (src dst . opts)
+                       (cond
+                         ;; copy(InputStream, Path, CopyOption...): the stream's
+                         ;; bytes become the file, replaced only with
+                         ;; REPLACE_EXISTING; the count is answered. A jolt
+                         ;; in-stream or a reify InputStream (io-streams.ss).
+                         ((or (in-stream? src) (user-in-stream? src))
+                          (let ((d (nfp dst)))
+                            (when (and (nio-dest-present? d)
+                                       (not (nio-opts-have? opts copt-sym 'replace-existing)))
+                              (nio-already-exists d))
+                            (when (nio-dest-present? d) (nio-delete1 d #t))
+                            ;; a chunk at a time (io-streams.ss copy-bytes-into!),
+                            ;; as the JDK copies through an 8 KiB buffer: the
+                            ;; stream never has to fit in memory
+                            (let ((port (open-file-output-port d (file-options no-fail) (buffer-mode block))))
+                              (->num (dynamic-wind
+                                       (lambda () #f)
+                                       (lambda () (copy-bytes-into! src (lambda (bv) (put-bytevector port bv))))
+                                       (lambda () (close-port port)))))))
+                         ;; copy(Path, OutputStream): the file's bytes into the
+                         ;; stream a chunk at a time; the count is answered.
+                         ((or (out-stream? dst) (user-out-stream? dst))
+                          (let ((s (nfp src)))
+                            (unless (nio-dest-present? s) (nio-no-such-file s))
+                            (io-note-file-read! s)
+                            (let ((port (nio-open-input-port s)))
+                              (->num (dynamic-wind
+                                       (lambda () #f)
+                                       (lambda ()
+                                         (copy-port-chunks! port
+                                           (lambda (bv)
+                                             (record-method-dispatch dst "write"
+                                               (list->cseq (list (na-byte-array bv) (->num 0) (->num (bytevector-length bv))))))))
+                                       (lambda () (close-port port)))))))
+                         (else
                        (let ((s (nfp src)) (d (nfp dst)))
                          (cond
                            ((string=? s d) (->path dst))
@@ -1157,7 +1192,7 @@
                                  (when (and mode c-chmod) (c-chmod d (bitwise-and mode #o777))))
                                (when (nio-opts-have? opts copt-sym 'copy-attributes)
                                  (set-file-mtime-millis! d (file-mtime-millis s)))))
-                            (->path dst))))))) ))
+                            (->path dst))))))))) ))
   (set! files-accum-chunks (cons files-final files-accum-chunks)))
 
 ;; getOwner resolves the real owning user (stat st_uid -> getpwuid -> pw_name),

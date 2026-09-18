@@ -2062,6 +2062,41 @@
 ;; natives-array.ss (the byte-array <-> bytevector bridge).
 (load "host/chez/java/io-streams.ss")
 
+;; zlib: the entry points java.util.zip binds (jolt_z_* in a built binary, see
+;; host/chez/stub/jolt_zlib.h) and the z_stream they drive. Mechanism only; the
+;; java.util.zip classes load after it.
+(load "host/chez/java/zlib.ss")
+
+;; What the java.util.zip classes share: the JDK's array range check, byte[]
+;; access, and CRC32 / Adler32. The class rows are in class-hierarchy.ss.
+(load "host/chez/java/zip-base.ss")
+
+;; java.util.zip.Inflater, and the window/output/range helpers Deflater shares.
+(load "host/chez/java/zip-inflater.ss")
+
+;; java.util.zip.Deflater and its static fields.
+(load "host/chez/java/zip-deflater.ss")
+
+;; InflaterInputStream and DeflaterInputStream: in-streams over custom ports, and
+;; the frame GZIPInputStream and ZipInputStream share.
+(load "host/chez/java/zip-in-streams.ss")
+
+;; DeflaterOutputStream: an out-stream over a custom port, and the frame
+;; GZIPOutputStream shares.
+(load "host/chez/java/zip-out-streams.ss")
+
+;; GZIPInputStream and GZIPOutputStream on those frames.
+(load "host/chez/java/zip-gzip.ss")
+
+;; ZipEntry, and ZipInputStream on the in-stream frame.
+(load "host/chez/java/zip-entries.ss")
+
+;; ZipFile, and the central-directory index the loader's jar roots share.
+(load "host/chez/java/zip-file.ss")
+
+;; ZipOutputStream on the out-stream frame.
+(load "host/chez/java/zip-out-entries.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss

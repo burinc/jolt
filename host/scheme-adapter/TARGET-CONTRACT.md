@@ -66,9 +66,12 @@ misbehavior, not a crash.
 ## Capability degradations, by tier
 
 - **system**: `sa-run-process` raises without subprocess support (callers
-  genuinely need the child). GC hooks (`sa-gc-collect`, `sa-gc-trip-bytes!`)
-  may no-op. Clocks (`sa-real-time-ms`) and `sa-file-mtime-ms` are required —
-  do not fake them.
+  genuinely need the child). `sa-environment-pairs` is the whole environment
+  as the R7RS `get-environment-variables` alist, read in process, never by
+  running a program. `sa-os-release` may answer #f, which leaves
+  `os.version` out of the system properties. GC hooks (`sa-gc-collect`,
+  `sa-gc-trip-bytes!`) may no-op. Clocks (`sa-real-time-ms`) and
+  `sa-file-mtime-ms` are required — do not fake them.
 - **introspect**: `sa-continuation-frames` → `'()`, `sa-procedure-info` → #f,
   `sa-stats` → zero vector. The runtime keeps working: backtraces carry type
   and message without frames (the degradedbacktrace gate proves this mode),

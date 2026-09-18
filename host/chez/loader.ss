@@ -296,13 +296,10 @@
   (for-each
     (lambda (root)
       ;; data_readers.{jolt,clj,cljc}, in the same precedence as a namespace's
-      ;; source (ldr-source-exts below) — first one found on this root wins.
-      (let loop ((es ldr-source-exts))
-        (when (pair? es)
-          (let ((f (string-append root "/data_readers" (car es))))
-            (if (file-exists? f)
-                (merge-data-readers-file f)
-                (loop (cdr es)))))))
+      ;; source (ldr-source-exts below) — first one found on this root wins,
+      ;; inside a jar root as on disk.
+      (let ((f (ldr-root-source root "data_readers")))
+        (when f (merge-data-readers-file f))))
     source-roots))
 
 ;; --- namespace -> file path -------------------------------------------------
@@ -337,6 +334,30 @@
            (or (and (>= n m) (string=? (substring p (- n m) n) suf))
                (loop (cdr es)))))))
 
+;; --- jar roots -------------------------------------------------------------
+;; A root that names a jar (a .jar or .zip file, either case) is read through
+;; its central directory (java/zip-file.ss root-jar-index): a namespace or a
+;; resource in it resolves to a jar path, "jar:file:<jar>!/<entry>" (io.ss),
+;; which read-file-string reads out of the archive. Nothing is extracted
+;; (jolt issue #1005), and the jar's own path is what the roots hold, as a jar
+;; on the JVM's classpath is.
+;;
+;; The file NAME on ROOT — a disk path under a directory root, a jar path into
+;; a jar root — or #f when it is not there.
+(define (ldr-root-file root name)
+  (let ((d (root-jar-index root)))
+    (if d
+        (and (zipdir-has? d name) (make-jar-path (root-path-abs root) name))
+        (let ((f (string-append root "/" name)))
+          (and (file-exists? f) f)))))
+;; The source of REL on ROOT: the first extension present, in ldr-source-exts
+;; order, or #f.
+(define (ldr-root-source root rel)
+  (let ext ((es ldr-source-exts))
+    (and (pair? es)
+         (or (ldr-root-file root (string-append rel (car es)))
+             (ext (cdr es))))))
+
 ;; First existing <root>/rel.<ext> on the search roots, else #f.
 ;; A self-contained jolt binary embeds jolt-core + stdlib source keyed by their
 ;; root-relative path ("clojure/string.clj"); those are checked first, so a
@@ -347,10 +368,7 @@
   (define (on-roots roots)
     (let loop ((roots roots))
       (and (pair? roots)
-           (or (let ext ((es ldr-source-exts))
-                 (and (pair? es)
-                      (let ((f (string-append (car roots) "/" rel (car es))))
-                        (if (file-exists? f) f (ext (cdr es))))))
+           (or (ldr-root-source (car roots) rel)
                (loop (cdr roots))))))
   ;; A namespace the project DECLARED it supplies is the project's, ahead of
   ;; everything — including the embedded copy a built binary carries, which is
@@ -908,7 +926,7 @@
 ;; zero length with FNV's basis), so the two never collide.
 (define (aot-file-digest path)
   (guard (e (else 0))
-    (if (file-exists? path)
+    (if (if (jar-path? path) (jar-path-exists? path) (file-exists? path))
         (let ((bv (read-file-bytes path)))
           (aot-hash-mix (bytevector-length bv) (aot-bytes-hash bv)))
         0)))
@@ -1396,8 +1414,11 @@
        (let ((rel (ns-name->rel name)))
          (let loop ((roots source-roots))
            (and (pair? roots)
-                (let ((base (string-append (car roots) "/" rel)))
-                  (if (cpath-artifact-valid? name base) base (loop (cdr roots)))))))))
+                ;; a jar root holds sources and resources, never a compiled .so
+                (if (root-jar-index (car roots))
+                    (loop (cdr roots))
+                    (let ((base (string-append (car roots) "/" rel)))
+                      (if (cpath-artifact-valid? name base) base (loop (cdr roots))))))))))
 
 ;; The first artifact on the roots whatever its state, for the error path: an
 ;; artifact-only deployment that a jolt upgrade invalidated otherwise reports only
@@ -1406,8 +1427,10 @@
   (let ((rel (ns-name->rel name)))
     (let loop ((roots source-roots))
       (and (pair? roots)
-           (let ((base (string-append (car roots) "/" rel)))
-             (if (file-exists? (cpath-so-file base)) base (loop (cdr roots))))))))
+           (if (root-jar-index (car roots))
+               (loop (cdr roots))
+               (let ((base (string-append (car roots) "/" rel)))
+                 (if (file-exists? (cpath-so-file base)) base (loop (cdr roots)))))))))
 
 ;; *compile-path* as a directory string, or #f when it is nil — the case
 ;; Compiler.compile reports as "*compile-path* not set".
@@ -2142,7 +2165,8 @@
 ;; never published, and the classpath cache never hit. Same failure the AOT
 ;; cache hit (aot-mkdir-p above); these are the native equivalents, so the
 ;; resolver never spawns a shell for something the filesystem API does. Only
-;; git and unzip stay subprocesses — those are real external programs.
+;; git stays a subprocess — it is a real external program. Jars are read in
+;; place (the jar seams below).
 ;;
 ;; A Windows path can arrive with backslashes (a %TEMP%- or %HOME%-derived one
 ;; does), and the separator-splitting walks below know only "/" — which Windows
@@ -2187,6 +2211,39 @@
 ;; `find` does by default.
 (def-var! "jolt.host" "symlink?"
   (lambda (p) (if (file-symbolic-link? (host-fs-path p)) #t #f)))
+
+;; --- jars on the roots (jolt.host) -------------------------------------------
+;; What jolt.deps and jolt.loader ask about a jar: whether a file is a whole
+;; archive, the names it holds, the text of one entry, and where a name resolves
+;; on a root. Each reads the central directory (java/zip-file.ss); none extracts.
+
+;; Is the file at PATH a whole zip archive — one whose END record and every
+;; central-directory header read? The resolver asks this of every jar it puts
+;; on the roots, so a cut download or a file that is not a jar fails resolution
+;; loudly, before anything is cached, rather than failing the first require.
+(def-var! "jolt.host" "zip-archive?"
+  (lambda (path) (if (zipdir-for (host-fs-path path)) #t #f)))
+
+;; The entry names of the archive at PATH, in directory order; nil when the file
+;; is not a whole archive.
+(def-var! "jolt.host" "zip-entry-names"
+  (lambda (path)
+    (let ((d (zipdir-for (host-fs-path path))))
+      (if d (list->cseq (zipdir-names d)) jolt-nil))))
+
+;; The text of the entry a jar path ("jar:file:<jar>!/<entry>") names, or nil
+;; when there is no such entry.
+(def-var! "jolt.host" "jar-entry-string"
+  (lambda (p)
+    (let ((bv (jar-path-bytes p)))
+      (if bv (utf8->string bv) jolt-nil))))
+
+;; The path NAME resolves to on ROOT — a file under a directory root, a jar
+;; path into a jar root — or nil. jolt.loader's roots backend locates through
+;; this so a context's roots may hold jars as the global roots may.
+(def-var! "jolt.host" "root-file"
+  (lambda (root name)
+    (or (ldr-root-file (host-fs-path root) name) jolt-nil)))
 
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".

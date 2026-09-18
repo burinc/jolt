@@ -231,3 +231,7 @@ unchecked-math?
 var-redefined?
 wall-nanos
 with-monitor
+jar-entry-string
+root-file
+zip-archive?
+zip-entry-names

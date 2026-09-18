@@ -69,7 +69,7 @@ jobs:
             "$out/bin/jolt" -e '(System/getenv "SSL_CERT_FILE")' | tr -d '"')"
           test -r "$cert"
 
-          # The Maven dependency makes the resolver download and unzip a jar.
+          # The Maven dependency makes the resolver download and extract a jar.
           # The local Git dependency drives jolt.deps through its git shell-out
           # without adding another network dependency to this CI check.
           gitdep="$tmp/gitdep"
