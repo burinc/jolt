@@ -954,7 +954,7 @@
 ;; opens it; a path with no such entry is java.io.FileNotFoundException.
 (define (jar-path-stream p)
   (let-values (((d ent) (jar-path-entry p)))
-    (if ent (zipdir-entry-stream d ent) (jar-path-missing p))))
+    (if ent (zipdir-entry-stream-owned d ent) (jar-path-missing p))))
 ;; The handler's own openConnection. Without one there is nothing to connect
 ;; through — say so rather than returning something that reads as empty.
 (define (url-open-connection u)

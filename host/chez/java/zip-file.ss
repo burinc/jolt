@@ -264,44 +264,75 @@
                                (loop (+ pos hlen) (cons ent acc)))))))))))))))
       (lambda () (close-port in)))))
 
+;; --- reading an archive's bytes ---------------------------------------------
+;; Every read of an entry's bytes goes through a READER: (read-at! pos bv start
+;; count) -> the bytes read into BV at START from file position POS, 0 at the
+;; end of the file. A ZipFile is one reader for every stream it opens — one
+;; file descriptor per ZipFile, however many entries are open at once, as the
+;; JDK reads every ZipFileInputStream through its one RandomAccessFile under a
+;; lock (ZipFile.java ZipFileInputStream.initDataOffset / read). A read with no
+;; ZipFile — a jar root's entry, a whole-entry read — opens a reader of its own
+;; (zipdir-file-reader) and closes it with the stream.
+
+;; A reader over a file port of its own, and the thunk that closes it.
+(define (zipdir-file-reader path)
+  (let ((in (open-file-input-port path))
+        (mu (make-mutex)))
+    (values (zipdir-port-reader in mu)
+            (lambda () (close-port in)))))
+
+;; The reader for port IN, positioned per read under MU: two streams of one
+;; ZipFile may read at once, and each owns its own position.
+(define (zipdir-port-reader in mu)
+  (lambda (pos bv start count)
+    (jolt-with-mutex mu
+      (set-port-position! in pos)
+      (let ((got (get-bytevector-some! in bv start count)))
+        (if (eof-object? got) 0 got)))))
+
+;; N bytes from POS through READ-AT!, whole, or #f when the file ends first.
+(define (zipdir-read-at read-at! pos n)
+  (let ((bv (make-bytevector n)))
+    (let loop ((off 0))
+      (if (= off n)
+          bv
+          (let ((got (read-at! (+ pos off) bv off (- n off))))
+            (and (> got 0) (loop (+ off got))))))))
+
 ;; Where ENT's data starts in the file, from its local header (ZipFile.java
 ;; initDataOffset): the header's own name and extra lengths, which may differ
 ;; from the central directory's.
-(define (zipdir-data-offset in size ent)
-  (let ((loc (zip-file-bytes in size (zdirent-loc-offset ent) zip-lochdr)))
+(define (zipdir-data-offset read-at! ent)
+  (let ((loc (zipdir-read-at read-at! (zdirent-loc-offset ent) zip-lochdr)))
     (unless (and loc (= (zip-u32 loc 0) zip-locsig))
       (zip-zerror "ZipFile invalid LOC header (bad signature)"))
     (+ (zdirent-loc-offset ent) zip-lochdr (zip-u16 loc 26) (zip-u16 loc 28))))
 
-;; A binary input port over the N bytes of PATH from OFFSET, on its own file
-;; port; closing it closes the file. A file that ends early ends the port.
-(define (zip-slice-port path offset n)
-  (let ((in (open-file-input-port path))
+;; A binary input port over the N bytes from OFFSET through READ-AT!; closing it
+;; runs CLOSE!. A file that ends early ends the port.
+(define (zip-slice-port read-at! offset n close!)
+  (let ((pos offset)
         (remaining n))
-    (set-port-position! in offset)
     (make-custom-binary-input-port
      "zip-entry"
      (lambda (bv start count)
        (if (<= remaining 0)
            0
-           (let ((got (get-bytevector-some! in bv start (min count remaining))))
-             (if (eof-object? got)
-                 0
-                 (begin (set! remaining (- remaining got)) got)))))
-     #f #f
-     (lambda () (close-port in)))))
+           (let ((got (read-at! pos bv start (min count remaining))))
+             (set! pos (+ pos got))
+             (set! remaining (- remaining got))
+             got)))
+     #f #f close!)))
 
-;; The compressed bytes of ENT, from a file port opened for the call.
+;; The compressed bytes of ENT, from a reader opened for the call.
 (define (zipdir-raw-bytes d ent)
-  (let ((in (open-file-input-port (zipdir-path d))))
+  (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))
     (dynamic-wind
       (lambda () #f)
       (lambda ()
-        (let* ((size (port-length in))
-               (off (zipdir-data-offset in size ent))
-               (bv (zip-file-bytes in size off (zdirent-csize ent))))
+        (let ((bv (zipdir-read-at read-at! (zipdir-data-offset read-at! ent) (zdirent-csize ent))))
           (or bv (zip-zerror "ZipFile invalid LOC header (bad signature)"))))
-      (lambda () (close-port in)))))
+      close!)))
 
 ;; Raw-deflate BV inflated, expecting SIZE bytes: one zlib stream, fed a window
 ;; at a time. A stream that ends early or late is the JDK's ZipException.
@@ -366,39 +397,44 @@
 ;; ZipFileInputStream), a deflated entry's is an InflaterInputStream over that
 ;; slice with a raw Inflater (ZipFileInflaterInputStream). Both are jolt's
 ;; in-stream on the zip-in-streams.ss frame, and available() answers the
-;; uncompressed bytes not yet read, as both of the JDK's do.
+;; uncompressed bytes not yet read, as both of the JDK's do. The bytes come
+;; through READ-AT!, and closing the stream runs CLOSE! — a ZipFile passes its
+;; shared reader and a no-op, a stream with no ZipFile a reader of its own.
 (define zip-int-max 2147483647)
-(define (zipdir-entry-stream d ent)
-  (let ((in (open-file-input-port (zipdir-path d))))
-    (let ((off (dynamic-wind
-                 (lambda () #f)
-                 (lambda () (zipdir-data-offset in (port-length in) ent))
-                 (lambda () (close-port in)))))
-      (let ((slice (zip-slice-port (zipdir-path d) off (zdirent-csize ent)))
-            (size (zdirent-size ent)))
-        (cond
-          ((= (zdirent-method ent) zip-stored)
-           (let ((remaining size))
-             (make-zin-stream
-              (make-zin "java.util.zip.ZipFile$ZipFileInputStream" (make-in-stream slice) #f #f
-                        (na-byte-array 0) 0 #f
-                        (lambda (z bv start count)
-                          (let ((n (get-bytevector-some! slice bv start count)))
-                            (if (eof-object? n)
-                                (begin (zin-reach-eof-set! z #t) 0)
-                                (begin (set! remaining (- remaining n)) n))))
-                        (lambda (z) (min remaining zip-int-max))
-                        (lambda (z) (close-port slice))
-                        #f))))
-          ((= (zdirent-method ent) zip-deflated)
-           (let ((inf (make-inflater #t)))
-             (make-zin-stream
-              (make-zin "java.util.zip.ZipFile$ZipFileInflaterInputStream" (make-in-stream slice) inf #t
-                        (na-byte-array 8192) 0 #f
-                        zin-inflate-read
-                        (lambda (z) (min (max 0 (- size (inflater-bytes-written inf))) zip-int-max))
-                        zin-inflate-close #f))))
-          (else (close-port slice) (zip-zerror "invalid compression method")))))))
+(define (zipdir-entry-stream d ent read-at! close!)
+  (let* ((off (zipdir-data-offset read-at! ent))
+         (slice (zip-slice-port read-at! off (zdirent-csize ent) close!))
+         (size (zdirent-size ent)))
+    (cond
+      ((= (zdirent-method ent) zip-stored)
+       (let ((remaining size))
+         (make-zin-stream
+          (make-zin "java.util.zip.ZipFile$ZipFileInputStream" (make-in-stream slice) #f #f
+                    (na-byte-array 0) 0 #f
+                    (lambda (z bv start count)
+                      (let ((n (get-bytevector-some! slice bv start count)))
+                        (if (eof-object? n)
+                            (begin (zin-reach-eof-set! z #t) 0)
+                            (begin (set! remaining (- remaining n)) n))))
+                    (lambda (z) (min remaining zip-int-max))
+                    (lambda (z) (close-port slice))
+                    #f))))
+      ((= (zdirent-method ent) zip-deflated)
+       (let ((inf (make-inflater #t)))
+         (make-zin-stream
+          (make-zin "java.util.zip.ZipFile$ZipFileInflaterInputStream" (make-in-stream slice) inf #t
+                    (na-byte-array 8192) 0 #f
+                    zin-inflate-read
+                    (lambda (z) (min (max 0 (- size (inflater-bytes-written inf))) zip-int-max))
+                    zin-inflate-close #f))))
+      (else (close-port slice) (zip-zerror "invalid compression method")))))
+
+;; The stream for an entry read outside any ZipFile — a jar root's entry
+;; through io/input-stream — on a reader of its own, closed with the stream.
+(define (zipdir-entry-stream-owned d ent)
+  (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))
+    (guard (e (#t (close!) (raise e)))
+      (zipdir-entry-stream d ent read-at! close!))))
 
 ;; --- the index the loader shares ---------------------------------------------
 ;; One zipdir per archive path, keyed by the file's modification time: a jar
@@ -436,11 +472,21 @@
        (zipdir-for root)))
 
 ;; --- java.util.zip.ZipFile --------------------------------------------------
-;; state #(zipdir name closed? streams): STREAMS holds the in-streams opened
-;; through getInputStream, which close() closes, as the JDK closes them.
+;; state #(zipdir name closed? streams reader close-reader! mutex): READER is
+;; the one file port every stream of this ZipFile reads through (one descriptor
+;; per ZipFile, as the JDK's Source holds one RandomAccessFile), and STREAMS the
+;; in-streams opened through getInputStream, held weakly as the JDK's istreams
+;; set holds them: a stream nothing references any more is not kept alive here,
+;; and close() closes the ones still reachable. The table is written under
+;; MUTEX, as the JDK synchronizes istreams (two threads opening entries at once
+;; would otherwise write one Chez hashtable together).
 (define (zfile-dir self) (vector-ref (jhost-state self) 0))
 (define (zfile-name self) (vector-ref (jhost-state self) 1))
 (define (zfile-closed? self) (vector-ref (jhost-state self) 2))
+(define (zfile-streams self) (vector-ref (jhost-state self) 3))
+(define (zfile-reader self) (vector-ref (jhost-state self) 4))
+(define (zfile-close-reader! self) ((vector-ref (jhost-state self) 5)))
+(define (zfile-mutex self) (vector-ref (jhost-state self) 6))
 
 (define (zfile-ensure-open self)
   (when (zfile-closed? self)
@@ -499,7 +545,8 @@
                     (zip-throw "java.io.FileNotFoundException"
                                (string-append name " (Is a directory)"))
                     (zipdir-read path coder name))))
-      (make-jhost "zip-file" (vector dir name #f '())))))
+      (let-values (((read-at! close!) (zipdir-file-reader path)))
+        (make-jhost "zip-file" (vector dir name #f (make-weak-eq-hashtable) read-at! close! (make-mutex)))))))
 
 (define (zfile-entry-arg self who x)
   (cond ((jolt-nil? x) (zip-throw "java.lang.NullPointerException" who))
@@ -521,8 +568,9 @@
   (let ((ent (zipdir-lookup (zfile-dir self) (zentry-name (zentry-of entry)))))
     (if (not ent)
         jolt-nil
-        (let ((s (zipdir-entry-stream (zfile-dir self) ent)))
-          (vector-set! (jhost-state self) 3 (cons s (vector-ref (jhost-state self) 3)))
+        (let ((s (zipdir-entry-stream (zfile-dir self) ent (zfile-reader self) (lambda () #f))))
+          (jolt-with-mutex (zfile-mutex self)
+            (hashtable-set! (zfile-streams self) s #t))
           s))))
 
 (define (zfile-entries self)
@@ -532,9 +580,13 @@
 (define (zfile-close self)
   (unless (zfile-closed? self)
     (vector-set! (jhost-state self) 2 #t)
-    (for-each (lambda (s) (guard (e (#t #f)) (record-method-dispatch s "close" jolt-nil)))
-              (vector-ref (jhost-state self) 3))
-    (vector-set! (jhost-state self) 3 '()))
+    (let ((live (jolt-with-mutex (zfile-mutex self)
+                  (let ((ks (hashtable-keys (zfile-streams self))))
+                    (hashtable-clear! (zfile-streams self))
+                    ks))))
+      (vector-for-each (lambda (s) (guard (e (#t #f)) (record-method-dispatch s "close" jolt-nil)))
+                       live))
+    (zfile-close-reader! self))
   jolt-nil)
 
 (hashtable-set! jhost-tag->fqn "zip-file" "java.util.zip.ZipFile")
