@@ -18,6 +18,9 @@
 (def with-retries     (var jolt.mvn-http/with-retries))
 (def lib-candidates   (var jolt.mvn-http/lib-candidates))
 (def windows-libdirs  (var jolt.mvn-http/windows-openssl-libdirs-for))
+(def pick-ai-addr-offset (var jolt.mvn-http/pick-ai-addr-offset))
+(def connect-error-message (var jolt.mvn-http/connect-error-message))
+(def ai-addr-fallback @(var jolt.mvn-http/O-ai-addr-fallback))
 (def max-attempts     @(var jolt.mvn-http/max-attempts))
 
 (def ^:private fails (atom []))
@@ -121,6 +124,35 @@
        (windows-libdirs "C:\\Program Files" "C:\\Program Files"
                         "C:\\Users\\me\\AppData\\Local")
        "Windows OpenSSL dirs include Git installs and remove duplicates")
+
+  ;; --- struct addrinfo layout probe (#979) -----------------------------------
+  ;; ai_addr sits at 24 under glibc and at 32 under the BSD order, which is what
+  ;; macOS, Win64 AND bionic/Android use — and os.name calls bionic "Linux", so
+  ;; the offset cannot come from the platform name. getaddrinfo is asked without
+  ;; AI_CANONNAME, so the NULL slot is ai_canonname and the other is ai_addr.
+  (ok= 32 (pick-ai-addr-offset 0 0x7f0000001000)
+       "ai_addr probe: NULL at 24 means the BSD order (bionic, macOS)")
+  (ok= 24 (pick-ai-addr-offset 0x7f0000001000 0)
+       "ai_addr probe: NULL at 32 means the glibc order")
+  ;; Inconclusive nodes fall back to what os.name implies, i.e. the pre-#979
+  ;; behaviour — never to a guess that could hand connect() a NULL sockaddr.
+  (ok= ai-addr-fallback (pick-ai-addr-offset 0 0)
+       "ai_addr probe: both slots NULL falls back to the platform default")
+  (ok= ai-addr-fallback (pick-ai-addr-offset 0x7f0000001000 0x7f0000002000)
+       "ai_addr probe: both slots set falls back to the platform default")
+
+  ;; --- connect failure reporting (#979) --------------------------------------
+  ;; Exhausting the candidates used to be reported as "connection refused" no
+  ;; matter what the kernel said; the bionic bug was really EFAULT, and calling
+  ;; it a refusal sent people looking at their network.
+  (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "errno 14")
+       "connect error names the errno it got")
+  (ok= true (str/includes? (connect-error-message "repo.clojars.org" 443 14) "repo.clojars.org:443")
+       "connect error names host and port")
+  (ok= false (str/includes? (connect-error-message "h" 443 111) "errno 14")
+       "connect error reports the errno it got, not a fixed one")
+  (ok= "could not connect to h:443" (connect-error-message "h" 443 nil)
+       "connect error with no captured code stays plain")
 
   ;; --- retry policy (jolt-ktiz.2) --------------------------------------------
   ;; Driven through an injectable attempt fn so the gate stays network-free.

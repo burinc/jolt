@@ -90,12 +90,22 @@
   (current-memory-bytes))
 
 ;; (sa-max-memory-bytes) -> exact integer
-;; Upper bound on the heap the runtime may use — the JVM's maxMemory, which
-;; jolt maps to Long/MAX_VALUE when the heap is unbounded. Contract: an upper
-;; bound on heap bytes. Degradation: a large constant is acceptable — the JVM
-;; arm already falls back to Long.MAX_VALUE semantics.
+;; Peak heap bytes: the most the collector has held from the OS since the last
+;; sa-reset-max-memory-bytes! (or since boot) -- the high-water mark behind
+;; jolt.host/maximum-memory-bytes. Not the JVM's maxMemory: that is the heap
+;; ceiling (rt.ss jolt-heap-max-bytes), and Runtime.maxMemory reads it there.
+;; Contract: never below sa-total-memory-bytes. Degradation: the current total
+;; is acceptable -- a target that keeps no high-water mark answers "now".
 (define (sa-max-memory-bytes)
   (maximum-memory-bytes))
+
+;; (sa-reset-max-memory-bytes!) -> void
+;; Start the high-water mark over from the current total, so a caller can read
+;; the peak growth of one stretch of work (the apply-scaling gate). Contract:
+;; right after it, sa-max-memory-bytes answers the current total. Degradation:
+;; may no-op where sa-max-memory-bytes already answers the current total.
+(define (sa-reset-max-memory-bytes!)
+  (reset-maximum-memory-bytes!))
 
 ;; (sa-real-time-ms) -> exact integer
 ;; Wall-clock milliseconds, monotonic within a process — used for elapsed
@@ -105,6 +115,143 @@
 ;; stamps must differ between runs.
 (define (sa-real-time-ms)
   (real-time))
+
+;; ---- records: open-coded predicates, accessors, mutators, constructors -------
+;;
+;; A nongenerative type's rtd is a compile-time constant in Chez, and cp0
+;; open-codes (record? v 'rtd), (record-accessor 'rtd i) and (record-constructor
+;; rcd) when the rtd is a constant. What it cannot see through is the top-level
+;; VARIABLE define-record-type binds each generated name to: the runtime is a
+;; sequence of top-level forms, so a (pvec? x) in a later form is a procedure
+;; call through the symbol's value cell (~1.3 ns alone, 4-6 ns per arm inside
+;; a dispatch chain), and the predicate's test cannot merge into the accessor
+;; that follows it.
+;;
+;; This define-record-type keeps the R6RS surface and, after the R6RS form has
+;; bound the generated names as variables, rebinds them as SYNTAX: in operator
+;; position a name expands to the open-coded form on the constant rtd; as a
+;; value it denotes a procedure over the same rtd, kept under a %rec/ alias, so
+;; (map pvec? xs) and the arm registries that take a predicate keep working on
+;; one stable object. (if (pvec? x) (pvec-cnt x) ...) compiles to a
+;; single type test.
+;;
+;; The variable binding stays on purpose: a file loaded EARLIER than the type's
+;; (collections.ss calls jrec? before records.ss loads) compiled its reference
+;; as a variable call, and Chez keeps a symbol's value cell when the name is
+;; later rebound as syntax, so those sites keep working as they did.
+;;
+;; What is kept, and what changes:
+;;   - a wrong-arity call falls through to the procedure, so it fails at run
+;;     time exactly as before rather than as a syntax error;
+;;   - set! of a generated name is rejected at expansion (nothing in the host
+;;     assigns one, and an assignment would silently miss the open-coded sites);
+;;   - a type error from an open-coded accessor or mutator names the ENCLOSING
+;;     procedure as who; the message and the value/type irritants are the same;
+;;   - a generative type, a name spec that is not identifiers, or a field spec
+;;     this parser does not recognise gets the plain R6RS definition; a type
+;;     with a protocol keeps its protocol constructor as a procedure, and so
+;;     does a child type (its constructor arity includes the parent's fields,
+;;     which are not visible here) -- their predicates and accessors are still
+;;     open-coded.
+;; TOP LEVEL ONLY: a body cannot hold both the variable and the syntax binding
+;; of one name, so a define-record-type inside a body fails to expand with
+;; "multiple definitions ... in body" -- write %r6rs-define-record-type there.
+;; Every host record is defined at top level. Gambit has its own
+;; define-record-type (host/gambit/prelude-shims.ss) and never loads this file;
+;; the shared host sources are untouched.
+;;
+;; The import is deliberately this narrow: one binding under a private name,
+;; so nothing here re-exposes Chez's error/warning over rt.ss's shadowing.
+(import (rename (only (rnrs records syntactic) define-record-type)
+                (define-record-type %r6rs-define-record-type)))
+
+;; (%define-record-op name proc (arg ...) body): NAME as syntax -- PROC as a
+;; value, BODY over ARG ... in operator position, PROC again on any other arity.
+(define-syntax %define-record-op
+  (syntax-rules ()
+    ((_ name proc (arg ...) body)
+     (define-syntax name
+       (lambda (x)
+         (syntax-case x ()
+           (id (identifier? #'id) #'proc)
+           ((_ arg ...) #'body)
+           ((_ . rest) #'(proc . rest))))))))
+
+(define-syntax define-record-type
+  (lambda (x)
+    (define (sym . parts)
+      (string->symbol
+       (apply string-append
+              (map (lambda (p) (if (symbol? p) (symbol->string p) p)) parts))))
+    (define (hidden name) (sym "%rec/" name))
+    ;; one field spec -> (accessor mutator-or-#f), or #f when unrecognised
+    (define (field-info type-name fs)
+      (cond ((symbol? fs) (list (sym type-name "-" fs) #f))
+            ((and (pair? fs) (memq (car fs) '(immutable mutable))
+                  (pair? (cdr fs)) (symbol? (cadr fs)))
+             (let* ((f (cadr fs))
+                    (explicit-acc (and (pair? (cddr fs)) (symbol? (caddr fs)) (caddr fs)))
+                    (explicit-mut (and explicit-acc (pair? (cdddr fs)) (symbol? (cadddr fs)) (cadddr fs)))
+                    (acc (or explicit-acc (sym type-name "-" f)))
+                    (mut (and (eq? (car fs) 'mutable)
+                              (or explicit-mut (sym type-name "-" f "-set!")))))
+               (list acc mut)))
+            (else #f)))
+    (syntax-case x ()
+      ((_ spec clause ...)
+       (let* ((d (syntax->datum x))
+              (spec-d (cadr d))
+              (clauses (cddr d))
+              (name (if (pair? spec-d) (car spec-d) spec-d))
+              (ctor (if (pair? spec-d) (cadr spec-d) (sym "make-" name)))
+              (pred (if (pair? spec-d) (caddr spec-d) (sym name "?")))
+              (fields (let ((fc (assq 'fields clauses))) (if fc (cdr fc) '())))
+              (infos (map (lambda (fs) (field-info name fs)) fields))
+              (ok? (and (symbol? name) (symbol? ctor) (symbol? pred)
+                        (assq 'nongenerative clauses)
+                        (not (memq #f infos))))
+              (ctor-inline? (and ok?
+                                 (not (assq 'protocol clauses))
+                                 (not (assq 'parent clauses)))))
+         (if (not ok?)
+             #'(%r6rs-define-record-type spec clause ...)
+             (let* ((ctx (syntax-case #'spec () ((n . _) #'n) (n #'n)))
+                    (ctor-args (map (lambda (i) (sym "a" (number->string i)))
+                                    (iota (length fields))))
+                    ;; (name args inline-form procedure-form) per generated name.
+                    ;; The procedure is rebuilt from the rtd rather than read from
+                    ;; the public name: a top-level begin installs every
+                    ;; definition head before it expands a right-hand side, so
+                    ;; by then the public name is already the syntax below.
+                    (rtd `(record-type-descriptor ,name))
+                    (ops
+                      (append
+                       (list (list pred '(v) `(record? v ,rtd) `(record-predicate ,rtd)))
+                       (if ctor-inline?
+                           (let ((rc `(record-constructor (record-constructor-descriptor ,name))))
+                             (list (list ctor ctor-args `(,rc ,@ctor-args) rc)))
+                           '())
+                       (let loop ((infos infos) (i 0) (acc '()))
+                         (if (null? infos)
+                             (reverse acc)
+                             (let ((a (car (car infos))) (m (cadr (car infos))))
+                               (loop (cdr infos) (+ i 1)
+                                     (append
+                                      (if m
+                                          (list (list m '(v n)
+                                                      `((record-mutator ,rtd ,i) v n)
+                                                      `(record-mutator ,rtd ,i)))
+                                          '())
+                                      (list (list a '(v)
+                                                  `((record-accessor ,rtd ,i) v)
+                                                  `(record-accessor ,rtd ,i)))
+                                      acc))))))))
+               (datum->syntax ctx
+                 `(begin
+                    (%r6rs-define-record-type ,spec-d ,@clauses)
+                    ,@(map (lambda (op) `(define ,(hidden (car op)) ,(cadddr op))) ops)
+                    ,@(map (lambda (op) `(%define-record-op ,(car op) ,(hidden (car op)) ,(cadr op) ,(caddr op)))
+                           ops))))))))))
 
 ;; ---- R5: io remainder (mtime) + the last GC hook -----------------------------
 
@@ -124,6 +271,15 @@
 ;; only; collection still happens on its own schedule.
 (define (sa-gc-trip-bytes! n)
   (collect-trip-bytes n))
+
+;; (sa-gc-trip-bytes) -> exact integer
+;; The allocation threshold at which a trip collection triggers: between two
+;; collections at most this much is allocated, which bounds how far work that
+;; holds nothing can raise the heap footprint (the apply-scaling gate's floor).
+;; Contract: the threshold in bytes. Degradation: 0 -- the target has no such
+;; threshold, so nothing is invisible by construction.
+(define (sa-gc-trip-bytes)
+  (collect-trip-bytes))
 
 ;; ---- R6: introspection tier (capability: introspect) -------------------------
 
@@ -149,6 +305,22 @@
             ((string=? (substring tag i (+ i m)) needle) #t)
             (else (loop (+ i 1)))))))
 
+;; (sa-probed-os-family) -> 'macos | 'windows | 'linux
+;; The OS family for a host tag that does not carry one, probed from the
+;; filesystem. Contract: the family the process is actually running on.
+;; Degradation: 'linux, matching the else-branch it replaces. Cached because
+;; sa-os-family is consulted from hot paths and the answer cannot change while
+;; the process runs.
+(define sa-os-family-cache #f)
+(define (sa-probed-os-family)
+  (or sa-os-family-cache
+      (let ((fam (cond ((file-exists? "/System/Library/CoreServices/SystemVersion.plist") 'macos)
+                       ((file-exists? "/proc/self/status") 'linux)
+                       ((getenv "SystemRoot") 'windows)
+                       (else 'linux))))
+        (set! sa-os-family-cache fam)
+        fam)))
+
 ;; (sa-os-family) -> 'macos | 'windows | 'linux
 ;; The OS family every host OS branch derives: SIGCHLD/SIG_BLOCK numerics
 ;; (process.ss, concurrency.ss), LC_TIME (tz-primitives.ss), struct-stat
@@ -157,28 +329,164 @@
 ;; of the three symbols. Degradation: none — the sites have no safe assumed
 ;; default; an unrecognized host falls back to 'linux, matching today's
 ;; else-branches.
+;;
+;; Portable-bytecode tags (pb, pb64l, tpb64l, ...) name the threading, word
+;; size and endianness and deliberately name no OS, because the same bytecode
+;; is meant to run on any of them. The tag therefore cannot answer for them and
+;; the else-branch called every bytecode build 'linux, including one running on
+;; macOS — which picks the Linux SIGCHLD, EAGAIN, O_NONBLOCK, LC_TIME and
+;; struct-stat values on a Darwin host. Probe instead.
+;;
+;; Memoized, which is what the note on sa-probed-os-family below already asks
+;; for and does not deliver: that cache sits on the PROBE, which only a pb tag
+;; reaches, so every real tag (ta6le, ta6nt, tarm64osx) re-derived on every
+;; call. The derivation is not free — sa-host-tag allocates a fresh string per
+;; call through symbol->string, and each sa-tag-contains? walks it allocating a
+;; substring per position, five needles deep. machine-type cannot change while
+;; the process runs, so one derivation is all there is to do.
+;;
+;; It matters because path classification is host-specific: java.io.File's
+;; isAbsolute and the project-relative base every filesystem touch goes through
+;; (java/io.ss jfile-fs) ask this per call. Uncached, .isAbsolute measured 355ms
+;; per 200k calls against 141ms; .exists, syscall included, 167ms per 50k
+;; against 116ms.
+;;
+;; The memo is module state in a file the runtime LOADS, not a saved heap, so it
+;; starts empty in every process and a cross-built binary cannot carry the build
+;; host's answer.
+(define sa-os-family-memo #f)
 (define (sa-os-family)
-  (let ((m (sa-host-tag)))
-    (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")) 'macos)
-          ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
-          (else 'linux))))
+  (or sa-os-family-memo
+      (let ((fam (sa-os-family-for-tag (sa-host-tag))))
+        (set! sa-os-family-memo fam)
+        fam)))
+
+;; (sa-os-family-for-tag tag) -> 'macos | 'windows | 'linux
+;; The derivation above, as a function OF the tag, so the gate can pin the whole
+;; table on one host instead of only the row that host happens to be
+;; (test/chez/host-derived-props-test.ss). The bug this splits out of was in
+;; this cond and was reported with the cond transcribed into Clojure, because
+;; there was no way to ask it about a tag. NOT for callers: anything with a tag
+;; to pass is branching on the tag, which sa-host-tag's contract forbids.
+(define (sa-os-family-for-tag m)
+  ;; "ios" joins the macos branch rather than getting one of its own: iOS is
+  ;; Darwin, so every constant this selects is already the right one, and the
+  ;; three-symbol contract has nowhere else to put it. Chez has four iOS tags
+  ;; (a6ios, arm64ios, ta6ios, tarm64ios; BUILDING documents tarm64ios as the
+  ;; cross-target), and not one of them contains "osx", "macos", "nt" or "pb",
+  ;; so all four reached the else-branch and called a Darwin system Linux.
+  ;; The substring is exact rather than lucky: those four are the only tags in
+  ;; the Chez tree containing "ios", and a tag that contained it by accident
+  ;; would have to be an "osx" tag, which wants 'macos anyway.
+  ;;
+  ;; Android takes no branch, and that is not an omission: it has no Chez tag of
+  ;; its own — it cross-builds as tarm64le (tools/cross-compile/README.md) — and
+  ;; Bionic is Linux for every constant this selects, SIGCHLD 17, EAGAIN 11,
+  ;; O_NONBLOCK, SOCK_CLOEXEC and the struct-stat offsets alike. Where Android
+  ;; does diverge is the link libraries (Bionic has no -lrt/-luuid/-ltinfo), and
+  ;; the tag cannot answer that: tarm64le is glibc arm64 Linux too. The target
+  ;; pack owns those flags, which is why they are not derived here.
+  (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")
+             (sa-tag-contains? m "ios")) 'macos)
+        ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
+        ((sa-tag-contains? m "pb") (sa-probed-os-family))
+        (else 'linux)))
 
 ;; (sa-arch) -> 'x86-64 | 'arm64 | 'i386 | 'other
 ;; The machine architecture — the nio-file stat-layout guard keys on x86-64.
 ;; Contract: the architecture symbol. Degradation: 'other for an unrecognized
 ;; host; callers treat it as unverified.
 (define (sa-arch)
-  (let ((m (sa-host-tag)))
-    (cond ((sa-tag-contains? m "arm64") 'arm64)
-          ((sa-tag-contains? m "a6") 'x86-64)
-          ((sa-tag-contains? m "i3") 'i386)
-          (else 'other))))
+  (let ((a (sa-arch-for-tag (sa-host-tag))))
+    (if (eq? a 'other) (sa-probed-arch) a)))
 
-;; (sa-endian) -> 'little | 'big | #f
-;; Byte order of the host. Contract: the byte order. Degradation: #f for an
-;; unrecognized suffix — the stat-layout guard treats that as unverified.
+;; (sa-arch-for-tag tag) -> the derivation above as a function OF the tag, on
+;; the same terms as sa-os-family-for-tag: for the gate, not for callers.
+;; 'other means THE TAG DOES NOT SAY, which is not the same as "unknown" —
+;; sa-arch probes past it.
+(define (sa-arch-for-tag m)
+  (cond ((sa-tag-contains? m "arm64") 'arm64)
+        ((sa-tag-contains? m "a6") 'x86-64)
+        ((sa-tag-contains? m "i3") 'i386)
+        (else 'other)))
+
+;; (sa-probed-arch) -> 'x86-64 | 'arm64 | 'i386 | 'other
+;; The architecture for a host tag that does not carry one — every pb tag, and
+;; any native tag outside the a6/i3/arm64 vocabulary. Contract: the architecture
+;; the process is actually running on. Degradation: 'other, matching the
+;; else-branch it replaces; every caller already treats that as unverified.
+;;
+;; uname(2) rather than the tag, because a pb tag's own "64" and "l" fields
+;; describe the BYTECODE's encoding and not the machine under it. The machine
+;; field's offset is the one platform constant here: struct utsname is
+;; fixed-width char arrays, 65 on Linux (machine is the 5th, at 260) and 256 on
+;; Darwin (at 1024), and the OS is already settled by sa-os-family before this
+;; runs. Windows has no uname and answers from the environment instead.
+(define sa-arch-cache #f)
+(define (sa-probed-arch)
+  (or sa-arch-cache
+      (let ((a (or (sa-probe-arch-name) 'other)))
+        (set! sa-arch-cache a)
+        a)))
+
+(define (sa-arch-name->symbol s)
+  (cond ((not s) #f)
+        ((or (string=? s "x86_64") (string=? s "amd64") (string=? s "AMD64")) 'x86-64)
+        ((or (string=? s "aarch64") (string=? s "arm64") (string=? s "ARM64")) 'arm64)
+        ((or (string=? s "i386") (string=? s "i686") (string=? s "x86")) 'i386)
+        (else #f)))
+
+(define (sa-probe-arch-name)
+  (if (eq? (sa-os-family) 'windows)
+      (sa-arch-name->symbol (getenv "PROCESSOR_ARCHITECTURE"))
+      (sa-arch-name->symbol (sa-uname-machine))))
+
+;; The `machine` field of uname(2), or #f when it cannot be had. Probe-only and
+;; fully guarded: a statically linked build may not carry the symbol at all, and
+;; a missing arch is a documented degradation rather than a boot failure.
+;;
+;; No sa-load-shared-object here, on sa-fbytes-init!'s reasoning and for its
+;; reason: the boot took the process-global handle long before anything can ask
+;; for an arch (rt.ss binds _exit through jolt-foreign-proc-safe at its line
+;; 135, and the first caller of sa-arch is host-static-methods.ss at 1553), and
+;; re-taking it would re-promote it above every :jolt/native loaded since.
+(define (sa-uname-machine)
+  (guard (e (#t #f))
+    (and (foreign-entry? "uname")
+         (let* ((linux? (eq? (sa-os-family) 'linux))
+                (off (if linux? 260 1024))
+                (size (if linux? 512 2048))
+                (buf (foreign-alloc size)))
+           (dynamic-wind
+             (lambda ()
+               (let loop ((i 0))
+                 (when (fx<? i size)
+                   (foreign-set! 'unsigned-8 buf i 0)
+                   (loop (fx+ i 1)))))
+             (lambda ()
+               (and (= 0 ((foreign-procedure "uname" (void*) int) buf))
+                    (let loop ((i 0) (acc '()))
+                      (let ((b (foreign-ref 'unsigned-8 buf (fx+ off i))))
+                        (if (or (fx=? b 0) (fx>? i 62))
+                            (and (pair? acc) (list->string (reverse acc)))
+                            (loop (fx+ i 1) (cons (integer->char b) acc)))))))
+             (lambda () (foreign-free buf)))))))
+
+;; (sa-endian) -> 'little | 'big
+;; Byte order of the host. Contract: the byte order. Degradation: none — the
+;; runtime always knows its own byte order, so a tag that does not name one is
+;; answered by native-endianness rather than by #f.
 (define (sa-endian)
-  (let* ((m (sa-host-tag)) (n (string-length m)))
+  (or (sa-endian-for-tag (sa-host-tag)) (native-endianness)))
+
+;; (sa-endian-for-tag tag) -> the derivation above as a function OF the tag, on
+;; the same terms as sa-os-family-for-tag: for the gate, not for callers. #f
+;; means THE TAG DOES NOT SAY — the osx and nt tags carry no le/be suffix and
+;; neither does any pb tag, whose own trailing l/b names the bytecode's encoding
+;; rather than a suffix in this shape. sa-endian answers native-endianness
+;; there, which is exact on every host and needs no probe.
+(define (sa-endian-for-tag m)
+  (let ((n (string-length m)))
     (if (>= n 2)
         (let ((suf (substring m (- n 2) n)))
           (cond ((string=? suf "le") 'little)
@@ -224,6 +532,32 @@
 ;; (state-image.ss). Contract: name + captured values. Degradation: #f — the
 ;; image writer refuses the closure ('image-no), the same verdict as today's
 ;; no-inspector builds.
+;; (sa-procedure-free-values p) -> list of the closure's captured values, in the
+;; order Chez stores them, or #f. POSITIONS, no names: the names are inspector
+;; information, which a release build does not generate, while the values are
+;; there either way. What position means which name is not knowable from here —
+;; see image-fnsrc-layout, which learns it per site from a probe.
+(define (sa-procedure-free-values x)
+  (guard (e (#t #f))
+    (let* ((io (inspect/object x))
+           (n  (io 'length)))
+      (and n
+           (let loop ((i 0) (acc '()))
+             (if (fx>=? i n)
+                 (reverse acc)
+                 (loop (fx+ i 1)
+                       (cons (let ((vo (io 'ref i))) ((vo 'ref) 'value)) acc))))))))
+
+;; (sa-procedure-code-name p) -> string | #f: the name the procedure's CODE
+;; object carries — the variable its lambda was bound under. Every closure of
+;; one lambda answers the same string, and it survives a build with inspector
+;; information off (it is what #<procedure name> prints), which is what makes
+;; it an identity for a wrapper kind (continuations.ss jolt-escape-fn?). #f
+;; for a procedure whose code carries no name.
+(define (sa-procedure-code-name p)
+  (let ((n (#%$code-name (#%$closure-code p))))
+    (and (string? n) n)))
+
 (define (sa-procedure-info x)
   (guard (e (#t #f))
     (if (sa-introspect-enabled?)
@@ -262,6 +596,19 @@
     ;; register-save area, so a fixed-arity call silently corrupts them).
     ((_ conv name args res) (foreign-procedure conv name args res))))
 
+;; (sa-foreign-procedure-native-error error-convention (conv ...) name args res)
+;; -> foreign procedure
+;; SYNTAX: like sa-foreign-procedure, with Chez's native-error convention kept
+;; separate from any other calling conventions. The result is a two-value
+;; answer: the declared C result and the calling thread's captured native error
+;; slot. `error-convention` is __errno on POSIX and __get_last_error on Windows.
+;; A target adapter must provide the equivalent atomic call-boundary capture;
+;; reading errno/GetLastError in a later host call is racy and is not equivalent.
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ error-convention (conv ...) name args res)
+     (foreign-procedure error-convention conv ... name args res))))
+
 ;; (sa-foreign-procedure-blocking name args res) -> foreign procedure
 ;; SYNTAX: like sa-foreign-procedure, but the call is __collect_safe — a blocking
 ;; foreign call must not freeze the stop-the-world collector process-wide (the
@@ -288,8 +635,12 @@
 
 ;; (sa-foreign-callable-collect-safe proc args res) -> foreign callable
 ;; SYNTAX: like sa-foreign-callable, but the callable entry uses the
-;; __collect_safe convention that reactivates the thread — for callbacks
-;; invoked while the thread is parked in a :blocking foreign call.
+;; __collect_safe convention that reactivates the thread — for a callback that
+;; can arrive on a thread which is not an ACTIVE Scheme thread at that moment:
+;; one the runtime never started (a dispatch queue or a pthread the C library
+;; spawned), or one parked in a :blocking foreign call. Both need the entry to
+;; activate the thread before any Scheme runs; without it the process takes a
+;; nonrecoverable memory fault instead of an exception.
 (define-syntax sa-foreign-callable-collect-safe
   (syntax-rules ()
     ((_ proc args res) (foreign-callable __collect_safe proc args res))))
@@ -410,7 +761,24 @@
 ;; and jolt.ffi/load-library must surface that as a clean jolt-level error, not a
 ;; VM abort (verified on Chez: a missing library raises a guardable error and the
 ;; jolt-level message is unchanged).
-(define (sa-load-shared-object name) (load-shared-object name))
+;;
+;; The process handle is loaded ONCE. Chez pushes a handle onto its dynamic
+;; lookup list on every load-shared-object, and every foreign-entry lookup
+;; walks that list with dlsym before it reaches the static "(cs)…" table
+;; (c/foreign.c lookup). rt.ss asks for the process at each
+;; jolt-foreign-proc-safe site — 57 by the end of boot — so a lookup that
+;; misses the process (every Chez-internal "(cs)" entry: inspect/object binds
+;; two per call; every optional-entry probe at boot) walked 57 handles, 2 ms a
+;; miss. And re-loading #f after a native library re-promotes the process's
+;; symbols over the library's (the BoringSSL/OpenSSL EVP_* flip). Named
+;; libraries load as before; test/chez/foreign-handles-test.ss pins this.
+(define sa-process-symbols-loaded? #f)
+(define (sa-load-shared-object name)
+  (if name
+      (load-shared-object name)
+      (unless sa-process-symbols-loaded?
+        (set! sa-process-symbols-loaded? #t)
+        (load-shared-object #f))))
 
 ;; (sa-foreign-entry? name) -> boolean
 ;; Does the named C entry resolve (in the process or a loaded object). Contract:
@@ -429,6 +797,29 @@
 ;; callable registry hands to C. Contract: the entry address of a callable.
 ;; Degradation: none.
 (define (sa-foreign-callable-entry-point co) (foreign-callable-entry-point co))
+
+;; ---- continuations tier (capability: continuations) --------------------------
+
+;; (sa-call-with-escape-continuation proc) -> value
+;; Call PROC with a one-shot ESCAPE procedure k. Invoking (k v) returns v from
+;; this sa-call-with-escape-continuation call, unwinding the dynamic-wind chain
+;; between the two — an escape is a real exit, so a jolt `finally` in between
+;; RUNS (unlike a fiber park, which drops those winders first).
+;;
+;; The contract is call/1cc's, and a target must enforce it rather than merely
+;; offer it: k is valid AT MOST ONCE, and only while this call is still on the
+;; stack. Invoking it a second time, or after PROC has returned normally, must
+;; RAISE — never re-enter, and never hang. That is what lets the layer above
+;; (host/chez/continuations.ss) present a single one-shot escape semantic on
+;; every target instead of one per target's continuation model.
+;;
+;; Degradation: a target with no continuations at all must raise a
+;; message-carrying condition; jolt.continuations then fails honestly rather
+;; than silently doing nothing. Chez: call/1cc natively, so this is the whole
+;; implementation — zero wrappers, capture is O(1) and depth-independent.
+;; Gambit: call/cc plus the spent flag its adapter carries, because call/cc is
+;; multi-shot and would otherwise re-enter a dead frame.
+(define (sa-call-with-escape-continuation proc) (call/1cc proc))
 
 ;; ---- R8: eval/compile/AOT (capabilities: native-compile, image) --------------
 
@@ -474,6 +865,53 @@
 ;; same story as sa-compile-file.
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
+
+;; (sa-vfasl-convert-file in out [codec]) -> boolean
+;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
+;; what loading the fasl would have produced, laid out per space and loaded
+;; straight into the static generation, which is worth roughly a third of jolt's
+;; own startup (see build-jolt.ss). Contract: produce a boot the target's runtime
+;; can boot from, or answer #f. Degradation: #f rather than raise — an app that
+;; boots slower is strictly better than an app that fails to build, and the
+;; caller keeps the plain boot it already has.
+;;
+;; CODEC is 'default, or 'wide for an image the target's default entry codec
+;; cannot carry — the caller has measured the image and found it over a limit
+;; (build.ss bld-lz4-image-ceiling). A target with one codec ignores the
+;; argument; Chez has two, and 'wide picks gzip over LZ4, which is the whole
+;; point: gzip has no 256MiB ceiling and LZ4 does.
+(define (sa-vfasl-convert-file in out . codec)
+  (guard (e (#t #f))
+    (if (and (pair? codec) (eq? (car codec) 'wide))
+        (parameterize ((compress-format 'gzip)) (vfasl-convert-file in out '()))
+        (vfasl-convert-file in out '()))
+    #t))
+
+;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
+;; Install a collection hook enforcing a heap ceiling, and answer whether the
+;; target could. On each collection the target performs its normal collection,
+;; then: above SOFT live bytes it forces a FULL collection — the one a
+;; generational collector defers, and the whole point under memory pressure —
+;; and if live bytes still exceed HARD it calls ON-EXCEEDED with that count.
+;;
+;; The policy lives in the caller (rt.ss jolt-install-heap-ceiling!): the
+;; thresholds, the message, and what ON-EXCEEDED does. This is only the seam
+;; that hooks collection, because doing that needs a target-specific native.
+;;
+;; Contract: ON-EXCEEDED is called only when the heap genuinely cannot be
+;; brought under HARD, so raising from it is the expected use.
+;; Degradation: answer #f without installing anything. The ceiling is then
+;; unenforced, which is what every jolt before 0.8.5 did, and the caller
+;; reports maxMemory accordingly rather than promising a bound it lacks.
+(define (sa-gc-install-ceiling! soft hard on-exceeded)
+  (collect-request-handler
+    (lambda ()
+      (collect)
+      (when (> (bytes-allocated) soft)
+        (collect (collect-maximum-generation))
+        (when (> (bytes-allocated) hard)
+          (on-exceeded (bytes-allocated))))))
+  #t)
 
 ;; (sa-fasl-write obj port [externals-pred]) -> void
 ;; fasl-serialize OBJ to PORT, optionally under the externals predicate
@@ -528,12 +966,6 @@
   (guard (e (#t (lambda (r) #f)))
     (record-accessor sa-winder-rtd 0)))
 
-;; (sa-winder-in w) -> the winder's before-thunk, or #f when W is not a
-;; dynamic-wind winder (a parameterize's critical-winder answers #f).
-(define (sa-winder-in w)
-  (and sa-winder-rtd
-       (eq? (record-rtd w) sa-winder-rtd)
-       (sa-winder-in-ref w)))
 
 ;; (sa-current-winders) -> the chain, innermost first.
 ;; (sa-current-winders-set! w) -> void. Replaces it wholesale.
@@ -543,6 +975,13 @@
 ;; chain on exit and would silently undo it. See jolt-park-drop-finallys!.
 (define (sa-current-winders) (#%$current-winders))
 (define (sa-current-winders-set! w) (#%$current-winders w))
+
+;; (sa-record-cas! r i old new): compare-and-swap field i (0-based) of record r,
+;; answering whether it swapped. What lets a lazy cell be claimed for forcing
+;; with no lock in the way and nothing allocated (seq.ss force-claimed!). A
+;; system primitive here; a target whose records are vectors swaps the slot
+;; under whatever makes that atomic for its threads.
+(define (sa-record-cas! r i old new) (#%$record-cas! r i old new))
 
 ;; (sa-disable-count) -> how many nested disable-interrupts this thread is
 ;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and
@@ -566,6 +1005,27 @@
 ;; What #3% gives up is argument checking, and both arguments here are literal.
 (define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
 
+
+;; --- capability-unchecked ---------------------------------------------------
+;; Unchecked fixnum / vector primitives, SYNTAX (CONTRACT.txt). A call site
+;; carries its own range proof; here each is the #3% primitive — what the
+;; whole runtime would be at optimize-level 3, applied to the one loop that
+;; has proven it.
+(define-syntax sa-ufx+ (syntax-rules () ((_ a b) (#3%fx+ a b))))
+(define-syntax sa-ufx- (syntax-rules () ((_ a b) (#3%fx- a b))))
+(define-syntax sa-ufx<? (syntax-rules () ((_ a b) (#3%fx<? a b))))
+(define-syntax sa-ufx>=? (syntax-rules () ((_ a b) (#3%fx>=? a b))))
+(define-syntax sa-ufx=? (syntax-rules () ((_ a b) (#3%fx=? a b))))
+(define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (#3%vector-ref v i))))
+(define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (#3%vector-set! v i x))))
+;; (sa-vector-copy-range! to at from start end): the R7RS shape over Chez's
+;; (vector-copy! from from-start to to-start count).
+(define (sa-vector-copy-range! to at from start end)
+  (vector-copy! from start to at (fx- end start)))
+;; (sa-string-copy-range! to at from start end): the same reorder over Chez's
+;; (string-copy! from from-start to to-start count).
+(define (sa-string-copy-range! to at from start end)
+  (string-copy! from start to at (fx- end start)))
 
 ;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
 ;; is a macro, so it must be defined before this load rather than captured at

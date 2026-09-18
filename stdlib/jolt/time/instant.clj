@@ -63,6 +63,12 @@
               "java.time.temporal.TemporalAdjuster" "TemporalAdjuster"
               "java.lang.Comparable" "Comparable"}})
 
+;; clojure.core's Inst protocol, as core_instant18.clj extends it on the JVM once
+;; java.time.Instant exists: inst? and inst-ms answer for an Instant from here.
+(extend-protocol Inst
+  java.time.Instant
+  (inst-ms* [i] (u/floor-div (inst-nanos i) 1000000)))
+
 (__register-class-methods! :jolt.time/instant
   (merge t/generic-methods
     {"getEpochSecond" (fn [x] (u/floor-div (inst-nanos x) nps))
@@ -123,6 +129,10 @@
   {"from" (fn [i] (java.util.Date. (u/floor-div (inst-nanos i) 1000000)))})
 
 ;; make the #inst/Date layer's Date.toInstant etc. yield THIS instant, so a Date
-;; and a library instant compare and print as one representation.
-(when-let [set-ctor (resolve 'jolt.host/set-instant-ctor!)]
-  ((deref set-ctor) (fn [nanos] (instant nanos))))
+;; and a library instant compare and print as one representation. The hook is
+;; a static reference: jolt.host/set-instant-ctor! is defined by the host that
+;; autoloads this namespace (inst-time.ss), and looking it up with `resolve` at
+;; load time made every app that reaches java.time resolve a var by name — the
+;; one thing `jolt build --tree-shake` cannot follow, so each kept every def and
+;; the compiler image for this one form.
+(jolt.host/set-instant-ctor! (fn [nanos] (instant nanos)))

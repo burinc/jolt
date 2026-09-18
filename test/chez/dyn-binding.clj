@@ -89,8 +89,22 @@
 (chk "with-bindings replays a frame" (with-bindings {#'*a* 5} *a*) 5)
 (chk "bound-fn carries it" (binding [*a* 4] ((bound-fn [] *a*))) 4)
 (chk "conveyed to a future" (binding [*a* 6] @(future *a*)) 6)
-(chk "conveyed to a raw thread"
-     (binding [*a* 8] (let [p (promise)] (.start (Thread. (fn [] (deliver p *a*)))) @p)) 8)
+;; Thread.start conveys nothing on the JVM (only future / send / pmap / bound-fn
+;; / core.async do, through binding-conveyor-fn): a raw thread reads the root.
+;; This row used to want 8 — jolt restored the caller's stack into the thread.
+(chk "a raw thread starts with no bindings"
+     (binding [*a* 8] (let [p (promise)] (.start (Thread. (fn [] (deliver p *a*)))) @p)) :root)
+(chk "bound-fn carries it into a raw thread"
+     (binding [*a* 8] (let [p (promise)] (.start (Thread. (bound-fn [] (deliver p *a*)))) @p)) 8)
+;; Var.set refuses a conveyed binding — the parent's own box — so a future's
+;; set! cannot reach the parent's frame; a frame the future pushes itself is its
+;; own to write.
+(chk "set! from a future on a conveyed binding is refused"
+     (binding [*a* 1] (try @(future (set! *a* 9)) :no-throw (catch Exception _ :threw))) :threw)
+(chk "...and the parent's binding is untouched"
+     (binding [*a* 1] (try @(future (set! *a* 9)) (catch Exception _ nil)) *a*) 1)
+(chk "set! inside the future's own binding"
+     (binding [*a* 1] @(future (binding [*a* 2] (set! *a* 9) *a*))) 9)
 (chk "with-redefs swaps the root" (with-redefs [*b* :redef] *b*) :redef)
 (chk "with-redefs restores" (do (with-redefs [*b* :redef] *b*) *b*) :root-b)
 

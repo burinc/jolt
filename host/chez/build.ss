@@ -85,12 +85,40 @@
 ;; The effective target machine, and whether this is a cross build.
 (define (bld-eff-machine) (or (bld-target) bld-machine))
 (define (bld-cross?) (and (bld-target) (not (string=? (bld-target) bld-machine)) #t))
-(define (bld-tgt-osx?) (bld-contains? (bld-eff-machine) "osx"))
+;; A Darwin target says "osx" OR "ios": Chez's four iOS tags (a6ios, arm64ios,
+;; ta6ios, tarm64ios) name Darwin without saying "osx" — the same vocabulary
+;; sa-os-family-for-tag matches on. Without "ios" here, `jolt build --target
+;; tarm64ios --library` links the output with ELF's -shared instead of
+;; -dynamiclib -install_name, which cannot produce a loadable Darwin dylib.
+(define (bld-tgt-osx?) (or (bld-contains? (bld-eff-machine) "osx")
+                           (bld-contains? (bld-eff-machine) "ios")))
 (define (bld-tgt-nt?) (bld-contains? (bld-eff-machine) "nt"))
+;; An env override, treating an EMPTY value as absent. A Makefile that exports a
+;; variable it did not manage to compute exports "" rather than nothing, and ""
+;; is a true value in Scheme -- so a plain (or (getenv ...) "cc") would hand the
+;; link an empty compiler name and fail somewhere far from the cause.
+(define (bld-env-override name)
+  (let ((v (getenv name))) (and v (> (string-length v) 0) v)))
+
 ;; The C compiler + arch flag for the OUTPUT binary. Cross overrides via env
 ;; (JOLT_TARGET_CC, e.g. aarch64-linux-gnu-gcc or a zig-cc wrapper;
 ;; JOLT_TARGET_ARCH_FLAG, e.g. "-arch x86_64" for a macOS x-arch link).
-(define (bld-cc) (if (bld-cross?) (or (getenv "JOLT_TARGET_CC") "cc") "cc"))
+;;
+;; JOLT_CC names the compiler for a NATIVE link. It exists because a bare `cc`
+;; is resolved by PATH, and PATH is not neutral when make provisions the pinned
+;; toolchain: gcc.mk puts the xPack bundle's bin directory FIRST on an exported
+;; PATH, so `as` and `ld` come from that bundle -- but the bundle ships no `cc`,
+;; so `cc` alone falls through to the system compiler. The link then pairs one
+;; vendor's driver with another vendor's assembler and linker (#788: a distro
+;; gcc 16 emitting .base64 into the bundle's pre-2.43 gas). Chez itself never
+;; had the problem: chezscheme.mk builds it with the absolute CC=$(GCC), and the
+;; Makefile now exports JOLT_CC with that same GCC. Same shape as JOLT_CHEZ,
+;; which exists because a bare `chez` on PATH could likewise be a different
+;; install from the one make provisioned.
+(define (bld-cc)
+  (if (bld-cross?)
+      (or (bld-env-override "JOLT_TARGET_CC") "cc")
+      (or (bld-env-override "JOLT_CC") "cc")))
 (define (bld-arch-flag) (if (bld-cross?) (or (getenv "JOLT_TARGET_ARCH_FLAG") "") ""))
 
 ;; Platform-appropriate flag to export executable symbols so a statically-linked
@@ -133,10 +161,31 @@
           (string-append "sh " qf " && rm -f " qf)))
       cmd))
 
+;; The directory holding an executable named the way the shell would find it. A
+;; BARE command name — JOLT_CHEZ=scheme, which runs perfectly well since PATH is
+;; what locates it — has no directory part to take, and path-parent answers "" for
+;; it where dirname answers ".": unhandled, the csv candidate built from it became
+;; an absolute "/../lib/csv<ver>" off the filesystem root. PATH is the only thing
+;; that knows where such a name lives, so ask it.
+(define (bld-exe-dir exe)
+  (let ((parent (path-parent exe)))
+    (if (string=? parent "")
+        (let ((p (bld-sh-capture
+                  (string-append "dirname \"$(command -v " (bld-sh-quote exe) ")\""))))
+          (if (> (string-length p) 0) p "."))
+        parent)))
+
 ;; The Chez executable, for the isolated compile pass (see build-binary step 4).
+;; $JOLT_CHEZ — the interpreter this script is itself running under — is
+;; authoritative when set, for the same reason as bld-host-csv-dir above: a
+;; fresh `command -v` PATH search can silently name a different Chez than the
+;; one actually selected to run the build.
 (define bld-chez
-  (let ((p (bld-sh-capture "command -v chez || command -v scheme || command -v petite")))
-    (if (> (string-length p) 0) p "chez")))
+  (let ((env (getenv "JOLT_CHEZ")))
+    (if (and env (> (string-length env) 0))
+        env
+        (let ((p (bld-sh-capture "command -v chez || command -v scheme || command -v petite")))
+          (if (> (string-length p) 0) p "chez")))))
 
 ;; Chez version off (scheme-version) "Chez Scheme Version X.Y.Z" — last token.
 (define bld-version
@@ -148,10 +197,24 @@
 
 ;; The HOST csv<ver>/<machine> dir holding scheme.h, libkernel.a, *.boot. Derived
 ;; from the chez executable's location; JOLT_CHEZ_CSV overrides.
+;;
+;; The executable's location comes from $JOLT_CHEZ (the same interpreter this
+;; script is running under — bin/jolt exports it) when set, rather than a fresh
+;; `command -v chez/scheme/petite` PATH search: that search re-derives an
+;; independent answer, which silently disagrees with the running interpreter
+;; whenever the one actually selected (make's local .cache/local provision, or
+;; any JOLT_CHEZ override) isn't also the one PATH would resolve — producing a
+;; mismatched dir (e.g. a PATH-resolved 9.x scheme paired with bld-version read
+;; off the running 10.x interpreter) that then fails bld-check-toolchain. The
+;; PATH search remains the fallback for a chez invoked directly, with no
+;; JOLT_CHEZ in its environment at all.
 (define bld-host-csv-dir
   (let ((env (getenv "JOLT_CHEZ_CSV")))
     (or (and env (> (string-length env) 0) env)
-        (let* ((bindir (bld-sh-capture "dirname \"$(command -v chez || command -v scheme || command -v petite)\""))
+        (let* ((chez (getenv "JOLT_CHEZ"))
+               (bindir (if (and chez (> (string-length chez) 0))
+                           (bld-exe-dir chez)
+                           (bld-sh-capture "dirname \"$(command -v chez || command -v scheme || command -v petite)\"")))
                (cand (string-append bindir "/../lib/csv" bld-version "/" bld-machine)))
           cand))))
 ;; The csv dir supplying the boots + kernel + scheme.h that get baked into the
@@ -186,8 +249,111 @@
               (error 'jolt-build (string-append "target pack file missing: " p hint)))))
         '("xpatch" "link-libs")))))
 
-;; Link flags. macOS Homebrew layout for the kernel's lz4/zlib/ncurses deps. The
-;; host branches double as the target flags for a non-cross build (host = target).
+;; The kernel's compression libraries — lz4 and zlib — as absolute paths to
+;; STATIC archives, or #f when none is reachable. Chez compiles both as part of
+;; its own build and installs liblz4.a / libz.a next to libkernel.a, so the
+;; archives matching the kernel this link bakes in are normally already in the csv
+;; dir, on every platform — Homebrew's chezscheme included (it vendors them; it
+;; depends on neither formula). The keg and pkg-config are macOS fallbacks for a
+;; Chez that somehow installed without them.
+;;
+;; Naming an archive by path is what forces the static choice: Apple's ld has no
+;; -Bstatic, and a bare -llz4 pointed at a directory holding both a .dylib and a
+;; .a always takes the .dylib. That is how the released macOS binary came to
+;; demand /opt/homebrew/opt/lz4/lib/liblz4.1.dylib off every machine that ran it
+;; — the install script's own `jolt --version` check died with a dyld error on a
+;; Mac with no Homebrew lz4, which is most of them. Neither library has to be a
+;; dependency of anything jolt produces: a jolt binary is meant to run with
+;; nothing else installed, the way a Go binary does.
+
+;; Archives the caller has already put on disk, as (("lz4" . path) ("z" . path)).
+;; They outrank the search below: the self-contained jolt has no Chez install to
+;; look in, so it carries the archives its own kernel was linked against and
+;; spills them for the one link it still performs (bld-relink-stub).
+(define bld-bundled-archives (make-parameter '()))
+
+;; lib name -> (Homebrew keg, pkg-config module), for the macOS fallbacks.
+(define bld-archive-sources '(("lz4" "lz4" "liblz4") ("z" "zlib" "zlib")))
+
+(define (bld-static-archive lib)
+  (let ((file (string-append "lib" lib ".a"))
+        (src (assoc lib bld-archive-sources)))
+    (let loop ((thunks
+                 (cons*
+                   (lambda () (cond ((assoc lib (bld-bundled-archives)) => cdr) (else #f)))
+                   ;; The csv dir the kernel itself comes from. (bld-csv-dir), not
+                   ;; bld-host-csv-dir, for the reason the Linux branch gives
+                   ;; below. A cross build's link never asks (the pack's link-libs
+                   ;; carries its own -llz4 -lz, resolved against the archives
+                   ;; under lib/), but build-jolt does, to embed them — hence the
+                   ;; pack path.
+                   (lambda () (string-append (bld-csv-dir) "/" file))
+                   (lambda () (and (bld-cross?)
+                                   (string-append (bld-target-pack) "/lib/" file)))
+                   ;; macOS only. A distro's static archive is deliberately NOT
+                   ;; searched on Linux: it may well be non-PIC, which would turn
+                   ;; today's working `jolt build --library` into a link error
+                   ;; ("recompile with -fPIC"). Chez's own archives are built
+                   ;; alongside libkernel.a, which that link already folds into a
+                   ;; shared object, so they carry the same guarantee. Darwin
+                   ;; compiles PIC throughout, so neither fallback has the problem.
+                   (if (and bld-osx? src)
+                       (list
+                         (lambda ()
+                           (let ((prefix (bld-sh-capture
+                                           (string-append "brew --prefix " (cadr src) " 2>/dev/null"))))
+                             (and (> (string-length prefix) 0)
+                                  (string-append prefix "/lib/" file))))
+                         (lambda ()
+                           (let ((libdir (bld-sh-capture
+                                           (string-append "pkg-config --variable=libdir "
+                                             (caddr src) " 2>/dev/null"))))
+                             (and (> (string-length libdir) 0)
+                                  (string-append libdir "/" file)))))
+                       '()))))
+      (if (null? thunks)
+          #f
+          (let ((path ((car thunks))))
+            (if (and path (file-exists? path)) path (loop (cdr thunks))))))))
+
+;; No archive anywhere: the link still has to find SOMETHING, and a binary that
+;; needs a shared library beats one that does not link at all. Say so — the
+;; result runs here and nowhere else, which is not what a `jolt build` output is
+;; for.
+(define (bld-warn-dynamic-lib! lib)
+  (display (string-append
+    "jolt build: warning: no static lib" lib ".a found next to the Chez kernel\n"
+    "  — linking " lib " dynamically; the binary will need it on every machine that runs it\n")))
+
+;; The macOS -llz4 fallback: the keg (or pkg-config) at least tells the linker
+;; where the dylib is, which a bare -llz4 on a Mac with no lz4 in /usr/lib cannot.
+(define (bld-osx-lz4-dynamic)
+  (bld-warn-dynamic-lib! "lz4")
+  (let ((prefix (bld-sh-capture "brew --prefix lz4 2>/dev/null")))
+    (if (> (string-length prefix) 0)
+        (string-append "-L" (bld-sh-quote (string-append prefix "/lib")) " -llz4")
+        (let ((pc (bld-sh-capture "pkg-config --libs-only-L liblz4 2>/dev/null")))
+          (if (> (string-length pc) 0)
+              (string-append pc " -llz4")
+              "-llz4")))))
+
+;; The link fragment for one of the kernel's compression libraries: the archive's
+;; path when one is reachable, else -l<lib>. WARN? says whether the fallback is
+;; worth a word. It always is for lz4, which no OS ships, and on Linux for zlib;
+;; on macOS libz is /usr/lib/libz.1.dylib, as much a part of the OS as libiconv,
+;; so falling back to it there is unremarkable.
+(define (bld-compression-lib lib warn?)
+  (let ((archive (bld-static-archive lib)))
+    (cond
+      (archive (string-append (bld-sh-quote archive) " "))
+      ;; a bare -llz4 finds nothing on a Mac: the keg is not on the default path.
+      ((and bld-osx? (string=? lib "lz4")) (string-append (bld-osx-lz4-dynamic) " "))
+      (else (when warn? (bld-warn-dynamic-lib! lib))
+            (string-append "-l" lib " ")))))
+
+;; Link flags. The kernel's lz4/zlib/ncurses deps, lz4 statically (see above).
+;; The host branches double as the target flags for a non-cross build
+;; (host = target).
 (define (bld-link-libs)
   (cond
     ;; cross: the static lz4/zlib live in the pack (lib/), and the pack's
@@ -198,17 +364,16 @@
      (or (getenv "JOLT_TARGET_LINK_LIBS")
          (string-append "-L" (bld-sh-quote (string-append (bld-target-pack) "/lib")) " "
            (bld-sh-capture (string-append "cat " (bld-sh-quote (string-append (bld-target-pack) "/link-libs")))))))
+    ;; macOS: libncurses, libiconv and Foundation ship with the OS and stay
+    ;; dynamic — they cannot be baked in. lz4 and zlib can, and are: lz4 because
+    ;; the OS has none at all, zlib because the archive Chez built is right there
+    ;; next to the kernel, which leaves the dependency list to things that are
+    ;; genuinely part of macOS.
     (bld-osx?
-     (let ((lz4 (bld-sh-capture "brew --prefix lz4 2>/dev/null")))
-       (if (> (string-length lz4) 0)
-           (string-append "-L" lz4 "/lib -llz4 -lz -lncurses -framework Foundation -liconv -lm")
-           (let ((pc (bld-sh-capture "pkg-config --libs-only-L liblz4 2>/dev/null")))
-             (if (> (string-length pc) 0)
-                 (string-append pc " -llz4 -lz -lncurses -framework Foundation -liconv -lm")
-                 (begin
-                   (display "jolt build: warning: lz4 library path not found via brew or pkg-config")
-                   (display " — linker may not find -llz4\n")
-                   "-llz4 -lz -lncurses -framework Foundation -liconv -lm"))))))
+     (string-append
+       (bld-compression-lib "lz4" #t)
+       (bld-compression-lib "z" #f)
+       "-lncurses -framework Foundation -liconv -lm"))
     ;; Windows (ta6nt, MinGW-w64 under MSYS2): the Chez kernel pulls in
     ;; compression, winsock, COM/UUID, and the registry.
     (bld-nt?
@@ -217,7 +382,42 @@
      "-static -llz4 -lz -lws2_32 -lrpcrt4 -lole32 -luuid -ladvapi32 -luser32 -lshell32 -lm")
     ;; Linux: the Chez kernel pulls in compression (lz4/z), the expression
     ;; editor (ncurses + terminfo), threads, dlopen, libuuid, and clock_gettime.
-    (else "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt")))
+    ;;
+    ;; --exclude-libs keeps the terminal libraries OUT of the executable's
+    ;; dynamic symbol table. -rdynamic puts everything else in, which is what
+    ;; lets a statically linked native resolve through (load-shared-object #f) —
+    ;; but exporting ncurses is actively harmful. The executable is searched
+    ;; before any dlopen'd library, so a jolt program that binds a real ncurses
+    ;; through the FFI has that library's own calls (_nc_setupterm and the rest)
+    ;; bound back into the kernel's copy, which is a different build with a
+    ;; different TERMINAL layout: the terminfo entry fails to parse, or initscr
+    ;; segfaults on the mismatch. Naming the archives costs nothing when they
+    ;; resolve to shared libraries instead — ld ignores an --exclude-libs name
+    ;; it did not link.
+    (else
+     (string-append
+       ;; -L the csv dir the kernel itself comes from: Chez ships liblz4.a /
+       ;; libz.a there, so -llz4 -lz resolve on a machine with no lz4/zlib
+       ;; development packages. (bld-csv-dir), not bld-host-csv-dir — every
+       ;; caller of bld-link-libs takes -I and libkernel.a from the same
+       ;; place, which for a cross build is the TARGET pack, not this host.
+       "-L" (bld-sh-quote (bld-csv-dir)) " "
+       ;; liblz4.a/libz.a join the list for a milder version of the same reason:
+       ;; the executable is searched before any dlopen'd library, so exporting a
+       ;; baked-in deflate/LZ4_decompress means an FFI-loaded libpng, libssl or
+       ;; libsqlite3 calls THIS copy instead of the one it was built against.
+       ;; ld matches these by basename, so naming the archives by absolute path
+       ;; above changes nothing here.
+       "-Wl,--exclude-libs,libncurses.a:libncursesw.a:libtinfo.a:liblz4.a:libz.a "
+       ;; lz4 and zlib by archive path rather than -llz4 -lz: the -L above
+       ;; already preferred the csv archives over any system .so, but only as a
+       ;; side effect of search order, so a Chez installed without them silently
+       ;; produced a binary with runtime compression dependencies. Naming them
+       ;; says so, and their absence is now a warning rather than silence. Falls
+       ;; back to -l (the -L above, then LIBRARY_PATH, then the system dirs).
+       (bld-compression-lib "lz4" #t)
+       (bld-compression-lib "z" #t)
+       "-lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
 
 ;; --- optional built-binary startup profile ----------------------------------
 ;; JOLT_STARTUP_PROFILE=1 reports wall time, process CPU, collections,
@@ -301,6 +501,7 @@
     "(load \"host/chez/cli-core.ss\")"
     "(load \"host/chez/png.ss\")"
     "(load \"host/chez/loader.ss\")"
+    "(load \"host/chez/diagnostic-render.ss\")"
     "(load \"host/chez/java/ffi.ss\")"
     (string-append "(set-source-roots! " (ldr-install-roots-str) ")")))
 
@@ -333,7 +534,7 @@
 ;; from disk (running from a source checkout). build-jolt embeds every runtime
 ;; .ss the manifest inlines, so `build` never touches the filesystem for them.
 (define (bld-source-string path)
-  (let ((emb (hashtable-ref embedded-resources path #f)))
+  (let ((emb (embedded-resource-ref path)))
     (cond ((string? emb) emb)
           ;; source embeds are UTF-8 bytevectors since the heap-size work —
           ;; missing this arm sent the standalone binary's `build` to disk for
@@ -359,12 +560,23 @@
 
 (define (bld-file-lines path) (bld-string-lines (bld-source-string path)))
 
+;; Build-time diagnostic. The runtime manifest carries one startup-profile mark
+;; per ENTRY, so "host/chez/rt.ss" is a single 64ms line hiding the ~40 files it
+;; transitively loads — enough to say the runtime is expensive, not enough to say
+;; which part. JOLT_PROFILE_INLINE=1 at BUILD time emits a mark after each inlined
+;; file, turning that one line into a per-file breakdown. Off by default: a
+;; shipped binary carries the coarse set, and each mark costs a statistics call.
+(define bld-profile-inline? (and (getenv "JOLT_PROFILE_INLINE") #t))
+
 ;; Emit one line to OUT, recursively inlining a `(load ...)` of a repo file.
 (define (bld-inline-line line out depth)
   (when (> depth 50) (error 'jolt-build "load nesting too deep"))
   (let ((p (bld-load-path line)))
     (if p
-        (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+        (begin
+          (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+          (when bld-profile-inline?
+            (bld-emit-startup-profile-mark! out (string-append "inlined " p))))
         (begin (put-string out line) (put-string out "\n")))))
 
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
@@ -445,41 +657,51 @@
           (dynamic-wind
             jolt-ns-load-vars-push!
             (lambda ()
-          (parameterize ((rdr-source-file (cdr nf)))
-            (jolt-enter-file! (cdr nf))   ; so a failure here names the file
-            (for-each
-              (lambda (f)
-                (ce-scan-requires! f (car nf))
-                (when (ei-flag-set-form? f)
-                  (jolt-compile-eval-form f (car nf)))
-                ;; per-ns is consumed POSITIONALLY by the emit walk
-                ;; (ei-next-cached, one pop per form ei-for-each-form
-                ;; dispatches). The emit walk compiles MACRO forms too, and
-                ;; keeps going past a form this analysis rejects — so both get
-                ;; a #f placeholder (ei-compile-form falls back to a fresh
-                ;; analysis on #f). Skipping them here shifted every later
-                ;; form's cached IR by one: a macro's def-var! captured the
-                ;; NEXT def's emission — invalid Scheme under direct-link, a
-                ;; silently corrupted expander before it. Only the ns form is
-                ;; skipped by BOTH walks.
-                (unless (ei-ns-form? f)
-                  (if (ce-macro-form? f)
-                      (set! per-ns (cons #f per-ns))
-                      ;; a form the analyzer rejects here only loses
-                      ;; whole-program type info (per-form emit still errors
-                      ;; the build if it's truly broken) — but say so, or an
-                      ;; optimized build silently loses inference for the ns.
-                      (guard (e (#t (display (string-append
-                                              "jolt build: note: whole-program inference skipped a form in "
-                                              (car nf) "\n")
-                                             (current-error-port))
-                                    (set! per-ns (cons #f per-ns))))
-                        (let ((n (ei-timed "wp: analyze"
-                                   (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f)))))
-                          (set! nodes (cons n nodes))
-                          (set! per-ns (cons n per-ns)))))))
-              (ei-timed "wp: parse" (lambda () (ei-read-all src))))))
-            jolt-ns-load-vars-pop!)
+           (parameterize ((rdr-source-file (cdr nf)))
+             (jolt-enter-file! (cdr nf))   ; so a failure here names the file
+             (let ((ord 0))
+             (for-each
+               (lambda (f)
+                 ;; ord mirrors the loader's and the emit walk's per-file form
+                 ;; counter (load-jolt-file* / ei-for-each-form): the
+                 ;; def-ordinal visibility replay (rt.ss var-def-ordinals) must
+                 ;; gate THIS analysis too — its cached IR is what the emit walk
+                 ;; pops positionally, so a resolution decided here but not
+                 ;; there (or vice versa) is the exact divergence the replay
+                 ;; exists to prevent.
+                 (parameterize ((jolt-form-ordinal ord))
+                 (ce-scan-requires! f (car nf))
+                 (when (ei-flag-set-form? f)
+                   (jolt-compile-eval-form f (car nf)))
+                 ;; per-ns is consumed POSITIONALLY by the emit walk
+                 ;; (ei-next-cached, one pop per form ei-for-each-form
+                 ;; dispatches). The emit walk compiles MACRO forms too, and
+                 ;; keeps going past a form this analysis rejects — so both get
+                 ;; a #f placeholder (ei-compile-form falls back to a fresh
+                 ;; analysis on #f). Skipping them here shifted every later
+                 ;; form's cached IR by one: a macro's def-var! captured the
+                 ;; NEXT def's emission — invalid Scheme under direct-link, a
+                 ;; silently corrupted expander before it. Only the ns form is
+                 ;; skipped by BOTH walks.
+                 (unless (ei-ns-form? f)
+                   (if (ce-macro-form? f)
+                       (set! per-ns (cons #f per-ns))
+                       ;; a form the analyzer rejects here only loses
+                       ;; whole-program type info (per-form emit still errors
+                       ;; the build if it's truly broken) — but say so, or an
+                       ;; optimized build silently loses inference for the ns.
+                       (guard (e (#t (display (string-append
+                                               "jolt build: note: whole-program inference skipped a form in "
+                                               (car nf) "\n")
+                                              (current-error-port))
+                                     (set! per-ns (cons #f per-ns))))
+                         (let ((n (ei-timed "wp: analyze"
+                                    (lambda () (jolt-ce-analyze (make-analyze-ctx (car nf)) f)))))
+                           (set! nodes (cons n nodes))
+                           (set! per-ns (cons n per-ns))))))
+                 (set! ord (fx+ ord 1))))
+               (ei-timed "wp: parse" (lambda () (ei-read-all src)))))))
+             jolt-ns-load-vars-pop!)
           (set! ns-nodes (cons (cons (car nf) (reverse per-ns)) ns-nodes))))
       ordered)
     (ei-timed "wp: fixpoint"
@@ -538,6 +760,145 @@
                                                           " " (ei-str-lit target) ")"))))
                                 (seq->list v))))))))
             (loop (cddr xs))))))))
+
+;; --- deferring the app's top-level forms out of the boot ---------------------
+;; Chez does not schedule a forked thread until Sbuild_heap returns. The app's
+;; emitted forms used to sit at the top level of the boot file, which is exactly
+;; that window — so a namespace top-level form that spawned a thread and waited
+;; for it never got its answer. Measured in a built binary: @(future …) hung
+;; forever, an agent send + await-for never ran the action, a promise delivered
+;; from a Thread timed out. All of them worked the moment -main started, and all
+;; of them worked under `jolt -m`, where the namespace loads after boot. The
+;; shape that found it was a top-level (clojure.java.shell/sh …): sh drains the
+;; child through two futures and derefs them with NO timeout, so it hung the
+;; process with no diagnostic.
+;;
+;; Proven below jolt: a boot file whose top level forks a thread and then sleeps
+;; two seconds reports the child never ran, and the child runs only once
+;; Sbuild_heap returns and Sscheme_start begins. Chez also refuses (collect) in
+;; that window — "cannot collect when multiple threads are active" — so the
+;; forked thread counts as active while being unable to run.
+;;
+;; So the app's forms move into the scheme-start launcher, which is past the
+;; boundary. They cannot simply be wrapped in a lambda: the app emit produces
+;; top-level (define jv$… …) forms interleaved with expressions, and Chez
+;; rejects an internal definition after an expression in a body. Instead each
+;; define is split — the binding is DECLARED at boot and ASSIGNED at init — so
+;; every jv$ name still exists at the top level and cross-form references (which
+;; is what direct-linking emits) are unchanged. Measured: an assigned top-level
+;; variable costs nothing against an immutable one in a compile-file unit (479ms
+;; vs 477ms on a 30M-iteration call loop), because such a unit compiles against
+;; the interaction environment and so cannot assume immutability either way.
+
+;; Index of PAT in S at or after START, or #f. Char-by-char rather than
+;; substring: this runs over every emitted app form of a whole application.
+(define (bld-find-substring s pat start)
+  (let ((n (string-length s)) (m (string-length pat)))
+    (let loop ((i start))
+      (cond ((fx> (fx+ i m) n) #f)
+            ((let cmp ((j 0))
+               (or (fx= j m)
+                   (and (char=? (string-ref s (fx+ i j)) (string-ref pat j))
+                        (cmp (fx+ j 1)))))
+             i)
+            (else (loop (fx+ i 1)))))))
+
+(define (bld-prefix? s pre)
+  (let ((n (string-length s)) (m (string-length pre)))
+    (and (fx>= n m) (string=? (substring s 0 m) pre))))
+
+;; The top-level (define nm …) names in one emitted app form, walking the
+;; (begin …) splice the def emit wraps its registrations in.
+;;
+;; Anything else that binds at the top level is refused rather than passed
+;; through: a define-record-type or a procedure-style define needs restructuring,
+;; not a set!, and would otherwise land in the init body as an illegal internal
+;; definition — or worse, compile and shadow. Today's app emit produces neither
+;; (records, protocols and deftypes all lower to (define jv$… <init>) plus
+;; runtime registration calls), so this is a tripwire on that staying true.
+(define (bld-app-form-defines s)
+  (let ((names '()))
+    (let ((ip (open-input-string s)))
+      (let loop ((f (read ip)))
+        (unless (eof-object? f)
+          (let walk ((f f))
+            (when (and (pair? f) (symbol? (car f)))
+              (cond
+                ((eq? (car f) 'begin) (for-each walk (cdr f)))
+                ((eq? (car f) 'define)
+                 (let ((h (and (pair? (cdr f)) (cadr f))))
+                   (unless (symbol? h)
+                     (error 'bld-app-form-defines
+                            "app form has a procedure-style define; cannot defer it" h))
+                   (set! names (cons h names))))
+                ((bld-prefix? (symbol->string (car f)) "define")
+                 (error 'bld-app-form-defines
+                        "app form has a top-level binding form the deferral cannot split"
+                        (car f)))
+                (else #f))))
+          (loop (read ip)))))
+    (reverse names)))
+
+;; Split APP-STRS into the declarations that stay at boot and the bodies that run
+;; from the launcher. Each (define nm <init>) becomes a bare (define nm) up top
+;; and a (set! nm <init>) in the body, rewritten textually so the emitted source
+;; is otherwise byte-identical — the line-number comments the back end threads
+;; through it survive, and no read/write round trip can perturb a literal. The
+;; jv$ name is unique to its var, so the occurrence is unambiguous; exactly one
+;; is required, and a miss fails the build rather than silently leaving a define
+;; that would become an illegal internal definition.
+(define (bld-defer-app-strs app-strs)
+  (let loop ((rest app-strs) (decls '()) (bodies '()))
+    (if (null? rest)
+        (values (reverse decls) (reverse bodies))
+        (let* ((s (car rest))
+               (names (bld-app-form-defines s)))
+          (loop (cdr rest)
+                (fold-left (lambda (acc nm)
+                             (cons (string-append "(define " (symbol->string nm) " (void))") acc))
+                           decls names)
+                (cons (fold-left
+                        (lambda (str nm)
+                          (let* ((n (symbol->string nm))
+                                 (pat (string-append "(define " n " "))
+                                 (at (bld-find-substring str pat 0)))
+                            (unless at
+                              (error 'bld-defer-app-strs "no (define …) text for" nm))
+                            (when (bld-find-substring str pat (fx+ at 1))
+                              (error 'bld-defer-app-strs "ambiguous (define …) text for" nm))
+                            (string-append (substring str 0 at)
+                                           "(set! " n " "
+                                           (substring str (fx+ at (string-length pat))
+                                                      (string-length str)))))
+                        s names)
+                      bodies)))))) 
+
+;; The init bodies as procedures the launcher calls, in order. Chunked rather
+;; than one procedure: a whole application's forms in a single lambda body is one
+;; enormous letrec* for Chez to compile, where the boot file used to hand it many
+;; small top-level forms. An empty chunk is not emitted — a lambda needs a body.
+(define bld-app-init-chunk 100)
+(define (bld-emit-app-init out bodies)
+  (let loop ((rest bodies) (k 0) (names '()))
+    (if (null? rest)
+        (begin
+          (put-string out "(define (jolt-app-init!)\n")
+          (if (null? names)
+              (put-string out "  #f")
+              (for-each (lambda (n) (put-string out (string-append "  (" n ")\n")))
+                        (reverse names)))
+          (put-string out ")\n"))
+        (let* ((nm (string-append "jolt-app-init$" (number->string k) "!"))
+               (chunk (let take ((r rest) (i 0) (acc '()))
+                        (if (or (null? r) (fx= i bld-app-init-chunk))
+                            (reverse acc)
+                            (take (cdr r) (fx+ i 1) (cons (car r) acc)))))
+               (after (let drop ((r rest) (i 0))
+                        (if (or (null? r) (fx= i bld-app-init-chunk)) r (drop (cdr r) (fx+ i 1))))))
+          (put-string out (string-append "(define (" nm ")\n"))
+          (for-each (lambda (s) (put-string out s) (put-string out "\n")) chunk)
+          (put-string out ")\n")
+          (loop after (fx+ k 1) (cons nm names))))))
 
 (define (bld-ns-prelude ns-name src)
   (let ((acc (list (string-append "(set-chez-ns! " (ei-str-lit ns-name) ")")))
@@ -611,7 +972,6 @@
           (ei-fresh-unit!)
           ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
           (set-optimize! #t)
-          (set-release! #t)
           ((var-deref "jolt.backend-scheme" "set-var-cache!") #t))
         (lambda ()
           (for-each
@@ -630,11 +990,13 @@
                   ;; defines above already installed every var. Without this the
                   ;; loader sees an unmarked ns and recompiles it from source on the
                   ;; first command that enters jolt.main/-main (run/build/version).
-                  (put-string out (string-append "(ldr-mark-loaded! " (ei-str-lit name) ")\n")))))
+                  (put-string out (string-append "(ldr-mark-loaded! " (ei-str-lit name) ")\n"))
+                  ;; ...and record that this ns is preloaded only because the CLI
+                  ;; image defines it, so an app build does not inherit the claim.
+                  (put-string out (string-append "(ldr-mark-cli-aot! " (ei-str-lit name) ")\n")))))
             ordered))
         (lambda ()
           (set-optimize! #f)
-          (set-release! #f)
           ((var-deref "jolt.backend-scheme" "set-var-cache!") #f)
           (ei-clear-cached!))))))
 
@@ -759,20 +1121,32 @@
           (bld-walk-files root "" '()))))
     (bld-strs embed-dirs)))
 
-;; Namespaces already defined at boot in the BUILD process (snapshotted before
-;; step 1 loads anything) — the driver image's set. bld-require-closure still
-;; skips these as preloaded; only LAZY stdlib (not in the image) is emitted.
-(define bld-boot-loaded #f)
+;; Namespaces defined in the runtime image before the CLI loads jolt.main and
+;; its require closure. By the time build-binary is called, jolt.main has loaded
+;; jolt.ffi and other lazy stdlib namespaces into THIS process, but those are not
+;; in the app image being written. Re-snapshotting loaded-ns there silently
+;; leaves their vars interned but UNBOUND in a source-mode-built app/library.
+;;
+;; The baseline is taken in loader.ss, and bld-runtime-manifest below loads
+;; loader.ss last but for java/ffi.ss (which defines no namespace of its own) —
+;; so the baseline is exactly the set an app image inherits. A load added after
+;; loader.ss there makes the baseline too SMALL, an over-emit that costs bytes;
+;; too large is the direction that leaves vars unbound.
+(define bld-boot-loaded (ldr-runtime-image-ns-copy))
 
 ;; --- the build --------------------------------------------------------------
 ;; entry-ns: the app's main namespace (a string). out-path: the binary to write.
 ;; mode: "dev" | "release" | "optimized". Every form runs through jolt.passes/
-;; run-passes (const-fold always; type inference in release+optimized; inline +
-;; scalar-replace additionally when optimized). Deps + source roots are already
+;; run-passes (const-fold always; type inference in every mode but dev; inline +
+;; scalar-replace additionally when direct-linked). Deps + source roots are already
 ;; applied by the caller.
 ;; natives: encoded :jolt/native libs to load at startup. embed-dirs: dirs whose
 ;; files bake into the binary (single-file). ext-roots: project-relative io/resource
 ;; roots resolved at runtime against JOLT_PWD (ship-alongside resources).
+;; allow-dynamic: "ns/name" strings the project and its deps vouch never resolve
+;; vars at runtime in the built binary (deps.edn :jolt/tree-shake {:allow-dynamic
+;; […]}); dce-shake skips them in its bail and compiler-needed scans (see
+;; dce-bail-scan). '() when nothing declared one.
 ;; direct-link?: closed-world direct-linking (app->app calls bind directly; a plain
 ;; def is frozen, ^:redef/^:dynamic stay var-routed). The caller (jolt.main) turns
 ;; this ON for release and optimized and OFF for --dev / --no-direct-link.
@@ -804,8 +1178,8 @@
 ;; the shared expand-spec + parse-libspec (loader.ss / ns.ss), matching the
 ;; loader's semantics exactly.
 ;; A libspec that only establishes an alias pulls nothing into the build. At
-;; runtime `require` interns the namespace without loading it (loader.ss
-;; ldr-load+register), so counting it as a dependency would emit the target into
+;; runtime `require` interns the namespace without loading it (ns.ss
+;; ns-load+register), so counting it as a dependency would emit the target into
 ;; the binary and run its top level — the opposite of what :as-alias asks for. The
 ;; alias itself is still replayed, by bld-scan-spec!. Mirrors clojure.core's
 ;; load-lib, which picks its loader with `need-ns (or as use)`.
@@ -872,24 +1246,25 @@
         (map rdr-form->data (ei-read-all src))))
     (reverse reqs)))
 
-;; Host classes a file's forms reference that a LIBRARY provides (jolt-lang/time,
-;; jolt-crypto, …). At runtime a class-miss autoloads the provider's install
-;; namespace off the source roots (host-static.ss jt-try-autoload! /
-;; lib-try-autoload!); a built binary has no source roots, so the scan must pull
-;; the provider into flat.ss instead — otherwise the binary throws the RFC 0008
-;; "add io.github.jolt-lang/time" error for a dependency the project did declare.
-;; Mirrors the runtime predicates: a jt-library class (or java.time.*) ->
-;; "jolt.time"; anything else consults lib-class-providers. A provider is pulled
-;; only when its source is actually on the roots (find-ns-file) — off the roots
-;; the runtime's unknown-class message is the contract and the build must keep
-;; succeeding exactly as before.
+;; Host classes a file's forms reference that a PROVIDER installs (RFC 0014). At
+;; runtime a class-miss autoloads the provider's install namespace off the source
+;; roots (host-static.ss lib-try-autoload!); a built binary has no source roots,
+;; so the scan must pull the provider into flat.ss instead — otherwise the binary
+;; throws the "add it to your deps.edn" error for a dependency the project did
+;; declare.
+;;
+;; This asks lib-provider-for, the same table the runtime resolves against,
+;; rather than restating its rules. The previous version mirrored the runtime
+;; predicates by hand and had to be kept in step with them.
+;;
+;; A provider is pulled only when its source is actually on the roots
+;; (find-ns-file) — off the roots the runtime's unknown-class message is the
+;; contract and the build must keep succeeding exactly as before.
 (define (bld-ns-class-providers file)
   (let ((src (ldr-read-source file))
         (cands '()))
     (define (add! class)
-      (let ((cand (cond ((or (member class jt-library-names) (java-time-prefixed? class))
-                         "jolt.time")
-                        ((lib-provider-for class) => (lambda (p) (vector-ref p 0)))
+      (let ((cand (cond ((lib-provider-for class) => (lambda (p) (vector-ref p 0)))
                         (else #f))))
         (when (and cand (not (member cand cands)))
           (set! cands (cons cand cands)))))
@@ -922,6 +1297,11 @@
 ;; the seed — e.g. jolt.time.impl) IS included and emitted: a built binary
 ;; has no disk roots, so its compiled Scheme must define those vars at boot —
 ;; the same reason bld-emit-cli-aot emits jolt.main into the release image.
+;; ldr-cli-aot? is the same claim reached from the other side: a release CLI
+;; bakes jolt.main's closure into its OWN heap, and bld-boot-loaded is taken
+;; before that (loader.ss), so the two agree — it stays as the explicit record
+;; of WHY such a namespace is preloaded, and covers any image that ever seeds
+;; the CLI closure earlier.
 ;; Result: deps first, roots last.
 (define (bld-require-closure names)
   (let ((visited (make-hashtable string-hash string=?))
@@ -934,33 +1314,50 @@
             (let ((file (find-ns-file name)))
               (when (and file
                          (or (not (ldr-install-file? file))
-                             (not (hashtable-ref bld-boot-loaded name #f))))
+                             (not (hashtable-ref bld-boot-loaded name #f))
+                             ;; preloaded only in the CLI image, not in an app's
+                             (ldr-cli-aot? name)))
                 (dfs (append (bld-ns-class-providers file) (bld-ns-requires file)))
                 (set! order (cons (cons name file) order)))))
           (dfs (cdr ns)))))
     (reverse order)))
 
 ;; Bake the *data-readers* table into the binary so a runtime (read-string
-;; "#my/tag …") resolves its reader fn like it does under jolt run. Tag and
-;; reader are symbols; the reader path var-derefs the fn at use time.
+;; "#my/tag …") resolves its reader fn like it does under jolt run. A reader is
+;; written as the SYMBOL naming its var (a var value is written as its own name);
+;; the reader path var-derefs the fn at use time.
 (define (bld-sym-lit s)
   (let ((ns (symbol-t-ns s)))
     (if (and ns (not (jolt-nil? ns)))
         (string-append "(jolt-symbol " (ei-str-lit ns) " " (ei-str-lit (symbol-t-name s)) ")")
         (string-append "(jolt-symbol #f " (ei-str-lit (symbol-t-name s)) ")"))))
+;; A table entry's source text, or #f for one that cannot be written as a literal.
+;; A FUNCTION value — the shape (alter-var-root #'*data-readers* assoc 'my/tag
+;; (fn …)) leaves — is skipped rather than emitted: a closure has no literal form,
+;; and the top-level code that installed it is in the binary and re-runs at
+;; startup, so the entry is back in the table before anything reads a #tag.
+;; Without the skip the emit walked a procedure into bld-sym-lit and the build
+;; died in symbol-t-ns.
+(define (bld-data-reader-lit v)
+  (cond ((symbol-t? v) (bld-sym-lit v))
+        ((var-cell? v) (bld-sym-lit (jolt-symbol (var-cell-ns v) (var-cell-name v))))
+        (else #f)))
 (define (bld-emit-data-readers out)
   (let ((tbl (var-deref "clojure.core" "*data-readers*")))
-    (when (and (pmap? tbl) (> (pmap-cnt tbl) 0))
-      (put-string out "\n;; === data readers ===\n")
-      (put-string out "(def-var! \"clojure.core\" \"*data-readers*\"\n  (jolt-assoc empty-pmap")
-      (pmap-fold tbl
-        (lambda (k v a)
-          (put-string out (string-append "\n    " (bld-sym-lit k) " " (bld-sym-lit v)))
-          a)
-        #f)
-      (put-string out "))\n"))))
+    (when (pmap? tbl)
+      (let ((pairs (pmap-fold tbl
+                     (lambda (k v a)
+                       (let ((klit (and (symbol-t? k) (bld-sym-lit k)))
+                             (vlit (bld-data-reader-lit v)))
+                         (if (and klit vlit) (cons (cons klit vlit) a) a)))
+                     '())))
+        (when (pair? pairs)
+          (put-string out "\n;; === data readers ===\n")
+          (put-string out "(def-var! \"clojure.core\" \"*data-readers*\"\n  (jolt-assoc empty-pmap")
+          (for-each (lambda (p) (put-string out (string-append "\n    " (car p) " " (cdr p)))) pairs)
+          (put-string out "))\n"))))))
 
-(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? library?)
+(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? allow-dynamic library?)
   (ei-profile-init!)
   ;; Windows executables carry .exe; normalize here so the append-payload and
   ;; cc paths agree and the shell can run the result. A library keeps its own
@@ -970,9 +1367,16 @@
                       out-path)))
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
-  ;; ALWAYS takes the cc path (build-shared), and a cross build (--target) always
-  ;; takes build-with-cc, so both need the toolchain even from the self-contained jolt.
+  ;; always takes build-shared, and any cross build takes a spawned cc path, so both
+  ;; need the toolchain even from the self-contained jolt.
   (when (or library? (bld-cross?) (not (jolt-embedded-bytes "stub/launcher"))) (bld-check-toolchain))
+  ;; Static natives have to be loaded into this HOST process while the app is
+  ;; emitted, so a target-architecture archive cannot be supported merely by
+  ;; handing it to the target linker. Refuse before bld-preload-static-natives!
+  ;; tries to turn one into a host shared object.
+  (when (and (bld-cross?) (> (string-length (bld-native-link-flags natives)) 0))
+    (error 'jolt-build
+      "cross build (--target) does not support :jolt/native archives yet (they need separate host and target archives)"))
   (when (> (string-length (bld-native-link-flags natives)) 0)
     ;; :static natives are cc-linked into the binary, so a C compiler must be on
     ;; PATH — the self-contained jolt bundles the Chez kernel (libkernel.a +
@@ -988,29 +1392,54 @@
     (bld-preload-static-natives! natives (string-append out-path ".build")))
    ;; 1. record app namespaces in dependency order as they finish loading.
    (let ((app-order '()))
-     (set! bld-boot-loaded
-       (hashtable-copy loaded-ns #f))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
     (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
       (load-namespace entry-ns))
-    (set-ns-loaded-hook! (lambda (name file) #f))
     (ei-mark! "load app from source")
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the
     ;; hook captures dynamic requires the static scan can't see.
     (let* ((graph (bld-require-closure (list entry-ns)))
            (_prof-graph (ei-mark! "require-graph DFS"))
+           ;; reader namespaces with transitive closure
+           (reader-ns-names (bld-data-reader-ns-names))
+           (reader-pairs (bld-require-closure reader-ns-names))
+           ;; Namespaces the CLASS scan pulled in (lib providers like jolt.time)
+           ;; and the data-reader namespaces are in the closure without ever
+           ;; having been loaded in-process: step 1 only loads what the entry's
+           ;; requires reach, and the runtime class-miss autoload fires on USE,
+           ;; which the build never triggers. Load them now, source-only like
+           ;; step 1 and with the hook STILL RECORDING. The strict emit below
+           ;; re-analyzes every source against process ns state, and an unloaded
+           ;; provider has no refer/alias tables, so its own :refer'd names would
+           ;; not resolve — that is why they load at all. They load under the hook
+           ;; because the emit ORDER has to be the order the loader ran them in: a
+           ;; provider's install namespace can depend on a namespace step 1
+           ;; already loaded through another path, and only the hook sees that
+           ;; edge. jolt.time's formatter half (a git dep) calls
+           ;; jolt.time.impl/register-type! at its top level, and impl — the
+           ;; embedded-stdlib half of the same provider — was loaded in step 1 when
+           ;; the entry's def touched LocalDateTime. Placing the never-loaded set
+           ;; in front of walked by the static graph alone put jolt.time.fmt before
+           ;; jolt.time.impl, and the binary died at startup on
+           ;; (impl/register-type! …) with "Attempting to call unbound fn" (#944).
+           (_loaded (begin
+                      (for-each
+                        (lambda (p)
+                          (unless (hashtable-ref loaded-ns (car p) #f)
+                            (parameterize ((ldr-source-only? #t))
+                              (load-namespace (car p)))))
+                        (append graph reader-pairs))
+                      (set-ns-loaded-hook! (lambda (name file) #f))
+                      #t))
            (walked (reverse app-order))
            ;; graph without the entry-ns pair (it goes last)
            (graph-rest (if (and (pair? graph)
                                 (string=? (caar (reverse graph)) entry-ns))
                            (reverse (cdr (reverse graph)))
                            graph))
-           ;; reader namespaces with transitive closure
-           (reader-ns-names (bld-data-reader-ns-names))
-           (reader-pairs (bld-require-closure reader-ns-names))
            ;; only keep reader pairs not already in graph-rest or walked
            (reader-pairs
              (filter (lambda (p)
@@ -1028,10 +1457,11 @@
            ;; built binary died at startup on (impl/register-type! …) with
            ;; "Attempting to call unbound fn".
            ;;
-           ;; A graph-rest entry missing from walked was already loaded before this
-           ;; load-namespace (dep resolution, boot), and so was everything it
-           ;; requires — nothing in walked can be its dependency. Those go in front,
-           ;; keeping bld-require-closure's post-order among themselves.
+           ;; With the closure loaded above, a graph-rest entry missing from walked
+           ;; was already loaded before step 1 (dep resolution, boot), and so was
+           ;; everything it requires — nothing in walked can be its dependency.
+           ;; Those go in front, keeping bld-require-closure's post-order among
+           ;; themselves.
            (pre (remp (lambda (p) (assoc (car p) walked)) graph-rest))
            (merged (append reader-pairs pre walked))
            ;; ensure entry-ns is last
@@ -1043,23 +1473,11 @@
        (when (null? ordered)
          (error 'jolt-build (string-append "no source namespace loaded for " entry-ns
                                            " — is it on the source roots?")))
-       ;; Namespaces the CLASS scan pulled in (lib providers like jolt.time) are in
-       ;; `ordered` without ever being loaded in-process: step 1 only loads what
-       ;; the require graph reaches, and the runtime class-miss autoload fires on
-       ;; USE, which the build never triggers. The strict emit below re-analyzes
-       ;; their source against process ns state — an unloaded provider has no
-       ;; refer/alias tables, so its own :refer'd names would not resolve. Load
-       ;; any still-unloaded ns of the closure now, source-only like step 1.
-       (for-each
-         (lambda (p)
-           (unless (hashtable-ref loaded-ns (car p) #f)
-             (parameterize ((ldr-source-only? #t))
-               (load-namespace (car p)))))
-         ordered)
-      ;; 2. emit each app namespace. Release and optimized modes enable the
-      ;; inference + record-shape setup passes (inference-enabled?); optimized
-      ;; mode additionally runs the inline + flatten + scalar-replace fixpoint
-      ;; (inline-enabled?). Dev mode gets const-fold + numeric-annotate only.
+      ;; 2. emit each app namespace. Every mode but dev runs the inference +
+      ;; record-shape setup passes and the inline + flatten + scalar-replace
+      ;; fixpoint (set-optimize! below; inlining follows direct-link); release
+      ;; and optimized differ only in the Chez compile parameters. Dev mode
+      ;; gets const-fold + numeric-annotate only.
       ;; direct-link? commits to a closed world: app->app calls bind directly, a
       ;; plain def is frozen in the binary (^:redef/^:dynamic stay var-routed).
       ;; The caller (jolt.main) turns it ON for release and optimized and OFF for
@@ -1080,8 +1498,12 @@
                 ;; must lower to var-deref, so prelude mode is on for the whole build.
                 (ei-fresh-unit!)
                 ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
-                (set-optimize! (string=? mode "optimized"))
-                (set-release! (string=? mode "release"))
+                ;; The passes run for every mode but dev. "release" and
+                ;; "optimized" differ only in the Chez compile parameters
+                ;; below (inspector + procedure-source info), not in what the
+                ;; compiler emits -- inlining follows direct-link, which both
+                ;; of them set.
+                (set-optimize! (not (string=? mode "dev")))
                 (when direct-link?
                   ((var-deref "jolt.backend-scheme" "set-direct-link!") #t)
                   ((var-deref "jolt.backend-scheme" "direct-link-reset!"))
@@ -1132,79 +1554,61 @@
                 ;; form too (no-op unless the app registered data readers).
                 (parameterize ((ei-emit-form-hook
                                 (lambda (form) (if data-readers-active (ldr-apply-readers form) form))))
-                  (if tree-shake?
-                      (dce-shake
-                        (dce-blob-records "host/chez/seed/prelude.ss")
-                        ;; EAGER per-ns accumulation (see the non-shake branch):
-                        ;; the emit lambdas carry side effects — cell/gensym
-                        ;; allocation and direct-link-defined registration — and
-                        ;; jolt's lazy `map` realizes them in a non-list order,
-                        ;; which can emit the entry ns before its dependencies
-                        ;; (var-routed calls, out-of-order cells). The named let
-                        ;; runs strictly in `ordered` order (deps first).
-                        (let ((per-ns '()))
-                          (let loopfe ((rest ordered))
-                            (unless (null? rest)
-                              (let* ((nf (car rest))
-                                     (src (ldr-read-source (cdr nf)))
-                                     (profile-form
-                                       (bld-startup-profile-form
-                                         (string-append "namespace " (car nf)))))
-                                (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                (parameterize ((rdr-source-file (cdr nf)))
-                                  ;; RT.load-parity bracket (dyn-binding.ss): the
-                                  ;; ns's replayed forms run under fresh
-                                  ;; *warn-on-reflection*/*assert* bindings.
-                                  (set! per-ns
-                                    (cons (append
-                                            (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
-                                            (map (lambda (s) (dce-rec #t #f '() s))
-                                                 (bld-ns-prelude (car nf) src))
-                                            (ei-emit-ns-records (car nf) src)
-                                            (list
-                                              (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
-                                              (dce-rec #t #f '() profile-form)))
-                                          per-ns)))
-                              (loopfe (cdr rest))))
-                          (apply append (reverse per-ns))))
-                        (string-append entry-ns "/-main"))
-                      (values
-                        #f
-                        ;; EAGER per-ns accumulation, NOT (apply append (map …)):
-                        ;; `map` here is jolt's LAZY map, and the per-ns emit lambdas carry side
-                        ;; effects (analysis, cell/gensym allocation, direct-link-defined
-                        ;; registration). Their realization order under apply/append is not the
-                        ;; list order, so an entry-ns lambda could run before a dependency's —
-                        ;; leaving cross-ns calls var-routed instead of direct-linked (and cell
-                        ;; names allocated out of order). for-each runs strictly in `ordered`
-                        ;; order (deps first), matching the loader.
-                        (let ((per-ns '()))
-                          (let loopfe ((rest ordered))
-                            (unless (null? rest)
-                              (let* ((nf (car rest))
-                                     (src (ei-timed "emit: read source"
-                                            (lambda () (ldr-read-source (cdr nf))))))
-                                (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                (parameterize ((rdr-source-file (cdr nf)))
-                                  ;; RT.load-parity bracket, matching the tree-shake path.
-                                  (set! per-ns
-                                    (cons (append
-                                            (list "(jolt-ns-load-vars-push!)")
-                                            (ei-timed "emit: ns-prelude"
-                                              (lambda () (bld-ns-prelude (car nf) src)))
-                                            (ei-timed "emit: per-ns total"
-                                              (lambda () (bld-emit-ns (car nf) src)))
-                                            (list
-                                              "(jolt-ns-load-vars-pop!)"
-                                              (bld-startup-profile-form
-                                                (string-append "namespace " (car nf)))))
-                                          per-ns)))
-                              (loopfe (cdr rest))))
-                          (apply append (reverse per-ns))))
-                        #f))))
+                  ;; Every build emits its app namespaces as DCE records — the
+                  ;; emitted Scheme plus the vars it references — and reads the
+                  ;; prelude as records too, so the same reachability walk that
+                  ;; drives --tree-shake also answers, for every build, whether
+                  ;; the program can reach the compiler. A shake prunes on that
+                  ;; graph; the default keeps every record and takes only the
+                  ;; compiler verdict (dce-needs-compiler?).
+                  ;;
+                  ;; EAGER per-ns accumulation, NOT (apply append (map …)):
+                  ;; `map` here is jolt's LAZY map, and the per-ns emit lambdas
+                  ;; carry side effects — analysis, cell/gensym allocation,
+                  ;; direct-link-defined registration — whose realization order
+                  ;; under apply/append is not the list order, so an entry-ns
+                  ;; lambda could run before a dependency's (var-routed calls,
+                  ;; out-of-order cells). The named let runs strictly in
+                  ;; `ordered` order (deps first), matching the loader.
+                  (let ((core-records (dce-blob-records "host/chez/seed/prelude.ss"))
+                        (app-records
+                          (let ((per-ns '()))
+                            (let loopfe ((rest ordered))
+                              (unless (null? rest)
+                                (let* ((nf (car rest))
+                                       (src (ei-timed "emit: read source"
+                                              (lambda () (ldr-read-source (cdr nf)))))
+                                       (profile-form
+                                         (bld-startup-profile-form
+                                           (string-append "namespace " (car nf)))))
+                                  (jolt-enter-file! (cdr nf))   ; name the file on a failure
+                                  (parameterize ((rdr-source-file (cdr nf)))
+                                    ;; RT.load-parity bracket (dyn-binding.ss): the
+                                    ;; ns's replayed forms run under fresh
+                                    ;; *warn-on-reflection*/*assert* bindings.
+                                    (set! per-ns
+                                      (cons (append
+                                              (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
+                                              (map (lambda (s) (dce-rec #t #f '() s))
+                                                   (ei-timed "emit: ns-prelude"
+                                                     (lambda () (bld-ns-prelude (car nf) src))))
+                                              (ei-timed "emit: per-ns total"
+                                                (lambda () (ei-emit-ns-records (car nf) src)))
+                                              (list
+                                                (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
+                                                (dce-rec #t #f '() profile-form)))
+                                            per-ns)))
+                                (loopfe (cdr rest))))
+                            (apply append (reverse per-ns)))))
+                        (entry-main (string-append entry-ns "/-main")))
+                    (if tree-shake?
+                        (dce-shake core-records app-records entry-main allow-dynamic)
+                        (values #f
+                                (map dce-rec-str app-records)
+                                (not (dce-needs-compiler? core-records app-records
+                                                          entry-main allow-dynamic)))))))
               (lambda ()
                 (set-optimize! #f)
-                (set-release! #f)
                 (set-direct-link-flag! #f)
                 ((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
                 ((var-deref "jolt.backend-scheme" "set-source-reg!") #f)
@@ -1237,26 +1641,33 @@
              (boot     (string-append builddir "/jolt.boot"))
              (boot-h   (string-append builddir "/boot_data.h"))
              (main-c   (string-append builddir "/main.c"))
-             ;; Emit the runtime half to its own file when it is app-independent,
-             ;; so its compile can be cached (bld-compile-runtime!). Tree-shaking
-             ;; rewrites the prelude per app (core-strs), and the cc / cross /
-             ;; library paths compile a single file in a spawned Chez, so all of
-             ;; those keep the one-file form. JOLT_NO_FLAT_SPLIT=1 forces the
-             ;; one-file form everywhere — an escape hatch for telling a build
-             ;; problem caused by the split apart from one merely revealed by it.
-             (split? (and (jolt-embedded-bytes "stub/launcher")
-                          (not library?) (not (bld-cross?)) (not core-strs)
-                          (not (getenv "JOLT_NO_FLAT_SPLIT")))))
+             ;; Emit the runtime half to its own file, always: it compiles under
+             ;; its own Chez parameters (bld-runtime-chez-params — no inspector
+             ;; information, which is 57% of a release binary and nothing the
+             ;; runtime's frames ever read), and when it is app-independent its
+             ;; fasl is cached (bld-compile-runtime!). A shaken core (core-strs)
+             ;; is per-app, so that unit skips the cache but is still the runtime
+             ;; unit; the cc / cross / library paths compile both files in their
+             ;; spawned Chez. JOLT_NO_FLAT_SPLIT=1 forces the one-file form
+             ;; everywhere — an escape hatch for telling a build problem caused
+             ;; by the split apart from one merely revealed by it — and the one
+             ;; file then compiles under the app half's parameters.
+             (split? (not (getenv "JOLT_NO_FLAT_SPLIT")))
+             (units (cond ((not split?) (list (list flat-ss flat-so 'whole)))
+                          (core-strs (list (list rt-ss rt-so 'runtime-shaken)
+                                           (list flat-ss flat-so 'app)))
+                          (else (list (list rt-ss rt-so 'runtime)
+                                      (list flat-ss flat-so 'app))))))
         (bld-mkdir-p builddir)
         ;; 3. flat source = runtime + app + launcher. When split, runtime.ss holds
         ;; the runtime half and flat.ss holds everything the app contributes; the
         ;; two are compiled separately and loaded into the boot in that order.
         (when split?
           (let ((out (open-output-file rt-ss 'replace)))
-            ;; The mode rides in the content so each mode keys its own cache entry:
-            ;; the text is mode-independent but the fasl is NOT — the Chez compile
-            ;; parameters (inspector info, fasl compression) differ by mode.
-            (put-string out (string-append ";; jolt runtime half — mode: " mode "\n"))
+            ;; No mode in the content: the runtime half compiles under ONE fixed
+            ;; parameter profile whatever the mode (bld-runtime-chez-params), so
+            ;; release, --opt and --dev share a single cache entry.
+            (put-string out ";; jolt runtime half\n")
             (bld-emit-runtime out drop-compiler? core-strs)
             (close-port out)))
         (let ((out (open-output-file flat-ss 'replace)))
@@ -1296,9 +1707,14 @@
           (for-each (lambda (p) (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n")))
                     ordered)
           (bld-emit-startup-profile-mark! out "app namespace registration")
-          (put-string out "\n;; === app ===\n")
-          (bld-emit-startup-profile-mark! out "app namespaces begin")
-          (for-each (lambda (s) (put-string out s) (put-string out "\n")) app-strs)
+          ;; The app's forms are DECLARED here and RUN from the launcher — see
+          ;; bld-defer-app-strs. The profile mark rides along into the init body,
+          ;; so "app namespaces begin" still brackets the work rather than the
+          ;; declarations.
+          (put-string out "\n;; === app (declarations; the bodies run at scheme-start) ===\n")
+          (let-values (((decls bodies) (bld-defer-app-strs app-strs)))
+            (for-each (lambda (s) (put-string out s) (put-string out "\n")) decls)
+            (bld-emit-app-init out (cons (bld-startup-profile-form "app namespaces begin") bodies)))
           ;; The launcher runs as Chez's scheme-start (so argv reaches -main —
           ;; top-level boot forms run during heap build, before args are set), and
           ;; suppresses the interactive greeting. It resets source roots to the
@@ -1314,7 +1730,12 @@
               "(sa-gc-trip-bytes!\n"
               "  (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))\n"
               "        (default (* 16 1024 1024)))\n"
-              "    (if trip (or (string->number trip) default) default)))\n"))
+              "    (if trip (or (string->number trip) default) default)))\n"
+              ;; and a heap ceiling, so a built app fails with an
+              ;; OutOfMemoryError carrying a stack rather than being SIGKILLed
+              ;; by the kernel with nothing to read. Same contract as jolt's own
+              ;; launcher and as the JVM's MaxRAMPercentage default.
+              "(jolt-install-heap-ceiling!)\n"))
           (put-string out "(scheme-start\n  (lambda args\n")
           (bld-emit-startup-profile-mark! out "scheme-start begin")
           ;; Shutdown hooks (`:shutdown` on a jolt.process, jolt.host/
@@ -1334,6 +1755,13 @@
             (string-append
               "    (guard (v (#t (jolt-report-throwable v (current-error-port))"
               (if library? " 1))\n" " (exit 1)))\n")))
+          ;; The app's own top-level forms, first thing inside the guard: past
+          ;; Sbuild_heap (so a thread they spawn can actually run) but still
+          ;; before the optional natives and the runtime source-root reset, which
+          ;; is the order they ran in when they lived in the boot file. Being
+          ;; inside the guard is a bonus — a throw from an app top-level form used
+          ;; to escape as Chez's opaque dump, and now reports like any other.
+          (put-string out "      (jolt-app-init!)\n")
           (bld-emit-natives out natives 'optional)
            (put-string out (string-append
                               "      (let ((base (or (getenv \"JOLT_PWD\") \".\")))\n"
@@ -1371,6 +1799,9 @@
                             "              (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
                             "                " (bld-startup-profile-form "entry -main") "\n"
                             "                jolt-main-result))))))\n"
+                            ;; as the CLI: a non-daemon Thread the program started
+                            ;; keeps the process alive until it finishes
+                            "    (jolt-await-user-threads!)\n"
                             "    (exit 0)))\n")))
           (close-port out))
         (ei-mark! "write flat.ss")
@@ -1384,34 +1815,26 @@
         ;;    make-boot-file, then xxd the boot into a C array and cc-link against
         ;;    libkernel.a. Kept so `make buildsmoke` still exercises the cc path.
         (cond
-          ;; cross-compiling (--target) always takes the spawn/cc path: the
+          ;; Cross-compiling (--target) always takes a spawned cc path: the
           ;; self-contained in-process compile can't load a target xpatch, and the
           ;; xpatch retargets make-boot-file for the whole spawned process.
+          ((and (bld-cross?) library?)
+           (build-shared entry-ns out-path mode builddir units boot boot-h ""))
           ((bld-cross?)
-           (when library?
-             (error 'jolt-build "cross build (--target) does not support --library yet"))
-           (when (> (string-length (bld-native-link-flags natives)) 0)
-             (error 'jolt-build
-               "cross build (--target) does not support :jolt/native archives yet (they need per-target-arch archives)"))
-           (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c
+           (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
                           "" (and drop-compiler? (not (bld-tgt-nt?)))))
           (library?
-           (build-shared entry-ns out-path mode builddir flat-ss flat-so boot boot-h
+           (build-shared entry-ns out-path mode builddir units boot boot-h
                          (bld-native-link-flags natives)))
           ;; petite-only is POSIX-only: on Windows jolt-foreign-proc-safe still
           ;; evals its foreign-procedure forms (fasl relocations abort the boot
           ;; there), and eval needs the compiler boot resident.
           ((jolt-embedded-bytes "stub/launcher")
-           (build-self-contained entry-ns out-path mode builddir
-                                 (if split?
-                                     (list (list rt-ss rt-so 'runtime)
-                                           (list flat-ss flat-so 'app))
-                                     (list (list flat-ss flat-so 'whole)))
-                                 boot
+           (build-self-contained entry-ns out-path mode builddir units boot
                                  (bld-native-link-flags natives)
                                  (and drop-compiler? (not bld-nt?))))
           (else
-           (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c
+           (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
                           (bld-native-link-flags natives)
                           (and drop-compiler? (not bld-nt?)))))))))))
 
@@ -1483,13 +1906,19 @@
                       "(define jolt-baked-runtime-fingerprint " (ei-str-lit fp) ")\n"))
     (close-port out)))
 
-;; Per-mode Chez compile parameters for app binaries. Mirrors the pattern in
-;; build-jolt.ss (optimize-level 2, fasl-compressed #t for release/optimized).
-;; "release" keeps inspector + proc-source ON so Clojure backtraces (via
-;; inspect/object walking the continuation) survive. "optimized" turns them OFF
-;; for max speed. "dev" has no entry (Chez defaults: optimize-level 2, inspector
-;; ON, proc-source ON, fasl uncompressed — full debuggability). Single table
-;; referenced by both the prologue-string builder and the parameterize block.
+;; Per-mode Chez compile parameters for the APP half of a binary (the app and
+;; its libraries). "release" keeps inspector + proc-source information ON:
+;; Chez records a frame's return-point source only as inspector information,
+;; and the reporter resolves that offset through the marker table to recover
+;; the spliced chain a frame sits in and the exact line — the `step-boom` /
+;; `app.util/inner-boom` frames the build smoke's --innerfn case pins vanish
+;; without it (both parameters off, AND proc-source alone: it does not cover
+;; return points). "optimized" turns them OFF for the smallest, fastest app
+;; half; "dev" has no entry (Chez defaults: optimize-level 2, inspector ON,
+;; proc-source ON, fasl uncompressed — full debuggability). Single table
+;; referenced by both the script-string builder and the in-process compile.
+;;
+;; The RUNTIME half never uses this table — see bld-runtime-chez-params.
 ;;
 ;; optimize-level 2, not 3: level 3 is Chez's UNSAFE mode — fx/fl/car/vector
 ;; ops skip their type checks, and jolt's error semantics depend on those
@@ -1505,32 +1934,83 @@
                  (generate-procedure-source-information #t)
                  (fasl-compressed #t))))
 
-(define (bld-chez-param-forms mode)
-  (let ((params (assoc mode bld-chez-params)))
-    (if params
-        (fold-left
-          (lambda (s p) (string-append s "(" (symbol->string (car p)) " "
-                                      (let ((v (cadr p)))
-                                        (cond ((boolean? v) (if v "#t" "#f"))
-                                              ((number? v) (number->string v))
-                                              (else (format "~s" v))))
-                                      ")\n"))
-          "" (cdr params))
-        "")))
+;; The RUNTIME half's parameters — rt.ss, the clojure.core prelude, the
+;; compiler image, the loader — one profile whatever the mode, and the same
+;; one jolt's own binary is built with (build-jolt.ss, release): no inspector
+;; information, no procedure-source information. Nothing reads them there: a
+;; runtime frame prints by its code name (na-chunk-map-first, map-seq, dorun),
+;; which Chez keeps either way; core is minted without splicing, so it has no
+;; inline chains to recover; and the image writer learns a core closure's
+;; capture layout from its maker, not from inspector names. What they cost
+;; was the whole of burinc/jolt#3: with the release row's parameters over the
+;; runtime half too, a hello-world binary measured 27.25MB, 110ms to start and
+;; 225MB resident, against 11.68MB / 70ms / 132MB with them off — inspector
+;; information was 57% of the bytes, and the `Sbuild_heap` phase that scales
+;; with the image (90MB → 48MB of heap once decompressed) 106ms → 44ms.
+;; build-smoke pins the runtime half byte-identical across release and --opt,
+;; so the profile cannot quietly drift back to per-mode.
+(define bld-runtime-chez-params
+  '((optimize-level 2)
+    (generate-inspector-information #f)
+    (generate-procedure-source-information #f)
+    (fasl-compressed #t)))
 
-;; Compile one flat source file under the mode's Chez parameters. The mode->params
-;; table stays as jolt build policy; this is a thin translation of those params
-;; into the target-neutral profile sa-compile-file consumes.
-(define (bld-chez-compile-file mode src so)
-  (let ((params (assoc mode bld-chez-params)))
+;; PARAMS as `(name value)` binding text — the body of a parameterize, or one
+;; form per line when SEP is a newline.
+(define (bld-params-bindings params sep)
+  (fold-left
+    (lambda (acc p)
+      (string-append acc (if (string=? acc "") "" sep)
+                     "(" (symbol->string (car p)) " "
+                     (let ((v (cadr p)))
+                       (cond ((boolean? v) (if v "#t" "#f"))
+                             ((number? v) (number->string v))
+                             (else (format "~s" v))))
+                     ")"))
+    "" params))
+
+;; The app half's parameters for MODE, or #f for a mode with no row (dev).
+(define (bld-mode-params mode)
+  (let ((row (assoc mode bld-chez-params))) (and row (cdr row))))
+
+;; A `(compile-file SRC SO)` form for a spawned Chez, under PARAMS when given.
+(define (bld-compile-file-form params src so)
+  (let ((cf (string-append "(compile-file " (ei-str-lit src) " " (ei-str-lit so) ")")))
     (if params
-        (let ((pv (lambda (k) (cadr (assq k (cdr params))))))
-          (sa-compile-file src so
-            `((optimize . ,(pv 'optimize-level))
-              (inspector-info . ,(pv 'generate-inspector-information))
-              (source-info . ,(pv 'generate-procedure-source-information))
-              (compressed . ,(pv 'fasl-compressed)))))
-        (sa-compile-file src so #f))))
+        (string-append "(parameterize (" (bld-params-bindings params " ") ")\n  " cf ")\n")
+        (string-append cf "\n"))))
+
+;; The compile forms for UNITS in a spawned Chez: the runtime unit under the
+;; runtime profile, the app (or one-file) unit under the mode's row.
+(define (bld-units-compile-forms units mode)
+  (fold-left
+    (lambda (acc u)
+      (string-append acc
+        (bld-compile-file-form
+          (if (memq (caddr u) '(runtime runtime-shaken)) bld-runtime-chez-params (bld-mode-params mode))
+          (car u) (cadr u))))
+    "" units))
+
+;; Every unit's object file, quoted, in load order — the make-boot-file tail.
+(define (bld-units-so-args units)
+  (fold-left (lambda (acc u) (string-append acc "  " (ei-str-lit (cadr u)) "\n")) "" units))
+
+;; Compile SRC to SO in this process under PARAMS (an alist as above), by
+;; translating the parameter names into the target-neutral profile
+;; sa-compile-file consumes; #f = the target's defaults.
+(define (bld-chez-compile-params! params src so)
+  (if params
+      (let ((pv (lambda (k) (cadr (assq k params)))))
+        (sa-compile-file src so
+          `((optimize . ,(pv 'optimize-level))
+            (inspector-info . ,(pv 'generate-inspector-information))
+            (source-info . ,(pv 'generate-procedure-source-information))
+            (compressed . ,(pv 'fasl-compressed)))))
+      (sa-compile-file src so #f)))
+
+;; Compile one app-half (or one-file) source under MODE's row.
+(define (bld-chez-compile-file mode src so)
+  (bld-chez-compile-params! (bld-mode-params mode) src so))
 
 ;; --- runtime-half fasl cache -------------------------------------------------
 ;; The runtime half of the flat source (rt.ss + the clojure.core prelude +
@@ -1559,10 +2039,23 @@
         (not (or (string=? e "0") (string-ci=? e "false")
                  (string-ci=? e "no") (string-ci=? e "off")))
         #t)))
-(define (bld-runtime-cache-path body mode)
-  (string-append (bld-runtime-cache-dir) "/runtime-" mode "-"
-                 (number->string (string-length body) 16) "-"
-                 (number->string (aot-content-hash body) 16) ".so"))
+;; Keyed on the source AND the Chez parameters it compiles under
+;; (bld-runtime-chez-params): the parameters are what decide the fasl's
+;; bytes. Keyed on the mode's name alone, as this was, the day the runtime
+;; half stopped generating inspector information every build on a machine
+;; that had built before kept serving the old 22MB fasl under the new policy
+;; — the same source, the same word "release", a different compile — and the
+;; binary did not shrink until the cache was cleared by hand.
+;; …and on the Chez that compiles it: a fasl is specific to the kernel's version
+;; and host (the machine-type tag, through the adapter), and two jolt binaries
+;; with different bundled kernels share this directory. Identical source text
+;; under a newer kernel must miss.
+(define (bld-runtime-cache-path body)
+  (let ((keyed (string-append (scheme-version) " " (sa-host-tag) "\n"
+                              (bld-params-bindings bld-runtime-chez-params "\n") body)))
+    (string-append (bld-runtime-cache-dir) "/runtime-"
+                   (number->string (string-length body) 16) "-"
+                   (number->string (aot-content-hash keyed) 16) ".so")))
 ;; Keep the newest few entries. One accumulates per jolt build × mode, so a
 ;; developer re-minting often would otherwise grow this without bound.
 (define bld-runtime-cache-keep 8)
@@ -1596,10 +2089,12 @@
       (put-bytevector out bs)
       (close-port out))))
 
-;; Compile the runtime half, reusing a cached fasl when one matches.
-(define (bld-compile-runtime! mode src so)
+;; Compile the runtime half under the runtime profile, reusing a cached fasl
+;; when one matches. CACHE? is #f for a shaken core: its text is per-app, so a
+;; hit is impossible and a store would only churn the cache.
+(define (bld-compile-runtime! src so cache?)
   (let* ((body (read-file-string src))
-         (cache (and (bld-runtime-cache-enabled?) (bld-runtime-cache-path body mode))))
+         (cache (and cache? (bld-runtime-cache-enabled?) (bld-runtime-cache-path body))))
     (if (and cache (file-exists? cache))
         (begin
           (bld-copy-file! cache so)
@@ -1607,7 +2102,7 @@
         (begin
           (bld-prepend-prologue! src)
           (ei-mark! "kernel prologue + hash")
-          (bld-chez-compile-file mode src so)
+          (bld-chez-compile-params! bld-runtime-chez-params src so)
           (ei-mark! "compile runtime half")
           (when cache
             (guard (e (#t #f))          ; an unwritable cache must not fail the build
@@ -1615,10 +2110,273 @@
               (bld-copy-file! so cache)
               (bld-prune-runtime-cache!)))))))
 
+;; --- how the boot image is encoded: --boot (jolt-lang/jolt#886) -------------
+;; Three points on one curve, and the flag is ordered along it:
+;;
+;;   'fast    vfasl + LZ4   the default — the fastest start, the largest binary
+;;   'small   vfasl + gzip  still an image, but a third smaller than a PLAIN boot
+;;                          and still faster to start than one
+;;   'plain   no vfasl      the fasl stream 0.8.4 produced (`--no-vfasl`)
+;;
+;; A vfasl boot is an image of the loaded heap, so it starts fast and takes room;
+;; that cost is what jolt#886 hit, an iOS `--target tpb64l` build growing 7.6MB in
+;; the binary and ~5MB in the IPA. But the cost turns out to be mostly the
+;; CODEC's, not vfasl's. Measured over two apps and two machine types, binary
+;; size and warm start against the plain boot as the baseline:
+;;
+;;   hello, host ta6le        plain 25,919,203/495ms  lz4 +5.5%/249ms  gzip -35.7%/429ms
+;;   build-app, host ta6le    plain 26,062,746/502ms  lz4 +5.8%/250ms  gzip -35.5%/434ms
+;;   hello, target tpb64l     plain 24,873,035        lz4 +5.8%        gzip -38.1%
+;;
+;; So for a jolt app 'small beats 'plain on BOTH axes and 'plain is a floor
+;; nobody should want — which is why it stays available (a target that cannot
+;; vfasl at all still needs it) but is not what the size-conscious build should
+;; reach for. The ratios are a property of what is in the image, not of the
+;; machine: the same three encodings over Chez's own boots, which carry no jolt
+;; runtime, cost lz4 +37% and gain gzip only 3-4%, with gzip SLOWER than plain.
+;; Anything user-facing has to say measure your own app, not quote one ratio.
+;;
+;; The mode is resolved once, in jolt.main (CLI flag > deps.edn > JOLT_BOOT /
+;; JOLT_NO_VFASL > default) and passed down; nothing here re-reads the
+;; environment, so there is one precedence rule rather than two.
+(define bld-boot-mode (make-parameter 'fast))
+
+(define (bld-vfasl-disabled?) (eq? (bld-boot-mode) 'plain))
+
+;; --- the boot image's LZ4 ceiling -------------------------------------------
+;; A big enough compressed fasl entry cannot be read back by the Chez kernel when
+;; the entry is LZ4. c/new-io.c's S_bytevector_uncompress returns the
+;; decompressed length as `Sfixnum(r)` with `int r`, and Sfixnum is
+;; `((ptr)(uptr)((x)*8))` — the multiply happens in the argument's own type, so
+;; the product leaves 32 bits and the length check in c/fasl.c can never match.
+;; The load then dies inside Sbuild_heap with "uncompressed size N ... is smaller
+;; than expected size M", before a line of the binary's own code has run. The
+;; gzip arm of the same function hands zlib a uLong and has no such ceiling.
+;;
+;; WHERE the line falls is undefined behaviour, and it is not the same on every
+;; platform, because what the widening cast does with the top bit of an overflowed
+;; `int` is the C compiler's business. Both of these are Chez 10.4.1
+;; (test/chez/vfasl-ceiling-test.ss measures whichever one is in front of it):
+;;
+;;   sign-extended   a NEGATIVE length at 2^28    ceiling 2^28   ta6le, and the
+;;                   platform in jolt-lang/jolt#886 — its -222298112 is exactly
+;;                   314572800*8 wrapped to signed 32-bit and divided back by 8
+;;   zero-extended   a length of 0 at 2^29        ceiling 2^29   tarm64osx
+;;
+;; 2^28 is therefore jolt's FLOOR, not a measurement of the machine: at or below
+;; every ceiling seen, so nothing it leaves on LZ4 can fail to load. On a
+;; zero-extending platform an image between 2^28 and 2^29 is re-encoded when it
+;; did not have to be, which costs decompression speed and nothing else. That is
+;; the direction to be wrong in, and it is why nothing user-facing quotes a size.
+;;
+;; It is 0.8.5's vfasl boot that can reach the ceiling at all. A plain boot is
+;; one compressed entry per top-level form and its entries are kilobytes;
+;; vfasl-convert-file combines each input boot file into ONE entry, so the app
+;; half of a large program is a single image — jolt's own is 43MB, and a program
+;; six times that size stops booting rather than merely booting slowly.
+;;
+;; jolt cannot fix the kernel it links against (an installed Chez is the user's),
+;; so it keeps the image off the ceiling instead: measure the converted boot and
+;; re-encode with gzip when an LZ4 entry is over. Only the oversized build pays
+;; gzip's slower decompression, and it pays it in exchange for booting at all.
+;;
+;; A parameter rather than a constant for one reason: the fallback below is code
+;; that runs only for images no gate can afford to build, and that is exactly the
+;; code that rots. test/chez/vfasl-ceiling-test.ss lowers the ceiling and drives
+;; the whole path against a boot it can build in a second. Nothing in a build
+;; moves it.
+(define bld-lz4-image-ceiling (make-parameter (expt 2 28)))
+
+;; The largest uncompressed size any LZ4 entry of the boot file PATH declares, or
+;; 0 when it has none. #f when the bytes do not parse as the framing below, which
+;; a caller reads as "leave this boot alone" — a Chez whose fasl layout moved is
+;; not something to guess at.
+;;
+;; Framing, from ChezScheme s/strip.ss (read-entry) and c/fasl.c:
+;;   header entry  0 <7 more header bytes> <uptr version> <uptr machine> ( … )
+;;   object entry  <situation 35|36|37> <uptr size> <u8 codec> <u8 kind>
+;;                 codec 45 gzip / 46 lz4: <uptr uncompressed-size> <payload>
+;;                 codec 44 uncompressed:  <payload>
+;;                 SIZE counts the codec and kind bytes and everything after.
+;;   terminator    127
+;; A boot holds several headers — the one emit-boot-header writes, then the one
+;; each input boot carried — so a header is a thing to skip, not an end.
+(define (bld-boot-max-lz4-entry path)
+  (define (u8 p)
+    (let ((b (get-u8 p)))
+      (if (eof-object? b) (error 'bld-boot-max-lz4-entry "eof in boot file" path) b)))
+  ;; -> (values value bytes-read), the shape the SIZE arithmetic needs
+  (define (uptr p)
+    (let loop ((k (u8 p)) (n 0) (c 1))
+      (let ((n (+ (* n 128) (bitwise-and k #x7f))))
+        (if (= 0 (bitwise-and k #x80))
+            (values n c)
+            (loop (u8 p) n (+ c 1))))))
+  (define (skip-header! p)               ; the leading 0 is already consumed
+    (let loop ((i 1)) (when (< i 8) (u8 p) (loop (+ i 1))))
+    (uptr p)                             ; version
+    (uptr p)                             ; machine type
+    (u8 p)                               ; #\(
+    (let loop () (unless (= (u8 p) 41) (loop))))          ; through #\)
+  (define (skip! p n)
+    (when (< n 0) (error 'bld-boot-max-lz4-entry "negative entry size" path))
+    (set-port-position! p (+ (port-position p) n)))
+  (guard (e (#t #f))
+    (let ((p (open-file-input-port path)))
+      (guard (e (#t (close-port p) (raise e)))
+        (let loop ((biggest 0))
+          (let ((b (get-u8 p)))
+            (cond
+              ((eof-object? b) (close-port p) biggest)
+              ((= b 0) (skip-header! p) (loop biggest))          ; another header
+              ((= b 127) (loop biggest))                         ; terminator
+              ((or (= b 35) (= b 36) (= b 37))                   ; visit/revisit/both
+               (let-values (((size size-bytes) (uptr p)))
+                 (let ((codec (u8 p)))
+                   (u8 p)                                        ; kind: fasl|vfasl
+                   (cond
+                     ((or (= codec 45) (= codec 46))
+                      (let-values (((raw raw-bytes) (uptr p)))
+                        (skip! p (- size 2 raw-bytes))
+                        (loop (if (and (= codec 46) (> raw biggest)) raw biggest))))
+                     ((= codec 44)
+                      (skip! p (- size 2))
+                      (loop biggest))
+                     (else (error 'bld-boot-max-lz4-entry "unknown fasl codec" codec))))))
+              (else (error 'bld-boot-max-lz4-entry "unknown fasl entry type" b)))))))))
+
+;; Does BOOT hold an LZ4 entry the kernel could not read back? #f for a boot that
+;; does not parse: the status quo already works for every image under the
+;; ceiling, and re-encoding on a guess would be the riskier answer. It says so
+;; out loud, though — a silent "could not check" is how this bug would come back
+;; wearing the same unreadable Sbuild_heap death it wore the first time.
+(define (bld-boot-over-lz4-ceiling? boot)
+  (let ((biggest (bld-boot-max-lz4-entry boot)))
+    (cond ((not biggest) (bld-note-unscannable-boot! boot) #f)
+          (else (>= biggest (bld-lz4-image-ceiling))))))
+
+;; "at or over" rather than a size: where the kernel actually gives out is
+;; undefined behaviour and moves by platform (2^28 or 2^29 — see
+;; bld-lz4-image-ceiling), so the number jolt acts on is its own floor, not a
+;; property of the machine, and quoting it as one would be wrong.
+(define (bld-note-wide-boot!)
+  (display (string-append
+             "jolt build: note — the boot image is at or over Chez's "
+             "LZ4 fasl ceiling;\n"
+             "  re-encoding it with gzip (slower to decompress, but it loads)\n")))
+
+(define (bld-note-retry-wide!)
+  (display (string-append
+             "jolt build: note — the boot image could not be written as an LZ4 "
+             "vfasl entry;\n  retrying with gzip\n")))
+
+(define (bld-note-no-vfasl!)
+  (display (string-append
+             "jolt build: note — the boot could not be converted to a vfasl "
+             "image;\n  keeping the plain boot (slower to start, same "
+             "behaviour)\n")))
+
+(define (bld-note-unscannable-boot! boot)
+  (display (string-append
+             "jolt build: note — could not read the fasl entry headers of "
+             boot ";\n  leaving its codec alone. If a large binary dies in "
+             "Sbuild_heap reporting an\n  \"uncompressed size\", this is the "
+             "check that stopped covering it.\n")))
+
+;; Convert BOOT to vfasl at VBOOT in this process, answering whether VBOOT is
+;; usable. LZ4 first — it is the fast default and what every normal image wants —
+;; then gzip if the image cleared the ceiling. The second arm also covers the
+;; conversion FAILING outright, which is what an image whose COMPRESSED half
+;; clears the ceiling does: $bytevector-compress reports its length through the
+;; same overflowing Sfixnum, so the write end raises long before the read end
+;; would have.
+(define (bld-vfasl-convert! boot vboot)
+  (if (eq? (bld-boot-mode) 'small)
+      (sa-vfasl-convert-file boot vboot 'wide)   ; asked for gzip; no ceiling to hit
+      (if (and (sa-vfasl-convert-file boot vboot)
+               (not (bld-boot-over-lz4-ceiling? vboot)))
+          #t
+          (and (sa-vfasl-convert-file boot vboot 'wide)
+               (begin (bld-note-wide-boot!) #t)))))
+
+;; The conversion as a form for the fresh-Chez compile scripts, empty under
+;; 'plain. 'small sets the codec in that process the way sa-vfasl-convert-file's
+;; 'wide does in this one.
+;;
+;; GUARDED, and it removes a half-written VBOOT on the way out. Those scripts run
+;; under bld-system, which turns a non-zero exit into a dead build — so an
+;; unguarded conversion means a target that cannot vfasl, or an image too big to
+;; write as one entry, takes the whole build down instead of degrading to the
+;; plain boot the way the in-process path does. bld-vfasl-ensure! reads the
+;; presence of VBOOT as the verdict.
+(define (bld-vfasl-script-form boot vboot)
+  (if (bld-vfasl-disabled?)
+      ""
+      (string-append
+        (if (eq? (bld-boot-mode) 'small) "(compress-format 'gzip)\n" "")
+        "(guard (e (#t (when (file-exists? " (ei-str-lit vboot) ")\n"
+        "                (delete-file " (ei-str-lit vboot) "))))\n"
+        "  (vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '()))\n")))
+
+;; One conversion in a fresh Chez, guarded the same way, leaving VBOOT present
+;; only if it worked. CODEC is 'wide for gzip, anything else for the default.
+(define (bld-vfasl-run-convert! builddir boot vboot codec)
+  (when (file-exists? vboot) (delete-file vboot))
+  (let ((cs (string-append builddir "/vfasl-convert.ss")))
+    (let ((p (open-output-file cs 'replace)))
+      (put-string p
+        (string-append
+          "(import (chezscheme))\n"
+          (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
+          (if (eq? codec 'wide) "(compress-format 'gzip)\n" "")
+          "(guard (e (#t (when (file-exists? " (ei-str-lit vboot) ")\n"
+          "                (delete-file " (ei-str-lit vboot) "))))\n"
+          "  (vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '()))\n"))
+      (close-port p))
+    (bld-system (string-append bld-chez " --script '" cs "'"))))
+
+;; The fresh-Chez counterpart of bld-vfasl-convert!, and the same contract:
+;; answer whether VBOOT is usable, never raise for a boot that simply could not
+;; be imaged. The paths that convert inside their compile script (build-with-cc,
+;; build-shared, and so every cross build) have to convert there — $fasl-to-vfasl
+;; lays an image out for one machine, and a cross build needs the xpatch's
+;; constants — so by the time we get here the attempt has already been made and
+;; this only has to grade it:
+;;
+;;   nothing produced   the script's conversion raised. Retry under gzip, which
+;;                      is also the arm for an image whose COMPRESSED half
+;;                      clears the ceiling. Still nothing: keep the plain boot.
+;;   over the ceiling   re-encode with gzip, as bld-vfasl-convert! does.
+;;   otherwise          the LZ4 image stands.
+(define (bld-vfasl-ensure! builddir boot vboot)
+  (cond
+    ((not (file-exists? vboot))
+     (bld-note-retry-wide!)
+     (bld-vfasl-run-convert! builddir boot vboot 'wide)
+     (cond ((file-exists? vboot) #t)
+           (else (bld-note-no-vfasl!) #f)))
+    ((bld-boot-over-lz4-ceiling? vboot)
+     (bld-note-wide-boot!)
+     (bld-vfasl-run-convert! builddir boot vboot 'wide)
+     (cond ((file-exists? vboot) #t)
+           (else (bld-note-no-vfasl!) #f)))
+    (else #t)))
+
+;; jolt's OWN boot (build-jolt.ss), whose conversion is not guarded: a jolt build
+;; that cannot image its boot is a broken toolchain, not a user's app degrading,
+;; so this raises rather than quietly shipping a plain boot.
+(define (bld-vfasl-regzip! builddir boot vboot)
+  (when (bld-boot-over-lz4-ceiling? vboot)
+    (bld-note-wide-boot!)
+    (bld-vfasl-run-convert! builddir boot vboot 'wide)
+    (unless (file-exists? vboot)
+      (error 'jolt-build "gzip re-encode of the boot image failed" vboot))))
+
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
 ;;   'whole   — one unsplit flat file: kernel prologue + baked fingerprint, no cache
 ;;   'runtime — the app-independent half: same, plus the fasl cache
+;;   'runtime-shaken — the same half with a tree-shaken core: per-app, no cache
 ;;   'app     — the app half: compiled plain. It needs no kernel prologue (its
 ;;              defines are jv$-munged and so cannot shadow a Chez name) and no
 ;;              fingerprint (the runtime unit carries the one that identifies it).
@@ -1632,7 +2390,8 @@
       (lambda (u)
         (let ((src (car u)) (so (cadr u)) (kind (caddr u)))
           (case kind
-            ((runtime) (bld-compile-runtime! mode src so))
+            ((runtime) (bld-compile-runtime! src so #t))
+            ((runtime-shaken) (bld-compile-runtime! src so #f))
             ((app)
              (bld-chez-compile-file mode src so)
              (ei-mark! "compile app half"))
@@ -1653,6 +2412,23 @@
               (if petite-only? '() (list scheme))
               (map cadr units)))
     (ei-mark! "make-boot-file")
+    ;; vfasl: the same win jolt's own boot gets (build-jolt.ss) — the kernel loads
+    ;; a prebuilt image straight into the static generation instead of walking a
+    ;; fasl stream and allocating, and Sbuild_heap's Scompact_heap then has far
+    ;; less to compact. Best effort: sa-vfasl-convert-file answers #f rather than
+    ;; raising, and the plain boot that is already on disk stays the payload.
+    ;;
+    ;; NOT when cross-compiling. Unlike build-with-cc and build-shared, which run
+    ;; their conversion inside the fresh-Chez compile script and so inherit the
+    ;; xpatch's retargeted constants, this one runs in THIS process — the host's.
+    ;; $fasl-to-vfasl lays the image out for a specific machine, so converting a
+    ;; target's boot with host constants would produce a broken binary. A cross
+    ;; build keeps the plain boot.
+    (unless (or (bld-cross?) (bld-vfasl-disabled?))
+      (let ((vboot (string-append boot ".vfasl")))
+        (when (bld-vfasl-convert! boot vboot)
+          (set! boot vboot)
+          (ei-mark! "vfasl-convert"))))
     ;; The stub is the native launcher the boot is appended to. With no :static
     ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
     ;; natives it's re-linked here from the bundled kernel + launcher source so the
@@ -1671,6 +2447,21 @@
                  "jolt build: note — on macOS this binary is unsigned; to share it,\n"
                  "  `xattr -d com.apple.quarantine " out-path "` on the target, or sign it.\n")))))
 
+;; Spill whichever bundled compression archives this binary carries into
+;; BUILDDIR, and answer them as bld-bundled-archives expects. Empty for a jolt
+;; built against a Chez that had none — bld-compression-lib then falls back and
+;; warns, exactly as it would on the dev machine.
+(define (bld-spill-bundled-archives builddir)
+  (fold-left
+    (lambda (acc lib)
+      (let ((name (string-append "lib" lib ".a")))
+        (if (jolt-embedded-bytes (string-append "csv/" name))
+            (let ((path (string-append builddir "/" name)))
+              (jolt-spill-embedded! (string-append "csv/" name) path)
+              (cons (cons lib path) acc))
+            acc)))
+    '() '("lz4" "z")))
+
 ;; Re-link the launcher stub with the app's static native archives baked in, to
 ;; OUT-PATH. The self-contained jolt bundles the Chez kernel (libkernel.a),
 ;; header, and launcher source; spill them and drive the system cc — the same link
@@ -1678,20 +2469,74 @@
 ;; (native-link) and, on Linux, -rdynamic so the baked-in symbols stay dlsym-
 ;; visible for (load-shared-object #f) + foreign-procedure at startup.
 (define (bld-relink-stub builddir native-link out-path)
-  (let ((h  (string-append builddir "/scheme.h"))
-        (lk (string-append builddir "/libkernel.a"))
-        (lc (string-append builddir "/launcher.c")))
+  (let* ((h  (string-append builddir "/scheme.h"))
+         (lk (string-append builddir "/libkernel.a"))
+         (lc (string-append builddir "/launcher.c"))
+         ;; The bundled lz4/zlib archives, spilled like the kernel: this link runs
+         ;; on a machine with no Chez install, so bld-static-archive has nowhere
+         ;; to look and the app would otherwise take whatever lz4 and zlib the
+         ;; machine happens to have — runtime dependencies the appended-stub path
+         ;; (the other 99% of builds) does not have, on a binary the user is
+         ;; about to ship. An archive is absent only when the jolt running this
+         ;; was itself built against a Chez that had none; then the link falls
+         ;; back to -l as it always did.
+         (archives (bld-spill-bundled-archives builddir)))
     (jolt-spill-embedded! "csv/scheme.h" h)
     (jolt-spill-embedded! "csv/libkernel.a" lk)
     (jolt-spill-embedded! "stub/launcher.c" lc)
     (display "jolt build: relinking launcher stub with static native libraries\n")
-    (bld-system (string-append
-      "cc -O2 " (bld-export-symbols-flag)
-      "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
-      native-link " " (bld-link-libs)))))
+    (parameterize ((bld-bundled-archives archives))
+      (bld-system (string-append
+        "cc -O2 " (bld-export-symbols-flag)
+        "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
+        native-link " " (bld-link-libs))))))
+
+;; --- boot-image prefetch (cold start) ---------------------------------------
+;; A binary that embeds its boot as a C array hands Chez a pointer into .data — a
+;; private, file-backed mapping the kernel demand-pages 4KB at a time as
+;; Sbuild_heap walks it — and nothing tells the kernel that the whole multi-MB
+;; range is about to be read in order. A cold jolt run reads 19.1MB of its 27.8MB
+;; binary before it prints anything, nearly all of it this boot. MADV_WILLNEED
+;; over the range, issued BEFORE Sscheme_init, lets that read overlap kernel init
+;; and the runtime image's top levels instead of being scheduled fault by fault
+;; behind them.
+;;
+;; It is a hint, and it buys nothing measurable on storage that is already
+;; bandwidth-bound — the A/B is in the commit that added this. What it targets is
+;; the opposite regime, a page-in bound by latency rather than throughput.
+;; Advisory in every sense: nothing checks the result, no platform has to
+;; implement it, and a failure costs the speedup and nothing else. Shared by the
+;; three C-array boot sites — jolt's own main (build-jolt.ss), `jolt build`'s cc
+;; executable, and --library. The appended-boot stub reads its boot through an fd
+;; rather than a mapping and carries the fadvise-shaped equivalent itself
+;; (stub/launcher.c).
+(define (bld-boot-prefetch-defn)
+  (string-append
+    "#include <stddef.h>\n"
+    "#if defined(__linux__) || defined(__APPLE__)\n"
+    "#include <stdint.h>\n"
+    "#include <sys/mman.h>\n"
+    "#include <unistd.h>\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) {\n"
+    "  long pagesize = sysconf(_SC_PAGESIZE);\n"
+    "  uintptr_t start, base;\n"
+    "  if (pagesize <= 0 || n == 0) return;\n"
+    "  /* madvise wants a page boundary; the array rarely starts on one. */\n"
+    "  start = (uintptr_t)p;\n"
+    "  base = start & ~(uintptr_t)(pagesize - 1);\n"
+    "  madvise((void *)base, n + (size_t)(start - base), MADV_WILLNEED);\n"
+    "}\n"
+    "#else\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) { (void)p; (void)n; }\n"
+    "#endif\n"))
+
+;; The call: the first statement of main / jolt_library_init, so the readahead is
+;; already in flight for everything that follows it.
+(define (bld-boot-prefetch-call)
+  "  jolt_prefetch_boot(jolt_boot, (size_t)jolt_boot_len);\n")
 
 ;; --- legacy cc link (dev bin/jolt): fresh Chez compile + xxd + cc ------------
-(define (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c native-link petite-only?)
+(define (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c native-link petite-only?)
   (display (string-append "jolt build: compiling " entry-ns " (" mode " mode)\n"))
   (let ((cs (string-append builddir "/compile.ss")))
     (let ((p (open-output-file cs 'replace)))
@@ -1702,18 +2547,33 @@
           ;; target machine (ChezScheme/BUILDING, "CROSS COMPILING SCHEME
           ;; PROGRAMS"); the boots below come from the target pack.
           (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
-          (bld-chez-param-forms mode)
-          "(compile-file " (ei-str-lit flat-ss) " " (ei-str-lit flat-so) ")\n"
+          ;; each unit under its own parameters (see build-self-contained): the
+          ;; runtime half without inspector information, the app half under the
+          ;; mode's row. No kernel prologue here — a fresh Chez has nothing of
+          ;; jolt's in its interaction environment to shadow a kernel name.
+          (bld-units-compile-forms units mode)
           ;; petite-only boot when the compiler image was dropped (see
-          ;; build-self-contained).
+          ;; build-self-contained). The unit fasls follow the Chez boots in the
+          ;; order they were compiled.
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
-          (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
+          (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n"
           (if petite-only?
               ""
-              (string-append (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "))
-          (ei-str-lit flat-so) ")\n"))
+              (string-append "  " (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n"))
+          (bld-units-so-args units) ")\n"
+          ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
+          ;; constants the way make-boot-file above does — see build-jolt.ss.
+          ;; --boot decides the codec, or omits the conversion (jolt#886).
+          (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  ;; the converted boot is what gets embedded
+  ;; …and only switch to it if one actually exists: bld-vfasl-ensure! answers #f
+  ;; for a target that could not be imaged at all, and the plain boot is then
+  ;; what gets embedded.
+  (unless (bld-vfasl-disabled?)
+    (when (bld-vfasl-ensure! builddir boot (string-append boot ".vfasl"))
+      (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
@@ -1723,7 +2583,9 @@
     (put-string mc
       (string-append
         "#include \"scheme.h\"\n#include \"boot_data.h\"\n"
+        (bld-boot-prefetch-defn)
         "int main(int argc, char *argv[]) {\n"
+        (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
         "  Sbuild_heap(0, 0);\n"
@@ -1759,6 +2621,7 @@
     "#include \"scheme.h\"\n"
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
+    (bld-boot-prefetch-defn)
     "/* jolt_set_lookup_addr is called from the built library's scheme-start\n"
     "   handler (registered via Sforeign_symbol after Sbuild_heap) to hand the\n"
     "   stub the Scheme lookup callable's address. */\n"
@@ -1767,6 +2630,7 @@
     "void* jolt_lookup(const char* name) { return jolt_lookup_fn ? jolt_lookup_fn(name) : 0; }\n"
     "int jolt_library_init(int argc, char** argv) {\n"
     "  if (!argv) argc = 0;  /* Sscheme_start reads argv[0..argc-1]; a NULL argv means no args */\n"
+    (bld-boot-prefetch-call)
     "  Sscheme_init(0);\n"
     "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
     "  Sbuild_heap(0, 0);\n"
@@ -1787,21 +2651,31 @@
     "        ((foreign-procedure \"jolt_set_lookup_addr\" (void*) void) lk-addr))\n"
     "      0)))\n"))
 
-(define (build-shared entry-ns out-path mode builddir flat-ss flat-so boot boot-h native-link)
+(define (build-shared entry-ns out-path mode builddir units boot boot-h native-link)
   (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, shared library)\n"))
   (let ((cs (string-append builddir "/compile.ss")))
     (let ((p (open-output-file cs 'replace)))
       (put-string p
         (string-append
           "(import (chezscheme))\n"
-          (bld-chez-param-forms mode)
-          "(compile-file " (ei-str-lit flat-ss) " " (ei-str-lit flat-so) ")\n"
+          ;; As in build-with-cc, loading the xpatch retargets compile-file and
+          ;; make-boot-file for the lifetime of this fresh Chez process.
+          (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
+          (bld-units-compile-forms units mode)
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
-          (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
-          (ei-str-lit flat-so) ")\n"))
+          (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n"
+          (bld-units-so-args units) ")\n"
+          ;; vfasl, as in build-with-cc and build-jolt.ss
+          (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  ;; …and only switch to it if one actually exists: bld-vfasl-ensure! answers #f
+  ;; for a target that could not be imaged at all, and the plain boot is then
+  ;; what gets embedded.
+  (unless (bld-vfasl-disabled?)
+    (when (bld-vfasl-ensure! builddir boot (string-append boot ".vfasl"))
+      (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
@@ -1812,35 +2686,57 @@
       (close-port p))
     (bld-clear-output! out-path)
     (bld-system (string-append
-      "cc -O2 -fPIC "
+      (bld-cc) " " (bld-arch-flag) " -O2 -fPIC "
       ;; -install_name @rpath/<base> so a binary that link-edits against the dylib
       ;; (rather than dlopen'ing it) can locate it via its rpath, not a build-dir path.
-      (if bld-osx?
+      (if (bld-tgt-osx?)
           (string-append "-dynamiclib -install_name '@rpath/" (bld-basename out-path) "' ")
           "-shared ")
       "-I'" (bld-csv-dir) "' '" lc "' '" (bld-csv-dir) "/libkernel.a' "
       "-o '" out-path "' " native-link " " (bld-link-libs))))
   (display (string-append "jolt build: wrote " out-path "\n")))
 
-;; optional trailing (target target-pack): a Chez machine string + a prepared
-;; target pack dir when cross-compiling (jolt build --target). Absent/nil = host.
+;; optional trailing (target target-pack boot-mode allow-dynamic): a Chez machine
+;; string + a prepared target pack dir when cross-compiling (jolt build --target)
+;; — absent/nil = host — then the boot mode (bld-opt-boot-mode) and the
+;; :allow-dynamic list (bld-opt-strs).
 (define (bld-opt-str opt i)
   (let loop ((o opt) (i i))
     (cond ((or (null? o) (< i 0)) #f)
           ((= i 0) (and (not (jolt-nil? (car o))) (jolt-str-render-one (car o))))
           (else (loop (cdr o) (- i 1))))))
+;; The boot mode as a symbol. Absent (a caller passing only the cross pair) or
+;; unrecognized reads as the default, so a bad value degrades to today's build
+;; rather than failing one; jolt.main is what rejects a typo, with a message.
+(define (bld-opt-boot-mode opt i)
+  (let ((s (bld-opt-str opt i)))
+    (cond ((equal? s "small") 'small)
+          ((equal? s "plain") 'plain)
+          (else 'fast))))
+;; optional trailing (allow-dynamic), index 3: a vector of "ns/name" strings
+;; (see build-binary). Absent/nil = '().
+(define (bld-opt-strs opt i)
+  (let loop ((o opt) (i i))
+    (cond ((or (null? o) (< i 0)) '())
+          ((= i 0) (if (jolt-nil? (car o)) '() (bld-strs (car o))))
+          (else (loop (cdr o) (- i 1))))))
 (def-var! "jolt.host" "build-binary"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
-    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1)))
+    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
-                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f))
+                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?)
+                    (bld-opt-strs opt 3) #f))
     jolt-nil))
 (def-var! "jolt.host" "build-library"
-  (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake?)
-    (build-binary (jolt-str-render-one entry)
-                  (jolt-str-render-one out)
-                  (jolt-str-render-one mode)
-                  natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t)
+  (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
+    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
+      (build-binary (jolt-str-render-one entry)
+                    (jolt-str-render-one out)
+                    (jolt-str-render-one mode)
+                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?)
+                    (bld-opt-strs opt 3) #t))
     jolt-nil))

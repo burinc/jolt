@@ -7,6 +7,7 @@
 # in jolt-core, so any drift fails CI. Regenerate after an intended change:
 #   grep -rhoE --include='*.ss' 'def-var! "jolt.host" "[^"]+"' host/ \
 #     | sed -E 's/.*"jolt.host" "([^"]+)".*/\1/' | LC_ALL=C sort -u
+add-reader-features!
 add-shutdown-hook
 allow-unresolved-vars?
 as-subvec
@@ -17,6 +18,7 @@ block-sigint
 build-binary
 build-library
 bytes-allocated
+call-cc
 call-on-main-thread
 call-on-main-thread-async
 callable-host?
@@ -33,13 +35,18 @@ condition-message
 cpu-nanos
 current-memory-bytes
 current-fiber
+ctx-for-ns
 deftype-ctor-class
 delete-file!
 delete-tree!
 directory?
+dispatch-macros
+embed-plan
 enable-trace!
 entry-at
+escape-fn?
 exact?
+extend-class!
 extension-epoch
 extension-has?
 extension-value
@@ -59,7 +66,9 @@ fiber-yield
 fiber?
 file-exists?
 file-mtime
+ffi-varargs-compile
 find-var
+fn-form-parse
 form-bigdec-source
 form-bigdec-value-source
 form-bigdec-value?
@@ -92,6 +101,9 @@ form-sym-meta
 form-sym-name
 form-sym-ns
 form-sym?
+form-tag-name
+form-tagged?
+form-syntax-quote-expand
 form-syntax-quote-lower
 form-uuid-source
 form-uuid-value-source
@@ -112,6 +124,7 @@ gc-real-nanos
 getenv
 host-class-name?
 host-intern!
+identity-hash
 image-add-after-restore-hook!
 image-add-before-dump-hook!
 image-dump-world!
@@ -129,8 +142,10 @@ image-write!
 inference-enabled?
 inline-enabled?
 inline-ir
+interpolate-parts
 interrupt!
 interrupted?
+invoke-rewriter
 java-hashcode
 jolt-class-for
 jolt-version
@@ -144,12 +159,17 @@ machine-type
 make-interrupt
 make-thread-local
 map-entry
+mark-spliced!
 maximum-memory-bytes
+reset-maximum-memory-bytes!
+gc-trip-bytes
 mkdirs!
 monitor-enter
 monitor-exit
 mono-nanos
 munge-name
+namespace-for
+ns-shaped-name?
 park-until-interrupt
 pop
 protocol-key-of
@@ -165,11 +185,14 @@ ref-get
 ref-put!
 refine-extension!
 regex-compiled?
+register-class-provider!
 register-class-supers!
 register-extension!
 register-extension-point!
 register-source!
+remove-dispatch-macro!
 rename-file!
+replace-builtin-ns!
 resolvable-names
 resolve-class-hint
 resolve-global
@@ -179,8 +202,12 @@ run-main-pump
 scheme-eval-string
 scheme-proc
 scheme-version
+seed-callable?
+set-default-zone-provider!
+set-dispatch-macro!
 set-field!
 set-instant-ctor!
+ns-source
 set-source-roots!
 set-static-field!
 set-var!
@@ -201,5 +228,6 @@ type-satisfies?
 tz-backend
 tz-offset-seconds
 unchecked-math?
+var-redefined?
 wall-nanos
 with-monitor

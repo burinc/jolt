@@ -219,27 +219,6 @@
                    (jolt-vector (jolt-nth pr 0) (substring s 0 (- (string-length s) (string-length rest)))))))
            (jolt-invoke ov-rps stream e? ev))))))
 
-;; inst? / inst-ms are host instance checks (the JVM's Inst protocol covers
-;; java.util.Date, its java.sql subclasses, and java.time.Instant). The overlay's
-;; tagged-:jolt/type read crashes on a sorted collection (get dispatches into the
-;; comparator with an incomparable key) and misses the Instant shim.
-;; A java.time.Instant is the base library's opaque value — a host tagged-table
-;; carrying :jolt.time/type = :jolt.time/instant and its epoch-nanos under :nanos
-;; (stdlib/jolt/time/instant.clj). Recognize it the same way host-table.ss spots a
-;; sorted map, so inst?/inst-ms cover an Instant without loading anything.
-(let ((kw-jt-type    (keyword "jolt.time" "type"))
-      (kw-jt-instant (keyword "jolt.time" "instant"))
-      (kw-nanos      (keyword #f "nanos")))
-  (let ((instant? (lambda (x) (and (htable? x) (jolt=2 (jolt-ref-get x kw-jt-type) kw-jt-instant)))))
-    (def-var! "clojure.core" "inst?"
-      (lambda (x) (if (or (jinst? x) (instant? x)) #t #f)))
-    (let ((ov-inst-ms (var-deref "clojure.core" "inst-ms")))
-      (def-var! "clojure.core" "inst-ms"
-        (lambda (x)
-          (cond ((jinst? x) (jinst-ms x))
-                ((instant? x) (quotient (exact (truncate (jolt-ref-get x kw-nanos))) 1000000))
-                (else (jolt-invoke ov-inst-ms x))))))))
-
 ;; A throwable is not a collection, function, or meta carrier on the JVM. The
 ;; ex-info record type is NOT a pmap, so pmap?/coll?/seqable?/ifn?/associative?
 ;; /counted? are naturally false — no exclusion arms needed.
@@ -259,13 +238,15 @@
   (lambda (e) (if (jolt-ex-info-record? e) (jolt-ex-info-record-cause e) jolt-nil)))
 ;; Throwable->map: the seed prelude version reads ex-data/ex-message/ex-cause
 ;; through the old var-deref chain; re-assert with the native versions.
-;; seqable? additionally covers the iterable java.util shims (Iterable on the JVM).
-;; The shim set lives in java/host-static-classes.ss (jhost-seqable-shim?) — do
-;; not duplicate the tag list here.
+;; seqable? additionally covers the iterable java.util shims (Iterable on the JVM)
+;; and any deftype/reify that DECLARES Seqable / ISeq / Iterable / Iterator. The
+;; shim set lives in java/host-static-classes.ss (jhost-seqable-shim?) and the
+;; declared-interface half in records-dispatch.ss (iface-seqable?, which reads
+;; the same probes the seq arms read) — do not duplicate either list here.
 (let ((prev (var-deref "clojure.core" "seqable?")))
   (def-var! "clojure.core" "seqable?"
     (lambda (x)
-      (if (jhost-seqable-shim? x)
+      (if (or (jhost-seqable-shim? x) (iface-seqable? x))
           #t
           (jolt-invoke1 prev x)))))
 ;; transients are IFn on the JVM (invoke = lookup); the queue is a full
@@ -358,3 +339,48 @@
                  (number? x) (char? x) (boolean? x) (jolt-nil? x) (procedure? x))
              #f)
             (else (jolt-invoke1 prev x))))))
+
+;; --- value-position natives are nameable ---------------------------------------
+;; A core fn used as a VALUE compiles to the runtime's Scheme procedure, not to
+;; the var's root, and the image writes a procedure as its var NAME. def-var!
+;; records that name -- but only for the procedure it was handed, and seq/get/nth
+;; are set!-EXTENDED afterwards (lazy-bridge for a lazy seq, records-coll for a
+;; deftype, natives-array for an array, nio-file for a Path). The extension is a
+;; new procedure nothing named, so (tree-seq vector? seq coll) refused to travel
+;; while 37 of 40 core fns sampled were fine.
+;;
+;; Registered HERE rather than beside each set!, because "the last extension" is
+;; not a place any one file can know it is: three files extend jolt-nth. This
+;; runs after every one of them. Same fix rt.ss already applies to the comparison
+;; chain singletons (jolt-lt/gt/le/ge), for the same reason (jolt-6cwk).
+;;
+;; `make coreproc` fails if any core fn goes unnameable, so a new extension that
+;; forgets is caught rather than discovered by an image that will not write.
+(for-each (lambda (p) (register-proc-name! (cdr p) "clojure.core" (car p)))
+          (list (cons "seq" jolt-seq)
+                  ;; the op registry's alength (natives-array.ss): value-position
+                  ;; alength compiles to it, so an image needs its name
+                  (cons "alength" jolt-alength)
+                  (cons "get" jolt-get)
+                  (cons "nth" jolt-nth)
+                  (cons "sequential?" jolt-sequential?)
+                  (cons "seq?" jolt-seq?)
+                  (cons "peek" jolt-peek)
+                  (cons "pop" jolt-pop)
+                  ;; value position compiles to the checked numeric layer's own
+                  ;; procedures, while the var roots went elsewhere -- the same
+                  ;; split as the comparison chain registered in rt.ss
+                  (cons "min" jolt-min)
+                  (cons "max" jolt-max)
+                  (cons "mod" jolt-mod)
+                  (cons "rem" jolt-rem)
+                  (cons "quot" jolt-quot)
+                  (cons "bit-and" jolt-bit-and*)
+                  (cons "bit-or" jolt-bit-or*)
+                  (cons "bit-xor" jolt-bit-xor*)
+                  (cons "some?" jolt-some?-fn)
+                  ;; protocol dispatch entry points: internal, but they are var
+                  ;; roots and a value built from one is as unwritable as any
+                  (cons "protocol-dispatch1" protocol-dispatch1)
+                  (cons "protocol-dispatch2" protocol-dispatch2)
+                (cons "protocol-dispatch3" protocol-dispatch3)))

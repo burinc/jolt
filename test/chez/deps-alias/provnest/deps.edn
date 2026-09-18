@@ -1,0 +1,7 @@
+{:paths ["src"]
+ :deps {local/provinner {:local/root "../provinner"}}
+
+ ;; The OUTER provider: its install namespace requires provinner's. Stands in for
+ ;; kmet, whose provider required jolt.crypto — a second declared provider — and
+ ;; got jolt.crypto's classes attributed to itself (jolt#926).
+ :jolt/provides {provnest.install ["javax.crypto.Cipher"]}}

@@ -3,8 +3,9 @@
 ;; A #inst literal lowers (analyzer :inst node -> emit) to (jolt-inst-from-string
 ;; "…"); this file parses the RFC3339 string to epoch-ms and models the value as a
 ;; `jinst` record (one flonum field, ms). Equality / map-key hashing are by the
-;; INSTANT (offset-normalized). The overlay inst?/inst-ms read (get x :jolt/type)/(get x :ms),
-;; so jolt-get answers those off a jinst — the overlay fns then work unchanged.
+;; INSTANT (offset-normalized). jolt-get answers :jolt/type and :ms off a jinst
+;; (the taxonomy keys); inst?/inst-ms themselves are the seed's Inst protocol,
+;; extended to java.util.Date, the class a jinst reports.
 ;;
 ;; This file owns the always-available java.util / java.text layer: java.util.Date,
 ;; java.sql.Date / Timestamp, Calendar, TimeZone, java.text.SimpleDateFormat,
@@ -138,8 +139,21 @@
 
 ;; names is sdf-date-names' vector: #(months months-short days days-short), the
 ;; days Monday-first (CLDR order); inst-fields' dow is 0=Sunday, hence dow-mon.
-(define (format-ms pattern ms names)
-  (let ((f (inst-fields ms)) (n (string-length pattern)) (out (open-output-string)))
+;; format-ms renders UTC unless a zone (a TimeZone jhost) is given, in which
+;; case the fields are that zone's clock and z / Z / X render its name and
+;; offset. The zone-less form is what the HTTP date formats use.
+(define (offset-string off-s style)   ; style: 'rfc822 ±hhmm | 'iso-h ±hh | 'iso-hm ±hhmm | 'iso-hcm ±hh:mm
+  (let* ((sign (if (< off-s 0) "-" "+")) (a (abs off-s))
+         (h (pad2 (quotient a 3600))) (m (pad2 (quotient (remainder a 3600) 60))))
+    (case style
+      ((rfc822 iso-hm) (string-append sign h m))
+      ((iso-h) (string-append sign h))
+      (else (string-append sign h ":" m)))))
+(define (format-ms pattern ms names . opt)
+  (let* ((zone (and (pair? opt) (car opt)))
+         (off-ms (if zone (tz-offset-ms zone ms) 0))
+         (off-s (quotient off-ms 1000))
+         (f (inst-fields (+ ms off-ms))) (n (string-length pattern)) (out (open-output-string)))
     ;; let* — dow-mon is derived from dow, so the bindings must be sequential.
     (let* ((y (list-ref f 0)) (mo (list-ref f 1)) (d (list-ref f 2))
            (hh (list-ref f 3)) (mi (list-ref f 4)) (se (list-ref f 5)) (dow (list-ref f 7))
@@ -175,11 +189,17 @@
               ((char=? c #\m) (display (if (= k 1) (number->string mi) (pad2 mi)) out) (loop (+ i k)))
               ((char=? c #\s) (display (if (= k 1) (number->string se) (pad2 se)) out) (loop (+ i k)))
               ((char=? c #\a) (display (if (< hh 12) "AM" "PM") out) (loop (+ i k)))
-              ;; timezone — format-ms renders UTC, the HTTP zone is GMT: z/zzz -> GMT,
-              ;; Z (RFC822) -> +0000, X (ISO) -> Z.
-              ((char=? c #\z) (display "GMT" out) (loop (+ i k)))
-              ((char=? c #\Z) (display "+0000" out) (loop (+ i k)))
-              ((char=? c #\X) (display "Z" out) (loop (+ i k)))
+              ;; timezone: with no zone format-ms renders UTC and the HTTP zone is
+              ;; GMT (z/zzz -> GMT, Z -> +0000, X -> Z); with one, z is its short
+              ;; name, Z its RFC822 offset, X/XX/XXX its ISO offset (Z at zero).
+              ((char=? c #\z) (display (if zone (tz-abbrev zone ms) "GMT") out) (loop (+ i k)))
+              ((char=? c #\Z) (display (if zone (offset-string off-s 'rfc822) "+0000") out) (loop (+ i k)))
+              ((char=? c #\X) (display (cond ((or (not zone) (= off-s 0)) "Z")
+                                              ((= k 1) (offset-string off-s 'iso-h))
+                                              ((= k 2) (offset-string off-s 'iso-hm))
+                                              (else (offset-string off-s 'iso-hcm)))
+                                        out)
+               (loop (+ i k)))
               (else (write-char c out) (loop (+ i 1)))))))
       (get-output-string out))))
 
@@ -190,8 +210,12 @@
       (cond ((= i 12) #f)
             ((string=? (ascii-string-down (substring (vector-ref month-names i) 0 3)) m3) (+ i 1))
             (else (loop (+ i 1)))))))
-(define (parse-ms pattern input)
+;; parse-ms reads the civil fields as UTC unless the input carries a zone (a
+;; z/Z/X directive consumed one) or a zone is given, in which case a zone-less
+;; input is that zone's clock, as SimpleDateFormat.parse reads it.
+(define (parse-ms pattern input . opt)
   (let ((pn (string-length pattern)) (inn (string-length input))
+        (zone (and (pair? opt) (car opt))) (tz-seen #f)
         (y 1970) (mo 1) (d 1) (hh 0) (mi 0) (ss 0) (frac-ms 0) (pm 'none) (off-s 0))
     ;; a parse failure is a java.time.format.DateTimeParseException (typed, so a
     ;; (catch DateTimeParseException …) over a bad date matches), like the JVM.
@@ -212,7 +236,7 @@
                              (cons (substring input ii j) j))))
     (define (read-tz ii)                 ; consume GMT/UTC/Z or ±hh[:]mm; -> next, sets off-s
       (cond ((>= ii inn) ii)
-            ((char-alphabetic? (string-ref input ii)) (cdr (read-alpha ii)))
+            ((char-alphabetic? (string-ref input ii)) (set! tz-seen #t) (cdr (read-alpha ii)))
             ((or (char=? (string-ref input ii) #\+) (char=? (string-ref input ii) #\-))
              (let* ((sign (if (char=? (string-ref input ii) #\-) -1 1))
                     (oh (or (and (< (+ ii 1) inn) (digits-at input (+ ii 1) 2)) 0))
@@ -222,6 +246,7 @@
                             (or (digits-at input (+ ii 3) 2) 0)))
                     (end (+ ii (if (> oh 0) (if has-colon 6 (if (> om 0) 5 3)) 0))))
                (set! off-s (* sign (+ (* oh 3600) (* om 60))))
+               (set! tz-seen #t)
                end))
             (else ii)))
     ;; skip a '[' optional section to just past its matching ']' (nestable;
@@ -239,7 +264,8 @@
           (begin
             (when (eq? pm 'pm) (when (< hh 12) (set! hh (+ hh 12))))
             (when (eq? pm 'am) (when (= hh 12) (set! hh 0)))
-            (make-jinst (- (+ (* 1000 (+ (* (days-from-civil y mo d) 86400) (* hh 3600) (* mi 60) ss)) frac-ms) (* off-s 1000))))
+            (let ((local (- (+ (* 1000 (+ (* (days-from-civil y mo d) 86400) (* hh 3600) (* mi 60) ss)) frac-ms) (* off-s 1000))))
+              (make-jinst (if (and zone (not tz-seen)) (local->utc zone local) local))))
           (let ((c (string-ref pattern pi)))
             (cond
               ((char-alphabetic? c)
@@ -369,9 +395,6 @@
                (else 'pass)))
         (else 'pass)))))
 
-;; inst-ms* is a seed native (the overlay inst-ms reads (get x :ms), now answered).
-(def-var! "clojure.core" "inst-ms*" (lambda (i) (jinst-ms i)))
-
 ;; --- java.time bridge from the #inst / java.util layer -----------------------
 ;; ms-of projects a core date value (a #inst, a Calendar, a java.sql.Date) to
 ;; epoch-ms for the java.util / java.text layer. The java.time value types are the
@@ -413,7 +436,8 @@
   (cond
     ((null? args) (make-jinst (now-ms)))
     ((null? (cdr args)) (make-jinst (ms->exact (ms-of (car args)))))
-    ;; deprecated (Date. year-1900 month0 date [hrs min sec]) — civil fields in UTC.
+    ;; deprecated (Date. year-1900 month0 date [hrs min sec]): civil fields on
+    ;; the default zone's clock, as the JVM reads them.
     (else
      (let* ((y  (+ 1900 (jnum->exact (list-ref args 0))))
             (mo (+ 1 (jnum->exact (list-ref args 1))))
@@ -421,7 +445,8 @@
             (hh (if (> (length args) 3) (jnum->exact (list-ref args 3)) 0))
             (mm (if (> (length args) 4) (jnum->exact (list-ref args 4)) 0))
             (ss (if (> (length args) 5) (jnum->exact (list-ref args 5)) 0)))
-       (make-jinst (* 1000 (+ (* (days-from-civil y mo d) 86400) (* hh 3600) (* mm 60) ss)))))))
+       (make-jinst (local->utc (default-timezone)
+                               (* 1000 (+ (* (days-from-civil y mo d) 86400) (* hh 3600) (* mm 60) ss))))))))
 (register-class-ctor! "Date" date-ctor)
 (register-class-ctor! "java.util.Date" date-ctor)
 (register-class-ctor! "Timestamp" date-ctor)
@@ -433,20 +458,24 @@
 ;; it deliberately does not; the base owns the whole java.time side.)
 ;; java.sql.Date: a distinct class from java.util.Date (a "sql-date" jhost over
 ;; epoch-ms) so a protocol extended to both routes a sql.Date to its own impl.
-;; (Date. year-1900 month0 day) builds UTC midnight of that civil date; valueOf
-;; parses "yyyy-MM-dd" to the same instant (so the two agree).
+;; (Date. year-1900 month0 day) builds midnight of that civil date on the
+;; default zone's clock; valueOf parses "yyyy-MM-dd" to the same instant, and
+;; toLocalDate reads the civil date back on that clock (so the three agree).
 (define (mk-sql-date ms) (make-jhost "sql-date" (vector (ms->exact ms))))
-(define (sql-date-midnight y mo d) (mk-sql-date (* 1000 (* (days-from-civil y mo d) 86400))))
+(define (sql-date-midnight y mo d)
+  (mk-sql-date (local->utc (default-timezone) (* 1000 (* (days-from-civil y mo d) 86400)))))
 (register-class-ctor! "java.sql.Date"
   (case-lambda
     ((ms) (mk-sql-date (ms-of ms)))   ; (Date. epoch-ms)
     ((y m d) (sql-date-midnight (+ 1900 (jnum->exact y)) (+ 1 (jnum->exact m)) (jnum->exact d)))))
 (register-class-statics! "java.sql.Date"
-  (list (cons "valueOf" (lambda (s) (mk-sql-date (jinst-ms (parse-ms "yyyy-MM-dd" (if (string? s) s (jolt-str-render-one s)))))))))
+  (list (cons "valueOf" (lambda (s) (mk-sql-date (jinst-ms (parse-ms "yyyy-MM-dd" (if (string? s) s (jolt-str-render-one s)) (default-timezone))))))))
 (register-host-methods! "sql-date"
   (list (cons "getTime" (lambda (self) (ms-of self)))
         (cons "toInstant" (lambda (self) (mk-instant (ms-of self))))
-        (cons "toLocalDate" (lambda (self) (host-static-call "java.time.LocalDate" "ofEpochDay" (inst-floor-div (ms-of self) 86400000))))
+        (cons "toLocalDate" (lambda (self)
+                              (let ((f (date-local-fields (ms-of self))))
+                                (host-static-call "java.time.LocalDate" "of" (list-ref f 0) (list-ref f 1) (list-ref f 2)))))
         (cons "toString" (lambda (self) (inst-rfc3339 (make-jinst (ms-of self)))))))
 
 ;; java.util.TimeZone: an id, and the offset that id stands for. A custom id —
@@ -508,18 +537,40 @@
         (and a b (min a b)))
       0))
 
-(define (timezone-of id) (make-jhost "timezone" (vector (if (string? id) id (jolt-str-render-one id)))))
+;; state: #(id last), last = (epoch-second . offset-seconds) of the most recent
+;; lookup or #f. A SimpleDateFormat formatting the same instant repeatedly (a
+;; loop over one date, a log line's timestamp) reads its offset off the pair
+;; instead of taking the libc probe's mutex and memo table each time; the pair
+;; is one immutable cons written in one slot, so a reader on another thread
+;; sees a whole (second . offset) or the previous one, never a torn mix.
+(define (timezone-of id) (make-jhost "timezone" (vector (if (string? id) id (jolt-str-render-one id)) #f)))
 (define (timezone? x) (and (jhost? x) (string=? (jhost-tag x) "timezone")))
 (define (tz-id tz) (if (timezone? tz) (vector-ref (jhost-state tz) 0) (jolt-str-render-one tz)))
 (define (tz-offset-ms tz ms)
-  (* 1000 (tz-offset-seconds (tz-id tz) (inst-floor-div (ms->exact ms) 1000))))
+  (let ((sec (inst-floor-div (ms->exact ms) 1000)))
+    (if (timezone? tz)
+        (let* ((st (jhost-state tz)) (last (vector-ref st 1)))
+          (if (and last (eqv? (car last) sec))
+              (* 1000 (cdr last))
+              (let ((off (tz-offset-seconds (vector-ref st 0) sec)))
+                (vector-set! st 1 (cons sec off))
+                (* 1000 off))))
+        (* 1000 (tz-offset-seconds (tz-id tz) sec)))))
 
+;; Two TimeZones with one id are equal and hash alike, as on the JVM (the JVM
+;; also compares rules, which one id fixes here). The cached-offset slot is
+;; never part of the comparison.
+(register-eq-arm! (lambda (a b) (or (timezone? a) (timezone? b)))
+                  (lambda (a b) (and (timezone? a) (timezone? b) (string=? (tz-id a) (tz-id b)))))
+(register-hash-arm! timezone? (lambda (x) (jolt-hash (tz-id x))))
 (register-host-methods! "timezone"
   (list (cons "getID" (lambda (self) (tz-id self)))
         (cons "toString" (lambda (self) (tz-id self)))
         (cons "getOffset" (lambda (self ms) (tz-offset-ms self ms)))
         (cons "getRawOffset" (lambda (self) (* 1000 (tz-raw-offset-seconds (tz-id self)))))
         (cons "hasSameRules" (lambda (self o) (string=? (tz-id self) (tz-id o))))
+        (cons "equals" (lambda (self o) (and (timezone? o) (string=? (tz-id self) (tz-id o)))))
+        (cons "hashCode" (lambda (self) (jolt-hash (tz-id self))))
         (cons "useDaylightTime"
               (lambda (self)
                 (let ((id (tz-id self)))
@@ -530,11 +581,59 @@
                 (> (tz-offset-ms self (ms-of d))
                    (* 1000 (tz-raw-offset-seconds (tz-id self))))))))
 
-;; jolt reads every date in UTC unless a zone says otherwise, so that is what the
-;; default zone is — the JVM's would be the machine's.
+;; The default zone: TZ from the process's own environment (a leading colon is
+;; the POSIX file form; a zoneinfo path is read for the zone name it ends in),
+;; else what a registered provider answers, else UTC. Core reads no system file
+;; for this. Which zone a machine is in lives in /etc/localtime or
+;; /etc/timezone, and looking there is I/O the program never asked for and a
+;; layout assumption core does not make; jolt.time knows how to find it (its
+;; ZoneId/systemDefault) and registers that lookup as the provider when it
+;; loads, so with the library present core and java.time name one zone, and
+;; without it a zone-less format is UTC. Not cached: a dumped image must not
+;; bake a build machine's zone in, and this is asked on the way into a format,
+;; not in a loop.
+(define default-zone-provider #f)
+(def-var! "jolt.host" "set-default-zone-provider!"
+  (lambda (f) (set! default-zone-provider (if (jolt-nil? f) #f f)) jolt-nil))
+(define (tz-env-zone)
+  (define (after-zoneinfo p)
+    (let ((i (substring-index "zoneinfo/" p)))
+      (and i (let ((z (substring p (+ i 9) (string-length p))))
+               (and (> (string-length z) 0) z)))))
+  (let ((tz (getenv "TZ")))
+    (and tz (> (string-length tz) 0)
+         (let ((tz (if (char=? (string-ref tz 0) #\:) (substring tz 1 (string-length tz)) tz)))
+           (and (> (string-length tz) 0)
+                (if (char=? (string-ref tz 0) #\/) (after-zoneinfo tz) tz))))))
+(define (system-tz-id)
+  (or (tz-env-zone)
+      (and default-zone-provider
+           (let ((z (guard (e (#t #f)) (jolt-invoke default-zone-provider))))
+             (and (string? z) (> (string-length z) 0) z)))
+      "UTC"))
+(define (default-timezone) (timezone-of (system-tz-id)))
+;; The zone's short name at an instant, as SimpleDateFormat's z renders it:
+;; UTC and GMT are themselves, a custom GMT±hh:mm id is its own name, a named
+;; zone answers through libc ("EST", "BST"), and a zone libc cannot name
+;; falls back to its id.
+(define (tz-abbrev zone ms)
+  (let ((id (tz-id zone)))
+    (cond ((string=? id "Z") "UTC")
+          ((member id '("UTC" "GMT" "UT")) id)
+          ((tz-custom-offset id) id)
+          ((tzp-tz-abbrev id (inst-floor-div (exact (truncate ms)) 1000)) => values)
+          (else id))))
+;; A local-clock reading in `zone` (a civil time taken as if it were UTC) to
+;; the instant it names: subtract the offset, then re-read the offset AT that
+;; instant so a reading across a DST step lands on the right side of it.
+(define (local->utc zone local)
+  (let* ((o1 (tz-offset-ms zone local))
+         (ms1 (- local o1))
+         (o2 (tz-offset-ms zone ms1)))
+    (- local o2)))
 (define timezone-statics
   (list (cons "getTimeZone" timezone-of)
-        (cons "getDefault" (lambda () (timezone-of "UTC")))))
+        (cons "getDefault" (lambda () (default-timezone)))))
 (register-class-statics! "TimeZone" timezone-statics)
 (register-class-statics! "java.util.TimeZone" timezone-statics)
 
@@ -702,7 +801,7 @@
 
 (define (calendar-arg-zone args)
   (or (let loop ((a args)) (cond ((null? a) #f) ((timezone? (car a)) (car a)) (else (loop (cdr a)))))
-      (timezone-of "UTC")))
+      (default-timezone)))
 
 (define (calendar-of-ms ms zone) (make-jhost "calendar" (vector (ms->exact ms) #f zone)))
 
@@ -794,36 +893,145 @@
                  (if (jolt-nil? s) (vector-ref sdf-root-names i) (list->vector (seq->list s)))))))
       (vector (f "months" 0) (f "months-short" 1) (f "days" 2) (f "days-short" 3)))))
 
+;; --- %t / %T: java.util.Formatter's date-time conversions --------------------
+;; natives-format.ss owns the format grammar; it scans %t<sub>, hands the
+;; sub-conversion char and the argument here through set-format-datetime!, and
+;; pads what comes back. This file owns everything a date-time rendering needs
+;; and natives-format.ss (loaded long before it) has no way to reach: the
+;; epoch-ms projection off a Date / Calendar / long, the machine's default zone,
+;; and the month and day names.
+;;
+;; The JVM reads the fields ON A ZONE — a Calendar's own, the machine's default
+;; for a Date / #inst / epoch-ms long — and so does this. The names are ROOT's
+;; (core carries no java.util.Locale; that is the jolt-lang/time library, RFC
+;; 0008), the same choice and the same documented divergence from a
+;; machine-locale JVM that SimpleDateFormat's name directives make.
+;;
+;; Every field renders in LOWER case and natives-format.ss upcases the whole
+;; result for %T. The one exception the JVM itself makes is %tr's am/pm marker,
+;; which is upper case under %t too.
+(define (fmt-dt-pad n w)                 ; n zero-padded to w digits
+  (let ((s (number->string n)))
+    (string-append (make-string (max 0 (- w (string-length s))) #\0) s)))
+;; The date-time argument types the JVM takes are Long, Date, Calendar and
+;; TemporalAccessor; here they are exactly what ms-of projects (a #inst /
+;; java.util.Date, a Calendar, a java.sql.Date / Timestamp, a long). Anything
+;; else is the IllegalFormatConversionException the JVM gives, naming the
+;; SUB-conversion ("F != java.lang.String") as the JVM does — including a
+;; java.time value, which the JVM's TemporalAccessor arm accepts for a
+;; LocalDate / ZonedDateTime. Core does not carry java.time (RFC 0008: it is the
+;; jolt-lang/time base), so it has nothing to project one from; the refusal is
+;; the honest answer until the library registers a projection. jolt-0la
+(define (fmt-dt-ms+zone a)               ; -> (values ms zone) | (values #f #f)
+  (cond ((and (jhost? a) (string=? (jhost-tag a) "calendar")) (values (cal-ms a) (cal-zone a)))
+        ((number? a) (values (ms->exact a) (default-timezone)))
+        ((jinst? a) (values (ms->exact (jinst-ms a)) (default-timezone)))
+        ((and (jhost? a) (string=? (jhost-tag a) "sql-date"))
+         (values (ms->exact (vector-ref (jhost-state a) 0)) (default-timezone)))
+        (else (values #f #f))))
+;; One field of a broken-down time. The composite conversions (%tR %tT %tr %tD
+;; %tF %tc) are spelled out of the simple ones, as java.util.Formatter spells
+;; them. #f for a sub-conversion that is not one of Java's — the caller turns
+;; that into UnknownFormatConversionException, which needs the %t / %T it saw.
+(define (fmt-dt-field sub y mo d hh mi se frac dow-mon h12 off-s ms zone names)
+  (define (self c) (fmt-dt-field c y mo d hh mi se frac dow-mon h12 off-s ms zone names))
+  (case sub
+    ((#\H) (fmt-dt-pad hh 2))
+    ((#\I) (fmt-dt-pad h12 2))
+    ((#\k) (number->string hh))
+    ((#\l) (number->string h12))
+    ((#\M) (fmt-dt-pad mi 2))
+    ((#\S) (fmt-dt-pad se 2))
+    ((#\L) (fmt-dt-pad frac 3))
+    ((#\N) (fmt-dt-pad (* frac 1000000) 9))
+    ((#\p) (if (< hh 12) "am" "pm"))
+    ((#\z) (offset-string off-s (quote rfc822)))
+    ((#\Z) (tz-abbrev zone ms))
+    ;; SECONDS_SINCE_EPOCH is a plain ms/1000 on the JVM, truncating toward
+    ;; zero, not the floor division the civil fields take.
+    ((#\s) (number->string (quotient ms 1000)))
+    ((#\Q) (number->string ms))
+    ((#\B) (vector-ref (vector-ref names 0) (- mo 1)))
+    ((#\b #\h) (vector-ref (vector-ref names 1) (- mo 1)))
+    ((#\A) (vector-ref (vector-ref names 2) dow-mon))
+    ((#\a) (vector-ref (vector-ref names 3) dow-mon))
+    ((#\C) (fmt-dt-pad (quotient (abs y) 100) 2))
+    ((#\Y) (if (< y 0) (string-append "-" (fmt-dt-pad (- y) 4)) (fmt-dt-pad y 4)))
+    ((#\y) (fmt-dt-pad (modulo y 100) 2))
+    ((#\j) (fmt-dt-pad (+ 1 (- (days-from-civil y mo d) (days-from-civil y 1 1))) 3))
+    ((#\m) (fmt-dt-pad mo 2))
+    ((#\d) (fmt-dt-pad d 2))
+    ((#\e) (number->string d))
+    ((#\R) (string-append (self #\H) ":" (self #\M)))
+    ((#\T) (string-append (self #\H) ":" (self #\M) ":" (self #\S)))
+    ((#\r) (string-append (self #\I) ":" (self #\M) ":" (self #\S) " " (string-upcase (self #\p))))
+    ((#\D) (string-append (self #\m) "/" (self #\d) "/" (self #\y)))
+    ((#\F) (string-append (self #\Y) "-" (self #\m) "-" (self #\d)))
+    ((#\c) (string-append (self #\a) " " (self #\b) " " (self #\d) " "
+                          (self #\T) " " (self #\Z) " " (self #\Y)))
+    (else #f)))
+(define (fmt-datetime-render sub a)
+  (if (jolt-nil? a)
+      "null"
+      (let-values (((ms zone) (fmt-dt-ms+zone a)))
+        (if (not ms)
+            (jolt-throw (jolt-host-throwable "java.util.IllegalFormatConversionException"
+                                             (string-append (string sub) " != " (jolt-class-name a))))
+            (let* ((off-ms (tz-offset-ms zone ms))
+                   (f (inst-fields (+ ms off-ms)))
+                   (hh (list-ref f 3)))
+              (fmt-dt-field sub (list-ref f 0) (list-ref f 1) (list-ref f 2)
+                            hh (list-ref f 4) (list-ref f 5) (list-ref f 6)
+                            (modulo (+ (list-ref f 7) 6) 7)
+                            (let ((h (modulo hh 12))) (if (= h 0) 12 h))
+                            (quotient off-ms 1000) ms zone
+                            (sdf-date-names "")))))))
+(set-format-datetime! fmt-datetime-render)
+
+;; state: #(pattern locale-id zone). The zone is the machine's at construction,
+;; as the JVM's is, and setTimeZone replaces it: format renders the instant on
+;; that zone's clock and parse reads a zone-less input on it.
 (define (sdf-ctor pat . rest)
   (make-jhost "sdf" (vector (if (string? pat) pat (jolt-str-render-one pat))
-                            (and (pair? rest) (jolt-str-render-one (car rest))))))
+                            (and (pair? rest) (jolt-str-render-one (car rest)))
+                            (default-timezone))))
 (register-class-ctor! "SimpleDateFormat" sdf-ctor)
 (register-class-ctor! "java.text.SimpleDateFormat" sdf-ctor)
 (register-host-methods! "sdf"
-  (list (cons "setTimeZone" (lambda (self tz) jolt-nil))
+  (list (cons "setTimeZone" (lambda (self tz) (vector-set! (jhost-state self) 2 tz) jolt-nil))
+        (cons "getTimeZone" (lambda (self) (vector-ref (jhost-state self) 2)))
         (cons "setLenient" (lambda (self b) jolt-nil))
         (cons "applyPattern" (lambda (self p) (vector-set! (jhost-state self) 0 (jolt-str-render-one p)) jolt-nil))
         (cons "toPattern" (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "parse" (lambda (self s) (parse-ms (vector-ref (jhost-state self) 0) (jolt-str-render-one s))))
+        (cons "parse" (lambda (self s)
+                        (let ((st (jhost-state self)))
+                          (parse-ms (vector-ref st 0) (jolt-str-render-one s) (vector-ref st 2)))))
         (cons "format" (lambda (self d)
                          (let ((st (jhost-state self)))
                            (format-ms (vector-ref st 0) (ms-of d)
-                                      (sdf-date-names (or (vector-ref st 1) ""))))))))
+                                      (sdf-date-names (or (vector-ref st 1) ""))
+                                      (vector-ref st 2)))))))
 
+;; The civil fields of an instant on the default zone's clock.
+(define (date-local-fields ms)
+  (inst-fields (+ ms (tz-offset-ms (default-timezone) ms))))
 ;; a jinst's java.util.Date method surface (record-method-dispatch arm).
 (register-method-arm! arm-priority-date
   (lambda (obj method-name rest-args)
     (cond
       ((jinst? obj)
        (cond ((string=? method-name "getTime") (jinst-ms obj))
-             ;; deprecated java.util.Date accessors (UTC civil fields).
-             ((string=? method-name "getYear") (- (list-ref (inst-fields (jinst-ms obj)) 0) 1900))
-             ((string=? method-name "getMonth") (- (list-ref (inst-fields (jinst-ms obj)) 1) 1))
-             ((string=? method-name "getDate") (list-ref (inst-fields (jinst-ms obj)) 2))
-             ((string=? method-name "getHours") (list-ref (inst-fields (jinst-ms obj)) 3))
-             ((string=? method-name "getMinutes") (list-ref (inst-fields (jinst-ms obj)) 4))
-             ((string=? method-name "getSeconds") (list-ref (inst-fields (jinst-ms obj)) 5))
-             ((string=? method-name "getDay") (list-ref (inst-fields (jinst-ms obj)) 7))
+             ;; deprecated java.util.Date accessors: the default zone's clock.
+             ((string=? method-name "getYear") (- (list-ref (date-local-fields (jinst-ms obj)) 0) 1900))
+             ((string=? method-name "getMonth") (- (list-ref (date-local-fields (jinst-ms obj)) 1) 1))
+             ((string=? method-name "getDate") (list-ref (date-local-fields (jinst-ms obj)) 2))
+             ((string=? method-name "getHours") (list-ref (date-local-fields (jinst-ms obj)) 3))
+             ((string=? method-name "getMinutes") (list-ref (date-local-fields (jinst-ms obj)) 4))
+             ((string=? method-name "getSeconds") (list-ref (date-local-fields (jinst-ms obj)) 5))
+             ((string=? method-name "getDay") (list-ref (date-local-fields (jinst-ms obj)) 7))
+             ;; minutes WEST of UTC, as the JVM signs it
+             ((string=? method-name "getTimezoneOffset")
+              (- (quotient (tz-offset-ms (default-timezone) (jinst-ms obj)) 60000)))
              ((string=? method-name "toInstant") (mk-instant (jinst-ms obj)))
              ((string=? method-name "toString") (inst-rfc3339 obj))
              ((string=? method-name "equals") (and (pair? (if (jolt-nil? rest-args) '() (seq->list rest-args)))
@@ -831,7 +1039,7 @@
                                                    (= (jinst-ms obj) (jinst-ms (car (seq->list rest-args))))))
              ((string=? method-name "before") (< (jinst-ms obj) (ms-of (car (seq->list rest-args)))))
              ((string=? method-name "after") (> (jinst-ms obj) (ms-of (car (seq->list rest-args)))))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method-name " for java.util.Date")))))
+             (else (dispatch-miss obj method-name (if (jolt-nil? rest-args) '() (seq->list rest-args))))))
       (else 'pass))))
 
 ;; Clojure's built-in data readers, so a library that merges default-data-readers

@@ -10,8 +10,10 @@ that verified the mechanism.
 
 The one-time step is preparing a **target pack** — the target's Chez boots,
 kernel, `scheme.h`, the cross `xpatch`, and static lz4/zlib — from a ChezScheme
-cross checkout (the ~10-min setup under [Reproduction](#reproduction)).
-`make-pack.sh` assembles the checkout's scattered artifacts into one pack dir:
+cross checkout (the ~10-min setup under [Reproduction](#reproduction)). A
+`--library` target pack must contain a position-independent (`-fPIC`)
+`libkernel.a` and position-independent static dependencies. `make-pack.sh`
+assembles the checkout's scattered artifacts into one pack dir:
 
 ```sh
 # after the ChezScheme cross setup below:
@@ -31,9 +33,18 @@ file app-x86        # => Mach-O 64-bit executable x86_64
 
 `build.ss` keeps `flat.ss` machine-neutral and retargets only step 4
 (compile-file / make-boot-file / cc-link) under the pack's `xpatch`; the
-`cross-smoke` workflow pins that output is byte-identical to the native build.
-Not yet cross-supported: `:jolt/native` static archives (need per-target-arch
-archives) and `--library`.
+`cross-smoke` workflow pins both executable and shared-library outputs on the
+target. Cross shared libraries use the same CLI composition:
+
+```sh
+JOLT_TARGET_CC=aarch64-linux-gnu-gcc \
+  bin/jolt build --library -m lib.core -o libcore.so \
+    --target tarm64le --target-pack /tmp/pack-tarm64le
+```
+
+Not yet cross-supported: `:jolt/native` static archives. They must be loaded
+while emitting the app as well as linked into the target, so supporting them
+needs explicit host and per-target archive variants.
 
 `cross-build-poc.sh` is the original hand-driven step 4, kept for reference.
 
@@ -130,40 +141,30 @@ The script picks the matching Linux link libs automatically for `*le`
 targets. A machine that only *runs* a cross-built binary needs nothing
 installed — no Chez, no jolt.
 
-## What a real `jolt build --target <machine>` needs
+## Target-pack requirements
 
-The POC hand-drives step 4; productizing it in build.ss is modest:
+The productized path keeps every target-owned decision in the pack and the
+target toolchain:
 
-1. **Spawn-path cross compile.** `build-with-cc` already spawns a fresh Chez
-   for `compile-file`/`make-boot-file`; a `--target` flag only needs to
-   prepend `(load ".../xc-<target>/s/xpatch")` to the generated compile.ss.
-   (The self-contained path compiles in-process and would keep using the
-   spawn path when cross-targeting.)
-2. **Key platform decisions off the target, not the host.** `bld-osx?` /
-   `bld-nt?` / `bld-link-libs` / the `.exe` suffix all read the *host*
-   `(machine-type)` today; under `--target` they must read the target
-   machine string.
-3. **Target packs.** `JOLT_CHEZ_CSV` already overrides where the boots +
-   kernel come from. A per-target bundle (petite/scheme.boot, libkernel.a,
-   scheme.h, static lz4/zlib, prebuilt launcher stub — ~10 MB, exactly what
-   the `csv<ver>/<machine>` install layout already contains, plus the
-   xpatch) could be published per release, Zig/Go style. With a prebuilt
-   *target* launcher stub, the append-payload path needs **no C compiler at
-   all** for pure-Clojure apps: the stub framing
-   (`[stub][boot][u64 len]["JOLTBOOT"]`) is arch-independent.
-4. **C cross-compilers only where unavoidable** (`:jolt/native` static
-   archives, `--library`): macOS↔macOS is `-arch`; Linux targets from any
-   host work with `zig cc -target x86_64-linux-gnu`; Windows needs
-   mingw-w64 (`--toolprefix=x86_64-w64-mingw32-`, same as Chez's own cross
-   build).
-5. **Version pinning.** Host compiler, xpatch, target boots, and target
-   kernel must come from one Chez tree (jolt already pins 10.4.1 in CI).
+1. **One Chez revision.** The host compiler, xpatch, target boots, and target
+   kernel must come from one Chez tree (jolt pins 10.4.1 in CI).
+2. **Spawn-path cross compile.** Both executable and library builds spawn a
+   fresh host Chez, load the pack's xpatch, and run `compile-file` plus
+   `make-boot-file` against the target boots. The self-contained in-process
+   compiler is deliberately not retargeted.
+3. **Target-aware linking.** `JOLT_TARGET_CC` and `JOLT_TARGET_ARCH_FLAG` select
+   the compiler and architecture; the pack's `link-libs` (or
+   `JOLT_TARGET_LINK_LIBS`) supplies OS/libc-specific libraries. A machine tag
+   such as `tarm64le` cannot by itself distinguish glibc Linux from Android.
+4. **PIC shared-library inputs.** `--library` folds `libkernel.a`, lz4, and zlib
+   into the output, so all of them must have been compiled with `-fPIC`.
+5. **No cross static natives yet.** A `:jolt/native` static archive is loaded
+   into the host while emitting the app and linked into the target afterwards;
+   supporting it requires separate host-loadable and target-linkable artifacts.
 
-Caveats: `:jolt/native` archives must be provided per target arch; app
-macros that inspect the build host at compile time would bake host facts
-(none of the stdlib does); Windows (`ta6nt` via mingw-w64) remains the one
-untested target family — buildable from any host, but verification needs a
-Windows machine or wine.
+App macros that inspect the build host can still bake host facts (none of the
+stdlib does). Windows (`ta6nt` via mingw-w64) remains the one untested target
+family — buildable from any host, but verification needs Windows or Wine.
 
 ## Cross-OS: macOS → Linux with `zig cc` (verified)
 

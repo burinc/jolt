@@ -1,0 +1,4 @@
+{:paths ["src"]
+ ;; vouches for compute -- but it evals, and an eval cannot be vouched away:
+ ;; the shake bails (see src/app/core.clj)
+ :jolt/tree-shake {:allow-dynamic [app.core/compute]}}

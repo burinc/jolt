@@ -21,10 +21,6 @@
 ;; (define-syntax define-jrec-family ...) — pre-expanded below
 
 ;; expansion of (define-jrec-family 8)
-(define-record-type (jrec make-jrec0 jrec?)
-  (fields (immutable desc) (immutable ext) (mutable hasheq))
-  (nongenerative chez-jrec-v5))
-
 (define-record-type (jrec1 make-jrec1 jrec1?)
   (parent jrec)
   (fields (mutable f0))
@@ -357,12 +353,6 @@
 (define jrec-fast-type-probe
   (make-jrec 'fast-type-probe (vector) jolt-nil))
 
-(define (jrec-vals r)
-  (let* ((n (jrec-nfields r)) (v (make-vector n)))
-    (do ((i 0 (fx+ i 1)))
-        ((fx= i n) v)
-      (vector-set! v i (jrec-field-ref r i)))))
-
 (define (jrec-tag r) (jrdesc-tag (jrec-desc r)))
 
 (define (jrec-pic-desc x) (and (jrec? x) (jrec-desc x)))
@@ -392,6 +382,7 @@
   (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
 
 (define (deftype-ctor-tag-set! ctor tag)
+  (jolt-identity-hasheq-seed! ctor (jolt-hash tag))
   (jolt-with-mutex
     chez-deftype-ctor-tag-mu
     (let ((t (hashtable-copy
@@ -441,6 +432,14 @@
 (define (chez-double-tag? t)
   (and (string? t) (string=? t "double")))
 
+(define (jolt-rec-dbl a)
+  (if (and (number? a) (not (flonum? a)))
+      (exact->inexact a)
+      a))
+
+(define chez-record-fields-tbl
+  (make-hashtable string-hash string=?))
+
 (define (register-record-shape! ctor-key field-kws
          field-tags type-tag)
   (jolt-with-mutex
@@ -449,6 +448,7 @@
       chez-record-shapes-tbl
       ctor-key
       (vector field-kws field-tags type-tag))
+    (hashtable-set! chez-record-fields-tbl type-tag field-kws)
     (hashtable-set!
       chez-record-dbl-tbl
       type-tag
@@ -468,6 +468,13 @@
     ((or (not tag) (jolt-nil-t? tag)) jolt-nil)
     ((string=? tag "num") "num")
     ((string=? tag "double") "double")
+    ((string=? tag "long") "num")
+    ((or (string=? tag "String")
+         (string=? tag "java.lang.String"))
+     "str")
+    ((or (string=? tag "Keyword")
+         (string=? tag "clojure.lang.Keyword"))
+     "kw")
     (else
      (let* ((simple (chez-shape-simple-name tag))
             (qualified? (not (string=? simple tag)))
@@ -518,12 +525,14 @@
                  (rtags (map (lambda (t)
                                (chez-resolve-field-tag t by-name owner-ns))
                              tags)))
-            (set! out
-              (jolt-assoc
-                out
-                k
-                (jolt-hash-map kw-fields (apply jolt-vector fields) kw-tags
-                  (apply jolt-vector rtags) kw-type type-tag)))))
+            (unless (chez-type-owns-lookup? type-tag)
+              (set! out
+                (jolt-assoc
+                  out
+                  k
+                  (jolt-hash-map kw-fields (apply jolt-vector fields)
+                    kw-tags (apply jolt-vector rtags) kw-type
+                    type-tag))))))
         ks
         vs))
     out))
@@ -561,7 +570,26 @@
     out))
 
 (define (jrec-field-index r k)
-  (hashtable-ref (jrdesc-index (jrec-desc r)) k #f))
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (if (fx<? i 0) (fx- -1 i) i))))
+
+(define (jrec-get-index r k)
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (fx>=? i 0) i)))
+
+(define (chez-type-owns-lookup? tag)
+  (and (find-method-any-protocol tag "valAt")
+       (not (hashtable-ref chez-record-type-tbl tag #f))
+       #t))
+
+(define (jrdesc-mask-fields! desc)
+  (let ((idx (jrdesc-index desc)))
+    (vector-for-each
+      (lambda (k)
+        (let ((i (hashtable-ref idx k #f)))
+          (when (and i (fx>=? i 0))
+            (hashtable-set! idx k (fx- -1 i)))))
+      (jrdesc-fkeys desc))))
 
 (define (jrec-vec-copy v)
   (let* ((n (vector-length v)) (out (make-vector n)))
@@ -599,26 +627,41 @@
              (and (not (jolt-nil? ext))
                   (not (eq? jrec-absent (jolt-get ext k jrec-absent))))))))
 
+(define (jrec-declared-valat r)
+  (vector-ref (jrdesc-ifc-of r) 6))
+
+(define (jrec-call-valat va coll k d)
+  (let ((m3 (car va)) (m2 (cdr va)))
+    (if (and m2 (jolt-nil? d))
+        (jolt-invoke m2 coll k)
+        (if m3 (jolt-invoke m3 coll k d) (jolt-invoke m2 coll k)))))
+
 (define (jrec-ref coll k d)
   (if (eq? k jolt-deftype-kw)
       (jrec-tag coll)
-      (let ((i (jrec-field-index coll k)))
-        (if i
-            (jrec-field-ref coll i)
-            (let* ((ext (jrec-ext coll))
-                   (v (if (jolt-nil? ext)
-                          jrec-absent
-                          (jolt-get ext k jrec-absent))))
-              (if (eq? v jrec-absent)
-                  (cond
-                    ((find-method-any-protocol (jrec-tag coll) "valAt") =>
-                     (lambda (m) (jolt-invoke m coll k d)))
-                    ((find-method-any-protocol (jrec-tag coll) "get") =>
-                     (lambda (m)
-                       (let ((r (jolt-invoke m coll k)))
-                         (if (jolt-nil? r) d r))))
-                    (else d))
-                  v))))))
+      (let ((i (jrec-get-index coll k)))
+        (if i (jrec-field-ref coll i) (jrec-ref-slow coll k d)))))
+
+(define (jrec-ref-slow coll k d)
+  (let* ((ext (jrec-ext coll))
+         (v (if (jolt-nil? ext)
+                jrec-absent
+                (jolt-get ext k jrec-absent))))
+    (if (eq? v jrec-absent)
+        (cond
+          ((jrec-declared-valat coll) =>
+           (lambda (va) (jrec-call-valat va coll k d)))
+          ((find-method-any-protocol (jrec-tag coll) "valAt") =>
+           (lambda (m) (jolt-invoke m coll k d)))
+          ((find-method-any-protocol (jrec-tag coll) "get") =>
+           (lambda (m)
+             (let ((r (jolt-invoke m coll k))) (if (jolt-nil? r) d r))))
+          (else d))
+        v)))
+
+(define (jrec-field r k) (jrec-lookup r k jolt-nil))
+
+(def-var! "clojure.core" "__deftype-field" jrec-field)
 
 (define (jolt-set-field! inst k v)
   (if (jrec? inst)
@@ -708,14 +751,6 @@
          (map-hash (mix-coll-hash (car total) (cdr total))))
     (i32 (bitwise-xor class-hash map-hash))))
 
-(define (jrec-hash-cached r)
-  (if (jrec-record? r)
-      (let ((h (jrec-hasheq r)))
-        (if (eqv? h 0)
-            (let ((h2 (jrec-hash r))) (jrec-hasheq-set! r h2) h2)
-            h))
-      (jrec-hash r)))
-
 (define (jrec-coll-print-shape r)
   (vector-ref (jrdesc-ifc-of r) 1))
 
@@ -777,7 +812,7 @@
                                  " "
                                  (jolt-pr-readable (jrec-field-ref r i)))
                                acc))))))
-    (string-append "#" (jrec-tag r) "{"
+    (string-append "#" (jch-munge-segments (jrec-tag r)) "{"
       (jolt-str-join-comma entry-strs) "}")))
 
 (register-eq-arm!
@@ -845,7 +880,13 @@
              (else #f)))
       (jch-isa? tag "java.lang.CharSequence") record?
       (and (not record?) (tag-declares-coll-iface? tag))
-      (and (not record?) (tag-declares-sequential? tag)))))
+      (and (not record?) (tag-declares-sequential? tag))
+      (and (not record?)
+           (let ((m3 (find-method-any-protocol-arity tag "valAt" 3))
+                 (m2 (find-method-any-protocol-arity tag "valAt" 2)))
+             (let ((m3 (and m3 (proc-accepts? m3 3) m3))
+                   (m2 (and m2 (proc-accepts? m2 2) m2)))
+               (and (or m3 m2) (cons m3 m2))))))))
 
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x)) (c (jrdesc-ifc d)))
@@ -1166,9 +1207,35 @@
   jrec-record?
   (lambda (x) (list->cseq (jrec-entry-list x))))
 
+(define (jrec-iseq->cseq x)
+  (let ((first-m (jrec-cl x "first"))
+        (next-m (jrec-cl x "next"))
+        (more-m (jrec-cl x "more")))
+    (define (step s)
+      (jolt-make-lazy-seq
+        (lambda ()
+          (let ((tail (cond
+                        (next-m (jolt-invoke next-m s))
+                        (more-m
+                         (let ((r (jolt-invoke more-m s)))
+                           (if (jolt-nil? (jolt-seq r)) jolt-nil r)))
+                        (else jolt-nil))))
+            (jolt-cons
+              (jolt-invoke first-m s)
+              (if (jolt-nil? tail)
+                  jolt-nil
+                  (if (and (jrec? tail) (eq? (jrec-tag tail) (jrec-tag x)))
+                      (step tail)
+                      (jolt-seq tail))))))))
+    (if first-m
+        (jolt-seq (step x))
+        (jrec-abstract-method-error x "first"))))
+
 (register-seq-arm!
   (lambda (x) (jrec-cl x "seq"))
-  (lambda (x) (jolt-seq (jolt-invoke (jrec-cl x "seq") x))))
+  (lambda (x)
+    (let ((r (jolt-invoke (jrec-cl x "seq") x)))
+      (if (eq? r x) (jrec-iseq->cseq x) (jolt-seq r)))))
 
 (register-conj-arm!
   (lambda (coll) (jrec-cl coll "cons"))
@@ -1214,9 +1281,9 @@
   "coll?"
   (lambda (x) (or (jrec-collection? x) (jolt-coll-pred? x))))
 
-(define proto-kw-jtype (keyword #f "jolt/type"))
+(define proto-kw-jtype (keyword "jolt" "type"))
 
-(define proto-kw-protocol (keyword #f "jolt/protocol"))
+(define proto-kw-protocol (keyword "jolt" "protocol"))
 
 (define proto-kw-name (keyword #f "name"))
 
@@ -1287,7 +1354,15 @@
   (let ((mi (hashtable-ref type-method-index type-tag #f)))
     (if mi (hashtable-ref mi method '()) '())))
 
+(define (forget-type-methods! type-tag)
+  (jolt-with-mutex rec-tbl-mu (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+    (hashtable-delete! type-registry type-tag)
+    (hashtable-delete! type-method-index type-tag)
+    (hashtable-delete! type-class-memo type-tag)
+    (hashtable-delete! clone-registry type-tag)))
+
 (define (prune-type-registry! keep?)
+  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -1350,7 +1425,10 @@
                         (let ((h (make-eq-hashtable)))
                           (jrdesc-ptable-set! desc h)
                           h))))
-            (hashtable-set! pt k fn))))))
+            (hashtable-set! pt k fn))))
+      (when (and (string=? method "valAt")
+                 (chez-type-owns-lookup? type-tag))
+        (jrdesc-mask-fields! desc))))
   (remove-clone! type-tag proto method)
   (if #f #f))
 
@@ -1359,6 +1437,16 @@
     (and ti
          (let ((pi (hashtable-ref ti proto #f)))
            (and pi (hashtable-ref pi method #f))))))
+
+(define extend-mark "__jolt_extend__")
+
+(define inline-mark "__jolt_inline__")
+
+(define (extend-impl-table? pi)
+  (and pi
+       (hashtable-ref pi extend-mark #f)
+       (not (hashtable-ref pi inline-mark #f))
+       #t))
 
 (define (find-method-any-protocol type-tag method)
   (let ((entries (tmi-entries type-tag method)))
@@ -1384,13 +1472,18 @@
 
 (define (type-implements-class?-uncached type-tag qname)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
+    (define (declared? k)
+      (let ((pi (hashtable-ref ti k #f)))
+        (and pi (not (extend-impl-table? pi)))))
     (and ti
-         (or (and (hashtable-ref ti qname #f) #t)
+         (or (declared? qname)
              (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))
                     (n (vector-length ks)))
                (let loop ((i 0))
                  (and (fx< i n)
-                      (or (proto-class-match? (vector-ref ks i) qname)
+                      (or (let ((k (vector-ref ks i)))
+                            (and (declared? k)
+                                 (proto-class-match? k qname)))
                           (loop (fx+ i 1))))))))))
 
 (define type-class-memo
@@ -1458,18 +1551,55 @@
                       acc
                       (cons t acc)))))))))
 
+(define jch-tags-plus-cache
+  (make-hashtable string-hash string=?))
+
+(define (jch-tags-plus name extra)
+  (let ((e (hashtable-ref jch-tags-plus-cache name #f)))
+    (if (and e (fx= (car e) jch-graph-epoch))
+        (cdr e)
+        (let* ((epoch jch-graph-epoch)
+               (ts (jch-tags name))
+               (result (if (or (null? ts) (null? (cdr ts)))
+                           (append ts extra)
+                           (cons
+                             (car ts)
+                             (cons (cadr ts) (append extra (cddr ts)))))))
+          (jolt-with-mutex
+            jch-cache-mutex
+            (when (fx= epoch jch-graph-epoch)
+              (hashtable-set!
+                jch-tags-plus-cache
+                name
+                (cons epoch result))))
+          result))))
+
+(define (graph-owned-tags? tags)
+  (and (pair? tags)
+       (let ((head (car tags)))
+         (or (eq? tags (jch-tags head))
+             (let ((e (hashtable-ref jch-tags-plus-cache head #f)))
+               (and e (eq? tags (cdr e))))))))
+
 (define (value-host-tags obj)
   (cond
-    ((flonum? obj) '("Double" "Float" "Number" "Object"))
+    ((flonum? obj)
+     (jch-tags-plus
+       "java.lang.Double"
+       '("java.lang.Float" "Float")))
     ((and (number? obj) (exact? obj) (not (integer? obj)))
-     '("Ratio" "Number" "Object"))
+     (jch-tags "clojure.lang.Ratio"))
     ((and (number? obj) (exact? obj) (integer? obj))
      (if (jolt-bigint-print? obj)
-         '("BigInt" "BigInteger" "Number" "Object")
-         '("Long" "Integer" "Number" "Object")))
-    ((number? obj) '("Number" "Object"))
-    ((string? obj) '("String" "CharSequence" "Object"))
-    ((boolean? obj) '("Boolean" "Object"))
+         (jch-tags-plus
+           "clojure.lang.BigInt"
+           '("java.math.BigInteger" "BigInteger"))
+         (jch-tags-plus
+           "java.lang.Long"
+           '("java.lang.Integer" "Integer"))))
+    ((number? obj) (jch-tags "java.lang.Number"))
+    ((string? obj) (jch-tags "java.lang.String"))
+    ((boolean? obj) (jch-tags "java.lang.Boolean"))
     ((char? obj) (jch-tags "java.lang.Character"))
     ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
     ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))
@@ -1478,7 +1608,7 @@
      (jch-tags "clojure.lang.APersistentVector$SubVector"))
     ((pvec? obj) (jch-tags "clojure.lang.PersistentVector"))
     ((pmap? obj)
-     (if (pmap-order obj)
+     (if (pmap-array? obj)
          (jch-tags "clojure.lang.PersistentArrayMap")
          (jch-tags "clojure.lang.PersistentHashMap")))
     ((pset? obj) (jch-tags "clojure.lang.PersistentHashSet"))
@@ -1492,14 +1622,12 @@
      '("Class" "java.lang.Class" "Object"))
     ((and (procedure? obj) (hashtable-ref proc-name-tbl obj #f)) =>
      (lambda (p)
-       (list
+       (cons
          (string-append
            (class-munge-name (car p))
            "$"
            (class-munge-name (cdr p)))
-         "AFunction" "clojure.lang.AFunction" "AFn"
-         "clojure.lang.AFn" "IFn" "clojure.lang.IFn" "Fn"
-         "clojure.lang.Fn" "Object")))
+         (jch-tags "clojure.lang.AFunction"))))
     ((and (jhost? obj) (jhost-value-tags (jhost-tag obj))) =>
      (lambda (tags) tags))
     ((and (jolt-array? obj) (eq? (jolt-array-kind obj) 'byte))
@@ -1514,6 +1642,7 @@
      '("[D" "Object"))
     ((jolt-array? obj) '("[Ljava.lang.Object;" "Object"))
     ((regex-t? obj) (jch-tags "java.util.regex.Pattern"))
+    ((matcher-t? obj) (jch-tags "java.util.regex.Matcher"))
     ((juuid? obj) (jch-tags "java.util.UUID"))
     ((jinst? obj) (jch-tags "java.util.Date"))
     ((jbigdec? obj) (jch-tags "java.math.BigDecimal"))
@@ -1536,7 +1665,19 @@
      (jch-tags (jolt-ex-info-record-class-name obj)))
     ((jolt-atom? obj) (jch-tags "clojure.lang.Atom"))
     ((jns? obj) (jch-tags "clojure.lang.Namespace"))
+    ((let ((n (jolt-class-name obj)))
+       (and (string? n) (jch-known-exact? n) n)) =>
+     jch-tags)
     (else '("Object"))))
+
+(define (jrec-assoc-entries r ext)
+  (let loop ((s (jolt-seq ext)) (r r))
+    (if (jolt-nil? s)
+        r
+        (let ((e (seq-first s)))
+          (loop
+            (jolt-seq (seq-more s))
+            (jolt-assoc r (jolt-nth e 0) (jolt-nth e 1)))))))
 
 (define (make-deftype-ctor name-sym field-kws . rest-args)
   (let* ((tag (string-append
@@ -1550,41 +1691,56 @@
          (dbl-flags (list->vector (map chez-double-tag? field-tags)))
          (ndbl (vector-length dbl-flags))
          (desc (make-jrdesc tag kws))
+         (_ (when (hashtable-ref chez-tag-desc tag #f)
+              (forget-type-methods! tag)))
          (_ (jolt-with-mutex
               rec-tbl-mu
               (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
                 (when old-desc (jrdesc-ptable-set! old-desc #f)))
               (hashtable-set! chez-tag-desc tag desc)))
+         (_ (when (chez-type-owns-lookup? tag)
+              (jrdesc-mask-fields! desc)))
          (nf (length kws))
          (ctor-name (string-append
                       (chez-current-ns)
                       "/->"
                       (symbol-t-name name-sym)))
+         (build (lambda (args)
+                  (let ((v (make-vector nf jolt-nil)))
+                    (let loop ((as args) (i 0))
+                      (if (or (null? as) (fx=? i nf))
+                          (make-jrec desc v jolt-nil)
+                          (let ((a (car as)))
+                            (vector-set!
+                              v
+                              i
+                              (if (and (fx< i ndbl)
+                                       (vector-ref dbl-flags i))
+                                  (jolt-rec-dbl a)
+                                  a))
+                            (loop (cdr as) (+ i 1))))))))
          (ctor (lambda args
-                 (when (not (= (length args) nf))
-                   (throw-jvm
-                     'ArityException
-                     (string-append
-                       "Wrong number of args ("
-                       (number->string (length args))
-                       ") passed to: "
-                       ctor-name)))
-                 (let ((v (make-vector nf jolt-nil)))
-                   (let loop ((as args) (i 0))
-                     (if (null? as)
-                         (make-jrec desc v jolt-nil)
-                         (let ((a (car as)))
-                           (vector-set!
-                             v
-                             i
-                             (if (and (fx< i ndbl)
-                                      (vector-ref dbl-flags i)
-                                      (number? a)
-                                      (not (flonum? a)))
-                                 (exact->inexact a)
-                                 a))
-                           (loop (cdr as) (+ i 1)))))))))
-    (register-class-ctor! tag ctor)
+                 (let ((n (length args)))
+                   (cond
+                     ((= n nf) (build args))
+                     ((and (= n (+ nf 2))
+                           (hashtable-ref chez-record-type-tbl tag #f))
+                      (let* ((r (build args))
+                             (m (list-ref args nf))
+                             (ext (list-ref args (+ nf 1)))
+                             (r (if (jolt-nil? ext)
+                                    r
+                                    (jrec-assoc-entries r ext))))
+                        (if (jolt-nil? m) r (jolt-with-meta r m))))
+                     (else
+                      (throw-jvm
+                        'ArityException
+                        (string-append
+                          "Wrong number of args ("
+                          (number->string n)
+                          ") passed to: "
+                          ctor-name))))))))
+    (class-ctor-set! tag ctor)
     (when (or (not (hashtable-ref
                      class-ctors-tbl
                      (symbol-t-name name-sym)
@@ -1593,7 +1749,7 @@
                 chez-simple-name-tag
                 (symbol-t-name name-sym)
                 #f))
-      (register-class-ctor! (symbol-t-name name-sym) ctor))
+      (class-ctor-set! (symbol-t-name name-sym) ctor))
     (jolt-with-mutex
       rec-tbl-mu
       (hashtable-set! chez-deftype-tag-set tag #t)
@@ -1613,10 +1769,19 @@
       tag)
     ctor))
 
-(define (make-protocol name-str methods)
-  (jolt-hash-map (keyword #f "jolt/type") (keyword #f "jolt/protocol")
-    (keyword #f "name") (jolt-symbol jolt-nil name-str)
-    (keyword #f "methods") methods))
+(define (make-protocol name-str methods . rest)
+  (let* ((sigs (if (null? rest) (jolt-hash-map) (car rest)))
+         (rest2 (if (null? rest) '() (cdr rest)))
+         (doc (if (null? rest2) jolt-nil (car rest2)))
+         (rest3 (if (null? rest2) '() (cdr rest2)))
+         (method-map (if (null? rest3) (jolt-hash-map) (car rest3)))
+         (base (jolt-hash-map proto-kw-jtype proto-kw-protocol proto-kw-name
+                 (jolt-symbol jolt-nil name-str) (keyword #f "methods")
+                 methods (keyword #f "sigs") sigs (keyword #f "method-map")
+                 method-map)))
+    (if (jolt-nil? doc)
+        base
+        (jolt-assoc base (keyword #f "doc") doc))))
 
 (define (register-protocol-methods! proto-name method-names)
   (let ((ns (chez-current-ns)))
@@ -1649,10 +1814,12 @@
         "java.util.Collection" "Iterable" "java.lang.Iterable"
         "UUID" "BigDecimal" "Date" "Timestamp" "Instant"
         "java.sql.Date" "Pattern" "java.util.regex.Pattern"
-        "Duration" "Period" "LocalDate" "LocalTime" "LocalDateTime"
-        "ZonedDateTime" "OffsetDateTime" "OffsetTime" "ZoneId"
-        "ZoneOffset" "Clock" "Year" "YearMonth" "Month" "DayOfWeek"
-        "ChronoUnit" "ChronoField" "TemporalAmount" "TemporalUnit"
+        "Matcher" "java.util.regex.Matcher" "MatchResult"
+        "java.util.regex.MatchResult" "Duration" "Period"
+        "LocalDate" "LocalTime" "LocalDateTime" "ZonedDateTime"
+        "OffsetDateTime" "OffsetTime" "ZoneId" "ZoneOffset" "Clock"
+        "Year" "YearMonth" "Month" "DayOfWeek" "ChronoUnit"
+        "ChronoField" "TemporalAmount" "TemporalUnit"
         "TemporalField" "ByteBuffer" "java.nio.ByteBuffer" "[B" "[C"
         "[I" "[J" "[D" "[Ljava.lang.Object;" "Reader"
         "java.io.Reader" "Writer" "java.io.Writer" "StringReader"
@@ -1696,8 +1863,6 @@
       ((dotted-name? type-name) type-name)
       (else #f))))
 
-(define extend-mark "__jolt_extend__")
-
 (define (mark-extend! tag proto-name)
   (jolt-with-mutex
     rec-tbl-mu
@@ -1706,17 +1871,39 @@
         (let ((pi (hashtable-ref ti proto-name #f)))
           (when pi (hashtable-set! pi extend-mark #t)))))))
 
+(define (deftype-tag-for-jvm-name type-name)
+  (and (not (hashtable-ref chez-deftype-tag-set type-name #f))
+       (let ((c (jch-registered-name type-name)))
+         (and c
+              (not (string=? c type-name))
+              (hashtable-ref chez-deftype-tag-set c #f)
+              c))))
+
+(define (ns-mapped-class-tag type-name)
+  (let ((cell (var-cell-lookup (chez-current-ns) type-name)))
+    (and cell
+         (let ((v (var-cell-root cell)))
+           (and (jclass? v) (jclass-name v))))))
+
 (define (register-method type-name proto-name method-name
          fn)
-  (let* ((host (canonical-host-tag type-name))
+  (let* ((type-name (or (deftype-tag-for-jvm-name type-name)
+                        type-name))
+         (host (canonical-host-tag type-name))
          (local (string-append (chez-current-ns) "." type-name))
          (tag (cond
                 (host host)
                 ((hashtable-ref chez-deftype-tag-set local #f) local)
                 ((hashtable-ref chez-deftype-tag-set type-name #f)
                  type-name)
+                ((ns-mapped-class-tag type-name))
                 ((hashtable-ref chez-simple-name-tag type-name #f))
-                (else local))))
+                (else
+                 (throw-jvm
+                   'IllegalArgumentException
+                   (string-append
+                     "Unable to resolve classname: "
+                     type-name))))))
     (register-protocol-method tag proto-name method-name fn)
     (mark-extend! tag proto-name)
     jolt-nil))
@@ -1734,6 +1921,7 @@
   (let ((tag (string-append (chez-current-ns) "." type-name)))
     (jolt-with-mutex
       rec-tbl-mu
+      (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
       (let ((ti (or (hashtable-ref type-registry tag #f)
                     (let ((h (make-hashtable string-hash string=?)))
                       (hashtable-set! type-registry tag h)
@@ -1742,7 +1930,11 @@
           (hashtable-set!
             ti
             proto-name
-            (make-hashtable string-hash string=?))))))
+            (make-hashtable string-hash string=?)))
+        (hashtable-set!
+          (hashtable-ref ti proto-name #f)
+          inline-mark
+          #t))))
   (let ((iface (cond
                  ((proto-key-qualified? proto-name)
                   (proto-iface-name proto-name))
@@ -1760,6 +1952,16 @@
       (string-append (chez-current-ns) "." type-name)
       (list iface)))
   jolt-nil)
+
+(define (protocol-miss-throw proto-name method-name obj)
+  (throw-jvm
+    'IllegalArgumentException
+    (string-append "No implementation of method: :" method-name
+      " of protocol: #'" proto-name " found for class: "
+      (if (jolt-nil? obj)
+          "nil"
+          (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
+            (if (string? n) n "?"))))))
 
 (define (protocol-resolve proto-name method-name obj)
   (cond
@@ -1780,18 +1982,14 @@
            (let loop ((tags (value-host-tags obj)))
              (cond
                ((null? tags)
-                (throw-jvm
-                  'IllegalArgumentException
-                  (string-append "No reified method " method-name)))
+                (protocol-miss-throw proto-name method-name obj))
                ((find-protocol-method (car tags) proto-name method-name))
                (else (loop (cdr tags))))))))
     (else
      (let loop ((tags (value-host-tags obj)))
        (cond
          ((null? tags)
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " in " proto-name)))
+          (protocol-miss-throw proto-name method-name obj))
          ((find-protocol-method (car tags) proto-name method-name))
          (else (loop (cdr tags))))))))
 
@@ -1896,6 +2094,15 @@
   (or (find-clone type-tag proto-name method-name)
       (devirt-resolve type-tag proto-name method-name obj)))
 
+(define (jrec-comparable-method v)
+  (and (jrec? v)
+       (find-method-any-protocol (jrec-tag v) "compareTo")))
+
+(register-compare-arm!
+  (lambda (a b) (and (jrec-comparable-method a) #t))
+  (lambda (a b)
+    (jnum->exact (jolt-invoke (jrec-comparable-method a) a b))))
+
 (define-record-type jiterator
   (fields (mutable cur))
   (nongenerative jolt-iterator-v1))
@@ -1908,25 +2115,92 @@
              (irr (if (irritants-condition? c)
                       (condition-irritants c)
                       '()))
-             (append-irr (lambda ()
-                           (let loop ((xs irr) (acc m))
-                             (if (null? xs)
-                                 acc
-                                 (loop
-                                   (cdr xs)
-                                   (string-append
-                                     acc
-                                     " "
-                                     (jolt-pr-str (car xs)))))))))
-        (if (and (string? m)
-                 (let scan ((i 0))
-                   (cond
-                     ((>= i (string-length m)) #f)
-                     ((char=? (string-ref m i) #\~) #t)
-                     (else (scan (+ i 1))))))
-            (guard (e (#t (append-irr))) (apply format m irr))
-            (append-irr)))
+             (irr (if (list? irr) irr '()))
+             (who (and (who-condition? c) (condition-who c)))
+             (text (if (string? m)
+                       (condition-template-fill m irr)
+                       (with-output-to-string (lambda () (display m))))))
+        (cond
+          ((symbol? who)
+           (string-append (symbol->string who) ": " text))
+          ((string? who) (string-append who ": " text))
+          (else text)))
       (with-output-to-string (lambda () (display-condition c)))))
+
+(define (condition-directive m i)
+  (let* ((n (string-length m))
+         (j (if (and (fx<? (fx+ i 1) n)
+                     (char=? (string-ref m (fx+ i 1)) #\:))
+                (fx+ i 2)
+                (fx+ i 1)))
+         (d (and (fx<? j n) (char-downcase (string-ref m j)))))
+    (cond
+      ((memv d '(#\s #\a)) (cons (fx+ j 1) d))
+      ((eqv? d #\~) (cons (fx+ j 1) #\~))
+      (else (cons (fx+ j 1) #f)))))
+
+(define (condition-append-irritants s irr)
+  (let loop ((xs irr) (acc s))
+    (if (null? xs)
+        acc
+        (loop
+          (cdr xs)
+          (string-append
+            acc
+            " "
+            (condition-irritant-string (car xs) #t))))))
+
+(define (condition-template-fill m irr)
+  (let ((n (string-length m)))
+    (let scan ((i 0) (simple? #t))
+      (cond
+        ((fx>=? i n)
+         (if simple?
+             (condition-fill-simple m irr)
+             (guard (e (#t (condition-append-irritants m irr)))
+               (apply format m irr))))
+        ((char=? (string-ref m i) #\~)
+         (let ((d (condition-directive m i)))
+           (scan (car d) (and simple? (cdr d) #t))))
+        (else (scan (fx+ i 1) simple?))))))
+
+(define (condition-irritant-string x readable?)
+  (let ((s (if readable?
+               (jolt-pr-readable x)
+               (jolt-str-render-one x))))
+    (if (string=? s "#object[:object]")
+        (with-output-to-string (lambda () (write x)))
+        s)))
+
+(define (condition-fill-simple m irr)
+  (let ((n (string-length m)))
+    (let loop ((i 0) (start 0) (irr irr) (acc '()))
+      (cond
+        ((fx>=? i n)
+         (condition-append-irritants
+           (apply
+             string-append
+             (reverse (cons (substring m start n) acc)))
+           irr))
+        ((char=? (string-ref m i) #\~)
+         (let* ((d (condition-directive m i))
+                (next (car d))
+                (kind (cdr d))
+                (acc (cons (substring m start i) acc)))
+           (cond
+             ((eqv? kind #\~) (loop next next irr (cons "~" acc)))
+             ((null? irr) (loop next next irr acc))
+             (else
+              (loop
+                next
+                next
+                (cdr irr)
+                (cons
+                  (condition-irritant-string
+                    (car irr)
+                    (not (eqv? kind #\a)))
+                  acc))))))
+        (else (loop (fx+ i 1) start irr acc))))))
 
 (def-var!
   "jolt.host"
@@ -1934,30 +2208,209 @@
   (lambda (c)
     (if (condition? c) (condition->message-string c) jolt-nil)))
 
+(define rd-class-method-hook #f)
+
+(define (set-rd-class-method-hook! f)
+  (set! rd-class-method-hook f))
+
+(define (rd-java-list? obj)
+  (or (pvec? obj)
+      (cseq? obj)
+      (empty-list-t? obj)
+      (jolt-lazyseq? obj)))
+
+(define (rd-java-set? obj)
+  (or (pset? obj) (htable-sorted-set? obj)))
+
+(define (rd-persistent-coll? obj)
+  (or (rd-java-list? obj) (rd-java-set? obj)))
+
+(define (rd-coll-last obj)
+  (if (pvec? obj)
+      (jolt-nth obj (fx- (jolt-count obj) 1))
+      (let loop ((s (jolt-seq obj)))
+        (let ((n (jolt-seq (seq-more s))))
+          (if (jolt-nil? n) (seq-first s) (loop n))))))
+
+(define rd-collection-mutators
+  '(("add" 1) ("addAll" 1) ("clear" 0) ("remove" 1)
+     ("removeAll" 1) ("removeIf" 1) ("retainAll" 1)))
+
+(define rd-list-mutators
+  '(("add" 2) ("addAll" 2) ("set" 2) ("addFirst" 1) ("addLast" 1)
+     ("removeFirst" 0) ("removeLast" 0) ("replaceAll" 1)
+     ("sort" 1)))
+
+(define (rd-mutator-in? table name argc)
+  (let loop ((t table))
+    (cond
+      ((null? t) #f)
+      ((and (string=? (caar t) name) (fx=? (cadar t) argc)) #t)
+      (else (loop (cdr t))))))
+
+(define (rd-coll-mutator? obj name argc)
+  (or (and (rd-persistent-coll? obj)
+           (rd-mutator-in? rd-collection-mutators name argc))
+      (and (rd-java-list? obj)
+           (rd-mutator-in? rd-list-mutators name argc))))
+
+(define (rd-var-meta obj)
+  (let ((m (var-cell-meta obj)))
+    (and m (not (jolt-nil? m)) m)))
+
+(define (rd-var-meta-get obj key)
+  (let ((m (rd-var-meta obj)))
+    (if m (jolt-get m (keyword #f key) jolt-nil) jolt-nil)))
+
+(define (rd-var-meta-flag? obj key)
+  (jolt-truthy? (rd-var-meta-get obj key)))
+
+(define (rd-args->list x)
+  (let ((s (jolt-seq x)))
+    (if (jolt-nil? s) '() (seq->list s))))
+
+(define (rd-iref-method name argc)
+  (cond
+    ((string=? name "addWatch")
+     (and (fx=? argc 2) jolt-add-watch))
+    ((string=? name "removeWatch")
+     (and (fx=? argc 1) jolt-remove-watch))
+    ((string=? name "getWatches")
+     (and (fx=? argc 0) jolt-get-watches))
+    ((string=? name "notifyWatches")
+     (and (fx=? argc 2) jolt-notify-watches))
+    ((string=? name "setValidator")
+     (and (fx=? argc 1) jolt-set-validator!))
+    ((string=? name "getValidator")
+     (and (fx=? argc 0) jolt-get-validator))
+    (else #f)))
+
+(define rd-extra-deref-hook #f)
+
+(define (set-rd-extra-deref-hook! f)
+  (set! rd-extra-deref-hook f))
+
+(define (rd-deref-kind x)
+  (cond
+    ((or (jolt-atom? x)
+         (jolt-ref? x)
+         (jvol? x)
+         (jolt-reduced? x))
+     'ideref)
+    (rd-extra-deref-hook (rd-extra-deref-hook x))
+    (else #f)))
+
+(define (rd-derefable? x) (and (rd-deref-kind x) #t))
+
+(define (rd-blocking-derefable? x)
+  (eq? 'iblocking (rd-deref-kind x)))
+
+(define (rd-ideref-method x name argc)
+  (cond
+    ((string=? name "deref")
+     (and (or (fx=? argc 0)
+              (and (fx=? argc 2) (rd-blocking-derefable? x)))
+          jolt-deref))
+    ((string=? name "get") (and (fx=? argc 0) jolt-deref))
+    ((string=? name "getAsBoolean")
+     (and (fx=? argc 0) rd-deref-as-boolean))
+    ((string=? name "getAsInt")
+     (and (fx=? argc 0) rd-deref-as-int))
+    ((string=? name "getAsLong")
+     (and (fx=? argc 0) rd-deref-as-long))
+    ((string=? name "getAsDouble")
+     (and (fx=? argc 0) rd-deref-as-double))
+    (else #f)))
+
+(define (rd-deref-as-boolean x)
+  (jolt-boolean (jolt-deref x)))
+
+(define (rd-deref-as-int x) (jolt-int-cast (jolt-deref x)))
+
+(define (rd-deref-as-long x)
+  (jolt-long-cast (jolt-deref x)))
+
+(define (rd-deref-as-double x) (jolt-double (jolt-deref x)))
+
+(define (rd-atom-method name argc)
+  (cond
+    ((string=? name "swap")
+     (and (memv argc '(1 2 3 4)) rd-atom-swap))
+    ((string=? name "swapVals")
+     (and (memv argc '(1 2 3 4)) rd-atom-swap-vals))
+    ((string=? name "reset") (and (fx=? argc 1) jolt-reset!))
+    ((string=? name "resetVals")
+     (and (fx=? argc 1) jolt-reset-vals!))
+    ((string=? name "compareAndSet")
+     (and (fx=? argc 2) jolt-compare-and-set!))
+    (else #f)))
+
+(define (rd-spread-tail args)
+  (if (fx=? (length args) 4)
+      (cons
+        (car args)
+        (cons
+          (cadr args)
+          (cons (caddr args) (rd-args->list (cadddr args)))))
+      args))
+
+(define (rd-atom-swap a . args)
+  (apply jolt-swap! a (rd-spread-tail args)))
+
+(define (rd-atom-swap-vals a . args)
+  (apply jolt-swap-vals! a (rd-spread-tail args)))
+
+(define (rd-ref-method name argc)
+  (cond
+    ((string=? name "set") (and (fx=? argc 1) jolt-ref-set))
+    ((string=? name "alter") (and (fx=? argc 2) rd-ref-alter))
+    ((string=? name "commute")
+     (and (fx=? argc 2) rd-ref-commute))
+    ((string=? name "touch") (and (fx=? argc 0) rd-ref-touch))
+    ((string=? name "getMinHistory")
+     (and (fx=? argc 0) jolt-ref-min-history))
+    ((string=? name "setMinHistory")
+     (and (fx=? argc 1) jolt-ref-min-history))
+    ((string=? name "getMaxHistory")
+     (and (fx=? argc 0) jolt-ref-max-history))
+    ((string=? name "setMaxHistory")
+     (and (fx=? argc 1) jolt-ref-max-history))
+    ((string=? name "getHistoryCount")
+     (and (fx=? argc 0) jolt-ref-history-count))
+    ((string=? name "trimHistory")
+     (and (fx=? argc 0) rd-ref-trim-history))
+    (else #f)))
+
+(define (rd-ref-alter r f args)
+  (apply jolt-alter r f (rd-args->list args)))
+
+(define (rd-ref-commute r f args)
+  (apply jolt-commute r f (rd-args->list args)))
+
+(define (rd-ref-touch r) (jolt-ensure r) jolt-nil)
+
+(define (rd-ref-trim-history r) jolt-nil)
+
 (define (record-method-dispatch-base obj method-name
          rest-args)
-  (let ((rest (if (jolt-nil? rest-args)
-                  '()
-                  (seq->list rest-args))))
+  (let ((rest (method-rest-args->list rest-args)))
     (cond
       ((and (procedure? obj) (deftype-ctor-tag obj)) =>
        (lambda (tag)
-         (cond
-           ((or (string=? method-name "getName")
-                (string=? method-name "getCanonicalName")
-                (string=? method-name "getTypeName"))
-            tag)
-           ((string=? method-name "getSimpleName") (last-dot tag))
-           ((string=? method-name "toString")
-            (string-append "class " tag))
-           (else
-            (throw-jvm
-              'IllegalArgumentException
-              (string-append
-                "No method "
-                method-name
-                " on class "
-                tag))))))
+         (let ((hit (and rd-class-method-hook
+                         (rd-class-method-hook tag method-name rest))))
+           (if (pair? hit)
+               (car hit)
+               (let ((jvm (jch-munge-segments tag)))
+                 (cond
+                   ((or (string=? method-name "getName")
+                        (string=? method-name "getCanonicalName")
+                        (string=? method-name "getTypeName"))
+                    jvm)
+                   ((string=? method-name "getSimpleName") (last-dot jvm))
+                   ((string=? method-name "toString")
+                    (string-append "class " jvm))
+                   (else (dispatch-miss obj method-name rest))))))))
       ((jolt-multifn? obj)
        (cond
          ((string=? method-name "addMethod")
@@ -1997,10 +2450,7 @@
                       (vector-ref vs i)))))))
          ((string=? method-name "toString")
           (jolt-str-render-one obj))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on MultiFn")))))
+         (else (dispatch-miss obj method-name rest))))
       ((and (jrec? obj)
             (find-method-any-protocol-arity
               (jrec-tag obj)
@@ -2046,10 +2496,10 @@
            (cond
              (f (apply jolt-invoke f obj rest))
              (d (record-method-dispatch d method-name rest-args))
-             (else
-              (throw-jvm
-                'IllegalArgumentException
-                (string-append "No method " method-name)))))))
+             ((and abstract-class-method-hook
+                   (abstract-class-method-hook obj method-name)) =>
+              (lambda (m) (apply m obj rest)))
+             (else (dispatch-miss obj method-name rest))))))
       ((string? obj) (jolt-string-method method-name obj rest))
       ((jiterator? obj)
        (cond
@@ -2062,10 +2512,7 @@
                 (let ((v (jolt-first s)))
                   (jiterator-cur-set! obj (jolt-rest s))
                   v))))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Iterator")))))
+         (else (dispatch-miss obj method-name rest))))
       ((string=? method-name "iterator")
        (make-jiterator (jolt-seq obj)))
       ((keyword-t? obj)
@@ -2090,10 +2537,7 @@
                2654435769)))
          ((string=? method-name "equals")
           (and (pair? rest) (eq? obj (car rest))))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Keyword")))))
+         (else (dispatch-miss obj method-name rest))))
       ((symbol-t? obj)
        (cond
          ((string=? method-name "getName") (symbol-t-name obj))
@@ -2109,27 +2553,35 @@
           (and (pair? rest) (jolt=2 obj (car rest))))
          ((string=? method-name "hashCode")
           (java-symbol-hash (symbol-t-name obj) (symbol-t-ns obj)))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Symbol")))))
+         (else (dispatch-miss obj method-name rest))))
       ((jns? obj)
        (cond
          ((or (string=? method-name "name")
               (string=? method-name "getName"))
           (jolt-symbol #f (jns-name obj)))
          ((string=? method-name "toString") (jns-name obj))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Namespace")))))
+         (else (dispatch-miss obj method-name rest))))
+      ((and (jolt-iref-watchable? obj)
+            (rd-iref-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (jolt-atom? obj)
+            (rd-atom-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (jolt-ref? obj)
+            (rd-ref-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (rd-derefable? obj)
+            (rd-ideref-method obj method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
       ((var-cell? obj)
        (cond
-         ((string=? method-name "ns") (intern-ns! (var-cell-ns obj)))
+         ((or (string=? method-name "ns")
+              (string=? method-name "-ns"))
+          (intern-ns! (var-cell-ns obj)))
          ((or (string=? method-name "sym")
-              (string=? method-name "name"))
+              (string=? method-name "-sym"))
           (jolt-symbol #f (var-cell-name obj)))
-         ((string=? method-name "getName")
+         ((string=? method-name "toSymbol")
           (jolt-symbol (var-cell-ns obj) (var-cell-name obj)))
          ((string=? method-name "toString")
           (string-append
@@ -2137,17 +2589,77 @@
             (var-cell-ns obj)
             "/"
             (var-cell-name obj)))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Var")))))
+         ((string=? method-name "getRawRoot") (var-cell-root obj))
+         ((string=? method-name "isMacro") (var-cell-macro? obj))
+         ((string=? method-name "isBound") (jolt-var-bound-one? obj))
+         ((string=? method-name "hasRoot")
+          (not (jolt-var-unbound? (var-cell-root obj))))
+         ((string=? method-name "isDynamic") (var-cell-dynamic? obj))
+         ((string=? method-name "isPublic")
+          (not (rd-var-meta-flag? obj "private")))
+         ((string=? method-name "getTag")
+          (rd-var-meta-get obj "tag"))
+         ((or (string=? method-name "deref")
+              (string=? method-name "get"))
+          (var-cell-deref obj))
+         ((and (string=? method-name "getThreadBinding")
+               (null? rest))
+          (jolt-var-thread-binding obj))
+         ((string=? method-name "setDynamic")
+          (var-cell-dynamic?-set!
+            obj
+            (if (pair? rest) (jolt-truthy? (car rest)) #t))
+          obj)
+         ((string=? method-name "setMacro")
+          (var-cell-macro?-set! obj #t)
+          (var-cell-meta-set!
+            obj
+            (jolt-assoc
+              (or (rd-var-meta obj) (jolt-hash-map))
+              jolt-kw-var-macro
+              #t))
+          jolt-nil)
+         ((string=? method-name "bindRoot")
+          (jolt-alter-var-root obj (lambda (_) (car rest)))
+          (var-cell-macro?-set! obj #f)
+          (let ((m (rd-var-meta obj)))
+            (when m
+              (var-cell-meta-set!
+                obj
+                (jolt-dissoc2 m jolt-kw-var-macro))))
+          jolt-nil)
+         ((string=? method-name "alterRoot")
+          (apply
+            jolt-alter-var-root
+            obj
+            (car rest)
+            (rd-args->list (cadr rest))))
+         ((and (string=? method-name "unbindRoot") (null? rest))
+          (var-root-set!
+            obj
+            (make-jolt-var-unbound
+              (var-cell-ns obj)
+              (var-cell-name obj)))
+          jolt-nil)
+         ((and (string=? method-name "set") (pair? rest))
+          (jolt-set-var! obj (car rest)))
+         ((and (string=? method-name "fn") (null? rest))
+          (let ((v (var-cell-deref obj)))
+            (if (jolt-truthy?
+                  (jolt-invoke1 (var-deref "clojure.core" "ifn?") v))
+                v
+                (jolt-throw
+                  (jolt-host-throwable
+                    "java.lang.ClassCastException"
+                    (string-append
+                      "class "
+                      (guard (c (#t "?")) (jolt-class-name v))
+                      " cannot be cast to class clojure.lang.IFn"))))))
+         (else (dispatch-miss obj method-name rest))))
       ((condition? obj)
        (cond
          ((throwable-method obj method-name rest) => car)
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Throwable")))))
+         (else (dispatch-miss obj method-name rest))))
       ((char? obj)
        (cond
          ((string=? method-name "toString") (string obj))
@@ -2160,10 +2672,41 @@
          ((string=? method-name "compareTo")
           (let ((o (car rest)))
             (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on char")))))
+         (else (dispatch-miss obj method-name rest))))
+      ((and (string=? method-name "getFirst") (rd-java-list? obj))
+       (let ((s (jolt-seq obj)))
+         (if (jolt-nil? s)
+             (throw-jvm 'NoSuchElementException "")
+             (seq-first s))))
+      ((and (string=? method-name "getLast") (rd-java-list? obj))
+       (if (jolt-nil? (jolt-seq obj))
+           (throw-jvm 'NoSuchElementException "")
+           (rd-coll-last obj)))
+      ((and (string=? method-name "reversed") (rd-java-list? obj))
+       (let ((items (reverse (seq->list (jolt-seq obj)))))
+         (if (pvec? obj)
+             (apply jolt-vector items)
+             (list->cseq items))))
+      ((rd-coll-mutator? obj method-name (length rest))
+       (let ((empty? (jolt-nil? (jolt-seq obj))))
+         (cond
+           ((string=? method-name "removeIf")
+            (if (and (not empty?)
+                     (let loop ((s (jolt-seq obj)))
+                       (and (not (jolt-nil? s))
+                            (or (jolt-truthy?
+                                  (jolt-invoke (car rest) (seq-first s)))
+                                (loop (jolt-seq (seq-more s)))))))
+                (throw-jvm 'UnsupportedOperationException "")
+                #f))
+           ((not empty?) (throw-jvm 'UnsupportedOperationException ""))
+           ((or (string=? method-name "removeFirst")
+                (string=? method-name "removeLast"))
+            (throw-jvm 'NoSuchElementException ""))
+           ((or (string=? method-name "replaceAll")
+                (string=? method-name "sort"))
+            jolt-nil)
+           (else (throw-jvm 'UnsupportedOperationException "")))))
       ((or (string=? method-name "indexOf")
            (string=? method-name "lastIndexOf"))
        (let ((target (car rest))
@@ -2191,8 +2734,25 @@
        (let ((boxed (dot-coll-method obj method-name rest)))
          (if boxed
              (car boxed)
-             (no-method-throw method-name obj (length rest)))))
-      (else (no-method-throw method-name obj (length rest))))))
+             (dispatch-miss obj method-name rest))))
+      (else (dispatch-miss obj method-name rest)))))
+
+(define class-ext-fallback-hook #f)
+
+(define (set-class-ext-fallback-hook! f)
+  (set! class-ext-fallback-hook f))
+
+(define abstract-class-method-hook #f)
+
+(define (set-abstract-class-method-hook! f)
+  (set! abstract-class-method-hook f))
+
+(define (dispatch-miss obj method-name args)
+  (let ((f (and class-ext-fallback-hook
+                (class-ext-fallback-hook obj method-name))))
+    (if f
+        (apply jolt-invoke f obj args)
+        (no-method-throw method-name obj (length args)))))
 
 (define (no-method-throw method-name obj . maybe-argc)
   (let* ((argc (if (null? maybe-argc) 0 (car maybe-argc)))
@@ -2224,6 +2784,65 @@
            (number->string argc) " args for class "
            (guard (e (#t "?")) (jolt-class-name obj))))))))
 
+(define (dot-coll-method obj name args)
+  (cond
+    ((string=? name "count") (list (jolt-count obj)))
+    ((string=? name "seq") (list (jolt-seq obj)))
+    ((string=? name "nth") (list (apply jolt-nth obj args)))
+    ((or (string=? name "get") (string=? name "valAt"))
+     (list (apply jolt-get obj args)))
+    ((string=? name "containsKey")
+     (list (jolt-contains? obj (car args))))
+    ((string=? name "contains")
+     (list
+       (if (pset? obj)
+           (jolt-contains? obj (car args))
+           (let ((x (car args)))
+             (let loop ((s (jolt-seq obj)))
+               (cond
+                 ((jolt-nil? s) #f)
+                 ((jolt=2 (seq-first s) x) #t)
+                 (else (loop (jolt-seq (seq-more s))))))))))
+    ((string=? name "size") (list (jolt-count obj)))
+    ((string=? name "isEmpty") (list (jolt-empty? obj)))
+    ((string=? name "hashCode") (list (jolt-java-hashcode obj)))
+    ((string=? name "cons") (list (jolt-conj obj (car args))))
+    ((or (string=? name "assoc") (string=? name "assocN"))
+     (list (jolt-assoc obj (car args) (cadr args))))
+    ((string=? name "without")
+     (list (jolt-dissoc obj (car args))))
+    ((string=? name "disjoin")
+     (list (jolt-disj obj (car args))))
+    ((string=? name "pop") (list (jolt-pop obj)))
+    ((string=? name "peek") (list (jolt-peek obj)))
+    ((string=? name "equiv")
+     (list (if (jolt= obj (car args)) #t #f)))
+    ((string=? name "asTransient")
+     (list (jolt-transient-new obj)))
+    ((string=? name "meta") (list (jolt-meta obj)))
+    ((string=? name "withMeta")
+     (list (jolt-with-meta obj (car args))))
+    ((and (jolt-map-entry? obj)
+          (or (string=? name "key") (string=? name "getKey")))
+     (list (jolt-nth obj 0)))
+    ((and (jolt-map-entry? obj)
+          (or (string=? name "val") (string=? name "getValue")))
+     (list (jolt-nth obj 1)))
+    ((and (jolt-map? obj) (string=? name "keySet"))
+     (list (apply jolt-hash-set (seq->list (jolt-keys obj)))))
+    ((and (jolt-map? obj) (string=? name "values"))
+     (list (apply jolt-vector (seq->list (jolt-vals obj)))))
+    ((and (jolt-map? obj) (string=? name "entrySet"))
+     (list (jolt-seq obj)))
+    ((string=? name "iterator")
+     (list (make-jiterator (jolt-seq obj))))
+    ((string=? name "reduce")
+     (list
+       (if (pair? (cdr args))
+           (jolt-reduce (car args) (cadr args) obj)
+           (jolt-reduce (car args) obj))))
+    (else #f)))
+
 (define method-dispatch-arms '())
 
 (define (register-method-arm! priority arm)
@@ -2234,7 +2853,11 @@
         ((< priority (caar as)) (cons (cons priority arm) as))
         (else (cons (car as) (ins (cdr as))))))))
 
+(define arm-priority-user-override 1)
+
 (define arm-priority-getclass 5)
+
+(define arm-priority-monitor 5)
 
 (define arm-priority-string 6)
 
@@ -2252,12 +2875,31 @@
 
 (define arm-priority-host-type 44)
 
+(define arm-priority-agent 45)
+
+(define arm-priority-bigdec 46)
+
 (define (record-method-dispatch obj method-name rest-args)
+  (when (jolt-nil? obj)
+    (no-method-throw
+      method-name
+      obj
+      (if (jolt-nil? rest-args) 0 (jolt-count rest-args))))
   (let loop ((as method-dispatch-arms))
     (if (null? as)
         (record-method-dispatch-base obj method-name rest-args)
         (let ((r ((cdar as) obj method-name rest-args)))
           (if (eq? r 'pass) (loop (cdr as)) r)))))
+
+(define (method-rest-args->list rest-args)
+  (cond
+    ((jolt-nil? rest-args) '())
+    ((and (pvec? rest-args)
+          (fx=?
+            (pvec-cnt rest-args)
+            (vector-length (pvec-tail rest-args))))
+     (vector->list (pvec-tail rest-args)))
+    (else (seq->list rest-args))))
 
 (register-method-arm!
   arm-priority-string
@@ -2266,7 +2908,7 @@
         (jolt-string-method
           method-name
           obj
-          (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+          (method-rest-args->list rest-args))
         'pass)))
 
 (register-method-arm!
@@ -2279,6 +2921,8 @@
 (define-record-type jreify
   (fields methods protos delegate)
   (nongenerative chez-jreify-v2))
+
+(register-code-value! jreify?)
 
 (define (reified-methods obj)
   (and (jreify? obj) (jreify-methods obj)))
@@ -2351,8 +2995,20 @@
   (lambda (x)
     (jolt-seq (record-method-dispatch x "iterator" jolt-nil))))
 
+(define (iface-seqable? v)
+  (and (or (jrec? v) (jreify? v))
+       (or (and (iface-method v "seq" #f) #t)
+           (and (iface-method v "iterator" #f) #t))))
+
 (define (jolt-satisfies? proto obj)
-  (let* ((pn (jolt-get proto (keyword #f "name") jolt-nil))
+  (if (jclass? proto)
+      (if (instance-check proto obj) #t #f)
+      (jolt-satisfies-protocol? proto obj)))
+
+(define kw-proto-name (keyword #f "name"))
+
+(define (jolt-satisfies-protocol? proto obj)
+  (let* ((pn (jolt-get proto kw-proto-name jolt-nil))
          (pn-str (if (symbol-t? pn) (symbol-t-name pn) pn)))
     (unless (string? pn-str)
       (throw-jvm
@@ -2373,11 +3029,43 @@
                   (jreify-protos obj))
                 #t))
           (else #f))
-        (let loop ((tags (value-host-tags obj)))
-          (cond
-            ((null? tags) #f)
-            ((type-satisfies? (car tags) pn-str) #t)
-            (else (loop (cdr tags))))))))
+        (let* ((tags (value-host-tags obj))
+               (memo (satisfies-memo-ref pn-str tags)))
+          (if memo
+              (vector-ref memo 2)
+              (let* ((pe jolt-proto-epoch)
+                     (ge jch-graph-epoch)
+                     (ans (let loop ((tags tags))
+                            (cond
+                              ((null? tags) #f)
+                              ((type-satisfies? (car tags) pn-str) #t)
+                              (else (loop (cdr tags)))))))
+                (satisfies-memo-set! pn-str tags pe ge ans)
+                ans))))))
+
+(define satisfies-memo
+  (make-hashtable string-hash string=?))
+
+(define (satisfies-memo-ref pn tags)
+  (let ((inner (hashtable-ref satisfies-memo pn #f)))
+    (and inner
+         (let ((e (hashtable-ref inner tags #f)))
+           (and e
+                (fx= (vector-ref e 0) jolt-proto-epoch)
+                (fx= (vector-ref e 1) jch-graph-epoch)
+                e)))))
+
+(define (satisfies-memo-set! pn tags pe ge ans)
+  (when (graph-owned-tags? tags)
+    (jolt-with-mutex
+      jch-cache-mutex
+      (when (and (fx= pe jolt-proto-epoch)
+                 (fx= ge jch-graph-epoch))
+        (let ((inner (or (hashtable-ref satisfies-memo pn #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! satisfies-memo pn t)
+                           t))))
+          (hashtable-set! inner tags (vector pe ge ans)))))))
 
 (define (last-dot s)
   (let loop ((i (- (string-length s) 1)))
@@ -2394,7 +3082,7 @@
     (else (memp pred (cdr lst)))))
 
 (define (extenders proto)
-  (let* ((pn (jolt-get proto (keyword #f "name") jolt-nil))
+  (let* ((pn (jolt-get proto kw-proto-name jolt-nil))
          (pn-str (if (symbol-t? pn) (symbol-t-name pn) pn))
          (out '()))
     (vector-for-each
@@ -2465,7 +3153,7 @@
                      (symbol-t-name name-sym))
                    #f)))
       (when (and ctor shape)
-        (register-class-statics!
+        (class-statics-merge!
           tag
           (list
             (cons
@@ -2536,7 +3224,13 @@
 
 (def-var! "clojure.core" "extenders" extenders)
 
-(def-var! "jolt.host" "type-satisfies?" type-satisfies?)
+(def-var!
+  "jolt.host"
+  "type-satisfies?"
+  (lambda (type-tag proto)
+    (type-satisfies?
+      (or (deftype-tag-for-jvm-name type-tag) type-tag)
+      proto)))
 
 (def-var!
   "jolt.host"

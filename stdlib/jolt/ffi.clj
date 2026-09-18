@@ -6,39 +6,169 @@
       (require '[jolt.ffi :as ffi])
       (ffi/load-library {:darwin \"libsqlite3.0.dylib\" :linux \"libsqlite3.so.0\"})
       (ffi/defcfn sqlite3-open \"sqlite3_open\" [:string :pointer] :int)
-      (let [pp (ffi/alloc (ffi/sizeof :pointer))]
-        (sqlite3-open \"x.db\" pp)
-        (let [db (ffi/read pp :pointer)] ...)
-        (ffi/free pp))
+      (with-open [arena (ffi/confined-arena)]
+        (let [pp (ffi/alloc arena :pointer)]
+          (sqlite3-open \"x.db\" pp)
+          (ffi/read pp :pointer)))
+
+  Every allocation belongs to an ARENA, which owns its lifetime, or to the
+  caller, who frees it by hand. See \"arenas\" below.
 
   Types (keywords): :int :uint :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8/:u8/:byte :char,
-  plus exact scalar widths :int8/:i8, :int16/:short, :uint16/:ushort, :int32,
-  :uint32.
+  :iptr :uptr :double :float :pointer :string :bool :void :uint8/:u8/:byte
+  :char, plus exact scalar widths :int8/:i8, :int16/:short, :uint16/:ushort,
+  :int32, :uint32.
   Exact widths use native byte order for both memory and signatures. Signed and
   unsigned names at one width expose the same stored bits; wire byte order stays
   an explicit codec or htons/ntohs concern.
 
+  :bool is a ONE-BYTE C boolean (C99 _Bool), true or false in jolt. jolt
+  truthiness decides the byte on the way out, so nil and false send 0 and every
+  other value sends 1 — a C predicate answers true/false rather than the truthy
+  number 0.
+
   :string carries NULL as nil in both directions: nil as an argument reaches C
   as a null char*, which is how APIs like setlocale spell \"query instead of
   set\", and a function returning NULL reads as nil. ffi/null stays the
-  :pointer spelling of NULL and is unchanged.
+  :pointer spelling of NULL and is unchanged. A foreign-callable gets the same
+  translation with the directions swapped, since C is the caller there: a null
+  char* C passes in arrives as nil, and returning nil hands C a null char*.
+
+  nil is the only spelling of NULL a :string position accepts. false is
+  rejected rather than sent, though Chez's own `string` type would take it as
+  NULL: a boolean arriving in a :string position is a mistake — a `when` that
+  did not fire, a predicate result — and silently sending it would land on the
+  one value C reads as \"absent\". (A boolean belongs in a :bool position, where
+  it means what it says.) Every other non-string is rejected too, which the
+  other foreign types already did on their own.
 
   A struct passed or returned by value uses the same literal descriptor as
   layout, wrapped in [:by-value descriptor]. An argument value is a non-null
   caller-owned pointer to the struct bytes. An aggregate-returning callable takes
   a non-null caller-owned destination pointer as its first Jolt argument, writes
   the C return there, and returns that pointer. Aggregate callbacks and exports
-  are not supported. A fixed aggregate may precede :varargs, but aggregate
-  variadic arguments and aggregate-return-plus-varargs are rejected.
+  are not supported. A fixed aggregate may precede the variadic marker, but
+  aggregate variadic arguments and aggregate-return-plus-varargs are rejected.
 
-  The memory/library primitives (alloc/free/read/write/sizeof/load-library/
-  ptr->string/string->ptr/null/null?) are provided by the host, as are the
-  buffer moves: read-bytes/write-bytes decode and encode UTF-8, read-array/
-  write-array move raw octets to and from a byte-array, and read-into! fills a
-  slice of an EXISTING byte-array — so a caller reading a stream whose length
-  it already knows fills one buffer instead of regrowing an accumulator per
-  chunk. All of them move the block in one copy, not a byte at a time.
+  LAYOUTS. (layout [:struct [[field type] ...]]) compiles a literal descriptor
+  to ABI layout data. Fields may use [:array element-type positive-count];
+  arrays may hold fixed-size scalars, nested structs or unions, or other fixed
+  arrays. read and write take a compiled layout where they take a type: a struct
+  reads as a MAP of its fields and writes from one, an array reads as a VECTOR
+  and writes from any sequence of the declared length. field-offset, read-field
+  and write-field reach one member by path, and integer components address array
+  elements: [:params 3], [:events 1 :frame], [:matrix 1 2]. `place` resolves one
+  such path ONCE into a value read and write accept where they take a type, for
+  a member read in a loop.
+
+  UNIONS. [:union [[field type] ...]] anywhere a nested struct goes. A union is
+  as large as its largest member and aligned to its strictest, so a struct that
+  holds one gets the offsets the compiler gives it:
+
+      (def curl-msg
+        (layout [:struct [[:msg :int]
+                          [:easy :pointer]
+                          [:data [:union [[:whatever :pointer] [:result :int]]]]]]))
+
+  A union carries no tag of its own — in C the program knows which member is
+  live, from a sibling field (CURLMsg) or from what it stored (epoll_data_t). So
+  `read` answers a union as a POINTER to its bytes and the caller reads the
+  member that applies, either through a `place` at its path or with a type of its
+  own, every member starting at offset 0:
+
+      (def msg-kind (place curl-msg :msg))
+      (def msg-result (place curl-msg [:data :result]))
+      (when (= (read p msg-kind) CURLMSG_DONE) (read p msg-result))
+
+  That pointer carries no RECORDED size (see `size`): reinterpret it where copy
+  or clone needs one. `write` names the member, as a pair —
+  (write p curl-msg {:msg 1 :easy nil :data [:result 0]}) — since the members
+  overlap and writing them all would leave only the last. A union is not passed
+  BY VALUE in a signature, alone or inside a struct: which member is live is the
+  program's knowledge rather than the type's, and the register classification
+  differs by which one it is. Declare :pointer and read the member from memory.
+
+  TWO LIBRARIES, ONE COPY. A declared :jolt/native is dlopen'd RTLD_LOCAL, so
+  its symbols reach its own defcfns and nobody else's. That is fine for a
+  dependent library linked against the SHARED base — it resolves the base's
+  symbols through its own handle and there is one copy of the base's globals.
+  It is not fine for one linked against the base's STATIC archive: that library
+  carries its own copy, so writes through one never appear in the other, and
+  nothing raises. raygui built against libraylib.a is the case that named this
+  — every control reads a mouse that never moves. jolt reports a duplicate
+  native symbol on stderr the first time such a symbol is bound, and
+  defining-libraries answers which libraries supply distinct definitions. The
+  fix is always to rebuild the dependent against the shared base library.
+
+  ARENAS. An arena is a group of allocations with one lifetime: allocate into
+  it, and closing it releases every block, callback and registered cleanup at
+  once. Four kinds, differing only in who may use them and who closes them:
+
+      (with-open [a (ffi/confined-arena)]     ; one thread, closed here
+        ...)
+      (with-open [a (ffi/shared-arena)]       ; any thread, closed here
+        ...)
+      (ffi/global-arena)                      ; the process; cannot be closed
+      (ffi/auto-arena)                        ; released once unreachable
+
+  A confined arena is the one to reach for inside a function: it is cheapest to
+  reason about, and using it from another thread raises rather than corrupting
+  memory. A shared arena is for memory that outlives the call and is released
+  elsewhere. An automatic arena is released when the collector reclaims the
+  arena itself, which is what a callback C may invoke from a thread jolt did not
+  start needs; jolt drains reclaimed automatic arenas when arenas are next
+  created or allocated in, and drain-auto-arenas! forces it.
+
+  alloc takes a byte count, a type keyword, or a compiled layout, and the memory
+  is ZEROED — a struct a caller only partly fills is the ordinary case, and
+  malloc's leftovers in the rest of it are a C-visible bug that reproduces only
+  under load. An integer byte count aligns to 16; a type or layout aligns
+  naturally; a third argument overrides. string->ptr, clone, reinterpret,
+  segment, slice and callback all take an arena in the same first position, and
+  free forgets the size it recorded.
+
+      (with-open [a (ffi/shared-arena)]
+        (let [buf (ffi/alloc a 4096)
+              name (ffi/string->ptr a \"config.toml\")
+              on-event (ffi/callback a handle-event [:pointer :int] :void)]
+          ...))                              ; all three released here
+
+  (ffi/alloc n) with no arena is still the caller-owned form: it answers a
+  pointer nobody tracks, freed with ffi/free. The scoped helpers below
+  (with-alloc, with-out, with-layout, with-c-string, with-c-string-array) are
+  that form with the free attached to a lexical scope, and remain the lightest
+  way to hold one allocation across one call.
+
+  CAUTION: do not close an arena while C still holds one of its pointers. C can
+  read released memory, and nothing raises.
+
+  The memory/library primitives (read/write/sizeof/load-library/ptr->string/
+  string->ptr/null/null?) are host-provided, as are the buffer moves:
+  read-bytes/write-bytes decode and encode UTF-8, read-array/write-array move
+  raw octets to and from a byte-array, and read-into! fills a slice of an
+  EXISTING byte-array — so a caller reading a stream whose length it already
+  knows fills one buffer instead of regrowing an accumulator per chunk. All of
+  them move the block in one copy, not a byte at a time.
+
+  Those four COPY. byte-buffer does not: it answers a direct
+  java.nio.ByteBuffer sharing the pointer's bytes, so a decoder that speaks
+  ByteBuffer reads foreign memory in place and a put through the buffer is a
+  write to the pointer. It keeps nothing alive — using one after the memory is
+  released reads freed memory.
+
+  string->ptr and ptr->string round-trip nil: nil answers NULL and allocates
+  nothing, NULL reads back as nil, and \"\" still allocates its NUL byte and
+  still reads back as \"\" — so an absent string stays distinguishable from a
+  present empty one. Every other value keeps going through the `str` coercion,
+  since with-c-string copies a VALUE. NULL is safe to free, so the scoped
+  helpers need no special case for it.
+
+  Where NULL is not available to mean it, a nil is rejected instead of rendered
+  as \"\": a nil foreign type (read/write/sizeof), a nil name to loaded?, and a
+  nil value to write-bytes, whose destination is the caller's own buffer so
+  there is no pointer that could carry absence. (load-library nil) keeps its
+  documented meaning — no name at all, the process's own symbols — which is an
+  answer rather than a missing one.
 
       (let [buf (ffi/alloc 65536)
             frame (byte-array total)]
@@ -48,64 +178,1099 @@
               (ffi/read-into! buf frame off n)     ; no per-chunk array
               (recur (+ off n))))))
 
-  foreign-fn lowers
-  a compile-time-typed signature to a real Chez foreign-procedure. foreign-callable
-  is the inverse — it wraps a jolt fn as a C-callable function pointer so C can
-  call back into jolt (e.g. GTK signal handlers); free-callable releases it.")
+  foreign-fn lowers a compile-time-typed signature to a real Chez
+  foreign-procedure (cfn is the same macro under babashka.ffi's name). Its
+  optional trailing map accepts :blocking and :capture-native-error literal
+  Booleans; capture returns [native-result error-code] atomically and requires
+  a non-void scalar result. foreign-callable is the inverse — it wraps a jolt fn
+  as a C-callable function pointer so C can call back into jolt (e.g. GTK signal
+  handlers); free-callable releases it, and `callback` is the arena-owned form
+  that needs no explicit release.
+
+  BABASHKA.FFI COMPATIBILITY. This namespace is a name-for-name, semantics-for-
+  semantics match of babashka.ffi wherever one substrate can match the other, so
+  a shim in either direction is a namespace alias plus a short list of gaps.
+  Matching: the arena constructors and every arena-taking function, alloc/free,
+  read/write (INCLUDING the argument order — the offset is last), sizeof,
+  alignof, place, copy, clone, size, address, segment, slice, reinterpret,
+  pointer?, null, null?, ptr->string, string->ptr, read-array, write-array,
+  find-symbol, load-library, load-system-library, cfn, defcfn, callback,
+  byte-buffer, both forms of the :& variadic marker, [:union ...] layouts, and
+  the type keywords with :bool included.
+
+  Where the two differ, they differ because the substrate does:
+
+    - A jolt pointer is a raw ADDRESS (an integer), not a sized MemorySegment.
+      So read and write do not bounds-check, and a zero-size pointer is not a
+      thing jolt can refuse. size answers the size jolt was TOLD — by an arena
+      allocation, segment or reinterpret — and 0 for everything else, so copy
+      and clone still work without an explicit count on memory jolt handed out.
+      pointer? answers true for any non-negative integer, because that is all a
+      pointer is here.
+    - cfn/foreign-fn is a MACRO: Chez's foreign-procedure needs its types at
+      compile time. Computed argtypes and a function-pointer target are not
+      available, and the library-scoped 4-argument cfn raises rather than
+      silently searching everything — jolt already resolves a declared native's
+      symbols through its own handle (see TWO LIBRARIES above).
+    - `callback` is likewise a macro, and takes jolt's :collect-safe option.
+    - A bare :& costs a compile on the first call of each distinct tail shape.
+      Both of babashka.ffi's variadic forms work — the declared tail
+      [:int :int :& :int], and the bare [:string :int :&] whose tail each call
+      infers from its values. What differs is what a NEW SHAPE costs: a Chez
+      foreign-procedure has its types fixed when it is COMPILED, so the first
+      call of each shape compiles one (about 0.8ms) and caches it. Steady-state
+      cost is about +13ns a call over a declared tail. See VARIADIC below.
+    - A layout is COMPILED by the `layout` macro and read and write take that
+      compiled value, where babashka.ffi takes the literal [:struct ...]
+      descriptor at each call. Chez builds the ABI layout with an ftype, at
+      compile time, which is also why the descriptor must be a literal —
+      (layout d) on a runtime value has nothing to compile. The same holds for
+      the [:union ...] descriptor, which is otherwise babashka.ffi's.
+    - read-array and write-array copy the one-byte widths in a single block move
+      and the wider ones element by element.
+    - jolt adds: (alloc n) with no arena, the with-* scoped helpers, arena?,
+      arena-open?, close-arena, drain-auto-arenas!, layout-size,
+      layout-alignment, field-offset, read-field, write-field, :varargs (a
+      second spelling of :&),
+      :blocking, :capture-native-error, errno, export!, foreign-callable,
+      free-callable, loaded?, defining-libraries, read-bytes, write-bytes,
+      read-into!, and the exact-width type aliases.
+
+  VARIADIC. :& marks the fixed/variadic boundary of a C function that takes an
+  ellipsis, as it does in babashka.ffi; :varargs is jolt's older spelling of the
+  same marker. It has two forms.
+
+  DECLARE THE TAIL and the binding is one compiled call, exactly as a fixed
+  signature is:
+
+      (defcfn c-fcntl "fcntl" [:int :int :& :int] :int)
+
+  LEAVE IT BARE and the binding serves every tail shape, each call reading its
+  own tail off the values it is given — the more useful half for the libc
+  functions the marker exists for, where the caller's arity varies:
+
+      (defcfn c-open "open" [:string :int :&] :int)
+      (c-open path O_RDONLY)          ; empty tail
+      (c-open path flags 0644)        ; one-int tail, same binding
+
+  Three carriers decide the tail, as in babashka.ffi: an integer, pointer,
+  boolean or nil travels as a 64-bit integer; a floating-point number or ratio as
+  a double; a string as a NUL-terminated C string. Anything else raises at the
+  call rather than reaching C as whatever it happens to be.
+
+  A bare marker costs a compile on the FIRST call of each distinct shape — a
+  foreign-procedure's types are fixed when it is compiled, so a shape jolt has
+  not seen has to be built — and a cache lookup on every call after. Measured
+  end to end against a do-nothing C variadic, where a fixed binding is 20ns and
+  a declared tail 20.4ns: 26.5ns with no tail, 34ns with one value, 41.5ns with
+  two, and about 0.8ms once per shape. So roughly +13ns and 1.6x a declared
+  tail. Declare the tail where it is always the same; leave it bare where it is
+  not.
+
+  C's default argument promotions apply to a declared tail too: pass values
+  narrower than int as :int and float as :double, which includes :bool, since
+  _Bool promotes to int in a variadic call. Neither form combines with :blocking
+  (a varargs convention and __collect_safe cannot both be emitted), and the bare
+  form additionally takes no by-value aggregate — its tail is compiled at the
+  call, where an ftype the binding declared is not available.")
+
+;; The primitives this namespace is built over are the host's, reached by their
+;; reserved __ names: alloc, read, write, sizeof, string->ptr, copy, read-array
+;; and write-array are all DEFINED here, over the host functions of the same
+;; name, so each needs a name its own definition has not taken.
+;;
+;; They are called rather than captured into locals. A jolt host with no FFI
+;; layer has none of them, and a top-level capture would then fail to LOAD this
+;; namespace instead of failing at the first foreign call — the difference
+;; between a host that cannot call C and a host that cannot read a jolt program.
+;; Inside a function body the reference resolves when it runs.
+
+;; -- layouts ------------------------------------------------------------------
 
 (defmacro layout
-  "Compile a literal [:struct [[field type] ...]] descriptor into immutable ABI
-  layout data. Field names are unique unqualified keywords; fields are fixed-size
-  scalars or nested structs. Chez supplies size, alignment, and offsets."
+  "Compile a literal [:struct [[field type] ...]] or [:union [[field type] ...]]
+  descriptor into immutable ABI layout data. Field names are unique unqualified
+  keywords; fields are fixed-size scalars, nested structs or unions, or
+  recursively nestable [:array type positive-count] descriptors. Chez supplies
+  size, alignment, and offsets; array elements use integer path components, for
+  example [:matrix 1 2]. Array metadata scales with the declared shape rather
+  than the product of array dimensions.
+
+  A union's members all start at its own offset, and it is as large as its
+  largest and aligned to its strictest — see UNIONS in the namespace docstring
+  for how read and write treat one."
   [descriptor]
   (list 'jolt.ffi/__layout descriptor))
 
+(defn layout?
+  "True for a value compiled by the layout macro."
+  [x]
+  (and (map? x) (= true (:jolt.ffi/layout x))))
+
 (defn- checked-layout [layout]
-  (when-not (and (map? layout) (= true (:jolt.ffi/layout layout)))
+  (when-not (layout? layout)
     (throw (ex-info "jolt.ffi: expected a compiled layout" {:layout layout})))
   layout)
 
 (defn- checked-field-path [path]
   (let [p (if (keyword? path) [path] path)]
     (when-not (and (vector? p) (pos? (count p))
-                   (every? #(and (keyword? %) (nil? (namespace %))) p))
-      (throw (ex-info "jolt.ffi: field path must be an unqualified keyword or non-empty vector of them"
+                   (keyword? (first p)) (nil? (namespace (first p)))
+                   (every? #(or (and (keyword? %) (nil? (namespace %)))
+                                (and (integer? %) (not (neg? %))))
+                           p))
+      (throw (ex-info "jolt.ffi: field path must start with an unqualified keyword and contain only unqualified keywords or non-negative array indices"
                       {:path path})))
     p))
 
 (defn layout-size [layout] (:size (checked-layout layout)))
 (defn layout-alignment [layout] (:alignment (checked-layout layout)))
 
+(def ^:private layout-index-marker :jolt.ffi/index)
+
+(defn- resolve-field-path [layout path]
+  (let [counts (:jolt.ffi/array-counts layout)
+        strides (:jolt.ffi/array-strides layout)]
+    (loop [parts path compact [] delta 0]
+      (if (empty? parts)
+        [compact delta]
+        (let [part (first parts)]
+          (if (integer? part)
+            (let [count (get counts compact)
+                  stride (get strides compact)]
+              (when-not (and count stride (< part count))
+                (throw (ex-info "jolt.ffi: unknown layout field path" {:path path})))
+              (recur (rest parts)
+                     (conj compact layout-index-marker)
+                     (+ delta (* part stride))))
+            (recur (rest parts) (conj compact part) delta)))))))
+
 (defn field-offset [layout path]
   (let [layout (checked-layout layout)
         path (checked-field-path path)
+        [compact delta] (resolve-field-path layout path)
         offsets (:jolt.ffi/offsets layout)]
-    (when-not (contains? offsets path)
+    (when-not (contains? offsets compact)
       (throw (ex-info "jolt.ffi: unknown layout field path" {:path path})))
-    (get offsets path)))
+    (+ (get offsets compact) delta)))
 
 (defn- field-type [layout path]
-  (let [types (:jolt.ffi/types layout)]
-    (when-not (contains? types path)
-      (throw (ex-info "jolt.ffi: field path names a struct, not a scalar field"
+  (let [[compact _] (resolve-field-path layout path)
+        types (:jolt.ffi/types layout)]
+    (when-not (contains? types compact)
+      (throw (ex-info "jolt.ffi: field path names a struct or array, not a scalar field"
                       {:path path})))
-    (get types path)))
+    (get types compact)))
+
+;; -- pointers -----------------------------------------------------------------
+;; A jolt pointer is the raw machine ADDRESS, the same representation a void*
+;; argument and result use. It carries no size of its own, so `size` answers the
+;; size jolt was TOLD: an arena allocation, `segment` with a size, or
+;; `reinterpret` records one here, and everything else answers 0 exactly as a
+;; pointer straight out of C does. That is enough for copy and clone to work
+;; without a count on memory jolt handed out, which is the reason the table
+;; exists; a per-access bounds check is not on offer and would cost a lookup on
+;; every read.
+;;
+;; The record lives in the host (host/chez/java/ffi.ss), in a sharded
+;; mutex-guarded table keyed by ADDRESS. Keyed by address is what forces an
+;; entry to be removed when the memory goes away: an allocator hands the same
+;; address out again, and a leftover entry would answer a size for a block that
+;; never had one. So `free` forgets, and an arena forgets its blocks and views
+;; when it closes.
+;;
+;; It is host state rather than an atom here because every allocation writes it.
+;; A single atom holding a persistent map made each alloc rebuild a path through
+;; the map under a CAS that every other allocating thread contended for; the
+;; shards give writers on different addresses different locks.
+;;
+;; segment, slice and reinterpret all take an arena for the same reason. Without
+;; one the declaration lasts for the life of the process, which is a leak in a
+;; loop and, once the memory is released, a wrong answer — babashka.ffi has
+;; neither problem because a MemorySegment carries its own size and there is no
+;; side table to go stale.
+
+(defn- remember-size! [pointer byte-count]
+  (jolt.ffi/__remember-size! pointer byte-count))
+
+(defn- forget-sizes! [pointers]
+  (jolt.ffi/__forget-sizes! pointers)
+  nil)
+
+(defn pointer?
+  "True when x could be a pointer: a non-negative integer address. A jolt
+  pointer is an address and nothing more, so this cannot tell one from any other
+  address-shaped integer."
+  [x]
+  (and (integer? x) (not (neg? x))))
+
+(defn address
+  "The native address of pointer p, as a long. A jolt pointer already IS its
+  address, so this is the identity on one — it exists so code written against
+  either FFI reads the same."
+  [p]
+  (when-not (pointer? p)
+    (throw (ex-info "jolt.ffi/address: not a pointer" {:pointer p})))
+  p)
+
+(defn size
+  "The size of pointer p in bytes, as far as jolt knows it: what an arena
+  allocated, or what segment/reinterpret declared. 0 for a pointer jolt was
+  never told the size of, including every pointer returned by C."
+  [p]
+  ;; Anything that is not an address was never a key, and answered 0 when this
+  ;; was a map lookup. Keep that rather than raising inside the host coercion.
+  (if (pointer? p) (jolt.ffi/__size p) 0))
+
+(defn- byte-count-of
+  "The byte count a size argument denotes: an integer count, a type keyword's
+  width, or a compiled layout's size.
+
+  A non-positive count is rejected here rather than at the allocator, which
+  answers \"0 is not a positive fixnum\" from inside Chez and names neither the
+  argument nor the caller."
+  [n]
+  (cond
+    (integer? n)
+    (do (when-not (pos? n)
+          (throw (ex-info "jolt.ffi: a byte count must be positive" {:size n})))
+        n)
+    (layout? n) (:size n)
+    (keyword? n) (jolt.ffi/__sizeof n)
+    :else (throw (ex-info "jolt.ffi: expected a byte count, a type keyword, or a compiled layout"
+                          {:size n}))))
+
+;; -- sizes --------------------------------------------------------------------
+
+(defn sizeof
+  "The size in bytes of a type keyword or of a compiled layout. A layout's size
+  includes its padding."
+  [t]
+  (if (layout? t) (:size t) (jolt.ffi/__sizeof t)))
+
+(defn alignof
+  "The alignment in bytes of a type keyword or of a compiled layout. Every jolt
+  scalar aligns naturally, so a type keyword's alignment is its width."
+  [t]
+  (if (layout? t) (:alignment t) (jolt.ffi/__sizeof t)))
+
+;; -- arenas -------------------------------------------------------------------
+;; An arena is a group of allocations with ONE lifetime. It is a map so that
+;; with-open closes it through its :close entry, carrying an atom that holds the
+;; group: the blocks to free, the callbacks to release, and the views whose
+;; cleanup functions to run.
+;;
+;;   :blocks    [[usable raw] ...]  freed in reverse allocation order (LIFO, the
+;;                                 order a caller built them in). `usable` is
+;;                                 what the caller holds and `raw` what the
+;;                                 allocator returned — they differ only for an
+;;                                 over-aligned block, see arena-alloc below.
+;;   :callables [addr ...]          released with free-callable
+;;   :views     [[pointer f] ...]   memory jolt does NOT own: run f, free nothing
+;;
+;; The four kinds differ only in who may touch the arena and who closes it.
+;; :confined records its creating thread and raises on use from another —
+;; babashka.ffi's confined arena does the same, and the failure it prevents (two
+;; threads freeing one list) has no error of its own, only a fault inside the
+;; allocator. :shared is usable from any thread; the atom's swap! is what makes
+;; that safe. :global and :auto cannot be closed by hand.
+
+(def ^:private arena-marker :jolt.ffi/arena)
+
+(defn arena?
+  "True for a value from one of the arena constructors."
+  [x]
+  (and (map? x) (= true (get x arena-marker))))
+
+(defn- checked-arena [a]
+  (when-not (arena? a)
+    (throw (ex-info "jolt.ffi: expected an arena from confined-arena, shared-arena, global-arena or auto-arena"
+                    {:arena a})))
+  a)
+
+(defn arena-open?
+  "True while arena a still owns its allocations. A global or automatic arena is
+  always open; neither is ever closed by hand."
+  [a]
+  (:open? @(:jolt.ffi/state (checked-arena a))))
+
+(defn- arena-usable! [a what]
+  (let [a (checked-arena a)
+        thread (:jolt.ffi/thread a)]
+    (when-not (:open? @(:jolt.ffi/state a))
+      (throw (ex-info (str "jolt.ffi/" what ": the arena is closed")
+                      {:arena-kind (:jolt.ffi/kind a)})))
+    (when (and thread (not= thread (jolt.host/thread-id)))
+      (throw (ex-info (str "jolt.ffi/" what ": this arena is confined to the thread that created it")
+                      {:arena-kind (:jolt.ffi/kind a)
+                       :owner thread
+                       :caller (jolt.host/thread-id)})))
+    a))
+
+;; Release one group: views first (their cleanup functions may still want to read
+;; the memory), then callbacks, then the blocks in reverse allocation order.
+;; Every step runs even if an earlier one threw — a cleanup function that raises
+;; must not strand the rest of the group — and the first failure is re-thrown
+;; once the group is empty.
+(defn- attempt-release! [failure f value]
+  (try
+    (f value)
+    (catch Throwable e
+      (when-not @failure (vreset! failure e)))))
+
+(defn- release-group!
+  ([state] (release-group! state false))
+  ([state exclusive?]
+   (let [closed {:open? false :blocks [] :callables [] :views []}
+         ;; A confined arena has one legal owner, so its exchange is a
+         ;; compare-and-set! rather than the CAS LOOP reset-vals! runs — one
+         ;; mutex acquisition and no [old new] pair allocated. Not a bare
+         ;; reset!: one owner thread is not one mutator, because fibers share
+         ;; their carrier's thread-id and a sibling fiber can allocate into the
+         ;; arena between the read and the publish, which a reset! would drop on
+         ;; the floor unfreed. The state stays an atom either way: arena-open?
+         ;; is public and may be observed from another thread.
+         group (if exclusive?
+                 (let [before @state]
+                   (if (compare-and-set! state before closed)
+                     before
+                     (first (reset-vals! state closed))))
+                 (first (reset-vals! state closed)))]
+     (when (:open? group)
+       ;; The overwhelmingly common empty arena needs only the atomic close
+       ;; above. For a populated group, one local volatile records the first
+       ;; failure; pass cleanup arguments directly instead of allocating one
+       ;; closure per release.
+       (let [views (:views group)
+             callables (:callables group)
+             blocks (:blocks group)]
+         (cond
+           ;; One ordinary allocation is the other dominant lexical-arena shape.
+           ;; There is no later cleanup to preserve after a failure, so finally
+           ;; can forget its size directly without failure aggregation or seq
+           ;; traversal. The allocator's raw/usable distinction is retained.
+           (and (empty? views) (empty? callables) (= 1 (count blocks)))
+           (let [[usable raw] (first blocks)]
+             (try (jolt.ffi/__free raw)
+                  (finally (forget-sizes! [usable]))))
+
+           (or (seq views) (seq callables) (seq blocks))
+           (let [failure (volatile! nil)]
+             (doseq [view views]
+               (when (second view)
+                 (attempt-release! failure (second view) (first view))))
+             (doseq [addr callables]
+               (attempt-release! failure jolt.ffi/free-callable addr))
+             (doseq [block (reverse blocks)]
+               (attempt-release! failure jolt.ffi/__free (second block)))
+             (forget-sizes! (concat (map first blocks) (map first views)))
+             (when @failure (throw @failure))))))
+     nil)))
+
+;; Draining is what makes an automatic arena's release observable: the collector
+;; hands back the state atoms it has reclaimed, and each one still names the
+;; blocks to free. Called where a program shows it is still using arenas — on
+;; every arena creation and every allocation into an automatic one — so an
+;; automatic arena is released promptly in code that keeps allocating, and not
+;; until the process ends in code that has stopped. Nothing here runs on the
+;; collector's own thread, so a cleanup function is called from ordinary jolt
+;; code with the whole runtime available.
+(defn drain-auto-arenas!
+  "Release every automatic arena the collector has reclaimed since the last
+  drain. Returns the number released. jolt calls this when arenas are created or
+  allocated into; call it directly to force a release at a chosen point."
+  []
+  (let [reclaimed (jolt.ffi/__auto-reclaimed)]
+    (doseq [state reclaimed] (release-group! state))
+    (count reclaimed)))
+
+(defn- new-arena [kind thread]
+  (drain-auto-arenas!)
+  (let [state (atom {:open? true :blocks [] :callables [] :views []})
+        arena {arena-marker true
+               :jolt.ffi/kind kind
+               :jolt.ffi/thread thread
+               :jolt.ffi/state state
+               :close (fn []
+                        (when (or (= kind :global) (= kind :auto))
+                          (throw (ex-info (str "jolt.ffi: a " (name kind) " arena cannot be closed")
+                                          {:arena-kind kind})))
+                        (when (and thread (not= thread (jolt.host/thread-id)))
+                          (throw (ex-info "jolt.ffi: a confined arena closes on the thread that created it"
+                                          {:owner thread :caller (jolt.host/thread-id)})))
+                        (release-group! state (= kind :confined)))}]
+    (when (= kind :auto) (jolt.ffi/__auto-guard! state))
+    arena))
+
+(defn confined-arena
+  "An arena for ONE thread — the one calling this. Allocating in it or closing it
+  from another thread raises. Create it in with-open:
+
+      (with-open [a (ffi/confined-arena)]
+        (let [pp (ffi/alloc a :pointer)] ...))
+
+  This is the arena to reach for inside a function."
+  []
+  (new-arena :confined (jolt.host/thread-id)))
+
+(defn shared-arena
+  "An arena usable from any thread. Create it in with-open, or hand it to
+  whatever closes it. Use it for memory that outlives the call that made it."
+  []
+  (new-arena :shared nil))
+
+(def ^:private the-global-arena (atom nil))
+
+(defn global-arena
+  "The arena whose memory lives as long as the process. It cannot be closed."
+  []
+  (or @the-global-arena
+      (do (compare-and-set! the-global-arena nil (new-arena :global nil))
+          @the-global-arena)))
+
+(defn auto-arena
+  "An arena released once the collector reclaims the arena itself; it cannot be
+  closed by hand. Keep it reachable for as long as C may use its pointers — the
+  collector cannot see the copy of a pointer that C holds.
+
+  This is the arena for a callback C may invoke from a thread jolt did not
+  start, where no lexical scope can be the callback's lifetime. See
+  drain-auto-arenas! for when the release actually happens."
+  []
+  (new-arena :auto nil))
+
+(defn close-arena
+  "Release every allocation, callback and registered cleanup in arena a; answers
+  nil. This is what with-open calls.
+
+  A second close releases nothing and is not an error. The group is swapped out
+  of the arena in one step, so nothing can be freed twice however many times
+  this is called — and making the second call raise would turn the legitimate
+  early release inside a with-open body into an exception thrown from the
+  `finally`, which replaces whatever the body was actually reporting. Closing a
+  confined arena from another thread still raises, and so does closing a global
+  or automatic arena at all: those are wrong, not redundant."
+  [a]
+  ((:close (checked-arena a)))
+  nil)
+
+;; Attaching to the group and the arena still being OPEN are one step. A shared
+;; arena can be closed by another thread between arena-usable!'s check and this,
+;; and a conj onto state that close has already reset attaches the value to a
+;; group nothing will ever release — a leak with no error to report it. The swap
+;; adds only while :open? holds; when it did not, the caller undoes whatever it
+;; had already allocated and the call raises rather than returning a pointer the
+;; arena is not going to free.
+;; The CAS-loop attach, and the only place that allocates the update closure —
+;; the confined path below builds no closure at all, and calls this only on the
+;; rare loss.
+(defn- arena-swap-add! [state key value]
+  (first (swap-vals! state (fn [m] (if (:open? m) (update m key conj value) m)))))
+
+(defn- arena-add!
+  ([a key value] (arena-add! a key value nil))
+  ([a key value on-lost]
+   (let [state (:jolt.ffi/state a)
+         before (if (= :confined (:jolt.ffi/kind a))
+                  ;; arena-usable! has already established the confined owner.
+                  ;; Re-read here because native allocation may re-enter user
+                  ;; code and close the arena before attachment.
+                  (let [before @state]
+                    (if (and (:open? before)
+                             (not (compare-and-set! state before (update before key conj value))))
+                      ;; The publish is a compare-and-set!, not a reset!, because
+                      ;; "one owner THREAD" is not "one mutator": fibers share
+                      ;; their carrier's thread-id (jolt.host/thread-id is
+                      ;; get-thread-id), so two fibers on one carrier both pass
+                      ;; the owner check, and preemption is polled at procedure
+                      ;; entries. A blind read-modify-write between them loses
+                      ;; allocations, or re-opens an arena a sibling has closed
+                      ;; and freed. The CAS is the same one mutex acquisition the
+                      ;; reset! was; only the rare loss pays the loop.
+                      (arena-swap-add! state key value)
+                      before))
+                  (arena-swap-add! state key value))]
+     (when-not (:open? before)
+       (when on-lost (on-lost))
+       (throw (ex-info "jolt.ffi: the arena closed while this allocation was in flight"
+                       {:arena-kind (:jolt.ffi/kind a)})))
+     value)))
+
+;; -- allocation ---------------------------------------------------------------
+
+(defn- align-of-spec
+  "The alignment an allocation size argument asks for. A type or a layout aligns
+  naturally; a bare byte count aligns to 16, which is what the allocator gives
+  anyway and what babashka.ffi documents for the same form."
+  [n]
+  (cond
+    (integer? n) 16
+    (layout? n) (:alignment n)
+    (keyword? n) (jolt.ffi/__sizeof n)
+    :else (throw (ex-info "jolt.ffi: expected a byte count, a type keyword, or a compiled layout"
+                          {:size n}))))
+
+;; An alignment is a positive power of two, as it is for babashka.ffi's alloc and
+;; for the C allocators underneath both. Anything else is checked here because
+;; neither of the two paths below would report it: an alignment at or under the
+;; allocator's own is not used at all, so a nonsense value would be silently
+;; ignored, and above it the rounding would divide by whatever was passed — 0
+;; faulting inside `rem`, 24 answering a multiple of 24 that is not an alignment.
+(defn- checked-alignment [alignment]
+  (when-not (and (integer? alignment) (pos? alignment)
+                 (zero? (bit-and alignment (dec alignment))))
+    (throw (ex-info "jolt.ffi: an alignment must be a positive power of two"
+                    {:alignment alignment})))
+  alignment)
+
+;; An over-aligned block (alignment above the allocator's own 16) is allocated
+;; align-1 bytes longer and rounded up inside itself, so the pointer the caller
+;; holds is not the pointer that gets freed. That is the whole reason a block is
+;; recorded as a [usable raw] pair.
+(defn- arena-alloc [a byte-count alignment]
+  (let [over? (> alignment 16)
+        raw (jolt.ffi/__calloc (if over? (+ byte-count alignment -1) byte-count))
+        remainder (if over? (rem raw alignment) 0)
+        usable (if (zero? remainder) raw (+ raw (- alignment remainder)))]
+    (arena-add! a :blocks [usable raw] (fn [] (jolt.ffi/__free raw)))
+    (remember-size! usable byte-count)))
+
+(defn alloc
+  "Allocate ZEROED native memory and answer its pointer. `n` is a byte count, a
+  type keyword, or a compiled layout.
+
+      (alloc arena n)            ; owned by the arena, released when it closes
+      (alloc arena n alignment)  ; the same, with the alignment spelled out
+      (alloc n)                  ; owned by the CALLER, released with ffi/free
+
+  A type or a layout aligns naturally, a byte count aligns to 16, and a third
+  argument overrides. An alignment above the allocator's own is honoured by
+  rounding up inside a larger block.
+
+  Use a confined arena inside one function; use a shared arena for memory that
+  outlives the call and is released elsewhere. The arena-less form is the one to
+  reach for when the allocation lives exactly as long as one lexical scope —
+  with-alloc, with-out and with-layout are that form with the free attached.
+
+  If C allocates the memory, bind its allocator with defcfn and release the
+  result with the matching C deallocator; reinterpret gives that pointer a size
+  and, with an arena, a scope for its deallocator.
+
+  CAUTION: do not close the arena while C still uses its memory. C can read
+  released memory, and nothing raises."
+  ([n] (jolt.ffi/__calloc (byte-count-of n)))
+  ([arena n] (alloc arena n (align-of-spec n)))
+  ([arena n alignment]
+   (let [arena (arena-usable! arena "alloc")]
+     (when (= :auto (:jolt.ffi/kind arena)) (drain-auto-arenas!))
+     (arena-alloc arena (byte-count-of n) (checked-alignment alignment)))))
+
+(defn string->ptr
+  "Copy s to a NUL-terminated UTF-8 C string and answer its pointer. With an
+  arena, the arena owns it; without one, the caller frees it.
+
+  nil answers NULL and allocates nothing, which is how an optional C string
+  argument is passed and what round-trips against ptr->string. Every other value
+  goes through the `str` coercion, because this copies a VALUE."
+  ([s] (jolt.ffi/__string->ptr s))
+  ([arena s]
+   (let [arena (arena-usable! arena "string->ptr")
+         p (jolt.ffi/__string->ptr s)]
+     (if (jolt.ffi/null? p)
+       p                                        ; nil: nothing was allocated
+       (do (arena-add! arena :blocks [p p] (fn [] (jolt.ffi/__free p)))
+           (remember-size! p (+ 1 (jolt.ffi/__utf8-length s))))))))
+
+(defn free
+  "Release a caller-owned block from `alloc` and answer nil, and forget the size
+  jolt recorded for that pointer.
+
+  Forgetting is not bookkeeping: the size table is keyed by address, an
+  allocator hands the same address out again, and a leftover entry would answer
+  a size for a block that never had one — which copy and clone would then use as
+  a byte count. Arena memory is released by closing the arena, not by this."
+  [p]
+  (forget-sizes! [p])
+  (jolt.ffi/__free p)
+  nil)
+
+(defn copy
+  "Copy bytes from pointer src to pointer dst; answers nil. Without n, copies
+  src's known size (see `size`), and dst must be at least that large.
+
+  The regions may overlap: the copy behaves as memmove. To copy into the middle
+  of dst, slice it first — (copy src (slice dst 16) n)."
+  ([src dst]
+   (let [n (size src)]
+     (when (zero? n)
+       (throw (ex-info "jolt.ffi/copy: the source has no known size — pass a byte count, or declare one with reinterpret"
+                       {:source src})))
+     (jolt.ffi/__copy src dst n)))
+  ([src dst n] (jolt.ffi/__copy src dst n)))
+
+(defn clone
+  "Allocate a copy of pointer src in arena and answer the new pointer. Without n
+  the size comes from src's known size (see `size`), so a pointer straight out of
+  C needs either an explicit count or a reinterpret first."
+  ([arena src]
+   (let [n (size src)]
+     (when (zero? n)
+       (throw (ex-info "jolt.ffi/clone: the source has no known size — pass a byte count, or declare one with reinterpret"
+                       {:source src})))
+     (clone arena src n)))
+  ([arena src n]
+   (let [dst (alloc arena n)]
+     (jolt.ffi/__copy src dst n)
+     dst)))
+
+(defn segment
+  "A pointer to addr. With a byte count, records that size so `size`, copy and
+  clone can use it. With an arena first, the arena forgets the size when it
+  closes; without one the declaration lasts for the life of the process.
+
+  CAUTION: keep addr before size. Transposed, the size becomes the address and
+  the first read can stop the process."
+  ([addr] addr)
+  ([addr byte-count]
+   (when (arena? addr)
+     (throw (ex-info "jolt.ffi/segment: the arena comes first — (segment arena addr byte-count)"
+                     {:arena addr})))
+   (remember-size! addr (byte-count-of byte-count)))
+  ([arena addr byte-count]
+   (let [arena (arena-usable! arena "segment")]
+     (arena-add! arena :views [addr nil])
+     (remember-size! addr (byte-count-of byte-count)))))
+
+(defn slice
+  "A pointer `offset` bytes into p. With a length — a byte count, a type
+  keyword, or a compiled layout — the slice's size is recorded, so walking an
+  array of structs takes the layout itself:
+
+      (with-open [a (ffi/confined-arena)]
+        (slice a arr (* i (sizeof point)) point))
+
+  Pass the arena when slicing in a loop. Each length recorded without one is an
+  entry that lives as long as the process, on an address the caller is free to
+  release — see the note above `remember-size!`.
+
+  CAUTION: keep offset before len. Transposed, the length becomes the offset."
+  ([p offset] (+ p offset))
+  ([p offset len]
+   (when (arena? p)
+     (throw (ex-info "jolt.ffi/slice: the arena comes first — (slice arena p offset len)"
+                     {:arena p})))
+   (remember-size! (+ p offset) (byte-count-of len)))
+  ([arena p offset len]
+   (let [arena (arena-usable! arena "slice")
+         q (+ p offset)]
+     (arena-add! arena :views [q nil])
+     (remember-size! q (byte-count-of len)))))
+
+(defn reinterpret
+  "Declare that pointer p addresses `byte-count` bytes, and answer p. This is how
+  a pointer from C gets a size, which is what `size`, copy and clone read.
+
+  The arena comes first, as it does for alloc, string->ptr, clone and callback:
+  (reinterpret arena p byte-count [cleanup]). With one, the declaration is
+  forgotten when the arena closes and the arena calls the optional cleanup
+  function with p — the place to hand a C library's own deallocator. Without an
+  arena the declaration lasts for the life of the process, so pass one when
+  calling this in a loop.
+
+  CAUTION: give the ACTUAL size. Nothing can check it, and jolt does not
+  bounds-check a read; a size larger than the allocation is a read off the end.
+
+  CAUTION: the arena frees nothing here — the memory is C's. What it releases is
+  the declaration and, through the cleanup function, whatever C wants released."
+  ([p byte-count]
+   (when (arena? p)
+     (throw (ex-info "jolt.ffi/reinterpret: the arena comes first — (reinterpret arena p byte-count)"
+                     {:arena p})))
+   (remember-size! p (byte-count-of byte-count)))
+  ([arena p byte-count] (reinterpret arena p byte-count nil))
+  ([arena p byte-count cleanup]
+   (let [arena (arena-usable! arena "reinterpret")]
+     (arena-add! arena :views [p cleanup])
+     (remember-size! p (byte-count-of byte-count)))))
+
+;; -- reading and writing ------------------------------------------------------
+
+(defn place?
+  "True for a value from `place`."
+  [x]
+  (and (map? x) (= true (:jolt.ffi/place x))))
+
+;; The sub-descriptor a compact path names, so a place at a struct or array
+;; member decodes as that shape rather than only as a scalar.
+(defn- descriptor-at [layout compact]
+  (loop [desc (:descriptor layout) parts (seq compact)]
+    (if (nil? parts)
+      desc
+      (let [part (first parts)]
+        (when-not (vector? desc)
+          (throw (ex-info "jolt.ffi: layout field path reaches past a scalar"
+                          {:path compact})))
+        (if (= part layout-index-marker)
+          (do (when-not (= :array (nth desc 0))
+                (throw (ex-info "jolt.ffi: layout field path indexes something that is not an array"
+                                {:path compact})))
+              (recur (nth desc 1) (next parts)))
+          (do (when-not (or (= :struct (nth desc 0)) (= :union (nth desc 0)))
+                (throw (ex-info "jolt.ffi: layout field path names a member of something that is not a struct or union"
+                                {:path compact})))
+              (let [field (first (filter (fn [f] (= part (nth f 0))) (nth desc 1)))]
+                (when-not field
+                  (throw (ex-info "jolt.ffi: unknown layout field path" {:path compact})))
+                (recur (nth field 1) (next parts)))))))))
+
+(defn place
+  "One member of layout t, resolved ONCE, as a value read and write take where
+  they take a type. `path` is a member name or a vector of member names and array
+  indices reaching into nested layouts; with no path the place is the whole
+  layout.
+
+      (def parent (place bone :parent))
+      (read p parent)                        ;=> 7
+      (write p parent 3)
+      (read p (place outer [:msgs 1 :data :result]))
+
+  The member decodes and encodes as its own type, the way read and write do it: a
+  struct as a map, an array as a vector. Resolving the path is the work a place
+  removes, so make one once and keep it, as with a defcfn binding.
+
+  A path that names nothing raises rather than answering nil: a layout is closed,
+  so a member that is not in it is a mistake in the program."
+  ([t] (place t nil))
+  ([t path]
+   (let [layout (checked-layout t)]
+     (if (or (nil? path) (and (vector? path) (zero? (count path))))
+       {:jolt.ffi/place true :jolt.ffi/layout layout
+        :jolt.ffi/desc (:descriptor layout)
+        :jolt.ffi/compact [] :jolt.ffi/delta 0}
+       (let [parts (checked-field-path path)
+             resolved (resolve-field-path layout parts)
+             compact (nth resolved 0)]
+         (when-not (contains? (:jolt.ffi/offsets layout) compact)
+           (throw (ex-info "jolt.ffi/place: unknown layout field path" {:path path})))
+         {:jolt.ffi/place true :jolt.ffi/layout layout
+          :jolt.ffi/desc (descriptor-at layout compact)
+          :jolt.ffi/compact compact :jolt.ffi/delta (nth resolved 1)})))))
+
+;; A scalar's address is base + the member's own offset + the array indices
+;; accumulated on the way in. The offsets and strides tables are the ones
+;; field-offset reads, so a layout read and a read-field of the same member
+;; resolve to the same byte.
+(defn- decode-desc [p layout desc compact delta base]
+  (cond
+    (keyword? desc)
+    (jolt.ffi/__read p desc (+ base delta (get (:jolt.ffi/offsets layout) compact)))
+
+    (= :struct (nth desc 0))
+    (reduce (fn [m field]
+              (assoc m (nth field 0)
+                     (decode-desc p layout (nth field 1)
+                                  (conj compact (nth field 0)) delta base)))
+            {}
+            (nth desc 1))
+
+    ;; A union carries no tag, so there is no member `read` could know to
+    ;; decode: which one is live is the program's knowledge, from a sibling
+    ;; field (CURLMsg) or from what it stored (epoll_data_t). So a union reads
+    ;; as a POINTER to its bytes, as it does in babashka.ffi, and the caller
+    ;; reads the member that applies — with a `place` at its path, or with a
+    ;; type of its own, every member starting at offset 0.
+    ;;
+    ;; The pointer carries no RECORDED size: a jolt pointer is a bare address
+    ;; and sizes live in a process-wide table (see `size`), so recording one per
+    ;; union read would add an entry per element walked over an array of
+    ;; structs, none of them reclaimed. `reinterpret` it where copy or clone
+    ;; needs a size.
+    (= :union (nth desc 0))
+    (+ p base delta (or (get (:jolt.ffi/offsets layout) compact) 0))
+
+    (= :array (nth desc 0))
+    (let [element (nth desc 1)
+          n (nth desc 2)
+          stride (get (:jolt.ffi/array-strides layout) compact)
+          child (conj compact layout-index-marker)]
+      (mapv (fn [i] (decode-desc p layout element child (+ delta (* i stride)) base))
+            (range n)))
+
+    :else
+    (throw (ex-info "jolt.ffi: unsupported layout descriptor" {:descriptor desc}))))
+
+(defn- encode-desc [p layout desc compact delta base v]
+  (cond
+    (keyword? desc)
+    (jolt.ffi/__write p desc v (+ base delta (get (:jolt.ffi/offsets layout) compact)))
+
+    (= :struct (nth desc 0))
+    (let [fields (nth desc 1)
+          names (mapv (fn [f] (nth f 0)) fields)]
+      (when-not (map? v)
+        (throw (ex-info (str "jolt.ffi/write: a struct value is a map of " (pr-str names))
+                        {:value v :fields names})))
+      (doseq [nm names]
+        (when-not (contains? v nm)
+          (throw (ex-info (str "jolt.ffi/write: struct value misses field " (pr-str nm))
+                          {:value v :fields names}))))
+      (doseq [k (keys v)]
+        (when-not (some (fn [nm] (= k nm)) names)
+          (throw (ex-info (str "jolt.ffi/write: struct value has unknown field " (pr-str k))
+                          {:value v :fields names}))))
+      (doseq [field fields]
+        (encode-desc p layout (nth field 1) (conj compact (nth field 0))
+                     delta base (get v (nth field 0))))
+      nil)
+
+    ;; The write direction has to name the member, since the bytes overlap and
+    ;; writing them all would leave only the last one. babashka.ffi spells that
+    ;; as a pair, and so does this: {:data [:result 0]}.
+    (= :union (nth desc 0))
+    (let [fields (nth desc 1)
+          names (mapv (fn [f] (nth f 0)) fields)]
+      (when-not (and (sequential? v) (= 2 (count (vec v))))
+        (throw (ex-info (str "jolt.ffi/write: a union value is a pair of a member name and its value, "
+                             "one of " (pr-str names))
+                        {:value v :fields names})))
+      (let [member (nth (vec v) 0)
+            member-value (nth (vec v) 1)
+            field (first (filter (fn [f] (= member (nth f 0))) fields))]
+        (when-not field
+          (throw (ex-info (str "jolt.ffi/write: union value names unknown member " (pr-str member))
+                          {:value v :fields names})))
+        (encode-desc p layout (nth field 1) (conj compact member) delta base member-value))
+      nil)
+
+    (= :array (nth desc 0))
+    (let [element (nth desc 1)
+          n (nth desc 2)
+          stride (get (:jolt.ffi/array-strides layout) compact)
+          child (conj compact layout-index-marker)]
+      ;; A jolt array as well as a sequence: an FFI caller often already has an
+      ;; int-array or a byte-array in hand, and babashka.ffi takes a Java array
+      ;; here for the same reason.
+      (when-not (or (sequential? v) (array? v))
+        (throw (ex-info (str "jolt.ffi/write: an array value is a sequence of " n " elements")
+                        {:value v :count n})))
+      (let [values (vec v)]
+        (when-not (= n (count values))
+          (throw (ex-info (str "jolt.ffi/write: an array value needs " n " elements, got " (count values))
+                          {:value v :count n})))
+        (dotimes [i n]
+          (encode-desc p layout element child (+ delta (* i stride)) base (nth values i))))
+      nil)
+
+    :else
+    (throw (ex-info "jolt.ffi: unsupported layout descriptor" {:descriptor desc}))))
+
+(defn- composite-parts [t what]
+  (cond
+    (place? t) [(:jolt.ffi/layout t) (:jolt.ffi/desc t)
+                (:jolt.ffi/compact t) (:jolt.ffi/delta t)]
+    (layout? t) [t (:descriptor t) [] 0]
+    :else (throw (ex-info (str "jolt.ffi/" what
+                               ": the type must be a type keyword, a compiled layout, or a place")
+                          {:type t}))))
+
+(defn read
+  "Read a value of type t from pointer p, at byte offset `off` (default 0).
+
+  t is a type keyword, a compiled layout, or a place. A layout reads a struct as
+  a map of its fields, an array as a vector, and a union as a POINTER to its
+  bytes — a union carries no tag, so the member that is live is the caller's to
+  know; a place is one member of a layout with its path already resolved.
+
+  A jolt pointer carries no size, so nothing here is bounds-checked: reading past
+  an allocation reads whatever is there."
+  ([p t] (if (keyword? t)
+           (jolt.ffi/__read p t 0)
+           (let [parts (composite-parts t "read")]
+             (decode-desc p (nth parts 0) (nth parts 1) (nth parts 2) (nth parts 3) 0))))
+  ([p t off] (if (keyword? t)
+               (jolt.ffi/__read p t off)
+               (let [parts (composite-parts t "read")]
+                 (decode-desc p (nth parts 0) (nth parts 1) (nth parts 2) (nth parts 3) off)))))
+
+(defn write
+  "Write v as type t to pointer p, at byte offset `off` (default 0); answers nil.
+
+  t is a type keyword, a compiled layout, or a place. A struct value is a map
+  holding each of the layout's fields and no others; an array value is any
+  sequence of the declared length; a union value is a PAIR of a member name and
+  its value, [:result 0], since the members overlap.
+
+  Note the argument order: the VALUE comes before the offset, as it does in
+  babashka.ffi."
+  ([p t v] (if (keyword? t)
+             (jolt.ffi/__write p t v 0)
+             (let [parts (composite-parts t "write")]
+               (encode-desc p (nth parts 0) (nth parts 1) (nth parts 2) (nth parts 3) 0 v))))
+  ([p t v off] (if (keyword? t)
+                 (jolt.ffi/__write p t v off)
+                 (let [parts (composite-parts t "write")]
+                   (encode-desc p (nth parts 0) (nth parts 1) (nth parts 2) (nth parts 3) off v)))))
 
 (defn read-field [pointer layout path]
   (let [layout (checked-layout layout)
         path (checked-field-path path)]
-    (jolt.ffi/read pointer (field-type layout path) (field-offset layout path))))
+    (jolt.ffi/__read pointer (field-type layout path) (field-offset layout path))))
 
 (defn write-field [pointer layout path value]
   (let [layout (checked-layout layout)
         path (checked-field-path path)]
-    (jolt.ffi/write pointer (field-type layout path) (field-offset layout path) value)))
+    (jolt.ffi/__write pointer (field-type layout path) value (field-offset layout path))))
+
+;; -- scalar array moves -------------------------------------------------------
+;; A copy of one scalar type between foreign memory and a jolt array of that
+;; width. The type gives the WIDTH and nothing else, so the bits land as they
+;; are: :uint32 above Integer/MAX_VALUE reads back negative in an int-array,
+;; exactly as a memcpy into a Java int[] does, which is what makes a round trip
+;; through these byte-exact.
+;;
+;; The one-byte widths move as one block (read-array / write-array below the
+;; dispatch, which is a single foreign block copy); the wider ones move element
+;; by element, since a jolt array of 4- or 8-byte elements has no bytevector to
+;; copy into. :string cannot be copied at all — its elements are pointers to
+;; bytes elsewhere, which a copy cannot follow.
+(def ^:private array-byte-types
+  #{:int8 :i8 :uint8 :u8 :byte :char :bool})
+
+(defn- array-carrier [t]
+  (cond
+    (contains? array-byte-types t) {:width 1}
+    (= t :float) {:width 4 :ctor float-array :read-type :float :write-type :float :float? true}
+    (= t :double) {:width 8 :ctor double-array :read-type :double :write-type :double :float? true}
+    (or (= t :string) (= t :void) (not (keyword? t)))
+    (throw (ex-info (str "jolt.ffi: read-array and write-array copy scalars; "
+                         (if (= t :string)
+                           ":string elements are pointers to bytes elsewhere, which a copy cannot follow"
+                           (str "cannot copy " (pr-str t))))
+                    {:type t}))
+    :else
+    (let [w (jolt.ffi/__sizeof t)]
+      (case w
+        2 {:width 2 :ctor short-array :read-type :int16 :write-type :uint16 :mask 0xffff}
+        4 {:width 4 :ctor int-array :read-type :int32 :write-type :uint32 :mask 0xffffffff}
+        8 {:width 8 :ctor long-array :read-type :int64 :write-type :uint64
+           :signed-type :int64}
+        (throw (ex-info (str "jolt.ffi: cannot copy " (pr-str t) " as an array element")
+                        {:type t :width w}))))))
+
+(defn- read-array-typed [p t n off]
+  (let [carrier (array-carrier t)]
+    (if (nil? (:ctor carrier))
+      (jolt.ffi/__read-array (+ p off) n)
+      (let [width (:width carrier)
+            element (:read-type carrier)
+            arr ((:ctor carrier) n)]
+        (dotimes [i n] (aset arr i (jolt.ffi/__read p element (+ off (* i width)))))
+        arr))))
+
+;; One element, written so the BITS land as they are: a value wider than its
+;; element folds into it rather than raising, which is the write half of "the type
+;; gives the width and nothing else".
+(defn- write-array-element [p carrier v off]
+  (let [element (:write-type carrier)]
+    (cond
+      (:float? carrier) (jolt.ffi/__write p element v off)
+      (:mask carrier) (jolt.ffi/__write p element (bit-and v (:mask carrier)) off)
+      ;; Eight bytes has no fixnum mask to fold with — 0xffffffffffffffff is a
+      ;; bignum and bit-and refuses it — so the SIGN picks the type instead. The
+      ;; two cover the whole 64-bit range between them and store the same bits.
+      (neg? v) (jolt.ffi/__write p (:signed-type carrier) v off)
+      :else (jolt.ffi/__write p element v off))))
+
+(defn- write-array-typed [p t arr off]
+  (let [carrier (array-carrier t)]
+    (if (nil? (:ctor carrier))
+      (jolt.ffi/__write-array (+ p off) arr)
+      (let [width (:width carrier)
+            n (count arr)]
+        (dotimes [i n]
+          (write-array-element p carrier (nth arr i) (+ off (* i width))))
+        n))))
+
+(defn read-array
+  "Copy elements out of foreign memory into a fresh jolt array.
+
+      (read-array p n)             ; n raw octets -> a byte-array (jolt's form)
+      (read-array p t n)           ; n elements of type t -> an array of its width
+      (read-array p t n offset)    ; the same, starting `offset` bytes in
+
+  The typed form answers a byte-array for the one-byte types, a short-array,
+  int-array or long-array for the 2-, 4- and 8-byte integer and pointer types,
+  and a float-array or double-array for :float and :double. For an array of
+  structs, or for elements decoded the way read decodes them, use read with an
+  [:array t n] layout instead."
+  ([p n] (jolt.ffi/__read-array p n))
+  ([p t n] (read-array-typed p t n 0))
+  ([p t n off] (read-array-typed p t n off)))
+
+(defn write-array
+  "Copy a jolt array's elements into foreign memory; answers the element count.
+
+      (write-array p arr)          ; every octet of a byte-array (jolt's form)
+      (write-array p arr off n)    ; n octets of it, from index off
+      (write-array p t arr)        ; arr's elements as type t
+      (write-array p t arr offset) ; the same, starting `offset` bytes in
+
+  The array must be the one for the type's width, as read-array answers it. A
+  value wider than its element truncates to the element, since the copy carries
+  bits and not a range."
+  ([p arr] (jolt.ffi/__write-array p arr))
+  ([p a b]
+   (if (keyword? a)
+     (write-array-typed p a b 0)
+     (throw (ex-info "jolt.ffi/write-array: expected (write-array p t arr) or (write-array p arr off n)"
+                     {:second a}))))
+  ([p a b c]
+   (if (keyword? a)
+     (write-array-typed p a b c)
+     (jolt.ffi/__write-array p a b c))))
+
+(defn byte-buffer
+  "A java.nio.ByteBuffer view of `len` bytes at pointer p — a byte count, a type
+  keyword, or a compiled layout.
+
+      (ffi/byte-buffer p 4096)
+      (ffi/byte-buffer p frame)              ; a layout's worth
+
+  The buffer and the native memory SHARE THE SAME BYTES, as they do in
+  babashka.ffi: a put through the buffer is a write to the pointer, and a write
+  C makes is visible to the next get. Nothing is copied, so this is the cheap way
+  to hand a decoder that speaks ByteBuffer a window onto foreign memory —
+  read-bytes, read-array and read-into! remain the block moves that copy OUT into
+  a jolt value.
+
+  It is a DIRECT buffer, so hasArray answers false and array raises, exactly as
+  they do on the JVM. Multi-byte accessors (getInt and the sibling widths) are
+  big-endian, which is java.nio's default and all jolt shims.
+
+  CAUTION: the buffer keeps nothing alive. It holds an address, not a reference
+  to an arena or an allocation, so using one after the memory is freed reads
+  memory that is no longer yours — the same rule babashka.ffi states for its own."
+  [p len]
+  (jolt.ffi/__byte-buffer p (byte-count-of len)))
+
+;; -- scoped helpers -----------------------------------------------------------
 
 (defn- helper-binding [macro-name binding]
   (when-not (and (vector? binding) (= 2 (count binding))
                  (symbol? (first binding)))
-    (throw (str "jolt.ffi/" macro-name " requires [pointer value] binding")))
+    (throw (IllegalArgumentException. (str "jolt.ffi/" macro-name " requires [pointer value] binding"))))
   binding)
+
+(defmacro with-arena
+  "Bind a confined arena for the body and close it on the way out — with-open
+  with the constructor spelled in. Every allocation made in the arena is released
+  when the body ends, however it ends."
+  [binding & body]
+  (when-not (and (vector? binding) (= 1 (count binding)) (symbol? (first binding)))
+    (throw (IllegalArgumentException. "jolt.ffi/with-arena requires a single-symbol binding, [arena]")))
+  (let [arena (first binding)]
+    `(let [~arena (jolt.ffi/confined-arena)]
+       (try ~@body (finally (jolt.ffi/close-arena ~arena))))))
 
 (defmacro with-alloc
   "Allocate byte-count bytes for pointer, evaluate body, and free exactly once.
@@ -128,7 +1293,9 @@
     `(jolt.ffi/with-alloc [~pointer (jolt.ffi/layout-size ~layout)] ~@body)))
 
 (defmacro with-c-string
-  "Copy value to a lexical NUL-terminated UTF-8 C string."
+  "Copy value to a lexical NUL-terminated UTF-8 C string. A nil value binds NULL
+  rather than an empty string, which is how an optional C string argument is
+  passed; freeing it is still a no-op."
   [binding & body]
   (let [[pointer value] (helper-binding "with-c-string" binding)]
     `(let [~pointer (jolt.ffi/string->ptr ~value)]
@@ -137,7 +1304,9 @@
 (defmacro with-c-string-array
   "Build a lexical pointer array of count NUL-terminated UTF-8 strings. The
   values expression is evaluated once. Partially built arrays are cleaned up if
-  conversion fails. Neither the array nor its member pointers may escape body."
+  conversion fails. Neither the array nor its member pointers may escape body.
+  A nil member is a NULL entry, which is what an argv/envp-shaped array wants;
+  it is tracked and freed like any other member, freeing NULL being a no-op."
   [binding values & body]
   (let [[pointer count-expr] (helper-binding "with-c-string-array" binding)]
     `(let [values# (vec ~values)
@@ -151,40 +1320,179 @@
            (doseq [[index# value#] (map-indexed vector values#)]
              (let [string-pointer# (jolt.ffi/string->ptr value#)]
                (swap! owned# conj string-pointer#)
-               (jolt.ffi/write ~pointer :pointer
-                               (* index# (jolt.ffi/sizeof :pointer))
-                               string-pointer#)))
+               (jolt.ffi/write ~pointer :pointer string-pointer#
+                               (* index# (jolt.ffi/sizeof :pointer)))))
            ~@body
            (finally
              (doseq [string-pointer# @owned#]
                (jolt.ffi/free string-pointer#))
              (jolt.ffi/free ~pointer)))))))
 
+;; -- foreign functions --------------------------------------------------------
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
-;; so it's emitted collect-safe and won't pin the garbage collector.
-;; A :varargs marker inside the argtype vector declares a VARIADIC libc
-;; function and marks the boundary: the types before :varargs are the fixed
-;; (named) parameters, the types after it are the concrete variadic arguments
-;; the binding always passes. The call is emitted with the variadic calling
-;; convention (__varargs_after n, n = fixed-arg count) — required on Apple
-;; arm64, which passes variadic arguments on the stack; a fixed-arity binding
-;; silently corrupts them. fcntl is (int fd, int cmd, ...), so:
-;;   (ffi/defcfn c-fcntl "fcntl" [:int :int :varargs :int] :int)
+;; so it's emitted collect-safe and won't pin the garbage collector. It is not
+;; only about latency: a thread inside a call that is NOT :blocking stays ACTIVE
+;; for the whole call, and the stop-the-world collector waits for every active
+;; thread. So if anything else needs to collect while this call is parked in C,
+;; it waits until the call returns — including a :collect-safe callback arriving
+;; on one of the library's own threads, which is how a request/response pair
+;; through one native library wedges itself (see foreign-callable below, and
+;; issue #973). A :string ARGUMENT cannot combine with :blocking; pass a
+;; :pointer (string->ptr, or an arena-owned string) in that position.
+;; A :& (or :varargs — the same marker, jolt's older spelling) inside the argtype
+;; vector declares a VARIADIC libc function and marks the boundary: the types
+;; before it are the fixed (named) parameters, the types after it are the
+;; concrete variadic arguments the binding always passes. The call is emitted
+;; with the variadic calling convention (__varargs_after n, n = fixed-arg count)
+;; — required on Apple arm64, which passes variadic arguments on the stack; a
+;; fixed-arity binding silently corrupts them. fcntl is (int fd, int cmd, ...):
+;;   (ffi/defcfn c-fcntl "fcntl" [:int :int :& :int] :int)
 ;; C's default argument promotions still apply after the marker: pass values
-;; narrower than int as :int (and float as :double), not as an exact narrow type.
-(defmacro foreign-fn [csym argtypes rettype & [opt]]
-  (if (= opt :blocking)
-    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
-    (list 'jolt.ffi/__cfn csym argtypes rettype)))
+;; narrower than int as :int (and float as :double), not as an exact narrow type
+;; — which includes :bool, since _Bool promotes to int in a variadic call.
+;;
+;; With NO types after it the marker is BARE — babashka.ffi's other variadic
+;; form, where the tail belongs to the call rather than to the binding and each
+;; call infers its own from the values it is given:
+;;   (ffi/defcfn c-open "open" [:string :int :&] :int)
+;;   (c-open path O_RDONLY)         ; empty tail
+;;   (c-open path flags 0644)       ; one-int tail, same binding
+;; A foreign-procedure's types are fixed when it is COMPILED, so this lowers to a
+;; dispatcher over a per-binding cache rather than to one procedure: the first
+;; call of each distinct tail shape compiles a foreign-procedure for it and every
+;; call after that finds it. Three carriers keep the shape space small (integer/
+;; pointer/boolean/nil, double, C string) — see jolt-ffi-varargs-* in
+;; host/chez/java/ffi.ss for the table and the measured costs. Declaring the tail
+;; stays about 1.6x cheaper per call, so declare it where it does not vary.
+;; An options map may instead combine :blocking with
+;; :capture-native-error. Capture returns [native-result error-code] (result
+;; first), with the error slot read in the foreign-call return path. The analyzer
+;; validates the literal map and rejects capture on :void.
+(defn- cfn-form [csym argtypes rettype args who]
+  (let [n (count args)]
+    (cond
+      (zero? n)
+      (list 'jolt.ffi/__cfn csym argtypes rettype)
 
-;; (defcfn name "c_symbol" [argtypes] rettype [:blocking]) — def a foreign function.
-(defmacro defcfn [name csym argtypes rettype & [opt]]
-  (list 'def name (if (= opt :blocking)
-                    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
-                    (list 'jolt.ffi/__cfn csym argtypes rettype))))
+      (and (= n 1) (= (first args) :blocking))
+      (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
+
+      (and (= n 1) (map? (first args)))
+      (list 'jolt.ffi/__cfn csym argtypes rettype (first args))
+
+      :else
+      (throw (ex-info (str "jolt.ffi/" who ": trailing option must be "
+                           ":blocking or an options map; got " (vec args))
+                      {:jolt/ffi-option args})))))
+
+(defmacro foreign-fn [csym argtypes rettype & args]
+  (cfn-form csym argtypes rettype args "foreign-fn"))
+
+;; The babashka.ffi name for the same thing. It is a MACRO here, not a function:
+;; Chez's foreign-procedure needs its argument and result types at COMPILE time,
+;; so a literal signature is the whole reason the emitted binding is a real typed
+;; call and not an interpreter. The consequences are worth naming, because they
+;; are what a shim in either direction runs into:
+;;   - argtypes must be a literal vector; a computed signature has nowhere to go.
+;;   - the target must be a literal C symbol name, not a function pointer.
+;;   - the 4-argument library-scoped form raises. jolt already resolves a
+;;     declared native's symbols through its OWN dlopen handle, ahead of the
+;;     global namespace, which is the guarantee the library argument buys in
+;;     babashka.ffi — see TWO LIBRARIES, ONE COPY in the namespace docstring.
+;;     Silently searching everything instead would answer the wrong library's
+;;     symbol on exactly the setup the argument exists to protect.
+(defmacro cfn [& args]
+  (let [args (vec args)
+        n (count args)]
+    (when (< n 3)
+      (throw (ex-info "jolt.ffi/cfn: expected (cfn csym argtypes rettype) and an optional trailing option"
+                      {:args args})))
+    (when-not (string? (nth args 0))
+      (throw (ex-info "jolt.ffi/cfn: the first argument must be a literal C symbol name. A library-scoped (cfn lib sym argtypes rettype) has no jolt equivalent: a declared :jolt/native already resolves its own symbols through its own handle."
+                      {:args args})))
+    (cfn-form (nth args 0) (nth args 1) (nth args 2) (vec (drop 3 args)) "cfn")))
+
+;; (defcfn name docstring? attr-map? "c_symbol" [argtypes] rettype
+;;         [:blocking | {opts}]? [raw-name & fn-tail]?)
+;;
+;; The plain form defs `name` as the binding. The docstring and attribute map are
+;; babashka.ffi's, and both land on the var, so a namespace of bindings documents
+;; itself and ^:private still works. :library in the attribute map raises, for the
+;; reason cfn's fourth argument does.
+;;
+;; The WRAPPER form binds the raw C function to a local name and defines `name`
+;; as a jolt function over it — the shape for an out-parameter or an error code
+;; that callers should never see:
+;;
+;;   (defcfn open-db
+;;     "sqlite3_open_v2" [:string :pointer :int :string] :int
+;;     open-native
+;;     [filename flags]
+;;     (with-open [arena (ffi/confined-arena)]
+;;       (let [pdb (ffi/alloc arena :pointer)
+;;             code (open-native filename pdb flags nil)]
+;;         (if (zero? code)
+;;           (ffi/read pdb :pointer)
+;;           (throw (ex-info "open failed" {:code code}))))))
+;;
+;; The raw name is local to the wrapper body and does not enter the namespace.
+;; The wrapper may have several arities and its own argument lists.
+(defn- def-cfn-form [name docstring attrs args]
+  (do
+    (when (< (count args) 3)
+      (throw (ex-info "jolt.ffi/defcfn: expected a C symbol, an argtype vector and a return type"
+                      {:name name})))
+    (when (and attrs (contains? attrs :library))
+      (throw (ex-info "jolt.ffi/defcfn: :library has no jolt equivalent — a declared :jolt/native resolves its own symbols through its own handle, ahead of the global namespace"
+                      {:name name})))
+    (let [tail (vec (drop 3 args))
+          option? (and (pos? (count tail))
+                       (or (= :blocking (nth tail 0)) (map? (nth tail 0))))
+          option (if option? [(nth tail 0)] [])
+          tail (if option? (vec (rest tail)) tail)
+          binding (cfn-form (nth args 0) (nth args 1) (nth args 2) option "defcfn")
+          named (if attrs (with-meta name (merge (or (meta name) {}) attrs)) name)
+          value (if (zero? (count tail))
+                  binding
+                  (let [raw (nth tail 0)]
+                    (when-not (symbol? raw)
+                      (throw (ex-info "jolt.ffi/defcfn: the wrapper form names the raw binding with a symbol after the return type"
+                                      {:name name :got raw})))
+                    (list 'let (vector raw binding)
+                          (cons 'fn (cons name (vec (rest tail)))))))]
+      (if docstring
+        (list 'def named docstring value)
+        (list 'def named value)))))
+
+;;
+;; A docstring and a C symbol are both strings, so the C symbol is found by the
+;; shape around it rather than by counting from either end: it is the first
+;; string FOLLOWED BY THE ARGTYPE VECTOR. Everything before it is the optional
+;; docstring and attribute map, in that order.
+(defmacro defcfn [name & args]
+  (let [args (vec args)
+        csym-index (first (keep-indexed
+                           (fn [i x]
+                             (when (and (string? x)
+                                        (< (inc i) (count args))
+                                        (vector? (nth args (inc i))))
+                               i))
+                           args))]
+    (when (nil? csym-index)
+      (throw (ex-info "jolt.ffi/defcfn: expected a C symbol name followed by an argtype vector and a return type"
+                      {:name name})))
+    (let [prefix (vec (take csym-index args))
+          docstring (when (and (pos? (count prefix)) (string? (nth prefix 0))) (nth prefix 0))
+          rest-prefix (if docstring (vec (rest prefix)) prefix)
+          attrs (when (and (pos? (count rest-prefix)) (map? (nth rest-prefix 0)))
+                  (nth rest-prefix 0))]
+      (when-not (= (count rest-prefix) (if attrs 1 0))
+        (throw (ex-info "jolt.ffi/defcfn: only a docstring and an attribute map may precede the C symbol"
+                        {:name name :before prefix})))
+      (def-cfn-form name docstring attrs (vec (drop csym-index args))))))
 
 ;; foreign-callable wraps a jolt fn `f` as a C-callable function pointer — the
 ;; inverse of foreign-fn, so C can call back INTO jolt (GTK signal handlers, a
@@ -192,8 +1500,34 @@
 ;; it where C expects a function pointer. argtypes/rettype use the same keywords
 ;; as foreign-fn; the args C passes arrive as jolt values and the jolt return is
 ;; marshaled back. The callback stays live until free-callable is called on the
-;; pointer. Pass a trailing :collect-safe when C invokes the callback from a
-;; thread parked in a :blocking foreign call (e.g. a GTK main loop):
+;; pointer — or, with `callback` below, until its arena closes.
+;;
+;; Pass a trailing :collect-safe when the callback can arrive on a thread that is
+;; not an ACTIVE jolt thread at that moment. Two ways that happens: C invokes it
+;; on a thread the runtime never started (a dispatch queue, a pthread the library
+;; spawned), or on a jolt thread currently parked in a :blocking foreign call
+;; (e.g. a GTK main loop). Either way the entry has to reactivate the thread
+;; first; without :collect-safe it runs jolt code on a thread the collector does
+;; not know is running, and the process dies with a nonrecoverable memory fault
+;; that no handler can catch. It costs an activation per call, so leave it off
+;; for a callback C only ever invokes on the thread that called into C (a qsort
+;; comparator).
+;;
+;; :collect-safe gets the callback IN. What it cannot do is collect on its
+;; behalf: the reactivated thread allocates like any other, and an allocation
+;; that reaches a trip point has to stop the world. If the thread that called
+;; into C is parked in a foreign call that is NOT :blocking, it never reaches a
+;; safe point, so that collection — and the callback with it — waits for the
+;; call to return. When the call is waiting for the callback's answer (a client
+;; read served by the same library's dispatch thread) the two wait for each
+;; other, and what surfaces is the call's own timeout, on the FIRST request and
+;; the more reliably the more the callback allocates. Mark the outbound call
+;; :blocking and the deadlock cannot form. This is issue #973, and
+;; test/chez/ffi-foreign-thread-test.sh is the shape.
+;;
+;; A :collect-safe callback cannot RETURN :string (it hands C an address as it
+;; deactivates); return a :pointer. A :string ARGUMENT is fine — C owns those
+;; bytes. The restriction is the mirror of :blocking's, which is on arguments.
 ;;   (g-signal-connect button "clicked"
 ;;                     (ffi/foreign-callable on-click [:pointer :pointer] :void :collect-safe)
 ;;                     (ffi/null))
@@ -201,6 +1535,32 @@
   (if (= opt :collect-safe)
     (list 'jolt.ffi/__ccallable f argtypes rettype :collect-safe)
     (list 'jolt.ffi/__ccallable f argtypes rettype)))
+
+(defn __arena-callback
+  "Internal. Record an already-built callable entry point as arena-owned, so the
+  arena releases it. `callback` expands to this around __ccallable."
+  [arena addr]
+  (let [arena (arena-usable! arena "callback")]
+    (arena-add! arena :callables addr (fn [] (jolt.ffi/free-callable addr)))))
+
+;; The arena-owned foreign-callable: same pointer, released when the arena
+;; closes, with no free-callable to remember. A macro for the same reason cfn is.
+;;
+;; Choose the arena for the thread that calls back. A shared arena lets C invoke
+;; the callback from any thread, including one jolt never started — an event-loop
+;; notification. A confined arena is the one for a callback C only invokes during
+;; a call you make, such as a comparison function. An automatic arena releases
+;; the pointer once the ARENA is unreachable, and the collector cannot see the
+;; copy C holds, so use it only when your own reference outlives every call C can
+;; make.
+;;
+;; CAUTION: C can call the pointer until its arena releases it and not one
+;; instruction longer. Unregister the callback with the C library first.
+(defmacro callback [arena f argtypes rettype & [opt]]
+  (list 'jolt.ffi/__arena-callback arena
+        (if (= opt :collect-safe)
+          (list 'jolt.ffi/__ccallable f argtypes rettype :collect-safe)
+          (list 'jolt.ffi/__ccallable f argtypes rettype))))
 
 ;; (export! name f [argtypes] rettype [:collect-safe]) — publish `f` as a
 ;; C-callable entry point under `name`, for `jolt build --library`. An embedder
@@ -217,12 +1577,18 @@
 
 ;; -- errno --------------------------------------------------------------------
 ;; errno is a PER-THREAD slot behind a libc function on every platform jolt
-;; runs on: __error on macOS, __errno_location on Linux, _errno on Windows
-;; (ucrt). Each returns the calling thread's &errno, so reading through it is
-;; correct under threads — and under fibers, whose syscall and errno read both
-;; run on the fiber's carrier thread. A global cell would be wrong the moment
-;; two threads made syscalls. The foreign-procedure form is created lazily on
-;; first call, so declaring all three is safe; errno calls the live one.
+;; runs on: __error on macOS, __errno_location on glibc/musl, __errno on
+;; bionic (Android), _errno on Windows (ucrt). Each returns the calling
+;; thread's &errno, so reading through it is correct under threads — and under
+;; fibers, whose syscall and errno read both run on the fiber's carrier thread.
+;; A global cell would be wrong the moment two threads made syscalls. The
+;; foreign-procedure form is created lazily on first call, so declaring all of
+;; them is safe; errno resolves and caches the live one.
+;;
+;; Bionic cannot be told apart by name — it reports os.name "Linux" while the
+;; glibc spelling has no entry there — so the Linux arm RESOLVES the accessor
+;; on first use: the glibc foreign-procedure raises its no-entry error on
+;; bionic, and __errno is taken instead.
 ;;
 ;; Read it IMMEDIATELY after the failing call: anything that can enter the
 ;; runtime between the call and the read — an allocation, a park, another FFI
@@ -230,20 +1596,29 @@
 (defcfn c-errno-location "__errno_location" [] :pointer)
 (defcfn c-error-location "__error" [] :pointer)
 (defcfn c-errno-msvc "_errno" [] :pointer)
+(defcfn c-errno-bionic "__errno" [] :pointer)
 (defcfn c-strerror "strerror" [:int] :string)
 
 (def ^:private errno-loc
-  (case (System/getProperty "os.name")
-    "Mac OS X" c-error-location
-    "Windows"  c-errno-msvc
-    c-errno-location))
+  ;; What is cached is the ACCESSOR, never its result. Each call answers the
+  ;; calling thread's slot, and a pointer taken once would read the first
+  ;; caller's errno from every thread after it (the thread row in
+  ;; test/chez/jolt-ffi-errno-test.clj is what catches that).
+  (delay
+    (case (System/getProperty "os.name")
+      "Mac OS X" c-error-location
+      "Windows"  c-errno-msvc
+      (try (c-errno-location) c-errno-location
+           (catch Throwable _
+             ;; no entry on bionic (Android/Termux)
+             c-errno-bionic)))))
 
 (defn errno
   "The calling thread's errno, read through the platform's thread-local
   accessor. Read it immediately after the failing foreign call — any
   intervening call into the runtime can overwrite the slot."
   []
-  (jolt.ffi/read (errno-loc) :int 0))
+  (jolt.ffi/__read ((force errno-loc)) :int 0))
 
 (defn errno-message
   "strerror's description of errno code e; with no argument, of the current

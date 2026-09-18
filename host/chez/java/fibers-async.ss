@@ -232,6 +232,31 @@
 (cca-def! "<!!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
 (cca-def! ">!!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
 
+;; (fiber-execute runnable) -> nil. Run RUNNABLE on a fiber and forget it: no
+;; result channel, no join. This is the spawn behind the :io Executor that
+;; clojure.core.async.impl.dispatch hands to core.async.flow, and it is
+;; deliberately leaner than fiber-spawn — a flow process never reads the channel
+;; fiber-spawn would allocate, and the executor contract (java.util.concurrent
+;; .Executor/execute returns void) has nothing to hand one to.
+;;
+;; Uncaught throws are REPORTED and swallowed, matching the executor-service
+;; shim's `execute` (concurrency.ss) rather than fiber-spawn's convey-to-channel:
+;; nobody is holding a channel to convey to. runnable->thunk accepts a FutureTask
+;; (what futurize submits) as well as a plain thunk, so the two executors take the
+;; same arguments.
+(define (async-fiber-execute r)
+  (let ((thunk (runnable->thunk r)))
+    (sa-fiber-spawn
+     (lambda ()
+       (*txn* #f)
+       (guard (e (#t (async-report-uncaught! "fiber-execute task" e)))
+         (jolt-invoke thunk))))
+    ;; a carrier may not exist yet on the very first spawn (fiber-spawn's own
+    ;; postlude does this too) — without it the fiber sits ready and unrun.
+    (jolt-fiber-ensure-carrier!)
+    jolt-nil))
+(cca-def! "fiber-execute" async-fiber-execute)
+
 ;; Install the alts! fiber-await hook (see async.ss).
 (set! jolt-fiber-alt-await-fn jolt-fiber-alt-await)
 

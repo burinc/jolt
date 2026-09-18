@@ -14,6 +14,11 @@
              var (host-contract.ss declares them; manifest-check.sh pins that list
              to native-ops).
     :value   Scheme proc for a VALUE-position use ((map + xs)); defaults to :call.
+             REQUIRED when the :call name is a Scheme MACRO rather than a
+             procedure (the arithmetic ops, and the spliced predicates in
+             values.ss): a macro name in value position is a compile error on
+             Gambit and a variable transformer at best on Chez, so these name
+             their <proc>-fn twin here.
     :dbl     flonum fast-path proc (^double contagion) — emit-numeric splices it.
     :lng     fixnum fast-path proc (^long). `/` has none (long/long is a Ratio).
     :bd      BigDecimal fast-path proc.
@@ -69,7 +74,7 @@
           :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
    "dec" {:call "jolt-n-dec" :value "jolt-dec" :arity #(= % 1)
           :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
-   "not" {:call "jolt-not" :arity #(= % 1) :bool? true :pure? true}
+   "not" {:call "jolt-not" :value "jolt-not-fn" :arity #(= % 1) :bool? true :pure? true}
    "min" {:call "jolt-n-min" :value "jolt-min"
           :dbl "flmin" :lng "jolt-l-min" :bd "jbd-min"
           :num-result? true :num-args? true :pure? true}
@@ -91,15 +96,43 @@
    "quot"  {:call "jolt-quot" :arity #(= % 2)
             :lng "jolt-l-quot" :bd "jbd-quot"
             :num-result? true :num-args? true :foldable? true}
-   "unchecked-add"      {:lng "jolt-uncadd2"}
-   "unchecked-subtract" {:lng "jolt-uncsub2"}
-   "unchecked-multiply" {:lng "jolt-uncmul2"}
+   ;; The unchecked family lowers to its runtime helpers directly. Before, only a
+   ;; proven-:long operand pair reached jolt-uncadd2 (via :lng); every other call
+   ;; was var-deref + jolt-invoke + the variadic rest-list fold — 29 ns against
+   ;; 3.6 for + on the same operands, and the hinted-Clojure idiom libraries
+   ;; write (unchecked-inc on a loop counter, unchecked-add on an accumulator) is
+   ;; exactly what paid it. :fixed names the 2-arg entry; :lng keeps the proven-
+   ;; long path on the same WRAPPING helpers (never the raising fx ops); :dbl is
+   ;; the same flonum op as +/-/*: unchecked-* wrap only longs and are ordinary
+   ;; arithmetic on a flonum operand, so a proven-double pair unboxes too.
+   "unchecked-add"      {:call "jolt-unchecked-add" :fixed {2 "jolt-uncadd2"}
+                         :lng "jolt-uncadd2" :dbl "fl+"
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-subtract" {:call "jolt-unchecked-sub" :fixed {2 "jolt-uncsub2"}
+                         :lng "jolt-uncsub2" :dbl "fl-"
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-multiply" {:call "jolt-unchecked-mul" :fixed {2 "jolt-uncmul2"}
+                         :lng "jolt-uncmul2" :dbl "fl*"
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-inc"      {:call "jolt-uncinc" :arity #(= % 1)
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-dec"      {:call "jolt-uncdec" :arity #(= % 1)
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-negate"   {:call "jolt-uncneg" :arity #(= % 1)
+                         :dbl-contagion? true :num-result? true :num-args? true}
    ;; collections
    "vector"      {:call "jolt-vector"}
    "hash-map"    {:call "jolt-hash-map-fn"}
    "hash-set"    {:call "jolt-hash-set"}
    "conj"        {:call "jolt-conj"    :arity #(>= % 1) :fixed {2 "jolt-conj2"}}
    "get"         {:call "jolt-get"     :arity #(or (= % 2) (= % 3)) :pure? true}
+   ;; Reads a deftype/defrecord's DECLARED slot, bypassing the get path — the
+   ;; deftype macro binds each immutable field with it. Not a public name: a
+   ;; type declaring clojure.lang.ILookup answers get through its own valAt, and
+   ;; a method body reading its own fields through get would re-enter that valAt
+   ;; on every entry. Cheaper than get too — straight to the slot, no type
+   ;; cascade. (records.ss jrec-field / clojure.core/__deftype-field.)
+   "__deftype-field" {:call "jrec-field" :arity #(= % 2) :pure? true}
    "nth"         {:call "jolt-nth"     :arity #(or (= % 2) (= % 3))}
    "count"       {:call "jolt-count"   :arity #(= % 1) :num-result? true}
    "assoc"       {:call "jolt-assoc"   :arity #(and (>= % 3) (odd? %))
@@ -113,6 +146,11 @@
    "empty?"      {:call "jolt-empty?"   :arity #(= % 1) :bool? true}
    "peek"        {:call "jolt-peek"    :arity #(= % 1)}
    "pop"         {:call "jolt-pop"     :arity #(= % 1)}
+   ;; @x / (deref x) — the read every loop that keeps state in an atom does, and
+   ;; it was going through a var-cell deref plus a generic invoke to reach a
+   ;; procedure that answers with one record read. Only the 1-arity form lowers:
+   ;; the timed (deref ref ms val) arity is rarer and stays on the var.
+   "deref"       {:call "jolt-deref"   :arity #(= % 1)}
    ;; Java arrays: the hot 1-dim forms lower to the native array-aware ops
    ;; (aget->jolt-nth, alength->jolt-count) and a write helper (aset->jolt-aset3),
    ;; skipping the clojure.core overlay's var-deref + reduce/seq alloc. Multi-dim
@@ -123,7 +161,7 @@
    ;; uses fall back to the clojure.core overlay var (the multi-dim walker).
    "aget"    {:call "jolt-nth"    :arity #(= % 2) :inline-only? true}
    "aset"    {:call "jolt-aset3"  :arity #(= % 3) :inline-only? true}
-   "alength" {:call "jolt-count"  :arity #(= % 1) :num-result? true}
+   "alength" {:call "jolt-alength" :arity #(= % 1) :num-result? true}
    ;; seq
    "first"   {:call "jolt-first"   :arity #(= % 1)}
    "rest"    {:call "jolt-rest"    :arity #(= % 1)}
@@ -137,6 +175,7 @@
    "filter"  {:call "jolt-filter"  :arity #(= % 2)}
    "remove"  {:call "jolt-remove"  :arity #(= % 2)}
    "reduce"  {:call "jolt-reduce"  :arity #(or (= % 2) (= % 3))}
+   "reduce-kv" {:call "jolt-reduce-kv" :arity #(= % 3)}
    "into"    {:call "jolt-into"    :arity #(= % 2)}
    "concat"  {:call "jolt-concat"}
    "apply"   {:call "jolt-apply"   :arity #(>= % 2)}
@@ -151,12 +190,12 @@
    "pos?"     {:call "jolt-pos?"   :arity #(= % 1) :bool? true :bd "jbd-pos?" :pure? true}
    "neg?"     {:call "jolt-neg?"   :arity #(= % 1) :bool? true :bd "jbd-neg?" :pure? true}
    "zero?"    {:call "jolt-zero?"  :arity #(= % 1) :bool? true :bd "jbd-zero?" :pure? true}
-   "identity" {:call "jolt-identity" :arity #(= % 1)}
-   "nil?"     {:call "jolt-nil?"   :arity #(= % 1) :bool? true :pure? true}
-   "some?"    {:call "jolt-some?"  :arity #(= % 1) :bool? true :pure? true}
+   "identity" {:call "jolt-identity" :value "jolt-identity-fn" :arity #(= % 1)}
+   "nil?"     {:call "jolt-nil?"   :value "jolt-nil?-fn"   :arity #(= % 1) :bool? true :pure? true}
+   "some?"    {:call "jolt-some?"  :value "jolt-some?-fn"  :arity #(= % 1) :bool? true :pure? true}
    ;; the reference inlines identical? (:inline -> Util/identical); a var call
    ;; here cost ~100ns per use in cell-less seed code (true?/false?/boolean?).
-   "identical?" {:call "jolt-identical?" :arity #(= % 2) :bool? true :pure? true}
+   "identical?" {:call "jolt-identical?" :value "jolt-identical?-fn" :arity #(= % 2) :bool? true :pure? true}
    "ex-info"  {:call "jolt-ex-info" :arity #(or (= % 2) (= % 3))}
    ;; bit ops emit a direct call to their helper instead of var-deref + the
    ;; variadic overlay. The helpers coerce through ->int, which rejects a

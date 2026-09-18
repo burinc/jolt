@@ -60,11 +60,17 @@
 # reset at use, so those work under either model; they are noted per file in
 # the R4 table, not re-pinned here.
 #
-# ThreadLocal (host-static-classes.ss:1195) is the one opposite-direction
-# parameter that does NOT defend: under fork-inheritance a child inherits the
-# parent's SET value instead of re-running its init-thunk (the JVM always
-# yields a fresh value per thread). Accepted divergence, documented in the R4
-# table; a fresh-default-per-thread target reproduces JVM ThreadLocal exactly.
+# java.lang.ThreadLocal (host-static-classes.ss) used to be the one opposite-
+# direction parameter that did NOT defend: under fork-inheritance a child
+# inherited the parent's SET value instead of running its own initialValue. That
+# was recorded here as an accepted divergence and it was not one — it is the only
+# thing the class promises, and it silently gave every worker in a pool one
+# shared ThreadLocal<Process> / RNG / SimpleDateFormat (jolt-uecg). It no longer
+# uses a thread parameter: the value lives in a per-thread virtual-register
+# table, so "fresh per thread" holds under either fork model.
+# java.lang.InheritableThreadLocal, whose contract IS inheritance, keeps a
+# per-instance thread parameter and so joins the load-bearing list above — an
+# adapter whose threads do not inherit must arrange it explicitly there too.
 #
 # MUTEXES ARE NON-RECURSIVE (PSL R4, pinned): same-thread re-acquire blocks,
 # per SRFI-18 mutex-acquire!. No host site re-acquires: re-entrant entry is
@@ -86,6 +92,12 @@ condition-signal
 condition-broadcast
 make-thread-parameter
 get-thread-id
+# Fences. seq.ss publishes a forced tail behind memory-order-release so the
+# seq's own fields are visible before the word that points to it on a weakly
+# ordered machine; a target whose threads share no memory (green threads on
+# one OS thread) provides both as no-ops.
+memory-order-acquire
+memory-order-release
 #
 # tier: system
 # getenv: R7RS get-environment-variable shape — (getenv "NAME") -> string or #f.
@@ -114,8 +126,16 @@ system
 # tolerates a fake); sa-real-time-ms may use any monotonic ms clock but never
 # a constant (callers stamp temp files with it); sa-total-memory-bytes may
 # approximate — callers only display it or subtract sa-bytes-allocated from
-# it; sa-max-memory-bytes may return a large constant (the JVM arm already
-# falls back to Long.MAX_VALUE semantics).
+# it; sa-max-memory-bytes is the heap's high-water mark since the last
+# sa-reset-max-memory-bytes! and may answer the current total (a target that
+# keeps no peak answers "now"), in which case sa-reset-max-memory-bytes! may
+# no-op; sa-gc-trip-bytes may answer 0 where no trip threshold exists (the
+# apply-scaling gate floors a footprint reading at it, and 0 is no floor);
+# sa-gc-install-ceiling! may answer
+# #f without installing anything, which leaves the heap unbounded as it was
+# before 0.8.5 — a target with no collection hook cannot enforce a ceiling,
+# and the caller then reports maxMemory as unbounded rather than promising a
+# bound it does not have.
 sa-run-process
 sa-gc-collect
 sa-gc-max-generation
@@ -125,6 +145,9 @@ sa-max-memory-bytes
 sa-real-time-ms
 sa-file-mtime-ms
 sa-gc-trip-bytes!
+sa-gc-trip-bytes
+sa-reset-max-memory-bytes!
+sa-gc-install-ceiling!
 #
 # tier: capability-introspect
 # OUR definitions in host/chez/scheme-adapter-runtime.ss for the blocklist's
@@ -136,7 +159,13 @@ sa-gc-trip-bytes!
 # a zero vector; the walker/procedure entry points degrade to '() / #f and
 # the backtrace renders without frames, gated by sa-introspect-enabled?
 # (a dynamic parameter — the degraded-backtrace gate flips it to prove throws
-# still carry type+message).
+# still carry type+message). sa-procedure-code-name is the one entry the
+# runtime reads for IDENTITY rather than for a report: (sa-procedure-code-name
+# p) -> the string the procedure's code object was bound under, the same for
+# every closure of one lambda, or #f; continuations.ss recognises an escape
+# wrapper by it. A target that answers #f there makes escape-fn? answer false,
+# which the contract permits; it must never answer a name for a procedure that
+# was not bound under it.
 sa-host-tag
 sa-os-family
 sa-arch
@@ -145,6 +174,7 @@ sa-stats
 sa-introspect-enabled?
 sa-continuation-frames
 sa-procedure-info
+sa-procedure-code-name
 #
 # tier: capability-ffi
 # OUR OWN definitions in host/chez/scheme-adapter-runtime.ss (loaded FIRST in
@@ -188,7 +218,31 @@ sa-foreign-entry-address
 sa-foreign-callable-entry-point
 sa-foreign-procedure-runtime
 sa-foreign-procedure
+sa-foreign-procedure-native-error
 sa-foreign-procedure-blocking
+#
+# tier: capability-continuations
+# OUR OWN definition in host/chez/scheme-adapter-runtime.ss — the one-shot
+# ESCAPE continuation, exposed to jolt programs as jolt.continuations
+# (call-cc / letcc) via host/chez/continuations.ss.
+#   (sa-call-with-escape-continuation proc) -> value: call PROC with a one-shot
+#     escape procedure k; (k v) returns v from THIS call, unwinding the
+#     dynamic-wind chain in between (so a jolt `finally` runs — an escape is a
+#     real exit, unlike a fiber park, which drops those winders first).
+# ENFORCED, NOT MERELY OFFERED: k is valid AT MOST ONCE and only while this
+# call is still on the stack. A second invocation, or one after PROC returned
+# normally, must RAISE — never re-enter a dead frame and never hang. A target
+# whose only continuation primitive is multi-shot (Gambit's call/cc) carries a
+# spent flag in its adapter to meet this; Chez's call/1cc is the contract
+# natively, so its adapter is a one-liner.
+# The layer above adds jolt policy the contract does not: which thread and
+# fiber may invoke a given escape, and the jolt-level error. Targets do not
+# implement that — they only owe the one-shot primitive.
+# Permitted degradation: a target with no usable continuations must raise a
+# message-carrying condition (never leave the name unbound); jolt.continuations
+# then fails honestly on that target, the same shape jolt.image takes when
+# fasl serialization is absent.
+sa-call-with-escape-continuation
 #
 # tier: eval
 # interaction-environment: R7RS (scheme repl), not Chez-only. The ONLY host
@@ -224,6 +278,40 @@ sa-make-boot-file
 # the write/read and convert a raise into a jolt-level message).
 sa-fasl-write
 sa-fasl-read
+#
+# tier: capability-unchecked
+# OUR OWN definitions in the adapter runtime file, SYNTAX. The unchecked
+# fixnum / vector primitives for the runtime's hot loops: the linear scan of a
+# small map's slot vector, a slot-vector copy. Contract: on VALID input —
+# fixnum operands whose result is a fixnum, a vector index in range — each
+# gives exactly the checked primitive's result. On invalid input the behaviour
+# is undefined, so a call site carries its own proof: a loop bound read from
+# the vector's own length or a used-count kept <= it, an index stepped from 0
+# by a constant. Degradation: a target may expand every one of these to the
+# checked primitive (gambit does) — the speed goes, nothing else. On Chez they
+# lower to the #3% (optimize-level 3) primitives, which is what makes a scan
+# loop 3x faster in the optimize-level 2 runtime.
+sa-ufx+
+sa-ufx-
+sa-ufx<?
+sa-ufx>=?
+sa-ufx=?
+sa-uvector-ref
+sa-uvector-set!
+#   (sa-vector-copy-range! to at from start end) -> unspecified: copy FROM's
+#     elements start..end-1 into TO at index at, the R7RS vector-copy! shape.
+#     Chez's vector-copy! takes (from from-start to to-start count), so its
+#     adapter reorders; a target with the R7RS order passes through. A bulk
+#     move in the target's runtime — what beats a Scheme copy loop.
+sa-vector-copy-range!
+#   (sa-string-copy-range! to at from start end) -> unspecified: the same shape
+#     over strings. Chez's string-copy! is (from from-start to to-start count)
+#     while R7RS (Gambit, Guile) is (to at from start end) — the two orders
+#     have the same arity, so a raw string-copy! in shared code compiles on
+#     both targets and on the R7RS one silently copies the empty destination
+#     INTO the source (the first block-copy subs did exactly that on gsi).
+#     string-copy! is blocklisted for that reason.
+sa-string-copy-range!
 #
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are

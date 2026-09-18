@@ -91,6 +91,28 @@
   (chk "missing-ns: error names the missing file"
        (and msg (re-find #"no/such/namespace/xyz" msg) (re-find #"Could not locate" msg))))
 
+;; --- (8) a nested require under (binding [*ns* ..]) interns into its own ns ----
+;; chez-current-ns prefers a live (binding [*ns* ..]) over the thread parameter,
+;; but set-chez-ns! used to write only the parameter — so ldr-load-body's restore
+;; of the current ns on the way out of a load did nothing under such a binding,
+;; and *ns* stayed pointing at the LAST file the require finished. Every def
+;; after the :require in the requiring file then interned into the wrong
+;; namespace. typedclojure's ann* macroexpands under exactly such a binding, so
+;; its whole dependency tree loaded wrong.
+;; Every answer below probed against JVM Clojure 1.12 first.
+(spit (str root "/nfx.clj") "(ns nfx) (defn nfx-fn [] :ok)")
+(spit (str root "/nfy.clj") "(ns nfy (:require [nfx :as d])) (defn nfy-fn [] (d/nfx-fn))")
+(set-roots!)
+(binding [*ns* (the-ns 'loader-test)]
+  (require 'nfy)
+  (chk "ns-binding: the load restores *ns* to the bound one" (= "loader-test" (str *ns*))))
+(chk "ns-binding: nested require's ns exists" (some? (find-ns 'nfx)))
+(chk "ns-binding: nested def interns in its own ns" (some? (ns-resolve 'nfx 'nfx-fn)))
+(chk "ns-binding: def did not leak into the bound ns" (nil? (ns-resolve 'loader-test 'nfx-fn)))
+(chk "ns-binding: requiring ns's def interns in its own ns" (some? (ns-resolve 'nfy 'nfy-fn)))
+(chk "ns-binding: cross-ns call works"
+     (= :ok (when-let [v (ns-resolve 'nfy 'nfy-fn)] ((deref v)))))
+
 (if (empty? @failures)
   (println "LOADER OK")
   (doseq [f @failures] (println "FAIL:" f)))

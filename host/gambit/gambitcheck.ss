@@ -142,8 +142,11 @@
 ;; unit-test sections — this list is only the CONTRACT-name side of the check.
 (define contract-syntax-shims
   '(with-mutex
-    sa-foreign-procedure sa-foreign-procedure-blocking
-    sa-foreign-callable sa-foreign-callable-collect-safe))
+    sa-foreign-procedure sa-foreign-procedure-native-error
+    sa-foreign-procedure-blocking
+    sa-foreign-callable sa-foreign-callable-collect-safe
+    ;; capability-unchecked: expand to the checked primitives here
+    sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=? sa-uvector-ref sa-uvector-set!))
 
 (define (bound? s)
   (or (guard (e (#t #f)) (eval s (interaction-environment)) #t)
@@ -228,6 +231,25 @@
   (check "fxsll alias" (fxsll 1 4) 16)
   (check "fxsra alias" (fxsra 8 1) 4)
   (check "native fx+ still bound" (fx+ 1 2) 3)
+  ;; capability-unchecked: on this target each is the checked primitive
+  (check "sa-ufx+" (sa-ufx+ 1 2) 3)
+  (check "sa-ufx-" (sa-ufx- 5 2) 3)
+  (check "sa-ufx<?" (sa-ufx<? 1 2) #t)
+  (check "sa-ufx>=?" (sa-ufx>=? 2 2) #t)
+  (check "sa-ufx=?" (sa-ufx=? 3 3) #t)
+  (check "sa-uvector-ref" (sa-uvector-ref (vector 1 2 3) 1) 2)
+  (check "sa-uvector-set!" (let ((v (vector 1 2 3))) (sa-uvector-set! v 1 9) (vector-ref v 1)) 9)
+  (check "sa-vector-copy-range! (R7RS shape)"
+         (let ((to (make-vector 5 0))) (sa-vector-copy-range! to 1 (vector 7 8 9) 1 3) to)
+         (vector 0 8 9 0 0))
+  ;; the string twin is the subs fast path (converters.ss, shared with this
+  ;; host); the raw string-copy! it replaced has the OPPOSITE argument order
+  ;; here, so a wrong adapter reads back "hello" untouched and a blank span.
+  (check "sa-string-copy-range! (R7RS shape)"
+         (let ((from (string-copy "hello world")) (to (make-string 5 #\-)))
+           (sa-string-copy-range! to 0 from 6 11)
+           (list to from))
+         (list "world" "hello world"))
   (check "bitwise-arithmetic-shift-left (natives-num.ss spelling)" (bitwise-arithmetic-shift-left 1 40) 1099511627776)
   (check "bitwise-arithmetic-shift-right floor on negative" (bitwise-arithmetic-shift-right -7 1) -4))
 
@@ -282,6 +304,21 @@
     (let ((t (fork-thread (lambda () (result (p))))))
       (thread-join! t)
       (check "parameter fork-inheritance: child sees parent's current value" (result) 2)))
+  ;; virtual registers are PER THREAD and a fresh thread starts every slot at
+  ;; fixnum 0 -- Chez's contract, which the runtime leans on for anything a
+  ;; child must not inherit (an interrupt box, a per-thread cache). Probed on
+  ;; Chez 10.x: the child of a thread that wrote slot 12 reads 0 there.
+  (let ((seen (vector 'unset 'unset)))
+    (set-virtual-register! 12 'parent)
+    (let ((t (fork-thread (lambda ()
+                            (vector-set! seen 0 (virtual-register 12))
+                            (set-virtual-register! 12 'child)
+                            (vector-set! seen 1 (virtual-register 12))))))
+      (thread-join! t)
+      (check "virtual-register: a fresh thread starts a written slot at 0" (vector-ref seen 0) 0)
+      (check "virtual-register: the child's write is its own" (vector-ref seen 1) 'child)
+      (check "virtual-register: the parent's slot is untouched" (virtual-register 12) 'parent)
+      (set-virtual-register! 12 0)))
   ;; get-thread-id: distinct numbers for live threads
   (let ((ids (make-table test: eq?)))
     (let ((id1 (get-thread-id))
@@ -368,6 +405,15 @@
                        "ffi is unsupported on the gambit target")
   (check-raise-message "sa-foreign-procedure (syntax)" (lambda () (sa-foreign-procedure "f" (int) int))
                        "ffi is unsupported on the gambit target")
+  (check-raise-message "sa-foreign-procedure-native-error (syntax)"
+                       (lambda ()
+                         (sa-foreign-procedure-native-error unsupported-native-error
+                                                            () "f" (int) int))
+                       "ffi is unsupported on the gambit target")
+  (check-raise-message "jolt-ffi-native-error-procedure (target wrapper)"
+                       (lambda ()
+                         (jolt-ffi-native-error-procedure () "f" (int) int))
+                       "ffi is unsupported on the gambit target")
   (check-raise-message "sa-foreign-procedure-blocking (syntax)" (lambda () (sa-foreign-procedure-blocking "f" (int) int))
                        "ffi is unsupported on the gambit target")
   (check-raise-message "sa-foreign-callable (syntax)" (lambda () (sa-foreign-callable (lambda () 1) (int) int))
@@ -392,6 +438,55 @@
                        "fasl serialization is unsupported on the gambit target")
   (check-raise-message "sa-run-process" (lambda () (sa-run-process "echo hi" #f))
                        "subprocess support is unsupported on the gambit target"))
+
+;; ---- continuations tier — the one-shot escape primitive ---------------------
+;; The gambit target IMPLEMENTS this tier rather than degrading, so these rows
+;; assert real behaviour, not an honest-failure message. The two refusals are
+;; the whole reason the adapter wraps call/cc at all: call/cc is multi-shot and
+;; would happily graft control back into a frame that already finished.
+(define (test-continuations)
+  (printf "== continuations: one-shot escape (call/cc + spent flag) ==\n")
+  (check "escape returns its value"
+         (sa-call-with-escape-continuation (lambda (k) (k 'escaped) 'not-reached))
+         'escaped)
+  (check "falling through returns the body value"
+         (sa-call-with-escape-continuation (lambda (k) 'fell-through))
+         'fell-through)
+  (check "escape leaves a loop from depth"
+         (sa-call-with-escape-continuation
+          (lambda (k) (let loop ((i 0)) (if (= i 100) (k i) (loop (+ i 1))))))
+         100)
+  ;; An escape is a real exit: the dynamic-wind chain between the capture and
+  ;; the escape unwinds, which is what makes a jolt `finally` run.
+  (check "escape unwinds dynamic-wind"
+         (let ((log '()))
+           (sa-call-with-escape-continuation
+            (lambda (k)
+              (dynamic-wind
+                (lambda () (set! log (cons 'in log)))
+                (lambda () (k 'out))
+                (lambda () (set! log (cons 'out log))))))
+           (reverse log))
+         '(in out))
+  (check-raise-message "second invocation refused"
+                       (lambda ()
+                         (let ((saved #f))
+                           (sa-call-with-escape-continuation
+                            (lambda (k) (set! saved k) (k 'first)))
+                           (saved 'again)))
+                       "escape continuation is spent")
+  (check-raise-message "invocation after a normal return refused"
+                       (lambda ()
+                         (let ((saved #f))
+                           (sa-call-with-escape-continuation
+                            (lambda (k) (set! saved k) 'fell-through))
+                           (saved 'too-late)))
+                       "escape continuation is spent")
+  (check "a fresh capture after a spent one still escapes"
+         (let ((saved #f))
+           (sa-call-with-escape-continuation (lambda (k) (set! saved k) (k 'first)))
+           (sa-call-with-escape-continuation (lambda (k) (k 'second))))
+         'second))
 
 ;; ---- coroutines tier (fibers R1) — the call/cc-based fiber primitive --------
 ;; Mirrors the Chez gate's correctness set at small scale: round trip,
@@ -472,6 +567,7 @@
 (test-threads)
 (test-hasheq-known-answers)
 (test-sa-surface)
+(test-continuations)
 (test-coroutines)
 
 (printf "\ngambitcheck: ~a failure(s)\n" failures)

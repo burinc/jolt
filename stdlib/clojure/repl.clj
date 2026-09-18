@@ -1,10 +1,16 @@
 ; Jolt Standard Library: clojure.repl
 ; Partial port from Clojure 1.12's clojure.repl: the special-form documentation
 ; data (special-doc-map / special-doc) and the metadata-driven interactive fns
-; (doc, find-doc, apropos, dir). source and pst are not provided — image-baked
+; (doc, find-doc, apropos, dir) plus demunge. source and pst are not provided — image-baked
 ; vars carry no :file, so there is no source text to point at.
 
 (ns clojure.repl)
+
+(defn demunge
+  "Given a string representation of a fn class,
+  as in a stack trace element, returns a readable version."
+  [fn-name]
+  (clojure.lang.Compiler/demunge fn-name))
 
 (def ^:private special-doc-map
   '{. {:url "java_interop#dot"

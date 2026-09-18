@@ -80,10 +80,26 @@
                 (or val ret)))
       nil vals)))
 
+(defn- merge-tree-shake
+  "jolt's own top-level key across the chain. :jolt/tree-shake holds
+  {:allow-dynamic [...]}, a list of vouched-for resolution sites, and two sources
+  that both declare one — the user deps.edn and the project's, or -Sdeps over
+  either — mean the UNION: a vouch the project makes is not withdrawn by the
+  user file also making one. The generic one-level map merge kept only the
+  last source's list."
+  [deps-edn-maps]
+  (let [ts (keep :jolt/tree-shake deps-edn-maps)]
+    (when (seq ts)
+      (let [allow (into [] (distinct) (mapcat :allow-dynamic ts))]
+        (cond-> (apply merge ts) (seq allow) (assoc :allow-dynamic allow))))))
+
 (defn merge-edns
   "Merge multiple deps edn maps from left to right into a single deps edn map."
   [deps-edn-maps]
-  (apply merge-with merge-or-replace (remove nil? deps-edn-maps)))
+  (let [maps (remove nil? deps-edn-maps)
+        merged (apply merge-with merge-or-replace maps)
+        ts (merge-tree-shake maps)]
+    (if ts (assoc merged :jolt/tree-shake ts) merged)))
 
 ;;;; Aliases
 

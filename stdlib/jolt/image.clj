@@ -14,10 +14,18 @@
   evaluates the fn sources it carries, so only load images you trust, the
   same way you would only load code you trust.
 
+  Lazy sequences travel unforced, and stay lazy: an infinite one keeps
+  generating after a restore, and a side effect that had not run still has not.
+  A multimethod, a reify, and a namespace travel as their name and come back as
+  the live object.
+
   What still refuses: a closure whose captured local was optimized into the
   compiled code (a let over compile-time constants — the message names the
-  capture), and open resources with neither a handler nor stub mode. Use
-  `scan` to find both without writing anything."
+  capture), a future that has not completed and a transient (both belong to a
+  thread a restore does not have), a fn the runtime built rather than analyzed,
+  and open resources with neither a handler nor stub mode. Use `scan` to find
+  any of them without writing anything; `dump!` with {:unwritable :stub} writes
+  placeholders instead of refusing."
   (:require [jolt.host :as host]))
 
 (defn dump!

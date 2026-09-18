@@ -97,6 +97,19 @@
        (get node :init)
        (single-fixed-arity-fn? (get node :init))))
 
+;; Does this def's metadata opt it out of the closed world? ^:dynamic must stay
+;; rebindable by `binding` and ^:redef redefinable by a later def, so neither may
+;; be bound to a Scheme name (the back end's direct-link opt-out) NOR have its
+;; body copied into a caller (the inline pass's stash gate). Those are the same
+;; question -- can this var's value still change under code already compiled --
+;; and answering it in two places is how ^:redef came to be direct-link-exempt
+;; and inline-eligible at once: a redefinition then landed on a var nothing read
+;; any more, and the caller kept running the spliced original.
+;;
+;; Lives here, in the leaf both the back end and jolt.passes require, so the key
+;; set has one home.
+(defn closed-world-opt-out? [m] (boolean (or (get m :dynamic) (get m :redef))))
+
 ;; ---------------------------------------------------------------------------
 ;; IR schema.
 ;;
@@ -147,6 +160,14 @@
 ;;  * the positions map-ir-children / reduce-ir-children recurse. A `?` marks an
 ;;    optional position recursed only when present.
 ;;
+;; :inline-chain — stamped by jolt.passes.inline on every node it copies out of a
+;; callee: a vector of [callee-fqn call-line] pairs, innermost first, naming the
+;; logical frames between this node and the physical fn it ends up inside. The
+;; back end folds it into the trace marker and the tail-site pair (backend_scheme
+;; with-site / sited-tail-call) so a backtrace reports a spliced call chain the
+;; way it reads without inlining. Carried on the node, not in a side table,
+;; because that is what survives the passes that rebuild nodes.
+;;
 ;; Annotation keys — optional, attached to any node by a later pass; a back end or
 ;; pass reads them but a node is valid without them. WHO attaches / reads each:
 ;;   :hint :shape :nilable   collection-type inference (jolt.passes.types) — the
@@ -154,9 +175,35 @@
 ;;   :num-kind :num-read     numeric pass (jolt.passes.numeric) — an :invoke's
 ;;                           proven :double/:long arithmetic kind, and a field
 ;;                           read's numeric kind.
+;;   :fl-aget :fl-aset       an aget/aset over a ^doubles array, lowered to the
+;;   :v-aget :v-aset         unboxed flvector path / to the direct backing path for
+;;   :b-aset                 the other array kinds / to the byte store, which owns
+;;                           the signed-8-bit narrowing (jolt.passes.numeric).
+;;   :prim-op                a clojure.core call lowered to a Chez primitive over
+;;                           operands the collection lattice proved
+;;                           (jolt.passes.types str-prim-op).
+;;   :fl-op :lng-op          a java.lang.Math member lowered to a native Chez
+;;                           flonum op / a jolt-l-* fixnum macro, over operands
+;;                           the numeric pass proved (jolt.passes.numeric).
+;;   :target-type            a :host-call receiver PROVEN :str/:kw/:sb — by a
+;;                           hint (analyzer) or by inference (jolt.passes.types).
+;;                           Drives the direct interop emit, and is what the
+;;                           call's own answer type is read off.
 ;;   :devirt-type :devirt-*  a monomorphic protocol call's resolved impl (backend).
 ;;   :num-ret                a ^double/^long declared return, on a :var node.
 ;;   :phints :nhints         per-arity ^Record / ^double param hints (analyzer).
+;;   :dead-hints             per-arity params carrying a primitive tag jolt acts
+;;                           on nowhere. Read ONLY by the JOLT_CHECK lint
+;;                           (jolt.passes.types report-dead-hints!); nothing in
+;;                           codegen consumes them, which is what they report.
+;;   :rec-hint               a declared ^Record type on a :local, moved off a
+;;                           callee arity by the inline pass onto the local that
+;;                           replaced the param (a spliced body has no arity).
+;;   :src-form :free-names   a :fn literal's source and captured names, the pair
+;;                           the state image rebuilds a closure from (analyzer).
+;;   :live-names :src-ns     what a SPLICED copy of that literal actually
+;;                           captures, and the namespace its form was written in
+;;                           (jolt.passes.inline).
 ;;   :ret-nhint              a fn arity's declared numeric return kind.
 ;;   :no-init                a :def with no initializer (declare).
 ;;   :meta-expr              a :def's evaluated metadata expression.

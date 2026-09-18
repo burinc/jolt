@@ -1,8 +1,8 @@
 (ns clojurestar.deps
   "Dialect-neutral dynamic dependency loading."
   (:require [grenadine.require-deps :as required]
-   ;; :jolt ahead of :bb — jolt's reader matches both, and this facade must
-   ;; bind to jolt.deps there, not babashka.deps.
+   ;; :jolt first. jolt no longer matches :bb (#893), so :clj would be its
+   ;; fallback and grenadine.jvm is not what this should bind to here.
    #?(:jolt [jolt.deps :as implementation]
       :bb [babashka.deps :as implementation]
       :glj [glojure.deps :as implementation]

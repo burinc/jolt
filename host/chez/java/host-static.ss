@@ -1,7 +1,9 @@
 ;; host-static.ss — the host-interop registry core: the class-statics / class-ctors
-;; / tagged-methods tables, the jhost record, and the coercion helpers. The actual
+;; / tagged-methods tables, the jhost record, and the emit entry points. The actual
 ;; entries are registered by host-static-methods.ss (Class/member statics) and
-;; host-static-classes.ss (instantiable object classes), loaded after this.
+;; host-static-classes.ss (instantiable object classes), loaded after this; the
+;; number-parsing family the statics hand results through is java-parse.ss,
+;; loaded before.
 ;;
 ;; The analyzer lowers `Class/member` to a :host-static node and `(Class. ...)` /
 ;; `(new Class ...)` to a :host-new node (jolt-core/jolt/analyzer.clj); the Chez
@@ -57,7 +59,34 @@
              "warning: ~a member ~a/~a registered twice with different values\n"
              kind class member)))
 
-(define (register-class-statics! name members)  ; members: list of (str . val/proc)
+;; The host's own boot-time registrations (io.ss, host-static-classes.ss, …), the
+;; statics counterpart of host-class-ctors-tbl. Together they are what "the
+;; runtime provides this class" means: register-class-provider! refuses a claim on
+;; a class already in the tables, and at declaration time — jolt.deps, before any
+;; library code runs — the only entries there are these. Both spellings, because a
+;; claim is tested under both (class-spellings).
+(define host-class-statics-tbl (make-hashtable string-hash string=?))
+
+(define (register-class-statics! name members)
+  (hashtable-set! host-class-statics-tbl name #t)
+  (hashtable-set! host-class-statics-tbl (short-class-name name) #t)
+  (class-statics-merge! name members))
+
+;; Would register-class-provider! refuse a :jolt/provides claim on this class?
+;; Answered from the HOST tables and not the live ones: a class ANOTHER library
+;; registered is still free to be declared — nothing has claimed it — and a
+;; registration that just landed must not make itself the reason.
+(define (runtime-provides-class? name)
+  (let ((short (short-class-name name)))
+    (and (or (hashtable-ref host-class-statics-tbl name #f)
+             (hashtable-ref host-class-statics-tbl short #f)
+             (hashtable-ref host-class-ctors-tbl name #f)
+             (hashtable-ref host-class-ctors-tbl short #f))
+         #t)))
+
+;; The merge itself: also the LIBRARY path (register-class-statics-owned!,
+;; extend-class!), which adds members without making the class the runtime's.
+(define (class-statics-merge! name members)  ; members: list of (str . val/proc)
   (let* ((short (short-class-name name))
          (h (or (hashtable-ref class-statics-tbl name #f)
                 (hashtable-ref class-statics-tbl short #f)
@@ -82,7 +111,15 @@
 
 (define (register-class-ctor! name proc)
   (hashtable-set! host-class-ctors-tbl name #t)
-  (hashtable-set! class-ctors-tbl name proc))
+  (class-ctor-set! name proc))
+
+;; The plain table write, for a ctor that is NOT the runtime coming to provide a
+;; host class: every deftype and defrecord binds (Name. …) through this table
+;; (protocols.ss), under its "ns.Name" tag AND its simple name. Recording those
+;; as the host's would make host-class-ctors-tbl — which is what
+;; runtime-provides-class? and the constructor-override warning read — answer
+;; yes for any class whose simple name a user type happens to share.
+(define (class-ctor-set! name proc) (hashtable-set! class-ctors-tbl name proc))
 
 ;; clojure.core/__register-class-ctor! lands here. Registering a class jolt does
 ;; not model is the intended use; REPLACING one it does is a process-wide
@@ -94,11 +131,58 @@
 ;; register-class-statics! reports a colliding static, so the cause is one env
 ;; var away instead of a bisect.
 (define (register-class-ctor-user! name proc)
-  (when (and (getenv "JOLT_DEBUG") (hashtable-ref host-class-ctors-tbl name #f))
-    (fprintf (current-error-port)
-             "warning: a library replaced the host constructor for ~a — every (~a. ...) in this process now builds its shim, including in namespaces that never asked for it\n"
-             name name))
-  (hashtable-set! class-ctors-tbl name proc))
+  ;; A constructor is one value, so there is no additive half to let through the
+  ;; way register-class-statics-user! does with members.
+  (cond
+    ((lib-pending-claimer name)
+     => (lambda (pending)
+          (provider-claim-hold! name pending '())
+          (lib-defer-registration! pending (lambda () (register-class-ctor-user! name proc)))))
+    ((lib-provider-owner-elsewhere name)
+     => (lambda (owner) (provider-claim-drop! name owner '())))
+    (else
+     (provider-claim-note! name)
+     (when (and (getenv "JOLT_DEBUG") (hashtable-ref host-class-ctors-tbl name #f))
+       (fprintf (current-error-port)
+                "warning: a library replaced the host constructor for ~a — every (~a. ...) in this process now builds its shim, including in namespaces that never asked for it\n"
+                name name))
+     (lib-note-provider-registration! name)
+     (hashtable-set! class-ctors-tbl name proc))))
+
+;; clojure.core/__register-class-statics! lands here — the statics counterpart of
+;; register-class-ctor-user!, and under the same provider guard. The host's own
+;; boot-time registrations go straight to register-class-statics! and are not
+;; subject to it: nothing has declared anything yet when they run.
+(define (register-class-statics-user! name members)
+  (let ((pending (lib-pending-claimer name)))
+    (if pending
+        ;; The claimer has not spoken yet, so there is nothing to compare this
+        ;; against — and letting it land would put an entry in the registry for a
+        ;; class whose provider has not loaded, which is exactly what stops the
+        ;; autoload from ever running (jolt#914). Hold it until the claim settles.
+        (begin (provider-claim-hold! name pending (map car members))
+               (lib-defer-registration!
+                pending (lambda () (register-class-statics-user! name members))))
+        (register-class-statics-owned! name members))))
+
+;; The claim on `name` has settled (or there never was one): what the class's
+;; provider registered is authority, everything else is additive or refused.
+(define (register-class-statics-owned! name members)
+  (let ((owner (lib-provider-owner-elsewhere name)))
+    (if owner
+        ;; A provider owns the members it registered, not the whole name. Adding a
+        ;; member its shim does not answer is the additive case extend-class! exists
+        ;; for and stays allowed; REPLACING one is the substitution that made
+        ;; resolution depend on load order, and that is what is refused.
+        (let* ((h (lookup-class class-statics-tbl name))
+               (taken (if h (filter (lambda (m) (hashtable-contains? h (car m))) members) '()))
+               (fresh (if h (filter (lambda (m) (not (hashtable-contains? h (car m)))) members) members)))
+          (when (pair? taken) (provider-claim-drop! name owner (map car taken)))
+          (when (pair? fresh) (class-statics-merge! name fresh)))
+        (begin
+          (provider-claim-note! name)
+          (lib-note-provider-registration! name)
+          (class-statics-merge! name members)))))
 
 (define (register-host-methods! tag members)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
@@ -106,69 +190,174 @@
                  (hashtable-set! host-methods-tbl tag h) h))))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
 
-;; Point a second tag at an existing tag's method table, sharing the table itself
-;; rather than copying it. A shim that differs from another ONLY in the class it
-;; reports — clojure.lang.LineNumberingPushbackReader over java.io.PushbackReader
-;; — needs its own tag so value-host-tags names the right class, but must not get
-;; its own copy of the methods: a later register-host-methods! on either tag would
-;; then reach only one of them, and the two would silently drift apart.
+;; ---- arity, before the member runs ------------------------------------------
+;; The JVM resolves a call by its ARITY before it runs anything: an extra trailing
+;; argument is "No matching method X found taking N args", never a silently
+;; dropped value. A table entry written with a fixed signature already says which
+;; arities it has — procedure-arity-mask reads them straight off the procedure —
+;; so the only thing missing was asking. A `. rest` entry says nothing, which is
+;; how (String/valueOf ca 1 2) came back "abc": valueOf's one arm took the array
+;; and never looked at the offset and count it was handed.
+;;
+;; So a member with overloads writes them as a case-lambda rather than as one
+;; rest-taking arm that picks arguments out of a list — the mask then carries the
+;; overload set, and the two invocation sites below (host-static-call for a
+;; static, the jhost arm for an instance method) enforce it with one bit test. A
+;; member that is genuinely variadic on the JVM — String/format, String/join —
+;; keeps its rest arg and stays unchecked, which is correct rather than lax.
+;;
+;; N is the JAVA argument count; an instance method's procedure also takes the
+;; receiver, which is not one of them.
+(define (host-arity-ok? f n self?)
+  (bitwise-bit-set? (procedure-arity-mask f) (if self? (fx+ n 1) n)))
+
+;; The comparator seam (natives-seq.ss jolt-comparator-fn) asks whether a value
+;; is a shim object whose tag registers a `compare` method — a Comparator held
+;; by the host (String/CASE_INSENSITIVE_ORDER) rather than by a deftype/reify.
+(set! jhost-compare-method?
+  (lambda (x)
+    (and (jhost? x) (host-method-ref (jhost-tag x) "compare") #t)))
+
+;; ---- how two tags relate ----------------------------------------------------
+;; A tag is a REPRESENTATION: the procedures in its table read the state vector
+;; its constructor builds. The class a tag reports is a separate fact, kept in
+;; ONE place (jhost-tag->fqn, class-hierarchy.ss) and answered from the class
+;; graph — instance?, class, the protocol tags. The two relations below are
+;; between representations, and the second is checked against the graph so a
+;; layout claim cannot contradict the class claim.
+;;
+;; alias: a second tag over the SAME table object, for a shim that differs from
+;; another only in the class it reports — clojure.lang.LineNumberingPushbackReader
+;; over java.io.PushbackReader. Sharing rather than copying is the point: a later
+;; register-host-methods! on either tag reaches both, where a copy would let the
+;; two silently drift apart. The alias inherits the original's parent link too,
+;; so an alias of a derived tag answers what the derived tag answers.
+(define host-methods-parent (make-hashtable string-hash string=?))   ; tag -> parent tag
+(define (host-tag-parent tag) (hashtable-ref host-methods-parent tag #f))
 (define (alias-host-methods! tag from)
   (let ((h (or (hashtable-ref host-methods-tbl from #f)
                (error 'alias-host-methods! "no methods registered for tag" from))))
-    (hashtable-set! host-methods-tbl tag h)))
+    (hashtable-set! host-methods-tbl tag h)
+    (let ((p (host-tag-parent from)))
+      (when p (hashtable-set! host-methods-parent tag p)))))
+
+;; derive: a tag whose LAYOUT EXTENDS another's — the scheduled future carries the
+;; j-future's five slots and five more — answers every member the parent tag
+;; answers plus its own. Neither an alias (the members differ) nor a copy (a copy
+;; freezes the parent's table as it stood when it was taken, the drift alias
+;; avoids): the child keeps a table of its own and names its parent, and
+;; host-method-ref walks the chain on a MISS only, so a hit on the tag's own table
+;; costs what it always did.
+;;
+;; CHECKED AGAINST THE CLASS GRAPH, because a parent's procedures reading the
+;; child's state is a claim about the layout, and the layout follows the class:
+;; the child's class must be a strict descendant of the parent's in the modeled
+;; hierarchy, so the graph — already the single answer to instance? — is also the
+;; single answer to "may this tag inherit that one". Two tags of ONE class are
+;; two layouts of it (future-task and j-future are both FutureTask), which is
+;; exactly why the graph cannot drive inheritance by itself: it names classes, not
+;; layouts, and would let the scheduled future reach the future-task table whose
+;; procedures read a different vector. A tag with no class row cannot derive: the
+;; check would have nothing to hold it to.
+(define (derive-host-methods! tag from members)
+  (unless (hashtable-ref host-methods-tbl from #f)
+    (error 'derive-host-methods! "no methods registered for tag" from))
+  (let ((child (jhost-fqn tag)) (parent (jhost-fqn from)))
+    (unless (and child parent)
+      (error 'derive-host-methods! "both tags must name a class (jhost-tag->fqn)" tag from))
+    (unless (and (not (string=? child parent)) (jch-isa? child parent))
+      (error 'derive-host-methods! "the child's class must extend the parent's" child parent))
+    ;; and the chain must end: a cycle would make host-method-ref loop
+    (let walk ((t from))
+      (when t
+        (when (string=? t tag) (error 'derive-host-methods! "derivation cycle" tag from))
+        (walk (host-tag-parent t)))))
+  (hashtable-set! host-methods-parent tag from)
+  (register-host-methods! tag members))
+
+;; The two resolvers, and the only readers of the chain. host-method-ref: the
+;; member NAME resolves to on TAG — its own table first, then each parent's — or
+;; #f; every dispatch goes through it. host-method-entries: every (name . proc)
+;; TAG answers, the child's first and a parent's member SHADOWED by the child's
+;; left out, as getMethods lists an override once; reflection (natives-array.ss)
+;; reads this rather than the tables.
+(define (host-method-ref tag name)
+  (let loop ((tag tag))
+    (and tag
+         (let ((h (hashtable-ref host-methods-tbl tag #f)))
+           (or (and h (hashtable-ref h name #f))
+               (loop (host-tag-parent tag)))))))
+(define (host-method-entries tag)
+  (let loop ((tag tag) (seen '()) (acc '()))
+    (if (not tag)
+        (reverse acc)
+        (let ((h (hashtable-ref host-methods-tbl tag #f)))
+          (if (not h)
+              (loop (host-tag-parent tag) seen acc)
+              (let-values (((names procs) (hashtable-entries h)))
+                (let walk ((i 0) (seen seen) (acc acc))
+                  (if (fx=? i (vector-length names))
+                      (loop (host-tag-parent tag) seen acc)
+                      (let ((n (vector-ref names i)))
+                        (if (member n seen)
+                            (walk (fx+ i 1) seen acc)
+                            (walk (fx+ i 1) (cons n seen)
+                                  (cons (cons n (vector-ref procs i)) acc))))))))))))
 
 (define (lookup-class h-tbl name)
   (or (hashtable-ref h-tbl name #f)
       (hashtable-ref h-tbl (short-class-name name) #f)))
+
+;; ---- the concrete methods of an abstract host class -------------------------
+;; (proxy [java.io.InputStream] [] (read …)) extends the class on the JVM and
+;; inherits every method it does not name — readAllBytes, skip, available,
+;; close — each written against the abstract read() the proxy supplies and
+;; reaching it by virtual dispatch. jolt generates no class: a proxy over a class
+;; with no constructor is a bare reify, and a method it did not write was a
+;; miss ("No matching field found: available"), so slurp, io/copy and a
+;; PushbackInputStream over such a proxy all failed. These tables ARE that
+;; inheritance. A reify's method miss (records-dispatch.ss) asks here; the
+;; classes the reify declares and their modeled ancestry are walked in order, and
+;; the method found runs against the reify itself, so its own calls back into
+;; read() reach the override as the JVM's would. A method the class leaves
+;; abstract is in its table too, raising what the proxy macro's stub raises for a
+;; method the body omits: UnsupportedOperationException naming the method.
+;; Keyed by the class's qualified name; io-streams.ss registers the java.io four.
+(define abstract-methods-tbl (make-hashtable string-hash string=?))   ; FQN -> (method-ht)
+(define (register-abstract-methods! class members)
+  (let ((h (or (hashtable-ref abstract-methods-tbl class #f)
+               (let ((h (make-hashtable string-hash string=?)))
+                 (hashtable-set! abstract-methods-tbl class h) h))))
+    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+(define (abstract-class-method obj method-name)
+  (let loop ((tags (jreify-host-tags obj)))
+    (cond ((null? tags) #f)
+          ((hashtable-ref abstract-methods-tbl (car tags) #f)
+           => (lambda (h) (or (hashtable-ref h method-name #f) (loop (cdr tags)))))
+          (else (loop (cdr tags))))))
+(set-abstract-class-method-hook! abstract-class-method)
 
 ;; ---- host object ------------------------------------------------------------
 (define-record-type jhost (fields tag (mutable state)) (nongenerative chez-jhost-v1))
 
 ;; record-method-dispatch (records.ss) gets a jhost arm: dispatch (.method obj a*)
 ;; through the tag's method table.
-;; clojure.lang.Sorted on jolt's sorted-map / sorted-set: comparator / entryKey /
-;; seqFrom / seq. data.priority-map's subseq/rsubseq reach for these (its
-;; PersistentPriorityMap delegates .comparator to the backing sorted-map). The
-;; comparator is returned as a small Comparator object whose .compare runs the
-;; map's 3-way fn, since (.. sc comparator (compare a b)) is the calling form.
-(define sorted-cmp-kw (keyword #f "cmp"))
-(register-host-methods! "jolt-comparator"
-  (list (cons "compare" (lambda (self a b) (jolt-invoke (jhost-state self) a b)))))
-(define (sorted-comparator-of sc)
-  (let ((c (jolt-ref-get sc sorted-cmp-kw)))
-    (make-jhost "jolt-comparator" (if (jolt-nil? c) jolt-compare c))))
-(define (sorted-iface-method? m)
-  (or (string=? m "comparator") (string=? m "entryKey")
-      (string=? m "seqFrom") (string=? m "seq")))
-(define (sorted-iface-dispatch obj method rest)
-  (cond
-    ((string=? method "comparator") (sorted-comparator-of obj))
-    ((string=? method "entryKey") (jolt-first (car rest)))   ; map entry -> its key
-    ((string=? method "seq")                                 ; (.seq sc) or (.seq sc ascending?)
-     (if (or (null? rest) (jolt-truthy? (car rest))) (jolt-seq obj) (jolt-rseq obj)))
-    ;; (.seqFrom sc k ascending?) — the entries from k onward, in order. Done with a
-    ;; comparator filter over the seq (jolt has no tree cursor), like subseq.
-    ((string=? method "seqFrom")
-     (let* ((k (car rest)) (asc (jolt-truthy? (cadr rest)))
-            (cmp (jolt-ref-get obj sorted-cmp-kw))
-            (cmpf (if (jolt-nil? cmp) jolt-compare cmp))
-            (es (seq->list (jolt-seq obj)))
-            (keep (filter (lambda (e)
-                            (let ((c (jnum->exact (jolt-invoke cmpf (jolt-first e) k))))
-                              (if asc (>= c 0) (<= c 0))))
-                          es)))
-       (list->cseq (if asc keep (reverse keep)))))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method " on sorted collection")))))
-
 (register-method-arm! arm-priority-host-type
   (lambda (obj method-name rest-args)
     (cond
       ((jhost? obj)
-       (let* ((mh (hashtable-ref host-methods-tbl (jhost-tag obj) #f))
-              (f (and mh (hashtable-ref mh method-name #f)))
-              (args (if (jolt-nil? rest-args) '() (seq->list rest-args))))
+       (let* ((f (host-method-ref (jhost-tag obj) method-name))
+              (args (method-rest-args->list rest-args)))
          (cond
-           (f (apply f obj args))
+           ;; A member whose arities do not include this one is not this member:
+           ;; fall to dispatch-miss, so a library extension still gets its say and
+           ;; the report is the JVM's "No matching method … taking N args" rather
+           ;; than whatever the body faulted on reading an argument it wasn't given
+           ;; ((.append sb "x" 1) used to surface Chez's "cadr: incorrect list
+           ;; structure").
+           (f (if (host-arity-ok? f (length args) #t)
+                  (apply f obj args)
+                  (dispatch-miss obj method-name args)))
            ;; (. Foo bar args) where Foo names a class is a STATIC call — that is
            ;; what the form means on the JVM. A dotted name resolves as a class at
            ;; analysis time, but an IMPORTED simple name evaluates to a class
@@ -199,14 +388,38 @@
            ;; the shared end of the chain, so a host object reports its real class
            ;; rather than its internal tag, and a (.-x obj) read that no registered
            ;; member claimed reads as a missing FIELD like it does everywhere else
-           (else (no-method-throw method-name obj (length args))))))
+           (else (dispatch-miss obj method-name args)))))
       ((number? obj) (apply number-method method-name obj (if (jolt-nil? rest-args) '() (seq->list rest-args))))
       (else 'pass))))
 
 ;; java.lang.Number method surface (the boxed-number methods cljc code calls). The
 ;; integer projections wrap modulo their width (ring-codec relies on byteValue
 ;; overflow: (.byteValue 255) => -1); the float projections are identity flonums.
+;;
+;; The arity table is the same device jolt-string-method uses (natives-str.ss) and
+;; is here for the same reason: these arms take `. args` and most never read it, so
+;; (.intValue (int 5) 1) answered 5 where the JVM raises "No matching method
+;; intValue found taking 1 args". A name absent from the table is unchecked.
+(define number-method-arities
+  (let ((h (make-hashtable string-hash string=?))
+        (mask (lambda (ns) (fold-left (lambda (m k) (bitwise-ior m (bitwise-arithmetic-shift-left 1 k))) 0 ns))))
+    (for-each (lambda (e) (hashtable-set! h (car e) (mask (cdr e))))
+      '(("byteValue" 0) ("shortValue" 0) ("intValue" 0) ("longValue" 0)
+        ("doubleValue" 0) ("floatValue" 0) ("toString" 0 1) ("hashCode" 0)
+        ("isNaN" 0) ("isInfinite" 0) ("negate" 0) ("abs" 0) ("bitLength" 0)
+        ("signum" 0) ("shiftLeft" 1) ("shiftRight" 1)))
+    h))
 (define (number-method method n . args)
+  ;; Same shape as jolt-string-method's check, including the (pair? args) guard:
+  ;; too few arguments already faults in the arm that reads one, and the 0-arg
+  ;; projections are what this is called with almost every time.
+  (if (and (pair? args)
+           (let ((m (hashtable-ref number-method-arities method #f)))
+             (and m (not (bitwise-bit-set? m (length args))))))
+      (dispatch-miss n method args)
+      (number-method-arms method n args)))
+
+(define (number-method-arms method n args)
   (cond
     ((string=? method "byteValue") (let ((b (modulo (jnum->exact n) 256))) (->num (if (>= b 128) (- b 256) b))))
     ((string=? method "shortValue") (let ((b (modulo (jnum->exact n) 65536))) (->num (if (>= b 32768) (- b 65536) b))))
@@ -235,7 +448,7 @@
     ;; precision, so an arithmetic shift by the (positive) amount.
     ((string=? method "shiftLeft") (->num (bitwise-arithmetic-shift-left (jnum->exact n) (jnum->exact (car args)))))
     ((string=? method "shiftRight") (->num (bitwise-arithmetic-shift-right (jnum->exact n) (jnum->exact (car args)))))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method " for Number")))))
+    (else (dispatch-miss n method args))))
 
 ;; Mutable static fields: "Class" -> (member -> 1-vector cell). A library that
 ;; writes a static field — clojure.spec.alpha's (set! (. clojure.lang.RT
@@ -269,89 +482,221 @@
 (vector-set! (mutable-static-cell "clojure.lang.RT" "checkSpecAsserts" #t) 0 #f)
 
 ;; ---- autoload the java.time base on first use -------------------------------
-;; Core carries the base java.time VALUE types (jolt.time.base and the namespaces
-;; it requires: Instant, LocalDate/LocalTime/LocalDateTime, Duration, Period,
-;; Year/YearMonth/MonthDay, and the Month/DayOfWeek/Chrono* enums) that must
-;; resolve with NO explicit require. stdlib Clojure loads lazily and only the
-;; Scheme runtime runs at boot, so the base is exposed by autoloading on first use:
-;; when interop resolves an unregistered class named by a base value type — or any
-;; `java.time.` class — load the base once and retry the lookup. Date-free programs
-;; never trigger it, so they pay nothing (RFC 0008).
+;; ---- host-class providers (RFC 0014) ----------------------------------------
+;; A JVM library reaches for MessageDigest/getInstance or java.sql.ResultSet
+;; without requiring an install namespace first, because on the JVM the class is
+;; simply there. Jolt has no such class, so something has to load the namespace
+;; that installs it — on the FIRST reference, before anything of the provider has
+;; loaded. That ordering is why a provider cannot just register itself as it
+;; loads: nothing has loaded it yet.
 ;;
-;; Everything that FORMATS or names a zone — DateTimeFormatter, FormatStyle,
-;; ZoneOffset, ZoneId, ZonedDateTime, OffsetDateTime, OffsetTime, Clock, and
-;; java.util.Locale — lives only in the jolt-lang/time library. Those are not in
-;; the base, so after the base loads (or immediately, for a bare library-only short
-;; name) the lookup still misses and unknown-class-message names the dependency.
+;; So the mapping class -> provider arrives as DATA, ahead of the load. A library
+;; declares it in its own deps.edn and jolt.deps collects it through the walk it
+;; already does for :jolt/native:
 ;;
-;; A class token arrives fully qualified (java.time.LocalDate) or as a short name
-;; (LocalDate) — jolt has no import map, so both reach here. jt-base-names are the
-;; base value-type short names that should autoload the base.
-(define jt-base-names
-  '("Instant" "LocalDate" "LocalTime" "LocalDateTime" "Duration" "Period"
-    "Year" "YearMonth" "MonthDay" "Month" "DayOfWeek" "ChronoUnit" "ChronoField"
-    "ValueRange" "TemporalAdjusters"))
-(define jt-base-autoload-done #f)
-(define (java-time-prefixed? class)
-  (and (>= (string-length class) 10) (string=? (substring class 0 10) "java.time.")))
-;; Gate for autoloading the base: a base value-type name, or any java.time. class
-;; (a fully-qualified library class autoloads the base too, then falls through to
-;; the hint below — cheap, the base loads at most once).
-(define (java-time-class? class)
-  (or (java-time-prefixed? class) (and (member class jt-base-names) #t)))
+;;     :jolt/provides {jolt.crypto ["java.security.MessageDigest" ...]}
+;;
+;; The runtime keeps no list of libraries. What it keeps below is jolt's OWN
+;; stdlib — core declaring the classes core implements, which is a different
+;; thing from core knowing what jolt-lang/db is. Everything else is registered
+;; through register-class-provider! from the resolved dependency graph.
+;;
+;; Each entry is #(install-ns coordinate (class-name ...) done-latch); coordinate
+;; is #f for jolt's own stdlib, which needs no dependency to be added.
+(define (class-simple-name c)
+  (let loop ((i (- (string-length c) 1)))
+    (cond ((< i 0) c)
+          ((char=? (string-ref c i) #\.) (substring c (+ i 1) (string-length c)))
+          (else (loop (- i 1))))))
+;; A class is claimed under BOTH spellings: a token arrives fully qualified
+;; (java.time.LocalDate) or simple (LocalDate) — jolt has no import map, so both
+;; reach here. Deriving the simple form is what removes the hand-sync failure the
+;; old hardcoded table kept hitting: it listed both spellings by hand, and a name
+;; present only as the qualified one failed for the IMPORTED SIMPLE form, which is
+;; how libraries actually write it.
+(define (class-spellings classes)
+  (let loop ((cs classes) (acc '()))
+    (if (null? cs)
+        (reverse acc)
+        (let* ((c (car cs)) (simple (class-simple-name c)))
+          (loop (cdr cs)
+                (if (string=? simple c) (cons c acc) (cons simple (cons c acc))))))))
 
-;; Classes provided ONLY by jolt-lang/time (RFC 0008): all formatting and zones,
-;; plus java.util.Locale. An unresolved reference to one of these — or to any
-;; other unresolved java.time. class — names the dependency rather than leaving a
-;; bare "Unknown class".
-;; This list has to name EVERY class jolt-lang/time registers, in both the simple
-;; and the fully-qualified spelling. A fully-qualified miss also reaches the
-;; autoload through java-time-prefixed?, so a name missing here fails only for the
-;; IMPORTED SIMPLE form — which is how libraries actually write it, and why
-;; DateTimeFormatterBuilder being absent kept malli's transform.cljc from loading
-;; while (java.time.format.DateTimeFormatterBuilder.) worked. When the library
-;; grows a class, add it here.
-(define jt-library-names
-  '("DateTimeFormatter" "java.time.format.DateTimeFormatter"
-    "DateTimeFormatterBuilder" "java.time.format.DateTimeFormatterBuilder"
-    "FormatStyle" "java.time.format.FormatStyle"
-    "ZoneOffset" "java.time.ZoneOffset" "ZoneId" "java.time.ZoneId"
-    "ZonedDateTime" "java.time.ZonedDateTime"
-    "OffsetDateTime" "java.time.OffsetDateTime"
-    "OffsetTime" "java.time.OffsetTime" "Clock" "java.time.Clock"
-    "Locale" "java.util.Locale"))
-;; Other first-party libraries that install host classes the JVM has built in.
-;; Same courtesy java.time gets: on the first miss of one of these names, require
-;; the library's install namespace when it is on the source roots, so an
-;; unmodified JVM library that reaches for the class just works once the
-;; dependency is declared — Selmer's {{ x|hash:"md5" }} filter calls
-;; MessageDigest/getInstance, and no JVM library requires an install namespace
-;; first. Off the roots, the message names the dependency to add.
-;; Each entry is #(install-ns coordinate (class-name …) done-latch).
-(define lib-class-providers
+;; Core's own stdlib. jolt.time.base is the base java.time VALUE types (RFC 0008)
+;; that must resolve with no explicit require; jolt.socket is java.net over POSIX
+;; sockets. Both ship with jolt, so neither names a coordinate: there is no
+;; dependency for a caller to add, and the autoload always finds them.
+;;
+;; Everything that FORMATS or names a zone — DateTimeFormatter, ZoneId,
+;; ZonedDateTime, Locale, ... — is the jolt-lang/time LIBRARY and is declared by
+;; that library, not here.
+(define core-class-providers
   (list
-   (vector "jolt.crypto" "io.github.jolt-lang/jolt-crypto"
-           ;; SecureRandom is NOT here: the runtime implements it natively over the
-           ;; OS CSPRNG, so it needs no dependency — it is a JDK class on the JVM
-           ;; and reaching for one should not make a program declare a library.
-           '("MessageDigest" "java.security.MessageDigest"
-             "Mac" "javax.crypto.Mac"
-             "Cipher" "javax.crypto.Cipher"
-             "SecretKeySpec" "javax.crypto.spec.SecretKeySpec"
-             "IvParameterSpec" "javax.crypto.spec.IvParameterSpec")
+   (vector "jolt.time.base" #f
+           (class-spellings
+            '("java.time.Instant" "java.time.LocalDate" "java.time.LocalTime"
+              "java.time.LocalDateTime" "java.time.Duration" "java.time.Period"
+              "java.time.Year" "java.time.YearMonth" "java.time.MonthDay"
+              "java.time.Month" "java.time.DayOfWeek"
+              "java.time.temporal.ChronoUnit" "java.time.temporal.ChronoField"
+              "java.time.temporal.ValueRange" "java.time.temporal.TemporalAdjusters"))
            (box #f))
-   ;; java.net lives in jolt's own stdlib rather than the runtime, since it is
-   ;; POSIX sockets over jolt.ffi. No coordinate to declare, so the autoload
-   ;; always finds it — a program reaching for InetAddress or NetworkInterface
-   ;; should no more have to require jolt.socket than it does on the JVM.
-   (vector "jolt.socket" "jolt.socket"
-           '("InetAddress" "java.net.InetAddress"
-             "Inet4Address" "java.net.Inet4Address"
-             "NetworkInterface" "java.net.NetworkInterface"
-             "Socket" "java.net.Socket"
-             "ServerSocket" "java.net.ServerSocket"
-             "InetSocketAddress" "java.net.InetSocketAddress")
+   (vector "jolt.socket" #f
+           (class-spellings
+            '("java.net.InetAddress" "java.net.Inet4Address"
+              "java.net.NetworkInterface" "java.net.Socket"
+              "java.net.ServerSocket" "java.net.InetSocketAddress"))
            (box #f))))
+(define lib-class-providers core-class-providers)
+
+;; ---- claim index: which claims have not had their chance yet ----------------
+;; One entry per SPELLING for the claims of providers that have not been
+;; autoloaded yet; entries leave the moment their provider is attempted. Two
+;; questions read it, and neither is on the hot path: which provider to autoload
+;; when a class reference MISSES (lib-try-autoload!), and whether a registration
+;; is about to squat on a class whose claimer has not spoken (lib-pending-claimer).
+;; The flag keeps the second one — asked once per registration — a boolean test
+;; when nothing is declared.
+(define lib-pending-claims-tbl (make-hashtable string-hash string=?))
+(define lib-any-pending-claims? #f)
+;; Autoload is one-shot per provider, and two threads reaching a claimed class at
+;; once must not both load the install namespace. The latch flip, the index purge
+;; and the held-registration list go under this mutex; the load itself does NOT,
+;; because an install namespace requires others and a nested autoload would
+;; deadlock on a non-recursive mutex.
+(define lib-claims-mu (make-mutex))
+(define (lib-claim-pending! p)
+  (for-each (lambda (c) (hashtable-set! lib-pending-claims-tbl c p)) (vector-ref p 2))
+  (set! lib-any-pending-claims? #t))
+(define (lib-claim-settled! p)
+  (for-each (lambda (c) (hashtable-delete! lib-pending-claims-tbl c)) (vector-ref p 2))
+  (set! lib-any-pending-claims? (> (hashtable-size lib-pending-claims-tbl) 0)))
+(for-each lib-claim-pending! core-class-providers)
+
+;; Registrations HELD because the class's declared provider has not loaded yet.
+;; Letting one land would put an entry in the registry for a class whose claimer
+;; has not spoken — and a registry HIT is exactly what stops the autoload, which
+;; is how resolution came to depend on compile order (jolt#914). They are replayed
+;; the moment the claim settles, through the same guard as any other registration:
+;; what the provider implements wins, what it left unanswered still lands. Keyed
+;; by provider, because the provider is what settles.
+(define lib-deferred-tbl (make-eq-hashtable))
+(define (lib-defer-registration! p thunk)
+  (jolt-with-mutex lib-claims-mu
+    (hashtable-set! lib-deferred-tbl p (cons thunk (hashtable-ref lib-deferred-tbl p '())))))
+;; Called for every settled claim, including one whose install namespace was off
+;; the source roots or raised: a provider that cannot deliver must not swallow
+;; somebody else's registration with it. Answers whether anything was held, which
+;; is a change to what the registry says and so a reason for the caller to retry.
+(define (lib-replay-deferred! p)
+  (let ((held (jolt-with-mutex lib-claims-mu
+                (let ((h (hashtable-ref lib-deferred-tbl p '())))
+                  (hashtable-delete! lib-deferred-tbl p)
+                  h))))
+    (for-each (lambda (t) (t)) (reverse held))
+    (pair? held)))
+
+;; The provider whose install namespace is loading on THIS thread, or #f. A
+;; provider registers its classes as its install namespace loads, and the
+;; registration guard (lib-provider-owner-elsewhere) has to tell that registration
+;; apart from another library squatting on the same class.
+;;
+;; Whoever LOADS an install namespace sets the mark (loader.ss load-namespace*,
+;; through lib-with-install-ns-mark) — not the autoload alone. A provider whose
+;; install namespace requires a SECOND provider's, which is how kmet reached
+;; jolt.crypto, registers that second provider's classes under a plain require;
+;; marking the whole load with the outer provider left the inner one's classes
+;; owned by nobody, so a later registration for a member it answers was accepted
+;; instead of dropped — jolt#914 one level down — and JOLT_DEBUG named the wrong
+;; namespace (jolt#926).
+(define lib-loading-provider (make-thread-parameter #f))
+
+(define (lib-provider-by-install-ns ns)
+  (let loop ((ps lib-class-providers))
+    (cond ((null? ps) #f)
+          ((string=? ns (vector-ref (car ps) 0)) (car ps))
+          (else (loop (cdr ps))))))
+
+;; Run `thunk` marked with the provider `ns` installs, if it installs one. A
+;; namespace that is NOT an install namespace leaves the mark alone rather than
+;; clearing it: a provider whose install! calls a helper namespace of its own is
+;; still that provider registering, and only another DECLARED provider is a
+;; different registrant.
+(define (lib-with-install-ns-mark ns thunk)
+  (let ((p (lib-provider-by-install-ns ns)))
+    (if p (parameterize ((lib-loading-provider p)) (thunk)) (thunk))))
+
+;; Classes a declared provider actually registered as its install namespace
+;; loaded. This is what the registration guard protects: a class whose provider
+;; has spoken for it is that provider's, and a later registration from anywhere
+;; else is dropped rather than allowed to win by being last (jolt#914). Filled at
+;; REGISTRATION time, not from the declaration, so a class a provider declares and
+;; never registers stays open — the declaration alone is not an implementation.
+(define lib-provider-owned-tbl (make-hashtable string-hash string=?))
+;; jolt.time.base and jolt.socket are the runtime's own BASE tier, and a base tier
+;; exists to be extended: jolt-lang/time declares only the formatting classes
+;; (DateTimeFormatter, ZoneId, ...) and adds a DateTimeFormatter arm to
+;; java.time.LocalDate/from, a class the base declares. That is the arrangement
+;; working, not a squat — the base ships the value types that must resolve with no
+;; dependency, and the library completes them.
+;;
+;; So what jolt ships claims a NAME, not the implementation of every member under
+;; it. RFC 0014's guard is about two DEPENDENCIES disagreeing over who implements a
+;; class (jolt#914), and the base tier is not one of them. Without this the tick
+;; suite lost five parse tests to "dropping a registration for LocalDate/from".
+(define (lib-core-provider? p) (and (memq p core-class-providers) #t))
+
+;; Every SPELLING of the class goes in, not just the one written: the statics
+;; table keys the fully-qualified and the simple name to ONE member table
+;; (register-class-statics!), so a registration under either spelling reaches the
+;; same members and both have to be covered.
+(define (lib-note-provider-registration! name)
+  (let ((p (lib-loading-provider)))
+    (when (and p (not (lib-core-provider? p)) (member name (vector-ref p 2)))
+      (let ((short (short-class-name name)))
+        (for-each (lambda (c)
+                    (when (string=? (short-class-name c) short)
+                      (hashtable-set! lib-provider-owned-tbl c p)))
+                  (vector-ref p 2))))))
+
+;; Declared providers from the dependency graph, installed at startup by
+;; jolt.deps. A claim on a class the runtime already IMPLEMENTS is refused: a
+;; dependency does not get to redefine what String means, and the same posture is
+;; why extend-class! will not replace a built-in.
+;;
+;; "Implements" is the statics/ctor tables, not the class hierarchy. The
+;; hierarchy knows names it does not implement — java.time.ZoneId is in it so
+;; isa?/instance? answer correctly, while the implementation is jolt-lang/time's
+;; to install. Checking the hierarchy rejected every provider for the classes it
+;; exists to provide.
+(define (register-class-provider! install-ns coordinate classes)
+  (let* ((cs (class-spellings classes))
+         (taken (filter (lambda (c) (or (hashtable-ref class-statics-tbl c #f)
+                                        (hashtable-ref class-ctors-tbl c #f)))
+                        cs)))
+    (if (pair? taken)
+        (jolt-throw
+         (jolt-host-throwable
+          "java.lang.IllegalArgumentException"
+          (string-append install-ns " claims host " (if (null? (cdr taken)) "class " "classes ")
+                         (fold-left (lambda (a c) (if (string=? a "") c (string-append a ", " c)))
+                                    "" taken)
+                         ", which the runtime already provides.")))
+        (let ((p (vector install-ns coordinate cs (box #f))))
+          (set! lib-class-providers (append lib-class-providers (list p)))
+          (lib-claim-pending! p)))))
+
+;; The Clojure-facing seam. jolt.deps calls this once per declared provider after
+;; it resolves the dependency graph, before any user code compiles — which is the
+;; ordering the whole mechanism depends on: the table has to be complete before
+;; the first class reference can miss.
+(def-var! "jolt.host" "register-class-provider!"
+  (lambda (install-ns coordinate classes)
+    (register-class-provider! install-ns
+                              (if (jolt-nil? coordinate) #f coordinate)
+                              (seq->list classes))
+    jolt-nil))
+
 (define (lib-provider-for class)
   (let loop ((ps lib-class-providers))
     (cond ((null? ps) #f)
@@ -361,16 +706,156 @@
 ;; on the source roots and raised while loading. 'failed is what separates a
 ;; dependency the caller forgot to declare from one that is declared and broken;
 ;; see unknown-class-message.
+(define (lib-load-provider! p)
+  ;; claim the load: whoever flips the latch from #f does it, everyone else sees
+  ;; a provider that has already had its chance and moves on.
+  (and (jolt-with-mutex lib-claims-mu
+         (and (not (unbox (vector-ref p 3)))
+              (begin (set-box! (vector-ref p 3) 'ok)
+                     (lib-claim-settled! p)
+                     #t)))
+       ;; The claim is settled from here whatever happens next, so registrations
+       ;; held against it are replayed on every exit — including the install
+       ;; namespace being off the roots, and the one that raises. A provider that
+       ;; cannot deliver leaves the class to whoever else registered it, which is
+       ;; what happened before the claim was honoured at all.
+       ;;
+       ;; Either half is a reason for the caller to look again, so the answer is
+       ;; their OR: a class can become resolvable through a replay alone.
+       (let* ((loaded (and (find-ns-file (vector-ref p 0))
+                           (begin (guard (c (#t (set-box! (vector-ref p 3) 'failed)
+                                                (lib-replay-deferred! p)
+                                                (raise c)))
+                                    ;; the mark comes from load-namespace* itself
+                                    ;; (lib-with-install-ns-mark), which is the
+                                    ;; only way it can also cover an install
+                                    ;; namespace reached by a plain require.
+                                    (load-namespace (vector-ref p 0)))
+                                  #t)))
+              (replayed (lib-replay-deferred! p)))
+         (or loaded replayed))))
+
+;; RFC 0014's resolution step: a class reference that MISSES the registry
+;; autoloads the provider that declares the class, and retries.
+;;
+;; A miss is enough because a claimed class cannot be a HIT before its claimer has
+;; loaded — register-class-provider! refuses a claim on a class the runtime
+;; already implements, and lib-pending-claimer holds any other library's
+;; registration until the claim settles. That is what makes resolution a property
+;; of the dependency graph rather than of compile order (jolt#914): the table hit
+;; that used to serve an undeclared registration — jolt.crypto registers an
+;; EC-only java.security.Signature while declaring only the symmetric classes —
+;; never forms, so the claimer still autoloads and still wins.
+;;
+;; Keeping it on the miss path is also what keeps it off the hot one: every
+;; static reference and every (Class. ...) would otherwise pay a lookup here, and
+;; jolt.time.base / jolt.socket leave a claim pending in almost every program, so
+;; there is no steady state in which that lookup goes away.
 (define (lib-try-autoload! class)
-  (let ((p (lib-provider-for class)))
-    (and p
-         (not (unbox (vector-ref p 3)))
-         (begin (set-box! (vector-ref p 3) 'ok)
-                (and (find-ns-file (vector-ref p 0))
-                     (begin (guard (c (#t (set-box! (vector-ref p 3) 'failed)
-                                          (raise c)))
-                              (load-namespace (vector-ref p 0)))
-                            #t))))))
+  (and lib-any-pending-claims?
+       (let ((p (hashtable-ref lib-pending-claims-tbl class #f)))
+         (and p (lib-load-provider! p)))))
+
+;; The provider that DECLARES this class and has not had its chance yet — meaning
+;; the registration about to happen is somebody else's, and must wait. #f when
+;; nothing claims the class, when the claim has already settled, or when this IS
+;; the claimer registering.
+(define (lib-pending-claimer name)
+  (and lib-any-pending-claims?
+       (let ((p (hashtable-ref lib-pending-claims-tbl name #f)))
+         (and p
+              (not (eq? p (lib-loading-provider)))
+              ;; An install namespace pulled in by a plain require rather than by
+              ;; the autoload carries no lib-loading-provider mark, and its own
+              ;; registrations must not be held against it.
+              (not (ns-dedup-loaded? (vector-ref p 0)))
+              p))))
+
+;; ---- the registration guard -------------------------------------------------
+;; A class a dependency DECLARES is that dependency's to implement, and RFC 0014
+;; already refuses two libraries claiming one class (jolt.deps host-class-providers)
+;; — so a claimed class has exactly one implementor and the only thing that can
+;; take it away is an undeclared side-effect registration from someone else's
+;; install!. That is what made resolution depend on compile order: whoever
+;; registered last decided what java.security.Signature meant, and who registered
+;; last depended on which namespace happened to compile first.
+;;
+;; So once the declared provider has registered a class member, a registration of
+;; that member from anywhere else is dropped. Loudly: the library asked for
+;; something it did not get, and the symptom otherwise shows up somewhere else
+;; entirely. Members the provider does NOT answer still go through — a shim with a
+;; gap in it is the case class-extensions.ss exists for, and a claim is authority
+;; over what the provider implements, not a reservation on the name.
+(define (lib-provider-owner-elsewhere name)
+  (let ((p (hashtable-ref lib-provider-owned-tbl name #f)))
+    (and p (not (eq? p (lib-loading-provider))) p)))
+
+;; One warning per class, not per registration: an install namespace registers
+;; the fully-qualified name, the simple name, and a constructor for the same
+;; class, and four copies of one message reads like four problems.
+(define lib-claim-warned-tbl (make-hashtable string-hash string=?))
+(define (claim-warn-once? tag name)
+  (let ((k (string-append tag "/" (short-class-name name))))
+    (and (not (hashtable-ref lib-claim-warned-tbl k #f))
+         (begin (hashtable-set! lib-claim-warned-tbl k #t) #t))))
+
+(define (provider-claim-drop! name owner members)
+  (when (claim-warn-once? "drop" name)
+    (fprintf (current-error-port)
+             "warning: dropping ~a — ~a declares that class (:jolt/provides, RFC 0014) and implements ~a; a library may only register the classes it declares\n"
+             (if (null? members)
+                 (string-append "a constructor registration for " name)
+                 (string-append "a registration for "
+                                (fold-left (lambda (a m)
+                                             (let ((one (string-append name "/" m)))
+                                               (if (string=? a "") one (string-append a ", " one))))
+                                           "" members)))
+             (or (vector-ref owner 1) (vector-ref owner 0))
+             (cond ((null? members) "it")
+                   ((null? (cdr members)) "that member")
+                   (else "those members")))))
+
+;; The same registration BEFORE the claimer has loaded costs nobody the class:
+;; it is held, the claimer autoloads on the first reference and registers, and
+;; whatever the claimer left unanswered lands after it. So this is a note, not the
+;; refusal provider-claim-drop! reports — but it is still a library registering a
+;; class it did not declare, which is the thing to fix at the source, so say so
+;; under JOLT_DEBUG the way the other registry diagnostics do.
+(define (provider-claim-hold! name pending members)
+  (when (and (getenv "JOLT_DEBUG") (claim-warn-once? "hold" name))
+    (fprintf (current-error-port)
+             "warning: holding ~a — ~a declares that class (:jolt/provides, RFC 0014) and has not loaded yet; it loads on the first reference to ~a, and what it does not implement is registered after it\n"
+             (if (null? members)
+                 (string-append "a constructor registration for " name)
+                 (string-append "a registration for "
+                                (fold-left (lambda (a m)
+                                             (let ((one (string-append name "/" m)))
+                                               (if (string=? a "") one (string-append a ", " one))))
+                                           "" members)))
+             (vector-ref pending 0) name)))
+
+;; The contract from the other side: an install namespace registering a class it
+;; does not declare. Nothing autoloads a provider for a class it never claimed, so
+;; whether that class resolves at all depends on what else happens to pull the
+;; namespace in first — which is how a reference to java.security.KeyPairGenerator
+;; reported "No dependency provides" in one namespace and answered an EC-only shim
+;; in the next (jolt#914).
+(define (provider-claim-note! name)
+  (when (getenv "JOLT_DEBUG")
+    (let ((self (lib-loading-provider)))
+      (when (and self (not (member name (vector-ref self 2)))
+                 ;; ...but not for a class the RUNTIME implements. There the
+                 ;; declaration the note asks for is refused ("which the runtime
+                 ;; already provides"), so the advice cannot be taken: registering
+                 ;; the members at install IS the route, and it is the additive
+                 ;; case class-extensions.ss exists for. Nothing autoloads for a
+                 ;; class that is already there either, so there is no order
+                 ;; dependence left to warn about (jolt#926).
+                 (not (runtime-provides-class? name))
+                 (claim-warn-once? "note" name))
+        (fprintf (current-error-port)
+                 "warning: ~a registers ~a without declaring it in :jolt/provides (RFC 0014); nothing autoloads ~a for a class it does not declare, so whether ~a resolves depends on what else pulls that namespace in\n"
+                 (vector-ref self 0) name (vector-ref self 0) name)))))
 
 ;; A provider that is on the source roots but raised while loading leaves the
 ;; class unregistered exactly like an undeclared dependency does — but the fix is
@@ -381,50 +866,52 @@
                  "the source roots but failed to load — see the earlier error "
                  "from " install-ns ". This is not a missing dependency."))
 
+;; A JDK-shaped name jolt has no implementation for. The message does NOT name a
+;; library: which one supplies java.sql or java.time is not the runtime's to say,
+;; and a caller is free to write the shim themselves — declaring it through
+;; :jolt/provides is the whole point. Naming a specific library here would put
+;; back, as a string, the coupling RFC 0014 removed.
+(define (jdk-class-name? class)
+  (or (and (>= (string-length class) 5) (string=? (substring class 0 5) "java."))
+      (and (>= (string-length class) 6) (string=? (substring class 0 6) "javax."))
+      ;; A SIMPLE name carries no package to test — a token arrives as ZoneOffset
+      ;; as often as java.time.ZoneOffset. The hierarchy answers it: reaching this
+      ;; message means the class has no implementation, so a name the hierarchy
+      ;; models is one jolt describes but nothing supplies. jch-known? matches the
+      ;; last segment, which is exactly the simple-name case.
+      (jch-known? class)))
+
+;; A simple name the current namespace IMPORTED names the class its import
+;; bound — (:import (java.security.cert CertificateFactory)) binds
+;; CertificateFactory to that class token — so the message is about
+;; java.security.cert.CertificateFactory and says a library provides it, not
+;; "Unknown class CertificateFactory", which reads as a typo.
+(define (imported-class-fqn class)
+  (let ((c (var-cell-lookup (chez-current-ns) class)))
+    (and c (var-cell-defined? c)
+         (let ((root (var-cell-root c)))
+           (and (jhost? root) (string=? (jhost-tag root) "class")
+                (vector-ref (jhost-state root) 0))))))
+
 (define (unknown-class-message class)
+  (let ((class (or (imported-class-fqn class) class)))
   (cond
-    ((or (member class jt-library-names) (java-time-prefixed? class))
-     (if (eq? jt-library-autoload-done 'failed)
-         (provider-load-failed-message class "jolt-lang/time" "jolt.time")
-         (string-append class " is provided by the jolt-lang/time library, not core "
-                        "(RFC 0008). Add io.github.jolt-lang/time to your deps.edn.")))
-    ((lib-provider-for class)
-     => (lambda (p)
-          (if (eq? (unbox (vector-ref p 3)) 'failed)
-              (provider-load-failed-message class (vector-ref p 1) (vector-ref p 0))
-              (string-append class " is provided by the " (vector-ref p 1)
-                             " library, not core. Add it to your deps.edn."))))
-    (else (string-append "Unknown class " class))))
-;; Load the core base once, on the first `java.time.` miss. The latch is set
-;; BEFORE the load so a self-referential static call while the base is loading
-;; cannot recurse into another autoload attempt (load-namespace marks a namespace
-;; loaded before evaluating its body). Returns #t only when it performed the load,
-;; so the caller retries the lookup exactly once.
-;; #f (not attempted), 'ok, or 'failed — the library was on the source roots and
-;; raised while loading, which unknown-class-message reports as its own case.
-(define jt-library-autoload-done #f)
-(define (jt-try-autoload! class)
-  (or (and (not jt-base-autoload-done)
-           (java-time-class? class)
-           (begin (set! jt-base-autoload-done #t)
-                  (load-namespace "jolt.time.base")
-                  #t))
-      ;; The formatting/zone half (ZoneId, ZonedDateTime, DateTimeFormatter,
-      ;; Locale, …) is the jolt-lang/time library. When it is on the source
-      ;; roots, requiring jolt.time installs its class shims — do that on the
-      ;; first miss of a library class, so a project that depends on the
-      ;; library can reference ZoneId (or require tick.core, whose
-      ;; cljc.java-time namespaces resolve these classes at load) without
-      ;; knowing the jolt.time install namespace. Off the roots, fall through
-      ;; to unknown-class-message, which names the dependency to add.
-      (and (not jt-library-autoload-done)
-           (or (member class jt-library-names) (java-time-prefixed? class))
-           (begin (set! jt-library-autoload-done 'ok)
-                  (and (find-ns-file "jolt.time")
-                       (begin (guard (c (#t (set! jt-library-autoload-done 'failed)
-                                            (raise c)))
-                                (load-namespace "jolt.time"))
-                              #t))))))
+    ;; A provider CLAIMS this class and is on the source roots, but raised while
+    ;; loading. Naming it is not a catalogue — it is the dependency the caller
+    ;; declared themselves, read back from their own deps.edn — and the fix is the
+    ;; opposite of adding something, so the two cases must not read alike.
+    ((and (lib-provider-for class)
+          (eq? (unbox (vector-ref (lib-provider-for class) 3)) 'failed))
+     => (lambda (_)
+          (let ((p (lib-provider-for class)))
+            (provider-load-failed-message class (or (vector-ref p 1) "declared")
+                                          (vector-ref p 0)))))
+    ((jdk-class-name? class)
+     (string-append "No dependency provides " class
+                    " — a concrete implementation of the JDK classes must be "
+                    "provided. A library supplies one by declaring :jolt/provides "
+                    "in its deps.edn (RFC 0014)."))
+    (else (string-append "Unknown class " class)))))
 
 ;; ---- emit entry points ------------------------------------------------------
 ;; A qualified reference whose namespace segment names a live namespace — directly
@@ -434,9 +921,20 @@
 ;; class and sending the reader looking in the wrong place.
 (define (static-miss-message class member)
   (let ((target (or (chez-resolve-alias (chez-current-ns) class) class)))
-    (if (chez-ns-exists? target)
-        (string-append "No such var: " class "/" member)
-        (unknown-class-message class))))
+    (cond
+      ((chez-ns-exists? target)
+       (string-append "No such var: " class "/" member))
+      ;; A class the RUNTIME implements is not a missing dependency, whatever the
+      ;; member lookup did: jolt registers a constructor and an instance method
+      ;; table for java.lang.StringBuilder and no statics at all, so the first
+      ;; StringBuilder/... reference fell off the end of the class table and
+      ;; reported "No dependency provides java.lang.StringBuilder" — advice that
+      ;; cannot be taken, since register-class-provider! refuses a claim on a
+      ;; class the runtime already provides. The miss is the MEMBER's, and that is
+      ;; the same message the class-with-statics path already gives (jolt#983).
+      ((runtime-provides-class? (or (imported-class-fqn class) class))
+       (string-append "No matching field or method: " class "/" member))
+      (else (unknown-class-message class)))))
 
 ;; JVM Clojure resolves (.getName String) — an instance member on a class
 ;; token — as a call on the java.lang.Class OBJECT when the class has no such
@@ -467,9 +965,11 @@
                     (or (class-instance-fallback class member)
                         (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member)))
                     v))
-              ;; class miss — autoload a provider (the java.time base, or a
-              ;; first-party library that installs the class) and retry once
-              (if (or (jt-try-autoload! class) (lib-try-autoload! class))
+              ;; class miss — autoload the provider that declares the class (the
+              ;; java.time base, jolt.socket, or a library that installs it) and
+              ;; retry once. A claimed class cannot be a hit before its claimer
+              ;; has loaded, so the miss is where resolution belongs (jolt#914).
+              (if (lib-try-autoload! class)
                   (host-static-ref class member)
                   (or (and (jch-known? class) (class-instance-fallback class member))
                       (throw-jvm (quote IllegalArgumentException) (static-miss-message class member)))))))))
@@ -480,7 +980,15 @@
   ;; Applying the field's value used to raise Chez's bare "attempt to apply
   ;; non-procedure" with no message.
   (let ((v (host-static-ref class member)))
-    (cond ((procedure? v) (apply v args))
+    (cond ((procedure? v)
+           (if (host-arity-ok? v (length args) #f)
+               (apply v args)
+               ;; the JVM's reflective miss for a static, which names no class —
+               ;; (String/valueOf ca 0) is "No matching method valueOf found
+               ;; taking 2 args", not valueOf(char[]) with the 0 thrown away.
+               (throw-jvm (quote IllegalArgumentException)
+                 (string-append "No matching method " member " found taking "
+                                (number->string (length args)) " args"))))
           ((null? args) v)
           (else (throw-jvm (quote IllegalArgumentException)
                   (string-append class "/" member " is a static field; it takes no arguments"))))))
@@ -499,10 +1007,9 @@
   (let ((ctor (lookup-class class-ctors-tbl class)))
     (cond
       (ctor (apply ctor args))
-      ;; the constructor may live in a not-yet-loaded provider (the java.time base,
-      ;; or a first-party library) — autoload and retry once before falling through
-      ;; to the var / no-ctor paths.
-      ((or (jt-try-autoload! class) (lib-try-autoload! class)) (apply host-new class args))
+      ;; the constructor may live in a provider that has not loaded yet — autoload
+      ;; and retry once before falling through to the var / no-ctor paths.
+      ((lib-try-autoload! class) (apply host-new class args))
       ;; deftype/defrecord: the type name is bound as a VAR (the
       ;; make-deftype-ctor closure) in its defining ns, not a registered host class.
       ;; Resolve it in the current ns / clojure.core and invoke it — so (P. args)
@@ -512,41 +1019,10 @@
                        (var-cell-lookup "clojure.core" class))))
          (if (and cell (var-cell-defined? cell) (procedure? (var-cell-root cell)))
              (apply (var-cell-root cell) args)
-             ;; a java.time / Locale ctor that never resolved is the jolt-lang/time
-             ;; library, not core — name it; otherwise it's a genuine missing ctor.
+             ;; a ctor for a class some provider CLAIMS, that never resolved,
+             ;; is that provider's absence — name it; otherwise it is a genuine
+             ;; missing ctor on a class jolt does have.
              (throw-jvm (quote IllegalArgumentException)
-               (if (or (member class jt-library-names) (java-time-prefixed? class))
+               (if (lib-provider-for class)
                    (unknown-class-message class)
                    (string-append "No matching ctor found for class " class)))))))))
-
-;; ---- coercion helpers -------------------------------------------------------
-;; numeric tower: currentTimeMillis/nanoTime are exact longs (JVM).
-(define (->num x) x)
-(define (jnum->exact n) (exact (truncate (jolt-need-num n))))
-;; parse an integer string in radix; #f on failure
-(define (parse-int-str s radix)
-  (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))
-    (and n (integer? n) (->num n))))
-(define (parse-int-or-throw s radix what)
-  (or (parse-int-str s radix)
-      (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                    (string-append "For input string: \""
-                                   (if (string? s) s (jolt-str-render-one s)) "\"")))))
-(define (char-code c) (if (char? c) (char->integer c) (jnum->exact c)))
-
-;; parse a double string (Double/parseDouble, (Double. s)); JVM accepts NaN /
-;; Infinity / decimal / scientific. #f on failure.
-(define (parse-double-str s)
-  (let ((t (str-trim (if (string? s) s (jolt-str-render-one s)))))
-    (cond
-      ((or (string=? t "NaN") (string=? t "+NaN") (string=? t "-NaN")) +nan.0)
-      ((or (string=? t "Infinity") (string=? t "+Infinity")) +inf.0)
-      ((string=? t "-Infinity") -inf.0)
-      (else (let ((n (string->number t))) (and n (real? n) (exact->inexact n)))))))
-(define (parse-double-or-throw s)
-  (or (parse-double-str s)
-      (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                    (string-append "For input string: \""
-                                   (if (string? s) s (jolt-str-render-one s)) "\"")))))
-(define (->double x) (if (number? x) (exact->inexact x) (parse-double-or-throw x)))
-

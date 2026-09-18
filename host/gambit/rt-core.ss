@@ -121,7 +121,14 @@
         ((number? x) (exact->inexact x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
-(define (jolt-not x) (if (jolt-truthy? x) #f #t))
+;; Mirrors rt.ss's spliced jolt-not (see values.ss jolt-nil? for why these are
+;; macros); rt-core.ss is the Gambit port of rt.ss's kernel, so the shape has to
+;; match or the Gambit host keeps paying the call.
+(define (jolt-not-fn x) (if (jolt-truthy? x) #f #t))
+(define-syntax jolt-not
+  (syntax-rules ()
+    ((_ e) (if (jolt-truthy? e) #f #t))
+    ((_ e ...) (jolt-not-fn e ...))))
 
 ;; --- ex-info record type -----------------------------------------------------
 ;; A throwable (ex-info or host-constructed typed throwable) is a distinct
@@ -180,6 +187,17 @@
 ;; (measured, Chez 10.4 arm64), and jolt-site! sits on the hot path. Reads are
 ;; ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
+;; --- Clojure fn identity ----------------------------------------------------
+;; The back end gives every non-capturing lambda one free variable to capture so
+;; two evaluations of (fn [x] x) are two objects (see host/chez/rt.ss for why —
+;; Chez shares one static closure otherwise). The emission is not target-gated,
+;; so the two names it references must be bound here too; both are ASSIGNED so
+;; no compiler can fold the capture away, exactly as on Chez.
+(define jolt-fn-identity-seed 0)
+(define jolt-fn-identity-probe #f)
+(set! jolt-fn-identity-seed 1)
+(set! jolt-fn-identity-probe #f)
+
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
 ;; the whole process (16 on every platform jolt targets). jolt claims three, allocated
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
@@ -222,17 +240,13 @@
 ;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
 ;; reporter validates it against the callsite table before splicing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
-;; The line to report for the INNERMOST frame. Inside a catch clause that is the
-;; line the throw came from, snapshotted on the way in; else the pair stashed at
-;; the raise. Never the live vreg — it can be stale between throws.
-(define (jolt-throw-line)
-  (let ((c (virtual-register jolt-vreg-catch-line)))
-    (if (pair? c)
-        (let ((l (cdr c))) (and (fixnum? l) (fx>? l 0) l))
-        (let ((s (jolt-throw-sitep)))
-          (if (pair? s)
-              (let ((l (cdr s))) (and (fixnum? l) (fx>? l 0) l))
-              #f)))))
+;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
+;; when one starts is a returned call's residue — the reporter's validator cannot
+;; tell it from a live pair when the innermost live frame is a host fn (the
+;; loader, the eval loop), which registers no callees. compile-eval.ss clears the
+;; slot when a form starts to compile and again when its compiled code starts to
+;; run, since macroexpansion runs user code in between.
+(define (jolt-site-reset!) (set-virtual-register! jolt-vreg-site 0))
 ;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
 ;; catch-line snapshot when a handler is running, else the raise-time stash.
 ;; #f when unset. The reporter must validate this against the callsite table
@@ -282,10 +296,23 @@
 (define jolt-fn-callees-table (make-hashtable string-hash string=?))
 (define (jolt-callsite-key fqn line)
   (string-append fqn ":" (number->string line)))
+;; Membership is answered by a companion index, not by scanning the list being
+;; built. jolt-tail-entries is keyed by CALLEE, so its list is every tail site
+;; that reaches one function: (member entry cur) made registering n of them cost
+;; O(n^2). Small today — a release build emits 5 registrations — but the cost is
+;; in the number of tail sites in the program, which is not a number to leave
+;; quadratic. The stored value stays a plain list; readers are unchanged.
+(define jolt-table-seen (make-eq-hashtable))          ; tbl -> {(key . entry) -> #t}
+(define (jolt-table-seen-for tbl)
+  (or (hashtable-ref jolt-table-seen tbl #f)
+      (let ((h (make-hashtable equal-hash equal?)))
+        (hashtable-set! jolt-table-seen tbl h)
+        h)))
 (define (jolt-table-add! tbl key entry)
-  (let ((cur (hashtable-ref tbl key '())))
-    (unless (member entry cur)
-      (hashtable-set! tbl key (cons entry cur)))))
+  (let ((seen (jolt-table-seen-for tbl)) (k (cons key entry)))
+    (unless (hashtable-ref seen k #f)
+      (hashtable-set! seen k #t)
+      (hashtable-set! tbl key (cons entry (hashtable-ref tbl key '()))))))
 (define (jolt-register-callsite! fqn line callee tail?)
   (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
   (jolt-table-add! jolt-fn-callees-table fqn callee)
@@ -355,10 +382,22 @@
 ;; /associative?/counted? are naturally false). Arity 2 (msg data) or 3 (msg data cause).
 ;; No :jolt/class field on plain ex-info — class defaults to clojure.lang.ExceptionInfo
 ;; via ex-info-class in records-interop.ss.
+;;
+;; nil data reads back as {}, not nil: ExceptionInfo's constructor rejects a null
+;; map, so an ExceptionInfo whose data is nil cannot exist and (ex-data (ex-info
+;; "m" nil)) is {}. Coercing HERE covers every caller — the emitter lowers the
+;; ex-info native op to a direct call to this procedure, so a wrapper around the
+;; clojure.core/ex-info var root would miss every compiled call site. It is also
+;; what makes (some? (ex-data e)) a sound "is this an ExceptionInfo" test, which
+;; is how the analyzer's throw-message tells one from a host throwable.
+;;
+;; A throwable that genuinely has NO data is a different construction:
+;; jolt-host-throwable / throw-jvm, which is what the JVM raises wherever
+;; ex-data is nil.
 (define (jolt-ex-info msg data . more)
   (make-jolt-ex-info-record "clojure.lang.ExceptionInfo" msg
                              (if (null? more) jolt-nil (car more))
-                             data 0))
+                             (if (jolt-nil? data) empty-pmap data) 0))
 ;; A host-constructed throwable (RuntimeException. etc.): a jolt-ex-info-record
 ;; carrying its canonical JVM class-name, so (class …) / instance? / .getMessage /
 ;; ex-message all reflect the real type.
@@ -400,15 +439,21 @@
 ;; --- host interop ------------------------------------------------------------
 ;; (.method target arg*) with method in backend supported-host-methods
 ;; (isDirectory/listFiles) lowers to (jolt-host-call "method" target arg*). Those
-;; map onto Chez path operations when the receiver is a path STRING; a File value
-;; is intercepted by io.ss's wrapper before reaching here. Any other receiver (a
+;; map onto Gambit's path operations when the receiver is a path STRING (the
+;; Chez spellings file-directory? / directory-list this used to call are not
+;; Gambit names, so file-seq died on the first directory). Any other receiver (a
 ;; deftype/record with its own .isDirectory) routes to the normal method dispatch
 ;; instead of misapplying file ops to it. record-method-dispatch is loaded later
 ;; (records.ss) and resolved at call time.
+(define (jolt-path-directory? p)
+  (and (file-exists? p) (eq? (file-type p) 'directory)))
+(define (jolt-path-entries p)
+  (let ((dir (if (string-suffix? "/" p) p (string-append p "/"))))
+    (map (lambda (e) (string-append dir e)) (directory-files p))))
 (define (jolt-host-call method target . args)
   (cond
-    ((and (string=? method "isDirectory") (string? target)) (if (file-directory? target) #t #f))
-    ((and (string=? method "listFiles") (string? target)) (list->cseq (directory-list target)))
+    ((and (string=? method "isDirectory") (string? target)) (if (jolt-path-directory? target) #t #f))
+    ((and (string=? method "listFiles") (string? target)) (list->cseq (jolt-path-entries target)))
     (else (record-method-dispatch target method (apply jolt-vector args)))))
 
 ;; --- var cells: late-bound global roots (Clojure vars) -----------------------
@@ -429,15 +474,48 @@
 ;; two hosts' cells must not drift (this one sat at v2 while chez moved twice).
 (define-record-type var-cell
   (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
-          (mutable dyn-bound?))
-  (nongenerative var-cell-v4))
+          (mutable dyn-bound?) (mutable dynamic?))
+  (nongenerative var-cell-v5))
 (define var-table (make-hashtable string-hash string=?))
+;; The whole-table snapshots host-contract.ss's completion scan reads (mirrors
+;; host/chez/rt.ss: a locked copy, iterated by the caller outside the lock).
+(define var-table-mu (make-mutex))
+;; ns -> hashtable(name -> cell): the per-namespace index of var-table that
+;; ns.ss's refer / ns-publics / ns-map / all-ns answer from (see host/chez/rt.ss
+;; ns-cells-index). Kept in lockstep with var-table at both insert sites below,
+;; exactly as Chez does — the shared ns.ss reads it, so without it every
+;; namespace looked empty here.
+(define ns-cells-index (make-hashtable string-hash string=?))
+(define (ns-cells-add! c)                ; caller holds var-table-mu
+  (let* ((ns (var-cell-ns c))
+         (b (or (hashtable-ref ns-cells-index ns #f)
+                (let ((b (make-hashtable string-hash string=?)))
+                  (hashtable-set! ns-cells-index ns b)
+                  b))))
+    (hashtable-set! b (var-cell-name c) c)))
+(define (ns-cells-list ns)
+  (jolt-with-mutex var-table-mu
+    (let ((b (hashtable-ref ns-cells-index ns #f)))
+      (if b (vector->list (hashtable-values b)) '()))))
+(define (ns-index-names)
+  (jolt-with-mutex var-table-mu (hashtable-keys ns-cells-index)))
+(define (rebuild-ns-cells-index!)
+  (jolt-with-mutex var-table-mu
+    (hashtable-clear! ns-cells-index)
+    (vector-for-each ns-cells-add! (hashtable-values var-table))))
+(define (var-table-cells) (jolt-with-mutex var-table-mu (hashtable-values var-table)))
+(define (var-table-entries)
+  (jolt-with-mutex var-table-mu
+    (let-values (((ks vs) (hashtable-entries var-table))) (cons ks vs))))
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
-          (hashtable-set! var-table k c)
-          c))))
+        (jolt-with-mutex var-table-mu
+          (or (hashtable-ref var-table k #f)
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f)))
+                (hashtable-set! var-table k c)
+                (ns-cells-add! c)
+                c))))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))
@@ -450,13 +528,46 @@
 ;; JVM-style class name and clojure.spec.alpha's fn-sym can recover the symbol of a
 ;; bare-fn predicate. Weak so GC'd fns drop out. Last def of a given proc wins.
 (define proc-name-tbl (make-weak-eq-hashtable))
+;; The READS take the table's mutex through proc-name-of, as on Chez (rt.ss):
+;; seq.ss prints a fn's name with it and host-class.ss's class arm reads it for
+;; (class a-fn) — both shared files, both unbound here until this mirror.
+(define proc-name-mu (make-mutex))
+(define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
+(define var-redefined-set (make-hashtable string-hash string=?))
+(define (var-redefined? ns name)
+  (hashtable-contains? var-redefined-set (string-append ns "/" name)))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
   (when (and (procedure? v) (not (hashtable-contains? proc-name-tbl v)))
     (hashtable-set! proc-name-tbl v (cons ns name)))
   (hashtable-set! ns-has-vars-set ns #t)
-  (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+  (let ((c (jolt-var ns name)))
+    ;; see host/chez/rt.ss def-var! -- a var defined more than once with a value
+    ;; may not have its body spliced (jolt-rtjm). (declare x) emits declare-var!,
+    ;; so a forward declaration is not a redefinition.
+    (when (not (jolt-var-unbound? (var-cell-root c)))
+      (hashtable-set! var-redefined-set (string-append ns "/" name) #t))
+    (var-root-set! c v) (var-cell-defined?-set! c #t) c))
+;; Linked vars — see host/chez/rt.ss var-root-set!. The Gambit seed is minted
+;; var-routed (gen-seed.ss sets no mint flags), so nothing links here yet; the
+;; funnel is mirrored so a def-var-linked! form loads if one ever arrives.
+(define var-linked-tbl (make-eq-hashtable))
+(define var-linked-mu (make-mutex))      ; ns.ss's remove-ns sweep takes it
+(define (var-root-set! c v)
+  (var-cell-root-set! c v)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (when l ((cdr l) v))))
+(define (var-linked-symbol c)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (and l (car l))))
+(define (def-var-linked! ns name sym v setter m)
+  (let ((c (if m (def-var-with-meta! ns name v m) (def-var-plain! ns name v))))
+    (hashtable-set! var-linked-tbl c (cons sym setter))
+    c))
+;; A def whose form declared NO metadata — see host/chez/rt.ss def-var-plain!.
+(define (def-var-plain! ns name v)
+  (let ((c (def-var! ns name v))) (var-cell-dynamic?-set! c #f) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
@@ -479,6 +590,16 @@
 ;; JVM spelling of the same question, Runtime.availableProcessors, is mapped in
 ;; the java layer (java/process.ss); clojure.core reaches it through here.
 (def-var! "jolt.host" "available-processors" (lambda () (jolt-available-processors)))
+;; jolt.host/getenv — the process environment. Mirrors rt.ss, and for the reason
+;; given there: the compiler image reads it in a top-level def as it LOADS, so it
+;; has to exist before the seed (jolt#879). Gambit's NATIVE getenv raises on an
+;; unset name where Chez's returns #f, but prelude-shims.ss already Chez-shapes
+;; the bare one-argument form (its getenv CONTRACT note) by catching that raise,
+;; which is why the bare (getenv "JOLT_VERSION") above works — so either spelling
+;; would do here. The default is passed explicitly rather than leaning on the
+;; shim's guard, which catches EVERY error and so cannot tell "unset" from a real
+;; failure; that is the one distinction a var handed to user code should keep.
+(def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n #f))) (if v v jolt-nil))))
 
 ;; SKIPPED on the gambit target: the telemetry primitives region (wall/mono
 ;; clocks, sa-stats counters, thread-id, machine-type/scheme-version) — Chez
@@ -490,16 +611,23 @@
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},
 ;; which it derives from the cell — so EVERY var (plain def, native-op, declare)
 ;; reports {:ns :name} like Clojure, with the user meta layered on when present.
-;; Meta and the macro flag live IN the cell (var-cell-v4 fields), matching
-;; chez: the shared files read and write the fields directly (dyn-binding.ss's
-;; dynamic check reads meta, ns.ss's alter-meta! sync writes macro?), so the
+;; Meta, the macro flag and the dynamic flag live IN the cell (var-cell-v5
+;; fields), matching chez: the shared files read and write the fields directly
+;; (dyn-binding.ss's dynamic check reads dynamic?, ns.ss's alter-meta! sync
+;; writes macro?), so the
 ;; eq-side-tables this file used to keep were invisible to them — a var defined
 ;; ^:dynamic through the seed still threw "non-dynamic" at the first binding.
 (define jolt-kw-var-ns (keyword #f "ns"))
 (define jolt-kw-var-name (keyword #f "name"))
 (define jolt-kw-var-macro (keyword #f "macro"))
 (define (def-var-with-meta! ns name v m)
-  (let ((c (def-var! ns name v))) (var-cell-meta-set! c m) c))
+  (let ((c (def-var! ns name v)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))
+    c))
+(define (var-meta-dynamic? m)
+  (and m (not (jolt-nil? m))
+       (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
 ;; A runtime-defined DYNAMIC var (the *earmuffed* core vars): tagged :dynamic so
 ;; push-thread-bindings accepts it — with no meta entry a var is non-dynamic and
 ;; binding throws, like the JVM.
@@ -509,7 +637,9 @@
 ;; Attach meta to an already-interned var (the declare/no-init emission path:
 ;; (def ^:dynamic *x*) must be bindable before its root is set).
 (define (set-var-meta! ns name m)
-  (var-cell-meta-set! (jolt-var ns name) m))
+  (let ((c (jolt-var ns name)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))))
 ;; runtime-macro flag: a var whose root holds a macro expander fn, so the
 ;; analyzer's form-macro?/form-expand-1 (host-contract.ss) expand it. The
 ;; prelude emits each core/stdlib defmacro as a def-var! of its expander
@@ -533,9 +663,14 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
-          (hashtable-set! var-table k c)
-          c))))
+        (jolt-with-mutex var-table-mu
+          (let ((c (hashtable-ref var-table k #f)))
+            (if c
+                (begin (var-cell-defined?-set! c #t) c)
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f)))  ; declared => interned/resolvable
+                  (hashtable-set! var-table k c)
+                  (ns-cells-add! c)
+                  c)))))))
 
 ;; regex: defines regex-t + the re-* fns (def-var!'d into
 ;; clojure.core), so it loads after def-var! and before the printer below (which
@@ -628,6 +763,7 @@
     ((and (flonum? x) (not (fl= x x))) "##NaN")
     ;; str of a bigint has NO N suffix (BigInt.toString); only the readable
     ;; printer adds it (see jolt-pr-readable-base).
+    ((fixnum? x) (jolt-fixnum->string x))
     ((and (exact? x) (integer? x)) (number->string x))
     ((flonum? x) (jolt-flonum->string x))
     (else (number->string x))))
@@ -784,6 +920,15 @@
     (cond ((null? rs) #f)
           (((caar rs) x) ((cdar rs) x))
           (else (loop (cdr rs))))))
+;; The class a value reports. This host has no class model, so the answer is no
+;; class: jolt-object-repr below prints the value plainly, and the last arm of
+;; value-host-tags (records-gambit.ss, from host/chez/protocols.ss) leaves it a
+;; plain Object — the same outcomes the guarded call used to reach by raising.
+(define (jolt-class-name x) #f)
+;; alength in call position (the op registry's native, natives-array.ss on
+;; Chez): the count of any array-like, nil refused — post-prelude names it.
+(define (jolt-alength a)
+  (if (jolt-nil? a) (error 'alength "null") (jolt-count a)))
 (define (jolt-object-repr x readable?)
   (let ((cls (guard (e (#t #f)) (jolt-class-name x)))
         (content (guard (e (#t #f)) (jolt-object-content x))))
@@ -792,10 +937,6 @@
           (readable? (string-append "#object[" cls " \"" (jolt-str-escape content) "\"]"))
           (else (string-append "#object[" cls " " content "]")))))
 
-;; readable? reaches only the #object[…] fallback: every other branch renders the
-;; same either way, and the readable printer handles the types that differ (string
-;; quoting, ##Inf) before it delegates here.
-(define (jolt-pr-str-base x) (jolt-pr-str-base/readable x #f))
 (define (jolt-pr-str-base/readable x readable?)
   (cond
     ((jolt-nil? x) "nil")
@@ -1091,19 +1232,29 @@
     ((string=? method "toString") s)
     ((string=? method "length") (string-length s))
     ((string=? method "charAt") (string-ref s (arg-idx 0)))
+    ;; the kernel's own searches below: string-index / string-rindex are Chez
+    ;; spellings Gambit does not bind, so (.indexOf s x) died on an unbound
+    ;; global. A char or a code point needle (String.indexOf(int)) is searched
+    ;; as its one-char string, like natives-str.ss.
     ((string=? method "indexOf")
-     (let ((needle (jolt-need-str (arg 0))))
-       (or (if (fx>? (length rest) 1)
-               (string-index s needle (arg-idx 1))
-               (string-index s needle))
-           -1)))
+     (str-index-of s (str-needle (arg 0)) (if (fx>? (length rest) 1) (arg-idx 1) 0)))
     ((string=? method "lastIndexOf")
-     (or (string-rindex s (jolt-need-str (arg 0))) -1))
+     (str-last-index-of s (str-needle (arg 0))))
+    ((string=? method "hashCode") (java-string-hash s))   ; natives-misc.ss, shared
     ((string=? method "startsWith") (string-prefix? (jolt-need-str (arg 0)) s))
     ((string=? method "endsWith") (string-suffix? (jolt-need-str (arg 0)) s))
     ((string=? method "substring")
      (substring s (arg-idx 0)
                 (if (fx>? (length rest) 1) (arg-idx 1) (string-length s))))
+    ;; the rest of the surface the seed's own sources call: cl-format's case
+    ;; directives, clojure.main's argument parsing, the printer's checks
+    ((string=? method "toLowerCase") (string-downcase s))
+    ((string=? method "toUpperCase") (string-upcase s))
+    ((string=? method "trim") (str-trim s))
+    ((string=? method "isEmpty") (fx=? (string-length s) 0))
+    ((string=? method "contains") (fx>=? (str-index-of s (str-needle (arg 0)) 0) 0))
+    ((string=? method "concat") (string-append s (jolt-need-str (arg 0))))
+    ((string=? method "equals") (let ((o (arg 0))) (and (string? o) (string=? s o))))
     (else (error 'jolt-string-method "unhandled string method on gambit" method))))
 
 ;; ---- clojure.core/str-* natives ---------------------------------------------
@@ -1171,9 +1322,23 @@
 (define (str-upper s) (string-upcase s))
 (define (str-lower s) (string-downcase s))
 (define (str-reverse-b s) (list->string (reverse (string->list s))))
-(define (str-find needle s)
-  (let ((i (str-index-of s needle 0)))
+(define (str-find needle s . opt)
+  (let ((i (str-index-of s needle (if (pair? opt) (car opt) 0))))
     (if (fx<? i 0) jolt-nil i)))
+;; The Chez twin (java/natives-str.ss str-last-find): String.lastIndexOf(str,
+;; from) — the last occurrence that STARTS at or before FROM, or nil; a negative
+;; FROM is nil, one past the end clamps, an empty needle answers min(from, len).
+(define (str-last-find needle s from)
+  (let* ((needle (str-needle needle))
+         (nlen (string-length needle)) (slen (string-length s)))
+    (cond
+      ((fx<? from 0) jolt-nil)
+      ((fx=? nlen 0) (fxmin from slen))
+      (else
+       (let loop ((i (fxmin from (fx- slen nlen))))
+         (cond ((fx<? i 0) jolt-nil)
+               ((jolt-char-by-char-match? s i needle nlen) i)
+               (else (loop (fx- i 1)))))))))
 (define (str-literal-split s sep)
   (let ((slen (string-length (jolt-need-str s))) (plen (string-length sep)))
     (if (fx=? plen 0)
@@ -1191,21 +1356,40 @@
           (else (loop (cdr xs) #f (cons (car xs) (cons sep acc)))))))
 (define (str-split pat s . opt)
   (let ((limit (if (and (pair? opt) (not (jolt-nil? (car opt)))) (jolt->idx (car opt)) #f)))
-    (if (jolt-regex? pat)
-        (error 'str-split "regex split unsupported on the gambit boot" pat)
-        (let ((parts (str-literal-split s pat)))
-          (apply jolt-vector
-            (if (and limit (fx>? limit 0) (fx>? (length parts) limit))
-                (append (list-head parts (fx- limit 1))
-                        (list (jolt-str-join-strs (list-tail parts (fx- limit 1)) pat)))
-                parts))))))
+    (define (literal-parts sep)
+      (let ((parts (str-literal-split s sep)))
+        (if (and limit (fx>? limit 0) (fx>? (length parts) limit))
+            (append (list-head parts (fx- limit 1))
+                    (list (jolt-str-join-strs (list-tail parts (fx- limit 1)) sep)))
+            parts)))
+    (apply jolt-vector
+      (if (jolt-regex? pat)
+          ;; a pattern that matches exactly one string splits on that text
+          ;; (#"\n" is pprint's line splitter); anything with regex structure
+          ;; runs the engine — regex-literal-text and re-split are regex.ss's,
+          ;; the same two natives-str.ss splits with on Chez
+          (let ((lit (regex-literal-text (regex-t-source pat))))
+            (if lit (literal-parts lit) (re-split (regex-t-irx pat) s limit)))
+          (literal-parts pat)))))
+;; Regex or literal, the natives-str.ss shape: a regex that is really a literal
+;; replaced by a string that is really a literal is a plain search-and-replace,
+;; anything else runs the engine (re-replace, regex.ss — $N expansion and fn
+;; replacements included). The regex? test comes first: under a profile
+;; without the regex group every regex.ss name but the predicates is bound to
+;; a raise, and no regex value exists to take that branch.
 (define (str-replace-all pat repl s)
   (if (jolt-regex? pat)
-      (error 'str-replace-all "regex replace unsupported on the gambit boot" pat)
+      (let ((lit (literal-replace-text pat repl)))
+        (if lit
+            (str-replace-literal s lit repl)
+            (re-replace (regex-t-irx pat) s repl #t)))
       (str-replace-literal s (str-needle pat) (str-needle repl))))
 (define (str-replace pat repl s)
   (if (jolt-regex? pat)
-      (error 'str-replace "regex replace unsupported on the gambit boot" pat)
+      (let ((lit (literal-replace-text pat repl)))
+        (if lit
+            (str-replace-literal-first s lit repl)
+            (re-replace (regex-t-irx pat) s repl #f)))
       (str-replace-literal-first s (str-needle pat) (str-needle repl))))
 (def-var! "clojure.core" "str-upper" str-upper)
 (def-var! "clojure.core" "str-lower" str-lower)
@@ -1213,10 +1397,65 @@
 (def-var! "clojure.core" "str-triml" str-triml)
 (def-var! "clojure.core" "str-trimr" str-trimr)
 (def-var! "clojure.core" "str-find" str-find)
+(def-var! "clojure.core" "str-last-find" str-last-find)
 (def-var! "clojure.core" "str-reverse-b" str-reverse-b)
 (def-var! "clojure.core" "str-split" str-split)
 (def-var! "clojure.core" "str-replace" str-replace)
 (def-var! "clojure.core" "str-replace-all" str-replace-all)
+
+;; ---- names the shared files read that rt.ss owns on Chez ---------------------
+
+;; The build's def-ordinal replay (host/chez/rt.ss var-def-ordinals):
+;; host-contract.ss's hc-resolve-cell reads jolt-form-ordinal as its gate and
+;; consults var-def-ordinal only when a build walk has set it. Nothing here
+;; runs a build walk — emit-image.ss and build.ss are not in the boot — so the
+;; gate stays #f and every var reads the unstamped 0, which is what Chez
+;; answers outside a walk too. The parameter exists so the shared file's read
+;; is a read, not an unbound global on the first `defn`.
+(define jolt-form-ordinal (make-parameter #f))
+(define (var-def-ordinal ns name) 0)
+
+;; A file path the way a report shows it (compile-eval.ss's diagnostics);
+;; mirrors host/chez/rt.ss jolt-display-path.
+(define (jolt-display-path p)
+  (define (under? p dir)
+    (and (string? dir) (> (string-length dir) 0)
+         (> (string-length p) (string-length dir))
+         (string=? (substring p 0 (string-length dir)) dir)
+         (char=? (string-ref p (string-length dir)) #\/)))
+  (define (strip-dot p)
+    (let loop ((p p))
+      (if (and (> (string-length p) 2) (string=? (substring p 0 2) "./"))
+          (loop (substring p 2 (string-length p)))
+          p)))
+  (cond
+    ((not (string? p)) p)
+    ((and (> (string-length p) 0) (char=? (string-ref p 0) #\/))
+     (let ((cwd (or (getenv "JOLT_PWD") (guard (_ (#t #f)) (current-directory))))
+           (home (getenv "HOME")))
+       (cond ((under? p cwd) (string-append "./" (substring p (+ 1 (string-length cwd)) (string-length p))))
+             ((under? p home) (string-append "~/" (substring p (+ 1 (string-length home)) (string-length p))))
+             (else p))))
+    ((and (> (string-length p) 1) (string=? (substring p 0 2) "./"))
+     (string-append "./" (strip-dot p)))
+    (else p)))
+
+;; Object monitors — `locking`, alter-var-root (dyn-binding.ss) and the STM's
+;; commit lock (refs.ss) take one through jolt-with-monitor, which
+;; java/concurrency.ss owns on Chez. One mutex per object in a weak table,
+;; entered through jwm-call so a re-entry by the holder runs inline (Chez's
+;; monitors are reentrant; SRFI-18's mutexes are not). No fibers park here, so
+;; the release on exit is unconditional.
+(define %monitor-tbl (make-weak-eq-hashtable))
+(define %monitor-mu (make-mutex))
+(define (object-monitor obj)
+  (jolt-with-mutex %monitor-mu
+    (or (hashtable-ref %monitor-tbl obj #f)
+        (let ((m (make-mutex)))
+          (hashtable-set! %monitor-tbl obj m)
+          m))))
+(define (jolt-with-monitor obj thunk) (jwm-call (object-monitor obj) thunk))
+(def-var! "jolt.host" "with-monitor" jolt-with-monitor)
 
 ;; source-registry.ss is excluded (introspect off on this target); the def
 ;; path emits registration calls — a no-op keeps them inert, matching the
@@ -1227,8 +1466,35 @@
 ;; the anon-fn emission registers source forms for image closure capture — a
 ;; no-op keeps those calls inert, matching the image-off degradation.
 (define (image-register-fn-form! . _) #f)
+;; ...and the maker a site attaches to its registration on first call
+(define (image-fn-form-maker! . _) #f)
+;; the source text a registration carries is (image-fn-form-src "..."): a
+;; bytevector constant on chez, an inert argument here
+(define (image-fn-form-src s) s)
+;; chez's def-var! records the var name of a code value (a multimethod, a reify)
+;; so a state image can write it as a reference. Gambit has no image, so the
+;; registration is a no-op and nothing is ever a named code value.
+(define (register-code-value! . _) #f)
+;; chez names a procedure def-var! never saw, so a state image can write it as a
+;; var reference. Gambit has no image; the registration is a no-op.
+(define (register-proc-name! v . _) v)
+(define (code-value? x) #f)
 
 ;; jclass?/jclass-name and the class objects they read live in host-vars.ss.
+
+;; ---- values the excluded java/ tree owns: none exists here ------------------
+;; The shared dispatch arms ask these of ANY value on the way to their own
+;; answer — value-host-tags tests jolt-array? before regex/uuid, inst? asks
+;; jinst?, format asks jbigdec?, (instance? File x) asks jfile? — so they have
+;; to answer, and the answer is #f: no array, inst, bigdec or File value can be
+;; constructed on this boot (natives-array.ss, inst-time.ss, bigdec.ss and
+;; io.ss are not in it). The accessors behind each predicate stay unbound and
+;; unreachable (unbound-allowlist.txt).
+(define (jolt-array? x) #f)
+(define (jolt-array-kind x) #f)
+(define (jinst? x) #f)
+(define (jfile? x) #f)
+(define (jbigdec? x) #f)
 
 ;; ---- concurrency tier stubs (demo boot: single-threaded) ---------------------
 ;; java/concurrency.ss + natives-queue.ss are excluded from this boot. Gambit
@@ -1259,8 +1525,19 @@
 ;; this boot reads them back — no host interop), so definitions succeed.
 (define class-ctors-tbl (make-hashtable string-hash string=?))
 (define (register-class-ctor! tag ctor) (hashtable-set! class-ctors-tbl tag ctor))
+;; The analyzer's two class questions (host-contract.ss): a bare Capitalized
+;; name is a host class when a constructor is registered under it (a deftype,
+;; or the throwable ctors host-vars.ss derives); nothing here has statics.
+(define (host-class-registered? nm) (and (hashtable-ref class-ctors-tbl nm #f) #t))
+(define (host-class-has-statics? nm) #f)
+;; On Chez the two differ in whether the class is also recorded as one the host
+;; provides (java/host-static.ss); there is no such registry here, so a deftype's
+;; ctor takes the same write under the name protocols.ss calls.
+(define (class-ctor-set! tag ctor) (register-class-ctor! tag ctor))
+;; register-class-methods! is what host-vars.ss binds clojure.core/__register-class-methods!
+;; to. Without that binding the var is UNBOUND on this host, and jolt.socket and
+;; the eight jolt.time namespaces call it at load — they could not load at all.
 (define class-methods-tbl (make-hashtable string-hash string=?))
 (define (register-class-methods! tag methods) (hashtable-set! class-methods-tbl tag methods))
 (define instance-check-arms '())
 (define (register-instance-check-arm! h) (set! instance-check-arms (cons h instance-check-arms)))
-(define (register-instance-check! cls pred) #f)

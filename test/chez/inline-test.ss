@@ -58,7 +58,17 @@
 (define (code-part s)
   (if (or (starts-with? s "(begin (let* (")
           (starts-with? s "(begin (image-register-fn-form!"))
-      (substring s (skip-form s 7) (string-length s))   ; 7 = past "(begin "
+      ;; one registration per literal, so skip every leading one (and a let*
+      ;; header, which a literal with no source rendering still gets)
+      (let loop ((i 7))   ; 7 = past "(begin "
+        (let* ((i (let ws ((i i))
+                    (if (and (< i (string-length s)) (char=? (string-ref s i) #\space))
+                        (ws (+ i 1)) i)))
+               (rest (substring s i (string-length s))))
+          (if (or (starts-with? rest "(let* (")
+                  (starts-with? rest "(image-register-fn-form!"))
+              (loop (skip-form s i))
+              rest)))
       s))
 (define (ev s) (jolt-compile-eval s "u"))
 

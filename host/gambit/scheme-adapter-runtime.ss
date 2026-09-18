@@ -44,6 +44,18 @@
 ;; Contract: perform a full collection. Degradation: may no-op — callers
 ;; already guard the call and the JVM semantic is only a hint. Gambit's
 ;; collector runs on its own schedule; no-op.
+;; sa-record-cas!: a record here is a vector with the type id in slot 0, so
+;; field i is slot i+1; the swap runs under one mutex because a green thread
+;; can be preempted between the read and the write.
+(define sa-record-cas-mu (make-mutex))
+(define (sa-record-cas! r i old new)
+  (jwm-call sa-record-cas-mu
+    (lambda ()
+      (let ((k (+ i 1)))
+        (if (eq? (vector-ref r k) old)
+            (begin (vector-set! r k new) #t)
+            #f)))))
+
 (define (sa-gc-collect)
   #f)
 
@@ -75,12 +87,29 @@
   9223372036854775807)
 
 ;; (sa-max-memory-bytes) -> exact integer
-;; Upper bound on the heap the runtime may use — the JVM's maxMemory, which
-;; jolt maps to Long/MAX_VALUE when the heap is unbounded. Contract: an upper
-;; bound on heap bytes. Degradation: a large constant is acceptable — the JVM
-;; arm already falls back to Long.MAX_VALUE semantics.
+;; Peak heap bytes since the last sa-reset-max-memory-bytes! -- the high-water
+;; mark behind jolt.host/maximum-memory-bytes (not the JVM's maxMemory, which
+;; is the heap ceiling). Contract: never below sa-total-memory-bytes.
+;; Degradation: the current total -- Gambit keeps no high-water mark, so this
+;; answers "now", which here is the same constant as the total.
 (define (sa-max-memory-bytes)
-  9223372036854775807)
+  (sa-total-memory-bytes))
+
+;; (sa-reset-max-memory-bytes!) -> void
+;; Start the high-water mark over. Contract: right after it, sa-max-memory-bytes
+;; answers the current total. Degradation: a no-op, which is exact here since
+;; sa-max-memory-bytes already answers the current total.
+(define (sa-reset-max-memory-bytes!)
+  #f)
+
+;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
+;; Permitted degradation: Gambit exposes no hook equivalent to Chez's
+;; collect-request-handler, so answer #f and install nothing. The heap is then
+;; unbounded, which is what every jolt before 0.8.5 did on every target, and
+;; the caller reports maxMemory as unbounded rather than promising a bound it
+;; cannot enforce.
+(define (sa-gc-install-ceiling! soft hard on-exceeded)
+  #f)
 
 ;; (sa-real-time-ms) -> exact integer
 ;; Wall-clock milliseconds, monotonic within a process — used for elapsed
@@ -114,6 +143,13 @@
 ;; still happens on its own schedule.
 (define (sa-gc-trip-bytes! n)
   #f)
+
+;; (sa-gc-trip-bytes) -> exact integer
+;; The allocation threshold at which a trip collection triggers. Contract: the
+;; threshold in bytes. Degradation: 0 -- Gambit exposes no such threshold, so
+;; nothing is invisible by construction and a floor built on it is no floor.
+(define (sa-gc-trip-bytes)
+  0)
 
 ;; ---- R6: introspection tier (capability: introspect) -------------------------
 
@@ -176,6 +212,13 @@
 (define (sa-procedure-info x)
   #f)
 
+;; (sa-procedure-code-name p) -> string | #f. Gambit names a procedure by its
+;; define, not by a let binding, so a closure of an inner lambda answers #f;
+;; the contract permits #f.
+(define (sa-procedure-code-name p)
+  (let ((n (##procedure-name p)))
+    (and (symbol? n) (symbol->string n))))
+
 ;; ---- R7: ffi tier (capability: ffi) — entirely unsupported, all raise -------
 
 ;; (sa-ffi-raise who) -> never returns
@@ -194,6 +237,25 @@
   (syntax-rules ()
     ((_ name args res) (sa-ffi-raise 'sa-foreign-procedure))
     ((_ conv name args res) (sa-ffi-raise 'sa-foreign-procedure))))
+
+;; (sa-foreign-procedure-native-error error-convention conv name args res)
+;; -> foreign procedure
+;; SYNTAX: an atomic native-error-capturing foreign procedure. Degradation: the
+;; gambit target has no ffi tier, so every shape raises the same documented
+;; unsupported error as the rest of the tier.
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ error-convention conv name args res)
+     (sa-ffi-raise 'sa-foreign-procedure-native-error))))
+
+;; The compiler emits this target wrapper so Chez can select errno versus
+;; GetLastError at expansion time. Gambit has neither native FFI convention;
+;; route it through the adapter capability so it degrades honestly.
+(define-syntax jolt-ffi-native-error-procedure
+  (syntax-rules ()
+    ((_ conv name args res)
+     (sa-foreign-procedure-native-error unsupported-native-error
+                                        conv name args res))))
 
 ;; (sa-foreign-procedure-blocking name args res) -> foreign procedure
 ;; SYNTAX: like sa-foreign-procedure, but the call is __collect_safe. Contract:
@@ -354,6 +416,39 @@
 (define (sa-fasl-read port . rest)
   (error 'sa-fasl-read "fasl serialization is unsupported on the gambit target"))
 
+;; ---- continuations tier (capability: continuations) -------------------------
+
+;; (sa-call-with-escape-continuation proc) -> value
+;; The one-shot ESCAPE continuation jolt.continuations is built on. Gambit's
+;; usable primitive is call/cc (the same R0(e) finding the fiber scheduler
+;; below rests on: ##continuation-capture/##continuation-graft SIGBUS gsi on
+;; same-stack re-entry), and call/cc is MULTI-SHOT — so the one-shot half of
+;; the contract is this adapter's job, not something the primitive gives.
+;;
+;; The spent flag is what supplies it. Chez's call/1cc refuses a second
+;; invocation and refuses one after the capturing call returned; both refusals
+;; are reproduced here, because without them a re-invocation would graft
+;; control back into a frame that already finished and silently re-run the
+;; caller's half-completed expression — the exact trap the fiber scheduler
+;; below avoids by construction rather than by checking.
+;;
+;; The flag is set on the normal return as well as on the escape: after PROC
+;; answers, this capture is no longer live, and a saved k invoked later must
+;; raise rather than re-enter. The layer above (host/chez/continuations.ss)
+;; adds the thread/fiber ownership rule and the jolt-level error; a target owes
+;; only the one-shot primitive.
+(define (sa-call-with-escape-continuation proc)
+  (call/cc
+   (lambda (k)
+     (let ((spent #f))
+       (let ((v (proc (lambda (val)
+                        (if spent
+                            (error 'sa-call-with-escape-continuation
+                                   "escape continuation is spent")
+                            (begin (set! spent #t) (k val)))))))
+         (set! spent #t)
+         v)))))
+
 ;; ---- fibers R1: coroutines tier (capability: coroutines) --------------------
 ;; Stackful green threads sharing one OS thread, per CONTRACT.txt's coroutines
 ;; tier. R0(e) pinned the primitive: ##continuation-capture/##continuation-graft
@@ -475,3 +570,19 @@
       (if f
           (begin (jolt-fiber-run f) (loop))
           #f))))
+
+;; --- capability-unchecked ---------------------------------------------------
+;; The unchecked fixnum / vector primitives (CONTRACT.txt): this target expands
+;; them to the checked primitives — the permitted degradation.
+(define-syntax sa-ufx+ (syntax-rules () ((_ a b) (fx+ a b))))
+(define-syntax sa-ufx- (syntax-rules () ((_ a b) (fx- a b))))
+(define-syntax sa-ufx<? (syntax-rules () ((_ a b) (fx<? a b))))
+(define-syntax sa-ufx>=? (syntax-rules () ((_ a b) (fx>=? a b))))
+(define-syntax sa-ufx=? (syntax-rules () ((_ a b) (fx=? a b))))
+(define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (vector-ref v i))))
+(define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (vector-set! v i x))))
+;; gambit's vector-copy! / string-copy! have the R7RS shape already
+(define (sa-vector-copy-range! to at from start end)
+  (vector-copy! to at from start end))
+(define (sa-string-copy-range! to at from start end)
+  (string-copy! to at from start end))

@@ -13,9 +13,11 @@
 ;;                    other value is returned as a field.
 ;;
 ;; Anything not recognized falls through to the previous dispatcher (jhost /
-;; number / regex / jrec protocol / string). Loaded LAST (after host-static.ss).
-;; A record (jrec) is jolt-map? here (records.ss makes it so) and a collection,
-;; so its protocol method (no dash, not a coll method) lands in the base.
+;; number / regex / jrec protocol / string). Loaded after the jhost record and
+;; its method registry (host-static.ss on Chez, host-statics.ss on Gambit —
+;; this file is shared with the Gambit boot). A record (jrec) is jolt-map? here
+;; (records.ss makes it so) and a collection, so its protocol method (no dash,
+;; not a coll method) lands in the base.
 
 ;; Vectors / maps / sets only (records are jolt-map? here). Raw seqs are excluded:
 ;; coll-interop accepts some seq representations and not others (a
@@ -26,106 +28,11 @@
 (define (dot-coll? obj)
   (or (jolt-vector? obj) (jolt-map? obj) (pset? obj)))
 
-;; Java .hashCode() for a collection (java.util.Map/Set/List semantics), NOT the
-;; Murmur3 hasheq that clojure.core/hash uses. A library computing .hashCode on its
-;; own collection type (flatland's OrderedMap via APersistentMap/mapHash, OrderedSet
-;; summing element .hashCodes) must agree with jolt's builtins, so map/set/vector
-;; .hashCode go here. Recursive: a nested collection element hashes the same way; a
-;; scalar routes to its own .hashCode. Sums use exact ints (jolt + is unbounded, as
-;; a Clojure (reduce + …) over element hashCodes is) except the map form, which
-;; mirrors APersistentMap.mapHash's 32-bit int accumulation.
-(define (jolt-java-hashcode x)
-  (cond
-    ((jolt-nil? x) 0)
-    ((pmap? x)
-     (pmap-fold x (lambda (k v a)
-                    (i32 (+ a (bitwise-xor (jolt-java-hashcode k) (jolt-java-hashcode v))))) 0))
-    ((pset? x)
-     (pset-fold x (lambda (e a) (if (jolt-nil? e) a (+ a (jolt-java-hashcode e)))) 0))
-    ((pvec? x)
-     (let ((n (pvec-count x)))
-       (let loop ((i 0) (h 1))
-         (if (fx>=? i n) h
-             (loop (fx+ i 1) (i32 (+ (* 31 h) (jolt-java-hashcode (pvec-nth-d x i jolt-nil)))))))))
-    ((or (cseq? x) (empty-list-t? x) (jolt-lazyseq? x))
-     (let loop ((s (jolt-seq x)) (h 1))
-       (if (jolt-nil? s) h
-           (loop (jolt-seq (seq-more s)) (i32 (+ (* 31 h) (jolt-java-hashcode (seq-first s))))))))
-    ;; a jrec is jolt-map? (so dot-coll?) — route it here directly, NOT through
-    ;; record-method-dispatch, which would re-enter the .hashCode arm and loop. A
-    ;; declared hashCode governs (flatland's types via APersistentMap/mapHash);
-    ;; else the structural record hash.
-    ((jrec? x) (let ((m (find-method-any-protocol (jrec-tag x) "hashCode")))
-                 (if m (jolt-invoke m x) (jrec-hash x))))
-    (else (record-method-dispatch x "hashCode" jolt-nil))))
-(def-var! "jolt.host" "java-hashcode" jolt-java-hashcode)
-
-;; Mirror coll-interop: return a one-element list boxing the result (so a jolt-nil
-;; result is still distinguishable from "not a collection method"), or #f.
-(define (dot-coll-method obj name args)
-  (cond
-    ((string=? name "count") (list (jolt-count obj)))
-    ((string=? name "seq")   (list (jolt-seq obj)))
-    ((string=? name "nth")   (list (apply jolt-nth obj args)))
-    ((or (string=? name "get") (string=? name "valAt"))
-     (list (apply jolt-get obj args)))
-    ((string=? name "containsKey") (list (jolt-contains? obj (car args))))
-    ;; java.util.Collection.contains(o): VALUE membership (a set is O(1) via
-    ;; contains?; a list/vector/seq is a linear scan — contains? on a vector tests
-    ;; an index, so it is wrong here).
-    ((string=? name "contains")
-     (list (if (pset? obj)
-               (jolt-contains? obj (car args))
-               (let ((x (car args)))
-                 (let loop ((s (jolt-seq obj)))
-                   (cond ((jolt-nil? s) #f)
-                         ((jolt=2 (seq-first s) x) #t)
-                         (else (loop (jolt-seq (seq-more s))))))))))
-    ((string=? name "size")    (list (jolt-count obj)))
-    ((string=? name "isEmpty") (list (jolt-empty? obj)))
-    ;; java.util.{Map,Set,List}.hashCode — the Java collection hashCode, so a
-    ;; jolt builtin matches a library's own type computing the same (flatland).
-    ((string=? name "hashCode") (list (jolt-java-hashcode obj)))
-    ;; IPersistentCollection / Associative / IPersistentVector / IPersistentMap /
-    ;; IPersistentSet mutators — a deftype built on the clojure.lang interfaces
-    ;; (e.g. flatland.ordered) calls these directly on its native backing
-    ;; map/vector/set. Each maps to the persistent op of the same meaning.
-    ((string=? name "cons")    (list (jolt-conj obj (car args))))
-    ((or (string=? name "assoc") (string=? name "assocN"))
-     (list (jolt-assoc obj (car args) (cadr args))))
-    ((string=? name "without") (list (jolt-dissoc obj (car args))))
-    ((string=? name "disjoin") (list (jolt-disj obj (car args))))
-    ((string=? name "pop")     (list (jolt-pop obj)))
-    ((string=? name "peek")    (list (jolt-peek obj)))
-    ((string=? name "equiv")   (list (if (jolt= obj (car args)) #t #f)))
-    ;; IEditableCollection.asTransient — hand back a transient over this coll.
-    ((string=? name "asTransient") (list (jolt-transient-new obj)))
-    ;; IObj — meta / withMeta thread metadata through the backing coll.
-    ((string=? name "meta")    (list (jolt-meta obj)))
-    ((string=? name "withMeta") (list (jolt-with-meta obj (car args))))
-    ;; MapEntry.key/val/getKey/getValue on a 2-elem entry (a flagged pvec).
-    ((and (jolt-map-entry? obj) (or (string=? name "key") (string=? name "getKey")))
-     (list (jolt-nth obj 0)))
-    ((and (jolt-map-entry? obj) (or (string=? name "val") (string=? name "getValue")))
-     (list (jolt-nth obj 1)))
-    ;; java.util.Map views: keySet (a Set), values (a Collection), entrySet.
-    ((and (jolt-map? obj) (string=? name "keySet"))
-     (list (apply jolt-hash-set (seq->list (jolt-keys obj)))))
-    ((and (jolt-map? obj) (string=? name "values"))
-     (list (apply jolt-vector (seq->list (jolt-vals obj)))))
-    ((and (jolt-map? obj) (string=? name "entrySet")) (list (jolt-seq obj)))
-    ;; (.iterator coll): a java.util.Iterator over the seq — for a map this is the
-    ;; entry iterator. Without this a map's .iterator falls into the map-as-object
-    ;; branch and is mis-read as a missing :iterator key (nil). Some libraries
-    ;; (e.g. malli's -vmap) iterate a map this way.
-    ((string=? name "iterator") (list (make-jiterator (jolt-seq obj))))
-    ;; (.reduce coll f) / (.reduce coll f init): clojure.lang.IReduce — every
-    ;; persistent collection reduces itself on the JVM.
-    ((string=? name "reduce")
-     (list (if (pair? (cdr args))
-               (jolt-reduce (car args) (cadr args) obj)
-               (jolt-reduce (car args) obj))))
-    (else #f)))
+;; (jolt-java-hashcode — Java .hashCode() for a collection — lives in
+;; natives-misc.ss beside the hash API, where hash-combine reads it;
+;; dot-coll-method — the java.util.Map/Collection/List surface of a collection
+;; — in records-dispatch.ss, where record-method-dispatch reaches it for a
+;; deftype built on the clojure.lang interfaces.)
 
 ;; Universal object-methods: on a
 ;; non-record map these win OVER a field lookup, like dispatch-member. getMessage
@@ -148,14 +55,77 @@
     ((string=? name "equals")    (list (if (jolt= obj (car args)) #t #f)))
     (else #f)))
 
+;; The record class's own two public fields on the JVM, boxed, or #f: __extmap
+;; is the extension keys (nil when there are none, as a dissoc back to the
+;; declared fields leaves it), __meta the metadata. Read by code that rebuilds
+;; a record without the positional factory (typed.clojure's update-expr), as
+;; (.-__extmap e) or the reflector's (. e __extmap), which tries a method first
+;; and then the field.
+(define (jrec-class-field obj mname)
+  (and (jrec-record? obj)
+       (cond ((string=? mname "__extmap")
+              (let ((ext (jrec-ext obj)))
+                (list (if (or (jolt-nil? ext) (fx=? 0 (jolt-count ext))) jolt-nil ext))))
+             ((string=? mname "__meta") (list (jolt-meta obj)))
+             (else #f))))
+
+;; clojure.lang.Sorted on jolt's sorted-map / sorted-set: comparator / entryKey /
+;; seqFrom / seq. data.priority-map's subseq/rsubseq reach for these (its
+;; PersistentPriorityMap delegates .comparator to the backing sorted-map). The
+;; comparator is returned as a small Comparator object whose .compare runs the
+;; map's 3-way fn, since (.. sc comparator (compare a b)) is the calling form.
+(define sorted-cmp-kw (keyword #f "cmp"))
+(register-host-methods! "jolt-comparator"
+  (list (cons "compare" (lambda (self a b) (jolt-invoke (jhost-state self) a b)))))
+(define (sorted-comparator-of sc)
+  (let ((c (jolt-ref-get sc sorted-cmp-kw)))
+    (make-jhost "jolt-comparator" (if (jolt-nil? c) jolt-compare c))))
+(define (sorted-iface-method? m)
+  (or (string=? m "comparator") (string=? m "entryKey")
+      (string=? m "seqFrom") (string=? m "seq")))
+(define (sorted-iface-dispatch obj method rest)
+  (cond
+    ((string=? method "comparator") (sorted-comparator-of obj))
+    ((string=? method "entryKey") (jolt-first (car rest)))   ; map entry -> its key
+    ((string=? method "seq")                                 ; (.seq sc) or (.seq sc ascending?)
+     (if (or (null? rest) (jolt-truthy? (car rest))) (jolt-seq obj) (jolt-rseq obj)))
+    ;; (.seqFrom sc k ascending?) — the entries from k onward, in order. Done with a
+    ;; comparator filter over the seq (jolt has no tree cursor), like subseq.
+    ((string=? method "seqFrom")
+     (let* ((k (car rest)) (asc (jolt-truthy? (cadr rest)))
+            (cmp (jolt-ref-get obj sorted-cmp-kw))
+            (cmpf (if (jolt-nil? cmp) jolt-compare cmp))
+            (es (seq->list (jolt-seq obj)))
+            (keep (filter (lambda (e)
+                            (let ((c (jnum->exact (jolt-invoke cmpf (jolt-first e) k))))
+                              (if asc (>= c 0) (<= c 0))))
+                          es)))
+       (list->cseq (if asc keep (reverse keep)))))
+    (else (dispatch-miss obj method rest))))
+
+;; The receivers the arm below answers for — every branch of its cond tests
+;; one of these (a field read tests the receiver inside its own branch). The
+;; arm sits at priority 30, so every receiver the string/getclass arms did not
+;; claim passes through it: a Matcher, a StringBuilder, a File, a Date. It used
+;; to convert the rest args to a list BEFORE the cond — a seq walk, a cseq plus
+;; a cons per argument — so every one of those receivers paid for a conversion
+;; whose result the arm then threw away with 'pass (448 bytes of the 576 an
+;; unhinted (.region m a b) allocated in dispatch). Test the receiver first, and
+;; convert with method-rest-args->list, which reads the argument vector's tail
+;; straight into conses. test/chez/method-dispatch-alloc-test.ss pins it.
+(define (dotform-receiver? obj)
+  (or (jrec? obj) (jolt-multifn? obj) (procedure? obj) (jolt-transient? obj)
+      (dot-coll? obj) (htable-sorted? obj) (jolt-map? obj) (jolt-ex-info-record? obj)))
 (register-method-arm! arm-priority-dotform
   (lambda (obj method-name rest-args)
-    (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
-           (field? (and (> (string-length method-name) 0)
+    (let* ((field? (and (> (string-length method-name) 0)
                         (char=? (string-ref method-name 0) #\-)))
            (mname (if field?
                       (substring method-name 1 (string-length method-name))
                       method-name)))
+     (if (not (or field? (dotform-receiver? obj)))
+      'pass
+      (let ((rest (method-rest-args->list rest-args)))
       (cond
         ;; A FIELD read. Checked FIRST, so no method arm below can claim a dashed
         ;; name — (.-count [1 2]) is not the count, the way the JVM's
@@ -173,10 +143,15 @@
         (field?
          (let ((kw (keyword #f mname)))
            (cond
-             ((jrec? obj) (if (jrec-field-index obj kw) (jrec-lookup obj kw jolt-nil) 'pass))
+             ((jrec? obj)
+              (cond ((jrec-field-index obj kw) (jrec-lookup obj kw jolt-nil))
+                    ((jrec-class-field obj mname) => car)
+                    (else 'pass)))
              ((and (jolt-map? obj) (jolt-truthy? (jolt-contains? obj kw)))
               (jolt-get obj kw jolt-nil))
              (else 'pass))))
+        ;; (. rec __extmap) with no args: no method by that name, then the field
+        ((and (null? rest) (jrec? obj) (jrec-class-field obj mname)) => car)
         ;; clojure.lang.MultiFn .dispatchFn / .getMethod — clojure.spec.alpha's
         ;; multi-spec walks a multimethod through these.
         ((jolt-multifn? obj)
@@ -192,6 +167,10 @@
         ;; (.applyTo f args): apply a fn to a seq of args (clojure.spec instrument).
         ((and (procedure? obj) (string=? mname "applyTo"))
          (apply jolt-invoke obj (seq->list (jolt-seq (car rest)))))
+        ;; (.compare f a b): a fn is a java.util.Comparator — AFunction.compare
+        ;; invokes it — so code holding a fn as a Comparator calls it this way.
+        ((and (procedure? obj) (string=? mname "compare") (pair? rest) (pair? (cdr rest)))
+         (jolt-invoke obj (car rest) (cadr rest)))
         ;; a transient (ITransientCollection/Set/Map): .contains / .valAt / .count —
         ;; test.check's distinct-collection gen uses (.contains transient-set k).
         ((jolt-transient? obj)
@@ -240,4 +219,4 @@
          (cond
            ((dot-object-method obj mname rest) => car)
            (else 'pass)))
-        (else 'pass)))))
+        (else 'pass)))))))

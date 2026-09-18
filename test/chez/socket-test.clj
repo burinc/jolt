@@ -67,6 +67,29 @@
     (check-eq "single byte" (.read (.getInputStream conn)) 65)
     (check-eq "zero-length read" (.read (.getInputStream client) (byte-array 0)) 0)))
 
+;; OutputStream.write(byte[]) — the abstract class's convenience overload, and
+;; the form library code reaches for. It shares an arity with write(int), so the
+;; argument is what tells them apart; without that a byte array landed on the
+;; single-byte arm and reported "class [B cannot be cast to class
+;; java.lang.Number", naming neither the socket nor the overload (jolt#954).
+(with-pair
+  (fn [server client conn]
+    (.write (.getOutputStream client) (.getBytes "hi" "UTF-8"))
+    (let [buf (byte-array 8)
+          n   (.read (.getInputStream conn) buf 0 8)]
+      (check-eq "write(byte[]) writes the whole array" (String. buf 0 n "UTF-8") "hi"))))
+
+;; …and it is binary-safe and empty-safe, like the 3-arg form beside it
+(with-pair
+  (fn [server client conn]
+    (let [out (.getOutputStream client)]
+      (.write out (byte-array 0))                    ; a no-op, not a hang
+      (.write out (byte-array [(unchecked-byte 0) (unchecked-byte 255)])))
+    (let [buf (byte-array 4)
+          n   (.read (.getInputStream conn) buf 0 4)]
+      (check-eq "write(byte[]) is binary-safe"
+                [n (mapv #(bit-and % 0xff) (take n buf))] [2 [0 255]]))))
+
 ;; read into an offset
 (with-pair
   (fn [server client conn]

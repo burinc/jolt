@@ -14,9 +14,158 @@
 
 ;; --- nil ---------------------------------------------------------------------
 (define-record-type jolt-nil-t (fields) (nongenerative jolt-nil-v1))
+;; Has a second OS thread ever been started? #f until the first fork-thread
+;; (lazy-bridge.ss shadows it to flip this), never #f again. The lock-free
+;; paths that are only unsafe under real concurrency — a lazy node's first
+;; force (seq.ss), the metadata table's read (natives-meta.ss) — skip their
+;; fences and claims while it is #f. Defined here, in the first shared file,
+;; because seq.ss and natives-meta.ss load long before lazy-bridge.ss and read
+;; it as soon as they run.
+(define jolt-mt? #f)
+(define (jolt-mark-mt!) (set! jolt-mt? #t))
+
+;; A fixnum's decimal text. Chez's number->string is (format "~d" x): the
+;; general formatter, ~230 ns for a fixnum, and its control-string cache sits
+;; under one process-wide mutex, so eight threads rendering integers ran 17x
+;; slower per thread than one. str, the printer and Long/toString render a
+;; fixnum through this; a bignum still goes to number->string. A negative value
+;; is walked as itself (quotient and remainder toward zero, the remainder
+;; negated per digit) rather than negated up front, so the most negative fixnum
+;; needs no special case.
+(define (jolt-fixnum->string n)
+  (if (fx=? n 0)
+      "0"
+      (let* ((neg? (fx<? n 0))
+             (len (let count ((m n) (k (if neg? 1 0)))
+                    (if (fx=? m 0) k (count (fxquotient m 10) (fx+ k 1)))))
+             (s (make-string len)))
+        (when neg? (string-set! s 0 #\-))
+        (let fill ((m n) (i (fx- len 1)))
+          (if (fx=? m 0)
+              s
+              (let ((d (fxremainder m 10)))
+                (string-set! s i (integer->char (fx+ 48 (if neg? (fx- 0 d) d))))
+                (fill (fxquotient m 10) (fx- i 1))))))))
+
 (define jolt-nil (make-jolt-nil-t))
-(define (jolt-nil? x) (jolt-nil-t? x))
-(define (jolt-some? x) (not (jolt-nil-t? x)))
+;; SPLICED, not called. Chez compiles each top-level form on its own -- verified:
+;; (define (f x) (fx+ x 1)) (define (g y) (f y)) in one compiled file, then
+;; (set! f ...) after load, still changes what g returns -- so a plain (define
+;; (jolt-nil? x) ...) here is an out-of-line call from every one of the thousands
+;; of sites the emitter writes, and from the whole runtime besides. Measured per
+;; check at optimize-level 2: 2.78ns called, 1.25ns spliced.
+;;
+;; Value position keeps an ordinary <name>-fn procedure and names it explicitly:
+;; op-registry's :value entry for the op, and every host reference that hands the
+;; predicate around rather than calling it. These are plain syntax-rules macros
+;; with NO identifier clause on purpose. Chez would accept a variable transformer
+;; (syntax-case with an (identifier? #'id) arm) and Gambit will not -- "Macro name
+;; can't be used as a variable" -- so a bare use has to be a compile error on both
+;; hosts rather than working on one. That is also what makes the -fn sweep
+;; verifiable: a missed value-position use fails the build, it does not silently
+;; keep the old cost.
+;; An arity the inline arm does not cover falls through to the procedure, so a
+;; wrong-arity use raises exactly what it raised before.
+;;
+;; An arm that uses its operand twice binds it first (jolt-truthy? below), so the
+;; argument expression is still evaluated exactly once; the binding is hygienic
+;; and cannot capture. The single-use arms splice the expression directly.
+(define (jolt-nil?-fn x) (jolt-nil-t? x))
+(define-syntax jolt-nil?
+  (syntax-rules ()
+    ((_ e) (jolt-nil-t? e))
+    ((_ e ...) (jolt-nil?-fn e ...))))
+
+(define (jolt-some?-fn x) (not (jolt-nil-t? x)))
+(define-syntax jolt-some?
+  (syntax-rules ()
+    ((_ e) (not (jolt-nil-t? e)))
+    ((_ e ...) (jolt-some?-fn e ...))))
+
+;; --- collection record layouts -------------------------------------------------
+;; The records behind jolt's collections are defined HERE, in the first shared
+;; file, rather than beside their operations. A generated predicate or accessor
+;; is open-coded only in forms compiled after its definition
+;; (scheme-adapter-runtime.ss define-record-type), and jolt=, jolt-hash and
+;; hasheq.ss dispatch on every one of these types before collections.ss, seq.ss,
+;; records.ss and lazy-bridge.ss load. A reference compiled earlier still works,
+;; through the variable, but as a call on every arm. test/chez/record-inline-
+;; test.ss pins the order: the dispatch files name no record op defined in a
+;; file that loads after them. The constructors that fill defaults (mk-pvec,
+;; make-pmap, make-pset, fresh-empty-list, make-jrec) stay with the operations.
+;;
+;; Every layout below travels raw in a state image, so each is image-format
+;; surface: a field change is a new nongenerative tag plus a legacy arm in
+;; state-image.ss.
+
+;; persistent vector (collections.ss): cnt elements in a 32-way trie (root,
+;; height = shift bits) plus a tail chunk; `ent` is the vector's kind (plain /
+;; map entry / subvec); `hasheq` caches the structural hash (0 = unset); `meta`
+;; is the vector's metadata, jolt-nil or a map -- PersistentVector's _meta.
+;; natives-meta.ss owns every read and write of the meta slot (it is written
+;; only on an instance nobody else holds yet; see coll-meta-set! there).
+;; chez-pvec-v3 (no meta slot) restores through state-image.ss's legacy arm.
+(define-record-type (pvec %mk-pvec pvec?)
+  (fields cnt shift root tail ent (mutable hasheq) (mutable meta)) (nongenerative chez-pvec-v4))
+
+;; persistent map (collections.ss): `root` is a slot vector in array mode or an
+;; hnode in hash mode, `cnt` the entry count, `hasheq` the cached hash, `meta`
+;; the map's metadata (natives-meta.ss owns the slot, as for pvec). The two
+;; previous generations (chez-pmap-v5: root cnt hasheq; chez-pmap-v4: root cnt
+;; order hasheq all-kw, a trie root plus an order list) restore through
+;; state-image.ss's legacy arm.
+(define-record-type (pmap %mk-pmap pmap?)
+  (fields root cnt (mutable hasheq) (mutable meta)) (nongenerative chez-pmap-v6))
+
+;; persistent set (collections.ss): `m` is the backing hash-mode pmap; `hasheq`
+;; and `meta` as for pvec/pmap. chez-pset-v2 (no meta slot) restores through
+;; state-image.ss's legacy arm.
+(define-record-type (pset %mk-pset pset?)
+  (fields m (mutable hasheq) (mutable meta)) (nongenerative chez-pset-v3))
+
+;; seq cell (seq.ss): the head; the tail, ONE published word (see seq.ss
+;; seq-tail-realized?); the forced flag; the cell's kind (sk-* in seq.ss); the
+;; chunk fields cvec/ci/crest; the claim lock (slot 7, seq.ss cseq-lock-index,
+;; which is why `meta` comes last); and the cell's metadata, jolt-nil or a map --
+;; the _meta of a PersistentList node or a Cons (natives-meta.ss owns the slot;
+;; written only on a cell nobody else holds yet). chez-cseq-v6, without the meta
+;; slot, restores through state-image.ss's legacy arm.
+(define-record-type cseq
+  (fields head (mutable tail) (mutable forced? cseq-forced-flag cseq-forced-flag-set!) kind cvec ci crest (mutable lock) (mutable meta))
+  (nongenerative chez-cseq-v7))
+
+;; The empty seq (Clojure's empty list ()), distinct from nil. Its one field is
+;; its metadata, jolt-nil or a map (EmptyList extends Obj): a metadata-bearing ()
+;; -- an `empty`/`pop`/`with-meta` result -- is a fresh instance, so the shared
+;; jolt-empty-list (seq.ss) never carries any. A fielded record is also what
+;; keeps Chez from interning every () into one object. natives-meta.ss owns the
+;; slot; empty-list-v2 restores through state-image.ss's legacy arm.
+(define-record-type empty-list-t (fields (mutable meta)) (nongenerative empty-list-v3))
+
+;; deferred seq node (lazy-bridge.ss): `thunk` is the node's ONE published word
+;; (the thunk until the node is forced, then the seq or a lazyseq-fail); val,
+;; realized? and error? are mirrors written before it, for the image; `lock` is
+;; the claim lock (slot 4, which is why `meta` comes last); `meta` is LazySeq's
+;; _meta (natives-meta.ss owns the slot; written only on a node nobody else
+;; holds yet). jolt-lazyseq-v2, without the meta slot, restores through
+;; state-image.ss's legacy arm.
+(define-record-type jolt-lazyseq
+  (fields (mutable thunk) (mutable val)
+          (mutable realized? jolt-lazyseq-realized-flag jolt-lazyseq-realized-flag-set!)
+          (mutable error? jolt-lazyseq-error-flag jolt-lazyseq-error-flag-set!)
+          (mutable lock) (mutable meta))
+  (nongenerative jolt-lazyseq-v3))
+
+;; deftype/defrecord instance base (records.ss): `desc` the type descriptor,
+;; `ext` the extension map, `hasheq` the defrecord __hasheq slot generalized to
+;; the family -- 0 = unset; a defrecord caches its structural hash here, a plain
+;; deftype its identity hash, and a type with a declared hasheq/hashCode never
+;; fills it (records-coll.ss jrec-hasheq-slow). The fielded children jrec1..8
+;; and the spill type jrec* (records.ss define-jrec-family) inherit these three
+;; fields, so desc-keyed dispatch stays uniform across the family.
+(define-record-type (jrec make-jrec0 jrec?)
+  (fields (immutable desc) (immutable ext) (mutable hasheq))
+  (nongenerative chez-jrec-v5))
 
 ;; --- the exit-only-cleanup marker --------------------------------------------
 ;; A fiber park is a continuation escape that is NOT an exit — the computation
@@ -53,7 +202,14 @@
 (define jolt-park-unwinding?-hook (lambda () #f))
 (define (jolt-park-unwinding?) (jolt-park-unwinding?-hook))
 
-(define (jolt-truthy? x) (not (or (jolt-nil? x) (eq? x #f))))
+;; The hot one: every `if` whose test is not provably a Scheme boolean goes
+;; through this, 2395 sites in a trivial app's emitted source before any of the
+;; runtime's own. See jolt-nil? above for why it is a macro.
+(define (jolt-truthy?-fn x) (not (or (jolt-nil-t? x) (eq? x #f))))
+(define-syntax jolt-truthy?
+  (syntax-rules ()
+    ((_ e) (let ((v e)) (not (or (jolt-nil-t? v) (eq? v #f)))))
+    ((_ e ...) (jolt-truthy?-fn e ...))))
 
 ;; --- keywords: interned so identity works; optional namespace ----------------
 (define-record-type keyword-t (fields ns name khash) (nongenerative keyword-v1))
@@ -298,6 +454,17 @@
         (cons (keyword #f "a") (keyword #f "b"))
         (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
         (cons "s1" "s2")
+        ;; Two base scalars of DIFFERENT kinds, and nil against anything, are
+        ;; answered ahead of the walk too (jolt=2's base-scalar clause), so an
+        ;; arm that would claim such a pair is refused for the same reason. The
+        ;; JVM's Util.equiv has no extension point here either: a Keyword is
+        ;; never equal to a String, a Long never to a Double, nil only to nil.
+        ;; The number pairs cover the exactness-aware number clause that moved
+        ;; up with them (bignum and ratio pairs used to reach the arms).
+        (cons (keyword #f "a") "a") (cons "a" (jolt-symbol #f "a"))
+        (cons (keyword #f "a") jolt-nil) (cons jolt-nil 0) (cons jolt-nil "s")
+        (cons 1 2.5) (cons #t (keyword #f "a")) (cons #\a "a") (cons 0 #f)
+        (cons (expt 2 70) (expt 2 71)) (cons 1/2 1/3) (cons #\a #\b) (cons #t #f)
         ;; jolt's own collection types, now answered ahead of the walk. All
         ;; THREE that jolt=2 hoists must be probed — a hoisted type missing from
         ;; here is one whose arms register happily and are then silently dead.
@@ -403,10 +570,33 @@
         ;; EQUAL case); answering the unequal case here keeps a fn-keyed map's
         ;; bucket scan off the arm walk. The pair is in eq-fast-probes.
         ((and (procedure? a) (procedure? b)) #f)
+        ;; nil is equal only to nil (the eq? clause above answered that pair),
+        ;; and two base scalars of different kinds are never equal. Both used to
+        ;; reach jolt=2-base only AFTER every registered arm had been asked —
+        ;; 145-240 ns per miss with 17 arms in a bare runtime, more per library
+        ;; loaded — and `case` lowers to a chain of exactly these compares, so
+        ;; a keyword case fed a symbol paid that per clause. Sound because the
+        ;; JVM's Util.equiv has no extension point for a base-vs-base pair: it
+        ;; goes straight to k1.equals(k2), and Keyword/Symbol/String/Character/
+        ;; Boolean equality is by kind. Numbers keep the exactness-aware
+        ;; compare of jolt=2-base. Every pair answered here is in
+        ;; eq-fast-probes, so the registry refuses an arm that would claim one.
+        ((or (jolt-nil? a) (jolt-nil? b)) #f)
+        ((and (base-scalar? a) (base-scalar? b))
+         (cond ((and (number? a) (number? b)) (and (eq? (exact? a) (exact? b)) (= a b)))
+               ((and (char? a) (char? b)) (char=? a b))
+               ((and (boolean? a) (boolean? b)) (eq? a b))
+               (else #f)))
         (else (let loop ((as jolt-eq-arms))
                 (cond ((null? as) (jolt=2-base a b)) 
                       (((caar as) a b) ((cdar as) a b)) 
                       (else (loop (cdr as))))))))
+;; the scalar kinds whose equality the JVM decides by kind: nil, Number, Keyword,
+;; Symbol, String, Character, Boolean. Records, host types and collections are
+;; NOT here — those are what the arm registry exists for.
+(define (base-scalar? x)
+  (or (number? x) (keyword-t? x) (string? x) (symbol-t? x) (char? x) (boolean? x)
+      (jolt-nil? x)))
 (define (jolt= a . rest)
   (let loop ((a a) (rest rest))
     (cond ((null? rest) #t)

@@ -634,9 +634,11 @@
   #f)
 
 ;; shared nil-put guard (was pasted at three put sites)
+;; The message is the reference's, word for word: channels.clj raises
+;; IllegalArgumentException "Can't put nil on channel" (no article).
 (define (async-check-put! v)
   (when (jolt-nil? v)
-    (throw-jvm (quote IllegalArgumentException) "Can't put nil on a channel")))
+    (throw-jvm (quote IllegalArgumentException) "Can't put nil on channel")))
 
 ;; clojure.core.async/*go-backend* — the R4 opt-in seam (epic jolt-nvpr.5):
 ;; :thread (default) is byte-for-byte today's go (a real OS thread); :fiber
@@ -965,7 +967,7 @@
 ;; carrier when a :fiber binding is in scope. thread is the documented escape
 ;; for blocking work (fibers-plan.md).
 (define cca-thread-spawn-sym (jolt-symbol "clojure.core.async" "thread-spawn"))
-(define (cca-thread-macro . body)
+(define (cca-thread-macro _form _env . body)
   (jolt-list cca-thread-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
 
 ;; --- install clojure.core.async ---------------------------------------------

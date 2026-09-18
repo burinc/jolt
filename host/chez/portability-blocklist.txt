@@ -26,12 +26,19 @@
 # shape is Chez-flavored and owned by a later round (noted inline). Verified-still
 # standard names are dropped rather than listed: make-eq-hashtable, make-eqv-
 # hashtable, symbol-hashtable?, list-sort, vector-sort, vector-sort!, guard,
-# string-copy!, time-second, time-nanosecond, eval, environment, exit,
+# time-second, time-nanosecond, eval, environment, exit,
 # command-line, condition-continuation, make-continuation-condition,
 # continuation-condition?, and the fx/fl/bytevector/vector/string R6RS arithmetic
 # are all standard R6RS and deliberately absent. `exit`/`eval` are standard, but
 # the host's Chez-ENV-SPECIFIER call sites ((environment '(chezscheme))) are real
 # migration work — tracked by R8, not by this gate.
+#
+# A name can also be standard on EVERY target and still belong here: string-copy!
+# is (from from-start to to-start count) on Chez and (to at from start end) on
+# R7RS/SRFI-13 (Gambit, Guile). Same arity, opposite direction, so a raw call in
+# shared code compiles on both and on the R7RS target copies the empty
+# destination into the source. It goes through sa-string-copy-range!
+# (CONTRACT.txt), which fixes the R7RS order.
 #
 # tier: ffi
 foreign-procedure
@@ -92,16 +99,22 @@ collect-trip-bytes
 file-modification-time
 #
 # tier: misc
+# (fxvector / make-fxvector left this tier when int/long/short arrays moved onto
+# an fxvector backing — java/natives-array.ss. They are the fixnum sibling of the
+# flvector backing double/float arrays have always used and that the back end
+# EMITS into compiled code, so the array representation is one Chez-typed-vector
+# decision, not a Chez-ism a call site can route around. A port replaces the
+# backing table there — a plain vector is a valid backing for every kind by
+# construction — rather than shimming these two names.)
 add1
 sub1
-fxvector
-make-fxvector
 last-pair
 list-copy
 sort!
 vector-append
 date-and-time
 record-writer
+string-copy!
 #
 # tier: chez-unsafe
 $primitive  # reader artifact for #3%/#% unsafe-primitive syntax — files that use

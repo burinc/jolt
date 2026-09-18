@@ -215,7 +215,10 @@ fi
 # (i) install-owned namespaces (stdlib/jolt-core — embedded in the binary) are
 # NEVER cached. Run in SOURCE mode (chez --script cli.ss) so clojure.set actually
 # loads on demand (the devcache preloads it); ldr-install-file? must bypass it.
-chez_bin="$(command -v chez || command -v scheme || command -v chezscheme)"
+# JOLT_CHEZ wins (see host/chez/selfcheck.sh) — otherwise this runs (i) under
+# whatever Chez happens to be on PATH, independent of the one the rest of this
+# gate actually built with.
+chez_bin="${JOLT_CHEZ:-$(command -v chez || command -v scheme || command -v chezscheme)}"
 n_i="(not cached)"
 if [ -n "$chez_bin" ]; then
   cache_i="$(mktemp -d)"
@@ -477,6 +480,27 @@ else
   echo "FAIL: (q2) cold='$q2_cold' (want none) after-add='$q2_warm' (want appeared)"; fails=$((fails+1))
 fi
 
+# (q3) the same probe through a ClassLoader. RT/baseLoader's getResource is the
+# other spelling of the same lookup, and libraries that reach the classpath
+# rather than clojure.java.io use it — but it walked the roots on its own and
+# announced nothing, so a compile-time probe through it was invisible to the key
+# and an added resource kept serving the "not there" answer. It resolves through
+# io/resource's resolver now, so it announces what that announces.
+printf '(ns proj.clopt)\n(defmacro embed [] (if-let [u (.getResource (clojure.lang.RT/baseLoader) "clopt.sql")] (slurp u) "none"))\n(defn run [] (embed))\n' > "$q/src/proj/clopt.clj"
+q3run() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'proj/proj {:local/root \"$q\"}}})
+    (require 'proj.clopt) (println (proj.clopt/run))" 2>/dev/null | tail -1
+}
+q3_cold="$(q3run)"
+printf 'appeared' > "$q/resources/clopt.sql"
+q3_warm="$(q3run)"
+if [ "$q3_cold" = "none" ] && [ "$q3_warm" = "appeared" ]; then
+  echo "PASS: (q3) an added resource invalidated the ns that probed the loader"; pass=$((pass+1))
+else
+  echo "FAIL: (q3) cold='$q3_cold' (want none) after-add='$q3_warm' (want appeared)"; fails=$((fails+1))
+fi
+
 # (r) the read happens while compiling the CONSUMER (the macro lives one
 # namespace away), so the resource belongs to the consumer's key, and editing it
 # has to move that key even though neither .clj changed.
@@ -582,6 +606,87 @@ else
   fi
 fi
 rm -rf "$cache_u"
+
+# --- (v) a namespace that sets a compiler flag still hits its cache -----------
+# (set! *warn-on-reflection* true) at a namespace's top level is the standard
+# idiom in ported Clojure libraries. A source load binds that var to a
+# thread-local slot for the duration of the file; loading the cached .so has to
+# bind it too, or the set! hits the root, raises, and the loader reads the raise
+# as a broken artifact — deleting and recompiling the SAME .so on every run, so
+# the cache never once takes.
+v="$tmp/v"; mkdir -p "$v/src/vlib"
+cat > "$v/src/vlib/core.clj" <<'CLJ'
+(ns vlib.core)
+(set! *warn-on-reflection* true)
+(defn answer [] 42)
+CLJ
+# ...and the frame has to be the NAMESPACE's own. Every entry point binds these
+# vars now, so a .so whose set! writes the CALLER's binding loads and hits fine
+# — it just escapes into the requiring code. :leak is what fails if the loader
+# stops establishing a frame per compiled load.
+# Top-level forms on purpose: -e compiles form by form, so vlib.core/answer
+# resolves only because the require evaluated in an earlier form. The || true
+# matters under set -e — a raising jolt otherwise kills the whole script before
+# the FAIL branch can say which case died.
+vrun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_v" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'vlib/vlib {:local/root \"$v\"}}})
+    (def b0 *warn-on-reflection*)
+    (require 'vlib.core)
+    (println :leak (not= b0 *warn-on-reflection*))
+    (println (vlib.core/answer))" 2>&1
+}
+cache_v="$(mktemp -d)"
+v_cold="$(vrun || true)"
+v_warm="$(vrun || true)"
+if echo "$v_cold" | grep -q '^42$' \
+   && echo "$v_warm" | grep -q '^42$' \
+   && echo "$v_warm" | grep -q 'hit vlib.core' \
+   && ! echo "$v_warm" | grep -q 'corrupt cache for vlib.core' \
+   && echo "$v_cold" | grep -q ':leak false' \
+   && echo "$v_warm" | grep -q ':leak false'; then
+  echo "PASS: (v) compiler-flag set! namespace hits its cache, set! stays in its own load"; pass=$((pass+1))
+else
+  echo "FAIL: (v) warm run: hit=$(echo "$v_warm" | grep -c 'hit vlib.core') corrupt=$(echo "$v_warm" | grep -c 'corrupt cache for vlib.core') out=$(echo "$v_warm" | grep -c '^42$') cold-leak=$(echo "$v_cold" | grep -c ':leak false') warm-leak=$(echo "$v_warm" | grep -c ':leak false')"; fails=$((fails+1))
+fi
+rm -rf "$cache_v"
+
+# (w) A live VALUE a macro put in its expansion has to survive the fasl. jolt
+# rebuilds one as CODE rather than stashing it in a process-local table
+# (jolt-l7tq), and a table would be invisible here — the cold run would work and
+# the warm one would load a .so referring to an index nothing filled. So this
+# asserts the WARM run, off the fasl, still answers: a named fn read back
+# through its var, and an anonymous literal rebuilt from its source form and its
+# captured value.
+elib="$(mktemp -d)"; mkdir -p "$elib/src/elib"
+printf '{:paths ["src"]}\n' > "$elib/deps.edn"
+cat > "$elib/src/elib/core.clj" <<'CLJ'
+(ns elib.core)
+(defmacro named-fn [] (deref #'clojure.core/memfn))
+(defn mk-adder [n] (fn [x] (+ x n)))
+(defmacro anon-fn [] (mk-adder 7))
+(def a (named-fn))
+(def b (anon-fn))
+CLJ
+erun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_e" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'elib/elib {:local/root \"$elib\"}}})
+    (require 'elib.core)
+    (println :embedded (fn? elib.core/a) (elib.core/b 35))" 2>&1
+}
+cache_e="$(mktemp -d)"
+e_cold="$(erun || true)"
+e_warm="$(erun || true)"
+if echo "$e_cold" | grep -q ':embedded true 42' \
+   && echo "$e_warm" | grep -q ':embedded true 42' \
+   && echo "$e_warm" | grep -q 'hit elib.core'; then
+  echo "PASS: (w) an embedded live value round-trips through the fasl"; pass=$((pass+1))
+else
+  echo "FAIL: (w) cold=$(echo "$e_cold" | grep -c ':embedded true 42') warm=$(echo "$e_warm" | grep -c ':embedded true 42') hit=$(echo "$e_warm" | grep -c 'hit elib.core')"
+  echo "$e_warm" | tail -4 | sed 's/^/    /'
+  fails=$((fails+1))
+fi
+rm -rf "$cache_e" "$elib"
 
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.

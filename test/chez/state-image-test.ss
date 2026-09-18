@@ -10,9 +10,13 @@
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
 ;; gate-boot's optimized profile compiles with generate-inspector-information off,
-;; which suppresses the closure free-var info free-value recovery needs
-;; ((io 'ref i) reports nothing); the release runtime has it ON, so turn it back
-;; on here — only code compiled after this point (the fixture evals) is affected.
+;; which suppresses the closure free-var NAMES ((io 'ref i) reports nothing).
+;; The runtime half of a built binary never generates it either (build.ss
+;; bld-runtime-chez-params) — a closure's capture layout comes from its maker
+;; (image-fn-form-maker!), which is what the fnsrc rows below exercise. A
+;; release build's APP half still has it on, and it is turned on here so the
+;; fixture evals that read names directly through the inspector see what that
+;; half sees; only code compiled after this point is affected.
 (generate-inspector-information #t)
 
 (define total 0) (define fails 0)
@@ -92,6 +96,188 @@
 (rt "double"      "[1.5 -0.0]"                     "[1.5 -0.0]")
 (rt "empty colls" "[[] {} #{} ()]"                 "[[] {} #{} ()]")
 (rt "record"      "(do (defrecord P [x y]) (->P 1 2))" "#user.P{:x 1, :y 2}")
+
+(define (str-has? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((fx>? (fx+ i m) n) #f)
+            ((string=? (substring s i (fx+ i m)) sub) #t)
+            (else (loop (fx+ i 1)))))))
+(define (refusal-of expr)
+  (cleanup!)
+  (call/cc (lambda (k)
+    (with-exception-handler
+      (lambda (e) (k (if (jolt-ex-info-record? e)
+                         (jolt-ex-info-record-message e)
+                         (call/cc (lambda (k2)
+                           (with-exception-handler (lambda (_) (k2 "?"))
+                             (lambda () (condition->message-string e))))))))
+      (lambda ()
+        (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
+        "WROTE")))))
+
+;; A closure with no source to rebuild from. It used to be enough to reach for a
+;; core-tier one -- (partial + 1) -- because clojure.core's literals were never
+;; registered. They are now, so the fixture has to be a procedure that was never
+;; ANALYZED at all: one this test makes in Scheme and hands to a var.
+;; Held INSIDE a vector, not as the var's root: a var root is nameable, and a
+;; nameable procedure travels as its var's name. This one is reachable only as
+;; data, so nothing can name it. Variadic, since it stands in for a watch fn and
+;; a map fn alike.
+(def-var! "user" "raw-holder"
+  (jolt-vector (lambda args (if (null? args) jolt-nil (car args)))))
+
+;; --- the value-kind matrix: restored values must still WORK ---------------------
+;; `rt` above compares printed forms, which settles a value type. It settles
+;; nothing for a value whose identity IS its meaning: = is identity for an atom, a
+;; delay, a regex, an array and a StringBuilder, so a restored one can print
+;; correctly and be dead. These rows bind the restored value and USE it.
+;;
+;; Every kind here round-trips today and none of it was pinned; probing the
+;; language kind by kind is what found the gaps the rest of this epic closes
+;; (jolt-1vfl).
+(define (rtu name expr probe expect)
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
+  (def-var! "user" "$rt"
+    (jolt-compile-eval (string-append "(jolt.host/image-read \"" tmp "\")") "user"))
+  (is name (string-append "(pr-str " probe ")") expect))
+
+;; reference types — restored, they must still deref, mutate and settle
+(rtu "atom"        "(atom {:a 1})"
+     "[(deref $rt) (do (swap! $rt assoc :b 2) (deref $rt))]" "[{:a 1} {:a 1, :b 2}]")
+(rtu "volatile"    "(volatile! 1)"
+     "[(deref $rt) (do (vreset! $rt 9) (deref $rt))]"        "[1 9]")
+(rtu "delay unforced" "(delay (+ 1 2))"
+     "[(realized? $rt) (deref $rt) (realized? $rt)]"         "[false 3 true]")
+(rtu "delay forced"   "(let [d (delay (+ 1 2))] @d d)"
+     "[(realized? $rt) (deref $rt)]"                         "[true 3]")
+
+;; NOT here: promise, future, agent, and a realized lazy seq. Each carries OS
+;; synchronisation state that the image copies as data, so what comes back holds
+;; dead primitives (jolt-ojoh). They get pinned with that fix, not before —
+;; a passing row here would enshrine the bug.
+
+;; seq kinds
+
+;; literals whose printed form is not the whole story
+(rtu "regex"       "#\"a+b\""
+     "[(str $rt) (re-find $rt \"xaabz\")]"                   "[\"a+b\" \"aab\"]")
+;; a USED regex holds its compiled engine (procedures) in its irx-cell; the
+;; image writes the source alone and the restored one recompiles on use. It
+;; used to refuse: "cannot write #<procedure> at irx-cell -> 3".
+(rtu "regex used"  "(let [r #\"a(b+)\"] (re-find r \"xabbz\") r)"
+     "[(str $rt) (re-find $rt \"xabbz\")]"                  "[\"a(b+)\" [\"abb\" \"bb\"]]")
+(rtu "regex compiled with flags"
+     "(let [r (java.util.regex.Pattern/compile \"^x\" java.util.regex.Pattern/MULTILINE)] (re-find r \"y\\nx\") r)"
+     "[(re-find $rt \"y\\nx\") (.flags $rt)]"               "[\"x\" 8]")
+(rtu "class token" "String"     "[(str $rt) (instance? $rt \"x\")]"
+     "[\"class java.lang.String\" true]")
+(rtu "File"        "(java.io.File. \"/tmp\")"
+     "[(.getPath $rt) (.isDirectory $rt)]"                   "[\"/tmp\" true]")
+
+;; arrays and StringBuilder are mutable host objects: contents, and still writable
+(rtu "byte-array"   "(byte-array [1 2 3])"      "(vec $rt)"  "[1 2 3]")
+(rtu "double-array" "(double-array [1.0 2.5])"  "(vec $rt)"  "[1.0 2.5]")
+(rtu "object-array" "(object-array [1 :a])"     "(vec $rt)"  "[1 :a]")
+;; one per BACKING: a byte array is a bytevector, an int/long array an fxvector,
+;; and a long array that outgrew the fixnum range a boxed vector — each is a
+;; different fasl object, and each has to come back both readable and writable.
+(rtu "int-array"    "(int-array [1 2 3])"       "(do (aset $rt 0 9) (vec $rt))" "[9 2 3]")
+(rtu "long-array"   "(long-array [1 2])"        "(do (aset $rt 1 7) (vec $rt))" "[1 7]")
+(rtu "widened long-array" "(doto (long-array 2) (aset 0 Long/MAX_VALUE))"
+     "(do (aset $rt 1 3) (vec $rt))"                         "[9223372036854775807 3]")
+(rtu "byte-array is writable" "(byte-array 2)"
+     "(do (aset $rt 0 200) (vec $rt))"                       "[-56 0]")
+(rtu "StringBuilder" "(StringBuilder. \"ab\")"
+     "(do (.append $rt \"c\") (str $rt))"                    "\"abc\"")
+
+;; --- lazy sequences built by clojure.core (jolt-a6k2) --------------------------
+;; A lazy seq whose thunk is a jolt `lazy-seq` form already travels: the thunk is
+;; an ordinary fn literal, so it registers and rebuilds like any closure, and the
+;; restored seq is still lazy (an infinite one keeps generating). What did not
+;; travel is a thunk clojure.core built -- map/filter/range/take/rest/cons build
+;; theirs as Chez lambdas in seq.ss, runtime Scheme with no source form -- and
+;; ONE core call anywhere in a chain poisoned the whole thing.
+(ev "(defn img-nat [n] (lazy-seq (cons n (img-nat (inc n)))))")
+
+(rtu "core map, unrealized"  "(map inc [1 2 3])"       "(vec $rt)"  "[2 3 4]")
+(rtu "core filter"           "(filter odd? [1 2 3 4])" "(vec $rt)"  "[1 3]")
+(rtu "core range"            "(range 3)"               "(vec $rt)"  "[0 1 2]")
+(rtu "rest of a user lazy"   "(rest (img-nat 0))"      "(vec (take 3 $rt))" "[1 2 3]")
+(rtu "core map over a user lazy" "(map inc (img-nat 0))" "(vec (take 3 $rt))" "[1 2 3]")
+(rtu "take of a user lazy"   "(take 3 (img-nat 0))"    "(vec $rt)"  "[0 1 2]")
+(rtu "cons onto a user lazy" "(cons 9 (img-nat 0))"    "(vec (take 3 $rt))" "[9 0 1]")
+
+;; and the point of carrying it as a producer rather than forcing it at dump: the
+;; restored seq is STILL LAZY. Forcing would both hang on an infinite seq and
+;; move when the side effect runs.
+(ev "(def img-lazy-count (atom 0))")
+(rtu "a restored core lazy seq is still lazy"
+     "(map (fn [x] (swap! img-lazy-count inc) x) [1 2 3])"
+     "[(deref img-lazy-count) (vec $rt) (deref img-lazy-count)]"
+     "[0 [1 2 3] 3]")
+
+;; ...and a chain already walked PART-WAY. Its unforced frontier is a per-element
+;; cell rather than the producer that built it, so these needed every cseq tail
+;; to carry a descriptor too, not just the producer entry points (jolt-0u7m).
+(rtu "map walked part-way"
+     "(let [s (map inc (range 100))] (first s) s)"
+     "(vec (take 4 $rt))"                                    "[1 2 3 4]")
+(rtu "rest of a core map"    "(rest (map inc [1 2 3]))" "(vec $rt)" "[3 4]")
+(rtu "filter walked part-way"
+     "(let [s (filter odd? (range 100))] (first s) s)"
+     "(vec (take 3 $rt))"                                    "[1 3 5]")
+(rtu "infinite iterate walked"
+     "(let [s (iterate inc 0)] (first s) (rest s))"
+     "(vec (take 3 $rt))"                                    "[1 2 3]")
+;; cycle and repeat are clojure.core OVERLAY fns -- their thunk is a fn literal in
+;; clojure.core. Those used to be unregisterable, so anything built from one
+;; refused; core's literals register now and they travel like any other.
+(rtu "cycle"    "(cycle [1 2])"   "(vec (take 5 $rt))"  "[1 2 1 2 1]")
+(rtu "repeat"   "(repeat :z)"     "(vec (take 3 $rt))"  "[:z :z :z]")
+(rtu "repeatedly" "(repeatedly (fn [] 7))" "(vec (take 2 $rt))" "[7 7]")
+(rtu "map-indexed" "(map-indexed (fn [i x] [i x]) [:a :b])"
+     "(vec (map vec $rt))"                              "[[0 :a] [1 :b]]")
+(rtu "distinct" "(distinct [1 1 2])" "(vec $rt)"        "[1 2]")
+(rtu "partial"  "(partial + 10)"  "($rt 5)"             "15")
+(rtu "comp"     "(comp inc inc)"  "($rt 1)"             "3")
+(rtu "memoize"  "(memoize (fn [x] (* x 2)))" "[($rt 4) ($rt 4)]" "[8 8]")
+
+;; ...and an infinite seq that genuinely CANNOT be written still terminates a
+;; scan: describing a finding used to print the object, which forces it.
+(ok "scanning an INFINITE unwritable seq terminates"
+    ;; unwritable because the producer captured a closure with no source, and
+    ;; infinite because (range) is -- so a describe that PRINTED it would hang
+    (= 1 (jolt-count (jolt-compile-eval
+                       "(jolt.host/image-scan (map (first raw-holder) (range)))"
+                       "user"))))
+
+(rtu "cons onto vec" "(cons 1 [2 3])"          "(vec $rt)"   "[1 2 3]")
+(rtu "PersistentQueue"
+     "(conj clojure.lang.PersistentQueue/EMPTY 1 2)"
+     "[(vec $rt) (peek $rt)]"                                "[[1 2] 1]")
+(rtu "subvec"      "(subvec [1 2 3 4] 1 3)"    "(vec $rt)"   "[2 3]")
+(rtu "sorted-set-by" "(sorted-set-by > 1 3 2)"
+     "[(vec $rt) (vec (conj $rt 4))]"                        "[[3 2 1] [4 3 2 1]]")
+
+;; scalars and literals the printed-form rows above do not reach
+(rtu "bigdec"      "1.5M"        "[(pr-str $rt) (decimal? $rt)]" "[\"1.5M\" true]")
+(rtu "NaN and Inf" "[##NaN ##Inf ##-Inf]"
+     "[(Double/isNaN (nth $rt 0)) (nth $rt 1) (nth $rt 2)]"  "[true ##Inf ##-Inf]")
+(rtu "inst"        "#inst \"2020-01-01T00:00:00.000-00:00\""
+     "[(inst? $rt) (inst-ms $rt)]"                           "[true 1577836800000]")
+(rtu "uuid"        "#uuid \"00000000-0000-0000-0000-000000000001\""
+     "[(uuid? $rt) (str $rt)]"
+     "[true \"00000000-0000-0000-0000-000000000001\"]")
+(rtu "tagged-literal" "(tagged-literal 'x 1)"
+     "[(:tag $rt) (:form $rt)]"                              "[x 1]")
+(rtu "qualified symbol" "'foo.bar/baz"
+     "[(namespace $rt) (name $rt)]"                          "[\"foo.bar\" \"baz\"]")
+
+;; a var travels by NAME and comes back as the live var, not a copy
+(rtu "var"         "(do (def rt-data-var {:a 1}) #'rt-data-var)"
+     "[(deref $rt) (= $rt #'rt-data-var)]"                   "[{:a 1} true]")
 
 ;; --- R4: sorted maps and sets travel -------------------------------------------
 ;; The wrapper's internal comparator machinery (a wrapped comparator closure + an
@@ -235,9 +421,9 @@
       "[2 true]")
   (cleanup!))
 ;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
-;; fn — (comp - compare) is a real core-tier closure with no registration
+;; fn — (first raw-holder) is a real core-tier closure with no registration
 (is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"
-    (string-append "(let [f (jolt.host/image-scan (sorted-map-by (comp - compare) :b 2 :a 1))]"
+    (string-append "(let [f (jolt.host/image-scan (sorted-map-by (first raw-holder) :b 2 :a 1))]"
                    " (vector (count f) (boolean (re-find #\"cmp-fn\" (str (:path (first f)))))))")
     "[1 true]")
 
@@ -289,11 +475,11 @@
 ;; a closure with no source registration to write -> refused, with the path to
 ;; it (a core-tier closure like partial's is never jfn$-registered)
 (is "unregistered closure is refused"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) :no-throw"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (first raw-holder)}}) :no-throw"
                    " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
     ":refused")
 (is "refusal names the path"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) \"\""
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (first raw-holder)}}) \"\""
                    " (catch Exception e (if (re-find #\":handlers\" (ex-message e)) :has-path :no-path)))")
     ":has-path")
 
@@ -307,9 +493,9 @@
 (is "scan is empty for a registered anon fn"
     "(count (jolt.host/image-scan user/scn))" "0")
 (is "scan reports an unregistered closure"
-    "(count (jolt.host/image-scan {:p (partial + 1)}))" "1")
+    "(count (jolt.host/image-scan {:p (first raw-holder)}))" "1")
 (is "scan reports a path"
-    "(-> (jolt.host/image-scan {:outer {:p (partial + 1)}}) first :path string? )" "true")
+    "(-> (jolt.host/image-scan {:outer {:p (first raw-holder)}}) first :path string? )" "true")
 (is "scan is empty for a named fn"
     "(count (jolt.host/image-scan {:f inc}))" "0")
 
@@ -478,7 +664,7 @@
            (null? (cdr ws))))
   (ok "watch key preserved" (eq? (car (car ws)) (keyword #f "w"))))
 (ev "(def wb (atom 0))")
-(ev "(add-watch user/wb :w (partial + 1))")
+(ev "(add-watch user/wb :w (first raw-holder))")
 (is "scan reports an unregistered watch"
     "(count (jolt.host/image-scan user/wb))" "1")
 (is "dump refuses an unregistered watch"
@@ -486,17 +672,17 @@
                    " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
     ":refused")
 
-;; metadata rides to the substituted object: the write side copies the meta
-;; table entry across the transform memo, so collect-meta keys the copy
+;; metadata rides to the substituted object: the write side installs the meta
+;; in the substituted map's own slot, so the sidecar carries nothing for it
 (ev "(def mm (with-meta {:f (fn [x] x)} {:m 1}))")
 (ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mm)"))
 (let* ((b (image-body tmp))
        (g (vector-ref b 0))
        (meta-alist (vector-ref b 1)))
   (ok "the substituted map is a fresh object" (not (eq? g (var-deref "user" "mm"))))
-  (ok "meta rides keyed by the substituted map"
-      (let ((e (assq g meta-alist)))
-        (and e (= 1 (jolt-get (cdr e) (keyword #f "m") jolt-nil))))))
+  (ok "meta rides in the substituted map's slot"
+      (= 1 (jolt-get (pmap-meta g) (keyword #f "m") jolt-nil)))
+  (ok "the sidecar carries no collection meta" (not (assq g meta-alist))))
 
 ;; handlers claim at any depth (not just var roots), procedures and resources
 (ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (= (:res-id x) 7))) (fn [x] {:claimed (:res-id x)}) (fn [d] d))")
@@ -511,6 +697,136 @@
   (ok "handler payload rides in the body"
       (= 7 (jolt-get (image-handled-payload (car handled)) (keyword #f "claimed") jolt-nil))))
 
+
+;; --- no synchronisation primitive may travel (jolt-ojoh) -----------------------
+;; A record carrying a mutex or condition variable has to be rebuilt through the
+;; LIVE constructor on the way out, the way walk-atom and walk-ref already are.
+;; Copying one as data produces an object whose primitives are not live kernel
+;; objects: an uncontended acquire on the copy happens to succeed, so the damage
+;; does not show until something actually waits, and then it is
+;;
+;;   Exception in mutex-acquire: failed: Invalid argument
+;;
+;; which names nothing and takes the process with it. That is why this is
+;; asserted STRUCTURALLY, on the written file, and not by using the restored
+;; object: a probe that acquires the copy passes, and a probe that contends for
+;; it is a race. The contract is simply that no such primitive is in the image.
+(define (sync-prims-in path)
+  (let ((acc '()))
+    (image-walk (image-graph path)
+                (lambda (x p) (when (mutex? x) (set! acc (cons (image-path->string p) acc)))))
+    acc))
+
+;; These run AFTER a thread has been forked, because that is what populates the
+;; per-node locks on a lazy cell and a lazily-tailed seq -- single-threaded, the
+;; lock field stays #f and the bug is invisible.
+(ev "(deref (future 1))")
+(ok "the runtime is on its multi-threaded path" jolt-mt?)
+
+(define (no-sync name expr)
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
+  (let ((found (sync-prims-in tmp)))
+    (set! total (+ total 1))
+    (unless (null? found)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a wrote ~a mutex(es), at: ~a\n" name (length found) found))))
+
+(no-sync "an undelivered promise"  "(promise)")
+(no-sync "a delivered promise"     "(let [p (promise)] (deliver p 5) p)")
+(no-sync "a completed future"      "(let [f (future 5)] @f f)")
+(no-sync "an agent"                "(agent 1)")
+(no-sync "a lazy seq forced multi-threaded" "(doall (map inc [1 2 3]))")
+(no-sync "a lazily-tailed seq"     "(doall (take 2 (iterate inc 0)))")
+(no-sync "a promise inside app state" "{:pending (promise) :xs [1 2]}")
+
+;; An image written BEFORE this fix (format 5 and older) has a raw mutex in it,
+;; and there is nothing to be done about the file -- but the restore walk can
+;; hand back a live primitive instead of the dead copy. Driven through the walk
+;; directly, since the checked-in old-format fixtures predate agents/promises.
+;; --- execution does not travel (jolt-ojoh) --------------------------------------
+;; The two records whose own state says a thread is mid-flight. Both used to
+;; restore SILENTLY WEDGED, which is worse than the dead-primitive bug above: a
+;; restored running future never completes, so deref hangs forever, and a
+;; restored agent that believes it has a busy worker queues every later send
+;; behind nothing.
+
+;; sleeps far longer than the gate takes, so it is still running when written --
+;; no window to get wrong, since the row only needs "not done yet"
+(ok "a running future is refused, and the message says why"
+    (str-has? (refusal-of "(future (Thread/sleep 300000))") "carries state, not execution"))
+(is "a running future scans as unwritable"
+    "(count (jolt.host/image-scan (future (Thread/sleep 300000))))" "1")
+(is "a completed future still travels"
+    "(count (jolt.host/image-scan (let [f (future 5)] @f f)))" "0")
+
+;; the wedged agent state is built directly rather than by racing a real send:
+;; the row is about the invariant, not about how fast this machine runs an action
+(let ((a (jolt-compile-eval "(agent 7)" "user")))
+  (jolt-agent-running?-set! a #t)
+  (jolt-agent-queue-set! a (vector '() (list 'pending-action)))
+  (def-var! "user" "$ag" a)
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\" $ag)"))
+  (let ((r (jolt-compile-eval (string-append "(jolt.host/image-read \"" tmp "\")") "user")))
+    (def-var! "user" "$agr" r)
+    (ok "a restored agent has no phantom worker" (not (jolt-agent-running? r)))
+    (ok "a restored agent has an empty queue"
+        (let ((q (jolt-agent-queue r)))
+          (and (null? (vector-ref q 0)) (null? (vector-ref q 1)))))
+    (is "a restored agent keeps its state and still takes work"
+        "(do (send $agr inc) (await-for 5000 $agr) (deref $agr))" "8")))
+
+;; --- code a var roots travels as the var's NAME (jolt-2cny) --------------------
+;; A named fn already did. A multimethod and a reify are code too, but they are
+;; RECORDS, so `procedure?` missed them, nothing recorded their var name, and the
+;; walk descended into a multifn's dispatch tables and refused at a raw hashtable
+;; the user could do nothing about. They restore as the LIVE object, not a copy.
+(ev "(defmulti sim-mm (fn [x] x)) (defmethod sim-mm :a [_] :got-a) (defmethod sim-mm :default [_] :dflt)")
+(ev "(defprotocol SimP (sim-px [x])) (def sim-rfy (reify SimP (sim-px [_] :from-reify)))")
+(rtu "multimethod"  "sim-mm"
+     "[($rt :a) ($rt :zz) (identical? $rt sim-mm)]"          "[:got-a :dflt true]")
+(rtu "reify"        "sim-rfy"
+     "[(sim-px $rt) (identical? $rt sim-rfy)]"               "[:from-reify true]")
+(rtu "a multimethod inside app state" "{:handler sim-mm}"
+     "((:handler $rt) :a)"                                   ":got-a")
+(is "a multimethod scans clean" "(count (jolt.host/image-scan sim-mm))" "0")
+
+;; --- a namespace is interned, a transient is not written at all (jolt-ji1h) ----
+;; find-ns is identity-stable and a var round-trips to the identical var, so a
+;; namespace coming back as a SECOND `user` that merely = the live one was out of
+;; line with both. It travels by name now, like a keyword.
+(rtu "namespace" "(find-ns 'user)"
+     "[(identical? $rt (find-ns 'user)) (str (ns-name $rt))]"  "[true \"user\"]")
+;; A transient belongs to the thread that made it. A transient VECTOR used to be
+;; written silently while a transient MAP refused on its backing hashtable --
+;; both refuse now, saying what to do.
+(ok "a transient refuses, saying what to do"
+    (str-has? (refusal-of "(transient [1 2])") "persistent!"))
+(is "a transient map refuses too"
+    "(count (jolt.host/image-scan (transient {:a 1})))" "1")
+(is "persistent! is the way through"
+    "(count (jolt.host/image-scan (persistent! (transient [1 2]))))" "0")
+
+(ok "restore mints a live primitive over a raw one from an old image"
+    (let* ((dead (vector (make-mutex) (make-condition)))
+           (healed (let-values (((g _) (image-graph-process dead 'restore #f))) g)))
+      (and (mutex? (vector-ref healed 0))
+           (thread-condition? (vector-ref healed 1))
+           (not (eq? (vector-ref healed 0) (vector-ref dead 0)))
+           (not (eq? (vector-ref healed 1) (vector-ref dead 1))))))
+
+;; ...and the restored objects still have to WORK. These pass today by luck --
+;; an uncontended acquire on a dead mutex succeeds -- so they are here to hold
+;; the behaviour steady across the fix, not to prove the bug.
+(rtu "promise unkept" "(promise)"
+     "[(realized? $rt) (do (deliver $rt 42) (deref $rt))]"   "[false 42]")
+(rtu "promise kept"   "(let [p (promise)] (deliver p 5) p)"  "(deref $rt)" "5")
+(rtu "future"         "(let [f (future 5)] @f f)"            "(deref $rt)" "5")
+(rtu "agent"          "(agent 1)"
+     "(do (send $rt inc) (await-for 5000 $rt) (deref $rt))"  "2")
+(rtu "lazy realized"  "(doall (map inc [1 2 3]))"
+     "[(vec $rt) (str (type $rt))]"   "[[2 3 4] \"class clojure.lang.LazySeq\"]")
 
 ;; --- header / compatibility ------------------------------------------------------
 (is "reading a non-image fails with a clear message"
@@ -997,6 +1313,57 @@
 (is "v0.6.8 fixture: its fields read" "[(:a imgrec8/box) (:b imgrec8/box) (count imgrec8/box)]" "[1 two 2]")
 (is "v0.6.8 fixture: a deftype instance prints" "(pr-str imgrec8/pt)" "#imgrec8.Pt{:x 3, :y 4}")
 
+;; --- the same proof for the COLLECTION records and their metadata. Format 7
+;; carried a vector/map/set/list/lazy-seq/() as the slotless records
+;; (chez-pvec-v3, chez-pmap-v5, chez-pset-v2, chez-cseq-v6, jolt-lazyseq-v2,
+;; empty-list-v2) and every collection's meta in the sidecar; format 8 gives
+;; each record a meta slot. The legacy arms re-mint the records and carry the
+;; sidecar entry onto them. Fixture made by the 0.8.8-era build (format 7);
+;; permanent, like the two above.
+(ok "v0.8.8 collection-meta fixture present" (file-exists? "test/chez/fixtures/image-v0.8.8-coll-meta.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.8-coll-meta.image")
+(is "v0.8.8 fixture: imgmeta8/plain" "imgmeta8/plain" "7")
+(is "v0.8.8 fixture: every collection's meta arrives in the slot"
+    "[(meta imgmeta8/vm) (meta imgmeta8/mm) (meta imgmeta8/sm) (meta imgmeta8/lm) (meta imgmeta8/em) (meta imgmeta8/lsm) (meta imgmeta8/nm) (meta (:k imgmeta8/nm)) (meta imgmeta8/bigv) (meta imgmeta8/bigm) (meta (first (keys imgmeta8/mk))) (meta (first imgmeta8/smk)) (meta imgmeta8/bm)]"
+    "[{:m :vec} {:m :map} {:m :set} {:m :list} {:m :empty} {:m :lazy} {:outer 1} {:inner 1} {:m :big} {:m :bigm} {:m :key} {:m :elem} {:m :rec}]")
+(is "v0.8.8 fixture: the values themselves"
+    "[imgmeta8/vm imgmeta8/lm imgmeta8/em imgmeta8/lsm (count imgmeta8/bigv) (nth imgmeta8/bigv 39) (get imgmeta8/bigm 7) (get imgmeta8/mk [1]) (contains? imgmeta8/smk {:x 1}) (:a imgmeta8/bm)]"
+    "[[1 2] (1 2) () (1 2) 40 39 7 :v true 1]")
+(is "v0.8.8 fixture: collections without meta read nil"
+    "[(meta imgmeta8/pv) (meta imgmeta8/pm) (meta imgmeta8/ps) (meta imgmeta8/pl) (meta imgmeta8/pe) (meta imgmeta8/pls)]"
+    "[nil nil nil nil nil nil]")
+(is "v0.8.8 fixture: the re-minted records are the live kinds"
+    "[(vector? imgmeta8/vm) (map? imgmeta8/mm) (set? imgmeta8/sm) (list? imgmeta8/lm) (list? imgmeta8/em) (seq? imgmeta8/lsm) (realized? imgmeta8/lsm)]"
+    "[true true true true true true true]")
+(is "v0.8.8 fixture: ops on the restored collections still carry"
+    "[(meta (conj imgmeta8/vm 3)) (meta (assoc imgmeta8/mm :b 2)) (meta (disj imgmeta8/sm 1)) (meta (conj imgmeta8/lm 0)) (meta (conj imgmeta8/em 0))]"
+    "[{:m :vec} {:m :map} {:m :set} {:m :list} {:m :empty}]")
+
+;; a format-8 image carries collection meta in the record itself: nested and
+;; shared collections round-trip with their meta, and sharing survives.
+(is "collection meta rides the record: value round-trip"
+    (string-append
+      "(let [v (with-meta [1 2] {:m 1})"
+      "      m (with-meta {:a v} {:n 2})"
+      "      _ (jolt.host/image-write! \"" tmp "\" {:v v :m m :l (with-meta (list 1) {:l 3}) :s (with-meta #{v} {:s 4}) :e (with-meta () {:e 5}) :z (doall (with-meta (lazy-seq [7]) {:z 6}))})"
+      "      g (jolt.host/image-read \"" tmp "\")]"
+      "  [(meta (:v g)) (meta (:m g)) (meta (:a (:m g))) (meta (:l g)) (meta (:s g)) (meta (:e g)) (meta (:z g))"
+      "   (identical? (:v g) (:a (:m g))) (:z g) (meta (conj (:v g) 3))])")
+    "[{:m 1} {:n 2} {:m 1} {:l 3} {:s 4} {:e 5} {:z 6} true (7) {:m 1}]")
+
+;; a with-meta copy of a cell whose tail is still pending shares that tail
+;; through the original (natives-meta.ss coll-with-meta): the copy's tail is a
+;; `rest` descriptor over the original cell, so it dumps like any lazy cell and
+;; forces once on either side of the image
+(is "a with-meta copy of a cell with a pending tail dumps, restores, and forces once"
+    (string-append
+      "(let [s (seq (map inc (list 1 2 3)))"
+      "      t (with-meta s {:m 1})"
+      "      _ (jolt.host/image-write! \"" tmp "\" {:t t :s s})"
+      "      g (jolt.host/image-read \"" tmp "\")]"
+      "  [(meta (:t g)) (vec (:t g)) (vec (:s g)) (vec t) (vec s)])")
+    "[{:m 1} [2 3 4] [2 3 4] [2 3 4] [2 3 4]]")
+
 ;; --- refs travel by value (format 3, jolt-867l.11): descriptor on dump,
 ;; re-mint on restore. Value, meta, shared identity, cycles, and STM liveness
 ;; all survive; the raw jolt-ref record never enters the fasl, so its layout
@@ -1014,9 +1381,10 @@
       "   (identical? (:cyc g) (:self (deref (:cyc g))))"
       "   (do (dosync (ref-set (:a g) 100)) (deref (:a g)))])")
     "[99 :hot true true 100]")
-;; format discipline: the new image writes header version 5 (3 added ref
-;; descriptors, 4 added image-rekey, 5 the jrec hasheq slot), and its bytes
-;; carry the descriptor rtd, never the live ref rtd
+;; format discipline: the new image writes header version 8 (3 added ref
+;; descriptors, 4 added image-rekey, 5 the jrec hasheq slot, 6 the image-sync
+;; marker, 7 the flat array-map record, 8 the collection meta slot), and its
+;; bytes carry the descriptor rtd, never the live ref rtd
 (define (bv-contains? bv s)
   (let* ((sb (string->utf8 s)) (m (bytevector-length sb)) (n (bytevector-length bv)))
     (let scan ((i 0))
@@ -1026,12 +1394,12 @@
                    (and (fx=? (bytevector-u8-ref bv (fx+ i j)) (bytevector-u8-ref sb j))
                         (cmp (fx+ j 1))))) #t)
             (else (scan (fx+ i 1)))))))
-(ok "ref-carrying image is format 5 with no raw jolt-ref rtd"
+(ok "ref-carrying image is format 8 with no raw jolt-ref rtd"
     (let ((port (open-file-input-port tmp)))
       (let* ((h (fasl-read port))
              (rest (get-bytevector-all port)))
         (close-port port)
-        (and (fx=? 5 (vector-ref h 1))
+        (and (fx=? 8 (vector-ref h 1))
              (bv-contains? rest "image-ref")
              (not (bv-contains? rest "jolt-ref-v2"))))))
 ;; an unknown format version refuses with a clean error naming both versions
@@ -1045,6 +1413,41 @@
 
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))
+
+;; --- the API surface (jolt-hnlk) ----------------------------------------------
+;; The handler READ side had no coverage at all: the existing handler test writes
+;; and inspects the graph, and never restores through image-restore-handler. So
+;; the restore-fn running, the first-accepting-wins order, and a restore-fn that
+;; THROWS falling through to the next -- the contract register-handler!'s own
+;; docstring states -- were unasserted.
+(ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (:res2 x))) (fn [x] {:tag :second}) (fn [d] (if (= (:tag d) :second) {:restored :by-second} (throw (ex-info \"not mine\" {})))))")
+;; registered LAST, so it is tried FIRST and must decline by throwing
+(ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (:res2 x))) (fn [x] {:tag :second}) (fn [d] (throw (ex-info \"never mine\" {}))))")
+(rtu "a handler's restore-fn runs" "{:r {:res2 true}}"
+     "(:restored (:r $rt))"                                  ":by-second")
+
+;; dump-world! takes an explicit namespace list, and {:unwritable :fail} restores
+;; dump!'s strictness where the default stubs.
+(ev "(in-ns 'apiworld) (def api-data {:a 1}) (in-ns 'user)")
+(def-var! "apiworld" "api-port"
+  (open-file-output-port (string-append tmp ".api-probe.txt") (file-options no-fail)))
+(is "dump-world! of a named ns writes it"
+    (string-append "(do (jolt.host/image-dump-world! \"" tmp "\" [\"apiworld\"]) "
+                   " (jolt.host/image-restore-world! \"" tmp "\"))")
+    "2")
+;; NOT covered here: dump-world! {:unwritable :fail}. It walks whole namespaces,
+;; and by this point in the file enough handlers and resolvers are registered that
+;; the default stubs NOTHING -- so a row asserting ":fail refuses where the default
+;; stubs" asserts nothing at all. Verified by hand instead (jolt-hnlk).
+
+;; a resolver spec may be a KIND STRING rather than a predicate; only the
+;; predicate form was covered. Asserted on the matcher directly, because
+;; resolvers are global and registration order decides which one claims a stub.
+(ok "a resolver spec given as a kind string matches that kind"
+    (and (image-stub-resolver-match ":object"
+           (jolt-hash-map (jolt-keyword "kind") ":object"))
+         (not (image-stub-resolver-match ":port"
+                (jolt-hash-map (jolt-keyword "kind") ":object")))))
 
 (printf "~a/~a state-image assertions passed\n" (- total fails) total)
 (when (> fails 0) (exit 1))

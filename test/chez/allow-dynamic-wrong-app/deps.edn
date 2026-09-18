@@ -1,0 +1,3 @@
+{:paths ["src"]
+ ;; a WRONG vouch: dynaload's computed require runs on every path -main takes
+ :jolt/tree-shake {:allow-dynamic [app.core/dynaload]}}

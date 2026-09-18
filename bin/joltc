@@ -1,3 +1,13 @@
 #!/bin/sh
 # joltc — compatibility shim; the launcher is bin/jolt now.
-exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/jolt" "$@"
+# $0 may be a symlink, and the launcher is a sibling of the REAL file, not of the
+# link — see bin/jolt, which resolves its own the same way.
+target="$0"
+while [ -L "$target" ]; do
+  link="$(readlink "$target")"
+  case "$link" in
+    /*) target="$link" ;;
+    *)  target="$(CDPATH= cd -- "$(dirname -- "$target")" && pwd)/$link" ;;
+  esac
+done
+exec "$(CDPATH= cd -- "$(dirname -- "$target")" && pwd)/jolt" "$@"

@@ -49,6 +49,14 @@
 ;;   - a defrecord caches its structural hash in the slot (the __hasheq field);
 ;;     a plain deftype caches its identity hash there (Object.hashCode), each
 ;;     paired with the matching equality above so the hash/eq contract holds.
+;;
+;; The slot is the cache because the jrec LAYOUT is image-format surface — adding
+;; a field means bumping every family tag — so there is nowhere else to put it.
+;; A type with a declared hasheq/hashCode never fills it. The write is a plain
+;; fixnum store with no lock: racing writers compute the same value (a structural
+;; hash is deterministic, and the identity table answers one id per object), so a
+;; double store is benign. The slot never travels — the image dump starts it
+;; unset (state-image.ss), the way the JVM marks __hasheq transient.
 (define (jrec-hasheq-slow x)
   (cond ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
         ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
@@ -136,7 +144,27 @@
             ;; rest because it is asked on the EQUALITY path — every (= record x)
             ;; consults it for both operands — and answering it from the protocol
             ;; table meant a mutex and a key-vector allocation per comparison.
-            (and (not record?) (tag-declares-sequential? tag)))))
+            (and (not record?) (tag-declares-sequential? tag))
+            ;; slot 6: a bare deftype's DECLARED ILookup, as (3-arity . 2-arity);
+            ;; either half may be #f. The JVM gives a bare deftype no key lookup
+            ;; of its own, so a declared valAt IS the lookup and answers for
+            ;; every key — a field-named one included, which is the whole point
+            ;; when the slot holds something valAt is there to transform
+            ;; (typed.clojure keeps a lazy thunk in one and forces it here).
+            ;; A defrecord keeps its generated field-first lookup: the JVM will
+            ;; not compile one that declares another valAt.
+            ;; Derived here, so the get path pays the vector-ref it already pays
+            ;; for the flags above rather than two string hashes per lookup.
+            (and (not record?)
+                 (let ((m3 (find-method-any-protocol-arity tag "valAt" 3))
+                       (m2 (find-method-any-protocol-arity tag "valAt" 2)))
+                   ;; -arity falls back to ANY same-named impl when no arity
+                   ;; matches, so each half is confirmed against the procedure
+                   ;; before it is kept — a type declaring only (valAt [_ k])
+                   ;; must not be called with a not-found argument.
+                   (let ((m3 (and m3 (proc-accepts? m3 3) m3))
+                         (m2 (and m2 (proc-accepts? m2 2) m2)))
+                     (and (or m3 m2) (cons m3 m2))))))))
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x))
          (c (jrdesc-ifc d)))
@@ -394,8 +422,32 @@
   (lambda (x) (jrec-charseq->seq x (jrec-charseq-length-method x) (jrec-cl x "charAt"))))
 (register-seq-arm! jrec-record?
   (lambda (x) (list->cseq (jrec-entry-list x))))
+;; A deftype that IS a seq (clojure.lang.ISeq: its seq method answers itself)
+;; walks through its own first and next into a lazy cseq — nil from next ends
+;; it, and a `more` without a `next` ends on an empty rest. Re-asking the
+;; answer for its seq, as the general arm below does, would ask forever; and
+;; only the cseq shape gives count/nth/reduce and the printer their walk.
+(define (jrec-iseq->cseq x)
+  (let ((first-m (jrec-cl x "first"))
+        (next-m (jrec-cl x "next"))
+        (more-m (jrec-cl x "more")))
+    (define (step s)
+      (jolt-make-lazy-seq
+        (lambda ()
+          (let ((tail (cond (next-m (jolt-invoke next-m s))
+                            (more-m (let ((r (jolt-invoke more-m s)))
+                                      (if (jolt-nil? (jolt-seq r)) jolt-nil r)))
+                            (else jolt-nil))))
+            (jolt-cons (jolt-invoke first-m s)
+                       (if (jolt-nil? tail) jolt-nil
+                           (if (and (jrec? tail) (eq? (jrec-tag tail) (jrec-tag x)))
+                               (step tail)
+                               (jolt-seq tail))))))))
+    (if first-m (jolt-seq (step x)) (jrec-abstract-method-error x "first"))))
 (register-seq-arm! (lambda (x) (jrec-cl x "seq"))
-  (lambda (x) (jolt-seq (jolt-invoke (jrec-cl x "seq") x))))
+  (lambda (x)
+    (let ((r (jolt-invoke (jrec-cl x "seq") x)))
+      (if (eq? r x) (jrec-iseq->cseq x) (jolt-seq r)))))
 (register-conj-arm! (lambda (coll) (jrec-cl coll "cons"))
   (lambda (coll x) (jolt-invoke (jrec-cl coll "cons") coll x)))
 ;; A plain defrecord (no IPersistentCollection.cons of its own) conjs a [k v] pair

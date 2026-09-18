@@ -352,6 +352,36 @@
   (let ((fs (jolt-cv-take-waiters! cv)))
     (unless (null? fs) (for-each sa-fiber-resume fs))))
 
+;; (jolt-cv-signal-one! cv) — wake exactly ONE thread waiting on cv, with mu held.
+;;
+;; The narrow counterpart of jolt-cv-wake!, for a condition that carries a QUEUE of
+;; interchangeable items to a crowd of interchangeable waiters: one item arrives,
+;; one waiter can take it, and any of them will do. The executor's task condition is
+;; that and is the only one in the runtime (java/concurrency.ss).
+;;
+;; The two preconditions, both of which that condition meets and neither of which
+;; the caller can be trusted to remember, so they are stated where the call is:
+;;
+;;   NO FIBER MAY WAIT ON cv. There is no fiber half here — a parked fiber lives in
+;;   a table this does not read, so signalling would leave it parked. The executor's
+;;   workers are threads, and jolt-condition-wait REFUSES on a fiber, so the pool
+;;   cannot acquire a fiber waiter by accident; the pool's other waiters (its
+;;   awaitTermination, which a fiber can reach) wait on a second condition of their
+;;   own and are woken with jolt-cv-wake!.
+;;
+;;   EVERY WAITER MUST WANT THE SAME THING. Broadcast is the default for the reason
+;;   given above — when the state is true for only one waiter, the waker cannot pick
+;;   which — and a signal here is right only because they are all waiting for "a
+;;   task, any task", so the one that wakes can always use what arrived.
+;;
+;; What it buys, measured on the pool it was written for: an enqueue used to
+;; broadcast, so a pool with 130 idle workers woke all 130 for one task, 129 of
+;; which took the queue mutex, found the task gone and parked again. Dispatching a
+;; no-op task cost 152us of that; signalling one took it to 8.9us, and the pool it
+;; needs for the same work from 134 threads to 7. Reference JVM Clojure dispatches
+;; the same task in 5.2us.
+(define (jolt-cv-signal-one! cv) (condition-signal cv))
+
 ;; Absolute epoch millis -> the absolute time object Chez's condition-wait wants.
 ;; Floored to an exact integer first: make-time will not take a flonum field, and a
 ;; deadline arriving as one is a caller's arithmetic, not something to trust.
@@ -388,24 +418,194 @@
       (sleep (ms->duration ms))))
 
 (define (jolt-cv-wait mu cv deadline decide)
+  (jolt-cv-wait/ibox mu cv deadline decide #f #f))
+
+;; The wait itself. ibox is the caller's interrupt box, or #f for a wait that is
+;; NOT interruptible — which is the default and what jolt-cv-wait above passes,
+;; because the runtime's own plumbing waits here too (the carrier idle wait, the
+;; load barrier, the main-queue pump, the tap queue, the channel internals) and
+;; interrupting any of those breaks the runtime rather than the caller's code.
+;; jolt-cv-wait-interruptibly at the bottom of this file is the opt-in door.
+;;
+;; The interrupt arm reads as a parameter rather than a wrapper around `decide`
+;; for a measured reason: a wrapper allocated a closure and a box on EVERY call,
+;; and most calls through here never wait at all — a deref of an already-delivered
+;; promise or a settled future runs decide once and returns. That cost a settled
+;; deref 1.15x against a 1.1x ceiling (release binary, A/B/A). Threaded through,
+;; the fast path is an `(if ibox ...)` that falls through (jolt-a0f1).
+(define (jolt-cv-wait/ibox mu cv deadline decide ibox who)
   ;; Registered OUTSIDE mu, and only for a fiber. Outside because the timer's
   ;; thunks run with timeout-mu released but registering takes it, so doing this
   ;; under mu would order mu above timeout-mu here and below it there.
   (when (and deadline (jolt-current-fiber))
     (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv)))))
-  (jolt-lock-wait mu
-    (lambda ()
-      (let loop ()
-        (let ((r (decide (and deadline (>= (now-millis) deadline)))))
-          (cond
-            ((not (eq? r jolt-cv-again)) r)
-            ((jolt-current-fiber)
-             => (lambda (f)
-                  (jolt-cv-register! cv f)
-                  (jolt-fiber-state-set! f 'parked)
-                  jolt-lock-parked))
-            (else
-             (if deadline
-                 (jolt-condition-wait cv mu (jolt-millis->time deadline))
-                 (jolt-condition-wait cv mu))
-             (loop))))))))
+  ;; The (mu . cv) this wait is findable by while it is willing to be interrupted,
+  ;; or #f. It lives OUT here and not inside the thunk below because jolt-lock-wait
+  ;; RETAKES that thunk when a parked fiber resumes: a loop-local would forget a
+  ;; registration the park had already made, and the entry would outlive the wait.
+  (let ((entry #f))
+    (jolt-lock-wait mu
+      (lambda ()
+        (let loop ()
+          ;; The flag FIRST, on every round. That ordering is what gives the
+          ;; already-set case for free — a thread whose flag is set when it calls a
+          ;; blocking op throws immediately and never waits, as on the JVM — and
+          ;; because the decision here is retaken rather than resumed into, the
+          ;; same check covers every wake for nothing extra. The read CLEARS, which
+          ;; is java.lang.Thread's own rule: "the interrupted status is cleared and
+          ;; an InterruptedException is thrown."
+          (when ibox
+            (when (unbox ibox)
+              (set-box! ibox #f)
+              (when entry (jolt-interrupt-wait-remove! ibox entry) (set! entry #f))
+              (jolt-interrupted-throw! who)))
+          (let ((r (if entry
+                       ;; REGISTERED. decide throws on its own account (a failed
+                       ;; agent is the live case), so that exit has to deregister
+                       ;; too, or the entry outlives the wait and a later interrupt
+                       ;; pokes a condition nobody is on.
+                       ;;
+                       ;; with-exception-handler and not guard, for java/sm.ss's
+                       ;; reason: the handler runs AT THE RAISE POINT, so
+                       ;; jolt-throw's captured continuation and site still describe
+                       ;; where the throw came from. A guard would unwind first and
+                       ;; the report would name this wait instead.
+                       (with-exception-handler
+                         (lambda (e) (jolt-interrupt-wait-remove! ibox entry) (raise-continuable e))
+                         (lambda () (decide (and deadline (>= (now-millis) deadline)))))
+                       ;; NOT REGISTERED — nothing to clean up, so decide runs with
+                       ;; nothing wrapped around it. This is the arm every
+                       ;; non-interruptible wait takes, and the one a wait that
+                       ;; answers on its first run takes.
+                       (decide (and deadline (>= (now-millis) deadline))))))
+            (cond
+              ((not (eq? r jolt-cv-again))
+               (when entry (jolt-interrupt-wait-remove! ibox entry) (set! entry #f))
+               r)
+              (else
+               ;; About to wait for the first time: become findable, then RE-READ
+               ;; the flag. The window between the read at the top and this
+               ;; registration is exactly what the second read closes — the
+               ;; interrupter sets the flag BEFORE it reads the registry, so either
+               ;; it found us, and its wake is already on its way to a mutex we
+               ;; still hold, or it did not and its flag is set for this read.
+               (when (and ibox (not entry))
+                 (let ((e (cons mu cv)))
+                   (set! entry e)
+                   (jolt-interrupt-wait-add! ibox e)
+                   (when (unbox ibox)
+                     (set-box! ibox #f)
+                     (jolt-interrupt-wait-remove! ibox e)
+                     (set! entry #f)
+                     (jolt-interrupted-throw! who))))
+               (cond
+                 ((jolt-current-fiber)
+                  => (lambda (f)
+                       (jolt-cv-register! cv f)
+                       (jolt-fiber-state-set! f 'parked)
+                       jolt-lock-parked))
+                 (else
+                  (if deadline
+                      (jolt-condition-wait cv mu (jolt-millis->time deadline))
+                      (jolt-condition-wait cv mu))
+                  (loop)))))))))))
+
+;; --- interruptible waiting --------------------------------------------------
+;; (jolt-cv-wait-interruptibly who mu cv deadline decide)
+;;
+;; jolt-cv-wait with one thing added: a thread parked in it is thrown out by
+;; .interrupt, the way every interruptible wait on the JVM is. It is the OPT-IN
+;; door onto jolt-cv-wait/ibox above; jolt-cv-wait passes #f and stays exactly as
+;; uninterruptible as it was, because the runtime's own plumbing waits through the
+;; same seam — the carrier idle wait, the load barrier, the main-queue pump, the
+;; tap queue, the channel internals — and interrupting any of those breaks the
+;; runtime rather than the caller's code. The interruptible sites are the ones a
+;; JVM caller can already name: promise and future deref, agent await,
+;; Thread.join, Thread.sleep, CountDownLatch.await, a task Future's get, a
+;; blocking queue take/put, awaitTermination, waitFor.
+;;
+;; TWO PIECES, and only the second one is new work. The first is that the wait
+;; RETAKES its decision on every wake rather than resuming into it, so one check
+;; at the top of the loop covers every wake and needs no second wait protocol.
+;;
+;; The second is that the interrupter has to WAKE a waiter blocked on a condition
+;; variable it has never heard of. It cannot know which future or latch its target
+;; happens to be sitting on, so the waiter says: it registers its (mu . cv) against
+;; its own interrupt identity for as long as it is willing to wait, and .interrupt
+;; sets the flag and then pokes every condition registered against that identity.
+;;
+;; WHY THE RACE CLOSES, and it closes for a reason worth not breaking. The whole
+;; loop above runs with mu HELD — decide is called under it — and the interrupter takes
+;; mu to wake (jolt-cv-wake! is documented "call with mu HELD"). So an interrupt
+;; cannot land in the gap between deciding to wait and actually parking. The one
+;; remaining window is between the check and the registration, and the re-check
+;; after registering is what closes it: the interrupter sets the flag BEFORE it
+;; reads the registry, so either it read us — and its wake is already on its way to
+;; a mutex we still hold — or it did not, and its flag is already set for the
+;; re-read. Both orders end in the same throw.
+;;
+;; The registry is touched ONLY by a wait that actually waits — a deref of an
+;; already-delivered promise takes no lock this file did not already take, and
+;; allocates nothing this file did not already allocate.
+;;
+;; THE IDENTITY IS THE INTERRUPT BOX, not the fiber, and that is a decision rather
+;; than an oversight. The flag lives in the box, .interrupt is handed a box and
+;; nothing else, and jolt has no per-fiber interrupt flag to key on — so a fiber
+;; waiting here registers under the box of the carrier it is running on (a fiber
+;; cannot migrate, so that box is stable for its lifetime) and is woken when that
+;; thread is interrupted. Every waiter woken re-checks, and the check CLEARS, so
+;; exactly one of them consumes the interrupt and throws while the rest go back to
+;; waiting — one interrupt, one InterruptedException, as on the JVM. The reachable
+;; shape is a go block that interrupts (Thread/currentThread), which is its carrier;
+;; test/chez/unit.edn pins it and known-divergences.edn records it.
+(define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> (mu . cv) list
+(define jolt-interrupt-waits-mu (make-mutex))
+
+;; Both called with the waiter's mu held. The table's own mutex is a leaf — taken
+;; around one hashtable operation with nothing inside it — so it cannot be part of
+;; a cycle, the same argument jolt-cv-waiters-mu rests on.
+(define (jolt-interrupt-wait-add! b entry)
+  (jolt-with-mutex jolt-interrupt-waits-mu
+    (hashtable-set! jolt-interrupt-waits b
+                    (cons entry (hashtable-ref jolt-interrupt-waits b '())))))
+
+(define (jolt-interrupt-wait-remove! b entry)
+  (jolt-with-mutex jolt-interrupt-waits-mu
+    (let ((es (remq entry (hashtable-ref jolt-interrupt-waits b '()))))
+      (if (null? es)
+          (hashtable-delete! jolt-interrupt-waits b)
+          (hashtable-set! jolt-interrupt-waits b es)))))
+
+;; (jolt-interrupt-wake-waits! b) — poke every condition the thread owning b is
+;; willing to be interrupted out of. Call AFTER setting the flag: the flag is what
+;; a woken waiter reads, and a wake that arrives before it is set says nothing.
+;;
+;; READ AND NOT DRAINED, unlike jolt-cv-take-waiters!. An entry is owned by the wait
+;; that made it and is removed by that wait when it stops waiting, so deleting it
+;; here would unregister a waiter that is still waiting — the one that did not win
+;; the flag, when several share a carrier — and the next interrupt would not reach
+;; it. The entries are woken OUTSIDE the table's mutex, so this path holds one lock
+;; at a time.
+(define (jolt-interrupt-wake-waits! b)
+  (let ((es (jolt-with-mutex jolt-interrupt-waits-mu
+              (hashtable-ref jolt-interrupt-waits b '()))))
+    (for-each (lambda (e) (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e)))) es)))
+
+;; The flag, read-and-cleared — java.lang.Thread's own rule for a wait that throws:
+;; "the interrupted status is cleared and an InterruptedException is thrown."
+(define (jolt-interrupt-take! b) (and (unbox b) (begin (set-box! b #f) #t)))
+
+(define (jolt-interrupted-throw! who)
+  (jolt-throw (jolt-host-throwable "java.lang.InterruptedException" who)))
+
+;; For a POLLED wait that has no condition variable to register (the subprocess
+;; reap loop): same flag, same clear, same throw, checked once per round.
+(define (jolt-interrupt-poll-check! who)
+  (let ((b (current-interrupt-box)))
+    (when (jolt-interrupt-take! b) (jolt-interrupted-throw! who))))
+
+;; `who` is the InterruptedException's message. The JVM's is null for most of these
+;; and "sleep interrupted" for Thread.sleep; jolt names the op instead, which is
+;; strictly more information and is what its other host throwables do.
+(define (jolt-cv-wait-interruptibly who mu cv deadline decide)
+  (jolt-cv-wait/ibox mu cv deadline decide (current-interrupt-box) who))

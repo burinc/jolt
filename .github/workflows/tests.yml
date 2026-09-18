@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/chez
-          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off
+          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off-pic
 
       - name: Build Chez Scheme from source
         if: steps.cache-chez.outputs.cache-hit != 'true'
@@ -38,7 +38,13 @@ jobs:
           cd /tmp/chez-src
           # --disable-x11: the expression editor's X11 clipboard isn't needed and
           # would pull an X11 build/link dep.
-          ./configure --installprefix=/opt/chez --threads --disable-x11
+          #
+          # CFLAGS+=-fPIC: `jolt build --library` links Chez's libkernel.a into a
+          # shared object, which a kernel built without -fPIC cannot do — the
+          # -shared link fails with a relocation error. build-lib-smoke.sh treats
+          # that as an environment limitation and SKIPS, so without this flag the
+          # buildlibsmoke gate passes without testing anything.
+          ./configure --installprefix=/opt/chez --threads --disable-x11 CFLAGS+=-fPIC
           make -j"$(nproc)"
           sudo make install
           sudo chown -R "$USER" /opt/chez
@@ -53,6 +59,35 @@ jobs:
           echo '/opt/chez/bin' >> "$GITHUB_PATH"
           /opt/chez/bin/chez --version
 
+      # Gambit, for the host/gambit gates (gambitcheck/kernel/eval/boot/unbound/
+      # vars/profile). apt's gambc is 4.9.3; the gates run on 4.9.8, the brew
+      # pin, so build the tag from source and cache it like Chez. The git tag
+      # ships the generated C files, so no bootstrap compiler is involved.
+      # Flags are the brew formula's minus openssl, which nothing here uses:
+      # --enable-single-host is the one-C-file-per-module build, the runtime
+      # options make UTF-8 the default encoding on files, stdio and terminals.
+      - name: Cache Gambit
+        id: cache-gambit
+        uses: actions/cache@v4
+        with:
+          path: /opt/gambit
+          key: gambit-${{ runner.os }}-${{ env.ImageOS }}-v4.9.8-single-host-f8
+
+      - name: Build Gambit from source
+        if: steps.cache-gambit.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v4.9.8 https://github.com/gambit/gambit.git /tmp/gambit-src
+          cd /tmp/gambit-src
+          ./configure --prefix=/opt/gambit --enable-single-host --enable-default-runtime-options=f8,-8,t8
+          make -j"$(nproc)"
+          sudo make install
+          sudo chown -R "$USER" /opt/gambit
+
+      - name: Show Gambit version
+        # Not on PATH: `gsc` is Ghostscript's name too, and the Makefile only
+        # ever runs $(GAMBIT_PREFIX)/bin/gsi and gsc.
+        run: /opt/gambit/bin/gsi -v
+
       - name: Install JDK + Clojure (certify oracle)
         run: |
           sudo apt-get install -y default-jdk rlwrap
@@ -62,7 +97,15 @@ jobs:
             https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
           head -1 linux-install.sh | grep -q '^#!' || { echo "installer download corrupt"; cat linux-install.sh | head -5; exit 1; }
           sudo bash linux-install.sh
+          # The runner image puts an older Temurin's java first on PATH, and the
+          # clojure launcher runs that (JAVA_HOME is only its fallback when no
+          # java is on PATH). JAVA_CMD is the launcher's first choice: point it
+          # at the JDK just installed (the corpus is measured on JDK 21+, and
+          # certify.clj refuses an older oracle).
+          echo "JAVA_CMD=/usr/lib/jvm/default-java/bin/java" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=/usr/lib/jvm/default-java" >> "$GITHUB_ENV"
           clojure --version
+          JAVA_CMD=/usr/lib/jvm/default-java/bin/java clojure -M -e '(println "oracle JDK" (System/getProperty "java.runtime.version"))'
 
       - name: Gate
         # `make test` = the self-host byte-fixpoint (the rebuilt seed must equal
@@ -72,7 +115,48 @@ jobs:
         # build ships the kernel dev files).
         # -j overlaps the independent gates (ci is a plain dependency list);
         # -Oline keeps per-recipe output contiguous for failure reading.
-        run: make CHEZ=/opt/chez/bin/chez -j"$(nproc)" -Oline test
+        env:
+          # The Chez built above is PIC, so `jolt build --library` links here and
+          # buildlibsmoke must actually run. This makes its skip paths fatal, so
+          # the gate cannot go back to reporting green without testing.
+          JOLT_REQUIRE_BUILDLIB: "1"
+          # Same for the gambit gates: with a Gambit built above, a skip is a
+          # failure, so they cannot go back to being the no-ops they were.
+          JOLT_REQUIRE_GAMBIT: "1"
+        run: make CHEZ=/opt/chez/bin/chez GAMBIT_PREFIX=/opt/gambit -j"$(nproc)" -Oline test
+
+  # No AI-assistant attribution in what a push or PR adds: tools/attributioncheck.sh
+  # over the pushed range (push) or the PR's commits and its description (PR).
+  # Its own job because it needs history — the test job's checkout is shallow,
+  # so origin/main..HEAD is not there to scan — and needs no Chez.
+  attribution:
+    name: No AI attribution in commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Commits in range
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            range="origin/$BASE_REF..HEAD"
+          elif [ -n "$BEFORE" ] && ! echo "$BEFORE" | grep -q '^0*$' && git cat-file -e "$BEFORE" 2>/dev/null; then
+            range="$BEFORE..HEAD"
+          else
+            range="HEAD~20..HEAD"   # a new branch or a force-push: the recent commits
+          fi
+          echo "scanning $range"
+          sh tools/attributioncheck.sh "$range"
+      - name: PR description
+        if: github.event_name == 'pull_request'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n' "$BODY" | sh tools/attributioncheck.sh --text
 
   windows-deps:
     name: Windows dependency paths
@@ -148,6 +232,91 @@ jobs:
       - name: Gate native dependency paths and Maven resolver
         run: make CHEZ=./chez-install/bin/chez depsunit mvnhttp
 
+      # Use PowerShell so JOLT_PWD retains its native drive-rooted spelling.
+      # The MSYS shell can translate it before the runtime sees the value,
+      # which would make this regression check vacuous.
+      - name: Resolve a fixture from a native absolute project directory
+        shell: powershell
+        run: |
+          $project = Join-Path $env:RUNNER_TEMP 'absolute-path-project'
+          $marker = Join-Path $project 'marker-src'
+          New-Item -ItemType Directory -Force -Path $marker | Out-Null
+          Set-Content -NoNewline -Encoding ascii `
+            -Path (Join-Path $project 'deps.edn') `
+            -Value '{:paths ["marker-src"]}'
+          $env:JOLT_PWD = (Resolve-Path $project).Path
+          if ($env:JOLT_PWD -notmatch '^[A-Za-z]:[\\/]') {
+            throw "expected a drive-absolute JOLT_PWD, got: $env:JOLT_PWD"
+          }
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          $resolved = (& $scheme --script host\chez\cli.ss -Spath 2>&1 | Out-String)
+          Write-Host $resolved
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $resolved.Contains('marker-src')) {
+            throw "resolved path did not contain the fixture's declared marker root"
+          }
+          $env:JOLT_EXPECTED_ROOTED = $env:JOLT_PWD.Substring(0, 2) + '\rooted.txt'
+          # Avoid string literals in the native `-e` argument: Windows
+          # PowerShell 5.1 removes their quotes while constructing argv.
+          $probe = '(let [p (str (char 92) (name (quote rooted.txt))) f (java.io.File. p)] (and (false? (.isAbsolute f)) (= (System/getenv (name (quote JOLT_EXPECTED_ROOTED))) (.getAbsolutePath f))))'
+          $rooted = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $rooted
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($rooted -ne 'true') {
+            throw "current-drive-rooted File resolution did not match user.dir's drive"
+          }
+
+      # The Windows path defects that the per-platform gates above model but
+      # cannot observe: #992 (a drive-absolute FILE argument read as
+      # project-relative, so the runtime opened "./C:/…") and #991
+      # (getCanonicalPath prefixing "/" to a drive-absolute path, so the value
+      # it returned resolved against the current drive and could not be opened).
+      # PowerShell again, so the drive-rooted spellings reach the runtime as
+      # the user typed them rather than as MSYS translations of them.
+      - name: Drive-absolute FILE argument and canonical paths
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'winpaths'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $script = Join-Path $dir 'hello.clj'
+          Set-Content -NoNewline -Encoding ascii -Path $script -Value '(println :hello-from-file)'
+
+          # JOLT_PWD unset is the prebuilt binary's own arrangement: the project
+          # directory is ".", so a mis-classified absolute path becomes "./C:/…".
+          Remove-Item Env:\JOLT_PWD -ErrorAction SilentlyContinue
+          foreach ($spelling in @(($script -replace '\\','/'), $script)) {
+            $out = (& $scheme --script host\chez\cli.ss $spelling 2>&1 | Out-String)
+            Write-Host "$spelling => $out"
+            if ($LASTEXITCODE -ne 0) { throw "jolt <$spelling> exited $LASTEXITCODE" }
+            if (-not $out.Contains(':hello-from-file')) {
+              throw "a drive-absolute FILE argument did not run: $spelling"
+            }
+          }
+
+          # getCanonicalPath must answer a path that can be written and read
+          # back, and must answer the SAME path for both separator spellings —
+          # the identity comparison it exists for.
+          $probe = 'x'
+          $probe = '(let [d (System/getenv (name (quote WINPATH_DIR)))' +
+                   '      p (str d (char 47) (name (quote out.txt)))' +
+                   '      b (.replace p (char 47) (char 92))' +
+                   '      c (.getCanonicalPath (java.io.File. p))' +
+                   '      c2 (.getCanonicalPath (java.io.File. b))]' +
+                   '  (spit c (name (quote written)))' +
+                   '  (println [(= c c2) (slurp c) (= (char 47) (.charAt c 0))]))'
+          $env:WINPATH_DIR = $dir
+          $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($out -ne '[true written false]') {
+            throw "canonicalized drive-absolute path was not usable/stable: $out"
+          }
+
+      # The resolver's HTTPS transport on Windows: ws2_32 sockets and the
+      # OpenSSL DLLs discovered under Git for Windows' mingw64/bin (the runner
+      # image has no other OpenSSL 3). Both separator spellings of the download
+      # path reach FileOutputStream as the user's environment would spell them.
       - name: Fetch dependencies with forward-slash absolute paths
         run: TMPDIR="$(cygpath -m "$RUNNER_TEMP")" make CHEZ=./chez-install/bin/chez httpsfetch
 

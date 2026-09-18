@@ -56,11 +56,11 @@
 ;; Each of these is a single Chez primitive after lowering. None can reach a jolt
 ;; prologue, so none can leave a rib behind, so none needs the save/restore.
 (let ((e (emit-num "(def _ (fn [^doubles a ^long i] (+ (aget a i) (aget a i))))")))
-  (gate-check "(1) proven aget still lowers inline" (gate-sub? e "(flvector-ref (jolt-array-vec") #t)
+  (gate-check "(1) proven aget still lowers inline" (gate-sub? e "(flvector-ref _av$") #t)
   (gate-check "(1) proven aget takes no trace-save" (saves? e) #f)
   (gate-check "(1) proven aget takes no trace-unwind" (unwinds? e) #f))
 (let ((e (emit-num "(def _ (fn [^doubles a ^long i] (do (aset a i 7.25) 1.0)))")))
-  (gate-check "(2) proven aset still lowers inline" (gate-sub? e "(flvector-set! (jolt-array-vec") #t)
+  (gate-check "(2) proven aset still lowers inline" (gate-sub? e "(flvector-set! _av$") #t)
   (gate-check "(2) proven aset takes no trace-save" (saves? e) #f))
 ;; the aget/aset pair inside a loop — the shape the regression was measured on
 (let ((e (emit-num "(def _ (fn [^doubles a ^doubles b ^long n] (dotimes [i n] (aset b i (+ (aget a i) 0.5)))))")))

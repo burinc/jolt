@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the aggregate-call C witness outside the tree, run the compiler-level
 # and public API checks, and retain the temporary directory on failure.
-set -u
+set -eu
 
 CHEZ=${1-}
 [ -n "$CHEZ" ] || { echo "usage: $0 <chez> [jolt]" >&2; exit 2; }

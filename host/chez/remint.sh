@@ -6,7 +6,9 @@
 set -e
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
-CHEZ="${CHEZ:-$(command -v chez || command -v chezscheme || command -v scheme)}"
+# JOLT_CHEZ wins (see host/chez/selfcheck.sh) — re-minting the seed under the
+# wrong Chez is exactly the mistake this script exists to avoid.
+CHEZ="${JOLT_CHEZ:-${CHEZ:-$(command -v chez || command -v chezscheme || command -v scheme)}}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -32,6 +34,7 @@ while [ "$i" -lt 8 ]; do
     if [ -n "$skipped" ] && [ "$skipped" -ne 0 ]; then
       echo "re-mint: $skipped form(s) failed to compile in the fixpoint pass:" >&2
       grep '^mint: skipped ' "$tmp/err" >&2
+      echo "re-mint: JOLT_MINT_DEBUG=1 chez --script host/chez/bootstrap.ss <seed…> prints why" >&2
       exit 1
     fi
     cp "$tmp/new-p.ss" host/chez/seed/prelude.ss

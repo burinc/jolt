@@ -65,6 +65,20 @@
   (and (pmap? x)
        (eq? (jolt-get x hc-kw-jolt-type) hc-kw-jolt-tagged)
        (eq? (jolt-get x hc-kw-tag) tag)))
+;; ANY #tag form the reader built. The analyzer has a leaf for the four tags it
+;; knows (#inst/#uuid/#bigdec, and #"regex" as a value); one that reaches the end
+;; of the cond is a tag with no reader function, which is what the JVM's reader
+;; raises on by name — better than "unsupported form", which names nothing.
+(define (hc-tagged? x)
+  (and (pmap? x) (eq? (jolt-get x hc-kw-jolt-type) hc-kw-jolt-tagged)))
+;; the tag as written. The reader keys a source tag :#name / :#ns/name and its own
+;; internal ones (:bigdec, :regex) bare, so strip a leading # if there is one.
+(define (hc-tag-name x)
+  (let* ((k (jolt-get x hc-kw-tag))
+         (nm (if (keyword-t? k) (keyword-t-name k) (jolt-pr-str k))))
+    (if (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\#))
+        (substring nm 1 (string-length nm))
+        nm)))
 (define (hc-regex? x) (regex-t? x))   ; #"..." reads as a regex VALUE now
 (define (hc-inst? x) (hc-tagged-of x hc-kw-inst))
 (define (hc-uuid? x) (hc-tagged-of x hc-kw-uuid))
@@ -101,6 +115,19 @@
 ;; like Compiler.resolveIn's else branch.
 (define (hc-allow-unresolved-vars?)
   (jolt-truthy? (guard (e (#t #f)) (var-deref "clojure.core" "*allow-unresolved-vars*"))))
+
+;; jolt.host/*invoke-rewrite* read at compile time: a hook over calls through a
+;; VAR. (f var-ns var-name form) answers a replacement form, or nil to leave the
+;; call alone; the analyzer consults it at its invoke arm only for a head that
+;; is a symbol, is not a local, and resolves to a var -- a local named `resolve`
+;; is a local call whatever the hook thinks of clojure.core/resolve -- and after
+;; macro expansion, so a macro-emitted (clojure.core/require ...) is seen like a
+;; hand-written one. nil (the default) costs one deref per var call analyzed.
+;; jolt.loader binds it while evaluating a context's source, so `require` and
+;; its kin carry the loader that owns the code, whoever calls the fn later.
+(define (hc-invoke-rewriter)
+  (let ((f (guard (e (#t #f)) (var-deref "jolt.host" "*invoke-rewrite*"))))
+    (if (or (not f) (jolt-nil? f)) #f f)))
 
 ;; --- form accessors ---------------------------------------------------------
 (define (hc-char-code x) (char->integer x))  ; native Chez char -> codepoint
@@ -229,10 +256,23 @@
               ;; or clojure.core var — e.g. the compiler ns referencing `set`,
               ;; which late-binds (interns `jolt.backend-scheme/set` undefined)
               ;; and would otherwise hide clojure.core/set on the mint fixpoint.
-              (and c (var-cell-defined? c) c))
+              (and c (var-cell-defined? c)
+                   ;; def-ordinal visibility (rt.ss var-def-ordinals): during a
+                   ;; build's emit walk the process holds the WHOLE program's
+                   ;; defs, but this file's forms were analyzed in order — a
+                   ;; same-ns var first defined by a LATER top-level form was
+                   ;; NOT resolvable when the in-order load compiled the form
+                   ;; being re-analyzed now, so it must not be here either
+                   ;; (fall through to refer / clojure.core, the in-order
+                   ;; answer). Unstamped vars read 0 and pass; the gate is #f
+                   ;; (off) outside the build's walks.
+                   (let ((cur (jolt-form-ordinal)))
+                     (or (not cur)
+                         (fx<=? (var-def-ordinal (chez-actx-cns ctx) nm) cur)))
+                   c))
             ;; a :refer'd name resolves to its source ns
             (let ((ref (chez-resolve-refer (chez-actx-cns ctx) nm)))
-              (and ref (var-cell-lookup ref nm)))
+              (and ref (var-cell-lookup (car ref) (cdr ref))))
             (var-cell-lookup "clojure.core" nm)))))
 
 ;; Runtime macros: a defmacro is emitted into the prelude as a
@@ -261,28 +301,109 @@
             dst))
       dst))
 
+;; --- rewriting a form the reader built, before anything else sees it ----------
+;; Two things have to happen to a form between the reader and the code that reads
+;; it: a syntax-quote marker gets lowered (hc-sq-expand-all) and a set-form gets
+;; turned into a real set (hc-macro-arg). Both are "the reader's shape is not the
+;; language's shape", both walk the same eager reader shapes, so both go through
+;; this one traversal. `visit` gets first refusal on each node and answers a
+;; replacement, or #f to keep descending.
+;;
+;; A container is rebuilt only when something below it changed, so a form with
+;; nothing to rewrite comes back as it went in, unallocated. A rebuilt one is
+;; handed back the three things the reader keys off OBJECT IDENTITY and a plain
+;; copy would drop: its metadata, its map source key order (which is its
+;; evaluation order) and its record-literal mark.
+(define (hc-keep-identity old new)
+  (let ((m (jolt-meta old)))
+    (if (jolt-nil? m)
+        new
+        (let ((c (jolt-with-meta new m)))
+          (let ((order (and (pmap? new) (rdr-map-order-ref new))))
+            (when order (rdr-map-order-set! c order)))
+          c))))
+
+(define (hc-walk-items visit items)
+  (let loop ((xs items) (acc '()) (changed #f))
+    (if (null? xs)
+        (values (reverse acc) changed)
+        (let ((y (hc-walk-form visit (car xs))))
+          (loop (cdr xs) (cons y acc) (or changed (not (eq? y (car xs)))))))))
+
+(define (hc-walk-map visit form)
+  (let ((ty (jolt-get form hc-kw-jolt-type)))
+    (cond
+      ;; the reader's set FORM: {:jolt/type :jolt/set :value <pvec>}
+      ((eq? ty hc-kw-jolt-set)
+       (let* ((v (jolt-get form hc-kw-value))
+              (nv (hc-walk-form visit v)))
+         (if (eq? nv v) form (hc-keep-identity form (jolt-assoc form hc-kw-value nv)))))
+      ;; a tagged literal: {:jolt/type :jolt/tagged :tag t :form f}
+      ((eq? ty hc-kw-jolt-tagged)
+       (let* ((f (jolt-get form hc-kw-form))
+              (nf (hc-walk-form visit f)))
+         (if (eq? nf f) form (hc-keep-identity form (jolt-assoc form hc-kw-form nf)))))
+      ((jolt-nil? ty)
+       (let ((order (rdr-map-order-ref form)))
+         (if order
+             ;; rdr-make-map re-registers the source order for the rebuilt map
+             (let-values (((kvs changed) (hc-walk-items visit order)))
+               (if changed (hc-keep-identity form (rdr-make-map kvs)) form))
+             (let-values (((kvs changed)
+                           (hc-walk-items
+                             visit (pmap-fold form (lambda (k v a) (cons k (cons v a))) '()))))
+               (if changed (hc-keep-identity form (apply jolt-hash-map kvs)) form)))))
+      (else form))))
+
+(define (hc-walk-form visit form)
+  (cond
+    ((visit form))
+    ((or (symbol-t? form) (hc-literal? form) (empty-list-t? form)) form)
+    ((cseq? form)
+     (let-values (((items changed) (hc-walk-items visit (seq->list form))))
+       (if (not changed)
+           form
+           (let ((new (hc-keep-identity form (apply jolt-list items))))
+             (when (rdr-ctor-call? form) (rdr-mark-ctor-form new))
+             new))))
+    ((pvec? form)
+     (let-values (((items changed) (hc-walk-items visit (vector->list (pvec-v form)))))
+       (if changed (hc-keep-identity form (apply jolt-vector items)) form)))
+    ((pset? form)
+     (let-values (((items changed) (hc-walk-items visit (pset-fold form cons '()))))
+       (if changed (hc-keep-identity form (apply jolt-hash-set items)) form)))
+    ((pmap? form) (hc-walk-map visit form))
+    (else form)))
+
 ;; A set literal reads as the tagged set-form {:jolt/type :jolt/set :value [...]}
-;; for the analyzer, but a macro must see a real set value (Clojure parity, so
-;; (set? arg) / seq / conj work — hiccup's compiler does this). Convert a set-form
-;; argument to a set; elements stay as read (a deeply-nested set literal inside
-;; another form is rarer and left for the analyzer).
-(define (hc-macro-arg x)
-  (if (rdr-set-form? x)
-      (let ((items (jolt-get x rdr-kw-value)))
-        (let loop ((i 0) (s empty-pset))
-          (if (fx>=? i (pvec-count items)) s
-              (loop (fx+ i 1) (pset-conj s (pvec-nth-d items i jolt-nil))))))
-      x))
-;; &form and &env are bound (as dynamic vars) around the expander call, so a
-;; macro body can read the call form / lexical env without changing the calling
-;; convention. The analyzer passes amp-env (the in-scope locals); macroexpand-1
-;; has none, so it defaults to {}.
-(define hc-amp-form-cell (declare-var! "clojure.core" "&form"))
-(define hc-amp-env-cell (declare-var! "clojure.core" "&env"))
-;; bound on every macro expansion (hc-expand-1's dynamic-wind) — tag :dynamic
-;; so the push passes the non-dynamic-var check.
-(set-var-meta! "clojure.core" "&form" (jolt-hash-map (keyword #f "dynamic") #t))
-(set-var-meta! "clojure.core" "&env" (jolt-hash-map (keyword #f "dynamic") #t))
+;; for the analyzer, but Clojure's ` #{...} ` is a reader macro: a real set exists
+;; before any macro runs, so a macro must see one too — (set? arg), seq and conj
+;; all depend on it, and hiccup's compiler does exactly that. The shape is jolt's,
+;; not the language's, so it is normalized out of the WHOLE argument rather than
+;; only its top level. A nested one used to arrive as the raw map, where (set? x)
+;; was false and (map? x) TRUE, so the obvious cond over vector?/set?/map? routed
+;; a set into the map branch and died on the key :jolt/type (#762).
+(define (hc-set-form->set x)
+  (and (rdr-set-form? x)
+       ;; the set-form is what carries the literal's metadata, so the set built
+       ;; from it has to inherit that — reitit writes ^:replace #{...} in route
+       ;; data and meta-merge unions instead of replacing without it.
+       (let ((items (hc-walk-form hc-set-form->set (jolt-get x rdr-kw-value))))
+         (hc-keep-identity x
+           (let loop ((i 0) (s empty-pset))
+             (if (fx>=? i (pvec-count items)) s
+                 (loop (fx+ i 1) (pset-conj s (pvec-nth-d items i jolt-nil)))))))))
+(define (hc-macro-arg x) (hc-walk-form hc-set-form->set x))
+;; &form and &env are the expander fn's first two PARAMETERS, as on the JVM —
+;; the lowering that adds them is analyzer.clj's macro-fn-arities (and its build
+;; path twin, ce-macro-arities). They used to be dynamic vars bound around the
+;; call instead, which read the same from inside a macro body but left the
+;; expander fn taking only its declared parameters: (apply macro-fn form env args)
+;; — the call every tools.analyzer-style macroexpand-1 makes — raised an
+;; ArityException. Params also outlive the expansion, so a closure a macro
+;; returns over &form still has it.
+;; The analyzer passes amp-env (the in-scope locals); macroexpand-1 has none, so
+;; it defaults to {}.
 ;; &form meta matches the JVM's {:line :column}. hc-kw-file is defined above
 ;; with hc-kw-line/hc-kw-column. hc-form-sans-file strips :file from &form meta
 ;; so a macro reading (meta &form) doesn't see it — libraries branch on its presence.
@@ -292,16 +413,32 @@
         form
         (jolt-with-meta form (jolt-dissoc2 m hc-kw-file)))))
 (define (hc-expand-1 ctx form . maybe-env)
-  (let* ((items (seq->list form))
+  ;; Normalize the WHOLE call form once, then take both the arguments and &form
+  ;; out of the result. Walking each argument separately left &form holding the
+  ;; raw shapes — a macro reading (nth &form 1) rather than its parameter still
+  ;; saw a set literal as the tagged map, set? false and map? TRUE, which is the
+  ;; #762 hazard surviving in the one place the argument walk did not reach. One
+  ;; walk is also less work than one per argument, and an unchanged form comes
+  ;; back unallocated.
+  (let* ((nform (hc-macro-arg form))
+         (items (seq->list nform))
          (head (car items))
-         (args (map hc-macro-arg (cdr items)))
+         (args (cdr items))
          (expander (var-cell-root (hc-resolve-cell ctx head)))
          (amp-env (if (pair? maybe-env) (car maybe-env) (jolt-hash-map))))
-    (dynamic-wind
-      (lambda () (jolt-push-thread-bindings
-                  (jolt-hash-map hc-amp-form-cell (hc-form-sans-file form) hc-amp-env-cell amp-env)))
-      (lambda () (hc-propagate-pos form (apply jolt-invoke expander args)))
-      (lambda () (jolt-pop-thread-bindings)))))
+    ;; A macro's two implicit parameters are invisible to its caller, so an arity
+    ;; error names the DECLARED count: (m 1 2) on a one-param macro is (2), not
+    ;; the (4) the expander is actually called with. The JVM corrects that after
+    ;; the fact (Compiler.macroexpand1 rethrows the ArityException with
+    ;; actual - 2); jolt asks first, the way seq.ss's arity pre-check classifies
+    ;; a site structurally rather than by matching a message afterwards — which
+    ;; also means the count never has to be parsed back out of one.
+    ;; Only for a real procedure: anything else jolt-invoke owns, error included.
+    (when (and (procedure? expander)
+               (not (proc-accepts? expander (fx+ 2 (length args)))))
+      (jolt-arity-error-name (jolt-proc-arity-name expander) (length args)))
+    (hc-propagate-pos form
+      (apply jolt-invoke expander (hc-form-sans-file nform) amp-env args))))
 
 ;; Classify a global (non-local) symbol reference against the var registry:
 ;;   {:kind :var :ns NS :name NAME}   — a defined var (compile ns / clojure.core)
@@ -342,6 +479,54 @@
 (define (hc-host-class-name? nm)
   (or (hc-fq-class-name? nm)
       (host-class-registered? nm)))
+
+;; The other side of that line, for a DOTTED name: dotted, with a LOWERCASE
+;; segment after the last dot — jolt.host, clojure.string. That is what a
+;; NAMESPACE looks like, and what no class jolt models looks like: every class the
+;; host registers has a capitalized final segment, hc-fq-class-name? above calls
+;; a lowercase one not-a-class, and the reader refuses to read one as a class
+;; token.
+;;
+;; The analyzer needs the question asked this way because resolve-global cannot
+;; tell the two apart on its own: a qualified sym it cannot resolve comes back
+;; :unresolved whether it is `Math/sqrt` or `no.such.ns/foo`, and reading the
+;; second as a class static is what made `(no.such.ns/foo 1)` report "Unknown
+;; class no.such.ns" from inside the call. Paired with jolt.host/namespace-for
+;; below (an alias in the compile ns, else ns.ss chez-ns-exists?, the rule find-ns
+;; uses) it fires only on a namespace-shaped ns that names nothing loaded AT ALL
+;; — the JVM's "No such namespace".
+;; A loaded namespace missing only the var must stay late-bound: that is how
+;; jolt-core reaches this very contract, and which jolt.host vars exist depends on
+;; which host files the boot loaded, so the guard there is the static one
+;; (jolt-host-manifest.txt) and the miss reports at the call.
+;;
+;; NOT merely (not (hc-fq-class-name? nm)): a name with no dot is read by its
+;; FIRST letter, the same convention. Lowercase — `str/join` — is an :as alias
+;; that was never registered, and the JVM's answer is the same "No such
+;; namespace" (the analyzer still asks host-class-name? first: a (defrecord
+;; point …) makes `point/create` a class, on both runtimes). A bare `Foo` is how
+;; an :import-ed short name is spelled, and its class may not be registered until
+;; its provider autoloads, so a Capitalized no-dot name stays with the host-static
+;; arm (documented in known-divergences.edn). Anything but a lowercase LETTER at
+;; the deciding position is left there too.
+(define (hc-ns-shaped-name? nm)
+  (let ((n (string-length nm)))
+    (let loop ((i (fx- n 1)))
+      (cond ((fx<? i 0) (and (fx>? n 0) (char-lower-case? (string-ref nm 0))))
+            ((char=? (string-ref nm i) #\.)
+             (and (fx<? (fx+ i 1) n) (char-lower-case? (string-ref nm (fx+ i 1)))))
+            (else (loop (fx- i 1)))))))
+
+;; Compiler.namespaceFor: the namespace `nm` names from the compile ns — an :as
+;; alias registered there, else a namespace by that name — as its name string,
+;; or #f when there is neither. The alias half is what keeps a loaded namespace
+;; that merely lacks the var on the late-bound arm above when it is reached
+;; THROUGH an alias (the mint compiles `op-registry/leaf-call-procs` against a
+;; seed that has the alias but not yet the var); the analyzer's "No such
+;; namespace" is this answering #f.
+(define (hc-namespace-for ctx nm)
+  (let ((target (or (chez-resolve-alias (chez-actx-cns ctx) nm) nm)))
+    (and (chez-ns-exists? target) target)))
 
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
@@ -464,9 +649,40 @@
         out
         (jolt-list (hc-sym "with-meta") out (hc-sq-lower ctx m gsmap)))))
 
+;; Is this the raw (clojure.core/syntax-quote x) form the reader emits for a `?
+;; The qualification is the point, exactly as in rdr-syntax-quote-form?: a BARE
+;; (syntax-quote x) is an ordinary call to whatever the program means by that
+;; name, not a marker. hc-head-is? accepts either spelling, so it cannot be used
+;; here.
+(define (hc-syntax-quote-form? x)
+  (and (hc-list? x)
+       (let ((s (jolt-seq x)))
+         (and (not (jolt-nil? s))
+              (let ((h (seq-first s)))
+                (and (symbol-t? h) (string=? (symbol-t-name h) "syntax-quote")
+                     (let ((ns (hc-sym-ns h)))
+                       (and (string? ns) (string=? ns "clojure.core")))))))))
+
 (define (hc-sq-lower-bare ctx form gsmap)
   (cond
     ((hc-head-is? form "unquote") (hc-second form))
+    ;; A NESTED backquote, lowered INSIDE-OUT — the order the JVM gets for free
+    ;; by resolving syntax-quote in the reader, where the inner ` has already
+    ;; become construction code before the outer one walks it. Two things follow
+    ;; from doing it in that order, and neither works without it:
+    ;;
+    ;;   * the inner template's ~unquotes belong to the INNER `. Lowering the
+    ;;     nested form as an ordinary list let the outer walk claim them, so
+    ;;     `(defmacro f [x#] `(g ~x#)) tried to resolve x# as a variable while
+    ;;     merely DEFINING the outer macro — the parameter it names does not
+    ;;     exist until the outer macro is called.
+    ;;   * a bare symbol left in the inner's construction code (what an inner
+    ;;     ~x# lowers to) is then walked by the OUTER gsmap, so the x# in the
+    ;;     parameter vector and the x# in the body get the same gensym.
+    ;;
+    ;; Fresh gsmap for the inner: each ` has its own auto-gensym scope.
+    ((hc-syntax-quote-form? form)
+     (hc-sq-lower ctx (hc-syntax-quote-lower ctx (hc-second form)) gsmap))
     ((hc-head-is? form "unquote-splicing")
      (jolt-throw (jolt-ex-info "~@ used outside of a list or vector in syntax-quote"
                                (jolt-hash-map))))
@@ -500,6 +716,30 @@
 
 (define (hc-syntax-quote-lower ctx inner)
   (hc-sq-lower ctx inner (make-hashtable string-hash string=?)))
+
+;; --- lowering every marker in a form, before anything can see it -------------
+;; Clojure's ` is a READER macro: by the time a program sees a form the backtick
+;; is already gone, replaced by its expansion. jolt reads ` to a marker
+;; (clojure.core/syntax-quote FORM) and lowers it in the analyzer, which is right
+;; for a marker in evaluated position and leaves it VISIBLE everywhere else — a
+;; macro reading its own argument forms, or a quoted form. typedclojure's
+;; (f/sub-f sb `call-abstract-many* opts) asserts its argument is
+;; (quote qualified-sym) and got (clojure.core/syntax-quote call-abstract-many*),
+;; so the checker would not load (jolt-024c).
+;;
+;; So the analyzer lowers every marker in a top-level form up front, at the
+;; reader's moment, through this same hc-syntax-quote-lower. A marker is replaced
+;; by its lowering and NOT rewalked: it is already fully lowered, nested backticks
+;; included (hc-sq-lower-bare does those inside-out).
+;;
+;; Only the reader's eager shapes are walked. A macro that builds its expansion
+;; lazily can still hand back a marker; analyze's own syntax-quote case — the
+;; evaluated-position path — is what lowers that one.
+(define (hc-sq-expand-all ctx form)
+  (hc-walk-form
+    (lambda (f)
+      (and (hc-syntax-quote-form? f) (hc-syntax-quote-lower ctx (hc-second f))))
+    form))
 ;; a ^Type param hint: name is the tag (a symbol, sometimes a string). Resolve it
 ;; against the record registry (records.ss) so the inference seeds the param as
 ;; that record — the open-world / cross-ns path where no caller type is inferred.
@@ -543,18 +783,33 @@
 ;; (records.ss) populated as deftype/defprotocol forms load.
 (define (hc-record-shapes ctx) (chez-record-shapes-map))
 (define (hc-protocol-methods ctx) (chez-protocol-methods-map))
-;; Optimization gate. On for --opt / :opt builds; off for release and dev.
-;; Inference + inline + scalar-replace passes are gated on this.
+;; Do the optimizing passes run at all? On for every build that is not --dev,
+;; and for nothing else: the runtime compile spine (REPL, load-string, runtime
+;; require) leaves it off, because a form compiled there must stay redefinable.
+;;
+;; ONE flag. There were two -- hc-optimize? for --opt and hc-release? for
+;; release -- and (or …) of them was the only thing either was ever read for, so
+;; they were the same question asked twice. That duplication is what let the
+;; inline gate below read "--opt" when it meant "closed world".
 (define hc-optimize? #f)
 (define (set-optimize! on) (set! hc-optimize? on))
-;; Inference gate. On for release builds too (inference without inline/scalar).
-(define hc-release? #f)
-(define (set-release! on) (set! hc-release? on))
-(define (hc-inference-enabled? ctx) (or hc-optimize? hc-release?))
-;; Inline additionally requires direct-link (closed-world guarantee).
+(define (hc-inference-enabled? ctx) hc-optimize?)
+;; Inline requires direct-link, and that is the WHOLE condition: splicing a defn
+;; body at a call site is sound exactly when the callee's var cannot be redefined
+;; out from under the copy, which is the closed world direct-linking commits to.
+;; A ^:dynamic/^:redef def, --no-direct-link and --dev all stay var-routed, so
+;; none of them splice.
+;;
+;; It used to also require hc-optimize? -- i.e. --opt -- which made the DEFAULT
+;; release build emit a real call everywhere the optimized build emitted a spliced
+;; body, and Chez cannot make that up: it does not inline across top-level forms
+;; in a compiled file. That was a policy dial on a pass whose precondition is a
+;; correctness property, so it is gone rather than defaulted differently. There is
+;; no configuration in which the un-spliced code is preferable to the spliced code
+;; at the same linkage, so there is no reason to keep a second path to test.
 (define hc-direct-link? #f)
 (define (set-direct-link-flag! on) (set! hc-direct-link? on))
-(define (hc-inline-enabled? ctx) (and hc-optimize? hc-direct-link?))
+(define (hc-inline-enabled? ctx) hc-direct-link?)
 ;; Inline-body registry: jolt.passes stashes an inline-eligible defn's
 ;; {:params :body :nhints :ret} here (keyed ns/name) as its form is optimized;
 ;; jolt.passes.inline fetches it to splice the body at a call site. The stash is an
@@ -567,12 +822,92 @@
 ;; site, and an unlocked read of a strong table is safe (see var-table in rt.ss).
 (define inline-stash-table (make-hashtable string-hash string=?))
 (define inline-stash-mu (make-mutex))
+;; Has this var been defined more than once, with a value, in the program loaded
+;; so far? The inline pass asks before stashing: splicing a var that is redefined
+;; later freezes whichever definition was current when the CALLER compiled, so one
+;; binary answers two ways depending which side of the second def a call site sat
+;; on (jolt-rtjm). `jolt build` loads the whole app from source before it emits any
+;; of it, so the answer is already final by stash time.
+;;
+;; Conservative in the harmless direction: a var redefined for any reason at all
+;; (the post-prelude native clobber, a reloaded namespace) loses its stash and
+;; keeps a real call, which is exactly what it compiles to without direct-linking.
+;; Every callee the inline pass actually spliced somewhere, "ns/name". A callee
+;; whose every call site was spliced has no reference left in the emitted code, so
+;; the tree-shake graph walk drops its def -- and the def's record is where the
+;; (jolt-register-source! …) lives, which is the only thing that maps an inlined
+;; frame back to ns/name (file:line). A --tree-shake binary then printed ONE frame
+;; where the same build unshaken printed three (jolt-o13s). dce.ss roots this set,
+;; so the identity survives the shake.
+;;
+;; Recorded at the SPLICE, not at the stash: a stashed fn nobody spliced is still
+;; genuinely dead and should still shake away.
+(define inline-spliced-set (make-hashtable string-hash string=?))
+(define (hc-mark-spliced! ctx ns-name nm)
+  (jolt-with-mutex inline-stash-mu
+    (hashtable-set! inline-spliced-set (string-append ns-name "/" nm) #t))
+  jolt-nil)
+(define (inline-spliced-fqns)
+  (jolt-with-mutex inline-stash-mu (vector->list (hashtable-keys inline-spliced-set))))
+(define (hc-var-redefined? ctx ns-name nm)
+  (if (var-redefined? ns-name nm) #t jolt-nil))
 (define (hc-stash-inline! ctx ns-name nm m)
   (jolt-with-mutex inline-stash-mu
     (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m))
   jolt-nil)
 (define (hc-inline-ir ctx ns-name nm)
   (or (hashtable-ref inline-stash-table (string-append ns-name "/" nm) #f) jolt-nil))
+
+;; --- direct-link of a seed var --------------------------------------------------
+;; The back end asks this before emitting a call to a var it did not define in
+;; this build: may the site bind the var's ROOT procedure once, at load, and
+;; call it directly? The answer is the same closed-world rule an app def gets
+;; under direct-link, applied to the seed image:
+;;   - the var's namespace was already defined when the runtime image booted
+;;     (ldr-runtime-image-ns-copy — the set build.ss reads as bld-boot-loaded),
+;;     so it is preloaded ahead of every app def and NOT emitted by this build;
+;;   - its root is a procedure whose arity mask admits the call's arity, so the
+;;     direct call cannot land on a keyword/map/multimethod or a wrong arity
+;;     (those keep jolt-invoke, which owns the ArityException);
+;;   - it is not ^:dynamic or ^:redef (the closed-world opt-outs), and the app
+;;     has not redefined it (var-redefined?).
+;; What changes for such a site is what changes under the JVM's direct linking:
+;; a later alter-var-root / with-redefs of the var is not seen by the compiled
+;; call. `jolt run` never direct-links, so the REPL and with-redefs in tests
+;; keep the var-routed call.
+(define hc-seed-ns-tbl #f)
+;; The boot that owns the runtime supplies the set: loader.ss installs its
+;; boot-time copy (ldr-runtime-image-ns-copy — the same set build.ss reads as
+;; bld-boot-loaded) for the CLI and `jolt build`, and gate-boot.ss snapshots the
+;; var table after the image loads for the pass gates. A boot that installs
+;; nothing (the Gambit host) direct-links no seed var, which is the safe answer.
+(define hc-seed-ns-source #f)
+(define (hc-seed-ns? ns)
+  (and hc-seed-ns-source
+       (begin
+         (unless hc-seed-ns-tbl (set! hc-seed-ns-tbl (hc-seed-ns-source)))
+         (hashtable-ref hc-seed-ns-tbl ns #f))))
+(define hc-kw-dynamic (keyword #f "dynamic"))
+(define hc-kw-redef (keyword #f "redef"))
+(define (hc-seed-callable? ctx ns-name nm nargs)
+  (let ((cell (var-cell-lookup ns-name nm)))
+    (if (and cell
+             (hc-seed-ns? ns-name)
+             (var-cell-defined? cell)
+             (procedure? (var-cell-root cell))
+             (fixnum? nargs)
+             (fxlogbit? nargs (procedure-arity-mask (var-cell-root cell)))
+             (let ((m (var-cell-meta cell)))
+               (or (not m) (jolt-nil? m)
+                   (and (not (jolt-truthy? (jolt-get m hc-kw-dynamic jolt-nil)))
+                        (not (jolt-truthy? (jolt-get m hc-kw-redef jolt-nil))))))
+             (not (var-redefined? ns-name nm)))
+        ;; a var the seed minted direct-linked answers its jv$ binding name, so
+        ;; the site applies the binding (rt.ss var-linked-symbol); any other
+        ;; seed var answers #t and the site hoists its root at load
+        (let ((sym (var-linked-symbol cell)))
+          (if sym (symbol->string sym) #t))
+        jolt-nil)))
 
 ;; --- declare the hot clojure.core primitives so resolve-global sees them ------
 ;; Mirrors backend_scheme.clj native-ops keys (op-registry entries with a :call)
@@ -583,13 +918,20 @@
 (for-each (lambda (nm) (declare-var! "clojure.core" nm))
   '("+" "-" "*" "/" "<" ">" "<=" ">=" "=" "inc" "dec" "not" "min" "max"
     "mod" "rem" "quot" "vector" "hash-map" "hash-set" "conj" "get" "nth" "count"
-    "assoc" "dissoc" "contains?" "find" "empty?" "peek" "pop" "first" "rest" "next" "seq"
-    "cons" "list" "reverse" "last" "map" "filter" "remove" "reduce" "into" "concat"
+    "assoc" "dissoc" "contains?" "find" "empty?" "peek" "pop" "deref" "first" "rest" "next" "seq"
+    "cons" "list" "reverse" "last" "map" "filter" "remove" "reduce" "reduce-kv" "into" "concat"
     "apply" "range" "take" "drop" "keys" "vals" "even?" "odd?" "pos?" "neg?"
     "zero?" "identity" "nil?" "some?" "identical?" "ex-info"
+    ;; not a public name — the deftype macro's field bindings lower through it
+    ;; (records.ss jrec-field). Declared here like the rest so the list matches
+    ;; native-ops, which manifest-check.sh enforces.
+    "__deftype-field"
     "aget" "aset" "alength"
     "bit-and" "bit-or" "bit-xor" "bit-not"
-    "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"))
+    "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"
+    "unchecked-add" "unchecked-subtract" "unchecked-multiply"
+    "unchecked-inc" "unchecked-dec" "unchecked-negate"))
+
 
 ;; --- install: bind the contract into the jolt.host namespace -----------------
 (define (hc-install!)
@@ -607,6 +949,8 @@
   (def-var! "jolt.host" "form-literal?" hc-literal?)
   (def-var! "jolt.host" "form-keyword?" hc-keyword?)
   (def-var! "jolt.host" "form-regex?" hc-regex?)
+  (def-var! "jolt.host" "form-tagged?" hc-tagged?)
+  (def-var! "jolt.host" "form-tag-name" hc-tag-name)
   (def-var! "jolt.host" "form-inst?" hc-inst?)
   (def-var! "jolt.host" "form-uuid?" hc-uuid?)
   (def-var! "jolt.host" "form-ns-value?" hc-ns-value?)
@@ -618,6 +962,8 @@
   (def-var! "jolt.host" "form-class-value-name" hc-class-value-name)
   (def-var! "jolt.host" "unchecked-math?" hc-unchecked-math?)
   (def-var! "jolt.host" "allow-unresolved-vars?" hc-allow-unresolved-vars?)
+  (def-dynvar! "jolt.host" "*invoke-rewrite*" jolt-nil)
+  (def-var! "jolt.host" "invoke-rewriter" hc-invoke-rewriter)
   (def-var! "jolt.host" "form-bigdec?" hc-bigdec?)
   (def-var! "jolt.host" "form-bigdec-source" hc-bigdec-source)
   (def-var! "jolt.host" "form-bigdec-value?" hc-bigdec-value?)
@@ -641,14 +987,23 @@
   (def-var! "jolt.host" "chez-number-literal" (lambda (n) (number->string n)))
   (def-var! "jolt.host" "form-special?" hc-special?)
   (def-var! "jolt.host" "compile-ns" hc-current-ns)
+  ;; A ctx for a DIFFERENT namespace than the one being compiled. The analyzer
+  ;; needs one to re-analyze a registered fn literal's SOURCE form in the ns it
+  ;; was compiled in (jolt-5n2p): its free symbols resolve there and not at the
+  ;; site the value was spliced into, which is the same reason the image restore
+  ;; path compiles its wrapper in (image-fnsrc-ns x).
+  (def-var! "jolt.host" "ctx-for-ns" (lambda (ns) (make-analyze-ctx ns)))
   (def-var! "jolt.host" "late-bind?" hc-late-bind?)
   (def-var! "jolt.host" "form-macro?" hc-macro?)
   (def-var! "jolt.host" "form-expand-1" hc-expand-1)
   (def-var! "jolt.host" "resolve-global" hc-resolve-global)
   (def-var! "jolt.host" "resolvable-names" hc-resolvable-names)
   (def-var! "jolt.host" "host-class-name?" hc-host-class-name?)
+  (def-var! "jolt.host" "ns-shaped-name?" hc-ns-shaped-name?)
+  (def-var! "jolt.host" "namespace-for" hc-namespace-for)
   (def-var! "jolt.host" "host-intern!" hc-intern!)
   (def-var! "jolt.host" "form-syntax-quote-lower" hc-syntax-quote-lower)
+  (def-var! "jolt.host" "form-syntax-quote-expand" hc-sq-expand-all)
   (def-var! "jolt.host" "record-type?" hc-record-type?)
   (def-var! "jolt.host" "record-ctor-key" hc-record-ctor-key)
   (def-var! "jolt.host" "deftype-ctor-class" hc-deftype-ctor-class)
@@ -657,6 +1012,33 @@
   (def-var! "jolt.host" "inline-enabled?" hc-inline-enabled?)
   (def-var! "jolt.host" "inference-enabled?" hc-inference-enabled?)
   (def-var! "jolt.host" "inline-ir" hc-inline-ir)
-  (def-var! "jolt.host" "stash-inline!" hc-stash-inline!))
+  (def-var! "jolt.host" "stash-inline!" hc-stash-inline!)
+  (def-var! "jolt.host" "var-redefined?" hc-var-redefined?)
+  (def-var! "jolt.host" "seed-callable?" hc-seed-callable?)
+  (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!))
 
 (hc-install!)
+
+;; --- jolt.scheme's lookup half -----------------------------------------------
+;; scheme-proc resolves a top-level Scheme binding at CALL time, through the
+;; adapter's global-reflection seam (sa-baked-global — portcheck pins the raw
+;; top-level-value/bound? primitives to scheme-adapter-runtime.ss). Its #f
+;; sentinel conflates "unbound" with "bound to #f", which is fine here: this
+;; fetches PROCEDURES, and a procedure is never #f. An unbound name answers a
+;; catchable ex-info rather than Chez's raw error, because "you typo'd the
+;; primitive" is the hatch's everyday failure — and in a tree-shaken binary it
+;; is also how a shaken-out primitive reports itself. It lives HERE, in the
+;; runtime half, because it needs no compiler: a build that drops the compiler
+;; image (build.ss drop-compiler?) leaves compile-eval.ss out, and a program
+;; whose only hatch use is jolt.scheme/proc must still answer. Its sibling
+;; scheme-eval-string, which does compile, stays in compile-eval.ss.
+(def-var! "jolt.host" "scheme-proc"
+  (lambda (name)
+    (let ((sym (string->symbol (jolt-need-string name))))
+      (let ((v (sa-baked-global sym)))
+        (or v
+            (jolt-throw (jolt-ex-info
+                         (string-append "no top-level Scheme binding: "
+                                        (symbol->string sym))
+                         (jolt-hash-map (jolt-keyword "name")
+                                        (symbol->string sym)))))))))

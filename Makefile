@@ -21,7 +21,36 @@ include $M/init.mk
 
 # An explicit caller-selected Chez is authoritative. This preserves CI/release
 # toolchains whose threading, libc floor, and native libraries are intentional.
+#
+# Same-or-newer system Chez: with nothing explicit selected, a Chez on PATH at
+# or above JOLT-CHEZ-FLOOR is also used as-is — the system toolchain then
+# builds and links everything, one self-consistent toolchain end to end, and
+# nothing is downloaded. Older, broken, or absent, fall through to provisioning
+# the pinned Chez + xPack GCC below. Set JOLT_SYSTEM_CHEZ= (empty) to always
+# provision the pinned versions.
+JOLT-CHEZ-FLOOR ?= 10.4.1
+JOLT_SYSTEM_CHEZ ?= 1
 JOLT-CHEZ := $(or $(CHEZ),$(CHEZSCHEME))
+ifeq (,$(JOLT-CHEZ))
+ifeq (1,$(JOLT_SYSTEM_CHEZ))
+JOLT-CHEZ := $(shell \
+  for name in chez chezscheme scheme; do \
+    exe=$$(command -v $$name 2>/dev/null) || continue; \
+    test -x "$$exe" || continue; \
+    exe=$$(cd "$$(dirname "$$exe")" && pwd -P)/$$(basename "$$exe"); \
+    v=$$(printf '(display (scheme-version)) (newline)\n' | "$$exe" -q 2>/dev/null | tr -d '\r'); \
+    v=$$(printf '%s\n' "$$v" | awk '{print $$NF}'); \
+    ok=$$(awk -v v="$$v" -v f="$(JOLT-CHEZ-FLOOR)" 'BEGIN { \
+      split(v, V, "."); split(f, F, "."); \
+      for (i = 1; i <= 3; i = i + 1) { \
+        if (V[i] + 0 > F[i] + 0) { print 1; exit } \
+        if (V[i] + 0 < F[i] + 0) { exit } \
+      } \
+      print 1 }'); \
+    if [ "$$ok" = 1 ]; then printf '%s\n' "$$exe"; break; fi; \
+  done)
+endif
+endif
 ifneq (,$(JOLT-CHEZ))
 SHELL-DEPS += $(JOLT-CHEZ)
 else
@@ -35,6 +64,11 @@ include $M/shell.mk
 MAKES-CLEAN := \
   build/ \
   target/ \
+
+MAKES-REALCLEAN := \
+  .jolt/ \
+  test/chez/*/.jolt/ \
+  test/chez/*/*/.jolt/ \
 
 PREFIX ?= $(if $(IS-ROOT),/usr/local,$(HOME)/.local)
 CHEZ ?= $(JOLT-CHEZ)
@@ -53,24 +87,32 @@ CHEZSCHEME-LIB-DIRS := \
   $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/lz4/lib \
   $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/zlib
 export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $(LIBRARY_PATH),:$(LIBRARY_PATH))
+# The provisioned GCC built Chez, so the same driver links the standalone
+# binary: gcc.mk puts the bundle's bin FIRST on the exported PATH, but the
+# bundle ships no `cc`, so a bare cc falls through to the distro driver and
+# pairs it with the bundle's older as/ld (#788: gcc 16 .base64 into pre-2.43
+# gas). build.ss bld-cc reads JOLT_CC. A command-line JOLT_CC=... still wins.
+export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
-  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
-  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling \
+  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
+  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
-  traceemit \
+  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
+  narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status \
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status hooks attributioncheck \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
-        gambitgen gambitgencheck gambitseedcheck grenadinecheck \
+        gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
+        gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
         fibersbench dynbench \
         fibersresidue
 
@@ -118,16 +160,16 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
+CI-GATES := submodules values recordinline corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
-  hasheq \
-  protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
-  fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
+  hasheq narrowhash \
+  protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
+  fnform coreproc traceemit traceeval degradedbacktrace \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -222,6 +264,12 @@ selfhost:
 values:
 	@$(CHEZ) --script test/chez/values-test.ss
 
+# Record predicates/accessors/mutators/constructors are open-coded: the
+# define-record-type in scheme-adapter-runtime.ss binds them as syntax over the
+# constant rtd. The gate pins the expansion shape and the semantics kept.
+recordinline:
+	@$(CHEZ) --script test/chez/record-inline-test.ss
+
 # The hash engine's VALUES, pinned to JVM Clojure. hasheq.ss gets tuned for speed
 # (its 32-bit leaf helpers are macros so they inline), and a tuning pass that
 # changes a hash VALUE rather than its cost fails nothing until a hash crosses the
@@ -229,6 +277,19 @@ values:
 # sweep over every length and char class.
 hasheq:
 	@$(CHEZ) --script test/chez/hasheq-test.ss
+
+# The same suites again with the hash engine's NARROW arms selected. hasheq.ss
+# and collections.ss compute in the Java int window, which is fixnum on a 64-bit
+# Chez and bignum on a 32-bit one (tpb32l, the pb/WASM build), so each operator
+# has a generic exact-integer twin that only a 32-bit host would otherwise ever
+# run. JOLT_NARROW_HASH=1 forces that arm at expand time here, which puts the
+# generic twins under the JVM-pinned hash goldens, the value-model suite and the
+# transient HAMT suite on ordinary hardware. Slower than `hasheq`: the knob is
+# read during expansion, so gate-boot has to compile the preamble from source.
+narrowhash:
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/hasheq-test.ss
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/values-test.ss
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/transient-test.ss
 
 # Fibers R1 (epic jolt-nvpr.2): the fiber primitive + single-carrier scheduler
 # behind the CONTRACT.txt coroutines tier. Correctness (round trip, completion,
@@ -273,6 +334,12 @@ fibers:
 asynctimer:
 	@$(CHEZ) --script test/chez/async-timer-test.ss
 
+# A nested run-interruptible extent restores the enclosing polling timer after
+# normal return, exception, or interruption, without sharing ownership between
+# application threads.
+interruptnest:
+	@$(CHEZ) --script test/chez/interrupt-nesting-test.ss
+
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two
 # workloads the trade-off is judged on — N nested fn literals (deep) and a real
@@ -300,6 +367,18 @@ corpus:
 # Host-specific unit cases.
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
+
+# The jolt half of the known-divergences :documented gate: every entry's :check
+# must render exactly its recorded :jolt value, its :jvm and :jolt must differ,
+# and an entry with no :check fails. certify.clj runs the JVM half against
+# reference Clojure; this half needs no JVM, so it lives in `ci`.
+# `make documented-record` prints what jolt currently answers, for recording a
+# new entry. Run `make certify` for the JVM side through the pinned oracle.
+documented:
+	@$(CHEZ) --script host/chez/run-documented.ss
+
+documented-record:
+	@$(CHEZ) --script host/chez/run-documented.ss --record
 
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
@@ -330,9 +409,36 @@ smoke: testbin
 tracesmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/trace-smoke.sh
 
+# What a user READS when jolt rejects their program: message, position, ex-data,
+# trace and exit status, pinned per case as golden files under test/errors. Every
+# other gate asserts that a bad program is rejected; this one asserts what the
+# report then says. Regenerate deliberately with:
+#   sh host/chez/error-report-check.sh generate
+errorreport: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/error-report-check.sh
+
+# Every diagnostic kind the sources raise is registered in
+# test/conformance/error-kinds.edn, and every registered kind is still raised.
+# Both directions: an unregistered kind is an error with no documented meaning,
+# and a registry entry nothing raises is a doc rotting into decoration.
+errorkinds:
+	@sh host/chez/error-kinds-check.sh
+
 # The IR schema validator (JOLT_IR_VALIDATE) reports no problems on real code.
 irvalidate:
 	@sh host/chez/ir-validate-smoke.sh
+
+# Every var the checked-in seed defines exists after the seed loads. The seed's
+# forms are emitted guard-wrapped so the MINT can skip one that fails to compile
+# (remint.sh fails on a nonzero skip count); the same guard is in the emitted
+# text, so it equally swallows a form that raises when the seed LOADS, and that
+# half went unchecked -- the var never appears and every read of the name gets
+# the truthy unbound sentinel (jolt#879). Run twice: the two compiler trace flags
+# are read in such defs, and each run pins them against its own environment, so
+# neither "always on" nor "always off" passes both arms.
+seeddefs:
+	@$(CHEZ) --script host/chez/run-seed-defs.ss
+	@JOLT_WP_TRACE=1 JOLT_IR_VALIDATE=1 $(CHEZ) --script host/chez/run-seed-defs.ss
 
 # The build-driving gates take testbin for the same reason smoke and cts do,
 # only more so: a `jolt build` costs ~2.5s through the prebuilt binary and
@@ -354,6 +460,13 @@ buildlibsmoke: testbin
 # default), and --dynamic keeps the runtime load-shared-object path.
 staticnativesmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/static-native-smoke.sh
+
+# Duplicate native symbol detection (issue #731): a declared :jolt/native that
+# carries its own static copy of another's code — raygui linked against
+# libraylib.a — used to go inert with no error. Pins that the footgun build is
+# reported AND that a correctly linked one is not.
+ffidupsym:
+	@sh host/chez/ffi-duplicate-symbol-smoke.sh
 
 # OPT-IN: jolt.mvn-http cert-verifying HTTPS fetch against Central + Clojars.
 # Not in `make test` — needs network + a working system OpenSSL.
@@ -383,6 +496,30 @@ mvnhttp:
 # Takes the built binary: script mode would measure the same ratio far slower.
 readscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/read_scaling_test.clj
+
+# Compiling a namespace stays linear in its source, and a quoted form does not
+# cost dramatically more than the construction it is. The second half is not
+# implied by the first: a per-form cost regression is linear, just linear and
+# slow, and one shipped green through the whole gate (see the file).
+compilescaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/compile_scaling_test.clj
+
+# apply must stream a variadic's rest, not materialize it: guards the
+# jolt-register-variadic! registration on the native + - * / min max and the
+# comparison chains (host/chez/seq.ss). Without it (apply max (range)) realizes
+# an unbounded seq until the process dies.
+applyscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/apply_scaling_test.clj
+
+# Lazy realization costs the same whether or not a thread has ever existed: a
+# cell publishes its forced tail through one word and reads it lock-free, and the
+# once-only mutex is borrowed for the force, never kept per cell. The ratio of one
+# workload timed before and after a thread has existed, in ONE process, is the
+# judge; a per-cell mutex reads ~5 there (every collection visits a million
+# finalized objects), the claim design ~1.5. Also races eight walkers over
+# shared unrealized seqs and checks every producer ran exactly once.
+lazyscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/lazyseq_mt_scaling_test.clj
 
 # (into vec vec) and subvec stay O(log n) through core — the raw pvec ops have
 # rrbscaling; this catches core falling back to an element-by-element rebuild.
@@ -421,6 +558,15 @@ complexity: testbin
 ioscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/io_scaling_test.clj
 
+# The constant-factor fast paths, each judged as a RATIO against a reference arm
+# the same run measures: reading a form off a stream vs off a string, the
+# memory-bounded char[] read vs slurping the file, and the literal-pattern
+# recognition that keeps split/replace off the regex engine. Deliberately not a
+# scaling gate — every regression here is linear with a terrible constant, which
+# a 1x-vs-4x ratio cannot see (see the file's header).
+fastpathratio: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/fastpath_ratio_test.clj
+
 # The 2026-08 sweep's remaining hot-path shapes in one gate: split-with-limit,
 # core.async timeout arming, ArrayDeque/StringTokenizer draining, ns-publics/
 # refer var-table independence, set/intersection smaller-side walk.
@@ -432,6 +578,27 @@ hotscaling: testbin
 # fixture projects in test/chez/deps-alias/. Offline.
 depssmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-alias-smoke.sh
+
+# bb.edn / deps.edn :tasks through the real CLI: babashka task semantics
+# (:depends, :init, :requires, :enter/:leave, :private, :extra-paths/:extra-deps,
+# the babashka.tasks API), the `tasks` listing, and exit-code propagation.
+# Offline fixture projects in test/chez/tasks/.
+taskssmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/tasks-smoke.sh
+
+# Running a FILE as a script through the real CLI, including a
+# `#!/usr/bin/env jolt` shebang executed by the kernel: the shebang line as a
+# comment, *command-line-args*, *file*, stdin, exit-code propagation, a project's
+# roots, -f/--file, and which of a file, a command and a task wins a name.
+# Offline, throwaway projects in a temp dir.
+scriptsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/script-smoke.sh
+
+# `jolt completions`: the name/doc lines a completing shell asks for, and the
+# zsh/bash/fish snippets it installs — parsed by their own shells, and the bash
+# one actually run against a project to see what it offers.
+completionssmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/completions-smoke.sh
 
 # The resolved-roots cache (.jolt/cpcache): a warm run reuses a project's final
 # dependency resolution instead of re-expanding the graph. Offline throwaway
@@ -480,24 +647,73 @@ stdlibfasl: testbin
 sci:
 	@$(CHEZ) --script host/chez/run-sci.ss
 
+# A complementary functional gate: load SCI through Jolt's ordinary dependency
+# path, then initialize and reuse real contexts. run-sci.ss remains the broad,
+# intentionally lenient source-loading compatibility gate.
+scifunctional: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/sci-functional-test.clj
+
 # clojure-test-suite conformance: run the vendored jank-lang/clojure-test-suite
 # per-namespace under jolt, gated on the per-namespace baseline
 # (test/chez/cts-known-failures.txt).
 cts: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" bash host/chez/cts.sh
 
+# The loader conformance suite: the cases that specify jolt.loader (roots
+# per context, isolation, delegation policy, unload). Baselined like certify —
+# a case that regresses fails, and a case that starts passing fails until the
+# baseline records it, so nothing green quietly goes red again.
+#
+# Through the BUILT binary, like cts and the other CLI gates: a loader that only
+# works against the source tree is not a loader, and jolt.loader ships in the
+# stdlib fasl, so the binary is the arrangement the cases have to hold under.
+loaderconf: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/loaderconf.sh
+
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
 # The widths gate covers the exact scalar vocabulary across both halves of the
-# API: runtime memory access and compiler-emitted procedures/callables. The
-# layout gate compares declarative struct metadata and field access against C;
-# the aggregate gate covers structs passed and returned by C value.
+# API: runtime memory access and compiler-emitted procedures/callables, :bool
+# included — the one type whose value, not just width, converts at the boundary.
+# The layout gate compares declarative struct metadata and field access against
+# C; the aggregate gate covers structs passed and returned by C value; the native
+# error gate covers atomic errno/GetLastError capture and option composition.
+# The arena gate covers the allocation-lifetime API (issue #799) and the rest of
+# the babashka.ffi-compatible surface built on it — the four arena kinds and who
+# closes each, arena-owned blocks/strings/callbacks/views, the pointer
+# vocabulary, layout-shaped read and write, places, and the typed array moves.
+# The foreign-thread gate covers the other side of the same collect-safety
+# contract (issue #973): a callback arriving on the library's OWN thread while
+# the caller is parked in an outbound call to that library, where a call that is
+# not :blocking pins the collector the callback needs — and the two signatures
+# the collect-safe convention cannot carry, which jolt must refuse in its own
+# words rather than leave to Chez's expander.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
+	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
+	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-foreign-thread-test.sh
+
+# Escape continuations (jolt.continuations, issue #736): the one-shot contract
+# call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
+# is not an ownership boundary, and the four misuses. The cross-fiber rows are
+# why this gate exists — unguarded, invoking an escape captured on another
+# fiber hangs the process rather than raising, so each of those rows runs on a
+# watchdog thread and FAILS on a deadline instead of wedging the run.
+continuations:
+	@bin/jolt run test/chez/continuations-test.clj
+
+# clojure.core.async.flow: the graph end to end (start/pause/resume/ping/inject,
+# the error channel, casts) and the j.u.c seams under it — deref of a Future,
+# ExecutionException out of .get, instance? Executor, and the workload -> carrier
+# mapping. The scale row is the one that would regress silently: :io processes
+# run on fibers, so 200 of them do not need 200 threads.
+flow:
+	@bin/jolt run test/chez/flow-test.clj
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
@@ -643,6 +859,23 @@ degradedbacktrace:
 narrow:
 	@$(CHEZ) --script host/chez/run-narrow.ss
 
+# The direct call shapes of a --direct-link build: seed vars called through a
+# load-bound root, the unhinted string/keyword interop guard, the unchecked
+# family lowered to its helpers, case on interned constants (run-directcall.ss).
+directcall:
+	@$(CHEZ) --script host/chez/run-directcall.ss
+
+# Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
+# transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
+arraymap:
+	@$(CHEZ) --script test/chez/arraymap-test.ss
+
+# Array backings: which Chez vector type each element kind stores its elements
+# in (fxvector / bytevector / flvector / boxed vector), the fixnum-range
+# widening, and that a boxed array of a typed kind still behaves.
+arraybacking:
+	@$(CHEZ) --script test/chez/array-backing-test.ss
+
 # Direct-linking emission: a closed-world build binds top-level app defs to jv$
 # Scheme bindings and routes app->app calls/refs to them, skipping var-deref +
 # jolt-invoke; ^:dynamic/^:redef and nested defs opt out.
@@ -654,6 +887,14 @@ directlink:
 # closure's inspector name must agree; system-ns closures stay unregistered.
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss
+
+# Every clojure.core fn must be nameable in value position: the state image
+# writes a procedure as its var NAME, and a native that is set!-extended after
+# its def-var! leaves a procedure nothing named — so values built from it stop
+# being writable, silently. Swept from the var table, so a fn added later is
+# covered without anyone remembering.
+coreproc:
+	@$(CHEZ) --script test/chez/core-proc-name-test.ss
 
 # Compilation-unit context: the emit-session state (mode flags, direct-link
 # registries, ctor shapes, gensym, cache cells) is per-unit, so two units are
@@ -740,6 +981,44 @@ readmecheck:
 portcheck:
 	@sh host/chez/portability-check.sh
 
+# The two hand-mirrored host file pairs (chez/rt.ss <-> gambit/rt-core.ss and the
+# two hasheq.ss) must not drift: a procedure defined in BOTH has to be identical
+# unless mirror-drift-allowlist.txt records the split as deliberate. Everything
+# else the hosts share is generated and gated by its own generator check; these
+# two pairs were kept in step by hand with nothing watching. Compares read
+# DATA, so reformatting is not drift, and a stale allowlist line fails too.
+mirrordrift:
+	@sh host/chez/mirror-drift-check.sh
+
+mirrordrift-regen:
+	@sh host/chez/mirror-drift-check.sh --regen
+
+# host/chez/regex-dfa.ss is a COPY of one vendored irregex procedure with two
+# deliberate changes. Fails when the submodule's original has moved on, so a
+# vendor bump cannot leave jolt shadowing a stale copy in silence.
+regexdfacheck:
+	@sh host/chez/regex-dfa-check.sh
+
+regexdfacheck-regen:
+	@sh host/chez/regex-dfa-check.sh --regen
+
+# The DFA work budget itself (#945): the pattern that took ~5s / never finished
+# takes the backtracker, a small one still gets a DFA, and the two engines agree
+# on every match. Deterministic — which engine a pattern got — not a clock.
+regexdfa:
+	@$(CHEZ) --script test/chez/regex-dfa-test.ss
+
+# Top-level host procedures nothing calls. A definition whose last caller went
+# away is still compiled into every binary and still copied forward into the
+# Gambit half by gen-records.ss — four of the first batch were dead in BOTH
+# copies for exactly that reason. Counts a name referenced when it appears as a
+# token anywhere OUTSIDE a comment, string bodies included (the backend emits
+# calls as text), or when an identifier inside a string literal is its stem and
+# the tail is all digits: (str "jolt-ffi-varargs-proc" k) reaches proc0..proc3,
+# and a gate without that rule would have deleted every varargs FFI binding.
+deadhost:
+	@sh host/chez/dead-host-check.sh
+
 census:
 	@sh host/chez/portability-check.sh --census
 
@@ -748,6 +1027,67 @@ census:
 # contract file lists a name Chez does not provide.
 adaptercheck:
 	@$(CHEZ) --script host/scheme-adapter/chez.ss
+
+# The three derived host properties (sa-os-family / sa-arch / sa-endian) are all
+# host logic may ask about the platform, so one wrong row is a wrong SIGCHLD,
+# LC_TIME and struct-stat offset at once. The row that broke in #796 — a
+# portable-bytecode tag, which names no OS — is only reachable from a host we do
+# not build on, so the table is pinned per tag rather than per running machine.
+hostprops:
+	@$(CHEZ) --script test/chez/host-derived-props-test.ss
+
+# The host method registry's tag relations (host-static.ss alias / derive): a
+# derivation must agree with the class graph (the child's class a strict
+# descendant of the parent's, both tags naming a class), the chain cannot cycle,
+# an alias of a derived tag inherits the link, and reflection lists a shadowed
+# member once. Also re-checks every derivation the runtime itself registers.
+hostregistry:
+	@$(CHEZ) --script test/chez/host-registry-test.ss
+
+# The process's own symbol handle is loaded once per process: Chez walks every
+# loaded handle with dlsym before its static "(cs)" table, so the 57 boot-time
+# loads made each foreign miss (and inspect/object) a 2 ms walk.
+foreignhandles:
+	@$(CHEZ) --script test/chez/foreign-handles-test.ss
+
+# An unhinted method call allocates its argument vector and at most one arg
+# list: no arm converts the rest args before testing the receiver.
+dispatchalloc:
+	@$(CHEZ) --script test/chez/method-dispatch-alloc-test.ss
+
+# A Matcher owns its match vector and source triple: repeated finds allocate
+# the result, not the machinery; .group reads the last match, none after a miss.
+regexmatcher:
+	@$(CHEZ) --script test/chez/regex-matcher-test.ss
+
+# java.io.File/getCanonicalPath's LEXICAL half, per platform (#991). On Windows
+# realpath(3) is not bound, so the fallback IS getCanonicalPath there — and its
+# POSIX-only spelling rejoined every segment as "/" + segment, answering
+# "/C:/Users/x/a.txt" for a drive-absolute path, which no later read or write
+# could open. Like hostprops, the rows that broke are unreachable from the host
+# CI runs on, so the platform (and realpath itself) is a parameter.
+winpath:
+	@$(CHEZ) --script test/chez/win-path-test.ss
+
+# The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
+# enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file
+# rather than one per top-level form — so a large enough app built a binary that
+# died in Sbuild_heap. build.ss re-encodes such an image with gzip; this measures
+# the ceiling of the kernel in front of it (undefined behaviour, so 2^28 on some
+# platforms and 2^29 on others), then pins that jolt's constant sits safely under
+# it, plus the entry scanner and both fallbacks. JOLT_MAX_HEAP=off because some
+# of the checks have to allocate at the ceiling to ask the question at all, and
+# the runtime's own heap bound would otherwise answer first.
+vfaslceiling:
+	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
+
+# The other half of the same rule: knowing the platform is only useful if the
+# struct stat offsets it selects are the ones this machine actually uses. The
+# gate measures the layout with no identity to go on — the pb case — and then
+# reads a file whose mode it just set, which no offset that merely happens to
+# carry S_IFDIR would answer correctly.
+statlayout:
+	@$(CHEZ) --script test/chez/stat-layout-test.ss
 
 # Every lock in the runtime must route through jolt's wrapper, because
 # preemption is refused while one is held and that only works if the runtime can
@@ -777,27 +1117,78 @@ parkcheck:
 shelloutcheck:
 	@sh host/chez/shellout-check.sh
 
+# errno survives only until the next thing that can set it, and reading it is
+# itself a foreign call — so a syscall wrapper must capture it once, at the
+# syscall, and branch on the value. See the script for what asking twice cost.
+errnocheck:
+	@sh host/chez/errno-check.sh
+
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.
 makefilesmoke:
 	@bash test/makefile-smoke.sh
 
+# tools/version.sh is the one definition of a checkout's version (bin/jolt,
+# build-jolt.ss and the release workflow all read it). The property: release
+# tags only, so the rolling `vnightly` tag the nightly moves to main's head is
+# never the answer, and a checkout with no release tag reachable answers
+# dev-g<sha>, which no :jolt/min-version floor can misread as a version.
+versionsmoke:
+	@bash test/version-smoke.sh
+
+# No AI-assistant attribution in the commits this tree adds to origin/main: a
+# session-link trailer, a co-author line, a generated-with footer. Commit
+# messages here describe the change and nothing else, and a session link is a
+# private URL. tools/attributioncheck.sh scans origin/main..HEAD (HEAD alone
+# when the remote branch is unknown); the same script is the commit-msg hook
+# `make hooks` installs, and CI's attribution job runs it over the pushed or PR
+# range with full history.
+attributioncheck:
+	@sh tools/attributioncheck.sh
+
+# Install the repository's git hooks into .git/hooks (copies, so a clone that
+# never runs this is unaffected; re-run after a hook changes).
+hooks:
+	@for h in tools/git-hooks/*; do cp "$$h" ".git/hooks/$$(basename "$$h")"; chmod +x ".git/hooks/$$(basename "$$h")"; echo "installed .git/hooks/$$(basename "$$h")"; done
+
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
+# The oracle version is READ from the committed profile, which certify.clj also
+# checks the running Clojure against — so the pin has one source, and bumping the
+# oracle is a profile edit rather than two edits that can drift apart.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
-		clojure -M test/conformance/certify.clj --self-test && \
-		clojure -M test/conformance/certify.clj; \
+		v=$$(sed -n 's/^ :clojure-version "\([^"]*\)".*/\1/p' test/conformance/profile.edn); \
+		if [ -z "$$v" ]; then echo "certify: no :clojure-version in test/conformance/profile.edn"; exit 1; fi; \
+		deps="{:deps {org.clojure/clojure {:mvn/version \"$$v\"}}}"; \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj --self-test && \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
 	fi
 
+# Where the gambit gates find gsi and gsc: GAMBIT_PREFIX/bin, brew's
+# gambit-scheme prefix by default (tests.yml builds 4.9.8 from source into
+# /opt/gambit and passes GAMBIT_PREFIX=/opt/gambit). NEVER bare gsc/gsi (gsc on
+# PATH is Ghostscript): always a prefix's binary. Absolute, because gambitboot
+# and unbound-check.sh cd into host/gambit before running it.
+GAMBIT_PREFIX ?= $(shell brew --prefix gambit-scheme 2>/dev/null)
+GAMBIT_GSI := $(abspath $(GAMBIT_PREFIX))/bin/gsi
+GAMBIT_GSC := $(abspath $(GAMBIT_PREFIX))/bin/gsc
+
+# Every gambit gate is detection-gated like certify: no gambit, clean skip. With
+# JOLT_REQUIRE_GAMBIT set the skip is a failure instead — tests.yml sets it, so
+# an install step that quietly stopped installing cannot turn the gates into
+# no-ops that read as green (the boot ran dead for two weeks with every gambit
+# gate skipping on the runner). $@ names the gate in the message.
+GAMBIT-SKIP = if [ -n "$$JOLT_REQUIRE_GAMBIT" ]; then \
+	  echo "$@: no gambit at $(GAMBIT_PREFIX)/bin and JOLT_REQUIRE_GAMBIT is set" >&2; exit 1; \
+	else \
+	  echo "$@: gambit-scheme not installed (GAMBIT_PREFIX=$(GAMBIT_PREFIX)) — skipped"; \
+	fi
+
 # Gambit adapter gate (G1, jolt-mj95.2): loads host/gambit/{prelude-shims,
 # scheme-adapter-runtime,hasheq}.ss under native gsi and asserts the
-# CONTRACT.txt names + shim behavior. Detection-gated like certify — skips
-# cleanly when gambit-scheme is absent. NEVER bare gsc/gsi (gsc on PATH is
-# Ghostscript): always the brew-prefix binary.
-GAMBIT_GSI := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsi
-GAMBIT_GSC := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsc
+# CONTRACT.txt names + shim behavior.
 
 # host/gambit/records-gambit.ss is GENERATED from the four host/chez records
 # files — records.ss, records-coll.ss, protocols.ss, records-dispatch.ss — (the
@@ -872,39 +1263,103 @@ gambitcheck:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/gambitcheck.ss; \
 	else \
-		echo "gambitcheck: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # G2 kernel-test gate (jolt-mj95.4): the full booted manifest on native gsi,
 # driven through the real natives. Same detection-gated shape as gambitcheck;
-# NOT in the ci list. Run from the repo root (boot's irregex load is cwd-relative).
+# a second on gsi. Run from the repo root (boot's irregex load is cwd-relative).
 gambitkernel:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/kernel-test.ss; \
 	else \
-		echo "gambitkernel: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # G3 eval gate: real jolt source through jolt-compile-eval on the booted
 # manifest + cross-minted seed, renders pinned to Chez captures. Detection-
-# gated like gambitcheck and NOT in the ci list — it boots the full seed, so
-# it takes about a minute on gsi. Run from the repo root.
+# gated like gambitcheck. In the ci list: it is the only gate that runs
+# emitted code on gsi end to end, and while it sat outside ci every row failed
+# for two weeks (jolt-cw2p) with nothing red. Run from the repo root.
 gambiteval:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/eval-test.ss; \
 	else \
-		echo "gambiteval: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
+
+# Every Scheme global the full-profile boot references is defined — Gambit's
+# own linker report over the compiled boot, minus what the record translator
+# evals at runtime, against host/gambit/unbound-allowlist.txt (untaken paths;
+# a stale line fails). The boot splices most of host/chez, so a Chez-side name
+# reaching a shared file is otherwise an unbound global no Chez gate can see;
+# mirrordrift only compares names defined on BOTH hosts. ~75s: it compiles the
+# seed to js (text only, no C compiler, no node). Detection-gated. Ordered
+# after gambitboot: both regenerate boot-full.ss, and under -j a reader must
+# not open the file mid-rewrite.
+gambitunbound: gambitboot
+	@if [ -x "$(GAMBIT_GSC)" ]; then \
+		JOLT_GSC="$(GAMBIT_GSC)" sh host/gambit/unbound-check.sh; \
+	else \
+		$(GAMBIT-SKIP); \
+	fi
+
+gambitunbound-regen:
+	@JOLT_GSC="$(GAMBIT_GSC)" sh host/gambit/unbound-check.sh --regen
+
+# The jolt half of the same question: every var cell the boot interned is
+# bound. Emitted code reaches a var through its cell, so after the boot the
+# var table holds every var the seed and the compiler image reference — an
+# unbound root is a reference nothing this boot defines (clojure.core/
+# chunk-first, bound by the excluded natives-array.ss, is how every `defn`
+# died). Against host/gambit/unbound-vars-allowlist.txt; a stale line fails.
+# One gsi boot, a few seconds. Detection-gated.
+gambitvars:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		"$(GAMBIT_GSI)" host/gambit/unbound-vars.ss < /dev/null; \
+	else \
+		$(GAMBIT-SKIP); \
+	fi
+
+gambitvars-regen:
+	@JOLT_GAMBITVARS=regen "$(GAMBIT_GSI)" host/gambit/unbound-vars.ss < /dev/null
+
+# The third question: every Class/member call and (new Class) the seed emits
+# resolves in the booted statics/constructor registries. The registries are
+# host-static-methods.ss's on Chez and host/gambit/host-statics.ss's here, and
+# nothing else says which of the seed's statics this target carries — a remint
+# reaching a new one degraded silently (parse-long answered "unsupported" with
+# every gate green). Reads the seed as text, boots, asks the registries; misses
+# against host/gambit/seed-statics-allowlist.txt, a stale line fails. A grep
+# and one gsi boot, a few seconds. Detection-gated.
+gambitstatics:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		JOLT_GSI="$(GAMBIT_GSI)" sh host/gambit/seed-statics.sh; \
+	else \
+		$(GAMBIT-SKIP); \
+	fi
+
+gambitstatics-regen:
+	@JOLT_GSI="$(GAMBIT_GSI)" sh host/gambit/seed-statics.sh --regen
+
+# Every macro the emitter can put in call position (the op registry's :call
+# names, the numeric op tables) has a same-named function in eval-fns.ss:
+# eval'd code on the Gambit boot cannot see unit macros. grep only, so it
+# gates in CI whether or not gambit is installed.
+gambittwins:
+	@sh host/gambit/eval-twins-check.sh
 
 # Build profiles: generate the reduced repl profile and check that the language
 # still works while an excluded feature reports itself instead of failing as an
-# unbound name. Cheap (a gsi load, no js compile), so it can gate the mechanism.
-gambitprofile:
+# unbound name. Cheap (a gsi load, no js compile), so it gates the mechanism.
+# Ordered after gambitboot: gen-boot.ss rewrites boot-active.ss for every
+# profile, and under -j two writers would race on it.
+gambitprofile: gambitboot
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		$(CHEZ) --script host/gambit/gen-boot.ss repl; \
 		"$(GAMBIT_GSI)" host/gambit/profile-test.ss; \
 	else \
-		echo "gambitprofile: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # The full-profile boot comes up on gsi: the js and gsi targets share the boot,
@@ -921,7 +1376,7 @@ gambitboot:
 	    *) printf '%s\n' "$$out" | tail -20; echo "gambitboot: FAILED — full-profile boot did not reach BOOT-OK" >&2; exit 1;; \
 	  esac; \
 	else \
-	  echo "gambitboot: gambit-scheme not installed (brew) — skipped"; \
+	  $(GAMBIT-SKIP); \
 	fi
 
 # The browser bundle: the whole stack (kernel + seed + compiler + a queue-polling
@@ -946,7 +1401,7 @@ gambitweb:
 		echo "gambitweb: $(GAMBIT_WEB_OUT) ($$(wc -c < "$$out" | tr -d ' ') bytes,\
  $$(gzip -c "$$out" | wc -c | tr -d ' ') gzipped)"; \
 	else \
-		echo "gambitweb: gambit-scheme not installed (brew) — skipped"; \
+		$(GAMBIT-SKIP); \
 	fi
 
 # G3 compiler-on-gsi (jolt-mj95.4): cross-mint the Gambit seed from the Chez

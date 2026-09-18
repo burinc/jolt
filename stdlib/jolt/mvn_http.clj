@@ -50,11 +50,12 @@
      "/usr/local/opt/openssl@3/lib/libssl.dylib"]
     ssl-names))
 
-;; JOLT_OPENSSL_LIBDIR names a directory whose libcrypto/libssl are tried
-;; before the platform candidates — the seam for an OpenSSL living outside
-;; the built-in paths (Nix, MacPorts, Guix, a nonstandard Homebrew prefix).
-;; The macOS hazard above does not apply to it: the entries are absolute
-;; paths into the named directory, never the bare Apple-shadowed sonames.
+;; A stock Windows install has no OpenSSL on PATH, but Git for Windows ships
+;; OpenSSL 3 under mingw64/bin: the machine-wide install under ProgramFiles
+;; (ProgramW6432 is the same directory seen from a 32-bit process) and the
+;; per-user one under LOCALAPPDATA/Programs. Pure over its three inputs so the
+;; gate can pin the list; the DLLs are tried in this order after
+;; JOLT_OPENSSL_LIBDIR and before the bare names.
 (defn- windows-openssl-libdirs-for [program-files program-w6432 local-app-data]
   (->> [[program-files "Git/mingw64/bin"]
         [program-w6432 "Git/mingw64/bin"]
@@ -65,6 +66,11 @@
        distinct
        vec))
 
+;; JOLT_OPENSSL_LIBDIR names a directory whose libcrypto/libssl are tried
+;; before the platform candidates — the seam for an OpenSSL living outside
+;; the built-in paths (Nix, MacPorts, Guix, a nonstandard Homebrew prefix).
+;; The macOS hazard above does not apply to it: the entries are absolute
+;; paths into the named directory, never the bare Apple-shadowed sonames.
 (defn- runtime-openssl-libdirs [explicit]
   (cond-> (if (and explicit (not (str/blank? explicit))) [explicit] [])
     windows? (into (windows-openssl-libdirs-for
@@ -121,7 +127,8 @@
 ;; before the first call), which exports the same getaddrinfo/socket/connect/
 ;; recv/send names plus closesocket. ---
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int :blocking)
+(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
+  {:blocking true :capture-native-error true})   ; [rc errno] — see connect-error-message
 (ffi/defcfn c-close       "close"       [:int] :int)
 (ffi/defcfn c-closesocket "closesocket" [:int] :int)              ; Windows sockets
 (ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t :blocking)
@@ -143,25 +150,67 @@
 (defn- set-timeouts! [fd ms]
   (if windows?
     (let [buf (ffi/alloc 4)]
-      (ffi/write buf :int 0 ms)
+      (ffi/write buf :int ms)
       (c-setsockopt fd sol-socket so-rcvtimeo buf 4)
       (c-setsockopt fd sol-socket so-sndtimeo buf 4)
       (ffi/free buf))
     (let [tv (ffi/alloc 16)]
-      (ffi/write tv :long 0 (quot ms 1000))
-      (ffi/write tv :long 8 (* (rem ms 1000) 1000))
+      (ffi/write tv :long (quot ms 1000))
+      (ffi/write tv :long (* (rem ms 1000) 1000) 8)
       (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
       (c-setsockopt fd sol-socket so-sndtimeo tv 16)
       (ffi/free tv))))
 
-;; struct addrinfo field offsets. Both macOS and Win64 place ai_addr at 32
-;; (ai_canonname before it); Linux packs ai_addr at 24.
+;; struct addrinfo field offsets. Everything up to ai_addrlen is laid out the
+;; same everywhere; the two pointers after it are not. glibc orders them
+;; ai_addr (24) then ai_canonname (32); the BSD order — macOS, Win64 AND
+;; bionic/Android — is ai_canonname (24) then ai_addr (32).
 (def ^:private O-ai-family 4)
 (def ^:private O-ai-socktype 8)
 (def ^:private O-ai-protocol 12)
 (def ^:private O-ai-addrlen 16)
-(def ^:private O-ai-addr (if (or macos? windows?) 32 24))
+(def ^:private O-ai-addr-glibc 24)
+(def ^:private O-ai-addr-bsd 32)
 (def ^:private O-ai-next 40)
+
+;; os.name cannot tell the two orders apart: Android reports "Linux" but its
+;; libc is bionic, so picking 24 there reads the NULL ai_canonname, hands
+;; connect() a NULL sockaddr, and every candidate fails EFAULT — no dependency
+;; outside the local Maven cache can be fetched (issue #979). The layout is
+;; probed off the live result node instead. The hints never carry
+;; AI_CANONNAME, so ai_canonname is NULL on every entry getaddrinfo returns
+;; and ai_addr never is: whichever slot holds a non-NULL pointer is ai_addr.
+;; Only if the probe cannot discriminate (both slots set, which no libc here
+;; does without AI_CANONNAME) does os.name decide, as it did before.
+(def ^:private O-ai-addr-fallback (if (or macos? windows?) O-ai-addr-bsd O-ai-addr-glibc))
+
+(defn- pick-ai-addr-offset
+  "Which of the two offsets holds ai_addr, given the pointers a result node
+  carries at 24 and 32."
+  [p24 p32]
+  (cond
+    (and (ffi/null? p24) (not (ffi/null? p32))) O-ai-addr-bsd
+    (and (ffi/null? p32) (not (ffi/null? p24))) O-ai-addr-glibc
+    :else O-ai-addr-fallback))
+
+(defn- ai-addr
+  "The ai_addr pointer of one getaddrinfo result node."
+  [ai]
+  (let [p24 (ffi/read ai :pointer O-ai-addr-glibc)
+        p32 (ffi/read ai :pointer O-ai-addr-bsd)]
+    (if (= O-ai-addr-glibc (pick-ai-addr-offset p24 p32)) p24 p32)))
+
+;; Every candidate failing used to be reported as "connection refused", which
+;; is a guess: the exhaustion says only that the LAST connect failed, and for
+;; the bionic bug above the real error was EFAULT. Report the code the kernel
+;; gave, so a wrong sockaddr does not read as a network outage. strerror only
+;; speaks errno, so the Windows path (GetLastError codes) shows the number.
+(defn- connect-error-message [host port err]
+  (str "could not connect to " host ":" port
+       (cond
+         (nil? err) ""
+         windows?   (str " (error " err ")")
+         :else      (str " (errno " err ": " (ffi/errno-message err) ")"))))
 
 (defn- connect
   "Resolve host:port and open a connected TCP socket; return its fd."
@@ -170,31 +219,33 @@
         service (ffi/string->ptr (str port))
         respp (ffi/alloc (ffi/sizeof :pointer))
         hints (ffi/alloc 48)]
-    (dotimes [i 48] (ffi/write hints :uint8 i 0))
     ;; SOCK_STREAM in ai_socktype, else getaddrinfo also returns UDP entries
-    ;; and connect() on a datagram socket spuriously "succeeds".
-    (ffi/write hints :int O-ai-socktype 1)
+    ;; and connect() on a datagram socket spuriously "succeeds". Every other
+    ;; field of the hints must be 0, which ffi/alloc already made them.
+    (ffi/write hints :int 1 O-ai-socktype)
     (try
       (let [rc (c-getaddrinfo node service hints respp)]
         (when-not (zero? rc)
           (throw (ex-info (str "lookup failed: " host) {:host host})))
         (let [res (ffi/read respp :pointer)]
           (try
-            (loop [ai res]
+            (loop [ai res err nil]
               (if (ffi/null? ai)
-                (throw (ex-info (str "connection refused: " host ":" port)
-                                {:host host :port port}))
+                (throw (ex-info (connect-error-message host port err)
+                                {:host host :port port :error err}))
                 (let [fam (ffi/read ai :int O-ai-family)
                       sockt (ffi/read ai :int O-ai-socktype)
                       proto (ffi/read ai :int O-ai-protocol)
                       addrlen (ffi/read ai :int O-ai-addrlen)
-                      addr (ffi/read ai :pointer O-ai-addr)
+                      addr (ai-addr ai)
                       fd (c-socket fam sockt proto)]
-                  (cond
-                    (neg? fd) (recur (ffi/read ai :pointer O-ai-next))
-                    (zero? (c-connect fd addr addrlen)) (do (set-timeouts! fd socket-timeout-ms) fd)
-                    :else (do (if windows? (c-closesocket fd) (c-close fd))
-                              (recur (ffi/read ai :pointer O-ai-next)))))))
+                  (if (neg? fd)
+                    (recur (ffi/read ai :pointer O-ai-next) err)
+                    (let [[rc code] (c-connect fd addr addrlen)]
+                      (if (zero? rc)
+                        (do (set-timeouts! fd socket-timeout-ms) fd)
+                        (do (if windows? (c-closesocket fd) (c-close fd))
+                            (recur (ffi/read ai :pointer O-ai-next) code))))))))
             (finally (c-freeaddrinfo res)))))
       (finally (ffi/free node) (ffi/free service) (ffi/free respp) (ffi/free hints)))))
 

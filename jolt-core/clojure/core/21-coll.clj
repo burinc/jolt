@@ -175,7 +175,7 @@
       (if xs
         (if (next xs)
           (recur (assoc m (first xs) (second xs)) (nnext xs))
-          (throw (str "No value supplied for key: " (first xs))))
+          (throw (IllegalArgumentException. (str "No value supplied for key: " (first xs)))))
         m))
     (if (seq s) (first s) {})))
 
@@ -190,20 +190,6 @@
 ;; namespace-munge: Clojure namespace name -> legal Java package name (- -> _).
 (defn namespace-munge [s]
   (apply str (map (fn [c] (if (= c \-) \_ c)) (seq (str s)))))
-
-;; reduce-kv over a map (k v) or vector (index v). Both branches go through reduce,
-;; so reduced short-circuits — and the vector path indexes correctly. nil folds
-;; to init, matching Clojure.
-(defn reduce-kv [f init coll]
-  (cond
-    (vector? coll) (reduce (fn [acc i] (f acc i (nth coll i))) init (range (count coll)))
-    (map? coll)    (reduce (fn [acc k] (f acc k (get coll k))) init (keys coll))
-    (nil? coll)    init
-    ;; a deftype/reify declaring IKVReduce drives its own kvreduce (the JVM
-    ;; method name is lowercase). Unwrap a reduced defensively, like reduce.
-    (instance? clojure.lang.IKVReduce coll)
-    (let [r (.kvreduce coll f init)] (if (reduced? r) (deref r) r))
-    :else (throw (str "reduce-kv not supported on: " coll))))
 
 ;; ex-info accessors. The constructor (ex-info) stays native — it builds the tagged
 ;; value and wires into throw — but the value exposes :jolt/type/:message/:data/
@@ -223,8 +209,11 @@
 
 ;; Throwable->map: the reference data rendering of a throwable. :via chains
 ;; through ex-cause the way the reference walks getCause; :cause/:data come
-;; from the root cause. Throwables carry no stack-trace elements here, so
-;; :trace is empty and :via entries have no :at.
+;; from the root cause; :phase is the throwable's own :clojure.error/phase,
+;; lifted to the top the way the reference does it — clojure.main/ex-triage
+;; reads the phase there, and a compile diagnostic carries one (analyzer
+;; diagnostic-data, reader.ss). Throwables carry no stack-trace elements here,
+;; so :trace is empty and :via entries have no :at.
 (defn Throwable->map [o]
   (let [msg-of (fn [t] (or (ex-message t) (jolt.host/condition-message t)))
         entry (fn [t]
@@ -236,13 +225,9 @@
               (if (some? t) (recur (conj acc t) (ex-cause t)) acc))
         root (peek via)
         m {:via (mapv entry via) :trace []}
-        m (if-let [c (msg-of root)] (assoc m :cause c) m)]
-    (if-let [d (ex-data root)] (assoc m :data d) m)))
-
-;; inst-ms: epoch milliseconds of an instant; throws on a non-inst (Clojure
-;; protocol behavior).
-(defn inst-ms [x]
-  (if (inst? x) (get x :ms) (throw (str "inst-ms requires an inst, got: " x))))
+        m (if-let [c (msg-of root)] (assoc m :cause c) m)
+        m (if-let [d (ex-data root)] (assoc m :data d) m)]
+    (if-let [phase (:clojure.error/phase (ex-data o))] (assoc m :phase phase) m)))
 
 ;; Clojure 1.11 map transformers. An empty-map base keeps insertion order;
 ;; transformed keys canonicalize via assoc (collisions: last entry in seq order
@@ -271,13 +256,21 @@
 (defn splitv-at [n coll]
   [(vec (take n coll)) (drop n coll)])
 
-;; with-redefs-fn: temporarily set each var's root to the mapped value, run
+;; with-redefs-fn: temporarily set each var's ROOT to the mapped value, run
 ;; the thunk, restore the saved roots even on throw. The with-redefs macro
 ;; (30-macros) builds the {var val} map from names.
+;;
+;; Root, and read back with .getRawRoot rather than var-get, because that is
+;; what .bindRoot / .getRawRoot mean in the reference implementation and the
+;; difference shows: under (binding [*v* 5] (with-redefs [*v* 2] …)) var-get
+;; answers 5, so a save/restore through it would write the thread value over the
+;; var's real root on the way out. It also has to be a root write for the redef
+;; to reach a thread that did not inherit this one's bindings — a redefed var is
+;; usually not dynamic at all, and var-set refuses those outright.
 (defn with-redefs-fn [binding-map func]
   (let [vars (vec (keys binding-map))
-        saved (mapv var-get vars)]
-    (doseq [v vars] (var-set v (get binding-map v)))
+        saved (mapv (fn [v] (.getRawRoot v)) vars)]
+    (doseq [v vars] (alter-var-root v (constantly (get binding-map v))))
     (try
       (func)
       (finally
@@ -286,7 +279,7 @@
         ;; fn at runtime and mis-apply it).
         (loop [i 0]
           (when (< i (count vars))
-            (var-set (nth vars i) (nth saved i))
+            (alter-var-root (nth vars i) (constantly (nth saved i)))
             (recur (inc i))))))))
 ;; A vector's seq IS a real chunked-seq (chunk-first hands out a 32-element block).
 ;; This is only a placeholder so references compile during overlay load; the host
@@ -317,7 +310,7 @@
 ;; future? stays native (deref/future-cancel/realized? call it); future-call and
 ;; future-cancel stay native too (OS threads).
 (defn future-done? [x]
-  (if (future? x) (boolean (get x :cached)) (throw "future-done? requires a future")))
+  (if (future? x) (boolean (get x :cached)) (throw (IllegalArgumentException. "future-done? requires a future"))))
 (defn future-cancelled? [x]
   (and (future? x) (boolean (get x :cancelled))))
 
@@ -332,7 +325,10 @@
 ;; mutable backing.
 (defn aget [arr & idxs]
   (reduce (fn [v i] (nth v i)) arr idxs))
-(defn alength [arr] (count arr))
+(defn alength [arr]
+  (if (nil? arr)
+    (throw (NullPointerException. "Cannot read the array length because the array is null"))
+    (count arr)))
 (defn aset [arr & idxs+val]
   (let [n (count idxs+val)
         val (nth idxs+val (dec n))
@@ -391,14 +387,19 @@
 ;; ancestry (jolt.host/class-supers) so reflective checks like
 ;; (ancestors (class f)) answer like the JVM.
 (defn supers [x]
-  (let [s (jolt.host/class-supers x)]
-    (if s (set s) #{})))
+  (let [s (set (jolt.host/class-supers x))]
+    (if (seq s) s nil)))
 
-;; Like Clojure's munge: rewrite dashes to underscores, preserving the argument's
-;; type — a symbol munges to a symbol, anything else to a string. (jolt only
-;; rewrites dashes, not the full Compiler CHAR_MAP.)
+;; munge: the name as the compiler would spell it in a class or method name,
+;; preserving the argument's type — a symbol munges to a symbol, anything else to
+;; a string. Clojure's own definition, character for character: the whole
+;; Compiler CHAR_MAP, not just the dash. Rewriting dashes alone left every other
+;; special character in place, so the result was not a legal identifier at all —
+;; (munge 'a?) answered a? — and a caller asking "do these two compile to one
+;; class name?" (typedclojure's datatype collision check does) was told no for
+;; a? and a_QMARK_, which do.
 (defn munge [s]
-  (let [m (str-replace-all "-" "_" (str s))]
+  (let [m (clojure.lang.Compiler/munge (str s))]
     (if (symbol? s) (symbol m) m)))
 
 (defn test

@@ -6,10 +6,13 @@
 ;; library checked out beside this repo, "/x" = absolute.
 ;;
 ;; :expect is the tally last observed. The gate fails when pass drops or
-;; fail/error/load-fail rise; it reports BETTER (not a failure) when pass rises,
-;; so improving a library is a manifest edit away. :note records why a non-zero
-;; fail/error count is expected — a host-model divergence, a missing JVM-only
-;; dependency, or a tracked bug.
+;; fail/error/load-fail rise; it reports BETTER (not a failure) when any of the
+;; four moves the other way, so improving a library is a manifest edit away.
+;; :tolerance is a SYMMETRIC noise band for a suite that generates its cases, and
+;; it suppresses BETTER exactly as it suppresses WORSE — inside the band a move is
+;; a different draw rather than a result, and reads as ok. :note records why a
+;; non-zero fail/error count is expected — a host-model divergence, a missing
+;; JVM-only dependency, or a tracked bug.
 {:libs
  [;; ---------------------------------------------------------- collections/util
   {:name "medley"
@@ -22,8 +25,8 @@
 
   {:name "cuerdas"
    :paths ["src" "test"]
+   :local-deps ["~time"]
    ;; str/abbreviate formats through a Locale, which is jolt-lang/time's (RFC 0008)
-   :deps ["~time/src"]
    ;; The two errors are java.text.BreakIterator, which abbreviate uses to find a
    ;; word boundary. That is Unicode text segmentation (UAX #29) and jolt has no
    ;; shim; an approximate one would quietly cut in the wrong place, so it stays
@@ -85,7 +88,7 @@
    ;; assert thread identity or timing and flap between fail and pass run to run,
    ;; hence the tolerance.
    :tolerance 2
-   :expect {:tests 31 :pass 210 :fail 8 :error 0}}
+   :expect {:tests 31 :pass 211 :fail 7 :error 0}}
 
   {:name "core.cache"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -141,9 +144,11 @@
   {:name "tools.reader"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   ;; the 3 fails are the syntax-quote reader-model divergence (a quoted
-   ;; syntax-quote is data on the JVM, a form on jolt); see known-divergences.edn
-   :expect {:tests 50 :pass 884 :fail 3 :error 0}}
+   ;; The 3 fails here were the syntax-quote reader-model divergence — a quoted
+   ;; backtick was data on the JVM and jolt's unlowered marker here. Gone since
+   ;; the analyzer lowers every marker before anything can see the form
+   ;; (jolt-024c).
+   :expect {:tests 50 :pass 887 :fail 0 :error 0}}
 
   {:name "edamame"
    :paths ["src" "resources" "test"]
@@ -193,6 +198,15 @@
    ;; trace. jolt does tail calls, so the calling frame is gone before anything can
    ;; look — the conform failure still throws with the same explain-data, it just
    ;; carries no ::caller. See known-divergences.edn.
+   ;;
+   ;; Tolerance because this suite GENERATES: map-spec-generators draws 200 samples
+   ;; through test.check and asserts that all seven key-combinations of an (or ...)
+   ;; :req appear. Usually they do; occasionally one does not, and the tally moves
+   ;; by one. Observed as a spurious REGRESSED (pass 170 -> 169, fail 4 -> 5) that
+   ;; four consecutive re-runs did not reproduce. Its test.check dependency already
+   ;; carries a tolerance for the same reason; this one was pinned exactly and
+   ;; should not have been.
+   :tolerance 2
    :expect {:tests 13 :pass 170 :fail 4 :error 0}}
 
   {:name "test.check"
@@ -229,8 +243,13 @@
    ;; database jolt does not carry, a generated case reaches a lone surrogate (jolt
    ;; chars are scalar values — :string-model), and the clojure-test-output and
    ;; exception-handling namespaces compare printed #error maps whose :trace is
-   ;; empty because tail calls leave no frames to report. The load-fail is clj-time,
-   ;; which needs joda-time.
+   ;; empty because tail calls leave no frames to report.
+   ;;
+   ;; The one load failure is generators.clj-time-test, which is written
+   ;; #?@(:bb [] :clj [[clj-time.core …]]) and so requires clj-time, i.e.
+   ;; joda-time. It briefly read as loading-with-no-tests while jolt matched :bb
+   ;; and took the empty arm (#894 re-recorded it that way); #893 dropped :bb, so
+   ;; the :clj arm and its load failure are back. pass/fail/error are unchanged.
    :expect {:tests 39 :pass 110 :fail 17 :error 2 :load-fail 1}}
 
   ;; ---------------------------------------------------------- data formats
@@ -262,7 +281,8 @@
    ;; jolt's vendored sci on the path does not change the count — it is a chain,
    ;; not one gap, and it is what `make sci`'s own floor already tracks. So the
    ;; :=> / function-schema surface stays unexercised here rather than pretending.
-   :deps ["~time/src" "@spec.alpha/src/main/clojure" "@test.check/src/main/clojure"]
+   :deps ["@spec.alpha/src/main/clojure" "@test.check/src/main/clojure"]
+   :local-deps ["~time"]
    :timeout 900
    ;; The residue is one :escape-unicode true case in each of the two APIs, and
    ;; it is the string model rather than a bug: jolt strings are codepoint-indexed,
@@ -276,13 +296,20 @@
   {:name "data.zip"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["~xml/src"]
+   ;; :local-deps, not :deps ["~xml/src"] — the xml library needs its OWN
+   ;; deps.edn read, not just its source on the path. That deps.edn is where the
+   ;; :jolt/native spec for libxml2 lives, and jolt.xml's defcfns bind
+   ;; xmlReaderForMemory at namespace load, so with only the source path the
+   ;; suite died with `foreign-procedure: no entry for "xmlReaderForMemory"` —
+   ;; the library was never dlopen'd because nothing had declared it. Every
+   ;; other first-party sibling here is pulled in this way for the same reason.
+   :local-deps ["~xml"]
    :expect {:tests 9 :pass 12 :fail 0 :error 0}}
 
   {:name "yamlstar"
    :root "yamlstar/core"
    :paths ["src" "test"]
-   :deps ["~time/src"]
+   :local-deps ["~time"]
    :expect {:tests 44 :pass 103 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- markup / text
@@ -306,17 +333,15 @@
    ;; org.apache.commons.lang.StringEscapeUtils, supplied by the preloaded
    ;; jolt.shim.commons-lang shim. No residue.
    :preload ["jolt.shim.commons-lang"]
-   ;; two assertions exist only on the suite's :clj branches; the :bb branches
-   ;; jolt now reads skip them. Same test count, nothing fails.
-   :expect {:tests 94 :pass 180 :fail 0 :error 0}}
+   :expect {:tests 94 :pass 182 :fail 0 :error 0}}
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
    ;; jolt-lang/crypto supplies java.security.MessageDigest, which the hash: filter
    ;; calls — the JVM has it built in, jolt gets it from the library. It goes on as
    ;; a real dependency, not a source path, so its :jolt/native libcrypto is loaded.
-   :deps ["@data.json/src/main/clojure" "~time/src"]
-   :local-deps ["~crypto"]
+   :deps ["@data.json/src/main/clojure"]
+   :local-deps ["~time" "~crypto"]
    ;; core_test does (:require [cheshire.core :refer :all]). Selmer's own source
    ;; resolves cheshire -> data.json -> jsonista at load and is fine on data.json,
    ;; but the test names cheshire outright, and real cheshire wraps Jackson. The
@@ -344,9 +369,10 @@
    ;; needs test.check and test.chuck's generators the way honeysql's own
    ;; deps.edn declares them; without those on the recipe the namespace is a
    ;; load failure rather than a missing dependency anyone would notice.
-   :deps ["~time/src" "@core.cache/src/main/clojure"
+   :deps ["@core.cache/src/main/clojure"
           "@data.priority-map/src/main/clojure"
           "@test.check/src/main/clojure" "@test.chuck/src" "@test.chuck/resources"]
+   :local-deps ["~time"]
    ;; test.chuck's string-from-regex generator parses the pattern with instaparse,
    ;; at the version test.chuck itself declares
    :extra-deps {instaparse/instaparse {:mvn/version "1.4.10"}}
@@ -377,9 +403,22 @@
 
   {:name "malli"
    :paths ["src" "resources" "test"]
-   :deps ["~time/src" "@spec.alpha/src/main/clojure"
+   :deps ["@spec.alpha/src/main/clojure"
           "@test.check/src/main/clojure" "@spec-tools/src"
           "@test.chuck/src" "@ordered/src"]
+   ;; sci is what malli.core/eval runs on: malli's own :test alias carries it,
+   ;; and malli.sci's evaluator dynaloads sci.core/eval-string* and fails with
+   ;; ::sci-not-available when it is absent — 72 errors' worth across
+   ;; core/error/transform/generator-test. It went unnoticed while jolt matched
+   ;; :bb, because malli.sci's :bb branch swaps the whole evaluator for
+   ;; load-string. This is jolt's own vendored sci, the copy `make sci` and
+   ;; `make scifunctional` gate, rather than the 0.12.51 malli's deps.edn names.
+   ;; That version did not load here at all until jolt-l7tq (its copy-var splices
+   ;; a macro var's dereffed value into the emitted form; sci changed this
+   ;; upstream in #1028, and the vendored copy postdates that). It loads now —
+   ;; the reason to keep the vendored one is runtime, not correctness: this row
+   ;; already needs 2400s, and 0.12.51 ran past it.
+   :local-deps ["~time" "!vendor/sci"]
    ;; malli's own deps, from the upstream deps.edn; jolt resolves the source out
    ;; of the Maven jars.
    :extra-deps {borkdude/dynaload {:mvn/version "0.3.5"}
@@ -389,7 +428,10 @@
    ;; jolt.time installs the java.time.* class seams; malli's own requires do
    ;; not reach it, so it is preloaded.
    :preload ["jolt.time"]
-   :timeout 900
+   ;; 900 was sized when jolt read :bb branches, which gated roughly half the
+   ;; assertions away and stubbed out m/eval; the full suite runs ~13k
+   ;; assertions with sci live and needs the room.
+   :timeout 2400
    ;; Keying protocol dispatch by defining namespace (jolt-ewmt) is what moved
    ;; this: malli.generator-ast evals a textually-renamed copy of
    ;; malli.generator, so a SECOND protocol also named Generator was extended to
@@ -399,26 +441,53 @@
    ;; private #'clojure.core/mk-am through core.rrb-vector (7), and jsonista, i.e.
    ;; Jackson (1).
    ;;
-   ;; Of what runs: 72 errors are the sci chain above. 104 of the failures are
-   ;; parser-info-test alone, which round-trips values drawn by (mg/sample s
-   ;; {:seed 0}) — a fixed seed draws DIFFERENT values here than on the JVM, so
-   ;; the test runs over different data. :every parsing and registry references
-   ;; themselves agree with 1.12.5 exactly on literal inputs, checked directly.
-   ;; That is the same family as test.check's :tolerance, not a malli bug.
-   ;;
    ;; The four malli.experimental.time suites went green when jolt-lang/time
    ;; grew the 3-arg DateTimeFormatter.parse with a strict pattern walk, the
-   ;; X/from statics and OffsetTime — 13 failures and 2 errors' worth. That is
-   ;; where the +14/-13/-1 against the previous recording came from.
+   ;; X/from statics and OffsetTime — 13 failures and 2 errors' worth.
    ;;
-   ;; Two things shape the tally below. The suite :bb-gates roughly half its
-   ;; assertions (babashka runs the reduced set, and jolt reads :bb branches
-   ;; now) — that is where the old 12059 passes went, with fail and error
-   ;; shrinking proportionally. And the one load failure is malli.util-test's
-   ;; cheshire, i.e. Jackson. The native-backed clojure.core.rrb-vector
-   ;; replaced the jar here, which is what brought the fipp/virhe chain (ten
-   ;; namespaces) back from the old mk-am load-fail wall.
-   :expect {:tests 219 :pass 6751 :fail 42 :error 34 :load-fail 1}}
+   ;; The one load failure is malli.util-test's cheshire, i.e. Jackson. The
+   ;; native-backed clojure.core.rrb-vector replaced the jar here, which is what
+   ;; brought the fipp/virhe chain (ten namespaces) back from the old mk-am
+   ;; load-fail wall.
+   ;;
+   ;; 6757/36/34 -> 13261/28/10 in #893, three effects and no regression on any
+   ;; counter:
+   ;;   - the suite :bb-gated roughly half its assertions and jolt was reading
+   ;;     those branches, so the pass count roughly doubles. malli.parser-test
+   ;;     alone goes from 1754 to 8224: its ensure-parser-type helper is
+   ;;     #?(:bb nil :default …), which made every call vacuous.
+   ;;   - sci is on the classpath now (see :local-deps), so the 72
+   ;;     ::sci-not-available errors that m/eval raised are gone.
+   ;;   - seqable? answers for a declared Seqable/Iterable, so :every over an
+   ;;     eduction validates and parses; that is the 104 identical? failures in
+   ;;     parser-test and the 12 in core-test.
+   ;;
+   ;; Where the residue sits, per target/libconformance/malli.log: 9 of the 26
+   ;; failures are malli.transform-test, then core-test (4), error-test (3),
+   ;; instrument-test (3), generator-test (2), provider-test (2), swagger-test
+   ;; (2) and registry-test (1). The 9 errors are generator-test (7),
+   ;; instrument-test (1) and parser-test (1). Several
+   ;; draw from (mg/sample s {:seed 0}), and a fixed seed drawing different
+   ;; values here than on the JVM is the same family as test.check's :tolerance,
+   ;; not a malli bug.
+   ;;
+   ;; The heaviest row in the gate, and the cost is jolt's, not the assertion
+   ;; count. malli.core-test's validation-test deliberately abandons a
+   ;; non-terminating (apply max (range)) after a 100ms timeout; interrupt does
+   ;; not stop a compute loop on the JVM either, so the thread runs on in both.
+   ;; Two jolt problems came out of that:
+   ;;   - apply materialized an unbounded rest instead of streaming it, so the
+   ;;     abandoned thread grew the heap without bound. FIXED — peak RSS for this
+   ;;     row went 27.9GB -> 1.74GB, which is what JOLT_MAX_HEAP=off was covering.
+   ;;   - every lazy cell took a mutex once any thread had been forked, and a
+   ;;     Chez mutex is a finalized object the collector visits, so the abandoned
+   ;;     thread cost ~8x wall time here (jolt-ugdf). FIXED -- cells are claimed
+   ;;     by CAS now, and function-schema-test after validation-test is 2.3x
+   ;;     its solo time instead of 7.8x. The remainder is the thread's own
+   ;;     allocation (4.6x the collections, each stopping the world); the row
+   ;;     runs in ~4 minutes, and :timeout 2400 is headroom for a loaded CI
+   ;;     runner, not the expected cost.
+   :expect {:tests 219 :pass 13269 :fail 26 :error 9 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
@@ -432,8 +501,8 @@
    :paths ["ring-core/src" "ring-core-protocols/src" "ring-websocket-protocols/src"
            "ring-core/test"]
    :test-paths ["ring-core/test"]
-   :deps ["@ring-codec/src" "~time/src" "~multipart/src"]
-   :local-deps ["~crypto"]
+   :deps ["@ring-codec/src" "~multipart/src"]
+   :local-deps ["~time" "~crypto"]
    :extra-deps {crypto-random/crypto-random {:mvn/version "1.2.1"}
                 crypto-equality/crypto-equality {:mvn/version "1.0.1"}}
    ;; The two session/cookie suites are written against clj-time, which is Joda —
@@ -454,7 +523,7 @@
    ;; its classes at load.
    :preload ["jolt.shim.commons-io" "jolt.shim.commons-fileupload"]
    :note "clj-time (Joda) + commons-fileupload are JVM-only; URLClassLoader/jar: URLs are jolt gaps"
-   :expect {:tests 152 :pass 450 :fail 1 :error 5 :load-fail 2}}
+   :expect {:tests 152 :pass 451 :fail 0 :error 5 :load-fail 2}}
 
   {:name "ring-spec"
    :paths ["src" "test"]
@@ -501,20 +570,21 @@
 
   {:name "lasertag"
    :paths ["src" "test"]
-   :deps ["~time/src"]
+   :local-deps ["~time"]
    ;; lasertag classifies a value by its class, so every failure here is jolt's class
    ;; model rather than a behavioral difference, all recorded in
-   ;; known-divergences.edn. The 9 that remain: six narrow numeric classes collapsing
-   ;; to Long/Double (:integer-box-model), one seq class still collapsing to LazySeq
-   ;; where the JVM says Repeat (:seq-type-model), and two the suite's :bb branches
-   ;; asserting babashka's host model (sci.impl.fns classnames, a :lambda-free tag
-   ;; set), where jolt answers with the real defining class.
+   ;; known-divergences.edn. The 7 that remain: six narrow numeric classes collapsing
+   ;; to Long/Double (:integer-box-model) and one seq class still collapsing to
+   ;; LazySeq where the JVM says Repeat (:seq-type-model). The two that used to sit
+   ;; beside them were the suite's :bb branches asserting babashka's host model
+   ;; (sci.impl.fns classnames, a :lambda-free tag set); jolt stopped reading :bb
+   ;; in #893 and answers with the real defining class.
    ;; (subvec answers the real SubVector class since #629, which is the 44 -> 46.)
    ;; 46 -> 49 is the seq classes: #648 gave a seq the class its producer gives it
    ;; and #659 picked the range flavor from the argument types. The row had not been
    ;; re-recorded since before #648, so part of that 3 was slack this gate had been
    ;; carrying — a regression in those rows would have read as "ok".
-   :expect {:tests 58 :pass 49 :fail 9 :error 0}}
+   :expect {:tests 58 :pass 51 :fail 7 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -536,11 +606,13 @@
   ;; ---------------------------------------------------------- time
   {:name "tick"
    :paths ["src" "test"]
-   :deps ["~time/src" "@spec.alpha/src/main/clojure"]
-   ;; the one failure is the suite's :bb branch asserting babashka's
-   ;; English-only locale rendering ("3030-May-03" under Locale/FRENCH); jolt
-   ;; renders the correct French "mai" through the time library.
-   :expect {:tests 67 :pass 722 :fail 1 :error 0}}
+   :deps ["@spec.alpha/src/main/clojure"]
+   :local-deps ["~time"]
+   ;; green since #893: the one failure that used to sit here was the suite's :bb
+   ;; branch asserting babashka's English-only locale rendering ("3030-May-03"
+   ;; under Locale/FRENCH), where jolt renders the correct French "mai" through
+   ;; the time library.
+   :expect {:tests 67 :pass 723 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- skipped
   {:name "process"

@@ -1,0 +1,5 @@
+#!/bin/sh
+# git commit-msg hook: refuse a message carrying AI attribution. Install with
+# `make hooks` (copies it to .git/hooks/commit-msg); the same check runs as the
+# attributioncheck gate and in CI, so this is the earliest of the three stops.
+exec sh "$(git rev-parse --show-toplevel)/tools/attributioncheck.sh" --msg-file "$1"

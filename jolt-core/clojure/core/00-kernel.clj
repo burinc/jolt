@@ -50,16 +50,21 @@
      (let [r (jolt.host/as-subvec (jolt.host/slice v s e))]
        (if (and (identical? r v) (meta v)) (with-meta r nil) r)))))
 
-;; Deliberately NOT Clojure's transient fold — (persistent! (reduce (fn [v o]
-;; (conj! v (f o))) (transient []) coll)). That is faster on the JVM and slower
-;; here: measured 5053ns against 2298ns for this body over 32 elements, in one
-;; binary. The same fold written INLINE (with inc in place of f) runs 1499ns, so
-;; the cost is not the fold — it appears only when the element fn arrives as a
-;; parameter, and a bare call through a parameter measures just 20.7ns against
-;; 14.6ns direct, which does not account for the gap. Unexplained; the numbers
-;; are reproducible and that is why this stays. Worth re-deriving before anyone
-;; "fixes" this to match Clojure.
-(defn mapv [f & colls] (vec (apply map f colls)))
+;; Clojure's own definition: the single-collection arity is a transient fold.
+;; This was (vec (apply map f colls)) for a long time because the fold measured
+;; SLOWER here (5053 ns against 2298 over 32 elements) for no reason anyone
+;; could name. Re-derived 2026-09-17: the reason was in conj! and make-pvec, not
+;; the fold — conj! was variadic and consed a rest list per element, and
+;; make-pvec built anything past 32 elements by conj, copying the tail each
+;; time. With both fixed (transients.ss, collections.ss) the fold is 0.7 µs /
+;; 0.7 KB against 1.6 µs / 6.2 KB over 32 elements, and 535 µs / 0.9 MB against
+;; 1317 µs / 4.6 MB over 26k — the lazy map's cells and the seq->list copy are
+;; what the old body paid for. The transient gate pins the per-element bytes.
+(defn mapv
+  ([f coll] (persistent! (reduce (fn [v o] (conj! v (f o))) (transient []) coll)))
+  ([f c1 c2] (into [] (map f c1 c2)))
+  ([f c1 c2 c3] (into [] (map f c1 c2 c3)))
+  ([f c1 c2 c3 & colls] (into [] (apply map f c1 c2 c3 colls))))
 
 (defn update [m k f & args] (assoc m k (apply f (get m k) args)))
 

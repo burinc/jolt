@@ -13,6 +13,7 @@ the second Scheme backend, and the test gates. For using jolt, see
 - [Scheme backends](#scheme-backends)
 - [Build profiles](#build-profiles)
 - [Test](#test)
+- [Error messages](#error-messages)
 - [Documentation](#documentation)
 
 ## Build from source
@@ -41,10 +42,13 @@ do **not** contain submodules, so they can't run or build — clone the repo
 instead.
 
 `bin/jolt` needs a **threaded Chez Scheme 10.x** on `PATH` as `chez` or
-`chezscheme`; set `JOLT_CHEZ` to point at a specific one. `make` provisions its
-own 10.4.1 when `PATH` has a different version, and exports `JOLT_CHEZ` so both
-halves of a build agree — running `bin/jolt` by hand against a 9.x picks up
-whatever primitive that release predates (`variable flvector? is not bound`).
+`chezscheme`; set `JOLT_CHEZ` to point at a specific one. `make` uses a Chez on
+`PATH` at or above its pinned version as-is, and provisions its own 10.4.1 only
+when nothing qualifies. It exports `JOLT_CHEZ` so both halves of a build agree —
+running `bin/jolt` by hand against a 9.x picks up whatever primitive that
+release predates (`variable flvector? is not bound`) — and, when provisioning
+did run, `JOLT_CC` too, so the standalone binary links with the same GCC that
+built Chez instead of whatever `cc` happens to resolve to.
 
 `make build` provisions [Chez Scheme](https://cisco.github.io/ChezScheme/) and a
 C compiler locally through [Makes](https://github.com/makeplus/makes), then
@@ -139,12 +143,20 @@ Host-specific runtime code sits behind an adapter contract
 capability or degrades it honestly — an absent one raises rather than faking a
 result.
 
-The Gambit targets need `gambit-scheme` (brew) and skip cleanly without it:
+The Gambit targets run the `gsi`/`gsc` under `GAMBIT_PREFIX/bin` — brew's
+`gambit-scheme` prefix by default, `make GAMBIT_PREFIX=/opt/gambit …` for
+another install — and skip cleanly when there is none. CI builds Gambit 4.9.8
+from source and runs them with `JOLT_REQUIRE_GAMBIT=1`, which turns that skip
+into a failure, so the gates cannot silently stop running there:
 
 ```bash
 make gambitcheck              # adapter + shims on native gsi
 make gambitkernel             # the booted kernel and natives (113 checks)
 make gambiteval               # jolt source through the compiler, renders pinned to Chez
+make gambitunbound            # gate: every Scheme global the boot references is defined (~75s)
+make gambitvars               # gate: every var the boot interns is bound
+make gambitstatics            # gate: every Class/member and (new Class) the seed emits resolves
+make gambittwins              # gate: every call-position macro has an eval twin (grep only)
 make gambitseed               # re-mint host/gambit/seed/ (runs on Chez, after a seed change)
 make gambitweb                # => target/gambit/jolt-web.js, the browser bundle
 make gambitweb PROFILE=repl   # a smaller bundle (see Build profiles below)
@@ -164,6 +176,32 @@ make gambitweb GAMBIT_WEB_OUT=../jolt-lang.github.io/resources/static/js/jolt-we
 Some Gambit host files are generated from their Chez counterparts (for example
 `records-gambit.ss` from `records.ss`); run `make gambitgen` after editing the
 source, and `make gambitgencheck` gates the drift.
+
+The boot splices most of `host/chez` into one Gambit unit, so a Chez-only name
+reaching a shared file is an unbound global there that no Chez gate can see.
+`make gambitunbound` compiles the boot with `gsc` and reads the linker's report
+of globals defined nowhere; `make gambitvars` boots on `gsi` and lists the var
+cells nothing bound. Both compare against an allowlist
+(`host/gambit/unbound-allowlist.txt`, `unbound-vars-allowlist.txt`) of paths the
+target never takes, and a line whose name has since been defined fails the
+gate; `make gambitunbound-regen` / `gambitvars-regen` rewrite the lists keeping
+the comments. Bind a new name — a mirror in `rt-core.ss`, a shim in
+`prelude-shims.ss`, a raise naming the absent capability in `host-vars.ss` —
+before reaching for the allowlist.
+
+The seed's own `Class/member` calls and `(Class. …)` constructors resolve
+against `host/gambit/host-statics.ss`, the Gambit target's interop tier: the
+jhost record and the registries in the same shape as Chez's `host-static.ss`,
+plus the members clojure.core and the embedded stdlib reach. `make
+gambitstatics` greps every static and constructor the seed emits and boots to
+ask the registries; a miss is a classified line in
+`host/gambit/seed-statics-allowlist.txt` (`make gambitstatics-regen`), and a
+line that resolves now fails. The java/ files both boots load — `class-model.ss`,
+`string-builder.ss`, `java-parse.ss`, `dot-forms.ss` — register into those
+registries, so a shim written against them runs on both hosts. Compiled code
+the Gambit boot evals cannot see the unit's macros; `make gambittwins` derives
+the call-position macros from the op registry and checks each has a function
+twin in `host/gambit/eval-fns.ss`.
 
 ### Build profiles
 
@@ -222,16 +260,47 @@ make corpus                   # conformance corpus vs the JVM-sourced spec
 make unit                     # host-specific unit cases
 make selfhost                 # bootstrap fixpoint (rebuild == checked-in seed)
 make smoke                    # bin/jolt CLI smoke
+make errorreport              # what a failing program PRINTS, pinned per case
 make sci                      # load borkdude/sci's source through jolt (compat stress)
-make ffi                      # HTTP-server GC-safety + http-client temp paths
+make ffi                      # the foreign-function interface, against C witnesses
 make transient                # transient mutation + linear-time builds
 make certify                  # JVM oracle (skips if clojure is absent)
 make libconformance           # replay the downstream library suites vs recorded tallies
 ```
 
+None of those measure throughput, and that is a real hole rather than an
+oversight to live with: `bench/arrays` once went 5.4x slower on a codegen change
+with all 88 ci targets and all 47 libraries still green — every answer was still
+correct. **Run `bench/run.sh` after any change to the compiler passes, the
+emitter, or the runtime's hot paths**, and read the table rather than the exit
+code; the suite reports, it does not judge.
+
+```bash
+NO_JVM=1 bench/run.sh          # the suite, optimized AOT binaries
+bench/run.sh sorted-access     # one benchmark, to re-check a suspicious row
+ci/bench-gate.sh A B           # two compilers head to head, ratios, exits nonzero
+```
+
+Suite noise is around 1.07x per benchmark on a quiet machine, and the FIRST
+benchmark of a run can be much further out than that, so a single suite run is
+not evidence on its own: re-measure anything that moved by running that
+benchmark alone, both before and after. A release runs `ci/bench-gate.sh`
+against the previous release automatically (`.github/workflows/release.yml`),
+and `publish` waits on it.
+
 The conformance corpus (`test/chez/corpus.edn`) is a host-neutral language spec
 whose expected values are sourced from reference JVM Clojure. See
 [test/conformance/SPEC.md](test/conformance/SPEC.md).
+
+Error *reports* are pinned the same way, by `make errorreport`: one directory per
+case under `test/errors/`, holding the program and the exact report jolt prints
+for it — message, position, ex-data, trace and exit status. The golden files
+record today's behaviour, bugs included, so that fixing one shows up as a diff a
+reviewer can read. After an intended change:
+
+```bash
+sh host/chez/error-report-check.sh generate    # then read the diff
+```
 
 Divergences from JVM Clojure are tracked, not tolerated silently:
 `test/conformance/known-divergences.edn` holds both the corpus rows whose value
@@ -239,6 +308,77 @@ differs and the deliberate behavioural divergences that are not corpus rows.
 `make certify` fails on a *new* (unlisted) divergence and on a stale entry, so a
 behaviour change either matches the JVM or gets an entry explaining why it
 doesn't.
+
+Commit messages describe the change and nothing else: no AI-assistant
+attribution — no session-link trailer, co-author line, or generated-with footer.
+`make attributioncheck` (part of `make ci`) scans the commits not yet on
+`origin/main`, CI scans every push and PR the same way, and `make hooks`
+installs a `commit-msg` hook that refuses such a message at commit time.
+
+## Error messages
+
+An error message is read by someone who is stuck. It should let them answer three
+questions without opening the compiler: what is wrong, what was expected, and
+where. The rules below are what jolt's own error-reporting work settled on; each
+one exists because breaking it produced a real bug.
+
+**Match Clojure's wording where Clojure has one.** `First argument to def must be
+a Symbol`, not a jolt paraphrase. People arrive here from Clojure and recognise
+these strings; a better-written message they have never seen is worse than the
+one they have. Where jolt has no counterpart, write a clear sentence.
+
+*(This is where jolt departs from jank's error style guide, which mandates
+complete sentences ending in a period. jank is the reference for its own errors
+and can spell them however it likes; jolt is not, and parity wins.)*
+
+**Never let a host fault reach the user.** `java.lang.IndexOutOfBoundsException:
+index out of bounds` as the compile error for `(let [a 1 b] a)` means a check is
+missing upstream, not that the message needs rewording. If a message names a
+Scheme primitive's failure, fix the check.
+
+**Say what was required, not only that something failed.** An empty message —
+`Unhandled exception (NullPointerException):` and nothing — leaves out the one
+fact the reader needs. `nil where a java.lang.String is required` is the fix.
+
+**But an empty message is sometimes correct.** The JVM's `NoSuchElementException`
+and its `UnsupportedOperationException` on a persistent collection both carry a
+null message. Parity beats a blanket rule: check the reference before populating
+one.
+
+**Raise a real throwable with a registered kind.** A thrown string is not
+catchable by class and answers `nil` to `ex-message`, so a program cannot handle
+its own errors. Use `analysis-error` (analyzer), or `rdr-error-kind` /
+`rdr-error-class` (reader — the latter when the error matches a JVM class a
+program can catch, like `NumberFormatException`), and add the kind to
+`test/conformance/error-kinds.edn` — `make errorkinds` fails on a kind that is
+raised but unregistered, and on one registered but never raised.
+
+**Never render an arbitrary value into a message.** It may be an infinite seq or
+a collection of any size. Name the type, or extract the offending text from the
+SOURCE line the way the caret does — that is bounded by the line.
+
+**State the fact in words, not geometry.** A bare `^^^^` encodes *which* thing is
+wrong as a column offset; recovering it means counting characters. Give the
+diagnostic a `:jolt.error/note` so the caret is labelled. Reports are read by
+tools and language models as often as by people, and neither counts columns well.
+
+**Describe the state of the world, not the compiler's attempt.** `foo is not
+defined`, not `Failed to resolve foo`. And state the constraint rather than
+blaming: `A union is not passed by value`, not `You can't pass a union by
+value`. The tone should be the same whether the cause was a typo or a
+misunderstanding.
+
+**One fact per sentence.** Densely packed messages get skimmed and misread.
+
+### Checklist
+
+- [ ] Matches Clojure's wording, if Clojure has one for this.
+- [ ] Names what was expected, not just that something was wrong.
+- [ ] Not a raw host fault leaking through a missing check.
+- [ ] A real throwable, with a kind registered in `error-kinds.edn`.
+- [ ] No arbitrary value rendered into the text.
+- [ ] A `:jolt.error/note` where a caret needs labelling.
+- [ ] A case in `test/errors/` if the shape of the report is new.
 
 ## Documentation
 

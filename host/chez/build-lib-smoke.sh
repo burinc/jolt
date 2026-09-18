@@ -13,11 +13,42 @@ jolt="${JOLT_BIN:-bin/jolt}"
 # Absolute form, for the cases that cd into a fixture directory first.
 case "$jolt" in /*) joltabs="$jolt" ;; *) joltabs="$root/$jolt" ;; esac
 
+app="$root/test/chez/build-lib"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# --library composes with --target: the real cross build is the manual-dispatch
+# cross-smoke workflow, so pin the wiring it rests on here, where no cross
+# toolchain is needed. Both cases fail before any compile, so they also run on a
+# machine the preflight below skips.
+echo "build-lib smoke: --library composes with --target"
+# 1. the CLI forwards --target through a library build (it used to reject the
+#    combination outright), so the missing pack is what it complains about.
+out="$( (unset JOLT_TARGET_PACK; JOLT_PWD="$app" "$jolt" build --library \
+          -m libadd.core -o "$work/never" --target tarm64le) 2>&1 )"
+case "$out" in
+  *"needs a target pack"*) ;;
+  *) echo "  FAIL: --library --target should ask for a target pack, got:"
+     printf '%s\n' "$out"; exit 1 ;;
+esac
+# 2. target + pack reach build.ss's cross path inside a library build — the
+#    "Provide a target pack" hint is emitted only when bld-cross? is true.
+mkdir -p "$work/emptypack"
+out="$(JOLT_PWD="$app" "$jolt" build --library -m libadd.core -o "$work/never" \
+        --target tarm64le --target-pack "$work/emptypack" 2>&1 )"
+case "$out" in
+  *"Provide a target pack"*) ;;
+  *) echo "  FAIL: --library --target-pack should reach the cross toolchain check, got:"
+     printf '%s\n' "$out"; exit 1 ;;
+esac
+
 # Preflight: same as build-smoke — a library build needs Chez's kernel dev files
 # (libkernel.a + scheme.h) and a C compiler. Skip cleanly where absent.
 csv="$JOLT_CHEZ_CSV"
 if [ -z "$csv" ]; then
-  chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+  # JOLT_CHEZ wins (see host/chez/selfcheck.sh) — else this can pair a
+  # PATH-resolved Chez's csv dir with a running interpreter built elsewhere.
+  chez_bin="${JOLT_CHEZ:-$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)}"
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do
@@ -25,15 +56,24 @@ if [ -z "$csv" ]; then
     done
   fi
 fi
-if ! command -v cc >/dev/null 2>&1 || [ -z "$csv" ] || [ ! -f "$csv/scheme.h" ] || [ ! -f "$csv/libkernel.a" ]; then
-  echo "build-lib smoke: skipped (Chez kernel dev files or C compiler not available)"
+# A skip here is an environment limitation, not a pass — but it exits 0, so a CI
+# job whose Chez cannot build a shared library would report this gate green while
+# testing nothing. JOLT_REQUIRE_BUILDLIB=1 (set by .github/workflows/tests.yml)
+# turns every skip below into a failure, so the gate is either run or loud.
+skip_or_fail() {
+  if [ -n "${JOLT_REQUIRE_BUILDLIB:-}" ]; then
+    echo "  FAIL: $1" >&2
+    echo "  (JOLT_REQUIRE_BUILDLIB is set, so this environment was expected to run the gate)" >&2
+    exit 1
+  fi
+  echo "build-lib smoke: skipped ($1)"
   exit 0
+}
+
+if ! command -v cc >/dev/null 2>&1 || [ -z "$csv" ] || [ ! -f "$csv/scheme.h" ] || [ ! -f "$csv/libkernel.a" ]; then
+  skip_or_fail "Chez kernel dev files or C compiler not available"
 fi
 export JOLT_CHEZ_CSV="$csv"
-
-app="$root/test/chez/build-lib"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
 
 case "$(uname -s)" in
   Darwin) lib="$work/libadd.dylib" ;;
@@ -48,8 +88,7 @@ if [ ! -f "$lib" ]; then
   # fails the -shared link with a relocation error — an environment limitation,
   # not a jolt bug, so skip like the missing-toolchain case above.
   if printf '%s' "$build_out" | grep -qiE 'recompile with .*-fPIC|can not be used when making a shared object|relocation R_'; then
-    echo "build-lib smoke: skipped (Chez libkernel.a is not position-independent; a shared library needs a PIC kernel)"
-    exit 0
+    skip_or_fail "Chez libkernel.a is not position-independent; a shared library needs a PIC kernel (configure Chez with CFLAGS+=-fPIC)"
   fi
   echo "  FAIL: jolt build --library produced no shared library"
   printf '%s\n' "$build_out"
@@ -61,8 +100,8 @@ if ! cc -O2 "$app/driver.c" -ldl -o "$work/driver" 2>"$work/driver.err"; then
   echo "  FAIL: driver compile failed"; cat "$work/driver.err"; exit 1
 fi
 got="$("$work/driver" "$lib" 2>&1)"; rc=$?
-if [ "$got" != "5" ] || [ "$rc" != "0" ]; then
-  echo "  FAIL: add(2,3) — want '5' rc 0, got '$got' rc $rc"; exit 1
+if [ "$got" != "5 8" ] || [ "$rc" != "0" ]; then
+  echo "  FAIL: exports — want '5 8' rc 0, got '$got' rc $rc"; exit 1
 fi
 
-echo "build-lib smoke: passed (library built, add(2,3)=5 via dlopen+jolt_lookup)"
+echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 via dlopen+jolt_lookup)"

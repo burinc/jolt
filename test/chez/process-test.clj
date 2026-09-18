@@ -65,8 +65,11 @@
   (check-eq "deref exit" (:exit res) 0))
 
 ;; timed deref honours the timeout BOTH ways (jolt-go9n): a live process answers
-;; the timeout value, a finished one its map — and neither throws a cast error
-;; (jolt takes the vendored :jolt splice arm, not bb's empty one).
+;; the timeout value, a finished one its map — and neither throws a cast error.
+;; This is what the jolt-lang/process fork existed for: upstream guards its
+;; IBlockingDeref arm behind #?@(:bb [] :clj […]), so while jolt matched :bb it
+;; took the empty splice. It reads the :clj arm now (#893), and vendor/process is
+;; upstream babashka/process again — which is exactly what this row pins.
 (let [slow (process ["sleep" "30"])]
   (check-eq "timed deref times out" (deref slow 150 :timed-out) :timed-out)
   (p/destroy slow))
@@ -93,6 +96,34 @@
 ;; an explicit :dir sets the child's cwd (pwd echoes the logical cd path)
 (let [sub (fs/create-temp-dir {:prefix "jp-dir-"})]
   (check-eq "dir set" (str/trim (:out (sh ["pwd"] {:dir (str sub)}))) (str sub))
+  (fs/delete-tree sub))
+;; JOLT_PWD is the launcher's message to THIS process — bin/jolt exports the user's
+;; cwd before cd'ing to its checkout. A child's cwd is whatever the spawn chose, so
+;; the variable is never forwarded: a child jolt reads user.dir from its own cwd
+;; instead of inheriting the parent's project. A caller that puts it in the env map
+;; asked for it and gets it.
+(check-eq "JOLT_PWD is not forwarded"
+          (str/trim (:out (sh ["sh" "-c" "echo ${JOLT_PWD-unset}"]))) "unset")
+(check-eq "JOLT_PWD is not forwarded through :extra-env"
+          (str/trim (:out (sh ["sh" "-c" "echo ${JOLT_PWD-unset}"] {:extra-env {"JP_Y" "1"}}))) "unset")
+(check-eq "an explicit JOLT_PWD is honored"
+          (str/trim (:out (sh ["sh" "-c" "echo $JOLT_PWD"] {:extra-env {"JOLT_PWD" "/explicit"}}))) "/explicit")
+;; End to end, in the shape a test harness takes: this process's own directory
+;; has a README.md (the jolt checkout's), and a child jolt rooted at another
+;; project — one with its own README.md — must read THAT one, whether it is put
+;; there by :dir or by a shell's cd. The wrong answer is the parent's README, a
+;; different text rather than a missing file. The child is the jolt under test:
+;; smoke.sh hands it down in JOLT_EXE, and bin/jolt exports the same.
+(let [sub (fs/create-temp-dir {:prefix "jp-proj-"})
+      exe (or (System/getenv "JOLT_EXE") (some-> (fs/which "jolt") str) "jolt-not-found:set-JOLT_EXE")
+      expr "(print (slurp \"README.md\"))"]
+  (spit (str sub "/README.md") "PROJECT-README-MARKER")
+  (check-eq "the parent's own README is not the project's"
+            (str/includes? (slurp "README.md") "PROJECT-README-MARKER") false)
+  (check-eq "a child jolt under :dir reads its own project"
+            (:out (sh [exe "-e" expr] {:dir (str sub)})) "PROJECT-README-MARKER")
+  (check-eq "a child jolt behind a cd reads its own project"
+            (:out (sh ["sh" "-c" (str "cd '" sub "' && '" exe "' -e '" expr "'")])) "PROJECT-README-MARKER")
   (fs/delete-tree sub))
 
 ;; ProcessBuilder.start throws (like the JVM) when the program can't be resolved,
@@ -167,6 +198,49 @@
   (check-eq "a later redirect overrides one stream"
             [(= (.redirectOutput pb) java.lang.ProcessBuilder$Redirect/PIPE)
              (= (.redirectInput pb) java.lang.ProcessBuilder$Redirect/INHERIT)] [true true]))
+
+;; --- the JDK 9 File overloads (jolt-947) --------------------------------------
+;; redirectInput(File) is defined as redirectInput(Redirect.from(file)), and
+;; redirectOutput/redirectError(File) as Redirect.to(file). jolt used to STORE
+;; the File and then ignore it — proc-redir-fragment only understood a Redirect
+;; jhost — so fd 0 stayed jolt's own and a child like `cat` read the terminal
+;; forever instead of seeing EOF. That is the whole repro below: with the
+;; redirect honoured the child finishes, without it the waitFor times out.
+(check-eq "redirectInput(File) gives the child the file, not jolt's stdin"
+          (let [pb (doto (java.lang.ProcessBuilder. ["sh" "-c" "cat; echo FINISHED"])
+                     (.redirectInput (java.io.File. "/dev/null"))
+                     (.redirectErrorStream true))
+                proc (.start pb)]
+            [(.waitFor proc 10 java.util.concurrent.TimeUnit/SECONDS)
+             (.exitValue proc)
+             (str/trim (slurp (.getInputStream proc)))])
+          [true 0 "FINISHED"])
+;; the same through babashka.process's File :in, which is how the issue was hit
+(check-eq "a File :in reaches the child through babashka.process"
+          (:exit (deref (process ["sh" "-c" "cat; echo FINISHED"]
+                                 {:in (fs/file "/dev/null") :out :pipe :err :pipe})
+                        10000 {:exit :timeout}))
+          0)
+;; redirectOutput(File) truncates into the file, redirectError(File) likewise
+(let [out (fs/file (str (fs/create-temp-dir) "/out.txt"))
+      err (fs/file (str (fs/create-temp-dir) "/err.txt"))]
+  (.waitFor (.start (doto (java.lang.ProcessBuilder. ["sh" "-c" "echo TO-OUT; echo TO-ERR 1>&2"])
+                      (.redirectOutput out)
+                      (.redirectError err))))
+  (check-eq "redirectOutput(File) / redirectError(File) write the files"
+            [(str/trim (slurp out)) (str/trim (slurp err))] ["TO-OUT" "TO-ERR"]))
+;; a File setter reads back as a Redirect, not as the File — the JDK's getter
+;; answers Redirect.from/to(file), so .type is what distinguishes them
+(let [pb (doto (java.lang.ProcessBuilder. ["true"])
+           (.redirectInput (java.io.File. "/dev/null"))
+           (.redirectOutput (java.io.File. "/dev/null")))]
+  (check-eq "a File setter reads back as a Redirect"
+            [(.type (.redirectInput pb)) (.type (.redirectOutput pb))] ["read" "write"]))
+;; anything that is neither says so, instead of being stored and ignored
+(check-eq "a non-file, non-Redirect argument is named"
+          (try (.redirectInput (java.lang.ProcessBuilder. ["true"]) 42) :no-throw
+               (catch IllegalArgumentException e (str/includes? (ex-message e) "redirectInput")))
+          true)
 
 ;; --- fd-level INHERIT ---------------------------------------------------------
 ;; Redirect.INHERIT hands the child jolt's REAL fds (posix_spawn leaves 0/1/2
@@ -339,6 +413,52 @@
   (fs/delete-if-exists readyf)
   (fs/delete-if-exists hookf))
 
+;; ^C must run the shutdown hooks too, and exit 130 (128+SIGINT) the way the JVM
+;; and the shell both report it. SIGINT used to be left to Chez's
+;; keyboard-interrupt-handler, which unwinds to Chez's top level and exits 255
+;; without ever reaching the exit handler — so a `:shutdown destroy-tree` cleaned
+;; up on `kill` and cleaned up nothing on ^C (jolt-na7). The shutdown watcher takes
+;; SIGINT along with SIGTERM/SIGHUP now.
+(let [readyf (str (fs/create-temp-file {:prefix "jp-sigint-" :suffix ".txt"}))
+      hookf  (str (fs/create-temp-file {:prefix "jp-sigint-hook-" :suffix ".txt"}))
+      nested (str "(.addShutdownHook (Runtime/getRuntime)"
+                  "  (Thread. (fn [] (spit \"" hookf "\" \"RAN\"))))"
+                  " (spit \"" readyf "\" \"ready\") (Thread/sleep 30000)")
+      proc (process [jolt-bin "-e" nested] {:out :string :err :string})]
+  (loop [n 0]
+    (when (and (< n 200) (str/blank? (slurp readyf)))
+      (Thread/sleep 50)
+      (recur (inc n))))
+  (sh ["sh" "-c" (str "kill -INT " (.pid (:proc proc)))])
+  (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "SIGINT kills a jolt that registered a shutdown hook" (p/alive? proc) false)
+  (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+  (check-eq "SIGINT runs the shutdown hooks" (slurp hookf) "RAN")
+  (check-eq "and exits 128+SIGINT" (:exit @proc) 130)
+  (fs/delete-if-exists readyf)
+  (fs/delete-if-exists hookf))
+
+;; The stdin-prompt case from the SIGTERM test above, for ^C: a jolt blocked
+;; INSIDE Chez's read holds the whole Scheme world, so the hooks can only run
+;; from the watcher thread parked in sigwait.
+(let [readyf (str (fs/create-temp-file {:prefix "jp-sigint-in-" :suffix ".txt"}))
+      hookf  (str (fs/create-temp-file {:prefix "jp-sigint-in-hook-" :suffix ".txt"}))
+      nested (str "(.addShutdownHook (Runtime/getRuntime)"
+                  "  (Thread. (fn [] (spit \"" hookf "\" \"RAN\"))))"
+                  " (spit \"" readyf "\" \"ready\") (read-line)")
+      proc (process [jolt-bin "-e" nested])]
+  (loop [n 0]
+    (when (and (< n 200) (str/blank? (slurp readyf)))
+      (Thread/sleep 50)
+      (recur (inc n))))
+  (sh ["sh" "-c" (str "kill -INT " (.pid (:proc proc)))])
+  (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "SIGINT reaches a jolt parked at a stdin prompt" (p/alive? proc) false)
+  (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+  (check-eq "and its shutdown hooks run there too (SIGINT)" (slurp hookf) "RAN")
+  (fs/delete-if-exists readyf)
+  (fs/delete-if-exists hookf))
+
 ;; Same root cause from the other side: while the main thread waits on stdin the
 ;; rest of the program has to keep running. A future stopped ticking the moment a
 ;; prompt was reached, which is not what a JVM does with a thread in
@@ -382,6 +502,117 @@
 (jolt.host/block-sigint)
 (check-eq "a child does not inherit jolt's blocked SIGINT"
           (:exit @(process ["sh" "-c" "kill -INT $$"] {:out :string :err :inherit})) 130)
+
+;; Nor does it inherit jolt's open FILES AND SOCKETS. A descriptor with no file
+;; action is the parent's own, and posix_spawn hands the child every one of them
+;; unless told otherwise — where the JVM's ProcessBuilder gives a child the three
+;; stdio streams and nothing more. The cost is not tidiness: a child holding a
+;; copy of a listening socket keeps that port BOUND after the parent closes it,
+;; and an orphaned child (parent killed by a test runner's timeout) keeps it for
+;; as long as the orphan lives, so the next run cannot bind the port at all
+;; (#910 — curl children aged hours still pinning fixed callback ports).
+(require 'jolt.socket)
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      child  (process ["sleep" "30"])]
+  (.close server)                       ; the parent is done with the listener…
+  (check-eq "the port a closed listener held is free while a child still runs"
+            (try (.close (java.net.ServerSocket. port)) :bound
+                 (catch java.io.IOException _ :bind-failed))
+            :bound)
+  (p/destroy child)
+  @child)
+
+;; The same thing said exactly, where the OS will show the table: three stdio
+;; pipes, no jolt source file, no socket. Linux-only (/proc); the port case above
+;; is the portable half.
+(when (fs/exists? "/proc/self/fd")
+  (let [child (process ["sleep" "30"])
+        fds   (-> (sh ["ls" (str "/proc/" (.pid (:proc child)) "/fd")]) :out
+                  str/split-lines)]
+    (check-eq "a child's descriptor table is its own stdio and nothing else"
+              (vec (sort (remove str/blank? fds))) ["0" "1" "2"])
+    (p/destroy child)
+    @child))
+
+;; posix_spawn_file_actions_addclosefrom_np is glibc 2.34+, so on this machine
+;; the case above can only ever exercise that one action. Every macOS and every
+;; older glibc — most of the range the released Linux binary targets — takes the
+;; enumeration fallback instead, and it is gated here by re-running the same
+;; question in a child jolt that has the closefrom path switched off.
+(let [exe  (or (System/getenv "JOLT_EXE") (some-> (fs/which "jolt") str) "jolt-not-found:set-JOLT_EXE")
+      expr (str "(require 'jolt.socket)"
+                "(require '[jolt.process :as p])"
+                "(let [s (java.net.ServerSocket. 0) port (.getLocalPort s)"
+                "      c (p/process [\"sleep\" \"30\"])]"
+                "  (.close s)"
+                "  (print (try (.close (java.net.ServerSocket. port)) \"FREE\""
+                "              (catch java.io.IOException _ \"BOUND\")))"
+                "  (p/destroy c) @c nil)")]
+  (check-eq "and the same holds on the enumeration fallback (no closefrom)"
+            (:out (sh [exe "-e" expr] {:extra-env {"JOLT_NO_SPAWN_CLOSEFROM" "1"}}))
+            "FREE"))
+
+;; Spawning while another thread closes descriptors. The enumeration fallback
+;; snapshots the parent's table between pipe() and posix_spawn, and a descriptor
+;; closed in that window — a sibling's drained pipe, a file, a port a finalizer
+;; released — leaves a close action on a dead fd. glibc skips it in the child; the
+;; Darwin kernel fails the whole spawn with EBADF, and three workers sharing a
+;; ThreadLocal<Process> (below) lost one subprocess to "posix_spawn failed
+;; (errno 9)". macOS spawns under POSIX_SPAWN_CLOEXEC_DEFAULT now, where the
+;; kernel decides the set at spawn time and nothing is snapshotted.
+(when (fs/exists? "/etc/hosts")
+  (let [errs   (atom []) pids (atom []) stop (atom false)
+        closer (Thread. (fn [] (while (not @stop)
+                                 (.close (java.io.FileInputStream. "/etc/hosts")))))
+        work   (fn [] (dotimes [_ 16]
+                        (try (let [p (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))
+                                   s (str/trim (slurp (.getInputStream p)))]
+                               (.waitFor p)
+                               (swap! pids conj s))
+                             (catch Exception e (swap! errs conj (.getMessage e))))))
+        ts     (mapv (fn [_] (Thread. work)) (range 4))]
+    (.start closer)
+    (doseq [t ts] (.start t))
+    (doseq [t ts] (.join t))
+    (reset! stop true)
+    (.join closer)
+    (check-eq "spawning from four threads while a fifth closes descriptors" @errs [])
+    (check-eq "and every one of those spawns was its own child" (count (distinct @pids)) 64)))
+
+;; A per-thread subprocess — ThreadLocal<Process>, the shape a worker pool uses to
+;; give each thread its own long-lived helper program. It only works if the child
+;; threads run initialValue themselves: jolt's ThreadLocal was a Chez thread
+;; parameter, which a forked thread inherits, so every worker got the PARENT's
+;; already-drained process and read an empty string off it (jolt-uecg).
+(let [tl   (proxy [ThreadLocal] []
+             (initialValue [] (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))))
+      ;; each caller reaps the process it owns, on its own thread — the child
+      ;; threads are the only holders of theirs once .join returns
+      pid  (fn [] (let [p (.get tl) s (str/trim (slurp (.getInputStream p)))]
+                    (.waitFor p)
+                    s))
+      main (pid)
+      seen (atom [])
+      ts   (mapv (fn [_] (Thread. (fn [] (swap! seen conj (pid))))) (range 3))]
+  (doseq [t ts] (.start t))
+  (doseq [t ts] (.join t))
+  (check-eq "each thread's ThreadLocal<Process> is its own subprocess"
+            (count (distinct (cons main @seen))) 4)
+  (check-eq "and every worker actually read a pid"
+            (every? (fn [s] (and (seq s) (parse-long s))) @seen) true))
+
+;; The inheritable variant is the opposite contract and must keep working: the
+;; child shares the parent's process rather than spawning a second one.
+(let [tl   (proxy [InheritableThreadLocal] []
+             (initialValue [] (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))))
+      main (.get tl)
+      got  (promise)]
+  (.start (Thread. (fn [] (deliver got (identical? (.get tl) main)))))
+  (check-eq "an InheritableThreadLocal<Process> child shares the parent's process"
+            (deref got 5000 :TIMED-OUT) true)
+  (slurp (.getInputStream main))
+  (.waitFor main))
 
 (if (empty? @failures)
   (println "PROCESS-TEST OK")

@@ -20,6 +20,10 @@
 ;; the top of rt.ss (expression-position cond-expand, lone-string `error`),
 ;; which every load path runs before this file.
 (load "vendor/irregex/irregex.scm")
+;; …and jolt's replacement for its NFA->DFA conversion: the vendored one is
+;; quadratic in the DFA size and unbounded in work, which made a large
+;; alternation take seconds (or never finish) on its first match. See the file.
+(load "host/chez/regex-dfa.ss")
 
 
 ;; A jolt regex value: the source string (for printing / str) + the LAZILY
@@ -87,23 +91,32 @@
                          (if (< i (vector-length x)) (lp (+ i 1) (walk (vector-ref x i) n)) n)))
           (else n))))
 
-;; Two cache stages per source, both under the mutex (dynamic-wind, not a bare
-;; release: a pattern that fails used to leave the mutex held, blocking every
-;; later compile). 'parsed holds the validated SRE; 'irx the built engine.
+;; Two cache stages per source. 'parsed holds the validated SRE; 'irx the built
+;; engine. The HIT is read without the mutex and only a miss takes it, then
+;; re-reads under it: every (jolt-regex "src") — which is what a #"…" literal
+;; evaluates each time it is reached — comes through here, and with the lookup
+;; inside the lock eight threads matching literals ran 24x slower per thread
+;; than one. A string-keyed hashtable read racing a locked writer answers stale
+;; or not-found, never a torn entry (the class-graph caches read the same way),
+;; and a not-found just takes the locked path. The writer holds the mutex under
+;; dynamic-wind, not a bare release: a pattern that fails used to leave it held,
+;; blocking every later compile.
 (define (regex-parsed-entry source)
-  (jolt-lock! regex-cache-mutex)
-  (dynamic-wind
-    (lambda () #f)
-    (lambda ()
-      (or (hashtable-ref regex-cache source #f)
-          (let ((entry (guard (e (#t (regex-syntax-error source e)))
-                         (let-values (((sre opts) (java-pattern->sre source)))
-                           (vector 'parsed sre opts
-                                   (or (sre-has-backref? sre)
-                                       (> (sre-count-submatches sre) 0)))))))
-            (hashtable-set! regex-cache source entry)
-            entry)))
-    (lambda () (jolt-unlock! regex-cache-mutex))))
+  (or (hashtable-ref regex-cache source #f)
+      (begin
+        (jolt-lock! regex-cache-mutex)
+        (dynamic-wind
+          (lambda () #f)
+          (lambda ()
+            (or (hashtable-ref regex-cache source #f)
+                (let ((entry (guard (e (#t (regex-syntax-error source e)))
+                               (let-values (((sre opts) (java-pattern->sre source)))
+                                 (vector 'parsed sre opts
+                                         (or (sre-has-backref? sre)
+                                             (> (sre-count-submatches sre) 0)))))))
+                  (hashtable-set! regex-cache source entry)
+                  entry)))
+          (lambda () (jolt-unlock! regex-cache-mutex))))))
 
 ;; the built engine for source, compiling once on first demand. A capturing
 ;; pattern gets irregex's BACKTRACKING matcher (see the engine note above); a
@@ -146,15 +159,20 @@
 
 ;; An irregex match -> the Clojure result: whole string (no groups) or the
 ;; [whole g1 ... gn] vector (nil for a non-participating group).
+;; The groups vector is built straight into its slot vector: it used to go
+;; through a list and apply (a cons per group plus the list->vector copy) on
+;; every capturing match.
 (define (irx-result m)
   (let ((n (irregex-match-num-submatches m)))
     (if (= n 0)
         (irregex-match-substring m 0)
-        (let loop ((i n) (acc '()))
-          (if (< i 0)
-              (apply jolt-vector acc)
-              (let ((s (irregex-match-substring m i)))
-                (loop (- i 1) (cons (if s s jolt-nil) acc))))))))
+        (let ((out (make-vector (+ n 1))))
+          (let loop ((i 0))
+            (if (> i n)
+                (make-pvec out)
+                (let ((s (irregex-match-substring m i)))
+                  (vector-set! out i (if s s jolt-nil))
+                  (loop (+ i 1)))))))))
 
 (define (jolt-re-matches re s)
   (let* ((s (rx-charseq->string s))
@@ -162,12 +180,66 @@
     (if m (irx-result m) jolt-nil)))
 
 ;; A stateful matcher (java.util.regex.Matcher): the compiled pattern, the target
-;; string, the next search position, and the last successful irregex match. re-find
-;; over a matcher steps through non-overlapping matches; re-groups returns the
-;; groups of the last one.
+;; string, the next search position, the last successful irregex match, and the
+;; REGION the matcher is confined to. re-find over a matcher steps through
+;; non-overlapping matches; re-groups returns the groups of the last one.
+;;
+;; The region is [rstart, rend) and defaults to the whole string. Under the JVM's
+;; default anchoring bounds ^ and $ match AT the region's edges, and that is what
+;; irregex gives for free: an (irregex-search irx s from rend) chunks the string
+;; as (s from rend), so bos sits at the search origin and eos at the region end.
+;; The consumer guard below is what keeps ^ from re-anchoring at a resumed scan
+;; position instead of the region start.
+;; A matcher OWNS its match machinery: one irregex match vector (allocated at
+;; the first search, reset before each — the way irregex-fold reuses its own)
+;; and one (string start end) source triple, rebuilt only when the region
+;; changes. Each find used to allocate both, plus a chunker cons, before any
+;; matching: ~200 bytes per attempt on the call a tokenizer makes per token.
+;; `last` is that same vector after a hit — .group/.start/.end read the LAST
+;; match, as on the JVM — and #f after a miss, so a stale read is a "No match
+;; found" rather than the previous match. test/chez/regex-matcher-test.ss.
 (define-record-type matcher-t
-  (fields irx str (mutable pos) (mutable last))
-  (nongenerative jolt-matcher-v1))
+  (fields irx str (mutable pos) (mutable last) (mutable rstart) (mutable rend)
+          (mutable matches) (mutable src))
+  (nongenerative jolt-matcher-v3))
+(define (matcher-matches! m)
+  (or (matcher-t-matches m)
+      (let ((mm (irregex-new-matches (matcher-t-irx m))))
+        (matcher-t-matches-set! m mm)
+        mm)))
+;; The source triple (string start end) irregex's string chunker reads, and the
+;; (triple . origin) pair the search starts from, allocated once per matcher
+;; and UPDATED IN PLACE when the region moves — a tokenizer sets the region
+;; before every attempt, and a rebuilt triple per attempt was 64 bytes of the
+;; ~200 this file's header counts. In place is sound because irregex reads the
+;; triple only during a search and no search is in flight when the region is
+;; set (a matcher is one thread's cursor, as on the JVM).
+(define (matcher-src! m)
+  (or (matcher-t-src m)
+      (let* ((src (list (matcher-t-str m) (matcher-t-rstart m) (matcher-t-rend m)))
+             (init (cons src (matcher-t-rstart m))))
+        (matcher-t-src-set! m init)
+        init)))
+(define (matcher-region-set! m a b)
+  (matcher-t-rstart-set! m a)
+  (matcher-t-rend-set! m b)
+  (let ((init (matcher-t-src m)))
+    (when init
+      (let ((src (car init)))
+        (set-car! (cdr src) a)
+        (set-car! (cddr src) b)
+        (set-cdr! init a)))))
+;; The matcher's own search: irx-search-from's body over the matcher's reused
+;; vector and triple. Answers the match vector (the matcher's own) or #f.
+(define (matcher-search! m i)
+  (let ((irx (matcher-t-irx m)) (origin (matcher-t-rstart m)))
+    (and (or (= i origin) (not (flag-set? (irregex-flags irx) ~consumer?)))
+         (let* ((init (matcher-src! m))
+                (matches (matcher-matches! m)))
+           (irregex-reset-matches! matches)
+           (irregex-match-chunker-set! matches irregex-basic-string-chunker)
+           (irregex-search/matches irx irregex-basic-string-chunker
+                                   init (car init) i matches)))))
 ;; EVERY regex entry point takes a CharSequence on the JVM, not just a String, and
 ;; a library matching over a WINDOW of a larger string passes its own
 ;; implementation rather than copying — instaparse's Segment is a deftype with
@@ -188,7 +260,8 @@
         ((rx-host-charseq->string s))
         (else (jolt-need-str s))))
 (define (jolt-re-matcher re s)
-  (make-matcher-t (regex-t-irx (jolt-re-pattern re)) (rx-charseq->string s) 0 #f))
+  (let ((s (rx-charseq->string s)))
+    (make-matcher-t (regex-t-irx (jolt-re-pattern re)) s 0 #f 0 (string-length s) #f #f)))
 (define (jolt-matcher? x) (matcher-t? x))
 
 ;; java.util.regex.Pattern.flags(). jolt compiles a pattern from its source alone,
@@ -214,6 +287,7 @@
                   ((#\s) (loop (fx+ i 1) (fxlogor acc 32)))   ; DOTALL
                   ((#\u) (loop (fx+ i 1) (fxlogor acc 64)))   ; UNICODE_CASE
                   ((#\d) (loop (fx+ i 1) (fxlogor acc 1)))    ; UNIX_LINES
+                  ((#\U) (loop (fx+ i 1) (fxlogor acc 256)))  ; UNICODE_CHARACTER_CLASS
                   (else 0))))))))                ; (?:, (?=, a flag we don't model
 
 ;; re-find: stateless over (re s), or stateful over a matcher (advance + remember).
@@ -223,10 +297,9 @@
      (let ((m (irregex-search (regex-t-irx (jolt-re-pattern re)) (rx-charseq->string s))))
        (if m (irx-result m) jolt-nil)))
     ((m)
-     (let* ((str (matcher-t-str m))
-            (len (string-length str))
+     (let* ((end (matcher-t-rend m))
             (start (matcher-t-pos m))
-            (mm (and (<= start len) (irx-search-from (matcher-t-irx m) str start))))
+            (mm (and (<= start end) (matcher-search! m start))))
        (if mm
            (let ((ms (irregex-match-start-index mm 0))
                  (e (irregex-match-end-index mm 0)))
@@ -248,17 +321,23 @@
 ;; match and remembers it for .group; .group n returns submatch n (0 = whole) or
 ;; nil; .groupCount is the pattern's capturing-group count.
 (define (jolt-matcher-matches m)
-  (let ((mm (irregex-match (matcher-t-irx m) (matcher-t-str m))))
+  (let ((mm (irregex-match (matcher-t-irx m) (matcher-t-str m)
+                           (matcher-t-rstart m) (matcher-t-rend m))))
     ;; like .lookingAt, anchored at the region start rather than the find cursor,
     ;; and a success moves the cursor past the match so a following .find resumes
     ;; where the JVM's would instead of re-finding what was just matched.
     (if mm (matcher-note-match! m mm) (begin (matcher-t-last-set! m #f) #f))))
+;; .group before a successful match is the JVM's IllegalStateException, message
+;; and all. It used to be a bare ex-info, which a (catch IllegalStateException …)
+;; could not select — the same shape of bug as a raw host condition escaping.
+(define (jolt-matcher-no-match)
+  (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "No match found")))
 (define (jolt-matcher-group m . n)
   (let ((last (matcher-t-last m)))
     (if last
         (let ((s (irregex-match-substring last (if (pair? n) (->idx (car n)) 0))))
           (if s s jolt-nil))
-        (jolt-throw (jolt-ex-info "No match available" (jolt-hash-map))))))
+        (jolt-matcher-no-match))))
 (define (jolt-matcher-group-count m) (irregex-num-submatches (matcher-t-irx m)))
 ;; .lookingAt: anchored at the region START, matching a PREFIX — the middle ground
 ;; between .matches (the whole region) and .find (anywhere). It does NOT resume
@@ -277,10 +356,47 @@
     (matcher-t-pos-set! m (if (> e ms) e (+ e 1))))
   #t)
 (define (jolt-matcher-looking-at m)
-  (let ((mm (irregex-search (matcher-t-irx m) (matcher-t-str m) 0)))
-    (if (and mm (= (irregex-match-start-index mm 0) 0))
+  (let* ((origin (matcher-t-rstart m))
+         (mm (matcher-search! m origin)))
+    (if (and mm (= (irregex-match-start-index mm 0) origin))
         (matcher-note-match! m mm)
         (begin (matcher-t-last-set! m #f) #f))))
+
+;; --- .reset / .find(int) / .region: the JVM's scan-position and region controls
+;; .reset drops the last match, clears the region back to the whole input and
+;; puts the scan cursor at 0. It is what .find(int) and .region are both defined
+;; in terms of on the JVM, and it returns the matcher so .reset chains.
+(define (matcher-reset! m)
+  (matcher-t-last-set! m #f)
+  (matcher-region-set! m 0 (string-length (matcher-t-str m)))
+  (matcher-t-pos-set! m 0)
+  m)
+;; .find(int from): RESET the matcher — region included, which is why the bounds
+;; check is against the whole input — and then scan from `from`. The int used to
+;; be dropped, so every (.find m i) answered with the first match in the string
+;; and the anchored-scan idiom (.find m i) + (= (.start m) i) only ever matched
+;; at 0.
+(define (jolt-matcher-find-from m i)
+  (let ((n (string-length (matcher-t-str m))))
+    (when (or (< i 0) (> i n))
+      (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "Illegal start index")))
+    (matcher-reset! m)
+    (matcher-t-pos-set! m i)
+    (not (jolt-nil? (jolt-re-find m)))))
+;; .region(start, end): confine every subsequent match to [start, end). Resets
+;; first, as the JVM does, so a region also clears the last match and puts the
+;; scan cursor at the region start.
+(define (jolt-matcher-region m a b)
+  (let ((n (string-length (matcher-t-str m))))
+    (define (oob what)
+      (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" what)))
+    (when (or (< a 0) (> a n)) (oob "start"))
+    (when (or (< b 0) (> b n)) (oob "end"))
+    (when (> a b) (oob "start > end"))
+    (matcher-reset! m)
+    (matcher-region-set! m a b)
+    (matcher-t-pos-set! m a)
+    m))
 
 ;; Next match at or after cursor `i`.
 ;;
@@ -290,20 +406,34 @@
 ;; flag; jolt's scanning loops (re-seq, replace-all, split, matcher find) hand-roll
 ;; their own loop, so they have to honor it here.
 ;;
-;; Without this, irregex-search treats its start argument as the string ORIGIN and
-;; re-anchors ^ there: (str/replace "abcabc" #"^abc" "-") replaced twice, and
-;; (re-seq #"^abc" "abcabc") returned two matches, where the JVM does one. Selmer's
-;; include-tag parser strips its tag with ^.+?include\s*, so a nested
-;; {% include "a/include/head.html" %} lost everything up to the LAST "include"
-;; and resolved to "/head.html".
+;; The resume index is NOT the origin. irregex-search's start argument is both
+;; where the scan begins and what the pattern treats as the beginning of input:
+;; it re-anchored ^ there, so (str/replace "abcabc" #"^abc" "-") replaced twice
+;; and (re-seq #"^abc" "abcabc") returned two matches where the JVM does one
+;; (Selmer's include-tag parser strips its tag with ^.+?include\s*, so a nested
+;; {% include "a/include/head.html" %} lost everything up to the LAST "include"),
+;; and look-behind could not see the character before the resume point, which is
+;; what the wide line-terminator anchors need to tell a CRLF's \n from a lone one.
 ;;
-;; Residual: a bos nested inside an alternation (#"^a|b") is not flagged a
-;; consumer — it can legitimately match elsewhere — so scanning continues and its
-;; ^ branch can still re-anchor at the resume offset. irregex's own fold has the
-;; same limit.
-(define (irx-search-from irx s i)
-  (and (or (= i 0) (not (flag-set? (irregex-flags irx) ~consumer?)))
-       (irregex-search irx s i)))
+;; irregex-search/matches takes the two separately — `init` is the origin every
+;; assertion is measured from, `i` is where to start looking — so pass the origin
+;; as init and the cursor as i. That origin is index 0 for a whole-string scan and
+;; the REGION START for a matcher confined to one; the four-argument form takes
+;; both it and the region end.
+;;
+;; The ~consumer? guard in front is now an optimization rather than a correction:
+;; a pattern anchored at the start of input cannot match past the origin, and
+;; irregex answers #f there on its own — this just saves it the scan.
+(define irx-search-from
+  (case-lambda
+    ((irx s i) (irx-search-from irx s i 0 (string-length s)))
+    ((irx s i origin end)
+     (and (or (= i origin) (not (flag-set? (irregex-flags irx) ~consumer?)))
+          (let ((src (list s origin end))
+                (matches (irregex-new-matches irx)))
+            (irregex-match-chunker-set! matches irregex-basic-string-chunker)
+            (irregex-search/matches irx irregex-basic-string-chunker
+                                    (cons src origin) src i matches))))))
 
 ;; All non-overlapping matches, left to right. Advance past each match end (or by
 ;; one on a zero-width match). nil when there are no matches (Clojure: seq-able as
@@ -333,3 +463,157 @@
 ;; asserts a fresh pattern answers false and a matched one true.
 (def-var! "jolt.host" "regex-compiled?"
   (lambda (x) (if (and (regex-t? x) (regex-t-irx-cell x)) #t #f)))
+
+;; ---- splitting ----------------------------------------------------------------
+;; The two halves clojure.string/split and String.split share, here rather than
+;; in java/natives-str.ss because the Gambit boot's string surface (rt-core.ss)
+;; splits on a regex too and that file is not shared.
+
+;; The exact text a pattern matches, when it matches exactly one string — or #f
+;; when the pattern has any regex structure at all.
+;;
+;; A great many regex splits are not really regex splits: #"\n" is the single
+;; commonest separator in line-oriented code, and it costs a full irregex search
+;; per line to find a character. Splitting 20k lines on #"\n" measured ~10x
+;; babashka (1086 ms vs 106 ms). Recognising the literal lets the same call take
+;; the non-allocating str-index-of scan the literal-separator arm already uses.
+;;
+;; This is Java regex SOURCE, so a backslash escape is either a control letter or
+;; a quoted punctuation character. Anything that can match more than one string —
+;; a metacharacter, a quantifier, a class, a group, an anchor, a predefined class
+;; like \d, an inline flag like (?i) — declines and keeps the engine. Declining
+;; is always safe; only accepting wrongly would be a bug.
+(define (regex-literal-text src)
+  (let ((n (string-length src)))
+    (and (fx>? n 0)
+         (let ((out (open-output-string)))
+           (let loop ((i 0))
+             (if (fx>=? i n)
+                 (get-output-string out)
+                 (let ((c (string-ref src i)))
+                   (cond
+                     ((memv c '(#\. #\* #\+ #\? #\[ #\] #\( #\) #\{ #\} #\| #\^ #\$)) #f)
+                     ((char=? c #\\)
+                      (and (fx<? (fx+ i 1) n)
+                           (let ((e (string-ref src (fx+ i 1))))
+                             (cond
+                               ((char=? e #\n) (write-char #\newline out) (loop (fx+ i 2)))
+                               ((char=? e #\r) (write-char #\return out) (loop (fx+ i 2)))
+                               ((char=? e #\t) (write-char #\tab out) (loop (fx+ i 2)))
+                               ((char=? e #\f) (write-char #\page out) (loop (fx+ i 2)))
+                               ;; a quoted punctuation character stands for itself;
+                               ;; a quoted LETTER or DIGIT is a class or a back
+                               ;; reference (\d \w \s \b \Q \p \1), never a literal
+                               ((and (char>? e #\space) (char<=? e #\~)
+                                     (not (char-alphabetic? e)) (not (char-numeric? e)))
+                                (write-char e out) (loop (fx+ i 2)))
+                               (else #f)))))
+                     (else (write-char c out) (loop (fx+ i 1)))))))))))
+
+;; (re-split irx s limit) -> parts, splitting at each match. Keeps interior AND
+;; trailing empty strings (the clojure.string wrapper drops trailing for limit 0);
+;; a positive limit yields at most `limit` parts (the rest kept unsplit).
+;; The clojure.string.clj split wrapper
+;; layers the trailing-empty trim on top.
+(define (re-split irx s limit)
+  (let* ((s (jolt-need-str s))
+         (len (string-length s)))
+    ;; nout counts out — (length out) per part made a limited split O(parts^2)
+    (let loop ((start 0) (last 0) (out '()) (nout 0))
+      (if (and limit (fx>=? nout (fx- limit 1)))
+          (reverse (cons (substring s last len) out))
+          (let ((m (and (fx<=? start len) (irx-search-from irx s start))))
+            (if (not m)
+                (reverse (cons (substring s last len) out))
+                (let ((ms (irregex-match-start-index m 0))
+                      (me (irregex-match-end-index m 0)))
+                  (if (fx=? me ms)                 ; zero-width: emit single-char segment
+                      (if (fx>=? start len)
+                          (reverse (cons (substring s last len) out))
+                          ;; Emit the segment from last to this match point, skip
+                          ;; leading empty (JVM semantics for zero-width splits).
+                          ;; Resume at me+1, not start+1 — start+1 can still sit at
+                          ;; or before ms and re-find this same match (#940).
+                          (let ((seg (substring s last ms)))
+                            (if (and (string=? seg "") (null? out))
+                                (loop (fx+ me 1) me out nout)
+                                (loop (fx+ me 1) me (cons seg out) (fx+ nout 1)))))
+                      (loop me me (cons (substring s last ms) out) (fx+ nout 1))))))))))
+
+;; ---- replacing --------------------------------------------------------------
+;; The same split of labor for clojure.string/replace and replace-first: here
+;; so rt-core.ss's Gambit string surface replaces on a regex with the code
+;; natives-str.ss uses.
+(define (string-has-char? s c)
+  (let loop ((i 0))
+    (cond ((fx=? i (string-length s)) #f)
+          ((char=? (string-ref s i) c) #t)
+          (else (loop (fx+ i 1))))))
+
+;; Replacement-string expansion against an irregex match, with the JVM's
+;; Matcher.appendReplacement syntax: $N inserts group N's text (dropped when the
+;; group didn't participate) and a backslash escapes the next character — so
+;; \\ inserts one backslash and \$ a literal dollar. re-quote-replacement's
+;; output round-trips through this.
+(define (expand-dollar repl m)
+  (let ((len (string-length repl)))
+    (let loop ((i 0) (acc '()))
+      (if (fx>=? i len)
+          (apply string-append (reverse acc))
+          (let ((c (string-ref repl i)))
+            (cond
+              ((and (char=? c #\\) (fx<? (fx+ i 1) len))
+               (loop (fx+ i 2) (cons (string (string-ref repl (fx+ i 1))) acc)))
+              ((and (char=? c #\$) (fx<? (fx+ i 1) len)
+                    (char<=? #\0 (string-ref repl (fx+ i 1)))
+                    (char<=? (string-ref repl (fx+ i 1)) #\9))
+               (let* ((n (fx- (char->integer (string-ref repl (fx+ i 1))) 48))
+                      (g (and (fx<=? n (irregex-match-num-submatches m))
+                              (irregex-match-substring m n))))
+                 (loop (fx+ i 2) (if g (cons g acc) acc))))
+              (else (loop (fx+ i 1) (cons (string c) acc)))))))))
+
+;; One match's replacement text. A string gets $N expansion; a fn (jolt closure)
+;; is called with the match result (whole string, or [whole g1 ...] when grouped)
+;; and its result stringified.
+(define (replacement-text replacement m)
+  (cond
+    ((string? replacement) (expand-dollar replacement m))
+    ((procedure? replacement) (jolt-str-render-one (jolt-invoke replacement (irx-result m))))
+    (else (jolt-str-render-one replacement))))
+
+;; regex replace, first or all matches.
+(define (re-replace irx s replacement all?)
+  (let ((len (string-length s)))
+    (let loop ((start 0) (last 0) (acc '()))
+      (let ((m (and (fx<=? start len) (irx-search-from irx s start))))
+        (if (not m)
+            (apply string-append (reverse (cons (substring s last len) acc)))
+            (let ((ms (irregex-match-start-index m 0))
+                  (me (irregex-match-end-index m 0)))
+              (if (fx=? me ms)                     ; zero-width: step past
+                  (if (fx>=? start len)
+                      (apply string-append (reverse (cons (substring s last len) acc)))
+                      (loop (fx+ start 1) last acc))
+                  (let ((acc2 (cons (replacement-text replacement m)
+                                    (cons (substring s last ms) acc))))
+                    (if all?
+                        (loop me me acc2)
+                        (apply string-append (reverse (cons (substring s me len) acc2))))))))))))
+
+;; A regex that is really a literal, replaced by a string that is really a
+;; literal, is a plain search-and-replace — the same recognition split uses.
+;; (str/replace s #"abc" "xyz") ran the engine over every position and measured
+;; ~10x babashka (1661 ms vs 174 ms) where THIS function's own literal arm did
+;; the identical work in 171 ms.
+;;
+;; Answers the literal text to search for, or #f to keep the engine. It declines
+;; whenever the replacement could mean more than itself: a $-group reference or
+;; a backslash escape, both of which the engine path expands, or a FUNCTION,
+;; which has to be called with each match. Declining is always safe.
+(define (literal-replace-text pat repl)
+  (and (jolt-regex? pat)
+       (string? repl)
+       (not (string-has-char? repl #\$))
+       (not (string-has-char? repl #\\))
+       (regex-literal-text (regex-t-source pat))))

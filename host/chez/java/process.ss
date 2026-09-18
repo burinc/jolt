@@ -43,10 +43,13 @@
 (define proc-libc-signal (jolt-foreign-proc-safe "signal" '(int void*) 'void*))
 ;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
 ;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
-;; loop). Both spellings of the location accessor: Darwin/BSD, then glibc/musl.
+;; loop). All three spellings of the location accessor: Darwin/BSD, glibc/musl,
+;; then bionic (Android — __errno_location does not exist there, and leaving it
+;; out reads every error as 0, so an EINTR retry never fires).
 (define proc-errno-loc
   (or (jolt-foreign-proc-safe "__error" '() 'void*)
-      (jolt-foreign-proc-safe "__errno_location" '() 'void*)))
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
 (define (proc-errno)
   (if proc-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (proc-errno-loc) 0)) 0))
 
@@ -322,15 +325,43 @@
   (list (cons "type" (lambda (self) (symbol->string (proc-redirect-kind self))))
         (cons "toString" (lambda (self) (string-append "Redirect." (symbol->string (proc-redirect-kind self)))))))
 
+;; JDK 9 gave every redirect setter a File overload — redirectInput(File) is
+;; defined as redirectInput(Redirect.from(file)), redirectOutput/redirectError as
+;; Redirect.to(file). Without them the File was STORED as the redirect and then
+;; ignored by proc-redir-fragment, which only understands a Redirect jhost: the
+;; child silently kept jolt's own fd, so `:in (fs/file "/dev/null")` through
+;; babashka.process left the child reading the terminal forever (jolt#947).
+;; `kind` is the one Redirect.from/to would build for this stream.
+(define (proc-redirect-arg who kind x)
+  (cond ((proc-redirect? x) x)
+        ((jfile? x) (make-proc-redirect kind (jfile-path x)))
+        ;; a Path (nio-file.ss) or a plain path string: not JDK overloads, but
+        ;; .directory already takes either through file-path-of, and refusing
+        ;; them here would make the redirect setters the odd ones out.
+        ((string? x) (make-proc-redirect kind x))
+        ((nio-path? x) (make-proc-redirect kind (nio-path-str x)))
+        (else (throw-jvm (quote IllegalArgumentException)
+                (string-append "ProcessBuilder." who ": expected a ProcessBuilder$Redirect or a File, got "
+                               (jolt-str-render-one x))))))
+
 ;; --- environment map (ProcessBuilder.environment()) --------------------------
 ;; A live mutable Map<String,String>, seeded from the parent environment. jolt's
 ;; babashka.process only calls clear/putAll, but put/get/remove are provided too.
 ;; state: a Scheme string->string hashtable.
+;; The environment a child starts from: the parent's, less JOLT_PWD. That variable
+;; is the launcher's message to THIS process — bin/jolt exports the user's cwd
+;; before cd'ing to its checkout — and a child's cwd is whatever the spawn chose
+;; (proc-effective-dir), so an inherited copy hands a child jolt the PARENT's
+;; project as its user.dir: (slurp "README.md") under :dir read the spawner's
+;; README. A caller that puts JOLT_PWD in the env map asked for it and keeps it.
+;; Both the inherited envp and the seed of ProcessBuilder.environment() come from
+;; here, so there is no spawn shape that forwards it.
+(define (proc-child-env-pairs)
+  (filter (lambda (p) (not (string=? (car p) "JOLT_PWD"))) (all-env-pairs)))
 (define (make-proc-env-map)
   (let ((h (make-hashtable string-hash string=?)))
-    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) (all-env-pairs))
+    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) (proc-child-env-pairs))
     (make-jhost "jolt-env-map" h)))
-(define (proc-env-map? x) (and (jhost? x) (string=? (jhost-tag x) "jolt-env-map")))
 (define (proc-env-map-pairs em)
   (let ((h (jhost-state em)))
     (vector->list
@@ -356,7 +387,6 @@
 ;; state: #(cmd env-map dir redir-in redir-out redir-err merge-err?)
 (define (make-proc-builder cmd)
   (make-jhost "process-builder" (vector cmd #f #f #f #f #f #f)))
-(define (proc-builder? x) (and (jhost? x) (string=? (jhost-tag x) "process-builder")))
 (define (proc-pb-cmd st)         (vector-ref (jhost-state st) 0))
 (define (proc-pb-env st)         (vector-ref (jhost-state st) 1))
 (define (proc-pb-dir st)         (vector-ref (jhost-state st) 2))
@@ -392,13 +422,13 @@
         ;; documented default rather than nil.
         (cons "redirectInput"  (lambda (self . r)
           (if (null? r) (or (proc-pb-redir-in self) proc-redirect-pipe)
-              (begin (proc-pb-set! self 3 (car r)) self))))
+              (begin (proc-pb-set! self 3 (proc-redirect-arg "redirectInput" 'read (car r))) self))))
         (cons "redirectOutput" (lambda (self . r)
           (if (null? r) (or (proc-pb-redir-out self) proc-redirect-pipe)
-              (begin (proc-pb-set! self 4 (car r)) self))))
+              (begin (proc-pb-set! self 4 (proc-redirect-arg "redirectOutput" 'write (car r))) self))))
         (cons "redirectError"  (lambda (self . r)
           (if (null? r) (or (proc-pb-redir-err self) proc-redirect-pipe)
-              (begin (proc-pb-set! self 5 (car r)) self))))
+              (begin (proc-pb-set! self 5 (proc-redirect-arg "redirectError" 'write (car r))) self))))
         (cons "redirectErrorStream" (lambda (self . b)
           (if (null? b) (and (proc-pb-merge-err? self) #t)
               (begin (proc-pb-set! self 6 (jolt-truthy? (car b))) self))))
@@ -489,6 +519,29 @@
 (define proc-c-spawn (jolt-foreign-proc-safe "posix_spawn" '(void* string void* void* void* void*) 'int))
 (define proc-c-read  (jolt-foreign-proc-blocking "read"  '(int void* size_t) 'ssize_t))
 (define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
+
+;; posix_spawn_file_actions_addclosefrom_np(fa, 3): one file action that closes
+;; every descriptor at or above 3 in the child, after the dup2s below have put
+;; the pipes on 0/1/2. glibc 2.34+ and Solaris have it (glibc lowers it to a
+;; single close_range(2) syscall); older glibcs — jolt's release binary is built
+;; for a floor well below 2.34 — and macOS do not, which is what
+;; proc-close-inherited-fds! falls back for.
+(define proc-fa-closefrom
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addclosefrom_np" '(void* int) 'int))
+
+;; macOS has no closefrom action, but it has the flag the question was asked
+;; for: POSIX_SPAWN_CLOEXEC_DEFAULT starts the child with EVERY descriptor
+;; closed except the ones a file action names — a dup2 target, an open, or an
+;; explicit posix_spawn_file_actions_addinherit_np. The set is decided by the
+;; kernel at spawn time, so there is no parent-side snapshot to go stale (the
+;; enumeration fallback's race, below). Both entries are Darwin-only; where they
+;; do not resolve the flag is not used.
+(define proc-attr-init     (jolt-foreign-proc-safe "posix_spawnattr_init"     '(void*) 'int))
+(define proc-attr-setflags (jolt-foreign-proc-safe "posix_spawnattr_setflags" '(void* short) 'int))
+(define proc-attr-destroy  (jolt-foreign-proc-safe "posix_spawnattr_destroy"  '(void*) 'int))
+(define proc-fa-inherit
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addinherit_np" '(void* int) 'int))
+(define proc-POSIX-SPAWN-CLOEXEC-DEFAULT #x4000)   ; <sys/spawn.h>, Darwin
 
 ;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
 ;; extension's own bindings (fcntl, errno) are gated separately by
@@ -688,6 +741,91 @@
 ;; posix_spawn.
 (define proc-spawn-fd-mutex (make-mutex))
 
+;; --- the child gets its own stdio and nothing else ---------------------------
+;; A descriptor with no file action IS the parent's descriptor, and posix_spawn
+;; hands the child EVERY one of them: the source files jolt has open, its nREPL
+;; listener, a socket a library is serving on. The JVM's child gets the three
+;; stdio streams and nothing else, and the difference is load-bearing rather
+;; than cosmetic. A child holding a copy of a listening socket keeps that port
+;; BOUND after the parent closes it, for as long as the child lives — and an
+;; ORPHANED child (parent killed by a test runner's per-namespace timeout, say)
+;; holds it for as long as IT lives, so the next run cannot bind the port at all
+;; (jolt-fhv, #910: "bind failed on port 54603" behind curl children aged hours).
+;;
+;; Three ways to say "and close the rest", in preference order:
+;;
+;;   1. posix_spawn_file_actions_addclosefrom_np(fa, 3), added LAST so it runs
+;;      after the dup2s have put the pipes on 0/1/2. One action, one
+;;      close_range(2) in the child, and no window at all: the set it closes is
+;;      decided in the child, after this process can no longer add to it.
+;;   2. POSIX_SPAWN_CLOEXEC_DEFAULT on macOS (proc-cloexec-default?): the kernel
+;;      starts the child with everything closed except what a file action names,
+;;      so the dup2'd pipes survive and an INHERITED stdio stream is named with
+;;      addinherit_np. Decided at spawn time like 1; no snapshot.
+;;   3. Where neither resolves — every glibc below 2.34, which is most of the
+;;      range jolt's released Linux binary targets — enumerate this process's
+;;      own open descriptors (/proc/self/fd on Linux, /dev/fd on BSD) and add one
+;;      addclose per fd. The snapshot is taken in the PARENT, so a descriptor
+;;      another thread opens between the listing and the spawn is still
+;;      inherited; proc-spawn-fd-mutex serialises spawns against each other, not
+;;      against the rest of the program. That residual window is one this file
+;;      cannot close without the syscall in 1, and it is a far smaller one than
+;;      inheriting the whole table.
+;;
+;; Each enumerated fd is confirmed open with fcntl(F_GETFD) before its action is
+;; added, because an addclose of an already-closed fd is a file action that
+;; FAILS. The check does not close the window either: a descriptor another
+;; thread closes between it and posix_spawn — a sibling's drained pipe, a file, a
+;; port a finalizer released — leaves a close action on a dead fd. glibc and musl
+;; ignore that in the child (a close below the fd limit that fails is skipped);
+;; the Darwin kernel fails the WHOLE spawn with EBADF, which is how three worker
+;; threads sharing a ThreadLocal<Process> lost one subprocess to "posix_spawn
+;; failed (errno 9)" — and why macOS takes tier 2, where nothing is snapshotted.
+;; The listing is itself served by an open directory descriptor which is gone
+;; again by the time directory-list returns, so the snapshot always contains at
+;; least one such fd. Without a working fcntl there is nothing to confirm with and
+;; the fallback declines rather than risk a spawn that cannot exec — that is
+;; today's inheritance, which is the honest degradation here.
+(define proc-F-GETFD 1)        ; macOS + Linux
+(define (proc-fd-live? fd)
+  (and proc-fcntl-get (>= (proc-fcntl-get fd proc-F-GETFD) 0)))
+(define (proc-open-fd-dir)
+  (let loop ((ds '("/proc/self/fd" "/dev/fd")))
+    (cond ((null? ds) #f)
+          ((guard (e (#t #f)) (file-directory? (car ds))) (car ds))
+          (else (loop (cdr ds))))))
+
+;; Tier 1 is the only tier a machine with a new enough glibc would ever run, so
+;; the gate could not see tier 2 at all. JOLT_NO_SPAWN_CLOSEFROM=1 makes this
+;; process take the enumeration path, and test/chez/process-test.clj re-runs the
+;; inheritance case in a child jolt with it set.
+(define (proc-closefrom-disabled?)
+  (let ((v (getenv "JOLT_NO_SPAWN_CLOSEFROM"))) (and v (not (string=? v "")) #t)))
+
+;; Tier 2: Darwin, with the attribute and inherit entries resolved. The same
+;; switch turns it off, so the enumeration fallback stays reachable from a Mac
+;; for the gate that exercises it.
+(define (proc-cloexec-default?)
+  (and (eq? (sa-os-family) 'macos)
+       proc-attr-init proc-attr-setflags proc-attr-destroy proc-fa-inherit
+       (not (proc-closefrom-disabled?))
+       #t))
+
+;; `keep` names the fds that already have a close action of their own (the
+;; pipe ends), so the fallback does not add a second one and fail it.
+(define (proc-close-inherited-fds! fa keep)
+  (if (and proc-fa-closefrom (not (proc-closefrom-disabled?)))
+      (proc-fa-closefrom fa 3)
+      (let ((dir (proc-open-fd-dir)))
+        (when (and dir proc-fcntl-get)
+          (for-each
+            (lambda (name)
+              (let ((fd (string->number name)))
+                (when (and fd (integer? fd) (exact? fd) (>= fd 3)
+                           (not (memv fd keep)) (proc-fd-live? fd))
+                  (proc-fa-close fa fd))))
+            (guard (e (#t '())) (directory-list dir)))))))
+
 ;; Spawn `/bin/sh -c sh-cmd` with fd-level stdio: an inherited stream gets no
 ;; file action (the child keeps the parent's descriptor); the rest get pipes.
 ;; Returns (values stdin-port stdout-port stderr-port pid), #f for inherited
@@ -742,24 +880,45 @@
              (out-p (and (not inherit-out?) (mk-pipe #t #f)))
              (err-p (and (not inherit-err?) (mk-pipe #t #f)))
              (fa (sa-foreign-alloc 128))
+             ;; posix_spawnattr_t is one pointer on Darwin, the only place this
+             ;; is allocated; 64 bytes leaves room for a wider layout regardless.
+             (attr (and (proc-cloexec-default?) (sa-foreign-alloc 64)))
              (pidbuf (sa-foreign-alloc 8)))
         (proc-fa-init fa)
+        (when attr
+          (proc-attr-init attr)
+          (proc-attr-setflags attr proc-POSIX-SPAWN-CLOEXEC-DEFAULT)
+          ;; An inherited stream has no dup2 naming it, so under the flag it
+          ;; would be closed with everything else: name it.
+          (when inherit-in?  (proc-fa-inherit fa 0))
+          (when inherit-out? (proc-fa-inherit fa 1))
+          (when inherit-err? (proc-fa-inherit fa 2)))
         (when in-p  (proc-fa-dup2 fa (car in-p) 0)
                     (proc-fa-close fa (car in-p)) (proc-fa-close fa (cdr in-p)))
         (when out-p (proc-fa-dup2 fa (cdr out-p) 1)
                     (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
         (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
                     (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
+        ;; LAST of the file actions, so the dup2s above have already moved the
+        ;; child's ends onto 0/1/2 by the time everything else goes. Under
+        ;; CLOEXEC_DEFAULT the kernel does this part.
+        (unless attr
+          (proc-close-inherited-fds!
+            fa (append (if in-p  (list (car in-p)  (cdr in-p))  '())
+                       (if out-p (list (car out-p) (cdr out-p)) '())
+                       (if err-p (list (car err-p) (cdr err-p)) '()))))
         (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
-                           (all-env-pairs))))
-               ;; attrp is NULL, so the child inherits this thread's signal mask —
+                           (proc-child-env-pairs))))
+               ;; attrp is NULL — or carries only the CLOEXEC_DEFAULT flag, never
+               ;; SETSIGMASK — so the child inherits this thread's signal mask,
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask
-                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))))
+                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa (or attr 0) (car argv) (car envp)))))
                (pid (sa-foreign-ref 'int pidbuf 0)))
           (proc-fa-destroy fa)
+          (when attr (proc-attr-destroy attr) (sa-foreign-free attr))
           (sa-foreign-free fa) (sa-foreign-free pidbuf)
           (proc-free-argv argv) (proc-free-argv envp)
           ;; parent side: the child's pipe ends close unconditionally; on a failed
@@ -792,7 +951,6 @@
 (define (proc-p-stderr-is st)  (vector-ref (jhost-state st) 2))
 (define (proc-p-pid st)        (vector-ref (jhost-state st) 3))
 (define (proc-p-exit-box st)   (vector-ref (jhost-state st) 4))
-(define (proc-p-cmd st)        (vector-ref (jhost-state st) 5))
 (define (proc-p-mutex st)      (vector-ref (jhost-state st) 6))
 (define (proc-p-stdout-port st) (vector-ref (jhost-state st) 7))
 (define (proc-p-stdin-port st)  (vector-ref (jhost-state st) 8))
@@ -800,7 +958,6 @@
 ;; The 128+signal status of a signal WE sent, if any — the one recoverable answer
 ;; when the child turns out to be unwaitable (see proc-lost-status).
 (define (proc-p-signalled st)  (vector-ref (jhost-state st) 10))
-(define (proc-process? x) (and (jhost? x) (string=? (jhost-tag x) "process")))
 
 ;; ProcessBuilder.start resolves the program before spawning and throws
 ;; IOException("…No such file or directory") when it can't be found; our shell
@@ -953,11 +1110,18 @@
 ;; itself slept the carrier, so a fiber could not have parked in there anyway
 ;; (jolt-x1no). Now the lock covers one waitpid attempt, and jolt-pause-ms parks a
 ;; fiber between attempts while a thread sleeps.
+;;
+;; The interrupt check is per ROUND rather than a registration, because this is a
+;; poll and not a condition wait: there is no cv for .interrupt to poke, so the flag
+;; is simply read (and cleared) each time round, which is the same
+;; check-clear-throw jolt-cv-wait-interruptibly does at the top of its decide.
+;; Process.waitFor throws InterruptedException on the JVM.
 (define (proc-wait-blocking st)
   (let ((code
           (let loop ((step 1))                   ; 1ms
             (or (proc-reap-once st)
                 (begin
+                  (jolt-interrupt-poll-check! "Process.waitFor")
                   (jolt-pause-ms step)
                   (loop (min proc-poll-step-max (* step 2))))))))
     (for-each proc-latch-wait (unbox (proc-p-inherit-latches st)))
@@ -996,8 +1160,12 @@
         (cons "waitFor" (lambda (self . args)
           (if (null? args)
               (->num (proc-wait-blocking self))
-              ;; (waitFor timeout unit): babashka always passes MILLISECONDS.
-              (proc-wait-timed self (jnum->exact (car args))))))
+              ;; (waitFor timeout unit), scaled by the unit through the one
+              ;; conversion every (timeout, unit) method uses (concurrency.ss).
+              ;; This read the amount as milliseconds whatever the unit said —
+              ;; babashka passes MILLISECONDS, so it never showed there — and a
+              ;; (.waitFor p 10 SECONDS) gave the child 10ms.
+              (proc-wait-timed self (tu-args->ms args)))))
         (cons "exitValue" (lambda (self)
           (jolt-with-mutex (proc-p-mutex self)
             (or (unbox (proc-p-exit-box self))
@@ -1022,7 +1190,8 @@
       (cond ((not (proc-alive? st)) #t)
             ((<= remaining 0) #f)
             ;; a fiber parks for the step rather than sleeping its carrier
-            (else (jolt-pause-ms step)
+            (else (jolt-interrupt-poll-check! "Process.waitFor")
+                  (jolt-pause-ms step)
                   (loop (- remaining step)))))))
 
 ;; --- java.lang.ProcessHandle (destroy-tree) ----------------------------------
@@ -1165,14 +1334,18 @@
         ;; The memory trio, over Chez's own heap accounting: current-memory-bytes
         ;; is what the collector has reserved from the OS (the JVM's totalMemory)
         ;; and bytes-allocated is what is live inside it, so free is the
-        ;; difference. maxMemory is unbounded here — Chez grows the heap on demand
-        ;; with no configured ceiling — and Long/MAX_VALUE is what the JVM reports
-        ;; for exactly that case. criterium reads all four for its report, and
-        ;; without them a benchmark namespace crashes rather than running.
+        ;; difference. criterium reads all four for its report, and without them a
+        ;; benchmark namespace crashes rather than running.
         (cons "totalMemory" (lambda (self) (->num (sa-total-memory-bytes))))
         (cons "freeMemory"
           (lambda (self) (->num (max 0 (- (sa-total-memory-bytes) (sa-bytes-allocated))))))
-        (cons "maxMemory" (lambda (self) (->num 9223372036854775807)))
+        ;; maxMemory is -Xmx on the JVM. jolt has a ceiling of its own now
+        ;; (rt.ss jolt-install-heap-ceiling!, 25% of RAM by default, the same
+        ;; share MaxRAMPercentage uses), so report that. Long/MAX_VALUE is still
+        ;; the answer under JOLT_MAX_HEAP=off, which is what unbounded means and
+        ;; what every release before 0.8.5 reported unconditionally.
+        (cons "maxMemory" (lambda (self)
+                            (->num (or (jolt-heap-max-bytes) 9223372036854775807))))
         ;; Runtime.gc routes to System/gc on the JVM, so it gets the same guarded
         ;; hint semantics — Chez's collect refuses while multiple threads are live,
         ;; and neither of these ever throws on the JVM.

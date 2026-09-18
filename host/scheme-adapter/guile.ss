@@ -28,6 +28,10 @@
 ;;                                        current values); Guile's SRFI-39 parameters
 ;;                                        default fresh per thread — inheritance must be
 ;;                                        reproduced explicitly, like the host relies on.
+;;   memory-order-acquire   UNIMPLEMENTED  Guile: no-op when threads share no memory,
+;;                                        else a fence; seq.ss publishes a forced
+;;                                        tail behind memory-order-release.
+;;   memory-order-release   UNIMPLEMENTED  (see memory-order-acquire)
 ;;   make-mutex             UNIMPLEMENTED  Guile: SRFI-18 make-mutex.
 ;;   mutex-acquire          UNIMPLEMENTED  Guile: (rnrs) mutex-acquire (SRFI-18 mutex-lock!).
 ;;                                        must verify: contract pins NON-RECURSIVE mutexes
@@ -74,13 +78,15 @@
 ;;   sa-gc-max-generation   UNIMPLEMENTED  ?? Guile uses Boehm GC — no generations.
 ;;   sa-bytes-allocated     UNIMPLEMENTED  ?? (gc-stats) candidate; must verify field/shape.
 ;;   sa-total-memory-bytes  UNIMPLEMENTED  ?? (gc-stats) candidate; must verify.
-;;   sa-max-memory-bytes    UNIMPLEMENTED  Large constant permitted by contract.
+;;   sa-max-memory-bytes    UNIMPLEMENTED  The current total permitted by contract.
+;;   sa-reset-max-memory-bytes! UNIMPLEMENTED  No-op permitted when the above answers "now".
 ;;   sa-real-time-ms        UNIMPLEMENTED  ?? (get-internal-real-time) — must verify units;
 ;;                                        may use any monotonic ms clock, never a constant.
 ;;   sa-file-mtime-ms       UNIMPLEMENTED  Guile: (stat:mtim (stat path)) — posix; must
 ;;                                        verify unit (time object -> ms conversion).
 ;;   sa-gc-trip-bytes!      UNIMPLEMENTED  ?? Guile exposes no GC trip threshold; no-op
 ;;                                        candidate — must verify callers tolerate it.
+;;   sa-gc-trip-bytes       UNIMPLEMENTED  0 permitted by contract (no trip threshold).
 
 ;; ---------------------------------------------------------------------------
 ;; tier: capability-introspect
@@ -96,13 +102,23 @@
 ;;   sa-continuation-frames UNIMPLEMENTED  ?? Guile's call-with-prompt does not expose
 ;;                                        frames; '() permitted (backtrace renders bare).
 ;;   sa-procedure-info      UNIMPLEMENTED  #f permitted by contract.
+;;   sa-procedure-code-name UNIMPLEMENTED  (procedure-name p) is a symbol in Guile;
+;;                                        #f permitted by contract.
 
 ;; ---------------------------------------------------------------------------
 ;; tier: capability-ffi
 ;; ---------------------------------------------------------------------------
+;;   sa-call-with-escape-continuation UNIMPLEMENTED Guile has call/cc; wrap it with a
+;;                                        spent flag so a second invocation (or one after
+;;                                        the capturing call returned) RAISES rather than
+;;                                        re-entering. The escape must unwind dynamic-wind
+;;                                        on the way out — jolt's `finally` rides that.
 ;;   sa-foreign-procedure   UNIMPLEMENTED  Guile: (pointer->procedure ret (dynamic-func name
 ;;                                        lib) args) — (system foreign). must verify call
 ;;                                        shape translation; SYNTAX on Chez (lowering).
+;;   sa-foreign-procedure-native-error UNIMPLEMENTED Must capture errno atomically
+;;                                        at the foreign call boundary; a later
+;;                                        read is racy and not equivalent.
 ;;   sa-foreign-procedure-blocking UNIMPLEMENTED  ?? must verify collect-safety; may
 ;;                                        collapse to plain sa-foreign-procedure only if the
 ;;                                        collector never stops other threads.
@@ -156,6 +172,21 @@
 ;;                                        may RAISE (jolt.image surfaces a clean unsupported
 ;;                                        error — the raise must carry a message).
 ;;   sa-fasl-read           UNIMPLEMENTED  ?? same, must verify externals resolution shape.
+
+;; ---------------------------------------------------------------------------
+;; tier: capability-unchecked
+;; ---------------------------------------------------------------------------
+;;   sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=?  UNIMPLEMENTED  Guile: the
+;;                                        checked (rnrs arithmetic fixnums) ops are
+;;                                        the permitted degradation; a tuned port may
+;;                                        expand to the unchecked variants.
+;;   sa-uvector-ref sa-uvector-set!       UNIMPLEMENTED  Guile: vector-ref /
+;;                                        vector-set! (degradation), or the
+;;                                        unchecked accessors when the port is tuned.
+;;   sa-vector-copy-range!                UNIMPLEMENTED  Guile: R7RS vector-copy!
+;;                                        has the contract's argument order.
+;;   sa-string-copy-range!                UNIMPLEMENTED  Guile: string-copy! (SRFI-13 /
+;;                                        R7RS) has the contract's argument order.
 
 ;; ---------------------------------------------------------------------------
 ;; tier: misc

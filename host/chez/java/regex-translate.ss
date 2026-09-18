@@ -78,7 +78,7 @@
                 (if (>= j n) src
                     (let ((fc (string-ref src j)))
                       (cond
-                       ((memv fc '(#\s #\i #\m #\x #\u))
+                       ((memv fc '(#\s #\i #\m #\x #\u #\d #\U))
                         (scan (+ j 1) (cons fc fs)))
                        ((and (char=? fc #\)) (pair? fs) (memv #\x fs))
                         (let ((others (reverse (remv #\x fs))))
@@ -97,6 +97,10 @@
         ((char=? c #\i) 'case-insensitive)
         ((char=? c #\m) 'multi-line)
         ((char=? c #\x) 'ignore-space)
+        ;; d (UNIX_LINES) narrows the terminator set DOT / ^ / $ read — see
+        ;; java-nel below. It used to be accepted and dropped, which was harmless
+        ;; only because the narrow set was all jolt ever applied.
+        ((char=? c #\d) 'unix-lines)
         (else #f)))
 
 (define (parse-leading-flags src i end)
@@ -111,7 +115,7 @@
                     (values (reverse opts) i)
                     (let ((c (string-ref src j)))
                       (cond
-                       ((memv c '(#\u #\U #\d)) (scan (+ j 1) fs))
+                       ((memv c '(#\u #\U)) (scan (+ j 1) fs))
                        ((regex-flag->opt c) =>
                         (lambda (opt) (scan (+ j 1) (cons opt fs))))
                        ((char=? c #\))
@@ -133,17 +137,52 @@
 (define sre-Z
   '(or #\space #\xA0 #\x1680 (/ #\x2000 #\x200A) #\x2028 #\x2029 #\x202F #\x205F #\x3000))
 
+;; \p{L}/\p{N} used to approximate with a hand-picked range ((/ #\x80
+;; #\xD7FF) for L), which is nearly the whole BMP above ASCII and so
+;; wrongly matched symbols/punctuation too, e.g. U+2192 → (#941). Build
+;; the real Unicode General Category ranges from Chez's own
+;; char-general-category instead. ~10ms over the full codepoint space,
+;; paid once and lazily, only if a pattern actually uses \p{L}/\p{N}.
+(define (unicode-category-ranges categories)
+  (let loop ((cp 0) (start #f) (ranges '()))
+    (define (close-at cp ranges)
+      (if start (cons `(/ ,(integer->char start) ,(integer->char (- cp 1))) ranges) ranges))
+    (cond
+     ((> cp #x10FFFF) (cons 'or (reverse (close-at cp ranges))))
+     ((and (>= cp #xD800) (<= cp #xDFFF)) (loop (+ cp 1) start ranges)) ; surrogates
+     (else
+      (let ((in? (memq (char-general-category (integer->char cp)) categories)))
+        (cond
+         ((and in? (not start)) (loop (+ cp 1) cp ranges))
+         ((and (not in?) start) (loop (+ cp 1) #f (close-at cp ranges)))
+         (else (loop (+ cp 1) start ranges))))))))
+
+;; The JVM's rule, which these follow: a Unicode CATEGORY name (\p{L}, \p{Lu},
+;; \p{N}, \p{Nd}, \p{P} ...) is the real category over every codepoint, while a
+;; POSIX name (\p{Alpha}, \p{Digit}, \p{Upper}, \p{Punct} ...) is ASCII unless
+;; UNICODE_CHARACTER_CLASS is on -- so \p{Alpha} matches "a" and not "é", and
+;; \p{Nd} matches an Arabic-Indic digit but not a Roman numeral (that is \p{N}).
+;; javaLowerCase/javaUpperCase are Character.isLowerCase/isUpperCase, which
+;; Ll/Lu approximate far better than ASCII did.
+(define sre-unicode-L  (delay (unicode-category-ranges '(Lu Ll Lt Lm Lo))))
+(define sre-unicode-Lu (delay (unicode-category-ranges '(Lu))))
+(define sre-unicode-Ll (delay (unicode-category-ranges '(Ll))))
+(define sre-unicode-N  (delay (unicode-category-ranges '(Nd Nl No))))
+(define sre-unicode-Nd (delay (unicode-category-ranges '(Nd))))
+(define sre-unicode-P  (delay (unicode-category-ranges '(Pc Pd Ps Pe Pi Pf Po))))
+(define sre-unicode-Ps (delay (unicode-category-ranges '(Ps))))
+(define sre-unicode-Pe (delay (unicode-category-ranges '(Pe))))
+
 (define (prop-class-sre name)
   (cond
-   ;; Letters — BMP + supplementary
-   ((or (string=? name "L") (string=? name "Alpha"))
-    '(or alpha (/ #\x80 #\xD7FF) (/ #\x10000 #\x10FFFF)))
-   ((string=? name "Lu")
-    '(or upper (/ #\xC0 #\xD6) (/ #\xD8 #\xDE)))
-   ((string=? name "Ll")
-    '(or lower (/ #\xDF #\xF6) (/ #\xF8 #\xFF)))
-   ((or (string=? name "N") (string=? name "Nd") (string=? name "Digit"))
-    'numeric)
+   ((string=? name "L") (force sre-unicode-L))
+   ((string=? name "Lu") (force sre-unicode-Lu))
+   ((string=? name "Ll") (force sre-unicode-Ll))
+   ((string=? name "N") (force sre-unicode-N))
+   ((string=? name "Nd") (force sre-unicode-Nd))
+   ;; POSIX names: ASCII, as on the JVM
+   ((string=? name "Alpha") 'alpha)
+   ((string=? name "Digit") 'numeric)
    ;; The Unicode separator categories are a short fixed list, so spell them out
    ;; rather than settling for irregex's ASCII `blank`. Zs is the space separators
    ;; (the non-breaking ones included — \p{Z} is a category, not Java's
@@ -152,10 +191,10 @@
    ((string=? name "Zl") #\x2028)
    ((string=? name "Zp") #\x2029)
    ((string=? name "Z") sre-Z)
-   ((string=? name "P") 'punct)
-    ((string=? name "Ps") '(or #\( #\[ #\{))
-    ((string=? name "Pe") '(or #\) #\] #\}))
-    ((string=? name "Lower") 'lower)
+   ((string=? name "P") (force sre-unicode-P))
+   ((string=? name "Ps") (force sre-unicode-Ps))
+   ((string=? name "Pe") (force sre-unicode-Pe))
+   ((string=? name "Lower") 'lower)
    ((string=? name "Upper") 'upper)
    ((string=? name "ASCII") 'ascii)
    ((string=? name "Alnum") 'alphanumeric)
@@ -166,8 +205,8 @@
    ((string=? name "Cntrl") 'cntrl)
    ((string=? name "XDigit") 'xdigit)
    ((string=? name "Space") 'whitespace)
-   ((string=? name "javaLowerCase") 'lower)
-   ((string=? name "javaUpperCase") 'upper)
+   ((string=? name "javaLowerCase") (force sre-unicode-Ll))
+   ((string=? name "javaUpperCase") (force sre-unicode-Lu))
    ((string=? name "javaWhitespace") 'whitespace)
    (else #f)))
 
@@ -233,15 +272,13 @@
                          (maybe-quantifier cc src i end flags depth)))
      ((char=? c #\()  (let-values (((grp i) (parse-group src i end flags depth)))
                          (maybe-quantifier grp src i end flags depth)))
-     ((char=? c #\.)  (maybe-quantifier (if (jr-flag? flags 'single-line) 'any 'nonl)
+     ((char=? c #\.)  (maybe-quantifier (if (jr-flag? flags 'single-line) 'any (jr-dot-sre flags))
                                         src (+ i 1) end flags depth))
-     ((char=? c #\^)  (maybe-quantifier (if (jr-flag? flags 'multi-line) 'bol 'bos)
+     ((char=? c #\^)  (maybe-quantifier (if (jr-flag? flags 'multi-line) (jr-bol-sre flags) 'bos)
                                         src (+ i 1) end flags depth))
      ((char=? c #\$)
       (maybe-quantifier
-       (if (jr-flag? flags 'multi-line)
-           '(or eol eos)
-           '(look-ahead (or eos (seq (? #\return) #\newline eos))))
+       (if (jr-flag? flags 'multi-line) (jr-eol-sre flags) (jr-final-eol-sre flags))
        src (+ i 1) end flags depth))
       ((char=? c #\{)
        ;; A {n,m} with no preceding atom: Java still validates it and rejects
@@ -316,103 +353,192 @@
               (values (if poss? `(atomic ,base) base) j))))))))
 
 ;; ── Escape sequences ──────────────────────────────────────────────────────────
+;;
+;; An escape means the same thing in a bare pattern and inside a character class
+;; unless Java says otherwise, and there are exactly three places it does:
+;;   \b        a word boundary outside a class, a COMPILE ERROR inside one
+;;   \R        a linebreak outside a class, an error inside one
+;;   \1..\9 \k back-references, legal only outside
+;; Everything else — \d \D \w \W \s \S, \p \P, \a \e \t \n \r \f, \cX, octal, \x,
+;; \u — is parse-escape-shared's job, and both callers fall through to it.
+;;
+;; This used to be two hand-kept copies and they HAD drifted: \a was in the
+;; bare-pattern copy only, so [\a] matched the letter a instead of BEL, and \c
+;; was in neither, so \cA matched the letter c. Add an escape here, not there,
+;; and both contexts get it.
+;;
+;; A miss answers (values #f i) — the caller decides what an unknown escape is.
+;; No real escape value is #f (they are chars, symbols and lists), so #f is an
+;; unambiguous sentinel.
+(define (parse-escape-shared src i end flags)
+  (let ((c (string-ref src i)))
+    (case c
+      ((#\d) (values 'numeric (+ i 1)))
+      ((#\D) (values '(~ numeric) (+ i 1)))
+      ((#\w) (values '(or alphanumeric #\_) (+ i 1)))
+      ((#\W) (values '(~ (or alphanumeric #\_)) (+ i 1)))
+      ((#\s) (values 'whitespace (+ i 1)))
+      ((#\S) (values '(~ whitespace) (+ i 1)))
+      ((#\p #\P) (parse-prop c src i end))
+      ((#\e) (values (integer->char #x1B) (+ i 1)))
+      ((#\t) (values #\tab (+ i 1)))
+      ((#\n) (values #\newline (+ i 1)))
+      ((#\r) (values #\return (+ i 1)))
+      ((#\f) (values (integer->char #x0C) (+ i 1)))
+      ((#\a) (values (integer->char #x07) (+ i 1)))
+      ;; \cX is X xor 64 on the RAW next character — no case folding first, so
+      ;; \ca is 97 xor 64 = 33, not \cA's 1. A dangling \c is a pattern error.
+      ((#\c)
+       (if (>= (+ i 1) end)
+           (error 'java-pattern->sre "incomplete \\c escape" src)
+           (values (integer->char
+                     (bitwise-xor (char->integer (string-ref src (+ i 1))) 64))
+                   (+ i 2))))
+      ((#\0) (parse-octal-escape src i end))
+      ((#\x)
+       (if (and (< (+ i 1) end) (char=? (string-ref src (+ i 1)) #\{))
+           (let ((close (str-scan-char src #\} (+ i 2) end)))
+             (if close
+                 (let ((v (parse-hex src (+ i 2) close)))
+                   (values (integer->char v) (+ close 1)))
+                 (values #\x i)))
+           (if (and (< (+ i 2) end) (hex-value (string-ref src (+ i 1)))
+                    (hex-value (string-ref src (+ i 2))))
+               (let ((v (+ (* 16 (hex-value (string-ref src (+ i 1))))
+                           (hex-value (string-ref src (+ i 2))))))
+                 (values (integer->char v) (+ i 3)))
+               (values #\x (+ i 1)))))
+      ((#\u)
+       (if (and (< (+ i 4) end) (hex-value (string-ref src (+ i 1)))
+                (hex-value (string-ref src (+ i 2)))
+                (hex-value (string-ref src (+ i 3)))
+                (hex-value (string-ref src (+ i 4))))
+           (let ((cp (+ (* 4096 (hex-value (string-ref src (+ i 1))))
+                        (* 256 (hex-value (string-ref src (+ i 2))))
+                        (* 16 (hex-value (string-ref src (+ i 3))))
+                        (hex-value (string-ref src (+ i 4))))))
+             (values (integer->char cp) (+ i 5)))
+           (values #\u (+ i 1))))
+      (else (values #f i)))))
+
+;; Java-compatible octal: \0 then up to 3 octal digits, value <= 0377. i points
+;; at the 0.
+(define (parse-octal-escape src i end)
+  (let ((d1 (and (< (+ i 1) end) (oct-value? (string-ref src (+ i 1)))
+                 (oct-value (string-ref src (+ i 1))))))
+    (if (not d1)
+        (values (integer->char 0) (+ i 1))
+        (let ((d2 (and (< (+ i 2) end) (oct-value? (string-ref src (+ i 2)))
+                       (oct-value (string-ref src (+ i 2))))))
+          (if (not d2)
+              (values (integer->char d1) (+ i 2))
+              (if (<= d1 3)
+                  (let ((d3 (and (< (+ i 3) end) (oct-value? (string-ref src (+ i 3)))
+                                 (oct-value (string-ref src (+ i 3))))))
+                    (if d3
+                        (values (integer->char (+ (* d1 64) (* d2 8) d3)) (+ i 4))
+                        (values (integer->char (+ (* d1 8) d2)) (+ i 3))))
+                  (values (integer->char (+ (* d1 8) d2)) (+ i 3))))))))
+
+;; Java's \R: a CRLF PAIR as one unit, or any single linebreak character. The
+;; pair has to lead the alternation or "\r\n" matches as two linebreaks.
+(define linebreak-sre
+  `(or (seq #\return #\newline)
+       #\newline ,(integer->char #x0B) ,(integer->char #x0C) #\return
+       ,(integer->char #x85) ,(integer->char #x2028) ,(integer->char #x2029)))
+
+;; ── Line terminators for DOT / ^ / $ ──────────────────────────────────────────
+;; Java's terminator set is \n, \r, \r\n, NEL (U+0085), LS (U+2028) and PS
+;; (U+2029); the UNIX_LINES flag ((?d)) narrows it to \n alone. irregex's own
+;; `nonl`, `bol` and `eol` carry the NARROW set and nothing else, so mapping onto
+;; them applied UNIX_LINES unconditionally (#956): `.` matched across a \r, (?m)^
+;; did not match after one, and `(?m)^(.*)$` over CRLF input captured the \r —
+;; found in an HTTP header parser, where every value came back with one attached.
+;;
+;; The wide forms are assertions rather than irregex ops, which costs the
+;; backtracking matcher for a pattern that anchors (non-multiline `$` already
+;; cost it — it has always been a look-ahead). Two rules shape them, and both are
+;; Java's: a CRLF is ONE terminator, so neither anchor may sit between the \r and
+;; the \n; and multiline ^ does not match at the very end of input, which is what
+;; its look-ahead for one more character says.
+(define java-nel (integer->char #x85))
+(define java-ls (integer->char #x2028))
+(define java-ps (integer->char #x2029))
+
+(define dot-sre-wide `(~ #\newline #\return ,java-nel ,java-ls ,java-ps))
+;; Multiline ^ never matches at the very end of input — not even after a final
+;; terminator, and not on empty input: java.util.regex's Caret returns false at
+;; endIndex before it looks at anything else (Perl's rule, which it cites). So
+;; every branch, the start-of-input one included, wants one more character.
+(define bol-sre-wide
+  `(seq (or bos
+            (look-behind (or #\newline ,java-nel ,java-ls ,java-ps))
+            (seq (look-behind #\return) (look-ahead (~ #\newline))))
+        (look-ahead any)))
+(define bol-sre-unix `(seq bol (look-ahead any)))
+(define eol-sre-wide
+  `(or eos
+       (look-ahead (or #\return ,java-nel ,java-ls ,java-ps))
+       (seq (or bos (look-behind (~ #\return))) (look-ahead #\newline))))
+;; `$` outside MULTILINE, and \Z: end of input, or just before a FINAL terminator
+;; — where a CRLF is one terminator, so the position between its halves is not
+;; "before a final \n" (Dollar's "No match between \r\n").
+(define final-eol-sre-wide
+  `(look-ahead (or eos
+                   (seq #\return (? #\newline) eos)
+                   (seq (or ,java-nel ,java-ls ,java-ps) eos)
+                   (seq (or bos (look-behind (~ #\return))) #\newline eos))))
+(define final-eol-sre-unix `(look-ahead (or eos (seq #\newline eos))))
+
+(define (jr-dot-sre flags) (if (jr-flag? flags 'unix-lines) 'nonl dot-sre-wide))
+(define (jr-bol-sre flags) (if (jr-flag? flags 'unix-lines) bol-sre-unix bol-sre-wide))
+(define (jr-eol-sre flags) (if (jr-flag? flags 'unix-lines) '(or eol eos) eol-sre-wide))
+(define (jr-final-eol-sre flags)
+  (if (jr-flag? flags 'unix-lines) final-eol-sre-unix final-eol-sre-wide))
 
 (define (parse-escape src i end flags)
   (if (>= i end)
       (values #\\ i)
       (let ((c (string-ref src i)))
         (case c
-          ((#\d) (values 'numeric (+ i 1)))
-          ((#\D) (values '(~ numeric) (+ i 1)))
-          ((#\w) (values '(or alphanumeric #\_) (+ i 1)))
-          ((#\W) (values '(~ (or alphanumeric #\_)) (+ i 1)))
-          ((#\s) (values 'whitespace (+ i 1)))
-          ((#\S) (values '(~ whitespace) (+ i 1)))
           ((#\b) (values '(or bow eow) (+ i 1)))
           ((#\B) (values 'nwb (+ i 1)))
           ((#\A) (values 'bos (+ i 1)))
-          ((#\Z)
-           (values '(look-ahead (or eos (seq (? #\return) #\newline eos))) (+ i 1)))
-           ((#\z) (values 'eos (+ i 1)))
-           ((#\e) (values (integer->char 27) (+ i 1)))
-           ((#\t) (values #\tab (+ i 1)))
-          ((#\n) (values #\newline (+ i 1)))
-          ((#\r) (values #\return (+ i 1)))
-          ((#\f) (values (integer->char #x0C) (+ i 1)))
-          ((#\a) (values (integer->char #x07) (+ i 1)))
-          ((#\e) (values (integer->char #x1B) (+ i 1)))
-           ((#\0)
-            ;; Java-compatible octal: \0 then up to 3 octal digits, value <= 0377
-            (let ((d1 (and (< (+ i 1) end) (oct-value? (string-ref src (+ i 1)))
-                           (oct-value (string-ref src (+ i 1))))))
-              (if (not d1)
-                  (values (integer->char 0) (+ i 1))
-                  (let ((d2 (and (< (+ i 2) end) (oct-value? (string-ref src (+ i 2)))
-                                (oct-value (string-ref src (+ i 2))))))
-                    (if (not d2)
-                        (values (integer->char d1) (+ i 2))
-                        (if (<= d1 3)
-                            (let ((d3 (and (< (+ i 3) end) (oct-value? (string-ref src (+ i 3)))
-                                          (oct-value (string-ref src (+ i 3))))))
-                              (if d3
-                                  (values (integer->char (+ (* d1 64) (* d2 8) d3)) (+ i 4))
-                                  (values (integer->char (+ (* d1 8) d2)) (+ i 3))))
-                            (values (integer->char (+ (* d1 8) d2)) (+ i 3))))))))
-          ((#\p #\P) (parse-prop c src i end))
-          ((#\x)
-           (if (and (< (+ i 1) end) (char=? (string-ref src (+ i 1)) #\{))
-               (let ((close (str-scan-char src #\} (+ i 2) end)))
-                 (if close
-                     (let ((v (parse-hex src (+ i 2) close)))
-                       (values (integer->char v) (+ close 1)))
-                     (values #\x i)))
-               (if (and (< (+ i 2) end) (hex-value (string-ref src (+ i 1)))
-                        (hex-value (string-ref src (+ i 2))))
-                   (let ((v (+ (* 16 (hex-value (string-ref src (+ i 1))))
-                               (hex-value (string-ref src (+ i 2))))))
-                     (values (integer->char v) (+ i 3)))
-                   (values #\x (+ i 1)))))
-          ((#\u)
-           (if (and (< (+ i 4) end) (hex-value (string-ref src (+ i 1)))
-                    (hex-value (string-ref src (+ i 2)))
-                    (hex-value (string-ref src (+ i 3)))
-                    (hex-value (string-ref src (+ i 4))))
-               (let ((cp (+ (* 4096 (hex-value (string-ref src (+ i 1))))
-                            (* 256 (hex-value (string-ref src (+ i 2))))
-                            (* 16 (hex-value (string-ref src (+ i 3))))
-                            (hex-value (string-ref src (+ i 4))))))
-                 (values (integer->char cp) (+ i 5)))
-                (values #\u (+ i 1))))
-           ((#\Q)
-            (let* ((eos-q (scan-qe src (+ i 1) end))
-                   (end-q (or eos-q end))
-                   (lit (substring src (+ i 1) end-q))
-                   (len (string-length lit))
-                   (idx (+ end-q (if eos-q 2 0)))
-                   (quant? (and (< idx end)
-                                (> len 1)
-                                (memv (string-ref src idx)
-                                      '(#\* #\+ #\? #\{)))))
-              (if quant?
-                  ;; Quantifier scopes only last char in Java
-                  (let* ((prefix (substring lit 0 (- len 1)))
-                         (last (string-ref lit (- len 1)))
-                         (prefix-chars (map (lambda (i) (string-ref prefix i))
-                                            (iota (string-length prefix)))))
-                    (let-values (((qm-sre qm-idx) (maybe-quantifier last src idx end flags 0)))
-                      (values `(seq ,@prefix-chars ,qm-sre) qm-idx)))
-                  (values (make-lit lit) idx))))
-            ((#\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9)
-            (values `(backref ,(- (char->integer c) (char->integer #\0))) (+ i 1)))
-           ((#\k)
-            (if (and (< (+ i 1) end) (char=? (string-ref src (+ i 1)) #\<))
-                (let ((gt (str-scan-char src #\> (+ i 2) end)))
-                  (if (not gt)
-                      (values #\k (+ i 1))
-                      (let ((nm (string->symbol (substring src (+ i 2) gt))))
-                        (values `(backref ,nm) (+ gt 1)))))
-                (values #\k (+ i 1))))
-          (else (values c (+ i 1)))))))
+          ((#\Z) (values (jr-final-eol-sre flags) (+ i 1)))
+          ((#\z) (values 'eos (+ i 1)))
+          ((#\R) (values linebreak-sre (+ i 1)))
+          ((#\Q)
+           (let* ((eos-q (scan-qe src (+ i 1) end))
+                  (end-q (or eos-q end))
+                  (lit (substring src (+ i 1) end-q))
+                  (len (string-length lit))
+                  (idx (+ end-q (if eos-q 2 0)))
+                  (quant? (and (< idx end)
+                               (> len 1)
+                               (memv (string-ref src idx)
+                                     '(#\* #\+ #\? #\{)))))
+             (if quant?
+                 ;; Quantifier scopes only last char in Java
+                 (let* ((prefix (substring lit 0 (- len 1)))
+                        (last (string-ref lit (- len 1)))
+                        (prefix-chars (map (lambda (i) (string-ref prefix i))
+                                           (iota (string-length prefix)))))
+                   (let-values (((qm-sre qm-idx) (maybe-quantifier last src idx end flags 0)))
+                     (values `(seq ,@prefix-chars ,qm-sre) qm-idx)))
+                 (values (make-lit lit) idx))))
+          ((#\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9)
+           (values `(backref ,(- (char->integer c) (char->integer #\0))) (+ i 1)))
+          ((#\k)
+           (if (and (< (+ i 1) end) (char=? (string-ref src (+ i 1)) #\<))
+               (let ((gt (str-scan-char src #\> (+ i 2) end)))
+                 (if (not gt)
+                     (values #\k (+ i 1))
+                     (let ((nm (string->symbol (substring src (+ i 2) gt))))
+                       (values `(backref ,nm) (+ gt 1)))))
+               (values #\k (+ i 1))))
+          (else
+           (let-values (((v j) (parse-escape-shared src i end flags)))
+             (if v (values v j) (values c (+ i 1)))))))))
 
 (define (parse-prop prefix src i end)
   ;; i points at p/P; next char is either { (braced) or property name (brace-less)
@@ -525,60 +651,14 @@
       (values #\\ i)
       (let ((c (string-ref src i)))
         (case c
-          ((#\d) (values 'numeric (+ i 1)))
-          ((#\D) (values '(~ numeric) (+ i 1)))
-          ((#\w) (values '(or alphanumeric #\_) (+ i 1)))
-          ((#\W) (values '(~ (or alphanumeric #\_)) (+ i 1)))
-          ((#\s) (values 'whitespace (+ i 1)))
-          ((#\S) (values '(~ whitespace) (+ i 1)))
-          ((#\b) (values (integer->char #x08) (+ i 1)))
-          ((#\p #\P) (parse-prop c src i end))
-          ((#\x)
-           (if (and (< (+ i 1) end) (char=? (string-ref src (+ i 1)) #\{))
-               (let ((close (str-scan-char src #\} (+ i 2) end)))
-                 (if close
-                     (let ((v (parse-hex src (+ i 2) close)))
-                       (values (integer->char v) (+ close 1)))
-                     (values #\x i)))
-               (if (and (< (+ i 2) end) (hex-value (string-ref src (+ i 1)))
-                        (hex-value (string-ref src (+ i 2))))
-                   (let ((v (+ (* 16 (hex-value (string-ref src (+ i 1))))
-                               (hex-value (string-ref src (+ i 2))))))
-                     (values (integer->char v) (+ i 3)))
-                   (values #\x (+ i 1)))))
-          ((#\u)
-           (if (and (< (+ i 4) end) (hex-value (string-ref src (+ i 1)))
-                    (hex-value (string-ref src (+ i 2)))
-                    (hex-value (string-ref src (+ i 3)))
-                    (hex-value (string-ref src (+ i 4))))
-               (let ((cp (+ (* 4096 (hex-value (string-ref src (+ i 1))))
-                            (* 256 (hex-value (string-ref src (+ i 2))))
-                            (* 16 (hex-value (string-ref src (+ i 3))))
-                            (hex-value (string-ref src (+ i 4))))))
-                 (values (integer->char cp) (+ i 5)))
-                (values #\u (+ i 1))))
-           ((#\e) (values (integer->char 27) (+ i 1)))
-           ((#\t) (values #\tab (+ i 1)))
-          ((#\n) (values #\newline (+ i 1)))
-          ((#\r) (values #\return (+ i 1)))
-          ((#\f) (values (integer->char #x0C) (+ i 1)))
-           ((#\0)
-            ;; Java-compatible octal: \0 then up to 3 octal digits, value <= 0377
-            (let ((d1 (and (< (+ i 1) end) (oct-value? (string-ref src (+ i 1)))
-                           (oct-value (string-ref src (+ i 1))))))
-              (if (not d1)
-                  (values (integer->char 0) (+ i 1))
-                  (let ((d2 (and (< (+ i 2) end) (oct-value? (string-ref src (+ i 2)))
-                                (oct-value (string-ref src (+ i 2))))))
-                    (if (not d2)
-                        (values (integer->char d1) (+ i 2))
-                        (if (<= d1 3)
-                            (let ((d3 (and (< (+ i 3) end) (oct-value? (string-ref src (+ i 3)))
-                                          (oct-value (string-ref src (+ i 3))))))
-                              (if d3
-                                  (values (integer->char (+ (* d1 64) (* d2 8) d3)) (+ i 4))
-                                  (values (integer->char (+ (* d1 8) d2)) (+ i 3))))
-                            (values (integer->char (+ (* d1 8) d2)) (+ i 3))))))))
+          ;; The two Java rejects. A backspace for \b is PERL: java.util.regex
+          ;; refuses the pattern, so refusing it here is the parity behaviour.
+          ((#\b)
+           (error 'java-pattern->sre "escape \\b not allowed in character class" src))
+          ((#\R)
+           (error 'java-pattern->sre "linebreak escape not allowed in character class" src))
+          ;; \Q…\E inside a class contributes its characters as members, so the
+          ;; bare-pattern copy's quantifier scoping does not apply here.
           ((#\Q)
            (let ((eos-q (scan-qe src (+ i 1) end)))
              (let* ((end-q (or eos-q end))
@@ -586,9 +666,9 @@
                (if (and eos-q (zero? (string-length lit)))
                    (error 'java-pattern->sre "empty quote escape in character class" src)
                    (values (make-lit lit) (+ end-q (if eos-q 2 0)))))))
-          ((#\R)
-           (error 'java-pattern->sre "linebreak escape not allowed in character class" src))
-          (else (values c (+ i 1)))))))
+          (else
+           (let-values (((v j) (parse-escape-shared src i end flags)))
+             (if v (values v j) (values c (+ i 1)))))))))
 
 ;; ── Groups ────────────────────────────────────────────────────────────────────
 
@@ -687,9 +767,12 @@
            ((char=? c #\x)
             (scan (+ j 1)
                   (cons (if neg 'not-ignore-space 'ignore-space) fs) neg))
-            ;; u (UNICODE_CASE), U (UNICODE_CHARACTER_CLASS), d (UNIX_LINES):
-            ;; accept and ignore — they don't change matching for our engine.
-            ((memv c '(#\c #\u #\U #\d))
+           ((char=? c #\d)
+            (scan (+ j 1)
+                  (cons (if neg 'not-unix-lines 'unix-lines) fs) neg))
+            ;; u (UNICODE_CASE) and U (UNICODE_CHARACTER_CLASS): accept and
+            ;; ignore — they don't change matching for our engine.
+            ((memv c '(#\c #\u #\U))
              (scan (+ j 1) fs neg))
            ((char=? c #\:)
             (let ((new-flags (apply-inline-flags flags fs)))
@@ -724,6 +807,7 @@
            ((eq? f 'not-single-line) (loop (cdr fs) (remq 'single-line flags)))
            ((eq? f 'not-multi-line) (loop (cdr fs) (remq 'multi-line flags)))
            ((eq? f 'not-ignore-space) (loop (cdr fs) (remq 'ignore-space flags)))
+           ((eq? f 'not-unix-lines) (loop (cdr fs) (remq 'unix-lines flags)))
            (else (loop (cdr fs) (cons f flags))))))))
 
 (define (wrap-case-flag sre fs)
@@ -739,6 +823,6 @@
           (cond
            ((eq? f 'case-insensitive) (loop (cdr fs) `(w/nocase ,sre)))
            ((eq? f 'case-sensitive)   (loop (cdr fs) `(w/case ,sre)))
-           ((memq f '(not-single-line not-multi-line not-ignore-space))
+           ((memq f '(not-single-line not-multi-line not-ignore-space not-unix-lines))
             (loop (cdr fs) sre))
            (else (loop (cdr fs) sre)))))))

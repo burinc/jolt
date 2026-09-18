@@ -108,6 +108,37 @@ else
   fails=$((fails+1))
 fi
 
+# (g) a namespace whose top level sets a compiler flag loads from its fasl.
+# babashka.process and babashka.fs both do (set! *warn-on-reflection* true).
+# Loading compiled code has to bind that var to a thread-local slot the way a
+# source load does; without it the set! hits the root, raises, and the fallback
+# quietly recompiles the whole namespace from source — the fasl is baked into
+# the binary and never once used. (f1) did not catch it because the aot-info
+# line it greps used to print before the load was attempted; it reports the
+# outcome now, and this checks the outcome a second way.
+for g_ns in babashka.fs babashka.process; do
+  n_g="$(JOLT_TRACE_LOAD=1 "$jolt" -e "(require '$g_ns)" 2>&1 | grep -c '\[load-form\]' || true)"
+  if [ "$n_g" = "0" ]; then
+    echo "PASS: (g) $g_ns loads from its fasl with zero [load-form] lines"; pass=$((pass+1))
+  else
+    echo "FAIL: (g) $g_ns compiled $n_g form(s) from source — fasl did not take"; fails=$((fails+1))
+  fi
+  # The frame has to belong to the NAMESPACE, not to whoever required it. Every
+  # entry point binds these vars now, so a fasl whose set! writes the CALLER's
+  # binding loads without complaint and (g) above stays green — the set! just
+  # escapes into the requiring code, where a stray *warn-on-reflection* is the
+  # least of it: *unchecked-math* changes what later arithmetic compiles to.
+  # This is the check that fails if the loader stops establishing its own frame.
+  out_g="$("$jolt" -e "(let [b *warn-on-reflection*] (require '$g_ns) (println :leak (not= b *warn-on-reflection*)))" 2>&1)"
+  if printf '%s' "$out_g" | grep -q ':leak false'; then
+    echo "PASS: (g) $g_ns set! stays inside its own load"; pass=$((pass+1))
+  else
+    echo "FAIL: (g) $g_ns leaked its compiler-flag set! to the requiring code"
+    printf '%s\n' "$out_g" | tail -3
+    fails=$((fails+1))
+  fi
+done
+
 echo
 echo "stdlib-fasl smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]

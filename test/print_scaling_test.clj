@@ -130,7 +130,7 @@
                 "jolt-str-join is re-copying the joined suffix per element "
                 "(host/chez/rt.ss, host/gambit/rt-core.ss, or sorted-map-render in host-table.ss).")))
   ;; the record arm, judged the same way
-  (when-not (= (pr-str (assoc (->ExtRec) :b 2 :a 1)) "#print-scaling-test.ExtRec{:b 2, :a 1}")
+  (when-not (= (pr-str (assoc (->ExtRec) :b 2 :a 1)) "#print_scaling_test.ExtRec{:b 2, :a 1}")
     (println (str "FAIL print-scaling: wrong record rendering — " (pr-str (assoc (->ExtRec) :b 2 :a 1))))
     (System/exit 1))
   (judge "record " n1 (* factor n1) #(render-rec n1) #(render-rec (* factor n1))

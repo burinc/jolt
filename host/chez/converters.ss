@@ -37,6 +37,17 @@
        (if (or (not ns) (jolt-nil? ns))
            (symbol-t-name v)
            (string-append ns "/" (symbol-t-name v)))))
+    ;; a keyword and a fixnum are the next most common str operands after
+    ;; strings (a keyword's name in a key, a count in a message), and both
+    ;; used to reach the full printer below: 78 ns for (str s :k). Rendered
+    ;; here exactly as the printer does — the keyword form is the one
+    ;; keyword-direct-emit (backend) spells for .toString.
+    ((keyword-t? v)
+     (let ((ns (keyword-t-ns v)))
+       (if ns
+           (string-append ":" ns "/" (keyword-t-name v))
+           (string-append ":" (keyword-t-name v)))))
+    ((fixnum? v) (jolt-fixnum->string v))
     ;; numbers and booleans reach the printer without an arm ever claiming them
     ;; (pr-fast-type?, rt.ss); the cases above already cover the rest of that set.
     ((pr-fast-type? v) (jolt-pr-str v))
@@ -83,32 +94,78 @@
       ((or (pvec? v) (pmap? v) (pset? v) (cseq? v) (empty-list-t? v) (jolt-lazyseq? v))
        (jolt-pr-readable v))
       (else (jolt-str-render-one v)))))
-(define (jolt-str . xs)
-  (cond
-    ((null? xs) "")
+;; A string renders as itself. jolt-str-one asks the toString hook first, but
+;; that hook only ever answers for a record (protocols.ss), so a string can skip
+;; it and the type cond behind it: strings are most of what str is handed.
+(define (jolt-str-piece v) (if (string? v) v (jolt-str-one v)))
+;; Fixed entries for two and three arguments — the arities library code
+;; actually writes — build the result in one string-append with no rest list,
+;; no accumulator and no reverse. The variadic entry keeps its shape. Measured
+;; 56 ns against string-append's 1 ns for (str s "!") before this.
+(define jolt-str
+  (case-lambda
+    (() "")
     ;; single arg returns its rendering directly (no string-append copy), so
     ;; (str sym) hands back the symbol's own name string — JVM (str x) is
     ;; x.toString(), and core.logic's non-unique lvar equality compares those by
     ;; identity.
-    ((null? (cdr xs)) (jolt-str-one (car xs)))
-    (else (let loop ((xs xs) (acc '()))
-            (if (null? xs)
-                (apply string-append (reverse acc))
-                (loop (cdr xs) (cons (jolt-str-one (car xs)) acc)))))))
+    ((a) (jolt-str-one a))
+    ((a b) (string-append (jolt-str-piece a) (jolt-str-piece b)))
+    ((a b c) (string-append (jolt-str-piece a) (jolt-str-piece b) (jolt-str-piece c)))
+    ((a b c . rest)
+     (let loop ((xs rest) (acc (list (jolt-str-piece c) (jolt-str-piece b) (jolt-str-piece a))))
+       (if (null? xs)
+           (apply string-append (reverse acc))
+           (loop (cdr xs) (cons (jolt-str-piece (car xs)) acc)))))))
 
-;; jolt indices are flonums; substring etc. need exact ints.
-(define (jolt->idx n) (exact (truncate (jolt-need-num n))))
+;; jolt indices are flonums; substring etc. need exact ints. A fixnum is already
+;; one — this sits on the proven-string .charAt/.substring path, so it must not
+;; call anything for the common case.
+(define (jolt->idx n) (if (fixnum? n) n (exact (truncate (jolt-need-num n)))))
 
-(define (jolt-subs s start . end)
-  (let ((s (jolt-need-string s)))
-    (substring s (jolt->idx start)
-               (if (null? end) (string-length s) (jolt->idx (car end))))))
+;; Chez's `substring` walks the span a character at a time; allocating the result
+;; and asking for the block move is ~3.7x faster for the spans a parser, a reader
+;; or a splitter cuts. Measured on Chez 10.4.1 / x86_64, 2048 chars out of 4300:
+;; `substring` 4.27us, `(make-string n)` + `string-copy!` 1.17us — and the
+;; make-string alone is 1.29us of that, so the copy itself is free and what the
+;; primitive spends is the per-character loop. Out-of-range falls through to
+;; `substring` so the range error stays the one host-faults.ss classifies. The
+;; copy goes through the adapter's sa-string-copy-range! rather than a raw
+;; string-copy!: this file is shared with the Gambit host, whose R7RS
+;; string-copy! takes the same five arguments in the opposite direction.
+(define (jolt-substr s start end)
+  (if (and (fixnum? start) (fixnum? end)
+           (fx>=? start 0) (fx<=? start end) (fx<=? end (string-length s)))
+      (let ((d (make-string (fx- end start))))
+        (sa-string-copy-range! d 0 s start end)
+        d)
+      (substring s start end)))
 
-;; vec: a pvec from any seqable (already-pvec returns itself).
+;; case-lambda, not `. end`: a rest-arg list allocated on every call is most of
+;; what a one-character (subs txt i (inc i)) costs, and a parser does that per
+;; input position.
+(define jolt-subs
+  (case-lambda
+    ((s start)
+     (let ((s (jolt-need-string s)))
+       (jolt-substr s (jolt->idx start) (string-length s))))
+    ((s start end)
+     (let ((s (jolt-need-string s)))
+       (jolt-substr s (jolt->idx start) (jolt->idx end))))))
+
+;; vec: a pvec from any seqable. A vector comes back as itself minus its
+;; metadata — clojure.core/vec's (with-meta coll nil) — so it is a copy only when
+;; it carried some. A map entry is the exception: MapEntry is not IObj, so vec
+;; takes LazilyPersistentVector.create's path there and answers a plain
+;; PersistentVector of the two slots. The entry is a pvec of kind #t here, and
+;; used to come back as itself — still a MapEntry to `class` and `instance?`.
 (define (jolt-vec coll)
   (cond
     ((jolt-nil? coll) (jolt-vector))
-    ((pvec? coll) coll)
+    ((pvec? coll)
+     (cond ((eq? (pvec-ent coll) #t) (pvec-with-ent coll #f))
+           ((eq? (pvec-meta coll) jolt-nil) coll)
+           (else (coll-with-meta coll jolt-nil))))
     ((string? coll) (apply jolt-vector (string->list coll)))
     ;; a source that drives its own reduce (IReduce/IReduceInit deftype or
     ;; reify) builds the vector by reduction, like LazilyPersistentVector.
@@ -236,6 +293,16 @@
   (set! jolt-compare-arms (cons (cons pred handler) jolt-compare-arms)))
 (define (jolt-compare a b)
   (cond
+    ;; Util.compare answers 0 for two identical references FIRST, before it asks
+    ;; for Comparable at all — so a value with no ordering still compares to
+    ;; itself, and a collection holding one sorts. Ordering is only ever
+    ;; consulted for two DISTINCT values, and comparing a value to itself under
+    ;; any ordering is 0 anyway, so this decides nothing the arms below would
+    ;; have decided differently. Numbers are not excluded the way jolt=2's
+    ;; identity clause excludes them: 0 is the right answer for a number
+    ;; compared to itself, NaN included (Double.compareTo says NaN equals
+    ;; itself), so interning cannot make it wrong.
+    ((eq? a b) 0)
     ((and (jolt-nil? a) (jolt-nil? b)) 0)
     ((jolt-nil? a) -1)
     ((jolt-nil? b) 1)
@@ -368,7 +435,12 @@
 ;; #xffffffff is itself a fixnum here.
 (define (jolt-unchecked-long x)
   (cond ((fixnum? x) x)
-        ((char? x) (char->integer x))
+        ;; RT.uncheckedLongCast(Object) is ((Number) x).longValue(): a Character
+        ;; is not a Number there, so (unchecked-long \a) raises. Only the INT
+        ;; cast has a char overload — (unchecked-long (unchecked-int c)) is the
+        ;; idiom, and it still works. jolt used to answer 97 here (found by the
+        ;; JVM certification of the new corpus rows).
+        ((char? x) (jolt-num-cast-throw x))
         ;; an exact integer wraps (long narrowing); a double SATURATES (Java's
         ;; double->long conversion clamps at the bounds, NaN is 0).
         ((and (number? x) (exact? x)) (jolt-wrap64 (truncate x)))

@@ -53,6 +53,22 @@ cat > "$work/src/app/tail.clj" <<'EOF'
   (boom 1))
 EOF
 
+# Same shape, but the callee is ^:redef so it stays var-routed and is never
+# spliced. A built binary must still name ITS frame -- that is what keeps the
+# baked tail-site instrumentation under test now that an ordinary callee is
+# inlined away (see the built-binary block below).
+mkdir -p "$work/src/app"
+cat > "$work/src/app/tailredef.clj" <<'EOF'
+(ns app.tailredef)
+
+(defn ^:redef boom [x]
+  (/ x 0))
+
+(defn -main [& _]
+  (println "before")
+  (boom 1))
+EOF
+
 run_app() {   # run_app <ns> [env-assignment]; prints combined output
   ( cd "$work" && env $2 "$joltabs" run -m "$1" 2>&1 )
 }
@@ -81,7 +97,7 @@ expect_no_match() {
 
 echo "trace smoke: an uncaught tail-call throw names fn, file and exact line"
 out="$(run_app app.tail)"
-expect_match "uncaught throw reports the message" "$out" 'Unhandled exception: Divide by zero'
+expect_match "uncaught throw reports the message" "$out" 'Unhandled exception (ArithmeticException): Divide by zero'
 # The erroring fn is a tail call from a tail call: the whole point of the case.
 # EXACT lines, not the line each fn was DEFINED on: boom opens on line 3 and
 # divides on line 4; -main opens on line 6 and calls boom on line 8. A frame that
@@ -108,6 +124,30 @@ cat > "$work/src/app/deep.clj" <<'EOF'
   (let [r (down 90)]
     (println "sum" r)))
 EOF
+# A try with no catch and no finally emits as its body verbatim (emit-try), so a
+# tail call inside one is still a real tail call and still needs its site stored
+# or TCO erases the frame unnamed. :try was not tail-transparent, so `wrapped`
+# vanished from the trace while the identical fn without the try was named.
+cat > "$work/src/app/baretry.clj" <<'EOF'
+(ns app.baretry)
+
+(defn boom [x]
+  (/ x 0))
+
+(defn wrapped [x]
+  (try (boom x)))
+
+(defn -main [& _]
+  (println "before")
+  (wrapped 1))
+EOF
+
+echo "trace smoke: a tail call inside a bare try keeps its frame"
+out_bt="$(run_app app.baretry)"
+expect_match "bare try: innermost frame is boom at the dividing line" "$out_bt" 'app\.baretry/boom (.*src/app/baretry\.clj:4)'
+expect_match "bare try: the wrapping fn is named at its call site" "$out_bt" 'app\.baretry/wrapped (.*src/app/baretry\.clj:7)'
+expect_match "bare try: and its caller" "$out_bt" 'app\.baretry/-main (.*src/app/baretry\.clj:11)'
+
 echo "trace smoke: 90-deep non-tail recursion reports the true depth"
 out_deep="$(run_app app.deep)"
 expect_match "deep: outermost caller -main present" "$out_deep" 'app\.deep/-main (.*src/app/deep\.clj:7)'
@@ -201,6 +241,64 @@ out_ss="$(run_app app.sitestale)"
 expect_match "sitestale: the thrower is named at its line" "$out_ss" 'app\.sitestale/h (.*src/app/sitestale\.clj:5)'
 expect_no_match "sitestale: the returned fn's site is rejected" "$out_ss" 'app\.sitestale/g'
 
+# A top-level form is a root. The site vreg holds the LAST tail site executed,
+# and only tail sites write it — so when a loaded file throws at its top level,
+# which nothing tail-called, the raise-time stash is whatever the previous call
+# left behind: helper's `str` tail here, long returned. The validator cannot
+# reject it either, because the innermost live frame is the loader itself, a
+# host fn that registers no callees. Each form-at-a-time entry — the loader,
+# -e, load-string, the REPL — clears the slot when a form starts (jolt-site-reset!).
+cat > "$work/src/app/topres.clj" <<'EOF'
+(ns app.topres)
+(defn helper [] (str "a" "b"))
+(defn -main [& _]
+  (helper)
+  (require 'app.topboom)
+  (println "unreachable"))
+EOF
+cat > "$work/src/app/topboom.clj" <<'EOF'
+(ns app.topboom)
+(throw (ex-info "top" {}))
+EOF
+echo "trace smoke: a returned tail site cannot haunt a throw at a loaded file's top level"
+out_tr="$(run_app app.topres)"
+expect_match "topres: the location is the throwing form" "$out_tr" 'at .*src/app/topboom\.clj:2:1'
+expect_match "topres: the loading caller is named at its require line" "$out_tr" 'app\.topres/-main (.*src/app/topres\.clj:5)'
+expect_no_match "topres: the returned helper is not resurrected" "$out_tr" 'app\.topres/helper'
+# The form's COMPILE is a root too: macroexpansion runs user code, and mk's
+# `apply` tail is what the slot held when the expanded throw ran — cleared again
+# between the expansion and the run.
+cat > "$work/src/app/macboom.clj" <<'EOF'
+(ns app.macboom)
+(defn mk [] (apply list ['throw (list 'ex-info "mac" {})]))
+(defmacro m [] (mk))
+(m)
+EOF
+cat > "$work/src/app/macmain.clj" <<'EOF'
+(ns app.macmain)
+(defn -main [& _]
+  (require 'app.macboom)
+  (println "unreachable"))
+EOF
+echo "trace smoke: macroexpansion's tail sites cannot haunt the expanded form's run"
+out_mr="$(run_app app.macmain)"
+expect_match "macres: the loading caller is named" "$out_mr" 'app\.macmain/-main (.*src/app/macmain\.clj:3)'
+expect_no_match "macres: the expander's helper is not resurrected" "$out_mr" 'app\.macboom/mk'
+# The same rule at the other form-at-a-time entries.
+run_e() { ( cd "$work" && "$joltabs" -e "$1" 2>&1 ); }
+out_e="$(run_e '(defn h [] (str 1)) (h) (throw (ex-info "x" {}))')"
+expect_match "-e: the throw is reported" "$out_e" 'Unhandled exception: x'
+expect_no_match "-e: a returned fn is not resurrected" "$out_e" '^ *[a-z.]*/h$'
+out_ls="$(run_e '(load-string "(defn h2 [] (str 1)) (h2) (throw (ex-info \"y\" {}))")')"
+expect_match "load-string: the throw is reported" "$out_ls" 'Unhandled exception: y'
+expect_no_match "load-string: a returned fn is not resurrected" "$out_ls" '^ *[a-z.]*/h2$'
+out_repl="$( ( cd "$work" && printf '(defn h3 [] (str 1))\n(h3)\n(throw (ex-info "z" {}))\n' | "$joltabs" repl 2>&1 ) )"
+expect_match "repl: the throw is reported" "$out_repl" 'error: z'
+expect_no_match "repl: a returned fn is not resurrected" "$out_repl" '^ *[a-z.]*/h3$'
+# and the positive dual: a throw INSIDE an evaluated fn still names it
+out_repl2="$( ( cd "$work" && printf '(defn t [] (throw (ex-info "q" {})))\n(t)\n' | "$joltabs" repl 2>&1 ) )"
+expect_match "repl: a throw inside an evaluated fn names it" "$out_repl2" '^ *[a-z.]*/t$'
+
 # R2: a HOST fault (no jolt-throw anywhere — a bad primitive-array index) is
 # captured by the cli's with-exception-handler while the frames are live, so
 # the trace still names the fn and its exact line.
@@ -241,7 +339,7 @@ expect_match "twolevel: frames in stack order" "$flat_tl" 'thrower .*twolevel/ho
 
 echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
-expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'
+expect_match "still reports the message" "$out_off" 'Unhandled exception (ArithmeticException): Divide by zero'
 expect_no_match "no history frames when opted out" "$out_off" 'app\.tail/boom'
 
 # Whether tracing is on changes the code the emitter produces — the entry prologue
@@ -298,6 +396,39 @@ cat > "$work/src/app/pst.clj" <<'EOF'
   (println "DONE"))
 EOF
 
+# A fault the host itself raised — string-append handed nil — is a typed
+# throwable by the time a catch binds it (java/host-faults.ss): printStackTrace
+# prints its class and message, and the frames that led to it, off the
+# continuation Chez attached to the raw condition. Uncaught, the report names
+# the class the same way.
+cat > "$work/src/app/fault.clj" <<'EOF'
+(ns app.fault)
+
+(defn faulty [s]
+  (.concat s nil))
+
+(defn fouter [s]
+  (faulty s))
+
+(defn -main [& args]
+  (let [w (java.io.StringWriter.)]
+    (try (fouter "a") (catch Exception e (.printStackTrace e w)))
+    (when (re-find #"^java\.lang\.NullPointerException: string-append: nil is not a string" (str w))
+      (println "FAULT-HEADER-OK"))
+    (when (re-find #"app\.fault/faulty" (str w))
+      (println "FAULT-FRAME-OK")))
+  (when (seq args) (fouter "b"))
+  (println "FAULT-DONE"))
+EOF
+echo "trace smoke: a host fault a catch binds is a typed throwable with a trace"
+fault="$(run_app app.fault)"
+expect_match "host fault: printStackTrace names class and message" "$fault" 'FAULT-HEADER-OK'
+expect_match "host fault: printStackTrace reaches the faulting fn" "$fault" 'FAULT-FRAME-OK'
+expect_match "host fault: -main completes" "$fault" 'FAULT-DONE'
+fault_u="$( cd "$work" && "$joltabs" -m app.fault again 2>&1 )"
+expect_match "host fault uncaught: the report names the class" "$fault_u" 'Unhandled exception (NullPointerException): string-append: nil is not a string'
+expect_match "host fault uncaught: the trace reaches the faulting fn" "$fault_u" 'app\.fault/faulty'
+
 echo "trace smoke: .printStackTrace works on every throwable a catch binds"
 pst="$(run_app app.pst)"
 expect_match "arithmetic error prints class and message" "$pst" 'java\.lang\.ArithmeticException: Divide by zero'
@@ -317,15 +448,32 @@ expect_match "execution continued past every catch" "$pst" 'DONE'
 # instrumentation in, so a deployed binary's uncaught error still names the
 # TCO-erased frame with its exact line — no marker files needed, the site
 # literals carry the lines. JOLT_TRACE=0 at BUILD time opts the binary out.
+#
+# A built binary also INLINES (jolt-mbcm.6: splicing follows direct-linking, which
+# every non-dev build sets), and a spliced callee has no procedure left to name a
+# frame after. The trace reads the same anyway: the splicer stamps each copied
+# node with the chain of fns it came through, the emitter folds that into the
+# marker and the tail-site pair, and the reporter expands one physical frame back
+# into the logical ones (jolt-mbcm.7). These rows are that parity, so they assert
+# the SAME two frames the `jolt run` rows above do -- if inline attribution
+# regresses, the built binary reports app.tail/-main at line 4 and both fail.
 echo "trace smoke: a built binary traces by default"
 ( cd "$work" && "$joltabs" build -m app.tail -o tailbin >/dev/null 2>&1 )
 out_bt="$("$work/tailbin" 2>&1)"
-expect_match "built: the tail-erased thrower is named at its line" "$out_bt" 'app\.tail/boom (.*src/app/tail\.clj:4)'
-expect_match "built: its caller is present" "$out_bt" 'app\.tail/-main'
+expect_match "built: the spliced callee is named at its own line" "$out_bt" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "built: and its caller at the call site" "$out_bt" 'app\.tail/-main (.*src/app/tail\.clj:8)'
+
+# The same shape where the callee CANNOT be spliced (^:redef stays var-routed):
+# a real frame, not a reconstructed one. Without this row the block above would
+# pass on a build that had stopped inlining altogether.
+( cd "$work" && "$joltabs" build -m app.tailredef -o tailredefbin >/dev/null 2>&1 )
+out_rd="$("$work/tailredefbin" 2>&1)"
+expect_match "built: a ^:redef callee keeps its own frame at its line" "$out_rd" 'app\.tailredef/boom (.*src/app/tailredef\.clj:4)'
+expect_match "built: and its caller at the call site" "$out_rd" 'app\.tailredef/-main (.*src/app/tailredef\.clj:8)'
 echo "trace smoke: JOLT_TRACE=0 at build time opts the binary out"
 ( cd "$work" && env JOLT_TRACE=0 "$joltabs" build -m app.tail -o tailbin0 >/dev/null 2>&1 )
 out_bt0="$("$work/tailbin0" 2>&1)"
-expect_match "untraced build: still reports the message" "$out_bt0" 'Unhandled exception: Divide by zero'
+expect_match "untraced build: still reports the message" "$out_bt0" 'Unhandled exception (ArithmeticException): Divide by zero'
 expect_no_match "untraced build: no baked trace frames" "$out_bt0" 'app\.tail/boom (.*:4)'
 
 if [ "$fails" -gt 0 ]; then

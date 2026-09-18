@@ -1,0 +1,3 @@
+error[analyze/unresolved-symbol]: Unable to resolve symbol: unknown-thing in this context
+  --> 1:1
+exit: 1

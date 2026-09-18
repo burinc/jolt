@@ -112,11 +112,39 @@
 ;; top-level entry: in direct-link mode it binds jv$<fqn> for a top-level def; off
 ;; that mode (the minter, runtime eval) it is exactly emit, so output is unchanged.
 (define jolt-ce-emit-top (var-deref "jolt.backend-scheme" "emit-top-form"))
-;; Seed mint and AOT build must stay byte-deterministic, so emit the image with var
-;; cell-caching OFF (compile-eval.ss turned it on for runtime eval; this file loads
-;; after it). Guarded for the first re-mint pass off an older seed.
+;; emit-top-form grew a second arity naming the enclosing def for a form that
+;; does not carry it (a macro's bare expander fn). The SEED that mints the next
+;; one is the previous release's, whose emit-top-form is still single-arity, so
+;; ask before passing it: pass 1 of a remint falls back and pass 2 — now running
+;; the reminted seed — uses it. Without this the mint dies with "incorrect number
+;; of arguments 2" before it can produce the seed that would accept them.
+(define (ei-emit-top-2? )
+  (and (procedure? jolt-ce-emit-top)
+       (bitwise-bit-set? (procedure-arity-mask jolt-ce-emit-top) 2)))
+(define (ei-emit-top ir fnsrc-def)
+  (if (and fnsrc-def (ei-emit-top-2?))
+      (jolt-ce-emit-top ir fnsrc-def)
+      (jolt-ce-emit-top ir)))
+;; Hoist the var cell behind every late-bound reference in the minted seed, so a
+;; clojure.core fn that calls another core fn resolves the callee's cell once per
+;; def instead of once per call. This was OFF, on the theory that the gensym-
+;; numbered cell names would not survive the mint's byte-fixpoint; they do —
+;; remint converges in 3 passes — and the shape is the same eager const-pool hoist
+;; the keyword literals have used here all along (backend_scheme.clj
+;; hoist-var-cell). It is worth the pass: the name lookup it removes is a
+;; string-append plus a string-hash probe, ~102ns, against ~1ns for the hoisted
+;; read, and 258 of core's 357 emitted vars carry at least one such reference —
+;; frequencies resolves assoc! per ELEMENT. Measured on 1M elements, that alone
+;; put clojure.core/frequencies at 439ms against 337ms for the identical body
+;; written in user code (which has had this since the per-site cache landed);
+;; both are 337ms now.
+;;
+;; Costs, measured against the same hello-world binary built either way: +297KB
+;; of binary (+1.3%) and +4.6ms of startup (+2.0%).
+;;
+;; Guarded for the first re-mint pass off an older seed.
 (let ((scv (var-deref "jolt.backend-scheme" "set-var-cache!")))
-  (when (procedure? scv) (scv #f)))
+  (when (procedure? scv) (scv #t)))
 ;; Tail-frame tracing off for the mint + `jolt build`: the seed must stay a
 ;; byte-fixpoint, and a built app should carry no per-call trace overhead.
 (let ((stf (var-deref "jolt.backend-scheme" "set-trace-frames!")))
@@ -179,16 +207,22 @@
   (hashtable-clear! ei-cached-ir)
   (hashtable-clear! ei-cached-ir-idx))
 
-(define (ei-compile-form ctx f optimize?)
-  (let* ((ns (chez-actx-cns ctx))
-         (cached (and optimize? (ei-next-cached ns)))
-         (ir (or cached
-                 (ei-timed "emit: analyze" (lambda () (jolt-ce-analyze ctx f))))))
-    (when optimize? (ei-publish-unit!))
-    (let ((ir* (if optimize?
-                   (ei-timed "emit: run-passes" (lambda () (jolt-ce-run-passes ir ctx (ei-unit))))
-                   ir)))
-      (ei-timed "emit: emit-top" (lambda () (jolt-ce-emit-top ir*))))))
+;; FNSRC-DEF (optional) names the enclosing def for a form that does not carry
+;; the name — a macro's expander arrives here as a bare fn. See emit-top-form.
+(define ei-compile-form
+  (case-lambda
+    ((ctx f optimize?) (ei-compile-form ctx f optimize? #f))
+    ((ctx f optimize? fnsrc-def)
+     (let* ((ns (chez-actx-cns ctx))
+            (cached (and optimize? (ei-next-cached ns)))
+            (ir (or cached
+                    (ei-timed "emit: analyze" (lambda () (jolt-ce-analyze ctx f))))))
+       (when optimize? (ei-publish-unit!))
+       (let ((ir* (if optimize?
+                      (ei-timed "emit: run-passes" (lambda () (jolt-ce-run-passes ir ctx (ei-unit))))
+                      ir)))
+         (ei-timed "emit: emit-top"
+                   (lambda () (ei-emit-top ir* fnsrc-def))))))))
 
 ;; The emitted `(def-var! …)(mark-macro! …)` pair for a defmacro, guard-wrapped
 ;; (tolerant) or bare (strict) to match guard?. With meta-scm (the derived
@@ -263,23 +297,31 @@
     (dynamic-wind
       jolt-ns-load-vars-push!
       (lambda ()
-        (let loop ((forms (ei-read-all src)))
+        (let loop ((forms (ei-read-all src)) (ord 0))
           (unless (null? forms)
             (let ((f (if hook (hook (car forms)) (car forms))))
-              (ce-scan-requires! f ns-name)
-              (cond
-                ((ei-ns-form? f) (loop (cdr forms)))
-                ((ce-macro-form? f)
-                 ;; macro kind hands proc (fn-form . meta-pmap-or-#f) — the
-                 ;; derived :doc/:arglists ride along to the def emission.
-                 (let-values (((nm fn-form mmap) (ce-defmacro->fn f)))
-                   (proc ns-name 'macro nm (cons fn-form mmap)))
-                 (loop (cdr forms)))
-                (else
-                 (when (ei-flag-set-form? f)
-                   (jolt-compile-eval-form f ns-name))
-                 (proc ns-name 'form #f f)
-                 (loop (cdr forms))))))))
+              ;; ord mirrors the loader's per-file top-level form counter
+              ;; (load-jolt-file*): every form read, the ns form included, so the
+              ;; def-ordinal visibility replay (rt.ss var-def-ordinals) compares
+              ;; a form's analysis against the same stamps the in-order pass-1
+              ;; load wrote. Set around the whole dispatch — analysis AND the
+              ;; flag-form evals — and, like the loader's, left BEFORE the tail
+              ;; call, so a namespace's forms do not nest one parameterize per
+              ;; form for the length of the file.
+              (parameterize ((jolt-form-ordinal ord))
+                (ce-scan-requires! f ns-name)
+                (cond
+                  ((ei-ns-form? f) #f)
+                  ((ce-macro-form? f)
+                   ;; macro kind hands proc (fn-form . meta-pmap-or-#f) — the
+                   ;; derived :doc/:arglists ride along to the def emission.
+                   (let-values (((nm fn-form mmap) (ce-defmacro->fn f)))
+                     (proc ns-name 'macro nm (cons fn-form mmap))))
+                  (else
+                   (when (ei-flag-set-form? f)
+                     (jolt-compile-eval-form f ns-name))
+                   (proc ns-name 'form #f f))))
+              (loop (cdr forms) (fx+ ord 1))))))
       jolt-ns-load-vars-pop!)))
 
 ;; Count of forms silently dropped during a guarded emit (a source form that
@@ -290,14 +332,44 @@
 (define ei-skipped-count 0)
 (define (ei-reset-skipped!) (set! ei-skipped-count 0))
 
+;; Does SCM bind a top-level jv$ variable — a direct-linked def from
+;; emit-def-cached? Such a form cannot be load-guarded: `define` inside a
+;; guard's body is an internal definition, invisible at the top level, so the
+;; mint emits it bare. A def whose init raises at load then aborts the boot
+;; instead of vanishing quietly — the failure run-seed-defs.ss exists to catch.
+(define (ei-top-level-define? scm)
+  (let* ((pat "(define jv$") (m (string-length pat)) (n (string-length scm)))
+    (let loop ((i 0))
+      (cond ((fx> (fx+ i m) n) #f)
+            ((let cmp ((k 0))
+               (or (fx= k m)
+                   (and (char=? (string-ref scm (fx+ i k)) (string-ref pat k))
+                        (cmp (fx+ k 1)))))
+             #t)
+            (else (loop (fx+ i 1)))))))
+
 (define (ei-emit-ns* ns-name src optimize? guard?)
   (let ((acc '()))
     (ei-for-each-form ns-name src
       (lambda (ns kind nm f)
         (let* ((form (if (eq? kind 'macro) (car f) f))
+               ;; a macro's expander is a bare fn form here, so hand the emitter
+               ;; the macro's name for fn-form registration (see emit-top-form)
+               (fnsrc-def (and (eq? kind 'macro) nm))
+               ;; A guarded form that fails is reported by name only; the
+               ;; reason is deliberately quiet during the fixpoint (an early
+               ;; pass compiles against an older seed and fails forms a later
+               ;; pass emits fine). JOLT_MINT_DEBUG=1 prints it, for the pass
+               ;; that stays failing at convergence.
                (scm (if guard?
-                        (guard (e (#t #f)) (ei-compile-form (make-analyze-ctx ns) form optimize?))
-                        (ei-compile-form (make-analyze-ctx ns) form optimize?))))
+                        (guard (e (#t (when (getenv "JOLT_MINT_DEBUG")
+                                        (fprintf (current-error-port) "mint: ~a/~a raised: ~a\n" ns (or nm "<top-level-form>")
+                                                 (if (and (condition? e) (message-condition? e))
+                                                     (apply format (condition-message e) (if (irritants-condition? e) (condition-irritants e) '()))
+                                                     (guard (_ (#t "?")) (jolt-repl-str (jolt-unwrap-throw e))))))
+                                      #f))
+                          (ei-compile-form (make-analyze-ctx ns) form optimize? fnsrc-def))
+                        (ei-compile-form (make-analyze-ctx ns) form optimize? fnsrc-def))))
           (if (and guard? (not scm))
               ;; a form the guard swallowed — report it so the drop isn't silent
               (begin
@@ -307,7 +379,9 @@
               (set! acc
                     (cons (if (eq? kind 'macro)
                               (ei-macro-string ns nm scm (ei-emit-meta ns (cdr f) guard?) guard?)
-                              (if guard? (string-append "(guard (e (#t #f))\n  " scm ")") scm))
+                              (if (and guard? (not (ei-top-level-define? scm)))
+                                  (string-append "(guard (e (#t #f))\n  " scm ")")
+                                  scm))
                           acc))))))
     (reverse acc)))
 
@@ -332,11 +406,11 @@
                (cached (ei-next-cached ns))
                (ir (jolt-ce-run-passes (or cached (jolt-ce-analyze ctx form)) ctx (ei-unit)))
                (str (if (eq? kind 'macro)
-                        (ei-macro-string ns nm (jolt-ce-emit-top ir) (ei-emit-meta ns (cdr f) #f) #f)
+                        (ei-macro-string ns nm (ei-emit-top ir nm) (ei-emit-meta ns (cdr f) #f) #f)
                         (jolt-ce-emit-top ir)))
                (fqn (if (eq? kind 'macro) (string-append ns "/" nm) (dce-def-fqn ir)))
                (refs (dce-app-refs ir str)))
-          (set! acc (cons (if fqn (dce-rec #f fqn refs str) (dce-rec #t #f refs str)) acc)))))
+          (set! acc (cons (if fqn (dce-rec #f fqn refs str (dce-def-init-runs? ir)) (dce-rec #t #f refs str)) acc)))))
     (reverse acc)))
 
 ;; Scheme string literal for a ns/name — uses the runtime's own writer
@@ -373,7 +447,7 @@
 (define ei-prelude-ns-files
   (append
     (map (lambda (tf) (cons "clojure.core" (string-append "jolt-core/clojure/core/" tf ".clj")))
-         '("00-syntax" "00-kernel" "10-seq" "20-coll" "21-coll" "22-coll" "25-sorted" "30-macros" "40-lazy" "50-io"))
+         '("00-syntax" "00-kernel" "10-seq" "20-coll" "21-coll" "22-coll" "25-sorted" "30-macros" "40-lazy" "50-io" "60-gvec"))
     (list (cons "clojure.string" "stdlib/clojure/string.clj")
           (cons "clojure.walk" "stdlib/clojure/walk.clj")
           (cons "clojure.template" "stdlib/clojure/template.clj")
@@ -381,6 +455,7 @@
           (cons "clojure.set" "stdlib/clojure/set.clj")
           (cons "clojure.pprint" "stdlib/clojure/pprint.clj")
           (cons "clojure.repl" "stdlib/clojure/repl.clj")
+          (cons "clojure.main" "stdlib/clojure/main.clj")
           ;; LAST: the generated :doc/:arglists shard fills what the sources
           ;; above did not declare, for every image ns (tools/gen-core-docs.sh).
           (cons "clojure.core" "jolt-core/clojure/core/90-docs.clj"))))

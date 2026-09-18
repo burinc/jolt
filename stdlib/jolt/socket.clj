@@ -21,14 +21,18 @@
 (def ^:private SOCK-STREAM 1)
 
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int :blocking)
+(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-bind        "bind"        [:int :pointer :int] :int)
 (ffi/defcfn c-listen      "listen"      [:int :int] :int)
-(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
-(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t :blocking)
+(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t
+  {:blocking true :capture-native-error true})
+(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-close       "close"       [:int] :int)
 ;; ioctl is (int fd, unsigned long request, ...) — the :varargs marker puts the
 ;; third argument where the callee's va_list reads it. Binding it fixed-arity
@@ -94,16 +98,17 @@
 (defn- make-sockaddr [ip port]
   ;; sockaddr_in (16 bytes): header(2) + sin_port(2, network order) +
   ;; sin_addr(4) + padding(8). BSD's header is sin_len + one-byte sin_family;
-  ;; Linux's is a 16-bit little-endian sin_family.
+  ;; Linux's is a 16-bit little-endian sin_family. ffi/alloc zeroes the block,
+  ;; so every byte this does not set is already 0 — which is what the padding
+  ;; and the unset half of the header have to be.
   (let [sa (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write sa :uint8 i 0))
     (if macos?
-      (do (ffi/write sa :uint8 0 16)          ;; sin_len
-          (ffi/write sa :uint8 1 AF-INET))
-      (ffi/write sa :uint8 0 AF-INET))
-    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))
-    (ffi/write sa :uint8 3 (bit-and port 0xff))
-    (ffi/write sa :uint 4 ip)
+      (do (ffi/write sa :uint8 16)          ;; sin_len
+          (ffi/write sa :uint8 AF-INET 1))
+      (ffi/write sa :uint8 AF-INET))
+    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)
+    (ffi/write sa :uint8 (bit-and port 0xff) 3)
+    (ffi/write sa :uint ip 4)
     sa))
 
 (defn- make-sockaddr-in [host port]
@@ -117,14 +122,14 @@
 (defn- local-port [fd]
   (let [sa (ffi/alloc 16) lenp (ffi/alloc 4)]
     (try
-      (ffi/write lenp :int 0 16)
+      (ffi/write lenp :int 16)
       (if (neg? (c-getsockname fd sa lenp)) 0 (sa-port sa))
       (finally (ffi/free sa) (ffi/free lenp)))))
 
 (defn- set-opt-1! [fd opt]
   (let [p (ffi/alloc 4)]
     (try
-      (ffi/write p :int 0 1)
+      (ffi/write p :int 1)
       (c-setsockopt fd sol-socket opt p 4)
       (finally (ffi/free p)))))
 
@@ -170,10 +175,10 @@
   (let [ip (resolve-host host)
         sa (make-sockaddr ip port)
         r  (loop []
-             (let [r (c-connect fd sa 16)]
+             (let [[r e] (c-connect fd sa 16)]
                (cond
                  (zero? r) 0
-                 (poller/connect-pending? (poller/errno))
+                 (poller/connect-pending? e)
                  (do (poller/wait-ready fd :write)
                      (let [e (poller/so-error fd)]
                        (if (zero? e)
@@ -287,18 +292,37 @@
   ;; R8). EAGAIN waits for readiness — parking the fiber on the poller when
   ;; there is a current fiber, blocking on a private kevent/epoll_wait when
   ;; there is not — and retries; EINTR retries immediately; anything else is
-  ;; the syscall's real answer, returned as-is (callers read errno semantics).
+  ;; the syscall's real answer, returned as-is. OP hands back the captured
+  ;; [result errno] pair from one foreign return path (jolt.ffi
+  ;; :capture-native-error) — every binding io-call drives is declared that
+  ;; way. The errno is spent on that classification and not returned, so a
+  ;; caller sees a terminal failure only as a negative result.
   (loop []
-    (let [r (op)]
+    (let [[r e] (op)]
       (cond
-        (and (neg? r) (poller/eintr?)) (recur)
-        (and (neg? r) (poller/eagain?)) (do (poller/wait-ready fd wait-kind) (recur))
-        :else r))))
+        (and (neg? r) (poller/eintr? e)) (recur)
+        (and (neg? r) (poller/eagain? e)) (do (poller/wait-ready fd wait-kind) (recur))
+        :else
+        (do
+          ;; A negative return that is neither retryable nor a wait is where a
+          ;; socket read turns into EOF (do-recv below), and the caller then sees
+          ;; a closed connection with no reason attached. It is the one place a
+          ;; syscall failure goes quiet, so say what it was when asked.
+          (when (and (neg? r) (jolt.host/getenv "JOLT_DEBUG"))
+            (binding [*out* *err*]
+              (println "jolt.socket: fd" fd wait-kind "syscall failed, errno" e
+                       "- answered as EOF")))
+          r)))))
 
 (defn- do-recv [fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
-  ;; also reads as EOF because errno isn't reachable to tell ECONNRESET from
-  ;; EINTR. Java throws SocketException there — documented divergence.
+  ;; also reads as EOF. Java throws SocketException there — documented
+  ;; divergence. What is left of the error is a CHOICE, not a limitation:
+  ;; io-call classifies a captured errno and returns only the syscall result,
+  ;; so a reset arrives here as -1 with nothing attached. Retryable errnos are
+  ;; already gone by this point — io-call loops on EINTR and waits out EAGAIN
+  ;; — so every negative n here is terminal. Narrowing that to SocketException
+  ;; on ECONNRESET means widening io-call's contract to hand the errno back.
   (let [n (io-call #(c-recv fd buf len 0) fd :read)]
     (if (pos? n)
       {:n n :bytes (ffi/read-array buf n)}
@@ -319,9 +343,12 @@
   (let [fd (jolt.host/ref-get self :fd)
         out (ffi/alloc 4)]
     (try
-      (ffi/write out :int 0 0)
+      (ffi/write out :int 0)
       ;; a failed ioctl reads as "nothing there", the way a failed recv reads as
-      ;; EOF — errno is not reachable to say more
+      ;; EOF. c-ioctl is not on a retry path, so it is bound without
+      ;; :capture-native-error and its errno is never captured to say more
+      ;; with — unlike the recv side, where the errno exists and io-call
+      ;; spends it on classification.
       (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
       (finally (ffi/free out)))))
 
@@ -364,23 +391,35 @@
           (throw (java.io.IOException. "Broken pipe")))
         (recur (+ off s))))))
 
+(defn- write-bytes! [self bytes off len]
+  (when (pos? len)
+    (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]
+      (try
+        (dotimes [i len]
+          (ffi/write buf :uint8 (bit-and (aget bytes (+ off i)) 0xff) i))
+        (send-fully! fd buf len)
+        (finally (ffi/free buf))))))
+
 (def ^:private socket-output-stream-methods
   {"write"
    (fn
+     ;; OutputStream.write has TWO one-argument overloads on the JVM: write(int)
+     ;; writes a byte, and write(byte[]) — the convenience method the abstract
+     ;; class defines as write(b, 0, b.length) — writes the array. Dispatching on
+     ;; the argument is the only way to tell them apart here, and without it a
+     ;; byte array reached (int b) and reported "class [B cannot be cast to class
+     ;; java.lang.Number", which named neither the socket nor the overload
+     ;; (jolt#954). This is the same argument-shaped dispatch io-streams.ss's
+     ;; out-stream/write does.
      ([self b]
-      (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
-        (try
-          (ffi/write buf :uint8 0 (bit-and (int b) 0xff))
-          (send-fully! fd buf 1)
-          (finally (ffi/free buf)))))
-     ([self bytes off len]
-      (when (pos? len)
-        (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]
+      (if (bytes? b)
+        (write-bytes! self b 0 (alength b))
+        (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
           (try
-            (dotimes [i len]
-              (ffi/write buf :uint8 i (bit-and (aget bytes (+ off i)) 0xff)))
-            (send-fully! fd buf len)
-            (finally (ffi/free buf)))))))
+            (ffi/write buf :uint8 (bit-and (int b) 0xff))
+            (send-fully! fd buf 1)
+            (finally (ffi/free buf))))))
+     ([self bytes off len] (write-bytes! self bytes off len)))
    "flush" (fn [self] nil)
    "close" (fn [self] (socket-close! (jolt.host/ref-get self :socket)))})
 
@@ -419,7 +458,7 @@
        (throw (java.io.IOException. "ServerSocket closed")))
      (let [sa (ffi/alloc 16) lenp (ffi/alloc 4)]
        (try
-         (ffi/write lenp :int 0 16)
+         (ffi/write lenp :int 16)
          (let [cfd (io-call #(c-accept (jolt.host/ref-get self :fd) sa lenp)
                             (jolt.host/ref-get self :fd) :read)]
            (when (neg? cfd) (throw (java.io.IOException. "accept() failed")))
@@ -502,7 +541,7 @@
   []
   (let [pp (ffi/alloc (ffi/sizeof :pointer))]
     (try
-      (ffi/write pp :pointer 0 ffi/null)
+      (ffi/write pp :pointer ffi/null)
       (when (neg? (c-getifaddrs pp))
         (throw (java.io.IOException. "getifaddrs() failed")))
       (let [head (ffi/read pp :pointer)]
@@ -523,7 +562,7 @@
 (defn- local-hostname []
   (let [n 256 buf (ffi/alloc n)]
     (try
-      (ffi/write buf :uint8 0 0)
+      (ffi/write buf :uint8 0)
       (if (neg? (c-gethostname buf n)) "localhost" (ffi/ptr->string buf))
       (finally (ffi/free buf)))))
 
@@ -536,7 +575,7 @@
         n 1025
         buf (ffi/alloc n)]
     (try
-      (ffi/write buf :uint8 0 0)
+      (ffi/write buf :uint8 0)
       (when (zero? (c-getnameinfo sa 16 buf n ffi/null 0 0))
         (let [nm (ffi/ptr->string buf)]
           (when-not (or (str/blank? nm) (= nm address)) nm)))

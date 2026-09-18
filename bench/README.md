@@ -1,486 +1,214 @@
 # jolt benchmark suite
 
-Benchmarks that isolate the workload axes jolt's optimizing passes target. The
-ray tracer (`examples/ray-tracer`) is **float-compute-bound** — its time is
-irreducible algorithmic math (hit-testing + transcendentals), and devirt,
-allocation removal, and type-proving all measured **flat** on it. So it can't
-tell us whether those passes work. These benchmarks make each pass's target
-workload the *dominant* cost.
+What jolt costs against JVM Clojure on the same portable source, one axis per
+row. `make test` and `make libconformance` check that answers are right and
+neither notices when they get slower — `arrays` once went 5.4× on a codegen
+change with every gate green, because every answer was still correct — so this
+suite is the throughput gate: a release compares it against the previous
+release and blocks `publish` on the result (`ci/bench-gate.sh`, wired into
+`.github/workflows/release.yml`), and the scaling gates in `make test` pin the
+complexity class of the paths the rows measure. See [Gating](#gating).
 
-Reference: the cross-language suites these draw from —
-[Are We Fast Yet?](https://github.com/smarr/are-we-fast-yet) (Marr et al., DLS '16)
-and the [Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/).
-The benchmarks are portable Clojure, so they also run on JVM Clojure for an
-absolute reference.
-
-## Benchmarks
-
-| Benchmark | Axis | Pass it exercises | Source |
-|---|---|---|---|
-| `binary-trees` | allocation / GC pressure (escaping short-lived records) | scalar-replace, escape analysis | CLBG |
-| `dispatch` | polymorphic (**megamorphic**) protocol dispatch | devirt, inline-cache | AWFY-style |
-| `mono-dispatch` | **monomorphic** protocol dispatch (devirt/inline-cache *can* fire) | devirt, inline-cache | AWFY-style |
-| `collections` | persistent map/vector churn (HAMT / 32-way tries) + map/filter/take/reduce over the built vector | persistent structures, transients | CLBG k-nucleotide-style |
-| `vecops` | vector-of-vectors: pairwise `into` concatenation, `subvec` windows + reduce, split-at/rejoin loop | vector concat + slice (the RRB axis; `into`/`subvec` are wired through the RRB ops, so concat is O(log n) here and linear in core Clojure) | RRB workload |
-| `mandelbrot` | pure float compute (tight arith loops, no alloc/dispatch) | native arith, loop codegen | CLBG |
-| `arrays` | primitive `double-array` throughput (unboxed `aget`/`aset`, no boxing/collections) | unboxed primitive-array codegen (flvector read/write) | CLBG-style |
-| `mathfns` | transcendental math (`java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles) | native `Math` op lowering (`flsqrt`/`flsin`/… vs generic host-static dispatch) | CLBG-style |
-| `fib` | recursion: function-call + integer-arith overhead | native arith, small-fn inlining | CLBG |
-| `tak` | deep three-way self-recursion + integer arith | direct-linked self-calls, proven fixnum arith | CLBG/AWFY |
-| `loop-recur` | tight `loop`/`recur` + per-iteration integer arith (`mod`, `quot`, `bit-xor`) | numeric pass (primitive long loop counters), loop codegen | CLBG-style |
-| `seqs` | lazy-seq + HOF pipelines (`map`/`filter`/`reduce`, `every?`, `iterate`/`take`, `mapcat`) | lazy-seq cell allocation, per-element call overhead | CLBG-style |
-| `transducers` | transducer pipelines (`comp` of `map`/`filter`/`take`) | transducer machinery, `reduce` fast paths | CLBG-style |
-| `transients` | bulk map/set building through the transient write path (`into`, `assoc!`/`conj!`, `dissoc!`/`disj!`, `zipmap`/`frequencies`/`group-by`), with a transient vector build as the control | editable-HAMT transient nodes, `persistent!` spine freeze | — |
-| `keyed-lookup` | scalar KEYS: hashing/comparing keywords, symbols and strings, and looking them up in SMALL maps; a symbol built per lookup, and a collection or keyword-local in head position | hash engine fast paths (`jolt-hasheq`/`jolt=2`), `symbol-t` khash, `jolt-invokeN` lookup shapes | honeysql `format-dsl` |
-| `hash-eq` | composite KEYS AND VALUES: repeat-hashing vectors/maps/sets/records/seqs, vector- record- and fn-keyed map and set lookups, and `=` on equal and unequal collections | per-instance hasheq caches, collection/record probes ahead of the eq and hash arm walks, hash fast-reject in `jolt-coll=?`, procedure identity hash | instaparse GLL msg-cache, honeysql |
-| `literals` | fixed per-call overhead in a library's inner fn: constant map/vector/set literals in the body (incl. quoted symbols), and `true?`/`false?`/`boolean?`/`identical?` | per-site constant hoisting (`hoist-const-per-site`), identity-based boolean predicates, inlined `identical?` | honeysql `format` loop |
-| `string-build` | `StringBuilder` appended to in a loop, and the transducer-over-`join` shape libraries render text with | proven-StringBuilder direct emission vs jhost method-table dispatch | honeysql `format-entity` |
-| `string-ops` | the ordinary String surface — `.indexOf`/`.startsWith`/`.substring`/`.toLowerCase` on hinted and inference-proven targets, `clojure.string` over already-string arguments, `.getName`/`.getNamespace` on a keyword | direct emission for proven-string and proven-keyword interop targets, `clojure.string/to-str` string fast path | honeysql, clojure.string |
-| `char-scan` | walking a string one code point at a time via `.charAt`, with the `int`/`long`/`unchecked-*` casts hinted Clojure puts around it, incl. a `case`-dispatched character state machine | numeric cast fast paths, `.charAt` on a proven string, `case` over small ints | honeysql `alphanumeric?` |
-| `sorted-access` | reads a collection's structure can answer without walking: `count`/`drop` on a vector seq, `rseq`, `first` on a sorted map/set | shape-answered reads (Counted / IDrop / leftmost-node), not traversal | — |
-| `nth-access` | `nth` on a vector, small and large, and with a default — the constant cost of an indexed read | `Indexed`-first ordering in `jolt-nth` ahead of the extension-type probes | — |
+The benchmarks draw on [Are We Fast Yet?](https://github.com/smarr/are-we-fast-yet)
+and the [Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/),
+plus shapes lifted from real libraries (honeysql's formatting loop, instaparse's
+message cache, malli's test suite). Each file's header says what it isolates
+and which compiler pass or runtime seam it exists to watch.
 
 ## Scorecard
 
-**vs JVM** is jolt ÷ JVM Clojure on the same source — **lower is better, and
-under 1.0× means jolt is faster**. Two build modes: **opt** is
-`jolt build --direct-link --opt`, **release** is a plain `jolt build` (what a
-default build ships). Times are the mean of 3 runs after warmup, in ms. Every
-row below is from ONE `MODE_A=1 bench/run.sh` on one machine (M-series) in one
-sitting, which is the only way the ratios mean anything.
+Measured 2026-09-09 on an Apple Silicon MacBook Pro (M1 Pro, macOS 26.3): jolt 0.8.6 (the tree of
+commit 871ef34c) built as `target/release/jolt`, OpenJDK 20.0.1, Chez 10.4.1. Sorted by
+ratio; the AOT rows first, then `startup`, then the run-mode rows.
 
-| Benchmark | vs JVM | vs JVM (release) | jolt (ms) | JVM (ms) | Axis |
-|---|---:|---:|---:|---:|---|
-| `vecops` | **0.3×** | 0.3× | 5.1 | 15.9 | vector concat + slice (beats the JVM) |
-| `tak` | **0.3×** | 0.3× | 7.0 | 20.4 | deep three-way self-recursion + integer arith (beats the JVM) |
-| `dispatch` | **1.1×** | 1.1× | 64.6 | 58.3 | megamorphic protocol dispatch |
-| `fib` | **1.3×** | 1.3× | 9.2 | 7.2 | recursion: call + integer arith |
-| `mathfns` | **1.5×** | 1.6× | 24.3 | 16.5 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2) |
-| `collections` | **1.8×** | 1.8× | 20.7 | 11.3 | persistent map/vector churn |
-| `loop-recur` | **1.8×** | 1.7× | 31.5 | 17.9 | tight loop/recur + per-iteration integer arith |
-| `binary-trees` | **1.8×** | 1.8× | 76.0 | 42.7 | escaping short-lived records (allocation/GC) |
-| `mandelbrot` | **1.9×** | 1.8× | 23.7 | 12.8 | pure float compute |
-| `mono-dispatch` | **2.5×** | 2.5× | 34.7 | 13.9 | monomorphic protocol dispatch |
-| `nth-access` | **2.6×** | 2.7× | 64.6 | 24.4 | `nth` on a vector, small and large |
-| `seqs` | **2.6×** | 2.7× | 384.5 | 145.3 | lazy-seq + HOF pipelines |
-| `hash-eq` | **3.7×** | 3.7× | 678.0 | 183.0 | composite-value hashing + collection `=` |
-| `transducers` | **3.9×** | 3.9× | 134.4 | 34.5 | transducer pipelines |
-| `transients` | **3.9×** | 3.8× | 242.0 | 62.0 | transient map/set bulk build |
-| `string-build` | **5.4×** | 5.5× | 210.0 | 39.0 | `StringBuilder` assembly + `join` |
-| `keyed-lookup` | **5.7×** | 5.9× | 148.0 | 26.0 | scalar-key hashing + small-map lookup |
-| `arrays` | **6.4×** | 6.4× | 234.2 | 36.4 | primitive `double-array` throughput |
-| `string-ops` | **7.1×** | 7.3× | 519.0 | 73.0 | String/Keyword interop + `clojure.string` |
-| `literals` | **8.2×** | 9.0× | 204.0 | 25.0 | constant literals + boolean predicates, per call |
-| `sorted-access` | **11.4×** | 11.6× | 123.8 | 10.9 | shape-answered collection reads |
-| `char-scan` | **27.1×** | 26.9× | 352.0 | 13.0 | per-character `.charAt` + numeric casts |
+| Benchmark | vs JVM | jolt (ms) | JVM (ms) | What it measures |
+|---|---:|---:|---:|---|
+| `arrays-unhinted` | **0.01×** | 59.9 | 10831.2 | the same array code without type hints |
+| `char-scan-unhinted` | **0.01×** | 113 | 7764 | the same scan without type hints |
+| `gc-arrays` | **0.02×** | 29.7 | 1725.7 | major-collection pause with a large typed array live (read jolt ms only, see below) |
+| `typed-records` | **0.03×** | 10.7 | 310.3 | records with `^double`/`^long`/`^String` field types at construction and every read |
+| `typed-records-unhinted` | **0.07×** | 19.9 | 292.6 | the same records without field types |
+| `string-ops-unhinted` | **0.10×** | 302 | 2958 | the same string interop without type hints |
+| `vecops` | **0.26×** | 4.1 | 15.9 | vector concat (`into`), `subvec` windows, split/rejoin (the RRB axis) |
+| `tak` | **0.36×** | 6.7 | 18.7 | deep three-way self-recursion + integer arith |
+| `stm` | **0.81×** | 122.0 | 151.5 | ref creation, `dosync` `ref-set`/`alter`, `deref` in a loop |
+| `dispatch` | **1.2×** | 65.6 | 56.6 | megamorphic protocol dispatch |
+| `fib` | **1.4×** | 9.3 | 6.8 | recursion: call overhead + integer arith |
+| `loop-recur` | **1.5×** | 28.5 | 18.8 | tight `loop`/`recur` with `mod`/`quot`/`bit-xor` per iteration |
+| `collections` | **1.5×** | 16.6 | 10.9 | persistent map/vector churn + map/filter/take/reduce over the result |
+| `mandelbrot` | **1.5×** | 21.9 | 14.2 | pure float compute, no allocation or dispatch |
+| `mathfns-unhinted` | **1.9×** | 41.9 | 22.2 | the same math without type hints |
+| `binary-trees` | **1.9×** | 75.3 | 39.4 | escaping short-lived records: allocation / GC pressure |
+| `literals` | **2.2×** | 55 | 25 | constant map/vector/set literals and quoted forms in a fn body, boolean predicates (per-form constant pool) |
+| `mathfns` | **2.3×** | 41.3 | 17.8 | `java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles |
+| `sorted-access` | **2.4×** | 31.0 | 13.1 | shape-answered reads: `count`/`drop` on a vector seq, `rseq`, `first` of a sorted map/set |
+| `seqs` | **2.4×** | 346.7 | 144.9 | lazy-seq + HOF pipelines: `map`/`filter`/`reduce`, `every?`, `iterate`/`take`, `mapcat` |
+| `transients` | **2.5×** | 154 | 61 | bulk map/set building through `into`, `assoc!`/`conj!`, `zipmap`/`frequencies`/`group-by` |
+| `hash-eq` | **2.6×** | 480 | 186 | hashing vectors/maps/sets/records/seqs, collection-keyed lookups, `=` on equal and unequal collections |
+| `printing` | **2.7×** | 752.4 | 282.2 | `pr-str` over scalars and namespaced maps, `print` into a rebound `*out*`, `format` with numeric directives and flags |
+| `mono-dispatch` | **2.7×** | 37.0 | 13.8 | monomorphic protocol dispatch (devirt / inline cache can fire) |
+| `nth-access` | **2.7×** | 62.3 | 23.2 | `nth` on a vector, small and large, with and without a default |
+| `string-ops` | **3.0×** | 298 | 98 | `.indexOf`/`.startsWith`/`.substring`/`.toLowerCase` on hinted strings, `clojure.string`, keyword `.getName` |
+| `executors` | **3.2×** | 1328.8 | 421.7 | `java.util.concurrent`: fire-and-forget enqueue, submit/get, growth to 64 blocking tasks, four producers on one pool |
+| `keyed-lookup` | **3.6×** | 91 | 25 | hashing keywords/symbols/strings and looking them up in small maps |
+| `lazy-threads` | **3.7×** | 237.4 | 64.8 | lazy pipelines after a `Thread` has existed (cells claimed by CAS, no mutex per cell) |
+| `arrays` | **3.7×** | 592.8 | 160.0 | primitive `double-array` throughput (hinted `aget`/`aset`) |
+| `apply-rest` | **3.8×** | 222.1 | 58.3 | `apply` of `+ max min < <=` and a user variadic over a million-element rest (streamed, not materialized) |
+| `transducers` | **4.0×** | 124.6 | 30.8 | transducer pipelines (`comp` of `map`/`filter`/`take`) |
+| `byte-arrays` | **4.5×** | 167.0 | 37.5 | raw bytes in bulk: block copies, a drained stream, `String`↔`byte[]`, hinted `^bytes` access |
+| `string-build` | **4.5×** | 183 | 41 | `StringBuilder` in a loop and transducer-over-`join` |
+| `char-scan` | **6.0×** | 108 | 18 | `.charAt` per code point with the `int`/`long`/`unchecked-*` casts, a `case` state machine |
+| `compile-forms` | **8.3×** | 817.1 | 98.5 | **compiling**, not running: `load-string` of 200 top-level defns and of one `deftest` holding 200 `is` forms |
+| `sorted-build` | **13.3×** | 701.3 | 52.6 | `into` a sorted-map/sorted-set in and out of key order, `sorted-map-by`, replace-every-key (one tree walk per insert) |
+| `startup` | **0.19×** | 84 | 443 | a built hello-world, whole process from exec to exit, best of 7 (JVM: `java -cp … clojure.main -m hello`) |
+| `mix-64` ×100000 (run mode) | **5.8×** | 30.5 | 5.3 | SplitMix `mix-64`: 64-bit integer arithmetic (heap bignums past the 61-bit fixnum) |
+| `deftype+protocol` ×100000 (run mode) | **3.5×** | 23.0 | 6.5 | open-world deftype allocation + protocol dispatch |
+| `split + rand-long` ×20000 (run mode) | **12.1×** | 43.7 | 3.6 | the PRNG: bignum 64-bit arithmetic + dispatch |
+| `gen/large-integer` ×2000 (run mode) | **4.9×** | 41.5 | 8.5 | `gen/large-integer`: arithmetic + rose-tree generator machinery |
+| `(gen/vector gen/large-integer)` ×500 (run mode) | **12.2×** | 461.9 | 38.0 | element generation + generator machinery |
 
-`opt` and `release` track each other closely across the whole suite — the plain
-`jolt build` picks up essentially all of the win. Every row is within 0.2 of a
-ratio point except `literals` (8.2× vs 9.0×), and that one is run-to-run spread
-on a small absolute (204ms vs 225ms) rather than a real mode difference; it reads
-level on repeat runs.
+**vs JVM** is jolt ÷ JVM Clojure on the same source: lower is better, and
+under 1.0× jolt is faster. Every row is from one `bench/run.sh` followed by one
+`bench/testcheck.sh` on one machine in one sitting, which is the only way the
+ratios mean anything; absolute milliseconds are that machine's and are not
+comparable to a table measured elsewhere. AOT rows are optimized standalone
+binaries (`jolt build --direct-link --opt`) timing the compute inside, the
+mean of 3 runs after warmup. A plain `jolt build` (`MODE_A=1`) tracks the
+optimized column to within 0.2 of a ratio point across the suite.
 
-### A stale scorecard hid a 1.7× regression for three weeks (now fixed)
+Reading it:
 
-The rows above are a full re-measure. The previous table's `loop-recur` (30.7),
-`mandelbrot` (23.3) and `fib` (7.0) figures dated from the 2026-07-26 refresh and
-were carried forward unchanged through three later README edits that added rows
-and prose without re-running the suite. They were wrong by then: bisecting the
-published release binaries puts `loop-recur` at 30.3ms on v0.5.12 (2026-07-29)
-and **51.7ms on v0.5.13** (2026-08-01), flat at ~52ms in every release from
-there through v0.7.17. The JVM column was unchanged across the same span and
-Chez has been 10.4.1 since June, so it was neither the machine nor the
-substrate.
+- **One run is not evidence.** Per-row noise is about 1.07× on a quiet
+  machine, more on the first row of a run and on `executors` (four producers
+  fighting over one mutex). Re-measure a row that moved, alone, on both sides
+  (`bench/run.sh <name>`) before believing it.
+- **`gc-arrays`** times full collections with one array rooted across them.
+  Read its jolt milliseconds against jolt only: the vs-JVM column mostly
+  reports that a JVM full GC's floor is ~750× a Chez major collection's, and
+  `System/gc` is a hint there and a full collection here.
+- **`*-unhinted`** rows are the same source with the type hints removed — what
+  a hint buys, and what unhinted library code pays.
+- **`compile-forms`** measures jolt compiling, not running. The reference
+  builds bytecode and generates no native code at load; jolt asks Chez for
+  optimized native code for every form, which is roughly half its time.
+- **`cst-format`** is the one row with a NON-JVM reference. It is the shape of
+  standard-clojure-style — a CST of one small fixed-key map per token, then an
+  atom-per-node mutating walk — and the upstream implementation of that
+  formatter is JavaScript, so the same work can be timed on V8. Measured on one
+  x86_64 Linux box, 57 KB of Clojure source: node 14.4 ms, JVM Clojure 167 ms,
+  jolt 290 ms. Read it as two facts rather than one — the IDIOM costs ~12x V8
+  before jolt is involved (persistent maps, an atom per node, and an output
+  string rebuilt per line, against plain objects, in-place fields and V8's
+  cons-strings), and jolt costs ~1.7x the JVM on top of that. It prints its own
+  parse/format split above `mean:`; `mean:` is the row.
+- **`startup`** is the one whole-process row: the boot image's decode plus the
+  runtime's init, which every other row excludes by timing inside a running
+  binary. `bench/startup.sh` and `bench/startup-phases.sh` break it down
+  further (boot, dispatch, compile, run) and compare against babashka.
+- The **run mode** rows (`bench/testcheck.sh`) reach library code through a
+  `require`, the way a test suite does, rather than as an AOT binary. They are
+  bound by 64-bit integer arithmetic (a genuine 64-bit value is a heap bignum
+  past Chez's 61-bit fixnum) and by open-world generator dispatch.
 
-The cause was in v0.5.13's bit-op change. `bit-and`/`bit-or`/`bit-xor`/`bit-not`
-moved off the raw Chez primitives — which Chez inlines to native code — onto
-`jolt-bit-*` helpers, so that a bad operand raises a catchable
-`IllegalArgumentException` in call position as well as value position. Correct,
-but the helpers coerce through `->int`, which range-checks against ±2^63. Those
-bounds are **bignums** on Chez's 61-bit fixnum tower, so every `(bit-xor a b)`
-on ordinary integers paid four fixnum-vs-bignum compares — the identical
-pathology the 2026-08-17 numeric-cast round fixed for `int`, `long` and the
-`unchecked-*` forms, which `->int` was not given.
-
-Two fixes took it back. **First, `->int` tests `fixnum?` first.** That is not a
-semantic narrowing: a Chez fixnum here is 61-bit, so it is always an exact
-integer inside signed 64-bit range and always took the slow path's accept
-branch. That alone was `loop-recur` 51.8 → 34.4ms.
-
-**Second, the back end open-codes the fixnum case.** Even with a cheap `->int`,
-`jolt-bit-xor` is a cross-unit call, and cp0 does not inline it — measured, it
-declines even from a direct same-unit call site. A call-position `bit-and`/`or`/
-`xor`/`not` now emits its operands into a `let*`, tests them, and takes
-`fxand`/`fxior`/`fxxor`/`fxnot` when both are fixnums, with the helper as the
-slow arm. `loop-recur` 34.4 → **30.8ms**, which is v0.5.12's 30.3.
-
-Isolated in Chez, 1.28M `bit-xor`s: 26ms through the old `->int`, 8ms through
-the new one, 4ms as a raw inlined `bitwise-xor`, and 4ms through the open-coded
-form — the inline recovers the call overhead completely.
-
-The catchable-exception semantics the helpers exist for are untouched, because
-the fast arm only short-circuits operands that provably cannot raise. `->int`
-accepts exactly the exact integers in signed 64-bit range; a fixnum is always
-one of those; and on fixnums the `fx*` ops agree with the generic `bitwise-*`
-ops and always yield a fixnum, since the result's bit pattern is bounded by the
-operands'. Everything that CAN raise — a non-integer, a ratio, an out-of-range
-bignum — still reaches the helper. An above-fixnum but in-range value like 2^62
-also reaches it, and still computes rather than raising. Ten corpus rows pin
-that contract against JVM Clojure, covering call position, value position, the
-variadic arity, the boundaries, and `Long/MIN_VALUE`/`Long/MAX_VALUE`.
-
-A proven `^long` operand does NOT license dropping the test: jolt's `^long` is
-64-bit and a Chez fixnum is 61, so a proven-`:long` value can be a bignum at
-runtime. That is why this is a runtime guard in the emitter and not a `:lng`
-registry entry. The shifts get no fast path either — `bit-shift-left` overflows
-fixnum range and `jolt-bit-shift-left` wraps to 64 bits, so no `fx` op agrees
-with them.
-
-**The float side was the same bug, and took the same fix.** A `^double`
-param/return coercion emits `jolt->fl` where it used to emit a bare
-`exact->inexact`, so every parameter entry, return and contagion site became a
-procedure call. `jolt->fl` returns its argument unchanged when it is already a
-flonum — it tests `flonum?` first — so the emitter now hoists that test to the
-call site (`(let ((t X)) (if (flonum? t) t (jolt->fl t)))`) and only a value
-that genuinely needs converting, or that must raise, reaches the helper.
-`jolt->fx` gets the same treatment on the `^long` side. `mandelbrot` 31.7 →
-**23.7ms**, against v0.5.12's 23.0.
-
-Both halves of the v0.5.13 window are closed now, and the shape of the fix was
-identical each time: a Chez primitive that inlines was replaced by a helper call
-for its JVM semantics, and the semantics only matter on the operands the fast
-path does not take. Open-code the no-op case, keep the helper as the slow arm.
-
-The moral is procedural, and is why this section exists: **the numeric rows were
-carried forward instead of re-measured, and that is what made a 1.7× regression
-invisible for three weeks.** A README edit that touches the scorecard should
-re-run the suite or say plainly which rows it did not.
-
-### Where the rest of the suite stands
-
-The arithmetic/loop half sits at ~1.3–1.9× the JVM. The 2026-07 numeric-pass
-round did most of that: mixed long×double contagion (a `:long` operand beside a
-proven double widens via `fixnum->flonum`, so `Math` calls over it lower to
-native flonum ops instead of generic host dispatch — `mathfns` ~22.7×→~1.6×) and
-JVM literal-init loop semantics (a `(loop [i 0] …)` counter is a primitive long,
-so its `inc`/compare/`mod`/`quot` run as fixnum ops — `loop-recur` ~8.3×→~1.7×,
-and `mandelbrot`'s grid counters took it ~2.0×→~1.6×). `tak` and `vecops` beat
-the JVM outright; `fib` is close to level with it.
-
-`vecops` is the row the RRB work moved. Its comment used to say every operation
-in it was linear per op on jolt; wiring `into` and `subvec` through the RRB ops
-made concat O(log n) while core Clojure's `into` stays linear, so jolt now runs
-it at 0.3× — the one place in the suite where jolt has a better ALGORITHM than
-the reference rather than a better or worse constant.
-
-`sorted-access` exists because every operation in it used to be a full traversal
-here while the reference answers it from the collection's shape — and none of
-that is visible to a value test, since the answers were correct all along. Over
-200k elements `(count (seq v))` was 18.8ms against 166ns, `(rseq v)` 19.8ms
-against 209ns, and `(first sorted-map)` 190ms against 416ns. Its collections are
-built OUTSIDE the timed region: constructing a sorted map is a separate and much
-larger gap (~126×, bead jolt-r8tz.7) that otherwise drowns out the reads this
-measures. `test/complexity_test.clj` gates the same properties pass/fail.
-
-`keyed-lookup` and `string-build` came out of profiling honeysql's test suite,
-where `honey.sql/format` was 11× the reference and neither the existing
-`collections` nor `transducers` benchmark could see why. `collections` churns large
-HAMTs, so a per-key hash is amortised across 32-way nodes; at 3-8 entries the hash
-IS the cost, and a symbol key built for one lookup and discarded pays a full
-Murmur3 every time. `transducers` measures its machinery with an arithmetic
-reducing function; `string-build`'s rf calls a host method instead, which was the
-most expensive interop shape jolt had. Both are sensitive to the fixes that
-followed: against the binary from before them, `keyed-lookup` ran 444ms (1.9×
-slower) and `string-build` 1322ms (6.4× slower).
-
-`char-scan` came out of the same profiling and is the worst ratio in the suite. It
-exists because the cost was in the *casts*, not the loop or the string: `int`,
-`long` and the `unchecked-*` forms all fell through a generic `cond` to a
-`truncate` call and generic bitwise masking, and `long` additionally compared
-against ±2^63, which are BIGNUMS on Chez's 61-bit fixnum tower, so every
-`(long x)` on an ordinary integer paid two fixnum-vs-bignum compares. One
-`(unchecked-int i)` was 44.7ns against the JVM's 2.7ns, which works out to ~100ns
-of pure coercion per character in a hinted `.charAt` loop. Giving each cast a
-fixnum fast path took this benchmark 466ms → 343ms; `alphanumeric?` on a 5-char
-entity went 597ns → 457ns and a plain code-point sum over 5 characters 330ns →
-203ns. What is left is not the casts — it is ~58ns per character for the `.charAt`
-plus loop plus `case` dispatch, against ~2ns on the JVM, and closing that needs
-the casts and `.charAt` to inline at the call site rather than be called.
-
-### The hash, equality and per-call-overhead axes
-
-Four benchmarks cover the 2026-08 rounds that came out of profiling honeysql and
-instaparse. None of the older benchmarks could see any of them: the work they
-measure is per-CALL and per-KEY, and every other benchmark amortises it across a
-data structure or a loop trip count.
-
-- **`hash-eq` 3.7×** is the composite-value half of the hash engine, where
-  `keyed-lookup` is the scalar half. Vectors, maps and sets fell through to a
-  linear walk of the equality and hash arm REGISTRIES before reaching their base
-  cases, so loading an unrelated library made `(hash {:a 1 :b 2})` 8.4× slower;
-  they are answered ahead of that walk now, and `reject-fast-type-claim!`
-  refuses an arm that would claim one. On top of that every collection kind got
-  a hasheq cache it was missing: a pvec had the field since `chez-pvec-v3` but
-  nothing ever wrote it (repeat hash of a 1k vector 131µs → 191ns), a defrecord
-  caches in an instance slot (4-field record 215 → 34ns, record-keyed map get
-  216 → 58ns), a seq caches on its head. `jolt-coll=?` then rejects on differing
-  cached hashes without a structural walk (27× on unequal 1k vectors). The fn
-  row is a bug in its own right: Chez's `equal-hash` returns ONE constant for
-  every procedure, so an fn-keyed map degenerated to a single bucket and
-  instaparse's `[listener index]` cache went quadratic — procedures get an
-  identity hasheq from a weak side table now, which took test.chuck's grammar
-  require 3.57s → 1.66s.
-- **`literals` 8.1×** is the worst new ratio and the purest one: it does no work
-  at all beyond constructing the literals in a function body and calling three
-  predicates. A literal collection is a compile-time constant the reference
-  emits into the class constant pool; rebuilding one per call made `pset-conj`
-  11% of samples in the honeysql profile, all of it set literals. Hoisting has
-  to be PER SITE (two textually identical literals are distinct objects in the
-  reference, and `=` short-circuits on identity), and quoted forms have to hoist
-  too or `#{:for 'for}` stays dynamic. The predicate half is separate: `true?`
-  and `false?` were `(= true x)`, and a mixed-type `=` misses every fast clause
-  and walks the equality arm registry, so `boolean?` on a keyword cost 801ns
-  against 194 now.
-- **`transients` 3.9×** is the bulk-build write path. A transient map or set was
-  a Chez hashtable, so `persistent!` folded every entry back through the
-  ordinary insert and rebuilt the trie from scratch — the transient did not
-  avoid the path-copying build, it deferred it and added a hashtable on top.
-  Writes now claim each node on their path into an editable copy. The transient
-  VECTOR build in the same benchmark is the control: it was always a tail-array
-  append, so if the map/set rows move and it does not, the change is in the trie
-  edit path.
-- **`string-ops` 7.1×** is the ordinary String surface, which `string-build`
-  (StringBuilder) and `char-scan` (`.charAt` plus casts) both miss. An interop
-  call on an unproven target finds its method table by hashing the target's tag
-  string, finds the handler by hashing the method name, and passes arguments as
-  a vector converted back to a list for apply. A target proven a string — by a
-  `^String` hint or by inference — emits the operation directly instead:
-  `(.indexOf ^String s 46)` 140 → 23ns, `(.startsWith ^String s "so")` 142 → 17,
-  `(.substring ^String s 1 4)` 236 → 23. The benchmark carries both proof seams
-  and the `clojure.string` layer over them, where `to-str` used to take
-  `.toString` unconditionally so a plain string paid the full dispatch chain.
-
-### The allocation-bound axes
-
-- **`arrays` ~6.4×** (was ~18.6×): two rounds took it there. The fixnum-first
-  index path in `jolt-flaget`/`jolt-flaset` removed the per-access index
-  coercion (~18.6×→~9.5×), then emit-side inlining removed the procedure
-  boundary itself — on a site where the pass has proven a `^doubles` array and
-  a `:long` index, the back end now emits `(flvector-ref (jolt-array-vec a) i)`
-  directly, so the flonum stays unboxed through the surrounding `fl+` chain
-  instead of being boxed at the wrapper's return (~9.5×→~6.4×). The residual is
-  the checked `flvector-ref` + record accessor at O2, Chez boxing the
-  loop-carried flonum accumulator (~145ms of the 234ms on a 40M-iteration
-  loop), and the JVM SIMD-vectorizing the dot loop. Hoisting the loop-invariant
-  `jolt-array-vec` accessor out of the loop is the queued next lever.
-- **`seqs` ~2.6×** (was ~6.3×): the allocation axis idiomatic Clojure hits most
-  — range/map/filter/reduce chains, short-circuiting `every?`, `iterate`/`take`,
-  and `mapcat` all build lazy-seq cells and call a closure per element. Two
-  rounds took it here, both the same bug in different clothing: a lazy seq
-  assembled out of COMPOSED lazy primitives pays for every layer. `iterate`
-  spelled as `(cons x (lazy-seq …))` allocated a lazyseq node + closure and then
-  a cseq cell + closure to keep the tail unforced — two of each per element
-  where one suffices (374ms → 83ms over 800k elements). `lazy-concat-seq`, which
-  `mapcat` and `(apply concat …)` both route through, built each inner
-  collection via variadic `jolt-concat`: ~3 lazy nodes and ~5 closures per
-  boundary, which swamps the per-element work when inner colls are small
-  (302ms → 122ms). Both now emit exactly one cell per element.
-- **`transducers` ~3.9×** (was ~7.0×): `eduction` was a plain lazy seq, so
-  reducing one allocated a cell per element instead of driving the transducer
-  into the accumulator. It is now a real `Eduction` implementing `IReduceInit`,
-  as on the JVM — 152ms→61ms, in line with `transduce`. The remainder is the
-  per-element reducing-fn call chain, not the pipeline shape.
-- **`binary-trees` ~1.8×** (was ~7.2×): two rounds. Each node walk read a field
-  through a keyword RE-INTERNED at every use site; keyword literals are now
-  hoisted to a per-def constant (277ms→171ms). Then the read itself stopped
-  being a generic `jolt-get`: typing the walker's parameter needs a record
-  tracked through a NILABLE RECURSIVE position, which took four fixes to the
-  whole-program pass — a `defn`'s self-recursive call now carries the fn's own
-  return type (it resolves through the fn's name as a `:local`, so it used to
-  read `:any` and a recursive constructor poisoned its own field types), the
-  param fixpoint primes without back edges before iterating with them, joining
-  two views of the same record keeps a one-sided field instead of widening it,
-  and a field read off a record-or-nil keeps the field type joined with `:nil`.
-  `(:left node)` now emits `jrec-field-at` at a static slot (165ms→67ms). What
-  is left is allocation and GC — the nodes escape into the tree, so
-  scalar-replace can't remove them.
-- **`mono-dispatch` ~2.5×**:
-  collapsed from two orders of magnitude by the type-proving / inline-field /
-  bare-read work (`binary-trees` ~140×→~1.8×, `mono-dispatch` ~330×→~2.5×). On a
-  statically proven monomorphic receiver, devirt resolves the impl and a
-  per-site inline cache holds it. A NILABLE receiver deliberately does not
-  devirtualize: the site caches its first resolution, so serving that impl to a
-  later nil receiver would return a wrong value where Clojure raises
-  `IllegalArgumentException` — a `some?`/`nil?` guard narrows it back and devirt
-  fires again.
-- **`dispatch` ~1.1×**: a megamorphic site runs a per-site polymorphic inline
-  cache (4-slot descriptor scan, `#3%` reads over the proven cache shape), so
-  it no longer pays a registry lookup per call.
-- **`nth-access` ~2.6×**: `jolt-nth` is `set!`-wrapped several times and the
-  array shim was outermost, so a plain vector read walked a chain of
-  extension-type probes before reaching the arm that answers it. `RT.nth` tests
-  `Indexed` first; so does this now (small vector 34.3 → 16.0ns). The residual
-  is a constant factor, which is why it lives here and not in
-  `test/complexity_test.clj` — two CI runners measured 2.79× and 5.14× for the
-  same commit, and the regression worth watching for lands inside that spread.
-- **`collections` ~1.8×**: JVM-exact Murmur3 hashing plus the array-map
-  `(k . v)` fold; the residual is Murmur3 on integer keys, which the JVM JITs
-  to a handful of instructions.
-
-
-## 64-bit integer arithmetic & generators (test.check)
-
-The AOT suite above is float-compute / dispatch / allocation bound; none of it
-exercises **64-bit integer arithmetic**, which Chez can't hold in a fixnum
-(61-bit), so genuine 64-bit values are heap bignums. The SplitMix PRNG behind
-`clojure.test.check` is the worst case — every `rand-long` is ~8 bignum ops.
-
-`bench/testcheck.sh` runs these in **run mode** (`jolt run`, the normal require
-path a test suite reaches library code through), against JVM Clojure on the same
-source, with the same warmup-and-mean convention as the suite above. The first
-two rows isolate one cost each; the rest are real test.check entry points and
-carry both plus the rose-tree machinery.
-
-| Workload | ×N | vs JVM | jolt (ms) | JVM (ms) | Bound by |
-|---|---:|---:|---:|---:|---|
-| SplitMix `mix-64` | 100k | **8.2×** | 48.4 | 5.9 | 64-bit integer arithmetic |
-| deftype alloc + protocol dispatch | 100k | **4.3×** | 28.6 | 6.7 | open-world dispatch |
-| raw `split` + `rand-long` | 20k | **21.3×** | 78.7 | 3.7 | bignum 64-bit + dispatch |
-| `gen/large-integer` | 2k | **7.4×** | 66.8 | 9.0 | arithmetic + rose-tree machinery |
-| `(gen/vector gen/large-integer)` | 500 | **21.4×** | 755.2 | 35.3 | element gen + gen machinery |
-
-Both columns are a fresh `bench/testcheck.sh` pair on one machine in one sitting,
-which is the only way the ratio means anything — the absolutes here read ~1.4× the
-previously published ones on BOTH hosts (JVM `mix-64` 4.0→5.9 alongside jolt
-34.7→48.4), so that shift is the machine, not either runtime. Compare ratios
-across revisions of this table, not milliseconds.
-
-Two no-C codegen levers collapsed the **arithmetic** half: emitting `bit-and`/
-`bit-or`/`bit-xor`/`bit-not` as inlined Chez `bitwise-*` primitives (they had gone
-through a var-deref'd variadic overlay), and caching the resolved var cell per
-reference site (a name lookup was ~45ns/access).
-
-These rows were re-measured with `bench/testcheck.sh` and are **not comparable to
-the numbers published before it existed** — that harness wasn't kept, and this one
-warms up before timing, which warms the JVM's JIT far more than a single-shot
-measurement did. jolt's own times improved (`mix-64` 45→35ms,
-`(gen/vector gen/large-integer)` 1289→695ms); the JVM's improved more, so the
-ratios read higher than they used to.
-
-The residual gap is **machinery, not arithmetic**: the open-world generator
-deftype/protocol dispatch + rose-tree allocation can't be devirtualized without
-static types, and the raw 64-bit ops bottom out at the Chez bignum floor
-(~20× a native long, substrate-inherent). A native SplitMix C/FFI shim would give
-the PRNG ~27× but is the only path that needs C.
+Diagnostics kept out of the table because the JVM has no reference for them:
+`ffi_arenas.clj` (jolt.ffi), `image_refs.clj` (jolt.image) and `fibers/`.
+Run them from this directory with `../bin/jolt -Sdeps '{:paths ["."]}' -m <ns>`
+and compare exact base and candidate runs on one host.
 
 ## Running
 
 ```sh
-bench/run.sh                 # full suite + JVM scorecard
+bench/run.sh                 # full suite + the startup row, vs JVM Clojure
 bench/run.sh fib             # one benchmark, default size
 bench/run.sh fib 32          # one benchmark, custom size
+bench/run.sh startup         # the startup row alone
 NO_JVM=1 bench/run.sh        # jolt only (skip the JVM reference)
-MODE_A=1 bench/run.sh        # also time each bench as a plain release build
+MODE_A=1 bench/run.sh        # also time each bench as a plain `jolt build`
+JOLT_BIN=target/release/jolt bench/run.sh   # a built jolt instead of bin/jolt
 
-bench/testcheck.sh           # 64-bit arithmetic + test.check generators (run mode)
-NO_JVM=1 bench/testcheck.sh  # jolt only
+bench/testcheck.sh           # the run-mode rows (test.check, 64-bit arithmetic)
+bench/startup.sh             # startup vs babashka; COLD=1 adds cold-page-cache runs
+bench/startup-phases.sh      # boot / dispatch / compile / run attribution
+bench/scorecard.clj          # render this README from README.tmpl + the two logs
 ```
 
-Two build modes matter: **optimized** (`--direct-link --opt`, the default
-scorecard — inlining, scalar replacement, closed-world direct linking) and
-**release** (plain `jolt build`, what a default build ships — inference passes
-but no direct-link/inlining). `MODE_A=1` adds the release column so a
-release-mode win or regression is visible; it roughly doubles build time, so
-it's on demand.
-
-Needs Chez's kernel dev files (`libkernel.a` + `scheme.h`) and `cc` for the build,
-like `jolt build`; set `JOLT_CHEZ_CSV` to override the detected csv dir.
-
-## Startup / small-program latency
-
-`bench/run.sh` builds each benchmark to a binary and times the compute *inside*
-it, so it deliberately excludes `jolt`'s own startup. That fixed floor — boot the
-runtime + compiler image, then compile the program — is what dominates ys-style
-workloads: many short `jolt prog.clj` runs where the program itself runs for
-milliseconds. `bench/startup.sh` measures it, whole-process wall clock (best of N)
-for a built jolt against babashka on the same sources:
+**This file is generated.** The scorecard table comes from one sitting's logs:
 
 ```sh
-bench/startup.sh                          # default 7 reps
-REPS=15 bench/startup.sh                   # more reps
-JOLT_BIN=/path/to/jolt bench/startup.sh   # pick the binary
+JOLT_BIN=target/release/jolt bench/run.sh > run.log
+JOLT_BIN=target/release/jolt bench/testcheck.sh > tc.log
+jolt run bench/scorecard.clj run.log tc.log --measured "Measured <date> on <machine>: jolt <version>, OpenJDK <v>, Chez <v>. …"
 ```
 
-Three sizes: `version` (pure boot floor, no program), `trivial` (boot + compile +
-run a one-liner), `script` (a small lazy-seq pipeline). Use a BUILT jolt
-(`target/release/jolt` or an installed one), not the dev `bin/jolt` source
-launcher — the dev script boots from source and opts out of the AOT cache, so it
-is not representative. Indicative (M-series): ~117ms vs babashka ~18ms (~6.5×).
-The floor is runtime + compiler image instantiation that re-runs each boot (Chez
-has no heap snapshot); see the CLI-closure AOT work that removed the per-boot
-recompile of `jolt.main`.
+renders `bench/README.tmpl` (a Selmer template) into `bench/README.md`, sorted
+by ratio, and refuses a partial run — every bench in `run.sh --list` needs a row
+in the logs and a one-line description in the script. Edit the template, not
+this file. `COLD=1 bench/startup.sh` drops the binary from the page cache
+between reps with `bench/pagecache.clj` (`posix_fadvise` on Linux, `msync` on
+macOS, where the kernel only partly honours it; the resident bytes it prints
+beside each rep say how cold the run really was).
 
-`startup.sh` tells you the floor is there but not where it goes. `bench/startup-phases.sh`
-attributes a `jolt prog.clj` run to four phases so a change shows which one it moved:
+`run.sh` builds each benchmark to a binary because jolt's optimizing passes
+(direct linking, inlining, scalar replacement, whole-program inference) fire
+only in an AOT build — `jolt run -m` is unoptimized. The build needs Chez's
+kernel dev files (`libkernel.a` + `scheme.h`) and `cc`, like `jolt build`; set
+`JOLT_CHEZ_CSV` to override the detected csv dir. `testcheck.sh` needs the
+test.check jar in `~/.m2` (or network on first run) for both hosts. Use a
+BUILT jolt (`JOLT_BIN`) for anything startup-related — the dev `bin/jolt`
+launcher boots from source and is not what users run.
 
-```sh
-bench/startup-phases.sh                              # 7 reps, 400 defns, 30M-iter loop
-REPS=15 bench/startup-phases.sh                      # more reps
-DEFNS=800 LOOP=60000000 bench/startup-phases.sh      # heavier compile / run
-JOLT_BIN=/path/to/jolt bench/startup-phases.sh      # pick the binary
-```
+Do not run two jolt or `clojure` invocations in this directory at once: both
+write `.cpcache` here, and the loser reads a half-written classpath.
 
-`boot` is `jolt --version` (runtime + image load, `jolt.main` recompile).
-`dispatch` is the deps/project resolve + load-file setup a file run adds on top,
-measured against a `nil` file. `compile` is the delta of a compile-heavy,
-run-trivial program (many defns) over the `nil` file, and `run` is the delta of a
-run-heavy, compile-trivial program (one long loop). The phases are external
-subtractions, each isolating one cost by construction — honest approximations,
-not a strict partition, but directional: speed up the compiler and `compile`
-drops, speed up the runtime and `run` drops. Indicative (M-series): boot ~110ms,
-dispatch ~1ms, compile ~400ms for 400 defns, run ~120ms for a 30M-iter loop —
-compilation is the dominant per-program cost.
+## Gating
+
+**Against the previous release.** `ci/bench-gate.sh <baseline-jolt>
+<candidate-jolt> [max-ratio] [bench…]` builds every benchmark in
+`bench/run.sh --list`, plus `hello` for the `startup` row, with both compilers,
+times them alternately on one machine (min of 3 after a discarded warm-up) and
+fails above 1.40× candidate/baseline on any row. The release workflow runs it
+against the newest published release and `publish` needs it green. There is no
+millisecond threshold anywhere: a ratio between two binaries on one runner is
+the only shape of timing assertion this repository allows in a gate, because an
+absolute ceiling false-fails on a slow runner and passes on a fast one while
+hiding a real regression. A benchmark newer than the baseline release is
+skipped with a note, not failed. The threshold is deliberately loose — it is a
+gate, not a scorecard — and a flagged row is re-measured alone before anything
+is concluded about its size.
+
+**Inside one process.** `make test` carries the shape gates, each a ratio
+measured in one run so machine speed cancels: `readscaling`, `compilescaling`
+(1× vs 4× input, and quoted-vs-constructed forms), `applyscaling` (`apply`
+streams an unbounded rest — `(apply > (range))` must answer), `lazyscaling`
+(the same lazy workload before and after a thread has existed), `vecscaling`,
+`pipescaling`, `chunkscaling`, `printscaling`, `ioscaling`, `hotscaling` and
+`rrbscaling`. A row here says how fast; a gate there says the complexity class
+did not change.
+
+What 0.8.6's performance changes are covered by: `byte-arrays` (hinted
+`^bytes` stores), `sorted-build` (one tree walk per insert), `lazy-threads`
+(cells claimed by compare-and-swap, no mutex per cell), `apply-rest` (streamed
+rest, var roots that stream), `compile-forms` and `literals` (the constant
+pool keyed by form identity), `printing` (`format`), and `startup` (the boot
+image codecs and the LZ4 ceiling fallback).
 
 ## A/B against a change
 
-To measure a pass, run the suite on `main`, then on the branch, back to back
-(same machine, quiet). Each benchmark prints `runs: [...]` and `mean: N ms`;
-compare the means. A pass is worth landing when it moves a benchmark whose axis it
-targets, even if the ray tracer stays flat.
+Run the suite on `main`, then on the branch, back to back on a quiet machine,
+and compare the `mean:` lines; a pass is worth landing when it moves the row
+whose axis it targets. `bench/aba.sh` automates an A1/B/A2 over a fixed set of
+benches: it checks out the parent's compiler files, builds and times each bench
+against `HEAD`, then restores the working tree — A1≈A2 rules out drift, B vs A
+is the change.
 
-`bench/aba.sh` automates an A1/B/A2 over the six benches: it checks out the
-parent's compiler files (`host/chez/seed/image.ss` +
-`jolt-core/jolt/passes/types.clj`), builds and times each bench against `HEAD`,
-then restores the working tree. A1≈A2 rules out drift; B vs A is the change.
-
-### Dev mode, and why `aba.sh` cannot see it
-
-`bench/aba.sh` compiles each benchmark with `jolt build`, and a built binary's
-prologues are baked with tracing OFF. So it is **structurally blind** to anything
-that only exists on the `jolt run` / `-M:alias` path — which is where the
-tail-frame history lives, and where tracing is on by default.
-
-That blindness is not hypothetical. A per-call ring save/restore landed in v0.5.20
-costing up to **19×** on proven-numeric code, shipped in v0.5.20 and v0.6.0, and
-every AOT number above stayed flat throughout because built binaries never carried
-it. What surfaced it was an application getting slower, not a benchmark.
-
-`bench/aba-trace.sh` is the dev-mode A/B/A. Give it two already-built binaries
-(a compiler change needs `make remint`, so reminting between phases would dominate
-the wall clock):
-
-    bench/aba-trace.sh /tmp/jolt-A /tmp/jolt-B
-
-Its bench set deliberately spans BOTH shapes, because the original set was
-call-heavy only and that is precisely why the regression was invisible:
-
-| shape | benches | what it shows |
-|---|---|---|
-| call-heavy | `fib` `tak` `binary-trees` | the per-entry ring push — what tracing fundamentally costs |
-| numeric loops | `arrays` `mathfns` `loop-recur` `mandelbrot` | per-call-SITE work landing on code that had none, so it reads as a multiple rather than a percentage |
-
-Tracing is **not** free, and the cost is very uneven. Against `JOLT_TRACE=0` on the
-same binary: `fib` ~10× (6.9 vs 0.7 ms), `binary-trees` ~1.6×, while the numeric
-benches are within noise. Reach for `JOLT_TRACE=0` when timing a dev-mode run —
-and note it changes the emitted code, so give it its own `JOLT_CACHE_DIR` or you
-will time a mix of both modes.
+`aba.sh` compiles with `jolt build`, whose binaries are baked with tracing off,
+so it is structurally blind to anything that only exists on the `jolt run` /
+`-M:alias` path — where tail-frame tracing is on by default, and where a
+per-call ring save/restore once cost up to 19× on numeric code while every AOT
+number stayed flat. `bench/aba-trace.sh /tmp/jolt-A /tmp/jolt-B` is the
+dev-mode A/B/A over two already-built binaries; its bench set spans both
+call-heavy (`fib`, `tak`, `binary-trees`) and numeric-loop (`arrays`,
+`mathfns`, `loop-recur`, `mandelbrot`) shapes because the regression above was
+invisible to a call-heavy set alone. Tracing is not free and is uneven (`fib`
+~10×, numeric loops within noise); time a dev-mode run with `JOLT_TRACE=0` and
+give it its own `JOLT_CACHE_DIR`, since the flag changes the emitted code.

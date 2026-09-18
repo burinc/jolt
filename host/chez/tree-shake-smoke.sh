@@ -22,13 +22,22 @@ case "$jolt" in /*) joltabs="$jolt" ;; *) joltabs="$root/$jolt" ;; esac
 # don't need the examples repo, so they're wired into `make shakelocal` / ci. The
 # git-dep apps (markdown/malli/…) stay in the manual `make shakesmoke`.
 scope="${SHAKESMOKE_SCOPE:-all}"
+# Ceiling, in percent, on how much of the program a fixture's shake may KEEP.
+# Every local fixture is a hello-world-sized app whose reachable set is a thin
+# slice of the prelude — measured 239-242 of ~683 defs, ~35% — so 50% catches a
+# shake that ran but kept nearly everything while leaving room for the handful
+# of defs a fixture's own source adds. Per-case override: run_local_case's 6th
+# argument.
+shake_max_kept="${SHAKE_MAX_KEPT_PCT:-50}"
 examples="$root/../examples"
 [ -d "$examples" ] || examples="$HOME/src/jolt-lang/examples"
 if [ "$scope" != "local" ] && [ ! -d "$examples" ]; then echo "shake smoke: skipped (examples repo not found)"; exit 0; fi
 
 csv="$JOLT_CHEZ_CSV"
 if [ -z "$csv" ]; then
-  chez_bin="$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)"
+  # JOLT_CHEZ wins (see host/chez/selfcheck.sh) — else this can pair a
+  # PATH-resolved Chez's csv dir with a running interpreter built elsewhere.
+  chez_bin="${JOLT_CHEZ:-$(command -v chez || command -v chezscheme || command -v scheme || command -v petite || true)}"
   if [ -n "$chez_bin" ]; then
     base="$(cd "$(dirname "$chez_bin")/.." 2>/dev/null && pwd)"
     for d in "$base"/lib/csv*/*/; do [ -f "${d}libkernel.a" ] && csv="${d%/}" && break; done
@@ -47,10 +56,12 @@ run_case() {
   app="$examples/$1"; ns="$2"; args="$3"
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >/dev/null 2>&1; then
-    echo "  - $1: FAIL (default build)"; fail=1; return; fi
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >/dev/null 2>&1; then
-    echo "  - $1: FAIL (--tree-shake build)"; fail=1; return; fi
+  # the build's own output is kept, and shown on a failure: a "FAIL (default
+  # build)" with nothing under it once cost a CI round trip to see the reason
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >"$tmp/$1-plain-out" 2>&1; then
+    echo "  - $1: FAIL (default build)"; tail -5 "$tmp/$1-plain-out" | sed 's/^/      /'; fail=1; return; fi
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >"$tmp/$1-shake-out" 2>&1; then
+    echo "  - $1: FAIL (--tree-shake build)"; tail -5 "$tmp/$1-shake-out" | sed 's/^/      /'; fail=1; return; fi
   o0="$(cd "$app" && "$b0" $args 2>&1)"
   o1="$(cd "$app" && "$b1" $args 2>&1)"
   if [ "$o0" != "$o1" ]; then
@@ -63,21 +74,88 @@ run_case() {
   echo "  - $1: ok (output identical; $((s0/1024))K -> $((s1/1024))K)"
 }
 
-# Same as run_case but looked up under the local test/chez/ directory, with
-# an optional flat.ss def-pruning assertion: if ASSERT_MISSING is set, grep
-# the --tree-shake .build dir for a "ns/def" string and fail if found.
+# Same as run_case but looked up under the local test/chez/ directory, with two
+# further checks. ASSERT_MISSING ($4): grep the --tree-shake .build dir for a
+# string and fail if found — a def the shake must have pruned. EXPECT ($5):
+# "shake" (the default) requires the shaken build to report `tree-shake kept`
+# and fails on `tree-shake skipped`, printing the offenders jolt named; "bail"
+# is for a fixture that resolves vars at runtime on purpose (ns-publics-app),
+# whose point is that the keep-everything fallback still answers identically.
+# Without the EXPECT check a bail passes this gate silently: it keeps every def,
+# so the outputs match by construction — which is how a prelude change that
+# bailed every --tree-shake build (0.7.29 to 0.8.4) went unnoticed here.
 # (The .build dir is the binary's build artifacts, kept alongside the binary.)
+#
+# EXPECT also decides two quantitative checks, because "it shook" is not the same
+# claim as "it shook anything". A regression that shakes but keeps nearly every
+# def, or that stops dropping the compiler image, still prints `tree-shake kept`
+# and still matches the plain build's output:
+#   - kept fraction: at most $shake_max_kept percent of the defs, or the 6th
+#     argument when a fixture legitimately keeps more.
+#   - the compiler image: a shake that does NOT bail drops it, unless a compile
+#     ref outside the bail set keeps it (an image write, a bare :& binding --
+#     see dce.ss dce-compile-refs; no fixture here has one), and a bail always
+#     keeps it. An allowed def that evals still BAILS: the compiler image is
+#     direct-linked against the whole core and cannot run over a shaken one.
+#
+# EXPECT_OUT ($7): a fixed string the --tree-shake build's stdout must contain —
+# for a bailing fixture, the paste-ready :allow-dynamic hint naming exactly the
+# sites that remain, which is how the gate proves an allowed site next to a
+# non-allowed one is neither let through nor re-suggested.
 run_local_case() {
-  app="$root/test/chez/$1"; ns="$2"; args="$3"; assert_missing="$4"
+  app="$root/test/chez/$1"; ns="$2"; args="$3"; assert_missing="$4"; expect="${5:-shake}"
+  max_kept="${6:-$shake_max_kept}"; expect_out="${7:-}"
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
   bdir="$tmp/$1-shake.build"
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >/dev/null 2>&1; then
-    echo "  - $1: FAIL (default build)"; fail=1; return; fi
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake 2>"$tmp/$1-shake-err"; then
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >"$tmp/$1-plain-out" 2>&1; then
+    echo "  - $1: FAIL (default build)"; tail -5 "$tmp/$1-plain-out" | sed 's/^/      /'; fail=1; return; fi
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >"$tmp/$1-shake-out" 2>"$tmp/$1-shake-err"; then
     echo "  - $1: FAIL (--tree-shake build)"
     cat "$tmp/$1-shake-err" | head -5
     fail=1; return; fi
+  case "$expect" in
+    shake)
+      if grep -q '^jolt build: tree-shake skipped' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (tree-shake skipped; the fixture must shake)"
+        sed -n '/^jolt build: tree-shake skipped/,/^jolt build: compiling/p' "$tmp/$1-shake-out" | grep -v '^jolt build: compiling' | head -8
+        fail=1; return
+      fi
+      if ! grep -q '^jolt build: tree-shake kept ' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (no 'tree-shake kept' report in the --tree-shake build output)"
+        fail=1; return
+      fi
+      counts="$(sed -n 's/^jolt build: tree-shake kept \([0-9]*\) of \([0-9]*\) defs.*/\1 \2/p' "$tmp/$1-shake-out" | head -1)"
+      kept_n="${counts%% *}"; kept_m="${counts##* }"
+      if [ -z "$kept_n" ] || [ -z "$kept_m" ] || [ "$kept_m" = 0 ]; then
+        echo "  - $1: FAIL (could not read the kept/total counts off the tree-shake report)"
+        fail=1; return
+      fi
+      kept_pct=$(( kept_n * 100 / kept_m ))
+      if [ "$kept_pct" -gt "$max_kept" ]; then
+        echo "  - $1: FAIL (tree-shake kept $kept_n of $kept_m defs, ${kept_pct}% > the ${max_kept}% ceiling)"
+        fail=1; return
+      fi
+      if ! grep -q '^jolt build: dropping compiler image' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (the shake ran but the binary kept the compiler image)"
+        fail=1; return
+      fi ;;
+    bail)
+      if ! grep -q '^jolt build: tree-shake skipped' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (expected the keep-everything bail; the shake ran)"
+        fail=1; return
+      fi
+      if grep -q '^jolt build: dropping compiler image' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (a bailed build must keep the compiler image)"
+        fail=1; return
+      fi ;;
+    *) echo "  - $1: FAIL (unknown EXPECT '$expect')"; fail=1; return ;;
+  esac
+  if [ -n "$expect_out" ] && ! grep -qF -- "$expect_out" "$tmp/$1-shake-out"; then
+    echo "  - $1: FAIL (the --tree-shake build output lacks: $expect_out)"
+    sed -n '/^jolt build: tree-shake skipped/,/^jolt build: compiling/p' "$tmp/$1-shake-out" | grep -v '^jolt build: compiling' | head -8
+    fail=1; return
+  fi
   o0="$(cd "$app" && "$b0" $args 2>&1)"
   o1="$(cd "$app" && "$b1" $args 2>&1)"
   if [ "$o0" != "$o1" ]; then
@@ -86,13 +164,18 @@ run_local_case() {
     echo "    --- shake -----"; echo "$o1" | head -5
     fail=1; return
   fi
-  # Check that a def that should be pruned is indeed absent from the shaken flat.ss
+  # Check that a def that should be pruned is indeed absent from the shaken
+  # build. A core def lives in the runtime unit (runtime.ss) and an app def in
+  # flat.ss, so look in both — a grep over flat.ss alone passes for a core def
+  # whatever the shake did.
   if [ -n "$assert_missing" ]; then
     blddir="$tmp/$1-shake.build"
-    if [ -f "$blddir/flat.ss" ] && grep -q "$assert_missing" "$blddir/flat.ss" 2>/dev/null; then
-      echo "  - $1: FAIL (pruned def '$assert_missing' found in shaken flat.ss)"
-      fail=1; return
-    fi
+    for f in "$blddir/flat.ss" "$blddir/runtime.ss"; do
+      if [ -f "$f" ] && grep -q "$assert_missing" "$f" 2>/dev/null; then
+        echo "  - $1: FAIL (pruned def '$assert_missing' found in shaken $(basename "$f"))"
+        fail=1; return
+      fi
+    done
   fi
   s0="$(wc -c < "$b0")"; s1="$(wc -c < "$b1")"
   echo "  - $1: ok (output identical; $((s0/1024))K -> $((s1/1024))K)"
@@ -111,10 +194,15 @@ fi
 
 # Tree-shake correctness fixtures: apps whose output IDENTICAL default vs --tree-shake
 # verifies the fixes in jolt-2f87. The defonce-app additionally asserts a never-referenced
-# def ("app.core/dead") is absent from the shaken output.
+# def ("app.core/dead") is absent from the shaken output. The pattern names the var
+# without its def form: app defs are emitted as def-var-with-meta!, and a pattern
+# pinned to def-var! matched nothing, so the assertion passed against an unshaken
+# flat.ss for as long as the emitter has carried metadata.
+# ns-publics-app is the one fixture that must BAIL: it enumerates its namespace at
+# runtime, which the static graph cannot follow.
 echo "shake smoke: correctness fixtures (ns-publics, defonce, data-readers)"
-run_local_case ns-publics-app   app.core  ""   ""
-run_local_case defonce-app      app.core  ""   "def-var! \"app.core\" \"dead\""
+run_local_case ns-publics-app   app.core  ""   ""   bail
+run_local_case defonce-app      app.core  ""   "\"app.core\" \"dead\""
 run_local_case datareader-app   app.core  ""   ""
 # data-reader literal rewriting: a #tag whose reader returns a FORM must splice
 # identically under a plain and a --tree-shake build (the tree-shake path once
@@ -131,6 +219,72 @@ run_local_case multipath-app    app.core  "alt"  ""
 # duplicate-fqn regression: a twice-defined var whose first def references a
 # helper referenced nowhere else — the union (not overwrite) keeps the helper alive.
 run_local_case dupfqn-app      app.core  ""     ""
+# spliced-callee regression (#882): a private helper that calls `resolve` and is
+# reachable only through the copies the inline pass made of it. It is KEPT (an
+# inlined frame still names ns/file:line) but is not reachable code, so it must
+# not bail the shake — core.async's go-macro walkers have exactly this shape, and
+# rooting them kept every def and the compiler image in any app that merely
+# loaded core.async. Bails against the pre-#882 dce.ss. app.core/walk-body is the
+# unreachable caller the helpers were spliced into, so it must be pruned.
+run_local_case spliced-resolve-app app.core "" "\"app.core\" \"walk-body\""
+# deps.edn :jolt/tree-shake {:allow-dynamic […]}: two reachable dynamic callers
+# on paths -main never takes — the app's own `res` (spec.alpha/res's shape, a
+# `resolve`) and a :local/root library's `dynaload` behind a delay (spec.gen's
+# shape, whole: a `require` of a COMPUTED name, then a `resolve`). The app's
+# deps.edn vouches for the first, the LIBRARY's for the second, and the union
+# lets the shake run: `dead` is pruned and the compiler image dropped. Bails
+# against a jolt that does not read the key, and against 0.8.7, whose vouch
+# covered the resolve but not the computed require — the shape every spec app
+# has. Both callers are ^:redef so the inline pass leaves them as the defs the
+# bail names.
+run_local_case allow-dynamic-app app.core "" "\"app.core\" \"dead\""
+# …and the same app with one more reachable caller nothing vouches for must
+# still bail, with the hint naming that caller alone — proof the allowed sites
+# were honoured (neither is listed) and the non-allowed one was not let through.
+run_local_case allow-dynamic-partial-app app.core "" "" bail "" \
+  ':jolt/tree-shake {:allow-dynamic [app.core/lookup]}'
+# …and :allow-dynamic vouches for a RESOLUTION only: an allowed def that EVALS
+# still bails, naming the eval and offering no allow entry for it, because the
+# compiler image is direct-linked against the whole core and cannot run over a
+# shaken one. It used to shake (and drop the compiler), and the eval died.
+run_local_case allow-dynamic-eval-app app.core "" "" bail "" \
+  "  app.core/compute -> clojure.core/eval"
+
+# …and a WRONG vouch fails by name. allow-dynamic-wrong-app vouches for a
+# dynaload whose computed require RUNS at -main and names a namespace the build
+# never baked, with its source on the roots. The vouch lets every build drop
+# the compiler -- the DEFAULT build too, since the verdict runs on every build,
+# which is why this is the plain build and not --tree-shake -- and the loader
+# then has source to compile and no compiler. It must refuse naming the file
+# and the vouch, not die on the first unbound compiler variable it touches.
+wrong="$root/test/chez/allow-dynamic-wrong-app"
+if [ -d "$wrong" ]; then
+  wb="$tmp/allow-dynamic-wrong-plain"
+  if ! JOLT_PWD="$wrong" "$jolt" build -m app.core -o "$wb" >"$tmp/wrong-out" 2>&1; then
+    echo "  - allow-dynamic-wrong-app: FAIL (default build)"; tail -5 "$tmp/wrong-out" | sed 's/^/      /'; fail=1
+  elif ! grep -q '^jolt build: dropping compiler image' "$tmp/wrong-out"; then
+    echo "  - allow-dynamic-wrong-app: FAIL (the vouched build kept the compiler; the fixture must drop it)"; fail=1
+  else
+    wo="$(cd "$wrong" && "$wb" 2>&1)"; wrc=$?
+    if [ "$wrc" = 0 ]; then
+      echo "  - allow-dynamic-wrong-app: FAIL (a run that compiles source without a compiler exited 0)"
+      echo "$wo" | head -5 | sed 's/^/      /'; fail=1
+    elif ! echo "$wo" | grep -q 'this build has no compiler; cannot load [./]*src/plugin/core\.clj from source'; then
+      echo "  - allow-dynamic-wrong-app: FAIL (the refusal does not name the file and the missing compiler)"
+      echo "$wo" | head -8 | sed 's/^/      /'; fail=1
+    elif ! echo "$wo" | grep -q ':allow-dynamic'; then
+      echo "  - allow-dynamic-wrong-app: FAIL (the refusal does not point at the vouch)"
+      echo "$wo" | head -8 | sed 's/^/      /'; fail=1
+    elif echo "$wo" | grep -q 'is not bound'; then
+      echo "  - allow-dynamic-wrong-app: FAIL (a raw unbound-variable error reached the report)"
+      echo "$wo" | head -8 | sed 's/^/      /'; fail=1
+    else
+      echo "  - allow-dynamic-wrong-app: ok (the wrong vouch is refused by name)"
+    fi
+  fi
+else
+  echo "  - allow-dynamic-wrong-app: skipped (not present)"
+fi
 
 [ "$fail" = 0 ] && echo "shake smoke: passed" || echo "shake smoke: FAILED"
 exit $fail

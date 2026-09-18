@@ -34,6 +34,18 @@
 (load bs-seed-image)
 (load "host/chez/compile-eval.ss")
 (load "host/chez/emit-image.ss")
+;; Mint DIRECT-LINKED: a core def binds jv$<fqn> and a core->core call applies
+;; it (backend set-direct-link!), bound through def-var-linked! so the var stays
+;; redefinable (set-seed-mint!; see rt.ss var-root-set!). The host contract's own
+;; direct-link flag stays off, so the inline pass splices nothing into core.
+;; Guarded for the first pass off an older seed, whose compiler has no
+;; set-seed-mint!: pass 1 then mints the var-routed shape with the new
+;; compiler, pass 2 — running that seed — mints the linked one, pass 3 converges.
+(let ((sdl (var-deref "jolt.backend-scheme" "set-direct-link!"))
+      (ssm (var-deref "jolt.backend-scheme" "set-seed-mint!"))
+      (rst (var-deref "jolt.backend-scheme" "direct-link-reset!")))
+  (when (and (procedure? sdl) (procedure? ssm) (procedure? rst))
+    (rst) (ssm #t) (sdl #t)))
 
 ;; Rebuild both artifacts from source ON CHEZ and write them out. Any overlay/
 ;; compiler form that fails to compile is skipped (guarded) so a partial build

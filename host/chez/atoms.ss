@@ -14,14 +14,27 @@
 ;; watches is an alist of (key . watch-fn); validator is a jolt fn or jolt-nil.
 ;; The peripheral ops + the notify/validate behaviour live natively here, and
 ;; post-prelude.ss re-asserts them over the overlay's def-var!.
-;; `lock` is a per-atom mutex guarding the read-modify-write critical sections,
-;; so swap!/reset!/compare-and-set! are atomic under real OS threads
-;; (futures/go blocks share the heap). The user fn in swap! runs OUTSIDE the lock
-;; (a CAS retry loop, like the JVM) so it never deadlocks on re-entrant access and
-;; a watch/validator can deref the same atom.
+;; Every state transition is a compare-and-swap on the val field
+;; (sa-record-cas!), the JVM's AtomicReference shape: swap! computes outside
+;; any lock and commits by CAS, retrying when another thread moved the value,
+;; and reset!/compare-and-set!/the -vals! pair are the same CAS. The watches
+;; field moves by CAS too. Nothing here takes a mutex: the per-atom mutex that
+;; used to guard these was a malloc'd pthread mutex and a guardian per atom
+;; (101 ns to make one, 64 ns to reset! through it against 7 to deref) and,
+;; on a program that wraps every node of a tree in an atom, the collector's
+;; largest population of foreign objects. `lock` stays in the layout — the
+;; record is image surface (jolt-atom-v3) — and holds #f; an atom restored from
+;; an older image carries its dead mutex there, which nothing reads.
+;;
+;; The release fence before a CAS orders the new value's contents ahead of the
+;; pointer that publishes it, so a reader that sees the pointer sees the
+;; object; a reader's own loads are dependent and need nothing (the lock
+;; version never fenced a deref either).
 (define-record-type jolt-atom
   (fields (mutable val) (mutable watches) (mutable validator) lock)
   (nongenerative jolt-atom-v3))
+(define jolt-atom-val-slot 0)
+(define jolt-atom-watches-slot 1)
 
 ;; a rejected reference value is IllegalStateException, like ARef.validate.
 (define (jolt-iref-state-throw)
@@ -34,7 +47,7 @@
   (let loop ((o opts) (validator jolt-nil) (m #f))
     (cond
       ((or (null? o) (null? (cdr o)))
-       (let ((a (make-jolt-atom v '() validator (make-mutex))))
+       (let ((a (make-jolt-atom v '() validator #f)))
          (jolt-atom-validate a v)
          (when (and m (not (jolt-nil? m)))
            (unless (jolt-map? m)
@@ -79,45 +92,73 @@
   (cond
     ((jolt-atom? x) (jolt-atom-val x))
     ((jolt-reduced? x) (jolt-reduced-val x))
-    (else (throw-jvm (quote ClassCastException) (string-append "deref: unsupported reference type " (jolt-final-str x))))))
+    ;; the reference's last resort is a Future cast: nil is a NullPointerException
+    (else (jolt-cast-throw x "java.util.concurrent.Future"))))
 
 ;; CAS the val from `old` to `nv` by identity (eq?), atomically. Returns #t on
-;; success. The compute step (f) runs outside this, so we re-check under the lock.
+;; success. The compute step (f) runs outside this; a loser recomputes.
 (define (jolt-atom-cas! a old nv)
-  (jolt-with-mutex (jolt-atom-lock a)
-    (if (eq? (jolt-atom-val a) old)
-        (begin (jolt-atom-val-set! a nv) #t)
-        #f)))
+  (when jolt-mt? (memory-order-release))
+  (sa-record-cas! a jolt-atom-val-slot old nv))
+;; Unconditional exchange (AtomicReference.getAndSet): the old value.
+(define (jolt-atom-exchange! a v)
+  (let retry ()
+    (let ((o (jolt-atom-val a)))
+      (if (jolt-atom-cas! a o v) o (retry)))))
 
 ;; (swap! a f arg*): JVM-style CAS loop — read, compute f OUTSIDE the lock, then
 ;; atomically compare-and-set; retry if another thread changed it. Validate the
 ;; new value before storing, notify watches after.
-(define (jolt-swap! a f . args)
-  (jolt-need-atom a)
-  (let retry ()
-    (let* ((old (jolt-atom-val a))
-           (nv (apply jolt-invoke f old args)))
-      (jolt-atom-validate a nv)
-      (if (jolt-atom-cas! a old nv)
-          (begin (jolt-atom-notify a old nv) nv)
-          (retry)))))
+;; Validate, CAS and notify — the half of swap! that does not depend on how the
+;; new value was computed. #f means the CAS lost and the caller must retry; the
+;; caller returns the new value itself, so a #f new value is not ambiguous here.
+(define (jolt-swap-commit! a old nv)
+  (jolt-atom-validate a nv)
+  (and (jolt-atom-cas! a old nv)
+       (begin (jolt-atom-notify a old nv) #t)))
+
+;; `(swap! a f)`, `(swap! a f x)` and `(swap! a f x y)` are almost every swap! a
+;; program writes — (swap! n inc), (swap! m assoc k v), (swap! v conj x) — and a
+;; single `. args` signature charged each of them a rest-arg list plus an `apply`
+;; to call f. The fixed clauses allocate nothing and call f directly. The retry
+;; loop is spelled out per clause rather than shared through a thunk: a thunk
+;; would trade the rest-arg list for a closure and give the fixed arities back
+;; what they came for. The variadic clause is the original body.
+(define jolt-swap!
+  (case-lambda
+    ((a f)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke1 f old)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))
+    ((a f x)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke2 f old x)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))
+    ((a f x y)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke3 f old x y)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))
+    ((a f . args)
+     (jolt-need-atom a)
+     (let retry ()
+       (let* ((old (jolt-atom-val a)) (nv (apply jolt-invoke f old args)))
+         (if (jolt-swap-commit! a old nv) nv (retry)))))))
 
 (define (jolt-reset! a v)
   (jolt-need-atom a)
   (jolt-atom-validate a v)
-  (let ((old (jolt-with-mutex (jolt-atom-lock a)
-               (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))
+  (let ((old (jolt-atom-exchange! a v)))
     (jolt-atom-notify a old v)
     v))
 
-;; compare-and-set! keeps jolt= (value) semantics, done atomically under the lock.
+;; compare-and-set! is the CAS helper with the JVM's identity comparison.
 (define (jolt-compare-and-set! a oldv newv)
   (jolt-need-atom a)
   (jolt-atom-validate a newv)
-  (let ((swapped (jolt-with-mutex (jolt-atom-lock a)
-                   (if (jolt= (jolt-atom-val a) oldv)
-                       (begin (jolt-atom-val-set! a newv) #t)
-                       #f))))
+  (let ((swapped (jolt-atom-cas! a oldv newv)))
     (when swapped (jolt-atom-notify a oldv newv))
     swapped))
 
@@ -134,8 +175,7 @@
 (define (jolt-reset-vals! a v)
   (jolt-need-atom a)
   (jolt-atom-validate a v)
-  (let ((old (jolt-with-mutex (jolt-atom-lock a)
-               (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))
+  (let ((old (jolt-atom-exchange! a v)))
     (jolt-atom-notify a old v)
     (jolt-vector old v)))
 
@@ -210,11 +250,17 @@
 ;; new value from the old, so there is nothing to lose.
 (define (jolt-watch-add alist key f)
   (cons (cons key f) (remp (lambda (kv) (jolt=2 (car kv) key)) alist)))
+;; The watch alist moves by CAS like the value: two threads adding at once
+;; both land (a loser recomputes from the winner's list), which the mutex
+;; guaranteed and a plain set! would not.
+(define (jolt-atom-watches-update! a f)
+  (let retry ()
+    (let* ((ws (jolt-atom-watches a)) (nws (f ws)))
+      (unless (sa-record-cas! a jolt-atom-watches-slot ws nws) (retry)))))
 (define (jolt-add-watch a key f)
   (cond
     ((jolt-atom? a)
-     (jolt-with-mutex (jolt-atom-lock a)
-       (jolt-atom-watches-set! a (jolt-watch-add (jolt-atom-watches a) key f)))
+     (jolt-atom-watches-update! a (lambda (ws) (jolt-watch-add ws key f)))
      a)
     ((iref? a)
      (jolt-with-mutex iref-tbl-mu
@@ -226,9 +272,7 @@
 (define (jolt-remove-watch a key)
   (cond
     ((jolt-atom? a)
-     (jolt-with-mutex (jolt-atom-lock a)
-       (jolt-atom-watches-set! a
-         (remp (lambda (kv) (jolt=2 (car kv) key)) (jolt-atom-watches a))))
+     (jolt-atom-watches-update! a (lambda (ws) (remp (lambda (kv) (jolt=2 (car kv) key)) ws)))
      a)
     ((iref? a)
      (jolt-with-mutex iref-tbl-mu
@@ -255,6 +299,48 @@
   (cond ((jolt-atom? a) (jolt-atom-validator a))
         ((iref? a) (iref-validator-of a))
         (else jolt-nil)))
+
+;; The rest of the ARef surface, which only the java interop layer reaches:
+;; records-dispatch.ss's rd-iref-method answers .getWatches and .notifyWatches
+;; with these. clojure.core has no fn for either — add-watch/remove-watch are the
+;; only public door — so they exist for the METHOD arm alone, and they live here
+;; beside the seam they read rather than in the java layer because both hosts
+;; share this file and neither shares that one.
+;;
+;; jolt-iref-watchable? is that arm's receiver guard: the four watchable
+;; reference types (atom / var / ref / agent) and nothing else, so a receiver
+;; that merely spells a method the same way keeps its own dispatch. It has to
+;; ASK on every call rather than close over a fixed answer: iref? walks the arm
+;; registry, and the agent arm is not registered until java/concurrency.ss loads,
+;; long after this file.
+(define (jolt-iref-watchable? r) (or (jolt-atom? r) (iref? r)))
+
+;; ARef.getWatches is an IPersistentMap, so an unwatched reference reads {} and
+;; not nil. Both alists are reverse-built (jolt-watch-add conses), and this walk
+;; front-to-back prepending key and fn undoes that — a seq over the map is not
+;; ordered anyway, but the flat kv list going in matches add order, which is the
+;; order notifyWatches uses.
+(define (jolt-get-watches r)
+  (let ((alist (cond ((jolt-atom? r) (jolt-atom-watches r))
+                     ((iref? r) (iref-watches-of r))
+                     (else (throw-jvm (quote ClassCastException)
+                                      "getWatches: not a watchable reference")))))
+    (let loop ((as alist) (kvs (quote ())))
+      (if (null? as)
+          (jolt-hash-map-build kvs)
+          (loop (cdr as) (cons (caar as) (cons (cdar as) kvs)))))))
+
+;; ARef.notifyWatches(old, new) is void and fires the watches WITHOUT touching
+;; the value — the JVM lets a subclass drive notification at its own mutation
+;; points, and jolt's ref types do exactly that (refs at commit, vars at root
+;; set). An atom keeps its watches in a record slot, every other reference type
+;; in the side table, so the two notifiers stay separate here as they do there.
+(define (jolt-notify-watches r old new)
+  (cond ((jolt-atom? r) (jolt-atom-notify r old new))
+        ((iref? r) (iref-notify r old new))
+        (else (throw-jvm (quote ClassCastException)
+                         "notifyWatches: not a watchable reference")))
+  jolt-nil)
 
 ;; vars are watchable IRefs: a root change (def / var-set on the root /
 ;; alter-var-root) validates and notifies like Var.bindRoot. The def-var! wrap

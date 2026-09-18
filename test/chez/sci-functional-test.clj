@@ -1,0 +1,335 @@
+;; Functional SCI gate: the source-loading gate proves broad compatibility,
+;; while this file proves that the supported dependency path yields usable,
+;; persistent SCI contexts.
+(ns sci-functional-test
+  (:require [sci.core :as sci]
+            [sci.impl.types]))
+
+(defn- check= [label expected actual]
+  (when-not (= expected actual)
+    (throw (ex-info (str label ": expected " (pr-str expected)
+                         ", got " (pr-str actual))
+                    {:label label :expected expected :actual actual}))))
+
+(let [ctx (sci/init {})]
+  (check= "basic evaluation" 3
+          (sci/eval-string* ctx "(+ 1 2)"))
+
+  (sci/eval-string* ctx "(def x 41)")
+  (check= "definitions persist" 42
+          (sci/eval-string* ctx "(+ x 1)"))
+
+  (sci/eval-string* ctx "(defn twice [n] (* n 2))")
+  (check= "defined functions persist" 42
+          (sci/eval-string* ctx "(twice 21)"))
+  (check= "closures evaluate" 42
+          (sci/eval-string* ctx "((let [n 40] (fn [x] (+ n x))) 2)"))
+  (check= "collection operations evaluate" {:a 2 :b 3}
+          (sci/eval-string* ctx "(update {:a 1 :b 3} :a inc)"))
+  (check= "lazy sequences realize with vec" [1 2 3 4]
+          (sci/eval-string* ctx "(vec (map inc (range 4)))"))
+
+  (sci/eval-string* ctx "(def y (twice x))")
+  (check= "successive evaluations share context state" 82
+          (sci/eval-string* ctx "y")))
+
+(let [a (sci/init {})
+      b (sci/init {})]
+  (sci/eval-string* a "(def isolated 7)")
+  (check= "first independent context retains its definition" 7
+          (sci/eval-string* a "isolated"))
+  (check= "independent contexts do not share definitions" :missing
+          (try
+            (sci/eval-string* b "isolated")
+            :shared
+            (catch Throwable _ :missing))))
+
+;; Java interop inside interpreted code. SCI resolves every method call through
+;; clojure.lang.Reflector (getMethods → its own matching → Method.invoke), so a
+;; library jolt runs through SCI rather than compiling — an extension, a
+;; dependency — cannot touch a host class without these. Static calls, instance
+;; calls and constructors are three distinct lookups; each is exercised where
+;; the REFLECTOR is what resolves it, and so is a class whose methods jolt
+;; models as a cond over the receiver (String) rather than as enumerable data.
+(let [ctx (sci/init {:classes {'java.lang.System java.lang.System
+                               'java.lang.Integer java.lang.Integer
+                               'java.lang.Math java.lang.Math
+                               'java.lang.Character java.lang.Character
+                               'java.io.File java.io.File
+                               'java.net.URI java.net.URI
+                               'java.util.ArrayList java.util.ArrayList}
+                     :imports {'System 'java.lang.System
+                               'Integer 'java.lang.Integer
+                               'Character 'java.lang.Character
+                               'Math 'java.lang.Math
+                               'File 'java.io.File
+                               'URI 'java.net.URI
+                               'ArrayList 'java.util.ArrayList}})]
+  (check= "static method, no args" true
+          (pos? (sci/eval-string* ctx "(System/currentTimeMillis)")))
+  (check= "static method, one arg" (System/getenv "HOME")
+          (sci/eval-string* ctx "(System/getenv \"HOME\")"))
+  (check= "static method, two args" (System/getProperty "os.name" "?")
+          (sci/eval-string* ctx "(System/getProperty \"os.name\" \"?\")"))
+  (check= "static returning a primitive" 42
+          (sci/eval-string* ctx "(Integer/parseInt \"42\")"))
+  (check= "static returning a boolean" false
+          (sci/eval-string* ctx "(Character/isWhitespace \\a)"))
+  (check= "static method on a class modeled as a cond" 2
+          (sci/eval-string* ctx "(Math/round 1.6)"))
+  (check= "constructor" "b.txt"
+          (sci/eval-string* ctx "(.getName (File. \"/a/b.txt\"))"))
+  (check= "instance method on a host object" "https"
+          (sci/eval-string* ctx "(.getScheme (URI. \"https://x.dev\"))"))
+  (check= "instance method on a native string" 2
+          (sci/eval-string* ctx "(.indexOf \"abcdef\" \"cd\")"))
+  (check= "instance method with a marshalled argument" "cdef"
+          (sci/eval-string* ctx "(.substring \"abcdef\" 2)"))
+  (check= "instance method after a mutating call" 1
+          (sci/eval-string* ctx "(let [l (ArrayList.)] (.add l \"x\") (.size l))"))
+  (check= "an unknown method surfaces with the method named" :threw
+          (try
+            (sci/eval-string* ctx "(.noSuchMethod (File. \"/a\"))")
+            :no-throw
+            (catch Throwable e
+              (if (re-find #"noSuchMethod" (ex-message e)) :threw :wrong-message)))))
+
+
+;; Arrays. SCI's aset on a primitive array is clojure.lang.RT/aset (its own aset*
+;; reflects there for a primitive component type), its 2-argument get is
+;; RT/get in newer releases, and its fn adapters cast through RT/longCast: the
+;; clojure.lang.RT value statics are what interpreted code compiles to. jolt had
+;; none of that family, so (aset ^longs a i v) inside SCI died with "No matching
+;; field or method: clojure.lang.RT/aset" (jolt-fn00).
+(let [ctx (sci/init {})]
+  (check= "aset on a long array inside SCI" 5
+          (sci/eval-string* ctx "(let [a (long-array 2)] (aset a 0 5) (aget a 0))"))
+  (check= "aset on a double array inside SCI" 2.5
+          (sci/eval-string* ctx "(let [a (double-array 2)] (aset a 1 2.5) (aget a 1))"))
+  (check= "aset on an object array inside SCI" :x
+          (sci/eval-string* ctx "(let [a (object-array 2)] (aset a 0 :x) (aget a 0))"))
+  (check= "RT/get and RT/aset by name, as an interpreted call site reaches them" [1 :nf 7]
+          (sci/eval-string* (sci/init {:classes {'clojure.lang.RT clojure.lang.RT}})
+            "[(clojure.lang.RT/get {:a 1} :a) (clojure.lang.RT/get {} :a :nf) (let [a (long-array 1)] (clojure.lang.RT/aset a 0 7) (aget a 0))]")))
+
+;; Type-hinted interop. SCI resolves a ^Hint to a Class at ANALYSIS time and
+;; asks that Class whether it is a functional interface to adapt
+;; (sci.impl.analyzer/resolve-tag-class -> reflector/maybe-fi-method ->
+;; .isAnnotationPresent). jolt answered that question by looking for a STATIC of
+;; the hinted class, so a hinted instance call could not be analyzed at all — it
+;; died with RFC 0014's "No dependency provides java.lang.StringBuilder" for a
+;; class jolt fully supplies, and an extension carrying one ^StringBuilder loop
+;; would not load (jolt#983). The unhinted call worked, which is what made it
+;; look like a missing class rather than a missing Class method.
+(defn- hinted-ctx []
+  (let [ctx (sci/init {:classes {:allow :all}})]
+    (sci/add-class! ctx 'java.lang.StringBuilder java.lang.StringBuilder)
+    (sci/add-class! ctx 'StringBuilder java.lang.StringBuilder)
+    ctx))
+
+(check= "hinted instance method" "x"
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [^StringBuilder sb] (.append sb \"x\")) (str (f (StringBuilder.)))"))
+(check= "hinted zero-arg instance method" 3
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [^StringBuilder sb] (.length sb)) (f (StringBuilder. \"abc\"))"))
+(check= "fully-qualified hint" "y"
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [^java.lang.StringBuilder sb] (.append sb \"y\")) (str (f (StringBuilder.)))"))
+(check= "hinted loop binding" "012"
+        (sci/eval-string* (hinted-ctx)
+          "(loop [i 0 ^StringBuilder sb (StringBuilder.)] (if (< i 3) (recur (inc i) (.append sb i)) (str sb)))"))
+(check= "unhinted call still dispatches dynamically" "x"
+        (sci/eval-string* (hinted-ctx)
+          "(defn f [sb] (.append sb \"x\")) (str (f (StringBuilder.)))"))
+
+
+;; A value with its own value-semantics seam (java.time) as an interop ARGUMENT.
+;; sci.impl.reflector/box-arg casts every argument to its reflected parameter
+;; type, and jolt — carrying no signatures — reports every parameter as
+;; java.lang.Object, so an argument only survives the call if
+;; (.cast java.lang.Object v) is the identity. It was not for java.time values:
+;; their instance? arm answered a definitive false for the root type and the
+;; cast threw ClassCastException, so any interpreted call taking one died (#985).
+;; Receivers are not boxed, which is why (.getYear d) worked all along and only
+;; arguments failed.
+(let [ctx (sci/init {:classes {'java.time.LocalDate java.time.LocalDate
+                               'java.time.Duration java.time.Duration
+                               'java.lang.Object java.lang.Object}
+                     :imports {'LocalDate 'java.time.LocalDate
+                               'Duration 'java.time.Duration}})]
+  (check= "java.time value as an instance-method argument" true
+          (sci/eval-string* ctx "(.isAfter (LocalDate/of 2021 1 1) (LocalDate/of 2020 1 1))"))
+  (check= "java.time values as static-method arguments" "PT24H"
+          (sci/eval-string* ctx "(str (Duration/between (LocalDate/of 2020 1 1) (LocalDate/of 2020 1 2)))"))
+  (check= "a java.time value is an Object" true
+          (sci/eval-string* ctx "(instance? java.lang.Object (LocalDate/of 2020 3 5))")))
+
+
+
+
+;; A host protocol shared into an SCI context, implemented from inside it.
+;;
+;; SCI has one model of a protocol: a map {:methods #{multimethod ..} :ns
+;; <sci namespace>} whose methods are multimethods dispatching on
+;; sci.impl.types/type-impl, which is what its defrecord/deftype/extend-type
+;; register into (a defmethod per method). A host protocol var copied in as-is
+;; (sci/copy-var*) is not that shape on ANY host — jolt's map has no :ns and its
+;; methods are plain fns; the JVM's has no :ns either and a :var SCI cannot
+;; alter-var-root — so a record implementing it dies in analysis (jolt#1000).
+;; The embedder shares a host protocol the way babashka shares
+;; clojure.core.protocols: one multimethod per method whose :default answers
+;; through the host protocol, a SCI-side protocol map naming them, and — for the
+;; other direction, a host caller handed a value SCI built — the host protocol
+;; extended to SCI's record and type classes, routing back through the
+;; multimethods. This is that recipe, run end to end on jolt.
+(defprotocol Shape
+  (area [this])
+  (scaled [this k]))
+(defrecord HostSquare [s]
+  Shape
+  (area [_] (* s s))
+  (scaled [_ k] (->HostSquare (* s k))))
+
+;; SCI-side methods: dispatch on SCI's notion of a value's type; a value SCI did
+;; not build (a host record, a string) falls to the host protocol.
+(defmulti sci-area sci.impl.types/type-impl)
+(defmulti sci-scaled sci.impl.types/type-impl)
+(defmethod sci-area :default [x] (area x))
+(defmethod sci-scaled :default [x k] (scaled x k))
+
+;; The value copied in AS-IS, the way an embedder written against babashka (whose
+;; defprotocol is SCI's) shares every var, is refused at SCI's own seams — and
+;; with the reference's words, since the refusal is a protocol miss in jolt's
+;; dispatcher: SCI alter-var-roots the protocol's :var through its IVar protocol
+;; and names the method namespace through HasName, and a host var and a missing
+;; :ns answer neither. These pin the shape (jolt#1006): the recipe below is the
+;; supported path, and a vendored SCI that starts mirroring host protocols
+;; itself will show up here as the rows going green.
+(let [host-ns (sci/create-ns 'raw)
+      ctx (sci/init {:classes {:allow :all}
+                     :namespaces {'raw {'Shape (sci/copy-var* #'Shape host-ns)
+                                        'area (sci/copy-var* #'area host-ns)
+                                        'scaled (sci/copy-var* #'scaled host-ns)}}})
+      failing (fn [src]
+                (try (sci/eval-string* ctx src) :evaluated
+                     (catch IllegalArgumentException e (ex-message e))))]
+  (check= "defrecord over a host protocol copied as-is dies where the JVM does"
+          "No implementation of method: :getRawRoot of protocol: #'sci.impl.vars/IVar found for class: clojure.lang.Var"
+          (failing "(defrecord Raw [s] raw/Shape (area [_] s) (scaled [_ k] s))"))
+  (check= "extend-type over a host protocol copied as-is dies where the JVM does"
+          "No implementation of method: :getName of protocol: #'sci.impl.types/HasName found for class: nil"
+          (failing "(extend-type String raw/Shape (area [s] (count s)) (scaled [s k] s))")))
+
+;; SCI's IVar is a protocol, and a host var is a plain host value to it: neither
+;; SCI nor the JVM extends IVar to clojure.lang.Var, which is why the two rows
+;; above fail on both. An EMBEDDER can supply that extension — and on jolt the
+;; extension has to be spellable with clojure.lang.Var's own methods, the way it
+;; is written on the JVM. toSymbol is the one IVar names that jolt's Var did not
+;; answer (jolt#1031), so this whole form used to fail to compile here.
+;;
+;; It is pinned as an embedder-visible capability, not as a fix for the rows
+;; above: with IVar extended, alter-var-root gets past getRawRoot and the copied
+;; -as-is protocol dies one seam later instead — at the same ExceptionInfo, with
+;; the same message, that Clojure 1.12.5 raises for this exact program. The
+;; supported path remains the multimethod recipe below.
+(extend-type clojure.lang.Var
+  sci.impl.vars/IVar
+  (bindRoot [this v] (.bindRoot this v))
+  (getRawRoot [this] (.getRawRoot this))
+  (toSymbol [this] (.toSymbol this))
+  (isMacro [this] (.isMacro this))
+  (hasRoot [this] (.hasRoot this))
+  (setThreadBound [this _v] nil)
+  (unbind [this] (.unbindRoot this)))
+
+(check= "IVar extended to a host var answers through Var's own methods"
+        ['clojure.core/inc true true]
+        [(sci.impl.vars/toSymbol #'clojure.core/inc)
+         (sci.impl.vars/hasRoot #'clojure.core/inc)
+         (identical? clojure.core/inc (sci.impl.vars/getRawRoot #'clojure.core/inc))])
+
+(let [host-ns (sci/create-ns 'raw2)
+      ctx (sci/init {:classes {:allow :all}
+                     :namespaces {'raw2 {'Shape (sci/copy-var* #'Shape host-ns)
+                                         'area (sci/copy-var* #'area host-ns)
+                                         'scaled (sci/copy-var* #'scaled host-ns)}}})]
+  (check= "with IVar extended, the copied-as-is protocol dies at the JVM's next seam"
+          "Unable to resolve symbol: area"
+          (try (sci/eval-string* ctx "(defrecord Raw2 [s] raw2/Shape (area [_] s) (scaled [_ k] s))")
+               :evaluated
+               (catch clojure.lang.ExceptionInfo e (ex-message e)))))
+
+;; the other direction: a SCI record or type reaching the HOST protocol answers
+;; through the SCI method its defrecord/deftype registered. Only a method the
+;; type actually registered counts — the :default is the host protocol itself,
+;; and answering through it here would loop.
+(defn- sci-method [mm this]
+  (let [f (get-method mm (sci.impl.types/type-impl this))]
+    (when-not (identical? f (get-method mm :default)) f)))
+(defn- via-sci [mm]
+  (fn [this & args]
+    (if-let [f (sci-method mm this)]
+      (apply f this args)
+      (throw (IllegalArgumentException.
+              (str "No implementation of method: " mm " for SCI type: "
+                   (sci.impl.types/type-impl this)))))))
+(doseq [c [sci.impl.records.SciRecord sci.impl.deftype.SciType]]
+  (extend c Shape {:area (via-sci sci-area) :scaled (via-sci sci-scaled)}))
+
+(def shapes-ns (sci/create-ns 'shapes))
+(def shapes-ctx
+  (sci/init {:classes {:allow :all}
+             :namespaces {'shapes {'Shape (sci/new-var 'shapes/Shape
+                                                       {:methods #{sci-area sci-scaled}
+                                                        :ns shapes-ns
+                                                        :name 'shapes/Shape
+                                                        :protocol Shape}
+                                                       {:ns shapes-ns})
+                                   'area (sci/copy-var* #'sci-area shapes-ns)
+                                   'scaled (sci/copy-var* #'sci-scaled shapes-ns)
+                                   'host-square (sci/copy-var* #'->HostSquare shapes-ns)}}}))
+
+(check= "defrecord implementing the host protocol, called inside SCI" 9
+        (sci/eval-string* shapes-ctx
+          "(defrecord Sq [s] shapes/Shape (area [_] (* s s)) (scaled [_ k] (->Sq (* s k))))
+           (shapes/area (->Sq 3))"))
+(check= "a second method, with an extra argument" 16
+        (sci/eval-string* shapes-ctx "(shapes/area (shapes/scaled (->Sq 2) 2))"))
+;; deftype: SCI emits (do (-create-type ..) ~@(map analyze methods)) and analyzes
+;; each method only as the evaluator reaches it, after the type exists — which
+;; needs ~@ to be as lazy as the JVM's (seq (concat ..)) (corpus "~@ is lazy").
+(check= "deftype implementing the host protocol, called inside SCI" 12
+        (sci/eval-string* shapes-ctx
+          "(deftype Rect [w h] shapes/Shape (area [_] (* w h)) (scaled [_ k] (->Rect (* w k) (* h k))))
+           (shapes/area (->Rect 3 4))"))
+(check= "a host record reaching the SCI method falls to the host protocol" 25
+        (sci/eval-string* shapes-ctx "(shapes/area (shapes/host-square 5))"))
+(check= "extend-type on a host class inside SCI" 3
+        (sci/eval-string* shapes-ctx
+          "(extend-type String shapes/Shape (area [s] (count s)) (scaled [s k] (apply str (repeat k s))))
+           (shapes/area (shapes/scaled \"a\" 3))"))
+(check= "extend-protocol to nil and Object inside SCI" [0 -1]
+        (sci/eval-string* shapes-ctx
+          "(extend-protocol shapes/Shape
+              nil (area [_] 0) (scaled [_ _] nil)
+              Object (area [_] -1) (scaled [o _] o))
+           [(shapes/area nil) (shapes/area 42)]"))
+(check= "satisfies? inside SCI sees the record, the type and the extension" [true true true]
+        (sci/eval-string* shapes-ctx
+          "[(satisfies? shapes/Shape (->Sq 1)) (satisfies? shapes/Shape (->Rect 1 1)) (satisfies? shapes/Shape \"s\")]"))
+
+;; host side: values SCI built, handed to the host protocol
+(let [sq (sci/eval-string* shapes-ctx "(->Sq 3)")
+      rect (sci/eval-string* shapes-ctx "(->Rect 2 5)")]
+  (check= "the host protocol on a SCI record" 9 (area sq))
+  (check= "the host protocol on a SCI type" 10 (area rect))
+  (check= "a host caller scaling a SCI record gets a SCI record back" 36
+          (area (scaled sq 2)))
+  (check= "a SCI record satisfies the host protocol" true (satisfies? Shape sq)))
+(let [other (sci/eval-string* shapes-ctx "(defrecord Plain [x]) (->Plain 1)")]
+  (check= "a SCI record whose type does not implement the protocol is refused, not looped"
+          :refused
+          (try (area other) :answered
+               (catch IllegalArgumentException _ :refused))))
+(println "SCI-FUNCTIONAL-TEST OK")

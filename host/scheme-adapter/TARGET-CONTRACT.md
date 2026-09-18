@@ -39,6 +39,20 @@ misbehavior, not a crash.
 - **`condition-wait` may wake spuriously.** Every wait site loops on its
   predicate; your implementation may wake threads freely but must not LOSE
   wakeups.
+- **An escape continuation is one-shot, and the target enforces it.**
+  `sa-call-with-escape-continuation` hands `proc` a procedure valid AT MOST
+  ONCE and only while that call is still on the stack. A second invocation, or
+  one after `proc` returned normally, must RAISE — a target whose only
+  primitive is multi-shot (`call/cc`) carries a spent flag rather than letting
+  control re-enter a finished frame. The escape must unwind the dynamic-wind
+  chain on its way out: jolt's `finally` runs on an escape, and a target that
+  skipped the unwind would silently drop cleanup. Ownership (which thread and
+  fiber may invoke a given escape) is the HOST's rule, not yours.
+- **Native error capture is part of the foreign call boundary.**
+  `sa-foreign-procedure-native-error` must return the C result and the calling
+  thread's errno/GetLastError-equivalent atomically; a later host call that reads
+  an error slot is not an equivalent implementation. A target without native
+  FFI must raise its documented unsupported-capability error.
 - **Blocking foreign calls must not stop other threads' GC.** Chez spells
   this `__collect_safe`; `sa-foreign-procedure-blocking` /
   `sa-foreign-callable-collect-safe` carry the requirement. A target whose
@@ -86,6 +100,21 @@ Logic branches on derived properties only: `sa-os-family` ('macos | 'windows
 | 'linux), `sa-arch`, `sa-endian`. The raw `sa-host-tag` string appears in
 NAMES only (release dirs, image headers, telemetry) — a port chooses any
 stable identifier; nothing parses it except target-owned build machinery.
+
+The derived three answer for the process that is RUNNING, not for the build
+that produced it. Chez's native machine tag happens to answer both, which is
+why the adapter reads it; its portable-bytecode tags name no OS at all, and
+deriving one from them called every bytecode build Linux (#796) while leaving
+the architecture and byte order unknown (#798). A port whose identifier is
+likewise portable must probe the host instead of parsing the identifier — the
+Chez adapter probes the filesystem for the OS, `uname(2)` for the architecture,
+and answers the byte order from `native-endianness` — and each answer may be
+cached, since none can change while the process runs.
+
+`sa-endian` has no degraded answer: a runtime always knows its own byte order,
+so a port answers it rather than declining. `sa-arch` may still answer `'other`,
+which callers read as "unverified" — but `'other` must mean the port could not
+find out, never merely that its identifier did not say.
 
 ## Target-owned files
 

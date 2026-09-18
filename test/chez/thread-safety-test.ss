@@ -581,6 +581,168 @@
 (jolt-reset! ts11-w 9)
 (ok "11. and stops firing once removed" (= 2 (length ts11-seen)))
 
+;; --- 12. forcing a lazy cell: the claim, and what a state image leaves behind --
+;; A lazy cell is claimed for forcing by a CAS on its lock field (seq.ss
+;; force-claimed!): no mutex per cell, so the collector has nothing extra to
+;; visit. Three things the protocol promises, checked with threads racing on the
+;; same unforced cells:
+;;   - a thunk runs ONCE however many threads reach the cell together;
+;;   - a cell whose lock field holds something that is not this process's claim
+;;     is still forcible -- a cell restored from an image written by a runtime
+;;     that kept a mutex per cell arrives with a fresh mutex there, and one
+;;     written mid-force arrives with the writer's token; both are stale;
+;;   - the claim is released when the thunk raises, so the next forcer runs it.
+(printf "\n== 12. forcing a lazy cell under racing threads ==\n")
+(jolt-mark-mt!)
+(define (ts12-count-cell counter)
+  (cseq-lazy 0 (lambda () (set! counter (+ counter 1)) jolt-nil)))
+(define ts12-runs 0)
+(define ts12-cell (cseq-lazy 0 (lambda () (set! ts12-runs (+ ts12-runs 1)) (cseq-realized 1 jolt-nil))))
+(ok "12. eight racing forcers finished"
+    (run-threads 8 (lambda (i) (seq-more ts12-cell)) 30.0 "12. racing seq-more"))
+(ok "12. the tail thunk ran exactly once" (= 1 ts12-runs))
+(ok "12. and every reader sees the published tail" (= 1 (seq-first (seq-more ts12-cell))))
+(ok "12. the claim is released after the run" (not (cseq-lock ts12-cell)))
+;; stale values in the lock field
+(define ts12-runs2 0)
+(define ts12-stale
+  (make-cseq 0 (lambda () (set! ts12-runs2 (+ ts12-runs2 1)) (cseq-realized 2 jolt-nil)) #f sk-cons #f 0 #f (make-mutex) jolt-nil))
+(ok "12. a cell restored with a mutex in its lock field still forces"
+    (run-threads 4 (lambda (i) (seq-more ts12-stale)) 30.0 "12. stale mutex"))
+(ok "12. ...once" (and (= 1 ts12-runs2) (= 2 (seq-first (seq-more ts12-stale)))))
+(define ts12-runs3 0)
+(define ts12-foreign
+  (make-cseq 0 (lambda () (set! ts12-runs3 (+ ts12-runs3 1)) (cseq-realized 3 jolt-nil)) #f sk-cons #f 0 #f (list 'forcing) jolt-nil))
+(ok "12. a cell restored with another process's claim token still forces"
+    (run-threads 4 (lambda (i) (seq-more ts12-foreign)) 30.0 "12. foreign token"))
+(ok "12. ...once" (and (= 1 ts12-runs3) (= 3 (seq-first (seq-more ts12-foreign)))))
+;; a raising thunk releases the claim
+(define ts12-raises 0)
+(define ts12-bad (cseq-lazy 0 (lambda () (set! ts12-raises (+ ts12-raises 1)) (error 'ts12 "boom"))))
+(define (ts12-try) (guard (e (#t 'raised)) (seq-more ts12-bad)))
+(ok "12. a raising tail thunk raises to its forcer" (eq? 'raised (ts12-try)))
+(ok "12. and leaves no claim behind" (not (cseq-lock ts12-bad)))
+(ok "12. so the next forcer runs it again" (and (eq? 'raised (ts12-try)) (= 2 ts12-raises)))
+;; the same for a lazy node
+(define ts12-lruns 0)
+(define ts12-node (jolt-make-lazy-seq (lambda () (set! ts12-lruns (+ ts12-lruns 1)) (cseq-realized 4 jolt-nil))))
+(ok "12. eight racing forcers of a lazy node finished"
+    (run-threads 8 (lambda (i) (force-lazyseq ts12-node)) 30.0 "12. racing force-lazyseq"))
+(ok "12. its body ran exactly once" (and (= 1 ts12-lruns) (= 4 (seq-first (force-lazyseq ts12-node)))))
+(ok "12. and its claim is released" (not (jolt-lazyseq-lock ts12-node)))
+
+;; 13. The reader's mode switches are per-thread. rdr-edn-mode, rdr-discard-cb,
+;; rdr-scan-mode and rdr-suppress-pos were plain parameters, which Chez shares
+;; across threads: an edn read on one thread put every other thread's reader
+;; into edn mode for its duration, and a #$ interpolation dropped the positions
+;; off the lists another thread was loading at that moment. The holder thread
+;; sits inside its parameterize while this thread reads.
+(define ts13-mu (make-mutex))
+(define ts13-cv (make-condition))
+(define ts13-state 'start)
+(fork-thread
+  (lambda ()
+    (parameterize ((rdr-edn-mode #t) (rdr-suppress-pos #t) (rdr-scan-mode #t))
+      (with-mutex ts13-mu
+        (set! ts13-state 'held)
+        (condition-broadcast ts13-cv)
+        (let wait () (unless (eq? ts13-state 'release) (condition-wait ts13-cv ts13-mu) (wait)))))))
+(with-mutex ts13-mu
+  (let wait () (unless (eq? ts13-state 'held) (condition-wait ts13-cv ts13-mu) (wait))))
+(ok "13. another thread's edn-mode read leaves this thread's reader alone"
+    (not (or (rdr-edn-mode) (rdr-scan-mode) (rdr-suppress-pos))))
+(ok "13. ...so a list read here still carries its position"
+    (let-values (((form j) (rdr-read-top "(f x)" 0 5)))
+      (not (jolt-nil? (jolt-get (jolt-meta form) (keyword #f "line") jolt-nil)))))
+(with-mutex ts13-mu (set! ts13-state 'release) (condition-broadcast ts13-cv))
+
+;; 14. A linked var's root and its jv$ binding are ONE value (rt.ss
+;; var-root-set!). The cell is written and then the value handed to the setter;
+;; without the two writes being one critical section a writer racing a writer
+;; of the same var interleaves into root=f2 / binding=f1 -- direct callers on
+;; one fn, var-routed callers on the other, for good. The reader holds
+;; var-linked-mu, so it sees a consistent pair when and only when the writers
+;; hold it too.
+(define ts14-binding 'init)
+(define ts14-cell
+  (def-var-linked! "thread-safety-test" "ts14" 'jv$thread-safety-test$ts14 'init
+                   (lambda (v) (set! ts14-binding v)) #f))
+(define ts14-mismatches
+  (let* ((writers 3) (iters 30000)
+         (done (make-mutex)) (cv (make-condition)) (left writers))
+    (do ((t 0 (fx+ t 1))) ((fx=? t writers))
+      (fork-thread
+        (lambda ()
+          (do ((i 0 (fx+ i 1))) ((fx=? i iters))
+            (var-root-set! ts14-cell (cons t i)))
+          (with-mutex done (set! left (fx- left 1)) (condition-broadcast cv)))))
+    (let loop ((i 0) (bad 0))
+      (if (fx=? i iters)
+          (begin
+            (with-mutex done
+              (let wait () (unless (fx=? left 0) (condition-wait cv done) (wait))))
+            bad)
+          (loop (fx+ i 1)
+                (if (with-mutex var-linked-mu
+                      (eq? (var-cell-root ts14-cell) ts14-binding))
+                    bad
+                    (fx+ bad 1)))))))
+(ok "14. a linked var's root and its binding are one value under concurrent writers"
+    (fx=? ts14-mismatches 0))
+
+;; 15. A thread jolt forks starts from the DEFAULT reader modes, whatever read
+;; the forking thread is inside. Chez copies thread parameters at fork, so a
+;; future (or an agent worker, or a fiber carrier) that an edn :readers fn
+;; started inherited edn mode -- for the rest of its life, for a pooled thread.
+(define ts15-inherited
+  (parameterize ((rdr-edn-mode #t) (rdr-scan-mode #t))
+    (jolt-future-deref
+      (jolt-future-call (lambda () (or (rdr-edn-mode) (rdr-scan-mode)))))))
+(ok "15. a thread jolt forks reads in the default modes" (not ts15-inherited))
+;; ...and the reset is the fork itself (lazy-bridge.ss's fork-thread shadow), not
+;; something each spawn site remembers to do: a bare fork-thread from inside a
+;; read starts clean too, which is what covers core.async's go/thread/put!/take!,
+;; the subprocess pump and every spawn site added later.
+(define ts15-bare
+  (parameterize ((rdr-edn-mode #t) (rdr-scan-mode #t) (*txn* 'ts15-txn))
+    (let ((mu (make-mutex)) (cv (make-condition)) (got 'unset))
+      (fork-thread (lambda ()
+                     (let ((v (list (rdr-edn-mode) (rdr-scan-mode) (*txn*))))
+                       (with-mutex mu (set! got v) (condition-broadcast cv)))))
+      (with-mutex mu (let wait () (when (eq? got 'unset) (condition-wait cv mu) (wait))))
+      got)))
+(ok "15. a bare fork-thread starts from the default reader modes and no txn"
+    (equal? ts15-bare '(#f #f #f)))
+
+;; --- 16. collection metadata under concurrent with-meta / carry ---------------
+;; A collection's meta lives in a slot of its own record (natives-meta.ss):
+;; with-meta allocates a copy and a conj that carries meta forward copies the
+;; slot, so no thread shares anything with another here. The property that has
+;; to hold whatever the mechanism: every thread attaches meta to its own fresh
+;; vectors and reads it back through a carry while every other thread does the
+;; same, and no carry is ever LOST — a nil where the thread's own map was
+;; expected. (This was the side-table's seqlock proof when collections read
+;; that table; the side table still serves records, reifies and fns.)
+(printf "\n== 16. collection metadata: carries under concurrent with-meta ==\n")
+(define ts16-lost 0)
+(define ts16-lost-mu (make-mutex))
+(define ts16-done
+  (run-threads 8
+    (lambda (tid)
+      (let ((m (jolt-hash-map (keyword #f "t") tid)) (lost 0))
+        (let loop ((i 0))
+          (when (fx<? i 40000)
+            (let* ((v (jolt-with-meta (jolt-vector i tid) m))
+                   (c (jolt-conj v i))            ; carries v's meta onto a fresh vector
+                   (got (jolt-meta c)))
+              (unless (eq? got m) (set! lost (fx+ lost 1))))
+            (loop (fx+ i 1))))
+        (with-mutex ts16-lost-mu (set! ts16-lost (+ ts16-lost lost)))))
+    120 "16. 8 threads x 40k with-meta/conj/meta"))
+(ok "16. no carry lost its meta to a racing writer" (and ts16-done (= ts16-lost 0)))
+(ok "16. a value with no meta still reads nil after the churn"
+    (jolt-nil? (jolt-meta (jolt-vector 1 2 3))))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

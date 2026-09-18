@@ -12,8 +12,26 @@
 # The launcher cd's to the jolt repo root so the runtime's relative loads work;
 # the user's original cwd (the project dir, where deps.edn lives) is passed in
 # JOLT_PWD.
-root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+#
+# $0 may be a SYMLINK. That is the natural way to put a checkout's jolt on PATH,
+# and it is what `#!/usr/bin/env jolt` executes, so follow the chain to the real
+# file before deriving the root from it: without this the root came out as the
+# symlink's own directory and the launcher died there looking for tools/version.sh
+# and host/chez/cli.ss. Hand-rolled rather than `readlink -f`, which is neither
+# POSIX nor present on older macOS.
+target="$0"
+while [ -L "$target" ]; do
+  link="$(readlink "$target")"
+  case "$link" in
+    /*) target="$link" ;;
+    *)  target="$(CDPATH= cd -- "$(dirname -- "$target")" && pwd)/$link" ;;
+  esac
+done
+root="$(CDPATH= cd -- "$(dirname -- "$target")/.." && pwd)"
 export JOLT_PWD="${JOLT_PWD:-$PWD}"
+# How jolt re-invokes itself (babashka.tasks/clojure in a task). An installed
+# jolt is on PATH and needs no help; this checkout is not.
+export JOLT_EXE="${JOLT_EXE:-$root/bin/jolt}"
 
 # Identify the Chez Scheme executable. $JOLT_CHEZ is authoritative and is how the
 # Makefile hands down the one it selected — the same interpreter that mints the
@@ -47,9 +65,15 @@ if [ -z "${JOLT_CHEZ:-}" ]; then
   fi
 fi
 CHEZ="$JOLT_CHEZ"
+# Resolved to a path and exported: build.ss's toolchain-dir lookup reads
+# JOLT_CHEZ from its own environment to find the csv dir next to the running
+# interpreter, rather than re-deriving it from a `command -v` PATH search that
+# can silently disagree with the interpreter actually selected above.
+export JOLT_CHEZ="$(command -v "$CHEZ" 2>/dev/null || echo "$CHEZ")"
 
-# Version for --version / banners: git describe of this checkout, else "dev".
-export JOLT_VERSION="${JOLT_VERSION:-$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo dev)}"
+# Version for --version / banners: tools/version.sh (git describe of this
+# checkout against release tags, else "dev" — see the script for why not bare).
+export JOLT_VERSION="${JOLT_VERSION:-$("$root/tools/version.sh")}"
 # Dev source mode opts OUT of the per-namespace AOT cache: the compiler is
 # volatile here (a "dev" version tag wouldn't invalidate the cache across edits),
 # and devboot already covers startup. A built jolt binary defaults the cache ON.
@@ -60,11 +84,18 @@ cd "$root" || exit 1
 # than source mode. Check freshness against the input list emitted by make devboot.
 # The cache is not used for REPL (interactive stdin needed) or when the first
 # arg is "repl" (explicit REPL command).
+#
+# JOLT_NO_DEVCACHE=1 forces source mode with the cache present and fresh. The two
+# are not interchangeable: the cached image bakes jolt.main's require closure and
+# marks it (ldr-mark-cli-aot!), where source mode loads the same namespaces as
+# ordinary requires — so a gate that means to exercise the source-mode ordering
+# has to say so, or it silently tests the cached one instead.
 CACHE_SO="target/dev/flat.so"
 CACHE_INPUTS="target/dev/flat.inputs"
 CACHE_CHEZ="target/dev/flat.chez"
 use_cache=0
-if [ -f "$CACHE_SO" ] && [ -f "$CACHE_INPUTS" ] && [ $# -gt 0 ] && [ "$1" != "repl" ]; then
+if [ -z "${JOLT_NO_DEVCACHE:-}" ] && \
+   [ -f "$CACHE_SO" ] && [ -f "$CACHE_INPUTS" ] && [ $# -gt 0 ] && [ "$1" != "repl" ]; then
   stale=0
   while IFS= read -r f; do
     if [ -n "$f" ] && [ "$CACHE_SO" -ot "$f" ]; then

@@ -38,9 +38,11 @@
           (.getSuperclass clojure.lang.PersistentVector) clojure.lang.APersistentVector)
 
 ;; getInterfaces: the direct super-interfaces (order is the graph's; compare as a set)
+;; Three of the JVM's five: it also lists java.lang.constant.Constable and
+;; ConstantDesc, which jolt does not model.
 (check-eq "String's direct interfaces"
           (set (map #(.getName %) (.getInterfaces String)))
-          #{"java.lang.CharSequence" "java.lang.Comparable"})
+          #{"java.lang.CharSequence" "java.lang.Comparable" "java.io.Serializable"})
 (check-eq "Object has no interfaces" (seq (.getInterfaces Object)) nil)
 
 ;; isInterface
@@ -66,6 +68,32 @@
 (check-eq "record class assignable to IPersistentMap"
           (.isAssignableFrom clojure.lang.IPersistentMap ReflectProbe) true)
 (check-eq "record class assignable to Object" (.isAssignableFrom Object ReflectProbe) true)
+
+
+;; Annotations: jolt models none, so the surface answers "none" for every class.
+;; It has to answer at all — a Class value that recognises no member falls
+;; through to the STATICS of the class it names, so (.isAnnotationPresent sb FI)
+;; used to report "No dependency provides java.lang.StringBuilder" for a class
+;; jolt fully supplies. SCI asks this of every ^Hint it resolves (jolt#983).
+(check-eq "isAnnotationPresent is false"
+          (.isAnnotationPresent StringBuilder java.lang.FunctionalInterface) false)
+(check-eq "getAnnotation is nil"
+          (.getAnnotation String java.lang.FunctionalInterface) nil)
+(check-eq "getAnnotations is empty" (seq (.getAnnotations String)) nil)
+(check-eq "getDeclaredAnnotations is empty" (seq (.getDeclaredAnnotations String)) nil)
+
+;; And a member miss on a class the runtime DOES implement reads as a member
+;; miss. RFC 0014's "No dependency provides" is advice that cannot be taken for
+;; a class register-class-provider! refuses claims on (jolt#983).
+(defn- miss-msg [f]
+  (try (f) :no-throw (catch Throwable e (ex-message e))))
+(check-eq "static miss on a runtime-provided class names the member"
+          (miss-msg #(StringBuilder/noSuchStatic "x"))
+          "No matching field or method: StringBuilder/noSuchStatic")
+(check-eq "a JDK class nobody provides still reports RFC 0014"
+          (boolean (re-find #"No dependency provides java\.sql\.DriverManager"
+                            (str (miss-msg #(java.sql.DriverManager/getConnection "x")))))
+          true)
 
 (if (empty? @failures)
   (println "CLASS-REFLECT-TEST OK")

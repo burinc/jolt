@@ -1,0 +1,61 @@
+;; A bb.edn-only project: no deps.edn, so bb.edn IS the project config —
+;; its :paths supply the source roots for every command, not just tasks.
+{:paths ["src" "script"]
+ :tasks
+ {:init     (def greeting "hello")
+  :requires ([clojure.string :as str])
+  :enter    (println "enter" (:name (current-task)))
+  :leave    (println "leave" (:name (current-task)))
+
+  hi     {:doc "say hi" :task (println greeting (str/upper-case "world"))}
+  clean  {:doc "remove build output" :task (println "cleaning")}
+  build  {:doc "build it" :depends [clean] :task (println "building")}
+  both   {:doc "depend on two" :depends [clean build] :task (println "both")}
+  args   {:task (println "args:" (pr-str *command-line-args*))}
+  boom   {:doc "fail with 7" :task (shell "sh" "-c" "exit 7")}
+  nested {:task (do (println "before") (run 'clean) (println "after"))}
+  ;; A task body is CODE, and the reader macros code uses have to read here:
+  ;; quote (as `nested` above already needs), deref, syntax-quote/unquote and
+  ;; #(). EDN has none of them and refuses ' @ ` ~ outright, which is why a
+  ;; project file is not read with the edn reader.
+  macros {:doc "the reader macros a code body needs"
+          :task (let [f (future 41) n 7]
+                  (println "macros:" @f (quote sym) (pr-str `[1 ~n]) (mapv #(* 2 %) [1 2])))}
+  secret {:private true :task (println "secret")}
+  ;; babashka's other spelling of "helper, not an entry point": a leading dash.
+  ;; Hidden from the listing like :private, and runnable like it too.
+  -dash  {:doc "a dash-named helper" :task (println "dash ran")}
+  ;; a :doc that spans lines. The listing is one task per line, so only the
+  ;; first may reach it.
+  multi  {:doc "first line\nsecond line of the doc" :task (println "multi")}
+  needs  {:requires ([bbproj.core :as c]) :task (println (c/hello))}
+  helper {:requires ([helper]) :task (println (helper/help))}
+  echo   {:task (shell "echo" "from-shell")}
+  bare   (println "bare body")
+  ;; the referred `clojure` fn must not shadow a clojure.* namespace prefix
+  fq     {:task (println (clojure.string/upper-case "fq") (clojure.core/inc 1)
+                         (boolean (jolt.host/getenv "PATH")))}
+  shcmd  "echo shell-string && echo second"
+
+  ;; a task's own roots, on top of the project's
+  xp     {:extra-paths ["extra"] :requires ([extra.thing]) :task (println (extra.thing/x))}
+  ;; re-invoke the jolt CLI
+  viajolt {:task (clojure "-e" "(println :from-clojure-fn)")}
+  ;; …with an options map, and with the args in one tokenized string
+  viajolt2 {:task (println (str/trim (:out (clojure {:out :string} "-e :tokenized"))))}
+  ;; `jolt` is the same function under the name that says what it does
+  viajolt3 {:task (jolt "-e" "(println :from-jolt-fn)")}
+  ;; a built-in command name, taken deliberately
+  path   {:override-builtin true :task (println "overridden path")}
+  ;; a cycle is an error, not a hang
+  ;; a :depends that fails still reports ITS status, parallel or not
+  pfail  {:depends [clean boom] :task (println "never")}
+  cyc1   {:depends [cyc2] :task (println "cyc1")}
+  cyc2   {:depends [cyc1] :task (println "cyc2")}
+  ;; a cycle that spans two SIBLING branches rather than one chain. Detection
+  ;; used to live in a per-thread dynamic var, which each :parallel branch
+  ;; inherited separately — so neither branch could see the other's task, and the
+  ;; run deadlocked with no output where the sequential one reported.
+  xcyc   {:depends [xcycA xcycB] :task (println "xcyc")}
+  xcycA  {:depends [xcycB] :task (println "xcycA")}
+  xcycB  {:depends [xcycA] :task (println "xcycB")}}}

@@ -74,13 +74,22 @@
   (is= "Windows relative path joins its declaring root" "D:/base/../lib"
        (absolute true "D:/base" "../lib"))
 
-  ;; A leading separator is relative to the current drive, but prefixing the
-  ;; project directory would change its meaning. Preserve both accepted Windows
-  ;; separator spellings, matching the old leading-slash behavior.
+  ;; A leading separator is rooted on the declaring project's drive. Resolve
+  ;; the drive explicitly so later raw filesystem checks cannot accidentally
+  ;; use the runtime checkout's drive instead.
   (doseq [p ["/project" "\\project"]]
     (is= (str "Windows root-relative path kind " (pr-str p)) :root-relative (kind true p))
-    (is= (str "Windows root-relative path spelling " (pr-str p)) p
+    (is= (str "Windows root-relative path drive " (pr-str p)) (str "D:" p)
          (absolute true "D:/base" p)))
+  (is= "Windows root-relative path under UNC base"
+       "\\\\server\\share\\base\\project"
+       (absolute true "\\\\server\\share\\base" "\\project"))
+  (is= "Windows root-relative path under trailing-separator UNC base"
+       "\\\\server\\share\\project"
+       (absolute true "\\\\server\\share\\" "\\project"))
+  (is= "Windows root-relative path without a rooted base stays rooted"
+       "\\project"
+       (absolute true "." "\\project"))
 
   ;; C:path resolves against Windows' per-drive current directory, not the
   ;; declaring project's directory. The launcher changes cwd before resolution,
@@ -292,6 +301,140 @@
     (is= "both unresolvable deps are named at once" true
          (and (str/includes? (str msg) "a/one 1.0")
               (str/includes? (str msg) "b/two 2.0")))))
+
+;;;; :jolt/native dedup identity
+
+(let [native-key (var jolt.deps/native-key)
+      dedup-by (var jolt.deps/dedup-by)]
+  ;; The keys a spec's candidates are declared under are the ones
+  ;; current-platform selects with. native-key read :win, which it never
+  ;; produces, so two Windows-only specs with no :name both keyed on an empty
+  ;; vector and dedup-by dropped the second (jolt-ajd).
+  (let [a {:windows ["sqlite3.dll"]}
+        b {:windows ["libcrypto-3-x64.dll"]}]
+    (is= "Windows-only specs key distinctly" true
+         (not= (native-key a) (native-key b)))
+    (is= "Windows-only specs both survive dedup" [a b] (dedup-by native-key [a b])))
+  (is= "a Windows candidate is part of the identity"
+       (native-key {:windows ["sqlite3.dll"]})
+       (native-key {:windows "sqlite3.dll"}))
+  (is= "the same Windows lib from two deps reconciles to one"
+       [{:windows ["sqlite3.dll"] :jolt.deps/root "/a"}]
+       (dedup-by native-key [{:windows ["sqlite3.dll"] :jolt.deps/root "/a"}
+                             {:windows ["sqlite3.dll"] :jolt.deps/root "/b"}]))
+
+  ;; Every platform key contributes, and :name still overrides all of them.
+  (is= "each platform key contributes to the identity" 3
+       (count (dedup-by native-key [{:darwin ["libz.dylib"]}
+                                    {:linux ["libz.so.1"]}
+                                    {:windows ["zlib1.dll"]}])))
+  (is= "a :name reconciles specs whose candidates differ" 1
+       (count (dedup-by native-key [{:name "z" :linux ["libz.so.1"]}
+                                    {:name "z" :windows ["zlib1.dll"]}])))
+  (is= "a :process lib keys on the flag, not on candidates" 1
+       (count (dedup-by native-key [{:process true :name "c"}
+                                    {:process true :name "c" :linux ["libc.so.6"]}])))
+
+  ;; A spec with no :name and no candidate under any platform key — a
+  ;; :static-only lib, or a key no platform selects — falls back to its own
+  ;; shape rather than to one shared empty identity.
+  (is= "static-only specs stay distinct" 2
+       (count (dedup-by native-key [{:static {:archive "native/libfoo.a"}}
+                                    {:static {:archive "native/libbar.a"}}])))
+  (is= "an identical static-only spec from two roots reconciles" 1
+       (count (dedup-by native-key
+                        [{:static {:archive "native/libfoo.a"} :jolt.deps/root "/a"}
+                         {:static {:archive "native/libfoo.a"} :jolt.deps/root "/b"}]))))
+
+;;;; :jolt/native reconciliation — a second spec fills in the keys the first omits
+
+;; dedup-by is winner-takes-all and the project's own specs run first, so an app
+;; that only wanted to ADD the :windows candidates a dependency never declared
+;; had to restate that dependency's :darwin and :linux lists verbatim — and a
+;; windows-only project entry deduped the dependency away and broke the other
+;; two platforms instead (jolt-lang/jolt#989). reconcile-natives overlays.
+(let [reconcile (var jolt.deps/reconcile-natives)]
+  (let [project {:name "z" :windows ["zlib1.dll"] :jolt.deps/root "/app"}
+        dep     {:name "z" :linux ["libz.so.1"] :darwin ["libz.dylib"]
+                 :jolt.deps/root "/dep"}]
+    (is= "the project adds a platform without restating the others"
+         [{:name "z" :windows ["zlib1.dll"] :jolt.deps/root "/app"
+           :linux ["libz.so.1"] :darwin ["libz.dylib"]
+           :jolt.deps/roots {:linux "/dep" :darwin "/dep"}}]
+         (reconcile [project dep]))
+    ;; the winner still wins every key it declares — an app override is an
+    ;; override, not a merge of candidate lists
+    (is= "a key the winner declares is not overlaid"
+         ["zlib1.dll"]
+         (:windows (first (reconcile [project (assoc dep :windows ["other.dll"])]))))))
+
+;; The root travels with the candidates it belongs to. Without it a dependency's
+;; relative "native/libfoo.so" would resolve against whichever deps.edn won the
+;; identity, which is exactly the directory it is not in.
+(let [reconcile (var jolt.deps/reconcile-natives)]
+  (is= "an overlaid key carries the declaring root"
+       {:linux "/dep"}
+       (:jolt.deps/roots
+        (first (reconcile [{:name "foo" :windows ["foo.dll"] :jolt.deps/root "/app"}
+                           {:name "foo" :linux ["native/libfoo.so"] :jolt.deps/root "/dep"}]))))
+  ;; a rootless spec (an older cpcache entry, or a caller that built the map)
+  ;; contributes its candidates and no root, rather than a nil one
+  (is= "a rootless overlay records no root"
+       nil
+       (:jolt.deps/roots
+        (first (reconcile [{:name "foo" :windows ["foo.dll"]}
+                           {:name "foo" :linux ["libfoo.so"]}]))))
+  ;; first-inclusion order is what the loader loads in, so it is preserved
+  (is= "first-inclusion order is preserved"
+       ["a" "b"]
+       (mapv :name (reconcile [{:name "a" :linux ["liba.so"]}
+                               {:name "b" :linux ["libb.so"]}
+                               {:name "a" :windows ["a.dll"]}])))
+  ;; specs that are not the same library are untouched by any of this
+  (is= "distinct libraries do not merge" 2
+       (count (reconcile [{:name "a" :linux ["liba.so"]}
+                          {:name "b" :windows ["b.dll"]}]))))
+
+;;;; :jolt/tree-shake {:allow-dynamic […]} → "ns/name" strings
+
+(let [allow-dynamic-entries (var jolt.deps/allow-dynamic-entries)]
+  ;; The list travels to the Scheme build driver as strings — the shape
+  ;; dce-bail-scan keys its allow set on — so a symbol is rendered as written.
+  (is= "symbols render as ns/name strings"
+       ["clojure.spec.alpha/res" "clojure.spec.gen.alpha/dynaload"]
+       (allow-dynamic-entries {:jolt/tree-shake {:allow-dynamic '[clojure.spec.alpha/res
+                                                                  clojure.spec.gen.alpha/dynaload]}}))
+  (is= "a string entry is taken as written"
+       ["a.b/c"]
+       (allow-dynamic-entries {:jolt/tree-shake {:allow-dynamic ["a.b/c"]}}))
+  (is= "no key is the empty list, not nil" [] (allow-dynamic-entries {}))
+  (is= "the key without :allow-dynamic is the empty list" []
+       (allow-dynamic-entries {:jolt/tree-shake {}})))
+
+;; Two deps.edn sources in the chain both declaring :jolt/tree-shake: the vouch
+;; lists union, in chain order and without duplicates. tools.deps' generic merge
+;; is one level deep, so the later source's {:allow-dynamic [...]} used to
+;; REPLACE the earlier one's and a user-file vouch silently dropped the project's.
+(let [merge-edns (var jolt.deps.edn/merge-edns)]
+  (is= "merge-edns unions :allow-dynamic across sources, in order, deduplicated"
+       {:paths ["src"] :jolt/tree-shake {:allow-dynamic '[a.b/c d.e/f g.h/i]}}
+       (merge-edns [{:jolt/tree-shake {:allow-dynamic '[a.b/c d.e/f]}}
+                    {:paths ["src"] :jolt/tree-shake {:allow-dynamic '[d.e/f g.h/i]}}]))
+  (is= "a source without the key leaves the other's list alone"
+       {:jolt/tree-shake {:allow-dynamic '[a.b/c]}}
+       (merge-edns [{:jolt/tree-shake {:allow-dynamic '[a.b/c]}} {} nil]))
+  (is= "no source with the key means no key"
+       {:paths ["src"]}
+       (merge-edns [{:paths ["src"]} {}])))
+
+;; The union itself, against the committed shake fixture: the app's own entry
+;; comes first, the :local/root library's after it, and both arrive — the
+;; build-level gate (make shakelocal) can only show that the shake ran, not
+;; which declaration got it there. Relative to the repo root, like the "."
+;; base-dir the resolve-deps cases above use.
+(is= "resolve-project unions the project's list with its :local/root dep's, project first"
+     ["app.core/res" "allowlib.core/dynaload"]
+     (:allow-dynamic (deps/resolve-project "test/chez/allow-dynamic-app")))
 
 (println (str "deps-expand: " (- @checks @failures) "/" @checks " passed"))
 (when (pos? @failures)

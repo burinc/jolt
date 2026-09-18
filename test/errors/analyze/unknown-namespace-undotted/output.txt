@@ -1,0 +1,8 @@
+error[analyze/unknown-namespace]: No such namespace: str
+  --> ./test/errors/analyze/unknown-namespace-undotted/input.clj:10:12
+    |
+  8 | (ns input)
+  9 | 
+ 10 | (defn f [] (str/join "," [1 2]))
+    |            ^^^^^^^^^^^^^^^^^^^^
+exit: 1

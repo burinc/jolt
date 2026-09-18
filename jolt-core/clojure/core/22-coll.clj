@@ -156,17 +156,11 @@
   ([f] (let [ret (f)] (if (fn? ret) (trampoline ret) ret)))
   ([f & args] (trampoline (fn [] (apply f args)))))
 
-;; Canonical pairwise max/min: > / < throw on non-numbers, and the NaN
-;; behavior is Clojure's by construction.
-(defn max
-  ([x] x)
-  ([x y] (if (> x y) x y))
-  ([x y & more] (reduce max (max x y) more)))
 
-(defn min
-  ([x] x)
-  ([x y] (if (< x y) x y))
-  ([x y & more] (reduce min (min x y) more)))
+;; max / min are the host's registered variadics (seq.ss jolt-max / jolt-min),
+;; bound as the var roots in ns.ss: the same procedures a value-position
+;; reference compiles to, so (identical? max (var-get #'max)) holds. An overlay
+;; definition here replaced the root with a second, different fn.
 
 (defn reverse [coll] (reduce conj (list) coll))
 
@@ -208,10 +202,6 @@
 (defn find-keyword
   ([nm] (keyword nm))
   ([ns nm] (keyword ns nm)))
-
-;; The raw Inst protocol method; jolt insts have one representation, so it is
-;; inst-ms itself.
-(defn inst-ms* [i] (inst-ms i))
 
 ;; Canonical comp — here rather than a host primitive so each stage is invoked with
 ;; jolt call semantics: (comp seq :content) works because the keyword stage
@@ -261,7 +251,7 @@
 
 ;; num: Clojure coerces to java.lang.Number; jolt just checks.
 (defn num [x]
-  (if (number? x) x (throw (str "num requires a number, got: " x))))
+  (if (number? x) x (throw (ClassCastException. (str "num requires a number, got: " x)))))
 
 ;; == numeric equality: 1-arity is trivially true without inspecting the value
 ;; (Clojure's shape); 2+ args must be numbers, as Numbers.equiv throws.
@@ -270,7 +260,7 @@
   ([x y]
    (if (and (number? x) (number? y))
      (= x y)
-     (throw (str "Cannot cast to number: " (if (number? x) y x)))))
+     (throw (ClassCastException. (str "Cannot cast to number: " (if (number? x) y x))))))
   ([x y & more]
    (if (== x y)
      (apply == y more)
@@ -301,7 +291,7 @@
 (defn parse-boolean [s]
   (if (string? s)
     (cond (= s "true") true (= s "false") false :else nil)
-    (throw (str "parse-boolean requires a string, got: " s))))
+    (throw (IllegalArgumentException. (str "parse-boolean requires a string, got: " s)))))
 
 (defn newline [] (print "\n") nil)
 
@@ -410,13 +400,34 @@
 ;; the base's own implementation rather than the override now running.
 (defmacro proxy-super [meth & args]
   `(jolt.host/proxy-super-call ~'this ~(name meth) ~@args))
-(defn construct-proxy [c & args] (throw "construct-proxy: not supported in Jolt"))
-(defn get-proxy-class [& interfaces] (throw "get-proxy-class: not supported in Jolt"))
+(defn construct-proxy [c & args] (throw (UnsupportedOperationException. "construct-proxy: not supported in Jolt")))
+(defn get-proxy-class [& interfaces] (throw (UnsupportedOperationException. "get-proxy-class: not supported in Jolt")))
+
+;; Clojure's serialized-require: require while holding
+;; clojure.lang.RT/REQUIRE_LOCK. Private there and here, and here it exists ONLY
+;; for code that reaches for the private var — jolt's own requiring-resolve does
+;; not go through it, for the reason given below. jolt.host/with-monitor rather
+;; than `locking`: that macro is defined in 30-macros.clj, which loads after this
+;; file.
+(defn ^:private serialized-require [& args]
+  (jolt.host/with-monitor clojure.lang.RT/REQUIRE_LOCK
+    (fn* [] (apply require args))))
 
 ;; resolve, requiring the symbol's namespace first when it isn't loaded yet —
 ;; the dynamic-require pattern (tooling, plugin registries). The require and
 ;; resolve are the runtime fns, so this works identically under jolt run and
 ;; in an AOT binary (which compiles the namespace from the source roots).
+;;
+;; A plain require, NOT serialized-require. Clojure holds RT/REQUIRE_LOCK across
+;; the require because its loader has no other guard against two threads loading
+;; one namespace. jolt's loader does (loader.ss, JLS 12.4.2 per namespace): a
+;; second thread's require blocks until the first thread's load of that namespace
+;; has finished, so the process-wide lock would add nothing it does not already
+;; give — and it adds a lock edge the loader's wait-for graph cannot see. Thread A
+;; holds the lock and waits on a namespace B is loading; B's top level calls
+;; requiring-resolve and waits on the lock. Neither wait is a loader wait, so the
+;; cycle walk never fires and both hang for good. test/chez/concurrent-require.clj
+;; pins this (property J).
 (defn requiring-resolve [sym]
   (if (qualified-symbol? sym)
     (or (resolve sym)

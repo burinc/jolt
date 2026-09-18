@@ -32,14 +32,6 @@
 ;; first file whose blocker is class (c) (a genuine Chez-only construct with no
 ;; gambit seam) — see REPORT.
 
-;; lazy-bridge forward-shared flags: seq.ss's force path reads jolt-mt? and
-;; seq-more dispatches on it, but lazy-bridge.ss (loaded much later) is what
-;; defines them. Pre-declare so seq.ss's references are bound; lazy-bridge.ss
-;; REDEFINES them with its real implementation (the #f default and the
-;; mark-mt! flip are identical, so the redefinition is a no-op in practice).
-(define jolt-mt? #f)
-(define (jolt-mark-mt!) (set! jolt-mt? #t))
-
 (##include "../chez/values.ss")
 (##include "hasheq.ss")
 (##include "../chez/collections.ss")
@@ -85,6 +77,19 @@
 (##include "../chez/reader.ss")
 (##include "../chez/syntax-quote.ss")
 (##include "../chez/host-contract.ss")
+;; The interop tier: the jhost record and the registries (host-statics.ss),
+;; then the java/ files shared with Chez that register into them — Class
+;; objects and the class model core reads (class-model.ss), StringBuilder
+;; (string-builder.ss), the `.`/`.-field` dispatch arms over records, maps and
+;; transients (dot-forms.ss). Before the seed: the prelude's own (import …) forms
+;; intern through jolt-class-for (host-vars.ss, the rest of the java/ tree's
+;; names, comes after it). java-parse.ss is the NumberFormatException family
+;; Long/parseLong and its siblings raise.
+(##include "../chez/java/java-parse.ss")
+(##include "host-statics.ss")
+(##include "../chez/java/class-model.ss")
+(##include "../chez/java/string-builder.ss")
+(##include "../chez/java/dot-forms.ss")
 
 ;; ---- G3: the cross-minted compiler on gsi (jolt-mj95.4) ----------------------
 ;;
@@ -96,6 +101,11 @@
 ;; the seed's emitted code expands seq.ss's macros in this unit; a load'd seed
 ;; would be a separate unit that cannot see them.
 (##include "eval-fns.ss")  ;; seq.ss numeric macros as eval-world FUNCTIONS (js exes cannot eval define-syntax)
+;; clojure.core is the current namespace while its own prelude loads, as in
+;; cli.ss: the prelude's defmultis (print-method) def-var! into the current ns
+;; and its (import …) forms bind class tokens there — under the default "user"
+;; both landed in the wrong namespace (clojure.core/Sequential stayed unbound).
+(set-chez-ns! "clojure.core")
 (##include "seed/prelude.ss")
 ;; post-prelude re-asserts the native overrides the overlay stubs out (ns-name,
 ;; char?, atom?, realized?, ...) — cli.ss order: prelude, post-prelude, image.
@@ -103,6 +113,7 @@
 ;; the clojure.core names the excluded java/ tree owns on Chez — after
 ;; post-prelude so these bindings are the last word
 (##include "host-vars.ss")
+(set-chez-ns! "user")
 (##include "seed/image.ss")
 (##include "../chez/compile-eval.ss")
 

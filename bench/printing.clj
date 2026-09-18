@@ -7,6 +7,7 @@
 ;;   - pr-str over scalars: hits *print-readably* per string/char
 ;;   - print-str into a rebound *out*: hits the *out* lookup per write
 ;;   - pr-str over namespaced maps: hits *print-namespace-maps* per map
+;;   - format: a directive parse plus a number rendering per item
 ;;
 ;; Portable Clojure (jolt + JVM Clojure).
 ;;   bench/run.sh printing 300
@@ -49,6 +50,17 @@
       (recur (next s) (+ n (count (pr-str (first s)))))
       n)))
 
+;; `format`: one directive of each numeric kind per item, with the flags a
+;; report line uses — the JVM's Formatter rounds the value's shortest decimal
+;; digits and jolt's does the same, so the strings are identical on both
+(defn format-items [n]
+  (loop [i 0 acc 0]
+    (if (< i n)
+      (recur (inc i)
+             (+ acc (count (format "%d %s %.2f %,d %e %08.3f|%-6s|"
+                                   i "x" (* i 1.5) (* i 1000) (* i 0.001) (- (* i 1.25)) "ab"))))
+      acc)))
+
 (defn run [iters scalars ns-maps]
   (loop [i 0 acc 0]
     (if (< i iters)
@@ -56,7 +68,8 @@
              (+ acc
                 (pr-scalars scalars)
                 (print-into-writer scalars)
-                (pr-ns-maps ns-maps)))
+                (pr-ns-maps ns-maps)
+                (format-items 100)))
       acc)))
 
 (defn -main [& args]

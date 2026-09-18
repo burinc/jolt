@@ -47,12 +47,18 @@ One entry per library: how to put it on the classpath, and what it scored.
 ## The gate criterion
 
 A library **regresses** when `pass` drops or `fail` / `error` / `load-fail` rise
-against `:expect`. A rising `pass` is reported as `BETTER` and does not fail the
-gate — improving a library is then a one-line manifest edit.
+against `:expect`. A move the other way — `pass` up, or any of the other three
+down — is reported as `BETTER` and does not fail the gate: improving a library is
+then a one-line manifest edit.
 
-`:tolerance` widens that on all four counters, not just `pass`: in a generative
-suite whether a drawn case fails or errors moves run to run while the total
-stays put.
+`:tolerance` widens both verdicts on all four counters, not just `pass`: in a
+generative suite whether a drawn case fails or errors moves run to run while the
+total stays put. It is a **symmetric** noise band, so it suppresses `BETTER` just
+as it suppresses `WORSE` — a `pass` above the recorded one but inside the band
+reports `ok`, because re-recording it would only re-centre the band on whatever
+the last run drew. test.check (`:tolerance 40`) reading pass=245 against a
+recorded 236 is that case. Above the band the move is real and says so, and every
+library without a `:tolerance` is pinned exactly, so any rise there is `BETTER`.
 
 `:expect` is deliberately a tally and not a per-assertion baseline. Some suites
 are order- and environment-sensitive (compliment completes against the live

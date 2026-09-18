@@ -33,6 +33,7 @@ Read it before assuming a JVM behaviour holds.
 - [Install](#install) — prebuilt binaries, Homebrew, install script
 - [Run](#run) — `-e`, project deps, `clj`-compatible options
 - [Differences from Clojure](#differences-from-clojure) — what actually diverges
+- [Scripts](#scripts) — a file, a shebang line, `*command-line-args*`
 - [Runtime dependencies](#runtime-dependencies) — acquiring libraries in code
 - [Diagnostics](#diagnostics) — error suggestions, EDN errors, the lint pass
 - [REPL and editor integration](#repl-and-editor-integration) — nREPL, CIDER/Calva/Cursive
@@ -57,8 +58,9 @@ With Homebrew:
 brew install jolt-lang/jolt/jolt
 ```
 
-Or with the install script (installs to `/usr/local/bin` by default; `--dir <dir>`
-and `--version <v>` override that):
+Or with the install script (installs to `~/.local/bin`, or `/usr/local/bin` as
+root; `--dir <dir>` and `--version <v>` — or `nightly`, the daily build of
+`main` — override that):
 
 ```bash
 curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
@@ -97,10 +99,6 @@ finally searches `PATH` for `chez` or `chezscheme`. `make` provisions its own
 10.4.1 when `PATH` has a different version and exports `JOLT_CHEZ` so both halves
 of a build agree.
 
-Note that GitHub's auto-generated "Source code (zip/tar.gz)" archives on the
-releases page do **not** contain submodules, so they can't run or build —
-clone the repo instead (or grab a prebuilt binary from the same page).
-
 After changing a compiler source — the reader (`host/chez/reader.ss`), the
 analyzer/IR/backend (`jolt-core/jolt/*.clj`), or the `clojure.core` overlay
 (`jolt-core/clojure/core/*.clj`) — re-mint the seed:
@@ -130,10 +128,14 @@ $ jolt -e '(/ 1 2)'
 1/2
 ```
 
+A file runs too — `jolt script.clj`, or an executable `#!/usr/bin/env jolt`
+script: see [Scripts](#scripts).
+
 When the current directory has a `deps.edn`, `-e` resolves it first, so the
 expression can require the project's own namespaces and its dependencies.
 `-Sdeps` and `-A` compose with it for a one-off evaluation, and `-M` takes the
-same main options on the command line when the selected aliases declare none:
+same main options on the command line when the selected aliases declare none
+(none at all starts a REPL, like `clj -M:dev`):
 
 ```bash
 jolt -Sdeps '{:paths ["src" "test"]}' -e "(require 'my.app-test 'clojure.test)
@@ -160,9 +162,8 @@ failing the query, so `jolt -A:test:dev -Spath` and `jolt -Spath -M:test` both
 answer. Under `-Scp` the deps.edn is still read — aliases, `:main-opts` and
 tasks work — but nothing is expanded, so a shared library declared by a
 *dependency* is not loaded (the project's own `:jolt/native` still is).
-`-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: there is no
-classpath cache to force, fetching is serial, and there is no JVM to pass
-options to.
+`-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: no classpath
+cache to force, serial fetching, no JVM to pass options to.
 
 ## Differences from Clojure
 
@@ -173,7 +174,7 @@ doubles, `BigDecimal` with `M` literals and `with-precision`), lazy and infinite
 sequences, transducers, destructuring, multimethods with hierarchies,
 protocols/records (`deftype`/`defrecord`/`reify`/`extend-protocol`), metadata,
 namespaces, atoms, refs/STM (`ref`/`dosync`/`alter`/`commute`),
-`future`/`promise`/`agent`/`pmap`, `clojure.core.async`, runtime
+`future`/`promise`/`agent`/`pmap`, `clojure.core.async` (and `.flow`), runtime
 `eval`/`load-string`/`defmacro`, and the full reader (`#()`, `#_`, `#?`, tagged
 literals, `#"…"`) all behave as on the JVM. `=` is category-aware
 (`(= 3 3.0)` ⇒ `false`) and `==` is value-equality, as in Clojure. The genuine
@@ -208,6 +209,18 @@ divergences:
   portable Clojure. It resolves first, so a library can ship a portable
   `foo.cljc` next to a `foo.jolt` that wins on jolt, the way `.clj` wins over
   `.cljc` on the JVM. `data_readers.jolt` works like `data_readers.clj` too.
+- **Digit separators in numbers.** `1_000_000`, `0xFF_FF` and `36rR_Z` read as
+  numbers; the JVM raises `Invalid number` on all three. The rule is Java's — an
+  underscore must sit between two digits, never against a sign, radix marker,
+  decimal point, exponent marker or `N`/`M` suffix — so `1_` and `0x_52` still
+  raise. A leading underscore is still an ordinary symbol. `clojure.edn` refuses
+  separators: edn's grammar has none, and a config that read only here would
+  fail in every other edn reader. Additive — nothing that reads on the JVM
+  changes meaning.
+- **Reader macros.** The `#` dispatch table is open for punctuation:
+  `jolt.reader/set-dispatch-macro!` puts a reader on a character. jolt ships
+  `#$"a ~{x}"` interpolation (`clojure.core.strint`'s grammar) on it. Additive —
+  `#<punct>` is a read error on the JVM.
 - **Clojure is a terminal dependency.** jolt *is* Clojure, so
   `org.clojure/clojure` in a `deps.edn` contributes neither an artifact nor
   children. On the JVM that artifact pulls in `org.clojure/spec.alpha`, so a
@@ -218,6 +231,99 @@ The tracked, gated list of value-level divergences is
 [test/conformance/known-divergences.edn](test/conformance/known-divergences.edn);
 the prose version is [Differences from Clojure](https://jolt-lang.github.io/docs/differences.html)
 on the docs site.
+
+## Scripts
+
+A file runs with `run` or without it, and needs no extension and no build step:
+
+```bash
+jolt script.clj              # load a file (`jolt run script.clj` is identical)
+jolt -f build                # ...when the file's name is a command or a task
+jolt - < script.clj          # read the program from stdin
+```
+
+So a first line of `#!/usr/bin/env jolt` makes the file an executable script, the
+way a `bb` one is:
+
+```bash
+$ cat hello
+#!/usr/bin/env jolt
+(println "hello" (first *command-line-args*))
+$ chmod +x hello
+$ ./hello world
+hello world
+```
+
+`#!` is a comment to end of line in Clojure's reader, so the line costs the
+program nothing. All it needs is a `jolt` on `PATH` — an installed binary, or a
+symlink to a checkout's `bin/jolt`. (Windows has no kernel shebang, so there
+`jolt script` is how a script runs.) Arguments after the script are `*command-line-args*` — the first
+standalone `--` ends option parsing — `*file*` is the script, stdin is left for
+the program to read, and `(System/exit n)` sets the process's exit status (an
+uncaught exception exits 1). An `(ns …)` form with `:require`s is fine, and when
+the directory has a `deps.edn` the script sees the project's paths and
+dependencies, like any other run.
+
+A built-in command wins a name it shares with a file — `jolt build` is always the
+compiler — which is what `-f` is for. A task loses to one: a file on disk is what
+`jolt greet` means when the project also has a `greet` task. A task loses to a
+command too, unless it claims the name with `:override-builtin true` — and when
+one does lose, jolt says so, because the command answering in a project that
+declares the task otherwise reads like the task went missing. `jolt run greet`
+reaches the task either way.
+
+Startup is jolt's boot floor — the runtime and compiler image are instantiated on
+every run, which measures ~0.17s against babashka's ~0.01s on the same machine. A
+script called in a loop is better compiled once: give it an `(ns …)` with a
+`-main` and `jolt build -m` it into a binary.
+
+`jolt completions zsh` gives a shell the project's task names, so a script or a
+task is a TAB away: see [Shell completion](#shell-completion).
+
+## Shell completion
+
+`jolt completions SHELL` prints a completion function for zsh, bash or fish.
+`jolt <TAB>` then offers jolt's commands and the project's tasks, and under zsh
+each task carries its `:doc`:
+
+```
+$ jolt build<TAB>
+build             -- compile a standalone binary or shared library
+build:linux       -- Compile native/libtsj.so for AWS Lambda (AL2023 arm64) via Docker
+build:linux:host  -- Compile native/libtsj.so natively for THIS Linux host (no Docker)
+```
+
+For zsh, in `~/.zshrc` after `compinit`:
+
+```bash
+source <(jolt completions zsh)
+```
+
+Or save it as `_jolt` somewhere on `$fpath`, which works too. For bash, source
+`jolt completions bash` from `~/.bashrc`. For fish, save `jolt completions fish`
+as `~/.config/fish/completions/jolt.fish`.
+
+A snippet holds jolt's own commands directly, since those change only when the
+binary does. The project's tasks it fetches with `jolt completions tasks` and
+caches against the mtimes of `deps.edn` and `bb.edn`, so a press costs nothing
+until one of those files moves. Under zsh that path forks no process at all and
+measures 0.4ms. Set `JOLT_COMPLETION_NO_CACHE=1` to bypass it. Fish is the
+exception: its completion function stays loaded for the session, so the tasks
+are cached in the shell's own variables, keyed on the directory they were read
+in, and a task added mid-session wants a new shell.
+
+`jolt completions tasks` is worth knowing on its own: one line per listable
+task, `name<TAB>doc`, which is the machine-readable form of what `jolt tasks`
+prints for a person. Anything scripting over a project's tasks should read that
+rather than parse the listing.
+
+A `:private` task and one whose name starts with `-` are left out, the same two
+`jolt tasks` hides. One case differs on purpose: a task sharing a built-in
+command's name is offered only when it wins that name with `:override-builtin`,
+because a completion's description says what the word will do, and for a task
+that loses to a command the answer is the command. `jolt tasks` lists it either
+way, being a list of what the project defines rather than of what typing the
+word gets you.
 
 ## Runtime dependencies
 
@@ -316,27 +422,76 @@ jolt build -m myapp.core -o myapp   # compile myapp.core's -main into ./myapp
 ./myapp arg1 arg2                   # runs anywhere; args reach -main
 ```
 
-Modes trade dynamism for speed: the default (release) build uses the proven code
-generator; `--opt` also runs the inference + inlining + scalar-replacement passes
-over the closed-world program; `--dev` is unoptimized. Numeric code unboxes to
-raw flonum/fixnum machine ops when types are proven — by whole-program inference,
-by JVM-style `^double`/`^long` hints, or by `(double x)`/`(long x)` casts where
-inference can't see. See
+Three modes trade dynamism for speed. The default (release) build direct-links
+and inlines your app's defs over a direct-linked `clojure.core`, runs
+whole-program inference, and drops the compiler when nothing in the program
+can reach `eval`; `--dev` (or `--no-direct-link`) keeps every app var
+redefinable; `--closed-world` also prunes every def `-main` cannot reach.
+Numeric code unboxes to raw flonum/fixnum machine ops when types are proven —
+by whole-program inference, by JVM-style `^double`/`^long` hints, or by
+`(double x)`/`(long x)` casts where inference can't see. See
 [Building & Running](https://jolt-lang.github.io/docs/building-and-deps.html#typed-arithmetic-and-inference).
 
-Two opt-in closed-world flags cut dispatch cost and binary size:
-
 ```bash
-jolt build -m myapp.core --direct-link   # app->app calls bind directly (no var lookup)
-jolt build -m myapp.core --tree-shake    # ship only code reachable from -main
+jolt build -m myapp.core --closed-world  # ship only code reachable from -main
 ```
 
-`--tree-shake` walks the call graph across your app, its libraries, and
+`--closed-world` (`--tree-shake` is the older spelling, still accepted) walks
+the call graph across your app, its libraries, and
 `clojure.core`, drops everything unreachable from `-main`, and typically removes
 1–2 MB. It stays sound by bailing out — keeping everything, and naming the
 library responsible — when reachable code resolves vars by name at runtime
 (`eval`/`resolve`/`ns-resolve`/…). See
 [RFC 0007](https://jolt-lang.github.io/docs/rfc/0007-compilation-modes-and-binary-output.html).
+
+When the site it names is dead in a built binary and you can say why — spec's
+`res` only qualifies a symbol for a description, spec.gen's `dynaload` sits
+behind a `delay` nothing forces — a `deps.edn` can vouch for it and the shake
+proceeds past it, keeping nothing extra:
+
+```clojure
+:jolt/tree-shake {:allow-dynamic [clojure.spec.alpha/res
+                                  clojure.spec.gen.alpha/dynaload]}
+```
+
+The key is read from the app's `deps.edn` and from every library's, and
+unioned, so a library ships its list once for every app that uses it. The bail
+message ends with the exact line to paste for the sites that remain; paste
+what it prints, because the def to name is the one the lookup ended up in
+after inlining, which may be the caller of the fn that wrote it. A vouch
+covers a RESOLUTION the graph cannot follow — `resolve`, `ns-publics`,
+`requiring-resolve` — and a `require` of a computed name, which is what
+spec.gen's `dynaload` does before its `resolve`; both are the one assertion
+that the site never runs in the binary, or names only what the build baked.
+It does not cover a def that runs the compiler on code (`eval`,
+`load-string`, an image restore): that bails whatever the list says, because
+the compiler image is direct-linked against the whole of `clojure.core` and
+cannot run over a pruned one, and the hint never offers a key for such a def.
+
+Vouching wrongly does not fail the build — it moves the failure into the
+binary, and into the default build as much as a `--closed-world` one, because
+the compiler verdict every build takes reads the same list: a vouched site is
+not a reason to keep the compiler. A `resolve` of a def the shake dropped
+answers `nil` where the unshaken binary answers the var, silently. A `require`
+of a computed name that runs and names a namespace the build did not bake
+fails at the call, by name: the binary has that namespace's source to compile
+and no compiler, and the loader says so, pointing at the vouch. Name a site
+only when you can say why it is dead.
+
+`--boot` trades the other way. The boot image ships as a prebuilt heap image
+(*vfasl*), which starts faster and takes more room — `--boot small` keeps the
+image but compresses it with gzip, and `--boot plain` drops it altogether:
+
+```bash
+jolt build -m myapp.core --boot small    # smallest binary that still loads as an image
+jolt build -m myapp.core --boot plain    # the pre-0.8.5 boot  (alias: --no-vfasl)
+```
+
+For a mobile app, where the download is the number that matters, `small` is
+usually the one: on the apps measured it is about a third smaller than `plain`
+*and* still faster to start. `JOLT_BOOT=small` and `:jolt/build {:boot :small}`
+do the same. Measure on your own target — the ratios depend on what your image
+holds.
 
 Built executables carry an optional startup profiler: launch one with
 `JOLT_STARTUP_PROFILE=1` to get per-stage wall time, process CPU time,
@@ -375,7 +530,7 @@ The C side `dlopen`s it, calls `jolt_library_init` once, then resolves each
 entry by name with `jolt_lookup` and casts to its type;
 [Native Interop](https://jolt-lang.github.io/docs/native-interop.html) has the
 full example, the type keywords (the same ones `foreign-fn` uses), and the
-threading limits. The same `--opt`/`--dev`/`--direct-link`/`--tree-shake` flags
+threading limits. The same `--opt`/`--dev`/`--direct-link`/`--closed-world` flags
 apply, and the same Chez kernel development files + C compiler are required to
 link.
 

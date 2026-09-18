@@ -95,8 +95,10 @@
 
 ;; (into to xform from): transduce `from` through `xform` with conj as the rf.
 (define (into-xform to xform from)
+  ;; conj onto a nil accumulator starts a list, as (conj nil x) does — into nil
+  ;; is (reduce conj nil from) on the JVM, and an empty source leaves nil.
   (let* ((conj-rf (lambda a (if (fx=? (length a) 1) (car a)   ; completion = identity
-                               (jolt-conj1 (car a) (cadr a)))))
+                               (jolt-conj1 (if (jolt-nil? (car a)) jolt-empty-list (car a)) (cadr a)))))
          (xrf (jolt-invoke xform conj-rf))
          ;; into-fold, not reduce-seq: an IReduce(Init) source drives its own
          ;; reduce here too (seq.ss).
@@ -111,19 +113,31 @@
       ;; lazily concat the per-element results — no seq->list, so mapcat over an
       ;; infinite source stays lazy; the outer lazy-seq node defers the first
       ;; element so a side-effecting f does not fire at construction (LazySeq).
-      (jolt-make-lazy-seq (lambda () (jolt-seq (lazy-concat-seq (apply jolt-map f colls)))))))
+      (jolt-make-lazy-src lz-mapcat f colls)))
 
 ;; take-while / drop-while: 1-arg -> transducer; 2-arg -> a seq over the coll.
+(define lz-mapcat
+  (register-lazy-src! 'mapcat
+    (lambda (f colls) (jolt-seq (lazy-concat-seq (apply jolt-map f colls))))))
+(define lz-take-while-top
+  (register-lazy-src! 'take-while-top
+    (lambda (pred coll) (jolt-seq (take-while-seq pred (jolt-seq coll))))))
+(define lz-drop-while
+  (register-lazy-src! 'drop-while
+    (lambda (pred coll) (jolt-seq (drop-while-seq pred coll)))))
+(define lz-take-while
+  (register-lazy-src! 'take-while
+    (lambda (pred s) (take-while-seq pred (jolt-seq (seq-more s))))))
 (define (take-while-seq pred s)
   (if (jolt-nil? s) jolt-empty-list
       (let ((x (seq-first s)))
         (if (jolt-truthy? (jolt-invoke pred x))
-            (cseq-lazy x (lambda () (take-while-seq pred (jolt-seq (seq-more s)))))
+            (cseq-lazy x (make-lazy-src lz-take-while pred s))
             jolt-empty-list))))
 (define jolt-take-while
   (case-lambda
     ((pred) (td-take-while pred))
-    ((pred coll) (jolt-make-lazy-seq (lambda () (jolt-seq (take-while-seq pred (jolt-seq coll))))))))
+    ((pred coll) (jolt-make-lazy-src lz-take-while-top pred coll))))
 (define (drop-while-seq pred coll)
   (let loop ((s (jolt-seq coll)))
     (if (and (not (jolt-nil? s)) (jolt-truthy? (jolt-invoke pred (seq-first s))))
@@ -132,37 +146,50 @@
 (define jolt-drop-while
   (case-lambda
     ((pred) (td-drop-while pred))
-    ((pred coll) (jolt-make-lazy-seq (lambda () (jolt-seq (drop-while-seq pred coll)))))))
+    ((pred coll) (jolt-make-lazy-src lz-drop-while pred coll))))
 
 ;; partition: (partition n coll), (partition n step coll), or
 ;; (partition n step pad coll). Only complete partitions of size n are kept;
 ;; with pad, a short final partition is padded from pad (and may be < n if pad
 ;; runs out). Each partition is a seq; the whole result is a lazy seq of seqs.
+(define lz-partition
+  (register-lazy-src! 'partition
+    (lambda (shape coll)
+      (jolt-seq (partition* (car shape) (cadr shape) (caddr shape) (cadddr shape) coll)))))
+(define lz-partition-more
+  (register-lazy-src! 'partition-more
+    (lambda (shape s)
+      (partition-walk (car shape) (cadr shape) (caddr shape) (cadddr shape)
+                      (jolt-seq (advance-by (cadr shape) s))))))
 (define jolt-partition
   (case-lambda
-    ((n coll) (jolt-make-lazy-seq (lambda () (jolt-seq (partition* (->idx n) (->idx n) #f #f coll)))))
-    ((n step coll) (jolt-make-lazy-seq (lambda () (jolt-seq (partition* (->idx n) (->idx step) #f #f coll)))))
-    ((n step pad coll) (jolt-make-lazy-seq (lambda () (jolt-seq (partition* (->idx n) (->idx step) #t pad coll)))))))
+    ((n coll) (jolt-make-lazy-src lz-partition (list (->idx n) (->idx n) #f #f) coll))
+    ((n step coll) (jolt-make-lazy-src lz-partition (list (->idx n) (->idx step) #f #f) coll))
+    ((n step pad coll) (jolt-make-lazy-src lz-partition (list (->idx n) (->idx step) #t pad) coll))))
 (define (take-n n s)               ; -> (values list-of-first-n remaining-seq taken-count)
   (let loop ((n n) (s s) (acc '()))
     (if (or (fx<=? n 0) (jolt-nil? s))
         (values (reverse acc) s (length acc))
         (loop (fx- n 1) (jolt-seq (seq-more s)) (cons (seq-first s) acc)))))
-(define (partition* n step has-pad pad coll)
-  (let loop ((s (jolt-seq coll)))
+(define (partition* n step has-pad pad coll) (partition-walk n step has-pad pad (jolt-seq coll)))
+;; a top-level walk, not a named let, so a cell's tail can name it. The four
+;; shape values ride in one slot as a list -- lazy-src carries three.
+(define (partition-walk n step has-pad pad s0)
+  (let ((shape (list n step has-pad pad)))   ; once per walk, not once per cell
+   (let loop ((s s0))
     (if (jolt-nil? s) jolt-empty-list
         (let-values (((part rest taken) (take-n n s)))
           (cond
             ;; full partition: emit it, advance `step` from its START
             ((fx=? taken n)
              (cseq-lazy (list->cseq part)
-                        (lambda () (loop (jolt-seq (advance-by step s))))))
+                        (make-lazy-src lz-partition-more shape s)))
             ;; short final partition with pad: top up to n from pad, then stop
             ((and has-pad (fx>? taken 0))
              (let ((padded (append part (take-list (- n taken) (jolt-seq pad)))))
-               (cseq-lazy (list->cseq padded) (lambda () jolt-empty-list))))
+               (cseq-lazy (list->cseq padded) (make-lazy-src lz-empty #f #f))))
             ;; short final partition, no pad: dropped (Clojure keeps only full ones)
-            (else jolt-empty-list))))))
+            (else jolt-empty-list)))))))
 (define (advance-by step s)        ; drop `step` elements from s (seq), returns a seq
   (let loop ((step step) (s s))
     (if (or (fx<=? step 0) (jolt-nil? s)) s
@@ -182,8 +209,13 @@
 ;; sorted-map-by / sorted-set-by cannot drift apart on which values they accept.
 ;; iface-method + record-method-dispatch live in records.ss (loaded later);
 ;; resolved at call time.
+;; A host-shim Comparator object (String/CASE_INSENSITIVE_ORDER) keeps its
+;; `compare` in the jhost method table, not the deftype/reify one. The java host
+;; layer (host-static.ss, loaded later) set!s this to look there; the Gambit
+;; boot, which has no jhost, keeps the #f default.
+(define jhost-compare-method? (lambda (x) #f))
 (define (jolt-comparator-fn cmp)
-  (if (iface-method cmp "compare" #f)
+  (if (or (iface-method cmp "compare" #f) (jhost-compare-method? cmp))
       (lambda (a b) (record-method-dispatch cmp "compare" (jolt-list a b)))
       (lambda (a b) (jolt-invoke cmp a b))))
 (def-var! "clojure.core" "__comparator-fn" jolt-comparator-fn)
@@ -211,7 +243,14 @@
 ;; collections do not. Must NOT be value equality: a deftype whose .equals calls
 ;; (identical? this o) to short-circuit (e.g. core.logic's Substitutions) would
 ;; otherwise recur forever (identical? -> = -> equiv -> .equals -> identical?).
-(define (jolt-identical? a b) (eq? a b))
+;; Spliced, like the predicates in values.ss (see jolt-nil? there for why). The
+;; reference compiler inlines identical? too (:inline -> Util/identical), and a
+;; var call here already cost ~100ns per use in cell-less seed code.
+(define (jolt-identical?-fn a b) (eq? a b))
+(define-syntax jolt-identical?
+  (syntax-rules ()
+    ((_ a b) (eq? a b))
+    ((_ e ...) (jolt-identical?-fn e ...))))
 
 ;; Give the seq.ss native procedures their transducer (1-arg) arity — the emitter
 ;; lowers (map f)/(filter p)/(take n) at the wrong arity to the bare procedure
@@ -241,11 +280,12 @@
 (def-var! "clojure.core" "reduced?" jolt-reduced-pred)
 (def-var! "clojure.core" "mapcat" jolt-mapcat)
 (def-var! "clojure.core" "zipmap" jolt-zipmap)
+(def-var! "clojure.core" "reduce-kv" jolt-reduce-kv)
 (def-var! "clojure.core" "take-while" jolt-take-while)
 (def-var! "clojure.core" "drop-while" jolt-drop-while)
 (def-var! "clojure.core" "partition" jolt-partition)
 (def-var! "clojure.core" "sort" jolt-sort)
-(def-var! "clojure.core" "identical?" jolt-identical?)
+(def-var! "clojure.core" "identical?" jolt-identical?-fn)
 
 ;; rseq: vectors + sorted colls only (Clojure), the reverse of the ascending seq.
 ;; Clojure's contract is explicit that this is CONSTANT time ("Returns, in
@@ -260,10 +300,12 @@
 ;; "vector-backed, ASCENDING from ci" and drive the O(1) count/drop and the
 ;; vec-reduce fast paths, so a descending seq wearing those fields would make all
 ;; three answer for the wrong direction.
+(define lz-vec-rseq
+  (register-lazy-src! 'vec-rseq (lambda (v i) (vec->rseq v (fx- i 1)))))
 (define (vec->rseq v i)
   (if (fx<? i 0)
       jolt-nil
-      (cseq-lazy/k (pvec-nth-d v i jolt-nil) (lambda () (vec->rseq v (fx- i 1))) sk-rseq)))
+      (cseq-lazy/k (pvec-nth-d v i jolt-nil) (make-lazy-src lz-vec-rseq v i) sk-rseq)))
 (define (jolt-rseq coll)
   (cond
     ((pvec? coll)
@@ -278,7 +320,7 @@
     ;; data.priority-map — drives rseq through its own method.
     ((and (jrec? coll) (find-method-any-protocol (jrec-tag coll) "rseq"))
      => (lambda (f) (jolt-invoke f coll)))
-    (else (jolt-throw (jolt-ex-info "rseq requires a vector or sorted collection" (jolt-hash-map))))))
+    (else (jolt-cast-throw coll "clojure.lang.Reversible"))))
 (def-var! "clojure.core" "rseq" jolt-rseq)
 
 ;; clojure.core/unchecked-* — host-defined wrapping (Java long) arithmetic from

@@ -1,0 +1,5 @@
+Unhandled exception (ArithmeticException): Divide by zero
+  at ./test/errors/runtime/divide-by-zero/input.clj:5:1
+  trace:
+    input/f (./test/errors/runtime/divide-by-zero/input.clj:3)
+exit: 1

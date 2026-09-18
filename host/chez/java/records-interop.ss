@@ -15,11 +15,12 @@
 (define (exception-isa? cls wanted)
   (jch-isa? (jch-fqn-of-simple cls) wanted))
 
-;; A raw Chez condition (an arity or non-seqable error Chez itself raised) carries
-;; no jolt exception class. All operation sites now throw typed jolt throwables
-;; (ArityException, IllegalArgumentException, ClassCastException, etc.) BEFORE
-;; Chez can raise a raw condition. Any raw condition that still escapes is a
-;; runtime error — classify it as RuntimeException.
+;; A raw Chez condition (an arity or type error Chez itself raised) carries no
+;; jolt exception class. Operation sites throw typed jolt throwables
+;; (ArityException, IllegalArgumentException, ClassCastException, etc.) before
+;; Chez can raise; one that still escapes is classified into a typed throwable
+;; at the catch boundary (host-faults.ss), so nothing below ever sees a bare
+;; condition as a throwable.
 ;; instance-check: (type-sym val) — type/protocol membership. Host shims loaded
 ;; later (io, inst-time, natives-array, natives-queue, host-static-classes)
 ;; register an arm with register-instance-check-arm! instead of set!-wrapping
@@ -31,13 +32,21 @@
   (set! instance-check-registry (cons f instance-check-registry)))
 
 ;; Object / java.lang.Object is the root of the type hierarchy: every non-nil
-;; value is an instance of Object; nil is not an instance of anything.
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (let ((tn (symbol-t-name type-sym)))
-      (if (or (string=? tn "Object") (string=? tn "java.lang.Object"))
-          (not (jolt-nil? val))
-          'pass))))
+;; value is an instance of Object; nil is not an instance of anything. This is
+;; NOT an arm — instance-check decides it BEFORE the registry, so no arm can
+;; answer the root type. An arm that models its own values (the java.time
+;; value-semantics seam registers one through __register-instance-check!)
+;; naturally answers a definitive false for any class its value's set does not
+;; list, and the root rule — registered first, hence asked LAST — never got to
+;; speak. That made (instance? Object <java.time value>) false and, through it,
+;; (.cast Object v) throw: SCI's box-arg casts every interop argument to its
+;; reflected parameter type and jolt reports every parameter as Object, so every
+;; interpreted call passing such a value died in the cast (#985).
+(define (root-object-type? ts)
+  (let ((tn (cond ((symbol-t? ts) (symbol-t-name ts))
+                  ((string? ts) ts)
+                  (else #f))))
+    (and tn (or (string=? tn "Object") (string=? tn "java.lang.Object")))))
 
 (define (instance-check-base type-sym val)
   (let ((tname (symbol-t-name type-sym)))
@@ -82,11 +91,13 @@
                          (not (char=? (string-ref type-sym 0) #\[))))
                 (jolt-symbol #f type-sym)
                 type-sym)))
-    (let loop ((rs instance-check-registry))
-      (if (null? rs)
-          (instance-check-base ts val)
-          (let ((r ((car rs) ts val)))
-            (if (eq? r 'pass) (loop (cdr rs)) r))))))
+    (if (root-object-type? ts)
+        (not (jolt-nil? val))
+        (let loop ((rs instance-check-registry))
+          (if (null? rs)
+              (instance-check-base ts val)
+              (let ((r ((car rs) ts val)))
+                (if (eq? r 'pass) (loop (cdr rs)) r)))))))
 (define (case-string tname val)
   (cond
     ((member tname '("Number" "java.lang.Number")) (number? val))
@@ -106,6 +117,9 @@
     ((member tname '("Atom" "clojure.lang.Atom")) (jolt-atom? val))
     ((member tname '("IFn" "clojure.lang.IFn" "Fn" "clojure.lang.Fn")) (procedure? val))
     ((member tname '("Pattern" "java.util.regex.Pattern")) (regex-t? val))
+    ((member tname '("Matcher" "java.util.regex.Matcher"
+                     "MatchResult" "java.util.regex.MatchResult"))
+     (matcher-t? val))
     ((member tname '("URI" "java.net.URI"))
      (and (jhost? val) (string=? (jhost-tag val) "uri")))
     ((member tname '("File" "java.io.File")) (jfile? val))
@@ -137,12 +151,9 @@
 ;; typed host throwable via jolt-host-throwable) or a raw Chez condition (an error
 ;; the host itself raised). Both answer here.
 ;;
-;; Returns a BOXED result (a one-element list) or #f for "not a Throwable method",
-;; matching dot-object-method — a legitimate nil/#f result has to stay
-;; distinguishable from "no such method".
-(define (jolt-throwable-value? v)
-  (or (jolt-ex-info-record? v) (condition? v)))
-
+;; jolt-throwable-method returns a BOXED result (a one-element list) or #f for
+;; "not a Throwable method", matching dot-object-method — a legitimate nil/#f
+;; result has to stay distinguishable from "no such method".
 (define (jolt-throwable-message v)
   (cond ((jolt-ex-info-record? v) (jolt-ex-info-record-message v))
         ((condition? v) (condition->message-string v))
@@ -208,13 +219,14 @@
     (else #f)))
 
 ;; Broad-catch fallback for catch-clause dispatch (analyze-try desugars
-;; (catch C e …) to (or (instance? C e) (__catch-broad? "C" e))). A jolt host
-;; condition or a raw raised value carries no jolt exception class, so instance?
-;; can't place it; a Clojure (catch C e) over such a value matches when C is
-;; RuntimeException (or a subclass) / Exception / Throwable — most host runtime
-;; errors are RuntimeExceptions. Typed throwables (ex-info records, (SomeException. …))
-;; are recognized by instance? as Throwable, so untyped? is false and they dispatch
-;; precisely through the instance? arm instead.
+;; (catch C e …) to (or (instance? C e) (__catch-broad? "C" e))). A raised value
+;; that is no throwable at all (a throw of a keyword or a string) carries no
+;; exception class, so instance? can't place it; a Clojure (catch C e) over such
+;; a value matches when C is RuntimeException (or a subclass) / Exception /
+;; Throwable. Typed throwables (ex-info records, (SomeException. …), and every
+;; host fault by the time a catch binds it — host-faults.ss) are recognized by
+;; instance? as Throwable, so untyped? is false and they dispatch precisely
+;; through the instance? arm instead.
 (define throwable-type-sym (jolt-symbol #f "Throwable"))
 (define (simple-class-name nm)
   (let loop ((i (- (string-length nm) 1)))

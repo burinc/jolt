@@ -109,6 +109,13 @@
   (check "nth vector" (jolt-nth (jolt-vector 10 20 30) 1) 20)
   (check "nth list" (jolt-nth (jolt-list 5 6 7) 2) 7)
   (check "nth string" (jolt-nth "abc" 1) #\b)
+  ;; subs's in-range arm is a block copy through sa-string-copy-range!
+  ;; (converters.ss); a Chez-ordered string-copy! here returned a blank span and
+  ;; wrote it back over the source.
+  (check "subs cuts the span and leaves the source alone"
+    (let ((src (string-copy "hello world")))
+      (list (jolt-subs src 6 11) (jolt-subs src 6) (jolt-subs src 0 0) src))
+    (list "world" "world" "" "hello world"))
   (check "nth out of range -> not-found" (jolt-nth (jolt-vector 10 20) 5 99) 99)
   (check-true "nth out of range raises jolt-throw"
     (guard (e (#t (jolt-throw-condition? e)))
@@ -294,6 +301,25 @@
 (test-meta)
 (test-vars)
 (test-equality)
+
+;; Forcing a lazy cell once a thread exists takes seq.ss's claim path
+;; (force-claimed!), which the single-threaded rows above never reach: every
+;; shim that path needs on this host has to be present, and two threads on the
+;; same unforced cell must still run its thunk once.
+(define (test-threaded-force)
+  (printf "== forcing lazy cells with threads ==\n")
+  (let* ((runs 0)
+         (cell (cseq-lazy 0 (lambda () (set! runs (+ runs 1)) (cseq-realized 1 jolt-nil))))
+         (node (jolt-make-lazy-seq (lambda () (set! runs (+ runs 1)) (cseq-realized 2 jolt-nil))))
+         (t1 (fork-thread (lambda () (seq-more cell) (force-lazyseq node))))
+         (t2 (fork-thread (lambda () (seq-more cell) (force-lazyseq node)))))
+    (thread-join! t1) (thread-join! t2)
+    (check "a forked thread flips the multi-threaded flag" jolt-mt? #t)
+    (check "two threads forcing one cell and one node ran each thunk once" runs 2)
+    (check "the cell's tail is published" (seq-first (seq-more cell)) 1)
+    (check "the node's value is published" (seq-first (force-lazyseq node)) 2)
+    (check "no claim is left behind" (list (cseq-lock cell) (jolt-lazyseq-lock node)) '(#f #f))))
+(test-threaded-force)
 
 (printf "\nkernel-test: ~a failure(s)\n" failures)
 (if (= failures 0)

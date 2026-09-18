@@ -37,6 +37,58 @@
    "exp" "flexp" "log" "fllog" "floor" "flfloor" "ceil" "flceiling"
    "pow" "flexpt" "abs" "flabs"})
 
+;; java.lang.Math members that are integer-in/integer-out on the JVM, as
+;; [op arity] over the jolt-l-* fixnum macros (host/chez/seq.ss). Without this a
+;; Math call on a proven :long took host-static-call — a string-keyed method
+;; lookup per invocation — where the flonum side had been lowering to a native op
+;; all along.
+;;
+;; The jolt-l-* helpers, not bare fx ops: a :long is promised to be within the
+;; 64-bit range, which is WIDER than Chez's 61-bit fixnum, so a bare fxmin would
+;; crash on a legitimate :long. Each one tests its operands and falls back to the
+;; generic op, exactly as the arithmetic path does. floorMod reuses jolt-l-mod —
+;; Math.floorMod is Scheme's modulo — and floorDiv gets jolt-floor-quotient, since
+;; the quot above truncates toward zero where floorDiv floors.
+;;
+;; Only members the Math shim (host/chez/java/host-static-methods.ss) actually
+;; carries. A member absent there must stay absent here too, or a type hint would
+;; decide whether the call RESOLVES at all: Math/addExact is not shimmed, so
+;; (Math/addExact 2 3) raises IllegalArgumentException — and lowering a hinted
+;; (Math/addExact ^long a ^long b) to jolt-l+ would make the same call succeed
+;; because a parameter carried a tag. Adding the Exact family is a shim change, not
+;; an optimization; see the follow-up bead.
+(def ^:private math-lng-ops
+  {"abs" ["jolt-l-abs" 1]
+   "min" ["jolt-l-min" 2] "max" ["jolt-l-max" 2]
+   "floorDiv" ["jolt-floor-quotient" 2] "floorMod" ["jolt-l-mod" 2]})
+
+;; Interop methods that answer a Chez FIXNUM when the receiver is proven (the
+;; :target-type stamp jolt.passes.types/the analyzer puts on a :host-call). Both
+;; the direct emit (string-direct-emit) and the generic jolt-string-method arm
+;; return a fixnum for these — string-length, str-index-of-any, java-string-hash
+;; (which is jolt-s32-narrowed), jolt-str-compare's -1/0/1, char->integer — so a
+;; :long kind lets the surrounding arithmetic take the fx path.
+;;
+;; A method whose answer is NOT a fixnum is absent, and so is every method on an
+;; unproven receiver: a `.length` on a record is a protocol method that can answer
+;; anything. A LYING hint (a non-string at runtime) reaches record-method-dispatch
+;; and its result meets an fx op, which is the same contract a wrong ^String hint
+;; already has at the accessor.
+(def ^:private str-fx-methods
+  #{"length" "indexOf" "lastIndexOf" "hashCode" "compareTo" "compareToIgnoreCase"
+    "codePointAt"})
+(defn- interop-fx-kind [tt m]
+  (when (or (and (= :str tt) (contains? str-fx-methods m))
+            (and (= :kw tt) (= "hashCode" m)))
+    :long))
+
+;; Array kinds read through jolt-vaget/jolt-vaset — everything but double/float,
+;; whose flvector the :fl-aget/:fl-aset path unboxes AND types. :bytes reads here
+;; but writes through jolt-baset, which owns the signed-8-bit narrowing (see the
+;; aset clauses in an-invoke).
+(def ^:private boxed-akinds #{:longs :ints :bytes :objects})
+(def ^:private boxed-aset-kinds #{:longs :ints :objects})
+
 ;; --- operand classification -------------------------------------------------
 (defn- int-lit? [n]
   (and (= :const (get n :op))
@@ -70,8 +122,9 @@
 ;; jolt.backend-scheme/dbl-ops resp. lng-ops, or emit-numeric splices a nil op.
 (defn- dbl-spec [nm n]
   (cond
-    (and (>= n 1) (contains? #{"+" "-" "*" "/" "min" "max"} nm)) :double
-    (and (= n 1) (contains? #{"inc" "dec"} nm)) :double
+    (and (>= n 1) (contains? #{"+" "-" "*" "/" "min" "max"
+                               "unchecked-add" "unchecked-subtract" "unchecked-multiply"} nm)) :double
+    (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec" "unchecked-negate"} nm)) :double
     (and (>= n 2) (contains? #{"<" ">" "<=" ">=" "=" "=="} nm)) :bool
     :else nil))
 
@@ -82,7 +135,7 @@
   (cond
     (and (>= n 1) (contains? #{"+" "-" "*" "min" "max"
                                "unchecked-add" "unchecked-subtract" "unchecked-multiply"} nm)) :long
-    (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec"} nm)) :long
+    (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec" "unchecked-negate"} nm)) :long
     (and (= n 2) (contains? #{"quot" "rem" "mod"} nm)) :long
     (and (>= n 2) (contains? #{"<" ">" "<=" ">=" "=" "=="} nm)) :bool
     :else nil))
@@ -158,9 +211,9 @@
   (let [fnode (get node :fn)
         nm (when (and (= :var (get fnode :op)) (= "clojure.core" (get fnode :ns)))
              (get fnode :name))
-        math-op (when (and (= :host-static (get fnode :op))
-                           (= "Math" (get fnode :class)))
-                  (get math-fl-ops (get fnode :member)))
+        math-static? (and (= :host-static (get fnode :op)) (= "Math" (get fnode :class)))
+        math-op (when math-static? (get math-fl-ops (get fnode :member)))
+        math-lng (when math-static? (get math-lng-ops (get fnode :member)))
         fnode' (nth (an fnode tenv) 1)
         ars (mapv (fn [a] (an a tenv)) (get node :args))
         argnodes (mapv (fn [r] (nth r 1)) ars)
@@ -190,6 +243,19 @@
                                        :else nd)))
                         ars)]
         [:double (assoc node1 :args args' :fl-op math-op)])
+      ;; java.lang.Math over proven fixnum operands -> the jolt-l-* fixnum macro,
+      ;; result typed :long so it doesn't de-opt the surrounding integer arithmetic.
+      ;; Mirrors the flonum clause above: at least one genuine :long operand (so
+      ;; (Math/abs 5) keeps its generic result) and every other operand a :long or a
+      ;; fixnum-range integer literal. A bignum literal is excluded for the reason
+      ;; the :long arithmetic path excludes it — the fx arm takes fixnums only.
+      (and math-lng (= (nth math-lng 1) n)
+           (some (fn [r] (= :long (nth r 0))) ars)
+           (every? (fn [r] (let [k (nth r 0) nd (nth r 1)]
+                             (or (= k :long)
+                                 (and (int-lit? nd) (fixnum-lit? (get nd :val))))))
+                   ars))
+      [:long (assoc node1 :lng-op (nth math-lng 0))]
       ;; (aget ^doubles-array i) -> unboxed flvector read, result proven :double, so
       ;; the surrounding arithmetic unboxes to fl*/fl+. A PROVEN-:long (or fixnum-
       ;; literal) index is tagged :fl-idx-long so the back end emits (flvector-ref
@@ -202,6 +268,30 @@
                    (or (= ikind :long)
                        (and (int-lit? inode) (fixnum-lit? (get inode :val))))
                    (assoc :fl-idx-long true))])
+      ;; (aget ^longs/^ints/^bytes/^objects a i) -> the direct backing read
+      ;; (jolt-vaget), skipping jolt-nth's index nil-check, coercion and
+      ;; pvec/string/cseq/record dispatch walk. NO result kind: an int/long array
+      ;; widens past the fixnum range, so an element is not provably a fixnum.
+      (and (= nm "aget") (= n 2) (contains? boxed-akinds (nth (nth ars 0) 0)))
+      [nil (assoc node1 :v-aget true)]
+      ;; (aset ^longs/^ints/^objects a i v) -> the direct backing write, returning
+      ;; the stored value (JVM contract). ^bytes has its own clause below rather
+      ;; than joining this one: it is the one kind that NARROWS at the store, and
+      ;; jolt-vaset answers its argument, not what was stored.
+      (and (= nm "aset") (= n 3) (contains? boxed-aset-kinds (nth (nth ars 0) 0)))
+      [nil (assoc node1 :v-aset true)]
+      ;; (aset ^bytes a i v) -> jolt-baset, which stores an in-range fixnum into
+      ;; the bytevector directly and hands everything else (a flonum, a bignum, an
+      ;; out-of-range value, a boxed backing, a lying hint) to the generic seam
+      ;; that narrows it.
+      ;;
+      ;; NO result kind, for the reason :v-aget has none: the stored byte IS a
+      ;; fixnum when the array really is one, but a lying ^bytes hint reaches the
+      ;; generic seam, which answers whatever that array's kind holds — so an
+      ;; element is not provably a fixnum and the surrounding arithmetic must not
+      ;; be told it is.
+      (and (= nm "aset") (= n 3) (= :bytes (nth (nth ars 0) 0)))
+      [nil (assoc node1 :b-aset true)]
       ;; (aset ^doubles-array i v) -> unboxed flvector-set!; returns the stored value
       ;; (:double), so an accumulator over the aset result types too. A proven-:long
       ;; (or fixnum-literal) index tags :fl-idx-long and a proven-:double value tags
@@ -348,6 +438,11 @@
                               (assoc a :body (nth (an (get a :body) e) 1))))
                           (get node :arities)))])
       (= op :def) [nil (assoc node :init (nth (an (get node :init) tenv) 1))]
+      ;; a proven-receiver interop call answering a fixnum is a :long operand, so
+      ;; (+ (.length s) 1) lowers to the fx path rather than generic jolt-n+.
+      (= op :host-call)
+      [(interop-fx-kind (get node :target-type) (get node :method))
+       (map-ir-children (fn [c] (nth (an c tenv) 1)) node)]
       ;; every other op introduces no bindings and isn't numeric: descend with the
       ;; same env to specialize nested arithmetic, no kind.
       :else [nil (map-ir-children (fn [c] (nth (an c tenv) 1)) node)])))

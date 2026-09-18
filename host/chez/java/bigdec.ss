@@ -23,11 +23,6 @@
 
 (define-record-type jbigdec (fields unscaled scale) (nongenerative chez-jbigdec-v1))
 
-(define (bd-index-char s ch)
-  (let loop ((i 0))
-    (cond ((>= i (string-length s)) #f)
-          ((char=? (string-ref s i) ch) i)
-          (else (loop (+ i 1))))))
 
 ;; "1.50" -> {150,2}; "3" -> {3,0}; "-0.0" -> {0,1}; ".5" -> {5,1};
 ;; "1.0E300" -> {10,-299}; "1.5E-7" -> {15,8}. Throws NumberFormatException on
@@ -509,3 +504,210 @@
     (register-class-ctor! n jbd-class-ctor)
     (register-class-statics! n jbd-class-statics))
   '("BigDecimal" "java.math.BigDecimal"))
+
+;; --- java.math.BigDecimal's INSTANCE members ---------------------------------
+;; The value model above is complete and the class answers its ctor and statics,
+;; but a jbigdec is a RECORD, not a jhost, so none of the shim method tables
+;; reach it: every (.scale b), (.movePointLeft b 6), (.setScale b 4 …) walked the
+;; whole dispatch chain and ended at "No matching method … for class
+;; java.math.BigDecimal" — or, for a zero-argument member, at the field spelling
+;; of the same miss. The JDK's instance API is defined entirely over the unscaled
+;; value and the scale, which is exactly what the record carries, so the members
+;; are that arithmetic under the Java names, with Java's scale rules — those
+;; rules being the whole reason a caller reaches for .movePointLeft or .setScale
+;; instead of ordinary arithmetic.
+
+;; RoundingMode as jolt models it: the enum's NAME, the same string
+;; *math-context*'s :rounding carries and jbd-round-inc? already dispatches on.
+;; The constants are registered as statics so (.setScale b 2
+;; RoundingMode/HALF_UP) — how JVM code spells it — resolves; BigDecimal's
+;; pre-Java-5 ROUND_* ints are registered beside them because plenty of ported
+;; code still passes those.
+(define jbd-rounding-mode-names
+  '("UP" "DOWN" "CEILING" "FLOOR" "HALF_UP" "HALF_DOWN" "HALF_EVEN" "UNNECESSARY"))
+(register-class-statics! "java.math.RoundingMode"
+  (map (lambda (n) (cons n n)) jbd-rounding-mode-names))
+(class-statics-merge! "java.math.BigDecimal"
+  (let loop ((ns jbd-rounding-mode-names) (i 0) (acc '()))
+    (if (null? ns) (reverse acc)
+        (loop (cdr ns) (+ i 1) (cons (cons (string-append "ROUND_" (car ns)) i) acc)))))
+
+;; Normalize whatever spelling arrived — the enum name, a keyword/symbol, or one
+;; of the legacy ints — to the mode name jbd-round-inc? reads. An unknown
+;; spelling is the JVM's IllegalArgumentException rather than a silent HALF_UP.
+(define (jbd-mode-normalize s)
+  (list->string (map (lambda (c) (if (char=? c #\-) #\_ (char-upcase c))) (string->list s))))
+(define (jbd-rounding-mode x)
+  (let ((name (cond ((string? x) (jbd-mode-normalize x))
+                    ((symbol-t? x) (jbd-mode-normalize (symbol-t-name x)))
+                    ((keyword? x) (jbd-mode-normalize (keyword-t-name x)))
+                    ((and (number? x) (exact? x) (integer? x) (<= 0 x 7))
+                     (list-ref jbd-rounding-mode-names x))
+                    (else #f))))
+    (if (and name (member name jbd-rounding-mode-names))
+        name
+        (throw-jvm (quote IllegalArgumentException)
+          (string-append "Invalid rounding mode: " (jolt-final-str x))))))
+
+;; setScale: scaling UP multiplies the unscaled value and is always exact;
+;; scaling DOWN divides by the dropped power of ten and rounds. The 1-argument
+;; form is RoundingMode.UNNECESSARY, so it raises ArithmeticException exactly
+;; when the digits it would drop are not all zero — jbd-round-inc? owns that
+;; throw already.
+(define (jbd-set-scale bd new-scale mode)
+  (let ((u (jbigdec-unscaled bd)) (s (jbigdec-scale bd)))
+    (cond
+      ((= new-scale s) bd)
+      ((> new-scale s) (make-jbigdec (* u (expt 10 (- new-scale s))) new-scale))
+      (else
+       (let* ((div (expt 10 (- s new-scale)))
+              (neg (< u 0)) (au (abs u))
+              (q (quotient au div)) (r (remainder au div))
+              (q2 (if (jbd-round-inc? q r div mode neg) (+ q 1) q)))
+         (make-jbigdec (if neg (- q2) q2) new-scale))))))
+
+;; movePointLeft(n) is this x 10^-n at scale max(scale+n, 0), and movePointRight
+;; is the same with -n — so each accepts a negative argument and becomes the
+;; other, as on the JVM. A scale that would go negative is folded back into the
+;; unscaled value, which is what keeps the pair exact inverses.
+(define (jbd-move-point bd n)
+  (let ((s (+ (jbigdec-scale bd) n)) (u (jbigdec-unscaled bd)))
+    (if (>= s 0) (make-jbigdec u s) (make-jbigdec (* u (expt 10 (- s))) 0))))
+
+;; stripTrailingZeros drops trailing zero digits from the unscaled value,
+;; lowering the scale past zero when they sit left of the point (Java 8's
+;; behaviour: 600 -> 6E+2). Zero strips to 0 at scale 0.
+(define (jbd-strip-trailing-zeros bd)
+  (let loop ((u (jbigdec-unscaled bd)) (sc (jbigdec-scale bd)))
+    (cond ((= u 0) (make-jbigdec 0 0))
+          ((= 0 (remainder u 10)) (loop (quotient u 10) (- sc 1)))
+          (else (make-jbigdec u sc)))))
+
+;; toPlainString never uses exponent notation, however extreme the scale.
+(define (jbd->plain-string bd)
+  (let ((u (jbigdec-unscaled bd)) (sc (jbigdec-scale bd)))
+    (if (<= sc 0)
+        (number->string (* u (expt 10 (- sc))))
+        (let* ((neg (< u 0)) (digs (number->string (abs u))) (dlen (string-length digs))
+               (body (if (<= dlen sc)
+                         (string-append "0." (make-string (- sc dlen) #\0) digs)
+                         (string-append (substring digs 0 (- dlen sc))
+                                        "." (substring digs (- dlen sc) dlen)))))
+          (if neg (string-append "-" body) body)))))
+
+;; value truncated toward zero, the JVM's toBigInteger / longValue / intValue.
+;; jolt has ONE integer type (see :integer-box-model), so the narrowing
+;; projections answer the same exact integer rather than wrapping to a width.
+(define (jbd->integer bd)
+  (truncate (/ (jbigdec-unscaled bd) (expt 10 (jbigdec-scale bd)))))
+(define (jbd->integer-exact bd)
+  (let ((v (jbd->integer bd)))
+    (if (jbigdec=? bd (make-jbigdec v 0))
+        v
+        (jolt-throw (jolt-host-throwable "java.lang.ArithmeticException"
+                                         "Rounding necessary")))))
+
+;; a MathContext argument — the {:precision N :rounding MODE} map
+;; with-precision binds — rounds the result to its significant digits. Java
+;; overloads several members on it; jolt reads it off the map the same way
+;; jbd-mc-round does for *math-context*.
+(define (jbd-math-context-arg? x) (and (jolt-map? x) (not (jolt-nil? (jolt-get x jbd-kw-precision)))))
+(define (jbd-round-mc bd mc)
+  (let ((prec (jnum->exact (jbd-mc-precision mc))))
+    ;; precision 0 is java.math.MathContext.UNLIMITED — no rounding at all.
+    (if (<= prec 0) bd (jbd-round-prec bd prec (jbd-mc-mode mc)))))
+
+;; divide's three shapes: exact (or *math-context*-rounded, or ArithmeticException
+;; on a non-terminating expansion), rounded at THIS value's scale, and rounded at
+;; a caller-named scale.
+(define (jbd-divide bd args)
+  (let ((d (jbd-coerce (car args))) (rest (cdr args)))
+    (cond
+      ((null? rest) (jbd-mc-round (jbd2-div bd d)))
+      ((jbd-math-context-arg? (car rest)) (jbd-round-mc (jbd2-div bd d) (car rest)))
+      ((null? (cdr rest))
+       (jbd-divide-scaled bd d (jbigdec-scale bd) (jbd-rounding-mode (car rest))))
+      (else
+       (jbd-divide-scaled bd d (jnum->exact (car rest)) (jbd-rounding-mode (cadr rest)))))))
+(define (jbd-divide-scaled bd d scale mode)
+  (when (= 0 (jbigdec-unscaled d))
+    (jolt-throw (jolt-host-throwable "java.lang.ArithmeticException" "Divide by zero")))
+  ;; the exact quotient as a rational, then one rescale — the same rounding step
+  ;; setScale takes, so both spellings round identically.
+  (let* ((r (/ (* (jbigdec-unscaled bd) (expt 10 (jbigdec-scale d)))
+               (* (jbigdec-unscaled d) (expt 10 (jbigdec-scale bd)))))
+         (scaled (* r (expt 10 scale)))
+         (neg (< scaled 0)) (a (abs scaled))
+         (q (floor a)) (rem (- a q))
+         (q2 (if (jbd-round-inc? q rem 1 mode neg) (+ q 1) q)))
+    (make-jbigdec (if neg (- q2) q2) scale)))
+
+;; precision: significant digits in the unscaled value; zero has precision 1.
+(define (jbd-precision bd)
+  (if (= 0 (jbigdec-unscaled bd)) 1 (jbd-digits (jbigdec-unscaled bd))))
+
+(define jbd-instance-members
+  (list
+   ;; --- scale and rounding ---------------------------------------------------
+   (cons "scale" (lambda (b) (->num (jbigdec-scale b))))
+   (cons "precision" (lambda (b) (->num (jbd-precision b))))
+   (cons "unscaledValue" (lambda (b) (jbigdec-unscaled b)))
+   (cons "signum" (lambda (b) (->num (let ((u (jbigdec-unscaled b))) (cond ((< u 0) -1) ((> u 0) 1) (else 0))))))
+   (cons "setScale"
+         (lambda (b n . rest)
+           (jbd-set-scale b (jnum->exact n)
+                          (if (null? rest) "UNNECESSARY" (jbd-rounding-mode (car rest))))))
+   (cons "movePointLeft" (lambda (b n) (jbd-move-point b (jnum->exact n))))
+   (cons "movePointRight" (lambda (b n) (jbd-move-point b (- (jnum->exact n)))))
+   (cons "scaleByPowerOfTen"
+         (lambda (b n) (make-jbigdec (jbigdec-unscaled b) (- (jbigdec-scale b) (jnum->exact n)))))
+   (cons "stripTrailingZeros" jbd-strip-trailing-zeros)
+   (cons "round" (lambda (b mc) (if (jbd-math-context-arg? mc) (jbd-round-mc b mc) b)))
+   ;; --- sign and arithmetic --------------------------------------------------
+   (cons "negate" (lambda (b . mc) (jbd-negate b)))
+   (cons "abs" (lambda (b . mc) (if (< (jbigdec-unscaled b) 0) (jbd-negate b) b)))
+   (cons "plus" (lambda (b . mc) b))
+   (cons "add" (lambda (b x . mc) (jbd-mc-round (jbd2+ b (jbd-coerce x)))))
+   (cons "subtract" (lambda (b x . mc) (jbd-mc-round (jbd2- b (jbd-coerce x)))))
+   (cons "multiply" (lambda (b x . mc) (jbd-mc-round (jbd2* b (jbd-coerce x)))))
+   (cons "divide" (lambda (b . args) (jbd-divide b args)))
+   (cons "remainder" (lambda (b x . mc) (jbd-int-rem b (jbd-coerce x))))
+   (cons "pow"
+         (lambda (b n . mc)
+           (let ((k (jnum->exact n)))
+             (when (< k 0)
+               (jolt-throw (jolt-host-throwable "java.lang.ArithmeticException" "Invalid operation")))
+             (make-jbigdec (expt (jbigdec-unscaled b) k) (* (jbigdec-scale b) k)))))
+   (cons "min" (lambda (b x) (jbd-min2 b (jbd-coerce x))))
+   (cons "max" (lambda (b x) (jbd-max2 b (jbd-coerce x))))
+   ;; --- comparison, conversion, identity ------------------------------------
+   (cons "compareTo" (lambda (b x) (->num (jbd-compare2 b (jbd-coerce x)))))
+   ;; jolt's bigdec equality is by VALUE throughout — (= 1.5M 1.50M) is true, the
+   ;; hash strips trailing zeros to match — so .equals answers what = answers
+   ;; rather than contradicting it with the JVM's scale-sensitive test.
+   (cons "equals" (lambda (b x) (and (jbigdec? x) (jbigdec=? b x))))
+   (cons "hashCode" (lambda (b) (->num (jbigdec-hasheq b))))
+   (cons "toBigInteger" jbd->integer)
+   (cons "toBigIntegerExact" jbd->integer-exact)
+   (cons "intValue" jbd->integer)
+   (cons "longValue" jbd->integer)
+   (cons "shortValue" jbd->integer)
+   (cons "byteValue" jbd->integer)
+   (cons "intValueExact" jbd->integer-exact)
+   (cons "longValueExact" jbd->integer-exact)
+   (cons "doubleValue" jbigdec->flonum)
+   (cons "floatValue" jbigdec->flonum)
+   (cons "toString" jbigdec->string)
+   (cons "toPlainString" jbd->plain-string)))
+
+(define jbd-instance-tbl (make-hashtable string-hash string=?))
+(for-each (lambda (p) (hashtable-set! jbd-instance-tbl (car p) (cdr p))) jbd-instance-members)
+
+(register-method-arm! arm-priority-bigdec
+  (lambda (obj method-name rest-args)
+    (if (jbigdec? obj)
+        (let ((f (hashtable-ref jbd-instance-tbl method-name #f)))
+          (if f
+              (apply f obj (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+              'pass))
+        'pass)))

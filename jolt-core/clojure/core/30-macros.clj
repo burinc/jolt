@@ -14,8 +14,12 @@
 
 ;; with-out-str: capture everything the body prints to *out* and return it as a
 ;; string. __with-out-str (clojure.core) runs the thunk with the output captured.
+;; The bare try is the same guard locking carries: the reference's with-out-str
+;; expands through `binding`, which is a try/finally, so a recur may not cross it.
+;; Without it jolt's capture thunk became the recur target and
+;; (loop [] (with-out-str (recur))) spun forever.
 (defmacro with-out-str [& body]
-  `(__with-out-str (fn* [] ~@body)))
+  `(__with-out-str (fn* [] (try ~@body))))
 
 ;; defmulti/defmethod are sugar over defmulti-setup/defmethod-setup (ctx-capturing
 ;; clojure.core fns) so they compile as plain invokes. name/mm are passed quoted;
@@ -114,8 +118,16 @@
 
 ;; Take x's monitor for the duration of body (futures/agents/threads share one
 ;; heap, so this is a real per-object lock), releasing on any exit.
+;;
+;; The bare try costs nothing — with no catch and no finally, emit-try emits the
+;; body and nothing else — and it is what keeps `recur` honest. The reference's
+;; locking IS a try/finally, so a recur may not cross it; jolt's thunk is a
+;; fiber-scheduling requirement (an OS mutex has thread granularity and a fiber
+;; is not a thread — java/concurrency.ss), and without the try that thunk quietly
+;; became the recur TARGET: (loop [] (locking o (recur))) spun forever instead of
+;; being refused.
 (defmacro locking [x & body]
-  `(jolt.host/with-monitor ~x (fn* [] ~@body)))
+  `(jolt.host/with-monitor ~x (fn* [] (try ~@body))))
 
 ;; STM macros over the host transaction seams (refs.ss). sync keeps the
 ;; reference's (sync flags & body) shape — flags are ignored, like the JVM.
@@ -165,10 +177,21 @@
 
 ;; Fresh free-standing var cells bound as locals; read/write with
 ;; var-get/var-set. The cells come from the host seam __local-var.
+;;
+;; The init goes into a THREAD BINDING, not the cell's root — Clojure's expansion
+;; is Var/create + setDynamic followed by pushThreadBindings, and var-set (Var.set)
+;; only ever writes a thread binding. Rooting them instead left the locals
+;; thread-bound? false and only worked because var-set used to fall back to a root
+;; write. The frame is scoped like `binding`'s, so leaving the form — by a throw as
+;; much as by returning — unbinds them again.
 (defmacro with-local-vars [bindings & body]
-  (let [binds (reduce (fn [acc p] (conj (conj acc (first p)) `(__local-var ~(second p))))
-                      [] (partition 2 bindings))]
-    `(let [~@binds] ~@body)))
+  (let [ps (partition 2 bindings)
+        binds (reduce (fn [acc p] (conj (conj acc (first p)) `(__local-var))) [] ps)
+        pairs (reduce (fn [acc p] (conj (conj acc (first p)) (second p))) [] ps)]
+    `(let* [~@binds
+            frame# (array-map ~@pairs)]
+       (push-thread-bindings frame#)
+       (try (do ~@body) (finally (pop-thread-bindings))))))
 
 ;; Canonical recursive expansion; closing goes through the host seam __close
 ;; (a map-like value's :close fn or a host file — no .close interop here).
@@ -196,20 +219,54 @@
 (defmacro bound-fn [& fntail]
   `(bound-fn* (fn ~@fntail)))
 
-(defmacro defonce [name expr]
+(defmacro defonce [name & body]
   ;; Must NOT reference clojure.core/resolve (a tree-shake bail ref).
   ;; Use jolt.host/find-var — a bare var-cell lookup with no alias resolution.
   ;; The ns/name strings are computed at expansion time.
+  ;;
+  ;; A leading docstring is accepted, so defonce takes the same
+  ;; (sym doc-string? init) shape `def` does. clojure.core's defonce is [name expr]
+  ;; only, which makes (defonce x "doc" 42) an arity error there rather than a
+  ;; different meaning — so accepting it is a superset, not a divergence. ^meta on
+  ;; the name rides along either way, since the expansion hands the symbol to `def`
+  ;; untouched.
   (let [ns-str (str (clojure.core/ns-name clojure.core/*ns*))
-        n-str (clojure.core/name name)]
+        n-str (clojure.core/name name)
+        n (clojure.core/count body)
+        ;; Two forms with a string first is the docstring shape; one form is the
+        ;; init — and a lone string IS the init, exactly as (def x "s") means.
+        doc (clojure.core/when (clojure.core/and (clojure.core/= 2 n)
+                                                 (clojure.core/string? (clojure.core/first body)))
+              (clojure.core/first body))
+        expr (clojure.core/if doc (clojure.core/second body) (clojure.core/first body))]
+    (clojure.core/when-not (clojure.core/or (clojure.core/= 1 n) doc)
+      (throw (new IllegalArgumentException
+                  (str "defonce takes a name, an optional docstring and an init: "
+                       "(defonce " n-str " doc-string? init)"))))
     `(if-let [v# (jolt.host/find-var ~ns-str ~n-str)]
        v#
-       (def ~name ~expr))))
+       ~(clojure.core/if doc
+          `(def ~name ~doc ~expr)
+          `(def ~name ~expr)))))
 
 ;; Single arglist (Jolt defmacro is single-arity); the optional else defaults nil
 ;; via rest-destructuring.
 (defmacro if-not [test then & [else]]
   `(if (not ~test) ~then ~else))
+
+;; Macro-argument validation, the reference implementation verbatim: each
+;; pred/message pair expands to a check that throws IllegalArgumentException
+;; naming the calling macro (via &form) and the requirement. Private on the JVM,
+;; but reachable there as @#'clojure.core/assert-args — the shape typedclojure
+;; and other macro-heavy libraries use, and what this exists to serve.
+(defmacro ^{:private true} assert-args
+  [& pairs]
+  `(do (when-not ~(first pairs)
+         (throw (IllegalArgumentException.
+                  (str (first ~'&form) " requires " ~(second pairs) " in " ~'*ns* ":" (:line (meta ~'&form))))))
+     ~(let [more (nnext pairs)]
+        (when more
+          (list* `assert-args more)))))
 
 ;; Conditional binding macros: the name is bound ONLY in the taken branch (the
 ;; auto-gensym temp# tests the value; the else/empty branch sees the surrounding
@@ -355,6 +412,13 @@
 ;; group, every other form appends to the current one. (extend-protocol uses
 ;; parse-extend-impls instead — it must treat a COMPUTED class type like
 ;; (Class/forName "[B"), a seq, as a head, which this would misread as a method.)
+;; deftype/defrecord options: leading keyword/value pairs before the specs
+;; (:load-ns, and any other the reference's parse-opts+specs consumes without
+;; reading, such as gvec's :no-print). Skipped, as the reference skips them.
+(defn- drop-type-opts [body]
+  (loop [b (seq body)]
+    (if (and b (keyword? (first b))) (recur (nnext b)) b)))
+
 (defn- group-by-head [items]
   ;; nil is a valid extension head (extend-protocol P ... nil (m [x] ...)).
   (reduce (fn [acc x]
@@ -481,6 +545,20 @@
                   do-art (fn [ar] (cons (first ar) (map (fn [x] (rw inst (psyms (first ar)) x)) (rest ar))))
                   arts' (if (vector? (first arts)) (do-art arts) (map do-art arts))]
               (concat (list head) (when named? (list fname)) arts'))
+            ;; (. obj member args*) / (. obj (method args*)): the member position
+            ;; names a field or method, it is not a value — rewrite the object and
+            ;; argument positions only. Without this a member named like a mutable
+            ;; field ((. this v)) had its member symbol rewritten into a field
+            ;; read, producing (. this (.-v this)).
+            (and (seq? form) (seq form) (symbol? (first form)) (= "." (name (first form)))
+                 (>= (count form) 3) (symbol? (nth form 2)))
+            (concat (list (first form) (rw inst shadowed (second form)) (nth form 2))
+                    (map (fn [x] (rw inst shadowed x)) (drop 3 form)))
+            (and (seq? form) (seq form) (symbol? (first form)) (= "." (name (first form)))
+                 (= 3 (count form)) (seq? (nth form 2)) (symbol? (first (nth form 2))))
+            (list (first form) (rw inst shadowed (second form))
+                  (cons (first (nth form 2))
+                        (map (fn [x] (rw inst shadowed x)) (rest (nth form 2)))))
             ;; a bare read of a mutable field -> live field access
             (and (symbol? form) (mutable? form) (not (contains? shadowed form)))
             (list (symbol (str ".-" (name form))) inst)
@@ -512,14 +590,21 @@
                           pnames (set (map name shadowed))
                           ;; let-bind only immutable fields; mutable ones are read live
                           ;; via rewrite-body so a set! within the method is observed.
-                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
+                          ;; The read is the DECLARED-SLOT one, not get: a type
+                          ;; declaring clojure.lang.ILookup answers get through its
+                          ;; own valAt, so binding fields with get would re-enter
+                          ;; that valAt on every method entry — including valAt's
+                          ;; own — and never come back. It is also the cheaper read
+                          ;; (straight to the slot, no type cascade).
+                          binds (vec (mapcat (fn [f] [f (list (symbol "clojure.core" "__deftype-field")
+                                                              inst (keyword (name f)))])
                                              (filter (fn [f] (and (not (mutable? f))
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))
                           mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
                           mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
                       (list argv (list* 'let binds mbody))))
-        groups (group-by-head body)
+        groups (group-by-head (drop-type-opts body))
         ;; merge clauses by method NAME across ALL protocols into one multi-arity
         ;; fn, so a name appearing in two interfaces with different arities
         ;; (data.priority-map's seq is in Seqable [this] AND Sorted [this asc])
@@ -546,27 +631,82 @@
        ~tname)))
 
 ;; The protocol value is built by make-protocol (a fn call) rather than an embedded
-;; tagged map literal: the interpreter would otherwise self-evaluate such a struct
-;; instead of evaluating its fields. methods is a {kw {:name str}} map (only :name
-;; is consulted). Each method is a thin dispatch fn over protocol-dispatch.
+;; tagged map literal: a map carrying :jolt/type is not a map FORM (host-contract.ss
+;; hc-map?), so the analyzer would read such a literal as a live value it cannot
+;; spell instead of evaluating its fields. methods is a {kw {:name str}} map (only
+;; :name is consulted). The rest of the value is Clojure's protocol map, which tooling
+;; reads to describe a protocol it was handed:
+;;
+;;   :sigs       {kw {:name sym :arglists (..) :doc str-or-nil :tag hint-or-nil}}
+;;               — the public description of the methods. (The JVM resolves :tag
+;;               to a Class; here it is the hint symbol as written.)
+;;   :doc        the protocol's own docstring, and ONLY WHEN IT HAS ONE — the JVM
+;;               leaves the key absent otherwise, so (contains? P :doc) is false
+;;               for an undocumented protocol. Also goes on the var, so (doc P)
+;;               prints it.
+;;   :method-map {kw kw} over the method names, identity on both halves (the JVM
+;;               does not munge either side: :foo-bar maps to :foo-bar).
+;;   :var        the protocol's own var, assoc'd AFTER the def below — it does not
+;;               exist while make-protocol runs. SCI reads this one (sci.core,
+;;               sci.impl.deftype).
+;;
+;; :on / :on-interface / :method-builders are the JVM's generated-interface keys
+;; and are deliberately absent here: jolt generates no interface, dispatching on
+;; the receiver's type tag instead. :extend-via-metadata is absent for a
+;; different reason — jolt PARSES the option (below) but its dispatch does not
+;; honor metadata extension, so recording the key would advertise a rule that
+;; does not hold. See make-protocol's comment, unit.edn's defprotocol-value
+;; suite, and jolt-2j3.
+;;
+;; Each method is a thin dispatch fn over protocol-dispatch, def'd with the var
+;; metadata the reference gives it — :arglists, :doc, :protocol (the protocol's
+;; own var) and the name's ^hint as :tag — so (doc a-method) prints a signature
+;; and tooling can tell a protocol method from a plain fn. See the method
+;; emission below.
 (defmacro defprotocol [pname & sigs]
   ;; Clojure's defprotocol takes an optional docstring and leading keyword
   ;; options (:extend-via-metadata true, honeysql uses it) before the method
-  ;; signatures — drop them (metadata extension is a JVM dispatch detail).
-  (let [sigs (loop [s sigs]
-               (cond
-                 (string? (first s))  (recur (rest s))
-                 (keyword? (first s)) (recur (rest (rest s)))
-                 :else s))
+  ;; signatures. The docstring is kept (it is :doc on the value and on the var);
+  ;; the options are read past. A string anywhere in the leading run is the
+  ;; docstring and the last one wins, which is what the JVM's assoc-in-a-loop
+  ;; parse does.
+  (let [parsed (loop [d nil s sigs]
+                 (cond
+                   (string? (first s))  (recur (first s) (rest s))
+                   (keyword? (first s)) (recur d (rest (rest s)))
+                   :else [d s]))
+        pdoc (first parsed)
+        sigs (second parsed)
         methods (reduce (fn [m sig]
                           (assoc m (keyword (name (first sig))) {:name (name (first sig))}))
                         {} sigs)
+        method-map (reduce (fn [m sig]
+                             (let [k (keyword (name (first sig)))]
+                               (assoc m k k)))
+                           {} sigs)
+        sigs-map (reduce (fn [m sig]
+                           (let [mname (first sig)
+                                 args (rest sig)
+                                 doc (when (string? (last args)) (last args))]
+                             (assoc m (keyword (name mname))
+                                    {:tag (:tag (meta mname))
+                                     :name (with-meta mname nil)
+                                     :arglists (apply list (filter vector? args))
+                                     :doc doc})))
+                         {} sigs)
         ;; the protocol's identity: this namespace plus the name (see protocol-key).
         ;; Baked here so the value, the dispatch shims and every later impl
         ;; registration all key on one string.
         pkey (str *ns* "/" (name pname))]
     `(do
-       (def ~pname (make-protocol ~pkey ~methods))
+       (def ~(if pdoc (with-meta pname (assoc (meta pname) :doc pdoc)) pname)
+         ;; :sigs is nil, not {}, for a protocol with no methods — the JVM's
+         ;; (when sigs ..) leaves the key present with a nil value.
+         (make-protocol ~pkey ~methods (quote ~(when (seq sigs) sigs-map)) ~pdoc ~method-map))
+       ;; :var is the protocol's own var, so it can only be attached once the def
+       ;; above has made one. alter-var-root, not a second def: a re-def would
+       ;; drop the metadata just written.
+       (alter-var-root (var ~pname) assoc :var (var ~pname))
        ;; register method var-keys for devirtualization; the inference
        ;; reads this (via infer-unit!) to resolve a protocol call on a known record
        (register-protocol-methods! ~pkey [~@(map (fn [s] (name (first s))) sigs)])
@@ -577,8 +717,28 @@
        ;; variadic protocol-dispatch with a vector of the extra args.
        ~@(map (fn [sig]
                 (let [pn pkey
-                      mn (name (first sig))
+                      mnm (first sig)
+                      mn (name mnm)
                       arglists (filter vector? (rest sig))
+                      mdoc (let [args (rest sig)] (when (string? (last args)) (last args)))
+                      ;; the method var's metadata, as the reference sets it:
+                      ;; :arglists and :doc (present with a nil value when the
+                      ;; method has no docstring, as there), :tag, and :protocol
+                      ;; — the protocol's own var, which is what tells tooling a
+                      ;; method belongs to a protocol at all. Without these
+                      ;; (doc a-method) printed a bare name and no arglists.
+                      ;; The values are QUOTED forms: def evaluates the symbol's
+                      ;; metadata map, and the arglists' `this` is a symbol, not a
+                      ;; reference. :tag is NOT set here — it is the method name's
+                      ;; own ^hint, which def already reads and resolves to a Class,
+                      ;; the value both hosts put on (defn ^String f ..). The
+                      ;; reference's defprotocol keeps a resolved SYMBOL instead;
+                      ;; that one difference is a documented divergence.
+                      mmeta (assoc (meta mnm)
+                                   :doc mdoc
+                                   :arglists (list 'quote (when (seq arglists)
+                                                            (apply list arglists)))
+                                   :protocol (list 'var pname))
                       clause (fn [argv]
                                (let [ps (mapv (fn [_] (fresh-sym)) argv)
                                      n (count ps)
@@ -589,8 +749,8 @@
                                    (= n 3) (list ps (list 'protocol-dispatch3 pn mn obj (nth ps 1) (nth ps 2)))
                                    :else   (list ps (list 'protocol-dispatch pn mn obj (vec (rest ps)))))))]
                   (if (seq arglists)
-                    `(def ~(first sig) (fn* ~@(map clause arglists)))
-                    `(def ~(first sig)
+                    `(def ~(with-meta mnm mmeta) (fn* ~@(map clause arglists)))
+                    `(def ~(with-meta mnm mmeta)
                        (fn* [this# & rest#] (protocol-dispatch ~pn ~mn this# rest#))))))
               sigs))))
 
@@ -719,8 +879,25 @@
 (defmacro proxy [supers ctor-args & methods]
   (if (and (vector? supers) (= 1 (count supers))
            (let [s (name (first supers))] (or (= s "ThreadLocal") (= s "InheritableThreadLocal"))))
-    (let [init (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
-      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))))
+    ;; WHICH of the two is load-bearing: they differ only in what a forked thread
+    ;; sees, and that is the entire difference between the classes. Lowering both
+    ;; to one object made whichever storage was chosen wrong for the other.
+    ;;
+    ;; initialValue is the only override this lowering can honour — the object it
+    ;; builds is a host storage shim, not a subclass, so a get/set/remove/
+    ;; toString/childValue body has nowhere to go. It used to be dropped in
+    ;; silence, which is a method that looks defined and never runs; say so at
+    ;; the call site instead.
+    (let [extra (remove (fn [m] (= "initialValue" (name (first m)))) methods)
+          init  (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
+      (when (seq extra)
+        (throw (ex-info (str "proxy over " (name (first supers))
+                             " can only override initialValue, not "
+                             (apply str (interpose ", " (map (fn [m] (name (first m))) extra))))
+                        {:class (name (first supers))
+                         :unsupported (mapv (fn [m] (name (first m))) extra)})))
+      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))
+                                    ~(= (name (first supers)) "InheritableThreadLocal")))
     ;; group the flattened specs by method name, so several arities of one method
     ;; become one multi-arity fn — the same shape reify builds.
     (loop [specs (seq (apply concat (map proxy-arity-specs methods)))
@@ -798,7 +975,7 @@
                           mbody (drop 2 spec)
                           mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
                       (list hinted (list* 'let binds mbody))))
-        groups (group-by-head body)
+        groups (group-by-head (drop-type-opts body))
         ;; merge clauses by name across protocols into one multi-arity fn (see
         ;; deftype's by-name).
         by-name (reduce (fn [m spec]

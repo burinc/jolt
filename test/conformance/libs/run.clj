@@ -146,9 +146,18 @@
             ;; working directory its own build uses — in a multi-module repo that
             ;; is the MODULE root, not the repo root (ring-core reads
             ;; test/ring/assets/…, which only resolves from ring/ring-core).
+            ;; JOLT_MAX_HEAP=off: this is a stress harness, not a user
+            ;; workload. 0.8.5 gave jolt a heap ceiling defaulting to 25% of
+            ;; RAM (the share the JVM's MaxRAMPercentage uses), which is the
+            ;; right default for a program but wrong here — malli's suite alone
+            ;; has a live set around 2.5GB, so on any machine with under ~10GB
+            ;; the ceiling would fail the suite before it could report a tally,
+            ;; and the tally is the whole output. A library that needs a bound
+            ;; can ask for one; the harness does not impose one.
             r (apply p/sh {:out :string :err :string
                            :dir (if dir (resolve-path lib-root dir) lib-root)
-                           :extra-env {"JOLT_NO_USER_DEPS" "1"}}
+                           :extra-env {"JOLT_NO_USER_DEPS" "1"
+                                       "JOLT_MAX_HEAP" "off"}}
                      cmd)
             out (str (:out r) (:err r))]
         (merge {:status :ran :exit (:exit r) :out out :nses (vec nses)}
@@ -168,6 +177,29 @@
       (> fail (+ (:fail exp 0) (or tolerance 0)))
       (> error (+ (:error exp 0) (or tolerance 0)))
       (> load-fail (:load-fail exp 0))))
+
+;; worse?'s mirror: a counter that moved the GOOD way by more than the tolerance.
+;; Reported as BETTER rather than as a failure, so recording the improvement is a
+;; one-line manifest edit.
+;;
+;; Two things were wrong here (jolt-8a8). Only `pass` was consulted, so a fix that
+;; turns failing assertions into absent ones — a load-fail that starts loading, an
+;; error the suite stops reaching — moved fail/error/load-fail down without moving
+;; pass up and read as plain `ok`. All four are mirrored now.
+;;
+;; And :tolerance is a SYMMETRIC noise band, which means it suppresses BETTER
+;; exactly as it suppresses WORSE. That is deliberate, not the leftover: inside the
+;; band a move is a different draw and not a result, so re-recording it would only
+;; re-centre the band on whatever the last run happened to generate. test.check
+;; (:tolerance 40) came back pass=245 against a recorded 236 and reports ok for
+;; that reason. Above the band the move is real and says so; a library without a
+;; :tolerance is pinned exactly, so any rise there is BETTER.
+(defn- better? [{:keys [pass fail error load-fail]} exp tolerance]
+  (let [t (or tolerance 0)]
+    (or (> pass (+ (:pass exp 0) t))
+        (< fail (- (:fail exp 0) t))
+        (< error (- (:error exp 0) t))
+        (< load-fail (:load-fail exp 0)))))
 
 (defn- tally-str [{:keys [tests pass fail error load-fail]}]
   (str "tests=" tests " pass=" pass " fail=" fail " error=" error
@@ -205,7 +237,7 @@
                                               name (:exit r) logdir name))
                              {:name name :verdict :fail})
                          (let [bad (and expect (worse? r expect tolerance))
-                               better (and expect (> (:pass r) (+ (:pass expect 0) (or tolerance 0))))]
+                               better (and expect (better? r expect tolerance))]
                            (println (format "%-20s %-6s %s%s"
                                             name
                                             (cond bad "WORSE" better "BETTER" :else "ok")

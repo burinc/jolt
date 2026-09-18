@@ -29,6 +29,15 @@
 #                    covered by the jolt-side stateimage gate.)
 #   todomvc-uikit    darwin-only, build-only: AppKit.
 #   hiccup/malli/markdown-app, ray-tracer*  no test task at all.
+#   reactive-dashboard  its metrics come out of /proc and its pipeline tests assert
+#                    on sample counts, so the suite is Linux-only; the app's own
+#                    repo CI runs it. The BUILD is the valuable half here anyway —
+#                    ebb + domino + glimmer-datastar + ring-chez-adapter is the
+#                    deepest dependency tree of any example.
+#   ffi-examples     its three programs call libffi and PortAudio, both declared
+#                    `:optional true` because neither is on every runner, and it
+#                    has no `test` task — `check` only reports what is present.
+#                    Building app.check still compiles all three.
 set -eu
 
 root="${1:?usage: examples-smoke.sh <examples-checkout> <jolt-binary>}"
@@ -38,12 +47,22 @@ case "$jolt" in
    *) jolt="$(cd "$(dirname "$jolt")" && pwd)/$(basename "$jolt")" ;;
 esac
 [ -x "$jolt" ] || { echo "examples-smoke: $jolt is not executable"; exit 2; }
-PATH="$(dirname "$jolt"):$PATH"
+# A task body is a shell command, and the ones here spell the binary `jolt`
+# (`:tasks {test "jolt -M:test"}`), so it has to be on PATH under that name.
+# Prepending the binary's OWN directory is not enough and is actively wrong in
+# CI: the release job unpacks ./jolt-bin next to the repo checkout, which is a
+# directory called `jolt`, so `jolt` resolved to the directory. dash reports
+# that as "jolt: Permission denied" and stops rather than continuing along PATH
+# the way macOS's sh does, which is why it only ever failed on the Linux runner.
+# A dedicated bin dir holding one symlink named `jolt` has no such ambiguity.
+binshim="$(mktemp -d)"
+ln -s "$jolt" "$binshim/jolt"
+PATH="$binshim:$PATH"
 export PATH
 root="$(cd "$root" && pwd)"
 
 manifest="$(mktemp)"
-trap 'rm -f "$manifest"' EXIT
+trap 'rm -f "$manifest"; rm -rf "$binshim"' EXIT
 cat > "$manifest" <<'EOF'
 basic-example    app.core       test
 commonmark-app   app.core       test
@@ -54,6 +73,7 @@ hiccup-app       app.core       -
 malli-app        app.core       -
 markdown-app     app.core       -
 http-client-app  app.core       -
+reactive-dashboard app.core     -
 ray-tracer       ray-baseline   -
 ray-tracer-multi rt.render      -
 fps-demo         fps-demo.core  -
@@ -62,6 +82,7 @@ glimmer-gl-app   gl-demo.core   -
 glimmer-tui-example tui-demo.core -
 todomvc-uikit    app.core       -   darwin
 image-dump-example app.core     -
+ffi-examples     app.check      -
 EOF
 
 fails=0

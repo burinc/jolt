@@ -113,8 +113,13 @@
     ((symbol-t? x) "clojure.lang.Symbol")
     ((jolt-atom? x) "clojure.lang.Atom")
     ((jolt-ref? x) "clojure.lang.Ref")
+    ((jolt-reduced? x) "clojure.lang.Reduced")
     ((char? x) "java.lang.Character")
     ((regex-t? x) "java.util.regex.Pattern")
+    ;; a stateful matcher (re-matcher) is a java.util.regex.Matcher, as the
+    ;; record's own comment in regex.ss already said — without this arm it fell
+    ;; through to (jolt-type x) and (class m) was :object. #998.
+    ((matcher-t? x) "java.util.regex.Matcher")
     ;; an anonymous / unregistered fn — like the JVM, where (class #(..)) is a
     ;; concrete ns$fn__N subclass. The $fn marker lets clojure.spec.alpha's fn-sym
     ;; recognize it as anonymous and return ::s/unknown. A named fn is registered
@@ -136,7 +141,7 @@
     ((pset? x) "clojure.lang.PersistentHashSet")
     ;; array mode (insertion-ordered, small literal maps) is PersistentArrayMap;
     ;; hash mode (hash-map, or grown past the array limit) is PersistentHashMap
-    ((pmap? x) (if (pmap-order x) "clojure.lang.PersistentArrayMap"
+    ((pmap? x) (if (pmap-array? x) "clojure.lang.PersistentArrayMap"
                    "clojure.lang.PersistentHashMap"))
     ((jolt-lazyseq? x) "clojure.lang.LazySeq")
     ((empty-list-t? x) "clojure.lang.PersistentList$EmptyList")
@@ -146,17 +151,32 @@
 ;; the class NAME of x (string), or nil for nil. (class x) wraps it in a Class
 ;; value (make-class-obj, host-static-classes.ss) so it renders like a JVM Class
 ;; while staying = its name string.
-;; The condition? class-arm was removed as dead — all throws now use typed jolt
-;; throwables, so a raw Chez condition never reaches the class-name chain.
+;; No condition? class-arm: a raw Chez condition never reaches the class-name
+;; chain, because every one a catch binds has become a typed throwable at the
+;; boundary (jolt-unwrap-throw, java/host-faults.ss).
 ;; A fn def'd into a var reports a JVM-style class name "ns$munged-name" (the
 ;; forward CHAR_MAP), so clojure.spec.alpha's fn-sym (which splits on $ and
 ;; demunges) recovers the predicate's symbol. Anonymous / unregistered fns stay
 ;; clojure.lang.IFn (fn-sym yields :unknown, as on the JVM).
+;;
+;; The table below IS clojure.lang.Compiler/CHAR_MAP, character by character, and
+;; it is the ONE forward munge table. It lives here rather than beside demunge
+;; (compile-eval.ss) only because of load order: rt.ss loads this file and
+;; compile-eval.ss comes after it, so this is the earlier of the two ends and the
+;; later one derives from it — Compiler/CHAR_MAP, Compiler/munge and the demunge
+;; token table are all built out of this alist, so no two of them can name
+;; different escapes for one character. It used to hold 15 of the JVM's 24
+;; entries, which is why (class clojure.core/+') reported "clojure.core$_PLUS_'":
+;; a name no JVM emits, demunge cannot reverse, and Java would not accept as an
+;; identifier.
 (define class-munge-map
-  '((#\? . "_QMARK_") (#\! . "_BANG_") (#\* . "_STAR_") (#\+ . "_PLUS_")
-    (#\> . "_GT_") (#\< . "_LT_") (#\= . "_EQ_") (#\/ . "_SLASH_") (#\- . "_")
-    (#\& . "_AMPERSAND_") (#\% . "_PERCENT_") (#\~ . "_TILDE_") (#\^ . "_CARET_")
-    (#\| . "_BAR_") (#\: . "_COLON_")))
+  '((#\- . "_") (#\: . "_COLON_") (#\+ . "_PLUS_") (#\> . "_GT_")
+    (#\< . "_LT_") (#\= . "_EQ_") (#\~ . "_TILDE_") (#\! . "_BANG_")
+    (#\@ . "_CIRCA_") (#\# . "_SHARP_") (#\' . "_SINGLEQUOTE_")
+    (#\" . "_DOUBLEQUOTE_") (#\% . "_PERCENT_") (#\^ . "_CARET_")
+    (#\& . "_AMPERSAND_") (#\* . "_STAR_") (#\| . "_BAR_") (#\{ . "_LBRACE_")
+    (#\} . "_RBRACE_") (#\[ . "_LBRACK_") (#\] . "_RBRACK_") (#\/ . "_SLASH_")
+    (#\\ . "_BSLASH_") (#\? . "_QMARK_")))
 (define (class-munge-name s)
   (let ((out (open-output-string)))
     (string-for-each
@@ -175,9 +195,19 @@
     (cond ((null? as) (jolt-class-base x))
           (((caar as) x) ((cdar as) x))
           (else (loop (cdr as))))))
+;; A Class is ONE object per class, as on the JVM: (class 1) and (class 2) hand
+;; back the same token, and it is the same token the class-name symbol Long
+;; evaluates to. That makes identical? on two Class values a class-equality test,
+;; which library code takes for granted — typedclojure dispatches its whole
+;; RClass-vs-RClass subtype rule behind (identical? (.getClass s) (.getClass t)),
+;; so a fresh token per call answered false there and skipped the rule outright.
+;; jolt-class-for is the interner every other class seam already went through
+;; (a class token, resolve, supers, Class/forName); this was the one that minted
+;; its own. It also canonicalizes the spelling, so a deftype in a dashed
+;; namespace lands on the token its own values report.
 (define (jolt-class x)
   (let ((n (jolt-class-name x)))
-    (if (jolt-nil? n) jolt-nil (make-class-obj n))))
+    (if (jolt-nil? n) jolt-nil (jolt-class-for n))))
 
 (def-var! "clojure.core" "class" jolt-class)
 
@@ -197,12 +227,20 @@
 ;; bare class-name tokens -> canonical JVM class-name strings, derived from the
 ;; modeled class graph (jvm-class-parents) so this list stays current with any
 ;; additions to class-hierarchy.ss.
+;;
+;; Keyed by the name a namespace would MAP the class under — the part after the
+;; last dot, $ and all (java.util.Map$Entry -> Map$Entry, java.lang.Thread$State
+;; -> Thread$State), which is what the JVM imports. jch-last-segment goes on past
+;; the $ because its job is the alternative spelling a protocol extension may use;
+;; taking that as an import name minted a clojure.core/Entry and a
+;; clojure.core/Seq the JVM has no mapping for, and left the two nested auto-
+;; imports with no token at all.
 (define class-token-alist
   (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
     (let ((result '()) (seen (make-hashtable string-hash string=?)))
       (vector-for-each
         (lambda (k _)
-          (let ((s (jch-last-segment k)))
+          (let ((s (jch-import-name k)))
             (when (not (hashtable-ref seen s #f))
               (hashtable-set! seen s #t)
               (set! result (cons (cons s k) result)))))
@@ -234,29 +272,33 @@
         keys vals)
       (reverse result))))
 
+;; The hex an object's default toString appends is Integer.toHexString of its
+;; hashCode, i.e. its IDENTITY hash. equal-hash is not that: it answers one
+;; constant for every procedure (hasheq.ss records the measurement), so every
+;; anonymous fn rendered the same string and a two-operand cast error named
+;; both operands identically. jolt-identity-hasheq is the per-object id
+;; (hash f) already reports — the same number the JVM prints. Rendering it
+;; unsigned over 32 bits is what Integer.toHexString does; the old (abs …)
+;; collapsed h and -h onto one string.
+(define (jolt-identity-hex x)
+  (string-downcase (number->string (bitwise-and (jolt-identity-hasheq x) #xffffffff) 16)))
 ;; (str f) of a fn renders JVM-style — "ns$name@hexhash" — so code that parses
 ;; fn identity out of the string (expound's pprint-fn) finds the $-separated
 ;; class name instead of a raw Chez #<procedure> form.
 (register-str-render!
   (lambda (x) (procedure? x))
-  (lambda (x) (string-append (jolt-class-name x) "@"
-                             (string-downcase (number->string (abs (equal-hash x)) 16)))))
+  (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
 ;; pr/print of a fn uses the JVM object form — #object[ns$name 0xHASH
 ;; "ns$name@HASH"] — which fn-identity parsers (lasertag's resolve-fn-name)
 ;; read the class name out of.
-(register-pr-arm!
-  (lambda (x) (procedure? x))
-  (lambda (x)
-    (let ((cn (jolt-class-name x))
-          (h (string-downcase (number->string (abs (equal-hash x)) 16))))
-      (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]"))))
+(define (jolt-fn-object-form x)
+  (let ((cn (jolt-class-name x))
+        (h (jolt-identity-hex x)))
+    (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]")))
+(register-pr-arm! (lambda (x) (procedure? x)) jolt-fn-object-form)
 ;; print of a fn uses the same #object form as pr (the JVM prints fns through
 ;; print-method Object on both paths); str keeps the bare cn@hash.
 (let ((prev (var-deref "clojure.core" "__print1")))
   (def-var! "clojure.core" "__print1"
     (lambda (x)
-      (if (procedure? x)
-          (let ((cn (jolt-class-name x))
-                (h (string-downcase (number->string (abs (equal-hash x)) 16))))
-            (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]"))
-          (jolt-invoke1 prev x)))))
+      (if (procedure? x) (jolt-fn-object-form x) (jolt-invoke1 prev x)))))

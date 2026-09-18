@@ -172,10 +172,15 @@
     (eval (list 'define pred-name (list 'make-jolt-record-pred id)) env)
     (let loop ((j 0) (fs fields))
       (if (pair? fs)
-          (let* ((spec (car fs))               ; (kind . name), kind ∈ mutable|immutable
-                 (f (cdr spec))
-                 (acc (string->symbol (string-append nstr "-" (symbol->string f))))
-                 (setn (string->symbol (string-append (symbol->string acc) "-set!"))))
+          (let* ((spec (car fs))               ; (kind . name) or (kind name acc [set])
+                 (named? (pair? (cdr spec)))
+                 (f (if named? (cadr spec) (cdr spec)))
+                 (acc (if named?
+                          (caddr spec)
+                          (string->symbol (string-append nstr "-" (symbol->string f)))))
+                 (setn (if (and named? (pair? (cdddr spec)))
+                           (cadddr spec)
+                           (string->symbol (string-append (symbol->string acc) "-set!")))))
             (eval (list 'define acc (list 'make-jolt-record-accessor
                                           id parent-n j))
                   env)
@@ -188,12 +193,13 @@
           #f))
     id))
 
-;; R6RS record runtime introspection over the shim registry. CENSUS (boot
-;; manifest, 2026-08-11): record-constructor + record-type-descriptor only, the
-;; make-pmap/make-pset raw-constructor fast paths in collections.ss. Under the
-;; shim a record type NAME is bound to its registered id (make-jolt-record-type
-;; returns it), so the descriptor is the registry rtd and the raw constructor
-;; is rebuilt from it.
+;; R6RS record runtime introspection over the shim registry: record-constructor
+;; + record-type-descriptor. No shared runtime file calls them any more
+;; (collections.ss names its raw constructors in the record definition, as
+;; pvec always did), so they serve a host file that reaches for the R6RS form.
+;; Under the shim a record type NAME is bound to its registered id
+;; (make-jolt-record-type returns it), so the descriptor is the registry rtd
+;; and the raw constructor is rebuilt from it.
 (define (record-type-descriptor name)
   (if (fixnum? name) (table-ref jolt-record-id-table name #f) #f))
 (define (record-constructor rtd)
@@ -202,11 +208,15 @@
         (make-jolt-record-ctor id n))
       (error 'record-constructor "not a jolt record descriptor" rtd)))
 
-;; field-spec extraction: (kind . name) pairs. R6RS semantics: a PLAIN spec is
-;; IMMUTABLE — only (mutable f) fields get a setter binding.
+;; field-spec extraction: (kind . name) pairs, or (kind name accessor [mutator])
+;; when the spec names its accessor and mutator itself, as R6RS allows and
+;; seq.ss uses. R6RS semantics: a PLAIN spec is IMMUTABLE — only (mutable f)
+;; fields get a setter binding.
 (define-syntax jolt-record-field-names
   (syntax-rules (mutable immutable)
     ((_ ()) '())
+    ((_ ((mutable f acc set) rest ...)) (cons (list 'mutable 'f 'acc 'set) (jolt-record-field-names (rest ...))))
+    ((_ ((immutable f acc) rest ...)) (cons (list 'immutable 'f 'acc) (jolt-record-field-names (rest ...))))
     ((_ ((mutable f) rest ...)) (cons (cons 'mutable 'f) (jolt-record-field-names (rest ...))))
     ((_ ((immutable f) rest ...)) (cons (cons 'immutable 'f) (jolt-record-field-names (rest ...))))
     ((_ (f rest ...)) (cons (cons 'immutable 'f) (jolt-record-field-names (rest ...))))))
@@ -300,6 +310,11 @@
 (define (hashtable-cells t)
   (table->list t))
 
+;; R6RS (hashtable-copy t [mutable?]) over table-copy, which keeps the source's
+;; test and weakness — records.ss copies the weak deftype-ctor-tag table on
+;; every deftype and expects the copy to stay weak.
+(define (hashtable-copy t . mutable?) (table-copy t))
+
 ;; ============================================================================
 ;; fx spelling aliases.
 ;;
@@ -351,6 +366,19 @@
   (syntax-rules () ((_ a b) (arithmetic-shift a b))))
 (define-syntax fxsra
   (syntax-rules () ((_ a b) (arithmetic-shift a (- b)))))
+
+;; ../chez/collections.ss declares its HAMT bitmap operators through
+;; define-width-op, the form host/chez/hasheq.ss uses to pick fx vs generic
+;; arithmetic by the target's fixnum width. This target's own hash engine is
+;; host/gambit/hasheq.ss, so the Chez definition never loads here — and the
+;; question it answers is already settled above: the fx aliases in this file ARE
+;; the generic operators, for the same ~30-bit-fixnum reason Chez's tpb32l needs
+;; the narrow arm. So always take the wide arm; it is bignum-safe on this target.
+(define-syntax define-width-op
+  (syntax-rules ()
+    ((_ name wide narrow)
+     (define-syntax name
+       (syntax-rules () ((_ a (... ...)) (wide a (... ...))))))))
 
 ;; Chez fxlogbit? (i fx): #t when bit i of fixnum fx is set. Gambit 4.9.7 has
 ;; no bit-test primitive (no bitwise-bit-set? / fixnum bit-test in any module);
@@ -438,9 +466,7 @@
 (define (%trim-trailing-newline s)
   (let loop ((n (string-length s)))
     (cond ((= n 0) "")
-          ((memv (string-ref s (- n 1)) '(#
-ewline #
-eturn)) (loop (- n 1)))
+          ((memv (string-ref s (- n 1)) '(#\newline #\return)) (loop (- n 1)))
           (else (substring s 0 n)))))
 
 (define (condition? x)
@@ -452,6 +478,16 @@ eturn)) (loop (- n 1)))
         (else #f)))
 (define (condition-irritants c)
   (if (error-object? c) (error-object-irritants c) '()))
+;; The R6RS condition-type predicates records-dispatch.ss's message rendering
+;; asks (condition->message-string): only an error object carries irritants,
+;; and no Gambit exception has a who slot (the error shim above folds a Chez
+;; `who` into the message text), so who-condition? is #f and condition-who is
+;; never reached. display-condition is display-exception's job here.
+(define (irritants-condition? c) (error-object? c))
+(define (who-condition? c) #f)
+(define (condition-who c) #f)
+(define (display-condition c . port)
+  (display-exception c (if (pair? port) (car port) (current-output-port))))
 
 ;; ============================================================================
 ;; thread-name mappings (G0 verdicts: the PIN holds — parameters fork-inherit
@@ -485,6 +521,12 @@ eturn)) (loop (- n 1)))
     ((_ m e1 e2 ...) (jwm-call m (lambda () e1 e2 ...)))))
 
 (define (make-thread-parameter init) (make-parameter init))
+
+;; Chez's fences, which seq.ss and lazy-bridge.ss issue before publishing a
+;; forced tail on the multi-threaded path. Gambit's Scheme-level threads are
+;; green threads on one OS thread, so ordering across them is program order.
+(define (memory-order-release) #!void)
+(define (memory-order-acquire) #!void)
 
 ;; SRFI-18 spellings: make-condition-variable / condition-variable-signal! /
 ;; condition-variable-broadcast.
@@ -639,8 +681,38 @@ eturn)) (loop (- n 1)))
         (if (null? (car ls)) init
             (apply f (append (map car ls) (list (loop (map cdr ls)))))))))
 
-;; R6RS get-line over Gambit's read-line.
+;; R6RS (rnrs lists) for-all / exists — Gambit has SRFI-1's every / any under
+;; different names and the same contract (the last application's value is the
+;; result; the empty list answers #t / #f). seq.ss, vars.ss, dyn-binding.ss and
+;; predicates.ss use them: (range 5) died on for-all and every gate was green.
+(define (for-all pred . lists) (apply every pred lists))
+(define (exists pred . lists) (apply any pred lists))
+
+;; R6RS (remp pred list) / (remv obj list): SRFI-1's remove is the same as remp;
+;; remv keeps the elements that are not eqv? to obj (atoms.ss's remove-watch,
+;; regex-translate.ss).
+(define (remp pred lst) (remove pred lst))
+(define (remv obj lst) (remove (lambda (x) (eqv? x obj)) lst))
+
+;; R6RS real->flonum: seq.ss's numeric macros widen an exact operand with it
+;; before every mixed fl* / fl+, so (* 2 1.5) reached an unbound global.
+(define (real->flonum x) (exact->inexact x))
+
+;; Chez bignum?: an exact integer outside the fixnum range (natives-format.ss).
+(define (bignum? x) (and (exact-integer? x) (not (fixnum? x))))
+
+;; R6RS char-general-category backs the \p{L}-style classes in
+;; regex-translate.ss. Gambit exposes no Unicode general categories, so such a
+;; pattern is refused as a syntax error (regex.ss's guard turns this raise into
+;; the PatternSyntaxException) rather than matched wrongly or left to die on an
+;; unbound global.
+(define (char-general-category c)
+  (error 'char-general-category
+         "\\p{...} character classes are unsupported on the gambit target"))
+
+;; R6RS get-line / put-string over Gambit's read-line / write-string.
 (define (get-line port) (read-line port))
+(define (put-string port s) (write-string s port))
 
 ;; Chez's format accepts a #f port meaning "to a string" — records.ss calls
 ;; (format #f "f~a" i). The plain SRFI-28 spelling (format "~a" x) is the
@@ -664,25 +736,62 @@ eturn)) (loop (- n 1)))
 (define (make-thread-parameter v) (make-parameter v))
 
 ;; virtual-register / set-virtual-register!: Chez's fixed per-thread slot
-;; array (rt-core claims slots 2/3/4). Gambit has no equivalent; one parameter
-;; per claimed slot, created lazily, reproduces the per-thread semantics and
-;; the "fresh thread starts every slot at fixnum 0" contract. converters.ss's
-;; jolt-print-one stashes a print-readably override in slot jolt-vreg-print-
-;; readably through these.
-(define %vreg-table (make-table test: eqv?))  ;; slot fixnum -> parameter
-(define (virtual-register n)
-  (let ((p (table-ref %vreg-table n #f)))
-    (if p (p) 0)))
-(define (set-virtual-register! n v)
-  (let ((p (or (table-ref %vreg-table n #f)
-               (let ((q (make-parameter 0))) (table-set! %vreg-table n q) q))))
-    (p v)))
+;; array (rt-core claims slots 2/3/4; seq.ss's claim path counts into 7).
+;; Gambit has no equivalent, so each thread carries its own vector of slots in
+;; its thread-specific field, made on first touch. That gives Chez's two
+;; properties: a slot is this thread's alone, and a FRESH THREAD STARTS EVERY
+;; SLOT AT FIXNUM 0 -- nothing is inherited. A parameter per slot, which this
+;; used to be, has neither: a parameter fork-inherits into a SRFI-18 thread
+;; (the G0 pin, and the reason make-thread-parameter above is an alias), so a
+;; child started with its parent's value, which is the one thing a per-thread
+;; interrupt box or cache must never do. gambitcheck.ss pins the contract.
+(define (%vreg-slots)
+  (let* ((t (current-thread)) (v (thread-specific t)))
+    (if (vector? v)
+        v
+        (let ((v (make-vector 16 0))) (thread-specific-set! t v) v))))
+(define (virtual-register n) (vector-ref (%vreg-slots) n))
+(define (set-virtual-register! n v) (vector-set! (%vreg-slots) n v))
+(define (virtual-register-count) 16)
 
-;; parse-int-str / parse-int-or-throw — ported from java/host-static.ss (G2
-;; EXCLUDES the java/ tree; natives-misc.ss's jolt-bigint calls them). String
-;; -> integer in RADIX, #f on failure; parse-int-or-throw raises a jolt
-;; NumberFormatException. str-trim is String.trim (java/natives-str.ss): chars
-;; at or below space.
+;; locks.ss's lock count, which seq.ss's force-claimed! keeps while a tail
+;; thunk runs. On Chez the scheduler reads it to refuse preempting a fiber that
+;; holds a lock; this host has no fibers, so the count is kept and nothing
+;; consults it.
+;; jolt-current-fiber: dyn-binding.ss tags each binding frame with its owner,
+;; the fiber running now or else the thread (dyn-owner). This host has no
+;; fibers, so the owner is always the thread.
+(define (jolt-current-fiber) #f)
+(define (jolt-locks-enter!) (set-virtual-register! 7 (+ 1 (virtual-register 7))))
+(define (jolt-locks-exit!) (set-virtual-register! 7 (- (virtual-register 7) 1)))
+
+;; locks.ss's explicit acquire/release pair, for the paths that hold a mutex
+;; by hand across a dynamic-wind (regex.ss's pattern cache). Same shape as
+;; Chez's: (jolt-lock! mu) blocks, (jolt-lock! mu #f) tries and answers #f, and
+;; the lock count above moves with the mutex. Recursive like Chez's mutexes and
+;; jwm-call above: a re-lock by the holder counts up instead of deadlocking on
+;; SRFI-18's non-recursive mutex, and only the matching unlock releases it.
+(define %jolt-lock-depth (make-table test: eq? weak-keys: #t))
+(define jolt-lock!
+  (case-lambda
+    ((mu) (jolt-lock! mu #t))
+    ((mu block?)
+     (if (eq? (mutex-state mu) (current-thread))
+         (begin (table-set! %jolt-lock-depth mu (+ 1 (table-ref %jolt-lock-depth mu 1)))
+                (jolt-locks-enter!)
+                #t)
+         (let ((got (if block? (mutex-lock! mu) (mutex-lock! mu 0))))
+           (when got (table-set! %jolt-lock-depth mu 1) (jolt-locks-enter!))
+           got)))))
+(define (jolt-unlock! mu)
+  (let ((d (table-ref %jolt-lock-depth mu 1)))
+    (if (> d 1)
+        (table-set! %jolt-lock-depth mu (- d 1))
+        (begin (table-set! %jolt-lock-depth mu) (mutex-unlock! mu)))
+    (jolt-locks-exit!)))
+
+;; str-trim — String.trim (java/natives-str.ss, which G2 excludes): chars at or
+;; below space. rt-core.ss binds clojure.core/trim to it.
 (define (str-trim s)
   (let ((len (string-length s)))
     (let scan-l ((i 0))
@@ -692,14 +801,20 @@ eturn)) (loop (- n 1)))
                     (if (char<=? (string-ref s j) #\space)
                         (scan-r (fx- j 1))
                         (substring s i (fx+ j 1)))))))))
-(define (parse-int-str s radix)
-  (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))
-    (and n (integer? n) n)))
-(define (parse-int-or-throw s radix what)
-  (or (parse-int-str s radix)
-      (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                    (string-append "For input string: \""
-                                   (if (string? s) s (jolt-str-render-one s)) "\"")))))
+
+;; parse-int-or-throw — natives-misc.ss's jolt-bigint is the only caller here (G2
+;; EXCLUDES the java/ tree, so none of the java.lang parsers exist on this host).
+;; The GRAMMAR is not copied: java-int-parse is in natives-num.ss, which both
+;; hosts include, so the one place jolt reads a Java integer cannot drift between
+;; them. bigint is the unbounded parse, so there is no width to name and only the
+;; ordinary "For input string:" message can come out.
+(define (parse-int-or-throw s radix type)
+  (let* ((str (if (string? s) s (jolt-str-render-one s)))
+         (v (java-int-parse str radix #f #f)))
+    (if (symbol? v)
+        (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                      (string-append "For input string: \"" str "\"")))
+        v)))
 
 ;; make-thread-parameter — a Chez PRIMITIVE (no .ss definition), absent on Gambit.
 ;; compile-eval.ss's jolt-current-source / jolt-aot-capture* are thread parameters;
@@ -727,6 +842,11 @@ eturn)) (loop (- n 1)))
     (unless (string=? name (short-class-name name))
       (hashtable-set! class-statics-tbl (short-class-name name) h))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+;; The two are one procedure here. On Chez they differ only in whether the class
+;; is also recorded as one the RUNTIME provides (host-static.ss), and the gambit
+;; boot has no provider registry to ask — records-dispatch.ss's defrecord
+;; `create` takes the merge, so the name has to exist.
+(define (class-statics-merge! name members) (register-class-statics! name members))
 
 ;; Chez gensym accepts a STRING prefix; Gambit only a symbol. Normalize.
 (define %gambit-gensym gensym)

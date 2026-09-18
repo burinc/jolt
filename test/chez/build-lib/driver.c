@@ -10,6 +10,7 @@
 typedef int (*init_fn)(int, char**);
 typedef void* (*lookup_fn)(const char*);
 typedef int (*add_fn)(int, int);
+typedef int (*point_size_fn)(void);
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: driver <libpath>\n"); return 2; }
@@ -20,7 +21,8 @@ int main(int argc, char** argv) {
   if (!init || !lookup) { fprintf(stderr, "missing init/lookup: %s\n", dlerror()); return 1; }
   if (init(0, NULL) != 0) { fprintf(stderr, "jolt_library_init failed\n"); return 1; }
   add_fn add = (add_fn)lookup("add");
-  if (!add) { fprintf(stderr, "jolt_lookup(\"add\") returned NULL\n"); return 1; }
-  printf("%d\n", add(2, 3));
+  point_size_fn point_size = (point_size_fn)lookup("point_size");
+  if (!add || !point_size) { fprintf(stderr, "jolt_lookup returned NULL\n"); return 1; }
+  printf("%d %d\n", add(2, 3), point_size());
   return 0;
 }

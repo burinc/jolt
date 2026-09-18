@@ -1,0 +1,8 @@
+{:paths ["tsk"]
+ :deps {tasklib/tasklib {:local/root "../lib"}}
+ :tasks {:requires ([both.helper :as h])
+         btask {:doc "a bb.edn task" :task (println "bb task" (h/where))}
+         appns {:task (do (require 'both.core) (println "app ns reachable"))}
+         bbdep {:requires ([tasklib.core :as t]) :task (println (t/who))}
+         ;; same name in both files: bb.edn wins
+         dtask {:task (println "bb.edn shadows deps.edn")}}}

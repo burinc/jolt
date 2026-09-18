@@ -101,8 +101,8 @@ yn "5: ...and no error/stacktrace" "$(printf '%s' "$out11" | grep -qi 'exception
 #    silently drop the root; and once the jar is fixed IN PLACE (the cache
 #    material doesn't fold jar bytes) the next run must resolve it, which it
 #    can only do if the degraded result was never written.
-if command -v python3 >/dev/null 2>&1; then
-  export JOLT_JARLIBS="$tmp/jarlibs"
+export JOLT_JARLIBS="$tmp/jarlibs"
+{
   mkdir -p "$tmp/proj2/src/app2"
   cat > "$tmp/proj2/deps.edn" <<'EOF'
 {:paths ["src"]
@@ -116,13 +116,14 @@ EOF
   run2() { JOLT_PWD="$tmp/proj2" JOLT_QUIET=1 JOLT_DEBUG=1 "$JOLT" "$@" 2>&1; }
   out12="$(run2 -e nil)"
   yn "6: corrupt jar fails resolution loudly" "$(printf '%s' "$out12" | grep -qi 'could not be resolved' && echo yes || echo no)"
-  python3 -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],"w"); z.writestr("libj/core.clj","(ns libj.core) (def y 7)"); z.close()' "$tmp/proj2/libj.jar"
+  # the repaired jar comes from jolt itself (tools/mkjar.clj writes a stored zip)
+  printf '(ns libj.core) (def y 7)' > "$tmp/proj2/core.clj"
+  # from a project-less directory: proj2's own deps.edn names the jar being repaired
+  JOLT_PWD="$tmp" JOLT_QUIET=1 "$JOLT" run "$root/tools/mkjar.clj" "$tmp/proj2/libj.jar" "libj/core.clj=$tmp/proj2/core.clj" >/dev/null
   out13="$(JOLT_PWD="$tmp/proj2" JOLT_QUIET=1 "$JOLT" run -m app2.core 2>&1)"
   yn "6: fixed jar resolves and loads" "$(printf '%s' "$out13" | tail -1 | grep -q 'jarlib 7' && echo yes || echo no)"
   unset JOLT_JARLIBS
-else
-  echo "  (skip: python3 not available for case 6)" >&2
-fi
+}
 
 # 7. the env knobs that move where Maven artifacts live select different keys:
 #    a run with JOLT_MAVEN_REPOSITORY / JOLT_MVNLIBS /

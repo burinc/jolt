@@ -1,0 +1,8 @@
+error[analyze/invalid-if]: Too few arguments to if
+  --> ./test/errors/analyze/invalid-if-too-few-args/input.clj:4:3
+   |
+ 2 | 
+ 3 | (defn f []
+ 4 |   (if))
+   |   ^^^^
+exit: 1

@@ -1,0 +1,4 @@
+# Loader conformance cases that do not pass yet, by case number.
+# Regenerate: JOLT_LOADERCONF_WRITE_BASELINE=1 make loaderconf
+#
+# A case leaves this file in the same change that makes it pass.

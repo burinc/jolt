@@ -20,7 +20,7 @@
 (define (jolt-var-get v)
   (if (var-cell? v)
       (var-cell-root v)
-      (throw-jvm (quote ClassCastException) "var-get: not a var")))
+      (jolt-cast-throw v "clojure.lang.Var")))
 
 ;; deref of a var -> its root.
 (define %v-deref jolt-deref)
@@ -60,6 +60,34 @@
 ;; defines) reported "class :object cannot be cast to …" instead of the JVM's
 ;; "class clojure.lang.Var$Unbound cannot be cast to …" / "ISeq from Var$Unbound".
 (register-class-arm! jolt-var-unbound? (lambda (u) "clojure.lang.Var$Unbound"))
+
+;; clojure.lang.Var$TBox — the box one thread binding lives in, and the whole of
+;; what (.getThreadBinding v) hands back. Its two JVM fields (thread, val) are
+;; package-private, so NOTHING reads them from Clojure: (.val b) and (.-val b)
+;; both raise "No matching field found" there, exactly as they do here by
+;; falling through to dispatch-miss. That leaves three observables, and this
+;; type carries all three: the box is non-nil iff a binding is in place, its
+;; class is clojure.lang.Var$TBox, and two reads of the SAME binding frame are
+;; identical? while a read from an inner frame is not. The last one is why the
+;; record holds the frame ENTRY rather than a copy of its value — dyn-binding.ss
+;; interns one box per entry, and a box built per call would read back as a
+;; different object, which it is not on the JVM.
+(define-record-type jolt-var-tbox (fields entry) (nongenerative jolt-var-tbox-v1))
+;; The JVM renders a TBox with Object.toString, so the suffix is an identity
+;; hash in hex — per-object and not reproducible across runs there either. The
+;; unbound marker above prints a literal 0 because corpus rows pin its text; a
+;; box's text is pinned by prefix only, so it can carry a real per-object id and
+;; two distinct boxes print differently, as they do on the JVM.
+(define (tbox-hex b) (number->string (jolt-identity-hasheq b) 16))
+(define (tbox-str b) (string-append "clojure.lang.Var$TBox@" (tbox-hex b)))
+(define (tbox-pr b)
+  (let ((h (tbox-hex b)))
+    (string-append "#object[clojure.lang.Var$TBox 0x" h
+                   " \"clojure.lang.Var$TBox@" h "\"]")))
+(register-pr-str-arm! jolt-var-tbox? tbox-str)
+(register-str-render! jolt-var-tbox? tbox-str)
+(register-pr-readable-arm! jolt-var-tbox? tbox-pr)
+(register-class-arm! jolt-var-tbox? (lambda (b) "clojure.lang.Var$TBox"))
 ;; (class a-reify) is a generated "ns$reify__N" class on the JVM — an unstable
 ;; per-eval name jolt can't reproduce, so (like the fixed AFunction$fn__0 stand-in
 ;; for an anonymous fn) it reports a stable reify-shaped placeholder rather than

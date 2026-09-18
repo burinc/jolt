@@ -1,12 +1,33 @@
 ;; run-sci.ss — SCI conformance: load borkdude/sci's own source (vendor/sci) through
 ;; jolt and require its forms to compile+eval. A real-world Clojure-compatibility
-;; stress test. Floor-gated like the corpus: a regression below
-;; the floor (or the count today, 416/424) fails. Raise the floor as host gaps close
-;; (the tail is genuine gaps — the eight remaining failures all reference
-;; sci.impl.copy-vars, a namespace this gate's load-order doesn't cover).
+;; stress test. Floor-gated like the corpus: a regression below the floor (or the
+;; count today, 399/424) fails. Raise the floor as host gaps close.
+;;
+;; The tail is this gate's own load-order, not a host gap. load-order below is a
+;; CURATED SUBSET in a fixed sequence, so a reference across it can land before its
+;; target is loaded — SCI's real requires are transitive and cyclic, and jolt has no
+;; trouble with them: the scifunctional gate loads the same library through the
+;; ordinary dependency path and passes. Of the twelve: seven cannot resolve an
+;; unqualified name from a namespace this list omits (four of them copy-core-var,
+;; from sci.impl.copy-vars) and five name the namespace outright —
+;; sci.impl.interpreter twice, sci.impl.types, sci.impl.cljs, edamame.impl.parser.
+;;
+;; That second group is why the floor moved 416 -> 412 (jolt-z88). A qualified name
+;; whose namespace is not loaded used to compile to a class static, so the form
+;; "loaded" and only a call would have found out; the analyzer reports it now, and
+;; four forms moved from silently-latent to counted. Nothing about SCI or jolt
+;; changed with them — the same four could never have run.
+;;
+;; 412 -> 399 (jolt-d1ip) is the same move for an ALIAS: `types/foo` in
+;; protocols.cljc, `i/foo` and `opts/foo` in core.cljc name an :as from an ns form
+;; whose require failed under this order, so the alias was never registered. The
+;; compiler's require pre-scan used to register it anyway, before the ns form
+;; ran, and the reference compiled to the same dead class static; without the
+;; pre-scan an unregistered lowercase alias is "No such namespace" at compile
+;; time, as on the JVM, and thirteen such forms are counted.
 ;;
 ;;   chez --script host/chez/run-sci.ss
-;;   JOLT_SCI_FLOOR=N    override the floor (default 416)
+;;   JOLT_SCI_FLOOR=N    override the floor (default 399)
 ;;   SCI_VERBOSE=1       print each failing form's error
 (import (chezscheme))
 
@@ -91,7 +112,7 @@
   load-order)
 
 (printf "\nSCI load: ~a/~a forms ok (~a fail)\n" total-ok (+ total-ok total-fail) total-fail)
-(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 416)))
+(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 399)))
 (when (< total-ok floor)
   (printf "REGRESSION: ~a forms loaded < floor ~a\n" total-ok floor))
 (flush-output-port)

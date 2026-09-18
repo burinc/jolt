@@ -55,7 +55,9 @@ proj="$(cd "$proj" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
 
-now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+# wall clock in ms, as startup.sh reads it: perl's Time::HiRes is on every host
+# this runs on, and a jolt process per sample would cost more than a phase
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
 
 # One build. $1 = label, $2 = extra env assignments, $3 = extra build flags.
 # Prints the profile table, then the flat.ss size and the two-way split.
@@ -97,12 +99,18 @@ run_config() {
       # after stripping parens a line reads:
       #   jolt build: [profile] <name words…> <ms> ms cumulative <total>
       gsub(/[()]/, "");
+      # a "- wp: fixpoint 3153 ms" sub-row is part of the parent total and
+      # carries no cumulative column; counting it would double the parent
+      # (no apostrophes in here: this program is a single-quoted shell string)
+      if ($4 == "-") next;
       ms = $(NF-3);
       name = "";
       for (i = 4; i <= NF - 4; i++) name = name (name == "" ? "" : " ") $i;
-      if (name ~ /compile-file|make-boot-file|payload link/) chez += ms;
-      else if (name ~ /prologue/)                            pro  += ms;
-      else                                                   jolt += ms;
+      # build.ss names the Chez rows "compile runtime half", "compile app
+      # half", "runtime fasl (cached)", "make-boot-file", "stub + payload link"
+      if (name ~ /^compile |^runtime fasl|make-boot-file|payload link/) chez += ms;
+      else if (name ~ /prologue/)                                        pro  += ms;
+      else                                                               jolt += ms;
     }
     END {
       t = jolt + pro + chez;

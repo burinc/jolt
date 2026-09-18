@@ -45,6 +45,16 @@
 (let ((spm (var-deref "jolt.backend-scheme" "set-prelude-mode!")))
   (if (procedure? spm) (spm #t)
       (begin (display "gen-seed: WARNING set-prelude-mode! not found\n") (exit 1))))
+;; Same reason as prelude-mode above: emit-image.ss turned var cell-hoisting ON on
+;; the unit current at ITS load time, and the fresh unit published here defaults it
+;; off. Without this the Gambit seed silently keeps the un-hoisted (var-deref ns
+;; name) shape — correct, but ~102ns per core var reference where the Chez seed
+;; pays ~1ns. dyn-binding.ss (which defines var-cell-deref) is ##included at
+;; boot.ss:83 / boot-full.ss:90, ahead of seed/prelude.ss, so the hoisted reader
+;; is bound before any hoisted cell is read.
+(let ((svc (var-deref "jolt.backend-scheme" "set-var-cache!")))
+  (if (procedure? svc) (svc #t)
+      (begin (display "gen-seed: WARNING set-var-cache! not found\n") (exit 1))))
 (let ((st (var-deref "jolt.backend-scheme" "set-target!")))
   (if (procedure? st)
       (begin (st (keyword #f "gambit"))
@@ -58,19 +68,7 @@
 (define gs-prelude (jolt-emit-prelude))
 (define gs-image (jolt-emit-image))
 
-(define (gs-has? text needle)
-  (let loop ((i 0))
-    (cond
-      ((>= i (string-length text)) #f)
-      ((string=? (substring text i (min (+ i (string-length needle)) (string-length text))) needle) #t)
-      (else (loop (+ i 1))))))
 
-(define (gs-index text needle)
-  (let loop ((i 0))
-    (cond
-      ((>= i (string-length text)) -1)
-      ((string=? (substring text i (min (+ i (string-length needle)) (string-length text))) needle) i)
-      (else (loop (+ i 1))))))
 
 ;; A "#3%" occurrence is a chez-only EMISSION only when it is a USE
 ;; (e.g. "(#3%vector-ref ...)" / "(#3%fl+ ...)" — a paren/whitespace right

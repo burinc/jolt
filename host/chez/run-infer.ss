@@ -34,6 +34,7 @@
 
 ;; analyze a source string to its IR node (fresh ctx, ns "user", no passes).
 (define (anode src) (analyze (make-analyze-ctx "user") (jolt-ce-read src)))
+(define kw (lambda (n) (keyword #f n)))
 ;; number of success-type diagnostics check-form produces for src.
 (define (diags src strict?) (jolt-count (check-form U (anode src) strict?)))
 ;; argument count of the :invoke node run-inference hands back — a pattern helper
@@ -92,6 +93,38 @@
 (let ((r (infer-body U (anode "(do (foo 1) (bar 2) (map inc [1]))") (jolt-hash-map))))
   (gate-check "infer-body calls" (jolt-count (jolt-nth r 2)) 3)        ; foo, bar, map
   (gate-check "infer-body escapes" (jolt-count (collected-escapes U)) 1)) ; inc (value position)
+
+;; --- the walk descends through EVERY node, including ops it has no arm for --
+;; `infer`'s per-op cond ends in a fallback. Answering :any there is right — the
+;; pass has no opinion about such a node's type — but the fallback must still walk
+;; the node's children, or nothing inside is annotated and every record read and
+;; numeric op in the subtree quietly falls back to the generic path.
+;;
+;; That is not hypothetical. The inline pass wraps a spliced body in :coerce to
+;; carry a callee's ^double/^long return coercion, :coerce had no arm, and so every
+;; inlined copy of a return-hinted fn came out untyped: its field reads emitted
+;; jolt-get instead of a slot read and its arithmetic the generic ops, which made
+;; declaring a return type roughly halve the speed of the fn's inlined copies.
+;;
+;; Collected calls are the probe: a call inside the node is seen only if the walk
+;; reached it. One case for :coerce (which has an arm now) and one for an op that
+;; has none and carries a child, so the fallback itself is pinned.
+;; :coerce has an arm of its own, so what it must be pinned on is the TYPE it
+;; answers, not the walk — the fallback below would walk it either way. The arm is
+;; what lets a spliced ^double body's RESULT type as a double for the code around
+;; it rather than degrading to :any.
+(let ((coerce-node (var-deref "jolt.ir" "coerce-node")))
+  (reset-escapes! U)
+  (let ((r (infer-body U (coerce-node (kw "double") (anode "(foo 1)")) (jolt-hash-map))))
+    (gate-check "infer walks through :coerce" (jolt-count (jolt-nth r 2)) 1)
+    (gate-check "a :coerce :double types as :double" (jolt-nth r 0) (kw "double"))))
+(reset-escapes! U)
+(let* ((unhandled (jolt-hash-map (kw "op") (kw "set-var")
+                                 (kw "the-var") (jolt-hash-map (kw "op") (kw "the-var")
+                                                               (kw "ns") "user" (kw "name") "sink")
+                                 (kw "val") (anode "(foo 1)")))
+       (r (infer-body U unhandled (jolt-hash-map))))
+  (gate-check "infer walks through an op with no arm" (jolt-count (jolt-nth r 2)) 1))
 
 ;; --- the record-shapes registry feeds call-result types --------------------
 ;; without shapes a (->P …) call result is :any (accepted); with the registry it

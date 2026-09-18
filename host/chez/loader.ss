@@ -45,18 +45,17 @@
     "vendor/grenadine-generated"))
 
 ;; True when `f` is a file owned by the Jolt runtime (compiler + stdlib) — either
-;; an embedded-resource key (string or bytevector value) or a path under one of
-;; ldr-install-roots.
+;; an embedded-resource key — eagerly registered, or carried by the source blob's
+;; index — or a path under one of ldr-install-roots.
 (define (ldr-install-file? f)
-  (let ((v (hashtable-ref embedded-resources f #f)))
-    (or (string? v) (bytevector? v)
-        (let loop ((roots ldr-install-roots))
-          (and (pair? roots)
-               (or (let ((root (car roots)))
-                     (and (>= (string-length f) (+ (string-length root) 1))
-                          (string=? (substring f 0 (string-length root)) root)
-                          (char=? (string-ref f (string-length root)) #\/)))
-                   (loop (cdr roots))))))))
+  (or (embedded-resource-has? f)
+      (let loop ((roots ldr-install-roots))
+        (and (pair? roots)
+             (or (let ((root (car roots)))
+                   (and (>= (string-length f) (+ (string-length root) 1))
+                        (string=? (substring f 0 (string-length root)) root)
+                        (char=? (string-ref f (string-length root)) #\/)))
+                 (loop (cdr roots)))))))
 
 ;; A Chez source string for the install roots list — "(list \"jolt-core\" \"stdlib\" \"vendor/fs/src\")".
 ;; Used by build templates so the literal stays in one place.
@@ -64,6 +63,63 @@
   (string-append "(list"
     (fold-left (lambda (s r) (string-append s " \"" r "\"")) "" ldr-install-roots)
     ")"))
+
+;; --- namespaces Jolt vendors and owns ---------------------------------------
+;; A copy of one of these on a project's roots must not shadow jolt's. A built
+;; binary already resolves jolt's copy first (install sources are embedded, and
+;; resolve-on-roots probes those before any root), so resolving these from the
+;; install roots is what keeps source mode answering the same file as the
+;; binary — a project that pulls babashka.fs in as a transitive dependency gets
+;; one babashka.fs, not two. babashka does not let a classpath copy shadow a
+;; built-in either.
+;;
+;; There is no per-namespace "supplement" seam any more. There used to be one
+;; (babashka.fs -> jolt.bb.fs), because jolt's reader matched :bb and babashka.fs
+;; writes list-dir as #?(:bb nil :default (defn list-dir …)) — so on jolt the var
+;; stayed declared and unbound and jolt had to fill it. Dropping :bb (issue #893,
+;; reader.ss rdr-features) means babashka.fs defines its own list-dir off the
+;; :clj branch, which is the one jolt's java.nio shims target.
+;;
+;; The escape hatch stays, because "jolt always wins" is not a thing a project
+;; can be stuck with. A project declares (deps.edn) which of these it supplies
+;; itself:
+;;
+;;   :jolt/replaces [babashka.fs]
+;;
+;; and its own copy resolves ahead of jolt's. jolt.deps collects the key and
+;; jolt.main hands it here through jolt.host/replace-builtin-ns! before any of
+;; the project compiles, which is the same ordering :jolt/provides needs.
+;;
+;; Only the PROJECT may declare one. A library that took a built-in over for the
+;; whole program would decide what babashka.fs MEANS for every other library in
+;; it, which is the shape the provider table already refuses for classes.
+(define ldr-ns-replacements '())
+(define (ldr-ns-replaced? name) (and (member name ldr-ns-replacements) #t))
+(define (replace-builtin-ns! name)
+  (unless (ldr-ns-replaced? name)
+    (set! ldr-ns-replacements (cons name ldr-ns-replacements))))
+;; the same question at the path level, for resolve-on-roots. A replacement
+;; covers the namespace's children too (babashka/fs/whatever), like the
+;; built-in list it overrides.
+(define (ldr-ns-replaced-rel? rel)
+  (let loop ((ns ldr-ns-replacements))
+    (and (pair? ns)
+         (or (ldr-rel-prefix? rel (ns-name->rel (car ns))) (loop (cdr ns))))))
+;; Matched as a namespace PREFIX so a child (babashka/process/pprint) travels
+;; with its parent.
+(define ldr-builtin-ns-rels '("babashka/fs" "babashka/process"))
+(define (ldr-builtin-ns-rel? rel)
+  (let loop ((bs ldr-builtin-ns-rels))
+    (and (pair? bs)
+         (or (ldr-rel-prefix? rel (car bs)) (loop (cdr bs))))))
+;; REL is B, or a child of it: matched as a namespace prefix so a child
+;; (babashka/process/pprint) travels with its parent.
+(define (ldr-rel-prefix? rel b)
+  (let ((bn (string-length b)))
+    (and (>= (string-length rel) bn)
+         (string=? (substring rel 0 bn) b)
+         (or (fx=? (string-length rel) bn)
+             (char=? (string-ref rel bn) #\/)))))
 
 ;; --- data readers (#tag literals) -------------------------------------------
 ;; A project's data_readers.{jolt,clj,cljc} at a source root maps a tag symbol to a
@@ -106,6 +162,33 @@
                 (jolt-throw
                   (jolt-ex-info msg (jolt-hash-map (keyword #f "tag") tag-kw) orig)))))
     (jolt-invoke rfn inner)))
+
+;; The reader FUNCTION for a *data-readers* value: a fn as-is, a var's root, or a
+;; qualified symbol's var — the same three shapes the read-string path accepts
+;; (reader.ss rdr-data-reader-fn). The load path took symbols only, so an entry
+;; added with (alter-var-root #'*data-readers* assoc 'my/tag (fn …)) reached the
+;; analyzer as (#<procedure> 'form) and died there as "unsupported form".
+(define (ldr-reader-fn rdr)
+  (cond
+    ((procedure? rdr) rdr)
+    ((var-cell? rdr) (let ((f (var-cell-root rdr))) (and (procedure? f) f)))
+    ((and (symbol-t? rdr) (not (jolt-nil? (symbol-t-ns rdr))))
+     (guard (e (#t #f))
+       (let ((v (var-deref (symbol-t-ns rdr) (symbol-t-name rdr))))
+         (and (procedure? v) v))))
+    (else #f)))
+
+;; The deferred shape, (reader-fn 'inner) evaluated at runtime. Only a SYMBOL
+;; reader can be written as a call; anything else that reaches here is a table
+;; entry that is not a reader at all, and saying so beats emitting a form the
+;; analyzer can only report as "unsupported form".
+(define (ldr-reader-call tag-kw rdr inner)
+  (if (symbol-t? rdr)
+      (jolt-list rdr (jolt-list (jolt-symbol #f "quote") inner))
+      (jolt-throw (jolt-ex-info
+                    (string-append "data reader " (keyword-t-name tag-kw) " is not a function")
+                    (jolt-hash-map (keyword #f "tag") tag-kw)))))
+
 ;; change-tracking walk: rewrite registered #tag forms, keep everything else
 ;; (and its identity/metadata) intact. Mirrors reader.ss rdr-form->data but keeps
 ;; set FORMS for the compiler spine instead of building real sets.
@@ -124,23 +207,26 @@
            ;; Clojure applies a data reader at read time and substitutes its result
            ;; as code. A reader that returns a FORM (a list — e.g. borkdude.html's
            ;; #html expands to (->Html (str …))) must be compiled, so splice it in.
-           ;; A reader that returns a VALUE (time-literals #time/date -> a Date) is
-           ;; left as a runtime call (reader-fn 'inner): the value rebuilds at
-           ;; startup, which also keeps a non-serializable constant out of an AOT
-           ;; build. The reader runs at load time only when its var RESOLVES — a
-           ;; reader whose ns isn't loaded yet falls back to the runtime call. A
-           ;; resolved reader that throws surfaces (the prior catch-all guard
-           ;; silently downgraded every reader bug to a runtime call).
-           (let ((rfn (and (symbol-t? rdr) (not (jolt-nil? (symbol-t-ns rdr)))
-                           (let ((v (var-deref (symbol-t-ns rdr) (symbol-t-name rdr))))
-                             (and (procedure? v) v)))))
+           ;; A reader NAMED BY A SYMBOL that returns a VALUE (time-literals
+           ;; #time/date -> a Date) is left as a runtime call (reader-fn 'inner):
+           ;; the value rebuilds at startup, which also keeps a non-serializable
+           ;; constant out of an AOT build. A fn/var reader has no name to call,
+           ;; so its value is spliced in. The reader runs at load time only when
+           ;; it RESOLVES — a reader whose ns isn't loaded yet falls back to the
+           ;; runtime call. A resolved reader that throws surfaces (the prior
+           ;; catch-all guard silently downgraded every reader bug to a call).
+           (let ((rfn (ldr-reader-fn rdr)))
              (if rfn
                  (let ((result (ldr-invoke-reader (jolt-get x rdr-kw-tag) rfn inner)))
-                   (if (cseq? result)
-                       result
-                       (jolt-list rdr (jolt-list (jolt-symbol #f "quote") inner))))
+                   (cond
+                     ((cseq? result) result)
+                     ;; a SYMBOL reader has a name to call at runtime
+                     ((symbol-t? rdr) (ldr-reader-call (jolt-get x rdr-kw-tag) rdr inner))
+                     ;; a fn/var reader has no name to defer to, so splice the value
+                     ;; it just produced — what the read-string path does anyway
+                     (else result)))
                  ;; unresolved reader (ns not loaded yet): runtime-call fallback
-                 (jolt-list rdr (jolt-list (jolt-symbol #f "quote") inner)))))
+                 (ldr-reader-call (jolt-get x rdr-kw-tag) rdr inner))))
          ((eq? inner (jolt-get x rdr-kw-form)) x)
          (else (rdr-make-tagged (jolt-get x rdr-kw-tag) inner)))))
     ((rdr-set-form? x)
@@ -172,22 +258,40 @@
                  (pmap-fold m (lambda (k v a) (cons k (cons v a))) '()))))
       (set! data-readers-active #t)
       ;; eagerly load each reader fn's namespace so the rewritten call resolves.
+      ;; Tolerant — a data_readers entry must not kill the project load — but a
+      ;; failure is reported in full (ldr-warn-reader-ns-failed!), or the miss
+      ;; surfaces later as an unrelated unresolved-var error at first #tag read.
       (pmap-fold m (lambda (k v a)
                      (when (and (symbol-t? v) (symbol-t-ns v) (not (jolt-nil? (symbol-t-ns v))))
-                       ;; tolerant — a data_readers entry must not kill the project
-                       ;; load — but say WHICH reader ns failed and why, or the
-                       ;; miss surfaces later as an unrelated unresolved-var error
-                       ;; at first #tag read.
-                       (guard (e (#t (display
-                                      (string-append "jolt: warning: data-reader namespace "
-                                                     (symbol-t-ns v) " failed to load: "
-                                                     (guard (_ (#t "(unprintable error)"))
-                                                       ((var-deref "jolt.host" "condition-message") e))
-                                                     "\n")
-                                      (current-error-port))))
+                       (guard (e (#t (ldr-warn-reader-ns-failed! (symbol-t-ns v) e m)))
                          (load-namespace (symbol-t-ns v))))
                      a)
                  #f)))))
+
+;; The warning for a data_readers namespace that failed to load — everything the
+;; reader needs to act on it: which namespace, why, WHERE it failed (the throw's
+;; own position, in the shape the uncaught report uses), and which tags of the
+;; file now have no reader. The load's position does not outlive the warning:
+;; load-jolt-file* unwinds it, so the next error in the process is not reported
+;; "at" this namespace's failing form.
+(define (ldr-warn-reader-ns-failed! ns-name e readers)
+  (let ((port (current-error-port))
+        (msg (guard (_ (#t "(unprintable error)"))
+               ((var-deref "jolt.host" "condition-message") e)))
+        (where (jolt-throwable-source-string e))
+        (tags (sort string<?
+                    (pmap-fold readers
+                               (lambda (k v a)
+                                 (if (and (symbol-t? v) (equal? (symbol-t-ns v) ns-name))
+                                     (cons (string-append "#" (jolt-pr-str k)) a)
+                                     a))
+                               '()))))
+    (display (string-append "jolt: warning: data-reader namespace " ns-name
+                            " failed to load: " msg "\n")
+             port)
+    (when where (display (string-append "  at " where "\n") port))
+    (unless (null? tags)
+      (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port))))
 (define (load-data-readers!)
   (for-each
     (lambda (root)
@@ -239,27 +343,37 @@
 ;; `require` resolves with no source on disk. The dev bin/jolt has an empty
 ;; source store, so the hashtable probes miss and it falls straight to disk.
 (define (resolve-on-roots rel)
-  (define (embedded-key? k)
-    (let ((v (hashtable-ref embedded-resources k #f)))
-      (or (string? v) (bytevector? v))))
-  (or (let loop ((es ldr-source-exts))
-        (and (pair? es)
-             (let ((k (string-append rel (car es))))
-               (if (embedded-key? k) k (loop (cdr es))))))
-      (let loop ((roots source-roots))
-        (and (pair? roots)
-             (or (let ext ((es ldr-source-exts))
-                   (and (pair? es)
-                        (let ((f (string-append (car roots) "/" rel (car es))))
-                          (if (file-exists? f) f (ext (cdr es))))))
-                 (loop (cdr roots)))))))
+  (define (embedded-key? k) (embedded-resource-has? k))
+  (define (on-roots roots)
+    (let loop ((roots roots))
+      (and (pair? roots)
+           (or (let ext ((es ldr-source-exts))
+                 (and (pair? es)
+                      (let ((f (string-append (car roots) "/" rel (car es))))
+                        (if (file-exists? f) f (ext (cdr es))))))
+               (loop (cdr roots))))))
+  ;; A namespace the project DECLARED it supplies is the project's, ahead of
+  ;; everything — including the embedded copy a built binary carries, which is
+  ;; what probes first for every other namespace. Anything less and the hatch
+  ;; would work in source mode and not in a build, which is the divergence the
+  ;; built-in rule exists to prevent.
+  (if (ldr-ns-replaced-rel? rel)
+      (on-roots source-roots)
+      (or (let loop ((es ldr-source-exts))
+            (and (pair? es)
+                 (let ((k (string-append rel (car es))))
+                   (if (embedded-key? k) k (loop (cdr es))))))
+          ;; a namespace jolt provides as a host built-in resolves to jolt's copy
+          ;; before a project root's — see ldr-builtin-ns-rels
+          (and (ldr-builtin-ns-rel? rel) (on-roots ldr-install-roots))
+          (on-roots source-roots))))
 
 ;; Read a namespace source. An embedded key (resolve-on-roots above, or the
 ;; build driver's app-order entries) reads its baked string; everything else is
 ;; a real path read off disk. Bytevector entries (the bundled boots/stub, and
 ;; source embeds stored as bytevectors to save heap) decode via utf8->string.
 (define (ldr-read-source path)
-  (let ((emb (hashtable-ref embedded-resources path #f)))
+  (let ((emb (embedded-resource-ref path)))
     (cond ((string? emb) emb)
           ((bytevector? emb) (utf8->string emb))
           (else (read-file-string path)))))
@@ -285,6 +399,15 @@
 ;; it from the loaded set so a require pulls the overlay from the source roots
 ;; (like clojure.test); the primitives stay defined either way.
 (hashtable-delete! loaded-ns "clojure.core.async")
+
+;; Immutable baseline for app-image construction.  The build command itself
+;; loads jolt.main and lazy stdlib namespaces before build-binary runs; those
+;; process-local additions must not be mistaken for namespaces baked into the
+;; runtime image that the new app will inherit.
+(define ldr-runtime-image-ns (hashtable-copy loaded-ns #f))
+(define (ldr-runtime-image-ns-copy) (hashtable-copy ldr-runtime-image-ns #f))
+;; host-contract's seed-var direct-link check reads the same boot set.
+(set! hc-seed-ns-source ldr-runtime-image-ns-copy)
 
 ;; *loaded-libs* is the other half of the loaded set: a clojure.lang.Ref that
 ;; tools.namespace and core.typed conj/disj on, and that ns-dedup-loaded? below
@@ -403,6 +526,36 @@
                 (cons ldr-unchecked-cell (var-cell-root ldr-unchecked-cell)))
           thunk))))
 
+;; The loader's two compile-from-source entrances -- load-jolt-file* below and
+;; the AOT capture around it (aot-capture-load) -- each refuse BY NAME in a
+;; binary built without the compiler, before either touches a compiler binding.
+;; build.ss drop-compiler? leaves compile-eval.ss out of such a binary, so
+;; jolt-compile-eval-form and the capture parameters both entrances parameterize
+;; are unbound there, and the first one touched died as "variable
+;; jolt-aot-capture-file is not bound": a raw Chez error naming a loader
+;; internal, with nothing pointing at the cause. The one way a compiler-dropped
+;; binary reaches source is a :jolt/tree-shake {:allow-dynamic […]} vouch that
+;; was wrong -- a require, requiring-resolve or compile of a computed name the
+;; vouch said never runs in the binary, or names only what the build baked,
+;; running and naming a namespace whose source is on the roots (dce.ss
+;; dce-bail-scan); the verdict runs on every build, so the default build is as
+;; exposed as a shaken one. Image restore refuses the same way (state-image.ss
+;; image-compile-eval-seam). Probed through sa-baked-global, the seam
+;; aot-runtime-fingerprint already reads a baked global through.
+(define (ldr-need-compiler! path)
+  (unless (procedure? (sa-baked-global 'jolt-compile-eval-form))
+    (jolt-throw (jolt-ex-info
+                  (string-append
+                    "this build has no compiler; cannot load " path " from source."
+                    " The build dropped the compiler because nothing reachable"
+                    " compiles at run time, and a deps.edn :jolt/tree-shake"
+                    " {:allow-dynamic […]} entry vouched for the site that just did"
+                    " -- a require, requiring-resolve or compile of a computed name"
+                    " that never runs in the binary, or names only a namespace the"
+                    " build baked. Drop the entry that covers this site, or require"
+                    " the namespace statically so the build bakes it.")
+                  (jolt-hash-map (keyword #f "file") path)))))
+
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
 
@@ -410,18 +563,23 @@
 ;; Split out so the AOT cache (below) reads source once for both keying and the
 ;; capture load, instead of re-reading inside the loop.
 (define (load-jolt-file* path src)
-  (let* ((end (string-length src))
-         ;; Restore the current-source position on NORMAL return only. Loading a
-         ;; required file advances the position per form; without restoring it, a
-         ;; later error in the requiring file (e.g. a second, missing require in
-         ;; the same ns form) would be blamed on the last form of the dependency
-         ;; that just loaded. On a throw we intentionally do NOT restore, so the
-         ;; error keeps the failing form's own position instead of unwinding to
-         ;; the requiring form — the report then points at the file that failed.
-         (saved-source (jolt-current-source)))
+  (ldr-need-compiler! path)
+  (let ((end (string-length src)))
     ;; parameterize (not a bare set!) so a require nested in this file's ns form
     ;; restores path when control returns to the rest of this file.
     (parameterize ((rdr-source-file path)    ; list forms read here carry :file = path
+                   ;; The current-source position too: loading a file advances it
+                   ;; per form, and the requiring file's next error (a second,
+                   ;; missing require in the same ns form) must not be blamed on
+                   ;; the dependency's last form. Bound around the WHOLE load, so a
+                   ;; throw restores it as well — the failing form's position
+                   ;; travels with the throw instead (the handler below), which is
+                   ;; what the uncaught report prints. Restoring on a normal
+                   ;; return only, as this used to, left a throw that was CAUGHT
+                   ;; (a data_readers namespace the loader tolerates, a require
+                   ;; in a try) pinning the position on the file that failed, and
+                   ;; every later, unrelated error was reported "at" it.
+                   (jolt-current-source (jolt-current-source))
                    ;; Tee into the AOT capture only while loading the file that
                    ;; capture was opened for. A nested load must not append its
                    ;; forms to the requiring namespace's artifact: that artifact
@@ -440,25 +598,54 @@
                                           (jolt-aot-capture))))
       (ldr-with-file-vars path
         (lambda ()
-          ;; rdr-read-top, not rdr-read-form: a stray close delimiter is a READ
-          ;; ERROR at a file's top level, and only the top-level entry says so.
-          ;; rdr-read-form leaves the position where it found the `)`, and the
-          ;; (> j i) guard below reads no progress as end of input — so one extra
-          ;; paren silently DROPPED the rest of the file and the run exited 0.
-          ;; A test file that lost its whole body that way still looked like a
-          ;; pass. The JVM raises "Unmatched delimiter: )" here (jolt-3amm).
-          (let loop ((i 0))
-            (when (< i end)
-              (let-values (((form j) (rdr-read-top src i end)))
-                (when (> j i)
-                  (unless (rdr-eof? form)
-                    (when (getenv "JOLT_TRACE_LOAD")
-                      (display "  [load-form] " (current-error-port))
-                      (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
-                    (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
-                                            (chez-current-ns)))
-                  (loop j))))))))
-    (jolt-current-source saved-source)))
+          ;; The failing form's position, recorded before the stack unwinds (an
+          ;; exception handler runs at the raise; a guard runs after) and keyed
+          ;; by the raised object, so the report can ask for it back. The
+          ;; innermost load records first and outer ones keep its answer.
+          ;; raise-continuable, so a continuable raise (a compiler warning)
+          ;; resumes exactly as it would without this handler.
+          (with-exception-handler
+            (lambda (e) (jolt-note-throw-source! e) (raise-continuable e))
+            (lambda ()
+              ;; rdr-read-top, not rdr-read-form: a stray close delimiter is a
+              ;; READ ERROR at a file's top level, and only the top-level entry
+              ;; says so. rdr-read-form leaves the position where it found the
+              ;; `)`, and the (> j i) guard below reads no progress as end of
+              ;; input — so one extra paren silently DROPPED the rest of the file
+              ;; and the run exited 0. A test file that lost its whole body that
+              ;; way still looked like a pass. The JVM raises "Unmatched
+              ;; delimiter: )" here (jolt-3amm).
+              (let loop ((i 0) (ord 0))
+                (when (< i end)
+                  (let-values (((form j) (rdr-read-top src i end)))
+                    (when (> j i)
+                      ;; ord counts every top-level form read (the ns form
+                      ;; included): it is the def-ordinal clock for the build's
+                      ;; visibility replay — rt.ss var-def-ordinals, stamped via
+                      ;; jolt-load-frames (NOT the gate: fibers share a
+                      ;; parameter cell, and the gate must stay off outside a
+                      ;; build's walks). PUSHED, not set: a file loaded from
+                      ;; inside this form — (load "impl") in a multi-file
+                      ;; namespace — defines vars that become visible to the
+                      ;; rest of THIS file at THIS ordinal, and its own frame
+                      ;; alone cannot say that. The frame carries the namespace
+                      ;; current as the form starts, so a nested REQUIRE's defs
+                      ;; (another namespace) claim no ordinal here. Bound for the
+                      ;; form's whole compile+eval (a macro expanding to defs
+                      ;; stamps at its call form's ordinal), then bumped. One
+                      ;; tail call: an eof placeholder read consumes no ordinal.
+                      (if (rdr-eof? form)
+                          (loop j ord)
+                          (begin
+                            (when (getenv "JOLT_TRACE_LOAD")
+                              (display "  [load-form] " (current-error-port))
+                              (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
+                            (parameterize ((jolt-load-frames
+                                             (cons (make-load-frame path ord (chez-current-ns))
+                                                   (jolt-load-frames))))
+                              (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
+                                                      (chez-current-ns)))
+                            (loop j (fx+ ord 1)))))))))))))))
 
 ;; --- AOT / compile cache for required namespaces ----------------------------
 ;; A disk-backed namespace is recompiled from source on EVERY run (load-jolt-file
@@ -668,12 +855,12 @@
 ;;
 ;; The requires are learned by RECORDING them during the compile that produced the
 ;; fasl, not by re-parsing ns forms: the loader funnels every require/use through
-;; ldr-load+register, so the record covers a top-level (require …) and a :require
-;; clause alike. They are written beside the fasl, in a sidecar named by the
-;; namespace's own hash alone — the one key derivable before its deps are known.
+;; ns-load+register (ns.ss), so the record covers a top-level (require …) and a
+;; :require clause alike. They are written beside the fasl, in a sidecar named by
+;; the namespace's own hash alone — the one key derivable before its deps are known.
 (define aot-dep-sink (make-thread-parameter #f))
 (define (aot-new-dep-sink) (vector '()))
-;; Called from ldr-load+register for every require target, whether or not the
+;; Called from the require/use load step for every target, whether or not the
 ;; target was already loaded — a dedup'd require is still a dependency.
 (define (aot-record-dep! name)
   (let ((sink (aot-dep-sink)))
@@ -830,6 +1017,7 @@
 ;; and reset to #f, dropping this ns's forms AFTER the require (the require's
 ;; target would cache, but the requiring ns's own defs would vanish from its .so).
 (define (aot-capture-load file src)
+  (ldr-need-compiler! file)
   (let ((cap (open-output-string)))
     (parameterize ((jolt-aot-capture cap) (jolt-aot-capture-file file))
       (load-jolt-file* file src)
@@ -928,6 +1116,34 @@
             (rename-file tmp-so so))
           (unless (file-exists? so)
             (aot-info (string-append "no .so produced for " name))))))))
+;; Evaluate a namespace's top-level forms from COMPILED code — an embedded fasl,
+;; an AOT-cached .so, a classpath artifact. RT.load brackets a compiled class's
+;; init with the compiler-flag vars exactly as Compiler.load brackets a source
+;; load, and so does `jolt build` for the namespaces it AOTs into a binary
+;; (jolt-ns-load-vars-push! is the same frame ldr-with-file-vars establishes for
+;; source). The loader's own compiled paths were the ones left out.
+;;
+;; Without the frame, a namespace whose top level does (set! *warn-on-reflection*
+;; true) — the standard idiom in ported Clojure libraries, and what both vendored
+;; babashka namespaces do — writes the ROOT binding and raises. Every caller here
+;; reads that raise as a broken artifact, so the failure is invisible and
+;; permanent: the embedded fasl silently recompiled babashka.fs and
+;; babashka.process from source on every process start, and a cached .so deleted
+;; and rebuilt itself on every run without ever once being served. It only ever
+;; worked when some enclosing file load happened to have the frame up already,
+;; which is why loading such a namespace from a script looked fine and loading it
+;; from -e, a REPL, or an nREPL eval did not.
+(define (ldr-with-compiled-ns-vars thunk)
+  (jolt-with-ns-load-vars thunk))
+
+;; " (msg)" for a diagnostic line, or "" when the message can't be read — the
+;; jolt.host seam is absent in a bootstrap image, and a diagnostic may not throw.
+(define (ldr-condition-suffix e)
+  (let ((m (guard (_ (#t #f))
+             (let ((m ((var-deref "jolt.host" "condition-message") e)))
+               (and (string? m) m)))))
+    (if m (string-append " (" m ")") "")))
+
 ;; A garbled .so makes `load` throw; one cut at a form boundary loads fine and
 ;; just stops early, which the completion marker catches instead. Either way:
 ;; delete the bad files and recompile from source. Recompiling after a partial
@@ -944,7 +1160,7 @@
       (aot-compile-and-cache name file src own))
     (let ((state (guard (e (else 'corrupt))
                    (aot-complete-reset! name)
-                   (load so)
+                   (ldr-with-compiled-ns-vars (lambda () (load so)))
                    (if (aot-complete? name) 'ok 'incomplete))))
       (case state
         ((ok) (aot-complete-reset! name))     ; done with the entry
@@ -964,15 +1180,27 @@
         (let ((bv (jolt-embedded-fasl name)))
           (and bv
                (begin
-                 (aot-info (string-append "embedded " name))
                  ;; Make success explicit: load-compiled-from-port returns the
                  ;; fasl's LAST expression value, which can be #f for a ns whose
                  ;; final form evaluates to nil/false. A #f read as "failed" so
                  ;; the caller reloaded the namespace from source ON TOP of the
                  ;; already-loaded fasl — the override-replay bug class at
                  ;; loader.ss:~432. #t is the real success signal.
-                 (guard (e (else #f))
-                   (load-compiled-from-port (open-bytevector-input-port bv))
+                 ;;
+                 ;; The aot-info line reports the OUTCOME, not the attempt. It
+                 ;; used to print before the load, so it said "embedded" just as
+                 ;; loudly for a fasl that raised on its first form and sent the
+                 ;; whole namespace to the source compiler — which is exactly
+                 ;; what both babashka namespaces did, unnoticed, for as long as
+                 ;; they have been embedded.
+                 (guard (e (else (aot-info (string-append "embedded " name
+                                                          " FAILED to load"
+                                                          (ldr-condition-suffix e)
+                                                          ", falling back to source"))
+                                 #f))
+                   (ldr-with-compiled-ns-vars
+                     (lambda () (load-compiled-from-port (open-bytevector-input-port bv))))
+                   (aot-info (string-append "embedded " name))
                    #t))))))
 
 ;; Dispatch for load-namespace*: embedded fasl (install-owned ns in a built
@@ -994,6 +1222,7 @@
          ;; embedded fasl registered but failed to load: fall back to source.
          (load-jolt-file file))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
+          (not (ldr-source-only?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
           ;; there is no key that would be safe to reuse.
@@ -1019,7 +1248,23 @@
     (else (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file)))))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
+;; Namespaces defined by the CLI's OWN AOT closure (bld-emit-cli-aot bakes
+;; jolt.main, jolt.deps and their on-demand requires into the CLI boot image and
+;; marks each loaded). They really are preloaded in the jolt process — but an app
+;; image written by `jolt build` is a DIFFERENT image and carries none of them,
+;; so the app build must not skip them as "already in the image". Without this,
+;; a ns that is in the CLI closure and neither in the runtime image nor the
+;; stdlib-fasl manifest — jolt.ffi, jolt.mvn-http — has every var it defines
+;; interned but UNBOUND in a built binary, while `jolt run` masks it by
+;; compiling the source at require time.
+(define ldr-cli-aot-ns (make-hashtable string-hash string=?))
+(define (ldr-mark-cli-aot! name) (hashtable-set! ldr-cli-aot-ns name #t))
+(define (ldr-cli-aot? name) (hashtable-ref ldr-cli-aot-ns name #f))
+
 (define (ldr-mark-loaded! name)
+  ;; the overlay has loaded, so a partly-seeded namespace is now complete and
+  ;; joins find-ns / all-ns (ns.ss ns-deferred)
+  (ns-undefer! name)
   (jolt-with-mutex ldr-tbl-mu (hashtable-set! loaded-ns name #t))
   (ldr-libs-update! (lambda (s) (pset-conj s (jolt-symbol #f name)))))
 
@@ -1691,9 +1936,16 @@
       ;; (a continuation escaping the load for good) never reached ldr-load-body's
       ;; guard, so the mark is rolled back here instead. Idempotent against the
       ;; guard's own rollback on the throw path.
+      ;;
+      ;; RFC 0014: an install namespace's registrations belong to the provider
+      ;; that DECLARES it, whichever way the load was reached — the class-miss
+      ;; autoload, or a plain require from another provider's install namespace
+      ;; (host-static.ss lib-with-install-ns-mark, jolt#926).
       (dynamic-wind
         (lambda () (ldr-assert-claim! name))
-        (lambda () (ldr-load-body name force? was-loaded?) (set! finished? #t))
+        (lambda ()
+          (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))
+          (set! finished? #t))
         (lambda ()
           (unless (jolt-park-unwinding?)
             (unless (or finished? was-loaded?) (ldr-unmark-loaded! name))
@@ -1726,7 +1978,7 @@
                          (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
                          (raise e)))
                (cond
-                 (art (load (cpath-so-file art)))
+                 (art (ldr-with-compiled-ns-vars (lambda () (load (cpath-so-file art)))))
                  ;; inside a compile, loading from source also emits the artifact
                  ;; — RT.load's COMPILE_FILES branch, which is what carries a
                  ;; compile through to the whole load closure.
@@ -1771,95 +2023,31 @@
 ;; kept under its old name for the build driver's callers.
 (define (expand-spec s) (expand-libspec s))
 
-;; --- require/use that LOAD ---------------------------------------------------
-;; Override the alias-only versions from natives-str.ss. Load each spec's target
-;; (no-op if baked/already loaded), THEN register its :as/:refer under the caller
-;; ns (chez-register-spec! reads the current ns, restored by load-namespace).
+;; --- the load step of require/use --------------------------------------------
+;; ns.ss owns `require`/`use`; what it cannot own is reading a namespace off the
+;; source roots, because it is loaded by runtimes that have no loader. So the
+;; body is there and the two steps only a loader can take are installed here.
 ;;
-;; keyword flags (clojure.core load-libs) are collected from the arg list before
-;; the libspecs: :reload forces the named libs past the dedup, :reload-all forces
-;; it off for the whole load (so transitively-required libs reload too), :verbose
-;; prints each load.
-(define (ldr-flag-names specs)
-  (let loop ((xs specs) (acc '()))
-    (cond ((null? xs) (reverse acc))
-          ((keyword? (car xs)) (loop (cdr xs) (cons (keyword-t-name (car xs)) acc)))
-          (else (loop (cdr xs) acc)))))
+;; ns-load-target! reads and initializes one already-expanded target. The dep is
+;; recorded BEFORE the load: a target already loaded is still a dependency of
+;; whoever is being compiled, and load-namespace* would dedup it away.
+(set-ns-load-target!
+  (lambda (target force-named?)
+    (aot-record-dep! target)
+    (load-namespace* target force-named?)))
 
-;; Load each expanded libspec's target (no-op if baked/already loaded), register
-;; its :as/:refer under the caller ns, and — for `use` (use? #t) — refer every
-;; public var when the spec has no :only/:refer filter. Target + opts both come
-;; from the shared parse-libspec (ns.ss): the single spec->target+opts parser
-;; routed through by loader-require / loader-use / chez-register-spec! /
-;; ce-scan-requires!.
-(define (ldr-load+register specs force-named? use?)
-  (for-each
-    (lambda (s0)
-      (for-each
-        (lambda (s)
-          (let* ((parsed (parse-libspec s))
-                 (target (and parsed (car parsed)))
-                 (opt-names (if parsed (map car (cdr parsed)) '()))
-                 ;; :as-alias establishes the alias WITHOUT loading the target — for
-                 ;; a namespace that may not exist yet, or exists only to qualify
-                 ;; keywords. clojure.core's load-lib picks the loader with
-                 ;; `need-ns (or as use)`, falling to (create-ns lib) when the spec
-                 ;; is :as-alias and neither — so a spec that also carries :as, or
-                 ;; that arrives through `use`, still loads.
-                 (alias-only? (and target
-                                   (member "as-alias" opt-names)
-                                   (not (member "as" opt-names))
-                                   (not use?))))
-            ;; record BEFORE loading: a target already loaded is still a
-            ;; dependency of whoever is being compiled, and load-namespace*
-            ;; would dedup it away. An alias-only spec loads nothing, so it is
-            ;; a dependency of nothing.
-            (when (and target (not alias-only?)) (aot-record-dep! target))
-            (cond
-              ((not target) #f)
-              (alias-only? (intern-ns! target))   ; create-ns, without loading
-              (else (load-namespace* target force-named?)))
-            (chez-register-spec! (chez-current-ns) s)
-            (when (and use? target
-                       (not (or (member "only" opt-names) (member "refer" opt-names))))
-              (chez-register-refer-all! (chez-current-ns) target)
-              ;; [ns :exclude [names]] — the excluded names stay OUT of the
-              ;; refer-all set (load-lib applies the same filter to its refer).
-              (let ((excl (assoc "exclude" (cdr parsed))))
-                (when excl
-                  (chez-register-refer-all-excludes!
-                    (chez-current-ns) target
-                    (map symbol-t-name (filter symbol-t? (seq->list (cdr excl))))))))))
-        (expand-spec s0)))
-    specs))
-
-(define (loader-require . specs)
-  (let* ((flags (ldr-flag-names specs))
-         (real (filter (lambda (s) (not (keyword? s))) specs))
-         (reload-all? (member "reload-all" flags))
-         (reload? (and (not reload-all?) (member "reload" flags)))
-         (verbose? (member "verbose" flags)))
-    (if reload-all?
-        (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?))
-          (ldr-load+register real #f #f))
-        (parameterize ((ldr-verbose? verbose?))
-          (ldr-load+register real (and reload? #t) #f))))
-  jolt-nil)
-(def-var! "clojure.core" "require" loader-require)
-
-(define (loader-use . specs0)
-  (let* ((flags (ldr-flag-names specs0))
-         (real (filter (lambda (s) (not (keyword? s))) specs0))
-         (reload-all? (member "reload-all" flags))
-         (reload? (and (not reload-all?) (member "reload" flags)))
-         (verbose? (member "verbose" flags)))
-    (if reload-all?
-        (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?))
-          (ldr-load+register real #f #t))
-        (parameterize ((ldr-verbose? verbose?))
-          (ldr-load+register real (and reload? #t) #t))))
-  jolt-nil)
-(def-var! "clojure.core" "use" loader-use)
+;; ns-with-load-opts interprets the keyword flags clojure.core's load-libs
+;; collects, once for the whole call: :reload forces the NAMED libs past the
+;; dedup, :reload-all forces it off for the whole load (so transitively-required
+;; libs reload too), :verbose prints each load.
+(set-ns-with-load-opts!
+  (lambda (flags k)
+    (let ((reload-all? (and (member "reload-all" flags) #t))
+          (verbose? (and (member "verbose" flags) #t)))
+      (if reload-all?
+          (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?)) (k #f))
+          (parameterize ((ldr-verbose? verbose?))
+            (k (and (member "reload" flags) #t)))))))
 
 (def-var! "clojure.core" "load-file" jolt-load-file)
 
@@ -1919,14 +2107,29 @@
 (def-var! "jolt.host" "set-source-roots!"
   (lambda (roots) (set-source-roots! (seq->list roots)) jolt-nil))
 (def-var! "jolt.host" "source-roots" (lambda () (list->cseq source-roots)))
+;; The file a namespace would load from, or nil: the same search a require
+;; does, without loading. jolt.main asks before requiring an entry namespace
+;; so it can say "no project here" instead of "could not locate" -- a catch
+;; around the require would re-raise a propagating load error from the wrong
+;; place and lose its location.
+(def-var! "jolt.host" "ns-source"
+  (lambda (nm)
+    (let ((f (find-ns-file (if (string? nm) nm (jolt-str-render-one nm)))))
+      (if f f jolt-nil))))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
+;; The Clojure-facing seam for :jolt/replaces (see ldr-ns-replacements above).
+;; jolt.deps collects the key and jolt.main calls this once per namespace after
+;; it resolves the project, before any of the project compiles.
+(def-var! "jolt.host" "replace-builtin-ns!"
+  (lambda (n) (replace-builtin-ns! (jolt-str-render-one n)) jolt-nil))
 (def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? p) #t #f)))
 ;; …and whether it is a DIRECTORY, which file-exists? also answers #t for. A bare
 ;; argv token is dispatched as a file to run before a :tasks lookup (main.clj's
 ;; run-file-arg?), so `jolt test` in any project with a test/ dir — which is every
 ;; jolt library — took the file path and died decoding a directory.
 (def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? p) #t #f)))
-(def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n))) (if v v jolt-nil))))
+;; jolt.host/getenv is defined in rt.ss, not here — the compiler image reads it
+;; as it loads, which is before this file (see the comment there).
 
 ;; --- filesystem primitives (jolt.host) --------------------------------------
 ;; jolt.deps did its filesystem work by shelling out: `mkdir -p`, `mv`, `rm -f`,

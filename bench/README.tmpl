@@ -1,0 +1,189 @@
+# jolt benchmark suite
+
+What jolt costs against JVM Clojure on the same portable source, one axis per
+row. `make test` and `make libconformance` check that answers are right and
+neither notices when they get slower — `arrays` once went 5.4× on a codegen
+change with every gate green, because every answer was still correct — so this
+suite is the throughput gate: a release compares it against the previous
+release and blocks `publish` on the result (`ci/bench-gate.sh`, wired into
+`.github/workflows/release.yml`), and the scaling gates in `make test` pin the
+complexity class of the paths the rows measure. See [Gating](#gating).
+
+The benchmarks draw on [Are We Fast Yet?](https://github.com/smarr/are-we-fast-yet)
+and the [Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/),
+plus shapes lifted from real libraries (honeysql's formatting loop, instaparse's
+message cache, malli's test suite). Each file's header says what it isolates
+and which compiler pass or runtime seam it exists to watch.
+
+## Scorecard
+
+{{measured}}
+
+| Benchmark | vs JVM | jolt (ms) | JVM (ms) | What it measures |
+|---|---:|---:|---:|---|
+{% for r in rows %}| `{{r.name}}` | **{{r.ratio}}×** | {{r.jolt}} | {{r.jvm}} | {{r.what}} |
+{% endfor %}| `startup` | **{{startup.ratio}}×** | {{startup.jolt}} | {{startup.jvm}} | {{startup.what}} |
+{% for r in run-rows %}| `{{r.label}}` ×{{r.n}} (run mode) | **{{r.ratio}}×** | {{r.jolt}} | {{r.jvm}} | {{r.what}} |
+{% endfor %}
+**vs JVM** is jolt ÷ JVM Clojure on the same source: lower is better, and
+under 1.0× jolt is faster. Every row is from one `bench/run.sh` followed by one
+`bench/testcheck.sh` on one machine in one sitting, which is the only way the
+ratios mean anything; absolute milliseconds are that machine's and are not
+comparable to a table measured elsewhere. AOT rows are optimized standalone
+binaries (`jolt build --direct-link --opt`) timing the compute inside, the
+mean of 3 runs after warmup. A plain `jolt build` (`MODE_A=1`) tracks the
+optimized column to within 0.2 of a ratio point across the suite.
+
+Reading it:
+
+- **One run is not evidence.** Per-row noise is about 1.07× on a quiet
+  machine, more on the first row of a run and on `executors` (four producers
+  fighting over one mutex). Re-measure a row that moved, alone, on both sides
+  (`bench/run.sh <name>`) before believing it.
+- **`gc-arrays`** times full collections with one array rooted across them.
+  Read its jolt milliseconds against jolt only: the vs-JVM column mostly
+  reports that a JVM full GC's floor is ~750× a Chez major collection's, and
+  `System/gc` is a hint there and a full collection here.
+- **`*-unhinted`** rows are the same source with the type hints removed — what
+  a hint buys, and what unhinted library code pays.
+- **`parallel-colls`** is eight threads doing the same per-call work on their
+  own values, so `mean:` is a wall clock that a lock anywhere on those paths
+  multiplies. It prints its one-thread time and the per-thread slowdown above
+  `mean:`; read the slowdown against the JVM's, which sits near 2× on the same
+  machine because eight threads share one allocator and one memory bus there
+  too. Noisier than a single-threaded row (±10%).
+- **`compile-forms`** measures jolt compiling, not running. The reference
+  builds bytecode and generates no native code at load; jolt asks Chez for
+  optimized native code for every form, which is roughly half its time.
+- **`cst-format`** is the one row with a NON-JVM reference. It is the shape of
+  standard-clojure-style — a CST of one small fixed-key map per token, then an
+  atom-per-node mutating walk — and the upstream implementation of that
+  formatter is JavaScript, so the same work can be timed on V8. Measured on one
+  x86_64 Linux box, 57 KB of Clojure source: node 14.4 ms, JVM Clojure 167 ms,
+  jolt 290 ms. Read it as two facts rather than one — the IDIOM costs ~12x V8
+  before jolt is involved (persistent maps, an atom per node, and an output
+  string rebuilt per line, against plain objects, in-place fields and V8's
+  cons-strings), and jolt costs ~1.7x the JVM on top of that. It prints its own
+  parse/format split above `mean:`; `mean:` is the row.
+- **`startup`** is the one whole-process row: the boot image's decode plus the
+  runtime's init, which every other row excludes by timing inside a running
+  binary. `bench/startup.sh` and `bench/startup-phases.sh` break it down
+  further (boot, dispatch, compile, run) and compare against babashka.
+- The **run mode** rows (`bench/testcheck.sh`) reach library code through a
+  `require`, the way a test suite does, rather than as an AOT binary. They are
+  bound by 64-bit integer arithmetic (a genuine 64-bit value is a heap bignum
+  past Chez's 61-bit fixnum) and by open-world generator dispatch.
+
+Diagnostics kept out of the table because the JVM has no reference for them:
+`ffi_arenas.clj` (jolt.ffi), `image_refs.clj` (jolt.image) and `fibers/`.
+Run them from this directory with `../bin/jolt -Sdeps '{:paths ["."]}' -m <ns>`
+and compare exact base and candidate runs on one host.
+
+## Running
+
+```sh
+bench/run.sh                 # full suite + the startup row, vs JVM Clojure
+bench/run.sh fib             # one benchmark, default size
+bench/run.sh fib 32          # one benchmark, custom size
+bench/run.sh startup         # the startup row alone
+NO_JVM=1 bench/run.sh        # jolt only (skip the JVM reference)
+MODE_A=1 bench/run.sh        # also time each bench as a plain `jolt build`
+JOLT_BIN=target/release/jolt bench/run.sh   # a built jolt instead of bin/jolt
+
+bench/testcheck.sh           # the run-mode rows (test.check, 64-bit arithmetic)
+bench/startup.sh             # startup vs babashka; COLD=1 adds cold-page-cache runs
+bench/startup-phases.sh      # boot / dispatch / compile / run attribution
+bench/scorecard.clj          # render this README from README.tmpl + the two logs
+```
+
+**This file is generated.** The scorecard table comes from one sitting's logs:
+
+```sh
+JOLT_BIN=target/release/jolt bench/run.sh > run.log
+JOLT_BIN=target/release/jolt bench/testcheck.sh > tc.log
+jolt run bench/scorecard.clj run.log tc.log --measured "Measured <date> on <machine>: jolt <version>, OpenJDK <v>, Chez <v>. …"
+```
+
+renders `bench/README.tmpl` (a Selmer template) into `bench/README.md`, sorted
+by ratio, and refuses a partial run — every bench in `run.sh --list` needs a row
+in the logs and a one-line description in the script. Edit the template, not
+this file. `COLD=1 bench/startup.sh` drops the binary from the page cache
+between reps with `bench/pagecache.clj` (`posix_fadvise` on Linux, `msync` on
+macOS, where the kernel only partly honours it; the resident bytes it prints
+beside each rep say how cold the run really was).
+
+`run.sh` builds each benchmark to a binary because jolt's optimizing passes
+(direct linking, inlining, scalar replacement, whole-program inference) fire
+only in an AOT build — `jolt run -m` is unoptimized. The build needs Chez's
+kernel dev files (`libkernel.a` + `scheme.h`) and `cc`, like `jolt build`; set
+`JOLT_CHEZ_CSV` to override the detected csv dir. `testcheck.sh` needs the
+test.check jar in `~/.m2` (or network on first run) for both hosts. Use a
+BUILT jolt (`JOLT_BIN`) for anything startup-related — the dev `bin/jolt`
+launcher boots from source and is not what users run.
+
+Do not run two jolt or `clojure` invocations in this directory at once: both
+write `.cpcache` here, and the loser reads a half-written classpath.
+
+## Gating
+
+**Against the previous release.** `ci/bench-gate.sh <baseline-jolt>
+<candidate-jolt> [max-ratio] [bench…]` builds every benchmark in
+`bench/run.sh --list`, plus `hello` for the `startup` row, with both compilers,
+times them alternately on one machine (min of 3 after a discarded warm-up) and
+fails above 1.40× candidate/baseline on any row. The release workflow runs it
+against the newest published release and `publish` needs it green. There is no
+millisecond threshold anywhere: a ratio between two binaries on one runner is
+the only shape of timing assertion this repository allows in a gate, because an
+absolute ceiling false-fails on a slow runner and passes on a fast one while
+hiding a real regression. A benchmark newer than the baseline release is
+skipped with a note, not failed. The threshold is deliberately loose — it is a
+gate, not a scorecard — and a flagged row is re-measured alone before anything
+is concluded about its size.
+
+**Inside one process.** `make test` carries the shape gates, each a ratio
+measured in one run so machine speed cancels: `readscaling`, `compilescaling`
+(1× vs 4× input, and quoted-vs-constructed forms), `applyscaling` (`apply`
+streams an unbounded rest — `(apply > (range))` must answer), `lazyscaling`
+(the same lazy workload before and after a thread has existed), `vecscaling`,
+`pipescaling`, `chunkscaling`, `printscaling`, `ioscaling`, `hotscaling` and
+`rrbscaling`. A row here says how fast; a gate there says the complexity class
+did not change.
+
+What 0.8.6's performance changes are covered by: `byte-arrays` (hinted
+`^bytes` stores), `sorted-build` (one tree walk per insert), `lazy-threads`
+(cells claimed by compare-and-swap, no mutex per cell), `apply-rest` (streamed
+rest, var roots that stream), `compile-forms` and `literals` (the constant
+pool keyed by form identity), `printing` (`format`), and `startup` (the boot
+image codecs and the LZ4 ceiling fallback).
+
+What the 2026-09 round after 0.8.8 is covered by: `parallel-colls` (the four
+process-wide locks that were on per-call paths, the atom's compare-and-swap,
+and metadata as a field — eight threads on their own values, where a shared
+lock shows as a per-thread slowdown), `metadata` (meta in a slot of the
+collection record: `with-meta` is a copy, a carry is a slot read), and
+`coll-dispatch` (the record predicates and accessors in front of every
+collection op open-coded, and the collection layouts loaded ahead of the
+dispatchers so it applies to them; `make recordinline` gates the mechanism,
+the row says what it is worth). `cst-format` is the end-to-end row those
+three feed.
+
+## A/B against a change
+
+Run the suite on `main`, then on the branch, back to back on a quiet machine,
+and compare the `mean:` lines; a pass is worth landing when it moves the row
+whose axis it targets. `bench/aba.sh` automates an A1/B/A2 over a fixed set of
+benches: it checks out the parent's compiler files, builds and times each bench
+against `HEAD`, then restores the working tree — A1≈A2 rules out drift, B vs A
+is the change.
+
+`aba.sh` compiles with `jolt build`, whose binaries are baked with tracing off,
+so it is structurally blind to anything that only exists on the `jolt run` /
+`-M:alias` path — where tail-frame tracing is on by default, and where a
+per-call ring save/restore once cost up to 19× on numeric code while every AOT
+number stayed flat. `bench/aba-trace.sh /tmp/jolt-A /tmp/jolt-B` is the
+dev-mode A/B/A over two already-built binaries; its bench set spans both
+call-heavy (`fib`, `tak`, `binary-trees`) and numeric-loop (`arrays`,
+`mathfns`, `loop-recur`, `mandelbrot`) shapes because the regression above was
+invisible to a call-heavy set alone. Tracing is not free and is uneven (`fib`
+~10×, numeric loops within noise); time a dev-mode run with `JOLT_TRACE=0` and
+give it its own `JOLT_CACHE_DIR`, since the flag changes the emitted code.

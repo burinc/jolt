@@ -22,7 +22,7 @@
   (fn* zero? [x]
     (if (number? x)
       (= x 0)
-      (throw (str "zero? requires a number, got: " x)))))
+      (throw (ClassCastException. (str "zero? requires a number, got: " x))))))
 
 ;; pos? checks number? explicitly: this tier is recompiled by the staged pass,
 ;; where a bare (> x 0) emits the native op that happily orders strings
@@ -31,7 +31,7 @@
   (fn* pos? [x]
     (if (number? x)
       (> x 0)
-      (throw (str "pos? requires a number, got: " x)))))
+      (throw (ClassCastException. (str "pos? requires a number, got: " x))))))
 
 ;; Canonical every?: short-circuits on the first falsey result, so infinite
 ;; seqs with an early counterexample terminate. Expressed over reduce+reduced so a
@@ -144,31 +144,41 @@
             specs)))
 
 ;; Threading: a list form threads x in as the first (->) or last (->>) arg; a bare
-;; symbol becomes (form x). Recursive; the expand-once cache makes that free.
+;; symbol becomes (form x). Iterative, so ONE expansion step yields the whole
+;; chain: a consumer that reads a single macroexpand-1 (tools.analyzer, a linter)
+;; gets the threaded shape, where a recursive definition would hand back another
+;; (-> ...) and only agree after a full macroexpand. A threaded step keeps its own
+;; form's metadata, so a fault inside the chain reports that step's line and not
+;; the whole chain's; a bare symbol has no form of its own and inherits the call's.
+;; loop*/recur, not loop: the loop macro is defined further down this file.
 (defmacro -> [x & forms]
-  (if (empty? forms)
-    x
-    (let [form (first forms)
-          threaded (if (seq? form)
-                     `(~(first form) ~x ~@(rest form))
-                     `(~form ~x))]
-      `(-> ~threaded ~@(rest forms)))))
+  (loop* [x x
+          forms (seq forms)]
+    (if forms
+      (let* [form (first forms)
+             threaded (if (seq? form)
+                        (with-meta `(~(first form) ~x ~@(rest form)) (meta form))
+                        `(~form ~x))]
+        (recur threaded (next forms)))
+      x)))
 
 (defmacro ->> [x & forms]
-  (if (empty? forms)
-    x
-    (let [form (first forms)
-          threaded (if (seq? form)
-                     `(~(first form) ~@(rest form) ~x)
-                     `(~form ~x))]
-      `(->> ~threaded ~@(rest forms)))))
+  (loop* [x x
+          forms (seq forms)]
+    (if forms
+      (let* [form (first forms)
+             threaded (if (seq? form)
+                        (with-meta `(~(first form) ~@(rest form) ~x) (meta form))
+                        `(~form ~x))]
+        (recur threaded (next forms)))
+      x)))
 
 ;; Forward declaration interns unbound vars (Clojure semantics). The interpreter
 ;; resolves forward refs lazily either way, but the COMPILER classifies globals at
 ;; compile time: without the var, a declared name that collides with a host root
 ;; binding (parse, hash, …) would compile to the host fn instead of the var.
 (defmacro declare [& syms]
-  `(do ~@(map (fn* [s] `(def ~s)) syms)))
+  `(do ~@(map (fn* [s] `(def ~(with-meta s (assoc (meta s) :declared true)))) syms)))
 
 ;; letfn is a macro over the letfn* special form, matching Clojure: each
 ;; (name [params] body*) spec becomes a name + a (fn name [params] body*) binding.
@@ -248,17 +258,24 @@
                         select (get pat :select)
                         as-sym (get pat :as)
                         or-keys (if defaults (keys defaults) [])
-                        ;; kwargs: a map pattern may bind against the sequential rest of
-                        ;; a fn — (& {:keys [...]}) — a seq of alternating k/v args,
-                        ;; optionally with a trailing map (Clojure 1.11: (f :a 1 {:b 2})
-                        ;; merges the map over the pairs; (f {:a 1}) is just the map). An
-                        ;; odd count means the last arg is that trailing map. A real map
-                        ;; is used as-is. g holds init once; gm is the coerced map every
-                        ;; lookup (and :as) reads from.
-                        coerce `(if (sequential? ~g)
-                                  (if (odd? (count ~g))
-                                    (merge (apply hash-map (butlast ~g)) (last ~g))
-                                    (apply hash-map ~g))
+                        ;; kwargs: a map pattern may bind against the seq rest of a fn
+                        ;; — (& {:keys [...]}) — a seq of alternating k/v args, optionally
+                        ;; with a trailing map (Clojure 1.11: (f :a 1 {:b 2}) merges the
+                        ;; map over the pairs). An odd count means the last arg is that
+                        ;; trailing map — except for a LONE element, which is the whole
+                        ;; value: (f {:a 1}) passes the map itself, and the JVM takes that
+                        ;; element as the map whatever it is, so a stray (f 1 :a) looks
+                        ;; keys up in a keyword and answers nil instead of throwing
+                        ;; (#909). Only a seq is coerced, like destmap*'s (seq? gmap): a
+                        ;; vector init destructures as itself, never as pairs. g holds
+                        ;; init once; gm is the coerced map every lookup (and :as) reads
+                        ;; from.
+                        coerce `(if (seq? ~g)
+                                  (if (next ~g)
+                                    (if (odd? (count ~g))
+                                      (merge (apply hash-map (butlast ~g)) (last ~g))
+                                      (apply hash-map ~g))
+                                    (if (seq ~g) (first ~g) (hash-map)))
                                   ~g)
                         acc-m (conj (conj (conj (conj acc g) init) gm) coerce)
                         base  (if as-sym (conj (conj acc-m as-sym) gm) acc-m)
@@ -398,13 +415,24 @@
                    (if defaults-as
                      (conj (conj acc-sel defaults-as) `(hash-map ~@dm-pairs))
                      acc-sel))
-               :else (throw (str "unsupported destructuring pattern: " (pr-str pat)))))
+               :else (throw (IllegalArgumentException. (str "unsupported destructuring pattern: " (pr-str pat))))))
          ploop
            (fn* ploop [i acc]
              (if (< i (count bindings))
                (ploop (+ i 2) (proc (nth bindings i) (nth bindings (inc i)) acc))
                acc))]
-    (ploop 0 []))))
+    ;; Checked before the walk, which steps in twos and reads (nth bindings
+    ;; (inc i)): an odd vector ran off the end and the user got the raw fault
+    ;; back — "java.lang.IndexOutOfBoundsException: index out of bounds" as the
+    ;; compile error for (let [a 1 b] a). analyze-bindings makes the same check
+    ;; for let*, but destructuring runs FIRST, so every `let`, `loop`, `for`,
+    ;; `doseq` and `if-let` reached the fault before the analyzer ever saw the
+    ;; form. Same wording as the special form, which is the reference's.
+    (if (odd? (count bindings))
+      (throw (ex-info "Bad binding form, expected matched symbol expression pairs"
+                      {:jolt.error/kind :analyze/invalid-binding
+                       :jolt.error/type :analysis-error}))
+      (ploop 0 [])))))
 
 ;; let desugars destructuring patterns to plain bindings (via destructure) so the
 ;; COMPILER sees only plain symbols — analyze-bindings rejects patterns as
@@ -457,19 +485,35 @@
                    (nth x 1)
                    x))
         ;; a :pre/:post conditions map (a leading map when the body has more forms
-        ;; after it) becomes assertions: pre before the body, then bind % to the
-        ;; result, post after, return %. (map? is a native, so this is tier-safe;
-        ;; the assert/map calls only run when a conditions map is actually present.)
+        ;; after it) becomes assertions: pre before the body, then — ONLY when
+        ;; there are :post conditions — bind % to the result, assert them, return
+        ;; %. (map? is a native, so this is tier-safe; the assert/map calls only
+        ;; run when a conditions map is actually present.)
+        ;;
+        ;; The % binding is what :post needs and what a :pre-only fn must not pay:
+        ;; wrapping the body in (let [% (do body)] %) puts the body in a binding
+        ;; INIT, which is not tail position, so a tail `recur` inside a :pre-only
+        ;; fn was rejected — malli's validate-times is one, and eight of its test
+        ;; namespaces stopped loading. The reference emits the wrapper only for
+        ;; :post, and this now matches it.
+        ;;
+        ;; Tail CALLS were never affected, measured rather than assumed: 3e6 deep
+        ;; self-calls through the var run at baseline RSS with the wrapper and
+        ;; without it, because the back end collapses (let [% X] %) to X. Only
+        ;; `recur`, which the analyzer checks on the pre-collapse tree, saw it.
         wrap-conds
           (fn* [body]
             (if (if (map? (first body)) (next body) false)
               (let [conds (first body)
                     real (next body)
-                    mka (fn* [cs] (map (fn* [c] `(assert ~c)) cs))]
-                `(~@(mka (get conds :pre))
-                  (let [~'% (do ~@real)]
-                    ~@(mka (get conds :post))
-                    ~'%)))
+                    mka (fn* [cs] (map (fn* [c] `(assert ~c)) cs))
+                    posts (get conds :post)]
+                (if (seq posts)
+                  `(~@(mka (get conds :pre))
+                    (let [~'% (do ~@real)]
+                      ~@(mka posts)
+                      ~'%))
+                  `(~@(mka (get conds :pre)) ~@real)))
               body))
         md (fn* go [ps nps lets]
              (if (seq ps)
@@ -545,12 +589,45 @@
         ;; :arglists — the parameter vectors as written (single arity: the one
         ;; vector; multi-arity: each clause's), attached to the var like Clojure so
         ;; doc/spec/expound tools can read it. tier-0 primitives only (loop, not
-        ;; map/reduce, which load later). def-meta-expr quotes it (data, not code).
+        ;; map/reduce, which load later). QUOTED in the expansion like the JVM's
+        ;; (def ^{:arglists (quote ([x]))} f …): def-meta-expr strips one quote
+        ;; layer either way, but a consumer that EVALUATES the def-name meta
+        ;; (tools.analyzer, typedclojure) read the bare ([x]) as a call of [x].
+        ;; A macro's two implicit params are elided, as the JVM's `sigs` elides
+        ;; them: a defmacro expands to a defn whose params are
+        ;; [&form &env & declared], and the var still reports the declared ones —
+        ;; what `doc` and every arglists-driven tool show. The trigger is &form in
+        ;; FIRST position, which is what the reference keys on. Guarded on length:
+        ;; a lone [&form] is an IndexOutOfBoundsException there (subvec 2..1), a
+        ;; crash rather than a shape worth reproducing.
+        declared-params (fn [pv]
+                          (if (and (vector? pv) (> (count pv) 1) (= (first pv) '&form))
+                            (subvec pv 2)
+                            pv))
+        ;; Past the single-arity `[params] body*` shape, every remaining form must
+        ;; be a `([params] body*)` clause. Checked here because the arglists walk
+        ;; below reaches straight into each one with (first (first cs)): given
+        ;; (defn f 5 6) that is (first 5), and the user got the raw cast back —
+        ;; "Don't know how to create ISeq from: java.lang.Long" as the compile
+        ;; error for their defn. The reference reports this through
+        ;; clojure.core.specs.alpha; jolt has no core specs, so it says so itself.
+        ;; Only `assert`-tier primitives are available this early in the prelude.
+        _ (when (not (vector? (first body)))
+            (loop [cs body]
+              (if (seq cs)
+                (let [c (first cs)]
+                  (if (if (seq? c) (vector? (first c)) false)
+                    (recur (rest cs))
+                    (throw (ex-info (str "Parameter declaration " (pr-str c)
+                                         " should be a vector")
+                                    {:jolt.error/kind :analyze/invalid-fn-parameters
+                                     :jolt.error/type :analysis-error}))))
+                nil)))
         arglists (if (vector? (first body))
-                   (list (first body))
+                   (list (declared-params (first body)))
                    (loop [cs body acc []]
                      (if (seq cs)
-                       (recur (rest cs) (conj acc (first (first cs))))
+                       (recur (rest cs) (conj acc (declared-params (first (first cs)))))
                        (seq acc))))
         ;; precedence, matching the JVM's conj order: name metadata < the derived
         ;; :arglists < docstring < leading attr-map < trailing attr-map. So an
@@ -559,7 +636,7 @@
         ;; attr-map overrides the docstring (the JVM conj'es the attr-maps onto
         ;; {:doc docstring}, so they are what wins).
         m1 name-meta
-        m2 (if arglists (assoc (if m1 m1 {}) :arglists arglists) m1)
+        m2 (if arglists (assoc (if m1 m1 {}) :arglists (list 'quote arglists)) m1)
         m3 (if docstring (assoc (if m2 m2 {}) :doc docstring) m2)
         m4 (if attr-map (conj (if m3 m3 {}) attr-map) m3)
         meta-map (if trail-attr (conj (if m4 m4 {}) trail-attr) m4)]
@@ -583,18 +660,31 @@
 (defn- fresh-sym [] (symbol (str (gensym))))
 
 ;; cond->: thread expr through each (test form) pair, only when the test is truthy.
-;; Linear nested let*, a distinct fresh symbol per step.
+;; ONE let with g rebound per step, each step delegating to -> rather than
+;; building the call itself — the reference's shape, and cond->>'s (30-macros).
+;; It used to be a nest of let* forms with a fresh symbol per step, threading by
+;; hand, so a consumer reading a single macroexpand-1 saw neither shape nor the
+;; per-step position -> now carries. It stays in this tier, not beside cond->>,
+;; because jolt.analyzer uses it and compiles while 10-seq loads.
+;; loop/conj/nth only: partition, butlast and interleave are later tiers, and
+;; this body runs at expansion time (like `ns` above), so `let` and `loop` from
+;; earlier in this file are what it has.
 (defmacro cond-> [expr & clauses]
-  (let [step (fn step [prev cls]
-               (if (empty? cls)
-                 prev
-                 (let [t (first cls)
-                       f (nth cls 1)
-                       gn (fresh-sym)
-                       call (if (seq? f) `(~(first f) ~prev ~@(rest f)) `(~f ~prev))]
-                   `(let* [~gn (if ~t ~call ~prev)] ~(step gn (drop 2 cls))))))
-        g0 (fresh-sym)]
-    `(let* [~g0 ~expr] ~(step g0 clauses))))
+  (let [g (fresh-sym)
+        steps (loop [cs (seq clauses) acc []]
+                (if cs
+                  (recur (next (next cs))
+                         (conj acc `(if ~(first cs) (-> ~g ~(nth cs 1)) ~g)))
+                  acc))
+        n (count steps)]
+    (if (zero? n)
+      `(let [~g ~expr] ~g)
+      ;; g is rebound by every step but the last; the last IS the body.
+      (let [binds (loop [i 0 acc [g expr]]
+                    (if (< i (dec n))
+                      (recur (inc i) (conj (conj acc g) (nth steps i)))
+                      acc))]
+        `(let ~binds ~(nth steps (dec n)))))))
 
 ;; case: nested =/or tests (no jump table). Test constants are NOT evaluated —
 ;; symbols, lists, and composite literals (vectors/maps/sets) are quoted so their
@@ -611,10 +701,24 @@
         mk-const (fn [c] (if (and (or (symbol? c) (seq? c) (vector? c) (map? c) (set? c))
                                   (not (tagged? c)))
                            `(quote ~c) c))
+        ;; a keyword, char, nil, true or false constant is compared by identity: a
+        ;; keyword is interned (and re-interned on image restore), and identical?
+        ;; is an inline native op where = is a call. That is what the reference
+        ;; does for these too (its case hashes then compares identity). Symbols,
+        ;; strings and numbers keep = — a symbol is not interned here.
+        ;; A CHAR is an immediate on the host, so identity IS equality for every
+        ;; code point, and a `case` over characters — the way Clojure spells a
+        ;; scanner state machine — was paying a generic `=` call per arm per
+        ;; input character.
+        ident-const? (fn [c] (or (keyword? c) (char? c) (nil? c) (true? c) (false? c)))
+        mk-test1 (fn [c]
+                   (if (ident-const? c)
+                     `(identical? ~g ~c)
+                     `(= ~g ~(mk-const c))))
         mk-test (fn [c]
                   (if (seq? c)
-                    `(or ~@(map (fn [v] `(= ~g ~(mk-const v))) c))
-                    `(= ~g ~(mk-const c))))
+                    `(or ~@(map mk-test1 c))
+                    (mk-test1 c)))
         ;; Collect test constants pairwise (so a trailing unpaired default is
         ;; excluded), flattening list/or-group tests into individual constants.
         ;; seed-only fns (reduce/conj/first/rest/drop/empty?/seq?) — analyzer.clj
@@ -644,7 +748,7 @@
                     (first cls)
                     `(if ~(mk-test (first cls)) ~(nth cls 1) ~(build (drop 2 cls))))))]
     (if dup
-      (throw (str "Duplicate case test constant: " (first dup)))
+      (throw (IllegalArgumentException. (str "Duplicate case test constant: " (first dup))))
       `(let* [~g ~expr] ~(build clauses)))))
 
 ;; for/doseq share these. for-parse-groups turns a binding vector into groups
