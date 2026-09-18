@@ -2091,6 +2091,9 @@
 ;; ZipEntry, and ZipInputStream on the in-stream frame.
 (load "host/chez/java/zip-entries.ss")
 
+;; ZipFile, and the central-directory index the loader's jar roots share.
+(load "host/chez/java/zip-file.ss")
+
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
 ;; proxy: extends-by-delegation over a concrete host class. After host-static.ss

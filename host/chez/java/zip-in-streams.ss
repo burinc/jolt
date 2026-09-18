@@ -233,11 +233,14 @@
         ((or (number? x) (jbigdec? x)) (jnum->exact x))
         (else (zip-class-cast x "java.lang.Number"))))
 
-;; available(): bytes still in the port's buffer mean not at the end; past
-;; them, the class's own answer. A closed stream is IOException "Stream closed".
+;; available(): the class's own answer, or 1 when it says 0 while bytes still
+;; wait in the port's buffer (the stream is not at its end). A ZipFile entry
+;; stream answers a count of what is left, which already includes them. A
+;; closed stream is IOException "Stream closed".
 (define (zin-available self z)
-  (let ((port (zin-live-port self z)))
-    (->num (if (fx> (port-buffered port) 0) 1 ((zin-available-proc z) z)))))
+  (let* ((port (zin-live-port self z))
+         (n ((zin-available-proc z) z)))
+    (->num (if (and (eqv? n 0) (fx> (port-buffered port) 0)) 1 n))))
 
 ;; skip(n): a negative count is IllegalArgumentException; then read and drop up
 ;; to n bytes (at most Integer.MAX_VALUE), 512 at a time (lines 215-236).

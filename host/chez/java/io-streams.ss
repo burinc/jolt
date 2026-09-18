@@ -1538,11 +1538,14 @@
             (else (apply prev target content opts)))))
   (def-var! "clojure.core" "spit" jolt-spit))
 
-;; with-open closes the new stream jhosts via their .close method.
+;; with-open closes a host object through its .close method: any jhost whose
+;; class registers one (the streams and readers here, a ZipFile, a socket) is
+;; Closeable. This used to name five tags, and each class added since had to
+;; add its own arm or fail with-open, as ZipFile did.
 (let ((prev jolt-close))
   (set! jolt-close
         (lambda (x)
-          (if (or (and (jhost? x) (member (jhost-tag x) '("in-stream" "out-stream" "char-reader" "char-writer" "reader-adapter")))
+          (if (or (and (jhost? x) (host-method-ref (jhost-tag x) "close"))
                   ;; a reify/proxy whose close is the one its class supplies
                   ;; (InputStream's and OutputStream's do nothing)
                   (and (jreify? x) (abstract-class-method x "close")))
