@@ -600,14 +600,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaced (the probe could not see an extension; the difference is the
   protocol answer).
 
-- **Breaking: a library that claims a `java.util.zip` class the runtime now
-  provides no longer loads.** jolt-lang/http-client's `:jolt/provides` claims
-  `GZIPInputStream`, `GZIPOutputStream`, `InflaterInputStream`,
-  `DeflaterInputStream` and `Inflater`; from this release, resolution stops with
-  `IllegalArgumentException: jolt.http.platform claims host classes …, which
-  the runtime already provides.` The claims are http-client's, not yours, so a
-  project cannot work around this in its own `deps.edn`: stay on the previous
-  release until an http-client release drops those five claims.
+- **A dependency's `:jolt/provides` claim on a class the runtime provides is
+  dropped with a warning, not refused.** jolt-lang/http-client's `deps.edn`
+  claims `GZIPInputStream`, `GZIPOutputStream`, `InflaterInputStream`,
+  `DeflaterInputStream` and `Inflater`, which this release's runtime provides;
+  under the previous rule every project on any release of http-client stopped
+  at resolution with `claims host classes …, which the runtime already
+  provides`, and the claims are http-client's, so nothing in the project's own
+  `deps.edn` could change that. A claim like that is a library from before the
+  runtime grew the class, not two dependencies disagreeing over one (RFC
+  0014's case), so the runtime's class answers, the library's other claims
+  stand and still autoload it, its install namespace's registrations for the
+  overtaken class land as any library's on a runtime class do, and the warning
+  names the library to upgrade. The refusal remains what it was for: two
+  declared providers of one class.
 
 
 ## [0.8.8] - 2026-09-15

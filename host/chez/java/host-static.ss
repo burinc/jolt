@@ -61,7 +61,7 @@
 
 ;; The host's own boot-time registrations (io.ss, host-static-classes.ss, …), the
 ;; statics counterpart of host-class-ctors-tbl. Together they are what "the
-;; runtime provides this class" means: register-class-provider! refuses a claim on
+;; runtime provides this class" means: register-class-provider! drops a claim on
 ;; a class already in the tables, and at declaration time — jolt.deps, before any
 ;; library code runs — the only entries there are these. Both spellings, because a
 ;; claim is tested under both (class-spellings).
@@ -72,7 +72,7 @@
   (hashtable-set! host-class-statics-tbl (short-class-name name) #t)
   (class-statics-merge! name members))
 
-;; Would register-class-provider! refuse a :jolt/provides claim on this class?
+;; Would register-class-provider! drop a :jolt/provides claim on this class?
 ;; Answered from the HOST tables and not the live ones: a class ANOTHER library
 ;; registered is still free to be declared — nothing has claimed it — and a
 ;; registration that just landed must not make itself the reason.
@@ -660,9 +660,18 @@
                   (vector-ref p 2))))))
 
 ;; Declared providers from the dependency graph, installed at startup by
-;; jolt.deps. A claim on a class the runtime already IMPLEMENTS is refused: a
-;; dependency does not get to redefine what String means, and the same posture is
-;; why extend-class! will not replace a built-in.
+;; jolt.deps. A claim on a class the runtime already IMPLEMENTS is dropped with
+;; a warning, and the rest of the claim stands: a dependency does not get to
+;; redefine what String means — the same posture is why extend-class! will not
+;; replace a built-in — but a claim like that is a library from before the
+;; runtime grew the class, not two dependencies disagreeing (RFC 0014's case,
+;; jolt#914). It used to be refused outright, and when java.util.zip moved into
+;; the runtime (jolt#916) every project pinned to an older jolt-lang/http-client
+;; release stopped at resolution with nothing in its own deps.edn to change. The
+;; runtime's class answers; the library's install namespace still autoloads for
+;; whatever it alone provides, and its registrations for the overtaken class land
+;; as any library's on a runtime class do (register-class-ctor-user!). The
+;; warning names what to upgrade.
 ;;
 ;; "Implements" is the statics/ctor tables, not the class hierarchy. The
 ;; hierarchy knows names it does not implement — java.time.ZoneId is in it so
@@ -671,20 +680,22 @@
 ;; exists to provide.
 (define (register-class-provider! install-ns coordinate classes)
   (let* ((cs (class-spellings classes))
-         (taken (filter (lambda (c) (or (hashtable-ref class-statics-tbl c #f)
-                                        (hashtable-ref class-ctors-tbl c #f)))
-                        cs)))
-    (if (pair? taken)
-        (jolt-throw
-         (jolt-host-throwable
-          "java.lang.IllegalArgumentException"
-          (string-append install-ns " claims host " (if (null? (cdr taken)) "class " "classes ")
-                         (fold-left (lambda (a c) (if (string=? a "") c (string-append a ", " c)))
-                                    "" taken)
-                         ", which the runtime already provides.")))
-        (let ((p (vector install-ns coordinate cs (box #f))))
-          (set! lib-class-providers (append lib-class-providers (list p)))
-          (lib-claim-pending! p)))))
+         (taken? (lambda (c) (or (hashtable-ref class-statics-tbl c #f)
+                                 (hashtable-ref class-ctors-tbl c #f))))
+         ;; the fully-qualified spellings the runtime provides, as declared
+         (stale (filter (lambda (c) (taken? c)) classes))
+         (kept (filter (lambda (c) (not (taken? c))) cs)))
+    (when (pair? stale)
+      (fprintf (current-error-port)
+               "warning: ~a claims ~a, which this jolt provides; the runtime's ~a answers and the claim is dropped — upgrade ~a\n"
+               install-ns
+               (fold-left (lambda (a c) (if (string=? a "") c (string-append a ", " c))) "" stale)
+               (if (null? (cdr stale)) "class" "classes")
+               (if coordinate (jolt-str-render-one coordinate) "the library")))
+    (when (pair? kept)
+      (let ((p (vector install-ns coordinate kept (box #f))))
+        (set! lib-class-providers (append lib-class-providers (list p)))
+        (lib-claim-pending! p)))))
 
 ;; The Clojure-facing seam. jolt.deps calls this once per declared provider after
 ;; it resolves the dependency graph, before any user code compiles — which is the
@@ -739,7 +750,7 @@
 ;; autoloads the provider that declares the class, and retries.
 ;;
 ;; A miss is enough because a claimed class cannot be a HIT before its claimer has
-;; loaded — register-class-provider! refuses a claim on a class the runtime
+;; loaded — register-class-provider! drops a claim on a class the runtime
 ;; already implements, and lib-pending-claimer holds any other library's
 ;; registration until the claim settles. That is what makes resolution a property
 ;; of the dependency graph rather than of compile order (jolt#914): the table hit
@@ -929,7 +940,7 @@
       ;; table for java.lang.StringBuilder and no statics at all, so the first
       ;; StringBuilder/... reference fell off the end of the class table and
       ;; reported "No dependency provides java.lang.StringBuilder" — advice that
-      ;; cannot be taken, since register-class-provider! refuses a claim on a
+      ;; cannot be taken, since register-class-provider! drops a claim on a
       ;; class the runtime already provides. The miss is the MEMBER's, and that is
       ;; the same message the class-with-statics path already gives (jolt#983).
       ((runtime-provides-class? (or (imported-class-fqn class) class))

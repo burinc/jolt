@@ -351,6 +351,20 @@ check "the dot form of a static autoloads too" "fixture-zone:UTC" "$(run -A:time
 # the imported simple name did not. malli's transform.cljc builds one that way.
 check "constructing a library class autoloads" "fixture-builder" "$(run -A:time run -m appzonector)"
 
+# A dependency's claim on a class the runtime now provides — the shape every
+# project pinned to an older release of a library meets after the runtime
+# grows that class (java.util.zip, jolt#916) — is dropped with a warning that
+# names the library, not refused: the runtime's class answers, and the
+# library's other claims still autoload it. Refusing made a jolt upgrade fail
+# every such project at resolution with nothing the project could change.
+out="$(runfull -A:prov3 run -m appprovstale)"
+check "a stale claim is dropped and the runtime's class answers" "crc:891568578 stale-skf:x"       "$(printf '%s\n' "$out" | tail -1)"
+case "$out" in
+  *"provstale.install claims java.util.zip.CRC32, which this jolt provides"*"upgrade"*)
+    check "the dropped claim is reported, naming the library" ok ok ;;
+  *) check "the dropped claim is reported, naming the library" "warning naming provstale.install and java.util.zip.CRC32" "$(printf '%s' "$out" | head -2)" ;;
+esac
+
 # Off the roots the reference reports that nothing provides the class — and
 # deliberately does NOT name a library (RFC 0014). Which library supplies
 # java.time is not the runtime's to say, and a caller may write the shim
