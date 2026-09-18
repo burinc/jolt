@@ -105,7 +105,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
-  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zipextract zlibregistersmoke zlibnativesmoke noexecsmoke \
+  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -161,7 +161,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values recordinline corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit zipextract depsnounzip zlibnativesmoke zipmemory noexecsmoke \
+  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
@@ -630,9 +630,11 @@ completionssmoke: testbin
 depscpcache: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-cpcache-smoke.sh
 
-# Dependency resolution with no unzip on PATH (jolt issue #988): a :mvn/version
-# jar from an offline local repository resolves, and a jar that is not a zip
-# fails loudly with no marker and no temporary file left.
+# Maven dependencies load from their jars in place, with no unzip on PATH and
+# no extraction (jolt issues #988 and #1005): a :mvn/version jar from an offline
+# local repository resolves and loads, its resources answer jar: URLs, a jar
+# that is not a whole archive fails loudly and caches nothing, and a damaged
+# entry is refused where it is read.
 depsnounzip: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-no-unzip-smoke.sh
 
@@ -641,12 +643,6 @@ depsnounzip: testbin
 # a fake coordinate type. The cases are ported from tools.deps. Offline.
 depsunit:
 	@JOLT_NO_USER_DEPS=1 bin/jolt run test/deps_expand_test.clj
-
-# jolt.host/extract-zip! over the zip fixtures: the trees unzip -o -q made,
-# UTF-8 names, an archive with a comment, replaced files, refused names, a
-# symbolic link, and archives that are not whole. Offline.
-zipextract:
-	@JOLT_NO_USER_DEPS=1 bin/jolt run test/zip_extract_test.clj
 
 # Vendored Grenadine core plus Jolt's effective-POM adapter. Offline.
 grenadine:

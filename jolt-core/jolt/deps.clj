@@ -21,8 +21,9 @@
   in both directions. Grenadine expands the dependency tree, builds effective
   POMs, and compares Maven versions; files are fetched by jolt itself over
   HTTPS (jolt.mvn-http);
-  git still shells out through jolt.host/sh, and jars extract through
-  jolt.host/extract-zip! (nothing here touches the JVM)."
+  git still shells out through jolt.host/sh; a jar is a source root read in
+  place through its central directory, never extracted (nothing here touches
+  the JVM)."
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [grenadine.expander :as expander]
@@ -49,13 +50,12 @@
 ;; does not carry: on Windows it runs the string through cmd.exe, where `mkdir -p
 ;; a/b` creates a directory named `-p` and the rest are not commands at all. Every
 ;; one of these is now a filesystem call, so the only subprocess left in this
-;; namespace is the one real external program, git. Jars extract in process
-;; through jolt.host/extract-zip!.
+;; namespace is the one real external program, git. A jar is never extracted:
+;; the loader reads it in place (jolt.host/zip-archive?, zip-entry-names).
 (defn- mkdirs! [p] (jolt.host/mkdirs! p))     ; mkdir -p; true if p ends up a dir
 (defn- rm-f [p] (jolt.host/delete-file! p))   ; absent is success
 (defn- rm-rf [p] (jolt.host/delete-tree! p))
 (defn- mv! [from to] (jolt.host/rename-file! from to))
-(defn- file-mtime [p] (jolt.host/file-mtime p))   ; epoch ms, 0 when absent
 (defn- touch! [p] (spit p ""))                ; the markers are all empty files
 
 (defn- find-file
@@ -450,22 +450,23 @@
 ;; --- maven cache ------------------------------------------------------------
 ;; jolt has no JVM, but a Clojure library's Maven JAR carries its .clj/.cljc/.cljs
 ;; SOURCE (Clojure ships source, not just bytecode). So a :mvn/version coordinate
-;; resolves by fetching the JAR (Clojars, then Central), extracting it, and using
-;; the extraction as a source root — its pom.xml supplies the transitive deps.
-;; A JAR of pure Java classes has no source to run, but the resources it packages
-;; are still readable through it, so it stays on the roots as a leaf.
+;; resolves by fetching the JAR (Clojars, then Central) and putting the jar
+;; itself on the source roots: the loader reads a namespace or a resource out
+;; of it through its central directory, as the JVM reads a jar on the
+;; classpath, and nothing is extracted (jolt issue #1005). Its pom.xml, read
+;; the same way, supplies the transitive deps. A JAR of pure Java classes has no
+;; source to run, but the resources it packages are still readable through it,
+;; so it stays on the roots as a leaf.
 ;;
 ;; JARs live at their standard path in the local Maven repository
 ;; (~/.m2/repository), so they are shared with JVM Clojure/tools.deps in both
 ;; directions: an artifact clj already fetched is reused without a download, and
-;; one jolt fetches is there for clj. The jolt-only source extraction sits in a
-;; "<artifact>-<version>.jar.jolt/" directory beside the jar. The repository
-;; location is configured the way tools.deps configures it — the :mvn/local-repo
-;; top key of deps.edn (also accepted in an add-deps map); anyone already using
-;; it gets the same behavior for free. JOLT_MAVEN_REPOSITORY supplies the
-;; dialect override and GRENADINE_MAVEN_REPOSITORY the shared default. Setting
-;; JOLT_MVNLIBS opts out of sharing entirely: the legacy
-;; self-contained layout under it, jar not kept.
+;; one jolt fetches is there for clj. The repository location is configured the
+;; way tools.deps configures it — the :mvn/local-repo top key of deps.edn (also
+;; accepted in an add-deps map); anyone already using it gets the same behavior
+;; for free. JOLT_MAVEN_REPOSITORY supplies the dialect override and
+;; GRENADINE_MAVEN_REPOSITORY the shared default. Setting JOLT_MVNLIBS opts out
+;; of sharing entirely: jars are kept under it, in a layout of jolt's own.
 
 (def ^:private ^:dynamic *mvn-local-repo*
   "The :mvn/local-repo of the resolution in progress (bound by resolve-project /
@@ -560,54 +561,36 @@
         {:type :jolt.deps/pom-not-found
          :coords coords})))))
 
-(defn- cache-fresh?
-  "Is the extraction at `dir` still valid for `jar`? The `.jolt-ok` marker is
-  written after a successful extraction; it is stale once the jar is rebuilt/refetched
-  (a SNAPSHOT, or the same coord re-installed into ~/.m2), so a jar whose mtime
-  is later than the marker's re-extracts. The legacy JOLT_MVNLIBS layout keeps
-  no jar, so its extraction is the only copy — trust it. A jar that has since
-  vanished (m2 pruned) also leaves the extraction as the last good copy."
-  [dir jar legacy]
-  (let [ok (str dir "/.jolt-ok")]
-    (and (file-exists? ok)
-         (or legacy
-             (not (file-exists? jar))
-             (<= (file-mtime jar) (file-mtime ok))))))
+(defn- jar-path
+  "The path of ENTRY inside the jar at JAR, as the loader spells it: the JVM's
+  jar: URL, which slurp, io/reader and jolt.host/jar-entry-string all read."
+  [jar entry]
+  (str "jar:file:" jar "!/" entry))
 
-(defn- extract-jar!
-  "Extract `jar` into `dir` (overwriting) through jolt.host/extract-zip!, marking
-  `.jolt-ok` only on success so a failed/partial extraction is never trusted as
-  a complete one. A stale `.jolt-ok` from a prior extraction is cleared first, so
-  a failed re-extract isn't left looking valid. Returns dir on success, nil on
-  failure (a non-fatal skip). The jar may live inside `dir` (the legacy
-  JOLT_MVNLIBS layout), so `dir` is not wiped."
-  [jar dir]
-  (mkdirs! dir)
-  (rm-f (str dir "/.jolt-ok"))
-  (if (jolt.host/extract-zip! jar dir)
-    (do (touch! (str dir "/.jolt-ok")) dir)
-    (do (warn "failed to extract " jar) nil)))
+(defn- jar-path? [p] (str/starts-with? (str p) "jar:file:"))
 
-(defn- extract-or-note!
-  "extract-jar! that records a failed extraction as an unresolvable artifact.
-  The jar is on disk but its source cannot be materialized (not a whole zip
-  archive, an entry jolt refuses, disk full) — a failure to OBTAIN the artifact,
-  not a skip. Left silent, the resolution completes without the dep's root and
-  the cpcache persists the degraded roots until the project's .jolt is deleted
-  by hand."
-  [jar dir coord version]
-  (or (extract-jar! jar dir)
-      (do (note-unresolvable! coord version
-                              (str jar " could not be extracted (not a whole zip archive, an entry jolt refuses, or the extraction failed)"))
-          nil)))
+(defn- archive-or-note!
+  "The jar's path when `jar` is a whole zip archive — an END record and every
+  central-directory header that read — else nil after recording the artifact
+  as unresolvable. The jar is on disk but cannot be read (a cut download, a
+  file that is not a jar, a full disk) — a failure to OBTAIN the artifact, not
+  a skip. Left silent, the resolution completes without the dep's root and
+  the cpcache persists the degraded roots until the project's .jolt is
+  deleted by hand; refusing here fails it before anything is cached."
+  [jar coord version]
+  (if (jolt.host/zip-archive? jar)
+    jar
+    (do (note-unresolvable! coord version
+                            (str jar " is not a whole zip archive (a cut download, or not a jar); delete it to fetch again"))
+        nil)))
 
 (defn- ensure-maven
   "Ensure coord@version's JAR is in the local Maven repository (reusing one the
   JVM toolchain already fetched; downloading from Clojars then Central when
-  absent) and extract its source beside it. Re-extracts when the jar is newer
-  than the last extraction. Returns the extraction dir, or nil after recording
-  the artifact as unresolvable (absent from every repo, fetch failures, or a
-  failed extraction) — the expansion reports every one and aborts at its end."
+  absent) and answer the jar's path, which is the dependency's source root:
+  the loader reads it in place. Returns nil after recording the artifact as
+  unresolvable (absent from every repo, fetch failures, or a jar that is not a
+  whole archive) — the expansion reports every one and aborts at its end."
   [coord version]
   (let [group (mvn-group coord) artifact (name coord)
         vdir-rel (str (str/replace group "." "/") "/" artifact "/" version)
@@ -615,49 +598,41 @@
         legacy (getenv "JOLT_MVNLIBS")
         dir (if legacy
               (str legacy "/" (sanitize (str coord)) "/" (sanitize version))
-              (str (m2-repo-dir) "/" vdir-rel "/" jar-name ".jolt"))
-        jar (if legacy
-              (str dir "/dep.jar")
-              (str (m2-repo-dir) "/" vdir-rel "/" jar-name))]
-    (if (cache-fresh? dir jar legacy)
-      dir
-      (if (and (not legacy) (file-exists? jar))
-        (do (info "using " jar-name " from the local Maven repository")
-            (extract-or-note! jar dir coord version))
-        ;; ERRORS carries the repos that failed for a reason OTHER than "no such
-        ;; artifact". Every repo answering 404 is a real "not found" and says so;
-        ;; a reset or a 503 is not, and reporting it as absent sent people
-        ;; looking for a dependency that was published years ago. Either way the
-        ;; dep is unresolvable and resolution will abort — the distinction is
-        ;; what the message says, and whether a retry was even attempted.
-        (loop [repos *mvn-repos* errors []]
-          (if (empty? repos)
-            (do (note-unresolvable!
-                 coord version
-                 (if (seq errors)
-                   ;; a reset, a 503, a TLS failure: the repos never told us
-                   ;; whether they have it, so do not claim they said no
-                   (str "could not be fetched: " (str/join "; " errors))
-                   (str "not found in any repository (tried "
-                        (str/join ", " *mvn-repos*) ")")))
-                nil)
-            (let [repo (first repos)
-                  _ (mkdirs! (if legacy dir (str (m2-repo-dir) "/" vdir-rel)))
-                  r (http/fetch* (str repo "/" vdir-rel "/" jar-name) jar)]
-              (if (= :ok (:outcome r))
-                (do (info "fetching " coord " " version)
-                    (let [d (extract-or-note! jar dir coord version)]
-                      ;; legacy layout never keeps the jar; the m2 layout does —
-                      ;; that IS the sharing.
-                      (when legacy (rm-f jar))
-                      d))
-                (recur (rest repos)
-                       (if (= :not-found (:outcome r))
-                         errors
-                         (conj errors (str repo " — "
-                                           (or (:error r)
-                                               (when (:status r) (str "HTTP " (:status r)))
-                                               (name (:outcome r)))))))))))))))
+              (str (m2-repo-dir) "/" vdir-rel))
+        jar (str dir "/" jar-name)]
+    (if (file-exists? jar)
+      (do (when-not legacy (info "using " jar-name " from the local Maven repository"))
+          (archive-or-note! jar coord version))
+      ;; ERRORS carries the repos that failed for a reason OTHER than "no such
+      ;; artifact". Every repo answering 404 is a real "not found" and says so;
+      ;; a reset or a 503 is not, and reporting it as absent sent people
+      ;; looking for a dependency that was published years ago. Either way the
+      ;; dep is unresolvable and resolution will abort — the distinction is
+      ;; what the message says, and whether a retry was even attempted.
+      (loop [repos *mvn-repos* errors []]
+        (if (empty? repos)
+          (do (note-unresolvable!
+               coord version
+               (if (seq errors)
+                 ;; a reset, a 503, a TLS failure: the repos never told us
+                 ;; whether they have it, so do not claim they said no
+                 (str "could not be fetched: " (str/join "; " errors))
+                 (str "not found in any repository (tried "
+                      (str/join ", " *mvn-repos*) ")")))
+              nil)
+          (let [repo (first repos)
+                _ (mkdirs! dir)
+                r (http/fetch* (str repo "/" vdir-rel "/" jar-name) jar)]
+            (if (= :ok (:outcome r))
+              (do (info "fetching " coord " " version)
+                  (archive-or-note! jar coord version))
+              (recur (rest repos)
+                     (if (= :not-found (:outcome r))
+                       errors
+                       (conj errors (str repo " — "
+                                         (or (:error r)
+                                             (when (:status r) (str "HTTP " (:status r)))
+                                             (name (:outcome r))))))))))))))
 
 (defn- raw-pom-deps-from
   "Transitive deps read from a pom.xml — as a deps map so the expansion walks
@@ -667,9 +642,10 @@
   skips a dependency it can't read a literal version for rather than failing."
   [pom]
   (do
-    (when (file-exists? pom)
-      (let [xml (slurp pom)
-            grab (fn [tag block] (second (re-find (re-pattern (str "<" tag ">(.*?)</" tag ">")) block)))]
+    (when-let [xml (if (jar-path? pom)
+                     (jolt.host/jar-entry-string pom)
+                     (when (file-exists? pom) (slurp pom)))]
+      (let [grab (fn [tag block] (second (re-find (re-pattern (str "<" tag ">(.*?)</" tag ">")) block)))]
         (into {}
           (for [[_ block] (re-seq #"(?s)<dependency>(.*?)</dependency>" xml)
                 :let [g (grab "groupId" block) a (grab "artifactId" block)
@@ -716,6 +692,14 @@
               (str url-prefix (subs ns (count prefix)) "/" (name coord) url-suffix)))
           git-url-hosts)))
 
+(defn- jar-root?
+  "Is `root` a jar rather than a directory? The loader reads a .jar/.zip root
+  in place; every other root is a directory."
+  [root]
+  (let [r (str/lower-case (str root))]
+    (and (or (str/ends-with? r ".jar") (str/ends-with? r ".zip"))
+         (not (jolt.host/directory? root)))))
+
 (defn- has-clj-source?
   "Does the tree hold any jolt-loadable source (.clj/.cljc)? A Maven JAR that is
   pure-Java (closure-compiler) or ClojureScript-only (cljs.java-time) has none,
@@ -725,7 +709,10 @@
   a WALK: with no source of ours to load, the deps it declares are its
   publisher's own JVM/cljs toolchain, and jolt has no JVM to run them on."
   [root]
-  (boolean (find-file root #(or (str/ends-with? % ".clj") (str/ends-with? % ".cljc")))))
+  (let [source? #(or (str/ends-with? % ".clj") (str/ends-with? % ".cljc"))]
+    (boolean (if (jar-root? root)
+               (some source? (jolt.host/zip-entry-names root))
+               (find-file root source?)))))
 
 ;; --- coordinate skips + normalization ----------------------------------------
 ;; jolt IS Clojure, so org.clojure/clojure is intrinsic; jolt has no
@@ -872,7 +859,7 @@
       (let [root (ensure-maven lib (:mvn/version coord))]
         (cond
           (nil? root) {:root nil :manifest :none}
-          ;; a Maven dep with no jolt-loadable source is a LEAF: the extraction
+          ;; a Maven dep with no jolt-loadable source is a LEAF: the jar
           ;; stays on the roots so io/resource can read whatever it packages,
           ;; but with no source of ours in it, the deps it declares are cljs/JVM
           ;; tooling — no :deps and no :pom here is what stops the walk.
@@ -882,8 +869,8 @@
           ;; predate their own dependencyManagement, so it is second choice.
           :else {:root root :manifest :mvn
                  :deps (effective-pom-deps lib coord)
-                 :pom (str root "/META-INF/maven/" (mvn-group lib) "/"
-                           (name lib) "/pom.xml")})))))
+                 :pom (jar-path root (str "META-INF/maven/" (mvn-group lib) "/"
+                                          (name lib) "/pom.xml"))})))))
 
 (defn- git-info [lib coord]
   (memoized [:info lib (ext/dep-id lib coord)]
@@ -900,25 +887,20 @@
             root (if-let [r (:deps/root coord)] (str checkout "/" r) checkout)]
         (assoc (manifest-info root) :sha sha :url url :checkout checkout)))))
 
-(defn- jar-extraction-dir [jar]
-  (str (or (getenv "JOLT_JARLIBS")
-           (str (or (getenv "HOME") ".") "/.jolt/jarlibs"))
-       "/" (sanitize jar)))
-
 (defn- local-info [lib coord]
   (memoized [:info lib (ext/dep-id lib coord)]
     (fn []
       (let [path (:local/root coord)]
         (if (str/ends-with? path ".jar")
-          ;; a jar local root extracts into a cache keyed by the jar path (the
-          ;; jar's directory may not be writable) and is re-extracted when the
-          ;; jar is newer than the extraction, like a Maven jar.
-          (let [dir (jar-extraction-dir path)]
-            (if (or (cache-fresh? dir path false)
-                    (extract-or-note! path dir lib path))
-              (let [pom (find-file (str dir "/META-INF") #(= % "pom.xml"))]
-                {:root dir :manifest :mvn :pom pom})
-              {:root nil :manifest :none}))
+          ;; a jar local root is read in place, like a Maven jar; the pom it
+          ;; packages, if any, is the first META-INF/**/pom.xml entry
+          (if (archive-or-note! path lib path)
+            (let [pom (some #(when (and (str/starts-with? % "META-INF/")
+                                        (str/ends-with? % "/pom.xml"))
+                               (jar-path path %))
+                            (jolt.host/zip-entry-names path))]
+              {:root path :manifest :mvn :pom pom})
+            {:root nil :manifest :none})
           (manifest-info path))))))
 
 (defmethod ext/coord-info :mvn [lib coord] (mvn-info lib coord))
@@ -1195,7 +1177,7 @@
 ;; The cache sits AFTER fetch/resolution: a miss runs the full resolve-deps
 ;; (which fetches missing deps over the network) and then writes; a hit never
 ;; touches the network. On a hit every cached path is checked to still exist on
-;; disk — a pruned gitlib checkout or a deleted jar/extraction is a miss, not an
+;; disk — a pruned gitlib checkout or a deleted jar is a miss, not an
 ;; error. A corrupt or unreadable cache file is a miss too, never an error.
 
 ;; --- :jolt/min-version ------------------------------------------------------
@@ -1391,7 +1373,7 @@
        "|" (pr-str (vec (sort-by (comp str key) (:default-deps opts))))
        "|" runtime-version
        ;; the environment-dependent artifact roots resolution materializes into:
-       ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS_DIR — the
+       ;; a run pointed at a different gitlibs (JOLT_GITLIBS_DIR — the
        ;; deps-alias smoke's retry scenarios do exactly this), a different
        ;; HOME (the ~/.m2 and ~/.jolt defaults), or a moved Maven repo
        ;; (JOLT_MVNLIBS / JOLT_MAVEN_REPOSITORY /
@@ -1399,7 +1381,6 @@
        ;; not share an entry whose cached roots point into the old location —
        ;; the old paths usually still exist, so validation alone won't miss.
        "|" (gitlibs-dir)
-       "|" (or (getenv "JOLT_JARLIBS") "")
        "|" (or (getenv "JOLT_MVNLIBS") "")
        "|" (or (getenv "JOLT_MAVEN_REPOSITORY") "")
        "|" (or (getenv "GRENADINE_MAVEN_REPOSITORY") "")

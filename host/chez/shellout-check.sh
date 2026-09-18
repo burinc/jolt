@@ -15,7 +15,8 @@
 # The fix was to do the filesystem work through filesystem calls (jolt.host
 # mkdirs!/rename-file!/delete-file!/delete-tree!/file-mtime/list-dir), leaving
 # the shell for the one thing that really is an external program: git. Jars
-# extract in process through jolt.host/extract-zip! (jolt issue #988).
+# are read in place through their central directory, never extracted (jolt
+# issues #988 and #1005).
 # That distinction is invisible in the source — a `(sh (str "rm -f " …))` reads
 # exactly like a `(sh (str "git clone " …))` — so it is checked here rather than
 # left to whoever adds the next one to remember which host they are on.

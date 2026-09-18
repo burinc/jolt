@@ -235,10 +235,70 @@
       (close-port port)
       result)))
 
+;; --- entries of an archive as paths ------------------------------------------
+;; A namespace source or a resource inside a jar on the roots is spelled as the
+;; JVM spells its URL: "jar:file:<absolute jar path>!/<entry name>". Every read
+;; of such a path — read-file-string, read-file-bytes, slurp, io/reader,
+;; io/input-stream, the resource resolver and the loader — goes through the
+;; archive's central directory (java/zip-file.ss, which loads later; its names
+;; are reached at call time), never through an extraction (jolt issue #1005).
+;; *file* carries the spelling for a namespace loaded from a jar, so an error
+;; report reads its source lines the same way. A whole entry read checks the
+;; entry's CRC-32 (zipdir-entry-bytes), so a damaged jar is refused where it is
+;; read, with the jar and the entry in the message.
+(define jar-path-prefix "jar:file:")
+(define (jar-path-split p)
+  (let ((pn (string-length jar-path-prefix)))
+    (and (string? p)
+         (> (string-length p) pn)
+         (string=? (substring p 0 pn) jar-path-prefix)
+         (let loop ((i pn))
+           (cond ((>= (+ i 1) (string-length p)) #f)
+                 ((and (char=? (string-ref p i) #\!) (char=? (string-ref p (+ i 1)) #\/))
+                  (cons (substring p pn i) (substring p (+ i 2) (string-length p))))
+                 (else (loop (+ i 1))))))))
+(define (jar-path? p) (and (jar-path-split p) #t))
+(define (make-jar-path jar entry) (string-append jar-path-prefix jar "!/" entry))
+;; The archive index and the entry a jar path names, or (values #f #f) when the
+;; archive is not readable or has no such entry.
+(define (jar-path-entry p)
+  (let ((parts (jar-path-split p)))
+    (if (not parts)
+        (values #f #f)
+        (let ((d (zipdir-for (car parts))))
+          (if (not d)
+              (values #f #f)
+              (let ((ent (hashtable-ref (zipdir-table d) (cdr parts) #f)))
+                (if ent (values d ent) (values #f #f))))))))
+(define (jar-path-exists? p)
+  (let-values (((d ent) (jar-path-entry p))) (and ent #t)))
+;; The entry's bytes, or #f when the path names no entry. A damaged entry raises
+;; the ZipException the read finds, with the path in it.
+(define (jar-path-bytes p)
+  (let-values (((d ent) (jar-path-entry p)))
+    (and ent
+         (guard (e ((jolt-throw-condition? e)
+                    (let ((v (jolt-throw-condition-value e)))
+                      (if (ex-info-map? v)
+                          (jolt-throw (jolt-host-throwable
+                                       (ex-info-class v)
+                                       (string-append p ": "
+                                                      (let ((m (jolt-ex-info-record-message v)))
+                                                        (if (string? m) m "unreadable entry")))))
+                          (raise e)))))
+           (zipdir-entry-bytes d ent)))))
+;; A java.io.FileNotFoundException for a jar path with no such entry, the class
+;; a missing file raises.
+(define (jar-path-missing p)
+  (throw-jvm (quote java.io.FileNotFoundException)
+             (string-append p " (No such file or directory)")))
+
 ;; Read a whole file as a bytevector ("" -> empty). Used to slurp boot/stub files.
 (define (read-file-bytes path)
-  (with-port (open-file-input-port path)
-    (lambda (p) (let ((bv (get-bytevector-all p))) (if (eof-object? bv) (bytevector) bv)))))
+  (if (jar-path? path)
+      (or (jar-path-bytes path) (jar-path-missing path))
+      (with-port (open-file-input-port path)
+        (lambda (p) (let ((bv (get-bytevector-all p))) (if (eof-object? bv) (bytevector) bv))))))
 
 ;; Write an embedded bytevector resource out to a path. make-boot-file needs the
 ;; petite/scheme boots as files, so they are spilled to scratch before the call.
@@ -355,6 +415,8 @@
 (define (project-relative p)
   (cond
     ((or (= (string-length p) 0) (jfile-path-absolute? p)) p)
+    ;; an entry inside a jar is already absolute (the jar's path is)
+    ((jar-path? p) p)
     ;; A single leading separator is rooted on the current drive but is not an
     ;; absolute File pathname on Windows. The JVM resolves it against user.dir's
     ;; drive; the process cwd is Jolt's source tree, so leaving it to the OS can
@@ -884,8 +946,15 @@
       ;; java.io.FileNotFoundException for a missing one, both like the JVM.
       ((string=? (url-protocol spec) "file")
        (host-new "FileInputStream" (url-strip-scheme spec)))
+      ;; an entry of a jar on the roots streams out of the archive
+      ((jar-path? spec) (jar-path-stream spec))
       (else (throw-jvm (quote java.io.IOException)
                        (string-append "protocol doesn't support input: " spec))))))
+;; An InputStream over the entry a jar path names, as ZipFile.getInputStream
+;; opens it; a path with no such entry is java.io.FileNotFoundException.
+(define (jar-path-stream p)
+  (let-values (((d ent) (jar-path-entry p)))
+    (if ent (zipdir-entry-stream d ent) (jar-path-missing p))))
 ;; The handler's own openConnection. Without one there is nothing to connect
 ;; through — say so rather than returning something that reads as empty.
 (define (url-open-connection u)
@@ -1098,6 +1167,10 @@
                (string-append out more))))))))
 
 (define (read-file-string path)
+  (if (jar-path? path)
+      (utf8->string (or (jar-path-bytes path) (jar-path-missing path)))
+      (read-file-string-on-disk path)))
+(define (read-file-string-on-disk path)
   (with-port (open-input-file path)
     (lambda (p)
       ;; A port with no meaningful length — a fifo, a character device — reports
@@ -1306,7 +1379,7 @@
 ;; catchable as that class, so the caller's fallback never runs.
 (define (slurp-path path)
   (io-note-file-read! path)
-  (unless (file-exists? path)
+  (unless (if (jar-path? path) (jar-path-exists? path) (file-exists? path))
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
   (read-file-string path))
@@ -1326,6 +1399,7 @@
       ;; jolt repo root under the launcher, not the project the user is in.
       ((string=? (url-protocol spec) "file")
        (slurp-path (project-relative (url-strip-scheme spec))))
+      ((jar-path? spec) (slurp-path spec))
       (else (throw-jvm (quote java.io.IOException)
                        (string-append "protocol doesn't support input: " spec))))))
 ;; Whatever the handler handed back: a byte stream, a reader, or a value that
@@ -1613,6 +1687,21 @@
                   (substring rel 2 (string-length rel))
                   rel)))
     (make-url (string-append "file:" (jfile-abs rel)))))
+;; The jar: URL for `nm` inside the jar at root JAR, absolute like the file: one.
+(define (resource-jar-url jar nm)
+  (make-url (make-jar-path (jfile-abs jar) nm)))
+;; The candidate for NM on ROOT, as (path-or-#f . url-thunk): a directory root's
+;; file, or a jar root's entry (loader.ss root-jar-index says which roots are
+;; jars). The path is what the AOT cache is told about; for a jar it is the
+;; entry's jar path, so the cache keys on the entry's content and re-validates
+;; when the jar changes.
+(define (resource-candidate root nm)
+  (let ((d (root-jar-index root)))
+    (if d
+        (let ((p (make-jar-path (jfile-abs root) nm)))
+          (cons p (and (zipdir-has? d nm) (lambda () (resource-jar-url root nm)))))
+        (let ((cand (string-append root "/" nm)))
+          (cons cand (and (file-exists? cand) (lambda () (resource-file-url root nm))))))))
 
 ;; The name argument, or an NPE. The JVM throws NullPointerException for a null
 ;; resource name from ClassLoader.getResource / getResources /
@@ -1651,10 +1740,10 @@
         (let loop ((roots (get-source-roots)))
           (if (null? roots)
               jolt-nil
-              (let ((cand (string-append (car roots) "/" nm)))
-                (io-note-file-read! cand)
-                (if (file-exists? cand)
-                    (resource-file-url (car roots) nm)
+              (let ((cand (resource-candidate (car roots) nm)))
+                (io-note-file-read! (car cand))
+                (if (cdr cand)
+                    ((cdr cand))
                     (loop (cdr roots)))))))))
 
 ;; (resource n) and (resource n loader). The JVM's 2-arity resolves against the
@@ -1757,10 +1846,10 @@
                (acc (if emb (list (make-embedded-res nm emb)) '())))
       (cond ((null? roots) (list->cseq (reverse acc)))
             (else
-             (let ((cand (string-append (car roots) "/" nm)))
-               (io-note-file-read! cand)
-               (if (file-exists? cand)
-                   (loop (cdr roots) (cons (resource-file-url (car roots) nm) acc))
+             (let ((cand (resource-candidate (car roots) nm)))
+               (io-note-file-read! (car cand))
+               (if (cdr cand)
+                   (loop (cdr roots) (cons ((cdr cand)) acc))
                    (loop (cdr roots) acc))))))))
 ;; The stream for whatever the resolver answered. Both branches of a resolved
 ;; resource are java.net.URLs with an openStream — a file: URL reads its target,

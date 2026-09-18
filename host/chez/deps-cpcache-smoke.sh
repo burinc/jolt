@@ -96,12 +96,11 @@ yn "5: deleted dep root -> miss" "$(miss "$out11" && echo yes || echo no)"
 yn "5: ...and no error/stacktrace" "$(printf '%s' "$out11" | grep -qi 'exception\|stacktrace\|error building' && echo no || echo yes)"
 
 # 6. a resolution that FAILED to materialize an artifact is never cached.
-#    A :local/root jar that cannot be extracted (corrupt zip — same machinery
-#    as a cut download or a full disk) must fail resolution loudly, not
-#    silently drop the root; and once the jar is fixed IN PLACE (the cache
-#    material doesn't fold jar bytes) the next run must resolve it, which it
-#    can only do if the degraded result was never written.
-export JOLT_JARLIBS="$tmp/jarlibs"
+#    A :local/root jar that is not a whole archive (corrupt zip — same
+#    machinery as a cut download) must fail resolution loudly, not silently
+#    drop the root; and once the jar is fixed IN PLACE (the cache material
+#    doesn't fold jar bytes) the next run must resolve it, which it can only
+#    do if the degraded result was never written.
 {
   mkdir -p "$tmp/proj2/src/app2"
   cat > "$tmp/proj2/deps.edn" <<'EOF'
@@ -122,7 +121,6 @@ EOF
   JOLT_PWD="$tmp" JOLT_QUIET=1 "$JOLT" run "$root/tools/mkjar.clj" "$tmp/proj2/libj.jar" "libj/core.clj=$tmp/proj2/core.clj" >/dev/null
   out13="$(JOLT_PWD="$tmp/proj2" JOLT_QUIET=1 "$JOLT" run -m app2.core 2>&1)"
   yn "6: fixed jar resolves and loads" "$(printf '%s' "$out13" | tail -1 | grep -q 'jarlib 7' && echo yes || echo no)"
-  unset JOLT_JARLIBS
 }
 
 # 7. the env knobs that move where Maven artifacts live select different keys:

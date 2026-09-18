@@ -644,8 +644,8 @@ cat > "$tmp/jarproj/src/japp.clj" <<'EOF'
 (ns japp (:require [jarlib.core :as j]))
 (defn -main [& _] (println "jar dep:" j/version))
 EOF
-check ":local/root jar extracts and loads" "jar dep: from-jar" \
-      "$(JOLT_PWD="$tmp/jarproj" JOLT_QUIET=1 JOLT_JARLIBS="$tmp/jarlibs" "$JOLT" run -m japp 2>&1 | tail -1)"
+check ":local/root jar loads in place" "jar dep: from-jar" \
+      "$(JOLT_PWD="$tmp/jarproj" JOLT_QUIET=1 "$JOLT" run -m japp 2>&1 | tail -1)"
 
 # :git/tag + short :git/sha — the tag resolves to its commit and the short sha
 # is verified as a prefix of it. Uses a local repo so the gate stays offline.

@@ -1,6 +1,5 @@
-;; make-fixtures.clj — write the java.util.zip fixture archives with JDK 21, then
-;; record the tree that `unzip -o -q` makes of each archive that is safe to
-;; extract. Run once from the repository root, and commit what it writes:
+;; make-fixtures.clj — write the java.util.zip fixture archives with JDK 21. Run
+;; once from the repository root, and commit what it writes:
 ;;   JAVA_CMD=/path/to/jdk-21/bin/java clojure -M test/chez/fixtures/zip/make-fixtures.clj
 (require '[clojure.java.io :as io]
          '[clojure.string :as str])
@@ -72,33 +71,6 @@
     (with-open [f (io/output-stream (io/file dir name))]
       (.writeTo out f))))
 
-(defn delete-tree [^java.io.File f]
-  (when (.isDirectory f)
-    (doseq [c (.listFiles f)] (delete-tree c)))
-  (io/delete-file f true))
-
-;; Extract with Info-ZIP unzip into NAME.tree, and list what it made in
-;; NAME.tree.edn: one path per line, a directory with a trailing slash. The
-;; list keeps empty directories, which git does not store.
-(defn record-tree [name]
-  (let [base (str/replace name #"\.zip$" "")
-        tree (io/file dir (str base ".tree"))]
-    (delete-tree tree)
-    (.mkdirs tree)
-    (let [p (.start (doto (ProcessBuilder. ["unzip" "-o" "-q" (str (io/file dir name)) "-d" (str tree)])
-                      (.inheritIO)))]
-      (when-not (zero? (.waitFor p))
-        (throw (ex-info "unzip failed" {:archive name}))))
-    (let [root (.toPath tree)
-          paths (->> (file-seq tree)
-                     (remove #(= % tree))
-                     (map (fn [^java.io.File f]
-                            (str (str/replace (str (.relativize root (.toPath f))) "\\" "/")
-                                 (when (.isDirectory f) "/"))))
-                     sort)]
-      (spit (io/file dir (str base ".tree.edn"))
-            (str "[" (str/join "\n " (map pr-str paths)) "]\n")))))
-
 (.mkdirs dir)
 
 (write-zip "deflated.zip"
@@ -109,9 +81,7 @@
             ["empty.txt" (byte-array 0) :deflated]
             ["empty-dir/" (byte-array 0) :deflated]])
 
-;; A UTF-8 name sets general purpose flag bit 11. Apple's unzip 6.00 cannot
-;; create this path ("Illegal byte sequence", 2026-09-14, also under
-;; LC_ALL=en_US.UTF-8), so no tree is recorded for this archive.
+;; A UTF-8 name sets general purpose flag bit 11.
 (write-zip "utf8-name.zip"
            [["名前/ファイル.txt" (utf8 "unicode name\n") :deflated]
             ["plain.txt" (utf8 "plain name\n") :deflated]])
@@ -131,17 +101,6 @@
 (write-no-signature-descriptors "no-signature-descriptors.zip"
                                 [["first.txt" (utf8 (str/join (repeat 20 "no signature\n")))]
                                  ["second.txt" (utf8 "second entry\n")]])
-
-;; Names extract-zip! refuses. Each archive has a safe entry first.
-(doseq [[archive unsafe] [["unsafe-absolute.zip" "/absolute.txt"]
-                          ["unsafe-drive.zip" "C:/drive-letter.txt"]
-                          ["unsafe-backslash.zip" "back\\slash.txt"]
-                          ["unsafe-dotdot.zip" "dir/../../escape.txt"]]]
-  (write-zip archive [["safe.txt" (utf8 "safe\n") :deflated]
-                      [unsafe (utf8 "unsafe\n") :deflated]]))
-
-(doseq [name ["deflated.zip" "stored.zip" "mixed.zip" "no-signature-descriptors.zip"]]
-  (record-tree name))
 
 (println "wrote" (count (filter #(str/ends-with? (.getName ^java.io.File %) ".zip") (.listFiles dir)))
          "archives in" (str dir))

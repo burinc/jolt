@@ -302,17 +302,24 @@
                   (else (zip-throw "java.lang.InternalError" (zstream-message zs)))))))))
       (lambda () (zstream-close! zs)))))
 
-;; The uncompressed bytes of the entry ENT of D, whole.
+;; The uncompressed bytes of the entry ENT of D, whole, checked against the
+;; entry's CRC-32 as ZipInputStream checks an entry it finishes: a damaged jar on
+;; the roots is refused where it is read, not loaded as whatever came out.
 (define (zipdir-entry-bytes d ent)
-  (let ((raw (zipdir-raw-bytes d ent)))
-    (cond
-      ((= (zdirent-method ent) zip-stored) raw)
-      ((= (zdirent-method ent) zip-deflated) (zip-inflate-raw raw (zdirent-size ent)))
-      (else (zip-zerror "invalid compression method")))))
-
-;; The entry's bytes as a UTF-8 string.
-(define (zipdir-entry-string d ent)
-  (utf8->string (zipdir-entry-bytes d ent)))
+  (let* ((raw (zipdir-raw-bytes d ent))
+         (out (cond
+                ((= (zdirent-method ent) zip-stored)
+                 (unless (= (bytevector-length raw) (zdirent-size ent))
+                   (zip-zerror (string-append "invalid entry size (expected "
+                                              (number->string (zdirent-size ent)) " but got "
+                                              (number->string (bytevector-length raw)) " bytes)")))
+                 raw)
+                ((= (zdirent-method ent) zip-deflated) (zip-inflate-raw raw (zdirent-size ent)))
+                (else (zip-zerror "invalid compression method"))))
+         (crc (zlib-crc32 0 out 0 (bytevector-length out))))
+    (unless (= crc (zdirent-crc ent))
+      (zip-zerror (zip-crc-message (zdirent-crc ent) crc)))
+    out))
 
 ;; An InputStream over ENT's uncompressed bytes, as ZipFile.getInputStream
 ;; answers: a stored entry's reads its slice of the file (ZipFile.java
@@ -374,10 +381,23 @@
                      (hashtable-set! zipdir-cache path (cons stamp d))))
                  d))))))
 
+;; --- jar roots ---------------------------------------------------------------
+;; The index of ROOT when it is a jar on the source roots — a .jar or .zip
+;; (either case) that is a file — or #f for a directory root or a jar that is
+;; not a readable archive (loader.ss ldr-root-file, io.ss resource-candidate).
+(define (root-jar-name? root)
+  (let ((n (string-length root)))
+    (and (> n 4)
+         (let ((suf (string-downcase (substring root (- n 4) n))))
+           (or (string=? suf ".jar") (string=? suf ".zip"))))))
+(define (root-jar-index root)
+  (and (root-jar-name? root)
+       (not (file-directory? root))
+       (zipdir-for root)))
+
 ;; --- java.util.zip.ZipFile --------------------------------------------------
 ;; state #(zipdir name closed? streams): STREAMS holds the in-streams opened
 ;; through getInputStream, which close() closes, as the JDK closes them.
-(define (zip-file? x) (and (jhost? x) (string=? (jhost-tag x) "zip-file")))
 (define (zfile-dir self) (vector-ref (jhost-state self) 0))
 (define (zfile-name self) (vector-ref (jhost-state self) 1))
 (define (zfile-closed? self) (vector-ref (jhost-state self) 2))
@@ -395,7 +415,7 @@
       (zentry-crc-set! z (zdirent-crc ent))
       (zentry-csize-set! z (zdirent-csize ent))
       (zentry-size-set! z (zdirent-size ent))
-      (when (zdirent-extra ent) (zentry-extra-set! z (na-byte-array (bytevector-copy (zdirent-extra ent)))))
+      (when (zdirent-extra ent) (zentry-set-extra0! z (zdirent-extra ent)))
       (when (zdirent-comment ent) (zentry-comment-set! z (zdirent-comment ent))))
     e))
 
@@ -483,7 +503,6 @@
    (cons "getEntry" (zip-method "getEntry" '(1) zfile-get-entry))
    (cons "getInputStream" (zip-method "getInputStream" '(1) zfile-get-input-stream))
    (cons "entries" (zip-method "entries" '(0) zfile-entries))
-   (cons "stream" (zip-method "stream" '(0) zfile-entries))
    (cons "size" (zip-method "size" '(0)
                   (lambda (self) (zfile-ensure-open self) (->num (zipdir-size (zfile-dir self))))))
    (cons "getName" (zip-method "getName" '(0) zfile-name))

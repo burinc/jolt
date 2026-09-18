@@ -50,7 +50,6 @@ extend-class!
 extension-epoch
 extension-has?
 extension-value
-extract-zip!
 fiber-carrier-count
 fiber-carrier-count-set!
 fiber-instance?
@@ -232,3 +231,7 @@ unchecked-math?
 var-redefined?
 wall-nanos
 with-monitor
+jar-entry-string
+root-file
+zip-archive?
+zip-entry-names
