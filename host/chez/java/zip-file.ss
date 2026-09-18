@@ -103,39 +103,63 @@
               (else (loop (+ i 4 sz)))))))))
 
 ;; The END record as (endpos cenlen cenoff total comment-bytes), with the Zip64
-;; END record's values when the locator points at one. #f when the file holds
-;; no END record (ZipFile.java findEND, initCEN lines 1483-1527).
+;; END record's values — and its position as endpos — when the locator points at
+;; one that agrees with it. #f when the file holds no END record (ZipFile.java
+;; findEND, lines 1559-1650).
+;;
+;; An END candidate whose comment length does not reach the end of the file is
+;; not refused: bytes padded after the archive are common enough that the JDK
+;; verifies the candidate instead, by the CEN signature where its cenlen says
+;; the central directory starts and the LOC signature where its cenoff says the
+;; first local header is, and scans on when either is missing. Both positions
+;; are measured back from the END record, never from the start of the file
+;; (see zipdir-read: a stub before the archive shifts every offset it holds).
 (define (zipdir-find-end in size)
   (let* ((n (min size zip-end-maxlen))
-         (tail (zip-file-bytes in size (- size n) n)))
+         (tail (zip-file-bytes in size (- size n) n))
+         (sig-at? (lambda (pos sig)
+                    (let ((bv (zip-file-bytes in size pos 4)))
+                      (and bv (= (zip-u32 bv 0) sig))))))
     (and tail
          (let loop ((i (- n zip-endhdr)))
            (and (>= i 0)
-                (if (and (= (zip-u32 tail i) zip-endsig)
-                         (= (+ i zip-endhdr (zip-u16 tail (+ i 20))) n))
-                    (let* ((endpos (+ (- size n) i))
-                           (comlen (zip-u16 tail (+ i 20)))
-                           (comment (let ((c (make-bytevector comlen)))
-                                      (bytevector-copy! tail (+ i zip-endhdr) c 0 comlen)
-                                      c))
-                           (total (zip-u16 tail (+ i 10)))
-                           (cenlen (zip-u32 tail (+ i 12)))
-                           (cenoff (zip-u32 tail (+ i 16))))
-                      ;; a Zip64 END record is consulted when the locator is
-                      ;; there and its record answers (ZipFile.java lines
-                      ;; 1443-1477): a sentinel field, or any field, comes
-                      ;; from it then
-                      (let ((loc (and (>= endpos zip64-lochdr)
-                                      (zip-file-bytes in size (- endpos zip64-lochdr) zip64-lochdr))))
-                        (if (and loc (= (zip-u32 loc 0) zip64-locsig))
-                            (let* ((end64pos (zip-u64 loc 8))
-                                   (end64 (zip-file-bytes in size end64pos zip64-endhdr)))
-                              (if (and end64 (= (zip-u32 end64 0) zip64-endsig))
-                                  (list endpos (zip-u64 end64 40) (zip-u64 end64 48)
-                                        (zip-u64 end64 32) comment)
-                                  (list endpos cenlen cenoff total comment)))
-                            (list endpos cenlen cenoff total comment))))
-                    (loop (- i 1))))))))
+                (let* ((endpos (+ (- size n) i))
+                       (comlen (zip-u16 tail (+ i 20)))
+                       (total (zip-u16 tail (+ i 10)))
+                       (cenlen (zip-u32 tail (+ i 12)))
+                       (cenoff (zip-u32 tail (+ i 16)))
+                       (cenpos (- endpos cenlen))
+                       (locpos (- cenpos cenoff)))
+                  (if (and (= (zip-u32 tail i) zip-endsig)
+                           (or (= (+ i zip-endhdr comlen) n)
+                               (and (>= cenpos 0) (>= locpos 0)
+                                    (sig-at? cenpos zip-censig)
+                                    (sig-at? locpos zip-locsig))))
+                      (let ((comment (let ((c (make-bytevector (min comlen (- n i zip-endhdr)))))
+                                       (bytevector-copy! tail (+ i zip-endhdr) c 0 (bytevector-length c))
+                                       c)))
+                        ;; a Zip64 END record is consulted when the locator is
+                        ;; there and its record agrees with this one on every
+                        ;; field this one does not mark as overflowed (lines
+                        ;; 1614-1644); it then supplies all three, and its
+                        ;; position is where the central directory ends
+                        (let ((loc (and (>= endpos zip64-lochdr)
+                                        (zip-file-bytes in size (- endpos zip64-lochdr) zip64-lochdr))))
+                          (if (and loc (= (zip-u32 loc 0) zip64-locsig))
+                              (let* ((end64pos (zip-u64 loc 8))
+                                     (end64 (zip-file-bytes in size end64pos zip64-endhdr)))
+                                (if (and end64 (= (zip-u32 end64 0) zip64-endsig))
+                                    (let ((cenlen64 (zip-u64 end64 40))
+                                          (cenoff64 (zip-u64 end64 48))
+                                          (total64 (zip-u64 end64 32)))
+                                      (if (or (and (not (= cenlen64 cenlen)) (not (= cenlen #xFFFFFFFF)))
+                                              (and (not (= cenoff64 cenoff)) (not (= cenoff #xFFFFFFFF)))
+                                              (and (not (= total64 total)) (not (= total zip64-magiccount))))
+                                          (list endpos cenlen cenoff total comment)
+                                          (list end64pos cenlen64 cenoff64 total64 comment)))
+                                    (list endpos cenlen cenoff total comment)))
+                              (list endpos cenlen cenoff total comment))))
+                      (loop (- i 1)))))))))
 
 ;; Read the central directory of the archive at PATH. CODER is the charset's
 ;; canonical name in lower case for names and comments, or #f for UTF-8; an
@@ -143,6 +167,16 @@
 ;; ZipCoder does. Every refusal is the JDK's: a directory or missing file the
 ;; open reports, an empty file, a file with no END record, and each CEN
 ;; inconsistency initCEN and checkAndAddEntry check.
+;;
+;; The central directory starts cenlen bytes BEFORE the END record, and the
+;; first local header cenoff bytes before that (initCEN lines 1665-1673): the
+;; offsets an archive states count from its own first byte, and a stub written
+;; before it — the shell line that makes a jar executable — moves every one by
+;; its length without rewriting them. That length, locpos, is added to each
+;; entry's local-header offset here, so the rest of the file reads positions.
+;; The END record's entry count is a hint the JDK does not enforce (it counts
+;; the headers it walks, lines 1712-1756); the count that must agree is the
+;; walk's own, which ends exactly at the record.
 (define (zipdir-read path coder . rest)
   (define name (and (pair? rest) (car rest)))
   (let ((in (guard (e (#t (zip-throw "java.nio.file.NoSuchFileException" (or name path))))
@@ -155,73 +189,79 @@
           (let-values (((endpos cenlen cenoff total comment)
                         (apply values (or (zipdir-find-end in size)
                                           (zip-zerror "zip END header not found")))))
-            (when (> (+ cenoff cenlen) endpos)
+            (when (> cenlen endpos)
               (zip-zerror "invalid END header (bad central directory size)"))
-            (when (> cenlen (- endpos cenoff))
-              (zip-zerror "invalid END header (bad central directory offset)"))
-            (let ((cen (zip-file-bytes in size cenoff cenlen)))
-              (unless cen (zip-zerror "invalid END header (bad central directory offset)"))
-              (let ((table (make-hashtable string-hash string=?))
-                    (decode (lambda (bv flag)
-                              (if (or (not coder) (not (zero? (bitwise-and flag zip-use-utf8))))
-                                  (zip-decode-utf8 bv)
-                                  (zip-decode-charset bv coder)))))
-                (let loop ((pos 0) (acc '()) (count 0))
-                  (cond
-                    ((>= pos cenlen)
-                     (unless (= pos cenlen) (zip-zerror "invalid CEN header (bad header size)"))
-                     (unless (= count total) (zip-zerror "invalid END header (bad central directory size)"))
-                     (make-zipdir path
-                                  (and (> (bytevector-length comment) 0)
-                                       (decode comment 0))
-                                  table
-                                  (list->vector (reverse acc))))
-                    (else
-                     (when (> (+ pos zip-cenhdr) cenlen)
-                       (zip-zerror "invalid CEN header (bad header size)"))
-                     (unless (= (zip-u32 cen pos) zip-censig)
-                       (zip-zerror "invalid CEN header (bad signature)"))
-                     (let* ((flag (zip-u16 cen (+ pos 8)))
-                            (method (zip-u16 cen (+ pos 10)))
-                            (xdostime (zip-u32 cen (+ pos 12)))
-                            (crc (zip-u32 cen (+ pos 16)))
-                            (csize (zip-u32 cen (+ pos 20)))
-                            (size (zip-u32 cen (+ pos 24)))
-                            (nlen (zip-u16 cen (+ pos 28)))
-                            (elen (zip-u16 cen (+ pos 30)))
-                            (clen (zip-u16 cen (+ pos 32)))
-                            (off (zip-u32 cen (+ pos 42)))
-                            (hlen (+ zip-cenhdr nlen elen clen)))
-                       (when (not (zero? (bitwise-and flag 1)))
-                         (zip-zerror "invalid CEN header (encrypted entry)"))
-                       (unless (or (= method zip-stored) (= method zip-deflated))
-                         (zip-zerror (string-append "invalid CEN header (bad compression method: "
-                                                    (number->string method) ")")))
-                       (when (> (+ pos hlen) cenlen)
+            (let* ((cenpos (- endpos cenlen))
+                   (locpos (- cenpos cenoff)))
+              (when (< locpos 0)
+                (zip-zerror "invalid END header (bad central directory offset)"))
+              (when (> total (quotient cenlen zip-cenhdr))
+                (zip-zerror "invalid END header (total entries count too large)"))
+              (let ((cen (zip-file-bytes in size cenpos cenlen)))
+                (unless cen (zip-zerror "read CEN tables failed"))
+                (let ((table (make-hashtable string-hash string=?))
+                      (decode (lambda (bv flag)
+                                (if (or (not coder) (not (zero? (bitwise-and flag zip-use-utf8))))
+                                    (zip-decode-utf8 bv)
+                                    (zip-decode-charset bv coder)))))
+                  (let loop ((pos 0) (acc '()))
+                    (cond
+                      ((>= pos cenlen)
+                       (unless (= pos cenlen) (zip-zerror "invalid CEN header (bad header size)"))
+                       (make-zipdir path
+                                    (and (> (bytevector-length comment) 0)
+                                         (decode comment 0))
+                                    table
+                                    (list->vector (reverse acc))))
+                      (else
+                       (when (> (+ pos zip-cenhdr) cenlen)
                          (zip-zerror "invalid CEN header (bad header size)"))
-                       (let* ((name-bv (let ((b (make-bytevector nlen)))
-                                         (bytevector-copy! cen (+ pos zip-cenhdr) b 0 nlen) b))
-                              (extra (and (> elen 0)
-                                          (let ((b (make-bytevector elen)))
-                                            (bytevector-copy! cen (+ pos zip-cenhdr nlen) b 0 elen) b)))
-                              (comment-bv (and (> clen 0)
-                                               (let ((b (make-bytevector clen)))
-                                                 (bytevector-copy! cen (+ pos zip-cenhdr nlen elen) b 0 clen) b)))
-                              (name (decode name-bv flag)))
-                         (let-values (((size64 csize64 off64)
-                                       (if extra (zip64-extra-fields extra size csize off) (values #f #f #f))))
-                           (let ((ent (make-zdirent name method flag crc
-                                                    (or csize64 csize) (or size64 size)
-                                                    xdostime extra
-                                                    (and comment-bv (decode comment-bv flag))
-                                                    (or off64 off))))
-                             (when (> (+ (zdirent-loc-offset ent) zip-lochdr) cenoff)
-                               (zip-zerror "invalid CEN header (bad header size)"))
-                             ;; a name that appears twice keeps the first (a
-                             ;; hashtable-ref finds it); every one is enumerated
-                             (unless (hashtable-ref table name #f)
-                               (hashtable-set! table name ent))
-                             (loop (+ pos hlen) (cons ent acc) (+ count 1))))))))))))))
+                       (unless (= (zip-u32 cen pos) zip-censig)
+                         (zip-zerror "invalid CEN header (bad signature)"))
+                       (let* ((flag (zip-u16 cen (+ pos 8)))
+                              (method (zip-u16 cen (+ pos 10)))
+                              (xdostime (zip-u32 cen (+ pos 12)))
+                              (crc (zip-u32 cen (+ pos 16)))
+                              (csize (zip-u32 cen (+ pos 20)))
+                              (size (zip-u32 cen (+ pos 24)))
+                              (nlen (zip-u16 cen (+ pos 28)))
+                              (elen (zip-u16 cen (+ pos 30)))
+                              (clen (zip-u16 cen (+ pos 32)))
+                              (off (zip-u32 cen (+ pos 42)))
+                              (hlen (+ zip-cenhdr nlen elen clen)))
+                         (when (not (zero? (bitwise-and flag 1)))
+                           (zip-zerror "invalid CEN header (encrypted entry)"))
+                         (unless (or (= method zip-stored) (= method zip-deflated))
+                           (zip-zerror (string-append "invalid CEN header (bad compression method: "
+                                                      (number->string method) ")")))
+                         (when (> (+ pos hlen) cenlen)
+                           (zip-zerror "invalid CEN header (bad header size)"))
+                         (let* ((name-bv (let ((b (make-bytevector nlen)))
+                                           (bytevector-copy! cen (+ pos zip-cenhdr) b 0 nlen) b))
+                                (extra (and (> elen 0)
+                                            (let ((b (make-bytevector elen)))
+                                              (bytevector-copy! cen (+ pos zip-cenhdr nlen) b 0 elen) b)))
+                                (comment-bv (and (> clen 0)
+                                                 (let ((b (make-bytevector clen)))
+                                                   (bytevector-copy! cen (+ pos zip-cenhdr nlen elen) b 0 clen) b)))
+                                (name (decode name-bv flag)))
+                           (let-values (((size64 csize64 off64)
+                                         (if extra (zip64-extra-fields extra size csize off) (values #f #f #f))))
+                             (let ((ent (make-zdirent name method flag crc
+                                                      (or csize64 csize) (or size64 size)
+                                                      xdostime extra
+                                                      (and comment-bv (decode comment-bv flag))
+                                                      (+ locpos (or off64 off)))))
+                               ;; the local header must lie before the central
+                               ;; directory (the JDK finds out when the entry is
+                               ;; opened: initDataOffset's "invalid LOC header")
+                               (when (> (+ (zdirent-loc-offset ent) zip-lochdr) cenpos)
+                                 (zip-zerror "invalid CEN header (bad header size)"))
+                               ;; a name that appears twice keeps the first (a
+                               ;; hashtable-ref finds it); every one is enumerated
+                               (unless (hashtable-ref table name #f)
+                                 (hashtable-set! table name ent))
+                               (loop (+ pos hlen) (cons ent acc)))))))))))))))
       (lambda () (close-port in)))))
 
 ;; Where ENT's data starts in the file, from its local header (ZipFile.java

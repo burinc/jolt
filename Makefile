@@ -1149,8 +1149,8 @@ parkcheck:
 # jolt.host/sh is Chez's `system`, which is cmd.exe on Windows: `mkdir -p a/b`
 # there creates a directory named `-p`, and mv/rm/touch/test/find are not
 # commands at all. So the resolver does its filesystem work through filesystem
-# calls, and the shell is left for git, which is a real program; jars extract in
-# process. The two spellings look alike in the source, so the rule is checked
+# calls, and the shell is left for git, which is a real program; jars are read in
+# place. The two spellings look alike in the source, so the rule is checked
 # rather than remembered.
 shelloutcheck:
 	@sh host/chez/shellout-check.sh

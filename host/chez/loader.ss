@@ -347,7 +347,7 @@
 (define (ldr-root-file root name)
   (let ((d (root-jar-index root)))
     (if d
-        (and (zipdir-has? d name) (make-jar-path (jfile-abs root) name))
+        (and (zipdir-has? d name) (make-jar-path (root-path-abs root) name))
         (let ((f (string-append root "/" name)))
           (and (file-exists? f) f)))))
 ;; The source of REL on ROOT: the first extension present, in ldr-source-exts

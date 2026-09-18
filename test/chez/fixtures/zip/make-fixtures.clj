@@ -102,5 +102,19 @@
                                 [["first.txt" (utf8 (str/join (repeat 20 "no signature\n")))]
                                  ["second.txt" (utf8 "second entry\n")]])
 
+;; Two archives the JDK opens that a reader trusting the END record's offsets
+;; does not: stored.zip behind the shell line that makes a jar executable (every
+;; offset it states is short by the stub's length — ZipFile finds the central
+;; directory from the END record and adds the difference to each local header),
+;; and mixed.zip with eight bytes after its END record (the comment length no
+;; longer reaches the end of the file; ZipFile verifies the CEN and LOC
+;; signatures instead of scanning on).
+(with-open [out (io/output-stream (io/file dir "prefixed.zip"))]
+  (.write out (utf8 "#!/bin/sh\nexec java -jar \"$0\" \"$@\"\n"))
+  (io/copy (io/file dir "stored.zip") out))
+(with-open [out (io/output-stream (io/file dir "padded.zip"))]
+  (io/copy (io/file dir "mixed.zip") out)
+  (.write out (byte-array 8)))
+
 (println "wrote" (count (filter #(str/ends-with? (.getName ^java.io.File %) ".zip") (.listFiles dir)))
          "archives in" (str dir))

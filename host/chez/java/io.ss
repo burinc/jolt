@@ -1680,16 +1680,21 @@
 ;; base every other filesystem touch uses, dropping a leading "./" so the path
 ;; reads like the JVM's instead of carrying a "/./" segment.
 (define (resource-file-url root nm)
-  (let* ((rel (string-append root "/" nm))
-         (rel (if (and (>= (string-length rel) 2)
-                       (char=? (string-ref rel 0) #\.)
-                       (char=? (string-ref rel 1) #\/))
-                  (substring rel 2 (string-length rel))
-                  rel)))
-    (make-url (string-append "file:" (jfile-abs rel)))))
+  (make-url (string-append "file:" (root-path-abs (string-append root "/" nm)))))
+;; A path under a source root made absolute for a URL: the roots are spelled as
+;; deps.edn spells them ("./src", "./lib.jar"), and the JVM's URL for a resource
+;; carries no "./" segment, so a leading one is dropped before the cwd is put in
+;; front. Directory and jar roots alike (resource-jar-url, loader.ss
+;; ldr-root-file, whose spelling is *file* and the AOT cache's key).
+(define (root-path-abs p)
+  (jfile-abs (if (and (>= (string-length p) 2)
+                      (char=? (string-ref p 0) #\.)
+                      (char=? (string-ref p 1) #\/))
+                 (substring p 2 (string-length p))
+                 p)))
 ;; The jar: URL for `nm` inside the jar at root JAR, absolute like the file: one.
 (define (resource-jar-url jar nm)
-  (make-url (make-jar-path (jfile-abs jar) nm)))
+  (make-url (make-jar-path (root-path-abs jar) nm)))
 ;; The candidate for NM on ROOT, as (path-or-#f . url-thunk): a directory root's
 ;; file, or a jar root's entry (loader.ss root-jar-index says which roots are
 ;; jars). The path is what the AOT cache is told about; for a jar it is the
@@ -1698,7 +1703,7 @@
 (define (resource-candidate root nm)
   (let ((d (root-jar-index root)))
     (if d
-        (let ((p (make-jar-path (jfile-abs root) nm)))
+        (let ((p (make-jar-path (root-path-abs root) nm)))
           (cons p (and (zipdir-has? d nm) (lambda () (resource-jar-url root nm)))))
         (let ((cand (string-append root "/" nm)))
           (cons cand (and (file-exists? cand) (lambda () (resource-file-url root nm))))))))

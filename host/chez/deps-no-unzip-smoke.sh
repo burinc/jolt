@@ -12,7 +12,10 @@
 #   4. a jar whose entry fails its CRC-32 resolves (its directory is whole), and
 #      the require of that entry fails with a ZipException that names the jar,
 #      as reading a damaged entry does;
-#   5. a :local/root jar is its own root too, with no extraction cache.
+#   5. a :local/root jar is its own root too, with no extraction cache;
+#   6. a jar on :paths with a launcher stub before the archive (an executable
+#      jar) loads, and its jar: URLs and *file* are absolute without the root's
+#      "./" spelling.
 #
 # JOLT_BIN is a built jolt, which needs no program on PATH; the gate runs
 # target/release/jolt (make testbin).
@@ -151,6 +154,32 @@ yn "5: a :local/root jar loads in place" \
    "$(printf '%s\n' "$out5" | tail -1 | grep -qx 'jarlib 7' && echo yes || echo no)"
 yn "5: no extraction cache under HOME" \
    "$([ ! -d "$tmp/home5/.jolt/jarlibs" ] && echo yes || echo no)"
+
+# 6. a jar on :paths — a root spelled relative, "./lib.jar" — with a launcher
+# stub before the archive, as an executable jar has: the central directory is
+# found from the END record, so it loads, and its jar: URLs and *file* are
+# absolute with no "./" segment, as a directory root's file: URL is.
+mkdir -p "$tmp/proj6/src/app6"
+printf '(ns pathjar.core)\n(def z 9)\n(def here *file*)\n' > "$tmp/pj.clj"
+printf 'k: v\n' > "$tmp/pj.edn"
+JOLT_PWD="$tmp" JOLT_QUIET=1 "$JOLT" run "$root/tools/mkjar.clj" "$tmp/pj-plain.jar" "pathjar/core.clj=$tmp/pj.clj" "pathjar/res.edn=$tmp/pj.edn" >/dev/null \
+  || { echo "  FAIL: 6: mkjar did not write the jar" >&2; fail=$((fail+1)); }
+{ printf '#!/bin/sh\nexec java -jar "$0" "$@"\n'; cat "$tmp/pj-plain.jar"; } > "$tmp/proj6/lib.jar"
+printf '{:paths ["src" "lib.jar"]}\n' > "$tmp/proj6/deps.edn"
+cat > "$tmp/proj6/src/app6/core.clj" <<'EOF2'
+(ns app6.core (:require [pathjar.core :as p] [clojure.java.io :as io]))
+(defn -main [& _]
+  (println "pathjar" p/z)
+  (println "file" p/here)
+  (println "url" (str (io/resource "pathjar/res.edn"))))
+EOF2
+out6="$(PATH="$empty" JOLT_PWD="$tmp/proj6" JOLT_QUIET=1 "$JOLT" run -m app6.core 2>&1)"
+yn "6: a stub-prefixed jar on :paths loads in place" \
+   "$(printf '%s\n' "$out6" | grep -qx 'pathjar 9' && echo yes || echo no)"
+yn "6: *file* is the absolute jar: path with no ./ segment" \
+   "$(printf '%s\n' "$out6" | grep -qx "file jar:file:$tmp/proj6/lib.jar!/pathjar/core.clj" && echo yes || echo no)"
+yn "6: the resource URL is the absolute jar: URL with no ./ segment" \
+   "$(printf '%s\n' "$out6" | grep -qx "url jar:file:$tmp/proj6/lib.jar!/pathjar/res.edn" && echo yes || echo no)"
 
 echo "deps-no-unzip-smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

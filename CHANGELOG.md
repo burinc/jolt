@@ -140,7 +140,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slice of the file; `ZipOutputStream` writes local headers, data descriptors,
   the central directory and the END record as the JDK writes them, and a time
   set through a `FileTime` travels as the JDK's extended-timestamp block, which
-  both readers take back. `slurp`, `io/copy`, `InputStreamReader`, `with-open`,
+  both readers take back. An archive with a launcher stub before it (an
+  executable jar) or bytes after its END record opens as on the JDK: the
+  central directory is found from the END record, not at the offset the record
+  states, and the stub's length is added to every local header. `slurp`,
+  `io/copy`, `InputStreamReader`, `with-open`,
   `proxy` and `reify` streams work with them, and `with-open` now closes any
   host object whose class has a `close` method. Every binary kind registers
   its zlib under private `jolt_z_*` names when it starts, so a built binary,
