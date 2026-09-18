@@ -1174,7 +1174,8 @@
 ;; Walk top-level forms in a source file and return the list of namespace name
 ;; STRINGS that this file requires (via ns :require/:use clauses and top-level
 ;; require/use forms). Only top-level forms are inspected — no recursion into
-;; subforms (the quoted-data bug ce-scan-requires! has). Specs are parsed through
+;; subforms, the compilation-unit rule ce-scan-requires! follows too (a require
+;; in a fn body registers nothing until it runs). Specs are parsed through
 ;; the shared expand-spec + parse-libspec (loader.ss / ns.ss), matching the
 ;; loader's semantics exactly.
 ;; A libspec that only establishes an alias pulls nothing into the build. At
