@@ -912,8 +912,10 @@
     (nil? root) []
     (= manifest :deps-edn) (filter-deps (:deps edn) root)
     (and (= manifest :mvn) deps) (filter-deps deps root)
-    (and (= manifest :mvn) pom (file-exists? pom))
-    (filter-deps (raw-pom-deps-from pom) root)
+    ;; the pom.xml the jar packages, when no effective POM could be built
+    ;; from a .pom beside it: a jar: path, which raw-pom-deps-from reads out
+    ;; of the archive and answers nil for when the jar holds none
+    (and (= manifest :mvn) pom) (filter-deps (raw-pom-deps-from pom) root)
     :else []))
 
 (defmethod ext/coord-deps :mvn [lib coord] (children-of (mvn-info lib coord)))

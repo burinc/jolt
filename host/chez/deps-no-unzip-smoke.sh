@@ -15,7 +15,10 @@
 #   5. a :local/root jar is its own root too, with no extraction cache;
 #   6. a jar on :paths with a launcher stub before the archive (an executable
 #      jar) loads, and its jar: URLs and *file* are absolute without the root's
-#      "./" spelling.
+#      "./" spelling;
+#   7. the pom.xml a jar packages is consulted for its dependencies when no
+#      .pom sits beside the jar: one it declares resolves and loads, and one no
+#      repository has fails the resolution.
 #
 # JOLT_BIN is a built jolt, which needs no program on PATH; the gate runs
 # target/release/jolt (make testbin).
@@ -26,11 +29,15 @@ cd "$root" || exit 1
 JOLT="${JOLT_BIN:-target/release/jolt}"
 case "$JOLT" in /*) ;; *) JOLT="$root/$JOLT" ;; esac
 pass=0; fail=0
-# Hermetic: no user deps.edn, and the default Maven layout.
+# Hermetic: no user deps.edn, the default Maven layout, and an AOT cache of its
+# own — the rows that read *file* out of a jar-loaded namespace see the source
+# path only when the namespace is COMPILED; a fasl hit in ~/.jolt/aot-cache from
+# an earlier run reads the requiring file's *file*, as a JVM AOT class does.
 export JOLT_NO_USER_DEPS=1
 unset JOLT_MVNLIBS GRENADINE_MAVEN_REPOSITORY
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+export JOLT_CACHE_DIR="$tmp/aot-cache"
 
 # label, then a yes/no word
 yn() { if [ "$2" = "yes" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL: $1" >&2; fi; }
@@ -180,6 +187,37 @@ yn "6: *file* is the absolute jar: path with no ./ segment" \
    "$(printf '%s\n' "$out6" | grep -qx "file jar:file:$tmp/proj6/lib.jar!/pathjar/core.clj" && echo yes || echo no)"
 yn "6: the resource URL is the absolute jar: URL with no ./ segment" \
    "$(printf '%s\n' "$out6" | grep -qx "url jar:file:$tmp/proj6/lib.jar!/pathjar/res.edn" && echo yes || echo no)"
+
+# 7. the pom.xml a jar packages under META-INF is consulted for its
+# dependencies when there is no .pom beside it — a :local/root jar, or a Maven
+# jar whose .pom could not be fetched. The jar's pom.xml names a second
+# artifact in the offline repository, which must resolve and load; a pom.xml
+# naming an artifact no repository has must fail the resolution, not drop it.
+pom frompom
+printf '(ns frompom.core)\n(def w 3)\n' > "$tmp/frompom.clj"
+JOLT_PWD="$tmp" JOLT_QUIET=1 "$JOLT" run "$root/tools/mkjar.clj" "$m2/org/example/frompom/1.0.0/frompom-1.0.0.jar" "frompom/core.clj=$tmp/frompom.clj" >/dev/null \
+  || { echo "  FAIL: 7: mkjar did not write frompom" >&2; fail=$((fail+1)); }
+printf '<project><modelVersion>4.0.0</modelVersion><groupId>local</groupId><artifactId>withpom</artifactId><version>1</version><dependencies><dependency><groupId>org.example</groupId><artifactId>frompom</artifactId><version>1.0.0</version></dependency></dependencies></project>\n' > "$tmp/withpom.xml"
+printf '(ns withpom.core (:require [frompom.core :as f]))\n(def total (+ f/w 4))\n' > "$tmp/withpom.clj"
+mkdir -p "$tmp/proj7/src/app7"
+JOLT_PWD="$tmp" JOLT_QUIET=1 "$JOLT" run "$root/tools/mkjar.clj" "$tmp/proj7/withpom.jar" "withpom/core.clj=$tmp/withpom.clj" "META-INF/maven/local/withpom/pom.xml=$tmp/withpom.xml" >/dev/null \
+  || { echo "  FAIL: 7: mkjar did not write withpom" >&2; fail=$((fail+1)); }
+printf '{:paths ["src"] :deps {local/withpom {:local/root "withpom.jar"}}}\n' > "$tmp/proj7/deps.edn"
+printf '(ns app7.core (:require [withpom.core :as w]))\n(defn -main [& _] (println "withpom" w/total))\n' > "$tmp/proj7/src/app7/core.clj"
+out7="$(PATH="$empty" JOLT_PWD="$tmp/proj7" JOLT_QUIET=1 JOLT_MAVEN_REPOSITORY="$m2" "$JOLT" run -m app7.core 2>&1)"
+yn "7: a dependency declared in the jar's own pom.xml resolves and loads" \
+   "$(printf '%s\n' "$out7" | grep -qx 'withpom 7' && echo yes || echo no)"
+printf '<project><modelVersion>4.0.0</modelVersion><groupId>local</groupId><artifactId>nopom</artifactId><version>1</version><dependencies><dependency><groupId>org.example</groupId><artifactId>does-not-exist</artifactId><version>9.9.9</version></dependency></dependencies></project>\n' > "$tmp/nopom.xml"
+mkdir -p "$tmp/proj7b/src/app7b"
+JOLT_PWD="$tmp" JOLT_QUIET=1 "$JOLT" run "$root/tools/mkjar.clj" "$tmp/proj7b/nopom.jar" "withpom/core.clj=$tmp/frompom.clj" "META-INF/maven/local/nopom/pom.xml=$tmp/nopom.xml" >/dev/null \
+  || { echo "  FAIL: 7: mkjar did not write nopom" >&2; fail=$((fail+1)); }
+printf '{:paths ["src"] :deps {local/nopom {:local/root "nopom.jar"}}}\n' > "$tmp/proj7b/deps.edn"
+printf '(ns app7b.core)\n(defn -main [& _] (println "ran"))\n' > "$tmp/proj7b/src/app7b/core.clj"
+out7b="$(PATH="$empty" JOLT_PWD="$tmp/proj7b" JOLT_QUIET=1 JOLT_MAVEN_REPOSITORY="$m2" "$JOLT" run -m app7b.core 2>&1)"
+yn "7: a dependency the jar's pom.xml declares that no repository has fails the resolution" \
+   "$(printf '%s' "$out7b" | grep -q 'does-not-exist' && echo yes || echo no)"
+yn "7: the program did not run without it" \
+   "$(printf '%s\n' "$out7b" | grep -qx 'ran' && echo no || echo yes)"
 
 echo "deps-no-unzip-smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
