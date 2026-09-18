@@ -10,11 +10,17 @@
 (define-record-type zdeflater
   (fields zs mu
           (mutable input) (mutable pos) (mutable lim)
+          (mutable input-buffer)          ; the ByteBuffer INPUT was copied from, or #f
           (mutable level) (mutable strategy) (mutable set-params)
           (mutable applied-level) (mutable applied-strategy) (mutable started)
           (mutable finish) (mutable finish-sent) (mutable finished)
           (mutable read) (mutable written))
-  (nongenerative jolt-zdeflater-v3))
+  (nongenerative jolt-zdeflater-v4))
+
+;; The input ByteBuffer's position follows what the engine consumed.
+(define (zdeflater-sync-buffer! st)
+  (let ((b (zdeflater-input-buffer st)))
+    (when b (zip-buffer-consumed! b (- (zdeflater-lim st) (zdeflater-pos st))))))
 
 ;; The input one zlib call gets: at most SIZE bytes of ARRAY from POS to LIM.
 (define (zdeflater-window array pos lim size)
@@ -63,7 +69,7 @@
                                    (if (= code z-version-error)
                                        zip-version-error-message
                                        "unknown error initializing zlib library"))))))
-      (let* ((st (make-zdeflater zs (make-mutex) (make-bytevector 0) 0 0
+      (let* ((st (make-zdeflater zs (make-mutex) (make-bytevector 0) 0 0 #f
                                  level 0 #f level 0 #f #f #f #f 0 0))
              (self (make-jhost "zip-deflater" st)))
         (zstream-guard! self zs (zdeflater-mu st))
@@ -71,13 +77,24 @@
 
 ;; setInput(byte[]) | setInput(byte[], off, len)
 (define (deflater-set-input! self . args)
-  (let-values (((bv off len more) (zip-array-args "setInput" self args "input")))
-    (deflater-locked self
-      (lambda (st)
-        (zdeflater-input-set! st (car args))
-        (zdeflater-pos-set! st off)
-        (zdeflater-lim-set! st (+ off len))))
-    jolt-nil))
+  (if (and (null? (cdr args)) (bb? (car args)))
+      ;; setInput(ByteBuffer): the remaining bytes, and the buffer to advance
+      (let ((arr (zip-buffer-remaining-array (car args))))
+        (deflater-locked self
+          (lambda (st)
+            (zdeflater-input-set! st arr)
+            (zdeflater-pos-set! st 0)
+            (zdeflater-lim-set! st (ja-len arr))
+            (zdeflater-input-buffer-set! st (car args))))
+        jolt-nil)
+      (let-values (((bv off len more) (zip-array-args "setInput" self args "input")))
+        (deflater-locked self
+          (lambda (st)
+            (zdeflater-input-set! st (car args))
+            (zdeflater-pos-set! st off)
+            (zdeflater-lim-set! st (+ off len))
+            (zdeflater-input-buffer-set! st #f)))
+        jolt-nil)))
 
 ;; setDictionary(byte[]) | setDictionary(byte[], off, len); the result check is
 ;; Deflater.c checkSetDictionaryResult.
@@ -116,17 +133,23 @@
           (zdeflater-set-params-set! st #t))))
     jolt-nil))
 
-;; deflate(ByteBuffer, int) is the one two-argument overload; ByteBuffer is out
-;; of scope, so any argument there is not a ByteBuffer. The call casts both
-;; arguments first: nil passes the ByteBuffer cast, so the flush is cast before
-;; the null check.
+;; deflate(ByteBuffer) | deflate(ByteBuffer, int): the output goes into an array
+;; of the buffer's remaining room through the byte[] overload, then into the
+;; buffer, whose position advances by what was produced (Deflater.java lines
+;; 700-760). The call casts both arguments first: nil passes the ByteBuffer
+;; cast, so the flush is cast before the null check.
 (define (deflater-deflate-buffer self b flush)
-  (if (jolt-nil? b)
-      (begin
-        (zip-int-arg flush)
-        (throw-jvm 'NullPointerException
-                   "Cannot invoke \"java.nio.ByteBuffer.isReadOnly()\" because \"output\" is null"))
-      (zip-class-cast b "java.nio.ByteBuffer")))
+  (cond
+    ((jolt-nil? b)
+     (zip-int-arg flush)
+     (throw-jvm 'NullPointerException
+                "Cannot invoke \"java.nio.ByteBuffer.isReadOnly()\" because \"output\" is null"))
+    ((bb? b)
+     (let* ((arr (na-byte-array (max 0 (- (bb-limit b) (bb-pos b)))))
+            (n (jnum->exact (deflater-deflate self arr (->num 0) (->num (ja-len arr)) flush))))
+       (zip-buffer-put! b arr n)
+       (->num n)))
+    (else (zip-class-cast b "java.nio.ByteBuffer"))))
 
 ;; deflate(byte[]) | deflate(byte[], off, len) | deflate(byte[], off, len, flush):
 ;; Deflater.deflate over Deflater.c doDeflate and checkDeflateStatus. A pending
@@ -148,67 +171,75 @@
 ;; 64 KiB window from the input left, with no output room (deflate.c
 ;; deflate_stored), so a stored call is offered the output room plus a window.
 (define (deflater-deflate self . args)
-  (if (= (length args) 2)
-      (deflater-deflate-buffer self (car args) (cadr args))
-      (let-values (((out-bv off len more) (zip-array-args "deflate" self args "output")))
-        (let ((out (car args))
-              (flush (if (pair? more) (car more) z-no-flush)))
-          (unless (memv flush (list z-no-flush z-sync-flush z-full-flush))
-            (zip-throw "java.lang.IllegalArgumentException" #f))
-          (deflater-open self
-            (lambda (st)
-              (let ((zs (zdeflater-zs st)))
-                (let loop ((total 0))
-                  (let* ((pos (zdeflater-pos st))
-                         (lim (zdeflater-lim st))
-                         (size (if (= (zip-deflate-func (zdeflater-applied-level st)) 0)
-                                   (+ (- len total) zip-input-window)
-                                   zip-input-window))
-                         (in (zdeflater-window (zdeflater-input st) pos lim size))
-                         (last? (<= (- lim pos) size))
-                         (pending? (zdeflater-set-params st))
-                         (quiet? (and pending?
-                                      (or (not (zdeflater-started st))
-                                          (and (= (zdeflater-strategy st) (zdeflater-applied-strategy st))
-                                               (= (zip-deflate-func (zdeflater-level st))
-                                                  (zip-deflate-func (zdeflater-applied-level st)))))))
-                         (params? (and pending? (or quiet? last?)))
-                         (mode (cond ((zdeflater-finish-sent st) z-finish)
-                                     ((not last?) z-no-flush)
-                                     ((zdeflater-finish st) z-finish)
-                                     (else flush))))
-                    (let-values (((code consumed produced bytes)
-                                  (if params?
-                                      (zstream-params! zs (zdeflater-level st) (zdeflater-strategy st)
-                                                       in (- len total))
-                                      (zstream-step! zs mode in (- len total)))))
-                      (unless (if params?
-                                  (memv code (list z-ok z-buf-error))
-                                  (memv code (list z-ok z-stream-end z-buf-error)))
-                        (zip-throw "java.lang.InternalError"
-                                   (or (zstream-message zs)
-                                       (if params?
-                                           "unknown error in checkDeflateStatus, setParams case"
-                                           "unknown error in checkDeflateStatus"))))
-                      (zip-store! out (+ off total) bytes produced)
-                      (unless params?
-                        (when (> (- len total) 0) (zdeflater-started-set! st #t))
-                        (when (= mode z-finish) (zdeflater-finish-sent-set! st #t))
-                        (when (= code z-stream-end) (zdeflater-finished-set! st #t)))
-                      (when (and params? (= code z-ok))
-                        (zdeflater-set-params-set! st #f)
-                        (zdeflater-applied-level-set! st (zdeflater-level st))
-                        (zdeflater-applied-strategy-set! st (zdeflater-strategy st)))
-                      (zdeflater-pos-set! st (+ pos consumed))
-                      (zdeflater-read-set! st (+ (zdeflater-read st) consumed))
-                      (zdeflater-written-set! st (+ (zdeflater-written st) produced))
-                      (let ((total (+ total produced)))
-                        (if (and (not last?)
-                                 (not params?)
-                                 (= consumed (bytevector-length in))
-                                 (< total len))
-                            (loop total)
-                            (->num total)))))))))))))
+  (cond
+    ((= (length args) 2)
+     (deflater-deflate-buffer self (car args) (cadr args)))
+    ((and (= (length args) 1) (bb? (car args)))
+     (deflater-deflate-buffer self (car args) (->num z-no-flush)))
+    (else
+     (let ((n (apply deflater-deflate-array self args)))
+       (deflater-locked self zdeflater-sync-buffer!)
+       n))))
+(define (deflater-deflate-array self . args)
+  (let-values (((out-bv off len more) (zip-array-args "deflate" self args "output")))
+    (let ((out (car args))
+          (flush (if (pair? more) (car more) z-no-flush)))
+      (unless (memv flush (list z-no-flush z-sync-flush z-full-flush))
+        (zip-throw "java.lang.IllegalArgumentException" #f))
+      (deflater-open self
+        (lambda (st)
+          (let ((zs (zdeflater-zs st)))
+            (let loop ((total 0))
+              (let* ((pos (zdeflater-pos st))
+                     (lim (zdeflater-lim st))
+                     (size (if (= (zip-deflate-func (zdeflater-applied-level st)) 0)
+                               (+ (- len total) zip-input-window)
+                               zip-input-window))
+                     (in (zdeflater-window (zdeflater-input st) pos lim size))
+                     (last? (<= (- lim pos) size))
+                     (pending? (zdeflater-set-params st))
+                     (quiet? (and pending?
+                                  (or (not (zdeflater-started st))
+                                      (and (= (zdeflater-strategy st) (zdeflater-applied-strategy st))
+                                           (= (zip-deflate-func (zdeflater-level st))
+                                              (zip-deflate-func (zdeflater-applied-level st)))))))
+                     (params? (and pending? (or quiet? last?)))
+                     (mode (cond ((zdeflater-finish-sent st) z-finish)
+                                 ((not last?) z-no-flush)
+                                 ((zdeflater-finish st) z-finish)
+                                 (else flush))))
+                (let-values (((code consumed produced bytes)
+                              (if params?
+                                  (zstream-params! zs (zdeflater-level st) (zdeflater-strategy st)
+                                                   in (- len total))
+                                  (zstream-step! zs mode in (- len total)))))
+                  (unless (if params?
+                              (memv code (list z-ok z-buf-error))
+                              (memv code (list z-ok z-stream-end z-buf-error)))
+                    (zip-throw "java.lang.InternalError"
+                               (or (zstream-message zs)
+                                   (if params?
+                                       "unknown error in checkDeflateStatus, setParams case"
+                                       "unknown error in checkDeflateStatus"))))
+                  (zip-store! out (+ off total) bytes produced)
+                  (unless params?
+                    (when (> (- len total) 0) (zdeflater-started-set! st #t))
+                    (when (= mode z-finish) (zdeflater-finish-sent-set! st #t))
+                    (when (= code z-stream-end) (zdeflater-finished-set! st #t)))
+                  (when (and params? (= code z-ok))
+                    (zdeflater-set-params-set! st #f)
+                    (zdeflater-applied-level-set! st (zdeflater-level st))
+                    (zdeflater-applied-strategy-set! st (zdeflater-strategy st)))
+                  (zdeflater-pos-set! st (+ pos consumed))
+                  (zdeflater-read-set! st (+ (zdeflater-read st) consumed))
+                  (zdeflater-written-set! st (+ (zdeflater-written st) produced))
+                  (let ((total (+ total produced)))
+                    (if (and (not last?)
+                             (not params?)
+                             (= consumed (bytevector-length in))
+                             (< total len))
+                        (loop total)
+                        (->num total))))))))))))
 
 (define (deflater-needs-input? self)
   (deflater-locked self (lambda (st) (= (zdeflater-lim st) (zdeflater-pos st)))))

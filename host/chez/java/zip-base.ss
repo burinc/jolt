@@ -184,3 +184,32 @@
            (lambda () (make-jhost "zip-crc32" (vector 0))))
 (reg-ctor! '("Adler32" "java.util.zip.Adler32")
            (lambda () (make-jhost "zip-adler32" (vector 1))))
+
+;; --- ByteBuffer arguments ----------------------------------------------------
+;; The ByteBuffer overloads of Inflater and Deflater (setInput(ByteBuffer),
+;; inflate(ByteBuffer), deflate(ByteBuffer[, flush])) run on the byte[] engine:
+;; the buffer's remaining bytes are copied into an input array at setInput, and
+;; output is produced into an array of the buffer's remaining room and put
+;; through the buffer, which advances its position by what was produced. The
+;; INPUT buffer's position advances as the engine consumes the array, after
+;; each call, as the JDK advances it during one (java/byte-buffer.ss holds the
+;; buffer's own layout).
+
+;; The remaining bytes of buffer B as a jolt byte-array (a copy).
+(define (zip-buffer-remaining-array b)
+  (let* ((n (max 0 (- (bb-limit b) (bb-pos b))))
+         (arr (na-byte-array n)))
+    (bb-bulk-ref! b (bb-pos b) arr 0 n)
+    arr))
+
+;; Put N bytes of ARR into B at its position and advance the position.
+(define (zip-buffer-put! b arr n)
+  (bb-bulk-set! b (bb-pos b) arr 0 n)
+  (bb-pos! b (+ (bb-pos b) n))
+  n)
+
+;; The input buffer's position after the engine consumed down to REMAINING
+;; bytes of the array copied from it.
+(define (zip-buffer-consumed! b remaining)
+  (bb-pos! b (- (bb-limit b) remaining)))
+

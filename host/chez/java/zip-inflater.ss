@@ -41,9 +41,15 @@
 (define-record-type zinflater
   (fields zs mu
           (mutable input) (mutable pos) (mutable lim)
+          (mutable input-buffer)          ; the ByteBuffer INPUT was copied from, or #f
           (mutable finished) (mutable pending) (mutable need-dict)
           (mutable read) (mutable written))
-  (nongenerative jolt-zinflater-v1))
+  (nongenerative jolt-zinflater-v2))
+
+;; The input ByteBuffer's position follows what the engine consumed.
+(define (zinflater-sync-buffer! st)
+  (let ((b (zinflater-input-buffer st)))
+    (when b (zip-buffer-consumed! b (- (zinflater-lim st) (zinflater-pos st))))))
 
 ;; Run F on the state under the object's lock, as the JDK synchronizes on zsRef.
 (define (inflater-locked self f)
@@ -75,20 +81,31 @@
                            (cond ((= code z-version-error) zip-version-error-message)
                                  ((= code z-stream-error) "inflateInit2 returned Z_STREAM_ERROR")
                                  (else "unknown error initializing zlib library"))))))
-      (let* ((st (make-zinflater zs (make-mutex) (make-bytevector 0) 0 0 #f #f #f 0 0))
+      (let* ((st (make-zinflater zs (make-mutex) (make-bytevector 0) 0 0 #f #f #f #f 0 0))
              (self (make-jhost "zip-inflater" st)))
         (zstream-guard! self zs (zinflater-mu st))
         self))))
 
 ;; setInput(byte[]) | setInput(byte[], off, len)
 (define (inflater-set-input! self . args)
-  (let-values (((bv off len more) (zip-array-args "setInput" self args "input")))
-    (inflater-locked self
-      (lambda (st)
-        (zinflater-input-set! st (car args))
-        (zinflater-pos-set! st off)
-        (zinflater-lim-set! st (+ off len))))
-    jolt-nil))
+  (if (and (null? (cdr args)) (bb? (car args)))
+      ;; setInput(ByteBuffer): the remaining bytes, and the buffer to advance
+      (let ((arr (zip-buffer-remaining-array (car args))))
+        (inflater-locked self
+          (lambda (st)
+            (zinflater-input-set! st arr)
+            (zinflater-pos-set! st 0)
+            (zinflater-lim-set! st (ja-len arr))
+            (zinflater-input-buffer-set! st (car args))))
+        jolt-nil)
+      (let-values (((bv off len more) (zip-array-args "setInput" self args "input")))
+        (inflater-locked self
+          (lambda (st)
+            (zinflater-input-set! st (car args))
+            (zinflater-pos-set! st off)
+            (zinflater-lim-set! st (+ off len))
+            (zinflater-input-buffer-set! st #f)))
+        jolt-nil)))
 
 ;; setDictionary(byte[]) | setDictionary(byte[], off, len); the result check is
 ;; Inflater.c checkSetDictionaryResult.
@@ -111,6 +128,21 @@
 ;; zlib took all of the last one, output room remains, and the stream goes on,
 ;; as the JDK's one call over all the input would.
 (define (inflater-inflate self . args)
+  (cond
+    ;; inflate(ByteBuffer): into an array of the buffer's remaining room, then
+    ;; through the buffer, whose position advances by what came out
+    ;; (Inflater.java lines 400-460)
+    ((and (= (length args) 1) (bb? (car args)))
+     (let* ((b (car args))
+            (arr (na-byte-array (max 0 (- (bb-limit b) (bb-pos b)))))
+            (n (jnum->exact (inflater-inflate self arr (->num 0) (->num (ja-len arr))))))
+       (zip-buffer-put! b arr n)
+       (->num n)))
+    (else
+     (let ((n (apply inflater-inflate-array self args)))
+       (inflater-locked self zinflater-sync-buffer!)
+       n))))
+(define (inflater-inflate-array self . args)
   (let-values (((out-bv off len more) (zip-array-args "inflate" self args "output")))
     (let ((out (car args)))
       (inflater-open self
