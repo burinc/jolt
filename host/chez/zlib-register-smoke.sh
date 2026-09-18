@@ -1,6 +1,7 @@
 #!/bin/sh
 # zlib-register smoke: every kind of binary jolt produces registers the zlib it
-# links under the private jolt_z_* names, and none exports zlib's own names.
+# links under the private jolt_z_* names, none exports zlib's own names, and
+# none loads a zlib or lz4 shared library at run time (the copy is static).
 #
 # The runtime's java.util.zip binds jolt_z_* (host/chez/java/zlib.ss). A binary
 # kind that skips the registration would fall back to whatever zlib the machine
@@ -48,6 +49,24 @@ no_zlib_exports() {
   [ -z "$hits" ] || fail "$2 exports zlib symbols: $(echo "$hits" | tr '\n' ' ')"
 }
 
+# Every platform: the binary must not load a zlib or lz4 library at run time.
+# The registration binds whatever `inflate` the link resolved, and a build.ss
+# fallback from Chez's libz.a to -lz (macOS ships /usr/lib/libz.1.dylib) would
+# register the OS's copy: java.util.zip would work on the build machine and
+# depend on a library the design says every jolt binary bakes in.
+no_zlib_dynamic_dep() {
+  case "$(uname -s)" in
+    Darwin)
+      command -v otool >/dev/null 2>&1 || fail "otool is not on PATH, so $2's load commands cannot be read"
+      hits="$(otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -Ei 'lz4|libz\.' || true)" ;;
+    Linux)
+      command -v readelf >/dev/null 2>&1 || fail "readelf is not on PATH, so $2's NEEDED entries cannot be read"
+      hits="$(readelf -d "$1" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | grep -Ei 'lz4|libz\.' || true)" ;;
+    *) return 0 ;;
+  esac
+  [ -z "$hits" ] || fail "$2 loads a compression library at run time instead of its own static copy: $(echo "$hits" | tr '\n' ' ')"
+}
+
 echo "zlib-register smoke: script mode has no registration"
 got="$(bin/jolt -e "$probe" 2>&1 | tail -1)"
 [ "$got" = "false" ] || fail "bin/jolt -e probe — want false, got \`$got\`"
@@ -58,6 +77,7 @@ if [ "$jolt" != "bin/jolt" ]; then
   got="$("$jolt" -e "$probe" 2>&1 | tail -1)"
   [ "$got" = "true" ] || fail "$jolt -e probe — want true, got \`$got\`"
   no_zlib_exports "$joltabs" "the jolt binary"
+  no_zlib_dynamic_dep "$joltabs" "the jolt binary"
   passed jolt-binary
 else
   skip_or_fail "the jolt binary and both stubs (JOLT_BIN is bin/jolt)" "jolt-binary and stubs"
@@ -93,6 +113,7 @@ if [ "$jolt" != "bin/jolt" ]; then
   fi
   check_app "$work/stub-app" "prebuilt-stub app"
   no_zlib_exports "$work/stub-app" "the prebuilt-stub app"
+  no_zlib_dynamic_dep "$work/stub-app" "the prebuilt-stub app"
   passed prebuilt-stub
 fi
 
@@ -124,6 +145,7 @@ EOF
     grep -q 'relinking launcher stub' "$work/relink.log" || { cat "$work/relink.log"; fail "the :static build did not relink the stub"; }
     check_app "$work/relink-app" "relinked-stub app"
     no_zlib_exports "$work/relink-app" "the relinked-stub app"
+    no_zlib_dynamic_dep "$work/relink-app" "the relinked-stub app"
     passed relinked-stub
   fi
 fi
@@ -152,6 +174,7 @@ if ! JOLT_NO_DEVCACHE=1 JOLT_PWD="$app" bin/jolt build -m zr.main -o "$work/cc-a
 fi
 check_app "$work/cc-app" "C-compiler-path app"
 no_zlib_exports "$work/cc-app" "the C-compiler-path app"
+no_zlib_dynamic_dep "$work/cc-app" "the C-compiler-path app"
 passed cc-path
 
 # 4. the library stub (bld-library-stub)
@@ -195,6 +218,7 @@ cc -O2 "$work/driver.c" -ldl -o "$work/driver" 2>"$work/driver.err" || { cat "$w
 got="$("$work/driver" "$lib" 2>&1)"
 [ "$got" = "1" ] || fail "library zlib_registered — want 1, got \`$got\`"
 no_zlib_exports "$lib" "the shared library"
+no_zlib_dynamic_dep "$lib" "the shared library"
 passed library
 
 finish

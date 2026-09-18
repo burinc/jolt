@@ -329,9 +329,17 @@ jobs:
           bin=target/release/jolt
           if [ "${{ runner.os }}" = "macOS" ]; then
             otool -L "$bin"
-            # Every load command must resolve inside the OS itself.
+            # Every load command must resolve inside the OS itself, and none
+            # may be a compression library: macOS ships /usr/lib/libz.1.dylib,
+            # so a build.ss fallback from Chez's libz.a to -lz would pass the
+            # first test and still leave java.util.zip (#916) on a zlib the
+            # binary did not bake in. jolt_register_zlib binds whatever
+            # `inflate` linked, which must be the static copy.
             bad="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
                    | grep -Ev '^(/usr/lib/|/System/Library/)' || true)"
+            zbad="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
+                   | grep -Ei 'lz4|libz\.' || true)"
+            bad="$(printf '%s\n%s' "$bad" "$zbad" | sed '/^$/d')"
           else
             readelf -d "$bin" | grep NEEDED || true
             # ncurses/tinfo/uuid are the Linux build's own story (STATIC_DEPS,
