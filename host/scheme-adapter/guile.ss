@@ -74,6 +74,10 @@
 ;;                                        open-pipe/open-process candidates.
 ;;                                        must verify: contract requires raise 'unsupported
 ;;                                        on targets without subprocess support.
+;;   sa-environment-pairs   UNIMPLEMENTED  Guile: (environ) -> "K=V" strings, split on
+;;                                        the first "="; the R7RS alist shape.
+;;   sa-os-release          UNIMPLEMENTED  Guile: (utsname:release (uname)) — posix; #f
+;;                                        permitted by contract.
 ;;   sa-gc-collect          UNIMPLEMENTED  Guile: (gc) — may no-op (contract allows).
 ;;   sa-gc-max-generation   UNIMPLEMENTED  ?? Guile uses Boehm GC — no generations.
 ;;   sa-bytes-allocated     UNIMPLEMENTED  ?? (gc-stats) candidate; must verify field/shape.

@@ -683,6 +683,47 @@
         (remove-ns 'libtrans)
         (jolt.host/set-source-roots! roots)))))
 
+;; --- 30. jar roots ----------------------------------------------------------
+;; A context's root may be a jar, read in place as the global roots read one
+;; (jolt issue #1005): the namespace loads out of it, a resource in it resolves
+;; to a jar: URL that opens, and the facade sees both.
+(defcase 30 "a jar root serves its namespaces and resources without extraction"
+  (let [src-dir (-> (root-dir "jarsrc")
+                    (write! "jarlib.clj" "(ns jarlib) (def where :jar) (def here *file*)")
+                    (write! "jarcfg.edn" "{:from :jar}"))
+        jar (str (root-dir "jarroot") "/lib.jar")]
+    (with-open [out (java.util.zip.ZipOutputStream. (java.io.FileOutputStream. jar))]
+      (doseq [name ["jarlib.clj" "jarcfg.edn"]]
+        (.putNextEntry out (java.util.zip.ZipEntry. name))
+        (.write out (.getBytes (slurp (str src-dir "/" name)) "UTF-8"))
+        (.closeEntry out)))
+    (let [ctx (l/classpath [jar] {:parent (l/root)})
+          cl (l/as-classloader ctx)]
+      (l/load ctx {:kind :ns :name "jarlib"})
+      (chk "the namespace loads from the jar"
+           (= :jar (val-of (l/resolve ctx {:kind :var :name "jarlib/where"}))))
+      (chk "*file* names the entry inside the jar"
+           (= (str "jar:file:" jar "!/jarlib.clj")
+              (val-of (l/resolve ctx {:kind :var :name "jarlib/here"}))))
+      (let [hits (l/find ctx {:kind :resource :name "jarcfg.edn"})]
+        (chk "find locates the resource in the jar" (seq hits))
+        (chk "the hit is a jar: location" (str/starts-with? (:url (first hits)) "jar:file:"))
+        (chk "open-hit reads it" (= "{:from :jar}" (slurp (l/open-hit ctx (first hits))))))
+      (chk "getResource answers a jar: URL"
+           (= "jar" (.getProtocol (.getResource cl "jarcfg.edn"))))
+      (chk "getResourceAsStream reads it"
+           (= "{:from :jar}" (slurp (.getResourceAsStream cl "jarcfg.edn"))))
+      (chk "the root does not see the jar's resource" (nil? (io/resource "jarcfg.edn")))
+      (chk "nothing was extracted beside the jar"
+           (= ["lib.jar"] (mapv fs/file-name (fs/list-dir (fs/parent jar)))))
+      (l/unload! ctx))
+    (let [err (try (l/classpath [(str (write! (root-dir "notjar") "x.jar" "nope") "/x.jar")]
+                                {:parent (l/root)})
+                   nil
+                   (catch Exception e e))]
+      (chk "a root that is a file but not an archive is refused eagerly"
+           (= :loader/bad-root (:type (ex-data err)))))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])

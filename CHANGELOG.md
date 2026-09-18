@@ -128,6 +128,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reacquired — so the catch clause runs inside the critical section the wait left.
   (#1011)
 
+- **`java.util.zip`, on the zlib every binary already links.** `Inflater`,
+  `Deflater`, `CRC32`, `Adler32`, `InflaterInputStream`, `DeflaterInputStream`,
+  `DeflaterOutputStream`, `GZIPInputStream`, `GZIPOutputStream`,
+  `ZipInputStream`, `ZipOutputStream`, `ZipFile`, `ZipEntry`, `ZipException`
+  and `DataFormatException`, translated from JDK 21 with its exception classes
+  and messages. The streams stream: the first byte of a decompressing stream
+  does not wait for the end of its input, and 100 MB through
+  `GZIPOutputStream` or `GZIPInputStream` peaks within 2 MB of 1 MB. `ZipFile`
+  reads an archive's central directory once and opens each entry from its own
+  slice of the file; `ZipOutputStream` writes local headers, data descriptors,
+  the central directory and the END record as the JDK writes them, and a time
+  set through a `FileTime` travels as the JDK's extended-timestamp block, which
+  both readers take back. An archive with a launcher stub before it (an
+  executable jar) or bytes after its END record opens as on the JDK: the
+  central directory is found from the END record, not at the offset the record
+  states, and the stub's length is added to every local header. `slurp`,
+  `io/copy`, `InputStreamReader`, `with-open`,
+  `proxy` and `reify` streams work with them, and `with-open` now closes any
+  host object whose class has a `close` method. Every binary kind registers
+  its zlib under private `jolt_z_*` names when it starts, so a built binary,
+  an app, a tree-shaken app and a `--library` need no zlib on the machine, and
+  a zlib loaded through `:jolt/native` does not replace it; the release check
+  refuses a binary that would load a zlib or lz4 library at run time on every
+  platform. Script mode instead binds the process's own zlib or a system libz,
+  so it is the one mode that needs a zlib on the machine. Where the classes
+  differ from JDK 21 — a Zip64 entry, which `ZipInputStream` and
+  `ZipOutputStream` refuse (`ZipFile` reads one), and six smaller cases —
+  `test/conformance/known-divergences.edn` lists them. `jolt.fs` exports `zip`,
+  `unzip`, `gzip` and `gunzip`, and `Files/copy` takes an `InputStream` source
+  and an `OutputStream` target, which they run on — a chunk at a time, as
+  `io/copy` now copies a stream source too, so an entry never has to fit in
+  memory. `ZipFile` reads every entry stream through one file descriptor and
+  holds the streams weakly, as the JDK does. (#916)
+
+- **Maven dependencies load from their jars in place.** A jar on the source
+  roots is read through its central directory: a `require` finds the
+  namespace's source in it, `io/resource` answers a `jar:file:<jar>!/<entry>`
+  URL that `slurp`, `io/reader`, `io/input-stream` and `.openStream` read out of
+  the archive, `*file*` carries that spelling for a namespace loaded from a jar
+  so an error report shows its source lines, and the AOT cache keys a resource
+  read on the entry's content. `jolt.deps` puts the jar itself on the roots —
+  no `<jar>.jolt/` extraction directory, no `.jolt-ok` marker, no `unzip`, and
+  a jar that is not a whole archive (a cut download, a file that is not a jar)
+  fails resolution before anything is cached, naming the jar. A damaged entry
+  is refused where it is read, with the jar and the entry in the message. A
+  `:local/root` jar is its own root too, so the `JOLT_JARLIBS` extraction cache
+  is gone; `JOLT_MVNLIBS` still names a private repository, now holding the
+  jars. `jolt.loader` accepts a jar root. Every `.jar.jolt/` directory an
+  earlier release left beside a jar in `~/.m2` can be deleted. (#988, #1005)
+
 ### Performance
 
 - **Vectors past 32 elements are built in bulk.** `make-pvec` conj'd one
@@ -283,6 +333,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LOCALAPPDATA/Programs`); `JOLT_OPENSSL_LIBDIR` is still tried first. The
   Windows CI job runs the resolver's unit gate and a live fetch through the
   transport with both separator spellings of the download path.
+
+- **`(System/getenv)`, a `ProcessBuilder` child's environment and `os.version`
+  no longer depend on a program being on `PATH`.** The map came from an
+  `env -0` spawned through the shell, so with no `env` on `PATH` it was empty
+  and every child of `ProcessBuilder` started from an empty environment — and
+  on Windows, where the shell is `cmd.exe`, `env` is not a command at all.
+  `os.version` ran `sw_vers` or `uname -r` the same way. The environment is
+  read from the C runtime's own table now (`_NSGetEnviron`, `environ`,
+  `GetEnvironmentStringsW`) and the version from `sysctl` / `uname(2)`; a
+  build's `chmod` no longer has a shell fallback either. The shell-out check
+  covers the runtime — no spawn site may name a program — and the
+  `noexecsmoke` gate proves the three answers with `PATH` empty against a built
+  binary. Besides `git` for git dependencies, jolt runs nothing off the
+  machine.
 
 - **A `require` inside a fn body no longer aliases at compile time.** The
   compiler pre-scanned every top-level form for `(require '[x :as a])`,
@@ -569,6 +633,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   walk: 281 ns on a map and 229 on a Long against ~110 for the tag probe it
   replaced (the probe could not see an extension; the difference is the
   protocol answer).
+
+- **A dependency's `:jolt/provides` claim on a class the runtime provides is
+  dropped with a warning, not refused.** jolt-lang/http-client's `deps.edn`
+  claims `GZIPInputStream`, `GZIPOutputStream`, `InflaterInputStream`,
+  `DeflaterInputStream` and `Inflater`, which this release's runtime provides;
+  under the previous rule every project on any release of http-client stopped
+  at resolution with `claims host classes …, which the runtime already
+  provides`, and the claims are http-client's, so nothing in the project's own
+  `deps.edn` could change that. A claim like that is a library from before the
+  runtime grew the class, not two dependencies disagreeing over one (RFC
+  0014's case), so the runtime's class answers, the library's other claims
+  stand and still autoload it, its install namespace's registrations for the
+  overtaken class land as any library's on a runtime class do, and the warning
+  names the library to upgrade. The refusal remains what it was for: two
+  declared providers of one class.
+
 
 ## [0.8.8] - 2026-09-15
 

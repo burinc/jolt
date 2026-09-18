@@ -1174,7 +1174,8 @@
 ;; Walk top-level forms in a source file and return the list of namespace name
 ;; STRINGS that this file requires (via ns :require/:use clauses and top-level
 ;; require/use forms). Only top-level forms are inspected — no recursion into
-;; subforms (the quoted-data bug ce-scan-requires! has). Specs are parsed through
+;; subforms, the compilation-unit rule ce-scan-requires! follows too (a require
+;; in a fn body registers nothing until it runs). Specs are parsed through
 ;; the shared expand-spec + parse-libspec (loader.ss / ns.ss), matching the
 ;; loader's semantics exactly.
 ;; A libspec that only establishes an alias pulls nothing into the build. At
@@ -2484,6 +2485,7 @@
     (jolt-spill-embedded! "csv/scheme.h" h)
     (jolt-spill-embedded! "csv/libkernel.a" lk)
     (jolt-spill-embedded! "stub/launcher.c" lc)
+    (bld-write-zlib-header! builddir)
     (display "jolt build: relinking launcher stub with static native libraries\n")
     (parameterize ((bld-bundled-archives archives))
       (bld-system (string-append
@@ -2582,16 +2584,17 @@
   (let ((mc (open-output-file main-c 'replace)))
     (put-string mc
       (string-append
-        "#include \"scheme.h\"\n#include \"boot_data.h\"\n"
+        "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
         (bld-boot-prefetch-defn)
         "int main(int argc, char *argv[]) {\n"
         (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
-        "  Sbuild_heap(0, 0);\n"
+        "  Sbuild_heap(0, jolt_register_zlib);\n"
         "  int status = Sscheme_start(argc, (const char **)argv);\n"
         "  Sscheme_deinit();\n  return status;\n}\n"))
     (close-port mc))
+  (bld-write-zlib-header! (path-parent main-c))
   ;; -rdynamic (Linux) exports the executable's symbols into the dynamic table so
   ;; a statically-linked native lib's symbols resolve via (load-shared-object #f)
   ;; at startup. macOS keeps unstripped executable symbols dlsym-visible already.
@@ -2616,9 +2619,18 @@
           ((char=? (string-ref p i) #\/) (substring p (fx+ i 1) (string-length p)))
           (else (loop (fx- i 1))))))
 
+;; Write host/chez/stub/jolt_zlib.h into DIR, beside a generated or spilled C
+;; file that #includes it. bld-source-string reads the binary's embedded copy
+;; (build-jolt.ss registers it) and falls back to the checkout on disk.
+(define (bld-write-zlib-header! dir)
+  (let ((p (open-output-file (string-append dir "/jolt_zlib.h") 'replace)))
+    (put-string p (bld-source-string "host/chez/stub/jolt_zlib.h"))
+    (close-port p)))
+
 (define (bld-library-stub)
   (string-append
     "#include \"scheme.h\"\n"
+    "#include \"jolt_zlib.h\"\n"
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
     (bld-boot-prefetch-defn)
@@ -2633,7 +2645,7 @@
     (bld-boot-prefetch-call)
     "  Sscheme_init(0);\n"
     "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
-    "  Sbuild_heap(0, 0);\n"
+    "  Sbuild_heap(0, jolt_register_zlib);\n"
     "  Sforeign_symbol(\"jolt_set_lookup_addr\", (void*)jolt_set_lookup_addr);\n"
     "  return Sscheme_start(argc, (const char**)argv); }\n"
     "void jolt_library_shutdown(void) { Sscheme_deinit(); }\n"))
@@ -2685,6 +2697,7 @@
       (put-string p (bld-library-stub))
       (close-port p))
     (bld-clear-output! out-path)
+    (bld-write-zlib-header! builddir)
     (bld-system (string-append
       (bld-cc) " " (bld-arch-flag) " -O2 -fPIC "
       ;; -install_name @rpath/<base> so a binary that link-edits against the dylib

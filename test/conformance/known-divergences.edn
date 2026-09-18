@@ -26,7 +26,7 @@
   :upstream-quirk
   "reference Clojure's own inconsistency, not a substrate limit. LazySeq.reify() returns a MUTABLE (new ArrayList(this)) where ASeq.reify() wraps it in Collections.unmodifiableList, so java.util.List's DEFAULT sort and replaceAll — both of which go through listIterator() — mutate a throwaway copy and silently succeed on a lazy seq while refusing on every other seq. jolt refuses on all of them. Reproducing it would mean reproducing a missing wrapper whose only observable is that nothing happens.",
   :restrictive
-  "the JVM supports something jolt does not: mark/reset replay over a non-seekable stream. The narrow direction, so it is NOT a superset — code relying on the JVM capability has no counterpart here",
+  "the JVM supports something jolt does not: mark/reset replay over a non-seekable stream, a Zip64 entry in a ZipInputStream. The narrow direction, so it is NOT a superset — code relying on the JVM capability has no counterpart here",
   :permissive
   "jolt succeeds where the JVM throws, on operations with one reasonable meaning: count works on eduction, keys on a vector of pairs, (empty MapEntry) => []. A superset: portable JVM code behaves identically.",
   :namespace-model
@@ -1318,6 +1318,101 @@
            :jvm "[false false true true]"
            :jolt "[true true true true]"}
    :note "Verified against Clojure 1.12.5. Only the two Java-named members diverge; = , ==, hash and compareTo agree."}
+  ;; io/copy puts bytes into the port directly, not through write(), so after
+  ;; finish() a copy of a few bytes waits in the port's buffer and is refused when
+  ;; it reaches the finished Deflater, at close, where the JDK refuses the write.
+  {:category :host-model
+   :behavior "clojure.java.io/copy of one byte into a DeflaterOutputStream after finish(), then close()"
+   :jvm "the copy throws IOException; close succeeds"
+   :jolt "the copy succeeds; close throws IOException \"write beyond end of stream\""
+   :check {:expr "(let [o (java.util.zip.DeflaterOutputStream. (java.io.ByteArrayOutputStream.))] (.finish o) [(try (clojure.java.io/copy (byte-array 1) o) :no-error (catch java.io.IOException e :refused)) (try (.close o) :closed (catch java.io.IOException e :refused-at-close))])"
+           :jvm "[:refused :closed]"
+           :jolt "[:no-error :refused-at-close]"}
+   :note "write() after finish() throws at the call on both; only a copy that bypasses write() is refused late, and only while it fits the port's buffer: a copy of 128 bytes or more (Chez 10.4.1) fills the buffer during the copy and is refused there, as on the JVM (measured 2026-09-15)."}
+  ;; ZipInputStream refuses a Zip64 entry: a local header size of 0xFFFFFFFF, or a
+  ;; Zip64 block (header ID 0x0001) in the extra field (zip-entries.ss
+  ;; zipin-read-loc; PKWARE APPNOTE 6.3.10 sections 4.4.8-4.4.9, 4.5.3). In the literal, the 20 bytes
+  ;; after the name "z.txt" are that extra field — header ID 1, length 16, then
+  ;; the 8-byte uncompressed and compressed sizes, and "zip64" is the data. JDK 21
+  ;; reads such entries. A scan of 718 Maven jars found none (spec, Archive
+  ;; reading).
+  {:category :restrictive
+   :behavior "getNextEntry on a stored entry whose extra field holds a Zip64 block"
+   :jvm "reads the entry (size 5)"
+   :jolt "throws ZipException \"Zip64 entries are not supported\""
+   :check {:expr "(try (.getSize (.getNextEntry (java.util.zip.ZipInputStream. (java.io.ByteArrayInputStream. (byte-array [80 75 3 4 20 0 0 0 0 0 0 0 0 0 106 -70 55 -49 5 0 0 0 5 0 0 0 5 0 20 0 122 46 116 120 116 1 0 16 0 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0 122 105 112 54 52]))))) (catch java.util.zip.ZipException e (.getMessage e)))"
+           :jvm "5"
+           :jolt "\"Zip64 entries are not supported\""}
+   :note "Unit rows pin both Zip64 shapes jolt-side (unit.edn suite zip)."}
+  ;; ZipOutputStream writes no Zip64 record: an entry whose size, compressed
+  ;; size or offset reaches 0xFFFFFFFF, or an archive with 0xFFFF entries, is
+  ;; refused at the point JDK 21 would write the Zip64 fields (zip-out-entries.ss
+  ;; zipout-write-loc!, zipout-write-cen!, zipout-write-end!). ZipFile reads a
+  ;; Zip64 central directory; only ZipInputStream (above) and the writer refuse.
+  {:category :restrictive
+   :behavior "putNextEntry of a pre-sized entry whose size is 0xFFFFFFFF"
+   :jvm "writes a Zip64 local header"
+   :jolt "throws ZipException \"Zip64 entries are not supported\""
+   :check {:expr "(try (.putNextEntry (java.util.zip.ZipOutputStream. (java.io.ByteArrayOutputStream.)) (doto (java.util.zip.ZipEntry. \"big\") (.setSize 4294967295) (.setCompressedSize 1) (.setCrc 0))) :put (catch java.util.zip.ZipException e (.getMessage e)))"
+           :jvm ":put"
+           :jolt "\"Zip64 entries are not supported\""}
+   :note "A 4 GiB entry through a stream would take the Zip64 data descriptor as well; corpus rows (java.util.zip / ZipOutputStream) pin the 32-bit shapes."}
+  ;; ZipFile.stream() answers a java.util.stream.Stream on the JVM; jolt has no
+  ;; java.util.stream, so the method is not there and entries() is the way to
+  ;; walk an archive.
+  {:category :host-model
+   :behavior "(.stream zip-file)"
+   :jvm "a Stream of the entries"
+   :jolt "no such method"
+   :check {:expr "(with-open [z (java.util.zip.ZipFile. \"test/chez/fixtures/zip/stored.zip\")] (try (.count (.stream z)) (catch IllegalArgumentException e :no-method)))"
+           :jvm "4"
+           :jolt ":no-method"}
+   :note "entries() enumerates every entry (corpus java.util.zip / ZipFile)."}
+  ;; ZipEntry has two one-argument constructors, (String) and (ZipEntry). jolt picks
+  ;; one by the argument's runtime value, so a nil takes the String constructor even
+  ;; under a ^ZipEntry hint, and its NullPointerException names the other
+  ;; parameter.
+  {:category :host-model
+   :behavior "(ZipEntry. e) with e nil and hinted ^ZipEntry"
+   :jvm "NullPointerException \"entry\""
+   :jolt "NullPointerException \"name\""
+   :check {:expr "(try (let [^java.util.zip.ZipEntry e nil] (java.util.zip.ZipEntry. e)) (catch NullPointerException x (.getMessage x)))"
+           :jvm "\"entry\""
+           :jolt "\"name\""}
+   :note "JDK 21 answers by the call's hint: ^String nil is \"name\" as here, ^ZipEntry nil is \"entry\", and an unhinted nil is IllegalArgumentException \"More than one matching method found: java.util.zip.ZipEntry\". jolt reads values, not hints, so all three are \"name\"."}
+  ;; A ZipInputStream name in a charset other than UTF-8, US-ASCII and ISO-8859-1
+  ;; decodes as (String. bytes charset) does (zip-entries.ss zip-decode-charset).
+  ;; jolt has the windows-1252 decoder; one byte it cannot map refuses the whole
+  ;; name, where the JDK's decoder reports only that byte.
+  {:category :host-model
+   :behavior "getNextEntry on a name with byte 0x81 through a windows-1252 ZipInputStream"
+   :jvm "IllegalArgumentException \"java.nio.charset.UnmappableCharacterException: Input length = 1\" on JDK 21; ZipException \"invalid LOC header (bad entry name)\" on JDK 26"
+   :jolt "UnsupportedEncodingException \"windows-1252\""
+   :check :prose
+   :why "The JVM side is not the same on every JDK: 21 raises IllegalArgumentException wrapping UnmappableCharacterException, and 26 raises ZipException \"invalid LOC header (bad entry name)\" before it decodes the name. An entry cannot name a JDK, so a machine check would pin the oracle to one version."
+   :note "UTF-8 names, and names with flag bit 11, decode as JDK 21 decodes them, including the refusal of malformed UTF-8 (corpus java.util.zip / ZipInputStream)."}
+  ;; A name in a charset jolt has but decodes without a reporting decoder: a
+  ;; byte sequence the charset cannot map becomes U+FFFD, where the JDK's decoder
+  ;; refuses it (ZipCoder.java's toString, Temurin OpenJDK 21.0.12.1).
+  {:category :host-model
+   :behavior "getNextEntry on a name with an unpaired surrogate through a UTF-16 ZipInputStream"
+   :jvm "IllegalArgumentException \"java.nio.charset.MalformedInputException: Input length = 4\" on JDK 21; ZipException \"invalid LOC header (bad entry name)\" on JDK 26"
+   :jolt "the name, with the bad sequence as U+FFFD"
+   :check :prose
+   :why "The JVM side is not the same on every JDK: 21 raises IllegalArgumentException wrapping MalformedInputException, and 26 raises ZipException \"invalid LOC header (bad entry name)\" before it decodes the name. An entry cannot name a JDK, so a machine check would pin the oracle to one version."
+   :note "UTF-8, US-ASCII and ISO-8859-1 names refuse bad bytes as JDK 21 does (corpus java.util.zip / ZipInputStream); only a charset decoded through (String. bytes charset) replaces them."}
+  ;; Jolt's java.nio.charset.StandardCharsets constants are strings, so
+  ;; ZipInputStream(in, charset) takes a string where JDK 21 casts the argument to
+  ;; Charset and refuses one (zip-entries.ss make-zip-input-stream). Refusing
+  ;; strings here would refuse StandardCharsets/UTF_8 itself.
+  {:category :host-model
+   :behavior "ZipInputStream(in, charset) with the charset named by a string"
+   :jvm "ClassCastException: a String is not a Charset"
+   :jolt "builds the stream"
+   :check {:expr "(try (str (class (java.util.zip.ZipInputStream. (java.io.ByteArrayInputStream. (byte-array 0)) \"UTF-8\"))) (catch ClassCastException e (.getMessage e)))"
+           :jvm "\"class java.lang.String cannot be cast to class java.nio.charset.Charset (java.lang.String and java.nio.charset.Charset are in module java.base of loader 'bootstrap')\""
+           :jolt "\"class java.util.zip.ZipInputStream\""}
+   :note "A Charset object is taken on both. Corpus rows (java.util.zip / ZipInputStream) pin the charsets a name decodes with."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than

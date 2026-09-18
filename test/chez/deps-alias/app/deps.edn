@@ -32,6 +32,9 @@
   ;; provnest declares javax.crypto.Cipher and requires provinner.install, which
   ;; declares java.security.KeyFactory.
   :prov2  {:extra-deps {local/provnest {:local/root "../provnest"}}}
+  ;; A stale claim: provstale declares java.util.zip.CRC32, which the runtime
+  ;; provides since java.util.zip moved in, alongside a class only it provides.
+  :prov3  {:extra-deps {local/provstale {:local/root "../provstale"}}}
   ;; a dep directory with NO deps.edn defaults to its src path
   :noedn  {:extra-deps {local/libnoedn {:local/root "../libnoedn"}}}
   ;; -X / -T exec fixtures

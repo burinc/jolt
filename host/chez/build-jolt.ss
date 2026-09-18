@@ -225,7 +225,8 @@
         (\"csv/libkernel.a\" \"jolt_libkernel_a\" \"jolt_libkernel_a_len\")
         (\"csv/liblz4.a\" \"jolt_liblz4_a\" \"jolt_liblz4_a_len\")
         (\"csv/libz.a\" \"jolt_libz_a\" \"jolt_libz_a_len\")
-        (\"stub/launcher.c\" \"jolt_launcher_c\" \"jolt_launcher_c_len\")))))
+        (\"stub/launcher.c\" \"jolt_launcher_c\" \"jolt_launcher_c_len\")
+        (\"host/chez/stub/jolt_zlib.h\" \"jolt_zlib_h\" \"jolt_zlib_h_len\")))))
 
 (suppress-greeting #t)
 ;; GC tuning: larger nursery for allocation-heavy workloads. Default 16 MB;
@@ -784,6 +785,10 @@
           (jb-empty-c-array header sym))))
   '("lz4" "z"))
 (jb-c-array "host/chez/stub/launcher.c" (string-append jb-build "/launcherc_data.h") "jolt_launcher_c")
+;; The zlib registration header, for the C files `jolt build` generates or
+;; relinks from this binary with no checkout on disk (build.ss
+;; bld-write-zlib-header!).
+(jb-c-array "host/chez/stub/jolt_zlib.h" (string-append jb-build "/joltzlibh_data.h") "jolt_zlib_h")
 ;; The embedded stdlib fasl blob (one concatenated .so per install-owned ns).
 ;; jb-emit-stdlib-fasls! wrote it during flat.ss emission; it is absent only when
 ;; that step never ran, which never happens in a real build. A 1-byte placeholder
@@ -800,6 +805,7 @@
   (put-string mc
     (string-append
       "#include \"scheme.h\"\n"
+      "#include \"jolt_zlib.h\"\n"
       "#include \"boot_data.h\"\n"
       "#include \"petite_data.h\"\n"
       "#include \"scheme_data.h\"\n"
@@ -809,6 +815,7 @@
       "#include \"lz4_data.h\"\n"
       "#include \"z_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
+      "#include \"joltzlibh_data.h\"\n"
       "#include \"stdlib_fasls_data.h\"\n"
       "#include \"source_blob_data.h\"\n"
       (bld-boot-prefetch-defn)
@@ -818,7 +825,7 @@
       (bld-boot-prefetch-call)
       "  Sscheme_init(0);\n"
       "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
-      "  Sbuild_heap(0, 0);\n"
+      "  Sbuild_heap(0, jolt_register_zlib);\n"
       "  int status = Sscheme_start(argc, (const char **)argv);\n"
       "  Sscheme_deinit();\n  return status;\n}\n"))
   (close-port mc))
@@ -829,6 +836,6 @@
 (bld-system (string-append
   ;; the embedded jolt_* arrays must be foreign-entry-visible at runtime:
   ;; -rdynamic on ELF; on Windows an exe needs an export table (GetProcAddress).
-  (bld-cc) " " (bld-arch-flag) " -O2 " (if (bld-tgt-nt?) "-Wl,--export-all-symbols " "-rdynamic ") "-I'" (bld-csv-dir) "' -I'" jb-build "' '" jb-main-c "' '"
+  (bld-cc) " " (bld-arch-flag) " -O2 " (if (bld-tgt-nt?) "-Wl,--export-all-symbols " "-rdynamic ") "-I'" (bld-csv-dir) "' -I'" jb-build "' -I'host/chez/stub' '" jb-main-c "' '"
   (bld-csv-dir) "/libkernel.a' -o '" jb-out "' " (bld-link-libs)))
 (display (string-append "build-jolt: wrote " jb-out "\n"))

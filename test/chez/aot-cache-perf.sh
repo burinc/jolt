@@ -31,7 +31,7 @@ one_run() {
 }
 median() { echo "$1" | tr ' ' '\n' | grep -E '^[0-9]' | sort -n | sed -n '2p'; }
 
-# pre-warm maven extractions so COLD measures compile, not download/unzip — and
+# pre-warm maven extractions so COLD measures compile, not download/extraction — and
 # check the workload actually RUNS. Timing a command that throws half way through
 # compares two crashes and reports them as a speedup, which is how a broken
 # require sat here unnoticed: every namespace after it was never measured.

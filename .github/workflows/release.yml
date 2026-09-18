@@ -211,7 +211,7 @@ jobs:
           # dir) are visible inside the msys2 shell
           path-type: inherit
           install: >-
-            git make vim unzip zip
+            git make vim zip
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-lz4
             mingw-w64-x86_64-zlib
@@ -329,9 +329,17 @@ jobs:
           bin=target/release/jolt
           if [ "${{ runner.os }}" = "macOS" ]; then
             otool -L "$bin"
-            # Every load command must resolve inside the OS itself.
+            # Every load command must resolve inside the OS itself, and none
+            # may be a compression library: macOS ships /usr/lib/libz.1.dylib,
+            # so a build.ss fallback from Chez's libz.a to -lz would pass the
+            # first test and still leave java.util.zip (#916) on a zlib the
+            # binary did not bake in. jolt_register_zlib binds whatever
+            # `inflate` linked, which must be the static copy.
             bad="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
                    | grep -Ev '^(/usr/lib/|/System/Library/)' || true)"
+            zbad="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
+                   | grep -Ei 'lz4|libz\.' || true)"
+            bad="$(printf '%s\n%s' "$bad" "$zbad" | sed '/^$/d')"
           else
             readelf -d "$bin" | grep NEEDED || true
             # ncurses/tinfo/uuid are the Linux build's own story (STATIC_DEPS,
@@ -348,10 +356,14 @@ jobs:
           echo "no unexpected dynamic dependencies"
 
       # Sanity: the built binary runs (no Chez needed) and self-reports a value.
+      # The gzip round trip goes through the zlib the binary links and registers
+      # as jolt_z_* (java.util.zip, #916).
       - name: Smoke the binary
         run: |
           out="$($JOLT_RUN_PREFIX ./target/release/jolt -e '(reduce + (range 10))')"
           test "$out" = "45" || { echo "jolt -e gave '$out', want 45"; exit 1; }
+          gz="$($JOLT_RUN_PREFIX ./target/release/jolt -e '(let [b (java.io.ByteArrayOutputStream.)] (with-open [o (java.util.zip.GZIPOutputStream. b)] (.write o (.getBytes (apply str (repeat 1000 "zip")) "UTF-8"))) [(count (slurp (java.util.zip.GZIPInputStream. (java.io.ByteArrayInputStream. (.toByteArray b))))) (< (.size b) 100)])')"
+          test "$gz" = "[3000 true]" || { echo "jolt gzip round trip gave '$gz', want [3000 true]"; exit 1; }
 
       # The binary is a self-contained COMPILER: it must `build` an app with no
       # jolt source on disk. Run from an isolated dir (nothing but the tiny app)
@@ -363,11 +375,19 @@ jobs:
           work="$(mktemp -d)"
           mkdir -p "$work/app/src/app"
           printf '{:paths ["src"]}\n' > "$work/app/deps.edn"
-          printf '(ns app.core)\n(defn -main [& _] (println "built:" (reduce + (range 10))))\n' \
-            > "$work/app/src/app/core.clj"
+          cat > "$work/app/src/app/core.clj" <<'EOF'
+          (ns app.core)
+          (defn -main [& _]
+            (println "built:" (reduce + (range 10)))
+            (let [b (java.io.ByteArrayOutputStream.)]
+              (with-open [o (java.util.zip.GZIPOutputStream. b)]
+                (.write o (.getBytes (apply str (repeat 1000 "zip")) "UTF-8")))
+              (println "gzip:" (count (slurp (java.util.zip.GZIPInputStream. (java.io.ByteArrayInputStream. (.toByteArray b))))) (< (.size b) 100))))
+          EOF
           ( cd "$work/app" && $JOLT_RUN_PREFIX "$jolt" build -m app.core -o app )
           out="$($JOLT_RUN_PREFIX "$work/app/app")"
-          test "$out" = "built: 45" || { echo "self-contained build ran '$out', want 'built: 45'"; exit 1; }
+          want="$(printf 'built: 45\ngzip: 3000 true')"
+          test "$out" = "$want" || { echo "self-contained build ran '$out', want '$want'"; exit 1; }
 
       # A built binary must also run the DYNAMIC require path: a namespace not
       # in the static ns graph compiles from the source roots at runtime, so the
