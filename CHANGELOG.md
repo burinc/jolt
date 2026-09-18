@@ -157,7 +157,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ZipOutputStream` refuse (`ZipFile` reads one), and six smaller cases —
   `test/conformance/known-divergences.edn` lists them. `jolt.fs` exports `zip`,
   `unzip`, `gzip` and `gunzip`, and `Files/copy` takes an `InputStream` source
-  and an `OutputStream` target, which they run on. (#916)
+  and an `OutputStream` target, which they run on — a chunk at a time, as
+  `io/copy` now copies a stream source too, so an entry never has to fit in
+  memory. `ZipFile` reads every entry stream through one file descriptor and
+  holds the streams weakly, as the JDK does. (#916)
 
 - **Maven dependencies load from their jars in place.** A jar on the source
   roots is read through its central directory: a `require` finds the
