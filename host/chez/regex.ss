@@ -24,6 +24,10 @@
 ;; quadratic in the DFA size and unbounded in work, which made a large
 ;; alternation take seconds (or never finish) on its first match. See the file.
 (load "host/chez/regex-dfa.ss")
+;; …and its SRE compiler, for single-character anchors: the vendored look-behind
+;; rescans from the chunk start, so `^`/`$`/`\A`/`\Z` anchored patterns were
+;; quadratic. See the file (#1062).
+(load "host/chez/java/regex-anchor-sre.scm")
 
 
 ;; A jolt regex value: the source string (for printing / str) + the LAZILY
