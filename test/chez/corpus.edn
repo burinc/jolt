@@ -2051,6 +2051,13 @@
   {:suite "macros / time, with-redefs, macroexpand" :label "with-redefs restores" :expected "1" :actual "(do (defn wr-g [] 1) (with-redefs [wr-g (fn [] 42)]) (wr-g))" :portability :common}
   {:suite "macros / time, with-redefs, macroexpand" :label "with-redefs restores on throw" :expected "1" :actual "(do (defn wr-h [] 1) (try (with-redefs [wr-h (fn [] 42)] (throw (ex-info \"x\" {}))) (catch :default e nil)) (wr-h))" :portability :common}
   {:suite "macros / time, with-redefs, macroexpand" :label "with-redefs-fn" :expected "42" :actual "(do (defn wr-i [] 1) (with-redefs-fn {(var wr-i) (fn [] 42)} (fn [] (wr-i))))" :portability :common}
+  ;; clojure.core/deref is an ordinary var to a compiled call, as on the JVM: a
+  ;; library that rebinds it (glimmer.ratom does, to make @ track a reactive cell
+  ;; that is not an atom) is seen by every @ / (deref x) / value-position use
+  ;; compiled before or after the rebind. It joined the lowered natives once and
+  ;; every @ in a built app went straight to the host primitive past the rebind.
+  {:suite "macros / time, with-redefs, macroexpand" :label "with-redefs on deref reaches @ inside a fn" :expected "7" :actual "(do (defrecord WrCell [v]) (def wr-orig-deref deref) (with-redefs [deref (fn [x] (if (instance? WrCell x) (:v x) (wr-orig-deref x)))] ((fn [c] @c) (->WrCell 7))))" :portability :common}
+  {:suite "macros / time, with-redefs, macroexpand" :label "with-redefs on deref reaches a value-position deref" :expected "[8 9]" :actual "(do (defrecord WrCell2 [v]) (def wr-orig-deref2 deref) (with-redefs [deref (fn [x] (if (instance? WrCell2 x) (:v x) (wr-orig-deref2 x)))] [(apply deref [(->WrCell2 8)]) (first (map deref [(->WrCell2 9)]))]))" :portability :common}
   {:suite "macros / time, with-redefs, macroexpand" :label "macroexpand full" :expected "true" :actual "(let [e (macroexpand (quote (when-not false 1)))] (= (quote if) (first e)))" :portability :common}
   {:suite "macros / time, with-redefs, macroexpand" :label "macroexpand non-macro" :expected "[1 2]" :actual "(macroexpand (quote [1 2]))" :portability :common}
   {:suite "macros / defmacro arity-clause & name metadata" :label "arity-clause form" :expected "10" :actual "(do (defmacro tw ([x] (list (quote *) x 2))) (tw 5))" :portability :common}
