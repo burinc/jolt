@@ -1074,6 +1074,12 @@
 ;; (s/library.ss) reads on every collect request, which is why every
 ;; collection on every thread, explicit or trip-driven, goes through the copy.
 ;;
+;; The tc mutex goes through the counting pair (locks.ss jolt-lock! /
+;; jolt-unlock!) and the waits through jolt-stop-the-world-wait, the one
+;; condition-wait beneath the fiber layer: a collect request stops the whole
+;; carrier, fibers and all, so this is the wait that must block it whatever is
+;; running there.
+;;
 ;; Contract: ON-STALL receives the number of active threads other than the
 ;; caller, i.e. the threads that have not reached a safe point.
 ;; Degradation: answer #f without installing anything, leaving the target's
@@ -1107,13 +1113,13 @@
            ;; condition-wait's #t is a signal, #f the timeout. On a timeout with
            ;; the request still pending and others still active, report once.
            (define (timed-wait c)
-             (or (condition-wait c tc-mutex timeout)
+             (or (jolt-stop-the-world-wait c tc-mutex timeout)
                  (begin
                    (when (and (pending?) (> (active-threads) 1) (not reported?))
                      (set! reported? #t)
-                     (mutex-release tc-mutex)
+                     (jolt-unlock! tc-mutex)
                      (on-stall (- (active-threads) 1))
-                     (mutex-acquire tc-mutex))
+                     (jolt-lock! tc-mutex))
                    #f)))
            (define (stall-rendezvous)
              (define once
@@ -1124,7 +1130,7 @@
                               "cannot return to the collect-request-handler"))
                    (set! once #t))))
              (dynamic-wind
-               (lambda () (disable-interrupts) (mutex-acquire tc-mutex))
+               (lambda () (disable-interrupts) (jolt-lock! tc-mutex))
                (lambda ()
                  (let f ()
                    (when (pending?)
@@ -1153,7 +1159,7 @@
                        (else
                         (timed-wait collect-cond)
                         (f))))))
-               (lambda () (mutex-release tc-mutex) (enable-interrupts))))
+               (lambda () (jolt-unlock! tc-mutex) (enable-interrupts))))
            (#%$set-top-level-value! '$collect-rendezvous stall-rendezvous)
            #t))))
 

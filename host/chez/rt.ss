@@ -438,9 +438,11 @@
 ;; running jolt through a :collect-safe callback, and in that shape the
 ;; reporting thread is the waiting callback.
 ;;
-;; Installed here, at load, on every driver: unlike the heap ceiling it reads
-;; nothing from the process, and a gate booting the runtime from source needs
-;; it as much as a built binary does.
+;; Installed at the end of this file, at load, on every driver: unlike the
+;; heap ceiling it reads nothing from the process, and a gate booting the
+;; runtime from source needs it as much as a built binary does. At the END so
+;; that everything the report calls (locks.ss, printing.ss, lazy-bridge.ss)
+;; is loaded before the first rendezvous that could take the timeout.
 (define jolt-ffi-callbacks-active (box 0))
 (define jolt-gc-stall-seconds 2)
 (define (jolt-on-foreign-thread?)
@@ -466,8 +468,6 @@
       jolt-gc-stall-seconds unreached (if (= unreached 1) "" "s")
       (if (> callbacks 0) callbacks "")
       (cond ((= callbacks 0) "") ((= callbacks 1) " is") (else "s are")))))
-(define jolt-gc-stall-watch-installed?
-  (sa-gc-install-stall-watch! jolt-gc-stall-seconds jolt-report-gc-stall))
 
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")
@@ -2245,3 +2245,8 @@
 ;; walks jolt collections, var cells and atoms, prints paths through the printers,
 ;; and reads proc-name-tbl to write a fn as its var's name.
 (load "host/chez/state-image.ss")
+
+;; The stall watch (see "a stalled collection says so" above): after every
+;; load, so a rendezvous that times out finds the reporter's dependencies.
+(define jolt-gc-stall-watch-installed?
+  (sa-gc-install-stall-watch! jolt-gc-stall-seconds jolt-report-gc-stall))

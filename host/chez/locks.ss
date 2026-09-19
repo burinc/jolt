@@ -282,6 +282,22 @@
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
      (condition-wait cv mu abs-time))))
 
+;; --- the wait beneath the fiber layer ---------------------------------------
+;; (jolt-stop-the-world-wait cv mu timeout) -> #t signalled | #f timed out
+;;
+;; Chez's condition-wait, for ONE caller: the collection rendezvous the adapter
+;; installs (scheme-adapter-runtime.ss sa-gc-install-stall-watch!), waiting on
+;; the collector's own conditions under the tc mutex. A collect request stops
+;; the whole OS thread — every fiber on the carrier with it — until the
+;; collection has run: parking here would run other Scheme code on a carrier
+;; the collector is waiting to stop, so this wait blocks the carrier whatever
+;; is on it, and the fiber refusal in jolt-condition-wait does not apply. It is
+;; reached with interrupts disabled (the rendezvous mirrors with-tc-mutex), so
+;; no preemption can land inside it either way. Named here rather than
+;; allowlisted so the gate keeps reading "every other condition-wait chose".
+(define (jolt-stop-the-world-wait cv mu timeout)
+  (condition-wait cv mu timeout))
+
 ;; --- waiting for a condition, from a thread OR a fiber ----------------------
 ;; (jolt-cv-wait mu cv deadline decide) -> whatever decide returns
 ;;
