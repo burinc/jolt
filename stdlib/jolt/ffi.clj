@@ -1340,7 +1340,15 @@
 ;; it waits until the call returns — including a :collect-safe callback arriving
 ;; on one of the library's own threads, which is how a request/response pair
 ;; through one native library wedges itself (see foreign-callable below, and
-;; issue #973). A :string ARGUMENT cannot combine with :blocking; pass a
+;; issue #973).
+;; Two things that sentence takes for granted are worth saying out loud. It
+;; assumes the call RETURNS: one that does not, such as a UI run loop or an
+;; event pump entered through the FFI, holds every other thread off the
+;; collector for the rest of the process's life. And it assumes somebody
+;; notices: nothing crashes, the parked thread looks perfectly healthy, and what
+;; stops is work on other threads, arbitrarily far from the call responsible.
+;; Mark anything that can block indefinitely.
+;; A :string ARGUMENT cannot combine with :blocking; pass a
 ;; :pointer (string->ptr, or an arena-owned string) in that position.
 ;; A :& (or :varargs — the same marker, jolt's older spelling) inside the argtype
 ;; vector declares a VARIADIC libc function and marks the boundary: the types
@@ -1524,6 +1532,17 @@
 ;; the more reliably the more the callback allocates. Mark the outbound call
 ;; :blocking and the deadlock cannot form. This is issue #973, and
 ;; test/chez/ffi-foreign-thread-test.sh is the shape.
+;;
+;; That timeout is the C API's rather than jolt's, which is what makes this
+;; failure so often silent. A library whose call carries a deadline reports one,
+;; and that is what the gate above observes. pthread_join, pthread_cond_wait,
+;; dispatch_semaphore_wait under DISPATCH_TIME_FOREVER, WaitForSingleObject
+;; under INFINITE and every other "wait until it is done" entry point have no
+;; deadline to report, so nothing surfaces at all: the process stops, with no
+;; output, no warning and no exit, and nothing pointing back at this paragraph.
+;; Expect silence rather than an error when the call you left unmarked is one of
+;; those, and reach for a stack sample: the calling thread sits in the C wait
+;; and the callback's thread sits in S_condition_wait.
 ;;
 ;; A :collect-safe callback cannot RETURN :string (it hands C an address as it
 ;; deactivates); return a :pointer. A :string ARGUMENT is fine — C owns those
