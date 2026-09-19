@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Performance
+
+- **A built app direct-calls the 49 core natives the boot defines in layers.**
+  The runtime asserts `deref` six times — once per `set!`-extended layer of the
+  procedure behind it (vars, atoms, dynamic bindings, volatiles, futures, the
+  post-prelude pass) — `__close` four, `map?`/`coll?`/`decimal?` three,
+  `var-get`, `with-meta`, `type`, `slurp`, `spit` and thirty-odd more twice,
+  and every one of those read as "a var this program defines more than once",
+  the mark the inline pass and the direct-link rule exist to respect for an
+  APP's own double definitions. So a built app called each of them through the
+  var cell and a generic invoke where `swap!`, asserted once, was a hoisted
+  direct call. A boot re-assertion is not an app redefinition: the mark is
+  cleared the moment the runtime image has finished booting (the same seam the
+  direct-link rule takes its seed-namespace set from), so a var the boot
+  defined twice is one definition with a final root to everything compiled
+  after it, and the app's own redefinitions mark it again from there. In an
+  `--opt` binary `@atom` goes 9.5 → 2.9 ns and `(map? m)` 14.6 → 7.8 ns per
+  call, loop included; against the 0.8.9 binary, stm 0.89x, cst-format 0.92x,
+  metadata 0.94x. What changes for such a site is what direct-linking already
+  meant for every other seed native: a rebind made before the app's namespace
+  loads (a library's `alter-var-root` at its own load, which is how
+  glimmer.ratom rebinds `deref`) is what the site hoists, and one made after
+  the site has loaded is invisible to it; `jolt run` never direct-links.
+  (jolt-o3gy)
+
 ## [0.8.9] - 2026-09-18
 
 The runtime grew in three directions. `jolt.loader` is real: a context loads
