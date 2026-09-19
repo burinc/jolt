@@ -80,21 +80,47 @@
 ;; its own reference type (glimmer.ratom, so @ tracks a reactive cell) has to be
 ;; seen by every @ compiled in the app, in a build as much as under `jolt run`;
 ;; as a native op the site called jolt-deref itself and the rebind reached
-;; nothing. The shape the site takes is the runtime's business — today it is
-;; var-routed even under direct-link, because the boot re-asserts the var once
-;; per layer of jolt-deref and seed-callable? reads that as a redefinition; a
-;; root hoisted at app load would see the rebind just the same.
+;; nothing. Under direct-link the site hoists the var's root at app load, like
+;; any other seed native: the boot asserts deref six times, once per
+;; set!-extended layer of jolt-deref, and that used to read as a redefinition
+;; (var-redefined?) and keep every app call var-routed — the overhead #1008
+;; chased by lowering it. A boot re-assertion is not an app redefinition: the
+;; mark is cleared when the runtime image finishes booting (rt.ss
+;; var-redefined-clear!, at hc-runtime-image-booted!), so a var the boot
+;; defined twice is one definition to everything compiled after it. The
+;; hoist runs after every dependency's top level, so the rebind is seen.
 (let ((e (emit-dl "(def usederef (fn [a] @a))")))
   (gate-check "@ under direct-link does not call jolt-deref" (gate-sub? e "jolt-deref") #f)
-  (run-emit e)
+  (gate-check "@ under direct-link hoists deref's root at load" (gate-sub? e "(jolt-seed-root (jolt-var \"clojure.core\" \"deref\"))") #t)
+  (gate-check "@ under direct-link is not var-routed" (gate-sub? e "jolt-invoke1") #f)
+  ;; The rebind comes FIRST, as a library's does (its top level runs before any
+  ;; namespace that requires it loads), and the site loaded after it hoists the
+  ;; rebound root. A rebind after the site has loaded is invisible to it, as to
+  ;; every direct-linked seed call; `jolt run` never direct-links.
   (let ((cell (jolt-var "clojure.core" "deref")) (orig (var-deref "clojure.core" "deref")))
     (jolt-alter-var-root cell (lambda (old) (lambda (x) 'rebound)))
-    (gate-check "@ under direct-link sees a rebound deref" (call "usederef" 1) 'rebound)
+    (run-emit e)
+    (gate-check "@ loaded after a rebind of deref sees the rebind" (call "usederef" 1) 'rebound)
     (jolt-alter-var-root cell (lambda (old) orig))
-    (gate-check "...and the restore" (call "usederef" (jolt-atom-new 7)) 7)))
+    (run-emit (emit-dl "(def usederef3 (fn [a] @a))"))
+    (gate-check "...and a site loaded after the restore sees the original" (call "usederef3" (jolt-atom-new 7)) 7)))
 (let ((e (emit-nodl "(def usederef2 (fn [a] @a))")))
   (gate-check "@ off direct-link does not call jolt-deref" (gate-sub? e "jolt-deref") #f)
   (gate-check "@ off direct-link is var-routed" (gate-sub? e "jolt-invoke1") #t))
+;; The same for the other boot-layered natives (49 of them: map? and coll?
+;; three times, __close four, var-get/with-meta/type/slurp/spit twice, …): each
+;; is one definition once the image has booted, and direct-calls.
+(gate-check "the boot's re-assertions are not redefinitions once the image has booted"
+            (var-redefined? "clojure.core" "deref") #f)
+(gate-check "seed-callable?: a boot-layered native answers #t" (seed-callable? jolt-nil "clojure.core" "map?" 1) #t)
+(let ((e (emit-dl "(def usemap? (fn [x] (map? x)))")))
+  (gate-check "a boot-layered native hoists its root under direct-link" (gate-sub? e "(jolt-seed-root (jolt-var \"clojure.core\" \"map?\"))") #t)
+  (run-emit e)
+  (gate-check "the hoisted layered native answers" (call "usemap?" (jolt-hash-map)) #t))
+;; ...and an APP var defined twice is still a redefinition after it.
+(ev "(defn twice [] 1)")
+(ev "(defn twice [] 2)")
+(gate-check "an app var defined twice is redefined" (var-redefined? "user" "twice") #t)
 (gate-check "seed-callable?: clojure.core/true? at 1 arg names its binding" (seed-callable? jolt-nil "clojure.core" "true?" 1) "jv$clojure.core$true?")
 (gate-check "seed-callable?: a runtime-defined seed var answers #t" (seed-callable? jolt-nil "clojure.core" "array-map" 2) #t)
 (gate-check "seed-callable?: wrong arity refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "true?" 3)) #t)

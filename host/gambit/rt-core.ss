@@ -536,6 +536,10 @@
 (define var-redefined-set (make-hashtable string-hash string=?))
 (define (var-redefined? ns name)
   (hashtable-contains? var-redefined-set (string-append ns "/" name)))
+;; host-contract.ss (shared) calls this from hc-runtime-image-booted!; no boot
+;; here reaches that seam, so it clears nothing that matters.
+(define (var-redefined-clear!)
+  (hashtable-clear! var-redefined-set))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.

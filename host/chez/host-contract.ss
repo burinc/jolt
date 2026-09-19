@@ -882,6 +882,15 @@
 ;; var table after the image loads for the pass gates. A boot that installs
 ;; nothing (the Gambit host) direct-links no seed var, which is the safe answer.
 (define hc-seed-ns-source #f)
+;; The one seam a driver calls when the runtime image has finished booting —
+;; every namespace with vars is image-defined, no user code has run — with the
+;; thunk that answers that set. Two things follow from "booted": the seed set
+;; the direct-link rule reads, and the end of the boot's own re-assertions of
+;; its natives, which are not redefinitions to anything compiled from here on
+;; (rt.ss var-redefined-clear!).
+(define (hc-runtime-image-booted! source)
+  (set! hc-seed-ns-source source)
+  (var-redefined-clear!))
 (define (hc-seed-ns? ns)
   (and hc-seed-ns-source
        (begin

@@ -1131,10 +1131,32 @@
   v)
 ;; "ns/name" of every var defined more than once with a value. Guarded by
 ;; var-table-mu like the other var-table side sets; reads are single-key.
+;;
+;; "Defined more than once" is about what a PROGRAM does: the inline pass may
+;; not splice a var an app defs twice (passes.clj), and seed-callable? will not
+;; direct-call one the app has redefined (host-contract.ss). The boot itself
+;; asserts many natives more than once — deref six times, one per
+;; set!-extended layer of jolt-deref (vars.ss, atoms.ss, dyn-binding.ss,
+;; natives-transduce.ss, java/concurrency.ss, post-prelude.ss); __close four;
+;; map?, coll?, decimal? three; 49 clojure.core vars in all — and every one of
+;; those read as a redefinition, so a built app called each of them through
+;; the var cell and a generic invoke where swap!, asserted once, was a hoisted
+;; direct call (~12 ns a call, and what #1008 lowered deref to a native op to
+;; escape — which bypassed the var for good and broke a library that rebinds
+;; it, jolt#1045). A boot re-assertion is not an app redefinition: once the
+;; runtime image has finished booting, a var the boot defined twice is one
+;; definition to everything compiled after it, with its root final. The set
+;; is cleared at that point (var-redefined-clear!, from hc-runtime-image-
+;; booted!: loader.ss for the CLI and `jolt build`, gate-boot.ss for the pass
+;; gates) and fills again with the app's own redefinitions. The seed mint
+;; never reaches that point, so core's own double definitions stay marked
+;; while core compiles, which is what the mint's inline pass needs.
 (define var-redefined-set (make-hashtable string-hash string=?))
 (define (var-redefined? ns name)
   (jolt-with-mutex var-table-mu
     (hashtable-contains? var-redefined-set (string-append ns "/" name))))
+(define (var-redefined-clear!)
+  (jolt-with-mutex var-table-mu (hashtable-clear! var-redefined-set)))
 ;; --- linked vars: a root that is also a top-level Scheme binding --------------
 ;; The seed is minted direct-linked (bootstrap.ss): a core def is emitted as
 ;;   (define jv$ns$name <init>)
