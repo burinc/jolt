@@ -103,6 +103,43 @@ done
 [ "$fails" -eq 0 ] || { echo "examples-smoke: manifest is out of sync with the checkout"; exit 1; }
 
 host_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+# Every build and every test task runs under a deadline, and a step that
+# outlives it is a FAIL that names the example — not a job cancelled at its
+# own timeout with nothing in the log to say which step stopped. That is how a
+# runtime regression that hung one example's test (a rebound
+# clojure.core/deref no longer reached compiled @ sites, so glimmer-datastar's
+# SSE body died while its client waited forever; jolt#1045) sat behind four
+# consecutive "cancelled" nightlies that nobody read as red. The deadline is
+# generous — the slowest build here takes under two minutes and the slowest
+# test task under one — so it fires for a hang, not for a slow runner.
+# POSIX sh: a watchdog subshell rather than timeout(1), which macOS lacks; the
+# step's whole process tree is killed, since a task shells out to a `jolt`
+# child and it is that grandchild that hangs.
+DEADLINE_SECS="${EXAMPLES_SMOKE_DEADLINE:-600}"
+kill_tree() {
+  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
+  kill -TERM "$1" 2>/dev/null || true
+}
+# with_deadline <label> <command...>: the command's status, or 124 with a line
+# saying which step did not finish.
+with_deadline() {
+  label=$1; shift
+  "$@" &
+  step=$!
+  ( sleep "$DEADLINE_SECS"; kill_tree "$step"; ) &
+  watchdog=$!
+  wait "$step"; status=$?
+  if kill -0 "$watchdog" 2>/dev/null; then
+    kill_tree "$watchdog"
+    wait "$watchdog" 2>/dev/null || true
+    return "$status"
+  fi
+  wait "$watchdog" 2>/dev/null || true
+  echo "examples-smoke: $label — did not finish within ${DEADLINE_SECS}s (killed)"
+  return 124
+}
+
 while read -r name main test os; do
   [ -n "${name:-}" ] || continue
   if [ -n "${os:-}" ] && [ "$os" != "$host_os" ]; then
@@ -115,7 +152,9 @@ while read -r name main test os; do
   # checkout stays clean for the test run that follows.
   tmp="$(mktemp -d)"
   echo "examples-smoke: $name — build -m $main"
-  if ( cd "$dir" && JOLT_PWD="$(pwd)" "$jolt" build -m "$main" -o "$tmp/$name" ) \
+  if with_deadline "$name build" \
+       sh -c 'cd "$1" && JOLT_PWD="$(pwd)" "$2" build -m "$3" -o "$4"' smoke \
+       "$dir" "$jolt" "$main" "$tmp/$name" \
      && [ -x "$tmp/$name" ]; then
     :
   else
@@ -125,7 +164,9 @@ while read -r name main test os; do
 
   if [ "$test" != "-" ]; then
     echo "examples-smoke: $name — $test"
-    ( cd "$dir" && JOLT_PWD="$(pwd)" "$jolt" "$test" ) || note_fail "$name $test"
+    with_deadline "$name $test" \
+      sh -c 'cd "$1" && JOLT_PWD="$(pwd)" "$2" "$3"' smoke "$dir" "$jolt" "$test" \
+      || note_fail "$name $test"
   fi
 done < "$manifest"
 

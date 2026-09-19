@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the site has loaded is invisible to it; `jolt run` never direct-links.
   (jolt-o3gy)
 
+### Internal
+
+- **The release workflow's examples job names a hung example.** Every build
+  and test task in `ci/examples-smoke.sh` runs under a deadline (600 s,
+  `EXAMPLES_SMOKE_DEADLINE`); a step that outlives it is killed with its
+  process tree and reported as a failure naming the example and the step, and
+  the run goes on. Before this a hang was the whole job cancelled at its own
+  timeout with nothing in the log to say which step stopped, which is how the
+  regression #1045 fixed sat behind four consecutive nightlies. The
+  `:jolt/provides` overtake warning also agrees its verb with its noun now.
+
 ## [0.8.9] - 2026-09-18
 
 The runtime grew in three directions. `jolt.loader` is real: a context loads

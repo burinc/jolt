@@ -687,10 +687,11 @@
          (kept (filter (lambda (c) (not (taken? c))) cs)))
     (when (pair? stale)
       (fprintf (current-error-port)
-               "warning: ~a claims ~a, which this jolt provides; the runtime's ~a answers and the claim is dropped — upgrade ~a\n"
+               "warning: ~a claims ~a, which this jolt provides; the runtime's ~a and the ~a dropped — upgrade ~a\n"
                install-ns
                (fold-left (lambda (a c) (if (string=? a "") c (string-append a ", " c))) "" stale)
-               (if (null? (cdr stale)) "class" "classes")
+               (if (null? (cdr stale)) "class answers" "classes answer")
+               (if (null? (cdr stale)) "claim is" "claims are")
                (if coordinate (jolt-str-render-one coordinate) "the library")))
     (when (pair? kept)
       (let ((p (vector install-ns coordinate kept (box #f))))
