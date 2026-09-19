@@ -1525,6 +1525,17 @@
 ;; :blocking and the deadlock cannot form. This is issue #973, and
 ;; test/chez/ffi-foreign-thread-test.sh is the shape.
 ;;
+;; That timeout is the C API's rather than jolt's, which is what makes this
+;; failure so often silent. A library whose call carries a deadline reports one,
+;; and that is what the gate above observes. pthread_join, pthread_cond_wait,
+;; dispatch_semaphore_wait under DISPATCH_TIME_FOREVER, WaitForSingleObject
+;; under INFINITE and every other "wait until it is done" entry point have no
+;; deadline to report, so nothing surfaces at all: the process stops, with no
+;; output, no warning and no exit, and nothing pointing back at this paragraph.
+;; Expect silence rather than an error when the call you left unmarked is one of
+;; those, and reach for a stack sample: the calling thread sits in the C wait
+;; and the callback's thread sits in S_condition_wait.
+;;
 ;; A :collect-safe callback cannot RETURN :string (it hands C an address as it
 ;; deactivates); return a :pointer. A :string ARGUMENT is fine — C owns those
 ;; bytes. The restriction is the mirror of :blocking's, which is on arguments.
