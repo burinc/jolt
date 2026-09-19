@@ -21,11 +21,19 @@ case "${TMPDIR:-}" in *\\*) sep='\' ;; *) sep=/ ;; esac
 
 # The URL and the path reach the program through the environment, never
 # interpolated into Clojure source: a backslash path is not a string literal.
+# fetch* rather than fetch: a failed CI fetch has to say WHY — a 503 from the
+# CDN, a reset, a cert rejection and a 404 are different bugs (or no bug at
+# all), and the boolean face folded them into one ":fail". The reason is the
+# resolver's own wording: :error, else the HTTP status, else the outcome name.
 fetch_expr='(require (quote [jolt.mvn-http]))
-            (let [ok (jolt.mvn-http/fetch (System/getenv "JOLT_HTTPS_FETCH_URL")
+            (let [r (jolt.mvn-http/fetch* (System/getenv "JOLT_HTTPS_FETCH_URL")
                                           (System/getenv "JOLT_HTTPS_FETCH_TMP"))
-                  libs (jolt.mvn-http/loaded-native-libraries)]
-              (println (str (if ok :ok :fail) (char 9) (:crypto libs) (char 9) (:ssl libs))))'
+                  libs (jolt.mvn-http/loaded-native-libraries)
+                  why (or (:error r)
+                          (when (:status r) (str "HTTP " (:status r)))
+                          (name (:outcome r)))]
+              (println (str (:outcome r) (char 9) (:crypto libs) (char 9) (:ssl libs)
+                            (char 9) (name (:outcome r)) ": " why)))'
 
 # fetch URL -> tmp; assert the file is non-empty and its first line looks like a
 # Maven pom (<?xml ...> or <project ...>). $1 = label, $2 = url.
@@ -36,8 +44,14 @@ check_pom () {
   got="$(printf '%s\n' "$line" | cut -f1)"
   crypto="$(printf '%s\n' "$line" | cut -f2)"
   ssl="$(printf '%s\n' "$line" | cut -f3)"
+  why="$(printf '%s\n' "$line" | cut -f4-)"
   if [ "$got" != ":ok" ]; then
-    printf '%s\n' "https-fetch: FAIL $label — fetch returned $line"
+    # A line without the tab fields is not the program's answer at all — a
+    # load error or a stack trace — so print it whole rather than an empty why.
+    case "$line" in
+      *"$(printf '\t')"*) printf '%s\n' "https-fetch: FAIL $label — $why ($crypto, $ssl)" ;;
+      *)                   printf '%s\n' "https-fetch: FAIL $label — $line" ;;
+    esac
     fails=$((fails + 1)); rm -f "$tmp"; return
   fi
   if [ ! -s "$tmp" ]; then
