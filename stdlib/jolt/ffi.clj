@@ -1340,7 +1340,15 @@
 ;; it waits until the call returns — including a :collect-safe callback arriving
 ;; on one of the library's own threads, which is how a request/response pair
 ;; through one native library wedges itself (see foreign-callable below, and
-;; issue #973). A :string ARGUMENT cannot combine with :blocking; pass a
+;; issue #973).
+;; Two things that sentence takes for granted are worth saying out loud. It
+;; assumes the call RETURNS: one that does not, such as a UI run loop or an
+;; event pump entered through the FFI, holds every other thread off the
+;; collector for the rest of the process's life. And it assumes somebody
+;; notices: nothing crashes, the parked thread looks perfectly healthy, and what
+;; stops is work on other threads, arbitrarily far from the call responsible.
+;; Mark anything that can block indefinitely.
+;; A :string ARGUMENT cannot combine with :blocking; pass a
 ;; :pointer (string->ptr, or an arena-owned string) in that position.
 ;; A :& (or :varargs — the same marker, jolt's older spelling) inside the argtype
 ;; vector declares a VARIADIC libc function and marks the boundary: the types
