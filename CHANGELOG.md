@@ -65,6 +65,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructed are gone, and `reset-context-state!` no longer clears a side
   table. `loaderconf` case 31 reproduces the reload shape.
 
+- **The default heap ceiling is computed on bionic (Android).** Physical-memory
+  detection tried only the glibc and Darwin `sysconf` name constants —
+  `_SC_PAGESIZE`/`_SC_PHYS_PAGES` as 30/85 and 29/200 — and bionic numbers its
+  names differently (39/98), so both pairs failed the plausibility check and a
+  built app ran with no ceiling, the kernel-kill scenario the ceiling exists to
+  prevent. The bionic pair joins the tried list; the `buildsmoke` heap checks
+  assert a default ceiling in a built binary.
+
+- **`jolt build` links on bionic (Android) with no wrapper.** The Linux link
+  line never named `-liconv`, and bionic's libc has no iconv: Chez's Linux
+  sources compile their iconv support unconditionally, so a Termux kernel's
+  `libkernel.a` carries `libiconv_open`/`libiconv_close` and every app link
+  died on both — which is why that platform needed a `cc` shim appending the
+  flag. The link line now adds `-liconv` when the link compiler targets
+  Android, asked of the compiler because no Chez tag can say it: Android
+  builds as `tarm64le`, the tag glibc arm64 Linux uses too.
+
+- **Bionic provisions its own Chez.** With no Chez 10.x on `PATH`, `make` fell
+  through to makes' provisioning, which assumes glibc twice over: `gcc.mk`
+  fetches xPack GCC (a glibc binary the bionic loader cannot exec) and Chez's
+  `make install` hard-links petite/scheme-script — refused with EACCES under
+  app data. On bionic `make` now builds the pinned release with the host
+  compiler and stages the install itself
+  (`host/chez/bionic-provision-chez.sh`): same tarball and configure flags as
+  makes', plus `LIBS=-liconv`, symlinks in place of hard links, and static
+  `libz.a`/`liblz4.a` beside the kernel. A Chez on `PATH` still wins, as
+  before.
+
 ### Internal
 
 - **The release workflow's examples job names a hung example.** Every build
