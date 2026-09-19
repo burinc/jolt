@@ -724,11 +724,19 @@
 ;;
 ;; Which of the two it is follows the JVM's reflector. A no-arg member read tries
 ;; the method and then the FIELD, so (.-x obj) and a missed 0-arg (.x obj) both
-;; end as "No matching field found" — getting here with a dash at all means no arm
-;; claimed it, since dot-forms.ss answers a field read only for a declared
-;; deftype/defrecord slot. A miss with arguments can only have been a method.
-;; Reading the dash back off here keeps the spellings apart without every arm
-;; having to thread the distinction through.
+;; end as "No matching field found" — getting here with a dash and no arguments
+;; means no arm claimed it, since dot-forms.ss answers a field read only for a
+;; declared deftype/defrecord slot. A miss with arguments can only have been a
+;; method, dash or no dash: (.-name x arg) is a call of the member named "-name",
+;; and the dash is part of what the JVM looked for (it munges it to _name), so
+;; only the field wording reads it back off. It used to word every dashed miss as
+;; a field, arguments and all.
+;;
+;; Either wording names the member as the JVM's compiler munged it before the
+;; reflector looked — nope? is nope_QMARK_, what-now is what_now, -go is _go —
+;; which is the spelling a caller sees on the JVM and greps for. class-munge-name
+;; (java/host-class.ss) loads after this file, like jolt-class-name below; both
+;; are resolved at call time.
 (define (no-method-throw method-name obj . maybe-argc)
   (let* ((argc (if (null? maybe-argc) 0 (car maybe-argc)))
          (dashed? (and (> (string-length method-name) 1)
@@ -738,13 +746,13 @@
       ((jolt-nil? obj)
        (throw-jvm (quote NullPointerException)
                   (string-append "Cannot invoke \"" method-name "\" because the target is null")))
-      ((or dashed? (fx=? argc 0))
+      ((fx=? argc 0)
        (throw-jvm (quote IllegalArgumentException)
-                  (string-append "No matching field found: " bare " for class "
+                  (string-append "No matching field found: " (class-munge-name bare) " for class "
                                  (guard (e (#t "?")) (jolt-class-name obj)))))
       (else
        (throw-jvm (quote IllegalArgumentException)
-                  (string-append "No matching method " method-name " found taking "
+                  (string-append "No matching method " (class-munge-name method-name) " found taking "
                                  (number->string argc) " args for class "
                                  (guard (e (#t "?")) (jolt-class-name obj))))))))
 
@@ -901,6 +909,13 @@
               (fx=? (pvec-cnt rest-args) (vector-length (pvec-tail rest-args))))
          (vector->list (pvec-tail rest-args)))
         (else (seq->list rest-args))))
+;; Were there no rest args at all? Answered off the vector's count, so an arm
+;; that only needs to know whether a call carried arguments (a field read takes
+;; none) can ask before it pays for the list.
+(define (method-rest-args-empty? rest-args)
+  (cond ((jolt-nil? rest-args) #t)
+        ((pvec? rest-args) (fx=? 0 (pvec-cnt rest-args)))
+        (else (jolt-nil? (jolt-seq rest-args)))))
 (register-method-arm! arm-priority-string
   (lambda (obj method-name rest-args)
     (if (string? obj)

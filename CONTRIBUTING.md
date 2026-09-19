@@ -65,12 +65,15 @@ analyzer/IR/backend (`jolt-core/jolt/*.clj`), or the `clojure.core` overlay
 (`jolt-core/clojure/core/*.clj`) — re-mint the seed:
 
 ```bash
-make remint                   # iterates host/chez/bootstrap.ss to a byte-fixpoint
+make remint                   # iterates host/chez/bootstrap.ss to a byte-fixpoint,
+                              # then cross-mints host/gambit/seed/ from the result
 ```
 
 A change that is not followed by `make remint` silently does nothing: the
 checked-in seed still carries the old code, and rebuilding the binary alone does
-not help.
+not help. Both seeds travel together — `make gambitseedcheck` (in `make ci`)
+holds `host/gambit/seed/` to the same sources, so commit what `remint` wrote
+under both `host/chez/seed/` and `host/gambit/seed/`.
 
 That trap extends past `jolt-core/`. `ei-prelude-ns-files` in
 `host/chez/emit-image.ss` also compiles seven `stdlib/` namespaces into the seed

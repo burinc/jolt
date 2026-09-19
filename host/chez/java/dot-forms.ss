@@ -8,7 +8,9 @@
 ;;   * collection interop wins first — count/seq/nth/get/valAt/containsKey on a
 ;;     vector/map/set/seq/record (so (. {:count 9} count) is the entry count, 1,
 ;;     NOT the :count field).
-;;   * field access — a "-name" member reads the field (records and maps).
+;;   * field access — a "-name" member with NO arguments reads the field (records
+;;                    and maps); with arguments it is a call of the member named
+;;                    "-name", which is the base dispatcher's (a dashed protocol method).
 ;;   * map member   — a stored fn is a method (called with self + args); any
 ;;                    other value is returned as a field.
 ;;
@@ -118,12 +120,22 @@
       (dot-coll? obj) (htable-sorted? obj) (jolt-map? obj) (jolt-ex-info-record? obj)))
 (register-method-arm! arm-priority-dotform
   (lambda (obj method-name rest-args)
-    (let* ((field? (and (> (string-length method-name) 0)
-                        (char=? (string-ref method-name 0) #\-)))
+    (let* ((dashed? (and (> (string-length method-name) 0)
+                         (char=? (string-ref method-name 0) #\-)))
+           ;; A dashed name reads a FIELD only with no arguments. With arguments
+           ;; it is a call of the member named "-name" — the analyzer's rule and
+           ;; the JVM's, which munges it to _name and looks for a method — so it
+           ;; is not this arm's at all: it passes with its dash intact, for the
+           ;; base's protocol-method lookup (a deftype's own -go, which is how a
+           ;; dash-named protocol method is invoked through interop) or the
+           ;; end-of-chain method miss. A declared slot used to answer a
+           ;; (.-fld x 1) with the argument silently dropped.
+           (field? (and dashed? (method-rest-args-empty? rest-args)))
            (mname (if field?
                       (substring method-name 1 (string-length method-name))
                       method-name)))
-     (if (not (or field? (dotform-receiver? obj)))
+     (if (or (and dashed? (not field?))
+             (not (or field? (dotform-receiver? obj))))
       'pass
       (let ((rest (method-rest-args->list rest-args)))
       (cond

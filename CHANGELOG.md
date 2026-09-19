@@ -34,6 +34,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`(.-name target args*)` calls the member named `-name`; only the
+  no-argument form is a field read.** The analyzer routed every `.-` head to
+  field access and dropped everything after the target, so the arguments
+  vanished and the field's value — a protocol method — was invoked one
+  argument short: `(.-go (T.) 42)` on a deftype implementing `(-go [this x])`
+  died with `Wrong number of args (1) passed to: fn`, a message naming an
+  anonymous fn nowhere near the form. Clojure treats only the no-argument form
+  as a field read; with arguments it is a call of the member named `-name`,
+  which is how a dash-named protocol method is invoked through interop.
+  cognitect aws-api's `(.-invoke-async client op-map)` — on the `aws/invoke`
+  path of every release from 0.8.603 through 0.8.824 — was the shape that could
+  not load. The runtime's field arm agreed with the old analyzer from the other
+  side: a declared slot answered `(.-fld x 1)` with the argument silently
+  dropped, and a dashed miss with arguments was worded as a field miss. Both
+  are the JVM's now — a slot with an argument is `No matching method _fld found
+  taking 1 args`, and either miss names the member the way the JVM's compiler
+  munges it before the reflector looks (`nope?` is `nope_QMARK_`, `what-now`
+  is `what_now`), as it had been printing the raw name. Pinned in the corpus
+  (`host-interop / .-name with arguments is a method call`) and `unit`
+  (`dotform`); two existing `.-field` corpus rows that spelled `try` as
+  `clojure.core/try`, which the JVM cannot compile, had been sitting in
+  certify's ungated `uncertifiable` bucket and are certified now. Fixes #1056;
+  the analyzer half is @burinc's #1057.
+
 - **A built binary no longer types a `reduce` accumulator from its init
   alone.** The init is the accumulator's value on the first call only — after
   that it is whatever the closure returned — but inference seeded the closure's
