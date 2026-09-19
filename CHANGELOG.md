@@ -5,7 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.10] - 2026-09-19
+
+A short window with one wrong-answer bug in it. A built binary typed a
+`reduce` accumulator from its init alone, so a `nil` or string init proved
+the accumulator that type on every later call and folded `nil?`, `some?` and
+`count` on it at compile time — `(reduce (fn [b x] (if (or (nil? b) (< x b))
+x b)) nil [5 3 9 1 7])` answered 7 in every build but `--dev`; the
+accumulator's type is the fixpoint of the init joined with the closure's
+return now. Beside it: `(.-name target args*)` is a call of the member named
+`-name`, as on the JVM, so cognitect aws-api's `(.-invoke-async client
+op-map)` loads; a loader's `io/resource` facade no longer goes stale when its
+`:id` is reused; a built app direct-calls the 49 core natives the boot
+defines in layers instead of routing each call through its var (`@atom`
+9.5 → 2.9 ns in an `--opt` binary); and jolt builds and runs on bionic
+(Android/Termux) — the heap ceiling is computed there, the app link names
+`-liconv`, and `make` provisions its own Chez.
 
 ### Performance
 
