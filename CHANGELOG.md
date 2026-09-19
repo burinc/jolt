@@ -5,7 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.9] - 2026-09-18
+
+The runtime grew in three directions. `jolt.loader` is real: a context loads
+its own namespaces, vars and resources from its own roots, shares through a
+delegate, and a function requires and resolves in the context that defined it,
+whoever calls it. `java.util.zip` runs on the zlib every binary already links,
+and a Maven jar is read in place through its central directory — no extraction
+directory beside it in `~/.m2`. And parallel Clojure code scales again: the
+four process-wide locks on single-value hot paths are gone, atoms are
+lock-free, a collection's metadata is a field of the collection and record
+predicates and accessors are open-coded, so eight threads working on their own
+values run 2–4x slower per thread where they ran 20–32x, and `with-meta` at
+parity. Around
+them: `ScheduledExecutorService`, `Object.wait`/`notify`, the rest of `Var`'s
+instance surface, a `char[]` through the string builders with host-method
+arity checked, a `require` inside a fn body no longer aliasing at compile time,
+a source formatter's constant factors, a collection stalled by a foreign call
+that is not `:blocking` finally saying so, three Windows path and
+native-library fixes plus Maven over Git for Windows' OpenSSL, and the Gambit
+boot revived with the gates that keep it alive.
 
 ### Added
 
@@ -178,6 +197,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jars. `jolt.loader` accepts a jar root. Every `.jar.jolt/` directory an
   earlier release left beside a jar in `~/.m2` can be deleted. (#988, #1005)
 
+- **A garbage collection stalled by a foreign call that is not `:blocking`
+  says so.** The collector stops the world by rendezvous, and a thread parked
+  in a foreign call that is not marked `:blocking` never arrives: every other
+  thread then waits for that call to return, and when the call is itself
+  waiting for one of them — a `:collect-safe` callback producing its answer on
+  the library's own thread — the process simply stopped, with no output, no
+  error and no exit unless the C side happened to carry a deadline (#973
+  documented the rule, #1046 the silence). The wait itself cannot say anything,
+  since whoever would print is one more thread at the rendezvous, so the
+  rendezvous now says it: two seconds into a collection that is waiting for a
+  thread to reach a safe point, stderr reports how many threads it waits for,
+  whether a `:collect-safe` callback is in progress, and to mark the outbound
+  call `:blocking` — once per stalled request, after which the wait continues,
+  so a call that does return completes the collection as before. The callback
+  is recognised even in the commonest shape, where its thread was activated
+  with the request already pending (the caller's own allocation tripped it on
+  the way into the unmarked call) and trapped before any jolt code ran on it.
+  Nothing is charged per foreign call; a `:collect-safe` callback pays a
+  compare-and-swap in and out. Chez only: the rendezvous is a copy of Chez
+  10.4's with timed waits, installed on that Chez and not on another, and a
+  gate runs the four shapes — an unmarked `sleep`, the same call `:blocking`,
+  the #973 round trip, and that round trip with the request pending — against
+  the runtime's stderr. (#1046)
+
 ### Performance
 
 - **Vectors past 32 elements are built in bulk.** `make-pvec` conj'd one
@@ -321,6 +364,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for that and is tracked separately. What remains under a profiler on an
   allocation-heavy parallel workload is Chez's own allocator, which refills a
   thread's allocation area one 16 KB segment at a time under a global mutex.
+- **A source formatter's constant factors: `subs` copies in one block, `deref`
+  answers an atom first, `swap!` has fixed arities, and `case` on a character
+  compares by identity.** `standard-clojure-style` is the one workload with a
+  reference that is not the JVM (its upstream is JavaScript), and a new
+  `bench/cst-format` row keeps both of its phases as a formatter spells them —
+  a ten-key map per token, a `^`-anchored `re-find` over a `subs` window, an
+  atom per node `swap!`'d as the walk learns its column. Five costs it found,
+  each a common case paying for a general one. Chez's `substring` moves one
+  character at a time, so `subs` allocates and block-copies the span (2048
+  characters out of 4300: 4.27 → 1.17 µs, the allocation now nearly all of
+  it) and its two-argument form allocates no rest list; `.substring`,
+  `subSequence` and the proven-`^String` emit route through the same copy.
+  `deref` was built in four `set!` layers (futures, vars, volatiles, atoms)
+  that an atom walked all of, with a rest list on the way in — ~60 ns to read
+  one field; its fixed 1-arity clause tests the atom first. `swap!` and
+  `vswap!` have fixed 2/3/4-arity clauses that allocate nothing and call `f`
+  directly. A set of characters, which is how Clojure spells a character
+  class, probes `amap-index` through a `char?` arm rather than generic
+  equality. And `case` compares a character constant with `identical?`, as it
+  already did keywords and booleans: replacing a linear `.indexOf` with a
+  `(case c …)` over the same six characters used to make a scanner SLOWER
+  (174.6 → 200.6 ms) and now makes it faster (164.7). Two complexity rows pin
+  that a fixed-span `subs` and an anchored `re-find` cost the window, not the
+  input. With the rest of this release's work the row runs 141.5 → 80.7 ms
+  against the 0.8.8 binary on one machine (min of three, alternating).
 
 ### Fixed
 
@@ -526,6 +594,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Cannot compile this value into code". The flag is cleared while the
   metadata expression emits, and the `:defmacro` arm emits its metadata through
   the same helper rather than a copy of the expression. (#1024)
+- **A `char[]` appends as its characters, and a host method called with more
+  arguments than any overload takes is an error rather than a silent drop.**
+  `StringBuilder.append` had no arm for a char array, so `(.append sb buf)` put
+  `#object[[C]` in the buffer and `(.append sb buf 0 n)` substringed that
+  rendering — silently wrong for a short range, a
+  `StringIndexOutOfBoundsException` past its eleven characters; a mock server
+  died inside its own thread on it and left its client hanging until the
+  runner's timeout, and nine call sites in the wild worked around it with
+  `(.append sb (String. buf 0 m))`. `append`, `insert` and `String/valueOf` now
+  share one conversion, a block copy off the array with the JVM's `(offset,
+  len)` semantics and bounds errors (the `char[]` three-argument form is
+  offset/len where the `CharSequence` one is start/end); `StringBuffer` shares
+  the table; the builders' `getChars` and `String/copyValueOf`, both missing,
+  are here. The second cause: a method-table arm written to take a rest list
+  accepted any number of arguments and read its own positionally, so
+  `(.length "abc" 1)` answered 3, `(String/valueOf ca 1 2)` returned the whole
+  array and `(.append sb "x" 1)` reported Chez's "cadr: incorrect list
+  structure". Arity is checked at both invocation sites off the procedure's own
+  arity mask, so a member states its overloads by how it is written, and a miss
+  takes the path an unknown name takes, so a class extension registered for the
+  name still gets its say. Checking it made two `String` overloads reachable
+  that had been dropping their extra argument, so they are implemented:
+  `startsWith(prefix, toffset)` and `lastIndexOf(str, fromIndex)`. The string
+  rows of the bench suite are flat (0.98–1.00x). (#1015, #1016, #1020, #1021,
+  #1022)
 - **A protocol dispatch miss is worded as the reference words it.** Calling a
   protocol method on a value nothing extends raised `No method area in
   user/Shape`; the reference's `emit-method-builder` raises `No implementation
@@ -12583,6 +12676,7 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
+[0.8.9]: https://github.com/jolt-lang/jolt/compare/v0.8.8...v0.8.9
 [0.8.8]: https://github.com/jolt-lang/jolt/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/jolt-lang/jolt/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/jolt-lang/jolt/compare/v0.8.5...v0.8.6
