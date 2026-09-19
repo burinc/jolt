@@ -7,7 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **A built app direct-calls the 49 core natives the boot defines in layers.**
+  The runtime asserts `deref` six times — once per `set!`-extended layer of the
+  procedure behind it (vars, atoms, dynamic bindings, volatiles, futures, the
+  post-prelude pass) — `__close` four, `map?`/`coll?`/`decimal?` three,
+  `var-get`, `with-meta`, `type`, `slurp`, `spit` and thirty-odd more twice,
+  and every one of those read as "a var this program defines more than once",
+  the mark the inline pass and the direct-link rule exist to respect for an
+  APP's own double definitions. So a built app called each of them through the
+  var cell and a generic invoke where `swap!`, asserted once, was a hoisted
+  direct call. A boot re-assertion is not an app redefinition: the mark is
+  cleared the moment the runtime image has finished booting (the same seam the
+  direct-link rule takes its seed-namespace set from), so a var the boot
+  defined twice is one definition with a final root to everything compiled
+  after it, and the app's own redefinitions mark it again from there. In an
+  `--opt` binary `@atom` goes 9.5 → 2.9 ns and `(map? m)` 14.6 → 7.8 ns per
+  call, loop included; against the 0.8.9 binary, stm 0.89x, cst-format 0.92x,
+  metadata 0.94x. What changes for such a site is what direct-linking already
+  meant for every other seed native: a rebind made before the app's namespace
+  loads (a library's `alter-var-root` at its own load, which is how
+  glimmer.ratom rebinds `deref`) is what the site hoists, and one made after
+  the site has loaded is invisible to it; `jolt run` never direct-links.
+  (jolt-o3gy)
+
 ### Fixed
+
+- **A built binary no longer types a `reduce` accumulator from its init
+  alone.** The init is the accumulator's value on the first call only — after
+  that it is whatever the closure returned — but inference seeded the closure's
+  accumulator param from the init's type, so in every build but `--dev` a
+  `nil` init proved it `:nil` and `(nil? b)` folded to true:
+  `(reduce (fn [b x] (if (or (nil? b) (< x b)) x b)) nil [5 3 9 1 7])`
+  answered 7 (the last rival, not the minimum), `some?` folded the same way,
+  a `"abc"` init proved it a string and `count` on it crashed with
+  `string-length: 3 is not a string`, a `0.0` init pinned a `^double` hint on
+  it so a long the closure returned came back as `2.0` where the JVM answers
+  `2`, and an accumulator handed to a `defn` narrowed that fn's parameter
+  through the whole-program fixpoint, folding the same predicate inside it.
+  The accumulator's type is now the fixpoint of the init joined with the
+  closure's return, widened to unknown when the two disagree, so the
+  predicates stay runtime tests and the joins see the converged type; a `0.0`
+  init whose closure always returns a flonum still unboxes. Gated per form
+  and whole-program in `make accfix`, and end to end in a built binary in
+  `buildsmoke` (with the nested-reduce and `loop`/`recur` shapes).
+
+- **A loader's `clojure.java.io/resource` / `ClassLoader` facade no longer
+  goes stale when its `:id` is reused.** `as-classloader` cached facades in an
+  id-keyed side table, and neither `unload!` nor a new `classpath` with the
+  same id replaced an entry — so a second context minted with a used id (a
+  `/reload`, a per-request context) resolved `io/resource` and the
+  `ClassLoader` resource methods through the first context's facade, which
+  wraps the first, now unloaded loader: "loader <id> is unloaded". The one
+  facade now lives on the loader itself (a `compare-and-set!` slot), keyed by
+  identity; the id-keyed table and its retention of every loader ever
+  constructed are gone, and `reset-context-state!` no longer clears a side
+  table. `loaderconf` case 31 reproduces the reload shape.
 
 - **The default heap ceiling is computed on bionic (Android).** Physical-memory
   detection tried only the glibc and Darwin `sysconf` name constants —
@@ -36,31 +92,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   makes', plus `LIBS=-liconv`, symlinks in place of hard links, and static
   `libz.a`/`liblz4.a` beside the kernel. A Chez on `PATH` still wins, as
   before.
-
-### Performance
-
-- **A built app direct-calls the 49 core natives the boot defines in layers.**
-  The runtime asserts `deref` six times — once per `set!`-extended layer of the
-  procedure behind it (vars, atoms, dynamic bindings, volatiles, futures, the
-  post-prelude pass) — `__close` four, `map?`/`coll?`/`decimal?` three,
-  `var-get`, `with-meta`, `type`, `slurp`, `spit` and thirty-odd more twice,
-  and every one of those read as "a var this program defines more than once",
-  the mark the inline pass and the direct-link rule exist to respect for an
-  APP's own double definitions. So a built app called each of them through the
-  var cell and a generic invoke where `swap!`, asserted once, was a hoisted
-  direct call. A boot re-assertion is not an app redefinition: the mark is
-  cleared the moment the runtime image has finished booting (the same seam the
-  direct-link rule takes its seed-namespace set from), so a var the boot
-  defined twice is one definition with a final root to everything compiled
-  after it, and the app's own redefinitions mark it again from there. In an
-  `--opt` binary `@atom` goes 9.5 → 2.9 ns and `(map? m)` 14.6 → 7.8 ns per
-  call, loop included; against the 0.8.9 binary, stm 0.89x, cst-format 0.92x,
-  metadata 0.94x. What changes for such a site is what direct-linking already
-  meant for every other seed native: a rebind made before the app's namespace
-  loads (a library's `alter-var-root` at its own load, which is how
-  glimmer.ratom rebinds `deref`) is what the site hoists, and one made after
-  the site has loaded is invisible to it; `jolt run` never direct-links.
-  (jolt-o3gy)
 
 ### Internal
 

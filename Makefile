@@ -184,7 +184,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
+  protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
@@ -882,6 +882,15 @@ contagion:
 # a field read off the result bare-indexes; a disagreeing impl keeps the generic path.
 protoret:
 	@$(CHEZ) --script host/chez/run-protoret.ss
+
+# A binding rebound through a feedback loop is not typed from its initial value
+# alone: a reduce closure's accumulator seeds from the fixpoint of the init joined
+# with the closure's return (reduce-acc-type), so nil?/some?/string? on it stay
+# runtime tests, a long the closure returns is not coerced, and the whole-program
+# param joins see the converged type — per-form, whole-program, nested, and the
+# loop/recur analogue. A 0.0 init whose closure returns a flonum keeps its fl-ops.
+accfix:
+	@$(CHEZ) --script host/chez/run-accfix.ss
 
 # Protocol-dispatch polymorphic inline cache: a protocol call the inference tags
 # :proto/:method but can't prove monomorphic emits a per-site cache keyed on the
