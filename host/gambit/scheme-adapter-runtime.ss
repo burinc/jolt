@@ -125,6 +125,21 @@
 (define (sa-gc-install-ceiling! soft hard on-exceeded)
   #f)
 
+;; (sa-gc-install-stall-watch! seconds on-stall) -> boolean
+;; Permitted degradation: Gambit's collector is not a rendezvous of active
+;; threads that a foreign call can hold off, and it exposes no hook on the
+;; wait; answer #f and install nothing. The diagnostic is then absent, which
+;; is what every release before 0.8.9 did on every target.
+(define (sa-gc-install-stall-watch! seconds on-stall)
+  #f)
+
+;; (sa-thread-id-of t) -> fixnum | #f
+;; Permitted degradation: #f — no per-thread number is readable from a
+;; thread object here, so the fork wrapper records nothing for the child and
+;; nothing consumes the record (no stall watch is installed on this host).
+(define (sa-thread-id-of t)
+  #f)
+
 ;; (sa-real-time-ms) -> exact integer
 ;; Wall-clock milliseconds, monotonic within a process — used for elapsed
 ;; deltas (build profiling) and unique temp-file stamps. Contract: an

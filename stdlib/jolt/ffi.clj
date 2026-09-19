@@ -1346,8 +1346,11 @@
 ;; event pump entered through the FFI, holds every other thread off the
 ;; collector for the rest of the process's life. And it assumes somebody
 ;; notices: nothing crashes, the parked thread looks perfectly healthy, and what
-;; stops is work on other threads, arbitrarily far from the call responsible.
-;; Mark anything that can block indefinitely.
+;; stops is work on other threads, arbitrarily far from the call responsible —
+;; which is what the runtime's stall report exists to point back at: two seconds
+;; into a collection that a thread has not reached a safe point for, stderr says
+;; so and names this option (see foreign-callable below). Mark anything that can
+;; block indefinitely.
 ;; A :string ARGUMENT cannot combine with :blocking; pass a
 ;; :pointer (string->ptr, or an arena-owned string) in that position.
 ;; A :& (or :varargs — the same marker, jolt's older spelling) inside the argtype
@@ -1533,16 +1536,22 @@
 ;; :blocking and the deadlock cannot form. This is issue #973, and
 ;; test/chez/ffi-foreign-thread-test.sh is the shape.
 ;;
-;; That timeout is the C API's rather than jolt's, which is what makes this
-;; failure so often silent. A library whose call carries a deadline reports one,
-;; and that is what the gate above observes. pthread_join, pthread_cond_wait,
-;; dispatch_semaphore_wait under DISPATCH_TIME_FOREVER, WaitForSingleObject
-;; under INFINITE and every other "wait until it is done" entry point have no
-;; deadline to report, so nothing surfaces at all: the process stops, with no
-;; output, no warning and no exit, and nothing pointing back at this paragraph.
-;; Expect silence rather than an error when the call you left unmarked is one of
-;; those, and reach for a stack sample: the calling thread sits in the C wait
-;; and the callback's thread sits in S_condition_wait.
+;; That timeout is the C API's rather than jolt's. A library whose call carries
+;; a deadline reports one, and that is what the gate above observes;
+;; pthread_join, pthread_cond_wait, dispatch_semaphore_wait under
+;; DISPATCH_TIME_FOREVER, WaitForSingleObject under INFINITE and every other
+;; "wait until it is done" entry point have none, and with one of those left
+;; unmarked the process would simply stop. What surfaces instead is the
+;; runtime's own report (issue #1046): two seconds into a collection that is
+;; waiting for a thread to reach a safe point, stderr says so — how many
+;; threads it waits for, whether a :collect-safe callback is in progress (the
+;; thread waiting for the collection is then the one the parked call is waiting
+;; for), and to mark the outbound call :blocking. The wait then goes on, so a
+;; call that does return completes the collection as before; a call that never
+;; returns leaves the process where it was, with the cause on stderr.
+;; test/chez/ffi-gc-stall-test.sh pins the report. A stack sample shows the
+;; same picture: the calling thread in the C wait, the callback's thread in
+;; S_condition_wait.
 ;;
 ;; A :collect-safe callback cannot RETURN :string (it hands C an address as it
 ;; deactivates); return a :pointer. A :string ARGUMENT is fine — C owns those

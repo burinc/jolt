@@ -127,23 +127,56 @@
 ;; callback) had none; doing it here once is what makes the invariant hold for
 ;; the next spawn site too. A site that needs the parent's dynamic bindings
 ;; installs them itself, after this (dyn-binding-stack snap).
+;; live-threads holds every thread jolt started and has not seen exit, keyed by
+;; id: #t while it runs, 'done for the one race below. Recorded by the FORKING
+;; thread, from the child's thread object (sa-thread-id-of), rather than by the
+;; child on its way in: a child forked while a collection is pending traps at
+;; its very first safe point — its thunk's entry — and waits for the
+;; collection before any line of it runs, so a self-record would not exist
+;; yet when the stall report asks who is waiting (rt.ss jolt-report-gc-stall
+;; tells a thread jolt started from one it did not by this table; a thread it
+;; did not start can only be running jolt through a :collect-safe callback).
+;; The forking thread records the child before it returns from fork-thread,
+;; so nothing the parent does next (park in a foreign call, say) can precede
+;; the record. The child deletes itself on exit; if it exits before the parent
+;; has recorded it — a thunk that finishes in the parent's next few
+;; instructions — it leaves 'done, which the parent's late record consumes
+;; instead of outliving the thread; a child gone entirely (context released)
+;; before the parent reads its id leaves that marker behind, one fixnum key
+;; that no later thread's id can equal. jolt-started-thread? reads #t only.
 (define live-threads (make-eqv-hashtable))
 (define live-threads-mutex (make-mutex))
 (define (live-thread-ids)
-  (jolt-with-mutex live-threads-mutex (vector->list (hashtable-keys live-threads))))
+  (jolt-with-mutex live-threads-mutex
+    (let loop ((ks (vector->list (hashtable-keys live-threads))) (acc '()))
+      (cond ((null? ks) acc)
+            ((eq? #t (hashtable-ref live-threads (car ks) #f)) (loop (cdr ks) (cons (car ks) acc)))
+            (else (loop (cdr ks) acc))))))
+(define (jolt-started-thread? id)
+  (jolt-with-mutex live-threads-mutex (eq? #t (hashtable-ref live-threads id #f))))
 (define %ls-orig-fork-thread fork-thread)
 (define (fork-thread thunk)
   (jolt-mark-mt!)
-  (%ls-orig-fork-thread
-   (lambda ()
-     (*txn* #f)
-     (rdr-default-modes!)
-     (let ((id (get-thread-id)))
-       (jolt-with-mutex live-threads-mutex (hashtable-set! live-threads id #t))
-       (dynamic-wind
-         (lambda () #f)
-         thunk
-         (lambda () (jolt-with-mutex live-threads-mutex (hashtable-delete! live-threads id))))))))
+  (let* ((t (%ls-orig-fork-thread
+             (lambda ()
+               (*txn* #f)
+               (rdr-default-modes!)
+               (let ((id (get-thread-id)))
+                 (dynamic-wind
+                   (lambda () #f)
+                   thunk
+                   (lambda ()
+                     (jolt-with-mutex live-threads-mutex
+                       (if (hashtable-contains? live-threads id)
+                           (hashtable-delete! live-threads id)
+                           (hashtable-set! live-threads id 'done)))))))))
+         (id (sa-thread-id-of t)))
+    (when id
+      (jolt-with-mutex live-threads-mutex
+        (if (eq? 'done (hashtable-ref live-threads id #f))
+            (hashtable-delete! live-threads id)
+            (hashtable-set! live-threads id #t))))
+    t))
 
 ;; coll->cells: coerce the body result to the cell representation = a seq | nil.
 (define (jolt-coll->cells c) (jolt-seq c))
