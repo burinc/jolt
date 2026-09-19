@@ -18,6 +18,10 @@
 ;;                     jolt auto-imports, a lib off the classpath) — informational
 ;;   :expected-error   the :expected SOURCE does not evaluate on the JVM (CORPUS BUG:
 ;;                     :expected is evaluated, so an unquoted seq asserts nothing)
+;;   :actual-error     the :actual SOURCE spells a special form as a clojure.core var
+;;                     (clojure.core/try), which the JVM cannot compile — the row
+;;                     reads as vocabulary the JVM lacks and would sit uncertified
+;;                     for good (CORPUS BUG)
 ;;   :read-error       :actual or :expected won't even read on the JVM reader
 ;;
 ;; Run from the repo root:
@@ -208,6 +212,21 @@
       (do (future-cancel f) [:timeout nil])
       r)))
 
+;; A special form spelled as a clojure.core var — (clojure.core/try …),
+;; (clojure.core/catch …) — is "No such var" on the JVM, which reads exactly like
+;; a jolt-only core fn and filed the row as uncertifiable: two .-field rows sat
+;; there, never judged, until a review noticed. jolt resolves the spelling, so
+;; nothing on its side objects; only this side can. The name, when the message
+;; is that and the name is one of the compiler's specials.
+(defn qualified-special-form [m]
+  (when-let [nm (second (re-find #"No such var: clojure\.core/([^\s,]+)" (or m "")))]
+    (when (special-symbol? (symbol nm)) nm)))
+(defn actual-error-detail [^Throwable t]
+  (some (fn [^Throwable c]
+          (when-let [nm (qualified-special-form (.getMessage c))]
+            (format "clojure.core/%s is a special form on the JVM, not a var — write %s" nm nm)))
+        (causes t)))
+
 ;; Did the JVM fail because it lacks the VOCABULARY rather than because it disagrees
 ;; about behavior? A jolt-only core fn, a class jolt auto-imports and the JVM does
 ;; not, a namespace off the classpath: the JVM never got to run the program, so it
@@ -327,10 +346,12 @@
       ;; actual threw on the JVM: either the JVM lacks the vocabulary (no opinion) or
       ;; it ran the row and rejected it while jolt answers a value (a divergence).
       (= (first a) :throw)
-      (if-let [why (uncertifiable-reason (second a))]
-        {:bucket :uncertifiable :reason why :detail (ex-summary (second a))}
-        {:bucket :jvm-raises
-         :detail (str "jolt-expected=" (pr-str expected) " JVM raised " (ex-summary (second a)))})
+      (if-let [d (actual-error-detail (second a))]
+        {:bucket :actual-error :detail d}
+        (if-let [why (uncertifiable-reason (second a))]
+          {:bucket :uncertifiable :reason why :detail (ex-summary (second a))}
+          {:bucket :jvm-raises
+           :detail (str "jolt-expected=" (pr-str expected) " JVM raised " (ex-summary (second a)))}))
 
       :else
       (let [e (eval-safe expected)]
@@ -394,6 +415,8 @@
       :read-error [:reader/jolt]
       :timeout [:perf/unbounded]
       :uncertifiable [(uncertifiable-feature actual)]
+      ;; a corpus bug fails the gate; it is a feature of no runtime
+      (:expected-error :actual-error) []
       [:host/jvm-interop])))
 
 ;; The classifier IS the gate's judgment, so it carries a fixture: one row per
@@ -410,6 +433,7 @@
    {:bucket :uncertifiable    :expected "2"       :actual "(try 1 (catch :default e 2))"}
    {:bucket :uncertifiable    :expected "1"       :actual "(do (require '[no.such.lib]) 1)"}
    {:bucket :expected-error   :expected "(1 2)"   :actual "(list 1 2)"}
+   {:bucket :actual-error     :expected "2"       :actual "(clojure.core/try (/ 1 0) (catch ArithmeticException e 2))"}
    {:bucket :read-error       :expected "1"       :actual "(1 ]"}
    {:bucket :timeout          :expected "nil"     :actual "(Thread/sleep 60000)"}])
 
@@ -498,6 +522,7 @@
     (println (format "  jvm-raises       %5d  <-- jolt answers a value, the JVM raises" (cnt :jvm-raises)))
     (println (format "  DIVERGENT        %5d  <-- corpus :expected disagrees with JVM" (cnt :divergent)))
     (println (format "  expected-error   %5d  <-- :expected source does not evaluate (CORPUS BUG)" (cnt :expected-error)))
+    (println (format "  actual-error     %5d  <-- :actual spells a special form as clojure.core/x (CORPUS BUG)" (cnt :actual-error)))
     (let [certifiable (+ (cnt :certified) (cnt :certified-throws) (cnt :divergent)
                          (cnt :throws-mismatch) (cnt :jvm-raises))]
       (println (format "\n  certifiable rows: %d  (certified %d / divergent %d / throws-mismatch %d / jvm-raises %d)"
@@ -517,6 +542,13 @@
       (doseq [{:keys [row detail]} (get by :expected-error)]
         (println (format "  [%s] %s\n      expected: %s\n      %s"
                          (:suite row) (:label row) (:expected row) detail))))
+    ;; …and an :actual the JVM cannot compile for a reason that is not vocabulary
+    ;; is the same kind of bug from the other side: the oracle never judges it.
+    (when (pos? (cnt :actual-error))
+      (println "\n=== :actual spells a special form as a clojure.core var — gate FAILS ===")
+      (doseq [{:keys [row detail]} (get by :actual-error)]
+        (println (format "  [%s] %s\n      actual: %s\n      %s"
+                         (:suite row) (:label row) (:actual row) detail))))
 
     ;; A row that timed out asserted NOTHING on this run, and the budget is
     ;; wall-clock on a shared JVM: future-cancel is best-effort, so an earlier
@@ -604,10 +636,11 @@
                                                        (get by :uncertifiable))})))
       (println (format "\nwrote machine-readable report to %s" edn-out)))
 
-    ;; Gate: fail on a NEW (unlisted) divergence, a stale allowlist entry, or an
-    ;; :expected that doesn't evaluate. Every current divergence is either
-    ;; intentional (classified in the allowlist) or a tracked bug — so a clean run
-    ;; means the corpus matches reference Clojure everywhere it claims to, modulo the
+    ;; Gate: fail on a NEW (unlisted) divergence, a stale allowlist entry, an
+    ;; :expected that doesn't evaluate, or an :actual the JVM cannot compile.
+    ;; Every current divergence is either intentional (classified in the
+    ;; allowlist) or a tracked bug — so a clean run means the corpus matches
+    ;; reference Clojure everywhere it claims to, modulo the
     ;; documented jolt-specific deltas.
     ;; The :documented list is gated too: its entries are prose about divergences
     ;; that are not corpus rows, so nothing above would notice one going stale.
@@ -619,7 +652,8 @@
       (doseq [m documented-problems] (println m)))
 
     (System/exit (if (or (seq new-divergences) (seq stale-entries)
-                         (seq documented-problems) (pos? (cnt :expected-error)))
+                         (seq documented-problems) (pos? (cnt :expected-error))
+                         (pos? (cnt :actual-error)))
                    1 0))))
 
 (apply -main *command-line-args*)
