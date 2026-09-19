@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and whole-program in `make accfix`, and end to end in a built binary in
   `buildsmoke` (with the nested-reduce and `loop`/`recur` shapes).
 
+- **A loader's `clojure.java.io/resource` / `ClassLoader` facade no longer
+  goes stale when its `:id` is reused.** `as-classloader` cached facades in an
+  id-keyed side table, and neither `unload!` nor a new `classpath` with the
+  same id replaced an entry — so a second context minted with a used id (a
+  `/reload`, a per-request context) resolved `io/resource` and the
+  `ClassLoader` resource methods through the first context's facade, which
+  wraps the first, now unloaded loader: "loader <id> is unloaded". The one
+  facade now lives on the loader itself (a `compare-and-set!` slot), keyed by
+  identity; the id-keyed table and its retention of every loader ever
+  constructed are gone, and `reset-context-state!` no longer clears a side
+  table. `loaderconf` case 31 reproduces the reload shape.
+
 ### Internal
 
 - **The release workflow's examples job names a hung example.** Every build
