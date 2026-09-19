@@ -1644,10 +1644,15 @@
 (defn- analyze-field [ctx hname items env]
   (when (< (count items) 2)
     (analysis-error :analyze/invalid-member-access "Malformed (.-field target) form"))
+  ;; Only the no-argument form is a field read. Clojure treats (.-name target
+  ;; args*) as a call of the member named "-name" -- which is how a protocol
+  ;; method whose name genuinely begins with a dash gets invoked, e.g.
+  ;; cognitect aws-api's (.-invoke-async client op-map). Dropping those args
+  ;; silently read the field instead and then called it one argument short.
   {:op :host-call
    :method (subs hname 1)        ; ".-field" -> "-field"
    :target (analyze ctx (nth items 1) env)
-    :args []})
+   :args (mapv #(analyze ctx % env) (drop 2 items))})
 
 ;; A macro referenced in VALUE position — a bare reference or an argument, never
 ;; the head of a call (a macro head macroexpands in analyze-list before this is
