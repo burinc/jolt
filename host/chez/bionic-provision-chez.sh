@@ -100,7 +100,10 @@ for f in petite.boot scheme.boot libkernel.a scheme.h; do
 done
 cp -f "$wa/zlib/libz.a" "$csv/libz.a"
 cp -f "$wa/lz4/lib/liblz4.a" "$csv/liblz4.a"
-# Symlinks, not Chez's hard links — the filesystem refuses those.
+# Symlinks, not Chez's hard links — the filesystem refuses those. Chez picks
+# its boot file by the executable's name, so scheme-script needs a
+# scheme-script.boot beside scheme.boot, as Chez's own install lays it out.
+ln -sf scheme.boot "$csv/scheme-script.boot"
 ln -sf scheme "$csv/petite"
 ln -sf "../lib/csv$version/$m/scheme" "$prefix/bin/scheme"
 ln -sf "../lib/csv$version/$m/petite" "$prefix/bin/petite"

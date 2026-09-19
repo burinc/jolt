@@ -608,10 +608,9 @@
    - :roots       [string] for `status`
    - :delegates   [Loader] for `status`
    - :members     [Loader] for `status`
-   - :context     host object for `(context l)`
-   - :classloader host view — value or (fn [l]) — for `as-classloader`"
+   - :context     host object for `(context l)`"
   [{:keys [id parent delegate-fn locate-fn gate-fn open-fn release-fn ns-load-fn
-           ns-vars-fn roots delegates members context classloader]}]
+           ns-vars-fn roots delegates members context]}]
   (let [l (->LoaderImpl
            (or id (next-id "loader"))
            parent delegate-fn locate-fn gate-fn open-fn release-fn ns-load-fn
@@ -620,8 +619,7 @@
              roots (assoc :roots (vec roots))
              delegates (assoc :delegates (vec delegates))
              members (assoc :members (vec members))
-             (some? context) (assoc :context context)
-             (some? classloader) (assoc :classloader classloader))
+             (some? context) (assoc :context context))
            {:links (atom {}) :in-flight (atom {}) :unloaded? (atom false)
             :facade (atom nil)})]
     (swap! loaders-by-id assoc (:id l) l)
