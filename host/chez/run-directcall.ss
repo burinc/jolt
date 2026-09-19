@@ -76,6 +76,25 @@
 (ev "(defn helper [x] (+ x 1))")
 (let ((e (emit-dl "(def useapp (fn [] (helper 1)))")))
   (gate-check "an app var is not a seed var" (gate-sub? e "jolt-seed-root") #f))
+;; deref is NOT a lowered native. A library that rebinds clojure.core/deref for
+;; its own reference type (glimmer.ratom, so @ tracks a reactive cell) has to be
+;; seen by every @ compiled in the app, in a build as much as under `jolt run`;
+;; as a native op the site called jolt-deref itself and the rebind reached
+;; nothing. The shape the site takes is the runtime's business — today it is
+;; var-routed even under direct-link, because the boot re-asserts the var once
+;; per layer of jolt-deref and seed-callable? reads that as a redefinition; a
+;; root hoisted at app load would see the rebind just the same.
+(let ((e (emit-dl "(def usederef (fn [a] @a))")))
+  (gate-check "@ under direct-link does not call jolt-deref" (gate-sub? e "jolt-deref") #f)
+  (run-emit e)
+  (let ((cell (jolt-var "clojure.core" "deref")) (orig (var-deref "clojure.core" "deref")))
+    (jolt-alter-var-root cell (lambda (old) (lambda (x) 'rebound)))
+    (gate-check "@ under direct-link sees a rebound deref" (call "usederef" 1) 'rebound)
+    (jolt-alter-var-root cell (lambda (old) orig))
+    (gate-check "...and the restore" (call "usederef" (jolt-atom-new 7)) 7)))
+(let ((e (emit-nodl "(def usederef2 (fn [a] @a))")))
+  (gate-check "@ off direct-link does not call jolt-deref" (gate-sub? e "jolt-deref") #f)
+  (gate-check "@ off direct-link is var-routed" (gate-sub? e "jolt-invoke1") #t))
 (gate-check "seed-callable?: clojure.core/true? at 1 arg names its binding" (seed-callable? jolt-nil "clojure.core" "true?" 1) "jv$clojure.core$true?")
 (gate-check "seed-callable?: a runtime-defined seed var answers #t" (seed-callable? jolt-nil "clojure.core" "array-map" 2) #t)
 (gate-check "seed-callable?: wrong arity refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "true?" 3)) #t)

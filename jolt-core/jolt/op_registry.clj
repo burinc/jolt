@@ -146,11 +146,16 @@
    "empty?"      {:call "jolt-empty?"   :arity #(= % 1) :bool? true}
    "peek"        {:call "jolt-peek"    :arity #(= % 1)}
    "pop"         {:call "jolt-pop"     :arity #(= % 1)}
-   ;; @x / (deref x) — the read every loop that keeps state in an atom does, and
-   ;; it was going through a var-cell deref plus a generic invoke to reach a
-   ;; procedure that answers with one record read. Only the 1-arity form lowers:
-   ;; the timed (deref ref ms val) arity is rarer and stays on the var.
-   "deref"       {:call "jolt-deref"   :arity #(= % 1)}
+   ;; deref is deliberately NOT here. A lowered op bypasses its var for good, and
+   ;; clojure.core/deref is a var libraries rebind: glimmer.ratom replaces it so
+   ;; @ tracks a reactive cell that is no atom, and delegates to the captured
+   ;; original for everything else — which is what the JVM's plain var call
+   ;; lets it do. Lowered, every @ in a built app called jolt-deref past the
+   ;; rebind and died with "cannot be cast to java.util.concurrent.Future". The
+   ;; atom-first case-lambda in atoms.ss is where @ on an atom is cheap; a built
+   ;; app still direct-calls it as an unlinked seed var (host-contract.ss
+   ;; seed-callable?, root hoisted at load), so what a site pays here is the
+   ;; var-cell deref + invoke of `jolt run` only.
    ;; Java arrays: the hot 1-dim forms lower to the native array-aware ops
    ;; (aget->jolt-nth, alength->jolt-count) and a write helper (aset->jolt-aset3),
    ;; skipping the clojure.core overlay's var-deref + reduce/seq alloc. Multi-dim
