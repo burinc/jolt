@@ -730,6 +730,31 @@ if [ "$nil_fold_got" != "$nil_fold_want" ]; then
   echo "  FAIL: nil?/some? fold inverted — got \`$nil_fold_got\`, want \`$nil_fold_want\`"; exit 1
 fi
 
+# The accumulator of a reduce closure is the init only on the FIRST call; after
+# that it is whatever the closure returned. Inference seeded it from the init
+# alone, so under --opt a nil init proved acc :nil (nil?/some? folded to constants)
+# and a string init proved acc :str (string? folded true, count lowered to
+# string-length): a release build printed 7 / [3] and crashed on (string-length 3).
+# The seed is now the fixpoint of init joined with the closure's return. The app
+# also pins the rest of the class end to end in a built binary — a 0.0 init whose
+# closure returns a long (was coerced to 2.0), the accumulator handed to a defn
+# (whole-program param joins), a nested reduce, the loop/recur analogue — and that
+# a 0.0 init whose closure returns a flonum still unboxes (fl+ in flat.ss). The
+# per-form emission rows live in host/chez/run-accfix.ss (make accfix).
+reduce_acc_app="$root/test/chez/reduce-acc-app"
+reduce_acc_out="$(dirname "$out")/reduce-acc-bin"
+if ! JOLT_PWD="$reduce_acc_app" "$jolt" build -m app.core -o "$reduce_acc_out" --opt >/dev/null 2>&1; then
+  echo "  FAIL: reduce-acc --opt build exited non-zero"; exit 1
+fi
+reduce_acc_got="$(cd "$reduce_acc_app" && "$reduce_acc_out" 2>&1)"
+reduce_acc_want="$(printf '1\n[1 2 3]\n8\n14.0\n2\n1\n1\n1')"
+if [ "$reduce_acc_got" != "$reduce_acc_want" ]; then
+  echo "  FAIL: reduce accumulator typed from its init alone — got \`$reduce_acc_got\`, want \`$reduce_acc_want\`"; exit 1
+fi
+if ! grep -q '#3%fl+' "$reduce_acc_out.build/flat.ss"; then
+  echo "  FAIL: a 0.0-seeded reduce closure returning a flonum lost its fl+"; exit 1
+fi
+
 # Only a proven-NON-NIL receiver may devirtualize. A devirt site resolves the impl
 # by the static type tag and caches it, so devirtualizing a record-or-nil receiver
 # served the cached impl to a later nil receiver: this printed 3 twice instead of
