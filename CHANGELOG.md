@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout with nothing in the log to say which step stopped, which is how the
   regression #1045 fixed sat behind four consecutive nightlies. The
   `:jolt/provides` overtake warning also agrees its verb with its noun now.
+- **The HTTPS fetch smoke says why a fetch failed.** `make httpsfetch` (and
+  the Windows dependency-paths job that runs it twice) read the boolean face of
+  `jolt.mvn-http/fetch`, so a failed live fetch logged `:fail` and nothing
+  else — a CDN 503, a reset, a rejected certificate and a 404 were one line.
+  It reads `fetch*` now and reports the outcome the resolver would have shown
+  the user: `not-found: HTTP 404`, `retryable: lookup failed: <host>`, the
+  loader's candidate list. Found on a main run where Central alone failed for
+  a tree that had passed eighteen minutes earlier and the log could not say
+  which of those it was.
 
 ## [0.8.9] - 2026-09-18
 
