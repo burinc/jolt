@@ -649,6 +649,18 @@
               (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
         '())))
 
+;; (sa-thread-id-of t) -> fixnum | #f
+;; The numeric id a thread OBJECT's own get-thread-id answers, read from any
+;; thread: its context's thread number. Contract: the id, or #f once the
+;; thread has exited (its context is released and the object marks it dead).
+;; Degradation: #f — the caller then records nothing for the thread.
+(define (sa-thread-id-of t)
+  (guard (e (#t #f))
+    (let ((tc (#%$thread-tc t)))
+      (and (not (eqv? tc 0))
+           (let ((n (#%$tc-field 'threadno tc)))
+             (and (fixnum? n) n))))))
+
 ;; (sa-procedure-info x) -> (name . ((free-name . value) ...)) | #f
 ;; A procedure's inspector name and live free-variable captures, in
 ;; registration order — what the image graph needs to serialize closures
@@ -1035,6 +1047,121 @@
         (when (> (bytes-allocated) hard)
           (on-exceeded (bytes-allocated))))))
   #t)
+;; (sa-gc-install-stall-watch! seconds on-stall) -> boolean
+;; Make a stalled collection observable. Chez stops the world by rendezvous:
+;; the thread whose allocation tripped runs $collect-rendezvous, and unless it
+;; is the last ACTIVE thread it waits on $collect-cond for the others to reach
+;; a safe point; the last one to arrive runs the collect-request-handler and
+;; broadcasts. A thread parked in a foreign call that is not __collect_safe
+;; stays active and never arrives, so every other thread waits for that call
+;; to return — and when the call is itself waiting for one of the waiting
+;; threads (a :collect-safe callback producing its answer), for good. Nothing
+;; in the wait can allocate or print: a Scheme watchdog is one more thread
+;; that reaches the rendezvous and waits, and a C thread cannot read the
+;; symbols involved through scheme.h (Stop_level_value calls into Scheme).
+;;
+;; So the rendezvous itself is where the stall is seen. This installs a copy
+;; of Chez 10.4's $collect-rendezvous (s/7.ss) whose waits carry a timeout:
+;; a thread that has waited SECONDS with the request still pending and other
+;; threads still active calls ON-STALL once per stalled request — with the
+;; tc mutex released and interrupts disabled, so it may allocate and print
+;; without re-entering the rendezvous — then goes on waiting exactly as
+;; before. The protocol is otherwise the original's: the same conditions,
+;; the same last-one-standing rule, the same hand-over to the main thread
+;; when it is waiting, so a stall that ends (the call returned) completes the
+;; collection as it always did. $collect-rendezvous is immutable in the system
+;; environment; $set-top-level-value! writes the slot the event handler
+;; (s/library.ss) reads on every collect request, which is why every
+;; collection on every thread, explicit or trip-driven, goes through the copy.
+;;
+;; The tc mutex goes through the counting pair (locks.ss jolt-lock! /
+;; jolt-unlock!) and the waits through jolt-stop-the-world-wait, the one
+;; condition-wait beneath the fiber layer: a collect request stops the whole
+;; carrier, fibers and all, so this is the wait that must block it whatever is
+;; running there.
+;;
+;; Contract: ON-STALL receives the number of active threads other than the
+;; caller, i.e. the threads that have not reached a safe point.
+;; Degradation: answer #f without installing anything, leaving the target's
+;; own rendezvous in place (no diagnostic, the behaviour of every release
+;; before 0.8.9). The copy is of ONE protocol, so it is installed only on the
+;; Chez it was read from — 10.4 — and only when every name it needs is bound;
+;; a Chez whose protocol has not been compared answers #f rather than run a
+;; rendezvous it might disagree with. The ffi gate (make ffi) asserts the
+;; watch is live on the Chez CI builds, so a Chez bump re-asks the question.
+(define (sa-gc-install-stall-watch! seconds on-stall)
+  (let ((se (#%$system-environment)))
+    (define (bound? name) (top-level-bound? name se))
+    (define (sysval name) (top-level-value name se))
+    (and (call-with-values scheme-version-number
+           (lambda (major minor sub) (and (= major 10) (= minor 4))))
+         (bound? '$collect-rendezvous)
+         (bound? '$collect-cond) (bound? '$collect-thread0-cond)
+         (bound? '$tc-mutex) (bound? '$active-threads)
+         (bound? '$collect-request-pending)
+         (let ((tc-mutex (sysval '$tc-mutex))
+               (collect-cond (sysval '$collect-cond))
+               (thread0-cond (sysval '$collect-thread0-cond))
+               (timeout (make-time 'time-duration 0 seconds))
+               ;; #t once ON-STALL has run for the request now pending; cleared
+               ;; where the request is cleared, so the next stall reports again.
+               (reported? #f)
+               (thread0-waiting? #f))
+           (define (active-threads) (sysval '$active-threads))
+           (define (pending?) (sysval '$collect-request-pending))
+           (define (pending-set! v) (#%$set-top-level-value! '$collect-request-pending v))
+           ;; condition-wait's #t is a signal, #f the timeout. On a timeout with
+           ;; the request still pending and others still active, report once.
+           (define (timed-wait c)
+             (or (jolt-stop-the-world-wait c tc-mutex timeout)
+                 (begin
+                   (when (and (pending?) (> (active-threads) 1) (not reported?))
+                     (set! reported? #t)
+                     (jolt-unlock! tc-mutex)
+                     (on-stall (- (active-threads) 1))
+                     (jolt-lock! tc-mutex))
+                   #f)))
+           (define (stall-rendezvous)
+             (define once
+               (let ((once #f))
+                 (lambda ()
+                   (when (eq? once #t)
+                     (#%$oops '$collect-rendezvous
+                              "cannot return to the collect-request-handler"))
+                   (set! once #t))))
+             (dynamic-wind
+               (lambda () (disable-interrupts) (jolt-lock! tc-mutex))
+               (lambda ()
+                 (let f ()
+                   (when (pending?)
+                     (cond
+                       ((= (active-threads) 1)   ; last one standing
+                        (cond
+                          ((or (eqv? 0 (get-thread-id)) (not thread0-waiting?))
+                           (dynamic-wind
+                             once
+                             (collect-request-handler)
+                             (lambda ()
+                               (pending-set! #f)
+                               (set! reported? #f)
+                               (condition-broadcast collect-cond)
+                               (condition-broadcast thread0-cond))))
+                          (else
+                           ;; get the main thread to perform the GC instead
+                           (condition-broadcast thread0-cond)
+                           (timed-wait collect-cond)
+                           (f))))
+                       ((eqv? 0 (get-thread-id))
+                        (set! thread0-waiting? #t)
+                        (timed-wait thread0-cond)
+                        (set! thread0-waiting? #f)
+                        (f))
+                       (else
+                        (timed-wait collect-cond)
+                        (f))))))
+               (lambda () (jolt-unlock! tc-mutex) (enable-interrupts))))
+           (#%$set-top-level-value! '$collect-rendezvous stall-rendezvous)
+           #t))))
 
 ;; (sa-fasl-write obj port [externals-pred]) -> void
 ;; fasl-serialize OBJ to PORT, optionally under the externals predicate

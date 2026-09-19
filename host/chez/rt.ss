@@ -406,6 +406,69 @@
                            "JOLT_MAX_HEAP=off."))))
         (set! jolt-heap-ceiling-bytes #f)))))
 
+
+;; --- a stalled collection says so ---------------------------------------------
+;; The collector stops the world by rendezvous, and a thread parked in a foreign
+;; call that is not :blocking never arrives: every other thread then waits for
+;; that call to return, and when the call is waiting for one of them (a
+;; :collect-safe callback producing its answer, issue #973) the process simply
+;; stops — no output, no error, no exit, unless the C side happens to carry a
+;; deadline (issue #1046). The wait itself cannot say anything: whoever would
+;; print is one more thread at the rendezvous. What can is the rendezvous, so
+;; the adapter installs one whose waits time out (sa-gc-install-stall-watch!),
+;; and this is the policy: two seconds — a real rendezvous completes in
+;; microseconds, and a foreign call that legitimately runs longer than that
+;; with other threads alive should be :blocking anyway — and a message that
+;; names the mechanism and the fix. Once per stalled request; the wait then
+;; continues, so a stall that ends completes the collection as before.
+;;
+;; The count of :collect-safe callbacks in progress turns "the usual cause"
+;; into the diagnosis: those callbacks are the threads waiting for the
+;; collection, and a parked call waiting for one of them is the deadlock.
+;; Kept by the emitted callable wrapper (backend emit-ffi-callable, through
+;; jolt-ffi-callback-enter!/exit! in java/ffi.ss) with a CAS on a box: one
+;; per callback, nothing per foreign call. The count alone misses the
+;; commonest shape of the deadlock: a foreign thread activated while a
+;; collect request is already pending — the caller's allocation tripped it
+;; on the way INTO the unmarked call, past its last safe point — traps in the
+;; callable's entry, before any jolt code has run on that thread, and waits
+;; with the count at 0. So the reporter also asks where IT is running: a
+;; thread jolt did not start (lazy-bridge.ss live-threads, recorded by the
+;; forking thread; the boot thread is the other one jolt knows) can only be
+;; running jolt through a :collect-safe callback, and in that shape the
+;; reporting thread is the waiting callback.
+;;
+;; Installed at the end of this file, at load, on every driver: unlike the
+;; heap ceiling it reads nothing from the process, and a gate booting the
+;; runtime from source needs it as much as a built binary does. At the END so
+;; that everything the report calls (locks.ss, printing.ss, lazy-bridge.ss)
+;; is loaded before the first rendezvous that could take the timeout.
+(define jolt-ffi-callbacks-active (box 0))
+(define jolt-gc-stall-seconds 2)
+(define (jolt-on-foreign-thread?)
+  (let ((id (get-thread-id)))
+    (and (not (eqv? id jolt-boot-thread-id))
+         (not (jolt-started-thread? id)))))
+(define (jolt-report-gc-stall unreached)
+  (let ((callbacks (max (unbox jolt-ffi-callbacks-active)
+                        (if (jolt-on-foreign-thread?) 1 0))))
+    (jolt-eprintf
+      (string-append
+        "jolt.ffi: a garbage collection has been waiting ~a s for ~a thread~a to reach a safe point.\n"
+        "  Every thread running jolt code reaches one within microseconds. A thread parked in a\n"
+        "  foreign call that is not marked :blocking never does, and every other thread now waits\n"
+        "  for that call to return."
+        (if (> callbacks 0)
+            (string-append
+              " ~a :collect-safe callback~a in progress: if the parked call is\n"
+              "  waiting for its answer, the two wait for each other for good.")
+            "~a~a")
+        " Mark the outbound call\n"
+        "  :blocking — see the :collect-safe notes on foreign-callable in jolt.ffi.\n")
+      jolt-gc-stall-seconds unreached (if (= unreached 1) "" "s")
+      (if (> callbacks 0) callbacks "")
+      (cond ((= callbacks 0) "") ((= callbacks 1) " is") (else "s are")))))
+
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")
 
@@ -2182,3 +2245,8 @@
 ;; walks jolt collections, var cells and atoms, prints paths through the printers,
 ;; and reads proc-name-tbl to write a fn as its var's name.
 (load "host/chez/state-image.ss")
+
+;; The stall watch (see "a stalled collection says so" above): after every
+;; load, so a rendezvous that times out finds the reporter's dependencies.
+(define jolt-gc-stall-watch-installed?
+  (sa-gc-install-stall-watch! jolt-gc-stall-seconds jolt-report-gc-stall))

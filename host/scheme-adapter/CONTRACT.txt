@@ -72,6 +72,17 @@
 # per-instance thread parameter and so joins the load-bearing list above — an
 # adapter whose threads do not inherit must arrange it explicitly there too.
 #
+# SA-THREAD-ID-OF answers a thread OBJECT's numeric id (the value get-thread-id
+# returns inside it) from OUTSIDE it, or #f once the thread has exited. The
+# fork-thread wrapper (lazy-bridge.ss) records the child under it in the
+# forking thread, before the child has run a single safe point: a record the
+# child makes of itself can come too late (a child started while a collection
+# is pending traps at its entry and waits there first), and the stall report
+# (rt.ss jolt-report-gc-stall) tells a thread jolt started from one it did
+# not by this record. A target that cannot read a thread's id from its object
+# answers #f and records nothing; every thread then reads as not started by
+# jolt, which is why the Gambit host, answering #f, installs no stall watch.
+#
 # MUTEXES ARE NON-RECURSIVE (PSL R4, pinned): same-thread re-acquire blocks,
 # per SRFI-18 mutex-acquire!. No host site re-acquires: re-entrant entry is
 # handled structurally — nested dosync joins the outer transaction through
@@ -92,6 +103,7 @@ condition-signal
 condition-broadcast
 make-thread-parameter
 get-thread-id
+sa-thread-id-of
 # Fences. seq.ss publishes a forced tail behind memory-order-release so the
 # seq's own fields are visible before the word that points to it on a weakly
 # ordered machine; a target whose threads share no memory (green threads on
@@ -139,7 +151,10 @@ system
 # #f without installing anything, which leaves the heap unbounded as it was
 # before 0.8.5 — a target with no collection hook cannot enforce a ceiling,
 # and the caller then reports maxMemory as unbounded rather than promising a
-# bound it does not have.
+# bound it does not have. sa-gc-install-stall-watch! may likewise answer #f:
+# a target whose collector is not a rendezvous of active threads, or a Chez
+# whose rendezvous protocol the Chez copy has not been compared against,
+# keeps its own rendezvous and reports no stall (the behaviour before 0.8.9).
 sa-run-process
 sa-environment-pairs
 sa-os-release
@@ -154,6 +169,7 @@ sa-gc-trip-bytes!
 sa-gc-trip-bytes
 sa-reset-max-memory-bytes!
 sa-gc-install-ceiling!
+sa-gc-install-stall-watch!
 #
 # tier: capability-introspect
 # OUR definitions in host/chez/scheme-adapter-runtime.ss for the blocklist's

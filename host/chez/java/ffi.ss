@@ -1080,6 +1080,21 @@
   (let ((addr (sa-foreign-callable-entry-point co)))
     (jolt-with-mutex ffi-tbl-mu (hashtable-set! ffi-callable-table addr co))
     addr))
+;; A :collect-safe callable's body runs between these (backend emit-ffi-callable
+;; wraps it): rt.ss jolt-ffi-callbacks-active counts the callbacks in progress
+;; so a stalled collection's report (jolt-report-gc-stall) can say whether one
+;; is among the threads waiting for it. A CAS per entry and exit — several
+;; foreign threads can be inside callbacks at once — and nothing on the
+;; foreign-call side. A callback returns to C by returning (a continuation
+;; cannot cross the foreign frame), so the exit always runs.
+(define (jolt-ffi-callback-enter!)
+  (let retry ()
+    (let ((n (unbox jolt-ffi-callbacks-active)))
+      (unless (box-cas! jolt-ffi-callbacks-active n (fx+ n 1)) (retry)))))
+(define (jolt-ffi-callback-exit!)
+  (let retry ()
+    (let ((n (unbox jolt-ffi-callbacks-active)))
+      (unless (box-cas! jolt-ffi-callbacks-active n (fx- n 1)) (retry)))))
 (define (ffi-free-callable addr)
   (let* ((a (jnum->exact addr))
          (co (jolt-with-mutex ffi-tbl-mu

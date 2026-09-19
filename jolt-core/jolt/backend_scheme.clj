@@ -1915,7 +1915,32 @@
                    (= "string" rettype) (str "(jolt-ffi-string->c " invoke ")")
                    (= "bool" rettype) (str "(jolt-ffi-bool->c " invoke ")")
                    :else invoke)
-                 "))")))]
+                 "))")))
+        ;; A :collect-safe callable counts itself in and out (java/ffi.ss
+        ;; jolt-ffi-callback-enter!/exit!, a CAS each) so a collection stalled
+        ;; by a non-:blocking outbound call can report that a callback is among
+        ;; the threads waiting for it (rt.ss jolt-report-gc-stall, issue #1046).
+        ;; Bound once, at callable construction; the count is per call, and
+        ;; only for this convention — a callback on the calling thread pays
+        ;; nothing. The body returns to C by returning (no continuation crosses
+        ;; the foreign frame), so the exit always runs.
+        ;;
+        ;; The entry lambda is bound under one fixed name so its code object
+        ;; carries it: a backtrace or a stack sample taken on the library's
+        ;; thread then reads jolt-ffi-collect-safe-entry where it would read an
+        ;; anonymous frame.
+        target
+        (if (:collect-safe node)
+          (let [fname (fresh-label "jolt_ffi_cs")
+                params (mapv (fn [i] (str "c" i)) (range (count argtypes)))]
+            (str "(let* ((" fname " " target ") "
+                 "(jolt-ffi-collect-safe-entry "
+                 "(lambda (" (str/join " " params) ") "
+                 "(jolt-ffi-callback-enter!) "
+                 "(let ((r (" fname (when (seq params) (str " " (str/join " " params))) "))) "
+                 "(jolt-ffi-callback-exit!) r)))) "
+                 "jolt-ffi-collect-safe-entry)"))
+          target)]
     (str "(jolt-ffi-register-callable! ("
          (if (:collect-safe node) "sa-foreign-callable-collect-safe " "sa-foreign-callable ")
          target

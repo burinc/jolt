@@ -729,6 +729,7 @@ ffi:
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
+	@sh test/chez/ffi-gc-stall-test.sh
 
 # zlib bindings (host/chez/java/zlib.ss): the z_stream layout, entry-point
 # resolution, checksums, round trips, error codes, dictionaries, parameter
