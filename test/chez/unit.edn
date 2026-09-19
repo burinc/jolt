@@ -178,6 +178,12 @@
   {:suite "dotform" :expr "(try (.-count [1 2]) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching field found: count for class clojure.lang.PersistentVector\""}
   {:suite "dotform" :expr "(do (defrecord Rf [x]) (.-x (->Rf 7)))" :expected "7"}
   {:suite "dotform" :expr "(do (defrecord Rg [a b]) (.-b (->Rg 1 2)))" :expected "2"}
+  ;; only the no-argument form is a field read: (.-name x args*) calls the member
+  ;; named "-name" (a dashed protocol method), and a declared slot with an
+  ;; argument attached is a method miss rather than a field read that drops it
+  {:suite "dotform" :expr "(do (defprotocol Pdm (-go [_ x])) (deftype Tdm [fld] Pdm (-go [_ x] (str \"got \" x))) [(.-go (->Tdm 1) 42) (. (->Tdm 1) -go 42) (.-fld (->Tdm 7))])" :expected "[\"got 42\" \"got 42\" 7]"}
+  {:suite "dotform" :expr "(do (deftype Tdf [fld]) (try (.-fld (->Tdf 7) 1) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching method _fld found taking 1 args for class user.Tdf\""}
+  {:suite "dotform" :expr "(do (deftype Tdq [a]) (try (.-nope? (->Tdq 1)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: nope_QMARK_ for class user.Tdq\""}
   {:suite "dotform" :expr "(do (defprotocol Greet (hi [_])) (defrecord Rh [nm] Greet (hi [_] (str \"hi \" nm))) (. (->Rh \"x\") hi))" :expected "\"hi x\""}
   {:suite "dotform" :expr "(try (throw (ex-info \"bad\" {})) (catch Throwable e (.getMessage e)))" :expected "\"bad\""}
   {:suite "dotform" :expr "(try (throw (ex-info \"bad\" {:k 1})) (catch Throwable e (.getMessage e)))" :expected "\"bad\""}

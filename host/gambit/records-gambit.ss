@@ -2769,19 +2769,19 @@
            "Cannot invoke \""
            method-name
            "\" because the target is null")))
-      ((or dashed? (fx=? argc 0))
+      ((fx=? argc 0)
        (throw-jvm
          'IllegalArgumentException
          (string-append
            "No matching field found: "
-           bare
+           (class-munge-name bare)
            " for class "
            (guard (e (#t "?")) (jolt-class-name obj)))))
       (else
        (throw-jvm
          'IllegalArgumentException
-         (string-append "No matching method " method-name " found taking "
-           (number->string argc) " args for class "
+         (string-append "No matching method " (class-munge-name method-name)
+           " found taking " (number->string argc) " args for class "
            (guard (e (#t "?")) (jolt-class-name obj))))))))
 
 (define (dot-coll-method obj name args)
@@ -2900,6 +2900,12 @@
             (vector-length (pvec-tail rest-args))))
      (vector->list (pvec-tail rest-args)))
     (else (seq->list rest-args))))
+
+(define (method-rest-args-empty? rest-args)
+  (cond
+    ((jolt-nil? rest-args) #t)
+    ((pvec? rest-args) (fx=? 0 (pvec-cnt rest-args)))
+    (else (jolt-nil? (jolt-seq rest-args)))))
 
 (register-method-arm!
   arm-priority-string
