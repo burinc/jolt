@@ -498,18 +498,42 @@
         node' (assoc node :args (if dr [msub (nd kr) (nd dr)] [msub (nd kr)]))]
     [rt (if (= rt :double) (assoc node' :num-read :double) node')]))
 
+;; The accumulator of a reduce closure is the init only on the FIRST call; on every
+;; later one it is what the closure returned. Its type is therefore the least
+;; fixpoint of acc = join(init, ret(f acc elem)) — seeding it from the init alone
+;; proved a nil init :nil (nil?/some? folded to constants, so (fn [b x] (if (or
+;; (nil? b) (< x b)) x b)) over nil kept the first element's rival) and a string
+;; init :str (count lowered to string-length and crashed on the first number).
+;; Iterate from the init: probe the closure under the seed, join its return in,
+;; and stop when the seed absorbs it. Each step widens (join is monotone and the
+;; lattice is finite — :nil/:double widen to :any/:num in one step, unions cap),
+;; so it converges in a few rounds; past the cap the seed is :any, the sound top.
+;; The probes run under a sub-env with their own diags/calls cells (the
+;; isolated-diag-count pattern) so only the final inference reports and feeds the
+;; whole-program param joins.
+(def ^:private reduce-acc-rounds 4)
+(defn- reduce-acc-type [fnode init-t et tenv env]
+  (let [sub (assoc env :diags (atom []) :calls (atom []))]
+    (loop [seed init-t rounds reduce-acc-rounds]
+      (if (or (= seed :any) (= rounds 0))
+        :any
+        (let [next (join seed (ty (infer-fn-seeded fnode {0 seed 1 et} tenv sub)))]
+          (if (= next seed) seed (recur next (- rounds 1))))))))
+
 (defn- infer-reduce-hof
   "reduce over a typed vector with a fn-literal: seed the closure's accumulator
-  (param 0) to the init type and its element (param 1) to the vector's element
-  type, so its body — and any calls it makes — see those types."
+  (param 0) to the converged accumulator type (reduce-acc-type) and its element
+  (param 1) to the vector's element type, so its body — and any calls it makes —
+  see those types."
   [node args n tenv env]
   (let [three (>= n 3)
         coll-r (infer (nth args (if three 2 1)) tenv env)
         init-r (when three (infer (nth args 1) tenv env))
         et (let [ct (ty coll-r)] (if (vec-type? ct) (velem ct) :any))
         init-t (if init-r (ty init-r) :any)
-        fn-r (infer-fn-seeded (nth args 0) {0 init-t 1 et} tenv env)]
-    [(join init-t (ty fn-r))
+        acc-t (reduce-acc-type (nth args 0) init-t et tenv env)
+        fn-r (infer-fn-seeded (nth args 0) {0 acc-t 1 et} tenv env)]
+    [(join acc-t (ty fn-r))
      (assoc node :args (if three
                          [(nd fn-r) (nd init-r) (nd coll-r)]
                          [(nd fn-r) (nd coll-r)]))]))

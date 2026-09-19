@@ -32,6 +32,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the site has loaded is invisible to it; `jolt run` never direct-links.
   (jolt-o3gy)
 
+### Fixed
+
+- **A built binary no longer types a `reduce` accumulator from its init
+  alone.** The init is the accumulator's value on the first call only — after
+  that it is whatever the closure returned — but inference seeded the closure's
+  accumulator param from the init's type, so in every build but `--dev` a
+  `nil` init proved it `:nil` and `(nil? b)` folded to true:
+  `(reduce (fn [b x] (if (or (nil? b) (< x b)) x b)) nil [5 3 9 1 7])`
+  answered 7 (the last rival, not the minimum), `some?` folded the same way,
+  a `"abc"` init proved it a string and `count` on it crashed with
+  `string-length: 3 is not a string`, a `0.0` init pinned a `^double` hint on
+  it so a long the closure returned came back as `2.0` where the JVM answers
+  `2`, and an accumulator handed to a `defn` narrowed that fn's parameter
+  through the whole-program fixpoint, folding the same predicate inside it.
+  The accumulator's type is now the fixpoint of the init joined with the
+  closure's return, widened to unknown when the two disagree, so the
+  predicates stay runtime tests and the joins see the converged type; a `0.0`
+  init whose closure always returns a flonum still unboxes. Gated per form
+  and whole-program in `make accfix`, and end to end in a built binary in
+  `buildsmoke` (with the nested-reduce and `loop`/`recur` shapes).
+
 ### Internal
 
 - **The release workflow's examples job names a hung example.** Every build
