@@ -169,6 +169,12 @@
       (or (and (%java-anchor-proc sre) #t)
           (and (memq sre '(epsilon bos eos bol eol bow eow commit)) #t))))
 
+;; Nothing above reaches the matcher until the translator emits the primitives,
+;; and it only does that once this says the host can compile them — a host that
+;; takes regex-translate.ss without this file (the Gambit boot) must keep getting
+;; the look-around SREs.
+(jr-use-anchor-prims!)
+
 ;; Registering the expansions is what keeps the rest of irregex ignorant of these
 ;; symbols: sre-length-ranges ERRORS on an unknown one, and sre->nfa answers #f,
 ;; which would silently drop the DFA.  Each expansion still contains a look-around,
