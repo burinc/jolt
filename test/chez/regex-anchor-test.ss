@@ -92,7 +92,26 @@
     ("(?<=a|abc)d" "xad"           ("d"))
     ("(?<!abc)d"   "abcd"          ())
     ("(?<!abc)d"   "xbcd"          ("d"))
-    ("(?<=a+)d"    "aaad"          ("d"))))
+    ("(?<=a+)d"    "aaad"          ("d"))
+    ;; a look-around nested inside a look-behind must read at position i, which
+    ;; sits at the wrapped chunk's end; the body's end is pinned by a zero-width
+    ;; assertion instead of `eos` (drg-bba2).
+    ("(?<=a(?=b))b"     "abc"      ("b"))
+    ("(?<=a(?=b))b"     "abbc"     ("b"))
+    ("(?<!a(?=b))b"     "xbc"      ("b"))
+    ("(?<!a(?=b))b"     "abc"      ())
+    ("(?<=ab(?=c))c"    "abc"      ("c"))
+    ("(?<=ab(?=c))c"    "abx"      ())
+    ("(?<=a(?=bc))bc"   "abc"      ("bc"))
+    ("(?<=x(?=y))y"     "xy"       ("y"))
+    ("(?<=x(?=y))y"     "xz"       ())
+    ;; an unbounded inner reach widens the chunk to its end; the body then gets
+    ;; the whole chunk (correct, O(position) rescan).
+    ("(?<=a(?=b*))b"    "abc"      ("b"))
+    ("(?<=a(?=b*c))c"   "abbc"     ())
+    ("(?<=a(?=b{2,}))b" "abb"      ("b"))
+    ("(?<=a(?=b{2,}))b" "ab"       ())
+    ("(?<=a(?=b+))b"    "acb"      ())))
 (for-each (lambda (v) (ok (format "~s on ~s => ~s" (car v) (cadr v) (caddr v))
                           (equal? (matches (car v) (cadr v)) (caddr v))))
           vectors)
