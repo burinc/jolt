@@ -965,14 +965,25 @@
             ;; different Chez machine. Needs a prepared target pack (--target-pack
             ;; DIR or $JOLT_TARGET_PACK) — see tools/cross-compile/README.md.
             target (:target opts)
-            target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))]
+            target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))
+            ;; --signable: an ordinary, same-machine executable build still
+            ;; produces a structurally complete (and therefore strictly
+            ;; signable) binary by routing through the same spawned-cc path
+            ;; --target cross-compiling always uses, rather than appending the
+            ;; boot image past this jolt's own embedded launcher stub. A
+            ;; self-contained jolt's default output has most of its bytes
+            ;; outside its own Mach-O/PE/ELF image, which a strict signature
+            ;; check (codesign --verify --strict on macOS) correctly refuses.
+            ;; No effect on --library (build-shared is always signable) or on
+            ;; a --target build (already forced onto this path).
+            signable? (boolean (some #{"--signable"} flag-args))]
         (when (and target (nil? target-pack))
           (throw (ex-info "--target needs a target pack: --target-pack DIR (or $JOLT_TARGET_PACK)" {:target target})))
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
           (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic))))))
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable?))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
@@ -1031,12 +1042,22 @@
   (println "                         first line is `#!/usr/bin/env jolt` runs as an")
   (println "                         executable script, with or without an extension")
   (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--closed-world] [--dynamic]")
-  (println "              [--boot fast|small|plain] [--library] [--target MACHINE --target-pack DIR]")
+  (println "              [--boot fast|small|plain] [--library] [--signable]")
+  (println "              [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary, or with --library a")
   (println "                         shared object an embedder dlopens and calls through")
   (println "                         jolt_library_init + jolt_lookup; --target")
   (println "                         cross-compiles either one for another Chez machine")
-  (println "                         (see tools/cross-compile)")
+  (println "                         (see tools/cross-compile). A self-contained jolt's")
+  (println "                         default executable output has most of its bytes")
+  (println "                         outside its own Mach-O/PE/ELF image, which a strict")
+  (println "                         signature check (codesign --verify --strict on")
+  (println "                         macOS) refuses; --signable produces a structurally")
+  (println "                         complete binary instead, at the cost of spawning a")
+  (println "                         separate Chez process and needing a C toolchain")
+  (println "                         (no effect on --library, always structurally")
+  (println "                         complete, or on a --target build, already forced")
+  (println "                         onto this same path)")
   (println "  path                   print the resolved source roots")
   (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
   (println "  completions SHELL      print a completion function to source, for")

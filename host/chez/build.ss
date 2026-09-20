@@ -103,6 +103,18 @@
 ;; Required when bld-target is set. Produced by the one-time ChezScheme cross
 ;; setup — see tools/cross-compile/README.md.
 (define bld-target-pack (make-parameter #f))
+;; --signable: force the spawned-cc build path (build-with-cc) for a
+;; same-machine executable even when this process carries an embedded
+;; launcher stub. A self-contained build appends the boot image as raw
+;; bytes past the end of its Mach-O/PE/ELF image (fast: no external Chez,
+;; no cc), which macOS's codesign --verify --strict correctly refuses —
+;; there is no Mach-O structure describing that trailing data. build-with-cc
+;; already produces a structurally complete binary (it's the same path
+;; --target cross-compiling always takes, since the in-process compiler
+;; can't load a target's xpatch); --signable is what makes it reachable for
+;; an ordinary, same-machine, non-cross build too, without requiring a
+;; source checkout that happens not to carry the stub.
+(define bld-signable (make-parameter #f))
 ;; The effective target machine, and whether this is a cross build.
 (define (bld-eff-machine) (or (bld-target) bld-machine))
 (define (bld-cross?) (and (bld-target) (not (string=? (bld-target) bld-machine)) #t))
@@ -1482,9 +1494,12 @@
                       out-path)))
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
-  ;; always takes build-shared, and any cross build takes a spawned cc path, so both
-  ;; need the toolchain even from the self-contained jolt.
-  (when (or library? (bld-cross?) (not (jolt-embedded-bytes "stub/launcher"))) (bld-check-toolchain))
+  ;; always takes build-shared, any cross build takes a spawned cc path, and
+  ;; --signable forces that same spawned-cc path for an ordinary executable, so
+  ;; all three need the toolchain even from the self-contained jolt.
+  (when (or library? (bld-cross?) (bld-signable)
+           (not (jolt-embedded-bytes "stub/launcher")))
+    (bld-check-toolchain))
   ;; Static natives have to be loaded into this HOST process while the app is
   ;; emitted, so a target-architecture archive cannot be supported merely by
   ;; handing it to the target linker. Refuse before bld-preload-static-natives!
@@ -1925,10 +1940,15 @@
         ;;  - SELF-CONTAINED (the distributed jolt, jolt-eaj): compile-file +
         ;;    make-boot-file run IN PROCESS (the compiler is resident — jolt is
         ;;    built from scheme.boot), then the boot is appended to a copy of the
-        ;;    embedded stub. No external Chez, no cc.
-        ;;  - LEGACY (dev bin/jolt): spawn a fresh Chez for compile-file/
+        ;;    embedded stub. No external Chez, no cc. The appended boot has no
+        ;;    Mach-O/PE/ELF structure of its own, so a strict signature check
+        ;;    (codesign --verify --strict on macOS) correctly refuses it.
+        ;;  - CC-LINKED (dev bin/jolt, any --target cross-compile, or an
+        ;;    explicit --signable): spawn a fresh Chez for compile-file/
         ;;    make-boot-file, then xxd the boot into a C array and cc-link against
-        ;;    libkernel.a. Kept so `make buildsmoke` still exercises the cc path.
+        ;;    libkernel.a. Produces a structurally complete binary a strict
+        ;;    signature check accepts. Kept so `make buildsmoke` still exercises
+        ;;    the cc path even when run from a self-contained jolt.
         (cond
           ;; Cross-compiling (--target) always takes a spawned cc path: the
           ;; self-contained in-process compile can't load a target xpatch, and the
@@ -1941,6 +1961,15 @@
           (library?
            (build-shared entry-ns out-path mode builddir units boot boot-h
                          (bld-native-link-flags natives)))
+          ;; --signable: same-machine executable, but the caller wants a
+          ;; structurally complete (and therefore strictly signable) binary
+          ;; even though this jolt carries the embedded stub. Checked before
+          ;; the stub branch below so it wins regardless of which jolt is
+          ;; running it from.
+          ((bld-signable)
+           (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
+                          (bld-native-link-flags natives)
+                          (and drop-compiler? (not bld-nt?))))
           ;; petite-only is POSIX-only: on Windows jolt-foreign-proc-safe still
           ;; evals its foreign-procedure forms (fasl relocations abort the boot
           ;; there), and eval needs the compiler boot resident.
@@ -2858,10 +2887,18 @@
     (cond ((or (null? o) (< i 0)) '())
           ((= i 0) (if (jolt-nil? (car o)) '() (bld-strs (car o))))
           (else (loop (cdr o) (- i 1))))))
+;; optional trailing (signable?), index 4: absent/nil reads as #f, same as
+;; every other opt slot here.
+(define (bld-opt-bool opt i)
+  (let loop ((o opt) (i i))
+    (cond ((or (null? o) (< i 0)) #f)
+          ((= i 0) (jolt-truthy? (car o)))
+          (else (loop (cdr o) (- i 1))))))
 (def-var! "jolt.host" "build-binary"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
-                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2))
+                   (bld-signable (bld-opt-bool opt 4)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
