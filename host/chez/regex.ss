@@ -100,8 +100,13 @@
 ;;
 ;; A WHITELIST, deliberately: an SRE shape not modelled here answers #f and keeps
 ;; the DFA, so a new translator output can only cost speed, never correctness.
-;; `zero-width?` is the companion — a trailing assertion is not "consuming
-;; pattern after it", which is what makes #"\s+$" linear.
+;;
+;; A trailing ASSERTION does not count as pattern after the repetition. It can
+;; still fail and make the repetition give units back, so #"\s+$" is not strictly
+;; linear — but no pattern containing an assertion can have a DFA in the first
+;; place (irregex's sre->nfa answers #f for `bos`, `eol`, a look-around and jolt's
+;; own anchor primitives alike), so refusing those here would change nothing
+;; except to make irregex build the NFA twice before giving up.
 (define (sre-zero-width? x)
   (cond ((symbol? x)
          (and (memq x '(epsilon bos eos bol eol bow eow nwb commit
