@@ -42,6 +42,12 @@
 ;; matching code.
 (define %look-behind-window 0)
 
+;; jolt #1062 / drg-bba2: the target end position for the innermost look-behind
+;; currently evaluating its body.  Bound around the body's evaluation so the
+;; zero-width `%look-behind-end` assertion can pin the body's end back to i even
+;; when the wrapped chunk was widened past i to let a nested look-around read.
+(define %look-behind-target 0)
+
 ;; An UPPER BOUND, in code units, on how many units an SRE body can consume — or
 ;; #f when the body is unbounded or its width is not statically known.  A
 ;; look-behind body that spans at most K units cannot have begun more than K units
@@ -89,6 +95,74 @@
        ((look-ahead neg-look-ahead look-behind neg-look-behind) 0)
        (else #f)))
     (else #f)))
+
+;; Forward reach of an SRE matched FORWARD from the current position: how far past
+;; its start a match may read.  A look-around contributes the reach of its own
+;; body.  #f means unbounded (or not modelled).  Bounds a nested look-ahead's body
+;; so a look-behind can size the chunk it hands to that look-ahead (drg-bba2).
+(define (%sre-forward-span sre)
+  (define (seq-span xs)
+    (let loop ((xs xs) (tot 0))
+      (cond ((null? xs) tot)
+            (else (let ((m (%sre-forward-span (car xs))))
+                    (and m (loop (cdr xs) (+ tot m))))))))
+  (cond
+    ((char? sre) 1)
+    ((string? sre) (string-length sre))
+    ((symbol? sre)
+     (case sre
+       ((any nonl) 1)
+       ((bos bol bow eos eol eow nwb epsilon) 0)
+       (else #f)))
+    ((pair? sre)
+     (case (car sre)
+       ((seq : atomic w/case w/nocase w/utf8 w/noutf8 word) (seq-span (cdr sre)))
+       ((or) (let loop ((xs (cdr sre)) (best 0))
+               (if (null? xs)
+                   best
+                   (let ((m (%sre-forward-span (car xs))))
+                     (and m (loop (cdr xs) (max best m)))))))
+       ((~ & - / posix-string) 1)
+       ((? ??) (seq-span (cdr sre)))
+       ((* *? + +? word+) #f)
+       ((** **?) (let ((hi (caddr sre)))
+                   (and (number? hi)
+                        (let ((w (seq-span (cdddr sre))))
+                          (and w (* hi w))))))
+       ((=) (and (number? (cadr sre))
+                 (let ((w (seq-span (cddr sre))))
+                   (and w (* (cadr sre) w)))))
+       ((>=) #f)
+       ((look-ahead neg-look-ahead look-behind neg-look-behind)
+        (%sre-forward-span (cadr sre)))
+       (else #f)))
+    (else #f)))
+
+;; The extra forward reach a LOOK-BEHIND body needs PAST the position i at which it
+;; must end: its consuming parts all end at or before i, so only a nested
+;; look-AROUND reads past i.  This is the width to extend the wrapped chunk by so an
+;; inner look-ahead can see the unit the outer tail matches; an explicit
+;; `(= ext any)` re-anchors the body's end back to i (drg-bba2).  Always a valid
+;; over-approximation -- or #f, which restores the plain full-chunk wrap.
+(define (%sre-lookbehind-ext sre)
+  (define (max-ext xs)
+    (let loop ((xs xs) (best 0))
+      (cond ((null? xs) best)
+            (else (let ((m (%sre-lookbehind-ext (car xs))))
+                    (and m (loop (cdr xs) (max best m))))))))
+  (cond
+    ((pair? sre)
+     (case (car sre)
+       ((=) (max-ext (cddr sre)))
+       ((** **?) (max-ext (cdddr sre)))
+       ((>=) #f)
+       ((~ & - / posix-string) 0)
+       ((look-ahead neg-look-ahead look-behind neg-look-behind)
+        (%sre-forward-span (cadr sre)))
+       ((seq : atomic w/case w/nocase w/utf8 w/noutf8 word or
+         ? ?? * *? + +? word+) (max-ext (cdr sre)))
+       (else #f)))
+    (else 0)))
 
 (define (sre->procedure sre . o)
   (define names
@@ -327,32 +401,59 @@
                            (next cnk init src str i end matches fail)
                            (fail))))))
                 (else
-                 (let* ((maxlen (%sre-max-length (cadr sre)))
-                        (check
-                         (lp (sre-sequence
-                              (cons '(* any) (append (cdr sre) '(eos))))
-                             n
-                             flags
-                             (lambda (cnk init src str i end matches fail) i))))
-                   (lambda (cnk init src str i end matches fail)
-                     ;; A body of bounded width K cannot have begun more than K
-                     ;; units back, so begin the rescan at (i - K).  Unknown
-                     ;; width, or a scan that began in an earlier chunk: keep the
-                     ;; general rescan from the chunk start.
-                     (let ((i* (if (and maxlen (eq? (car init) src))
-                                   (max (cdr init) (- i maxlen))
-                                   (cdr init))))
-                       (if (and maxlen (eq? (car init) src)
-                                (> (- i (cdr init)) maxlen))
-                           (set! %look-behind-window maxlen))
-                       (let* ((cnk* (wrap-end-chunker cnk src i))
-                              (str* ((chunker-get-str cnk*) (car init)))
-                              (end* ((chunker-get-end cnk*) (car init))))
-                         (if ((if (eq? (car sre) 'look-behind) (lambda (x) x) not)
-                              (check cnk* init (car init) str* i* end* matches
-                                     (lambda () #f)))
-                             (next cnk init src str i end matches fail)
-                             (fail)))))))))
+                  ;; jolt #1062 / drg-bba2: a look-behind only inspects the units
+                  ;; just before the current position.  Compile the body to end AT
+                  ;; i via `(* any) BODY <end>`, and rescan back no farther than
+                  ;; the body's width K.  When the body nests a look-around it may
+                  ;; legitimately read PAST i, so widen the wrapped chunk to
+                  ;; i + EXT and terminate the body with the zero-width
+                  ;; `%look-behind-end` assertion instead of `eos`: it pins the
+                  ;; body's end back to i without consuming, so it never demands
+                  ;; characters that need not exist.  EXT is #f when the inner
+                  ;; reach is unbounded, in which case the body gets the whole
+                  ;; chunk (correct, but O(position) to rescan).
+                  (let* ((ext (%sre-lookbehind-ext (cadr sre)))
+                         (maxlen (%sre-max-length (cadr sre)))
+                         (pin? (not (and (number? ext) (= ext 0))))
+                         (suffix (if pin?
+                                     (append (cdr sre) (list '%look-behind-end))
+                                     (append (cdr sre) '(eos))))
+                         (check
+                          (lp (sre-sequence (cons '(* any) suffix))
+                              n
+                              flags
+                              (lambda (cnk init src str i end matches fail) i))))
+                    (lambda (cnk init src str i end matches fail)
+                      ;; A body of bounded width K cannot have begun more than K
+                      ;; units back, so begin the rescan at (i - K).  Unknown
+                      ;; width, or a scan that began in an earlier chunk: keep the
+                      ;; general rescan from the chunk start.
+                      (let ((i* (if (and maxlen (eq? (car init) src))
+                                    (max (cdr init) (- i maxlen))
+                                    (cdr init))))
+                        (if (and maxlen (eq? (car init) src)
+                                 (> (- i (cdr init)) maxlen))
+                            (set! %look-behind-window maxlen))
+                        (let* ((cnk* (cond ((eq? ext #f) cnk)
+                                           ((> ext 0)
+                                            (wrap-end-chunker
+                                             cnk src
+                                             (min (+ i ext)
+                                                  ((chunker-get-end cnk) src))))
+                                           (else (wrap-end-chunker cnk src i))))
+                               (str* ((chunker-get-str cnk*) (car init)))
+                               (end* ((chunker-get-end cnk*) (car init)))
+                               (saved %look-behind-target)
+                               (ok (begin
+                                     (set! %look-behind-target i)
+                                     ((if (eq? (car sre) 'look-behind)
+                                          (lambda (x) x) not)
+                                      (check cnk* init (car init) str* i* end*
+                                             matches (lambda () #f))))))
+                          (set! %look-behind-target saved)
+                          (if ok
+                              (next cnk init src str i end matches fail)
+                              (fail)))))))))
             ((atomic)
              (let ((once
                     (lp (sre-sequence (cdr sre))
@@ -574,6 +675,16 @@
                  (fail)))))
         ((epsilon)
          next)
+        ((%look-behind-end)
+         ;; jolt #1062 / drg-bba2: zero-width assertion that succeeds only when the
+         ;; current position equals the look-behind's target end.  The target is
+         ;; set around the body's evaluation (%look-behind-target), letting a
+         ;; look-behind body's end be pinned to i while its chunk is widened past i
+         ;; so a nested look-around can read there.
+         (lambda (cnk init src str i end matches fail)
+           (if (= i %look-behind-target)
+               (next cnk init src str i end matches fail)
+               (fail))))
         (else
          (let ((cell (assq sre sre-named-definitions)))
            (if cell
