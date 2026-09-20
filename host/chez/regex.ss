@@ -339,8 +339,19 @@
 (define (jolt-matcher-group m . n)
   (let ((last (matcher-t-last m)))
     (if last
-        (let ((s (irregex-match-substring last (if (pair? n) (->idx (car n)) 0))))
-          (if s s jolt-nil))
+        (let ((arg (if (pair? n) (car n) 0)))
+          (if (string? arg)
+              ;; JVM .group(String) is name-only: an unknown name is an error,
+              ;; even when the string looks like a group number.
+              (let ((sym (string->symbol arg)))
+                (if (assq sym (irregex-match-names last))
+                    (let ((s (irregex-match-substring last sym)))
+                      (if s s jolt-nil))
+                    (jolt-throw (jolt-host-throwable
+                                 "java.lang.IllegalArgumentException"
+                                 (string-append "No group with name <" arg ">")))))
+              (let ((s (irregex-match-substring last (->idx arg))))
+                (if s s jolt-nil))))
         (jolt-matcher-no-match))))
 (define (jolt-matcher-group-count m) (irregex-num-submatches (matcher-t-irx m)))
 ;; .lookingAt: anchored at the region START, matching a PREFIX — the middle ground
@@ -554,11 +565,64 @@
           ((char=? (string-ref s i) c) #t)
           (else (loop (fx+ i 1))))))
 
-;; Replacement-string expansion against an irregex match, with the JVM's
-;; Matcher.appendReplacement syntax: $N inserts group N's text (dropped when the
-;; group didn't participate) and a backslash escapes the next character — so
-;; \\ inserts one backslash and \$ a literal dollar. re-quote-replacement's
-;; output round-trips through this.
+;; Group N's replacement text: empty when the group did not participate, and the
+;; JVM's IndexOutOfBoundsException ("No group N") when N exceeds the count.
+(define (group-text m ref)
+  (if (fx>? ref (irregex-match-num-submatches m))
+      (jolt-throw (jolt-host-throwable
+                   "java.lang.IndexOutOfBoundsException"
+                   (string-append "No group " (number->string ref))))
+      (let ((g (irregex-match-substring m ref)))
+        (if g g ""))))
+
+;; A ${name} reference: `i` is the index of the `{`. Returns (next-index . text).
+;; The braced form names a group (never a number): a missing `}`, an empty or
+;; digit-leading name, and a name no group carries are each the JVM's error.
+(define (parse-braced-ref repl m i)
+  (let ((len (string-length repl)))
+    (define (bad msg)
+      (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException" msg)))
+    (let close ((k (fx+ i 1)))
+      (if (fx>=? k len)
+          (bad "named capturing group is missing trailing '}'")
+          (if (char=? (string-ref repl k) #\})
+              (let ((name (substring repl (fx+ i 1) k)))
+                (cond
+                  ((fx=? (string-length name) 0)
+                   (bad "named capturing group has 0 length name"))
+                  ((char<=? #\0 (string-ref name 0) #\9)
+                   (bad (string-append "capturing group name {" name
+                                       "} starts with digit character")))
+                  (else
+                   (let ((sym (string->symbol name)))
+                     (if (assq sym (irregex-match-names m))
+                         (let ((g (irregex-match-substring m sym)))
+                           (cons (fx+ k 1) (if g g "")))
+                         (bad (string-append "No group with name {" name "}")))))))
+              (close (fx+ k 1)))))))
+
+;; The group number of a $N reference starting at index i (a digit): a greedy run
+;; of digits clipped to the longest prefix that is a valid group (JVM
+;; appendReplacement), so "$12" with one group is group 1 then a literal "2".
+;; Returns (next-index . text).
+(define (parse-group-ref repl m i)
+  (let ((len (string-length repl))
+        (ngroups (irregex-match-num-submatches m)))
+    (define (digit? c) (char<=? #\0 c #\9))
+    (define (dv c) (fx- (char->integer c) 48))
+    (let consume ((j (fx+ i 1)) (ref (dv (string-ref repl i))))
+      (if (and (fx<? j len)
+               (digit? (string-ref repl j))
+               (fx<=? (+ (* ref 10) (dv (string-ref repl j))) ngroups))
+          (consume (fx+ j 1) (+ (* ref 10) (dv (string-ref repl j))))
+          (cons j (group-text m ref))))))
+
+;; Matcher.appendReplacement syntax: $N inserts group N's text and ${name} the
+;; text of the named group, while a backslash escapes the next character, so \\
+;; inserts one backslash and \$ a literal dollar. A dangling backslash, a `$`
+;; that does not start a group reference, and a group index past the count are
+;; errors, matching the JVM. Unlike $N, ${...} is a name reference and never a
+;; number, so ${1} is the same error as ${y} when no group is named "1".
 (define (expand-dollar repl m)
   (let ((len (string-length repl)))
     (let loop ((i 0) (acc '()))
@@ -566,16 +630,30 @@
           (apply string-append (reverse acc))
           (let ((c (string-ref repl i)))
             (cond
-              ((and (char=? c #\\) (fx<? (fx+ i 1) len))
-               (loop (fx+ i 2) (cons (string (string-ref repl (fx+ i 1))) acc)))
-              ((and (char=? c #\$) (fx<? (fx+ i 1) len)
-                    (char<=? #\0 (string-ref repl (fx+ i 1)))
-                    (char<=? (string-ref repl (fx+ i 1)) #\9))
-               (let* ((n (fx- (char->integer (string-ref repl (fx+ i 1))) 48))
-                      (g (and (fx<=? n (irregex-match-num-submatches m))
-                              (irregex-match-substring m n))))
-                 (loop (fx+ i 2) (if g (cons g acc) acc))))
+              ((char=? c #\\)
+               (if (fx>=? (fx+ i 1) len)
+                   (jolt-throw (jolt-host-throwable
+                                "java.lang.IllegalArgumentException"
+                                "character to be escaped is missing"))
+                   (loop (fx+ i 2)
+                         (cons (string (string-ref repl (fx+ i 1))) acc))))
+              ((and (char=? c #\$) (fx>=? (fx+ i 1) len))
+               (jolt-throw (jolt-host-throwable
+                            "java.lang.IllegalArgumentException"
+                            "Illegal group reference: group index is missing")))
+              ((and (char=? c #\$)
+                    (char<=? #\0 (string-ref repl (fx+ i 1)) #\9))
+               (let ((r (parse-group-ref repl m (fx+ i 1))))
+                 (loop (car r) (cons (cdr r) acc))))
+              ((and (char=? c #\$) (char=? (string-ref repl (fx+ i 1)) #\{))
+               (let ((r (parse-braced-ref repl m (fx+ i 1))))
+                 (loop (car r) (cons (cdr r) acc))))
+              ((char=? c #\$)
+               (jolt-throw (jolt-host-throwable
+                            "java.lang.IllegalArgumentException"
+                            "Illegal group reference")))
               (else (loop (fx+ i 1) (cons (string c) acc)))))))))
+
 
 ;; One match's replacement text. A string gets $N expansion; a fn (jolt closure)
 ;; is called with the match result (whole string, or [whole g1 ...] when grouped)
@@ -595,15 +673,41 @@
             (apply string-append (reverse (cons (substring s last len) acc)))
             (let ((ms (irregex-match-start-index m 0))
                   (me (irregex-match-end-index m 0)))
-              (if (fx=? me ms)                     ; zero-width: step past
-                  (if (fx>=? start len)
-                      (apply string-append (reverse (cons (substring s last len) acc)))
-                      (loop (fx+ start 1) last acc))
-                  (let ((acc2 (cons (replacement-text replacement m)
-                                    (cons (substring s last ms) acc))))
-                    (if all?
-                        (loop me me acc2)
-                        (apply string-append (reverse (cons (substring s me len) acc2))))))))))))
+              (let ((acc2 (cons (replacement-text replacement m)
+                                (cons (substring s last ms) acc))))
+                ;; advance to the match end, or one past a zero-width match —
+                ;; which is emitted like any other, then stepped over. The same
+                ;; rule re-seq and the matcher's .find use.
+                (if all?
+                    (loop (if (fx=? me ms) (fx+ me 1) me) me acc2)
+                    (apply string-append (reverse (cons (substring s me len) acc2)))))))))))
+
+;; Matcher.replaceAll / .replaceFirst: substitute every match in the region (or
+;; just the first), expanding $N in the replacement, then leave the matcher
+;; reset with no match — the JVM's post-state. The region confines where matches
+;; are sought; the whole input is returned with the region's replacements.
+(define (jolt-matcher-replace m replacement all?)
+  (let* ((s (matcher-t-str m))
+         (irx (matcher-t-irx m))
+         (len (string-length s))
+         (a (matcher-t-rstart m))
+         (b (matcher-t-rend m)))
+    (let loop ((pos a) (last a) (acc '()))
+      (let ((mm (and (fx<=? pos b) (irx-search-from irx s pos a b))))
+        (if (not mm)
+            (begin
+              (matcher-reset! m)
+              (apply string-append (reverse (cons (substring s last len) acc))))
+            (let ((ms (irregex-match-start-index mm 0))
+                  (me (irregex-match-end-index mm 0)))
+              (let ((acc2 (cons (expand-dollar replacement mm)
+                                (cons (substring s last ms) acc))))
+                ;; same zero-width advance rule as re-replace/re-seq/.find
+                (if all?
+                    (loop (if (fx=? me ms) (fx+ me 1) me) me acc2)
+                    (begin
+                      (matcher-reset! m)
+                      (apply string-append (reverse (cons (substring s me len) acc2))))))))))))
 
 ;; A regex that is really a literal, replaced by a string that is really a
 ;; literal, is a plain search-and-replace — the same recognition split uses.

@@ -1712,6 +1712,13 @@
                     (not (jolt-nil? (jolt-re-find obj)))))
                ((string=? method-name "group") (apply jolt-matcher-group obj rest))
                ((string=? method-name "groupCount") (jolt-matcher-group-count obj))
+               ;; .replaceAll/.replaceFirst reset the matcher, substitute every
+               ;; match in the region (or the first), expand $N in the replacement,
+               ;; and leave the matcher with no match.
+               ((string=? method-name "replaceAll")
+                (jolt-matcher-replace obj (car rest) #t))
+               ((string=? method-name "replaceFirst")
+                (jolt-matcher-replace obj (car rest) #f))
                ((string=? method-name "region")
                 (jolt-matcher-region obj (jnum->exact (car rest)) (jnum->exact (cadr rest))))
                ((string=? method-name "regionStart") (matcher-t-rstart obj))
