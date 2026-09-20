@@ -2,8 +2,13 @@
 ;;
 ;; `sre->procedure` below is a verbatim copy of the vendored IrRegex definition
 ;; (vendor/irregex/irregex.scm), redefined globally so it wins over the vendored
-;; one at load time.  The ONE change is in the `look-behind` arm, which gains an
-;; O(1) fast path for single-character bodies.
+;; one at load time.  The changes are marked "jolt #1062" and are these: the
+;; `look-behind` arm gains an O(1) fast path for single-character bodies and a
+;; width-bounded rescan for wider ones; the symbol arm gains the zero-width
+;; `%look-behind-end` assertion that bounded rescan needs, and a direct compilation
+;; of the java.util.regex line anchors (host/chez/java/regex-anchors.ss); and the
+;; three "empty repetition" guards ask `%sre-empty?`, which knows those anchors are
+;; zero-width, rather than the vendored `sre-empty?`, which does not.
 ;;
 ;; Why: the vendored `look-behind` compiles its body as `(* any) X eos` against a
 ;; chunk wrapped to end at the current position, so it rescans from the chunk
@@ -72,6 +77,11 @@
      (case sre
        ((any nonl) 1)
        ((bos bol bow eos eol eow nwb epsilon) 0)
+       ;; jolt #1062: the java.util.regex line-anchor primitives
+       ;; (regex-anchors.ss) are zero-width assertions, exactly like `eos`
+       ;; and `eol` above, and are bounded the same way.
+       ((%java-bol %java-eol %java-final-eol
+         %java-bol-unix %java-final-eol-unix) 0)
        (else #f)))
     ((pair? sre)
      (case (car sre)
@@ -113,6 +123,11 @@
      (case sre
        ((any nonl) 1)
        ((bos bol bow eos eol eow nwb epsilon) 0)
+       ;; jolt #1062: the java.util.regex line-anchor primitives
+       ;; (regex-anchors.ss) are zero-width assertions, exactly like `eos`
+       ;; and `eol` above, and are bounded the same way.
+       ((%java-bol %java-eol %java-final-eol
+         %java-bol-unix %java-final-eol-unix) 0)
        (else #f)))
     ((pair? sre)
      (case (car sre)
@@ -191,6 +206,15 @@
               (sre->cset sre (flag-set? flags ~case-insensitive?))
               next))
             ((or)
+             ;; jolt #1062: an alternation of single code units is a char SET, and
+             ;; one binary search beats a chain of alternation closures — which is
+             ;; how every java.util.regex character class arrives here (`[a-z_]`,
+             ;; `\w`, `\s` are all `or`).  regex-anchors.ss says when the rewrite
+             ;; is legal; when it is not, the vendored alternation below runs.
+             (if (%sre-cset-able? sre)
+                 (sre-cset->procedure
+                  (sre->cset sre (flag-set? flags ~case-insensitive?))
+                  next)
              (case (length (cdr sre))
                ((0) (lambda (cnk init src str i end matches fail) (fail)))
                ((1) (rec (cadr sre)))
@@ -203,7 +227,7 @@
                   (lambda (cnk init src str i end matches fail)
                     (first cnk init src str i end matches
                            (lambda ()
-                             (rest cnk init src str i end matches fail))))))))
+                             (rest cnk init src str i end matches fail)))))))))
             ((w/case)
              (lp (sre-sequence (cdr sre))
                  n
@@ -240,7 +264,7 @@
                        (lambda () (body cnk init src str i end matches fail))))))
             ((*)
              (cond
-              ((sre-empty? (sre-sequence (cdr sre)))
+              ((%sre-empty? (sre-sequence (cdr sre)))
                (error "invalid sre: empty *" sre))
               (else
                (let ((body (rec (list '+ (sre-sequence (cdr sre))))))
@@ -250,7 +274,7 @@
                            (next cnk init src str i end matches fail))))))))
             ((*?)
              (cond
-              ((sre-empty? (sre-sequence (cdr sre)))
+              ((%sre-empty? (sre-sequence (cdr sre)))
                (error "invalid sre: empty *?" sre))
               (else
                (letrec
@@ -269,7 +293,7 @@
                            (body cnk init src str i end matches fail))))))))
             ((+)
              (cond
-              ((sre-empty? (sre-sequence (cdr sre)))
+              ((%sre-empty? (sre-sequence (cdr sre)))
                (error "invalid sre: empty +" sre))
               (else
                (letrec
@@ -686,10 +710,30 @@
                (next cnk init src str i end matches fail)
                (fail))))
         (else
-         (let ((cell (assq sre sre-named-definitions)))
-           (if cell
-               (rec (cdr cell))
-               (error "unknown regexp" sre))))))
+         ;; jolt #1062: java.util.regex's line anchors (host/chez/java/
+         ;; regex-anchors.ss).  Each is decidable from the unit before the position
+         ;; and the two after it, so it compiles to ONE zero-width test rather than
+         ;; the look-around SRE it is registered as.  This arm has to precede the
+         ;; sre-named-definitions lookup below, which would expand it back into
+         ;; that SRE — which is exactly what every other irregex walker wants, and
+         ;; what the matcher must not do.
+         (cond
+           ((%java-anchor-proc sre)
+            => (lambda (anchor?)
+                 (lambda (cnk init src str i end matches fail)
+                   (if (anchor? cnk init src str i end)
+                       (next cnk init src str i end matches fail)
+                       (fail)))))
+           ;; …and a named class (`whitespace`, `alphanumeric`, `punctuation`, …)
+           ;; whose definition is an alternation of units folds to a char set for
+           ;; the same reason the `or` arm above does; expanding it first would
+           ;; hand the alternation chain back.
+           ((%sre-cset-able? sre)
+            (sre-cset->procedure
+             (sre->cset sre (flag-set? flags ~case-insensitive?))
+             next))
+           ((assq sre sre-named-definitions) => (lambda (cell) (rec (cdr cell))))
+           (else (error "unknown regexp" sre))))))
      ((char? sre)
       (if (flag-set? flags ~case-insensitive?)
           ;; case-insensitive

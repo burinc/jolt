@@ -24,9 +24,13 @@
 ;; quadratic in the DFA size and unbounded in work, which made a large
 ;; alternation take seconds (or never finish) on its first match. See the file.
 (load "host/chez/regex-dfa.ss")
-;; …and its SRE compiler, for single-character anchors: the vendored look-behind
-;; rescans from the chunk start, so `^`/`$`/`\A`/`\Z` anchored patterns were
-;; quadratic. See the file (#1062).
+;; …and java.util.regex's line anchors as O(1) zero-width primitives: expressed as
+;; the look-around SREs they are equivalent to, `^`/`$`/`\Z` paid the general
+;; look-around machinery at every candidate position. See the file (#1062).
+(load "host/chez/java/regex-anchors.ss")
+;; …and its SRE compiler, which compiles those primitives and bounds the vendored
+;; look-behind: that look-behind rescans from the chunk start, which made any
+;; pattern containing one quadratic. See the file (#1062).
 (load "host/chez/java/regex-anchor-sre.scm")
 
 

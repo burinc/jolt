@@ -490,11 +490,20 @@
                    (seq (or bos (look-behind (~ #\return))) #\newline eos))))
 (define final-eol-sre-unix `(look-ahead (or eos (seq #\newline eos))))
 
+;; What the parser actually emits for an anchor is the matching PRIMITIVE from
+;; host/chez/regex-anchors.ss, not the SRE above: each of these assertions is
+;; decidable from three code units, and paying for the general look-around
+;; machinery at every candidate position is what made `$` 70x the JVM (#1062).
+;; The SREs remain the primitives' registered expansions, so they are still what
+;; irregex itself reads the anchors as — see regex-anchors.ss.  Multiline `$`
+;; under UNIX_LINES needs no primitive: irregex's own `eol` already means "before
+;; a \n, or at the end of input", which is `(or eol eos)` with the redundancy
+;; dropped.
 (define (jr-dot-sre flags) (if (jr-flag? flags 'unix-lines) 'nonl dot-sre-wide))
-(define (jr-bol-sre flags) (if (jr-flag? flags 'unix-lines) bol-sre-unix bol-sre-wide))
-(define (jr-eol-sre flags) (if (jr-flag? flags 'unix-lines) '(or eol eos) eol-sre-wide))
+(define (jr-bol-sre flags) (if (jr-flag? flags 'unix-lines) '%java-bol-unix '%java-bol))
+(define (jr-eol-sre flags) (if (jr-flag? flags 'unix-lines) 'eol '%java-eol))
 (define (jr-final-eol-sre flags)
-  (if (jr-flag? flags 'unix-lines) final-eol-sre-unix final-eol-sre-wide))
+  (if (jr-flag? flags 'unix-lines) '%java-final-eol-unix '%java-final-eol))
 
 (define (parse-escape src i end flags)
   (if (>= i end)

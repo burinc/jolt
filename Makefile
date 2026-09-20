@@ -122,7 +122,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorcheck \
+  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorcheck regexreplace deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -1144,6 +1144,15 @@ regexmatcher:
 # path never does — plus JVM-verified answers, so no clock.
 regexanchor:
 	@$(CHEZ) --script test/chez/regex-anchor-test.ss
+
+# java.util.regex's `^`/`$`/`\Z` are compiled as zero-width PRIMITIVES
+# (host/chez/java/regex-anchors.ss), not as the look-ahead/look-behind SREs they
+# are equivalent to. The SREs stay registered as those primitives' expansions, so
+# the gate is differential: the same pattern compiled both ways must report the
+# same matches over every terminator (\n, \r, \r\n, NEL, LS, PS) in every
+# position. Also pins the `or`-to-char-set fold, and what it must refuse.
+regexanchorprims:
+	@$(CHEZ) --script test/chez/regex-anchor-prims-test.ss
 
 # clojure.string/replace must emit the replacement for a ZERO-WIDTH match —
 # #"" , (?=x), (?m)^/(?m)$ — then advance one char past it, the same rule re-seq
