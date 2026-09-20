@@ -204,6 +204,25 @@
    :check :prose
    :why "the JVM's answer is the machine's default locale, so there is no fixed value to record"
    :note "Core has no default locale. Explicit locale ids resolve through the :date-names extension point (:fallback :default): an unregistered id falls back to ROOT rather than throwing."}
+  ;; jolt's Unicode data is the Chez it runs on and the JVM's is the JDK's: two
+  ;; independent UCD versions on their own release schedules. Chez 10.4.1 answers
+  ;; from Unicode 17.0 and JDK 25 from 16.0, so a code point whose properties
+  ;; changed between the two answers differently. Sweeping every BMP code point
+  ;; through all four normalization forms finds exactly one: U+A7F1 MODIFIER
+  ;; LETTER CAPITAL S, given the compatibility decomposition <super> 0053 in
+  ;; 17.0, so NFKC/NFKD fold it to "S" here and leave it alone on the JVM
+  ;; (NFC/NFD leave it alone on both). Masking that one code point would pin jolt
+  ;; to one JDK's UCD version, which the next JDK moves anyway, and the rest of
+  ;; jolt's Unicode surface — Character/getType, \p{L}, case conversion — already
+  ;; reads those same Chez tables. So the divergence on record is the version,
+  ;; and the code point is what it currently amounts to (gh-1066).
+  {:category :host-model
+   :behavior "(java.text.Normalizer/normalize \"\\uA7F1\" java.text.Normalizer$Form/NFKC)"
+   :jvm "\"\\ua7f1\" — UCD 16.0 gives it no decomposition"
+   :jolt "\"S\" — UCD 17.0 gives it <super> 0053"
+   :check :prose
+   :why "each side answers from its own host's Unicode version, so either value changes under a JDK or a Chez bump and neither is a fixed pair to record"
+   :note "The fast paths in host/chez/java/text-normalize.ss derive their tables from the running Chez for exactly this reason, so they cannot disagree with it about which Unicode version this is; make normalizecheck holds the one property they pin."}
   ;; format's %t name conversions read the SAME names, for the same reason, and
   ;; so carry the same divergence: %tB / %tb / %tA / %ta come off the :date-names
   ;; extension point, ROOT's abbreviated forms with nothing registered, where the

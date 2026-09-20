@@ -757,6 +757,31 @@
   {:suite "normalizer" :expr "[(java.text.Normalizer/normalize \"ﬁ\" java.text.Normalizer$Form/NFKC) (str java.text.Normalizer$Form/NFKD) (.getName (class java.text.Normalizer$Form/NFC))]" :expected "[\"fi\" \"NFKD\" \"java.text.Normalizer$Form\"]"}
   {:suite "normalizer" :expr "[(java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC) (java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC)]" :expected "[true false]"}
 
+  ;; --- java.text.Normalizer fast paths (gh-1066) -------------------------------
+  ;; normalize/isNormalized no longer rebuild every string through Chez: a
+  ;; per-character classification says which characters begin a normalization
+  ;; segment of their own, so already-normalized runs are copied (or, when the
+  ;; whole string is one, handed straight back) and only the stretches with no
+  ;; boundary reach the normalizer. The rows below are the three classes and the
+  ;; boundaries between them -- host/chez/java/text-normalize.ss.
+  ;; An input that needs no work is the SAME string, not a rebuilt equal one.
+  {:suite "normalizer" :expr "(let [s \"plain ascii\"] (identical? s (java.text.Normalizer/normalize s java.text.Normalizer$Form/NFKC)))" :expected "true"}
+  ;; inert runs, an expansion (fi) and a singleton (OHM SIGN -> OMEGA) interleaved
+  {:suite "normalizer" :expr "(java.text.Normalizer/normalize \"a\ufb01b\u2126c\" java.text.Normalizer$Form/NFKC)" :expected "\"afib\u03a9c\""}
+  ;; an unsafe stretch: the combining acute has no boundary before it, so it is
+  ;; normalized together with the character it belongs to and not on its own
+  {:suite "normalizer" :expr "(vec (map int (java.text.Normalizer/normalize \"ae\u0301b\" java.text.Normalizer$Form/NFC)))" :expected "[97 233 98]"}
+  ;; canonical ordering inside that stretch: dot-above (230) after dot-below (220)
+  {:suite "normalizer" :expr "(vec (map int (java.text.Normalizer/normalize \"q\u0307\u0323\" java.text.Normalizer$Form/NFC)))" :expected "[113 803 775]"}
+  ;; composes BACKWARD: a Hangul jamo and an Indic vowel sign each pull the
+  ;; starter before them into their segment. Splitting there is the miss the
+  ;; pinned table in text-normalize.ss exists to prevent (make normalizecheck).
+  {:suite "normalizer" :expr "[(vec (map int (java.text.Normalizer/normalize \"\u1100\u1161\u11a8\" java.text.Normalizer$Form/NFC))) (vec (map int (java.text.Normalizer/normalize \"\uac00\u11a8\" java.text.Normalizer$Form/NFC))) (vec (map int (java.text.Normalizer/normalize \"\u09c7\u09be\" java.text.Normalizer$Form/NFC)))]" :expected "[[44033] [44033] [2507]]"}
+  {:suite "normalizer" :expr "(vec (map int (java.text.Normalizer/normalize \"\uac01\" java.text.Normalizer$Form/NFD)))" :expected "[4352 4449 4520]"}
+  ;; isNormalized answers at the first character that disagrees, and says true
+  ;; for text it never has to normalize
+  {:suite "normalizer" :expr "[(java.text.Normalizer/isNormalized \"\ufb01 and the rest of a long ascii tail\" java.text.Normalizer$Form/NFKC) (java.text.Normalizer/isNormalized \"plain ascii\" java.text.Normalizer$Form/NFKC) (java.text.Normalizer/isNormalized \"\uac00\u11a8\" java.text.Normalizer$Form/NFC)]" :expected "[false true false]"}
+
   ;; --- CharsetDecoder / CodingErrorAction (gh-946) ----------------------------
   ;; CodingErrorAction had no provider and the decoder's method table held only
   ;; .charset, so the documented way to decode a stream a chunk at a time could

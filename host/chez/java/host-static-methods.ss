@@ -884,8 +884,10 @@
 ;; ---- java.text.Normalizer ----------------------------------------------------
 ;; Unicode normalization: identifier comparison, path equality on filesystems
 ;; that store decomposed accents, and search/fuzzy matching all go through it.
-;; Chez implements all four Unicode normalization forms natively, so this is a
-;; direct dispatch on the Form constant rather than a table of its own.
+;; Chez implements all four Unicode normalization forms natively, so the Form
+;; constant only has to pick one of them; java/text-normalize.ss is what stands
+;; between that and the call, so text that needs no normalizing does not get
+;; rebuilt character by character to prove it.
 ;;
 ;; Form is an enum, and jolt models an enum constant the way TimeUnit does: a
 ;; jhost carrying its name, so (str Normalizer$Form/NFC) is "NFC" as on the JVM
@@ -906,21 +908,26 @@
 ;; has no other failure mode. A form that is not one of the four constants can
 ;; only come from jolt code that built one by hand, so it names itself in the
 ;; message rather than reading as a missing method.
-(define (normalizer-normalize s form)
-  (let ((str (jolt-str-render-one s))
-        (nm (if (normalizer-form? form) (normalizer-form-name form) (jolt-str-render-one form))))
-    (cond ((string=? nm "NFC")  (string-normalize-nfc str))
-          ((string=? nm "NFD")  (string-normalize-nfd str))
-          ((string=? nm "NFKC") (string-normalize-nfkc str))
-          ((string=? nm "NFKD") (string-normalize-nfkd str))
+(define (normalizer-form-index form)
+  (let ((nm (if (normalizer-form? form) (normalizer-form-name form) (jolt-str-render-one form))))
+    (cond ((string=? nm "NFC")  0)
+          ((string=? nm "NFD")  1)
+          ((string=? nm "NFKC") 2)
+          ((string=? nm "NFKD") 3)
           (else (throw-jvm (quote IllegalArgumentException)
                            (string-append "Normalizer/normalize: not a Normalizer.Form: " nm))))))
+;; Both entry points run over java/text-normalize.ss's per-character
+;; classification rather than straight at Chez: text that is already normalized
+;; is recognized by a scan and returned as it came in, and isNormalized answers
+;; at the first character that disagrees instead of normalizing the whole string
+;; to compare it (gh-1066).
+(define (normalizer-normalize s form)
+  (jtn-normalize (jolt-str-render-one s) (normalizer-form-index form)))
 (register-class-statics! "java.text.Normalizer"
   (list (cons "normalize" normalizer-normalize)
         (cons "isNormalized"
               (lambda (s form)
-                (let ((str (jolt-str-render-one s)))
-                  (string=? str (normalizer-normalize str form)))))))
+                (jtn-normalized? (jolt-str-render-one s) (normalizer-form-index form))))))
 (register-class-statics! "java.text.Normalizer$Form" normalizer-form-constants)
 
 ;; Class.forName: an array descriptor ("[C") is its own class token; a class Jolt
