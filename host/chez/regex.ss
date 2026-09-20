@@ -50,10 +50,27 @@
 ;; this matches the JVM's submatch semantics; irregex's DFA is POSIX leftmost-longest
 ;; and, worse, leaks a non-participating alternation group's capture (e.g.
 ;; #"(?:([0-9])|([0-9])r([0-9]+))" on "2r11" left group 1 = "2"), which broke
-;; tools.reader's number reader. Non-capturing patterns keep the fast DFA — with no
-;; groups to read, its whole-match result is all a caller sees. Which engine a
-;; pattern needs is read off its SRE (sre-count-submatches below), so each
-;; pattern builds exactly one engine, at first use.
+;; tools.reader's number reader.
+;;
+;; A NON-capturing pattern used to keep the DFA unconditionally, and that was
+;; wrong twice over (#1062). Leftmost-longest is visible without any groups — the
+;; JVM answers "a" for (re-find #"a|ab" "ab") and the DFA answered "ab" — and the
+;; DFA is not the fast engine for most patterns either: its transition lookup
+;; walks a list of char sets per character, so a literal or a class repetition
+;; measured 3-8x the backtracking matcher on the same input (#"zzz" 17 ms vs
+;; 2.8 ms over 5k lines, #"[0-9]+" 30 ms vs 3.8 ms).
+;;
+;; What the DFA IS for is the one shape backtracking is bad at: an unbounded
+;; repetition with more pattern after it, where a failed match retries that
+;; repetition from every start position. #".*z" over a line with no z is quadratic
+;; — 268 ms against the DFA's 16 ms, and babashka, itself a backtracking engine,
+;; takes 234 ms. So the DFA is kept for exactly those patterns and the
+;; backtracking matcher takes the rest, which is both faster and the JVM's own
+;; answer. sre-linear-backtrack? below is the test, and it is a WHITELIST: a shape
+;; it does not model keeps the DFA.
+;;
+;; Which engine a pattern needs is read off its SRE, so each pattern builds
+;; exactly one engine, at first use.
 
 ;; Compile a Java/Clojure pattern string → a regex-t. The pattern is parsed into an
 ;; irregex SRE via regex-translate.ss's java-pattern->sre, which handles the full
@@ -71,6 +88,87 @@
                          (and (< i (vector-length x))
                               (or (walk (vector-ref x i)) (lp (+ i 1))))))
           (else #f))))
+
+;; Can the backtracking matcher run this SRE in linear time per start position?
+;;
+;; It cannot when an UNBOUNDED repetition has consuming pattern after it: the
+;; repetition takes everything, the tail fails, and it gives a unit back and
+;; retries, once per start position. That is the #".*z" shape, and it is the only
+;; shape jolt keeps irregex's DFA for (see the engine note above). Two sources of
+;; it: a repetition followed by something that can consume, and a repetition
+;; nested inside another (#"(?:a+)+"), whose retries multiply.
+;;
+;; A WHITELIST, deliberately: an SRE shape not modelled here answers #f and keeps
+;; the DFA, so a new translator output can only cost speed, never correctness.
+;; `zero-width?` is the companion — a trailing assertion is not "consuming
+;; pattern after it", which is what makes #"\s+$" linear.
+(define (sre-zero-width? x)
+  (cond ((symbol? x)
+         (and (memq x '(epsilon bos eos bol eol bow eow nwb commit
+                        %java-bol %java-eol %java-final-eol
+                        %java-bol-unix %java-final-eol-unix))
+              #t))
+        ((pair? x)
+         (case (car x)
+           ((look-ahead neg-look-ahead look-behind neg-look-behind) #t)
+           ((seq : submatch $ => submatch-named atomic w/case w/nocase)
+            (let lp ((xs (cdr x)))
+              (or (null? xs) (and (sre-zero-width? (car xs)) (lp (cdr xs))))))
+           ((or) (let lp ((xs (cdr x)))
+                   (or (null? xs) (and (sre-zero-width? (car xs)) (lp (cdr xs))))))
+           (else #f)))
+        (else #f)))
+
+(define (sre-unbounded-rep? x)
+  (and (pair? x)
+       (or (and (memq (car x) '(* + *? +? >= >=? word+)) #t)
+           (and (memq (car x) '(** **?)) (not (number? (caddr x)))))))
+
+(define (sre-has-unbounded-rep? x)
+  (or (sre-unbounded-rep? x)
+      (and (pair? x)
+           (let lp ((xs (cdr x)))
+             (and (pair? xs) (or (sre-has-unbounded-rep? (car xs)) (lp (cdr xs))))))))
+
+(define (sre-linear-backtrack? sre)
+  (let walk ((x sre))
+    (cond
+      ((char? x) #t)
+      ((string? x) #t)
+      ((symbol? x) #t)                       ; a named class or an assertion
+      ((not (pair? x)) #f)
+      ((string? (car x)) #t)                 ; ("abc"), an enumerated char set
+      (else
+       (case (car x)
+         ((~ & - /) #t)                      ; a char set: one unit, no retry
+         ((seq : submatch $ => submatch-named atomic w/case w/nocase)
+          ;; every element safe, and nothing that can consume after a repetition
+          (let lp ((xs (if (memq (car x) '(=> submatch-named)) (cddr x) (cdr x))))
+            (cond ((null? xs) #t)
+                  ((not (walk (car xs))) #f)
+                  ((and (sre-has-unbounded-rep? (car xs))
+                        (let tail ((ys (cdr xs)))
+                          (and (pair? ys)
+                               (or (not (sre-zero-width? (car ys))) (tail (cdr ys))))))
+                   #f)
+                  (else (lp (cdr xs))))))
+         ((or) (let lp ((xs (cdr x)))
+                 (or (null? xs) (and (walk (car xs)) (lp (cdr xs))))))
+         ((? ??) (let ((body (sre-sequence (cdr x))))
+                   (and (walk body) (not (sre-has-unbounded-rep? body)))))
+         ((* + *? +? word+)
+          ;; a repetition whose body repeats is the #"(?:a+)+" blowup
+          (let ((body (sre-sequence (cdr x))))
+            (and (walk body) (not (sre-has-unbounded-rep? body)))))
+         ((** **?)
+          (let ((body (sre-sequence (cdddr x))))
+            (and (number? (cadr x)) (number? (caddr x))
+                 (walk body) (not (sre-has-unbounded-rep? body)))))
+         ((=) (let ((body (sre-sequence (cddr x))))
+                (and (number? (cadr x)) (walk body)
+                     (not (sre-has-unbounded-rep? body)))))
+         (else #f))))))
+
 (define regex-cache (make-hashtable string-hash string=?))
 (define regex-cache-mutex (make-mutex 'regex-cache))
 
@@ -121,7 +219,8 @@
                                (let-values (((sre opts) (java-pattern->sre source)))
                                  (vector 'parsed sre opts
                                          (or (sre-has-backref? sre)
-                                             (> (sre-count-submatches sre) 0)))))))
+                                             (> (sre-count-submatches sre) 0)
+                                             (sre-linear-backtrack? sre)))))))
                   (hashtable-set! regex-cache source entry)
                   entry)))
           (lambda () (jolt-unlock! regex-cache-mutex))))))

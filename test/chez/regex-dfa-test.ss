@@ -1,13 +1,20 @@
 ;; regex-dfa-test.ss — the DFA work budget in host/chez/regex-dfa.ss (#945).
 ;;
-;; A group-free pattern compiles to irregex's DFA unless the conversion runs past
-;; the state cap or, since #945, past a deterministic work budget; either answer
-;; is "compile the backtracking matcher instead". The property gated here is
-;; that choice itself, not the time it takes: the pattern from #945 (a 50-way
-;; alternation with unbounded `.*` branches, which took ~5s / never finished) must
-;; trip the budget and get the backtracker, a small pattern must still get a DFA,
-;; and the two engines must agree on every match — the budget is a match-time
-;; optimization, never a semantics change.
+;; A group-free pattern compiles to irregex's DFA unless jolt's own engine rule
+;; declines it (#1062), or the conversion runs past the state cap or, since #945,
+;; past a deterministic work budget; every one of those answers is "compile the
+;; backtracking matcher instead". The property gated here is that choice itself,
+;; not the time it takes: the pattern from #945 (a 50-way alternation with
+;; unbounded `.*` branches, which took ~5s / never finished) must trip the budget
+;; and get the backtracker, a pattern of the shape the DFA is kept FOR must still
+;; get a DFA, and the two engines must agree on every match — the budget is a
+;; match-time optimization, never a semantics change.
+;;
+;; #1062 added the rule in front: the DFA is kept only for a pattern backtracking
+;; would run superlinearly, i.e. one with an unbounded repetition that has
+;; consuming pattern after it (#".*z"). Everything else takes the backtracking
+;; matcher, which is faster AND leftmost-first like java.util.regex, where the DFA
+;; is leftmost-longest. The rows below pin both halves of that.
 ;;
 ;; No clock anywhere: an absolute ceiling false-fails on a slow runner and passes
 ;; on a fast one while hiding a regression, and a ratio needs two arms of the
@@ -56,7 +63,13 @@
 
 ;; 1. a small group-free pattern still gets the DFA
 (ok "a.*b compiles to a DFA" (eq? (engine-of "a.*b") 'dfa))
-(ok "a plain alternation compiles to a DFA" (eq? (engine-of "foo|bar|baz") 'dfa))
+;; …and a pattern backtracking handles linearly does not: nothing follows the
+;; repetition in #"[a-z]+", and #"foo|bar|baz" has no repetition at all.
+(ok "a plain alternation takes the backtracker" (eq? (engine-of "foo|bar|baz") 'backtrack))
+(ok "a trailing repetition takes the backtracker" (eq? (engine-of "[a-z]+") 'backtrack))
+(ok "a repetition before an anchor takes the backtracker" (eq? (engine-of "\\s+$") 'backtrack))
+(ok "a repetition before a consumer keeps the DFA" (eq? (engine-of "[a-z]+@") 'dfa))
+(ok "a nested repetition keeps the DFA" (eq? (engine-of "(?:a+)+") 'dfa))
 
 ;; 2. the #945 pattern trips the budget: backtracker, and it still answers
 (ok "#945 pattern takes the backtracker under the budget" (eq? (engine-of p945) 'backtrack))
@@ -68,9 +81,12 @@
 ;; the state cap as well, so lifting the budget buys it nothing; take patterns
 ;; that DO get a DFA, drop the budget to zero so the same patterns take the
 ;; backtracker, and the two engines must agree on every input.
+;; Patterns that still GET a DFA — the budget arm needs one to take away. Each
+;; has an unbounded repetition with consuming pattern after it, which is the shape
+;; the DFA is kept for.
 (define patterns
-  '("a.*b" "foo|bar|baz" "(?i)rate.?limit|timed? out|upstream.*unavailable"
-    "[0-9]+|x.y" "colou?r|gr[ae]y" "stream error: .*closed|eof"))
+  '("a.*b" "(?i)rate.?limit|timed? out|upstream.*unavailable"
+    "x.*y|p.*q" "stream error: .*closed|eof"))
 (define inputs
   '("HTTP 500" "socket hang up" "zzz" "upstream x y z unavailable" "stream error: foo closed"
     "Rate Limit" "TIMED OUT" "timeout" "aXXb ab a" "eof" "colour gray grey color"
@@ -117,6 +133,17 @@
 (fresh!)
 (for-each (lambda (s x y) (ok (format "30-alt pattern agrees on ~s under both engines" s) (equal? x y)))
           inputs bt-30 dfa-30)
+
+;; 5. leftmost-FIRST, which is what routing these patterns to the backtracking
+;; matcher buys (#1062). java.util.regex takes the first alternative that matches,
+;; not the longest; irregex's DFA is POSIX leftmost-longest, so while #"a|ab" got
+;; a DFA it answered "ab" on "ab" where the JVM answers "a". No groups are needed
+;; to see it, which is why "non-capturing patterns keep the DFA" was not safe.
+(fresh!)
+(ok "a|ab takes the first alternative" (equal? (all-matches "a|ab" "ab") '((0 . 1))))
+(ok "(?:a|ab) takes the first alternative" (equal? (all-matches "(?:a|ab)" "ab") '((0 . 1))))
+(ok "ab|a still takes the first alternative" (equal? (all-matches "ab|a" "ab") '((0 . 2))))
+(ok "foo|foobar takes the first alternative" (equal? (all-matches "foo|foobar" "foobar") '((0 . 3))))
 
 (printf "regex-dfa: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))
