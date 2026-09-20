@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -1112,6 +1112,16 @@ adaptercheck:
 # not build on, so the table is pinned per tag rather than per running machine.
 hostprops:
 	@$(CHEZ) --script test/chez/host-derived-props-test.ss
+
+# java/text-normalize.ss reads every Unicode property it needs back out of the
+# running Chez, but one — whether a character composes BACKWARD — can only be
+# derived by decomposing the whole code point space, so it is pinned in the
+# file. A miss is a wrong answer, not a slow one: the fast path would split a
+# Hangul syllable or an Indic vowel sign away from its base. Unicode keeps
+# adding these, so this re-derives the set from the Chez in hand and diffs it,
+# then runs the fast path against Chez over every code point and ~20k strings.
+normalizecheck:
+	@$(CHEZ) --script test/chez/normalize-fastpath-test.ss
 
 # The host method registry's tag relations (host-static.ss alias / derive): a
 # derivation must agree with the class graph (the child's class a strict

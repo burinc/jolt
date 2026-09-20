@@ -2091,6 +2091,7 @@
 (load "host/chez/java/java-parse.ss")           ; Long/parseLong & co: the NumberFormatException family (shared)
 (load "host/chez/java/host-static.ss")          ; registries + jhost + the emit entry points
 (load "host/chez/java/string-builder.ss")       ; StringBuilder/StringBuffer over jhost (shared)
+(load "host/chez/java/text-normalize.ss")       ; java.text.Normalizer's quick-check fast paths
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
