@@ -122,7 +122,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa \
+  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -1070,6 +1070,15 @@ regexdfacheck:
 regexdfacheck-regen:
 	@sh host/chez/regex-dfa-check.sh --regen
 
+# host/chez/java/regex-anchor-sre.scm is a COPY of one vendored irregex procedure
+# (sre->procedure) with one deliberate change. Same staleness gate as the DFA
+# shadow: fails when the submodule's original has moved on.
+regexanchorcheck:
+	@sh host/chez/regex-anchor-check.sh
+
+regexanchorcheck-regen:
+	@sh host/chez/regex-anchor-check.sh --regen
+
 # The DFA work budget itself (#945): the pattern that took ~5s / never finished
 # takes the backtracker, a small one still gets a DFA, and the two engines agree
 # on every match. Deterministic — which engine a pattern got — not a clock.
@@ -1127,6 +1136,30 @@ dispatchalloc:
 # the result, not the machinery; .group reads the last match, none after a miss.
 regexmatcher:
 	@$(CHEZ) --script test/chez/regex-matcher-test.ss
+
+# A one-unit look-behind must stop rescanning from the chunk start (#1062): the
+# `^`/`$`/`\A`/`\Z` anchors build on such look-behinds, so the vendored O(position)
+# compile made every anchored pattern quadratic / unusable on a whole file. The
+# witness is deterministic — the general path calls `wrap-end-chunker`, the fast
+# path never does — plus JVM-verified answers, so no clock.
+regexanchor:
+	@$(CHEZ) --script test/chez/regex-anchor-test.ss
+
+# java.util.regex's `^`/`$`/`\Z` are compiled as zero-width PRIMITIVES
+# (host/chez/java/regex-anchors.ss), not as the look-ahead/look-behind SREs they
+# are equivalent to. The SREs stay registered as those primitives' expansions, so
+# the gate is differential: the same pattern compiled both ways must report the
+# same matches over every terminator (\n, \r, \r\n, NEL, LS, PS) in every
+# position. Also pins the `or`-to-char-set fold, and what it must refuse.
+regexanchorprims:
+	@$(CHEZ) --script test/chez/regex-anchor-prims-test.ss
+
+# clojure.string/replace must emit the replacement for a ZERO-WIDTH match —
+# #"" , (?=x), (?m)^/(?m)$ — then advance one char past it, the same rule re-seq
+# and the matcher's .find use. re-replace bumped `start` and dropped the
+# replacement text, so every zero-width match replaced with nothing.
+regexreplace:
+	@$(CHEZ) --script test/chez/regex-replace-zero-width-test.ss
 
 # java.io.File/getCanonicalPath's LEXICAL half, per platform (#991). On Windows
 # realpath(3) is not bound, so the fallback IS getCanonicalPath there — and its

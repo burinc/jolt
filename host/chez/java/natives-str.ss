@@ -520,8 +520,8 @@
 (define (jolt-str-to-char-array s) (na-char-array s))
 (define (jolt-str-get-bytes s cs) (na-byte-array (charset-encode-bv s cs)))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
-(define (jolt-str-replace-all s pat repl) (irregex-replace/all (str-irx pat) s repl))
-(define (jolt-str-replace-first s pat repl) (irregex-replace (str-irx pat) s repl))
+(define (jolt-str-replace-all s pat repl) (re-replace (str-irx pat) s repl #t))
+(define (jolt-str-replace-first s pat repl) (re-replace (str-irx pat) s repl #f))
 ;; re-split, not irregex-split: irregex-split collapses an empty field, so
 ;; ("a::b" ":") came back ("a" "b") where the JVM gives ("a" "" "b").
 ;; `limit` arrives raw from the direct-emit path (the JVM's 2-arg overload) and

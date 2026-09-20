@@ -490,11 +490,38 @@
                    (seq (or bos (look-behind (~ #\return))) #\newline eos))))
 (define final-eol-sre-unix `(look-ahead (or eos (seq #\newline eos))))
 
+;; Where an anchor can be emitted as a PRIMITIVE instead — each of these
+;; assertions is decidable from three code units, and paying for the general
+;; look-around machinery at every candidate position is what made `$` 70x the JVM
+;; (#1062).  The primitives are jolt's own SRE extension, and only the Chez host
+;; teaches irregex about them: host/chez/java/regex-anchors.ss registers their
+;; expansions (the SREs above, which is what every other irregex walker then
+;; reads them as) and regex-anchor-sre.scm compiles them.  It calls
+;; `jr-use-anchor-prims!` when it loads.
+;;
+;; The Gambit boot ##includes THIS file and the vendored irregex and nothing
+;; else — its `load` of a host/chez path is a deliberate no-op (host/gambit/
+;; boot.ss) — so there the flag stays off and the SREs are emitted, exactly as
+;; before #1062.  A primitive emitted into an irregex that has never heard of it
+;; is an "unknown regexp" at compile.
+(define jr-anchor-prims? #f)
+(define (jr-use-anchor-prims!) (set! jr-anchor-prims? #t))
+
+;; Multiline `$` under UNIX_LINES needs no primitive either way: irregex's own
+;; `eol` already means "before a \n, or at the end of input", which is what
+;; `(or eol eos)` said with the redundancy spelled out.
 (define (jr-dot-sre flags) (if (jr-flag? flags 'unix-lines) 'nonl dot-sre-wide))
-(define (jr-bol-sre flags) (if (jr-flag? flags 'unix-lines) bol-sre-unix bol-sre-wide))
-(define (jr-eol-sre flags) (if (jr-flag? flags 'unix-lines) '(or eol eos) eol-sre-wide))
+(define (jr-bol-sre flags)
+  (if (jr-flag? flags 'unix-lines)
+      (if jr-anchor-prims? '%java-bol-unix bol-sre-unix)
+      (if jr-anchor-prims? '%java-bol bol-sre-wide)))
+(define (jr-eol-sre flags)
+  (if (jr-flag? flags 'unix-lines) 'eol
+      (if jr-anchor-prims? '%java-eol eol-sre-wide)))
 (define (jr-final-eol-sre flags)
-  (if (jr-flag? flags 'unix-lines) final-eol-sre-unix final-eol-sre-wide))
+  (if (jr-flag? flags 'unix-lines)
+      (if jr-anchor-prims? '%java-final-eol-unix final-eol-sre-unix)
+      (if jr-anchor-prims? '%java-final-eol final-eol-sre-wide)))
 
 (define (parse-escape src i end flags)
   (if (>= i end)
