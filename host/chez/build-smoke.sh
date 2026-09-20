@@ -1643,4 +1643,40 @@ gz_case() {
 gz_case plain || exit 1
 gz_case shake --tree-shake || exit 1
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict + gzip-round-trip)"
+# --signable (#1064): force the cc-linked path for an ordinary same-machine
+# executable, so the result is a structurally complete image `codesign --verify
+# --strict` accepts rather than a boot appended past the end of a stub copy.
+#
+# The flag reaches build.ss through a POSITIONAL optional-arg slot (bld-opt-bool
+# opt 4, behind target/target-pack/boot-mode/allow-dynamic), so an opt inserted
+# ahead of it — or a reordering of jolt.host/build-binary's trailing args —
+# turns --signable into a silent no-op that still builds a perfectly good,
+# perfectly unsignable binary. Nothing else here would notice.
+#
+# The two paths name themselves: build-self-contained's verdict says
+# ", self-contained)" and build-with-cc's does not. A dev jolt carries no
+# embedded stub and takes the cc path either way, so the assertion against THIS
+# jolt is that --signable builds and runs; it becomes the real differential the
+# moment JOLT_BIN points at a packaged jolt, which is where the bug lives.
+echo "build smoke: --signable takes the cc-linked path"
+sgout="$(dirname "$out")/signable"
+if ! JOLT_PWD="$gzapp" "$jolt" build -m gz.main -o "$sgout" --signable >"$sgout.log" 2>&1; then
+  echo "  FAIL: --signable did not build"; tail -20 "$sgout.log"; exit 1
+fi
+if grep -q 'self-contained' "$sgout.log"; then
+  echo "  FAIL: --signable took the self-contained path (the appended boot is what codesign --strict refuses)"
+  tail -5 "$sgout.log"; exit 1
+fi
+sggot="$(cd / && "$sgout" 2>&1 | tail -1)"
+if [ "$sggot" != "GZIP 3000 true" ]; then
+  echo "  FAIL: the --signable binary — want 'GZIP 3000 true', got \`$sggot\`"; exit 1
+fi
+# Say which of the two things was actually proved, so a green run from a dev
+# jolt is not mistaken for coverage of the stub-carrying case.
+if grep -q 'self-contained' "$(dirname "$out")/gzip-plain.log"; then
+  echo "  (this jolt carries the embedded stub: --signable diverted it off that path)"
+else
+  echo "  (this jolt carries no embedded stub: both paths are cc-linked here)"
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict + gzip-round-trip + signable)"
