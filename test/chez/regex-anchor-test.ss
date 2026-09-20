@@ -80,7 +80,19 @@
     ("(?i)(?<=a)b" "ab"        ("b"))
     ("(?i)(?<!a)b" "Ab"        ())
     ("(?i)(?<=A)b" "ab"        ("b"))
-    ("(?i)(?<=[a-c])d" "Bd"    ("d"))))
+    ("(?i)(?<=[a-c])d" "Bd"    ("d"))
+    ;; fixed-width multi-unit look-behind: the general path handles these, and
+    ;; they must keep answering once the rescan is bounded to the body's width.
+    ("(?<=line )(\\d+)" "line 42"  ("42"))
+    ("(?<=line )(\\d+)" "xline 42" ("42"))
+    ("(?<=line )(\\d+)" "lin 42"   ())
+    ("(?<=abc)d"   "abcd"          ("d"))
+    ("(?<=abc)d"   "bcd"           ())
+    ("(?<=a|abc)d" "abcd"          ("d"))
+    ("(?<=a|abc)d" "xad"           ("d"))
+    ("(?<!abc)d"   "abcd"          ())
+    ("(?<!abc)d"   "xbcd"          ("d"))
+    ("(?<=a+)d"    "aaad"          ("d"))))
 (for-each (lambda (v) (ok (format "~s on ~s => ~s" (car v) (cadr v) (caddr v))
                           (equal? (matches (car v) (cadr v)) (caddr v))))
           vectors)
@@ -105,7 +117,25 @@
                           (= 0 (rescans (car c) (cdr c)))))
           one-unit)
 
-;; 3. controls: a body that is NOT one unit still takes the general path, so the
+;; 2b. a FIXED-WIDTH multi-unit look-behind must rescan only its own width, not
+;; back to the chunk start.  The rescan window is the body's width and is
+;; independent of the input length (the walk back to the chunk start was #1062).
+;; `%look-behind-window` is set to the clamped window on every bounded evaluation,
+;; or left 0 when the body's width is unbounded/unknown and the general rescan
+;; runs.  This is clock-free: it counts units, not time.
+(define (window pattern-string s)
+  (set! %look-behind-window 0) (matches pattern-string s) %look-behind-window)
+(ok "multi-unit look-behind rescan window is its own width"
+    (= 5 (window "(?<=line )(\\d+)" (rep 400 "line 7 x\n"))))
+(ok "multi-unit look-behind window does not grow with input"
+    (= (window "(?<=line )(\\d+)" (rep 200 "line 7 x\n"))
+       (window "(?<=line )(\\d+)" (rep 1600 "line 7 x\n"))))
+(ok "alternation look-behind window is its widest branch"
+    (= 3 (window "(?<=a|abc)d" (rep 400 "abcd"))))
+(ok "an unbounded-width look-behind keeps the general rescan"
+    (= 0 (window "(?<=a+)d" (rep 400 "aaad"))))
+
+;; 3. controls: a body that is NOT one unit never takes the O(1) fast path, so the
 ;; witness above is live and the guard did not over-fire.  `(?<=ab)` is a two-char
 ;; string and `(?<=ab|cd)` an alternation of strings — if the char-set guard read
 ;; either as a single unit, the fast path would misfire and the query would be

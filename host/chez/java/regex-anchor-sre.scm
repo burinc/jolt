@@ -36,6 +36,60 @@
   (and (chars-only? sre)
        (guard (e (#t #f)) (sre->cset sre (flag-set? flags ~case-insensitive?)))))
 
+;; Set by the bounded look-behind rescan to the width it clamped to, so the
+;; clock-free test (test/chez/regex-anchor-test.ss) can witness that the rescan
+;; window is the body's own width and never grows with the input.  Never read by
+;; matching code.
+(define %look-behind-window 0)
+
+;; An UPPER BOUND, in code units, on how many units an SRE body can consume — or
+;; #f when the body is unbounded or its width is not statically known.  A
+;; look-behind body that spans at most K units cannot have begun more than K units
+;; behind the current position, so the rescan below only has to start at (i - K)
+;; instead of walking back to the chunk start; that walk was #1062's O(n) per
+;; evaluation.
+;;
+;; The result is always a valid over-approximation (or #f, which disables the
+;; bound), so it can never hide a match: `or` takes its widest branch, a bounded
+;; quantifier its widest expansion, and any shape not modelled answers #f, leaving
+;; the general rescan in place.
+(define (%sre-max-length sre)
+  (define (seq-max xs)
+    (let loop ((xs xs) (tot 0))
+      (cond ((null? xs) tot)
+            (else (let ((m (%sre-max-length (car xs))))
+                    (and m (loop (cdr xs) (+ tot m))))))))
+  (cond
+    ((char? sre) 1)
+    ((string? sre) (string-length sre))
+    ((symbol? sre)
+     (case sre
+       ((any nonl) 1)
+       ((bos bol bow eos eol eow nwb epsilon) 0)
+       (else #f)))
+    ((pair? sre)
+     (case (car sre)
+       ((seq : atomic w/case w/nocase w/utf8 w/noutf8 word) (seq-max (cdr sre)))
+       ((or) (let loop ((xs (cdr sre)) (best 0))
+               (if (null? xs)
+                   best
+                   (let ((m (%sre-max-length (car xs))))
+                     (and m (loop (cdr xs) (max best m)))))))
+       ((~ & - / posix-string) 1)
+       ((? ??) (%sre-max-length (cadr sre)))
+       ((* *? + +? word+) #f)
+       ((** **?) (let ((hi (caddr sre)))
+                   (and (number? hi)
+                        (let ((w (seq-max (cdddr sre))))
+                          (and w (* hi w))))))
+       ((=) (and (number? (cadr sre))
+                 (let ((w (seq-max (cddr sre))))
+                   (and w (* (cadr sre) w)))))
+       ((>=) #f)
+       ((look-ahead neg-look-ahead look-behind neg-look-behind) 0)
+       (else #f)))
+    (else #f)))
+
 (define (sre->procedure sre . o)
   (define names
     (if (and (pair? o) (pair? (cdr o))) (cadr o) (sre-names sre 1 '())))
@@ -255,38 +309,50 @@
                  (if (check cnk init src str i end matches (lambda () #f))
                      (fail)
                      (next cnk init src str i end matches fail)))))
-            ((look-behind neg-look-behind)
-             ;; jolt #1062: a single-character look-behind only inspects the
-             ;; immediately preceding code unit, so test it directly instead of
-             ;; re-running (`(* any)` X eos) from the chunk start (O(position)).
-             (cond
-               ((and (pair? (cdr sre)) (null? (cddr sre)) (%prev-char-cset (cadr sre) flags))
-                (let ((pos? (eq? (car sre) 'look-behind))
-                      (cs (%prev-char-cset (cadr sre) flags)))
-                  (lambda (cnk init src str i end matches fail)
-                    (let ((ch (if (> i ((chunker-get-start cnk) src))
-                                  (string-ref str (- i 1))
-                                  (chunker-prev-char cnk init src))))
-                      (if (eq? pos? (and ch (cset-contains? cs ch)))
-                          (next cnk init src str i end matches fail)
-                          (fail))))))
-               (else
-                (let ((check
-                       (lp (sre-sequence
-                            (cons '(* any) (append (cdr sre) '(eos))))
-                           n
-                           flags
-                           (lambda (cnk init src str i end matches fail) i))))
-                  (lambda (cnk init src str i end matches fail)
-                    (let* ((cnk* (wrap-end-chunker cnk src i))
-                           (str* ((chunker-get-str cnk*) (car init)))
-                           (i* (cdr init))
-                           (end* ((chunker-get-end cnk*) (car init))))
-                      (if ((if (eq? (car sre) 'look-behind) (lambda (x) x) not)
-                           (check cnk* init (car init) str* i* end* matches
-                                  (lambda () #f)))
-                          (next cnk init src str i end matches fail)
-                          (fail))))))))
+             ((look-behind neg-look-behind)
+              ;; jolt #1062: a look-behind only inspects the units just before
+              ;; the current position.  A single-unit body is tested directly
+              ;; (O(1)); a body of bounded width K begins its rescan at (i - K)
+              ;; instead of re-running (`(* any)` X eos) from the chunk start
+              ;; (O(position)).  A body of unknown width keeps the general path.
+              (cond
+                ((and (pair? (cdr sre)) (null? (cddr sre)) (%prev-char-cset (cadr sre) flags))
+                 (let ((pos? (eq? (car sre) 'look-behind))
+                       (cs (%prev-char-cset (cadr sre) flags)))
+                   (lambda (cnk init src str i end matches fail)
+                     (let ((ch (if (> i ((chunker-get-start cnk) src))
+                                   (string-ref str (- i 1))
+                                   (chunker-prev-char cnk init src))))
+                       (if (eq? pos? (and ch (cset-contains? cs ch)))
+                           (next cnk init src str i end matches fail)
+                           (fail))))))
+                (else
+                 (let* ((maxlen (%sre-max-length (cadr sre)))
+                        (check
+                         (lp (sre-sequence
+                              (cons '(* any) (append (cdr sre) '(eos))))
+                             n
+                             flags
+                             (lambda (cnk init src str i end matches fail) i))))
+                   (lambda (cnk init src str i end matches fail)
+                     ;; A body of bounded width K cannot have begun more than K
+                     ;; units back, so begin the rescan at (i - K).  Unknown
+                     ;; width, or a scan that began in an earlier chunk: keep the
+                     ;; general rescan from the chunk start.
+                     (let ((i* (if (and maxlen (eq? (car init) src))
+                                   (max (cdr init) (- i maxlen))
+                                   (cdr init))))
+                       (if (and maxlen (eq? (car init) src)
+                                (> (- i (cdr init)) maxlen))
+                           (set! %look-behind-window maxlen))
+                       (let* ((cnk* (wrap-end-chunker cnk src i))
+                              (str* ((chunker-get-str cnk*) (car init)))
+                              (end* ((chunker-get-end cnk*) (car init))))
+                         (if ((if (eq? (car sre) 'look-behind) (lambda (x) x) not)
+                              (check cnk* init (car init) str* i* end* matches
+                                     (lambda () #f)))
+                             (next cnk init src str i end matches fail)
+                             (fail)))))))))
             ((atomic)
              (let ((once
                     (lp (sre-sequence (cdr sre))
