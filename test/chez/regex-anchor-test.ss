@@ -237,6 +237,54 @@
           (equal? (starts pat s) want))))
   lookbehind-vectors)
 
+;; --- \b and \B at the edges of the input, and over "_" (jolt-406) -------------
+;; Three defects in irregex's own boundary assertions, all reachable with no
+;; look-behind anywhere:
+;;
+;;   eow read the ABSENCE of a preceding character as a word character, so a
+;;   subject starting with a non-word character reported a word ending at 0.
+;;   nwb required BOTH neighbours to exist, so \B -- the complement of \b --
+;;   could never match at position 0 or at the end of input.
+;;   bow/eow/nwb asked char-alphanumeric?, which excludes "_", while the \w in
+;;   the same pattern is (or alphanumeric #\_) (regex-translate.ss), so \b split
+;;   identifiers at their underscores.
+;;
+;; Start indices, all from reference JVM Clojure.
+(define boundary-vectors
+  '(("\\b"  " ab"   (1 3))
+    ("\\B"  " ab"   (0 2))
+    ("\\b"  "ab "   (0 2))
+    ("\\B"  "ab "   (1 3))
+    ("\\b"  "a\n"   (0 1))
+    ("\\B"  "a\n"   (2))
+    ("\\b"  "ab"    (0 2))
+    ("\\B"  "ab"    (1))
+    ("\\b"  ""      ())
+    ("\\B"  ""      (0))
+    ("\\b"  " "     ())
+    ("\\B"  " "     (0 1))
+    ;; "_" is a word character, so an identifier is ONE word
+    ("\\b"  "a_b"   (0 3))
+    ("\\B"  "a_b"   (1 2))
+    ("\\b"  "_a"    (0 2))
+    ("\\B"  "_a"    (1))
+    ("\\b"  "a_"    (0 2))
+    ("\\B"  "a_"    (1))
+    ("\\b"  "a__b"  (0 4))
+    ("\\B"  "a__b"  (1 2 3))
+    ;; digits are word characters too, and punctuation is not
+    ("\\b"  "1a"    (0 2))
+    ("\\b"  "a-b"   (0 1 2 3))
+    ("\\B"  "a-b"   ())
+    ("\\b"  "a.b.c" (0 1 2 3 4 5))))
+
+(for-each
+  (lambda (v)
+    (let ((pat (car v)) (s (cadr v)) (want (caddr v)))
+      (ok (string-append "starts " pat " over " (format "~s" s) " = " (format "~a" want))
+          (equal? (starts pat s) want))))
+  boundary-vectors)
+
 ;; The look-behind layer must be TRANSPARENT for an assertion body: testing X
 ;; inside (?<=X) at position i has to answer exactly what testing X at i answers
 ;; on its own.  That is the invariant jolt-69q broke and this restores, and it is

@@ -228,6 +228,15 @@
        (else 0)))
     (else 0)))
 
+;; The "word character" a word BOUNDARY is a boundary between.  java.util.regex
+;; defines \b in terms of \w, which is [a-zA-Z0-9_], and regex-translate.ss
+;; already spells \w as (or alphanumeric #\_) for exactly that reason.  irregex's
+;; char-alphanumeric? leaves the underscore out -- its own (word ...) SRE adds it
+;; back by hand, which is the tell -- so bow/eow/nwb disagreed with the \w sitting
+;; beside them in the same pattern: (re-seq #"\b" "a_b") was (0 1 2 3), splitting
+;; the identifier at its underscore, against the JVM's (0 3).  jolt-406.
+(define (%word-char? c) (or (char-alphanumeric? c) (eqv? c #\_)))
+
 (define (sre->procedure sre . o)
   (define names
     (if (and (pair? o) (pair? (cdr o))) (cadr o) (sre-names sre 1 '())))
@@ -691,14 +700,14 @@
         ((bow)
          (lambda (cnk init src str i end matches fail)
            (if (and (if (> i ((chunker-get-start cnk) src))
-                        (not (char-alphanumeric? (string-ref str (- i 1))))
+                        (not (%word-char? (string-ref str (- i 1))))
                         (let ((ch (chunker-prev-char cnk init src)))
-                          (or (not ch) (not (char-alphanumeric? ch)))))
+                          (or (not ch) (not (%word-char? ch)))))
                     (if (< i end)
-                        (char-alphanumeric? (string-ref str i))
+                        (%word-char? (string-ref str i))
                         (let ((next ((chunker-get-next cnk) src)))
                           (and next
-                               (char-alphanumeric?
+                               (%word-char?
                                 (string-ref ((chunker-get-str cnk) next)
                                             ((chunker-get-start cnk) next)))))))
                (next cnk init src str i end matches fail)
@@ -723,13 +732,20 @@
         ((eow)
          (lambda (cnk init src str i end matches fail)
            (if (and (if (< i end)
-                        (not (char-alphanumeric? (string-ref str i)))
+                        (not (%word-char? (string-ref str i)))
                         (let ((ch (chunker-next-char cnk src)))
-                          (or (not ch) (not (char-alphanumeric? ch)))))
+                          (or (not ch) (not (%word-char? ch)))))
                     (if (> i ((chunker-get-start cnk) src))
-                        (char-alphanumeric? (string-ref str (- i 1)))
+                        (%word-char? (string-ref str (- i 1)))
+                        ;; jolt-406: `(or (not prev) ...)` here read the ABSENCE of
+                        ;; a preceding character as a word character, so every
+                        ;; subject beginning with a non-word character reported a
+                        ;; word ending at position 0 — (re-seq #"\b" " ab") was
+                        ;; (0 1 3) against the JVM's (1 3).  There is no word
+                        ;; before the start of input, so there is nothing for one
+                        ;; to end.
                         (let ((prev (chunker-prev-char cnk init src)))
-                          (or (not prev) (char-alphanumeric? prev)))))
+                          (and prev (%word-char? prev)))))
                (next cnk init src str i end matches fail)
                (fail))))
         ((nwb)  ;; non-word-boundary
@@ -740,12 +756,21 @@
                  (c2 (if (> i ((chunker-get-start cnk) src))
                          (string-ref str (- i 1))
                          (chunker-prev-char cnk init src))))
-             (if (and c1 c2
-                      (if (char-alphanumeric? c1)
-                          (char-alphanumeric? c2)
-                          (not (char-alphanumeric? c2))))
-                 (next cnk init src str i end matches fail)
-                 (fail)))))
+             ;; jolt-406: \B is the complement of \b, so it must answer for the
+             ;; positions at the very edges too — and there it has only one
+             ;; neighbour.  The old `(and c1 c2 ...)` failed outright whenever a
+             ;; neighbour was missing, which made \B unmatchable at position 0 and
+             ;; at the end of input: (re-seq #"\B" "ab ") was (1) against the
+             ;; JVM's (1 3).  The edge of the input is not a word character, it is
+             ;; the absence of one, which is exactly how a non-word character
+             ;; behaves for this test — so treat a missing neighbour as non-word
+             ;; and ask the real question: do both sides have the SAME wordness?
+             ;; If they do there is no transition here, which is what \B means.
+             (let ((w1 (and c1 (%word-char? c1)))
+                   (w2 (and c2 (%word-char? c2))))
+               (if (eq? w1 w2)
+                   (next cnk init src str i end matches fail)
+                   (fail))))))
         ((epsilon)
          next)
         ((%look-behind-end)
