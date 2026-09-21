@@ -36,9 +36,14 @@ check() { # label expected actual
 }
 
 proj="$tmp/proj"
-mkdir -p "$proj"
+mkdir -p "$proj/src/compl"
+cat > "$proj/src/compl/api.clj" <<'EOF'
+(ns compl.api)
+(defn greet [m] (println "greet" (pr-str m)))
+EOF
 cat > "$proj/bb.edn" <<'EOF'
-{:tasks
+{:paths ["src"]
+ :tasks
  {alpha   {:doc "one line" :task (println 1)}
   beta    {:doc "first line\nsecond line" :task (println 2)}
   build:x {:doc "a colon in the name" :task (println 3)}
@@ -49,7 +54,17 @@ cat > "$proj/bb.edn" <<'EOF'
   ;; so `jolt build` is the compiler and the completion must describe THAT.
   ;; `path` does ask, so the task is what runs and the task is what to describe.
   build   {:doc "loses to the build command" :task (println 7)}
-  path    {:doc "wins the path name" :override-builtin true :task (println 8)}}}
+  path    {:doc "wins the path name" :override-builtin true :task (println 8)}
+  ;; Tasks that PARSE their arguments. What they offer after their own name
+  ;; lives behind babashka.cli and cannot be cached as a flat list, so these are
+  ;; the only tasks a snippet may call jolt back for — and the `cli` marker in
+  ;; the lines below is how it tells them apart.
+  cli-opt {:doc     "parses its args"
+           :exec-fn compl.api/greet
+           :cli     {:spec {:name {:desc "who to greet"}
+                            :loud {:coerce :boolean :desc "shout it"}}}}
+  cli-cmd {:cmd {"migrate" {:doc "run migrations"}
+                 "seed"    {:doc "seed it"}}}}}
 EOF
 
 run() { d="$1"; shift; JOLT_PWD="$d" JOLT_QUIET=1 "$JOLT_ABS" "$@" 2>&1; }
@@ -73,11 +88,43 @@ check "a task that loses to a builtin stays out" "" \
   "$(printf '%s\n' "$out" | grep '^build	')"
 check "...and one that overrides a builtin is in" "path	wins the path name" \
   "$(printf '%s\n' "$out" | grep '^path')"
-check "one line per offered task" "5" "$(printf '%s\n' "$out" | grep -c .)"
+check "one line per offered task" "7" "$(printf '%s\n' "$out" | grep -c .)"
+
+# The third field is what tells a snippet this task is worth starting jolt for.
+check "a task that parses is marked cli" "cli-opt	parses its args	cli" \
+  "$(printf '%s\n' "$out" | grep '^cli-opt')"
+# …with an empty doc field rather than a missing one, so field 3 stays field 3
+check "...and keeps its doc field when it has no :doc" "cli-cmd		cli" \
+  "$(printf '%s\n' "$out" | grep '^cli-cmd')"
+check "a plain task is not marked" "alpha	one line" \
+  "$(printf '%s\n' "$out" | grep '^alpha')"
 
 check "a project with no tasks says nothing" "" "$(run "$tmp" completions tasks)"
 check "...and exits 0" "0" \
   "$(JOLT_PWD="$tmp" "$JOLT_ABS" completions tasks >/dev/null 2>&1; echo $?)"
+
+# --- the hidden completion callback ------------------------------------------
+#
+# `jolt org.babashka.cli/completions complete --shell SHELL -- <task> <token>…`
+# is babashka.cli's own callback contract, answered here for a task that parses.
+# It is what the snippets call, and the one place per-task options come from.
+
+check "the callback offers a task's options" "--loud	shout it" \
+  "$(run "$proj" org.babashka.cli/completions complete --shell bash -- cli-opt --lo)"
+check "...and its subcommands" "migrate	run migrations" \
+  "$(run "$proj" org.babashka.cli/completions complete --shell bash -- cli-cmd mi)"
+# Everything that is not a CLI task defers to the shell's own file completion.
+# Answering with nothing instead would both offer nothing AND suppress that
+# fallback, since the stub cannot tell "no candidates" from "not my business".
+check "a plain task defers to file completion" "org.babashka.cli/file-completion" \
+  "$(run "$proj" org.babashka.cli/completions complete --shell bash -- alpha --x)"
+check "an unknown task defers too" "org.babashka.cli/file-completion" \
+  "$(run "$proj" org.babashka.cli/completions complete --shell bash -- nosuch --x)"
+check "...and so does a project with no tasks at all" "org.babashka.cli/file-completion" \
+  "$(run "$tmp" org.babashka.cli/completions complete --shell bash -- alpha --x)"
+check "the callback exits 0 even with nothing to say" "0" \
+  "$(JOLT_PWD="$proj" "$JOLT_ABS" org.babashka.cli/completions complete --shell bash \
+       -- nosuch >/dev/null 2>&1; echo $?)"
 
 # --- the snippets ------------------------------------------------------------
 
@@ -122,6 +169,40 @@ if command -v bash >/dev/null 2>&1; then
     ' _ "$tmp/snip.bash" 2>/dev/null)"
   check "the bash function offers the build command and both b-tasks" \
     "beta build build:x " "$got"
+
+  # Past the task name, where only a CLI task has anything to say. This is the
+  # callback's own path through the snippet: a value that reaches COMPREPLY here
+  # came from jolt over the hidden command, not from the cached list.
+  got="$(cd "$proj" && PATH="$(dirname "$JOLT_ABS"):$PATH" \
+    bash --noprofile --norc -c '
+      set -u
+      . "$1"
+      COMP_WORDS=(jolt cli-opt --l); COMP_CWORD=2
+      _jolt_completions
+      printf "%s\n" "${COMPREPLY[@]}" | sort | tr "\n" " "
+    ' _ "$tmp/snip.bash" 2>/dev/null)"
+  check "the bash function completes a CLI task's options" "--loud " "$got"
+
+  got="$(cd "$proj" && PATH="$(dirname "$JOLT_ABS"):$PATH" \
+    bash --noprofile --norc -c '
+      set -u
+      . "$1"
+      COMP_WORDS=(jolt cli-cmd ""); COMP_CWORD=2
+      _jolt_completions
+      printf "%s\n" "${COMPREPLY[@]}" | sort | tr "\n" " "
+    ' _ "$tmp/snip.bash" 2>/dev/null)"
+  check "...and its subcommands" "migrate seed " "$got"
+
+  # A plain task falls back to files, which is what it did before any of this.
+  got="$(cd "$proj" && PATH="$(dirname "$JOLT_ABS"):$PATH" \
+    bash --noprofile --norc -c '
+      set -u
+      . "$1"
+      COMP_WORDS=(jolt alpha ""); COMP_CWORD=2
+      _jolt_completions
+      printf "%s\n" "${COMPREPLY[@]}" | sort | tr "\n" " "
+    ' _ "$tmp/snip.bash" 2>/dev/null)"
+  check "a plain task still completes files" "bb.edn src " "$got"
 fi
 
 # --- the zsh function's candidates, with descriptions ------------------------
@@ -208,6 +289,28 @@ EOF
   touch "$proj/bb.edn"
   presses 1 >/dev/null
   check "editing bb.edn invalidates the cache" "2" "$(grep -c . "$tmp/calls")"
+
+  # The same claim for the callback: the ONE case that starts jolt after a task
+  # name is a task that parses. A press after a plain task must still cost
+  # nothing, which is the whole reason the task lines carry a `cli` marker
+  # rather than the snippet asking jolt what each task is.
+  press_task() { # task-name
+    ( cd "$proj" && PATH="$shim:$PATH" XDG_CACHE_HOME="$cachedir" \
+      JOLT_COMPLETION_NO_CACHE= bash --noprofile --norc -c '
+        set -u
+        . "$1"
+        COMP_WORDS=(jolt "$2" ""); COMP_CWORD=2
+        _jolt_completions
+      ' _ "$tmp/snip.bash" "$1" >/dev/null 2>&1 )
+  }
+  : > "$tmp/calls"
+  press_task alpha
+  check "a press after a plain task spawns jolt not at all" "0" \
+    "$(grep -c . "$tmp/calls")"
+  : > "$tmp/calls"
+  press_task cli-opt
+  check "...and after a task that parses, exactly once" "1" \
+    "$(grep -c . "$tmp/calls")"
 fi
 
 # --- the fish snippet --------------------------------------------------------

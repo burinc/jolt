@@ -75,6 +75,13 @@
   goes through jolt.tasks/listable so that TAB and `jolt tasks` agree on which
   tasks exist.
 
+  A task that PARSES its arguments — one with :exec-fn or :cmd — gets a third
+  field, `cli`, and an empty doc field when it has no :doc. That marker is what
+  lets a snippet know which tasks are worth calling jolt back for: the options
+  and subcommands of such a task live behind babashka.cli and cannot be cached
+  as a flat list, while a plain task has nothing to offer after its name and
+  must keep costing a completing shell nothing.
+
   A task that shares a built-in's name is dropped unless it wins that name,
   because a completion's description is a promise about what the word will do.
   `jolt tasks` is a list of what the project defines and lists such a task
@@ -86,9 +93,11 @@
   (for [[k v] (tasks/listable tasks)
         :when (or (not (overridable (str k)))
                   (and (map? v) (:override-builtin v)))]
-    (if-let [doc (tasks/doc-line v)]
-      (str k \tab doc)
-      (str k))))
+    (let [doc (tasks/doc-line v)]
+      (cond
+        (tasks/cli-node v) (str k \tab (or doc "") \tab "cli")
+        doc                (str k \tab doc)
+        :else              (str k)))))
 
 ;; --- the snippets ------------------------------------------------------------
 
@@ -157,6 +166,41 @@
        "  fi\n"
        "}\n"
        "\n"
+       ;; The one thing a cached list cannot answer: a task that parses its own
+       ;; arguments (:exec-fn / :cmd) offers different options at every position,
+       ;; and only jolt can say which. `jolt completions tasks` marks those tasks
+       ;; with a third `cli` field, so the callback below runs for them alone and
+       ;; every other task still completes without starting jolt at all.
+       "_jolt_is_cli_task() {\n"
+       "  local l\n"
+       "  for l in ${(f)\"$(_jolt_cached_tasks)\"}; do\n"
+       "    [[ ${l%%$'\\t'*} == $1 ]] || continue\n"
+       "    [[ $l == *$'\\t'cli ]] && return 0\n"
+       "    return 1\n"
+       "  done\n"
+       "  return 1\n"
+       "}\n"
+       "\n"
+       ;; $1 is the index of the task's own name in $words: 2 for `jolt <task>`,
+       ;; 3 for `jolt run <task>`. babashka.cli answers with the same
+       ;; value<TAB>description lines the task list uses, plus its file-completion
+       ;; marker when the shell should fall back to files.
+       "_jolt_task_complete() {\n"
+       "  local -a lines\n"
+       "  local l do_files=\n"
+       "  lines=(\"${(@f)$(" prog " org.babashka.cli/completions complete --shell zsh"
+       " -- \"${(@)words[$1,CURRENT]}\" 2>/dev/null)}\")\n"
+       "  for l in $lines; do\n"
+       "    [[ -n $l ]] || continue\n"
+       "    if [[ $l == org.babashka.cli/file-completion ]]; then do_files=1; continue; fi\n"
+       "    _jolt_add $l\n"
+       "  done\n"
+       "  (( $#described )) && _describe -t options 'option' described\n"
+       "  (( $#bare )) && _describe -t options 'option' bare\n"
+       "  [[ -n $do_files ]] && _files\n"
+       "  return 0\n"
+       "}\n"
+       "\n"
        "_jolt() {\n"
        "  local -a commands=(" (pairs->sh cmds) ")\n"
        "  local -a options=(" (pairs->sh opts) ")\n"
@@ -168,7 +212,7 @@
        "  # truncated at the colon and vanishes behind the command it then collides\n"
        "  # with.\n"
        "  _jolt_add() {\n"
-       "    v=${1%%$'\\t'*}; d=; [[ $1 == *$'\\t'* ]] && d=${1#*$'\\t'}\n"
+       "    v=${1%%$'\\t'*}; d=${1#*$'\\t'}; [[ $1 == *$'\\t'* ]] || d=; d=${d%%$'\\t'*}\n"
        "    v=${v//\\\\/\\\\\\\\}; v=${v//:/\\\\:}\n"
        "    d=${d//\\\\/\\\\\\\\}; d=${d//:/\\\\:}\n"
        "    if [[ -n $d ]]; then described+=(\"$v:$d\"); else bare+=(\"$v\"); fi\n"
@@ -212,8 +256,12 @@
        "        for l in ${(f)\"$(_jolt_cached_tasks)\"}; do [[ -n $l ]] && _jolt_add $l; done\n"
        "        (( $#described )) && _describe -t commands 'task' described\n"
        "        (( $#bare )) && _describe -t commands 'task' bare\n"
-       "      fi\n"
-       "      _files ;;\n"
+       "        _files\n"
+       "      elif _jolt_is_cli_task ${words[3]}; then\n"
+       "        _jolt_task_complete 3\n"
+       "      else\n"
+       "        _files\n"
+       "      fi ;;\n"
        "    completions)\n"
        "      (( CURRENT == 3 )) && _describe -t commands 'shell' \\\n"
        "        '(zsh:a\\ zsh\\ completion\\ function bash:a\\ bash\\ completion\\ function"
@@ -228,7 +276,8 @@
        "        '--target-pack[support directory]:dir:_files -/' ;;\n"
        "    tasks|path|version|help|repl) ;;\n"
        "    nrepl-server) (( CURRENT == 3 )) && _message 'port' ;;\n"
-       "    *) _files ;;\n"
+       "    *)\n"
+       "      if _jolt_is_cli_task ${words[2]}; then _jolt_task_complete 2; else _files; fi ;;\n"
        "  esac\n"
        "}\n"
        "\n"
@@ -277,6 +326,39 @@
        "  fi\n"
        "}\n"
        "\n"
+       ;; A task that parses its own arguments (:exec-fn / :cmd) is marked with a
+       ;; third `cli` field by `completions tasks`. Those are the only tasks worth
+       ;; starting jolt for after the name: what they accept depends on where the
+       ;; cursor is, so no flat cache can answer it. Every other task completes
+       ;; from the cache alone, as before.
+       "_jolt_is_cli_task() {\n"
+       "  local line\n"
+       "  while IFS= read -r line; do\n"
+       "    case \"$line\" in\n"
+       "      \"$1\"$'\\t'*$'\\t'cli) return 0 ;;\n"
+       "      \"$1\"$'\\t'*|\"$1\") return 1 ;;\n"
+       "    esac\n"
+       "  done < <(_jolt_cached_tasks)\n"
+       "  return 1\n"
+       "}\n"
+       "\n"
+       ;; $1 is the index of the task's own name in COMP_WORDS: 1 for
+       ;; `jolt <task>`, 2 for `jolt run <task>`. bash shows no descriptions, so
+       ;; only the value half of each line that comes back is offered.
+       "_jolt_task_complete() {\n"
+       "  local line v\n"
+       "  while IFS= read -r line; do\n"
+       "    [ -n \"$line\" ] || continue\n"
+       "    if [ \"$line\" = org.babashka.cli/file-completion ]; then\n"
+       "      while IFS= read -r v; do [ -n \"$v\" ] && COMPREPLY+=( \"$v\" ); done \\\n"
+       "        < <(compgen -f -- \"$cur\")\n"
+       "      continue\n"
+       "    fi\n"
+       "    COMPREPLY+=( \"${line%%$'\\t'*}\" )\n"
+       "  done < <(" prog " org.babashka.cli/completions complete --shell bash --"
+       " \"${COMP_WORDS[@]:$1:COMP_CWORD-$1+1}\" 2>/dev/null)\n"
+       "}\n"
+       "\n"
        "_jolt_completions() {\n"
        "  local cur prev commands options tasks\n"
        "  COMPREPLY=()\n"
@@ -301,12 +383,20 @@
        "  fi\n"
        "  case \"${COMP_WORDS[1]}\" in\n"
        "    run) tasks=$(_jolt_cached_tasks | cut -f1)\n"
-       "         COMPREPLY=( $(compgen -W \"-m -f --file --parallel $tasks\" -- \"$cur\") ) ;;\n"
+       "         if [ \"$COMP_CWORD\" -gt 2 ] && _jolt_is_cli_task \"${COMP_WORDS[2]}\"; then\n"
+       "           _jolt_task_complete 2\n"
+       "         else\n"
+       "           COMPREPLY=( $(compgen -W \"-m -f --file --parallel $tasks\" -- \"$cur\") )\n"
+       "         fi ;;\n"
        "    completions) COMPREPLY=( $(compgen -W \"zsh bash fish tasks\" -- \"$cur\") ) ;;\n"
        "    build) COMPREPLY=( $(compgen -W \"-m -o --opt --dev --no-direct-link --dynamic\n"
        "                                     --tree-shake --boot --library --target --target-pack\" -- \"$cur\") ) ;;\n"
        "    tasks|path|version|help|repl) ;;\n"
-       "    *) COMPREPLY=( $(compgen -f -- \"$cur\") ) ;;\n"
+       "    *) if _jolt_is_cli_task \"${COMP_WORDS[1]}\"; then\n"
+       "         _jolt_task_complete 1\n"
+       "       else\n"
+       "         COMPREPLY=( $(compgen -f -- \"$cur\") )\n"
+       "       fi ;;\n"
        "  esac\n"
        "  return 0\n"
        "}\n"
@@ -343,7 +433,60 @@
        "  end\n"
        "end\n"
        "\n"
-       "complete -c " prog " -f -n '__fish_is_first_arg' -a '(__jolt_tasks)'\n"
+       ;; The candidate list fish shows is `value<TAB>description`, so the third
+       ;; field a CLI task carries has to come off here — left on, it would print
+       ;; as part of the description. __jolt_tasks keeps the raw lines, since the
+       ;; marker is exactly what the two functions below read.
+       "function __jolt_tasks_listed\n"
+       "  for l in (__jolt_tasks)\n"
+       "    set -l parts (string split \\t -- $l)\n"
+       "    if test (count $parts) -gt 1\n"
+       "      printf '%s\\t%s\\n' $parts[1] $parts[2]\n"
+       "    else\n"
+       "      printf '%s\\n' $parts[1]\n"
+       "    end\n"
+       "  end\n"
+       "end\n"
+       "\n"
+       ;; A task that parses its own arguments (:exec-fn / :cmd) offers different
+       ;; options at every position, which no cached list can answer — those, and
+       ;; only those, are worth starting jolt for after the name.
+       "function __jolt_is_cli_task\n"
+       "  set -l toks (commandline --tokenize --cut-at-cursor)\n"
+       "  if test (count $toks) -lt 2\n"
+       "    return 1\n"
+       "  end\n"
+       "  for l in (__jolt_tasks)\n"
+       "    set -l parts (string split \\t -- $l)\n"
+       "    if test \"$parts[1]\" = \"$toks[2]\"\n"
+       "      if test (count $parts) -ge 3; and test \"$parts[3]\" = cli\n"
+       "        return 0\n"
+       "      end\n"
+       "      return 1\n"
+       "    end\n"
+       "  end\n"
+       "  return 1\n"
+       "end\n"
+       "\n"
+       "function __jolt_task_complete\n"
+       "  set -l toks (commandline --tokenize --cut-at-cursor)\n"
+       "  set -e toks[1]\n"
+       "  set -l cur (commandline --current-token)\n"
+       "  for line in (" prog " org.babashka.cli/completions complete --shell fish"
+       " -- $toks \"$cur\" 2>/dev/null)\n"
+       "    if test \"$line\" = org.babashka.cli/file-completion\n"
+       "      __fish_complete_path \"$cur\"\n"
+       "    else\n"
+       ;; printf, not echo: echo would eat a bare -n or -e candidate as its own
+       ;; flag rather than printing it
+       "      printf '%s\\n' $line\n"
+       "    end\n"
+       "  end\n"
+       "end\n"
+       "\n"
+       "complete -c " prog " -f -n '__fish_is_first_arg' -a '(__jolt_tasks_listed)'\n"
+       "complete -c " prog " -f -n 'not __fish_is_first_arg; and __jolt_is_cli_task'"
+       " -a '(__jolt_task_complete)'\n"
        (apply str
               (for [[n d] cmds]
                 (str "complete -c " prog " -f -n '__fish_is_first_arg' -a '" n "' -d '"
