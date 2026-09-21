@@ -70,7 +70,14 @@ and on a stale entry.
 - `jolt completions zsh|bash|fish`: a shell completion function to source, so
   `jolt <TAB>` offers jolt's commands and the project's tasks.
   `jolt completions tasks` is the machine-readable listing it calls back for,
-  one `name<TAB>doc` per listable task. `make completionssmoke` gates it.
+  one `name<TAB>doc` per listable task, with a third `cli` field on a task that
+  parses its own arguments. `make completionssmoke` gates it.
+- `jolt <task>` where the task has an `:exec-fn` or a `:cmd` tree: the arguments
+  are parsed by the vendored `babashka.cli` (`vendor/cli`, re-exported as
+  `jolt.cli`), so the task gets coercion, validation, subcommands and `--help`
+  for free. `jolt org.babashka.cli/completions complete --shell SHELL -- <task>
+  <token>…` is the hidden callback the snippets use for those tasks.
+  `make taskssmoke` gates it.
 - `make test`: the full gate. Individual gates: `corpus`, `unit`, `selfhost`,
   `smoke`, `sci`, `ffi`, `transient`, `certify`, `libconformance`.
 - `make remint`: re-mint the bootstrap seed to a byte-fixpoint. Required after

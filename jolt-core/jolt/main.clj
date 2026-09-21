@@ -766,6 +766,38 @@
                      (deps/project-tasks (project-dir))))
       (print ((requiring-resolve 'jolt.completions/snippet) what "jolt")))))
 
+;; `jolt org.babashka.cli/completions complete --shell zsh -- <task> <token>…`
+;; — babashka.cli's hidden completion callback, answered here for a task that
+;; parses (one with :exec-fn or :cmd). The generated snippets complete a task
+;; NAME from their own cache and call back only for a task those cached lines
+;; marked as one that parses, so a plain task still costs a completing shell no
+;; jolt start at all.
+;;
+;; Nothing on this path may report a failure: the stub discards stderr and reads
+;; stdout as the candidate list, so a project whose deps do not resolve has to
+;; come back as babashka.cli's file-completion marker rather than as an error —
+;; anything else both offers nothing and suppresses the shell's own fallback.
+(defn- cmd-cli-completions [more]
+  (let [[sub & opts] more
+        shell (or (second (drop-while #(not= "--shell" %) opts)) "zsh")
+        toks  (vec (rest (drop-while #(not= "--" %) opts)))]
+    (case sub
+      ;; the stub to install is jolt's own — it is the one that knows to call
+      ;; back here, and for which tasks
+      "snippet" (print ((requiring-resolve 'jolt.completions/snippet) shell "jolt"))
+      "complete"
+      (let [tasks (try (deps/project-tasks (project-dir)) (catch :default _ nil))
+            t     (and (seq toks) (get tasks (symbol (first toks))))]
+        ;; a handler lives on the project's paths, or on the task's own, so the
+        ;; project is applied before the tree is described — tolerantly (a task
+        ;; may be the build step for a :jolt/native library that is missing) and
+        ;; muted, since a resolution's own output is not a candidate
+        (when (map? t)
+          (try (with-out-str (apply-project! (resolve-for-task t) false))
+               (catch :default _ nil)))
+        ((requiring-resolve 'jolt.tasks/complete!) tasks toks shell))
+      (println "org.babashka.cli/file-completion"))))
+
 ;; A task that shares a built-in's name but does not claim it loses the name, and
 ;; the built-in then reports in its own terms: in a project whose deps.edn has a
 ;; `build` task, `jolt build` fails with "build needs an entry: -m NS", which
@@ -1199,6 +1231,11 @@
 
       (#{"help" "--help" "-h"} cmd)      (usage)
       (#{"version" "--version" "-V"} cmd) (println (str "jolt " (version)))
+
+      ;; the hidden completion callback, before the :override-builtin check: it
+      ;; is not a name a project can take, and a shell must not be able to lose
+      ;; it to a task
+      (= cmd "org.babashka.cli/completions") (cmd-cli-completions more)
 
       ;; A task may take a built-in command's name, but only by asking to
       ;; (babashka's :override-builtin). Checked here, after the two commands

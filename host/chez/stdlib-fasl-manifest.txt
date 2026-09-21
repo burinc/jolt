@@ -13,6 +13,9 @@
 #
 # build-jolt fails on drift between this manifest and the discovered set, so the
 # two can never silently diverge. clojure.test MUST be in the embedded set.
+babashka.cli
+babashka.cli.exec
+babashka.cli.internal
 babashka.fs
 babashka.process
 babashka.process.pprint
@@ -52,6 +55,7 @@ grenadine.repo
 grenadine.runtime
 grenadine.source
 grenadine.tree
+jolt.cli
 jolt.completions
 jolt.continuations
 jolt.fibers

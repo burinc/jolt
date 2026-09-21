@@ -180,7 +180,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -411,7 +411,7 @@ documented-record:
 # buildlibsmoke` slower with the prerequisite than without it. The staleness
 # check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
 # install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
-TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/grenadine/src vendor/grenadine-generated vendor/irregex
+TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/cli/src vendor/grenadine/src vendor/grenadine-generated vendor/irregex
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
@@ -663,6 +663,14 @@ depsnounzip: testbin
 # a fake coordinate type. The cases are ported from tools.deps. Offline.
 depsunit:
 	@JOLT_NO_USER_DEPS=1 bin/jolt run test/deps_expand_test.clj
+
+# The jolt.cli surface over the vendored babashka.cli: that the re-export
+# reaches the parser, the dispatcher and the help renderer, and that *exit-fn*
+# (a dynamic var, which import-vars cannot re-export as a delegating fn) is
+# deliberately NOT among them. The task runner's own use of babashka.cli is
+# covered by taskssmoke. Offline.
+clishim:
+	@JOLT_NO_USER_DEPS=1 bin/jolt run test/cli_shim_test.clj
 
 # Vendored Grenadine core plus Jolt's effective-POM adapter. Offline.
 grenadine:

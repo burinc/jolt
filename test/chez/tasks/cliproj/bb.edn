@@ -1,0 +1,68 @@
+;; CLI tasks: a task that names an :exec-fn or a :cmd tree parses its arguments
+;; with babashka.cli before anything runs. Everything here is babashka's, at
+;; 1.13.219 + 1.13.221 + 1.13.223 semantics.
+{:paths ["src"]
+ :tasks
+ {:requires ([cliproj.api :as api])
+  ;; runner-level parser options, like :init and :requires: every CLI task in
+  ;; this map parses against them, and its own keys win
+  :cli      {:spec {:trace {:coerce :boolean :desc "trace the run"}}}
+
+  ;; the simplest shape: a handler plus the spec it parses against
+  greet   {:doc     "greet someone"
+           :exec-fn api/greet
+           :cli     {:spec {:name {:desc "who to greet" :default "world"}
+                            :loud {:coerce :boolean :desc "shout it"}}}}
+
+  ;; :exec-args on the task, which wins over the same key under :cli
+  tone    {:doc       "defaults from :exec-args"
+           :exec-fn   api/greet
+           :exec-args {:name "ada" :loud true}
+           :cli       {:exec-args {:name "grace"}}}
+
+  ;; a spec that lives on the handler var rather than in bb.edn
+  serve   {:doc "serve the app" :exec-fn api/serve}
+
+  ;; :cli naming a def, for options a bb.edn cannot express
+  bysym   {:doc "options from a def" :exec-fn api/greet :cli api/greet-opts}
+
+  ;; a command tree
+  db      {:doc "database commands"
+           :cmd {"migrate" {:doc     "run migrations"
+                            :exec-fn api/migrate
+                            :spec    {:steps {:coerce :long :desc "how many"}}}
+                 "seed"    {:doc "seed the database" :exec-fn api/seed}}}
+
+  ;; a tree AND a body: the body is the root, run when no command is named
+  dbx     {:doc  "a tree with a default action"
+           :task (println "dbx default")
+           :cmd  {"go" {:exec-fn api/body-and-tree}}}
+
+  ;; a CLI task named in :depends: its handler runs in its own place in the
+  ;; graph, with the options the target's parse produced, narrowed by :restrict
+  ;; :restrict lives under :cli, with the rest of what babashka.cli reads
+  setup   {:doc     "prepare"
+           :exec-fn api/setup
+           :cli     {:restrict [:verbose]
+                     :spec     {:verbose {:coerce :boolean :desc "say more"}}}}
+  app     {:doc "serve, after setup" :depends [setup] :exec-fn api/serve}
+
+  ;; a plain task in :depends of a CLI task — it must not run for --help
+  prep    {:doc "a plain dependency" :task (println "prep ran")}
+  helped  {:doc "a CLI task with a plain dependency" :depends [prep] :exec-fn api/greet}
+
+  ;; a :cmd task has no single handler, so naming one in :depends is refused
+  baddep  {:doc "refused" :depends [db] :exec-fn api/greet}
+
+  ;; a :cmd tree held in code rather than in edn
+  dbsym   {:doc "a tree named by a symbol" :cmd api/tree}
+
+  ;; a handler that throws: the task fails, like a body that throws
+  boom    {:doc "fail on purpose" :exec-fn api/boom}
+
+  ;; babashka.tasks/run reaching a CLI task — it is a target of its own, so it
+  ;; parses the invocation's arguments
+  viarun  {:doc "run a CLI task from a body" :task (run 'greet)}
+
+  ;; a plain task, for the completion and listing assertions
+  plain   {:doc "not a CLI task" :task (println "plain ran")}}}
