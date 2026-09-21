@@ -16,3 +16,6 @@
 [submodule "vendor/grenadine"]
 	path = vendor/grenadine
 	url = https://github.com/clojurestar/grenadine.git
+[submodule "vendor/cli"]
+	path = vendor/cli
+	url = https://github.com/babashka/cli.git
