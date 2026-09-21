@@ -45,7 +45,6 @@
 
 (define (npath-root-for windows? s) (path-root windows? s))
 (define (npath-root s) (npath-root-for (nio-windows?) s))
-(define (npath-rooted-for? windows? s) (not (string=? (npath-root-for windows? s) "")))
 
 (define (npath-segs-for windows? s) (path-segments windows? s))
 (define (npath-segs s) (npath-segs-for (nio-windows?) s))
@@ -54,6 +53,9 @@
 ;; a canonical path wants; java.nio.file's empty path is "".
 (define (npath-rebuild root segs)
   (if (and (null? segs) (string=? root "")) "" (path-rebuild root segs)))
+;; The same over a path parsed by java/io.ss's path-parse, which is how the
+;; getters below read a root and its segments from one scan rather than three.
+(define (npath-render pp segs) (npath-rebuild (ppath-root pp) segs))
 
 ;; java.nio.file normalize: drop ".", resolve ".." against the preceding
 ;; segment. A ".." that reaches past a ROOT is dropped — a rooted path stays
@@ -76,9 +78,8 @@
             (else (loop (cdr ss) (cons seg stack))))))))
 
 (define (npath-normalize-for windows? s)
-  (let ((root (npath-root-for windows? s)))
-    (npath-rebuild root (npath-fold-dots (not (string=? root ""))
-                                         (npath-segs-for windows? s)))))
+  (let ((pp (path-parse windows? s)))
+    (npath-render pp (npath-fold-dots (ppath-rooted? pp) (ppath-segs pp)))))
 (define (npath-normalize s) (npath-normalize-for (nio-windows?) s))
 
 ;; Paths.get(first, more...) — join with the separator, no normalization. The
@@ -107,16 +108,24 @@
 ;; the current drive, so the JVM resolves it against THIS path's root — "C:/a"
 ;; resolve "\b" is "C:/b", not "C:/a/\b".
 (define (npath-resolve-for windows? a b)
-  (cond ((string=? b "") a)
-        ((npath-absolute-for? windows? b) b)
-        ((npath-rooted-for? windows? b)
-         (let ((aroot (npath-root-for windows? a)))
-           (if (string=? aroot "")
-               b
-               (npath-rebuild aroot (npath-segs-for windows? b)))))
-        ((string=? a "") b)
-        ((path-sep-for? windows? (string-ref a (- (string-length a) 1))) (string-append a b))
-        (else (string-append a (path-join-sep windows? a) b))))
+  (cond
+    ((string=? b "") a)
+    ((npath-absolute-for? windows? b) b)
+    (else
+     ;; b's root, read once and kept. This asked "is b rooted", which rendered
+     ;; the root and dropped it, and the rooted branch below then read b again.
+     ;; b is NOT split into segments here: the branch taken by almost every
+     ;; caller concatenates and never needs them.
+     (let ((broot (npath-root-for windows? b)))
+       (cond
+         ((not (string=? broot ""))
+          (let ((aroot (npath-root-for windows? a)))
+            (if (string=? aroot "")
+                b
+                (npath-rebuild aroot (npath-segs-for windows? b)))))
+         ((string=? a "") b)
+         ((path-sep-for? windows? (string-ref a (- (string-length a) 1))) (string-append a b))
+         (else (string-append a (path-join-sep windows? a) b)))))))
 (define (npath-resolve self other)
   (make-nio-path (npath-resolve-for (nio-windows?)
                                     (nio-path-str self) (npath-string-of other))))
@@ -138,11 +147,11 @@
 ;; and a root has no parent. This answered "/" for every rooted path, so on
 ;; Windows the parent of "C:/a" was "/" — a directory on another drive.
 (define (npath-parent-for windows? s)
-  (let ((root (npath-root-for windows? s)) (segs (npath-segs-for windows? s)))
+  (let* ((pp (path-parse windows? s)) (segs (ppath-segs pp)))
     (cond
       ((null? segs) jolt-nil)
-      ((null? (cdr segs)) (if (string=? root "") jolt-nil root))
-      (else (npath-rebuild root (reverse (cdr (reverse segs))))))))
+      ((null? (cdr segs)) (if (ppath-rooted? pp) (ppath-root pp) jolt-nil))
+      (else (npath-render pp (reverse (cdr (reverse segs))))))))
 (define (npath-parent s)
   (let ((r (npath-parent-for (nio-windows?) s)))
     (if (string? r) (make-nio-path r) r)))
@@ -170,24 +179,29 @@
 (define (npath-starts-with-for windows? a b)
   ;; the empty path is a single empty component: only another empty path starts with it
   (if (string=? b "") (string=? a "")
-      (and (string=? (npath-root-for windows? a) (npath-root-for windows? b))
-           (let loop ((sa (npath-segs-for windows? a)) (sb (npath-segs-for windows? b)))
-             (cond ((null? sb) #t)
-                   ((null? sa) #f)
-                   ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
-                   (else #f))))))
+      (let ((pa (path-parse windows? a)) (pb (path-parse windows? b)))
+        (and (string=? (ppath-root pa) (ppath-root pb))
+             (let loop ((sa (ppath-segs pa)) (sb (ppath-segs pb)))
+               (cond ((null? sb) #t)
+                     ((null? sa) #f)
+                     ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
+                     (else #f)))))))
 (define (npath-starts-with self other)
   (npath-starts-with-for (nio-windows?) (nio-path-str self) (npath-string-of other)))
 
 (define (npath-ends-with-for windows? a b)
-  (if (npath-rooted-for? windows? b)
-      (string=? (npath-normalize-for windows? a) (npath-normalize-for windows? b))
-      (let loop ((sa (reverse (npath-segs-for windows? a)))
-                 (sb (reverse (npath-segs-for windows? b))))
-        (cond ((null? sb) #t)
-              ((null? sa) #f)
-              ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
-              (else #f)))))
+  ;; b is parsed once and serves both branches -- the rooted one normalizes it
+  ;; from the parse in hand rather than handing the string back to be re-read.
+  (let ((pb (path-parse windows? b)))
+    (if (ppath-rooted? pb)
+        (string=? (npath-normalize-for windows? a)
+                  (npath-render pb (npath-fold-dots #t (ppath-segs pb))))
+        (let loop ((sa (reverse (npath-segs-for windows? a)))
+                   (sb (reverse (ppath-segs pb))))
+          (cond ((null? sb) #t)
+                ((null? sa) #f)
+                ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
+                (else #f))))))
 (define (npath-ends-with self other)
   (npath-ends-with-for (nio-windows?) (nio-path-str self) (npath-string-of other)))
 

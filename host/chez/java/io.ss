@@ -683,9 +683,8 @@
 ;; The root as a string, separators normalized to "/" and one trailing "/" kept
 ;; when the root is a directory prefix ("C:/", "//srv/sh/", "/") rather than a
 ;; drive-relative "C:".
-(define (path-root windows? p)
-  (let* ((end (path-root-end windows? p))
-         (raw (substring p 0 end)))
+(define (path-root-from windows? p end)
+  (let ((raw (substring p 0 end)))
     (cond
       ((= end 0) "")
       ((and windows? (= end 2) (windows-drive-prefix? p)) raw)  ; "C:" — drive-relative
@@ -699,30 +698,79 @@
                       out
                       (string-append out "/"))))
            s))))))
+(define (path-root windows? p)
+  (path-root-from windows? p (path-root-end windows? p)))
 
 ;; The non-empty segments under the root. Empty ones (a doubled separator) are
 ;; dropped here, which is what the JVM's normalize does to them anyway.
-(define (path-segments windows? p)
+(define (path-segments-from windows? p from)
   (let ((n (string-length p)))
-    (let loop ((i (path-root-end windows? p)) (start (path-root-end windows? p)) (acc '()))
+    (let loop ((i from) (start from) (acc '()))
       (cond
         ((= i n) (reverse (if (> i start) (cons (substring p start i) acc) acc)))
         ((path-sep-for? windows? (string-ref p i))
          (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring p start i) acc) acc)))
         (else (loop (+ i 1) start acc))))))
+(define (path-segments windows? p)
+  (path-segments-from windows? p (path-root-end windows? p)))
+
+;; A path PARSED once: its root, its segments, and the platform they were read
+;; for. Every helper below used to take the string and re-derive both, and
+;; path-root / path-segments each begin with their own path-root-end scan — so a
+;; single Path method could scan the same string up to seven times (endsWith
+;; against a rooted other normalizes both sides, and each normalize is a root
+;; plus a segment split). The scan runs once here and the parts are read as
+;; fields instead (jolt-2sp).
+;;
+;; This deliberately does NOT reach jolt-path-normalize, which every jfile runs
+;; through and which a directory listing runs per entry: that one is a character
+;; walk that allocates nothing for an already-normal path, it never asks for
+;; segments, and turning it into a parse-and-render would allocate a record and
+;; a segment list per file. It keeps its own shape for that reason.
+;;
+;; The platform is NOT a field. It reads like it should be one -- the parse is
+;; platform-specific, so the result "belongs to" a platform -- but nothing would
+;; ever read it back: every helper below already takes `windows?` as a parameter,
+;; which is what lets a Linux runner pin the Windows rows
+;; (test/chez/win-platform-test.ss). A field no caller reads is weight on every
+;; parse and one more thing to keep true, so the parser takes the platform and
+;; the value keeps only what the platform decided.
+(define-record-type ppath
+  (fields root segs)
+  (nongenerative jolt-ppath-v1))
+
+(define (path-parse windows? p)
+  (let ((end (path-root-end windows? p)))
+    (make-ppath (path-root-from windows? p end)
+                (path-segments-from windows? p end))))
+
+(define (ppath-rooted? pp) (not (string=? (ppath-root pp) "")))
+
+;; Re-render, optionally over a different segment list — the shape every
+;; consumer wants: parse, transform the segments, render.
+(define (ppath-render pp segs) (path-rebuild (ppath-root pp) segs))
 
 (define (path-rebuild root segs)
   (cond
     ((null? segs) (if (string=? root "") "." root))
     (else
-     (let loop ((out root) (ss segs) (first? #t))
-       (if (null? ss)
-           out
-           (loop (string-append out
-                                (if (or first? (string=? out "")) "" "/")
-                                (car ss))
-                 (cdr ss)
-                 #f))))))
+     ;; ONE allocation for the whole path. This appended per segment, and each
+     ;; append copies the answer built so far -- quadratic in the number of
+     ;; segments, on the function every getter below ends in. A path is short
+     ;; enough that the constant hid it, but rebuilding was measurably the most
+     ;; expensive thing in the Path algebra, more than the scanning above it.
+     ;;
+     ;; No separator before the FIRST segment: a root either ends in one ("/",
+     ;; "C:/", "//srv/sh/") or must not gain one ("C:" is drive-relative, and
+     ;; "C:a" names a different file from "C:/a"). The old spelling also tested
+     ;; (string=? out "") for that, which could only ever be true on the first
+     ;; segment and so said the same thing twice.
+     (apply string-append root
+            (cons (car segs)
+                  (let loop ((ss (cdr segs)) (acc '()))
+                    (if (null? ss)
+                        (reverse acc)
+                        (loop (cdr ss) (cons (car ss) (cons "/" acc))))))))))
 
 ;; Fold "." and ".." lexically. Only ever applied to a part of a path that does
 ;; NOT exist: where a component is real, realpath resolves it instead, because
@@ -737,8 +785,8 @@
       (else (loop (cdr ss) (cons (car ss) out))))))
 
 (define (jfile-fold-dots-for windows? p)
-  (path-rebuild (path-root windows? p)
-                (fold-dot-segments (path-segments windows? p))))
+  (let ((pp (path-parse windows? p)))
+    (ppath-render pp (fold-dot-segments (ppath-segs pp)))))
 
 ;; The JVM canonicalizes a path whose tail does not exist -- on a host where
 ;; /tmp is a link, new File("/tmp/nope").getCanonicalPath is
@@ -750,19 +798,19 @@
 ;; reachable from a POSIX host.
 (define (jfile-canonical-for windows? realpath p)
   (or (realpath p)
-      (let* ((root (path-root windows? p))
-             (segs (path-segments windows? p)))
+      (let* ((pp (path-parse windows? p))
+             (root (ppath-root pp))
+             (segs (ppath-segs pp)))
         (let loop ((n (- (length segs) 1)))
           (cond
             ((< n 0) (jfile-fold-dots-for windows? p))
             (else
              (let ((rp (realpath (path-rebuild root (list-head segs n)))))
                (if rp
-                   (jfile-fold-dots-for
-                    windows?
-                    (path-rebuild (path-root windows? rp)
-                                  (append (path-segments windows? rp)
-                                          (list-tail segs n))))
+                   (let ((rpp (path-parse windows? rp)))
+                     (jfile-fold-dots-for
+                      windows?
+                      (ppath-render rpp (append (ppath-segs rpp) (list-tail segs n)))))
                    (loop (- n 1))))))))))
 
 (define (jfile-canonical p)
