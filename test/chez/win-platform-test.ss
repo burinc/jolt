@@ -406,6 +406,53 @@
 (same "windows probes every letter"
       (length (file-list-roots-for #t (lambda (_) #t))) 26)
 
+;; --- the parsed path agrees with the two readers it replaces (jolt-2sp) -------
+;; path-parse exists so a helper reads a path's root and segments from ONE scan
+;; instead of asking path-root and path-segments separately, each of which
+;; begins with its own path-root-end. That is only safe while the parse says
+;; exactly what those two say, so this pins the equivalence directly rather than
+;; inferring it from the callers passing: every shape the root scan distinguishes
+;; — POSIX, drive, drive-relative, UNC, current-drive-rooted, relative — on both
+;; platforms, including the ones whose roots the callers below never build.
+(define (parse-agrees label windows? given)
+  (let ((pp (path-parse windows? given)))
+    (same (string-append label " / root") (ppath-root pp) (path-root windows? given))
+    (same (string-append label " / segs") (ppath-segs pp) (path-segments windows? given))
+    (same (string-append label " / rooted?")
+          (ppath-rooted? pp) (not (string=? (path-root windows? given) "")))))
+(parse-agrees "posix absolute"        #f "/a/b/c")
+(parse-agrees "posix relative"        #f "a/b")
+(parse-agrees "posix root itself"     #f "/")
+(parse-agrees "posix empty"           #f "")
+(parse-agrees "posix doubled sep"     #f "//a//b")
+(parse-agrees "posix backslash name"  #f "\\a\\b")
+(parse-agrees "posix dots"            #f "/a/./b/../c")
+(parse-agrees "win drive"             #t "C:/a/b")
+(parse-agrees "win drive backslash"   #t "C:\\a\\b")
+(parse-agrees "win drive root only"   #t "C:/")
+(parse-agrees "win drive-relative"    #t "C:a/b")
+(parse-agrees "win unc"               #t "//srv/sh/a")
+(parse-agrees "win unc root only"     #t "//srv/sh/")
+(parse-agrees "win unc backslash"     #t "\\\\srv\\sh\\a")
+(parse-agrees "win current-drive"     #t "\\a\\b")
+(parse-agrees "win relative"          #t "a\\b")
+(parse-agrees "win empty"             #t "")
+(parse-agrees "win dots"              #t "C:/a/./b/../c")
+
+;; ppath-render is path-rebuild over the parse — the third of the three calls a
+;; helper used to make. Rendering a parse back unchanged is the identity on any
+;; already-normal path, which is what makes "parse, transform segments, render"
+;; a safe replacement for the string-in/string-out shape.
+(define (render-roundtrip label windows? given want)
+  (let ((pp (path-parse windows? given)))
+    (same label (ppath-render pp (ppath-segs pp)) want)))
+(render-roundtrip "posix roundtrip"   #f "/a/b"        "/a/b")
+(render-roundtrip "posix rel"         #f "a/b"         "a/b")
+(render-roundtrip "win drive"         #t "C:/a/b"      "C:/a/b")
+(render-roundtrip "win drive bs"      #t "C:\\a\\b"    "C:/a/b")
+(render-roundtrip "win unc"           #t "//srv/sh/a"  "//srv/sh/a")
+(render-roundtrip "win current-drive" #t "\\a\\b"      "/a/b")
+
 ;; --- rename-replace! on this host --------------------------------------------
 ;; The Windows branch needs a real Windows filesystem and is gated on the
 ;; Windows runner. What is checked here is that adding it did not cost POSIX its
