@@ -1041,6 +1041,25 @@ if [ "$got_um_bin" != "$umwant" ]; then
   echo "  FAIL: top-level (set! *unchecked-math* …) in a built binary — want \`$umwant\`, got \`$got_um_bin\`"; exit 1
 fi
 
+# -main is user code after the load, so both the CLI's `run -m` and a built
+# binary's launcher run it under clojure.main's compiler-flag frame: a set! in
+# -main is legal and reads back. Before the fix both threw "Can't
+# change/establish root binding".
+efapp="$root/test/chez/entry-flags-app"
+efwant="ENTRY-FLAGS true false"
+got_ef_src="$(cd "$efapp" && JOLT_PWD="$efapp" "$joltabs" run -m eflags.main 2>&1 | tail -1)"
+if [ "$got_ef_src" != "$efwant" ]; then
+  echo "  FAIL: (set! *warn-on-reflection* …) in -main from source — want \`$efwant\`, got \`$got_ef_src\`"; exit 1
+fi
+efout="$(dirname "$out")/entry-flags-bin"
+if ! JOLT_PWD="$efapp" "$jolt" build -m eflags.main -o "$efout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of an entry-flags app exited non-zero"; exit 1
+fi
+got_ef_bin="$(cd / && "$efout" 2>&1 | tail -1)"
+if [ "$got_ef_bin" != "$efwant" ]; then
+  echo "  FAIL: (set! *warn-on-reflection* …) in -main in a built binary — want \`$efwant\`, got \`$got_ef_bin\`"; exit 1
+fi
+
 # A built binary must have the vendored babashka.fs (via jolt.fs) available and
 # runnable — including functions defined after babashka.fs's cljs-only reader
 # conditionals (directory?/cwd/which). Guards the vendored-namespace baking.

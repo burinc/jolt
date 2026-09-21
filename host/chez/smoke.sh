@@ -1956,6 +1956,40 @@ check '(do (load-string "(set! *unchecked-math* true) :x") *unchecked-math*)' 'f
 check '(do (load-string "(set! *warn-on-reflection* true) :x") *warn-on-reflection*)' 'false'
 check '(do (load-string "(set! *assert* false) :x") *assert*)' 'true'
 
+# ...and -m/run -m carry the same frame: -main is code running AFTER the
+# require's load frame popped, so a -main that set! a flag used to throw where
+# the same form at the file's top level worked. The entry frame also reaches
+# what -main evaluates at runtime — a jolt.loader source dep opens with the
+# same idiom — and the loader brackets it per file, so the dep's set! does not
+# escape into the entry's frame (checked here as *assert* staying at its root).
+ef_dir="$(mktemp -d)"
+mkdir -p "$ef_dir/src"
+printf '(ns eflags) (defn -main [& _] (set! *warn-on-reflection* true) (println "ENTRY-FLAGS" *warn-on-reflection*))\n' \
+  > "$ef_dir/src/eflags.clj"
+printf '(ns fdep) (set! *assert* false) (def v :from-dep)\n' > "$ef_dir/src/fdep.clj"
+printf '(ns xeflags) (defn go [_] (set! *assert* false) (println "XF-FLAGS" *assert*))\n' \
+  > "$ef_dir/src/xeflags.clj"
+printf '{:paths ["src"] :tasks {flg {:task (do (set! *warn-on-reflection* true) (println "TASK-FLAGS" *warn-on-reflection*))}}}\n' \
+  > "$ef_dir/deps.edn"
+printf '(ns lflags (:require [jolt.loader :as jl]))\n(defn -main [& _]\n  (set! *unchecked-math* true)\n  (let [r (jl/load (jl/classpath ["%s/src"]) {:kind :ns :name "fdep"})]\n    (println "LOADER-FLAGS" *unchecked-math* *assert* (:handle r))))\n' "$ef_dir" \
+  > "$ef_dir/src/lflags.clj"
+ef_check() { # label expected actual
+  if [ "$2" = "$3" ]; then pass=$((pass + 1))
+  else echo "  FAIL: $1"; echo "    want \`$2\` got \`$3\`"; fails=$((fails + 1)); fi
+}
+ef_check "-m: a set! in -main has a frame" "ENTRY-FLAGS true" \
+  "$(JOLT_PWD="$ef_dir" $jolt -m eflags 2>&1 | tail -1)"
+ef_check "run -m: the same" "ENTRY-FLAGS true" \
+  "$(JOLT_PWD="$ef_dir" $jolt run -m eflags 2>&1 | tail -1)"
+ef_check "-m + jolt.loader: the entry's set! holds and the loaded file's stays scoped" \
+  "LOADER-FLAGS true true fdep" \
+  "$(JOLT_PWD="$ef_dir" $jolt -m lflags 2>&1 | tail -1)"
+ef_check "a task body: an entry like any other" "TASK-FLAGS true" \
+  "$(JOLT_PWD="$ef_dir" $jolt flg 2>&1 | tail -1)"
+ef_check "-X exec fn: the same" "XF-FLAGS false" \
+  "$(JOLT_PWD="$ef_dir" $jolt -X xeflags/go 2>&1 | tail -1)"
+rm -rf "$ef_dir"
+
 # The runtime's own boot must not read as registry drift. A class registered
 # under BOTH its qualified and its simple name shares one member table, so a
 # fresh closure per spelling re-registers the member with a different value and
