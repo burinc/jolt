@@ -510,7 +510,11 @@
                 (begin (char-reader-replay! self (cdr replay)) (car replay))
                 (get-char (char-reader-port self))))
          (m (char-reader-mark self)))
-    (when (and m (not (eof-object? c)))
+    ;; `vector? m`, not `m`: an invalidated mark is the symbol 'invalid, and the
+    ;; reader goes on being read from after one — the JVM drops the mark and
+    ;; keeps delivering characters, and only reset() raises. Testing `m` here
+    ;; walked into (vector-ref 'invalid 3) on the next unit.
+    (when (and (vector? m) (not (eof-object? c)))
       (let ((n (fx+ (vector-ref m 3) 1)))
         (if (fx>? n (fxmax (vector-ref m 1) char-reader-mark-floor))
             (char-reader-mark! self 'invalid)         ; read past what a mark keeps
