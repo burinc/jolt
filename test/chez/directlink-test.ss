@@ -84,6 +84,13 @@
   (ok "on: a's def registers a write-through setter over the binding"
       (contains? ea "(lambda (v) (set! jv$app$a v))")))
 
+(let ((ep (emit-form "app" "(def ||| (fn* ([] 7)))")))
+  (ok "on: a pipe-named def emits a valid direct binding"
+      (contains? ep "(define jv$app$_V__V__V_ ")))
+(let ((eu (emit-form "app" "(def uses-pipe (fn* ([] (|||))))")))
+  (ok "on: a pipe-named call uses its escaped direct binding"
+      (contains? eu "(jv$app$_V__V__V_)")))
+
 (let ((eb (emit-form "app" "(def b (fn* ([] (a))))")))
   (ok "on: b's call to a is a direct (jv$app$a) call" (contains? eb "(jv$app$a)"))
   (ok "on: b's call to a is NOT var-routed" (not (var-routed? eb "app" "a")))
