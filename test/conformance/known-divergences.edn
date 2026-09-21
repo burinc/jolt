@@ -1231,6 +1231,26 @@
            :jvm "throws IllegalArgumentException"
            :jolt "[-56 127]"}
    :note "(byte 200) still throws on both — the CAST is checked, the byte-array STORE narrows. Portable code passes (byte v) or (unchecked-byte v) to aset and behaves identically here."}
+  ;; The 2-arg (T-array size init) constructor, where jolt accepts three inits the
+  ;; JVM refuses. Numbers.T_array branches on an instanceof of the element's OWN
+  ;; boxed type — Byte for byte_array, Short for short_array — and a Clojure
+  ;; integer literal is a Long, so (byte-array 3 200) and (short-array 3 7) fall
+  ;; to the seq branch and die in RT.seq; the portable spellings are (byte 200)
+  ;; and (short 7). jolt has one exact-integer type (:integer-box-model) and so
+  ;; cannot tell a Byte from a Short from a Long at the init, the same reason the
+  ;; two byte-store rows above diverge; it fills, narrowing for byte exactly as
+  ;; na-byte-of narrows at every other door. object-array is a third case and a
+  ;; simpler one: the JVM gives it no 2-arity at all, so jolt's fill has nothing
+  ;; to disagree with. The SEQ form of the init agrees on both runtimes for every
+  ;; kind — test/chez/array-backing-test.ss pins it row by row. jolt-6g1.
+  {:category :permissive
+   :behavior "(byte-array 3 200), (short-array 3 7), (object-array 2 :x) — a 2-arg array constructor whose init the JVM will not take"
+   :jvm "byte/short raise IllegalArgumentException (Don't know how to create ISeq from: java.lang.Long); object-array raises ArityException (no 2-arity)"
+   :jolt "fills: byte narrows to [-56 -56 -56], short is [7 7 7], object-array is [:x :x]"
+   :check {:expr "[(vec (byte-array 3 200)) (vec (short-array 3 7)) (vec (object-array 2 :x))]"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[[-56 -56 -56] [7 7 7] [:x :x]]"}
+   :note "Only the SCALAR init diverges. (byte-array 3 [1 2]) is [1 2 0] on both, as is every other kind's seq init."}
   ;; A flonum reaching an array store: jolt floors a non-integer INDEX (na-idx, for
   ;; every array kind) and, for a byte array, truncates the VALUE toward zero before
   ;; narrowing it (na-byte-of, the JVM's d2i then byteValue). The JVM's Reflector

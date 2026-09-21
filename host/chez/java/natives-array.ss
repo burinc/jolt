@@ -373,10 +373,46 @@
 ;; bytes rather than whatever magnitude it was handed.
 (define (na-from-seq x kind)
   (make-jolt-array (na-list->backing (seq->list (jolt-seq x)) kind) kind))
+
+;; (T-array size init) has TWO forms on the JVM, and Numbers.T_array picks between
+;; them with an instanceof: an init that is the element's own scalar type fills
+;; every slot, and ANYTHING ELSE is a seq that fills a PREFIX, the tail staying at
+;; the element default. jolt only ever had the first, so (int-array 3 [1 2]) built
+;; three slots each holding the vector [1 2] instead of [1 2 0] — an int array whose
+;; elements are not ints. na-scalar-init? is that instanceof, per kind: Number for
+;; the numeric kinds, Character for char, Boolean for boolean.
+;;
+;; 'object is deliberately exempt and keeps the fill it has always done: the JVM
+;; gives object-array no 2-arity at all (it raises ArityException), so there is no
+;; reference behaviour to match and nothing to be wrong about — narrowing it to a
+;; prefix fill would be jolt inventing a second rule, not adopting the JVM's.
+(define (na-scalar-init? kind v)
+  (cond ((eq? kind 'object) #t)
+        ((eq? kind 'char) (char? v))
+        ((eq? kind 'boolean) (boolean? v))
+        (else (number? v))))
+
+;; The seq form. Routed through na-list->backing rather than a per-kind store loop
+;; so the prefix is packed by exactly the rule the (T-array coll) constructor packs
+;; by — byte narrowing, the flvector/fxvector choice, and the boxing fallback for
+;; an element the backing cannot hold are all decided in one place.
+;;
+;; A nil init seqs to nothing, which lands on an all-default array: that is the
+;; JVM's answer too (RT.seq(null) is null, so its fill loop runs zero times).
+(define (na-init-prefix-backing n kind init default)
+  (let* ((n (exact n))
+         (taken (let loop ((i 0) (l (seq->list (jolt-seq init))) (acc '()))
+                  (if (or (fx=? i n) (null? l))
+                      (reverse acc)
+                      (loop (fx+ i 1) (cdr l) (cons (car l) acc))))))
+    (na-list->backing (append taken (make-list (- n (length taken)) default)) kind)))
+
 ;; (T-array size) | (T-array size init) | (T-array seq)
 (define (na-num-array a rest init kind)
   (if (number? a)
-      (make-jolt-array (na-make-backing (na-idx a) kind (if (pair? rest) (car rest) init)) kind)
+      (if (and (pair? rest) (not (na-scalar-init? kind (car rest))))
+          (make-jolt-array (na-init-prefix-backing (na-idx a) kind (car rest) init) kind)
+          (make-jolt-array (na-make-backing (na-idx a) kind (if (pair? rest) (car rest) init)) kind))
       (na-from-seq a kind)))
 
 ;; numeric tower: array element defaults / narrowed bytes / count are
@@ -430,7 +466,14 @@
     ;; (Chez has no lazily-zeroed allocation the way the JVM's new char[n] gets
     ;; zero pages from the OS), so parity is not the claim — but the cost falls
     ;; to what filling a string costs.
-    ((number? a) (make-jolt-array (make-string (exact (na-idx a)) #\nul) 'char))
+    ;; The init went unread until jolt-6g1: every sibling constructor threaded
+    ;; `rest` through na-num-array and this one dropped it on the floor, so
+    ;; (char-array 3 \.) answered three NULs. It takes the same route as the others
+    ;; now, which also gives it the seq form ((char-array 3 "ab") is [\a \b \nul]).
+    ;; The 1-arg case is unchanged and still bottoms out in (make-string n #\nul)
+    ;; — na-make-backing's char arm — so the flat, untraced backing described
+    ;; above is what it still allocates.
+    ((number? a) (na-num-array a rest #\nul 'char))
     ;; (char-array coll) coerces STRICTLY, and keeps doing so: a character is
     ;; itself, a number is the character at that code point, and anything else
     ;; raises out of truncate — which is what this constructor has always done
@@ -453,7 +496,13 @@
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.
 (define (na-byte-array a . rest)
   (cond
-    ((number? a) (make-jolt-array (na-make-backing (na-idx a) 'byte (if (pair? rest) (car rest) 0)) 'byte))
+    ;; na-num-array, not na-make-backing directly: byte-array keeps its own cond
+    ;; for the bytevector/string doors below, but the size+init door is the same
+    ;; one every other constructor uses and needs the same seq form — before
+    ;; jolt-6g1 (byte-array 3 [1 2]) died in na-byte-of trying to narrow the vector
+    ;; itself to a byte, where the JVM answers [1 2 0]. An out-of-range scalar
+    ;; still narrows exactly as before (na-make-backing's byte arm).
+    ((number? a) (na-num-array a rest 0 'byte))
     ((bytevector? a) (na-bv->bytearray a))
     ((string? a) (na-bv->bytearray (string->utf8 a)))
     (else (na-from-seq a 'byte))))
