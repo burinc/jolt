@@ -361,6 +361,48 @@
       (when (pid-alive? gpid) (sh ["sh" "-c" (str "kill -9 " gpid)])))
     (fs/delete-if-exists pidf)))
 
+;; --- java.lang.ProcessHandle, the class (jolt-lang/jolt#1087) ----------------
+;; The handle shim answered .pid / .descendants / .destroy and Process.toHandle
+;; built one, but the CLASS was not registered, so every reference to it died at
+;; the first touch: (ProcessHandle/current) reported RFC 0014's "No dependency
+;; provides java.lang.ProcessHandle" — advice nothing can act on for a class the
+;; runtime already models. Asking for your own pid, to stamp into a log or temp
+;; filename, is the portable spelling that needs it (kmet's
+;; terminal/capture-log-path died at namespace load on it).
+(let [self (ProcessHandle/current)]
+  (check-eq "ProcessHandle/current has a live pid" (pos? (.pid self)) true)
+  (check-eq "...and it is this process's, the one a child's $PPID reports"
+            (str (.pid self)) (str/trim (:out (sh ["sh" "-c" "echo $PPID"]))))
+  (check-eq "...and it is an instance of the class"
+            (instance? java.lang.ProcessHandle self) true)
+  (check-eq "current is alive" (.isAlive self) true)
+  ;; of(pid) answers an Optional, as the JVM's does — present for a running pid
+  (check-eq "of(own pid) is present" (.isPresent (ProcessHandle/of (.pid self))) true)
+  (check-eq "of(own pid) round-trips" (.pid (.get (ProcessHandle/of (.pid self)))) (.pid self))
+  ;; ...and empty for one nothing is running under. 2^22 is over every default
+  ;; pid_max, so no race can hand this one a live process.
+  (check-eq "of(unused pid) is empty" (.isPresent (ProcessHandle/of 4194304)) false)
+  ;; ...and so is a non-positive one, which kill(2) would read as a process GROUP
+  (check-eq "of(0) is empty" (.isPresent (ProcessHandle/of 0)) false)
+  (check-eq "of(negative) is empty" (.isPresent (ProcessHandle/of -1)) false)
+  ;; pid 1 always exists and is usually root's, so kill(pid, 0) answers EPERM
+  ;; rather than 0 — "exists, you may not signal it". Reading any failure as
+  ;; dead reported every process but our own as gone.
+  (check-eq "of(pid 1) is present" (.isPresent (ProcessHandle/of 1)) true)
+  (check-eq "toString is the pid" (.toString self) (str (.pid self)))
+  (check-eq "two handles on one pid are equal" (.equals self (ProcessHandle/current)) true))
+
+;; Process.toHandle now answers something that reports the class, which is what
+;; babashka.process's destroy-tree rides on
+(let [p (process ["sh" "-c" "sleep 5"])
+      h (.toHandle (:proc p))]
+  (check-eq "toHandle is a ProcessHandle" (instance? java.lang.ProcessHandle h) true)
+  (check-eq "toHandle carries the child's pid" (.pid h) (.pid (:proc p)))
+  (check-eq "the child is alive" (.isAlive h) true)
+  (.destroy h)
+  (loop [n 0] (when (and (< n 60) (p/alive? p)) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "handle destroy kills it" (p/alive? p) false))
+
 ;; --- descendants / destroy-tree over a real grandchild (jolt-hpdu) -----------
 ;; ProcessHandle.descendants was hardcoded empty, so destroy-tree WAS destroy:
 ;; killing a wrapper left whatever the wrapper spawned running (a `lake env repl`
