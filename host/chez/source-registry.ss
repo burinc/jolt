@@ -555,7 +555,16 @@
 ;;
 ;; Only a trailing __il<digits> over a non-empty base is stripped, so a fn the user
 ;; actually named foo__il is left alone.
-(define (srcreg-display-name nm)
+;;
+;; A NAMED inner literal is bound under its image-registry label,
+;; jfn$<ns>/<def>$<n>/<name> (backend fnsrc-name), so the registry has a key
+;; that cannot collide. Shown as <ns>/<def>/<name>, the way clojure.stacktrace
+;; demunges user$f$mapi__12: the counter is a compiler artifact. An anonymous
+;; literal's label has one `/` and is shown as is. munge-chars never emits a
+;; `/`, so the two slashes are the label's own.
+;; The alpha-rename is stripped from the name part as well: a named literal
+;; inside a spliced callee reaches here as jfn$…/step-boom__il22.
+(define (srcreg-strip-il nm)
   (let ((n (string-length nm)))
     (let scan ((i n))
       (cond
@@ -565,13 +574,31 @@
         ((and (fx<? i n) (fx>? i 4)
               (string=? (substring nm (fx- i 4) i) "__il"))
          (substring nm 0 (fx- i 4)))
-        ;; ...or by "$jf", the unique alias a NAMED inner literal is bound under
-        ;; so the image registry has a key that cannot collide. Same deal as
-        ;; __ilN: a compiler artifact, not something to show a user.
-        ((and (fx<? i n) (fx>? i 3)
-              (string=? (substring nm (fx- i 3) i) "$jf"))
-         (substring nm 0 (fx- i 3)))
         (else nm)))))
+(define (srcreg-literal-display nm)
+  (let ((n (string-length nm)))
+    (and (fx>? n 4) (string=? (substring nm 0 4) "jfn$")
+         (let* ((i1 (let find ((i 4)) (cond ((fx=? i n) #f)
+                                             ((char=? (string-ref nm i) #\/) i)
+                                             (else (find (fx+ i 1))))))
+                (i2 (and i1 (let find ((i (fx- n 1))) (cond ((fx<=? i i1) #f)
+                                                              ((char=? (string-ref nm i) #\/) i)
+                                                              (else (find (fx- i 1))))))))
+           (and i2
+                (let* ((ns (substring nm 4 i1))
+                       (mid (substring nm (fx+ i1 1) i2))
+                       ;; <def>$<n>: drop the counter
+                       (def (let scan ((i (string-length mid)))
+                              (cond ((and (fx>? i 0) (char<=? #\0 (string-ref mid (fx- i 1)) #\9))
+                                     (scan (fx- i 1)))
+                                    ((and (fx>? i 0) (char=? (string-ref mid (fx- i 1)) #\$))
+                                     (substring mid 0 (fx- i 1)))
+                                    (else mid))))
+                       (name (srcreg-strip-il (substring nm (fx+ i2 1) n))))
+                  (string-append ns "/" (if (fx=? (string-length def) 0) "" (string-append def "/")) name)))))))
+(define (srcreg-display-name nm)
+  (or (srcreg-literal-display nm)
+      (srcreg-strip-il nm)))
 
 (define (srcreg-frame name record line) (vector name record line))
 (define (srcreg-frame-nm f) (vector-ref f 0))

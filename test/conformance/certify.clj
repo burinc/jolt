@@ -458,37 +458,73 @@
     (format "  self-test FAIL: args %s — expected corpus %s, got %s"
             (pr-str args) (pr-str want) (pr-str got))))
 
+(declare oracle-jdk-mismatch)
+;; [oracle-feature pinned refuses?]: the pin is exact, in both directions.
+(def oracle-jdk-test-cases
+  [[21 21 false]
+   [26 21 true]
+   [20 21 true]
+   [21 nil true]])
+
+(defn oracle-jdk-self-test []
+  (for [[feature pinned want] oracle-jdk-test-cases
+        :let [got (boolean (oracle-jdk-mismatch feature pinned))]
+        :when (not= got want)]
+    (format "  self-test FAIL: oracle JDK %s vs pinned %s — expected refuse? %s, got %s"
+            feature (pr-str pinned) want got)))
+
 (defn self-test []
   (let [got (mapv (fn [row] (assoc row :got (:bucket (classify row)))) self-test-rows)
         bad (remove #(= (:bucket %) (:got %)) got)
-        arg-bad (arg-self-test)]
+        arg-bad (arg-self-test)
+        jdk-bad (oracle-jdk-self-test)]
     (doseq [{:keys [bucket got actual]} bad]
       (println (format "  self-test FAIL: %s — expected bucket %s, got %s" actual bucket got)))
     (doseq [m arg-bad] (println m))
-    (println (format "certify self-test: %d/%d bucket fixtures pass, %d/%d arg-parse cases pass"
+    (doseq [m jdk-bad] (println m))
+    (println (format "certify self-test: %d/%d bucket fixtures pass, %d/%d arg-parse cases pass, %d/%d oracle-JDK cases pass"
                      (- (count got) (count bad)) (count got)
-                     (- (count arg-test-cases) (count arg-bad)) (count arg-test-cases)))
-    (System/exit (if (or (seq bad) (seq arg-bad)) 1 0))))
+                     (- (count arg-test-cases) (count arg-bad)) (count arg-test-cases)
+                     (- (count oracle-jdk-test-cases) (count jdk-bad)) (count oracle-jdk-test-cases)))
+    (System/exit (if (or (seq bad) (seq arg-bad) (seq jdk-bad)) 1 0))))
 
-;; The corpus is measured on this JDK or newer: java.util.SequencedCollection and
-;; its List/Deque methods (JDK 21) have rows. An older oracle would report them
-;; as NEW divergences, which is not a fact about jolt — refuse to judge instead.
-;; CI points JAVA_CMD at the JDK it installs for this: the `clojure` launcher
-;; runs JAVA_CMD first, then the java on PATH, and JAVA_HOME only when there is
-;; none — not the newest JDK on the machine.
-(def oracle-jdk-floor 21)
+;; The corpus is measured on ONE JDK, recorded in the profile as :oracle-jdk
+;; (the feature version; --profile writes the JDK it ran on). A measured value
+;; is only true for the JDK that measured it, in both directions: an older
+;; oracle lacks java.util.SequencedCollection (JDK 21) and reports its rows as
+;; NEW divergences; a newer one changed java.util.zip's exceptions (JDK 26 raises
+;; IllegalStateException where 21 raises NullPointerException on a closed
+;; Inflater, and reworded the CEN messages) and reports those. Neither is a fact
+;; about jolt — refuse to judge instead. The `clojure` launcher runs JAVA_CMD
+;; first, then the java on PATH, and JAVA_HOME only when there is none — so it
+;; is whatever happens to be first, not the pinned one: make certify sets
+;; JAVA_CMD to the pinned JDK when it can find one, and CI points it at the JDK
+;; it installs.
+(def profile
+  (edn/read-string (slurp "test/conformance/profile.edn")))
 
-(def oracle-clojure-version
-  (:clojure-version
-   (edn/read-string (slurp "test/conformance/profile.edn"))))
+(def oracle-clojure-version (:clojure-version profile))
+
+(def oracle-jdk (:oracle-jdk profile))
+
+;; The refusal text for an oracle on JDK `feature` when the corpus pins
+;; `pinned`, or nil when they agree. Pure, so the self-test can cover it
+;; without a second JDK on the machine.
+(defn oracle-jdk-mismatch [feature pinned]
+  (cond
+    (nil? pinned)
+    "certify: test/conformance/profile.edn has no :oracle-jdk — regenerate it with --profile on the JDK the corpus is measured on."
+    (not= feature pinned)
+    (str (format "certify: the oracle is JDK %s (%s), but the corpus is measured on JDK %d.\n"
+                 (System/getProperty "java.runtime.version") (System/getProperty "java.home") pinned)
+         (format "        java.* behaviour differs across JDKs, so this oracle would report JDK %d's changes as jolt divergences.\n" feature)
+         (format "        Point JAVA_CMD at a JDK %d java (the clojure launcher's first choice) — make certify does this when it finds one —\n" pinned)
+         "        or re-measure: regen-corpus.clj, then certify.clj --profile, both on the new JDK.")))
 
 (defn check-oracle-jdk! []
-  (let [feature (.feature (Runtime/version))]
-    (when (< feature oracle-jdk-floor)
-      (println (format "certify: the oracle is JDK %s (%s), but the corpus is measured on JDK %d or newer."
-                       (System/getProperty "java.runtime.version") (System/getProperty "java.home") oracle-jdk-floor))
-      (println "        Set JAVA_CMD to a newer JDK's java (the clojure launcher's first choice), or put one first on PATH.")
-      (System/exit 2))))
+  (when-let [msg (oracle-jdk-mismatch (.feature (Runtime/version)) oracle-jdk)]
+    (println msg)
+    (System/exit 2)))
 
 (defn check-oracle-clojure! []
   (when-not (= oracle-clojure-version (clojure-version))
@@ -511,8 +547,8 @@
         by (group-by :bucket results)
         n (count results)
         cnt #(count (get by % []))]
-    (println (format "Certifying %d corpus rows against JVM Clojure %s on JDK %s\n" n (clojure-version)
-                     (System/getProperty "java.runtime.version")))
+    (println (format "Certifying %d corpus rows against JVM Clojure %s on JDK %s (profile pins %d)\n" n (clojure-version)
+                     (System/getProperty "java.runtime.version") oracle-jdk))
     (println (format "  certified        %5d  (jolt expected == JVM)" (cnt :certified)))
     (println (format "  certified-throws %5d  (:throws, JVM also throws)" (cnt :certified-throws)))
     (println (format "  uncertifiable    %5d  (JVM lacks the vocabulary — jolt-only fn/class/lib)" (cnt :uncertifiable)))
@@ -611,6 +647,8 @@
                              "faithful Clojure. A runtime's conformance LEVEL = portable + the feature "
                              "families it implements. See SPEC.md.")
                    :clojure-version (clojure-version)
+                   ;; the JDK this run measured on; check-oracle-jdk! refuses any other
+                   :oracle-jdk (.feature (Runtime/version))
                    ;; certified rows MINUS the ones that only certified because the
                    ;; oracle supplied a name — those are listed as non-portable.
                    :portable-count (count (filter #(and (#{:certified :certified-throws} (:bucket %))

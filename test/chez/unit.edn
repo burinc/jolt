@@ -1,6 +1,6 @@
 [
-  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$.]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
-  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core\\$mm\\$\" s)))" :expected "true"}
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$./]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core/mm\\$\" s)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0) (< x 10))) (repeatedly 500 (fn [] (.nextInt r 10)))))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.) b (byte-array 16)] (.nextBytes r b) [(alength b) (> (count (distinct (seq b))) 4)])" :expected "[16 true]"}
@@ -621,6 +621,36 @@
   {:suite "io" :label "slurp accepts the IReader used by *in*" :expr "(with-in-str \"one\\ntwo\" (slurp *in*))" :expected "\"one\\ntwo\""}
   {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"hello\""}
   {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"ab\""}
+  ;; spit stages into a temp file and renames over the target, so OVERWRITING is
+  ;; the case that broke on Windows, where a rename onto an existing destination
+  ;; is refused (#1074): the second spit to any path failed, as did the first
+  ;; spit to a File/createTempFile target. The Windows half needs that platform
+  ;; (.github/workflows/tests.yml); these rows keep the POSIX half honest.
+  {:suite "io" :label "spit overwrites an existing file" :expr "(do (spit \"/tmp/jolt-io-overwrite.txt\" \"first\") (spit \"/tmp/jolt-io-overwrite.txt\" \"second\") (slurp \"/tmp/jolt-io-overwrite.txt\"))" :expected "\"second\""}
+  {:suite "io" :label "spit overwrites a file the runtime just created" :expr "(let [f (java.io.File/createTempFile \"jolt-spit\" \".txt\")] (spit f \"written\") (let [v (slurp f)] (.delete f) v))" :expected "\"written\""}
+  ;; The PATH-LIST separator is not the file separator. It is ":" here and ";" on
+  ;; Windows, where ":" is the drive suffix — babashka.fs/split-paths and
+  ;; fs/which read it, and answering ":" there cut every entry in half (#1074).
+  ;; The Windows rows are pinned in test/chez/win-platform-test.ss.
+  {:suite "io" :label "path.separator is the PATH-list separator" :expr "[(System/getProperty \"path.separator\") (System/getProperty \"file.separator\")]" :expected "[\":\" \"/\"]"}
+  {:suite "io" :expr "[java.io.File/pathSeparator java.io.File/pathSeparatorChar java.io.File/separator java.io.File/separatorChar]" :expected "[\":\" \\: \"/\" \\/]"}
+  {:suite "io" :expr "(get (System/getProperties) \"path.separator\")" :expected "\":\""}
+  {:suite "io" :label "split-paths reads the platform separator" :expr "(do (require (quote [babashka.fs :as fs])) (mapv str (fs/split-paths (str \"/a\" (System/getProperty \"path.separator\") \"/b\"))))" :expected "[\"/a\" \"/b\"]"}
+  ;; A Path's ROOT is the prefix that is not a segment. The shim had a POSIX-only
+  ;; one, so on Windows a drive path was a relative path whose first segment was
+  ;; "C:" — fs/absolute? false, getRoot nil, getParent off the drive letter
+  ;; (#1074). These rows are the POSIX half; win-platform-test.ss pins both.
+  {:suite "io" :label "a Path's root, parent and absoluteness" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (fs/path \"/a/b\")] [(fs/absolute? p) (str (.getRoot p)) (str (fs/parent p)) (.getNameCount p)]))" :expected "[true \"/\" \"/a\" 2]"}
+  {:suite "io" :label "the parent of a root is nil" :expr "(do (require (quote [babashka.fs :as fs])) [(fs/parent (fs/path \"/\")) (.getRoot (fs/path \"a/b\")) (fs/absolute? (fs/path \"a/b\"))])" :expected "[nil nil false]"}
+  ;; ".." cannot climb above a root, but survives above a relative path
+  {:suite "io" :label "normalize respects the root" :expr "(do (require (quote [babashka.fs :as fs])) (mapv (fn [x] (str (fs/normalize x))) [\"/a/../..\" \"/a/./b\" \"a/../../b\"]))" :expected "[\"/\" \"/a/b\" \"../b\"]"}
+  ;; java.io.tmpdir must name a directory that is actually there — it read only
+  ;; TMPDIR, which Windows does not set, and answered "/tmp" on any drive (#1074)
+  {:suite "io" :label "java.io.tmpdir names a real directory" :expr "(.isDirectory (java.io.File. (System/getProperty \"java.io.tmpdir\")))" :expected "true"}
+  {:suite "io" :label "createTempFile lands under java.io.tmpdir" :expr "(let [f (java.io.File/createTempFile \"jolt-tmpd\" \".txt\") v (.startsWith (.getPath f) (System/getProperty \"java.io.tmpdir\"))] (.delete f) v)" :expected "true"}
+  ;; File/listRoots enumerates the filesystem roots: one here, one per drive on
+  ;; Windows, where it used to answer "/" and enumerate nothing (#1074)
+  {:suite "io" :expr "(mapv str (java.io.File/listRoots))" :expected "[\"/\"]"}
   {:suite "io" :expr "(flush)" :expected ""}
   ;; .listFiles / file-seq keep the form of the path they were given, like the
   ;; JVM's new File(this, name) — a relative directory lists relative children.

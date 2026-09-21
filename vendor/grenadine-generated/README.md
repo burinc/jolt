@@ -21,7 +21,7 @@ The `grenadine-<version>-src.tar.gz` asset of the matching Grenadine release,
 which ships the generated sources alongside the committed ones. Verified
 against the release's `grenadine-checksums.txt`:
 
-    49c5f701e19d9a2a517581d0a4b222f2069209a9c2971d9f516b3dd15970c3e1  grenadine-0.1.13-src.tar.gz
+    835923cdffdc91d8073d79b6c88b7a1866e603d3fa4c7d0a59fdf400f927f9fc  grenadine-0.1.15-src.tar.gz
 
 The tarball's copies of the files Grenadine *does* commit are byte-identical to
 the git tag, checked file by file — which is what makes taking half the tree

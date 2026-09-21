@@ -1,6 +1,6 @@
 ;; fnform-test.ss — R1 (bead jolt-hqpn): unique anon-fn letrec names +
 ;; source-form registration. A user-ns anon literal must be registered under a
-;; deterministic jfn$<ns>$<def>$<n> name, that name must be what Chez's
+;; deterministic jfn$<ns>/<def>$<n> name, that name must be what Chez's
 ;; inspector reports for the live closure ((io 'code) 'name), and the registry
 ;; must carry {form, ns, free-names}. Covers a literal inside a map, a nested
 ;; literal, a variadic literal, a literal capturing a local ONLY through a
@@ -52,36 +52,36 @@
 (jolt-eval "(def p (partial + 1))" "app")
 
 ;; --- registry: one entry per literal, name -> {form, ns, free-names} ---
-(ok "config$0 registered with ns" (string=? (reg-ns "jfn$app$config$0") "app"))
-(ok "config$0 form is an fn* form" (string=? (reg-form-head "jfn$app$config$0") "fn*"))
-(ok "config$0 free-names empty" (equal? (reg-frees "jfn$app$config$0") '()))
+(ok "config$0 registered with ns" (string=? (reg-ns "jfn$app/config$0") "app"))
+(ok "config$0 form is an fn* form" (string=? (reg-form-head "jfn$app/config$0") "fn*"))
+(ok "config$0 free-names empty" (equal? (reg-frees "jfn$app/config$0") '()))
 (ok "config$1 (outer nested literal) registered"
-    (and (string=? (reg-ns "jfn$app$config$1") "app")
-         (equal? (reg-frees "jfn$app$config$1") '())))
+    (and (string=? (reg-ns "jfn$app/config$1") "app")
+         (equal? (reg-frees "jfn$app/config$1") '())))
 (ok "config$2 (inner literal) free-names = y"
-    (equal? (reg-frees "jfn$app$config$2") '("y")))
+    (equal? (reg-frees "jfn$app/config$2") '("y")))
 (ok "v2$0 (variadic) registered"
-    (and (string=? (reg-ns "jfn$app$v2$0") "app")
-         (equal? (reg-frees "jfn$app$v2$0") '())))
+    (and (string=? (reg-ns "jfn$app/v2$0") "app")
+         (equal? (reg-frees "jfn$app/v2$0") '())))
 (ok "captured$0 free-names = base (captured only through the nested literal)"
-    (equal? (reg-frees "jfn$app$captured$0") '("base")))
+    (equal? (reg-frees "jfn$app/captured$0") '("base")))
 (ok "captured$1 free-names = base"
-    (equal? (reg-frees "jfn$app$captured$1") '("base")))
+    (equal? (reg-frees "jfn$app/captured$1") '("base")))
 (ok "shadowed$0 free-names = y (shadow case)"
-    (equal? (reg-frees "jfn$app$shadowed$0") '("y")))
+    (equal? (reg-frees "jfn$app/shadowed$0") '("y")))
 
 ;; --- the live closure's inspector name equals the registered name ---
 (define cfg (var-deref "app" "config"))
 (define kh (keyword #f "handler"))
 (define kn (keyword #f "nested"))
-(ok "handler closure name" (string=? (closure-name (jolt-get cfg kh jolt-nil)) "jfn$app$config$0"))
-(ok "nested closure name" (string=? (closure-name (jolt-get cfg kn jolt-nil)) "jfn$app$config$1"))
-(ok "inner closure name" (string=? (closure-name ((jolt-get cfg kn jolt-nil) 3)) "jfn$app$config$2"))
+(ok "handler closure name" (string=? (closure-name (jolt-get cfg kh jolt-nil)) "jfn$app/config$0"))
+(ok "nested closure name" (string=? (closure-name (jolt-get cfg kn jolt-nil)) "jfn$app/config$1"))
+(ok "inner closure name" (string=? (closure-name ((jolt-get cfg kn jolt-nil) 3)) "jfn$app/config$2"))
 (define v2 (var-deref "app" "v2"))
 (define kf (keyword #f "f"))
-(ok "variadic closure name" (string=? (closure-name (jolt-get v2 kf jolt-nil)) "jfn$app$v2$0"))
-(ok "captured closure name" (string=? (closure-name (var-deref "app" "captured")) "jfn$app$captured$0"))
-(ok "shadowed closure name" (string=? (closure-name (var-deref "app" "shadowed")) "jfn$app$shadowed$0"))
+(ok "variadic closure name" (string=? (closure-name (jolt-get v2 kf jolt-nil)) "jfn$app/v2$0"))
+(ok "captured closure name" (string=? (closure-name (var-deref "app" "captured")) "jfn$app/captured$0"))
+(ok "shadowed closure name" (string=? (closure-name (var-deref "app" "shadowed")) "jfn$app/shadowed$0"))
 
 ;; --- the closures still work (the letrec wrapper changed nothing) ---
 (ok "handler calls" (eqv? ((jolt-get cfg kh jolt-nil) 5) 10))
@@ -136,19 +136,19 @@
 
 (let ((e (emit-src "app" "(def lazy1 {:f (fn [x] (* x 2))})")))
   (ok "a registration is emitted as source text"
-      (has? e "(image-register-fn-form! \"jfn$app$lazy1$0\" (image-fn-form-src \"(fn* [x] (* x 2))\") \"app\" (jolt-vector ))"))
+      (has? e "(image-register-fn-form! \"jfn$app/lazy1$0\" (image-fn-form-src \"(fn* [x] (* x 2))\") \"app\" (jolt-vector ))"))
   (ok "...and builds no quoted structure at load" (not (has? e "(jolt-symbol "))))
 (let ((e (emit-src "app" "(def lazy2 {:a (fn [x] x) :b (fn [y] y)})")))
   (ok "several literals register as sibling calls, no let* header"
-      (and (has? e "(begin (image-register-fn-form! \"jfn$app$lazy2$0\"")
-           (has? e " (image-register-fn-form! \"jfn$app$lazy2$1\"")
+      (and (has? e "(begin (image-register-fn-form! \"jfn$app/lazy2$0\"")
+           (has? e " (image-register-fn-form! \"jfn$app/lazy2$1\"")
            (not (has? e "(let* ((_q$")))))
 (jolt-eval "(def lazy1 {:f (fn [x] (* x 2))})" "app")
-(ok "before the first lookup the slot holds the bytes" (bytevector? (raw-form "jfn$app$lazy1$0")))
-(ok "the first lookup parses the form" (string=? (reg-form-head "jfn$app$lazy1$0") "fn*"))
-(ok "...and caches it in the slot" (not (bytevector? (raw-form "jfn$app$lazy1$0"))))
+(ok "before the first lookup the slot holds the bytes" (bytevector? (raw-form "jfn$app/lazy1$0")))
+(ok "the first lookup parses the form" (string=? (reg-form-head "jfn$app/lazy1$0") "fn*"))
+(ok "...and caches it in the slot" (not (bytevector? (raw-form "jfn$app/lazy1$0"))))
 (ok "the parsed form carries no reader position"
-    (let ((form (vector-ref (image-fn-form-lookup "jfn$app$lazy1$0") 0)))
+    (let ((form (vector-ref (image-fn-form-lookup "jfn$app/lazy1$0") 0)))
       (jolt-nil? (jolt-get (jolt-meta form) (keyword #f "line") jolt-nil))))
 
 ;; Round-trip fidelity: the text reads back to the SAME construction the
@@ -187,8 +187,8 @@
       (and (has? e "(let* ((_q$0") (has? e "(jolt-class-for "))))
 (jolt-eval "(def clsf {:f (cls-fn)})" "app")
 (ok "...and registers a form, not text"
-    (and (vector? (image-fn-form-lookup "jfn$app$clsf$0"))
-         (not (bytevector? (raw-form "jfn$app$clsf$0")))))
+    (and (vector? (image-fn-form-lookup "jfn$app/clsf$0"))
+         (not (bytevector? (raw-form "jfn$app/clsf$0")))))
 
 ;; The minted seed carries every core literal as text: no quoted construction
 ;; is left in it.
@@ -213,13 +213,13 @@
     (jolt-eval "(do (reset! dl-holder (fn [x] (+ x 1))) @dl-holder)" "app")))
 ((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
 (ok "do-spliced literal is named under direct-link"
-    (string-prefix? (or (closure-name dl-closure) "") "jfn$app$$"))
+    (string-prefix? (or (closure-name dl-closure) "") "jfn$app/$"))
 (ok "do-spliced literal is registered"
     (and (closure-name dl-closure) (image-fn-form-lookup (closure-name dl-closure)) #t))
 
 ;; --- non-def literals: the counter is per NAMESPACE, not per top-level form.
 ;; Per form, every deftype method body and every defmethod in a namespace was
-;; jfn$<ns>$$0 and the registrations overwrote each other -- an image restore
+;; jfn$<ns>/$0 and the registrations overwrote each other -- an image restore
 ;; of one such closure came back with the LAST form's source.
 (define anon-a (jolt-eval "(let [f (fn [x] (* x 2))] f)" "app2"))
 (define anon-b (jolt-eval "(let [f (fn [x] (* x 3))] f)" "app2"))
@@ -232,6 +232,87 @@
          (image-fn-form-lookup (closure-name anon-b))
          (string=? (reg-form-head (closure-name anon-a)) "fn*")
          #t))
+
+;; --- the label's separators cannot be forged by a name's own characters.
+;; The name is jfn$<ns>/<def>$<n>: munge-chars never emits a `/`, and the
+;; reader never lets one into a namespace or def name, so the `/` is
+;; unambiguous. A `$` is not: it also starts an escape ($$ for a literal `$`,
+;; $U..$ for a control char), so with `$` as the separator ns "a$" + def "c"
+;; and ns "a" + def "$c" were both jfn$a$$$c$0 and the second registration
+;; overwrote the first. Rows use the runtime eval path with the ns handed in
+;; directly, since that is how an unusual ns name reaches the emitter.
+(define (reg-form-text name)
+  (let ((e (image-fn-form-lookup name))) (and e (jolt-pr-str (vector-ref e 0)))))
+(define (closure-of ns nm) (var-deref ns nm))
+(jolt-eval "(def c (let [f (fn [x] (* x 10))] f))" "a$")
+(jolt-eval "(def $c (let [f (fn [x] (* x 20))] f))" "a")
+(ok "a `$` in a namespace name cannot forge the ns/def separator"
+    (let ((n1 (closure-name (closure-of "a$" "c")))
+          (n2 (closure-name (closure-of "a" "$c"))))
+      (and n1 n2 (not (string=? n1 n2)))))
+(ok "...and both registrations survive with their own source"
+    (and (has? (or (reg-form-text (closure-name (closure-of "a$" "c"))) "") "10")
+         (has? (or (reg-form-text (closure-name (closure-of "a" "$c"))) "") "20")))
+(jolt-eval "(def $c (let [f (fn [x] (* x 30))] f))" "x\x01;")
+(jolt-eval "(def c (let [f (fn [x] (* x 40))] f))" "x\x01;$")
+(ok "a control char + `$` in a namespace name cannot forge it either"
+    (let ((n1 (closure-name (closure-of "x\x01;" "$c")))
+          (n2 (closure-name (closure-of "x\x01;$" "c"))))
+      (and n1 n2 (not (string=? n1 n2))
+           (has? (or (reg-form-text n1) "") "30")
+           (has? (or (reg-form-text n2) "") "40"))))
+(ok "the label is munge-chars over the fqn, not a plain-text substitution"
+    (string=? (or (closure-name (closure-of "a$" "c")) "") "jfn$a$$/c$0"))
+
+;; --- a NAMED inner literal is keyed by its scope, not by its name alone.
+;; Bound under <name>$jf<n> with the counter per def, `mapi` in def a and
+;; `mapi` in def b (or in two namespaces) both registered as mapi$jf0, and
+;; an image restore of a's closure came back with b's source. The label is
+;; now jfn$<ns>/<def>$<n>/<name>: the anon label plus the name, so the
+;; registry key is unique and a backtrace still knows what the user called it.
+(jolt-eval "(def a (let [mapi (fn mapi [x] (* x 2))] mapi))" "app")
+(jolt-eval "(def b (let [mapi (fn mapi [x] (* x 3))] mapi))" "app")
+(jolt-eval "(def a (let [mapi (fn mapi [x] (* x 4))] mapi))" "app.other")
+(ok "same-named inner fns in two defs have distinct names"
+    (let ((n1 (closure-name (closure-of "app" "a")))
+          (n2 (closure-name (closure-of "app" "b"))))
+      (and n1 n2 (not (string=? n1 n2)))))
+(ok "...and in two namespaces"
+    (let ((n1 (closure-name (closure-of "app" "a")))
+          (n3 (closure-name (closure-of "app.other" "a"))))
+      (and n1 n3 (not (string=? n1 n3)))))
+(ok "each keeps its own registration"
+    (and (has? (or (reg-form-text (closure-name (closure-of "app" "a"))) "") "(* x 2)")
+         (has? (or (reg-form-text (closure-name (closure-of "app" "b"))) "") "(* x 3)")
+         (has? (or (reg-form-text (closure-name (closure-of "app.other" "a"))) "") "(* x 4)")))
+(ok "a named inner literal's label is the anon label plus its name"
+    (string=? (or (closure-name (closure-of "app" "a")) "") "jfn$app/a$0/mapi"))
+;; The runtime eval path used to bind a named inner literal under <ns>/<name>
+;; and register nothing, so the closure dumped from a build but refused from
+;; a `jolt run` session. Registration is the same on both paths now.
+(ok "a named inner literal is registered on the runtime eval path"
+    (string=? (or (reg-form-head "jfn$app/a$0/mapi") "") "fn*"))
+(let ((e (emit-src "app" "(def a (let [mapi (fn mapi [x] (* x 2))] mapi))")))
+  (ok "...and the emitted text registers it under the same label"
+      (has? e "(image-register-fn-form! \"jfn$app/a$0/mapi\"")))
+;; A def's DIRECT named init is the var's root: it is not a literal to
+;; register, and its frame keeps the <ns>/<name> the source registry keys on.
+(jolt-eval "(defn direct [x] (inc x))" "app")
+(ok "a def's direct named init still binds under ns/name"
+    (string=? (or (closure-name (closure-of "app" "direct")) "") "app/direct"))
+(ok "...and is not registered as a literal" (not (image-fn-form-lookup "app/direct")))
+;; A backtrace shows the named literal as <ns>/<def>/<name>, the way
+;; clojure.stacktrace demunges user$f$mapi__12; the counter is a compiler
+;; artifact. An anonymous literal's label is shown as is.
+(ok "display: named literal" (string=? (srcreg-display-name "jfn$app/a$0/mapi") "app/a/mapi"))
+(ok "display: named literal outside a def" (string=? (srcreg-display-name "jfn$app/$0/f") "app/f"))
+(ok "display: anon literal is shown as is" (string=? (srcreg-display-name "jfn$app/a$0") "jfn$app/a$0"))
+(ok "display: a user name is left alone" (string=? (srcreg-display-name "jfn") "jfn"))
+;; the inline splicer alpha-renames a named literal inside a spliced callee
+;; (step-boom -> step-boom__il22); that artifact is stripped from the label too
+(ok "display: splicer rename stripped from the name part"
+    (string=? (srcreg-display-name "jfn$app.core/-main$0/step-boom__il22") "app.core/-main/step-boom"))
+(ok "display: splicer rename stripped from a bare frame" (string=? (srcreg-display-name "step-boom__il7") "step-boom"))
 
 (printf "\nfnform gate: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))

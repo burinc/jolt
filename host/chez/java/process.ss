@@ -963,32 +963,104 @@
 ;; IOException("…No such file or directory") when it can't be found; our shell
 ;; would otherwise fail at exec (127) with a different message. Mirror it:
 ;;   - absolute program: the file must exist
-;;   - slash-bearing relative program: resolves against the child cwd, like exec
+;;   - separator-bearing relative program: resolves against the child cwd, like exec
 ;;   - bare name: an entry of that name must be on PATH
-(define (proc-path-join a b)
-  (if (or (= (string-length a) 0) (char=? (string-ref a (- (string-length a) 1)) #\/))
-      (string-append a b)
-      (string-append a "/" b)))
-(define (proc-has-slash? s)
-  (let loop ((i 0)) (cond ((= i (string-length s)) #f)
-                          ((char=? (string-ref s i) #\/) #t)
-                          (else (loop (+ i 1))))))
-(define (proc-on-path? prog)
-  (let ((path (getenv "PATH")))
-    (and path
-         (let loop ((dirs (str-literal-split path ":")))
-           (cond ((null? dirs) #f)
-                 ((and (> (string-length (car dirs)) 0)
-                       (file-exists? (proc-path-join (car dirs) prog))) #t)
-                 (else (loop (cdr dirs))))))))
+;;
+;; Windows spells all three differently, and this used to know none of it
+;; (jolt-lang/jolt#1074). PATH is ";"-separated there, so splitting on ":" turned
+;; "C:\Windows\System32" into "C" and "\Windows\System32" and nothing on PATH
+;; was ever found; a drive-absolute "C:/Windows/System32/curl.exe" was read as
+;; relative and joined onto the child cwd; and a bare name resolves through
+;; PATHEXT, so "curl" IS curl.exe. Only a "/"-rooted program (rooted on the
+;; current drive) and a slash-bearing relative one worked, which is why
+;; babashka.process threw "Cannot resolve program: curl" before a spawn was even
+;; attempted.
+;;
+;; Every decision below takes the platform (and PATH / PATHEXT / the existence
+;; test) as a parameter, so the Windows rows are pinned from the Linux runner —
+;; the arrangement sa-os-family-for-tag and jfile-fold-dots-for already use
+;; (test/chez/win-platform-test.ss).
+
+;; A PATH entry is whatever spelling the environment holds — "C:\Windows\System32"
+;; natively — and the joined program path is what the OS is asked for and what
+;; an unresolvable-program message names, so it keeps that spelling
+;; (java/io.ss path-join-sep, shared with the java.nio.file Path shim).
+(define (proc-path-join-for windows? a b)
+  (let ((n (string-length a)))
+    (cond ((= n 0) b)
+          ((path-sep-for? windows? (string-ref a (- n 1))) (string-append a b))
+          (else (string-append a (path-join-sep windows? a) b)))))
+
+;; A backslash is a separator only on Windows; on POSIX it is an ordinary
+;; character in a filename, so "a\b" there is a bare name to look up on PATH.
+(define (proc-has-separator-for? windows? s)
+  (let loop ((i 0))
+    (cond ((= i (string-length s)) #f)
+          ((char=? (string-ref s i) #\/) #t)
+          ((and windows? (char=? (string-ref s i) #\\)) #t)
+          (else (loop (+ i 1))))))
+
+;; cmd quotes a PATH entry that holds a space ("C:\Program Files\x";C:\y); the
+;; quotes are the shell's, not part of the directory name.
+(define (proc-unquote s)
+  (let ((n (string-length s)))
+    (if (and (>= n 2) (char=? (string-ref s 0) #\") (char=? (string-ref s (- n 1)) #\"))
+        (substring s 1 (- n 1))
+        s)))
+(define (proc-path-entries-for windows? path)
+  (map proc-unquote (str-literal-split (or path "") (path-list-separator-for windows?))))
+
+;; CreateProcess appends an extension from PATHEXT when the program name has
+;; none, which is the whole reason a bare "curl" finds curl.exe. The bare name is
+;; tried first, so a program that already carries its extension still resolves as
+;; itself. cmd's own default list stands in when the variable is unset.
+(define proc-default-pathext ".COM;.EXE;.BAT;.CMD")
+(define (proc-name-candidates-for windows? pathext prog)
+  (if (not windows?)
+      (list prog)
+      (cons prog
+            (let loop ((exts (str-literal-split
+                              (if (and pathext (> (string-length pathext) 0))
+                                  pathext proc-default-pathext)
+                              ";"))
+                       (acc '()))
+              (cond ((null? exts) (reverse acc))
+                    ((= (string-length (car exts)) 0) (loop (cdr exts) acc))
+                    (else (loop (cdr exts) (cons (string-append prog (car exts)) acc))))))))
+(define (proc-candidate-exists? windows? pathext exists? p)
+  (let loop ((cs (proc-name-candidates-for windows? pathext p)))
+    (cond ((null? cs) #f)
+          ((exists? (car cs)) #t)
+          (else (loop (cdr cs))))))
+
+(define (proc-on-path-for? windows? pathext path prog exists?)
+  (let loop ((dirs (proc-path-entries-for windows? path)))
+    (cond ((null? dirs) #f)
+          ((and (> (string-length (car dirs)) 0)
+                (proc-candidate-exists? windows? pathext exists?
+                                        (proc-path-join-for windows? (car dirs) prog)))
+           #t)
+          (else (loop (cdr dirs))))))
+
+(define (proc-program-resolvable-for? windows? pathext path base prog exists?)
+  (cond
+    ((= (string-length prog) 0) #f)
+    ;; Named as spelled, never joined to a base: POSIX "/x", Windows "C:\x",
+    ;; "C:/x" and "\\srv\sh\x" — and Windows "\x", which is rooted on the
+    ;; process's current drive and so is the OS's to resolve, not ours.
+    ((or (jfile-path-absolute-for? windows? prog)
+         (windows-root-relative-for? windows? prog))
+     (proc-candidate-exists? windows? pathext exists? prog))
+    ((proc-has-separator-for? windows? prog)
+     (proc-candidate-exists? windows? pathext exists?
+                             (proc-path-join-for windows? base prog)))
+    (else (proc-on-path-for? windows? pathext path prog exists?))))
+
 (define (proc-program-resolvable? prog effective-dir)
   (let ((prog (if (string? prog) prog (jolt-str-render-one prog))))
-    (cond
-      ((= (string-length prog) 0) #f)
-      ((char=? (string-ref prog 0) #\/) (file-exists? prog))
-      ((proc-has-slash? prog)
-       (file-exists? (proc-path-join (or effective-dir (getenv "JOLT_PWD") ".") prog)))
-      (else (proc-on-path? prog)))))
+    (proc-program-resolvable-for?
+     (eq? (sa-os-family) 'windows) (getenv "PATHEXT") (getenv "PATH")
+     (or effective-dir (getenv "JOLT_PWD") ".") prog file-exists?)))
 
 (define (proc-pb-start self)
   (let* ((st (jhost-state self))

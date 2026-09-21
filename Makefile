@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath winplatform statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
@@ -975,7 +975,7 @@ directlink:
 	@$(CHEZ) --script test/chez/directlink-test.ss
 
 # Unique anon-fn letrec names + source-form registration (R1): a user-ns anon
-# literal registers jfn$<ns>$<def>$<n> -> {form, ns, free-names} and the live
+# literal registers jfn$<ns>/<def>$<n> -> {form, ns, free-names} and the live
 # closure's inspector name must agree; system-ns closures stay unregistered.
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss
@@ -1204,6 +1204,22 @@ regexreplace:
 winpath:
 	@$(CHEZ) --script test/chez/win-path-test.ss
 
+# The rest of the Windows answers a Linux runner cannot observe (#1074): the
+# PATH-LIST separator (";" there, because ":" is the drive suffix, so a ":"-split
+# cut every entry in half and fs/which never found anything), the ProcessBuilder
+# program resolver (";"-split PATH, drive-rooted and UNC programs, PATHEXT), the
+# java.nio.file Path root (a drive path read as relative, so fs/absolute? was
+# false and getParent walked off the drive letter), java.io.tmpdir (TMPDIR only,
+# which Windows does not set), File/listRoots, and the replace-rename that spit
+# and the AOT publish steps depend on — Windows refuses a rename onto an
+# existing destination, so the second spit to any path threw. Same arrangement
+# as winpath and hostprops: the platform is a parameter, so the rows that broke
+# are pinned from the host CI runs on. The end-to-end half, which needs a real
+# Windows filesystem, PATH and process table, is the windows-deps job in
+# .github/workflows/tests.yml.
+winplatform:
+	@$(CHEZ) --script test/chez/win-platform-test.ss
+
 # The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
 # enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file
 # rather than one per top-level form — so a large enough app built a binary that
@@ -1287,13 +1303,32 @@ hooks:
 	@for h in tools/git-hooks/*; do cp "$$h" ".git/hooks/$$(basename "$$h")"; chmod +x ".git/hooks/$$(basename "$$h")"; echo "installed .git/hooks/$$(basename "$$h")"; done
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
-# The oracle version is READ from the committed profile, which certify.clj also
-# checks the running Clojure against — so the pin has one source, and bumping the
-# oracle is a profile edit rather than two edits that can drift apart.
+# The oracle's Clojure version AND JDK are READ from the committed profile, which
+# certify.clj also checks the running oracle against — so each pin has one source,
+# and bumping the oracle is a profile edit rather than two edits that can drift
+# apart. The clojure launcher runs JAVA_CMD first, else whatever java is first on
+# PATH — on a machine with several JDKs that is rarely the pinned one, and a
+# mismatched JDK reports its own java.* changes as jolt divergences. With
+# JAVA_CMD unset, look for the pinned JDK in the usual places (Homebrew, the
+# Linux jvm directory, macOS java_home) and hand it to the launcher; certify.clj
+# still refuses whatever JDK actually runs if it is not the pinned one.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
 		v=$$(sed -n 's/^ :clojure-version "\([^"]*\)".*/\1/p' test/conformance/profile.edn); \
 		if [ -z "$$v" ]; then echo "certify: no :clojure-version in test/conformance/profile.edn"; exit 1; fi; \
+		jdk=$$(sed -n 's/^ :oracle-jdk \([0-9]*\).*/\1/p' test/conformance/profile.edn); \
+		if [ -z "$$jdk" ]; then echo "certify: no :oracle-jdk in test/conformance/profile.edn"; exit 1; fi; \
+		if [ -z "$$JAVA_CMD" ]; then \
+			for c in /opt/homebrew/opt/openjdk@$$jdk/bin/java /usr/local/opt/openjdk@$$jdk/bin/java \
+			         /usr/lib/jvm/java-$$jdk-openjdk*/bin/java /usr/lib/jvm/temurin-$$jdk-jdk*/bin/java \
+			         /usr/lib/jvm/java-$$jdk-*/bin/java; do \
+				if [ -x "$$c" ]; then JAVA_CMD="$$c"; break; fi; \
+			done; \
+			if [ -z "$$JAVA_CMD" ] && [ -x /usr/libexec/java_home ]; then \
+				h=$$(/usr/libexec/java_home -v "$$jdk" 2>/dev/null) && [ -x "$$h/bin/java" ] && JAVA_CMD="$$h/bin/java"; \
+			fi; \
+			if [ -n "$$JAVA_CMD" ]; then echo "certify: JAVA_CMD=$$JAVA_CMD (profile pins JDK $$jdk)"; export JAVA_CMD; fi; \
+		fi; \
 		deps="{:deps {org.clojure/clojure {:mvn/version \"$$v\"}}}"; \
 		clojure -Sdeps "$$deps" -M test/conformance/certify.clj --self-test && \
 		clojure -Sdeps "$$deps" -M test/conformance/certify.clj; \

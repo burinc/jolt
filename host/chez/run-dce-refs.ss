@@ -188,7 +188,7 @@
 (let ((bare '(def-var! "app.core" "f" 1))
       (meta '(def-var-with-meta! "clojure.repl" "find-doc" (lambda (x) x) (jolt-hash-map)))
       (registered '(begin (let* ((_q$0 (jolt-symbol #f "fn*")))
-                            (image-register-fn-form! "jfn$clojure.repl$find-doc$0" _q$0 "clojure.repl" (jolt-vector)))
+                            (image-register-fn-form! "jfn$clojure.repl/find-doc$0" _q$0 "clojure.repl" (jolt-vector)))
                           (def-var-with-meta! "clojure.repl" "find-doc" (lambda (x) x) (jolt-hash-map))))
       (record-group '(begin (begin (def-var-plain! "clojure.pprint" "nl-t" 1)
                                    (def-var-plain! "clojure.pprint" "->nl-t" 2))
@@ -208,16 +208,16 @@
 ;; Registrations are emitted as sibling calls ahead of the def -- one per
 ;; literal, no let* header -- in both the var-routed and the linked mint; a
 ;; literal with no source rendering keeps the let* construction next to them.
-(let ((flat '(begin (image-register-fn-form! "jfn$app$f$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
-                    (image-register-fn-form! "jfn$app$f$1" (image-fn-form-src "(fn* [y] y)") "app" (jolt-vector))
+(let ((flat '(begin (image-register-fn-form! "jfn$app/f$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
+                    (image-register-fn-form! "jfn$app/f$1" (image-fn-form-src "(fn* [y] y)") "app" (jolt-vector))
                     (def-var-with-meta! "app" "f" (lambda (x) x) (jolt-hash-map))))
-      (linked '(begin (image-register-fn-form! "jfn$app$g$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
+      (linked '(begin (image-register-fn-form! "jfn$app/g$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
                       (define jv$app/g (lambda (x) x))
                       (def-var-linked! "app" "g" (quote jv$app/g) jv$app/g (lambda (v) (set! jv$app/g v)) (jolt-hash-map))
                       (jolt-register-variadic! 1 jv$app/g)))
-      (mixed '(begin (image-register-fn-form! "jfn$app$h$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
+      (mixed '(begin (image-register-fn-form! "jfn$app/h$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
                      (let* ((_q$0 (jolt-symbol #f "fn*")))
-                       (image-register-fn-form! "jfn$app$h$1" _q$0 "app" (jolt-vector)))
+                       (image-register-fn-form! "jfn$app/h$1" _q$0 "app" (jolt-vector)))
                      (def-var-with-meta! "app" "h" (lambda (x) x) (jolt-hash-map)))))
   (gate-check "def-var-form: sibling registrations then def is the def"
               (dce-def-var-form flat) (list-ref flat 3))
