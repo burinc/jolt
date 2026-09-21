@@ -6,6 +6,9 @@
 # app resolves from deps.edn; bb.edn's paths join in for task runs), and
 # `depsonly` pins jolt's own deps.edn :tasks forms.
 #
+# `cliproj` is the CLI-task fixture: tasks that name an :exec-fn or a :cmd tree
+# and so parse their arguments with babashka.cli.
+#
 # Asserts the babashka task semantics jolt supports — code bodies, :doc,
 # :depends (deduped, dependency-first, cycles refused), :init, :requires (global
 # and per-task), :enter/:leave, :private, :extra-paths/:extra-deps,
@@ -24,6 +27,7 @@ BB="$root/test/chez/tasks/bbproj"
 BOTH="$root/test/chez/tasks/both"
 DEPS="$root/test/chez/tasks/depsonly"
 NAT="$root/test/chez/tasks/native"
+CLI="$root/test/chez/tasks/cliproj"
 pass=0; fail=0
 export JOLT_NO_USER_DEPS=1
 # babashka.tasks/jolt (and `clojure`, its babashka name) re-invokes the jolt
@@ -319,6 +323,104 @@ check "run --parallel runs a shared dependency once" "1" \
 # future's deref wraps the throw, and reading only the top ex-data lost it
 check "failed :depends exits with its code"            "7" "$(status "$BB" pfail)"
 check "failed :depends exits with its code (parallel)" "7" "$(status "$BB" run --parallel pfail)"
+
+# --- CLI tasks (:exec-fn / :cmd) ---------------------------------------------
+#
+# A task that names a handler or a command tree parses its arguments with
+# babashka.cli before anything runs. Fixture: test/chez/tasks/cliproj, whose
+# handlers print the map they were called with, so what is asserted here is the
+# map the runner built rather than a side effect further down.
+
+check "an :exec-fn task is called with the parsed options" \
+  'greet {:loud true, :name "ada"}' "$(inbb "$CLI" greet --name ada --loud)"
+check "...with the spec's defaults filled in" 'greet {:name "world"}' \
+  "$(inbb "$CLI" greet)"
+check "...and a bad value is refused" "1" "$(status "$CLI" serve --port nope)"
+
+# :exec-args on the task wins over the one under :cli, as an exec call's does
+check ":exec-args defaults, the task's own winning" 'greet {:loud true, :name "ada"}' \
+  "$(inbb "$CLI" tone)"
+check "...and the command line still wins over both" 'greet {:loud true, :name "eve"}' \
+  "$(inbb "$CLI" tone --name eve)"
+
+# the spec may live on the handler var instead of in bb.edn, which is where
+# `bb -x` reads it from too
+check "a spec on the handler var is used" "serve {:port 8080}" "$(inbb "$CLI" serve)"
+check "...and parses against it" "serve {:port 9090}" "$(inbb "$CLI" serve --port 9090)"
+
+# :cli may name a def, for options edn cannot express
+check ":cli naming a def is resolved" 'greet {:name "grace"}' \
+  "$(inbb "$CLI" bysym --name grace)"
+
+# --help comes for free, and prints the task's own name
+out="$(inbb "$CLI" greet --help)"
+case "$out" in *"Usage: jolt greet"*) r=yes ;; *) r="no: $out" ;; esac
+check "--help prints usage for the task" "yes" "$r"
+case "$out" in *"who to greet"*) r=yes ;; *) r="no: $out" ;; esac
+check "...including each option's :desc" "yes" "$r"
+check "...and exits 0" "0" "$(status "$CLI" greet --help)"
+check "-h is the same" "0" "$(status "$CLI" greet -h)"
+
+# The reason the :depends walk moved inside the parser: asking what a task
+# accepts must not run the task's dependencies.
+check "--help does not run :depends" "" \
+  "$(inbb "$CLI" helped --help | grep '^prep ran$')"
+check "...which do run when the task does" "prep ran" \
+  "$(inbb "$CLI" helped --name ada | grep '^prep ran$')"
+
+# a :cmd tree
+check "a :cmd command dispatches" "migrate {:steps 3}" "$(inbb "$CLI" db migrate --steps 3)"
+check "...and a sibling command is its own" "seed {}" "$(inbb "$CLI" db seed)"
+check "naming no command is an error" "1" "$(status "$CLI" db)"
+case "$(inbb "$CLI" db)" in *migrate*seed*) r=yes ;; *) r="no" ;; esac
+check "...listing the commands there are" "yes" "$r"
+check "a task with a tree AND a body runs the body as its root" "dbx default" \
+  "$(inbb "$CLI" dbx)"
+check "...and the tree when a command is named" "sub {:x 1}" "$(inbb "$CLI" dbx go --x 1)"
+
+# A CLI task named in :depends does not parse: its handler is called with what
+# the target's parse produced, narrowed by its own :restrict.
+check "a CLI :depends handler runs before the target" "setup {:verbose true}" \
+  "$(inbb "$CLI" app --port 9000 --verbose | grep '^setup')"
+check "...and :restrict narrows what it is handed" "setup {:verbose true}" \
+  "$(inbb "$CLI" app --port 9000 --verbose | grep '^setup')"
+check "...while the target's handler gets the whole map" \
+  "serve {:port 9000, :verbose true}" \
+  "$(inbb "$CLI" app --port 9000 --verbose | grep '^serve')"
+# the dependency's spec merges into the target's, so the option parses at all
+check "a dependency's option is accepted by the target" "0" \
+  "$(status "$CLI" app --verbose)"
+case "$(inbb "$CLI" app --help)" in *--verbose*) r=yes ;; *) r="no" ;; esac
+check "...and shows up in the target's help" "yes" "$r"
+
+# a :cmd task is a tree, not one thing to run
+check ":depends naming a :cmd task is refused" "1" "$(status "$CLI" baddep)"
+inbb "$CLI" baddep 2>&1 | grep -q "no single handler" \
+  && check "...saying why" "yes" "yes" \
+  || check "...saying why" "yes" "no"
+
+# runner-level parser options, the :tasks-map :cli entry — like :init and
+# :requires, it reaches every CLI task in the map
+check "a runner-level :cli spec reaches a task" 'greet {:name "ada", :trace true}' \
+  "$(inbb "$CLI" greet --trace --name ada)"
+case "$(inbb "$CLI" greet --help)" in *"trace the run"*) r=yes ;; *) r="no" ;; esac
+check "...and shows up in its help" "yes" "$r"
+
+# a :cmd may name a def, so a large tree lives in code rather than in edn
+check "a :cmd naming a def is resolved" "tree-by-sym {}" "$(inbb "$CLI" dbsym up)"
+
+# a handler that throws fails the task, like a body that throws
+check "a throwing handler fails the task" "1" "$(status "$CLI" boom)"
+inbb "$CLI" boom 2>&1 | grep -q "handler said no" \
+  && check "...with its own message" "yes" "yes" \
+  || check "...with its own message" "yes" "no"
+
+# babashka.tasks/run reaching a CLI task: it is a target of its own, so it parses
+check "run from a body parses" 'greet {:name "eve"}' "$(inbb "$CLI" viarun --name eve)"
+
+# the listing treats a CLI task like any other
+case "$(inbb "$CLI" tasks)" in *"greet   greet someone"*) r=yes ;; *) r="no" ;; esac
+check "a CLI task is listed with its :doc" "yes" "$r"
 
 echo "tasks-smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
