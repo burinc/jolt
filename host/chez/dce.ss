@@ -344,9 +344,9 @@
 ;; under one of their names is unsound.
 ;; A direct-linked seed def (bootstrap.ss) is minted as
 ;;   (begin [(image-register-fn-form! ...)... | (let* <quote pool> (image-register-fn-form! ...)...)]
-;;          (define jv$ns$name <init>)
-;;          (def-var-linked! "ns" "name" 'jv$ns$name jv$ns$name (lambda (v) (set! jv$ns$name v)) meta)
-;;          [(jolt-register-variadic! n jv$ns$name)])
+;;          (define jv$ns/name <init>)
+;;          (def-var-linked! "ns" "name" 'jv$ns/name jv$ns/name (lambda (v) (set! jv$ns/name v)) meta)
+;;          [(jolt-register-variadic! n jv$ns/name)])
 ;; — the same single-fqn def, so it prunes under that name too. The walk below
 ;; admits exactly these siblings, in this order; any other begin stays a keep form.
 (define (dce-def-var-form b)

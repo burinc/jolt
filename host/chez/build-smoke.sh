@@ -100,13 +100,13 @@ done
 # The cross-ns app.core -> app.util/shout reference is direct-linked in the plain
 # release build, not var-routed.
 #
-# Asserted on the BINDING, not on a (jv$app.util$shout ...) call form. Release
+# Asserted on the BINDING, not on a (jv$app.util/shout ...) call form. Release
 # inlines now (jolt-mbcm.6), and shout is small enough to be spliced into its
 # caller, so there is no call left to find -- the old assertion failed on a build
 # that had done MORE than it asked for. The binding is emitted for every
 # direct-linked def whether or not any particular call to it survives, and it is
 # absent entirely under --no-direct-link, so it still discriminates.
-if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
+if ! grep -q 'define jv\$app.util/shout' "$out.build/flat.ss"; then
   echo "  FAIL: release build did not direct-link the app->app call"; exit 1
 fi
 # ...and nothing reads it through its var, which is the thing direct-linking is
@@ -218,7 +218,7 @@ check_fnid() {  # check_fnid <binary> <label>
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
   echo "  FAIL: jolt build --no-direct-link exited non-zero"; exit 1
 fi
-if grep -q 'define jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
+if grep -q 'define jv\$app.util/shout' "$out.nodl.build/flat.ss"; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
 fi
 check_fnid "$out.nodl" "the --no-direct-link build"
@@ -667,7 +667,7 @@ if [ "$got_dl" != "$want" ]; then
   echo "--- got ----"; echo "$got_dl"
   exit 1
 fi
-if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
+if ! grep -q 'define jv\$app.util/shout' "$out.build/flat.ss"; then
   echo "  FAIL: --direct-link did not emit a direct app->app call"; exit 1
 fi
 # A direct-link build registers fn sources, so an uncaught throw prints a Clojure

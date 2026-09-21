@@ -45,24 +45,24 @@
 (direct-link-reset!)
 (set-direct-link! #t)
 (let ((e (emit-form "app" "(def a (fn* ([] 1)))")))
-  (ok "U1 direct-link on: def emits a jv$ binding" (contains? e "(define jv$app$a ")))
+  (ok "U1 direct-link on: def emits a jv$ binding" (contains? e "(define jv$app/a ")))
 
 ;; --- U2: fresh unit, direct-link defaults OFF -> no jv$ (isolation) ----------
 (set-emit-unit! U2)
 (let ((e (emit-form "app" "(def a (fn* ([] 1)))")))
   (ok "U2 fresh unit: direct-link defaults off (no jv$ binding)"
-      (not (contains? e "(define jv$app$a "))))
+      (not (contains? e "(define jv$app/a "))))
 
 ;; --- back to U1: its direct-link state is intact (reentrancy) ----------------
 (set-emit-unit! U1)
 (let ((e (emit-form "app" "(def a (fn* ([] 1)))")))
   (ok "U1 again: per-unit direct-link state preserved (jv$ binding back)"
-      (contains? e "(define jv$app$a ")))
+      (contains? e "(define jv$app/a ")))
 
 ;; --- turning U1 off does not affect a value we already captured on U2 --------
 (set-direct-link! #f)
 (let ((e1 (emit-form "app" "(def a (fn* ([] 1)))")))
-  (ok "U1 direct-link off again: no jv$ binding" (not (contains? e1 "(define jv$app$a "))))
+  (ok "U1 direct-link off again: no jv$ binding" (not (contains? e1 "(define jv$app/a "))))
 
 ;; --- gensym labels are per-unit: two fresh units start their counter at 0, so
 ;; the SAME form emits byte-identical output (a global counter would diverge) ----

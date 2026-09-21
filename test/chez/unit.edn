@@ -2320,6 +2320,52 @@
   {:suite "munge-injective"
    :expr "(do (defmacro ||| [x y] `(or ~x ~y)) (||| nil 7))"
    :expected "7"}
+  ;; The reserved/emitted-name prefix is part of the same injectivity claim. It
+  ;; was a bare `_`, which a user can write: `if` and `_if` both emitted `_if`,
+  ;; so (let [if 1 _if 2] if) answered 2. The prefix is now the $R escape, which
+  ;; no unprefixed munge can start with (an unprefixed $ is always $$/$P/$H/$V/$U).
+  {:suite "munge-injective" :expr "(let [if 1 _if 2] if)" :expected "1"}
+  {:suite "munge-injective" :expr "(let [if 1 _if 2] _if)" :expected "2"}
+  {:suite "munge-injective" :expr "(let [lambda 1 _lambda 2] lambda)" :expected "1"}
+  {:suite "munge-injective" :expr "(let [keyword 1] ((fn [_keyword] keyword) 2))" :expected "1"}
+  {:suite "munge-injective" :expr "(let [if 1] ((fn [_if] if) 2))" :expected "1"}
+  ;; A Clojure symbol both Scheme readers take for a NUMBER: +i/-i, +inf.0 and
+  ;; friends, and a dot-leading or sign-dot-leading decimal. The reference reader
+  ;; yields symbols for all of these; emitted bare they were "invalid bound
+  ;; variable 0+1i" at compile time. Such a name takes the $R prefix too.
+  {:suite "munge-injective"
+   :expr "(let [+i 1 -i 2 .5 3 -.5 4 +.5e1 5 +inf.0 6 -inf.0 7 +nan.0 8 -NaN.0 9] [+i -i .5 -.5 +.5e1 +inf.0 -inf.0 +nan.0 -NaN.0])"
+   :expected "[1 2 3 4 5 6 7 8 9]"}
+  {:suite "munge-injective" :expr "((fn +i [] 1))" :expected "1"}
+  {:suite "munge-injective" :expr "(letfn [(-i [] 2)] (-i))" :expected "2"}
+  ;; near-misses stay bare identifiers on both hosts (a spare prefix would be
+  ;; harmless, but these pin that the common -name/+name shapes are untouched)
+  {:suite "munge-injective" :expr "(let [-invoke 1 +inc 2 -i0 3 .x 4 .. 5] [-invoke +inc -i0 .x ..])" :expected "[1 2 3 4 5]"}
+  ;; A symbol built with (symbol s) can hold any character at all. Every
+  ;; character that is not an identifier constituent on BOTH hosts (whitespace,
+  ;; controls, the reader delimiters " ( ) [ ] { } ; , ` \ and the non-ASCII
+  ;; White_Space chars Chez delimits on) escapes as $U<hex>$, so the emitted
+  ;; Scheme still reads as one identifier — and distinct names stay distinct: a
+  ;; backslash used to be swallowed by the reader, making a\b the same local as ab.
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a b\") 1] (symbol \"a b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a;b\") 1] (symbol \"a;b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a(b\") 1] (symbol \"a(b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a)b\") 1] (symbol \"a)b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\\"b\") 1] (symbol \"a\\\"b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a{b\") 1] (symbol \"a{b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a[b]\") 1] (symbol \"a[b]\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a,b\") 1] (symbol \"a,b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a`b\") 1] (symbol \"a`b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\tb\") 1] (symbol \"a\\tb\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\u00a0b\") 1] (symbol \"a\\u00a0b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\u2028b\") 1] (symbol \"a\\u2028b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\\\b\") 1 'ab 2] (symbol \"a\\\\b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a\\\\b\") 1 'ab 2] 'ab))" :expected "2"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a b\") 1 (symbol \"a\\u00a0b\") 2] (symbol \"a b\")))" :expected "1"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"a b\") 1 (symbol \"a\\u00a0b\") 2] (symbol \"a\\u00a0b\")))" :expected "2"}
+  {:suite "munge-injective" :expr "(eval (list 'let [(symbol \"\") 1] (symbol \"\")))" :expected "1"}
+  ;; the same escapes at a fn's own name and its params, not just a let
+  {:suite "munge-injective" :expr "(eval (list (list 'fn (symbol \"f g\") [(symbol \"x y\")] (symbol \"x y\")) 3))" :expected "3"}
   ;; # reaches munge only as the reader's auto-gensym suffix on #() params
   ;; (p__1#) — a user can't write a #-named local (# is a dispatch char) — so the
   ;; # -> $H case is backend-only. Smoke-test that a #() still munges its gensym
