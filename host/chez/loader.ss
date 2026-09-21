@@ -1126,13 +1126,13 @@
               (put-string out captured)
               (put-string out (format "\n(aot-mark-complete! ~s)\n" name))
               (close-output-port out))
-            (rename-file tmp-scm scm)
+            (rename-replace! tmp-scm scm)
             ;; compile-file prints "compiling X with output to Y" per file to
             ;; current-output-port by default — swallow it so a cache miss can't
             ;; corrupt the running program's stdout.
             (parameterize ((current-output-port (open-output-string)))
               (sa-compile-file scm tmp-so #f))
-            (rename-file tmp-so so))
+            (rename-replace! tmp-so so))
           (unless (file-exists? so)
             (aot-info (string-append "no .so produced for " name))))))))
 ;; Evaluate a namespace's top-level forms from COMPILED code — an embedded fasl,
@@ -1465,14 +1465,14 @@
     (guard (e (else (delete-file tmp-scm #f) (delete-file tmp-so #f) (raise e)))
       (let ((out (open-output-file tmp-scm 'replace)))
         (put-string out captured) (close-output-port out))
-      (rename-file tmp-scm (cpath-scm-file base))
+      (rename-replace! tmp-scm (cpath-scm-file base))
       ;; compile-file narrates to current-output-port by default — swallow it so a
       ;; compile can't corrupt the running program's stdout.
       (parameterize ((current-output-port (open-output-string)))
         (sa-compile-file (cpath-scm-file base) tmp-so #f))
       (delete-file (cpath-so-file base) #f)
       (cpath-write-meta! (cpath-meta-file base) (cpath-meta-lines name deps))
-      (rename-file tmp-so (cpath-so-file base)))
+      (rename-replace! tmp-so (cpath-so-file base)))
     base))
 
 ;; The compiling load: evaluate the namespace while capturing its emitted Scheme,
@@ -2191,10 +2191,12 @@
       (aot-delete-tree p)
       (if (file-exists? p) #f #t))))
 ;; `mv` within one filesystem: rename(2), which is the atomicity the publish
-;; steps (a staged cache entry, a staged git checkout) depend on.
+;; steps (a staged cache entry, a staged git checkout) depend on — INCLUDING
+;; rename(2)'s replacement of an existing destination, which Windows refuses
+;; (java/io.ss rename-replace!, jolt-lang/jolt#1074).
 (def-var! "jolt.host" "rename-file!"
   (lambda (from to)
-    (guard (e (#t #f)) (rename-file (host-fs-path from) (host-fs-path to)) #t)))
+    (guard (e (#t #f)) (rename-replace! (host-fs-path from) (host-fs-path to)) #t)))
 ;; last-modified in epoch milliseconds, 0 when absent — what `test -nt` compared.
 (def-var! "jolt.host" "file-mtime"
   (lambda (p)

@@ -380,12 +380,14 @@
        (ascii-drive-letter? (string-ref p 0))
        (char=? (string-ref p 1) #\:)))
 
-(define (windows-root-relative? p)
-  (and (eq? (sa-os-family) 'windows)
+(define (windows-root-relative-for? windows? p)
+  (and windows?
        (> (string-length p) 0)
        (path-separator-char? (string-ref p 0))
        (or (= (string-length p) 1)
            (not (path-separator-char? (string-ref p 1))))))
+(define (windows-root-relative? p)
+  (windows-root-relative-for? (eq? (sa-os-family) 'windows) p))
 
 (define (trim-trailing-path-separator p)
   (let ((n (string-length p)))
@@ -401,9 +403,14 @@
 ;; relative case is resolved separately by project-relative below. `C:child`
 ;; still depends on Windows' process-local current directory for that drive and
 ;; remains an older File-shim compatibility gap.
-(define (jfile-path-absolute? p)
+;;
+;; Split on the platform the way jfile-fold-dots-for is, so the rows a Linux
+;; runner can never reach are still pinned (test/chez/win-platform-test.ss), and
+;; so ProcessBuilder's program resolver can ask the same question this does
+;; instead of keeping a second, POSIX-only answer of its own (#1074).
+(define (jfile-path-absolute-for? windows? p)
   (let ((n (string-length p)))
-    (if (eq? (sa-os-family) 'windows)
+    (if windows?
         (or (and (>= n 3)
                  (windows-drive-prefix? p)
                  (path-separator-char? (string-ref p 2)))
@@ -411,6 +418,8 @@
                  (path-separator-char? (string-ref p 0))
                  (path-separator-char? (string-ref p 1))))
         (and (> n 0) (char=? (string-ref p 0) #\/)))))
+(define (jfile-path-absolute? p)
+  (jfile-path-absolute-for? (eq? (sa-os-family) 'windows) p))
 
 (define (project-relative p)
   (cond
@@ -576,6 +585,25 @@
 ;; jfile-fold-dots as a single unsplittable segment.
 (define (path-sep-for? windows? c)
   (or (char=? c #\/) (and windows? (char=? c #\\))))
+
+;; Is P already spelled in the native Windows style — backslashes and no forward
+;; slash? A join onto such a path uses ITS separator rather than handing back a
+;; mixed spelling: Windows accepts either, but a %TEMP%- or PATH-derived
+;; directory is native, and the joined path is what the caller then sees in an
+;; error message or hands to a child process. Callers: the java.nio.file Path
+;; resolve/join (nio-file.ss) and ProcessBuilder's program resolver
+;; (process.ss). Always false on POSIX, where a backslash is an ordinary
+;; character in a filename and nothing about it says "separator".
+(define (path-backslash-style? windows? p)
+  (and windows?
+       (let loop ((i 0) (bs #f))
+         (cond ((= i (string-length p)) bs)
+               ((char=? (string-ref p i) #\/) #f)
+               ((char=? (string-ref p i) #\\) (loop (+ i 1) #t))
+               (else (loop (+ i 1) bs))))))
+
+;; The separator a join adds after P: the one P already uses, else "/".
+(define (path-join-sep windows? p) (if (path-backslash-style? windows? p) "\\" "/"))
 
 ;; The ROOT of P — the prefix that is not a segment and must be reproduced
 ;; verbatim — and the index the segments start at. Rendered with "/" separators,
@@ -775,6 +803,24 @@
     (cond ((not (file-exists? p)) #f)
           ((file-directory? p) (delete-directory p))
           (else (delete-file p) #t))))
+
+;; rename(2) REPLACES an existing destination. Chez's rename-file is MoveFile on
+;; Windows, which refuses one — "cannot rename A to B: file exists" — so every
+;; publish-by-rename here failed the moment its target already existed: the
+;; SECOND spit to a path, the first spit to a File/createTempFile target, and
+;; every AOT or classpath artifact written a second time (jolt-lang/jolt#1074).
+;; Those callers all mean the POSIX semantic, so drop the destination first
+;; there. That opens a window where the target is gone and the new content is
+;; not in place yet; it is Windows-only, and still far narrower than the
+;; truncate-in-place write the staged rename replaced.
+;;
+;; java.io.File.renameTo keeps the bare rename-file: the JVM documents it as
+;; platform-dependent and it fails over an existing destination on Windows too,
+;; so matching it IS the shim's job.
+(define (rename-replace! from to)
+  (when (and (eq? (sa-os-family) 'windows) (file-exists? to))
+    (delete-file to #f))
+  (rename-file from to))
 
 ;; --- java.net.URL (a jhost "url", state #(spec handler)) --------------------
 ;; A File.toURL value: .toString / .toExternalForm give the spec, .getPath /
@@ -1577,7 +1623,7 @@
                        (open-output-file tmp 'replace))
             (lambda (port) (put-string port text)))
           (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
-            (rename-file tmp p))))
+            (rename-replace! tmp p))))
     jolt-nil))
 
 ;; (flush) is (.flush *out*) on the JVM. When *out* holds a real writer — a
@@ -2212,8 +2258,7 @@
                (string-append "Prefix string \"" (jolt-str-render-one prefix)
                               "\" too short: length must be at least 3")))
   (let* ((d (cond ((pair? dir) (file-path-of (car dir)))
-                  ((getenv "TMPDIR") => (lambda (t) t))
-                  (else "/tmp")))
+                  (else (host-temp-dir))))
          (sfx (if (or (null? (list suffix)) (jolt-nil? suffix)) ".tmp" (jolt-str-render-one suffix))))
     (let ((n (jolt-with-mutex io-counter-mutex
               (set! temp-file-counter (+ temp-file-counter 1))
@@ -2223,12 +2268,40 @@
                               (number->string (now-millis)) "-" (number->string n) sfx)))
         (if (file-exists? p) (loop (+ n 1))
             (begin (close-port (open-output-file p 'truncate)) (make-jfile p))))))))
+;; File.listRoots: the filesystem roots. POSIX has exactly one; Windows has one
+;; per mounted drive, and answering "/" there named a directory on whichever
+;; drive the process happened to be on rather than enumerating anything
+;; (jolt-lang/jolt#1074). No volume-enumerating entry point is bound here, so
+;; probe the 26 letters — enumeration IS what the method is for, it is called
+;; rarely, and 26 stats are cheap next to a wrong answer. EXISTS? is a parameter
+;; so the Windows row is reachable from a Linux runner
+;; (test/chez/win-platform-test.ss). A Windows host that somehow shows no drive
+;; at all still answers "C:/" rather than an empty array, because the JVM never
+;; answers an empty one.
+(define (file-list-roots-for windows? exists?)
+  (if (not windows?)
+      (list "/")
+      (let loop ((i 25) (acc '()))
+        (if (< i 0)
+            (if (null? acc) (list "C:/") acc)
+            (let ((r (string-append (string (integer->char (+ (char->integer #\A) i))) ":/")))
+              (loop (- i 1) (if (exists? r) (cons r acc) acc)))))))
+
+;; separator stays "/" on both platforms — Windows accepts it and every path
+;; this shim renders uses it — but pathSeparator is the PATH-LIST separator and
+;; must be ";" on Windows, or babashka.fs/split-paths and fs/which cut every
+;; drive-lettered entry in half (host-static-methods.ss path-list-separator).
 (let ((statics (list (cons "separator" "/")
                      (cons "separatorChar" #\/)
-                     (cons "pathSeparator" ":")
-                     (cons "pathSeparatorChar" #\:)
+                     (cons "pathSeparator" (path-list-separator))
+                     (cons "pathSeparatorChar" (string-ref (path-list-separator) 0))
                      (cons "createTempFile" file-create-temp)
-                     (cons "listRoots" (lambda () (jolt-vector (make-jfile "/")))))))
+                     (cons "listRoots"
+                           (lambda ()
+                             (apply jolt-vector
+                                    (map make-jfile
+                                         (file-list-roots-for (eq? (sa-os-family) 'windows)
+                                                              file-exists?))))))))
   (register-class-statics! "File" statics)
   (register-class-statics! "java.io.File" statics))
 (register-class-ctor! "java.io.File" jolt-file-ctor)

@@ -346,6 +346,116 @@ jobs:
             throw "a forward-slash drive-absolute path did not reach the byte streams: $out"
           }
 
+      # The three defects of #1074, none of which a POSIX runner can observe.
+      # test/chez/win-platform-test.ss pins the decisions with the platform as a
+      # parameter; only a real Windows filesystem, PATH and process table can say
+      # the decisions were the right ones. PowerShell again — Windows PowerShell
+      # 5.1 strips the quotes off a string literal in a native argument, so the
+      # probes spell their strings with (name (quote x)) and (char n), as the
+      # path steps above do.
+      - name: spit replaces an existing file
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'winspit'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $env:WINSPIT_DIR = $dir
+          # spit stages into a sibling temp file and renames over the target, and
+          # Windows refuses a rename onto an existing destination — so the SECOND
+          # spit to any path threw, as did the FIRST spit to a createTempFile
+          # target (which already exists). Both, plus append, in one probe.
+          $probe = '(let [d (System/getenv (name (quote WINSPIT_DIR)))' +
+                   '      p (str d (char 47) (name (quote t.txt)))' +
+                   '      t (java.io.File/createTempFile (name (quote joltspit)) (str (char 46) (name (quote txt))))]' +
+                   '  (spit p (name (quote a)))' +
+                   '  (spit p (name (quote b)))' +
+                   '  (spit t (name (quote c)))' +
+                   '  (spit p (name (quote d)) :append true)' +
+                   '  (println (pr-str [(slurp p) (slurp t)])))'
+          $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($out -ne '["bd" "c"]') {
+            throw "spit did not replace an existing target: $out"
+          }
+
+      - name: path.separator is ";" and the PATH readers agree
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          # ":" is the drive suffix here, so a ":"-split of "C:/a;C:/b" answers
+          # three garbage entries and fs/which never finds anything.
+          # The entry count is the assertion rather than the entries themselves:
+          # two is right and three is the bug, and how a Path renders its
+          # separators is win-path-test.ss's question, not this one's.
+          $probe = '(do (require (quote [babashka.fs :as fs]))' +
+                   '  (let [two (str (name (quote C)) (char 58) (char 47) (name (quote a)) (char 59)' +
+                   '                 (name (quote C)) (char 58) (char 47) (name (quote b)))]' +
+                   '    (println (pr-str [(System/getProperty (name (quote path.separator)))' +
+                   '                      java.io.File/pathSeparator' +
+                   '                      (count (fs/split-paths two))' +
+                   '                      (some? (fs/which (name (quote curl))))]))))'
+          $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($out -ne '[";" ";" 2 true]') {
+            throw "the PATH-list separator did not reach its readers: $out"
+          }
+
+      - name: ProcessBuilder starts a Windows program
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          # Every spelling a caller actually uses: the bare name (which resolves
+          # only through PATHEXT — curl IS curl.exe), the native drive-absolute
+          # path, and its forward-slash spelling (what a joined cache directory
+          # looks like). kmet's curl transport hits all of these.
+          $env:WINCURL = (Get-Command curl.exe).Source
+          $probe = '(do (require (quote [babashka.process :as proc]))' +
+                   '  (let [v (str (char 45) (char 45) (name (quote version)))' +
+                   '        native (System/getenv (name (quote WINCURL)))' +
+                   '        slash (.replace native (char 92) (char 47))' +
+                   '        run (fn [p] (:exit @(proc/process [p v] {:out :string :err :string})))]' +
+                   '    (println (pr-str [(run (name (quote curl))) (run native) (run slash)]))))'
+          $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($out -ne '[0 0 0]') {
+            throw "a Windows program could not be resolved and started: $out"
+          }
+
+      - name: Path roots, java.io.tmpdir and listRoots are Windows-shaped
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          # The java.nio.file Path shim had a POSIX-only root, so a drive path
+          # was a relative path whose first segment happened to be "C:" —
+          # fs/absolute? false, getParent off the drive letter. java.io.tmpdir
+          # read only TMPDIR, which Windows does not set, and listRoots answered
+          # "/" instead of the drives. TMPDIR is cleared here so the property
+          # has to find TEMP the way a plain Windows process does.
+          Remove-Item Env:\TMPDIR -ErrorAction SilentlyContinue
+          $env:WINROOT_DIR = $env:SystemDrive
+          $probe = '(do (require (quote [babashka.fs :as fs]))' +
+                   '  (let [d (System/getenv (name (quote WINROOT_DIR)))' +
+                   '        p (fs/path (str d (char 47) (name (quote Windows)) (char 47) (name (quote System32))))' +
+                   '        tmp (System/getProperty (name (quote java.io.tmpdir)))]' +
+                   '    (println (pr-str [(fs/absolute? p)' +
+                   '                      (str (fs/parent p))' +
+                   '                      (str (.getRoot p))' +
+                   '                      (.startsWith (.toLowerCase tmp) (.toLowerCase d))' +
+                   '                      (.isDirectory (java.io.File. tmp))' +
+                   '                      (boolean (some (fn [r] (= (str r) (str d (char 47))))' +
+                   '                                     (java.io.File/listRoots)))]))))'
+          $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $drive = $env:SystemDrive
+          $want = '[true "' + $drive + '/Windows" "' + $drive + '/" true true true]'
+          if ($out -ne $want) {
+            throw "the Path root / tmpdir / listRoots answers were not Windows-shaped: $out (want $want)"
+          }
+
       # The resolver's HTTPS transport on Windows: ws2_32 sockets and the
       # OpenSSL DLLs discovered under Git for Windows' mingw64/bin. The runner
       # image also has an OpenSSL of its own on PATH, which the bare-name

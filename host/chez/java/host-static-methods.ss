@@ -1094,6 +1094,52 @@
   (jolt-with-mutex sys-prop-mu
     (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
       (hashtable-delete! sys-prop-table k) prev)))
+;; The PATH-LIST separator is not the file separator, and Windows is the reason
+;; they must be told apart: ":" is the drive suffix there, so ";" separates list
+;; entries. Answering ":" everywhere cut every Windows entry in half —
+;; (babashka.fs/split-paths "C:/a;C:/b") came back as ["C" "/a;C" "/b"], so
+;; fs/exec-paths was garbage, fs/which never found anything, and
+;; babashka.process's Windows resolver threw before a spawn was attempted
+;; (jolt-lang/jolt#1074).
+;;
+;; The FILE separator stays "/" on both. Windows accepts it everywhere, and the
+;; whole File/Path surface here already renders with it — getAbsolutePath,
+;; getCanonicalPath, babashka.fs/absolutize and /normalize all answer "C:/x"
+;; (test/chez/win-path-test.ss pins that), so one file has one spelling.
+;;
+;; Parameterized by platform, and defined in this file rather than beside the
+;; other path helpers in java/io.ss, because this file loads first (rt.ss) and
+;; System/getProperty is the caller closest to the load point.
+(define (path-list-separator-for windows?) (if windows? ";" ":"))
+(define (path-list-separator) (path-list-separator-for (eq? (sa-os-family) 'windows)))
+
+;; java.io.tmpdir. TMPDIR is the POSIX spelling and the only one this chain
+;; knew, so on Windows — which sets TEMP and TMP and not TMPDIR — it answered
+;; "/tmp": a directory on whichever drive the process happened to be on, which
+;; is where every File/createTempFile, every jolt.host temp write and every
+;; resolver download went (jolt-lang/jolt#1074). TMPDIR still wins everywhere,
+;; because a caller that sets it means it and the https-fetch smoke sets it on
+;; Windows too.
+;;
+;; GETENV* is a parameter so the rows a Linux runner cannot reach are still
+;; pinned (test/chez/win-platform-test.ss), and one definition serves all three
+;; callers — System/getProperty, File/createTempFile (java/io.ss) and
+;; Files/createTempFile (java/nio-file.ss) — because two hand-kept copies is how
+;; java.io and java.nio.file start disagreeing about a path.
+(define (host-temp-dir-for windows? getenv*)
+  (define (named k) (let ((v (getenv* k))) (and v (> (string-length v) 0) v)))
+  (or (named "TMPDIR")
+      (and (not windows?) "/tmp")
+      (named "TEMP")
+      (named "TMP")
+      ;; Nothing named one. SystemRoot is the variable Windows always sets (the
+      ;; OS probe in scheme-adapter-runtime.ss keys off it), and <SystemRoot>\Temp
+      ;; exists on every install; "C:/Windows/Temp" is the last resort for a
+      ;; process started with no environment at all.
+      (let ((sr (named "SystemRoot"))) (and sr (string-append sr "/Temp")))
+      "C:/Windows/Temp"))
+(define (host-temp-dir) (host-temp-dir-for (eq? (sa-os-family) 'windows) getenv))
+
 ;; java.class.path — jolt's equivalent of the JVM classpath is the resolved
 ;; source roots (project :paths + every dependency's roots), which a project
 ;; command installs with set-source-roots! before it runs anything. Editor
@@ -1107,10 +1153,11 @@
 (define sys-class-path-provider (lambda () '()))
 (define (set-class-path-provider! f) (set! sys-class-path-provider f))
 (define (sys-class-path)
-  (let loop ((roots (sys-class-path-provider)) (acc ""))
-    (cond ((null? roots) acc)
-          ((string=? acc "") (loop (cdr roots) (car roots)))
-          (else (loop (cdr roots) (string-append acc ":" (car roots)))))))
+  (let ((sep (path-list-separator)))
+    (let loop ((roots (sys-class-path-provider)) (acc ""))
+      (cond ((null? roots) acc)
+            ((string=? acc "") (loop (cdr roots) (car roots)))
+            (else (loop (cdr roots) (string-append acc sep (car roots))))))))
 
 (define (sys-get-property k . dflt)
   (let* ((k (jolt-need-string k))
@@ -1123,14 +1170,14 @@
           ((string=? k "jolt.version") (jolt-version-string))
           ((string=? k "line.separator") "\n")
           ((string=? k "file.separator") "/")
-          ((string=? k "path.separator") ":")
+          ((string=? k "path.separator") (path-list-separator))
           ((string=? k "java.class.path") (sys-class-path))
           ;; user.dir is the user's cwd (JVM: the process cwd). jolt-user-dir (io.ss)
           ;; owns that chain — JOLT_PWD, then the process's own working directory —
           ;; so the property and every relative path resolve against the same place.
           ((string=? k "user.dir") (jolt-user-dir))
           ((string=? k "user.home") (or (getenv "HOME") ""))
-          ((string=? k "java.io.tmpdir") (or (getenv "TMPDIR") "/tmp"))
+          ((string=? k "java.io.tmpdir") (host-temp-dir))
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
 ;; System/getProperties: a java.util.Properties holding the same values
@@ -1141,10 +1188,11 @@
 (define (sys-properties-pmap)
   (let ((base (jolt-hash-map "os.name" sys-os-name "os.arch" sys-os-arch
                              "line.separator" "\n" "file.separator" "/"
-                             "path.separator" ":" "java.class.path" (sys-class-path)
+                             "path.separator" (path-list-separator)
+                             "java.class.path" (sys-class-path)
                              "jolt.version" (jolt-version-string)
                              "user.dir" (jolt-user-dir) "user.home" (or (getenv "HOME") "")
-                             "java.io.tmpdir" (or (getenv "TMPDIR") "/tmp"))))
+                             "java.io.tmpdir" (host-temp-dir))))
     ;; keys whose value can be absent join only when they answer — a JVM
     ;; Properties never holds a nil value
     (let ((v (sys-os-version)))
