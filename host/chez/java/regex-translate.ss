@@ -40,6 +40,22 @@
            i)
           (else (loop (+ i 1))))))
 
+;; ── Pattern-syntax errors ─────────────────────────────────────────────────────
+;;
+;; A malformed pattern is a java.util.regex.PatternSyntaxException on the JVM, and
+;; that exception carries two things beyond the description: the index into the
+;; pattern where parsing stopped, and — derived from it — the caret line getMessage
+;; renders. So a parse failure here is not a bare (error …) string; it is this
+;; record, raised as-is, and regex.ss turns it into the JVM's exact message. index
+;; is -1 when the JVM would name no position (its own getMessage then prints no
+;; " near index" clause and no caret). A record, not an R6RS condition type: the
+;; Gambit boot ##includes this file, and it has define-record-type (a shim) but
+;; no define-condition-type.
+(define-record-type java-pattern-error (fields desc index))
+
+(define (java-re-error desc idx)
+  (raise (make-java-pattern-error desc idx)))
+
 ;; ── (?x) whitespace/comment stripping (from regex.ss, duplicated for standalone use)
 
 (define (regex-x-strip s start)
@@ -140,10 +156,11 @@
 ;; \p{L}/\p{N} used to approximate with a hand-picked range ((/ #\x80
 ;; #\xD7FF) for L), which is nearly the whole BMP above ASCII and so
 ;; wrongly matched symbols/punctuation too, e.g. U+2192 → (#941). Build
-;; the real Unicode General Category ranges from Chez's own
-;; char-general-category instead. ~10ms over the full codepoint space,
-;; paid once and lazily, only if a pattern actually uses \p{L}/\p{N}.
-(define (unicode-category-ranges categories)
+;; the real Unicode ranges from Chez's own char-general-category (and, for
+;; the binary properties, its R6RS char predicates) instead. ~10ms over the
+;; full codepoint space, paid once per name and lazily, only if a pattern
+;; actually uses it.
+(define (unicode-property-ranges in?)
   (let loop ((cp 0) (start #f) (ranges '()))
     (define (close-at cp ranges)
       (if start (cons `(/ ,(integer->char start) ,(integer->char (- cp 1))) ranges) ranges))
@@ -151,7 +168,7 @@
      ((> cp #x10FFFF) (cons 'or (reverse (close-at cp ranges))))
      ((and (>= cp #xD800) (<= cp #xDFFF)) (loop (+ cp 1) start ranges)) ; surrogates
      (else
-      (let ((in? (memq (char-general-category (integer->char cp)) categories)))
+      (let ((in? (in? (integer->char cp))))
         (cond
          ((and in? (not start)) (loop (+ cp 1) cp ranges))
          ((and (not in?) start) (loop (+ cp 1) #f (close-at cp ranges)))
@@ -162,27 +179,94 @@
 ;; POSIX name (\p{Alpha}, \p{Digit}, \p{Upper}, \p{Punct} ...) is ASCII unless
 ;; UNICODE_CHARACTER_CLASS is on -- so \p{Alpha} matches "a" and not "é", and
 ;; \p{Nd} matches an Arabic-Indic digit but not a Roman numeral (that is \p{N}).
-;; javaLowerCase/javaUpperCase are Character.isLowerCase/isUpperCase, which
-;; Ll/Lu approximate far better than ASCII did.
-(define sre-unicode-L  (delay (unicode-category-ranges '(Lu Ll Lt Lm Lo))))
-(define sre-unicode-Lu (delay (unicode-category-ranges '(Lu))))
-(define sre-unicode-Ll (delay (unicode-category-ranges '(Ll))))
-(define sre-unicode-N  (delay (unicode-category-ranges '(Nd Nl No))))
-(define sre-unicode-Nd (delay (unicode-category-ranges '(Nd))))
-(define sre-unicode-P  (delay (unicode-category-ranges '(Pc Pd Ps Pe Pi Pf Po))))
-(define sre-unicode-Ps (delay (unicode-category-ranges '(Ps))))
-(define sre-unicode-Pe (delay (unicode-category-ranges '(Pe))))
+;;
+;; Every general category and category group java.util.regex names (Pattern's
+;; CharPredicates), spelled as the R6RS categories it unions. The binary
+;; properties the JVM spells \p{IsAlphabetic}, \p{IsLowercase} … are the same
+;; Unicode properties R6RS's char-alphabetic? / char-lower-case? … answer, and
+;; Character.isLowerCase/isUpperCase/isAlphabetic (javaLowerCase …) are those
+;; properties too, not the bare Ll/Lu categories. A script (\p{IsLatin}) or a
+;; block (\p{InGreek}) has no data behind it here: jolt has no script or block
+;; tables, so those names are refused as unsupported (known-divergences.edn).
+(define unicode-category-groups
+  '(("L" Lu Ll Lt Lm Lo) ("LC" Lu Ll Lt) ("Lu" Lu) ("Ll" Ll) ("Lt" Lt) ("Lm" Lm) ("Lo" Lo)
+    ("M" Mn Mc Me) ("Mn" Mn) ("Mc" Mc) ("Me" Me)
+    ("N" Nd Nl No) ("Nd" Nd) ("Nl" Nl) ("No" No)
+    ("P" Pc Pd Ps Pe Pi Pf Po) ("Pc" Pc) ("Pd" Pd) ("Ps" Ps) ("Pe" Pe) ("Pi" Pi) ("Pf" Pf) ("Po" Po)
+    ("S" Sm Sc Sk So) ("Sm" Sm) ("Sc" Sc) ("Sk" Sk) ("So" So)
+    ("C" Cc Cf Cs Co Cn) ("Cc" Cc) ("Cf" Cf) ("Cs" Cs) ("Co" Co) ("Cn" Cn)))
 
+(define unicode-binary-properties
+  `(("ALPHABETIC" . ,char-alphabetic?)
+    ("LOWERCASE" . ,char-lower-case?)
+    ("UPPERCASE" . ,char-upper-case?)
+    ("WHITE_SPACE" . ,char-whitespace?) ("WHITESPACE" . ,char-whitespace?)
+    ("TITLECASE" . ,(lambda (c) (eq? (char-general-category c) 'Lt)))
+    ("LETTER" . ,(lambda (c) (memq (char-general-category c) '(Lu Ll Lt Lm Lo))))
+    ("DIGIT" . ,(lambda (c) (eq? (char-general-category c) 'Nd)))
+    ("ALNUM" . ,(lambda (c) (or (char-alphabetic? c) (eq? (char-general-category c) 'Nd))))
+    ("BLANK" . ,(lambda (c) (or (eq? (char-general-category c) 'Zs) (char=? c #\tab))))
+    ("PUNCTUATION" . ,(lambda (c) (memq (char-general-category c) '(Pc Pd Ps Pe Pi Pf Po))))
+    ("CONTROL" . ,(lambda (c) (eq? (char-general-category c) 'Cc)))
+    ("ASSIGNED" . ,(lambda (c) (not (eq? (char-general-category c) 'Cn))))
+    ("HEX_DIGIT" . ,(lambda (c) (or (and (char<=? #\0 c) (char<=? c #\9))
+                                    (and (char<=? #\a c) (char<=? c #\f))
+                                    (and (char<=? #\A c) (char<=? c #\F))
+                                    (and (char<=? #\xFF10 c) (char<=? c #\xFF19))
+                                    (and (char<=? #\xFF21 c) (char<=? c #\xFF26))
+                                    (and (char<=? #\xFF41 c) (char<=? c #\xFF46)))))
+    ("JOIN_CONTROL" . ,(lambda (c) (memv (char->integer c) '(#x200C #x200D))))
+    ("NONCHARACTER_CODE_POINT" . ,(lambda (c) (let ((n (char->integer c)))
+                                                (or (and (>= n #xFDD0) (<= n #xFDEF))
+                                                    (= (bitwise-and n #xFFFE) #xFFFE)))))))
+
+;; Character.isX for the javaX names, as the JDK defines them.
+(define java-character-predicates
+  `(("javaLowerCase" . ,char-lower-case?)
+    ("javaUpperCase" . ,char-upper-case?)
+    ("javaAlphabetic" . ,char-alphabetic?)
+    ("javaTitleCase" . ,(lambda (c) (eq? (char-general-category c) 'Lt)))
+    ("javaLetter" . ,(lambda (c) (memq (char-general-category c) '(Lu Ll Lt Lm Lo))))
+    ("javaDigit" . ,(lambda (c) (eq? (char-general-category c) 'Nd)))
+    ("javaLetterOrDigit" . ,(lambda (c) (memq (char-general-category c) '(Lu Ll Lt Lm Lo Nd))))
+    ("javaDefined" . ,(lambda (c) (not (eq? (char-general-category c) 'Cn))))
+    ("javaSpaceChar" . ,(lambda (c) (memq (char-general-category c) '(Zs Zl Zp))))
+    ;; isWhitespace: a space separator that is not non-breaking, the line and
+    ;; paragraph separators, and the ASCII controls \t \n \x0B \f \r \x1C-\x1F.
+    ("javaWhitespace" . ,(lambda (c) (let ((n (char->integer c)))
+                                       (or (and (memq (char-general-category c) '(Zs Zl Zp))
+                                                (not (memv n '(#xA0 #x2007 #x202F))))
+                                           (and (>= n 9) (<= n 13))
+                                           (and (>= n #x1C) (<= n #x1F))))))
+    ("javaISOControl" . ,(lambda (c) (let ((n (char->integer c)))
+                                       (or (<= n #x1F) (and (>= n #x7F) (<= n #x9F))))))))
+
+;; name -> built SRE, once per name (the walk over the codepoint space is the
+;; cost, so a class is built the first time a pattern names it and kept). The
+;; regex cache's lock already serializes the translator's callers; the table
+;; takes its own so a direct caller (a gate, a REPL) is safe too — a Chez
+;; hashtable written from two threads faults in the collector.
+(define unicode-property-cache (make-hashtable string-hash string=?))
+(define unicode-property-mutex (make-mutex 'unicode-properties))
+(define (unicode-property-sre name in?)
+  (or (hashtable-ref unicode-property-cache name #f)
+      (jolt-with-mutex unicode-property-mutex
+        (or (hashtable-ref unicode-property-cache name #f)
+            (let ((sre (unicode-property-ranges in?)))
+              (hashtable-set! unicode-property-cache name sre)
+              sre)))))
+
+;; The SRE for a \p{name}, or #f for a name jolt cannot build. The spellings
+;; the JVM accepts for a category — L, IsL, gc=L, general_category=L — all
+;; reach the same table; a binary property is Is<Property>.
 (define (prop-class-sre name)
+  (define (category-sre nm)
+    (let ((e (assoc nm unicode-category-groups)))
+      (and e (unicode-property-sre nm (lambda (c) (memq (char-general-category c) (cdr e)))))))
+  (define (prefixed? pre) (and (> (string-length name) (string-length pre))
+                               (string=? (substring name 0 (string-length pre)) pre)))
+  (define (after pre) (substring name (string-length pre) (string-length name)))
   (cond
-   ((string=? name "L") (force sre-unicode-L))
-   ((string=? name "Lu") (force sre-unicode-Lu))
-   ((string=? name "Ll") (force sre-unicode-Ll))
-   ((string=? name "N") (force sre-unicode-N))
-   ((string=? name "Nd") (force sre-unicode-Nd))
-   ;; POSIX names: ASCII, as on the JVM
-   ((string=? name "Alpha") 'alpha)
-   ((string=? name "Digit") 'numeric)
    ;; The Unicode separator categories are a short fixed list, so spell them out
    ;; rather than settling for irregex's ASCII `blank`. Zs is the space separators
    ;; (the non-breaking ones included — \p{Z} is a category, not Java's
@@ -191,9 +275,10 @@
    ((string=? name "Zl") #\x2028)
    ((string=? name "Zp") #\x2029)
    ((string=? name "Z") sre-Z)
-   ((string=? name "P") (force sre-unicode-P))
-   ((string=? name "Ps") (force sre-unicode-Ps))
-   ((string=? name "Pe") (force sre-unicode-Pe))
+   ((category-sre name) => values)
+   ;; POSIX names: ASCII, as on the JVM
+   ((string=? name "Alpha") 'alpha)
+   ((string=? name "Digit") 'numeric)
    ((string=? name "Lower") 'lower)
    ((string=? name "Upper") 'upper)
    ((string=? name "ASCII") 'ascii)
@@ -205,9 +290,16 @@
    ((string=? name "Cntrl") 'cntrl)
    ((string=? name "XDigit") 'xdigit)
    ((string=? name "Space") 'whitespace)
-   ((string=? name "javaLowerCase") (force sre-unicode-Ll))
-   ((string=? name "javaUpperCase") (force sre-unicode-Lu))
-   ((string=? name "javaWhitespace") 'whitespace)
+   ((string=? name "all") 'any)
+   ((assoc name java-character-predicates)
+    => (lambda (e) (unicode-property-sre name (cdr e))))
+   ((prefixed? "Is")
+    (let ((nm (after "Is")))
+      (cond ((assoc (string-upcase nm) unicode-binary-properties)
+             => (lambda (e) (unicode-property-sre name (cdr e))))
+            (else (prop-class-sre nm)))))
+   ((prefixed? "gc=") (category-sre (after "gc=")))
+   ((prefixed? "general_category=") (category-sre (after "general_category=")))
    (else #f)))
 
 ;; ── Literal string → SRE ──────────────────────────────────────────────────────
@@ -220,7 +312,480 @@
 
 ;; ── Entry point ───────────────────────────────────────────────────────────────
 
+
+;; ── JDK-faithful pattern-syntax validator ─────────────────────────────────────
+;; Java rejects patterns the SRE translation would otherwise quietly accept: a
+;; quantifier with no atom, a malformed {...}, an unfinished group, a bad
+;; \p / \x / \N / \k escape.  This mirrors java.util.regex.Pattern's own scan
+;; (group0 / sequence / atom / closure / clazz / range / escape) so the reported
+;; description and index match the JVM (host/chez/regex.ss renders them as
+;; "<desc> near index <n>" plus the caret line).  It answers only "what would
+;; the JVM say about this text"; whether jolt can BUILD what it accepts is the
+;; translator's question, asked next.
+;;
+;; The JVM's indexes are cursor arithmetic (error() reports cursor - 1), and a
+;; scan that has run off the end sits one past the sentinel — which is why an
+;; unclosed group after a trailing backslash is "near index n+1" while a plain
+;; unclosed group is "near index n".  Every such quirk here was captured from a
+;; JDK run (test/chez/regex-syntax-test.ss), not derived.
+
+;; Pattern.RemoveQEQuoting, exactly: the JVM rewrites every \Q…\E span BEFORE it
+;; parses, and the index its PatternSyntaxException names is an index into that
+;; rewritten buffer, not the source. A quoted ASCII letter or non-ASCII unit is
+;; copied; a quoted digit is copied too, with a \x3 prefix when it opens the
+;; quote (so a \u escape before the \Q cannot absorb it); any other quoted unit
+;; is backslash-escaped, a quoted backslash doubled. A quote with no \E runs to
+;; the end. Everything before the first \Q, and everything outside a quote after
+;; it, is copied verbatim — an \E outside a quote stays for the scanner to reject.
+(define (jsc-qe-rewrite s)
+  (let* ((n (string-length s))
+         (start (let loop ((i 0))
+                  (cond ((>= i (- n 1)) #f)
+                        ((not (char=? (string-ref s i) #\\)) (loop (+ i 1)))
+                        ((char=? (string-ref s (+ i 1)) #\Q) i)
+                        (else (loop (+ i 2)))))))
+    (if (not start)
+        s
+        (let loop ((i (+ start 2)) (in-quote #t) (begin-quote #t)
+                   (acc (reverse (string->list (substring s 0 start)))))
+          (if (>= i n)
+              (list->string (reverse acc))
+              (let ((c (string-ref s i)) (i (+ i 1)))
+                (cond
+                  ((or (> (char->integer c) 127) (jsc-latin-letter? c))
+                   (loop i in-quote #f (cons c acc)))
+                  ((jsc-digit? c)
+                   (loop i in-quote #f
+                         (cons c (if begin-quote (append '(#\3 #\x #\\) acc) acc))))
+                  ((not (char=? c #\\))
+                   (loop i in-quote #f (cons c (if in-quote (cons #\\ acc) acc))))
+                  (in-quote
+                   (if (and (< i n) (char=? (string-ref s i) #\E))
+                       (loop (+ i 1) #f #f acc)
+                       (loop i #t #f (cons #\\ (cons #\\ acc)))))
+                  ((and (< i n) (char=? (string-ref s i) #\Q))
+                   (loop (+ i 1) #t #t acc))
+                  (else
+                   (loop (if (< i n) (+ i 1) i) #f #f
+                         (if (< i n) (cons (string-ref s i) (cons c acc)) (cons c acc)))))))))))
+
+(define (jsc-latin-letter? c)
+  (or (and (char>=? c #\A) (char<=? c #\Z))
+      (and (char>=? c #\a) (char<=? c #\z))))
+
+(define (jsc-digit? c)
+  (and (char>=? c #\0) (char<=? c #\9)))
+
+(define (jsc-latin-char? c)
+  (or (jsc-latin-letter? c) (jsc-digit? c)))
+
+(define (jsc-octal? c)
+  (and (char>=? c #\0) (char<=? c #\7)))
+
+;; Is this a \p{…} name the JVM would accept?  The general categories and their
+;; groups, the POSIX and java* names, `all`, and the prefixed spellings — an Is
+;; (script, binary property or category), an In (block), gc= / general_category=
+;; / sc= / script= / blk= / block= — with a non-empty argument.  A script or
+;; block NAME is not checked (jolt has no table to check it against); the
+;; translator refuses the ones it cannot build.
+(define jvm-property-names
+  '("Lower" "Upper" "ASCII" "Alpha" "Digit" "Alnum" "Punct" "Graph" "Print"
+    "Blank" "Cntrl" "XDigit" "Space" "all"
+    "javaLowerCase" "javaUpperCase" "javaAlphabetic" "javaIdeographic"
+    "javaTitleCase" "javaDigit" "javaDefined" "javaLetter" "javaLetterOrDigit"
+    "javaJavaIdentifierStart" "javaJavaIdentifierPart"
+    "javaUnicodeIdentifierStart" "javaUnicodeIdentifierPart"
+    "javaIdentifierIgnorable" "javaSpaceChar" "javaWhitespace" "javaISOControl"
+    "javaMirrored"
+    "C" "Cc" "Cf" "Cn" "Co" "Cs" "L" "LC" "Ll" "Lm" "Lo" "Lt" "Lu" "M" "Mc" "Me"
+    "Mn" "N" "Nd" "Nl" "No" "P" "Pc" "Pd" "Pe" "Pf" "Pi" "Po" "Ps" "S" "Sc" "Sk"
+    "Sm" "So" "Z" "Zl" "Zp" "Zs"))
+
+(define (jvm-property-name? name)
+  (define (prefixed? pre)
+    (and (> (string-length name) (string-length pre))
+         (string=? (substring name 0 (string-length pre)) pre)))
+  (or (and (member name jvm-property-names) #t)
+      (prefixed? "Is") (prefixed? "In")
+      (prefixed? "gc=") (prefixed? "general_category=")
+      (prefixed? "sc=") (prefixed? "script=")
+      (prefixed? "blk=") (prefixed? "block=")))
+
+;; COMMENTS mode. The JVM skips whitespace and #-to-end-of-line comments at
+;; nearly every token boundary once an unscoped (?x) is in force — inside a
+;; class, between ( and ?, after \p, between the digits of a {m,n} — and the
+;; translator handles it the same way apply-global-x does: everything after the
+;; first unscoped flag group naming x is stripped before parsing. The validator
+;; scans that same stripped text, so it accepts exactly what the translator
+;; parses; what it must then add back is the JVM's index, which is a position
+;; in the UNSTRIPPED pattern. So this returns the stripped text and, for each
+;; of its positions, the original one. Before the first (?x) nothing changes.
+(define (jsc-x-strip s)
+  (let ((n (string-length s)))
+    (define (x-group-end i)             ; i at ( of (?…): index after ) when the
+      (let scan ((j (+ i 2)) (x? #f))    ; group is unscoped flags naming x
+        (and (< j n)
+             (let ((c (string-ref s j)))
+               (cond ((char=? c #\x) (scan (+ j 1) #t))
+                     ((memv c '(#\s #\i #\m #\u #\d #\U #\c #\-)) (scan (+ j 1) x?))
+                     ((and (char=? c #\)) x?) (+ j 1))
+                     (else #f))))))
+    (let find ((i 0) (in-class #f))
+      (cond
+        ((>= (+ i 2) n) (values s #f))
+        ((char=? (string-ref s i) #\\) (find (+ i 2) in-class))
+        ((and (not in-class) (char=? (string-ref s i) #\[)) (find (+ i 1) #t))
+        ((and in-class (char=? (string-ref s i) #\])) (find (+ i 1) #f))
+        ((and (not in-class) (char=? (string-ref s i) #\()
+              (char=? (string-ref s (+ i 1)) #\?)
+              (x-group-end i))
+         => (lambda (start)
+              (let ((out (open-output-string)) (map '()))
+                (let loop ((k 0))
+                  (when (< k start)
+                    (write-char (string-ref s k) out) (set! map (cons k map)) (loop (+ k 1))))
+                (let loop ((k start))
+                  (if (>= k n)
+                      (begin (set! map (cons n map))
+                             (values (get-output-string out) (list->vector (reverse map))))
+                      (let ((c (string-ref s k)))
+                        (cond
+                          ((and (char=? c #\\) (< (+ k 1) n))
+                           (write-char c out) (write-char (string-ref s (+ k 1)) out)
+                           (set! map (cons (+ k 1) (cons k map)))
+                           (loop (+ k 2)))
+                          ((char=? c #\#)
+                           (let skip ((j (+ k 1)))
+                             (cond ((>= j n) (loop j))
+                                   ((char=? (string-ref s j) #\newline) (loop (+ j 1)))
+                                   (else (skip (+ j 1))))))
+                          ((memv c '(#\space #\tab #\newline #\return #\x0B #\x0C))
+                           (loop (+ k 1)))
+                          (else (write-char c out) (set! map (cons k map)) (loop (+ k 1))))))))))
+        (else (find (+ i 1) in-class))))))
+
+(define (java-syntax-check source)
+  (let*-values (((qe) (jsc-qe-rewrite source))
+                ((s index-map) (jsc-x-strip qe)))
+   (let ((n (string-length s)))
+    (define (rf k) (string-ref s k))
+    ;; An index is a position in s; in COMMENTS mode it is mapped back to the
+    ;; unstripped pattern. The JVM's end-relative indexes (n-1, n+1) and its
+    ;; "the unit before" (Unmatched closing) are an offset from a mapped
+    ;; position, so they land on a stripped unit when that is what is there.
+    (define (err desc idx . delta)
+      (let ((d (if (null? delta) 0 (car delta))))
+        (java-re-error desc
+                       (+ d (cond ((not index-map) idx)
+                                  ((<= idx n) (vector-ref index-map idx))
+                                  (else (+ (string-length qe) (- idx n))))))))
+    (define seen '())                   ; the named groups defined so far
+    (define refs 0)                     ; back-references read so far
+
+    ;; ── escapes ──
+    ;; Each reads one escape and answers (values kind code next): kind is char
+    ;; (code = the code point, or #f for a \N{…} whose value jolt cannot look
+    ;; up), class (\d \p{…} …), atom (an assertion or \R, quantifiable like the
+    ;; JVM allows), or ref.  A class can be quantified but not end a range.
+
+    ;; \0: one to three octal digits, the third only when the first is 0-3.
+    (define (octal i)                   ; i = the first digit
+      (if (or (>= i n) (not (jsc-octal? (rf i))))
+          (err "Illegal octal escape sequence" i)
+          (let ((d1 (- (char->integer (rf i)) 48)))
+            (if (and (< (+ i 1) n) (jsc-octal? (rf (+ i 1))))
+                (let ((d2 (- (char->integer (rf (+ i 1))) 48)))
+                  (if (and (<= d1 3) (< (+ i 2) n) (jsc-octal? (rf (+ i 2))))
+                      (values (+ (* d1 64) (* d2 8) (- (char->integer (rf (+ i 2))) 48)) (+ i 3))
+                      (values (+ (* d1 8) d2) (+ i 2))))
+                (values d1 (+ i 1))))))
+
+    ;; \x: two hex digits, or {hex+} at most 0x10FFFF (Pattern.x()).
+    (define (hex i)                     ; i = after the x
+      (cond
+        ((and (< i n) (hex-value (rf i)))
+         (if (and (< (+ i 1) n) (hex-value (rf (+ i 1))))
+             (values (+ (* 16 (hex-value (rf i))) (hex-value (rf (+ i 1)))) (+ i 2))
+             (err "Illegal hexadecimal escape sequence" (+ i 1))))
+        ((and (< i n) (char=? (rf i) #\{) (< (+ i 1) n) (hex-value (rf (+ i 1))))
+         (let loop ((k (+ i 1)) (v 0))
+           (cond ((>= k n) (err "Unclosed hexadecimal escape sequence" k))
+                 ((hex-value (rf k))
+                  (let ((v (+ (* v 16) (hex-value (rf k)))))
+                    (if (> v #x10FFFF)
+                        (err "Hexadecimal codepoint is too big" k)
+                        (loop (+ k 1) v))))
+                 ((char=? (rf k) #\}) (values v (+ k 1)))
+                 (else (err "Unclosed hexadecimal escape sequence" k)))))
+        (else (err "Illegal hexadecimal escape sequence" i))))
+
+    ;; \u: exactly four hex digits (Pattern.uxxxx()) …
+    (define (uxxxx i)                   ; i = after the u
+      (let loop ((k i) (v 0))
+        (cond ((>= k (+ i 4)) (values v k))
+              ((and (< k n) (hex-value (rf k)))
+               (loop (+ k 1) (+ (* v 16) (hex-value (rf k)))))
+              (else (err "Illegal Unicode escape sequence" k)))))
+    ;; … and a high surrogate followed by \u + a low one is a single code point
+    ;; (Pattern.u()); the second escape is read, and so checked, either way.
+    (define (unicode i)
+      (let-values (((v k) (uxxxx i)))
+        (if (and (<= #xD800 v) (<= v #xDBFF)
+                 (< (+ k 1) n) (char=? (rf k) #\\) (char=? (rf (+ k 1)) #\u))
+            (let-values (((v2 k2) (uxxxx (+ k 2))))
+              (if (and (<= #xDC00 v2) (<= v2 #xDFFF))
+                  (values (+ #x10000 (* (- v #xD800) #x400) (- v2 #xDC00)) k2)
+                  (values v k)))
+            (values v k))))
+
+    ;; \N{name}: the braces are checked here, and a name no character can have
+    ;; (Character.codePointOf takes letters, digits, space and hyphen, any case,
+    ;; and every name has a letter) is refused as the JVM refuses it; whether a
+    ;; well-formed name EXISTS is the translator's answer, which is that it has
+    ;; no table to say.
+    (define (charname i)                ; i = after the N → next
+      (if (or (>= i n) (not (char=? (rf i) #\{)))
+          (err "Illegal character name escape sequence" i)
+          (let ((cl (str-scan-char s #\} (+ i 1) n)))
+            (cond
+              ((not cl)
+               (if (>= (+ i 1) (- n 1))
+                   (err "Unclosed character name escape sequence" (+ i 1))
+                   (err "Unclosed character name escape sequence" n -1)))
+              ((let ok ((k (+ i 1)) (letter #f))
+                 (if (>= k cl)
+                     letter
+                     (and (or (jsc-latin-char? (rf k)) (memv (rf k) '(#\space #\-)))
+                          (ok (+ k 1) (or letter (jsc-latin-letter? (rf k)))))))
+               (+ cl 1))
+              (else
+               (err (string-append "Unknown character name [" (substring s (+ i 1) cl) "]") cl))))))
+
+    ;; \p{name} / \pL: the shape, and that the JVM knows the name.
+    (define (property i)                ; i = after the p/P → next
+      (cond
+        ((>= i n)
+         (err (string-append "Unknown character property name {"
+                             (string (integer->char 0)) "}")
+              i))
+        ((char=? (rf i) #\{)
+         (let ((cl (str-scan-char s #\} (+ i 1) n)))
+           (cond ((not cl) (err "Unclosed character family" n))
+                 ((= cl (+ i 1)) (err "Empty character family" cl))
+                 ((jvm-property-name? (substring s (+ i 1) cl)) (+ cl 1))
+                 (else (err (string-append "Unknown character property name {"
+                                           (substring s (+ i 1) cl) "}")
+                            cl)))))
+        ((jvm-property-name? (string (rf i))) (+ i 1))
+        (else (err (string-append "Unknown character property name {" (string (rf i)) "}")
+                   i))))
+
+    ;; <name> of a named group or a \k back-reference: a Latin letter, then
+    ;; Latin letters and digits, then > → (values name next)
+    (define (groupname j)
+      (if (or (>= j n) (not (jsc-latin-letter? (rf j))))
+          (err "capturing group name does not start with a Latin letter" j)
+          (let loop ((k (+ j 1)))
+            (cond ((>= k n) (err "named capturing group is missing trailing '>'" n))
+                  ((char=? (rf k) #\>) (values (substring s j k) (+ k 1)))
+                  ((jsc-latin-char? (rf k)) (loop (+ k 1)))
+                  (else (err "named capturing group is missing trailing '>'" k))))))
+
+    (define (backref i)                 ; i = after the k → next
+      (if (or (>= i n) (not (char=? (rf i) #\<)))
+          (err "\\k is not followed by '<' for named capturing group" i)
+          (let-values (((nm k) (groupname (+ i 1))))
+            (if (member nm seen)
+                k
+                (err (string-append "named capturing group <" nm "> does not exist")
+                     (- k 1))))))
+
+    ;; One escape at i (the backslash). where is top, group or class: a trailing
+    ;; backslash reads the JVM's end sentinel as a literal, and what then fails
+    ;; is the enclosing construct.
+    (define (escape i where)
+      (if (>= (+ i 1) n)
+          (case where
+            ((class) (err "Unclosed character class" n))
+            ((top) (err "Unescaped trailing backslash" n))
+            (else (err "Unclosed group" n 1)))
+          (let ((c (rf (+ i 1))) (inclass (eq? where 'class)))
+            (define (illegal) (err "Illegal/unsupported escape sequence" (+ i 1)))
+            (define (char v k) (values 'char v k))
+            (case c
+              ((#\0) (let-values (((v k) (octal (+ i 2)))) (char v k)))
+              ((#\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9)
+               (if inclass (illegal) (begin (set! refs (+ refs 1)) (values 'ref #f (+ i 2)))))
+              ((#\a) (char 7 (+ i 2)))
+              ((#\e) (char 27 (+ i 2)))
+              ((#\f) (char 12 (+ i 2)))
+              ((#\n) (char 10 (+ i 2)))
+              ((#\r) (char 13 (+ i 2)))
+              ((#\t) (char 9 (+ i 2)))
+              ((#\c)
+               (if (>= (+ i 2) n)
+                   (err "Illegal control escape sequence" (+ i 1))
+                   (char (bitwise-xor (char->integer (rf (+ i 2))) 64) (+ i 3))))
+              ((#\x) (let-values (((v k) (hex (+ i 2)))) (char v k)))
+              ((#\u) (let-values (((v k) (unicode (+ i 2)))) (char v k)))
+              ((#\N) (char #f (charname (+ i 2))))
+              ((#\p #\P) (values 'class #f (property (+ i 2))))
+              ((#\d #\D #\s #\S #\w #\W #\h #\H #\v #\V) (values 'class #f (+ i 2)))
+              ((#\b #\B #\A #\G #\z #\Z #\R #\X)
+               (if inclass (illegal) (values 'atom #f (+ i 2))))
+              ((#\k) (if inclass (illegal)
+                         (begin (set! refs (+ refs 1)) (values 'ref #f (backref (+ i 2))))))
+              ((#\Q #\E) (illegal))
+              (else
+               (if (jsc-latin-char? c)
+                   (illegal)
+                   (char (char->integer c) (+ i 2))))))))
+
+    ;; ── character classes (Pattern.clazz / range) ──
+    ;; One class member that is not [, && or ] → (values kind code next)
+    (define (element j)
+      (if (char=? (rf j) #\\)
+          (escape j 'class)
+          (values 'char (char->integer (rf j)) (+ j 1))))
+
+    ;; [ at i → the index after its ]. `members` counts what the class holds
+    ;; so far: a ] closes only a non-empty class, otherwise it is a member, and
+    ;; an && with nothing on either side is the JVM's "Bad class syntax".
+    (define (cclass i)
+      (let* ((j (+ i 1))
+             (j (if (and (< j n) (char=? (rf j) #\^)) (+ j 1) j)))
+        (let loop ((j j) (members 0))
+          (cond
+            ((>= j n) (err "Unclosed character class" n -1))
+            ((char=? (rf j) #\[) (loop (cclass j) (+ members 1)))
+            ((and (char=? (rf j) #\&) (< (+ j 1) n) (char=? (rf (+ j 1)) #\&))
+             (if (and (= members 0)
+                      (or (>= (+ j 2) n) (memv (rf (+ j 2)) '(#\] #\&))))
+                 (err "Bad class syntax" (+ j 1))
+                 (loop (+ j 2) members)))
+            ((char=? (rf j) #\])
+             (if (> members 0) (+ j 1) (loop (+ j 1) 1)))
+            (else
+             (let-values (((kind code k) (element j)))
+               (if (and (eq? kind 'char) (< k n) (char=? (rf k) #\-))
+                   ;; a single unit followed by - : a range, unless the - is
+                   ;; itself last, or before ] or a nested [ (then both are
+                   ;; literal)
+                   (cond
+                     ((>= (+ k 1) n) (err "Illegal character range" n))
+                     ((memv (rf (+ k 1)) '(#\] #\[)) (loop k (+ members 1)))
+                     ((and (char=? (rf (+ k 1)) #\\) (< (+ k 2) n)
+                           (memv (rf (+ k 2)) '(#\p #\P)))
+                      ;; a \p cannot end a range; the JVM's escape() refuses it
+                      (err "Illegal/unsupported escape sequence" (+ k 2)))
+                     (else
+                      (let-values (((kind2 code2 k2) (element (+ k 1))))
+                        (if (or (not (eq? kind2 'char))
+                                (and code code2 (< code2 code)))
+                            (err "Illegal character range" (- k2 1))
+                            (loop k2 (+ members 1))))))
+                   (loop k (+ members 1)))))))))
+
+    ;; ── groups (Pattern.group0) ──
+    ;; ( at i → (values next quantifiable?): a flags-only (?i) is not an atom,
+    ;; so a quantifier after it dangles.
+    (define (group i)
+      (define (body j)
+        (let ((k (scan j #f)))
+          (if (>= k n) (err "Unclosed group" n) (values (+ k 1) #t))))
+      (cond
+        ((>= (+ i 1) n) (err "Unclosed group" n))
+        ((not (char=? (rf (+ i 1)) #\?)) (body (+ i 1)))
+        ((>= (+ i 2) n) (err "Unknown inline modifier" n))
+        (else
+         (let ((c2 (rf (+ i 2))))
+           (case c2
+             ((#\: #\= #\! #\>) (body (+ i 3)))
+             ((#\<)
+              (if (and (< (+ i 3) n) (memv (rf (+ i 3)) '(#\= #\!)))
+                  ;; a look-behind body must have a bounded length, which on the
+                  ;; JDK (25) only a back-reference fails; the check runs
+                  ;; before the group is known to be closed
+                  (let* ((before refs) (k (scan (+ i 4) #f)))
+                    (cond ((> refs before)
+                           (err "Look-behind group does not have an obvious maximum length" k -1))
+                          ((>= k n) (err "Unclosed group" n))
+                          (else (values (+ k 1) #t))))
+                  (let-values (((nm k) (groupname (+ i 3))))
+                    (if (member nm seen)
+                        (err (string-append "Named capturing group <" nm "> is already defined")
+                             (- k 1))
+                        (begin (set! seen (cons nm seen))
+                               (body k))))))
+             ((#\$ #\@) (err "Unknown group type" (+ i 2)))
+             (else (flags (+ i 2))))))))
+
+    ;; (?flags) or (?flags:body), j = the first flag. One - switches to the
+    ;; flags being turned off; a second is not a flag.
+    (define (flags j)
+      (let loop ((k j) (minus #f))
+        (cond ((>= k n) (err "Unknown inline modifier" n))
+              ((memv (rf k) '(#\i #\m #\s #\d #\u #\x #\U #\c)) (loop (+ k 1) minus))
+              ((and (char=? (rf k) #\-) (not minus)) (loop (+ k 1) #t))
+              ((char=? (rf k) #\)) (values (+ k 1) #f))
+              ((char=? (rf k) #\:)
+               (let ((m (scan (+ k 1) #f)))
+                 (if (>= m n) (err "Unclosed group" n) (values (+ m 1) #t))))
+              (else (err "Unknown inline modifier" k)))))
+
+    ;; {n}, {n,}, {n,m} at i → the index after the }
+    (define (brace i)
+      (let ((j (+ i 1)))
+        (if (or (>= j n) (not (jsc-digit? (rf j))))
+            (err "Illegal repetition" j)
+            (let ((k (let loop ((k j))
+                       (if (and (< k n) (jsc-digit? (rf k))) (loop (+ k 1)) k))))
+              (cond
+                ((>= k n) (err "Unclosed counted closure" n))
+                ((char=? (rf k) #\}) (+ k 1))
+                ((char=? (rf k) #\,)
+                 (let ((m (let loop ((m (+ k 1)))
+                            (if (and (< m n) (jsc-digit? (rf m))) (loop (+ m 1)) m))))
+                   (cond
+                     ((>= m n) (err "Unclosed counted closure" n))
+                     ((not (char=? (rf m) #\})) (err "Unclosed counted closure" m))
+                     ((and (> m (+ k 1))
+                           (< (string->number (substring s (+ k 1) m))
+                              (string->number (substring s j k))))
+                      (err "Illegal repetition range" m))
+                     (else (+ m 1)))))
+                (else (err "Unclosed counted closure" k)))))))
+
+    ;; ── sequences (Pattern.expr / sequence / closure) ──
+    ;; From i to the end or, below the top, to the ) that closes the group.
+    ;; `prev` says whether a quantifier has an atom to apply to.
+    (define (scan i top?)
+      (let loop ((i i) (prev #f))
+        (if (>= i n)
+            i
+            (let ((c (rf i)))
+              (case c
+                ((#\)) (if top? (err "Unmatched closing ')'" i -1) i))
+                ((#\\)
+                 (let-values (((kind code k) (escape i (if top? 'top 'group))))
+                   (loop k #t)))
+                ((#\[) (loop (cclass i) #t))
+                ((#\() (let-values (((k p) (group i))) (loop k p)))
+                ((#\* #\+ #\?)
+                 (if prev
+                     (let ((k (+ i 1)))
+                       (loop (if (and (< k n) (memv (rf k) '(#\? #\+))) (+ k 1) k) #f))
+                     (err (string-append "Dangling meta character '" (string c) "'") i)))
+                ((#\{)
+                 (let ((k (brace i)))
+                   (loop (if (and (< k n) (memv (rf k) '(#\? #\+))) (+ k 1) k) #f)))
+                ((#\|) (loop (+ i 1) #f))
+                (else (loop (+ i 1) #t)))))))
+
+    (scan 0 #t))))
+
 (define (java-pattern->sre source)
+  (java-syntax-check source)
   (let ((source (apply-global-x source)))
     (let* ((len (string-length source)))
       (let-values (((opts start) (parse-leading-flags source 0 len)))
@@ -370,6 +935,25 @@
 ;; A miss answers (values #f i) — the caller decides what an unknown escape is.
 ;; No real escape value is #f (they are chars, symbols and lists), so #f is an
 ;; unambiguous sentinel.
+(define (parse-uxxxx src i end)
+  (and (< (+ i 3) end)
+       (hex-value (string-ref src i)) (hex-value (string-ref src (+ i 1)))
+       (hex-value (string-ref src (+ i 2))) (hex-value (string-ref src (+ i 3)))
+       (+ (* 4096 (hex-value (string-ref src i)))
+          (* 256 (hex-value (string-ref src (+ i 1))))
+          (* 16 (hex-value (string-ref src (+ i 2))))
+          (hex-value (string-ref src (+ i 3))))))
+
+;; Java's \h and \v (JDK 8+): horizontal whitespace is
+;; [ \t\xA0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000], vertical is
+;; [\n\x0B\f\r\x85\u2028\u2029]. Both used to fall through to the literal
+;; letter.
+(define horizontal-ws-sre
+  '(or #\space #\tab #\xA0 #\x1680 #\x180E (/ #\x2000 #\x200A) #\x202F #\x205F #\x3000))
+(define vertical-ws-sre
+  `(or #\newline ,(integer->char #x0B) ,(integer->char #x0C) #\return
+       ,(integer->char #x85) ,(integer->char #x2028) ,(integer->char #x2029)))
+
 (define (parse-escape-shared src i end flags)
   (let ((c (string-ref src i)))
     (case c
@@ -379,7 +963,19 @@
       ((#\W) (values '(~ (or alphanumeric #\_)) (+ i 1)))
       ((#\s) (values 'whitespace (+ i 1)))
       ((#\S) (values '(~ whitespace) (+ i 1)))
+      ((#\h) (values horizontal-ws-sre (+ i 1)))
+      ((#\H) (values `(~ ,horizontal-ws-sre) (+ i 1)))
+      ((#\v) (values vertical-ws-sre (+ i 1)))
+      ((#\V) (values `(~ ,vertical-ws-sre) (+ i 1)))
       ((#\p #\P) (parse-prop c src i end))
+      ;; Two escapes the JVM compiles and jolt cannot build, refused as syntax
+      ;; errors rather than matched as the literal letter (which is what an
+      ;; unknown escape falls to below): \N{NAME} needs the Unicode name table,
+      ;; \X the grapheme-cluster rules. known-divergences.edn carries both.
+      ((#\N)
+       (java-re-error "\\N{name} is unsupported on jolt (no Unicode character name table)" i))
+      ((#\X)
+       (java-re-error "\\X (extended grapheme cluster) is unsupported on jolt" i))
       ((#\e) (values (integer->char #x1B) (+ i 1)))
       ((#\t) (values #\tab (+ i 1)))
       ((#\n) (values #\newline (+ i 1)))
@@ -408,17 +1004,28 @@
                            (hex-value (string-ref src (+ i 2))))))
                  (values (integer->char v) (+ i 3)))
                (values #\x (+ i 1)))))
+      ;; \uXXXX. The JVM reads a high surrogate followed by \u + a low surrogate
+      ;; as the one supplementary code point they encode (Pattern.u()), which is
+      ;; how a pattern spells an emoji in Java source. A lone surrogate is a
+      ;; legal Java char but not a Chez one — a jolt string cannot hold it — so
+      ;; it is refused (known-divergences.edn), not silently read as something
+      ;; else.
       ((#\u)
-       (if (and (< (+ i 4) end) (hex-value (string-ref src (+ i 1)))
-                (hex-value (string-ref src (+ i 2)))
-                (hex-value (string-ref src (+ i 3)))
-                (hex-value (string-ref src (+ i 4))))
-           (let ((cp (+ (* 4096 (hex-value (string-ref src (+ i 1))))
-                        (* 256 (hex-value (string-ref src (+ i 2))))
-                        (* 16 (hex-value (string-ref src (+ i 3))))
-                        (hex-value (string-ref src (+ i 4))))))
-             (values (integer->char cp) (+ i 5)))
-           (values #\u (+ i 1))))
+       (let ((cp (parse-uxxxx src (+ i 1) end)))
+         (if (not cp)
+             (values #\u (+ i 1))
+             (let ((cp2 (and (<= #xD800 cp) (<= cp #xDBFF)
+                             (< (+ i 6) end)
+                             (char=? (string-ref src (+ i 5)) #\\)
+                             (char=? (string-ref src (+ i 6)) #\u)
+                             (parse-uxxxx src (+ i 7) end))))
+               (cond
+                 ((and cp2 (<= #xDC00 cp2) (<= cp2 #xDFFF))
+                  (values (integer->char (+ #x10000 (* (- cp #xD800) #x400) (- cp2 #xDC00)))
+                          (+ i 11)))
+                 ((and (<= #xD800 cp) (<= cp #xDFFF))
+                  (java-re-error "a lone surrogate is unsupported on jolt (strings hold code points, not UTF-16 units)" (+ i 4)))
+                 (else (values (integer->char cp) (+ i 5))))))))
       (else (values #f i)))))
 
 ;; Java-compatible octal: \0 then up to 3 octal digits, value <= 0377. i points
@@ -580,16 +1187,23 @@
                        (sre (prop-class-sre name)))
                   (if sre
                       (values (if (char=? prefix #\P) `(~ ,sre) sre) (+ close 1))
-                      (error 'java-pattern->sre
-                             (string-append "unknown \\p property: " name) src)))))
+                      (java-re-error (prop-unsupported-message name) close)))))
           ;; Brace-less: \pL — single char at i+1 is the property name
           (let* ((ch (string-ref src (+ i 1)))
                  (name (string ch))
                  (sre (prop-class-sre name)))
             (if sre
                 (values (if (char=? prefix #\P) `(~ ,sre) sre) (+ i 2))
-                (error 'java-pattern->sre
-                       (string-append "unknown \\p property: " name) src))))))
+                (java-re-error (prop-unsupported-message name) (+ i 1)))))))
+
+;; A \p name the validator let through is one the JVM knows (a script, a block,
+;; a binary property jolt has no data for); say so rather than call it unknown.
+(define (prop-unsupported-message name)
+  (string-append "\\p{" name "} is unsupported on jolt (no Unicode "
+                 (cond ((and (> (string-length name) 2) (string=? (substring name 0 2) "In")) "block")
+                       ((and (> (string-length name) 2) (string=? (substring name 0 2) "Is")) "script or property")
+                       (else "property"))
+                 " table for it)"))
 
 (define (parse-hex src start end)
   (let loop ((i start) (v 0))
@@ -653,10 +1267,13 @@
         ((null? (cdr members)) (car members))
         (else `(or ,@members))))
 
+;; A - after a member opens a range unless what follows is ] (the - is then a
+;; literal) or a nested [ (the JVM's range() answers the single unit and the
+;; - is a literal too: [a-[b]] is a, -, and the class b).
 (define (maybe-cc-range atom src i end flags cont members)
   (if (and (< i end) (char=? (string-ref src i) #\-)
            (< (+ i 1) end)
-           (not (char=? (string-ref src (+ i 1)) #\])))
+           (not (memv (string-ref src (+ i 1)) '(#\] #\[))))
       (let ((i2 (+ i 1)))
         (let-values (((end-atom i3) (parse-cc-atom src i2 end flags)))
           (cond
@@ -702,7 +1319,7 @@
 (define (parse-group src i end flags depth)
   (let ((i1 (+ i 1)))
     (if (>= i1 end)
-        (error 'java-pattern->sre "unterminated group" src)
+        (java-re-error "Unclosed group" end)
         (let ((c1 (string-ref src i1)))
           (if (not (char=? c1 #\?))
               (parse-capturing-group src i1 end flags depth)
@@ -712,43 +1329,43 @@
   (let-values (((sre i2) (parse-expr src i end flags (+ depth 1))))
     (if (and (< i2 end) (char=? (string-ref src i2) #\)))
         (values `(submatch ,sre) (+ i2 1))
-        (error 'java-pattern->sre "unterminated capturing group" src))))
+        (java-re-error "Unclosed group" end))))
 
 (define (parse-special-group src i end flags depth)
   (if (>= i end)
-      (error 'java-pattern->sre "unterminated group" src)
+      (java-re-error "Unclosed group" end)
       (let ((c (string-ref src i)))
         (case c
           ((#\:)
            (let-values (((sre i2) (parse-expr src (+ i 1) end flags (+ depth 1))))
              (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                  (values sre (+ i2 1))
-                 (error 'java-pattern->sre "unterminated non-capturing group" src))))
+                 (java-re-error "Unclosed group" end))))
           ((#\=)
            (let-values (((sre i2) (parse-expr src (+ i 1) end flags (+ depth 1))))
              (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                  (values `(look-ahead ,sre) (+ i2 1))
-                 (error 'java-pattern->sre "unterminated lookahead" src))))
+                 (java-re-error "Unclosed group" end))))
           ((#\!)
            (let-values (((sre i2) (parse-expr src (+ i 1) end flags (+ depth 1))))
              (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                  (values `(neg-look-ahead ,sre) (+ i2 1))
-                 (error 'java-pattern->sre "unterminated neg-lookahead" src))))
+                 (java-re-error "Unclosed group" end))))
           ((#\<)
            (if (>= (+ i 1) end)
-               (error 'java-pattern->sre "unterminated group" src)
+               (java-re-error "Unclosed group" end)
                (let ((c2 (string-ref src (+ i 1))))
                  (case c2
                    ((#\=)
                     (let-values (((sre i2) (parse-expr src (+ i 2) end flags (+ depth 1))))
                       (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                           (values `(look-behind ,sre) (+ i2 1))
-                          (error 'java-pattern->sre "unterminated lookbehind" src))))
+                          (java-re-error "Unclosed group" end))))
                    ((#\!)
                     (let-values (((sre i2) (parse-expr src (+ i 2) end flags (+ depth 1))))
                       (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                           (values `(neg-look-behind ,sre) (+ i2 1))
-                          (error 'java-pattern->sre "unterminated neg-lookbehind" src))))
+                          (java-re-error "Unclosed group" end))))
                    (else
                     (let ((gt (str-scan-char src #\> (+ i 1) end)))
                       (if (not gt)
@@ -762,7 +1379,7 @@
            (let-values (((sre i2) (parse-expr src (+ i 1) end flags (+ depth 1))))
              (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                  (values `(atomic ,sre) (+ i2 1))
-                 (error 'java-pattern->sre "unterminated atomic group" src))))
+                 (java-re-error "Unclosed group" end))))
            ((#\c #\i #\s #\m #\x #\u #\U #\d #\- #\))
            (parse-inline-flags-group src i end flags depth))
           ((#\#)
@@ -806,7 +1423,7 @@
               (let-values (((sre i2) (parse-expr src (+ j 1) end new-flags (+ depth 1))))
                 (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                     (values (wrap-case-flag sre fs) (+ i2 1))
-                    (error 'java-pattern->sre "unterminated scoped flags group" src)))))
+                    (java-re-error "Unclosed group" end)))))
            ((char=? c #\))
             ;; Unscoped toggle (?i) — parse remainder with new flags
             (let ((new-flags (apply-inline-flags flags fs))
