@@ -1833,7 +1833,12 @@
     (throw-jvm (quote NullPointerException)
                "Cannot invoke \"java.io.File.isAbsolute()\" because \"f\" is null"))
   (let ((p (jfile-path (make-jfile (file-path-of x)))))
-    (when (and (fx>? (string-length p) 0) (char=? (string-ref p 0) #\/))
+    ;; .isAbsolute, not "starts with a separator" — the two agree on POSIX and
+    ;; differ on Windows both ways round: "C:/x" IS absolute and was silently
+    ;; accepted here, and "/x" is NOT (it is rooted on the current drive) yet was
+    ;; rejected. The comment above already says this mirrors .isAbsolute; now it
+    ;; asks it (jolt-lang/jolt#1074).
+    (when (jfile-path-absolute? p)
       (throw-jvm (quote IllegalArgumentException)
                  (string-append p " is not a relative path")))
     p))
@@ -2270,18 +2275,46 @@
 ;; throws, message and all -- new File("/a", null) raises NPE rather than
 ;; answering "/a". jolt read it as "" and quietly answered the parent, the same
 ;; silently-wrong-file shape as the nil coercions above.
+
+;; The rules above, spelled for both platforms. Three things in them are really
+;; questions about the platform rather than about "/":
+;; whether a character is a separator, whether the parent already ends in one,
+;; and which one a join should add. The old spelling asked (string=? p "/"),
+;; which is "is the parent the root" written for the one platform that has
+;; exactly one root — Windows has "C:/", "//srv/sh/" and "/". Since a normalized
+;; path ends in a separator only when it IS a root, asking that directly covers
+;; every root on both platforms and needs no root table.
+;;
+;; The default parent stays "/" for both: WinNTFileSystem.getDefaultParent() is
+;; "\\", which is the same path in the "/" spelling this shim renders with.
+(define (path-ends-with-sep? windows? p)
+  (let ((n (string-length p)))
+    (and (fx>? n 0) (path-sep-for? windows? (string-ref p (fx- n 1))))))
+
+(define (jolt-file-join-for windows? p c)
+  (let ((p (if (string=? p "") "/" p)))
+    (cond
+      ;; an empty child, or one that is nothing but a separator, adds nothing
+      ((or (string=? c "")
+           (and (fx=? (string-length c) 1) (path-sep-for? windows? (string-ref c 0))))
+       p)
+      ;; a child that starts with a separator supplies the join itself, so the
+      ;; parent must not add a second one
+      ((path-sep-for? windows? (string-ref c 0))
+       (if (path-ends-with-sep? windows? p)
+           (string-append p (substring c 1 (string-length c)))
+           (string-append p c)))
+      ((path-ends-with-sep? windows? p) (string-append p c))
+      (else (string-append p (path-join-sep windows? p) c)))))
+
 (define (jolt-file-join parent child)
   (when (jolt-nil? child) (throw-jvm (quote NullPointerException) jolt-nil))
   (let ((c (jolt-path-normalize (file-path-of child))))
     (if (jolt-nil? parent)
         c
-        (let* ((p (jolt-path-normalize (file-path-of parent)))
-               (p (if (string=? p "") "/" p)))
-          (cond ((or (string=? c "") (string=? c "/")) p)
-                ((char=? (string-ref c 0) #\/)
-                 (if (string=? p "/") c (string-append p c)))
-                ((string=? p "/") (string-append p c))
-                (else (string-append p "/" c)))))))
+        (jolt-file-join-for (eq? (sa-os-family) 'windows)
+                            (jolt-path-normalize (file-path-of parent))
+                            c))))
 ;; new File((String)null) throws too, with a null message of its own. Only the
 ;; two-arg form takes a null parent, and there it means "the child alone".
 (define (jolt-file-ctor a . rest)

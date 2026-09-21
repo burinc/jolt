@@ -274,6 +274,57 @@
 (ok "posix prefix"                (npath-starts-with-for #f "/a/b" "/a"))
 (ok "posix absolute vs relative"  (not (npath-starts-with-for #f "/a/b" "a")))
 
+;; --- the two-arg File constructor's resolve ----------------------------------
+;; FileSystem.resolve(parent, child). Every POSIX row here is the JVM's own
+;; answer, taken from a real JDK run, because this is the behaviour the rewrite
+;; had to preserve exactly; the Windows rows are the ones a Linux runner cannot
+;; reach. The old code asked (string=? p "/") — "is the parent the root", written
+;; for the one platform that has a single root.
+(define (join label windows? p c want)
+  (same label (jolt-file-join-for windows? p c) want))
+(join "posix child"                 #f "/a/b" "c"   "/a/b/c")
+(join "posix rooted child"          #f "/a/b" "/c"  "/a/b/c")
+(join "posix empty child"           #f "/a/b" ""    "/a/b")
+(join "posix separator child"       #f "/a/b" "/"   "/a/b")
+(join "posix root parent"           #f "/"    "c"   "/c")
+(join "posix root parent, rooted child" #f "/" "/c" "/c")
+(join "posix root parent, empty"    #f "/"    ""    "/")
+(join "posix empty parent defaults to the root" #f "" "c" "/c")
+(join "posix relative parent"       #f "a"    "b"   "a/b")
+(join "posix relative parent, rooted child" #f "a" "/b" "a/b")
+(join "posix nested child"          #f "/a"   "b/c" "/a/b/c")
+
+;; Windows: a backslash is a separator too, and every root ends in one — so the
+;; drive root joins without doubling, exactly as "/" does on POSIX.
+(join "windows drive root parent"   #t "C:/"  "c"        "C:/c")
+(join "windows drive root, rooted child" #t "C:/" "/c"   "C:/c")
+(join "windows drive root, backslash child" #t "C:/" "\\c" "C:/c")
+(join "windows drive parent"        #t "C:/a" "b"        "C:/a/b")
+(join "windows drive parent, rooted child" #t "C:/a" "/b" "C:/a/b")
+(join "windows native parent keeps backslashes" #t "C:\\a" "b" "C:\\a\\b")
+(join "windows native parent, backslash child" #t "C:\\a" "\\b" "C:\\a\\b")
+(join "windows UNC root parent"     #t "//srv/sh/" "c"   "//srv/sh/c")
+(join "windows UNC parent"          #t "//srv/sh/a" "b"  "//srv/sh/a/b")
+(join "windows separator child alone" #t "C:/a" "\\"   "C:/a")
+(join "windows empty child"         #t "C:/a" ""         "C:/a")
+;; on POSIX a backslash is an ordinary character, so it is a plain child name
+;; and the join still adds a "/"
+(join "posix backslash child is a name" #f "/a" "\\b"  "/a/\\b")
+
+;; --- as-relative-path asks .isAbsolute ---------------------------------------
+;; io/file puts every child through it, so a wrong answer either rejects a legal
+;; call or silently joins an absolute path onto a parent.
+(define (rel label windows? p absolute?)
+  (ok label (eq? (jfile-path-absolute-for? windows? p) absolute?)))
+(rel "posix rooted child is rejected"      #f "/c"  #t)
+(rel "posix relative child is kept"        #f "c"   #f)
+(rel "posix nested relative child is kept" #f "a/b" #f)
+;; the two Windows rows the old leading-"/" test got backwards, both ways round
+(rel "windows drive child IS absolute"     #t "C:/c" #t)
+(rel "windows current-drive child is NOT"  #t "/c"   #f)
+(rel "windows UNC child IS absolute"       #t "//srv/sh/c" #t)
+(rel "windows relative child is kept"      #t "c"    #f)
+
 ;; --- java.io.tmpdir ----------------------------------------------------------
 ;; TMPDIR is the POSIX spelling; Windows sets TEMP and TMP and not TMPDIR, so
 ;; the old chain answered "/tmp" on a drive nobody chose.
