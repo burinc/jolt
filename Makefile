@@ -967,7 +967,7 @@ directlink:
 	@$(CHEZ) --script test/chez/directlink-test.ss
 
 # Unique anon-fn letrec names + source-form registration (R1): a user-ns anon
-# literal registers jfn$<ns>$<def>$<n> -> {form, ns, free-names} and the live
+# literal registers jfn$<ns>/<def>$<n> -> {form, ns, free-names} and the live
 # closure's inspector name must agree; system-ns closures stay unregistered.
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss
@@ -1279,13 +1279,32 @@ hooks:
 	@for h in tools/git-hooks/*; do cp "$$h" ".git/hooks/$$(basename "$$h")"; chmod +x ".git/hooks/$$(basename "$$h")"; echo "installed .git/hooks/$$(basename "$$h")"; done
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
-# The oracle version is READ from the committed profile, which certify.clj also
-# checks the running Clojure against — so the pin has one source, and bumping the
-# oracle is a profile edit rather than two edits that can drift apart.
+# The oracle's Clojure version AND JDK are READ from the committed profile, which
+# certify.clj also checks the running oracle against — so each pin has one source,
+# and bumping the oracle is a profile edit rather than two edits that can drift
+# apart. The clojure launcher runs JAVA_CMD first, else whatever java is first on
+# PATH — on a machine with several JDKs that is rarely the pinned one, and a
+# mismatched JDK reports its own java.* changes as jolt divergences. With
+# JAVA_CMD unset, look for the pinned JDK in the usual places (Homebrew, the
+# Linux jvm directory, macOS java_home) and hand it to the launcher; certify.clj
+# still refuses whatever JDK actually runs if it is not the pinned one.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
 		v=$$(sed -n 's/^ :clojure-version "\([^"]*\)".*/\1/p' test/conformance/profile.edn); \
 		if [ -z "$$v" ]; then echo "certify: no :clojure-version in test/conformance/profile.edn"; exit 1; fi; \
+		jdk=$$(sed -n 's/^ :oracle-jdk \([0-9]*\).*/\1/p' test/conformance/profile.edn); \
+		if [ -z "$$jdk" ]; then echo "certify: no :oracle-jdk in test/conformance/profile.edn"; exit 1; fi; \
+		if [ -z "$$JAVA_CMD" ]; then \
+			for c in /opt/homebrew/opt/openjdk@$$jdk/bin/java /usr/local/opt/openjdk@$$jdk/bin/java \
+			         /usr/lib/jvm/java-$$jdk-openjdk*/bin/java /usr/lib/jvm/temurin-$$jdk-jdk*/bin/java \
+			         /usr/lib/jvm/java-$$jdk-*/bin/java; do \
+				if [ -x "$$c" ]; then JAVA_CMD="$$c"; break; fi; \
+			done; \
+			if [ -z "$$JAVA_CMD" ] && [ -x /usr/libexec/java_home ]; then \
+				h=$$(/usr/libexec/java_home -v "$$jdk" 2>/dev/null) && [ -x "$$h/bin/java" ] && JAVA_CMD="$$h/bin/java"; \
+			fi; \
+			if [ -n "$$JAVA_CMD" ]; then echo "certify: JAVA_CMD=$$JAVA_CMD (profile pins JDK $$jdk)"; export JAVA_CMD; fi; \
+		fi; \
 		deps="{:deps {org.clojure/clojure {:mvn/version \"$$v\"}}}"; \
 		clojure -Sdeps "$$deps" -M test/conformance/certify.clj --self-test && \
 		clojure -Sdeps "$$deps" -M test/conformance/certify.clj; \

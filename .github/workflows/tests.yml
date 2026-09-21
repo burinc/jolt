@@ -100,8 +100,9 @@ jobs:
           # The runner image puts an older Temurin's java first on PATH, and the
           # clojure launcher runs that (JAVA_HOME is only its fallback when no
           # java is on PATH). JAVA_CMD is the launcher's first choice: point it
-          # at the JDK just installed (the corpus is measured on JDK 21+, and
-          # certify.clj refuses an older oracle).
+          # at the JDK just installed (the corpus is measured on the JDK
+          # test/conformance/profile.edn pins as :oracle-jdk, and certify.clj
+          # refuses any other).
           echo "JAVA_CMD=/usr/lib/jvm/default-java/bin/java" >> "$GITHUB_ENV"
           echo "JAVA_HOME=/usr/lib/jvm/default-java" >> "$GITHUB_ENV"
           clojure --version

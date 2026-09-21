@@ -1113,7 +1113,7 @@
 (let* ((fn-form (list->cseq (list (jolt-symbol #f "fn*")
                                   (apply jolt-vector (list (jolt-symbol #f "x")))
                                   (list->cseq (list (jolt-symbol #f "x"))))))
-       (bad (make-image-fnsrc "jfn$r3$bad$0" fn-form "user"
+       (bad (make-image-fnsrc "jfn$r3/bad$0" fn-form "user"
                               (apply jolt-vector (list (jolt-symbol #f "x")))
                               (vector 1 2))))
   (ok "malformed fnsrc record refuses with a named error"
@@ -1138,14 +1138,14 @@
       (put-string p "(load \"host/chez/scheme-adapter-runtime.ss\")\n")
       (put-string p "(load \"host/chez/rt.ss\")\n")
       (put-string p "(guard (e (#t (display (condition->message-string e)) (newline)))\n")
-      (put-string p "  (image-eval-fnsrc (make-image-fnsrc \"jfn$r3$nce$0\" '() \"user\" '() (vector)) '()))\n"))
+      (put-string p "  (image-eval-fnsrc (make-image-fnsrc \"jfn$r3/nce$0\" '() \"user\" '() (vector)) '()))\n"))
     'replace)
   (let* ((rc (system (string-append chez-bin " --script " probe " > " out " 2>&1")))
          (msg (read-file-string out)))
     (ok "compiler-dropped build refuses fnsrc restore, naming the fn"
         (and (fx=? rc 0)
              (str-contains? msg "no compiler")
-             (str-contains? msg "jfn$r3$nce$0")))
+             (str-contains? msg "jfn$r3/nce$0")))
     (delete-file probe)
     (delete-file out)))
 

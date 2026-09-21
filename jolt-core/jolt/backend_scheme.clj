@@ -453,11 +453,14 @@
 (defn- direct-link-fn? [ns nm]
   (contains? @(:direct-link-fns (cur)) (dl-fqn ns nm)))
 
-;; recur-target and the set of munged local names known to hold a procedure (a
-;; named fn's self-recursion name) are lexically scoped — dynamic vars so the
+;; recur-target and the munged local names known to hold a procedure (a named
+;; fn's self-recursion name) are lexically scoped — dynamic vars so the
 ;; recursion auto-restores them (no manual save/restore, no throw-leak).
+;; *known-procs* maps each such name to the fn's trace site (the name its frame
+;; carries: ns/name for a def's direct init, the registry label for a nested
+;; literal), so a call site inside it records the same name the frame reports.
 (def ^:dynamic *recur-target* nil)
-(def ^:dynamic *known-procs* #{})
+(def ^:dynamic *known-procs* {})
 ;; munged local name -> the Scheme name holding its backing flvector, for the
 ;; ^doubles PARAMS of the arities being emitted. emit-arity-clause binds one per
 ;; such param at entry ((_av$N (jolt-array-vec-of a))), and a proven aget/aset
@@ -467,9 +470,12 @@
 ;; nested arity's params, a catch binding) drops the name for its scope, so an
 ;; inner `a` bound to some other array never reads the outer one's vector.
 (def ^:dynamic *array-vecs* {})
-;; When set (in the :def emit path), fns are emitted with a qualified letrec
-;; binding (ns/name) so Chez reports a unique per-var frame name — no collisions
-;; across namespaces. Nested/anonymous fns ignore it (they never register).
+;; When set (in the :def emit path), the def's direct named init is emitted with
+;; a qualified letrec binding (ns/name) so Chez reports a unique per-var frame
+;; name — no collisions across namespaces — and that name is what the source
+;; registry keys the def's record on. A nested named literal is bound under its
+;; registry label instead (emit-fn), never under ns/name: that name is not
+;; unique per literal, and it reads as a var the namespace does not have.
 (def ^:dynamic *qualifying-ns* nil)
 ;; Set while emitting the init of a def whose value is an ANONYMOUS fn. Such a fn
 ;; is emitted bare so the enclosing (define jv$ns/name …) names the procedure and
@@ -558,9 +564,9 @@
 ;; The static callee fqn of a call site's fn head, or nil for a genuinely dynamic
 ;; callee (an arbitrary IFn through jolt-invoke — register nothing for that line).
 ;; :var — the var's fqn, matching the qualified name a source-registered frame
-;; reports; :local — a known procedure (self / a letrec-bound named fn): its
-;; qualified name, or the enclosing fn's *trace-site* for a self-call; :keyword /
-;; :coll / computed callees — nil.
+;; reports; :local — a known procedure (self / an enclosing named fn): the site
+;; its frame carries (*known-procs*), or the enclosing fn's *trace-site* for a
+;; self-call; :keyword / :coll / computed callees — nil.
 (defn- static-callee [fnode]
   (case (:op fnode)
     ;; The registered name must be the SAME form the callee's own *trace-site*
@@ -572,10 +578,8 @@
            (str (munge-name (:ns fnode)) "/" (munge-name (:name fnode)))
            (munge-name (:name fnode)))
     :local (let [nm (munge-name (:name fnode))]
-             (when (contains? *known-procs* nm)
-               (if (contains? *trace-self* nm)
-                 *trace-site*
-                 (if *qualifying-ns* (str (munge-name *qualifying-ns*) "/" nm) nm))))
+             (when-let [site (get *known-procs* nm)]
+               (if (contains? *trace-self* nm) *trace-site* site)))
     nil))
 ;; The def-emit sibling: one (jolt-register-callsite! …) per collected (line,
 ;; callee) entry, or "" when tracing is off / nothing collected — the seed mint
@@ -2101,18 +2105,26 @@
                      :else lett)]))
 
 ;; The globally unique letrec name for the next anon literal:
-;; jfn$<munged-ns>$<munged-def>$<counter> (counter per top-level def);
-;; literals outside any def use jfn$<munged-ns>$$<counter>, with the counter
-;; per NAMESPACE for the life of the process. Per top-level form, every
-;; deftype method body and every defmethod in a namespace started at $$0 and
-;; their registrations (keyed by name) overwrote each other, so an image
-;; restore of one such closure came back with the LAST form's source.
-;; Deterministic still: one mint or build emits a namespace's forms in source
-;; order, so the same source emits the same names.
+;; jfn$<ns>/<def>$<counter> (counter per top-level def); literals outside any
+;; def use jfn$<ns>/$<counter>, with the counter per NAMESPACE for the life of
+;; the process. Per top-level form, every deftype method body and every
+;; defmethod in a namespace started at $0 and their registrations (keyed by
+;; name) overwrote each other, so an image restore of one such closure came
+;; back with the LAST form's source. Deterministic still: one mint or build
+;; emits a namespace's forms in source order, so the same source emits the
+;; same names.
+;;
+;; The parts are munge-chars, not munge-name: the jfn$ prefix already keeps
+;; the whole name off every reserved word. The separator is `/` because no
+;; escape can forge it: munge-chars never emits one and the reader never lets
+;; one into a namespace or def name. With `$` as the separator, ns "a$" + def
+;; "c" and ns "a" + def "$c" both spelled jfn$a$$$c$0, and the second
+;; registration silently replaced the first.
 (def ^:private fnsrc-ns-counters (atom {}))
 (defn- fnsrc-name []
-  (str "jfn$" (munge-name *fnsrc-ns*)
-       (if *fnsrc-def* (str "$" (munge-name *fnsrc-def*) "$") "$$")
+  (str "jfn$" (munge-chars *fnsrc-ns*) "/"
+       (if *fnsrc-def* (munge-chars *fnsrc-def*) "")
+       "$"
        (if *fnsrc-def*
          (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)
          (let [k (str *fnsrc-ns*)
@@ -2121,7 +2133,7 @@
            n))))
 
 ;; A top-level form's collected anon-fn registrations as Scheme siblings:
-;;   (image-register-fn-form! "jfn$..." (image-fn-form-src "<source text>") "ns" <quoted free names>)
+;;   (image-register-fn-form! "jfn$ns/def$0" (image-fn-form-src "<source text>") "ns" <quoted free names>)
 ;; "" when the namespace is system or nothing was collected, so any fn-free def
 ;; emits byte-identically.
 ;;
@@ -2294,14 +2306,20 @@
         ;; a named fn binds its own name as a known-procedure local across ALL
         ;; arities, so self-calls emit directly rather than via jolt-invoke.
         self (when-let [nm (:name node)] (munge-name nm))
-        ;; When *qualifying-ns* is set (the :def runtime-eval path), bind the
-        ;; letrec under a qualified name (ns/name) so Chez reports a unique
-        ;; per-var frame name. Nested/anonymous fns ignore it (self is nil).
-        qname (when (and self *qualifying-ns*)
+        ;; When *qualifying-ns* is set (the :def runtime-eval path), a def's
+        ;; DIRECT named init binds its letrec under a qualified name (ns/name) so
+        ;; Chez reports a unique per-var frame name — the source registry's key
+        ;; for the def. A nested named literal is not the var's root: it binds
+        ;; under its registry label below, on this path as on every other. Bound
+        ;; under ns/name too, it was never registered (the qualified branch
+        ;; skipped registration), so a closure over a letfn-bound fn dumped from
+        ;; a build and refused from a `jolt run` session; and two defs' inner
+        ;; `mapi`s shared one frame name that read as a var named mapi.
+        qname (when (and self *qualifying-ns* def-init?)
                 (str (munge-name *qualifying-ns*) "/" self))
         ;; the unique name is allocated BEFORE the arity bodies emit, so an
         ;; enclosing literal numbers ahead of the literals nested inside it
-        ;; (document order — jfn$ns$def$0 is the outermost)
+        ;; (document order — jfn$ns/def$0 is the outermost)
         ;; The namespace the literal's SOURCE was written in: this one, or the
         ;; callee's when the inline pass copied it here. Both are checked against
         ;; the system split, so a core literal spliced into user code stays
@@ -2311,10 +2329,14 @@
         ;; A literal registers whether or not it has a NAME. It used to have to be
         ;; anonymous, because the registry is keyed on the name Chez reports and a
         ;; named fn is bound under its own munged name, which is not unique -- two
-        ;; `mapi`s in two fns would collide. So a named one is bound under
-        ;; <name>$jf<n> instead and its short name aliases that: unique for the
-        ;; registry, still readable in a backtrace (source-registry strips the
-        ;; suffix, as it already does for the splicer's __ilN).
+        ;; `mapi`s in two fns would collide. So a named one is bound under the
+        ;; anon label plus its name, jfn$<ns>/<def>$<n>/<name>, and its short
+        ;; name aliases that: unique for the registry, and a backtrace shows it
+        ;; as <ns>/<def>/<name> (source-registry srcreg-display-name), the way
+        ;; clojure.stacktrace demunges user$f$mapi__12. It was <name>$jf<n> with
+        ;; the counter per def, so `mapi` in two defs — or in two namespaces —
+        ;; was mapi$jf0 in both, and an image restore of the first closure came
+        ;; back with the second's source.
         ;;
         ;; This is what map-indexed, distinct, dedupe, partition-by and tree-seq
         ;; needed: each closes a lazy-seq thunk over a letfn-bound fn, and that
@@ -2325,9 +2347,11 @@
                             (not (fnsrc-system-ns? fnsrc-src-ns))
                             (:src-form node))
                    (if (:name node)
-                     (str (munge-name (:name node)) "$jf" (let [n @*fnsrc-counter*]
-                                                            (swap! *fnsrc-counter* inc) n))
+                     (str (fnsrc-name) "/" (munge-chars (:name node)))
                      (fnsrc-name)))
+        ;; the name a NAMED fn's frame carries, which is what its tail sites
+        ;; record; nil for an anonymous literal, whose tail sites skip
+        site (when self (or qname fnsrc-nm self))
         ;; --- fn identity -------------------------------------------------
         ;; Chez shares ONE closure object across every evaluation of a lambda
         ;; with no free variables, where Clojure allocates a fresh fn each time.
@@ -2347,9 +2371,9 @@
         ;; allocated.
         force-id? (and (not def-init?) (empty? (:free-names node)))
         id-nm (when force-id? (fresh-label "_fnid$"))
-        clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
-                          *trace-site* (or qname self)
-                          *trace-self* (cond-> #{} self (conj self) qname (conj qname))
+        clauses (binding [*known-procs* (if self (assoc *known-procs* self site) *known-procs*)
+                          *trace-site* site
+                          *trace-self* (cond-> #{} self (conj self) site (conj site))
                           ;; An enclosing letrec's bindings are initialised by the
                           ;; time anything in THIS body runs, so a literal nested
                           ;; here may name one — map-indexed's lazy-seq thunk
@@ -3722,7 +3746,7 @@
 ;; name itself. A macro's expander reaches the image emitter as a BARE fn form —
 ;; ce-defmacro->fn has already split the name off — so the caller supplies it
 ;; here; otherwise every macro in a namespace registers its anon fns under
-;; jfn$<ns>$$<n> with the counter restarting per form, and siblings collide.
+;; jfn$<ns>/$<n> with the counter restarting per form, and siblings collide.
 (defn emit-top-form
   ([node] (emit-top-form node nil))
   ([node fnsrc-def]
@@ -3734,9 +3758,9 @@
   ;; instance holding one refused to dump.
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node) *fnsrc-ns*)
             ;; :defmacro too, not just :def. Without it every defmacro in a
-            ;; namespace emits its expander under jfn$<ns>$$<n> with the counter
+            ;; namespace emits its expander under jfn$<ns>/$<n> with the counter
             ;; restarting per top-level form, so sibling macros all claim
-            ;; jfn$<ns>$$0 — last registration wins, and an image dump of a
+            ;; jfn$<ns>/$0 — last registration wins, and an image dump of a
             ;; closure over an earlier macro's expander restores a different
             ;; macro's source. A defmacro node carries :name exactly as :def
             ;; does, so naming it is all that is needed.

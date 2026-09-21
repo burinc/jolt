@@ -1,4 +1,4 @@
-;; fn-form-registry.ss — map unique anonymous-fn names (jfn$<ns>$<def>$<n>) back
+;; fn-form-registry.ss — map unique fn-literal names (jfn$<ns>/<def>$<n>) back
 ;; to their source form, defining ns, and free local names, so a closure
 ;; captured in a state image can be reconstructed as code (the R2/R3 write/read
 ;; sides of the image work). Registered at load time by emitted code, one
