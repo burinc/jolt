@@ -1166,47 +1166,53 @@
 ;; the parenthetical distinguishes them.
 ;;
 ;; This lives in io.ss rather than next to the stream constructors because slurp
-;; reaches a file through read-file-string-on-disk below, not through
+;; reaches a file through read-file-bytes-on-disk below, not through
 ;; io-streams.ss -- and while that was the only opener NOT classifying, slurp of
 ;; a directory, of an unreadable file and of anything at all under descriptor
 ;; exhaustion all came back as a bare java.io.IOException carrying Chez's own
 ;; wording (jolt-3ah).
 ;;
-;; --- EMFILE is the reason a probe cannot reconstruct ---
-;; The open failed because the PROCESS is out of descriptors, and nothing is
-;; wrong with this path at all.  Re-probing the filesystem cannot see that -- the
-;; file is there and readable -- so the condition itself has to be asked, or the
-;; message blames the file's mode bits for the program's own leak.  The JVM
-;; reports EMFILE as "Too many open files" and so does this now.
-;; Read out of the IRRITANTS, not condition/report-string: Chez's EMFILE
-;; condition carries no i/o-file-name, so report-string raises trying to format
-;; it -- and it raises whether or not descriptors are still exhausted, so there
-;; is no waiting it out either.  The irritants hold what is wanted anyway, as
-;; ("/the/path" "Too many open files").
-(define (io-string-ci-contains? s sub)
-  (let ((n (string-length s)) (m (string-length sub)))
-    (let loop ((i 0))
-      (cond ((fx>? (fx+ i m) n) #f)
-            ((string-ci=? (substring s i (fx+ i m)) sub) #t)
-            (else (loop (fx+ i 1)))))))
-(define (io-emfile-condition? e)
-  (and (condition? e)
-       (let loop ((l (guard (e2 (#t '())) (condition-irritants e))))
-         (cond ((not (pair? l)) #f)
-               ((and (string? (car l)) (io-string-ci-contains? (car l) "too many open files")) #t)
-               (else (loop (cdr l)))))))
+;; --- the reason comes from the condition, not from a second look at the disk ---
+;; What the JVM puts in the parentheses is strerror(errno), and Chez's i/o
+;; conditions carry that very string among their IRRITANTS, as
+;; ("/the/path" "No such file or directory") -- and equally "Permission denied",
+;; "Is a directory", "Too many open files". Both sides are printing the same libc
+;; string, so the condition is what is asked.
+;;
+;; A probe of the filesystem cannot stand in for it. EMFILE is the case that
+;; shows why: the open failed because the PROCESS is out of descriptors and
+;; nothing is wrong with the path at all, so a probe finds a readable file and
+;; blames the program's own leak on the file's mode bits. A parent directory
+;; without +x is the same story inverted -- the open says "Permission denied" and
+;; the probe cannot so much as stat the target, so it would say "No such file or
+;; directory". And whatever the reason, the filesystem can change between the
+;; failure and the probe.
+;;
+;; The IRRITANTS, not condition/report-string: Chez's EMFILE condition carries no
+;; i/o-file-name, so report-string raises trying to format it -- and it raises
+;; whether or not descriptors are still exhausted, so there is no waiting it out.
+;; The reason is the LAST irritant; the first is the path Chez was handed, which
+;; is not always the path being reported (spit opens a temp file and names its
+;; target), so position picks it out rather than identity.
+(define (io-open-reason exc)
+  (and (pair? exc) (condition? (car exc))
+       (let ((irr (guard (e2 (#t (quote ()))) (condition-irritants (car exc)))))
+         (and (pair? irr) (pair? (cdr irr))
+              (let last ((l irr))
+                (cond ((pair? (cdr l)) (last (cdr l)))
+                      ((and (string? (car l)) (fx>? (string-length (car l)) 0)) (car l))
+                      (else #f)))))))
 
-;; EXC is the condition the open raised, when there was one -- it is asked first
-;; because it is the only authoritative account of why the open failed; the
-;; filesystem probes below are a reconstruction after the fact.
+;; EXC is the condition the open raised, when there was one. The probes are the
+;; fallback for the one caller with no condition to offer: open-path-guarded's
+;; directory check, which refuses before it opens.
 (define (file-open-error given resolved . exc)
   (throw-jvm (quote java.io.FileNotFoundException)
              (string-append given " ("
-                            (cond ((and (pair? exc) (io-emfile-condition? (car exc)))
-                                                                 "Too many open files")
-                                  ((not (file-exists? resolved)) "No such file or directory")
-                                  ((file-directory? resolved)    "Is a directory")
-                                  (else                          "Permission denied"))
+                            (or (io-open-reason exc)
+                                (cond ((not (file-exists? resolved)) "No such file or directory")
+                                      ((file-directory? resolved)    "Is a directory")
+                                      (else                          "Permission denied")))
                             ")")))
 
 ;; Opening is guarded rather than pre-checked -- existence and permission can
@@ -1453,7 +1459,7 @@
 (define (slurp-path path)
   (io-note-file-read! path)
   ;; An entry inside a jar has no open to fail, so its absence is still checked
-  ;; here. A path ON DISK is not pre-checked: read-file-string-on-disk opens
+  ;; here. A path ON DISK is not pre-checked: read-file-bytes-on-disk opens
   ;; through open-path-guarded, which reports a missing file the same way and
   ;; also reports the three this used to miss -- a directory, an unreadable
   ;; file, and an open refused because the process is out of descriptors.
@@ -1488,8 +1494,8 @@
         ;; whose readAllBytes is the class's
         ((or (and (jhost? s) (string=? (jhost-tag s) "in-stream"))
              (user-in-stream? s))
-         (utf8->string (na-bytearray->bv
-                        (record-method-dispatch s "readAllBytes" jolt-nil))))
+         (utf8-bytes->string (na-bytearray->bv
+                              (record-method-dispatch s "readAllBytes" jolt-nil))))
         (else (jolt-str-render-one s))))
 ;; slurp over a clojure.core/IReader (what *in* and with-in-str hand out). The
 ;; protocol is line-based — -read-line, -read-form, -read+string, no char read —
@@ -2446,10 +2452,11 @@
 ;;     two characters — so the run is collected and decoded together;
 ;;   - a byte sequence that is not valid UTF-8 becomes U+FFFD rather than
 ;;     raising, since the string already parsed as a URI and the accessor has no
-;;     way to report an error. Chez's utf8->string replaces malformed input
-;;     exactly as the JVM's UTF-8 decoder does (one U+FFFD for "%FF", one for the
-;;     truncated "%E2%82", one for a surrogate's "%ED%A0%80"), so the
-;;     substitution is the host's, not a rule reimplemented here;
+;;     way to report an error. The JVM decodes these through a CharsetDecoder, so
+;;     the run decodes through utf8-bytes->string (natives-str.ss), which is that
+;;     decoder: "%FF" is one U+FFFD and "%C0%AF" is two, where Chez's own
+;;     utf8->string would answer one for both, and "%EF%BB%BF" is U+FEFF rather
+;;     than a signature to swallow;
 ;;   - inside a BRACKETED IPv6 literal a "%" is the scope-id separator, not an
 ;;     escape, so "[fe80::1%25eth0]" must not decode to "[fe80::1%eth0]" — a
 ;;     scope id is written with the "%" escaped and stays that way. The JVM has
@@ -2479,7 +2486,7 @@
                    (run (+ j 3) (cons (+ (* 16 (hexv (string-ref x (+ j 1))))
                                          (hexv (string-ref x (+ j 2))))
                                       bytes))
-                   (begin (set! out (cons (utf8->string (u8-list->bytevector (reverse bytes))) out))
+                   (begin (set! out (cons (utf8-bytes->string (u8-list->bytevector (reverse bytes))) out))
                           (loop j in?)))))
             ;; everything up to the next escape passes through unchanged — but
             ;; the bracket state has to be tracked across it to know what an

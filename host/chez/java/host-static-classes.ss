@@ -248,7 +248,7 @@
 ;; descriptor under it takes the bytes themselves — see pw-write-bytes! below.
 (define (writer-piece-range x rest)
   (cond
-    ((byte-array-arg? x) (utf8->string (byte-array-range x rest)))
+    ((byte-array-arg? x) (utf8-bytes->string (byte-array-range x rest)))
     ((and (pair? rest) (pair? (cdr rest)))
      (let* ((s (writer-piece x))
             (off (max 0 (jnum->exact (car rest))))

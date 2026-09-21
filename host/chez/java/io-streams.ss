@@ -936,7 +936,7 @@
 ;; Every file-opening constructor here opens through this, so a failure arrives
 ;; as the JVM's java.io.FileNotFoundException rather than a raw Chez condition.
 ;; The guard and the classification live in io.ss, which loads first, because
-;; slurp reaches a file WITHOUT passing through here (read-file-string-on-disk)
+;; slurp reaches a file WITHOUT passing through here (read-file-bytes-on-disk)
 ;; and the two have to answer alike; the note above open-path-guarded there says
 ;; what each reason means.
 (define (open-file-guarded src thunk)
@@ -1142,10 +1142,14 @@
       (begin (set-box! stdin-pending-lf #f)
              (let ((b (get))) (if (eqv? b 10) (get) b)))
       (get)))
+;; utf8-bytes->string, not utf8->string: this is the decoder seam for
+;; (read-line) off the process's own stdin, and it answers to the same rules as
+;; every other Reader (natives-str.ss) -- a leading BOM is U+FEFF and not a
+;; signature to swallow, and a malformed run costs what java.nio charges it.
 (define (stdin-line-string buf i)
   (let ((out (make-bytevector i)))
     (bytevector-copy! buf 0 out 0 i)
-    (utf8->string out)))
+    (utf8-bytes->string out)))
 
 ;; The \n of a CRLF, when the port can say it is already sitting there. A port
 ;; that cannot answer, or that has nothing yet, leaves it to the flag: peeking

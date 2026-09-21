@@ -43,6 +43,12 @@ check() {
 check a "$(run '(println (instance? java.io.InputStream System/in))')" "true"
 check a2 "$(run '(println (class System/in))')" "java.io.InputStream"
 
+# stdin is decoded by the same decoder as every other Reader (natives-str.ss
+# utf8-bytes->string), not by Chez's codec: a leading BOM is U+FEFF and an
+# overlong costs one replacement per byte, both as the JVM answers them.
+check b0 "$(run '(println (pr-str [(mapv int (read-line)) (mapv int (read-line))]))' "$(printf '\357\273\277ab\n\300\257c\n')")" \
+  "[[65279 97 98] [65533 65533 99]]"
+
 # --- (b) slurp / read / line-seq over piped stdin -----------------------------
 check b "$(run '(println (slurp System/in))' 'hello stdin')" "hello stdin"
 check c "$(run '(println (pr-str (vec (line-seq (clojure.java.io/reader System/in)))))' 'a
@@ -351,6 +357,25 @@ else
     "$rd_dir/read.txt (Permission denied)"
 fi
 chmod 644 "$rd_dir/read.txt"
+
+# A target under a directory the process cannot write is the case a probe after
+# the fact gets WRONG: the open says EACCES, and re-looking at the filesystem
+# cannot even stat the target, so it would report it missing. The reason is read
+# off the condition instead, so all three doors say what the JVM says.
+mkdir -p "$rd_dir/ro"
+chmod 555 "$rd_dir/ro"
+if [ -w "$rd_dir/ro" ]; then
+  echo "SKIP: (write into an unwritable directory) mode bits do not apply to this user"
+else
+  for form in "(spit \"$rd_dir/ro/x.txt\" \"y\")" \
+              "(clojure.java.io/output-stream \"$rd_dir/ro/x.txt\")" \
+              "(clojure.java.io/writer \"$rd_dir/ro/x.txt\")"; do
+    check "write into an unwritable directory: $form" \
+      "$(run "(println (try $form :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+      "$rd_dir/ro/x.txt (Permission denied)"
+  done
+fi
+chmod 755 "$rd_dir/ro"
 
 # The WRITE side had the same gap, and io/writer had no check at all: it handed
 # back a Writer over a directory and the failure surfaced at close, or never
