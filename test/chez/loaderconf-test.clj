@@ -748,6 +748,38 @@
            (identical? new-cl (l/with-loader* new (fn [] (clojure.lang.RT/baseLoader)))))
       (l/unload! new))))
 
+;; --- 32. the reader follows the file's own namespace -------------------------
+;; A file is read form by form, each after the forms before it ran, so the
+;; namespace its ns form switched to — and the aliases and refers that form
+;; installed — are in force for the reader that expands its syntax quotes.
+;; Reading the whole file up front under the caller's *ns* expanded `v to the
+;; CALLER's v and `bb/v by the caller's aliases, so a macro's expansion named
+;; a var the defining file never mentioned. The host loader read form-by-form,
+;; which is why a plain require from the root never showed this. The caller
+;; here is bound to a decoy namespace holding v 999, so the failure mode is a
+;; wrong value, not just an error.
+(defcase 32 "syntax quotes resolve in the namespace the file declares"
+  (let [d (root-dir "syntaxquote")]
+    (spit (str d "/sqb.clj") "(ns sqb) (def v 42) (defmacro m [] `v)")
+    (spit (str d "/sqa.clj") "(ns sqa (:require [sqb])) (defn f [] (sqb/m))")
+    (spit (str d "/sqc.clj") "(ns sqc (:require [sqb :as bb])) (defmacro m [] `bb/v)")
+    (spit (str d "/sqd.clj") "(ns sqd (:require [sqc])) (defn f [] (sqc/m))")
+    (spit (str d "/sqe.clj") "(ns sqe (:require [sqb :refer [v]])) (defmacro m [] `v)")
+    (spit (str d "/sqf.clj") "(ns sqf (:require [sqe])) (defn f [] (sqe/m))")
+    (let [ctx (l/classpath [d])
+          decoy (create-ns 'loaderconf-decoy)
+          _ (intern decoy 'v 999)]
+      (binding [*ns* decoy]
+        (l/load ctx {:kind :ns :name "sqa"})
+        (l/load ctx {:kind :ns :name "sqd"})
+        (l/load ctx {:kind :ns :name "sqf"}))
+      (chk "a plain syntax quote resolves in the defining namespace"
+           (= 42 ((val-of (l/resolve ctx {:kind :var :name "sqa/f"})))))
+      (chk "a syntax-quoted alias resolves through the defining namespace's aliases"
+           (= 42 ((val-of (l/resolve ctx {:kind :var :name "sqd/f"})))))
+      (chk "a syntax-quoted referred symbol resolves through the defining namespace"
+           (= 42 ((val-of (l/resolve ctx {:kind :var :name "sqf/f"}))))))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])
