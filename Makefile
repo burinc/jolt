@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath winplatform statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
@@ -1195,6 +1195,22 @@ regexreplace:
 # CI runs on, so the platform (and realpath itself) is a parameter.
 winpath:
 	@$(CHEZ) --script test/chez/win-path-test.ss
+
+# The rest of the Windows answers a Linux runner cannot observe (#1074): the
+# PATH-LIST separator (";" there, because ":" is the drive suffix, so a ":"-split
+# cut every entry in half and fs/which never found anything), the ProcessBuilder
+# program resolver (";"-split PATH, drive-rooted and UNC programs, PATHEXT), the
+# java.nio.file Path root (a drive path read as relative, so fs/absolute? was
+# false and getParent walked off the drive letter), java.io.tmpdir (TMPDIR only,
+# which Windows does not set), File/listRoots, and the replace-rename that spit
+# and the AOT publish steps depend on — Windows refuses a rename onto an
+# existing destination, so the second spit to any path threw. Same arrangement
+# as winpath and hostprops: the platform is a parameter, so the rows that broke
+# are pinned from the host CI runs on. The end-to-end half, which needs a real
+# Windows filesystem, PATH and process table, is the windows-deps job in
+# .github/workflows/tests.yml.
+winplatform:
+	@$(CHEZ) --script test/chez/win-platform-test.ss
 
 # The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
 # enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file

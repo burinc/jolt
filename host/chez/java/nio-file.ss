@@ -17,87 +17,135 @@
 (define files-accum-chunks '())
 
 ;; ---- path string algebra ----------------------------------------------------
-(define (npath-absolute? s) (and (> (string-length s) 0) (char=? (string-ref s 0) #\/)))
+;; A Path is a name, and a name has a ROOT: a prefix that is not a segment and
+;; must be reproduced verbatim. POSIX has one ("/"); Windows has "C:/" (drive),
+;; "//srv/sh/" (UNC), "/" (rooted on the process's current drive) and "C:"
+;; (rooted on that drive's current directory). This file assumed the POSIX shape
+;; everywhere — the root was one leading "/" and nothing else — so on Windows a
+;; drive path was a RELATIVE path whose first segment happened to be "C:".
+;; (fs/absolute? "C:/Windows/System32") answered false, getRoot answered nil,
+;; getParent walked off the drive letter and normalize could fold a path above
+;; its own root (jolt-lang/jolt#1074).
+;;
+;; java/io.ss already owns this split for getCanonicalPath — path-root,
+;; path-segments and path-rebuild, with the platform a parameter so
+;; win-path-test.ss can pin the Windows rows from a Linux runner — so the Path
+;; shim asks IT rather than keeping a second, POSIX-only answer. Two hand-kept
+;; copies is how java.io and java.nio.file start disagreeing about a path, which
+;; is the same reason the access(2) predicate there is one function for all six
+;; of its callers.
+(define (nio-windows?) (eq? (sa-os-family) 'windows))
 
-;; The non-empty "/"-separated segments of a path.
-(define (npath-segs s)
-  (let loop ((i 0) (start 0) (acc '()))
-    (cond
-      ((= i (string-length s))
-       (reverse (if (> i start) (cons (substring s start i) acc) acc)))
-      ((char=? (string-ref s i) #\/)
-       (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring s start i) acc) acc)))
-      (else (loop (+ i 1) start acc)))))
+;; isAbsolute is NOT "has a root". On Windows "\x" is rooted on whichever drive
+;; the process is on and "C:x" on that drive's current directory; the JVM calls
+;; neither absolute, because neither names a file by itself. getRoot answers for
+;; both, which is why the two questions stay separate here.
+(define (npath-absolute-for? windows? s) (jfile-path-absolute-for? windows? s))
+(define (npath-absolute? s) (npath-absolute-for? (nio-windows?) s))
 
-(define (npath-join-segs abs? segs)
-  (let ((body (let loop ((ss segs) (out ""))
-                (cond ((null? ss) out)
-                      ((string=? out "") (loop (cdr ss) (car ss)))
-                      (else (loop (cdr ss) (string-append out "/" (car ss))))))))
-    (cond (abs? (string-append "/" body))
-          ((string=? body "") "")
-          (else body))))
+(define (npath-root-for windows? s) (path-root windows? s))
+(define (npath-root s) (npath-root-for (nio-windows?) s))
+(define (npath-rooted-for? windows? s) (not (string=? (npath-root-for windows? s) "")))
 
-;; java.nio.file normalize: drop ".", resolve ".." against the preceding segment.
-(define (npath-normalize s)
-  (let ((abs? (npath-absolute? s)))
-    (let loop ((ss (npath-segs s)) (stack '()))
-      (if (null? ss)
-          (let ((segs (reverse stack)))
-            (cond ((and (null? segs) abs?) "/")
-                  ((null? segs) "")
-                  (else (npath-join-segs abs? segs))))
-          (let ((seg (car ss)))
-            (cond
-              ((string=? seg ".") (loop (cdr ss) stack))
-              ((string=? seg "..")
-               (cond
-                 ((and (pair? stack) (not (string=? (car stack) "..")))
-                  (loop (cdr ss) (cdr stack)))
-                 (abs? (loop (cdr ss) stack))          ; /.. stays at root
-                 (else (loop (cdr ss) (cons ".." stack)))))
-              (else (loop (cdr ss) (cons seg stack)))))))))
+(define (npath-segs-for windows? s) (path-segments windows? s))
+(define (npath-segs s) (npath-segs-for (nio-windows?) s))
+
+;; path-rebuild answers "." for a rootless path with no segments, which is what
+;; a canonical path wants; java.nio.file's empty path is "".
+(define (npath-rebuild root segs)
+  (if (and (null? segs) (string=? root "")) "" (path-rebuild root segs)))
+
+;; java.nio.file normalize: drop ".", resolve ".." against the preceding
+;; segment. A ".." that reaches past a ROOT is dropped — a rooted path stays
+;; rooted — while one that reaches past a relative path survives, because
+;; "../x" is a real name. (io.ss's fold-dot-segments drops it either way, which
+;; is right for a canonical path, since a canonical path is always rooted.)
+(define (npath-fold-dots rooted? segs)
+  (let loop ((ss segs) (stack '()))
+    (if (null? ss)
+        (reverse stack)
+        (let ((seg (car ss)))
+          (cond
+            ((string=? seg ".") (loop (cdr ss) stack))
+            ((string=? seg "..")
+             (cond
+               ((and (pair? stack) (not (string=? (car stack) "..")))
+                (loop (cdr ss) (cdr stack)))
+               (rooted? (loop (cdr ss) stack))
+               (else (loop (cdr ss) (cons ".." stack)))))
+            (else (loop (cdr ss) (cons seg stack))))))))
+
+(define (npath-normalize-for windows? s)
+  (let ((root (npath-root-for windows? s)))
+    (npath-rebuild root (npath-fold-dots (not (string=? root ""))
+                                         (npath-segs-for windows? s)))))
+(define (npath-normalize s) (npath-normalize-for (nio-windows?) s))
 
 ;; Paths.get(first, more...) — join with the separator, no normalization. The
 ;; varargs `more` arrives as a jolt String[] (from into-array); spread it.
 (define (npath-spread-args args)
   (apply append (map (lambda (x) (if (jolt-array? x) (ja->list x) (list x))) args)))
+;; A joined path keeps the separator the left side is already spelled with
+;; (java/io.ss path-join-sep), so a native "C:\\Users\\x" gains "\\" and everything
+;; else gains "/"; a separator the caller already wrote — either kind, on
+;; Windows — is not doubled.
+(define (npath-join-for windows? parts)
+  (fold-left (lambda (acc p)
+               (cond ((string=? p "") acc)
+                     ((string=? acc "") p)
+                     ((path-sep-for? windows? (string-ref acc (- (string-length acc) 1)))
+                      (string-append acc p))
+                     (else (string-append acc (path-join-sep windows? acc) p))))
+             "" parts))
 (define (npath-get first . more)
-  (let ((s (fold-left (lambda (acc x)
-                        (let ((p (npath-string-of x)))
-                          (cond ((string=? p "") acc)
-                                ((string=? acc "") p)
-                                ((char=? (string-ref acc (- (string-length acc) 1)) #\/)
-                                 (string-append acc p))
-                                (else (string-append acc "/" p)))))
-                      (npath-string-of first) (npath-spread-args more))))
-    (make-nio-path s)))
+  (make-nio-path (npath-join-for (nio-windows?)
+                                 (cons (npath-string-of first)
+                                       (map npath-string-of (npath-spread-args more))))))
 
 ;; Path.resolve(other): an absolute other replaces this; else concatenate.
+;; A Windows other that is ROOTED but not absolute ("\b") is neither: it names
+;; the current drive, so the JVM resolves it against THIS path's root — "C:/a"
+;; resolve "\b" is "C:/b", not "C:/a/\b".
+(define (npath-resolve-for windows? a b)
+  (cond ((string=? b "") a)
+        ((npath-absolute-for? windows? b) b)
+        ((npath-rooted-for? windows? b)
+         (let ((aroot (npath-root-for windows? a)))
+           (if (string=? aroot "")
+               b
+               (npath-rebuild aroot (npath-segs-for windows? b)))))
+        ((string=? a "") b)
+        ((path-sep-for? windows? (string-ref a (- (string-length a) 1))) (string-append a b))
+        (else (string-append a (path-join-sep windows? a) b))))
 (define (npath-resolve self other)
-  (let ((a (nio-path-str self)) (b (npath-string-of other)))
-    (cond ((string=? b "") self)
-          ((npath-absolute? b) (make-nio-path b))
-          ((string=? a "") (make-nio-path b))
-          ((char=? (string-ref a (- (string-length a) 1)) #\/) (make-nio-path (string-append a b)))
-          (else (make-nio-path (string-append a "/" b))))))
+  (make-nio-path (npath-resolve-for (nio-windows?)
+                                    (nio-path-str self) (npath-string-of other))))
 
-;; Path.relativize(other): the path from self to other (both same absoluteness).
+;; Path.relativize(other): the path from self to other. The JVM demands both be
+;; rooted the same way and throws IllegalArgumentException otherwise; this
+;; answers a best-effort path instead, as it always has — callers here (glob and
+;; walk in babashka.fs) pass two paths from the same walk.
+(define (npath-relativize-for windows? a b)
+  (let loop ((x (npath-segs-for windows? a)) (y (npath-segs-for windows? b)))
+    (if (and (pair? x) (pair? y) (string=? (car x) (car y)))
+        (loop (cdr x) (cdr y))
+        (npath-rebuild "" (append (map (lambda (_) "..") x) y)))))
 (define (npath-relativize self other)
-  (let* ((sa (npath-segs (nio-path-str self)))
-         (sb (npath-segs (npath-string-of other))))
-    (let loop ((a sa) (b sb))
-      (if (and (pair? a) (pair? b) (string=? (car a) (car b)))
-          (loop (cdr a) (cdr b))
-          (make-nio-path
-           (npath-join-segs #f (append (map (lambda (_) "..") a) b)))))))
+  (make-nio-path (npath-relativize-for (nio-windows?)
+                                       (nio-path-str self) (npath-string-of other))))
 
-(define (npath-parent s)
-  (let ((abs? (npath-absolute? s)) (segs (npath-segs s)))
+;; The parent of the last segment under a root is the ROOT ("C:/a" -> "C:/"),
+;; and a root has no parent. This answered "/" for every rooted path, so on
+;; Windows the parent of "C:/a" was "/" — a directory on another drive.
+(define (npath-parent-for windows? s)
+  (let ((root (npath-root-for windows? s)) (segs (npath-segs-for windows? s)))
     (cond
       ((null? segs) jolt-nil)
-      ((null? (cdr segs)) (if abs? (make-nio-path "/") jolt-nil))
-      (else (make-nio-path (npath-join-segs abs? (reverse (cdr (reverse segs)))))))))
+      ((null? (cdr segs)) (if (string=? root "") jolt-nil root))
+      (else (npath-rebuild root (reverse (cdr (reverse segs))))))))
+(define (npath-parent s)
+  (let ((r (npath-parent-for (nio-windows?) s)))
+    (if (string? r) (make-nio-path r) r)))
 
 (define (npath-file-name s)
   (let ((segs (npath-segs s)))
@@ -115,26 +163,33 @@
         ((jfile? x) (jfile-path x))
         (else (jolt-str-render-one x))))
 
+;; The ROOTS must match, not merely the absoluteness: "C:/a" does not start with
+;; "D:/", and both are rooted. Comparing the roots also makes the answer
+;; independent of how the caller spelled its separators, since path-root renders
+;; both kinds as "/".
+(define (npath-starts-with-for windows? a b)
+  ;; the empty path is a single empty component: only another empty path starts with it
+  (if (string=? b "") (string=? a "")
+      (and (string=? (npath-root-for windows? a) (npath-root-for windows? b))
+           (let loop ((sa (npath-segs-for windows? a)) (sb (npath-segs-for windows? b)))
+             (cond ((null? sb) #t)
+                   ((null? sa) #f)
+                   ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
+                   (else #f))))))
 (define (npath-starts-with self other)
-  (let ((a (nio-path-str self)) (b (npath-string-of other)))
-    ;; the empty path is a single empty component: only another empty path starts with it
-    (if (string=? b "") (string=? a "")
-        (and (eq? (npath-absolute? a) (npath-absolute? b))
-             (let loop ((sa (npath-segs a)) (sb (npath-segs b)))
-               (cond ((null? sb) #t)
-                     ((null? sa) #f)
-                     ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
-                     (else #f)))))))
+  (npath-starts-with-for (nio-windows?) (nio-path-str self) (npath-string-of other)))
 
+(define (npath-ends-with-for windows? a b)
+  (if (npath-rooted-for? windows? b)
+      (string=? (npath-normalize-for windows? a) (npath-normalize-for windows? b))
+      (let loop ((sa (reverse (npath-segs-for windows? a)))
+                 (sb (reverse (npath-segs-for windows? b))))
+        (cond ((null? sb) #t)
+              ((null? sa) #f)
+              ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
+              (else #f)))))
 (define (npath-ends-with self other)
-  (let ((a (nio-path-str self)) (b (npath-string-of other)))
-    (if (npath-absolute? b)
-        (string=? (npath-normalize a) (npath-normalize b))
-        (let loop ((sa (reverse (npath-segs a))) (sb (reverse (npath-segs b))))
-          (cond ((null? sb) #t)
-                ((null? sa) #f)
-                ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
-                (else #f))))))
+  (npath-ends-with-for (nio-windows?) (nio-path-str self) (npath-string-of other)))
 
 (define (nio-path-method self name rest)   ; -> boxed result, or #f to fall through
   (let ((s (nio-path-str self)))
@@ -145,7 +200,8 @@
       ((string=? name "getName")       (list (let ((segs (npath-segs s)) (i (exact (truncate (car rest)))))
                                                (make-nio-path (list-ref segs i)))))
       ((string=? name "getNameCount")  (list (length (npath-segs s))))
-      ((string=? name "getRoot")       (list (if (npath-absolute? s) (make-nio-path "/") jolt-nil)))
+      ((string=? name "getRoot")       (list (let ((r (npath-root s)))
+                                               (if (string=? r "") jolt-nil (make-nio-path r)))))
       ((string=? name "getFileSystem") (list default-nio-filesystem))
       ((string=? name "normalize")     (list (make-nio-path (npath-normalize s))))
       ((string=? name "resolve")       (list (npath-resolve self (car rest))))
@@ -169,7 +225,7 @@
       ((string=? name "subpath")       (list (let ((segs (npath-segs s))
                                                    (b (exact (truncate (car rest))))
                                                    (e (exact (truncate (cadr rest)))))
-                                               (make-nio-path (npath-join-segs #f (list-head (list-tail segs b) (- e b)))))))
+                                               (make-nio-path (npath-rebuild "" (list-head (list-tail segs b) (- e b)))))))
       ((string=? name "compareTo")     (list (let ((o (npath-string-of (car rest))))
                                                (cond ((string<? s o) -1) ((string>? s o) 1) (else 0)))))
       ((string=? name "equals")        (list (and (nio-path? (car rest)) (string=? s (nio-path-str (car rest))))))
@@ -395,7 +451,7 @@
 
 (define nio-temp-counter 0)
 (define nio-temp-mutex (make-mutex))
-(define (nio-tmp-dir) (or (getenv "TMPDIR") "/tmp"))
+(define (nio-tmp-dir) (host-temp-dir))
 ;; A temp path in `dir` (default the system temp dir), unique across processes
 ;; via now-millis + a retry counter, like java.nio.file's createTemp*.
 (define (nio-temp-path dir prefix suffix)
