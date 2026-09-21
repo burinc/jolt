@@ -1,5 +1,6 @@
-;; The lexical half of java.io.File/getCanonicalPath, per platform
-;; (jolt-lang/jolt#991). Run:
+;; The path rules that read a platform rather than a filesystem, per platform:
+;; the lexical half of java.io.File/getCanonicalPath (jolt-lang/jolt#991) and
+;; the glob translator's separator class (jolt-lang/jolt#1086). Run:
 ;;   chez --script test/chez/win-path-test.ss
 ;;
 ;; realpath(3) is not bound on a Windows build, so THIS is the whole of
@@ -17,6 +18,7 @@
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
 (load "host/chez/java/io.ss")
+(load "host/chez/java/nio-file.ss")
 
 (define total 0) (define fails 0)
 (define (ok name pred)
@@ -99,6 +101,65 @@
 (canon "no ancestor resolves"           #t "C:/gone/./a/../b" "C:/gone/b")
 (canon "posix walk unchanged"           #f "/u/real/nope.txt" "/u/target/nope.txt")
 (canon "posix no ancestor resolves"     #f "/gone/./a/../b" "/gone/b")
+
+;; --- the glob translator's separator class (jolt-lang/jolt#1086) -------------
+;; Same reason the platform is a parameter here: jolt renders every path with
+;; "/" everywhere, but the vendored babashka.fs/match reads os.name and on
+;; Windows hands the matcher `escaped-base + "\\" + "/" + pattern-with-"/"-
+;; rewritten-to-"\\\\"`. So the Windows rows below spell a separator the way
+;; babashka.fs really does — as an escaped backslash — and that spelling used to
+;; translate to a literal backslash no "/"-rendered path could ever hold:
+;; (fs/glob "src" "**/*.clj") answered () on Windows while "**.clj" answered
+;; every file. These rows are unreachable from the host that runs CI.
+(define (rx label windows? pattern want)
+  (let ((got (npath-glob->regex-for windows? pattern)))
+    (set! total (+ total 1))
+    (unless (string=? got want)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a (windows? ~s): ~s -> ~s, want ~s\n" label windows? pattern got want))))
+
+;; and the translation actually applied to a path, which is what fs/glob asks
+(define (globs label windows? pattern path want)
+  (let ((got (and (jolt-truthy? (jolt-re-matches (jolt-re-pattern (npath-glob->regex-for windows? pattern))
+                                                 path))
+                  #t)))
+    (set! total (+ total 1))
+    (unless (eq? got want)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a (windows? ~s): ~s vs ~s -> ~s, want ~s\n"
+              label windows? pattern path got want))))
+
+;; POSIX is unchanged: "/" alone separates and "\" is an ordinary filename
+;; character, so "a\\b" still names the file really called a\b and not a/b.
+(rx "posix segment class"   #f "*.clj"     "^[^/]*\\.clj$")
+(rx "posix crossing"        #f "**/*.clj"  "^.*/[^/]*\\.clj$")
+(rx "posix escaped backslash is a literal" #f "a\\\\b" "^a\\\\b$")
+(globs "posix ** crosses"   #f "**/*.clj" "/r/d1/d2/two.clj" #t)
+(globs "posix * does not cross" #f "*.clj" "d1/one.clj" #f)
+(globs "posix backslash names a file" #f "a\\\\b" "a\\b" #t)
+(globs "posix backslash is not a separator" #f "a\\\\b" "a/b" #f)
+
+;; Windows: both spellings separate, as the JDK's Globs reads a Windows pattern.
+(rx "win segment class"     #t "*.clj"       "^[^/\\\\]*\\.clj$")
+(rx "win rewritten crossing" #t "**\\\\*.clj" "^.*[/\\\\][^/\\\\]*\\.clj$")
+(rx "win plain / still separates" #t "**/*.clj" "^.*/[^/\\\\]*\\.clj$")
+;; the whole string babashka.fs/match builds for (fs/glob "C:/src" "**/*.clj"):
+;; the base, the escaped separator it appends, then the rewritten pattern
+(globs "win rewritten pattern matches a nested file"
+       #t "C:/src\\/**\\\\*.clj" "C:/src/kmet/libs/terminal.clj" #t)
+(globs "win rewritten pattern rejects the wrong extension"
+       #t "C:/src\\/**\\\\*.clj" "C:/src/kmet/libs/terminal.cljc" #f)
+(globs "win ** with no separator still matches"
+       #t "C:/src\\/**.clj" "C:/src/kmet/libs/terminal.clj" #t)
+;; * stops at either separator rather than running through the tree
+(globs "win * does not cross /"  #t "*.clj" "d1/one.clj" #f)
+(globs "win * does not cross \\" #t "*.clj" "d1\\one.clj" #f)
+;; inside a character class "\\" is still a literal: [/\] would name two
+;; members there, not one separator
+(rx "win class keeps the literal" #t "a[\\\\]b" "^a[\\\\]b$")
+;; an escape of anything else is untouched on both platforms
+(rx "win escaped star"      #t "a\\*b"     "^a\\*b$")
+(rx "posix escaped star"    #f "a\\*b"     "^a\\*b$")
 
 (if (> fails 0)
     (begin (printf "WIN-PATH FAILURES: ~a of ~a\n" fails total) (exit 1))

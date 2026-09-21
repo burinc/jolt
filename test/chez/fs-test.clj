@@ -59,6 +59,14 @@
        ["one.clj"])
 (check "glob **" (sort (mapv fs/file-name (fs/glob root "**.clj")))
        ["one.clj" "two.clj"])
+;; ...and the spelling that names the separator. Every other glob row here
+;; dodges it, which is how jolt-lang/jolt#1086 hid: on Windows babashka.fs/match
+;; rewrites the pattern's "/" to "\\" and the translator read that as a literal
+;; backslash, so "**/*.clj" matched nothing there while "**.clj" matched
+;; everything. The separator class is a platform parameter now, driven from a
+;; table in win-path-test.ss; this is the live half.
+(check "glob **/" (sort (mapv fs/file-name (fs/glob root "**/*.clj")))
+       ["one.clj" "two.clj"])
 (check "glob ?" (mapv fs/file-name (fs/glob (fs/path root "d1") "one.cl?"))
        ["one.clj"])
 (check "glob alt" (count (fs/glob (fs/path root "d1") "*.{clj,txt}")) 2)

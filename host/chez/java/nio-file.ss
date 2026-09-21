@@ -248,11 +248,35 @@
       (else #f))))
 
 ;; ---- glob / regex PathMatcher -----------------------------------------------
-;; Translate a "glob:" pattern to a Java-style regex string. ** crosses "/", *
-;; and ? stay within a segment, {a,b} alternates, [..] is a char class, \ escapes.
+;; Translate a "glob:" pattern to a Java-style regex string. ** crosses a
+;; separator, * and ? stay within a segment, {a,b} alternates, [..] is a char
+;; class, \ escapes.
+;;
+;; WHICH characters separate is a platform parameter, the way jfile-fold-dots-for's
+;; root shape is (io.ss) — and for the same reason: the Windows rows are
+;; unreachable from the host that runs CI, so they are driven from a table.
+;; jolt renders every path with "/" on every platform, but the vendored
+;; babashka.fs/match derives win? from os.name rather than File/separator and
+;; there rewrites every "/" in the CALLER's pattern to "\\" before handing it
+;; over. That arrives here as an escaped backslash — a literal character no
+;; "/"-rendered path can hold — so on Windows every pattern that spelled a
+;; separator at all matched nothing, while the separator-free spelling of the
+;; same query matched: (fs/glob "src" "**/*.clj") answered () where
+;; (fs/glob "src" "**.clj") answered 152 files (jolt-lang/jolt#1086). "**/*.ext"
+;; being the common spelling, Windows globbing silently saw an empty tree.
+;;
+;; So on Windows both "/" and "\" separate, which is also how the JDK's Globs
+;; reads a Windows pattern. On POSIX "\" stays an ordinary filename character:
+;; a file really named a\b is matched by "a\\b" and not by "a/b".
 (define (nio-bad-glob msg) (jolt-throw (jolt-ex-info (string-append "invalid glob: " msg) empty-pmap)))
-(define (npath-glob->regex pattern)
-  (let ((n (string-length pattern)))
+(define (npath-glob->regex pattern) (npath-glob->regex-for (nio-windows?) pattern))
+(define (npath-glob->regex-for windows? pattern)
+  (let ((n (string-length pattern))
+        ;; one segment's worth of any character: everything but a separator
+        (not-sep (if windows? "[^/\\\\]" "[^/]"))
+        ;; an escaped "\" — the separator babashka.fs wrote on Windows, and a
+        ;; literal backslash everywhere else
+        (esc-backslash (if windows? "[/\\\\]" "\\\\")))
     (let loop ((i 0) (out "^") (brace #f) (class #f))   ; brace = inside {}, class = inside []
       (if (>= i n)
           (cond (brace (nio-bad-glob "missing '}'"))
@@ -262,8 +286,8 @@
              (cond
               ((and (char=? c #\*) (< (+ i 1) n) (char=? (string-ref pattern (+ i 1)) #\*))
                (loop (+ i 2) (string-append out (if class "\\*\\*" ".*")) brace class))
-              ((char=? c #\*) (loop (+ i 1) (string-append out (if class "\\*" "[^/]*")) brace class))
-              ((char=? c #\?) (loop (+ i 1) (string-append out (if class "\\?" "[^/]")) brace class))
+              ((char=? c #\*) (loop (+ i 1) (string-append out (if class "\\*" (string-append not-sep "*"))) brace class))
+              ((char=? c #\?) (loop (+ i 1) (string-append out (if class "\\?" not-sep)) brace class))
               ((and class (char=? c #\!) (char=? (string-ref out (- (string-length out) 1)) #\[))
                (loop (+ i 1) (string-append out "^") brace class))
               ((char=? c #\{) (if brace (nio-bad-glob "nested '{'") (loop (+ i 1) (string-append out "(") #t class)))
@@ -273,7 +297,15 @@
               ((char=? c #\]) (loop (+ i 1) (string-append out "]") brace #f))
               ((char=? c #\\)
                (if (< (+ i 1) n)
-                   (loop (+ i 2) (string-append out "\\" (string (string-ref pattern (+ i 1)))) brace class)
+                   ;; a "\\" pair outside a character class is the one the
+                   ;; Windows rewrite writes for a separator; inside a class it
+                   ;; is a literal, since [/\] would name two members there
+                   (let ((next (string-ref pattern (+ i 1))))
+                     (loop (+ i 2)
+                           (string-append out (if (and (char=? next #\\) (not class))
+                                                  esc-backslash
+                                                  (string-append "\\" (string next))))
+                           brace class))
                    (nio-bad-glob "no character to escape after '\\'")))
               ((memv c '(#\. #\( #\) #\^ #\$ #\+ #\|))
                (loop (+ i 1) (string-append out "\\" (string c)) brace class))
