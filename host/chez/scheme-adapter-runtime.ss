@@ -1231,7 +1231,29 @@
 ;; with no lock in the way and nothing allocated (seq.ss force-claimed!). A
 ;; system primitive here; a target whose records are vectors swaps the slot
 ;; under whatever makes that atomic for its threads.
-(define (sa-record-cas! r i old new) (#%$record-cas! r i old new))
+;;
+;; STRONG, and that is the whole of the definition below. Chez's $record-cas! is
+;; one ldxr/stxr attempt on AArch64 (s/arm64.ss asm-cas): the stxr fails
+;; whenever this core's exclusive monitor was cleared between the two — a
+;; context switch, or another core storing into the same reservation granule,
+;; which a store to the NEXT FIELD of the same record is — and the primitive
+;; then answers #f with the field still holding `old`. Every caller here reads
+;; #f as "somebody else got there first": compare-and-set! hands it straight to
+;; the program, force-claimed!'s release leaves a claim in place on it. Under
+;; load that was one refusal in a few hundred thousand on Apple silicon
+;; (test/chez/cas-test.ss counts them), and one connection in ~1400 served by
+;; nobody in ring-chez-adapter, whose worker took the refusal to mean another
+;; owner had the conn. x86's cmpxchg cannot fail this way, which is why it was
+;; only ever seen on the Mac. So: a #f is taken at its word only once the field
+;; is seen NOT holding `old`; while it still does, the attempt is repeated.
+;; The re-read is the plain field read the failure path already paid for, and
+;; the loop ends the instant either the swap lands or another writer moves the
+;; field.
+(define (sa-record-cas! r i old new)
+  (let retry ()
+    (cond ((#%$record-cas! r i old new) #t)
+          ((eq? (#%$record-ref r i) old) (retry))
+          (else #f))))
 
 ;; (sa-disable-count) -> how many nested disable-interrupts this thread is
 ;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and
