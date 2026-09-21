@@ -220,5 +220,41 @@
     "[(try ((fn [^objects a ^long i] (aget a i)) (object-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try ((fn [^objects a ^long i] (aset a i 1)) (object-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try (aget (object-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try (let [a (long-array 2)] (aset a 0 Long/MAX_VALUE) ((fn [^longs x ^long i] (aget x i)) a 9)) (catch ArrayIndexOutOfBoundsException e :aioobe))]"
     "[:aioobe :aioobe :aioobe :aioobe]")
 
+;; --- (T-array size init): the scalar fill and the SEQ form (jolt-6g1) -----------
+;; Numbers.T_array branches on an instanceof: an init that is the element's own
+;; scalar type fills every slot, anything else is a seq that fills a PREFIX and
+;; leaves the tail at the element default. jolt had only the fill, so a seq init
+;; was stored AS the element — (int-array 3 [1 2]) was three slots each holding
+;; the vector — and char-array read no init at all. Every row below was compared
+;; against reference JVM Clojure; the backing rows say the fix did not cost the
+;; typed representation the rest of this file pins.
+(is "char-array fills from a scalar init" "(mapv int (char-array 3 \\.))"        "[46 46 46]")
+(is "char-array takes a seq prefix"       "(mapv int (char-array 3 [\\a \\b]))"  "[97 98 0]")
+(is "char-array seqs a string init"       "(mapv int (char-array 3 \"ab\"))"     "[97 98 0]")
+(is "a nil init is an empty seq"          "(mapv int (char-array 3 nil))"        "[0 0 0]")
+(is "a seq longer than the array stops"   "(mapv int (char-array 2 [\\a \\b \\c \\d]))" "[97 98]")
+(is "char-array 1-arg is unchanged"       "(mapv int (char-array 3))"            "[0 0 0]")
+(is "int-array takes a seq prefix"        "(vec (int-array 3 [1 2]))"            "[1 2 0]")
+(is "int-array still fills from a scalar" "(vec (int-array 3 7))"                "[7 7 7]")
+(is "long-array takes a seq prefix"       "(vec (long-array 3 [1 2]))"           "[1 2 0]")
+(is "byte-array takes a seq prefix"       "(vec (byte-array 3 [1 2]))"           "[1 2 0]")
+(is "byte-array nil init"                 "(vec (byte-array 3 nil))"             "[0 0 0]")
+(is "byte-array truncates a long seq"     "(vec (byte-array 2 [1 2 3 4]))"       "[1 2]")
+(is "boolean-array takes a seq prefix"    "(vec (boolean-array 3 [true false]))" "[true false false]")
+(is "double-array takes a seq prefix"     "(vec (double-array 3 [1.5]))"         "[1.5 0.0 0.0]")
+(is "float-array takes a seq prefix"      "(vec (float-array 3 [1.5]))"          "[1.5 0.0 0.0]")
+;; A scalar byte init still narrows the way na-byte-of narrows everywhere else.
+;; The JVM raises here instead (Numbers.byte_array wants an instanceof Byte, so a
+;; Long literal falls to its seq branch) — the :permissive divergence already on
+;; record for the byte store, recorded again for this door in known-divergences.
+(is "a scalar byte init narrows"          "(vec (byte-array 3 200))"             "[-56 -56 -56]")
+;; The seq form must not box a typed backing: it packs through na-list->backing,
+;; the same door (T-array coll) uses, so the representation is the kind's own.
+(backing "char-array with a scalar init"  "(char-array 3 \\.)"       'string)
+(backing "char-array with a seq init"     "(char-array 3 [\\a \\b])" 'string)
+(backing "byte-array with a seq init"     "(byte-array 3 [1 2])"     'bytevector)
+(backing "int-array with a seq init"      "(int-array 3 [1 2])"      'fxvector)
+(backing "double-array with a seq init"   "(double-array 3 [1.5])"   'flvector)
+
 (printf "array-backing-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))
