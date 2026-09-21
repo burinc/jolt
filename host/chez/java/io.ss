@@ -25,35 +25,76 @@
 ;;
 ;; The two-argument constructor normalizes each ARGUMENT and then resolves them.
 ;; That result is normal too, on every JDK from 21. See jolt-file-join.
-(define (path-has-double-sep? p n)
-  (let loop ((i 1))
+;; Scanning starts after the ROOT, whose separators are structural rather than
+;; redundant: "//srv/sh" is a UNC root and collapsing its leading pair to
+;; "/srv/sh" names a directory on the current drive instead. POSIX has no root
+;; to protect (FROM is 0 there), so "//a/b" still folds to "/a/b" as the JVM
+;; does — the row win-path-test.ss already pins.
+(define (path-has-double-sep? p n from)
+  (let loop ((i (fxmax 1 from)))
     (and (fx<? i n)
          (or (and (char=? (string-ref p i) #\/) (char=? (string-ref p (fx- i 1)) #\/))
              (loop (fx+ i 1))))))
 
-(define (jolt-path-normalize p)
-  (let ((n (string-length p)))
+;; May the trailing separator at index N-1 be dropped? Not when it IS the root:
+;; "/" is a path rather than an empty one, and on Windows so is the drive root
+;; "C:/" — trimming that to "C:" names the drive's current directory instead,
+;; which is a different file. File/listRoots is what found this: it builds its
+;; roots through here, so every root it answered came back drive-RELATIVE
+;; (jolt-lang/jolt#1074).
+;;
+;; POSIX is decided by the length test alone — the only POSIX path whose
+;; trailing separator is its root is "/" itself — so the root scan runs on
+;; Windows only, and this stays allocation-free on the hot path (a jfile is
+;; built per entry on every directory listing).
+(define (trailing-sep-droppable-for? windows? p n)
+  (and (fx>? n 1)
+       (char=? (string-ref p (fx- n 1)) #\/)
+       (or (not windows?)
+           (fx>=? (fx- n 1) (path-root-end #t p)))))
+
+(define (jolt-path-normalize-for windows? p)
+  (define (trailing-sep-droppable? p n) (trailing-sep-droppable-for? windows? p n))
+  (let* ((n (string-length p))
+         ;; POSIX classifies nothing as a root here, so its answers are exactly
+         ;; what they were; only Windows has a prefix to hold back.
+         (root-end (if windows? (path-root-end #t p) 0)))
     (cond
       ;; an already-normal path is the overwhelmingly common case, and a jfile is
       ;; built per entry on every directory listing: look before copying, so the
       ;; answer is p itself and nothing is allocated
-      ((not (path-has-double-sep? p n))
-       ;; a trailing separator goes, but "/" is a path, not an empty one
-       (if (and (fx>? n 1) (char=? (string-ref p (fx- n 1)) #\/))
+      ((not (path-has-double-sep? p n root-end))
+       (if (trailing-sep-droppable? p n)
            (substring p 0 (fx- n 1))
            p))
       (else
        (let ((out (make-string n)))
-         (let loop ((i 0) (j 0) (prev-slash? #f))
+         ;; the root is copied verbatim, and the collapse picks up after it with
+         ;; prev-slash? seeded from the root's last character, so a root that
+         ;; ends in a separator does not then swallow the first child separator
+         (let copy ((k 0))
+           (when (fx<? k root-end)
+             (string-set! out k (string-ref p k))
+             (copy (fx+ k 1))))
+         (let loop ((i root-end)
+                    (j root-end)
+                    (prev-slash? (and (fx>? root-end 0)
+                                      (char=? (string-ref p (fx- root-end 1)) #\/))))
            (if (fx=? i n)
-               (let ((j (if (and (fx>? j 1) (char=? (string-ref out (fx- j 1)) #\/))
-                            (fx- j 1)
-                            j)))
-                 (substring out 0 j))
+               ;; cut to the written prefix BEFORE asking about the trailing
+               ;; separator: out is n wide and only j of it is valid, and
+               ;; path-root-end measures the whole string it is handed
+               (let* ((collapsed (substring out 0 j))
+                      (m (string-length collapsed)))
+                 (if (trailing-sep-droppable? collapsed m)
+                     (substring collapsed 0 (fx- m 1))
+                     collapsed))
                (let ((c (string-ref p i)))
                  (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
                        (else (string-set! out j c)
                              (loop (fx+ i 1) (fx+ j 1) (char=? c #\/))))))))))))
+(define (jolt-path-normalize p)
+  (jolt-path-normalize-for (eq? (sa-os-family) 'windows) p))
 
 (define-record-type jfile (fields path) (nongenerative jolt-jfile-v1)
   (protocol (lambda (new) (lambda (p) (new (jolt-path-normalize p))))))

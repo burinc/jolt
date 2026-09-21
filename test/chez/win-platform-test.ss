@@ -291,6 +291,58 @@
 ;; an empty value is not a value
 (same "an empty TMPDIR is ignored" (host-temp-dir-for #f (env-from '(("TMPDIR" . "")))) "/tmp")
 
+;; --- File's trailing-separator normalization ---------------------------------
+;; Every java.io.File is built through jolt-path-normalize, which drops a
+;; trailing separator — except the one that IS the root. "/" was already
+;; protected by a length test; the Windows drive root "C:/" was not, so it
+;; normalized to "C:", the drive's CURRENT DIRECTORY, a different file. That is
+;; how File/listRoots came back drive-relative on the Windows runner even after
+;; it started enumerating drives (#1074). Driven through the File constructor
+;; because the invariant belongs to every construction site, not to one helper.
+(define (norm-path label windows? given want)
+  (same label (jolt-path-normalize-for windows? given) want))
+;; POSIX rows first: none of this may move, and the only POSIX path whose
+;; trailing separator is its root is "/" itself.
+(norm-path "posix root survives"            #f "/"        "/")
+(norm-path "posix trailing separator goes"  #f "/a/"      "/a")
+(norm-path "posix deeper trailing goes"     #f "/a/b/"    "/a/b")
+(norm-path "posix doubled separator folds"  #f "/a//b"    "/a/b")
+(norm-path "posix doubled and trailing"     #f "/a//b//"  "/a/b")
+(norm-path "posix relative untouched"       #f "a/b"      "a/b")
+(norm-path "posix bare name untouched"      #f "a"        "a")
+;; a drive letter means nothing on POSIX, so "C:/" is an ordinary relative name
+;; whose trailing separator goes
+(norm-path "posix has no drive root"        #f "C:/"      "C:")
+
+;; Windows: the drive root and the UNC root keep their separator; everything
+;; below them loses it.
+(norm-path "windows drive root survives"    #t "C:/"       "C:/")
+(norm-path "windows drive child trims"      #t "C:/a/"     "C:/a")
+(norm-path "windows deeper child trims"     #t "C:/a/b/"   "C:/a/b")
+(norm-path "windows drive root, doubled"    #t "C://"      "C:/")
+(norm-path "windows current-drive root"     #t "/"         "/")
+;; The drive root and the UNC root are NOT symmetric here, and that is the JVM's
+;; asymmetry rather than an accident: java.io.File keeps "C:\\" whole because the
+;; separator is what makes it absolute rather than drive-relative, while
+;; "\\\\srv\\sh\\" normalizes to "\\\\srv\\sh" — the share IS the root, and the
+;; trailing separator adds nothing. path-root-end encodes exactly that: it counts
+;; the separator into a drive root and leaves it out of a UNC one. (The
+;; java.nio.file Path shim answers "//srv/sh/" for getRoot, WITH the separator,
+;; because that is what Path.getRoot does — a different API with a different
+;; convention, pinned separately above.)
+(norm-path "windows UNC root drops its trailing sep" #t "//srv/sh/" "//srv/sh")
+(norm-path "windows UNC root already bare"  #t "//srv/sh"  "//srv/sh")
+(norm-path "windows UNC child trims"        #t "//srv/sh/a/" "//srv/sh/a")
+(norm-path "windows UNC keeps its leading pair" #t "//srv/sh/a" "//srv/sh/a")
+(norm-path "windows drive-relative kept"    #t "C:a/"      "C:a")
+(norm-path "windows doubled separator folds" #t "C:/a//b"  "C:/a/b")
+;; and the File constructor carries the same invariant, since that is where
+;; every construction site goes through
+(same "the File constructor keeps a drive root"
+      (jolt-path-normalize-for #t "C:/") "C:/")
+(same "a File on this host still normalizes"
+      (jfile-path (make-jfile "/a/b/")) "/a/b")
+
 ;; --- File/listRoots ----------------------------------------------------------
 ;; One root on POSIX; one per mounted drive on Windows, where "/" named a
 ;; directory on whichever drive the process was on and enumerated nothing.
