@@ -824,10 +824,38 @@
 ;; as that class, so the caller's fallback never runs. The message is the JVM's
 ;; shape -- the path AS GIVEN, then the reason in parens -- and the JVM uses this
 ;; one class for all three reasons, so distinguish only the parenthetical.
-(define (file-open-error given resolved)
+;; The open failed because the PROCESS is out of descriptors, and nothing is
+;; wrong with this path at all.  Re-probing the filesystem cannot see that -- the
+;; file is there and readable -- so the condition itself has to be asked, or the
+;; message blames the file's mode bits for the program's own leak.  The JVM
+;; reports EMFILE as "Too many open files" and so does this now.
+;; Read out of the IRRITANTS, not condition/report-string: Chez's EMFILE
+;; condition carries no i/o-file-name, so report-string raises trying to format
+;; it -- and it raises whether or not descriptors are still exhausted, so there
+;; is no waiting it out either.  The irritants hold what is wanted anyway, as
+;; ("/the/path" "Too many open files").
+(define (io-string-ci-contains? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((fx>? (fx+ i m) n) #f)
+            ((string-ci=? (substring s i (fx+ i m)) sub) #t)
+            (else (loop (fx+ i 1)))))))
+(define (io-emfile-condition? e)
+  (and (condition? e)
+       (let loop ((l (guard (e2 (#t '())) (condition-irritants e))))
+         (cond ((not (pair? l)) #f)
+               ((and (string? (car l)) (io-string-ci-contains? (car l) "too many open files")) #t)
+               (else (loop (cdr l)))))))
+
+;; EXC is the condition the open raised, when there was one -- it is asked first
+;; because it is the only authoritative account of why the open failed; the
+;; filesystem probes below are a reconstruction after the fact.
+(define (file-open-error given resolved . exc)
   (throw-jvm (quote java.io.FileNotFoundException)
              (string-append given " ("
-                            (cond ((not (file-exists? resolved)) "No such file or directory")
+                            (cond ((and (pair? exc) (io-emfile-condition? (car exc)))
+                                                                 "Too many open files")
+                                  ((not (file-exists? resolved)) "No such file or directory")
                                   ((file-directory? resolved)    "Is a directory")
                                   (else                          "Permission denied"))
                             ")")))
@@ -839,8 +867,19 @@
 (define (open-file-guarded src thunk)
   (let ((resolved (path-of src)))
     (when (file-directory? resolved) (file-open-error (file-path-of src) resolved))
-    (guard (e ((i/o-error? e) (file-open-error (file-path-of src) resolved)))
+    (guard (e ((i/o-error? e) (file-open-error (file-path-of src) resolved e)))
       (thunk resolved))))
+
+;; (io/reader path) and (io/reader (io/file path)): the file's own port, read on
+;; demand.  open-file-guarded gives the same FileNotFoundException/`Is a directory`
+;; reporting every other file-opening ctor here gives, so a missing path still
+;; fails at io/reader time and with the same message it always did.
+(define (jio-file-char-reader path)
+  (io-note-file-read! path)
+  (open-file-guarded path
+    (lambda (p)
+      (make-char-reader (transcoded-port (open-file-input-port p (file-options) (buffer-mode block))
+                                         utf8-tx)))))
 
 (reg-ctor! '("FileInputStream" "java.io.FileInputStream")
   (lambda (src . _)
@@ -1616,6 +1655,26 @@
             ;; Reader in a BufferedReader on the JVM, and that is what the adapter
             ;; is. Without this arm io/reader refused every reify/proxy Reader.
             ((user-reader? x) (make-reader-adapter x))
+            ;; A FILE is STREAMED, not slurped.  io.ss's file and path arms answer
+            ;; a StringReader over the whole content, which is right for a file
+            ;; sitting still and wrong for one that is not: the content had to be
+            ;; read before the reader existed, so .readLine and line-seq over a
+            ;; FIFO, a tailed log or a device could not return until EOF.  Against
+            ;; a pipe held open for 3s, (.readLine (io/reader path)) took 3002 ms
+            ;; where the JVM took 6 (jolt-0nk).  The JVM hands back a
+            ;; BufferedReader over a FileReader and reads on demand; a char-reader
+            ;; over the file's own port is exactly that, and is already what
+            ;; (FileReader. path) builds a few hundred lines up.
+            ;;
+            ;; Only a real on-disk file takes this path.  A jar entry has to be
+            ;; inflated out of its archive and an embedded resource is already in
+            ;; memory, so both keep io.ss's StringReader arms — there is no port to
+            ;; stream from.  slurp is unaffected either way: jolt-slurp answers a
+            ;; path through slurp-path and never builds a reader at all.
+            ((and (jfile? x) (not (jar-path? (jfile-fs x))))
+             (jio-file-char-reader (jfile-fs x)))
+            ((and (string? x) (not (jar-path? (project-relative x))))
+             (jio-file-char-reader (project-relative x)))
             (else (prev x))))))
 (let ((prev jolt-io-writer))
   (set! jolt-io-writer

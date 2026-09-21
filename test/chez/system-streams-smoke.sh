@@ -241,6 +241,87 @@ check s2 "$(run '(let [p (java.io.PushbackInputStream. (java.io.ByteArrayInputSt
 # kernel reports (r9 above shows why that part is not a fixed number here)
 check s3 "$(run '(let [p (java.io.PushbackInputStream. System/in)] (.unread p 120) (println (pr-str [(>= (.available p) 1) (.read p) (.read p)])))' 'ab')" "[true 120 97]"
 
+# --- (io/reader path) streams the file, it does not slurp it (jolt-0nk) -------
+# io/reader over a path used to answer a StringReader built from the whole file,
+# so the content had to be read before the reader existed and nothing could be
+# consumed from a source still arriving: .readLine and line-seq over a FIFO, a
+# tailed log or a device blocked until EOF. The JVM hands back a BufferedReader
+# over a FileReader; io-streams.ss now builds a char-reader over the file's port.
+#
+# The witness is a FIFO whose writer holds it open, writes one line, sleeps, then
+# writes another. A streaming reader returns the first line immediately; a
+# slurping one cannot return until the writer closes. The test cannot hang: if
+# the reader blocks, the writer finishes on its own and the assertion fails on
+# the elapsed time instead.
+#
+# The writer's open blocks until a reader opens, so the clock is anchored to the
+# reader and does not depend on how long jolt takes to start.
+if command -v mkfifo >/dev/null 2>&1; then
+  fifo_dir="$(mktemp -d)"
+  fifo="$fifo_dir/pipe"
+  # elapsed_first_line <expr-building-the-reader>: ms until the first line lands.
+  elapsed_first_line() {
+    rm -f "$fifo"; mkfifo "$fifo"
+    ( exec 3> "$fifo"; printf 'line1\n' >&3; sleep 3; printf 'line2\n' >&3; exec 3>&- ) &
+    writer=$!
+    sleep 0.2
+    JOLT_QUIET=1 "$jolt" -e "(let [t0 (System/currentTimeMillis)
+                                   r  $1
+                                   l  (.readLine r)]
+                               (println (str l \" \" (- (System/currentTimeMillis) t0))))" \
+      </dev/null 2>/dev/null | tail -1
+    wait "$writer" 2>/dev/null || true
+  }
+  # "line1 <ms>" -- the line must be right AND must not have waited for the close.
+  got="$(elapsed_first_line "(clojure.java.io/reader \"$fifo\")")"
+  line="${got% *}"; ms="${got##* }"
+  check "io/reader path is incremental (line)" "$line" "line1"
+  if [ -n "$ms" ] && [ "$ms" -lt 1000 ] 2>/dev/null; then
+    check "io/reader path is incremental (no wait)" "ok" "ok"
+  else
+    check "io/reader path is incremental (no wait)" "waited ${ms}ms for a writer holding the pipe open 3s" "ok"
+  fi
+  # The same through io/file, which is the other door into the same arm.
+  got="$(elapsed_first_line "(clojure.java.io/reader (clojure.java.io/file \"$fifo\"))")"
+  line="${got% *}"; ms="${got##* }"
+  check "io/reader io/file is incremental (line)" "$line" "line1"
+  if [ -n "$ms" ] && [ "$ms" -lt 1000 ] 2>/dev/null; then
+    check "io/reader io/file is incremental (no wait)" "ok" "ok"
+  else
+    check "io/reader io/file is incremental (no wait)" "waited ${ms}ms" "ok"
+  fi
+  rm -rf "$fifo_dir"
+fi
+
+# The port-backed reader must decode and split exactly as the slurping one did.
+rd_dir="$(mktemp -d)"
+printf 'alpha\nbeta\ngamma\n'                > "$rd_dir/plain.txt"
+printf 'a\r\nb\r\nc'                         > "$rd_dir/crlf.txt"
+printf 'caf\303\251 \346\227\245 \360\237\216\211\n' > "$rd_dir/utf8.txt"
+: > "$rd_dir/empty.txt"
+check "reader lines" \
+  "$(run "(println (pr-str (vec (line-seq (clojure.java.io/reader \"$rd_dir/plain.txt\")))))")" \
+  '["alpha" "beta" "gamma"]'
+# CRLF: BufferedReader strips the \r with the \n, and a last line with no
+# terminator is still a line.
+check "reader CRLF lines" \
+  "$(run "(println (pr-str (vec (line-seq (clojure.java.io/reader \"$rd_dir/crlf.txt\")))))")" \
+  '["a" "b" "c"]'
+check "reader utf8 round trip" \
+  "$(run "(println (pr-str (slurp (clojure.java.io/reader \"$rd_dir/utf8.txt\"))))")" \
+  '"café 日 🎉\n"'
+check "reader empty file" \
+  "$(run "(println (pr-str (slurp (clojure.java.io/reader \"$rd_dir/empty.txt\"))))")" \
+  '""'
+# A missing path still fails at io/reader time, with the message it always had.
+check "reader missing path" \
+  "$(run "(println (try (clojure.java.io/reader \"$rd_dir/nope.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/nope.txt (No such file or directory)"
+check "reader on a directory" \
+  "$(run "(println (try (clojure.java.io/reader \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+rm -rf "$rd_dir"
+
 echo ""
 echo "system-streams smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]
