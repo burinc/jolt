@@ -445,6 +445,185 @@
 (define (unsupported-encoding-throw name)
   (jolt-throw (jolt-host-throwable "java.io.UnsupportedEncodingException" name)))
 
+;; --- UTF-8 -> string, the way java.nio's decoder does it ---------------------
+;;
+;; Chez's utf8->string and Java's CharsetDecoder agree on every well-formed
+;; input and disagree on malformed ones, because they disagree about how many
+;; BYTES a bad sequence costs. Java replaces per malformed RUN, and the run
+;; length is decided by sun.nio.cs.UTF_8's malformedN: an overlong lead is
+;; rejected on its own, and the continuation bytes behind it are then each a
+;; stray of their own. Chez folds the whole sequence into one replacement.
+;;
+;;   bytes           Java            Chez
+;;   C0 AF           FFFD FFFD       FFFD
+;;   E0 80 AF        FFFD FFFD FFFD  FFFD
+;;   F0 80 80 AF     FFFD x4         FFFD
+;;   F4 90 80 80     FFFD x4         FFFD
+;;   EF BB BF        FEFF            (stripped)
+;;
+;; The last row is not about malformed input at all: Chez treats a leading BOM
+;; as a signature and drops it, and Java hands it back as U+FEFF.
+;;
+;; So (String. bytes) cannot be utf8->string. It also cannot be a transcoded
+;; port, which is what slurp-of-a-path uses -- that agrees with Java only on
+;; the two-byte row above and is wrong on the other four, and it is twice the
+;; cost besides (8.1MB x20: utf8->string 889ms, bytevector->string 1733ms).
+;;
+;; utf8-bytes->string is therefore Chez's decoder behind a GUARD. Well-formed
+;; input with no leading BOM is exactly the case where the two cannot disagree,
+;; so it goes to utf8->string; anything else is re-decoded by the hand-written
+;; Java model below. Measured on the same 8.1MB x20, over utf8->string's 889ms:
+;; the guard adds 185ms, and decoding by hand instead would add 968ms -- ~20%
+;; to keep the C decoder against ~110% to replace it.
+(define (%utf8-cont? b) (fx=? (fxand b #xC0) #x80))
+
+;; #t when Chez's decoder and Java's cannot differ on bv: strictly well-formed
+;; UTF-8, and no BOM for Chez to swallow.
+(define (%utf8-java-plain? bv)
+  (let* ((n (bytevector-length bv))
+         (n4 (fx- n 4)))
+    (and (not (and (fx>=? n 3)
+                   (fx=? (bytevector-u8-ref bv 0) #xEF)
+                   (fx=? (bytevector-u8-ref bv 1) #xBB)
+                   (fx=? (bytevector-u8-ref bv 2) #xBF)))
+         (let loop ((i 0))
+           ;; ASCII runs dominate real payloads, so clear four bytes per step
+           ;; while the index stays word-aligned: no high bit anywhere in the
+           ;; word means four plain characters. Byte at a time this scan cost
+           ;; 371ms per 8.1MB x20 against the 185ms it costs here.
+           (let skip ((i i))
+             (cond
+               ((and (fx<=? i n4) (fx=? (fxand i 3) 0)
+                     (fx=? (fxand (bytevector-u32-native-ref bv i) #x80808080) 0))
+                (skip (fx+ i 4)))
+               ((fx>=? i n) #t)
+               (else
+                (let ((b1 (bytevector-u8-ref bv i)))
+                  (cond
+                    ((fx<? b1 #x80) (loop (fx+ i 1)))
+                    ;; C0/C1 are overlong two-byte leads and never well-formed
+                    ((and (fx>=? b1 #xC2) (fx<=? b1 #xDF))
+                     (and (fx<? (fx+ i 1) n)
+                          (%utf8-cont? (bytevector-u8-ref bv (fx+ i 1)))
+                          (loop (fx+ i 2))))
+                    ((and (fx>=? b1 #xE0) (fx<=? b1 #xEF))
+                     (and (fx<? (fx+ i 2) n)
+                          (let ((b2 (bytevector-u8-ref bv (fx+ i 1))))
+                            (and (%utf8-cont? b2)
+                                 (not (and (fx=? b1 #xE0) (fx<? b2 #xA0)))   ; overlong
+                                 (not (and (fx=? b1 #xED) (fx>? b2 #x9F)))   ; surrogate
+                                 (%utf8-cont? (bytevector-u8-ref bv (fx+ i 2)))
+                                 (loop (fx+ i 3))))))
+                    ((and (fx>=? b1 #xF0) (fx<=? b1 #xF4))
+                     (and (fx<? (fx+ i 3) n)
+                          (let ((b2 (bytevector-u8-ref bv (fx+ i 1))))
+                            (and (%utf8-cont? b2)
+                                 (not (and (fx=? b1 #xF0) (fx<? b2 #x90)))   ; overlong
+                                 (not (and (fx=? b1 #xF4) (fx>? b2 #x8F)))   ; > U+10FFFF
+                                 (%utf8-cont? (bytevector-u8-ref bv (fx+ i 2)))
+                                 (%utf8-cont? (bytevector-u8-ref bv (fx+ i 3)))
+                                 (loop (fx+ i 4))))))
+                    (else #f))))))))))
+
+;; sun.nio.cs.UTF_8's decode loop, one sequence at a time.
+;;
+;; Decodes the sequence at I and answers two values: its code point (#xFFFD for
+;; a malformed one) and the index just past what Java would have CONSUMED for
+;; it. N bounds the bytes available, and MORE? says whether bytes beyond N may
+;; still arrive -- a streaming reader passes #t and gets (values #f i) when the
+;; sequence is cut off at the buffer edge, meaning "refill and ask again". With
+;; MORE? #f, N is end of input: an incomplete but VALID prefix there is one
+;; replacement for the whole remainder, because Java's decoder underflows and
+;; the flush replaces once.
+;;
+;; Both the whole-buffer decoder below and the streaming port that java/
+;; io-streams.ss hands every Reader run on this, so the two cannot drift.
+(define %utf8-replacement #xFFFD)
+(define (%utf8-java-step bv i n more?)
+  (let ((b1 (bytevector-u8-ref bv i)))
+    (cond
+      ((fx<? b1 #x80) (values b1 (fx+ i 1)))
+      ;; C0/C1 are overlong leads; they fall to the stray arm at the bottom
+      ((and (fx>=? b1 #xC2) (fx<=? b1 #xDF))
+       (if (fx>=? (fx+ i 1) n)
+           (if more? (values #f i) (values %utf8-replacement n))
+           (let ((b2 (bytevector-u8-ref bv (fx+ i 1))))
+             (if (%utf8-cont? b2)
+                 (values (fxior (fxsll (fxand b1 #x1F) 6) (fxand b2 #x3F)) (fx+ i 2))
+                 (values %utf8-replacement (fx+ i 1))))))
+      ((and (fx>=? b1 #xE0) (fx<=? b1 #xEF))
+       (if (fx>=? (fx+ i 1) n)
+           (if more? (values #f i) (values %utf8-replacement n))
+           (let* ((b2 (bytevector-u8-ref bv (fx+ i 1)))
+                  ;; isMalformed3_2: the lead is already wrong on its own, so
+                  ;; Java consumes ONE byte and the rest become strays
+                  (lead-bad? (or (and (fx=? b1 #xE0) (fx=? (fxand b2 #xE0) #x80))
+                                 (not (%utf8-cont? b2)))))
+             (cond
+               (lead-bad? (values %utf8-replacement (fx+ i 1)))
+               ((fx>=? (fx+ i 2) n)
+                (if more? (values #f i) (values %utf8-replacement n)))
+               (else
+                (let ((b3 (bytevector-u8-ref bv (fx+ i 2))))
+                  (if (not (%utf8-cont? b3))
+                      (values %utf8-replacement (fx+ i 2))
+                      (let ((c (fxior (fxsll (fxand b1 #x0F) 12)
+                                      (fxsll (fxand b2 #x3F) 6)
+                                      (fxand b3 #x3F))))
+                        ;; a surrogate is malformedForLength(3) -- one
+                        ;; replacement for all three bytes, unlike the overlong
+                        ;; above, which costs one per byte
+                        (if (and (fx>=? c #xD800) (fx<=? c #xDFFF))
+                            (values %utf8-replacement (fx+ i 3))
+                            (values c (fx+ i 3)))))))))))
+      ;; Java's four-byte arm is F0..F7; F5..F7 always fail the lead test
+      ((and (fx>=? b1 #xF0) (fx<=? b1 #xF7))
+       (if (fx>=? (fx+ i 1) n)
+           (if more? (values #f i) (values %utf8-replacement n))
+           (let* ((b2 (bytevector-u8-ref bv (fx+ i 1)))
+                  (lead-bad? (or (fx>? b1 #xF4)
+                                 (and (fx=? b1 #xF0) (or (fx<? b2 #x90) (fx>? b2 #xBF)))
+                                 (and (fx=? b1 #xF4) (not (fx=? (fxand b2 #xF0) #x80)))
+                                 (not (%utf8-cont? b2)))))
+             (cond
+               (lead-bad? (values %utf8-replacement (fx+ i 1)))
+               ((fx>=? (fx+ i 2) n)
+                (if more? (values #f i) (values %utf8-replacement n)))
+               ((not (%utf8-cont? (bytevector-u8-ref bv (fx+ i 2))))
+                (values %utf8-replacement (fx+ i 2)))
+               ((fx>=? (fx+ i 3) n)
+                (if more? (values #f i) (values %utf8-replacement n)))
+               ((not (%utf8-cont? (bytevector-u8-ref bv (fx+ i 3))))
+                (values %utf8-replacement (fx+ i 3)))
+               (else
+                (values (fxior (fxsll (fxand b1 #x07) 18)
+                               (fxsll (fxand b2 #x3F) 12)
+                               (fxsll (fxand (bytevector-u8-ref bv (fx+ i 2)) #x3F) 6)
+                               (fxand (bytevector-u8-ref bv (fx+ i 3)) #x3F))
+                        (fx+ i 4)))))))
+      ;; 80..BF (a stray continuation), C0/C1, F8..FF
+      (else (values %utf8-replacement (fx+ i 1))))))
+
+;; The whole-buffer decoder: only reached for input %utf8-java-plain? turned
+;; down, so it is never on a hot path.
+(define (utf8->string/java bv)
+  (let* ((n (bytevector-length bv))
+         (out (make-string n)))          ; one char per byte is the upper bound
+    (let loop ((i 0) (o 0))
+      (if (fx>=? i n)
+          (if (fx=? o n) out (substring out 0 o))
+          (let-values (((c next) (%utf8-java-step bv i n #f)))
+            (string-set! out o (integer->char c))
+            (loop next (fx+ o 1)))))))
+
+;; Decode UTF-8 bytes the way the JVM does. Shared by decode-bytevector
+;; (String., slurp of a byte source, the CharsetDecoder) -- anything that turns
+;; a whole byte buffer into text.
+(define (utf8-bytes->string bv)
+  (if (%utf8-java-plain? bv)
+      (utf8->string bv)
+      (utf8->string/java bv)))
+
 ;; Encode a string to bytes (a bytevector) under a named charset. UTF-8 default;
 ;; ISO-8859-1/US-ASCII are one byte per char; UTF-16/UTF-32 via Chez's codecs
 ;; (plain "UTF-16" emits a big-endian BOM then BE, matching the JVM); anything

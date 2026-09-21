@@ -248,7 +248,7 @@
 ;; descriptor under it takes the bytes themselves — see pw-write-bytes! below.
 (define (writer-piece-range x rest)
   (cond
-    ((byte-array-arg? x) (utf8->string (byte-array-range x rest)))
+    ((byte-array-arg? x) (utf8-bytes->string (byte-array-range x rest)))
     ((and (pair? rest) (pair? (cdr rest)))
      (let* ((s (writer-piece x))
             (off (max 0 (jnum->exact (car rest))))
@@ -1221,7 +1221,14 @@
   (let* ((name (string-charset-name rest))
          (cs (charset-canonical-down name)))
     (cond
-      ((string=? cs "utf-8") (utf8->string bv))
+      ;; utf8-bytes->string, not utf8->string: Java's decoder replaces malformed
+      ;; input per RUN and Chez's per SEQUENCE, so the two differ on overlongs
+      ;; and on a leading BOM (natives-str.ss has the table). Every byte->text
+      ;; seam below this -- (String. bytes), slurp of a byte array or a byte
+      ;; stream, .readAllBytes, the CharsetDecoder, a zip entry name -- inherits
+      ;; whichever one is named here, which is how (slurp (io/input-stream f))
+      ;; came to disagree with (slurp f) on the same bytes (jolt-dta.13).
+      ((string=? cs "utf-8") (utf8-bytes->string bv))
       ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
        (list->string (map integer->char (bytevector->u8-list bv))))
       ((or (string=? cs "utf-16") (string=? cs "utf-16be"))
@@ -1236,7 +1243,7 @@
       (else (let ((u8 (iconv-bytes bv name "UTF-8")))
               (if u8
                   (guard (e (#t (list->string (map integer->char (bytevector->u8-list u8)))))
-                    (utf8->string u8))
+                    (utf8-bytes->string u8))
                   (unsupported-encoding-throw name)))))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.

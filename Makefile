@@ -188,7 +188,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
-  systemstreams \
+  systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
@@ -756,6 +756,13 @@ ffi:
 # changes, close, and the guardian drain.
 zlibunit:
 	@$(CHEZ) --script test/chez/zlib-test.ss
+
+# UTF-8 bytes -> text against java.nio's decoder (natives-str.ss
+# utf8-bytes->string, host-static-classes.ss decode-bytevector): the named
+# malformed rows, 2702 JVM-pinned random rows, and the soundness of the guard
+# that keeps Chez's C decoder on the well-formed path.
+utf8decode:
+	@$(CHEZ) --script test/chez/utf8-decode-test.ss
 
 # Escape continuations (jolt.continuations, issue #736): the one-shot contract
 # call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
