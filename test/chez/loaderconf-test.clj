@@ -780,6 +780,33 @@
       (chk "a syntax-quoted referred symbol resolves through the defining namespace"
            (= 42 ((val-of (l/resolve ctx {:kind :var :name "sqf/f"}))))))))
 
+;; --- 33. a load's compiler-flag set! is scoped to the load -------------------
+;; A source load brackets the set!-able compiler flags to their roots for the
+;; file's extent, as the host loader does (loader.ss ldr-with-file-vars — the
+;; JVM's Compiler.load): a top-level (set! *warn-on-reflection* true) is legal,
+;; and its effect ends with the file instead of escaping into the loading
+;; context's frame. Without the bracket, the set! wrote the caller's frame and
+;; stayed there; this caller watches its own values.
+(defcase 33 "a loaded file's compiler-flag set! does not escape into the caller"
+  (let [d (write! (root-dir "loadflags") "lf.clj"
+                  "(ns lf) (set! *warn-on-reflection* true) (set! *unchecked-math* true) (set! *assert* false) (def v 42)")
+        ctx (l/classpath [d])
+        w *warn-on-reflection*
+        u *unchecked-math*
+        a *assert*]
+    (binding [*warn-on-reflection* *warn-on-reflection*
+              *unchecked-math* *unchecked-math*
+              *assert* *assert*]
+      (l/load ctx {:kind :ns :name "lf"})
+      (chk "the file loaded and its def is live"
+           (= 42 (val-of (l/resolve ctx {:kind :var :name "lf/v"}))))
+      (chk "warn-on-reflection did not escape the load"
+           (identical? w *warn-on-reflection*))
+      (chk "unchecked-math did not escape the load"
+           (identical? u *unchecked-math*))
+      (chk "assert did not escape the load"
+           (identical? a *assert*)))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])

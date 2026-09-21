@@ -331,6 +331,23 @@
       (= "--" (first in))    (concat (seq acc) (rest in))
       :else                  (recur (next in) (conj acc (first in))))))
 
+(defn- with-entry-bindings
+  "Run F under clojure.main's entry bindings for the vars a source commonly
+  set!s — *warn-on-reflection*, *assert*, *unchecked-math*. clojure.main wraps
+  every entry — repl, -e, -m, -X/-T — in with-bindings, so user code running
+  AFTER the load (a -main, an exec fn, a task body, and anything it evaluates
+  at runtime, a jolt.loader source dep included) has a thread-local slot for a
+  top-level (set! *warn-on-reflection* true). jolt bound them for -e and for a
+  file load, but not around its own entries. Scoped, so a throw pops the frame
+  instead of leaving it standing for the rest of the thread. The -e evaluator
+  keeps the same frame in host/chez/dyn-binding.ss (jolt-with-ns-load-vars) and
+  the built binary's launcher takes it there too; all four agree on the set."
+  [f]
+  (binding [*warn-on-reflection* *warn-on-reflection*
+            *assert* *assert*
+            *unchecked-math* *unchecked-math*]
+    (f)))
+
 (defn- run-ns
   "Require ns-name and invoke its -main with the string app args. A leading
   standalone \"--\" in app-args is consumed as POSIX end-of-options, so this is
@@ -338,26 +355,31 @@
   `-m`, `-M`/`-A` aliases, and a :main-opts task all route through here."
   [ns-name app-args]
   (let [app-args (drop-end-of-options app-args)]
-    (push-thread-bindings {#'clojure.core/*command-line-args* (seq app-args)})
-    ;; The entry namespace not being on the roots usually means there is no
-    ;; project here at all -- jolt was started in a subdirectory, or somewhere
-    ;; else entirely -- and "could not locate app/core" hides that. Asked
-    ;; BEFORE the require, not caught around it: a catch re-raises a load error
-    ;; that propagates through the require from here, and the report then names
-    ;; run-ns instead of the form that failed.
-    (let [dir (project-dir)]
-      (when (and (not (.exists (java.io.File. (str dir "/deps.edn"))))
-                 (not (.exists (java.io.File. (str dir "/bb.edn"))))
-                 (nil? (jolt.host/ns-source ns-name)))
-        (let [here (.getCanonicalPath (java.io.File. dir))]
-          (throw (ex-info (str "No project found in " here " (no deps.edn or bb.edn), so "
-                               ns-name " was looked for on the built-in source roots only. "
-                               "Run from the project directory, or pass -Sdeps.")
-                          {:ns ns-name :dir here})))))
-    (require (symbol ns-name))
-    (if-let [mainv (ns-resolve (symbol ns-name) (symbol "-main"))]
-      (apply (deref mainv) app-args)
-      (throw (ex-info (str "namespace " ns-name " has no -main") {:ns ns-name})))))
+    ;; The require brackets the file it loads (loader.ss ldr-with-file-vars),
+    ;; but that frame pops with the load; the -main that follows is code
+    ;; running AFTER it, and needs its own entry frame (with-entry-bindings).
+    (binding [*command-line-args* (seq app-args)]
+      (with-entry-bindings
+        (fn []
+          ;; The entry namespace not being on the roots usually means there is no
+          ;; project here at all -- jolt was started in a subdirectory, or somewhere
+          ;; else entirely -- and "could not locate app/core" hides that. Asked
+          ;; BEFORE the require, not caught around it: a catch re-raises a load error
+          ;; that propagates through the require from here, and the report then names
+          ;; run-ns instead of the form that failed.
+          (let [dir (project-dir)]
+            (when (and (not (.exists (java.io.File. (str dir "/deps.edn"))))
+                       (not (.exists (java.io.File. (str dir "/bb.edn"))))
+                       (nil? (jolt.host/ns-source ns-name)))
+              (let [here (.getCanonicalPath (java.io.File. dir))]
+                (throw (ex-info (str "No project found in " here " (no deps.edn or bb.edn), so "
+                                     ns-name " was looked for on the built-in source roots only. "
+                                     "Run from the project directory, or pass -Sdeps.")
+                                {:ns ns-name :dir here})))))
+          (require (symbol ns-name))
+          (if-let [mainv (ns-resolve (symbol ns-name) (symbol "-main"))]
+            (apply (deref mainv) app-args)
+            (throw (ex-info (str "namespace " ns-name " has no -main") {:ns ns-name}))))))))
 
 ;; Evaluate a string of forms through the launcher's evaluator (cli-core.ss), the
 ;; same primitive a bare `jolt -e` runs — so the fast path and the project-aware
@@ -570,13 +592,16 @@
   from the command line wins, else the aliases' :exec-fn; :exec-args merges
   under the command-line k v overrides."
   [argmap fsym-arg args]
-  (let [fsym (qualify-fn (or fsym-arg (:exec-fn argmap)) argmap)
-        _ (when-not fsym (throw (ex-info "No function to execute: supply ns/fn or an alias with :exec-fn" {})))
-        exec-args (parse-exec-args (:exec-args argmap) args)]
-    (require (symbol (namespace fsym)))
-    (if-let [v (resolve fsym)]
-      ((deref v) exec-args)
-      (throw (ex-info (str "Function not found: " fsym) {:fn fsym})))))
+  ;; -X/-T is an entry like -m: the exec fn is user code after the load.
+  (with-entry-bindings
+    (fn []
+      (let [fsym (qualify-fn (or fsym-arg (:exec-fn argmap)) argmap)
+            _ (when-not fsym (throw (ex-info "No function to execute: supply ns/fn or an alias with :exec-fn" {})))
+            exec-args (parse-exec-args (:exec-args argmap) args)]
+        (require (symbol (namespace fsym)))
+        (if-let [v (resolve fsym)]
+          ((deref v) exec-args)
+          (throw (ex-info (str "Function not found: " fsym) {:fn fsym})))))))
 
 ;; -X:alias… [ns/fn] [k v …] — resolve with the aliases, invoke :exec-fn (or
 ;; the given ns/fn) with :exec-args + overrides.
@@ -704,18 +729,22 @@
     ;; tolerant: see load-natives! — the task may be the build step for a
     ;; :jolt/native library that does not exist yet
     (apply-project! resolved false)
-    ((requiring-resolve 'jolt.tasks/run-task!)
-     {:tasks (:tasks resolved)
-      :name name
-      ;; :args verbatim — a :main-opts task hands them to run-ns, which is the
-      ;; one end-of-options point for every ns entry form and consumes the
-      ;; leading "--" itself. :app-args is the same list with it consumed, for
-      ;; the *command-line-args* a code body sees. Dropping it in both places
-      ;; would eat a second standalone "--" that is the program's own data.
-      :args (vec more)
-      :app-args (vec (drop-end-of-options more))
-      :parallel parallel?
-      :run-main-opts apply-main-opts})))
+    ;; a task is an entry too (clojure.main -T): its body is user code running
+    ;; after the load, and :run-main-opts lands in run-ns' own entry frame.
+    (with-entry-bindings
+      (fn []
+        ((requiring-resolve 'jolt.tasks/run-task!)
+         {:tasks (:tasks resolved)
+          :name name
+          ;; :args verbatim — a :main-opts task hands them to run-ns, which is the
+          ;; one end-of-options point for every ns entry form and consumes the
+          ;; leading "--" itself. :app-args is the same list with it consumed, for
+          ;; the *command-line-args* a code body sees. Dropping it in both places
+          ;; would eat a second standalone "--" that is the program's own data.
+          :args (vec more)
+          :app-args (vec (drop-end-of-options more))
+          :parallel parallel?
+          :run-main-opts apply-main-opts})))))
 
 ;; `jolt tasks` — the listing. Reads the :tasks maps alone: naming the tasks
 ;; needs no dependency expansion, and a project whose deps don't resolve should

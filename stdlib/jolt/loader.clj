@@ -1302,9 +1302,17 @@
             ;; *file* is the source being evaluated, as load binds it, so a
             ;; def that reads it (a resource path relative to its own file, a
             ;; jar entry's spelling) sees the context's file and not the
-            ;; program that opened the context
+            ;; program that opened the context. The compiler flags are
+            ;; bracketed like a host file load brackets them
+            ;; (loader.ss ldr-with-file-vars — the JVM's Compiler.load): a
+            ;; top-level (set! *warn-on-reflection* true) is legal, and its
+            ;; effect ends with the file instead of escaping into the loading
+            ;; context's frame.
             (binding [*ns* *ns*
                       *file* file
+                      *warn-on-reflection* *warn-on-reflection*
+                      *assert* *assert*
+                      *unchecked-math* *unchecked-math*
                       jolt.host/*invoke-rewrite* (context-rewriter (:id l) ns-name)]
               (letfn [(eval-form [f]
                         (try

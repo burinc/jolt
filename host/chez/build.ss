@@ -1922,13 +1922,19 @@
                             ;; traced binary maps the fault to fn + line. jolt
                             ;; throws skip it (jolt-capture-fault! tests) and
                             ;; raise-continuable preserves warning semantics.
+                            ;; -main is user code running after the load, so it
+                            ;; gets the compiler-flag frame clojure.main's -m gives it
+                            ;; (dyn-binding.ss jolt-with-ns-load-vars; run-ns does the
+                            ;; same for the interpreted CLI).
                             "        (when (and maincell (var-cell-defined? maincell))\n"
                             "          (with-exception-handler\n"
                             "            (lambda (c) (when (serious-condition? c) (jolt-capture-fault! c)) (raise-continuable c))\n"
                             "            (lambda ()\n"
-                            "              (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
-                            "                " (bld-startup-profile-form "entry -main") "\n"
-                            "                jolt-main-result))))))\n"
+                            "              (jolt-with-ns-load-vars\n"
+                            "                (lambda ()\n"
+                            "                  (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
+                            "                    " (bld-startup-profile-form "entry -main") "\n"
+                            "                    jolt-main-result))))))))\n"
                             ;; as the CLI: a non-daemon Thread the program started
                             ;; keeps the process alive until it finishes
                             "    (jolt-await-user-threads!)\n"
