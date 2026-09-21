@@ -45,7 +45,7 @@
 ;; binding, and a redefinition writes through to that binding (rt.ss
 ;; var-root-set!), so the site follows it.
 (let ((e (emit-dl "(def usetrue (fn [x] (true? x)))")))
-  (gate-check "seed call applies the linked jv$ binding" (gate-sub? e "(jv$clojure.core$true? ") #t)
+  (gate-check "seed call applies the linked jv$ binding" (gate-sub? e "(jv$clojure.core/true? ") #t)
   (gate-check "seed call hoists no root" (gate-sub? e "jolt-seed-root") #f)
   (gate-check "seed call is a direct application, not jolt-invoke1" (gate-sub? e "jolt-invoke1") #f)
   (gate-check "seed call does not deref the var cell" (gate-sub? e "var-cell-deref") #f)
@@ -121,7 +121,7 @@
 (ev "(defn twice [] 1)")
 (ev "(defn twice [] 2)")
 (gate-check "an app var defined twice is redefined" (var-redefined? "user" "twice") #t)
-(gate-check "seed-callable?: clojure.core/true? at 1 arg names its binding" (seed-callable? jolt-nil "clojure.core" "true?" 1) "jv$clojure.core$true?")
+(gate-check "seed-callable?: clojure.core/true? at 1 arg names its binding" (seed-callable? jolt-nil "clojure.core" "true?" 1) "jv$clojure.core/true?")
 (gate-check "seed-callable?: a runtime-defined seed var answers #t" (seed-callable? jolt-nil "clojure.core" "array-map" 2) #t)
 (gate-check "seed-callable?: wrong arity refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "true?" 3)) #t)
 (gate-check "seed-callable?: a dynamic var refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "*print-length*" 0)) #t)

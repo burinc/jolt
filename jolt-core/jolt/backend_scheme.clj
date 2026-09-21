@@ -390,17 +390,62 @@
 (defn set-source-reg! [on] (reset! (:source-reg? (cur)) (boolean on)))
 (defn- source-reg? [] @(:source-reg? (cur)))
 
-;; A direct-link Scheme binding name for a var. The fqn maps to a unique identifier
-;; jv$<ns>$<name>; chars that break a Scheme identifier or the `$` separator are
-;; escaped so distinct vars never collide.
-(defn- dl-munge [s]
-  (-> s
-      (str/replace "$" "_D_")
-      (str/replace "#" "_H_")
-      (str/replace "'" "_Q_")
-      (str/replace "|" "_V_")))
-(defn- dl-name [ns nm] (str "jv$" (dl-munge ns) "$" (dl-munge nm)))
+;; --- identifier munging ------------------------------------------------------
+;; Every Clojure name the emitter writes as a Scheme IDENTIFIER — a local, a
+;; param, a fn's letrec self-name, a direct-link binding — goes through
+;; munge-chars. A Clojure symbol can hold any character: the reader lets ' # |
+;; and $ through, and (symbol s) lets everything through, including the chars
+;; the Scheme reader takes as delimiters (a space, ; ( ) [ ] { } " , ` \) — an
+;; identifier emitted bare with one of those either fails to read, reads as two
+;; datums, or (a backslash, which Chez swallows) silently ALIASES a different
+;; name. The escape is INJECTIVE, so two distinct Clojure names never munge to
+;; one Scheme identifier: $ is the escape lead and is itself escaped FIRST
+;; ($$ = a literal $), then ' -> $P, # -> $H, | -> $V, and any other unsafe
+;; char -> $U<hex>$ (self-delimiting, so the codepoint width is free). Every $
+;; in the output therefore begins one of those tokens, and decoding is a plain
+;; left-to-right inverse. The same mapping runs at a binding and at every
+;; reference, so resolution stays consistent.
+;;
+;; The unsafe set was derived by probing both readers (Chez 10.4, Gambit 4.9),
+;; not from the standards: whitespace and controls (code < 33), the fourteen
+;; ASCII chars below, and the non-ASCII Unicode White_Space characters, which
+;; Chez's char-whitespace? delimits on while the reference reader lets them
+;; through (Java's isWhitespace excludes NBSP). test/chez/unit.edn
+;; munge-injective pins one row per class.
+(def ^:private munge-unsafe-ascii
+  ;; " # $ ' ( ) , ; [ \ ] ` { | }
+  #{34 35 36 39 40 41 44 59 91 92 93 96 123 124 125})
+(defn- munge-unicode-space? [cp]
+  (or (= cp 0x85) (= cp 0xA0) (= cp 0x1680)
+      (and (>= cp 0x2000) (<= cp 0x200A))
+      (= cp 0x2028) (= cp 0x2029) (= cp 0x202F) (= cp 0x205F) (= cp 0x3000)))
+(defn- munge-unsafe? [cp]
+  (or (< cp 33)
+      (contains? munge-unsafe-ascii cp)
+      (and (> cp 127) (munge-unicode-space? cp))))
+(defn- munge-char [cp]
+  (cond (= cp 36) "$$"
+        (= cp 39) "$P"
+        (= cp 35) "$H"
+        (= cp 124) "$V"
+        :else (str "$U" (format "%x" cp) "$")))
+(defn- munge-chars [s]
+  ;; a name with nothing to escape (nearly all of them) is returned as-is
+  (if (some (fn [c] (munge-unsafe? (int c))) s)
+    (apply str (map (fn [c] (let [cp (int c)] (if (munge-unsafe? cp) (munge-char cp) c))) s))
+    s))
+
+;; A direct-link Scheme binding name for a var: jv$ + the munged fqn (ns/name),
+;; the same identity the direct-link registry keys on (dl-fqn), so two distinct
+;; vars can never share a binding. It used to be jv$<ns>$<name> over per-part
+;; _D_/_H_/_Q_/_V_ substitutions — text a user can write, so (def _V_ …) and
+;; (def | …) bound the same jv$app$_V_ — and even with injective parts a $
+;; separator can be forged by an escape in the ns name (a$P + $ + Pc reads as
+;; a + $ + P$Pc). The / is a plain identifier char on both hosts. Nothing
+;; parses the shape back: the registry maps a binding to its (ns, name), and
+;; dce.ss / the jv$ shadow guard test only the prefix.
 (defn- dl-fqn [ns nm] (str ns "/" nm))
+(defn- dl-name [ns nm] (str "jv$" (munge-chars (dl-fqn ns nm))))
 (defn- direct-linkable? [ns nm]
   (and (direct-link?) (contains? @(:direct-link-defined (cur)) (dl-fqn ns nm))))
 ;; A direct-linked var whose value is a fn literal — its binding is a Scheme
@@ -427,7 +472,7 @@
 ;; across namespaces. Nested/anonymous fns ignore it (they never register).
 (def ^:dynamic *qualifying-ns* nil)
 ;; Set while emitting the init of a def whose value is an ANONYMOUS fn. Such a fn
-;; is emitted bare so the enclosing (define jv$ns$name …) names the procedure and
+;; is emitted bare so the enclosing (define jv$ns/name …) names the procedure and
 ;; its backtrace frame resolves; wrapping or re-binding it would drop that name.
 ;; emit-fn therefore skips its own variadic registration and emit-def-cached emits
 ;; the sibling (jolt-register-variadic! …) against the define's own binding.
@@ -943,39 +988,53 @@
                   "ftype-&ref" "ftype-pointer-address"}]
     (into from-registry helpers)))
 
-;; Most jolt names are already valid Scheme identifiers. The one that isn't is
-;; `#`, which jolt auto-gensyms use as a suffix (p1__0000X4# from #(...)) — `#`
-;; starts a datum in Scheme, so replace it with `_`. A name that collides with a
-;; Scheme keyword, a bare-emitted native op, or ANY runtime-emitted identifier
-;; (prefix "jolt-", "jv$", or in rt-emitted-names) is prefixed with `_` so it
-;; can never shadow the emitted form. The "jolt-"/"jv$" prefix rules are a
-;; safety net for identifiers added to the runtime that aren't yet in the
-;; registry — they catch future additions without manual enumeration.
+;; A munged name both Scheme readers would take for a NUMBER rather than an
+;; identifier. The reference reader yields SYMBOLS for +i, -i, +inf.0, -nan.0,
+;; .5, -.5 and the like (its number match needs a digit right after the sign),
+;; and emitted bare they abort compilation ("invalid bound variable 0+1i").
+;; Derived by probing both readers over the sign/dot-led tokens a symbol can
+;; start with: a number begins with a digit; with . and a digit; or with a sign
+;; and then a digit, a dot, a lone i, or inf.0/nan.0 in any case. A lone . is
+;; the pair dot, unreadable in a binding position. Over-approximates on purpose
+;; (+.. and +inf.0x are identifiers): a spare prefix costs nothing where a
+;; missed number is a reader error. The common -name/+name shapes (-invoke,
+;; +inc, -i0) are untouched. A digit-led name can only come from (symbol s).
+(defn- digit-char? [c] (let [cp (int c)] (and (>= cp 48) (<= cp 57))))
+(defn- number-lookalike? [s]
+  (let [n (count s) c0 (nth s 0) c1 (when (> n 1) (nth s 1))]
+    (or (digit-char? c0)
+        (and (= c0 \.) (or (nil? c1) (digit-char? c1)))
+        (and (or (= c0 \+) (= c0 \-))
+             (some? c1)
+             (or (digit-char? c1)
+                 (= c1 \.)
+                 (and (= n 2) (or (= c1 \i) (= c1 \I)))
+                 (and (or (= c1 \i) (= c1 \I) (= c1 \n) (= c1 \N))
+                      (let [r (str/lower-case (subs s 1))]
+                        (or (str/starts-with? r "inf.0") (str/starts-with? r "nan.0")))))))))
+
+;; The emitted identifier for a Clojure name: munge-chars (above), then a $R
+;; prefix on any name that would otherwise collide with something the emitter
+;; writes bare or the reader would not take as an identifier — a Scheme keyword
+;; (a local named `if` would turn the (if …) the back end emits into a call), a
+;; bare-emitted native op, ANY runtime-emitted identifier (rt-emitted-names, or
+;; the "jolt-"/"jv$" prefixes as a safety net for additions not yet in that
+;; registry), a number lookalike, or the empty name. The prefix is an escape
+;; token, not a plain `_`: a bare `_` is text a user can write, so `if` and
+;; `_if` both emitted `_if` and (let [if 1 _if 2] if) answered 2. No unprefixed
+;; munge can start with $R (an unprefixed $ is always $$/$P/$H/$V/$U), so the
+;; prefix keeps munge-name injective. A $ -> $$ still leaves the jv$/jolt-
+;; prefix tests true, and those runtime names never reach munge-name.
 (defn- munge-name [s]
-  ;; A Clojure symbol may carry chars that break a Scheme identifier or that
-  ;; collide once substituted: ' is the quote reader macro (a bare f' reads as f
-  ;; then 'rest), # is the auto-gensym suffix the reader puts on #() params
-  ;; (p__1#) and starts a Scheme datum, | starts a delimited identifier, and $
-  ;; is the escape marker used below. Map all four to safe tokens INJECTIVELY so
-  ;; two distinct Clojure locals can never munge to the same Scheme identifier:
-  ;; reserve $ as the escape char and escape it FIRST ($$ = a literal $), then
-  ;; ' -> $P, # -> $H, and | -> $V. Decoding has an unambiguous left-to-right
-  ;; inverse, so no two inputs share an output. The same mapping applies at the
-  ;; binding and at every reference, so resolution stays consistent. Only the
-  ;; char-substitution step changes; the reserved/emitted-name _-prefix below is
-  ;; untouched (it runs on the substituted string; a $ -> $$ still leaves the
-  ;; jv$/jolt- prefix tests true, and those runtime names never reach munge-name).
-  (let [s (-> s
-              (str/replace "$" "$$")
-              (str/replace "'" "$P")
-              (str/replace "#" "$H")
-              (str/replace "|" "$V"))]
-    (if (or (contains? scheme-reserved s)
+  (let [s (munge-chars s)]
+    (if (or (zero? (count s))
+            (contains? scheme-reserved s)
             (contains? bare-native-names s)
             (contains? rt-emitted-names s)
             (.startsWith ^String s "jolt-")
-            (.startsWith ^String s "jv$"))
-      (str "_" s) s)))
+            (.startsWith ^String s "jv$")
+            (number-lookalike? s))
+      (str "$R" s) s)))
 
 (declare emit)
 (declare emit*)
@@ -2393,7 +2452,7 @@
         ;;   (letrec ((m (lambda …))) (jolt-register-variadic! N m))   name = m
         ;;   (letrec ((m (jolt-register-variadic! N (lambda …)))) m)   name = #f
         ;; An ANONYMOUS fn has no binding of its own — it is emitted bare so the
-        ;; enclosing (define jv$ns$name …) names it — so its def registers the
+        ;; enclosing (define jv$ns/name …) names it — so its def registers the
         ;; sibling call instead (emit-def-cached), and *variadic-reg-suppressed?*
         ;; tells this fn to leave it alone.
         variadic-fixed (some (fn [a] (when (:rest a) (count (:params a)))) arities)
@@ -3570,7 +3629,7 @@
         ;; frame to ns/name (file:line). Chez names the frame by whatever emit-fn
         ;; binds the lambda to: a NAMED fn (defn, or (fn foo …)) gets a letrec
         ;; self-binding = munge-name of the fn's own name; an ANONYMOUS fn def has
-        ;; no letrec, so the lambda sits directly under (define jv$ns$name …) and
+        ;; no letrec, so the lambda sits directly under (define jv$ns/name …) and
         ;; takes that name. Register under whichever Chez will report.
         pos (:pos node)
         frame-name (when fn? (if-let [fnm (:name (:init node))] (munge-name fnm) b))

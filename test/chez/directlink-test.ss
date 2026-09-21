@@ -32,6 +32,13 @@
 ;; (jolt-var "ns" "name") binding in the def's let*. Outside one it resolves per
 ;; access: (var-deref "ns" "name"). Both are the var route; only jv$<ns>$<name> is
 ;; not, and that is what every assertion here is actually about.
+;; Every datum in the emitted text reads without error — an unescaped delimiter in
+;; a binding name (a bare | or a space) makes the read raise or stop short.
+(define (reads-clean? s)
+  (guard (e (#t #f))
+    (let ((p (open-input-string s)))
+      (let loop () (if (eof-object? (read p)) #t (loop))))))
+
 (define (var-routed? s ns name)
   (or (contains? s (string-append "(var-deref \"" ns "\" \"" name "\")"))
       (contains? s (string-append "(jolt-var \"" ns "\" \"" name "\")"))))
@@ -60,12 +67,12 @@
 (let ((eb (emit-form "app" "(def b (fn* ([] (a))))")))
   (ok "off: call to a routes through jolt-invoke + var-deref"
       (and (contains? eb "(jolt-invoke") (var-routed? eb "app" "a")))
-  (ok "off: no jv$ direct call" (not (contains? eb "(jv$app$a)")))
+  (ok "off: no jv$ direct call" (not (contains? eb "(jv$app/a)")))
   ;; a def carries source position in its var meta (:line/:column/:file), so it
   ;; emits def-var-with-meta! — but still NO jv$ binding off direct-link.
   (ok "off: def emits def-var-with-meta! (no jv$ binding, not linked)"
       (and (contains? (emit-form "app" "(def a (fn* ([] 1)))") "(def-var-with-meta! \"app\" \"a\"")
-           (not (contains? (emit-form "app" "(def a (fn* ([] 1)))") "(define jv$app$a"))
+           (not (contains? (emit-form "app" "(def a (fn* ([] 1)))") "(define jv$app/a"))
            (not (contains? (emit-form "app" "(def a (fn* ([] 1)))") "(def-var-linked!")))))
 
 ;; --- direct-link ON ---
@@ -74,62 +81,78 @@
 
 (let ((ea (emit-form "app" "(def a (fn* ([] 1)))")))   ; registers app/a in the set
   (ok "on: a's def emits a jv$ binding aliased to its var cell"
-      (and (contains? ea "(begin (define jv$app$a ")
-           (contains? ea "(def-var-linked! \"app\" \"a\" 'jv$app$a jv$app$a")))
+      (and (contains? ea "(begin (define jv$app/a ")
+           (contains? ea "(def-var-linked! \"app\" \"a\" 'jv$app/a jv$app/a")))
   ;; jolt#1009: the def is LINKED — it registers a setter over the binding, so a
   ;; later alter-var-root / with-redefs / def writes the new root through to the
   ;; jv$ name every direct call site applies and every value-ref reads. Without
   ;; it the binding froze at load and the var cell alone moved, so `(var-get #'a)`
   ;; and a compiled `a` disagreed for the rest of the process.
   (ok "on: a's def registers a write-through setter over the binding"
-      (contains? ea "(lambda (v) (set! jv$app$a v))")))
+      (contains? ea "(lambda (v) (set! jv$app/a v))")))
 
 (let ((ep (emit-form "app" "(def ||| (fn* ([] 7)))")))
   (ok "on: a pipe-named def emits a valid direct binding"
-      (contains? ep "(define jv$app$_V__V__V_ ")))
+      (contains? ep "(define jv$app/$V$V$V "))
+  (ok "on: a pipe-named def's emission reads back as Scheme" (reads-clean? ep)))
 (let ((eu (emit-form "app" "(def uses-pipe (fn* ([] (|||))))")))
   (ok "on: a pipe-named call uses its escaped direct binding"
-      (contains? eu "(jv$app$_V__V__V_)")))
+      (contains? eu "(jv$app/$V$V$V)")))
+;; The binding name is jv$ + the munged FQN (ns/name), the same identity the
+;; direct-link registry keys on, so two distinct vars can never share one: the
+;; old per-part _V_/_D_/_H_/_Q_ substitutions were plain text a user can write
+;; ((def _V_ …) and (def | …) both bound jv$app/_V_), and a $ separator between
+;; separately-munged parts could be forged by an escape in the ns name.
+(let ((ev (emit-form "app" "(def _V_ (fn* ([] 1)))"))
+      (ep (emit-form "app" "(def ||| (fn* ([] 7)))")))
+  (ok "on: a def literally named _V_ binds jv$app/_V_, not the pipe's name"
+      (and (contains? ev "(define jv$app/_V_ ") (not (contains? ep "jv$app/_V_")))))
+(let ((ed (emit-form "app" "(def $ (fn* ([] 1)))")))
+  (ok "on: a $-named def escapes the $ ($$) so it cannot read as a separator"
+      (and (contains? ed "(define jv$app/$$ ") (reads-clean? ed))))
+(let ((eq (emit-form "app" "(def a'# (fn* ([] 1)))")))
+  (ok "on: ' and # in a def name take the same $P/$H escapes locals do"
+      (and (contains? eq "(define jv$app/a$P$H ") (reads-clean? eq))))
 
 (let ((eb (emit-form "app" "(def b (fn* ([] (a))))")))
-  (ok "on: b's call to a is a direct (jv$app$a) call" (contains? eb "(jv$app$a)"))
+  (ok "on: b's call to a is a direct (jv$app/a) call" (contains? eb "(jv$app/a)"))
   (ok "on: b's call to a is NOT var-routed" (not (var-routed? eb "app" "a")))
   (ok "on: b's call to a is NOT jolt-invoke'd" (not (contains? eb "(jolt-invoke"))))
 
 (let ((eh (emit-form "app" "(def hof (fn* ([] a)))")))
-  (ok "on: a used as a value references the binding directly" (contains? eh " jv$app$a)"))
+  (ok "on: a used as a value references the binding directly" (contains? eh " jv$app/a)"))
   (ok "on: value-ref to a is NOT var-routed" (not (var-routed? eh "app" "a"))))
 
 ;; A map-valued (non-fn) def is invokable in Clojure but is NOT a Scheme procedure;
 ;; a direct-link call to it must route through jolt-invoke, never raw-apply the
 ;; binding (which crashed with "attempt to apply non-procedure" before the fix).
 (let ((ec (emit-form "app" "(def cfg {:a 1 :b 2})")))   ; registers app/cfg (non-fn) in the set
-  (ok "on: a non-fn def still gets a jv$ binding" (contains? ec "(define jv$app$cfg "))
+  (ok "on: a non-fn def still gets a jv$ binding" (contains? ec "(define jv$app/cfg "))
   ;; jolt#1009 was reported against exactly this shape — a plain value def, whose
   ;; only reachable uses are value-position reads of the binding.
   (ok "on: a non-fn def is linked too"
-      (and (contains? ec "(def-var-linked! \"app\" \"cfg\" 'jv$app$cfg jv$app$cfg")
-           (contains? ec "(lambda (v) (set! jv$app$cfg v))"))))
+      (and (contains? ec "(def-var-linked! \"app\" \"cfg\" 'jv$app/cfg jv$app/cfg")
+           (contains? ec "(lambda (v) (set! jv$app/cfg v))"))))
 (let ((eu (emit-form "app" "(def usecfg (fn* ([] (cfg :a))))")))
   (ok "on: call to a map-valued def routes through jolt-invoke" (contains? eu "(jolt-invoke"))
-  (ok "on: call to a map-valued def still uses the direct binding" (contains? eu "jv$app$cfg"))
-  (ok "on: a map-valued def is NOT raw-applied as a procedure" (not (contains? eu "(jv$app$cfg"))))
+  (ok "on: call to a map-valued def still uses the direct binding" (contains? eu "jv$app/cfg"))
+  (ok "on: a map-valued def is NOT raw-applied as a procedure" (not (contains? eu "(jv$app/cfg"))))
 
 ;; ^:dynamic opts out: no jv$ binding, callers stay indirect.
 (let ((ed (emit-form "app" "(def ^:dynamic d 5)")))
-  (ok "on: ^:dynamic def gets no jv$ binding" (not (contains? ed "(define jv$app$d")))
+  (ok "on: ^:dynamic def gets no jv$ binding" (not (contains? ed "(define jv$app/d")))
   (ok "on: ^:dynamic def is not linked" (not (contains? ed "(def-var-linked!"))))
 (let ((eu (emit-form "app" "(def usesd (fn* ([] (d))))")))
   (ok "on: call to a ^:dynamic var stays indirect" (var-routed? eu "app" "d"))
-  (ok "on: ^:dynamic var not direct-linked" (not (contains? eu "(jv$app$d)"))))
+  (ok "on: ^:dynamic var not direct-linked" (not (contains? eu "(jv$app/d)"))))
 
 ;; ^:redef opts out too (a def redefinable after build stays var-routed).
 (let ((er (emit-form "app" "(def ^:redef r 5)")))
-  (ok "on: ^:redef def gets no jv$ binding" (not (contains? er "(define jv$app$r")))
+  (ok "on: ^:redef def gets no jv$ binding" (not (contains? er "(define jv$app/r")))
   (ok "on: ^:redef def is not linked" (not (contains? er "(def-var-linked!"))))
 (let ((eu (emit-form "app" "(def usesr (fn* ([] (r))))")))
   (ok "on: call to a ^:redef var stays indirect" (var-routed? eu "app" "r"))
-  (ok "on: ^:redef var not direct-linked" (not (contains? eu "(jv$app$r)"))))
+  (ok "on: ^:redef var not direct-linked" (not (contains? eu "(jv$app/r)"))))
 
 ;; A var only defined LATER in emission order is not yet in the set -> indirect.
 (direct-link-reset!)

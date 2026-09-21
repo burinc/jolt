@@ -1,8 +1,8 @@
 ;; source-registry.ss — map emitted procedures back to Clojure source for native
 ;; stack traces, and render an uncaught throwable.
 ;;
-;; A direct-linked def compiles to (define jv$ns$name <fn>); the back end also
-;; emits (jolt-register-source! "jv$ns$name" ns name file line) once per such def
+;; A direct-linked def compiles to (define jv$ns/name <fn>); the back end also
+;; emits (jolt-register-source! "jv$ns/name" ns name file line) once per such def
 ;; — at definition time, so there is zero per-call cost. On an uncaught error we
 ;; walk Chez's native continuation frames, read each frame's procedure name, and
 ;; look it up here to print a Clojure backtrace.
@@ -16,7 +16,7 @@
 
 ;; Keyed by the procedure name Chez actually reports for a frame — the SHORT
 ;; munged fn name (the letrec self-binding emit-fn uses), e.g. "deepest", not the
-;; jv$ns$name global. Two vars in different namespaces can share a short name; an
+;; jv$ns/name global. Two vars in different namespaces can share a short name; an
 ;; 'ambiguous marker then keeps the frame name in the trace but drops the
 ;; (now-uncertain) ns/file:line, so a trace is never misattributed.
 (define source-registry (make-hashtable string-hash string=?))

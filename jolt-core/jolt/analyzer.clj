@@ -2005,7 +2005,7 @@
           ;; spec §3 and the reference. No (not shadowed) guard here.
           (and sf-name (contains? handled sf-name))
             ;; stamp the form's source offset onto a top-level def so the back end
-            ;; can register it (jv$ns$name -> source) for native stack traces.
+            ;; can register it (jv$ns/name -> source) for native stack traces.
             (let [node (analyze-special ctx sf-name form items env)
                   p (form-position form)]
               (if (and p (= :def (:op node))) (stamp-def-pos ctx env node p) node))

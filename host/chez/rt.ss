@@ -1161,9 +1161,9 @@
   (jolt-with-mutex var-table-mu (hashtable-clear! var-redefined-set)))
 ;; --- linked vars: a root that is also a top-level Scheme binding --------------
 ;; The seed is minted direct-linked (bootstrap.ss): a core def is emitted as
-;;   (define jv$ns$name <init>)
-;;   (def-var-linked! "ns" "name" 'jv$ns$name jv$ns$name (lambda (v) (set! jv$ns$name v)) meta)
-;; and a core->core call applies jv$ns$name — one top-level load, no
+;;   (define jv$ns/name <init>)
+;;   (def-var-linked! "ns" "name" 'jv$ns/name jv$ns/name (lambda (v) (set! jv$ns/name v)) meta)
+;; and a core->core call applies jv$ns/name — one top-level load, no
 ;; var-cell-deref, no jolt-invokeN. The binding and the var's root have to stay
 ;; ONE value, or a redefinition splits the world: direct callers on the old
 ;; root, var-routed callers (an app's, the REPL's) on the new. So every write of
@@ -2257,7 +2257,7 @@
 ;; a lookup resolves against is the final one.
 (load "host/chez/java/class-extensions.ss")
 
-;; Native stack traces: jv$ns$name -> source registry + continuation frame walk +
+;; Native stack traces: jv$ns/name -> source registry + continuation frame walk +
 ;; uncaught-throwable renderer. After the printers/equality it relies on.
 (load "host/chez/source-registry.ss")
 
