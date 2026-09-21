@@ -213,6 +213,15 @@
     ("(?x)[a# ]" "Unclosed character class near index 8\n(?x)[a# ]\n        ^")
     ("(?x) *" "Dangling meta character '*' near index 5\n(?x) *\n     ^")
     ("(?x)(?#c)" "Unknown inline modifier near index 9\n(?x)(?#c)")
+    ;; ...and a flag group that turns COMMENTS OFF does not turn it on. The x
+    ;; on either side of the "-" used to, so the validator stripped what the
+    ;; translator kept and read a different pattern than the one built: these
+    ;; three compiled here and are errors on the JVM.
+    ("(?-x)#\\k" "\\k is not followed by '<' for named capturing group near index 8\n(?-x)#\\k")
+    ("(?i-x)#\\k" "\\k is not followed by '<' for named capturing group near index 9\n(?i-x)#\\k")
+    ("(?idmsux-idmsux)#\\k" "\\k is not followed by '<' for named capturing group near index 19\n(?idmsux-idmsux)#\\k")
+    ("(?-x)#(" "Unclosed group near index 7\n(?-x)#(")
+    ("(?x)#\\k" #f)
     ("(?x)\\k <a>" "named capturing group <a> does not exist near index 9\n(?x)\\k <a>\n         ^")
     ("(?x)a{2} {" "Illegal repetition near index 10\n(?x)a{2} {")
     ("(?x)a\\ (" "Unclosed group near index 8\n(?x)a\\ (")

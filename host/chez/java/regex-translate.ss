@@ -209,7 +209,12 @@
     ("PUNCTUATION" . ,(lambda (c) (memq (char-general-category c) '(Pc Pd Ps Pe Pi Pf Po))))
     ("CONTROL" . ,(lambda (c) (eq? (char-general-category c) 'Cc)))
     ("ASSIGNED" . ,(lambda (c) (not (eq? (char-general-category c) 'Cn))))
-    ("HEX_DIGIT" . ,(lambda (c) (or (and (char<=? #\0 c) (char<=? c #\9))
+    ;; UnicodeProp.HEXDIGIT is DIGIT.is(ch) || the ASCII and fullwidth spellings,
+    ;; so EVERY Nd digit is a hex digit to java.util.regex — U+1C50, U+0660 and
+    ;; U+0966 all answer \p{IsHex_Digit} on the JDK. A wider set than Unicode's
+    ;; own Hex_Digit property, and the JVM's is what this has to answer.
+    ("HEX_DIGIT" . ,(lambda (c) (or (eq? (char-general-category c) 'Nd)
+                                    (and (char<=? #\0 c) (char<=? c #\9))
                                     (and (char<=? #\a c) (char<=? c #\f))
                                     (and (char<=? #\A c) (char<=? c #\F))
                                     (and (char<=? #\xFF10 c) (char<=? c #\xFF19))
@@ -427,7 +432,14 @@
         (and (< j n)
              (let ((c (string-ref s j)))
                (cond ((char=? c #\x) (scan (+ j 1) #t))
-                     ((memv c '(#\s #\i #\m #\u #\d #\U #\c #\-)) (scan (+ j 1) x?))
+                     ;; the same flag set apply-global-x accepts, and no wider:
+                     ;; a group naming "-" turns flags OFF, so (?-x), (?i-x) and
+                     ;; (?idmsux-idmsux) all leave COMMENTS mode off. Taking the
+                     ;; x on either side of the "-" as switching it on stripped
+                     ;; whitespace and #-comments the translator kept, so the
+                     ;; validator read a different pattern than the one built:
+                     ;; (?-x)#\k compiled here and is an error on the JVM.
+                     ((memv c '(#\s #\i #\m #\u #\d #\U)) (scan (+ j 1) x?))
                      ((and (char=? c #\)) x?) (+ j 1))
                      (else #f))))))
     (let find ((i 0) (in-class #f))
