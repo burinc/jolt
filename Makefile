@@ -967,7 +967,7 @@ directlink:
 	@$(CHEZ) --script test/chez/directlink-test.ss
 
 # Unique anon-fn letrec names + source-form registration (R1): a user-ns anon
-# literal registers jfn$<ns>$<def>$<n> -> {form, ns, free-names} and the live
+# literal registers jfn$<ns>/<def>$<n> -> {form, ns, free-names} and the live
 # closure's inspector name must agree; system-ns closures stay unregistered.
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss

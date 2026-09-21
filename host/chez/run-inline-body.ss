@@ -313,7 +313,7 @@
 ;;    un-spliced literal registers exactly as it always did -- the registry
 ;;    defaults the live names to the source names, and defaulting is `eq?`, so
 ;;    this reads whether the fifth argument was emitted at all.
-(let ((reg (image-fn-form-lookup "jfn$ilglib$ilg-mk$0")))
+(let ((reg (image-fn-form-lookup "jfn$ilglib/ilg-mk$0")))
   (gate-check "the callee's own literal is registered" (vector? reg) #t)
   (gate-check "an un-spliced registration carries no capture list"
               (eq? (vector-ref reg 2) (vector-ref reg 3)) #t))
@@ -339,7 +339,7 @@
   (gate-check "and its literal IS registered"
               (gate-sub? e "image-register-fn-form!") #t))
 
-(let ((reg (image-fn-form-lookup "jfn$ilgapp$ilg-app-live$0")))
+(let ((reg (image-fn-form-lookup "jfn$ilgapp/ilg-app-live$0")))
   (gate-check "a spliced literal is registered at all" (vector? reg) #t)
   (when (vector? reg)
     (gate-check "a spliced registration carries one"

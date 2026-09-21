@@ -336,7 +336,7 @@
 (define-record-type image-handled (fields payload) (nongenerative image-handled-v1))
 
 ;; An anonymous closure a state image can rebuild from source (write side here;
-;; R3 reconstructs). name is the unique jfn$<ns>$<def>$<n> the backend bound
+;; R3 reconstructs). name is the unique jfn$<ns>/<def>$<n> the backend bound
 ;; the literal under — what Chez's inspector reports for the live closure;
 ;; form/ns/free-names come from the load-time registration (fn-form-registry.ss);
 ;; free-values are the LIVE captured values recovered by name through the
@@ -630,9 +630,9 @@
   (guard (e (#t #f))
     (let* ((info (sa-procedure-info x))
            (nm (and info (car info))))
-      ;; No prefix test: an anonymous literal is bound under jfn$..., a NAMED one
-      ;; under <name>$jf<n>, and the registry lookup is the real question either
-      ;; way -- a name nothing registered simply misses.
+      ;; No prefix test: a literal is bound under jfn$<ns>/<def>$<n>, a NAMED
+      ;; one with /<name> appended, and the registry lookup is the real question
+      ;; either way -- a name nothing registered simply misses.
       (and (string? nm)
            (let ((reg (image-fn-form-lookup nm)))
              (and reg (cons nm reg)))))))
