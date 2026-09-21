@@ -69,6 +69,11 @@
     * loading a namespace pre-loads its `(ns … (:require …))` dependencies
       through the loader first, so the compiler resolves the context's own
       version of every dependency.
+    * a namespace's source is read and evaluated form by form, the way the
+      host loader reads one: the file's `ns` form has run by the time the rest
+      of it is read, so the aliases and refers that form installs are in force
+      for the reader, and syntax quotes resolve in the namespace the file
+      declares, never in the caller's.
     * a call through `require` / `use` / `refer` / `resolve` / `ns-resolve` /
       `find-var` in evaluated source compiles to its context-carrying form
       (`__require-in` and friends): the compiler's var-call hook
@@ -1016,18 +1021,6 @@
 
 ;; --- reading and evaluating a namespace source ----------------------------
 
-(defn- read-forms
-  "Every top-level form in FILE, in order. Metadata (line/column) is kept on
-   the forms the reader put it on."
-  [file]
-  (with-open [r (java.io.PushbackReader. (io/reader file))]
-    (let [eof (Object.)]
-      (loop [xs []]
-        (let [f (read r false eof)]
-          (if (identical? eof f)
-            xs
-            (recur (conj xs f))))))))
-
 (defn- ns-form?
   [f]
   (and (seq? f) (= 'ns (first f)) (symbol? (second f))))
@@ -1261,34 +1254,50 @@
 
 (defn- eval-namespace-source
   "Read FILE, evaluate it as NS-NAME in the host namespace space, and answer
-   {:handle <namespace object> :vars {sym cell}}."
+   {:handle <namespace object> :vars {sym cell}}.
+
+   Like the host loader, forms are read and evaluated one at a time: a form is
+   read only after the ones before it ran, so the file's own namespace — and
+   the aliases and refers its `ns` form installed — are in force for the
+   reader. A syntax quote therefore resolves in the namespace the file
+   declares, not in whatever namespace the caller happened to be in. Only the
+   forms through the first `ns` form are read ahead, because its requires are
+   preloaded through this loader before the private-load claim is taken (a
+   claim is never held while waiting on another)."
   [l ns-name file]
-  ;; a context's data-reader vars must be loaded through IT (the host's require
-  ;; has no business finding them), then its file is bound over the host table
-  ;; while the source is read.
-  (let [forms (read-forms file)]
-    (when (empty? forms)
-      (unreadable! l ns-name (str file " is empty")))
-    (doseq [dep (required-ns-names forms)]
-      (when (not= dep ns-name)
-        (preload-dep! l dep)
-        ;; The runtime `require` inside the ns form would load from the GLOBAL
-        ;; roots whatever this loader could not serve, silently compiling the
-        ;; source against definitions the context cannot see (a hermetic
-        ;; context's clojure.string, say). Resolving only through the loader is
-        ;; what makes the policies and the delegate chain mean anything.
-        (when-not (resolve l {:kind :ns :name dep})
-          (throw (ex-info (str "namespace " ns-name " requires " dep
-                               ", which this loader cannot serve; add its root,"
-                               " delegate it, or inject it")
-                          {:type :loader/unreadable :kind :ns :name dep})))))
-    (with-private-load-claim
-      ns-name
-      (fn []
-        (if (reloading? ns-name)
-          (claim-private! l ns-name)
-          (mark-private! l ns-name))
-        (try
+  (with-open [r (java.io.PushbackReader. (io/reader file))]
+    (let [eof (Object.)
+          ;; Read through the first ns form, or the whole file when there is
+          ;; none. Reading stops there because the forms after it must be read
+          ;; once it has run — see the docstring — and the requires it names
+          ;; are the ones preloaded below, before evaluation.
+          prefix (loop [xs []]
+                   (let [f (read r false eof)]
+                     (cond
+                       (identical? eof f) xs
+                       (ns-form? f) (conj xs f)
+                       :else (recur (conj xs f)))))]
+      (when (empty? prefix)
+        (unreadable! l ns-name (str file " is empty")))
+      (doseq [dep (required-ns-names prefix)]
+        (when (not= dep ns-name)
+          (preload-dep! l dep)
+          ;; The runtime `require` inside the ns form would load from the GLOBAL
+          ;; roots whatever this loader could not serve, silently compiling the
+          ;; source against definitions the context cannot see (a hermetic
+          ;; context's clojure.string, say). Resolving only through the loader
+          ;; is what makes the policies and the delegate chain mean anything.
+          (when-not (resolve l {:kind :ns :name dep})
+            (throw (ex-info (str "namespace " ns-name " requires " dep
+                                 ", which this loader cannot serve; add its root,"
+                                 " delegate it, or inject it")
+                            {:type :loader/unreadable :kind :ns :name dep})))))
+      (with-private-load-claim
+        ns-name
+        (fn []
+          (if (reloading? ns-name)
+            (claim-private! l ns-name)
+            (mark-private! l ns-name))
           (try
             ;; *file* is the source being evaluated, as load binds it, so a
             ;; def that reads it (a resource path relative to its own file, a
@@ -1297,41 +1306,50 @@
             (binding [*ns* *ns*
                       *file* file
                       jolt.host/*invoke-rewrite* (context-rewriter (:id l) ns-name)]
-              (doseq [f forms]
-                (eval f)))
+              (letfn [(eval-form [f]
+                        (try
+                          (eval f)
+                          (catch :default e
+                            ;; an unresolved #tag is the one failure the runtime
+                            ;; reports as a bare "cannot compile this value" —
+                            ;; name the tag and the reason
+                            (if-let [tags (seq (unresolved-reader-tags [f]))]
+                              (throw (ex-info (str "the source of " ns-name " uses " (count tags)
+                                                   (if (= 1 (count tags)) " reader tag " " reader tags ")
+                                                   (str/join " " (map #(str "#" %) (sort tags)))
+                                                   (if (declares-data-readers? l)
+                                                     (str ": its roots ship a data_readers.clj, but"
+                                                          " per-context data readers are not supported"
+                                                          " — register the tag in the host's"
+                                                          " *data-readers* (or read such data with"
+                                                          " clojure.edn/read-string and a :readers map)")
+                                                     ": no reader is registered for it"))
+                                            {:type :loader/unreadable :kind :ns :name ns-name
+                                             :tags (vec (sort tags))}
+                                            e))
+                              (throw e)))))]
+                (doseq [f prefix]
+                  (eval-form f))
+                (loop []
+                  (let [f (read r false eof)]
+                    (when-not (identical? eof f)
+                      (eval-form f)
+                      (recur))))))
+            (let [n (find-ns (symbol ns-name))]
+              (when-not n
+                (unreadable! l ns-name (str "the source did not define it (" file ")")))
+              {:handle n :vars (ns-interns n)})
             (catch :default e
-              ;; an unresolved #tag is the one failure the runtime reports as a
-              ;; bare "cannot compile this value" — name the tag and the reason
-              (if-let [tags (seq (unresolved-reader-tags forms))]
-                (throw (ex-info (str "the source of " ns-name " uses " (count tags)
-                                     (if (= 1 (count tags)) " reader tag " " reader tags ")
-                                     (str/join " " (map #(str "#" %) (sort tags)))
-                                     (if (declares-data-readers? l)
-                                       (str ": its roots ship a data_readers.clj, but"
-                                            " per-context data readers are not supported"
-                                            " — register the tag in the host's"
-                                            " *data-readers* (or read such data with"
-                                            " clojure.edn/read-string and a :readers map)")
-                                       ": no reader is registered for it"))
-                                  {:type :loader/unreadable :kind :ns :name ns-name
-                                   :tags (vec (sort tags))}
-                                  e))
-                (throw e))))
-          (let [n (find-ns (symbol ns-name))]
-            (when-not n
-              (unreadable! l ns-name (str "the source did not define it (" file ")")))
-            {:handle n :vars (ns-interns n)})
-          (catch :default e
-            ;; A failed load leaves no partial namespace behind: the claim is
-            ;; held, so whatever is installed under the name was installed by
-            ;; this evaluation. A failed :reload is the exception — it was
-            ;; re-evaluating the INSTALLED namespace in place, and that
-            ;; namespace is what already-linked code is holding, so dropping
-            ;; the registration would be the destructive choice.
-            (when (and (not (reloading? ns-name))
-                       (find-ns (symbol ns-name)))
-              (remove-ns (symbol ns-name)))
-            (throw e)))))))
+              ;; A failed load leaves no partial namespace behind: the claim is
+              ;; held, so whatever is installed under the name was installed by
+              ;; this evaluation. A failed :reload is the exception — it was
+              ;; re-evaluating the INSTALLED namespace in place, and that
+              ;; namespace is what already-linked code is holding, so dropping
+              ;; the registration would be the destructive choice.
+              (when (and (not (reloading? ns-name))
+                         (find-ns (symbol ns-name)))
+                (remove-ns (symbol ns-name)))
+              (throw e))))))))
 
 (defn- source-roots-ns-load
   "The backend's namespace reader: a namespace already linked through the home
