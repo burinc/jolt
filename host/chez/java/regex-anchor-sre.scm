@@ -153,6 +153,10 @@
        (else #f)))
     (else #f)))
 
+;; How far past i a forward-reading assertion in a look-behind body must be able
+;; to see; see the symbol arm of %sre-lookbehind-ext below for why three.
+(define %lookbehind-assertion-ext 3)
+
 ;; The extra forward reach a LOOK-BEHIND body needs PAST the position i at which it
 ;; must end: its consuming parts all end at or before i, so only a nested
 ;; look-AROUND reads past i.  This is the width to extend the wrapped chunk by so an
@@ -177,6 +181,51 @@
        ((seq : atomic w/case w/nocase w/utf8 w/noutf8 word or
          ? ?? * *? + +? word+) (max-ext (cdr sre)))
        (else #f)))
+    ;; jolt-69q: an assertion that READS FORWARD from the position it is tested
+    ;; at cannot be evaluated against a chunk wrapped to end at i — the wrap IS
+    ;; the end of input as far as it can tell, so it answers about the wrap
+    ;; instead of about the subject.  Whether i ends the input, ends a line, or
+    ;; ends a word are all questions about what comes AFTER i:
+    ;;
+    ;;   (re-find #"(?<=a$)" "ab")   matched at 1, where the JVM does not
+    ;;   (re-find #"(?<=a\b)" "ab")  likewise — eow saw the wrap, not the 'b'
+    ;;   (re-find #"(?m)(?<=^)" "ab") found NOTHING, where the JVM finds 0:
+    ;;     %java-bol is "...and not at the end of input", so the wrap made
+    ;;     every position look like the end and the anchor declined them all
+    ;;
+    ;; A FINITE widening is enough, and #f (the whole chunk) is not needed: each of
+    ;; these assertions only has to see a bounded distance past i to answer.  The
+    ;; chunk is wrapped to min(i + ext, real end), so when the real input runs out
+    ;; first the assertion is reading the true end, and when it does not the window
+    ;; stays full — which is itself the answer, because a full window means more
+    ;; input follows.  %look-behind-end then pins the body's own end back to i, so
+    ;; the widening lets the assertion LOOK past i without letting the body MATCH
+    ;; past it.
+    ;;
+    ;; Three is the widest any of them needs:
+    ;;   \z, eos          1 — is there any unit after i at all
+    ;;   bow, eow, nwb     1 — the character AT i (bow reads forward, despite the name)
+    ;;   %java-bol         1 — Java's ^ is "...and not at the end of input"
+    ;;   $, \Z            3 — "end of input, or before the FINAL line terminator".
+    ;;                         The longest terminator is \r\n, two units, so a
+    ;;                         still-full three-unit window cannot be a lone
+    ;;                         terminator and the assertion correctly declines.
+    ;;
+    ;; Keeping it finite is the point: ext = #f would be correct too, but it hands
+    ;; the body the whole chunk, and the (* any) prefix then runs to the end of the
+    ;; input at every position — O(n^2) for a scan, which is exactly the cost #1062
+    ;; exists to remove.  Measured over a 10k-unit subject: (?<=a$) scans in 1.8 ms
+    ;; with the bounded window against 1582 ms with the whole chunk, and (?<=\b) in
+    ;; 2.8 ms against 2814 ms.
+    ;;
+    ;; bos is the one assertion left at 0: \A is i = 0 and nothing else, a purely
+    ;; backward question no wrap can affect.
+    ((symbol? sre)
+     (case sre
+       ((eos eol eow nwb bow bol
+         %java-bol %java-eol %java-final-eol
+         %java-bol-unix %java-final-eol-unix) %lookbehind-assertion-ext)
+       (else 0)))
     (else 0)))
 
 (define (sre->procedure sre . o)

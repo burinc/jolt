@@ -163,6 +163,98 @@
 (ok "a string-alternation look-behind still rescans" (> (rescans "(?<=ab|cd)e" (rep 500 "abe")) 0))
 (ok "a two-char look-behind still answers" (equal? (matches "(?<=ab)c" "zcabc") '("c")))
 
+;; --- an assertion INSIDE a look-behind body reads the real input (jolt-69q) ---
+;; The look-behind wraps the chunk to end at the current position, which is the
+;; whole point of the bounded rescan above -- but an assertion that reads FORWARD
+;; then answers about the wrap instead of about the subject.  $ saw the wrap as
+;; end-of-input, \b saw it as end-of-word, and %java-bol ("...and not at the end
+;; of input") saw every position as the end and declined them all, so
+;; (?m)(?<=^) found nothing at all.  %sre-lookbehind-ext now answers #f for those
+;; assertions, which restores the full-chunk wrap and lets %look-behind-end pin
+;; the body's end back to i.
+;;
+;; These are START INDICES, not substrings: every match here is zero-width, so
+;; the substring form the vectors above use cannot tell position 1 from position
+;; 2.  Every expected value was taken from reference JVM Clojure.
+(define (starts pattern-string s)
+  (let ((irx (regex-t-irx (jolt-regex pattern-string))))
+    (let loop ((i 0) (acc '()))
+      (let ((m (and (<= i (string-length s)) (irx-search-from irx s i))))
+        (if (not m)
+            (reverse acc)
+            (let ((ms (irregex-match-start-index m 0)) (me (irregex-match-end-index m 0)))
+              (loop (if (> me ms) me (+ me 1)) (cons ms acc))))))))
+
+(define lookbehind-vectors
+  '(;; $ / \Z / \z inside the body: the bead's own case is the first row
+    ("(?<=a$)"      "ab"     ())
+    ("(?<=a$)"      "a"      (1))
+    ("(?<=a$)"      "a\n"    (1))
+    ("(?<=a$)"      "a\nb"   ())
+    ("(?<=a\\Z)"    "ab"     ())
+    ("(?<=a\\Z)"    "a"      (1))
+    ("(?<=a\\z)"    "ab"     ())
+    ("(?<=a\\z)"    "a"      (1))
+    ;; the negative form follows from the positive one
+    ("(?<!a$)b"     "ab"     (1))
+    ("(?<!a$)b"     "a\nb"   (2))
+    ;; the anchor inside an alternation and behind a char class
+    ("(?<=a$|c)"    "ab"     ())
+    ("(?<=a$|c)"    "a"      (1))
+    ("(?<=[ab]$)"   "ab"     (2))
+    ("(?<=[ab]$)"   "a"      (1))
+    ;; multiline ^ inside a look-behind: nothing matched before jolt-69q
+    ("(?m)(?<=^)"   "ab"     (0))
+    ("(?m)(?<=^)"   "a\nb"   (0 2))
+    ("(?m)(?<=^)"   "\na"    (0 1))
+    ("(?m)(?<=\\n^)" "a\nb"  (2))
+    ("(?m)(?<=a$)"  "ab"     ())
+    ("(?m)(?<=a$)"  "a\n"    (1))
+    ;; shapes the fix must NOT disturb: \A is purely backward, a nested
+    ;; look-ahead already had its own widening, and a plain body is untouched.
+    ("(?<=\\A)"     "ab"     (0))
+    ("(?<=^a)"      "ab"     (1))
+    ("(?<=^a)"      " ab"    ())
+    ("(?<=a(?=b))"  "ab"     (1))
+    ("(?<=a)"       " ab"    (2))
+    ;; The line terminators $ and \Z look past: these are what sizes the widening
+    ;; window at 3 (a lone \r\n is two units, so three still-available units mean
+    ;; more input follows and the assertion must decline).  All JVM-verified.
+    ("(?<=a$)"      "a\r\n"   (1))
+    ("(?<=a$)"      "a\r\nb"  ())
+    ("(?<=a$)"      "a\r"     (1))
+    ("(?<=a$)"      "a\r\n\r\n" ())
+    ("(?<=a$)"      "a\n\n"   ())
+    ("(?<=a\\Z)"    "a\r\n"   (1))
+    ("(?<=a\\Z)"    "a\r\nb"  ())
+    ("(?<=a\\z)"    "a\r\n"   ())
+    ("(?m)(?<=a$)"  "a\r\nb"  (1))))
+
+(for-each
+  (lambda (v)
+    (let ((pat (car v)) (s (cadr v)) (want (caddr v)))
+      (ok (string-append "starts " pat " over " (format "~s" s) " = " (format "~a" want))
+          (equal? (starts pat s) want))))
+  lookbehind-vectors)
+
+;; The look-behind layer must be TRANSPARENT for an assertion body: testing X
+;; inside (?<=X) at position i has to answer exactly what testing X at i answers
+;; on its own.  That is the invariant jolt-69q broke and this restores, and it is
+;; worth pinning separately from the values above because it still holds while
+;; jolt's own \b disagrees with the JVM at the input edges (a distinct defect --
+;; \b and \B there are wrong with or without the look-behind).  When that is
+;; fixed these rows keep passing; if the look-behind ever starts wrapping the
+;; chunk away from an assertion again, they fail even though the JVM-valued rows
+;; above might not cover the shape.
+(for-each
+  (lambda (pat)
+    (for-each
+      (lambda (s)
+        (ok (string-append "(?<=" pat ") is transparent over " (format "~s" s))
+            (equal? (starts (string-append "(?<=" pat ")") s) (starts pat s))))
+      '("ab" " ab" "ab " "a b" "a\n" "a\nb" "\na" "a" "")))
+  '("\\b" "\\B" "$" "\\z" "\\Z" "\\A"))
+
 (set! wrap-end-chunker saved-wrap)
 (printf "regex-anchor: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))
