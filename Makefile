@@ -189,7 +189,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine mvnh
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -822,6 +822,15 @@ gosm:
 # the same bug class through a core.async pipeline sweep.
 threadsafety:
 	@$(CHEZ) --script test/chez/thread-safety-test.ss
+
+# compare-and-swap is strong. Chez's $record-cas! is one ldxr/stxr attempt on
+# AArch64 and answers #f with the field still holding the expected value when
+# the exclusive monitor was cleared under it; sa-record-cas! retries while it
+# does. Scenarios 2 and 3 are reproducers: on the weak primitive they count
+# spurious refusals on Apple silicon (ring-chez-adapter lost one connection in
+# ~1400 to one); on x86 they can only check the semantics.
+cas:
+	@$(CHEZ) --script test/chez/cas-test.ss
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value
