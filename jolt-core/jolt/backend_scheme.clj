@@ -394,7 +394,11 @@
 ;; jv$<ns>$<name>; chars that break a Scheme identifier or the `$` separator are
 ;; escaped so distinct vars never collide.
 (defn- dl-munge [s]
-  (-> s (str/replace "$" "_D_") (str/replace "#" "_H_") (str/replace "'" "_Q_")))
+  (-> s
+      (str/replace "$" "_D_")
+      (str/replace "#" "_H_")
+      (str/replace "'" "_Q_")
+      (str/replace "|" "_V_")))
 (defn- dl-name [ns nm] (str "jv$" (dl-munge ns) "$" (dl-munge nm)))
 (defn- dl-fqn [ns nm] (str ns "/" nm))
 (defn- direct-linkable? [ns nm]
@@ -951,21 +955,21 @@
   ;; A Clojure symbol may carry chars that break a Scheme identifier or that
   ;; collide once substituted: ' is the quote reader macro (a bare f' reads as f
   ;; then 'rest), # is the auto-gensym suffix the reader puts on #() params
-  ;; (p__1#) and starts a Scheme datum, and $ is the escape marker used below.
-  ;; Map all three to safe tokens INJECTIVELY so two distinct Clojure locals can
-  ;; never munge to the same Scheme identifier: reserve $ as the escape char and
-  ;; escape it FIRST ($$ = a literal $), then ' -> $P and # -> $H. Decoding is an
-  ;; unambiguous left-to-right inverse ($$ -> $, $P -> ', $H -> #): every $ in
-  ;; the output is either doubled (came from a literal $) or single+P/+H (came
-  ;; from ' / #), so no two inputs share an output. The same mapping applies at
-  ;; the binding and at every reference, so resolution stays consistent. Only the
+  ;; (p__1#) and starts a Scheme datum, | starts a delimited identifier, and $
+  ;; is the escape marker used below. Map all four to safe tokens INJECTIVELY so
+  ;; two distinct Clojure locals can never munge to the same Scheme identifier:
+  ;; reserve $ as the escape char and escape it FIRST ($$ = a literal $), then
+  ;; ' -> $P, # -> $H, and | -> $V. Decoding has an unambiguous left-to-right
+  ;; inverse, so no two inputs share an output. The same mapping applies at the
+  ;; binding and at every reference, so resolution stays consistent. Only the
   ;; char-substitution step changes; the reserved/emitted-name _-prefix below is
   ;; untouched (it runs on the substituted string; a $ -> $$ still leaves the
   ;; jv$/jolt- prefix tests true, and those runtime names never reach munge-name).
   (let [s (-> s
               (str/replace "$" "$$")
               (str/replace "'" "$P")
-              (str/replace "#" "$H"))]
+              (str/replace "#" "$H")
+              (str/replace "|" "$V"))]
     (if (or (contains? scheme-reserved s)
             (contains? bare-native-names s)
             (contains? rt-emitted-names s)
