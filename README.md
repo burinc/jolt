@@ -318,6 +318,20 @@ task, `name<TAB>doc`, which is the machine-readable form of what `jolt tasks`
 prints for a person. Anything scripting over a project's tasks should read that
 rather than parse the listing.
 
+A task that parses its own arguments — one with an `:exec-fn` or a `:cmd` tree,
+see below — carries a third field, `cli`, and completes past its own name:
+
+```
+$ jolt serve --<TAB>
+--port    port to listen on
+--host    interface to bind
+```
+
+Those options cannot be cached as a flat list, since what a task accepts depends
+on where the cursor is, so that one case does call jolt back — through
+`jolt org.babashka.cli/completions`, babashka.cli's own callback contract. Every
+other task still completes from the cache without starting jolt at all.
+
 A `:private` task and one whose name starts with `-` are left out, the same two
 `jolt tasks` hides. One case differs on purpose: a task sharing a built-in
 command's name is offered only when it wins that name with `:override-builtin`,
@@ -325,6 +339,43 @@ because a completion's description says what the word will do, and for a task
 that loses to a command the answer is the command. `jolt tasks` lists it either
 way, being a list of what the project defines rather than of what typing the
 word gets you.
+
+## Tasks that parse their arguments
+
+A `bb.edn` (or `deps.edn`) `:tasks` entry normally holds a body to run. An entry
+that names an `:exec-fn` instead — or a `:cmd` tree of them — has its arguments
+parsed by [babashka.cli](https://github.com/babashka/cli) first, which is
+babashka's own CLI-task feature and works here the same way:
+
+```clojure
+{:tasks
+ {:requires ([app.api :as api])
+
+  serve {:doc     "serve the app"
+         :exec-fn api/serve
+         :cli     {:spec {:port {:coerce :long :default 8080 :desc "port to listen on"}}}}
+
+  db    {:doc "database commands"
+         :cmd {"migrate" {:exec-fn api/migrate :spec {:steps {:coerce :long}}}
+               "seed"    {:exec-fn api/seed}}}}}
+```
+
+`jolt serve --port 9000` calls `api/serve` with `{:port 9000}`, coerced and
+validated; `jolt serve --help` prints the options and runs nothing; `jolt db
+migrate --steps 3` dispatches through the tree. A spec may live on the handler
+var as `:org.babashka/cli` metadata instead of in the task map, which is where
+`bb -x` reads it from too, and `:cli` may name a `def` for options edn cannot
+express, such as an `:error-fn`.
+
+`--help` short-circuits before the `:depends` walk: asking what a task accepts
+never runs its dependencies. A CLI task named in `:depends` does not parse on its
+own — its handler is called in its place in the graph with the options the
+target's parse produced, narrowed by its own `:restrict`, and its spec merges
+into the target's so those options parse and show up in `--help` there.
+
+The parser is vendored at `vendor/cli` and re-exported as `jolt.cli`, so a
+program can use it directly: `(require '[jolt.cli :as cli])` gives `parse-opts`,
+`parse-args`, `dispatch` and `format-opts`.
 
 ## Runtime dependencies
 
