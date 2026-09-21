@@ -1956,6 +1956,33 @@ check '(do (load-string "(set! *unchecked-math* true) :x") *unchecked-math*)' 'f
 check '(do (load-string "(set! *warn-on-reflection* true) :x") *warn-on-reflection*)' 'false'
 check '(do (load-string "(set! *assert* false) :x") *assert*)' 'true'
 
+# ...and the other direction, which is the one that was wrong: a nested load
+# INHERITS the enclosing frame's flags. Compiler.load pushes
+# WARN_ON_REFLECTION.deref(), not the var's root, so a file loaded from inside
+# another file sees the outer file's set! and stops seeing it only where that
+# outer frame ends. jolt bound the ROOT, which reset every nested load to the
+# defaults: an outer (set! *unchecked-math* true) was invisible to load-string,
+# load-file and require alike, so arithmetic under a require compiled
+# differently from the arithmetic above it (jolt-8sf).
+check '(do (set! *unchecked-math* true) (load-string "*unchecked-math*"))' 'true'
+check '(do (set! *warn-on-reflection* true) (load-string "*warn-on-reflection*"))' 'true'
+check '(do (set! *assert* false) (load-string "*assert*"))' 'false'
+# Both directions in one form: the inner set! is visible to the rest of the
+# inner load and gone once it returns, and the value it started from was the
+# enclosing frame's rather than the root.
+check '(do (set! *unchecked-math* true) [(load-string "(set! *unchecked-math* false) *unchecked-math*") *unchecked-math*])' '[false true]'
+# A real file, which is the other frame: load-string scopes through
+# compile-eval.ss, load-file and require through loader.ss ldr-with-file-vars,
+# and both read the value the same way now. The file PRINTS what it saw rather
+# than yielding it, because jolt's load-file answers nil where the reference
+# answers the last form's value (jolt-5gx) -- reading the value back through
+# the return would be testing that instead of this.
+inh_dir="$(mktemp -d)"
+printf '(println [*unchecked-math* *warn-on-reflection* *assert*])\n' > "$inh_dir/finner.clj"
+check "(do (set! *unchecked-math* true) (set! *warn-on-reflection* true) (set! *assert* false) (load-file \"$inh_dir/finner.clj\"))" '[true true false]'
+check "(load-file \"$inh_dir/finner.clj\")" '[false false true]'
+rm -rf "$inh_dir"
+
 # ...and -m/run -m carry the same frame: -main is code running AFTER the
 # require's load frame popped, so a -main that set! a flag used to throw where
 # the same form at the file's top level worked. The entry frame also reaches

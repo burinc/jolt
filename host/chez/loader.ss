@@ -512,10 +512,16 @@
 ;; A file load binds *file* to the path and *source-path* to the bare file
 ;; name around its forms (the reference binds both in Compiler.load), so loaded
 ;; code can read its own location. It also rebinds the compiler-flag vars
-;; *warn-on-reflection*, *assert* and *unchecked-math* to their current roots, so
-;; a file's top-level (set! *unchecked-math* …) is legal and its effect ends with
-;; the file rather than leaking into the root. Cells resolve lazily — the vars'
-;; defaults load after this file.
+;; *warn-on-reflection*, *assert* and *unchecked-math* to the values they
+;; currently hold, so a file's top-level (set! *unchecked-math* …) is legal and
+;; its effect ends with the file rather than leaking into the root.
+;;
+;; CURRENT, not root: Compiler.load pushes WARN_ON_REFLECTION.deref(), so a file
+;; loaded from inside another file INHERITS the outer one's flags and only stops
+;; inheriting where the outer frame ends. Binding the root reset every nested
+;; load to the defaults instead — measured against the reference, an outer
+;; (set! *unchecked-math* true) was invisible to load-string, load-file and
+;; require alike. Cells resolve lazily — the vars' defaults load after this file.
 (define ldr-file-cell #f)
 (define ldr-spath-cell #f)
 (define ldr-warn-cell #f)
@@ -540,9 +546,9 @@
         (dyn-with-frame
           (list (cons ldr-file-cell path)
                 (cons ldr-spath-cell name)
-                (cons ldr-warn-cell (var-cell-root ldr-warn-cell))
-                (cons ldr-assert-cell (var-cell-root ldr-assert-cell))
-                (cons ldr-unchecked-cell (var-cell-root ldr-unchecked-cell)))
+                (cons ldr-warn-cell (var-cell-deref ldr-warn-cell))
+                (cons ldr-assert-cell (var-cell-deref ldr-assert-cell))
+                (cons ldr-unchecked-cell (var-cell-deref ldr-unchecked-cell)))
           thunk))))
 
 ;; The loader's two compile-from-source entrances -- load-jolt-file* below and

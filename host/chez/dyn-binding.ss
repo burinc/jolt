@@ -216,7 +216,17 @@
                         '("*warn-on-reflection*" "*assert*" "*unchecked-math*"))))
         (if (for-all values cells) cells 'missing))))
   (if (pair? jolt-nsload-cells)
-      (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
+      ;; The CURRENT value, not the root. A load nested inside another load --
+      ;; a file that requires a namespace, a -main that load-strings -- inherits
+      ;; the enclosing file's flags on the JVM, because Compiler.load pushes
+      ;; WARN_ON_REFLECTION.deref() rather than its root. Binding the root here
+      ;; reset every nested load to the defaults, so an outer (set!
+      ;; *unchecked-math* true) stopped applying at the first require and the
+      ;; arithmetic under it compiled differently from the arithmetic above it.
+      ;; Where this frame is the OUTERMOST one -- an entry (-e, a built binary's
+      ;; -main) and the AOT replay this was written for -- nothing is bound
+      ;; above it, so the current value IS the root and this reads the same.
+      (map (lambda (c) (cons c (var-cell-deref c))) jolt-nsload-cells)
       '()))
 (define (jolt-ns-load-vars-push!)
   (dyn-push-frame! (jolt-ns-load-var-pairs))
