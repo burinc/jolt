@@ -959,6 +959,10 @@
 (jch-register-supers! "java.lang.Enum" '("java.lang.Comparable"))
 (jch-register-supers! "java.lang.Package" '())
 (jch-register-supers! "java.lang.Process" '())
+;; the handle shim's class had the same gap the redirect's did below — a tag row
+;; and no graph row — so it was not a known class, and the statics process.ss
+;; now registers had nothing to hang an (instance? ProcessHandle …) off
+(jch-register-supers! "java.lang.ProcessHandle" '())
 (jch-register-supers! "java.lang.ProcessBuilder" '())
 ;; the redirect shim's class had a tag row but no graph row, so it was not a
 ;; known class: no token, no nested-static modifier bit

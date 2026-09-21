@@ -41,6 +41,13 @@
 ;; file is load-ed at top level, so a second define of the same name silently wins
 ;; and the SIGCHLD restore below would reach the recorder instead.
 (define proc-libc-signal (jolt-foreign-proc-safe "signal" '(int void*) 'void*))
+;; getpid(2), for ProcessHandle.current(). Chez has none of its own (build.ss
+;; works around the gap where it needs per-process uniqueness), so all three
+;; spellings: POSIX, the Microsoft CRT's underscored one, and the Win32 API.
+(define proc-c-getpid
+  (or (jolt-foreign-proc-safe "getpid" '() 'int)
+      (jolt-foreign-proc-safe "_getpid" '() 'int)
+      (jolt-foreign-proc-safe "GetCurrentProcessId" '() 'unsigned-32)))
 ;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
 ;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
 ;; loop). All three spellings of the location accessor: Darwin/BSD, glibc/musl,
@@ -58,6 +65,7 @@
 (define proc-SIGKILL 9)
 (define proc-EINTR 4)          ; macOS + Linux
 (define proc-ECHILD 10)        ; macOS + Linux
+(define proc-EPERM 1)          ; macOS + Linux
 ;; SIGCHLD is 20 on Darwin/BSD and 17 on Linux. Same os-family test as
 ;; concurrency.ss uses for the SIG_BLOCK numerics.
 (define proc-SIGCHLD (if (eq? (sa-os-family) 'macos) 20 17))
@@ -1338,11 +1346,67 @@
                    (cons (car frontier) acc)))))))
 
 (define (make-proc-handle pid) (make-jhost "process-handle" pid))
+(define (proc-handle? x) (and (jhost? x) (string=? (jhost-tag x) "process-handle")))
+
+;; kill(pid, 0) asks whether a signal COULD be delivered — the portable liveness
+;; probe, and the only one available for a pid this process never spawned
+;; (proc-alive? reads a Process state's waitpid box, which a bare handle has no
+;; claim to). With no kill binding nothing can be known, so answer the way the
+;; JVM does for a handle it is holding.
+(define (proc-pid-alive? pid)
+  (if proc-kill
+      (or (= 0 (proc-kill pid 0))
+          ;; EPERM says the process EXISTS and this one may not signal it —
+          ;; another user's, pid 1 being the everyday case. Only ESRCH means
+          ;; there is nothing there, so reading any failure as dead would
+          ;; report every process but our own as gone.
+          (= (proc-errno) proc-EPERM))
+      #t))
+
 (register-host-methods! "process-handle"
   (list (cons "destroy" (lambda (self) (when proc-kill (proc-kill (jhost-state self) proc-SIGTERM)) #t))
+        (cons "destroyForcibly" (lambda (self) (when proc-kill (proc-kill (jhost-state self) proc-SIGKILL)) #t))
         (cons "pid"     (lambda (self) (->num (jhost-state self))))
+        (cons "isAlive" (lambda (self) (proc-pid-alive? (jhost-state self))))
+        ;; SIGTERM is catchable everywhere jolt binds kill; Windows has no
+        ;; binding and TerminateProcess is unconditional, which is exactly what
+        ;; the JVM reports there.
+        (cons "supportsNormalTermination" (lambda (self) (and proc-kill #t)))
+        (cons "equals"  (lambda (self o) (and (proc-handle? o) (eqv? (jhost-state self) (jhost-state o)))))
+        (cons "hashCode" (lambda (self) (->num (jhost-state self))))
+        ;; ProcessHandleImpl.toString is the pid and nothing else
+        (cons "toString" (lambda (self) (number->string (jhost-state self))))
         (cons "descendants" (lambda (self)
           (apply jolt-vector (map make-proc-handle (proc-descendants (jhost-state self))))))))
+
+;; ...and the CLASS. Everything above has answered since #600, and
+;; Process.toHandle builds one, but java.lang.ProcessHandle had a tag row
+;; (class-hierarchy.ss) and no statics, so the name resolved to nothing: even
+;; (ProcessHandle/current) — the portable way to ask for your OWN pid, to stamp
+;; into a log or temp filename — reported RFC 0014's "No dependency provides",
+;; advice no dependency can take for a class the runtime already models
+;; (jolt-lang/jolt#1087). The graph row is in class-hierarchy.ss beside
+;; java.lang.Process's, which is what makes (instance? ProcessHandle
+;; (.toHandle p)) answer true.
+;;
+;; of(pid) answers an Optional, empty for a pid nothing is running under, as the
+;; JVM's does — current() does not, since the caller's own process is there by
+;; construction.
+(register-class-statics! "java.lang.ProcessHandle"
+  (list (cons "current" (lambda ()
+          (if proc-c-getpid
+              (make-proc-handle (proc-c-getpid))
+              (throw-jvm (quote UnsupportedOperationException)
+                         "ProcessHandle.current(): this build resolves no getpid entry point"))))
+        ;; a non-positive pid is empty rather than a liveness probe: kill(0, 0)
+        ;; asks about the caller's whole process GROUP and kill(-n, 0) about
+        ;; group n, so both would answer "alive" for something that is not a
+        ;; process at all
+        (cons "of" (lambda (pid)
+          (let ((p (exact (truncate pid))))
+            (if (and (> p 0) (proc-pid-alive? p))
+                (jt-optional #t (make-proc-handle p))
+                jt-optional-empty))))))
 
 ;; --- CompletableFuture (Process.onExit().thenRun(f)) -------------------------
 ;; A minimal one-shot: thenRun spawns a thread that waits for the process to exit
