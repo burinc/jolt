@@ -436,7 +436,11 @@
                   (bytevector-copy! buf lo slice 0 len)
                   (let* ((s (utf8-bytes->string slice))
                          (n (string-length s)))
-                    (string-copy! s 0 str (fx+ start o) n)
+                    ;; sa-string-copy-range!, not string-copy!: Chez's takes
+                    ;; (from from-start to to-start count) and R7RS's the same
+                    ;; five in the opposite direction, so the raw one compiles
+                    ;; on both and copies backwards on one (CONTRACT.txt).
+                    (sa-string-copy-range! str (fx+ start o) s 0 n)
                     (set! lo cut)
                     (loop (fx+ o n)))))
                ;; Nothing complete in the window: either the request has room
