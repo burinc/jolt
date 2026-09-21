@@ -1124,62 +1124,135 @@
 ;; NOT announced: the loader reads namespace SOURCE through this too, and those
 ;; are described by the cache key already. slurp-path / io/resource / io/reader —
 ;; the entry points user code reaches — announce for themselves.
-;; 64 KB, the same block the reader drain uses: a single get-string-n! the size
-;; of the whole file measures no better than chunks (the decoder has no bulk win
-;; to give), and chunking keeps one bad length from asking for an absurd string.
-(define slurp-block-size 65536)
-
-;; The text of a file, decoded through the port's own transcoder.
+;; The BYTES of a file, read into a buffer allocated once.
 ;;
-;; get-string-all was the whole cost of slurp: it grows its result as it goes,
-;; so an 8.1 MB file cost 1745 ms against 1249 ms for the same decode into a
-;; buffer allocated ONCE — slurp is among the most-called IO functions in
-;; ordinary Clojure, and it was paying ~40% overhead on every call.
-;;
-;; The file's BYTE length is an exact upper bound on its character count (UTF-8
-;; never decodes more characters than it has bytes), so the result buffer can be
-;; allocated once up front. An ASCII file then needs no copy at all — the count
-;; comes back equal to the length and the buffer IS the answer; a file with
-;; multibyte characters decodes to fewer and takes one substring at the end.
-;;
-;; The DECODER IS UNCHANGED, deliberately. Reading the bytes and calling
-;; utf8->string is faster still (665 ms), but it is a different decoder: on an
-;; overlong sequence (C0 AF) the port's transcoder emits two replacement
-;; characters, as Java's CharsetDecoder does, and utf8->string emits one. Slurp
-;; is not the place to trade Java's behavior on malformed input for speed.
-(define (read-file-string-sized p n)
-  (let ((out (make-string n)))
+;; get-bytevector-all was the whole cost of slurp: it grows its result as it
+;; goes, so an 8.1 MB file cost 1745 ms against 1249 ms for the same read into a
+;; buffer allocated ONCE -- slurp is among the most-called IO functions in
+;; ordinary Clojure, and it was paying ~40% overhead on every call. file-length
+;; gives the exact size, so ask for it once.
+(define (read-file-bytes-sized p n)
+  (let ((out (make-bytevector n)))
     (let loop ((at 0))
       (cond
         ((fx<? at n)
-         (let ((k (get-string-n! p out at (fxmin slurp-block-size (fx- n at)))))
+         (let ((k (get-bytevector-n! p out at (fx- n at))))
            (if (or (eof-object? k) (fx=? k 0))
-               ;; fewer characters than bytes — the file had multibyte content
-               (substring out 0 at)
+               ;; shorter than file-length promised: truncated under the read
+               (let ((short (make-bytevector at)))
+                 (bytevector-copy! out 0 short 0 at)
+                 short)
                (loop (fx+ at k)))))
         ;; The bound was reached, which normally means done. A file being
-        ;; APPENDED to while it is read has more, and get-string-all would have
-        ;; taken it, so ask once rather than silently truncating.
+        ;; APPENDED to while it is read has more, and get-bytevector-all would
+        ;; have taken it, so ask once rather than silently truncating.
         (else
-         (let ((more (get-string-all p)))
-           (if (or (eof-object? more) (fx=? (string-length more) 0))
+         (let ((more (get-bytevector-all p)))
+           (if (or (eof-object? more) (fx=? (bytevector-length more) 0))
                out
-               (string-append out more))))))))
+               (let* ((m (bytevector-length more))
+                      (both (make-bytevector (fx+ n m))))
+                 (bytevector-copy! out 0 both 0 n)
+                 (bytevector-copy! more 0 both n m)
+                 both))))))))
 
+;; --- why an open failure is classified, and where ----------------------------
+;; The JVM raises java.io.FileNotFoundException when a path cannot be opened, and
+;; libraries branch on that class: instaparse decides whether its argument is a
+;; grammar or a file by slurping and catching FNF. A raw Chez i/o condition is
+;; not catchable as that class -- nor as any Java class -- so the caller's
+;; fallback never runs. The message is the JVM's shape: the path AS GIVEN, then
+;; the reason in parens. The JVM uses this one class for all the reasons, so only
+;; the parenthetical distinguishes them.
+;;
+;; This lives in io.ss rather than next to the stream constructors because slurp
+;; reaches a file through read-file-string-on-disk below, not through
+;; io-streams.ss -- and while that was the only opener NOT classifying, slurp of
+;; a directory, of an unreadable file and of anything at all under descriptor
+;; exhaustion all came back as a bare java.io.IOException carrying Chez's own
+;; wording (jolt-3ah).
+;;
+;; --- EMFILE is the reason a probe cannot reconstruct ---
+;; The open failed because the PROCESS is out of descriptors, and nothing is
+;; wrong with this path at all.  Re-probing the filesystem cannot see that -- the
+;; file is there and readable -- so the condition itself has to be asked, or the
+;; message blames the file's mode bits for the program's own leak.  The JVM
+;; reports EMFILE as "Too many open files" and so does this now.
+;; Read out of the IRRITANTS, not condition/report-string: Chez's EMFILE
+;; condition carries no i/o-file-name, so report-string raises trying to format
+;; it -- and it raises whether or not descriptors are still exhausted, so there
+;; is no waiting it out either.  The irritants hold what is wanted anyway, as
+;; ("/the/path" "Too many open files").
+(define (io-string-ci-contains? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((fx>? (fx+ i m) n) #f)
+            ((string-ci=? (substring s i (fx+ i m)) sub) #t)
+            (else (loop (fx+ i 1)))))))
+(define (io-emfile-condition? e)
+  (and (condition? e)
+       (let loop ((l (guard (e2 (#t '())) (condition-irritants e))))
+         (cond ((not (pair? l)) #f)
+               ((and (string? (car l)) (io-string-ci-contains? (car l) "too many open files")) #t)
+               (else (loop (cdr l)))))))
+
+;; EXC is the condition the open raised, when there was one -- it is asked first
+;; because it is the only authoritative account of why the open failed; the
+;; filesystem probes below are a reconstruction after the fact.
+(define (file-open-error given resolved . exc)
+  (throw-jvm (quote java.io.FileNotFoundException)
+             (string-append given " ("
+                            (cond ((and (pair? exc) (io-emfile-condition? (car exc)))
+                                                                 "Too many open files")
+                                  ((not (file-exists? resolved)) "No such file or directory")
+                                  ((file-directory? resolved)    "Is a directory")
+                                  (else                          "Permission denied"))
+                            ")")))
+
+;; Opening is guarded rather than pre-checked -- existence and permission can
+;; change between a check and the open, and only the open itself is
+;; authoritative. A DIRECTORY is the one case that needs the check: the JVM
+;; refuses it at construction, while a Chez port over a directory opens fine and
+;; raises on the first READ, far from the call that was wrong.
+;;
+;; That check is the only syscall this adds, and on the slurp path it replaces
+;; one: slurp-path used to stat for existence up front and now lets the open
+;; report it.
+(define (open-path-guarded given resolved thunk)
+  (when (file-directory? resolved) (file-open-error given resolved))
+  (guard (e ((i/o-error? e) (file-open-error given resolved e)))
+    (thunk resolved)))
+
+;; The text of a file: read the bytes, then decode them with the one decoder
+;; every other byte->text seam uses (natives-str.ss utf8-bytes->string).
+;;
+;; This used to read through the PORT's transcoder instead, which is Chez's
+;; UTF-8 codec and not java.nio's -- so the same bytes came back differently
+;; from (slurp f) and from (String. (.readAllBytes ...)), and a file with a BOM
+;; quietly lost its first character. Reading bytes is also the faster of the two
+;; (8.1MB x20: 1150ms against the transcoder's 1234ms); the well-formedness
+;; guard inside utf8-bytes->string spends that margin and about as much again,
+;; for a net ~8%.
+;;
+;; THE LOADER READS SOURCE THROUGH HERE, so a .clj beginning with a UTF-8 BOM
+;; now fails to read, exactly as it does on the JVM and on babashka
+;; ("Unable to resolve symbol: <U+FEFF>"). Chez's codec used to swallow the BOM
+;; and hide that, at the price of swallowing it out of DATA files too.
 (define (read-file-string path)
-  (if (jar-path? path)
-      (utf8->string (or (jar-path-bytes path) (jar-path-missing path)))
-      (read-file-string-on-disk path)))
-(define (read-file-string-on-disk path)
-  (with-port (open-input-file path)
+  (utf8-bytes->string
+   (if (jar-path? path)
+       (or (jar-path-bytes path) (jar-path-missing path))
+       (read-file-bytes-on-disk path))))
+(define (read-file-bytes-on-disk path)
+  (with-port (open-path-guarded path path (lambda (p) (open-file-input-port p)))
     (lambda (p)
       ;; A port with no meaningful length — a fifo, a character device — reports
       ;; 0 or raises; both fall back to the growing read, which is correct for
       ;; anything whose size cannot be known in advance.
       (let ((n (guard (e (#t #f)) (file-length p))))
         (if (and (fixnum? n) (fx>? n 0))
-            (read-file-string-sized p n)
-            (let ((s (get-string-all p))) (if (eof-object? s) "" s)))))))
+            (read-file-bytes-sized p n)
+            (let ((bv (get-bytevector-all p))) (if (eof-object? bv) (bytevector) bv)))))))
 
 ;; Drain a jhost reader (StringReader / PushbackReader): read code units from the
 ;; current position to EOF (-1) and assemble the string. Used by slurp; advances
@@ -1379,7 +1452,12 @@
 ;; catchable as that class, so the caller's fallback never runs.
 (define (slurp-path path)
   (io-note-file-read! path)
-  (unless (if (jar-path? path) (jar-path-exists? path) (file-exists? path))
+  ;; An entry inside a jar has no open to fail, so its absence is still checked
+  ;; here. A path ON DISK is not pre-checked: read-file-string-on-disk opens
+  ;; through open-path-guarded, which reports a missing file the same way and
+  ;; also reports the three this used to miss -- a directory, an unreadable
+  ;; file, and an open refused because the process is out of descriptors.
+  (when (and (jar-path? path) (not (jar-path-exists? path)))
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
   (read-file-string path))
@@ -1473,15 +1551,24 @@
                (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
   (let* ((p (project-relative (if (url-jhost? path) (url-write-path path) (file-path-of path))))
          (text (jolt-str-render-one content)))
+    ;; The JVM opens the TARGET, so a target it cannot open fails here and names
+    ;; itself. This wrote its temp file first and only discovered the target at
+    ;; the rename, which came back as Chez's "cannot rename ..." inside a plain
+    ;; java.io.IOException -- naming a temp path the caller never asked for
+    ;; (jolt-g81).
+    (when (file-directory? p) (file-open-error p p))
     (if (spit-append? opts)
-        (with-port (open-output-file p 'append)
+        (with-port (open-path-guarded p p (lambda (rp) (open-output-file rp 'append)))
           (lambda (port) (put-string port text)))
         (let ((tmp (string-append p ".spit-tmp-"
                                    (number->string (sa-real-time-ms)) "-"
                                    (number->string (jolt-with-mutex io-counter-mutex
                                                      (begin (set! spit-tmp-counter (+ spit-tmp-counter 1))
                                                             spit-tmp-counter))))))
-          (with-port (open-output-file tmp 'replace)
+          ;; the temp file is this function's business, but a failure to open it
+          ;; is the caller's target failing, so report the target
+          (with-port (guard (e ((i/o-error? e) (file-open-error p p e)))
+                       (open-output-file tmp 'replace))
             (lambda (port) (put-string port text)))
           (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
             (rename-file tmp p))))
@@ -1601,13 +1688,32 @@
 ;; --- clojure.java.io/writer: an existing writer passes through; a File / path
 ;; gets a file-backed writer (host-static.ss "file-writer") that persists on
 ;; flush/close. Mirrors io.clj's writer over the host's StringWriter/file ports.
+;; The JVM opens the file when the Writer is CONSTRUCTED, so a target it cannot
+;; open raises there. jolt's file-writer is a StringWriter over a path that
+;; spits at flush/close (host-static-classes.ss), so there was no open at all
+;; here and (io/writer <a directory>) handed back a Writer -- the failure then
+;; surfaced at close, or never (jolt-g81).
+;;
+;; The target is OPENED rather than reasoned about, for the reason
+;; open-path-guarded gives: only the open knows. Opening for append rather than
+;; truncate keeps any existing content -- the write itself still goes through
+;; jolt-spit later -- while still creating a missing file, which is what the
+;; JVM's FileWriter does too.
+(define (io-writer-target! given)
+  (let ((p (project-relative given)))
+    (close-port (open-path-guarded p p
+                  (lambda (rp)
+                    (open-file-output-port rp (file-options no-fail no-truncate append)
+                                           (buffer-mode none)))))
+    given))
+
 (define (jolt-io-writer x)
   (cond
     ((and (jhost? x) (string=? (jhost-tag x) "writer")) x)
     ((and (jhost? x) (string=? (jhost-tag x) "file-writer")) x)
-    ((jfile? x) (make-jhost "file-writer" (vector (jfile-path x) "")))
-    ((url-jhost? x) (make-jhost "file-writer" (vector (url-write-path x) "")))
-    ((string? x) (make-jhost "file-writer" (vector x "")))
+    ((jfile? x) (make-jhost "file-writer" (vector (io-writer-target! (jfile-path x)) "")))
+    ((url-jhost? x) (make-jhost "file-writer" (vector (io-writer-target! (url-write-path x)) "")))
+    ((string? x) (make-jhost "file-writer" (vector (io-writer-target! x) "")))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
 ;; --- clojure.java.io ns -----------------------------------------------------

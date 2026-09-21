@@ -320,6 +320,85 @@ check "reader missing path" \
 check "reader on a directory" \
   "$(run "(println (try (clojure.java.io/reader \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
   "$rd_dir (Is a directory)"
+
+# slurp of a PATH reached the file without the classification every constructor
+# above goes through, so these three came back as a bare java.io.IOException
+# carrying Chez's own wording -- uncatchable as the class the JVM raises and the
+# class a library branches on (jolt-3ah).
+printf 'content\n' > "$rd_dir/read.txt"
+check "slurp missing path" \
+  "$(run "(println (try (slurp \"$rd_dir/nope.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/nope.txt (No such file or directory)"
+# io/input-stream funnels its file arms through one opener, and that one was
+# never guarded either -- a missing path answered with Chez's wording inside the
+# right class, which no caller can read.
+check "input-stream missing path" \
+  "$(run "(println (try (clojure.java.io/input-stream \"$rd_dir/nope.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/nope.txt (No such file or directory)"
+check "input-stream on a directory" \
+  "$(run "(println (try (clojure.java.io/input-stream \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "slurp on a directory" \
+  "$(run "(println (try (slurp \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+# Running as root defeats the mode bits, so only assert this where they hold.
+chmod 000 "$rd_dir/read.txt"
+if [ -r "$rd_dir/read.txt" ]; then
+  echo "SKIP: (slurp unreadable file) mode bits do not apply to this user"
+else
+  check "slurp unreadable file" \
+    "$(run "(println (try (slurp \"$rd_dir/read.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+    "$rd_dir/read.txt (Permission denied)"
+fi
+chmod 644 "$rd_dir/read.txt"
+
+# The WRITE side had the same gap, and io/writer had no check at all: it handed
+# back a Writer over a directory and the failure surfaced at close, or never
+# (jolt-g81).
+check "spit to a directory" \
+  "$(run "(println (try (spit \"$rd_dir\" \"x\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "output-stream on a directory" \
+  "$(run "(println (try (clojure.java.io/output-stream \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "writer on a directory" \
+  "$(run "(println (try (clojure.java.io/writer \"$rd_dir\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir (Is a directory)"
+check "output-stream into a missing directory" \
+  "$(run "(println (try (clojure.java.io/output-stream \"$rd_dir/no/x.txt\") :no-throw (catch java.io.FileNotFoundException e (.getMessage e))))")" \
+  "$rd_dir/no/x.txt (No such file or directory)"
+
+# A BOM is content, not a signature: Chez's codec ate it and the JVM hands it
+# back, so a Reader and a path read both used to lose the first character
+# (jolt-qvt). The same file loaded as SOURCE now fails the way it does on the
+# JVM and on babashka, which is the point.
+printf '\357\273\277ab\n' > "$rd_dir/bom.txt"
+check "reader keeps a leading BOM" \
+  "$(run "(println (mapv int (slurp (clojure.java.io/reader \"$rd_dir/bom.txt\"))))")" \
+  "[65279 97 98 10]"
+check "slurp of a path keeps a leading BOM" \
+  "$(run "(println (mapv int (slurp \"$rd_dir/bom.txt\")))")" \
+  "[65279 97 98 10]"
+
+# Descriptor exhaustion. Nothing is wrong with the path -- the PROCESS is out of
+# descriptors -- so re-probing the filesystem cannot tell, and the classification
+# has to come from the condition the open raised or the message blames the file's
+# mode bits for the program's own leak. The witness holds readers open (io/reader
+# keeps a descriptor as of jolt-0nk) until the next open has to fail.
+emfile_expr="(let [p \"$rd_dir/read.txt\"
+                   held (doall (for [_ (range 2000)] (try (clojure.java.io/reader p) (catch Throwable _ nil))))
+                   n (count (remove nil? held))
+                   r (try (slurp p) :no-throw (catch java.io.FileNotFoundException e (.getMessage e)))]
+               (println (if (< n 8) :too-few-descriptors r)))"
+emfile_out="$( ulimit -n 256 2>/dev/null && run "$emfile_expr" )"
+case "$emfile_out" in
+  ":too-few-descriptors"|"")
+    echo "SKIP: (slurp under descriptor exhaustion) could not establish the limit" ;;
+  *)
+    check "slurp under descriptor exhaustion" \
+      "$emfile_out" \
+      "$rd_dir/read.txt (Too many open files)" ;;
+esac
 rm -rf "$rd_dir"
 
 echo ""
