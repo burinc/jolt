@@ -213,15 +213,75 @@
     ("(?x)[a# ]" "Unclosed character class near index 8\n(?x)[a# ]\n        ^")
     ("(?x) *" "Dangling meta character '*' near index 5\n(?x) *\n     ^")
     ("(?x)(?#c)" "Unknown inline modifier near index 9\n(?x)(?#c)")
-    ;; ...and a flag group that turns COMMENTS OFF does not turn it on. The x
-    ;; on either side of the "-" used to, so the validator stripped what the
-    ;; translator kept and read a different pattern than the one built: these
-    ;; three compiled here and are errors on the JVM.
+    ;; ...and a flag group whose OFF set names x leaves COMMENTS off.  An x
+    ;; anywhere in the group used to turn it on, so the validator stripped what
+    ;; the translator kept and read a different pattern than the one built:
+    ;; these three compiled here and are errors on the JVM.
     ("(?-x)#\\k" "\\k is not followed by '<' for named capturing group near index 8\n(?-x)#\\k")
     ("(?i-x)#\\k" "\\k is not followed by '<' for named capturing group near index 9\n(?i-x)#\\k")
     ("(?idmsux-idmsux)#\\k" "\\k is not followed by '<' for named capturing group near index 19\n(?idmsux-idmsux)#\\k")
     ("(?-x)#(" "Unclosed group near index 7\n(?-x)#(")
     ("(?x)#\\k" #f)
+    ;; An x in the ON set turns COMMENTS on whatever else the group names, and an
+    ;; x in the OFF set turns it off whatever came before the "-" — addFlag and
+    ;; then subFlag, so (?x-x) is off and (?x-i) is on.  All eight letters of
+    ;; "idmsuxUc" are a flag group's alphabet; c (CANON_EQ) used to end the scan.
+    ("(?x-i)#\\k" #f) ("(?xi-m)#\\k" #f) ("(?x-)#\\k" #f) ("(?x-s)#\\k" #f) ("(?cx)#\\k" #f)
+    ("(?xc)#\\k" #f) ("(?dx)#\\k" #f)
+    ("(?x-i)#(" #f) ("(?xi-m)#(" #f) ("(?x-i)a b" #f)
+    ("(?s-x)#\\k" "\\k is not followed by '<' for named capturing group near index 9\n(?s-x)#\\k")
+    ("(?x-x)#\\k" "\\k is not followed by '<' for named capturing group near index 9\n(?x-x)#\\k")
+    ;; one "-" and no more, and a letter outside the alphabet ends the group
+    ("(?-x-x)a" "Unknown inline modifier near index 4\n(?-x-x)a\n    ^")
+    ("(?x--x)a" "Unknown inline modifier near index 4\n(?x--x)a\n    ^")
+    ("(?X)a" "Unknown inline modifier near index 2\n(?X)a\n  ^")
+    ("(?x-y)a" "Unknown inline modifier near index 4\n(?x-y)a\n    ^")
+    ("(?)a" #f) ("(?-)a" #f) ("(?x-)a" #f) ("(?c)a" #f)
+    ;; COMMENTS is scoped like any other flag: an unscoped (?x) runs to the end of
+    ;; the enclosing group, (?x:…) to the end of its own, and (?-x) turns it off.
+    ("(?x:a b)c d" #f) ("(?x)(?-x)a b" #f) ("(a(?x)b c)d e" #f) ("(?i:(?x)A B)C D" #f)
+    ("(?x)a(?#c)b" "Unknown inline modifier near index 11\n(?x)a(?#c)b")
+    ("(?x)[a#b]" "Unclosed character class near index 8\n(?x)[a#b]\n        ^")
+    ("(?x)[a b]" #f) ("(?x)\\Qa b\\E" #f) ("(?x)a\\ b" #f)
+    ;; \p{…} is read RAW: the JVM skips comments once after the "{" and then takes
+    ;; the family name to the first "}" as it stands, so \p{ Lu} is \p{Lu} while
+    ;; \p{Lu } is a name of its own.  A (?x: inside a name is name text, not a
+    ;; flag group, and turns stripping on for nothing that follows it.
+    ("(?x)\\p{ Lu}" #f)
+    ("(?x)\\p{ Lu }" "Unknown character property name {Lu } near index 11\n(?x)\\p{ Lu }\n           ^")
+    ("(?x)\\p{L u}" "Unknown character property name {L u} near index 10\n(?x)\\p{L u}\n          ^")
+    ("\\p{(?#c)(?x: {2}(\\p{gc=Lu}" "Unknown character property name {(?#c)(?x: {2} near index 15\n\\p{(?#c)(?x: {2}(\\p{gc=Lu}\n               ^")
+    ;; a quantifier's "{" peeks the next unit raw, comments in force or not
+    ("(?x)a{1 ,2}" #f)
+    ("(?x)a{ 1,2}" "Illegal repetition near index 6\n(?x)a{ 1,2}\n      ^")
+    ("(?x)a{#c\n1,2}" "Illegal repetition near index 6\n(?x)a{#c\n1,2}\n      ^")
+    ;; ── \Q…\E is rewritten away before anything reads the pattern ──────────────
+    ;; Pattern.RemoveQEQuoting runs first on the JVM, so \c sees the Z the quote
+    ;; yields.  The translator used to read \Q inline instead and took the
+    ;; backslash that opens the quote as \c's control letter.
+    ("\\c\\QZ(?=" #f) ("\\c\\QA" #f) ("\\Qab\\E*" #f)
+    ("\\c\\Q" "Illegal control escape sequence near index 1\n\\c\\Q\n ^")
+    ("\\c\\Q(" "Unclosed group near index 4\n\\c\\Q(\n    ^")
+    ("\\Q\\E*" "Dangling meta character '*' near index 0\n\\Q\\E*\n^")
+    ("\\u00\\Q41" "Illegal Unicode escape sequence near index 4\n\\u00\\Q41\n    ^")
+    ;; ── \p{name=value} has a message of its own ───────────────────────────────
+    ;; Pattern.family splits a braced spec at the FIRST "=" and names the two
+    ;; halves separately, the key lowercased and the value as written.  Only gc,
+    ;; general_category, sc, script, blk and block are keys; the key is matched
+    ;; without regard to case and the gc value with.
+    ("\\p{GC=Lu}" #f) ("\\p{Gc=Lu}" #f) ("\\p{general_category=Lu}" #f)
+    ("\\p{GENERAL_CATEGORY=Lu}" #f)
+    ("\\p{foo=bar}" "Unknown Unicode property {name=<foo>, value=<bar>} near index 10\n\\p{foo=bar}\n          ^")
+    ("\\p{FOO=BAR}" "Unknown Unicode property {name=<foo>, value=<BAR>} near index 10\n\\p{FOO=BAR}\n          ^")
+    ("\\P{FOO=BAR}" "Unknown Unicode property {name=<foo>, value=<BAR>} near index 10\n\\P{FOO=BAR}\n          ^")
+    ("[\\p{foo=bar}]" "Unknown Unicode property {name=<foo>, value=<bar>} near index 11\n[\\p{foo=bar}]\n           ^")
+    ("\\p{\\p{gc=Lu}" "Unknown Unicode property {name=<\\p{gc>, value=<Lu>} near index 11\n\\p{\\p{gc=Lu}\n           ^")
+    ("\\p{=}" "Unknown Unicode property {name=<>, value=<>} near index 4\n\\p{=}\n    ^")
+    ("\\p{a=}" "Unknown Unicode property {name=<a>, value=<>} near index 5\n\\p{a=}\n     ^")
+    ("\\p{=b}" "Unknown Unicode property {name=<>, value=<b>} near index 5\n\\p{=b}\n     ^")
+    ("\\p{gc=lu}" "Unknown Unicode property {name=<gc>, value=<lu>} near index 8\n\\p{gc=lu}\n        ^")
+    ("\\p{gc=Bogus}" "Unknown Unicode property {name=<gc>, value=<Bogus>} near index 11\n\\p{gc=Bogus}\n           ^")
+    ("\\p{gc=Lu=x}" "Unknown Unicode property {name=<gc>, value=<Lu=x>} near index 10\n\\p{gc=Lu=x}\n          ^")
     ("(?x)\\k <a>" "named capturing group <a> does not exist near index 9\n(?x)\\k <a>\n         ^")
     ("(?x)a{2} {" "Illegal repetition near index 10\n(?x)a{2} {")
     ("(?x)a\\ (" "Unclosed group near index 8\n(?x)a\\ (")

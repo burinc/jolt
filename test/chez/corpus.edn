@@ -3444,6 +3444,18 @@
   ;; the JVM's rule: a Unicode CATEGORY name is the real category over every
   ;; codepoint, a POSIX name (Alpha, Digit, Upper, Punct, Alnum) is ASCII
   {:suite "regex / \\p property classes" :label "p{L} is letters, not every non-ASCII char (#941)" :expected "[\"a\" \"é\" \"漢\"]" :actual "(re-seq #\"\\p{L}\" \"aé漢→\")" :portability :common}
+  ;; Inline flags are scoped, and a group's OFF set is applied over its ON set
+  ;; — see the flag-group parser and x-strip in host/chez/java/regex-translate.ss.
+  ;; Every row here was run against the JDK before it was written down.
+  {:suite "regex / inline flag groups" :label "an x in the ON set turns COMMENTS on whatever else the group names" :expected "[true false false true true]" :actual "(mapv #(boolean (re-matches (re-pattern %) \"ab\")) [\"(?x-i)a b\" \"(?i-x)a b\" \"(?x-x)a b\" \"(?x-s)a b\" \"(?cx)a b\"])" :portability :common}
+  {:suite "regex / inline flag groups" :label "the OFF set is applied over the ON set, not before it" :expected "[false false]" :actual "[(boolean (re-matches #\"(?i-i:AB)\" \"ab\")) (boolean (re-matches #\"(?s-s).\" \"\\n\"))]" :portability :common}
+  {:suite "regex / inline flag groups" :label "COMMENTS is scoped: (?x:...) to its own group, an unscoped (?x) to the enclosing one" :expected "[true true true]" :actual "[(boolean (re-matches #\"(?x:a b)c d\" \"abc d\")) (boolean (re-matches #\"(a(?x)b c)d e\" \"abcd e\")) (boolean (re-matches #\"(?i:(?x)A B)C D\" \"abC D\"))]" :portability :common}
+  {:suite "regex / inline flag groups" :label "(?-x) turns COMMENTS back off" :expected "[true false]" :actual "[(boolean (re-matches #\"(?x)a (?-x)b c\" \"ab c\")) (boolean (re-matches #\"(?x)a (?-x)b c\" \"abc\"))]" :portability :common}
+  {:suite "regex / \\Q quoting" :label "the quote is rewritten away before the pattern is read, so \\c sees the quoted letter" :expected "true" :actual "(boolean (re-matches #\"\\c\\QZ\" (str (char 26))))" :portability :common}
+  {:suite "regex / \\Q quoting" :label "a quantifier after \\E binds the last quoted character alone" :expected "\"abbb\"" :actual "(re-matches #\"\\Qab\\E*\" \"abbb\")" :portability :common}
+  {:suite "regex / \\Q quoting" :label "COMMENTS does not reach inside a quote" :expected "[true false]" :actual "[(boolean (re-matches #\"(?x)\\Qa b\\E\" \"a b\")) (boolean (re-matches #\"(?x)\\Qa b\\E\" \"ab\"))]" :portability :common}
+  {:suite "regex / \\p property classes" :label "a p{name=value} key is matched without regard to case, its value with" :expected "[true false]" :actual "[(boolean (re-matches #\"\\p{GC=Lu}\" \"A\")) (boolean (re-matches #\"\\p{Gc=Lu}\" \"a\"))]" :portability :common}
+  {:suite "regex / \\p property classes" :label "COMMENTS skips once after p{ and then reads the family name raw" :expected "true" :actual "(boolean (re-matches #\"(?x)\\p{ Lu}\" \"A\"))" :portability :common}
   {:suite "regex / \\p property classes" :label "a class over p{L}p{N} drops an arrow (#941)" :expected "\"a  b\"" :actual "(clojure.string/replace \"a → b\" #\"[^\\p{L}\\p{N}\\s_-]\" \"\")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Alpha} is ASCII" :expected "[\"a\"]" :actual "(re-seq #\"\\p{Alpha}\" \"aé\")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Digit} is ASCII" :expected "[\"1\"]" :actual "(re-seq #\"\\p{Digit}\" \"1٣\")" :portability :common}
