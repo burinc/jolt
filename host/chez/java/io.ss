@@ -591,10 +591,74 @@
 ;; #f when the path does not exist (realpath fails ENOENT) or the host has no
 ;; realpath at all -- a Windows build, where the callers below fall back to
 ;; lexical folding, which is what this file could do before.
+;; --- why realpath failed ------------------------------------------------------
+;; The walk below answers a best-effort path when realpath fails, which is right
+;; for a path that merely does not exist yet: the JVM does the same. It is wrong
+;; for a failure meaning the path can NEVER name a file, where the JVM raises.
+;; Answering a string there lets a path that cannot be opened travel on as though
+;; it could.
+;;
+;; The JVM's split, measured against Clojure 1.12 rather than assumed:
+;;
+;;   ENOENT / ENOTDIR / EACCES    best-effort path, no error
+;;   ELOOP / ENAMETOOLONG         java.io.IOException, in strerror's own wording
+;;
+;; Errno comes from the location accessor rather than Chez's native-error
+;; convention, which needs a literal foreign-procedure whose load-time relocation
+;; aborts the boot where the symbol is absent -- exactly the Windows build
+;; realpath is already missing from. Same three spellings process.ss uses:
+;; Darwin/BSD, glibc/musl, then bionic.
+(define io-errno-loc
+  (or (jolt-foreign-proc-safe "__error" '() 'void*)
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
+(define (io-errno)
+  (if io-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (io-errno-loc) 0)) 0))
+
+;; macOS values from <sys/errno.h>; Linux from asm-generic/errno.h. The same
+;; os-family split process.ss uses for EAGAIN and io_poller.clj for EINPROGRESS.
+;; A wrong value here degrades to today's behavior (no raise) rather than
+;; misfiring, and the gate exercises both platforms.
+(define io-ELOOP        (if (eq? (sa-os-family) 'macos) 62 40))
+(define io-ENAMETOOLONG (if (eq? (sa-os-family) 'macos) 63 36))
+
+(define (jfile-realpath* p)                 ; -> (values path-or-#f errno)
+  (if (not c-realpath)
+      (values #f 0)
+      (let ((buf (make-bytevector 4096 0)))
+        (if (= 0 (c-realpath p buf))
+            (values #f (io-errno))
+            (values (jfile-cstr buf) 0)))))
+
 (define (jfile-realpath p)
-  (and c-realpath
-       (let ((buf (make-bytevector 4096 0)))     ; >= PATH_MAX
-         (and (not (= 0 (c-realpath p buf))) (jfile-cstr buf)))))
+  (let-values (((rp e) (jfile-realpath* p))) rp))
+
+;; realpath for an ANCESTOR of the path being canonicalized -- a component that
+;; has to be resolved to descend through. A failure that can never name a file
+;; raises HERE, where the same failure on the FINAL component does not: the JVM
+;; leaves a trailing symlink loop or over-long name unresolved and answers,
+;; and raises only when it had to walk through one. Both directions measured.
+(define (jfile-realpath-ancestor p)
+  (let-values (((rp e) (jfile-realpath* p)))
+    (cond (rp rp)
+          ((= e io-ELOOP)
+           (throw-jvm (quote java.io.IOException)
+                      "Too many levels of symbolic links"))
+          ((= e io-ENAMETOOLONG)
+           (throw-jvm (quote java.io.IOException) "File name too long"))
+          (else #f))))
+
+;; A Java String can hold a NUL and a C path cannot, so a path carrying one can
+;; never name a file. The JVM refuses it in the CANONICALIZING route
+;; specifically: File.exists answers false rather than raising, and
+;; getAbsolutePath hands the NUL straight back. So this belongs here and not in
+;; jfile-abs, which those two go through.
+(define (jfile-nul-free! p)
+  (when (let loop ((i 0))
+          (cond ((>= i (string-length p)) #f)
+                ((char=? (string-ref p i) #\nul) #t)
+                (else (loop (+ i 1)))))
+    (throw-jvm (quote java.io.IOException) "Invalid file path")))
 
 ;; "/a/b" -> "/a", "/a" -> "/", "/" -> #f. The directory half of an output
 ;; path, POSIX-only on purpose: its callers are the AOT cache and the build
@@ -796,25 +860,37 @@
 ;; be driven from a test without a filesystem, and so the Windows rows -- where
 ;; the host has no realpath at all and this is the entire implementation -- are
 ;; reachable from a POSIX host.
-(define (jfile-canonical-for windows? realpath p)
-  (or (realpath p)
-      (let* ((pp (path-parse windows? p))
-             (root (ppath-root pp))
-             (segs (ppath-segs pp)))
-        (let loop ((n (- (length segs) 1)))
-          (cond
-            ((< n 0) (jfile-fold-dots-for windows? p))
-            (else
-             (let ((rp (realpath (path-rebuild root (list-head segs n)))))
-               (if rp
-                   (let ((rpp (path-parse windows? rp)))
-                     (jfile-fold-dots-for
-                      windows?
-                      (ppath-render rpp (append (ppath-segs rpp) (list-tail segs n)))))
-                   (loop (- n 1))))))))))
+;; ANCESTOR-REALPATH resolves the components the walk descends through, and is
+;; where a can-never-name-a-file failure raises; REALPATH answers for the whole
+;; path, where such a failure is not an error on the JVM. The 3-argument form
+;; uses one procedure for both, which is what a driver with no errno to read
+;; wants (win-path-test.ss) and what the Windows fallback is.
+(define jfile-canonical-for
+  (case-lambda
+    ((windows? realpath p)
+     (jfile-canonical-for windows? realpath realpath p))
+    ((windows? realpath ancestor-realpath p)
+     (or (realpath p)
+         (let* ((pp (path-parse windows? p))
+                (root (ppath-root pp))
+                (segs (ppath-segs pp)))
+           (let loop ((n (- (length segs) 1)))
+             (cond
+               ((< n 0) (jfile-fold-dots-for windows? p))
+               (else
+                (let ((rp (ancestor-realpath (path-rebuild root (list-head segs n)))))
+                  (if rp
+                      (let ((rpp (path-parse windows? rp)))
+                        (jfile-fold-dots-for
+                         windows?
+                         (ppath-render rpp (append (ppath-segs rpp) (list-tail segs n)))))
+                      (loop (- n 1))))))))))))
 
 (define (jfile-canonical p)
-  (jfile-canonical-for (eq? (sa-os-family) 'windows) jfile-realpath (jfile-abs p)))
+  (let ((abs (jfile-abs p)))
+    (jfile-nul-free! abs)
+    (jfile-canonical-for (eq? (sa-os-family) 'windows)
+                         jfile-realpath jfile-realpath-ancestor abs)))
 
 ;; --- file metadata over Chez filesystem ops ---------------------------------
 ;; byte size of a regular file (0 for a directory or a missing file).
