@@ -786,6 +786,14 @@
     (else (jrec-field-pr r))))
 
 (define (jrec-field-pr r)
+  (string-append
+    "#"
+    (jch-munge-segments (jrec-tag r))
+    (if (jolt-print-hash?)
+        "#"
+        (with-deeper-print (jrec-field-body r)))))
+
+(define (jrec-field-body r)
   (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))
          (n (vector-length fkeys))
          (entry-strs (let loop ((i 0) (acc '()))
@@ -812,8 +820,10 @@
                                  " "
                                  (jolt-pr-readable (jrec-field-ref r i)))
                                acc))))))
-    (string-append "#" (jch-munge-segments (jrec-tag r)) "{"
-      (jolt-str-join-comma entry-strs) "}")))
+    (string-append
+      "{"
+      (jolt-str-join-comma (jolt-limited-list-strs entry-strs))
+      "}")))
 
 (register-eq-arm!
   (lambda (a b) (or (jrec? a) (jrec? b)))
