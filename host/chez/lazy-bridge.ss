@@ -154,22 +154,33 @@
             (else (loop (cdr ks) acc))))))
 (define (jolt-started-thread? id)
   (jolt-with-mutex live-threads-mutex (eq? #t (hashtable-ref live-threads id #f))))
+;; A thread is born with its creator's signal mask, and jolt has one: the
+;; SIGTERM/SIGHUP/SIGINT the shutdown watcher takes over must be blocked in every
+;; thread, or the kernel delivers the signal to whichever one does not block it
+;; instead of leaving it pending for sigwait (concurrency.ss, #1098). The guard
+;; wraps the SPAWN — it blocks on this thread, creates, and restores — so the
+;; child has the mask from its first instruction. set! by concurrency.ss once the
+;; POSIX mask primitives are up; the identity below is what a host without them
+;; (Windows, Gambit) keeps.
+(define jolt-fork-sigmask-guard (lambda (fork) (fork)))
 (define %ls-orig-fork-thread fork-thread)
 (define (fork-thread thunk)
   (jolt-mark-mt!)
-  (let* ((t (%ls-orig-fork-thread
+  (let* ((t (jolt-fork-sigmask-guard
              (lambda ()
-               (*txn* #f)
-               (rdr-default-modes!)
-               (let ((id (get-thread-id)))
-                 (dynamic-wind
-                   (lambda () #f)
-                   thunk
-                   (lambda ()
-                     (jolt-with-mutex live-threads-mutex
-                       (if (hashtable-contains? live-threads id)
-                           (hashtable-delete! live-threads id)
-                           (hashtable-set! live-threads id 'done)))))))))
+               (%ls-orig-fork-thread
+                (lambda ()
+                  (*txn* #f)
+                  (rdr-default-modes!)
+                  (let ((id (get-thread-id)))
+                    (dynamic-wind
+                      (lambda () #f)
+                      thunk
+                      (lambda ()
+                        (jolt-with-mutex live-threads-mutex
+                          (if (hashtable-contains? live-threads id)
+                              (hashtable-delete! live-threads id)
+                              (hashtable-set! live-threads id 'done)))))))))))
          (id (sa-thread-id-of t)))
     (when id
       (jolt-with-mutex live-threads-mutex

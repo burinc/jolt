@@ -501,6 +501,38 @@
   (fs/delete-if-exists readyf)
   (fs/delete-if-exists hookf))
 
+;; …and neither signal may be swallowed by a thread that was already running when
+;; the hook was registered. Arming blocks {INT,TERM,HUP} in the arming thread, so
+;; the kernel skips it and delivers to any thread that does NOT block them — and a
+;; thread a dependency forked at namespace-load time, long before -main could
+;; register a hook, is exactly that. SIGINT landed there, where Chez's
+;; keyboard-interrupt handler is a no-op, and ^C did nothing at all: no exit, no
+;; hooks; SIGTERM landed there at SIG_DFL and killed the process with its hooks
+;; unrun. Every case above passes without this one because a one-liner has no
+;; load-time threads (#1098). Every thread jolt forks is born with the shutdown
+;; signals blocked now, whenever it was forked.
+(doseq [[sig code] [["INT" 130] ["TERM" 143]]]
+  (let [readyf (str (fs/create-temp-file {:prefix "jp-presig-" :suffix ".txt"}))
+        hookf  (str (fs/create-temp-file {:prefix "jp-presig-hook-" :suffix ".txt"}))
+        nested (str "(.start (Thread. (fn [] (Thread/sleep 30000))))"
+                    " (.addShutdownHook (Runtime/getRuntime)"
+                    "  (Thread. (fn [] (spit \"" hookf "\" \"RAN\"))))"
+                    " (spit \"" readyf "\" \"ready\") (Thread/sleep 30000)")
+        proc (process [jolt-bin "-e" nested] {:out :string :err :string})]
+    (loop [n 0]
+      (when (and (< n 200) (str/blank? (slurp readyf)))
+        (Thread/sleep 50)
+        (recur (inc n))))
+    (sh ["sh" "-c" (str "kill -" sig " " (.pid (:proc proc)))])
+    (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+    (check-eq (str "SIG" sig " is not swallowed by a thread forked before the hook")
+              (p/alive? proc) false)
+    (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+    (check-eq (str "SIG" sig " runs the hooks past a load-time thread") (slurp hookf) "RAN")
+    (check-eq (str "and still exits " code " (SIG" sig ")") (:exit @proc) code)
+    (fs/delete-if-exists readyf)
+    (fs/delete-if-exists hookf)))
+
 ;; Same root cause from the other side: while the main thread waits on stdin the
 ;; rest of the program has to keep running. A future stopped ticking the moment a
 ;; prompt was reached, which is not what a JVM does with a thread in

@@ -3325,12 +3325,36 @@
     (for-each (lambda (n) (c-sigaddset s n)) sigs)
     s))
 
+;; Run THUNK with (HOW, SET) applied to THIS thread's mask and put the mask back
+;; exactly as it was afterwards. Both of jolt's mask windows are this shape: the
+;; spawn window that hands a child a default mask, and the fork window that hands
+;; a new thread jolt's. The restore is SIG_SETMASK from the saved old set rather
+;; than the inverse operation, because the caller's own mask is whatever it is and
+;; "unblock what we blocked" would unblock a signal the caller had blocked for its
+;; own reasons.
+(define (jolt-with-sigmask how set thunk)
+  (if (not (and jolt-sigmask-ok? set))
+      (thunk)
+      (let* ((old (sa-foreign-alloc 128))
+             (restore (lambda ()
+                        (c-pthread-sigmask jolt-sig-setmask-how old 0)
+                        (sa-foreign-free old))))
+        (c-pthread-sigmask how set old)
+        ;; not dynamic-wind: its after-thunk can run more than once, and this one
+        ;; frees. Normal return and throw both restore exactly once; multiple
+        ;; values survive the round trip.
+        (let ((vals (guard (e (#t (restore) (raise e))) (call-with-values thunk list))))
+          (restore)
+          (apply values vals)))))
+
 ;; Per-thread SIGINT mask. A worker thread parked in a foreign call (the nREPL
 ;; accept loop in c-accept, or a conn handler) can't run Chez's keyboard-interrupt
-;; handler on ^C, so if SIGINT is delivered there the process hangs. Block SIGINT
-;; in the primordial thread BEFORE forking such workers (they inherit the mask),
-;; then park-until-interrupt unblocks it in the primordial once its handler is
-;; installed, so ^C is always delivered to the parked thread.
+;; handler on ^C, so if SIGINT is delivered there the process hangs — which the
+;; fork guard further down rules out for every thread jolt forks. What is left for
+;; this to say is the PRIMORDIAL thread's mask, the one no fork can set: a server
+;; blocks SIGINT here before it starts accepting, and park-until-interrupt unblocks
+;; it once its handler is installed, so ^C lands on the parked thread and nowhere
+;; else.
 (define (jolt-set-sigint-blocked block?)
   (when jolt-sigmask-ok?
     (let ((set (jolt-make-sigset '(2)))              ; SIGINT = 2
@@ -3446,16 +3470,49 @@
 ;; (jolt-na7). A JVM makes no such distinction: ^C runs the hooks and exits 130.
 ;; Taking SIGINT here makes the two agree.
 ;;
-;; This only ever applies to a program that registered a shutdown hook — arming is
-;; what installs the mask, and it happens on the first registration (see below).
-;; A program with nothing to clean up keeps Chez's ^C behavior untouched, and a
-;; CHILD process never inherits the mask (jolt-with-empty-sigmask, further down),
-;; so ^C on the foreground process group still kills subprocesses outright.
+;; The WATCHER only ever applies to a program that registered a shutdown hook —
+;; arming is what starts it, on the first registration (see below). A program with
+;; nothing to clean up keeps Chez's ^C behavior: the signal reaches the primordial
+;; thread, the one place Chez's handler can act on it, rather than a worker that
+;; would swallow it (the fork guard below). A CHILD process inherits none of this
+;; mask (jolt-with-empty-sigmask, further down), so ^C on the foreground process
+;; group still kills subprocesses outright.
 (define jolt-shutdown-signals '(15 1 2))
-(define jolt-shutdown-sigset #f)
+(define jolt-shutdown-sigset (and jolt-sigmask-ok? (jolt-make-sigset jolt-shutdown-signals)))
 ;; #t once the sigwait watcher owns the signals above — park-until-interrupt reads
 ;; it to decide whether SIGINT is still Chez's to deliver.
-(define (jolt-shutdown-watcher-running?) (and jolt-shutdown-sigset #t))
+(define jolt-shutdown-armed (box #f))
+(define (jolt-shutdown-watcher-running?) (unbox jolt-shutdown-armed))
+
+;; EVERY thread jolt forks is born with those signals blocked, armed or not: the
+;; fork guard below is what lazy-bridge.ss's fork-thread shadow runs around the
+;; spawn. Blocking them on the arming thread alone is not enough. A new thread
+;; inherits its creator's mask, so that covers the threads forked AFTER the first
+;; hook and none of the ones forked before it — and a dependency that starts a
+;; thread at namespace-load time (a server's accept loop, a pool) starts it long
+;; before -main can register anything. The kernel picks a thread that does not
+;; block the signal, so it skipped the masked arming thread and delivered to one
+;; of those: ^C landed where Chez's keyboard-interrupt handler is a no-op and did
+;; nothing at all — no exit, no hooks — and SIGTERM landed there at SIG_DFL, a
+;; hard kill with the hooks unrun. Minimal programs have no load-time threads,
+;; which is why every ^C case in the gate passed while a real app's ^C did not
+;; (#1098).
+;;
+;; Blocked in the PARENT for the length of the spawn, not by the child on its way
+;; in: the child then has the mask from its first instruction, leaving no window
+;; in which a brand-new thread is the one unmasked thread in the process. The
+;; parent's own mask goes back exactly as it was.
+;;
+;; The one thread this cannot reach is the one jolt did not fork — the primordial
+;; — and that is the point: it stays the kernel's delivery target until a hook is
+;; registered, so an unarmed program still dies on SIGTERM and still takes ^C
+;; through Chez. Arming blocks the signals on the thread that registers the hook,
+;; which is the primordial in every case jolt controls (a hook registered from a
+;; forked thread leaves the primordial unmasked, and the signal goes there, just
+;; as it did before any of this).
+(define (jolt-fork-with-shutdown-blocked fork)
+  (jolt-with-sigmask jolt-sig-block-how jolt-shutdown-sigset fork))
+(set! jolt-fork-sigmask-guard jolt-fork-with-shutdown-blocked)
 (define c-sigwait (jolt-foreign-proc-blocking "sigwait" '(void* void*) 'int))
 ;; The watcher cannot leave through Chez's (exit): called off the main thread it
 ;; never returns. It has already run the hooks and flushed by then, so _exit is
@@ -3475,17 +3532,15 @@
 ;; ways a program most often waits — condition-wait (deref of a promise) and a
 ;; blocking foreign call — are not safe points. The handler would never run and
 ;; the process would then ignore the signal entirely, which is worse than not
-;; handling it. Blocking the signals here also blocks them in every thread forked
-;; afterwards (a new thread inherits its creator's mask), so the kernel has no
-;; thread to deliver to and leaves the signal pending for sigwait to take.
+;; handling it. Blocking the signals here puts the calling thread where every
+;; thread jolt forked already is (the fork guard above), so no thread is left for
+;; the kernel to deliver to and the signal stays pending for sigwait to take.
 (define (jolt-arm-shutdown!)
   (jolt-install-exit-handler!)
-  (when (and jolt-sigmask-ok? c-sigwait c-underscore-exit)
+  (when (and jolt-sigmask-ok? jolt-shutdown-sigset c-sigwait c-underscore-exit)
     (let ((start? (jolt-with-mutex jolt-shutdown-mutex
-                    (and (not jolt-shutdown-sigset)
-                         (begin (set! jolt-shutdown-sigset
-                                      (jolt-make-sigset jolt-shutdown-signals))
-                                #t)))))
+                    (and (not (unbox jolt-shutdown-armed))
+                         (begin (set-box! jolt-shutdown-armed #t) #t)))))
       (when start?
         (let ((old (sa-foreign-alloc 128)))
           (c-pthread-sigmask jolt-sig-block-how jolt-shutdown-sigset old)
@@ -3526,19 +3581,7 @@
 ;; mechanisms for one rule is worse than one honest window.
 (define jolt-empty-sigset (and jolt-sigmask-ok? (jolt-make-sigset '())))
 (define (jolt-with-empty-sigmask thunk)
-  (if (not jolt-empty-sigset)
-      (thunk)
-      (let* ((old (sa-foreign-alloc 128))
-             (restore (lambda ()
-                        (c-pthread-sigmask jolt-sig-setmask-how old 0)
-                        (sa-foreign-free old))))
-        (c-pthread-sigmask jolt-sig-setmask-how jolt-empty-sigset old)
-        ;; not dynamic-wind: its after-thunk can run more than once, and this one
-        ;; frees. Normal return and throw both restore exactly once; multiple
-        ;; values survive the round trip.
-        (let ((vals (guard (e (#t (restore) (raise e))) (call-with-values thunk list))))
-          (restore)
-          (apply values vals)))))
+  (jolt-with-sigmask jolt-sig-setmask-how jolt-empty-sigset thunk))
 
 (def-var! "jolt.host" "call-on-main-thread" jolt-call-on-main-thread)
 (def-var! "jolt.host" "call-on-main-thread-async" jolt-call-on-main-thread-async)
