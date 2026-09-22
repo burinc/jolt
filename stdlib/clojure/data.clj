@@ -59,7 +59,8 @@
    (not-empty (set/difference b a))
    (not-empty (set/intersection a b))])
 
-(defn- equality-partition [x]
+;; public, as the reference's protocol method is
+(defn equality-partition [x]
   (cond
     (nil? x) :atom
     (map? x) :map

@@ -26,8 +26,8 @@
   (when-not (= got want)
     (swap! failures conj (str label ": want " (pr-str want) " got " (pr-str got)))))
 
-(defn- posix [dir x] (file-arg-for (deps/native-path-kind-for false x) false dir x))
-(defn- win [dir x] (file-arg-for (deps/native-path-kind-for true x) true dir x))
+(defn- posix [dir x] (file-arg-for (@#'deps/native-path-kind-for false x) false dir x))
+(defn- win [dir x] (file-arg-for (@#'deps/native-path-kind-for true x) true dir x))
 
 ;; --- "-" is stdin on both, and is checked before anything classifies it -------
 (check "posix dash" (posix "/proj" "-") "/dev/stdin")
