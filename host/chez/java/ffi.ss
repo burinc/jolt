@@ -683,6 +683,13 @@
     n))
 (def-var! "jolt.ffi" "read-bytes" ffi-read-bytes)
 (def-var! "jolt.ffi" "write-bytes" ffi-write-bytes)
+;; …and under the reserved __ names, for the same reason as __read-array below:
+;; stdlib/jolt/ffi.clj DEFINES read-bytes and write-bytes over these — to carry
+;; the :doc/:arglists the Scheme side cannot attach, and so that write-bytes can
+;; route a byte-array argument to the raw block move instead of rendering it
+;; with `str` — so each needs a name its own definition has not taken.
+(def-var! "jolt.ffi" "__read-bytes" ffi-read-bytes)
+(def-var! "jolt.ffi" "__write-bytes" ffi-write-bytes)
 
 ;; --- byte-array buffer I/O (binary-faithful) --------------------------------
 ;; Move raw bytes between a jolt byte-array (jolt-array kind 'byte) and foreign
