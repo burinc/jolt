@@ -1,7 +1,7 @@
 ;; run-sci.ss — SCI conformance: load borkdude/sci's own source (vendor/sci) through
 ;; jolt and require its forms to compile+eval. A real-world Clojure-compatibility
 ;; stress test. Floor-gated like the corpus: a regression below the floor (or the
-;; count today, 399/424) fails. Raise the floor as host gaps close.
+;; count today, 417/434) fails. Raise the floor as host gaps close.
 ;;
 ;; The tail is this gate's own load-order, not a host gap. load-order below is a
 ;; CURATED SUBSET in a fixed sequence, so a reference across it can land before its
@@ -26,8 +26,16 @@
 ;; pre-scan an unregistered lowercase alias is "No such namespace" at compile
 ;; time, as on the JVM, and thirteen such forms are counted.
 ;;
+;; 399/424 -> 417/434 (#1095): sci.impl.cljs and sci.impl.copy-vars joined the
+;; list, ahead of namespaces.cljc. `:refer` of a name that does not exist now
+;; throws `x does not exist`, as the JVM's refer does, so namespaces.cljc's ns
+;; form — which refers copy-core-var and friends — failed outright once they
+;; were missing, and every alias it registers went with it. Loading their
+;; namespace first is the order SCI's own requires give; the four copy-core-var
+;; forms counted above load with it.
+;;
 ;;   chez --script host/chez/run-sci.ss
-;;   JOLT_SCI_FLOOR=N    override the floor (default 399)
+;;   JOLT_SCI_FLOOR=N    override the floor (default 417)
 ;;   SCI_VERBOSE=1       print each failing form's error
 (import (chezscheme))
 
@@ -101,7 +109,7 @@
     "impl/vars.cljc" "lang.cljc" "impl/utils.cljc" "ctx_store.cljc" "impl/deftype.cljc"
     "impl/records.cljc" "impl/core_protocols.cljc" "impl/hierarchies.cljc"
     "impl/destructure.cljc" "impl/doseq_macro.cljc" "impl/for_macro.cljc" "impl/fns.cljc"
-    "impl/multimethods.cljc" "impl/namespaces.cljc" "core.cljc"))
+    "impl/multimethods.cljc" "impl/cljs.cljc" "impl/copy_vars.cljc" "impl/namespaces.cljc" "core.cljc"))
 
 (define total-ok 0) (define total-fail 0)
 (for-each
@@ -112,7 +120,7 @@
   load-order)
 
 (printf "\nSCI load: ~a/~a forms ok (~a fail)\n" total-ok (+ total-ok total-fail) total-fail)
-(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 399)))
+(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 417)))
 (when (< total-ok floor)
   (printf "REGRESSION: ~a forms loaded < floor ~a\n" total-ok floor))
 (flush-output-port)
