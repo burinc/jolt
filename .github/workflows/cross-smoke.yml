@@ -37,7 +37,7 @@ jobs:
       # kernel. Same pinned version as tests.yml/release.yml.
       - name: Cache Chez Scheme (host + cross)
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/chez
           key: chez-cross-v10.4.1-ta6le-tarm64le-pic-v2

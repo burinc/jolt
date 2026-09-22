@@ -54,7 +54,7 @@ jobs:
 
       - name: Cache Chez install
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/chez-opt
           key: glibc-floor-chez-v10.4.1-${{ matrix.name }}-pic-v2
@@ -73,7 +73,7 @@ jobs:
             '${{ matrix.image }}' sh ci/glibc-floor-build.sh
 
       - name: Upload binary + report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jolt-${{ matrix.name }}
           path: |
@@ -91,7 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: jolt-${{ matrix.name }}
           path: probe

@@ -20,7 +20,7 @@ jobs:
           sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev xxd
       - name: Cache Chez Scheme
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /opt/chez
           key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off
