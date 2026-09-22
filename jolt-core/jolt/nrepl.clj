@@ -117,7 +117,10 @@
   ;; fcntl below, and Windows on neither.
   (let [fd (c-socket AF-INET (bit-or SOCK-STREAM sock-cloexec) 0)]
     (when (neg? fd) (throw (ex-info "socket() failed" {})))
-    (let [opt (ffi/alloc 4)] (ffi/write opt :int 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt))
+    ;; not on Windows: there SO_REUSEADDR lets a second listener take a busy port
+    ;; (jolt.socket's new-fd! says more)
+    (when-not windows?
+      (let [opt (ffi/alloc 4)] (ffi/write opt :int 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt)))
     (let [sa (make-sockaddr port)]
       (when (neg? (c-bind fd sa 16)) (c-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
       (ffi/free sa))

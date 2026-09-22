@@ -225,7 +225,12 @@
   (winsock/ensure!)
   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
     (when (neg? fd) (throw (java.io.IOException. "socket() failed")))
-    (set-opt-1! fd so-reuse)
+    ;; SO_REUSEADDR is what the JDK sets on a POSIX listener, so a restarted server
+    ;; can rebind a port its predecessor left in TIME_WAIT. Winsock gives the same
+    ;; option a different meaning — bind a port another socket is LISTENING on —
+    ;; and the JDK's Windows listener binds exclusively instead, so a busy port is
+    ;; a BindException there. Leave it unset on Windows.
+    (when-not windows? (set-opt-1! fd so-reuse))
     (guard-fd! fd)
     fd))
 

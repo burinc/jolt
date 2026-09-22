@@ -976,10 +976,21 @@
 ;; convention, whichever way the child was created — so proc-reap-once,
 ;; proc-alive? and exitValue are each written once. Windows has no waitpid and no
 ;; wait-status word to decode; the process HANDLE answers there instead.
+;;
+;; A reaped child's handle is closed here, as the JDK closes it: every caller
+;; caches the status it answers in the exit-box, under the process mutex, and
+;; never asks again, so nothing reads the handle after this. Left open it pins the
+;; kernel's process object for the life of jolt, one per spawn. The slot goes to
+;; #f, which proc-signal reads (under the same mutex) as "nothing to terminate".
 (define (proc-status-once st)
   (let ((h (proc-p-win-handle st)))
     (if h
-        (proc-win-status-once h (proc-p-pid st))
+        (call-with-values (lambda () (proc-win-status-once h (proc-p-pid st)))
+          (lambda (rc decoded err)
+            (when decoded
+              ((proc-win-close-handle) h)
+              (vector-set! (jhost-state st) 11 #f))
+            (values rc decoded err)))
         (proc-waitpid-once (proc-p-pid st) #t))))
 
 ;; ProcessBuilder.start resolves the program before spawning and throws
@@ -1482,7 +1493,9 @@
             (values 0 #f 0)
             (let ((codep (sa-foreign-alloc 4)))
               (let ((ok ((proc-win-get-exit-code) h codep)))
-                (let ((code (sa-foreign-ref 'unsigned-32 codep 0)))
+                ;; signed, as Process.exitValue answers it: exit(-1) is -1 and an
+                ;; access violation -1073741819, not 4294967295 / 3221225477
+                (let ((code (sa-foreign-ref 'integer-32 codep 0)))
                   (sa-foreign-free codep)
                   (if (= ok 0)
                       (values -1 #f proc-ECHILD)
@@ -1888,7 +1901,10 @@
 (define (proc-signal st sig)
   (let ((h (proc-p-win-handle st)))
     (cond
-      (h (proc-win-terminate! h))
+      ;; under the mutex, so a concurrent reap cannot close the handle between
+      ;; reading it and terminating through it
+      (h (jolt-with-mutex (proc-p-mutex st)
+           (let ((h (proc-p-win-handle st))) (and h (proc-win-terminate! h)))))
       (proc-kill
        (proc-kill (proc-p-pid st) sig)
        (when (or (= sig proc-SIGTERM) (= sig proc-SIGKILL))
