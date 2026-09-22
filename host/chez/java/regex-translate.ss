@@ -623,6 +623,13 @@
     ;; pattern ever showed the difference.
     (define (err/past desc idx) (err desc (+ idx 1) -1))
 
+    ;; Did stripping take a run off the END of the pattern?  Pattern's reads run
+    ;; one past their own sentinel when it did, and more than one of its errors
+    ;; turns on that.
+    (define (trailing-run?)
+      (and index-map (> n 0)
+           (> (vector-ref index-map n) (+ 1 (vector-ref index-map (- n 1))))))
+
     (define seen '())                   ; the named groups defined so far
     (define refs 0)                     ; back-references read so far
 
@@ -703,10 +710,7 @@
                ;; the cursor has stopped either ON the last unit it read — the
                ;; final kept unit of the name — or past the sentinel, which is
                ;; where an empty name and a trailing stripped run both leave it.
-               (if (or (= (+ i 1) n)
-                       (and index-map
-                            (> (vector-ref index-map n)
-                               (+ 1 (vector-ref index-map (- n 1))))))
+               (if (or (= (+ i 1) n) (trailing-run?))
                    (err "Unclosed character name escape sequence" n)
                    (err "Unclosed character name escape sequence" (- n 1))))
               ((let ok ((k (+ i 1)) (letter #f))
@@ -778,9 +782,25 @@
               ((#\r) (char 13 (+ i 2)))
               ((#\t) (char 9 (+ i 2)))
               ((#\c)
-               (if (>= (+ i 2) n)
-                   (err "Illegal control escape sequence" (+ i 1))
-                   (char (bitwise-xor (char->integer (rf (+ i 2))) 64) (+ i 3))))
+               ;; Pattern.c() tests cursor < patternLength against the
+               ;; UNSTRIPPED buffer and then read()s, which with COMMENTS in
+               ;; force skips the run and hands back the sentinel.  So a \c with
+               ;; a stripped run after it and nothing else does NOT fail here:
+               ;; the JVM takes NUL as the control letter and carries on past
+               ;; its own end, where an open group is "Unclosed group", an open
+               ;; class is "Unclosed character class", and at the top level the
+               ;; read past the sentinel is the JDK's own "Unexpected internal
+               ;; error".  (?x)\c a and (?x)\c ) are the same reading, and both
+               ;; compile — the letter is simply the next unit that survives.
+               (cond
+                 ((< (+ i 2) n)
+                  (char (bitwise-xor (char->integer (rf (+ i 2))) 64) (+ i 3)))
+                 ((trailing-run?)
+                  (case where
+                    ((class) (err "Unclosed character class" n))
+                    ((top) (err "Unexpected internal error" n))
+                    (else (err "Unclosed group" n 1))))
+                 (else (err "Illegal control escape sequence" (+ i 1)))))
               ((#\x) (let-values (((v k) (hex (+ i 2)))) (char v k)))
               ((#\u) (let-values (((v k) (unicode (+ i 2)))) (char v k)))
               ((#\N) (char #f (charname (+ i 2))))
