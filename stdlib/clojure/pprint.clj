@@ -44,16 +44,23 @@
                          (if (#{:prefix :per-line-prefix :suffix} (first body))
                            (recur (drop 2 body) (concat acc (take 2 body)))
                            [(apply hash-map acc) body]))]
-    `(do (if (clojure.pprint/level-exceeded)
+    ;; the helpers are private, so the expansion reaches them through their vars,
+    ;; as the reference does — a caller's ns may not name them (jolt#1095)
+    `(do (if (#'clojure.pprint/level-exceeded)
            (-write clojure.core/*out* "#")
-           (clojure.core/binding [clojure.pprint/*current-level* (inc clojure.pprint/*current-level*)
-                                  clojure.pprint/*current-length* 0]
-             (clojure.pprint/start-block clojure.core/*out*
-                                        ~(:prefix options)
-                                        ~(:per-line-prefix options)
-                                        ~(:suffix options))
+           (do
+           (push-thread-bindings {#'clojure.pprint/*current-level*
+                                  (inc (var-get #'clojure.pprint/*current-level*))
+                                  #'clojure.pprint/*current-length* 0})
+           (try
+             (#'clojure.pprint/start-block clojure.core/*out*
+                                          ~(:prefix options)
+                                          ~(:per-line-prefix options)
+                                          ~(:suffix options))
              ~@body
-             (clojure.pprint/end-block clojure.core/*out*)))
+             (#'clojure.pprint/end-block clojure.core/*out*)
+             (finally
+               (pop-thread-bindings)))))
          nil)))
 
 (defmacro print-length-loop
@@ -61,9 +68,9 @@
   items (if set), printing a single \"...\" as an extra element and terminating."
   [bindings & body]
   `(loop ~bindings
-     (if (and clojure.pprint/*current-length*
+     (if (and (var-get #'clojure.pprint/*current-length*)
               clojure.pprint/*print-length*
-              (>= clojure.pprint/*current-length* clojure.pprint/*print-length*))
+              (>= (var-get #'clojure.pprint/*current-length*) clojure.pprint/*print-length*))
        (do (-write *out* "...") nil)
        (do ~@body))))
 
@@ -72,19 +79,19 @@
   format-in is a control string or a previously compiled format."
   [format-in]
   `(let [format-in# ~format-in
-         cf# (if (string? format-in#) (clojure.pprint/cached-compile format-in#) format-in#)]
+         cf# (if (string? format-in#) (#'clojure.pprint/cached-compile format-in#) format-in#)]
      (fn [& args#]
-       (let [navigator# (clojure.pprint/init-navigator args#)]
-         (clojure.pprint/execute-format cf# navigator#)))))
+       (let [navigator# (#'clojure.pprint/init-navigator args#)]
+         (#'clojure.pprint/execute-format cf# navigator#)))))
 
 (defmacro formatter
   "Returns a function (fn [stream & args]) that runs the compiled format."
   [format-in]
   `(let [format-in# ~format-in
-         cf# (if (string? format-in#) (clojure.pprint/cached-compile format-in#) format-in#)]
+         cf# (if (string? format-in#) (#'clojure.pprint/cached-compile format-in#) format-in#)]
      (fn [stream# & args#]
-       (let [navigator# (clojure.pprint/init-navigator args#)]
-         (clojure.pprint/execute-format stream# cf# navigator#)))))
+       (let [navigator# (#'clojure.pprint/init-navigator args#)]
+         (#'clojure.pprint/execute-format stream# cf# navigator#)))))
 
 (defmacro with-pprint-dispatch
   "Execute body with the pretty-print dispatch function bound to function. A
