@@ -953,7 +953,9 @@
 
 ;; --- java.lang.Process -------------------------------------------------------
 ;; state: #(stdin-os stdout-is stderr-is pid exit-box cmd mutex stdout-port
-;;          stdin-port inherit-latches signalled-box)
+;;          stdin-port inherit-latches signalled-box win-handle)
+;; win-handle is the Win32 process HANDLE on the CreateProcessW path and #f on
+;; every other one — it is what stands in for waitpid there (proc-status-once).
 (define (proc-p-stdin-os st)   (vector-ref (jhost-state st) 0))
 (define (proc-p-stdout-is st)  (vector-ref (jhost-state st) 1))
 (define (proc-p-stderr-is st)  (vector-ref (jhost-state st) 2))
@@ -966,6 +968,19 @@
 ;; The 128+signal status of a signal WE sent, if any — the one recoverable answer
 ;; when the child turns out to be unwaitable (see proc-lost-status).
 (define (proc-p-signalled st)  (vector-ref (jhost-state st) 10))
+;; The Win32 process handle, or #f off the CreateProcessW path.
+(define (proc-p-win-handle st)
+  (let ((v (jhost-state st))) (and (> (vector-length v) 11) (vector-ref v 11))))
+
+;; ONE status probe for ST's child, in proc-waitpid-once's (rc decoded errno)
+;; convention, whichever way the child was created — so proc-reap-once,
+;; proc-alive? and exitValue are each written once. Windows has no waitpid and no
+;; wait-status word to decode; the process HANDLE answers there instead.
+(define (proc-status-once st)
+  (let ((h (proc-p-win-handle st)))
+    (if h
+        (proc-win-status-once h (proc-p-pid st))
+        (proc-waitpid-once (proc-p-pid st) #t))))
 
 ;; ProcessBuilder.start resolves the program before spawning and throws
 ;; IOException("…No such file or directory") when it can't be found; our shell
@@ -1070,6 +1085,588 @@
      (eq? (sa-os-family) 'windows) (getenv "PATHEXT") (getenv "PATH")
      (or effective-dir (getenv "JOLT_PWD") ".") prog file-exists?)))
 
+
+;; --- the Windows spawn path (CreateProcessW) ---------------------------------
+;; Where posix_spawn does not exist, jolt used to fall back to Chez's
+;; open-process-ports and hand it proc-build-shell-command's string. That string
+;; is built for /bin/sh — it opens with `exec `, prefixes `cd 'DIR' &&` and
+;; `env -i K=V …`, and quotes argv with sh rules — and on Windows it reaches
+;; cmd.exe, which stops at the first token. So EVERY spawn failed, and failed
+;; QUIETLY: exit 0, empty stdout, and "'exec' is not recognized…" on a stderr
+;; nobody was required to read (jolt-lang/jolt#1108). java.lang.ProcessBuilder,
+;; clojure.java.shell and babashka.process were all unusable there.
+;;
+;; The fix is not a better string. ProcessBuilder's contract is an argv LIST and
+;; no shell at all, and Windows has an API shaped exactly like that, so this is
+;; what the JDK does: build the one command line CreateProcessW takes, pipe the
+;; three streams with CreatePipe, and reap through the process handle. No shell
+;; is involved in either direction, which is also how the quoting stops being a
+;; guessing game.
+;;
+;; Modelled on the JDK's own Windows implementation, read rather than recalled:
+;; java.base/windows/classes/java/lang/ProcessImpl.java for the command line and
+;; java.base/windows/native/libjava/ProcessImpl_md.c for the spawn. Where they
+;; differ from the POSIX path here, the JDK's answer wins — the point is that a
+;; ProcessBuilder behaves the same on both.
+
+(define proc-win? (eq? (sa-os-family) 'windows))
+
+;; --- kernel32 / user32 entry points ------------------------------------------
+;; Lazily resolved through io.ss's win32 surface: off Windows not one of these
+;; loads a library or looks up a symbol.
+(define-win32-proc proc-win-create-pipe
+  "kernel32.dll" "CreatePipe" (void* void* void* unsigned-32) int)
+(define-win32-proc proc-win-set-handle-info
+  "kernel32.dll" "SetHandleInformation" (void* unsigned-32 unsigned-32) int)
+(define-win32-proc proc-win-get-handle-info
+  "kernel32.dll" "GetHandleInformation" (void* void*) int)
+(define-win32-proc proc-win-create-process
+  "kernel32.dll" "CreateProcessW"
+  (void* void* void* void* int unsigned-32 void* void* void* void*) int)
+(define-win32-proc proc-win-close-handle
+  "kernel32.dll" "CloseHandle" (void*) int)
+(define-win32-proc proc-win-get-std-handle
+  "kernel32.dll" "GetStdHandle" (int) void*)
+(define-win32-proc proc-win-wait-single
+  "kernel32.dll" "WaitForSingleObject" (void* unsigned-32) unsigned-32)
+(define-win32-proc proc-win-get-exit-code
+  "kernel32.dll" "GetExitCodeProcess" (void* void*) int)
+(define-win32-proc proc-win-terminate
+  "kernel32.dll" "TerminateProcess" (void* unsigned-32) int)
+(define-win32-proc proc-win-get-process-id
+  "kernel32.dll" "GetProcessId" (void*) unsigned-32)
+(define-win32-proc proc-win-open-process
+  "kernel32.dll" "OpenProcess" (unsigned-32 int unsigned-32) void*)
+(define-win32-proc proc-win-last-error
+  "kernel32.dll" "GetLastError" () unsigned-32)
+(define-win32-proc proc-win-create-file
+  "kernel32.dll" "CreateFileW"
+  (void* unsigned-32 unsigned-32 void* unsigned-32 unsigned-32 void*) void*)
+;; A console window decides whether CREATE_NO_WINDOW may be used, exactly as
+;; ProcessImpl_md.c decides it. user32 is the only non-kernel32 entry here, and a
+;; host without it degrades to "no console", which is the conservative answer.
+(define-win32-proc proc-win-get-console-window
+  "user32.dll" "GetConsoleWindow" () void*)
+
+;; ReadFile/WriteFile PARK: a pipe read waits for the child, and a plain foreign
+;; call keeps the thread active for the stop-the-world collector, so one blocked
+;; on an idle pipe would freeze every other thread's GC. The buffers they are
+;; handed live in foreign memory for the same reason (see jolt-foreign-proc-blocking).
+;;
+;; Deliberately NOT overlapped I/O, so there is no readiness to hand the fiber
+;; poller and a parked read holds its carrier thread. That is the same trade
+;; proc-nonblock-ok? already documents for a host without fcntl: on Windows a
+;; CreatePipe pipe is synchronous, and making it otherwise means OVERLAPPED
+;; structures and completion ports through this whole layer. Correct and
+;; blocking, rather than clever and unverifiable.
+(define proc-win-read-file
+  (let ((memo #f) (done? #f))
+    (lambda ()
+      (unless done?
+        (set! done? #t)
+        (set! memo (and proc-win?
+                        (begin (win32-load-lib! "kernel32.dll")
+                               (and (sa-foreign-entry? "ReadFile")
+                                    (guard (e (#t #f))
+                                      (sa-foreign-procedure-runtime
+                                       "ReadFile" '(void* void* unsigned-32 void* void*) 'int #t)))))))
+      memo)))
+(define proc-win-write-file
+  (let ((memo #f) (done? #f))
+    (lambda ()
+      (unless done?
+        (set! done? #t)
+        (set! memo (and proc-win?
+                        (begin (win32-load-lib! "kernel32.dll")
+                               (and (sa-foreign-entry? "WriteFile")
+                                    (guard (e (#t #f))
+                                      (sa-foreign-procedure-runtime
+                                       "WriteFile" '(void* void* unsigned-32 void* void*) 'int #t)))))))
+      memo)))
+
+;; Every entry point the spawn needs. #f for any one of them means this path
+;; cannot run — see proc-win-spawn-ok? below, and the loud failure in
+;; proc-pb-start that replaced the silent sh-string fallback.
+(define (proc-win-spawn-ok?)
+  (and proc-win?
+       (proc-win-create-pipe) (proc-win-set-handle-info) (proc-win-create-process)
+       (proc-win-close-handle) (proc-win-get-std-handle) (proc-win-wait-single)
+       (proc-win-get-exit-code) (proc-win-read-file) (proc-win-write-file)
+       #t))
+
+;; --- Win32 constants ---------------------------------------------------------
+(define proc-win-STARTF-USESTDHANDLES       #x100)
+(define proc-win-CREATE-NO-WINDOW           #x08000000)
+(define proc-win-CREATE-UNICODE-ENVIRONMENT #x00000400)
+(define proc-win-HANDLE-FLAG-INHERIT        1)
+(define proc-win-STD-INPUT-HANDLE  -10)
+(define proc-win-STD-OUTPUT-HANDLE -11)
+(define proc-win-STD-ERROR-HANDLE  -12)
+(define proc-win-WAIT-OBJECT-0 0)
+(define proc-win-GENERIC-READ      #x80000000)
+(define proc-win-GENERIC-WRITE     #x40000000)
+(define proc-win-FILE-APPEND-DATA  #x00000004)
+(define proc-win-SYNCHRONIZE       #x00100000)
+(define proc-win-FILE-SHARE-READ   #x00000001)
+(define proc-win-FILE-SHARE-WRITE  #x00000002)
+(define proc-win-CREATE-ALWAYS     2)
+(define proc-win-OPEN-EXISTING     3)
+(define proc-win-OPEN-ALWAYS       4)
+(define proc-win-FILE-ATTRIBUTE-NORMAL #x80)
+(define proc-win-PROCESS-QUERY-LIMITED-INFORMATION #x1000)
+(define proc-win-PROCESS-TERMINATE #x0001)
+(define proc-win-SYNCHRONIZE-ACCESS #x00100000)
+
+(define proc-win-ptr-size (sa-foreign-sizeof 'void*))
+;; A Win32 HANDLE comes back through Chez's void* as an UNSIGNED address, so
+;; INVALID_HANDLE_VALUE — (HANDLE)-1 — is all ones at the pointer's width rather
+;; than -1. Comparing against -1 would never match and every failed CreateFileW
+;; would be taken for a usable handle.
+(define proc-win-INVALID-HANDLE (- (expt 2 (* 8 proc-win-ptr-size)) 1))
+(define (proc-win-handle-ok? h)
+  (and (number? h) (not (= h 0)) (not (= h proc-win-INVALID-HANDLE))))
+
+;; STARTUPINFOW / PROCESS_INFORMATION field offsets, derived from the pointer
+;; width rather than hardcoded for x64: the struct is
+;;   DWORD cb; LPWSTR lpReserved, lpDesktop, lpTitle;
+;;   DWORD dwX dwY dwXSize dwYSize dwXCountChars dwYCountChars dwFillAttribute dwFlags;
+;;   WORD wShowWindow, cbReserved2; LPBYTE lpReserved2;
+;;   HANDLE hStdInput, hStdOutput, hStdError;
+;; which is 104 bytes on x64 and 68 on x86 — both of which these formulas give.
+(define proc-win-si-flags-off (+ (* 4 proc-win-ptr-size) 28))
+(define proc-win-si-res2-off
+  (let ((raw (+ (* 4 proc-win-ptr-size) 36)))
+    (* proc-win-ptr-size (quotient (+ raw (- proc-win-ptr-size 1)) proc-win-ptr-size))))
+(define proc-win-si-stdin-off  (+ proc-win-si-res2-off proc-win-ptr-size))
+(define proc-win-si-stdout-off (+ proc-win-si-res2-off (* 2 proc-win-ptr-size)))
+(define proc-win-si-stderr-off (+ proc-win-si-res2-off (* 3 proc-win-ptr-size)))
+(define proc-win-si-size       (+ proc-win-si-res2-off (* 4 proc-win-ptr-size)))
+(define proc-win-pi-size (+ (* 2 proc-win-ptr-size) 8))
+
+;; --- the command line --------------------------------------------------------
+;; CreateProcessW takes ONE string, so the argv list has to be flattened into the
+;; spelling msvcrt's startup code splits back apart. The JDK's rules, from
+;; ProcessImpl.createCommandLine in VERIFICATION_LEGACY — the mode a plain
+;; ProcessBuilder.start() takes there (no SecurityManager, and
+;; jdk.lang.Process.allowAmbiguousCommands defaulting to true).
+;;
+;; All pure, and pinned from the Linux runner in test/chez/win-platform-test.ss:
+;; the string is the whole of the bug, and it is the half a POSIX host can check.
+
+;; The argument without its outermost quotes, if it has a matched pair.
+(define (proc-win-unquote s)
+  (let ((n (string-length s)))
+    (if (and (>= n 2) (char=? (string-ref s 0) #\") (char=? (string-ref s (- n 1)) #\"))
+        (substring s 1 (- n 1))
+        s)))
+
+;; How many backslashes run backwards from just before index START. msvcrt reads
+;; \" as a literal quote, so a run of them immediately before a closing quote
+;; would escape it; doubling the run leaves the quote closing and the
+;; backslashes literal. This is why "C:\dir\" cannot be quoted naively.
+(define (proc-win-count-leading-backslash s start)
+  (let loop ((j (- start 1)) (k 0))
+    (if (and (>= j 0) (char=? (string-ref s j) #\\))
+        (loop (- j 1) (+ k 1))
+        k)))
+
+(define (proc-win-has-space-or-tab? s)
+  (let loop ((i 0))
+    (cond ((= i (string-length s)) #f)
+          ((or (char=? (string-ref s i) #\space) (char=? (string-ref s i) #\tab)) #t)
+          (else (loop (+ i 1))))))
+
+;; LEGACY's escape set is exactly {space, tab}: an empty argument must be quoted
+;; (or it vanishes), an argument the caller ALREADY quoted is passed through
+;; untouched, and everything else is quoted only when whitespace would otherwise
+;; split it. Nothing else is escaped — <, >, & and | are the command PROCESSOR's
+;; metacharacters, and no command processor is involved here.
+(define (proc-win-needs-escaping? s)
+  (or (= 0 (string-length s))
+      (and (string=? (proc-win-unquote s) s)
+           (proc-win-has-space-or-tab? s))))
+
+;; An argument in quotes, with its trailing backslash run doubled.
+(define (proc-win-quote-arg s)
+  (string-append "\"" s
+                 (make-string (proc-win-count-leading-backslash s (string-length s)) #\\)
+                 "\""))
+
+;; The PROGRAM is quoted without that doubling — quoteString in the JDK — because
+;; it is not an argument being escaped for msvcrt but a path being kept in one
+;; piece for CreateProcessW's own parse.
+(define (proc-win-quote-program s)
+  (string-append "\"" s "\""))
+
+;; `new File(cmd[0]).getPath()` is the JDK's first move, and on Windows that
+;; rewrites "/" to "\". jolt renders paths with "/" everywhere else and Win32
+;; accepts either, but this string is not read by jolt — it is parsed by
+;; CreateProcessW and then, for a .bat or .cmd target, by cmd.exe, which is far
+;; happier with backslashes. So the program takes the native spelling here and
+;; only here. A bare name ("curl") has no separator and is unchanged.
+(define (proc-win-program-spelling s)
+  (list->string (map (lambda (c) (if (char=? c #\/) #\\ c)) (string->list s))))
+
+(define (proc-win-command-line cmd)
+  (let* ((argv (map (lambda (x) (if (string? x) x (jolt-str-render-one x))) cmd))
+         (exe  (proc-win-program-spelling (car argv)))
+         (head (if (proc-win-needs-escaping? exe) (proc-win-quote-program exe) exe)))
+    (let loop ((rest (cdr argv)) (acc head))
+      (if (null? rest)
+          acc
+          (loop (cdr rest)
+                (string-append acc " "
+                               (if (proc-win-needs-escaping? (car rest))
+                                   (proc-win-quote-arg (car rest))
+                                   (car rest))))))))
+
+;; --- the environment block ---------------------------------------------------
+;; CreateProcessW takes "K=V\0K=V\0…\0" — sorted case-insensitively by NAME,
+;; which Windows requires and ProcessEnvironment.toEnvironmentBlock produces, and
+;; carrying SystemRoot, which some MSVCRT versions refuse to start without.
+;;
+;; This is what replaces `env -i K=V …`: there is no env program on Windows and
+;; nothing to exec it with, and the block is exact — the child gets these
+;; variables and no others, which is the semantics the sh prefix was reaching for.
+(define (proc-win-name<? a b)
+  (let ((la (string-downcase a)) (lb (string-downcase b)))
+    (string<? la lb)))
+
+(define (proc-win-env-entries pairs)
+  (let* ((sorted (list-sort (lambda (x y) (proc-win-name<? (car x) (car y))) pairs))
+         (has-root? (let loop ((ps sorted))
+                      (cond ((null? ps) #f)
+                            ((string-ci=? (caar ps) "SystemRoot") #t)
+                            (else (loop (cdr ps))))))
+         (root (and (not has-root?) (getenv "SystemRoot")))
+         (all (if (and root (> (string-length root) 0))
+                  (list-sort (lambda (x y) (proc-win-name<? (car x) (car y)))
+                             (cons (cons "SystemRoot" root) sorted))
+                  sorted)))
+    (if (null? all)
+        ;; an empty environment is still a block, not a null pointer: one NUL
+        ;; here plus the terminator the marshalling appends
+        (string #\nul)
+        (apply string-append
+               (map (lambda (p) (string-append (car p) "=" (cdr p) (string #\nul))) all)))))
+
+;; --- pipes and redirect handles ----------------------------------------------
+;; CreatePipe with NULL security attributes makes BOTH ends non-inheritable; the
+;; child's end is then marked inheritable by hand. Doing it the other way round —
+;; an inheritable lpPipeAttributes — hands the child a duplicate of jolt's own end
+;; too, and a read on that pipe never sees EOF because a writer is still open in
+;; the child. ProcessImpl_md.c's initHolder is this, and the comment there says
+;; the same thing.
+;; -> (cons read-handle write-handle), or #f.
+(define (proc-win-pipe)
+  (let ((rp (sa-foreign-alloc proc-win-ptr-size))
+        (wp (sa-foreign-alloc proc-win-ptr-size)))
+    (let ((ok ((proc-win-create-pipe) rp wp 0 0)))
+      (let ((r (sa-foreign-ref 'void* rp 0))
+            (w (sa-foreign-ref 'void* wp 0)))
+        (sa-foreign-free rp) (sa-foreign-free wp)
+        (and (not (= ok 0)) (cons r w))))))
+
+(define (proc-win-make-inheritable! h)
+  ((proc-win-set-handle-info) h proc-win-HANDLE-FLAG-INHERIT proc-win-HANDLE-FLAG-INHERIT))
+(define (proc-win-make-private! h)
+  ((proc-win-set-handle-info) h proc-win-HANDLE-FLAG-INHERIT 0))
+
+;; The child's end of a file/discard redirect, opened inheritable. Returns a
+;; handle or #f; #f is a failure the caller reports as an IOException rather than
+;; silently giving the child jolt's own descriptor.
+(define (proc-win-open-redirect kind file)
+  (let ((open (proc-win-create-file)))
+    (and open
+         (let* ((share (bitwise-ior proc-win-FILE-SHARE-READ proc-win-FILE-SHARE-WRITE))
+                (h (case kind
+                     ((write)
+                      (win32-with-wstr file
+                        (lambda (w) (open w proc-win-GENERIC-WRITE share 0
+                                          proc-win-CREATE-ALWAYS proc-win-FILE-ATTRIBUTE-NORMAL 0))))
+                     ((append)
+                      ;; FILE_APPEND_DATA without FILE_WRITE_DATA is what makes every
+                      ;; write land at the end atomically, which is what ">>" means.
+                      (win32-with-wstr file
+                        (lambda (w) (open w (bitwise-ior proc-win-FILE-APPEND-DATA proc-win-SYNCHRONIZE)
+                                          share 0 proc-win-OPEN-ALWAYS
+                                          proc-win-FILE-ATTRIBUTE-NORMAL 0))))
+                     ((read)
+                      (win32-with-wstr file
+                        (lambda (w) (open w proc-win-GENERIC-READ share 0
+                                          proc-win-OPEN-EXISTING proc-win-FILE-ATTRIBUTE-NORMAL 0))))
+                     ;; NUL is the Windows /dev/null, and it is a device name
+                     ;; rather than a path — OPEN_EXISTING, no directory involved.
+                     ((discard)
+                      (win32-with-wstr "NUL"
+                        (lambda (w) (open w proc-win-GENERIC-WRITE share 0
+                                          proc-win-OPEN-EXISTING proc-win-FILE-ATTRIBUTE-NORMAL 0))))
+                     (else #f))))
+           (and h (proc-win-handle-ok? h)
+                (begin (proc-win-make-inheritable! h) h))))))
+
+;; --- handle-backed ports -----------------------------------------------------
+;; The POSIX side wraps a descriptor with read(2)/write(2); here the same two
+;; ports sit on ReadFile/WriteFile over the HANDLE. Going through msvcrt's
+;; _open_osfhandle to reuse the fd ports instead would tie jolt's pipes to
+;; whichever C runtime happened to answer, which is a class of Windows bug worth
+;; not having.
+(define (proc-win-input-port h)
+  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
+        (nread (sa-foreign-alloc 4))
+        (closed? (box #f)))
+    (make-custom-binary-input-port
+      (string-append "process-handle-" (number->string h))
+      (lambda (bv start n)
+        (let ((want (min n proc-fd-buf-size)))
+          (if (unbox closed?)
+              0
+              (let ((ok ((proc-win-read-file) h buf want nread 0)))
+                ;; A pipe whose write ends have all closed fails the read with
+                ;; ERROR_BROKEN_PIPE rather than returning zero bytes — that IS
+                ;; the EOF, and reporting it as an error would turn every normal
+                ;; child exit into one. A zero-byte success is EOF too.
+                (if (= ok 0)
+                    0
+                    (let ((got (sa-foreign-ref 'unsigned-32 nread 0)))
+                      (let loop ((i 0))
+                        (when (< i got)
+                          (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
+                          (loop (+ i 1))))
+                      got))))))
+      #f #f
+      (lambda ()
+        (set-box! closed? #t)
+        (sa-foreign-free buf) (sa-foreign-free nread)
+        ((proc-win-close-handle) h)))))
+
+(define (proc-win-output-port h)
+  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
+        (nwrote (sa-foreign-alloc 4))
+        (closed? (box #f)))
+    (make-custom-binary-output-port
+      (string-append "process-handle-" (number->string h))
+      (lambda (bv start n)
+        (let ((want (min n proc-fd-buf-size)))
+          (let loop ((i 0))
+            (when (< i want)
+              (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
+              (loop (+ i 1))))
+          (if (unbox closed?)
+              (error 'process "write to closed pipe" h)
+              (let ((ok ((proc-win-write-file) h buf want nwrote 0)))
+                (if (= ok 0)
+                    (error 'process "write to child failed" h)
+                    (sa-foreign-ref 'unsigned-32 nwrote 0))))))
+      #f #f
+      (lambda ()
+        (set-box! closed? #t)
+        (sa-foreign-free buf) (sa-foreign-free nwrote)
+        ((proc-win-close-handle) h)))))
+
+;; --- reaping through the process handle --------------------------------------
+;; There is no waitpid here. WaitForSingleObject(h, 0) decides whether the child
+;; has exited and GetExitCodeProcess then gives the code. Asking
+;; GetExitCodeProcess alone cannot do it: it answers STILL_ACTIVE (259) for a
+;; running child and 259 for one that exited with 259, and the two are
+;; indistinguishable — the handle wait is what tells them apart.
+;;
+;; Answers in proc-waitpid-once's convention so every caller above is unchanged:
+;; (values rc decoded-or-#f errno), rc = the pid on reap, 0 while running.
+(define (proc-win-status-once h pid)
+  (if (not (proc-win-wait-single))
+      (values -1 #f proc-ECHILD)
+      (let ((w ((proc-win-wait-single) h 0)))
+        (if (not (= w proc-win-WAIT-OBJECT-0))
+            (values 0 #f 0)
+            (let ((codep (sa-foreign-alloc 4)))
+              (let ((ok ((proc-win-get-exit-code) h codep)))
+                (let ((code (sa-foreign-ref 'unsigned-32 codep 0)))
+                  (sa-foreign-free codep)
+                  (if (= ok 0)
+                      (values -1 #f proc-ECHILD)
+                      ;; The exit code is already what Process.exitValue answers on
+                      ;; Windows — there is no wait-status encoding to decode, and
+                      ;; no 128+signal convention, because nothing here is signalled.
+                      (values pid code 0)))))))))
+
+;; destroy / destroyForcibly. Windows has one answer for both: TerminateProcess,
+;; which cannot be caught — which is why ProcessHandle.supportsNormalTermination
+;; is false there, as it already is here. Exit code 1 matches the JDK's.
+(define (proc-win-terminate! h)
+  (let ((t (proc-win-terminate)))
+    (and t (not (= 0 (t h 1))))))
+
+;; ProcessHandle's pid-only surface, which has no handle to work from: open one
+;; for the query and close it again. A pid that cannot be opened at all is gone.
+(define (proc-win-with-pid-handle pid access proc)
+  (let ((open (proc-win-open-process)))
+    (and open
+         (let ((h (open access 0 pid)))
+           (and (proc-win-handle-ok? h)
+                (let ((r (proc (list h))))
+                  ((proc-win-close-handle) h)
+                  r))))))
+
+(define (proc-win-pid-alive? pid)
+  (let ((r (proc-win-with-pid-handle
+            pid (bitwise-ior proc-win-PROCESS-QUERY-LIMITED-INFORMATION
+                             proc-win-SYNCHRONIZE-ACCESS)
+            (lambda (hs) (not (= ((proc-win-wait-single) (car hs) 0) proc-win-WAIT-OBJECT-0))))))
+    (and r #t)))
+
+(define (proc-win-pid-terminate! pid)
+  (let ((t (proc-win-terminate)))
+    (and t
+         (proc-win-with-pid-handle
+          pid proc-win-PROCESS-TERMINATE
+          (lambda (hs) (not (= 0 (t (car hs) 1)))))
+         #t)))
+
+;; --- the spawn ---------------------------------------------------------------
+;; Returns (values child-stdin-port child-stdout-port child-stderr-port pid handle),
+;; each port #f where the stream was inherited rather than piped — the same shape
+;; proc-spawn-fd-level answers with, plus the handle the reaping needs.
+(define (proc-win-spawn st)
+  (let* ((cmdline (proc-win-command-line (proc-pb-cmd st)))
+         (env-map (proc-pb-env st))
+         (dir     (proc-effective-dir (proc-pb-dir st)))
+         (rin     (proc-pb-redir-in st))
+         (rout    (proc-pb-redir-out st))
+         (rerr    (proc-pb-redir-err st))
+         (merge?  (proc-pb-merge-err? st))
+         (inherit? (lambda (r) (and (proc-redirect? r) (eq? (proc-redirect-kind r) 'inherit))))
+         (redir-kind (lambda (r) (and (proc-redirect? r) (proc-redirect-kind r))))
+         ;; everything to free or close on the way out, whichever way it goes
+         (to-free '())
+         (child-handles '())
+         (our-handles '())
+         (restore '()))
+    (define (keep-free! p) (set! to-free (cons p to-free)) p)
+    ;; bInheritHandles is all-or-nothing: CreateProcess passes EVERY inheritable
+    ;; handle in the process, so one left marked is one the next child gets too
+    ;; ("greedy grandchild", KB 315939). jolt's own standard handles are the ones
+    ;; that can arrive already marked, from whatever launched jolt, so their flag
+    ;; is saved and put back around the call — restoreIOEHandleState in
+    ;; ProcessImpl_md.c. The pipe ends need no entry: jolt's end is explicitly
+    ;; made private and the child's is closed here the moment CreateProcess returns.
+    (define (keep-restore! h)
+      (let ((g (proc-win-get-handle-info)))
+        (when g
+          (let ((p (sa-foreign-alloc 4)))
+            (let ((ok (g h p)))
+              (set! restore (cons (cons h (if (= ok 0) 0 (sa-foreign-ref 'unsigned-32 p 0))) restore))
+              (sa-foreign-free p))))))
+    (define (restore-flags!)
+      (for-each (lambda (e)
+                  ((proc-win-set-handle-info) (car e) proc-win-HANDLE-FLAG-INHERIT
+                   (bitwise-and (cdr e) proc-win-HANDLE-FLAG-INHERIT)))
+                restore)
+      (set! restore '()))
+    (define (keep-child! h) (set! child-handles (cons h child-handles)) h)
+    (define (cleanup-child!)
+      (for-each (lambda (h) ((proc-win-close-handle) h)) child-handles)
+      (set! child-handles '()))
+    (define (cleanup-ours!)
+      (for-each (lambda (h) ((proc-win-close-handle) h)) our-handles)
+      (set! our-handles '()))
+    (define (free-all!) (for-each sa-foreign-free to-free) (set! to-free '()))
+    (define (fail! msg)
+      (cleanup-child!) (cleanup-ours!) (restore-flags!) (free-all!)
+      (throw-jvm (quote java.io.IOException) msg))
+    ;; One stream's child-side handle plus the port jolt keeps, if any.
+    ;; `which` is 'in for the stream the child READS.
+    (define (stream which redir)
+      (cond
+        ;; INHERIT: the child gets jolt's real handle, marked inheritable for the
+        ;; duration. True inheritance, as on the POSIX side — no pump thread, and
+        ;; isatty holds in the child.
+        ((inherit? redir)
+         (let ((h ((proc-win-get-std-handle)
+                   (case which
+                     ((in) proc-win-STD-INPUT-HANDLE)
+                     ((out) proc-win-STD-OUTPUT-HANDLE)
+                     (else proc-win-STD-ERROR-HANDLE)))))
+           (unless (proc-win-handle-ok? h) (fail! "ProcessBuilder: no standard handle to inherit"))
+           (keep-restore! h)
+           (proc-win-make-inheritable! h)
+           (cons h #f)))
+        ((memq (redir-kind redir) '(write append read discard))
+         (let ((h (proc-win-open-redirect (redir-kind redir) (proc-redirect-file redir))))
+           (unless h
+             (fail! (string-append "ProcessBuilder: cannot open redirect target "
+                                   (if (proc-redirect-file redir)
+                                       (jolt-str-render-one (proc-redirect-file redir))
+                                       "NUL"))))
+           (keep-child! h)
+           (cons h #f)))
+        (else
+         (let ((p (proc-win-pipe)))
+           (unless p (fail! "ProcessBuilder: CreatePipe failed"))
+           ;; the child writes (out/err) or reads (in); jolt keeps the other end
+           (let* ((child-end (if (eq? which 'in) (car p) (cdr p)))
+                  (our-end   (if (eq? which 'in) (cdr p) (car p))))
+             (proc-win-make-inheritable! child-end)
+             (proc-win-make-private! our-end)
+             (keep-child! child-end)
+             (set! our-handles (cons our-end our-handles))
+             (cons child-end our-end))))))
+    (let* ((sin  (stream 'in  rin))
+           (sout (stream 'out rout))
+           (serr (if merge? (cons (car sout) #f) (stream 'err rerr)))
+           (si (keep-free! (sa-foreign-alloc proc-win-si-size)))
+           (pi (keep-free! (sa-foreign-alloc proc-win-pi-size)))
+           (wcmd (keep-free! (win32-wstr cmdline)))
+           (wdir (and dir (keep-free! (win32-wstr dir))))
+           (wenv (and env-map
+                      (keep-free! (win32-wstr (proc-win-env-entries (proc-env-map-pairs env-map))))))
+           ;; CREATE_NO_WINDOW would hide a console the child was meant to share,
+           ;; so it is dropped exactly when a standard handle is being inherited
+           ;; and this process has a console — ProcessImpl_md.c's own test.
+           (console? (let ((g (proc-win-get-console-window)))
+                       (and g (proc-win-handle-ok? (g)))))
+           (flags (bitwise-ior
+                   proc-win-CREATE-UNICODE-ENVIRONMENT
+                   (if (and console? (or (inherit? rin) (inherit? rout) (inherit? rerr)))
+                       0
+                       proc-win-CREATE-NO-WINDOW))))
+      (let loop ((i 0)) (when (< i proc-win-si-size)
+                          (sa-foreign-set! 'unsigned-8 si i 0) (loop (+ i 1))))
+      (let loop ((i 0)) (when (< i proc-win-pi-size)
+                          (sa-foreign-set! 'unsigned-8 pi i 0) (loop (+ i 1))))
+      (sa-foreign-set! 'unsigned-32 si 0 proc-win-si-size)             ; cb
+      (sa-foreign-set! 'unsigned-32 si proc-win-si-flags-off proc-win-STARTF-USESTDHANDLES)
+      (sa-foreign-set! 'void* si proc-win-si-stdin-off  (car sin))
+      (sa-foreign-set! 'void* si proc-win-si-stdout-off (car sout))
+      (sa-foreign-set! 'void* si proc-win-si-stderr-off (car serr))
+      (let ((ok ((proc-win-create-process)
+                 0            ; lpApplicationName — NULL, so the command line names it
+                 wcmd         ; lpCommandLine
+                 0 0          ; process / thread security attributes
+                 1            ; bInheritHandles — the marked ones, and only those
+                 flags
+                 (or wenv 0)  ; NULL inherits jolt's own environment
+                 (or wdir 0)
+                 si pi)))
+        (when (= ok 0)
+          (let ((e (let ((g (proc-win-last-error))) (if g (g) 0))))
+            (fail! (string-append "Cannot run program \"" (jolt-str-render-one (car (proc-pb-cmd st)))
+                                  "\": CreateProcess error=" (number->string e)))))
+        ;; The child owns its ends now; keeping them open here is what stops a
+        ;; read ever seeing EOF.
+        (cleanup-child!)
+        (restore-flags!)
+        (let ((hproc (sa-foreign-ref 'void* pi 0))
+              (hthread (sa-foreign-ref 'void* pi proc-win-ptr-size))
+              (pid (sa-foreign-ref 'unsigned-32 pi (* 2 proc-win-ptr-size))))
+          ((proc-win-close-handle) hthread)     ; never used; the JDK drops it too
+          (free-all!)
+          (values (and (cdr sin)  (proc-win-output-port (cdr sin)))
+                  (and (cdr sout) (proc-win-input-port  (cdr sout)))
+                  (and (cdr serr) (proc-win-input-port  (cdr serr)))
+                  pid
+                  hproc))))))
+
 (define (proc-pb-start self)
   (let* ((st (jhost-state self))
          (cmd (proc-pb-cmd self)))
@@ -1095,7 +1692,42 @@
       ;; posix_spawn a child's dispositions match a plain shell's exactly.
       ;; The fork path stays as the fallback for machine types without the FFI,
       ;; INHERIT emulation and all.
-      (if proc-spawn-fd-ok?
+      (cond
+        ;; --- Windows: CreateProcessW, no shell in sight (jolt-lang/jolt#1108) ---
+        (proc-win?
+         (unless (proc-win-spawn-ok?)
+           ;; The old behaviour here was Chez's open-process-ports handed a
+           ;; /bin/sh command string, which cmd.exe answered with exit 0, empty
+           ;; stdout and a complaint on stderr — so a caller that only checked the
+           ;; status saw a successful spawn that never ran. Refuse loudly instead;
+           ;; there is no correct string to fall back to.
+           (throw-jvm (quote java.io.IOException)
+             "ProcessBuilder: no Windows spawn path — kernel32 CreateProcessW/CreatePipe unavailable"))
+         (when (or (inherit? rout) (inherit? rerr))
+           (guard (e (#t #f)) (flush-output-port (current-output-port)))
+           (guard (e (#t #f)) (flush-output-port (current-error-port))))
+         (call-with-values
+           ;; Serialised for the same reason the posix_spawn path is, and a
+           ;; sharper one: CreateProcess with bInheritHandles inherits EVERY
+           ;; inheritable handle in the process, so two spawns overlapping would
+           ;; each hand the other's pipe ends to their child — and a read whose
+           ;; write end is still open in some unrelated child never sees EOF
+           ;; (KB 315939, the race the JDK holds a lock for).
+           (lambda () (jolt-with-mutex proc-spawn-fd-mutex (proc-win-spawn self)))
+           (lambda (cin cout cerr pid hproc)
+             (let* ((child-stdin  (or cin  (proc-null-output-port)))
+                    (child-stdout (or cout (proc-null-input-port)))
+                    (child-stderr (or cerr (proc-null-input-port)))
+                    (pst (vector (make-out-stream child-stdin)
+                                 (make-in-stream child-stdout)
+                                 (make-in-stream child-stderr)
+                                 pid (box #f) (proc-pb-cmd self) (make-mutex)
+                                 child-stdout child-stdin (box '()) (box #f)
+                                 hproc)))
+               ;; No inherit latches: INHERIT here is real handle inheritance, so
+               ;; there is no pump whose output waitFor has to join.
+               (make-jhost "process" pst)))))
+        (proc-spawn-fd-ok?
           ;; An INHERITED stream means the child writes jolt's real descriptors,
           ;; so anything jolt has buffered must land first to keep its order.
           (begin
@@ -1114,11 +1746,14 @@
                                     (make-in-stream child-stderr)
                                     pid (box #f) (proc-pb-cmd self) (make-mutex)
                                     child-stdout child-stdin (box '()) (box #f))))
-                  (make-jhost "process" pst)))))
+                  (make-jhost "process" pst))))))
+        (else
           (call-with-values
             ;; Chez forks for this one, so the child inherits this thread's
             ;; signal mask just as the posix_spawn path does. (It also leaves
             ;; SIGINT ignored in the child, which is why this is the fallback.)
+            ;; POSIX only — the string it is handed is /bin/sh's, and Windows is
+            ;; served by the CreateProcessW arm above.
             (lambda () (jolt-with-empty-sigmask
                          (lambda () (sa-run-process (proc-build-shell-command self) #f))))
             (lambda (child-stdin child-stdout child-stderr pid)
@@ -1135,7 +1770,7 @@
                 (when (inherit? rin)  (proc-pump (current-input-port) child-stdin #t))
                 (when (inherit? rout) (set-box! latches (cons (proc-pump child-stdout (current-output-port) #f) (unbox latches))))
                 (when (inherit? rerr) (set-box! latches (cons (proc-pump child-stderr (current-error-port) #f) (unbox latches))))
-                (make-jhost "process" pst))))))))
+                (make-jhost "process" pst)))))))))
 
 ;; Block until the process exits, caching and returning the decoded status. Any
 ;; INHERIT output pumps are joined first, so all forwarded output has landed by
@@ -1165,7 +1800,7 @@
 (define (proc-reap-once st)
   (jolt-with-mutex (proc-p-mutex st)
     (or (unbox (proc-p-exit-box st))
-        (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
+        (call-with-values (lambda () (proc-status-once st))
           (lambda (rc decoded err)
             (cond
               ((and decoded (= rc (proc-p-pid st)))
@@ -1213,7 +1848,7 @@
 (define (proc-alive? st)
   (jolt-with-mutex (proc-p-mutex st)
     (if (unbox (proc-p-exit-box st)) #f
-        (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
+        (call-with-values (lambda () (proc-status-once st))
           (lambda (rc decoded err)
             (cond ((= rc 0) #t)                      ; still running
                   (decoded (set-box! (proc-p-exit-box st) decoded) #f)
@@ -1222,11 +1857,22 @@
 
 ;; Records a terminating signal we sent, so proc-lost-status can still give the
 ;; right answer for a child that something else reaps before we get to it.
+;;
+;; Windows has no signals and one way to stop a process: TerminateProcess, which
+;; cannot be caught. So destroy and destroyForcibly are the same call there — as
+;; they are on the JVM, whose ProcessHandle.supportsNormalTermination is false on
+;; Windows for exactly this reason (and is already false here, gated on proc-kill).
+;; Nothing goes in the signalled box: the child's exit code stays readable from
+;; its handle afterwards, so there is no lost status to reconstruct.
 (define (proc-signal st sig)
-  (when proc-kill
-    (proc-kill (proc-p-pid st) sig)
-    (when (or (= sig proc-SIGTERM) (= sig proc-SIGKILL))
-      (set-box! (proc-p-signalled st) (+ 128 sig))))
+  (let ((h (proc-p-win-handle st)))
+    (cond
+      (h (proc-win-terminate! h))
+      (proc-kill
+       (proc-kill (proc-p-pid st) sig)
+       (when (or (= sig proc-SIGTERM) (= sig proc-SIGKILL))
+         (set-box! (proc-p-signalled st) (+ 128 sig))))
+      (else #f)))
   st)
 
 (register-host-methods! "process"
@@ -1249,7 +1895,7 @@
         (cons "exitValue" (lambda (self)
           (jolt-with-mutex (proc-p-mutex self)
             (or (unbox (proc-p-exit-box self))
-                (call-with-values (lambda () (proc-waitpid-once (proc-p-pid self) #t))
+                (call-with-values (lambda () (proc-status-once self))
                   (lambda (rc decoded err)
                     (cond (decoded (set-box! (proc-p-exit-box self) decoded) (->num decoded))
                           ;; unwaitable: it HAS exited (something else reaped it), so
@@ -1354,6 +2000,10 @@
 ;; claim to). With no kill binding nothing can be known, so answer the way the
 ;; JVM does for a handle it is holding.
 (define (proc-pid-alive? pid)
+  (if proc-win?
+      ;; No kill(2) to probe with: open the process for a status query and ask
+      ;; its handle. A pid nothing can be opened for is gone.
+      (proc-win-pid-alive? pid)
   (if proc-kill
       (or (= 0 (proc-kill pid 0))
           ;; EPERM says the process EXISTS and this one may not signal it —
@@ -1361,11 +2011,16 @@
           ;; there is nothing there, so reading any failure as dead would
           ;; report every process but our own as gone.
           (= (proc-errno) proc-EPERM))
-      #t))
+      #t)))
+
+(define (proc-handle-destroy! pid sig)
+  (cond (proc-win? (proc-win-pid-terminate! pid))
+        (proc-kill (proc-kill pid sig) #t)
+        (else #t)))
 
 (register-host-methods! "process-handle"
-  (list (cons "destroy" (lambda (self) (when proc-kill (proc-kill (jhost-state self) proc-SIGTERM)) #t))
-        (cons "destroyForcibly" (lambda (self) (when proc-kill (proc-kill (jhost-state self) proc-SIGKILL)) #t))
+  (list (cons "destroy" (lambda (self) (proc-handle-destroy! (jhost-state self) proc-SIGTERM) #t))
+        (cons "destroyForcibly" (lambda (self) (proc-handle-destroy! (jhost-state self) proc-SIGKILL) #t))
         (cons "pid"     (lambda (self) (->num (jhost-state self))))
         (cons "isAlive" (lambda (self) (proc-pid-alive? (jhost-state self))))
         ;; SIGTERM is catchable everywhere jolt binds kill; Windows has no

@@ -485,6 +485,124 @@
   (delete-file dst #f)
   (delete-path! d))
 
+;; --- the Windows command line (jolt-lang/jolt#1108) --------------------------
+;; Where posix_spawn is missing, every spawn used to go to Chez's
+;; open-process-ports carrying proc-build-shell-command's /bin/sh string — `exec `,
+;; `cd 'DIR' &&`, `env -i K=V …`, sh quoting — which on Windows reaches cmd.exe.
+;; cmd stops at the first token, so EVERY spawn failed, and failed with exit 0 and
+;; an empty stdout: only stderr said anything. The fix is a real CreateProcessW
+;; spawn with no shell on either side, and this is the half of it a POSIX runner
+;; can check — the one string CreateProcessW takes, built by the JDK's rules
+;; (ProcessImpl.createCommandLine in VERIFICATION_LEGACY, the mode a plain
+;; ProcessBuilder.start() takes there).
+
+(define (cmdline label argv want)
+  (let ((got (proc-win-command-line argv)))
+    (set! total (+ total 1))
+    (unless (string=? got want)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a: got ~s, want ~s\n" label got want))))
+
+;; the two repros from the issue, which used to produce "exec 'git' '--version'"
+;; and "exec 'cmd' '/c' 'echo' 'hi'"
+(cmdline "bare program and flag" '("git" "--version") "git --version")
+(cmdline "cmd /c passthrough" '("cmd" "/c" "echo" "hi") "cmd /c echo hi")
+
+;; A program path takes the native spelling — `new File(cmd[0]).getPath()` is the
+;; JDK's first move and rewrites "/" to "\" on Windows. A bare name has no
+;; separator and is untouched.
+(same "program spelling rewrites /" (proc-win-program-spelling "C:/Windows/System32/curl.exe")
+      "C:\\Windows\\System32\\curl.exe")
+(same "program spelling leaves a bare name" (proc-win-program-spelling "curl") "curl")
+(same "program spelling leaves backslashes" (proc-win-program-spelling "C:\\bin\\x.exe") "C:\\bin\\x.exe")
+(cmdline "drive-absolute program" '("C:/Windows/System32/curl.exe" "-s" "http://x/")
+         "C:\\Windows\\System32\\curl.exe -s http://x/")
+(cmdline "relative program" '("./tool" "-v") ".\\tool -v")
+
+;; A program whose path holds a space is quoted, so CreateProcessW's own parse
+;; does not stop at the space and look for "C:\Program.exe".
+(cmdline "program with a space is quoted" '("C:/Program Files/Git/bin/git.exe" "status")
+         "\"C:\\Program Files\\Git\\bin\\git.exe\" status")
+
+;; --- which ARGUMENTS get quoted ---------------------------------------------
+;; LEGACY's escape set is exactly {space, tab}. An empty argument must be quoted
+;; or it disappears; an argument the caller already quoted is passed through.
+(ok "empty argument needs escaping"     (proc-win-needs-escaping? ""))
+(ok "space needs escaping"              (proc-win-needs-escaping? "a b"))
+(ok "tab needs escaping"                (proc-win-needs-escaping? "a\tb"))
+(ok "plain argument does not"           (not (proc-win-needs-escaping? "abc")))
+(ok "already-quoted is passed through"  (not (proc-win-needs-escaping? "\"a b\"")))
+;; cmd's metacharacters are NOT escaped: no command processor is involved, so
+;; they are ordinary bytes on the way to the child's own argv.
+(ok "& is not a metacharacter here"     (not (proc-win-needs-escaping? "a&b")))
+(ok "| is not a metacharacter here"     (not (proc-win-needs-escaping? "a|b")))
+(ok "> is not a metacharacter here"     (not (proc-win-needs-escaping? "a>b")))
+
+(cmdline "argument with a space"  '("echo" "a b")   "echo \"a b\"")
+(cmdline "empty argument"         '("prog" "")      "prog \"\"")
+(cmdline "pre-quoted argument"    '("prog" "\"a b\"") "prog \"a b\"")
+(cmdline "metacharacters ride through" '("echo" "a&b|c>d") "echo a&b|c>d")
+
+;; A run of backslashes immediately before the closing quote would escape it —
+;; msvcrt reads \" as a literal quote — so the run is doubled. This is why
+;; "C:\my dir\" cannot be quoted naively.
+(same "count trailing backslashes (none)" (proc-win-count-leading-backslash "abc" 3) 0)
+(same "count trailing backslashes (one)"  (proc-win-count-leading-backslash "a\\" 2) 1)
+(same "count trailing backslashes (two)"  (proc-win-count-leading-backslash "a\\\\" 3) 2)
+(cmdline "trailing backslash in a quoted argument"
+         '("prog" "C:\\my dir\\") "prog \"C:\\my dir\\\\\"")
+;; ...and an argument that needs no quotes keeps its backslashes as they are
+(cmdline "trailing backslash with no space" '("prog" "C:\\dir\\") "prog C:\\dir\\")
+
+;; --- the environment block ---------------------------------------------------
+;; CreateProcessW takes "K=V\0K=V\0…", sorted case-insensitively by name — which
+;; Windows requires and ProcessEnvironment.toEnvironmentBlock produces. This is
+;; what replaces `env -i K=V …`: there is no env program on Windows, and the block
+;; is exact, which is the semantics the sh prefix was reaching for.
+(define (envblock label pairs want)
+  (let ((got (proc-win-env-entries pairs)))
+    (set! total (+ total 1))
+    (unless (string=? got want)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a: got ~s, want ~s\n" label got want))))
+
+(define NUL (string #\nul))
+(envblock "one entry" '(("PATH" . "C:\\bin")) (string-append "PATH=C:\\bin" NUL))
+(envblock "sorted case-insensitively by name"
+          '(("zeta" . "1") ("ALPHA" . "2") ("Beta" . "3"))
+          (string-append "ALPHA=2" NUL "Beta=3" NUL "zeta=1" NUL))
+;; an empty environment is still a block, not a null pointer
+(envblock "empty environment" '() NUL)
+
+;; --- STARTUPINFOW / PROCESS_INFORMATION layout -------------------------------
+;; Derived from the pointer width rather than hardcoded, so the same formulas
+;; serve x64 and x86. The runner is 64-bit, where the documented sizes are 104
+;; and 24 — if the derivation were wrong, CreateProcessW would read the std
+;; handles out of the padding and the child would get none of them.
+(when (= 8 (sa-foreign-sizeof 'void*))
+  (same "STARTUPINFOW size on x64"     proc-win-si-size 104)
+  (same "STARTUPINFOW dwFlags offset"  proc-win-si-flags-off 60)
+  (same "STARTUPINFOW hStdInput"       proc-win-si-stdin-off 80)
+  (same "STARTUPINFOW hStdOutput"      proc-win-si-stdout-off 88)
+  (same "STARTUPINFOW hStdError"       proc-win-si-stderr-off 96)
+  (same "PROCESS_INFORMATION size"     proc-win-pi-size 24)
+  ;; (HANDLE)-1 arrives through Chez's void* as an unsigned address, so the
+  ;; INVALID_HANDLE_VALUE test has to be all-ones at the pointer width — against
+  ;; -1 it would never match and every failed CreateFileW would look usable.
+  (same "INVALID_HANDLE_VALUE is all ones" proc-win-INVALID-HANDLE #xFFFFFFFFFFFFFFFF)
+  (ok "INVALID_HANDLE_VALUE is not a usable handle"
+      (not (proc-win-handle-ok? proc-win-INVALID-HANDLE)))
+  (ok "NULL is not a usable handle" (not (proc-win-handle-ok? 0)))
+  (ok "a real address is a usable handle" (proc-win-handle-ok? 12345)))
+
+;; Nothing above resolved a Win32 entry point: this is a POSIX runner, and the
+;; whole surface is gated on the machine type. If any of it had tried, the
+;; accessors would answer #f rather than raising — which is also what a Windows
+;; host missing an entry gets, and what proc-win-spawn-ok? turns into a loud
+;; IOException instead of the silent exit-0 that started this.
+(ok "no Win32 entry resolves on a POSIX host" (not (proc-win-spawn-ok?)))
+(ok "proc-win? is false on a POSIX host" (not proc-win?))
+
 (if (> fails 0)
     (begin (printf "WIN-PLATFORM FAILURES: ~a of ~a\n" fails total) (exit 1))
     (printf "WIN-PLATFORM OK (~a checks)\n" total))
