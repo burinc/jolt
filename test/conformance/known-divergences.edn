@@ -30,7 +30,7 @@
   :permissive
   "jolt succeeds where the JVM throws, on operations with one reasonable meaning: count works on eduction, keys on a vector of pairs, (empty MapEntry) => []. A superset: portable JVM code behaves identically.",
   :namespace-model
-  "jolt's namespace layer is permissive: clojure.core always resolves (a :refer-clojure :exclude/:only affects syntax-quote qualification but not resolve/ns-resolve) and var privacy is not enforced across namespaces. A superset — code that resolves on the JVM resolves on jolt.",
+  "jolt's namespace layer is permissive where the JVM's has no useful answer: a namespace made by a bare in-ns still sees clojure.core, a load cycle completes, and a late-bound host static is resolved at the call. A superset — code that resolves on the JVM resolves on jolt.",
   :deps-model
   "jolt resolves deps.edn itself (grenadine, no JVM toolchain) and jolt IS Clojure, so a host-supplied coordinate is TERMINAL: it contributes neither an artifact nor children. Not a superset — the JVM's org.clojure/clojure carries dependencies of its own, and those do not arrive here.",
   :type-hint-model
@@ -604,25 +604,9 @@
            :jvm "true"
            :jolt "false"}
    :note "core vars are minted without reader positions; user + loaded-file defns carry :line/:column/:file."}
-  ;; resolve/ns-resolve ignore a :refer-clojure :exclude/:only — clojure.core always
-  ;; resolves. The filter still governs syntax-quote qualification. jolt-ox7c.27
-  {:category :namespace-model
-   :behavior "(ns x (:refer-clojure :exclude [map])) then (resolve 'map)"
-   :jvm "nil"
-   :jolt "#'clojure.core/map"
-   :check {:expr "(do (ns kd-refer-excl (:refer-clojure :exclude [map])) (pr-str (resolve 'map)))"
-           :jvm "\"nil\""
-           :jolt "\"#'clojure.core/map\""}
-   :note "clojure.core always resolves; :exclude/:only affect syntax-quote, not resolve. Permissive."}
-  ;; a :private var is readable from another namespace (privacy is not enforced).
-  {:category :namespace-model
-   :behavior "reading a ^:private var from another namespace"
-   :jvm "throws (var is not public)"
-   :jolt "returns the value"
-   :check {:expr "(do (ns kd-priv-a) (def ^:private secret 42) (ns kd-priv-b) (eval 'kd-priv-a/secret))"
-           :jvm "throws IllegalStateException"
-           :jolt "42"}
-   :note "Var privacy is not enforced across namespaces; ns-publics still filters privates out."}
+  ;; (:refer-clojure :exclude/:only now withhold the name from the compiler,
+  ;;  resolve and ns-map, and a ^:private var of another namespace is refused
+  ;;  as on the JVM — jolt#1095 — so both of those divergences are gone.)
   ;; (ns-resolve / ns-unmap / alias on a missing namespace now throw like the JVM —
   ;;  jolt-ox7c.33 — so that divergence is gone.)
   ;; an unregistered reader tag reads as an inert tagged literal rather than throwing.

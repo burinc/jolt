@@ -509,7 +509,8 @@
                                               (lambda (c) (not (var-private? c))))
                            (lambda (k v acc)
                              (let ((local (var-cell-lookup cns (symbol-t-name k))))
-                               (if (and local (var-cell-defined? local))
+                               (if (or (and local (var-cell-defined? local))
+                                       (not (chez-core-visible? cns (symbol-t-name k))))
                                    acc
                                    (jolt-assoc acc k v))))
                            (jolt-hash-map)))))
@@ -664,8 +665,9 @@
                 (or (var-cell-lookup cns nm)
                     (let ((ref (chez-resolve-refer cns nm)))
                       (and ref (var-cell-lookup (car ref) (cdr ref))))
-                    ;; the implicit clojure.core refer — blocked by an ns-unmap tombstone
-                    (and (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
+                    ;; the implicit clojure.core refer — blocked by a :refer-clojure
+                    ;; exclusion or an ns-unmap tombstone
+                    (and (chez-core-visible? cns nm)
                          (var-cell-lookup "clojure.core" nm))))))
     (if (and c (var-cell-defined? c)) c jolt-nil)))
 ;; (resolve sym) resolves globally; (resolve &env sym) additionally answers nil
@@ -708,7 +710,7 @@
                 (or (var-cell-lookup cns nm)
                     (let ((ref (chez-resolve-refer cns nm)))
                       (and ref (var-cell-lookup (car ref) (cdr ref))))
-                    (and (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
+                    (and (chez-core-visible? cns nm)
                          (var-cell-lookup "clojure.core" nm))))))
     (if (and c (var-cell-defined? c)) c jolt-nil)))
 
@@ -805,20 +807,55 @@
                  nm))))))
       (ns-cells-list target))
     jolt-nil))
-;; (:refer-clojure :exclude [names…]) — clojure.core always resolves on Chez, so
-;; the only thing to track is the EXCLUDE set: an excluded name is not
-;; clojure.core/name, so syntax-quote qualifies it to the current ns instead (a ns
-;; that excludes and defines its own, e.g. core.logic.fd's ==).
-(define ns-core-exclude-table (make-hashtable equal-hash equal?))  ; cns -> (name -> #t)
-(define (chez-register-core-exclude! cns name)
+;; (:refer-clojure :exclude [names…] :only [names…]) — which clojure.core names
+;; the ns does NOT get. clojure.core is never copied into a namespace on Chez: the
+;; implicit refer is a fallback every resolver consults last, and what is tracked
+;; is which names that fallback withholds. An excluded name resolves nowhere until
+;; the ns defines its own — "Unable to resolve symbol" at a use above that def,
+;; nil from resolve — and syntax-quote qualifies it to the current ns
+;; (core.logic.fd's ==), as on the JVM (jolt#1095).
+;;
+;; On the JVM each refer-clojure call ADDS the core mappings its filter lets
+;; through and removes none, so a name stays unmapped only while EVERY call the ns
+;; has seen withheld it: `(ns x)` then `(refer-clojure :exclude '[inc])` leaves inc
+;; mapped, the ns macro's default (refer-clojure) having mapped it already. So a
+;; ns's entry is one clause per call — (exclude-set . only-set-or-#f) — and a name
+;; is excluded when all of them exclude it. A call that withholds nothing makes
+;; every later one moot, so it collapses the entry to 'all. A ns no refer-clojure
+;; ever ran in (a bare in-ns) has no entry and sees all of core — permissive where
+;; the JVM would see none of it.
+(define ns-core-exclude-table (make-hashtable equal-hash equal?))  ; cns -> 'all | (clause …)
+(define (name-set names)
+  (let ((h (make-hashtable string-hash string=?)))
+    (for-each (lambda (n) (hashtable-set! h n #t)) names)
+    h))
+;; excl: the :exclude names; only: the :only names, or #f when :only is absent
+(define (chez-register-core-refer! cns excl only)
   (jolt-with-mutex ns-map-mu
-   (let ((h (or (hashtable-ref ns-core-exclude-table cns #f)
-                (let ((h (make-hashtable string-hash string=?)))
-                  (hashtable-set! ns-core-exclude-table cns h) h))))
-     (hashtable-set! h name #t))))
+    (let ((cur (hashtable-ref ns-core-exclude-table cns #f)))
+      (unless (eq? cur 'all)
+        (hashtable-set! ns-core-exclude-table cns
+          (if (and (null? excl) (not only))
+              'all
+              (cons (cons (name-set excl) (and only (name-set only)))
+                    (or cur '()))))))))
+(define (core-clause-excludes? c name)
+  (or (and (hashtable-ref (car c) name #f) #t)
+      (and (cdr c) (not (hashtable-ref (cdr c) name #f)))))
 (define (chez-core-excluded? cns name)
-  (let ((h (hashtable-ref ns-core-exclude-table cns #f)))
-    (and h (hashtable-ref h name #f) #t)))
+  (let ((cur (hashtable-ref ns-core-exclude-table cns #f)))
+    (and (pair? cur)
+         (for-all (lambda (c) (core-clause-excludes? c name)) cur))))
+;; The implicit clojure.core refer of `name` in `cns`: blocked by a
+;; :refer-clojure exclusion or an ns-unmap tombstone. The one test the compiler
+;; (host-contract.ss hc-resolve-cell), resolve, ns-resolve and ns-refers share.
+;; `ns` and `in-ns` are never blocked: Compiler.lookupVar / resolveIn /
+;; maybeResolveIn answer RT.NS_VAR / IN_NS_VAR for them before consulting the
+;; namespace, so a file can always switch namespaces, whatever it excluded.
+(define (chez-core-visible? cns name)
+  (or (string=? name "ns") (string=? name "in-ns")
+      (and (not (chez-core-excluded? cns name))
+           (not (eq? (hashtable-ref ns-refer-table (cons cns name) #f) 'unmapped)))))
 ;; refer-clojure is a MACRO here (marked below) whose expander is this fn, so
 ;; args arrive UNEVALUATED: a top-level (:exclude [names]) is raw, while the ns
 ;; macro emits quoted args ((quote :exclude) (quote [names])) — the JVM shape,
@@ -839,21 +876,29 @@
 ;; A Scheme-side macro expander takes the JVM's leading &form / &env like any
 ;; other (host-contract.ss hc-expand-1); neither is read here.
 (define (jolt-refer-clojure _form _env . args)
-  (let loop ((a args) (names '()))
+  (define (quoted xs) (jolt-list (jolt-symbol #f "quote") (apply jolt-list xs)))
+  (define (opt-names k v nm)
+    (and (keyword? k) (string=? (keyword-t-name k) nm) v
+         (filter symbol-t? (seq->list v))))
+  (let loop ((a args) (names '()) (only #f))
     (cond
      ((or (null? a) (null? (cdr a)))
-      (jolt-list (jolt-symbol "clojure.core" "refer-clojure-register!")
-                 (jolt-list (jolt-symbol #f "quote") (apply jolt-list (reverse names)))))
-     ((let ((k (rc-unquote (car a))) (v (rc-unquote (cadr a))))
-        (and (keyword? k) (string=? (keyword-t-name k) "exclude") v))
-      => (lambda (v)
-           (loop (cddr a) (append (filter symbol-t? (seq->list v)) names))))
-     (else (loop (cddr a) names)))))
-(define (jolt-refer-clojure-register! names)
-  (let ((cns (chez-current-ns)))
-    (for-each (lambda (n) (when (symbol-t? n)
-                            (chez-register-core-exclude! cns (symbol-t-name n))))
-              (seq->list names)))
+      ;; the :only list rides as a second argument, and only when spelled, so
+      ;; an exclude-only form keeps the one-argument call older seeds emit.
+      (apply jolt-list (jolt-symbol "clojure.core" "refer-clojure-register!")
+             (quoted (reverse names))
+             (if only (list (quoted only)) '())))
+     (else
+      (let ((k (rc-unquote (car a))) (v (rc-unquote (cadr a))))
+        (cond
+         ((opt-names k v "exclude") => (lambda (ns) (loop (cddr a) (append ns names) only)))
+         ((opt-names k v "only") => (lambda (ns) (loop (cddr a) names (append (or only '()) ns))))
+         (else (loop (cddr a) names only))))))))
+(define (jolt-refer-clojure-register! names . only)
+  (define (names-of xs) (map symbol-t-name (filter symbol-t? (seq->list xs))))
+  (chez-register-core-refer! (chez-current-ns)
+                             (names-of names)
+                             (and (pair? only) (names-of (car only))))
   jolt-nil)
 
 ;; alter-meta! / reset-meta!: a var's metadata lives in the cell's meta field;

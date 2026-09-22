@@ -117,6 +117,10 @@
  :analyze/invalid-macro-value
  "A macro's var used as a value. Macros exist only at compile time."
 
+ :analyze/private-var
+ "A reference to another namespace's ^:private var — as a value, a call head or
+  a macro. (var ns/name) is exempt. Carries :symbol, the var's qualified name."
+
  :analyze/invalid-arity
  "A special form applied to the wrong number of arguments."
 
