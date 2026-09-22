@@ -1873,8 +1873,14 @@
           ;; parameter — so the wrapper has to be installed on the thread that
           ;; calls (exit), and for an app that is this one. Installed before the
           ;; guard so the (exit 1) an uncaught throw takes runs the hooks too.
-          ;; The CLI's own twin of this is at the top of jolt-cli-run.
+          ;; The CLI's own twin of this is at the top of jolt-cli-run — including
+          ;; the arm, which has to run on THIS thread (the primordial) and before
+          ;; any app top-level form can start a thread of its own: it is what makes
+          ;; ^C and `kill` run the hooks and exit 128+signal, whichever thread the
+          ;; app registered them from. A library build has no thread of its own to
+          ;; arm; its host process owns both of these.
           (unless library? (put-string out "    (jolt-install-exit-handler!)\n"))
+          (unless library? (put-string out "    (jolt-arm-shutdown!)\n"))
           ;; The prologue (optional native loads + source-root setup) and the -main
           ;; call (or library export publish) run under one guard so a throw in
           ;; either surfaces as jolt-report-throwable + a non-zero exit/return

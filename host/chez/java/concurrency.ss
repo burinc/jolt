@@ -3391,6 +3391,14 @@
 (define jolt-shutdown-ran (box #f))
 
 (define (jolt-register-shutdown-hook! key thunk)
+  ;; A registered hook is a second mutator: the watcher thread runs it, and it can
+  ;; touch whatever jolt value the program can. That is what jolt-mt? guards, and
+  ;; the watcher does not flip it itself — it is forked dormant so a program with
+  ;; no hooks keeps the single-threaded lazy path (lazy-bridge.ss). Flipping HERE
+  ;; is race-free for the same reason the fork does it: the registering thread is
+  ;; either registering or forcing a cell, never both, and if any other thread
+  ;; exists the flag is already on.
+  (jolt-mark-mt!)
   (jolt-with-mutex jolt-shutdown-mutex
     (set-box! jolt-shutdown-hooks (cons (cons key thunk) (unbox jolt-shutdown-hooks))))
   ;; outside the mutex: arming takes it to test the watcher's flag
@@ -3458,25 +3466,32 @@
   jolt-nil)
 
 ;; --- SIGTERM / SIGHUP / SIGINT -----------------------------------------------
-;; The signals a JVM runs shutdown hooks for and jolt can take over: SIGTERM (the
-;; default `kill`, what a supervisor sends), SIGHUP, and SIGINT (^C). Same numbers
-;; on Linux and macOS.
+;; The signals a JVM runs shutdown hooks for, and jolt takes the same three:
+;; SIGTERM (the default `kill`, what a supervisor sends), SIGHUP, and SIGINT (^C).
+;; Same numbers on Linux and macOS.
 ;;
-;; SIGINT used to be left out on the grounds that Chez owns it through
-;; keyboard-interrupt-handler. It does — and that is exactly the problem: Chez's
-;; handler unwinds to its own top level, which under a script means exiting 255
-;; without ever reaching the exit handler. So a program with a registered hook
-;; ^C'd ran no hook at all, while the same program `kill`ed ran every one of them
-;; (jolt-na7). A JVM makes no such distinction: ^C runs the hooks and exits 130.
-;; Taking SIGINT here makes the two agree.
+;; A JVM answers all three alike, whatever the program is doing and whichever
+;; thread registered the hook: it runs the hooks and exits 128+signal. Measured on
+;; OpenJDK 20 / Clojure 1.12.6, for a hook registered on the main thread, a hook
+;; registered on a worker, and no hook at all: 130 / 143 / 129 in all nine cells.
+;; It can answer that uniformly because a dedicated signal dispatcher thread owns
+;; the three from VM startup.
 ;;
-;; The WATCHER only ever applies to a program that registered a shutdown hook —
-;; arming is what starts it, on the first registration (see below). A program with
-;; nothing to clean up keeps Chez's ^C behavior: the signal reaches the primordial
-;; thread, the one place Chez's handler can act on it, rather than a worker that
-;; would swallow it (the fork guard below). A CHILD process inherits none of this
-;; mask (jolt-with-empty-sigmask, further down), so ^C on the foreground process
-;; group still kills subprocesses outright.
+;; jolt's watcher is that thread, and the CLI arms it at entry (cli-core.ss, and
+;; the launcher a `jolt build` emits) for the same reason the JVM does it at
+;; startup rather than on demand: nothing but a thread itself can mask a signal in
+;; it, so arming later — on the first hook, possibly from a worker — leaves the
+;; PRIMORDIAL thread unmasked, and the kernel delivers there. That meant SIG_DFL
+;; for TERM/HUP, a hard kill with the hooks unrun, and for INT Chez's
+;; keyboard-interrupt handler, which unwinds to Chez's top level and exits 255
+;; without ever reaching the exit handler (jolt-na7, and #1098 for the worker
+;; case).
+;;
+;; Arming is idempotent and still happens on the first registration too, for a
+;; runtime embedded without jolt's CLI entry (a gate harness loading rt.ss).
+;;
+;; A CHILD process inherits none of this mask (jolt-with-empty-sigmask, further
+;; down), so ^C on the foreground process group still kills subprocesses outright.
 (define jolt-shutdown-signals '(15 1 2))
 (define jolt-shutdown-sigset (and jolt-sigmask-ok? (jolt-make-sigset jolt-shutdown-signals)))
 ;; #t once the sigwait watcher owns the signals above — park-until-interrupt reads
@@ -3519,22 +3534,28 @@
 ;; the whole of what is left to do.
 (define c-underscore-exit (jolt-foreign-proc-safe "_exit" '(int) 'void))
 
-;; Arming happens on the FIRST shutdown hook, never before. Taking a signal over means
-;; its default "terminate now" disposition no longer applies, and a program with
-;; nothing to clean up must stay killable even when its main thread is somewhere
-;; Scheme cannot be resumed from — parked in Chez's own blocking stdin read, say,
-;; where no Scheme thread runs at all. A program that registered a hook has asked
-;; for the cleanup and takes that trade; one that never did is left exactly as it
-;; was.
+;; Taking these signals over means their default "terminate now" disposition no
+;; longer applies, so a program with nothing to clean up has to stay killable
+;; even when its main thread is somewhere Scheme cannot be resumed from — parked
+;; in Chez's own blocking stdin read, say, where no Scheme thread runs at all.
+;; The watcher is what keeps that true: it is a DEDICATED THREAD parked in
+;; sigwait, and it exits the process itself. Arming can therefore happen up front,
+;; before anyone has asked for cleanup, which is what lets the primordial thread
+;; be masked in time.
 ;;
-;; A DEDICATED THREAD parked in sigwait, not (register-signal-handler): Chez runs
-;; a registered handler on the main thread at its next safe point, and the two
-;; ways a program most often waits — condition-wait (deref of a promise) and a
-;; blocking foreign call — are not safe points. The handler would never run and
-;; the process would then ignore the signal entirely, which is worse than not
-;; handling it. Blocking the signals here puts the calling thread where every
-;; thread jolt forked already is (the fork guard above), so no thread is left for
-;; the kernel to deliver to and the signal stays pending for sigwait to take.
+;; sigwait rather than (register-signal-handler): Chez runs a registered handler
+;; on the main thread at its next safe point, and the two ways a program most
+;; often waits — condition-wait (deref of a promise) and a blocking foreign call —
+;; are not safe points. The handler would never run and the process would then
+;; ignore the signal entirely, which is worse than not handling it.
+;;
+;; Blocking the signals here puts the calling thread where every thread jolt forked
+;; already is (the fork guard above), so no thread is left for the kernel to
+;; deliver to and the signal stays pending for sigwait to take. The watcher itself
+;; is forked DORMANT: it runs no jolt code until a signal arrives, and a program
+;; that never registers a hook must not pay the multi-threaded lazy path for a
+;; thread asleep in a foreign call (lazy-bridge.ss; registration is what flips the
+;; flag).
 (define (jolt-arm-shutdown!)
   (jolt-install-exit-handler!)
   (when (and jolt-sigmask-ok? jolt-shutdown-sigset c-sigwait c-underscore-exit)
@@ -3545,7 +3566,7 @@
         (let ((old (sa-foreign-alloc 128)))
           (c-pthread-sigmask jolt-sig-block-how jolt-shutdown-sigset old)
           (sa-foreign-free old))
-        (fork-thread
+        (fork-thread-dormant
           (lambda ()
             (let ((sigbuf (sa-foreign-alloc 8)))
               (let loop ()

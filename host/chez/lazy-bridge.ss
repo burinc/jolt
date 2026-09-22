@@ -164,8 +164,8 @@
 ;; (Windows, Gambit) keeps.
 (define jolt-fork-sigmask-guard (lambda (fork) (fork)))
 (define %ls-orig-fork-thread fork-thread)
-(define (fork-thread thunk)
-  (jolt-mark-mt!)
+(define (%ls-fork-thread mark-mt? thunk)
+  (when mark-mt? (jolt-mark-mt!))
   (let* ((t (jolt-fork-sigmask-guard
              (lambda ()
                (%ls-orig-fork-thread
@@ -188,6 +188,19 @@
             (hashtable-delete! live-threads id)
             (hashtable-set! live-threads id #t))))
     t))
+(define (fork-thread thunk) (%ls-fork-thread #t thunk))
+
+;; A thread that parks in a foreign call and runs no jolt code until something
+;; wakes it has not made the process multi-threaded, and saying that it has is not
+;; free: jolt-mt? is what puts every lazy cell on the claim path for the rest of
+;; the program (1.03-1.06x on a seq pipeline, measured). The shutdown watcher is
+;; one of these — armed in every CLI process, asleep in sigwait for the whole life
+;; of a program that may never register a hook — so it forks this way instead. The
+;; OWNER of a dormant thread is then responsible for marking the process
+;; multi-threaded before any jolt code can reach it: for the watcher that is hook
+;; registration (concurrency.ss), which is the moment a second mutator becomes
+;; possible at all.
+(define (fork-thread-dormant thunk) (%ls-fork-thread #f thunk))
 
 ;; coll->cells: coerce the body result to the cell representation = a seq | nil.
 (define (jolt-coll->cells c) (jolt-seq c))

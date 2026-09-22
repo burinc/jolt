@@ -398,6 +398,15 @@
   ;; entries. Without it a hook registered from a worker would be invisible to a
   ;; System/exit here.
   (jolt-install-exit-handler!)
+  ;; …and take SIGTERM/SIGHUP/SIGINT over on the same thread, for the same reason
+  ;; it has to be this one: nothing but a thread itself can mask a signal in it,
+  ;; so a watcher armed later — on the first shutdown hook, which a dependency may
+  ;; register from a worker — would leave the PRIMORDIAL thread unmasked and the
+  ;; kernel would deliver here, to SIG_DFL or to Chez's keyboard-interrupt
+  ;; handler, with the hooks unrun either way. A JVM arms its signal dispatcher at
+  ;; startup and answers 128+signal with the hooks run whoever registered them;
+  ;; this is the point where jolt can do the same (concurrency.ss).
+  (jolt-arm-shutdown!)
   (guard (v (#t (jolt-report-uncaught v)))
     ;; Host faults (a condition raised outside jolt-throw) get their k / marks /
     ;; site captured HERE: a with-exception-handler runs before the stack

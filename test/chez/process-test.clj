@@ -501,22 +501,41 @@
   (fs/delete-if-exists readyf)
   (fs/delete-if-exists hookf))
 
-;; …and neither signal may be swallowed by a thread that was already running when
-;; the hook was registered. Arming blocks {INT,TERM,HUP} in the arming thread, so
-;; the kernel skips it and delivers to any thread that does NOT block them — and a
-;; thread a dependency forked at namespace-load time, long before -main could
-;; register a hook, is exactly that. SIGINT landed there, where Chez's
-;; keyboard-interrupt handler is a no-op, and ^C did nothing at all: no exit, no
-;; hooks; SIGTERM landed there at SIG_DFL and killed the process with its hooks
-;; unrun. Every case above passes without this one because a one-liner has no
-;; load-time threads (#1098). Every thread jolt forks is born with the shutdown
-;; signals blocked now, whenever it was forked.
-(doseq [[sig code] [["INT" 130] ["TERM" 143]]]
+;; …and no signal may be swallowed by a thread that was already running, nor
+;; depend on WHICH thread registered the hook. The kernel delivers to a thread
+;; that does not block the signal, so before the watcher was armed up front it
+;; skipped the masked arming thread and delivered to one that was forked earlier —
+;; a dependency's accept loop or pool, started at namespace-load time long before
+;; -main could register anything. ^C landed there, where Chez's keyboard-interrupt
+;; handler is a no-op, and did nothing at all: no exit, no hooks. SIGTERM landed
+;; there at SIG_DFL and killed the process with its hooks unrun. Minimal programs
+;; have no load-time threads, which is why every case above passed while a real
+;; app's ^C did nothing (#1098).
+;;
+;; The JVM answers all of this uniformly — its signal dispatcher thread owns the
+;; three from VM startup — and these rows are its answers, measured on OpenJDK 20
+;; with Clojure 1.12.6 rather than assumed: hooks run and the status is 128+signal
+;; for a hook registered on the main thread, for one registered on a worker, and
+;; the status alone for a program with no hooks at all.
+(doseq [[label prog sig code hook?]
+        (let [hookform (fn [f] (str "(.addShutdownHook (Runtime/getRuntime)"
+                                    " (Thread. (fn [] (spit \"" f "\" \"RAN\"))))"))
+              ;; a thread started before the hook, as a dependency's would be
+              prefork (fn [f] (str "(.start (Thread. (fn [] (Thread/sleep 30000))))" (hookform f)))
+              ;; …and the hook itself registered from a worker, not from -main
+              offmain (fn [f] (str "(let [t (Thread. (fn [] " (hookform f) "))]"
+                                   " (.start t) (.join t))"))
+              none    (fn [_] "nil")]
+          [["a thread forked before the hook" prefork "INT"  130 true]
+           ["a thread forked before the hook" prefork "TERM" 143 true]
+           ["a hook registered off the main thread" offmain "INT"  130 true]
+           ["a hook registered off the main thread" offmain "TERM" 143 true]
+           ["a hook registered off the main thread" offmain "HUP"  129 true]
+           ["no shutdown hook at all" none "INT"  130 false]
+           ["no shutdown hook at all" none "TERM" 143 false]])]
   (let [readyf (str (fs/create-temp-file {:prefix "jp-presig-" :suffix ".txt"}))
         hookf  (str (fs/create-temp-file {:prefix "jp-presig-hook-" :suffix ".txt"}))
-        nested (str "(.start (Thread. (fn [] (Thread/sleep 30000))))"
-                    " (.addShutdownHook (Runtime/getRuntime)"
-                    "  (Thread. (fn [] (spit \"" hookf "\" \"RAN\"))))"
+        nested (str (prog hookf)
                     " (spit \"" readyf "\" \"ready\") (Thread/sleep 30000)")
         proc (process [jolt-bin "-e" nested] {:out :string :err :string})]
     (loop [n 0]
@@ -525,11 +544,11 @@
         (recur (inc n))))
     (sh ["sh" "-c" (str "kill -" sig " " (.pid (:proc proc)))])
     (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
-    (check-eq (str "SIG" sig " is not swallowed by a thread forked before the hook")
-              (p/alive? proc) false)
+    (check-eq (str "SIG" sig " is not swallowed: " label) (p/alive? proc) false)
     (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
-    (check-eq (str "SIG" sig " runs the hooks past a load-time thread") (slurp hookf) "RAN")
-    (check-eq (str "and still exits " code " (SIG" sig ")") (:exit @proc) code)
+    (when hook?
+      (check-eq (str "SIG" sig " runs the hooks: " label) (slurp hookf) "RAN"))
+    (check-eq (str "SIG" sig " exits " code ": " label) (:exit @proc) code)
     (fs/delete-if-exists readyf)
     (fs/delete-if-exists hookf)))
 
