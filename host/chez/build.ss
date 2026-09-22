@@ -21,9 +21,13 @@
 (load "host/chez/dce.ss")
 
 ;; --- shell helpers ----------------------------------------------------------
+;; Every spawn here goes through jolt-with-empty-sigmask, for the reason jolt-sh
+;; gives (loader.ss): the shutdown signals are blocked on this thread, and a cc
+;; started under bash would otherwise outlive a ^C'd build.
+;;
 ;; Run a command, return its stdout as one trimmed string ("" on no output).
 (define (bld-sh-capture cmd)
-  (let* ((p (process (bld-sh-wrap cmd))) (in (car p)))
+  (let* ((p (jolt-with-empty-sigmask (lambda () (process (bld-sh-wrap cmd))))) (in (car p)))
     (let loop ((acc '()))
       (let ((l (get-line in)))
         (if (eof-object? l)
@@ -37,7 +41,7 @@
             (loop (cons l acc)))))))
 
 (define (bld-system cmd)
-  (let ((rc (system (bld-sh-wrap cmd))))
+  (let ((rc (jolt-with-empty-sigmask (lambda () (system (bld-sh-wrap cmd))))))
     (unless (zero? rc)
       (bld-command-failed rc cmd))))
 
@@ -50,7 +54,8 @@
 ;; caller shows the log itself — bld-echo-log, on every path, or a warning the
 ;; compiler emitted on a command that then succeeded would be swallowed.
 (define (bld-system->log cmd log)
-  (system (bld-sh-wrap (string-append cmd " > '" log "' 2>&1"))))
+  (jolt-with-empty-sigmask
+    (lambda () (system (bld-sh-wrap (string-append cmd " > '" log "' 2>&1"))))))
 
 (define (bld-log-string log)
   (if (not (file-exists? log))
@@ -1873,8 +1878,14 @@
           ;; parameter — so the wrapper has to be installed on the thread that
           ;; calls (exit), and for an app that is this one. Installed before the
           ;; guard so the (exit 1) an uncaught throw takes runs the hooks too.
-          ;; The CLI's own twin of this is at the top of jolt-cli-run.
+          ;; The CLI's own twin of this is at the top of jolt-cli-run — including
+          ;; the arm, which has to run on THIS thread (the primordial) and before
+          ;; any app top-level form can start a thread of its own: it is what makes
+          ;; ^C and `kill` run the hooks and exit 128+signal, whichever thread the
+          ;; app registered them from. A library build has no thread of its own to
+          ;; arm; its host process owns both of these.
           (unless library? (put-string out "    (jolt-install-exit-handler!)\n"))
+          (unless library? (put-string out "    (jolt-arm-shutdown!)\n"))
           ;; The prologue (optional native loads + source-root setup) and the -main
           ;; call (or library export publish) run under one guard so a throw in
           ;; either surfaces as jolt-report-throwable + a non-zero exit/return
