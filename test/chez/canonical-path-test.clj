@@ -117,6 +117,84 @@
 
 ;; --- cleanup + report --------------------------------------------------------
 
+;; --- a path that can never name a file is refused, not approximated ----------
+;; getCanonicalPath answers a best-effort path when realpath fails, which is
+;; what the JVM does for a path that merely does not exist yet. It is wrong for
+;; a failure meaning the path can NEVER name a file: the JVM raises, and
+;; answering a string lets a path that cannot be opened travel on as though it
+;; could (jolt#1094).
+;;
+;; Every expectation below, message text included, was read off JVM Clojure
+;; 1.12 rather than chosen. The split the JVM draws is by errno: ENOENT,
+;; ENOTDIR and EACCES answer best-effort; ELOOP and ENAMETOOLONG raise.
+
+(defn- canon [p]
+  (try (.getCanonicalPath (File. (str p)))
+       (catch java.io.IOException e (.getMessage e))))
+
+;; A Java String holds a NUL; a C path cannot. All three placements.
+(check "an embedded NUL is refused" (canon (str "/tmp/a" (char 0) "b")) "Invalid file path")
+(check "a trailing NUL is refused"  (canon (str "/tmp/x" (char 0)))     "Invalid file path")
+;; A LEADING NUL mattered most: it truncated the path to empty, so the answer
+;; was the process's own working directory — a caller's path silently becoming
+;; somewhere else entirely.
+(check "a leading NUL is refused"   (canon (str (char 0) "/tmp/x"))     "Invalid file path")
+
+;; The NUL check belongs to the canonicalising route only. exists answers false
+;; there rather than raising, and getAbsolutePath hands the NUL back — both are
+;; the JVM's behaviour and neither may start throwing.
+(check "exists with a NUL still answers false"
+       (.exists (File. (str "/tmp/a" (char 0) "b"))) false)
+(check "getAbsolutePath keeps the NUL"
+       (count (.getAbsolutePath (File. (str "/tmp/a" (char 0) "b")))) 8)
+
+;; A symlink cycle, and the distinction that makes it subtle: the JVM raises
+;; when it had to WALK THROUGH the loop, and answers when the loop is the final
+;; component it never had to resolve.
+(let [d (str root "/loop")]
+  (.mkdirs (File. d))
+  (let [a (str d "/a") b (str d "/b")]
+    (Files/createSymbolicLink (path a) (path b) (into-array java.nio.file.attribute.FileAttribute []))
+    (Files/createSymbolicLink (path b) (path a) (into-array java.nio.file.attribute.FileAttribute []))
+    (check "a traversed symlink loop raises"
+           (canon (str a "/db")) "Too many levels of symbolic links")
+    (check "a deeper traversal raises too"
+           (canon (str a "/x/y")) "Too many levels of symbolic links")
+    (check "the loop as the final component still answers"
+           (canon a) (str (real-path d) "/a"))
+    (try (.delete (File. a)) (catch Throwable _ nil))
+    (try (.delete (File. b)) (catch Throwable _ nil)))
+  ;; a dangling link is not a loop: it answers, like a missing path
+  (let [dang (str d "/dangling")]
+    (Files/createSymbolicLink (path dang) (path (str d "/nothing")) (into-array java.nio.file.attribute.FileAttribute []))
+    (check "a dangling symlink answers rather than raising"
+           (canon dang) (str (real-path d) "/dangling"))
+    (try (.delete (File. dang)) (catch Throwable _ nil)))
+  (try (.delete (File. d)) (catch Throwable _ nil)))
+
+;; An over-long component is the same shape: it raises where it must be
+;; traversed, and answers where it is the tail.
+(let [n500 (apply str (repeat 500 "n"))]
+  (check "an over-long intermediate component raises"
+         (canon (str root "/" n500 "/x")) "File name too long")
+  (check "an over-long final component answers"
+         (canon (str root "/" n500)) (str (real-path root) "/" n500)))
+
+;; and the ordinary failures keep their best-effort answer
+(check "a missing intermediate still answers"
+       (canon (str root "/no-such-zzz/file")) (str (real-path root) "/no-such-zzz/file"))
+(let [f (str root "/regular.txt")]
+  (spit f "x")
+  (check "a path through a regular file still answers"
+         (canon (str f "/x")) (str (real-path root) "/regular.txt/x"))
+  (try (.delete (File. f)) (catch Throwable _ nil)))
+
+;; getCanonicalFile is the same contract, so it raises where the string form does
+(check "getCanonicalFile refuses a NUL too"
+       (try (.getPath (.getCanonicalFile (File. (str "/tmp/a" (char 0) "b"))))
+            (catch java.io.IOException e (.getMessage e)))
+       "Invalid file path")
+
 (doseq [f [(str inside "/escape.txt") (str inside "/out-dir") (str inside "/plain.txt")
            (str outside "/secret.txt") inside outside root]]
   (try (.delete (File. f)) (catch Throwable _ nil)))
