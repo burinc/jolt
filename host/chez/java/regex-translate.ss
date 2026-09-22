@@ -185,9 +185,18 @@
                                      ((char=? (string-ref s k) #\})
                                       (emit! k) (loop (+ k 1) x? in-class stack))
                                      (else (emit! k) (copy (+ k 1)))))))))
-                   ;; an escape is two units, and neither is a token boundary
+                   ;; An escape is two units, and neither is a token boundary.
+                   ;; \x{…} and \N{…} carry a braced argument the JVM skips
+                   ;; comments inside like anywhere else — (?x)\x{4 1} is 0x41 —
+                   ;; so that "{" is taken here, out of reach of the quantifier
+                   ;; peek below, which would otherwise have kept the unit after
+                   ;; it and moved every index in a malformed \x{ or \N{.
                    ((and (char=? c #\\) (< (+ i 1) n))
-                    (emit! i) (emit! (+ i 1)) (loop (+ i 2) x? in-class stack))
+                    (emit! i) (emit! (+ i 1))
+                    (if (and (memv (string-ref s (+ i 1)) '(#\x #\N))
+                             (< (+ i 2) n) (char=? (string-ref s (+ i 2)) #\{))
+                        (begin (emit! (+ i 2)) (loop (+ i 3) x? in-class stack))
+                        (loop (+ i 2) x? in-class stack)))
                    ;; A quantifier's "{" peeks the next unit raw (Pattern reads
                    ;; temp[cursor+1] there, not next()), so (?x)a{ 1,2} is an
                    ;; "Illegal repetition" on the JVM while (?x)a{1 ,2} is fine.
@@ -604,6 +613,23 @@
                        (+ d (cond ((not index-map) idx)
                                   ((<= idx n) (vector-ref index-map idx))
                                   (else (+ (string-length qe) (- idx n))))))))
+    ;; The JVM reports cursor - 1, and some of its errors are raised after a
+    ;; next() that — with COMMENTS in force — has already skipped the whitespace
+    ;; and #-comments following the unit that caused them. The index then names
+    ;; the unit AFTER that run rather than the offending one: (?x)* is a dangling
+    ;; '*' near index 4 and (?x)* #c\n is the same '*' near index 8. So take the
+    ;; cursor's own position, which is the next kept unit, and step back one.
+    ;; Without stripping the two readings coincide, which is why only a (?x)
+    ;; pattern ever showed the difference.
+    (define (err/past desc idx) (err desc (+ idx 1) -1))
+
+    ;; Did stripping take a run off the END of the pattern?  Pattern's reads run
+    ;; one past their own sentinel when it did, and more than one of its errors
+    ;; turns on that.
+    (define (trailing-run?)
+      (and index-map (> n 0)
+           (> (vector-ref index-map n) (+ 1 (vector-ref index-map (- n 1))))))
+
     (define seen '())                   ; the named groups defined so far
     (define refs 0)                     ; back-references read so far
 
@@ -642,6 +668,11 @@
                         (loop (+ k 1) v))))
                  ((char=? (rf k) #\}) (values v (+ k 1)))
                  (else (err "Unclosed hexadecimal escape sequence" k)))))
+        ;; Pattern.x() PEEKS the first unit raw and only starts READING — which
+        ;; is what skips — once it has seen a "{", so a malformed \x{…} reports
+        ;; from past the run after the brace and a malformed \x41 does not.
+        ((and (< i n) (char=? (rf i) #\{))
+         (err/past "Illegal hexadecimal escape sequence" i))
         (else (err "Illegal hexadecimal escape sequence" i))))
 
     ;; \u: exactly four hex digits (Pattern.uxxxx()) …
@@ -674,9 +705,14 @@
           (let ((cl (str-scan-char s #\} (+ i 1) n)))
             (cond
               ((not cl)
-               (if (>= (+ i 1) (- n 1))
-                   (err "Unclosed character name escape sequence" (+ i 1))
-                   (err "Unclosed character name escape sequence" n -1)))
+               ;; Pattern.N() reads towards the "}" with read(), which skips a
+               ;; COMMENTS run, and then reports cursor - 1. With no "}" at all
+               ;; the cursor has stopped either ON the last unit it read — the
+               ;; final kept unit of the name — or past the sentinel, which is
+               ;; where an empty name and a trailing stripped run both leave it.
+               (if (or (= (+ i 1) n) (trailing-run?))
+                   (err "Unclosed character name escape sequence" n)
+                   (err "Unclosed character name escape sequence" (- n 1))))
               ((let ok ((k (+ i 1)) (letter #f))
                  (if (>= k cl)
                      letter
@@ -746,9 +782,25 @@
               ((#\r) (char 13 (+ i 2)))
               ((#\t) (char 9 (+ i 2)))
               ((#\c)
-               (if (>= (+ i 2) n)
-                   (err "Illegal control escape sequence" (+ i 1))
-                   (char (bitwise-xor (char->integer (rf (+ i 2))) 64) (+ i 3))))
+               ;; Pattern.c() tests cursor < patternLength against the
+               ;; UNSTRIPPED buffer and then read()s, which with COMMENTS in
+               ;; force skips the run and hands back the sentinel.  So a \c with
+               ;; a stripped run after it and nothing else does NOT fail here:
+               ;; the JVM takes NUL as the control letter and carries on past
+               ;; its own end, where an open group is "Unclosed group", an open
+               ;; class is "Unclosed character class", and at the top level the
+               ;; read past the sentinel is the JDK's own "Unexpected internal
+               ;; error".  (?x)\c a and (?x)\c ) are the same reading, and both
+               ;; compile — the letter is simply the next unit that survives.
+               (cond
+                 ((< (+ i 2) n)
+                  (char (bitwise-xor (char->integer (rf (+ i 2))) 64) (+ i 3)))
+                 ((trailing-run?)
+                  (case where
+                    ((class) (err "Unclosed character class" n))
+                    ((top) (err "Unexpected internal error" n))
+                    (else (err "Unclosed group" n 1))))
+                 (else (err "Illegal control escape sequence" (+ i 1)))))
               ((#\x) (let-values (((v k) (hex (+ i 2)))) (char v k)))
               ((#\u) (let-values (((v k) (unicode (+ i 2)))) (char v k)))
               ((#\N) (char #f (charname (+ i 2))))
@@ -809,6 +861,142 @@
                             (loop k2 (+ members 1))))))
                    (loop k (+ members 1)))))))))
 
+    ;; ── can the JVM put a maximum length on this look-behind body? ──
+    ;;
+    ;; Not the same question as "is it bounded": JDK 21 measures (?<=a*) and
+    ;; (?<=a{2,}) without complaint.  What defeats it is an unbounded LAZY or
+    ;; POSSESSIVE repetition with something else ahead of it in the same
+    ;; sequence — (?<!ab*+) is refused where (?<!a*+b) and (?<!ab*) both
+    ;; compile, and (?<!ab{2,3}+) does too because that one is bounded.
+    ;;
+    ;; What counts as "ahead of it" is Java's own study(): zero-width things
+    ;; contribute nothing (^, $, \b, a flag group, a look-around), and a group
+    ;; holding a top-level | is a Branch, whose study() resets the TreeInfo
+    ;; that Curly.study() then overflows — so such a group neither carries what
+    ;; precedes it into its branches nor passes anything out: (?<!a(b*+|c)) and
+    ;; (?<!a(b|c)d*+) compile, (?<!a(b*+)) does not.
+    ;;
+    ;; Captured from JDK 21 over 852 look-behind shapes, decision and index
+    ;; both.  jolt used to ask only whether the body held a back-reference, so
+    ;; it accepted every one of these.
+    (define (lb-unmeasurable? start stop)
+      (define (skip-class i)
+        (let lp ((i (+ i 1)))
+          (cond ((>= i stop) stop)
+                ((char=? (rf i) #\\) (lp (+ i 2)))
+                ((char=? (rf i) #\]) (+ i 1))
+                (else (lp (+ i 1))))))
+      (define (top-bar? i)              ; a | of this group's own, not a nested one
+        (let lp ((i i) (d 0))
+          (cond ((>= i stop) #f)
+                ((char=? (rf i) #\\) (lp (+ i 2) d))
+                ((char=? (rf i) #\[) (lp (skip-class i) d))
+                ((char=? (rf i) #\() (lp (+ i 1) (+ d 1)))
+                ((char=? (rf i) #\)) (and (> d 0) (lp (+ i 1) (- d 1))))
+                ((and (char=? (rf i) #\|) (= d 0)) #t)
+                (else (lp (+ i 1) d)))))
+      ;; the quantifier at i, if any → (values next unbounded? lazy-or-possessive?)
+      (define (marked j unbounded?)
+        (if (and (< j stop) (memv (rf j) '(#\? #\+)))
+            (values (+ j 1) unbounded? #t)
+            (values j unbounded? #f)))
+      (define (quantifier i)
+        (if (>= i stop)
+            (values i #f #f)
+            (let ((c (rf i)))
+              (cond
+                ((memv c '(#\* #\+)) (marked (+ i 1) #t))
+                ((char=? c #\?) (marked (+ i 1) #f))
+                ((char=? c #\{)
+                 (let ((cl (str-scan-char s #\} i stop)))
+                   (if (or (not cl) (= cl i))
+                       (values i #f #f)
+                       (marked (+ cl 1) (char=? (rf (- cl 1)) #\,)))))
+                (else (values i #f #f))))))
+      (let loop ((i start) (seen #f) (stack '()))
+        (and (< i stop)
+             (let ((c (rf i)))
+               (cond
+                 ((char=? c #\\)
+                  (let* ((e (and (< (+ i 1) stop) (rf (+ i 1))))
+                         (zero (and e (memv e '(#\b #\B #\A #\z #\Z #\G))))
+                         ;; a braced or angled argument belongs to the escape and
+                         ;; is not a bound: \p{Sc}{2,}+ is ONE atom possessively
+                         ;; repeated, and reading {Sc} as the repetition made the
+                         ;; {2,}+ after it invisible.
+                         (after
+                          (cond
+                            ((and (memv e '(#\p #\P #\x #\N))
+                                  (< (+ i 2) stop) (char=? (rf (+ i 2)) #\{))
+                             (let ((cl (str-scan-char s #\} (+ i 3) stop)))
+                               (if cl (+ cl 1) stop)))
+                            ((and (eqv? e #\k) (< (+ i 2) stop) (char=? (rf (+ i 2)) #\<))
+                             (let ((gt (str-scan-char s #\> (+ i 3) stop)))
+                               (if gt (+ gt 1) stop)))
+                            ;; and so does a run of digits: \x41*+ is one atom
+                            ;; repeated, not \x then 4 then 1 then the repeat.
+                            ((eqv? e #\c) (min stop (+ i 3)))
+                            ((eqv? e #\x) (min stop (+ i 4)))
+                            ((eqv? e #\u) (min stop (+ i 6)))
+                            ((eqv? e #\0)
+                             (let lp ((k (+ i 2)) (d 0))
+                               (if (and (< k stop) (< d 3) (jsc-octal? (rf k)))
+                                   (lp (+ k 1) (+ d 1))
+                                   k)))
+                            ((jsc-digit? e)
+                             (let lp ((k (+ i 2)))
+                               (if (and (< k stop) (jsc-digit? (rf k))) (lp (+ k 1)) k)))
+                            (else (+ i 2)))))
+                    (let-values (((j unb mk) (quantifier after)))
+                      (if (and unb mk seen)
+                          #t
+                          (loop j (or seen (not zero)) stack)))))
+                 ((char=? c #\[)
+                  (let-values (((j unb mk) (quantifier (skip-class i))))
+                    (if (and unb mk seen) #t (loop j #t stack))))
+                 ((memv c '(#\^ #\$)) (loop (+ i 1) seen stack))
+                 ((char=? c #\|) (loop (+ i 1) #f stack))
+                 ((char=? c #\))
+                  (and (pair? stack)
+                       (let ((outer (caar stack)) (zero (cadar stack)) (bar (caddar stack)))
+                         (let-values (((j unb mk) (quantifier (+ i 1))))
+                           (if (and unb mk outer)
+                               #t
+                               (loop j
+                                     (if bar #f (or outer (not zero)))
+                                     (cdr stack)))))))
+                 ((char=? c #\()
+                  (let ((g (parse-flag-group s i stop)))
+                    (cond
+                      ;; (?flags) is not a node at all
+                      ((and g (not (flag-group-scoped? g))) (loop (flag-group-end g) seen stack))
+                      ;; (?#…) is a comment
+                      ((and (< (+ i 2) stop) (char=? (rf (+ i 1)) #\?) (char=? (rf (+ i 2)) #\#))
+                       (let ((cl (str-scan-char s #\) (+ i 3) stop)))
+                         (loop (if cl (+ cl 1) stop) seen stack)))
+                      (else
+                       (let* ((look (and (< (+ i 2) stop) (char=? (rf (+ i 1)) #\?)
+                                         (or (memv (rf (+ i 2)) '(#\= #\!))
+                                             (and (char=? (rf (+ i 2)) #\<)
+                                                  (< (+ i 3) stop)
+                                                  (memv (rf (+ i 3)) '(#\= #\!))))))
+                              (body (cond (g (flag-group-end g))
+                                          ((not (and (< (+ i 1) stop) (char=? (rf (+ i 1)) #\?)))
+                                           (+ i 1))
+                                          ((and (char=? (rf (+ i 2)) #\<)
+                                                (not look))
+                                           (let ((gt (str-scan-char s #\> (+ i 3) stop)))
+                                             (if gt (+ gt 1) (+ i 3))))
+                                          ((and (char=? (rf (+ i 2)) #\<) look) (+ i 4))
+                                          (else (+ i 3))))
+                              (bar (top-bar? body)))
+                         (loop body
+                               (if (or look bar) #f seen)
+                               (cons (list seen look bar) stack)))))))
+                 (else
+                  (let-values (((j unb mk) (quantifier (+ i 1))))
+                    (if (and unb mk seen) #t (loop j #t stack)))))))))
+
     ;; ── groups (Pattern.group0) ──
     ;; ( at i → (values next quantifiable?): a flags-only (?i) is not an atom,
     ;; so a quantifier after it dangles.
@@ -826,11 +1014,13 @@
              ((#\: #\= #\! #\>) (body (+ i 3)))
              ((#\<)
               (if (and (< (+ i 3) n) (memv (rf (+ i 3)) '(#\= #\!)))
-                  ;; a look-behind body must have a bounded length, which on the
-                  ;; JDK (25) only a back-reference fails; the check runs
-                  ;; before the group is known to be closed
+                  ;; a look-behind body must have a measurable maximum length;
+                  ;; a back-reference defeats it, and so does lb-unmeasurable?
+                  ;; above. The check runs BEFORE the group is known to be
+                  ;; closed, which is why (?<!ab*+ names the look-behind and
+                  ;; (?<!a{2,}+ names the unclosed group.
                   (let* ((before refs) (k (scan (+ i 4) #f)))
-                    (cond ((> refs before)
+                    (cond ((or (> refs before) (lb-unmeasurable? (+ i 4) k))
                            (err "Look-behind group does not have an obvious maximum length" k -1))
                           ((>= k n) (err "Unclosed group" n))
                           (else (values (+ k 1) #t))))
@@ -898,7 +1088,7 @@
                  (if prev
                      (let ((k (+ i 1)))
                        (loop (if (and (< k n) (memv (rf k) '(#\? #\+))) (+ k 1) k) #f))
-                     (err (string-append "Dangling meta character '" (string c) "'") i)))
+                     (err/past (string-append "Dangling meta character '" (string c) "'") i)))
                 ((#\{)
                  (let ((k (brace i)))
                    (loop (if (and (< k n) (memv (rf k) '(#\? #\+))) (+ k 1) k) #f)))

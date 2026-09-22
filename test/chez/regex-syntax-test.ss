@@ -264,6 +264,75 @@
     ("\\c\\Q(" "Unclosed group near index 4\n\\c\\Q(\n    ^")
     ("\\Q\\E*" "Dangling meta character '*' near index 0\n\\Q\\E*\n^")
     ("\\u00\\Q41" "Illegal Unicode escape sequence near index 4\n\\u00\\Q41\n    ^")
+    ;; ── an index that names a cursor, not the unit that caused the error ──────
+    ;; Pattern.error() reports cursor - 1, and some errors are raised after a
+    ;; next() that has already skipped the run following the offending unit. The
+    ;; index then names what comes after that run.
+    ("(?x)* " "Dangling meta character '*' near index 5\n(?x)* \n     ^")
+    ("(?x)*a" "Dangling meta character '*' near index 4\n(?x)*a\n    ^")
+    ("(?x)*  x" "Dangling meta character '*' near index 6\n(?x)*  x\n      ^")
+    ("(?x)* #c\n" "Dangling meta character '*' near index 8\n(?x)* #c\n\n        ^")
+    ("(?x)?  x" "Dangling meta character '?' near index 6\n(?x)?  x\n      ^")
+    ("(?x)+ #c\n" "Dangling meta character '+' near index 8\n(?x)+ #c\n\n        ^")
+    ("(?x)a|* " "Dangling meta character '*' near index 7\n(?x)a|* \n       ^")
+    ;; Pattern.x() peeks the first unit raw and only READS once it has seen a
+    ;; "{", so a malformed \x{…} reports from past the run and \xZ does not.
+    ("(?x)\\x{" "Illegal hexadecimal escape sequence near index 6\n(?x)\\x{\n      ^")
+    ("(?x)\\x{4 1}" #f) ("(?x)a{1 ,2}" #f)
+    ("(?x)\\x{ " "Illegal hexadecimal escape sequence near index 7\n(?x)\\x{ \n       ^")
+    ("(?x)\\x{  x" "Illegal hexadecimal escape sequence near index 8\n(?x)\\x{  x\n        ^")
+    ("(?x)\\x{ }" "Illegal hexadecimal escape sequence near index 7\n(?x)\\x{ }\n       ^")
+    ("(?x)\\xZ " "Illegal hexadecimal escape sequence near index 6\n(?x)\\xZ \n      ^")
+    ;; an unclosed \N{…}: the cursor stops on the last unit read, unless an empty
+    ;; name or a trailing stripped run has carried it past the sentinel
+    ("(?x)\\N{" "Unclosed character name escape sequence near index 7\n(?x)\\N{")
+    ("(?x)\\N{A" "Unclosed character name escape sequence near index 7\n(?x)\\N{A\n       ^")
+    ("(?x)\\N{AB" "Unclosed character name escape sequence near index 8\n(?x)\\N{AB\n        ^")
+    ("(?x)\\N{ " "Unclosed character name escape sequence near index 8\n(?x)\\N{ ")
+    ("(?x)\\N{  x" "Unclosed character name escape sequence near index 9\n(?x)\\N{  x\n         ^")
+    ("(?x)\\N{A " "Unclosed character name escape sequence near index 9\n(?x)\\N{A ")
+    ("(?x)\\N{ #c\n" "Unclosed character name escape sequence near index 11\n(?x)\\N{ #c\n")
+    ;; ── a \c that runs off the end of a COMMENTS pattern ─────────────────────
+    ;; Pattern.c() tests cursor < patternLength against the UNSTRIPPED buffer and
+    ;; then read()s, which skips the run and hands back the sentinel. So the
+    ;; letter is simply the next unit that survives — (?x)\c a is \ca and
+    ;; (?x)\c ) is \c) — and with nothing left the JVM carries on past its own
+    ;; end: an open group is unclosed, an open class is unclosed, and at the top
+    ;; level the read past the sentinel is the JDK's own internal error.
+    ("(?x)\\c a" #f) ("(?x)\\c )" #f)
+    ("(?x)\\c" "Illegal control escape sequence near index 5\n(?x)\\c\n     ^")
+    ("(?x)\\c " "Unexpected internal error near index 7\n(?x)\\c ")
+    ("(?x)\\c\n" "Unexpected internal error near index 7\n(?x)\\c\n")
+    ("(?x)\\c#z" "Unexpected internal error near index 8\n(?x)\\c#z")
+    ("(?x)a|\\c " "Unexpected internal error near index 9\n(?x)a|\\c ")
+    ("(?x)(\\c " "Unclosed group near index 9\n(?x)(\\c ")
+    ("(?x)(?:\\c " "Unclosed group near index 11\n(?x)(?:\\c ")
+    ("(?x)[a\\c " "Unclosed character class near index 9\n(?x)[a\\c ")
+    ;; ── a look-behind body the JVM cannot put a maximum length on ────────────
+    ;; Not "unbounded": (?<!ab*) and (?<!a{2,}+) are both measured. What defeats
+    ;; study() is an unbounded LAZY or POSSESSIVE repetition with something ahead
+    ;; of it in the same sequence. Zero-width things are not ahead of it, and a
+    ;; group holding a top-level | is a Branch, which passes nothing either way.
+    ("(?<!ab*)" #f) ("(?<!a*+b)" #f) ("(?<!a{2,}+)" #f) ("(?<!a*+)" #f) ("(?<!ab??)" #f)
+    ("(?<!ab{2,3}+)" #f) ("(?<!a|b*+)" #f) ("(?<!^a*+)" #f) ("(?<!\\ba*+)" #f)
+    ("(?<!(?i)ab*+)" "Look-behind group does not have an obvious maximum length near index 11\n(?<!(?i)ab*+)\n           ^")
+    ("(?<!(?=c)ab*+)" "Look-behind group does not have an obvious maximum length near index 12\n(?<!(?=c)ab*+)\n            ^")
+    ("(?<!a(b*+|c))" #f)
+    ("(?<!a(b|c)d*+)" #f) ("(?<!a(?:b|c)d*+)" #f) ("(?<!(a|b)c*+)" #f)
+    ("(?<!\\x41*+)" #f) ("(?<!((b|c)d*+))" #f)
+    ("(?<!ab*+)" "Look-behind group does not have an obvious maximum length near index 7\n(?<!ab*+)\n       ^")
+    ("(?<!ab{2,}+)" "Look-behind group does not have an obvious maximum length near index 10\n(?<!ab{2,}+)\n          ^")
+    ("(?<!ab+?)" "Look-behind group does not have an obvious maximum length near index 7\n(?<!ab+?)\n       ^")
+    ("(?<!a(b*+))" "Look-behind group does not have an obvious maximum length near index 9\n(?<!a(b*+))\n         ^")
+    ("(?<!(a)b*+)" "Look-behind group does not have an obvious maximum length near index 9\n(?<!(a)b*+)\n         ^")
+    ("(?<!a(?=c)b*+)" "Look-behind group does not have an obvious maximum length near index 12\n(?<!a(?=c)b*+)\n            ^")
+    ("(?<!\\p{Sc}{2,}+)" #f)
+    ("(?<!a\\p{Sc}{2,}+)" "Look-behind group does not have an obvious maximum length near index 15\n(?<!a\\p{Sc}{2,}+)\n               ^")
+    ("(?<!a\\x41*+)" "Look-behind group does not have an obvious maximum length near index 10\n(?<!a\\x41*+)\n          ^")
+    ("(?<=ab*+)" "Look-behind group does not have an obvious maximum length near index 7\n(?<=ab*+)\n       ^")
+    ("(?<!ab*+" "Look-behind group does not have an obvious maximum length near index 7\n(?<!ab*+\n       ^")
+    ("(?<!a{2,}+" "Unclosed group near index 10\n(?<!a{2,}+")
+    ("a#(?<!\t\\p{Sc}{2,}+" "Look-behind group does not have an obvious maximum length near index 17\na#(?<!\t\\p{Sc}{2,}+\n      \t          ^")
     ;; ── \p{name=value} has a message of its own ───────────────────────────────
     ;; Pattern.family splits a braced spec at the FIRST "=" and names the two
     ;; halves separately, the key lowercased and the value as written.  Only gc,
