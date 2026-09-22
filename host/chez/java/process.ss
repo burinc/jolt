@@ -1509,11 +1509,13 @@
                   r))))))
 
 (define (proc-win-pid-alive? pid)
-  (let ((r (proc-win-with-pid-handle
-            pid (bitwise-ior proc-win-PROCESS-QUERY-LIMITED-INFORMATION
-                             proc-win-SYNCHRONIZE-ACCESS)
-            (lambda (hs) (not (= ((proc-win-wait-single) (car hs) 0) proc-win-WAIT-OBJECT-0))))))
-    (and r #t)))
+  (let ((w (proc-win-wait-single)))
+    (and w
+         (let ((r (proc-win-with-pid-handle
+                   pid (bitwise-ior proc-win-PROCESS-QUERY-LIMITED-INFORMATION
+                                    proc-win-SYNCHRONIZE-ACCESS)
+                   (lambda (hs) (not (= (w (car hs) 0) proc-win-WAIT-OBJECT-0))))))
+           (and r #t)))))
 
 (define (proc-win-pid-terminate! pid)
   (let ((t (proc-win-terminate)))
@@ -1563,6 +1565,22 @@
                    (bitwise-and (cdr e) proc-win-HANDLE-FLAG-INHERIT)))
                 restore)
       (set! restore '()))
+    ;; Save and CLEAR the inherit flag on all three of jolt's own standard
+    ;; handles before anything else, whether or not this spawn inherits any of
+    ;; them: whatever launched jolt may have left them marked, and one marked
+    ;; handle goes to every child from then on. prepareIOEHandleState in
+    ;; ProcessImpl_md.c, and the "greedy grandchild" its comment names.
+    (define (prepare-std-handles!)
+      (let ((g (proc-win-get-std-handle)))
+        (when g
+          (for-each (lambda (which)
+                      (let ((h (g which)))
+                        (when (proc-win-handle-ok? h)
+                          (keep-restore! h)
+                          (proc-win-make-private! h))))
+                    (list proc-win-STD-INPUT-HANDLE
+                          proc-win-STD-OUTPUT-HANDLE
+                          proc-win-STD-ERROR-HANDLE)))))
     (define (keep-child! h) (set! child-handles (cons h child-handles)) h)
     (define (cleanup-child!)
       (for-each (lambda (h) ((proc-win-close-handle) h)) child-handles)
@@ -1588,7 +1606,8 @@
                      ((out) proc-win-STD-OUTPUT-HANDLE)
                      (else proc-win-STD-ERROR-HANDLE)))))
            (unless (proc-win-handle-ok? h) (fail! "ProcessBuilder: no standard handle to inherit"))
-           (keep-restore! h)
+           ;; already saved and cleared by prepare-std-handles! below; put the
+           ;; flag back up for the one stream that is actually being inherited
            (proc-win-make-inheritable! h)
            (cons h #f)))
         ((memq (redir-kind redir) '(write append read discard))
@@ -1611,6 +1630,7 @@
              (keep-child! child-end)
              (set! our-handles (cons our-end our-handles))
              (cons child-end our-end))))))
+    (prepare-std-handles!)
     (let* ((sin  (stream 'in  rin))
            (sout (stream 'out rout))
            (serr (if merge? (cons (car sout) #f) (stream 'err rerr)))
