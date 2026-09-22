@@ -1520,8 +1520,8 @@
                     (when-not (symbol? raw)
                       (throw (ex-info "jolt.ffi/defcfn: the wrapper form names the raw binding with a symbol after the return type"
                                       {:name name :got raw})))
-                    (list 'let (vector raw binding)
-                          (cons 'fn (cons name (vec (rest tail)))))))]
+                    (list 'clojure.core/let (vector raw binding)
+                          (cons 'clojure.core/fn (cons name (vec (rest tail)))))))]
       (if docstring
         (list 'def named docstring value)
         (list 'def named value)))))

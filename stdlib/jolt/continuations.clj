@@ -74,7 +74,7 @@
   (when-not (and (vector? binding) (= 1 (count binding)) (symbol? (first binding)))
     (throw (ex-info "jolt.continuations/letcc requires a [escape] binding of one symbol"
                     {:binding binding})))
-  (list 'jolt.host/call-cc (concat (list 'fn binding) body)))
+  (list 'jolt.host/call-cc (concat (list 'clojure.core/fn binding) body)))
 
 (defn escape-fn?
   "True when x is an escape continuation handed out by call-cc or letcc.

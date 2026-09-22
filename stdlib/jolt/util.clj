@@ -29,5 +29,5 @@
                 :when (not (contains? excl sym))
                 :let [target (symbol (name from-ns) (name sym))]]
             (if (:macro (meta v))
-              (list 'defmacro sym ['& 'args] (list 'clojure.core/cons (list 'quote target) 'args))
-              (list 'defn sym ['& 'args] (list 'clojure.core/apply target 'args)))))))
+              (list 'clojure.core/defmacro sym ['& 'args] (list 'clojure.core/cons (list 'quote target) 'args))
+              (list 'clojure.core/defn sym ['& 'args] (list 'clojure.core/apply target 'args)))))))

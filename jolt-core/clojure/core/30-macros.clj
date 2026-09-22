@@ -602,8 +602,8 @@
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))
                           mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
-                          mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
-                      (list argv (list* 'let binds mbody))))
+                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)]
+                      (list argv (list* 'clojure.core/let binds mbody))))
         groups (group-by-head (drop-type-opts body))
         ;; merge clauses by method NAME across ALL protocols into one multi-arity
         ;; fn, so a name appearing in two interfaces with different arities
@@ -744,10 +744,10 @@
                                      n (count ps)
                                      obj (first ps)]
                                  (cond
-                                   (= n 1) (list ps (list 'protocol-dispatch1 pn mn obj))
-                                   (= n 2) (list ps (list 'protocol-dispatch2 pn mn obj (nth ps 1)))
-                                   (= n 3) (list ps (list 'protocol-dispatch3 pn mn obj (nth ps 1) (nth ps 2)))
-                                   :else   (list ps (list 'protocol-dispatch pn mn obj (vec (rest ps)))))))]
+                                   (= n 1) (list ps (list 'clojure.core/protocol-dispatch1 pn mn obj))
+                                   (= n 2) (list ps (list 'clojure.core/protocol-dispatch2 pn mn obj (nth ps 1)))
+                                   (= n 3) (list ps (list 'clojure.core/protocol-dispatch3 pn mn obj (nth ps 1) (nth ps 2)))
+                                   :else   (list ps (list 'clojure.core/protocol-dispatch pn mn obj (vec (rest ps)))))))]
                   (if (seq arglists)
                     `(def ~(with-meta mnm mmeta) (fn* ~@(map clause arglists)))
                     `(def ~(with-meta mnm mmeta)
@@ -973,8 +973,8 @@
                           binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
                                              (remove (fn [f] (contains? pnames (name f))) fields)))
                           mbody (drop 2 spec)
-                          mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
-                      (list hinted (list* 'let binds mbody))))
+                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)]
+                      (list hinted (list* 'clojure.core/let binds mbody))))
         groups (group-by-head (drop-type-opts body))
         ;; merge clauses by name across protocols into one multi-arity fn (see
         ;; deftype's by-name).

@@ -194,7 +194,7 @@
 ;; (tools.macro / tools.analyzer) expects, instead of an opaque special form.
 (defmacro letfn [fnspecs & body]
   (cons 'letfn*
-        (cons (reduce (fn [acc s] (conj (conj acc (first s)) (cons 'fn s))) [] fnspecs)
+        (cons (reduce (fn [acc s] (conj (conj acc (first s)) (cons 'clojure.core/fn s))) [] fnspecs)
               body)))
 
 ;; destructure — Clojure's binding-vector expander.
