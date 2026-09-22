@@ -287,6 +287,31 @@
     (print-method x w))
   nil)
 
+;; The reference's namespace-map lifting (core_print.clj), private there and
+;; here: clojure.pprint's map printer reaches it as #'clojure.core/lift-ns, the
+;; way the JVM's does. jolt's own printer lifts in the host (printing.ss).
+(defn- strip-ns
+  [named]
+  (if (symbol? named)
+    (symbol nil (name named))
+    (keyword nil (name named))))
+
+(defn- lift-ns
+  "Returns [lifted-ns lifted-kvs] or nil if m can't be lifted."
+  [m]
+  (when *print-namespace-maps*
+    (loop [ns nil
+           [[k v :as entry] & entries] (seq m)
+           kvs []]
+      (if entry
+        (when (qualified-ident? k)
+          (if ns
+            (when (= ns (namespace k))
+              (recur ns entries (conj kvs [(strip-ns k) v])))
+            (when-let [new-ns (namespace k)]
+              (recur new-ns entries (conj kvs [(strip-ns k) v])))))
+        [ns kvs]))))
+
 ;; An Eduction prints as the seq it yields — (2 3 4), not the deftype's fields.
 ;; Registered against the type rather than derived from its interfaces because
 ;; that is what the JVM does: a bare Sequential/Seqable deftype prints as

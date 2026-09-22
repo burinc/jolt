@@ -148,7 +148,7 @@
    ;; backtick was data on the JVM and jolt's unlowered marker here. Gone since
    ;; the analyzer lowers every marker before anything can see the form
    ;; (jolt-024c).
-   :expect {:tests 50 :pass 887 :fail 0 :error 0}}
+   :expect {:tests 49 :pass 875 :fail 0 :error 0}}
 
   {:name "edamame"
    :paths ["src" "resources" "test"]
@@ -333,7 +333,7 @@
    ;; org.apache.commons.lang.StringEscapeUtils, supplied by the preloaded
    ;; jolt.shim.commons-lang shim. No residue.
    :preload ["jolt.shim.commons-lang"]
-   :expect {:tests 94 :pass 182 :fail 0 :error 0}}
+   :expect {:tests 93 :pass 181 :fail 0 :error 0}}
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]

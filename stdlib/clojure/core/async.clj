@@ -434,7 +434,7 @@
 (defmacro go-loop
   "(go (loop bindings body...))"
   [bindings & body]
-  (list 'clojure.core.async/go (list* 'loop bindings body)))
+  (list 'clojure.core.async/go (list* 'clojure.core/loop bindings body)))
 
 ;; --- alts -------------------------------------------------------------------
 ;; do-alts uses a per-call handler registered on each channel (no poll loop).

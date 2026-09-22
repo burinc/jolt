@@ -899,15 +899,18 @@
                         (let [cform (nth cl 1)
                               bindsym (nth cl 2)
                               bodyf (drop 3 cl)
-                              letform (cons 'let (cons (vector bindsym evar) bodyf))
+                              ;; clojure.core-qualified: a ns that excludes (or
+                              ;; :only-omits) let/or/instance? and defines its
+                              ;; own must still get core's here (jolt#1095).
+                              letform (cons 'clojure.core/let (cons (vector bindsym evar) bodyf))
                               fullname (when (form-sym? cform) (form-sym-name cform))
                               catch-all? (or (not (form-sym? cform))
                                              (contains? catch-all-names fullname))]
                           (if catch-all?
                             letform
-                            (list 'if (list 'or
-                                            (list 'instance? cform evar)
-                                            (list '__catch-broad? fullname evar))
+                            (list 'if (list 'clojure.core/or
+                                            (list 'clojure.core/instance? cform evar)
+                                            (list 'clojure.core/__catch-broad? fullname evar))
                                   letform else))))
                       (list 'throw evar)
                       (reverse @catches))]
@@ -1665,6 +1668,22 @@
     (analysis-error :analyze/invalid-macro-value
            (str "Can't take value of a macro: #'" (:ns r) "/" (:name r)))))
 
+;; A ^:private var of another namespace cannot be referenced at all, as on the
+;; JVM (jolt#1095): resolve-global tags one :private, and this throws the
+;; reference's IllegalStateException wording. A call head or macro gets
+;; Compiler.isInline / isMacro's "var: #'a/hidden is not public"; a value gets
+;; resolveIn's, which prints the symbol as written. (var a/hidden) is exempt —
+;; analyze-special's "var" arm never calls this — so @#'a/hidden still works.
+(defn- deny-private [form r head?]
+  (when (:private r)
+    (analysis-error :analyze/private-var
+                    (str "var: "
+                         (if head?
+                           (str "#'" (:ns r) "/" (:name r))
+                           (str (if-let [ns (form-sym-ns form)] (str ns "/") "") (form-sym-name form)))
+                         " is not public")
+                    {:jolt.error/symbol (str (:ns r) "/" (:name r))})))
+
 ;; instance? is a macro on jolt (so it can quote a bare class name — the class
 ;; model has no evaluable Class for every name), but the JVM has it as a plain fn,
 ;; so a value-position reference — (partial instance? SomeClass), (map (partial
@@ -1767,7 +1786,8 @@
       ns (let [r (resolve-global ctx form)]
            (if (= :var (:kind r))
              (or (macro-value-fn ctx form r)
-                 (do (deny-macro-value ctx form r)
+                 (do (deny-private form r false)
+                     (deny-macro-value ctx form r)
                      (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
@@ -1816,7 +1836,8 @@
                 ;; :num-ret (a ^double/^long declared return) rides on the var node so
                 ;; jolt.passes.numeric types a call to it (an accumulator over the result).
                 :var (or (macro-value-fn ctx form r)
-                         (do (deny-macro-value ctx form r)
+                         (do (deny-private form r false)
+                             (deny-macro-value ctx form r)
                              (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
                 :host (host-ref (:name r))
                 ;; a class-name symbol (java.util.Map) self-evaluates to an interned
@@ -1973,7 +1994,8 @@
             ;; The RUN of the expander is marked separately (macro-run box): a
             ;; throw out of it is filed under the reference's macro phases and
             ;; names the macro, which is a different thing from the note above.
-            (let* [mbox *macro-run-box*
+            (let* [_ (deny-private head (resolve-global ctx head) true)
+                   mbox *macro-run-box*
                    mprev (when mbox @mbox)
                    _ (when mbox (reset! mbox [(macro-symbol ctx head) head form]))
                    expanded (form-expand-1 ctx form (amp-env-map env))
@@ -2072,7 +2094,11 @@
               ;; stamp the list form's source offset onto the :invoke
               ;; so the success checker can report file:line:col. nil when the
               ;; reader did not record it (synthetic/macro-built forms).
-              (let [n (invoke (analyze ctx head env)
+              ;; qualified heads only: an unqualified one resolves again in
+              ;; analyze-symbol, which applies the same check.
+              (let [_ (when (and (form-sym? head) (form-sym-ns head))
+                        (deny-private head (resolve-global ctx head) true))
+                    n (invoke (analyze ctx head env)
                               (mapv #(analyze ctx % env) (rest items)))
                     p (form-position form)]
                 (if p (assoc n :pos p) n))))))))

@@ -276,15 +276,15 @@
 (ev "(def sm-rewrites #{\"do\" \"let*\" \"if\" \"loop*\" \"recur\"})")
 (gate-check "every analyzer special form is rewritten or opaque to the pass"
             (ev (string-append
-                 "(pr-str (sort (remove (fn [s] (contains? clojure.core.async/sm-opaque (symbol s)))"
-                 "                      (remove sm-rewrites jolt.analyzer/handled))))"))
+                 "(pr-str (sort (remove (fn [s] (contains? @#'clojure.core.async/sm-opaque (symbol s)))"
+                 "                      (remove sm-rewrites @#'jolt.analyzer/handled))))"))
             "()")
 ;; and the other direction is not asserted on purpose: sm-opaque names heads the
 ;; analyzer handles elsewhere (new, ., case*, deftype*, reify*, import*, catch,
 ;; finally), and listing extras only ever costs a park its cheap representation.
 (gate-check "the pass rewrites exactly the five heads it claims"
             (ev (string-append
-                 "(pr-str (sort (filter (fn [s] (contains? clojure.core.async/sm-opaque (symbol s)))"
+                 "(pr-str (sort (filter (fn [s] (contains? @#'clojure.core.async/sm-opaque (symbol s)))"
                  "                      sm-rewrites)))"))
             "()")
 

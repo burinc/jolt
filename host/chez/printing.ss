@@ -52,21 +52,28 @@
 ;; resolved once — see pr-readably-cell (rt.ss) for why the cached cell is safe
 (define ns-maps-cell #f)
 (define (pr-ns-maps-shared-ns pairs)
+  ;; clojure.core/lift-ns: every key a qualified ident — keyword OR symbol — of
+  ;; one namespace
+  (define (ident-ns k)
+    (let ((n (cond ((keyword? k) (keyword-t-ns k))
+                   ((symbol-t? k) (symbol-t-ns k))
+                   (else #f))))
+      (and (string? n) (not (string=? n "")) n)))
   (and (pair? pairs)
        (begin
          (unless ns-maps-cell
            (set! ns-maps-cell (jolt-var "clojure.core" "*print-namespace-maps*")))
          (jolt-truthy? (jolt-var-get ns-maps-cell)))
-       (keyword? (caar pairs))
-       (let ((ns (keyword-t-ns (caar pairs))))
-         (and ns (not (string=? ns ""))
+       (let ((ns (ident-ns (caar pairs))))
+         (and ns
               (let all-ns? ((rest (cdr pairs)))
                 (if (null? rest)
                     ns   ;; all keys checked → return the shared namespace
-                    (and (keyword? (caar rest))
-                         (let ((n (keyword-t-ns (caar rest))))
-                           (and n (string=? n ns)
-                                (all-ns? (cdr rest)))))))))))
+                    (let ((n (ident-ns (caar rest))))
+                      (and n (string=? n ns) (all-ns? (cdr rest))))))))))
+;; lift-ns's strip-ns: the key without its namespace, keeping its kind
+(define (pr-strip-ns k)
+  (if (keyword? k) (keyword #f (keyword-t-name k)) (jolt-symbol #f (symbol-t-name k))))
 
 (define (jolt-pr-readable-base x)
   (cond
@@ -111,7 +118,7 @@
                                 (jolt-str-join-comma
                                  (jolt-limited-list-strs
                                   (map (lambda (pr)
-                                         (string-append (jolt-pr-readable (keyword #f (keyword-t-name (car pr))))
+                                         (string-append (jolt-pr-readable (pr-strip-ns (car pr)))
                                                         " " (jolt-pr-readable (cdr pr))))
                                        pairs)))
                                 "}")

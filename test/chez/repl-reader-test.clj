@@ -6,7 +6,7 @@
 ;; regex whose body — parens, quotes and all — must not be miscounted as delimiters.
 (require 'jolt.main)
 
-(def complete? jolt.main/repl-form-complete?)
+(def complete? @#'jolt.main/repl-form-complete?)
 
 ;; [input expected-complete?]
 (def cases

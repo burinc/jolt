@@ -129,8 +129,16 @@
                           (conj acc `(refer-clojure ~@(map (fn [s] `(quote ~s)) args)))
                         :else acc))
                     acc))
-                [] clauses)]
-    `(do (in-ns (quote ~nm)) ~@calls)))
+                [] clauses)
+        ;; no :refer-clojure clause means the default (refer-clojure), as on the
+        ;; JVM — it is what makes a later standalone (refer-clojure :exclude …)
+        ;; withhold nothing, the names being mapped already (ns.ss).
+        ;; (reduce/or, not some/into: this expands before 10-seq has loaded)
+        explicit? (reduce (fn [a c] (or a (and (or (seq? c) (vector? c))
+                                                (= :refer-clojure (first c)))))
+                          false clauses)
+        default (if (or explicit? (= nm 'clojure.core)) () (list `(refer-clojure)))]
+    `(do (in-ns (quote ~nm)) ~@default ~@calls)))
 
 ;; import is a MACRO like the JVM's: its specs are never evaluated, so
 ;; (import [java.nio.file Paths]) works bare — under strict resolution the
@@ -186,7 +194,7 @@
 ;; (tools.macro / tools.analyzer) expects, instead of an opaque special form.
 (defmacro letfn [fnspecs & body]
   (cons 'letfn*
-        (cons (reduce (fn [acc s] (conj (conj acc (first s)) (cons 'fn s))) [] fnspecs)
+        (cons (reduce (fn [acc s] (conj (conj acc (first s)) (cons 'clojure.core/fn s))) [] fnspecs)
               body)))
 
 ;; destructure — Clojure's binding-vector expander.

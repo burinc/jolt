@@ -1,6 +1,6 @@
 [
-  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$./]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
-  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core/mm\\$\" s)))" :expected "true"}
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (@#'jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$./]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
+  {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (@#'jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core/mm\\$\" s)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0) (< x 10))) (repeatedly 500 (fn [] (.nextInt r 10)))))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.) b (byte-array 16)] (.nextBytes r b) [(alength b) (> (count (distinct (seq b))) 4)])" :expected "[16 true]"}
@@ -102,9 +102,12 @@
   {:suite "assert-args" :expr "(:private (meta #'clojure.core/assert-args))" :expected "true"}
   {:suite "assert-args" :expr "(:macro (meta #'clojure.core/assert-args))" :expected "true"}
   {:suite "assert-args" :expr "(seq? (@#'clojure.core/assert-args true \"x\"))" :expected "true"}
-  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m1 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (eval '(aa-m1 [1])))" :expected ":ok"}
-  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m2 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (try (eval '(aa-m2 (1))) (catch IllegalArgumentException e (boolean (re-find #\"aa-m2 requires a vector for its binding\" (ex-message e))))))" :expected "true"}
-  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m3 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\" (even? (count b)) \"an even number of forms in binding vector\") :ok)) (try (eval '(aa-m3 [1 2 3])) (catch IllegalArgumentException e (boolean (re-find #\"aa-m3 requires an even number of forms in binding vector\" (ex-message e))))))" :expected "true"}
+  ;; private, so outside clojure.core only @#' reaches it — a qualified use is the
+  ;; JVM's "not public" (jolt#1095); the rows below define their macros IN core.
+  {:suite "assert-args" :expr "(try (eval '(defmacro aa-m0 [b] (clojure.core/assert-args (vector? b) \"a vector\") :ok)) :compiled (catch Exception e (ex-message e)))" :expected "\"var: #'clojure.core/assert-args is not public\""}
+  {:suite "assert-args" :expr "(do (binding [*ns* (the-ns 'clojure.core)] (eval '(defmacro aa-m1 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok))) (eval '(clojure.core/aa-m1 [1])))" :expected ":ok"}
+  {:suite "assert-args" :expr "(do (binding [*ns* (the-ns 'clojure.core)] (eval '(defmacro aa-m2 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok))) (try (eval '(clojure.core/aa-m2 (1))) (catch IllegalArgumentException e (boolean (re-find #\"aa-m2 requires a vector for its binding\" (ex-message e))))))" :expected "true"}
+  {:suite "assert-args" :expr "(do (binding [*ns* (the-ns 'clojure.core)] (eval '(defmacro aa-m3 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\" (even? (count b)) \"an even number of forms in binding vector\") :ok))) (try (eval '(clojure.core/aa-m3 [1 2 3])) (catch IllegalArgumentException e (boolean (re-find #\"aa-m3 requires an even number of forms in binding vector\" (ex-message e))))))" :expected "true"}
   {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (clojure.repl/demunge \"my_ns$my_fn_QMARK_\"))" :expected "\"my-ns/my-fn?\""}
   {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (ifn? (requiring-resolve 'clojure.repl/demunge)))" :expected "true"}
   {:suite "special-form precedence" :expr "(do (ns sftest (:refer-clojure :exclude [def])) (defmacro def [n v] :shadowed) (clojure.core/defn ff [] 99) (ff))" :expected "99"}
