@@ -417,6 +417,34 @@
 
 
 
+;; deftest records itself here. A reload must REPLACE the entry for a namespace's
+;; test name rather than add a second one. clojure.test on the JVM discovers
+;; tests through var metadata, so redefining the var replaces the test; this
+;; registry is a different design and needs the same answer, because
+;; reload-and-run is the whole point of a live image.
+;;
+;; Appending made a reloaded namespace run its tests once more per reload, and
+;; report the extra runs as extra tests. The count going up is the harmless half.
+;; The other half is that a test run twice in one invocation reads as a pass if
+;; EITHER run passed, and the reload loop is exactly where someone is chasing a
+;; flake (jolt#1096).
+;;
+;; A replaced entry keeps its POSITION, so reloading does not reorder a
+;; namespace's tests against each other.
+(defn register-test!
+  "Add the test f as ns-sym/name, replacing any entry already registered under
+  that namespace and name. deftest calls this; a tool that interns test vars
+  itself can too."
+  [ns-sym name f]
+  (swap! registry
+         (fn [r]
+           (let [entry {:name name :ns ns-sym :fn f}
+                 i (first (keep-indexed
+                           (fn [i t] (when (and (= name (:name t)) (= ns-sym (:ns t))) i))
+                           r))]
+             (if i (assoc r i entry) (conj r entry)))))
+  nil)
+
 (defmacro deftest [name & body]
   (when *load-tests*
     `(do
@@ -424,9 +452,8 @@
        ;; the var carries :test metadata like clojure.test's deftest, so tooling
        ;; that discovers tests by scanning var meta finds it.
        (alter-meta! (var ~name) assoc :test ~name)
-       (swap! clojure.test/registry conj {:name '~name
-                                          :ns (clojure.core/ns-name clojure.core/*ns*)
-                                          :fn ~name})
+       (clojure.test/register-test! (clojure.core/ns-name clojure.core/*ns*)
+                                    '~name ~name)
        (var ~name))))
 
 (defmacro deftest-

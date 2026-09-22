@@ -198,6 +198,54 @@
      2
      "run-test takes the var by name")
 
+;; --- the registry replaces on redefine -------------------------------------
+;; deftest used to append unconditionally, so reloading a test namespace in a
+;; live image ran its tests once more per reload and reported the extra runs as
+;; extra tests (jolt#1096). Re-evaluating a deftest form is the same code path a
+;; reload takes, so that is what these drive. Reference clojure.test cannot grow
+;; here at all: it finds tests through var metadata, so redefining the var
+;; replaces the test — checked against `clojure -M` on the same input.
+
+(def ^:private redef-runs (atom []))
+
+(deftest api-redefined (swap! redef-runs conj :first))
+(deftest api-redefined (swap! redef-runs conj :second))
+
+(let [entries (filter (fn [e] (= (quote api-redefined) (:name e))) @t/registry)]
+  (ok= (count entries) 1
+       "a redefined deftest replaces its registry entry rather than adding one")
+  ;; and the entry must carry the NEW body — replacing with the stale thunk
+  ;; would be just as wrong as appending, and invisible to a count.
+  (reset! redef-runs [])
+  ((:fn (first entries)))
+  (ok= @redef-runs [:second]
+       "the replacement registers the new body, not the original"))
+
+;; a replaced entry keeps its position, so a reload does not reorder a
+;; namespace's tests against each other
+(deftest api-order-first (is true))
+(deftest api-order-second (is true))
+(deftest api-order-first (is true))
+(ok= (->> @t/registry
+          (filter (fn [e] (contains? #{(quote api-order-first) (quote api-order-second)}
+                                     (:name e))))
+          (mapv :name))
+     [(quote api-order-first) (quote api-order-second)]
+     "replacing an entry keeps its position in the registry")
+
+;; the entry is keyed by namespace AND name, so the same test name in two
+;; namespaces stays two tests. Driven through register-test! directly rather
+;; than with in-ns gymnastics; the registry is saved and restored around it.
+(let [saved @t/registry]
+  (t/register-test! (quote reg-probe-a) (quote shared) (fn [] nil))
+  (t/register-test! (quote reg-probe-b) (quote shared) (fn [] nil))
+  (ok= (count (filter (fn [e] (= (quote shared) (:name e))) @t/registry)) 2
+       "the same test name in two namespaces is two entries")
+  (t/register-test! (quote reg-probe-a) (quote shared) (fn [] nil))
+  (ok= (count (filter (fn [e] (= (quote shared) (:name e))) @t/registry)) 2
+       "re-registering one of them replaces only that namespace's entry")
+  (reset! t/registry saved))
+
 (let [n @passes f @fails]
   (doseq [m f] (println "clojure-test-api FAIL " m))
   (println "CLOJURE-TEST-API-RESULT pass" n "fail" (count f))
