@@ -28,7 +28,13 @@ jobs:
           submodules: recursive
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v19
+        uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # v21 flipped this default from false to true, which would install
+          # Determinate Nix and log in to FlakeHub instead of installing
+          # upstream Nix. Pinned to what v19 did here, so this bump changes the
+          # Node runtime and nothing else. Dropping the line adopts Determinate.
+          determinate: false
 
       - name: Check the flake and formatting
         run: |
