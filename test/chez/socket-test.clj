@@ -122,6 +122,79 @@
             "threw")
   (.close server))
 
+;; -- the unbound ServerSocket and .bind --------------------------------------
+;; (ServerSocket.) makes an UNBOUND socket, as Java's does. It used to bind an
+;; ephemeral wildcard port in the constructor, so it answered isBound true and a
+;; real getLocalPort where the JVM answers false and -1, and .bind did not exist
+;; to bind it afterwards. Every expectation below was read off JVM Clojure 1.12,
+;; error classes and messages included. Ports stay kernel-assigned (0).
+(let [s (java.net.ServerSocket.)]
+  (check-eq "a fresh no-arg ServerSocket is not bound" (.isBound s) false)
+  (check-eq "an unbound socket has no local port" (.getLocalPort s) -1)
+  (check-eq "an unbound socket says so" (str s) "ServerSocket[unbound]")
+  (check-eq "accept on an unbound socket throws rather than blocking"
+            (try (.accept s) "no-throw"
+                 (catch java.net.SocketException e (.getMessage e)))
+            "Socket is not bound yet")
+  (.close s))
+
+(let [s (java.net.ServerSocket.)]
+  (.bind s (java.net.InetSocketAddress. "127.0.0.1" 0))
+  (check-eq "bind makes it bound" (.isBound s) true)
+  (check-eq "bind assigns a real port" (pos? (.getLocalPort s)) true)
+  (check-eq "re-binding a bound socket throws"
+            (try (.bind s (java.net.InetSocketAddress. "127.0.0.1" 0)) "no-throw"
+                 (catch java.net.SocketException e (.getMessage e)))
+            "Already bound")
+  (.close s)
+  ;; Java's isBound asks "was it ever bound", so close does not clear it, and
+  ;; the port it was bound to is still readable.
+  (check-eq "isBound survives close" (.isBound s) true)
+  (check-eq "the port survives close" (pos? (.getLocalPort s)) true))
+
+;; the two-argument overload takes the backlog Java's does
+(let [s (java.net.ServerSocket.)]
+  (.bind s (java.net.InetSocketAddress. "127.0.0.1" 0) 10)
+  (check-eq "the 2-arg bind binds too" (pos? (.getLocalPort s)) true)
+  (.close s))
+
+(let [s (java.net.ServerSocket.)]
+  (.close s)
+  (check-eq "bind after close throws"
+            (try (.bind s (java.net.InetSocketAddress. "127.0.0.1" 0)) "no-throw"
+                 (catch java.net.SocketException e (.getMessage e)))
+            "Socket is closed"))
+
+;; a bound-by-.bind socket is a working server, not just a bound fd
+(let [srv (java.net.ServerSocket.)]
+  (.bind srv (java.net.InetSocketAddress. "127.0.0.1" 0))
+  (let [client (java.net.Socket. "127.0.0.1" (.getLocalPort srv))
+        conn   (.accept srv)]
+    (check-eq "a socket bound by .bind accepts connections"
+              (some? conn) true)
+    (.close conn) (.close client))
+  (.close srv))
+
+;; what #1093 was actually doing: probing whether a port is free. The held port
+;; must refuse and a free one must take it — the failing form reported every
+;; port unavailable.
+(let [held (java.net.ServerSocket.)]
+  (.bind held (java.net.InetSocketAddress. "127.0.0.1" 0))
+  (let [taken (.getLocalPort held)]
+    (check-eq "binding a held port is refused"
+              (let [s (java.net.ServerSocket.)]
+                (try (do (.bind s (java.net.InetSocketAddress. "127.0.0.1" taken)) :bound)
+                     (catch java.io.IOException _ :refused)
+                     (finally (.close s))))
+              :refused))
+  (.close held))
+(check-eq "binding a free port succeeds"
+          (let [s (java.net.ServerSocket.)]
+            (try (do (.bind s (java.net.InetSocketAddress. "127.0.0.1" 0)) :bound)
+                 (catch java.io.IOException _ :refused)
+                 (finally (.close s))))
+          :bound)
+
 ;; write to a peer-closed socket throws instead of silently dropping — and the
 ;; process must survive it (SIGPIPE guarded via MSG_NOSIGNAL / SO_NOSIGPIPE).
 (let [server (java.net.ServerSocket. 0)
