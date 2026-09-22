@@ -185,9 +185,18 @@
                                      ((char=? (string-ref s k) #\})
                                       (emit! k) (loop (+ k 1) x? in-class stack))
                                      (else (emit! k) (copy (+ k 1)))))))))
-                   ;; an escape is two units, and neither is a token boundary
+                   ;; An escape is two units, and neither is a token boundary.
+                   ;; \x{…} and \N{…} carry a braced argument the JVM skips
+                   ;; comments inside like anywhere else — (?x)\x{4 1} is 0x41 —
+                   ;; so that "{" is taken here, out of reach of the quantifier
+                   ;; peek below, which would otherwise have kept the unit after
+                   ;; it and moved every index in a malformed \x{ or \N{.
                    ((and (char=? c #\\) (< (+ i 1) n))
-                    (emit! i) (emit! (+ i 1)) (loop (+ i 2) x? in-class stack))
+                    (emit! i) (emit! (+ i 1))
+                    (if (and (memv (string-ref s (+ i 1)) '(#\x #\N))
+                             (< (+ i 2) n) (char=? (string-ref s (+ i 2)) #\{))
+                        (begin (emit! (+ i 2)) (loop (+ i 3) x? in-class stack))
+                        (loop (+ i 2) x? in-class stack)))
                    ;; A quantifier's "{" peeks the next unit raw (Pattern reads
                    ;; temp[cursor+1] there, not next()), so (?x)a{ 1,2} is an
                    ;; "Illegal repetition" on the JVM while (?x)a{1 ,2} is fine.
@@ -604,6 +613,16 @@
                        (+ d (cond ((not index-map) idx)
                                   ((<= idx n) (vector-ref index-map idx))
                                   (else (+ (string-length qe) (- idx n))))))))
+    ;; The JVM reports cursor - 1, and some of its errors are raised after a
+    ;; next() that — with COMMENTS in force — has already skipped the whitespace
+    ;; and #-comments following the unit that caused them. The index then names
+    ;; the unit AFTER that run rather than the offending one: (?x)* is a dangling
+    ;; '*' near index 4 and (?x)* #c\n is the same '*' near index 8. So take the
+    ;; cursor's own position, which is the next kept unit, and step back one.
+    ;; Without stripping the two readings coincide, which is why only a (?x)
+    ;; pattern ever showed the difference.
+    (define (err/past desc idx) (err desc (+ idx 1) -1))
+
     (define seen '())                   ; the named groups defined so far
     (define refs 0)                     ; back-references read so far
 
@@ -642,6 +661,11 @@
                         (loop (+ k 1) v))))
                  ((char=? (rf k) #\}) (values v (+ k 1)))
                  (else (err "Unclosed hexadecimal escape sequence" k)))))
+        ;; Pattern.x() PEEKS the first unit raw and only starts READING — which
+        ;; is what skips — once it has seen a "{", so a malformed \x{…} reports
+        ;; from past the run after the brace and a malformed \x41 does not.
+        ((and (< i n) (char=? (rf i) #\{))
+         (err/past "Illegal hexadecimal escape sequence" i))
         (else (err "Illegal hexadecimal escape sequence" i))))
 
     ;; \u: exactly four hex digits (Pattern.uxxxx()) …
@@ -674,9 +698,17 @@
           (let ((cl (str-scan-char s #\} (+ i 1) n)))
             (cond
               ((not cl)
-               (if (>= (+ i 1) (- n 1))
-                   (err "Unclosed character name escape sequence" (+ i 1))
-                   (err "Unclosed character name escape sequence" n -1)))
+               ;; Pattern.N() reads towards the "}" with read(), which skips a
+               ;; COMMENTS run, and then reports cursor - 1. With no "}" at all
+               ;; the cursor has stopped either ON the last unit it read — the
+               ;; final kept unit of the name — or past the sentinel, which is
+               ;; where an empty name and a trailing stripped run both leave it.
+               (if (or (= (+ i 1) n)
+                       (and index-map
+                            (> (vector-ref index-map n)
+                               (+ 1 (vector-ref index-map (- n 1))))))
+                   (err "Unclosed character name escape sequence" n)
+                   (err "Unclosed character name escape sequence" (- n 1))))
               ((let ok ((k (+ i 1)) (letter #f))
                  (if (>= k cl)
                      letter
@@ -898,7 +930,7 @@
                  (if prev
                      (let ((k (+ i 1)))
                        (loop (if (and (< k n) (memv (rf k) '(#\? #\+))) (+ k 1) k) #f))
-                     (err (string-append "Dangling meta character '" (string c) "'") i)))
+                     (err/past (string-append "Dangling meta character '" (string c) "'") i)))
                 ((#\{)
                  (let ((k (brace i)))
                    (loop (if (and (< k n) (memv (rf k) '(#\? #\+))) (+ k 1) k) #f)))
