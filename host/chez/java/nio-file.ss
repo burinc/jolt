@@ -516,6 +516,36 @@
                                   (if (string? suffix) suffix ""))))
         (if (file-exists? (project-relative full)) (loop) full)))))
 
+;; ---- Files/isHidden ---------------------------------------------------------
+;; Files.isHidden is implementation-specific, and the JDK answers it per
+;; platform: UnixFileSystemProvider.isHidden tests the NAME's first character for
+;; ".", while WindowsFileSystemProvider.isHidden reads the file's DOS attribute
+;; word and asks for FILE_ATTRIBUTE_HIDDEN, ignoring the name entirely. So on
+;; Windows a dot-prefixed file is NOT hidden unless `attrib +h` says so, and a
+;; plainly-named one IS when it does.
+;;
+;; This tested the leading dot on every platform, which inverted the answer in
+;; both directions on Windows and took everything built on it along:
+;; babashka.fs/hidden? delegates straight to Files/isHidden, and fs/glob skips
+;; hidden entries by asking it — so a glob over the same tree selected a
+;; different set of files under jolt than under babashka (jolt-lang/jolt#1110).
+;;
+;; Neither side has a directory exception: a hidden DIRECTORY is hidden on
+;; Windows, and a dot-prefixed one is hidden on Unix.
+;;
+;; The platform is a parameter, like every other Windows-shaped answer in this
+;; file, so the rows are pinned from a POSIX runner (test/chez/win-platform-test.ss).
+(define (nio-hidden-for? windows? attrs name)
+  (if windows?
+      (and attrs (not (= 0 (bitwise-and attrs win32-FILE-ATTRIBUTE-HIDDEN))) #t)
+      (and (> (string-length name) 0) (char=? (string-ref name 0) #\.))))
+
+(define (nio-hidden? p)
+  (let ((windows? (nio-windows?)))
+    (nio-hidden-for? windows?
+                     (and windows? (win32-file-attributes (nfp p)))
+                     (npath-string-of (npath-file-name (npath-string-of p))))))
+
 (let ((files-statics
        (list
         (cons "notExists"     (lambda (p . _) (if (file-exists? (nfp p)) #f #t)))
@@ -525,8 +555,7 @@
         (cons "isReadable"    (lambda (p . _) (file-accessible? (nfp p) access-r-ok)))
         (cons "isWritable"    (lambda (p . _) (file-accessible? (nfp p) access-w-ok)))
         (cons "isExecutable"  (lambda (p . _) (file-accessible? (nfp p) access-x-ok)))
-        (cons "isHidden"      (lambda (p . _) (let ((nm (npath-string-of (npath-file-name (npath-string-of p)))))
-                                                (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\.)))))
+        (cons "isHidden"      (lambda (p . _) (nio-hidden? p)))
         (cons "size"          (lambda (p . _) (nio-size (nfp p))))
         (cons "delete"        (lambda (p) (nio-delete1 (nfp p) #f) jolt-nil))
         (cons "deleteIfExists"(lambda (p) (nio-delete1 (nfp p) #t)))

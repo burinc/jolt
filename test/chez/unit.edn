@@ -918,6 +918,15 @@
   ;; clojure.core's *in* is a reify over IReader, which a JVM PushbackReader could
   ;; never hold and which has no close to dispatch.
   {:suite "pushback-close" :expr "(with-in-str \"x\" (do (.close (java.io.PushbackReader. *in*)) :ok))" :expected ":ok"}
+  ;; Files/isHidden is implementation-specific: the leading dot is the POSIX rule,
+  ;; and the DOS attribute is the Windows one (jolt-lang/jolt#1110). These are the
+  ;; POSIX half; the Windows rows are pinned over nio-hidden-for? in
+  ;; test/chez/win-path-test.ss, which is the only place a POSIX runner can reach
+  ;; them. A directory gets no exception on either platform.
+  {:suite "files-hidden" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-hidden-test\") _ (.mkdirs (java.io.File. d)) dot (str d \"/.dotted\") plain (str d \"/plain.clj\")] (spit dot \"x\") (spit plain \"x\") [(java.nio.file.Files/isHidden (java.nio.file.Paths/get dot (make-array String 0))) (java.nio.file.Files/isHidden (java.nio.file.Paths/get plain (make-array String 0)))])" :expected "[true false]"}
+  {:suite "files-hidden" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-hidden-test/.dotdir\")] (.mkdirs (java.io.File. d)) (java.nio.file.Files/isHidden (java.nio.file.Paths/get d (make-array String 0))))" :expected "true"}
+  ;; a path that does not exist answers false rather than raising
+  {:suite "files-hidden" :expr "(java.nio.file.Files/isHidden (java.nio.file.Paths/get \"no-such-file-here.txt\" (make-array String 0)))" :expected "false"}
   {:suite "javastatic" :expr "(BigInteger. \"123\")" :expected "123"}
   {:suite "javastatic" :expr "(let [m (HashMap. {:a 1 :b 2})] (.get m :b))" :expected "2"}
   {:suite "javastatic" :expr "(let [m (HashMap. {})] (.put m :x 1) (.put m :y 2) (.size m))" :expected "2"}
