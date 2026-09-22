@@ -26,7 +26,7 @@ jobs:
 
       - name: Cache Chez Scheme
         id: cache-chez
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /opt/chez
           key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off-pic
@@ -68,7 +68,7 @@ jobs:
       # options make UTF-8 the default encoding on files, stdio and terminals.
       - name: Cache Gambit
         id: cache-gambit
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /opt/gambit
           key: gambit-${{ runner.os }}-${{ env.ImageOS }}-v4.9.8-single-host-f8
@@ -191,7 +191,7 @@ jobs:
 
       - name: Cache Chez Scheme
         id: cache-chez-win
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: chez-install
           key: chez-windows-latest-v10.4.1-mingw64
