@@ -56,55 +56,182 @@
 (define (java-re-error desc idx)
   (raise (make-java-pattern-error desc idx)))
 
-;; ── (?x) whitespace/comment stripping (from regex.ss, duplicated for standalone use)
+;; ── Inline flag groups: (?onFlags-offFlags) and (?onFlags-offFlags: ───────────
+;;
+;; java.util.regex.Pattern.group0 reads a flag group with addFlag() over the
+;; letters before the "-" and subFlag() over the letters after it.  "idmsuxUc" is
+;; the whole alphabet, a second "-" is "Unknown inline modifier", and the group
+;; ends either at ")" — the setting then runs to the end of the ENCLOSING group —
+;; or at ":", where it runs to the end of this one.
+;;
+;; That grammar used to be written out four times over: in the parser's
+;; leading-flag fast path, in its group parser, and in the two COMMENTS
+;; pre-passes (one for the parser, one for the validator).  The four disagreed.
+;; Three read a group naming "-" at all as switching flags OFF, so (?x-i) turned
+;; COMMENTS on for the JVM and off here; the fourth applied the OFF set before
+;; the ON set, so (?i-i:AB) matched "ab".  One parser now, so they cannot drift
+;; apart again.
+;;
+;; i is at the "(" of "(?…".  Answers (on off end terminator) — the flag letters
+;; before and after the "-", the index just past the terminator, and the
+;; terminator itself — or #f when this is not a flag group at all (a look-around,
+;; a name, an unknown letter).
+(define flag-group-letters '(#\i #\d #\m #\s #\u #\x #\U #\c))
 
-(define (regex-x-strip s start)
-  (let ((n (string-length s)) (out (open-output-string)))
-    (let loop ((i start))
-      (if (>= i n)
-          (get-output-string out)
-          (let ((c (string-ref s i)))
-            (cond
-             ((and (char=? c #\\) (< (+ i 1) n))
-              (write-char c out) (write-char (string-ref s (+ i 1)) out)
-              (loop (+ i 2)))
-             ((char=? c #\#)
-              (let skip ((j (+ i 1)))
-                (if (>= j n) (loop j)
-                    (if (char=? (string-ref s j) #\newline)
-                        (loop (+ j 1))
-                        (skip (+ j 1))))))
-             ((memv c '(#\space #\tab #\newline #\return #\x0B #\x0C))
-              (loop (+ i 1)))
-             (else (write-char c out) (loop (+ i 1)))))))))
+(define (parse-flag-group src i end)
+  (and (< (+ i 1) end)
+       (char=? (string-ref src i) #\()
+       (char=? (string-ref src (+ i 1)) #\?)
+       (let scan ((j (+ i 2)) (on '()) (off '()) (neg #f))
+         (and (< j end)
+              (let ((c (string-ref src j)))
+                (cond
+                 ((memv c flag-group-letters)
+                  (if neg
+                      (scan (+ j 1) on (cons c off) neg)
+                      (scan (+ j 1) (cons c on) off neg)))
+                 ((and (char=? c #\-) (not neg)) (scan (+ j 1) on off #t))
+                 ((or (char=? c #\)) (char=? c #\:))
+                  (list (reverse on) (reverse off) (+ j 1) c))
+                 (else #f)))))))
 
-(define (apply-global-x src)
-  (let ((n (string-length src)))
-    (let loop ((i 0) (in-class #f))
-      (if (>= (+ i 2) n)
-          src
-          (let ((c (string-ref src i)))
-            (cond
-             ((and (char=? c #\\) (< (+ i 1) n)) (loop (+ i 2) in-class))
-             ((and (not in-class) (char=? c #\[)) (loop (+ i 1) #t))
-             ((and in-class (char=? c #\])) (loop (+ i 1) #f))
-             ((and (not in-class) (char=? c #\()
-                   (char=? (string-ref src (+ i 1)) #\?))
-              (let scan ((j (+ i 2)) (fs '()))
-                (if (>= j n) src
-                    (let ((fc (string-ref src j)))
+(define (flag-group-on g) (car g))
+(define (flag-group-off g) (cadr g))
+(define (flag-group-end g) (caddr g))
+(define (flag-group-scoped? g) (char=? (cadddr g) #\:))
+
+;; Does this group leave COMMENTS on, starting from `now`?  addFlag and then
+;; subFlag, so a letter on both sides ends up off: (?x-x) is off, (?x-i) is on.
+(define (flag-group-comments? g now)
+  (cond ((memv #\x (flag-group-off g)) #f)
+        ((memv #\x (flag-group-on g)) #t)
+        (else now)))
+
+;; ── COMMENTS (?x): whitespace and #-comments ─────────────────────────────────
+;;
+;; With COMMENTS in force the JVM drops unescaped whitespace and #-to-end-of-line
+;; runs at every token boundary — inside a character class as much as outside —
+;; and it does so while parsing, so the mode is scoped like any other flag: an
+;; unscoped (?x) runs to the end of the enclosing group, (?x:…) to the end of its
+;; own, and (?-x) turns it back off.
+;;
+;; jolt strips in a pre-pass instead, which comes to the same thing only if the
+;; pre-pass tracks the same scope.  It did not: two strippers, one for the parser
+;; and one for the validator, both took "the first unscoped group naming x turns
+;; stripping on for the rest of the pattern" — which gets (?x:a b)c d, (?x)a
+;; (?-x)b c and (a(?x)b c)d e all wrong.  This one carries the flag through the
+;; group nesting, and both callers share it.
+;;
+;; \Q…\E is already gone when this runs (jsc-qe-rewrite has escaped what it
+;; quoted), which is what keeps (?x)\Qa b\E matching "a b" rather than "ab".
+;;
+;; Answers the stripped text and, for each of its positions, the position it came
+;; from — a PatternSyntaxException names an index into the unstripped pattern.
+;; The map is #f when nothing was stripped, the overwhelmingly common case and
+;; the fast path.
+(define (x-strip s)
+  (let ((n (string-length s)))
+    ;; Is there any group that turns COMMENTS on?  If not, nothing is stripped.
+    (define (any-x?)
+      (let loop ((i 0) (in-class #f))
+        (cond ((>= i n) #f)
+              ((char=? (string-ref s i) #\\) (loop (+ i 2) in-class))
+              ((and (not in-class) (char=? (string-ref s i) #\[)) (loop (+ i 1) #t))
+              ((and in-class (char=? (string-ref s i) #\])) (loop (+ i 1) #f))
+              ((and (not in-class) (char=? (string-ref s i) #\()
+                    (let ((g (parse-flag-group s i n)))
+                      (and g (memv #\x (flag-group-on g))
+                           (not (memv #\x (flag-group-off g))))))
+               #t)
+              (else (loop (+ i 1) in-class)))))
+    (if (not (any-x?))
+        (values s #f)
+        (let ((out (open-output-string)) (map '()))
+          (define (emit! k)
+            (write-char (string-ref s k) out) (set! map (cons k map)))
+          (define (emit-range! a b)
+            (let lp ((k a)) (when (< k b) (emit! k) (lp (+ k 1)))))
+          (let loop ((i 0) (x? #f) (in-class #f) (stack '()))
+            (if (>= i n)
+                (begin (set! map (cons n map))
+                       (values (get-output-string out) (list->vector (reverse map))))
+                (let ((c (string-ref s i)))
+                  (cond
+                   ;; \p{…} / \P{…}: the JVM skips comments once after the "{"
+                   ;; and then reads the family name RAW to the first "}", so
+                   ;; \p{ Lu } names "Lu " to it and is not the same property as
+                   ;; \p{Lu}.  Copying the name through is what makes jolt say so
+                   ;; too — stripping it made \p{L u} a legal spelling of \p{Lu}.
+                   ;; The name is copied whether or not COMMENTS is on, because a
+                   ;; (?x: inside one is name text to the JVM and must not turn
+                   ;; stripping on for the rest of the pattern.
+                   ((and (char=? c #\\) (< (+ i 2) n)
+                         (memv (string-ref s (+ i 1)) '(#\p #\P))
+                         (char=? (string-ref s (+ i 2)) #\{))
+                    (emit! i) (emit! (+ i 1)) (emit! (+ i 2))
+                    (let skip ((j (+ i 3)))
+                      (cond ((>= j n) (loop j x? in-class stack))
+                            ((and x? (memv (string-ref s j)
+                                           '(#\space #\tab #\newline #\return #\x0B #\x0C)))
+                             (skip (+ j 1)))
+                            ((and x? (char=? (string-ref s j) #\#))
+                             (let eol ((k (+ j 1)))
+                               (cond ((>= k n) (loop k x? in-class stack))
+                                     ((char=? (string-ref s k) #\newline) (skip (+ k 1)))
+                                     (else (eol (+ k 1))))))
+                            (else
+                             (let copy ((k j))
+                               (cond ((>= k n) (loop k x? in-class stack))
+                                     ((char=? (string-ref s k) #\})
+                                      (emit! k) (loop (+ k 1) x? in-class stack))
+                                     (else (emit! k) (copy (+ k 1)))))))))
+                   ;; an escape is two units, and neither is a token boundary
+                   ((and (char=? c #\\) (< (+ i 1) n))
+                    (emit! i) (emit! (+ i 1)) (loop (+ i 2) x? in-class stack))
+                   ;; A quantifier's "{" peeks the next unit raw (Pattern reads
+                   ;; temp[cursor+1] there, not next()), so (?x)a{ 1,2} is an
+                   ;; "Illegal repetition" on the JVM while (?x)a{1 ,2} is fine.
+                   ;; Only the ONE unit, and only when it is one that would
+                   ;; otherwise go: anything else still needs the normal reading
+                   ;; (an escape is a pair, a "(" opens a scope).
+                   ((and x? (not in-class) (char=? c #\{) (< (+ i 1) n)
+                         (memv (string-ref s (+ i 1))
+                               '(#\space #\tab #\newline #\return #\x0B #\x0C #\#)))
+                    (emit! i) (emit! (+ i 1)) (loop (+ i 2) x? in-class stack))
+                   ((and x? (memv c '(#\space #\tab #\newline #\return #\x0B #\x0C)))
+                    (loop (+ i 1) x? in-class stack))
+                   ((and x? (char=? c #\#))
+                    (let skip ((j (+ i 1)))
+                      (cond ((>= j n) (loop j x? in-class stack))
+                            ((char=? (string-ref s j) #\newline)
+                             (loop (+ j 1) x? in-class stack))
+                            (else (skip (+ j 1))))))
+                   (in-class
+                    (emit! i)
+                    (loop (+ i 1) x? (not (char=? c #\])) stack))
+                   ((char=? c #\[) (emit! i) (loop (+ i 1) x? #t stack))
+                   ((char=? c #\()
+                    (let ((g (parse-flag-group s i n)))
                       (cond
-                       ((memv fc '(#\s #\i #\m #\x #\u #\d #\U))
-                        (scan (+ j 1) (cons fc fs)))
-                       ((and (char=? fc #\)) (pair? fs) (memv #\x fs))
-                        (let ((others (reverse (remv #\x fs))))
-                          (string-append
-                           (substring src 0 i)
-                           (apply string-append
-                                  (map (lambda (f) (string #\( #\? f #\))) others))
-                           (regex-x-strip src (+ j 1)))))
-                       (else (loop (+ i 1) in-class)))))))
-             (else (loop (+ i 1) in-class))))))))
+                       ;; (?flags) — the setting outlives its own ")", so no
+                       ;; scope is pushed; the group is copied as it stands, and
+                       ;; the parser reads it again for the flags jolt applies.
+                       ((and g (not (flag-group-scoped? g)))
+                        (emit-range! i (flag-group-end g))
+                        (loop (flag-group-end g) (flag-group-comments? g x?)
+                              in-class stack))
+                       ;; (?flags: — scoped, like any other ( … )
+                       (g
+                        (emit-range! i (flag-group-end g))
+                        (loop (flag-group-end g) (flag-group-comments? g x?)
+                              in-class (cons x? stack)))
+                       (else (emit! i) (loop (+ i 1) x? in-class (cons x? stack))))))
+                   ((char=? c #\))
+                    (emit! i)
+                    (if (null? stack)
+                        (loop (+ i 1) x? in-class stack)
+                        (loop (+ i 1) (car stack) in-class (cdr stack))))
+                   (else (emit! i) (loop (+ i 1) x? in-class stack))))))))))
 
 ;; ── Leading flags ─────────────────────────────────────────────────────────────
 
@@ -119,30 +246,27 @@
         ((char=? c #\d) 'unix-lines)
         (else #f)))
 
+;; A run of unscoped flag groups at the head of the pattern becomes irregex
+;; options rather than an SRE wrapper.  Same grammar as everywhere else, and the
+;; same precedence: the OFF set is applied over the ON set, not before it.
 (define (parse-leading-flags src i end)
   (let loop ((i i) (opts '()))
-    (if (>= (+ i 3) end)
-        (values (reverse opts) i)
-        (let ((c0 (string-ref src i))
-              (c1 (string-ref src (+ i 1))))
-          (if (and (char=? c0 #\() (char=? c1 #\?))
-              (let scan ((j (+ i 2)) (fs '()))
-                (if (>= j end)
-                    (values (reverse opts) i)
-                    (let ((c (string-ref src j)))
-                      (cond
-                       ((memv c '(#\u #\U)) (scan (+ j 1) fs))
-                       ((regex-flag->opt c) =>
-                        (lambda (opt) (scan (+ j 1) (cons opt fs))))
-                       ((char=? c #\))
-                        (if (and (< (+ j 1) end)
-                                 (memv (string-ref src (+ j 1)) '(#\* #\+ #\?)))
-                            (error 'java-pattern->sre
-                                   "dangling quantifier after flag group" src)
-                            (loop (+ j 1) (append opts (reverse fs)))))
-                       ((char=? c #\:) (values (reverse opts) i))
-                       (else (values (reverse opts) i))))))
-              (values (reverse opts) i))))))
+    (let ((g (parse-flag-group src i end)))
+      (if (or (not g) (flag-group-scoped? g))
+          (values (reverse opts) i)
+          (if (and (< (flag-group-end g) end)
+                   (memv (string-ref src (flag-group-end g)) '(#\* #\+ #\?)))
+              (error 'java-pattern->sre "dangling quantifier after flag group" src)
+              (loop (flag-group-end g)
+                    (let on ((cs (flag-group-on g)) (opts opts))
+                      (if (pair? cs)
+                          (let ((f (regex-flag->opt (car cs))))
+                            (on (cdr cs) (if f (cons f (remq f opts)) opts)))
+                          (let off ((cs (flag-group-off g)) (opts opts))
+                            (if (pair? cs)
+                                (let ((f (regex-flag->opt (car cs))))
+                                  (off (cdr cs) (if f (remq f opts) opts)))
+                                opts))))))))))
 
 ;; ── \p{...} property class → SRE char-set ─────────────────────────────────────
 ;; Covers the categories the current pipeline handles, extended to include
@@ -272,6 +396,12 @@
                                (string=? (substring name 0 (string-length pre)) pre)))
   (define (after pre) (substring name (string-length pre) (string-length name)))
   (cond
+   ;; Pattern.family() reads the key/value split first, before any plain name —
+   ;; and no plain name holds an "=", so nothing else can be reached through it.
+   ((property-key-split name)
+    => (lambda (kv)
+         (and (member (car kv) '("gc" "general_category"))
+              (category-sre (cdr kv)))))
    ;; The Unicode separator categories are a short fixed list, so spell them out
    ;; rather than settling for irregex's ASCII `blank`. Zs is the space separators
    ;; (the non-breaking ones included — \p{Z} is a category, not Java's
@@ -303,8 +433,6 @@
       (cond ((assoc (string-upcase nm) unicode-binary-properties)
              => (lambda (e) (unicode-property-sre name (cdr e))))
             (else (prop-class-sre nm)))))
-   ((prefixed? "gc=") (category-sre (after "gc=")))
-   ((prefixed? "general_category=") (category-sre (after "general_category=")))
    (else #f)))
 
 ;; ── Literal string → SRE ──────────────────────────────────────────────────────
@@ -387,12 +515,10 @@
 (define (jsc-octal? c)
   (and (char>=? c #\0) (char<=? c #\7)))
 
-;; Is this a \p{…} name the JVM would accept?  The general categories and their
-;; groups, the POSIX and java* names, `all`, and the prefixed spellings — an Is
-;; (script, binary property or category), an In (block), gc= / general_category=
-;; / sc= / script= / blk= / block= — with a non-empty argument.  A script or
-;; block NAME is not checked (jolt has no table to check it against); the
-;; translator refuses the ones it cannot build.
+;; The keyless \p{…} names the JVM knows: the general categories and their
+;; groups, the POSIX and java* names, `all`, and the Is (script, binary property
+;; or category) and In (block) spellings with a non-empty argument.  The keyed
+;; gc= / sc= / blk= spellings go through property-key-split below instead.
 (define jvm-property-names
   '("Lower" "Upper" "ASCII" "Alpha" "Digit" "Alnum" "Punct" "Graph" "Print"
     "Blank" "Cntrl" "XDigit" "Space" "all"
@@ -411,74 +537,61 @@
     (and (> (string-length name) (string-length pre))
          (string=? (substring name 0 (string-length pre)) pre)))
   (or (and (member name jvm-property-names) #t)
-      (prefixed? "Is") (prefixed? "In")
-      (prefixed? "gc=") (prefixed? "general_category=")
-      (prefixed? "sc=") (prefixed? "script=")
-      (prefixed? "blk=") (prefixed? "block=")))
+      (prefixed? "Is") (prefixed? "In")))
 
-;; COMMENTS mode. The JVM skips whitespace and #-to-end-of-line comments at
-;; nearly every token boundary once an unscoped (?x) is in force — inside a
-;; class, between ( and ?, after \p, between the digits of a {m,n} — and the
-;; translator handles it the same way apply-global-x does: everything after the
-;; first unscoped flag group naming x is stripped before parsing. The validator
-;; scans that same stripped text, so it accepts exactly what the translator
-;; parses; what it must then add back is the JVM's index, which is a position
-;; in the UNSTRIPPED pattern. So this returns the stripped text and, for each
-;; of its positions, the original one. Before the first (?x) nothing changes.
-(define (jsc-x-strip s)
-  (let ((n (string-length s)))
-    (define (x-group-end i)             ; i at ( of (?…): index after ) when the
-      (let scan ((j (+ i 2)) (x? #f))    ; group is unscoped flags naming x
-        (and (< j n)
-             (let ((c (string-ref s j)))
-               (cond ((char=? c #\x) (scan (+ j 1) #t))
-                     ;; the same flag set apply-global-x accepts, and no wider:
-                     ;; a group naming "-" turns flags OFF, so (?-x), (?i-x) and
-                     ;; (?idmsux-idmsux) all leave COMMENTS mode off. Taking the
-                     ;; x on either side of the "-" as switching it on stripped
-                     ;; whitespace and #-comments the translator kept, so the
-                     ;; validator read a different pattern than the one built:
-                     ;; (?-x)#\k compiled here and is an error on the JVM.
-                     ((memv c '(#\s #\i #\m #\u #\d #\U)) (scan (+ j 1) x?))
-                     ((and (char=? c #\)) x?) (+ j 1))
-                     (else #f))))))
-    (let find ((i 0) (in-class #f))
-      (cond
-        ((>= (+ i 2) n) (values s #f))
-        ((char=? (string-ref s i) #\\) (find (+ i 2) in-class))
-        ((and (not in-class) (char=? (string-ref s i) #\[)) (find (+ i 1) #t))
-        ((and in-class (char=? (string-ref s i) #\])) (find (+ i 1) #f))
-        ((and (not in-class) (char=? (string-ref s i) #\()
-              (char=? (string-ref s (+ i 1)) #\?)
-              (x-group-end i))
-         => (lambda (start)
-              (let ((out (open-output-string)) (map '()))
-                (let loop ((k 0))
-                  (when (< k start)
-                    (write-char (string-ref s k) out) (set! map (cons k map)) (loop (+ k 1))))
-                (let loop ((k start))
-                  (if (>= k n)
-                      (begin (set! map (cons n map))
-                             (values (get-output-string out) (list->vector (reverse map))))
-                      (let ((c (string-ref s k)))
-                        (cond
-                          ((and (char=? c #\\) (< (+ k 1) n))
-                           (write-char c out) (write-char (string-ref s (+ k 1)) out)
-                           (set! map (cons (+ k 1) (cons k map)))
-                           (loop (+ k 2)))
-                          ((char=? c #\#)
-                           (let skip ((j (+ k 1)))
-                             (cond ((>= j n) (loop j))
-                                   ((char=? (string-ref s j) #\newline) (loop (+ j 1)))
-                                   (else (skip (+ j 1))))))
-                          ((memv c '(#\space #\tab #\newline #\return #\x0B #\x0C))
-                           (loop (+ k 1)))
-                          (else (write-char c out) (set! map (cons k map)) (loop (+ k 1))))))))))
-        (else (find (+ i 1) in-class))))))
+;; Pattern.family() splits a braced \p{…} at the FIRST "=" before it looks at
+;; anything else: what is left of it is a key, lowercased, and what is right of
+;; it a value, kept as written.  Answers (key . value), or #f when the text holds
+;; no "=" and is a plain property name.  One splitter for the validator and the
+;; translator both — they used to spell the keys out separately, and
+;; case-sensitively, so \p{GC=Lu} was rejected here and compiles on the JVM.
+(define (rx-downcase s)
+  (let* ((n (string-length s)) (out (make-string n)))
+    (let loop ((i 0))
+      (if (>= i n)
+          out
+          (begin (string-set! out i (char-downcase (string-ref s i)))
+                 (loop (+ i 1)))))))
+
+(define (property-key-split name)
+  (let ((eq (str-scan-char name #\= 0 (string-length name))))
+    (and eq (cons (rx-downcase (substring name 0 eq))
+                  (substring name (+ eq 1) (string-length name))))))
+
+;; The general category names \p{gc=…} takes, spelled as the JVM spells them —
+;; it matches the value case-sensitively even though the key is case-insensitive.
+(define unicode-gc-value-names
+  '("C" "Cc" "Cf" "Cn" "Co" "Cs" "L" "LC" "Ll" "Lm" "Lo" "Lt" "Lu" "M" "Mc" "Me"
+    "Mn" "N" "Nd" "Nl" "No" "P" "Pc" "Pd" "Pe" "Pf" "Pi" "Po" "Ps" "S" "Sc" "Sk"
+    "Sm" "So" "Z" "Zl" "Zp" "Zs"))
+
+;; #f when the JVM accepts this \p{…} text, otherwise the description it rejects
+;; with.  A keyed spec gets a sentence of its own, naming the two halves
+;; separately — jolt printed the keyless "Unknown character property name {…}"
+;; for both, so \p{FOO=BAR} reported something the JVM never says.  A script or
+;; block VALUE is not checked: jolt has no table to check it against, and the
+;; translator refuses the ones it cannot build.
+(define (jvm-property-reject name)
+  (let ((kv (property-key-split name)))
+    (if kv
+        (and (not (if (member (car kv) '("gc" "general_category"))
+                      (member (cdr kv) unicode-gc-value-names)
+                      (member (car kv) '("sc" "script" "blk" "block"))))
+             (string-append "Unknown Unicode property {name=<" (car kv)
+                            ">, value=<" (cdr kv) ">}"))
+        (and (not (jvm-property-name? name))
+             (string-append "Unknown character property name {" name "}")))))
 
 (define (java-syntax-check source)
   (let*-values (((qe) (jsc-qe-rewrite source))
-                ((s index-map) (jsc-x-strip qe)))
+                ((s index-map) (x-strip qe)))
+    (java-syntax-check-stripped qe s index-map)))
+
+;; qe is the \Q-rewritten pattern, s that text with COMMENTS whitespace stripped
+;; out of it, index-map s's positions back in qe's terms.  java-pattern->sre
+;; hands its own copies of all three straight in, so the text checked here and
+;; the text parsed there are one object and cannot disagree.
+(define (java-syntax-check-stripped qe s index-map)
    (let ((n (string-length s)))
     (define (rf k) (string-ref s k))
     ;; An index is a position in s; in COMMENTS mode it is mapped back to the
@@ -584,13 +697,11 @@
          (let ((cl (str-scan-char s #\} (+ i 1) n)))
            (cond ((not cl) (err "Unclosed character family" n))
                  ((= cl (+ i 1)) (err "Empty character family" cl))
-                 ((jvm-property-name? (substring s (+ i 1) cl)) (+ cl 1))
-                 (else (err (string-append "Unknown character property name {"
-                                           (substring s (+ i 1) cl) "}")
-                            cl)))))
-        ((jvm-property-name? (string (rf i))) (+ i 1))
-        (else (err (string-append "Unknown character property name {" (string (rf i)) "}")
-                   i))))
+                 ((jvm-property-reject (substring s (+ i 1) cl))
+                  => (lambda (desc) (err desc cl)))
+                 (else (+ cl 1)))))
+        ((jvm-property-reject (string (rf i))) => (lambda (desc) (err desc i)))
+        (else (+ i 1))))
 
     ;; <name> of a named group or a \k back-reference: a Latin letter, then
     ;; Latin letters and digits, then > → (values name next)
@@ -794,11 +905,19 @@
                 ((#\|) (loop (+ i 1) #f))
                 (else (loop (+ i 1) #t)))))))
 
-    (scan 0 #t))))
+    (scan 0 #t)))
 
+;; Pattern.RemoveQEQuoting and then COMMENTS stripping, ONCE, with the validator
+;; and the parser below both reading what comes out.  They used to preprocess
+;; apart: the validator rewrote \Q…\E where the parser tried to read it inline,
+;; so \c\QZ(?= was accepted by the one and refused by the other with a confident
+;; "Unclosed group" — \c having eaten the backslash that opened the quote.  A
+;; parser that reads a different string from the one that was checked can always
+;; be talked into contradicting it, so it no longer reads a different string.
 (define (java-pattern->sre source)
-  (java-syntax-check source)
-  (let ((source (apply-global-x source)))
+  (let*-values (((qe) (jsc-qe-rewrite source))
+                ((source index-map) (x-strip qe)))
+    (java-syntax-check-stripped qe source index-map)
     (let* ((len (string-length source)))
       (let-values (((opts start) (parse-leading-flags source 0 len)))
         (let-values (((sre _end) (parse-expr source start len opts 0)))
@@ -1405,54 +1524,57 @@
 ;; ── Inline flags: (?imsx-imsx:body) ─────────────────────────────────────────
 
 (define (parse-inline-flags-group src i end flags depth)
-  (let scan ((j i) (fs '()) (neg #f))
-    (if (>= j end)
-        (error 'java-pattern->sre "unterminated inline flags" src)
-        (let ((c (string-ref src j)))
-          (cond
-           ((char=? c #\-) (scan (+ j 1) fs #t))
-           ((char=? c #\i)
-            (scan (+ j 1)
-                  (cons (if neg 'case-sensitive 'case-insensitive) fs) neg))
-           ((char=? c #\s)
-            (scan (+ j 1)
-                  (cons (if neg 'not-single-line 'single-line) fs) neg))
-           ((char=? c #\m)
-            (scan (+ j 1)
-                  (cons (if neg 'not-multi-line 'multi-line) fs) neg))
-           ((char=? c #\x)
-            (scan (+ j 1)
-                  (cons (if neg 'not-ignore-space 'ignore-space) fs) neg))
-           ((char=? c #\d)
-            (scan (+ j 1)
-                  (cons (if neg 'not-unix-lines 'unix-lines) fs) neg))
-            ;; u (UNICODE_CASE) and U (UNICODE_CHARACTER_CLASS): accept and
-            ;; ignore — they don't change matching for our engine.
-            ((memv c '(#\c #\u #\U))
-             (scan (+ j 1) fs neg))
-           ((char=? c #\:)
-            (let ((new-flags (apply-inline-flags flags fs)))
-              (let-values (((sre i2) (parse-expr src (+ j 1) end new-flags (+ depth 1))))
-                (if (and (< i2 end) (char=? (string-ref src i2) #\)))
-                    (values (wrap-case-flag sre fs) (+ i2 1))
-                    (java-re-error "Unclosed group" end)))))
-           ((char=? c #\))
-            ;; Unscoped toggle (?i) — parse remainder with new flags
-            (let ((new-flags (apply-inline-flags flags fs))
-                  (k (+ j 1)))
-              (let ((qc (and (< k end) (string-ref src k))))
-                (cond
-                 ((and qc (memv qc '(#\* #\+ #\?)))
-                  (error 'java-pattern->sre "dangling quantifier after flag group" src))
-                 ((and qc (char=? qc #\{))
-                  (let-values (((qi i2) (parse-bounded 'epsilon src k end flags depth)))
-                    (let-values (((sre i3) (parse-expr src i2 end new-flags (+ depth 1))))
-                      (values (wrap-flags-sre sre fs) i3))))
-                 (else
-                  (let-values (((sre i2) (parse-expr src k end new-flags (+ depth 1))))
-                    (values (wrap-flags-sre sre fs) i2)))))))
-           (else
-            (error 'java-pattern->sre "unrecognized inline flag" src)))))))
+  ;; i is just past the "(?"; parse-flag-group wants the "(" itself.
+  (let ((g (parse-flag-group src (- i 2) end)))
+    (if (not g)
+        (error 'java-pattern->sre "unrecognized inline flag" src)
+        (let ((fs (flag-group-opts g))
+              (j (- (flag-group-end g) 1)))  ; the terminator's own index
+          (if (flag-group-scoped? g)
+              (let ((new-flags (apply-inline-flags flags fs)))
+                (let-values (((sre i2) (parse-expr src (+ j 1) end new-flags (+ depth 1))))
+                  (if (and (< i2 end) (char=? (string-ref src i2) #\)))
+                      (values (wrap-case-flag sre fs) (+ i2 1))
+                      (java-re-error "Unclosed group" end))))
+              ;; Unscoped toggle (?i) — parse the remainder with the new flags
+              (let ((new-flags (apply-inline-flags flags fs))
+                    (k (+ j 1)))
+                (let ((qc (and (< k end) (string-ref src k))))
+                  (cond
+                   ((and qc (memv qc '(#\* #\+ #\?)))
+                    (error 'java-pattern->sre "dangling quantifier after flag group" src))
+                   ((and qc (char=? qc #\{))
+                    (let-values (((qi i2) (parse-bounded 'epsilon src k end flags depth)))
+                      (let-values (((sre i3) (parse-expr src i2 end new-flags (+ depth 1))))
+                        (values (wrap-flags-sre sre fs) i3))))
+                   (else
+                    (let-values (((sre i2) (parse-expr src k end new-flags (+ depth 1))))
+                      (values (wrap-flags-sre sre fs) i2)))))))))))
+
+;; A flag group as the symbols apply-inline-flags understands, with the OFF set
+;; resolved against the ON set rather than left to the order they are applied in.
+;; A letter named on both sides is off — the JVM runs addFlag and then subFlag —
+;; and resolving it here is also what keeps wrap-case-flag from being handed both
+;; case-insensitive and case-sensitive and taking whichever it tests for first.
+;; u, U and c (UNICODE_CASE, UNICODE_CHARACTER_CLASS, CANON_EQ) are accepted and
+;; dropped: they do not change what this engine matches.
+(define (flag-group-opts g)
+  (let loop ((cs '(#\i #\s #\m #\x #\d)) (out '()))
+    (if (null? cs)
+        out
+        (let ((c (car cs)))
+          (loop (cdr cs)
+                (cond ((memv c (flag-group-off g)) (cons (regex-flag->off-opt c) out))
+                      ((memv c (flag-group-on g)) (cons (regex-flag->opt c) out))
+                      (else out)))))))
+
+(define (regex-flag->off-opt c)
+  (cond ((char=? c #\i) 'case-sensitive)
+        ((char=? c #\s) 'not-single-line)
+        ((char=? c #\m) 'not-multi-line)
+        ((char=? c #\x) 'not-ignore-space)
+        ((char=? c #\d) 'not-unix-lines)
+        (else #f)))
 
 (define (apply-inline-flags flags fs)
   (let loop ((fs fs) (flags flags))
