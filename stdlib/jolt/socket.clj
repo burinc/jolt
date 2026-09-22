@@ -424,38 +424,85 @@
    "close" (fn [self] (socket-close! (jolt.host/ref-get self :socket)))})
 
 ;; -- ServerSocket ------------------------------------------------------------
-(defn- server-ctor [& args]
-  ;; [] [port] [port backlog] [port backlog bindAddr] — binds the wildcard
-  ;; address unless bindAddr says otherwise, like Java. Port 0 asks the kernel
-  ;; for an ephemeral port; getsockname recovers the real one.
-  (let [port      (if (pos? (count args)) (int (first args)) 0)
-        backlog   (if (>= (count args) 2) (int (second args)) 50)
-        bind-host (if (>= (count args) 3) (host-arg->str (nth args 2)) "0.0.0.0")
-        fd        (new-fd!)
-        sa        (make-sockaddr-in bind-host port)]
+;; Bind fd to bind-host:port and start listening, or throw. Shared by the ctor
+;; forms that bind on construction and by the bind method, which is the only way
+;; a no-arg socket ever becomes bound.
+;;
+;; close-on-failure? is the difference between the two callers, not a knob. The
+;; ctor owns its fd and no caller has seen it yet, so a failed bind must close it
+;; or it leaks. bind must NOT close, because Java leaves a failed bind's socket
+;; open — the caller still holds it and is the one who closes or retries.
+(defn- bind-listen! [fd bind-host port backlog close-on-failure?]
+  (let [sa (make-sockaddr-in bind-host port)]
     (when (neg? (c-bind fd sa 16))
-      (c-close fd) (ffi/free sa)
+      (when close-on-failure? (c-close fd))
+      (ffi/free sa)
       (throw (java.io.IOException. (str "bind failed on port " port))))
     (ffi/free sa)
     (when (neg? (c-listen fd backlog))
-      (c-close fd)
-      (throw (java.io.IOException. "listen() failed")))
+      (when close-on-failure? (c-close fd))
+      (throw (java.io.IOException. "listen() failed")))))
+
+(defn- server-ctor [& args]
+  ;; [] [port] [port backlog] [port backlog bindAddr]. The arg'd forms bind the
+  ;; wildcard address unless bindAddr says otherwise, like Java, and port 0 asks
+  ;; the kernel for an ephemeral port that getsockname recovers.
+  ;;
+  ;; The NO-ARG form makes an UNBOUND socket, which is what Java's does: nothing
+  ;; is bound and nothing listens until bind is called. It used to bind an
+  ;; ephemeral wildcard port right here, so (ServerSocket.) answered isBound true
+  ;; and a real getLocalPort where the JVM answers false and -1, and it held a
+  ;; port the caller never asked for.
+  (if (zero? (count args))
     (doto (tt :server-socket "java.net.ServerSocket")
-      (jolt.host/ref-put! :fd fd)
+      (jolt.host/ref-put! :fd (new-fd!))
       (jolt.host/ref-put! :closed? false)
-      (jolt.host/ref-put! :bind-addr bind-host)
-      (jolt.host/ref-put! :port (if (zero? port) (local-port fd) port)))))
+      (jolt.host/ref-put! :bound? false))
+    (let [port      (int (first args))
+          backlog   (if (>= (count args) 2) (int (second args)) 50)
+          bind-host (if (>= (count args) 3) (host-arg->str (nth args 2)) "0.0.0.0")
+          fd        (new-fd!)]
+      (bind-listen! fd bind-host port backlog true)
+      (doto (tt :server-socket "java.net.ServerSocket")
+        (jolt.host/ref-put! :fd fd)
+        (jolt.host/ref-put! :closed? false)
+        (jolt.host/ref-put! :bound? true)
+        (jolt.host/ref-put! :bind-addr bind-host)
+        (jolt.host/ref-put! :port (if (zero? port) (local-port fd) port))))))
+
+;; (.bind ss endpoint) / (.bind ss endpoint backlog), the two overloads
+;; ServerSocket declares. Java's default backlog is 50, the same one the
+;; [port backlog] ctor form defaults to.
+(defn- server-bind! [self endpoint backlog]
+  (when (jolt.host/ref-get self :closed?)
+    (throw (java.net.SocketException. "Socket is closed")))
+  (when (jolt.host/ref-get self :bound?)
+    (throw (java.net.SocketException. "Already bound")))
+  (let [h  (str (or (jolt.host/ref-get endpoint :host) "0.0.0.0"))
+        p  (int (or (jolt.host/ref-get endpoint :port) 0))
+        fd (jolt.host/ref-get self :fd)]
+    (bind-listen! fd h p backlog false)
+    (jolt.host/ref-put! self :bound? true)
+    (jolt.host/ref-put! self :bind-addr h)
+    (jolt.host/ref-put! self :port (if (zero? p) (local-port fd) p)))
+  nil)
 
 (defn- server->str [self]
-  (let [ba (or (jolt.host/ref-get self :bind-addr) "0.0.0.0")]
-    (str "ServerSocket[addr=" ba "/" ba
-         ",localport=" (or (jolt.host/ref-get self :port) 0) "]")))
+  (if (jolt.host/ref-get self :bound?)
+    (let [ba (or (jolt.host/ref-get self :bind-addr) "0.0.0.0")]
+      (str "ServerSocket[addr=" ba "/" ba
+           ",localport=" (or (jolt.host/ref-get self :port) 0) "]"))
+    "ServerSocket[unbound]"))
 
 (def ^:private server-socket-methods
   {"accept"
    (fn [self]
      (when (jolt.host/ref-get self :closed?)
        (throw (java.io.IOException. "ServerSocket closed")))
+     ;; A no-arg socket has an fd but nothing is listening on it, so accept would
+     ;; block or fail obscurely. Java names the case.
+     (when-not (jolt.host/ref-get self :bound?)
+       (throw (java.net.SocketException. "Socket is not bound yet")))
      (let [sa (ffi/alloc 16) lenp (ffi/alloc 4)]
        (try
          (ffi/write lenp :int 16)
@@ -482,9 +529,21 @@
          (poller/forget! fd)))   ; see socket-close!
      nil)
 
+   "bind"
+   (fn
+     ([self endpoint] (server-bind! self endpoint 50))
+     ([self endpoint backlog] (server-bind! self endpoint (int backlog))))
+
    "isClosed"     (fn [self] (boolean (jolt.host/ref-get self :closed?)))
-   "isBound"      (fn [self] (not (jolt.host/ref-get self :closed?)))
-   "getLocalPort" (fn [self] (or (jolt.host/ref-get self :port) 0))
+   ;; Java's isBound asks "was this ever bound", not "is it usable now": it stays
+   ;; true after close, and it is false on a fresh no-arg socket. Answering
+   ;; (not closed?) had it backwards at both ends.
+   "isBound"      (fn [self] (boolean (jolt.host/ref-get self :bound?)))
+   ;; -1 until bound, as Java answers, and the port survives close.
+   "getLocalPort" (fn [self]
+                    (if (jolt.host/ref-get self :bound?)
+                      (or (jolt.host/ref-get self :port) 0)
+                      -1))
    "toString"     server->str})
 
 ;; -- InetSocketAddress -------------------------------------------------------
