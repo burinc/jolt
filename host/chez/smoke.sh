@@ -1930,7 +1930,7 @@ check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a 
 # actually relies on. POSIX only — Windows has no FD_CLOEXEC (it controls
 # inheritance with HANDLE_FLAG_INHERIT), so there this asserts nothing rather
 # than asserting the wrong thing.
-check '(do (require (quote jolt.nrepl)) (if jolt.nrepl/windows? :close-on-exec (let [fd (jolt.nrepl/listen-socket 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
+check '(do (require (quote jolt.nrepl)) (if @(var jolt.nrepl/windows?) :close-on-exec (let [fd ((var jolt.nrepl/listen-socket) 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
 
 # jolt.ffi/load-library's per-OS map form — documented since the FFI docs
 # existed, implemented only in 0.7.10 (it rendered the map to a string and
