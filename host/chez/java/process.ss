@@ -1328,18 +1328,19 @@
 ;; This is what replaces `env -i K=V …`: there is no env program on Windows and
 ;; nothing to exec it with, and the block is exact — the child gets these
 ;; variables and no others, which is the semantics the sh prefix was reaching for.
+;; ROOT is the parent's SystemRoot (or #f), passed in rather than read here so
+;; the block is a pure function of its arguments.
 (define (proc-win-name<? a b)
   (let ((la (string-downcase a)) (lb (string-downcase b)))
     (string<? la lb)))
 
-(define (proc-win-env-entries pairs)
+(define (proc-win-env-entries pairs root)
   (let* ((sorted (list-sort (lambda (x y) (proc-win-name<? (car x) (car y))) pairs))
          (has-root? (let loop ((ps sorted))
                       (cond ((null? ps) #f)
                             ((string-ci=? (caar ps) "SystemRoot") #t)
                             (else (loop (cdr ps))))))
-         (root (and (not has-root?) (getenv "SystemRoot")))
-         (all (if (and root (> (string-length root) 0))
+         (all (if (and (not has-root?) root (> (string-length root) 0))
                   (list-sort (lambda (x y) (proc-win-name<? (car x) (car y)))
                              (cons (cons "SystemRoot" root) sorted))
                   sorted)))
@@ -1639,7 +1640,7 @@
            (wcmd (keep-free! (win32-wstr cmdline)))
            (wdir (and dir (keep-free! (win32-wstr dir))))
            (wenv (and env-map
-                      (keep-free! (win32-wstr (proc-win-env-entries (proc-env-map-pairs env-map))))))
+                      (keep-free! (win32-wstr (proc-win-env-entries (proc-env-map-pairs env-map) (getenv "SystemRoot"))))))
            ;; CREATE_NO_WINDOW would hide a console the child was meant to share,
            ;; so it is dropped exactly when a standard handle is being inherited
            ;; and this process has a console — ProcessImpl_md.c's own test.

@@ -559,8 +559,8 @@
 ;; Windows requires and ProcessEnvironment.toEnvironmentBlock produces. This is
 ;; what replaces `env -i K=V …`: there is no env program on Windows, and the block
 ;; is exact, which is the semantics the sh prefix was reaching for.
-(define (envblock label pairs want)
-  (let ((got (proc-win-env-entries pairs)))
+(define (envblock label pairs want . root)
+  (let ((got (proc-win-env-entries pairs (if (null? root) #f (car root)))))
     (set! total (+ total 1))
     (unless (string=? got want)
       (set! fails (+ fails 1))
@@ -573,6 +573,18 @@
           (string-append "ALPHA=2" NUL "Beta=3" NUL "zeta=1" NUL))
 ;; an empty environment is still a block, not a null pointer
 (envblock "empty environment" '() NUL)
+;; SystemRoot rides along from the parent, in its sorted place...
+(envblock "SystemRoot is added in sorted order"
+          '(("zeta" . "1") ("ALPHA" . "2"))
+          (string-append "ALPHA=2" NUL "SystemRoot=C:\\Windows" NUL "zeta=1" NUL)
+          "C:\\Windows")
+;; ...unless the caller already set it, in any case
+(envblock "an explicit SystemRoot wins"
+          '(("systemroot" . "D:\\W"))
+          (string-append "systemroot=D:\\W" NUL)
+          "C:\\Windows")
+(envblock "SystemRoot alone fills an empty environment" '()
+          (string-append "SystemRoot=C:\\Windows" NUL) "C:\\Windows")
 
 ;; --- STARTUPINFOW / PROCESS_INFORMATION layout -------------------------------
 ;; Derived from the pointer width rather than hardcoded, so the same formulas
@@ -599,9 +611,15 @@
 ;; whole surface is gated on the machine type. If any of it had tried, the
 ;; accessors would answer #f rather than raising — which is also what a Windows
 ;; host missing an entry gets, and what proc-win-spawn-ok? turns into a loud
-;; IOException instead of the silent exit-0 that started this.
-(ok "no Win32 entry resolves on a POSIX host" (not (proc-win-spawn-ok?)))
-(ok "proc-win? is false on a POSIX host" (not proc-win?))
+;; IOException instead of the silent exit-0 that started this. On the Windows
+;; runner the same rows flip: every entry must resolve there.
+(if (eq? (sa-os-family) 'windows)
+    (begin
+      (ok "every Win32 entry resolves on a Windows host" (proc-win-spawn-ok?))
+      (ok "proc-win? is true on a Windows host" proc-win?))
+    (begin
+      (ok "no Win32 entry resolves on a POSIX host" (not (proc-win-spawn-ok?)))
+      (ok "proc-win? is false on a POSIX host" (not proc-win?))))
 
 ;; --- a LIVE spawn, on whichever host is running -------------------------------
 ;; Everything above is a table. This is the part that would actually have caught
@@ -645,7 +663,9 @@
 ;; it is what the old sh string was being handed to — `cmd /c echo ok` printed
 ;; nothing at all and exited 0 before the CreateProcessW path.
 (define echo-argv    (if live-windows? '("cmd" "/c" "echo" "ok")        '("/bin/sh" "-c" "echo ok")))
-(define stderr-argv  (if live-windows? '("cmd" "/c" "echo" "err" "1>&2") '("/bin/sh" "-c" "echo err 1>&2")))
+;; The redirect goes first on Windows: cmd echoes everything up to the operator,
+;; so `echo err 1>&2` writes "err " with the space.
+(define stderr-argv  (if live-windows? '("cmd" "/c" "1>&2" "echo" "err") '("/bin/sh" "-c" "echo err 1>&2")))
 (define exit3-argv   (if live-windows? '("cmd" "/c" "exit" "3")          '("/bin/sh" "-c" "exit 3")))
 ;; An argument holding a space must arrive as ONE argument. On Windows the
 ;; command-line builder quotes it, so cmd's echo prints the quotes back —
