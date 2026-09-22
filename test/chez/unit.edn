@@ -904,6 +904,44 @@
   {:suite "javastatic" :expr "(let [r (java.io.PushbackReader. (java.io.StringReader. \"ab\"))] [(.read r) (.read r)])" :expected "[97 98]"}
   {:suite "javastatic" :expr "(let [r (PushbackReader. (StringReader. \"ab\")) a (.read r)] (.unread r a) [a (.read r) (.read r)])" :expected "[97 97 98]"}
   {:suite "javastatic" :expr "(let [r (PushbackReader. (StringReader. \"a\"))] (.unread r \\x) [(.read r) (.read r)])" :expected "[120 97]"}
+  ;; PushbackReader.close() is in.close() — it closes the reader it WRAPS
+  ;; (jolt-lang/jolt#1109). It was a no-op, so `with-open` over a PushbackReader —
+  ;; the normal spelling, and the one clojure.core/read callers use — closed
+  ;; nothing at all and the wrapped reader's port stayed open for the life of the
+  ;; process. Only observable where the wrapped reader OWNS a handle: io/reader on
+  ;; a path answers a StringReader here, java.io.FileReader is the streaming one.
+  {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-pbr-close.txt\") _ (spit f \"ab\") r (java.io.FileReader. f) p (java.io.PushbackReader. r)] (.read p) (.close p) (try (.read r) :not-closed (catch Throwable _ :closed)))" :expected ":closed"}
+  {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (java.io.PushbackReader. r)] (.close p) @closed)" :expected "true"}
+  ;; the line-numbering subclass shares the table, so it delegates identically
+  {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (clojure.lang.LineNumberingPushbackReader. r)] (.close p) @closed)" :expected "true"}
+  ;; ...but a wrapped value with NO close is still a no-op rather than a throw:
+  ;; clojure.core's *in* is a reify over IReader, which a JVM PushbackReader could
+  ;; never hold and which has no close to dispatch.
+  {:suite "pushback-close" :expr "(with-in-str \"x\" (do (.close (java.io.PushbackReader. *in*)) :ok))" :expected ":ok"}
+  ;; Files/isHidden is implementation-specific: the leading dot is the POSIX rule,
+  ;; and the DOS attribute is the Windows one (jolt-lang/jolt#1110). These are the
+  ;; POSIX half; the Windows rows are pinned over nio-hidden-for? in
+  ;; test/chez/win-path-test.ss, which is the only place a POSIX runner can reach
+  ;; them. A directory gets no exception on either platform.
+  {:suite "files-hidden" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-hidden-test\") _ (.mkdirs (java.io.File. d)) dot (str d \"/.dotted\") plain (str d \"/plain.clj\")] (spit dot \"x\") (spit plain \"x\") [(java.nio.file.Files/isHidden (java.nio.file.Paths/get dot (make-array String 0))) (java.nio.file.Files/isHidden (java.nio.file.Paths/get plain (make-array String 0)))])" :expected "[true false]"}
+  {:suite "files-hidden" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-hidden-test/.dotdir\")] (.mkdirs (java.io.File. d)) (java.nio.file.Files/isHidden (java.nio.file.Paths/get d (make-array String 0))))" :expected "true"}
+  ;; a path that does not exist answers false rather than raising
+  {:suite "files-hidden" :expr "(java.nio.file.Files/isHidden (java.nio.file.Paths/get \"no-such-file-here.txt\" (make-array String 0)))" :expected "false"}
+  ;; jolt.winsock is the one WSAStartup, shared by jolt.socket, jolt.nrepl and
+  ;; jolt.mvn-http — which used to carry two private copies between them and
+  ;; leave the socket shim with none, so every java.net socket failed on Windows
+  ;; while Maven resolution and nREPL worked (jolt-lang/jolt#1107). Off Windows it
+  ;; is a no-op that still answers, so every caller can say it on the way in.
+  {:suite "winsock" :expr "(do (require (quote jolt.winsock)) (jolt.winsock/ensure!))" :expected "true"}
+  {:suite "winsock" :expr "(do (require (quote jolt.winsock)) [(jolt.winsock/ensure!) (jolt.winsock/ensure!)])" :expected "[true true]"}
+  ;; The four socket numbers that differ by platform. Every one of them answered
+  ;; Linux's value on Windows, which is the other half of why no socket worked
+  ;; there — Winsock is BSD-shaped for all four, and MSG_NOSIGNAL in particular is
+  ;; not merely unnecessary there but an unknown flag that fails the send. A
+  ;; function of the platform, so the Windows row is pinned from this runner.
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for false true))" :expected "{:sol-socket 65535, :so-reuse 4, :msg-nosignal 0, :fionread 1074030207}"}
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for true false))" :expected "{:sol-socket 65535, :so-reuse 4, :msg-nosignal 0, :fionread 1074030207}"}
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for false false))" :expected "{:sol-socket 1, :so-reuse 2, :msg-nosignal 16384, :fionread 21531}"}
   {:suite "javastatic" :expr "(BigInteger. \"123\")" :expected "123"}
   {:suite "javastatic" :expr "(let [m (HashMap. {:a 1 :b 2})] (.get m :b))" :expected "2"}
   {:suite "javastatic" :expr "(let [m (HashMap. {})] (.put m :x 1) (.put m :y 2) (.size m))" :expected "2"}

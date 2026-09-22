@@ -161,6 +161,48 @@
 (rx "win escaped star"      #t "a\\*b"     "^a\\*b$")
 (rx "posix escaped star"    #f "a\\*b"     "^a\\*b$")
 
+;; --- Files/isHidden: the name on POSIX, the DOS attribute on Windows ---------
+;; java.nio.file.Files.isHidden is implementation-specific and the JDK answers it
+;; per platform. This tested the leading dot everywhere, so BOTH Windows rows were
+;; wrong: a dot-prefixed file read as hidden when Windows says it is not, and a
+;; file carrying the attribute read as visible when Windows says it is
+;; (jolt-lang/jolt#1110). babashka.fs/hidden? is Files/isHidden verbatim and
+;; fs/glob skips hidden entries by asking it, so the two answers decided which
+;; files a glob returned.
+;;
+;; `attrs` is the DOS attribute word GetFileAttributesW answers, or #f when the
+;; path cannot be read — the parameter that lets the Windows rows run here.
+(define HIDDEN #x2)
+(define DIR    #x10)
+(define ARCHIVE #x20)
+(define (hid label windows? attrs name want)
+  (let ((got (nio-hidden-for? windows? attrs name)))
+    (set! total (+ total 1))
+    (unless (eq? (and got #t) want)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a (windows? ~s): got ~s, want ~s\n" label windows? got want))))
+
+;; POSIX: the NAME decides, and an attribute word is not consulted even if one
+;; were somehow available.
+(hid "posix dot file is hidden"        #f #f ".dot.clj"  #t)
+(hid "posix plain file is not"         #f #f "plain.clj" #f)
+(hid "posix bare dot-name is hidden"   #f #f "."         #t)
+(hid "posix empty name is not hidden"  #f #f ""          #f)
+(hid "posix ignores the attribute"     #f HIDDEN "plain.clj" #f)
+
+;; Windows: the ATTRIBUTE decides, and the name is not consulted at all.
+(hid "win dot file without the attribute is visible" #t ARCHIVE ".dot.clj"  #f)
+(hid "win plain file with the attribute is hidden"   #t (bitwise-ior ARCHIVE HIDDEN) "attr.clj" #t)
+(hid "win plain file without it is visible"          #t ARCHIVE "plain.clj" #f)
+(hid "win dot file WITH the attribute is hidden"     #t HIDDEN  ".dot.clj"  #t)
+;; no directory exception on either side — Files.isHidden of a hidden directory
+;; is true on Windows, and WindowsFileAttributes.isHidden is the bare bit test
+(hid "win hidden directory is hidden"  #t (bitwise-ior DIR HIDDEN) "sub" #t)
+(hid "win plain directory is not"      #t DIR "sub" #f)
+;; an unreadable path answers "not hidden" rather than raising, which is what a
+;; failed GetFileAttributesW (INVALID_FILE_ATTRIBUTES) reaches this as
+(hid "win unreadable path is not hidden" #t #f "gone.clj" #f)
+
 (if (> fails 0)
     (begin (printf "WIN-PATH FAILURES: ~a of ~a\n" fails total) (exit 1))
     (printf "WIN-PATH OK (~a checks)\n" total))
