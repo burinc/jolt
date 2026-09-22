@@ -1,22 +1,57 @@
 ;; java.net.Socket / ServerSocket / InetSocketAddress for Jolt via jolt.ffi.
-;; POSIX sockets + jolt.host/tagged-table + ref-put!/ref-get for state.
+;; C sockets — POSIX, and ws2_32 on Windows — plus jolt.host/tagged-table and
+;; ref-put!/ref-get for state.
 ;;
 ;; Usage: (require 'jolt.socket)  ;; registers classes globally
 
 (ns jolt.socket
-  "POSIX socket support. Registers Socket, ServerSocket, InetSocketAddress,
-  InetAddress and the socket stream classes with the host class registry.
+  "Socket support over the host's C sockets — POSIX, and Winsock on Windows.
+  Registers Socket, ServerSocket, InetSocketAddress, InetAddress and the socket
+  stream classes with the host class registry.
 
   Deliberate divergences from the JVM (test/conformance/known-divergences.edn):
   a recv error reads as EOF (-1) rather than throwing, .connect ignores its
   timeout argument (always blocking), and toString formats are approximate.
-  IPv4 only."
+  IPv4 only.
+
+  On Windows, additionally: sockets are blocking, because the readiness poller is
+  kqueue/epoll and there is none there — so a fiber blocked on a socket holds its
+  carrier rather than parking, which is a jolt superset java.net never promised —
+  and NetworkInterface enumerates nothing, for want of a GetAdaptersAddresses
+  walk. Both are recorded entries; InetAddress and the sockets themselves work
+  (jolt-lang/jolt#1107)."
   (:require [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]
+            [jolt.winsock :as winsock]
             [clojure.string :as str]))
 
+;; -- platform ----------------------------------------------------------------
+;; macOS carries BSD constants and a sin_len-led sockaddr; Linux has a 16-bit
+;; sin_family and needs MSG_NOSIGNAL on send — without it a write to a
+;; peer-closed socket raises SIGPIPE and kills the process (macOS suppresses
+;; the signal per-fd via the SO_NOSIGPIPE socket option instead).
+;;
+;; Windows is the third platform, and it sides with BSD on almost everything that
+;; is a number here: Winsock grew out of the BSD API, so SOL_SOCKET is 0xffff,
+;; SO_REUSEADDR is 4 and FIONREAD is the BSD _IOR encoding. It is NOT BSD about
+;; the sockaddr (no sin_len — the 16-bit sin_family is Linux's shape) and it has
+;; no MSG_NOSIGNAL at all, because it has no SIGPIPE to suppress; passing Linux's
+;; 0x4000 there is an unknown flag and send() fails with it. Every one of these
+;; was answered with the Linux value before, which is a large part of why no
+;; java.net socket worked on Windows (jolt-lang/jolt#1107).
+(def ^:private os-name
+  (str/lower-case (or (System/getProperty "os.name") "")))
+(def ^:private macos?   (str/includes? os-name "mac"))
+(def ^:private windows? (str/includes? os-name "win"))
+
 ;; -- FFI --------------------------------------------------------------------
+;; The library that provides the socket symbols, loaded before the bindings
+;; below. POSIX: the running process's own libc. Windows: ws2_32, which has to be
+;; asked for by name — its symbols are not in jolt.exe's export table even though
+;; it is linked in (jolt.winsock says more).
 (ffi/load-library)
+(when windows? (ffi/load-library ["ws2_32.dll" "ws2_32"]))
+
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)
 
@@ -29,35 +64,72 @@
   {:blocking true :capture-native-error true})
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
-(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t
-  {:blocking true :capture-native-error true})
-(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t
-  {:blocking true :capture-native-error true})
-(ffi/defcfn c-close       "close"       [:int] :int)
-;; ioctl is (int fd, unsigned long request, ...) — the :varargs marker puts the
-;; third argument where the callee's va_list reads it. Binding it fixed-arity
-;; instead is what makes Apple arm64 return SUCCESS with the out-parameter
-;; untouched, since variadic arguments travel on the stack there.
-(ffi/defcfn c-ioctl       "ioctl"       [:int :ulong :varargs :pointer] :int)
 (ffi/defcfn c-inet-addr   "inet_addr"   [:pointer] :uint)
 (ffi/defcfn c-gethostbyname "gethostbyname" [:pointer] :pointer :blocking)
 (ffi/defcfn c-gethostname  "gethostname"  [:pointer :size_t] :int)
-(ffi/defcfn c-getifaddrs   "getifaddrs"   [:pointer] :int)
-(ffi/defcfn c-freeifaddrs  "freeifaddrs"  [:pointer] :void)
 (ffi/defcfn c-getnameinfo  "getnameinfo"
   [:pointer :uint :pointer :uint :pointer :uint :int] :int :blocking)
 
-;; macOS carries BSD constants and a sin_len-led sockaddr; Linux has a 16-bit
-;; sin_family and needs MSG_NOSIGNAL on send — without it a write to a
-;; peer-closed socket raises SIGPIPE and kills the process (macOS suppresses
-;; the signal per-fd via the SO_NOSIGPIPE socket option instead).
-(def ^:private macos?
-  (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac"))
-(def ^:private sol-socket   (if macos? 0xffff 1))
-(def ^:private so-reuse     (if macos? 4 2))
+;; The rest differ by platform in signature, not only in value, so they live in
+;; the taken branch — a symbol that exists on one OS only (closesocket on
+;; Windows, getifaddrs on POSIX) can be bound nowhere else. jolt interns the vars
+;; from both branches at analysis time, so the references below resolve either
+;; way; this is the arrangement jolt.nrepl already uses.
+(if windows?
+  (do
+    ;; Winsock's recv/send take an int length and return int, not ssize_t; a
+    ;; socket is closed with closesocket, not close; and the ioctl is
+    ;; ioctlsocket, which is fixed-arity rather than variadic.
+    (ffi/defcfn c-recv  "recv" [:int :pointer :int :int] :int
+      {:blocking true :capture-native-error true})
+    (ffi/defcfn c-send  "send" [:int :pointer :int :int] :int
+      {:blocking true :capture-native-error true})
+    (ffi/defcfn c-close "closesocket" [:int] :int)
+    (ffi/defcfn c-ioctl "ioctlsocket" [:int :int :pointer] :int))
+  (do
+    (ffi/defcfn c-recv  "recv" [:int :pointer :size_t :int] :ssize_t
+      {:blocking true :capture-native-error true})
+    (ffi/defcfn c-send  "send" [:int :pointer :size_t :int] :ssize_t
+      {:blocking true :capture-native-error true})
+    (ffi/defcfn c-close "close" [:int] :int)
+    ;; ioctl is (int fd, unsigned long request, ...) — the :varargs marker puts the
+    ;; third argument where the callee's va_list reads it. Binding it fixed-arity
+    ;; instead is what makes Apple arm64 return SUCCESS with the out-parameter
+    ;; untouched, since variadic arguments travel on the stack there.
+    (ffi/defcfn c-ioctl "ioctl" [:int :ulong :varargs :pointer] :int)
+    ;; The interface table. Windows has no getifaddrs — see ifaddr-entries.
+    (ffi/defcfn c-getifaddrs  "getifaddrs"  [:pointer] :int)
+    (ffi/defcfn c-freeifaddrs "freeifaddrs" [:pointer] :void)))
+
+(defn sock-consts-for
+  "The four socket numbers that differ by platform, as a map. A function of the
+  platform rather than four reads of this host's, so the Windows row — which no
+  CI runner here can observe — is pinned from a POSIX one (test/chez/unit.edn).
+  Every one of them answered Linux's value on Windows before jolt-lang/jolt#1107.
+
+    :sol-socket   SOL_SOCKET. BSD (and Winsock, which grew out of it) put the
+                  socket level at 0xffff; Linux numbers it 1.
+    :so-reuse     SO_REUSEADDR at that level: 4 on BSD/Windows, 2 on Linux.
+    :msg-nosignal The send flag that suppresses SIGPIPE on a peer-closed socket.
+                  Linux needs it; macOS uses the SO_NOSIGPIPE socket option
+                  instead; Windows has no SIGPIPE to suppress and no such flag,
+                  so passing Linux's 0x4000 there is an unknown flag and send
+                  fails with it. 0 on both.
+    :fionread     The ioctl that reports how many bytes are readable. The BSD
+                  _IOR encoding on macOS and Windows; Linux has its own number."
+  [macos? windows?]
+  (let [bsd? (or macos? windows?)]
+    {:sol-socket   (if bsd? 0xffff 1)
+     :so-reuse     (if bsd? 4 2)
+     :msg-nosignal (if bsd? 0 0x4000)
+     :fionread     (if bsd? 0x4004667F 0x541B)}))
+
+(def ^:private sock-consts (sock-consts-for macos? windows?))
+(def ^:private sol-socket   (:sol-socket sock-consts))
+(def ^:private so-reuse     (:so-reuse sock-consts))
 (def ^:private so-nosigpipe 0x1022)
-(def ^:private msg-nosignal (if macos? 0 0x4000))
-(def ^:private fionread (if macos? 0x4004667F 0x541B))
+(def ^:private msg-nosignal (:msg-nosignal sock-consts))
+(def ^:private fionread     (:fionread sock-consts))
 
 ;; The link-layer address family getifaddrs reports a MAC under, and where the
 ;; MAC sits inside that entry's sockaddr. BSD's sockaddr_dl carries a
@@ -74,6 +146,7 @@
   ;; sin_addr (network byte order) for a numeric IP or hostname (IPv4 only).
   ;; string->ptr NUL-terminates — a bare alloc+write-array leaves the
   ;; terminator to whatever malloc hands back.
+  (winsock/ensure!)
   (let [hp (ffi/string->ptr (str host))]
     (try
       (let [addr (c-inet-addr hp)]
@@ -137,10 +210,19 @@
   ;; accepted fds don't reliably inherit socket options — set SO_NOSIGPIPE
   ;; explicitly on every fd we hand out, and O_NONBLOCK so the R8 readiness
   ;; interception can park a fiber instead of pinning its carrier.
+  ;;
+  ;; nonblock! is a no-op on Windows, deliberately: there is no readiness poller
+  ;; there (jolt.io-poller is kqueue/epoll), so a non-blocking socket would answer
+  ;; WSAEWOULDBLOCK with nothing able to wait for it. Blocking sockets are also
+  ;; what the JVM's own java.net.Socket is — the non-blocking fd plus the poller
+  ;; is jolt's fiber extension over it, not the java.net contract — so this is a
+  ;; missing jolt superset on Windows, not a missing java.net behaviour. Recorded
+  ;; in test/conformance/known-divergences.edn (jolt-lang/jolt#1107).
   (when macos? (set-opt-1! fd so-nosigpipe))
   (poller/nonblock! fd))
 
 (defn- new-fd! []
+  (winsock/ensure!)
   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
     (when (neg? fd) (throw (java.io.IOException. "socket() failed")))
     (set-opt-1! fd so-reuse)
@@ -594,10 +676,7 @@
         ;; an all-zero address is what an interface with no hardware reports.
         (when (some pos? bs) (byte-array bs))))))
 
-(defn- ifaddr-entries
-  "One map per getifaddrs entry: {:name :ip :mac}. The list is freed before
-  returning, so everything needed is read out here."
-  []
+(defn- ifaddr-entries* []
   (let [pp (ffi/alloc (ffi/sizeof :pointer))]
     (try
       (ffi/write pp :pointer ffi/null)
@@ -618,7 +697,24 @@
           (finally (c-freeifaddrs head))))
       (finally (ffi/free pp)))))
 
+(defn- ifaddr-entries
+  "One map per getifaddrs entry: {:name :ip :mac}. The list is freed before
+  returning, so everything needed is read out here.
+
+  Empty on Windows, which has no getifaddrs — enumerating adapters there means
+  GetAdaptersAddresses and a walk of the IP_ADAPTER_ADDRESSES chain, which is not
+  written here. What used to happen instead was worse than an empty list: the
+  binding did not resolve and every caller died with `foreign-procedure: no entry
+  for \"getifaddrs\"`, including InetAddress/getLocalHost, which only wanted this
+  as a fallback (jolt-lang/jolt#1107). getLocalHost answers from gethostname plus
+  the resolver, which is the primary path on every platform and the one the JDK's
+  own Windows getLocalHost uses; NetworkInterface enumerates nothing there,
+  recorded in test/conformance/known-divergences.edn."
+  []
+  (if windows? [] (ifaddr-entries*)))
+
 (defn- local-hostname []
+  (winsock/ensure!)
   (let [n 256 buf (ffi/alloc n)]
     (try
       (ffi/write buf :uint8 0)
@@ -691,6 +787,7 @@
   NULL-terminated array of pointers at offset 24 of struct hostent) carries them
   all; a numeric literal resolves to itself without a lookup."
   [host]
+  (winsock/ensure!)
   (let [hp (ffi/string->ptr (str host))]
     (try
       (let [numeric (c-inet-addr hp)]

@@ -987,6 +987,42 @@
   ;; where bb answers "sub\\x.clj", and fs/relativize "../x" where bb answers
   ;; "..\\x" — so code comparing path STRINGS across the two needs an explicit
   ;; normalization rule.
+  ;; java.net.NetworkInterface enumerates the interface table through getifaddrs(3),
+  ;; which Windows does not have — the equivalent there is GetAdaptersAddresses and
+  ;; a walk of the IP_ADAPTER_ADDRESSES chain, which jolt does not do. Until
+  ;; jolt-lang/jolt#1107 this was not an empty answer but a hard failure: the
+  ;; binding did not resolve and the call died with `foreign-procedure: no entry
+  ;; for "getifaddrs"`, which also took InetAddress/getLocalHost down with it,
+  ;; since that only wanted the interface table as a fallback. getLocalHost now
+  ;; answers from gethostname plus the resolver on every platform — the path the
+  ;; JDK's own Windows getLocalHost takes — and the enumeration answers nothing.
+  {:category :host-model
+   :behavior "java.net.NetworkInterface/getNetworkInterfaces, getByName and getByInetAddress ON WINDOWS"
+   :jvm "the machine's adapters, with their addresses and hardware addresses"
+   :jolt "an empty enumeration; getByName and getByInetAddress answer nil"
+   :check :prose
+   :why "Windows-only; the gate runs on whichever host invoked it"
+   :note "POSIX is unaffected and enumerates through getifaddrs as before. InetAddress/getLocalHost and getByName DO work on Windows — they go through gethostname and the resolver, not the interface table. Code that needs a Windows adapter list has no answer here yet; the fix is a GetAdaptersAddresses walk."}
+  ;; A socket on jolt is set O_NONBLOCK so a fiber that would block can park on
+  ;; jolt.io-poller instead of pinning its carrier (fibers R8). That poller is
+  ;; kqueue or epoll, and Windows has neither: WSAPoll is a stateless poll rather
+  ;; than a kernel-held registration set, and its own wake channel would have to
+  ;; be a loopback socket pair, since it accepts only sockets. So sockets stay
+  ;; BLOCKING on Windows (jolt-lang/jolt#1107).
+  ;;
+  ;; Worth being precise about which direction this diverges in: blocking is what
+  ;; java.net.Socket IS on the JVM — the non-blocking descriptor and the readiness
+  ;; poller are jolt's fiber extension OVER java.net, not part of its contract.
+  ;; What Windows is missing is therefore a jolt superset, not a java.net
+  ;; behaviour, and the visible consequence is throughput under fibers rather than
+  ;; a different answer from any java.net call.
+  {:category :host-model
+   :behavior "a fiber blocked on a java.net socket read or write ON WINDOWS"
+   :jvm "n/a — the JVM has no fibers over java.net.Socket; a virtual thread unmounts because the JDK's own socket implementation is non-blocking underneath"
+   :jolt "the fiber's carrier thread blocks in recv/send; the fibers queued behind it wait"
+   :check :prose
+   :why "Windows-only; the gate runs on whichever host invoked it"
+   :note "POSIX is unaffected — kqueue/epoll park the fiber as before. Every java.net call answers the same value on Windows; only the concurrency of a fiber pool changes. jolt.io-poller/nonblock! is the no-op that makes this deliberate rather than a broken non-blocking socket with nothing able to wait for it."}
   {:category :host-model
    :behavior "(System/getProperty \"line.separator\") / \"file.separator\", java.io.File/separator and separatorChar, the string File and java.nio.file.Path render, and clojure.core/system-newline, ON WINDOWS"
    :jvm "\"\\r\\n\" and \"\\\\\"; paths render \"sub\\\\deep.clj\" — the platform's own conventions"

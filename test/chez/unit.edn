@@ -927,6 +927,21 @@
   {:suite "files-hidden" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-hidden-test/.dotdir\")] (.mkdirs (java.io.File. d)) (java.nio.file.Files/isHidden (java.nio.file.Paths/get d (make-array String 0))))" :expected "true"}
   ;; a path that does not exist answers false rather than raising
   {:suite "files-hidden" :expr "(java.nio.file.Files/isHidden (java.nio.file.Paths/get \"no-such-file-here.txt\" (make-array String 0)))" :expected "false"}
+  ;; jolt.winsock is the one WSAStartup, shared by jolt.socket, jolt.nrepl and
+  ;; jolt.mvn-http — which used to carry two private copies between them and
+  ;; leave the socket shim with none, so every java.net socket failed on Windows
+  ;; while Maven resolution and nREPL worked (jolt-lang/jolt#1107). Off Windows it
+  ;; is a no-op that still answers, so every caller can say it on the way in.
+  {:suite "winsock" :expr "(do (require (quote jolt.winsock)) (jolt.winsock/ensure!))" :expected "true"}
+  {:suite "winsock" :expr "(do (require (quote jolt.winsock)) [(jolt.winsock/ensure!) (jolt.winsock/ensure!)])" :expected "[true true]"}
+  ;; The four socket numbers that differ by platform. Every one of them answered
+  ;; Linux's value on Windows, which is the other half of why no socket worked
+  ;; there — Winsock is BSD-shaped for all four, and MSG_NOSIGNAL in particular is
+  ;; not merely unnecessary there but an unknown flag that fails the send. A
+  ;; function of the platform, so the Windows row is pinned from this runner.
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for false true))" :expected "{:sol-socket 65535, :so-reuse 4, :msg-nosignal 0, :fionread 1074030207}"}
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for true false))" :expected "{:sol-socket 65535, :so-reuse 4, :msg-nosignal 0, :fionread 1074030207}"}
+  {:suite "winsock" :expr "(do (require (quote jolt.socket)) (jolt.socket/sock-consts-for false false))" :expected "{:sol-socket 1, :so-reuse 2, :msg-nosignal 16384, :fionread 21531}"}
   {:suite "javastatic" :expr "(BigInteger. \"123\")" :expected "123"}
   {:suite "javastatic" :expr "(let [m (HashMap. {:a 1 :b 2})] (.get m :b))" :expected "2"}
   {:suite "javastatic" :expr "(let [m (HashMap. {})] (.put m :x 1) (.put m :y 2) (.size m))" :expected "2"}

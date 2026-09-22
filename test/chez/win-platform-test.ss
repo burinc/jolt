@@ -603,6 +603,93 @@
 (ok "no Win32 entry resolves on a POSIX host" (not (proc-win-spawn-ok?)))
 (ok "proc-win? is false on a POSIX host" (not proc-win?))
 
+;; --- a LIVE spawn, on whichever host is running -------------------------------
+;; Everything above is a table. This is the part that would actually have caught
+;; jolt-lang/jolt#1108: it starts a real child through the real ProcessBuilder, so
+;; on the Windows runner it drives CreateProcessW end to end, and on a POSIX one
+;; it drives posix_spawn. The failure it is written against is the one the issue
+;; describes — a spawn that "succeeds" with exit 0 and an empty stdout — which no
+;; assertion on the exit code alone can see.
+;;
+;; The windows-deps job runs `make winplatform` for exactly this reason: before
+;; it, that job ran only `make depsunit mvnhttp`, and jolt.mvn-http initializes
+;; its own Winsock and spawns nothing, so the broken paths were never touched.
+
+(define (pdispatch o m . args)
+  (record-method-dispatch o m (if (null? args) jolt-nil (apply jolt-list args))))
+
+;; The child's whole stdout (or stderr) as a string, read to EOF.
+(define (drain-stream is)
+  (let loop ((acc '()))
+    (let ((b (jnum->exact (pdispatch is "read"))))
+      (if (< b 0)
+          (utf8->string (u8-list->bytevector (reverse acc)))
+          (loop (cons b acc))))))
+
+;; Windows line endings are the shell's, not the test's.
+(define (strip-cr s)
+  (list->string (filter (lambda (c) (not (char=? c #\return))) (string->list s))))
+
+;; -> (values stdout stderr exit-code)
+(define (run-child argv)
+  (let* ((pb (host-new "ProcessBuilder" (apply jolt-vector argv)))
+         (p  (pdispatch pb "start"))
+         (o  (drain-stream (pdispatch p "getInputStream")))
+         (e  (drain-stream (pdispatch p "getErrorStream")))
+         (rc (jnum->exact (pdispatch p "waitFor"))))
+    (values (strip-cr o) (strip-cr e) rc)))
+
+(define live-windows? (eq? (sa-os-family) 'windows))
+
+;; One trivial program per platform. cmd.exe is the Windows one precisely because
+;; it is what the old sh string was being handed to — `cmd /c echo ok` printed
+;; nothing at all and exited 0 before the CreateProcessW path.
+(define echo-argv    (if live-windows? '("cmd" "/c" "echo" "ok")        '("/bin/sh" "-c" "echo ok")))
+(define stderr-argv  (if live-windows? '("cmd" "/c" "echo" "err" "1>&2") '("/bin/sh" "-c" "echo err 1>&2")))
+(define exit3-argv   (if live-windows? '("cmd" "/c" "exit" "3")          '("/bin/sh" "-c" "exit 3")))
+;; An argument holding a space must arrive as ONE argument. On Windows the
+;; command-line builder quotes it, so cmd's echo prints the quotes back —
+;; which is the observable difference from it having been split into two.
+(define spaced-argv  (if live-windows? '("cmd" "/c" "echo" "a b")        '("/bin/sh" "-c" "echo $#" "sh" "a b")))
+(define spaced-want  (if live-windows? "\"a b\"\n" "1\n"))
+
+(call-with-values (lambda () (run-child echo-argv))
+  (lambda (o e rc)
+    ;; the whole bug in one row: stdout was empty and the status said success
+    (same "live spawn: stdout"    o "ok\n")
+    (same "live spawn: stderr"    e "")
+    (same "live spawn: exit code" rc 0)))
+
+(call-with-values (lambda () (run-child stderr-argv))
+  (lambda (o e rc)
+    (same "live spawn: stderr is its own stream" e "err\n")
+    (same "live spawn: stdout stays empty"       o "")
+    (same "live spawn: exit code with stderr"    rc 0)))
+
+(call-with-values (lambda () (run-child exit3-argv))
+  (lambda (o e rc)
+    (same "live spawn: a nonzero exit is reported" rc 3)))
+
+(call-with-values (lambda () (run-child spaced-argv))
+  (lambda (o e rc)
+    (same "live spawn: an argument with a space stays one argument" o spaced-want)))
+
+;; Two in a row: the child's pipe ends have to be closed on this side after each
+;; spawn, or the second child inherits the first's and neither read ever reaches
+;; EOF — which would hang here rather than fail.
+(call-with-values (lambda () (run-child echo-argv))
+  (lambda (o e rc)
+    (same "live spawn: a second child is independent" o "ok\n")
+    (same "live spawn: ...and exits cleanly"          rc 0)))
+
+;; A program that cannot be resolved is refused before any spawn, with the
+;; JVM's message — this is #1074's guarantee, re-checked live because the
+;; Windows resolver (PATHEXT, drive-rooted paths) only runs on that host.
+(ok "live spawn: an unresolvable program raises"
+    (guard (e (#t #t))
+      (run-child '("jolt-no-such-program-anywhere"))
+      #f))
+
 (if (> fails 0)
     (begin (printf "WIN-PLATFORM FAILURES: ~a of ~a\n" fails total) (exit 1))
     (printf "WIN-PLATFORM OK (~a checks)\n" total))
