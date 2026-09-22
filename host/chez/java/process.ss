@@ -1341,15 +1341,29 @@
 ;; variables and no others, which is the semantics the sh prefix was reaching for.
 ;; ROOT is the parent's SystemRoot (or #f), passed in rather than read here so
 ;; the block is a pure function of its arguments.
-(define (proc-win-name<? a b)
-  (let ((la (string-downcase a)) (lb (string-downcase b)))
-    (string<? la lb)))
+;;
+;; The order is ProcessEnvironment.NameComparator's, not a lower-cased string<?:
+;; Windows canonicalizes names to UPPER case, so a character that sits between
+;; the two cases — `_ [ \ ] ^` — sorts after Z, not before a (_JAVA_OPTIONS goes
+;; last). Per character and only where the two differ, as the JDK compares.
+(define (proc-win-name-compare a b)
+  (let ((n1 (string-length a)) (n2 (string-length b)))
+    (let loop ((i 0))
+      (if (= i (min n1 n2))
+          (- n1 n2)
+          (let ((c1 (string-ref a i)) (c2 (string-ref b i)))
+            (if (char=? c1 c2)
+                (loop (+ i 1))
+                (let ((u1 (char->integer (char-upcase c1)))
+                      (u2 (char->integer (char-upcase c2))))
+                  (if (= u1 u2) (loop (+ i 1)) (- u1 u2)))))))))
+(define (proc-win-name<? a b) (< (proc-win-name-compare a b) 0))
 
 (define (proc-win-env-entries pairs root)
   (let* ((sorted (list-sort (lambda (x y) (proc-win-name<? (car x) (car y))) pairs))
          (has-root? (let loop ((ps sorted))
                       (cond ((null? ps) #f)
-                            ((string-ci=? (caar ps) "SystemRoot") #t)
+                            ((= 0 (proc-win-name-compare (caar ps) "SystemRoot")) #t)
                             (else (loop (cdr ps))))))
          (all (if (and (not has-root?) root (> (string-length root) 0))
                   (list-sort (lambda (x y) (proc-win-name<? (car x) (car y)))
