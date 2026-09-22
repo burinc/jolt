@@ -21,9 +21,13 @@
 (load "host/chez/dce.ss")
 
 ;; --- shell helpers ----------------------------------------------------------
+;; Every spawn here goes through jolt-with-empty-sigmask, for the reason jolt-sh
+;; gives (loader.ss): the shutdown signals are blocked on this thread, and a cc
+;; started under bash would otherwise outlive a ^C'd build.
+;;
 ;; Run a command, return its stdout as one trimmed string ("" on no output).
 (define (bld-sh-capture cmd)
-  (let* ((p (process (bld-sh-wrap cmd))) (in (car p)))
+  (let* ((p (jolt-with-empty-sigmask (lambda () (process (bld-sh-wrap cmd))))) (in (car p)))
     (let loop ((acc '()))
       (let ((l (get-line in)))
         (if (eof-object? l)
@@ -37,7 +41,7 @@
             (loop (cons l acc)))))))
 
 (define (bld-system cmd)
-  (let ((rc (system (bld-sh-wrap cmd))))
+  (let ((rc (jolt-with-empty-sigmask (lambda () (system (bld-sh-wrap cmd))))))
     (unless (zero? rc)
       (bld-command-failed rc cmd))))
 
@@ -50,7 +54,8 @@
 ;; caller shows the log itself — bld-echo-log, on every path, or a warning the
 ;; compiler emitted on a command that then succeeded would be swallowed.
 (define (bld-system->log cmd log)
-  (system (bld-sh-wrap (string-append cmd " > '" log "' 2>&1"))))
+  (jolt-with-empty-sigmask
+    (lambda () (system (bld-sh-wrap (string-append cmd " > '" log "' 2>&1"))))))
 
 (define (bld-log-string log)
   (if (not (file-exists? log))
