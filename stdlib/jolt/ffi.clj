@@ -144,11 +144,18 @@
 
   The memory/library primitives (read/write/sizeof/load-library/ptr->string/
   string->ptr/null/null?) are host-provided, as are the buffer moves:
-  read-bytes/write-bytes decode and encode UTF-8, read-array/write-array move
-  raw octets to and from a byte-array, and read-into! fills a slice of an
+  read-bytes decodes UTF-8 and write-bytes encodes it, read-array/write-array
+  move raw octets to and from a byte-array, and read-into! fills a slice of an
   EXISTING byte-array — so a caller reading a stream whose length it already
   knows fills one buffer instead of regrowing an accumulator per chunk. All of
   them move the block in one copy, not a byte at a time.
+
+  write-bytes takes a byte-array too, and then writes its octets exactly rather
+  than encoding anything — the same block move write-array makes. Its `str`
+  coercion below is for VALUES, and a byte-array is not one: rendering it would
+  write the characters of \"#object[[B]\" and lose the bytes with nothing raised
+  at any layer. read-bytes has no such case, since decoding is the whole of what
+  it does; read-array is the half that reads data back unharmed.
 
   Those four COPY. byte-buffer does not: it answers a direct
   java.nio.ByteBuffer sharing the pointer's bytes, so a decoder that speaks
@@ -275,9 +282,10 @@
   call, where an ftype the binding declared is not available.")
 
 ;; The primitives this namespace is built over are the host's, reached by their
-;; reserved __ names: alloc, read, write, sizeof, string->ptr, copy, read-array
-;; and write-array are all DEFINED here, over the host functions of the same
-;; name, so each needs a name its own definition has not taken.
+;; reserved __ names: alloc, read, write, sizeof, string->ptr, copy, read-array,
+;; write-array, read-bytes and write-bytes are all DEFINED here, over the host
+;; functions of the same name, so each needs a name its own definition has not
+;; taken.
 ;;
 ;; They are called rather than captured into locals. A jolt host with no FFI
 ;; layer has none of them, and a top-level capture would then fail to LOAD this
@@ -1228,6 +1236,46 @@
    (if (keyword? a)
      (write-array-typed p a b c)
      (jolt.ffi/__write-array p a b c))))
+
+(defn read-bytes
+  "Decode n octets at pointer p as a string; answers that string.
+
+      (read-bytes p n)             ; n octets -> a String
+
+  The decode is UTF-8, falling back to latin1 for a sequence that is not valid
+  UTF-8, so any n octets answer a string rather than raising. That fallback is
+  LOSSY for data that is not text. When the bytes are data, read-array answers a
+  byte-array and decodes nothing.
+
+  n frames the read in OCTETS, not characters, so a string whose encoding is
+  longer than its character count reads back with the count write-bytes
+  returned, not with (count s)."
+  [p n]
+  (jolt.ffi/__read-bytes p n))
+
+(defn write-bytes
+  "Copy a value's bytes into foreign memory; answers the octet count.
+
+      (write-bytes p \"hi\")                    ; a string's UTF-8 octets
+      (write-bytes p (byte-array [104 105]))  ; a byte-array's octets, exactly
+
+  A BYTE-ARRAY writes its own octets, byte for byte, the way write-array does:
+  0x00 and 0xff included, nothing decoded on the way, no interpretation of what
+  the bytes mean. read-array reads them back unchanged; read-bytes would have to
+  decode them, so it is the wrong half of the pair for data.
+
+  ANYTHING ELSE is rendered by `str` first and that text's UTF-8 octets written,
+  so a number or a keyword writes what you would print. nil is rejected rather
+  than rendered as \"\": the destination is the caller's own buffer, so absence
+  has no NULL to mean it with, and writing 0 octets is the answer \"\" already
+  has.
+
+  Neither path writes a NUL terminator. For a NUL-terminated C string, use
+  string->ptr."
+  [p v]
+  (if (bytes? v)
+    (jolt.ffi/__write-array p v)
+    (jolt.ffi/__write-bytes p v)))
 
 (defn byte-buffer
   "A java.nio.ByteBuffer view of `len` bytes at pointer p — a byte count, a type
