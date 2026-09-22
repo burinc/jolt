@@ -683,8 +683,7 @@
                       (and ref (var-cell-lookup (car ref) (cdr ref))))
                     ;; the implicit clojure.core refer — blocked by a :refer-clojure
                     ;; exclusion or an ns-unmap tombstone
-                    (and (chez-core-visible? cns nm)
-                         (var-cell-lookup "clojure.core" nm))))))
+                    (chez-core-refer-cell cns nm)))))
     (if (and c (var-cell-defined? c)) c jolt-nil)))
 ;; (resolve sym) resolves globally; (resolve &env sym) additionally answers nil
 ;; when sym names a local in env (the &env map's keys) — a macro's resolve avoids
@@ -726,8 +725,7 @@
                 (or (var-cell-lookup cns nm)
                     (let ((ref (chez-resolve-refer cns nm)))
                       (and ref (var-cell-lookup (car ref) (cdr ref))))
-                    (and (chez-core-visible? cns nm)
-                         (var-cell-lookup "clojure.core" nm))))))
+                    (chez-core-refer-cell cns nm)))))
     (if (and c (var-cell-defined? c)) c jolt-nil)))
 
 ;; remove-ns: drop the namespace from the registry AND its vars, so find-ns
@@ -837,34 +835,53 @@
 ;; On the JVM each refer-clojure call ADDS the core mappings its filter lets
 ;; through and removes none, so a name stays unmapped only while EVERY call the ns
 ;; has seen withheld it: `(ns x)` then `(refer-clojure :exclude '[inc])` leaves inc
-;; mapped, the ns macro's default (refer-clojure) having mapped it already. So a
-;; ns's entry is one clause per call — (exclude-set . only-set-or-#f) — and a name
-;; is excluded when all of them exclude it. A call that withholds nothing makes
-;; every later one moot, so it collapses the entry to 'all. A ns no refer-clojure
-;; ever ran in (a bare in-ns) has no entry and sees all of core — permissive where
-;; the JVM would see none of it.
-(define ns-core-exclude-table (make-hashtable equal-hash equal?))  ; cns -> 'all | (clause …)
+;; mapped, the ns macro's default (refer-clojure) having mapped it already. A ns
+;; no refer-clojure ever ran in (a bare in-ns) has no entry and sees all of core —
+;; permissive where the JVM would see none of it.
+;;
+;; What a ns has withheld so far is kept as ONE set, however many calls it has
+;; seen, so re-evaluating an ns form in a REPL does not lengthen every later core
+;; lookup (jolt-09s). A call withholds either a finite set (:exclude E) or all
+;; but a finite set (:only O, less any :exclude: O \ E), and the intersection of
+;; two such is again one of the two:
+;;   excl E1 & excl E2  -> excl (E1 ∩ E2)      excl E & allow A -> excl (E \ A)
+;;   allow A1 & allow A2 -> allow (A1 ∪ A2)
+;; so the entry is (excl . names) or (allow . names), and a lookup one probe.
+(define ns-core-exclude-table (make-hashtable equal-hash equal?))  ; cns -> (excl|allow . names)
 (define (name-set names)
   (let ((h (make-hashtable string-hash string=?)))
     (for-each (lambda (n) (hashtable-set! h n #t)) names)
     h))
+(define (name-set-filter keep? h)
+  (let ((r (make-hashtable string-hash string=?)))
+    (vector-for-each (lambda (n) (when (keep? n) (hashtable-set! r n #t)))
+                     (hashtable-keys h))
+    r))
+(define (core-withheld-meet a b)
+  (let ((ka (car a)) (sa (cdr a)) (kb (car b)) (sb (cdr b)))
+    (cond ((and (eq? ka 'excl) (eq? kb 'excl))
+           (cons 'excl (name-set-filter (lambda (n) (hashtable-ref sb n #f)) sa)))
+          ((eq? ka 'excl)
+           (cons 'excl (name-set-filter (lambda (n) (not (hashtable-ref sb n #f))) sa)))
+          ((eq? kb 'excl) (core-withheld-meet b a))
+          (else (let ((u (name-set-filter (lambda (n) #t) sa)))
+                  (vector-for-each (lambda (n) (hashtable-set! u n #t)) (hashtable-keys sb))
+                  (cons 'allow u))))))
 ;; excl: the :exclude names; only: the :only names, or #f when :only is absent
 (define (chez-register-core-refer! cns excl only)
-  (jolt-with-mutex ns-map-mu
-    (let ((cur (hashtable-ref ns-core-exclude-table cns #f)))
-      (unless (eq? cur 'all)
+  (let ((clause (if only
+                    (cons 'allow (name-set (filter (lambda (n) (not (member n excl))) only)))
+                    (cons 'excl (name-set excl)))))
+    (jolt-with-mutex ns-map-mu
+      (let ((cur (hashtable-ref ns-core-exclude-table cns #f)))
         (hashtable-set! ns-core-exclude-table cns
-          (if (and (null? excl) (not only))
-              'all
-              (cons (cons (name-set excl) (and only (name-set only)))
-                    (or cur '()))))))))
-(define (core-clause-excludes? c name)
-  (or (and (hashtable-ref (car c) name #f) #t)
-      (and (cdr c) (not (hashtable-ref (cdr c) name #f)))))
+          (if cur (core-withheld-meet cur clause) clause))))))
 (define (chez-core-excluded? cns name)
   (let ((cur (hashtable-ref ns-core-exclude-table cns #f)))
-    (and (pair? cur)
-         (for-all (lambda (c) (core-clause-excludes? c name)) cur))))
+    (and cur
+         (if (eq? (car cur) 'excl)
+             (and (hashtable-ref (cdr cur) name #f) #t)
+             (not (hashtable-ref (cdr cur) name #f))))))
 ;; The implicit clojure.core refer of `name` in `cns`: blocked by a
 ;; :refer-clojure exclusion or an ns-unmap tombstone. The one test the compiler
 ;; (host-contract.ss hc-resolve-cell), resolve, ns-resolve and ns-refers share.
@@ -875,6 +892,16 @@
   (or (string=? name "ns") (string=? name "in-ns")
       (and (not (chez-core-excluded? cns name))
            (not (eq? (hashtable-ref ns-refer-table (cons cns name) #f) 'unmapped)))))
+;; The var the implicit clojure.core refer maps NM to in CNS, or #f. Only a
+;; PUBLIC var: the JVM's refer copies clojure.core's publics into the namespace,
+;; so a private core name (strip-ns, lift-ns) is simply unmapped elsewhere and a
+;; bare use is "Unable to resolve symbol", not "is not public" (jolt-zv0).
+;; clojure.core itself resolves its privates through its own interns, which
+;; every caller consults first.
+(define (chez-core-refer-cell cns nm)
+  (and (chez-core-visible? cns nm)
+       (let ((c (var-cell-lookup "clojure.core" nm)))
+         (and c (not (var-private? c)) c))))
 ;; refer-clojure is a MACRO here (marked below) whose expander is this fn, so
 ;; args arrive UNEVALUATED: a top-level (:exclude [names]) is raw, while the ns
 ;; macro emits quoted args ((quote :exclude) (quote [names])) — the JVM shape,
