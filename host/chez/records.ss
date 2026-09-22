@@ -695,6 +695,14 @@
     ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
     (else (jrec-field-pr r))))
 (define (jrec-field-pr r)
+  ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
+  ;; what the JVM's reader resolves a record literal by, and what its own
+  ;; printer writes. jolt's reader takes either spelling (reader.ss).
+  ;; The map part obeys *print-level* / *print-length* like any map — the JVM
+  ;; writes #tag then print-map, so a level past the limit is #tag#.
+  (string-append "#" (jch-munge-segments (jrec-tag r))
+                 (if (jolt-print-hash?) "#" (with-deeper-print (jrec-field-body r)))))
+(define (jrec-field-body r)
   ;; one "k v" string per entry, joined once: the extension map is unbounded
   ;; (any non-field key assoc'd on lands there), and appending each entry to a
   ;; growing accumulator is quadratic in the entry count.
@@ -715,7 +723,4 @@
                       (cons (string-append (jolt-pr-readable (vector-ref fkeys i)) " "
                                            (jolt-pr-readable (jrec-field-ref r i)))
                             acc))))))
-    ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
-    ;; what the JVM's reader resolves a record literal by, and what its own
-    ;; printer writes. jolt's reader takes either spelling (reader.ss).
-    (string-append "#" (jch-munge-segments (jrec-tag r)) "{" (jolt-str-join-comma entry-strs) "}")))
+    (string-append "{" (jolt-str-join-comma (jolt-limited-list-strs entry-strs)) "}")))

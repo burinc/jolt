@@ -239,6 +239,19 @@
   (if (or (pvec? v) (cseq? v) (empty-list-t? v))
       (map symbol-t-name (filter symbol-t? (seq->list v)))
       '()))
+;; clojure.core/refer's check on each name it is asked to refer by name (:only,
+;; :refer [..]): the target must hold a PUBLIC var by that name, else
+;; IllegalAccessError "x is not public" / "x does not exist" — raised before
+;; anything is mapped for that name, as the JVM's refer does (jolt#1095).
+(define (refer-name-check! target nm)
+  (let ((c (var-cell-lookup target nm)))
+    (cond
+      ((not (and c (var-cell-defined? c)))
+       (jolt-throw (jolt-host-throwable "java.lang.IllegalAccessError"
+                                        (string-append nm " does not exist"))))
+      ((var-private? c)
+       (jolt-throw (jolt-host-throwable "java.lang.IllegalAccessError"
+                                        (string-append nm " is not public")))))))
 ;; Register a parsed libspec's :as alias + :refer/:only names under `cns`, with
 ;; the :exclude and :rename that qualify them: load-lib hands refer every one of
 ;; :only/:exclude/:rename, so (require '[a.b :refer [x] :rename {x y}]) binds y
@@ -291,6 +304,9 @@
                    ((or (pvec? v) (cseq? v) (empty-list-t? v))
                     (for-each (lambda (nm)
                                 (unless (member nm excl)
+                                  ;; not in the speculative pre-analysis scan: the
+                                  ;; target may not be loaded yet there
+                                  (when check-alias? (refer-name-check! target nm))
                                   (chez-register-refer! cns (local nm) target nm)))
                               (libspec-names v))))))))
           opts)))))
@@ -790,12 +806,15 @@
                 ((string=? (keyword-t-name k) "exclude") (set! excl (names)))
                 ((string=? (keyword-t-name k) "rename")  (set! rename v))))))
         (loop (cddr a))))
+    (when only
+      (for-each (lambda (nm) (unless (member nm excl) (refer-name-check! target nm))) only))
     ;; the target's own bucket (rt.ss ns-cells-index): a refer walked EVERY
     ;; interned var in the image before, so each (:use ...)/(refer ...) cost
     ;; O(total vars) and a program load O(namespaces x total vars)
     (for-each
       (lambda (c)
-        (when (var-cell-defined? c)
+        ;; publics only, like the JVM's walk over ns-publics
+        (when (and (var-cell-defined? c) (not (var-private? c)))
           (let ((nm (var-cell-name c)))
             (when (and (or (not only) (member nm only)) (not (member nm excl)))
               (let ((renamed (and rename
@@ -880,25 +899,57 @@
   (define (opt-names k v nm)
     (and (keyword? k) (string=? (keyword-t-name k) nm) v
          (filter symbol-t? (seq->list v))))
-  (let loop ((a args) (names '()) (only #f))
+  (let loop ((a args) (names '()) (only #f) (rename #f))
     (cond
      ((or (null? a) (null? (cdr a)))
-      ;; the :only list rides as a second argument, and only when spelled, so
-      ;; an exclude-only form keeps the one-argument call older seeds emit.
+      ;; :only and :rename ride as optional trailing arguments, and only when
+      ;; spelled, so an exclude-only form keeps the one-argument call older
+      ;; seeds emit.
       (apply jolt-list (jolt-symbol "clojure.core" "refer-clojure-register!")
              (quoted (reverse names))
-             (if only (list (quoted only)) '())))
+             (cond (rename (list (if only (quoted only) jolt-nil)
+                                 (jolt-list (jolt-symbol #f "quote") rename)))
+                   (only (list (quoted only)))
+                   (else '()))))
      (else
       (let ((k (rc-unquote (car a))) (v (rc-unquote (cadr a))))
         (cond
-         ((opt-names k v "exclude") => (lambda (ns) (loop (cddr a) (append ns names) only)))
-         ((opt-names k v "only") => (lambda (ns) (loop (cddr a) names (append (or only '()) ns))))
-         (else (loop (cddr a) names only))))))))
-(define (jolt-refer-clojure-register! names . only)
+         ((opt-names k v "exclude") => (lambda (ns) (loop (cddr a) (append ns names) only rename)))
+         ((opt-names k v "only") => (lambda (ns) (loop (cddr a) names (append (or only '()) ns) rename)))
+         ((and (keyword? k) (string=? (keyword-t-name k) "rename") (pmap? v))
+          (loop (cddr a) names only v))
+         (else (loop (cddr a) names only rename))))))))
+;; (refer 'clojure.core :exclude … :only … :rename …), the reference's
+;; refer-clojure. A :rename'd name is withheld under its own name and referred
+;; under the new one; like refer, the :only names are checked, and a :rename
+;; entry whose name is not in the refer set does nothing.
+(define (jolt-refer-clojure-register! names . more)
   (define (names-of xs) (map symbol-t-name (filter symbol-t? (seq->list xs))))
-  (chez-register-core-refer! (chez-current-ns)
-                             (names-of names)
-                             (and (pair? only) (names-of (car only))))
+  (let* ((cns (chez-current-ns))
+         (excl (names-of names))
+         (only (and (pair? more) (not (jolt-nil? (car more))) (names-of (car more))))
+         (rename (and (pair? more) (pair? (cdr more)) (pmap? (cadr more)) (cadr more)))
+         (renames (if rename
+                      (filter (lambda (p) (and (symbol-t? (car p)) (symbol-t? (cdr p))))
+                              (map (lambda (k) (cons k (jolt-get rename k)))
+                                   (seq->list (jolt-keys rename))))
+                      '()))
+         (referred? (lambda (nm) (and (not (member nm excl)) (or (not only) (member nm only))))))
+    (when only
+      (for-each (lambda (nm)
+                  (unless (or (member nm excl) (string=? nm "ns") (string=? nm "in-ns"))
+                    (refer-name-check! "clojure.core" nm)))
+                only))
+    (chez-register-core-refer! cns
+                               (append excl (map (lambda (p) (symbol-t-name (car p))) renames))
+                               only)
+    (for-each (lambda (p)
+                (let ((from (symbol-t-name (car p))))
+                  (when (referred? from)
+                    (let ((c (var-cell-lookup "clojure.core" from)))
+                      (when (and c (var-cell-defined? c) (not (var-private? c)))
+                        (chez-register-refer! cns (symbol-t-name (cdr p)) "clojure.core" from))))))
+              renames))
   jolt-nil)
 
 ;; alter-meta! / reset-meta!: a var's metadata lives in the cell's meta field;

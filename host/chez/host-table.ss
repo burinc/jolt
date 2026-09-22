@@ -250,14 +250,23 @@
 ;; --- printing ----------------------------------------------------------------
 ;; sorted colls render in SORTED order (the value's :seq), not HAMT order; a
 ;; sorted-map prints "{k v, k v}" (", " between pairs) like the pmap arm.
+;; *print-level* and *print-length* apply as to the hash collections (the JVM
+;; prints both through print-sequential): a level past the limit is "#", and at
+;; most *print-length* elements are rendered before "...".
 (define (sorted-map-render sc render)
-  (string-append "{"
-    (jolt-str-join-comma
-      (map (lambda (e) (string-append (render (jolt-nth e 0)) " " (render (jolt-nth e 1))))
-           (seq->list (sc-call sc kw-op-seq))))
-    "}"))
+  (if (jolt-print-hash?) "#"
+      (with-deeper-print
+        (string-append "{"
+          (jolt-str-join-comma
+            (jolt-limited-seq-strs (jolt-seq (sc-call sc kw-op-seq))
+              (lambda (e) (string-append (render (jolt-nth e 0)) " " (render (jolt-nth e 1))))))
+          "}"))))
 (define (sorted-set-render sc render)
-  (string-append "#{" (jolt-str-join (map render (seq->list (sc-call sc kw-op-seq)))) "}"))
+  (if (jolt-print-hash?) "#"
+      (with-deeper-print
+        (string-append "#{"
+          (jolt-str-join (jolt-limited-seq-strs (jolt-seq (sc-call sc kw-op-seq)) render))
+          "}"))))
 (define (sorted-render x render)
   (if (htable-sorted-map? x) (sorted-map-render x render) (sorted-set-render x render)))
 

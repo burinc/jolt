@@ -6,7 +6,8 @@
 ;; Native print is not involved: this ns defines its own print/pr/prn
 ;; that route through (-write *out* ...).
 (ns clojure.pprint
-  (:refer-clojure :exclude [deftype print pr prn]))
+  (:refer-clojure :exclude [deftype print pr prn])
+  (:require [clojure.walk]))
 
 ;;======================================================================
 ;; Macros (must precede their first use)
@@ -63,16 +64,32 @@
                (pop-thread-bindings)))))
          nil)))
 
+(defn- pll-mod-body [var-sym body]
+  (letfn [(inner [form]
+            (if (seq? form)
+              (let [form (macroexpand form)]
+                (condp = (first form)
+                  'loop* form
+                  'recur (concat `(recur (inc ~var-sym)) (rest form))
+                  (clojure.walk/walk inner identity form)))
+              form))]
+    (clojure.walk/walk inner identity body)))
+
+;; The reference's: the loop carries its OWN element count, threaded through every
+;; recur by pll-mod-body. Counting through *current-length* instead could not see
+;; a map's entries — each is a nested logical block that resets it to 0 so both
+;; halves of the pair print — so (binding [*print-length* 2] (pprint {…})) printed
+;; every entry.
 (defmacro print-length-loop
-  "A loop for pretty-printer dispatch functions. Stops after *print-length*
-  items (if set), printing a single \"...\" as an extra element and terminating."
+  "A version of loop that iterates at most *print-length* times. This is designed
+  for use in pretty-printer dispatch functions."
   [bindings & body]
-  `(loop ~bindings
-     (if (and (var-get #'clojure.pprint/*current-length*)
-              clojure.pprint/*print-length*
-              (>= (var-get #'clojure.pprint/*current-length*) clojure.pprint/*print-length*))
-       (do (-write *out* "...") nil)
-       (do ~@body))))
+  (let [count-var (gensym "length-count")
+        mod-body (pll-mod-body count-var body)]
+    `(loop ~(apply vector count-var 0 bindings)
+       (if (or (not clojure.core/*print-length*) (< ~count-var clojure.core/*print-length*))
+         (do ~@mod-body)
+         (-write clojure.core/*out* "...")))))
 
 (defmacro formatter-out
   "Returns a function (fn [& args]) that runs the compiled format against *out*.
@@ -628,10 +645,9 @@
 (def ^:dynamic ^{:private true} *current-level* 0)
 (def ^:dynamic ^{:private true} *current-length* nil)
 
-;; jolt has no bindable clojure.core/*print-length* / *print-level* vars; define
-;; them here so the printer-control machinery can bind and read them.
-(def ^:dynamic *print-length* nil)
-(def ^:dynamic *print-level* nil)
+;; *print-length* / *print-level* are clojure.core's, as on the JVM: pprint used
+;; to define its own pair, so (binding [*print-length* 3] (pprint …)) — the core
+;; var — was silently ignored.
 
 (declare ^{:arglists '([n])} format-simple-number)
 
@@ -677,8 +693,8 @@
   (let [options (merge {:stream true} (apply hash-map kw-args))]
     (binding [clojure.pprint/*print-base* (get options :base clojure.pprint/*print-base*)
               clojure.pprint/*print-circle* (get options :circle clojure.pprint/*print-circle*)
-              clojure.pprint/*print-length* (get options :length clojure.pprint/*print-length*)
-              clojure.pprint/*print-level* (get options :level clojure.pprint/*print-level*)
+              clojure.core/*print-length* (get options :length clojure.core/*print-length*)
+              clojure.core/*print-level* (get options :level clojure.core/*print-level*)
               clojure.pprint/*print-lines* (get options :lines clojure.pprint/*print-lines*)
               clojure.pprint/*print-miser-width* (get options :miser-width clojure.pprint/*print-miser-width*)
               clojure.pprint/*print-pprint-dispatch* (get options :dispatch clojure.pprint/*print-pprint-dispatch*)
@@ -2060,19 +2076,23 @@
 
 
 (defn- pprint-map [amap]
-  (pprint-logical-block :prefix "{" :suffix "}"
-    (print-length-loop [aseq (seq amap)]
-      (when aseq
-        (pprint-logical-block
-          (write-out (ffirst aseq))
-          (-write *out* " ")
-          (pprint-newline :linear)
-          (set! *current-length* 0)
-          (write-out (fnext (first aseq))))
-        (when (next aseq)
-          (-write *out* ", ")
-          (pprint-newline :linear)
-          (recur (next aseq)))))))
+  (let [[ns lift-map] (when (not (record? amap))
+                        (#'clojure.core/lift-ns amap))
+        amap (or lift-map amap)
+        prefix (if ns (str "#:" ns "{") "{")]
+    (pprint-logical-block :prefix prefix :suffix "}"
+      (print-length-loop [aseq (seq amap)]
+        (when aseq
+          (pprint-logical-block
+            (write-out (ffirst aseq))
+            (-write *out* " ")
+            (pprint-newline :linear)
+            (set! *current-length* 0) ; always print both parts of the [k v] pair
+            (write-out (fnext (first aseq))))
+          (when (next aseq)
+            (-write *out* ", ")
+            (pprint-newline :linear)
+            (recur (next aseq))))))))
 
 (defn- pprint-simple-default [obj]
   (-write *out* (pr-str obj)))
