@@ -904,6 +904,20 @@
   {:suite "javastatic" :expr "(let [r (java.io.PushbackReader. (java.io.StringReader. \"ab\"))] [(.read r) (.read r)])" :expected "[97 98]"}
   {:suite "javastatic" :expr "(let [r (PushbackReader. (StringReader. \"ab\")) a (.read r)] (.unread r a) [a (.read r) (.read r)])" :expected "[97 97 98]"}
   {:suite "javastatic" :expr "(let [r (PushbackReader. (StringReader. \"a\"))] (.unread r \\x) [(.read r) (.read r)])" :expected "[120 97]"}
+  ;; PushbackReader.close() is in.close() — it closes the reader it WRAPS
+  ;; (jolt-lang/jolt#1109). It was a no-op, so `with-open` over a PushbackReader —
+  ;; the normal spelling, and the one clojure.core/read callers use — closed
+  ;; nothing at all and the wrapped reader's port stayed open for the life of the
+  ;; process. Only observable where the wrapped reader OWNS a handle: io/reader on
+  ;; a path answers a StringReader here, java.io.FileReader is the streaming one.
+  {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-pbr-close.txt\") _ (spit f \"ab\") r (java.io.FileReader. f) p (java.io.PushbackReader. r)] (.read p) (.close p) (try (.read r) :not-closed (catch Throwable _ :closed)))" :expected ":closed"}
+  {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (java.io.PushbackReader. r)] (.close p) @closed)" :expected "true"}
+  ;; the line-numbering subclass shares the table, so it delegates identically
+  {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (clojure.lang.LineNumberingPushbackReader. r)] (.close p) @closed)" :expected "true"}
+  ;; ...but a wrapped value with NO close is still a no-op rather than a throw:
+  ;; clojure.core's *in* is a reify over IReader, which a JVM PushbackReader could
+  ;; never hold and which has no close to dispatch.
+  {:suite "pushback-close" :expr "(with-in-str \"x\" (do (.close (java.io.PushbackReader. *in*)) :ok))" :expected ":ok"}
   {:suite "javastatic" :expr "(BigInteger. \"123\")" :expected "123"}
   {:suite "javastatic" :expr "(let [m (HashMap. {:a 1 :b 2})] (.get m :b))" :expected "2"}
   {:suite "javastatic" :expr "(let [m (HashMap. {})] (.put m :x 1) (.put m :y 2) (.size m))" :expected "2"}

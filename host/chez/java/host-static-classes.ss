@@ -1097,6 +1097,17 @@
           (vector-set! st 4 0)
           (->num 10))
          (else (vector-set! st 4 (+ 1 (vector-ref st 4))) c))))))
+;; Every java.io.Reader has close(), so the JVM's PushbackReader.close can call
+;; in.close() unconditionally. jolt can be handed something a JVM PushbackReader
+;; could not: clojure.core's *in* is a reify over IReader (jolt-core/clojure/
+;; core/50-io.clj) with no close method at all, and dispatching one at it would
+;; throw where the JVM has nothing to throw about. So a record or reify is asked
+;; whether it HAS the method; a host reader (io/reader, StringReader, the port
+;; readers) always does and is dispatched straight.
+(define (pbr-closeable? rdr)
+  (if (or (jrec? rdr) (jreify? rdr))
+      (and (iface-method rdr "close" #f) #t)
+      #t))
 (register-host-methods! "pushback-reader"
   (list (cons "read"
           (lambda (self . rest)
@@ -1135,7 +1146,24 @@
                         (vector-set! (jhost-state self) 1 acc)
                         (loop (- i 1) (cons (->num (char->integer (ja-ref ch i))) acc))))))
             jolt-nil))
-        (cons "close" (lambda (self) jolt-nil))
+        ;; java.io.PushbackReader.close() is `in.close()` — it closes the reader it
+        ;; WRAPS, and a no-op here leaked every one of them (jolt-lang/jolt#1109).
+        ;; with-open over a PushbackReader is the normal spelling, so nothing else
+        ;; ever closed the wrapped reader: jolt.loader brackets each source file
+        ;; that way (stdlib/jolt/loader.clj), so every file it loaded stayed open
+        ;; for the life of the process. Invisible on POSIX, where an open
+        ;; descriptor does not stop an unlink; on Windows it makes the directory
+        ;; undeletable, which is how it was found.
+        ;;
+        ;; Only the PUSHBACK readers delegate. The other no-op closes in this file
+        ;; ("writer", "string-reader", ...) are over in-memory buffers, where a
+        ;; no-op is exactly what the JDK does.
+        (cons "close"
+          (lambda (self)
+            (let ((rdr (vector-ref (jhost-state self) 0)))
+              (when (and (not (jolt-nil? rdr)) (pbr-closeable? rdr))
+                (record-method-dispatch rdr "close" jolt-nil)))
+            jolt-nil))
         ;; 1-based, like clojure.lang.LineNumberingPushbackReader's own +1 over the
         ;; underlying LineNumberReader. A plain PushbackReader counts nothing.
         (cons "getLineNumber" (lambda (self) (->num (+ 1 (vector-ref (jhost-state self) 3)))))
