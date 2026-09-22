@@ -466,8 +466,8 @@
      (lambda () (close-port bp)))))
 
 ;; --- char input (Reader) ----------------------------------------------------
-;; state #(port pending-lf?): pending-lf? is the \n owed by a \r that ended the
-;; last line — see char-reader-get-char.
+;; state #(port pending-lf? scratch mark replay): pending-lf? is the \n owed by
+;; a \r that ended the last line — see char-reader-get-char.
 (define (char-reader-port self) (vector-ref (jhost-state self) 0))
 (define (char-reader-pending-lf? self) (vector-ref (jhost-state self) 1))
 (define (char-reader-pending-lf! self v) (vector-set! (jhost-state self) 1 v))
@@ -475,7 +475,68 @@
 ;; Slot 2 is the block-read scratch string (see char-reader-read-block!), grown
 ;; on demand and reused across calls so a streaming read allocates once rather
 ;; than once per call.
-(define (make-char-reader port) (make-jhost "char-reader" (vector port #f #f)))
+;;
+;; Slots 3 and 4 are BufferedReader's mark/reset, kept above the port rather
+;; than as a port position because the port is as often a pipe, a socket or a
+;; terminal as a file, and the JVM's mark works over all of them: it is the
+;; buffer that remembers, not the source. The mark is #f or
+;; #(pending-lf-at-mark limit recorded count) — every unit read from the port
+;; after mark() is pushed onto `recorded` (reversed) — and replay is the list
+;; of units reset() put back, delivered before the port is read again. The
+;; recording is of RAW port units, below the CR-LF skip, and the skip flag is
+;; saved with the mark (BufferedReader's markedSkipLF), so a reset re-reads
+;; exactly what the reader saw. A read past the limit keeps the mark up to
+;; the JVM's default buffer size (8192): its readAheadLimit is the size it
+;; guarantees, and it does not invalidate a mark the buffer still holds.
+;;
+;; Until 0.8.11 the streamed file reader took mark as a no-op and reset as
+;; "seek to 0" — a peek written as mark/read/reset restarted the file every
+;; time, and Selmer's template parser never reached EOF.
+(define (make-char-reader port) (make-jhost "char-reader" (vector port #f #f #f '())))
+(define (char-reader-mark self) (vector-ref (jhost-state self) 3))
+(define (char-reader-mark! self m) (vector-set! (jhost-state self) 3 m))
+(define (char-reader-replay self) (vector-ref (jhost-state self) 4))
+(define (char-reader-replay! self l) (vector-set! (jhost-state self) 4 l))
+(define char-reader-mark-floor 8192)
+;; Is a mark or a replay in force? Then the block reads take the one-unit path
+;; through char-reader-raw-get, which is what records and replays; a reader
+;; nobody has marked keeps its get-string-n! fill.
+(define (char-reader-buffered? self)
+  (or (char-reader-mark self) (pair? (char-reader-replay self))))
+;; One raw unit: the replay first, then the port; recorded when a mark is on.
+(define (char-reader-raw-get self)
+  (let* ((replay (char-reader-replay self))
+         (c (if (pair? replay)
+                (begin (char-reader-replay! self (cdr replay)) (car replay))
+                (get-char (char-reader-port self))))
+         (m (char-reader-mark self)))
+    ;; `vector? m`, not `m`: an invalidated mark is the symbol 'invalid, and the
+    ;; reader goes on being read from after one — the JVM drops the mark and
+    ;; keeps delivering characters, and only reset() raises. Testing `m` here
+    ;; walked into (vector-ref 'invalid 3) on the next unit.
+    (when (and (vector? m) (not (eof-object? c)))
+      (let ((n (fx+ (vector-ref m 3) 1)))
+        (if (fx>? n (fxmax (vector-ref m 1) char-reader-mark-floor))
+            (char-reader-mark! self 'invalid)         ; read past what a mark keeps
+            (begin (vector-set! m 2 (cons c (vector-ref m 2)))
+                   (vector-set! m 3 n)))))
+    c))
+(define (char-reader-mark-set! self limit)
+  (char-reader-mark! self (vector (char-reader-pending-lf? self)
+                                  (if (and (fixnum? limit) (fx>=? limit 0)) limit 0)
+                                  '() 0)))
+(define (char-reader-reset! self)
+  (let ((m (char-reader-mark self)))
+    (cond
+      ((not m) (io-throw "Stream not marked"))
+      ((eq? m 'invalid) (io-throw "Mark invalid"))
+      (else
+       ;; what was read since the mark goes back in front of whatever a
+       ;; previous reset already put back and is not yet consumed
+       (char-reader-replay! self (append (reverse (vector-ref m 2)) (char-reader-replay self)))
+       (vector-set! m 2 '())
+       (vector-set! m 3 0)
+       (char-reader-pending-lf! self (vector-ref m 0))))))
 ;; One character, minus the \n owed by a \r that ended the last line. Chez's
 ;; get-line splits on \n ALONE, so every line of CRLF input came back with its
 ;; \r still attached and a line-oriented protocol (HTTP headers, SMTP, RESP)
@@ -487,22 +548,31 @@
 ;; That is why java.io.BufferedReader keeps this flag, and it is the same flag
 ;; System/in's hand-written loop below keeps, for the same reason.
 (define (char-reader-get-char self)
-  (let ((c (get-char (char-reader-port self))))
+  (let* ((plain? (not (char-reader-buffered? self)))
+         (c (if plain? (get-char (char-reader-port self)) (char-reader-raw-get self))))
     (if (not (char-reader-pending-lf? self))
         c
         (begin (char-reader-pending-lf! self #f)
-               (if (eqv? c #\newline) (get-char (char-reader-port self)) c)))))
+               (if (eqv? c #\newline)
+                   (if plain? (get-char (char-reader-port self)) (char-reader-raw-get self))
+                   c)))))
 ;; The next line without its terminator, or the eof object at end of input. A
 ;; line that ends at eof is still a line; only an immediate eof is the end.
 (define (char-reader-line self)
-  (let ((out (open-output-string)))
-    (let loop ((any? #f))
-      (let ((c (char-reader-get-char self)))
+  ;; The first unit goes through char-reader-get-char for the LF a \r left
+  ;; owed; after it nothing within this line can set that flag, so the rest of
+  ;; an unmarked reader's line is read straight off the port — the mark and
+  ;; replay tests are per line here, not per character.
+  (let ((out (open-output-string))
+        (port (char-reader-port self))
+        (plain? (not (char-reader-buffered? self))))
+    (let loop ((any? #f) (first? #t))
+      (let ((c (if (and plain? (not first?)) (get-char port) (char-reader-get-char self))))
         (cond
           ((eof-object? c) (if any? (get-output-string out) c))
           ((char=? c #\newline) (get-output-string out))
           ((char=? c #\return) (char-reader-pending-lf! self #t) (get-output-string out))
-          (else (write-char c out) (loop #t)))))))
+          (else (write-char c out) (loop #t #f)))))))
 ;; 64 KB: the knee measured on this path. Below it the per-call overhead starts
 ;; to show again; above it the scratch stops paying for itself.
 (define char-reader-block-size 65536)
@@ -583,6 +653,10 @@
     (cond
       ((not (and (fixnum? off) (fixnum? len) (fx>=? off 0) (fx>=? len 0)))
        (char-reader-read-elementwise! self buf off len))
+      ;; a mark or a replay in force: one unit at a time, so it is recorded
+      ;; or replayed (see the state note above)
+      ((char-reader-buffered? self)
+       (char-reader-read-elementwise! self buf off len))
       ((and (string? v) (fx<=? (fx+ off len) (string-length v)))
        (char-reader-fill-string! self v off len))
       ((not (and (vector? v) (fx<=? (fx+ off len) (vector-length v))))
@@ -641,11 +715,11 @@
                                    (if (or (>= i k) (eof-object? (char-reader-get-char self))) (->num i)
                                        (loop (+ i 1) k)))))
    (cons "close" (lambda (self) (close-port (char-reader-port self)) jolt-nil))
-   (cons "mark" (lambda (self . _) jolt-nil))
-   (cons "reset" (lambda (self) (guard (e (#t jolt-nil))
-                                  (set-port-position! (char-reader-port self) 0)
-                                  (char-reader-pending-lf! self #f)
-                                  jolt-nil)))
+   (cons "markSupported" (lambda (self) #t))
+   (cons "mark" (lambda (self . rest)
+                  (char-reader-mark-set! self (if (pair? rest) (jnum->exact (car rest)) 0))
+                  jolt-nil))
+   (cons "reset" (lambda (self) (char-reader-reset! self) jolt-nil))
    (cons "toString" (lambda (self) "#<Reader>"))))
 
 ;; --- a Reader jolt did not build (reify / proxy / any deftype) ---------------
