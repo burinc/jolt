@@ -180,11 +180,48 @@
 ;; A pattern the engine will not compile is a PatternSyntaxException, the same
 ;; catchable thing the JVM throws — not the raw internal error, which surfaced as
 ;; an unnamed condition no (catch PatternSyntaxException …) could see.
+;; The exact string java.util.regex.PatternSyntaxException.getMessage() builds:
+;; the description, " near index N" ONLY when N >= 0, a newline, the whole pattern,
+;; and — when N lands inside the pattern — another newline and a caret under that
+;; column. The caret padding is one character per column before N: a space, or a
+;; tab where the pattern has a tab (PatternSyntaxException.java). N is an index
+;; into the pattern's CODE POINTS (Pattern parses those), but getMessage measures
+;; and pads it against the Java String's UTF-16 units, so a supplementary
+;; character before N is two columns of padding and counts two toward the
+;; "inside the pattern" test — a JDK quirk, reproduced.
+(define (pattern-syntax-message desc idx source)
+  (define (units c) (if (> (char->integer c) #xFFFF) 2 1))
+  (define utf16-length
+    (let loop ((k 0) (u 0))
+      (if (>= k (string-length source)) u (loop (+ k 1) (+ u (units (string-ref source k)))))))
+  (string-append
+   desc
+   (if (and (integer? idx) (>= idx 0))
+       (string-append " near index " (number->string idx))
+       "")
+   "\n" source
+   (if (and (integer? idx) (>= idx 0) (< idx utf16-length))
+       (string-append
+        "\n"
+        (let loop ((k 0) (u 0) (pad ""))
+          (if (or (>= u idx) (>= k (string-length source)))
+              pad
+              (let ((c (string-ref source k)))
+                (loop (+ k 1) (+ u (units c))
+                      (string-append pad (if (char=? c #\tab) "\t" " ")
+                                     (if (and (= (units c) 2) (< (+ u 1) idx)) " " ""))))))
+        "^")
+       "")))
+
 (define (regex-syntax-error source e)
   (jolt-throw
    (jolt-host-throwable "java.util.regex.PatternSyntaxException"
-     (string-append (guard (e2 (#t "Unsupported pattern")) (condition-message-of e))
-                    " near index 0\n" source))))
+     (if (java-pattern-error? e)
+         (pattern-syntax-message (java-pattern-error-desc e)
+                                 (java-pattern-error-index e)
+                                 source)
+         (string-append (guard (e2 (#t "Unsupported pattern")) (condition-message-of e))
+                        " near index 0\n" source)))))
 
 (define (condition-message-of e)
   (if (and (condition? e) (message-condition? e)) (condition-message e) "Unsupported pattern"))

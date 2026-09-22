@@ -3429,6 +3429,11 @@
   {:suite "regex / re-pattern & string ops" :label "split on regex" :expected "[\"a\" \"b\" \"c\"]" :actual "(do (require '[clojure.string :as s]) (s/split \"a1b2c\" #\"\\d\"))" :portability :common}
   {:suite "regex / re-pattern & string ops" :label "replace regex" :expected "\"X-X\"" :actual "(do (require '[clojure.string :as s]) (s/replace \"a-b\" #\"[a-z]\" \"X\"))" :portability :common}
   {:suite "regex / re-pattern & string ops" :label "replace $1" :expected "\"[a][b]\"" :actual "(do (require '[clojure.string :as s]) (s/replace \"ab\" #\"([a-z])\" \"[$1]\"))" :portability :common}
+  ;; UnicodeProp.HEXDIGIT is DIGIT.is(ch) || the ASCII and fullwidth spellings,
+  ;; so java.util.regex reads EVERY Nd digit as a hex digit — a wider set than
+  ;; Unicode's own Hex_Digit property, and the JVM's is the one to answer.
+  {:suite "regex / \\p property classes" :label "p{IsHex_Digit} takes every Nd digit, as the JVM does" :expected "[true true true true true false]" :actual "(mapv #(boolean (re-matches #\"\\p{IsHex_Digit}\" (str (char %)))) [0x0660 0x0966 0x1C50 0xFF10 0x0041 0x0047])" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{IsHex_Digit} still rejects a non-hex letter and a Roman numeral" :expected "[false false]" :actual "[(boolean (re-matches #\"\\p{IsHex_Digit}\" \"g\")) (boolean (re-matches #\"\\p{IsHex_Digit}\" (str (char 0x2160))))]" :portability :common}
   {:suite "regex / \\p property classes" :label "p{L} ascii" :expected "\"hello\"" :actual "(re-matches #\"^\\p{L}+$\" \"hello\")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{L} utf-8" :expected "true" :actual "(boolean (re-matches #\"^\\p{L}+$\" \"héllo\"))" :portability :common}
   {:suite "regex / \\p property classes" :label "p{L} rejects digits" :expected "false" :actual "(boolean (re-matches #\"^\\p{L}+$\" \"ab1\"))" :portability :common}
