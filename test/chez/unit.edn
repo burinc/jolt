@@ -2112,8 +2112,10 @@
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'with-loading-context))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'add-doc-and-meta))" :expected "false"}
  ;; assert-args moved out of the JVM-only set: ported (see the assert-args suite)
- ;; because macro-heavy libraries reach it as @#'clojure.core/assert-args.
- {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'assert-args))" :expected "true"}
+ ;; because macro-heavy libraries reach it as @#'clojure.core/assert-args. It is
+ ;; private, so only the qualified name resolves outside clojure.core, as on the
+ ;; JVM ((resolve 'assert-args) is nil there).
+ {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'clojure.core/assert-args))" :expected "true"}
  ;; amap/areduce are NOT JVM-only: they are index loops over alength/aget/aset/
  ;; aclone, all of which jolt has, so they are implemented in the overlay.
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'amap))" :expected "true"}
