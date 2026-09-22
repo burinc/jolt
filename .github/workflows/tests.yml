@@ -233,6 +233,15 @@ jobs:
       - name: Gate native dependency paths and Maven resolver
         run: make CHEZ=./chez-install/bin/chez depsunit mvnhttp
 
+      # The Windows-shaped path, PATH and PROCESS rows. depsunit and mvnhttp
+      # above spawn nothing and initialize their own Winsock, which is exactly
+      # why this job missed jolt-lang/jolt#1108 — every subprocess spawn failed
+      # on Windows, silently, for a whole release. winplatform ends in a LIVE
+      # spawn through ProcessBuilder, so on this runner it drives CreateProcessW
+      # end to end.
+      - name: Gate the Windows path, PATH and process rows
+        run: make CHEZ=./chez-install/bin/chez winplatform winpath
+
       # java.util.zip in script mode under MSYS2 (#916). There are no jolt_z_*
       # names there: zlib.ss binds the process's own zlib if scheme.exe exports
       # one, else MSYS2's zlib1.dll from /mingw64/bin (mingw-w64-x86_64-zlib,

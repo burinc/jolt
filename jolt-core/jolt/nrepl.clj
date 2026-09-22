@@ -19,6 +19,7 @@
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
+            [jolt.winsock :as winsock]
             [jolt.analyzer :as ana]))
 
 ;; --- sockets (loopback server) ---------------------------------------------
@@ -58,9 +59,7 @@
   (do
     (ffi/defcfn c-recv  "recv"        [:int :pointer :int :int] :int :blocking)
     (ffi/defcfn c-send  "send"        [:int :pointer :int :int] :int :blocking)
-    (ffi/defcfn c-close "closesocket" [:int] :int)
-    ;; Winsock must be initialized once per process before any socket call.
-    (ffi/defcfn c-wsastartup "WSAStartup" [:int :pointer] :int))
+    (ffi/defcfn c-close "closesocket" [:int] :int))
   (do
     (ffi/defcfn c-recv  "recv"  [:int :pointer :size_t :int] :ssize_t :blocking)
     (ffi/defcfn c-send  "send"  [:int :pointer :size_t :int] :ssize_t :blocking)
@@ -78,17 +77,6 @@
 ;; SOL_SOCKET / SO_REUSEADDR: 0xffff / 4 on macOS and Windows, 1 / 2 on Linux.
 (def ^:private sol-socket (if (or macos? windows?) 0xffff 1))
 (def ^:private so-reuse   (if (or macos? windows?) 4 2))
-
-;; Initialize Winsock (a no-op off Windows). WSAStartup is refcounted and must
-;; precede any socket call; WSADATA is ~408 bytes on x64, so 512 is ample.
-(defn- ensure-winsock! []
-  (when windows?
-    (let [wsadata (ffi/alloc 512)]
-      (try
-        (let [r (c-wsastartup 0x0202 wsadata)]
-          (when-not (zero? r)
-            (throw (ex-info (str "WSAStartup failed: " r) {}))))
-        (finally (ffi/free wsadata))))))
 
 (defn- make-sockaddr [port]
   ;; ffi/alloc zeroes the block, so the padding and the bytes below are already 0.
@@ -120,13 +108,19 @@
   fd)
 
 (defn- listen-socket [port]
-  (ensure-winsock!)                                          ; no-op off Windows
+  ;; Winsock, once per process, before the first socket call — shared with
+  ;; jolt.socket and jolt.mvn-http rather than carried here, which is what this
+  ;; used to be (jolt-lang/jolt#1107). A no-op off Windows.
+  (winsock/ensure!)
   ;; SOCK_CLOEXEC where the platform has it, so the fd is never briefly
   ;; inheritable between socket() and fcntl(). Linux only; macOS relies on the
   ;; fcntl below, and Windows on neither.
   (let [fd (c-socket AF-INET (bit-or SOCK-STREAM sock-cloexec) 0)]
     (when (neg? fd) (throw (ex-info "socket() failed" {})))
-    (let [opt (ffi/alloc 4)] (ffi/write opt :int 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt))
+    ;; not on Windows: there SO_REUSEADDR lets a second listener take a busy port
+    ;; (jolt.socket's new-fd! says more)
+    (when-not windows?
+      (let [opt (ffi/alloc 4)] (ffi/write opt :int 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt)))
     (let [sa (make-sockaddr port)]
       (when (neg? (c-bind fd sa 16)) (c-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
       (ffi/free sa))

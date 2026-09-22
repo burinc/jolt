@@ -53,8 +53,16 @@
 ;; -- platform constants --------------------------------------------------------
 ;; EAGAIN/EWOULDBLOCK share one value on both platforms; O_NONBLOCK, the socket
 ;; error option and the connect-in-progress errno do not.
-(def ^:private macos?
-  (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac"))
+(def ^:private os-name
+  (str/lower-case (or (System/getProperty "os.name") "")))
+(def ^:private macos?   (str/includes? os-name "mac"))
+;; There is no third backend here: the poller is kqueue or epoll, and Windows has
+;; neither. A WSAPoll one is not a translation of this file — WSAPoll is a
+;; stateless poll rather than a kernel-held registration set, and its wake pipe
+;; would have to be a loopback socket pair, since WSAPoll accepts only sockets.
+;; So on Windows sockets stay BLOCKING and nothing parks: see nonblock! below and
+;; the entry in test/conformance/known-divergences.edn (jolt-lang/jolt#1107).
+(def ^:private windows? (str/includes? os-name "win"))
 
 (def ^:private F-GETFL 3)
 (def ^:private F-SETFL 4)
@@ -92,8 +100,19 @@
 (defn eintr? ([] (= EINTR (errno))) ([e] (= EINTR e)))
 (defn connect-pending? [e] (or (= EINPROGRESS e) (= EALREADY e)))
 (defn nonblock! [fd]
-  (let [f (c-fcntl fd F-GETFL 0)]
-    (c-fcntl fd F-SETFL (bit-or f O-NONBLOCK))))
+  ;; A no-op on Windows, and deliberately so. O_NONBLOCK is fcntl, which Windows
+  ;; does not have — the ioctlsocket(FIONBIO) equivalent does exist — but setting
+  ;; a socket non-blocking is only useful with something that can wait for it to
+  ;; become ready, and there is no poller here on Windows. A non-blocking socket
+  ;; with no poller answers WSAEWOULDBLOCK to reads nobody can retry usefully,
+  ;; which is strictly worse than blocking. Blocking is also exactly what the
+  ;; JVM's java.net.Socket is: the non-blocking fd plus the readiness poller is
+  ;; jolt's fiber extension over java.net, not part of its contract. So what
+  ;; Windows is missing is a jolt superset, not a java.net behaviour
+  ;; (jolt-lang/jolt#1107).
+  (when-not windows?
+    (let [f (c-fcntl fd F-GETFL 0)]
+      (c-fcntl fd F-SETFL (bit-or f O-NONBLOCK)))))
 (defn so-error [fd]
   (let [v (ffi/alloc 4) lenp (ffi/alloc 4)]
     (try

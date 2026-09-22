@@ -154,22 +154,33 @@
             (else (loop (cdr ks) acc))))))
 (define (jolt-started-thread? id)
   (jolt-with-mutex live-threads-mutex (eq? #t (hashtable-ref live-threads id #f))))
+;; A thread is born with its creator's signal mask, and jolt has one: the
+;; SIGTERM/SIGHUP/SIGINT the shutdown watcher takes over must be blocked in every
+;; thread, or the kernel delivers the signal to whichever one does not block it
+;; instead of leaving it pending for sigwait (concurrency.ss, #1098). The guard
+;; wraps the SPAWN — it blocks on this thread, creates, and restores — so the
+;; child has the mask from its first instruction. set! by concurrency.ss once the
+;; POSIX mask primitives are up; the identity below is what a host without them
+;; (Windows, Gambit) keeps.
+(define jolt-fork-sigmask-guard (lambda (fork) (fork)))
 (define %ls-orig-fork-thread fork-thread)
-(define (fork-thread thunk)
-  (jolt-mark-mt!)
-  (let* ((t (%ls-orig-fork-thread
+(define (%ls-fork-thread mark-mt? thunk)
+  (when mark-mt? (jolt-mark-mt!))
+  (let* ((t (jolt-fork-sigmask-guard
              (lambda ()
-               (*txn* #f)
-               (rdr-default-modes!)
-               (let ((id (get-thread-id)))
-                 (dynamic-wind
-                   (lambda () #f)
-                   thunk
-                   (lambda ()
-                     (jolt-with-mutex live-threads-mutex
-                       (if (hashtable-contains? live-threads id)
-                           (hashtable-delete! live-threads id)
-                           (hashtable-set! live-threads id 'done)))))))))
+               (%ls-orig-fork-thread
+                (lambda ()
+                  (*txn* #f)
+                  (rdr-default-modes!)
+                  (let ((id (get-thread-id)))
+                    (dynamic-wind
+                      (lambda () #f)
+                      thunk
+                      (lambda ()
+                        (jolt-with-mutex live-threads-mutex
+                          (if (hashtable-contains? live-threads id)
+                              (hashtable-delete! live-threads id)
+                              (hashtable-set! live-threads id 'done)))))))))))
          (id (sa-thread-id-of t)))
     (when id
       (jolt-with-mutex live-threads-mutex
@@ -177,6 +188,19 @@
             (hashtable-delete! live-threads id)
             (hashtable-set! live-threads id #t))))
     t))
+(define (fork-thread thunk) (%ls-fork-thread #t thunk))
+
+;; A thread that parks in a foreign call and runs no jolt code until something
+;; wakes it has not made the process multi-threaded, and saying that it has is not
+;; free: jolt-mt? is what puts every lazy cell on the claim path for the rest of
+;; the program (1.03-1.06x on a seq pipeline, measured). The shutdown watcher is
+;; one of these — armed in every CLI process, asleep in sigwait for the whole life
+;; of a program that may never register a hook — so it forks this way instead. The
+;; OWNER of a dormant thread is then responsible for marking the process
+;; multi-threaded before any jolt code can reach it: for the watcher that is hook
+;; registration (concurrency.ss), which is the moment a second mutator becomes
+;; possible at all.
+(define (fork-thread-dormant thunk) (%ls-fork-thread #f thunk))
 
 ;; coll->cells: coerce the body result to the cell representation = a seq | nil.
 (define (jolt-coll->cells c) (jolt-seq c))

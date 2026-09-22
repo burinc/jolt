@@ -2115,13 +2115,20 @@
 ;; `sh` runs `sh -c CMD`, inheriting stdout/stderr (so git progress shows), and
 ;; returns the exit code. `sh-out` captures stdout to a string (exit ignored) for
 ;; commands whose output we parse (git rev-parse). Used by jolt.deps for git.
-(define (jolt-sh cmd) (system cmd))
+;;
+;; Both spawn with an EMPTY signal mask, as ProcessBuilder does (process.ss): the
+;; CLI blocks SIGTERM/SIGHUP/SIGINT on the primordial thread at entry for the
+;; shutdown watcher (java/concurrency.ss), a blocked mask survives fork and exec,
+;; and bash — /bin/sh on macOS and several Linuxes — does not clear it. The
+;; child and everything it starts would then ignore ^C and a plain `kill`.
+(define (jolt-sh cmd) (jolt-with-empty-sigmask (lambda () (system cmd))))
 (def-var! "jolt.host" "sh" jolt-sh)
 
 (define (jolt-sh-out cmd)
   (call-with-values
-    (lambda () (sa-run-process (string-append "exec sh -c " (sh-quote cmd))
-                               (native-transcoder)))
+    (lambda () (jolt-with-empty-sigmask
+                 (lambda () (sa-run-process (string-append "exec sh -c " (sh-quote cmd))
+                                            (native-transcoder)))))
     (lambda (stdin stdout stderr pid)
       (close-port stdin)
       (let ((out (get-string-all stdout)))

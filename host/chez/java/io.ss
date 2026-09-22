@@ -710,6 +710,89 @@
 ;; The separator a join adds after P: the one P already uses, else "/".
 (define (path-join-sep windows? p) (if (path-backslash-style? windows? p) "\\" "/"))
 
+;; --- the Win32 native surface ------------------------------------------------
+;; The handful of kernel32 entry points the shims need where POSIX has no answer:
+;; the DOS file attributes behind java.nio.file.Files/isHidden (nio-file.ss), and
+;; the UTF-16 marshalling every W entry point takes, which the ProcessBuilder
+;; spawn path (process.ss) shares. Lives here because io.ss is the file both of
+;; those already load — and already the home of the other platform-parameterized
+;; path helpers above.
+;;
+;; Everything is resolved LAZILY and only on Windows: on POSIX nothing here ever
+;; loads a library or looks up an entry, so a jolt that never calls one pays
+;; nothing and a host without the entry degrades rather than failing to boot.
+;;
+;; kernel32 is loaded explicitly, as sa-windows-env-entries does for
+;; GetEnvironmentStringsW and jolt.nrepl does for ws2_32: -lkernel32 being linked
+;; does not put its symbols in jolt.exe's own export table, so the process handle
+;; alone does not resolve them. load-shared-object PREPENDS to Chez's lookup list
+;; and every later foreign-entry walks it, so each library is loaded at most once.
+(define win32? (lambda () (eq? (sa-os-family) 'windows)))
+
+(define win32-loaded-libs '())
+(define (win32-load-lib! name)
+  (unless (member name win32-loaded-libs)
+    (set! win32-loaded-libs (cons name win32-loaded-libs))
+    (guard (e (#t #f)) (sa-load-shared-object name))))
+
+;; A Win32 entry point, or #f: #f off Windows, #f when the library or the symbol
+;; is missing. Resolved through sa-foreign-procedure-runtime for the reason
+;; jolt-foreign-proc-safe takes that branch on Windows — a compiled foreign
+;; reference is a load-time fasl relocation there, and a missing symbol aborts
+;; the boot before any guard can run.
+(define (win32-proc lib name args res)
+  (and (win32?)
+       (begin
+         (win32-load-lib! lib)
+         (and (sa-foreign-entry? name)
+              (guard (e (#t #f)) (sa-foreign-procedure-runtime name args res #f))))))
+
+;; Resolve ONCE, on first use, and remember the answer (including #f).
+(define-syntax define-win32-proc
+  (syntax-rules ()
+    ((_ id lib name args res)
+     (define id
+       (let ((memo #f) (done? #f))
+         (lambda ()
+           (unless done?
+             (set! done? #t)
+             (set! memo (win32-proc lib name (quote args) (quote res))))
+           memo))))))
+
+;; A NUL-terminated UTF-16LE copy of S in foreign memory — what every W entry
+;; point takes. The caller owns it and must sa-foreign-free it. Surrogate pairs
+;; are string->utf16's to get right, which is the reason not to hand-roll it.
+(define (win32-wstr s)
+  (let* ((bv (string->utf16 s (endianness little)))
+         (n (bytevector-length bv))
+         (p (sa-foreign-alloc (+ n 2))))
+    (sa-foreign-bytes-set! p bv n)
+    (sa-foreign-set! 'unsigned-8 p n 0)
+    (sa-foreign-set! 'unsigned-8 p (+ n 1) 0)
+    p))
+
+;; Run BODY with the wide copy of S, freeing it however BODY leaves.
+(define (win32-with-wstr s proc)
+  (let ((w (win32-wstr s)))
+    (dynamic-wind (lambda () #f) (lambda () (proc w)) (lambda () (sa-foreign-free w)))))
+
+(define win32-INVALID-FILE-ATTRIBUTES #xFFFFFFFF)
+(define win32-FILE-ATTRIBUTE-HIDDEN   #x2)
+(define win32-FILE-ATTRIBUTE-DIRECTORY #x10)
+
+(define-win32-proc win32-get-file-attributes-w
+  "kernel32.dll" "GetFileAttributesW" (void*) unsigned-32)
+
+;; The DOS attribute word for PATH, or #f when it cannot be read (the path does
+;; not exist, or this is not Windows). Win32 takes "/" as a separator as happily
+;; as "\\", so the "/"-rendered paths the Path shim hands out need no rewriting.
+(define (win32-file-attributes path)
+  (let ((f (win32-get-file-attributes-w)))
+    (and f
+         (let ((a (win32-with-wstr path
+                    (lambda (w) (guard (e (#t win32-INVALID-FILE-ATTRIBUTES)) (f w))))))
+           (and (not (= a win32-INVALID-FILE-ATTRIBUTES)) a)))))
+
 ;; The ROOT of P — the prefix that is not a segment and must be reproduced
 ;; verbatim — and the index the segments start at. Rendered with "/" separators,
 ;; the spelling getAbsolutePath and babashka.fs/absolutize already answer with
@@ -2489,6 +2572,15 @@
 ;; this shim renders uses it — but pathSeparator is the PATH-LIST separator and
 ;; must be ";" on Windows, or babashka.fs/split-paths and fs/which cut every
 ;; drive-lettered entry in half (host-static-methods.ss path-list-separator).
+;;
+;; Asked for again as jolt-lang/jolt#1110 and deliberately left as it is. Flipping
+;; separator alone is a one-line change, but it would then disagree with what File
+;; and Path actually RENDER, which is the one thing the JDK guarantees they agree
+;; about; moving the rendering too is not local — getCanonicalPath, the glob
+;; translator and every path comparison in this shim are written over the "/"
+;; spelling. Recorded as a deviation instead, with the consumer-visible
+;; consequence (path STRINGS differ from babashka on Windows), in
+;; test/conformance/known-divergences.edn.
 (let ((statics (list (cons "separator" "/")
                      (cons "separatorChar" #\/)
                      (cons "pathSeparator" (path-list-separator))

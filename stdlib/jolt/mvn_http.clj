@@ -12,6 +12,7 @@
   certificate is verified (default verify paths + VERIFY_PEER + hostname check).
   On Windows the sockets are ws2_32 + WSAStartup + closesocket."
   (:require [jolt.ffi :as ffi]
+            [jolt.winsock :as winsock]
             [clojure.string :as str]))
 
 (def ^:private os-name
@@ -110,21 +111,14 @@
 (def ^:private native-failure (volatile! nil))
 
 ;; Windows sockets live in ws2_32.dll and need WSAStartup(2.2) once before any
-;; socket call; POSIX sockets are process symbols, so this is a no-op there.
-(ffi/defcfn c-WSAStartup "WSAStartup" [:int :pointer] :int)       ; Windows Winsock init
-
-(defn- init-sockets! []
-  (when windows?
-    (ffi/load-library ["ws2_32.dll" "ws2_32"])
-    (let [wsadata (ffi/alloc 512)]
-      (try (when-not (zero? (c-WSAStartup 0x0202 wsadata))
-             (throw (ex-info "WSAStartup failed" {})))
-           (finally (ffi/free wsadata))))))
+;; socket call; POSIX sockets are process symbols, so jolt.winsock/ensure! is a
+;; no-op there. This used to be a third private copy of that, alongside
+;; jolt.nrepl's and the one jolt.socket did not have (jolt-lang/jolt#1107).
 
 ;; ffi/load-library takes the ordered candidates, answers the one that loaded
 ;; and raises naming every one it tried when none does.
 (defn- load-native! []
-  (init-sockets!)
+  (winsock/ensure!)
   (let [libdirs (runtime-openssl-libdirs)
         crypto  (:path (ffi/load-library (lib-candidates libdirs crypto-names crypto-candidates)))
         ssl     (:path (ffi/load-library (lib-candidates libdirs ssl-names ssl-candidates)))]
