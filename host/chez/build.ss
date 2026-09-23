@@ -468,13 +468,18 @@
 ;; runtime libraries, so the versioned file is there wherever jolt runs: link
 ;; it by path when the -dev name does not resolve. `cc -print-file-name`
 ;; answers the name unchanged when the compiler's search path lacks it.
+;; -l<lib> also resolves to lib<lib>.a, and the release build relies on that:
+;; STATIC_DEPS (ci/glibc-floor-build.sh) deletes the .so symlinks so the
+;; archives are what -l finds. So either one keeps the -l spelling.
 (define (bld-system-lib lib sonames)
   (define (resolve name)
     (let ((p (bld-sh-capture (string-append (bld-cc) " " (bld-arch-flag)
                                             " -print-file-name=" name " 2>/dev/null"))))
       (and (> (string-length p) 0) (char=? (string-ref p 0) #\/) p)))
   (cond
-    ((resolve (string-append "lib" lib ".so")) (string-append "-l" lib " "))
+    ((or (resolve (string-append "lib" lib ".so"))
+         (resolve (string-append "lib" lib ".a")))
+     (string-append "-l" lib " "))
     ((exists resolve sonames) => (lambda (p) (string-append (bld-sh-quote p) " ")))
     (else (string-append "-l" lib " "))))
 
