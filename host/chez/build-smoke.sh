@@ -585,6 +585,26 @@ if ! printf '%s' "$got_rl" | grep -q '^resloader: true true 1 true true$'; then
   echo "--- got ----"; echo "$got_rl"; exit 1
 fi
 
+# A loader root over the binary's EMBEDDED resources: a root spelled
+# "embed:<prefix>" resolves namespaces and resources straight out of the heap,
+# with nothing on disk — what a shipped app uses to run a plugin or extension
+# bundle it carries. Its own app: nothing in the project's closure requires the
+# fixture namespaces, so a jolt.loader context is the only way they exist in the
+# binary, and the run is from / so a filesystem answer cannot pass it by
+# accident. Only a built binary has an embedded store to resolve against, which
+# is why the check lives here.
+echo "build smoke: embedded loader root (namespace + resource from the heap)"
+elapp="$root/test/chez/embedloader-app"
+elout="$(dirname "$out")/embedloader-bin"
+if ! JOLT_PWD="$elapp" "$jolt" build -m app.core -o "$elout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of the embedded-root app exited non-zero"; exit 1
+fi
+got_el="$(cd / && "$elout" --embedloader 2>&1)"
+if ! printf '%s' "$got_el" | grep -q '^embedloader: true true true true true true true true true$'; then
+  echo "  FAIL: embedded loader root — want 'embedloader: true true true true true true true true true'"
+  echo "--- got ----"; echo "$got_el"; exit 1
+fi
+
 # With no -o and JOLT_PWD unset -- the built jolt started in the project -- the
 # binary is named after the project DIRECTORY, not the entry namespace: "." is
 # resolved to the directory it stands for.

@@ -1767,7 +1767,16 @@
         ((and (jhost? x) (string=? (jhost-tag x) "url"))
          (if (jar-path? (url-spec x))
              (jar-path-stream (url-spec x))
-             (jio-open-in-file (file-url->path (url-spec x)))))
+             (jio-open-in-file (url-strip-scheme (url-spec x)))))
+        ;; io/resource's answer for a resource baked into a built binary — a
+        ;; java.net.URL with an openStream (io.ss embedded-res). Without this arm
+        ;; (io/input-stream (io/resource "baked.txt")) threw in a built binary
+        ;; while the same call on a file: URL worked. The content is the source
+        ;; string or a bytevector, whichever the embed stored.
+        ((embedded-res? x)
+         (let ((c (embedded-res-content x)))
+           (make-in-stream (open-bytevector-input-port
+                            (if (bytevector? c) c (string->utf8 c))))))
         ;; an entry inside a jar on the roots streams out of the archive (io.ss)
         ((jar-path? x) (jar-path-stream x))
         ((string? x) (jio-open-in-file (io-source-path x)))
