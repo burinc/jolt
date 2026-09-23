@@ -792,6 +792,18 @@
 ;;
 ;; NULL is safe for both callers to free: free(NULL) is a defined no-op, and
 ;; ffi/free reaches it through Chez's foreign-free, which accepts 0.
+;; The octets string->ptr copies for a non-nil value. A BYTE-ARRAY is data and
+;; copies its own octets, the rule write-bytes follows (#1101): rendering it with
+;; `str` allocated the characters of "#object[[B]" in place of its bytes, and the
+;; size accounting above agreed with the wrong copy. Every other value is the
+;; UTF-8 of its `str` form.
+(define (ffi-value-octets s)
+  (if (na-bytes? s)
+      (let* ((n (ja-len s)) (bv (make-bytevector n)))
+        (ja-bytes->bv! s 0 bv 0 n)
+        bv)
+      (string->utf8 (jolt-str-render-one s))))
+
 (define (ffi-string->ptr s)
   (if (jolt-nil? s)
       ffi-null
@@ -799,7 +811,7 @@
       ;; sa-foreign-set! loop, ~30ns a byte across the boundary — the cost this
       ;; file's buffer-I/O section exists to avoid, on the one path that had
       ;; kept it.
-      (let* ((bv (string->utf8 (jolt-str-render-one s)))
+      (let* ((bv (ffi-value-octets s))
              (n (bytevector-length bv))
              (p (sa-foreign-alloc (+ n 1))))
         ;; free on a mid-copy throw — the caller only ever sees a whole buffer
@@ -808,11 +820,10 @@
           (sa-foreign-set! 'unsigned-8 p n 0)
           p))))
 
-;; The UTF-8 byte length of a value rendered as a string — what string->ptr just
-;; allocated, so an arena can record the block's size without scanning for the
-;; NUL again.
+;; The octet count string->ptr just copied, less the NUL, so an arena can record
+;; the block's size without scanning for the NUL again.
 (define (ffi-utf8-length s)
-  (if (jolt-nil? s) 0 (bytevector-length (string->utf8 (jolt-str-render-one s)))))
+  (if (jolt-nil? s) 0 (bytevector-length (ffi-value-octets s))))
 
 ;; --- bare :& — per-call variadic tail inference ------------------------------
 ;; babashka.ffi's BARE :& is one binding serving every tail shape: no types
