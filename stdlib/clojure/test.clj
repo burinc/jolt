@@ -349,21 +349,22 @@
            (clojure.test/do-report {:type :fail :message (str "expected " '~form " to throw")
                                     :expected '~form :actual nil})
            (catch Throwable e#
-             (let [m# (or (clojure.core/ex-message e#) (str e#))]
-               ;; honor the class hierarchy (ExceptionInfo IS a RuntimeException),
-               ;; then fall back to a simple-name match like thrown? does.
-               ;; the thrown thing on a pass, nil otherwise, exactly as thrown?
-               ;; above. #1091 reports thrown?; this half had the same defect,
-               ;; and a caller who matched on the message is the likeliest one
-               ;; to go on and assert about ex-data.
-               (if (and (or (clojure.core/instance? ~klass-sym e#)
-                            (clojure.test/class-match? e# ~klass))
-                        (re-find ~re m#))
-                 (do (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual e#})
-                     e#)
-                 (do (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " matching " ~re " but got " (clojure.core/class e#) ": " m#)
-                                              :expected '~form :actual e#})
-                     nil))))))
+             (let [m# (or (clojure.core/ex-message e#) (str e#))
+                   ;; honor the class hierarchy (ExceptionInfo IS a RuntimeException),
+                   ;; then fall back to a simple-name match like thrown? does.
+                   class-ok?# (or (clojure.core/instance? ~klass-sym e#)
+                                  (clojure.test/class-match? e# ~klass))]
+               (if (and class-ok?# (re-find ~re m#))
+                 (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual e#})
+                 (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " matching " ~re " but got " (clojure.core/class e#) ": " m#)
+                                          :expected '~form :actual e#}))
+               ;; the thrown thing whenever the CLASS matched, message or not, and
+               ;; nil otherwise. The JVM's catch names the class and its e# sits
+               ;; after the message test, so a wrong message still answers the
+               ;; exception there; a wrong class never reaches that catch, and
+               ;; `is`'s outer guard answers nil (see thrown? above). #1091
+               ;; reports thrown?; this half had the same defect.
+               (when class-ok?# e#)))))
 
       ;; instance? gets a dedicated report path for a clearer fail message
       ;; (mirrors thrown? above); it is a function now, but keep the explicit form.

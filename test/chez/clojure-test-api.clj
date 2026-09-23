@@ -284,20 +284,27 @@
      true
      "a subclass match answers the exception")
 
-;; nil when the assertion does NOT pass, which is the JVM's answer in both
-;; shapes. Worth pinning: answering the exception here would be a fresh
-;; divergence rather than a fix, since the JVM's catch names the expected class
-;; and a mismatch never reaches it.
+;; nil when nothing matching the CLASS was thrown, which is the JVM's answer.
+;; Worth pinning: answering the exception here would be a fresh divergence
+;; rather than a fix, since the JVM's catch names the expected class and a
+;; mismatch never reaches it.
 (ok= (quiet? (fn [] (is (thrown? clojure.lang.ExceptionInfo :nothing-thrown))))
      nil
      "nothing thrown answers nil")
 (ok= (quiet? (fn [] (is (thrown? java.io.IOException (throw (ex-info "wrong class" {}))))))
      nil
      "a non-matching class answers nil")
-(ok= (quiet? (fn [] (is (thrown-with-msg? clojure.lang.ExceptionInfo #"nope"
+(ok= (quiet? (fn [] (is (thrown-with-msg? java.io.IOException #"boom"
                                           (throw (ex-info "boom" {}))))))
      nil
-     "a non-matching message answers nil")
+     "thrown-with-msg? of a non-matching class answers nil")
+;; ...but a matching class with a non-matching message answers the exception:
+;; the JVM's e# follows the message test inside the class's own catch.
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown-with-msg? clojure.lang.ExceptionInfo #"nope"
+                                                     (throw (ex-info "boom" {})))))))
+     true
+     "a non-matching message still answers the exception")
 
 ;; the value changed; the reporting must not have
 (ok= (let [p (t/n-pass) f (t/n-fail)]
