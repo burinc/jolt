@@ -778,8 +778,10 @@
   arena, the arena owns it; without one, the caller frees it.
 
   nil answers NULL and allocates nothing, which is how an optional C string
-  argument is passed and what round-trips against ptr->string. Every other value
-  goes through the `str` coercion, because this copies a VALUE."
+  argument is passed and what round-trips against ptr->string. A BYTE-ARRAY
+  copies its own octets, byte for byte, then the NUL, as write-bytes does; a C
+  API that reads it as a string stops at the first 0x00 it holds. Every other
+  value goes through the `str` coercion, because this copies a VALUE."
   ([s] (jolt.ffi/__string->ptr s))
   ([arena s]
    (let [arena (arena-usable! arena "string->ptr")
@@ -1270,8 +1272,8 @@
   has no NULL to mean it with, and writing 0 octets is the answer \"\" already
   has.
 
-  Neither path writes a NUL terminator. For a NUL-terminated C string, use
-  string->ptr."
+  Neither path writes a NUL terminator. For a NUL-terminated copy in fresh
+  memory, use string->ptr, which answers both kinds of value the same way."
   [p v]
   (if (bytes? v)
     (jolt.ffi/__write-array p v)
@@ -1341,7 +1343,8 @@
     `(jolt.ffi/with-alloc [~pointer (jolt.ffi/layout-size ~layout)] ~@body)))
 
 (defmacro with-c-string
-  "Copy value to a lexical NUL-terminated UTF-8 C string. A nil value binds NULL
+  "Copy value to a lexical NUL-terminated C string, by string->ptr's rules: a
+  byte-array's own octets, anything else as UTF-8. A nil value binds NULL
   rather than an empty string, which is how an optional C string argument is
   passed; freeing it is still a no-op."
   [binding & body]
