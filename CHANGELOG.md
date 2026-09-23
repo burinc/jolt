@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two are different keys. `jolt.host/embedded-resource?` is the Clojure-side
   predicate.
 
+- **`jolt build --include NS` / `:jolt/build {:include [ns …]}`.** A namespace
+  the require scan cannot see — one the app reaches only through a runtime
+  `requiring-resolve`, a plugin loader's shape — was simply absent from the
+  built image, and a built binary has no source roots to load it from, so the
+  lookup failed at the call with "Could not locate … on the source roots". The
+  repeatable flag and the deps.edn key (symbols or strings) seed the require
+  closure with the named namespaces, so their vars are compiled in; a name with
+  no source file on the roots fails the build, instead of silently baking
+  nothing and leaving the failure to the binary's first lookup.
+
 ### Fixed
 
 - **`io/input-stream` refused an embedded resource, and `URL.openStream` handed

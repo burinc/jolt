@@ -1718,4 +1718,59 @@ else
   echo "  (this jolt carries no embedded stub: both paths are cc-linked here)"
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict + gzip-round-trip + signable)"
+# --include NS / :jolt/build {:include […]} bakes a namespace the require scan
+# cannot see. The motivating shape is an app that reaches a namespace only by a
+# runtime lookup (requiring-resolve): a built binary has no source roots, so
+# without the include the lookup dies at the call and nothing else in the build
+# notices. Both spellings are exercised, plus the two edges — the same app with
+# NO include must miss, and an include nothing can emit must fail the build —
+# so neither assertion can pass for the wrong reason.
+echo "build smoke: --include bakes a dynamically looked-up namespace"
+inc_app="$(mktemp -d)/inc-app"
+mkdir -p "$inc_app/src/inc"
+printf '(ns inc.plugin)\n(defn hello [] "plugin-load")\n' > "$inc_app/src/inc/plugin.clj"
+cat > "$inc_app/src/inc/core.clj" <<'INC_CORE_EOF'
+(ns inc.core)
+(defn -main [& _]
+  (println "include:" (if-let [f (requiring-resolve 'inc.plugin/hello)] (f) :missing)))
+INC_CORE_EOF
+printf '{:paths ["src"]}\n' > "$inc_app/deps.edn"
+incbin="$(dirname "$out")/inc-bin"
+if ! JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$incbin" --include inc.plugin >/dev/null 2>&1; then
+  echo "  FAIL: --include build exited non-zero"; exit 1
+fi
+got_inc="$(cd / && "$incbin" 2>&1)"
+if [ "$got_inc" != "include: plugin-load" ]; then
+  echo "  FAIL: --include binary — want 'include: plugin-load', got \`$got_inc\`"; exit 1
+fi
+# the deps.edn spelling of the same thing (symbols, not strings)
+printf '{:paths ["src"] :jolt/build {:include [inc.plugin]}}\n' > "$inc_app/deps.edn"
+incdeps="$(dirname "$out")/inc-deps-bin"
+if ! JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$incdeps" >/dev/null 2>&1; then
+  echo "  FAIL: :jolt/build {:include […]} build exited non-zero"; exit 1
+fi
+got_incdeps="$(cd / && "$incdeps" 2>&1)"
+if [ "$got_incdeps" != "include: plugin-load" ]; then
+  echo "  FAIL: deps.edn :include binary — want 'include: plugin-load', got \`$got_incdeps\`"; exit 1
+fi
+# ...and with neither spelling the lookup MISSES — the passes above are only
+# meaningful against a baseline that fails.
+printf '{:paths ["src"]}\n' > "$inc_app/deps.edn"
+incnone="$(dirname "$out")/inc-none-bin"
+if ! JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$incnone" >/dev/null 2>&1; then
+  echo "  FAIL: plain include-less build exited non-zero"; exit 1
+fi
+got_incnone="$(cd / && "$incnone" 2>&1 || true)"
+if ! printf '%s' "$got_incnone" | grep -q 'Could not locate inc/plugin'; then
+  echo "  FAIL: without an include the lookup must miss — got \`$got_incnone\`"; exit 1
+fi
+# a name nothing can emit fails the build instead of silently baking nothing
+if JOLT_PWD="$inc_app" "$jolt" build -m inc.core -o "$(dirname "$out")/inc-bad-bin" --include no.such.ns >"$(dirname "$out")/inc-bad.log" 2>&1; then
+  echo "  FAIL: an unemittable --include name was accepted"; exit 1
+fi
+if ! grep -q 'cannot include no.such.ns' "$(dirname "$out")/inc-bad.log"; then
+  echo "  FAIL: the include failure did not name the namespace"; tail -5 "$(dirname "$out")/inc-bad.log"; exit 1
+fi
+rm -rf "$(dirname "$inc_app")"
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include)"

@@ -530,6 +530,22 @@ fails at the call, by name: the binary has that namespace's source to compile
 and no compiler, and the loader says so, pointing at the vouch. Name a site
 only when you can say why it is dead.
 
+A namespace the app reaches only by a runtime lookup — a plugin loader's
+`(requiring-resolve 'myapp.plugin/run)` — is invisible to the require scan, and
+a built binary has no source roots to load it from. Bake it in explicitly; the
+flag repeats, and the `deps.edn` key takes symbols or strings:
+
+```bash
+jolt build -m myapp.core --include myapp.plugin
+```
+
+```clojure
+:jolt/build {:include [myapp.plugin]}
+```
+
+An include with no source file on the roots fails the build, rather than baking
+nothing and leaving the failure to the binary's first lookup.
+
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the
 image but compresses it with gzip, and `--boot plain` drops it altogether:
