@@ -279,8 +279,8 @@
             ;; mapping to fall back on then, so a use ABOVE the ns's own
             ;; (defn nm …) is "Unable to resolve symbol", not clojure.core/nm
             ;; (jolt#1095). The same guard jsq-resolve-symbol applies.
-            (and (chez-core-visible? (chez-actx-cns ctx) nm)
-                 (var-cell-lookup "clojure.core" nm))))))
+            ;; Public vars only, as the JVM's refer maps them.
+            (chez-core-refer-cell (chez-actx-cns ctx) nm)))))
 
 ;; Runtime macros: a defmacro is emitted into the prelude as a
 ;; def-var! of its cross-compiled expander fn plus (mark-macro! ns name), so the

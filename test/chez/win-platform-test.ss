@@ -585,6 +585,22 @@
           "C:\\Windows")
 (envblock "SystemRoot alone fills an empty environment" '()
           (string-append "SystemRoot=C:\\Windows" NUL) "C:\\Windows")
+;; ...in NameComparator's order, which upper-cases: `_` (0x5F) sorts after Z
+;; (0x5A), where a lower-cased comparison put it before a (0x61)
+(envblock "an underscore sorts after Z, as Windows canonicalizes upward"
+          '(("_JAVA_OPTIONS" . "1") ("ZETA" . "2") ("alpha" . "3"))
+          (string-append "alpha=3" NUL "ZETA=2" NUL "_JAVA_OPTIONS=1" NUL))
+(envblock "a shorter name sorts first when one prefixes the other"
+          '(("PATHEXT" . "1") ("Path" . "2"))
+          (string-append "Path=2" NUL "PATHEXT=1" NUL))
+;; The MAP is case-sensitive, as the JDK's is: ProcessBuilder.environment() is a
+;; clone of a HashMap there too, and only System.getenv(String) ignores case. So
+;; a "PATH" put beside an inherited "Path" is a second entry on the JVM as well.
+(same "the environment map keeps PATH and Path apart, as the JDK's HashMap does"
+      (let ((em (make-proc-env-from-strings (jolt-vector "Path=C:\\old"))))
+        (hashtable-set! (jhost-state em) "PATH" "C:\\new")   ; what .put does
+        (length (proc-env-map-pairs em)))
+      2)
 
 ;; --- STARTUPINFOW / PROCESS_INFORMATION layout -------------------------------
 ;; Derived from the pointer width rather than hardcoded, so the same formulas
