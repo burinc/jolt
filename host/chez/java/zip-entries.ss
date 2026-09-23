@@ -557,10 +557,11 @@
 ;; A method NAME that only ZipInputStream has, taking one of ARITIES arguments.
 ;; On any other in-stream, or with another count, there is no matching method.
 (define (zipin-method name arities f)
-  (lambda (self . args)
-    (if (and (zipin-of self) (memv (length args) arities))
-        (apply f self args)
-        (no-method-throw name self (length args)))))
+  (host-arity-of arities #t
+    (lambda (self . args)
+      (if (and (zipin-of self) (memv (length args) arities))
+          (apply f self args)
+          (no-method-throw name self (length args))))))
 
 ;; closeEntry(): lines 169-173, through this stream's own read.
 (define (zipin-close-entry self)

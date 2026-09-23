@@ -28,14 +28,20 @@
 ;; Chez flonum op. When every operand is a proven flonum, the Math call lowers to
 ;; the flonum op (the back end reads :fl-op) instead of the generic string-keyed
 ;; host-static dispatch — and, crucially, the result types :double so it doesn't
-;; break flonum contagion in the surrounding arithmetic. Chez flatan takes 1 or 2
-;; args (2-arg = atan2); fllog takes 1 or 2. abs/floor/ceil are double-in→double-out
-;; here because the branch only fires on a proven-double operand.
+;; break flonum contagion in the surrounding arithmetic. abs/floor/ceil are
+;; double-in→double-out here because the branch only fires on a proven-double
+;; operand.
+;;
+;; As [op arity], the arity being the JVM method's, as math-lng-ops below does. A
+;; call at any other arity is not this method, so it keeps host-static-call and
+;; its "No matching method" miss: without the arity, (Math/floor 4.5 1) lowered
+;; to (flfloor 4.5 1.0) and failed Chez's compile-time arity check instead. (Chez
+;; flatan and fllog take a second argument; Math/atan and Math/log do not.)
 (def ^:private math-fl-ops
-  {"sqrt" "flsqrt" "sin" "flsin" "cos" "flcos" "tan" "fltan"
-   "asin" "flasin" "acos" "flacos" "atan" "flatan" "atan2" "flatan"
-   "exp" "flexp" "log" "fllog" "floor" "flfloor" "ceil" "flceiling"
-   "pow" "flexpt" "abs" "flabs"})
+  {"sqrt" ["flsqrt" 1] "sin" ["flsin" 1] "cos" ["flcos" 1] "tan" ["fltan" 1]
+   "asin" ["flasin" 1] "acos" ["flacos" 1] "atan" ["flatan" 1] "atan2" ["flatan" 2]
+   "exp" ["flexp" 1] "log" ["fllog" 1] "floor" ["flfloor" 1] "ceil" ["flceiling" 1]
+   "pow" ["flexpt" 2] "abs" ["flabs" 1]})
 
 ;; java.lang.Math members that are integer-in/integer-out on the JVM, as
 ;; [op arity] over the jolt-l-* fixnum macros (host/chez/seq.ss). Without this a
@@ -233,7 +239,7 @@
       ;; least one genuine :double operand (so (Math/abs 5) keeps its int result) and
       ;; every other operand a :double, a :long (widened to flonum — JVM widens a long
       ;; arg to these double-returning overloads too), or an integer literal.
-      (and math-op (pos? n)
+      (and math-op (= (nth math-op 1) n)
            (some (fn [r] (= :double (nth r 0))) ars)
            (every? (fn [r] (let [k (nth r 0)]
                              (or (= k :double) (= k :long) (int-lit? (nth r 1))))) ars))
@@ -242,7 +248,7 @@
                                        (= k :long) (assoc nd :fl-coerce true)
                                        :else nd)))
                         ars)]
-        [:double (assoc node1 :args args' :fl-op math-op)])
+        [:double (assoc node1 :args args' :fl-op (nth math-op 0))])
       ;; java.lang.Math over proven fixnum operands -> the jolt-l-* fixnum macro,
       ;; result typed :long so it doesn't de-opt the surrounding integer arithmetic.
       ;; Mirrors the flonum clause above: at least one genuine :long operand (so

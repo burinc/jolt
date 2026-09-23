@@ -155,11 +155,12 @@
 (define zout-prior-close (zout-prior "close"))
 
 (define (zout-method name arities prior f)
-  (lambda (self . args)
-    (let ((z (zout-of self)))
-      (cond ((not z) (apply prior self args))
-            ((memv (length args) arities) (apply f self z args))
-            (else (no-method-throw name self (length args)))))))
+  (host-arity-over prior arities
+    (lambda (self . args)
+      (let ((z (zout-of self)))
+        (cond ((not z) (apply prior self args))
+              ((memv (length args) arities) (apply f self z args))
+              (else (no-method-throw name self (length args))))))))
 
 (define (zout-null-array)
   (throw-jvm 'NullPointerException "Cannot read the array length because \"b\" is null"))

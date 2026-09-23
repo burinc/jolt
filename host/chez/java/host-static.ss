@@ -84,6 +84,305 @@
              (hashtable-ref host-class-ctors-tbl short #f))
          #t)))
 
+;; ---- arity, before the member runs ------------------------------------------
+;; The JVM resolves a call by its ARITY before it runs anything: an extra trailing
+;; argument is "No matching method X found taking N args", never a silently
+;; dropped value. A table entry written with a fixed signature already says which
+;; arities it has — procedure-arity-mask reads them straight off the procedure —
+;; so the only thing missing was asking. A `. rest` entry says nothing, which is
+;; how (String/valueOf ca 1 2) came back "abc": valueOf's one arm took the array
+;; and never looked at the offset and count it was handed.
+;;
+;; So a member with overloads writes them as a case-lambda rather than as one
+;; rest-taking arm that picks arguments out of a list — the mask then carries the
+;; overload set, and the two invocation sites below (host-static-call for a
+;; static, the jhost arm for an instance method) enforce it with one bit test. A
+;; member that is genuinely variadic on the JVM — String/format, String/join —
+;; keeps its rest arg and stays unchecked, which is correct rather than lax.
+;;
+;; N is the JAVA argument count; an instance method's procedure also takes the
+;; receiver, which is not one of them.
+(define (host-arity-ok? f n self?)
+  (bitwise-bit-set? (procedure-arity-mask f) (if self? (fx+ n 1) n)))
+
+;; A wrapper that takes `. args` to do something for every call — coerce the
+;; operands, check the receiver, count the arguments itself — reads as "any
+;; arity" to the bit test above, and so hid its member's overload set: every
+;; Math entry went through one such wrapper and (Math/abs 1 2) reached Chez's
+;; own arity error, which names an anonymous procedure. These give a wrapper the
+;; mask it actually honours, so the check keeps working through it.
+;;
+;;   (host-arity-like f wrapper)            ; wrapper answers exactly f's arities
+;;   (host-arity-of arities self? wrapper)  ; ARITIES are Java argument counts
+;;   (host-arity-over prior arities wrapper) ; an instance method that answers
+;;                                           ; ARITIES and hands every other
+;;                                           ; receiver to PRIOR
+(define (host-arities->mask arities self?)
+  (fold-left (lambda (m n) (bitwise-ior m (bitwise-arithmetic-shift-left 1 (if self? (fx+ n 1) n))))
+             0 arities))
+(define (host-arity-like f wrapper)
+  (make-arity-wrapper-procedure wrapper (procedure-arity-mask f) #f))
+(define (host-arity-of arities self? wrapper)
+  (make-arity-wrapper-procedure wrapper (host-arities->mask arities self?) #f))
+(define (host-arity-over prior arities wrapper)
+  (make-arity-wrapper-procedure
+    wrapper
+    (bitwise-ior (procedure-arity-mask prior) (host-arities->mask arities #t))
+    #f))
+
+;; ---- the JVM's overload arities, for members that cannot state their own ------
+;; A member written `(lambda (self . args) ...)` picks its overload out of the
+;; argument list, so its procedure takes any count and the arity check above
+;; passes everything: (Integer/parseInt "1" 10 3) answered 1 and dropped the 3,
+;; (Thread/sleep 1 0 1) slept and answered nil. Rewriting ~170 such members as
+;; case-lambdas would restate each body once per overload, so they declare the
+;; JVM's arities here instead, and registration gives the procedure that mask.
+;;
+;; Each row is (key member count ...): the counts are the Java argument counts of
+;; the member's public overloads, read by reflection from the JDK, never the
+;; receiver. A static's key is the class's simple name (the FQN and the simple
+;; name share one member table); an instance method's key is its jhost tag, and
+;; a tag that serves several classes (in-stream, out-stream) takes the union.
+;; `varargs` marks a member with a trailing `...` parameter: jolt accepts its
+;; elements loose as well as in an array, so it stays open on purpose.
+;;
+;; A member with a fixed signature, or a wrapper built with host-arity-like /
+;; host-arity-of, already answers its own arities and needs no row. `make
+;; hostarity` fails on any member that still takes any count without a row here,
+;; and on a row that names nothing registered.
+(define host-static-arity-rows
+  '(
+    ("Array" "newInstance" varargs)
+    ("Arrays" "asList" varargs)
+    ("Base64" "getMimeEncoder" 0 2)
+    ("BigDecimal" "valueOf" 1 2)
+    ("Byte" "parseByte" 1 2)
+    ("Byte" "toString" 1)
+    ("Byte" "valueOf" 1 2)
+    ("ByteBuffer" "wrap" 1 3)
+    ("Calendar" "getInstance" 0 1 2)
+    ("Class" "forName" 1 2 3)
+    ("Collections" "emptyList" 0)
+    ("Collections" "emptyMap" 0)
+    ("Collections" "synchronizedList" 1)
+    ("Collections" "synchronizedMap" 1)
+    ("Collections" "synchronizedSet" 1)
+    ("Collections" "unmodifiableList" 1)
+    ("Collections" "unmodifiableMap" 1)
+    ("Collections" "unmodifiableSet" 1)
+    ("Compiler" "eval" 1 2)
+    ("Executors" "newCachedThreadPool" 0 1)
+    ("Executors" "newFixedThreadPool" 1 2)
+    ("Executors" "newScheduledThreadPool" 1 2)
+    ("Executors" "newSingleThreadExecutor" 0 1)
+    ("Executors" "newSingleThreadScheduledExecutor" 0 1)
+    ("Executors" "newVirtualThreadPerTaskExecutor" 0)
+    ("Executors" "newWorkStealingPool" 0 1)
+    ("File" "createTempFile" 2 3)
+    ("FileChannel" "open" varargs)
+    ("FileTime" "from" 1 2)
+    ("Files" "copy" varargs)
+    ("Files" "createDirectories" varargs)
+    ("Files" "createDirectory" varargs)
+    ("Files" "createFile" varargs)
+    ("Files" "createLink" 2)
+    ("Files" "createSymbolicLink" varargs)
+    ("Files" "createTempDirectory" varargs)
+    ("Files" "createTempFile" varargs)
+    ("Files" "exists" varargs)
+    ("Files" "getAttribute" varargs)
+    ("Files" "getLastModifiedTime" varargs)
+    ("Files" "getOwner" varargs)
+    ("Files" "getPosixFilePermissions" varargs)
+    ("Files" "isDirectory" varargs)
+    ("Files" "isExecutable" 1)
+    ("Files" "isHidden" 1)
+    ("Files" "isReadable" 1)
+    ("Files" "isRegularFile" varargs)
+    ("Files" "isSymbolicLink" 1)
+    ("Files" "isWritable" 1)
+    ("Files" "move" varargs)
+    ("Files" "newDirectoryStream" 1 2)
+    ("Files" "newInputStream" varargs)
+    ("Files" "newOutputStream" varargs)
+    ("Files" "notExists" varargs)
+    ("Files" "readAllLines" 1 2)
+    ("Files" "readAttributes" varargs)
+    ("Files" "setAttribute" varargs)
+    ("Files" "setPosixFilePermissions" 2)
+    ("Files" "size" 1)
+    ("Files" "write" varargs)
+    ("GregorianCalendar" "getInstance" 0 1 2)
+    ("Integer" "parseInt" 1 2 4)
+    ("Integer" "toString" 1 2)
+    ("Integer" "valueOf" 1 2)
+    ("Keyword" "find" 1 2)
+    ("Keyword" "intern" 1 2)
+    ("Long" "parseLong" 1 2 4)
+    ("Long" "toString" 1 2)
+    ("Long" "valueOf" 1 2)
+    ("Math" "random" 0)
+    ("NumberFormat" "getCurrencyInstance" 0 1)
+    ("NumberFormat" "getInstance" 0 1)
+    ("NumberFormat" "getIntegerInstance" 0 1)
+    ("NumberFormat" "getNumberInstance" 0 1)
+    ("Numbers" "equiv" 2)
+    ("Objects" "hash" varargs)
+    ("Optional" "empty" 0)
+    ("Path" "of" varargs)
+    ("Paths" "get" varargs)
+    ("Pattern" "compile" 1 2)
+    ("RT" "aget" 2)
+    ("RT" "alength" 1)
+    ("RT" "assoc" 3)
+    ("RT" "classForName" 1 3)
+    ("RT" "classForNameNonLoading" 1)
+    ("RT" "conj" 2)
+    ("RT" "dissoc" 2)
+    ("RT" "find" 2)
+    ("RT" "list" 0 1 2 3 4 5)
+    ("RT" "subvec" 3)
+    ("SecureRandom" "getInstance" 1 2 3)
+    ("SecureRandom" "getInstanceStrong" 0)
+    ("Short" "parseShort" 1 2)
+    ("Short" "toString" 1)
+    ("Short" "valueOf" 1 2)
+    ("String" "format" varargs)
+    ("String" "join" varargs)
+    ("Symbol" "create" 1 2)
+    ("Symbol" "intern" 1 2)
+    ("System" "console" 0)
+    ("System" "exit" 1)
+    ("System" "gc" 0)
+    ("System" "getProperty" 1 2)
+    ("System" "lineSeparator" 0)
+    ("System" "runFinalization" 0)
+    ("Thread" "interrupted" 0)
+    ("Thread" "sleep" 1 2)
+    ("Thread" "yield" 0)
+    ("URLDecoder" "decode" 1 2)
+    ("URLEncoder" "encode" 1 2)
+    ("Var" "intern" 2 3 4)))
+(define host-method-arity-rows
+  '(
+    ("abq" "offer" 1 3)
+    ("abq" "poll" 0 2)
+    ("abq" "toArray" 0 1)
+    ("arraydeque" "add" 1)
+    ("arraydeque" "addAll" 1)
+    ("arraydeque" "toArray" 0 1)
+    ("arraylist" "add" 1 2)
+    ("arraylist" "addAll" 1 2)
+    ("arraylist" "toArray" 0 1)
+    ("arrays-aslist" "toArray" 0 1)
+    ("byte-buffer" "get" 0 1 2 3 4)
+    ("byte-buffer" "getChar" 0 1)
+    ("byte-buffer" "getInt" 0 1)
+    ("byte-buffer" "getLong" 0 1)
+    ("byte-buffer" "getShort" 0 1)
+    ("byte-buffer" "limit" 0 1)
+    ("byte-buffer" "position" 0 1)
+    ("byte-buffer" "put" 1 2 3 4)
+    ("byte-buffer" "putChar" 1 2)
+    ("byte-buffer" "putInt" 1 2)
+    ("byte-buffer" "putLong" 1 2)
+    ("byte-buffer" "putShort" 1 2)
+    ("calendar" "set" 2 3 5 6)
+    ("char-buffer" "get" 0 1 2 3 4)
+    ("char-buffer" "limit" 0 1)
+    ("char-buffer" "position" 0 1)
+    ("char-buffer" "put" 1 2 3 4)
+    ("char-reader" "mark" 1)
+    ("char-reader" "read" 0 1 3)
+    ("char-writer" "append" 1 3)
+    ("char-writer" "write" 1 3)
+    ("charset-decoder" "decode" 1 3)
+    ("class" "getConstructor" varargs)
+    ("class" "getDeclaredConstructor" varargs)
+    ("class" "getDeclaredMethod" varargs)
+    ("class" "getMethod" varargs)
+    ("class-ctor" "newInstance" varargs)
+    ("count-down-latch" "await" 0 2)
+    ("executor-service" "awaitTermination" 2)
+    ("executor-service" "invokeAll" 1 3)
+    ("executor-service" "invokeAny" 1 3)
+    ("file-writer" "append" 1 3)
+    ("file-writer" "write" 1 3)
+    ("future-task" "cancel" 1)
+    ("future-task" "get" 0 2)
+    ("hashset" "toArray" 0 1)
+    ("in-stream" "mark" 1)
+    ("in-stream" "read" 0 1 3)
+    ("in-stream" "readNBytes" 1 3)
+    ("in-stream" "skip" 1)
+    ("in-stream" "unread" 1 3)
+    ("j-future" "cancel" 1)
+    ("j-future" "get" 0 2)
+    ("jolt-runtime" "exec" 1 2 3)
+    ("linkedlist" "add" 1 2)
+    ("linkedlist" "addAll" 1 2)
+    ("linkedlist" "toArray" 0 1)
+    ("nio-filesystem" "getPath" varargs)
+    ("out-stream" "finish" 0)
+    ("out-stream" "toString" 0 1)
+    ("out-stream" "write" 1 3)
+    ("port-writer" "append" 1 3)
+    ("port-writer" "println" 0 1)
+    ("port-writer" "write" 1 3)
+    ("print-stream" "append" 1 3)
+    ("print-stream" "format" varargs)
+    ("print-stream" "printf" varargs)
+    ("print-stream" "println" 0 1)
+    ("print-stream" "write" 1 3)
+    ("print-writer" "append" 1 3)
+    ("print-writer" "write" 1 3)
+    ("print-writer-on" "append" 1 3)
+    ("print-writer-on" "write" 1 3)
+    ("process" "waitFor" 0 1 2)
+    ("process-builder" "command" varargs)
+    ("process-builder" "redirectError" 0 1)
+    ("process-builder" "redirectErrorStream" 0 1)
+    ("process-builder" "redirectInput" 0 1)
+    ("process-builder" "redirectOutput" 0 1)
+    ("properties" "getProperty" 1 2)
+    ("pushback-reader" "read" 0 1 3)
+    ("pushback-reader" "unread" 1 3)
+    ("random" "nextInt" 0 1 2)
+    ("reader-adapter" "mark" 1)
+    ("reader-adapter" "read" 0 1 3)
+    ("reentrant-lock" "tryLock" 0 2)
+    ("ref-queue" "poll" 0)
+    ("ref-queue" "remove" 0 1)
+    ("reflect-method" "invoke" varargs)
+    ("securerandom" "nextInt" 0 1 2)
+    ("securerandom" "setSeed" 1)
+    ("string-reader" "mark" 1)
+    ("string-reader" "read" 0 1 3)
+    ("url" "openConnection" 0 1)
+    ("user-thread" "interrupt" 0)
+    ("user-thread" "join" 0 1 2)
+    ("writer" "append" 1 3)
+    ("writer" "write" 1 3)
+    ("zip-adler32" "update" 1 3)
+    ("zip-crc32" "update" 1 3)))
+(define (host-arity-rows->table rows)
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (r) (hashtable-set! t (string-append (car r) "/" (cadr r)) (cddr r))) rows)
+    t))
+(define host-static-arities (host-arity-rows->table host-static-arity-rows))
+(define host-method-arities (host-arity-rows->table host-method-arity-rows))
+
+;; A member procedure as registration stores it: an open procedure with a fixed
+;; row gets the row's mask, narrowed to what the procedure itself accepts.
+(define (host-arity-declared table key member f self?)
+  (if (and (procedure? f) (< (procedure-arity-mask f) 0))
+      (let ((row (hashtable-ref table (string-append key "/" member) #f)))
+        (if (and row (not (eq? (car row) 'varargs)))
+            (make-arity-wrapper-procedure
+              f (bitwise-and (procedure-arity-mask f) (host-arities->mask row self?)) #f)
+            f))
+      f))
+
 ;; The merge itself: also the LIBRARY path (register-class-statics-owned!,
 ;; extend-class!), which adds members without making the class the runtime's.
 (define (class-statics-merge! name members)  ; members: list of (str . val/proc)
@@ -101,7 +400,8 @@
     (for-each (lambda (p)
                 (let ((old (hashtable-ref h (car p) #f)))
                   (when old (registry-collision! "static" name (car p) old (cdr p))))
-                (hashtable-set! h (car p) (cdr p)))
+                (hashtable-set! h (car p)
+                  (host-arity-declared host-static-arities short (car p) (cdr p) #f)))
               members)))
 
 ;; Names the HOST registered (io.ss, io-streams.ss, …), as opposed to a library
@@ -194,28 +494,10 @@
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
                (let ((h (make-hashtable string-hash string=?)))
                  (hashtable-set! host-methods-tbl tag h) h))))
-    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
-
-;; ---- arity, before the member runs ------------------------------------------
-;; The JVM resolves a call by its ARITY before it runs anything: an extra trailing
-;; argument is "No matching method X found taking N args", never a silently
-;; dropped value. A table entry written with a fixed signature already says which
-;; arities it has — procedure-arity-mask reads them straight off the procedure —
-;; so the only thing missing was asking. A `. rest` entry says nothing, which is
-;; how (String/valueOf ca 1 2) came back "abc": valueOf's one arm took the array
-;; and never looked at the offset and count it was handed.
-;;
-;; So a member with overloads writes them as a case-lambda rather than as one
-;; rest-taking arm that picks arguments out of a list — the mask then carries the
-;; overload set, and the two invocation sites below (host-static-call for a
-;; static, the jhost arm for an instance method) enforce it with one bit test. A
-;; member that is genuinely variadic on the JVM — String/format, String/join —
-;; keeps its rest arg and stays unchecked, which is correct rather than lax.
-;;
-;; N is the JAVA argument count; an instance method's procedure also takes the
-;; receiver, which is not one of them.
-(define (host-arity-ok? f n self?)
-  (bitwise-bit-set? (procedure-arity-mask f) (if self? (fx+ n 1) n)))
+    (for-each (lambda (p)
+                (hashtable-set! h (car p)
+                  (host-arity-declared host-method-arities tag (car p) (cdr p) #t)))
+              members)))
 
 ;; The comparator seam (natives-seq.ss jolt-comparator-fn) asks whether a value
 ;; is a shim object whose tag registers a `compare` method — a Comparator held
@@ -435,10 +717,16 @@
     ((string=? method "floatValue") (->num n))
     ;; .toString(radix) — BigInteger/Integer render in a base, lowercase like the
     ;; JVM (rewrite-clj's integer node reconstructs 0xff / 0377 / 2r1001 this way).
+    ;; It is BigInteger's overload, the one jolt's single integer type can take, so
+    ;; it follows BigInteger: a radix outside 2..36 renders in base 10 rather than
+    ;; raising, and a double has no such overload.
     ((string=? method "toString")
-     (if (pair? args)
-         (string-downcase (number->string (jnum->exact n) (jnum->exact (car args))))
-         (jolt-num->string n)))
+     (cond ((null? args) (jolt-num->string n))
+           ((and (exact? n) (integer? n))
+            (let ((radix (jnum->exact (car args))))
+              (string-downcase
+                (number->string n (if (and (fixnum? radix) (fx<=? 2 radix 36)) radix 10)))))
+           (else (dispatch-miss n method args))))
     ((string=? method "hashCode") (->num (jnum->exact n)))
     ;; Double/Float .isNaN / .isInfinite (a non-flonum is neither).
     ((string=? method "isNaN") (and (flonum? n) (not (= n n))))
@@ -911,6 +1199,16 @@
            (and (jhost? root) (string=? (jhost-tag root) "class")
                 (vector-ref (jhost-state root) 0))))))
 
+;; The class a static call names, spelled as the JVM reports it: a qualified
+;; name as written, an imported simple name through its import, and one of the
+;; default java.lang imports (Math, String, Thread) through ns.ss's canonical
+;; table.
+(define (static-class-fqn class)
+  (cond ((memv #\. (string->list class)) class)
+        ((imported-class-fqn class))
+        ((member class jolt-default-import-names) (jolt-default-import-canonical class))
+        (else class)))
+
 (define (unknown-class-message class)
   (let ((class (or (imported-class-fqn class) class)))
   (cond
@@ -954,20 +1252,12 @@
        (string-append "No matching field or method: " class "/" member))
       (else (unknown-class-message class)))))
 
-;; JVM Clojure resolves (.getName String) — an instance member on a class
-;; token — as a call on the java.lang.Class OBJECT when the class has no such
-;; static. Mirror it: a static-member miss consults the Class instance table
-;; (the "class" tag) and applies the method to the interned class object. Only
-;; the miss paths reach here, so a real static always wins; the unknown-class
-;; arm additionally requires jch-known?, so a typo'd class name still reports
-;; Unknown class instead of answering reflection calls. jolt-class-for is
-;; defined in host-static-classes.ss (loads after us) — resolved at call time.
-(define (class-instance-fallback class member)
-  (let ((h (hashtable-ref host-methods-tbl "class" #f)))
-    (and h
-         (let ((m (hashtable-ref h member #f)))
-           (and m (lambda args (apply m (jolt-class-for class) args)))))))
-
+;; A member the class does not have is a miss, including a java.lang.Class
+;; instance method: (Math/getName) and (. Math getName) have no static to call on
+;; the JVM either. (.getName Math) is the Class-object call, and it reaches the
+;; class value through the instance path, not through here. This used to fall
+;; back to the Class instance table, which answered "Math" for (Math/getName)
+;; where the JVM refuses the call.
 ;; Unique miss marker: the registry holds fields and methods in one table, and a
 ;; field may legitimately hold a falsy value (Boolean/FALSE is #f), so absence
 ;; cannot be read off a #f result.
@@ -980,8 +1270,7 @@
           (if h
               (let ((v (hashtable-ref h member host-static-miss)))
                 (if (eq? v host-static-miss)
-                    (or (class-instance-fallback class member)
-                        (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member)))
+                    (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member))
                     v))
               ;; class miss — autoload the provider that declares the class (the
               ;; java.time base, jolt.socket, or a library that installs it) and
@@ -989,8 +1278,7 @@
               ;; has loaded, so the miss is where resolution belongs (jolt#914).
               (if (lib-try-autoload! class)
                   (host-static-ref class member)
-                  (or (and (jch-known? class) (class-instance-fallback class member))
-                      (throw-jvm (quote IllegalArgumentException) (static-miss-message class member)))))))))
+                  (throw-jvm (quote IllegalArgumentException) (static-miss-message class member))))))))
 
 (define (host-static-call class member . args)
   ;; the registry's one rule: a procedure is a method to call, anything else is
@@ -1001,12 +1289,14 @@
     (cond ((procedure? v)
            (if (host-arity-ok? v (length args) #f)
                (apply v args)
-               ;; the JVM's reflective miss for a static, which names no class —
-               ;; (String/valueOf ca 0) is "No matching method valueOf found
-               ;; taking 2 args", not valueOf(char[]) with the 0 thrown away.
+               ;; the compiler's miss for a static call with no overload of that
+               ;; arity — (String/valueOf ca 0) is "No matching method valueOf
+               ;; found taking 2 args for class java.lang.String", not
+               ;; valueOf(char[]) with the 0 thrown away.
                (throw-jvm (quote IllegalArgumentException)
                  (string-append "No matching method " member " found taking "
-                                (number->string (length args)) " args"))))
+                                (number->string (length args)) " args for class "
+                                (static-class-fqn class)))))
           ((null? args) v)
           (else (throw-jvm (quote IllegalArgumentException)
                   (string-append class "/" member " is a static field; it takes no arguments"))))))

@@ -208,7 +208,8 @@
 (define (al-family? x)
   (and (jhost? x) (or (string=? (jhost-tag x) "arraylist")
                        (string=? (jhost-tag x) "linkedlist")
-                       (string=? (jhost-tag x) "arraydeque"))))
+                       (string=? (jhost-tag x) "arraydeque")
+                       (string=? (jhost-tag x) "arrays-aslist"))))
 (register-seq-arm! al-family? (lambda (x) (list->cseq (al->list x))))
 
 ;; ---- StringWriter -----------------------------------------------------------
@@ -2277,6 +2278,35 @@
 ;; (jolt.host/table? x) — is x a host tagged-table?
 (def-var! "jolt.host" "table?" (lambda (x) (if (htable? x) #t #f)))
 
+;; --- Arrays.asList ----------------------------------------------------------
+;; A fixed-size List VIEW of the array: .set writes the array and aset shows
+;; through the list, and add/remove raise UnsupportedOperationException, as
+;; java.util.Arrays$ArrayList does. The view shares the array's backing vector
+;; in ArrayList's state layout — #(backing count head) — so the ArrayList
+;; accessors read it unchanged. A reference array's backing is a plain vector
+;; and is never replaced (only fxvector and string backings promote), so the
+;; view cannot detach from its array.
+;;
+;; asList is varargs: an Object[] is the list's array, and loose elements get a
+;; fresh one, the looseness String/format already has.
+(define (arrays-as-list . args)
+  (let ((arr (if (and (= 1 (length args)) (jolt-array? (car args))
+                      (eq? (jolt-array-kind (car args)) 'object))
+                 (car args)
+                 (make-jolt-array (list->vector args) 'object))))
+    (make-jhost "arrays-aslist" (vector (jolt-array-vec arr) (ja-len arr) 0))))
+(define (aslist-unsupported . _) (throw-jvm 'UnsupportedOperationException jolt-nil))
+(define arrays-aslist-methods
+  (let ((read-only (lambda (name) (cdr (assoc name arraylist-methods)))))
+    (append
+      (map (lambda (n) (cons n (read-only n)))
+           '("get" "set" "size" "isEmpty" "contains" "toArray" "iterator" "toString"))
+      (list (cons "getFirst" al-first) (cons "getLast" al-last))
+      (map (lambda (e) (cons (car e) (host-arity-of (cdr e) #t aslist-unsupported)))
+           '(("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0)
+             ("addFirst" 1) ("addLast" 1) ("removeFirst" 0) ("removeLast" 0))))))
+(register-host-methods! "arrays-aslist" arrays-aslist-methods)
+
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
 ;; array's own backing (whichever of the four natives-array.ss picks for the
@@ -2337,9 +2367,89 @@
                                     "[" (if (null? parts) ""
                                             (fold-left (lambda (acc s) (string-append acc ", " s))
                                                        (car parts) (cdr parts)))
-                                    "]"))))))))
+                                    "]")))))
+         (cons "asList" arrays-as-list))))
   (register-class-statics! "Arrays" arrays-statics)
   (register-class-statics! "java.util.Arrays" arrays-statics))
+
+;; --- java.util.Objects ------------------------------------------------------
+;; The null-safe forms of equals/hashCode/toString, over the same seams a value's
+;; own .equals and .hashCode take (record-method-dispatch, jolt-java-hashcode), so
+;; Objects/equals on two jolt values answers what (.equals a b) does: an array is
+;; equal only to itself, a vector equals a list with the same elements.
+(define (objects-equals? a b)
+  (or (eq? a b)
+      (and (not (jolt-nil? a))
+           (jolt-truthy? (record-method-dispatch a "equals" (jolt-list b))))))
+(define (objects-deep-equals? a b)
+  (cond ((eq? a b) #t)
+        ((or (jolt-nil? a) (jolt-nil? b)) #f)
+        ((and (jolt-array? a) (jolt-array? b))
+         (and (eq? (jolt-array-kind a) (jolt-array-kind b))
+              (= (ja-len a) (ja-len b))
+              (let loop ((i 0))
+                (or (fx=? i (ja-len a))
+                    (and (objects-deep-equals? (ja-ref a i) (ja-ref b i)) (loop (fx+ i 1)))))))
+        (else (objects-equals? a b))))
+;; Arrays.hashCode(Object[]), which Objects.hash is: 31*h + hash(e) from 1, in
+;; 32-bit int arithmetic, nil hashing to 0.
+(define (objects-hash-of xs)
+  (fold-left (lambda (h x) (i32 (+ (* 31 h) (jolt-java-hashcode x)))) 1 xs))
+;; A Supplier argument: a reified Supplier's get, or a plain fn (as withInitial
+;; takes above).
+(define (objects-supply f)
+  (if (iface-method f "get" 1) (record-method-dispatch f "get" jolt-nil) (jolt-invoke f)))
+(define (objects-npe msg) (throw-jvm 'NullPointerException msg))
+(let ((objects-statics
+       (list
+         (cons "equals" (lambda (a b) (objects-equals? a b)))
+         (cons "deepEquals" (lambda (a b) (objects-deep-equals? a b)))
+         (cons "hashCode" (lambda (o) (->num (jolt-java-hashcode o))))
+         ;; varargs: an Object[] is the values, loose values are too
+         (cons "hash" (lambda xs
+                        (->num (objects-hash-of
+                                 (if (and (= 1 (length xs)) (jolt-array? (car xs))
+                                          (eq? (jolt-array-kind (car xs)) 'object))
+                                     (ja->list (car xs))
+                                     xs)))))
+         (cons "toString"
+               (case-lambda
+                 ((o) (if (jolt-nil? o) "null" (jolt-str-render-one o)))
+                 ((o d) (if (jolt-nil? o) d (jolt-str-render-one o)))))
+         (cons "isNull" (lambda (o) (jolt-nil? o)))
+         (cons "nonNull" (lambda (o) (not (jolt-nil? o))))
+         ;; the message is a String, or a Supplier of one asked only on failure
+         (cons "requireNonNull"
+               (case-lambda
+                 ((o) (if (jolt-nil? o) (objects-npe jolt-nil) o))
+                 ((o m) (if (jolt-nil? o)
+                            (objects-npe (cond ((string? m) m)
+                                               ((jolt-nil? m) jolt-nil)
+                                               (else (objects-supply m))))
+                            o))))
+         (cons "requireNonNullElse"
+               (lambda (o d)
+                 (cond ((not (jolt-nil? o)) o)
+                       ((not (jolt-nil? d)) d)
+                       (else (objects-npe "defaultObj")))))
+         (cons "requireNonNullElseGet"
+               (lambda (o s)
+                 (cond ((not (jolt-nil? o)) o)
+                       ((jolt-nil? s) (objects-npe "supplier"))
+                       (else (let ((v (objects-supply s)))
+                               (if (jolt-nil? v) (objects-npe "supplier.get()") v))))))
+         (cons "compare"
+               (lambda (a b c) (if (eq? a b) 0 ((jolt-comparator-fn c) a b))))
+         (cons "checkIndex"
+               (lambda (i n)
+                 (let ((i (jnum->exact i)) (n (jnum->exact n)))
+                   (if (and (>= i 0) (< i n))
+                       (->num i)
+                       (throw-jvm 'IndexOutOfBoundsException
+                         (string-append "Index " (number->string i)
+                                        " out of bounds for length " (number->string n))))))))))
+  (register-class-statics! "Objects" objects-statics)
+  (register-class-statics! "java.util.Objects" objects-statics))
 
 ;; --- java.util.Random -------------------------------------------------------
 ;; Java-compatible LCG: java.util.Random's exact algorithm.

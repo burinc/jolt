@@ -101,10 +101,11 @@
 ;; A method WHO that takes one of ARITIES arguments after self; any other count
 ;; has no matching method.
 (define (zip-method who arities f)
-  (lambda (self . args)
-    (if (memv (length args) arities)
-        (apply f self args)
-        (no-method-throw who self (length args)))))
+  (host-arity-of arities #t
+    (lambda (self . args)
+      (if (memv (length args) arities)
+          (apply f self args)
+          (no-method-throw who self (length args))))))
 
 ;; The arguments of X(byte[]) | X(byte[], int off, int len, int ...) as
 ;; (values bv off len more), where MORE holds the int arguments after LEN.

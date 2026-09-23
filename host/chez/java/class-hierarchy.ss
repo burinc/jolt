@@ -862,6 +862,7 @@
 (jch-register-supers! "java.net.URLEncoder" '())
 (jch-register-supers! "java.net.URLDecoder" '())
 (jch-register-supers! "java.util.ArrayList" '("java.util.List" "java.util.RandomAccess"))
+(jch-register-supers! "java.util.Arrays$ArrayList" '("java.util.List" "java.util.RandomAccess"))
 (jch-register-supers! "java.util.Queue" '("java.util.Collection"))
 ;; the two blocking queues concurrency.ss models: without a row here they were
 ;; no BlockingQueue, Queue or Collection to instance?, so a (satisfies-ish) check
@@ -1205,6 +1206,7 @@
     ("coder-result" . "java.nio.charset.CoderResult")
     ("coding-error-action" . "java.nio.charset.CodingErrorAction")
     ("arraylist" . "java.util.ArrayList")
+    ("arrays-aslist" . "java.util.Arrays$ArrayList")
     ("linkedlist" . "java.util.LinkedList")
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
