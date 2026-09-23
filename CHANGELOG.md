@@ -5,6 +5,226 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.11] - 2026-09-22
+
+Namespace resolution, regex and Windows are the bulk of this window. A
+`^:private` var of another namespace is refused now, and `:refer-clojure
+:exclude`/`:only`/`:rename` mean what they mean on the JVM. That is the one
+breaking change here: code that calls another namespace's private function
+by its qualified name has to go through the var (`(@#'ns/f ...)`).
+`java.util.regex` got faster on `$`-anchored patterns and character classes,
+its matching agrees with the JVM on look-behinds, `\b`/`\B` and flag groups,
+and a bad pattern gets the JVM's `PatternSyntaxException` message. On
+Windows, subprocesses, sockets, `spit` over an existing file, `PATH`
+splitting and drive-rooted paths all work. `jolt build` gains `--signable`
+for macOS code signing, and a `:static` native links on a stock Linux box
+again. `bb.edn` tasks with `:exec-fn`/`:cmd` parse their arguments through
+babashka.cli.
+
+### Changed
+
+- **A `^:private` var of another namespace is refused.** Calling or reading
+  `a/hidden` from outside `a` is `var: #'a/hidden is not public` (call or
+  macro head) or `var: a/hidden is not public` (value position), as on the
+  JVM. `(var a/hidden)`, `#'a/hidden`, `@#'a/hidden` and `with-redefs` still
+  reach it. `refer :only`, `require :refer`, `use :only` and `:refer-clojure
+  :only` throw `IllegalAccessError` for a name that does not exist or is
+  private instead of ignoring it, and `refer` without `:only` refers only
+  public vars. A private `clojure.core` name is no longer visible unqualified
+  elsewhere: `(resolve 'lift-ns)` is `nil`. (#1095, #1113, #1115)
+
+  A macro that expands to its own namespace's private function breaks the
+  same way in its callers. glimmer's `reaction` did: a project using it
+  needs glimmer v0.1.3 or later. glimmer-tui v0.2.5, glimmer-gtk v0.1.1,
+  glimmer-gl v0.1.1, glimmer-appkit v0.1.2, glimmer-uikit v0.2.1 and
+  glimmer-datastar v0.1.1 pin it, as does duratom's main branch.
+- **`:refer-clojure` exclusion follows the JVM.** An excluded core name no
+  longer falls back to `clojure.core`, so using it above the namespace's own
+  def is `Unable to resolve symbol`. `:only` and `:rename` were ignored and are
+  honored now. A name stays withheld only while every `refer-clojure` the
+  namespace has seen withholds it, so `(refer-clojure :exclude '[inc])` after
+  a plain `(ns x)` leaves `inc` mapped. Reloading an ns form no longer grows
+  the exclusion list that every unqualified core lookup scans. The `try`/`catch`
+  lowering names `clojure.core/let` and friends, so a namespace that excludes
+  `let` and defines its own (promesa does) no longer gets its own `let` inside
+  every `catch`. (#1113, #1115)
+- **Regex alternation is leftmost-first when there are no groups.** A
+  non-capturing pattern always ran irregex's DFA, which is leftmost-longest:
+  `(re-find #"a|ab" "ab")` answered `"ab"`; the JVM and now jolt answer `"a"`.
+  (#1062)
+- **`clojure.test`: `(is (thrown? ...))` and `(is (thrown-with-msg? ...))`
+  return the exception** on a pass and `nil` otherwise, as `is`'s docstring
+  says. They returned the report counters map, so `(ex-message (is (thrown?
+  ...)))` was `nil` and an assertion on it tested nothing. (#1091)
+- **A redefined `deftest` replaces its registry entry.** Reloading a test
+  namespace ran each test once more per reload, and the first entry kept the
+  old body. The entry keeps its position. A suite that defines one test name
+  twice now runs it once, as on the JVM. (#1096)
+- **`(ServerSocket.)` is unbound until `.bind`.** The no-arg constructor bound
+  and listened on an ephemeral port. It now makes the socket and stops, and
+  `.bind(SocketAddress)` / `.bind(SocketAddress, backlog)` exist. `isBound`
+  stays true after close, `getLocalPort` is `-1` until bound, and `accept` on
+  an unbound socket raises `Socket is not bound yet` instead of blocking.
+  (#1093)
+- **A nested load inherits the enclosing file's compiler flags.** A file that
+  `set!`s `*unchecked-math*`, `*warn-on-reflection*` or `*assert*` and then
+  loads another file (`require`, `load-file`, `load-string`) passes its current
+  values down, as `Compiler.load` does; the nested load used to start from the
+  roots.
+- **Every entry point binds the `set!`-able compiler flags.** A `(set!
+  *warn-on-reflection* true)` inside `-main` under `-m`, `run -m`, `-M`, an
+  `-X`/`-T` exec fn, a task body or a built binary's launcher threw `Can't
+  change/establish root binding`. `jolt.loader`'s source evaluation brackets
+  the flags per file, like the host loader.
+
+### Added
+
+- **`jolt build --signable`** produces an executable that `codesign --verify
+  --strict` accepts. The default self-contained build appends the compiled
+  boot past the launcher's Mach-O image, which codesign refuses; `--signable`
+  takes the cc-linked path instead and needs a C compiler. (#1064)
+- **CLI tasks.** A `bb.edn` or `deps.edn` task naming an `:exec-fn`, or a `:cmd`
+  tree of them, has its arguments parsed by babashka.cli (vendored at
+  v0.12.91, public as `jolt.cli`) with babashka 1.13.223's semantics:
+  coercion, validation, subcommands, `--help`, inherited options and
+  `:depends` on CLI tasks. `jolt <task> --help` matches `bb <task> --help`
+  byte for byte apart from the program name. Shell completion offers a CLI
+  task's own options. (#1083)
+- **`java.lang.ProcessHandle`** is a class: `ProcessHandle/current`,
+  `ProcessHandle/of` (an `Optional`), `isAlive`, `destroyForcibly`,
+  `supportsNormalTermination`, `equals`/`hashCode`/`toString`. Referencing it
+  used to throw at the first touch. (#1087)
+- **`Files/isHidden` on Windows** reads the hidden attribute instead of the
+  leading dot, so `fs/glob` skips the same files babashka does. (#1110)
+- **java.util.regex escapes**: `\h` `\H` `\v` `\V` are real classes (they
+  matched the literal letter), `\p{...}` covers every general category, the
+  binary properties and the `java*` names, and `\p{name=value}` keys are
+  case-insensitive. `\N{NAME}`, `\X`, scripts and blocks are refused with a
+  message that says jolt has no table for them rather than matched wrongly.
+
+### Fixed
+
+- **A `:static` native builds on Linux again.** In 0.8.9 and 0.8.10 every
+  `jolt build` with a `:jolt/native` `:static` entry died on x86_64 Ubuntu with
+  `relocation R_X86_64_32 ... can not be used when making a PIE object`,
+  because the shipped Chez kernel was not position-independent. The release
+  kernel is built with `-fPIC` now, and a link that still fails on PIE (an
+  app's own non-PIC archive, or a locally built Chez) retries with `-no-pie`.
+  The relink also named `-luuid`, `-lncurses` and `-ltinfo`, which need the
+  `-dev` packages; without `uuid-dev` it failed with `cannot find -luuid`. It
+  links the versioned runtime library (`libuuid.so.1`) when the dev name is
+  missing, since jolt itself already depends on it. (#1060)
+- **Windows: subprocesses spawn.** Every `ProcessBuilder` start failed or
+  reported exit 0 with empty output. Spawning goes through `CreateProcessW`
+  with the JDK's own command-line quoting and environment block, pipes via
+  `CreatePipe`, and reaping via the process handle. (#1108)
+- **Windows: `java.net` sockets work.** Winsock is started once
+  (`jolt.winsock`) and the socket constants are Winsock's (`SOL_SOCKET`,
+  `SO_REUSEADDR`, `FIONREAD`, no `MSG_NOSIGNAL`). Sockets stay blocking on
+  Windows, and `NetworkInterface` enumerates nothing there, but
+  `InetAddress/getLocalHost` no longer dies looking for `getifaddrs`. (#1107)
+- **Windows: `spit` over an existing file**, including a `createTempFile`
+  target, no longer throws `file exists`. `path.separator` is `";"`, so
+  `fs/split-paths`, `fs/exec-paths` and `fs/which` work. `ProcessBuilder`
+  finds programs on a `;`-separated PATH, takes drive-rooted and UNC paths as
+  spelled, and tries PATHEXT. A drive path has a root, so `fs/absolute?`,
+  `getRoot`, `getParent` and `normalize` answer correctly. `java.io.tmpdir`
+  reads `TEMP`/`TMP`, and `File/listRoots` lists drives. (#1074)
+- **Windows: a glob with a separator matches.** `(fs/glob "src" "**/*.clj")`
+  found nothing while `"**.clj"` found everything. (#1086)
+- **`PushbackReader.close` closes the reader it wraps**, so `with-open` over
+  one no longer leaks the file descriptor. (#1109)
+- **Shutdown hooks run whichever thread registered them.** A thread forked
+  before the first hook was registered could receive SIGINT/SIGTERM itself:
+  ^C did nothing and SIGTERM killed the process without running hooks. With the
+  hook registered off the main thread, ^C exited 255 without hooks. Every
+  forked thread now starts with the shutdown signals blocked and the watcher is
+  armed at startup, so exit codes (130/143/129) and hooks match the JVM in
+  every case. ^C at the REPL exits 130 instead of 255. (#1098)
+- **`compare-and-set!` no longer fails spuriously on Apple silicon.** The
+  underlying CAS is a single `ldxr`/`stxr`, which can fail with the field still
+  holding the old value; it retries now while the field is unchanged.
+  ring-chez-adapter was dropping about one connection in 1400 under load on
+  M-series Macs because of it.
+- **`io/reader` on a path streams the file** instead of reading it whole
+  first, so `.readLine` and `line-seq` over a FIFO or a growing log return as
+  lines arrive. `mark`/`reset` work on it. Running out of descriptors reports
+  `(Too many open files)`, not `(Permission denied)`.
+- **File open errors report the reason the open failed.** Writing into a
+  directory the process cannot write reported `(No such file or directory)`
+  from `spit`, `io/output-stream` and `io/writer`; it reports `(Permission
+  denied)`. `slurp`, `spit`, `io/writer` and `io/output-stream` on a directory
+  are a `FileNotFoundException ... (Is a directory)` as on the JVM.
+- **Malformed UTF-8 decodes like the JVM everywhere.** `String.`, `slurp` of a
+  path, a stream or a URL, readers, `read-line` from stdin and URI accessors
+  now agree with java.nio on replacement counts for overlong and truncated
+  sequences and keep a leading BOM as U+FEFF.
+- **`getCanonicalPath` refuses a path that can never name a file.** A path
+  that has to traverse a symlink loop or an over-long component raises the
+  JVM's `IOException`, and a NUL in the path is refused instead of silently
+  canonicalizing to the working directory. (#1094)
+- **Regex matching agrees with the JVM on look-behinds and word boundaries.**
+  An anchor inside a look-behind read the end of the look-behind's window
+  instead of the input, so `(?<=a$)` matched in `"ab"` and `(?m)(?<=^)` matched
+  nowhere. `\b` reported a word end at position 0 of `" ab"`, `\B` never
+  matched at the edges, and `\b` split words at `_`.
+- **Regex flag groups and COMMENTS mode.** `(?x-i)` turned COMMENTS off,
+  `(?i-i:AB)` matched `"ab"`, and `(?x)` applied to the rest of the pattern
+  instead of its enclosing group. `\Q...\E` is read the same way by the
+  validator and the parser. Look-behinds the JVM rejects (`(?<!ab*+)`) are
+  rejected.
+- **`PatternSyntaxException` messages read like the JVM's**: description,
+  `near index N`, the pattern and the caret line. They carried the
+  translator's internal text and `near index 0`.
+- **Array constructors read their init.** `(char-array 3 \.)` ignored the
+  fill, and a seq init filled every slot with the seq itself: `(int-array 3
+  [1 2])` was `[[1 2] [1 2] [1 2]]`. A seq init fills a prefix, as on the JVM:
+  `[1 2 0]`.
+- **`jolt.ffi/write-bytes` of a byte-array writes its octets.** It wrote the
+  array's print form, `#object[[B]`. (#1092)
+- **`*print-length*` and `*print-level*`.** `clojure.pprint` had its own copies
+  of the vars, so binding core's did nothing to pprint, and maps were never
+  truncated. Records and sorted collections obey both limits in the core
+  printer. Namespaced-map printing lifts symbol keys too (`#:a{b 1}`).
+- **`jolt.loader` reads a file's forms in the file's own namespace**, one at a
+  time. A syntax quote inside a loaded file's macro resolved against the
+  caller's `*ns*`, so a dependent namespace failed with `No such var:
+  user/v` or called the wrong var.
+- **Symbols with reader-unsafe characters compile.** A name containing `|`
+  (ys.v0.std's `|||` macro), a backslash, a bracket or non-ASCII whitespace
+  produced Scheme that could not be read, or collided with another name
+  (`a\b` and `ab` were the same local). Names that read as Scheme numbers
+  (`+i`, `.5`) and names starting with `_` no longer collide with generated
+  ones. Two named `fn` literals with the same name in different defs no
+  longer share an image source-map entry.
+
+### Performance
+
+- **Regex: `$`-anchored patterns and character classes.** Anchors were
+  quadratic in the input: `(str/replace content #"(?m)\s+$" "")` over 274 KB
+  did not finish in 256 s and now takes 12.6 ms. Anchors are direct
+  predicates, a class of single characters is one char-set test instead of an
+  alternation chain, and the backtracking matcher is used where it is linear
+  (`#"[0-9]+"` 30 → 3.8 ms). Against babashka on the issue's rows jolt is now
+  0.8–2.8x. (#1062)
+- **`java.text.Normalizer`** returns an already-normalized string without
+  rebuilding it and `isNormalized` stops at the first character that needs
+  work: NFC/NFKC over 1 MB of ASCII 112 → 2.8 ms, under babashka's 5 ms. (#1066)
+- **`readLine`/`line-seq` on a file reader**: 120 → 85 ms over a 7 MB file.
+
+### Internal
+
+- Actions moved to their first Node 24 majors; nix-installer-action v22 with
+  `determinate: false` so the flake job still installs upstream Nix.
+- grenadine 0.1.13 → 0.1.15.
+- `make certify` pins its oracle to JDK 21 (`:oracle-jdk` in `profile.edn`)
+  and refuses another.
+- New gates: `winplatform` (Windows path/PATH/spawn rows pinned from Linux,
+  plus a live spawn), `utf8decode`, `normalizecheck`, `regexanchorprims`,
+  `regexsyntax`, `cas`, `clishim`; `windows-deps` CI runs `winplatform` and
+  `winpath`; the release workflow links a `:static` native with the packaged
+  binary.
+
 ## [0.8.10] - 2026-09-19
 
 A short window with one wrong-answer bug in it. A built binary typed a
