@@ -119,7 +119,12 @@
 ;; as the host's would make host-class-ctors-tbl — which is what
 ;; runtime-provides-class? and the constructor-override warning read — answer
 ;; yes for any class whose simple name a user type happens to share.
-(define (class-ctor-set! name proc) (hashtable-set! class-ctors-tbl name proc))
+;; Bumped by every write to class-ctors-tbl, so host-new's front cache below can
+;; tell a ctor it resolved from one a redefinition replaced.
+(define class-ctor-epoch 0)
+(define (class-ctor-set! name proc)
+  (set! class-ctor-epoch (fx+ class-ctor-epoch 1))
+  (hashtable-set! class-ctors-tbl name proc))
 
 ;; clojure.core/__register-class-ctor! lands here. Registering a class jolt does
 ;; not model is the intended use; REPLACING one it does is a process-wide
@@ -147,6 +152,7 @@
                 "warning: a library replaced the host constructor for ~a — every (~a. ...) in this process now builds its shim, including in namespaces that never asked for it\n"
                 name name))
      (lib-note-provider-registration! name)
+     (set! class-ctor-epoch (fx+ class-ctor-epoch 1))
      (hashtable-set! class-ctors-tbl name proc))))
 
 ;; clojure.core/__register-class-statics! lands here — the statics counterpart of
@@ -1015,8 +1021,27 @@
     (let ((v (host-static-ref class member)))
       (if (procedure? v) (v) v))))
 
+;; The ctor for CLASS, cached eq? on the name object: (Name. …) compiles to
+;; (host-new "ns.Name" …) with the name as a literal, so every construction at a
+;; site passes the same string, and lookup-class hashed it — twice on a miss of
+;; the qualified spelling — per object built. core.logic builds a Substitutions
+;; per binding step. Stamped with class-ctor-epoch, read BEFORE the lookup so a
+;; racing registration can only understamp; a miss is not cached, so the
+;; autoload and var paths below still run every time they are needed.
+(define host-new-cache (make-weak-eq-hashtable))
+(define host-new-cache-mu (make-mutex))
+(define (host-new-ctor class)
+  (let ((e (hashtable-ref host-new-cache class #f)))
+    (if (and e (fx= (car e) class-ctor-epoch))
+        (cdr e)
+        (let* ((epoch class-ctor-epoch)
+               (ctor (lookup-class class-ctors-tbl class)))
+          (when ctor
+            (jolt-with-mutex host-new-cache-mu
+              (hashtable-set! host-new-cache class (cons epoch ctor))))
+          ctor))))
 (define (host-new class . args)
-  (let ((ctor (lookup-class class-ctors-tbl class)))
+  (let ((ctor (host-new-ctor class)))
     (cond
       (ctor (apply ctor args))
       ;; the constructor may live in a provider that has not loaded yet — autoload

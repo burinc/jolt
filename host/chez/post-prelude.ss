@@ -68,7 +68,7 @@
         ;; result is boolean-cast like any interface-boolean return.
         ((and (jrec? x) (find-method-any-protocol (jrec-tag x) "isRealized"))
          => (lambda (m) (if (jolt-truthy? (jolt-invoke m x)) #t #f)))
-        ((and (reified-methods x) (hashtable-ref (reified-methods x) "isRealized" #f))
+        ((reify-method-ref x "isRealized")
          => (lambda (m) (if (jolt-truthy? (jolt-invoke m x)) #t #f)))
         ;; a seq cell answers by its forced flag: the rest of a realized lazy
         ;; chain is a cseq under jolt's seq model, and (realized? (rest s)) after
@@ -271,8 +271,7 @@
 ;; (a bare deftype stays out of all of them; records already answer via
 ;; jrec-record?).
 (define (jrec-iface-pred? x iface)
-  (and (jrec? x) (not (jrec-record? x))
-       (eq? #t (instance-check (jolt-symbol #f iface) x))))
+  (and (jrec? x) (not (jrec-record? x)) (jrec-type-isa? x iface) #t))
 (for-each
   (lambda (p)
     (let ((nm (car p)) (iface (cdr p)))

@@ -344,7 +344,7 @@
                   (loop (fx+ i 1) (jolt-assoc1 m (vector-ref ks i) (vector-ref vs i)))))))
          ((string=? method-name "toString") (jolt-str-render-one obj))
          (else (dispatch-miss obj method-name rest))))
-      ((and (jrec? obj) (find-method-any-protocol-arity (jrec-tag obj) method-name (+ 1 (length rest))))
+      ((and (jrec? obj) (jrec-method-arity obj method-name (+ 1 (length rest))))
        => (lambda (f) (apply jolt-invoke f obj rest)))
       ;; (.field inst): a deftype/record field read with no matching method.
       ;; Clojure reads the field for (.q x) just like (.-q x); a declared method
@@ -373,9 +373,9 @@
           (if (jolt-truthy? (jolt-contains? obj (car rest)))
               (make-map-entry (car rest) (jolt-get obj (car rest) jolt-nil)) jolt-nil))
          (else jolt-nil)))   ; .empty of a record is nil on the JVM
-      ((reified-methods obj)
-       => (lambda (rm)
-            (let ((f (hashtable-ref rm method-name #f))
+      ((jreify? obj)
+       => (lambda (_)
+            (let ((f (reify-method-ref obj method-name))
                   (d (jreify-delegate obj)))
               (cond
                 (f (apply jolt-invoke f obj rest))
@@ -882,14 +882,29 @@
 ;; A nil receiver is a NullPointerException before any arm looks: the JVM
 ;; cannot invoke anything on null. (.toString nil) used to answer "" and
 ;; (.equals nil 1) false through the universal Object arm.
+;;
+;; A (.-name x) read of a declared deftype/defrecord slot answers before the walk,
+;; from the type's per-name cache (records-coll.ss jrec-dash-field-index): the
+;; walk reached the dot-form arm third, and a deftype equals reading the other
+;; instance's field paid it per compare. Only the ahead-of-it arms matter, and
+;; getClass / wait / notify / a string receiver never name a dashed field of a
+;; jrec — the one arm that could, a library's override (jolt.host/
+;; extend-class!), turns the shortcut off by existing at the head of the list.
 (define (record-method-dispatch obj method-name rest-args)
   (when (jolt-nil? obj)
     (no-method-throw method-name obj (if (jolt-nil? rest-args) 0 (jolt-count rest-args))))
-  (let loop ((as method-dispatch-arms))
-    (if (null? as)
-        (record-method-dispatch-base obj method-name rest-args)
-        (let ((r ((cdar as) obj method-name rest-args)))
-          (if (eq? r 'pass) (loop (cdr as)) r)))))
+  (cond
+    ((and (jrec? obj)
+          (not (fx=? (caar method-dispatch-arms) arm-priority-user-override))
+          (method-rest-args-empty? rest-args)
+          (jrec-dash-field-index obj method-name))
+     => (lambda (slot) (jrec-field-ref obj slot)))
+    (else
+     (let loop ((as method-dispatch-arms))
+       (if (null? as)
+           (record-method-dispatch-base obj method-name rest-args)
+           (let ((r ((cdar as) obj method-name rest-args)))
+             (if (eq? r 'pass) (loop (cdr as)) r)))))))
 
 ;; Strings are the most common interop receiver in library code (honeysql's
 ;; format path alone is .charAt/.length/.indexOf/.toString per entity), and the
@@ -939,22 +954,81 @@
 (define-record-type jreify (fields methods protos delegate) (nongenerative chez-jreify-v2))
 ;; likewise a reify: (def r (reify ...)) is code the restoring build already has.
 (register-code-value! jreify?)
-(define (reified-methods obj) (and (jreify? obj) (jreify-methods obj)))
+;; A reify's methods are a LAYOUT and a vector of fns: (slots . fns), where SLOTS
+;; maps a method name to its index in FNS. The layout is the reify SITE's — every
+;; instance of (reify P (m [_] …) Q (n [_] …)) names the same methods — so one
+;; table is shared by all of them and only the closures are per instance. Building
+;; a string-keyed hashtable per instance, from a {kw fn} map built per instance,
+;; made (reify …) ~310 ns against the JVM's ~25; core.logic builds one per
+;; constraint per propagation step. reify-method-ref is the one way in.
+(define (reify-method-ref obj name)
+  (and (jreify? obj)
+       (let* ((m (jreify-methods obj))
+              (i (hashtable-ref (car m) name #f)))
+         (and i (vector-ref (cdr m) i)))))
 (define (reify-delegate obj) (and (jreify? obj) (jreify-delegate obj)))
 ;; (get reify k) / (:k reify) routes to a reify's ILookup valAt — clojure.spec.alpha
 ;; reifies fspec/regex specs as clojure.lang.ILookup and reads (:args spec) off them.
 (register-get-arm! jreify?
   (lambda (coll k d)
-    (let ((m (and (reified-methods coll) (hashtable-ref (reified-methods coll) "valAt" #f))))
+    (let ((m (reify-method-ref coll "valAt")))
       (if m (jolt-invoke m coll k d) d))))
+(define (reify-proto-names proto-names)
+  (intern-reify-protos
+   (map (lambda (p) (if (symbol-t? p) (symbol-t-name p) p))
+        (if (and (pair? proto-names) (null? (cdr proto-names)) (jolt-coll-pred? (car proto-names)))
+            (seq->list (car proto-names))
+            proto-names))))
+;; The general entry (proxy, and any caller holding a {name fn} map): the layout
+;; is built for this call.
 (define (make-reified-delegating methods-map delegate proto-names)
-  (let ((ht (make-hashtable string-hash string=?))
-        (protos (if (and (pair? proto-names) (null? (cdr proto-names)) (jolt-coll-pred? (car proto-names)))
-                    (seq->list (car proto-names)) proto-names)))
-    (for-each (lambda (p) (hashtable-set! ht (if (keyword? p) (keyword-t-name p) p)
-                                          (jolt-get methods-map p jolt-nil)))
-              (seq->list (jolt-keys methods-map)))
-    (make-jreify ht (map (lambda (p) (if (symbol-t? p) (symbol-t-name p) p)) protos) delegate)))
+  (let* ((ks (seq->list (jolt-keys methods-map)))
+         (slots (make-hashtable string-hash string=?))
+         (fns (make-vector (length ks))))
+    (let loop ((ks ks) (i 0))
+      (unless (null? ks)
+        (let ((p (car ks)))
+          (hashtable-set! slots (if (keyword? p) (keyword-t-name p) p) i)
+          (vector-set! fns i (jolt-get methods-map p jolt-nil))
+          (loop (cdr ks) (fx+ i 1)))))
+    (make-jreify (cons slots fns) (reify-proto-names proto-names) delegate)))
+;; The reify macro's entry: SHAPE is the site's literal [[method-name …]
+;; [protocol …]], a constant the site's pool binds once, so it is the same object
+;; for every instance the site builds and its layout is computed once, keyed eq?
+;; on it. FNS follow in the order the names list them.
+(define reify-shape-memo (make-weak-eq-hashtable))
+(define reify-shape-mu (make-mutex))
+(define (reify-shape-layout shape)
+  (or (hashtable-ref reify-shape-memo shape #f)
+      (let* ((names (seq->list (jolt-nth shape 0)))
+             (slots (make-hashtable string-hash string=?))
+             (layout (cons slots (reify-proto-names (seq->list (jolt-nth shape 1))))))
+        (let loop ((ns names) (i 0))
+          (unless (null? ns)
+            (hashtable-set! slots (car ns) i)
+            (loop (cdr ns) (fx+ i 1))))
+        (jolt-with-mutex reify-shape-mu (hashtable-set! reify-shape-memo shape layout))
+        layout)))
+(define (make-reified-at shape . fns)
+  (let ((layout (reify-shape-layout shape)))
+    (make-jreify (cons (car layout) (list->vector fns)) (cdr layout) #f)))
+;; Every reify from one site declares the same protocols, but the names arrive
+;; as rest args, so each instance got its own fresh list. The questions asked of
+;; that list — its dispatch tags (jreify-host-tags), instance? against a class
+;; name (reify-declares-class?) — are pure functions of it, and answering them
+;; from scratch munged every protocol name per call: (instance? P r) on a reify
+;; of seven protocols was ~3.5 us against the JVM's ~14 ns, and core.logic asks
+;; it of every constraint on every propagation step (protocols/id). Interning
+;; gives equal lists one identity, so those answers are memoized by eq on the
+;; list. The table is strong: it holds one list per distinct protocol set, which
+;; the reify sites in the program bound. Read unlocked, written under
+;; jch-cache-mutex (the jch-tags pattern).
+(define reify-protos-table (make-hashtable equal-hash equal?))
+(define (intern-reify-protos ps)
+  (or (hashtable-ref reify-protos-table ps #f)
+      (jolt-with-mutex jch-cache-mutex
+        (or (hashtable-ref reify-protos-table ps #f)
+            (begin (hashtable-set! reify-protos-table ps ps) ps)))))
 (define (make-reified methods-map . proto-names)
   (make-reified-delegating methods-map #f proto-names))
 ;; A deftype or reify that DECLARES java.lang.Iterable or java.util.Iterator is
@@ -1033,6 +1107,45 @@
           (cond ((jclass? proto) (jclass-name proto))
                 ((jolt-nil? proto) "nil")
                 (else (jolt-final-str proto))))))
+    (cond ((and (jreify? obj) (not (jreify-delegate obj))) (reify-satisfies? obj pn-str))
+          ((jrec? obj) (jrec-satisfies? obj pn-str))
+          (else (jolt-satisfies-walk obj pn-str)))))
+;; ...and a record's, per type, in its descriptor cache (slot 10), which retires
+;; with the registry and graph epochs. The walk re-hashed the tag and the name for
+;; the direct answer and, on a miss, consed the record's tag list afresh and walked
+;; it through the registry (~320 ns, three times what the reify hit costs).
+(define (jrec-satisfies? obj pn-str)
+  (let* ((t (vector-ref (jrdesc-ifc-of obj) 10))
+         (hit (hashtable-ref t pn-str 'none)))
+    (if (eq? hit 'none)
+        (let ((ans (and (jolt-satisfies-walk obj pn-str) #t)))
+          (jolt-with-mutex jrdesc-ifc-mutex (hashtable-set! t pn-str ans))
+          ans)
+        hit)))
+;; A plain reify's answer is a function of its interned protocol list, the
+;; protocol, the registry and the class graph — memoized on exactly those, eq? on
+;; the list and on the name (the protocol value's interned name string). Without
+;; it a hit re-munged every declared name ahead of the match (~0.9 us for the
+;; sixth of six, against the JVM's ~45 ns) and a miss walked the reify's tags
+;; through the registry. A proxy consults its delegate, so it walks.
+(define reify-satisfies-memo (make-weak-eq-hashtable))
+(define reify-satisfies-mu (make-mutex))
+(define (reify-satisfies? obj pn-str)
+  (let* ((protos (jreify-protos obj))
+         (epoch (fx+ jolt-proto-epoch jch-graph-epoch))
+         (inner (hashtable-ref reify-satisfies-memo protos #f))
+         (e (and inner (hashtable-ref inner pn-str #f))))
+    (if (and e (fx= (car e) epoch))
+        (cdr e)
+        (let ((ans (and (jolt-satisfies-walk obj pn-str) #t)))
+          (jolt-with-mutex reify-satisfies-mu
+            (let ((t (or (hashtable-ref reify-satisfies-memo protos #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! reify-satisfies-memo protos t)
+                           t))))
+              (hashtable-set! t pn-str (cons epoch ans))))
+          ans))))
+(define (jolt-satisfies-walk obj pn-str)
     (or
       ;; direct: a record type's own registry, a reify's declared list.
       (cond
@@ -1058,7 +1171,7 @@
                                 ((type-satisfies? (car tags) pn-str) #t)
                                 (else (loop (cdr tags)))))))
               (satisfies-memo-set! pn-str tags pe ge ans)
-              ans))))))
+              ans)))))
 ;; satisfies?'s memo: the extended walk's answer per (protocol, tag list),
 ;; stamped with the two epochs it depends on — the protocol registry's
 ;; (jolt-proto-epoch, bumped by every registration, prune and inline marker) and
@@ -1137,9 +1250,8 @@
             (else (let ((s (jrec-field-pr v))) (substring s 1 (string-length s))))))))
 
 ;; a reify with a toString method renders through it, like the JVM.
-(register-str-render! (lambda (v) (and (jreify? v) (reified-methods v)
-                                       (hashtable-ref (reified-methods v) "toString" #f) #t))
-  (lambda (v) (jolt-invoke (hashtable-ref (reified-methods v) "toString" #f) v)))
+(register-str-render! (lambda (v) (and (reify-method-ref v "toString") #t))
+  (lambda (v) (jolt-invoke (reify-method-ref v "toString") v)))
 
 ;; `type` lives in natives-meta.ss: it needs jolt-meta for the :type
 ;; override and a total value->taxonomy mapping, so it sits with meta — a record
@@ -1243,4 +1355,5 @@
                       (and cell (protocol-value-key (var-cell-root cell)))))))
         jolt-nil)))
 (def-var! "clojure.core" "make-reified" (lambda (mm . rest) (apply make-reified mm rest)))
+(def-var! "clojure.core" "make-reified-at" make-reified-at)
 (def-var! "clojure.core" "record-method-dispatch" (lambda (obj m rest) (record-method-dispatch obj m rest)))

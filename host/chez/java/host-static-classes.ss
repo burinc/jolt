@@ -1956,7 +1956,7 @@
 ;; Pluggable instance? — a library registers (fn [class-name-string val] -> true
 ;; | false | nil); nil means "not my class, fall through". First non-nil wins.
 (define user-instance-checks '())
-(register-instance-check-arm!
+(register-instance-check-user-arm!
   (lambda (type-sym val)
     (let ((tname (symbol-t-name type-sym)))
       (let loop ((fs user-instance-checks))
@@ -1964,8 +1964,14 @@
             'pass
             (let ((r ((car fs) tname val)))
               (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
+;; the bump retires every instance? answer cached while no library arm existed
+;; (records-interop.ss jolt-instance-site) — the arm may claim any of them now
+(define (user-instance-checks-empty?) (null? user-instance-checks))
 (def-var! "clojure.core" "__register-instance-check!"
-  (lambda (f) (set! user-instance-checks (append user-instance-checks (list f))) jolt-nil))
+  (lambda (f)
+    (set! user-instance-checks (append user-instance-checks (list f)))
+    (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
+    jolt-nil))
 
 ;; ---- value-semantics seams -------------------------------------------------
 ;; A library that models its own host values (java.time via jolt-lang/time) needs
@@ -2020,7 +2026,7 @@
 (def-var! "clojure.core" "__register-class!"
   (lambda (pred class-fn tags-fn)
     (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
-      (register-class-arm! p (lambda (x) (jolt-invoke class-fn x)))
+      (register-class-arm-checked! p (lambda (x) (jolt-invoke class-fn x)))
       (set! jt-user-value-tags-arms
             (append jt-user-value-tags-arms
                     (list (cons p (lambda (x) (jt-jolt-strs->list (jolt-invoke tags-fn x))))))))

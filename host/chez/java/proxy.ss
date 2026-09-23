@@ -77,9 +77,7 @@
   (lambda (type-sym val)
     (if (proxy-value? val)
         (let ((tname (if (symbol-t? type-sym) (symbol-t-name type-sym) type-sym)))
-          (if (and (string? tname)
-                   (or (member (last-dot tname) '("IObj" "IMeta"))
-                       (memp (lambda (p) (proto-class-match? p tname)) (jreify-protos val))))
+          (if (and (string? tname) (reify-declares-class? (jreify-protos val) tname))
               #t
               (if (jolt-truthy? (instance-check type-sym (reify-delegate val))) #t #f)))
         (quote pass))))

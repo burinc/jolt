@@ -91,9 +91,10 @@
 ;; (class a-reify) is a generated "ns$reify__N" class on the JVM — an unstable
 ;; per-eval name jolt can't reproduce, so (like the fixed AFunction$fn__0 stand-in
 ;; for an anonymous fn) it reports a stable reify-shaped placeholder rather than
-;; the :object fallback. Covers promise/future too (both reify instances). The
-;; protocols it satisfies drive instance?/satisfies?, not this name.
-(register-class-arm! jreify? (lambda (r) "clojure.lang.IObj$reify__0"))
+;; the :object fallback. The protocols it satisfies drive instance?/satisfies?,
+;; not this name.
+;; answered by jolt-class-name's fast path (host-class.ss class-fast-name), which
+;; is also why no arm may claim a reify now.
 
 ;; bound? — native (the overlay's (get v :root) is nil on a var-cell record).
 (define (jolt-var-bound-one? v) (and (var-cell? v) (not (jolt-var-unbound? (var-cell-root v)))))

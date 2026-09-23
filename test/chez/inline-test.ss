@@ -55,20 +55,23 @@
 (define (starts-with? s pre)
   (and (>= (string-length s) (string-length pre))
        (string=? (substring s 0 (string-length pre)) pre)))
+;; The code is the LAST form of that begin: the preamble is registrations and,
+;; for a literal with no source rendering, a (let* …) header — but the code can
+;; open with a (let* …) of its own too (a top-level fn's constant pool), so
+;; guessing which leading forms are preamble by their head threw the code away
+;; and left ")" to assert on. Taking the last form cannot mistake one for the other.
 (define (code-part s)
   (if (or (starts-with? s "(begin (let* (")
           (starts-with? s "(begin (image-register-fn-form!"))
-      ;; one registration per literal, so skip every leading one (and a let*
-      ;; header, which a literal with no source rendering still gets)
-      (let loop ((i 7))   ; 7 = past "(begin "
-        (let* ((i (let ws ((i i))
-                    (if (and (< i (string-length s)) (char=? (string-ref s i) #\space))
-                        (ws (+ i 1)) i)))
-               (rest (substring s i (string-length s))))
-          (if (or (starts-with? rest "(let* (")
-                  (starts-with? rest "(image-register-fn-form!"))
-              (loop (skip-form s i))
-              rest)))
+      (let loop ((i 7) (last-start #f))   ; 7 = past "(begin "
+        (let ((i (let ws ((i i))
+                   (if (and (< i (string-length s)) (char=? (string-ref s i) #\space))
+                       (ws (+ i 1)) i))))
+          (if (or (>= i (string-length s)) (char=? (string-ref s i) #\)))
+              (if last-start
+                  (let ((end (skip-form s last-start))) (substring s last-start end))
+                  s)
+              (loop (skip-form s i) i))))
       s))
 (define (ev s) (jolt-compile-eval s "u"))
 

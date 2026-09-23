@@ -8,36 +8,84 @@
 ;; dispatch precedence.
 
 ;; ---- extend the collection dispatchers with a jrec arm ----------------------
-;; equality for a jrec: a deftype implementing IPersistentCollection/equiv (e.g.
-;; core.cache's caches, which equiv to their backing map) compares through that
-;; method, so (= cache {…}) works; a plain record has no equiv and falls back to
-;; field-wise jrec=? (and a record is never = a plain map).
-(register-eq-arm! (lambda (a b) (or (jrec? a) (jrec? b)))
-                  (lambda (a b)
-                    (cond ((and (jrec? a) (jrec-cl a "equiv")) => (lambda (m) (if (jolt-truthy? (jolt-invoke m a b)) #t #f)))
-                          ((and (jrec? b) (jrec-cl b "equiv")) => (lambda (m) (if (jolt-truthy? (jolt-invoke m b a)) #t #f)))
-                          ;; a deftype with a custom Object.equals (but no equiv) governs
-                          ;; its own value equality and map-key identity — core.logic's
-                          ;; LVar/LCons key substitutions on id, ignoring metadata, so
-                          ;; structural jrec=? (which sees the meta field) is wrong here.
-                          ((and (jrec? a) (jrec-cl a "equals")) => (lambda (m) (if (jolt-truthy? (jolt-invoke m a b)) #t #f)))
-                          ((and (jrec? b) (jrec-cl b "equals")) => (lambda (m) (if (jolt-truthy? (jolt-invoke m b a)) #t #f)))
-                          ;; A deftype declaring clojure.lang.Sequential compares
-                          ;; ELEMENT-WISE against any other sequential, in either
-                          ;; direction. The JVM reaches the same answer through
-                          ;; APersistentVector/ASeq .equiv, which test `instanceof
-                          ;; Sequential` rather than a concrete collection type — so
-                          ;; (= (eduction (map inc) [1 2]) [2 3]) is true there.
-                          ((or (jrec-sequential-decl? a) (jrec-sequential-decl? b))
-                           (and (seq-eq-candidate? a) (seq-eq-candidate? b) (seq=? a b)))
-                          ;; field-wise equality is a RECORD's semantics (the
-                          ;; JVM defrecord's equals); a plain deftype without a
-                          ;; declared equiv/equals is Object.equals — IDENTITY.
-                          ;; Two equal-field deftype instances used to compare
-                          ;; = here (and collapse as map keys), which the JVM
-                          ;; never does.
-                          ((and (jrec-record? a) (jrec-record? b)) (jrec=? a b))
-                          (else (eq? a b)))))
+;; Equality with a jrec on either side is clojure.lang.Util/equiv, step for step:
+;; the LEFT side's equiv when it is an IPersistentCollection, else the right
+;; side's, else the left side's equals.
+;;   - a deftype's equiv is the one it declares (core.cache's caches equiv to
+;;     their backing map, so (= cache {…}) holds); a defrecord's is field-wise
+;;     jrec=? against the same record type, so a record is never = a plain map.
+;;   - a jolt collection's equiv against a jrec: a sequential one compares
+;;     element-wise with a type that declares clojure.lang.Sequential (the JVM's
+;;     `instanceof Sequential` test, which is why (= [2 3] (eduction (map inc)
+;;     [1 2])) holds in either order); a map or set never equals one. It does NOT
+;;     ask the jrec's equiv: (= {:a 1} cache) is false on the JVM.
+;;   - equals is the declared Object.equals (core.logic's LVar keys its
+;;     substitutions on id, ignoring metadata, so structural jrec=? would be
+;;     wrong), a defrecord's field-wise compare, or IDENTITY — two equal-field
+;;     plain deftypes are not =, and neither are two that declare only Sequential.
+;;
+;; Two jrecs are answered from jolt=2 ahead of the arm walk (values.ss): this arm
+;; registers first, so it was the LAST one asked, and every record compare paid
+;; every other arm's predicate before reaching it. The jrec pair is in
+;; eq-fast-probes, so no arm may claim one; this arm owns the MIXED pairs, which
+;; still walk so a library arm for the other side's type is asked first.
+;;
+;; What a type contributes is read from its derived-interface vector (IA/IB
+;; below, #f for a side that is not a jrec): slot 12 is #(equiv equals ipc?
+;; list? map? set?),
+;; slot 5 its declared Sequential, slot 3 whether it is a defrecord — where the
+;; arm used to look equiv and equals up by name on every compare.
+(define (jrec-equiv=? a b)
+  (let* ((ia (and (jrec? a) (jrdesc-ifc-of a)))
+         (ib (and (jrec? b)
+                  (if (and ia (eq? (jrec-desc a) (jrec-desc b))) ia (jrdesc-ifc-of b)))))
+    (cond ((if ia (vector-ref (vector-ref ia 12) 2) (jrec-eq-other-coll? a))
+           (jrec-ipc-equiv a ia b ib))
+          ((if ib (vector-ref (vector-ref ib 12) 2) (jrec-eq-other-coll? b))
+           (jrec-ipc-equiv b ib a ia))
+          (ia (jrec-equals a ia b ib))
+          (else #f))))
+;; the other side is one of jolt's own collections (it is not a jrec, and no
+;; library arm claimed the pair)
+(define (jrec-eq-other-coll? x)
+  (or (jolt-sequential? x) (jolt-lazyseq? x) (jolt-coll? x)))
+;; x.equiv(o); IX is #f when x is a jolt collection (o is a jrec then), and the
+;; collection's own equiv decides by what o is: APersistentVector/ASeq compare
+;; element-wise with a Sequential or java.util.List, APersistentMap entry by
+;; entry with a java.util.Map it accepts, APersistentSet member by member with a
+;; java.util.Set.
+(define (jrec-ipc-equiv x ix o io)
+  (cond ((not ix)
+         (let ((po (vector-ref io 12)))
+           (cond ((or (jolt-sequential? x) (jolt-lazyseq? x))
+                  (and (vector-ref po 3) (seq=? x o)))
+                 ((jolt-map? x)
+                  (and (vector-ref po 4)
+                       (= (jolt-count x) (jolt-count o))
+                       (let loop ((s (jolt-seq x)))
+                         (or (jolt-nil? s)
+                             (let* ((e (jolt-first s)) (k (jolt-nth e 0 jolt-nil)))
+                               (and (jolt-truthy? (jolt-contains? o k))
+                                    (jolt=2 (jolt-nth e 1 jolt-nil) (jolt-get o k jolt-nil))
+                                    (loop (jolt-next s))))))))
+                 ((or (jolt-set? x) (htable-sorted-set? x))
+                  (and (vector-ref po 5)
+                       (= (jolt-count x) (jolt-count o))
+                       (let loop ((s (jolt-seq o)))
+                         (or (jolt-nil? s)
+                             (and (jolt-truthy? (jolt-contains? x (jolt-first s)))
+                                  (loop (jolt-next s)))))))
+                 (else #f))))
+        ((vector-ref (vector-ref ix 12) 0)
+         => (lambda (m) (if (jolt-truthy? (jolt-invoke m x o)) #t #f)))
+        (else (jrec-equals x ix o io))))
+;; x.equals(o)
+(define (jrec-equals x ix o io)
+  (cond ((vector-ref (vector-ref ix 12) 1)
+         => (lambda (m) (if (jolt-truthy? (jolt-invoke m x o)) #t #f)))
+        ((vector-ref ix 3) (and io (vector-ref io 3) (jrec=? x o)))
+        (else (eq? x o))))
+(register-eq-arm! (lambda (a b) (not (eq? (jrec? a) (jrec? b)))) jrec-equiv=?)
 ;; jrec hashing is a fast clause in jolt-hash / jolt-hasheq (a jrec probe in
 ;; hash-fast-probes keeps any arm from claiming one), field-first: the hasheq
 ;; slot answers a repeat hash in one read. 0 = unset routes here.
@@ -164,7 +212,43 @@
                    ;; must not be called with a not-found argument.
                    (let ((m3 (and m3 (proc-accepts? m3 3) m3))
                          (m2 (and m2 (proc-accepts? m2 2) m2)))
-                     (and (or m3 m2) (cons m3 m2))))))))
+                     (and (or m3 m2) (cons m3 m2)))))
+            ;; slot 7: the type's declared impl per method NAME (jrec-method),
+            ;; filled on first ask. Here, and not a table of its own, so it is
+            ;; retired with the rest of this vector when either epoch moves.
+            (make-weak-eq-hashtable)
+            ;; slot 8: instance?'s own-type answer per class NAME
+            ;; (jrec-declares-class?, records-interop.ss), keyed eq? like slot 7.
+            (make-weak-eq-hashtable)
+            ;; slot 9: jrec-method-arity's answers, method name -> ((nargs . impl) …)
+            (make-weak-eq-hashtable)
+            ;; slot 10: satisfies?'s answer per protocol NAME (records-dispatch.ss)
+            (make-weak-eq-hashtable)
+            ;; slot 11: jrec-type-isa?'s answer per interface NAME
+            (make-weak-eq-hashtable)
+            ;; slot 12: what jrec-equiv=? decides equality by — the declared
+            ;; equiv and equals impls (either #f), and whether the type is an
+            ;; IPersistentCollection: a defrecord always is, and so is a type
+            ;; with an equiv impl, which an extend-type can add without a
+            ;; class-graph edge
+            ;; The last three are what a jolt collection's own equiv asks of the
+            ;; other side (jrec-ipc-equiv): is it a java.util.List or Sequential,
+            ;; a java.util.Map that is not an IPersistentMap or also declares
+            ;; MapEquivalence (APersistentMap.equiv's test — flatland's ordered
+            ;; map passes it, a defrecord does not), a java.util.Set.
+            (let ((equiv (find-method-any-protocol tag "equiv")))
+              (vector equiv
+                      (find-method-any-protocol tag "equals")
+                      (and (or record? equiv (jch-isa? tag "clojure.lang.IPersistentCollection")) #t)
+                      (and (not record?)
+                           (or (tag-declares-sequential? tag) (jch-isa? tag "java.util.List")) #t)
+                      (and (jch-isa? tag "java.util.Map")
+                           (or (not (jch-isa? tag "clojure.lang.IPersistentMap"))
+                               (jch-isa? tag "clojure.lang.MapEquivalence"))
+                           #t)
+                      (and (jch-isa? tag "java.util.Set") #t)))
+            ;; slot 13: jrec-dash-field-index's answers, "-name" -> slot or #f
+            (make-weak-eq-hashtable))))
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x))
          (c (jrdesc-ifc d)))
@@ -173,6 +257,69 @@
         (let ((fresh (jrdesc-derive-ifc d (jrec-record?-uncached x))))
           (jrdesc-ifc-set! d fresh)
           fresh))))
+;; The impl a record type declares for METHOD (any protocol), or #f. Every
+;; collection op on a record asks this first — equality asks it for equiv and
+;; equals on both operands, hashing for hasheq and hashCode, meta/assoc/nth/count
+;; each for their own — and find-method-any-protocol answers from two string-keyed
+;; tables per call. core.logic keys its substitution maps on LVars, which declare
+;; equals and hashCode, so every map probe paid four such lookups per key compared.
+;; Keyed eq? on the name: callers pass literals, so a repeat is one eq?-ref; a
+;; name spelled by a different string object just fills its own entry.
+(define (jrec-method x method)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 7))
+         (hit (hashtable-ref t method 'none)))
+    (if (eq? hit 'none)
+        (let ((m (find-method-any-protocol (jrec-tag x) method)))
+          (jolt-with-mutex jrdesc-ifc-mutex (hashtable-set! t method m))
+          m)
+        hit)))
+;; Does a record TYPE implement IFACE — its own tag, an interface or protocol it
+;; declares, or their ancestry in the class graph? The question map?/coll?/
+;; vector?/… ask of a deftype, answered from the type alone and memoized per type
+;; (slot 11, keyed eq? on the literal interface name).
+;;
+;; It must NOT be instance?: instance? consults the library arms, and a library's
+;; value-tags arm (__register-class!) is a predicate over arbitrary values that
+;; may well call map? — which asked instance? of the same deftype, which asked the
+;; arm again: an unbounded recursion that hung any (satisfies? P x) or
+;; (instance? P x) on such a value once a library had registered one.
+(define (jrec-type-isa? x iface)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 11))
+         (hit (hashtable-ref t iface 'none)))
+    (if (eq? hit 'none)
+        (let* ((tag (jrec-tag x))
+               (ans (or (jrec-declares-class? tag iface) (jch-isa? tag iface))))
+          (jolt-with-mutex jrdesc-ifc-mutex (hashtable-set! t iface ans))
+          ans)
+        hit)))
+;; The declared slot a (.-name x) field read names, or #f: METHOD is the dashed
+;; name the call site passes as a literal, so a repeat is one eq?-ref (slot 13)
+;; where the read built the undashed substring, interned it as a keyword and
+;; looked that up per call — ~70 ns of a deftype equals that reads the other
+;; instance's field, which every map probe keyed on such a type runs.
+(define (jrec-dash-field-index x method)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 13))
+         (hit (hashtable-ref t method 'none)))
+    (if (eq? hit 'none)
+        (let ((i (and (fx>? (string-length method) 1)
+                      (char=? (string-ref method 0) #\-)
+                      (jrec-field-index x (keyword #f (substring method 1 (string-length method)))))))
+          (jolt-with-mutex jrdesc-ifc-mutex (hashtable-set! t method i))
+          i)
+        hit)))
+;; ...and by name AND arity (NARGS counts `this`), for the calls that pick one
+;; arity of a method a type declares at several — every (.method rec …) interop
+;; call and iface-method. Same cache, same keying; find-method-any-protocol-arity
+;; decides, including its any-arity fallback.
+(define (jrec-method-arity x method nargs)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 9))
+         (hit (assv nargs (hashtable-ref t method '()))))
+    (if hit
+        (cdr hit)
+        (let ((m (find-method-any-protocol-arity (jrec-tag x) method nargs)))
+          (jolt-with-mutex jrdesc-ifc-mutex
+            (hashtable-set! t method (cons (cons nargs m) (hashtable-ref t method '()))))
+          m))))
 
 ;; A CharSequence is not a collection, but three of RT's entry points name one
 ;; anyway — RT.count is its length, RT.seq walks its characters, RT.nth reads one
@@ -238,7 +385,8 @@
 ;; excluded: a defrecord is a map, not a sequential.
 ;;
 ;; Keyed by TAG, like tag-declares-coll-iface? beside it, so jrdesc-derive-ifc
-;; answers it once per type per epoch instead of once per comparison.
+;; answers it once per type per epoch (slot 5, read by jrec-equiv=?) instead of
+;; once per comparison.
 (define (tag-declares-sequential? tag)
   (let ((ti (hashtable-ref type-registry tag #f)))
     (and ti
@@ -246,12 +394,6 @@
            (cond ((null? ps) #f)
                  ((string=? (jch-last-segment (car ps)) "Sequential") #t)
                  (else (loop (cdr ps))))))))
-(define (jrec-sequential-decl? x)
-  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 5)))
-;; Both sides must be seq-comparable for the element-wise path; anything else
-;; (a number, a map, a bare deftype) is simply not equal to a sequential.
-(define (seq-eq-candidate? x)
-  (or (jolt-sequential? x) (jolt-lazyseq? x) (jrec-sequential-decl? x)))
 
 (define (jrec-abstract-method-error x method)
   (jolt-throw (jolt-host-throwable "java.lang.AbstractMethodError"
@@ -264,9 +406,8 @@
 ;; re-deriving jrec-vs-reify lookup and arity handling.
 (define (iface-method v method nargs)
   (cond ((jrec? v)
-         (if nargs (find-method-any-protocol-arity (jrec-tag v) method nargs)
-             (find-method-any-protocol (jrec-tag v) method)))
-        ((jreify? v) (let ((rm (reified-methods v))) (and rm (hashtable-ref rm method #f))))
+         (if nargs (jrec-method-arity v method nargs) (jrec-method v method)))
+        ((jreify? v) (reify-method-ref v method))
         (else #f)))
 ;; a record counts its declared fields plus anything assoc'd on beyond them
 (define (jrec-field-count coll)

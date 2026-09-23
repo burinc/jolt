@@ -812,8 +812,7 @@
       ;; the JVM's failed interface cast: throw ClassCastException naming the
       ;; interface the requested arity belongs to.
       ((and (jrec? x)
-            (find-method-any-protocol-arity (jrec-tag x) "deref"
-                                            (if (null? opts) 1 3)))
+            (jrec-method-arity x "deref" (if (null? opts) 1 3)))
        ;; the arity lookup falls back to any same-name method, so verify the
        ;; chosen impl really accepts this call's arity before invoking.
        => (lambda (m)
@@ -822,7 +821,7 @@
                                             (+ 1 (length opts)))))
                 (jolt-throw (deref-cast-error x opts))
                 (apply jolt-invoke m x opts))))
-      ((and (reified-methods x) (hashtable-ref (reified-methods x) "deref" #f))
+      ((reify-method-ref x "deref")
        => (lambda (m)
             (if (and (procedure? m)
                      (not (bitwise-bit-set? (procedure-arity-mask m)

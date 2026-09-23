@@ -57,6 +57,30 @@
 (define suite-total (make-hashtable string-hash string=?))
 (define (bump! ht k) (hashtable-set! ht k (+ 1 (hashtable-ref ht k 0))))
 
+;; A row that never returns used to stall the whole gate at 100% CPU with nothing
+;; printed — in CI, a job that runs to its timeout with no clue which row hung. A
+;; watchdog thread watches the row in flight and, past the limit, names it and
+;; exits nonzero. It never interrupts a row (that could leave the runtime's locks
+;; held mid-update); the process ends instead. JOLT_UNIT_ROW_TIMEOUT overrides the
+;; limit in seconds.
+(define row-limit-secs
+  (or (let ((v (getenv "JOLT_UNIT_ROW_TIMEOUT"))) (and v (string->number v))) 120))
+(define row-in-flight #f)      ; (index expr start-seconds) or #f
+(fork-thread
+  (lambda ()
+    (let loop ()
+      (sleep (make-time 'time-duration 0 1))
+      (let ((r row-in-flight))
+        (when (and r (> (- (time-second (current-time)) (caddr r)) row-limit-secs))
+          (let ((p (current-error-port)))
+            (fprintf p "\nunit gate: row ~a did not finish within ~as — hung?\n  ~a\n"
+                     (car r) row-limit-secs (cadr r))
+            (flush-output-port p))
+          ;; exit from this thread would only unwind this thread; rt.ss's
+          ;; jolt-exit-process ends the process from any thread
+          (jolt-exit-process 2)))
+      (loop))))
+
 (let loop ((i 0))
   (when (< i (pvec-count cases))
     (let* ((row (pvec-nth-d cases i jolt-nil))
@@ -66,6 +90,7 @@
            (throws? (eq? expected kw-throws))
            (sink (open-output-string)))
       (bump! suite-total suite)
+      (set! row-in-flight (list i expr (time-second (current-time))))
       (guard (e (#t (if throws?
                         (begin (set! pass (+ pass 1)) (bump! suite-pass suite))
                         (set! fails (cons (list suite expr "raised") fails)))))
@@ -77,7 +102,8 @@
             ((string=? got expected) (begin (set! pass (+ pass 1)) (bump! suite-pass suite)))
             (else (set! fails (cons (list suite expr
                     (string-append "want `" expected "` got `" got "`")) fails))))))
-      (zj-reset!))
+      (zj-reset!)
+      (set! row-in-flight #f))
     (loop (+ i 1))))
 
 (printf "\nunit gate: ~a/~a passed\n" pass (pvec-count cases))

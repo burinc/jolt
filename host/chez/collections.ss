@@ -1537,7 +1537,7 @@
 ;; as an inline impl; the core collection fns fall back to it. find-method-any-
 ;; protocol / jolt-invoke load later — resolved at call time.
 (define (rec-coll-method coll name)
-  (and (jrec? coll) (find-method-any-protocol (jrec-tag coll) name)))
+  (and (jrec? coll) (jrec-method coll name)))
 
 (define (jolt-nth-nil-idx! i)
   (when (jolt-nil? i)
