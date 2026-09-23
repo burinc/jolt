@@ -701,7 +701,7 @@
   (sa-fiber-spawn
    (lambda () (rl-lock r5-lk) (set-box! r5-in #t) (jolt-fiber-<! r5-ch) (rl-unlock r5-lk))))
 (define r5-b
-  (sa-fiber-spawn (lambda () (set-box! r5-got (rl-trylock r5-lk 3000)))))
+  (sa-fiber-spawn (lambda () (set-box! r5-got (rl-trylock r5-lk 3000 (host-static-ref "TimeUnit" "MILLISECONDS"))))))
 (jolt-fiber-ensure-carrier!)
 (wait-until (lambda () (unbox r5-in)) 5.0 "9g. the holder took the lock")
 (sleep (make-time 'time-duration 100000000 0))   ; 100ms inside the bounded wait
