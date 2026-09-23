@@ -312,11 +312,31 @@
              ;; (thrown? IllegalArgumentException …) matches an ArityException subclass
              ;; like the JVM; class-match? is the simple-name fallback for a class jolt
              ;; models only by name.
+             ;; The thrown thing on a PASS, nil otherwise. `is`'s own docstring
+             ;; promises the first half -- "then returns the thing thrown" --
+             ;; and the value used to be do-report's instead, a counters map,
+             ;; so the bind-and-assert shape silently stopped asserting:
+             ;;
+             ;;     (let [ex (is (thrown? ExceptionInfo (f)))]
+             ;;       (is (= "..." (ex-message ex))))
+             ;;
+             ;; ex-message of a map is nil, so the inner `is` compared nil to a
+             ;; string and never tested the message (jolt#1091).
+             ;;
+             ;; nil on the non-pass branch is the JVM's answer too, by a route
+             ;; jolt does not share: there the catch names the expected class, so
+             ;; a different exception is not caught here at all -- `is`'s own
+             ;; outer guard takes it, reports :error and answers nil. jolt
+             ;; catches Throwable to report a fail that names the class it got,
+             ;; which is the friendlier report and a divergence that predates
+             ;; this. Returning the exception there would be a NEW one.
              (if (or (clojure.core/instance? ~klass-sym e#)
                      (clojure.test/class-match? e# ~klass))
-               (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual e#})
-               (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " but got " (clojure.core/class e#))
-                                        :expected '~form :actual e#})))))
+               (do (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual e#})
+                   e#)
+               (do (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " but got " (clojure.core/class e#))
+                                            :expected '~form :actual e#})
+                   nil)))))
 
       ;; (is (thrown-with-msg? Class re body...))
       (thrown-form? form "thrown-with-msg?")
@@ -329,15 +349,22 @@
            (clojure.test/do-report {:type :fail :message (str "expected " '~form " to throw")
                                     :expected '~form :actual nil})
            (catch Throwable e#
-             (let [m# (or (clojure.core/ex-message e#) (str e#))]
-               ;; honor the class hierarchy (ExceptionInfo IS a RuntimeException),
-               ;; then fall back to a simple-name match like thrown? does.
-               (if (and (or (clojure.core/instance? ~klass-sym e#)
-                            (clojure.test/class-match? e# ~klass))
-                        (re-find ~re m#))
+             (let [m# (or (clojure.core/ex-message e#) (str e#))
+                   ;; honor the class hierarchy (ExceptionInfo IS a RuntimeException),
+                   ;; then fall back to a simple-name match like thrown? does.
+                   class-ok?# (or (clojure.core/instance? ~klass-sym e#)
+                                  (clojure.test/class-match? e# ~klass))]
+               (if (and class-ok?# (re-find ~re m#))
                  (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual e#})
                  (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " matching " ~re " but got " (clojure.core/class e#) ": " m#)
-                                          :expected '~form :actual e#}))))))
+                                          :expected '~form :actual e#}))
+               ;; the thrown thing whenever the CLASS matched, message or not, and
+               ;; nil otherwise. The JVM's catch names the class and its e# sits
+               ;; after the message test, so a wrong message still answers the
+               ;; exception there; a wrong class never reaches that catch, and
+               ;; `is`'s outer guard answers nil (see thrown? above). #1091
+               ;; reports thrown?; this half had the same defect.
+               (when class-ok?# e#)))))
 
       ;; instance? gets a dedicated report path for a clearer fail message
       ;; (mirrors thrown? above); it is a function now, but keep the explicit form.
