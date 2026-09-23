@@ -374,12 +374,26 @@
 
 ;; A member procedure as registration stores it: an open procedure with a fixed
 ;; row gets the row's mask, narrowed to what the procedure itself accepts.
+;;
+;; One wrapper per procedure and mask: a class registered under both spellings
+;; (Thread and java.lang.Thread) hands the same procedure over twice, and the
+;; second registration must store the SAME value, or registry-collision!
+;; reports the boot as drifting. The mask is part of the key because one
+;; procedure can serve two members with different overloads (SecureRandom's
+;; getInstance and getInstanceStrong).
+(define host-arity-wrappers (make-weak-eq-hashtable))   ; f -> ((mask . wrapper) ...)
 (define (host-arity-declared table key member f self?)
   (if (and (procedure? f) (< (procedure-arity-mask f) 0))
       (let ((row (hashtable-ref table (string-append key "/" member) #f)))
         (if (and row (not (eq? (car row) 'varargs)))
-            (make-arity-wrapper-procedure
-              f (bitwise-and (procedure-arity-mask f) (host-arities->mask row self?)) #f)
+            (let ((mask (bitwise-and (procedure-arity-mask f) (host-arities->mask row self?))))
+              (let* ((known (hashtable-ref host-arity-wrappers f '()))
+                     (hit (assv mask known)))
+                (if hit
+                    (cdr hit)
+                    (let ((w (make-arity-wrapper-procedure f mask #f)))
+                      (hashtable-set! host-arity-wrappers f (cons (cons mask w) known))
+                      w))))
             f))
       f))
 
@@ -398,10 +412,10 @@
     (unless (string=? name short)
       (hashtable-set! class-statics-tbl short h))
     (for-each (lambda (p)
-                (let ((old (hashtable-ref h (car p) #f)))
-                  (when old (registry-collision! "static" name (car p) old (cdr p))))
-                (hashtable-set! h (car p)
-                  (host-arity-declared host-static-arities short (car p) (cdr p) #f)))
+                (let ((v (host-arity-declared host-static-arities short (car p) (cdr p) #f))
+                      (old (hashtable-ref h (car p) #f)))
+                  (when old (registry-collision! "static" name (car p) old v))
+                  (hashtable-set! h (car p) v)))
               members)))
 
 ;; Names the HOST registered (io.ss, io-streams.ss, …), as opposed to a library
