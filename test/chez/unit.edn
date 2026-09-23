@@ -3296,6 +3296,11 @@
   ;; no class arm may claim a value the (class x) fast path answers: the runtime's
   ;; own arms, checked after boot, and a library's, refused as it registers
   {:suite "dispatch-caches" :expr "((jolt.host/scheme-eval-string \"(lambda () (length (class-arms-claiming-fast-types)))\"))" :expected "0"}
+  ;; two deftype/record values are answered by jolt=2 ahead of the equality arms
+  ;; (records-coll.ss jrec-equiv=?): no arm registered before records.ss built its
+  ;; probe may claim the pair, and a library arm that does is refused
+  {:suite "dispatch-caches" :expr "((jolt.host/scheme-eval-string \"(lambda () (length (filter (lambda (arm) ((car arm) jrec-fast-type-probe jrec-fast-type-probe)) jolt-eq-arms)))\"))" :expected "0"}
+  {:suite "dispatch-caches" :expr "((jolt.host/scheme-eval-string \"(lambda () (guard (e (#t #t)) (eq-arm-reject-fast-type! 'probe (lambda (a b) (and (jrec? a) (jrec? b)))) #f))\"))" :expected "true"}
   {:suite "dispatch-caches" :expr "(try (clojure.core/__register-class! (fn [x] (vector? x)) (fn [_] \"my.Vec\") (fn [_] [\"my.Vec\"])) :registered (catch Exception e :refused))" :expected ":refused"}
   {:suite "dispatch-caches" :expr "(do (clojure.core/__register-class! (fn [x] (and (map? x) (= :uclass-probe (:uclass-kind x)) false)) (fn [_] \"my.Map\") (fn [_] [\"my.Map\"])) (class 1))" :expected "java.lang.Long"}
   ;; an (instance? T x) site's cached answer must follow every change that can

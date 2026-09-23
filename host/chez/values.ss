@@ -450,31 +450,36 @@
 ;; defined in hasheq.ss which loads after this file — the probes are evaluated
 ;; at registration time, when the whole runtime is loaded.
 (define (eq-fast-probes)
-  (list (cons 0 1) (cons 1.5 2.5)
-        (cons (keyword #f "a") (keyword #f "b"))
-        (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
-        (cons "s1" "s2")
-        ;; Two base scalars of DIFFERENT kinds, and nil against anything, are
-        ;; answered ahead of the walk too (jolt=2's base-scalar clause), so an
-        ;; arm that would claim such a pair is refused for the same reason. The
-        ;; JVM's Util.equiv has no extension point here either: a Keyword is
-        ;; never equal to a String, a Long never to a Double, nil only to nil.
-        ;; The number pairs cover the exactness-aware number clause that moved
-        ;; up with them (bignum and ratio pairs used to reach the arms).
-        (cons (keyword #f "a") "a") (cons "a" (jolt-symbol #f "a"))
-        (cons (keyword #f "a") jolt-nil) (cons jolt-nil 0) (cons jolt-nil "s")
-        (cons 1 2.5) (cons #t (keyword #f "a")) (cons #\a "a") (cons 0 #f)
-        (cons (expt 2 70) (expt 2 71)) (cons 1/2 1/3) (cons #\a #\b) (cons #t #f)
-        ;; jolt's own collection types, now answered ahead of the walk. All
-        ;; THREE that jolt=2 hoists must be probed — a hoisted type missing from
-        ;; here is one whose arms register happily and are then silently dead.
-        (cons (jolt-vector 1) (jolt-vector 2))
-        (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))
-        (cons (jolt-hash-set 1) (jolt-hash-set 2))
-        ;; procedures: fn equality is identity, answered ahead of the walk (a
-        ;; collision-bucket compare of fn-keyed map keys paid the whole arm
-        ;; walk per entry) — so no arm may claim one.
-        (cons car cdr)))
+  (append
+   (list (cons 0 1) (cons 1.5 2.5)
+         (cons (keyword #f "a") (keyword #f "b"))
+         (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
+         (cons "s1" "s2")
+         ;; Two base scalars of DIFFERENT kinds, and nil against anything, are
+         ;; answered ahead of the walk too (jolt=2's base-scalar clause), so an
+         ;; arm that would claim such a pair is refused for the same reason. The
+         ;; JVM's Util.equiv has no extension point here either: a Keyword is
+         ;; never equal to a String, a Long never to a Double, nil only to nil.
+         ;; The number pairs cover the exactness-aware number clause that moved
+         ;; up with them (bignum and ratio pairs used to reach the arms).
+         (cons (keyword #f "a") "a") (cons "a" (jolt-symbol #f "a"))
+         (cons (keyword #f "a") jolt-nil) (cons jolt-nil 0) (cons jolt-nil "s")
+         (cons 1 2.5) (cons #t (keyword #f "a")) (cons #\a "a") (cons 0 #f)
+         (cons (expt 2 70) (expt 2 71)) (cons 1/2 1/3) (cons #\a #\b) (cons #t #f)
+         ;; jolt's own collection types, now answered ahead of the walk. All
+         ;; THREE that jolt=2 hoists must be probed — a hoisted type missing from
+         ;; here is one whose arms register happily and are then silently dead.
+         (cons (jolt-vector 1) (jolt-vector 2))
+         (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))
+         (cons (jolt-hash-set 1) (jolt-hash-set 2))
+         ;; procedures: fn equality is identity, answered ahead of the walk (a
+         ;; collision-bucket compare of fn-keyed map keys paid the whole arm
+         ;; walk per entry) — so no arm may claim one.
+         (cons car cdr))
+   ;; two jrecs (jolt=2's jrec-pair=? clause). records.ss builds the probe after
+   ;; the earliest arms register; those are checked by the dispatch-caches unit
+   ;; row after boot instead (probe-if-available).
+   (probe-if-available (lambda () (cons jrec-fast-type-probe jrec-fast-type-probe)))))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
@@ -570,6 +575,10 @@
         ;; EQUAL case); answering the unequal case here keeps a fn-keyed map's
         ;; bucket scan off the arm walk. The pair is in eq-fast-probes.
         ((and (procedure? a) (procedure? b)) #f)
+        ;; two deftype/record values: the record arm's own decision, answered
+        ;; ahead of the walk it sat at the end of (records-coll.ss jrec-equiv=?,
+        ;; loads later — runtime forward ref). The pair is in eq-fast-probes.
+        ((and (jrec? a) (jrec? b)) (jrec-equiv=? a b))
         ;; nil is equal only to nil (the eq? clause above answered that pair),
         ;; and two base scalars of different kinds are never equal. Both used to
         ;; reach jolt=2-base only AFTER every registered arm had been asked —

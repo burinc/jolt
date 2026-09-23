@@ -702,7 +702,8 @@
     (else (jolt=2 ea eb))))
 
 (define (jrec=? a b)
-  (and (string=? (jrec-tag a) (jrec-tag b))
+  (and (or (eq? (jrec-desc a) (jrec-desc b))
+           (string=? (jrec-tag a) (jrec-tag b)))
        (let ((n (jrec-nfields a)))
          (and (= n (jrec-nfields b))
               (let loop ((i 0))
@@ -825,24 +826,67 @@
       (jolt-str-join-comma (jolt-limited-list-strs entry-strs))
       "}")))
 
-(register-eq-arm!
-  (lambda (a b) (or (jrec? a) (jrec? b)))
-  (lambda (a b)
+(define (jrec-equiv=? a b)
+  (let* ((ia (and (jrec? a) (jrdesc-ifc-of a)))
+         (ib (and (jrec? b)
+                  (if (and ia (eq? (jrec-desc a) (jrec-desc b)))
+                      ia
+                      (jrdesc-ifc-of b)))))
     (cond
-      ((and (jrec? a) (jrec-cl a "equiv")) =>
-       (lambda (m) (if (jolt-truthy? (jolt-invoke m a b)) #t #f)))
-      ((and (jrec? b) (jrec-cl b "equiv")) =>
-       (lambda (m) (if (jolt-truthy? (jolt-invoke m b a)) #t #f)))
-      ((and (jrec? a) (jrec-cl a "equals")) =>
-       (lambda (m) (if (jolt-truthy? (jolt-invoke m a b)) #t #f)))
-      ((and (jrec? b) (jrec-cl b "equals")) =>
-       (lambda (m) (if (jolt-truthy? (jolt-invoke m b a)) #t #f)))
-      ((or (jrec-sequential-decl? a) (jrec-sequential-decl? b))
-       (and (seq-eq-candidate? a)
-            (seq-eq-candidate? b)
-            (seq=? a b)))
-      ((and (jrec-record? a) (jrec-record? b)) (jrec=? a b))
-      (else (eq? a b)))))
+      ((if ia
+           (vector-ref (vector-ref ia 12) 2)
+           (jrec-eq-other-coll? a))
+       (jrec-ipc-equiv a ia b ib))
+      ((if ib
+           (vector-ref (vector-ref ib 12) 2)
+           (jrec-eq-other-coll? b))
+       (jrec-ipc-equiv b ib a ia))
+      (ia (jrec-equals a ia b ib))
+      (else #f))))
+
+(define (jrec-eq-other-coll? x)
+  (or (jolt-sequential? x) (jolt-lazyseq? x) (jolt-coll? x)))
+
+(define (jrec-ipc-equiv x ix o io)
+  (cond
+    ((not ix)
+     (let ((po (vector-ref io 12)))
+       (cond
+         ((or (jolt-sequential? x) (jolt-lazyseq? x))
+          (and (vector-ref po 3) (seq=? x o)))
+         ((jolt-map? x)
+          (and (vector-ref po 4)
+               (= (jolt-count x) (jolt-count o))
+               (let loop ((s (jolt-seq x)))
+                 (or (jolt-nil? s)
+                     (let* ((e (jolt-first s)) (k (jolt-nth e 0 jolt-nil)))
+                       (and (jolt-truthy? (jolt-contains? o k))
+                            (jolt=2
+                              (jolt-nth e 1 jolt-nil)
+                              (jolt-get o k jolt-nil))
+                            (loop (jolt-next s))))))))
+         ((or (jolt-set? x) (htable-sorted-set? x))
+          (and (vector-ref po 5)
+               (= (jolt-count x) (jolt-count o))
+               (let loop ((s (jolt-seq o)))
+                 (or (jolt-nil? s)
+                     (and (jolt-truthy? (jolt-contains? x (jolt-first s)))
+                          (loop (jolt-next s)))))))
+         (else #f))))
+    ((vector-ref (vector-ref ix 12) 0) =>
+     (lambda (m) (if (jolt-truthy? (jolt-invoke m x o)) #t #f)))
+    (else (jrec-equals x ix o io))))
+
+(define (jrec-equals x ix o io)
+  (cond
+    ((vector-ref (vector-ref ix 12) 1) =>
+     (lambda (m) (if (jolt-truthy? (jolt-invoke m x o)) #t #f)))
+    ((vector-ref ix 3) (and io (vector-ref io 3) (jrec=? x o)))
+    (else (eq? x o))))
+
+(register-eq-arm!
+  (lambda (a b) (not (eq? (jrec? a) (jrec? b))))
+  jrec-equiv=?)
 
 (define (jrec-hasheq-slow x)
   (cond
@@ -899,6 +943,22 @@
                (and (or m3 m2) (cons m3 m2)))))
       (make-weak-eq-hashtable) (make-weak-eq-hashtable)
       (make-weak-eq-hashtable) (make-weak-eq-hashtable)
+      (make-weak-eq-hashtable)
+      (let ((equiv (find-method-any-protocol tag "equiv")))
+        (vector equiv (find-method-any-protocol tag "equals")
+          (and (or record?
+                   equiv
+                   (jch-isa? tag "clojure.lang.IPersistentCollection"))
+               #t)
+          (and (not record?)
+               (or (tag-declares-sequential? tag)
+                   (jch-isa? tag "java.util.List"))
+               #t)
+          (and (jch-isa? tag "java.util.Map")
+               (or (not (jch-isa? tag "clojure.lang.IPersistentMap"))
+                   (jch-isa? tag "clojure.lang.MapEquivalence"))
+               #t)
+          (and (jch-isa? tag "java.util.Set") #t)))
       (make-weak-eq-hashtable))))
 
 (define (jrdesc-ifc-of x)
@@ -933,6 +993,23 @@
             jrdesc-ifc-mutex
             (hashtable-set! t iface ans))
           ans)
+        hit)))
+
+(define (jrec-dash-field-index x method)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 13))
+         (hit (hashtable-ref t method 'none)))
+    (if (eq? hit 'none)
+        (let ((i (and (fx>? (string-length method) 1)
+                      (char=? (string-ref method 0) #\-)
+                      (jrec-field-index
+                        x
+                        (keyword
+                          #f
+                          (substring method 1 (string-length method)))))))
+          (jolt-with-mutex
+            jrdesc-ifc-mutex
+            (hashtable-set! t method i))
+          i)
         hit)))
 
 (define (jrec-method-arity x method nargs)
@@ -1015,14 +1092,6 @@
              ((null? ps) #f)
              ((string=? (jch-last-segment (car ps)) "Sequential") #t)
              (else (loop (cdr ps))))))))
-
-(define (jrec-sequential-decl? x)
-  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 5)))
-
-(define (seq-eq-candidate? x)
-  (or (jolt-sequential? x)
-      (jolt-lazyseq? x)
-      (jrec-sequential-decl? x)))
 
 (define (jrec-abstract-method-error x method)
   (jolt-throw
@@ -2966,11 +3035,20 @@
       method-name
       obj
       (if (jolt-nil? rest-args) 0 (jolt-count rest-args))))
-  (let loop ((as method-dispatch-arms))
-    (if (null? as)
-        (record-method-dispatch-base obj method-name rest-args)
-        (let ((r ((cdar as) obj method-name rest-args)))
-          (if (eq? r 'pass) (loop (cdr as)) r)))))
+  (cond
+    ((and (jrec? obj)
+          (not (fx=?
+                 (caar method-dispatch-arms)
+                 arm-priority-user-override))
+          (method-rest-args-empty? rest-args)
+          (jrec-dash-field-index obj method-name)) =>
+     (lambda (slot) (jrec-field-ref obj slot)))
+    (else
+     (let loop ((as method-dispatch-arms))
+       (if (null? as)
+           (record-method-dispatch-base obj method-name rest-args)
+           (let ((r ((cdar as) obj method-name rest-args)))
+             (if (eq? r 'pass) (loop (cdr as)) r)))))))
 
 (define (method-rest-args->list rest-args)
   (cond

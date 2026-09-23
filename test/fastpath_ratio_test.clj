@@ -119,9 +119,19 @@
 ;;
 ;;   record-key-get     a map keyed on a deftype that declares equals/hashCode
 ;;                      (core.logic's LVar) looked both methods up by NAME, in two
-;;                      string-keyed tables, on every key compared. The reference
-;;                      is the same lookup over identity-keyed deftypes, which
-;;                      declare neither and so find nothing to call (5.46 -> 1.86).
+;;                      string-keyed tables, on every key compared, and its
+;;                      (.-id ^EqKey o) field read interned a keyword per call.
+;;                      The reference is the same lookup over defrecord keys,
+;;                      whose = is structural with no method to call, so the
+;;                      ratio is what calling a declared equals adds per key
+;;                      (4.66 -> 2.3; the JVM ~1.0).
+;;
+;;   record-eq          = on two records walked every registered equality arm
+;;                      (the record arm registered first, so it was asked last)
+;;                      and then looked the types' equiv and equals up by name
+;;                      per compare: ~225 ns against ~36 for two one-element
+;;                      vectors, and a small map keyed on records scans with =.
+;;                      The reference is = on two equal vectors (6.8 -> 1.36).
 ;;
 ;;   top-level-fn       a fn built in a bare top-level form — every deftype and
 ;;                      defrecord method, every extend-type impl and defmethod —
@@ -268,12 +278,17 @@
   Object
   (equals [_ o] (and (instance? EqKey o) (= id (.-id ^EqKey o))))
   (hashCode [_] (hash id)))
-(deftype PlainKey [id])
+(defrecord RecKey [id])
 (def ^:private eq-key-map (zipmap (map #(EqKey. %) (range 8)) (range)))
 (def ^:private eq-probe (EqKey. 7))
-(def ^:private plain-keys (mapv #(PlainKey. %) (range 8)))
-(def ^:private plain-key-map (zipmap plain-keys (range)))
-(def ^:private plain-probe (nth plain-keys 7))
+(def ^:private rec-key-map (zipmap (map ->RecKey (range 8)) (range)))
+(def ^:private rec-probe (->RecKey 7))
+;; two equal records, and two equal vectors to measure them against
+(defrecord EqRec [a])
+(def ^:private eq-rec-a (->EqRec 7))
+(def ^:private eq-rec-b (->EqRec 7))
+(def ^:private eq-vec-a [7])
+(def ^:private eq-vec-b [7])
 ;; one body, built under a def and in a bare top-level form
 (def ^:private kw-map {:a 1 :b 2 :c 3})
 (def ^:private fn-via-def (fn [m] (+ (get m :a) (get m :b) (get m :c))))
@@ -398,11 +413,17 @@
           3.0 8.0)
 
   ;; A key with its own equals/hashCode must not cost wildly more to look up
-  ;; than an identity key.
+  ;; than a record key.
   (judge! "record-key-get"
-          #(dotimes [_ 20000] (get plain-key-map plain-probe))
+          #(dotimes [_ 20000] (get rec-key-map rec-probe))
           #(dotimes [_ 20000] (get eq-key-map eq-probe))
-          3.0 4.5)
+          3.2 4.5)
+
+  ;; = on two records must cost about what = on two small vectors costs.
+  (judge! "record-eq"
+          #(dotimes [_ dispatch-n] (= eq-vec-a eq-vec-b))
+          #(dotimes [_ dispatch-n] (= eq-rec-a eq-rec-b))
+          2.5 4.0)
 
   ;; The same fn body costs the same whether a def or a bare form built it.
   (judge! "top-level-fn"

@@ -882,14 +882,29 @@
 ;; A nil receiver is a NullPointerException before any arm looks: the JVM
 ;; cannot invoke anything on null. (.toString nil) used to answer "" and
 ;; (.equals nil 1) false through the universal Object arm.
+;;
+;; A (.-name x) read of a declared deftype/defrecord slot answers before the walk,
+;; from the type's per-name cache (records-coll.ss jrec-dash-field-index): the
+;; walk reached the dot-form arm third, and a deftype equals reading the other
+;; instance's field paid it per compare. Only the ahead-of-it arms matter, and
+;; getClass / wait / notify / a string receiver never name a dashed field of a
+;; jrec — the one arm that could, a library's override (jolt.host/
+;; extend-class!), turns the shortcut off by existing at the head of the list.
 (define (record-method-dispatch obj method-name rest-args)
   (when (jolt-nil? obj)
     (no-method-throw method-name obj (if (jolt-nil? rest-args) 0 (jolt-count rest-args))))
-  (let loop ((as method-dispatch-arms))
-    (if (null? as)
-        (record-method-dispatch-base obj method-name rest-args)
-        (let ((r ((cdar as) obj method-name rest-args)))
-          (if (eq? r 'pass) (loop (cdr as)) r)))))
+  (cond
+    ((and (jrec? obj)
+          (not (fx=? (caar method-dispatch-arms) arm-priority-user-override))
+          (method-rest-args-empty? rest-args)
+          (jrec-dash-field-index obj method-name))
+     => (lambda (slot) (jrec-field-ref obj slot)))
+    (else
+     (let loop ((as method-dispatch-arms))
+       (if (null? as)
+           (record-method-dispatch-base obj method-name rest-args)
+           (let ((r ((cdar as) obj method-name rest-args)))
+             (if (eq? r 'pass) (loop (cdr as)) r)))))))
 
 ;; Strings are the most common interop receiver in library code (honeysql's
 ;; format path alone is .charAt/.length/.indexOf/.toString per entity), and the

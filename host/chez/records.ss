@@ -614,7 +614,7 @@
         ((or (jolt-nil? ea) (jolt-nil? eb)) #f)
         (else (jolt=2 ea eb))))
 (define (jrec=? a b)
-  (and (string=? (jrec-tag a) (jrec-tag b))
+  (and (or (eq? (jrec-desc a) (jrec-desc b)) (string=? (jrec-tag a) (jrec-tag b)))
        (let ((n (jrec-nfields a)))
          (and (= n (jrec-nfields b))
               (let loop ((i 0))
