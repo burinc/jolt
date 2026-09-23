@@ -246,6 +246,69 @@
        "re-registering one of them replaces only that namespace's entry")
   (reset! t/registry saved))
 
+;; --- (is (thrown? ...)) answers the thing thrown ----------------------------
+;; `is`'s own docstring states it: "checks that an instance of c is thrown from
+;; body, fails if not; then returns the thing thrown". It used to answer
+;; do-report's value instead -- the counters map on a pass -- so binding the
+;; result and asserting on it silently stopped asserting (jolt#1091). Every
+;; expectation here was read off JVM Clojure 1.12.
+;;
+;; quiet? runs an assertion with the report swallowed, so these do not print
+;; into the gate's output; the pass/fail counters still move and are checked.
+(defn- quiet? [f] (binding [t/*test-out* (java.io.StringWriter.)] (f)))
+
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown? clojure.lang.ExceptionInfo
+                                            (throw (ex-info "boom" {:a 1})))))))
+     true
+     "thrown? answers the exception, not the counters")
+
+;; the shape the issue is about, and the reason it matters: on a counters map
+;; ex-message is nil, so the inner assertion compared nil to a string and tested
+;; nothing at all.
+(ok= (quiet? (fn [] (let [ex (is (thrown? clojure.lang.ExceptionInfo
+                                          (throw (ex-info "boom" {:a 1}))))]
+                      [(ex-message ex) (ex-data ex)])))
+     ["boom" {:a 1}]
+     "the bound exception carries its message and data")
+
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
+                                                     (throw (ex-info "boom" {})))))))
+     true
+     "thrown-with-msg? answers the exception too")
+
+;; a subclass matches and still answers the exception
+(ok= (quiet? (fn [] (instance? clojure.lang.ExceptionInfo
+                               (is (thrown? RuntimeException (throw (ex-info "sub" {})))))))
+     true
+     "a subclass match answers the exception")
+
+;; nil when the assertion does NOT pass, which is the JVM's answer in both
+;; shapes. Worth pinning: answering the exception here would be a fresh
+;; divergence rather than a fix, since the JVM's catch names the expected class
+;; and a mismatch never reaches it.
+(ok= (quiet? (fn [] (is (thrown? clojure.lang.ExceptionInfo :nothing-thrown))))
+     nil
+     "nothing thrown answers nil")
+(ok= (quiet? (fn [] (is (thrown? java.io.IOException (throw (ex-info "wrong class" {}))))))
+     nil
+     "a non-matching class answers nil")
+(ok= (quiet? (fn [] (is (thrown-with-msg? clojure.lang.ExceptionInfo #"nope"
+                                          (throw (ex-info "boom" {}))))))
+     nil
+     "a non-matching message answers nil")
+
+;; the value changed; the reporting must not have
+(ok= (let [p (t/n-pass) f (t/n-fail)]
+       (quiet? (fn []
+                 (is (thrown? clojure.lang.ExceptionInfo (throw (ex-info "x" {}))))
+                 (is (thrown-with-msg? clojure.lang.ExceptionInfo #"x" (throw (ex-info "x" {}))))
+                 (is (thrown? clojure.lang.ExceptionInfo :nothing-thrown))))
+       [(- (t/n-pass) p) (- (t/n-fail) f)])
+     [2 1]
+     "two passes and one fail still counted as before")
+
 (let [n @passes f @fails]
   (doseq [m f] (println "clojure-test-api FAIL " m))
   (println "CLOJURE-TEST-API-RESULT pass" n "fail" (count f))
