@@ -460,6 +460,29 @@
       (else (when warn? (bld-warn-dynamic-lib! lib))
             (string-append "-l" lib " ")))))
 
+;; The link fragment for one of the kernel's shared system libraries on Linux.
+;; -l<lib> needs the unversioned lib<lib>.so, which only the -dev package
+;; installs; a machine with a compiler but no uuid-dev (stock Ubuntu with
+;; build-essential) has just libuuid.so.1, so every :static relink died with
+;; "cannot find -luuid". The jolt binary doing the link needs those same
+;; runtime libraries, so the versioned file is there wherever jolt runs: link
+;; it by path when the -dev name does not resolve. `cc -print-file-name`
+;; answers the name unchanged when the compiler's search path lacks it.
+;; -l<lib> also resolves to lib<lib>.a, and the release build relies on that:
+;; STATIC_DEPS (ci/glibc-floor-build.sh) deletes the .so symlinks so the
+;; archives are what -l finds. So either one keeps the -l spelling.
+(define (bld-system-lib lib sonames)
+  (define (resolve name)
+    (let ((p (bld-sh-capture (string-append (bld-cc) " " (bld-arch-flag)
+                                            " -print-file-name=" name " 2>/dev/null"))))
+      (and (> (string-length p) 0) (char=? (string-ref p 0) #\/) p)))
+  (cond
+    ((or (resolve (string-append "lib" lib ".so"))
+         (resolve (string-append "lib" lib ".a")))
+     (string-append "-l" lib " "))
+    ((exists resolve sonames) => (lambda (p) (string-append (bld-sh-quote p) " ")))
+    (else (string-append "-l" lib " "))))
+
 ;; Link flags. The kernel's lz4/zlib/ncurses deps, lz4 statically (see above).
 ;; The host branches double as the target flags for a non-cross build
 ;; (host = target).
@@ -526,7 +549,11 @@
        ;; back to -l (the -L above, then LIBRARY_PATH, then the system dirs).
        (bld-compression-lib "lz4" #t)
        (bld-compression-lib "z" #t)
-       "-lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"
+       (bld-system-lib "ncurses" '("libncurses.so.6" "libncurses.so.5"))
+       (bld-system-lib "tinfo" '("libtinfo.so.6" "libtinfo.so.5"))
+       "-ldl -lm -lpthread "
+       (bld-system-lib "uuid" '("libuuid.so.1"))
+       "-lrt"
        ;; bionic's libc has no iconv, and Chez's Linux sources compile their
        ;; iconv support unconditionally, so a Termux kernel's libkernel.a
        ;; carries libiconv_open/close: without -liconv the final link dies on

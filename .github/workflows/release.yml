@@ -342,11 +342,13 @@ jobs:
             bad="$(printf '%s\n%s' "$bad" "$zbad" | sed '/^$/d')"
           else
             readelf -d "$bin" | grep NEEDED || true
-            # ncurses/tinfo/uuid are the Linux build's own story (STATIC_DEPS,
-            # and libuuid on top of glibc); the compression libraries are the
-            # ones jolt bakes in itself, on every platform, so assert those.
+            # STATIC_DEPS bakes in lz4, zlib, ncurses and tinfo, so the binary
+            # needs glibc and libuuid (which has no static package on
+            # manylinux2014) and nothing else. An allowlist, because a build.ss
+            # link-flag change that quietly turns ncurses dynamic produces a
+            # binary that will not start on a machine without libncurses.so.5.
             bad="$(readelf -d "$bin" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' \
-                   | grep -Ei 'lz4|libz\.' || true)"
+                   | grep -Ev '^(libc|libdl|libm|libpthread|librt|libuuid)\.so\.[0-9]+$|^ld-linux' || true)"
           fi
           if [ -n "$bad" ]; then
             echo "::error::$bin needs libraries that are not on a stock machine:"
