@@ -144,10 +144,27 @@
                       (lambda (x) (jolt-invoke render x)))
     jolt-nil))
 
+;; The library seam for instance?, the same contract as Chez's
+;; (host-static-classes.ss, excluded here): each fn answers nil to pass, so ONE
+;; arm asks them in order and passes when none decides. Registering each as its
+;; own arm answering (jolt-truthy? …) turned a pass into a definitive false —
+;; the first library to register one shadowed every arm after it — and made the
+;; library's answer look like a builtin one to instance-check's verdict memo,
+;; which must never cache what library code says (records-interop.ss).
+(define user-instance-checks '())
+(define (user-instance-checks-empty?) (null? user-instance-checks))
+(register-instance-check-user-arm!
+  (lambda (type-sym val)
+    (let ((tname (symbol-t-name type-sym)))
+      (let loop ((fs user-instance-checks))
+        (if (null? fs)
+            'pass
+            (let ((r (jolt-invoke (car fs) tname val)))
+              (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
 (def-var! "clojure.core" "__register-instance-check!"
   (lambda (f)
-    (register-instance-check-arm!
-      (lambda (cls val) (jolt-truthy? (jolt-invoke f cls val))))
+    (set! user-instance-checks (append user-instance-checks (list f)))
+    (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
     jolt-nil))
 
 ;; The class-methods half of the same seam. The table is write-only on this boot

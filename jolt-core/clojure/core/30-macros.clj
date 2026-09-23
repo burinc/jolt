@@ -917,9 +917,11 @@
 (defmacro definterface [name-sym & body]
   `(do (def ~name-sym {}) (quote ~name-sym)))
 
-;; make-reified is a fn (clojure.core); the method map {kw (fn* ...)} is an
-;; ordinary map literal that evaluates to {keyword fn}, and the protocol NAME is
-;; passed as a string (not the symbol) so the call compiles as a plain invoke.
+;; make-reified-at is a fn (clojure.core). The site's SHAPE — its method names and
+;; protocol keys, as a literal [[name …] [proto …]] of strings — is a constant, so
+;; the compiled site binds it once and every instance hands the runtime the same
+;; object, which is what lets it build the method layout once per site instead of
+;; a table per instance. The method fns follow, in the order the names list.
 (defmacro reify [& forms]
   ;; a reify can implement SEVERAL protocols; collect them all (each bare symbol
   ;; switches the current protocol, like extend-type) and pass every protocol name
@@ -929,9 +931,9 @@
   ;; fn so dispatch picks the clause by arg count.
   (loop [items (seq forms) protos [] methods {} order []]
     (if (empty? items)
-      `(make-reified
-         ~(reduce (fn [m k] (assoc m k `(fn ~@(get methods k)))) {} order)
-         ~@(vec (map protocol-key protos)))
+      `(make-reified-at
+         [[~@(map name order)] [~@(map protocol-key protos)]]
+         ~@(map (fn [k] `(fn ~@(get methods k))) order))
       (let [x (first items)]
         (if (symbol? x)
           (recur (rest items) (conj protos x) methods order)

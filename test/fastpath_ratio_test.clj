@@ -84,6 +84,51 @@
 ;;                      the string is short or long. A copying trim is linear in
 ;;                      the length; a scanning one is not.
 ;;
+;;   reify-instance     (instance? SomeProtocol r) on a reify walked every
+;;   deftype-instance   host-shim instance-check arm (23 of them, each passing)
+;;                      and then munged every declared protocol name to compare
+;;                      it — ~3.5 us for a reify of six protocols against the
+;;                      JVM's ~14 ns, ~500 ns for a deftype. core.logic asks it
+;;                      of every var and constraint on every propagation step,
+;;                      and its finite-domain solver spent 56 s seeing a trivial
+;;                      contradiction. The reference arm calls a protocol method
+;;                      on the same value, which never walked anything. Measured
+;;                      before/after: reify 204 -> 1.38, deftype 7.75 -> 1.13.
+;;
+;;   instance-miss      ...and a NO walked all of them every time, then the
+;;   number-miss        JVM taxonomy: 500-700 ns for (instance? IVar 5), which
+;;                      core.logic asks of every term it walks. The builtin arms'
+;;                      verdict per value kind is memoized now, the library arm
+;;                      still asked live (31 -> 1.55, 22 -> 1.37).
+;;
+;;   instance-site      ...and past both memos, each (instance? T x) SITE caches
+;;   instance-site-type its last type argument and receiver kind, so a repeat is
+;;                      two eq?s and an epoch compare — the shape of the JVM's
+;;                      inlined instanceof, where the memo path still interned the
+;;                      type name and read two tables per call. Held BELOW a
+;;                      protocol call: the site measures 0.32 (quoted name) and
+;;                      0.42 (a deftype as T) of one; without it, 1.15-1.95.
+;;
+;;   reify-construct    (reify …) built a {kw fn} map and then a hashtable from it
+;;                      per instance (~310 ns against the JVM's ~25). The layout is
+;;                      the site's, built once; an instance is a vector of fns.
+;;                      The reference constructs a deftype (8.9 -> 1.05).
+;;
+;;   satisfies-reify    satisfies? on a reify re-munged every declared protocol
+;;                      name ahead of the match (13.5 -> 0.82).
+;;
+;;   record-key-get     a map keyed on a deftype that declares equals/hashCode
+;;                      (core.logic's LVar) looked both methods up by NAME, in two
+;;                      string-keyed tables, on every key compared. The reference
+;;                      is the same lookup over identity-keyed deftypes, which
+;;                      declare neither and so find nothing to call (5.46 -> 1.86).
+;;
+;;   top-level-fn       a fn built in a bare top-level form — every deftype and
+;;                      defrecord method, every extend-type impl and defmethod —
+;;                      got no constant pool, so each keyword literal in it
+;;                      re-interned on every call. The reference is the same fn
+;;                      built under a def, which always had one (2.38 -> 1.02).
+;;
 ;; Only the ratios are judged, never the absolute times — a slow shared runner
 ;; moves both arms together. Sampling follows io_scaling_test.clj: best-of-N
 ;; (minimum, not mean — interference only ever adds time), a ceiling, a
@@ -205,6 +250,37 @@
 (def ^:private absent-str "QZXW")
 (def ^:private absent-char \Q)
 
+;; dispatch fixtures: a reify and a deftype declaring several protocols, and
+;; deftype map keys with and without their own equals/hashCode
+(defprotocol DP1 (dp1 [x])) (defprotocol DP2 (dp2 [x])) (defprotocol DP3 (dp3 [x]))
+(defprotocol DP4 (dp4 [x])) (defprotocol DP5 (dp5 [x])) (defprotocol DP6 (dp6 [x]))
+(def ^:private dispatch-reify
+  (reify DP1 (dp1 [_] 1) DP2 (dp2 [_] 2) DP3 (dp3 [_] 3)
+         DP4 (dp4 [_] 4) DP5 (dp5 [_] 5) DP6 (dp6 [_] 6)))
+(deftype DispatchT [a] DP1 (dp1 [_] a) DP2 (dp2 [_] a))
+(def ^:private dispatch-t (DispatchT. 1))
+(def ^:private dispatch-n 100000)
+(defprotocol DP7 (dp7 [x] [x y]))
+(defn- mk-reify [a] (reify DP1 (dp1 [_] a) DP2 (dp2 [_] a) DP7 (dp7 [_] a) (dp7 [_ y] y)))
+(defn- mk-type [a] (DispatchT. a))
+(def ^:private made-reify (mk-reify 1))
+(deftype EqKey [id]
+  Object
+  (equals [_ o] (and (instance? EqKey o) (= id (.-id ^EqKey o))))
+  (hashCode [_] (hash id)))
+(deftype PlainKey [id])
+(def ^:private eq-key-map (zipmap (map #(EqKey. %) (range 8)) (range)))
+(def ^:private eq-probe (EqKey. 7))
+(def ^:private plain-keys (mapv #(PlainKey. %) (range 8)))
+(def ^:private plain-key-map (zipmap plain-keys (range)))
+(def ^:private plain-probe (nth plain-keys 7))
+;; one body, built under a def and in a bare top-level form
+(def ^:private kw-map {:a 1 :b 2 :c 3})
+(def ^:private fn-via-def (fn [m] (+ (get m :a) (get m :b) (get m :c))))
+(def ^:private fn-holder (atom nil))
+(reset! fn-holder (fn [m] (+ (get m :a) (get m :b) (get m :c))))
+(def ^:private fn-via-top @fn-holder)
+
 (defn -main [& _]
   (spit src-path source-text)
   (spit data-path payload)
@@ -277,6 +353,62 @@
           #(dotimes [_ 200] (str/trim clean-short))
           #(dotimes [_ 200] (str/trim clean-long))
           4.0 10.0)
+
+  ;; instance? on a reify or deftype that declares the protocol must cost about
+  ;; what calling one of its methods costs.
+  (judge! "reify-instance"
+          #(dotimes [_ dispatch-n] (dp6 dispatch-reify))
+          #(dotimes [_ dispatch-n] (instance? fastpath_ratio_test.DP6 dispatch-reify))
+          4.0 20.0)
+  (judge! "deftype-instance"
+          #(dotimes [_ dispatch-n] (dp1 dispatch-t))
+          #(dotimes [_ dispatch-n] (instance? fastpath_ratio_test.DP2 dispatch-t))
+          3.0 6.0)
+
+  ;; ...and a miss, on a record and on a number, must too.
+  (judge! "instance-miss"
+          #(dotimes [_ dispatch-n] (dp1 dispatch-t))
+          #(dotimes [_ dispatch-n] (instance? fastpath_ratio_test.DP7 dispatch-t))
+          4.0 10.0)
+  (judge! "number-miss"
+          #(dotimes [_ dispatch-n] (dp1 dispatch-t))
+          #(dotimes [_ dispatch-n] (instance? fastpath_ratio_test.DP7 42))
+          4.0 10.0)
+
+  ;; The site cache: cheaper than the protocol call it is measured against.
+  (judge! "instance-site"
+          #(dotimes [_ dispatch-n] (dp1 dispatch-t))
+          #(dotimes [_ dispatch-n] (instance? fastpath_ratio_test.DP7 dispatch-t))
+          0.8 1.1)
+  (judge! "instance-site-type"
+          #(dotimes [_ dispatch-n] (dp1 dispatch-t))
+          #(dotimes [_ dispatch-n] (instance? DispatchT dispatch-t))
+          0.8 1.1)
+
+  ;; Building a reify must cost about what building a deftype costs.
+  (judge! "reify-construct"
+          #(dotimes [_ dispatch-n] (mk-type 1))
+          #(dotimes [_ dispatch-n] (mk-reify 1))
+          3.0 6.0)
+
+  ;; satisfies? on a reify must cost about a protocol call.
+  (judge! "satisfies-reify"
+          #(dotimes [_ dispatch-n] (dp1 dispatch-t))
+          #(dotimes [_ dispatch-n] (satisfies? DP2 made-reify))
+          3.0 8.0)
+
+  ;; A key with its own equals/hashCode must not cost wildly more to look up
+  ;; than an identity key.
+  (judge! "record-key-get"
+          #(dotimes [_ 20000] (get plain-key-map plain-probe))
+          #(dotimes [_ 20000] (get eq-key-map eq-probe))
+          3.0 4.5)
+
+  ;; The same fn body costs the same whether a def or a bare form built it.
+  (judge! "top-level-fn"
+          #(dotimes [_ dispatch-n] (fn-via-def kw-map))
+          #(dotimes [_ dispatch-n] (fn-via-top kw-map))
+          1.5 2.0)
 
   (.delete (java.io.File. src-path))
   (.delete (java.io.File. data-path))

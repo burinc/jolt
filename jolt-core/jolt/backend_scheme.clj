@@ -783,8 +783,8 @@
          (every? (fn [k] (and (= :const (:op k)) (keyword? (:val k)))) ks)
          (apply distinct? (map :val ks)))))
 
-(defn- emit-with-cells [emit-thunk]
-  (let [cells (atom [])
+(defn- emit-with-scope [cells? emit-thunk]
+  (let [cells (when cells? (atom []))
         pool (atom {})
         ids (atom {})
         raw (binding [*cache-cells* cells
@@ -798,12 +798,13 @@
         ;; fixpoint needs.
         consts (map (fn [p] (str "(" (first (val p)) " " (nth (val p) 2) ")"))
                     (sort-by (comp second val) @pool))
-        lazies (map (fn [c] (str "(" c " #f)")) @cells)
+        lazies (map (fn [c] (str "(" c " #f)")) (when cells @cells))
         binds  (concat consts lazies)]
     (if (seq binds)
       ;; let*, not let: the consts can depend on each other now.
       (str "(let* (" (str/join " " binds) ") " raw ")")
       raw)))
+(defn- emit-with-cells [emit-thunk] (emit-with-scope true emit-thunk))
 
 ;; A cache-cell scope for a top-level EXPRESSION (jolt-g3u). Without it the
 ;; collector exists only inside a def, so every var / protocol / ctor site in a
@@ -880,14 +881,28 @@
 (defn- top-form-repeats? [node]
   (node-tree-any? (fn [n] (contains? repeat-ops (:op n))) node))
 
+(defn- top-form-has-fn? [node]
+  (node-tree-any? (fn [n] (= :fn (:op n))) node))
+
+;; A fn literal in a bare top-level form gets the CONSTANT pool, not the cells.
+;; Such a form is how every deftype/defrecord method, every extend-type and
+;; extend-protocol impl, every defmethod body and every reify-in-a-registration
+;; reaches the runtime — code that runs on every call of the method — and without
+;; a pool each keyword literal in it re-interned per evaluation: a deftype method
+;; binds its fields with (__deftype-field this :f), so a type of eight fields paid
+;; eight intern lookups (a string hash each) on every method entry. core.logic's
+;; Substitutions is that type, and the lookups were a fifth of a propagation run.
+;; The pool is cheap where the cells are not: a hoisted keyword is one binding and
+;; one variable read in place of the (keyword …) call text, so the form Chez
+;; compiles barely grows — the 14% load cost measured above was the cells.
 (defn- emit-top-cells [node emit-thunk]
-  (if (and (var-cache?)
-           ;; never a def: the :def cases already wrap their INIT, which is the
-           ;; part that repeats. A def's remaining pieces run once.
-           (not= :def (:op node))
-           (top-form-repeats? node))
-    (emit-with-cells emit-thunk)
-    (emit-thunk)))
+  (cond
+    ;; never a def: the :def cases already wrap their INIT, which is the part
+    ;; that repeats. A def's remaining pieces run once.
+    (or (not (var-cache?)) (= :def (:op node))) (emit-thunk)
+    (top-form-repeats? node) (emit-with-cells emit-thunk)
+    (top-form-has-fn? node) (emit-with-scope false emit-thunk)
+    :else (emit-thunk)))
 
 ;; Scheme syntactic keywords. A jolt local with one of these names would, when
 ;; emitted verbatim, shadow the Scheme form in operator position (a local named
@@ -2814,6 +2829,20 @@
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
                                  (fn [operands] (emit-call tail? callee operands tl ich)))))]
     (cond
+      ;; (instance? T x) asks the same question at nearly every call — T is a literal
+      ;; or a type's ctor value — so the site gets an inline cache (records-interop.ss
+      ;; jolt-instance-site): the last T by identity and the last receiver kind,
+      ;; answered by two eq?s and an epoch compare. Without it every call interned the type name as a symbol and went
+      ;; through instance-check's type-argument normalization and two memo tables,
+      ;; 37-54 ns against the JVM's inlined instanceof. The site object is a per-site
+      ;; constant, so this needs a pool; it also needs var-cache? so the seed mint
+      ;; stays byte-identical, and a callee that IS clojure.core's — an ns that
+      ;; defined its own instance-check resolves elsewhere and is called as written.
+      (and *const-pool* (var-cache?)
+           (= :var (:op fnode)) (= "clojure.core" (:ns fnode)) (= "instance-check" (:name fnode))
+           (= 2 (count arg-nodes)))
+      (let [site (hoist-const-per-site "(jolt-instance-site-make)")]
+        (order-args (fn [as] (str "(jolt-instance-site " site " " (first as) " " (second as) ")"))))
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
       ;; through the protocol var -> jolt-invoke -> protocol-resolve (which recomputes

@@ -7,7 +7,7 @@
 ;; contagion clone registry.
 ;;
 ;; Loaded after records-coll.ss; uses the jrec layout + rec-tbl-mu from
-;; records.ss. reified-methods / record-method-dispatch are free references into
+;; records.ss. reify-method-ref / record-method-dispatch are free references into
 ;; records-dispatch.ss, resolved at call time.
 
 ;; ---- protocol identity ------------------------------------------------------
@@ -159,7 +159,28 @@
 ;; so two pairs that print alike but split differently never collide. Minted once
 ;; per pair; reused by the descriptor ptable (eq?-ref).
 (define proto-method-keys (make-hashtable string-hash string=?))
+;; ...and in front of it, the same answer keyed eq? on the two name OBJECTS. A
+;; protocol call on a record resolves through here every time (the per-site PIC
+;; exists only under --opt), and the names it passes are the literals the
+;; defprotocol shim was compiled with, so a repeat is two eq?-refs where the
+;; string table cost a string-append and a hash of the joined name per call.
+;; A name spelled by another string object fills its own entry; the key it gets
+;; is still the one identity the string table hands out.
+(define pm-key-eq-cache (make-weak-eq-hashtable))
+(define pm-key-eq-mu (make-mutex))
 (define (intern-pm-key proto method)
+  (let* ((inner (hashtable-ref pm-key-eq-cache proto #f))
+         (k (and inner (hashtable-ref inner method #f))))
+    (or k
+        (let ((k (intern-pm-key-by-name proto method)))
+          (jolt-with-mutex pm-key-eq-mu
+            (let ((t (or (hashtable-ref pm-key-eq-cache proto #f)
+                         (let ((t (make-weak-eq-hashtable)))
+                           (hashtable-set! pm-key-eq-cache proto t)
+                           t))))
+              (hashtable-set! t method k)))
+          k))))
+(define (intern-pm-key-by-name proto method)
   (let* ((s (string-append proto (string (integer->char 0)) method))
          (k (hashtable-ref proto-method-keys s #f)))
     ;; double-checked: the whole point of this table is that one (proto . method)
@@ -323,7 +344,7 @@
 (def-var! "jolt.host" "jrec-method?"
   (lambda (v name)
     (cond ((jrec? v) (if (find-method-any-protocol (jrec-tag v) name) #t #f))
-          ((reified-methods v) => (lambda (m) (if (hashtable-ref m name #f) #t #f)))
+          ((jreify? v) (if (reify-method-ref v name) #t #f))
           (else #f))))
 
 ;; (str x) is x.toString() on the JVM, so a deftype/record that DECLARES toString
@@ -358,8 +379,24 @@
 ;; java.lang.Iterable, …) reaches a reify declaring it, exactly as instanceof
 ;; answers on the JVM. The reify's own method table is consulted before these
 ;; (protocol-resolve), so an inline impl still wins.
+;;
+;; A function of the protocol list and the class graph only, so it is memoized
+;; per list (interned by make-reified-delegating, so one per reify site) and
+;; stamped with jch-graph-epoch, which is what changes an interface's ancestry.
+(define jreify-tags-memo (make-weak-eq-hashtable))
 (define (jreify-host-tags obj)
-  (let loop ((ps (jreify-protos obj)) (acc '()))
+  (let* ((ps (jreify-protos obj))
+         (e (hashtable-ref jreify-tags-memo ps #f)))
+    (if (and e (fx= (car e) jch-graph-epoch))
+        (cdr e)
+        (let* ((epoch jch-graph-epoch)
+               (tags (jreify-protos-tags ps)))
+          (jolt-with-mutex jch-cache-mutex
+            (when (fx= epoch jch-graph-epoch)
+              (hashtable-set! jreify-tags-memo ps (cons epoch tags))))
+          tags))))
+(define (jreify-protos-tags protos)
+  (let loop ((ps protos) (acc '()))
     (if (null? ps)
         (reverse (cons "Object" acc))
         (let inner ((ts (jch-tags (proto-iface-name (car ps)))) (acc acc))
@@ -933,9 +970,9 @@
           (let* ((desc (jrec-desc obj))
                  (f (find-protocol-method-desc desc proto-name method-name)))
             (or f (find-protocol-method (jrdesc-tag desc) proto-name method-name)))))
-    ((reified-methods obj)
-     => (lambda (rm)
-          (or (hashtable-ref rm method-name #f)
+    ((jreify? obj)
+     => (lambda (_)
+          (or (reify-method-ref obj method-name)
               ;; not implemented on the reify — fall back to the protocol's
               ;; extended impls over the reify's host tags (e.g. an Object/default
               ;; extension). malli reifies some protocols and leans on the default.

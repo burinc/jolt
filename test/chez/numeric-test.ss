@@ -444,8 +444,11 @@
   ;; user's `+` must stay an ordinary var call instead
   (ok "an ns-level `+` is NOT rewritten to unchecked-add under *unchecked-math*"
       (not (has? e "jolt-uncadd2")))
+  ;; through its var either way: per access, or through the interned cell the
+  ;; form's constant pool hoists (a top-level fn gets one — emit-top-cells)
   (ok "...it calls the ns's own + through its var"
-      (has? e "(var-deref \"shadow-cast-ns\" \"+\")")))
+      (or (has? e "(var-deref \"shadow-cast-ns\" \"+\")")
+          (has? e "(jolt-var \"shadow-cast-ns\" \"+\")"))))
 (let ((e (emit-in "u" "(fn* ([a b] (+ a b)))")))
   (ok "...while core's `+` still is" (has? e "jolt-uncadd2")))
 (def-var! "clojure.core" "*unchecked-math*" jolt-nil)

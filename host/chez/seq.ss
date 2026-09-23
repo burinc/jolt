@@ -1266,7 +1266,7 @@
     ;; inline `invoke` method with the value itself as the leading `this`.
     ((and (jrec? f) (find-method-any-protocol (jrec-tag f) "invoke"))
      => (lambda (m) (apply jolt-invoke m f args)))
-    ((and (reified-methods f) (hashtable-ref (reified-methods f) "invoke" #f))
+    ((reify-method-ref f "invoke")
      => (lambda (m) (apply jolt-invoke m f args)))
     ;; host types registered as callable (promise delivers, …): consulted only
     ;; after every built-in case missed, so the hot dispatch pays nothing.
@@ -1937,7 +1937,7 @@
 ;; variadic core fn could carry more than 21 arguments.
 (define (jolt-apply-to-method f)
   (cond ((jrec? f) (find-method-any-protocol (jrec-tag f) "applyTo"))
-        ((reified-methods f) => (lambda (h) (hashtable-ref h "applyTo" #f)))
+        ((jreify? f) (reify-method-ref f "applyTo"))
         (else #f)))
 (define (jolt-apply f . args)
   (let* ((r (reverse args)) (tail (car r)) (fixed (reverse (cdr r)))

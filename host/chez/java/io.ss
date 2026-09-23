@@ -1813,8 +1813,7 @@
      (let ((c (embedded-res-content src)))
        (if (bytevector? c) (utf8->string c) c)))
     ((reader-jhost? src) (drain-reader src))
-    ((and (reified-methods src)
-          (hashtable-ref (reified-methods src) "-read-line" #f))
+    ((reify-method-ref src "-read-line")
      (drain-ireader src))
     ;; a file: URL reads its target (jar:/http:/… raise in url-content).
     ((and (jhost? src) (string=? (jhost-tag src) "url")) (url-content src))

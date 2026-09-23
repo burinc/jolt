@@ -207,7 +207,7 @@
         ;; declares both seq[this] (Seqable) and seq[this ascending] (Sorted), and
         ;; (.seq pm false) must reach the 2-arg one, not dot-coll's plain seq.
         ((and (jrec? obj)
-              (find-method-any-protocol-arity (jrec-tag obj) mname (+ 1 (length rest))))
+              (jrec-method-arity obj mname (+ 1 (length rest))))
          => (lambda (f) (apply jolt-invoke f obj rest)))
         ;; collection interop first (entry count / seq / nth / get / containsKey).
         ((and (dot-coll? obj) (dot-coll-method obj mname rest))

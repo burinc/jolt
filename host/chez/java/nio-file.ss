@@ -607,7 +607,7 @@
         (cons "size"           (lambda (self) (nio-size (jhost-state self))))))
 
 (define (nio-call-visitor visitor name . args)
-  (let ((m (and (reified-methods visitor) (hashtable-ref (reified-methods visitor) name #f))))
+  (let ((m (reify-method-ref visitor name)))
     (if m (fvr-sym (apply jolt-invoke m visitor args)) 'continue)))
 
 ;; Files/walkFileTree(start, opts, max-depth, visitor): pre-order directory walk
@@ -676,7 +676,7 @@
         (let ((rx (jolt-re-pattern (npath-glob->regex arg))))
           (filter (lambda (p) (jolt-truthy? (jolt-re-matches rx (npath-string-of (npath-file-name (nio-path-str p)))))) paths)))
        ;; a DirectoryStream$Filter reify filters by its accept method
-       ((and arg (reified-methods arg) (hashtable-ref (reified-methods arg) "accept" #f))
+       ((and arg (reify-method-ref arg "accept"))
         => (lambda (m) (filter (lambda (p) (jolt-truthy? (jolt-invoke m arg p))) paths)))
        (else paths)))))
 

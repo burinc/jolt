@@ -18,7 +18,65 @@
 ;; The entry is stable, so the var cell bound below stays current as arms register.
 (define jolt-class-arms '())
 (define (register-class-arm! pred handler)
+  (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
   (set! jolt-class-arms (cons (cons pred handler) jolt-class-arms)))
+;; A LIBRARY's arm (__register-class!) is probed as it registers: it arrives at
+;; runtime, after the whole runtime has loaded, so its predicate can be run
+;; against the probes there and then. The runtime's own arms cannot be probed at
+;; registration — one of them names a predicate from a file that loads later, and
+;; an unbound reference aborts the whole-program release build instead of
+;; raising — so class-arms-claiming-fast-types answers for them after boot, and
+;; the dispatch-caches unit gate requires it to be empty.
+(define (register-class-arm-checked! pred handler)
+  (class-arm-reject-fast-type! '__register-class! pred)
+  (register-class-arm! pred handler))
+(define (class-arms-claiming-fast-types)
+  (let ((probes (class-fast-probes)))
+    (filter (lambda (arm)
+              (exists (lambda (p) (guard (e (#t #f)) (and ((car arm) p) #t))) probes))
+            jolt-class-arms)))
+
+;; The runtime's own values answer (class x) without the arm walk: scalars, jolt's
+;; collections and seqs, records and plain reifies. The walk is ~50 predicates
+;; long and grows as libraries load, and (class x) is not the only thing that
+;; pays it — instance? asks it of every value it cannot answer otherwise, so a
+;; miss on a number cost two thirds of a microsecond.
+;;
+;; A record's class is its tag, and only its tag: the else arm of
+;; jolt-class-base rendered jolt-type, which honours :type METADATA, so
+;; (class (with-meta a-record {:type :foo})) answered :foo where the JVM answers
+;; the record's class. A plain reify reports the fixed stand-in the JVM's
+;; per-site ns$reify__N cannot be reproduced by (this used to be an arm in
+;; vars.ss); a proxy is a reify with a delegate and keeps its arm (proxy.ss).
+;;
+;; Sound only while no arm claims one of these types: __register-class! refuses
+;; one that does (register-class-arm-checked!), which also covers its
+;; value-host-tags half since that reuses the predicate, and the runtime's own
+;; arms are held to it by class-arms-claiming-fast-types below.
+(define (class-fast-name x)
+  (cond ((or (jolt-nil? x) (boolean? x) (number? x) (string? x) (keyword? x)
+             (symbol-t? x) (char? x) (pvec? x) (pmap? x) (pset? x) (cseq? x)
+             (empty-list-t? x) (jolt-lazyseq? x))
+         (jolt-class-base x))
+        ((jrec? x) (jrec-tag x))
+        ((and (jreify? x) (not (jreify-delegate x))) "clojure.lang.IObj$reify__0")
+        (else #f)))
+(define (class-fast-probes)
+  (append (list jolt-nil #t #f 0 1.5 (expt 2 70) 1/3 "s" #\a
+                (keyword #f "class-probe") (jolt-symbol #f "class-probe"))
+          (probe-if-available (lambda () (jolt-vector 1)))
+          (probe-if-available (lambda () (jolt-hash-map (keyword #f "a") 1)))
+          (probe-if-available (lambda () (jolt-hash-set 1)))
+          (probe-if-available (lambda () (list->cseq (list 1))))
+          (probe-if-available (lambda () jolt-empty-list))
+          ;; the record constructor, not jolt-make-lazy-seq: lazy-bridge.ss loads
+          ;; after this file and its arms register, and an unbound reference is
+          ;; not a catchable condition in the whole-program release compile
+          (probe-if-available (lambda () (make-jolt-lazyseq (lambda () jolt-nil) jolt-nil #f #f #f jolt-nil)))
+          (probe-if-available (lambda () jrec-fast-type-probe))
+          (probe-if-available (lambda () (make-reified (jolt-hash-map))))))
+(define (class-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (class-fast-probes) "the (class x) fast path"))
 
 ;; ---- seq flavor -> JVM class --------------------------------------------------
 ;; The one place the sk-* tags a cseq cell carries (seq.ss) become clojure.lang.*
@@ -191,10 +249,11 @@
                 (string-append (class-munge-name (car p)) "$" (class-munge-name (cdr p))))))
 
 (define (jolt-class-name x)
-  (let loop ((as jolt-class-arms))
-    (cond ((null? as) (jolt-class-base x))
-          (((caar as) x) ((cdar as) x))
-          (else (loop (cdr as))))))
+  (or (class-fast-name x)
+      (let loop ((as jolt-class-arms))
+        (cond ((null? as) (jolt-class-base x))
+              (((caar as) x) ((cdar as) x))
+              (else (loop (cdr as)))))))
 ;; A Class is ONE object per class, as on the JVM: (class 1) and (class 2) hand
 ;; back the same token, and it is the same token the class-name symbol Long
 ;; evaluates to. That makes identical? on two Class values a class-equality test,

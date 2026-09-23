@@ -164,7 +164,20 @@
                    ;; must not be called with a not-found argument.
                    (let ((m3 (and m3 (proc-accepts? m3 3) m3))
                          (m2 (and m2 (proc-accepts? m2 2) m2)))
-                     (and (or m3 m2) (cons m3 m2))))))))
+                     (and (or m3 m2) (cons m3 m2)))))
+            ;; slot 7: the type's declared impl per method NAME (jrec-method),
+            ;; filled on first ask. Here, and not a table of its own, so it is
+            ;; retired with the rest of this vector when either epoch moves.
+            (make-weak-eq-hashtable)
+            ;; slot 8: instance?'s own-type answer per class NAME
+            ;; (jrec-declares-class?, records-interop.ss), keyed eq? like slot 7.
+            (make-weak-eq-hashtable)
+            ;; slot 9: jrec-method-arity's answers, method name -> ((nargs . impl) …)
+            (make-weak-eq-hashtable)
+            ;; slot 10: satisfies?'s answer per protocol NAME (records-dispatch.ss)
+            (make-weak-eq-hashtable)
+            ;; slot 11: jrec-type-isa?'s answer per interface NAME
+            (make-weak-eq-hashtable))))
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x))
          (c (jrdesc-ifc d)))
@@ -173,6 +186,54 @@
         (let ((fresh (jrdesc-derive-ifc d (jrec-record?-uncached x))))
           (jrdesc-ifc-set! d fresh)
           fresh))))
+;; The impl a record type declares for METHOD (any protocol), or #f. Every
+;; collection op on a record asks this first — equality asks it for equiv and
+;; equals on both operands, hashing for hasheq and hashCode, meta/assoc/nth/count
+;; each for their own — and find-method-any-protocol answers from two string-keyed
+;; tables per call. core.logic keys its substitution maps on LVars, which declare
+;; equals and hashCode, so every map probe paid four such lookups per key compared.
+;; Keyed eq? on the name: callers pass literals, so a repeat is one eq?-ref; a
+;; name spelled by a different string object just fills its own entry.
+(define (jrec-method x method)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 7))
+         (hit (hashtable-ref t method 'none)))
+    (if (eq? hit 'none)
+        (let ((m (find-method-any-protocol (jrec-tag x) method)))
+          (jolt-with-mutex jrdesc-ifc-mutex (hashtable-set! t method m))
+          m)
+        hit)))
+;; Does a record TYPE implement IFACE — its own tag, an interface or protocol it
+;; declares, or their ancestry in the class graph? The question map?/coll?/
+;; vector?/… ask of a deftype, answered from the type alone and memoized per type
+;; (slot 11, keyed eq? on the literal interface name).
+;;
+;; It must NOT be instance?: instance? consults the library arms, and a library's
+;; value-tags arm (__register-class!) is a predicate over arbitrary values that
+;; may well call map? — which asked instance? of the same deftype, which asked the
+;; arm again: an unbounded recursion that hung any (satisfies? P x) or
+;; (instance? P x) on such a value once a library had registered one.
+(define (jrec-type-isa? x iface)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 11))
+         (hit (hashtable-ref t iface 'none)))
+    (if (eq? hit 'none)
+        (let* ((tag (jrec-tag x))
+               (ans (or (jrec-declares-class? tag iface) (jch-isa? tag iface))))
+          (jolt-with-mutex jrdesc-ifc-mutex (hashtable-set! t iface ans))
+          ans)
+        hit)))
+;; ...and by name AND arity (NARGS counts `this`), for the calls that pick one
+;; arity of a method a type declares at several — every (.method rec …) interop
+;; call and iface-method. Same cache, same keying; find-method-any-protocol-arity
+;; decides, including its any-arity fallback.
+(define (jrec-method-arity x method nargs)
+  (let* ((t (vector-ref (jrdesc-ifc-of x) 9))
+         (hit (assv nargs (hashtable-ref t method '()))))
+    (if hit
+        (cdr hit)
+        (let ((m (find-method-any-protocol-arity (jrec-tag x) method nargs)))
+          (jolt-with-mutex jrdesc-ifc-mutex
+            (hashtable-set! t method (cons (cons nargs m) (hashtable-ref t method '()))))
+          m))))
 
 ;; A CharSequence is not a collection, but three of RT's entry points name one
 ;; anyway — RT.count is its length, RT.seq walks its characters, RT.nth reads one
@@ -264,9 +325,8 @@
 ;; re-deriving jrec-vs-reify lookup and arity handling.
 (define (iface-method v method nargs)
   (cond ((jrec? v)
-         (if nargs (find-method-any-protocol-arity (jrec-tag v) method nargs)
-             (find-method-any-protocol (jrec-tag v) method)))
-        ((jreify? v) (let ((rm (reified-methods v))) (and rm (hashtable-ref rm method #f))))
+         (if nargs (jrec-method-arity v method nargs) (jrec-method v method)))
+        ((jreify? v) (reify-method-ref v method))
         (else #f)))
 ;; a record counts its declared fields plus anything assoc'd on beyond them
 (define (jrec-field-count coll)

@@ -309,12 +309,45 @@
 ;; by never descending into try or fn*.
 (ev "(def ch (clojure.core.async/chan))")
 (ev "(defn helper-take [c] (clojure.core.async/<! c))")
-(define (emit-scheme src) (jolt-analyze-emit-form (jolt-ce-read src) "user"))
-
 ;; The two spellings a rewritten park site emits to. Pinned by a check below, so a
 ;; rename or a direct-linked build cannot make the scan blind instead of failing.
 (define sm-call-take "(var-deref \"clojure.core.async\" \"__sm-take\")")
 (define sm-call-put  "(var-deref \"clojure.core.async\" \"__sm-put\")")
+
+;; A form with a constant pool (a def, or a top-level form holding a fn) reads a
+;; var through a cell the pool binds once — (_kc$N (jolt-var "ns" "name")) at the
+;; top, (var-cell-deref _kc$N) at the site — instead of the per-access var-deref.
+;; Rewrite each park op's cell reads back to the canonical spelling, so every
+;; check below reads one spelling whichever way the site was emitted. The "does
+;; contain a park site" pins still fail if a future spelling escapes this.
+(define (string-replace-all s from to)
+  (let ((n (string-length s)) (m (string-length from)))
+    (let loop ((i 0) (acc '()) (start 0))
+      (cond ((fx>? (fx+ i m) n)
+             (apply string-append (reverse (cons (substring s start n) acc))))
+            ((string=? (substring s i (fx+ i m)) from)
+             (loop (fx+ i m) (cons to (cons (substring s start i) acc)) (fx+ i m)))
+            (else (loop (fx+ i 1) acc start))))))
+(define (canonical-park-spellings s)
+  (fold-left
+   (lambda (s op)
+     (let* ((bind-tail (string-append " (jolt-var \"clojure.core.async\" \"" (car op) "\"))"))
+            (n (string-length s)) (m (string-length bind-tail)))
+       ;; each "(_kc$N" immediately followed by bind-tail names a cell for this op
+       (let loop ((i 0) (s s))
+         (let ((j (let find ((k i)) (cond ((fx>? (fx+ k m) (string-length s)) #f)
+                                          ((string=? (substring s k (fx+ k m)) bind-tail) k)
+                                          (else (find (fx+ k 1)))))))
+           (if (not j)
+               s
+               (let* ((open (let back ((k (fx- j 1))) (if (char=? (string-ref s k) #\() k (back (fx- k 1)))))
+                      (cell (substring s (fx+ open 1) j)))
+                 (loop (fx+ j m)
+                       (string-replace-all s (string-append "(var-cell-deref " cell ")") (cdr op)))))))))
+   s
+   (list (cons "__sm-take" sm-call-take) (cons "__sm-put" sm-call-put))))
+(define (emit-scheme src)
+  (canonical-park-spellings (jolt-analyze-emit-form (jolt-ce-read src) "user")))
 
 ;; Is a rewritten park site inside some dynamic-wind's balanced extent? One
 ;; left-to-right scan: `winds` holds the depth each open wind started at, so a

@@ -82,6 +82,21 @@
   ;; (protocols.ss protocol-resolve), so there is no name to report and no Class
   ;; to hand back. Reporting a name for a class that does not exist would just
   ;; move the failure from a nil key to a ClassNotFoundException.
+  ;; Redefining a deftype replaces the TYPE, not just the name (jolt-nx2x). On the
+  ;; JVM each deftype form is a fresh class: code compiled against the first keeps
+  ;; constructing it, and its instances keep its methods. jolt keys a type's
+  ;; methods by its tag (forget-type-methods! drops the old definition's), so old
+  ;; instances already dispatch to the new definition; a (T. …) resolved to the old
+  ;; ctor would mint objects of the old layout answering the new methods. Keeping
+  ;; the whole old definition alive per call site needs a descriptor-versioned
+  ;; method table — out of scope for a REPL-redefinition detail.
+  {:category :host-model
+   :behavior "(T. …) that ran before T is redefined"
+   :jvm "keeps constructing the class it first linked against (the old definition); a site first run after the redefinition links the new one"
+   :jolt "constructs the current definition — a redefinition replaces the type"
+   :check {:expr "(load-string \"(ns kd-nx2x.ns) (deftype T [a] Object (toString [_] \\\"one\\\")) (defn mk [] (T. 0)) (def before (str (mk))) (deftype T [a] Object (toString [_] \\\"two\\\")) [before (str (mk))]\")"
+           :jvm "[\"one\" \"one\"]"
+           :jolt "[\"one\" \"two\"]"}}
   ;; The scheduled pools (jolt-hgjo). Three class-model details of
   ;; java.util.concurrent.ScheduledThreadPoolExecutor that jolt does not
   ;; reproduce; the schedule methods' behaviour is certified by the corpus rows
