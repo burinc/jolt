@@ -5,9 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.12] - 2026-09-24
+
+Mostly Windows and host-surface parity. Files and Paths render with `\` on
+Windows, `file:` URLs round-trip with drive letters, directory mtimes and
+access/creation times are real on every platform, and a DLL that is present
+but cannot load says so instead of reading as missing. Host static members now
+check the JVM's arities, which rejects calls that used to run with their extra
+arguments dropped. `instance?`, `satisfies?` and `reify` stop resolving by name
+on every call (core.logic's finite-domain case 2445 ms → 379 ms), and
+test.check's own suite runs 106/1 against the JVM's 106/0.
 
 ### Added
+
+- **`java.util.SplittableRandom`, `java.util.Objects`, fixed-size
+  `Arrays/asList`.** SplittableRandom is SplitMix64 as the JDK implements it,
+  bounded variants included, checked draw for draw against the JVM (test.check
+  defines two specs only when the class exists). `Arrays/asList` is a view that
+  writes through to its array. Character gains the case maps, `isAlphabetic`,
+  `isSpaceChar`, `isISOControl`, the Java identifier predicates, `compare`,
+  `hashCode` and `toString`.
 
 - **`jolt.loader`: a root over the embedded resource table, `"embed:<prefix>"`.**
   A build already bakes `deps.edn :jolt/build {:embed [dirs]}` into the binary
@@ -35,6 +52,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows file paths and URLs (#1110, #1117, #1118, #1119).** File and Path
+  render with `\` wherever the JVM shows one (`toString`, `getPath`,
+  `getParent`, `str`, exception messages, `File/separator`); a `\` typed by
+  the caller is a separator and paths normalize like the JDK. `toURI`/`toURL`,
+  `io/as-url` and `io/resource` spell `file:/C:/…` as the JDK does and accept
+  `file:///C:/…` back. Closing a PushbackReader after `read` closes the reader
+  it was built on, so the file is no longer left pending delete.
+  `FileTime/from` works, and a directory's mtime can be set on Windows. The
+  POSIX attribute view raises UnsupportedOperationException on Windows instead
+  of answering `rwxr-xr-x` and ignoring writes.
+
+- **File access and creation times are real.** `lastAccessTime` and
+  `creationTime` answered the mtime; they read `st_atime` and the birth time
+  now (statx on Linux, GetFileAttributesEx on Windows) and can be set.
+  `FileTime.toString` printed `#object[…]`, equal FileTimes were not `=`,
+  `fileKey` was nil, and a failed `createLink`/`createSymbolicLink` looked like
+  it succeeded. Exception messages name the path the caller gave, not the one
+  jolt resolved.
+
+- **`string->ptr` on a byte-array copies its bytes (#1100).** It rendered the
+  array with `str` and allocated `"#object[[B]"`; `with-c-string` and
+  `with-c-string-array` inherited it.
+
+- **clojure.test honours `test-ns-hook` and a caller's `*report-counters*`.**
+  `run-tests` ran every test in a namespace that defines a hook, and a report
+  inside a captured run bumped the global tally. `test-var` reports an uncaught
+  exception through `report` and emits begin/end-test-var.
+  `Thread.getStackTrace` answers the reconstructed stack instead of an empty
+  array, so test.check's failure location prints a file and line instead of
+  `(:)`.
+
+- **`map?`/`coll?`/`vector?` on a redefined deftype could recurse forever**
+  when a library `instance?` predicate itself called `map?`. They answer from
+  the type's declared interfaces now. `(class r)` no longer reports a record's
+  `:type` metadata, which the JVM ignores.
+
 - **A native library that is on disk but fails to load is no longer reported
   as not found (#1127).** On Windows, `libssl-3-x64.dll` copied beside
   `jolt.exe` warned "not found — tried [libssl-3-x64.dll …] (a task may build
@@ -59,6 +112,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(.getResourceAsStream cl "baked.txt")` answered a `java.io.Reader` where the
   JVM answers an `InputStream`. Both are byte streams now, so a byte read and
   `(InputStreamReader. …)`-style composition behave as they do on the JVM.
+
+### Changed
+
+- **Host static members check the JVM's arities (#1020 follow-up).** About 170
+  members accepted any argument count and dropped the extras:
+  `(Integer/parseInt "1" 10 3)` answered 1 and `(String/join "," ["a"] 1)`
+  answered `"[a],1"`. They now declare the JDK's overload arities and a miss
+  names the class. Java varargs members stay open. `(repeat nil :a)` and
+  `(mapcat identity 5)` throw at the call as on the JVM.
+
+### Performance
+
+- **`instance?`, `class`, `satisfies?`, record methods and `reify` stop
+  resolving by name on every call.** Per-site and per-type caches, retired by
+  an epoch when a library registers a new arm. `instance?` on a reify
+  3500 → 13 ns (JVM 14), `satisfies?` on a reify ~1300 → 39 ns, reify
+  construction 310 → 48 ns; the `dispatch` and `mono-dispatch` benchmarks are
+  3.1x and 3.5x faster.
+
+### Internal
+
+- **`tools/wine`**: a podman image that runs jolt's Windows build (source mode
+  and a cross-built `jolt.exe`) under Wine, and the `winparity` gate replaying
+  the Windows issue repros. A ta6nt cross build of jolt itself links again.
+- `make libconformance` finds the library checkouts from a git worktree, and
+  fails instead of skipping when they are missing.
 
 ## [0.8.11] - 2026-09-22
 
