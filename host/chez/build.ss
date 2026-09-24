@@ -804,9 +804,13 @@
 ;;                                                compile ns: one base per PHASE,
 ;;                                                so the wp walk and the emit walk's
 ;;                                                re-analysis never reuse a name
-;;   clojure.core/gensym                          unqualified, and a macro can make
-;;                                                a global of one: a base per
-;;                                                namespace, distinct in this build
+;;   clojure.core/gensym, and the reader's        unqualified, and a macro can make
+;;   #() / syntax-quote auto-gensyms              a global of one: a base per
+;;                                                namespace, distinct in this build.
+;;                                                The walks re-read each file and
+;;                                                re-evaluate its macro definitions,
+;;                                                so a template's auto-gensyms come
+;;                                                from these reads
 ;;   the backend's per-ns anon-literal counter    qualified by the namespace: one
 ;;                                                base, restarted per namespace
 ;;
@@ -830,8 +834,13 @@
     ((var-deref "clojure.core" "reset!") (jolt-get unit (keyword #f "fresh-counter")) 0)
     ((var-deref "jolt.analyzer" "set-name-counter!")
      (+ bld-name-base (if (eq? phase 'emit) (expt 2 39) 0)))
-    (set! jolt-gensym-counter
-      (+ bld-name-base (* (bld-gensym-slot ns) (expt 2 21)) phase-off))
+    ;; clojure.core/gensym and the reader's three (#() params, a read `,
+    ;; a compiled `): each a quarter of the namespace's range for the phase
+    (let ((base (+ bld-name-base (* (bld-gensym-slot ns) (expt 2 21)) phase-off)))
+      (set! jolt-gensym-counter base)
+      (set! rdr-anon-counter (+ base (expt 2 18)))
+      (set! rdr-sq-gensym-counter (+ base (* 2 (expt 2 18))))
+      (set! hc-sq-gensym-counter (+ base (* 3 (expt 2 18)))))
     ;; anon literals outside a def: named per namespace, counted from where the
     ;; load left off unless seeded
     ((var-deref "jolt.backend-scheme" "seed-fnsrc-ns-counter!") ns bld-name-base)))
