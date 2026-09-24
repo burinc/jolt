@@ -1516,8 +1516,19 @@
           (for-each (lambda (p) (put-string out (string-append "\n    " (car p) " " (cdr p)))) pairs)
           (put-string out "))\n"))))))
 
-(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? allow-dynamic library?)
+(define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? allow-dynamic library? includes)
   (ei-profile-init!)
+  ;; --include NS / :jolt/build {:include […]} — namespaces the app reaches
+  ;; only through a runtime lookup (requiring-resolve) and the source scan
+  ;; cannot see. Each must have a file to emit: a typo fails the build here,
+  ;; rather than baking nothing and leaving the failure to the binary's first
+  ;; lookup. They seed the require closure below (entry last — the ordering
+  ;; below assumes it).
+  (for-each
+    (lambda (n)
+      (unless (find-ns-file n)
+        (error 'jolt-build (string-append "cannot include " n " — no source file on the roots"))))
+    includes)
   ;; Windows executables carry .exe; normalize here so the append-payload and
   ;; cc paths agree and the shell can run the result. A library keeps its own
   ;; suffix (.dll/.so/.dylib) — never rewrite it to .exe.
@@ -1562,8 +1573,10 @@
     (ei-mark! "load app from source")
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the
-    ;; hook captures dynamic requires the static scan can't see.
-    (let* ((graph (bld-require-closure (list entry-ns)))
+    ;; hook captures dynamic requires the static scan can't see; the includes
+    ;; seed it with the caller's explicit namespaces (the entry stays LAST: the
+    ;; graph handling below reads it off the tail).
+    (let* ((graph (bld-require-closure (append includes (list entry-ns))))
            (_prof-graph (ei-mark! "require-graph DFS"))
            ;; reader namespaces with transitive closure
            (reader-ns-names (bld-data-reader-ns-names))
@@ -2947,7 +2960,7 @@
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
                     natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?)
-                    (bld-opt-strs opt 3) #f))
+                    (bld-opt-strs opt 3) #f (bld-opt-strs opt 5)))
     jolt-nil))
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
@@ -2957,5 +2970,5 @@
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
                     natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?)
-                    (bld-opt-strs opt 3) #t))
+                    (bld-opt-strs opt 3) #t (bld-opt-strs opt 5)))
     jolt-nil))

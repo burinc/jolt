@@ -1,0 +1,8 @@
+{:paths ["src"]
+
+ ;; Bake assets/ into the binary: the fixture namespaces and data.txt resolve
+ ;; with nothing on disk, through a jolt.loader embedded root ("embed:bundled"
+ ;; — embed keys are relative to the embed dir). assets/ is deliberately NOT a
+ ;; project path: no app namespace requires the fixture, so a loader context is
+ ;; the only way it exists in this binary.
+ :jolt/build {:embed ["assets"]}}

@@ -37,6 +37,11 @@
   `identical?` holds. A resource hit names a location; `open-hit` turns it into
   an open handle on demand, so nothing holds a file handle between calls.
 
+  A hit on an embedded root (`embedded-root?`) names an embedded key instead of
+  a path: a namespace hit carries it in `:file`, a resource hit in `:url` with
+  `:embedded? true`, and reading goes through that location rather than
+  re-resolving the request name.
+
   Two tiers decide which loader answers. Linkage follows the DEFINING loader:
   code compiled for a context resolves through that context for its whole life,
   whoever calls it and on whatever thread. Dynamic loading — `require` reached
@@ -104,9 +109,11 @@
   own cells. That claim covers the evict/evaluate window, not a reader's view
   of a name another context reloads while unrelated code compiles; a name one
   context reloaded is the name the global registry holds. `:class` requests
-  have no backend on this host yet. A root may be a directory or a jar; a jar
-  is read in place through its central directory, as the global roots read
-  one, and never extracted.
+  have no backend on this host yet. A root may be a directory, a jar, or an
+  embedded root — "embed:<prefix>", a prefix into the runtime's
+  embedded-resource table (what deps.edn `:jolt/build {:embed [dirs]}` bakes
+  into a binary; see `embedded-root?`); a jar is read in place through its
+  central directory, as the global roots read one, and never extracted.
 
   One registry also means one slot per name. A private load EVICTS whatever
   the process has under the name — including a host namespace the context is
@@ -354,14 +361,16 @@
 
 (defn- default-open
   "Open a resource hit. A file: location opens the file, a jar:file: location
-   streams the entry out of its archive; anything else — the jar:-classed
-   embedded resource a built binary hands out — is re-resolved by name through
-   the host's resolver, which is what produced the location."
+   streams the entry out of its archive, an embedded hit reads its key through
+   the host resolver; anything else — the jar:-classed embedded resource a
+   built binary hands out — is re-resolved by name through the host's resolver,
+   which is what produced the location."
   [hit]
   (when-let [url (:url hit)]
     (cond
       (str/starts-with? url "file:") (io/input-stream (file-url-path url))
       (str/starts-with? url "jar:file:") (io/input-stream url)
+      (:embedded? hit) (io/input-stream (host-resource url))
       :else (io/input-stream (host-resource (:name hit))))))
 
 (defn- hit-url
@@ -374,6 +383,7 @@
     (cond
       (str/starts-with? url "file:") (io/as-url (java.io.File. (file-url-path url)))
       (str/starts-with? url "jar:file:") (java.net.URL. url)
+      (:embedded? hit) (host-resource url)
       :else (host-resource (:name hit)))))
 
 (defn- open*
@@ -961,6 +971,25 @@
 
 ;; ─── The source-roots code backend ─────────────────────────────────────────
 
+(def ^:private embedded-root-marker "embed:")
+
+(defn embedded-root?
+  "Is ROOT an embedded root — the spelling \"embed:<prefix>\", naming a prefix
+   into the runtime's embedded-resource table (what deps.edn
+   `:jolt/build {:embed [dirs]}` bakes into a binary) rather than a directory
+   or a jar on disk? A context over such a root serves namespaces and
+   resources with no files anywhere, which is how a shipped binary runs a
+   library it carries. The var is also the feature probe: a jolt that has it
+   supports embedded roots."
+  [root]
+  (and (some? root) (str/starts-with? (str root) embedded-root-marker)))
+
+(defn- embedded-root-prefix
+  "The prefix of an embedded root — the marker's rest, with no trailing
+   slash. Keys are \"<prefix>/<name>\"."
+  [root]
+  (subs (str root) (count embedded-root-marker)))
+
 (defn- jar-root?
   "Is ROOT a jar — a .jar or .zip that is a file? The host reads such a root
    in place (jolt.host/root-file); every other root is a directory."
@@ -972,36 +1001,49 @@
 (defn- validate-root!
   "Construction is the eager-validation point: a root that is missing, not a
    directory or a whole jar, or not readable fails here, not at the first
-   load."
+   load. An embedded root's only requirement is a non-blank prefix — its keys
+   are probed per request, so a prefix holding nothing is still a legal root,
+   and a wrong one degrades to an ordinary miss."
   [root]
-  (let [f (fs/file (str root))]
-    (when-not (fs/exists? f)
-      (throw (ex-info (str "loader root does not exist: " root)
+  (if (embedded-root? root)
+    (when (str/blank? (embedded-root-prefix root))
+      (throw (ex-info (str "loader root is an embedded root with a blank prefix: " root)
                       {:type :loader/bad-root :root (str root)})))
-    (when-not (fs/readable? f)
-      (throw (ex-info (str "loader root is not readable: " root)
-                      {:type :loader/bad-root :root (str root)})))
-    (cond
-      (fs/directory? f) nil
-      (jar-root? root)
-      (when-not (jolt.host/zip-archive? (str root))
-        (throw (ex-info (str "loader root is not a whole zip archive: " root)
+    (let [f (fs/file (str root))]
+      (when-not (fs/exists? f)
+        (throw (ex-info (str "loader root does not exist: " root)
                         {:type :loader/bad-root :root (str root)})))
-      :else
-      (throw (ex-info (str "loader root is neither a directory nor a jar: " root)
-                      {:type :loader/bad-root :root (str root)})))))
+      (when-not (fs/readable? f)
+        (throw (ex-info (str "loader root is not readable: " root)
+                        {:type :loader/bad-root :root (str root)})))
+      (cond
+        (fs/directory? f) nil
+        (jar-root? root)
+        (when-not (jolt.host/zip-archive? (str root))
+          (throw (ex-info (str "loader root is not a whole zip archive: " root)
+                          {:type :loader/bad-root :root (str root)})))
+        :else
+        (throw (ex-info (str "loader root is neither a directory nor a jar: " root)
+                        {:type :loader/bad-root :root (str root)}))))))
 
 (defn- root-file
   "The location NAME resolves to on ROOT, or nil: an absolute file path under
-   a directory root, a jar: path into a jar root (jolt.host/root-file)."
+   a directory root, a jar: path into a jar root, an embedded key under an
+   embedded root (jolt.host/root-file). An embedded key is already its own
+   location — absolutizing it would turn the key into a path that cannot
+   exist."
   [root name]
   (when-let [p (jolt.host/root-file (str root) name)]
-    (if (str/starts-with? p "jar:file:") p (str (fs/absolutize (fs/file p))))))
+    (cond
+      (embedded-root? root) p
+      (str/starts-with? p "jar:file:") p
+      :else (str (fs/absolutize (fs/file p))))))
 
 (defn- roots-locate
   "Locate ns sources and resources under ROOTS, in order, without reading
-   them — ns hits carry a file path (a jar: path for a jar root), resource
-   hits a URL."
+   them — ns hits carry a file path (a jar: path for a jar root, an embedded
+   key for an embedded root), resource hits a URL and, on an embedded root,
+   the `:embedded?` marker that says the URL is a key."
   [roots]
   (fn [req]
     (case (:kind req)
@@ -1015,12 +1057,15 @@
                       (for [root roots
                             :let [f (root-file root (:name req))]
                             :when f]
-                        {:kind :resource
-                         ;; a URL path is "/"-separated; the file path renders
-                         ;; with "\\" on Windows
-                         :url (if (str/starts-with? f "jar:file:")
-                                f
-                                (str "file:" (if (= "\\" java.io.File/separator) (str/replace f "\\" "/") f)))}))
+                        (cond-> {:kind :resource
+                                 ;; an embedded key is its own location; a URL
+                                 ;; path is "/"-separated, and the file path
+                                 ;; renders with "\\" on Windows
+                                 :url (cond
+                                        (or (embedded-root? root)
+                                            (str/starts-with? f "jar:file:")) f
+                                        :else (str "file:" (if (= "\\" java.io.File/separator) (str/replace f "\\" "/") f)))}
+                          (embedded-root? root) (assoc :embedded? true))))
       nil)))
 
 ;; --- reading and evaluating a namespace source ----------------------------
@@ -1233,9 +1278,11 @@
 (defn- declares-data-readers?
   "Do L's own roots ship a data_readers.clj? (Its tags cannot work: the
    runtime's reader resolves #tag against the host's *data-readers* before the
-   loader ever sees the form — see the docstring.)"
+   loader ever sees the form — see the docstring.) An embedded root has no
+   files to check."
   [l]
-  (boolean (some #(fs/exists? (fs/file % "data_readers.clj"))
+  (boolean (some #(when-not (embedded-root? %)
+                    (fs/exists? (fs/file % "data_readers.clj")))
                  (get-in l [:info :roots]))))
 
 (defn- unresolved-reader-tags
@@ -1256,9 +1303,23 @@
      forms)
     @seen))
 
+(defn- open-source-reader
+  "A reader over FILE — a source path, or an embedded-resource key (the
+   `:file` of an ns hit on an embedded root), which is read through the host
+   resolver rather than the filesystem: a key is not a path, and opening it as
+   one would look for a file named \"assets/…\" under the cwd."
+  [file]
+  (if (jolt.host/embedded-resource? file)
+    (io/reader (host-resource file))
+    (io/reader file)))
+
 (defn- eval-namespace-source
   "Read FILE, evaluate it as NS-NAME in the host namespace space, and answer
    {:handle <namespace object> :vars {sym cell}}.
+
+   FILE is a source path, a jar: path, or an embedded key (an ns hit on an
+   embedded root) — `*file*` carries whichever of the three it is, and the
+   whole file is read through `open-source-reader`.
 
    Like the host loader, forms are read and evaluated one at a time: a form is
    read only after the ones before it ran, so the file's own namespace — and
@@ -1269,7 +1330,7 @@
    preloaded through this loader before the private-load claim is taken (a
    claim is never held while waiting on another)."
   [l ns-name file]
-  (with-open [r (java.io.PushbackReader. (io/reader file))]
+  (with-open [r (java.io.PushbackReader. (open-source-reader file))]
     (let [eof (Object.)
           ;; Read through the first ns form, or the whole file when there is
           ;; none. Reading stops there because the forms after it must be read
@@ -1572,8 +1633,8 @@
    loader IS roots plus a delegate; every combinator below builds a delegate to
    hand to :parent, except `self-first`, which reorders the two.
 
-   Validation is eager: an unreadable root or jar fails here, not at the first
-   load."
+   Validation is eager: an unreadable root or jar — or an embedded root with a
+   blank prefix — fails here, not at the first load."
   ([roots] (classpath roots nil))
   ([roots opts] (roots-loader roots opts)))
 
