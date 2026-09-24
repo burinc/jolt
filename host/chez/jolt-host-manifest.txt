@@ -42,6 +42,7 @@ delete-tree!
 directory?
 dispatch-macros
 embed-plan
+embedded-resource?
 enable-trace!
 entry-at
 escape-fn?

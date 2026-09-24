@@ -5,6 +5,43 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`jolt.loader`: a root over the embedded resource table, `"embed:<prefix>"`.**
+  A build already bakes `deps.edn :jolt/build {:embed [dirs]}` into the binary
+  and `io/resource` serves those keys with no files on disk, but a loader root
+  could only be a directory or a jar — so a shipped app could not `require` a
+  library it had baked in. An embedded root resolves namespaces and resources
+  straight out of that store: `ldr-root-file` answers the embedded key (which
+  `ldr-read-source` already reads), `jolt.loader/embedded-root?` is the public
+  predicate and the feature probe, a blank prefix is refused at construction
+  (a prefix holding nothing is still a legal root), and a resource hit from
+  such a root carries `:embedded? true`, so opening reads the hit's own
+  location instead of re-resolving the request name — on a prefixed root the
+  two are different keys. `jolt.host/embedded-resource?` is the Clojure-side
+  predicate.
+
+- **`jolt build --include NS` / `:jolt/build {:include [ns …]}`.** A namespace
+  the require scan cannot see — one the app reaches only through a runtime
+  `requiring-resolve`, a plugin loader's shape — was simply absent from the
+  built image, and a built binary has no source roots to load it from, so the
+  lookup failed at the call with "Could not locate … on the source roots". The
+  repeatable flag and the deps.edn key (symbols or strings) seed the require
+  closure with the named namespaces, so their vars are compiled in; a name with
+  no source file on the roots fails the build, instead of silently baking
+  nothing and leaving the failure to the binary's first lookup.
+
+### Fixed
+
+- **`io/input-stream` refused an embedded resource, and `URL.openStream` handed
+  back a reader.** `(io/input-stream (io/resource "baked.txt"))` threw in a
+  built binary while the same call on a `file:` URL worked, and
+  `(.getResourceAsStream cl "baked.txt")` answered a `java.io.Reader` where the
+  JVM answers an `InputStream`. Both are byte streams now, so a byte read and
+  `(InputStreamReader. …)`-style composition behave as they do on the JVM.
+
 ## [0.8.11] - 2026-09-22
 
 Namespace resolution, regex and Windows are the bulk of this window. A

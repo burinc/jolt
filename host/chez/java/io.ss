@@ -134,8 +134,13 @@
       ((string=? name "isDirectory") (list #f))
       ((string=? name "isFile")      (list #t))
       ((string=? name "openStream")
+       ;; A byte stream, not a reader: a URL's openStream is byte-level on the
+       ;; JVM, and a baked resource can be binary (the same StringReader ->
+       ;; InputStream fix url-open-stream records for file: URLs). io/reader
+       ;; still decodes whatever it is handed.
        (let ((c (embedded-res-content obj)))
-         (list (host-new "StringReader" (if (bytevector? c) (utf8->string c) c)))))
+         (list (make-in-stream (open-bytevector-input-port
+                                (if (bytevector? c) c (string->utf8 c)))))))
       (else #f))))
 
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
