@@ -1767,7 +1767,7 @@
         ((and (jhost? x) (string=? (jhost-tag x) "url"))
          (if (jar-path? (url-spec x))
              (jar-path-stream (url-spec x))
-             (jio-open-in-file (url-strip-scheme (url-spec x)))))
+             (jio-open-in-file (file-url->path (url-spec x)))))
         ;; io/resource's answer for a resource baked into a built binary — a
         ;; java.net.URL with an openStream (io.ss embedded-res). Without this arm
         ;; (io/input-stream (io/resource "baked.txt")) threw in a built binary
