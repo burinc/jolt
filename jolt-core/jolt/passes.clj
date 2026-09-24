@@ -16,7 +16,8 @@
   (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline! var-redefined?]]
             [jolt.passes.fold :refer [const-fold]]
             [jolt.passes.numeric :as numeric]
-            [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace direct-call-edges]]
+            [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace direct-call-edges
+                                        begin-growth-budget! end-growth-budget!]]
              [jolt.passes.types :refer [run-inference
                                          check-form infer-body reinfer-def
                                          set-rtenv! set-vtypes!
@@ -205,6 +206,7 @@
       ;; unit pointer), no separate registries. Protocol methods for devirtualization.
       (let [_ (set-record-shapes! unit (record-shapes ctx))
             _ (set-protocol-methods! unit (protocol-methods ctx))
+            _ (begin-growth-budget! node)
             opt (loop [i 0 n (const-fold node)]
                   (reset! (:dirty unit) false)
                   (let [n2 (const-fold (scalar-replace (flatten-lets (inline-node n ctx))))]
@@ -213,6 +215,7 @@
                       (do (when (and wp-trace? (pos? i))
                             (println (str "[inline] " (:ns node) "/" (:name node) " rounds " (inc i))))
                           n2))))
+            _ (end-growth-budget!)
             ;; a top-level def whose params the whole-program fixpoint typed gets
             ;; reinferred with those seeds (record types flow in from its callers);
             ;; everything else takes the ordinary per-form inference.

@@ -153,6 +153,31 @@
       (= 0 (count-occ (code-part e) "tinyh")))
   (ok "while the cycle call stays real" (= 1 (count-occ (code-part e) "bx-a"))))
 
+;; --- code growth is bounded per top-level form (#1059) ------------------------
+;; Each splice passes the per-site size check on its own, so a form with many
+;; call sites of a mid-size callee used to grow by the callee's size at EVERY
+;; site: clojure.test's `is` inlined do-report twice per assertion, a 41-line
+;; deftest emitted 69KB of Scheme, and inlining was half of a test app's build.
+;; The growth a form may take is bounded, charged at the NET size of a splice
+;; (the body minus the call it replaces), so tiny helpers stay free.
+(define (vec-of-calls f n)
+  (let loop ((i 0) (acc ""))
+    (if (= i n) (string-append "[" acc "]")
+        (loop (+ i 1) (string-append acc " (" f " (+ y " (number->string i) "))")))))
+(ev "(def midh (fn* ([x] (if (< x 0) (- 0 x) (if (> x 100) (* x 2) (+ (* x 3) (* x 4) (* x 5) (* x 6) (* x 7) (* x 8) (* x 9) (* x 10) (* x 11) (* x 12) (* x 13) (* x 14)))))))")
+(let* ((src (string-append "(fn* ([y] " (vec-of-calls "midh" 300) "))"))
+       (e (emitf "u" src))
+       (left (count-occ (code-part e) "midh")))
+  (ok "a mid-size callee at 300 sites is inlined at some of them" (< left 300))
+  (ok "…but not at all of them: the form's growth is bounded" (> left 0)))
+(ok "a partly inlined form still computes the same values"
+    (equal? (map jnum->exact (seq->list (ev (string-append "((fn* ([y] " (vec-of-calls "midh" 300) ")) 1)"))))
+            (let loop ((i 299) (acc '()))
+              (if (< i 0) acc
+                  (loop (- i 1) (cons (let ((x (+ 1 i))) (if (> x 100) (* x 2) (* x 102))) acc))))))
+(let ((e (emitf "u" (string-append "(fn* ([y] " (vec-of-calls "add1" 300) "))"))))
+  (ok "a tiny callee is inlined at every one of 300 sites" (= 0 (count-occ (code-part e) "add1"))))
+
 (set-optimize! #f)
 (set-direct-link-flag! #f)
 (printf "~a/~a passed~n" (- total fails) total)
