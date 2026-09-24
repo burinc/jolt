@@ -5,10 +5,6 @@
 ;; Kept separate from clojure-test.clj (which gates the assertion/report/fixture
 ;; machinery) so a missing var reads as a missing var. Prints the
 ;; `CLOJURE-TEST-API OK` / `FAIL` sentinel smoke.sh greps.
-;;
-;; Where jolt's model differs from the reference, the difference is asserted here
-;; rather than glossed: test-ns reports a delta off one cumulative counter atom
-;; instead of binding *report-counters* to a per-namespace ref.
 (ns clojure-test-api
   (:require [clojure.test :as t :refer [deftest is]]
             [clojure.string :as str]))
@@ -153,12 +149,11 @@
 (ok= (:private (meta #'api-private-test)) true "deftest- marks the var private")
 
 ;; --- test-ns / test-all-vars / run-test-var --------------------------------------
-;; test-ns returns this call's summary. jolt's is a delta off the cumulative
-;; counter atom rather than a per-namespace ref's contents; the summary shape is
-;; the same, which is what callers use.
+;; test-ns returns the counters of a ref bound for that namespace, like the
+;; reference: {:test :pass :fail :error}, with no :type.
 (let [s (binding [t/*test-out* (java.io.StringWriter.)]
           (t/test-ns 'clojure-test-api))]
-  (ok= (:type s) :summary "test-ns returns a :summary map")
+  (ok= (contains? s :type) false "test-ns returns the namespace's counters, no :type")
   (ok= (and (pos? (:test s)) (pos? (:fail s))) true
        "test-ns counts this namespace's tests, including the deliberately failing one"))
 
@@ -315,6 +310,66 @@
        [(- (t/n-pass) p) (- (t/n-fail) f)])
      [2 1]
      "two passes and one fail still counted as before")
+
+;; --- a captured run keeps its own tally ----------------------------------------
+;; test.check's clojure-test suite runs one test var with *report-counters* bound
+;; to a fresh ref and report rebound to a recorder, then asserts on both. The
+;; results belong to that ref alone: they must not reach the enclosing run's
+;; summary or jolt's process-wide tally. Expectations read off JVM Clojure 1.12.
+(deftest ^:private api-throws (throw (ex-info "terrible" {})))
+
+(defn- capture [v]
+  (let [reports (atom [])
+        r0 t/report
+        before [(t/n-pass) (t/n-fail) (t/n-error)]]
+    (binding [t/*report-counters* (ref t/*initial-report-counters*)
+              t/*test-out* (java.io.StringWriter.)
+              t/report (fn [m] (swap! reports conj (:type m)) (r0 m))]
+      (t/test-var v)
+      {:counters @t/*report-counters*
+       :types @reports
+       :global (mapv - [(t/n-pass) (t/n-fail) (t/n-error)] before)})))
+
+(ok= (capture #'api-failing-test)
+     {:counters {:test 1 :pass 0 :fail 1 :error 0}
+      :types [:begin-test-var :fail :end-test-var]
+      :global [0 0 0]}
+     "a failure lands in the bound ref, not the process-wide tally")
+(ok= (capture #'api-throws)
+     {:counters {:test 1 :pass 0 :fail 0 :error 1}
+      :types [:begin-test-var :error :end-test-var]
+      :global [0 0 0]}
+     "an uncaught throw is reported through report and counted as an error")
+
+(deftest ^:private api-captures-inside
+  (is (= 1 (:fail (:counters (capture #'api-failing-test))))))
+(ok= (binding [t/*test-out* (java.io.StringWriter.)
+               t/*report-counters* (ref t/*initial-report-counters*)]
+       (t/test-vars [#'api-captures-inside])
+       @t/*report-counters*)
+     {:test 1 :pass 1 :fail 0 :error 0}
+     "a capture nested in a run does not leak into the run's tally")
+
+;; --- test-ns-hook ----------------------------------------------------------------
+;; When a namespace defines test-ns-hook, run-tests and test-ns call it INSTEAD of
+;; running every test in the namespace (test.check's own suite uses it to keep
+;; its deliberately failing defspecs out of the run).
+(let [hns (create-ns 'api-hook-ns)
+      ran (atom [])
+      saved @t/registry]
+  (intern hns (with-meta 'skipped {:test (fn [] (swap! ran conj :skipped))}) nil)
+  (intern hns (with-meta 'kept {:test (fn [] (swap! ran conj :kept) (is true))}) nil)
+  (intern hns 'test-ns-hook (fn [] (t/test-vars [(ns-resolve hns 'kept)])))
+  ;; a deftest-registered test in the namespace is skipped by the hook too
+  (t/register-test! 'api-hook-ns 'registered (fn [] (swap! ran conj :registered)))
+  (let [s (quiet? (fn [] (t/run-tests 'api-hook-ns)))]
+    (ok= [@ran s] [[:kept] {:type :summary :test 1 :pass 1 :fail 0 :error 0}]
+         "run-tests calls test-ns-hook instead of running every test"))
+  (reset! ran [])
+  (let [s (quiet? (fn [] (t/test-ns 'api-hook-ns)))]
+    (ok= [@ran s] [[:kept] {:test 1 :pass 1 :fail 0 :error 0}]
+         "test-ns calls test-ns-hook and returns that namespace's counters"))
+  (reset! t/registry saved))
 
 (let [n @passes f @fails]
   (doseq [m f] (println "clojure-test-api FAIL " m))
