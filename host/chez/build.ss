@@ -946,7 +946,7 @@
               (when (keyword? k)
                 (cond
                   ;; :as-alias registers the alias exactly like :as; what it does
-                  ;; NOT do is pull the target into the build (bld-ns-requires).
+                  ;; NOT do is pull the target into the build (bld-ns-requires*).
                   ((and (or (string=? (keyword-t-name k) "as")
                             (string=? (keyword-t-name k) "as-alias"))
                         (symbol-t? v))
@@ -1458,7 +1458,6 @@
       (jolt-enter-file! file)
       (map rdr-form->data (ei-read-all src)))))
 
-(define (bld-ns-requires file) (bld-ns-requires* (bld-scan-forms file)))
 (define (bld-ns-requires* forms)
   (let ((reqs '()))
     (for-each
@@ -1520,7 +1519,6 @@
 ;; A provider is pulled only when its source is actually on the roots
 ;; (find-ns-file) — off the roots the runtime's unknown-class message is the
 ;; contract and the build must keep succeeding exactly as before.
-(define (bld-ns-class-providers file) (bld-ns-class-providers* (bld-scan-forms file)))
 (define (bld-ns-class-providers* forms)
   (let ((cands '()))
     (define (add! class)
