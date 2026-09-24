@@ -105,8 +105,10 @@
   (when-let [v (resolve '*file*)]
     (when-let [f (deref v)]
       (when (string? f)
-        (let [i (str/last-index-of f "/")]
-          (if i (subs f (inc i)) f))))))
+        ;; the path renders with "\\" on Windows, where "/" may appear too
+        (let [i (max (or (str/last-index-of f "/") -1)
+                     (if (= "\\" java.io.File/separator) (or (str/last-index-of f "\\") -1) -1))]
+          (if (neg? i) f (subs f (inc i))))))))
 
 (defn testing-vars-str
   "Returns a string representation of the current test: the names in

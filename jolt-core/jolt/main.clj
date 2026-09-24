@@ -951,7 +951,7 @@
       (let [pdir (project-dir)
             ;; the project dir's own name; "." (JOLT_PWD unset, the built binary
             ;; started in the project) resolves to the directory it stands for
-            proj (let [seg (last (str/split pdir #"/"))
+            proj (let [seg (.getName (java.io.File. pdir))
                        seg (if (or (str/blank? seg) (= "." seg))
                              (.getName (.getCanonicalFile (java.io.File. pdir)))
                              seg)]
@@ -959,7 +959,7 @@
             out (let [o (:out opts)]
                   (cond
                     (nil? o) (str pdir "/target/" (if (= mode "dev") "debug" "release") "/" proj)
-                    (str/starts-with? o "/") o
+                    (path-rooted? o) o
                     :else (str pdir "/" o)))
             ;; :jolt/native libs with a :static archive are cc-linked into the
             ;; binary by default; --dynamic (or deps.edn :jolt/build {:dynamic-natives

@@ -1058,10 +1058,13 @@
                             :let [f (root-file root (:name req))]
                             :when f]
                         (cond-> {:kind :resource
-                                 :url (if (or (embedded-root? root)
-                                              (str/starts-with? f "jar:file:"))
-                                       f
-                                       (str "file:" f))}
+                                 ;; an embedded key is its own location; a URL
+                                 ;; path is "/"-separated, and the file path
+                                 ;; renders with "\\" on Windows
+                                 :url (cond
+                                        (or (embedded-root? root)
+                                            (str/starts-with? f "jar:file:")) f
+                                        :else (str "file:" (if (= "\\" java.io.File/separator) (str/replace f "\\" "/") f)))}
                           (embedded-root? root) (assoc :embedded? true))))
       nil)))
 

@@ -103,8 +103,8 @@
 (canon "posix no ancestor resolves"     #f "/gone/./a/../b" "/gone/b")
 
 ;; --- the glob translator's separator class (jolt-lang/jolt#1086) -------------
-;; Same reason the platform is a parameter here: jolt renders every path with
-;; "/" everywhere, but the vendored babashka.fs/match reads os.name and on
+;; Same reason the platform is a parameter here: jolt rendered every path with
+;; "/" everywhere before #1110, but the vendored babashka.fs/match reads os.name and on
 ;; Windows hands the matcher `escaped-base + "\\" + "/" + pattern-with-"/"-
 ;; rewritten-to-"\\\\"`. So the Windows rows below spell a separator the way
 ;; babashka.fs really does — as an escaped backslash — and that spelling used to
@@ -142,7 +142,17 @@
 ;; Windows: both spellings separate, as the JDK's Globs reads a Windows pattern.
 (rx "win segment class"     #t "*.clj"       "^[^/\\\\]*\\.clj$")
 (rx "win rewritten crossing" #t "**\\\\*.clj" "^.*[/\\\\][^/\\\\]*\\.clj$")
-(rx "win plain / still separates" #t "**/*.clj" "^.*/[^/\\\\]*\\.clj$")
+(rx "win plain / still separates" #t "**/*.clj" "^.*[/\\\\][^/\\\\]*\\.clj$")
+;; and since a path renders with "\\" on Windows (jolt-lang/jolt#1110), a "/" in
+;; a pattern has to meet one: the JDK's Windows glob reads "/" as the separator
+(globs "win / in a pattern matches a native separator" #t "sub/*.clj" "sub\\deep.clj" #t)
+(globs "win / in a pattern still matches /" #t "sub/*.clj" "sub/deep.clj" #t)
+;; what babashka.fs/match builds once the base it str's is native: every "\\"
+;; in the base escaped, then the escaped separator, then the rewritten pattern
+(globs "win native base matches a native path"
+       #t "C:\\\\src\\\\**\\\\*.clj" "C:\\src\\kmet\\libs\\terminal.clj" #t)
+(globs "win native base rejects the wrong extension"
+       #t "C:\\\\src\\\\**\\\\*.clj" "C:\\src\\kmet\\libs\\terminal.cljc" #f)
 ;; the whole string babashka.fs/match builds for (fs/glob "C:/src" "**/*.clj"):
 ;; the base, the escaped separator it appends, then the rewritten pattern
 (globs "win rewritten pattern matches a nested file"
