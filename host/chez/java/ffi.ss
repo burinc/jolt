@@ -96,7 +96,9 @@
        (jolt-throw (jolt-ex-info
                      (string-append "jolt.ffi/load-library: cannot load "
                                     (if (null? (cdr cands)) "" "any of ")
-                                    (ffi-join-candidates cands))
+                                    (ffi-join-candidates cands)
+                                    (let ((note (ffi-load-failure-note cands)))
+                                      (if note (string-append " — " note) "")))
                      (jolt-hash-map (jolt-keyword "candidates")
                                     (make-pvec (list->vector cands))))))
       ((jolt-ffi-load-native (car cs)) (car cs))
@@ -286,10 +288,31 @@
 ;; which is where Git for Windows puts its DLLs. The system directories are
 ;; deliberately absent — a bare name already reaches them, and the versioned
 ;; OpenSSL builds are never there.
+;;
+;; The executable is asked of Windows itself: (command-line)'s first element is
+;; argv[0] as TYPED — plain "jolt" when jolt.exe is found on PATH, which has no
+;; directory in it — and under `scheme --script` it is the script. Either way the
+;; folder holding jolt.exe went unsearched, and a DLL copied beside it was not
+;; found by the one lookup that could find it (jolt-lang/jolt#1127).
+(define-win32-proc ffi-get-module-file-name-w
+  "kernel32.dll" "GetModuleFileNameW" (void* u8* unsigned-32) unsigned-32)
+
+(define (ffi-win32-exe-path)
+  (let ((f (ffi-get-module-file-name-w)))
+    (and f
+         (guard (e (#t #f))
+           (let* ((cap 32768)
+                  (bv (make-bytevector (* 2 cap) 0))
+                  (n (f 0 bv cap)))
+             (and (> n 0) (< n cap)
+                  (let ((out (make-bytevector (* 2 n))))
+                    (bytevector-copy! bv 0 out 0 (* 2 n))
+                    (utf16->string out (endianness little)))))))))
+
 (define (ffi-exe-dir)
   (guard (e (#t #f))
     (let* ((argv (command-line))
-           (exe (and (pair? argv) (car argv))))
+           (exe (or (ffi-win32-exe-path) (and (pair? argv) (car argv)))))
       (and (string? exe)
            (let loop ((i (- (string-length exe) 1)))
              (cond ((< i 0) #f)
@@ -389,7 +412,8 @@
 (define (jolt-ffi-load-native path)
   (cond
     ((eq? (sa-os-family) 'windows)
-     (guard (e (#t #f)) (sa-load-shared-object path) #t))
+     (guard (e (#t (ffi-note-load-failure! path (ffi-condition-text e)) #f))
+       (sa-load-shared-object path) #t))
     ((not ffi-dlopen) #f)
     (else
      (jolt-with-mutex ffi-native-mu
@@ -413,7 +437,79 @@
                                  (append (or (vector-ref ffi-native-handles 0) '())
                                          (list (cons (car cs) h))))
                     h)
-                   (else (loop (cdr cs)))))))))))))
+                   (else
+                    (ffi-note-load-failure! (car cs) (and ffi-dlerror (ffi-dlerror)))
+                    (loop (cdr cs)))))))))))))
+
+;; --- why a library that is THERE did not load -------------------------------
+;; A candidate that fails is not necessarily missing. On Windows the usual case
+;; is a DLL sitting right beside jolt.exe whose own dependency (libcrypto beside
+;; libssl, the VC++ runtime beside either) cannot be found — LoadLibrary fails
+;; the file that exists, and "not found — tried [libssl-3-x64.dll]" sent the
+;; user looking for a file they could see (jolt-lang/jolt#1127). The loader's
+;; own reason is kept per candidate at the failure, so a report can name the
+;; file it found and why it did not load without loading anything again.
+(define ffi-dlerror (jolt-foreign-proc-safe "dlerror" '() 'string))
+(define ffi-native-failures (make-hashtable string-hash equal?))  ; path -> reason or #f
+
+(define (ffi-note-load-failure! path reason)
+  (jolt-with-mutex ffi-native-mu
+    (hashtable-set! ffi-native-failures path reason)))
+
+(define (ffi-condition-text e)
+  (ffi-trim-right
+   (guard (_ (#t (call-with-string-output-port (lambda (p) (display-condition e p)))))
+     (if (and (message-condition? e) (irritants-condition? e))
+         (apply format (condition-message e) (condition-irritants e))
+         (call-with-string-output-port (lambda (p) (display-condition e p)))))))
+
+;; FormatMessage ends Windows' reason with CRLF.
+(define (ffi-trim-right s)
+  (let loop ((n (string-length s)))
+    (if (and (> n 0) (char-whitespace? (string-ref s (- n 1))))
+        (loop (- n 1))
+        (substring s 0 n))))
+
+;; Where the loader would find NAME on disk, or #f. A name with a directory in
+;; it is opened as given; a bare one is looked up in the directories the loader
+;; searches that this process can list (ffi-dll-search-dirs on Windows: the
+;; executable's directory and PATH). Anything this cannot see stays reported as
+;; not found, which is what it was before.
+(define (ffi-native-locate name)
+  (define (exists? p) (guard (e (#t #f)) (file-exists? p)))
+  (if (not (ffi-bare-soname? name))
+      (and (exists? name) name)
+      (let loop ((ds (if (eq? (sa-os-family) 'windows)
+                         (ffi-dll-search-dirs)
+                         (ffi-so-search-dirs))))
+        (cond ((null? ds) #f)
+              ((exists? (string-append (car ds) "/" name)) (string-append (car ds) "/" name))
+              (else (loop (cdr ds)))))))
+
+;; One sentence per candidate that exists but did not load, or #f when every
+;; candidate is simply absent.
+(define (ffi-load-failure-note cands)
+  (let loop ((cs cands) (acc '()))
+    (if (null? cs)
+        (and (pair? acc)
+             (let join ((xs (reverse acc)) (out ""))
+               (if (null? xs)
+                   out
+                   (join (cdr xs) (if (string=? out "") (car xs)
+                                      (string-append out "; " (car xs)))))))
+        (let ((at (ffi-native-locate (car cs)))
+              (why (jolt-with-mutex ffi-native-mu
+                     (hashtable-ref ffi-native-failures (car cs) #f))))
+          (loop (cdr cs)
+                (if at
+                    (cons (string-append
+                           at " is there but did not load"
+                           (if why (string-append ": " why) "")
+                           (if (eq? (sa-os-family) 'windows)
+                               " (a DLL it depends on is missing or not on PATH — Windows reports that as the module not being found)"
+                               ""))
+                          acc)
+                    acc))))))
 ;; Every declared native through which `sym` RESOLVES, as (path . address) in
 ;; declaration order. Walking all of them rather than stopping at the first is
 ;; what makes the duplicate below visible; it costs one dlsym per declared
@@ -1167,7 +1263,10 @@
         (cond
           ((null? cs)
            (unless optional?
-             (error 'jolt-build "required native library not found" cands))
+             (let ((note (ffi-load-failure-note cands)))
+               (if note
+                   (error 'jolt-build (string-append "required native library did not load — " note) cands)
+                   (error 'jolt-build "required native library not found" cands))))
            #f)
           ;; RTLD_LOCAL + register; #t when it took (handle or Windows-global).
           ((jolt-ffi-load-native (car cs)) #t)
@@ -1286,6 +1385,14 @@
 (def-var! "jolt.ffi" "system-library-candidates"
   (lambda (n) (list->cseq (ffi-system-library-candidates
                            (ffi-str-arg "system-library-candidates name" n)))))
+;; jolt.main/load-natives! appends it to a missing-library report, so a
+;; candidate that is on disk but failed to load is not reported as not found.
+(def-var! "jolt.ffi" "load-failure-note"
+  (lambda (cands)
+    (or (ffi-load-failure-note
+         (map (lambda (c) (ffi-str-arg "load-failure-note candidate" c))
+              (seq->list (jolt-seq cands))))
+        jolt-nil)))
 (def-var! "jolt.ffi" "find-symbol" ffi-find-symbol)
 (def-var! "jolt.ffi" "alloc" ffi-alloc)
 (def-var! "jolt.ffi" "free" ffi-free)

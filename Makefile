@@ -181,7 +181,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
+  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
@@ -504,6 +504,11 @@ noexecsmoke: testbin
 # reported AND that a correctly linked one is not.
 ffidupsym:
 	@sh host/chez/ffi-duplicate-symbol-smoke.sh
+
+# A native that is on disk but fails to load (its own dependency is missing)
+# is reported as that, with the loader's reason — not as "not found" (#1127).
+ffiloadfail:
+	@sh host/chez/ffi-load-failure-smoke.sh
 
 # OPT-IN: jolt.mvn-http cert-verifying HTTPS fetch against Central + Clojars.
 # Not in `make test` — needs network + a working system OpenSSL.

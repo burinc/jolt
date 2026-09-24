@@ -35,6 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A native library that is on disk but fails to load is no longer reported
+  as not found (#1127).** On Windows, `libssl-3-x64.dll` copied beside
+  `jolt.exe` warned "not found — tried [libssl-3-x64.dll …] (a task may build
+  it)" when what actually failed was a DLL it depends on (libcrypto, the VC++
+  runtime): LoadLibrary fails the file that exists, and the loader's reason was
+  dropped. `:jolt/native` loading, `jolt.ffi/load-library` and a built binary's
+  startup now name the file they found and the loader's own reason (dlerror on
+  macOS/Linux), and a task no longer offers to build a library that is already
+  there. The Windows lookup of the executable's own folder also read argv[0],
+  which is plain `jolt` when jolt.exe is run from PATH; it now asks Windows for
+  the module path.
+
+  ```
+  warning: required native library ssl did not load — C:\jolt/libssl-3-x64.dll
+  is there but did not load: (while loading libssl-3-x64.dll) The specified
+  module could not be found. (a DLL it depends on is missing or not on PATH …)
+  ```
+
 - **`io/input-stream` refused an embedded resource, and `URL.openStream` handed
   back a reader.** `(io/input-stream (io/resource "baked.txt"))` threw in a
   built binary while the same call on a `file:` URL worked, and
