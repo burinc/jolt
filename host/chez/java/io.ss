@@ -881,6 +881,7 @@
 ;; from any host (test/chez/win-platform-test.ss).
 (define win32-epoch-offset-ms 11644473600000)
 (define (unix-ms->filetime ms) (* (+ ms win32-epoch-offset-ms) 10000))
+(define (filetime->unix-ms ft) (- (div ft 10000) win32-epoch-offset-ms))
 
 (define win32-FILE-WRITE-ATTRIBUTES      #x100)
 (define win32-FILE-SHARE-ALL             #x7)          ; read | write | delete
@@ -891,28 +892,61 @@
 (define-win32-proc win32-create-file-w
   "kernel32.dll" "CreateFileW" (void* unsigned-32 unsigned-32 void* unsigned-32 unsigned-32 void*) iptr)
 (define-win32-proc win32-set-file-time
-  "kernel32.dll" "SetFileTime" (iptr void* void* u8*) int)
+  "kernel32.dll" "SetFileTime" (iptr u8* u8* u8*) int)
 (define-win32-proc win32-close-handle
   "kernel32.dll" "CloseHandle" (iptr) int)
 
-;; Files.setLastModifiedTime on Windows, as WindowsFileAttributeViews does it:
-;; open the path for FILE_WRITE_ATTRIBUTES — with FILE_FLAG_BACKUP_SEMANTICS,
-;; the flag that lets CreateFile open a directory at all — and set only the
-;; last-write time. Answers whether it was set; #f off Windows.
-(define (win32-set-file-mtime-millis! path ms)
+;; Files.setLastModifiedTime / setAttribute on Windows, as WindowsFileAttributeViews
+;; does it: open the path for FILE_WRITE_ATTRIBUTES — with
+;; FILE_FLAG_BACKUP_SEMANTICS, the flag that lets CreateFile open a directory at
+;; all — and set just the times given. Each of CREATION, ACCESS and WRITE is epoch
+;; ms or #f, and a #f slot passes NULL, which SetFileTime leaves alone. Answers
+;; whether they were set; #f off Windows.
+(define (win32-set-file-times! path creation access write)
   (let ((create (win32-create-file-w)) (set-time (win32-set-file-time))
         (close (win32-close-handle)))
+    (define (ft ms)
+      (and ms (let ((b (make-bytevector 8 0)))
+                (bytevector-u64-set! b 0 (unix-ms->filetime ms) (endianness little))
+                b)))
     (and create set-time close
          (let ((h (win32-with-wstr path
                     (lambda (w)
                       (create w win32-FILE-WRITE-ATTRIBUTES win32-FILE-SHARE-ALL 0
                               win32-OPEN-EXISTING win32-FILE-FLAG-BACKUP-SEMANTICS 0)))))
            (and (not (= h win32-INVALID-HANDLE-VALUE))
-                (let ((ft (make-bytevector 8 0)))
-                  (bytevector-u64-set! ft 0 (unix-ms->filetime ms) (endianness little))
-                  (let ((ok (not (= 0 (set-time h 0 0 ft)))))
-                    (close h)
-                    ok)))))))
+                (let ((ok (not (= 0 (set-time h (ft creation) (ft access) (ft write))))))
+                  (close h)
+                  ok))))))
+(define (win32-set-file-mtime-millis! path ms) (win32-set-file-times! path #f #f ms))
+
+;; Files.createLink on Windows: CreateHardLinkW(new, existing, NULL). Answers
+;; whether the link was made; #f off Windows.
+(define-win32-proc win32-create-hard-link-w
+  "kernel32.dll" "CreateHardLinkW" (void* void* void*) int)
+(define (win32-create-hard-link! link existing)
+  (let ((f (win32-create-hard-link-w)))
+    (and f
+         (win32-with-wstr link
+           (lambda (l) (win32-with-wstr existing
+                         (lambda (e) (not (= 0 (f l e 0))))))))))
+
+;; The three times of PATH as a vector #(creation access write) of epoch ms, or
+;; #f. WIN32_FILE_ATTRIBUTE_DATA is the attribute word and then three FILETIMEs,
+;; each two DWORDs — at 4, 12 and 20, so not 8-aligned, and read as two halves.
+(define-win32-proc win32-get-file-attributes-ex-w
+  "kernel32.dll" "GetFileAttributesExW" (void* int u8*) int)
+(define (win32-file-times path)
+  (let ((f (win32-get-file-attributes-ex-w)))
+    (and f
+         (let ((buf (make-bytevector 36 0)))
+           (define (at off)
+             (filetime->unix-ms
+              (+ (bytevector-u32-ref buf off (endianness little))
+                 (* (bytevector-u32-ref buf (+ off 4) (endianness little)) #x100000000))))
+           (and (win32-with-wstr path
+                  (lambda (w) (guard (e (#t #f)) (not (= 0 (f w 0 buf))))))  ; GetFileExInfoStandard
+                (vector (at 4) (at 12) (at 20)))))))
 
 ;; The ROOT of P — the prefix that is not a segment and must be reproduced
 ;; verbatim — and the index the segments start at. Rendered with "/" separators,

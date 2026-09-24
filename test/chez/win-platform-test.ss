@@ -764,6 +764,17 @@
       (run-child '("jolt-no-such-program-anywhere"))
       #f))
 
+;; FILETIME <-> epoch ms (java/io.ss). 116444736000000000 is 1970-01-01 in 100ns
+;; ticks since 1601; the three times GetFileAttributesEx reads come back through
+;; filetime->unix-ms, and every set goes out through unix-ms->filetime.
+(ok "the Unix epoch is FILETIME 116444736000000000"
+    (= 116444736000000000 (unix-ms->filetime 0)))
+(ok "filetime->unix-ms inverts unix-ms->filetime"
+    (andmap (lambda (ms) (= ms (filetime->unix-ms (unix-ms->filetime ms))))
+            '(0 1 1100000000250 1600000000000 -1 -11644473600000)))
+(ok "a sub-millisecond FILETIME truncates to its millisecond"
+    (= 1 (filetime->unix-ms (+ (unix-ms->filetime 1) 9999))))
+
 (if (> fails 0)
     (begin (printf "WIN-PLATFORM FAILURES: ~a of ~a\n" fails total) (exit 1))
     (printf "WIN-PLATFORM OK (~a checks)\n" total))
