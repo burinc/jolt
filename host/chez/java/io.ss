@@ -2678,11 +2678,13 @@
                           (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
                           jolt-nil))
         (cons "getId" (lambda (self) (thread-handle-id self)))
-        ;; no reified call stack (jolt does TCO, so caller frames are erased) — an
-        ;; empty StackTraceElement[]. clojure.spec.test.alpha's instrument reads it
-        ;; to name the caller var; it degrades to no ::caller, the conform error
-        ;; (the ExceptionInfo) is still thrown.
-        (cons "getStackTrace" (lambda (self) (jolt-vector)))
+        ;; the calling thread's frames, reconstructed the way an uncaught error's
+        ;; backtrace is (source-registry.ss); another thread's stack is not
+        ;; reachable, so it answers an empty array.
+        (cons "getStackTrace" (lambda (self)
+                                (if (eqv? (thread-handle-id self) (get-thread-id))
+                                    (jolt-current-stack-trace)
+                                    (jolt-vector))))
         ;; The flag first, then the poke: a waiter woken by the poke reads the
         ;; flag, so a wake that arrives before it is set says nothing. Waking is
         ;; what turns .interrupt from "the target will notice next time it looks"

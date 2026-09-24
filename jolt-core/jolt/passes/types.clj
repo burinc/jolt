@@ -968,7 +968,11 @@
                               shapes (get env :record-shapes)]
                           (if (contains? shapes ck) (assoc env :map->-ctor-key ck) env))
                         env)]
-             [:any (assoc node :init (nth (infer (get node :init) tenv env') 1))]))
+             [:any (let [n (assoc node :init (nth (infer (get node :init) tenv env') 1))]
+                     ;; evaluated metadata is code too (a :test fn): infer it like the init
+                     (if-let [me (get node :meta-expr)]
+                       (assoc n :meta-expr (nth (infer me tenv env) 1))
+                       n))]))
       (= op :try)
       (let [n (assoc node :body (nth (infer (get node :body) tenv env) 1))
             n (if (get node :catch-body) (assoc n :catch-body (nth (infer (get node :catch-body) tenv env) 1)) n)

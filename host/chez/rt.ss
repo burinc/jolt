@@ -767,13 +767,26 @@
       (unless (hashtable-ref seen k #f)
         (hashtable-set! seen k #t)
         (hashtable-set! tbl key (cons entry (hashtable-ref tbl key '())))))))
+;; A TAIL call whose callee is dynamic (a fn value, a keyword, a collection) has
+;; no callee to name, so the emitter registers it as "?" and it lands only here:
+;; fqn -> (line …). Nothing walks through it. It answers one question, whether a
+;; live stack read's site pair is a call that went somewhere and returned
+;; (source-registry jolt-site-exited?), which a dynamic tail call answers the
+;; same way a static one does.
+(define jolt-dynamic-tail-lines (make-hashtable string-hash string=?))
 (define (jolt-register-callsite! fqn line callee tail?)
-  (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
-  (jolt-table-add! jolt-fn-callees-table fqn callee)
-  (when tail?
-    (jolt-table-add! jolt-tail-exits fqn (cons line callee))
-    (jolt-table-add! jolt-tail-entries callee (cons fqn line)))
+  (if (string=? callee "?")
+      (jolt-table-add! jolt-dynamic-tail-lines fqn line)
+      (begin
+        (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
+        (jolt-table-add! jolt-fn-callees-table fqn callee)
+        (when tail?
+          (jolt-table-add! jolt-tail-exits fqn (cons line callee))
+          (jolt-table-add! jolt-tail-entries callee (cons fqn line)))))
   jolt-nil)
+;; The lines of a fn's dynamic tail calls, or '().
+(define (jolt-callsite-dynamic-tail-lines fqn)
+  (and (string? fqn) (hashtable-ref jolt-dynamic-tail-lines fqn '())))
 ;; The registered static callees at (fqn, line) as a non-empty list, or #f
 ;; (unknown / dynamic site — nothing was registered).
 (define (jolt-callsite-callees fqn line)

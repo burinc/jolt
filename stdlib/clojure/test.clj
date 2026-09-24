@@ -28,6 +28,11 @@
 ;; defspec run through its :test metadata doesn't blow up on an unbound var.
 (def ^:dynamic *testing-vars* (list))
 (def ^:dynamic *report-counters* nil)
+;; The ref run-tests / test-ns bound for the run in progress. A result counts
+;; toward jolt's process-wide tally only while *report-counters* is this ref (or
+;; unbound): a caller that binds *report-counters* to a ref of its own, as
+;; test.check's suite does to capture one test var's results, keeps them private.
+(def ^:dynamic ^:private *run-counters* nil)
 ;; the stack of testing strings, innermost first — bindable like the JVM's
 ;; (test.chuck rebinds it around its property reports).
 (def ^:dynamic *testing-contexts* (list))
@@ -129,19 +134,22 @@
   (when *report-counters*
     (dosync (commute *report-counters* assoc k (inc (or (@*report-counters* k) 0))))))
 
+(defn- global-tally? []
+  (or (nil? *report-counters*) (identical? *report-counters* *run-counters*)))
+
 (defn inc-report-counter
-  "Bump a counter by key. With *report-counters* bound this moves that ref, as
-  the reference does; without one it moves jolt's process-wide tally, which is
-  what a caller outside a run is asking for."
+  "Bump a counter by key: *report-counters* when bound, as the reference does,
+  and jolt's process-wide tally unless the caller bound a ref of its own."
   [k]
-  (if *report-counters*
-    (bump-counters! k)
+  (bump-counters! k)
+  (when (global-tally?)
     (swap! counters update k (fnil inc 0))))
 
-(defn inc-pass! [] (swap! counters update :pass inc))
+(defn inc-pass! [] (when (global-tally?) (swap! counters update :pass inc)))
 (defn fail! [m]
   (let [line (str (ctx-str) (when (or (seq *testing-contexts*) (seq @ctx-stack)) " ") "FAIL: " (report-line m))]
-    (swap! counters (fn [r] (-> r (update :fail inc) (update :fails conj line))))
+    (when (global-tally?)
+      (swap! counters (fn [r] (-> r (update :fail inc) (update :fails conj line)))))
     (with-test-out
       (println "\nFAIL in" (testing-vars-str m))
       (when (seq *testing-contexts*) (println (testing-contexts-str)))
@@ -150,7 +158,8 @@
       (println "  actual:" (pr-str (:actual m))))))
 (defn err! [m]
   (let [line (str (ctx-str) (when (or (seq *testing-contexts*) (seq @ctx-stack)) " ") "ERROR: " (report-line m))]
-    (swap! counters (fn [r] (-> r (update :error inc) (update :fails conj line))))
+    (when (global-tally?)
+      (swap! counters (fn [r] (-> r (update :error inc) (update :fails conj line)))))
     (with-test-out
       (println "\nERROR in" (testing-vars-str m))
       (when (seq *testing-contexts*) (println (testing-contexts-str)))
@@ -474,23 +483,33 @@
              (if i (assoc r i entry) (conj r entry)))))
   nil)
 
+(defn- def-test-form
+  "The (def ...) deftest and deftest- expand to, shaped like clojure.test's: the
+  var's VALUE runs it as a test through test-var and the body lives in :test.
+  So a test-ns-hook that calls its tests by name, (defn test-ns-hook [] (a) (b)),
+  counts each one, brackets it in begin/end-test-var, and reports an uncaught
+  throw as an :error instead of losing the rest of the run.
+
+  The thunk is a NAMED fn only so the def registers its source: a stack read
+  (test.check's reporter walks one for an assertion's file:line) then maps the
+  body's frame, which lives in the def's metadata, back to this file."
+  [name body extra-meta]
+  `(do
+     (def ~(vary-meta name merge extra-meta {:test `(fn [] ~@body)})
+       (fn ~name [] (clojure.test/test-var (var ~name))))
+     (clojure.test/register-test! (clojure.core/ns-name clojure.core/*ns*)
+                                  '~name (:test (meta (var ~name))))
+     (var ~name)))
+
 (defmacro deftest [name & body]
   (when *load-tests*
-    `(do
-       (defn ~name [] ~@body)
-       ;; the var carries :test metadata like clojure.test's deftest, so tooling
-       ;; that discovers tests by scanning var meta finds it.
-       (alter-meta! (var ~name) assoc :test ~name)
-       (clojure.test/register-test! (clojure.core/ns-name clojure.core/*ns*)
-                                    '~name ~name)
-       (var ~name))))
+    (def-test-form name body nil)))
 
 (defmacro deftest-
   "Like deftest but the var is private."
   [name & body]
   (when *load-tests*
-    `(doto (clojure.test/deftest ~name ~@body)
-       (alter-meta! assoc :private true))))
+    (def-test-form name body {:private true})))
 
 ;; with-test attaches a test body as :test metadata on a var-defining form (which
 ;; must return the var), like clojure.test's — schema's tests wrap s/defn this way.
@@ -546,8 +565,6 @@
   (reduce compose-fixtures (fn [f] (f)) fixtures))
 
 (defn- run-one [t]
-  (bump-counters! :test)
-  (swap! counters update :test inc)
   (wrap-fixtures (get @each-fixtures (:ns t) [])
     (fn []
       ;; bind *testing-vars* the way test-var does, so a failure inside a
@@ -555,15 +572,17 @@
       ;; be the real VAR: test.check's reporter reads this stack and treats the
       ;; entries as vars, so a stand-in map fails as "cannot be cast to Named".
       ;; A test whose var no longer resolves leaves the stack alone.
-      (binding [*testing-vars* (let [v (try (ns-resolve (:ns t) (:name t))
-                                            (catch Throwable _ nil))]
-                                 (if v (conj *testing-vars* v) *testing-vars*))]
-        (try
-          ((:fn t))
-          (catch Throwable e
-            (err! {:type :error
-                   :message (str (:name t) " crashed")
-                   :expected nil :actual e})))))))
+      (let [v (try (ns-resolve (:ns t) (:name t)) (catch Throwable _ nil))]
+        (binding [*testing-vars* (if v (conj *testing-vars* v) *testing-vars*)]
+          (when v (do-report {:type :begin-test-var :var v}))
+          (inc-report-counter :test)
+          (try
+            ((:fn t))
+            (catch Throwable e
+              (do-report {:type :error
+                          :message "Uncaught exception, not in assertion."
+                          :expected nil :actual e})))
+          (when v (do-report {:type :end-test-var :var v})))))))
 
 ;; A registered test still counts only while its var carries :test metadata.
 ;; clojure.test discovers tests by scanning vars for that key, so removing it is
@@ -611,54 +630,67 @@
 
 (defn run-registered [] (run-selected nil))
 
-;; (run-tests 'ns1 'ns2 …) runs only those namespaces' tests, like clojure.test.
-;; With no args it runs everything registered (a deliberate superset of the
-;; JVM's current-ns default — jolt's harnesses load then run whole suites).
-;; Prints and returns THIS call's summary; the global counters stay cumulative
-;; for the n-pass/n-fail harness API.
-(defn run-tests [& nses]
-  (let [before @counters
-        ns-syms (map (fn [n] (if (symbol? n) n (ns-name n))) nses)
-        ns-set (when (seq ns-syms) (set ns-syms))]
-    (run-selected ns-set)
-    ;; interned (:test meta) tests discovered up front and run inside the same
-    ;; :once fixtures as registered tests, matching JVM test-ns.
-    (let [reg-by-ns (group-by :ns @registry)]
-      (doseq [n ns-syms
-              :let [its (interned-tests n reg-by-ns)]
-              :when (seq its)]
+;; A namespace's tests: its test-ns-hook when it defines one, which then decides
+;; what runs, like clojure.test's test-ns; otherwise its registered and interned
+;; tests inside its :once fixtures.
+(defn- ns-hook [ns-sym]
+  (when (find-ns ns-sym)
+    (find-var (symbol (str ns-sym) "test-ns-hook"))))
+
+(defn- run-ns [n reg-by-ns]
+  (do-report {:type :begin-test-ns :ns (find-ns n)})
+  (if-let [hook (ns-hook n)]
+    ((var-get hook))
+    (let [ts (concat (filter selected? (get reg-by-ns n))
+                     (interned-tests n reg-by-ns))]
+      (when (seq ts)
         (wrap-fixtures (get @once-fixtures n [])
-          (fn [] (doseq [t its] (run-one t))))))
-    (let [r @counters
-          d {:type :summary
-             :test  (- (:test r)  (:test before))
-             :pass  (- (:pass r)  (:pass before))
-             :fail  (- (:fail r)  (:fail before))
-             :error (- (:error r) (:error before))}]
-      (with-test-out
-        (println)
-        (println (str "Ran " (:test d) " tests. "
-                      (:pass d) " assertions passed, "
-                      (:fail d) " failures, " (:error d) " errors.")))
-      d)))
+          (fn [] (doseq [t ts] (run-one t)))))))
+  (do-report {:type :end-test-ns :ns (find-ns n)}))
+
+;; (run-tests 'ns1 'ns2 …) runs only those namespaces' tests, like clojure.test,
+;; and (run-tests) is (run-tests *ns*). run-registered runs everything registered.
+;; Counts go to a ref bound for this call, whose contents are the summary; the
+;; process-wide counters stay cumulative for the n-pass/n-fail harness API.
+(defn run-tests
+  ([] (run-tests *ns*))
+  ([& nses]
+   (let [ns-syms (map (fn [n] (if (symbol? n) n (ns-name n))) nses)
+         rc (ref *initial-report-counters*)]
+     (binding [*report-counters* rc
+               *run-counters* rc]
+       (let [reg-by-ns (group-by :ns @registry)]
+         (doseq [n ns-syms] (run-ns n reg-by-ns))))
+     (let [d (assoc @rc :type :summary)]
+       (do-report d)
+       d))))
+
+(defmethod report :summary [m]
+  (with-test-out
+    (println)
+    (println (str "Ran " (:test m) " tests. "
+                  (:pass m) " assertions passed, "
+                  (:fail m) " failures, " (:error m) " errors."))))
 
 ;; --- var-level API (clojure.test parity) -------------------------------------
 
 
 (defn test-var
   "Run the test attached to var v via its :test metadata, with *testing-vars*
-  bound like clojure.test."
+  bound like clojure.test. An exception escaping the test is reported as an
+  :error through report."
   [v]
   (when-let [t (:test (meta v))]
     (binding [*testing-vars* (conj *testing-vars* v)]
-      (bump-counters! :test)
-      (swap! counters update :test inc)
+      (do-report {:type :begin-test-var :var v})
+      (inc-report-counter :test)
       (try
         (t)
         (catch Throwable e
-          (err! {:type :error
-                 :message (str (:name (meta v)) " crashed")
-                 :expected nil :actual e}))))))
+          (do-report {:type :error
+                      :message "Uncaught exception, not in assertion."
+                      :expected nil :actual e})))
+      (do-report {:type :end-test-var :var v}))))
 
 (defn test-vars
   "Run the vars' :test fns, each namespace group wrapped in its :once fixtures
@@ -671,8 +703,11 @@
       (wrap-fixtures (get @once-fixtures n [])
         (fn []
           (doseq [v vs]
-            (wrap-fixtures (get @each-fixtures n [])
-              (fn [] (test-var v)))))))))
+            ;; only a test var runs inside the :each fixtures, like
+            ;; clojure.test's (when (:test (meta v)) ...)
+            (when (:test (meta v))
+              (wrap-fixtures (get @each-fixtures n [])
+                (fn [] (test-var v))))))))))
 
 (defmacro run-test
   "Run a single test var: (run-test my-test)."
@@ -710,24 +745,18 @@
 
 (defn test-ns
   "If the namespace defines test-ns-hook, calls that; otherwise tests every var in
-  it. Returns this call's summary counts.
-
-  Unlike the reference this does not bind *report-counters* to a fresh ref —
-  jolt's counters live in one atom and the summary is a before/after delta — so a
-  reporter that pokes at *report-counters* sees the cumulative atom rather than a
-  per-namespace ref."
+  it. Counts go to a ref bound for the call, whose contents are returned."
   [n]
-  (let [before @counters
-        ns-sym (if (symbol? n) n (ns-name n))]
-    (if-let [hook (find-var (symbol (str ns-sym) "test-ns-hook"))]
-      ((var-get hook))
-      (test-all-vars ns-sym))
-    (let [r @counters]
-      {:type :summary
-       :test  (- (:test r)  (:test before))
-       :pass  (- (:pass r)  (:pass before))
-       :fail  (- (:fail r)  (:fail before))
-       :error (- (:error r) (:error before))})))
+  (let [ns-sym (if (symbol? n) n (ns-name n))
+        rc (ref *initial-report-counters*)]
+    (binding [*report-counters* rc
+              *run-counters* rc]
+      (do-report {:type :begin-test-ns :ns (find-ns ns-sym)})
+      (if-let [hook (ns-hook ns-sym)]
+        ((var-get hook))
+        (test-all-vars ns-sym))
+      (do-report {:type :end-test-ns :ns (find-ns ns-sym)}))
+    @rc))
 
 (defn run-all-tests
   "Runs the tests in every loaded namespace, or in those whose name matches re."

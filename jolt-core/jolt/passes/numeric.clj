@@ -443,7 +443,12 @@
                                   e (if self (assoc e self nil) e)]
                               (assoc a :body (nth (an (get a :body) e) 1))))
                           (get node :arities)))])
-      (= op :def) [nil (assoc node :init (nth (an (get node :init) tenv) 1))]
+      ;; the evaluated metadata too: a fn in it (clojure.test's :test body) is
+      ;; code like the init, and left unanalyzed its arithmetic stayed generic
+      (= op :def) [nil (let [n (assoc node :init (nth (an (get node :init) tenv) 1))]
+                         (if-let [me (get node :meta-expr)]
+                           (assoc n :meta-expr (nth (an me tenv) 1))
+                           n))]
       ;; a proven-receiver interop call answering a fixnum is a :long operand, so
       ;; (+ (.length s) 1) lowers to the fx path rather than generic jolt-n+.
       (= op :host-call)

@@ -94,7 +94,13 @@
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
    :deps ["@data.priority-map/src/main/clojure"]
-   :expect {:tests 23 :pass 1314 :fail 0 :error 0}}
+   ;; wrapped-test's cache stampede asserts inside 1000 raw Threads, which do not
+   ;; inherit *report-counters*, so as on the JVM only the main thread's
+   ;; assertions count: one per successful lookup, i.e. 1000 minus however many
+   ;; failing lookups raced in before the value was cached. That moves run to run
+   ;; (the JVM read 968 for that namespace; jolt 981-999).
+   :tolerance 60
+   :expect {:tests 23 :pass 1290 :fail 0 :error 0}}
 
   {:name "core.memoize"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -216,7 +222,10 @@
    :timeout 900
    ;; property-based: the assertion count moves with the generated cases
    :tolerance 40
-   :expect {:tests 123 :pass 236 :fail 10 :error 2}}
+   ;; the one fail is generators-test "byte": (instance? Byte (gen/byte ...)) —
+   ;; jolt's integers are one fixnum type, the :integer-box-model divergence in
+   ;; known-divergences.edn. The JVM runs the same 106 tests with 0 fails.
+   :expect {:tests 106 :pass 237 :fail 1 :error 0}}
 
   {:name "instaparse"
    :paths ["src" "test"]
@@ -240,17 +249,17 @@
    ;; agrees with Java on accepting and rejecting every pattern in its curated list,
    ;; and on what the accepted ones match. What is left is a long tail that is not
    ;; regex-translation work: \N{...} named-character escapes need a Unicode name
-   ;; database jolt does not carry, a generated case reaches a lone surrogate (jolt
-   ;; chars are scalar values — :string-model), and the clojure-test-output and
-   ;; exception-handling namespaces compare printed #error maps whose :trace is
-   ;; empty because tail calls leave no frames to report.
+   ;; database jolt does not carry, and a generated case reaches a lone surrogate
+   ;; (jolt chars are scalar values — :string-model). The clojure-test-output and
+   ;; exception-handling namespaces keep their deliberately failing specs out of
+   ;; the run with test-ns-hook, which run-tests honors, so they run 2 tests each.
    ;;
    ;; The one load failure is generators.clj-time-test, which is written
    ;; #?@(:bb [] :clj [[clj-time.core …]]) and so requires clj-time, i.e.
    ;; joda-time. It briefly read as loading-with-no-tests while jolt matched :bb
    ;; and took the empty arm (#894 re-recorded it that way); #893 dropped :bb, so
    ;; the :clj arm and its load failure are back. pass/fail/error are unchanged.
-   :expect {:tests 39 :pass 110 :fail 17 :error 2 :load-fail 1}}
+   :expect {:tests 31 :pass 115 :fail 1 :error 3 :load-fail 1}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"

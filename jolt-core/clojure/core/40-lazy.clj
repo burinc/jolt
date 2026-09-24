@@ -146,9 +146,12 @@
   ([n f] (take n (repeatedly f))))
 
 ;; --- repeat ---
+;; The count is coerced up front, as Repeat.create's long parameter is: a nil
+;; count throws NullPointerException and a non-number ClassCastException at the
+;; call, not when the seq is first walked; 3.99 is 3.
 (defn repeat
   ([x] (lazy-seq (cons x (repeat x))))
-  ([n x] (take n (repeat x))))
+  ([n x] (take (long n) (repeat x))))
 
 ;; --- iterate ---
 ;; NATIVE: host/chez/seq.ss jolt-iterate, registered in ns.ss. f is applied

@@ -2555,6 +2555,169 @@
                           (/ (random-next 24 st) (exact->inexact (expt 2 24))))))
     (cons "nextBoolean" (lambda (self) (fx=? 1 (random-next 1 (jhost-state self)))))))
 
+;; --- java.util.SplittableRandom ------------------------------------------------
+;; SplitMix64, the JDK's algorithm step for step: a 64-bit seed advanced by an
+;; odd gamma, each output a mix of the new seed. State is #(seed gamma) held as
+;; unsigned 64-bit values; results come back as the JVM's signed long/int.
+;; test.check's JavaUtilSplittableRandom is a port of this class, and its suite
+;; checks the port against the real one draw for draw.
+(define sr-mask64 #xFFFFFFFFFFFFFFFF)
+(define sr-golden #x9e3779b97f4a7c15)
+(define (sr-u64 x) (bitwise-and x sr-mask64))
+(define (sr-s64 x) (let ((u (sr-u64 x))) (if (>= u #x8000000000000000) (- u #x10000000000000000) u)))
+(define (sr-s32 x) (let ((u (bitwise-and x #xFFFFFFFF))) (if (>= u #x80000000) (- u #x100000000) u)))
+(define (sr-xorshift z n) (bitwise-xor z (bitwise-arithmetic-shift-right z n)))
+(define (sr-mix64 z)
+  (let* ((z (sr-u64 (* (sr-xorshift z 30) #xbf58476d1ce4e5b9)))
+         (z (sr-u64 (* (sr-xorshift z 27) #x94d049bb133111eb))))
+    (sr-xorshift z 31)))
+(define (sr-mix32 z)
+  (let ((z (sr-u64 (* (sr-xorshift z 33) #x62a9d9ed799705f5))))
+    (sr-s32 (bitwise-arithmetic-shift-right (sr-u64 (* (sr-xorshift z 28) #xcb24d0a5c88c35b3)) 32))))
+(define (sr-mix-gamma z)
+  (let* ((z (sr-u64 (* (sr-xorshift z 33) #xff51afd7ed558ccd)))
+         (z (sr-u64 (* (sr-xorshift z 33) #xc4ceb9fe1a85ec53)))
+         (z (bitwise-ior (sr-xorshift z 33) 1)))
+    (if (< (bitwise-bit-count (sr-xorshift z 1)) 24)
+        (bitwise-xor z #xaaaaaaaaaaaaaaaa)
+        z)))
+(define (make-splittable-random seed gamma)
+  (make-jhost "splittable-random" (vector (sr-u64 seed) gamma)))
+(define (sr-next-seed! st)
+  (let ((s (sr-u64 (+ (vector-ref st 0) (vector-ref st 1)))))
+    (vector-set! st 0 s)
+    s))
+(define (sr-next-long st) (sr-s64 (sr-mix64 (sr-next-seed! st))))
+(define (sr-next-int st) (sr-mix32 (sr-next-seed! st)))
+(define (sr-next-double st)
+  (* (bitwise-arithmetic-shift-right (sr-mix64 (sr-next-seed! st)) 11) (expt 2.0 -53)))
+;; An argument to a long or int parameter narrows the way reflective dispatch
+;; narrows it on the JVM, through Number.longValue/intValue: an integer wraps to
+;; the parameter's width and a double saturates (NaN is 0). So (.nextInt r
+;; 3000000000) reaches the JDK as a negative bound and throws its "bound must be
+;; positive", instead of drawing from a range no int can reach.
+(define (sr-narrow x lo hi wrap)
+  (if (flonum? x)
+      (cond ((not (= x x)) 0)
+            ((<= x (inexact lo)) lo)
+            ((>= x (inexact hi)) hi)
+            (else (exact (truncate x))))
+      (wrap (exact (truncate x)))))
+(define (sr-long-arg x)
+  (sr-narrow x #x-8000000000000000 #x7FFFFFFFFFFFFFFF sr-s64))
+(define (sr-int-arg x)
+  (sr-narrow x #x-80000000 #x7FFFFFFF sr-s32))
+;; Math.nextDown: the largest double below d, for a bounded nextDouble that
+;; rounded up to its bound. Both zeros step to -Double/MIN_VALUE.
+(define (sr-next-down d)
+  (if (= d 0.0)
+      -4.9406564584124654e-324
+      (let ((bv (make-bytevector 8)))
+        (bytevector-ieee-double-set! bv 0 d (endianness little))
+        (let ((bits (bytevector-s64-ref bv 0 (endianness little))))
+          (bytevector-s64-set! bv 0 (if (> d 0.0) (- bits 1) (+ bits 1)) (endianness little))
+          (bytevector-ieee-double-ref bv 0 (endianness little))))))
+;; RandomSupport.boundedNextLong / boundedNextInt: rejection sampling written with
+;; the JVM's wrapping arithmetic, so the draws consumed match the JDK's.
+(define (sr-bounded-long st origin bound)
+  (let ((r (sr-next-long st)))
+    (let* ((n (sr-s64 (- bound origin))) (m (sr-s64 (- n 1))))
+      (cond
+        ((= 0 (bitwise-and n m)) (sr-s64 (+ (bitwise-and r m) origin)))
+        ((> n 0)
+         (let loop ((u (bitwise-arithmetic-shift-right (sr-u64 r) 1)))
+           (let ((r (remainder u n)))
+             (if (< (sr-s64 (- (+ u m) r)) 0)
+                 (loop (bitwise-arithmetic-shift-right (sr-u64 (sr-next-long st)) 1))
+                 (sr-s64 (+ r origin))))))
+        (else
+         (let loop ((r r))
+           (if (or (< r origin) (>= r bound)) (loop (sr-next-long st)) r)))))))
+(define (sr-bounded-int st origin bound)
+  (let ((r (sr-next-int st)))
+    (let* ((n (sr-s32 (- bound origin))) (m (sr-s32 (- n 1))))
+      (cond
+        ((= 0 (bitwise-and n m)) (sr-s32 (+ (bitwise-and r m) origin)))
+        ((> n 0)
+         (let loop ((u (bitwise-arithmetic-shift-right (bitwise-and r #xFFFFFFFF) 1)))
+           (let ((r (remainder u n)))
+             (if (< (sr-s32 (- (+ u m) r)) 0)
+                 (loop (bitwise-arithmetic-shift-right (bitwise-and (sr-next-int st) #xFFFFFFFF) 1))
+                 (sr-s32 (+ r origin))))))
+        (else
+         (let loop ((r r))
+           (if (or (< r origin) (>= r bound)) (loop (sr-next-int st)) r)))))))
+(define (sr-check-bound bound)
+  (unless (> bound 0) (throw-jvm 'IllegalArgumentException "bound must be positive")))
+(define (sr-check-range origin bound)
+  (unless (< origin bound) (throw-jvm 'IllegalArgumentException "bound must be greater than origin")))
+
+(for-each
+  (lambda (nm)
+    (register-class-ctor! nm
+      (lambda args
+        (if (pair? args)
+            (make-splittable-random (sr-long-arg (car args)) sr-golden)
+            ;; the JDK seeds a no-arg instance from a shared generator; jolt-random
+            ;; is seeded per process and per thread, which serves the same purpose
+            (let ((s (jolt-random #x10000000000000000)))
+              (make-splittable-random (sr-mix64 s) (sr-mix-gamma (sr-u64 (+ s sr-golden)))))))))
+  '("SplittableRandom" "java.util.SplittableRandom"))
+(register-host-methods! "splittable-random"
+  (list
+    (cons "split" (lambda (self)
+                    (let* ((st (jhost-state self))
+                           (seed (sr-next-long st)))
+                      (make-splittable-random seed (sr-mix-gamma (sr-next-seed! st))))))
+    (cons "nextLong" (lambda (self . a)
+                       (let ((st (jhost-state self)))
+                         (cond
+                           ((null? a) (sr-next-long st))
+                           ((null? (cdr a))
+                            (let ((b (sr-long-arg (car a))))
+                              (sr-check-bound b)
+                              (sr-bounded-long st 0 b)))
+                           (else
+                            (let ((o (sr-long-arg (car a))) (b (sr-long-arg (cadr a))))
+                              (sr-check-range o b)
+                              (sr-bounded-long st o b)))))))
+    (cons "nextInt" (lambda (self . a)
+                      (let ((st (jhost-state self)))
+                        (cond
+                          ((null? a) (sr-next-int st))
+                          ((null? (cdr a))
+                           (let ((b (sr-int-arg (car a))))
+                             (sr-check-bound b)
+                             (sr-bounded-int st 0 b)))
+                          (else
+                           (let ((o (sr-int-arg (car a))) (b (sr-int-arg (cadr a))))
+                             (sr-check-range o b)
+                             (sr-bounded-int st o b)))))))
+    (cons "nextDouble" (lambda (self . a)
+                         (let ((st (jhost-state self)))
+                           (cond
+                             ((null? a) (sr-next-double st))
+                             ((null? (cdr a))
+                              (let ((b (inexact (car a))))
+                                (unless (and (> b 0.0) (< b +inf.0))
+                                  (throw-jvm 'IllegalArgumentException "bound must be finite and positive"))
+                                (let ((r (* (sr-next-double st) b)))
+                                  (if (>= r b) (sr-next-down b) r))))
+                             (else
+                              ;; RandomSupport.checkRange + boundedNextDouble: both
+                              ;; ends finite, and a span that overflows to Infinity
+                              ;; is drawn at half scale and doubled back
+                              (let ((o (inexact (car a))) (b (inexact (cadr a))))
+                                (unless (and (finite? o) (finite? b) (< o b))
+                                  (throw-jvm 'IllegalArgumentException "bound must be greater than origin"))
+                                (let* ((d (sr-next-double st))
+                                       (r (if (< (- b o) +inf.0)
+                                              (+ (* d (- b o)) o)
+                                              (let ((ho (* 0.5 o)))
+                                                (* (+ (* d (- (* 0.5 b) ho)) ho) 2.0)))))
+                                  (if (>= r b) (sr-next-down b) r))))))))
+    (cons "nextBoolean" (lambda (self) (< (sr-next-int (jhost-state self)) 0)))))
+
 ;; --- java.security.SecureRandom ----------------------------------------------
 ;; Every draw comes straight from the OS CSPRNG (jolt-random-bytes), so there is
 ;; no seed and no internal state to carry: unlike java.util.Random above, two
