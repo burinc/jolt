@@ -1019,7 +1019,11 @@
 ;; than one procedure: a whole application's forms in a single lambda body is one
 ;; enormous letrec* for Chez to compile, where the boot file used to hand it many
 ;; small top-level forms. An empty chunk is not emitted — a lambda needs a body.
-(define bld-app-init-chunk 100)
+;; Small chunks: Chez's passes over one lambda body grow faster than the body, and
+;; one app form can already be tens of KB (a deftest). A 28MB app half compiled in
+;; 49.6s at 100 forms per procedure and 31.2s at 10 (#1059); the extra calls at
+;; startup are one per ten namespaces' worth of forms.
+(define bld-app-init-chunk 10)
 (define (bld-emit-app-init out bodies)
   (let loop ((rest bodies) (k 0) (names '()))
     (if (null? rest)
@@ -2196,10 +2200,24 @@
 (define (bld-units-so-args units)
   (fold-left (lambda (acc u) (string-append acc "  " (ei-str-lit (cadr u)) "\n")) "" units))
 
+;; Run THUNK with a larger collect trip, restoring it after. The back-end steps
+;; (compile-file, vfasl-convert-file) allocate tens of GB on a large app and at
+;; the CLI's 16MB trip spent ~60% of their time collecting (#1059): a 28MB app
+;; half compiled in 49.6s at the default and 36.2s at 64MB.
+(define bld-backend-trip-bytes (* 64 1024 1024))
+(define (bld-with-backend-gc thunk)
+  (let ((saved (collect-trip-bytes)))
+    (dynamic-wind
+      (lambda () (collect-trip-bytes (max saved bld-backend-trip-bytes)))
+      thunk
+      (lambda () (collect-trip-bytes saved)))))
+
 ;; Compile SRC to SO in this process under PARAMS (an alist as above), by
 ;; translating the parameter names into the target-neutral profile
 ;; sa-compile-file consumes; #f = the target's defaults.
 (define (bld-chez-compile-params! params src so)
+  (bld-with-backend-gc (lambda () (bld-chez-compile-params!* params src so))))
+(define (bld-chez-compile-params!* params src so)
   (if params
       (let ((pv (lambda (k) (cadr (assq k params)))))
         (sa-compile-file src so
@@ -2492,13 +2510,19 @@
 ;; same overflowing Sfixnum, so the write end raises long before the read end
 ;; would have.
 (define (bld-vfasl-convert! boot vboot)
-  (if (eq? (bld-boot-mode) 'small)
-      (sa-vfasl-convert-file boot vboot 'wide)   ; asked for gzip; no ceiling to hit
-      (if (and (sa-vfasl-convert-file boot vboot)
-               (not (bld-boot-over-lz4-ceiling? vboot)))
-          #t
-          (and (sa-vfasl-convert-file boot vboot 'wide)
-               (begin (bld-note-wide-boot!) #t)))))
+  (or (bld-with-backend-gc
+        (lambda ()
+          (if (eq? (bld-boot-mode) 'small)
+              (sa-vfasl-convert-file boot vboot 'wide)   ; asked for gzip; no ceiling to hit
+              (if (and (sa-vfasl-convert-file boot vboot)
+                       (not (bld-boot-over-lz4-ceiling? vboot)))
+                  #t
+                  (and (sa-vfasl-convert-file boot vboot 'wide)
+                       (begin (bld-note-wide-boot!) #t))))))
+      ;; both codecs failed (an image too big for the heap ceiling, a target that
+      ;; cannot vfasl): the plain boot stands, and the user should know why the
+      ;; binary starts slower and where the time went
+      (begin (bld-note-no-vfasl!) #f)))
 
 ;; The conversion as a form for the fresh-Chez compile scripts, empty under
 ;; 'plain. 'small sets the codec in that process the way sa-vfasl-convert-file's
