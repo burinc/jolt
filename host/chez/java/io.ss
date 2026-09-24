@@ -53,9 +53,46 @@
        (or (not windows?)
            (fx>=? (fx- n 1) (path-root-end #t p)))))
 
-(define (jolt-path-normalize-for windows? p)
+;; Windows spells a separator either way, and a File or Path holds ONE spelling:
+;; "/", the one every scan in this file and nio-file.ss reads. What the caller
+;; SEES is the native "\" — path-native below renders it at the display boundary
+;; (str, toString, getPath, getAbsolutePath, getCanonicalPath, getParent, and the
+;; path in an exception message), as WinNTFileSystem and WindowsPathParser do by
+;; normalizing to "\" at construction. Keeping the held spelling "/" is what lets
+;; the ~60 separator scans between here and the Path shim stay as they are; the
+;; alternative, holding "\", would have to teach every one of them both.
+(define (path-backslashes->slashes p)
+  (if (let loop ((i 0)) (and (fx<? i (string-length p))
+                             (or (char=? (string-ref p i) #\\) (loop (fx+ i 1)))))
+      (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list p)))
+      p))
+;; The spelling a caller sees: "\" for "/" on Windows, the held path on POSIX.
+;; A File or Path renders through this and nothing else, so File/separator, the
+;; file.separator property and every rendered path agree — the one thing the JDK
+;; guarantees about them, and why File/separator could not be flipped alone
+;; (jolt-lang/jolt#1110).
+(define (path-native-for windows? p)
+  (if (and windows?
+           (let loop ((i 0)) (and (fx<? i (string-length p))
+                                  (or (char=? (string-ref p i) #\/) (loop (fx+ i 1))))))
+      (list->string (map (lambda (c) (if (char=? c #\/) #\\ c)) (string->list p)))
+      p))
+(define (path-native p) (path-native-for (eq? (sa-os-family) 'windows) p))
+;; A java.nio.file FileSystemException's message: "file", "file -> other", and
+;; ": reason" after either, as FileSystemException.getMessage builds it. Only the
+;; paths are rendered natively; the reason is strerror's text, and flipping the
+;; whole string would turn "Input/output error" into "Input\output error".
+(define (fs-exception-message-for windows? file other reason)
+  (string-append (path-native-for windows? file)
+                 (if other (string-append " -> " (path-native-for windows? other)) "")
+                 (if reason (string-append ": " reason) "")))
+(define (fs-exception-message file other reason)
+  (fs-exception-message-for (eq? (sa-os-family) 'windows) file other reason))
+
+(define (jolt-path-normalize-for windows? p0)
   (define (trailing-sep-droppable? p n) (trailing-sep-droppable-for? windows? p n))
-  (let* ((n (string-length p))
+  (let* ((p (if windows? (path-backslashes->slashes p0) p0))
+         (n (string-length p))
          ;; POSIX classifies nothing as a root here, so its answers are exactly
          ;; what they were; only Windows has a prefix to hold back.
          (root-end (if windows? (path-root-end #t p) 0)))
@@ -134,8 +171,13 @@
       ((string=? name "isDirectory") (list #f))
       ((string=? name "isFile")      (list #t))
       ((string=? name "openStream")
+       ;; A byte stream, not a reader: a URL's openStream is byte-level on the
+       ;; JVM, and a baked resource can be binary (the same StringReader ->
+       ;; InputStream fix url-open-stream records for file: URLs). io/reader
+       ;; still decodes whatever it is handed.
        (let ((c (embedded-res-content obj)))
-         (list (host-new "StringReader" (if (bytevector? c) (utf8->string c) c)))))
+         (list (make-in-stream (open-bytevector-input-port
+                                (if (bytevector? c) c (string->utf8 c)))))))
       (else #f))))
 
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
@@ -879,40 +921,114 @@
 ;; A FILETIME: 100-nanosecond intervals since 1601-01-01 UTC, which is
 ;; 11644473600 seconds before the Unix epoch. Pure, so the conversion is pinned
 ;; from any host (test/chez/win-platform-test.ss).
-(define win32-epoch-offset-ms 11644473600000)
-(define (unix-ms->filetime ms) (* (+ ms win32-epoch-offset-ms) 10000))
+;; Converted at the FILETIME's own resolution, which is what a FileTime carries:
+;; a nanosecond count loses only its last two digits on the way out.
+(define win32-epoch-offset-ticks 116444736000000000)
+(define (unix-ns->filetime ns) (+ (div ns 100) win32-epoch-offset-ticks))
+(define (filetime->unix-ns ft) (* (- ft win32-epoch-offset-ticks) 100))
 
+(define win32-FILE-READ-ATTRIBUTES       #x80)
 (define win32-FILE-WRITE-ATTRIBUTES      #x100)
 (define win32-FILE-SHARE-ALL             #x7)          ; read | write | delete
 (define win32-OPEN-EXISTING              3)
 (define win32-FILE-FLAG-BACKUP-SEMANTICS #x02000000)   ; what opens a directory
+(define win32-FILE-FLAG-OPEN-REPARSE-POINT #x00200000) ; the link itself, not its target
+(define win32-FILE-ATTRIBUTE-REPARSE-POINT #x400)
 (define win32-INVALID-HANDLE-VALUE       -1)
+
+;; CreateFileW follows a symbolic link unless told not to, so the handle a time
+;; is read or set through names the link's TARGET by default. NOFOLLOW_LINKS asks
+;; for the link itself: FILE_FLAG_OPEN_REPARSE_POINT, as the JDK's
+;; WindowsPath.openFor*AttributeAccess(followLinks=false) passes.
+(define (win32-attr-open-flags follow?)
+  (if follow?
+      win32-FILE-FLAG-BACKUP-SEMANTICS
+      (bitwise-ior win32-FILE-FLAG-BACKUP-SEMANTICS win32-FILE-FLAG-OPEN-REPARSE-POINT)))
+;; GetFileAttributesExW never follows a reparse point: on a link it answers the
+;; link's own times. That is the NOFOLLOW answer, and for any path that is not a
+;; reparse point the only answer; a FOLLOW read of a link has to open it.
+(define (win32-times-need-handle? attrs follow?)
+  (and follow? (not (= 0 (bitwise-and attrs win32-FILE-ATTRIBUTE-REPARSE-POINT)))))
 
 (define-win32-proc win32-create-file-w
   "kernel32.dll" "CreateFileW" (void* unsigned-32 unsigned-32 void* unsigned-32 unsigned-32 void*) iptr)
 (define-win32-proc win32-set-file-time
-  "kernel32.dll" "SetFileTime" (iptr void* void* u8*) int)
+  "kernel32.dll" "SetFileTime" (iptr u8* u8* u8*) int)
 (define-win32-proc win32-close-handle
   "kernel32.dll" "CloseHandle" (iptr) int)
+(define-win32-proc win32-get-file-time
+  "kernel32.dll" "GetFileTime" (iptr u8* u8* u8*) int)
 
-;; Files.setLastModifiedTime on Windows, as WindowsFileAttributeViews does it:
-;; open the path for FILE_WRITE_ATTRIBUTES — with FILE_FLAG_BACKUP_SEMANTICS,
-;; the flag that lets CreateFile open a directory at all — and set only the
-;; last-write time. Answers whether it was set; #f off Windows.
-(define (win32-set-file-mtime-millis! path ms)
-  (let ((create (win32-create-file-w)) (set-time (win32-set-file-time))
-        (close (win32-close-handle)))
-    (and create set-time close
+;; Open PATH for ACCESS with the link-following flags, run PROC on the handle and
+;; close it. #f when the open fails or this is not Windows.
+(define (win32-with-attr-handle path access follow? proc)
+  (let ((create (win32-create-file-w)) (close (win32-close-handle)))
+    (and create close
          (let ((h (win32-with-wstr path
                     (lambda (w)
-                      (create w win32-FILE-WRITE-ATTRIBUTES win32-FILE-SHARE-ALL 0
-                              win32-OPEN-EXISTING win32-FILE-FLAG-BACKUP-SEMANTICS 0)))))
+                      (create w access win32-FILE-SHARE-ALL 0
+                              win32-OPEN-EXISTING (win32-attr-open-flags follow?) 0)))))
            (and (not (= h win32-INVALID-HANDLE-VALUE))
-                (let ((ft (make-bytevector 8 0)))
-                  (bytevector-u64-set! ft 0 (unix-ms->filetime ms) (endianness little))
-                  (let ((ok (not (= 0 (set-time h 0 0 ft)))))
-                    (close h)
-                    ok)))))))
+                (dynamic-wind (lambda () #f) (lambda () (proc h)) (lambda () (close h))))))))
+
+;; Files.setLastModifiedTime / setAttribute on Windows, as WindowsFileAttributeViews
+;; does it: open the path for FILE_WRITE_ATTRIBUTES — with
+;; FILE_FLAG_BACKUP_SEMANTICS, the flag that lets CreateFile open a directory at
+;; all, and FILE_FLAG_OPEN_REPARSE_POINT when not following a link — and set just
+;; the times given. Each of CREATION, ACCESS and WRITE is epoch NANOSECONDS or #f,
+;; and a #f slot passes NULL, which SetFileTime leaves alone. Answers whether they
+;; were set; #f off Windows.
+(define (win32-set-file-times! path creation access write follow?)
+  (let ((set-time (win32-set-file-time)))
+    (define (ft ns)
+      (and ns (let ((b (make-bytevector 8 0)))
+                (bytevector-u64-set! b 0 (unix-ns->filetime ns) (endianness little))
+                b)))
+    (and set-time
+         (win32-with-attr-handle path win32-FILE-WRITE-ATTRIBUTES follow?
+           (lambda (h) (not (= 0 (set-time h (ft creation) (ft access) (ft write)))))))))
+
+;; Files.createLink on Windows: CreateHardLinkW(new, existing, NULL). Answers
+;; whether the link was made; #f off Windows.
+(define-win32-proc win32-create-hard-link-w
+  "kernel32.dll" "CreateHardLinkW" (void* void* void*) int)
+(define (win32-create-hard-link! link existing)
+  (let ((f (win32-create-hard-link-w)))
+    (and f
+         (win32-with-wstr link
+           (lambda (l) (win32-with-wstr existing
+                         (lambda (e) (not (= 0 (f l e 0))))))))))
+
+;; The three times of PATH as a vector #(creation access write) of epoch
+;; NANOSECONDS (100ns resolution), or #f. WIN32_FILE_ATTRIBUTE_DATA is the
+;; attribute word and then three FILETIMEs, each two DWORDs — at 4, 12 and 20, so
+;; not 8-aligned, and read as two halves. FOLLOW? on a reparse point reads the
+;; target's through a handle (GetFileTime), since the attribute data describes
+;; the link itself.
+(define-win32-proc win32-get-file-attributes-ex-w
+  "kernel32.dll" "GetFileAttributesExW" (void* int u8*) int)
+(define (win32-filetime-at buf off)
+  (filetime->unix-ns
+   (+ (bytevector-u32-ref buf off (endianness little))
+      (* (bytevector-u32-ref buf (+ off 4) (endianness little)) #x100000000))))
+(define (win32-file-times path follow?)
+  (let ((f (win32-get-file-attributes-ex-w)))
+    (and f
+         (let ((buf (make-bytevector 36 0)))
+           (and (win32-with-wstr path
+                  (lambda (w) (guard (e (#t #f)) (not (= 0 (f w 0 buf))))))  ; GetFileExInfoStandard
+                (if (win32-times-need-handle? (bytevector-u32-ref buf 0 (endianness little)) follow?)
+                    (let ((get-time (win32-get-file-time)))
+                      (and get-time
+                           (win32-with-attr-handle path win32-FILE-READ-ATTRIBUTES #t
+                             (lambda (h)
+                               (let ((c (make-bytevector 8 0)) (a (make-bytevector 8 0))
+                                     (m (make-bytevector 8 0)))
+                                 (and (not (= 0 (get-time h c a m)))
+                                      (vector (win32-filetime-at c 0) (win32-filetime-at a 0)
+                                              (win32-filetime-at m 0))))))))
+                    (vector (win32-filetime-at buf 4) (win32-filetime-at buf 12)
+                            (win32-filetime-at buf 20))))))))
 
 ;; The ROOT of P — the prefix that is not a segment and must be reproduced
 ;; verbatim — and the index the segments start at. Rendered with "/" separators,
@@ -1129,28 +1245,56 @@
       (= (c-access p mode) 0)
       ;; no access(2) to ask (or X_OK on Windows): the old answer, existence.
       (if (file-exists? p) #t #f)))
-;; set atime+mtime from epoch milliseconds via utimes(2). struct timeval is
-;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets; usec fits
-;; its field (< 1e6) so a signed 64-bit native-endian write covers the layout.
-;; Resolved via jolt-foreign-proc-safe — a literal foreign-procedure here is a
+;; utimes(2) is the fallback for a host without utimensat: struct timeval is
+;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets. Resolved via jolt-foreign-proc-safe — a literal foreign-procedure here is a
 ;; fasl relocation that aborts the boot on platforms lacking the symbol.
 ;; Windows has no utimes, and its CRT's _utime64 is no substitute: it opens the
 ;; path without FILE_FLAG_BACKUP_SEMANTICS, so it cannot open a DIRECTORY and a
 ;; directory's mtime was never set (jolt-lang/jolt#1119) — and it has second
-;; resolution. win32-set-file-mtime-millis! below is what the JDK's Windows
+;; resolution. win32-set-file-times! (SetFileTime) is what the JDK's Windows
 ;; provider does. Answers whether the time was set.
 (define c-utimes (jolt-foreign-proc-safe "utimes" '(string u8*) 'int))
+;; utimensat(2) sets either time alone (UTIME_OMIT in the other slot) at
+;; nanosecond resolution, and can leave a symbolic link's target alone
+;; (AT_SYMLINK_NOFOLLOW). Setting the mtime through utimes moved the access time
+;; to it as well, where the JDK keeps the access time as it was, for
+;; File.setLastModified and Files.setLastModifiedTime both. The constants are
+;; per-OS, measured with cc/gcc: #(AT_FDCWD UTIME_OMIT AT_SYMLINK_NOFOLLOW).
+(define c-utimensat (jolt-foreign-proc-safe "utimensat" '(int string u8* int) 'int))
+(define utimensat-consts
+  (case (sa-os-family)
+    ((linux) '#(-100 1073741822 #x100))
+    ((macos) '#(-2 -2 #x20))
+    (else #f)))
+;; A struct timespec of epoch NS at OFF: seconds floored, so a time before the
+;; epoch keeps its nanoseconds field in [0, 1e9).
+(define (timespec-bytes! bv off ns)
+  (bytevector-s64-set! bv off (div ns 1000000000) (native-endianness))
+  (bytevector-s64-set! bv (+ off 8) (mod ns 1000000000) (native-endianness)))
+;; Set P's access and/or modification time, each epoch NS or #f to leave it as
+;; it is. FOLLOW? #f sets a symbolic link's own. Answers whether it was set.
+(define (set-file-times-ns! p atime mtime follow?)
+  (cond
+    ((eq? (sa-os-family) 'windows) (win32-set-file-times! p #f atime mtime follow?))
+    ((and c-utimensat utimensat-consts)
+     (let ((ts (make-bytevector 32 0)) (k utimensat-consts))
+       (if atime (timespec-bytes! ts 0 atime)
+           (bytevector-s64-set! ts 8 (vector-ref k 1) (native-endianness)))
+       (if mtime (timespec-bytes! ts 16 mtime)
+           (bytevector-s64-set! ts 24 (vector-ref k 1) (native-endianness)))
+       (= 0 (c-utimensat (vector-ref k 0) p ts (if follow? 0 (vector-ref k 2))))))
+    ;; no utimensat: utimes, which can only set both, so both get the one given
+    ((and c-utimes follow? (or mtime atime))
+     (let ((tv (make-bytevector 32 0)) (t (or mtime atime)))
+       (define (tv! off ns)
+         (bytevector-s64-set! tv off (div ns 1000000000) (native-endianness))
+         (bytevector-s64-set! tv (+ off 8) (div (mod ns 1000000000) 1000) (native-endianness)))
+       (tv! 0 (or atime t))
+       (tv! 16 (or mtime t))
+       (= (c-utimes p tv) 0)))
+    (else #f)))
 (define (set-file-mtime-millis! p ms)
-  (if c-utimes
-      (let ((sec (div ms 1000))
-            (tv (make-bytevector 32 0))
-            (usec (* (mod ms 1000) 1000)))
-        (bytevector-s64-set! tv 0 sec (native-endianness))
-        (bytevector-s64-set! tv 8 usec (native-endianness))
-        (bytevector-s64-set! tv 16 sec (native-endianness))
-        (bytevector-s64-set! tv 24 usec (native-endianness))
-        (= (c-utimes p tv) 0))
-      (win32-set-file-mtime-millis! p ms)))
+  (set-file-times-ns! p #f (* (exact (floor ms)) 1000000) #t))
 ;; mkdir -p: create p and any missing parents. Returns #t if p ends up a dir.
 (define (mkdirs! p)
   (unless (or (= 0 (string-length p)) (file-exists? p))
@@ -1409,16 +1553,38 @@
       (guard (e (#t jolt-nil)) (produce))
       jolt-nil))
 
+;; File.setReadable/setWritable/setExecutable(enable [, ownerOnly]) and
+;; setReadOnly, as the JDK's UnixFileSystem.setPermission does them: BIT is the
+;; permission's "other" bit, widened to the owner's alone (ownerOnly, the
+;; default) or to all three classes, then or'd in or masked out with chmod.
+;; Answers whether the mode was changed; false for a missing file. On Windows
+;; only the write bit means anything (the read-only attribute, which Chez's
+;; chmod sets through _wchmod), and the JDK answers a read or execute change
+;; with ENABLE itself. None of these existed, so every call raised.
+(define (jfile-set-permission! fp bit args)
+  (let ((enable? (and (pair? args) (jolt-truthy? (car args))))
+        (owner-only? (or (not (pair? args)) (null? (cdr args)) (jolt-truthy? (cadr args)))))
+    (guard (e (#t #f))
+      (cond
+        ((and (eq? (sa-os-family) 'windows) (not (= bit 2))) enable?)
+        (else
+         (let* ((m (bitwise-and (get-mode fp) #o7777))
+                (a (if (and owner-only? (not (eq? (sa-os-family) 'windows)))
+                       (* bit #o100)
+                       (* bit #o111))))
+           (chmod fp (if enable? (bitwise-ior m a) (bitwise-and m (bitwise-not a))))
+           #t))))))
+
 ;; --- File method surface (record-method-dispatch arm) -----------------------
 (define (jfile-method f name args)        ; -> boxed result, or #f to fall through
   (let ((p (jfile-path f))               ; the path as given (display methods)
         (fp (jfile-fs f)))               ; JOLT_PWD-resolved on-disk path (FS methods)
     (cond
-      ((string=? name "getPath")        (list p))
+      ((string=? name "getPath")        (list (path-native p)))
       ((string=? name "getName")        (list (path-last-segment p)))
-      ((string=? name "toString")       (list p))
-      ((string=? name "getAbsolutePath")(list (jfile-abs fp)))
-      ((string=? name "getCanonicalPath")(list (jfile-canonical fp)))
+      ((string=? name "toString")       (list (path-native p)))
+      ((string=? name "getAbsolutePath")(list (path-native (jolt-path-normalize (jfile-abs fp)))))
+      ((string=? name "getCanonicalPath")(list (path-native (jfile-canonical fp))))
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (jfile->uri fp)))
       ((string=? name "toURL")          (list (make-url (jfile->url-spec fp))))
@@ -1444,6 +1610,10 @@
       ((string=? name "mkdirs")         (list (if (mkdirs! fp) #t #f)))
       ((string=? name "delete")         (list (if (delete-path! fp) #t #f)))
       ((string=? name "deleteOnExit")   (list jolt-nil))
+      ((string=? name "setReadable")    (list (jfile-set-permission! fp 4 args)))
+      ((string=? name "setWritable")    (list (jfile-set-permission! fp 2 args)))
+      ((string=? name "setExecutable")  (list (jfile-set-permission! fp 1 args)))
+      ((string=? name "setReadOnly")    (list (jfile-set-permission! fp 2 (list #f #f))))
       ((string=? name "setLastModified")
        (list (guard (e (#t #f))
                (set-file-mtime-millis! fp (exact (floor (car args)))))))
@@ -1463,7 +1633,7 @@
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
       ((string=? name "hashCode")       (list (->num (string-hash p))))
       ((string=? name "getParent")
-       (list (or (jfile-parent-path p) jolt-nil)))
+       (list (let ((parent (jfile-parent-path p))) (if parent (path-native parent) jolt-nil))))
       (else #f))))
 
 (register-method-arm! arm-priority-file
@@ -1613,9 +1783,12 @@
 ;; EXC is the condition the open raised, when there was one. The probes are the
 ;; fallback for the one caller with no condition to offer: open-path-guarded's
 ;; directory check, which refuses before it opens.
+;; GIVEN is named the way a java.io.File built from it would name it: the JDK
+;; opens a File, so (slurp "a//b") reports "a/b", and path-native alone left the
+;; doubled separator in.
 (define (file-open-error given resolved . exc)
   (throw-jvm (quote java.io.FileNotFoundException)
-             (string-append given " ("
+             (string-append (path-native (jolt-path-normalize given)) " ("
                             (or (io-open-reason exc)
                                 (cond ((not (file-exists? resolved)) "No such file or directory")
                                       ((file-directory? resolved)    "Is a directory")
@@ -1651,13 +1824,16 @@
 ;; now fails to read, exactly as it does on the JVM and on babashka
 ;; ("Unable to resolve symbol: <U+FEFF>"). Chez's codec used to swallow the BOM
 ;; and hide that, at the price of swallowing it out of DATA files too.
-(define (read-file-string path)
+;; GIVEN, when passed, is the path as the caller spelled it, for the message: a
+;; missing file is reported under that name, as the JVM's FileInputStream does,
+;; rather than under the user.dir-resolved PATH this opens.
+(define (read-file-string path . given)
   (utf8-bytes->string
    (if (jar-path? path)
        (or (jar-path-bytes path) (jar-path-missing path))
-       (read-file-bytes-on-disk path))))
-(define (read-file-bytes-on-disk path)
-  (with-port (open-path-guarded path path (lambda (p) (open-file-input-port p)))
+       (apply read-file-bytes-on-disk path given))))
+(define (read-file-bytes-on-disk path . given)
+  (with-port (open-path-guarded (if (pair? given) (car given) path) path (lambda (p) (open-file-input-port p)))
     (lambda (p)
       ;; A port with no meaningful length — a fifo, a character device — reports
       ;; 0 or raises; both fall back to the growing read, which is correct for
@@ -1863,7 +2039,7 @@
 ;; libraries branch on it: instaparse decides whether its argument is a grammar or
 ;; a file by slurping and catching FNF. A raw Chez open-input-file condition is not
 ;; catchable as that class, so the caller's fallback never runs.
-(define (slurp-path path)
+(define (slurp-path path . given)
   (io-note-file-read! path)
   ;; An entry inside a jar has no open to fail, so its absence is still checked
   ;; here. A path ON DISK is not pre-checked: read-file-bytes-on-disk opens
@@ -1873,7 +2049,7 @@
   (when (and (jar-path? path) (not (jar-path-exists? path)))
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
-  (read-file-string path))
+  (apply read-file-string path given))
 ;; The content a URL names, as text: a file: URL reads its target from disk (a
 ;; missing file is a FileNotFoundException, as on the JVM); any other protocol has
 ;; no local backing, so raise rather than hand back empty content. slurp /
@@ -1921,7 +2097,7 @@
               (loop #f)))))))
 (define (jolt-slurp src . opts)
   (cond
-    ((jfile? src) (slurp-path (jfile-fs src)))
+    ((jfile? src) (slurp-path (jfile-fs src) (jfile-path src)))
     ((embedded-res? src)
      (let ((c (embedded-res-content src)))
        (if (bytevector? c) (utf8->string c) c)))
@@ -1938,7 +2114,10 @@
     ;; a byte input-stream shim (e.g. clj-http-lite's :as :stream body): drain it.
     ((and (htable? src) (jolt-truthy? (jolt-ref-get src (keyword "jolt" "input-stream"))))
      (decode-bytevector (drain-byte-stream src) (slurp-encoding opts)))
-    ((string? src) (slurp-path (io-source-path src)))
+    ((string? src) (let ((fp (io-source-path src)))
+                     (if (jar-path? fp)
+                         (slurp-path fp)
+                         (slurp-path fp (if (file-url-string? src) (file-url->path src) src)))))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
 (define (spit-append? opts)
@@ -1961,16 +2140,17 @@
   (unless (or (string? path) (jfile? path) (jhost? path))
     (throw-jvm (quote IllegalArgumentException)
                (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
-  (let* ((p (project-relative (if (url-jhost? path) (url-write-path path) (file-path-of path))))
+  (let* ((given (if (url-jhost? path) (url-write-path path) (file-path-of path)))
+         (p (project-relative given))
          (text (jolt-str-render-one content)))
     ;; The JVM opens the TARGET, so a target it cannot open fails here and names
     ;; itself. This wrote its temp file first and only discovered the target at
     ;; the rename, which came back as Chez's "cannot rename ..." inside a plain
     ;; java.io.IOException -- naming a temp path the caller never asked for
     ;; (jolt-g81).
-    (when (file-directory? p) (file-open-error p p))
+    (when (file-directory? p) (file-open-error given p))
     (if (spit-append? opts)
-        (with-port (open-path-guarded p p (lambda (rp) (open-output-file rp 'append)))
+        (with-port (open-path-guarded given p (lambda (rp) (open-output-file rp 'append)))
           (lambda (port) (put-string port text)))
         (let ((tmp (string-append p ".spit-tmp-"
                                    (number->string (sa-real-time-ms)) "-"
@@ -1979,7 +2159,7 @@
                                                             spit-tmp-counter))))))
           ;; the temp file is this function's business, but a failure to open it
           ;; is the caller's target failing, so report the target
-          (with-port (guard (e ((i/o-error? e) (file-open-error p p e)))
+          (with-port (guard (e ((i/o-error? e) (file-open-error given p e)))
                        (open-output-file tmp 'replace))
             (lambda (port) (put-string port text)))
           (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
@@ -2007,7 +2187,7 @@
 
 ;; --- str / type / instance? integration ------------------------------------
 ;; str of a jfile is its path (Clojure's File.toString).
-(register-str-render! jfile? jfile-path)
+(register-str-render! jfile? (lambda (f) (path-native (jfile-path f))))
 
 ;; The stdin line seam (__stdin-read-line, the *in* reader's source) lives in
 ;; io-streams.ss, next to the System/in stream it reads.
@@ -2081,14 +2261,14 @@
   (cond
     ((reader-jhost? x) x)
     ((jfile? x) (io-note-file-read! (jfile-fs x))
-                (host-new "StringReader" (read-file-string (jfile-fs x))))
+                (host-new "StringReader" (read-file-string (jfile-fs x) (jfile-path x))))
     ((embedded-res? x)
      (let ((c (embedded-res-content x)))
        (host-new "StringReader" (if (bytevector? c) (utf8->string c) c))))
     ((url-jhost? x) (host-new "StringReader" (url-content x)))
     ((string? x) (let ((p (project-relative x)))
                    (io-note-file-read! p)
-                   (host-new "StringReader" (read-file-string p))))
+                   (host-new "StringReader" (if (jar-path? p) (read-file-string p) (read-file-string p x)))))
     ((or (cseq? x) (empty-list-t? x) (pvec? x))
      (host-new "StringReader" (seq-source->string x)))
     ;; anything else is not a source, and quietly rendering it would read as empty
@@ -2113,7 +2293,7 @@
 ;; JVM's FileWriter does too.
 (define (io-writer-target! given)
   (let ((p (project-relative given)))
-    (close-port (open-path-guarded p p
+    (close-port (open-path-guarded given p
                   (lambda (rp)
                     (open-file-output-port rp (file-options no-fail no-truncate append)
                                            (buffer-mode none)))))
@@ -2683,21 +2863,13 @@
             (let ((r (string-append (string (integer->char (+ (char->integer #\A) i))) ":/")))
               (loop (- i 1) (if (exists? r) (cons r acc) acc)))))))
 
-;; separator stays "/" on both platforms — Windows accepts it and every path
-;; this shim renders uses it — but pathSeparator is the PATH-LIST separator and
-;; must be ";" on Windows, or babashka.fs/split-paths and fs/which cut every
-;; drive-lettered entry in half (host-static-methods.ss path-list-separator).
-;;
-;; Asked for again as jolt-lang/jolt#1110 and deliberately left as it is. Flipping
-;; separator alone is a one-line change, but it would then disagree with what File
-;; and Path actually RENDER, which is the one thing the JDK guarantees they agree
-;; about; moving the rendering too is not local — getCanonicalPath, the glob
-;; translator and every path comparison in this shim are written over the "/"
-;; spelling. Recorded as a deviation instead, with the consumer-visible
-;; consequence (path STRINGS differ from babashka on Windows), in
-;; test/conformance/known-divergences.edn.
-(let ((statics (list (cons "separator" "/")
-                     (cons "separatorChar" #\/)
+;; separator is "\\" on Windows, and File and Path render with it (path-native),
+;; so the two agree as they do on the JDK (jolt-lang/jolt#1110). pathSeparator is
+;; the PATH-LIST separator and must be ";" there, or babashka.fs/split-paths and
+;; fs/which cut every drive-lettered entry in half (host-static-methods.ss
+;; path-list-separator).
+(let ((statics (list (cons "separator" (file-separator))
+                     (cons "separatorChar" (string-ref (file-separator) 0))
                      (cons "pathSeparator" (path-list-separator))
                      (cons "pathSeparatorChar" (string-ref (path-list-separator) 0))
                      (cons "createTempFile" file-create-temp)

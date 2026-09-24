@@ -335,6 +335,25 @@
            (or (and (>= n m) (string=? (substring p (- n m) n) suf))
                (loop (cdr es)))))))
 
+;; --- embedded roots ---------------------------------------------------------
+;; A root spelled "embed:<prefix>" is not a directory on disk but a prefix
+;; into the runtime's embedded-resource table — the store `jolt build`'s
+;; deps.edn :jolt/build {:embed [dirs]} registers (io.ss
+;; register-embedded-resource!), and the one a self-contained jolt binary
+;; carries jolt-core + stdlib under. A loader context over such a root serves
+;; namespaces and resources with no files anywhere, which is how a shipped
+;; binary runs a library it baked in.
+;;
+;; The spelling cannot collide with a real path: ":" is illegal in a Windows
+;; path, and a POSIX directory literally named "embed:" is not a thing. Keys
+;; are "<prefix>/<name>", so the prefix never carries a trailing slash.
+(define (ldr-embedded-root? root)
+  (and (string? root)
+       (>= (string-length root) 6)
+       (string=? (substring root 0 6) "embed:")))
+(define (ldr-embedded-root-prefix root)
+  (substring root 6 (string-length root)))
+
 ;; --- jar roots -------------------------------------------------------------
 ;; A root that names a jar (a .jar or .zip file, either case) is read through
 ;; its central directory (java/zip-file.ss root-jar-index): a namespace or a
@@ -343,14 +362,21 @@
 ;; (jolt issue #1005), and the jar's own path is what the roots hold, as a jar
 ;; on the JVM's classpath is.
 ;;
-;; The file NAME on ROOT — a disk path under a directory root, a jar path into
-;; a jar root — or #f when it is not there.
+;; The location NAME resolves to on ROOT — a disk path under a directory root,
+;; a jar path into a jar root, an embedded KEY under an embedded root — or #f
+;; when it is not there.
 (define (ldr-root-file root name)
-  (let ((d (root-jar-index root)))
-    (if d
-        (and (zipdir-has? d name) (make-jar-path (root-path-abs root) name))
-        (let ((f (string-append root "/" name)))
-          (and (file-exists? f) f)))))
+  (if (ldr-embedded-root? root)
+      ;; The answer is the key itself, not a path: ldr-read-source reads such a
+      ;; key (embedded-resource-ref), and io.ss's reader/opener accept it the
+      ;; way they accept any other source location.
+      (let ((k (string-append (ldr-embedded-root-prefix root) "/" name)))
+        (and (embedded-resource-has? k) k))
+      (let ((d (root-jar-index root)))
+        (if d
+            (and (zipdir-has? d name) (make-jar-path (root-path-abs root) name))
+            (let ((f (string-append root "/" name)))
+              (and (file-exists? f) f))))))
 ;; The source of REL on ROOT: the first extension present, in ldr-source-exts
 ;; order, or #f.
 (define (ldr-root-source root rel)
@@ -2255,12 +2281,21 @@
     (let ((bv (jar-path-bytes p)))
       (if bv (utf8->string bv) jolt-nil))))
 
-;; The path NAME resolves to on ROOT — a file under a directory root, a jar
-;; path into a jar root — or nil. jolt.loader's roots backend locates through
-;; this so a context's roots may hold jars as the global roots may.
+;; The location NAME resolves to on ROOT — a file under a directory root, a
+;; jar path into a jar root, an embedded key under an "embed:<prefix>" root —
+;; or nil. jolt.loader's roots backend locates through this so a context's
+;; roots may hold jars (and embedded roots) as the global roots may.
 (def-var! "jolt.host" "root-file"
   (lambda (root name)
     (or (ldr-root-file (host-fs-path root) name) jolt-nil)))
+
+;; True when NAME is a key in the runtime's embedded-resource table — what
+;; deps.edn :jolt/build {:embed [dirs]} bakes into a binary, and what a
+;; jolt.loader embedded root ("embed:<prefix>", ldr-embedded-root? above)
+;; resolves against. The Clojure side reads such a source through the host
+;; resolver instead of opening the key as a filesystem path.
+(def-var! "jolt.host" "embedded-resource?"
+  (lambda (name) (if (embedded-resource-has? name) #t #f)))
 
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".

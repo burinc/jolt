@@ -807,6 +807,65 @@
       (chk "assert did not escape the load"
            (identical? a *assert*)))))
 
+;; --- 34. embedded roots: the marker, validation, status ---------------------
+;; An embedded root is a prefix into the runtime's embedded-resource table, not
+;; a path: construction validates the PREFIX itself, so a blank one is refused
+;; eagerly while a prefix holding nothing yet is a legal root — the keys are
+;; probed per request, never up front.
+(defcase 34 "an embedded root is a marker into the embedded table, validated at construction"
+  (chk "embedded-root? recognises the marker"
+       (and (l/embedded-root? "embed:assets/bundled")
+            (l/embedded-root? "embed:")
+            (not (l/embedded-root? "src"))
+            (not (l/embedded-root? nil))))
+  (let [ctx (l/classpath ["embed:no/such/prefix"] {:id "embedded" :parent (l/isolated)})]
+    (chk "a prefix holding nothing is still a legal root"
+         (= ["embed:no/such/prefix"] (:roots (l/status ctx))))
+    (l/unload! ctx))
+  (let [err (try (l/classpath ["embed:"]) nil (catch Exception e e))]
+    (chk "a blank prefix is refused eagerly" (= :loader/bad-root (:type (ex-data err))))
+    (chk "the refusal names the root" (= "embed:" (:root (ex-data err))))))
+
+;; --- 35. an embedded root that holds nothing is a plain miss -----------------
+;; Nothing about an embedded root touches the filesystem: `find` answers [],
+;; `load` fails with the loader's own miss, and no "path" is ever opened — a
+;; prefix that matches nothing degrades exactly like a directory root that is
+;; empty.
+(defcase 35 "an embedded root over an empty prefix misses without a filesystem error"
+  (let [ctx (l/classpath ["embed:no/such/bundle"] {:parent (l/isolated)})
+        err (try (l/load ctx {:kind :ns :name "fixture.entry"}) nil (catch Exception e e))]
+    (chk "find answers no namespace hits"
+         (empty? (l/find ctx {:kind :ns :name "fixture.entry"})))
+    (chk "find answers no resource hits"
+         (empty? (l/find ctx {:kind :resource :name "fixture/data.txt"})))
+    (chk "load fails" (some? err))
+    (chk "the failure is the loader's own miss, not a filesystem error"
+         (= :loader/miss (:type (ex-data err))))
+    (chk "the failure names the namespace"
+         (= "fixture.entry" (:name (ex-data err))))
+    (l/unload! ctx)))
+
+;; --- 36. a resource hit opens through its own location -----------------------
+;; A resource hit carries the LOCATION it was found at; opening must read that,
+;; never re-resolve the request name through the host. On a prefixed root the
+;; two differ by construction — the request name is relative to the root while
+;; the location is the full embedded key — so a fallback to the name would ask
+;; for a key that does not exist. `jolt/loader.clj` names this very source, on a
+;; host source root under bin/jolt and in the embedded table of a built jolt.
+(defcase 36 "a resource hit opens through its own location, not the request name"
+  (let [ctx (l/->loader (fn [req]
+                          (when (= :resource (:kind req))
+                            {:kind :resource
+                             :url "jolt/loader.clj"
+                             :embedded? true})))
+        hit (first (l/find ctx {:kind :resource :name "loaderconf-probe.txt"}))]
+    (chk "the resolver's hit comes back" (some? hit))
+    (chk "it carries its own location" (= "jolt/loader.clj" (:url hit)))
+    (let [s (l/open-hit ctx hit)]
+      (chk "open-hit opens the hit's location" (some? s))
+      (chk "and reads that resource, not the request name"
+           (str/includes? (slurp s) "(ns jolt.loader")))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])

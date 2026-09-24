@@ -909,22 +909,30 @@
   (let [{:keys [project-paths embed-dirs build] :as resolved}
         (resolve-current)]
     (apply-project! resolved)
-    (let [opts (loop [a more, entry nil, out nil, target nil, tpack nil, end-opts? false]
+    (let [opts (loop [a more, entry nil, out nil, target nil, tpack nil, includes [], end-opts? false]
                  (let [cur (first a)]
                    (cond
-                     (empty? a)                              {:entry entry :out out :target target :target-pack tpack}
-                     (and (not end-opts?) (= "--" cur))      (recur (rest a) entry out target tpack true)
-                     (and (not end-opts?) (= "-m" cur))      (recur (drop 2 a) (second a) out target tpack false)
-                     (and (not end-opts?) (= "-o" cur))      (recur (drop 2 a) entry (second a) target tpack false)
+                     (empty? a)                              {:entry entry :out out :target target :target-pack tpack :includes includes}
+                     (and (not end-opts?) (= "--" cur))      (recur (rest a) entry out target tpack includes true)
+                     (and (not end-opts?) (= "-m" cur))      (recur (drop 2 a) (second a) out target tpack includes false)
+                     (and (not end-opts?) (= "-o" cur))      (recur (drop 2 a) entry (second a) target tpack includes false)
                      ;; cross-compilation: --target <machine> [--target-pack <dir>]
-                     (and (not end-opts?) (= "--target" cur))      (recur (drop 2 a) entry out (second a) tpack false)
-                     (and (not end-opts?) (= "--target-pack" cur)) (recur (drop 2 a) entry out target (second a) false)
+                     (and (not end-opts?) (= "--target" cur))      (recur (drop 2 a) entry out (second a) tpack includes false)
+                     (and (not end-opts?) (= "--target-pack" cur)) (recur (drop 2 a) entry out target (second a) includes false)
                      ;; --boot takes a value; skip both so a bare `build --boot small`
                      ;; does not read `small` as the entry namespace.
-                     (and (not end-opts?) (= "--boot" cur))        (recur (drop 2 a) entry out target tpack false)
-                     (and (not end-opts?) (str/starts-with? cur "-")) (recur (rest a) entry out target tpack false)
-                     :else                                   (recur (rest a) (or entry cur) out target tpack end-opts?))))
+                     (and (not end-opts?) (= "--boot" cur))        (recur (drop 2 a) entry out target tpack includes false)
+                     ;; --include takes a value too, and repeats; deps.edn
+                     ;; :jolt/build {:include [ns …]} is read alongside it below.
+                     (and (not end-opts?) (= "--include" cur))
+                     (let [v (second a)]
+                       (when (or (nil? v) (str/starts-with? v "-"))
+                         (throw (ex-info "--include needs a namespace name" {:include v})))
+                       (recur (drop 2 a) entry out target tpack (conj includes v) false))
+                     (and (not end-opts?) (str/starts-with? cur "-")) (recur (rest a) entry out target tpack includes false)
+                     :else                                   (recur (rest a) (or entry cur) out target tpack includes end-opts?))))
           entry (:entry opts)
+          cli-includes (:includes opts)
           ;; flags are only recognized before the end-of-options marker
           flag-args (take-while #(not= "--" %) more)
           mode  (cond (some #{"--opt"} flag-args) "optimized"
@@ -943,7 +951,7 @@
       (let [pdir (project-dir)
             ;; the project dir's own name; "." (JOLT_PWD unset, the built binary
             ;; started in the project) resolves to the directory it stands for
-            proj (let [seg (last (str/split pdir #"/"))
+            proj (let [seg (.getName (java.io.File. pdir))
                        seg (if (or (str/blank? seg) (= "." seg))
                              (.getName (.getCanonicalFile (java.io.File. pdir)))
                              seg)]
@@ -951,7 +959,7 @@
             out (let [o (:out opts)]
                   (cond
                     (nil? o) (str pdir "/target/" (if (= mode "dev") "debug" "release") "/" proj)
-                    (str/starts-with? o "/") o
+                    (path-rooted? o) o
                     :else (str pdir "/" o)))
             ;; :jolt/native libs with a :static archive are cc-linked into the
             ;; binary by default; --dynamic (or deps.edn :jolt/build {:dynamic-natives
@@ -1019,6 +1027,18 @@
             ;; bails: the compiler image is direct-linked against the whole core
             ;; and cannot run over a shaken one (dce.ss dce-bail-scan).
             allow-dynamic (vec (:allow-dynamic resolved))
+            ;; namespaces to bake besides the require closure — deps.edn
+            ;; :jolt/build {:include […]}, unioned with --include NS: names the
+            ;; static scan cannot see, reached only by a runtime
+            ;; requiring-resolve (a plugin loader). Symbols or strings; the
+            ;; driver fails the build on a name with no source file, rather
+            ;; than silently baking nothing.
+            include-names (into [] (comp (map str) (remove str/blank?) (distinct))
+                                (concat cli-includes
+                                        (let [v (:include build)]
+                                          (cond (nil? v) []
+                                                (sequential? v) v
+                                                :else [v]))))
             ;; a shared library (callable from C/C++/Rust via jolt_library_init +
             ;; jolt_lookup) instead of an executable: --library.
             library? (some #{"--library"} flag-args)
@@ -1043,8 +1063,8 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable?))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic nil include-names)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable? include-names))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
@@ -1104,7 +1124,7 @@
   (println "                         executable script, with or without an extension")
   (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--closed-world] [--dynamic]")
   (println "              [--boot fast|small|plain] [--library] [--signable]")
-  (println "              [--target MACHINE --target-pack DIR]")
+  (println "              [--include NS] [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary, or with --library a")
   (println "                         shared object an embedder dlopens and calls through")
   (println "                         jolt_library_init + jolt_lookup; --target")
@@ -1119,6 +1139,10 @@
   (println "                         (no effect on --library, always structurally")
   (println "                         complete, or on a --target build, already forced")
   (println "                         onto this same path)")
+  (println "                         --include NS bakes a namespace the require scan")
+  (println "                         cannot see (one reached only by a runtime")
+  (println "                         requiring-resolve); repeatable, and")
+  (println "                         :jolt/build {:include [ns …]} does the same")
   (println "  path                   print the resolved source roots")
   (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
   (println "  completions SHELL      print a completion function to source, for")

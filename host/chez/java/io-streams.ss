@@ -1024,9 +1024,9 @@
 ;; demand.  open-file-guarded gives the same FileNotFoundException/`Is a directory`
 ;; reporting every other file-opening ctor here gives, so a missing path still
 ;; fails at io/reader time and with the same message it always did.
-(define (jio-file-char-reader path)
+(define (jio-file-char-reader path . given)   ; GIVEN: the caller's spelling, for the message
   (io-note-file-read! path)
-  (open-file-guarded path
+  (open-path-guarded (if (pair? given) (car given) path) path
     (lambda (p)
       (make-char-reader (open-java-utf8-input-port
                           (open-file-input-port p (file-options) (buffer-mode block))
@@ -1752,25 +1752,34 @@
 ;; input-stream/output-stream now yield real byte streams (were char reader/writer).
 ;; the file branches announce themselves to the AOT cache (io-note-file-read!,
 ;; io.ss): opening a resource for reading at compile time is a read like a slurp.
-(define (jio-open-in-file p)
+(define (jio-open-in-file p . given)   ; GIVEN: the caller's spelling, for the message
   (io-note-file-read! p)
   ;; The one funnel for io/input-stream's file arms -- a path, an io/file, a
   ;; file: URL -- and it opened unguarded, so a missing path came back carrying
   ;; Chez's own wording where every FileInputStream above reports the JVM's.
-  (open-path-guarded p p
+  (open-path-guarded (if (pair? given) (car given) p) p
     (lambda (rp) (make-in-stream (open-file-input-port rp (file-options) (buffer-mode block))))))
 (define (jio-input-stream x)
   (cond ((or (in-stream? x) (user-in-stream? x)) x)
-        ((jfile? x) (jio-open-in-file (jfile-fs x)))
+        ((jfile? x) (jio-open-in-file (jfile-fs x) (jfile-path x)))
         ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (make-in-stream (open-bytevector-input-port (na-bytearray->bv x))))
         ((bytevector? x) (make-in-stream (open-bytevector-input-port x)))
         ((and (jhost? x) (string=? (jhost-tag x) "url"))
          (if (jar-path? (url-spec x))
              (jar-path-stream (url-spec x))
-             (jio-open-in-file (file-url->path (url-spec x)))))
+             (let ((up (file-url->path (url-spec x)))) (jio-open-in-file up up))))
+        ;; io/resource's answer for a resource baked into a built binary — a
+        ;; java.net.URL with an openStream (io.ss embedded-res). Without this arm
+        ;; (io/input-stream (io/resource "baked.txt")) threw in a built binary
+        ;; while the same call on a file: URL worked. The content is the source
+        ;; string or a bytevector, whichever the embed stored.
+        ((embedded-res? x)
+         (let ((c (embedded-res-content x)))
+           (make-in-stream (open-bytevector-input-port
+                            (if (bytevector? c) c (string->utf8 c))))))
         ;; an entry inside a jar on the roots streams out of the archive (io.ss)
         ((jar-path? x) (jar-path-stream x))
-        ((string? x) (jio-open-in-file (io-source-path x)))
+        ((string? x) (jio-open-in-file (io-source-path x) (if (file-url-string? x) (file-url->path x) x)))
         (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an InputStream.")))))
 (define (jio-output-stream x . rest)
   (cond ((or (out-stream? x) (user-out-stream? x)) x)
@@ -1841,9 +1850,9 @@
             ;; stream from.  slurp is unaffected either way: jolt-slurp answers a
             ;; path through slurp-path and never builds a reader at all.
             ((and (jfile? x) (not (jar-path? (jfile-fs x))))
-             (jio-file-char-reader (jfile-fs x)))
+             (jio-file-char-reader (jfile-fs x) (jfile-path x)))
             ((and (string? x) (not (jar-path? (io-source-path x))))
-             (jio-file-char-reader (io-source-path x)))
+             (jio-file-char-reader (io-source-path x) (if (file-url-string? x) (file-url->path x) x)))
             (else (prev x))))))
 (let ((prev jolt-io-writer))
   (set! jolt-io-writer
