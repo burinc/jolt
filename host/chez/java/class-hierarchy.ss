@@ -1234,6 +1234,8 @@
     ;; the delegating wrapper over a Reader jolt did not build (io-streams.ss)
     ("reader-adapter" . "java.io.BufferedReader")
     ("time-unit" . "java.util.concurrent.TimeUnit")
+    ;; Files/getLastModifiedTime and fs/last-modified-time (nio-file.ss)
+    ("file-time" . "java.nio.file.attribute.FileTime")
     ("normalizer-form" . "java.text.Normalizer$Form")
     ;; subprocess shims (process.ss), backing vendored babashka.process
     ("process-builder" . "java.lang.ProcessBuilder")

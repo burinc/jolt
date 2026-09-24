@@ -1053,12 +1053,22 @@
 
 ;; ---- PushbackReader ---------------------------------------------------------
 ;; state: a vector #(wrapped-reader pushed-list line-numbering? line column skip-lf?
-;;                   at-line-start? prev-at-line-start?)
-;; The last two are LineNumberingPushbackReader's atLineStart: true before
-;; anything is read, then whether the last unit read was a newline (or EOF); an
-;; unread restores the value from before that read, as the JVM's does.
+;;                   at-line-start? prev-at-line-start? owned-reader)
+;; at-line-start? and prev-at-line-start? are LineNumberingPushbackReader's
+;; atLineStart: true before anything is read, then whether the last unit read
+;; was a newline (or EOF); an unread restores the value from before that read,
+;; as the JVM's does.
+;;
+;; wrapped-reader is what reads come from, and a form read replaces it: the
+;; drain-parse-refill path of host-reader-read-form (io.ss) drains it and puts a
+;; StringReader over the unconsumed tail in its place. owned-reader is the
+;; reader the constructor was handed, which that swap never touches, and it is
+;; what close closes (jolt-lang/jolt#1117) -- closing slot 0 after a read closed
+;; the in-memory tail and left the file open until a GC.
+(define (make-pbr-state rdr line-numbering?)
+  (vector rdr '() line-numbering? 0 0 #f #t #t rdr))
 (register-class-ctor! "PushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '() #f 0 0 #f #t #t))))
+  (lambda (rdr . _) (make-jhost "pushback-reader" (make-pbr-state rdr #f))))
 ;; Fully-qualified aliases so (java.io.PushbackReader. …) / (java.io.StringReader. …)
 ;; resolve to these built-ins even when a library defines a deftype of the same
 ;; simple name (tools.reader), which would otherwise take the bare-name slot.
@@ -1074,7 +1084,7 @@
 ;; (extend LineNumberingPushbackReader IndexingReader …) to dispatch. The methods
 ;; are shared with the plain reader below, so the two cannot drift.
 (define (make-lnpbr rdr . _)
-  (make-jhost "line-numbering-pushback-reader" (vector rdr '() #t 0 0 #f #t #t)))
+  (make-jhost "line-numbering-pushback-reader" (make-pbr-state rdr #t)))
 (register-class-ctor! "LineNumberingPushbackReader" make-lnpbr)
 (register-class-ctor! "clojure.lang.LineNumberingPushbackReader" make-lnpbr)
 (define (read-unit r)        ; read one code unit (flonum) from any reader, -1 at EOF
@@ -1161,7 +1171,7 @@
         ;; no-op is exactly what the JDK does.
         (cons "close"
           (lambda (self)
-            (let ((rdr (vector-ref (jhost-state self) 0)))
+            (let ((rdr (vector-ref (jhost-state self) 8)))
               (when (and (not (jolt-nil? rdr)) (pbr-closeable? rdr))
                 (record-method-dispatch rdr "close" jolt-nil)))
             jolt-nil))

@@ -1767,13 +1767,15 @@
         ((and (jhost? x) (string=? (jhost-tag x) "url"))
          (if (jar-path? (url-spec x))
              (jar-path-stream (url-spec x))
-             (jio-open-in-file (url-strip-scheme (url-spec x)))))
+             (jio-open-in-file (file-url->path (url-spec x)))))
         ;; an entry inside a jar on the roots streams out of the archive (io.ss)
         ((jar-path? x) (jar-path-stream x))
-        ((string? x) (jio-open-in-file (project-relative x)))
+        ((string? x) (jio-open-in-file (io-source-path x)))
         (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an InputStream.")))))
 (define (jio-output-stream x . rest)
   (cond ((or (out-stream? x) (user-out-stream? x)) x)
+        ;; a "file:" string is the URL's file, as it is for the read side
+        ((and (string? x) (file-url-string? x)) (apply jio-output-stream (file-url->path x) rest))
         ((or (jfile? x) (string? x))
          (let ((append? (let loop ((o rest)) (cond ((or (null? o) (null? (cdr o))) #f)
                                                     ((and (keyword-t? (car o)) (string=? (keyword-t-name (car o)) "append") (jolt-truthy? (cadr o))) #t)
@@ -1840,8 +1842,8 @@
             ;; path through slurp-path and never builds a reader at all.
             ((and (jfile? x) (not (jar-path? (jfile-fs x))))
              (jio-file-char-reader (jfile-fs x)))
-            ((and (string? x) (not (jar-path? (project-relative x))))
-             (jio-file-char-reader (project-relative x)))
+            ((and (string? x) (not (jar-path? (io-source-path x))))
+             (jio-file-char-reader (io-source-path x)))
             (else (prev x))))))
 (let ((prev jolt-io-writer))
   (set! jolt-io-writer

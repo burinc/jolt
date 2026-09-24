@@ -728,7 +728,17 @@
         (cons "hashCode"   (lambda (self) (jhost-state self)))
         (cons "toString"   (lambda (self) (iso-instant-str-nanos (* (jhost-state self) 1000000))))))
 (let ((ft-statics (list (cons "fromMillis" (lambda (ms) (make-file-time (jnum->exact ms))))
-                        (cons "from" (lambda (inst . _) (make-file-time (inst-ms inst)))))))
+                        ;; from(Instant) and from(long, TimeUnit). The Instant is
+                        ;; the jolt.time base's value, so its epoch millis come from
+                        ;; clojure.core/inst-ms, looked up when called: a bare
+                        ;; Scheme inst-ms here named nothing, and every
+                        ;; (fs/set-last-modified-time p instant) raised "variable
+                        ;; inst-ms is not bound" (jolt-lang/jolt#1119).
+                        (cons "from" (lambda (x . unit)
+                                       (make-file-time
+                                        (if (pair? unit)
+                                            (tu->ms x (car unit))
+                                            (jolt-invoke (var-deref "clojure.core" "inst-ms") x))))))))
   (register-class-statics! "FileTime" ft-statics)
   (register-class-statics! "java.nio.file.attribute.FileTime" ft-statics))
 
@@ -827,6 +837,16 @@
 (define c-link     (jolt-foreign-proc-safe "link"     '(string string) 'int))
 (define c-readlink (jolt-foreign-proc-safe "readlink" '(string u8* unsigned-long) 'long))
 (define c-chmod    (jolt-foreign-proc-safe "chmod"    '(string int) 'int))
+;; The JDK's Windows filesystem provider has no PosixFileAttributeView, so
+;; getPosixFilePermissions / setPosixFilePermissions raise
+;; UnsupportedOperationException there, and so does a create given a
+;; "posix:permissions" attribute. The shim answered #o755 for the get and did
+;; nothing for the set — chmod is not bound on Windows — so a caller asking
+;; whether a file was read-only was told it was writable.
+(define (nio-posix-view! . msg)
+  (when (win32?)
+    (jolt-throw (jolt-host-throwable "java.lang.UnsupportedOperationException"
+                                     (if (pair? msg) (car msg) jolt-nil)))))
 (define (nio-is-symlink? fp)
   (and c-readlink (> (c-readlink fp (make-bytevector 1 0) 1) 0)))   ; readlink succeeds only on a link
 (define (nio-readlink fp)
@@ -851,6 +871,7 @@
                                                           ((not (file-exists? fp)) (nio-no-such-file fp))
                                                           (else (nio-fs-throw "java.nio.file.NotLinkException" fp))))))
              (cons "setPosixFilePermissions" (lambda (p perms . _)
+                                               (nio-posix-view!)
                                                (when c-chmod (c-chmod (nfp p) (posix-set->mode perms))) (->path p))))))
   (set! files-accum-chunks (cons files-attr files-accum-chunks)))
 (let ((lo-statics (list (cons "NOFOLLOW_LINKS" fvo-nofollow))))
@@ -1076,7 +1097,7 @@
               (else (loop (cdr os) (cdr bs) acc)))))))
 (let ((files-stat
        (list (cons "getPosixFilePermissions"
-                   (lambda (p . _) (nio-mode->perm-set (or (nio-stat-mode (nfp p)) #o755)))))))
+                   (lambda (p . _) (nio-posix-view!) (nio-mode->perm-set (or (nio-stat-mode (nfp p)) #o755)))))))
   (set! files-accum-chunks (cons files-stat files-accum-chunks)))
 ;; instance? FileTime
 (register-instance-check-arm!
@@ -1130,6 +1151,8 @@
 ;; the umask — exactly what java.nio.file's create* do.
 (define (nio-apply-attrs-umask! fp args)
   (let ((um (nio-current-umask)))
+    (when (exists file-attr? (npath-spread-args args))
+      (nio-posix-view! "'posix:permissions' not supported as initial attribute"))
     (for-each (lambda (a) (when (and (file-attr? a) c-chmod)
                             (c-chmod fp (bitwise-and (posix-set->mode (jhost-state a)) (bitwise-not um)))))
               (npath-spread-args args))))
@@ -1205,7 +1228,7 @@
       (let ((tv (make-bytevector 32 0)) (sec (div ms 1000)) (usec (* (mod ms 1000) 1000)))
         (bytevector-s64-set! tv 0 sec (native-endianness)) (bytevector-s64-set! tv 8 usec (native-endianness))
         (bytevector-s64-set! tv 16 sec (native-endianness)) (bytevector-s64-set! tv 24 usec (native-endianness))
-        (c-lutimes fp tv))
+        (= 0 (c-lutimes fp tv)))
       (set-file-mtime-millis! fp ms)))
 (define (nio-lmtime-millis fp opts)              ; read, honoring NOFOLLOW on a link
   (if (and (nio-opts-nofollow? opts) (nio-is-symlink? fp))
@@ -1246,15 +1269,25 @@
 (define (nio-require-exists fp)
   (unless (or (file-exists? fp) (nio-is-symlink? fp))
     (jolt-throw (jolt-host-throwable "java.nio.file.NoSuchFileException" fp))))
+;; Files.setLastModifiedTime reports a time it could not set as an IOException,
+;; where java.io.File.setLastModified answers false. The setters below answer
+;; whether they set it, and discarding that is how a directory's mtime on
+;; Windows went unset with no sign of it (jolt-lang/jolt#1119).
+(define (nio-mtime-set-or-raise! fp set?)
+  (unless set?
+    (jolt-throw (jolt-host-throwable "java.nio.file.FileSystemException"
+                                     (string-append fp ": cannot set the last modified time")))))
 (let ((files-throwing-setters
        (list
         (cons "setLastModifiedTime" (lambda (p t) (let ((fp (nfp p))) (nio-require-exists fp)
-                                                    (set-file-mtime-millis! fp (file-time-ms t)) (->path p))))
+                                                    (nio-mtime-set-or-raise! fp (set-file-mtime-millis! fp (file-time-ms t)))
+                                                    (->path p))))
         (cons "setAttribute" (lambda (path attr value . opts)
                                (let ((fp (nfp path)) (nm (nio-attr-name (npath-string-of attr))))
                                  (when (member nm '("lastModifiedTime" "creationTime" "lastAccessTime"))
                                    (nio-require-exists fp)
-                                   (nio-set-lmtime! fp (if (file-time? value) (file-time-ms value) (jnum->exact value)) opts))
+                                   (nio-mtime-set-or-raise!
+                                    fp (nio-set-lmtime! fp (if (file-time? value) (file-time-ms value) (jnum->exact value)) opts)))
                                  (->path path)))))))
   (set! files-accum-chunks (cons files-throwing-setters files-accum-chunks)))
 

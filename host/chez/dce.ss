@@ -255,7 +255,10 @@
     ;; find's call sites lower to jolt-find2 (host-table.ss), which answers for a
     ;; native map itself and resolves find-other by name for every other type — so
     ;; an app that only ever calls find has no IR edge to it
-    "clojure.core/find-other"))
+    "clojure.core/find-other"
+    ;; FileTime.from(Instant) (nio-file.ss) reads the Instant's epoch millis
+    ;; through inst-ms, so fs/set-last-modified-time with an Instant needs it
+    "clojure.core/inst-ms"))
 
 ;; --- reading a minted blob (prelude.ss) into records ------------------------
 ;; The prelude is a flat list of (guard CLAUSE (def-var! "ns" "name" V)) forms (+ the
