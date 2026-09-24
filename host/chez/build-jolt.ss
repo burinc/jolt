@@ -80,7 +80,10 @@
 (bld-system (string-append "mkdir -p '" (path-parent jb-out) "' '" jb-build "'"))
 
 ;; --- 0. compile the launcher stub -------------------------------------------
-(define jb-stub (string-append jb-build "/launcher"))
+;; A Windows linker names its output "<name>.exe" whatever -o says, so the stub
+;; is named that way for a Windows target: a native MSYS2 build only found
+;; "launcher" through MSYS's own .exe lookup, and a cross build has none.
+(define jb-stub (string-append jb-build (if (bld-tgt-nt?) "/launcher.exe" "/launcher")))
 (display "build-jolt: compiling launcher stub\n")
 (bld-system (string-append
   (bld-cc) " " (bld-arch-flag) " -O2 -I'" (bld-csv-dir) "' 'host/chez/stub/launcher.c' '"

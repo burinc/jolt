@@ -175,8 +175,8 @@
 ;; native lib's symbols resolve via (load-shared-object #f). macOS keeps unstripped
 ;; dlsym visibility; Windows needs an explicit export table; ELF (Linux) needs -rdynamic.
 (define (bld-export-symbols-flag)
-  (cond (bld-osx? "")
-        (bld-nt? "-Wl,--export-all-symbols ")
+  (cond ((bld-tgt-osx?) "")
+        ((bld-tgt-nt?) "-Wl,--export-all-symbols ")
         (else "-rdynamic ")))
 
 ;; --- linking an executable against archives that may not be PIC -------------
