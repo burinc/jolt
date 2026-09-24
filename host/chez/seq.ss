@@ -220,16 +220,26 @@
     (else (cseq-lazy (seq-first s) (make-lazy-src lz-take-walk (fx- n 1) s)))))
 (define lz-take-walk
   (register-lazy-src! 'take-walk (lambda (n s) (take-walk n (jolt-seq (seq-more s))))))
+;; How many elements a take/drop count steps over. clojure.core counts down with
+;; (dec n) while (pos? n), so a positive count is ceil(n) steps whatever its type:
+;; (take 1.5 xs) is two elements, (take 1/2 xs) one. Answers a fixnum, or 'all for
+;; a count no fixnum reaches (+inf.0, a bigint, 1e30) — the countdown never ends
+;; there, so a take takes everything. A count that is not a number is handed back
+;; unchanged, for the fixnum ops below to refuse as they always have.
+(define (take-drop-count n)
+  (cond ((fixnum? n) (if (fx<=? n 0) 0 n))
+        ((not (real? n)) n)
+        ((not (> n 0)) 0)                       ; zero, negative, NaN
+        ((and (flonum? n) (infinite? n)) 'all)
+        (else (let ((k (exact (ceiling n)))) (if (fixnum? k) k 'all)))))
 (define lz-take
   (register-lazy-src! 'take
     (lambda (n coll)
       (jolt-seq
-       (if (and (flonum? n) (infinite? n))
-           (if (> n 0.0) (jolt-seq coll) jolt-empty-list)
-           (let ((n (->idx n)))
-             (if (fx<=? n 0)
-                 jolt-empty-list                 ; (take 0 coll) must not seq its source
-                 (take-walk n (jolt-seq coll)))))))))
+       (let ((n (take-drop-count n)))
+         (cond ((eq? n 'all) (jolt-seq coll))
+               ((fx<=? n 0) jolt-empty-list)    ; (take 0 coll) must not seq its source
+               (else (take-walk n (jolt-seq coll)))))))))
 ;; clojure.core/list? — Clojure's (instance? IPersistentList x), which among the
 ;; seq flavors only PersistentList is.
 (define (cseq-list? s) (fx=? (cseq-kind s) sk-list))
@@ -1814,18 +1824,31 @@
 ;; 625ns and 18.5ms when dropping a million elements. As with count, the step
 ;; loop re-checks per cell so a few plain cells in front of a vector-backed one
 ;; still reach the jump.
+;; A count no fixnum reaches drops everything from a lazy source, the countdown
+;; never ending; the JVM hands a vector or range that count through IDrop, whose
+;; long cast refuses it. (drop n coll) is lazy, so that surfaces when it is walked.
+(define (drop-count-out-of-range n coll)
+  (if (or (pvec? coll)
+          (and (cseq? coll) (let ((k (cseq-kind coll))) (or (fx=? k sk-long-range) (fx=? k sk-range)))))
+      (throw-jvm 'java.lang.IllegalArgumentException
+                 (string-append "Value out of range for long: "
+                                (jolt-str-render-one (inexact (if (flonum? n) n (ceiling n))))))
+      jolt-empty-list))
 (define lz-drop
   (register-lazy-src! 'drop
-    (lambda (n coll)
+    (lambda (n0 coll)
      (jolt-seq
-      (let loop ((n (->idx n)) (s (jolt-seq coll)))
+      (let ((c (take-drop-count n0)))
+       (if (eq? c 'all)
+        (drop-count-out-of-range n0 coll)
+        (let loop ((n c) (s (jolt-seq coll)))
         (cond
           ((jolt-nil? s) jolt-empty-list)
           ((fx<=? n 0) s)
           ((and (cseq-cvec s) (not (cseq-crest s)))
            (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
              (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq v i))))
-          (else (loop (fx- n 1) (jolt-seq (seq-more s))))))))))
+          (else (loop (fx- n 1) (jolt-seq (seq-more s))))))))))))
 (define (jolt-drop n coll) (jolt-make-lazy-src lz-drop n coll))
 
 ;; (iterate f x) — x, (f x), (f (f x)), … as ONE lazy cell per element.
