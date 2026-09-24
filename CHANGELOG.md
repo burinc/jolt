@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`jolt build` caches and parallelizes its back end (#1059).** The app half of a
+  binary is now one compile unit per namespace, cached in `~/.jolt/build-cache` on its
+  emitted text, with misses compiled in parallel child processes; the vfasl image is
+  converted per unit, with the runtime part converted once and cached; and the build's
+  load step uses the AOT namespace cache again. Inlining is bounded per top-level form
+  (400 IR nodes; `JOLT_INLINE_GROWTH`), which stops test-heavy namespaces from
+  expanding into megabytes of Scheme. On kmet a release build went from 128.5s and
+  5.6GB of memory to 55s from cold, 35s for an unchanged rebuild and 38s after editing
+  one namespace, under 1GB. `JOLT_BUILD_CACHE=0`, `JOLT_BUILD_CACHE_DIR`,
+  `JOLT_BUILD_CACHE_MB` and `JOLT_BUILD_JOBS` control the unit cache.
+
+### Fixed
+
+- `take` and `drop` count a non-integer `n` as the JVM does: `(take 1.5 xs)` is two
+  elements and `(take 1/2 xs)` one, where jolt floored a double and threw on a ratio or
+  a count past the fixnum range. `repeatedly`, `split-at` and `drop-last` follow.
+- A vfasl conversion that fails inside the build prints its note instead of silently
+  keeping the plain boot.
+
 ## [0.8.12] - 2026-09-24
 
 Mostly Windows and host-surface parity. Files and Paths render with `\` on
