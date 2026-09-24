@@ -105,12 +105,22 @@
 ;; key for this platform, and it read as a missing library — it named no search
 ;; because none happened, and "(a task may build it)" pointed at a build for a
 ;; file that is already on disk. Say which keys the spec DOES declare instead.
+;; A candidate that IS on disk but failed to load (a DLL whose own dependency is
+;; missing, #1127) is named with the loader's reason rather than reported as
+;; not found.
 (defn- native-missing-msg [spec plat cands]
   (let [nm (or (:name spec) (first cands) "?")
-        declared-keys (filterv #(contains? spec %) [:darwin :linux :windows])]
-    (if (seq (native-declared spec plat))
+        declared-keys (filterv #(contains? spec %) [:darwin :linux :windows])
+        note (when (seq cands) (jolt.ffi/load-failure-note cands))]
+    (cond
+      note
+      (str "required native library " nm " did not load — " note)
+
+      (seq (native-declared spec plat))
       (str "required native library " nm " not found — tried " (pr-str cands)
            " for " (name plat))
+
+      :else
       (str "required native library " nm " has no " plat " candidates"
            (when (seq declared-keys)
              (str " (declares " (str/join ", " declared-keys) ")"))
@@ -146,7 +156,11 @@
             ;; skip it rather than fail. Its foreign calls only resolve in a static
             ;; build; document a dynamic candidate too to use it under `run`.
             (when (and (nil? hit) (not (:optional spec)) (not (:static spec)))
-              (let [msg (native-missing-msg spec plat cands)]
+              (let [msg (native-missing-msg spec plat cands)
+                    ;; a task may build a library it declared candidates for,
+                    ;; but not one already on disk that failed to load
+                    buildable? (and (seq (native-declared spec plat))
+                                    (nil? (jolt.ffi/load-failure-note cands)))]
                 (if strict?
                   (throw (ex-info msg {:native spec}))
                   (binding [*out* *err*]
@@ -154,8 +168,7 @@
                     ;; for; it cannot build one this platform was never told
                     ;; the name of.
                     (println (str "warning: " msg
-                                  (when (seq (native-declared spec plat))
-                                    " (a task may build it)"))))))))))))))
+                                  (when buildable? " (a task may build it)"))))))))))))))
 
 ;; Install the :jolt/provides declarations a resolved project collected (RFC 0014).
 ;; An entry is [install-ns lib class ...]; lib is nil for the project's own.
