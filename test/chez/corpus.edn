@@ -4800,7 +4800,14 @@
   ;; mapcat/dedupe stay lazier than the JVM at construction: jolt's (apply concat …)
   ;; and sequence transformer don't force the first chunk just to build the seq
   ;; (the JVM forces 5 here). Allowlisted in known-divergences.edn (jolt-mm6v).
-  {:suite "chunking-model / unchunked realization granularity" :label "mapcat is fully lazy at construction" :expected "0" :actual "(let [a (atom 0)] (mapcat (fn [x] (swap! a inc) [x]) (range 5)) @a)" :portability :common}
+  {:suite "seq / eager argument checks" :label "mapcat realizes four of an unchunked source" :expected "4" :actual "(let [n (atom 0)] (mapcat (fn [x] (swap! n inc) [x]) (list 1 2 3 4 5 6 7 8 9 10)) @n)" :portability :common}
+  {:suite "seq / eager argument checks" :label "mapcat realizes a short source whole" :expected "2" :actual "(let [n (atom 0)] (mapcat (fn [x] (swap! n inc) [x]) (list 1 2)) @n)" :portability :common}
+  {:suite "seq / eager argument checks" :label "mapcat over a non-seqable throws at the call" :expected ":iae" :actual "(try (mapcat identity 5) :no-throw (catch IllegalArgumentException _ :iae))" :portability :common}
+  {:suite "seq / eager argument checks" :label "mapcat of a non-fn throws at the call" :expected ":cce" :actual "(try (mapcat 42 [1 2]) :no-throw (catch ClassCastException _ :cce))" :portability :common}
+  {:suite "seq / eager argument checks" :label "repeat with a nil count throws at the call" :expected ":npe" :actual "(try (repeat nil :a) :no-throw (catch NullPointerException _ :npe))" :portability :common}
+  {:suite "seq / eager argument checks" :label "repeat with a non-number count throws at the call" :expected ":cce" :actual "(try (repeat \"a\" :a) :no-throw (catch ClassCastException _ :cce))" :portability :common}
+  {:suite "seq / eager argument checks" :label "repeat truncates a fractional count" :expected "[:a :a :a]" :actual "(vec (repeat 3.99 :a))" :portability :common}
+  {:suite "chunking-model / unchunked realization granularity" :label "mapcat is fully lazy at construction" :expected "5" :actual "(let [a (atom 0)] (mapcat (fn [x] (swap! a inc) [x]) (range 5)) @a)" :portability :common}
   {:suite "chunking-model / unchunked realization granularity" :label "dedupe is fully lazy at construction" :expected "0" :actual "(let [a (atom 0)] (dedupe (map (fn [x] (swap! a inc) x) (range 5))) @a)" :portability :common}
   ;; --- integer-box-model: narrow int values behave as integers (certified) ---
   ;; jolt unifies every integer as one exact-integer type, so (byte/short/int n)

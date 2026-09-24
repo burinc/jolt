@@ -110,15 +110,26 @@
 (define (jolt-mapcat f . colls)
   (if (null? colls)
       (td-mapcat f)
-      ;; lazily concat the per-element results — no seq->list, so mapcat over an
-      ;; infinite source stays lazy; the outer lazy-seq node defers the first
-      ;; element so a side-effecting f does not fire at construction (LazySeq).
-      (jolt-make-lazy-src lz-mapcat f colls)))
+      ;; clojure.core/mapcat is (apply concat (apply map f colls)), and that apply
+      ;; realizes the mapped seq four elements in (a chunked source, its first
+      ;; chunk) before concat returns — so a bad f or a non-seqable coll throws at
+      ;; the call. The rest is concatenated lazily, so an infinite source stays
+      ;; lazy; each element's f result is computed once, in the mapped seq.
+      (let ((m (apply jolt-map f colls)))
+        (let loop ((s (jolt-seq m)) (i 1))
+          (when (and (not (jolt-nil? s)) (fx<? i 4))
+            (loop (jolt-next s) (fx+ i 1))))
+        (jolt-make-lazy-src lz-mapcat-seq m jolt-nil))))
 
 ;; take-while / drop-while: 1-arg -> transducer; 2-arg -> a seq over the coll.
 (define lz-mapcat
   (register-lazy-src! 'mapcat
     (lambda (f colls) (jolt-seq (lazy-concat-seq (apply jolt-map f colls))))))
+;; the source jolt-mapcat builds now: the already-mapped seq. 'mapcat stays
+;; registered so an image dumped with one still restores.
+(define lz-mapcat-seq
+  (register-lazy-src! 'mapcat-seq
+    (lambda (m _) (jolt-seq (lazy-concat-seq m)))))
 (define lz-take-while-top
   (register-lazy-src! 'take-while-top
     (lambda (pred coll) (jolt-seq (take-while-seq pred (jolt-seq coll))))))
