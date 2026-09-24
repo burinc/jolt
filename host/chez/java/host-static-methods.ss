@@ -23,7 +23,8 @@
 (define (math-checked entry)
   (let ((f (cdr entry)))
     (if (procedure? f)
-        (cons (car entry) (lambda args (apply f (map jolt-need-num args))))
+        (cons (car entry)
+              (host-arity-like f (lambda args (apply f (map jolt-need-num args)))))
         entry)))
 (register-class-statics! "Math"
   (map math-checked
@@ -682,7 +683,55 @@
         ;; Character.codePointOf(name) is deliberately absent: it is a lookup in the
         ;; Unicode character-name database, which this host does not carry, and a
         ;; partial ASCII-only table would answer wrongly rather than not at all.
+        ;; So are getNumericValue (the numeric value of a Roman numeral or a vulgar
+        ;; fraction is a table Chez does not expose) and reverseBytes (it can answer
+        ;; a surrogate, which is no char here).
+        ;;
+        ;; The case maps are the simple (one-to-one) Unicode mappings, which is
+        ;; what char-upcase and its kin answer and what the JVM's char overloads
+        ;; are defined by: \ß upper-cases to itself, not to "SS". The int
+        ;; overload answers an int, and a value that is no scalar is unchanged.
+        (cons "toUpperCase" (lambda (c) (char-case-map c char-upcase)))
+        (cons "toLowerCase" (lambda (c) (char-case-map c char-downcase)))
+        (cons "toTitleCase" (lambda (c) (char-case-map c char-titlecase)))
+        (cons "isTitleCase" (lambda (c) (char-category-in? c '(Lt))))
+        (cons "isDefined" (lambda (c) (let ((ch (scalar-char c))) (and ch (not (eq? (char-general-category ch) 'Cn))))))
+        (cons "isAlphabetic" (lambda (c) (let ((ch (scalar-char c))) (and ch (char-alphabetic? ch)))))
+        (cons "isSpaceChar" (lambda (c) (char-category-in? c '(Zs Zl Zp))))
+        (cons "isISOControl" (lambda (c) (let ((cp (char->cp c)))
+                                           (or (and (>= cp 0) (<= cp #x1F)) (and (>= cp #x7F) (<= cp #x9F))))))
+        ;; the identifier rules the JVM's javadoc states: a start is a letter, a
+        ;; letter number, a currency symbol or a connector; a part adds digits, the
+        ;; two combining marks and the ignorable controls and formats
+        (cons "isJavaIdentifierStart" (lambda (c) (char-category-in? c '(Lu Ll Lt Lm Lo Nl Sc Pc))))
+        (cons "isJavaIdentifierPart"
+              (lambda (c) (or (char-category-in? c '(Lu Ll Lt Lm Lo Nl Sc Pc Nd Mn Mc Cf))
+                              (let ((cp (char->cp c)))
+                                (or (and (>= cp 0) (<= cp 8)) (and (>= cp #xE) (<= cp #x1B))
+                                    (and (>= cp #x7F) (<= cp #x9F)))))))
+        (cons "isSurrogate" (lambda (c) (jolt-need-char c) #f))   ; no char here is one
+        (cons "compare" (lambda (a b) (->num (- (char->integer (jolt-need-char a)) (char->integer (jolt-need-char b))))))
+        (cons "hashCode" (lambda (c) (->num (char->integer (jolt-need-char c)))))
+        (cons "toString"
+              (lambda (c)
+                (if (char? c)
+                    (string c)
+                    (let ((ch (scalar-char c)))
+                      (if ch
+                          (string ch)
+                          (throw-jvm 'IllegalArgumentException
+                            (string-append "Not a valid Unicode code point: 0x"
+                                           (string-upcase (number->string (jnum->exact c) 16)))))))))
         ))
+
+;; A char argument of an overload that takes only a char.
+(define (jolt-need-char x) (if (char? x) x (jolt-cast-throw x "java.lang.Character")))
+;; A Character case map over a char or an int codepoint (see toUpperCase above).
+(define (char-case-map x f)
+  (if (char? x)
+      (f x)
+      (let ((ch (scalar-char x)))
+        (->num (if ch (char->integer (f ch)) (jnum->exact x))))))
 
 ;; String/valueOf(Object): "null" for nil, else jolt's str semantics.
 ;; String/format(fmt args…) / (locale fmt args…) -> the clojure.core format engine.

@@ -206,11 +206,12 @@
 ;; A method NAME of zip streams that takes one of ARITIES arguments; F gets the
 ;; stream, its zin record and the arguments.
 (define (zin-method name arities prior f)
-  (lambda (self . args)
-    (let ((z (zin-of self)))
-      (cond ((not z) (apply prior self args))
-            ((memv (length args) arities) (apply f self z args))
-            (else (no-method-throw name self (length args)))))))
+  (host-arity-over prior arities
+    (lambda (self . args)
+      (let ((z (zin-of self)))
+        (cond ((not z) (apply prior self args))
+              ((memv (length args) arities) (apply f self z args))
+              (else (no-method-throw name self (length args))))))))
 
 ;; A byte[] argument of a call that took its overload: nil passes.
 (define (zin-bytes-arg b)

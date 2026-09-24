@@ -338,11 +338,12 @@
 
 ;; --- the methods only ZipOutputStream has ------------------------------------
 (define (zipout-method-of name arities f)
-  (lambda (self . args)
-    (let ((z (zout-of self)))
-      (if (and z (zipout? (zout-extra z)) (memv (length args) arities))
-          (apply f self z args)
-          (no-method-throw name self (length args))))))
+  (host-arity-of arities #t
+    (lambda (self . args)
+      (let ((z (zout-of self)))
+        (if (and z (zipout? (zout-extra z)) (memv (length args) arities))
+            (apply f self z args)
+            (no-method-throw name self (length args)))))))
 
 (register-host-methods! "out-stream"
   (list

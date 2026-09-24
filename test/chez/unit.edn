@@ -1310,12 +1310,38 @@
   {:suite "str" :expr "[(String/copyValueOf (char-array \"hi\")) (String/copyValueOf (char-array \"abc\") 1 2) (String/valueOf (char-array \"abc\") 1 2)]" :expected "[\"hi\" \"bc\" \"bc\"]"}
   ;; A STATIC resolves by arity too. These are unit rows rather than corpus rows
   ;; because the JVM compiler rejects the call outright — there is no value for the
-  ;; oracle to source, only a compile error — but the runtime report is the JVM's,
-  ;; which for a static names no class.
-  {:suite "str" :expr "(try (String/valueOf (char-array \"abc\") 0) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method valueOf found taking 2 args\""}
+  ;; oracle to source, only a compile error — but the report is the compiler's,
+  ;; which names the class (Clojure 1.12.0: "No matching method valueOf found
+  ;; taking 2 args for class java.lang.String").
+  {:suite "str" :expr "(try (String/valueOf (char-array \"abc\") 0) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method valueOf found taking 2 args for class java.lang.String\""}
   {:suite "str" :expr "(try (String/valueOf 5 1 2) (catch ClassCastException e (.getMessage e)))" :expected "\"class java.lang.Long cannot be cast to class [C\""}
-  {:suite "javastatic" :expr "(try (System/getenv \"HOME\" 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method getenv found taking 2 args\""}
+  {:suite "javastatic" :expr "(try (System/getenv \"HOME\" 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method getenv found taking 2 args for class java.lang.System\""}
   {:suite "javastatic" :expr "(map? (System/getenv))" :expected "true"}
+  ;; A member that picks its overload out of a rest list states the JVM's
+  ;; arities (host-static.ss arity rows), so an extra argument is a miss, not a
+  ;; dropped value: each of these used to answer as if the last argument were
+  ;; not there (jolt#1020).
+  {:suite "javastatic" :expr "(mapv (fn [f] (try (f) (catch IllegalArgumentException e (.getMessage e)))) [#(Integer/parseInt \"1\" 10 3) #(Long/valueOf \"1\" 10 3) #(Long/toString 5 10 3) #(System/getProperty \"x\" \"d\" 1) #(Thread/sleep 1 0 1)])" :expected "[\"No matching method parseInt found taking 3 args for class java.lang.Integer\" \"No matching method valueOf found taking 3 args for class java.lang.Long\" \"No matching method toString found taking 3 args for class java.lang.Long\" \"No matching method getProperty found taking 3 args for class java.lang.System\" \"No matching method sleep found taking 3 args for class java.lang.Thread\"]"}
+  {:suite "javastatic" :expr "[(Integer/parseInt \"ff\" 16) (Long/toString 255 16) (System/getProperty \"jolt.no.such.prop\" \"d\")]" :expected "[255 \"ff\" \"d\"]"}
+  ;; java.lang.Math's entries coerce their operands through one wrapper, which
+  ;; used to hide their arity: an extra argument reached Chez's own arity error,
+  ;; naming an anonymous procedure. A proven-double operand takes the flonum
+  ;; lowering, which checks the JVM arity too.
+  {:suite "javastatic" :expr "(mapv (fn [f] (try (f) (catch IllegalArgumentException e (.getMessage e)))) [#(Math/abs 1 2) #(Math/max 1 2 3) #(Math/floor 4.5 1) #(Math/pow 2.0 3.0 4.0)])" :expected "[\"No matching method abs found taking 2 args for class java.lang.Math\" \"No matching method max found taking 3 args for class java.lang.Math\" \"No matching method floor found taking 2 args for class java.lang.Math\" \"No matching method pow found taking 3 args for class java.lang.Math\"]"}
+  ;; a java.lang.Class method is not a static of the class it describes: the dot
+  ;; form calls it on the class value, the static form is a miss
+  {:suite "javastatic" :expr "[(.getName Math) (try (Math/getName) (catch IllegalArgumentException e :miss))]" :expected "[\"java.lang.Math\" :miss]"}
+  ;; BigInteger.toString(radix), the overload jolt's single integer type takes:
+  ;; a radix outside 2..36 renders in base 10, as BigInteger does
+  {:suite "javastatic" :expr "[(.toString (biginteger 255) 16) (.toString (biginteger 255) 1) (.toString (biginteger 255) 37) (try (.toString 5.0 16) (catch IllegalArgumentException e :miss))]" :expected "[\"ff\" \"255\" \"255\" :miss]"}
+  ;; java.lang.Character's case maps and classification, char and int overloads
+  {:suite "javastatic" :expr "[(Character/toUpperCase \\a) (Character/toUpperCase 97) (Character/toUpperCase \\ß) (Character/toLowerCase (char 0x130)) (Character/toTitleCase (char 0x1C6)) (Character/toString 128512) (Character/isAlphabetic 97) (Character/isSpaceChar \\space) (Character/isISOControl (char 7)) (Character/compare \\a \\b) (Character/hashCode \\a) (Character/isJavaIdentifierStart \\$) (Character/isJavaIdentifierPart \\1) (Character/isJavaIdentifierStart \\1)]" :expected "[\\A 65 \\ß \\i \\ǅ \"😀\" true true true -1 97 true true false]"}
+  {:suite "javastatic" :expr "(try (Character/toString -1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"Not a valid Unicode code point: 0x-1\""}
+  ;; java.util.Objects
+  {:suite "javastatic" :expr "[(java.util.Objects/equals 1 1) (java.util.Objects/equals (int-array [1]) (int-array [1])) (java.util.Objects/deepEquals (int-array [1]) (int-array [1])) (java.util.Objects/hash (to-array [\"a\" nil 3])) (java.util.Objects/hashCode nil) (java.util.Objects/toString nil) (java.util.Objects/toString nil \"d\") (java.util.Objects/isNull nil) (java.util.Objects/nonNull nil) (java.util.Objects/requireNonNullElse nil 2) (java.util.Objects/compare 1 2 compare) (java.util.Objects/checkIndex 1 3)]" :expected "[true false true 123011 0 \"null\" \"d\" true false 2 -1 1]"}
+  {:suite "javastatic" :expr "(mapv (fn [f] (try (f) (catch Exception e [(.getSimpleName (class e)) (.getMessage e)]))) [#(java.util.Objects/requireNonNull nil) #(java.util.Objects/requireNonNull nil \"boom\") #(java.util.Objects/requireNonNullElse nil nil) #(java.util.Objects/checkIndex 5 3)])" :expected "[[\"NullPointerException\" nil] [\"NullPointerException\" \"boom\"] [\"NullPointerException\" \"defaultObj\"] [\"IndexOutOfBoundsException\" \"Index 5 out of bounds for length 3\"]]"}
+  ;; Arrays/asList is a fixed-size view of its array
+  {:suite "javastatic" :expr "(let [a (to-array [1 2 3]) l (java.util.Arrays/asList a)] (.set l 0 9) (aset a 2 7) [(vec l) (vec a) (.size l) (.getName (class l)) (count l) (try (.add l 4) (catch UnsupportedOperationException e :unsupported))])" :expected "[[9 2 7] [9 2 7] 3 \"java.util.Arrays$ArrayList\" 3 :unsupported]"}
   ;; the java.lang.Number surface resolves by arity as well; jolt has one integer
   ;; type, so the class it names is Long where the JVM names Integer
   {:suite "javastatic" :expr "(try (.intValue (int 5) 1) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching method intValue found taking 1 args for class java.lang.Long\""}
@@ -2068,7 +2094,7 @@
   {:suite "javastatic" :expr "(Math/getExponent 2.0)" :expected "1"}
   {:suite "javastatic" :expr "(Math/getExponent 0.0)" :expected "-1023"}
   ;; Stage D — executor awaitTermination blocks until workers drain
-  {:suite "concurrency" :expr "(do (require '[clojure.core.async :refer [<!!]]) (let [e (java.util.concurrent.Executors/newSingleThreadExecutor) c (java.util.concurrent.CountDownLatch. 1)] (.execute e (fn [] (.countDown c))) (.shutdown e) (.await c) (.awaitTermination e 5000) (.isTerminated e)))" :expected "true"}
+  {:suite "concurrency" :expr "(do (require '[clojure.core.async :refer [<!!]]) (let [e (java.util.concurrent.Executors/newSingleThreadExecutor) c (java.util.concurrent.CountDownLatch. 1)] (.execute e (fn [] (.countDown c))) (.shutdown e) (.await c) (.awaitTermination e 5000 java.util.concurrent.TimeUnit/MILLISECONDS) (.isTerminated e)))" :expected "true"}
   ;; Stage D — ReentrantLock reentrant lock/unlock + hold count
   {:suite "concurrency" :expr "(let [l (java.util.concurrent.locks.ReentrantLock.)] (.lock l) (.lock l) (let [locked (.isLocked l) held (.isHeldByCurrentThread l)] (.unlock l) (.unlock l) [locked held (.isLocked l)]))" :expected "[true true false]"}
   ;; Stage D — ReentrantLock tryLock

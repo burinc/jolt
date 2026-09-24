@@ -123,7 +123,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
-  narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety values wp ci
@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost adaptercheck hostprops normalizecheck hostregistry foreignhandles dispatchalloc regexmatcher winpath winplatform statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
@@ -1154,6 +1154,14 @@ normalizecheck:
 # member once. Also re-checks every derivation the runtime itself registers.
 hostregistry:
 	@$(CHEZ) --script test/chez/host-registry-test.ss
+
+# Every host member answers the JVM's arities: a member that takes any count is
+# a JVM varargs member with a `varargs` row in host-static.ss, every arity row
+# names a registered member, and a fixed row narrowed its member. An open member
+# passes the invocation layer's arity check for every call, so an extra argument
+# was silently dropped (jolt#1020).
+hostarity:
+	@$(CHEZ) --script test/chez/host-arity-test.ss
 
 # The process's own symbol handle is loaded once per process: Chez walks every
 # loaded handle with dlsym before its static "(cs)" table, so the 57 boot-time
