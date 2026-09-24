@@ -445,7 +445,8 @@ jobs:
           # fs/absolute? false, getParent off the drive letter. java.io.tmpdir
           # read only TMPDIR, which Windows does not set, and listRoots answered
           # "/" instead of the drives. TMPDIR is cleared here so the property
-          # has to find TEMP the way a plain Windows process does.
+          # has to find TEMP the way a plain Windows process does. Paths render
+          # with "\" as on the JVM, roots included.
           Remove-Item Env:\TMPDIR -ErrorAction SilentlyContinue
           $env:WINROOT_DIR = $env:SystemDrive
           $probe = '(do (require (quote [babashka.fs :as fs]))' +
@@ -457,13 +458,15 @@ jobs:
                    '                      (str (.getRoot p))' +
                    '                      (.startsWith (.toLowerCase tmp) (.toLowerCase d))' +
                    '                      (.isDirectory (java.io.File. tmp))' +
-                   '                      (boolean (some (fn [r] (= (str r) (str d (char 47))))' +
+                   '                      (boolean (some (fn [r] (= (str r) (str d (char 92))))' +
                    '                                     (java.io.File/listRoots)))]))))'
           $out = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
           Write-Host $out
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $drive = $env:SystemDrive
-          $want = '[true "' + $drive + '/Windows" "' + $drive + '/" true true true]'
+          # pr-str doubles each backslash, and a single-quoted PowerShell string
+          # keeps both: this is C:\Windows as the JVM prints it
+          $want = '[true "' + $drive + '\\Windows" "' + $drive + '\\" true true true]'
           if ($out -ne $want) {
             throw "the Path root / tmpdir / listRoots answers were not Windows-shaped: $out (want $want)"
           }
