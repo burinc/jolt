@@ -3,9 +3,9 @@
 ;; standings in manifest.edn.
 ;;
 ;; The library checkouts are NOT vendored — they are ordinary upstream clones
-;; under $JOLT_CONFORMANCE_LIBS (default ../conformance-libraries). This gate is
-;; therefore opt-in (`make libconformance`) and skips cleanly when the checkout
-;; is absent. What lives in this repo is the recipe (which paths, which deps,
+;; under $JOLT_CONFORMANCE_LIBS (default: conformance-libraries beside the main
+;; jolt checkout, also from a worktree). This gate is therefore opt-in
+;; (`make libconformance`) and fails when the checkout is absent. What lives in this repo is the recipe (which paths, which deps,
 ;; which namespaces) and the expected tally, so a jolt change that regresses a
 ;; library is caught here instead of being noticed months later.
 ;;
@@ -22,14 +22,25 @@
 
 (def ^:private here (str repo-root "/test/conformance/libs"))
 
+;; The library checkouts sit beside the MAIN jolt checkout. A git worktree has its
+;; own root (.claude/worktrees/<x>), whose parent holds none of them, so ask git
+;; for the common dir: it names the main checkout's .git from either kind.
+(def ^:private checkout-parent
+  (let [r (try (p/sh {:out :string :err :string :dir repo-root}
+                     "git" "rev-parse" "--path-format=absolute" "--git-common-dir")
+               (catch Exception _ nil))
+        common (some-> r :out str/trim)]
+    (if (and r (zero? (:exit r)) (seq common))
+      (.getParent (.getParentFile (java.io.File. common)))
+      (.getParent (java.io.File. repo-root)))))
+
 (def ^:private libs-root
   (or (System/getenv "JOLT_CONFORMANCE_LIBS")
-      (str (.getParent (java.io.File. repo-root)) "/conformance-libraries")))
+      (str checkout-parent "/conformance-libraries")))
 
 (def ^:private siblings-root
   ;; first-party jolt libraries (xml, time, db, ...) sit beside the jolt checkout
-  (or (System/getenv "JOLT_SIBLING_LIBS")
-      (.getParent (java.io.File. repo-root))))
+  (or (System/getenv "JOLT_SIBLING_LIBS") checkout-parent))
 
 ;; Absolute: each child runs with :dir set to the library's own root, so a
 ;; relative JOLT_BIN (what the Makefile passes) would not resolve there.
@@ -206,10 +217,12 @@
        (when (and load-fail (pos? load-fail)) (str " load-fail=" load-fail))))
 
 (defn -main [& args]
+  ;; A missing checkout fails: exiting 0 here reported a gate that ran nothing
+  ;; as green.
   (when-not (exists? libs-root)
-    (println (str "SKIP: no library checkout at " libs-root
+    (println (str "FAIL: no library checkout at " libs-root
                   " (set JOLT_CONFORMANCE_LIBS)"))
-    (System/exit 0))
+    (System/exit 1))
   (let [manifest (edn/read-string (slurp (str here "/manifest.edn")))
         wanted (set args)
         entries (cond->> (:libs manifest)
