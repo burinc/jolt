@@ -794,16 +794,42 @@
       (run-child '("jolt-no-such-program-anywhere"))
       #f))
 
-;; FILETIME <-> epoch ms (java/io.ss). 116444736000000000 is 1970-01-01 in 100ns
-;; ticks since 1601; the three times GetFileAttributesEx reads come back through
-;; filetime->unix-ms, and every set goes out through unix-ms->filetime.
+;; FILETIME <-> epoch ns (java/io.ss). 116444736000000000 is 1970-01-01 in 100ns
+;; ticks since 1601; the three times GetFileAttributesEx / GetFileTime read come
+;; back through filetime->unix-ns, and every set goes out through
+;; unix-ns->filetime, so a FileTime keeps the FILETIME's 100ns resolution.
 (ok "the Unix epoch is FILETIME 116444736000000000"
-    (= 116444736000000000 (unix-ms->filetime 0)))
-(ok "filetime->unix-ms inverts unix-ms->filetime"
-    (andmap (lambda (ms) (= ms (filetime->unix-ms (unix-ms->filetime ms))))
-            '(0 1 1100000000250 1600000000000 -1 -11644473600000)))
-(ok "a sub-millisecond FILETIME truncates to its millisecond"
-    (= 1 (filetime->unix-ms (+ (unix-ms->filetime 1) 9999))))
+    (= 116444736000000000 (unix-ns->filetime 0)))
+(ok "filetime->unix-ns inverts unix-ns->filetime at 100ns"
+    (andmap (lambda (ns) (= ns (filetime->unix-ns (unix-ns->filetime ns))))
+            '(0 100 1100000000250000000 1600000000123456700 -100 -11644473600000000000)))
+(ok "a FILETIME tick is 100ns, so the last two digits of a nanosecond count go"
+    (= 1600000000123456700 (filetime->unix-ns (unix-ns->filetime 1600000000123456789))))
+
+;; Following a symbolic link for a time. CreateFileW follows a link unless
+;; FILE_FLAG_OPEN_REPARSE_POINT is passed, and GetFileAttributesExW never does —
+;; so NOFOLLOW needs the flag on a set, and FOLLOW needs a handle on a read of a
+;; reparse point. Both were the other way round.
+(ok "a FOLLOW open does not ask for the reparse point"
+    (= 0 (bitwise-and (win32-attr-open-flags #t) win32-FILE-FLAG-OPEN-REPARSE-POINT)))
+(ok "a NOFOLLOW open asks for the reparse point, and can still open a directory"
+    (= (win32-attr-open-flags #f)
+       (bitwise-ior win32-FILE-FLAG-OPEN-REPARSE-POINT win32-FILE-FLAG-BACKUP-SEMANTICS)))
+(ok "a FOLLOW read of a reparse point goes through a handle"
+    (win32-times-need-handle? (bitwise-ior #x20 win32-FILE-ATTRIBUTE-REPARSE-POINT) #t))
+(ok "a NOFOLLOW read of one, and any read of a plain file, does not"
+    (and (not (win32-times-need-handle? win32-FILE-ATTRIBUTE-REPARSE-POINT #f))
+         (not (win32-times-need-handle? #x20 #t))))
+
+;; A FileSystemException's message renders its PATHS natively and leaves the
+;; reason alone: strerror's "Input/output error" is not a path.
+(same "windows fs message flips only the paths"
+      (fs-exception-message-for #t "C:/a/b" "C:/c" "Input/output error")
+      "C:\\a\\b -> C:\\c: Input/output error")
+(same "posix fs message"
+      (fs-exception-message-for #f "a/b" #f "Input/output error")
+      "a/b: Input/output error")
+(same "a bare path" (fs-exception-message-for #t "a/b" #f #f) "a\\b")
 
 (if (> fails 0)
     (begin (printf "WIN-PLATFORM FAILURES: ~a of ~a\n" fails total) (exit 1))

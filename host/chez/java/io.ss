@@ -78,6 +78,16 @@
       (list->string (map (lambda (c) (if (char=? c #\/) #\\ c)) (string->list p)))
       p))
 (define (path-native p) (path-native-for (eq? (sa-os-family) 'windows) p))
+;; A java.nio.file FileSystemException's message: "file", "file -> other", and
+;; ": reason" after either, as FileSystemException.getMessage builds it. Only the
+;; paths are rendered natively; the reason is strerror's text, and flipping the
+;; whole string would turn "Input/output error" into "Input\output error".
+(define (fs-exception-message-for windows? file other reason)
+  (string-append (path-native-for windows? file)
+                 (if other (string-append " -> " (path-native-for windows? other)) "")
+                 (if reason (string-append ": " reason) "")))
+(define (fs-exception-message file other reason)
+  (fs-exception-message-for (eq? (sa-os-family) 'windows) file other reason))
 
 (define (jolt-path-normalize-for windows? p0)
   (define (trailing-sep-droppable? p n) (trailing-sep-droppable-for? windows? p n))
@@ -906,15 +916,34 @@
 ;; A FILETIME: 100-nanosecond intervals since 1601-01-01 UTC, which is
 ;; 11644473600 seconds before the Unix epoch. Pure, so the conversion is pinned
 ;; from any host (test/chez/win-platform-test.ss).
-(define win32-epoch-offset-ms 11644473600000)
-(define (unix-ms->filetime ms) (* (+ ms win32-epoch-offset-ms) 10000))
-(define (filetime->unix-ms ft) (- (div ft 10000) win32-epoch-offset-ms))
+;; Converted at the FILETIME's own resolution, which is what a FileTime carries:
+;; a nanosecond count loses only its last two digits on the way out.
+(define win32-epoch-offset-ticks 116444736000000000)
+(define (unix-ns->filetime ns) (+ (div ns 100) win32-epoch-offset-ticks))
+(define (filetime->unix-ns ft) (* (- ft win32-epoch-offset-ticks) 100))
 
+(define win32-FILE-READ-ATTRIBUTES       #x80)
 (define win32-FILE-WRITE-ATTRIBUTES      #x100)
 (define win32-FILE-SHARE-ALL             #x7)          ; read | write | delete
 (define win32-OPEN-EXISTING              3)
 (define win32-FILE-FLAG-BACKUP-SEMANTICS #x02000000)   ; what opens a directory
+(define win32-FILE-FLAG-OPEN-REPARSE-POINT #x00200000) ; the link itself, not its target
+(define win32-FILE-ATTRIBUTE-REPARSE-POINT #x400)
 (define win32-INVALID-HANDLE-VALUE       -1)
+
+;; CreateFileW follows a symbolic link unless told not to, so the handle a time
+;; is read or set through names the link's TARGET by default. NOFOLLOW_LINKS asks
+;; for the link itself: FILE_FLAG_OPEN_REPARSE_POINT, as the JDK's
+;; WindowsPath.openFor*AttributeAccess(followLinks=false) passes.
+(define (win32-attr-open-flags follow?)
+  (if follow?
+      win32-FILE-FLAG-BACKUP-SEMANTICS
+      (bitwise-ior win32-FILE-FLAG-BACKUP-SEMANTICS win32-FILE-FLAG-OPEN-REPARSE-POINT)))
+;; GetFileAttributesExW never follows a reparse point: on a link it answers the
+;; link's own times. That is the NOFOLLOW answer, and for any path that is not a
+;; reparse point the only answer; a FOLLOW read of a link has to open it.
+(define (win32-times-need-handle? attrs follow?)
+  (and follow? (not (= 0 (bitwise-and attrs win32-FILE-ATTRIBUTE-REPARSE-POINT)))))
 
 (define-win32-proc win32-create-file-w
   "kernel32.dll" "CreateFileW" (void* unsigned-32 unsigned-32 void* unsigned-32 unsigned-32 void*) iptr)
@@ -922,30 +951,37 @@
   "kernel32.dll" "SetFileTime" (iptr u8* u8* u8*) int)
 (define-win32-proc win32-close-handle
   "kernel32.dll" "CloseHandle" (iptr) int)
+(define-win32-proc win32-get-file-time
+  "kernel32.dll" "GetFileTime" (iptr u8* u8* u8*) int)
+
+;; Open PATH for ACCESS with the link-following flags, run PROC on the handle and
+;; close it. #f when the open fails or this is not Windows.
+(define (win32-with-attr-handle path access follow? proc)
+  (let ((create (win32-create-file-w)) (close (win32-close-handle)))
+    (and create close
+         (let ((h (win32-with-wstr path
+                    (lambda (w)
+                      (create w access win32-FILE-SHARE-ALL 0
+                              win32-OPEN-EXISTING (win32-attr-open-flags follow?) 0)))))
+           (and (not (= h win32-INVALID-HANDLE-VALUE))
+                (dynamic-wind (lambda () #f) (lambda () (proc h)) (lambda () (close h))))))))
 
 ;; Files.setLastModifiedTime / setAttribute on Windows, as WindowsFileAttributeViews
 ;; does it: open the path for FILE_WRITE_ATTRIBUTES — with
 ;; FILE_FLAG_BACKUP_SEMANTICS, the flag that lets CreateFile open a directory at
-;; all — and set just the times given. Each of CREATION, ACCESS and WRITE is epoch
-;; ms or #f, and a #f slot passes NULL, which SetFileTime leaves alone. Answers
-;; whether they were set; #f off Windows.
-(define (win32-set-file-times! path creation access write)
-  (let ((create (win32-create-file-w)) (set-time (win32-set-file-time))
-        (close (win32-close-handle)))
-    (define (ft ms)
-      (and ms (let ((b (make-bytevector 8 0)))
-                (bytevector-u64-set! b 0 (unix-ms->filetime ms) (endianness little))
+;; all, and FILE_FLAG_OPEN_REPARSE_POINT when not following a link — and set just
+;; the times given. Each of CREATION, ACCESS and WRITE is epoch NANOSECONDS or #f,
+;; and a #f slot passes NULL, which SetFileTime leaves alone. Answers whether they
+;; were set; #f off Windows.
+(define (win32-set-file-times! path creation access write follow?)
+  (let ((set-time (win32-set-file-time)))
+    (define (ft ns)
+      (and ns (let ((b (make-bytevector 8 0)))
+                (bytevector-u64-set! b 0 (unix-ns->filetime ns) (endianness little))
                 b)))
-    (and create set-time close
-         (let ((h (win32-with-wstr path
-                    (lambda (w)
-                      (create w win32-FILE-WRITE-ATTRIBUTES win32-FILE-SHARE-ALL 0
-                              win32-OPEN-EXISTING win32-FILE-FLAG-BACKUP-SEMANTICS 0)))))
-           (and (not (= h win32-INVALID-HANDLE-VALUE))
-                (let ((ok (not (= 0 (set-time h (ft creation) (ft access) (ft write))))))
-                  (close h)
-                  ok))))))
-(define (win32-set-file-mtime-millis! path ms) (win32-set-file-times! path #f #f ms))
+    (and set-time
+         (win32-with-attr-handle path win32-FILE-WRITE-ATTRIBUTES follow?
+           (lambda (h) (not (= 0 (set-time h (ft creation) (ft access) (ft write)))))))))
 
 ;; Files.createLink on Windows: CreateHardLinkW(new, existing, NULL). Answers
 ;; whether the link was made; #f off Windows.
@@ -958,22 +994,36 @@
            (lambda (l) (win32-with-wstr existing
                          (lambda (e) (not (= 0 (f l e 0))))))))))
 
-;; The three times of PATH as a vector #(creation access write) of epoch ms, or
-;; #f. WIN32_FILE_ATTRIBUTE_DATA is the attribute word and then three FILETIMEs,
-;; each two DWORDs — at 4, 12 and 20, so not 8-aligned, and read as two halves.
+;; The three times of PATH as a vector #(creation access write) of epoch
+;; NANOSECONDS (100ns resolution), or #f. WIN32_FILE_ATTRIBUTE_DATA is the
+;; attribute word and then three FILETIMEs, each two DWORDs — at 4, 12 and 20, so
+;; not 8-aligned, and read as two halves. FOLLOW? on a reparse point reads the
+;; target's through a handle (GetFileTime), since the attribute data describes
+;; the link itself.
 (define-win32-proc win32-get-file-attributes-ex-w
   "kernel32.dll" "GetFileAttributesExW" (void* int u8*) int)
-(define (win32-file-times path)
+(define (win32-filetime-at buf off)
+  (filetime->unix-ns
+   (+ (bytevector-u32-ref buf off (endianness little))
+      (* (bytevector-u32-ref buf (+ off 4) (endianness little)) #x100000000))))
+(define (win32-file-times path follow?)
   (let ((f (win32-get-file-attributes-ex-w)))
     (and f
          (let ((buf (make-bytevector 36 0)))
-           (define (at off)
-             (filetime->unix-ms
-              (+ (bytevector-u32-ref buf off (endianness little))
-                 (* (bytevector-u32-ref buf (+ off 4) (endianness little)) #x100000000))))
            (and (win32-with-wstr path
                   (lambda (w) (guard (e (#t #f)) (not (= 0 (f w 0 buf))))))  ; GetFileExInfoStandard
-                (vector (at 4) (at 12) (at 20)))))))
+                (if (win32-times-need-handle? (bytevector-u32-ref buf 0 (endianness little)) follow?)
+                    (let ((get-time (win32-get-file-time)))
+                      (and get-time
+                           (win32-with-attr-handle path win32-FILE-READ-ATTRIBUTES #t
+                             (lambda (h)
+                               (let ((c (make-bytevector 8 0)) (a (make-bytevector 8 0))
+                                     (m (make-bytevector 8 0)))
+                                 (and (not (= 0 (get-time h c a m)))
+                                      (vector (win32-filetime-at c 0) (win32-filetime-at a 0)
+                                              (win32-filetime-at m 0))))))))
+                    (vector (win32-filetime-at buf 4) (win32-filetime-at buf 12)
+                            (win32-filetime-at buf 20))))))))
 
 ;; The ROOT of P — the prefix that is not a segment and must be reproduced
 ;; verbatim — and the index the segments start at. Rendered with "/" separators,
@@ -1190,28 +1240,56 @@
       (= (c-access p mode) 0)
       ;; no access(2) to ask (or X_OK on Windows): the old answer, existence.
       (if (file-exists? p) #t #f)))
-;; set atime+mtime from epoch milliseconds via utimes(2). struct timeval is
-;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets; usec fits
-;; its field (< 1e6) so a signed 64-bit native-endian write covers the layout.
-;; Resolved via jolt-foreign-proc-safe — a literal foreign-procedure here is a
+;; utimes(2) is the fallback for a host without utimensat: struct timeval is
+;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets. Resolved via jolt-foreign-proc-safe — a literal foreign-procedure here is a
 ;; fasl relocation that aborts the boot on platforms lacking the symbol.
 ;; Windows has no utimes, and its CRT's _utime64 is no substitute: it opens the
 ;; path without FILE_FLAG_BACKUP_SEMANTICS, so it cannot open a DIRECTORY and a
 ;; directory's mtime was never set (jolt-lang/jolt#1119) — and it has second
-;; resolution. win32-set-file-mtime-millis! below is what the JDK's Windows
+;; resolution. win32-set-file-times! (SetFileTime) is what the JDK's Windows
 ;; provider does. Answers whether the time was set.
 (define c-utimes (jolt-foreign-proc-safe "utimes" '(string u8*) 'int))
+;; utimensat(2) sets either time alone (UTIME_OMIT in the other slot) at
+;; nanosecond resolution, and can leave a symbolic link's target alone
+;; (AT_SYMLINK_NOFOLLOW). Setting the mtime through utimes moved the access time
+;; to it as well, where the JDK keeps the access time as it was, for
+;; File.setLastModified and Files.setLastModifiedTime both. The constants are
+;; per-OS, measured with cc/gcc: #(AT_FDCWD UTIME_OMIT AT_SYMLINK_NOFOLLOW).
+(define c-utimensat (jolt-foreign-proc-safe "utimensat" '(int string u8* int) 'int))
+(define utimensat-consts
+  (case (sa-os-family)
+    ((linux) '#(-100 1073741822 #x100))
+    ((macos) '#(-2 -2 #x20))
+    (else #f)))
+;; A struct timespec of epoch NS at OFF: seconds floored, so a time before the
+;; epoch keeps its nanoseconds field in [0, 1e9).
+(define (timespec-bytes! bv off ns)
+  (bytevector-s64-set! bv off (div ns 1000000000) (native-endianness))
+  (bytevector-s64-set! bv (+ off 8) (mod ns 1000000000) (native-endianness)))
+;; Set P's access and/or modification time, each epoch NS or #f to leave it as
+;; it is. FOLLOW? #f sets a symbolic link's own. Answers whether it was set.
+(define (set-file-times-ns! p atime mtime follow?)
+  (cond
+    ((eq? (sa-os-family) 'windows) (win32-set-file-times! p #f atime mtime follow?))
+    ((and c-utimensat utimensat-consts)
+     (let ((ts (make-bytevector 32 0)) (k utimensat-consts))
+       (if atime (timespec-bytes! ts 0 atime)
+           (bytevector-s64-set! ts 8 (vector-ref k 1) (native-endianness)))
+       (if mtime (timespec-bytes! ts 16 mtime)
+           (bytevector-s64-set! ts 24 (vector-ref k 1) (native-endianness)))
+       (= 0 (c-utimensat (vector-ref k 0) p ts (if follow? 0 (vector-ref k 2))))))
+    ;; no utimensat: utimes, which can only set both, so both get the one given
+    ((and c-utimes follow? (or mtime atime))
+     (let ((tv (make-bytevector 32 0)) (t (or mtime atime)))
+       (define (tv! off ns)
+         (bytevector-s64-set! tv off (div ns 1000000000) (native-endianness))
+         (bytevector-s64-set! tv (+ off 8) (div (mod ns 1000000000) 1000) (native-endianness)))
+       (tv! 0 (or atime t))
+       (tv! 16 (or mtime t))
+       (= (c-utimes p tv) 0)))
+    (else #f)))
 (define (set-file-mtime-millis! p ms)
-  (if c-utimes
-      (let ((sec (div ms 1000))
-            (tv (make-bytevector 32 0))
-            (usec (* (mod ms 1000) 1000)))
-        (bytevector-s64-set! tv 0 sec (native-endianness))
-        (bytevector-s64-set! tv 8 usec (native-endianness))
-        (bytevector-s64-set! tv 16 sec (native-endianness))
-        (bytevector-s64-set! tv 24 usec (native-endianness))
-        (= (c-utimes p tv) 0))
-      (win32-set-file-mtime-millis! p ms)))
+  (set-file-times-ns! p #f (* (exact (floor ms)) 1000000) #t))
 ;; mkdir -p: create p and any missing parents. Returns #t if p ends up a dir.
 (define (mkdirs! p)
   (unless (or (= 0 (string-length p)) (file-exists? p))
@@ -1470,6 +1548,28 @@
       (guard (e (#t jolt-nil)) (produce))
       jolt-nil))
 
+;; File.setReadable/setWritable/setExecutable(enable [, ownerOnly]) and
+;; setReadOnly, as the JDK's UnixFileSystem.setPermission does them: BIT is the
+;; permission's "other" bit, widened to the owner's alone (ownerOnly, the
+;; default) or to all three classes, then or'd in or masked out with chmod.
+;; Answers whether the mode was changed; false for a missing file. On Windows
+;; only the write bit means anything (the read-only attribute, which Chez's
+;; chmod sets through _wchmod), and the JDK answers a read or execute change
+;; with ENABLE itself. None of these existed, so every call raised.
+(define (jfile-set-permission! fp bit args)
+  (let ((enable? (and (pair? args) (jolt-truthy? (car args))))
+        (owner-only? (or (not (pair? args)) (null? (cdr args)) (jolt-truthy? (cadr args)))))
+    (guard (e (#t #f))
+      (cond
+        ((and (eq? (sa-os-family) 'windows) (not (= bit 2))) enable?)
+        (else
+         (let* ((m (bitwise-and (get-mode fp) #o7777))
+                (a (if (and owner-only? (not (eq? (sa-os-family) 'windows)))
+                       (* bit #o100)
+                       (* bit #o111))))
+           (chmod fp (if enable? (bitwise-ior m a) (bitwise-and m (bitwise-not a))))
+           #t))))))
+
 ;; --- File method surface (record-method-dispatch arm) -----------------------
 (define (jfile-method f name args)        ; -> boxed result, or #f to fall through
   (let ((p (jfile-path f))               ; the path as given (display methods)
@@ -1505,6 +1605,10 @@
       ((string=? name "mkdirs")         (list (if (mkdirs! fp) #t #f)))
       ((string=? name "delete")         (list (if (delete-path! fp) #t #f)))
       ((string=? name "deleteOnExit")   (list jolt-nil))
+      ((string=? name "setReadable")    (list (jfile-set-permission! fp 4 args)))
+      ((string=? name "setWritable")    (list (jfile-set-permission! fp 2 args)))
+      ((string=? name "setExecutable")  (list (jfile-set-permission! fp 1 args)))
+      ((string=? name "setReadOnly")    (list (jfile-set-permission! fp 2 (list #f #f))))
       ((string=? name "setLastModified")
        (list (guard (e (#t #f))
                (set-file-mtime-millis! fp (exact (floor (car args)))))))
@@ -1674,9 +1778,12 @@
 ;; EXC is the condition the open raised, when there was one. The probes are the
 ;; fallback for the one caller with no condition to offer: open-path-guarded's
 ;; directory check, which refuses before it opens.
+;; GIVEN is named the way a java.io.File built from it would name it: the JDK
+;; opens a File, so (slurp "a//b") reports "a/b", and path-native alone left the
+;; doubled separator in.
 (define (file-open-error given resolved . exc)
   (throw-jvm (quote java.io.FileNotFoundException)
-             (string-append (path-native given) " ("
+             (string-append (path-native (jolt-path-normalize given)) " ("
                             (or (io-open-reason exc)
                                 (cond ((not (file-exists? resolved)) "No such file or directory")
                                       ((file-directory? resolved)    "Is a directory")

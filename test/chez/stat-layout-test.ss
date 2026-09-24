@@ -80,17 +80,24 @@
       (bytevector-s64-set! tv 16 1600000000 (native-endianness))
       (bytevector-s64-set! tv 24 0 (native-endianness))
       (c-utimes tmp tv)
-      (ok (format "st_atime reads back the access time (got ~a)" (nio-access-time-ms tmp #t))
-          (eqv? 1100000000250 (nio-access-time-ms tmp #t)))
-      (ok (format "st_mtime reads back the mtime (got ~a)" (nio-lstat-mtime-millis tmp))
-          (eqv? 1600000000000 (nio-lstat-mtime-millis tmp)))
-      (let ((b (nio-creation-time-ms tmp #t)))
-        (ok (format "the birth time, where there is one, is not in the future (got ~a)" b)
-            (or (not b) (<= b (* 1000 (+ 1 (time-second (current-time))))))))
-      (ok "utimensat moves the access time and leaves the mtime"
-          (and (nio-set-access-time! tmp 1200000000000 #t)
-               (eqv? 1200000000000 (nio-access-time-ms tmp #t))
-               (eqv? 1600000000000 (nio-lstat-mtime-millis tmp))))))
+      (let ((ns (lambda (nm) (let ((t (nio-read-time tmp nm #t))) (and t (file-time-ns t))))))
+        (ok (format "st_atime reads back the access time (got ~a)" (ns "lastAccessTime"))
+            (eqv? 1100000000250000000 (ns "lastAccessTime")))
+        (ok (format "st_mtime reads back the mtime (got ~a)" (ns "lastModifiedTime"))
+            (eqv? 1600000000000000000 (ns "lastModifiedTime")))
+        (let ((b (ns "creationTime")))
+          (ok (format "the birth time, where there is one, is not in the future (got ~a)" b)
+              (or (not b) (<= b (* 1000000000 (+ 1 (time-second (current-time))))))))
+        (ok "utimensat moves the access time and leaves the mtime"
+            (and (nio-set-access-time! tmp 1200000000000000000 #t)
+                 (eqv? 1200000000000000000 (ns "lastAccessTime"))
+                 (eqv? 1600000000000000000 (ns "lastModifiedTime"))))
+        ;; the timespec's nanoseconds survive both ways, and setting the mtime
+        ;; leaves the access time where it was
+        (ok "an mtime set to the nanosecond reads back to the nanosecond"
+            (and (nio-set-mtime! tmp 1600000000123456789 #t)
+                 (eqv? 1600000000123456789 (ns "lastModifiedTime"))
+                 (eqv? 1200000000000000000 (ns "lastAccessTime")))))))
   ;; st_dev and st_ino: the file key of one file read twice is one key.
   (ok "the file key is (st_dev, st_ino) and stable"
       (let ((a (nio-file-key tmp #t)) (b (nio-file-key tmp #t)))

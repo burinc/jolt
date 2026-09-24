@@ -427,13 +427,20 @@
 ;; below take the resolved path to act on and an optional SHOWN one to report,
 ;; which each Files entry point passes as (nio-shown its-argument).
 (define (nio-shown x) (if (jolt-nil? x) "" (npath-string-of x)))
-(define (nio-fs-throw cls fp) (jolt-throw (jolt-host-throwable cls (path-native fp))))
-(define (nio-no-such-file fp)   (nio-fs-throw "java.nio.file.NoSuchFileException" fp))
-(define (nio-already-exists fp) (nio-fs-throw "java.nio.file.FileAlreadyExistsException" fp))
+;; FileSystemException's (file, other, reason) are kept apart until the message
+;; is built (io.ss fs-exception-message), so only the paths render with "\" on
+;; Windows and the reason text is left as the OS wrote it.
+(define (nio-fs-throw cls fp . other+reason)
+  (let ((other  (and (pair? other+reason) (car other+reason)))
+        (reason (and (pair? other+reason) (pair? (cdr other+reason)) (cadr other+reason))))
+    (jolt-throw (jolt-host-throwable cls (fs-exception-message fp other reason)))))
+(define (nio-no-such-file fp . other)
+  (nio-fs-throw "java.nio.file.NoSuchFileException" fp (and (pair? other) (car other))))
+(define (nio-already-exists fp . other)
+  (nio-fs-throw "java.nio.file.FileAlreadyExistsException" fp (and (pair? other) (car other))))
 ;; "<path>: <reason>" is the JDK's rendering for every errno without a class.
 (define (nio-fs-detail fp reason)
-  (nio-fs-throw "java.nio.file.FileSystemException"
-                (if reason (string-append fp ": " reason) fp)))
+  (nio-fs-throw "java.nio.file.FileSystemException" fp #f reason))
 
 ;; The strerror text is the LAST string irritant: an open raises (path reason),
 ;; rename-file raises (src dst reason). Any other shape degrades to a bare path
@@ -627,16 +634,25 @@
 (define (fvr-sym r) (if (fvr? r) (jhost-state r) 'continue))
 (define fvo-follow-links  (make-jhost "fvo" 'follow-links))
 
-;; BasicFileAttributes — the subset the visitors read (times land with the
-;; attributes increment).
-(define (make-basic-attrs fp) (make-jhost "basic-attrs" fp))
+;; BasicFileAttributes of a path, read through (FOLLOW? #t) or not through
+;; (NOFOLLOW_LINKS) a symbolic link — every getter answers through
+;; nio-attr-value, the one table readAttributes and getAttribute also read, so
+;; the three cannot disagree about a link. It used to hold only the path and
+;; follow always, so readAttributes(link, BasicFileAttributes, NOFOLLOW_LINKS)
+;; described the target and isSymbolicLink was false for everything.
+(define (make-basic-attrs fp follow?) (make-jhost "basic-attrs" (cons fp follow?)))
+(define (basic-attrs-value self nm)
+  (let ((st (jhost-state self))) (nio-attr-value (car st) nm (cdr st))))
 (register-host-methods! "basic-attrs"
-  (list (cons "isDirectory"    (lambda (self) (if (file-directory? (jhost-state self)) #t #f)))
-        (cons "isRegularFile"  (lambda (self) (let ((fp (jhost-state self)))
-                                                (if (and (file-exists? fp) (not (file-directory? fp))) #t #f))))
-        (cons "isSymbolicLink" (lambda (self) #f))
-        (cons "isOther"        (lambda (self) #f))
-        (cons "size"           (lambda (self) (nio-size (jhost-state self))))))
+  (list (cons "isDirectory"      (lambda (self) (basic-attrs-value self "isDirectory")))
+        (cons "isRegularFile"    (lambda (self) (basic-attrs-value self "isRegularFile")))
+        (cons "isSymbolicLink"   (lambda (self) (basic-attrs-value self "isSymbolicLink")))
+        (cons "isOther"          (lambda (self) (basic-attrs-value self "isOther")))
+        (cons "size"             (lambda (self) (basic-attrs-value self "size")))
+        (cons "lastModifiedTime" (lambda (self) (basic-attrs-value self "lastModifiedTime")))
+        (cons "lastAccessTime"   (lambda (self) (basic-attrs-value self "lastAccessTime")))
+        (cons "creationTime"     (lambda (self) (basic-attrs-value self "creationTime")))
+        (cons "fileKey"          (lambda (self) (basic-attrs-value self "fileKey")))))
 
 (define (nio-call-visitor visitor name . args)
   (let ((m (reify-method-ref visitor name)))
@@ -669,7 +685,7 @@
                  (if (and ino (member ino ancestors))
                      (let ((r (nio-call-visitor visitor "visitFileFailed" path-obj jolt-nil)))
                        (if (eq? r 'terminate) (stop #t) r))
-                     (let ((r (nio-call-visitor visitor "preVisitDirectory" path-obj (make-basic-attrs fp))))
+                     (let ((r (nio-call-visitor visitor "preVisitDirectory" path-obj (make-basic-attrs fp follow?))))
                        (cond
                          ((eq? r 'terminate) (stop #t))
                          ((eq? r 'skip-subtree) 'continue)
@@ -684,7 +700,7 @@
                                     (unless (eq? cr 'skip-siblings) (loop (cdr names))))))))
                           (let ((pr (nio-call-visitor visitor "postVisitDirectory" path-obj jolt-nil)))
                             (if (eq? pr 'terminate) (stop #t) 'continue)))))))
-               (let ((r (nio-call-visitor visitor "visitFile" path-obj (make-basic-attrs fp))))
+               (let ((r (nio-call-visitor visitor "visitFile" path-obj (make-basic-attrs fp follow?))))
                  (if (eq? r 'terminate) (stop #t) r)))))
        (walk (->path start) 0 '())))
     (->path start)))
@@ -746,79 +762,142 @@
         'pass)))
 
 ;; ---- FileTime + attributes + POSIX permissions + symlinks -------------------
-;; FileTime carries epoch milliseconds; this host layer resolves timestamps at
-;; millisecond granularity (utimes(2)).
-(define (make-file-time ms) (make-jhost "file-time" ms))
+;; A FileTime is the JDK's (value, unit) pair: state (VALUE . SCALE), SCALE the
+;; unit's size in nanoseconds, or SCALE 0 for one made from an Instant, whose
+;; VALUE is then its epoch nanoseconds. It was epoch milliseconds, so a file's
+;; time lost its sub-millisecond digits on the way in: str showed ".123Z" where
+;; the JDK shows ".123456789Z", and two times a microsecond apart were equal.
+;; The pair is kept rather than a nanosecond count because the JDK converts from
+;; it: to(unit)/toMillis truncate toward zero from the unit held, but floor from
+;; an Instant. A bare integer state is a millisecond FileTime from before this.
+(define (make-file-time-in value scale) (make-jhost "file-time" (cons value scale)))
+(define (make-file-time ms) (make-file-time-in ms 1000000))
+(define (make-file-time-ns ns) (make-file-time-in ns 1))
 (define (file-time? x) (and (jhost? x) (string=? (jhost-tag x) "file-time")))
-(define (file-time-ms x) (if (file-time? x) (jhost-state x) 0))
+(define (file-time-parts x)
+  (let ((st (jhost-state x))) (if (pair? st) st (cons st 1000000))))
+;; epoch nanoseconds, exact
+(define (file-time-ns x)
+  (if (file-time? x)
+      (let ((p (file-time-parts x)))
+        (if (eqv? (cdr p) 0) (car p) (* (car p) (cdr p))))
+      0))
+(define ft-long-min (- (expt 2 63)))
+(define ft-long-max (- (expt 2 63) 1))
+(define (ft-saturate n) (max ft-long-min (min ft-long-max n)))
+;; FileTime.to(unit), USCALE the unit's nanoseconds: TimeUnit.convert from the
+;; unit held (truncating, saturating at Long's range), or seconds and nanos
+;; converted apart for an Instant-made one.
+(define (file-time-to x uscale)
+  (let* ((p (file-time-parts x)) (v (car p)) (sc (cdr p)))
+    (if (eqv? sc 0)
+        (let* ((secs (floor (/ v 1000000000))) (nanos (- v (* secs 1000000000)))
+               (s (ft-saturate (quotient (* secs 1000000000) uscale))))
+          (if (or (= s ft-long-min) (= s ft-long-max))
+              s
+              (ft-saturate (+ s (quotient nanos uscale)))))
+        (ft-saturate (quotient (* v sc) uscale)))))
+(define (file-time-ms x) (if (file-time? x) (file-time-to x 1000000) 0))
+(define (file-time-compare a b)
+  (let ((x (file-time-ns a)) (y (file-time-ns b)))
+    (cond ((< x y) -1) ((> x y) 1) (else 0))))
+;; hashCode is toInstant().hashCode(), which equals needs: (int)(s ^ s>>>32) +
+;; 51 * nanos over the instant's seconds and nanos, in int arithmetic.
+(define (file-time-hash x)
+  (let* ((ns (file-time-ns x))
+         (secs (floor (/ ns 1000000000)))
+         (nanos (- ns (* secs 1000000000)))
+         (s64 (bitwise-and secs #xFFFFFFFFFFFFFFFF))
+         (h (bitwise-and (+ (bitwise-and (bitwise-xor s64 (bitwise-arithmetic-shift-right s64 32))
+                                         #xFFFFFFFF)
+                            (* 51 nanos))
+                         #xFFFFFFFF)))
+    (if (>= h #x80000000) (- h #x100000000) h)))
+;; A TimeUnit argument's scale; tu->ms's rule for anything else (milliseconds).
+(define (file-time-unit-scale u) (if (time-unit? u) (time-unit-scale u) 1000000))
 (register-host-methods! "file-time"
-  (list (cons "toMillis"   (lambda (self) (jhost-state self)))
-        (cons "toInstant"  (lambda (self) (mk-instant (jhost-state self))))
-        (cons "compareTo"  (lambda (self o) (let ((a (jhost-state self)) (b (file-time-ms o)))
-                                              (cond ((< a b) -1) ((> a b) 1) (else 0)))))
-        (cons "equals"     (lambda (self o) (and (file-time? o) (= (jhost-state self) (file-time-ms o)))))
-        (cons "hashCode"   (lambda (self) (jhost-state self)))
-        (cons "toString"   (lambda (self) (file-time->string (jhost-state self))))))
-;; FileTime.toString: ISO-8601 in UTC, the fraction only when there is one and
-;; with its trailing zeros dropped, no "+" on a five-digit year, and a year at or
-;; before 0 written as "-" and 1 - year ("-0001" is year 0). That is FileTime's
-;; own rendering, not Instant's. It called a helper that no longer existed, so
-;; every .toString raised and str fell through to #object[...].
-(define (file-time->string ms)
-  (let* ((f (inst-fields ms)) (y (list-ref f 0)) (frac (list-ref f 6)))
+  (list (cons "toMillis"   (lambda (self) (file-time-ms self)))
+        (cons "to"         (lambda (self unit) (file-time-to self (file-time-unit-scale unit))))
+        (cons "toInstant"  (lambda (self)
+                             (unless jt-instant-hook (load-namespace "jolt.time.base"))
+                             (jt-instant-hook (file-time-ns self))))
+        (cons "compareTo"  (lambda (self o) (file-time-compare self o)))
+        (cons "equals"     (lambda (self o) (and (file-time? o) (= 0 (file-time-compare self o)))))
+        (cons "hashCode"   (lambda (self) (file-time-hash self)))
+        (cons "toString"   (lambda (self) (file-time->string (file-time-ns self))))))
+;; FileTime.toString: ISO-8601 in UTC, the fraction (to the nanosecond) only when
+;; there is one and with its trailing zeros dropped, no "+" on a five-digit year,
+;; and a year at or before 0 written as "-" and 1 - year ("-0001" is year 0).
+;; That is FileTime's own rendering, not Instant's.
+(define (file-time->string ns)
+  (let* ((secs (floor (/ ns 1000000000)))
+         (frac (- ns (* secs 1000000000)))
+         (f (inst-fields (* secs 1000))) (y (list-ref f 0)))
     (string-append (if (> y 0) (pad4 y) (string-append "-" (pad4 (- 1 y))))
                    "-" (pad2 (list-ref f 1)) "-" (pad2 (list-ref f 2))
                    "T" (pad2 (list-ref f 3)) ":" (pad2 (list-ref f 4)) ":" (pad2 (list-ref f 5))
                    (if (= frac 0)
                        ""
-                       (let loop ((s (pad3 frac)))
+                       (let loop ((s (let ((d (number->string frac)))
+                                       (string-append (make-string (- 9 (string-length d)) #\0) d))))
                          (if (char=? (string-ref s (- (string-length s) 1)) #\0)
                              (loop (substring s 0 (- (string-length s) 1)))
                              (string-append "." s))))
                    "Z")))
-(register-str-render! file-time? (lambda (t) (file-time->string (jhost-state t))))
+(register-str-render! file-time? (lambda (t) (file-time->string (file-time-ns t))))
 (register-eq-arm! (lambda (a b) (and (file-time? a) (file-time? b)))
-                  (lambda (a b) (= (jhost-state a) (jhost-state b))))
-(register-hash-arm! file-time? (lambda (t) (jolt-hash (jhost-state t))))
+                  (lambda (a b) (= 0 (file-time-compare a b))))
+(register-hash-arm! file-time? file-time-hash)
+;; FileTime is Comparable, so compare / sort take two of them.
+(register-compare-arm! (lambda (a b) (and (file-time? a) (file-time? b))) file-time-compare)
+;; An Instant's epoch nanoseconds: the jolt.time base's own count when it is one,
+;; else clojure.core/inst-ms's milliseconds, both looked up when called — a bare
+;; Scheme inst-ms here named nothing, and every (fs/set-last-modified-time p
+;; instant) raised "variable inst-ms is not bound" (jolt-lang/jolt#1119).
+(define (instant-epoch-nanos x)
+  (or (guard (e (#t #f))
+        (and (jolt-truthy? (jolt-invoke (var-deref "jolt.time.instant" "inst?") x))
+             (jnum->exact (jolt-invoke (var-deref "jolt.time.instant" "inst-nanos") x))))
+      (* (jnum->exact (jolt-invoke (var-deref "clojure.core" "inst-ms") x)) 1000000)))
 (let ((ft-statics (list (cons "fromMillis" (lambda (ms) (make-file-time (jnum->exact ms))))
-                        ;; from(Instant) and from(long, TimeUnit). The Instant is
-                        ;; the jolt.time base's value, so its epoch millis come from
-                        ;; clojure.core/inst-ms, looked up when called: a bare
-                        ;; Scheme inst-ms here named nothing, and every
-                        ;; (fs/set-last-modified-time p instant) raised "variable
-                        ;; inst-ms is not bound" (jolt-lang/jolt#1119).
+                        ;; from(long, TimeUnit) keeps the pair; from(Instant) the
+                        ;; instant's nanoseconds
                         (cons "from" (lambda (x . unit)
-                                       (make-file-time
-                                        (if (pair? unit)
-                                            (tu->ms x (car unit))
-                                            (jolt-invoke (var-deref "clojure.core" "inst-ms") x))))))))
+                                       (if (pair? unit)
+                                           (make-file-time-in (jnum->exact x) (file-time-unit-scale (car unit)))
+                                           (make-file-time-in (instant-epoch-nanos x) 0)))))))
   (register-class-statics! "FileTime" ft-statics)
   (register-class-statics! "java.nio.file.attribute.FileTime" ft-statics))
-
-;; A basic-attrs value also answers the time getters as FileTimes.
-(register-host-methods! "basic-attrs"
-  (list (cons "lastModifiedTime" (lambda (self) (nio-attr-value (jhost-state self) "lastModifiedTime")))
-        (cons "lastAccessTime"   (lambda (self) (nio-attr-value (jhost-state self) "lastAccessTime")))
-        (cons "creationTime"     (lambda (self) (nio-attr-value (jhost-state self) "creationTime")))
-        (cons "fileKey"          (lambda (self) (nio-attr-value (jhost-state self) "fileKey")))))
 
 ;; Files/getAttribute / setAttribute / readAttributes over the "basic:" view.
 (define (nio-attr-name a)                      ; strip a "view:" prefix
   (let ((i (let loop ((j 0)) (cond ((>= j (string-length a)) #f)
                                    ((char=? (string-ref a j) #\:) j) (else (loop (+ j 1)))))))
     (if i (substring a (+ i 1) (string-length a)) a)))
-(define (nio-attr-value fp nm)
-  (cond
-    ((string=? nm "lastModifiedTime") (make-file-time (file-mtime-millis fp)))
-    ((string=? nm "lastAccessTime")   (make-file-time (nio-time-attr-ms fp nm '())))
-    ((string=? nm "creationTime")     (make-file-time (nio-time-attr-ms fp nm '())))
-    ((string=? nm "size")             (nio-size fp))
-    ((string=? nm "isDirectory")      (if (file-directory? fp) #t #f))
-    ((string=? nm "isRegularFile")    (if (and (file-exists? fp) (not (file-directory? fp))) #t #f))
-    ((string=? nm "isSymbolicLink")   (if (nio-is-symlink? fp) #t #f))
-    ((string=? nm "isOther")          #f)
-    ((string=? nm "fileKey")          (nio-file-key fp #t))
-    (else jolt-nil)))
+;; The basic attribute NM of FP, read through a symbolic link (FOLLOW?) or of
+;; the link itself. A link read as itself is a link: not a directory, not a
+;; regular file, sized by its target string, with its own times and file key.
+(define (nio-attr-value fp nm follow?)
+  (let ((link? (and (not follow?) (nio-is-symlink? fp))))
+    (cond
+      ((member nm '("lastModifiedTime" "lastAccessTime" "creationTime"))
+       (nio-time-attr fp nm (not link?)))
+      ((string=? nm "size")
+       (if link?
+           (bytevector-length (string->utf8 (or (nio-readlink fp) "")))
+           (nio-size fp)))
+      ((string=? nm "isDirectory")      (and (not link?) (file-directory? fp) #t))
+      ((string=? nm "isRegularFile")    (and (not link?) (file-regular? fp) #t))
+      ((string=? nm "isSymbolicLink")   link?)
+      ((string=? nm "isOther")          (and (not link?) (file-exists? fp)
+                                             (not (file-directory? fp)) (not (file-regular? fp)) #t))
+      ((string=? nm "fileKey")          (nio-file-key fp (not link?)))
+      (else jolt-nil))))
+;; readAttributes/getAttribute on a path that is not there raise, as the JDK's
+;; do; a dangling link is there when read as itself.
+(define (nio-attrs-require-exists! fp follow? shown)
+  (unless (or (file-exists? fp) (and (not follow?) (nio-is-symlink? fp)))
+    (nio-no-such-file shown)))
 (define nio-basic-attr-names
   '("lastModifiedTime" "lastAccessTime" "creationTime" "size"
     "isDirectory" "isRegularFile" "isSymbolicLink" "isOther" "fileKey"))
@@ -832,15 +911,19 @@
 (define (nio-str-suffix? s suf)
   (let ((n (string-length s)) (m (string-length suf)))
     (and (>= n m) (string=? (substring s (- n m) n) suf))))
-(define (nio-read-attributes path what . _)
-  (let ((w (npath-string-of what)))
+;; LinkOption/NOFOLLOW_LINKS among OPTS describes a symbolic link as itself, in
+;; both forms, as getAttribute already did.
+(define (nio-read-attributes path what . opts)
+  (let* ((w (npath-string-of what))
+         (fp (nfp path))
+         (follow? (not (nio-opts-nofollow? opts))))
+    (nio-attrs-require-exists! fp follow? (nio-shown path))
     (if (nio-str-suffix? w "Attributes")   ; the Class form -> a BasicFileAttributes value
-        (make-basic-attrs (nfp path))
+        (make-basic-attrs fp follow?)
         ;; the string form ("view:a,b" / "*" / "a") -> a map of just those attributes
-        (let* ((fp (nfp path))
-               (attr-part (nio-attr-name w))
+        (let* ((attr-part (nio-attr-name w))
                (names (if (string=? attr-part "*") nio-basic-attr-names (nio-split-commas attr-part))))
-          (fold-left (lambda (m nm) (jolt-assoc m nm (nio-attr-value fp nm))) empty-pmap names)))))
+          (fold-left (lambda (m nm) (jolt-assoc m nm (nio-attr-value fp nm follow?))) empty-pmap names)))))
 
 ;; PosixFilePermissions <-> "rwxr-xr-x" strings, and chmod-based set.
 (define posix-order '("OWNER_READ" "OWNER_WRITE" "OWNER_EXECUTE"
@@ -909,21 +992,37 @@
               (let ((bv (make-bytevector n)))
                 (do ((i 0 (+ i 1))) ((= i n) (utf8->string bv))
                   (bytevector-u8-set! bv i (bytevector-u8-ref buf i))))))))
-;; A link that was not made raises, named the JDK's way: FileAlreadyExists when
-;; the link path is taken, NoSuchFile when its directory or (for a hard link) the
-;; existing file is missing, and "link -> existing" as the message of a hard
-;; link's. Both used to discard the result, so a failed link answered the path as
-;; though it had been made — and on Windows, where there is no link(2),
-;; createLink never made one at all. Named by looking after the failure, as the
-;; rest of this file does, which reads the same on Windows as on POSIX.
-(define (nio-link-failed link existing shown-link shown-existing)
-  (let ((msg (if existing (string-append shown-link " -> " shown-existing) shown-link)))
-    (cond ((or (file-exists? link) (nio-is-symlink? link)) (nio-already-exists msg))
+;; A link that was not made raises, named the JDK's way (UnixException
+;; .translateToIOException): EEXIST is FileAlreadyExists, ENOENT NoSuchFile,
+;; EACCES AccessDenied, and any other errno a FileSystemException whose reason is
+;; strerror's text — "l -> e: Operation not permitted" for a hard link to a
+;; directory. A hard link's message names both paths, "link -> existing". ERR is
+;; the errno read straight after the failed call; without one (Windows, whose
+;; CreateHardLinkW sets no errno) the class is named by looking after the
+;; failure, and the reason is unknown.
+(define nio-EEXIST 17)
+(define nio-ENOENT 2)
+(define nio-EACCES 13)
+(define c-strerror (jolt-foreign-proc-safe "strerror" '(int) 'string))
+(define (nio-link-failed link existing shown-link shown-existing err)
+  (let ((other (and existing shown-existing)))
+    (cond ((and err (> err 0))
+           (cond ((= err nio-EEXIST) (nio-already-exists shown-link other))
+                 ((= err nio-ENOENT) (nio-no-such-file shown-link other))
+                 ((= err nio-EACCES)
+                  (nio-fs-throw "java.nio.file.AccessDeniedException" shown-link other))
+                 (else
+                  (let ((reason (and c-strerror (c-strerror err))))
+                    (nio-fs-throw "java.nio.file.FileSystemException" shown-link other
+                                  (if (and reason (= err io-ELOOP))
+                                      (string-append reason " or unable to access attributes of symbolic link")
+                                      reason))))))
+          ((or (file-exists? link) (nio-is-symlink? link)) (nio-already-exists shown-link other))
           ((or (and existing (not (file-exists? existing)))
                (let ((parent (npath-parent-for (nio-windows?) link)))
                  (and (string? parent) (not (file-directory? parent)))))
-           (nio-no-such-file msg))
-          (else (nio-fs-detail msg #f)))))
+           (nio-no-such-file shown-link other))
+          (else (nio-fs-throw "java.nio.file.FileSystemException" shown-link other)))))
 (define fvo-nofollow (make-jhost "link-option" 'nofollow-links))
 (let ((files-attr
        (list (cons "readAttributes" nio-read-attributes)
@@ -931,15 +1030,18 @@
              (cons "createSymbolicLink" (lambda (link target . _)
                                           (if c-symlink
                                               (unless (= 0 (c-symlink (npath-string-of target) (nfp link)))
-                                                (nio-link-failed (nfp link) #f (nio-shown link) #f))
+                                                (let ((err (io-errno)))   ; before anything else can set it
+                                                  (nio-link-failed (nfp link) #f (nio-shown link) #f err)))
                                               (jolt-throw (jolt-ex-info "symlink unavailable" empty-pmap)))
                                           (->path link)))
              (cons "createLink" (lambda (link existing . _)
-                                  (let ((l (nfp link)) (e (nfp existing)))
-                                    (unless (if (nio-windows?)
-                                                (win32-create-hard-link! l e)
-                                                (and c-link (= 0 (c-link e l))))
-                                      (nio-link-failed l e (nio-shown link) (nio-shown existing))))
+                                  (let* ((l (nfp link)) (e (nfp existing))
+                                         (err (cond ((nio-windows?) (and (win32-create-hard-link! l e) 0))
+                                                    ((not c-link) #f)
+                                                    ((= 0 (c-link e l)) 0)
+                                                    (else (io-errno)))))   ; before anything else can set it
+                                    (unless (eqv? err 0)
+                                      (nio-link-failed l e (nio-shown link) (nio-shown existing) err)))
                                   (->path link)))
              (cons "readSymbolicLink" (lambda (p) (let* ((fp (nfp p)) (t (nio-readlink fp)))
                                                     (cond (t (make-nio-path t))
@@ -1306,29 +1408,20 @@
 
 ;; ---- nofollow timestamps (the link's own mtime, via lstat/lutimes) ----------
 (define c-lstat (jolt-foreign-proc-safe "lstat" '(string u8*) 'int))
-(define c-lutimes (jolt-foreign-proc-safe "lutimes" '(string u8*) 'int))
 (define (nio-stat-buf fp follow?)                ; struct stat of FP, or #f
   (let ((f (if follow? c-stat c-lstat)))
     (and f (nio-stat-layout)
          (let ((buf (make-bytevector 256 0)))
            (and (= 0 (f fp buf)) buf)))))
-(define (nio-timespec-ms buf off)
-  (+ (* 1000 (bytevector-s64-ref buf off (native-endianness)))
-     (div (bytevector-s64-ref buf (+ off 8) (native-endianness)) 1000000)))
-(define (nio-lstat-mtime-millis fp)              ; the symlink's own mtime
-  (let ((buf (nio-stat-buf fp #f)))
-    (and buf (nio-timespec-ms buf (nio-layout-mtime-off (nio-stat-layout))))))
-(define (nio-set-lmtime! fp ms opts)             ; nofollow on a link sets the link's own time
-  (if (and (nio-opts-nofollow? opts) (nio-is-symlink? fp) c-lutimes)
-      (let ((tv (make-bytevector 32 0)) (sec (div ms 1000)) (usec (* (mod ms 1000) 1000)))
-        (bytevector-s64-set! tv 0 sec (native-endianness)) (bytevector-s64-set! tv 8 usec (native-endianness))
-        (bytevector-s64-set! tv 16 sec (native-endianness)) (bytevector-s64-set! tv 24 usec (native-endianness))
-        (= 0 (c-lutimes fp tv)))
-      (set-file-mtime-millis! fp ms)))
-(define (nio-lmtime-millis fp opts)              ; read, honoring NOFOLLOW on a link
-  (if (and (nio-opts-nofollow? opts) (nio-is-symlink? fp))
-      (or (nio-lstat-mtime-millis fp) (file-mtime-millis fp))
-      (file-mtime-millis fp)))
+;; A timespec as the JDK's UnixFileAttributes.toFileTime makes it: whole
+;; seconds when there is no fraction, else nanoseconds.
+(define (nio-timespec-file-time sec nsec)
+  (if (= nsec 0)
+      (make-file-time-in sec 1000000000)
+      (make-file-time-ns (+ (* sec 1000000000) nsec))))
+(define (nio-stat-file-time buf off)
+  (nio-timespec-file-time (bytevector-s64-ref buf off (native-endianness))
+                          (bytevector-s64-ref buf (+ off 8) (native-endianness))))
 
 ;; ---- the access and creation times (jolt-ow0x) --------------------------------
 ;; The shim used to keep one time per file and answer the mtime for all three,
@@ -1338,34 +1431,41 @@
 ;; FILETIMEs on Windows. A host or filesystem with no birth time answers the
 ;; mtime, which is the JDK's fallback too.
 (define c-statx (jolt-foreign-proc-safe "statx" '(int string int unsigned-32 u8*) 'int))
-(define (nio-statx-btime-ms fp follow?)
+(define (nio-statx-btime fp follow?)
   ;; statx(AT_FDCWD, fp, AT_SYMLINK_NOFOLLOW?, STATX_BTIME, buf): stx_mask@0
   ;; says whether the filesystem answered, stx_btime@80 is {s64 sec, u32 nsec}.
   (and c-statx (eq? (sa-os-family) 'linux)
        (let ((buf (make-bytevector 256 0)))
          (and (= 0 (c-statx -100 fp (if follow? 0 #x100) #x800 buf))
               (not (= 0 (bitwise-and (bytevector-u32-ref buf 0 (native-endianness)) #x800)))
-              (+ (* 1000 (bytevector-s64-ref buf 80 (native-endianness)))
-                 (div (bytevector-u32-ref buf 88 (native-endianness)) 1000000))))))
-(define (nio-access-time-ms fp follow?)
+              (nio-timespec-file-time (bytevector-s64-ref buf 80 (native-endianness))
+                                      (bytevector-u32-ref buf 88 (native-endianness)))))))
+;; The time NM ("lastModifiedTime", "lastAccessTime" or "creationTime") of FP as
+;; a FileTime at the resolution the filesystem keeps — nanoseconds from struct
+;; stat / statx, 100ns FILETIME ticks on Windows — through a symbolic link or,
+;; FOLLOW? #f, of the link itself. #f when it cannot be read.
+(define (nio-read-time fp nm follow?)
   (if (nio-windows?)
-      (let ((t (win32-file-times fp))) (and t (vector-ref t 1)))
-      (let ((buf (nio-stat-buf fp follow?)))
-        (and buf (nio-timespec-ms buf (nio-layout-atime-off (nio-stat-layout)))))))
-(define (nio-creation-time-ms fp follow?)
-  (if (nio-windows?)
-      (let ((t (win32-file-times fp))) (and t (vector-ref t 0)))
-      (let ((off (let ((l (nio-stat-layout))) (and l (nio-layout-birth-off l)))))
-        (if off
-            (let ((buf (nio-stat-buf fp follow?))) (and buf (nio-timespec-ms buf off)))
-            (nio-statx-btime-ms fp follow?)))))
-;; The attribute NM's time as epoch ms, honoring NOFOLLOW on a link like the mtime.
-(define (nio-time-attr-ms fp nm opts)
-  (let ((follow? (not (and (nio-opts-nofollow? opts) (nio-is-symlink? fp)))))
-    (or (cond ((string=? nm "lastAccessTime") (nio-access-time-ms fp follow?))
-              ((string=? nm "creationTime")   (nio-creation-time-ms fp follow?))
-              (else #f))
-        (nio-lmtime-millis fp opts))))
+      (let ((t (win32-file-times fp follow?)))
+        (and t (make-file-time-ns
+                (vector-ref t (cond ((string=? nm "creationTime") 0)
+                                    ((string=? nm "lastAccessTime") 1)
+                                    (else 2))))))
+      (let ((lay (nio-stat-layout)))
+        (and lay
+             (let ((off (cond ((string=? nm "lastAccessTime") (nio-layout-atime-off lay))
+                              ((string=? nm "creationTime") (nio-layout-birth-off lay))
+                              (else (nio-layout-mtime-off lay)))))
+               (if off
+                   (let ((buf (nio-stat-buf fp follow?))) (and buf (nio-stat-file-time buf off)))
+                   (nio-statx-btime fp follow?)))))))
+;; The same, never #f: a host or filesystem with no birth time answers the mtime,
+;; which is the JDK's fallback too, and a host with no stat layout the
+;; millisecond mtime Chez reads.
+(define (nio-time-attr fp nm follow?)
+  (or (nio-read-time fp nm follow?)
+      (and (not (string=? nm "lastModifiedTime")) (nio-read-time fp "lastModifiedTime" follow?))
+      (make-file-time (file-mtime-millis fp))))
 
 ;; Setting them. utimensat(2) with UTIME_OMIT in the mtime slot moves the access
 ;; time alone; its constants are per-OS (measured with cc/gcc as above). The
@@ -1373,49 +1473,34 @@
 ;; Windows through SetFileTime; Linux has no way to set it and the JDK ignores
 ;; the set there, so this answers #t without doing anything. Both answer whether
 ;; the time was set.
-(define c-utimensat (jolt-foreign-proc-safe "utimensat" '(int string u8* int) 'int))
 (define c-setattrlist (jolt-foreign-proc-safe "setattrlist" '(string u8* u8* size_t unsigned-long) 'int))
-(define (nio-timespec ms)
-  (let ((ts (make-bytevector 16 0)))
-    (bytevector-s64-set! ts 0 (div ms 1000) (native-endianness))
-    (bytevector-s64-set! ts 8 (* (mod ms 1000) 1000000) (native-endianness))
-    ts))
-(define (nio-set-access-time! fp ms follow?)
-  (if (nio-windows?)
-      (win32-set-file-times! fp #f ms #f)
-      (let ((k (case (sa-os-family)           ; #(AT_FDCWD UTIME_OMIT AT_SYMLINK_NOFOLLOW)
-                 ((linux) '#(-100 1073741822 #x100))
-                 ((macos) '#(-2 -2 #x20))
-                 (else #f))))
-        (and c-utimensat k
-             (let ((ts (make-bytevector 32 0)))
-               (bytevector-copy! (nio-timespec ms) 0 ts 0 16)
-               (bytevector-s64-set! ts 24 (vector-ref k 1) (native-endianness))
-               (= 0 (c-utimensat (vector-ref k 0) fp ts (if follow? 0 (vector-ref k 2)))))))))
-(define (nio-set-creation-time! fp ms follow?)
-  (cond ((nio-windows?) (win32-set-file-times! fp ms #f #f))
+;; Each setter takes epoch NANOSECONDS; io.ss set-file-times-ns! is the one
+;; utimensat / SetFileTime call for the access and modification times.
+(define (nio-set-mtime! fp ns follow?) (set-file-times-ns! fp #f ns follow?))
+(define (nio-set-access-time! fp ns follow?) (set-file-times-ns! fp ns #f follow?))
+(define (nio-set-creation-time! fp ns follow?)
+  (cond ((nio-windows?) (win32-set-file-times! fp ns #f #f follow?))
         ((eq? (sa-os-family) 'macos)
          ;; struct attrlist: bitmapcount=ATTR_BIT_MAP_COUNT(5)@0, commonattr@4;
          ;; the buffer is the one timespec; options FSOPT_NOFOLLOW=1.
          (and c-setattrlist
-              (let ((al (make-bytevector 24 0)))
+              (let ((al (make-bytevector 24 0)) (ts (make-bytevector 16 0)))
                 (bytevector-u16-set! al 0 5 (native-endianness))
                 (bytevector-u32-set! al 4 #x200 (native-endianness))
-                (= 0 (c-setattrlist fp al (nio-timespec ms) 16 (if follow? 0 1))))))
+                (timespec-bytes! ts 0 ns)
+                (= 0 (c-setattrlist fp al ts 16 (if follow? 0 1))))))
         (else #t)))
 (let ((files-nofollow-time
        (list
         (cons "getLastModifiedTime" (lambda (p . opts)
-                                      (let ((fp (nfp p)))
-                                        (unless (or (file-exists? fp) (nio-is-symlink? fp)) (nio-no-such-file (nio-shown p)))
-                                        (make-file-time (nio-lmtime-millis fp opts)))))
+                                      (let ((fp (nfp p)) (follow? (not (nio-opts-nofollow? opts))))
+                                        (nio-attrs-require-exists! fp follow? (nio-shown p))
+                                        (nio-attr-value fp "lastModifiedTime" follow?))))
         (cons "getAttribute" (lambda (path attr . opts)
-                               (let ((fp (nfp path)) (nm (nio-attr-name (npath-string-of attr))))
-                                 (cond ((member nm '("lastModifiedTime" "creationTime" "lastAccessTime"))
-                                        (make-file-time (nio-time-attr-ms fp nm opts)))
-                                       ((string=? nm "fileKey")
-                                        (nio-file-key fp (not (and (nio-opts-nofollow? opts) (nio-is-symlink? fp)))))
-                                       (else (nio-attr-value fp nm)))))))))
+                               (let ((fp (nfp path)) (nm (nio-attr-name (npath-string-of attr)))
+                                     (follow? (not (nio-opts-nofollow? opts))))
+                                 (nio-attrs-require-exists! fp follow? (nio-shown path))
+                                 (nio-attr-value fp nm follow?)))))))
   (set! files-accum-chunks (cons files-nofollow-time files-accum-chunks)))
 
 ;; java.nio.channels.FileChannel/open — babashka.fs/touch uses it only to create
@@ -1446,25 +1531,25 @@
 ;; Windows went unset with no sign of it (jolt-lang/jolt#1119).
 (define (nio-time-set-or-raise! fp what set?)
   (unless set?
-    (nio-fs-throw "java.nio.file.FileSystemException" (string-append fp ": cannot set the " what))))
+    (nio-fs-throw "java.nio.file.FileSystemException" fp #f (string-append "cannot set the " what))))
 (define (nio-mtime-set-or-raise! fp set?) (nio-time-set-or-raise! fp "last modified time" set?))
 (let ((files-throwing-setters
        (list
         (cons "setLastModifiedTime" (lambda (p t) (let ((fp (nfp p))) (nio-require-exists fp (nio-shown p))
-                                                    (nio-mtime-set-or-raise! (nio-shown p) (set-file-mtime-millis! fp (file-time-ms t)))
+                                                    (nio-mtime-set-or-raise! (nio-shown p) (nio-set-mtime! fp (file-time-ns t) #t))
                                                     (->path p))))
         (cons "setAttribute" (lambda (path attr value . opts)
                                (let ((fp (nfp path)) (nm (nio-attr-name (npath-string-of attr))))
                                  (when (member nm '("lastModifiedTime" "creationTime" "lastAccessTime"))
                                    (nio-require-exists fp (nio-shown path))
-                                   (let ((ms (if (file-time? value) (file-time-ms value) (jnum->exact value)))
-                                         (follow? (not (and (nio-opts-nofollow? opts) (nio-is-symlink? fp)))))
+                                   (let ((ns (if (file-time? value) (file-time-ns value) (* (jnum->exact value) 1000000)))
+                                         (follow? (not (nio-opts-nofollow? opts))))
                                      (cond ((string=? nm "lastModifiedTime")
-                                            (nio-mtime-set-or-raise! (nio-shown path) (nio-set-lmtime! fp ms opts)))
+                                            (nio-mtime-set-or-raise! (nio-shown path) (nio-set-mtime! fp ns follow?)))
                                            ((string=? nm "lastAccessTime")
-                                            (nio-time-set-or-raise! (nio-shown path) "last access time" (nio-set-access-time! fp ms follow?)))
+                                            (nio-time-set-or-raise! (nio-shown path) "last access time" (nio-set-access-time! fp ns follow?)))
                                            (else
-                                            (nio-time-set-or-raise! (nio-shown path) "creation time" (nio-set-creation-time! fp ms follow?))))))
+                                            (nio-time-set-or-raise! (nio-shown path) "creation time" (nio-set-creation-time! fp ns follow?))))))
                                  (->path path)))))))
   (set! files-accum-chunks (cons files-throwing-setters files-accum-chunks)))
 
@@ -1560,8 +1645,10 @@
                                (nio-write-bv! d (nio-read-bv s))
                                (let ((mode (nio-stat-mode s)))            ; preserve source perms
                                  (when (and mode c-chmod) (c-chmod d (bitwise-and mode #o777))))
+                               ;; COPY_ATTRIBUTES carries both times, at full resolution
                                (when (nio-opts-have? opts copt-sym 'copy-attributes)
-                                 (set-file-mtime-millis! d (file-mtime-millis s)))))
+                                 (set-file-times-ns! d (file-time-ns (nio-time-attr s "lastAccessTime" #t))
+                                                     (file-time-ns (nio-time-attr s "lastModifiedTime" #t)) #t))))
                             (->path dst))))))))) ))
   (set! files-accum-chunks (cons files-final files-accum-chunks)))
 
