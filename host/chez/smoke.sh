@@ -953,6 +953,19 @@ else
   fails=$((fails + 1))
 fi
 
+# Thread.getStackTrace / StackTraceElement: frames reconstructed the way an
+# uncaught error's backtrace is, named like the JVM's (ns$fn). test.check's
+# clojure-test reporter walks this stack for an assertion's file:line.
+st_out="$($jolt run test/chez/stack-trace-test.clj 2>/dev/null)"
+if printf '%s' "$st_out" | grep -q 'STACK-TRACE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: Thread.getStackTrace"
+  echo "    $(printf '%s' "$st_out" | grep STACK-TRACE-RESULT | tail -1)"
+  printf '%s' "$st_out" | grep 'stack-trace FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # clojure.zip + clojure.data: the surface data.zip and cider-nrepl drive, including
 # the SHAPE of a diff result (its map arm is a seq, its vector/set arms are
 # vectors). Both load on require, so they cannot be corpus rows.

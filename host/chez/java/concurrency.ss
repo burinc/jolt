@@ -1751,7 +1751,10 @@
                                   (jolt-final-str (cadr args)))))))
           '("Thread" "java.lang.Thread"))
 (register-host-methods! "user-thread"
-  (list (cons "start" (lambda (self)
+  ;; another thread's frames live on its own continuation, which this thread
+  ;; cannot walk: an empty StackTraceElement[]
+  (list (cons "getStackTrace" (lambda (self) (jolt-vector)))
+        (cons "start" (lambda (self)
           (let ((st (jhost-state self)))
             (when (vector-ref st 5)
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"

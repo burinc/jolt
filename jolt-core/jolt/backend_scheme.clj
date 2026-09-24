@@ -1068,19 +1068,19 @@
 ;; the same reason: a (.concat s nil) in tail position raises from inside the
 ;; host, and without the site the fn it sat in is the one frame the report
 ;; cannot recover.
-(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call})
-;; A try with neither a catch nor a finally is tail-transparent too, because
-;; emit-try emits it as its body and nothing else: there is no guard and no
-;; dynamic-wind between the caller and that body, so a tail call inside one is a
-;; real tail call and needs its site stored like any other. Treating it as opaque
-;; stored nothing, TCO erased the frames anyway, and the trace lost every frame
-;; from the try outwards — (defn wrapped [x] (try (boom x))) reported `boom` and
-;; then stopped, where the same fn without the try named itself and its caller.
-;; A try that HAS a catch or a finally is genuinely not tail-transparent and stays
-;; opaque; this reads the same two keys emit-try branches on.
+(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call :try})
+;; A try is tail-transparent too. With neither a catch nor a finally, emit-try
+;; emits it as its body and nothing else, so a tail call inside one is a real tail
+;; call. With a catch or a finally the body runs inside a guard or dynamic-wind,
+;; so its last call is not a Chez tail call — but the guard itself is, and it
+;; erases the enclosing fn's frame all the same. The body's last call is then the
+;; fn's exit: storing its site and registering it as a tail edge is what lets a
+;; trace, or Thread.getStackTrace, name the fn the try sat in. Treating the try
+;; as opaque lost every frame from the try outwards —
+;; (defn wrapped [x] (try (boom x))) reported `boom` and then stopped. The
+;; finally body is not the fn's exit; emit-try emits it non-tail.
 (defn- tail-transparent? [node]
-  (or (contains? tail-transparent-ops (:op node))
-      (and (= :try (:op node)) (nil? (:catch-sym node)) (nil? (:finally node)))))
+  (contains? tail-transparent-ops (:op node)))
 (defn emit [node]
   (let [s (if (and *tail?* (not (tail-transparent? node)))
             (binding [*tail?* false] (emit* node))
@@ -3253,7 +3253,7 @@
                (emit (:body node)))]
     (if-let [fin (:finally node)]
       (str "(dynamic-wind jolt-finally-in (lambda () " core ")"
-           " (lambda () " (emit fin) "))")
+           " (lambda () " (binding [*tail?* false] (emit fin)) "))")
       core)))
 
 ;; Does this IR node emit to an expression that yields a Scheme boolean? Used to

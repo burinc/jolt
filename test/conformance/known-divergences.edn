@@ -842,18 +842,19 @@
            :jvm "[\"java.lang.Float\" false]"
            :jolt "[\"java.lang.Double\" true]"}
    :note "Chez has one flonum. instance? is deliberately permissive for Float/Double and Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset."}
-  ;; (.getStackTrace (Thread/currentThread)) is empty. jolt does proper tail calls,
-  ;; so the frames a caller-naming API wants are the ones TCO has already erased —
-  ;; (defn f [x y] (g x y)) leaves no f frame to find. jolt reports a backtrace for a
-  ;; THROW by walking the live continuation, which is the non-tail spine and is what
-  ;; error reporting actually needs; there is no reified stack to hand back on demand.
+  ;; Thread.getStackTrace names the frames jolt can reconstruct: the live
+  ;; continuation, plus callers TCO erased that the compile-time callsite tables
+  ;; name (a static tail edge, or the one most recent tail site bridging a gap).
+  ;; A caller erased by a tail call through a fn VALUE — apply of a var holding a
+  ;; wrapper, as spec's instrument installs — with no live named frame above it
+  ;; has nothing static pointing at it, so it is left out rather than guessed.
   {:category :host-model
-   :behavior "(.getStackTrace (Thread/currentThread)), and clojure.spec.test.alpha's ::caller derived from it"
-   :jvm "the caller's frames; ::caller {:var-scope the-calling-var}"
-   :jolt "an empty StackTraceElement[]; no ::caller key"
-   :check {:expr "(zero? (count (.getStackTrace (Thread/currentThread))))"
-           :jvm "false"
-           :jolt "true"}
+   :behavior "(.getStackTrace (Thread/currentThread)) for a caller erased by a tail call through a fn value, and clojure.spec.test.alpha's ::caller derived from it"
+   :jvm "the caller's frame is there; ::caller {:var-scope the-calling-var}"
+   :jolt "the frame is missing; no ::caller key"
+   :check {:expr "(do (defn dv-g [& a] (mapv (fn [e] (.getClassName e)) (.getStackTrace (Thread/currentThread)))) (def dv-h dv-g) (defn dv-f [& a] (apply dv-h a)) (boolean (some (fn [c] (.contains c \"dv_f\")) (dv-f 1))))"
+           :jvm "true"
+           :jolt "false"}
    :note "Inherent to tail calls, not a missing shim. spec's instrument still throws the same conform ExceptionInfo with the same explain-data — only the ::caller annotation is absent. Surfaces in spec.alpha's clojure.test-clojure.instr suite."}
   ;; clojure.instant's third reader. jolt has one millisecond instant type, so
   ;; java.sql.Timestamp is java.util.Date and the sub-millisecond digits are gone.
