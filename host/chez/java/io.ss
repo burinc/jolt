@@ -299,17 +299,19 @@
                   (cons (substring p pn i) (substring p (+ i 2) (string-length p))))
                  (else (loop (+ i 1))))))))
 (define (jar-path? p) (and (jar-path-split p) #t))
-(define (make-jar-path jar entry) (string-append jar-path-prefix jar "!/" entry))
+(define (make-jar-path jar entry) (string-append jar-path-prefix (file-uri-path jar) "!/" entry))
 ;; The archive index and the entry a jar path names, or (values #f #f) when the
 ;; archive is not readable or has no such entry.
 (define (jar-path-entry p)
   (let ((parts (jar-path-split p)))
     (if (not parts)
         (values #f #f)
-        (let ((d (zipdir-for (car parts))))
+        ;; the archive is a file: URL's path, the entry a URL path segment:
+        ;; both may be escaped, and the jar may be spelled "/C:/…" (#1118)
+        (let ((d (zipdir-for (file-url->path (car parts)))))
           (if (not d)
               (values #f #f)
-              (let ((ent (hashtable-ref (zipdir-table d) (cdr parts) #f)))
+              (let ((ent (hashtable-ref (zipdir-table d) (uri-decode-lenient (cdr parts)) #f)))
                 (if ent (values d ent) (values #f #f))))))))
 (define (jar-path-exists? p)
   (let-values (((d ent) (jar-path-entry p))) (and ent #t)))
@@ -560,10 +562,91 @@
              (not (char=? (string-ref abs (- (string-length abs) 1)) #\/)))
         (string-append abs "/")
         abs)))
+;; The two edges between a filesystem path and the path of a file: URL, per
+;; platform (jolt-lang/jolt#1118). Everything between them is written once over
+;; the URL spelling; the platform is a parameter so the Windows rows are pinned
+;; from any host (test/chez/win-platform-test.ss).
+;;
+;; OUT, java.io.File.slashify over an absolute path: on Windows the separators
+;; become "/" and the path gains the "/" a drive does not start with, so
+;; "C:\a\b" is "/C:/a/b" and the URL "file:/C:/a/b" — the JDK's spelling, and
+;; the one every consumer of a file URL expects. A UNC path keeps its host as the
+;; JDK does: "//srv/sh" becomes "////srv/sh". POSIX paths are already in URL
+;; form. Characters are NOT encoded here; File.toURI encodes, File.toURL and
+;; jolt's own file:/jar:file: spellings do not.
+(define (file-uri-path-for windows? abs)
+  (if windows?
+      (let* ((p (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list abs))))
+             (p (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/))
+                    p
+                    (string-append "/" p))))
+        (if (and (>= (string-length p) 2) (string=? (substring p 0 2) "//"))
+            (string-append "//" p)
+            p))
+      abs))
+(define (file-uri-path abs) (file-uri-path-for (win32?) abs))
+
+;; IN, the filesystem path a file: URL names — what the JDK's file: handler
+;; opens. An empty or "localhost" authority is dropped ("file:///a" is "/a"),
+;; any other is a UNC host ("file://srv/sh/x" is "//srv/sh/x"); %hh escapes are
+;; decoded, since File.toURI writes them; and on Windows the "/" in front of a
+;; drive is dropped, since "/C:/a" is a path on the current drive's root that
+;; names nothing. The JVM rejects a malformed escape; a "%" that does not start
+;; one is left as a literal here, because jolt's own file: spellings carry the
+;; path unencoded and a "%" in a file name must still open.
+(define (file-url->path-for windows? spec)
+  (let* ((rest (if (and (>= (string-length spec) 5) (string-ci=? (substring spec 0 5) "file:"))
+                   (substring spec 5 (string-length spec))
+                   spec))
+         (rest (if (and (>= (string-length rest) 2) (string=? (substring rest 0 2) "//"))
+                   (let* ((n (string-length rest))
+                          (slash (let loop ((j 2)) (cond ((>= j n) n)
+                                                         ((char=? (string-ref rest j) #\/) j)
+                                                         (else (loop (+ j 1))))))
+                          (host (substring rest 2 slash))
+                          (path (substring rest slash n)))
+                     (if (or (string=? host "") (string-ci=? host "localhost"))
+                         path
+                         (string-append "//" host path)))
+                   rest))
+         (p (uri-decode-lenient rest)))
+    (if (and windows?
+             (>= (string-length p) 3)
+             (char=? (string-ref p 0) #\/)
+             (windows-drive-prefix? (substring p 1 (string-length p)))
+             (or (= (string-length p) 3) (path-separator-char? (string-ref p 3))))
+        (substring p 1 (string-length p))
+        p)))
+(define (file-url->path spec) (file-url->path-for (win32?) spec))
+
+;; The path a STRING names as a clojure.java.io source or sink. Its Coercions
+;; try (URL. s) before (File. s), so "file:/a/b" is the file /a/b rather than a
+;; relative path whose first segment is "file:"; any other string is a path.
+(define (file-url-string? s)
+  (and (>= (string-length s) 5) (string-ci=? (substring s 0 5) "file:")))
+(define (io-source-path s)
+  (project-relative (if (file-url-string? s) (file-url->path s) s)))
+
+;; %hh decoding when every "%" starts a well-formed escape, else the text as it
+;; is (see file-url->path-for).
+(define (uri-decode-lenient s)
+  (let ((n (string-length s)))
+    (let loop ((i 0))
+      (cond ((>= i n) (uri-decode s))
+            ((char=? (string-ref s i) #\%)
+             (if (and (<= (+ i 3) n) (uri-hex? (string-ref s (+ i 1))) (uri-hex? (string-ref s (+ i 2))))
+                 (loop (+ i 3))
+                 s))
+            (else (loop (+ i 1)))))))
+
 ;; File.toURI / Path.toUri: a java.net.URI over the file: form of the path, its
 ;; characters percent-encoded and an existing directory's ending in a slash.
-(define (jfile->uri p)
-  (uri-parse (string-append "file:" (uri-quote-path (jfile-uri-path p)))))
+(define (jfile->uri-spec p)
+  (string-append "file:" (uri-quote-path (file-uri-path (jfile-uri-path p)))))
+(define (jfile->uri p) (uri-parse (jfile->uri-spec p)))
+;; File.toURL: the same URL unencoded, as the JDK's (deprecated) toURL spells it.
+(define (jfile->url-spec p)
+  (string-append "file:" (file-uri-path (jfile-uri-path p))))
 
 ;; --- canonical paths --------------------------------------------------------
 ;; getCanonicalPath is realpath(3), not "make it absolute": it resolves
@@ -793,6 +876,44 @@
                     (lambda (w) (guard (e (#t win32-INVALID-FILE-ATTRIBUTES)) (f w))))))
            (and (not (= a win32-INVALID-FILE-ATTRIBUTES)) a)))))
 
+;; A FILETIME: 100-nanosecond intervals since 1601-01-01 UTC, which is
+;; 11644473600 seconds before the Unix epoch. Pure, so the conversion is pinned
+;; from any host (test/chez/win-platform-test.ss).
+(define win32-epoch-offset-ms 11644473600000)
+(define (unix-ms->filetime ms) (* (+ ms win32-epoch-offset-ms) 10000))
+
+(define win32-FILE-WRITE-ATTRIBUTES      #x100)
+(define win32-FILE-SHARE-ALL             #x7)          ; read | write | delete
+(define win32-OPEN-EXISTING              3)
+(define win32-FILE-FLAG-BACKUP-SEMANTICS #x02000000)   ; what opens a directory
+(define win32-INVALID-HANDLE-VALUE       -1)
+
+(define-win32-proc win32-create-file-w
+  "kernel32.dll" "CreateFileW" (void* unsigned-32 unsigned-32 void* unsigned-32 unsigned-32 void*) iptr)
+(define-win32-proc win32-set-file-time
+  "kernel32.dll" "SetFileTime" (iptr void* void* u8*) int)
+(define-win32-proc win32-close-handle
+  "kernel32.dll" "CloseHandle" (iptr) int)
+
+;; Files.setLastModifiedTime on Windows, as WindowsFileAttributeViews does it:
+;; open the path for FILE_WRITE_ATTRIBUTES — with FILE_FLAG_BACKUP_SEMANTICS,
+;; the flag that lets CreateFile open a directory at all — and set only the
+;; last-write time. Answers whether it was set; #f off Windows.
+(define (win32-set-file-mtime-millis! path ms)
+  (let ((create (win32-create-file-w)) (set-time (win32-set-file-time))
+        (close (win32-close-handle)))
+    (and create set-time close
+         (let ((h (win32-with-wstr path
+                    (lambda (w)
+                      (create w win32-FILE-WRITE-ATTRIBUTES win32-FILE-SHARE-ALL 0
+                              win32-OPEN-EXISTING win32-FILE-FLAG-BACKUP-SEMANTICS 0)))))
+           (and (not (= h win32-INVALID-HANDLE-VALUE))
+                (let ((ft (make-bytevector 8 0)))
+                  (bytevector-u64-set! ft 0 (unix-ms->filetime ms) (endianness little))
+                  (let ((ok (not (= 0 (set-time h 0 0 ft)))))
+                    (close h)
+                    ok)))))))
+
 ;; The ROOT of P — the prefix that is not a segment and must be reproduced
 ;; verbatim — and the index the segments start at. Rendered with "/" separators,
 ;; the spelling getAbsolutePath and babashka.fs/absolutize already answer with
@@ -1013,28 +1134,23 @@
 ;; its field (< 1e6) so a signed 64-bit native-endian write covers the layout.
 ;; Resolved via jolt-foreign-proc-safe — a literal foreign-procedure here is a
 ;; fasl relocation that aborts the boot on platforms lacking the symbol.
-;; Windows has no utimes; its CRT _utime64 takes {actime, modtime} as two
-;; signed 64-bit seconds (16 bytes, second resolution).
+;; Windows has no utimes, and its CRT's _utime64 is no substitute: it opens the
+;; path without FILE_FLAG_BACKUP_SEMANTICS, so it cannot open a DIRECTORY and a
+;; directory's mtime was never set (jolt-lang/jolt#1119) — and it has second
+;; resolution. win32-set-file-mtime-millis! below is what the JDK's Windows
+;; provider does. Answers whether the time was set.
 (define c-utimes (jolt-foreign-proc-safe "utimes" '(string u8*) 'int))
-(define c-utime64 (and (not c-utimes)
-                       (jolt-foreign-proc-safe "_utime64" '(string u8*) 'int)))
 (define (set-file-mtime-millis! p ms)
-  (let ((sec (div ms 1000)))
-    (cond
-      (c-utimes
-       (let ((tv (make-bytevector 32 0))
-             (usec (* (mod ms 1000) 1000)))
-         (bytevector-s64-set! tv 0 sec (native-endianness))
-         (bytevector-s64-set! tv 8 usec (native-endianness))
-         (bytevector-s64-set! tv 16 sec (native-endianness))
-         (bytevector-s64-set! tv 24 usec (native-endianness))
-         (= (c-utimes p tv) 0)))
-      (c-utime64
-       (let ((tb (make-bytevector 16 0)))
-         (bytevector-s64-set! tb 0 sec (native-endianness))
-         (bytevector-s64-set! tb 8 sec (native-endianness))
-         (= (c-utime64 p tb) 0)))
-      (else #f))))
+  (if c-utimes
+      (let ((sec (div ms 1000))
+            (tv (make-bytevector 32 0))
+            (usec (* (mod ms 1000) 1000)))
+        (bytevector-s64-set! tv 0 sec (native-endianness))
+        (bytevector-s64-set! tv 8 usec (native-endianness))
+        (bytevector-s64-set! tv 16 sec (native-endianness))
+        (bytevector-s64-set! tv 24 usec (native-endianness))
+        (= (c-utimes p tv) 0))
+      (win32-set-file-mtime-millis! p ms)))
 ;; mkdir -p: create p and any missing parents. Returns #t if p ends up a dir.
 (define (mkdirs! p)
   (unless (or (= 0 (string-length p)) (file-exists? p))
@@ -1086,9 +1202,6 @@
     (and (> (vector-length st) 1)
          (let ((h (vector-ref st 1))) (and (not (jolt-nil? h)) h)))))
 (define (url-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "url")))
-(define (url-strip-scheme spec)
-  (if (and (>= (string-length spec) 5) (string=? (substring spec 0 5) "file:"))
-      (substring spec 5 (string-length spec)) spec))
 ;; The path component: the spec without its scheme, and without an authority when
 ;; one is present. "https://example.com/a.html" -> "/a.html", "file:/a/b" -> "/a/b"
 ;; (a file: URL keeps giving the filesystem path callers read it for).
@@ -1112,7 +1225,7 @@
 (define (url-write-path u)
   (let ((spec (url-spec u)))
     (if (string=? (url-protocol spec) "file")
-        (url-strip-scheme spec)
+        (file-url->path spec)
         (throw-jvm (quote IllegalArgumentException)
                    (string-append "Can not write to non-file URL <" spec ">")))))
 
@@ -1239,7 +1352,7 @@
       ;; FileInputStream resolves a relative path against user.dir and raises
       ;; java.io.FileNotFoundException for a missing one, both like the JVM.
       ((string=? (url-protocol spec) "file")
-       (host-new "FileInputStream" (url-strip-scheme spec)))
+       (host-new "FileInputStream" (file-url->path spec)))
       ;; an entry of a jar on the roots streams out of the archive
       ((jar-path? spec) (jar-path-stream spec))
       (else (throw-jvm (quote java.io.IOException)
@@ -1308,7 +1421,7 @@
       ((string=? name "getCanonicalPath")(list (jfile-canonical fp)))
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (jfile->uri fp)))
-      ((string=? name "toURL")          (list (make-url (string-append "file:" (jfile-uri-path fp)))))
+      ((string=? name "toURL")          (list (make-url (jfile->url-spec fp))))
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
@@ -1776,7 +1889,7 @@
       ;; JVM, where a bare path here would resolve against the process cwd -- the
       ;; jolt repo root under the launcher, not the project the user is in.
       ((string=? (url-protocol spec) "file")
-       (slurp-path (project-relative (url-strip-scheme spec))))
+       (slurp-path (project-relative (file-url->path spec))))
       ((jar-path? spec) (slurp-path spec))
       (else (throw-jvm (quote java.io.IOException)
                        (string-append "protocol doesn't support input: " spec))))))
@@ -1825,7 +1938,7 @@
     ;; a byte input-stream shim (e.g. clj-http-lite's :as :stream body): drain it.
     ((and (htable? src) (jolt-truthy? (jolt-ref-get src (keyword "jolt" "input-stream"))))
      (decode-bytevector (drain-byte-stream src) (slurp-encoding opts)))
-    ((string? src) (slurp-path (project-relative src)))
+    ((string? src) (slurp-path (io-source-path src)))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
 (define (spit-append? opts)
@@ -2060,7 +2173,7 @@
 ;; IllegalArgumentException, as the JVM's File(URI) throws.
 (define (url-file-coercion u)
   (if (string=? (url-protocol (url-spec u)) "file")
-      (make-jfile (url-strip-scheme (url-spec u)))
+      (make-jfile (file-url->path (url-spec u)))
       (throw-jvm 'IllegalArgumentException (string-append "Not a file: " (url-spec u)))))
 (def-var! "clojure.java.io" "as-file"
   ;; Clojure extends Coercions to nil, so (io/as-file nil) is nil -- NOT a File
@@ -2090,7 +2203,7 @@
 ;; base every other filesystem touch uses, dropping a leading "./" so the path
 ;; reads like the JVM's instead of carrying a "/./" segment.
 (define (resource-file-url root nm)
-  (make-url (string-append "file:" (root-path-abs (string-append root "/" nm)))))
+  (make-url (string-append "file:" (file-uri-path (root-path-abs (string-append root "/" nm))))))
 ;; A path under a source root made absolute for a URL: the roots are spelled as
 ;; deps.edn spells them ("./src", "./lib.jar"), and the JVM's URL for a resource
 ;; carries no "./" segment, so a leading one is dropped before the cwd is put in
@@ -2218,13 +2331,14 @@
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.
-;; as-url of a File is File.toURL — a file: URL (JVM), so the spec carries the
-;; scheme; a bare string keeps its spec as given.
+;; as-url of a File is clojure.java.io's (.toURL (.toURI f)) — the encoded
+;; file: URL File.toURI spells, "file:/C:/…" on Windows (#1118); a bare string
+;; keeps its spec as given.
 (def-var! "clojure.java.io" "as-url"
   (lambda (x)
     (cond ((and (jhost? x) (string=? (jhost-tag x) "url")) x)
           ((htable? x) x)
-          (else (let ((spec (if (jfile? x) (string-append "file:" (jfile-fs x)) (jolt-str-render-one x)))
+          (else (let ((spec (if (jfile? x) (jfile->uri-spec (jfile-fs x)) (jolt-str-render-one x)))
                       (ctor (lookup-class class-ctors-tbl "URL")))
                   (if ctor (ctor spec) (make-url spec)))))))
 

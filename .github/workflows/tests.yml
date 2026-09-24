@@ -238,9 +238,11 @@ jobs:
       # why this job missed jolt-lang/jolt#1108 — every subprocess spawn failed
       # on Windows, silently, for a whole release. winplatform ends in a LIVE
       # spawn through ProcessBuilder, so on this runner it drives CreateProcessW
-      # end to end.
+      # end to end. winparity replays the #1108/#1109/#1117/#1118/#1119 repros
+      # (spawn, PushbackReader close, file: URLs, directory mtimes) through the
+      # CLI on this runner's filesystem.
       - name: Gate the Windows path, PATH and process rows
-        run: make CHEZ=./chez-install/bin/chez winplatform winpath
+        run: make CHEZ=./chez-install/bin/chez winplatform winpath winparity
 
       # java.util.zip in script mode under MSYS2 (#916). There are no jolt_z_*
       # names there: zlib.ss binds the process's own zlib if scheme.exe exports

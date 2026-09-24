@@ -637,6 +637,44 @@
       (ok "no Win32 entry resolves on a POSIX host" (not (proc-win-spawn-ok?)))
       (ok "proc-win? is false on a POSIX host" (not proc-win?))))
 
+;; --- file: URLs, both directions (jolt-lang/jolt#1118) -------------------------
+;; File.toURI on Windows rendered "file:C:%5CUsers%5C…": the separators were
+;; percent-encoded and the drive had no "/" in front, so jolt could not open the
+;; URL its own toURI produced, and the JDK's spellings "file:/C:/…" and
+;; "file:///C:/…" were refused as "/C:/…" paths. Whatever toURI emits has to
+;; come back through the opener as the same path.
+(same "uri path: drive, backslashes"   (file-uri-path-for #t "C:\\Users\\x\\a.txt") "/C:/Users/x/a.txt")
+(same "uri path: drive, slashes"       (file-uri-path-for #t "C:/Users/x/a.txt")    "/C:/Users/x/a.txt")
+(same "uri path: UNC keeps its host"   (file-uri-path-for #t "\\\\srv\\sh\\a")      "////srv/sh/a")
+(same "uri path: posix unchanged"      (file-uri-path-for #f "/a/b\\c")             "/a/b\\c")
+
+(same "url->path: JDK spelling"        (file-url->path-for #t "file:/C:/Users/x/a.txt")   "C:/Users/x/a.txt")
+(same "url->path: empty authority"     (file-url->path-for #t "file:///C:/Users/x/a.txt") "C:/Users/x/a.txt")
+(same "url->path: localhost authority" (file-url->path-for #t "file://localhost/C:/a")    "C:/a")
+(same "url->path: bare drive"          (file-url->path-for #t "file:C:/a/b")              "C:/a/b")
+(same "url->path: raw backslashes"     (file-url->path-for #t "file:C:\\a\\b")            "C:\\a\\b")
+(same "url->path: escaped separators"  (file-url->path-for #t "file:C:%5CUsers%5Cx")      "C:\\Users\\x")
+(same "url->path: escaped space"       (file-url->path-for #t "file:/C:/has%20space/x")   "C:/has space/x")
+(same "url->path: UNC host"            (file-url->path-for #t "file://srv/sh/a")          "//srv/sh/a")
+(same "url->path: drive root"          (file-url->path-for #t "file:/C:/")                "C:/")
+(same "url->path: a stray % is literal" (file-url->path-for #t "file:/C:/100%/x")         "C:/100%/x")
+(same "url->path: utf-8 escapes"       (file-url->path-for #f "file:/a/%C3%A4")           "/a/\x00e4;")
+;; POSIX keeps the leading "/", and a path whose first segment merely LOOKS like
+;; a drive is still a POSIX path
+(same "url->path: posix"               (file-url->path-for #f "file:/a/b")                "/a/b")
+(same "url->path: posix empty authority" (file-url->path-for #f "file:///a/b")            "/a/b")
+(same "url->path: posix /C: is a name" (file-url->path-for #f "file:/C:/a")               "/C:/a")
+(same "url->path: relative"            (file-url->path-for #f "file:a/b")                 "a/b")
+;; the round trip toURI's spelling has to survive, per platform
+(for-each
+  (lambda (w? path want)
+    (same (format "round trip ~s (windows? ~s)" path w?)
+          (file-url->path-for w? (string-append "file:" (uri-quote-path (file-uri-path-for w? path))))
+          want))
+  '(#t #t #f)
+  '("C:\\Users\\has space\\x.txt" "C:/100%/x" "/tmp/has space/x.txt")
+  '("C:/Users/has space/x.txt" "C:/100%/x" "/tmp/has space/x.txt"))
+
 ;; --- a LIVE spawn, on whichever host is running -------------------------------
 ;; Everything above is a table. This is the part that would actually have caught
 ;; jolt-lang/jolt#1108: it starts a real child through the real ProcessBuilder, so

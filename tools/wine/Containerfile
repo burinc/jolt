@@ -1,0 +1,39 @@
+# A Linux box that runs jolt's Windows build under Wine.
+#
+# Chez 10.4.1 is built twice: natively (ta6le, the host that runs the build
+# scripts) and as a MinGW cross build for ta6nt, which yields scheme.exe, the
+# ta6nt boot files, libkernel.a and the xpatch that `make jolt-release
+# JOLT_CROSS_TARGET=ta6nt` retargets code generation with.
+#
+#   podman build --platform linux/amd64 -t jolt-wine tools/wine
+#   tools/wine/run.sh <command>     # repo mounted at /work
+FROM docker.io/library/debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
+      build-essential git ca-certificates xxd make \
+      liblz4-dev zlib1g-dev libncurses-dev uuid-dev \
+      gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+      wine wine64 xvfb procps \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG CHEZ_TAG=v10.4.1
+RUN git clone --depth 1 --branch $CHEZ_TAG --recurse-submodules --shallow-submodules \
+      https://github.com/cisco/ChezScheme /opt/chez-src
+WORKDIR /opt/chez-src
+RUN ./configure --threads --disable-x11 -m=ta6le --installprefix=/usr/local && make -j"$(nproc)" && make install
+RUN make bootquick XM=ta6nt
+RUN ./configure --cross --force --threads --disable-x11 -m=ta6nt --toolprefix=x86_64-w64-mingw32- \
+ && make -j"$(nproc)"
+
+# The ta6nt runtime laid out the way the Windows CI jobs lay it out: boot files
+# next to scheme.exe, the csv directory for linking.
+RUN mkdir -p /opt/chez-nt/bin /opt/chez-nt/csv \
+ && cp ta6nt/bin/ta6nt/*.exe /opt/chez-nt/bin/ \
+ && (cp ta6nt/bin/ta6nt/*.dll /opt/chez-nt/bin/ 2>/dev/null || true) \
+ && cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot /opt/chez-nt/bin/ \
+ && cp ta6nt/boot/ta6nt/petite.boot ta6nt/boot/ta6nt/scheme.boot ta6nt/boot/ta6nt/scheme.h \
+       ta6nt/boot/ta6nt/libkernel.a /opt/chez-nt/csv/
+
+ENV WINEDEBUG=-all WINEPREFIX=/root/.wine
+RUN wineboot --init 2>/dev/null; wineserver -w; true
+WORKDIR /work

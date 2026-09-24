@@ -915,6 +915,13 @@
   ;; a path answers a StringReader here, java.io.FileReader is the streaming one.
   {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-pbr-close.txt\") _ (spit f \"ab\") r (java.io.FileReader. f) p (java.io.PushbackReader. r)] (.read p) (.close p) (try (.read r) :not-closed (catch Throwable _ :closed)))" :expected ":closed"}
   {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (java.io.PushbackReader. r)] (.close p) @closed)" :expected "true"}
+  ;; ...and still after clojure.core/read has run over it (jolt-lang/jolt#1117):
+  ;; a form read drains the wrapped reader and swaps a StringReader over the
+  ;; unread tail into its place, and close used to close that swap, leaving the
+  ;; file open until a GC -- on Windows, an undeletable file. jolt.loader reads
+  ;; every source file this way.
+  {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-pbr-read-close.txt\") _ (spit f \"(a) (b)\") r (java.io.FileReader. f) p (java.io.PushbackReader. r)] [(read p) (do (.close p) (try (.read r) :not-closed (catch Throwable _ :closed)))])" :expected "[(a) :closed]"}
+  {:suite "pushback-close" :expr "(let [f (str (System/getProperty \"java.io.tmpdir\") \"/jolt-lnpbr-read-close.txt\") _ (spit f \"(a)\") r (java.io.FileReader. f)] (with-open [p (clojure.lang.LineNumberingPushbackReader. r)] (read p false nil)) (try (.read r) :not-closed (catch Throwable _ :closed)))" :expected ":closed"}
   ;; the line-numbering subclass shares the table, so it delegates identically
   {:suite "pushback-close" :expr "(let [closed (atom false) r (reify java.io.Closeable (close [_] (reset! closed true) nil)) p (clojure.lang.LineNumberingPushbackReader. r)] (.close p) @closed)" :expected "true"}
   ;; ...but a wrapped value with NO close is still a no-op rather than a throw:
@@ -2190,6 +2197,28 @@
                _  (Files/deleteIfExists d)]
            [sz ex mt cpsz mvsz (pos? sz)])))"
    :expected "[5 true 1000 5 5 true]"}
+  ;; file: URLs round trip (jolt-lang/jolt#1118): File.toURI percent-encodes, and
+  ;; the opener did not decode, so a path with a space could not be opened from
+  ;; the URL toURI gave for it; "file:///abs" is the JDK's other spelling.
+  {:suite "file-url" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt url sp\") f (str d \"/x.txt\")] (.mkdirs (java.io.File. d)) (spit f \"payload\") [(slurp (.toURL (.toURI (java.io.File. f)))) (slurp (clojure.java.io/as-url (java.io.File. f))) (slurp (str \"file://\" (.getAbsolutePath (java.io.File. f)))) (boolean (re-find #\"%20\" (str (.toURI (java.io.File. f)))))])" :expected "[\"payload\" \"payload\" \"payload\" true]"}
+  {:suite "file-url" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt url sp\") f (str d \"/x.txt\")] (.mkdirs (java.io.File. d)) (spit f \"payload\") (= (.getAbsolutePath (clojure.java.io/as-file (.toURL (.toURI (java.io.File. f))))) (.getAbsolutePath (java.io.File. f))))" :expected "true"}
+  ;; FileTime (jolt-lang/jolt#1119): from(Instant) looked up a Scheme inst-ms that
+  ;; does not exist, so fs/set-last-modified-time with an Instant raised "variable
+  ;; inst-ms is not bound"; from(long, TimeUnit) is the other JDK overload; and the
+  ;; value reported (class x) => :object.
+  {:suite "nio-filetime" :expr "(str (class (java.nio.file.attribute.FileTime/fromMillis 5)))" :expected "\"class java.nio.file.attribute.FileTime\""}
+  {:suite "nio-filetime" :expr "(instance? java.nio.file.attribute.FileTime (java.nio.file.attribute.FileTime/fromMillis 5))" :expected "true"}
+  {:suite "nio-filetime" :expr "(.toMillis (java.nio.file.attribute.FileTime/from (java.time.Instant/ofEpochMilli 1234)))" :expected "1234"}
+  {:suite "nio-filetime" :expr "(.toMillis (java.nio.file.attribute.FileTime/from 3 java.util.concurrent.TimeUnit/SECONDS))" :expected "3000"}
+  ;; a DIRECTORY's mtime, set from a number and from an Instant, read back to the
+  ;; millisecond. On Windows the CRT's _utime64 cannot open a directory at all, so
+  ;; the set was silently dropped there and kmet's stale-lock test could not
+  ;; back-date its lock directory.
+  {:suite "nio-filetime" :expr "(let [d (Files/createTempDirectory \"jft\" (into-array java.nio.file.attribute.FileAttribute []))] (Files/setLastModifiedTime d (java.nio.file.attribute.FileTime/fromMillis 1600000000123)) (let [a (.toMillis (Files/getLastModifiedTime d (into-array java.nio.file.LinkOption [])))] (Files/setLastModifiedTime d (java.nio.file.attribute.FileTime/from (java.time.Instant/ofEpochMilli 1500000000456))) (let [b (.toMillis (Files/getLastModifiedTime d (into-array java.nio.file.LinkOption [])))] (Files/delete d) [a b])))" :expected "[1600000000123 1500000000456]"}
+  ;; setAttribute of creationTime / lastAccessTime is not a way to set the mtime:
+  ;; the shim wrote every one of the three through to the mtime, so
+  ;; (fs/set-creation-time f t) moved the file's last-modified time.
+  {:suite "nio-filetime" :expr "(let [f (Files/createTempFile \"jfa\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) lo (into-array java.nio.file.LinkOption [])] (Files/setLastModifiedTime f (java.nio.file.attribute.FileTime/fromMillis 1600000000000)) (Files/setAttribute f \"creationTime\" (java.nio.file.attribute.FileTime/fromMillis 5000000000) lo) (Files/setAttribute f \"basic:lastAccessTime\" (java.nio.file.attribute.FileTime/fromMillis 6000000000) lo) (let [m (.toMillis (Files/getLastModifiedTime f lo))] (Files/delete f) m))" :expected "1600000000000"}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}

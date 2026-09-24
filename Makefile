@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
@@ -1235,6 +1235,14 @@ winpath:
 # .github/workflows/tests.yml.
 winplatform:
 	@$(CHEZ) --script test/chez/win-platform-test.ss
+
+# The Windows parity reports (#1108 spawn, #1109/#1117 PushbackReader close,
+# #1118 file: URLs, #1119 mtimes) as their own repros, end to end through the
+# CLI. A POSIX run checks the portable half; the rows it exists for are the
+# Windows ones, which run in the windows-deps job and, locally, under Wine
+# (tools/wine: `tools/wine/run.sh jolt-nt test/chez/win-parity-smoke.clj`).
+winparity:
+	@$(CHEZ) --script host/chez/cli.ss test/chez/win-parity-smoke.clj
 
 # The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
 # enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file
