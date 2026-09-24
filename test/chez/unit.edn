@@ -2215,6 +2215,10 @@
   ;; the set was silently dropped there and kmet's stale-lock test could not
   ;; back-date its lock directory.
   {:suite "nio-filetime" :expr "(let [d (Files/createTempDirectory \"jft\" (into-array java.nio.file.attribute.FileAttribute []))] (Files/setLastModifiedTime d (java.nio.file.attribute.FileTime/fromMillis 1600000000123)) (let [a (.toMillis (Files/getLastModifiedTime d (into-array java.nio.file.LinkOption [])))] (Files/setLastModifiedTime d (java.nio.file.attribute.FileTime/from (java.time.Instant/ofEpochMilli 1500000000456))) (let [b (.toMillis (Files/getLastModifiedTime d (into-array java.nio.file.LinkOption [])))] (Files/delete d) [a b])))" :expected "[1600000000123 1500000000456]"}
+  ;; setAttribute of creationTime / lastAccessTime is not a way to set the mtime:
+  ;; the shim wrote every one of the three through to the mtime, so
+  ;; (fs/set-creation-time f t) moved the file's last-modified time.
+  {:suite "nio-filetime" :expr "(let [f (Files/createTempFile \"jfa\" \".txt\" (into-array java.nio.file.attribute.FileAttribute [])) lo (into-array java.nio.file.LinkOption [])] (Files/setLastModifiedTime f (java.nio.file.attribute.FileTime/fromMillis 1600000000000)) (Files/setAttribute f \"creationTime\" (java.nio.file.attribute.FileTime/fromMillis 5000000000) lo) (Files/setAttribute f \"basic:lastAccessTime\" (java.nio.file.attribute.FileTime/fromMillis 6000000000) lo) (let [m (.toMillis (Files/getLastModifiedTime f lo))] (Files/delete f) m))" :expected "1600000000000"}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}

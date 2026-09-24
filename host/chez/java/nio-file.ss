@@ -1284,8 +1284,12 @@
                                                     (->path p))))
         (cons "setAttribute" (lambda (path attr value . opts)
                                (let ((fp (nfp path)) (nm (nio-attr-name (npath-string-of attr))))
+                                 ;; the shim keeps one time per file, the mtime, and
+                                 ;; answers it for all three getters; a creation or
+                                 ;; access time set must not move it (jolt-ow0x)
                                  (when (member nm '("lastModifiedTime" "creationTime" "lastAccessTime"))
-                                   (nio-require-exists fp)
+                                   (nio-require-exists fp))
+                                 (when (string=? nm "lastModifiedTime")
                                    (nio-mtime-set-or-raise!
                                     fp (nio-set-lmtime! fp (if (file-time? value) (file-time-ms value) (jnum->exact value)) opts)))
                                  (->path path)))))))
