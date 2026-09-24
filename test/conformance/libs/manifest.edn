@@ -216,7 +216,10 @@
    :timeout 900
    ;; property-based: the assertion count moves with the generated cases
    :tolerance 40
-   :expect {:tests 123 :pass 236 :fail 10 :error 2}}
+   ;; the one fail is generators-test "byte": (instance? Byte (gen/byte ...)) —
+   ;; jolt's integers are one fixnum type, the :integer-box-model divergence in
+   ;; known-divergences.edn. The JVM runs the same 106 tests with 0 fails.
+   :expect {:tests 106 :pass 237 :fail 1 :error 0}}
 
   {:name "instaparse"
    :paths ["src" "test"]
