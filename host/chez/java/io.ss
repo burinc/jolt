@@ -53,9 +53,36 @@
        (or (not windows?)
            (fx>=? (fx- n 1) (path-root-end #t p)))))
 
-(define (jolt-path-normalize-for windows? p)
+;; Windows spells a separator either way, and a File or Path holds ONE spelling:
+;; "/", the one every scan in this file and nio-file.ss reads. What the caller
+;; SEES is the native "\" — path-native below renders it at the display boundary
+;; (str, toString, getPath, getAbsolutePath, getCanonicalPath, getParent, and the
+;; path in an exception message), as WinNTFileSystem and WindowsPathParser do by
+;; normalizing to "\" at construction. Keeping the held spelling "/" is what lets
+;; the ~60 separator scans between here and the Path shim stay as they are; the
+;; alternative, holding "\", would have to teach every one of them both.
+(define (path-backslashes->slashes p)
+  (if (let loop ((i 0)) (and (fx<? i (string-length p))
+                             (or (char=? (string-ref p i) #\\) (loop (fx+ i 1)))))
+      (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list p)))
+      p))
+;; The spelling a caller sees: "\" for "/" on Windows, the held path on POSIX.
+;; A File or Path renders through this and nothing else, so File/separator, the
+;; file.separator property and every rendered path agree — the one thing the JDK
+;; guarantees about them, and why File/separator could not be flipped alone
+;; (jolt-lang/jolt#1110).
+(define (path-native-for windows? p)
+  (if (and windows?
+           (let loop ((i 0)) (and (fx<? i (string-length p))
+                                  (or (char=? (string-ref p i) #\/) (loop (fx+ i 1))))))
+      (list->string (map (lambda (c) (if (char=? c #\/) #\\ c)) (string->list p)))
+      p))
+(define (path-native p) (path-native-for (eq? (sa-os-family) 'windows) p))
+
+(define (jolt-path-normalize-for windows? p0)
   (define (trailing-sep-droppable? p n) (trailing-sep-droppable-for? windows? p n))
-  (let* ((n (string-length p))
+  (let* ((p (if windows? (path-backslashes->slashes p0) p0))
+         (n (string-length p))
          ;; POSIX classifies nothing as a root here, so its answers are exactly
          ;; what they were; only Windows has a prefix to hold back.
          (root-end (if windows? (path-root-end #t p) 0)))
@@ -1448,11 +1475,11 @@
   (let ((p (jfile-path f))               ; the path as given (display methods)
         (fp (jfile-fs f)))               ; JOLT_PWD-resolved on-disk path (FS methods)
     (cond
-      ((string=? name "getPath")        (list p))
+      ((string=? name "getPath")        (list (path-native p)))
       ((string=? name "getName")        (list (path-last-segment p)))
-      ((string=? name "toString")       (list p))
-      ((string=? name "getAbsolutePath")(list (jfile-abs fp)))
-      ((string=? name "getCanonicalPath")(list (jfile-canonical fp)))
+      ((string=? name "toString")       (list (path-native p)))
+      ((string=? name "getAbsolutePath")(list (path-native (jolt-path-normalize (jfile-abs fp)))))
+      ((string=? name "getCanonicalPath")(list (path-native (jfile-canonical fp))))
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (jfile->uri fp)))
       ((string=? name "toURL")          (list (make-url (jfile->url-spec fp))))
@@ -1497,7 +1524,7 @@
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
       ((string=? name "hashCode")       (list (->num (string-hash p))))
       ((string=? name "getParent")
-       (list (or (jfile-parent-path p) jolt-nil)))
+       (list (let ((parent (jfile-parent-path p))) (if parent (path-native parent) jolt-nil))))
       (else #f))))
 
 (register-method-arm! arm-priority-file
@@ -2041,7 +2068,7 @@
 
 ;; --- str / type / instance? integration ------------------------------------
 ;; str of a jfile is its path (Clojure's File.toString).
-(register-str-render! jfile? jfile-path)
+(register-str-render! jfile? (lambda (f) (path-native (jfile-path f))))
 
 ;; The stdin line seam (__stdin-read-line, the *in* reader's source) lives in
 ;; io-streams.ss, next to the System/in stream it reads.
@@ -2715,21 +2742,13 @@
             (let ((r (string-append (string (integer->char (+ (char->integer #\A) i))) ":/")))
               (loop (- i 1) (if (exists? r) (cons r acc) acc)))))))
 
-;; separator stays "/" on both platforms — Windows accepts it and every path
-;; this shim renders uses it — but pathSeparator is the PATH-LIST separator and
-;; must be ";" on Windows, or babashka.fs/split-paths and fs/which cut every
-;; drive-lettered entry in half (host-static-methods.ss path-list-separator).
-;;
-;; Asked for again as jolt-lang/jolt#1110 and deliberately left as it is. Flipping
-;; separator alone is a one-line change, but it would then disagree with what File
-;; and Path actually RENDER, which is the one thing the JDK guarantees they agree
-;; about; moving the rendering too is not local — getCanonicalPath, the glob
-;; translator and every path comparison in this shim are written over the "/"
-;; spelling. Recorded as a deviation instead, with the consumer-visible
-;; consequence (path STRINGS differ from babashka on Windows), in
-;; test/conformance/known-divergences.edn.
-(let ((statics (list (cons "separator" "/")
-                     (cons "separatorChar" #\/)
+;; separator is "\\" on Windows, and File and Path render with it (path-native),
+;; so the two agree as they do on the JDK (jolt-lang/jolt#1110). pathSeparator is
+;; the PATH-LIST separator and must be ";" there, or babashka.fs/split-paths and
+;; fs/which cut every drive-lettered entry in half (host-static-methods.ss
+;; path-list-separator).
+(let ((statics (list (cons "separator" (file-separator))
+                     (cons "separatorChar" (string-ref (file-separator) 0))
                      (cons "pathSeparator" (path-list-separator))
                      (cons "pathSeparatorChar" (string-ref (path-list-separator) 0))
                      (cons "createTempFile" file-create-temp)

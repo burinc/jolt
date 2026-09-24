@@ -1151,16 +1151,17 @@
 ;; babashka.process's Windows resolver threw before a spawn was attempted
 ;; (jolt-lang/jolt#1074).
 ;;
-;; The FILE separator stays "/" on both. Windows accepts it everywhere, and the
-;; whole File/Path surface here already renders with it — getAbsolutePath,
-;; getCanonicalPath, babashka.fs/absolutize and /normalize all answer "C:/x"
-;; (test/chez/win-path-test.ss pins that), so one file has one spelling.
+;; The FILE separator is "\\" on Windows, and File and Path render with it
+;; (java/io.ss path-native), so the property, File/separator and every rendered
+;; path agree (jolt-lang/jolt#1110).
 ;;
 ;; Parameterized by platform, and defined in this file rather than beside the
 ;; other path helpers in java/io.ss, because this file loads first (rt.ss) and
 ;; System/getProperty is the caller closest to the load point.
 (define (path-list-separator-for windows?) (if windows? ";" ":"))
 (define (path-list-separator) (path-list-separator-for (eq? (sa-os-family) 'windows)))
+(define (file-separator-for windows?) (if windows? "\\" "/"))
+(define (file-separator) (file-separator-for (eq? (sa-os-family) 'windows)))
 
 ;; java.io.tmpdir. TMPDIR is the POSIX spelling and the only one this chain
 ;; knew, so on Windows — which sets TEMP and TMP and not TMPDIR — it answered
@@ -1218,7 +1219,7 @@
           ((string=? k "user.name") (sys-user-name))
           ((string=? k "jolt.version") (jolt-version-string))
           ((string=? k "line.separator") "\n")
-          ((string=? k "file.separator") "/")
+          ((string=? k "file.separator") (file-separator))
           ((string=? k "path.separator") (path-list-separator))
           ((string=? k "java.class.path") (sys-class-path))
           ;; user.dir is the user's cwd (JVM: the process cwd). jolt-user-dir (io.ss)
@@ -1236,7 +1237,7 @@
   (make-system-properties (sys-properties-pmap) sys-prop-table))
 (define (sys-properties-pmap)
   (let ((base (jolt-hash-map "os.name" sys-os-name "os.arch" sys-os-arch
-                             "line.separator" "\n" "file.separator" "/"
+                             "line.separator" "\n" "file.separator" (file-separator)
                              "path.separator" (path-list-separator)
                              "java.class.path" (sys-class-path)
                              "jolt.version" (jolt-version-string)

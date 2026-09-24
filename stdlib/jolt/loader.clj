@@ -1016,7 +1016,11 @@
                             :let [f (root-file root (:name req))]
                             :when f]
                         {:kind :resource
-                         :url (if (str/starts-with? f "jar:file:") f (str "file:" f))}))
+                         ;; a URL path is "/"-separated; the file path renders
+                         ;; with "\\" on Windows
+                         :url (if (str/starts-with? f "jar:file:")
+                                f
+                                (str "file:" (if (= "\\" java.io.File/separator) (str/replace f "\\" "/") f)))}))
       nil)))
 
 ;; --- reading and evaluating a namespace source ----------------------------

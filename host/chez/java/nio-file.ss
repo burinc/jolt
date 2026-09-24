@@ -3,10 +3,13 @@
 ;; File<->Path bridge. babashka.fs is built entirely on java.nio.file, so this
 ;; is the substrate it runs on.
 ;;
-;; A Path is a jhost tagged "nio-path" whose state is the path string as given
-;; (unix "/" separator on this host). Like java.nio.file, a Path is just a name
-;; until an operation touches disk — resolution against the working directory
-;; happens in toAbsolutePath / the Files layer, not at construction.
+;; A Path is a jhost tagged "nio-path" whose state is the path string,
+;; normalized as the JDK's path parsers do at construction: runs of separators
+;; collapse and a trailing one is dropped, and on Windows it is held with "/" and
+;; rendered with "\" (java/io.ss jolt-path-normalize, path-native). Like
+;; java.nio.file, a Path is just a name until an operation touches disk —
+;; resolution against the working directory happens in toAbsolutePath / the Files
+;; layer, not at construction.
 ;;
 ;; Loaded from rt.ss after java/io.ss (needs make-jfile / jfile? / jfile-abs).
 
@@ -161,7 +164,21 @@
     (if (null? segs) jolt-nil (make-nio-path (car (reverse segs))))))
 
 ;; ---- the Path jhost ---------------------------------------------------------
-(define (make-nio-path s) (make-jhost "nio-path" (if (string? s) s (npath-string-of s))))
+;; Paths.get("a//b/") is "a/b" on the JDK, as new File("a//b/") already was here;
+;; the Path kept the string as given, so the two disagreed about one name, and a
+;; Path built from a tmpdir ending in "/" rendered "T//x".
+;;
+;; One place Path and File normalize differently, and it is the JDK's: a UNC root
+;; alone keeps its trailing separator as a Path ("\\\\srv\\sh\\", what
+;; WindowsPathParser answers) where java.io.File drops it ("\\\\srv\\sh").
+(define (npath-held-for windows? s)
+  (let ((n (jolt-path-normalize-for windows? s)))
+    (if (and windows? (fx>? (string-length n) 2) (string=? (substring n 0 2) "//"))
+        (let ((pp (path-parse #t n)))
+          (if (null? (ppath-segs pp)) (ppath-root pp) n))
+        n)))
+(define (make-nio-path s)
+  (make-jhost "nio-path" (npath-held-for (nio-windows?) (if (string? s) s (npath-string-of s)))))
 (define (nio-path? x) (and (jhost? x) (string=? (jhost-tag x) "nio-path")))
 (define (nio-path-str p) (jhost-state p))
 (define default-nio-filesystem (make-jhost "nio-filesystem" #f))
@@ -208,7 +225,7 @@
 (define (nio-path-method self name rest)   ; -> boxed result, or #f to fall through
   (let ((s (nio-path-str self)))
     (cond
-      ((string=? name "toString")      (list s))
+      ((string=? name "toString")      (list (path-native s)))
       ((string=? name "getFileName")   (list (npath-file-name s)))
       ((string=? name "getParent")     (list (npath-parent s)))
       ((string=? name "getName")       (list (let ((segs (npath-segs s)) (i (exact (truncate (car rest)))))
@@ -307,6 +324,10 @@
                                                   (string-append "\\" (string next))))
                            brace class))
                    (nio-bad-glob "no character to escape after '\\'")))
+              ;; a "/" in a Windows pattern is a separator, as the JDK's
+              ;; Windows glob reads it, and the path it meets renders "\\"
+              ((and windows? (char=? c #\/) (not class))
+               (loop (+ i 1) (string-append out esc-backslash) brace class))
               ((memv c '(#\. #\( #\) #\^ #\$ #\+ #\|))
                (loop (+ i 1) (string-append out "\\" (string c)) brace class))
               (else (loop (+ i 1) (string-append out (string c)) brace class))))))))
@@ -326,12 +347,14 @@
 
 (register-host-methods! "nio-path-matcher"
   (list (cons "matches" (lambda (self p)
-                          (and (jolt-truthy? (jolt-re-matches (jhost-state self) (npath-string-of p))) #t)))))
+                          ;; the JDK matches the path's rendered string: a
+                          ;; regex: pattern on Windows is written against "\\"
+                          (and (jolt-truthy? (jolt-re-matches (jhost-state self) (path-native (npath-string-of p)))) #t)))))
 
 (register-host-methods! "nio-filesystem"
   (list (cons "getPathMatcher" (lambda (self spec) (npath-make-matcher (npath-string-of spec))))
         (cons "getPath" (lambda (self first . more) (apply npath-get first more)))
-        (cons "getSeparator" (lambda (self) "/"))))
+        (cons "getSeparator" (lambda (self) (file-separator)))))
 
 ;; ---- construction statics + File bridge -------------------------------------
 (let ((paths-statics (list (cons "get" npath-get)))
@@ -360,7 +383,7 @@
 ;; instance? and class but NOT value-host-tags, which is exactly the drift the
 ;; registry exists to prevent: (extend-protocol P java.nio.file.Path …) then
 ;; threw "No method" on a value whose (class …) said java.nio.file.Path.
-(register-str-render! nio-path? (lambda (p) (nio-path-str p)))
+(register-str-render! nio-path? (lambda (p) (path-native (nio-path-str p))))
 (register-eq-arm! (lambda (a b) (and (nio-path? a) (nio-path? b)))
                   (lambda (a b) (string=? (nio-path-str a) (nio-path-str b))))
 (register-hash-arm! nio-path? (lambda (p) (string-hash (nio-path-str p))))
@@ -397,7 +420,7 @@
 ;; correctness: no pre-check here gates a mutation. createFile -- the one place
 ;; where losing the race would cost data -- takes the O_EXCL open instead, which
 ;; does raise a typed condition, and stats nothing.
-(define (nio-fs-throw cls fp) (jolt-throw (jolt-host-throwable cls fp)))
+(define (nio-fs-throw cls fp) (jolt-throw (jolt-host-throwable cls (path-native fp))))
 (define (nio-no-such-file fp)   (nio-fs-throw "java.nio.file.NoSuchFileException" fp))
 (define (nio-already-exists fp) (nio-fs-throw "java.nio.file.FileAlreadyExistsException" fp))
 ;; "<path>: <reason>" is the JDK's rendering for every errno without a class.

@@ -394,6 +394,36 @@
 (same "a File on this host still normalizes"
       (jfile-path (make-jfile "/a/b/")) "/a/b")
 
+;; --- the native spelling (jolt-lang/jolt#1110) -------------------------------
+;; A File or Path is HELD with "/" on Windows, however the caller spelled it, and
+;; RENDERED with "\\" — str, toString, getPath and the rest go through
+;; path-native — so File/separator, file.separator and every rendered path say
+;; the same thing, as they do on the JDK. POSIX holds and renders the same string.
+(norm-path "windows backslashes are held as /"   #t "C:\\a\\b\\"   "C:/a/b")
+(norm-path "windows mixed and doubled separators" #t "C:\\a/\\b"    "C:/a/b")
+(norm-path "windows UNC in backslashes"          #t "\\\\srv\\sh\\a" "//srv/sh/a")
+(norm-path "windows relative in backslashes"     #t "sub\\deep.clj"  "sub/deep.clj")
+(norm-path "posix backslash stays a name char"   #f "a\\b"           "a\\b")
+(same "windows renders a drive path natively" (path-native-for #t "C:/a/b") "C:\\a\\b")
+(same "windows renders a UNC path natively" (path-native-for #t "//srv/sh/a") "\\\\srv\\sh\\a")
+(same "windows renders a relative path natively" (path-native-for #t "sub/deep.clj") "sub\\deep.clj")
+(same "windows renders the empty path as itself" (path-native-for #t "") "")
+(same "posix renders what it holds" (path-native-for #f "/a/b\\c") "/a/b\\c")
+(same "the file separator is \\ on windows" (file-separator-for #t) "\\")
+(same "the file separator is / on posix" (file-separator-for #f) "/")
+;; the relativize #1110 measured: babashka answers "..\\x\\b.clj" there
+(same "windows relativize renders natively"
+      (path-native-for #t (npath-relativize-for #t "C:/tmp/a/b.clj" "C:/tmp/a/x/b.clj")) "..\\x\\b.clj")
+;; A Path keeps a lone UNC root's trailing separator where File drops it
+;; (WindowsPathParser vs WinNTFileSystem); anything below the root trims.
+(same "a windows Path keeps a UNC root's separator" (npath-held-for #t "\\\\srv\\sh") "//srv/sh/")
+(same "a windows Path keeps a UNC root's separator, given" (npath-held-for #t "//srv/sh/") "//srv/sh/")
+(same "a windows Path trims below a UNC root" (npath-held-for #t "//srv/sh/a/") "//srv/sh/a")
+(same "a windows Path trims below a drive" (npath-held-for #t "C:\\a\\") "C:/a")
+(same "a posix Path collapses and trims like File" (npath-held-for #f "a//b/") "a/b")
+(same "a posix Path keeps the root" (npath-held-for #f "/") "/")
+(same "the empty Path stays empty" (npath-held-for #t "") "")
+
 ;; --- File/listRoots ----------------------------------------------------------
 ;; One root on POSIX; one per mounted drive on Windows, where "/" named a
 ;; directory on whichever drive the process was on and enumerated nothing.
