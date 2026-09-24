@@ -2136,6 +2136,17 @@
 ;; "c" and ns "a" + def "$c" both spelled jfn$a$$$c$0, and the second
 ;; registration silently replaced the first.
 (def ^:private fnsrc-ns-counters (atom {}))
+
+(defn seed-fnsrc-ns-counter!
+  "Start namespace ns's anon-literal counter at n. The build does this as it
+  emits each namespace: the counter otherwise carries whatever the in-process
+  load of that namespace used — a source load consumes names, a cached one does
+  not — and a namespace's emitted text must not depend on which it was, since
+  the build caches one compiled unit per namespace on its text (#1059). The
+  build seeds far above zero so a built binary's own runtime evaluation, whose
+  counters start at 0, cannot reuse a baked name."
+  [ns n]
+  (swap! fnsrc-ns-counters assoc (str ns) n))
 (defn- fnsrc-name []
   (str "jfn$" (munge-chars *fnsrc-ns*) "/"
        (if *fnsrc-def* (munge-chars *fnsrc-def*) "")

@@ -807,6 +807,8 @@
 ;;   clojure.core/gensym                          unqualified, and a macro can make
 ;;                                                a global of one: a base per
 ;;                                                namespace, distinct in this build
+;;   the backend's per-ns anon-literal counter    qualified by the namespace: one
+;;                                                base, restarted per namespace
 ;;
 ;; Every base sits above 2^40, past anything the in-process load before the build
 ;; reached, so no name made here repeats one made there.
@@ -829,7 +831,10 @@
     ((var-deref "jolt.analyzer" "set-name-counter!")
      (+ bld-name-base (if (eq? phase 'emit) (expt 2 39) 0)))
     (set! jolt-gensym-counter
-      (+ bld-name-base (* (bld-gensym-slot ns) (expt 2 21)) phase-off))))
+      (+ bld-name-base (* (bld-gensym-slot ns) (expt 2 21)) phase-off))
+    ;; anon literals outside a def: named per namespace, counted from where the
+    ;; load left off unless seeded
+    ((var-deref "jolt.backend-scheme" "seed-fnsrc-ns-counter!") ns bld-name-base)))
 
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
@@ -1116,10 +1121,16 @@
 
 (define (bld-ns-prelude ns-name src)
   (let ((acc (list (string-append "(set-chez-ns! " (ei-str-lit ns-name) ")")))
-        (nsf (let loop ((fs (ei-read-all src)))
-               (cond ((null? fs) #f)
-                     ((ei-ns-form? (car fs)) (car fs))
-                     (else (loop (cdr fs)))))))
+        ;; read up to the ns form, not the whole file: it is nearly always first,
+        ;; and the emit walk parses the rest anyway
+        (nsf (let ((end (string-length src)))
+               (let loop ((i 0))
+                 (and (< i end)
+                      (let-values (((form j) (rdr-read-top src i end)))
+                        (and (> j i)
+                             (if (and (not (rdr-eof? form)) (ei-ns-form? form))
+                                 form
+                                 (loop j)))))))))
     (when nsf
       (for-each
         (lambda (clause)
@@ -1420,8 +1431,27 @@
          (not (member "as" opt-names))
          (not use?))))
 
-(define (bld-ns-requires file)
-  (let ((src (ldr-read-source file)) (reqs '()))
+;; FILE's top-level forms as data, read in scan mode — the one read the require
+;; scan makes of each file; its requires and the classes it names both come off
+;; it (it used to read every file twice, once for each).
+;;
+;; scan mode: this read happens BEFORE any namespace is loaded, so alias-resolved
+;; auto keywords (::alias/kw) can't resolve yet — read them leniently; only
+;; require clauses and class names are taken from these forms. rdr-source-file
+;; scopes the file the way the inference and emit walks below already do, so a
+;; reader error carries it in the message; jolt-enter-file! records it for the
+;; uncaught reporter, which runs after every dynamic binding here has unwound.
+;; This walk evaluates nothing, so the two of them are the only record of which
+;; file a failure came from.
+(define (bld-scan-forms file)
+  (let ((src (ldr-read-source file)))
+    (parameterize ((rdr-scan-mode #t) (rdr-source-file file))
+      (jolt-enter-file! file)
+      (map rdr-form->data (ei-read-all src)))))
+
+(define (bld-ns-requires file) (bld-ns-requires* (bld-scan-forms file)))
+(define (bld-ns-requires* forms)
+  (let ((reqs '()))
     (for-each
       (lambda (form)
         (when (cseq? form)
@@ -1464,17 +1494,7 @@
                              (set! reqs (cons (car parsed) reqs)))))
                        (expand-spec unquoted))))
                   (cdr items)))))))
-      ;; scan mode: this read happens BEFORE any namespace is loaded, so
-      ;; alias-resolved auto keywords (::alias/kw) can't resolve yet — read
-      ;; them leniently; only require clauses are extracted from these forms.
-      ;; rdr-source-file scopes the file the way the inference and emit walks below
-      ;; already do, so a reader error carries it in the message; jolt-enter-file!
-      ;; records it for the uncaught reporter, which runs after every dynamic
-      ;; binding here has unwound. This walk evaluates nothing, so the two of them
-      ;; are the only record of which file a failure came from.
-      (parameterize ((rdr-scan-mode #t) (rdr-source-file file))
-        (jolt-enter-file! file)
-        (map rdr-form->data (ei-read-all src))))
+      forms)
     (reverse reqs)))
 
 ;; Host classes a file's forms reference that a PROVIDER installs (RFC 0014). At
@@ -1491,9 +1511,9 @@
 ;; A provider is pulled only when its source is actually on the roots
 ;; (find-ns-file) — off the roots the runtime's unknown-class message is the
 ;; contract and the build must keep succeeding exactly as before.
-(define (bld-ns-class-providers file)
-  (let ((src (ldr-read-source file))
-        (cands '()))
+(define (bld-ns-class-providers file) (bld-ns-class-providers* (bld-scan-forms file)))
+(define (bld-ns-class-providers* forms)
+  (let ((cands '()))
     (define (add! class)
       (let ((cand (cond ((lib-provider-for class) => (lambda (p) (vector-ref p 0)))
                         (else #f))))
@@ -1511,9 +1531,7 @@
             ((cseq? x) (for-each walk (seq->list x)))
             ((pvec? x) (for-each walk (seq->list x)))
             ((pmap? x) (pmap-fold x (lambda (k v a) (walk k) (walk v) #f) #f))))
-    (parameterize ((rdr-scan-mode #t) (rdr-source-file file))
-      (jolt-enter-file! file)
-      (for-each (lambda (f) (walk (rdr-form->data f))) (ei-read-all src)))
+    (for-each walk forms)
     (filter (lambda (c) (find-ns-file c)) cands)))
 
 ;; Post-order DFS from a list of root namespace names: for each name, find its
@@ -1548,7 +1566,8 @@
                              (not (hashtable-ref bld-boot-loaded name #f))
                              ;; preloaded only in the CLI image, not in an app's
                              (ldr-cli-aot? name)))
-                (dfs (append (bld-ns-class-providers file) (bld-ns-requires file)))
+                (let ((forms (bld-scan-forms file)))
+                  (dfs (append (bld-ns-class-providers* forms) (bld-ns-requires* forms))))
                 (set! order (cons (cons name file) order)))))
           (dfs (cdr ns)))))
     (reverse order)))
@@ -1640,7 +1659,9 @@
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
-    (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
+    ;; emit from source, never a compiled artifact — the AOT cache aside, which
+    ;; loads the same program and replays its def-ordinal stamps (loader.ss)
+    (parameterize ((ldr-source-only? #t) (ldr-build-aot-cache? #t))
       (load-namespace entry-ns))
     (ei-mark! "load app from source")
     ;; Build ordered ns list from the require graph (static scan of source files)
@@ -1676,7 +1697,7 @@
                       (for-each
                         (lambda (p)
                           (unless (hashtable-ref loaded-ns (car p) #f)
-                            (parameterize ((ldr-source-only? #t))
+                            (parameterize ((ldr-source-only? #t) (ldr-build-aot-cache? #t))
                               (load-namespace (car p)))))
                         (append graph reader-pairs))
                       (set-ns-loaded-hook! (lambda (name file) #f))

@@ -1130,8 +1130,10 @@
         ;; reason (io.ss io-file-read-sink). A nested require binds its own, so a
         ;; dependency's reads are recorded against the dependency.
         (res-sink (vector '())))
-    (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink))
-                      (aot-capture-load file src))))
+    (let* ((stamps (vector file '()))
+           (captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink)
+                                    (jolt-def-ordinal-sink stamps))
+                       (aot-capture-load file src))))
       (unless (and (string? captured) (fx>? (string-length captured) 0))
         (aot-info (string-append "nothing captured for " name ", not caching")))
       (when (and (string? captured) (fx>? (string-length captured) 0))
@@ -1157,6 +1159,9 @@
                           (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
             (let ((out (open-output-file tmp-scm 'replace)))
               (put-string out captured)
+              ;; the first-def stamps this load made, replayed against whatever
+              ;; file the artifact is loaded for (aot-replay-def-ordinals!)
+              (put-string out (format "\n(aot-replay-def-ordinals! '~s)" (reverse (vector-ref stamps 1))))
               (put-string out (format "\n(aot-mark-complete! ~s)\n" name))
               (close-output-port out))
             (rename-replace! tmp-scm scm)
@@ -1203,6 +1208,19 @@
 ;; require dedups) and the fresh full load re-runs them; install-owned
 ;; namespaces, whose defs DO get set!-overridden after load, never take this
 ;; path at all. Non-fatal — a repeated failure just misses every run.
+;; The file a cached artifact is being loaded for, while it loads.
+(define aot-loading-file (make-parameter #f))
+;; Replay the first-def stamps a source load of the artifact's file made (rt.ss
+;; var-def-ordinals): a cached load runs compiled defs outside the reader walk
+;; that stamps them, and a build's pass 1 loading from the cache would otherwise
+;; hand the emit walk an unstamped program — the #451 forward-reference
+;; divergence. First writer wins, as for a source load.
+(define (aot-replay-def-ordinals! stamps)
+  (let ((file (aot-loading-file)))
+    (when file
+      (for-each (lambda (s) (var-def-ordinal-stamp1! file (car s) (cadr s) (caddr s)))
+                stamps))))
+
 (define (aot-safe-load-or-recompile name file src own base)
   (let ((so (string-append base ".so")))
     (define (recover! why)
@@ -1212,7 +1230,8 @@
       (aot-compile-and-cache name file src own))
     (let ((state (guard (e (else 'corrupt))
                    (aot-complete-reset! name)
-                   (ldr-with-compiled-ns-vars (lambda () (load so)))
+                   (parameterize ((aot-loading-file file))
+                     (ldr-with-compiled-ns-vars (lambda () (load so))))
                    (if (aot-complete? name) 'ok 'incomplete))))
       (case state
         ((ok) (aot-complete-reset! name))     ; done with the entry
@@ -1274,7 +1293,7 @@
          ;; embedded fasl registered but failed to load: fall back to source.
          (load-jolt-file file))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
-          (not (ldr-source-only?))
+          (or (not (ldr-source-only?)) (ldr-build-aot-cache?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
           ;; there is no key that would be safe to reuse.
@@ -1438,6 +1457,13 @@
 ;; would hand it a path with no source behind it. Compiled output is a load
 ;; shortcut; a build wants the real thing.
 (define ldr-source-only? (make-thread-parameter #f))
+;; ...except the AOT cache, when the build's pass 1 asks for it: a cached
+;; namespace loads the same program its source would (the cache's contract for
+;; `jolt run`), replays its def-ordinal stamps (aot-replay-def-ordinals!), and
+;; the emit walk reads the source file the ns-loaded hook names either way. The
+;; build otherwise recompiled every namespace from source on every build just
+;; to load it — 16s of a 46s rebuild of a 231-namespace app (#1059).
+(define ldr-build-aot-cache? (make-thread-parameter #f))
 
 ;; The base path of the first usable artifact for `name` on the source roots, or
 ;; #f. This is the load side: the JVM finds compiled output through the classpath,

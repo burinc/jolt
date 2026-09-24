@@ -17,6 +17,8 @@
 ;;      changes, and is superlinear in the image (40s for a 28MB app half)
 ;;   e. the app half is one compile unit per namespace, cached on its text; a
 ;;      miss compiles in a worker (in parallel, in a real build)
+;;   f. the require scan parses each file once, and the ns prelude stops at the
+;;      ns form
 ;;
 ;;   chez --script test/chez/build-scaling-test.ss
 (import (chezscheme))
@@ -203,6 +205,32 @@
 (bld-compile-worker wm)
 (ok "a worker compiles and converts each job in its manifest"
     (and (file-exists? (at "w1.so")) (file-exists? (at "w1.so.vfasl"))))
+
+;; --- f: each source file is parsed once by the require scan ------------------------
+;; The scan read every file twice (its requires, then the classes it names), and
+;; the emit's ns prelude parsed a whole file to find its first form.
+(define sroot (at "scan-src"))
+(bld-mkdir-p (string-append sroot "/scan"))
+(write-text! (string-append sroot "/scan/a.clj")
+  "(ns scan.a (:require [scan.b :as b]))\n(defn f [] (b/g))\n")
+(write-text! (string-append sroot "/scan/b.clj")
+  ";; leading comment\n(ns scan.b)\n(defn g [] 1)\n")
+(define saved-roots (get-source-roots))
+(set-source-roots!* (list sroot))
+(define reads 0)
+(define real-read-source ldr-read-source)
+(set! ldr-read-source (lambda (f) (set! reads (+ reads 1)) (real-read-source f)))
+(define closure (bld-require-closure (list "scan.a")))
+(set! ldr-read-source real-read-source)
+(ok "the require scan still finds the closure, deps first"
+    (equal? (map car closure) '("scan.b" "scan.a")))
+(ok "…reading each file once" (= reads 2))
+(set-source-roots!* saved-roots)
+(ok "the ns prelude reads the ns form even when it is not the first form"
+    (equal? (bld-ns-prelude "scan.b" ";; c\n(def early 1)\n(ns scan.b (:require [clojure.string :as str]))\n(def x 2)\n")
+            (bld-ns-prelude "scan.b" "(ns scan.b (:require [clojure.string :as str]))\n")))
+(ok "…and a file with no ns form yields only the ns switch"
+    (equal? (bld-ns-prelude "scan.c" "(def x 1)\n") (list "(set-chez-ns! \"scan.c\")")))
 
 (printf "\nbuild scaling gate: ~a/~a passed~a\n"
         (- total fails) total (if (= fails 0) "" (format " (~a failed)" fails)))

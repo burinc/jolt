@@ -412,10 +412,12 @@ done
 # compiled artifact, and those defs run outside the reader walk that stamps the
 # def ordinals — so pass 1 would hand the emit walk an unstamped program, every
 # var would read as visible from form 0, and the binary would resolve the
-# ns-local redefinition again. Pass 1 loading from SOURCE is what keeps the
-# stamps (ldr-source-only? gates the cache branch, loader.ss); nothing else in
-# this gate builds an app whose cache a run has already warmed, so without this
-# case that gate could be removed and every check above would still pass.
+# ns-local redefinition again. The build's pass 1 DOES load from the cache (a
+# rebuild used to recompile every namespace from source just to load it, #1059),
+# so what keeps the stamps is the artifact replaying the ones its source load made
+# (loader.ss aot-replay-def-ordinals!); nothing else in this gate builds an app
+# whose cache a run has already warmed, so without this case that replay could
+# be removed and every check above would still pass.
 # Its own cache dir (under the temp dir the trap removes) so the gate neither
 # reads nor writes the user's ~/.jolt cache.
 fwd_cache="$(dirname "$out")/aot-cache"
@@ -480,24 +482,37 @@ cat > "$mfn_app/src/mf/core.clj" <<'MFN_EOF'
   (println "mfn-after: " (u/after-load {:req "K"})))
 MFN_EOF
 mfn_out="$(dirname "$out")/mfn-bin"
-if ! JOLT_PWD="$mfn_app" "$jolt" build -m mf.core -o "$mfn_out" >/dev/null 2>&1; then
-  echo "  FAIL: multi-file-namespace app build exited non-zero"; exit 1
-fi
-# the binary runs the (load) itself, so the app source outlives this run
-got_mfn="$(cd / && "$mfn_out" 2>&1)"
-want_mfn="$(cd "$mfn_app" && JOLT_PWD="$mfn_app" "$joltabs" run -m mf.core 2>&1)"
-rm -rf "$(dirname "$mfn_app")"
-if [ "$got_mfn" != "$want_mfn" ]; then
-  echo "  FAIL: a (load)ed redefinition resolves differently in the binary and under jolt run"
-  echo "--- binary ----"; echo "$got_mfn"
-  echo "--- jolt run --"; echo "$want_mfn"; exit 1
-fi
-for line in 'mfn-second: 8' 'mfn-after:  [{:req K, :seen-second true} 40]'; do
-  if ! printf '%s' "$got_mfn" | grep -qF "$line"; then
-    echo "  FAIL: (load)ed redefinition — want '$line'"
-    echo "--- got ----"; echo "$got_mfn"; exit 1
+# twice over one private AOT cache: the second build's pass 1 loads mf.util from
+# the artifact the first one cached, so its outer-frame stamps (the loaded file's
+# defs, stamped against mf.util at the (load) form) come from the replay
+mfn_cache="$(dirname "$out")/mfn-aot-cache"
+for mfn_i in 1 2; do
+  if ! JOLT_PWD="$mfn_app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$mfn_cache" \
+       "$jolt" build -m mf.core -o "$mfn_out.$mfn_i" >/dev/null 2>&1; then
+    echo "  FAIL: multi-file-namespace app build $mfn_i exited non-zero"; exit 1
   fi
 done
+if ! ls "$mfn_cache"/*/*/mf.util-*.so >/dev/null 2>&1; then
+  echo "  FAIL: the warm (load) case is vacuous — no AOT artifact for mf.util under $mfn_cache"
+  exit 1
+fi
+# the binary runs the (load) itself, so the app source outlives this run
+want_mfn="$(cd "$mfn_app" && JOLT_PWD="$mfn_app" "$joltabs" run -m mf.core 2>&1)"
+for mfn_i in 1 2; do
+  got_mfn="$(cd / && "$mfn_out.$mfn_i" 2>&1)"
+  if [ "$got_mfn" != "$want_mfn" ]; then
+    echo "  FAIL: a (load)ed redefinition resolves differently in binary $mfn_i and under jolt run"
+    echo "--- binary ----"; echo "$got_mfn"
+    echo "--- jolt run --"; echo "$want_mfn"; exit 1
+  fi
+  for line in 'mfn-second: 8' 'mfn-after:  [{:req K, :seen-second true} 40]'; do
+    if ! printf '%s' "$got_mfn" | grep -qF "$line"; then
+      echo "  FAIL: (load)ed redefinition (build $mfn_i) — want '$line'"
+      echo "--- got ----"; echo "$got_mfn"; exit 1
+    fi
+  done
+done
+rm -rf "$(dirname "$mfn_app")"
 
 # A closure returned by a SPLICED callee must still travel in a state image, and
 # the built binary must agree with `jolt run` about it. Only a built binary
