@@ -1676,7 +1676,7 @@
 ;; directory check, which refuses before it opens.
 (define (file-open-error given resolved . exc)
   (throw-jvm (quote java.io.FileNotFoundException)
-             (string-append given " ("
+             (string-append (path-native given) " ("
                             (or (io-open-reason exc)
                                 (cond ((not (file-exists? resolved)) "No such file or directory")
                                       ((file-directory? resolved)    "Is a directory")
@@ -1712,13 +1712,16 @@
 ;; now fails to read, exactly as it does on the JVM and on babashka
 ;; ("Unable to resolve symbol: <U+FEFF>"). Chez's codec used to swallow the BOM
 ;; and hide that, at the price of swallowing it out of DATA files too.
-(define (read-file-string path)
+;; GIVEN, when passed, is the path as the caller spelled it, for the message: a
+;; missing file is reported under that name, as the JVM's FileInputStream does,
+;; rather than under the user.dir-resolved PATH this opens.
+(define (read-file-string path . given)
   (utf8-bytes->string
    (if (jar-path? path)
        (or (jar-path-bytes path) (jar-path-missing path))
-       (read-file-bytes-on-disk path))))
-(define (read-file-bytes-on-disk path)
-  (with-port (open-path-guarded path path (lambda (p) (open-file-input-port p)))
+       (apply read-file-bytes-on-disk path given))))
+(define (read-file-bytes-on-disk path . given)
+  (with-port (open-path-guarded (if (pair? given) (car given) path) path (lambda (p) (open-file-input-port p)))
     (lambda (p)
       ;; A port with no meaningful length — a fifo, a character device — reports
       ;; 0 or raises; both fall back to the growing read, which is correct for
@@ -1924,7 +1927,7 @@
 ;; libraries branch on it: instaparse decides whether its argument is a grammar or
 ;; a file by slurping and catching FNF. A raw Chez open-input-file condition is not
 ;; catchable as that class, so the caller's fallback never runs.
-(define (slurp-path path)
+(define (slurp-path path . given)
   (io-note-file-read! path)
   ;; An entry inside a jar has no open to fail, so its absence is still checked
   ;; here. A path ON DISK is not pre-checked: read-file-bytes-on-disk opens
@@ -1934,7 +1937,7 @@
   (when (and (jar-path? path) (not (jar-path-exists? path)))
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
-  (read-file-string path))
+  (apply read-file-string path given))
 ;; The content a URL names, as text: a file: URL reads its target from disk (a
 ;; missing file is a FileNotFoundException, as on the JVM); any other protocol has
 ;; no local backing, so raise rather than hand back empty content. slurp /
@@ -1982,7 +1985,7 @@
               (loop #f)))))))
 (define (jolt-slurp src . opts)
   (cond
-    ((jfile? src) (slurp-path (jfile-fs src)))
+    ((jfile? src) (slurp-path (jfile-fs src) (jfile-path src)))
     ((embedded-res? src)
      (let ((c (embedded-res-content src)))
        (if (bytevector? c) (utf8->string c) c)))
@@ -1999,7 +2002,10 @@
     ;; a byte input-stream shim (e.g. clj-http-lite's :as :stream body): drain it.
     ((and (htable? src) (jolt-truthy? (jolt-ref-get src (keyword "jolt" "input-stream"))))
      (decode-bytevector (drain-byte-stream src) (slurp-encoding opts)))
-    ((string? src) (slurp-path (io-source-path src)))
+    ((string? src) (let ((fp (io-source-path src)))
+                     (if (jar-path? fp)
+                         (slurp-path fp)
+                         (slurp-path fp (if (file-url-string? src) (file-url->path src) src)))))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
 (define (spit-append? opts)
@@ -2022,16 +2028,17 @@
   (unless (or (string? path) (jfile? path) (jhost? path))
     (throw-jvm (quote IllegalArgumentException)
                (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
-  (let* ((p (project-relative (if (url-jhost? path) (url-write-path path) (file-path-of path))))
+  (let* ((given (if (url-jhost? path) (url-write-path path) (file-path-of path)))
+         (p (project-relative given))
          (text (jolt-str-render-one content)))
     ;; The JVM opens the TARGET, so a target it cannot open fails here and names
     ;; itself. This wrote its temp file first and only discovered the target at
     ;; the rename, which came back as Chez's "cannot rename ..." inside a plain
     ;; java.io.IOException -- naming a temp path the caller never asked for
     ;; (jolt-g81).
-    (when (file-directory? p) (file-open-error p p))
+    (when (file-directory? p) (file-open-error given p))
     (if (spit-append? opts)
-        (with-port (open-path-guarded p p (lambda (rp) (open-output-file rp 'append)))
+        (with-port (open-path-guarded given p (lambda (rp) (open-output-file rp 'append)))
           (lambda (port) (put-string port text)))
         (let ((tmp (string-append p ".spit-tmp-"
                                    (number->string (sa-real-time-ms)) "-"
@@ -2040,7 +2047,7 @@
                                                             spit-tmp-counter))))))
           ;; the temp file is this function's business, but a failure to open it
           ;; is the caller's target failing, so report the target
-          (with-port (guard (e ((i/o-error? e) (file-open-error p p e)))
+          (with-port (guard (e ((i/o-error? e) (file-open-error given p e)))
                        (open-output-file tmp 'replace))
             (lambda (port) (put-string port text)))
           (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
@@ -2142,14 +2149,14 @@
   (cond
     ((reader-jhost? x) x)
     ((jfile? x) (io-note-file-read! (jfile-fs x))
-                (host-new "StringReader" (read-file-string (jfile-fs x))))
+                (host-new "StringReader" (read-file-string (jfile-fs x) (jfile-path x))))
     ((embedded-res? x)
      (let ((c (embedded-res-content x)))
        (host-new "StringReader" (if (bytevector? c) (utf8->string c) c))))
     ((url-jhost? x) (host-new "StringReader" (url-content x)))
     ((string? x) (let ((p (project-relative x)))
                    (io-note-file-read! p)
-                   (host-new "StringReader" (read-file-string p))))
+                   (host-new "StringReader" (if (jar-path? p) (read-file-string p) (read-file-string p x)))))
     ((or (cseq? x) (empty-list-t? x) (pvec? x))
      (host-new "StringReader" (seq-source->string x)))
     ;; anything else is not a source, and quietly rendering it would read as empty
@@ -2174,7 +2181,7 @@
 ;; JVM's FileWriter does too.
 (define (io-writer-target! given)
   (let ((p (project-relative given)))
-    (close-port (open-path-guarded p p
+    (close-port (open-path-guarded given p
                   (lambda (rp)
                     (open-file-output-port rp (file-options no-fail no-truncate append)
                                            (buffer-mode none)))))
