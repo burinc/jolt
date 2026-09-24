@@ -70,6 +70,17 @@
 (defn- gen-name [prefix]
   (str "_r$" prefix (dec (swap! gensym-counter inc))))
 
+(defn set-name-counter!
+  "Reseed the counter behind generated names. The build driver does this at each
+  namespace so a namespace's emitted text does not depend on how many names the
+  namespaces before it — or the in-process load before the build — used, which is
+  what lets the build cache one compiled unit per namespace (#1059). Safe because
+  every name this makes is either lexical (a catch, loop or duplicate-param local)
+  or qualified by its compile namespace (a fn's rname), and the driver seeds each
+  build phase above anything the load phase reached."
+  [n]
+  (reset! gensym-counter n))
+
 ;; The innermost list form currently being analyzed that carries reader position
 ;; metadata — what a diagnostic raised anywhere below it should name. Without it
 ;; the only position available to the reporter is the one the LOADER records per

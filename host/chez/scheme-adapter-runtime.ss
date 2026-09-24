@@ -264,6 +264,16 @@
   (let ((t (file-modification-time path)))
     (+ (* (time-second t) 1000) (div (time-nanosecond t) 1000000))))
 
+;; (sa-file-size path) -> exact integer
+;; PATH's size in bytes. Contract: the size a reader of the whole file would
+;; see (a cache's byte budget reads it). Degradation: none — a file that cannot
+;; be opened raises, as the caller's other file operations would.
+(define (sa-file-size path)
+  (let ((p (open-file-input-port path)))
+    (let ((n (port-length p)))
+      (close-port p)
+      n)))
+
 ;; (sa-gc-trip-bytes! n) -> void
 ;; Set the allocation threshold at which a trip collection triggers — the
 ;; dev-cache CLI's GC tuning knob (cli-devcache.ss). Contract: honor N as a

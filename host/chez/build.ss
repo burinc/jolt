@@ -780,6 +780,57 @@
 (define jolt-contagion-prepass-done! (var-deref "jolt.backend-scheme" "contagion-prepass-done!"))
 (define jolt-reset-clone-prepass!    (var-deref "jolt.backend-scheme" "reset-clone-prepass!"))
 
+;; APP-STRS regrouped by namespace from SIZES ((ns . form-count) …, in order), or
+;; one group named for ENTRY when the sizes are absent or do not account for every
+;; string (a shaken app).
+(define (bld-group-app-strs app-strs sizes entry)
+  (if (and sizes (= (length app-strs) (apply + (map cdr sizes))))
+      (let loop ((ss sizes) (rest app-strs) (acc '()))
+        (if (null? ss)
+            (reverse acc)
+            (let take ((n (cdar ss)) (r rest) (g '()))
+              (if (= n 0)
+                  (loop (cdr ss) r (if (null? g) acc (cons (cons (caar ss) (reverse g)) acc)))
+                  (take (- n 1) (cdr r) (cons (car r) g))))))
+      (list (cons entry app-strs))))
+
+;; --- per-namespace name counters (#1059) --------------------------------------
+;; The build caches one compiled unit per namespace, keyed on the unit's text, so
+;; that text has to depend on the namespace and what it sees, not on how many
+;; generated names were used before it. Four counters feed emitted names:
+;;
+;;   the unit's label and inline-rename counters  lexical names only: restart at 0
+;;   the analyzer's name counter                  lexical, or qualified by the
+;;                                                compile ns: one base per PHASE,
+;;                                                so the wp walk and the emit walk's
+;;                                                re-analysis never reuse a name
+;;   clojure.core/gensym                          unqualified, and a macro can make
+;;                                                a global of one: a base per
+;;                                                namespace, distinct in this build
+;;
+;; Every base sits above 2^40, past anything the in-process load before the build
+;; reached, so no name made here repeats one made there.
+(define bld-name-base (expt 2 40))
+(define bld-gensym-slots (make-hashtable string-hash string=?))
+(define bld-gensym-slot-owner (make-eqv-hashtable))
+(define (bld-gensym-slot ns)
+  (or (hashtable-ref bld-gensym-slots ns #f)
+      (let probe ((slot (fxlogand (aot-content-hash ns) #x7FFFF)))
+        (if (hashtable-ref bld-gensym-slot-owner slot #f)
+            (probe (fxlogand (fx+ slot 1) #x7FFFF))
+            (begin (hashtable-set! bld-gensym-slot-owner slot ns)
+                   (hashtable-set! bld-gensym-slots ns slot)
+                   slot)))))
+(define (bld-seed-name-counters! ns phase)
+  (let ((unit (ei-unit))
+        (phase-off (if (eq? phase 'emit) (expt 2 20) 0)))
+    ((var-deref "clojure.core" "reset!") (jolt-get unit (keyword #f "gensym-counter")) 0)
+    ((var-deref "clojure.core" "reset!") (jolt-get unit (keyword #f "fresh-counter")) 0)
+    ((var-deref "jolt.analyzer" "set-name-counter!")
+     (+ bld-name-base (if (eq? phase 'emit) (expt 2 39) 0)))
+    (set! jolt-gensym-counter
+      (+ bld-name-base (* (bld-gensym-slot ns) (expt 2 21)) phase-off))))
+
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
   ;; before any flag is set, so the whole-program seeds set here — and the mode flags —
@@ -790,6 +841,7 @@
     (for-each
       (lambda (nf)
         (set-chez-ns! (car nf))
+        (bld-seed-name-counters! (car nf) 'wp)
         (let ((src (ei-timed "wp: read source" (lambda () (ldr-read-source (cdr nf))))) (per-ns '()))
           ;; This walk, not the emit walk, is where an --opt build's IR is
           ;; produced, so a file's top-level (set! *unchecked-math* …) has to be
@@ -1024,17 +1076,33 @@
 ;; 49.6s at 100 forms per procedure and 31.2s at 10 (#1059); the extra calls at
 ;; startup are one per ten namespaces' worth of forms.
 (define bld-app-init-chunk 10)
+
+;; A namespace name as the middle of a Chez identifier: the chunk procedures are
+;; named after their namespace, not their position, so a namespace's unit text
+;; does not change when an earlier namespace gains or loses forms.
+(define (bld-unit-tag ns)
+  (list->string
+    (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\. #\- #\_))) c #\_))
+         (string->list ns))))
+
+;; (define (jolt-app-init!) …) calling NAMES in order, after PRE (forms to run first).
+(define (bld-emit-app-init-main out names pre)
+  (put-string out "(define (jolt-app-init!)\n")
+  (for-each (lambda (f) (put-string out (string-append "  " f "\n"))) pre)
+  (for-each (lambda (n) (put-string out (string-append "  (" n ")\n"))) names)
+  (when (and (null? names) (null? pre)) (put-string out "  #f"))
+  (put-string out ")\n"))
+
 (define (bld-emit-app-init out bodies)
+  (bld-emit-app-init-main out (bld-emit-app-chunks out "" bodies) '()))
+
+;; The chunk procedures for BODIES, named for TAG; answers their names in order.
+(define (bld-emit-app-chunks out tag bodies)
   (let loop ((rest bodies) (k 0) (names '()))
     (if (null? rest)
-        (begin
-          (put-string out "(define (jolt-app-init!)\n")
-          (if (null? names)
-              (put-string out "  #f")
-              (for-each (lambda (n) (put-string out (string-append "  (" n ")\n")))
-                        (reverse names)))
-          (put-string out ")\n"))
-        (let* ((nm (string-append "jolt-app-init$" (number->string k) "!"))
+        (reverse names)
+        (let* ((nm (string-append "jolt-app-init$" tag (if (string=? tag "") "" "$")
+                                  (number->string k) "!"))
                (chunk (let take ((r rest) (i 0) (acc '()))
                         (if (or (null? r) (fx= i bld-app-init-chunk))
                             (reverse acc)
@@ -1568,7 +1636,7 @@
     (bld-mkdir-p (string-append out-path ".build"))
     (bld-preload-static-natives! natives (string-append out-path ".build")))
    ;; 1. record app namespaces in dependency order as they finish loading.
-   (let ((app-order '()))
+   (let ((app-order '()) (app-ns-sizes #f))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
@@ -1761,6 +1829,7 @@
                                          (bld-startup-profile-form
                                            (string-append "namespace " (car nf)))))
                                   (jolt-enter-file! (cdr nf))   ; name the file on a failure
+                                  (bld-seed-name-counters! (car nf) 'emit)
                                   (parameterize ((rdr-source-file (cdr nf)))
                                     ;; RT.load-parity bracket (dyn-binding.ss): the
                                     ;; ns's replayed forms run under fresh
@@ -1778,6 +1847,9 @@
                                                 (dce-rec #t #f '() profile-form)))
                                             per-ns)))
                                 (loopfe (cdr rest))))
+                            (set! app-ns-sizes
+                              (map (lambda (nf recs) (cons (car nf) (length recs)))
+                                   ordered (reverse per-ns)))
                             (apply append (reverse per-ns)))))
                         (entry-main (string-append entry-ns "/-main")))
                     (if tree-shake?
@@ -1832,11 +1904,23 @@
              ;; by the split apart from one merely revealed by it — and the one
              ;; file then compiles under the app half's parameters.
              (split? (not (getenv "JOLT_NO_FLAT_SPLIT")))
+             ;; the app's forms by namespace (one group for a shaken app: the
+             ;; shake reorders nothing but no longer knows the boundaries)
+             (groups (bld-group-app-strs app-strs (and (not tree-shake?) app-ns-sizes) entry-ns))
+             (group-files (let loop ((i 0) (gs groups) (acc '()))
+                            (if (null? gs) (reverse acc)
+                                (loop (+ i 1) (cdr gs)
+                                      (cons (string-append builddir "/app-" (number->string i) ".ss") acc)))))
+             (post-ss (string-append builddir "/app-post.ss"))
+             ;; flat.ss is the app's prologue (natives, embedded resources, roots,
+             ;; namespace registration), then one unit per namespace, then the
+             ;; init entry + launcher — each compiled, and cached, on its own.
+             (app-units (append (list (list flat-ss flat-so 'app))
+                                (map (lambda (f) (list f (string-append f ".so") 'app)) group-files)
+                                (list (list post-ss (string-append post-ss ".so") 'app))))
              (units (cond ((not split?) (list (list flat-ss flat-so 'whole)))
-                          (core-strs (list (list rt-ss rt-so 'runtime-shaken)
-                                           (list flat-ss flat-so 'app)))
-                          (else (list (list rt-ss rt-so 'runtime)
-                                      (list flat-ss flat-so 'app))))))
+                          (core-strs (cons (list rt-ss rt-so 'runtime-shaken) app-units))
+                          (else (cons (list rt-ss rt-so 'runtime) app-units)))))
         (bld-mkdir-p builddir)
         ;; 3. flat source = runtime + app + launcher. When split, runtime.ss holds
         ;; the runtime half and flat.ss holds everything the app contributes; the
@@ -1891,9 +1975,24 @@
           ;; so "app namespaces begin" still brackets the work rather than the
           ;; declarations.
           (put-string out "\n;; === app (declarations; the bodies run at scheme-start) ===\n")
-          (let-values (((decls bodies) (bld-defer-app-strs app-strs)))
-            (for-each (lambda (s) (put-string out s) (put-string out "\n")) decls)
-            (bld-emit-app-init out (cons (bld-startup-profile-form "app namespaces begin") bodies)))
+          (let ((names
+                  (let loop ((gs groups) (fs group-files) (acc '()))
+                    (if (null? gs)
+                        acc
+                        (let ((gout (if split? (open-output-file (car fs) 'replace) out)))
+                          (when split?
+                            (put-string gout (string-append ";; app unit: " (caar gs) "\n")))
+                          (let-values (((decls bodies) (bld-defer-app-strs (cdar gs))))
+                            (for-each (lambda (s) (put-string gout s) (put-string gout "\n")) decls)
+                            (let ((ns-names (bld-emit-app-chunks gout (bld-unit-tag (caar gs)) bodies)))
+                              (when split? (close-port gout))
+                              (loop (cdr gs) (cdr fs) (append acc ns-names)))))))))
+            (when split?
+              (close-port out)
+              (set! out (open-output-file post-ss 'replace))
+              (put-string out ";; app init entry + launcher\n"))
+            (bld-emit-app-init-main out names
+                                    (list (bld-startup-profile-form "app namespaces begin"))))
           ;; The launcher runs as Chez's scheme-start (so argv reaches -main —
           ;; top-level boot forms run during heap build, before args are set), and
           ;; suppresses the interactive greeting. It resets source roots to the
@@ -2601,6 +2700,217 @@
     (unless (file-exists? vboot)
       (error 'jolt-build "gzip re-encode of the boot image failed" vboot))))
 
+;; --- app unit cache + parallel compile (#1059) --------------------------------
+;; The app half is one compile unit per namespace (plus a prologue and the
+;; launcher), each compiled — and converted to vfasl — on its own and cached on
+;; its text. A rebuild after an edit recompiles the namespaces whose text changed;
+;; everything else is a copy. Misses compile in parallel child processes of this
+;; jolt: a 28MB app half compiled in 34.3s sequentially, 22.9s across 8 Chez
+;; threads (allocation serializes), and 8.3s across 8 processes.
+;;
+;; The key is the unit's text plus everything else its fasl depends on: the Chez
+;; compile parameters, the Chez version and machine, and the building jolt's
+;; runtime fingerprint (a unit compiles against that runtime's macros and
+;; primitives). Length + two independent 32-bit hashes, since a false hit is
+;; silently wrong code. JOLT_BUILD_CACHE=0 turns it off; JOLT_BUILD_CACHE_DIR
+;; moves it; JOLT_BUILD_JOBS caps the children (1 = compile in process).
+(define (bld-build-cache-dir)
+  (or (getenv "JOLT_BUILD_CACHE_DIR")
+      (string-append (or (getenv "HOME") ".") "/.jolt/build-cache")))
+(define (bld-env-off? name)
+  (let ((e (getenv name)))
+    (and (string? e)
+         (or (string=? e "0") (string-ci=? e "false") (string-ci=? e "no") (string-ci=? e "off")))))
+(define (bld-build-cache-enabled?) (not (bld-env-off? "JOLT_BUILD_CACHE")))
+
+;; FNV-1a and a multiplicative hash with a different basis and multiplier, in one
+;; pass; answered as hex text. Both multipliers stay under 2^24 so a product of a
+;; 32-bit state is a fixnum on every 64-bit target.
+(define (bld-text-key s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (h1 2166136261) (h2 1540483477))
+      (if (fx=? i n)
+          (string-append (number->string n 16) "-" (number->string h1 16) "-" (number->string h2 16))
+          (let ((c (char->integer (string-ref s i))))
+            (loop (fx+ i 1)
+                  (fxlogand (fx* (fxlogxor h1 c) 16777619) #xFFFFFFFF)
+                  (fxlogand (fx+ (fx* (fxlogxor h2 (fxsrl h2 15)) #x5bd1e9) c) #xFFFFFFFF)))))))
+
+(define (bld-unit-key mode text)
+  (bld-text-key
+    (string-append (scheme-version) " " (sa-host-tag) " " (aot-runtime-fingerprint) "\n"
+                   (bld-params-bindings (or (bld-mode-params mode) '()) "\n") "\n"
+                   text)))
+
+;; so path -> cache key, for the vfasl step to find the unit's cached image
+(define bld-unit-keys (make-hashtable string-hash string=?))
+(define (bld-unit-cache-so key) (string-append (bld-build-cache-dir) "/" key ".so"))
+(define (bld-unit-cache-vfasl key codec)
+  (string-append (bld-build-cache-dir) "/" key "." (symbol->string codec) ".vfasl"))
+
+(define (bld-cache-store! from to)
+  (guard (e (#t #f))               ; an unwritable cache must not fail the build
+    (bld-mkdir-p (bld-build-cache-dir))
+    (let ((tmp (string-append to ".tmp" (number->string (get-process-id)))))
+      (bld-copy-file! from tmp)
+      (rename-file tmp to))))
+
+;; Keep the cache under a byte budget (JOLT_BUILD_CACHE_MB, default 2048), oldest
+;; first. One entry accumulates per distinct unit text, so an app edited often
+;; would otherwise grow it without bound.
+(define (bld-prune-build-cache!)
+  (guard (e (#t #f))
+    (let* ((dir (bld-build-cache-dir))
+           (limit (* 1024 1024 (or (let ((v (getenv "JOLT_BUILD_CACHE_MB"))) (and v (string->number v)))
+                                   2048)))
+           (fs (sort (lambda (a b) (> (cadr a) (cadr b)))
+                     (map (lambda (f) (let ((p (string-append dir "/" f)))
+                                        (list p (sa-file-mtime-ms p) (sa-file-size p))))
+                          (filter (lambda (f) (or (bld-suffix? f ".so") (bld-suffix? f ".vfasl")))
+                                  (directory-list dir))))))
+      (let loop ((fs fs) (total 0))
+        (unless (null? fs)
+          (let ((t (+ total (caddr (car fs)))))
+            (when (> t limit) (guard (e (#t #f)) (delete-file (car (car fs)))))
+            (loop (cdr fs) t)))))))
+
+;; The executable this process is running, or #f when it cannot be named — then
+;; units compile in process. Asked of the OS rather than read off argv[0], which
+;; is whatever the caller passed.
+(define (bld-self-exe)
+  (guard (e (#t #f))
+    (let ((p (case (sa-os-family)
+               ((macos)
+                (let ((f (jolt-foreign-proc-safe "_NSGetExecutablePath" '(u8* u8*) 'int)))
+                  (and f
+                       (let ((buf (make-bytevector 4096 0)) (sz (make-bytevector 4 0)))
+                         (bytevector-u32-native-set! sz 0 4096)
+                         (and (fx=? 0 (f buf sz)) (bld-cstring buf))))))
+               ((linux)
+                (let ((f (jolt-foreign-proc-safe "readlink" '(string u8* size_t) 'long)))
+                  (and f
+                       (let* ((buf (make-bytevector 4096 0)) (n (f "/proc/self/exe" buf 4095)))
+                         (and (> n 0) (bld-cstring buf))))))
+               (else #f))))
+      (and p (file-exists? p) (bld-jolt-exe? p) p))))
+;; Does PATH answer the worker probe? Under the dev launcher this process is a
+;; plain Chez running jolt, and a worker argv handed to that would not compile
+;; anything. One process start, and only for a build with misses to share out.
+(define (bld-jolt-exe? path)
+  (guard (e (#t #f))
+    (string=? "jolt-build-worker"
+              (bld-sh-capture (string-append (bld-sh-quote path)
+                                             " --build-worker-probe < /dev/null 2>/dev/null")))))
+(define (bld-cstring bv)
+  (let loop ((i 0))
+    (if (or (fx=? i (bytevector-length bv)) (fx=? 0 (bytevector-u8-ref bv i)))
+        (utf8->string (let ((out (make-bytevector i))) (bytevector-copy! bv 0 out 0 i) out))
+        (loop (fx+ i 1)))))
+
+(define (bld-build-jobs)
+  (let ((v (getenv "JOLT_BUILD_JOBS")))
+    (max 1 (or (and v (string->number v)) (min 8 (jolt-available-processors))))))
+
+;; A worker job: #(src so vso-or-#f mode codec). The worker compiles SRC to SO
+;; under MODE's parameters and, given VSO, converts SO to a vfasl image there.
+(define (bld-run-job! job)
+  (let ((src (vector-ref job 0)) (so (vector-ref job 1)) (vso (vector-ref job 2))
+        (mode (vector-ref job 3)) (codec (vector-ref job 4)))
+    (bld-chez-compile-file mode src so)
+    (when vso (sa-vfasl-convert-object-file so vso codec))))
+
+;; Entry for a child: run every job in MANIFEST (a file of `write`n job vectors).
+(define (bld-compile-worker manifest)
+  (let ((ip (open-input-file manifest)))
+    (let loop ()
+      (let ((job (read ip)))
+        (unless (eof-object? job)
+          (parameterize ((current-output-port (open-output-string)))   ; compile-file's "compiling …"
+            (bld-run-job! job))
+          (loop))))
+    (close-port ip)))
+
+;; Split JOBS (with sizes) into N bins, largest first into the lightest bin.
+(define (bld-bin-jobs jobs n)
+  (let ((bins (make-vector n '())) (loads (make-vector n 0)))
+    (for-each
+      (lambda (j)
+        (let ((i (let find ((k 0) (best 0))
+                   (if (fx=? k n) best
+                       (find (fx+ k 1) (if (< (vector-ref loads k) (vector-ref loads best)) k best))))))
+          (vector-set! bins i (cons (car j) (vector-ref bins i)))
+          (vector-set! loads i (+ (vector-ref loads i) (cdr j)))))
+      (sort (lambda (a b) (> (cdr a) (cdr b))) jobs))
+    (filter pair? (map reverse (vector->list bins)))))
+
+;; Run JOBS ((job . size) …) across child processes of EXE, at most N at once.
+;; Answers nothing: the caller reads the outputs, and anything a child did not
+;; produce compiles again in process, where a failure raises with its real
+;; message.
+(define (bld-run-jobs-parallel! builddir exe jobs n)
+  (let* ((bins (bld-bin-jobs jobs n))
+         (cmds (let loop ((bs bins) (i 0) (acc '()))
+                 (if (null? bs) (reverse acc)
+                     (let ((mf (string-append builddir "/jobs-" (number->string i) ".edn")))
+                       (let ((op (open-output-file mf 'replace)))
+                         (for-each (lambda (j) (write j op) (newline op)) (car bs))
+                         (close-port op))
+                       (loop (cdr bs) (+ i 1)
+                             (cons (string-append
+                                     (bld-sh-quote exe) " --build-worker " (bld-sh-quote mf)
+                                     " < /dev/null > " (bld-sh-quote (string-append mf ".log")) " 2>&1")
+                                   acc)))))))
+    (bld-system->log
+      (string-append "( " (fold-left (lambda (acc c) (string-append acc c " & ")) "" cmds) "wait )")
+      (string-append builddir "/jobs.log"))))
+
+;; Compile the app units (src so kind) under MODE, from the cache where it can.
+;; VFASL? also converts each compiled miss while its child has it (the split vfasl
+;; step then finds every unit's image cached).
+(define (bld-compile-app-units! builddir mode units vfasl?)
+  (let* ((cache? (bld-build-cache-enabled?))
+         (codec (bld-vfasl-codec))
+         (keyed (map (lambda (u) (let ((text (read-file-string (car u))))
+                                   (list u (bld-unit-key mode text) (string-length text))))
+                     units))
+         (misses (filter (lambda (k) (not (and cache? (file-exists? (bld-unit-cache-so (cadr k))))))
+                         keyed)))
+    (for-each (lambda (k) (hashtable-set! bld-unit-keys (cadr (car k)) (cadr k))) keyed)
+    ;; an image left in the build dir by an earlier build is not this build's:
+    ;; the vfasl step takes one found there as a worker's output
+    (for-each (lambda (u) (let ((vso (string-append (cadr u) ".vfasl")))
+                            (when (file-exists? vso) (delete-file vso))))
+              units)
+    ;; misses: in children when there is enough to share out, else here
+    (let ((exe (and (pair? misses) (pair? (cdr misses)) (> (bld-build-jobs) 1) (bld-self-exe)))
+          (job (lambda (k) (let ((u (car k)))
+                             (vector (car u) (cadr u)
+                                     (and vfasl? (string-append (cadr u) ".vfasl"))
+                                     mode codec)))))
+      (when exe
+        (for-each (lambda (k) (let ((so (cadr (car k)))) (when (file-exists? so) (delete-file so))))
+                  misses)
+        (bld-run-jobs-parallel! builddir exe
+                                (map (lambda (k) (cons (job k) (caddr k))) misses)
+                                (min (bld-build-jobs) (length misses))))
+      (for-each
+        (lambda (k)
+          (let ((u (car k)))
+            (unless (and exe (file-exists? (cadr u)))
+              (bld-chez-compile-file mode (car u) (cadr u)))
+            (when cache?
+              (bld-cache-store! (cadr u) (bld-unit-cache-so (cadr k)))
+              (let ((vso (string-append (cadr u) ".vfasl")))
+                (when (and vfasl? exe (file-exists? vso))
+                  (bld-cache-store! vso (bld-unit-cache-vfasl (cadr k) codec)))))))
+        misses))
+    ;; hits
+    (for-each (lambda (k) (unless (memq k misses) (bld-copy-file! (bld-unit-cache-so (cadr k)) (cadr (car k)))))
+              keyed)
+    (when cache? (bld-prune-build-cache!))
+    (ei-mark! (string-append "compile app units (" (number->string (length misses)) "/"
+                             (number->string (length keyed)) " compiled)"))))
+
 ;; --- split vfasl conversion (#1059) ------------------------------------------
 ;; Converting the whole boot every build re-imaged ~40MB of Chez + runtime that
 ;; does not change between builds, and a whole-boot conversion is superlinear in
@@ -2632,9 +2942,18 @@
                      (bld-prune-runtime-cache!)))
                  out))))))
 
-;; Convert one compiled app unit SO to VSO; #t when it worked.
+;; Convert one compiled app unit SO to VSO; #t when it worked. A unit whose image
+;; is cached (or that a compile child already converted) is not converted again.
 (define (bld-vfasl-unit! so vso)
-  (bld-with-backend-gc (lambda () (sa-vfasl-convert-object-file so vso (bld-vfasl-codec)))))
+  (let* ((key (hashtable-ref bld-unit-keys so #f))
+         (cache (and key (bld-build-cache-enabled?) (bld-unit-cache-vfasl key (bld-vfasl-codec)))))
+    (cond
+      ((and cache (file-exists? cache)) (bld-copy-file! cache vso) #t)
+      ((file-exists? vso) #t)
+      ((bld-with-backend-gc (lambda () (sa-vfasl-convert-object-file so vso (bld-vfasl-codec))))
+       (when cache (bld-cache-store! vso cache))
+       #t)
+      (else #f))))
 
 (define (bld-concat-files! out paths)
   (let ((op (open-file-output-port out (file-options no-fail) (buffer-mode block))))
@@ -2684,15 +3003,15 @@
           (case kind
             ((runtime) (set! rt-key (bld-compile-runtime! src so #t)))
             ((runtime-shaken) (bld-compile-runtime! src so #f))
-            ((app)
-             (bld-chez-compile-file mode src so)
-             (ei-mark! "compile app half"))
+            ((app) #f)                  ; together, below
             (else
              (bld-prepend-prologue! src)
              (ei-mark! "kernel prologue + hash")
              (bld-chez-compile-file mode src so)
              (ei-mark! "Chez compile-file")))))
       units)
+    (bld-compile-app-units! builddir mode (filter (lambda (u) (eq? (caddr u) 'app)) units)
+                            (not (or (bld-cross?) (bld-vfasl-disabled?))))
     ;; A compiler-dropped binary (no runtime eval) boots from petite alone —
     ;; scheme.boot is the Chez compiler, ~5 MB of heap and ~1 MB of binary it
     ;; would never call. Chez's interpreter (petite) can't create a
@@ -3065,6 +3384,8 @@
                     natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?)
                     (bld-opt-strs opt 3) #f (bld-opt-strs opt 5)))
     jolt-nil))
+(def-var! "jolt.host" "build-compile-worker"
+  (lambda (manifest) (bld-compile-worker (jolt-str-render-one manifest)) jolt-nil))
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))

@@ -166,11 +166,11 @@ run_local_case() {
   fi
   # Check that a def that should be pruned is indeed absent from the shaken
   # build. A core def lives in the runtime unit (runtime.ss) and an app def in
-  # flat.ss, so look in both — a grep over flat.ss alone passes for a core def
-  # whatever the shake did.
+  # the app's units (flat.ss, app-N.ss, app-post.ss), so look in all of them — a
+  # grep over one file alone passes for a def in another whatever the shake did.
   if [ -n "$assert_missing" ]; then
     blddir="$tmp/$1-shake.build"
-    for f in "$blddir/flat.ss" "$blddir/runtime.ss"; do
+    for f in "$blddir/flat.ss" "$blddir/runtime.ss" "$blddir"/app-[0-9]*.ss "$blddir/app-post.ss"; do
       if [ -f "$f" ] && grep -q "$assert_missing" "$f" 2>/dev/null; then
         echo "  - $1: FAIL (pruned def '$assert_missing' found in shaken $(basename "$f"))"
         fail=1; return

@@ -431,6 +431,17 @@
 
 (define (jolt-cli-dispatch cli-args prepare-build!)
     (cond
+      ;; --build-worker MANIFEST — internal: a `jolt build` compiling app units in
+      ;; parallel runs copies of itself with this (build.ss bld-run-jobs-parallel!).
+      ;; Ahead of everything else so a worker started in a project directory never
+      ;; resolves the project.
+      ((and (pair? cli-args) (string=? (car cli-args) "--build-worker") (pair? (cdr cli-args)))
+       (prepare-build!)
+       ((var-deref "jolt.host" "build-compile-worker") (cadr cli-args)))
+      ;; …and asks this first, so it never hands a worker argv to something that
+      ;; is not a jolt (under the dev launcher the process is a plain Chez).
+      ((and (pair? cli-args) (string=? (car cli-args) "--build-worker-probe"))
+       (display "jolt-build-worker\n"))
       ;; -e EXPR [args…] — evaluate one expression and print it (blank for nil).
       ;; Each top-level form is read, compiled, and evaled in sequence so each
       ;; form is visible to the next, matching JVM load semantics. The argv after

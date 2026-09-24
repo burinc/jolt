@@ -16,6 +16,7 @@ available-processors
 backtrace-string
 block-sigint
 build-binary
+build-compile-worker
 build-library
 bytes-allocated
 call-cc

@@ -1,9 +1,16 @@
 #!/bin/sh
+
 # build smoke: `jolt build` compiles a multi-namespace app (macro + cross-ns +
 # clojure.string) into a standalone binary, which then runs with no jolt source
 # or Chez install on the path — args reach -main, output matches.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+
+# The app's emitted Scheme is several files since the build compiles (and
+# caches) one unit per namespace: flat.ss is the prologue, app-N.ss each
+# namespace, app-post.ss the launcher. A check about what the app emitted reads
+# all of them — one over flat.ss alone passes an absence check vacuously.
+appsrc() { cat "$1/flat.ss" "$1"/app-[0-9]*.ss "$1/app-post.ss" 2>/dev/null; }
 
 # JOLT_BIN overrides the jolt under test. The gate targets point it at the
 # freshly built target/release/jolt: a `jolt build` costs ~2.5s through the
@@ -106,12 +113,12 @@ done
 # that had done MORE than it asked for. The binding is emitted for every
 # direct-linked def whether or not any particular call to it survives, and it is
 # absent entirely under --no-direct-link, so it still discriminates.
-if ! grep -q 'define jv\$app.util/shout' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'define jv\$app.util/shout'; then
   echo "  FAIL: release build did not direct-link the app->app call"; exit 1
 fi
 # ...and nothing reads it through its var, which is the thing direct-linking is
 # for. This holds whether the call was spliced or left as a jv$ application.
-if grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")'; then
   echo "  FAIL: release build still var-routed the app->app call"; exit 1
 fi
 
@@ -122,8 +129,8 @@ fi
 if ! JOLT_PWD="$app" JOLT_NO_WP_INFER=1 "$jolt" build -m app.core -o "$out.noop" >/dev/null 2>&1; then
   echo "  FAIL: JOLT_NO_WP_INFER build exited non-zero"; exit 1
 fi
-default_fl=$(grep -c '#3%fl' "$out.build/flat.ss" || true)
-noop_fl=$(grep -c '#3%fl' "$out.noop.build/flat.ss" || true)
+default_fl=$(appsrc "$out.build" | grep -c '#3%fl' || true)
+noop_fl=$(appsrc "$out.noop.build" | grep -c '#3%fl' || true)
 if [ "$default_fl" -le "$noop_fl" ]; then
   echo "  FAIL: wp-infer added no fl-ops to the release build (default=$default_fl noop=$noop_fl)"; exit 1
 fi
@@ -133,13 +140,13 @@ fi
 # no fixpoint needed), so flat.ss carries the inline native and NO
 # record-method-dispatch "startsWith" anywhere. Runtime shape is asserted below
 # via --strd; this is the emit-level proof.
-if ! grep -q 'str-starts-with?' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'str-starts-with?'; then
   echo "  FAIL: str-target .startsWith did not lower to the string native"; exit 1
 fi
-if grep -q 'record-method-dispatch.*startsWith' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q 'record-method-dispatch.*startsWith'; then
   echo "  FAIL: str-target .startsWith still routes through record-method-dispatch"; exit 1
 fi
-if ! grep -q 'str-starts-with?' "$out.noop.build/flat.ss"; then
+if ! appsrc "$out.noop.build" | grep -q 'str-starts-with?'; then
   echo "  FAIL: str-target lowering depended on the wp fixpoint (str-ret table is per-form)"; exit 1
 fi
 
@@ -151,10 +158,10 @@ fi
 # sym elsewhere) don't false-positive; the positive one matches kwsym's exact
 # emission (the bare (jolt-symbol (keyword-t-ns …)) shape also appears in the
 # runtime section, so it alone would not prove the stamp fired).
-if ! grep -qF '(jolt-symbol (keyword-t-ns k) (keyword-t-name k))' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -qF '(jolt-symbol (keyword-t-ns k) (keyword-t-name k))'; then
   echo "  FAIL: kw-target .sym did not lower to the inline keyword arm"; exit 1
 fi
-if grep -qE 'record-method-dispatch [^ ()]+"sym"' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -qE 'record-method-dispatch [^ ()]+"sym"'; then
   echo "  FAIL: kw-target .sym still routes through record-method-dispatch"; exit 1
 fi
 
@@ -164,13 +171,13 @@ fi
 # that local and route no "append"/"toString" on it through the jhost method table.
 # The negative grep anchors the method name right after the target so unrelated
 # record-method-dispatch lines elsewhere in the closure cannot false-positive.
-if ! grep -qF '(sb-append! sb (sb-piece' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -qF '(sb-append! sb (sb-piece'; then
   echo "  FAIL: sb-target .append did not lower to the inline sb-append!"; exit 1
 fi
-if ! grep -qF '(sb-str sb)' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -qF '(sb-str sb)'; then
   echo "  FAIL: sb-target .toString did not lower to the inline sb-str"; exit 1
 fi
-if grep -qE 'record-method-dispatch [^ ()]+"append"' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -qE 'record-method-dispatch [^ ()]+"append"'; then
   echo "  FAIL: sb-target .append still routes through record-method-dispatch"; exit 1
 fi
 
@@ -182,10 +189,10 @@ fi
 # classes are referenced nowhere, so that provider must stay out. The greps
 # target ns EMISSION (set-chez-ns!), not bare strings — the runtime section of
 # flat.ss always mentions both providers in its autoload tables.
-if ! grep -q 'set-chez-ns! "jolt\.time"' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'set-chez-ns! "jolt\.time"'; then
   echo "  FAIL: a jolt.time class ref did not pull the provider ns into flat.ss"; exit 1
 fi
-if grep -q 'set-chez-ns! "jolt\.crypto"' "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q 'set-chez-ns! "jolt\.crypto"'; then
   echo "  FAIL: unreferenced lib provider jolt.crypto leaked into flat.ss"; exit 1
 fi
 
@@ -218,13 +225,13 @@ check_fnid() {  # check_fnid <binary> <label>
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
   echo "  FAIL: jolt build --no-direct-link exited non-zero"; exit 1
 fi
-if grep -q 'define jv\$app.util/shout' "$out.nodl.build/flat.ss"; then
+if appsrc "$out.nodl.build" | grep -q 'define jv\$app.util/shout'; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
 fi
 check_fnid "$out.nodl" "the --no-direct-link build"
 # and it IS var-routed there -- without this the check above would pass on a
 # build that emitted no reference to shout at all.
-if ! grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.nodl.build/flat.ss"; then
+if ! appsrc "$out.nodl.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")'; then
   echo "  FAIL: --no-direct-link did not var-route the app->app call"; exit 1
 fi
 # An OPEN-WORLD build maps its frames too. emit-def-cached only emits a source
@@ -687,12 +694,12 @@ if [ "$got_dl" != "$want" ]; then
   echo "--- got ----"; echo "$got_dl"
   exit 1
 fi
-if ! grep -q 'define jv\$app.util/shout' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'define jv\$app.util/shout'; then
   echo "  FAIL: --direct-link did not emit a direct app->app call"; exit 1
 fi
 # A direct-link build registers fn sources, so an uncaught throw prints a Clojure
 # stack trace mapping each native frame back to ns/name (file:line).
-if ! grep -q 'jolt-register-source!' "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q 'jolt-register-source!'; then
   echo "  FAIL: --direct-link did not emit source registrations"; exit 1
 fi
 boom_err="$(cd / && "$out" --boom 2>&1 >/dev/null)"
@@ -771,7 +778,7 @@ reduce_acc_want="$(printf '1\n[1 2 3]\n8\n14.0\n2\n1\n1\n1')"
 if [ "$reduce_acc_got" != "$reduce_acc_want" ]; then
   echo "  FAIL: reduce accumulator typed from its init alone — got \`$reduce_acc_got\`, want \`$reduce_acc_want\`"; exit 1
 fi
-if ! grep -q '#3%fl+' "$reduce_acc_out.build/flat.ss"; then
+if ! appsrc "$reduce_acc_out.build" | grep -q '#3%fl+'; then
   echo "  FAIL: a 0.0-seeded reduce closure returning a flonum lost its fl+"; exit 1
 fi
 
@@ -888,7 +895,7 @@ if [ "$got_do" != "$(printf '1\nalive')" ]; then
   echo "  FAIL: --tree-shake defonce binary output mismatch"
   echo "--- got ----"; echo "$got_do"; exit 1
 fi
-if grep -q '"app.core" "dead"' "$doout.build/flat.ss"; then
+if appsrc "$doout.build" | grep -q '"app.core" "dead"'; then
   echo "  FAIL: --tree-shake did not drop the unreferenced def app.core/dead"; exit 1
 fi
 [ -f "$doout.build/runtime.ss" ] || { echo "  FAIL: --tree-shake did not emit the shaken core as its own runtime unit"; exit 1; }
@@ -929,7 +936,7 @@ got_img="$(JOLT_PWD="$ckapp" "$jolt" -e "(require 'jolt.image) (println (:answer
 if [ "$got_img" != "42" ]; then
   echo "  FAIL: the image the shaken binary wrote does not read back — got: $got_img"; exit 1
 fi
-if grep -q '"ck.main" "dead"' "$ckout.build/flat.ss"; then
+if appsrc "$ckout.build" | grep -q '"ck.main" "dead"'; then
   echo "  FAIL: the compiler-keeping shake did not prune the app half (ck.main/dead)"; exit 1
 fi
 if ! grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"' "$ckout.build/runtime.ss"; then
@@ -1459,7 +1466,7 @@ aaout="$(dirname "$out")/as-alias-bin"
 if ! JOLT_PWD="$root/test/chez/as-alias-app" "$joltabs" build -m app.core -o "$aaout" >/dev/null 2>&1; then
   echo "  FAIL: as-alias-app build exited non-zero"; exit 1
 fi
-if grep -q 'set-chez-ns! "app.other"' "$aaout.build/flat.ss"; then
+if appsrc "$aaout.build" | grep -q 'set-chez-ns! "app.other"'; then
   echo "  FAIL: :as-alias pulled app.other into the binary"; exit 1
 fi
 got_aa="$(cd / && "$aaout" 2>&1)"
@@ -1484,7 +1491,7 @@ fi
 [ -f "$splitout.build/runtime.ss" ] || { echo "  FAIL: no runtime.ss — the split did not happen"; exit 1; }
 # clojure.core lives in the runtime half only; finding it in flat.ss means the app
 # half still carries the runtime and nothing was actually separated.
-if grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"' "$splitout.build/flat.ss"; then
+if appsrc "$splitout.build" | grep -Eq 'def-var[a-z!-]*! "clojure.core" "group-by"'; then
   echo "  FAIL: runtime defs still in flat.ss after the split"; exit 1
 fi
 if [ "$(ls "$cachedir"/*.so 2>/dev/null | wc -l | tr -d ' ')" != "1" ]; then
@@ -1519,6 +1526,42 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   echo "--- unsplit ---";     echo "$got_nosplit"
   exit 1
 fi
+
+# --- app unit cache (#1059) -----------------------------------------------------
+# The app half compiles as one unit per namespace, cached on the unit's text. A
+# rebuild of unchanged source compiles nothing; an edit to one namespace
+# recompiles that namespace's unit and no other — which only holds if a unit's
+# text depends on its own namespace and not on how many names the namespaces
+# before it (or the build's own load phase) used. Each binary must still behave
+# exactly like the reference.
+echo "build smoke: app unit cache (rebuild compiles only what changed)"
+ucapp="$(dirname "$out")/unitcache-app"
+ucache="$(dirname "$out")/unitcache"
+rm -rf "$ucapp" "$ucache"
+cp -R "$app" "$ucapp"
+ucbuild() { # $1 = output; answers the profile's "compile app units (m/n compiled)" line
+  JOLT_PWD="$ucapp" JOLT_BUILD_CACHE_DIR="$ucache" JOLT_BUILD_PROFILE=1 "$joltabs" build -m app.core -o "$1" 2>"$1.prof" >/dev/null \
+    || { echo "  FAIL: unit-cache build $1 exited non-zero"; sed -n '1,20p' "$1.prof"; exit 1; }
+  sed -n 's/.*compile app units (\([0-9]*\)\/\([0-9]*\) compiled).*/\1 \2/p' "$1.prof"
+}
+uc1="$(ucbuild "$(dirname "$out")/uc-bin1")"
+uc2="$(ucbuild "$(dirname "$out")/uc-bin2")"
+[ -n "$uc1" ] || { echo "  FAIL: no 'compile app units' profile line"; exit 1; }
+if [ "${uc2%% *}" != "0" ]; then
+  echo "  FAIL: an unchanged rebuild compiled units ($uc2 — want 0 compiled)"; exit 1
+fi
+printf '\n(defn added-later [x] (str "later " x))\n' >> "$ucapp/src/app/util.clj"
+uc3="$(ucbuild "$(dirname "$out")/uc-bin3")"
+if [ "${uc3%% *}" != "1" ]; then
+  echo "  FAIL: editing one namespace recompiled ${uc3%% *} units (want 1; units: ${uc1#* })"; exit 1
+fi
+for b in uc-bin1 uc-bin2 uc-bin3; do
+  got_uc="$(cd / && "$(dirname "$out")/$b" alpha bb ccc 2>&1)"
+  if [ "$got_uc" != "$want" ]; then
+    echo "  FAIL: $b disagrees with the reference output"
+    echo "--- want ---"; echo "$want"; echo "--- got ---"; echo "$got_uc"; exit 1
+  fi
+done
 
 # --boot picks how the boot image is encoded (jolt-lang/jolt#886): `fast` (the
 # default) is vfasl+LZ4, `small` is vfasl+gzip, `plain` skips vfasl entirely.
@@ -1773,4 +1816,4 @@ if ! grep -q 'cannot include no.such.ns' "$(dirname "$out")/inc-bad.log"; then
 fi
 rm -rf "$(dirname "$inc_app")"
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include)"

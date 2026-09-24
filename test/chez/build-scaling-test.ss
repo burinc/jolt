@@ -15,6 +15,8 @@
 ;;   d. the vfasl image is converted in pieces: the runtime prefix once (cached),
 ;;      the app per unit. The whole-boot conversion re-imaged ~40MB that never
 ;;      changes, and is superlinear in the image (40s for a 28MB app half)
+;;   e. the app half is one compile unit per namespace, cached on its text; a
+;;      miss compiles in a worker (in parallel, in a real build)
 ;;
 ;;   chez --script test/chez/build-scaling-test.ss
 (import (chezscheme))
@@ -34,6 +36,13 @@
 (define tmp "target/build-scaling-gate")
 (bld-mkdir-p tmp)
 (define (at name) (string-append tmp "/" name))
+
+(define (substring? needle hay)
+  (let ((n (string-length needle)) (h (string-length hay)))
+    (let loop ((i 0))
+      (cond ((> (+ i n) h) #f)
+            ((string=? needle (substring hay i (+ i n))) #t)
+            (else (loop (+ i 1)))))))
 
 (define (read-all-string s)
   (let ((ip (open-input-string s)))
@@ -132,6 +141,68 @@
 (ok "a second build reuses the cached prefix"
     (and (bld-vfasl-split! tmp (list (at "no-such-petite.boot")) units rt-key #f vboot2)
          (string=? (boot-output vboot2) "42")))
+
+;; --- e: one compile unit per namespace, cached on its text -------------------------
+(define grouped (bld-group-app-strs '("a1" "a2" "b1" "c1" "c2" "c3") '(("a" . 2) ("b" . 1) ("c" . 3)) "entry"))
+(ok "app strings regroup by namespace, in order"
+    (equal? grouped '(("a" "a1" "a2") ("b" "b1") ("c" "c1" "c2" "c3"))))
+(ok "a namespace that emitted nothing makes no unit"
+    (equal? (bld-group-app-strs '("a1" "c1") '(("a" . 1) ("b" . 0) ("c" . 1)) "entry")
+            '(("a" "a1") ("c" "c1"))))
+(ok "strings the sizes do not account for (a shaken app) stay one unit"
+    (equal? (bld-group-app-strs '("x" "y") '(("a" . 3)) "entry") '(("entry" "x" "y"))))
+(ok "chunk procedures are named for their namespace, not their position"
+    (let ((s (with-output-to-string
+               (lambda () (bld-emit-app-chunks (current-output-port) (bld-unit-tag "my.ns-x/y?") '("(f)"))))))
+      (and (substring? "jolt-app-init$my.ns-x_y_$0!" s))))
+(ok "the unit key moves with the text"
+    (not (string=? (bld-unit-key "release" "(define x 1)") (bld-unit-key "release" "(define x 2)"))))
+(ok "…and with the compile parameters"
+    (not (string=? (bld-unit-key "release" "(define x 1)") (bld-unit-key "optimized" "(define x 1)"))))
+(ok "…and is stable for the same inputs"
+    (string=? (bld-unit-key "release" "(define x 1)") (bld-unit-key "release" "(define x 1)")))
+
+;; the cache: a miss compiles and stores, a hit copies without compiling
+(define ucache (at "unit-cache"))
+(when (file-exists? ucache)
+  (for-each (lambda (f) (delete-file (string-append ucache "/" f))) (directory-list ucache)))
+(putenv "JOLT_BUILD_CACHE_DIR" ucache)
+(putenv "JOLT_BUILD_JOBS" "1")
+(define u1-ss (at "u1.ss")) (define u2-ss (at "u2.ss"))
+(write-text! u1-ss "(define gate-u1 1)\n")
+(write-text! u2-ss "(define gate-u2 2)\n")
+(define uunits (list (list u1-ss (at "u1.so") 'app) (list u2-ss (at "u2.so") 'app)))
+(bld-compile-app-units! tmp "release" uunits #f)
+(ok "a cold build compiles every unit and caches it"
+    (and (file-exists? (at "u1.so")) (file-exists? (at "u2.so"))
+         (= 2 (length (filter (lambda (f) (bld-suffix? f ".so")) (directory-list ucache))))))
+(delete-file (at "u1.so")) (delete-file (at "u2.so"))
+(define real-compile bld-chez-compile-file)
+(define compiled-again 0)
+(set! bld-chez-compile-file (lambda args (set! compiled-again (+ compiled-again 1)) (apply real-compile args)))
+(bld-compile-app-units! tmp "release" uunits #f)
+(ok "a warm build compiles nothing and still produces every unit"
+    (and (= compiled-again 0) (file-exists? (at "u1.so")) (file-exists? (at "u2.so"))))
+(write-text! u2-ss "(define gate-u2 3)\n")
+(bld-compile-app-units! tmp "release" uunits #f)
+(ok "changing one unit recompiles that unit only" (= compiled-again 1))
+(set! bld-chez-compile-file real-compile)
+
+;; an image an earlier build left in the build dir is never taken as this build's
+(write-text! (at "u1.so.vfasl") "stale bytes from an earlier build")
+(bld-compile-app-units! tmp "release" uunits #t)
+(ok "a unit image left over from an earlier build is not reused"
+    (and (bld-vfasl-unit! (at "u1.so") (at "u1.so.vfasl"))
+         (not (string=? (read-file-string (at "u1.so.vfasl")) "stale bytes from an earlier build"))))
+
+;; a worker manifest compiles its jobs
+(define wm (at "jobs.edn"))
+(let ((op (open-output-file wm 'replace)))
+  (write (vector u1-ss (at "w1.so") (at "w1.so.vfasl") "release" 'default) op)
+  (close-port op))
+(bld-compile-worker wm)
+(ok "a worker compiles and converts each job in its manifest"
+    (and (file-exists? (at "w1.so")) (file-exists? (at "w1.so.vfasl"))))
 
 (printf "\nbuild scaling gate: ~a/~a passed~a\n"
         (- total fails) total (if (= fails 0) "" (format " (~a failed)" fails)))
