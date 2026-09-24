@@ -2591,14 +2591,32 @@
 (define (sr-next-int st) (sr-mix32 (sr-next-seed! st)))
 (define (sr-next-double st)
   (* (bitwise-arithmetic-shift-right (sr-mix64 (sr-next-seed! st)) 11) (expt 2.0 -53)))
-(define (sr-long-arg x) (exact (truncate x)))
-;; the largest double below d, for a bounded nextDouble that rounded up to its bound
+;; An argument to a long or int parameter narrows the way reflective dispatch
+;; narrows it on the JVM, through Number.longValue/intValue: an integer wraps to
+;; the parameter's width and a double saturates (NaN is 0). So (.nextInt r
+;; 3000000000) reaches the JDK as a negative bound and throws its "bound must be
+;; positive", instead of drawing from a range no int can reach.
+(define (sr-narrow x lo hi wrap)
+  (if (flonum? x)
+      (cond ((not (= x x)) 0)
+            ((<= x (inexact lo)) lo)
+            ((>= x (inexact hi)) hi)
+            (else (exact (truncate x))))
+      (wrap (exact (truncate x)))))
+(define (sr-long-arg x)
+  (sr-narrow x #x-8000000000000000 #x7FFFFFFFFFFFFFFF sr-s64))
+(define (sr-int-arg x)
+  (sr-narrow x #x-80000000 #x7FFFFFFF sr-s32))
+;; Math.nextDown: the largest double below d, for a bounded nextDouble that
+;; rounded up to its bound. Both zeros step to -Double/MIN_VALUE.
 (define (sr-next-down d)
-  (let ((bv (make-bytevector 8)))
-    (bytevector-ieee-double-set! bv 0 d (endianness little))
-    (let ((bits (bytevector-s64-ref bv 0 (endianness little))))
-      (bytevector-s64-set! bv 0 (if (> d 0.0) (- bits 1) (+ bits 1)) (endianness little))
-      (bytevector-ieee-double-ref bv 0 (endianness little)))))
+  (if (= d 0.0)
+      -4.9406564584124654e-324
+      (let ((bv (make-bytevector 8)))
+        (bytevector-ieee-double-set! bv 0 d (endianness little))
+        (let ((bits (bytevector-s64-ref bv 0 (endianness little))))
+          (bytevector-s64-set! bv 0 (if (> d 0.0) (- bits 1) (+ bits 1)) (endianness little))
+          (bytevector-ieee-double-ref bv 0 (endianness little))))))
 ;; RandomSupport.boundedNextLong / boundedNextInt: rejection sampling written with
 ;; the JVM's wrapping arithmetic, so the draws consumed match the JDK's.
 (define (sr-bounded-long st origin bound)
@@ -2668,11 +2686,11 @@
                         (cond
                           ((null? a) (sr-next-int st))
                           ((null? (cdr a))
-                           (let ((b (sr-long-arg (car a))))
+                           (let ((b (sr-int-arg (car a))))
                              (sr-check-bound b)
                              (sr-bounded-int st 0 b)))
                           (else
-                           (let ((o (sr-long-arg (car a))) (b (sr-long-arg (cadr a))))
+                           (let ((o (sr-int-arg (car a))) (b (sr-int-arg (cadr a))))
                              (sr-check-range o b)
                              (sr-bounded-int st o b)))))))
     (cons "nextDouble" (lambda (self . a)
@@ -2686,10 +2704,17 @@
                                 (let ((r (* (sr-next-double st) b)))
                                   (if (>= r b) (sr-next-down b) r))))
                              (else
+                              ;; RandomSupport.checkRange + boundedNextDouble: both
+                              ;; ends finite, and a span that overflows to Infinity
+                              ;; is drawn at half scale and doubled back
                               (let ((o (inexact (car a))) (b (inexact (cadr a))))
-                                (unless (< o b)
+                                (unless (and (finite? o) (finite? b) (< o b))
                                   (throw-jvm 'IllegalArgumentException "bound must be greater than origin"))
-                                (let ((r (+ (* (sr-next-double st) (- b o)) o)))
+                                (let* ((d (sr-next-double st))
+                                       (r (if (< (- b o) +inf.0)
+                                              (+ (* d (- b o)) o)
+                                              (let ((ho (* 0.5 o)))
+                                                (* (+ (* d (- (* 0.5 b) ho)) ho) 2.0)))))
                                   (if (>= r b) (sr-next-down b) r))))))))
     (cons "nextBoolean" (lambda (self) (< (sr-next-int (jhost-state self)) 0)))))
 

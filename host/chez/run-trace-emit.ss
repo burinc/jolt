@@ -177,8 +177,15 @@
 ;; A NAMED fn whose body ends in a native-op tail call: exactly one jolt-site!
 ;; store, carrying the static ('fn . line) pair (sited-tail-call), and the def
 ;; wrapper registers the site's static callee for the reporter's staleness
-;; validator (jolt-register-callsite!). A dynamic-callee site (mdemo's f above)
-;; registers nothing.
+;; validator (jolt-register-callsite!). A dynamic-callee NON-tail site registers
+;; nothing; a dynamic TAIL site registers "?" so a live stack read can tell its
+;; pair went somewhere and returned (source-registry jolt-site-exited?).
+(define dyn-src "(def ddemo (fn ddemo [f x]\n  (let [a (f x)]\n    (f a))))")
+(let ((e (emit-num dyn-src)))
+  (gate-check "(10b) dynamic tail site registers ?"
+              (gate-sub? e "(jolt-register-callsite! \"ddemo\" 3 \"?\" #t)") #t)
+  (gate-check "(10b) dynamic non-tail site registers nothing"
+              (gate-sub? e "(jolt-register-callsite! \"ddemo\" 2 ") #f))
 (define sited-src "(def sdemo (fn sdemo [x]\n  (+ x 1)))")
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) native tail site stores the pair" (gate-sub? e "(jolt-site! '(") #t)

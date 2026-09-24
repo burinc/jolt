@@ -753,6 +753,22 @@
              (or (hit? (jolt-callsite-callees fnm (srcreg-frame-line ctx)))
                  (hit? (jolt-callsite-fn-callees fnm)))))))
 
+;; A live read's pair stands for an erased frame only while its tail call is still
+;; running, and spliced innermost it claims that call reached the stack read with
+;; no traced frame in between. When the pair's own site registers a static tail
+;; callee, the call went there instead: had that callee still been running it would
+;; be a live frame, or it would have stored a pair of its own on its way out. Either
+;; way the pair is a returned call's residue, whatever the live frames' callee lists
+;; say — they only show the pair's chain is CALLED somewhere, not that it still is.
+;; A dynamic tail call (a fn value) is registered by line alone and counts the same.
+;; A tail call through a host method (the stack read itself) registers nothing.
+(define (jolt-site-exited? site)
+  (let ((line (jolt-marker-entry-line (cdr site)))
+        (exits (jolt-callsite-tail-exits (car site)))
+        (dyn (jolt-callsite-dynamic-tail-lines (car site))))
+    (or (and (pair? exits) (exists (lambda (e) (eqv? (car e) line)) exits))
+        (and (pair? dyn) (memv line dyn) #t))))
+
 ;; Forward path from callee `start` through single tail exits until an exit
 ;; reaches `target`; returns the erased (fn . exit-line) entries DEEPEST
 ;; first, '() when start IS the target (nothing erased), #f when no
@@ -847,12 +863,14 @@
         ;; unless registered evidence contradicts it. A live read's pair can be
         ;; residue from anywhere along the stack, so there it splices in only on
         ;; positive evidence: the walk reaches a live frame, or the innermost
-        ;; live frame's registered callees name a walked fn.
+        ;; live frame's registered callees name a walked fn, and the pair's own
+        ;; tail call has not visibly gone somewhere else (jolt-site-exited?).
         (if (and site (not used?))
             (call-with-values (lambda () (jolt-backwalk site cont-names))
               (lambda (path connected?)
                 (if (if live?
-                        (jolt-site-evidenced? path connected? cont)
+                        (and (not (jolt-site-exited? site))
+                             (jolt-site-evidenced? path connected? cont))
                         (jolt-site-valid? site path connected? cont cont-names))
                     (append (srcreg-site-frames path) body)
                     body)))

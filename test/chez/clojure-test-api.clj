@@ -371,6 +371,76 @@
          "test-ns calls test-ns-hook and returns that namespace's counters"))
   (reset! t/registry saved))
 
+;; --- deftest's shape: calling the test fn runs it AS a test ---------------------
+;; clojure.test's deftest defines the var as (fn [] (test-var (var name))) and puts
+;; the body in :test, so the canonical hook (defn test-ns-hook [] (a) (b)) counts
+;; each test, brackets it in begin/end-test-var, and turns an uncaught throw into
+;; an :error so the tests after it still run. Expectations read off JVM Clojure
+;; 1.12 on the same namespace.
+(defn- report-trace [f]
+  (let [rs (atom []) r0 t/report]
+    (binding [t/report (fn [m]
+                         (swap! rs conj (if (#{:begin-test-var :end-test-var} (:type m))
+                                          [(:type m) (symbol (name (:name (meta (:var m)))))]
+                                          (:type m)))
+                         (binding [t/*test-out* (java.io.StringWriter.)] (r0 m)))]
+      [(f) @rs])))
+
+(ns api-hook-direct (:require [clojure.test :refer [deftest is]]))
+(deftest ta (is true))
+(deftest tb (throw (ex-info "boom" {})))
+(deftest tc (is true) (is true))
+(defn test-ns-hook [] (ta) (tb) (tc))
+
+(ns api-fixture-ns (:require [clojure.test :as t :refer [deftest is]]))
+(def each-calls (atom 0))
+(t/use-fixtures :each (fn [f] (swap! each-calls inc) (f)))
+(deftest one (is true))
+(defn plain [] 1)
+
+(ns clojure-test-api)
+
+(def ^:private hook-trace
+  [{:test 3 :pass 3 :fail 0 :error 1 :type :summary}
+   [:begin-test-ns
+    [:begin-test-var 'ta] :pass [:end-test-var 'ta]
+    [:begin-test-var 'tb] :error [:end-test-var 'tb]
+    [:begin-test-var 'tc] :pass :pass [:end-test-var 'tc]
+    :end-test-ns :summary]])
+
+(ok= (report-trace (fn [] (t/run-tests 'api-hook-direct)))
+     hook-trace
+     "a hook calling deftest fns runs each through test-var")
+
+;; no-arg run-tests is (run-tests *ns*): it honors that namespace's hook too
+(ok= (report-trace (fn [] (binding [*ns* (the-ns 'api-hook-direct)] (t/run-tests))))
+     hook-trace
+     "(run-tests) runs *ns* through the same path, hook included")
+
+(ok= [(fn? api-hook-direct/ta)
+      (fn? (:test (meta #'api-hook-direct/ta)))
+      (= api-hook-direct/ta (:test (meta #'api-hook-direct/ta)))]
+     [true true false]
+     "deftest's var value is a test-var thunk, its body lives in :test")
+
+(ok= (report-trace (fn [] (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                            (api-hook-direct/ta)
+                            @t/*report-counters*)))
+     [{:test 1 :pass 1 :fail 0 :error 0}
+      [[:begin-test-var 'ta] :pass [:end-test-var 'ta]]]
+     "calling a deftest directly reports it as a test")
+
+(ok= (let [v (t/deftest- api-private-t (is true))] [(:private (meta v)) (fn? @v)])
+     [true true]
+     "deftest- is private and keeps the thunk")
+
+;; :each fixtures wrap test vars only, like clojure.test's (when (:test (meta v)) …)
+(ok= (binding [t/*test-out* (java.io.StringWriter.)]
+       (t/test-vars [#'api-fixture-ns/one #'api-fixture-ns/plain])
+       @api-fixture-ns/each-calls)
+     1
+     "test-vars runs :each fixtures only around test vars")
+
 (let [n @passes f @fails]
   (doseq [m f] (println "clojure-test-api FAIL " m))
   (println "CLOJURE-TEST-API-RESULT pass" n "fail" (count f))

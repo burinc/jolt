@@ -2811,7 +2811,10 @@
         ;; R2: record this site's static callee for the callsite table. Runs after
         ;; the args are emitted, so when a line carries both a call and its
         ;; operand's call the OUTER (later-emitted) callee wins — the tail call's.
-        _ (when tl (register-callsite! tl (static-callee fnode) tail?))
+        ;; A dynamic TAIL callee registers as "?": the reporter needs to know the
+        ;; site's call went somewhere even when it cannot say where (rt.ss
+        ;; jolt-dynamic-tail-lines). A dynamic non-tail site still registers nothing.
+        _ (when tl (register-callsite! tl (or (static-callee fnode) (when tail? "?")) tail?))
         nop (native-op fnode (count args))
         kind (ifn-kind fnode)
         ;; order args left-to-right (build receives the spliced operand strings)

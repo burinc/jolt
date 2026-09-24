@@ -481,23 +481,33 @@
              (if i (assoc r i entry) (conj r entry)))))
   nil)
 
+(defn- def-test-form
+  "The (def ...) deftest and deftest- expand to, shaped like clojure.test's: the
+  var's VALUE runs it as a test through test-var and the body lives in :test.
+  So a test-ns-hook that calls its tests by name, (defn test-ns-hook [] (a) (b)),
+  counts each one, brackets it in begin/end-test-var, and reports an uncaught
+  throw as an :error instead of losing the rest of the run.
+
+  The thunk is a NAMED fn only so the def registers its source: a stack read
+  (test.check's reporter walks one for an assertion's file:line) then maps the
+  body's frame, which lives in the def's metadata, back to this file."
+  [name body extra-meta]
+  `(do
+     (def ~(vary-meta name merge extra-meta {:test `(fn [] ~@body)})
+       (fn ~name [] (clojure.test/test-var (var ~name))))
+     (clojure.test/register-test! (clojure.core/ns-name clojure.core/*ns*)
+                                  '~name (:test (meta (var ~name))))
+     (var ~name)))
+
 (defmacro deftest [name & body]
   (when *load-tests*
-    `(do
-       (defn ~name [] ~@body)
-       ;; the var carries :test metadata like clojure.test's deftest, so tooling
-       ;; that discovers tests by scanning var meta finds it.
-       (alter-meta! (var ~name) assoc :test ~name)
-       (clojure.test/register-test! (clojure.core/ns-name clojure.core/*ns*)
-                                    '~name ~name)
-       (var ~name))))
+    (def-test-form name body nil)))
 
 (defmacro deftest-
   "Like deftest but the var is private."
   [name & body]
   (when *load-tests*
-    `(doto (clojure.test/deftest ~name ~@body)
-       (alter-meta! assoc :private true))))
+    (def-test-form name body {:private true})))
 
 ;; with-test attaches a test body as :test metadata on a var-defining form (which
 ;; must return the var), like clojure.test's — schema's tests wrap s/defn this way.
@@ -636,23 +646,22 @@
           (fn [] (doseq [t ts] (run-one t)))))))
   (do-report {:type :end-test-ns :ns (find-ns n)}))
 
-;; (run-tests 'ns1 'ns2 …) runs only those namespaces' tests, like clojure.test.
-;; With no args it runs everything registered (a deliberate superset of the
-;; JVM's current-ns default — jolt's harnesses load then run whole suites).
+;; (run-tests 'ns1 'ns2 …) runs only those namespaces' tests, like clojure.test,
+;; and (run-tests) is (run-tests *ns*). run-registered runs everything registered.
 ;; Counts go to a ref bound for this call, whose contents are the summary; the
 ;; process-wide counters stay cumulative for the n-pass/n-fail harness API.
-(defn run-tests [& nses]
-  (let [ns-syms (map (fn [n] (if (symbol? n) n (ns-name n))) nses)
-        rc (ref *initial-report-counters*)]
-    (binding [*report-counters* rc
-              *run-counters* rc]
-      (if (seq ns-syms)
-        (let [reg-by-ns (group-by :ns @registry)]
-          (doseq [n ns-syms] (run-ns n reg-by-ns)))
-        (run-selected nil)))
-    (let [d (assoc @rc :type :summary)]
-      (do-report d)
-      d)))
+(defn run-tests
+  ([] (run-tests *ns*))
+  ([& nses]
+   (let [ns-syms (map (fn [n] (if (symbol? n) n (ns-name n))) nses)
+         rc (ref *initial-report-counters*)]
+     (binding [*report-counters* rc
+               *run-counters* rc]
+       (let [reg-by-ns (group-by :ns @registry)]
+         (doseq [n ns-syms] (run-ns n reg-by-ns))))
+     (let [d (assoc @rc :type :summary)]
+       (do-report d)
+       d))))
 
 (defmethod report :summary [m]
   (with-test-out
@@ -692,8 +701,11 @@
       (wrap-fixtures (get @once-fixtures n [])
         (fn []
           (doseq [v vs]
-            (wrap-fixtures (get @each-fixtures n [])
-              (fn [] (test-var v)))))))))
+            ;; only a test var runs inside the :each fixtures, like
+            ;; clojure.test's (when (:test (meta v)) ...)
+            (when (:test (meta v))
+              (wrap-fixtures (get @each-fixtures n [])
+                (fn [] (test-var v))))))))))
 
 (defmacro run-test
   "Run a single test var: (run-test my-test)."

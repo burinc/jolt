@@ -362,10 +362,21 @@
                (if changed (hc-keep-identity form (apply jolt-hash-map kvs)) form)))))
       (else form))))
 
+;; A symbol's metadata map is walked too: a def evaluates its name's metadata, so
+;; (def ^{:test (fn [] '`foo)} x …) — the shape clojure.test's deftest expands to
+;; — must not keep a marker the same code in the init would have had lowered.
+(define (hc-walk-sym-meta visit form)
+  (let ((m (symbol-t-meta form)))
+    (if (pmap? m)
+        (let ((nm (hc-walk-map visit m)))
+          (if (eq? nm m) form (jolt-with-meta form nm)))
+        form)))
+
 (define (hc-walk-form visit form)
   (cond
     ((visit form))
-    ((or (symbol-t? form) (hc-literal? form) (empty-list-t? form)) form)
+    ((symbol-t? form) (hc-walk-sym-meta visit form))
+    ((or (hc-literal? form) (empty-list-t? form)) form)
     ((cseq? form)
      (let-values (((items changed) (hc-walk-items visit (seq->list form))))
        (if (not changed)

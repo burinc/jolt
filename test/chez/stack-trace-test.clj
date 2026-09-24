@@ -11,7 +11,8 @@
 ;;
 ;; Prints the STACK-TRACE OK / FAIL sentinel smoke.sh greps.
 (ns stack-trace-test
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [clojure.test]))
 
 (def ^:private fails (atom []))
 (def ^:private passes (atom 0))
@@ -65,6 +66,49 @@
 (ok= (mapv first (own-frames (via-tail)))
      ["stack_trace_test$here_tail" "stack_trace_test$via_tail"]
      "a fn that read the stack in tail position names itself")
+
+;; --- a returned tail call leaves no frame -------------------------------------------
+;; returns-via tail-calls leaf-inc and both return before the stack is read; the
+;; tail-site pair leaf-inc stored is still in the slot, and the reading fn calls
+;; returns-via elsewhere in its body. The JVM shows neither. Both a multi-line and
+;; a one-line let, since the reached line can name returns-via either way.
+(defn- leaf-inc [x] (inc x))
+(defn- returns-via [x] (leaf-inc x))
+(defn- read-after [x]
+  (let [a (returns-via x)
+        st (.getStackTrace (Thread/currentThread))]
+    st))
+(defn- read-after-1 [x] (let [a (returns-via x) st (.getStackTrace (Thread/currentThread))] st))
+(defn- probe-after [] (let [st (read-after 1)] st))
+(defn- probe-after-1 [] (let [st (read-after-1 1)] st))
+(ok= (mapv first (own-frames (probe-after)))
+     ["stack_trace_test$read_after" "stack_trace_test$probe_after"]
+     "a tail call that already returned is not reported")
+(ok= (mapv first (own-frames (probe-after-1)))
+     ["stack_trace_test$read_after_1" "stack_trace_test$probe_after_1"]
+     "a returned tail call on the reading line is not reported")
+;; the same through a tail call to a fn VALUE, which names no static callee
+(defn- returns-dyn [f x] (f x))
+(defn- read-after-dyn [x]
+  (let [a (returns-dyn inc x)
+        st (.getStackTrace (Thread/currentThread))]
+    st))
+(defn- probe-after-dyn [] (let [st (read-after-dyn 1)] st))
+(ok= (mapv first (own-frames (probe-after-dyn)))
+     ["stack_trace_test$read_after_dyn" "stack_trace_test$probe_after_dyn"]
+     "a returned tail call through a fn value is not reported")
+
+;; --- a deftest body --------------------------------------------------------------
+;; deftest's body lives in the var's :test metadata, as on the JVM; its frame still
+;; maps to this file (test.check's reporter takes an assertion's file:line from the
+;; first frame outside clojure.test)
+(def ^:private in-test (atom nil))
+(clojure.test/deftest ^:private reads-in-test (let [st (here)] (reset! in-test st)))
+(clojure.test/test-var #'reads-in-test)
+(ok= (vec (take 2 (own-frames @in-test)))
+     [["stack_trace_test$here" "stack-trace-test.clj"]
+      ["stack_trace_test$reads_in_test$fn__0" "stack-trace-test.clj"]]
+     "a deftest body's frame is named and mapped to its file")
 
 ;; --- a caller erased through apply, under a try ------------------------------------
 ;; The JVM keeps fail and runner; jolt erased both (apply is a tail call, and the
