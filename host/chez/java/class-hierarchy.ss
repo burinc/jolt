@@ -1116,6 +1116,7 @@
 (jch-register-supers! "java.util.Random"
                       '("java.util.random.RandomGenerator" "java.io.Serializable"))
 (jch-register-supers! "java.security.SecureRandom" '("java.util.Random"))
+(jch-register-supers! "java.util.SplittableRandom" '("java.util.random.RandomGenerator"))
 (jch-register-supers! "java.util.Enumeration" '())
 (jch-mark-interface! "java.util.Enumeration")
 (jch-register-supers! "java.util.StringTokenizer" '("java.util.Enumeration"))
@@ -1280,6 +1281,7 @@
     ("reentrant-lock" . "java.util.concurrent.locks.ReentrantLock")
     ("count-down-latch" . "java.util.concurrent.CountDownLatch")
     ("random" . "java.util.Random")
+    ("splittable-random" . "java.util.SplittableRandom")
     ("securerandom" . "java.security.SecureRandom")
     ("optional" . "java.util.Optional")
     ("string-tokenizer" . "java.util.StringTokenizer")

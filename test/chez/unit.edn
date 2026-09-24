@@ -1960,6 +1960,12 @@
   {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"hi\") (.flush w)) @sb)" :expected "\"hi\""}
   {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"a\") (.write w \"b\") (.flush w)) @sb)" :expected "\"ab\""}
   {:suite "core / print-simple" :expr "(with-out-str (print-simple {:a 1} *out*))" :expected "\"{:a 1}\""}
+  ;; java.util.SplittableRandom is SplitMix64 step for step; expectations read off
+  ;; the JVM for the same seeds (test.check checks its own port against it)
+  {:suite "splittable-random" :expr "(let [r (java.util.SplittableRandom. 42)] [(.nextLong r) (.nextInt r) (.nextDouble r) (.nextBoolean r)])" :expected "[-4767286540954276203 909395113 0.27860113025513866 true]"}
+  {:suite "splittable-random" :expr "(let [s (.split (java.util.SplittableRandom. 42))] (.nextLong s) [(.nextLong s 1000) (.nextLong s 5 17) (.nextLong s 1024) (.nextInt s 7) (.nextInt s -5 5) (.nextInt s 64)])" :expected "[790 9 22 4 -2 34]"}
+  {:suite "splittable-random" :expr "(let [t (java.util.SplittableRandom. -7)] [(.nextInt t (- Integer/MAX_VALUE 3)) (.nextLong t Long/MIN_VALUE Long/MAX_VALUE) (.nextLong t (- Long/MAX_VALUE 9)) (.nextDouble t 3.5) (.nextDouble t -2.0 2.0)])" :expected "[1812828221 8829294814793142954 8365612164934435592 0.557914739184063 0.26364036713027117]"}
+  {:suite "splittable-random" :expr "(try (.nextLong (java.util.SplittableRandom. 1) 5 5) (catch IllegalArgumentException e (ex-message e)))" :expected "\"bound must be greater than origin\""}
   {:suite "core / StackTraceElement->vec" :expr "(StackTraceElement->vec (first (.getStackTrace (Thread/currentThread))))" :expected "[\"java.lang.Thread\" \"getStackTrace\" \"Thread.java\" -1]"}
   ;; an unbound var reads as a per-cell sentinel naming its var (JVM Var$Unbound
   ;; parity) on every read surface: a plain compiled read, var-get, and deref/@.
