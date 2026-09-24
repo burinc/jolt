@@ -1022,6 +1022,23 @@
         (vfasl-convert-file in out '()))
     #t))
 
+;; (sa-vfasl-convert-object-file in out [codec]) -> boolean
+;; The same conversion for ONE compiled object file rather than a whole boot:
+;; OUT keeps IN's object-file header instead of gaining a boot header, so it can
+;; follow a converted boot in the same image (a boot file is its inputs
+;; concatenated, and the kernel skips each input's header). This is what lets a
+;; build convert only what changed — the runtime prefix and each app unit are
+;; converted once and cached (build.ss). Output entries are compressed, as a
+;; whole-boot conversion's are. Same contract and degradation as above.
+(define (sa-vfasl-convert-object-file in out . codec)
+  (guard (e (#t #f))
+    (parameterize ((fasl-compressed #t)
+                   (compress-format (if (and (pair? codec) (eq? (car codec) 'wide))
+                                        'gzip
+                                        (compress-format))))
+      (vfasl-convert-file in out #f))
+    #t))
+
 ;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
 ;; Install a collection hook enforcing a heap ceiling, and answer whether the
 ;; target could. On each collection the target performs its normal collection,

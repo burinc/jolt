@@ -2206,11 +2206,11 @@
 ;; half compiled in 49.6s at the default and 36.2s at 64MB.
 (define bld-backend-trip-bytes (* 64 1024 1024))
 (define (bld-with-backend-gc thunk)
-  (let ((saved (collect-trip-bytes)))
+  (let ((saved (sa-gc-trip-bytes)))
     (dynamic-wind
-      (lambda () (collect-trip-bytes (max saved bld-backend-trip-bytes)))
+      (lambda () (sa-gc-trip-bytes! (max saved bld-backend-trip-bytes)))
       thunk
-      (lambda () (collect-trip-bytes saved)))))
+      (lambda () (sa-gc-trip-bytes! saved)))))
 
 ;; Compile SRC to SO in this process under PARAMS (an alist as above), by
 ;; translating the parameter names into the target-neutral profile
@@ -2277,13 +2277,14 @@
                    (number->string (aot-content-hash keyed) 16) ".so")))
 ;; Keep the newest few entries. One accumulates per jolt build × mode, so a
 ;; developer re-minting often would otherwise grow this without bound.
-(define bld-runtime-cache-keep 8)
+(define bld-runtime-cache-keep 16)   ; a runtime fasl + its vfasl prefix per entry
 (define (bld-prune-runtime-cache!)
   (guard (e (#t #f))
     (let* ((dir (bld-runtime-cache-dir))
            (fs (map (lambda (f) (let ((p (string-append dir "/" f)))
                                    (cons p (sa-file-mtime-ms p))))
-                     (filter (lambda (f) (bld-suffix? f ".so")) (directory-list dir)))))
+                     (filter (lambda (f) (or (bld-suffix? f ".so") (bld-suffix? f ".vfasl")))
+                             (directory-list dir)))))
       (when (> (length fs) bld-runtime-cache-keep)
         (for-each (lambda (p) (guard (e (#t #f)) (delete-file (car p))))
                   (list-tail (sort (lambda (a b) (> (cdr a) (cdr b))) fs)
@@ -2311,6 +2312,8 @@
 ;; Compile the runtime half under the runtime profile, reusing a cached fasl
 ;; when one matches. CACHE? is #f for a shaken core: its text is per-app, so a
 ;; hit is impossible and a store would only churn the cache.
+;; Answers the cache path the fasl is keyed under, or #f when it is not cached —
+;; the vfasl prefix built over it is cached under the same key (bld-base-vfasl!).
 (define (bld-compile-runtime! src so cache?)
   (let* ((body (read-file-string src))
          (cache (and cache? (bld-runtime-cache-enabled?) (bld-runtime-cache-path body))))
@@ -2327,7 +2330,8 @@
             (guard (e (#t #f))          ; an unwritable cache must not fail the build
               (bld-mkdir-p (bld-runtime-cache-dir))
               (bld-copy-file! so cache)
-              (bld-prune-runtime-cache!)))))))
+              (bld-prune-runtime-cache!)))))
+    cache))
 
 ;; --- how the boot image is encoded: --boot (jolt-lang/jolt#886) -------------
 ;; Three points on one curve, and the flag is ordered along it:
@@ -2597,6 +2601,68 @@
     (unless (file-exists? vboot)
       (error 'jolt-build "gzip re-encode of the boot image failed" vboot))))
 
+;; --- split vfasl conversion (#1059) ------------------------------------------
+;; Converting the whole boot every build re-imaged ~40MB of Chez + runtime that
+;; does not change between builds, and a whole-boot conversion is superlinear in
+;; the image: a 28MB app half took 40s in the build process (17.5s in a fresh
+;; Chez, 19.7GB allocated). A boot file is its inputs concatenated, and a vfasl
+;; entry loads on its own, so the prefix is converted once (keyed on the runtime
+;; fasl's cache key, the base boots and the codec) and each app unit is
+;; converted by itself.
+(define (bld-vfasl-codec) (if (eq? (bld-boot-mode) 'small) 'wide 'default))
+
+;; The cached prefix image for BASE-BOOTS + the runtime unit, or #f. RT-KEY is
+;; the runtime fasl's cache path (#f for a shaken runtime: converted, not kept).
+(define (bld-base-vfasl! builddir base-boots rt-so rt-key petite-only?)
+  (let* ((cache (and rt-key
+                     (string-append rt-key "." (symbol->string (bld-vfasl-codec))
+                                    (if petite-only? ".petite" "") ".vfasl")))
+         (out (string-append builddir "/base.vfasl")))
+    (if (and cache (file-exists? cache))
+        (begin (ei-mark! "runtime vfasl (cached)") cache)
+        (let ((base-boot (string-append builddir "/base.boot")))
+          (sa-make-boot-file base-boot (append base-boots (list rt-so)))
+          (and (bld-with-backend-gc
+                 (lambda () (sa-vfasl-convert-file base-boot out (bld-vfasl-codec))))
+               (begin
+                 (ei-mark! "runtime vfasl-convert")
+                 (when cache
+                   (guard (e (#t #f))
+                     (bld-copy-file! out cache)
+                     (bld-prune-runtime-cache!)))
+                 out))))))
+
+;; Convert one compiled app unit SO to VSO; #t when it worked.
+(define (bld-vfasl-unit! so vso)
+  (bld-with-backend-gc (lambda () (sa-vfasl-convert-object-file so vso (bld-vfasl-codec)))))
+
+(define (bld-concat-files! out paths)
+  (let ((op (open-file-output-port out (file-options no-fail) (buffer-mode block))))
+    (for-each (lambda (p) (put-bytevector op (read-file-bytes p))) paths)
+    (close-port op)))
+
+;; Build VBOOT from the prefix image and each app unit's image; #t on success.
+;; #f (nothing usable written) sends the caller to the whole-boot conversion:
+;; a unit that will not convert, or a result over the LZ4 ceiling, which that
+;; path knows how to re-encode.
+(define (bld-vfasl-split! builddir base-boots units rt-key petite-only? vboot)
+  (let ((rt (find (lambda (u) (memq (caddr u) '(runtime runtime-shaken))) units))
+        (apps (filter (lambda (u) (not (memq (caddr u) '(runtime runtime-shaken)))) units)))
+    (and rt
+         (let ((base (bld-base-vfasl! builddir base-boots (cadr rt) rt-key petite-only?)))
+           (and base
+                (let loop ((us apps) (acc '()))
+                  (if (null? us)
+                      (begin
+                        (bld-concat-files! vboot (cons base (reverse acc)))
+                        (if (and (not (eq? (bld-boot-mode) 'small))
+                                 (bld-boot-over-lz4-ceiling? vboot))
+                            (begin (delete-file vboot) #f)
+                            #t))
+                      (let ((vso (string-append (cadr (car us)) ".vfasl")))
+                        (and (bld-vfasl-unit! (cadr (car us)) vso)
+                             (loop (cdr us) (cons vso acc)))))))))))
+
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
 ;;   'whole   — one unsplit flat file: kernel prologue + baked fingerprint, no cache
@@ -2607,7 +2673,8 @@
 ;;              fingerprint (the runtime unit carries the one that identifies it).
 (define (build-self-contained entry-ns out-path mode builddir units boot native-link petite-only?)
   (let ((petite (string-append builddir "/petite.boot"))
-        (scheme (string-append builddir "/scheme.boot")))
+        (scheme (string-append builddir "/scheme.boot"))
+        (rt-key #f))
     (jolt-spill-embedded! "csv/petite.boot" petite)
     (unless petite-only? (jolt-spill-embedded! "csv/scheme.boot" scheme))
     (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, self-contained)\n"))
@@ -2615,7 +2682,7 @@
       (lambda (u)
         (let ((src (car u)) (so (cadr u)) (kind (caddr u)))
           (case kind
-            ((runtime) (bld-compile-runtime! src so #t))
+            ((runtime) (set! rt-key (bld-compile-runtime! src so #t)))
             ((runtime-shaken) (bld-compile-runtime! src so #f))
             ((app)
              (bld-chez-compile-file mode src so)
@@ -2649,11 +2716,23 @@
     ;; $fasl-to-vfasl lays the image out for a specific machine, so converting a
     ;; target's boot with host constants would produce a broken binary. A cross
     ;; build keeps the plain boot.
+    ;; Split first: the runtime prefix (petite + scheme + runtime fasl) converts
+    ;; once per runtime and is cached, and only the app's own units convert per
+    ;; build. The whole-boot conversion stays as the fallback for anything the
+    ;; split cannot do (a shaken runtime is per-app but still splits; an image
+    ;; over the LZ4 ceiling goes back through the whole-boot path, which
+    ;; re-encodes it).
     (unless (or (bld-cross?) (bld-vfasl-disabled?))
       (let ((vboot (string-append boot ".vfasl")))
-        (when (bld-vfasl-convert! boot vboot)
-          (set! boot vboot)
-          (ei-mark! "vfasl-convert"))))
+        (cond
+          ((bld-vfasl-split! builddir
+                             (append (list petite) (if petite-only? '() (list scheme)))
+                             units rt-key petite-only? vboot)
+           (set! boot vboot)
+           (ei-mark! "vfasl-convert (split)"))
+          ((bld-vfasl-convert! boot vboot)
+           (set! boot vboot)
+           (ei-mark! "vfasl-convert")))))
     ;; The stub is the native launcher the boot is appended to. With no :static
     ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
     ;; natives it's re-linked here from the bundled kernel + launcher source so the
