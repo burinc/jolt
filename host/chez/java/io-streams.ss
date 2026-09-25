@@ -1087,10 +1087,9 @@
    (cons "print" (lambda (self x) (ps-emit self (writer-piece x))))
    (cons "println" (lambda (self . xs)
                      (ps-emit-line self (if (null? xs) "\n" (string-append (writer-piece (car xs)) "\n")))))
-   (cons "printf" (lambda (self fmt . args)
-                    (ps-emit self (apply jolt-format (jolt-str-render-one fmt) args))))
-   (cons "format" (lambda (self fmt . args)
-                    (ps-emit self (apply jolt-format (jolt-str-render-one fmt) args)) self))
+   ;; printf and format are the same call, and both answer the stream
+   (cons "printf" (lambda (self a . rest) (ps-emit self (jvm-format-string a rest)) self))
+   (cons "format" (lambda (self a . rest) (ps-emit self (jvm-format-string a rest)) self))
    (cons "append" (lambda (self x . rest) (ps-emit self (append-text x rest)) self))
    (cons "write" (lambda (self x . rest)
                    (let ((t (ps-target self)))
