@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An interop field read or `set!` on a record or deftype finds a declared slot under
+  any spelling that munges to the slot's name, as the JVM's compiler does:
+  `(.-processed_count r)` reads `[processed-count]`, `(.-my-field r)` reads `[my_field]`,
+  and `(.-ready_QMARK_ r)` reads `[ready?]` (#1139). Keyword reads stay exact. A no-arg
+  `(.zz r)` no longer reads a key assoc'd onto the record, which is not a field.
+- A deftype or defrecord method whose parameter is `_` can read `_` in its body. It
+  names the last `_` parameter, as in `fn`.
 - Reader errors carry the JVM's class: EOF, an unmatched delimiter, a bad escape and
   the rest are `RuntimeException`s (they were `ExceptionInfo`), a malformed `\u`
   escape an `IllegalArgumentException`, with the JVM's messages ("EOF while reading

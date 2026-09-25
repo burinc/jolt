@@ -573,6 +573,20 @@
   (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
     (and i (if (fx<? i 0) (fx- -1 i) i))))
 
+(define (jrec-member-field r k)
+  (if (jrec-field-index r k)
+      k
+      (let ((m (class-munge-name (keyword-t-name k)))
+            (fkeys (jrdesc-fkeys (jrec-desc r))))
+        (let loop ((i 0))
+          (cond
+            ((fx=? i (vector-length fkeys)) #f)
+            ((string=?
+               (class-munge-name (keyword-t-name (vector-ref fkeys i)))
+               m)
+             (vector-ref fkeys i))
+            (else (loop (fx+ i 1))))))))
+
 (define (jrec-get-index r k)
   (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
     (and i (fx>=? i 0) i)))
@@ -665,7 +679,9 @@
 
 (define (jolt-set-field! inst k v)
   (if (jrec? inst)
-      (let ((i (jrec-field-index inst k)))
+      (let ((i (let ((k2 (and (keyword-t? k)
+                              (jrec-member-field inst k))))
+                 (and k2 (jrec-field-index inst k2)))))
         (if i
             (let* ((flags (hashtable-ref
                             chez-record-dbl-tbl
@@ -2609,8 +2625,8 @@
        (lambda (f) (apply jolt-invoke f obj rest)))
       ((and (jrec? obj)
             (null? rest)
-            (jrec-has? obj (keyword #f method-name)))
-       (jrec-lookup obj (keyword #f method-name) jolt-nil))
+            (jrec-member-field obj (keyword #f method-name))) =>
+       (lambda (k) (jrec-lookup obj k jolt-nil)))
       ((and (jrec-record? obj)
             (member
               method-name

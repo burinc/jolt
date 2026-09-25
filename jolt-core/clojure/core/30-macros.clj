@@ -442,6 +442,14 @@
           (recur (next ps) (conj nps g) (conj (conj lets (first ps)) g))))
       [nps lets])))
 
+;; deftype/defrecord rename each _ param to a fresh symbol so two of them don't
+;; collide on the field binds, but _ is still a binding the body can read: on the
+;; JVM it names the last _ param, as (fn [_ _] _) does. PARAMS is the method's
+;; params as written, RENAMED the same vector after renaming.
+(defn- underscore-rebind [params renamed body]
+  (let [g (last (keep (fn [[p r]] (when (= p (quote _)) r)) (map vector params renamed)))]
+    (if g (list (list* 'clojure.core/let [(quote _) g] body)) body)))
+
 ;; Every symbol a destructuring pattern binds (a superset: an :or default's own
 ;; symbols come along, which only makes the mutable-field live-read rewrite skip
 ;; a name it would have rewritten). Used to shadow those names against the fields.
@@ -602,7 +610,8 @@
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))
                           mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
-                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)]
+                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)
+                          mbody (underscore-rebind (nth spec 1) raw mbody)]
                       (list argv (list* 'clojure.core/let binds mbody))))
         groups (group-by-head (drop-type-opts body))
         ;; merge clauses by method NAME across ALL protocols into one multi-arity
@@ -975,7 +984,8 @@
                           binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
                                              (remove (fn [f] (contains? pnames (name f))) fields)))
                           mbody (drop 2 spec)
-                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)]
+                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)
+                          mbody (underscore-rebind (nth spec 1) raw mbody)]
                       (list hinted (list* 'clojure.core/let binds mbody))))
         groups (group-by-head (drop-type-opts body))
         ;; merge clauses by name across protocols into one multi-arity fn (see

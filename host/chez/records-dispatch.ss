@@ -348,9 +348,11 @@
        => (lambda (f) (apply jolt-invoke f obj rest)))
       ;; (.field inst): a deftype/record field read with no matching method.
       ;; Clojure reads the field for (.q x) just like (.-q x); a declared method
-      ;; (above) wins, this is the field-accessor fallback.
-      ((and (jrec? obj) (null? rest) (jrec-has? obj (keyword #f method-name)))
-       (jrec-lookup obj (keyword #f method-name) jolt-nil))
+      ;; (above) wins, this is the field-accessor fallback. Declared slots only,
+      ;; under either spelling (jrec-member-field): a key assoc'd onto a record
+      ;; is in its extension map, not a field of its class.
+      ((and (jrec? obj) (null? rest) (jrec-member-field obj (keyword #f method-name)))
+       => (lambda (k) (jrec-lookup obj k jolt-nil)))
       ;; a defrecord is Associative / ILookup / IPersistentMap / Seqable / Counted,
       ;; so its clojure.lang interface methods delegate to the map fns when not
       ;; overridden by a declared method — reitit's impl calls (.assoc match k v),
