@@ -118,12 +118,13 @@ while `rest` realizes only the head (`lazy / realization order & count`,
 behavior; two classes diverge by representation, never by value, and are
 allowlisted in `known-divergences.edn`:
 
-- **`:seq-type-model`** (`seq-type-model / …` suite, jolt-aei7) — jolt reifies
-  every seq as `PersistentList` (eager) or `LazySeq` (deferred). JVM has a
-  specialized class per producer (`Cons`, `Iterate`, `LongRange`, `Repeat`,
-  `Cycle`, `PersistentVector$ChunkedSeq`, `StringSeq`, `KeySeq`/`ValSeq`, `RSeq`,
-  `ArraySeq`, `SubVector`), so `(class …)` differs. `instance?
-  clojure.lang.ISeq/Sequential` and all values/laziness are correct.
+- **`:seq-type-model`** (`seq-type-model / …` suite, jolt-aei7) — jolt reports
+  the JVM's specialized class for nearly every producer (`Cons`, `Iterate`,
+  `LongRange`, `Range`, `Repeat`, `PersistentVector$ChunkedSeq`, `StringSeq`,
+  `KeySeq`/`ValSeq`, `RSeq`, `ArraySeq`, `SubVector`), and `drop` over an
+  `IDrop` coll answers that coll's own seq. `cycle` still collapses to
+  `LazySeq` where the JVM has `Cycle`. `instance? clojure.lang.ISeq/Sequential`
+  and all values/laziness are correct.
 - **`:chunking-model`** (`chunking-model / …` suite, jolt-mm6v) — jolt chunks
   range/vector seqs through `map`/`filter` like the JVM (forcing one element
   realizes the whole ~32-element chunk). What remains finer-grained:

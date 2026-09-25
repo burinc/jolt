@@ -198,6 +198,20 @@
     (lambda (n end+step) (range-chunked n (car end+step) (cdr end+step) sk-repeat))))
 (define lz-iterate
   (register-lazy-src! 'iterate (lambda (f x) (jolt-iterate f (jolt-invoke1 f x)))))
+;; (repeat x) / (repeat n x): clojure.lang.Repeat, one lazy cell per element whose
+;; tail holds x and how many elements follow it (#f = unbounded), so a drop can
+;; skip ahead instead of walking (repeat-skip), as Repeat's IDrop does.
+(define lz-repeat-val
+  (register-lazy-src! 'repeat-val (lambda (x left) (repeat-cells x left))))
+(define (repeat-cells x n)            ; the first N elements (#f = all of them)
+  (if (and n (<= n 0))
+      jolt-empty-list
+      (cseq-lazy/k x (make-lazy-src lz-repeat-val x (and n (- n 1))) sk-repeat)))
+(define jolt-repeat
+  (case-lambda
+    ((x) (repeat-cells x #f))
+    ;; Repeat.create takes a long: a nil count throws, 2.7 is 2
+    ((n x) (repeat-cells x (jolt-long-cast n)))))
 (define lz-map-chunk
   (register-lazy-src! 'map-chunk
     (lambda (f s) (jolt-seq (map-seq f (jolt-seq (na-chunk-rest s)))))))
@@ -1824,32 +1838,78 @@
 ;; 625ns and 18.5ms when dropping a million elements. As with count, the step
 ;; loop re-checks per cell so a few plain cells in front of a vector-backed one
 ;; still reach the jump.
-;; A count no fixnum reaches drops everything from a lazy source, the countdown
-;; never ending; the JVM hands a vector or range that count through IDrop, whose
-;; long cast refuses it. (drop n coll) is lazy, so that surfaces when it is walked.
-(define (drop-count-out-of-range n coll)
-  (if (or (pvec? coll)
-          (and (cseq? coll) (let ((k (cseq-kind coll))) (or (fx=? k sk-long-range) (fx=? k sk-range)))))
-      (throw-jvm 'java.lang.IllegalArgumentException
-                 (string-append "Value out of range for long: "
-                                (jolt-str-render-one (inexact (if (flonum? n) n (ceiling n))))))
-      jolt-empty-list))
+;; The seq N (a fixnum) elements into seq S, or () when S runs out first.
+(define (drop-walk n s)
+  (let loop ((n n) (s s))
+    (cond
+      ((jolt-nil? s) jolt-empty-list)
+      ((fx<=? n 0) s)
+      ;; the jump keeps the seq's own flavor: an array map's seq dropped into is
+      ;; still a PersistentArrayMap$Seq, a vector's a ChunkedSeq
+      ((and (cseq-cvec s) (not (cseq-crest s)))
+       (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
+         (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq/k v i (cseq-kind s)))))
+      ((and (fx=? (cseq-kind s) sk-repeat) (repeat-skip s n)))
+      (else (loop (fx- n 1) (jolt-seq (seq-more s)))))))
+;; A Repeat cell N elements on, without walking: an unbounded repeat is the same
+;; seq at every position, and a bounded one just has fewer left. #f when the
+;; cell's tail has been forced already (its count is no longer at hand) — the
+;; walk then steps through the cells that exist.
+(define (repeat-skip s n)
+  (let ((t (cseq-tail s)))
+    (and (lazy-src? t)
+         (cond ((eq? (lazy-src-fn t) lz-repeat) s)            ; (range a b 0): unbounded
+               ((eq? (lazy-src-fn t) lz-repeat-val)
+                (let ((left (lazy-src-b t)))
+                  (if left
+                      (repeat-cells (cseq-head s) (- (+ left 1) n))
+                      s)))
+               (else #f)))))
+;; A count no fixnum reaches drops everything from a lazy source: the countdown
+;; never ends.
 (define lz-drop
   (register-lazy-src! 'drop
     (lambda (n0 coll)
      (jolt-seq
       (let ((c (take-drop-count n0)))
-       (if (eq? c 'all)
-        (drop-count-out-of-range n0 coll)
-        (let loop ((n c) (s (jolt-seq coll)))
-        (cond
-          ((jolt-nil? s) jolt-empty-list)
-          ((fx<=? n 0) s)
-          ((and (cseq-cvec s) (not (cseq-crest s)))
-           (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
-             (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq v i))))
-          (else (loop (fx- n 1) (jolt-seq (seq-more s))))))))))))
-(define (jolt-drop n coll) (jolt-make-lazy-src lz-drop n coll))
+        (if (eq? c 'all)
+            jolt-empty-list
+            (drop-walk c (jolt-seq coll))))))))
+;; clojure.lang.IDrop — the colls Clojure 1.12's drop hands the count to, eagerly,
+;; getting back the coll's own kind of seq: PersistentVector and its ChunkedSeq,
+;; LongRange, Repeat, StringSeq, PersistentArrayMap and its Seq. Not Range, a
+;; subvec, a hash map or a plain list; those drop lazily. A subvec's seq is
+;; vector-backed here, but on the JVM it is APersistentVector$Seq, not IDrop.
+(define (idrop-coll? c)
+  (cond ((pvec? c) (not (jolt-subvec-view? c)))
+        ((cseq? c)
+         (let ((k (cseq-kind c)))
+           (or (and (fx=? k sk-chunked-seq)
+                    (not (and (cseq-cvec c) (jolt-subvec-view? (cseq-cvec c)))))
+               (fx=? k sk-long-range) (fx=? k sk-string-seq)
+               (fx=? k sk-arraymap-seq) (fx=? k sk-repeat))))
+        ((pmap? c) (pmap-array? c))
+        (else #f)))
+;; The count IDrop.drop(int) receives: a long passes as itself, anything else
+;; through Math/ceil, and the int cast refuses what does not fit — a long past
+;; Integer/MAX_VALUE is an overflow, a double past the long range out of range.
+(define (idrop-count n)
+  (if (range-long-arg? n)
+      (if (> n 2147483647) (throw-jvm 'ArithmeticException "integer overflow") n)
+      (let ((d (ceiling (inexact n))))
+        (cond ((> d 9.223372036854775807e18)
+               (throw-jvm 'java.lang.IllegalArgumentException
+                          (string-append "Value out of range for long: " (jolt-str-render-one d))))
+              ((> d 2147483647.0) (throw-jvm 'ArithmeticException "integer overflow"))
+              (else (exact d))))))
+(define (jolt-drop n coll)
+  (if (idrop-coll? coll)
+      (let ((s (jolt-seq coll)))
+        (if (jolt-pos? n)
+            (let ((k (idrop-count n)))
+              (if (jolt-nil? s) jolt-empty-list (drop-walk k s)))
+            (if (jolt-nil? s) jolt-empty-list s)))
+      (jolt-make-lazy-src lz-drop n coll)))
 
 ;; (iterate f x) — x, (f x), (f (f x)), … as ONE lazy cell per element.
 ;; The overlay spelling, (cons x (lazy-seq (iterate f (f x)))), costs two records
