@@ -14,7 +14,7 @@
    :impl-detail
    "representation detail: syntax-quote yields a list? (JVM yields a Cons)",
   :seq-type-model
-  "jolt reifies the JVM's specialized seq class for nearly every producer now (Cons/Iterate/LongRange/Range/Repeat/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). What still collapses to LazySeq is repeat (JVM: Repeat), cycle (Cycle) and drop over a vector (ChunkedSeq) — see the three :entries rows below. Values and laziness are correct, only (class …) differs. jolt-aei7",
+  "jolt reifies the JVM's specialized seq class for nearly every producer now (Cons/Iterate/LongRange/Range/Repeat/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). What still collapses to LazySeq is cycle (JVM: Cycle) — see its :entries row below. Values and laziness are correct, only (class …) differs. jolt-aei7",
   :chunking-model
   "jolt now chunks range/vector seqs through map/filter like the JVM (forcing one element realizes the whole ~32-element chunk). What remains finer-grained: dedupe realizes 0 at construction where the JVM's sequence transformer forces the first chunk just to build the seq. (mapcat realizes like the JVM's (apply concat …): four elements, or the first chunk.) jolt-mm6v",
   :integer-box-model
@@ -1611,13 +1611,11 @@
    :label "chunk round-trip",
    :category :host-model}
   ;; A seq now reports the concrete clojure.lang class of whatever produced it
-  ;; (cons, vector seq, string seq, keys, vals, rseq, sort, range, iterate, the
-  ;; map/set seq views), so those rows certify. These three producers are still
-  ;; modelled as a lazy seq and keep its class: repeat wants clojure.lang.Repeat,
-  ;; cycle Cycle, and (drop 1 a-vector) is a ChunkedSeq on the JVM.
-  {:suite "seq-type-model / remaining class collapse", :label "repeat", :category :seq-type-model}
+  ;; (cons, vector seq, string seq, keys, vals, rseq, sort, range, iterate,
+  ;; repeat, the map/set seq views, drop over an IDrop coll), so those rows
+  ;; certify. cycle is still modelled as a lazy seq and keeps its class; the JVM
+  ;; has clojure.lang.Cycle.
   {:suite "seq-type-model / remaining class collapse", :label "cycle", :category :seq-type-model}
-  {:suite "seq-type-model / remaining class collapse", :label "drop over a vector", :category :seq-type-model}
   {:suite "chunking-model / unchunked realization granularity", :label "dedupe is fully lazy at construction", :category :chunking-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "byte class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "short class", :category :integer-box-model}

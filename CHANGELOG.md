@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a count past the fixnum range. `repeatedly`, `split-at` and `drop-last` follow.
 - A vfasl conversion that fails inside the build prints its note instead of silently
   keeping the plain boot.
+- `repeat` is a `clojure.lang.Repeat` (it was a `LazySeq`), `realized?` refuses it,
+  and dropping into it skips ahead instead of walking. `drop` over an `IDrop`
+  collection (a vector or its seq, a long range, a repeat, a string's seq, an array
+  map or its seq) is eager and answers that collection's own seq, raising `IDrop`'s
+  int-cast errors for a count that does not fit, as on the JVM.
 
 ## [0.8.12] - 2026-09-24
 
