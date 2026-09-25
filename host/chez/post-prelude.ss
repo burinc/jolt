@@ -159,7 +159,10 @@
       (kw-eof (keyword #f "eof")))
   (def-var! "clojure.core" "read"
     (case-lambda
-      (() (jolt-invoke ov-read))
+      ;; through the var, not ov-read: the overlay's ([] (read *in*)) calls its
+      ;; own 1-arity directly, skipping the host-reader test below, so
+      ;; (binding [*in* (LineNumberingPushbackReader. …)] (read)) missed it.
+      (() (jolt-invoke (var-deref "clojure.core" "read") (var-deref "clojure.core" "*in*")))
       ((stream)
        (if (reader-jhost? stream)
            (let-values (((form found?) (host-reader-read-form stream)))
@@ -199,7 +202,8 @@
       (kw-eof (keyword #f "eof")))
   (def-var! "clojure.core" "read+string"
     (case-lambda
-      (() (jolt-invoke ov-rps))
+      ;; through the var, for the reason read's 0-arity above gives
+      (() (jolt-invoke (var-deref "clojure.core" "read+string") (var-deref "clojure.core" "*in*")))
       ((stream) (jolt-invoke (var-deref "clojure.core" "read+string") stream #t jolt-nil))
       ((opts stream)
        (if (and (pmap? opts) (jolt-contains? opts kw-eof))
