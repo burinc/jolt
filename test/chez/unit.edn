@@ -1184,6 +1184,10 @@
   {:suite "reader" :expr "(= :done (with-in-str \"\" (read *in* false :done)))" :expected "true"}
   {:suite "reader" :expr "(let [[v s] (with-in-str \"42 rest\" (read+string))] (and (= v 42) (string? s)))" :expected "true"}
   {:suite "reader" :expr "(= [1 2] (with-in-str \"1 2\" [(first (read+string)) (first (read+string))]))" :expected "true"}
+  ;; the 0-arities read *in* when it holds a HOST reader, as the 1-arities do
+  {:suite "reader" :expr "(binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(+ 1 2) :x\"))] [(read) (read)])" :expected "[(+ 1 2) :x]"}
+  {:suite "reader" :expr "(binding [*in* (java.io.PushbackReader. (java.io.StringReader. \"42\"))] (read))" :expected "42"}
+  {:suite "reader" :expr "(binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(+ 1 2)\"))] (read+string))" :expected "[(+ 1 2) \"(+ 1 2)\"]"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (= #{1 2} (e0/read-string \"#{1 2}\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (uuid? (e0/read-string \"#uuid \\\"550e8400-e29b-41d4-a716-446655440000\\\"\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (inst? (e0/read-string \"#inst \\\"2020-01-01T00:00:00Z\\\"\")))" :expected "true"}
@@ -1515,6 +1519,9 @@
   {:suite "sbdirect" :expr "(StringBuffer. nil)" :expected :throws}
   ;; a PrintWriter over a StringBuffer forwards into the shared store
   {:suite "sbdirect" :expr "(let [b (StringBuffer.)] (binding [*out* (java.io.PrintWriter. b)] (print \"hi\")) (str b))" :expected "\"hi\""}
+  ;; a PrintWriter over a proxy java.io.Writer writes through the proxy's own
+  ;; write, not clojure.pprint's -write protocol (which a proxy doesn't implement)
+  {:suite "printwriter-proxy" :expr "(let [sb (StringBuilder.) w (proxy [java.io.Writer] [] (write ([x] (.append sb (str x))) ([b o n] (.append sb (subs (str b) o (+ o n))))) (flush []) (close [])) pw (java.io.PrintWriter. w)] (.write pw \"ab\") (binding [*out* pw] (print \"cd\")) (str sb))" :expected "\"abcd\""}
   {:suite "strdirect" :expr "(let [str-trim (fn [_] \"SHADOWED\")] (.trim \"  a  \"))" :expected "\"a\""}
   {:suite "type" :expr "(type 5)" :expected "java.lang.Long"}
   {:suite "type" :expr "(type 5.0)" :expected "java.lang.Double"}

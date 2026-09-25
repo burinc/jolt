@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection (a vector or its seq, a long range, a repeat, a string's seq, an array
   map or its seq) is eager and answers that collection's own seq, raising `IDrop`'s
   int-cast errors for a count that does not fit, as on the JVM.
+- A `java.io.PrintWriter` over a `proxy` `java.io.Writer` writes through the proxy's
+  own `write`, where its first write threw a missing `clojure.pprint/-write` (#1132).
+- `(read)` and `(read+string)` read a host reader bound to `*in*`, such as a
+  `LineNumberingPushbackReader` or `PushbackReader`. They threw a missing `-read-form`
+  / `-read+string`, although `(read *in*)` already worked (#1133).
 
 ## [0.8.12] - 2026-09-24
 

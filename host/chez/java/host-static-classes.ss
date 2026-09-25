@@ -418,6 +418,11 @@
     ;; (PrintWriter. (io/writer f)) falling through to the pprint protocol below,
     ;; which a file writer does not implement.
     ((jhost? target) (record-method-dispatch target "write" (jolt-list s)))
+    ;; a proxy/reify java.io.Writer is no jhost but carries its own write
+    ;; method, the same test jolt-write (printing.ss) makes for a bound *out*.
+    ;; clojure.pprint's writers name theirs -write, so they still fall through.
+    ((iface-method target "write" #f)
+     (record-method-dispatch target "write" (jolt-list s)))
     (else
      (jolt-invoke (var-deref "clojure.pprint" "-write") target s))))
 (register-class-ctor! "PrintWriter"
