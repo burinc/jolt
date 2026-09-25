@@ -398,33 +398,62 @@
   (list (cons "setOut" (lambda (v) (sys-set-stream! "out" v)))
         (cons "setErr" (lambda (v) (sys-set-stream! "err" v)))))
 
-;; PrintWriter — a thin wrapper over a target writer. write/append/print forward
-;; the rendered text to the target. clojure.data.json's pretty printer builds
-;; (PrintWriter. *out*) where *out* is bound to clojure.pprint's pretty-writer (a
-;; jolt record), so forwarding routes column-aware through clojure.pprint/-write;
-;; for a host writer target it falls back to that writer's own write.
-(define (pw-forward target s)
+;; PrintWriter — a thin wrapper over a target writer. clojure.data.json's pretty
+;; printer builds (PrintWriter. *out*) where *out* is bound to clojure.pprint's
+;; pretty-writer (a jolt record), so text for one of those routes column-aware
+;; through clojure.pprint/-write.
+;;
+;; A target that is a Writer in its own right — a host writer (file-backed,
+;; OutputStreamWriter, BufferedWriter, a nested PrintWriter) or a proxy/reify
+;; java.io.Writer — is called the way the JDK's PrintWriter calls its `out`:
+;; text (write(String), print, append, a char[]) as write(s, 0, len), a single
+;; char (write(int), append(char)) as write(c), the line separator
+;; as write("\n"), and flush/close as its own flush/close. Which overload a
+;; proxy receives is observable: a java.io.Writer proxy need only define the
+;; abstract write(cbuf, off, len), and one that does must work.
+(define (pw-target self) (vector-ref (jhost-state self) 0))
+(define (pw-writer-target? t)
+  (or (and (jhost? t)
+           (not (string=? (jhost-tag t) "port-writer"))
+           (not (string=? (jhost-tag t) "writer"))
+           (not (sb-jhost? t)))
+      (and (not (jhost? t)) (iface-method t "write" #f) #t)))
+;; Text into a target that is not a Writer of its own: stdout/stderr, a
+;; StringWriter/StringBuilder, or clojure.pprint's pretty-writer.
+(define (pw-emit-text t s)
   (cond
     ;; through port-writer-port, not the raw slot: a port-writer holds the SYMBOL
     ;; 'out / 'err and resolves it per call, so a (PrintWriter. *out*) built inside
     ;; a with-out-str writes to the capture rather than past it.
-    ((and (jhost? target) (string=? (jhost-tag target) "port-writer"))
-     (display s (port-writer-port target)))
-    ((and (jhost? target) (memv #t (list (string=? (jhost-tag target) "writer")
-                                         (sb-jhost? target))))
-     (sb-append! target s))
-    ;; every other host writer knows how to write itself — a file-backed writer, an
-    ;; OutputStreamWriter, a nested PrintWriter. Naming them one by one left
-    ;; (PrintWriter. (io/writer f)) falling through to the pprint protocol below,
-    ;; which a file writer does not implement.
-    ((jhost? target) (record-method-dispatch target "write" (jolt-list s)))
-    ;; a proxy/reify java.io.Writer is no jhost but carries its own write
-    ;; method, the same test jolt-write (printing.ss) makes for a bound *out*.
-    ;; clojure.pprint's writers name theirs -write, so they still fall through.
-    ((iface-method target "write" #f)
-     (record-method-dispatch target "write" (jolt-list s)))
-    (else
-     (jolt-invoke (var-deref "clojure.pprint" "-write") target s))))
+    ((and (jhost? t) (string=? (jhost-tag t) "port-writer"))
+     (display s (port-writer-port t)))
+    ((jhost? t) (sb-append! t s))
+    (else (jolt-invoke (var-deref "clojure.pprint" "-write") t s))))
+(define (pw-text! self s)
+  (let ((t (pw-target self)))
+    (if (pw-writer-target? t)
+        (record-method-dispatch t "write" (jolt-list s (->num 0) (->num (string-length s))))
+        (pw-emit-text t s))))
+(define (pw-char! self c)                 ; c: the char's code
+  (let ((t (pw-target self)))
+    (if (pw-writer-target? t)
+        (record-method-dispatch t "write" (jolt-list (->num c)))
+        (pw-emit-text t (string (integer->char c))))))
+(define (pw-newline! self)
+  (let ((t (pw-target self)))
+    (if (pw-writer-target? t)
+        (record-method-dispatch t "write" (jolt-list "\n"))
+        (pw-emit-text t "\n"))))
+(define (pw-print! self x)              ; print(char) too is text: write(s, 0, 1)
+  (if (char-array-arg? x)
+      (pw-text! self (char-array->string x))
+      (pw-text! self (render-piece x))))
+(define (pw-pass! self name)              ; flush / close, when the target has one
+  (let ((t (pw-target self)))
+    (when (or (and (jhost? t) (host-method-ref (jhost-tag t) name))
+              (and (not (jhost? t)) (iface-method t name #f)))
+      (record-method-dispatch t name jolt-nil))
+    jolt-nil))
 (register-class-ctor! "PrintWriter"
   (lambda args (make-jhost "print-writer" (vector (if (pair? args) (car args) jolt-nil)))))
 (register-class-ctor! "java.io.PrintWriter"
@@ -434,11 +463,26 @@
   ;; (csq start end) and renders everything as text. Sharing append-text between
   ;; them read the 3-arg write's LENGTH as an end index and printed (.write w 65)
   ;; as "65" rather than "A".
-  (list (cons "write" (lambda (self x . rest) (pw-forward (vector-ref (jhost-state self) 0) (writer-piece-range x rest)) jolt-nil))
-        (cons "print" (lambda (self x) (pw-forward (vector-ref (jhost-state self) 0) (render-piece x)) jolt-nil))
-        (cons "append" (lambda (self x . rest) (pw-forward (vector-ref (jhost-state self) 0) (append-text x rest)) self))
-        (cons "flush" (lambda (self) jolt-nil))
-        (cons "close" (lambda (self) jolt-nil))
+  (list (cons "write" (lambda (self x . rest)
+                        (if (and (null? rest) (number? x))
+                            (pw-char! self (jnum->exact x))
+                            (pw-text! self (writer-piece-range x rest)))
+                        jolt-nil))
+        (cons "print" (lambda (self x) (pw-print! self x) jolt-nil))
+        (cons "println" (lambda (self . xs)
+                          (unless (null? xs) (pw-print! self (car xs)))
+                          (pw-newline! self)
+                          jolt-nil))
+        (cons "append" (lambda (self x . rest)
+                         (if (and (null? rest) (char? x))
+                             (pw-char! self (char->integer x))
+                             (pw-text! self (append-text x rest)))
+                         self))
+        (cons "printf" (lambda (self a . rest) (pw-text! self (jvm-format-string a rest)) self))
+        (cons "format" (lambda (self a . rest) (pw-text! self (jvm-format-string a rest)) self))
+        (cons "flush" (lambda (self) (pw-pass! self "flush")))
+        (cons "close" (lambda (self) (pw-pass! self "close")))
+        (cons "checkError" (lambda (self) (pw-pass! self "flush") #f))
         (cons "toString" (lambda (self) ""))))
 
 ;; PrintWriter-on — a writer that accumulates writes and, on flush, hands the

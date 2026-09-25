@@ -795,35 +795,31 @@
                                         parts)))
                          (str-join-strs (map jolt-str-render-one items)
                                         (jolt-str-render-one delim)))))
-        ;; String.format(fmt, Object...) is called both ways in the wild: with the
-        ;; args spread, and with a single Object[] holding them (which is what the
-        ;; JVM's varargs actually compiles to, and what Selmer writes). Splat a lone
-        ;; array argument so both reach the same format engine. A leading Locale is
-        ;; accepted and ignored — formatting here is locale-independent.
-        ;; The leading argument is a Locale when it is not the format string —
-        ;; String.format(Locale, String, Object...) vs String.format(String,
-        ;; Object...). Testing for the core "locale" jhost tag alone missed the
-        ;; Locale jolt-lang/time installs (a tagged table), so (String/format
-        ;; (Locale/getDefault) "%.3f" args) took the table as the format string.
-        ;; Formatting here is locale-independent, so the locale is dropped either way.
-        (cons "format" (lambda (a . rest)
-                         (let* ((locale? (and (pair? rest) (not (string? a))))
-                                (fmt (if locale? (car rest) a))
-                                (args (if locale? (cdr rest) rest))
-                                ;; jolt-array? / ja->list live in natives-array.ss,
-                                ;; loaded after this file — resolved at call time.
-                                (args (if (and (pair? args) (null? (cdr args))
-                                               (jolt-array? (car args)))
-                                          (ja->list (car args))
-                                          args)))
-                           ;; The locale drives the decimal separator: the JVM
-                           ;; renders %.3f of 123.04455 as "123,045" under de.
-                           (if locale?
-                               (parameterize ((format-decimal-sep
-                                               (number-symbol (jolt-str-render-one a)
-                                                              "decimal-sep" ".")))
-                                 (apply jolt-format fmt args))
-                               (apply jolt-format fmt args)))))))
+        ;; String.format([Locale] fmt, Object...): jvm-format-string below
+        (cons "format" (lambda (a . rest) (jvm-format-string a rest)))))
+
+;; The text of a JVM format(…) call — String.format, and PrintStream's and
+;; PrintWriter's printf/format, which all take ([Locale] String Object...). A
+;; lone array argument is the varargs array itself, which is what the JVM's
+;; varargs compiles to and what Selmer writes, so it is splatted. The leading
+;; argument is a Locale when it is not the format string; testing for the core
+;; "locale" jhost tag alone missed the Locale jolt-lang/time installs (a tagged
+;; table). The locale only picks the decimal separator: the JVM renders %.3f of
+;; 123.04455 as "123,045" under de.
+(define (jvm-format-string a rest)
+  (let* ((locale? (and (pair? rest) (not (string? a))))
+         (fmt (if locale? (car rest) a))
+         (args (if locale? (cdr rest) rest))
+         ;; jolt-array? / ja->list live in natives-array.ss, loaded after this
+         ;; file — resolved at call time.
+         (args (if (and (pair? args) (null? (cdr args)) (jolt-array? (car args)))
+                   (ja->list (car args))
+                   args)))
+    (if locale?
+        (parameterize ((format-decimal-sep
+                        (number-symbol (jolt-str-render-one a) "decimal-sep" ".")))
+          (apply jolt-format fmt args))
+        (apply jolt-format fmt args))))
 
 ;; ---- java.text.NumberFormat -------------------------------------------------
 ;; A grouping decimal formatter (selmer number-format / cuerdas). state:

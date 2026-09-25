@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `(read)` and `(read+string)` read a host reader bound to `*in*`, such as a
   `LineNumberingPushbackReader` or `PushbackReader`. They threw a missing `-read-form`
   / `-read+string`, although `(read *in*)` already worked (#1133).
+- A `java.io.PrintWriter` passes `flush` and `close` to the writer it wraps, so text
+  written through one over a file writer reaches the file; it lost everything before.
+  It also calls its target the way the JDK's does (text as `write(s, 0, len)`, which is
+  all a `java.io.Writer` proxy has to define), and gains `println`, `printf`, `format`
+  and `checkError`.
+- `clojure.pprint/pprint` and `cl-format` write to any `java.io.Writer` (a
+  `StringWriter`, a file writer, a `PrintWriter`, `*out*`); they threw a missing
+  `-write` for all of them.
+- `PrintStream`'s and `PrintWriter`'s `printf`/`format` spread a lone `Object[]` as the
+  varargs, as `String/format` does, and `PrintStream.printf` answers the stream.
 
 ## [0.8.12] - 2026-09-24
 

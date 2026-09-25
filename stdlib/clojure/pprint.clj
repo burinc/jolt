@@ -209,6 +209,20 @@
   (-write [w x])
   (-pflush [w]))
 
+;; Any other base is a java.io.Writer (a StringWriter, a file writer, a
+;; PrintWriter, *out*, a proxy), written the way the JVM's column writer writes
+;; its base: a string through write(String), a char as write(int), and flushed
+;; with its own flush. Without this (pprint x w) and (cl-format w …) threw for
+;; every writer that was not one of the records above.
+(extend-protocol IPrettyWriter
+  Object
+  (-write [w x]
+    (if (or (char? x) (number? x))
+      (.write w (int x))
+      (.write w ^String x))
+    nil)
+  (-pflush [w] (.flush w) nil))
+
 ;;======================================================================
 ;; column writer
 ;;======================================================================
