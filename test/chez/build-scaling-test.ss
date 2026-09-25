@@ -120,13 +120,17 @@
 (define units (list (list rt-ss rt-so 'runtime) (list app-ss app-so 'app)))
 (define base-boots (list (string-append csv "/petite.boot") (string-append csv "/scheme.boot")))
 (define rt-key (at "rt-key.so"))
-(for-each (lambda (f) (when (file-exists? f) (delete-file f)))
-          (list rt-key (string-append rt-key ".default.vfasl")))
+(define rt-key-dir tmp)
+(define (prefix-images)             ; the prefix images cached under rt-key
+  (filter (lambda (f) (and (> (string-length f) 10) (string=? (substring f 0 10) "rt-key.so.")
+                           (bld-suffix? f ".default.vfasl")))
+          (directory-list rt-key-dir)))
+(for-each (lambda (f) (delete-file (string-append rt-key-dir "/" f))) (prefix-images))
 (define vboot (at "split.boot"))
 (ok "a split conversion produces an image"
     (and (bld-vfasl-split! tmp base-boots units rt-key #f vboot) (file-exists? vboot)))
 (ok "the runtime prefix image is cached under the runtime's key"
-    (file-exists? (string-append rt-key ".default.vfasl")))
+    (= 1 (length (prefix-images))))
 (define probe (at "probe.ss"))
 (write-text! probe "(display app-says)\n")
 (define (boot-output boot)
@@ -137,12 +141,24 @@
         (if (eof-object? c) (list->string (reverse acc)) (loop (cons c acc)))))))
 (ok "the split image boots, and app code sees the runtime's record as its own type"
     (string=? (boot-output vboot) "42"))
-;; second build: the prefix comes from the cache (make its source unreadable to
-;; prove nothing re-converts it)
+;; second build: the prefix comes from the cache, nothing re-converts it
 (define vboot2 (at "split2.boot"))
+(define real-convert sa-vfasl-convert-file)
+(define conversions 0)
+(set! sa-vfasl-convert-file (lambda args (set! conversions (+ conversions 1)) (apply real-convert args)))
 (ok "a second build reuses the cached prefix"
-    (and (bld-vfasl-split! tmp (list (at "no-such-petite.boot")) units rt-key #f vboot2)
+    (and (bld-vfasl-split! tmp base-boots units rt-key #f vboot2)
+         (= conversions 0)
          (string=? (boot-output vboot2) "42")))
+(set! sa-vfasl-convert-file real-convert)
+;; the prefix image is laid out for the exact kernel, and a patched Chez can keep
+;; its version string, so the key reads the boot files themselves
+(define fake-boot (at "fake.boot"))
+(write-text! fake-boot "one kernel")
+(define k1 (bld-files-key (list fake-boot)))
+(write-text! fake-boot "one kerneL")
+(ok "the prefix key moves with the Chez boot files' content"
+    (not (string=? k1 (bld-files-key (list fake-boot)))))
 
 ;; --- e: one compile unit per namespace, cached on its text -------------------------
 (define grouped (bld-group-app-strs '("a1" "a2" "b1" "c1" "c2" "c3") '(("a" . 2) ("b" . 1) ("c" . 3)) "entry"))
@@ -156,7 +172,12 @@
 (ok "chunk procedures are named for their namespace, not their position"
     (let ((s (with-output-to-string
                (lambda () (bld-emit-app-chunks (current-output-port) (bld-unit-tag "my.ns-x/y?") '("(f)"))))))
-      (and (substring? "jolt-app-init$my.ns-x_y_$0!" s))))
+      (and (substring? "jolt-app-init$my.ns-x_y_$" s) (substring? "$0!" s))))
+(ok "names that differ only in rewritten characters get different chunk names"
+    (let ((tags (map bld-unit-tag '("app.db?" "app.db!" "app.db_" "app.db"))))
+      (and (string=? (list-ref tags 2) "app.db_") (string=? (list-ref tags 3) "app.db")
+           (let distinct ((ts tags))
+             (or (null? ts) (and (not (member (car ts) (cdr ts))) (distinct (cdr ts))))))))
 (ok "the unit key moves with the text"
     (not (string=? (bld-unit-key "release" "(define x 1)") (bld-unit-key "release" "(define x 2)"))))
 (ok "…and with the compile parameters"
@@ -205,6 +226,26 @@
 (bld-compile-worker wm)
 (ok "a worker compiles and converts each job in its manifest"
     (and (file-exists? (at "w1.so")) (file-exists? (at "w1.so.vfasl"))))
+
+;; The parent takes any output that exists as finished and caches it, so a job
+;; that dies part way must leave none: a child raising after it has written some
+;; of the fasl (a heap ceiling, a backend fault) stands in for one killed mid-write.
+(for-each (lambda (f) (when (file-exists? f) (delete-file f)))
+          (list (at "w2.so") (at "w2.so.part") (at "w2.so.vfasl")))
+(set! bld-chez-compile-file
+  (lambda (mode src so) (write-text! so "half a fasl") (error 'gate "compile died part way")))
+(ok "a job whose compile dies part way raises"
+    (guard (e (#t #t))
+      (bld-run-job! (vector u1-ss (at "w2.so") (at "w2.so.vfasl") "release" 'default))
+      #f))
+(set! bld-chez-compile-file real-compile)
+(ok "…and leaves no output for the parent to take as finished"
+    (not (file-exists? (at "w2.so"))))
+(write-text! (at "w3.so") "not a fasl")
+(when (file-exists? (at "w3.so.vfasl")) (delete-file (at "w3.so.vfasl")))
+(ok "a unit image that will not convert is left unwritten, not half written"
+    (and (not (sa-vfasl-convert-object-file (at "w3.so") (at "w3.so.vfasl")))
+         (not (file-exists? (at "w3.so.vfasl")))))
 
 ;; --- f: each source file is parsed once by the require scan ------------------------
 ;; The scan read every file twice (its requires, then the classes it names), and

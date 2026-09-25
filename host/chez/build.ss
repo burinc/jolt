@@ -1094,10 +1094,14 @@
 ;; A namespace name as the middle of a Chez identifier: the chunk procedures are
 ;; named after their namespace, not their position, so a namespace's unit text
 ;; does not change when an earlier namespace gains or loses forms.
+;; A name that had to be rewritten also carries a hash of the original after a
+;; $, which a clean name cannot contain, so app.db? and app.db! (or a real
+;; app.db_) never share a chunk procedure.
 (define (bld-unit-tag ns)
-  (list->string
-    (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\. #\- #\_))) c #\_))
-         (string->list ns))))
+  (let ((clean (list->string
+                 (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\. #\- #\_))) c #\_))
+                      (string->list ns)))))
+    (if (string=? clean ns) ns (string-append clean "$" (bld-text-key ns)))))
 
 ;; (define (jolt-app-init!) …) calling NAMES in order, after PRE (forms to run first).
 (define (bld-emit-app-init-main out names pre)
@@ -1950,6 +1954,11 @@
                           (core-strs (cons (list rt-ss rt-so 'runtime-shaken) app-units))
                           (else (cons (list rt-ss rt-so 'runtime) app-units)))))
         (bld-mkdir-p builddir)
+        ;; a unit file left by an earlier build of this output (one with more
+        ;; namespaces) is not this build's, and the smokes read every app-N.ss
+        (for-each (lambda (f) (when (and (> (string-length f) 4) (string=? (substring f 0 4) "app-"))
+                                (guard (e (#t #f)) (delete-file (string-append builddir "/" f)))))
+                  (directory-list builddir))
         ;; 3. flat source = runtime + app + launcher. When split, runtime.ss holds
         ;; the runtime half and flat.ss holds everything the app contributes; the
         ;; two are compiled separately and loaded into the boot in that order.
@@ -2436,6 +2445,22 @@
       (put-bytevector out bs)
       (close-port out))))
 
+;; Write a shared cache entry so no reader ever sees it half written: another
+;; build may be reading the same key right now. Never raises (an unwritable
+;; cache must not fail the build) and leaves no temp file behind.
+(define (bld-cache-put! from to)
+  (let ((tmp (string-append to ".tmp" (number->string (get-process-id)))))
+    (guard (e (#t (guard (e2 (#t #f)) (when (file-exists? tmp) (delete-file tmp))) #f))
+      (bld-copy-file! from tmp)
+      (rename-file tmp to)
+      #t)))
+;; Copy a cache entry to TO; #f when there is none. Another build's prune can
+;; delete the entry between the existence check and the read, which is a miss.
+(define (bld-cache-fetch! cache to)
+  (guard (e (#t #f))
+    (and (file-exists? cache)
+         (begin (bld-copy-file! cache to) #t))))
+
 ;; Compile the runtime half under the runtime profile, reusing a cached fasl
 ;; when one matches. CACHE? is #f for a shaken core: its text is per-app, so a
 ;; hit is impossible and a store would only churn the cache.
@@ -2444,10 +2469,8 @@
 (define (bld-compile-runtime! src so cache?)
   (let* ((body (read-file-string src))
          (cache (and cache? (bld-runtime-cache-enabled?) (bld-runtime-cache-path body))))
-    (if (and cache (file-exists? cache))
-        (begin
-          (bld-copy-file! cache so)
-          (ei-mark! "runtime fasl (cached)"))
+    (if (and cache (bld-cache-fetch! cache so))
+        (ei-mark! "runtime fasl (cached)")
         (begin
           (bld-prepend-prologue! src)
           (ei-mark! "kernel prologue + hash")
@@ -2456,7 +2479,7 @@
           (when cache
             (guard (e (#t #f))          ; an unwritable cache must not fail the build
               (bld-mkdir-p (bld-runtime-cache-dir))
-              (bld-copy-file! so cache)
+              (bld-cache-put! so cache)
               (bld-prune-runtime-cache!)))))
     cache))
 
@@ -2749,7 +2772,9 @@
   (let ((e (getenv name)))
     (and (string? e)
          (or (string=? e "0") (string-ci=? e "false") (string-ci=? e "no") (string-ci=? e "off")))))
-(define (bld-build-cache-enabled?) (not (bld-env-off? "JOLT_BUILD_CACHE")))
+(define (bld-build-cache-enabled?)
+  ;; without a runtime fingerprint a key cannot tell two jolts apart
+  (and (not (bld-env-off? "JOLT_BUILD_CACHE")) (aot-runtime-fingerprint) #t))
 
 ;; FNV-1a and a multiplicative hash with a different basis and multiplier, in one
 ;; pass; answered as hex text. Both multipliers stay under 2^24 so a product of a
@@ -2766,7 +2791,7 @@
 
 (define (bld-unit-key mode text)
   (bld-text-key
-    (string-append (scheme-version) " " (sa-host-tag) " " (aot-runtime-fingerprint) "\n"
+    (string-append (scheme-version) " " (sa-host-tag) " " (or (aot-runtime-fingerprint) "") "\n"
                    (bld-params-bindings (or (bld-mode-params mode) '()) "\n") "\n"
                    text)))
 
@@ -2779,9 +2804,7 @@
 (define (bld-cache-store! from to)
   (guard (e (#t #f))               ; an unwritable cache must not fail the build
     (bld-mkdir-p (bld-build-cache-dir))
-    (let ((tmp (string-append to ".tmp" (number->string (get-process-id)))))
-      (bld-copy-file! from tmp)
-      (rename-file tmp to))))
+    (bld-cache-put! from to)))
 
 ;; Keep the cache under a byte budget (JOLT_BUILD_CACHE_MB, default 2048), oldest
 ;; first. One entry accumulates per distinct unit text, so an app edited often
@@ -2837,15 +2860,25 @@
 
 (define (bld-build-jobs)
   (let ((v (getenv "JOLT_BUILD_JOBS")))
-    (max 1 (or (and v (string->number v)) (min 8 (jolt-available-processors))))))
+    (let ((n (and v (string->number v))))
+      (max 1 (if (and n (exact? n) (integer? n)) n (min 8 (jolt-available-processors)))))))
 
 ;; A worker job: #(src so vso-or-#f mode codec). The worker compiles SRC to SO
 ;; under MODE's parameters and, given VSO, converts SO to a vfasl image there.
+;; The parent takes an output that exists as a finished one, so each is written
+;; under a temp name and renamed into place only once complete: a child that
+;; raises, runs out of heap or is killed part way leaves nothing, and the parent
+;; compiles that unit again in process, where a failure reports itself.
 (define (bld-run-job! job)
   (let ((src (vector-ref job 0)) (so (vector-ref job 1)) (vso (vector-ref job 2))
         (mode (vector-ref job 3)) (codec (vector-ref job 4)))
-    (bld-chez-compile-file mode src so)
-    (when vso (sa-vfasl-convert-object-file so vso codec))))
+    (let ((so-part (string-append so ".part")))
+      (bld-chez-compile-file mode src so-part)
+      (rename-file so-part so))
+    (when vso
+      (let ((vso-part (string-append vso ".part")))
+        (when (sa-vfasl-convert-object-file so vso-part codec)
+          (rename-file vso-part vso))))))
 
 ;; Entry for a child: run every job in MANIFEST (a file of `write`n job vectors).
 (define (bld-compile-worker manifest)
@@ -2901,7 +2934,8 @@
          (keyed (map (lambda (u) (let ((text (read-file-string (car u))))
                                    (list u (bld-unit-key mode text) (string-length text))))
                      units))
-         (misses (filter (lambda (k) (not (and cache? (file-exists? (bld-unit-cache-so (cadr k))))))
+         (misses (filter (lambda (k) (not (and cache? (bld-cache-fetch! (bld-unit-cache-so (cadr k))
+                                                                         (cadr (car k))))))
                          keyed)))
     (for-each (lambda (k) (hashtable-set! bld-unit-keys (cadr (car k)) (cadr k))) keyed)
     ;; an image left in the build dir by an earlier build is not this build's:
@@ -2932,9 +2966,6 @@
                 (when (and vfasl? exe (file-exists? vso))
                   (bld-cache-store! vso (bld-unit-cache-vfasl (cadr k) codec)))))))
         misses))
-    ;; hits
-    (for-each (lambda (k) (unless (memq k misses) (bld-copy-file! (bld-unit-cache-so (cadr k)) (cadr (car k)))))
-              keyed)
     (when cache? (bld-prune-build-cache!))
     (ei-mark! (string-append "compile app units (" (number->string (length misses)) "/"
                              (number->string (length keyed)) " compiled)"))))
@@ -2949,15 +2980,32 @@
 ;; converted by itself.
 (define (bld-vfasl-codec) (if (eq? (bld-boot-mode) 'small) 'wide 'default))
 
+;; The Chez boot files the prefix image is built over, by content: the runtime
+;; fasl's key names the Chez version, but a vfasl image is laid out for the exact
+;; kernel, and a patched Chez can keep its version string.
+(define (bld-files-key paths)
+  (let loop ((ps paths) (h1 2166136261) (h2 1540483477) (n 0))
+    (if (null? ps)
+        (string-append (number->string n 16) "-" (number->string h1 16) "-" (number->string h2 16))
+        (let* ((bs (read-file-bytes (car ps))) (len (bytevector-length bs)))
+          (let inner ((i 0) (h1 h1) (h2 h2))
+            (if (fx=? i len)
+                (loop (cdr ps) h1 h2 (+ n len))
+                (let ((c (bytevector-u8-ref bs i)))
+                  (inner (fx+ i 1)
+                         (fxlogand (fx* (fxlogxor h1 c) 16777619) #xFFFFFFFF)
+                         (fxlogand (fx+ (fx* (fxlogxor h2 (fxsrl h2 15)) #x5bd1e9) c) #xFFFFFFFF)))))))))
+
 ;; The cached prefix image for BASE-BOOTS + the runtime unit, or #f. RT-KEY is
 ;; the runtime fasl's cache path (#f for a shaken runtime: converted, not kept).
 (define (bld-base-vfasl! builddir base-boots rt-so rt-key petite-only?)
   (let* ((cache (and rt-key
-                     (string-append rt-key "." (symbol->string (bld-vfasl-codec))
+                     (string-append rt-key "." (bld-files-key base-boots) "."
+                                    (symbol->string (bld-vfasl-codec))
                                     (if petite-only? ".petite" "") ".vfasl")))
          (out (string-append builddir "/base.vfasl")))
-    (if (and cache (file-exists? cache))
-        (begin (ei-mark! "runtime vfasl (cached)") cache)
+    (if (and cache (bld-cache-fetch! cache out))
+        (begin (ei-mark! "runtime vfasl (cached)") out)
         (let ((base-boot (string-append builddir "/base.boot")))
           (sa-make-boot-file base-boot (append base-boots (list rt-so)))
           (and (bld-with-backend-gc
@@ -2966,7 +3014,7 @@
                  (ei-mark! "runtime vfasl-convert")
                  (when cache
                    (guard (e (#t #f))
-                     (bld-copy-file! out cache)
+                     (bld-cache-put! out cache)
                      (bld-prune-runtime-cache!)))
                  out))))))
 
@@ -2976,7 +3024,7 @@
   (let* ((key (hashtable-ref bld-unit-keys so #f))
          (cache (and key (bld-build-cache-enabled?) (bld-unit-cache-vfasl key (bld-vfasl-codec)))))
     (cond
-      ((and cache (file-exists? cache)) (bld-copy-file! cache vso) #t)
+      ((and cache (bld-cache-fetch! cache vso)) #t)
       ((file-exists? vso) #t)
       ((bld-with-backend-gc (lambda () (sa-vfasl-convert-object-file so vso (bld-vfasl-codec))))
        (when cache (bld-cache-store! vso cache))

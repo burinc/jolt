@@ -1011,6 +1011,11 @@
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
 
+;; A conversion that fails part way leaves a truncated OUT, which a caller
+;; testing (file-exists? out) would take for a result; #f leaves no OUT.
+(define (sa-delete-partial! out)
+  (guard (e (#t #f)) (when (file-exists? out) (delete-file out))))
+
 ;; (sa-vfasl-convert-file in out [codec]) -> boolean
 ;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
 ;; what loading the fasl would have produced, laid out per space and loaded
@@ -1026,7 +1031,7 @@
 ;; argument; Chez has two, and 'wide picks gzip over LZ4, which is the whole
 ;; point: gzip has no 256MiB ceiling and LZ4 does.
 (define (sa-vfasl-convert-file in out . codec)
-  (guard (e (#t #f))
+  (guard (e (#t (sa-delete-partial! out) #f))
     (if (and (pair? codec) (eq? (car codec) 'wide))
         (parameterize ((compress-format 'gzip)) (vfasl-convert-file in out '()))
         (vfasl-convert-file in out '()))
@@ -1041,7 +1046,7 @@
 ;; converted once and cached (build.ss). Output entries are compressed, as a
 ;; whole-boot conversion's are. Same contract and degradation as above.
 (define (sa-vfasl-convert-object-file in out . codec)
-  (guard (e (#t #f))
+  (guard (e (#t (sa-delete-partial! out) #f))
     (parameterize ((fasl-compressed #t)
                    (compress-format (if (and (pair? codec) (eq? (car codec) 'wide))
                                         'gzip
