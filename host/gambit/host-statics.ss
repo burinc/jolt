@@ -36,6 +36,11 @@
                (let ((h (make-hashtable string-hash string=?)))
                  (hashtable-set! host-methods-tbl tag h) h))))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+;; The member NAME resolves to on TAG, or #f. There is no parent chain here:
+;; every jhost tag this target builds registers its own members.
+(define (host-method-ref tag name)
+  (let ((h (hashtable-ref host-methods-tbl tag #f)))
+    (and h (hashtable-ref h name #f))))
 ;; A class token may arrive fully qualified (java.io.StringReader) or short
 ;; (StringReader): exact first, then by last dotted segment.
 (define (lookup-class h-tbl name)

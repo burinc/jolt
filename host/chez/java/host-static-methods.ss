@@ -806,7 +806,10 @@
 ;; "locale" jhost tag alone missed the Locale jolt-lang/time installs (a tagged
 ;; table). The locale only picks the decimal separator: the JVM renders %.3f of
 ;; 123.04455 as "123,045" under de.
-(define (jvm-format-string a rest)
+(define (jvm-format-string a rest) (jvm-format-pieces a rest #f))
+;; The same, handing SINK each piece java.util.Formatter would append separately
+;; (natives-format.ss jolt-format*) — PrintWriter/PrintStream .printf.
+(define (jvm-format-pieces a rest sink)
   (let* ((locale? (and (pair? rest) (not (string? a))))
          (fmt (if locale? (car rest) a))
          (args (if locale? (cdr rest) rest))
@@ -818,8 +821,8 @@
     (if locale?
         (parameterize ((format-decimal-sep
                         (number-symbol (jolt-str-render-one a) "decimal-sep" ".")))
-          (apply jolt-format fmt args))
-        (apply jolt-format fmt args))))
+          (jolt-format* sink fmt args))
+        (jolt-format* sink fmt args))))
 
 ;; ---- java.text.NumberFormat -------------------------------------------------
 ;; A grouping decimal formatter (selmer number-format / cuerdas). state:

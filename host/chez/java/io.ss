@@ -1866,22 +1866,58 @@
         (loop (cdr ps) (cons (integer->char (jnum->exact (car ps))) acc)))))
 
 ;; A line-numbering reader folds \r\n and a lone \r to one \n and counts a line
-;; for each, one character at a time (pbr-read-translated). A bulk drain has to
-;; leave exactly the state that loop would have: same text, same line/column, and
-;; the same "a \n right after this \r is already counted" flag.
+;; for each, one character at a time (pbr-read-translated, then the pushback
+;; reader's own column in its read). A bulk drain has to leave exactly the state
+;; that loop would have: same text, same line and column, the same "a \n right
+;; after this \r is already counted" and end-of-input flags, and the same
+;; atLineStart pair. Reaching the end of S is not reading the end of input —
+;; pbr-fold-eof! is that.
 (define (pbr-fold-and-count! st s)
   (let ((n (string-length s)))
     (let loop ((i 0) (acc '()) (line (vector-ref st 3)) (col (vector-ref st 4))
-               (skip-lf (vector-ref st 5)))
+               (skip-lf (vector-ref st 5)) (pending (vector-ref st 9))
+               (als (vector-ref st 6)) (prev (vector-ref st 7)))
       (if (fx>=? i n)
           (begin (vector-set! st 3 line) (vector-set! st 4 col) (vector-set! st 5 skip-lf)
+                 (vector-set! st 9 pending) (vector-set! st 6 als) (vector-set! st 7 prev)
                  (list->string (reverse acc)))
           (let ((c (string-ref s i)))
             (cond
-              ((and skip-lf (char=? c #\newline)) (loop (fx+ i 1) acc line col #f))
+              ((and skip-lf (char=? c #\newline)) (loop (fx+ i 1) acc line col #f pending als prev))
               ((or (char=? c #\return) (char=? c #\newline))
-               (loop (fx+ i 1) (cons #\newline acc) (fx+ line 1) 0 (char=? c #\return)))
-              (else (loop (fx+ i 1) (cons c acc) line (fx+ col 1) #f))))))))
+               (loop (fx+ i 1) (cons #\newline acc) (fx+ line 1) 1 (char=? c #\return) #f #t als))
+              (else (loop (fx+ i 1) (cons c acc) line (fx+ col 1) #f #t #f als))))))))
+
+;; pbr-fold-and-count!'s counting over s[a, b) with no folded copy built: what
+;; a read that parses the string in place needs, per form.
+(define (pbr-count! st s a b)
+  (let loop ((i a) (line (vector-ref st 3)) (col (vector-ref st 4))
+             (skip-lf (vector-ref st 5)) (pending (vector-ref st 9))
+             (als (vector-ref st 6)) (prev (vector-ref st 7)))
+    (if (fx>=? i b)
+        (begin (vector-set! st 3 line) (vector-set! st 4 col) (vector-set! st 5 skip-lf)
+               (vector-set! st 9 pending) (vector-set! st 6 als) (vector-set! st 7 prev))
+        (let ((c (string-ref s i)))
+          (cond
+            ((and skip-lf (char=? c #\newline)) (loop (fx+ i 1) line col #f pending als prev))
+            ((or (char=? c #\return) (char=? c #\newline))
+             (loop (fx+ i 1) (fx+ line 1) 1 (char=? c #\return) #f #t als))
+            (else (loop (fx+ i 1) line (fx+ col 1) #f #t #f als)))))))
+
+;; Reading the end of input: the pending line ends, and the column and
+;; atLineStart go back to the start of a line, as a read of -1 leaves them.
+(define (pbr-fold-eof! st)
+  (when (vector-ref st 9)
+    (vector-set! st 3 (+ 1 (vector-ref st 3)))
+    (vector-set! st 9 #f))
+  (vector-set! st 7 (vector-ref st 6))
+  (vector-set! st 6 #t)
+  (vector-set! st 4 1))
+
+;; The numbering origin a read at index I of S starts from (reader.ss
+;; rdr-read-one): the line the reader reports, its column, and the two flags.
+(define (pbr-numbering-origin st s i)
+  (vector s i (+ 1 (vector-ref st 3)) (vector-ref st 4) (vector-ref st 5) (vector-ref st 9) #f))
 
 (define (drain-reader-by-dispatch r)
   (let loop ((acc '()))
@@ -1937,34 +1973,98 @@
     (else (values #f #f))))
 
 ;; Read ONE form from a host reader (StringReader/PushbackReader), advancing it
-;; past exactly that form. -> (values form found?). (read r) over a java.io reader
-;; — cuerdas' interpolation reads this way, and so does anything reading a source
-;; file form by form.
+;; past exactly that form. -> (values form found? text), TEXT (when CAPTURE is
+;; passed, else "") the source the read
+;; consumed. (read r) over a java.io reader — cuerdas' interpolation reads this
+;; way, and so does anything reading a source file form by form — and
+;; read+string and clojure.edn/read over one.
+;;
+;; EDN? and CB pick clojure.edn's grammar (reader.ss rdr-read-one); EOF-ERROR?
+;; raises "EOF while reading" at end of input instead of answering found? #f.
+;; Over a LineNumberingPushbackReader the read is numbered from the reader's own
+;; counters, so an error escapes as the reference's ReaderException, and the
+;; counters then move over exactly what the read consumed. An EOF error consumes
+;; the rest of the input, as the reference's reader has by then.
 ;;
 ;; A string-backed reader parses AT its current index and moves the index; the
 ;; drain-parse-refill fallback below re-materializes the whole remaining input per
 ;; form, which is quadratic over a file. The fallback still covers a char-reader
 ;; over a Chez port, a library's own reader shim, and a reader with pushback.
-;; A pushback reader over a proxy/reify Reader (or io/reader's adapter over one)
-;; is read incrementally instead: see host-reader-read-form-incremental.
-(define (host-reader-read-form r)
+(define (host-reader-read r edn? cb eof-error? . capture)
   (let-values (((sr lnst) (host-reader-string-cursor r)))
     (if sr
-        (let* ((s (sr-s sr)) (i (sr-pos sr)) (pr (rdr-parse-at s i)))
-          (if (not pr)
-              (begin (sr-pos! sr (string-length s)) (values jolt-nil #f))
-              (let ((j (cdr pr)))
-                ;; the line-numbering reader counts what a char-by-char read would
-                ;; have counted over the span this form consumed
-                (when lnst (pbr-fold-and-count! lnst (substring s i j)))
-                (sr-pos! sr j)
-                (values (car pr) #t))))
+        (let* ((s (sr-s sr)) (i (sr-pos sr)) (end (string-length s)))
+          (define (consume-all!)
+            (when lnst
+              (pbr-count! lnst s i end)
+              (pbr-fold-eof! lnst))
+            (sr-pos! sr end))
+          ;; an error consumes through what it names (rdr-error-resume-index)
+          (define (consume-through! k)
+            (when lnst (pbr-count! lnst s i k))
+            (sr-pos! sr k))
+          (let ((pr (rdr-on-read-error
+                     (lambda (e)
+                       (if (rdr-eof-error? e)
+                           (consume-all!)
+                           (consume-through! (rdr-error-resume-index s i e))))
+                     (lambda ()
+                       (rdr-read-one s i (and lnst (pbr-numbering-origin lnst s i))
+                                     edn? cb eof-error?)))))
+            (if (not pr)
+                (begin (consume-all!) (values jolt-nil #f ""))
+                (let ((j (cdr pr)))
+                  (when lnst (pbr-count! lnst s i j))
+                  (sr-pos! sr j)
+                  (values (car pr) #t (if (pair? capture) (substring s i j) ""))))))
         (if (pushback-over-user-reader? r)
-            (host-reader-read-form-incremental r)
-            (let* ((s (drain-reader r)) (pr (jolt-parse-next s)))
-              (if (jolt-nil? pr)
-                  (begin (reader-refill! r "") (values jolt-nil #f))
-                  (begin (reader-refill! r (jolt-nth pr 1)) (values (jolt-nth pr 0) #t))))))))
+            (host-reader-read-incremental r edn? cb eof-error?)
+            (host-reader-read-drained r edn? cb eof-error?)))))
+
+;; The fallback: drain, read from the front, and put back what the read did not
+;; consume. Draining a line-numbering reader counts everything it drains, so the
+;; counters are put back first and then moved over only the consumed text. The
+;; drained text is already folded (no \r left in it), which is also why skip-lf
+;; starts over; characters that came out of the pushback buffer were counted when
+;; they were first read, so they move the column only.
+(define (host-reader-read-drained r edn? cb eof-error?)
+  (let* ((st (and (jhost? r) (pushback-reader-tag? (jhost-tag r)) (jhost-state r)))
+         (lnst (and st (vector-ref st 2) st))
+         (snap (and lnst (vector-copy lnst)))
+         (npushed (if st (length (vector-ref st 1)) 0))
+         (s (drain-reader r))
+         (end (string-length s)))
+    (define (count-through! j)
+      (when lnst
+        (let ((p (fxmin npushed j)))
+          (let ((line (vector-ref lnst 3)) (pending (vector-ref lnst 9)))
+            (pbr-fold-and-count! lnst (substring s 0 p))
+            (vector-set! lnst 3 line)
+            (vector-set! lnst 9 pending))
+          (pbr-fold-and-count! lnst (substring s p j)))))
+    (define (consume-all!)
+      (count-through! end)
+      (when lnst (pbr-fold-eof! lnst))
+      (reader-refill! r ""))
+    (when snap
+      (for-each (lambda (k) (vector-set! lnst k (vector-ref snap k))) '(3 4 6 7 9))
+      (vector-set! lnst 5 #f))
+    (let ((pr (rdr-on-read-error
+               (lambda (e)
+                 (if (rdr-eof-error? e)
+                     (consume-all!)
+                     (let ((k (rdr-error-resume-index s 0 e)))
+                       (count-through! k)
+                       (reader-refill! r (substring s k end)))))
+               (lambda ()
+                 (rdr-read-one s 0 (and lnst (pbr-numbering-origin lnst s 0))
+                               edn? cb eof-error?)))))
+      (if (not pr)
+          (begin (consume-all!) (values jolt-nil #f ""))
+          (let ((j (cdr pr)))
+            (count-through! j)
+            (reader-refill! r (substring s j end))
+            (values (car pr) #t (substring s 0 j)))))))
 
 ;; A pushback reader whose wrapped reader is the program's own -- a proxy/reify
 ;; java.io.Reader, or the adapter io/reader puts around one. Such a reader can
@@ -1978,38 +2078,27 @@
        (let ((w (vector-ref (jhost-state r) 0)))
          (or (not (jhost? w)) (string=? (jhost-tag w) "reader-adapter")))))
 
-;; Is e the reader's "input ended inside a form" error? Every one the reader
-;; raises starts "EOF ": "EOF while reading string", "EOF after #_" and so on.
-(define (rdr-eof-throw? e)
-  (and (jolt-throw-condition? e)
-       (let ((v (jolt-throw-condition-value e)))
-         (and (ex-info-map? v)
-              (let ((m (jolt-ex-info-record-message v)))
-                (and (string? m)
-                     (fx>=? (string-length m) 4)
-                     (string=? (substring m 0 4) "EOF ")))))))
-
 ;; Read ONE form from a pushback reader through its own read/unread, taking
 ;; only as much input as the form needs. Characters go into a buffer while a
 ;; small scanner tracks bracket depth and whether it is inside a string, regex,
 ;; char literal or comment. The real parser runs only at a top-level boundary:
 ;; the bracket that closes depth back to 0, the quote that closes a top-level
-;; string, or whitespace/a comment after a top-level token. An "EOF ..." read
-;; error there means the form continues (a quote or #_ with nothing after it
-;; yet), so reading goes on. What the parser did not consume -- at most the
-;; delimiter that ended a token, or the rest of a line after a token that ran
-;; into a bracket -- is unread, so the next read starts right after the form.
-;; At end of input the buffer is parsed as it stands, and its errors are the
+;; string, whitespace or a comment after a top-level token, or a terminating
+;; macro character right after one (where the reference's token read stops). An
+;; EOF read error there means the form continues (a quote or #_ with nothing
+;; after it yet), so reading goes on. What the parser did not consume is
+;; unread, so the next read starts right after the form; a read error unreads
+;; what lies past the token it names, as the string path consumes through it.
+;; At end of input the buffer is parsed as it stands, so its errors are the
 ;; string path's errors.
-(define (host-reader-read-form-incremental r)
-  (let-values (((form found? text) (host-reader-read-form+text-incremental r)))
-    (values form found?)))
-
-;; The same read, plus the text the form was read from (what read+string
-;; returns): everything consumed up to the form's end, leading whitespace
-;; included, as the drain path's read+string has it.
-(define (host-reader-read-form+text-incremental r)
-  (let ((buf (open-output-string)))
+;;
+;; The pushback reader's own read counts lines, so a line-numbering reader's
+;; counters need no bookkeeping here; the numbering origin for a ReaderException
+;; is the counters as they stood before the first character was read.
+(define (host-reader-read-incremental r edn? cb eof-error?)
+  (let* ((st (jhost-state r))
+         (snap (and (vector-ref st 2) (vector-copy st)))
+         (buf (open-output-string)))
     (define (read-char!)
       (let ((u (record-method-dispatch r "read" jolt-nil)))
         (if (or (jolt-nil? u) (and (number? u) (< u 0)))
@@ -2020,24 +2109,33 @@
         (when (fx>=? k j)
           (record-method-dispatch r "unread" (jolt-list (string-ref s k)))
           (loop (fx- k 1)))))
+    ;; the read at the buffer's front; a non-EOF error unreads past its token
+    ;; and propagates
+    (define (read-buffer s eof-err?)
+      (rdr-on-read-error
+       (lambda (e)
+         (unless (rdr-eof-error? e)
+           (unread-tail! s (rdr-error-resume-index s 0 e))))
+       (lambda ()
+         (rdr-read-one s 0 (and snap (pbr-numbering-origin snap s 0)) edn? cb eof-err?))))
+    (define (buffer-text)
+      ;; get-output-string resets the port, so put the text back
+      (let ((s (get-output-string buf))) (put-string buf s) s))
     ;; -> (form . text) when a form is complete, #f when more input is needed
     (define (attempt)
-      (let* ((s (get-output-string buf))
-             (pr (guard (e ((rdr-eof-throw? e) 'more))
-                   (rdr-parse-at s 0))))
-        ;; get-output-string resets the port, so put the text back
-        (put-string buf s)
-        (cond
-          ((or (eq? pr 'more) (not pr)) #f)
-          (else
-           (unread-tail! s (cdr pr))
-           (cons (car pr) (substring s 0 (cdr pr)))))))
+      (let* ((s (buffer-text))
+             (pr (guard (e ((rdr-eof-error? e) #f)) (read-buffer s #t))))
+        (and pr
+             (begin (unread-tail! s (cdr pr))
+                    (cons (car pr) (substring s 0 (cdr pr)))))))
     (define (finish)
-      (let* ((s (get-output-string buf)) (pr (rdr-parse-at s 0)))
+      (let* ((s (buffer-text)) (pr (read-buffer s eof-error?)))
         (if pr
             (begin (unread-tail! s (cdr pr)) (values (car pr) #t (substring s 0 (cdr pr))))
-            (values jolt-nil #f s))))
-    (let loop ((depth 0) (mode 'code) (content? #f))
+            (values jolt-nil #f ""))))
+    (define (done-or got otherwise)
+      (if got (values (car got) #t (cdr got)) (otherwise)))
+    (define (step depth mode content?)
       (let ((c (read-char!)))
         (if (not c)
             (finish)
@@ -2045,54 +2143,63 @@
               (write-char c buf)
               (case mode
                 ((code)
-                 (cond
-                   ((char=? c #\;) (loop depth 'comment content?))
-                   ((char=? c #\\) (loop depth 'char-escape #t))
-                   ((char=? c #\") (loop depth 'string #t))
-                   ((memv c '(#\( #\[ #\{)) (loop (fx+ depth 1) 'code #t))
-                   ((memv c '(#\) #\] #\}))
-                    (let ((d (fx- depth 1)))
-                      (if (fx<=? d 0)
-                          (let ((got (attempt)))
-                            (if got (values (car got) #t (cdr got)) (loop d 'code #t)))
-                          (loop d 'code #t))))
-                   ((or (char-whitespace? c) (char=? c #\,))
-                    (if (and content? (fx<=? depth 0))
-                        (let ((got (attempt)))
-                          (if got (values (car got) #t (cdr got)) (loop depth 'code content?)))
-                        (loop depth 'code content?)))
-                   (else (loop depth 'code #t))))
-                ((char-escape) (loop depth 'code #t))
+                 (if (and content? (fx<=? depth 0)
+                          (memv c '(#\( #\[ #\{ #\" #\; #\\ #\@ #\^ #\` #\~)))
+                     ;; a terminating macro character ends a pending token
+                     (done-or (attempt) (lambda () (code-char depth c content?)))
+                     (code-char depth c content?)))
+                ((char-escape) (step depth 'code #t))
                 ((string)
                  (cond
-                   ((char=? c #\\) (loop depth 'string-escape #t))
+                   ((char=? c #\\) (step depth 'string-escape #t))
                    ((char=? c #\")
                     (if (fx<=? depth 0)
-                        (let ((got (attempt)))
-                          (if got (values (car got) #t (cdr got)) (loop depth 'code #t)))
-                        (loop depth 'code #t)))
-                   (else (loop depth 'string #t))))
-                ((string-escape) (loop depth 'string #t))
+                        (done-or (attempt) (lambda () (step depth 'code #t)))
+                        (step depth 'code #t)))
+                   (else (step depth 'string #t))))
+                ((string-escape) (step depth 'string #t))
                 ((comment)
                  (if (memv c '(#\newline #\return))
                      (if (and content? (fx<=? depth 0))
-                         (let ((got (attempt)))
-                           (if got (values (car got) #t (cdr got)) (loop depth 'code content?)))
-                         (loop depth 'code content?))
-                     (loop depth 'comment content?))))))))))
+                         (done-or (attempt) (lambda () (step depth 'code content?)))
+                         (step depth 'code content?))
+                     (step depth 'comment content?))))))))
+    (define (code-char depth c content?)
+      (cond
+        ((char=? c #\;) (step depth 'comment content?))
+        ((char=? c #\\) (step depth 'char-escape #t))
+        ((char=? c #\") (step depth 'string #t))
+        ((memv c '(#\( #\[ #\{)) (step (fx+ depth 1) 'code #t))
+        ((memv c '(#\) #\] #\}))
+         (let ((d (fx- depth 1)))
+           (if (fx<=? d 0)
+               (done-or (attempt) (lambda () (step d 'code #t)))
+               (step d 'code #t))))
+        ((or (char-whitespace? c) (char=? c #\,))
+         (if (and content? (fx<=? depth 0))
+             (done-or (attempt) (lambda () (step depth 'code content?)))
+             (step depth 'code content?)))
+        (else (step depth 'code #t))))
+    (step 0 'code #f)))
 
-;; clojure.edn/read over a reader: drain the jhost reader to a string and read the
-;; first EDN form. Re-asserted over the prelude in post-prelude.ss.
-;;
-;; Through clojure.edn/read-string, NOT the core one: this is the edn seam, and
-;; the core reader is the SOURCE reader — it resolves ::kw, takes #(…) and #=,
-;; and ends a token at an @ where edn refuses it (#905). An empty opts map is
-;; what makes end of input an error here, as it is on the JVM; the core
-;; read-string answered nil.
-(define (chez-edn-read reader)
-  (jolt-invoke (var-deref "clojure.edn" "read-string")
-               empty-pmap
-               (if (reader-jhost? reader) (drain-reader reader) (jolt-str-render-one reader))))
+(define (host-reader-read-form r)
+  (let-values (((form found? text) (host-reader-read r #f #f #f)))
+    (values form found?)))
+
+;; java.lang.String.trim: every char at or below U+0020 off both ends.
+;; clojure.edn/read over a reader: one EDN form off the reader, leaving the rest
+;; of it for the next read, through clojure.edn's own tag pass. Absent :eof in
+;; opts makes end of input an error, as on the JVM.
+(define (chez-edn-read opts reader)
+  (let ((edn->value (var-deref "clojure.edn" "edn->value"))
+        (kw-eof (keyword #f "eof")))
+    (let-values (((form found? text)
+                  (host-reader-read reader #t
+                                    (lambda (f) (jolt-invoke edn->value opts f) jolt-nil)
+                                    (not (jolt-truthy? (jolt-contains? opts kw-eof))))))
+      (if found?
+          (jolt-invoke edn->value opts form)
+          (jolt-get opts kw-eof)))))
 
 ;; line-seq: an io/reader is a jhost StringReader. Drain it (or take a string)
 ;; and split on a line terminator; a trailing terminator does NOT yield a final

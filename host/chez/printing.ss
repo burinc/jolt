@@ -219,6 +219,34 @@
                 w))
          => (lambda (w) (record-method-dispatch w "write" (jolt-list s)) jolt-nil))
         (else (display s) jolt-nil)))
+;; (.append *out* x) — what the reference's print family uses for the space
+;; between arguments, the newline, and a printed character, so a Writer under
+;; *out* sees those as appends, separately from each value's write. X is a char or
+;; a string. Routed exactly like jolt-write; a writer with no append method of
+;; its own gets write, which is what java.io.Writer.append's default does.
+(define (jolt-append x)
+  (let ((s (if (char? x) (string x) x)))
+    (cond ((and (not (jolt-nil? jolt-pprint-write-hook))
+                (not (jolt-pprint-hook-suppressed))
+                (jolt-truthy? (jolt-invoke jolt-pprint-write-hook s)))
+           jolt-nil)
+          ((let ((w (begin
+                      (unless out-cell
+                        (set! out-cell (jolt-var "clojure.core" "*out*")))
+                      (var-cell-deref out-cell))))
+             (and (or (iface-method w "write" #f)
+                      (and (jhost? w)
+                           (not (and (string=? (jhost-tag w) "port-writer")
+                                     (eq? (vector-ref (jhost-state w) 0) 'out)))))
+                  w))
+           => (lambda (w)
+                (if (if (jhost? w)
+                        (host-method-ref (jhost-tag w) "append")
+                        (iface-method w "append" #f))
+                    (record-method-dispatch w "append" (jolt-list x))
+                    (record-method-dispatch w "write" (jolt-list s)))
+                jolt-nil))
+          (else (display s) jolt-nil))))
 (def-var! "clojure.core" "__set-pprint-write-hook!"
   (lambda (f) (set! jolt-pprint-write-hook f) jolt-nil))
 ;; clojure.pprint wraps its writing in this so core print routes into the active
@@ -271,6 +299,7 @@
 
 (def-var! "clojure.core" "__pr-str1" jolt-pr-str1)
 (def-var! "clojure.core" "__write" jolt-write)
+(def-var! "clojure.core" "__append" jolt-append)
 (def-var! "clojure.core" "__with-out-str" jolt-with-out-str)
 (def-var! "clojure.core" "__eprint" jolt-eprint)
 (def-var! "clojure.core" "__eprintf" jolt-eprintf)

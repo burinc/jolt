@@ -677,6 +677,42 @@
            :jvm "throws RuntimeException"
            :jolt "nil"}
    :note "Permissive."}
+  ;; A read error keeps its diagnostic position in ex-data whatever its class.
+  {:category :permissive
+   :behavior "(ex-data e) for a read error raised as a RuntimeException, e.g. (read-string \"(a\")"
+   :jvm "nil — a bare RuntimeException carries no data"
+   :jolt "{:jolt.error/kind :read/eof … :clojure.error/line 1 :clojure.error/column 3}"
+   :check {:expr "(:clojure.error/column (ex-data (try (read-string \"(a\") (catch RuntimeException e e))))"
+           :jvm "nil"
+           :jolt "3"}
+   :note "The class, message and cause match the JVM's (RuntimeException, NumberFormatException, IllegalArgumentException); the data is what jolt's error report and JOLT_DIAG read the kind and position from. Code that asks (instance? clojure.lang.IExceptionInfo e) first behaves identically, and (str e) does not include it."}
+  ;; Where a LineNumberingPushbackReader stands after a read error other than EOF.
+  {:category :reader-model
+   :behavior "the :clojure.error/column of the LispReader$ReaderException for a non-EOF read error, e.g. an unmatched ) or an invalid number"
+   :jvm "past what the reader consumed: the delimiter, the whole token, the whole collection"
+   :jolt "the error's own position: the start of the offending text"
+   :check {:expr "(ex-data (try (read (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"  )\"))) (catch Exception e e)))"
+           :jvm "#:clojure.error{:line 1, :column 4}"
+           :jolt "#:clojure.error{:line 1, :column 3}"}
+   :note "EOF errors — the incomplete input a REPL meets — stand where the JVM's do, past the input. The reader here works over a string and raises at the position it judges, which the error report also points at; the JVM's position is a side effect of how far its char-by-char reader got. The stream does move past the offending text either way, so a REPL reads on."}
+  ;; A token's terminator: the JVM reads it and pushes it back.
+  {:category :reader-model
+   :behavior "LineNumberingPushbackReader line/column right after reading a symbol, number or keyword"
+   :jvm "one character further on: the reader read the terminator and pushed it back (a newline is counted, the column steps back)"
+   :jolt "just past the token"
+   :check {:expr "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\nb\"))] (read r) [(.getLineNumber r) (.getColumnNumber r)])"
+           :jvm "[2 0]"
+           :jolt "[1 2]"}
+   :note "Forms that end in a delimiter (lists, vectors, maps, strings) and end of input leave identical counters. Reproducing the read-and-push-back would put a character in the pushback buffer after every token, which takes the next read off the string-indexed fast path onto the drain-and-refill one."}
+  ;; One value's printed text reaches a Writer as one write.
+  {:category :printer-model
+   :behavior "the calls a Writer bound to *out* receives while one value prints readably, e.g. (pr \"a\") or (prn [1 2])"
+   :jvm "one per piece print-method emits: the quotes and each character of a string, each bracket, element and separator of a collection"
+   :jolt "one write of the value's whole text"
+   :check {:expr "(let [log (atom 0)] (binding [*out* (proxy [java.io.Writer] [] (write ([x] (swap! log inc)) ([x o l] (swap! log inc))) (append ([x] (swap! log inc) this)) (flush []) (close []))] (pr [1 2])) @log)"
+           :jvm "5"
+           :jolt "1"}
+   :note "Between values the calls match: each argument of print/pr/println/prn is its own write, the space and the newline are appends, and PrintWriter.printf writes each Formatter piece. The text is identical; only a Writer that logs its calls can tell. jolt renders a value in the host printer, which is also what keeps pr-str fast, rather than walking print-method once per element."}
   ;; unchecked-add/-subtract/-multiply accept any arity (the JVM's take exactly 2).
   {:category :permissive
    :behavior "(unchecked-add x) or (unchecked-add a b c), e.g. through apply"

@@ -51,9 +51,18 @@
       (recur (str out (if first? "" " ") (__pr-str1 (first s))) (next s) false)
       out)))
 
-(defn pr [& xs] (__write (apply pr-str xs)) nil)
+;; Each argument is its own write, and the space between two is an
+;; (.append *out* \space) — the calls the reference's pr makes, which a Writer
+;; bound to *out* sees one by one. The newline is an append too.
+(defn pr [& xs]
+  (loop [s (seq xs)]
+    (when s
+      (__write (__pr-str1 (first s)))
+      (let [n (next s)]
+        (when n (__append \space) (recur n)))))
+  nil)
 
-(defn prn [& xs] (apply pr xs) (__write "\n") (when *flush-on-newline* (flush)) nil)
+(defn prn [& xs] (apply pr xs) (__append "\n") (when *flush-on-newline* (flush)) nil)
 
 ;; print renders each arg non-readably (strings/chars unquoted) like str — except
 ;; nil, which prints as "nil" (str yields ""). Only the top-level arg needs the
@@ -61,19 +70,21 @@
 ;; printer.
 ;; print renders non-readably (__print1): a nested string is raw, unlike str/pr
 ;; which quote it. (print ["x"]) => [x], (str ["x"]) => ["x"].
+;; Written piece by piece like pr; a character is appended, as the reference's
+;; print-method for Character does when not printing readably.
 (defn print [& xs]
-  (__write (loop [out "" s (seq xs) first? true]
-             (if s
-               (let [x (first s)
-                     r (__print1 x)]
-                 (recur (str out (if first? "" " ") r) (next s) false))
-               out)))
+  (loop [s (seq xs)]
+    (when s
+      (let [x (first s)]
+        (if (char? x) (__append x) (__write (__print1 x))))
+      (let [n (next s)]
+        (when n (__append \space) (recur n)))))
   nil)
 
 ;; *flush-on-newline* is true by default, as on the JVM: a line-terminated write
 ;; reaches the writer under *out* rather than sitting in its buffer. That is what
 ;; makes (println …) through an OutputStreamWriter arrive at the stream beneath it.
-(defn println [& xs] (apply print xs) (__write "\n") (when *flush-on-newline* (flush)) nil)
+(defn println [& xs] (apply print xs) (__append "\n") (when *flush-on-newline* (flush)) nil)
 
 ;; Transient accumulation (canonical JVM form): assoc! into a native-backed
 ;; scratch table per element, then persistent! bulk-builds the HAMT once —

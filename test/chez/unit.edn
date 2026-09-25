@@ -2825,8 +2825,8 @@
   ;; a bad \\u escape is a proper reader error (ExceptionInfo), not a raw condition.
   {:suite "r8-reader" :expr "(try (read-string \":::foo\") (catch Throwable e :threw))" :expected ":threw"}
   {:suite "r8-reader" :expr "[(read-string \":foo:bar\") (read-string \":ns/foo\") (read-string \":ns//\")]" :expected "[:foo:bar :ns/foo :ns//]"}
-  {:suite "r8-reader" :expr "(try (read-string \"\\\\uABCG\") (catch clojure.lang.ExceptionInfo e :ex) (catch Throwable e :other))" :expected ":ex"}
-  {:suite "r8-reader" :expr "(try (read-string \"\\\"\\\\u041\\\"\") (catch clojure.lang.ExceptionInfo e :ex) (catch Throwable e :other))" :expected ":ex"}
+  {:suite "r8-reader" :expr "(try (read-string \"\\\\uABCG\") (catch IllegalArgumentException e :ex) (catch Throwable e :other))" :expected ":ex"}
+  {:suite "r8-reader" :expr "(try (read-string \"\\\"\\\\u041\\\"\") (catch IllegalArgumentException e :ex) (catch Throwable e :other))" :expected ":ex"}
   {:suite "r8-reader" :expr "[(int (read-string \"\\\\u0041\")) (count (read-string \"\\\"\\\\u0041\\\"\"))]" :expected "[65 1]"}
   {:suite "r7-lazyseq" :expr "(let [a (atom 0) s (lazy-seq (do (swap! a inc) [1]))] (doall (map deref (for [_ (range 8)] (future (doall s))))) @a)" :expected "1"}
   ;; single-threaded realization is memoized: the body/step runs exactly once no
@@ -3360,12 +3360,12 @@
   ;; a read-string that fails at run time is the program's execution error (the
   ;; reference's shape, minus the trace frame it names); the source reads are
   ;; the syntax errors
-  {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (read-string \"(\") (catch Throwable e e))))" :expected "\"Execution error (ExceptionInfo) at (REPL:1).\\nEOF while reading\\n\""}
+  {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (read-string \"(\") (catch Throwable e e))))" :expected "\"Execution error at (REPL:1).\\nEOF while reading\\n\""}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (load-string \"(\") (catch Throwable e e))))" :expected "\"Syntax error reading source at (REPL:1:2).\\nEOF while reading\\n\""}
   ;; ...and repl files what ITS read raised under :read-source, as the
   ;; reference's does around LispReader$ReaderException: the hook sees the
-  ;; phase on a wrapper whose cause is the read diagnostic, with its position
-  {:suite "clojure.main" :expr "(do (require 'clojure.main) (let [seen (atom nil)] (binding [*ns* (create-ns 'replx)] (refer-clojure) (with-out-str (binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(\\n\"))] (clojure.main/repl :caught (fn [e] (reset! seen [(:clojure.error/phase (ex-data e)) (:phase (Throwable->map e)) (ex-message e) (ex-message (ex-cause e)) (clojure.main/err->msg e)])))))) @seen))" :expected "[:read-source :read-source nil \"EOF while reading\" \"Syntax error reading source at (REPL:2:1).\\nEOF while reading\\n\"]"}
+  ;; phase on a wrapper whose cause is that ReaderException, with its position
+  {:suite "clojure.main" :expr "(do (require 'clojure.main) (let [seen (atom nil)] (binding [*ns* (create-ns 'replx)] (refer-clojure) (with-out-str (binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(\\n\"))] (clojure.main/repl :caught (fn [e] (reset! seen [(:clojure.error/phase (ex-data e)) (:phase (Throwable->map e)) (ex-message e) (ex-message (ex-cause e)) (clojure.main/err->msg e)])))))) @seen))" :expected "[:read-source :read-source nil \"java.lang.RuntimeException: EOF while reading, starting at line 1\" \"Syntax error reading source at (REPL:2:1).\\nEOF while reading, starting at line 1\\n\"]"}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (try (load-string \"(let [x] 1)\") (catch Throwable e e))))" :expected "\"Syntax error macroexpanding clojure.core/let at (REPL:1:1).\\nBad binding form, expected matched symbol expression pairs\\n\""}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (ClassCastException. \"class java.lang.String cannot be cast to class java.lang.Number\")))" :expected "\"Execution error (ClassCastException) at (REPL:1).\\nclass java.lang.String cannot be cast to class java.lang.Number\\n\""}
   {:suite "clojure.main" :expr "(do (require 'clojure.main) (clojure.main/err->msg (clojure.lang.ArityException. 0 \"clojure.core//\")))" :expected "\"Execution error (ArityException) at (REPL:1).\\nWrong number of args (0) passed to: clojure.core//\\n\""}

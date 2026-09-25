@@ -66,7 +66,7 @@
     (if (= v :jolt/reader-eof)
       (if (contains? opts :eof)
         (get opts :eof)
-        (throw (ex-info "EOF while reading" {})))
+        (throw (RuntimeException. "EOF while reading")))
       (edn->value opts v))))
 
 (defn read-string

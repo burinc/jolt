@@ -82,14 +82,15 @@
                       (string-append "class " (guard (e (#t "?")) (jolt-class-name x))
                                      " cannot be cast to class clojure.lang.IPending"))))
         (else (jolt-invoke overlay-realized? x))))))
-;; clojure.edn/read over a reader: drain the jhost reader, then read through the
-;; overlay read-string so the opts map (:readers/:default/:eof) is honored.
+;; clojure.edn/read over a reader: one form off a jhost reader (io.ss
+;; chez-edn-read), with the opts map (:readers/:default/:eof) honored.
 (def-var! "clojure.edn" "read"
   (case-lambda
-    ((reader) (chez-edn-read reader))
+    ((reader) (jolt-invoke (var-deref "clojure.edn" "read") empty-pmap reader))
     ((opts reader)
-     (jolt-invoke (var-deref "clojure.edn" "read-string") opts
-                  (if (reader-jhost? reader) (drain-reader reader) (jolt-str-render-one reader))))))
+     (if (reader-jhost? reader)
+         (chez-edn-read opts reader)
+         (jolt-invoke (var-deref "clojure.edn" "read-string") opts (jolt-str-render-one reader))))))
 ;; line-seq: a jhost reader (io/reader result) -> drain+split; a map-reader (the
 ;; overlay's :read-line-fn model, e.g. with-in-str) -> the overlay version.
 (let ((overlay-line-seq (var-deref "clojure.core" "line-seq")))
@@ -155,6 +156,11 @@
 ;; reader; everything else (the *in* reify) delegates to the overlay.
 ;; The 2-arity is Clojure's (read opts stream): :eof in opts is the end-of-input
 ;; value, and its ABSENCE is what makes EOF throw — {:eof nil} reads nil at EOF.
+;; End of input raises inside the read (host-reader-read's EOF-ERROR?), so over a
+;; LineNumberingPushbackReader it is the reference's ReaderException like any
+;; other read error.
+(define (host-read-eof-opt? opts kw-eof)
+  (and (pmap? opts) (jolt-truthy? (jolt-contains? opts kw-eof))))
 (let ((ov-read (var-deref "clojure.core" "read"))
       (kw-eof (keyword #f "eof")))
   (def-var! "clojure.core" "read"
@@ -165,22 +171,19 @@
       (() (jolt-invoke (var-deref "clojure.core" "read") (var-deref "clojure.core" "*in*")))
       ((stream)
        (if (reader-jhost? stream)
-           (let-values (((form found?) (host-reader-read-form stream)))
-             (if found? form (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap))))
+           (let-values (((form found? text) (host-reader-read stream #f #f #t)))
+             form)
            (jolt-invoke ov-read stream)))
       ((opts stream)
        (if (reader-jhost? stream)
-           (let-values (((form found?) (host-reader-read-form stream)))
-             (cond (found? form)
-                   ((and (pmap? opts) (jolt-contains? opts kw-eof)) (jolt-get opts kw-eof))
-                   (else (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap)))))
+           (let* ((eof? (host-read-eof-opt? opts kw-eof)))
+             (let-values (((form found? text) (host-reader-read stream #f #f (not eof?))))
+               (if found? form (jolt-get opts kw-eof))))
            (jolt-invoke ov-read opts stream)))
       ((stream e? ev)
        (if (reader-jhost? stream)
-           (let-values (((form found?) (host-reader-read-form stream)))
-             (cond (found? form)
-                   ((jolt-truthy? e?) (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap)))
-                   (else ev)))
+           (let-values (((form found? text) (host-reader-read stream #f #f (jolt-truthy? e?))))
+             (if found? form ev))
            (jolt-invoke ov-read stream e? ev)))
       ;; the 4th argument is the JVM reader's recursive? bookkeeping, not ours
       ((stream e? ev recursive?)
@@ -211,25 +214,13 @@
            (jolt-invoke (var-deref "clojure.core" "read+string") stream #t jolt-nil)))
       ((stream e? ev recursive?)
        (jolt-invoke (var-deref "clojure.core" "read+string") stream e? ev))
+      ;; the text is the reference's (.trim (.getString stream)): what the read
+      ;; consumed, whitespace off both ends
       ((stream e? ev)
-       (cond
-         ;; a program's own Reader may be interactive: take only the form, as
-         ;; host-reader-read-form does, rather than draining to end of input
-         ((and (reader-jhost? stream) (pushback-over-user-reader? stream))
-          (let-values (((form found? text) (host-reader-read-form+text-incremental stream)))
-            (cond (found? (jolt-vector form text))
-                  ((jolt-truthy? e?) (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap)))
-                  (else (jolt-vector ev "")))))
-         ((reader-jhost? stream)
-           (let* ((s (drain-reader stream)) (pr (jolt-parse-next s)))
-             (if (jolt-nil? pr)
-                 (begin (reader-refill! stream "")
-                        (if (jolt-truthy? e?) (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap))
-                            (jolt-vector ev "")))
-                 (let ((rest (jolt-nth pr 1)))
-                   (reader-refill! stream rest)
-                   (jolt-vector (jolt-nth pr 0) (substring s 0 (- (string-length s) (string-length rest))))))))
-         (else (jolt-invoke ov-rps stream e? ev)))))))
+       (if (reader-jhost? stream)
+           (let-values (((form found? text) (host-reader-read stream #f #f (jolt-truthy? e?) #t)))
+             (jolt-vector (if found? form ev) (jstring-trim text)))
+           (jolt-invoke ov-rps stream e? ev))))))
 
 ;; A throwable is not a collection, function, or meta carrier on the JVM. The
 ;; ex-info record type is NOT a pmap, so pmap?/coll?/seqable?/ifn?/associative?
