@@ -477,7 +477,13 @@
 ;; instead of growing a bignum, which used to reach fx* and escape as a raw
 ;; "fixnum overflow" ArithmeticException that no catch clause could select.
 (define fmt-int-max 2147483647)
-(define (jolt-format fmt . args)
+;; SINK, when not #f, is handed the output a piece at a time, in the units
+;; java.util.Formatter appends to its destination: each run of literal text, and
+;; each directive's text (%n and %% included). PrintWriter/PrintStream .printf
+;; write those pieces separately, as the JDK's do; format and String/format pass
+;; #f and get the one string.
+(define (jolt-format fmt . args) (jolt-format* #f fmt args))
+(define (jolt-format* sink fmt args)
   (let* ((fmt (jolt-need-string fmt))
          (n (string-length fmt))
          (argv (list->vector args))
@@ -522,12 +528,18 @@
     ;; ("abc%" -> '%', "%1$" -> '1')
     (define (unterminated i)
       (fmt-unknown-conversion (if (fx<? (fx+ i 1) n) (string (string-ref fmt (fx+ i 1))) "%")))
+    (define (piece!)
+      (when sink
+        (let ((s (get-output-string out)))
+          (unless (string=? s "") (sink s)))))
     (let loop ((i 0) (ordinary 0) (last -1))
       (if (fx>=? i n)
-          (get-output-string out)
+          (begin (piece!) (get-output-string out))
           (let ((c (string-ref fmt i)))
             (if (not (char=? c #\%))
                 (begin (write-char c out) (loop (fx+ i 1) ordinary last))
+                (begin
+                (piece!)
                 (let* ((idx (scan-index (fx+ i 1)))
                        (fl (scan-flags (if idx (cdr idx) (fx+ i 1))))
                        (flags (car fl))
@@ -545,11 +557,13 @@
                       ((char=? d #\%)
                        (fmt-check-flags d flags width prec)
                        (display (fmt-pad "%" flags width #f) out)
+                       (piece!)
                        (loop (fx+ j 1) ordinary last))
                       ;; %n: the line separator, taking neither width nor argument
                       ((char=? d #\n)
                        (fmt-check-flags d flags width prec)
                        (write-char #\newline out)
+                       (piece!)
                        (loop (fx+ j 1) ordinary last))
                       (else
                        (let* ((date? (or (char=? d #\t) (char=? d #\T)))
@@ -576,10 +590,11 @@
                                                           flags width #f)))
                                         (fmt-directive d a flags width prec))
                                     out))
+                         (piece!)
                          ;; only an un-indexed directive advances the ordinary
                          ;; cursor, and every one of them remembers its argument
                          ;; for a following %<
                          (loop end
                                (if (or idx (fmt-flag? flags #\<)) ordinary (fx+ ordinary 1))
-                               k))))))))))))
+                               k)))))))))))))
 (def-var! "clojure.core" "format" jolt-format)

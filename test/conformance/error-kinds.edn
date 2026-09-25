@@ -26,6 +26,14 @@
   positioned raise. Narrowing one of these to its own kind is always an
   improvement; nothing depends on it staying general."
 
+ :read/eof
+ "The input ended inside a form: an unclosed collection, string, regex or
+  character literal, or a reader macro (`'`, `#_`, `^`, a `#tag`) with nothing
+  after it. A `RuntimeException` on both runtimes. Read from a
+  `LineNumberingPushbackReader`, it is the cause of a
+  `LispReader$ReaderException` that stands past the end of the input, and an
+  unclosed collection's message names the line it opened on."
+
  :read/invalid-token
  "A token that is not a valid symbol or keyword: a leading or trailing slash, a
   bare `:` or `::`, or a keyword name beginning with a colon (`:::c`)."

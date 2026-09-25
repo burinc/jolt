@@ -56,11 +56,7 @@ jolt-bigdec-from-string
 jolt-inst-from-string
 chez-edn-read
 chez-line-seq
-drain-reader
-host-reader-read-form
-host-reader-read-form+text-incremental
-pushback-over-user-reader?
-reader-refill!
+host-reader-read
 #
 # Emitted for clojure.core.Vec's node writes (vector-of, 60-gvec.clj); no
 # array constructor exists here, so no Vec is ever built.

@@ -485,6 +485,15 @@
 ;; never reached. display-condition is display-exception's job here.
 (define (irritants-condition? c) (error-object? c))
 (define (who-condition? c) #f)
+;; The R6RS condition-kind predicates the reader's error handlers ask. Every
+;; condition here is an error: nothing raises a warning, and Gambit has no
+;; violation kind distinct from an error.
+(define (error? x) (condition? x))
+(define (violation? x) #f)
+(define (warning? x) #f)
+;; Every raise that reaches a handler here is non-continuable, so passing one on
+;; is a plain raise to the enclosing handler.
+(define (raise-continuable x) (raise x))
 (define (condition-who c) #f)
 (define (display-condition c . port)
   (display-exception c (if (pair? port) (car port) (current-output-port))))

@@ -56,6 +56,12 @@
 (define (rdr-nonconstituent? c)
   (or (char=? c #\@) (char=? c #\`) (char=? c #\~)))
 
+;; The JVM reader's isMacro: every character with a reader macro of its own,
+;; which is the terminator set's macros plus ' % and #. A numeric escape in a
+;; string stops at one of these (or whitespace, or the end) without an error.
+(define (rdr-macro-char? c)
+  (and (memv c '(#\" #\; #\' #\@ #\^ #\` #\~ #\( #\) #\[ #\] #\{ #\} #\\ #\% #\#)) #t))
+
 (define (rdr-digit? c) (and (char>=? c #\0) (char<=? c #\9)))
 (define (rdr-octal? c) (and (char>=? c #\0) (char<=? c #\7)))
 (define (rdr-all-digits? s from to)
@@ -373,12 +379,12 @@
 ;; opening quote already consumed; read to the closing quote, processing escapes.
 (define (rdr-read-string-lit s i end)
   (let loop ((i i) (acc '()))
-    (when (>= i end) (rdr-error s i "EOF while reading string"))
+    (when (>= i end) (rdr-eof-error s i "EOF while reading string"))
     (let ((c (string-ref s i)))
       (cond
         ((char=? c #\") (values (list->string (reverse acc)) (+ i 1)))
         ((char=? c #\\)
-         (when (>= (+ i 1) end) (rdr-error s i "EOF while reading string"))
+         (when (>= (+ i 1) end) (rdr-eof-error s i "EOF while reading string"))
          (let ((e (string-ref s (+ i 1))))
            (case e
              ((#\n) (loop (+ i 2) (cons #\newline acc)))
@@ -388,19 +394,13 @@
              ((#\") (loop (+ i 2) (cons #\" acc)))
              ((#\b) (loop (+ i 2) (cons #\backspace acc)))
              ((#\f) (loop (+ i 2) (cons #\page acc)))
-             ;; octal escape \ooo: 1-3 octal digits (Clojure's \0..\377), so \000
-             ;; is one null char, not \0 + literal "00".
-             ((#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7)
-              (let oct ((j (+ i 1)) (val 0) (cnt 0))
-                (if (and (fx<? cnt 3) (fx<? j end) (rdr-octal? (string-ref s j)))
-                    (oct (fx+ j 1) (fx+ (fx* val 8) (fx- (char->integer (string-ref s j)) 48)) (fx+ cnt 1))
-                    (begin
-                      (when (> val 255)
-                        (rdr-error s i "Octal escape sequence must be in range [0, 377]"))
-                      (loop j (cons (integer->char val) acc))))))
-              ((#\u)
-               (when (>= (+ i 5) end) (rdr-error s i "EOF while reading string"))
-               (let-values (((cp j) (rdr-hex->int s (+ i 2) 4)))
+             ((#\u)
+               ;; the first character after \u has to be a hex digit; at the end
+               ;; of input the JVM reads -1 and names it as the char U+FFFF
+               (let ((c1 (if (< (+ i 2) end) (string-ref s (+ i 2)) (integer->char #xFFFF))))
+                 (unless (rdr-hexdigit c1)
+                   (rdr-error s i (string-append "Invalid unicode escape: \\u" (string c1)))))
+               (let-values (((cp j) (rdr-string-escape-digits s i (+ i 2) end 16 4 #t)))
                  ;; A \u escape is a UTF-16 code unit. jolt chars are Unicode scalars,
                  ;; so combine a high+low surrogate pair into the one scalar char.
                  ;; Lone surrogates have no scalar — throw Invalid character constant
@@ -417,13 +417,44 @@
                    ((and (fx>=? cp #xD800) (fx<=? cp #xDFFF))
                     (rdr-error s i "Invalid character constant: lone surrogate \\u escape"))
                    (else (loop j (cons (integer->char cp) acc))))))
-             (else (rdr-error s i (string-append "Unsupported escape character: \\" (string e))
-)))))
+             ;; octal escape \ooo: 1-3 digits (Clojure's \0..\377), so \000 is one
+             ;; null char, not \0 + literal "00". Any decimal digit starts one, as
+             ;; on the JVM, which then rejects the digits that are not octal.
+             (else
+              (unless (char-numeric? e)
+                (rdr-error s i (string-append "Unsupported escape character: \\" (string e))))
+              (let-values (((val j) (rdr-string-escape-digits s i (+ i 1) end 8 3 #f)))
+                (when (> val 255)
+                  (rdr-error s i "Octal escape sequence must be in range [0, 377]."))
+                (loop j (cons (integer->char val) acc)))))))
         (else (loop (+ i 1) (cons c acc)))))))
+
+;; LispReader.readUnicodeChar over a stream: up to N digits in BASE from index K
+;; (the escape's backslash is at I). A run ends early at the end of input,
+;; whitespace or a macro character — an error only when EXACT (a \u escape takes
+;; all four) — and any other non-digit is an invalid digit. -> (values code j).
+(define (rdr-string-escape-digits s i k end base n exact?)
+  (let loop ((j k) (cnt 0) (acc 0))
+    (let ((c (and (< j end) (< cnt n) (string-ref s j))))
+      (cond
+        ((or (not c) (rdr-ws? c) (and (> cnt 0) (rdr-macro-char? c)))
+         (when (and exact? (< cnt n))
+           (rdr-error-class s i "java.lang.IllegalArgumentException"
+                            (keyword "read" "invalid-unicode")
+                            (string-append "Invalid character length: " (number->string cnt)
+                                           ", should be: " (number->string n))))
+         (values acc j))
+        (else
+         (let ((d (rdr-hexdigit c)))
+           (unless (and d (< d base))
+             (rdr-error-class s i "java.lang.IllegalArgumentException"
+                              (keyword "read" "invalid-unicode")
+                              (string-append "Invalid digit: " (string c))))
+           (loop (+ j 1) (+ cnt 1) (+ (* acc base) d))))))))
 
 ;; backslash already consumed; read a Clojure character literal.
 (define (rdr-read-char s i end start)
-  (when (>= i end) (rdr-error s i "EOF while reading char"))
+  (when (>= i end) (rdr-eof-error s i "EOF while reading character"))
   (let ((c0 (string-ref s i)))
     (if (char-alphabetic? c0)
         ;; named / unicode / single-letter: collect the alnum run
@@ -449,6 +480,19 @@
         ;; any other single char (\(  \\  \;  \space-as-symbol handled above)
         (values c0 (+ i 1)))))
 
+;; The digits of a \u / \o character name after its letter, in BASE; a
+;; non-digit is the JVM's IllegalArgumentException, named by that character.
+(define (rdr-char-token-digits name s start base)
+  (let loop ((k 1) (acc 0))
+    (if (= k (string-length name))
+        acc
+        (let* ((c (string-ref name k)) (d (rdr-hexdigit c)))
+          (unless (and d (< d base))
+            (rdr-error-class s start "java.lang.IllegalArgumentException"
+                             (keyword "read" "invalid-unicode")
+                             (string-append "Invalid digit: " (string c))))
+          (loop (+ k 1) (+ (* acc base) d))))))
+
 ;; START is the backslash's own index, threaded from the dispatch so every
 ;; raise below names the literal that was written. A character name is parsed out
 ;; of the source and then judged, so without it these are the reader's only errors
@@ -461,29 +505,29 @@
     ((string=? name "return") #\return)
     ((string=? name "backspace") #\backspace)
     ((string=? name "formfeed") #\page)
+    ;; LispReader.CharacterReader: the length is judged before the digits, and
+    ;; a surrogate is refused by the code it names, in lowercase hex.
     ((char=? (string-ref name 0) #\u)
-      (let* ((hex (substring name 1 (string-length name)))
-             (cp (string->number hex 16)))
-        (cond
-          ;; \uXXXX takes exactly 4 hex digits; a bad digit or wrong length is a
-          ;; reader error (ex-info), not a raw integer->char crash on #f.
-          ((not (= (string-length hex) 4))
-           (rdr-error-kind s start (keyword "read" "invalid-unicode")
-                           (string-append "Invalid unicode character escape length: "
-                                          (number->string (string-length hex)) ", should be: 4")))
-          ((not cp)
-           (rdr-error-kind s start (keyword "read" "invalid-unicode")
-                           (string-append "Invalid unicode character: \\u" hex)))
-          ((and (>= cp #xD800) (<= cp #xDFFF))
-           (rdr-error-kind s start (keyword "read" "invalid-unicode")
-                           "Invalid character constant: lone surrogate \\u escape"))
-          (else (integer->char cp)))))
+     (unless (= (string-length name) 5)
+       (rdr-error-class s start "java.lang.IllegalArgumentException"
+                        (keyword "read" "invalid-unicode")
+                        (string-append "Invalid unicode character: \\" name)))
+     (let ((cp (rdr-char-token-digits name s start 16)))
+       (when (and (>= cp #xD800) (<= cp #xDFFF))
+         (rdr-error-kind s start (keyword "read" "invalid-unicode")
+                         (string-append "Invalid character constant: \\u" (string-downcase (number->string cp 16)))))
+       (integer->char cp)))
     ((char=? (string-ref name 0) #\o)
-     (let ((v (string->number (substring name 1 (string-length name)) 8)))
-       (when (or (not v) (> v 255))
+     (let ((len (- (string-length name) 1)))
+       (when (> len 3)
          (rdr-error-kind s start (keyword "read" "invalid-character")
-                         "Octal escape sequence must be in range [0, 377]"))
-       (integer->char v)))
+                         (string-append "Invalid octal escape sequence length: "
+                                        (number->string len))))
+       (let ((v (rdr-char-token-digits name s start 8)))
+         (when (> v 255)
+           (rdr-error-kind s start (keyword "read" "invalid-character")
+                           "Octal escape sequence must be in range [0, 377]."))
+         (integer->char v))))
     (else (rdr-error-kind s start (keyword "read" "invalid-character")
                           (string-append "Unsupported character: \\" name)))))
 
@@ -589,11 +633,11 @@
 
 ;; --- collections ------------------------------------------------------------
 ;; Read forms until the close delimiter; returns (values reversed?-no list j).
-(define (rdr-read-seq s i end close)
-  (let loop ((i i) (acc '()))
+(define (rdr-read-seq s start end close)
+  (let loop ((i start) (acc '()))
     (let ((i (rdr-skip-ws s i end)))
       (cond
-        ((>= i end) (rdr-error s i "EOF while reading"))
+        ((>= i end) (rdr-eof-error s i (rdr-starting-at s start "EOF while reading")))
         ((char=? (string-ref s i) close) (values (reverse acc) (+ i 1)))
         (else
          (let-values (((form j) (rdr-read-form s i end)))
@@ -833,15 +877,12 @@
                             rdr-kw-ref-column col))))
     (if f (jolt-assoc (jolt-assoc m rdr-kw-err-file f) rdr-kw-ref-source f) m)))
 
-(define (rdr-error-kind s i kind msg)
-  (let-values (((line col) (rdr-line-col-at s i)))
-    (jolt-throw (jolt-ex-info msg (rdr-diagnostic-data kind line col)))))
-
-;; The same diagnostic, keeping a JVM throwable CLASS. Several read errors match a
-;; class a program can catch — an invalid number is a NumberFormatException on
-;; both runtimes, an invalid token a RuntimeException — and turning one into an
-;; ExceptionInfo to carry a kind would break every (catch NumberFormatException …)
-;; around a read.
+;; A read diagnostic keeps a JVM throwable CLASS. Every read error has one a
+;; program can catch — an invalid number is a NumberFormatException on both
+;; runtimes, a duplicate key an IllegalArgumentException, and everything else
+;; the reader raises itself (EOF, an unmatched delimiter, a bad escape) a plain
+;; RuntimeException — and an ExceptionInfo in their place broke every
+;; (catch RuntimeException …) that tells a read error from an ex-info one.
 ;;
 ;; make-jolt-ex-info-record directly, NOT jolt-host-throwable: that helper's
 ;; optional third argument is the CAUSE, not the data (the record's fields are
@@ -852,10 +893,21 @@
     (jolt-throw (make-jolt-ex-info-record
                  class msg jolt-nil (rdr-diagnostic-data kind line col) 0))))
 
+(define (rdr-error-kind s i kind msg)
+  (rdr-error-class s i "java.lang.RuntimeException" kind msg))
+
 ;; The kindless spelling, kept so the 37 existing call sites read unchanged while
 ;; they are given kinds one at a time.
 (define (rdr-error s i msg)
   (rdr-error-kind s i (keyword "read" "invalid-syntax") msg))
+
+;; The input ended inside a form. Its own kind because a line-numbering read
+;; places it differently from every other error: the reference's reader has
+;; consumed everything by then, so it stands at the end of input (see
+;; rdr-numbered-position).
+(define rdr-kw-eof-kind (keyword "read" "eof"))
+(define (rdr-eof-error s i msg)
+  (rdr-error-kind s i rdr-kw-eof-kind msg))
 
 ;; Raise a read diagnostic that has NO position. Only rdr-make-map and
 ;; rdr-make-set need this: they take an element LIST, and are also called by the
@@ -1032,16 +1084,34 @@
 (define (rdr-feature? kw)
   (and (keyword? kw) (jolt-nil? (let ((n (keyword-t-ns kw))) (if n n jolt-nil)))
        (and (member (keyword-t-name kw) rdr-features) #t)))
+(define rdr-reserved-features (list (keyword #f "else") (keyword #f "none")))
+;; LispReader.ConditionalReader: the body is a LIST, found after an optional @
+;; and whitespace, and a feature that matches must be followed by its form. A
+;; feature that does not match may end the list — the reference discards the
+;; form after it, finds the close, and stops.
 (define (rdr-read-reader-cond s i end)   ; i is past the '?'
-  (let* ((splice (and (< i end) (char=? (string-ref s i) #\@)))
-         (start (if splice (+ i 1) i)))
+  (when (>= i end) (rdr-eof-error s i "EOF while reading character"))
+  (let* ((splice (char=? (string-ref s i) #\@))
+         (start (let skip ((k (if splice (+ i 1) i)))
+                  (if (and (< k end) (rdr-ws? (string-ref s k))) (skip (+ k 1)) k))))
+    (when (>= start end) (rdr-eof-error s start "EOF while reading character"))
+    (unless (char=? (string-ref s start) #\()
+      (rdr-error s start "read-cond body must be a list"))
     (let-values (((form j) (rdr-read-form s start end)))
-      (when (rdr-eof? form) (rdr-error s i "EOF after #?"))
-      (let ((items (cond ((pvec? form) (seq->list form))
-                         ((or (cseq? form) (empty-list-t? form)) (seq->list form))
-                         (else '()))))
+      (let ((items (seq->list form)))
         (let loop ((xs items))
-          (cond ((or (null? xs) (null? (cdr xs))) (values rdr-eof j))  ; no match -> discard
+          (cond ((null? xs) (values rdr-eof j))  ; no match -> discard
+                ((memq (car xs) rdr-reserved-features)
+                 (rdr-error s start (string-append "Feature name " (jolt-pr-str (car xs))
+                                                   " is reserved.")))
+                ((and (null? (cdr xs)) (rdr-feature? (car xs)))
+                 (let ((line (rdr-numbered-line s (+ start 1))))
+                   (rdr-error s start
+                              (if line
+                                  (string-append "read-cond starting on line " (number->string line)
+                                                 " requires an even number of forms")
+                                  "read-cond requires an even number of forms."))))
+                ((null? (cdr xs)) (values rdr-eof j))
                 ((rdr-feature? (car xs))
                  (if splice
                      ;; #?@ — the matched value is a collection whose ITEMS splice
@@ -1175,6 +1245,10 @@
     (let-values (((nstok j) (rdr-read-token s i2 end)))
       (when (and spaced? (not auto?))
         (rdr-error s i2 "Namespaced map must specify a namespace"))
+      ;; nothing at all after #: or #:: — the reference reads a namespace FORM
+      ;; there and meets the end of input
+      (when (and (string=? nstok "") (>= j end))
+        (rdr-eof-error s j "EOF while reading"))
       (let skip-boundary ((k j))
         (cond
           ((and (< k end) (rdr-ws? (string-ref s k)))
@@ -1219,6 +1293,8 @@
                                                           "Unknown auto-resolved namespace alias: " nstok))))))
                             nstok)))
              (let-values (((es next) (rdr-read-seq s (+ k 1) end #\})))
+               (when (and (not (rdr-scan-mode)) (odd? (length es)))
+                 (rdr-error s k "Namespaced map literal must contain an even number of forms"))
                (values (rdr-make-map (rdr-nsmap-kvs mapns es)) next)))))))))
 
 ;; *read-eval* gate for #= — the cell is captured lazily (the var is def'd
@@ -1328,7 +1404,7 @@
             (values (vector-ref (pvec-v res) 0) j)))
         (let-values (((form j) (rdr-read-form s (+ i 1) end)))
           (when (rdr-eof? form)
-            (rdr-error s i (string-append "EOF after #" (string c))))
+            (rdr-eof-error s i "EOF while reading"))
           (values (jolt-invoke fn form) j)))))
 
 ;; --- #$"…" — string interpolation -------------------------------------------
@@ -1405,7 +1481,7 @@
       (char-alphabetic? c)))
 
 (define (rdr-read-dispatch s i end)      ; i points just past the '#'
-  (when (>= i end) (rdr-error s i "EOF after #"))
+  (when (>= i end) (rdr-eof-error s i "EOF while reading character"))
   (let ((c (string-ref s i)))
     (when (and (rdr-edn-mode) (not (rdr-edn-dispatch-char? c)))
       (rdr-error s i (string-append "No dispatch macro for: " (string c))))
@@ -1426,7 +1502,7 @@
          (values (jolt-re-pattern src) j)))
       ((char=? c #\_)                    ; #_ discard the next form
         (let-values (((d j) (rdr-read-form s (+ i 1) end)))
-          (when (rdr-eof? d) (rdr-error s i "EOF after #_"))
+          (when (rdr-eof? d) (rdr-eof-error s i "EOF while reading"))
           ;; edn validates the discarded element (its tags go through the same
           ;; :readers/:default pipeline; an unreadable one throws)
           (let ((cb (rdr-discard-cb)))
@@ -1444,32 +1520,39 @@
        ;; Reported as the tagged literal "#<" running to EOF before.
        (rdr-error s i "Unreadable form"))
       ((char=? c #\')                    ; #'x var-quote -> (var x)
-       (let-values (((form j) (rdr-read-form s (+ i 1) end)))
-         (values (jolt-list (jolt-symbol #f "var") form) j)))
+       (rdr-wrap s (+ i 1) end (jolt-symbol #f "var")))
       ((char=? c #\^)                    ; #^meta — deprecated metadata syntax = ^meta
        (let-values (((mform j) (rdr-read-form s (+ i 1) end)))
          (let-values (((target k) (rdr-read-form s j end)))
            (when (rdr-eof? target)
-             (rdr-error s j "EOF after #^meta"))
+             (rdr-eof-error s j "EOF while reading"))
            (values (rdr-attach-meta target (rdr-meta-map mform)) k))))
       ((char=? c #\#)                    ; ## symbolic value: ##Inf / ##-Inf / ##NaN
-       (let-values (((tok j) (rdr-read-token s (+ i 1) end)))
-         (values (cond ((string=? tok "Inf") +inf.0)
-                       ((string=? tok "-Inf") -inf.0)
-                       ((string=? tok "NaN") +nan.0)
-                       (else (rdr-error s j (string-append "unknown ## literal: " tok)
-)))
-                 j)))
+       ;; the reference reads a whole FORM here, so what follows ## may be any
+       ;; form, and only a symbol can name a symbolic value
+       (let-values (((o j) (rdr-read-form s (+ i 1) end)))
+         (when (rdr-eof? o) (rdr-eof-error s j "EOF while reading"))
+         (let ((name (and (symbol-t? o) (not (symbol-t-ns o)) (symbol-t-name o))))
+           (values (cond ((equal? name "Inf") +inf.0)
+                         ((equal? name "-Inf") -inf.0)
+                         ((equal? name "NaN") +nan.0)
+                         ((symbol-t? o)
+                          (rdr-error s (+ i 1) (string-append "Unknown symbolic value: ##"
+                                                              (jolt-str-render-one o))))
+                         (else
+                          (rdr-error s (+ i 1) (string-append "Invalid token: ##"
+                                                              (jolt-str-render-one o)))))
+                   j))))
       ((char=? c #\=)                    ; #=form read-eval: evaluate at READ time
        ;; The clojure reader's EvalReader, gated by *read-eval* (clj-uuid
        ;; computes its bit masks with #=). EDN has no = dispatch. The var cell
        ;; and the eval entry point live in later-loaded files; both resolve at
        ;; call time, and by the time user source is read the runtime is up.
        ;; EDN has no = dispatch; the gate above rejects it there.
+       (unless (rdr-read-eval?)
+         (rdr-error s i "EvalReader not allowed when *read-eval* is false."))
        (let-values (((form j) (rdr-read-form s (+ i 1) end)))
-         (when (rdr-eof? form) (rdr-error s i "EOF after #="))
-         (unless (rdr-read-eval?)
-           (rdr-error s i "EvalReader not allowed when *read-eval* is false."))
+         (when (rdr-eof? form) (rdr-eof-error s i "EOF while reading"))
          (values (jolt-compile-eval-form form (chez-current-ns)) j)))
       ((char=? c #\?)                    ; #?(...) / #?@(...) reader conditional
        (rdr-read-reader-cond s (+ i 1) end))
@@ -1483,7 +1566,7 @@
       (else                              ; #tag form -> tagged {:tag :#tag :form ...}
        (let-values (((tok j) (rdr-read-token s i end)))
          (let-values (((form k) (rdr-read-form s j end)))
-           (when (rdr-eof? form) (rdr-error s j "EOF after #tag"))
+           (when (rdr-eof? form) (rdr-eof-error s j "EOF while reading"))
            (if (rdr-record-tag? tok)       ; #ns.Type{..}/[..] record literal
                (values (rdr-record-ctor-form tok form) k)
                (values (rdr-make-tagged (keyword #f (string-append "#" tok)) form) k))))))))
@@ -1492,14 +1575,14 @@
 ;; every other backslash sequence is kept verbatim (regex engine semantics).
 (define (rdr-read-regex s i end)
   (let loop ((i i) (acc '()))
-    (when (>= i end) (rdr-error s i "EOF while reading regex"))
+    (when (>= i end) (rdr-eof-error s i "EOF while reading regex"))
     (let ((c (string-ref s i)))
       (cond
         ((char=? c #\") (values (list->string (reverse acc)) (+ i 1)))
         ;; \" delimits without ending the literal, and the pattern SOURCE keeps
         ;; the backslash — (pr-str #"a\"b") round-trips as #"a\"b" like the JVM.
         ((char=? c #\\)
-         (when (>= (+ i 1) end) (rdr-error s i "EOF while reading regex"))
+         (when (>= (+ i 1) end) (rdr-eof-error s i "EOF while reading regex"))
          (loop (+ i 2) (cons (string-ref s (+ i 1)) (cons #\\ acc))))
         (else (loop (+ i 1) (cons c acc)))))))
 
@@ -1551,7 +1634,7 @@
                (let ((lst (apply jolt-list es)))
                  (values (if (rdr-suppress-pos)
                              lst
-                             (let-values (((line col) (rdr-line-col-at s i)))
+                             (let-values (((line col) (rdr-form-line-col s i)))
                                (rdr-attach-pos lst line col)))
                          j))))
             ((char=? c #\[) (let-values (((es j) (rdr-read-seq s (+ i 1) end #\])))
@@ -1597,7 +1680,7 @@
             ;; — edamame names its own resolver that and :refers it in.
             ((char=? c #\`)
              (let-values (((form j) (rdr-read-form s (+ i 1) end)))
-               (when (rdr-eof? form) (rdr-error s i "EOF after `"))
+               (when (rdr-eof? form) (rdr-eof-error s i "EOF while reading"))
                (values (if (rdr-self-eval-literal? form)
                            form
                            (jolt-list (jolt-symbol "clojure.core" "syntax-quote") form))
@@ -1606,6 +1689,10 @@
             ;; ~ / ~@ read as clojure.core/unquote(-splicing), like the JVM reader —
             ;; so code that inspects pattern/template data (core.logic's defne) sees
             ;; the qualified symbol it expects.
+            ;; ~ looks at the next character for an @ first, so ~ at the end of
+            ;; input is a character EOF on the JVM
+            ((and (char=? c #\~) (>= (+ i 1) end))
+             (rdr-eof-error s (+ i 1) "EOF while reading character"))
             ((char=? c #\~)
              (if (and (< (+ i 1) end) (char=? (string-ref s (+ i 1)) #\@))
                  (rdr-wrap s (+ i 2) end (jolt-symbol "clojure.core" "unquote-splicing"))
@@ -1614,7 +1701,7 @@
              (let-values (((mform j) (rdr-read-form s (+ i 1) end)))
                (let-values (((target k) (rdr-read-form s j end)))
                  (when (rdr-eof? target)
-                   (rdr-error s i "EOF after ^meta"))
+                   (rdr-eof-error s i "EOF while reading"))
                  (values (rdr-attach-meta target (rdr-meta-map mform)) k))))
             (else
              (let-values (((tok j) (rdr-read-token-lead s i end)))
@@ -1629,7 +1716,7 @@
 (define (rdr-wrap s i end head)
   (let-values (((form j) (rdr-read-form s i end)))
     (when (rdr-eof? form)
-      (rdr-error s i "EOF while reading reader macro"))
+      (rdr-eof-error s i "EOF while reading"))
     (values (jolt-list head form) j)))
 
 ;; --- form -> data -----------------------------------------------------------
@@ -2047,22 +2134,25 @@
       (rdr-error s k (string-append "Unmatched delimiter: " (string (string-ref s k)))))
     (let-values (((form j) (rdr-read-form s k end)))
       (when (rdr-splice-t? form)
-        (jolt-throw (jolt-ex-info
-                     "Reader conditional splicing not allowed at the top level."
-                     empty-pmap)))
+        (rdr-error s k "Reader conditional splicing not allowed at the top level."))
       (values form j))))
 
 ;; clojure.core/read-string: first form, or nil for blank / comment-only input
 ;; (parse-string wart, matched deliberately). jolt-read-form-raw keeps set FORMS
 ;; for the compiler spine (compile-eval); the data seam converts them to sets.
 (define (jolt-read-form-raw s)
-  ;; A DATA read (rdr-call-as-data): the reader's file is off and the error
-  ;; carries no phase. The file paths read through rdr-read-top (loader.ss,
-  ;; emit-image.ss ei-read-all) and load-string (compile-eval.ss) are source.
+  (let ((form (rdr-read-top-data s)))
+    (if (rdr-eof? form) jolt-nil form)))
+;; The first form of s, or rdr-eof — the sentinel keeps end of input apart from
+;; a form that IS nil. A DATA read (rdr-call-as-data): the reader's file is off
+;; and the error carries no phase. The file paths read through rdr-read-top
+;; (loader.ss, emit-image.ss ei-read-all) and load-string (compile-eval.ss) are
+;; source.
+(define (rdr-read-top-data s)
   (rdr-call-as-data
    (lambda ()
      (let-values (((form j) (rdr-read-top s 0 (string-length s))))
-       (if (rdr-eof? form) jolt-nil form)))))
+       form))))
 
 ;; the edn seam: strict mode (no auto-resolved keywords), each #_ discard handed
 ;; to the callback for tag validation, and a distinct EOF sentinel so the edn
@@ -2089,11 +2179,14 @@
     ((s) (let ((form (jolt-read-form-raw s)))
            (if (jolt-nil? form) form (rdr-form->data form))))
     ((opts s)
-     (let ((form (if (jolt-nil? s) jolt-nil (jolt-read-form-raw s))))
-       (cond ((not (jolt-nil? form)) (rdr-form->data form))
+     (let ((form (if (jolt-nil? s) rdr-eof (rdr-read-top-data s))))
+       (cond ((not (rdr-eof? form)) (rdr-form->data form))
              ((and (pmap? opts) (jolt-contains? opts rdr-kw-eof))
               (jolt-get opts rdr-kw-eof))
-             (else (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap))))))))
+             (else
+              (let ((s (if (string? s) s "")))
+                (rdr-call-as-data
+                 (lambda () (rdr-eof-error s (string-length s) "EOF while reading"))))))))))
 
 ;; __parse-next: [form rest-of-string] or nil when only whitespace/comments left.
 (define (jolt-parse-next s)
@@ -2112,11 +2205,212 @@
 ;; host reader read that way (java/io.ss host-reader-read-form) was quadratic.
 ;; Scheme-level, for that one caller: the jolt-visible __parse-next is unchanged.
 (define (rdr-parse-at s i)
-  (rdr-call-as-data
-   (lambda ()
-     (let ((end (string-length s)))
-       (let-values (((form j) (rdr-read-top s i end)))
-         (and (not (rdr-eof? form)) (cons (rdr-form->data form) j)))))))
+  (rdr-read-one s i #f #f #f #f))
+
+;; --- reading for a LineNumberingPushbackReader ------------------------------
+;; A read from a clojure.lang.LineNumberingPushbackReader (a REPL's *in*,
+;; with-in-str, tools.reader's source readers) is the one read where the
+;; reference's reader knows lines. An unclosed collection names the line it
+;; opened on ("EOF while reading, starting at line 2"), and LispReader.read wraps
+;; ANY error in a LispReader$ReaderException whose message is the cause's
+;; toString and whose ex-data is the reader's own line and column
+;; (EdnReader$ReaderException the same, with no data). Everywhere else the
+;; reference raises the bare error, and so does this reader.
+;;
+;; The reader here works over a string, so a line-numbering read hands it an
+;; ORIGIN: the string, an index into it, and the stream's counters at that index
+;; — #(s index line column skip-lf pending cached-origin-position). Every line
+;; and column is derived from the text past the origin.
+;;
+;; The origin rides in rdr-data-read — #t for any other data read, the origin
+;; vector for a numbered one, truthy either way — rather than a parameter of its
+;; own: a read loop pays a thread parameter's binding per form (~60ns), and the
+;; data read binds that one already.
+(define (rdr-numbering)
+  (let ((d (rdr-data-read))) (and (vector? d) d)))
+
+;; The counters after reading s[a, b) the way LineNumberingPushbackReader counts:
+;; its LineNumberReader folds \r, \n and \r\n to one \n and ends a line for each
+;; (skip-lf marks the \n of a \r\n, already counted); a newline puts the column
+;; back to 1 and anything else moves it on. PENDING is JDK 21's end-of-input rule:
+;; the stream ending after anything but a line terminator ends one more line.
+(define (lnpr-advance s a b line col skip-lf pending)
+  (let loop ((k a) (line line) (col col) (skip-lf skip-lf) (pending pending))
+    (if (fx>=? k b)
+        (values line col skip-lf pending)
+        (let ((c (string-ref s k)))
+          (cond
+            ((and skip-lf (char=? c #\newline)) (loop (fx+ k 1) line col #f #f))
+            ((or (char=? c #\newline) (char=? c #\return))
+             (loop (fx+ k 1) (fx+ line 1) 1 (char=? c #\return) #f))
+            (else (loop (fx+ k 1) line (fx+ col 1) #f #t)))))))
+
+(define (rdr-origin-advance o k)
+  (lnpr-advance (vector-ref o 0) (vector-ref o 1) (fxmax k (vector-ref o 1))
+                (vector-ref o 2) (vector-ref o 3) (vector-ref o 4) (vector-ref o 5)))
+
+;; The stream's line at index K of s, when this read numbers lines — the line
+;; the reference's reader stood on after reading the character before K. #f for
+;; any other read, and for a nested read of some other string.
+(define (rdr-numbered-line s k)
+  (let ((o (rdr-numbering)))
+    (and o (eq? (vector-ref o 0) s)
+         (let-values (((line col skip-lf pending) (rdr-origin-advance o k))) line))))
+
+;; The :line/:column a form read at index I carries. From a line-numbering
+;; reader that is the STREAM's position, as LispReader takes it from the reader's
+;; own counters — so a form re-read under a setLineNumber (clojure.main/
+;; renumbering-read) keeps the line it came from. Otherwise it is the string's.
+;;
+;; The origin's own string position is looked up once per read, BEFORE any form
+;; position, and kept in the origin: rdr-line-col-at's cursor only walks forward,
+;; and asking for the origin after a later index sent it back to the start of the
+;; string on every read — quadratic over a with-in-str read loop (make ioscaling).
+(define (rdr-origin-string-pos o s)
+  (or (vector-ref o 6)
+      (let ((p (if (fx=? (vector-ref o 1) 0)
+                   (cons 1 1)
+                   (let-values (((l0 c0) (rdr-line-col-at s (vector-ref o 1)))) (cons l0 c0)))))
+        (vector-set! o 6 p)
+        p)))
+(define (rdr-form-line-col s i)
+  (let ((o (rdr-numbering)))
+    (if (and o (eq? (vector-ref o 0) s))
+        (let* ((p (rdr-origin-string-pos o s)) (l0 (car p)) (c0 (cdr p)))
+          (let-values (((line col) (rdr-line-col-at s i)))
+            (values (+ (vector-ref o 2) (- line l0))
+                    (if (= line l0) (+ (vector-ref o 3) (- col c0)) col))))
+        (rdr-line-col-at s i))))
+
+;; START is just past a collection's open delimiter.
+(define (rdr-starting-at s start msg)
+  (let ((line (rdr-numbered-line s start)))
+    (if line (string-append msg ", starting at line " (number->string line)) msg)))
+
+;; The inverse of rdr-line-col-at: the index a diagnostic's line and column name.
+(define (rdr-index-at s line col)
+  (let ((n (string-length s)))
+    (let loop ((k 0) (l 1))
+      (cond ((fx=? l line) (fxmin n (fx+ k (fx- col 1))))
+            ((fx>=? k n) n)
+            ((char=? (string-ref s k) #\newline) (loop (fx+ k 1) (fx+ l 1)))
+            (else (loop (fx+ k 1) l))))))
+
+;; Where the stream stands for the ReaderException, as (values line column). An
+;; EOF error stands where the reference's does: past the whole input, the end
+;; counted as a line end and the column back at 1. Any other read error stands
+;; at its own diagnostic position; the reference's stands just past what its
+;; reader consumed, which for a token or a whole collection is further on (a
+;; documented divergence). An error that is not the reader's — a data reader or
+;; #= throwing — stands at the origin.
+(define (rdr-numbered-position o e)
+  (let ((d (rdr-read-error-of e)) (s (vector-ref o 0)))
+    (cond
+      ((and d (eq? (jolt-get d rdr-kw-err-kind jolt-nil) rdr-kw-eof-kind))
+       (let-values (((line col skip-lf pending) (rdr-origin-advance o (string-length s))))
+         (values (if pending (+ line 1) line) 1)))
+      ((and d (fixnum? (jolt-get d rdr-kw-err-line jolt-nil)))
+       (let-values (((line col skip-lf pending)
+                     (rdr-origin-advance o (rdr-index-at s (jolt-get d rdr-kw-err-line jolt-nil)
+                                                         (jolt-get d rdr-kw-err-column jolt-nil)))))
+         (values line col)))
+      (else (values (vector-ref o 2) (vector-ref o 3))))))
+
+(define rdr-kw-clj-line (keyword "clojure.error" "line"))
+(define rdr-kw-clj-column (keyword "clojure.error" "column"))
+;; LispReader$ReaderException(line, column, cause): its message is the cause's
+;; toString, "java.lang.RuntimeException: EOF while reading".
+(define (rdr-reader-exception o e edn?)
+  (let-values (((line col) (rdr-numbered-position o e)))
+    (let ((v (jolt-unwrap-throw e)))
+      (make-jolt-ex-info-record
+       (if edn? "clojure.lang.EdnReader$ReaderException" "clojure.lang.LispReader$ReaderException")
+       (jolt-str-render-one v)
+       v
+       (if edn? jolt-nil (jolt-hash-map rdr-kw-clj-line line rdr-kw-clj-column col))
+       0))))
+
+;; Where a stream reading s from index I stands after the read error E: past
+;; the offending token, as the reference's reader stands past what it consumed
+;; — past the whole input for an EOF, one character for a stray delimiter, the
+;; token for anything that starts one — and never at I, so a REPL that keeps
+;; reading after an error moves on instead of raising the same one forever.
+;; An error with no position (not the reader's) consumes nothing.
+(define (rdr-error-resume-index s i e)
+  (let* ((v (jolt-unwrap-throw e))
+         (v (if (and (jolt-ex-info-record? v)
+                     (member (jolt-ex-info-record-class-name v)
+                             '("clojure.lang.LispReader$ReaderException"
+                               "clojure.lang.EdnReader$ReaderException")))
+                (jolt-ex-info-record-cause v)
+                v))
+         (d (rdr-read-error-of v))
+         (n (string-length s)))
+    (cond
+      ((not d) i)
+      ((eq? (jolt-get d rdr-kw-err-kind jolt-nil) rdr-kw-eof-kind) n)
+      ((fixnum? (jolt-get d rdr-kw-err-line jolt-nil))
+       (let ((k (fxmax i (rdr-index-at s (jolt-get d rdr-kw-err-line jolt-nil)
+                                       (jolt-get d rdr-kw-err-column jolt-nil)))))
+         (if (or (fx>=? k n) (rdr-terminator? (string-ref s k)))
+             (fxmin n (fx+ k 1))
+             (let loop ((j (fx+ k 1)))
+               (if (or (fx>=? j n) (rdr-terminator? (string-ref s j))) j (loop (fx+ j 1)))))))
+      (else (fxmin n (fx+ i 1))))))
+
+;; Run THUNK; if it raises, hand the condition to ON-ERROR (for its effect)
+;; and let it propagate unchanged. A handler rather than a guard, for the
+;; reason rdr-read-one gives: nothing is captured when nothing fails.
+(define (rdr-on-read-error on-error thunk)
+  (with-exception-handler
+    (lambda (e) (unless (warning? e) (on-error e)) (raise-continuable e))
+    thunk))
+
+;; Is E an EOF read error — bare, or the cause of a ReaderException?
+(define (rdr-eof-error? e)
+  (let* ((v (jolt-unwrap-throw e))
+         (v (if (and (jolt-ex-info-record? v)
+                     (member (jolt-ex-info-record-class-name v)
+                             '("clojure.lang.LispReader$ReaderException"
+                               "clojure.lang.EdnReader$ReaderException")))
+                (jolt-ex-info-record-cause v)
+                v))
+         (d (rdr-read-error-of v)))
+    (and d (eq? (jolt-get d rdr-kw-err-kind jolt-nil) rdr-kw-eof-kind))))
+
+;; ONE form of s at index i, as DATA -> (form . next-index), or #f at end of
+;; input when EOF-ERROR? is false (true raises "EOF while reading" there). EDN?
+;; reads clojure.edn's grammar, CB validating each #_ discard, and hands the form
+;; back raw for clojure.edn's own tag pass. ORIGIN numbers the read (see above),
+;; and with one every error that escapes is raised as a ReaderException.
+(define (rdr-read-one s i origin edn? cb eof-error?)
+  ;; with-exception-handler, not guard: a guard captures a continuation on every
+  ;; read, which a read loop pays per form whether anything fails or not. The
+  ;; handler runs where the error was raised — inside the read, rdr-numbering
+  ;; still bound — and raises the wrapper from there.
+  (if origin
+      (with-exception-handler
+        (lambda (e)
+          (if (or (jolt-throw-condition? e) (error? e) (violation? e))
+              (jolt-throw (rdr-reader-exception origin e edn?))
+              (raise-continuable e)))
+        (lambda () (rdr-read-one-mode s i origin edn? cb eof-error?)))
+      (rdr-read-one-mode s i #f edn? cb eof-error?)))
+(define (rdr-read-one-mode s i origin edn? cb eof-error?)
+  (if edn?
+      (parameterize ((rdr-edn-mode #t) (rdr-discard-cb cb))
+        (rdr-read-one-data s i origin edn? eof-error?))
+      (rdr-read-one-data s i origin edn? eof-error?)))
+;; rdr-call-as-data's bindings, the origin carried in rdr-data-read (see
+;; rdr-numbering).
+(define (rdr-read-one-data s i origin edn? eof-error?)
+  (parameterize ((rdr-source-file #f) (rdr-data-read (or origin #t)))
+    (when origin (rdr-origin-string-pos origin s))
+    (let ((end (string-length s)))
+      (let-values (((form j) (rdr-read-top s i end)))
+        (cond ((not (rdr-eof? form)) (cons (if edn? form (rdr-form->data form)) j))
+              (eof-error? (rdr-eof-error s end "EOF while reading"))
+              (else #f))))))
 
 ;; __read-tagged: apply a built-in data reader to an already-read form. The tag
 ;; is the :#name keyword the reader produced; #uuid/#inst reuse the inst-time ctors.
@@ -2162,6 +2456,43 @@
 (def-var! "clojure.core" "read-string" jolt-read-string)
 (def-var! "clojure.core" "__parse-next" jolt-parse-next)
 (def-var! "clojure.core" "__parse-next-from" jolt-parse-next-from)
+
+;; The *in* readers of 50-io.clj stand in for the LineNumberingPushbackReader a
+;; JVM *in* is (stdin, with-in-str), so they number their reads the same way. A
+;; reader keeps a numbering: the counters its buffer's index 0 stands at, as a
+;; mutable #(line column skip-lf pending), advanced over whatever text it drops.
+(define (jolt-numbering) (vector 1 1 #f #f))
+(define (numbering-origin n s)
+  (vector s 0 (vector-ref n 0) (vector-ref n 1) (vector-ref n 2) (vector-ref n 3) #f))
+(define (jolt-numbering-advance! n s a b)
+  (let-values (((line col skip-lf pending)
+                (lnpr-advance s a b (vector-ref n 0) (vector-ref n 1) (vector-ref n 2) (vector-ref n 3))))
+    (vector-set! n 0 line) (vector-set! n 1 col) (vector-set! n 2 skip-lf) (vector-set! n 3 pending)
+    jolt-nil))
+;; __parse-next-from, numbered: [form next-index], nil at end of input, and any
+;; error a LispReader$ReaderException — after RESUME! is handed the index the
+;; stream stands at past the error (rdr-error-resume-index).
+(define (jolt-parse-next-numbered s i n resume!)
+  (let ((r (rdr-on-read-error
+            (lambda (e) (jolt-invoke resume! (rdr-error-resume-index s i e)))
+            (lambda () (rdr-read-one s i (numbering-origin n s) #f #f #f)))))
+    (if r (jolt-vector (car r) (cdr r)) jolt-nil)))
+;; Raise end of input for a reader whose buffer is s: the reference's
+;; ReaderException, standing past the whole input.
+(define (jolt-read-eof s n)
+  (rdr-read-one s (string-length s) (numbering-origin n s) #f #f #t))
+(def-var! "clojure.core" "__numbering" jolt-numbering)
+(def-var! "clojure.core" "__numbering-advance!" jolt-numbering-advance!)
+(def-var! "clojure.core" "__parse-next-numbered" jolt-parse-next-numbered)
+(def-var! "clojure.core" "__read-eof" jolt-read-eof)
+;; java.lang.String.trim: strips every char at or below U+0020 from both ends.
+;; read+string trims the text it returns with it.
+(define (jstring-trim s)
+  (let* ((n (string-length s))
+         (a (let loop ((k 0)) (if (and (fx<? k n) (char<=? (string-ref s k) #\space)) (loop (fx+ k 1)) k)))
+         (b (let loop ((k n)) (if (and (fx>? k a) (char<=? (string-ref s (fx- k 1)) #\space)) (loop (fx- k 1)) k))))
+    (substring s a b)))
+(def-var! "clojure.core" "__jtrim" jstring-trim)
 (def-var! "clojure.core" "__read-tagged" jolt-read-tagged)
 ;; __read-form-raw: the read form WITHOUT building values — set/tagged literals
 ;; stay FORMS. clojure.edn reads this so it applies a #tag through its :readers/

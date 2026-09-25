@@ -11,8 +11,12 @@
 ;; atom-held buffer, so (read) consumes its form and a following (read-line)
 ;; returns the REST of that line — as in Clojure.
 ;;
-;; Forms are parsed by the host seam __parse-next-from (one form + the index
-;; just past it, nil when only whitespace remains). The readers hold a CURSOR
+;; Forms are parsed by the host seam __parse-next-numbered (one form + the index
+;; just past it, nil when only whitespace remains). A JVM *in* is a
+;; LineNumberingPushbackReader, so these readers number their reads the same
+;; way: each keeps the counters (__numbering) its buffer's index 0 stands at, a
+;; read error escapes as a LispReader$ReaderException at the stream's line and
+;; column, and an unclosed collection names the line it opened on. The readers hold a CURSOR
 ;; into their input rather than the shrinking rest of the string: re-copied
 ;; tails made line/form drains O(input x items) (`make ioscaling` gates the
 ;; shape). Known wart shared with the parse contract: input that is only a
@@ -29,8 +33,11 @@
   (-read-line [rdr] "Next line, newline stripped; nil at EOF.")
   (-read-form [rdr] "Next form; the reader-eof sentinel at end of input.")
   (-read+string [rdr eof-error? eof-value]
-    "Next form plus the exact text consumed (leading whitespace included), as
+    "Next form plus the text consumed, trimmed as String.trim does, as
     [form text]. On EOF: throws, or returns [eof-value \"\"] when eof-error? is false.")
+  (-read-eof [rdr]
+    "Raises end of input, as a read of this reader does when it finds nothing:
+    the LispReader$ReaderException standing past the input.")
   (-read-char [rdr]
     "Next character as a code point; -1 at end of input — java.io.Reader's
     .read contract, which clojure.main/repl-read walks the input with.")
@@ -55,7 +62,8 @@
   "A reader over string s (the with-in-str expansion calls this)."
   [s]
   (let [pos (atom 0)
-        line-start (atom [true true])]
+        line-start (atom [true true])
+        numbering (__numbering)]
     (reify IReader
       (-read-line [_]
         ;; \n, \r and \r\n all end a line, and none of them is part of it —
@@ -67,7 +75,7 @@
             (reset! pos (nth r 1))
             (nth r 0))))
       (-read-form [_]
-        (let [r (__parse-next-from s @pos)]
+        (let [r (__parse-next-numbered s @pos numbering #(reset! pos %))]
           (if (nil? r)
             (do (line-start! line-start true) reader-eof)
             (do (reset! pos (nth r 1))
@@ -75,15 +83,17 @@
                 (nth r 0)))))
       (-read+string [_ eof-error? eof-value]
         (let [p @pos
-              r (__parse-next-from s p)]
+              r (__parse-next-numbered s p numbering #(reset! pos %))]
           (if (nil? r)
             (do (line-start! line-start true)
+                (reset! pos (count s))
                 (if eof-error?
-                  (throw (ex-info "EOF while reading" {}))
+                  (__read-eof s numbering)
                   [eof-value ""]))
             (do (reset! pos (nth r 1))
                 (line-start! line-start false)
-                [(nth r 0) (subs s p (nth r 1))]))))
+                [(nth r 0) (__jtrim (subs s p (nth r 1)))]))))
+      (-read-eof [_] (__read-eof s numbering))
       (-read-char [_]
         (let [p @pos]
           (if (< p (count s))
@@ -105,6 +115,14 @@
 ;; incremental), but cost is bounded by that form, never the whole session.
 (def ^:private stdin-buf (atom ["" 0]))
 (def ^:private stdin-line-start (atom [true true]))
+;; the counters index 0 of stdin-buf stands at: whatever the buffer drops, and
+;; every line read around it, moves them on
+(def ^:private stdin-numbering (__numbering))
+(defn- stdin-drop! [s p] (__numbering-advance! stdin-numbering s 0 p))
+(defn- stdin-line! [line]
+  (when-not (nil? line)
+    (let [l (str line "\n")] (__numbering-advance! stdin-numbering l 0 (count l))))
+  line)
 
 (def ^:dynamic *in*
   (reify IReader
@@ -116,20 +134,23 @@
         (if (< p (count s))
           (let [i (str-find "\n" s p)]
             (if (nil? i)
-              (do (reset! stdin-buf ["" 0]) (subs s p))
+              (do (stdin-drop! s (count s)) (reset! stdin-buf ["" 0]) (subs s p))
               (do (reset! stdin-buf [s (inc i)]) (subs s p i))))
-          (__stdin-read-line))))
+          (do (stdin-drop! s (count s))
+              (reset! stdin-buf ["" 0])
+              (stdin-line! (__stdin-read-line))))))
     (-read-form [_]
       (loop []
         (let [sp @stdin-buf
               s (nth sp 0)
               p (nth sp 1)
-              r (__parse-next-from s p)]
+              r (__parse-next-numbered s p stdin-numbering #(reset! stdin-buf [s %]))]
           (if (nil? r)
             (let [line (__stdin-read-line)]
               (if (nil? line)
                 (do (line-start! stdin-line-start true) reader-eof)
-                (do (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
+                (do (stdin-drop! s p)
+                    (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
             (do (reset! stdin-buf [s (nth r 1)])
                 (line-start! stdin-line-start false)
                 (nth r 0))))))
@@ -138,18 +159,20 @@
         (let [sp @stdin-buf
               s (nth sp 0)
               p (nth sp 1)
-              r (__parse-next-from s p)]
+              r (__parse-next-numbered s p stdin-numbering #(reset! stdin-buf [s %]))]
           (if (nil? r)
             (let [line (__stdin-read-line)]
               (if (nil? line)
                 (do (line-start! stdin-line-start true)
                     (if eof-error?
-                      (throw (ex-info "EOF while reading" {}))
+                      (__read-eof s stdin-numbering)
                       [eof-value ""]))
-                (do (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
+                (do (stdin-drop! s p)
+                    (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
             (do (reset! stdin-buf [s (nth r 1)])
                 (line-start! stdin-line-start false)
-                [(nth r 0) (subs s p (nth r 1))])))))
+                [(nth r 0) (__jtrim (subs s p (nth r 1)))])))))
+    (-read-eof [_] (__read-eof (nth @stdin-buf 0) stdin-numbering))
     ;; A character comes off the same buffer the form and line ops read, so the
     ;; three interleave: clojure.main/repl-read skips whitespace character by
     ;; character, unreads the one that ended the skip, and then reads a form
@@ -168,7 +191,8 @@
             (let [line (__stdin-read-line)]
               (if (nil? line)
                 (do (line-start! stdin-line-start true) -1)
-                (do (reset! stdin-buf [(str line "\n") 0]) (recur))))))))
+                (do (stdin-drop! s (count s))
+                    (reset! stdin-buf [(str line "\n") 0]) (recur))))))))
     (-unread-char [_ _c]
       (let [sp @stdin-buf
             p (nth sp 1)]
@@ -198,19 +222,19 @@
   ([stream]
    (let [v (-read-form stream)]
      (if (= v reader-eof)
-       (throw (ex-info "EOF while reading" {}))
+       (-read-eof stream)
        v)))
   ([opts stream]
    (let [v (-read-form stream)]
      (if (= v reader-eof)
        (if (contains? opts :eof)
          (get opts :eof)
-         (throw (ex-info "EOF while reading" {})))
+         (-read-eof stream))
        v)))
   ([stream eof-error? eof-value]
    (let [v (-read-form stream)]
      (if (= v reader-eof)
-       (if eof-error? (throw (ex-info "EOF while reading" {})) eof-value)
+       (if eof-error? (-read-eof stream) eof-value)
        v)))
   ([stream eof-error? eof-value _recursive?]
    (read stream eof-error? eof-value)))

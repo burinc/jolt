@@ -293,7 +293,7 @@
     (cond (= s "true") true (= s "false") false :else nil)
     (throw (IllegalArgumentException. (str "parse-boolean requires a string, got: " s)))))
 
-(defn newline [] (print "\n") nil)
+(defn newline [] (__append "\n") nil)
 
 ;; seque: jolt is single-threaded eager here — the queue is a no-op and the
 ;; coll passes through.

@@ -478,8 +478,10 @@
                              (pw-char! self (char->integer x))
                              (pw-text! self (append-text x rest)))
                          self))
-        (cons "printf" (lambda (self a . rest) (pw-text! self (jvm-format-string a rest)) self))
-        (cons "format" (lambda (self a . rest) (pw-text! self (jvm-format-string a rest)) self))
+        (cons "printf" (lambda (self a . rest)
+                         (jvm-format-pieces a rest (lambda (piece) (pw-text! self piece)))
+                         self))
+        (cons "format" (lambda (self a . rest) (jvm-format-pieces a rest (lambda (piece) (pw-text! self piece))) self))
         (cons "flush" (lambda (self) (pw-pass! self "flush")))
         (cons "close" (lambda (self) (pw-pass! self "close")))
         (cons "checkError" (lambda (self) (pw-pass! self "flush") #f))
@@ -1102,11 +1104,16 @@
 
 ;; ---- PushbackReader ---------------------------------------------------------
 ;; state: a vector #(wrapped-reader pushed-list line-numbering? line column skip-lf?
-;;                   at-line-start? prev-at-line-start? owned-reader)
-;; at-line-start? and prev-at-line-start? are LineNumberingPushbackReader's
-;; atLineStart: true before anything is read, then whether the last unit read
-;; was a newline (or EOF); an unread restores the value from before that read,
-;; as the JVM's does.
+;;                   at-line-start? prev-at-line-start? owned-reader line-pending?)
+;; The counters split the way clojure.lang.LineNumberingPushbackReader's do. LINE
+;; (0-based, as java.io.LineNumberReader keeps it) is counted BELOW the pushback,
+;; so a character read twice through an unread counts once; skip-lf? marks the
+;; \n of a \r\n, already counted; line-pending? is JDK 21's end-of-input rule —
+;; the stream ending after anything but a line terminator ends one more line,
+;; once. COLUMN (1-based) and at-line-start? are the pushback reader's own, moved
+;; by every read including one out of the pushback: a newline or the end of input
+;; puts the column back to 1, anything else moves it on, and an unread steps it
+;; back. prev-at-line-start? is what an unread restores at-line-start? to.
 ;;
 ;; wrapped-reader is what reads come from, and a form read replaces it: the
 ;; drain-parse-refill path of host-reader-read-form (io.ss) drains it and puts a
@@ -1115,7 +1122,7 @@
 ;; what close closes (jolt-lang/jolt#1117) -- closing slot 0 after a read closed
 ;; the in-memory tail and left the file open until a GC.
 (define (make-pbr-state rdr line-numbering?)
-  (vector rdr '() line-numbering? 0 0 #f #t #t rdr))
+  (vector rdr '() line-numbering? 0 1 #f #t #t rdr #f))
 (register-class-ctor! "PushbackReader"
   (lambda (rdr . _) (make-jhost "pushback-reader" (make-pbr-state rdr #f))))
 ;; Fully-qualified aliases so (java.io.PushbackReader. …) / (java.io.StringReader. …)
@@ -1138,9 +1145,10 @@
 (register-class-ctor! "clojure.lang.LineNumberingPushbackReader" make-lnpbr)
 (define (read-unit r)        ; read one code unit (flonum) from any reader, -1 at EOF
   (record-method-dispatch r "read" jolt-nil))
-;; One character from the wrapped reader, terminators folded to \n. Pushback sits
-;; ABOVE this (as it does on the JVM), so an unread \n is handed straight back and
-;; does not count a second line.
+;; One character from the wrapped reader, terminators folded to \n: the
+;; LineNumberReader half, which owns the line count. Pushback sits ABOVE this (as
+;; it does on the JVM), so an unread \n is handed straight back and does not
+;; count a second line.
 (define (pbr-read-translated self)
   (let* ((st (jhost-state self))
          (c (read-unit (vector-ref st 0)))
@@ -1154,9 +1162,14 @@
        (cond
          ((or (eqv? n 13) (eqv? n 10))
           (vector-set! st 3 (+ 1 (vector-ref st 3)))
-          (vector-set! st 4 0)
+          (vector-set! st 9 #f)
           (->num 10))
-         (else (vector-set! st 4 (+ 1 (vector-ref st 4))) c))))))
+         ((or (jolt-nil? c) (and n (< n 0)))
+          (when (vector-ref st 9)
+            (vector-set! st 3 (+ 1 (vector-ref st 3)))
+            (vector-set! st 9 #f))
+          c)
+         (else (vector-set! st 9 #t) c))))))
 ;; Every java.io.Reader has close(), so the JVM's PushbackReader.close can call
 ;; in.close() unconditionally. jolt can be handed something a JVM PushbackReader
 ;; could not: clojure.core's *in* is a reify over IReader (jolt-core/clojure/
@@ -1179,7 +1192,12 @@
                           (else (read-unit (vector-ref st 0)))))
                      (n (and (number? c) (jnum->exact c))))
                 (vector-set! st 7 (vector-ref st 6))
-                (vector-set! st 6 (or (eqv? n 10) (eqv? n -1) (jolt-nil? c)))
+                (cond ((or (eqv? n 10) (eqv? n -1) (jolt-nil? c))
+                       (vector-set! st 6 #t)
+                       (vector-set! st 4 1))
+                      (else
+                       (vector-set! st 6 #f)
+                       (vector-set! st 4 (+ 1 (vector-ref st 4)))))
                 c))
             (if (null? rest)
                 (read1)
@@ -1195,9 +1213,13 @@
           (lambda (self ch . rest)
             (vector-set! (jhost-state self) 6 (vector-ref (jhost-state self) 7))
             (if (null? rest)
-                ;; unread(int|char) — push one code unit back
-                (vector-set! (jhost-state self) 1
-                  (cons (if (char? ch) (->num (char->integer ch)) ch) (vector-ref (jhost-state self) 1)))
+                ;; unread(int|char) — push one code unit back, and step the column
+                ;; back over it (only this arity is LineNumberingPushbackReader's
+                ;; own; the char[] one below is PushbackReader's and leaves it)
+                (begin
+                  (vector-set! (jhost-state self) 4 (- (vector-ref (jhost-state self) 4) 1))
+                  (vector-set! (jhost-state self) 1
+                    (cons (if (char? ch) (->num (char->integer ch)) ch) (vector-ref (jhost-state self) 1))))
                 ;; unread(char[] cbuf, off, len) — push cbuf[off,off+len) so cbuf[off]
                 ;; reads back first (the list head).
                 (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))

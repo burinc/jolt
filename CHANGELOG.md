@@ -22,6 +22,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reader errors carry the JVM's class: EOF, an unmatched delimiter, a bad escape and
+  the rest are `RuntimeException`s (they were `ExceptionInfo`), a malformed `\u`
+  escape an `IllegalArgumentException`, with the JVM's messages ("EOF while reading
+  character", "Invalid digit: z", "read-cond body must be a list", ...). A read from a
+  `LineNumberingPushbackReader`, `with-in-str` or stdin wraps any error in a
+  `LispReader$ReaderException` at the stream's line and column (`clojure.edn`: an
+  `EdnReader$ReaderException`), and an unclosed collection names the line it opened
+  on. `clojure.main/repl` catches that class as the JVM's does, and moves past the
+  bad input instead of reporting the same error forever. EOF errors have their own
+  kind, `read/eof`.
+- `#'` at end of input and a reader conditional whose matched feature has no form
+  are read errors; `(read-string {} "nil")` is nil, not an EOF error; `"\0a"` is an
+  invalid octal escape.
+- `LineNumberingPushbackReader` counts like the JVM's: the column starts at 1 and an
+  unread steps it back, end of input ends the last line, and reading forms from one
+  over a file no longer counts every line twice. A form read from one carries the
+  stream's line, so `clojure.main/renumbering-read` keeps it.
+- Successive `clojure.edn/read`s from one reader read successive forms; the first
+  drained the whole reader. `read+string` trims its text like the JVM's.
+- `(str e)` includes ex-data only for an `ExceptionInfo`, as `Throwable.toString` does.
+- A Writer bound to `*out*` sees the JVM's calls: `print`/`pr`/`println`/`prn` write
+  each argument separately with the space and newline as appends, a printed char is
+  an append, `println` makes no empty write, and `PrintWriter`/`PrintStream`
+  `.printf`/`.format` write each piece the Formatter produces.
 - `take` and `drop` count a non-integer `n` as the JVM does: `(take 1.5 xs)` is two
   elements and `(take 1/2 xs)` one, where jolt floored a double and threw on a ratio or
   a count past the fixnum range. `repeatedly`, `split-at` and `drop-last` follow.
@@ -50,7 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `read` and `read+string` over a `PushbackReader` wrapping a program's own `proxy`
   or `reify` Reader return once the form is complete, as on the JVM. They drained
   the reader to end of input first, so over an interactive source such as an IDE's
-  stdin they waited until the stream was closed (#1137).
+  stdin they waited until the stream was closed (#1137). A token followed by `(`,
+  `;` or another terminating character returns at that character, and read errors
+  over such a reader are the same `ReaderException` as over a string.
 
 ## [0.8.12] - 2026-09-24
 

@@ -115,13 +115,6 @@
                 ;; no Clojure meaning in a trace
                 "record-method-dispatch" "protocol-resolve" "devirt-resolve"
                 "list->cseq" "host-static-call" "host-call"
-                ;; the reader's own recursive descent. A read error used to print
-                ;; ten of these — rdr-read-form, rdr-read-seq, rdr-read-form … —
-                ;; above the one line that said what was wrong. They name the
-                ;; parser's shape, never anything in the program being read.
-                "rdr-read-form" "rdr-read-seq" "rdr-read-top" "rdr-make-map"
-                "rdr-make-set" "rdr-read-string" "rdr-read-keyword"
-                "rdr-read-token" "rdr-read-dispatch" "rdr-read-anon-fn"
                 ;; the CLI's own entry frames: every trace ended with these, and
                 ;; they say only that jolt was started, which the reader knows.
                 ;; run-script! is the one that loads a FILE (a script, a `run
@@ -142,10 +135,18 @@
 ;; So this is load-bearing beyond tidiness: narrowing the prefix rule, or letting
 ;; a scheduler procedure be named without the prefix, puts carrier internals back
 ;; into every go-block trace.
+;;
+;; The reader's own procedures (reader.ss, every one rdr-) are plumbing by the
+;; same kind of rule. A read error used to print ten of them — rdr-read-form,
+;; rdr-read-seq, rdr-read-form … — above the one line that said what was wrong;
+;; they name the parser's shape, never anything in the program being read. A
+;; list of them went stale the first time a raise moved out of tail position in
+;; a helper nobody had listed.
 (define (srcreg-plumbing-name? nm)
   (or (hashtable-ref srcreg-plumbing-names nm #f)
       (and (fx>? (string-length nm) 0) (char=? (string-ref nm 0) #\$))
-      (and (fx>=? (string-length nm) 5) (string=? (substring nm 0 5) "jolt-"))))
+      (and (fx>=? (string-length nm) 5) (string=? (substring nm 0 5) "jolt-"))
+      (and (fx>=? (string-length nm) 4) (string=? (substring nm 0 4) "rdr-"))))
 
 ;; An inspector message that may return ZERO values (e.g. 'source-path when a
 ;; frame carries no source) — read it as one value or #f. `guard` alone cannot
@@ -1095,14 +1096,21 @@
                      "\n :trace []"
                      "}"))))
 
-;; toString (str/print) for ex-info records: "ClassName: message data"
+;; toString (str/print) for throwable records: Throwable's "ClassName: message",
+;; the ": message" dropped when there is none. Only ExceptionInfo's own toString
+;; appends its data. A throwable of another class can carry data here too — a
+;; read error keeps its diagnostic position on its RuntimeException — and
+;; printing that into its toString broke the text a caller builds from it, the
+;; ReaderException's message first among them.
 (register-str-render! jolt-ex-info-record?
   (lambda (x)
     (let* ((class-name (jolt-ex-info-record-class-name x))
            (msg (jolt-ex-info-record-message x))
            (data (jolt-ex-info-record-data x)))
-      (string-append class-name ": " (jolt-str-render-one msg)
-                     (if (jolt-nil? data) ""
+      (string-append class-name
+                     (if (jolt-nil? msg) "" (string-append ": " (jolt-str-render-one msg)))
+                     (if (or (jolt-nil? data) (not (equal? class-name "clojure.lang.ExceptionInfo")))
+                         ""
                          (string-append " " (jolt-pr-str data)))))))
 
 ;; count on ex-info / host throwable records throws UnsupportedOperationException
