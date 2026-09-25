@@ -74,7 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `read` and `read+string` over a `PushbackReader` wrapping a program's own `proxy`
   or `reify` Reader return once the form is complete, as on the JVM. They drained
   the reader to end of input first, so over an interactive source such as an IDE's
-  stdin they waited until the stream was closed (#1137).
+  stdin they waited until the stream was closed (#1137). A token followed by `(`,
+  `;` or another terminating character returns at that character, and read errors
+  over such a reader are the same `ReaderException` as over a string.
 
 ## [0.8.12] - 2026-09-24
 
