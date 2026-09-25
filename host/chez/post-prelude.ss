@@ -212,7 +212,15 @@
       ((stream e? ev recursive?)
        (jolt-invoke (var-deref "clojure.core" "read+string") stream e? ev))
       ((stream e? ev)
-       (if (reader-jhost? stream)
+       (cond
+         ;; a program's own Reader may be interactive: take only the form, as
+         ;; host-reader-read-form does, rather than draining to end of input
+         ((and (reader-jhost? stream) (pushback-over-user-reader? stream))
+          (let-values (((form found? text) (host-reader-read-form+text-incremental stream)))
+            (cond (found? (jolt-vector form text))
+                  ((jolt-truthy? e?) (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap)))
+                  (else (jolt-vector ev "")))))
+         ((reader-jhost? stream)
            (let* ((s (drain-reader stream)) (pr (jolt-parse-next s)))
              (if (jolt-nil? pr)
                  (begin (reader-refill! stream "")
@@ -220,8 +228,8 @@
                             (jolt-vector ev "")))
                  (let ((rest (jolt-nth pr 1)))
                    (reader-refill! stream rest)
-                   (jolt-vector (jolt-nth pr 0) (substring s 0 (- (string-length s) (string-length rest)))))))
-           (jolt-invoke ov-rps stream e? ev))))))
+                   (jolt-vector (jolt-nth pr 0) (substring s 0 (- (string-length s) (string-length rest))))))))
+         (else (jolt-invoke ov-rps stream e? ev)))))))
 
 ;; A throwable is not a collection, function, or meta carrier on the JVM. The
 ;; ex-info record type is NOT a pmap, so pmap?/coll?/seqable?/ifn?/associative?

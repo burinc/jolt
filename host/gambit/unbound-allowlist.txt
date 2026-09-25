@@ -58,6 +58,8 @@ chez-edn-read
 chez-line-seq
 drain-reader
 host-reader-read-form
+host-reader-read-form+text-incremental
+pushback-over-user-reader?
 reader-refill!
 #
 # Emitted for clojure.core.Vec's node writes (vector-of, 60-gvec.clj); no

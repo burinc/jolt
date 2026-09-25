@@ -1945,6 +1945,8 @@
 ;; drain-parse-refill fallback below re-materializes the whole remaining input per
 ;; form, which is quadratic over a file. The fallback still covers a char-reader
 ;; over a Chez port, a library's own reader shim, and a reader with pushback.
+;; A pushback reader over a proxy/reify Reader (or io/reader's adapter over one)
+;; is read incrementally instead: see host-reader-read-form-incremental.
 (define (host-reader-read-form r)
   (let-values (((sr lnst) (host-reader-string-cursor r)))
     (if sr
@@ -1957,10 +1959,127 @@
                 (when lnst (pbr-fold-and-count! lnst (substring s i j)))
                 (sr-pos! sr j)
                 (values (car pr) #t))))
-        (let* ((s (drain-reader r)) (pr (jolt-parse-next s)))
-          (if (jolt-nil? pr)
-              (begin (reader-refill! r "") (values jolt-nil #f))
-              (begin (reader-refill! r (jolt-nth pr 1)) (values (jolt-nth pr 0) #t)))))))
+        (if (pushback-over-user-reader? r)
+            (host-reader-read-form-incremental r)
+            (let* ((s (drain-reader r)) (pr (jolt-parse-next s)))
+              (if (jolt-nil? pr)
+                  (begin (reader-refill! r "") (values jolt-nil #f))
+                  (begin (reader-refill! r (jolt-nth pr 1)) (values (jolt-nth pr 0) #t))))))))
+
+;; A pushback reader whose wrapped reader is the program's own -- a proxy/reify
+;; java.io.Reader, or the adapter io/reader puts around one. Such a reader can
+;; be an interactive source (a REPL's or an IDE's stdin) whose read blocks until
+;; more input arrives, so draining it to EOF to parse one form waits for input
+;; the form never needed, as the JVM's LispReader does not (jolt-lang/jolt#1137).
+;; The string and char-reader cases stay on their drains: those end, and the
+;; char-reader drain is the fast path loading a file depends on.
+(define (pushback-over-user-reader? r)
+  (and (jhost? r) (pushback-reader-tag? (jhost-tag r))
+       (let ((w (vector-ref (jhost-state r) 0)))
+         (or (not (jhost? w)) (string=? (jhost-tag w) "reader-adapter")))))
+
+;; Is e the reader's "input ended inside a form" error? Every one the reader
+;; raises starts "EOF ": "EOF while reading string", "EOF after #_" and so on.
+(define (rdr-eof-throw? e)
+  (and (jolt-throw-condition? e)
+       (let ((v (jolt-throw-condition-value e)))
+         (and (ex-info-map? v)
+              (let ((m (jolt-ex-info-record-message v)))
+                (and (string? m)
+                     (fx>=? (string-length m) 4)
+                     (string=? (substring m 0 4) "EOF ")))))))
+
+;; Read ONE form from a pushback reader through its own read/unread, taking
+;; only as much input as the form needs. Characters go into a buffer while a
+;; small scanner tracks bracket depth and whether it is inside a string, regex,
+;; char literal or comment. The real parser runs only at a top-level boundary:
+;; the bracket that closes depth back to 0, the quote that closes a top-level
+;; string, or whitespace/a comment after a top-level token. An "EOF ..." read
+;; error there means the form continues (a quote or #_ with nothing after it
+;; yet), so reading goes on. What the parser did not consume -- at most the
+;; delimiter that ended a token, or the rest of a line after a token that ran
+;; into a bracket -- is unread, so the next read starts right after the form.
+;; At end of input the buffer is parsed as it stands, and its errors are the
+;; string path's errors.
+(define (host-reader-read-form-incremental r)
+  (let-values (((form found? text) (host-reader-read-form+text-incremental r)))
+    (values form found?)))
+
+;; The same read, plus the text the form was read from (what read+string
+;; returns): everything consumed up to the form's end, leading whitespace
+;; included, as the drain path's read+string has it.
+(define (host-reader-read-form+text-incremental r)
+  (let ((buf (open-output-string)))
+    (define (read-char!)
+      (let ((u (record-method-dispatch r "read" jolt-nil)))
+        (if (or (jolt-nil? u) (and (number? u) (< u 0)))
+            #f
+            (integer->char (exact (truncate u))))))
+    (define (unread-tail! s j)
+      (let loop ((k (fx- (string-length s) 1)))
+        (when (fx>=? k j)
+          (record-method-dispatch r "unread" (jolt-list (string-ref s k)))
+          (loop (fx- k 1)))))
+    ;; -> (form . text) when a form is complete, #f when more input is needed
+    (define (attempt)
+      (let* ((s (get-output-string buf))
+             (pr (guard (e ((rdr-eof-throw? e) 'more))
+                   (rdr-parse-at s 0))))
+        ;; get-output-string resets the port, so put the text back
+        (put-string buf s)
+        (cond
+          ((or (eq? pr 'more) (not pr)) #f)
+          (else
+           (unread-tail! s (cdr pr))
+           (cons (car pr) (substring s 0 (cdr pr)))))))
+    (define (finish)
+      (let* ((s (get-output-string buf)) (pr (rdr-parse-at s 0)))
+        (if pr
+            (begin (unread-tail! s (cdr pr)) (values (car pr) #t (substring s 0 (cdr pr))))
+            (values jolt-nil #f s))))
+    (let loop ((depth 0) (mode 'code) (content? #f))
+      (let ((c (read-char!)))
+        (if (not c)
+            (finish)
+            (begin
+              (write-char c buf)
+              (case mode
+                ((code)
+                 (cond
+                   ((char=? c #\;) (loop depth 'comment content?))
+                   ((char=? c #\\) (loop depth 'char-escape #t))
+                   ((char=? c #\") (loop depth 'string #t))
+                   ((memv c '(#\( #\[ #\{)) (loop (fx+ depth 1) 'code #t))
+                   ((memv c '(#\) #\] #\}))
+                    (let ((d (fx- depth 1)))
+                      (if (fx<=? d 0)
+                          (let ((got (attempt)))
+                            (if got (values (car got) #t (cdr got)) (loop d 'code #t)))
+                          (loop d 'code #t))))
+                   ((or (char-whitespace? c) (char=? c #\,))
+                    (if (and content? (fx<=? depth 0))
+                        (let ((got (attempt)))
+                          (if got (values (car got) #t (cdr got)) (loop depth 'code content?)))
+                        (loop depth 'code content?)))
+                   (else (loop depth 'code #t))))
+                ((char-escape) (loop depth 'code #t))
+                ((string)
+                 (cond
+                   ((char=? c #\\) (loop depth 'string-escape #t))
+                   ((char=? c #\")
+                    (if (fx<=? depth 0)
+                        (let ((got (attempt)))
+                          (if got (values (car got) #t (cdr got)) (loop depth 'code #t)))
+                        (loop depth 'code #t)))
+                   (else (loop depth 'string #t))))
+                ((string-escape) (loop depth 'string #t))
+                ((comment)
+                 (if (memv c '(#\newline #\return))
+                     (if (and content? (fx<=? depth 0))
+                         (let ((got (attempt)))
+                           (if got (values (car got) #t (cdr got)) (loop depth 'code content?)))
+                         (loop depth 'code content?))
+                     (loop depth 'comment content?))))))))))
 
 ;; clojure.edn/read over a reader: drain the jhost reader to a string and read the
 ;; first EDN form. Re-asserted over the prelude in post-prelude.ss.
