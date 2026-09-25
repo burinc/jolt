@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
@@ -1260,6 +1260,12 @@ winparity:
 # the runtime's own heap bound would otherwise answer first.
 vfaslceiling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
+
+# The build-side shapes `jolt build`'s back-end cost depends on (#1059): small
+# init procedures, the back end's collect trip, a failed vfasl that says so, and
+# the per-unit compile/convert caches.
+buildscaling:
+	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/build-scaling-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The

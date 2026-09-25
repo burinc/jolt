@@ -264,6 +264,16 @@
   (let ((t (file-modification-time path)))
     (+ (* (time-second t) 1000) (div (time-nanosecond t) 1000000))))
 
+;; (sa-file-size path) -> exact integer
+;; PATH's size in bytes. Contract: the size a reader of the whole file would
+;; see (a cache's byte budget reads it). Degradation: none — a file that cannot
+;; be opened raises, as the caller's other file operations would.
+(define (sa-file-size path)
+  (let ((p (open-file-input-port path)))
+    (let ((n (port-length p)))
+      (close-port p)
+      n)))
+
 ;; (sa-gc-trip-bytes! n) -> void
 ;; Set the allocation threshold at which a trip collection triggers — the
 ;; dev-cache CLI's GC tuning knob (cli-devcache.ss). Contract: honor N as a
@@ -1001,6 +1011,11 @@
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
 
+;; A conversion that fails part way leaves a truncated OUT, which a caller
+;; testing (file-exists? out) would take for a result; #f leaves no OUT.
+(define (sa-delete-partial! out)
+  (guard (e (#t #f)) (when (file-exists? out) (delete-file out))))
+
 ;; (sa-vfasl-convert-file in out [codec]) -> boolean
 ;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
 ;; what loading the fasl would have produced, laid out per space and loaded
@@ -1016,10 +1031,27 @@
 ;; argument; Chez has two, and 'wide picks gzip over LZ4, which is the whole
 ;; point: gzip has no 256MiB ceiling and LZ4 does.
 (define (sa-vfasl-convert-file in out . codec)
-  (guard (e (#t #f))
+  (guard (e (#t (sa-delete-partial! out) #f))
     (if (and (pair? codec) (eq? (car codec) 'wide))
         (parameterize ((compress-format 'gzip)) (vfasl-convert-file in out '()))
         (vfasl-convert-file in out '()))
+    #t))
+
+;; (sa-vfasl-convert-object-file in out [codec]) -> boolean
+;; The same conversion for ONE compiled object file rather than a whole boot:
+;; OUT keeps IN's object-file header instead of gaining a boot header, so it can
+;; follow a converted boot in the same image (a boot file is its inputs
+;; concatenated, and the kernel skips each input's header). This is what lets a
+;; build convert only what changed — the runtime prefix and each app unit are
+;; converted once and cached (build.ss). Output entries are compressed, as a
+;; whole-boot conversion's are. Same contract and degradation as above.
+(define (sa-vfasl-convert-object-file in out . codec)
+  (guard (e (#t (sa-delete-partial! out) #f))
+    (parameterize ((fasl-compressed #t)
+                   (compress-format (if (and (pair? codec) (eq? (car codec) 'wide))
+                                        'gzip
+                                        (compress-format))))
+      (vfasl-convert-file in out #f))
     #t))
 
 ;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean

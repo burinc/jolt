@@ -1,10 +1,17 @@
 #!/bin/sh
+
 # static-native smoke: a project's :jolt/native lib with a :static archive is
 # LINKED INTO the built binary (the default), so the binary calls the C function
 # with no shared object on disk at runtime. --dynamic keeps the old behavior —
 # load a shared object at runtime.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+
+# The app's emitted Scheme is several files since the build compiles (and
+# caches) one unit per namespace: flat.ss is the prologue, app-N.ss each
+# namespace, app-post.ss the launcher. A check about what the app emitted reads
+# all of them — one over flat.ss alone passes an absence check vacuously.
+appsrc() { cat "$1/flat.ss" "$1"/app-[0-9]*.ss "$1/app-post.ss" 2>/dev/null; }
 
 # JOLT_BIN overrides the jolt under test. The gate targets point it at the
 # freshly built target/release/jolt: a `jolt build` costs ~2.5s through the
@@ -77,10 +84,10 @@ fi
 [ -x "$out" ] || { echo "  FAIL: no executable produced"; exit 1; }
 # A static lib emits a process-symbol load (its archive is in-process), not a
 # dlopen of the shared object.
-if ! grep -q "jolt-build-load-native '() #f #t" "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q "jolt-build-load-native '() #f #t"; then
   echo "  FAIL: static native did not emit a process-symbol load"; exit 1
 fi
-if grep -q "libgreet.$soext" "$out.build/flat.ss"; then
+if appsrc "$out.build" | grep -q "libgreet.$soext"; then
   echo "  FAIL: static native baked a runtime shared-object load"; exit 1
 fi
 # Remove BOTH libs: a static-linked symbol lives in the binary, nothing to load.
@@ -162,7 +169,7 @@ if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --dynamic >"$work/build
   echo "  FAIL: jolt build --dynamic exited non-zero"; cat "$work/build.log"; exit 1
 fi
 # --dynamic loads the shared object at runtime.
-if ! grep -q "libgreet.$soext" "$out.build/flat.ss"; then
+if ! appsrc "$out.build" | grep -q "libgreet.$soext"; then
   echo "  FAIL: --dynamic did not emit a runtime shared-object load"; exit 1
 fi
 got="$(cd / && "$out" 2>&1)"

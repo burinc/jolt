@@ -1324,8 +1324,17 @@
 ;; from one layout must not gate another's analysis.
 (define (var-def-ordinal-key file ns name)
   (string-append (or file "*") "\x1;" ns "/" name))
+;; The AOT cache records the stamps a source load of one file makes, so a later
+;; load of the cached artifact can replay them (loader.ss aot-compile-and-cache /
+;; aot-replay-def-ordinals!): a build's pass 1 may then load from the cache and
+;; still hand the emit walk a stamped program. #f, or #(file stamps) collecting
+;; (ns name ord) for stamps against FILE.
+(define jolt-def-ordinal-sink (make-parameter #f))
 (define (var-def-ordinal-stamp1! file ns name ord)
-  (let ((k (var-def-ordinal-key file ns name)))
+  (let ((k (var-def-ordinal-key file ns name))
+        (sink (jolt-def-ordinal-sink)))
+    (when (and sink (equal? file (vector-ref sink 0)))
+      (vector-set! sink 1 (cons (list ns name ord) (vector-ref sink 1))))
     (jolt-with-mutex var-table-mu
       (unless (hashtable-contains? var-def-ordinals k)
         (hashtable-set! var-def-ordinals k ord)))))
