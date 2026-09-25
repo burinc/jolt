@@ -211,6 +211,27 @@
 (ok "changing one unit recompiles that unit only" (= compiled-again 1))
 (set! bld-chez-compile-file real-compile)
 
+;; The prune drops the least recently USED entries: a hit marks its entry, so an
+;; entry every build reads is not evicted just for having been created first.
+(define lru (at "lru-cache"))
+(bld-mkdir-p lru)
+(for-each (lambda (f) (delete-file (string-append lru "/" f))) (directory-list lru))
+(define lru-a (string-append lru "/a.so")) (define lru-b (string-append lru "/b.so"))
+(write-text! lru-a (make-string 1000 #\a))
+(write-text! lru-b (make-string 1000 #\b))
+(set-file-mtime-millis! lru-a 1000000000000)      ; a: created long ago
+(set-file-mtime-millis! lru-b 1500000000000)      ; b: newer, never read
+(ok "a cache hit marks its entry as used"
+    (and (bld-cache-fetch! lru-a (at "lru-out.so"))
+         (> (sa-file-mtime-ms lru-a) 1500000000000)))
+(putenv "JOLT_BUILD_CACHE_DIR" lru)
+(putenv "JOLT_BUILD_CACHE_MB" (number->string (/ 1500.0 1024 1024)))
+(bld-prune-build-cache!)
+(ok "…so over budget the prune keeps it and drops the older-used entry"
+    (and (file-exists? lru-a) (not (file-exists? lru-b))))
+(putenv "JOLT_BUILD_CACHE_MB" "2048")
+(putenv "JOLT_BUILD_CACHE_DIR" ucache)
+
 ;; an image an earlier build left in the build dir is never taken as this build's
 (write-text! (at "u1.so.vfasl") "stale bytes from an earlier build")
 (bld-compile-app-units! tmp "release" uunits #t)
