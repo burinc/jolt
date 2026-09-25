@@ -1866,14 +1866,16 @@
                       s)))
                (else #f)))))
 ;; A count no fixnum reaches drops everything from a lazy source: the countdown
-;; never ends.
+;; never ends, so the source is walked to its end, realizing it as the JVM's
+;; step loop does.
 (define lz-drop
   (register-lazy-src! 'drop
     (lambda (n0 coll)
      (jolt-seq
       (let ((c (take-drop-count n0)))
         (if (eq? c 'all)
-            jolt-empty-list
+            (let loop ((s (jolt-seq coll)))
+              (if (jolt-nil? s) jolt-empty-list (loop (jolt-seq (seq-more s)))))
             (drop-walk c (jolt-seq coll))))))))
 ;; clojure.lang.IDrop — the colls Clojure 1.12's drop hands the count to, eagerly,
 ;; getting back the coll's own kind of seq: PersistentVector and its ChunkedSeq,

@@ -582,9 +582,9 @@
    :local-deps ["~time"]
    ;; lasertag classifies a value by its class, so every failure here is jolt's class
    ;; model rather than a behavioral difference, all recorded in
-   ;; known-divergences.edn. The 7 that remain: six narrow numeric classes collapsing
-   ;; to Long/Double (:integer-box-model) and one seq class still collapsing to
-   ;; LazySeq where the JVM says Repeat (:seq-type-model). The two that used to sit
+   ;; known-divergences.edn. The 6 that remain are narrow numeric classes collapsing
+   ;; to Long/Double (:integer-box-model); the seventh, repeat's LazySeq where the
+   ;; JVM says Repeat, went when repeat became a Repeat. The two that used to sit
    ;; beside them were the suite's :bb branches asserting babashka's host model
    ;; (sci.impl.fns classnames, a :lambda-free tag set); jolt stopped reading :bb
    ;; in #893 and answers with the real defining class.
@@ -593,7 +593,7 @@
    ;; and #659 picked the range flavor from the argument types. The row had not been
    ;; re-recorded since before #648, so part of that 3 was slack this gate had been
    ;; carrying — a regression in those rows would have read as "ok".
-   :expect {:tests 58 :pass 51 :fail 7 :error 0}}
+   :expect {:tests 58 :pass 52 :fail 6 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]
