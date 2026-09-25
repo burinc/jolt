@@ -156,7 +156,7 @@
          (let ((kw (keyword #f mname)))
            (cond
              ((jrec? obj)
-              (cond ((jrec-field-index obj kw) (jrec-lookup obj kw jolt-nil))
+              (cond ((jrec-member-field obj kw) => (lambda (k) (jrec-lookup obj k jolt-nil)))
                     ((jrec-class-field obj mname) => car)
                     (else 'pass)))
              ((and (jolt-map? obj) (jolt-truthy? (jolt-contains? obj kw)))

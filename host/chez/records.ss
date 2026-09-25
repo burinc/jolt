@@ -459,6 +459,25 @@
 (define (jrec-field-index r k)
   (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
     (and i (if (fx<? i 0) (fx- -1 i) i))))
+;; The declared slot an interop member name K (a keyword) reads or sets, as its
+;; keyword, or #f. The JVM compiler munges a member name before the reflector
+;; looks, and a slot's Java field is its own munged name, so two spellings that
+;; munge alike name one slot: (.-processed_count r) reads [processed-count],
+;; (.-my-field r) reads [my_field], (.-ready_QMARK_ r) reads [ready?]. The
+;; spelling as written is tried first, so a read that matches never munges.
+;; Only the interop field paths go through this; a keyword read stays exact, as
+;; on the JVM ((:processed_count r) is nil). class-munge-name
+;; (java/host-class.ss) loads after this file and is resolved at call time.
+(define (jrec-member-field r k)
+  (if (jrec-field-index r k)
+      k
+      (let ((m (class-munge-name (keyword-t-name k)))
+            (fkeys (jrdesc-fkeys (jrec-desc r))))
+        (let loop ((i 0))
+          (cond ((fx=? i (vector-length fkeys)) #f)
+                ((string=? (class-munge-name (keyword-t-name (vector-ref fkeys i))) m)
+                 (vector-ref fkeys i))
+                (else (loop (fx+ i 1))))))))
 ;; the slot the GET path may read — #f for a masked type, so get falls through to
 ;; the valAt that type declares.
 (define (jrec-get-index r k)
@@ -593,7 +612,8 @@
 ;; this; returns v, as set! does.
 (define (jolt-set-field! inst k v)
   (if (jrec? inst)
-      (let ((i (jrec-field-index inst k)))
+      (let ((i (let ((k2 (and (keyword-t? k) (jrec-member-field inst k))))
+                 (and k2 (jrec-field-index inst k2)))))
         (if i (let* ((flags (hashtable-ref chez-record-dbl-tbl (jrec-tag inst) #f))
                      ;; a ^double field stays a flonum across set!, like the ctor —
                      ;; keeps a later field read sound to unbox.
