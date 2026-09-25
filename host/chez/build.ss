@@ -2456,10 +2456,19 @@
       #t)))
 ;; Copy a cache entry to TO; #f when there is none. Another build's prune can
 ;; delete the entry between the existence check and the read, which is a miss.
+;; A hit moves the entry's mtime to now: the prunes evict oldest mtime first, so
+;; the mtime has to say when the entry was last USED, or an entry every build
+;; reads goes first merely for having been created first.
 (define (bld-cache-fetch! cache to)
   (guard (e (#t #f))
     (and (file-exists? cache)
-         (begin (bld-copy-file! cache to) #t))))
+         (begin
+           (bld-copy-file! cache to)
+           (guard (e (#t #f))           ; a cache we cannot mark is still a hit
+             (let ((t (current-time)))
+               (set-file-mtime-millis! cache (+ (* (time-second t) 1000)
+                                                (quotient (time-nanosecond t) 1000000)))))
+           #t))))
 
 ;; Compile the runtime half under the runtime profile, reusing a cached fasl
 ;; when one matches. CACHE? is #f for a shaken core: its text is per-app, so a
