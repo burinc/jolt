@@ -110,6 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mapcat` and `(apply concat ...)` return their last collection as it is instead of
+  copying it, as the JVM's `concat` does. `tree-seq` nests one `mapcat` per level, so
+  the copy cost every element its depth: a 4000-deep chain took 1.6s to walk (JVM
+  1ms), and writ's proof summaries spent minutes in `tree-seq`.
 - **A `lazy-seq` body that fails and is forced again sees the locals it had not
   finished with, as on the JVM.** The reference's compiler nulls a `^:once` fn's
   captured field at its last use on the path the body takes; jolt emptied every
