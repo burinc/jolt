@@ -126,6 +126,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `jolt CMD --help` (or `-h`) prints that command's usage for every built-in
+  command. None of them knew the flag: `nrepl-server --help` dropped it and started
+  a server on the default port, `repl --help` started a REPL, and `run`, `build`
+  and `completions` failed on it as an argument (#1152).
 - `mapcat` and `(apply concat ...)` return their last collection as it is instead of
   copying it, as the JVM's `concat` does. `tree-seq` nests one `mapcat` per level, so
   the copy cost every element its depth: a 4000-deep chain took 1.6s to walk (JVM
