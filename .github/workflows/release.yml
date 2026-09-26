@@ -148,11 +148,12 @@ jobs:
           # runner by ci/termux-build.sh, which also runs the smokes and the
           # dependency allowlist there -- the host cannot execute a bionic binary,
           # so the host-side checks below skip this row. The binary links Termux's
-          # ncurses, libuuid and libiconv.
-          - os: ubuntu-24.04-arm
-            target: aarch64-android
-            shell: bash
-            termux: termux/termux-docker:aarch64
+          # ncurses, libuuid and libiconv. Not released until the gates listed in
+          # #1148 pass on bionic; tests.yml still builds and gates it on every push.
+          # - os: ubuntu-24.04-arm
+          #   target: aarch64-android
+          #   shell: bash
+          #   termux: termux/termux-docker:aarch64
     defaults:
       run:
         shell: ${{ matrix.shell }}
