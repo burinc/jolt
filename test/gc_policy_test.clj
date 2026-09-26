@@ -55,12 +55,29 @@
   (reduce (fn [a x] (mod (+ a x) 1000000007)) 0
           (take 6000000 (iterate (fn [x] (mod (+ x 3) 1000000007)) 1))))
 
+;; For the startup reading: a built binary's first collection comes within a
+;; millisecond of the policy starting and reads as most of that millisecond. The
+;; share averaged each collection's own ratio, so that one reading doubled the
+;; nursery, and the next doubled it again though collection took 2% of it: a 9ms
+;; benchmark ran in a 42MB nursery. Fed the same readings, the policy now keeps
+;; the floor (a share of summed times, and nothing resized before five
+;; collections, as the JVM's AdaptiveSizePolicyReadyThreshold). The live policy
+;; is reset first; the readings are nanoseconds (gc, elapsed).
+(defn- startup []
+  (jolt.host/scheme-eval-string
+   "(begin (set! gc-share-gc 0.0) (set! gc-share-el 0.0) (set! gc-share 0.0) (set! gc-seen 0)
+           (set! gc-probe-from #f) (set! gc-growth-hold #f) (gc-win-reset!)
+           (sa-gc-trip-bytes! gc-trip-floor)
+           (gc-size-nursery! 400000 500000)
+           (for-each (lambda (i) (gc-size-nursery! 120000 6000000)) '(1 2 3 4 5 6)))"))
+
 (defn -main [mode]
   (case mode
     "refresh" (refresh)
     "churn" (churn)
     "light" (reduce + (range 1000))
     "walk" (walk)
+    "startup" (startup)
     "pinned" (churn)
     ;; the heap ceiling bounds the TOTAL heap, as -Xmx does: live data, nursery
     ;; and the free memory kept (the gate reads the high-water mark and the GC log)

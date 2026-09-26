@@ -514,7 +514,8 @@
 (define gc-heap-free-limit 2)
 (define gc-overhead-threshold 5)
 (define gc-overhead-count 0)
-(define gc-share-long 0.0)                ; long-term average of gc-time / elapsed
+(define gc-long-gc 0.0) (define gc-long-el 0.0)   ; decayed sums, gc-time and elapsed
+(define gc-share-long 0.0)                ; their ratio: the long-term share of time collecting
 (define (gc-overhead-setup!)
   (let ((v (getenv "JOLT_GC_OVERHEAD_LIMIT")))
     (when (and v (member (string-downcase v) '("off" "0" "false" "none")))
@@ -524,8 +525,9 @@
     (when t (set! gc-time-limit t))
     (when f (set! gc-heap-free-limit f))))
 (define (gc-check-overhead! gc-ns elapsed-ns hard)
-  (when (> elapsed-ns 0)
-    (set! gc-share-long (+ (* 0.9 gc-share-long) (* 0.1 (/ (exact->inexact gc-ns) elapsed-ns)))))
+  (set! gc-long-gc (+ (* 0.9 gc-long-gc) gc-ns))
+  (set! gc-long-el (+ (* 0.9 gc-long-el) elapsed-ns))
+  (when (> gc-long-el 0) (set! gc-share-long (/ gc-long-gc gc-long-el)))
   (when gc-overhead-limit?
     (let ((free-pct (* 100 (/ (exact->inexact (max 0 (- hard (sa-bytes-allocated)))) hard))))
       (if (and (>= (* 100 gc-share-long) gc-time-limit) (< free-pct gc-heap-free-limit))
@@ -591,7 +593,21 @@
 (define gc-trip-floor (* 16 1024 1024))
 (define gc-trip-cap (* 1024 1024 1024))
 (define gc-adaptive? #t)
-(define gc-share 0.0)                     ; recent average of gc-time / elapsed
+;; The share of time spent collecting, recently: decayed SUMS of collection time
+;; and elapsed time, and their ratio -- not an average of each collection's ratio,
+;; which gives a collection 0.3ms after the last as much say as one 300ms after
+;; it. The first collection after the policy is installed comes within a
+;; millisecond of it and read 85%, and the average of ratios doubled the nursery
+;; on it and again on the next, so a 9ms benchmark (bench/typed-records) ran in a
+;; 42MB nursery, 1.3x slower on the release runner's x86 CPUs, whose caches a
+;; 16MB one fits better. And, as the JVM's adaptive sizing waits for
+;; AdaptiveSizePolicyReadyThreshold (5) collections, the size is not changed on
+;; the program's say until five collections have been seen; the heap ceiling's
+;; limit applies from the first.
+(define gc-share-gc 0.0) (define gc-share-el 0.0)
+(define gc-share 0.0)
+(define gc-seen 0)
+(define gc-ready-threshold 5)
 (define gc-target-share 1/10)
 (define gc-free-ratio 50)
 (define gc-hot-at-bound 0)                ; consecutive dominating collections at the bound
@@ -675,7 +691,10 @@
        (set! gc-probe-from #f)))))
 (define (gc-size-nursery! gc-ns elapsed-ns)
   (when (and gc-adaptive? (> elapsed-ns 0))
-    (set! gc-share (+ (* 0.7 gc-share) (* 0.3 (/ (exact->inexact gc-ns) elapsed-ns))))
+    (set! gc-share-gc (+ (* 0.7 gc-share-gc) gc-ns))
+    (set! gc-share-el (+ (* 0.7 gc-share-el) elapsed-ns))
+    (set! gc-share (/ gc-share-gc gc-share-el))
+    (set! gc-seen (+ gc-seen 1))
     (gc-check-growth! gc-ns elapsed-ns)
     (let ((trip (sa-gc-trip-bytes)) (limit (gc-trip-limit)) (cap (gc-max-trip)))
       (set! gc-hot-at-bound
@@ -684,6 +703,8 @@
         ;; the heap ceiling's room shrank under the nursery: follow it down now,
         ;; probe or not -- the ceiling comes before any bet on the nursery
         ((> trip cap) (set! gc-probe-from #f) (gc-set-trip! cap))
+        ;; too few collections yet to say anything about the program
+        ((< gc-seen gc-ready-threshold) #f)
         ;; a growth past the bound still being checked: leave it be
         (gc-probe-from #f)
         ;; under the floor for want of room, and the room is back: to the floor
