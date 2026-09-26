@@ -58,11 +58,29 @@
 ;; takew counts threads parked in a blocking take (so a non-blocking offer! to an
 ;; unbuffered channel can tell a taker is waiting). alt-takers/alt-putters are
 ;; pending alt-handler registrations (alts! ops parked on this channel). xrf is the
-;; transducer reducing fn (or #f); exh the ex-handler (or #f).
+;; transducer reducing fn (or #f); exh the ex-handler (or #f). cvw counts every
+;; thread waiting on cv, takers and putters alike (ac-cv-wait), so a take or put
+;; that nobody waits on skips the broadcast (ac-broadcast!). That is not a nicety
+;; on Android: bionic's pthread_cond_broadcast makes a futex syscall whether or
+;; not anyone waits (glibc's and macOS's return first), 187ns against 6ns here,
+;; and every take and put broadcast, so an immediate take cost 350ns there.
+;; Every broadcast and every wait runs holding mu, so the count cannot miss a
+;; waiter: one that has not counted itself yet re-checks its condition under mu
+;; before it waits.
+;;
+;; The layout is image surface (a channel travels raw, its mu and cv swapped for
+;; image-sync placeholders): async-chan-v3, without cvw, restores through
+;; state-image.ss's legacy arm. The v3 uid is retired.
 (define-record-type async-chan
   (fields mu cv (mutable items) cap kind (mutable closed?) (mutable xrf) (mutable takew)
-          exh (mutable alt-takers) (mutable alt-putters))
-  (nongenerative async-chan-v3))
+          exh (mutable alt-takers) (mutable alt-putters) (mutable cvw))
+  (nongenerative async-chan-v4))
+(define (ac-cv-wait ch)
+  (async-chan-cvw-set! ch (fx+ (async-chan-cvw ch) 1))
+  (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch))
+  (async-chan-cvw-set! ch (fx- (async-chan-cvw ch) 1)))
+(define (ac-broadcast! ch)
+  (when (fx>? (async-chan-cvw ch) 0) (condition-broadcast (async-chan-cv ch))))
 
 (define (ac-qnew) (vector '() '() 0))
 (define (ac-qlen ch) (vector-ref (async-chan-items ch) 2))
@@ -178,14 +196,14 @@
                            (ac-buf-give! ch v))
                           ((promise)
                            (ac-qpush! ch (cons v #f))
-                           (condition-broadcast (async-chan-cv ch)))
+                           (ac-broadcast! ch))
                           (else
                            (if (> (async-chan-cap ch) 0)
                                (begin (ac-qpush! ch (cons v #f))
-                                      (condition-broadcast (async-chan-cv ch)))
+                                      (ac-broadcast! ch))
                                (let ((box (vector #f)))
                                  (ac-qpush! ch (cons v box))
-                                 (condition-broadcast (async-chan-cv ch))))))))
+                                 (ac-broadcast! ch)))))))
                      (alt-deliver! h #t ch)
                      (set! progress #t))
                    (set! progress #t)) ; dead registration
@@ -208,7 +226,7 @@
                   ;; Commit the value: unbuffered rendezvous push
                   (let ((box (vector #f)))
                     (ac-qpush! ch (cons v box))
-                    (condition-broadcast (async-chan-cv ch)))
+                    (ac-broadcast! ch))
                   (alt-deliver! h #t ch)
                   (set! progress #t)
                   (pair-loop))
@@ -217,7 +235,7 @@
                   (set! progress #t)
                   (pair-loop))))))
       (when progress (loop))))
-  (condition-broadcast (async-chan-cv ch)))
+  (ac-broadcast! ch))
 
 ;; A transducer is a jolt fn (xform); (xform add-rf) yields the channel's reducing
 ;; fn. add-rf: 0-arg init, 1-arg completion, 2-arg step (enqueue the output). A
@@ -245,8 +263,8 @@
                       (raise e))))
       (apply jolt-invoke xrf ch v))))
 
-(define (ac-make cap kind xrf) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f xrf 0 #f '() '()))
-(define (ac-make/exh cap kind exh) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f #f 0 exh '() '()))
+(define (ac-make cap kind xrf) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f xrf 0 #f '() '() 0))
+(define (ac-make/exh cap kind exh) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f #f 0 exh '() '() 0))
 
 ;; (chan) | (chan n) | (chan buf) | (chan n|buf xform) | (chan n|buf xform exh)
 (define (jolt-async-chan . args)
@@ -279,7 +297,7 @@
     (for-each (lambda (hp) (when (alt-claim! (car hp)) (alt-deliver! (car hp) #f ch)))
               (async-chan-alt-putters ch))
     (async-chan-alt-putters-set! ch '())
-    (condition-broadcast (async-chan-cv ch)))
+    (ac-broadcast! ch))
   jolt-nil)
 (define (jolt-async-close! ch) (jolt-with-mutex (async-chan-mu ch) (ac-close! ch)))
 
@@ -302,7 +320,7 @@
                     (let ((r (ac-xrf-apply ch v)))
                       (when (jolt-reduced? r) (ac-close! ch))
                       #t))
-                   (else (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
+                   (else (ac-cv-wait ch) (loop))))
            ;; Unbuffered with xform: apply immediately (output goes to rendezvous queue)
            (let ((r (ac-xrf-apply ch v)))
              (when (jolt-reduced? r) (ac-close! ch))
@@ -322,14 +340,14 @@
                  (cond ((async-chan-closed? ch) #f)
                        ((< (ac-qlen ch) (async-chan-cap ch))
                         (ac-qpush! ch (cons v #f)) (ac-notify! ch) #t)
-                       (else (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
+                       (else (ac-cv-wait ch) (loop))))
                (let ((box (vector #f)))                        ; unbuffered: rendezvous
                  (ac-qpush! ch (cons v box))
                  (ac-notify! ch)
                   (let loop ()
                    (if (vector-ref box 0)
                        #t
-                       (begin (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))))))))))
+                       (begin (ac-cv-wait ch) (loop))))))))))))
 
 ;; remove + return the head value, waking a parked rendezvous putter.
 (define (ac-take-head! ch)
@@ -369,7 +387,7 @@
                      ;; commit value (unbuffered rendezvous)
                      (let ((box (vector #f)))
                        (ac-qpush! ch (cons v box))
-                       (condition-broadcast (async-chan-cv ch)))
+                       (ac-broadcast! ch))
                      (ac-take-head! ch))
                    (loop))))  ; dead registration, retry
             (else (ac-take-wait ch) (loop))))))
@@ -378,7 +396,7 @@
 ;; unbuffered channel can see that a taker is ready.
 (define (ac-take-wait ch)
   (async-chan-takew-set! ch (fx+ 1 (async-chan-takew ch)))
-  (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch))
+  (ac-cv-wait ch)
   (async-chan-takew-set! ch (fx- (async-chan-takew ch) 1)))
 
 ;; non-blocking take for alts!/poll!: a value, jolt-nil (closed+empty), or ac-poll-empty.
@@ -398,7 +416,7 @@
                  (alt-deliver! h #t ch)
                  (let ((box (vector #f)))
                    (ac-qpush! ch (cons v box))
-                   (condition-broadcast (async-chan-cv ch)))
+                   (ac-broadcast! ch))
                  (ac-take-head! ch))
                ac-poll-empty)))
         (else ac-poll-empty)))

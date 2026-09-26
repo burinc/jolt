@@ -114,6 +114,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a 100k-element set went from 610ns to 300ns, `contains?` from 148ns to 95ns, and
   `distinct` from 946ns to 450ns per element.
 
+- **A core.async take or put that no thread is waiting on skips the wakeup.**
+  Every take and put broadcast the channel's condition, which on Android is a
+  futex syscall even with no waiters (bionic's `pthread_cond_broadcast` does not
+  check first, glibc's and macOS's do). A channel now counts the threads blocked
+  on it and broadcasts only when there are some: a take from a buffered channel
+  went from 96ns to 53ns on macOS and from about 340ns to 135ns under Termux.
+  Images from 0.8.12 holding a channel still restore.
+
 ### Fixed
 
 - `mapcat` and `(apply concat ...)` return their last collection as it is instead of
