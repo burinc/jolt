@@ -128,6 +128,13 @@
               (hashtable-set! ei-form-cache ns-name (cons src forms))
               forms)))))
 (define (ei-form-cache-clear!) (hashtable-clear! ei-form-cache))
+;; Hand a parse to the next walk that asks ei-read-all-for for it. The graph's
+;; scan (build.ss bld-scan-forms) fills this for sources it could read in normal
+;; mode, so the wp walk skips its own parse of them; the wp walk fills it for the
+;; rest before the emit walk consumes it.
+(define (ei-form-cache-put! ns-name src forms)
+  (unless ei-form-cache-off?
+    (hashtable-set! ei-form-cache ns-name (cons src forms))))
 
 ;; ei-macro-form? / ei-defmacro->fn moved to compile-eval.ss (ce-macro-form? /
 ;; ce-defmacro->fn, loaded before this) — shared with the runtime defmacro spine.

@@ -849,10 +849,6 @@
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
   ;; before any flag is set, so the whole-program seeds set here — and the mode flags —
   ;; land on the one unit the per-form emit reads.
-  ;; Drop the previous build's parsed forms (in-process builds — nREPL): this
-  ;; build's wp walk refills the cache, and the emit walk then reuses it instead
-  ;; of re-reading and re-parsing every source. See ei-read-all-for.
-  (ei-form-cache-clear!)
   (jolt-wp-set-record-shapes! (ei-unit) (jolt-wp-host-record-shapes #f))
   (jolt-wp-set-proto-methods! (ei-unit) (jolt-wp-host-proto-methods #f))
   (let ((nodes '()) (ns-nodes '()))
@@ -1460,11 +1456,77 @@
 ;; uncaught reporter, which runs after every dynamic binding here has unwound.
 ;; This walk evaluates nothing, so the two of them are the only record of which
 ;; file a failure came from.
-(define (bld-scan-forms file)
-  (let ((src (ldr-read-source file)))
-    (parameterize ((rdr-scan-mode #t) (rdr-source-file file))
-      (jolt-enter-file! file)
-      (map rdr-form->data (ei-read-all src)))))
+;; A source with no read-time-context token reads identically before its deps
+;; load and after, so bld-scan-forms reads it in normal mode and hands the forms
+;; to the wp walk (ei-form-cache): one parse per source per build instead of two.
+;; Two token shapes DO depend on read-time context and are left to the scan read:
+;; #= evaluates while reading, and an ALIAS-qualified auto keyword — ::alias/kw
+;; or #::alias{...} — needs the alias's namespace loaded. ::kw and #::{} resolve
+;; against the ns itself, which the read installs. A false positive only costs
+;; that file the fast path.
+(define (bld-kw-delim? c)
+  (or (char-whitespace? c)
+      (memv c '(#\( #\) #\[ #\] #\{ #\} #\" #\; #\' #\@ #\^ #\` #\~ #\\ #\,))))
+
+(define (bld-alias-kw-blocked? src i n)
+  ;; i is the first ':' of '::'; blocked when a non-empty alias token is
+  ;; followed by '/' (::alias/kw) or by '{' (#::alias{...}).
+  (let scan ((j (+ i 2)))
+    (cond ((>= j n) #f)
+          ((or (char=? (string-ref src j) #\/) (char=? (string-ref src j) #\{))
+           (>= j (+ i 2)))
+          ((bld-kw-delim? (string-ref src j)) #f)
+          (else (scan (+ j 1))))))
+
+(define (bld-early-read-blocked? src)
+  (let ((n (string-length src)))
+    (let loop ((i 0))
+      (cond ((>= (+ i 1) n) #f)
+            ((and (char=? (string-ref src i) #\#) (char=? (string-ref src (+ i 1)) #\=)) #t)
+            ((and (char=? (string-ref src i) #\:) (char=? (string-ref src (+ i 1)) #\:))
+             (if (bld-alias-kw-blocked? src i n) #t (loop (+ i 2))))
+            (else (loop (+ i 1)))))))
+
+(define (bld-scan-forms ns-name file)
+  (let* ((src (ldr-read-source file))
+         ;; The graph's scan is the first of a build's two reads of every source.
+         ;; Where the source allows it, read it here in NORMAL mode — the read the
+         ;; whole-program walk would do — and stash the forms for that walk. Any
+         ;; reader error (a duplicate map key, a deliberately unbalanced fixture)
+         ;; falls back to the scan read: scan mode tolerates what normal mode
+         ;; rejects and its forms feed only this graph, while a real syntax error
+         ;; is still reported by the loader when it loads the file.
+         ;; bld-seed-name-counters! is what makes the early read reproducible: the
+         ;; reader mints #()/` names from global counters, and the wp walk seeds
+         ;; them per namespace and phase, so the early read has to be seeded the
+         ;; same way or the walk's forms (and the emitted names) would shift.
+         (early (and (not ei-form-cache-off?)
+                     (not (bld-early-read-blocked? src))
+                     (let ((prev (chez-current-ns)))
+                       (let ((forms (guard (e (#t #f))
+                                      (bld-seed-name-counters! ns-name 'wp)
+                                      ;; ::kw / #::{} resolve against this ns, so
+                                      ;; the forms match the wp walk's own read.
+                                      (set-chez-ns! ns-name)
+                                      (parameterize ((rdr-source-file file))
+                                        (jolt-enter-file! file)
+                                        (ei-read-all src)))))
+                         (set-chez-ns! prev)
+                         (when forms
+                           (ei-form-cache-put! ns-name src forms)
+                           forms))))))
+    ;; the fallback's data conversion runs INSIDE the scan-mode parameterization:
+    ;; scan mode's unresolved alias placeholders are what the graph's own requires
+    ;; and class scans are built for, and converting them outside it re-enables
+    ;; the duplicate-literal check that scan mode exists to skip (a set mixing
+    ;; ::o/x with :o/x returned "Duplicate key" here before — build smoke's
+    ;; scan-alias-set case).
+    (parameterize ((rdr-source-file file))
+      (if early
+          (map rdr-form->data early)
+          (parameterize ((rdr-scan-mode #t))
+            (jolt-enter-file! file)
+            (map rdr-form->data (ei-read-all src)))))))
 
 (define (bld-ns-requires* forms)
   (let ((reqs '()))
@@ -1581,7 +1643,7 @@
                              (not (hashtable-ref bld-boot-loaded name #f))
                              ;; preloaded only in the CLI image, not in an app's
                              (ldr-cli-aot? name)))
-                (let ((forms (bld-scan-forms file)))
+                (let ((forms (bld-scan-forms name file)))
                   (dfs (append (bld-ns-class-providers* forms) (bld-ns-requires* forms))))
                 (set! order (cons (cons name file) order)))))
           (dfs (cdr ns)))))
@@ -1679,6 +1741,11 @@
     (parameterize ((ldr-source-only? #t) (ldr-build-aot-cache? #t))
       (load-namespace entry-ns))
     (ei-mark! "load app from source")
+    ;; Start every build with the parsed-form table empty; the graph scan below
+    ;; fills it (bld-scan-forms) and the wp/emit walks consume it. An in-process
+    ;; rebuild (nREPL) after an edit must parse the new source, and the table is
+    ;; keyed by namespace + the source it was parsed from.
+    (ei-form-cache-clear!)
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the
     ;; hook captures dynamic requires the static scan can't see; the includes
