@@ -145,6 +145,59 @@
          (fn [] (locking o (.wait o 150)) :timed-out)
          nil))
 
+;; 17-21. A wait INSIDE A LAZY SEQ's realization (jolt-lang/jolt#1142). Forcing a
+;; lazy cell used to count as holding a lock for the whole thunk, so any of the waits
+;; above, reached from a map/for body on a fiber, raised "a fiber cannot leave the
+;; CPU while its carrier holds a counted lock" -- and a `locking` inside one failed
+;; only when the monitor happened to be contended, which is how samizdat met it (a
+;; DB insert inside a two-collection mapv). The JVM's LazySeq holds a monitor across
+;; whatever the thunk blocks on, so all of these are ordinary Clojure.
+(let [p (promise)]
+  (probe :lazy-doall-map #(vec (doall (map (fn [_] (deref p)) [1]))) #(deliver p :delivered)))
+(let [p (promise)]
+  (probe :lazy-for #(vec (for [_ [1]] (deref p))) #(deliver p :delivered)))
+(let [p (promise)]
+  (probe :lazy-mapv-2 #(mapv (fn [_ _] (deref p)) [1] [2]) #(deliver p :delivered)))
+(let [p (promise)]
+  (probe :lazy-filterv #(filterv (fn [_] (deref p)) [1]) #(deliver p true)))
+;; a timed wait inside the body parks too (a library sleep is one: ebb's is a
+;; scheduler callback behind a wait): the releaser, queued behind the waiter on
+;; the one carrier, has already run when the body wakes. Not Thread/sleep, which
+;; stops the carrier on purpose, as a go block's does on the JVM.
+(let [ran (atom nil)]
+  (probe :lazy-timed-wait
+         #(vec (map (fn [_] (deref (promise) 100 nil) @ran) [1]))
+         #(reset! ran :sibling-ran)))
+;; the samizdat shape: the lock is held by the releaser's side when the lazy body
+;; asks for it, so the body has to park on the monitor mid-realization
+(let [o (Object.)
+      entered (promise)
+      p (promise)]
+  (binding [a/*go-backend* :fiber]
+    (a/go (locking o (deliver entered true) (deref p))))
+  (deref entered)
+  (probe :lazy-contended-locking
+         #(vec (doall (map (fn [_] (locking o :got)) [1])))
+         #(deliver p :released)))
+;; Two fibers forcing the SAME cell: the first parks inside the thunk, holding the
+;; claim; the second must wait for it by giving the carrier away (a sleep would keep
+;; the one carrier the first needs to resume on), and both see the one value.
+(let [p (promise)
+      runs (atom 0)
+      s (map (fn [_] (swap! runs inc) (deref p)) [1])
+      both (a/chan 2)]
+  (binding [a/*go-backend* :fiber]
+    (a/go (a/>! both [:first (first s)]))
+    (a/go (a/>! both [:second (first s)]))
+    (a/go (deliver p :one)))
+  (let [t (a/timeout case-timeout-ms)
+        a1 (a/alts!! [both t])
+        a2 (a/alts!! [both t])]
+    (swap! results conj [:lazy-shared-cell
+                         (if (and (= both (second a1)) (= both (second a2)))
+                           [(into {} [(first a1) (first a2)]) @runs]
+                           :HUNG)])))
+
 (def expected
   {:promise :delivered
    :promise-timed :delivered
@@ -161,7 +214,14 @@
    :waitfor-yields :sibling-ran
    :read-line-yields :sibling-ran
    :object-wait :notified
-   :object-wait-deadline :timed-out})
+   :object-wait-deadline :timed-out
+   :lazy-doall-map [:delivered]
+   :lazy-for [:delivered]
+   :lazy-mapv-2 [:delivered]
+   :lazy-filterv [1]
+   :lazy-timed-wait [:sibling-ran]
+   :lazy-contended-locking [:got]
+   :lazy-shared-cell [{:first :one :second :one} 1]})
 
 (let [got (into {} @results)
       bad (remove (fn [[k v]] (= v (get expected k))) (seq got))
