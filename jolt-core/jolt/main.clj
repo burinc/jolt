@@ -1084,53 +1084,100 @@
   ;; nREPL server so an editor can connect and (require '[some.lib]) live. A
   ;; library's middleware (deps.edn :nrepl/middleware) is composed over the
   ;; built-in handler — sessions / interruptible-eval / completion etc.
-  ;;
-  ;; Checked before `raw-port` below, which filters OUT every "-"-prefixed
-  ;; arg — otherwise --help was silently discarded and this started a real
-  ;; server on the default port instead of printing anything.
-  (if (some #{"-h" "--help" "help"} more)
-    (do (println "usage: jolt nrepl-server [port]")
-        (println)
-        (println "Start an nREPL server (default 7888, or $JOLT_NREPL_PORT) for editors —")
-        (println "CIDER, Calva, Cursive. A library's middleware (deps.edn :nrepl/middleware)")
-        (println "is composed over the built-in handler: sessions, interruptible eval,")
-        (println "completion, lookup, and whatever else the library adds."))
-    (let [resolved (resolve-current)]
-      (apply-project! resolved)
-      (let [raw-port (first (filter #(not (str/starts-with? % "-")) more))
-            parsed (some-> raw-port parse-long)
-            default (parse-long (or (jolt.host/getenv "JOLT_NREPL_PORT") "7888"))
-            port (or parsed default)]
-        (when (and raw-port (nil? parsed))
-          (println (str "warning: ignoring invalid nREPL port '" raw-port "', using " default)))
-        (require 'jolt.nrepl)
-        ;; start binds the socket synchronously on this (primordial) thread, so a
-        ;; failure like the port already being in use surfaces here and exits rather
-        ;; than being swallowed by a background thread. It then runs the accept loop
-        ;; on a worker thread and returns a stop fn, leaving this thread free to own
-        ;; the process main loop: main-thread-affine work an eval starts (e.g. a UI
-        ;; toolkit's event loop) marshals here via jolt.host/call-on-main-thread —
-        ;; on macOS a native UI event loop must run on the main thread or the
-        ;; process aborts (e.g. AppKit rejects setting the main menu off-main).
-        ;; Block SIGINT in this (primordial) thread before starting the server so the
-        ;; accept-loop future — and the conn-handler futures it spawns — inherit a
-        ;; blocked SIGINT mask. Without this, ^C lands on the accept loop blocked in
-        ;; c-accept (a foreign call), where Chez can't fire the keyboard-interrupt
-        ;; handler, and the server hangs. Registering the stop hook below then arms
-        ;; the shutdown watcher, which takes SIGINT along with SIGTERM/SIGHUP, so ^C
-        ;; is picked up by sigwait and the hooks run cleanly wherever this thread is.
-        ;; (park-until-interrupt keeps SIGINT blocked while that watcher is running,
-        ;; and only unblocks it for its own ^C handler when nothing armed one.)
-        (jolt.host/block-sigint)
-        (let [stop ((resolve 'jolt.nrepl/start) port (:nrepl-middleware resolved))]
-          ;; register stop so ^C (handled by park-until-interrupt) closes the socket
-          ;; and drops .nrepl-port on the way out.
-          (jolt.host/add-shutdown-hook stop)
-          ;; park here until ^C (handled by park-until-interrupt's keyboard-interrupt-
-          ;; handler, which runs the shutdown hooks and exits). The accept loop
-          ;; inherited SIGINT-blocked above, so ^C is delivered to this thread.
-          (jolt.host/park-until-interrupt)
-          (when stop (stop)))))))
+  (let [resolved (resolve-current)]
+    (apply-project! resolved)
+    (let [raw-port (first (filter #(not (str/starts-with? % "-")) more))
+          parsed (some-> raw-port parse-long)
+          default (parse-long (or (jolt.host/getenv "JOLT_NREPL_PORT") "7888"))
+          port (or parsed default)]
+      (when (and raw-port (nil? parsed))
+        (println (str "warning: ignoring invalid nREPL port '" raw-port "', using " default)))
+      (require 'jolt.nrepl)
+      ;; start binds the socket synchronously on this (primordial) thread, so a
+      ;; failure like the port already being in use surfaces here and exits rather
+      ;; than being swallowed by a background thread. It then runs the accept loop
+      ;; on a worker thread and returns a stop fn, leaving this thread free to own
+      ;; the process main loop: main-thread-affine work an eval starts (e.g. a UI
+      ;; toolkit's event loop) marshals here via jolt.host/call-on-main-thread —
+      ;; on macOS a native UI event loop must run on the main thread or the
+      ;; process aborts (e.g. AppKit rejects setting the main menu off-main).
+      ;; Block SIGINT in this (primordial) thread before starting the server so the
+      ;; accept-loop future — and the conn-handler futures it spawns — inherit a
+      ;; blocked SIGINT mask. Without this, ^C lands on the accept loop blocked in
+      ;; c-accept (a foreign call), where Chez can't fire the keyboard-interrupt
+      ;; handler, and the server hangs. Registering the stop hook below then arms
+      ;; the shutdown watcher, which takes SIGINT along with SIGTERM/SIGHUP, so ^C
+      ;; is picked up by sigwait and the hooks run cleanly wherever this thread is.
+      ;; (park-until-interrupt keeps SIGINT blocked while that watcher is running,
+      ;; and only unblocks it for its own ^C handler when nothing armed one.)
+      (jolt.host/block-sigint)
+      (let [stop ((resolve 'jolt.nrepl/start) port (:nrepl-middleware resolved))]
+        ;; register stop so ^C (handled by park-until-interrupt) closes the socket
+        ;; and drops .nrepl-port on the way out.
+        (jolt.host/add-shutdown-hook stop)
+        ;; park here until ^C (handled by park-until-interrupt's keyboard-interrupt-
+        ;; handler, which runs the shutdown hooks and exits). The accept loop
+        ;; inherited SIGINT-blocked above, so ^C is delivered to this thread.
+        (jolt.host/park-until-interrupt)
+        (when stop (stop))))))
+
+(def ^:private command-docs
+  "The commands section of `jolt help`, in order: [command lines]. A row whose
+  command is nil is not a command of its own (a bare FILE, a task). `jolt CMD
+  --help` prints CMD's rows."
+  [["repl"
+    ["  repl                   start a REPL"]]
+   ["nrepl-server"
+    ["  nrepl-server [port]    start an nREPL server (default 7888) for editors"]]
+   ["run"
+    ["  run -m NS [args]       resolve deps.edn, load NS, call its -main"
+     "  run FILE [args]        load a Clojure file"]]
+   [nil
+    ["  FILE [args]            the same, with `run` left out — so a file whose"
+     "                         first line is `#!/usr/bin/env jolt` runs as an"
+     "                         executable script, with or without an extension"]]
+   ["build"
+    ["  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--closed-world] [--dynamic]"
+     "              [--boot fast|small|plain] [--library] [--signable]"
+     "              [--include NS] [--target MACHINE --target-pack DIR]"
+     "                         compile a standalone binary, or with --library a"
+     "                         shared object an embedder dlopens and calls through"
+     "                         jolt_library_init + jolt_lookup; --target"
+     "                         cross-compiles either one for another Chez machine"
+     "                         (see tools/cross-compile). A self-contained jolt's"
+     "                         default executable output has most of its bytes"
+     "                         outside its own Mach-O/PE/ELF image, which a strict"
+     "                         signature check (codesign --verify --strict on"
+     "                         macOS) refuses; --signable produces a structurally"
+     "                         complete binary instead, at the cost of spawning a"
+     "                         separate Chez process and needing a C toolchain"
+     "                         (no effect on --library, always structurally"
+     "                         complete, or on a --target build, already forced"
+     "                         onto this same path)"
+     "                         --include NS bakes a namespace the require scan"
+     "                         cannot see (one reached only by a runtime"
+     "                         requiring-resolve); repeatable, and"
+     "                         :jolt/build {:include [ns …]} does the same"]]
+   ["path"
+    ["  path                   print the resolved source roots"]]
+   ["tasks"
+    ["  tasks                  list the project's bb.edn/deps.edn :tasks"]]
+   ["completions"
+    ["  completions SHELL      print a completion function to source, for"
+     "                         zsh, bash or fish; `completions tasks` prints"
+     "                         the name/doc lines that function asks for"]]
+   [nil
+    ["  <task> [args]          run a task (`run <task>` and `run --parallel"
+     "                         <task>` do the same)"]]])
+
+(def ^:private builtin-commands
+  "The commands jolt dispatches itself, which a task may take over only with
+  :override-builtin, and which answer -h/--help with their own usage."
+  #{"run" "repl" "nrepl-server" "path" "build" "tasks" "completions"})
+
+(defn- command-usage [cmd]
+  (println "usage:")
+  (doseq [[k ls] command-docs :when (= k cmd), l ls] (println l)))
 
 (defn- usage []
   (println (str "jolt " (version)))
@@ -1139,41 +1186,7 @@
   (println "With no command, starts a REPL.")
   (println)
   (println "commands:")
-  (println "  repl                   start a REPL")
-  (println "  nrepl-server [port]    start an nREPL server (default 7888) for editors")
-  (println "  run -m NS [args]       resolve deps.edn, load NS, call its -main")
-  (println "  run FILE [args]        load a Clojure file")
-  (println "  FILE [args]            the same, with `run` left out — so a file whose")
-  (println "                         first line is `#!/usr/bin/env jolt` runs as an")
-  (println "                         executable script, with or without an extension")
-  (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--closed-world] [--dynamic]")
-  (println "              [--boot fast|small|plain] [--library] [--signable]")
-  (println "              [--include NS] [--target MACHINE --target-pack DIR]")
-  (println "                         compile a standalone binary, or with --library a")
-  (println "                         shared object an embedder dlopens and calls through")
-  (println "                         jolt_library_init + jolt_lookup; --target")
-  (println "                         cross-compiles either one for another Chez machine")
-  (println "                         (see tools/cross-compile). A self-contained jolt's")
-  (println "                         default executable output has most of its bytes")
-  (println "                         outside its own Mach-O/PE/ELF image, which a strict")
-  (println "                         signature check (codesign --verify --strict on")
-  (println "                         macOS) refuses; --signable produces a structurally")
-  (println "                         complete binary instead, at the cost of spawning a")
-  (println "                         separate Chez process and needing a C toolchain")
-  (println "                         (no effect on --library, always structurally")
-  (println "                         complete, or on a --target build, already forced")
-  (println "                         onto this same path)")
-  (println "                         --include NS bakes a namespace the require scan")
-  (println "                         cannot see (one reached only by a runtime")
-  (println "                         requiring-resolve); repeatable, and")
-  (println "                         :jolt/build {:include [ns …]} does the same")
-  (println "  path                   print the resolved source roots")
-  (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
-  (println "  completions SHELL      print a completion function to source, for")
-  (println "                         zsh, bash or fish; `completions tasks` prints")
-  (println "                         the name/doc lines that function asks for")
-  (println "  <task> [args]          run a task (`run <task>` and `run --parallel")
-  (println "                         <task>` do the same)")
+  (doseq [[_ ls] command-docs, l ls] (println l))
   (println "  help, --help, -h       print this message")
   (println "  version, --version, -V print the jolt version")
   (println)
@@ -1289,9 +1302,15 @@
       ;; (babashka's :override-builtin). Checked here, after the two commands
       ;; that read no project at all, so it costs nothing a command doesn't
       ;; already pay: everything below resolves the project anyway.
-      (and (#{"run" "repl" "nrepl-server" "path" "build" "tasks" "completions"} cmd)
-           (builtin-overridden? cmd))
+      (and (builtin-commands cmd) (builtin-overridden? cmd))
       (run-task cmd more false)
+
+      ;; CMD -h / --help: that command's usage, before it resolves a project or
+      ;; reads its arguments -- each command parses its own, and none of them
+      ;; knew the flag (nrepl-server dropped every "-" argument and started a
+      ;; server, repl started a REPL, build asked for an entry; #1152)
+      (and (builtin-commands cmd) (#{"-h" "--help"} (first more)))
+      (command-usage cmd)
 
       (= cmd "run")                      (cmd-run more)
       (= cmd "repl")                     (repl)

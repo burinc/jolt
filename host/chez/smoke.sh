@@ -579,6 +579,21 @@ else
   echo "  FAIL: --help should print the same usage as help"
   fails=$((fails + 1))
 fi
+# CMD -h / --help prints that command's usage and runs nothing: each command
+# parsed its own args and none knew the flag, so nrepl-server --help started a
+# server on the default port and repl --help a REPL (#1152).
+help_dir="$(mktemp -d)"
+help_jolt="$jolt_timeout $(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+for c in run repl nrepl-server path tasks completions build; do
+  out="$(cd "$help_dir" && JOLT_PWD="$help_dir" JOLT_NREPL_PORT=45991 $help_jolt $c --help </dev/null 2>&1)"; rc=$?
+  if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q "^  $c " && [ ! -e "$help_dir/.nrepl-port" ]; then
+    pass=$((pass + 1))
+  else
+    echo "  FAIL: $c --help should print its usage and run nothing (exit $rc): $(printf '%s' "$out" | head -2)"
+    fails=$((fails + 1))
+  fi
+done
+rm -rf "$help_dir"
 # version / --version are synonyms and name the version.
 if $jolt version 2>/dev/null | grep -q '^jolt ' \
    && [ "$($jolt version 2>/dev/null)" = "$($jolt --version 2>/dev/null)" ]; then
