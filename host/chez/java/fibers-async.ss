@@ -316,7 +316,7 @@
 ;; "cannot collect when multiple threads are active" refusal (the JVM-faithful
 ;; guarded no-op), but the gate must SEE that refusal when the poller's blocking
 ;; wait is not collect-safe — a collect that fails proves it.
-(def-var! "jolt.host" "gc-full!" (lambda () (sa-gc-collect)))
+(def-var! "jolt.host" "gc-full!" (lambda () (jolt-collect-full!)))
 
 ;; --- jolt.fibers: the public lower-level API (epic jolt-of08.1) ---------------
 ;; stdlib/jolt/fibers.clj is a thin veneer over these seams. spawn mirrors

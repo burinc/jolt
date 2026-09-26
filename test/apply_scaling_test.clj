@@ -18,7 +18,13 @@
 ;;   mark is floored at one collection trip (jolt.host/gc-trip-bytes): between
 ;;   two collections at most that much is allocated, so work that holds nothing
 ;;   can raise the footprint by up to a trip and no more, and anything under it
-;;   is invisible by construction. Two streaming arms read the floor, ratio 1.
+;;   is invisible by construction. The older generations add their own slack:
+;;   they are collected when the heap grows past the collector's allowance over
+;;   the last live set (jolt.host/gc-old-growth-bytes), so garbage promoted before
+;;   that point also raises the mark, by up to the allowance, and by how much
+;;   depends on where the arm lands against it, not on its length (CI read 12MB
+;;   vs 36MB for two streaming arms). The floor is a trip plus that allowance.
+;;   Two streaming arms read the floor, ratio 1.
 ;;   A materialized rest holds n elements at once and reads its own size, so
 ;;   the ratio lands near 4. A control arm applies max to a vector that IS held
 ;;   for the whole call and must read above the ceiling first, so a reading
@@ -35,6 +41,9 @@
 
 (ns apply-scaling-test)
 
+;; A held rest of n1 reads ~85MB, over the floor a fresh process starts with
+;; (a trip plus the older generations' 64MB minimum): a floor above the smaller
+;; arm's reading would compress a real 4x into a pass.
 (def ^:private n1 2000000)
 (def ^:private factor 4)
 ;; Streaming measures 1 exactly and a materialized rest ~4, so the line sits
@@ -45,20 +54,20 @@
 (defn- peak-growth
   "[floored-mb raw-mb]: how far the heap footprint rose while f ran, from the
   collector's high-water mark reset before f and read after it, floored at one
-  collection trip."
+  collection trip plus the older generations' growth allowance."
   [f]
   (System/gc)
   (jolt.host/reset-maximum-memory-bytes!)
-  (let [base (jolt.host/current-memory-bytes)]
+  (let [base (jolt.host/current-memory-bytes)
+        floor (+ (jolt.host/gc-trip-bytes) (jolt.host/gc-old-growth-bytes))]
     (f)
-    (let [growth (- (jolt.host/maximum-memory-bytes) base)
-          floor (jolt.host/gc-trip-bytes)]
-      [(max 1 (quot (max growth floor) mb)) (quot growth mb)])))
+    (let [growth (- (jolt.host/maximum-memory-bytes) base)]
+      [(max 1 (quot (max growth floor) mb)) (quot growth mb) (quot floor mb)])))
 
-(defn- report [label [m1 raw1] [m4 raw4]]
+(defn- report [label [m1 raw1 floor1] [m4 raw4 floor4]]
   (let [ratio (double (/ m4 m1))]
-    (println (format "apply-scaling %s: %dMB vs %dMB (x%d args) ratio %.2f (ceiling %.1f; raw %dMB vs %dMB, floor %dMB)"
-                     label m1 m4 factor ratio max-ratio raw1 raw4 (quot (jolt.host/gc-trip-bytes) mb)))
+    (println (format "apply-scaling %s: %dMB vs %dMB (x%d args) ratio %.2f (ceiling %.1f; raw %dMB vs %dMB, floor %dMB/%dMB)"
+                     label m1 m4 factor ratio max-ratio raw1 raw4 floor1 floor4))
     ratio))
 
 (defn- judge [label g1 g4]
@@ -84,17 +93,19 @@
     (println "FAIL apply-scaling: wrong values before any measurement — fix that first")
     (System/exit 1))
 
-  ;; SPACE: the yardstick first, then the shape.
+  ;; SPACE: the yardstick is judged first, but measured LAST: its held vectors
+  ;; make the collector's full collections slow, which grows the older
+  ;; generations' allowance (and so the floor) for everything measured after.
   (apply + (range 1000)) (apply max (range 1000))          ; warm
-  (judge-control "control: apply max over a held vector"
-                 (peak-growth #(apply max (vec (range n1))))
-                 (peak-growth #(apply max (vec (range (* factor n1))))))
-  (judge "apply +"
-         (peak-growth #(apply + (range n1)))
-         (peak-growth #(apply + (range (* factor n1)))))
-  (judge "apply max"
-         (peak-growth #(apply max (range n1)))
-         (peak-growth #(apply max (range (* factor n1)))))
+  (let [plus [(peak-growth #(apply + (range n1)))
+              (peak-growth #(apply + (range (* factor n1))))]
+        mx [(peak-growth #(apply max (range n1)))
+            (peak-growth #(apply max (range (* factor n1))))]
+        control [(peak-growth #(apply max (vec (range n1))))
+                 (peak-growth #(apply max (vec (range (* factor n1)))))]]
+    (apply judge-control "control: apply max over a held vector" control)
+    (apply judge "apply +" plus)
+    (apply judge "apply max" mx))
 
   ;; TERMINATION: unbounded seq, short-circuiting chain. A materializing apply
   ;; cannot answer at all, so run each on a future and give it a deadline —

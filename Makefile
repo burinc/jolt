@@ -599,6 +599,9 @@ gcpolicy: testbin
 	 echo "gcpolicy: JOLT_MAX_HEAP=256m with ~100MB held -> total after collections $${after}MB, peak $$((pk / 1048576))MB, max $$((mx / 1048576))MB"; \
 	 [ -n "$$after" ] && [ $$((after * 1048576 * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: a collection left the total heap at $${after}MB, more than 10% over JOLT_MAX_HEAP=256m: the ceiling bounds the TOTAL heap, as -Xmx does, within the collector's working room"; exit 1; }; \
 	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the total heap peaked at $$pk during collections, more than 10% over JOLT_MAX_HEAP=256m (v0.8.12 peaked 23% over)"; exit 1; }; \
+	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
+	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
+	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -eq 67108864 ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
 	 oh=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=1g JOLT_GC_TIME_LIMIT=0 JOLT_GC_HEAP_FREE_LIMIT=100 $$j run $$t churn 2>&1) || true; \
 	 case "$$oh" in *OutOfMemoryError*"GC overhead limit exceeded"*) ;; *) echo "FAIL gcpolicy: with every collection over the limits, the GC overhead limit did not raise: $$(printf '%s' "$$oh" | head -2)"; exit 1;; esac; \
 	 off=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=1g JOLT_GC_TIME_LIMIT=0 JOLT_GC_HEAP_FREE_LIMIT=100 JOLT_GC_OVERHEAD_LIMIT=off $$j run $$t churn 2>&1 | sed -n 's/^trip //p'); \

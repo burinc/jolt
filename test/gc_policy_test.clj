@@ -32,8 +32,22 @@
       (recur (inc i) (mapv (fn [j] {:i j :s (str j "-" i)}) (range 200000)))
       (+ (count window) (count @held)))))
 
+;; For the refresh: a full collection the program asks for measures the live set
+;; as the policy's own do, so the older generations' allowance afterwards is sized
+;; from what is live NOW. Held data grows the allowance past its 64MB minimum;
+;; dropped and collected, it goes back. Before, System/gc left the policy's
+;; figure where its last own full collection put it.
+(defn- refresh []
+  (reset! held (vec (map (fn [i] {:i i :s (str "held-" i)}) (range 600000))))
+  (System/gc)
+  (let [with-held (jolt.host/gc-old-growth-bytes)]
+    (reset! held nil)
+    (System/gc)
+    (println "growth" with-held (jolt.host/gc-old-growth-bytes))))
+
 (defn -main [mode]
   (case mode
+    "refresh" (refresh)
     "churn" (churn)
     "light" (reduce + (range 1000))
     "pinned" (churn)

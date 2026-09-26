@@ -727,10 +727,22 @@
 (define gc-full-ms-this-time 0)
 (define gc-old-factor 2.0)
 (define gc-last-full-end-ms 0)
+;; A full collection asked for by the program (System/gc, Runtime.gc,
+;; jolt.host/gc-full!) measures the live set as the policy's own do, so what the
+;; heap may grow by afterwards is sized from it rather than from whatever was live
+;; at the policy's last full one. Raises what sa-gc-collect raises.
+(define (jolt-collect-full!)
+  (sa-gc-collect)
+  (set! gc-live-after-full (sa-bytes-allocated)))
+;; How far the heap may grow past the live set before the older generations are
+;; collected: garbage promoted before then stays, so work that holds nothing can
+;; raise the footprint by up to this (jolt.host/gc-old-growth-bytes).
+(define (gc-old-growth-limit live)
+  (max (exact (floor (* gc-old-factor live))) (+ live (* 64 1024 1024))))
+(define (gc-old-growth-bytes) (- (gc-old-growth-limit gc-live-after-full) gc-live-after-full))
 (define (gc-collect-old-when-grown! collect-full!)
   (let ((live gc-live-after-full))
-    (when (> (sa-bytes-allocated)
-             (max (exact (floor (* gc-old-factor live))) (+ live (* 64 1024 1024))))
+    (when (> (sa-bytes-allocated) (gc-old-growth-limit live))
       (let ((t0 (sa-real-time-ms)))
         ;; tight (in place) when a second copy of the live data would not fit
         ;; under a heap ceiling, as for the ceiling's own collections
@@ -1885,6 +1897,9 @@
 ;; which bounds how far work that holds nothing can raise the footprint.
 (def-var! "jolt.host" "reset-maximum-memory-bytes!" (lambda () (sa-reset-max-memory-bytes!) jolt-nil))
 (def-var! "jolt.host" "gc-trip-bytes" (lambda () (sa-gc-trip-bytes)))
+;; and how far the older generations may grow past the live set before they are
+;; collected (rt.ss gc-collect-old-when-grown!): the rest of that bound.
+(def-var! "jolt.host" "gc-old-growth-bytes" (lambda () (gc-old-growth-bytes)))
 ;; The calling thread's id, so telemetry can be read per-thread. Wrapped in a lambda
 ;; so the get-thread-id reference resolves at CALL time: a non-threaded Chez build
 ;; lacks the binding, and only a caller that actually asks for a thread id should

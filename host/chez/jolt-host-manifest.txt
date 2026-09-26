@@ -165,6 +165,7 @@ mark-spliced!
 maximum-memory-bytes
 reset-maximum-memory-bytes!
 gc-trip-bytes
+gc-old-growth-bytes
 mkdirs!
 monitor-enter
 monitor-exit

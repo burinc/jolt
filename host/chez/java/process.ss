@@ -2192,7 +2192,7 @@
         ;; hint semantics — Chez's collect refuses while multiple threads are live,
         ;; and neither of these ever throws on the JVM.
         (cons "gc" (lambda (self)
-                     (guard (e (#t #f)) (sa-gc-collect))
+                     (guard (e (#t #f)) (jolt-collect-full!))
                      jolt-nil))
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).
