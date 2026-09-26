@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A prebuilt **Android arm64** binary (`jolt-<ver>-aarch64-android.tar.gz`) for
+  Termux, built and checked in `termux/termux-docker` on each release (#943). It
+  needs Termux's `ncurses`, `libuuid` and `libiconv`; the install script picks it
+  on Android and says which packages to add if one is missing. CI builds it and
+  runs the gate on bionic (`make bionic-ci`) on every push; the gates that still
+  fail there are listed in the Makefile and tracked as bugs.
 - **A clj-kondo config and hook for `jolt.ffi`, exported at
   `clj-kondo.exports/jolt-lang/jolt/`.** Without it, clj-kondo cannot see
   through `defcfn`'s `__cfn` expansion, so every C symbol it binds reads as

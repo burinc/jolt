@@ -83,8 +83,13 @@ fi
 case "$(uname -s)" in
     Linux*)  platform=linux ;;
     Darwin*) platform=macos ;;
-    *) >&2 echo "Unsupported OS: $(uname -s). Prebuilt binaries exist for Linux and macOS."; exit 1 ;;
+    *) >&2 echo "Unsupported OS: $(uname -s). Prebuilt binaries exist for Linux, macOS and Android (Termux)."; exit 1 ;;
 esac
+# Android (Termux) reports Linux, but its libc is bionic: a glibc binary cannot
+# run there, so it has its own build.
+if [[ "$platform" == "linux" && "$(uname -o 2>/dev/null || true)" == "Android" ]]; then
+    platform=android
+fi
 
 case "$(uname -m)" in
     x86_64|amd64)   arch=x86_64 ;;
@@ -94,13 +99,13 @@ esac
 
 target="${arch}-${platform}"
 case "$target" in
-    x86_64-linux|aarch64-macos) ;;
+    x86_64-linux|aarch64-macos|aarch64-android) ;;
     x86_64-macos)
        >&2 echo "No prebuilt jolt for Intel macOS (GitHub retired the Intel runner)."
        >&2 echo "Build from source: https://github.com/${repo} (needs Chez Scheme + cc)."
        exit 1 ;;
     *) >&2 echo "No prebuilt jolt for ${target}."
-       >&2 echo "Available: x86_64-linux, aarch64-macos."
+       >&2 echo "Available: x86_64-linux, aarch64-macos, aarch64-android."
        >&2 echo "Build from source: https://github.com/${repo} (make jolt-release)."
        exit 1 ;;
 esac
@@ -196,6 +201,13 @@ if ! run_err="$("$install_dir/jolt" --version 2>&1 >/dev/null)"; then
         >&2 echo "This build needs ${missing:-a library that is not installed here}."
         >&2 echo "Install that library, or install a jolt that bakes it in:"
         >&2 echo "  brew install lz4        # if the missing library is liblz4"
+    fi
+    # The Android build links Termux's libiconv (bionic has no iconv), ncurses
+    # and libuuid; the loader names the first one missing.
+    if [[ "$platform" == "android" && "$run_err" == *"not found"* ]]; then
+        >&2 echo ""
+        >&2 echo "Install the libraries the Android build links against:"
+        >&2 echo "  pkg install ncurses libuuid libiconv"
     fi
     if [[ "$run_err" == *GLIBC_* ]]; then
         need="$(printf '%s' "$run_err" | sed -nE "s/.*GLIBC_([0-9.]+).*/\1/p" | head -1)"

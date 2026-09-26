@@ -144,6 +144,15 @@ jobs:
           - os: windows-latest
             target: x86_64-windows
             shell: msys2 {0}
+          # Android (bionic, #943): built in termux/termux-docker on the arm64
+          # runner by ci/termux-build.sh, which also runs the smokes and the
+          # dependency allowlist there -- the host cannot execute a bionic binary,
+          # so the host-side checks below skip this row. The binary links Termux's
+          # ncurses, libuuid and libiconv.
+          - os: ubuntu-24.04-arm
+            target: aarch64-android
+            shell: bash
+            termux: termux/termux-docker:aarch64
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -159,13 +168,13 @@ jobs:
       # image. The container writes target/release/jolt into the mounted
       # workspace; every later step (smokes, package) runs on the host. ---
       - name: Clone Chez Scheme source (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.termux
         run: |
           git clone --depth 1 --branch v10.4.1 --recurse-submodules \
             https://github.com/cisco/ChezScheme.git "$HOME/chez-src"
 
       - name: Cache Chez Scheme (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.termux
         id: cache-chez
         uses: actions/cache@v5
         with:
@@ -173,7 +182,7 @@ jobs:
           key: chez-manylinux2014-v10.4.1-static-pic-v2
 
       - name: Build jolt in ${{ matrix.container-build }} (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.termux
         env:
           JOLT_VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -186,6 +195,23 @@ jobs:
             -e JOLT_VERSION="$JOLT_VERSION" \
             -e STATIC_DEPS=1 \
             '${{ matrix.container-build }}' sh ci/glibc-floor-build.sh
+
+      # --- Android: Chez and jolt both build inside the Termux image (the
+      # Makefile's bionic path provisions the pinned Chez); the script copies
+      # the binary back into the workspace, which the container's unprivileged
+      # user can only write where the host has opened it up. ---
+      - name: Build jolt in Termux (Android)
+        if: matrix.termux
+        env:
+          JOLT_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          mkdir -p target/release
+          chmod 777 target target/release
+          # env inside the command: the image's entrypoint clears the environment
+          docker run --rm \
+            -v "$PWD":/src \
+            '${{ matrix.termux }}' env JOLT_VERSION="$JOLT_VERSION" sh /src/ci/termux-build.sh
+          cat target/release/bionic-report.txt
 
       # --- macOS: Homebrew chezscheme ships `chez` plus the csv kernel dev files
       # (libkernel.a, scheme.h, *.boot), which is all build-jolt needs — and,
@@ -324,7 +350,7 @@ jobs:
       # `jolt --version` check died with a dyld error for everyone else, and
       # nothing in this workflow noticed. Now it would.
       - name: Assert the binary needs no library the target machine may not have
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !matrix.termux
         run: |
           bin=target/release/jolt
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -361,6 +387,7 @@ jobs:
       # The gzip round trip goes through the zlib the binary links and registers
       # as jolt_z_* (java.util.zip, #916).
       - name: Smoke the binary
+        if: ${{ !matrix.termux }}
         run: |
           out="$($JOLT_RUN_PREFIX ./target/release/jolt -e '(reduce + (range 10))')"
           test "$out" = "45" || { echo "jolt -e gave '$out', want 45"; exit 1; }
@@ -372,6 +399,7 @@ jobs:
       # so a build that reaches for host/chez/*.ss on the filesystem fails here,
       # not on a user's machine.
       - name: Smoke a self-contained build
+        if: ${{ !matrix.termux }}
         run: |
           jolt="$(pwd)/target/release/jolt"
           work="$(mktemp -d)"
@@ -404,7 +432,7 @@ jobs:
       # cross row runs an x86_64 binary under Rosetta, where a `cc` that
       # defaults to arm64 cannot link the spilled x86_64 kernel at all.
       - name: Smoke a self-contained build with a static native (the relink path)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.termux
         run: |
           jolt="$(pwd)/target/release/jolt"
           work="$(mktemp -d)"
@@ -438,6 +466,7 @@ jobs:
       # boot's top-level defines must be visible to the runtime compiler's eval
       # (issue #290: this died with "variable var-deref is not bound").
       - name: Smoke a runtime require in a built binary
+        if: ${{ !matrix.termux }}
         run: |
           jolt="$(pwd)/target/release/jolt"
           work="$(mktemp -d)"
