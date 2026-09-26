@@ -182,6 +182,20 @@
                   (let [c (nth cur i) a (nth argtypes i nil)]
                     (cond (nil? c) a (nil? a) c :else (join c a))))))))
 
+;; While the pass walks ONE node, record-ctor-site! captures that node's ctor-site
+;; ops (in walk order) instead of folding them into the unit accumulator: the
+;; accumulator is rebuilt once after convergence (wp-replay-ctor-ops!), in node
+;; order and per-node walk order, from the ops each node's LAST walk recorded —
+;; the sequence an all-node pass would have written. nil outside a wp-pass walk
+;; (the ops then fold into the unit accumulator directly, as before).
+(def ^:dynamic *wp-node-cells* nil) ; [join-ops-atom demote-keys-atom] or nil
+(defn- record-ctor-join! [env vk fields ats]
+  (if *wp-node-cells*
+    (swap! (nth *wp-node-cells* 0) conj [vk fields ats])
+    (swap! (:wp-field-joins (:unit env)) join-ctor-args vk fields ats)))
+(defn- record-ctor-demote! [env ck]
+  (swap! (if *wp-node-cells* (nth *wp-node-cells* 1) (:wp-field-demote (:unit env))) conj ck))
+
 ;; build a record's struct TYPE from its registry entry, resolving each field's
 ;; declared type hint against `shapes` ("ns/->Name" -> entry). A field tagged with
 ;; a record type (its ctor-key) recurses, so a Vec3 stored in a Ray field reads
@@ -590,18 +604,17 @@
       (and entry (= n (count (get entry :fields)))
            (not (= (get env :map->-ctor-key) vk))
            (not (map->-self-for-record? (get env :self-name) vk)))
-      (swap! (:wp-field-joins (:unit env))
-             #(join-ctor-args % vk (get entry :fields) ats))
+      (record-ctor-join! env vk (get entry :fields) ats)
       (and (nil? entry) (.startsWith ^String (get fnode :name) "map->"))
       (let [ck (str (get fnode :ns) "/->" (.substring ^String (get fnode :name) 5))]
-        (when (contains? shapes ck) (swap! (:wp-field-demote (:unit env)) conj ck)))
+        (when (contains? shapes ck) (record-ctor-demote! env ck)))
       (and (= "clojure.core" (get fnode :ns)) (= (get fnode :name) "assoc")
            (= n 3) (= :const (get (nth args 1) :op)) (keyword? (get (nth args 1) :val)))
       (let [coll-t (ty (nth ares 0)) kw (get (nth args 1) :val)]
         (when-not (record-t? coll-t)
           (doseq [[ck e] shapes]
             (when (contains? (into #{} (get e :fields)) kw)
-              (swap! (:wp-field-demote (:unit env)) conj ck)))))
+              (record-ctor-demote! env ck)))))
       :else nil)))
 
 ;; A parameter carrying a primitive tag jolt acts on nowhere (analyzer
@@ -1414,23 +1427,97 @@
                 pt2)))
           pt calls))
 
+;; JOLT_NO_WP_MEMO=1 disables the walk skip; the pass then walks every node
+;; every pass and folds ctor ops straight into the unit accumulator, i.e. the
+;; pre-memo pass. The memoized and unmemoized passes must produce identical
+;; seeds/field types, so an A/B of the two over the same program is the
+;; equivalence check.
+(def ^:private wp-memo-off? (jolt.host/getenv "JOLT_NO_WP_MEMO"))
+
+;; the keys whose current return types a walk can read (its collected call heads),
+;; as a stable set.
+(defn- wp-call-keys [calls]
+  (reduce (fn [s c] (conj s (nth c 0))) (sorted-set) calls))
+
 ;; one fixpoint pass over every top-level node: a specializable def is typed
 ;; under the current param seeds (so a seeded record flows into the calls it
 ;; makes) and contributes its return type; any other form is typed only to
-;; harvest its call sites and escapes. Returns {:rets :ptypes}, with ptypes
-;; recomputed fresh each pass — :any is absorbing, so accumulating across passes
-;; would pin a param at :any before its callers' return types are known.
-(defn- wp-pass [unit nodes spec ks ptypes]
-  (reduce
-    (fn [acc node]
-      (let [k (when (= :def (get node :op)) (str (get node :ns) "/" (get node :name)))
-            s (and k (get spec k))]
-        (if s
-          (let [r (infer-body unit (:body s) (zipmap (:params s) (get ptypes k)) (:name s) k (:params s))]
-            (-> acc (assoc-in [:rets k] (nth r 0))
-                    (update :ptypes wp-accum spec (nth r 2))))
-          (update acc :ptypes wp-accum spec (nth (infer-body unit node {}) 2)))))
-    {:rets {} :ptypes (wp-empty-ptypes spec ks)} nodes))
+;; harvest its call sites and escapes. Returns {:rets :ptypes :memo :walked
+;; :skipped}, with ptypes recomputed fresh each pass — :any is absorbing, so
+;; accumulating across passes would pin a param at :any before its callers'
+;; return types are known.
+;;
+;; A node's walk is a pure function of the node and the ambient inputs it reads:
+;; its own param seeds and the return types of the keys its calls name (field
+;; types, pm-rets, record shapes and *collect-self-rec?* are fixed for the whole
+;; pass). The memo (threaded pass to pass) holds, per node, those inputs and the
+;; walk's outputs, so a node whose inputs did not move since its last walk is
+;; skipped and contributes the recorded ret/calls/joins/demote — the same values
+;; a fresh walk would have produced. The pass therefore emits exactly the
+;; all-node pass's outputs; it just stops re-walking the part of the graph the
+;; last pass already settled, which is where the Jacobi iteration's redundant
+;; work lives (a change reaches one more level of the call graph per pass).
+(defn- wp-pass [unit nodes spec ks ptypes rets memo]
+  ;; the unmemoized pass writes the unit accumulator as it walks (the pre-memo
+  ;; pas), so each pass starts it empty; the memoized pass leaves the accumulator
+  ;; alone and wp-replay-ctor-ops! rebuilds it once after convergence.
+  (when wp-memo-off?
+    (reset! (:wp-field-joins unit) {})
+    (reset! (:wp-field-demote unit) #{}))
+  (let [pass
+    (reduce
+      (fn [acc [i node]]
+        (let [k (when (= :def (get node :op)) (str (get node :ns) "/" (get node :name)))
+              s (and k (get spec k))
+              seeds (when s (get ptypes k))
+              old (nth (:memo acc) i)
+              skip? (and (not wp-memo-off?) old (= seeds (:seeds old))
+                         (every? (fn [d] (= (get rets d) (get (:vals old) d))) (:deps old)))]
+          (if skip?
+            (-> acc
+                (update :skipped inc)
+                (cond-> s (assoc-in [:rets k] (:ret old)))
+                (update :ptypes wp-accum spec (:calls old)))
+            (let [cells (when-not wp-memo-off? [(atom []) (atom [])])
+                  r (binding [*wp-node-cells* cells]
+                      (if s
+                        (infer-body unit (:body s) (zipmap (:params s) seeds) (:name s) k (:params s))
+                        (infer-body unit node {})))
+                  calls (nth r 2)]
+              (if wp-memo-off?
+                (-> acc
+                    (update :walked inc)
+                    (cond-> s (assoc-in [:rets k] (nth r 0)))
+                    (update :ptypes wp-accum spec calls))
+                (let [deps (cond-> (into (or (:deps old) (sorted-set)) (wp-call-keys calls))
+                             s (conj k))]
+                  (-> acc
+                      (update :walked inc)
+                      (cond-> s (assoc-in [:rets k] (nth r 0)))
+                      (update :ptypes wp-accum spec calls)
+                      (assoc-in [:memo i]
+                                {:deps deps
+                                 :vals (reduce (fn [m d] (assoc m d (get rets d))) {} deps)
+                                 :seeds seeds :ret (when s (nth r 0)) :calls calls
+                                 :join-ops @(nth cells 0) :demotes @(nth cells 1)}))))))))
+      {:rets {} :ptypes (wp-empty-ptypes spec ks) :memo memo :walked 0 :skipped 0}
+      (map-indexed vector nodes))]
+    pass))
+
+;; install the ctor ops the param fixpoint's last pass recorded for each node.
+;; A node's ops are from its last walk; a node the last pass skipped had its
+;; inputs unmoved since that walk, so the replay is exactly the accumulator an
+;; all-node pass would have left — but folded once, after convergence, instead
+;; of once per pass (the passes themselves no longer touch the accumulator, and
+;; nothing reads it until the outer field loop does).
+(defn- wp-replay-ctor-ops! [unit memo]
+  (reset! (:wp-field-joins unit) {})
+  (reset! (:wp-field-demote unit) #{})
+  (doseq [m memo]
+    (when m
+      (doseq [[vk fields ats] (:join-ops m)]
+        (swap! (:wp-field-joins unit) join-ctor-args vk fields ats))
+      (doseq [ck (:demotes m)] (swap! (:wp-field-demote unit) conj ck)))))
 
 ;; fold a pass's positional ctor-arg joins into a {ctor-key {field-kw type}} map,
 ;; dropping demoted/escaped records (their fields read :any) and :any/conflicting
@@ -1480,13 +1567,15 @@
 ;; loads, ahead of loader.ss. See the note on jolt.passes/ir-validate?.
 (def ^:private wp-trace? (jolt.host/getenv "JOLT_WP_TRACE"))
 (defn- wp-iterate [unit nodes spec ks ptypes0 rets0 self-rec?]
-  (loop [iter 0 ptypes ptypes0 rets rets0]
+  ;; escapes accumulate across this fixpoint's passes. An escape is a static
+  ;; property of the program (a var in value position, not a call head), so the
+  ;; first (all-node) pass collects every one; a later pass that skips a node
+  ;; must not drop the escapes that node's walk would have re-contributed.
+  (reset-escapes! unit)
+  (loop [iter 0 ptypes ptypes0 rets rets0 memo (vec (repeat (count nodes) nil))]
     (set-rtenv! unit (reduce (fn [m k] (let [v (get rets k)] (if (some? v) (assoc m k v) m))) {} ks))
-    (reset-escapes! unit)
-    (reset! (:wp-field-joins unit) {})
-    (reset! (:wp-field-demote unit) #{})
     (let [pass (binding [*collect-self-rec?* self-rec?]
-                 (wp-pass unit nodes spec ks ptypes))
+                 (wp-pass unit nodes spec ks ptypes rets memo))
           escaped (set (collected-escapes unit))
           new-ptypes (reduce (fn [m k]
                                (if (contains? escaped k)
@@ -1496,11 +1585,12 @@
           converged? (and (= new-ptypes ptypes) (= new-rets rets))]
       (when wp-trace?
         (println (str "[wp] iter " iter (if self-rec? " main" " prime")
-                      " nodes " (count nodes) " specializable " (count ks)
+                      " nodes " (count nodes) " walked " (:walked pass) " skipped " (:skipped pass)
+                      " specializable " (count ks)
                       (if converged? " converged" ""))))
       (if (or converged? (>= iter 16))
-        [converged? new-ptypes new-rets]
-        (recur (inc iter) new-ptypes new-rets)))))
+        [converged? new-ptypes new-rets (:memo pass)]
+        (recur (inc iter) new-ptypes new-rets (:memo pass))))))
 
 ;; inner param-type fixpoint, run with the lean field types held FIXED by the caller.
 ;; returns [converged? ptypes]. The outer field-type loop in wp-infer! re-runs this
@@ -1524,7 +1614,7 @@
 (defn- wp-param-fixpoint [unit nodes spec ks]
   (let [primed (wp-iterate unit nodes spec ks (wp-empty-ptypes spec ks) {} false)
         main (wp-iterate unit nodes spec ks (nth primed 1) (nth primed 2) true)]
-    [(nth main 0) (nth main 1)]))
+    [(nth main 0) (nth main 1) (nth main 3)]))
 
 (defn wp-infer!
   "Run the closed-world param-type fixpoint over the unit's analyzed top-level
@@ -1551,7 +1641,8 @@
       ;; types (a pre-fixpoint is more specific than the truth, so unsound to seed).
       (loop [ft-iter 0 ftypes {}]
         (reset! (:field-types unit) ftypes)
-        (let [[param-converged? new-ptypes] (wp-param-fixpoint unit nodes spec ks)
+        (let [[param-converged? new-ptypes ctor-memo] (wp-param-fixpoint unit nodes spec ks)
+              _ (when-not wp-memo-off? (wp-replay-ctor-ops! unit ctor-memo))
               escaped (set (collected-escapes unit))
                new-ftypes (derive-field-types unit @(:wp-field-joins unit) @(:wp-field-demote unit) escaped shallow-field-type)
                new-rich-ftypes (derive-field-types unit @(:wp-field-joins unit) @(:wp-field-demote unit) escaped shallow-field-type-rich)
