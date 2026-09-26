@@ -339,7 +339,7 @@ check "the fish snippet offers jolt's options too" "0" "$?"
 # check, because neither list is reachable from outside its namespace.
 ov_words() { grep -o '"[a-zA-Z-]*"' | tr -d '"' | sort -u | tr '\n' ' '; }
 check "main and the completion agree on which commands a task can override" \
-  "$(grep -B1 'builtin-overridden? cmd)' jolt-core/jolt/main.clj \
+  "$(sed -n '/def ^:private builtin-commands/,/}/p' jolt-core/jolt/main.clj \
      | grep -o '#{[^}]*}' | ov_words)" \
   "$(sed -n '/def ^:private overridable/,/}/p' jolt-core/jolt/completions.clj \
      | grep -o '#{[^}]*}' | ov_words)"
