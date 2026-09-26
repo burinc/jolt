@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.13] - 2026-09-26
+
+Mostly memory and lazy seqs. The heap ceiling now bounds the whole heap as `-Xmx`
+does, the nursery sizes itself by the time spent collecting, and the JVM's GC tuning
+flags have `JOLT_*` equivalents, including the GC overhead limit. Lazy seqs stop
+holding what they have walked past (writ's prover went from 3.8GB live to 134MB) and
+cost a third of what they did per element, and collections no longer promote the
+cells a walk left behind. `jolt build` caches and compiles namespaces in parallel,
+and a run of reader, printer and interop fixes brings more of the JVM's behavior
+over.
+
 ### Added
 
 - **A clj-kondo config and hook for `jolt.ffi`, exported at
@@ -36,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5.6GB of memory to 55s from cold, 35s for an unchanged rebuild and 38s after editing
   one namespace, under 1GB. `JOLT_BUILD_CACHE=0`, `JOLT_BUILD_CACHE_DIR`,
   `JOLT_BUILD_CACHE_MB` and `JOLT_BUILD_JOBS` control the unit cache.
+- **The compiler does less work per build** (#1155): each app source is parsed once,
+  the inference registries' maps are reused across forms, the whole-program
+  parameter-type fixpoint skips nodes whose inputs did not move, and a pass that
+  changes one call site leaves the rest of the tree shared instead of copying it.
+  The output is byte-identical; with the build cache off, the fps-demo example
+  builds in 3.4s where it took 3.8s, and reactive-dashboard in 9.8s to 13.4s where
+  it took 11s to 15.7s.
 - **The heap ceiling bounds the heap's total size, as `-Xmx` does.** `JOLT_MAX_HEAP`
   (and the 25%-of-RAM default) used to bound only the live data, so a program near a
   4GB ceiling held 6.5GB. It now covers the live data, the nursery and the free memory
@@ -53,7 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The nursery size follows the time spent collecting, bounded by the live data.**
   It starts at 16MB and doubles while collection takes more than a tenth of the run,
   up to the size of the data the program keeps; past that only while collection keeps
-  taking more than a fifth. A program that allocates little keeps 16MB. writ's prover
+  taking more than a fifth. The share counts each collection by its time, and nothing
+  is resized before five collections are in, as the JVM's
+  `AdaptiveSizePolicyReadyThreshold` has it, so a short run keeps the floor. A
+  program that allocates little keeps 16MB. writ's prover
   spent 40% of its time collecting at the fixed 16MB and 25% now (65.4s to 58.8s, peak
   RSS 2.14GB to 2.28GB); a loop holding 40MB went from 3.25s to 2.1s at 256MB to 327MB peak.
   The knobs mirror the JVM's: `JOLT_MAX_RAM_PERCENTAGE`, `JOLT_GC_TIME_RATIO`,
@@ -95,17 +116,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata; the chunk fields moved to a vector-backed subtype, a claim swaps the tail
   word itself instead of a lock field, and the image mirror of the forced flag is
   gone. writ's pong allocates 345GB where it allocated 449GB; a realized `map` costs
-  77 bytes per element where it cost 92. Near the heap ceiling, a full collection that cannot get under its soft
-  limit no longer repeats after every young collection; the next waits until half the
-  remaining room is used. A program whose live data sat above the soft limit (writ's
-  prover on a 16GB CI runner) used to stall there for hours. `JOLT_GC_LOG=1` prints a
-  line per collection.
+  77 bytes per element where it cost 92.
+- Near the heap ceiling, a full collection that cannot get under its soft limit no
+  longer repeats after every young collection; the next waits until half the remaining
+  room is used. A program whose live data sat above the soft limit (writ's prover on a
+  16GB CI runner) used to stall there for hours. `JOLT_GC_LOG=1` prints a line per
+  collection, as `-verbose:gc` does.
 - **Hand-written lazy seqs cost less per element.** A `lazy-seq` node's own thunk stays
   on it while it runs, as the reference keeps `fn`, which drops three stores and a
   marker from every force; the macro's two halves and `chunked-seq?` compile to direct
-  calls instead of a var lookup and a generic invoke. A `lazy-seq` walker over a list
-  went from 74ns to 47ns per element, `keep` from 95ns to 64ns, and `for` with `:when`
-  from 61ns to 39ns.
+  calls instead of a var lookup and a generic invoke. With the other lazy-seq changes
+  in this release, a `lazy-seq` walker over a list costs 42ns per element where 0.8.12
+  took 123ns, `keep` 53ns (was 150), and `for` with `:when` 33ns (was 203).
 - **Hashing a long is 3x faster, and hash sets and maps with it.** The 32-bit
   sign-extension the murmur hash applies at every step branched on the hash's sign bit,
   a coin flip the CPU mispredicted about half the time; it is branch-free now, and the
@@ -114,8 +136,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a zero fill and a copy loop with a write barrier per slot, the per-level
   helpers inline, and `contains?` takes the lookup path `get` already had: `conj` onto
   a 100k-element set went from 610ns to 300ns, `contains?` from 148ns to 95ns, and
-  `distinct` from 946ns to 450ns per element.
-
+  `distinct` from 943ns to 397ns per element.
 - **A core.async take or put that no thread is waiting on skips the wakeup.**
   Every take and put broadcast the channel's condition, which on Android is a
   futex syscall even with no waiters (bionic's `pthread_cond_broadcast` does not
@@ -139,16 +160,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copying it, as the JVM's `concat` does. `tree-seq` nests one `mapcat` per level, so
   the copy cost every element its depth: a 4000-deep chain took 1.6s to walk (JVM
   1ms), and writ's proof summaries spent minutes in `tree-seq`.
-- **A `lazy-seq` body that fails and is forced again sees the locals it had not
-  finished with, as on the JVM.** The reference's compiler nulls a `^:once` fn's
-  captured field at its last use on the path the body takes; jolt emptied every
-  capture on entry, so a body that threw before reading a capture reran with it nil
-  (`(let [v [1 2]] (lazy-seq (when (first-run?) (throw …)) v))` answered `nil` on the
-  second force where the JVM answers `(1 2)`). Each capture is now emptied at its
-  last use, with loops, branches and nested fns accounted for, and the store that
-  empties it needs no write barrier: a `lazy-seq` walker is 44ns per element (was
-  47), `keep` 59ns (was 65).
-
+- **A lazy seq whose body throws runs its body again on the next force**, as the
+  reference's `LazySeq` does (it keeps `fn` until `invoke` returns); jolt cached the
+  failure and re-raised it. The rerun sees the locals the body had not finished with:
+  a `lazy-seq` thunk is `^:once` (below), and as the reference's compiler does, each
+  capture is emptied at its last use on the path the body takes, with loops, branches
+  and nested fns accounted for, so `(let [v [1 2]] (lazy-seq (when (first-run?)
+  (throw …)) v))` answers `(1 2)` on the second force, as on the JVM. Not recording
+  failures also took an exception handler off every force.
 - **Lazy seqs no longer keep what they have walked past.** Three retention bugs,
   each fixed the way the reference does it:
   - A lazy seq whose body answers another lazy seq (a `keep` or `dedupe` skip, a
@@ -169,13 +188,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `dedupe` over a 3M-element run now fit in a 256MB heap, as on the JVM.
   `(apply concat xs)` realizes as much of `xs` as the JVM does (4 colls, from
   `RestFn.applyTo`), where it realized 1.
-- **A lazy seq whose body throws runs its body again on the next force**, as the
-  reference's `LazySeq` does (it keeps `fn` until `invoke` returns); a `lazy-seq`
-  body's captured locals are cleared by then, so the rerun sees them nil, as there.
-  jolt cached the failure and re-raised it. Not recording failures also removed an
-  exception handler from every force: with the pieces above, a `lazy-seq` walker
-  costs 86ns per element where it cost 115ns, `keep` 100ns (was 142), `for` with
-  `:when` 141ns (was 196).
 - clojure.core vars carry the reference's `:tag` metadata (`(:tag (meta #'not))` is
   `Boolean`, `(:tag (meta #'str))` is `String`), where they carried none.
 - A `loop` local bound to a primitive boolean (`(nil? x)`, `(= a b)`, `(< a b)`,
