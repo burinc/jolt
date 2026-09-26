@@ -2059,13 +2059,21 @@
 ;; 9M cells, 3.8GB live, where the JVM held 256MB). The reference starts each coll
 ;; as (cat (first zs) (next zs)), advancing the outer seq as the coll starts, and
 ;; this does the same, which is also the reference's realization count.
+;;
+;; The LAST coll is returned as it is, not copied, as the reference's concat
+;; does, and it is what keeps nested concats linear: tree-seq nests one mapcat
+;; per level, so copying the last coll at every level cost each element its
+;; depth (a 4000-deep chain took 1.6s to walk against the JVM's 1ms).
 ;; outer/inner are top-level rather than a named let, so a cell's tail can name
 ;; them instead of closing over them (seq.ss lazy-src).
 (define (lazy-concat-outer s)
   (if (jolt-nil? s)
       jolt-empty-list
-      (let ((cur (jolt-seq (seq-first s))))
-        (lazy-concat-inner cur (jolt-seq (seq-more s))))))
+      (let ((cur (jolt-seq (seq-first s)))
+            (more (jolt-seq (seq-more s))))
+        (if (jolt-nil? more)
+            (if (jolt-nil? cur) jolt-empty-list cur)   ; last: share it
+            (lazy-concat-inner cur more)))))
 (define (lazy-concat-inner cur more)
   (if (jolt-nil? cur)
       (lazy-concat-outer more)                         ; empty inner: skip, no cell
