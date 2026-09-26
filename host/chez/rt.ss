@@ -772,7 +772,9 @@
              (if (> elapsed-ns 0) (quotient (* 100 gc-ns) elapsed-ns) 0)
              (quotient elapsed-ns 1000000)
              (mb (sa-bytes-allocated)) (mb (sa-total-memory-bytes)) (mb gc-live-after-full) (mb (sa-gc-trip-bytes))
-             (if gc-full-this-time (string-append " full:" (symbol->string gc-full-this-time)) ""))))
+             (if gc-full-this-time
+                 (format " full:~a ~ams old-x~a" gc-full-this-time gc-full-ms-this-time gc-old-factor)
+                 ""))))
 
 ;; Run THUNK with the nursery at least BYTES, the floor restored after: for a
 ;; phase known to churn before the average has seen it (the build's back end).

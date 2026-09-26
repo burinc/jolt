@@ -45,11 +45,22 @@
     (System/gc)
     (println "growth" with-held (jolt.host/gc-old-growth-bytes))))
 
+;; For nepotism: a walk down one long lazy seq keeps nothing it has passed, so
+;; what the heap holds after each young collection stays flat. With Chez's own
+;; schedule the cell the walk was on at a collection was promoted, then its
+;; tail was realized into it, and the dead promoted cell rooted every cell
+;; realized after it: the heap after each collection climbed by most of a
+;; nursery until a full collection.
+(defn- walk []
+  (reduce (fn [a x] (mod (+ a x) 1000000007)) 0
+          (take 6000000 (iterate (fn [x] (mod (+ x 3) 1000000007)) 1))))
+
 (defn -main [mode]
   (case mode
     "refresh" (refresh)
     "churn" (churn)
     "light" (reduce + (range 1000))
+    "walk" (walk)
     "pinned" (churn)
     ;; the heap ceiling bounds the TOTAL heap, as -Xmx does: live data, nursery
     ;; and the free memory kept (the gate reads the high-water mark and the GC log)

@@ -112,6 +112,7 @@
 ;; Degradation: a target without the choice ignores it.
 (define sa-gc-tight-generation 2)
 (define (sa-gc-tight! on?)
+  (set! sa-young-tight? on?)
   (in-place-minimum-generation
     (if on? (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
 
@@ -1119,12 +1120,51 @@
     (collect-request-handler
       (lambda ()
         (let ((t0 (sa-monotonic-ns)))
-          (collect)
+          (sa-collect-young!)
           (maintain collect-full!)
           (let ((t1 (sa-monotonic-ns)))
             (observe (- t1 t0) (- t1 last-end))
             (set! last-end t1))))))
   #t)
+;; The collection the hook runs in place of Chez's (collect). Chez's schedule
+;; collects generation g every radix^g collections and otherwise only
+;; generation 0, promoting what survives into generation 1. That breeds
+;; nepotism in lazy seqs: the cell a walk is on when a collection comes is live,
+;; so it is promoted; the walk then realizes its tail, storing a young cell into
+;; it, and moves on. The promoted cell is dead, but its generation is not
+;; collected next time, so the write barrier's remembered set roots that young
+;; cell, and through it every cell realized since -- the whole window. Measured
+;; in bench/seqs: ~70% of every nursery survived (209k seq cells at 16MB, 0.8.12
+;; alike), every collection copied it, and the cost grew with the nursery, so
+;; the nursery policy's larger windows ran the bench 1.1-1.4x slower.
+;;
+;; So every collection takes generation 1 with it: (collect g 1 g+1) with g at
+;; least 1, where generation 0's survivors go to 1 and everything collected
+;; above that moves up one. The cell a walk was on last time is in generation 1
+;; and is collected with the rest, so nothing it points at survives through it.
+;; The price is that generation 1 is copied into 2 at every collection rather
+;; than every fourth: it only ever holds one window's survivors, and in
+;; practice cost nothing measurable (writ's prover: same time and GC time;
+;; bench/seqs 245ms -> 165ms against 0.8.12, the heap-churn gate 2.3s -> 2.1s
+;; and 404MB -> 320MB). The maximum generation is never on this schedule: the
+;; policy's own full collections take it (rt.ss, heap growth and the ceiling).
+;;
+;; Near a heap ceiling (sa-gc-tight!) the collection copies only generation 0,
+;; Chez's own: copying generation 1 as well needs room the ceiling may not have
+;; (the gcpolicy gate peaked 30% over a 256MB ceiling that way).
+(define sa-young-count 0)
+(define sa-young-tight? #f)
+(define (sa-collect-young!)
+  (set! sa-young-count (fx+ sa-young-count 1))
+  (if sa-young-tight?
+      (collect)
+      (let* ((cmg (collect-maximum-generation))
+             (radix (collect-generation-radix))
+             (g (let loop ((g (fx- cmg 1)))
+                  (if (or (fx<= g 1) (fx= 0 (modulo sa-young-count (expt radix g))))
+                      g
+                      (loop (fx- g 1))))))
+        (collect (fxmax 1 g) 1 (fxmin cmg (fx+ (fxmax 1 g) 1))))))
 (define (sa-monotonic-ns)
   (let ((t (current-time 'time-monotonic)))
     (+ (* (time-second t) 1000000000) (time-nanosecond t))))
