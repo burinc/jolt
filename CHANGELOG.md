@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   up to the size of the data the program keeps; past that only while collection keeps
   taking more than a fifth. A program that allocates little keeps 16MB. writ's prover
   spent 40% of its time collecting at the fixed 16MB and 25% now (65.4s to 58.8s, peak
-  RSS 2.14GB to 2.28GB); a loop holding 40MB went from 2.9s to 2.25s at 274MB to 406MB.
+  RSS 2.14GB to 2.28GB); a loop holding 40MB went from 3.25s to 2.1s at 256MB to 327MB peak.
   The knobs mirror the JVM's: `JOLT_MAX_RAM_PERCENTAGE`, `JOLT_GC_TIME_RATIO`,
   `JOLT_MAX_HEAP_FREE_RATIO`, `JOLT_NEW_SIZE`, `JOLT_MAX_NEW_SIZE`; `JOLT_GC_TRIP_BYTES`
   still pins the size, and a value jolt cannot read is refused at startup. The older
@@ -80,8 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collected: about 70% of each nursery survived a `reduce` over `iterate` or an
   `into` over `mapcat`, in 0.8.12 as well. Each collection now takes generation 1
   with it, so a dead cell there roots nothing. `bench/seqs` went from 245ms to
-  165ms and `lazy-threads` from 201ms to 107ms against 0.8.12; a loop rebuilding
-  40MB each round from 2.3s to 2.1s and 404MB to 320MB peak.
+  165ms and `lazy-threads` from 201ms to 107ms against 0.8.12.
 - **`for` is the reference's expansion.** The innermost binding conses each value (and
   over a chunked seq fills a chunk at a time, as the reference does) where jolt's
   expansion built `(concat (list x) (step (rest s)))` per value; an innermost binding
