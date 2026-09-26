@@ -1266,6 +1266,9 @@
 (define (register-record-type! name-sym)
   (let ((tag (string-append (chez-current-ns) "." (symbol-t-name name-sym))))
     (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl tag #t))
+    ;; chez-type-owns-lookup? reads this table while the shapes map is built, so
+    ;; the inference-registry cache has to rebuild after it changes.
+    (chez-infer-registry-bump!)
     ;; a defrecord's class ancestry: replace the deftype IType row with the
     ;; record interfaces (their closure supplies Associative/Seqable/ILookup/…),
     ;; keeping any protocol interfaces already grafted by the inline

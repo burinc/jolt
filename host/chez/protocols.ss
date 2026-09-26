@@ -129,13 +129,21 @@
     (hashtable-delete! type-registry type-tag)
     (hashtable-delete! type-method-index type-tag)
     (hashtable-delete! type-class-memo type-tag)
-    (hashtable-delete! clone-registry type-tag)))
+    (hashtable-delete! clone-registry type-tag))
+  ;; find-method-any-protocol reads type-method-index, and
+  ;; chez-type-owns-lookup? (records.ss) consults it while the inference
+  ;; shapes map is built: dropping a type's valAt changes that map.
+  (chez-infer-registry-bump!))
 
 (define (prune-type-registry! keep?)
   ;; a registry change like any other to the caches keyed on the epoch (the
   ;; PICs, satisfies?'s memo): a tag a later definition reuses must not find a
   ;; pruned type's answer
   (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+  ;; ...and to the inference shapes map, through the same
+  ;; find-method-any-protocol / chez-type-owns-lookup? path as
+  ;; forget-type-methods!.
+  (chez-infer-registry-bump!)
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -234,6 +242,10 @@
   ;; the clone captured the prior body. Keyed exactly (type/proto/method) so a
   ;; sibling type's clone survives; devirt-resolve-fl then falls back to devirt-resolve.
   (remove-clone! type-tag proto method)
+  ;; an impl can flip a type's owns-lookup reading (records.ss
+  ;; chez-type-owns-lookup?), which decides whether the shapes map carries the
+  ;; type at all — so the inference-registry cache has to rebuild.
+  (chez-infer-registry-bump!)
   (if #f #f))
 (define (find-protocol-method type-tag proto method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
@@ -752,6 +764,7 @@
                     (hashtable-set! chez-protocol-methods-tbl
                                     (string-append ns "/" m) (cons proto-name m)))))
               (seq->list method-names)))
+  (chez-infer-registry-bump!)
   jolt-nil)
 
 ;; register-method: extend-type/extend register an impl. Host type names keep a

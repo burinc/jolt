@@ -328,13 +328,42 @@
 ;; handed a class and has to answer what that class declares.
 (define chez-record-fields-tbl (make-hashtable string-hash string=?))
 
+;; --- inference-registry materialization cache ---------------------------------
+;; chez-record-shapes-map / chez-protocol-methods-map walk the registries above
+;; and rebuild a whole jolt map on every call. jolt.passes/run-passes calls BOTH
+;; once per emitted top-level form — 441us + 173us measured against kmet's 153
+;; records / 124 methods, ~615us a form, ~4.8s of a build whose 7750 forms are
+;; emitted. The registries only change when a type or protocol is DEFINED, so a
+;; cached map is served until the next registration.
+;;
+;; Every writer clears the cache under chez-infer-map-mu, and the reader
+;; re-checks the generation after building, so a registration racing a read can
+;; never publish a map that predates it. The reader never holds
+;; chez-infer-map-mu while scanning the tables, so a writer holding rec-tbl-mu
+;; can take chez-infer-map-mu without a lock-order cycle. A miss on the race just
+;; rebuilds next call — the same work the uncached version did every call.
+;; register-record-type! and register-protocol-method bump too, though they
+;; mutate other tables: chez-type-owns-lookup? (consulted per record while
+;; building the shapes map) reads the defrecord-type and protocol-method
+;; registries, so a change there changes the materialized map.
+(define chez-infer-map-mu (make-mutex))
+(define chez-infer-registry-gen 0)
+(define chez-record-shapes-memo #f)      ; (generation . map) or #f
+(define chez-protocol-methods-memo #f)
+(define (chez-infer-registry-bump!)
+  (jolt-with-mutex chez-infer-map-mu
+    (set! chez-infer-registry-gen (fx+ chez-infer-registry-gen 1))
+    (set! chez-record-shapes-memo #f)
+    (set! chez-protocol-methods-memo #f)))
+
 (define (register-record-shape! ctor-key field-kws field-tags type-tag)
   (jolt-with-mutex rec-tbl-mu
     (hashtable-set! chez-record-shapes-tbl ctor-key
                     (vector field-kws field-tags type-tag))
     (hashtable-set! chez-record-fields-tbl type-tag field-kws)
     (hashtable-set! chez-record-dbl-tbl type-tag
-                    (list->vector (map chez-double-tag? field-tags)))))
+                    (list->vector (map chez-double-tag? field-tags))))
+  (chez-infer-registry-bump!))
 
 ;; Coerce ^double fields to flonums in-place on a freshly-built field vector.
 ;; simple name of a dotted/slashed string: the segment after the last . or /.
@@ -383,8 +412,9 @@
           (else (loop (+ i 1))))))
 
 ;; materialize chez-record-shapes-tbl into "ns/->Name" -> {:fields :tags :type},
-;; the shape record-type-from-entry consumes.
-(define (chez-record-shapes-map)
+;; the shape record-type-from-entry consumes. Built fresh; chez-record-shapes-map
+;; below serves it from the generation cache.
+(define (chez-record-shapes-map-build)
   (let ((by-name (make-hashtable string-hash string=?))
         (kw-fields (keyword #f "fields")) (kw-tags (keyword #f "tags")) (kw-type (keyword #f "type"))
         (out (jolt-hash-map)))
@@ -435,7 +465,8 @@
                 (else (loop (cdr ks))))))))
 
 ;; materialize chez-protocol-methods-tbl into "ns/method" -> [proto method].
-(define (chez-protocol-methods-map)
+;; Built fresh; chez-protocol-methods-map below serves it from the generation cache.
+(define (chez-protocol-methods-map-build)
   (let ((out (jolt-hash-map)))
     (let-values (((ks vs) (jolt-with-mutex rec-tbl-mu
                             (let-values (((a b) (hashtable-entries chez-protocol-methods-tbl)))
@@ -444,6 +475,34 @@
         (lambda (k v) (set! out (jolt-assoc out k (jolt-vector (car v) (cdr v)))))
         ks vs))
     out))
+
+;; Serve the shapes map from the generation cache, rebuilding only after a
+;; registration moved the generation. The generation is re-read after the build:
+;; a writer that bumped while the build was in flight leaves the generation
+;; different, and the fresh map is used for this call but not published, so the
+;; next call rebuilds against the newer registries instead of installing a
+;; pre-registration snapshot. See the cache block above.
+(define (chez-record-shapes-map)
+  (let ((gen chez-infer-registry-gen))
+    (let ((memo chez-record-shapes-memo))
+      (if (and memo (fx=? (car memo) gen))
+          (cdr memo)
+          (let ((m (chez-record-shapes-map-build)))
+            (jolt-with-mutex chez-infer-map-mu
+              (when (fx=? chez-infer-registry-gen gen)
+                (set! chez-record-shapes-memo (cons gen m))))
+            m)))))
+
+(define (chez-protocol-methods-map)
+  (let ((gen chez-infer-registry-gen))
+    (let ((memo chez-protocol-methods-memo))
+      (if (and memo (fx=? (car memo) gen))
+          (cdr memo)
+          (let ((m (chez-protocol-methods-map-build)))
+            (jolt-with-mutex chez-infer-map-mu
+              (when (fx=? chez-infer-registry-gen gen)
+                (set! chez-protocol-methods-memo (cons gen m))))
+            m)))))
 
 ;; A type that declares its own clojure.lang.ILookup has its fields MASKED from
 ;; the get path: on the JVM a bare deftype has no key lookup but the one it

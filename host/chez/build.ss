@@ -849,6 +849,10 @@
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
   ;; before any flag is set, so the whole-program seeds set here — and the mode flags —
   ;; land on the one unit the per-form emit reads.
+  ;; Drop the previous build's parsed forms (in-process builds — nREPL): this
+  ;; build's wp walk refills the cache, and the emit walk then reuses it instead
+  ;; of re-reading and re-parsing every source. See ei-read-all-for.
+  (ei-form-cache-clear!)
   (jolt-wp-set-record-shapes! (ei-unit) (jolt-wp-host-record-shapes #f))
   (jolt-wp-set-proto-methods! (ei-unit) (jolt-wp-host-proto-methods #f))
   (let ((nodes '()) (ns-nodes '()))
@@ -908,7 +912,7 @@
                            (set! nodes (cons n nodes))
                            (set! per-ns (cons n per-ns))))))
                  (set! ord (fx+ ord 1))))
-               (ei-timed "wp: parse" (lambda () (ei-read-all src)))))))
+               (ei-timed "wp: parse" (lambda () (ei-read-all-for (car nf) src)))))))
              jolt-ns-load-vars-pop!)
           (set! ns-nodes (cons (cons (car nf) (reverse per-ns)) ns-nodes))))
       ordered)
@@ -1912,7 +1916,10 @@
                 ;; it off stale build-time shapes. Harmless under today's control
                 ;; flow (build XOR eval per process), cheap to make robust.
                 (jolt-wp-set-record-shapes! (ei-unit) (jolt-hash-map))
-                (ei-clear-cached!)))))
+                (ei-clear-cached!)
+                ;; the parsed forms the wp walk stashed for this emit walk are
+                ;; done with; a later build re-parses whatever changed.
+                (ei-form-cache-clear!)))))
         (when drop-compiler? (display "jolt build: dropping compiler image (no runtime eval)\n"))
       (ei-mark! "emit app namespaces")
       (ei-acc-report!)
