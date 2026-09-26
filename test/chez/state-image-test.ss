@@ -1508,5 +1508,19 @@
     "[(vec imgcat8/walked) (vec imgcat8/outer-walked)]"
     "[[1 2 3 4 5 6] [1 2 3 4 5 6]]")
 
+;; A channel travels raw, its mutex and condition as image-sync placeholders.
+;; async-chan-v4 counts the threads waiting on it; the 0.8.12 layout (v3) has no
+;; count and restores through the legacy arm, values, closed state and all.
+;; Fixture made by v0.8.12 (format 8); permanent, like those above.
+(ok "v0.8.12 channel fixture present" (file-exists? "test/chez/fixtures/image-v0.8.12-chan.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.12-chan.image")
+(is "v0.8.12 fixture: imgchan8/plain" "imgchan8/plain" "7")
+(is "v0.8.12 fixture: a buffered channel keeps its values, a closed one its last value"
+    "(do (require 'clojure.core.async) [(clojure.core.async/<!! imgchan8/buffered) (clojure.core.async/<!! imgchan8/buffered) (clojure.core.async/<!! imgchan8/buffered) (clojure.core.async/<!! imgchan8/closed) (clojure.core.async/<!! imgchan8/closed)])"
+    "[1 2 3 :last nil]")
+(is "v0.8.12 fixture: the restored channel is live: a take waiting on it is woken by a put"
+    "(let [f (future (clojure.core.async/<!! imgchan8/buffered))] (Thread/sleep 50) (clojure.core.async/>!! imgchan8/buffered 9) (deref f 2000 :timeout))"
+    "9")
+
 (printf "~a/~a state-image assertions passed\n" (- total fails) total)
 (when (> fails 0) (exit 1))

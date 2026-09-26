@@ -51,6 +51,9 @@
 ;; throwable is written as a copy without it. Formats 8 and older carry the v1
 ;; layout, which restores through image-legacy-ex-info? below.
 ;;
+;; Version 10 (also): an async channel is async-chan-v4, which counts the
+;; threads waiting on it; async-chan-v3 restores through image-legacy-coll?.
+;;
 ;; Version 10: a seq cell is chez-cseq-v8 (head tail kind meta), with the chunk
 ;; fields on a chez-cseqv-v1 subtype, and a lazy seq node is jolt-lazyseq-v4
 ;; (thunk val lock meta); formats 9 and older carry chez-cseq-v7 (head tail
@@ -496,7 +499,8 @@
 (define (image-legacy-coll? x)
   (and (record? x)
        (memq (record-type-uid (record-rtd x))
-             '(chez-pvec-v3 chez-pset-v2 chez-cseq-v6 chez-cseq-v7 jolt-lazyseq-v2 jolt-lazyseq-v3 empty-list-v2))
+             '(chez-pvec-v3 chez-pset-v2 chez-cseq-v6 chez-cseq-v7 jolt-lazyseq-v2 jolt-lazyseq-v3 empty-list-v2
+               async-chan-v3))
        #t))
 (define (legacy-cell head tail kind cvec ci crest meta)
   (if cvec
@@ -521,6 +525,11 @@
       ((jolt-lazyseq-v2) (legacy-lazyseq (f 0) (f 1) (f 3) jolt-nil))
       ((jolt-lazyseq-v3) (legacy-lazyseq (f 0) (f 1) (f 3) (f 5)))
       ((empty-list-v2) (fresh-empty-list))
+      ;; mu cv items cap kind closed? xrf takew exh alt-takers alt-putters, with
+      ;; no waiter count: nothing waits in an image, so it starts at 0 (and
+      ;; takew with it). mu and cv are image-sync placeholders the record walk
+      ;; replaces with live ones.
+      ((async-chan-v3) (make-async-chan (f 0) (f 1) (f 2) (f 3) (f 4) (f 5) (f 6) 0 (f 8) (f 9) (f 10) 0))
       (else (error 'legacy-coll->coll "not a legacy collection record" x)))))
 
 ;; A resource the dump could not write (port, thread, non-eq hashtable,
