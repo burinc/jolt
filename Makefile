@@ -622,6 +622,9 @@ gcpolicy: testbin
 	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
 	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
 	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -eq 67108864 ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
+	 st=$$(JOLT_NO_USER_DEPS=1 $$j run $$t startup 2>&1 | sed -n 's/^trip //p'); \
+	 echo "gcpolicy: a sub-millisecond first reading then cheap collections -> nursery $$st"; \
+	 [ "$$st" = "$$floor" ] || { echo "FAIL gcpolicy: one collection right after startup grew the nursery to $${st:-?} (the share must weigh collections by their time, and wait for five)"; exit 1; }; \
 	 set -- $$(JOLT_NO_USER_DEPS=1 JOLT_GC_TRIP_BYTES=16m JOLT_GC_LOG=1 $$j run $$t walk 2>&1 | sed -n 's/^gc: .* heap \([0-9]*\)MB .*/\1/p' | sort -n | sed -n '1p;$$p'); \
 	 echo "gcpolicy: a lazy-seq walk's heap after each collection ranged $${1:-?}MB..$${2:-?}MB"; \
 	 [ -n "$${2:-}" ] && [ $$(($$2 - $$1)) -le 4 ] || { echo "FAIL gcpolicy: the heap after a lazy-seq walk's collections climbed from $${1:-?}MB to $${2:-?}MB: a dead promoted cell is rooting the cells realized after it (nepotism; see sa-collect-young!)"; exit 1; }; \
