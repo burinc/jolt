@@ -134,6 +134,27 @@
 ;; JOLT_WP_TRACE=1 also reports each def whose inline fixpoint ran more than one
 ;; round (see jolt.passes.types wp-trace?).
 (def ^:private wp-trace? (jolt.host/getenv "JOLT_WP_TRACE"))
+;; JOLT_PASS_TRACE=1 accumulates each run-passes phase's wall time and prints a
+;; window sum every 500 timed phases, so where a build's per-form cost sits can
+;; be read without a profiler (the phase names are the units below: :inline is
+;; the fixpoint, :infer reinfer-def/run-inference, :pm-bodies the inline-method
+;; body re-infers, :numeric numeric/annotate).
+(def ^:private pass-trace? (jolt.host/getenv "JOLT_PASS_TRACE"))
+(def ^:private pass-trace (atom {:n 0 :sums {}}))
+(defn- pt [phase f]
+  (if pass-trace?
+    (let [t0 (System/nanoTime)
+          v (f)
+          dt (- (System/nanoTime) t0)
+          st (swap! pass-trace (fn [st]
+                                 (-> st (update :n inc)
+                                     (update-in [:sums phase] (fnil + 0) dt))))]
+      (when (zero? (mod (:n st) 500))
+        (println (str "[passes] " (:n st) " phases "
+                      (into (sorted-map) (map (fn [[k v]] [k (quot v 1000000)])) (:sums st))))
+        (reset! pass-trace {:n 0 :sums {}}))
+      v)
+    (f)))
 (defn- report-ir! [phase node]
   (run! (fn [p] (println (str "IR-VALIDATE [" phase "] " p)))
         (jolt.ir/tree-problems node)))
@@ -194,51 +215,51 @@
   ;; a refusal that only declines to overwrite would splice it. Storing nil is the
   ;; removal: inline-ir hands it back as nil and try-inline treats that as no stash.
   (when (and (inline-enabled? ctx) (= :def (:op node)))
-    (stash-inline! ctx (:ns node) (:name node)
-                   (when (inline-eligible? ctx node) (stash-of node))))
-  (let [result
-        (numeric/annotate
-          (cond
+    (pt :stash (fn [] (stash-inline! ctx (:ns node) (:name node)
+                                     (when (inline-eligible? ctx node) (stash-of node))))))
+  (let [ir (cond
       ;; Full inline + inference (optimize + direct-link)
       (inline-enabled? ctx)
       ;; install the record-ctor shapes ONCE on the unit — the inline record fold and
       ;; the back end's direct-ctor emit read it from there (jolt.op-registry holds the
       ;; unit pointer), no separate registries. Protocol methods for devirtualization.
-      (let [_ (set-record-shapes! unit (record-shapes ctx))
-            _ (set-protocol-methods! unit (protocol-methods ctx))
-            _ (begin-growth-budget! node)
-            opt (loop [i 0 n (const-fold node)]
-                  (reset! (:dirty unit) false)
-                  (let [n2 (const-fold (scalar-replace (flatten-lets (inline-node n ctx))))]
-                    (if (and @(:dirty unit) (< i inline-fixpoint-cap))
-                      (recur (inc i) n2)
-                      (do (when (and wp-trace? (pos? i))
-                            (println (str "[inline] " (:ns node) "/" (:name node) " rounds " (inc i))))
-                          n2))))
-            _ (end-growth-budget!)
+      (let [_ (pt :setup (fn [] (set-record-shapes! unit (record-shapes ctx))
+                                 (set-protocol-methods! unit (protocol-methods ctx))
+                                 (begin-growth-budget! node)))
+            opt (pt :inline (fn [] (loop [i 0 n (const-fold node)]
+                                    (reset! (:dirty unit) false)
+                                    (let [n2 (const-fold (scalar-replace (flatten-lets (inline-node n ctx))))]
+                                      (if (and @(:dirty unit) (< i inline-fixpoint-cap))
+                                        (recur (inc i) n2)
+                                        (do (when (and wp-trace? (pos? i))
+                                              (println (str "[inline] " (:ns node) "/" (:name node) " rounds " (inc i))))
+                                            n2))))))
+            _ (pt :growth (fn [] (end-growth-budget!)))
             ;; a top-level def whose params the whole-program fixpoint typed gets
             ;; reinferred with those seeds (record types flow in from its callers);
             ;; everything else takes the ordinary per-form inference.
-            seeds (when (= :def (:op opt)) (param-seeds-for unit (str (:ns opt) "/" (:name opt))))]
+            seeds (when (= :def (:op opt)) (param-seeds-for unit (str (:ns opt) "/" (:name opt))))
+            ir1 (pt :pm-bodies (fn [] (reinfer-inline-method-bodies unit opt)))
+            ir2 (pt :infer (fn [] (if seeds (reinfer-def unit ir1 seeds) (run-inference unit ir1))))]
         ;; a final const-fold after inference propagates any predicate folded to a
-        ;; constant, collapsing the `if` it gates to the taken branch; re-infer
-        ;; inline method bodies with the receiver seeded (field reads → jrec-field-at);
-        ;; then inject any whole-program :double param hints for the numeric pass.
-        (inject-wp-nhints unit (const-fold (reinfer-inline-method-bodies unit
-                                        (if seeds (reinfer-def unit opt seeds) (run-inference unit opt))))))
+        ;; constant, collapsing the `if` it gates to the taken branch; then inject
+        ;; any whole-program :double param hints for the numeric pass.
+        (pt :nhints (fn [] (inject-wp-nhints unit (const-fold ir2)))))
 
       ;; Inference mode (release/optimize without direct-link): inference without
       ;; the inline fixpoint. Record shape + protocol caches are redefinition-safe.
       (inference-enabled? ctx)
-      (let [_ (set-record-shapes! unit (record-shapes ctx))
-            _ (set-protocol-methods! unit (protocol-methods ctx))
-            opt (const-fold node)
-            seeds (when (= :def (:op opt)) (param-seeds-for unit (str (:ns opt) "/" (:name opt))))]
-        (inject-wp-nhints unit (const-fold (reinfer-inline-method-bodies unit
-                                        (if seeds (reinfer-def unit opt seeds) (run-inference unit opt))))))
+      (let [_ (pt :setup (fn [] (set-record-shapes! unit (record-shapes ctx))
+                                 (set-protocol-methods! unit (protocol-methods ctx))))
+            opt (pt :fold (fn [] (const-fold node)))
+            seeds (when (= :def (:op opt)) (param-seeds-for unit (str (:ns opt) "/" (:name opt))))
+            ir1 (pt :pm-bodies (fn [] (reinfer-inline-method-bodies unit opt)))
+            ir2 (pt :infer (fn [] (if seeds (reinfer-def unit ir1 seeds) (run-inference unit ir1))))]
+        (pt :nhints (fn [] (inject-wp-nhints unit (const-fold ir2)))))
 
       ;; Dev/normal: const-fold + numeric only
       :else
-      (const-fold node)))]
+      (pt :fold (fn [] (const-fold node))))
+        result (pt :numeric (fn [] (numeric/annotate ir)))]
     (when ir-validate? (report-ir! "passes" result))
     result)))
