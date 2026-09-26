@@ -35,10 +35,11 @@ apt-get update
 apt-get -y -o Dpkg::Options::=--force-confnew upgrade
 # clang: cc. make/git/curl: the build and Chez provisioning. which: makes'
 # init.mk looks bash up with it. xxd: build-jolt embeds the boot as C bytes.
-# binutils: readelf for the dependency report.
+# binutils: readelf for the dependency report. zip, perl: tools the gates use
+# (a :local/root jar fixture, the manifest check).
 # The rest are the link line's libraries (build.ss bld-link-libs, bionic arm):
 # ncurses for the expression editor, libuuid, and libiconv (bionic has no iconv).
-apt-get install -y clang make git curl which xxd binutils \
+apt-get install -y clang make git curl which xxd binutils zip perl \
   ncurses libuuid libiconv
 
 # Termux has no /tmp.
