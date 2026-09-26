@@ -74,7 +74,7 @@
 
 (def n-threads 8)
 (def n-distinct 12)
-(def tmp-root (str "/tmp/jolt-ldrtest-" (System/currentTimeMillis)))
+(def tmp-root (str (System/getProperty "java.io.tmpdir") "/jolt-ldrtest-" (System/currentTimeMillis)))
 
 ;; The target. defonce keeps the SAME atom across a second load while the swap!
 ;; below it runs again, so the counter reads 2 if the file was loaded twice — it

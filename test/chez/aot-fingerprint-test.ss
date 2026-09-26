@@ -33,7 +33,7 @@
 ;; up after itself rather than littering /tmp on every CI build.
 (define tmpdirs '())
 (define (tmpdir)
-  (let ((d (string-append "/tmp/jolt-fp-test-" (number->string (get-process-id))
+  (let ((d (string-append (host-temp-dir) "/jolt-fp-test-" (number->string (get-process-id))
                           "-" (number->string (length tmpdirs)))))
     (aot-mkdir-p d)
     (set! tmpdirs (cons d tmpdirs))

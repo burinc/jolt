@@ -156,7 +156,7 @@
 (ok "bare :& — three-argument open, one-int tail, SAME binding"
     (jolt-truthy?
       (ev (string-append
-            "(let [p \"/tmp/jolt-bare-varargs-gate\" fd (c-open p "
+            "(let [p \"" (host-temp-dir) "/jolt-bare-varargs-gate\" fd (c-open p "
             (if (eq? (sa-os-family) 'linux) "65" "513")   ; O_CREAT|O_WRONLY
             " 420)] (c-close fd) (c-unlink p) (>= fd 0))"))))
 ;; Every carrier, through snprintf: 64-bit integers (integers, pointers,

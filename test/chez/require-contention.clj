@@ -31,7 +31,7 @@
 (alter-var-root #'clojure.core.async/*fiber-carrier-count* (constantly 8))
 
 (def askers 16)
-(def tmp-root (str "/tmp/jolt-reqcont-" (System/currentTimeMillis)))
+(def tmp-root (str (System/getProperty "java.io.tmpdir") "/jolt-reqcont-" (System/currentTimeMillis)))
 
 ;; The target parks at top level: the channel is fed by a real thread after a delay,
 ;; so the take cannot complete inline and the load is genuinely suspended half-run.

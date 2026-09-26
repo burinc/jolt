@@ -46,7 +46,10 @@
 (check-eq "in string" (:out (sh ["cat"] {:in "line1\nline2\n"})) "line1\nline2\n")
 
 ;; :dir and :env / :extra-env
-(check-eq "dir" (:out (sh ["pwd"] {:dir "/tmp"})) "/tmp\n")
+;; the canonical path, so the child's `pwd` (getcwd) answers it back on hosts
+;; whose temp dir sits behind a symlink (macOS /var -> /private/var).
+(let [d (.getCanonicalPath (java.io.File. (System/getProperty "java.io.tmpdir")))]
+  (check-eq "dir" (:out (sh ["pwd"] {:dir d})) (str d "\n")))
 (check-eq "env replace" (:out (sh ["sh" "-c" "echo $JP_VAR"] {:env {"JP_VAR" "set"}})) "set\n")
 (check-eq "extra-env keeps PATH" (:out (sh ["sh" "-c" "echo $JP_X"] {:extra-env {"JP_X" "y"}})) "y\n")
 

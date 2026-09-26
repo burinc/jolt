@@ -248,7 +248,8 @@
             (else (loop (+ i 1)))))))
 (define (script-form-for mode)
   (parameterize ((bld-boot-mode mode))
-    (bld-vfasl-script-form "/tmp/in.boot" "/tmp/out.vfasl")))
+    (bld-vfasl-script-form (string-append (host-temp-dir) "/in.boot")
+                           (string-append (host-temp-dir) "/out.vfasl"))))
 
 (ok "'plain emits no conversion at all"
     (string=? (script-form-for 'plain) ""))

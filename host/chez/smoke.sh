@@ -15,6 +15,11 @@ jolt="${JOLT_BIN:-bin/jolt}"
 # cases that the make gate never saw, because the gate always sets JOLT_BIN.
 jolt_bin="${JOLT_BIN:-bin/jolt}"
 
+# Temp root for the cases that write real files. TMPDIR is the POSIX spelling and
+# the only one set on Termux, where /tmp does not exist; /tmp is the fallback
+# when it is unset.
+tmp="${TMPDIR:-/tmp}"
+
 # Every case here is a sub-second jolt invocation, so a case that does not finish
 # has hung — and a hung case is invisible: `make -Oline` shows nothing for a target
 # until it completes, so a CI gate sits silent until the 6-hour job limit with no
@@ -1119,17 +1124,17 @@ fi
 
 # A throwing go/thread body reports to stderr (the JVM's uncaught-exception
 # handler behavior) while the channel still just closes: <!! stays nil.
-thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>/tmp/jolt-smoke-thr-err)"
-if [ "$thr_out" = "nil" ] && grep -q "Exception in go/thread body" /tmp/jolt-smoke-thr-err; then
+thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>"$tmp/jolt-smoke-thr-err")"
+if [ "$thr_out" = "nil" ] && grep -q "Exception in go/thread body" "$tmp/jolt-smoke-thr-err"; then
   pass=$((pass + 1))
 else
   echo "  FAIL: throwing (thread ...) should print an uncaught report and <!! nil"
-  echo "    stdout \`$thr_out\`; stderr: $(head -1 /tmp/jolt-smoke-thr-err)"
+  echo "    stdout \`$thr_out\`; stderr: $(head -1 "$tmp/jolt-smoke-thr-err")"
   fails=$((fails + 1))
 fi
 # Same for a raw Thread body.
-$jolt -e '(do (.start (Thread. (fn [] (throw (ex-info "boom" {}))))) (Thread/sleep 200))' 2>/tmp/jolt-smoke-thr2-err >/dev/null
-if grep -q "Exception in Thread body" /tmp/jolt-smoke-thr2-err; then
+$jolt -e '(do (.start (Thread. (fn [] (throw (ex-info "boom" {}))))) (Thread/sleep 200))' 2>"$tmp/jolt-smoke-thr2-err" >/dev/null
+if grep -q "Exception in Thread body" "$tmp/jolt-smoke-thr2-err"; then
   pass=$((pass + 1))
 else
   echo "  FAIL: a throwing Thread body should print an uncaught report"
