@@ -129,6 +129,9 @@ if ! diff -u "$tmp/hostman" "$tmp/hostdef" > "$tmp/hd"; then
   sed 's/^/    /' "$tmp/hd"
   fail=1
 fi
+# The :refer half below reads multi-line vectors with perl; without it that half
+# would come back empty and the check would pass over every referred name.
+command -v perl >/dev/null 2>&1 || { echo "  FAIL: manifest check needs perl to read [jolt.host :refer [...]] vectors"; exit 1; }
 # references from jolt-core: qualified jolt.host/NAME plus names pulled in via
 # [jolt.host :refer [...]]. Strip Clojure line comments first so a `; jolt.host/x`
 # mention (e.g. a prose reference to the class-* seams) isn't counted.

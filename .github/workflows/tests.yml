@@ -126,6 +126,29 @@ jobs:
           JOLT_REQUIRE_GAMBIT: "1"
         run: make CHEZ=/opt/chez/bin/chez GAMBIT_PREFIX=/opt/gambit -j"$(nproc)" -Oline test
 
+  # The gate on bionic (Android/Termux, #943): jolt and its pinned Chez build in
+  # termux/termux-docker on an arm64 runner, the release smokes run there
+  # (ci/termux-build.sh), and then `make bionic-ci` -- the CI gate minus the gates
+  # still tracked as failing on bionic (the Makefile lists them). Android has no
+  # /tmp and many gates' fixtures write there by name, so the entrypoint makes one
+  # as root before dropping to the Termux user: the gates are there to exercise
+  # jolt, and jolt itself uses $TMPDIR.
+  android:
+    name: Android (bionic)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Build and gate jolt in Termux
+        run: |
+          mkdir -p target/release
+          chmod 777 target target/release
+          docker run --rm --entrypoint /system/bin/sh -v "$PWD":/src \
+            termux/termux-docker:aarch64 \
+            -c 'mkdir -p /tmp && chmod 1777 /tmp && exec /entrypoint.sh sh /src/ci/termux-build.sh bionic-ci'
+
   # No AI-assistant attribution in what a push or PR adds: tools/attributioncheck.sh
   # over the pushed range (push) or the PR's commits and its description (PR).
   # Its own job because it needs history — the test job's checkout is shallow,
