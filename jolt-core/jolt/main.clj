@@ -1084,42 +1084,53 @@
   ;; nREPL server so an editor can connect and (require '[some.lib]) live. A
   ;; library's middleware (deps.edn :nrepl/middleware) is composed over the
   ;; built-in handler — sessions / interruptible-eval / completion etc.
-  (let [resolved (resolve-current)]
-    (apply-project! resolved)
-    (let [raw-port (first (filter #(not (str/starts-with? % "-")) more))
-          parsed (some-> raw-port parse-long)
-          default (parse-long (or (jolt.host/getenv "JOLT_NREPL_PORT") "7888"))
-          port (or parsed default)]
-      (when (and raw-port (nil? parsed))
-        (println (str "warning: ignoring invalid nREPL port '" raw-port "', using " default)))
-      (require 'jolt.nrepl)
-      ;; start binds the socket synchronously on this (primordial) thread, so a
-      ;; failure like the port already being in use surfaces here and exits rather
-      ;; than being swallowed by a background thread. It then runs the accept loop
-      ;; on a worker thread and returns a stop fn, leaving this thread free to own
-      ;; the process main loop: main-thread-affine work an eval starts (e.g. a UI
-      ;; toolkit's event loop) marshals here via jolt.host/call-on-main-thread —
-      ;; on macOS a native UI event loop must run on the main thread or the
-      ;; process aborts (e.g. AppKit rejects setting the main menu off-main).
-      ;; Block SIGINT in this (primordial) thread before starting the server so the
-      ;; accept-loop future — and the conn-handler futures it spawns — inherit a
-      ;; blocked SIGINT mask. Without this, ^C lands on the accept loop blocked in
-      ;; c-accept (a foreign call), where Chez can't fire the keyboard-interrupt
-      ;; handler, and the server hangs. Registering the stop hook below then arms
-      ;; the shutdown watcher, which takes SIGINT along with SIGTERM/SIGHUP, so ^C
-      ;; is picked up by sigwait and the hooks run cleanly wherever this thread is.
-      ;; (park-until-interrupt keeps SIGINT blocked while that watcher is running,
-      ;; and only unblocks it for its own ^C handler when nothing armed one.)
-      (jolt.host/block-sigint)
-      (let [stop ((resolve 'jolt.nrepl/start) port (:nrepl-middleware resolved))]
-        ;; register stop so ^C (handled by park-until-interrupt) closes the socket
-        ;; and drops .nrepl-port on the way out.
-        (jolt.host/add-shutdown-hook stop)
-        ;; park here until ^C (handled by park-until-interrupt's keyboard-interrupt-
-        ;; handler, which runs the shutdown hooks and exits). The accept loop
-        ;; inherited SIGINT-blocked above, so ^C is delivered to this thread.
-        (jolt.host/park-until-interrupt)
-        (when stop (stop))))))
+  ;;
+  ;; Checked before `raw-port` below, which filters OUT every "-"-prefixed
+  ;; arg — otherwise --help was silently discarded and this started a real
+  ;; server on the default port instead of printing anything.
+  (if (some #{"-h" "--help" "help"} more)
+    (do (println "usage: jolt nrepl-server [port]")
+        (println)
+        (println "Start an nREPL server (default 7888, or $JOLT_NREPL_PORT) for editors —")
+        (println "CIDER, Calva, Cursive. A library's middleware (deps.edn :nrepl/middleware)")
+        (println "is composed over the built-in handler: sessions, interruptible eval,")
+        (println "completion, lookup, and whatever else the library adds."))
+    (let [resolved (resolve-current)]
+      (apply-project! resolved)
+      (let [raw-port (first (filter #(not (str/starts-with? % "-")) more))
+            parsed (some-> raw-port parse-long)
+            default (parse-long (or (jolt.host/getenv "JOLT_NREPL_PORT") "7888"))
+            port (or parsed default)]
+        (when (and raw-port (nil? parsed))
+          (println (str "warning: ignoring invalid nREPL port '" raw-port "', using " default)))
+        (require 'jolt.nrepl)
+        ;; start binds the socket synchronously on this (primordial) thread, so a
+        ;; failure like the port already being in use surfaces here and exits rather
+        ;; than being swallowed by a background thread. It then runs the accept loop
+        ;; on a worker thread and returns a stop fn, leaving this thread free to own
+        ;; the process main loop: main-thread-affine work an eval starts (e.g. a UI
+        ;; toolkit's event loop) marshals here via jolt.host/call-on-main-thread —
+        ;; on macOS a native UI event loop must run on the main thread or the
+        ;; process aborts (e.g. AppKit rejects setting the main menu off-main).
+        ;; Block SIGINT in this (primordial) thread before starting the server so the
+        ;; accept-loop future — and the conn-handler futures it spawns — inherit a
+        ;; blocked SIGINT mask. Without this, ^C lands on the accept loop blocked in
+        ;; c-accept (a foreign call), where Chez can't fire the keyboard-interrupt
+        ;; handler, and the server hangs. Registering the stop hook below then arms
+        ;; the shutdown watcher, which takes SIGINT along with SIGTERM/SIGHUP, so ^C
+        ;; is picked up by sigwait and the hooks run cleanly wherever this thread is.
+        ;; (park-until-interrupt keeps SIGINT blocked while that watcher is running,
+        ;; and only unblocks it for its own ^C handler when nothing armed one.)
+        (jolt.host/block-sigint)
+        (let [stop ((resolve 'jolt.nrepl/start) port (:nrepl-middleware resolved))]
+          ;; register stop so ^C (handled by park-until-interrupt) closes the socket
+          ;; and drops .nrepl-port on the way out.
+          (jolt.host/add-shutdown-hook stop)
+          ;; park here until ^C (handled by park-until-interrupt's keyboard-interrupt-
+          ;; handler, which runs the shutdown hooks and exits). The accept loop
+          ;; inherited SIGINT-blocked above, so ^C is delivered to this thread.
+          (jolt.host/park-until-interrupt)
+          (when stop (stop)))))))
 
 (defn- usage []
   (println (str "jolt " (version)))
