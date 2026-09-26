@@ -158,6 +158,16 @@
   (probe :lazy-for #(vec (for [_ [1]] (deref p))) #(deliver p :delivered)))
 (let [p (promise)]
   (probe :lazy-mapv-2 #(mapv (fn [_ _] (deref p)) [1] [2]) #(deliver p :delivered)))
+(let [p (promise)]
+  (probe :lazy-filterv #(filterv (fn [_] (deref p)) [1]) #(deliver p true)))
+;; a timed wait inside the body parks too (a library sleep is one: ebb's is a
+;; scheduler callback behind a wait): the releaser, queued behind the waiter on
+;; the one carrier, has already run when the body wakes. Not Thread/sleep, which
+;; stops the carrier on purpose, as a go block's does on the JVM.
+(let [ran (atom nil)]
+  (probe :lazy-timed-wait
+         #(vec (map (fn [_] (deref (promise) 100 nil) @ran) [1]))
+         #(reset! ran :sibling-ran)))
 ;; the samizdat shape: the lock is held by the releaser's side when the lazy body
 ;; asks for it, so the body has to park on the monitor mid-realization
 (let [o (Object.)
@@ -208,6 +218,8 @@
    :lazy-doall-map [:delivered]
    :lazy-for [:delivered]
    :lazy-mapv-2 [:delivered]
+   :lazy-filterv [1]
+   :lazy-timed-wait [:sibling-ran]
    :lazy-contended-locking [:got]
    :lazy-shared-cell [{:first :one :second :one} 1]})
 
