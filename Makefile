@@ -258,29 +258,19 @@ ci:
 	$(call run-gate,ci,$(CI-GATES))
 
 # The CI gate on bionic (Android/Termux, #943), which tests.yml runs inside
-# termux/termux-docker through ci/termux-build.sh. Every CI gate except the ones
-# below, which fail on bionic for reasons tracked under jolt-rcz9; a fix takes its
-# gate off this list, so the list only shrinks.
-#   corpus             non-Unicode charsets raise (jolt-rcz9.1)
-#   buildlibsmoke      the provisioned kernel is not PIC (jolt-rcz9.2)
-#   staticnativesmoke  a non-PIC archive's preload is not reported (jolt-rcz9.3)
-#   cts                every namespace crashes (jolt-rcz9.4)
-#   noexecsmoke        spawning with an empty PATH (jolt-rcz9.5)
-#   winplatform        spawns /bin/sh (jolt-rcz9.6)
-#   ffiloadfail        a library on disk reported missing (jolt-rcz9.7)
-#   ffi                asserts off-Android behavior (jolt-rcz9.8)
-#   smoke              LC_TIME, libm exp ulps, no sqlite (jolt-rcz9.9)
-#   makefilesmoke      expects makes' glibc provisioning (jolt-rcz9.10)
-BIONIC-SKIP := corpus buildlibsmoke staticnativesmoke cts noexecsmoke winplatform ffiloadfail ffi smoke makefilesmoke
-BIONIC-GATES := $(filter-out $(BIONIC-SKIP),$(CI-GATES))
+# termux/termux-docker through ci/termux-build.sh. It is now the CI gate: the
+# ten gates that used to be skipped here (jolt-rcz9) all pass on bionic — the
+# charset layer finds libiconv, the provisioned kernel is PIC, CTS matches its
+# baseline, and the fixtures that asserted off-Android behavior branch on the
+# platform.
 bionic-ci:
-	$(call run-gate,bionic-ci,$(BIONIC-GATES))
+	$(call run-gate,bionic-ci,$(CI-GATES))
 
 # The prerequisite-only targets the wrappers drive. Not meant to be run directly:
 # they pass silently, which is the thing the wrappers exist to prevent.
 gate-run-test: $(TEST-GATES)
 gate-run-ci: $(CI-GATES)
-gate-run-bionic-ci: $(BIONIC-GATES)
+gate-run-bionic-ci: $(CI-GATES)
 
 # Is THIS working tree covered by a complete gate run? A subset run leaves the
 # receipt absent (the wrapper clears it) and any edit since changes the tree hash.

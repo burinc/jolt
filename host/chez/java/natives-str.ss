@@ -385,62 +385,90 @@
 ;; UnsupportedEncodingException, which is what the JVM throws for a charset it
 ;; does not have. Silently returning UTF-8 bytes, as this used to, left the caller
 ;; no way to tell it had asked for something the host could not do.
+;; Names differ by provider: glibc exports iconv_open/iconv/iconv_close, and
+;; Termux's GNU libiconv exports libiconv_open/libiconv/libiconv_close. BOTH
+;; pairs can exist at once on bionic: Android's libc carries a PARTIAL iconv
+;; (UTF-8/16 and ASCII only) beside Termux's complete GNU library, so a symbol
+;; that resolves is not a provider that can name the charset — the libc pair
+;; answers (iconv_t)-1 for windows-1252/Shift_JIS. Trying one name and taking
+;; its presence for capability is what left every non-Unicode charset raising
+;; on bionic. So collect the pairs and let each request fall through to the
+;; next provider. Both names are literal because foreign-procedure names a
+;; symbol at compile time.
 (define c-iconv-open  (jolt-foreign-proc-safe "iconv_open" '(string string) 'void*))
 (define c-iconv-conv  (jolt-foreign-proc-safe "iconv" '(void* void* void* void* void*) 'size_t))
 (define c-iconv-close (jolt-foreign-proc-safe "iconv_close" '(void*) 'int))
+(define c-libiconv-open  (jolt-foreign-proc-safe "libiconv_open" '(string string) 'void*))
+(define c-libiconv-conv  (jolt-foreign-proc-safe "libiconv" '(void* void* void* void* void*) 'size_t))
+(define c-libiconv-close (jolt-foreign-proc-safe "libiconv_close" '(void*) 'int))
 (define iconv-size-max (- (expt 2 (* 8 (sa-foreign-sizeof 'size_t))) 1))
 
-;; iconv_open, or #f when the host has no such charset. The descriptor must be
-;; closed by the caller.
+;; (open conv close) for every iconv this host has, unprefixed first: where
+;; both work the libc's is the process's own.
+(define iconv-providers
+  (filter (lambda (p) (and (vector-ref p 0) (vector-ref p 1) (vector-ref p 2)))
+          (list (vector c-iconv-open c-iconv-conv c-iconv-close)
+                (vector c-libiconv-open c-libiconv-conv c-libiconv-close))))
+
+;; The first provider that can name FROM->TO, as (provider . descriptor), or #f
+;; when none can. A provider whose open raises is skipped too, not fatal. The
+;; descriptor is the caller's to close, with that provider's close.
 (define (iconv-open-cd from to)
-  (and c-iconv-open
-       (guard (e (#t #f))
-         (let ((cd (c-iconv-open to from)))
-           (and (not (= cd iconv-size-max)) (not (= cd 0)) cd)))))
+  (let loop ((ps iconv-providers))
+    (and (pair? ps)
+         (let ((p (car ps)))
+           (guard (e (#t (loop (cdr ps))))
+             (let ((cd ((vector-ref p 0) to from)))
+               (if (or (= cd iconv-size-max) (= cd 0))
+                   (loop (cdr ps))
+                   (cons p cd))))))))
 
 (define (iconv-known? name)
-  (let ((cd (iconv-open-cd "UTF-8" name)))
-    (and cd (begin (c-iconv-close cd) #t))))
+  (let ((pcd (iconv-open-cd "UTF-8" name)))
+    (and pcd (begin ((vector-ref (car pcd) 2) (cdr pcd)) #t))))
 
 ;; Convert bytes between two charsets, or #f if the host cannot. The four
 ;; iconv arguments are pointers to a cursor pair, so they live in one 32-byte
 ;; block at offsets 0/8/16/24: in pointer, in remaining, out pointer, out
 ;; remaining. Worst case a byte grows to four (UTF-32), plus room for a BOM.
 (define (iconv-bytes bv from to)
-  (and c-iconv-conv c-iconv-close
-       (let ((cd (iconv-open-cd from to)))
-         (and cd
-              (let* ((inlen (bytevector-length bv))
-                     (outcap (+ 32 (* 4 (max inlen 1))))
-                     (inbuf (sa-foreign-alloc (max inlen 1)))
-                     (outbuf (sa-foreign-alloc outcap))
-                     (cells (sa-foreign-alloc 32))
-                     (result
-                      (guard (e (#t #f))
-                        (do ((i 0 (+ i 1))) ((= i inlen))
-                          (sa-foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
-                        (sa-foreign-set! 'void* cells 0 inbuf)
-                        (sa-foreign-set! 'unsigned-64 cells 8 inlen)
-                        (sa-foreign-set! 'void* cells 16 outbuf)
-                        (sa-foreign-set! 'unsigned-64 cells 24 outcap)
-                        (and (not (= iconv-size-max
-                                     (c-iconv-conv cd cells (+ cells 8) (+ cells 16) (+ cells 24))))
-                             ;; Then reset the descriptor to its initial state, which
-                             ;; POSIX spells as an iconv with a NULL input. A stateful
-                             ;; charset holds a mode, and its closing shift back to
-                             ;; ASCII is only emitted here — without it
-                             ;; (.getBytes "い" "ISO-2022-JP") stops after the
-                             ;; character and drops the trailing ESC ( B the JVM
-                             ;; writes. Stateless charsets write nothing.
-                             (begin (c-iconv-conv cd 0 0 (+ cells 16) (+ cells 24))
-                                    #t)
-                             (let* ((n (- outcap (sa-foreign-ref 'unsigned-64 cells 24)))
-                                    (out (make-bytevector n)))
-                               (do ((i 0 (+ i 1))) ((= i n) out)
-                                 (bytevector-u8-set! out i (sa-foreign-ref 'unsigned-8 outbuf i))))))))
-                (sa-foreign-free inbuf) (sa-foreign-free outbuf) (sa-foreign-free cells)
-                (c-iconv-close cd)
-                result)))))
+  (let ((pcd (iconv-open-cd from to)))
+    (and pcd
+         (let* ((provider (car pcd))
+                (cd (cdr pcd))
+                (conv (vector-ref provider 1))
+                (close (vector-ref provider 2))
+                (inlen (bytevector-length bv))
+                (outcap (+ 32 (* 4 (max inlen 1))))
+                (inbuf (sa-foreign-alloc (max inlen 1)))
+                (outbuf (sa-foreign-alloc outcap))
+                (cells (sa-foreign-alloc 32))
+                (result
+                 (guard (e (#t #f))
+                   (do ((i 0 (+ i 1))) ((= i inlen))
+                     (sa-foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
+                   (sa-foreign-set! 'void* cells 0 inbuf)
+                   (sa-foreign-set! 'unsigned-64 cells 8 inlen)
+                   (sa-foreign-set! 'void* cells 16 outbuf)
+                   (sa-foreign-set! 'unsigned-64 cells 24 outcap)
+                   (and (not (= iconv-size-max
+                                (conv cd cells (+ cells 8) (+ cells 16) (+ cells 24))))
+                        ;; Then reset the descriptor to its initial state, which
+                        ;; POSIX spells as an iconv with a NULL input. A stateful
+                        ;; charset holds a mode, and its closing shift back to
+                        ;; ASCII is only emitted here — without it
+                        ;; (.getBytes "い" "ISO-2022-JP") stops after the
+                        ;; character and drops the trailing ESC ( B the JVM
+                        ;; writes. Stateless charsets write nothing.
+                        (begin (conv cd 0 0 (+ cells 16) (+ cells 24))
+                               #t)
+                        (let* ((n (- outcap (sa-foreign-ref 'unsigned-64 cells 24)))
+                               (out (make-bytevector n)))
+                          (do ((i 0 (+ i 1))) ((= i n) out)
+                            (bytevector-u8-set! out i (sa-foreign-ref 'unsigned-8 outbuf i))))))))
+           (sa-foreign-free inbuf) (sa-foreign-free outbuf) (sa-foreign-free cells)
+           (close cd)
+           result))))
 
 (define (unsupported-encoding-throw name)
   (jolt-throw (jolt-host-throwable "java.io.UnsupportedEncodingException" name)))

@@ -113,9 +113,14 @@ fi
 # arm64 macOS has no non-PIC form at all.
 if [ "$(uname -s)" = Linux ] && cc -no-pie -E -x c /dev/null -o /dev/null 2>/dev/null; then
   # A leaf function is position-independent by accident — take the address of
-  # static data, which is what gets the absolute relocation.
+  # static data, which is what gets the absolute relocation. The data is a
+  # NON-static (preemptible) global on purpose: on aarch64 a reference to a
+  # local symbol still lowers to adrp/add, which links into a shared object
+  # fine, so only a global the loader could interpose forces the non-PIC
+  # relocation this case is about (R_X86_64_32 on x86_64, and
+  # R_AARCH64_ADR_PREL_PG_HI21 / R_AARCH64_ABS64 on aarch64).
   cat > "$work/nopic.c" <<'EOF'
-static const char greeting[] = "static";
+const char greeting[] = "static";
 const char *jolt_static_greeting(void) { return greeting; }
 int jolt_static_answer(void) { return 42; }
 EOF
@@ -139,8 +144,13 @@ EOF
     cat "$work/build.log"; exit 1
   fi
   # Where the compiler links PIE by default (__PIE__), the first link must have
-  # failed and the -no-pie retry must be what produced the binary.
-  if echo | cc -E -dM -x c - 2>/dev/null | grep -q '__PIE__'; then
+  # failed and the -no-pie retry must be what produced the binary. NOT on
+  # bionic: build.ss bld-no-pie-supported? refuses -no-pie there by design —
+  # Android's loader requires a PIE executable, so the first link has to
+  # succeed, and on aarch64 it does (the adrp/add pair in the archive resolves
+  # against the definition in the executable).
+  if echo | cc -E -dM -x c - 2>/dev/null | grep -q '__PIE__' \
+     && ! cc -dumpmachine 2>/dev/null | grep -q android; then
     if ! grep -q 'relinking with -no-pie' "$work/build.log"; then
       echo "  FAIL: a PIE-by-default toolchain linked a non-PIC archive without the -no-pie retry"
       cat "$work/build.log"; exit 1

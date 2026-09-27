@@ -79,7 +79,11 @@ EOF
 run_out="$(cd "$work/proj" && "$jolt" run -m app.core 2>&1 || true)"
 echo "$run_out" | grep -q "required native library top did not load — .*libtop.$soext is there" \
   || report "run did not report the library as present-but-unloadable (got: $(echo "$run_out" | head -3))"
-echo "$run_out" | grep -q "not found" \
+# bionic's OWN loader reason contains "not found" ("library \"libdep.so\"
+# not found: needed by ..."), so the broad word would fire on the correct
+# report. The bug being caught is jolt CLASSIFYING the candidate as missing —
+# its "required native library <name> not found" sentence.
+echo "$run_out" | grep -q "required native library top not found" \
   && report "run still reports a library on disk as not found"
 task_out="$(cd "$work/proj" && "$jolt" hello 2>&1 || true)"
 echo "$task_out" | grep -q "warning: required native library top did not load" \
