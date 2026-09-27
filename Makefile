@@ -348,6 +348,9 @@ narrowhash:
 # bare monitor-enter/monitor-exit halves across a fiber switch. A monitor is the
 # one lock in the runtime that wraps user code, so neither half of locks.ss's
 # premise — short regions, never spanning a park — holds for it.
+# fibers-interrupt-test.ss is the interrupt gate: jolt.fibers/interrupt! raises
+# a throwable in another fiber wherever it is -- spinning, parked on a channel or
+# a deref, a CPS'd go body -- and an abandoned channel wait swallows no value.
 # async-io-thread-test.ss is the io-thread gate (jolt-579): core.async's third
 # carrier. It runs with the pool pinned to ONE carrier, which is what makes "8
 # bodies parked at the same time, all of them resuming" mean that a fiber released
@@ -364,6 +367,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
+	@$(CHEZ) --script test/chez/fibers-interrupt-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own

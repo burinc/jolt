@@ -264,8 +264,13 @@
           ;; mu is released here. jolt-current-fiber still answers this fiber —
           ;; the switch is what clears that register — and the state it needs is
           ;; already 'parked, set by decide under mu.
-          (begin (jolt-fiber-to-scheduler! (jolt-current-fiber))
-                 (retake))
+          (let ((f (jolt-current-fiber)))
+            ;; An interrupt (fibers.ss) ends the wait instead of letting the
+            ;; decision be retaken: its wake is not "something changed".
+            (when (jolt-fiber-switch-for-park? f)
+              (jolt-fiber-to-scheduler! f))
+            (jolt-fiber-check-interrupt! f)
+            (retake))
           r))))
 
 ;; --- blocking, and who is allowed to do it ----------------------------------

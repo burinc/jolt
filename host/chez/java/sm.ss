@@ -147,10 +147,16 @@
   (let* ((park? (jolt-with-mutex (alt-handler-wmu h)
                   (if (vector-ref (alt-handler-mailbox h) 0)
                       #f
-                      (begin (jolt-fiber-state-set! f 'parked) #t)))))
-    (if park?
-        (jolt-sm-park! f resume)
-        (begin (enable-interrupts) (resume)))))
+                      (jolt-fiber-commit-park! f h)))))
+    (cond
+      (park? (jolt-sm-park! f resume))
+      ;; an interrupt is pending (fibers.ss): abandon the wait and raise, inside
+      ;; the driver's handler, which marks the fiber dead and closes its channel
+      ((and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+       (enable-interrupts)
+       (alt-claim! h)
+       (jolt-fiber-check-interrupt! f))
+      (else (enable-interrupts) (resume)))))
 
 ;; --- the driver -------------------------------------------------------------
 ;; The fiber thunk of a CPS'd body. It runs on the first entry AND on every
@@ -180,6 +186,9 @@
           (go-chan-finish! w e))            ; publishes the failure, then closes w
         (jolt-fiber-dead! f e))
       (lambda ()
+        ;; an interrupt that woke a cheap park is raised before the step runs,
+        ;; so the step never reads the mailbox the wake left empty
+        (jolt-fiber-check-interrupt! f)
         (let ((step (jolt-fiber-sm f)))
           ;; 'running marks "a driver is on the stack" — see jolt-sm-park!
           (jolt-fiber-sm-set! f 'running)
