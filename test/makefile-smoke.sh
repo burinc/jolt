@@ -32,8 +32,9 @@ cat >"$fake_chez" <<'FAKE'
 #!/bin/sh
 # /bin/sh, not /usr/bin/env bash: this script is EXECUTED (make runs the fake
 # Chez directly), and Android/Termux has no /usr/bin/env — the kernel answers
-# ENOENT and make reports the recipe as error 126. /bin/sh exists on bionic
-# (/bin is a symlink to /system/bin) and on every POSIX host.
+# ENOENT and make reports the recipe as error 126. A #!/bin/sh script runs
+# there: /bin is /system/bin on a device, and where there is no /bin at all
+# (termux-docker) termux-exec rewrites the interpreter to $PREFIX/bin/sh.
 case ${1-} in
   -q)
     cat >/dev/null

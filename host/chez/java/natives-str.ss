@@ -406,7 +406,7 @@
 ;; (open conv close) for every iconv this host has, unprefixed first: where
 ;; both work the libc's is the process's own.
 (define iconv-providers
-  (filter (lambda (p) (vector-ref p 0))
+  (filter (lambda (p) (and (vector-ref p 0) (vector-ref p 1) (vector-ref p 2)))
           (list (vector c-iconv-open c-iconv-conv c-iconv-close)
                 (vector c-libiconv-open c-libiconv-conv c-libiconv-close))))
 
