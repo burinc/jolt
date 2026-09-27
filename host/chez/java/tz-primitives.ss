@@ -38,6 +38,30 @@
 (define (tzp-locale-restore! saved)
   (when saved (tzp-setlocale tzp-LC_TIME saved)))
 
+;; The locale's identity without its codeset, lowercased: "en_US.UTF-8" and
+;; "en_US.utf8" name the same locale, while bionic answering "C.UTF-8" for a
+;; request it did not honor names none of it.
+(define (tzp-locale-root name)
+  (let loop ((i 0) (out '()))
+    (if (fx=? i (string-length name))
+        (list->string (reverse out))
+        (let ((c (char-downcase (string-ref name i))))
+          (cond ((or (char=? c #\.) (char=? c #\@))
+                 (list->string (reverse out)))
+                ((char=? c #\-)
+                 (loop (fx+ i 1) (cons #\_ out)))
+                (else (loop (fx+ i 1) (cons c out))))))))
+
+;; Does this libc really put LC_TIME into REQUESTED? A non-NULL setlocale answer
+;; is not the same question: bionic accepts an unavailable locale and silently
+;; keeps C.UTF-8, so the name read BACK decides — an uninstalled request is not
+;; reported as honored, which is what keeps locale-name's nil-says-fall-back
+;; contract true on Android.
+(define (tzp-locale-honored? requested)
+  (and (tzp-setlocale tzp-LC_TIME requested)
+       (let ((now (tzp-setlocale tzp-LC_TIME #f)))
+         (and now (string=? (tzp-locale-root now) (tzp-locale-root requested))))))
+
 ;; Capability probe: has libc a real en_US locale to name months from?
 ;;
 ;; It RESTORES LC_TIME, for the same reason tzp-offset-probe restores TZ. This runs
@@ -55,7 +79,7 @@
          (let ((saved (tzp-setlocale tzp-LC_TIME #f)))
            (dynamic-wind
              (lambda () #f)
-             (lambda () (and (tzp-setlocale tzp-LC_TIME "en_US.UTF-8") #t))
+             (lambda () (and (tzp-locale-honored? "en_US.UTF-8") #t))
              (lambda () (tzp-locale-restore! saved)))))))
 
 ;; FFI symbols present? (setenv/getenv/unsetenv are POSIX-only, so this is #f on
@@ -232,7 +256,7 @@
                                (dynamic-wind
                                  (lambda () #f)
                                  (lambda ()
-                                   (and (tzp-setlocale tzp-LC_TIME libc-loc)
+                                   (and (tzp-locale-honored? libc-loc)
                                         (let ((n (tzp-strftime buf 128 fmt tm)))
                                           (and (> n 0) n))))
                                  (lambda () (tzp-locale-restore! saved)))))))

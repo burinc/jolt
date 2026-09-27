@@ -11,8 +11,12 @@
 ;; Clojure 1.11 clojure.math: round = floor(x+0.5), rint = round-half-even,
 ;; floor/ceil/floor-div return doubles, to-degrees/to-radians via PI.
 
-(define jolt-math-pi (acos -1.0))
-(define jolt-math-e (exp 1.0))
+;; clojure.math's PI/E are java.lang.Math's, which the JDK defines as compile-time
+;; double literals — not the host libm's atan(1)/exp(1). Pinned as literals so a
+;; host whose libm rounds exp(1) one ulp high (bionic's) still answers the JVM's
+;; value, the same reason host-static-methods.ss pins its copies.
+(define jolt-math-pi 3.141592653589793)
+(define jolt-math-e 2.718281828459045)
 
 (define (jolt-math-cbrt x)
   ;; sign-aware so negative inputs stay real (expt of a negative flonum to a

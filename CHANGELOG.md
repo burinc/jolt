@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Non-Unicode charsets work on bionic (#1148).** `getBytes`, `String`'s
+  decoding constructor, `URLEncoder`/`URLDecoder` and the stateful ISO-2022-JP
+  cases went through Android's partial libc iconv: `iconv_open` resolves there
+  but cannot name Shift_JIS, EUC-JP, ISO-2022-JP or windows-1252, and Termux's
+  GNU library exports only `libiconv_*`. The charset layer now collects every
+  provider and uses the first that can name the charset, so those encodings
+  work and one no provider has still raises `UnsupportedEncodingException`.
+- **`jolt.host/locale-name` returns nil for a locale bionic did not actually
+  switch to (#1148).** bionic's `setlocale` accepts an unavailable locale and
+  silently keeps C.UTF-8, where glibc returns NULL, so jolt's boot probe
+  believed an `en_US.UTF-8` locale was installed and every localized format
+  answered English. The probe and `locale-name` now read the category back and
+  compare locale roots; a request the OS did not honor answers nil, and
+  jolt.time's bundled tables take over.
+- **`ProcessBuilder.start` returns after the child has exec'd on bionic
+  (#1148).** Android's `posix_spawn` returns as soon as it forks, before the
+  child has closed the descriptors it should not inherit, so a listener the
+  parent closed right after `start` could still be bound in the child. Every
+  spawn now waits on a close-on-exec pipe, as glibc, musl and Darwin already
+  do internally.
+- **`Math/PI`/`Math/E` and `clojure.math`'s are the JDK's literal constants,
+  not the host libm's `atan(1)`/`exp(1)` (#1148).** bionic's `exp(1)` is one ulp
+  high, so `Math/E` — and everything built on it, `jolt.infix`'s `e` among
+  them — answered a different double than the JVM's.
+
+### Changed
+
+- **The bionic CI job runs the full CI gate (#1148).** `make bionic-ci` no
+  longer skips the ten gates that used to fail on Android/Termux: the charset
+  layer finds libiconv, the provisioned Chez kernel is built with
+  `CFLAGS+=-fPIC` (so `jolt build --library` links there), CTS matches its
+  baseline, and the fixtures that assumed off-Android behavior or a glibc
+  provisioning path branch on the platform. `ci/termux-build.sh` installs the
+  libsqlite package the smoke fixture's per-OS map names.
+
 ## [0.8.13] - 2026-09-26
 
 Mostly memory and lazy seqs. The heap ceiling now bounds the whole heap as `-Xmx`

@@ -834,6 +834,64 @@
                   (proc-fa-close fa fd))))
             (guard (e (#t '())) (directory-list dir)))))))
 
+;; The shell every fd-level spawn goes through (as `sh -c "exec prog args"`).
+;; /bin/sh on every POSIX host but one: Android has no /bin before 10, and a
+;; container built from its system image (termux-docker) has none at all, while
+;; /system/bin/sh is always there. Termux's app hides the gap by preloading
+;; termux-exec, which rewrites a /bin/sh exec, but a jolt started without that
+;; preload (env -i, a service, a plain adb shell) could spawn nothing. Decided
+;; once, on first spawn.
+(define proc-posix-shell
+  (let ((sh #f))
+    (lambda ()
+      (or sh
+          (let ((found (if (or (file-exists? "/bin/sh")
+                               (not (file-exists? "/system/bin/sh")))
+                           "/bin/sh"
+                           "/system/bin/sh")))
+            (set! sh found)
+            found)))))
+
+;; --- start() returns after the child has exec'd --------------------------------
+;; The JDK's start() does not return until the child has exec'd (or failed to),
+;; and glibc, musl and Darwin's posix_spawn wait the same way. bionic's does not:
+;; it returns as soon as the child is forked, before the child has run a single
+;; file action. The parent then races its own child: a listener it closes right
+;; after start() is still bound in the child for a moment (the port case in
+;; process-test.clj), and the child's descriptor table is briefly the parent's.
+;;
+;; So every spawn carries an exec barrier: a pipe whose write end is FD_CLOEXEC
+;; and is left open in the child (it is in the enumeration's keep list), while
+;; the read end gets a close action. The parent drops its write end once
+;; posix_spawn returns and reads to EOF, which arrives when the child's copy
+;; goes: at exec, or earlier under tier 1's closefrom, which has already done
+;; the closing the barrier exists for. A child that dies before exec closes it
+;; too. On a spawn that already waits the EOF is there by the first read.
+;; Without a working fcntl the barrier is skipped (#f): the write end would
+;; survive into the child and the read would last as long as the child does.
+(define proc-F-SETFD 2)
+(define proc-FD-CLOEXEC 1)
+(define (proc-exec-barrier-pipe)
+  (and proc-fcntl-set
+       (let ((fds (sa-foreign-alloc 8)))
+         (let ((p (and (= 0 (proc-c-pipe fds))
+                       (cons (sa-foreign-ref 'int fds 0) (sa-foreign-ref 'int fds 4)))))
+           (sa-foreign-free fds)
+           (cond ((not p) #f)
+                 ((= 0 (proc-fcntl-set (cdr p) proc-F-SETFD proc-FD-CLOEXEC)) p)
+                 (else (proc-c-close (car p)) (proc-c-close (cdr p)) #f))))))
+
+;; Block until the barrier's read end reads EOF, then close it.
+(define (proc-await-exec fd)
+  (let ((buf (sa-foreign-alloc 1)))
+    (let retry ()
+      (let ((got (proc-c-read fd buf 1)))
+        (cond ((> got 0) (retry))
+              ((and (< got 0) (= (proc-errno) proc-EINTR)) (retry))
+              (else #f))))
+    (sa-foreign-free buf)
+    (proc-c-close fd)))
+
 ;; Spawn `/bin/sh -c sh-cmd` with fd-level stdio: an inherited stream gets no
 ;; file action (the child keeps the parent's descriptor); the rest get pipes.
 ;; Returns (values stdin-port stdout-port stderr-port pid), #f for inherited
@@ -887,6 +945,7 @@
       (let* ((in-p  (and (not inherit-in?)  (mk-pipe #f #t)))
              (out-p (and (not inherit-out?) (mk-pipe #t #f)))
              (err-p (and (not inherit-err?) (mk-pipe #t #f)))
+             (barrier (proc-exec-barrier-pipe))
              (fa (sa-foreign-alloc 128))
              ;; posix_spawnattr_t is one pointer on Darwin, the only place this
              ;; is allocated; 64 bytes leaves room for a wider layout regardless.
@@ -907,6 +966,8 @@
                     (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
         (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
                     (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
+        ;; The barrier's write end stays open until exec (it is FD_CLOEXEC).
+        (when barrier (proc-fa-close fa (car barrier)))
         ;; LAST of the file actions, so the dup2s above have already moved the
         ;; child's ends onto 0/1/2 by the time everything else goes. Under
         ;; CLOEXEC_DEFAULT the kernel does this part.
@@ -914,8 +975,10 @@
           (proc-close-inherited-fds!
             fa (append (if in-p  (list (car in-p)  (cdr in-p))  '())
                        (if out-p (list (car out-p) (cdr out-p)) '())
-                       (if err-p (list (car err-p) (cdr err-p)) '()))))
-        (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
+                       (if err-p (list (car err-p) (cdr err-p)) '())
+                       (if barrier (list (car barrier) (cdr barrier)) '()))))
+        (let* ((shell (proc-posix-shell))
+               (argv (proc-marshal-argv (list shell "-c" sh-cmd)))
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
                            (proc-child-env-pairs))))
@@ -923,7 +986,7 @@
                ;; SETSIGMASK — so the child inherits this thread's signal mask,
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask
-                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa (or attr 0) (car argv) (car envp)))))
+                     (lambda () (proc-c-spawn pidbuf shell fa (or attr 0) (car argv) (car envp)))))
                (pid (sa-foreign-ref 'int pidbuf 0)))
           (proc-fa-destroy fa)
           (when attr (proc-attr-destroy attr) (sa-foreign-free attr))
@@ -934,18 +997,25 @@
           (when in-p  (proc-c-close (car in-p)))
           (when out-p (proc-c-close (cdr out-p)))
           (when err-p (proc-c-close (cdr err-p)))
+          (when barrier (proc-c-close (cdr barrier)))
           (if (= rc 0)
               (vector (and in-p  (cdr in-p))
                       (and out-p (car out-p))
                       (and err-p (car err-p))
-                      pid)
+                      pid
+                      (and barrier (car barrier)))
               (begin
+                (when barrier (proc-c-close (car barrier)))
                 (when in-p  (proc-c-close (cdr in-p)))
                 (when out-p (proc-c-close (car out-p)))
                 (when err-p (proc-c-close (car err-p)))
                 (throw-jvm (quote java.io.IOException)
                   (string-append "posix_spawn failed (errno " (number->string rc) ")"))))))))
   (let ((fds (spawn-locked)))
+    ;; Outside the lock: the child's table was copied at fork, so a spawn that
+    ;; starts meanwhile cannot reach it, and waiting on exec here would
+    ;; serialise every spawn behind the slowest child's exec.
+    (let ((fd (vector-ref fds 4))) (when fd (proc-await-exec fd)))
     (values (let ((fd (vector-ref fds 0))) (and fd (proc-fd-output-port fd)))
             (let ((fd (vector-ref fds 1))) (and fd (proc-fd-input-port fd)))
             (let ((fd (vector-ref fds 2))) (and fd (proc-fd-input-port fd)))

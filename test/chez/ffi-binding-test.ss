@@ -304,9 +304,14 @@
 ;; gate can stand in for an Android process on any host. Kept last in the file:
 ;; Chez has putenv but no unsetenv, so the stand-in environment is cleared by
 ;; setting PREFIX back to empty rather than removing it.
-(ok "off Android there is no prefix to fall back to" (not (ffi-termux-lib-dir)))
-(ok "and a bare name is tried exactly once"
-    (equal? '("libssl.so") (ffi-native-candidates "libssl.so")))
+;; On a REAL Android/Termux host the fallback is already armed from the
+;; process's own environment, so the off-Android half of this pair can only be
+;; asserted where that environment does not say Android (the same rule ffi.ss
+;; uses). The stand-in below sets the variables explicitly and runs everywhere.
+(unless (ffi-termux-lib-dir)
+  (ok "off Android there is no prefix to fall back to" (not (ffi-termux-lib-dir)))
+  (ok "and a bare name is tried exactly once"
+      (equal? '("libssl.so") (ffi-native-candidates "libssl.so"))))
 
 (putenv "PREFIX" "/data/data/com.termux/files/usr")
 (putenv "TERMUX_VERSION" "0.119.0-beta.3")

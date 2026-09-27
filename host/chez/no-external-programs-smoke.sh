@@ -11,7 +11,7 @@
 # cmd.exe, `env` is not a command at all. Each answer is read through the C
 # runtime now (environ, sysctl, uname(2)), so it must hold with PATH empty.
 #
-# /bin/sh itself is still reachable by absolute path, which is what keeps the
+# sh itself is still reachable by absolute path, which is what keeps the
 # ProcessBuilder spawn below working: the test is about programs found on PATH.
 #
 #   JOLT_BIN=target/release/jolt sh host/chez/no-external-programs-smoke.sh
@@ -55,10 +55,16 @@ got="$(run -e '(let [e (.environment (ProcessBuilder. ["true"]))] [(.get e "JOLT
 [ "$got" = '["present" true]' ] || fail "ProcessBuilder environment — want [\"present\" true], got \`$got\`"
 pass=$((pass + 1))
 
-# The child sees the parent's environment. /bin/sh is spawned by absolute path;
-# `printenv` would need PATH, so the shell's own expansion reads the variable.
+# The child sees the parent's environment. sh is spawned by absolute path, the
+# one this host's PATH names (Termux's lives under $PREFIX, and termux-docker has
+# no /bin at all), so the empty PATH never has to find it; the value is read
+# with the SHELL'S OWN expansion and echo, both builtins. Not printf (Android's
+# mksh has no printf builtin: it is /system/bin/printf, which an empty PATH
+# cannot reach) and not `echo -n` (macOS /bin/sh prints the -n), so the newline
+# echo adds is trimmed on the jolt side.
+sh_abs="$(command -v sh)"
 echo "no-external-programs smoke: a child inherits the environment, $label"
-got="$(run -e '(let [p (.start (ProcessBuilder. ["/bin/sh" "-c" "printf %s \"$JOLT_SMOKE_MARK\""]))] (.waitFor p) (slurp (.getInputStream p)))' 2>&1 | tail -1)"
+got="$(run -e "(let [p (.start (ProcessBuilder. [\"$sh_abs\" \"-c\" \"echo \$JOLT_SMOKE_MARK\"]))] (.waitFor p) (clojure.string/trim (slurp (.getInputStream p))))" 2>&1 | tail -1)"
 [ "$got" = '"present"' ] || fail "child environment — want \"present\", got \`$got\`"
 pass=$((pass + 1))
 
