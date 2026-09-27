@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt.fibers/interrupt!`, `masked` and `unmasked`.** `interrupt!` makes
+  another fiber raise a throwable wherever it is (spinning, parked on a
+  channel, in a deref, in a CPS'd go body), the way an Erlang process dies of
+  an exit signal. The fiber raises it itself at a point where it could already
+  be switched out, and an abandoned channel wait is claimed so it can't swallow
+  a value. `masked` defers interrupts over a region and `unmasked` reopens one
+  inside it, like Haskell's `mask`, so cleanup after an interruptible body
+  can't be torn.
+
 ## [0.8.13] - 2026-09-26
 
 Mostly memory and lazy seqs. The heap ceiling now bounds the whole heap as `-Xmx`

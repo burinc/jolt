@@ -184,5 +184,69 @@
 (ok "11. the masked wait took its value, and the interrupt landed as the mask closed"
     (died? r11 "wait"))
 
+;; --- 12. a wait an interrupt ended does not wake a later channel wait ---------
+;; The deref's registration outlives the raise (the cv's waiter list still holds
+;; the fiber), so delivering the promise afterwards resumes the fiber wherever it
+;; is parked by then. A channel wait must read that as the spurious wake it is
+;; and keep waiting, not return an empty mailbox as nil.
+(define r12 (ev "
+(let [p (promise) c (a/chan)
+      w (f/spawn (fn [] (try @p (catch Throwable _ nil)) [:took (a/<!! c)]))]
+  (a/<!! (a/timeout 20))
+  (f/interrupt! w (ex-info \"leave deref\" {}))
+  (a/<!! (a/timeout 20))
+  (deliver p 1)
+  (a/<!! (a/timeout 20))
+  (a/>!! c :v)
+  (outcome w))"))
+(ok "12. a stale deref wake leaves a later channel wait parked"
+    (jolt=2 r12 (jolt-vector (keyword #f "took") (keyword #f "v"))))
+
+;; --- 13. the same for a CPS'd go body's cheap park ------------------------------
+(define r13 (ev "
+(binding [a/*go-backend* :fiber]
+  (let [p (promise) c (a/chan) fib (promise)
+        g (a/go (deliver fib (f/current-fiber))
+                (try @p (catch Throwable _ nil))
+                [:took (a/<! c)])]
+    (a/<!! (a/timeout 20))
+    (f/interrupt! @fib (ex-info \"leave deref\" {}))
+    (a/<!! (a/timeout 20))
+    (deliver p 1)
+    (a/<!! (a/timeout 20))
+    (a/>!! c :v)
+    (first (a/alts!! [g (a/timeout 1000)]))))"))
+(ok "13. a stale deref wake leaves a later cheap park parked"
+    (jolt=2 r13 (jolt-vector (keyword #f "took") (keyword #f "v"))))
+
+;; --- 14. a cheap park that was delivered leaves no waiter behind ---------------
+;; Otherwise a later interrupt of a deref reads the stale handler as the wait,
+;; finds it already claimed, and wakes nothing.
+(define r14 (ev "
+(binding [a/*go-backend* :fiber]
+  (let [p (promise) c (a/chan 1) fib (promise)
+        g (a/go (deliver fib (f/current-fiber))
+                (a/<! c)
+                @p)]
+    (a/<!! (a/timeout 20))
+    (a/>!! c :first)
+    (a/<!! (a/timeout 20))
+    (f/interrupt! @fib (ex-info \"in deref\" {}))
+    (let [v (a/alts!! [g (a/timeout 1000)])]
+      (deliver p :late)
+      (= g (second v)))))"))
+(ok "14. an interrupt reaches a go body's deref after a delivered cheap park" (eq? #t r14))
+
+;; --- 15. an interruptible wait an interrupt ended leaves no registration --------
+(define waits-before (hashtable-size jolt-interrupt-waits))
+(ev "
+(let [p (promise)
+      w (f/spawn (fn [] (try @p (catch Throwable _ :caught))))]
+  (a/<!! (a/timeout 20))
+  (f/interrupt! w (ex-info \"leave deref\" {}))
+  (outcome w))")
+(ok "15. the interrupted deref deregistered from its interrupt box"
+    (= waits-before (hashtable-size jolt-interrupt-waits)))
+
 (printf "~a/~a passed\n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

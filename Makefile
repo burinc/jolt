@@ -122,7 +122,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy lazyretain \
-  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
+  deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
   hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
@@ -1241,6 +1241,13 @@ regexdfa:
 # and a gate without that rule would have deleted every varargs FFI binding.
 deadhost:
 	@sh host/chez/dead-host-check.sh
+
+# A top-level define that rebinds a name a define-record-type generated. The
+# host files share one top level, so the later define wins silently and every
+# reader of the field gets the other procedure (the fiber record's waiter field
+# read through fibers-async.ss's handler allocator).
+recordshadow:
+	@$(CHEZ) --script host/chez/record-shadow-check.ss
 
 census:
 	@sh host/chez/portability-check.sh --census

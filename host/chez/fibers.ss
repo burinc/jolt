@@ -80,7 +80,7 @@
           (mutable monitors)
           (mutable sic)
           (mutable interrupt)
-          (mutable waiter)
+          (mutable parked-on)
           (mutable mask))
   (nongenerative jolt-fiber-v5))
 
@@ -966,7 +966,7 @@
     (jolt-lock! mu)
     (let ((park? (not (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f))))))
       (when park?
-        (jolt-fiber-waiter-set! f h)
+        (jolt-fiber-parked-on-set! f h)
         (jolt-fiber-state-set! f 'parked))
       (jolt-unlock! mu)
       park?)))
@@ -1000,7 +1000,7 @@
                                (let ((r (and (eq? (jolt-fiber-state f) 'parked)
                                              ;; masked: raised when it unmasks, not woken now
                                              (fx=? 0 (jolt-fiber-mask f))
-                                             (or (jolt-fiber-waiter f) 'park))))
+                                             (or (jolt-fiber-parked-on f) 'park))))
                                  (jolt-unlock! mu)
                                  r))))
         (cond
@@ -1018,7 +1018,7 @@
   (let ((e (and f (fx=? 0 (jolt-fiber-mask f)) (jolt-fiber-interrupt f))))
     (when e
       (jolt-fiber-interrupt-set! f #f)
-      (jolt-fiber-waiter-set! f #f)
+      (jolt-fiber-parked-on-set! f #f)
       (jolt-adjust-interrupts! (jolt-current-disable-count)
                                (jolt-carrier-sic (jolt-fiber-carrier f)))
       (jolt-throw e))))

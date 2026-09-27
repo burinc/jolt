@@ -202,27 +202,36 @@
     ;; resume is restored to it, so the resumed path must NOT enable again; only
     ;; the no-park path does.
     (disable-interrupts)
-    (let ((park?
-           (jolt-with-mutex (alt-handler-wmu h)
-             (if (vector-ref (alt-handler-mailbox h) 0)
-                 #f
-                 ;; #f too when an interrupt is pending (fibers.ss): then the
-                 ;; wait is abandoned, and claimed below so no value lands in it
-                 (jolt-fiber-commit-park! f h)))))
-      (when park?
-        (jolt-fiber-bump-chan-parks! f)
-        (jolt-fiber-to-scheduler! f))
-      ;; Balances the disable above on BOTH paths: the park returns here when the
-      ;; fiber is resumed (restored to the depth it parked at), so it owes the
-      ;; same enable the no-park path does.
-      (enable-interrupts)
-      (jolt-fiber-waiter-set! f #f)
-      (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
-        ;; the wait is over either way: a value already in the mailbox was taken
-        ;; by a fiber that is dying, and an empty one must never be filled
-        (alt-claim! h)
-        (jolt-fiber-check-interrupt! f))
-      (alt-handler-mailbox h))))
+    (let wait ()
+      (let ((park?
+             (jolt-with-mutex (alt-handler-wmu h)
+               (if (vector-ref (alt-handler-mailbox h) 0)
+                   #f
+                   ;; #f too when an interrupt is pending (fibers.ss): then the
+                   ;; wait is abandoned, and claimed below so no value lands in it
+                   (jolt-fiber-commit-park! f h)))))
+        (when park?
+          (jolt-fiber-bump-chan-parks! f)
+          (jolt-fiber-to-scheduler! f))
+        ;; Resumed with nothing delivered and no interrupt to raise: a wake from a
+        ;; registration an interrupt left behind (the waiter list of a deref or a
+        ;; monitor the fiber was raised out of). Park again; the resume restored
+        ;; the depth the park was taken at, so the region is still open.
+        (when (and park?
+                   (not (vector-ref (alt-handler-mailbox h) 0))
+                   (not (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))))
+          (wait))))
+    ;; Balances the disable above on BOTH paths: the park returns here when the
+    ;; fiber is resumed (restored to the depth it parked at), so it owes the
+    ;; same enable the no-park path does.
+    (enable-interrupts)
+    (jolt-fiber-parked-on-set! f #f)
+    (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+      ;; the wait is over either way: a value already in the mailbox was taken
+      ;; by a fiber that is dying, and an empty one must never be filled
+      (alt-claim! h)
+      (jolt-fiber-check-interrupt! f))
+    (alt-handler-mailbox h)))
 
 ;; The fiber alts! await: park on the already-registered shared handler and
 ;; return [val port]. Registered by async.ss's __do-alts with wake = the
