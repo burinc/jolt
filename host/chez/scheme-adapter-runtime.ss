@@ -1084,8 +1084,9 @@
 ;; (sa-gc-install-after-collect! maintain observe) -> boolean
 ;; Hook every collection: the target performs its normal collection, then calls
 ;; (MAINTAIN collect-full!) -- collect-full! collects EVERY generation now, the
-;; collection a generational collector defers; (collect-full! #t) does it TIGHT
-;; (see sa-gc-tight!) -- and then
+;; collection a generational collector defers; (collect-full! room) does it TIGHT
+;; (see sa-gc-tight!) within ROOM free bytes, in steps when the younger
+;; generations hold more than that (sa-collect-tight) -- and then
 ;; (OBSERVE gc-ns elapsed-ns): how long the whole of this collection took,
 ;; MAINTAIN's work included, and how long since the previous one ended, both
 ;; monotonic nanoseconds. Answers whether the target could install the hook.
@@ -1109,12 +1110,14 @@
         (collect-full!
           (case-lambda
             (() (collect (collect-maximum-generation)))
-            ((tight?)
-             (if tight?
+            ;; ROOM: #f for an ordinary full collection, else the free bytes the tight
+            ;; one has to work in
+            ((room)
+             (if room
                  (let ((saved (in-place-minimum-generation)))
                    (dynamic-wind
                      (lambda () (in-place-minimum-generation (min saved sa-gc-tight-generation)))
-                     (lambda () (collect (collect-maximum-generation)))
+                     (lambda () (sa-collect-tight room))
                      (lambda () (in-place-minimum-generation saved))))
                  (collect (collect-maximum-generation)))))))
     (collect-request-handler
@@ -1126,6 +1129,34 @@
             (observe (- t1 t0) (- t1 last-end))
             (set! last-end t1))))))
   #t)
+;; A tight full collection within ROOM free bytes. Marking in place does not
+;; keep a tight collection from copying: Chez still copies a segment whose chunk
+;; is under a quarter used, or that was marked before and is now under three
+;; quarters live, and after a run of tight young collections that can be most of
+;; the younger generations. A copied object's source is freed only when its
+;; collection ends, so one (collect max) peaks at the heap in use plus everything
+;; it copies: the gcpolicy gate's forced case, with ~140MB in generations 1-3
+;; and none yet in the oldest, peaked at 322MB under a 256MB ceiling.
+;;
+;; So when the younger generations hold more than ROOM, collect them a step at a
+;; time first -- 1 into 2, 2 into 3, up to the one below the oldest -- and then
+;; everything into the oldest. A step frees its sources before the next copies,
+;; so the peak is the heap plus the largest step (269MB there). The steps are
+;; passes a single collection would not make, so they are only taken when the
+;; younger generations would not fit: once the oldest holds the compacted bulk,
+;; one collection copies little, and staging every forced collection ran that
+;; gate 1.15x slower.
+(define (sa-collect-tight room)
+  (let ((cmg (collect-maximum-generation)))
+    (when (> (let sum ((g 1) (n 0))
+               (if (fx< g cmg) (sum (fx+ g 1) (+ n (bytes-allocated g))) n))
+             room)
+      (let loop ((g 1))
+        (when (fx< g (fx- cmg 1))
+          (collect g (fx+ g 1))
+          (loop (fx+ g 1)))))
+    (collect cmg)))
+
 ;; The collection the hook runs in place of Chez's (collect). Chez's schedule
 ;; collects generation g every radix^g collections and otherwise only
 ;; generation 0, promoting what survives into generation 1. That breeds

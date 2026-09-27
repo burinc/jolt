@@ -458,9 +458,19 @@
 ;; copied gigabytes per nursery and ran nowhere (writ's prover, ~4GB live against
 ;; the 4GB default ceiling of a 16GB CI runner, sat for hours). The heap is still
 ;; bounded by HARD, and a live set that cannot fit still raises.
+;;
+;; Under SOFT the wait is a quarter of that room, not half. The forced collection
+;; needs room of its own: a tight one still copies the sparse old segments
+;; (sa-collect-tight), and waiting for half the room put the first one at
+;; 199MB of a 256MB ceiling with ~90MB to copy, peaking at 291MB. A quarter
+;; still keeps a live set just under SOFT from collecting after every young
+;; collection.
 (define (gc-enforce-ceiling! soft hard collect-full!)
   (when (or (> (sa-bytes-allocated)
-               (max soft (+ gc-live-after-full (quotient (- hard gc-live-after-full) 2))))
+               (let ((room (- hard gc-live-after-full)))
+                 (if (> gc-live-after-full soft)
+                     (+ gc-live-after-full (quotient room 2))
+                     (max soft (+ gc-live-after-full (quotient room 4))))))
             ;; the total is over: collect and give memory back at once -- unless
             ;; the last time did not get it under, and then not again until half
             ;; the room has been used since, the same back-off as the live data
@@ -478,7 +488,7 @@
     ;; 150MB-live program under 384m peaked at 402MB copying them).
     (gc-fit-reserve-to! hard gc-live-after-full)
     (let ((t0 (sa-real-time-ms)))
-      (collect-full! #t)
+      (collect-full! (max 0 (- hard (sa-bytes-allocated))))
       (set! gc-full-ms-this-time (+ gc-full-ms-this-time (- (sa-real-time-ms) t0))))
     (set! gc-full-this-time 'ceiling)
     (set! gc-live-after-full (sa-bytes-allocated))
@@ -768,7 +778,8 @@
         ;; tight (in place) when a second copy of the live data would not fit
         ;; under a heap ceiling, as for the ceiling's own collections
         (let ((c jolt-heap-ceiling-bytes))
-          (collect-full! (and c (> (+ (sa-total-memory-bytes) live) c))))
+          (collect-full! (and c (> (+ (sa-total-memory-bytes) live) c)
+                              (max 0 (- c (sa-bytes-allocated))))))
         (let* ((t1 (sa-real-time-ms))
                (since (max 1 (- t1 gc-last-full-end-ms))))
           (set! gc-full-ms-this-time (+ gc-full-ms-this-time (- t1 t0)))
@@ -781,18 +792,21 @@
 
 ;; JOLT_GC_LOG=1: one line per collection on stderr -- what the JVM's -verbose:gc
 ;; answers. How long it took, what share of the time since the last one, the heap
-;; after it (in use, and the total the collector holds), the nursery it leaves,
+;; after it (in use, and the total the collector holds), the most the process has
+;; held from the OS so far (a jump marks the collection that set it), the nursery
+;; it leaves,
 ;; and whether the policy collected everything
 ;; (grown: the heap passed twice the live set; ceiling: it passed the soft limit).
 (define gc-log? #f)
 (define (gc-log-line gc-ns elapsed-ns)
   (let ((mb (lambda (b) (quotient b (* 1024 1024)))))
     (fprintf (current-error-port)
-             "gc: ~ams (~a% of ~ams) heap ~aMB total ~aMB live-after-full ~aMB trip ~aMB~a\n"
+             "gc: ~ams (~a% of ~ams) heap ~aMB total ~aMB peak ~aMB live-after-full ~aMB trip ~aMB~a\n"
              (quotient gc-ns 1000000)
              (if (> elapsed-ns 0) (quotient (* 100 gc-ns) elapsed-ns) 0)
              (quotient elapsed-ns 1000000)
-             (mb (sa-bytes-allocated)) (mb (sa-total-memory-bytes)) (mb gc-live-after-full) (mb (sa-gc-trip-bytes))
+             (mb (sa-bytes-allocated)) (mb (sa-total-memory-bytes)) (mb (sa-max-memory-bytes))
+             (mb gc-live-after-full) (mb (sa-gc-trip-bytes))
              (if gc-full-this-time
                  (format " full:~a ~ams old-x~a" gc-full-this-time gc-full-ms-this-time gc-old-factor)
                  ""))))
