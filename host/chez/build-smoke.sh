@@ -420,6 +420,27 @@ for line in 'fwd-get:   41' 'fwd-first: 7' 'fwd-late:  [{K 5, :url K, :method :g
   fi
 done
 
+# A runtime require of a namespace the image already loaded must be a no-op.
+# App namespaces are pre-registered (intern-ns!) at boot but were never
+# ldr-mark-loaded!'d, so the loader's dedup missed and re-read the embedded
+# source, re-evaluating the namespace in place — the #451 reload window again,
+# from the runtime side, outside the emit walk that fix gated. A re-evaluated
+# fwd-get links the now-visible ns-local `get`, so the binary threw
+# String→Associative where `jolt run` was fine (reported against kmet: its
+# extension loader requires host namespaces at startup). --rerequire pins both
+# the stamp identity and that call against the in-order run.
+got_rr="$(cd / && "$out" --rerequire 2>&1)"
+want_rr="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --rerequire 2>&1)"
+if [ "$got_rr" != "$want_rr" ]; then
+  echo "  FAIL: a runtime require of an image namespace re-evaluates it"
+  echo "--- binary ----"; echo "$got_rr"
+  echo "--- jolt run --"; echo "$want_rr"; exit 1
+fi
+if ! printf '%s' "$got_rr" | grep -qF 're-require same-stamp: true'; then
+  echo "  FAIL: --rerequire re-evaluated app.embedded in the built binary"
+  echo "--- got ----"; echo "$got_rr"; exit 1
+fi
+
 # ...and the same with a WARM AOT cache, which is how a user meets this: the
 # cache is on by default in a built jolt, and the report that opened this said
 # "jolt run works fine once aot kicks in". A cached namespace loads from its
