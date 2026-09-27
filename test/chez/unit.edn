@@ -608,12 +608,12 @@
   ;; existence made a read-only file report writable and every regular file
   ;; report executable, so a caller testing writability before a write took the
   ;; wrong branch and found out at the open.
-  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro.txt\") (spit \"/tmp/jolt-access-ro.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro.txt\" (fs/str->posix \"r--r--r--\")) (let [f (java.io.File. \"/tmp/jolt-access-ro.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true false false]"}
-  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-rwx.txt\") (spit \"/tmp/jolt-access-rwx.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-rwx.txt\" (fs/str->posix \"rwxr-xr-x\")) (let [f (java.io.File. \"/tmp/jolt-access-rwx.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true true true]"}
-  {:suite "io" :expr "(let [f (java.io.File. \"/tmp/jolt-access-absent-xyz\")] [(.canRead f) (.canWrite f) (.canExecute f)])" :expected "[false false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-ro.txt\")] (fs/delete-if-exists p) (spit p \"x\") (fs/set-posix-file-permissions p (fs/str->posix \"r--r--r--\")) (let [f (java.io.File. p)] [(.canRead f) (.canWrite f) (.canExecute f)])))" :expected "[true false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-rwx.txt\")] (fs/delete-if-exists p) (spit p \"x\") (fs/set-posix-file-permissions p (fs/str->posix \"rwxr-xr-x\")) (let [f (java.io.File. p)] [(.canRead f) (.canWrite f) (.canExecute f)])))" :expected "[true true true]"}
+  {:suite "io" :expr "(let [f (java.io.File. (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-absent-xyz\"))] [(.canRead f) (.canWrite f) (.canExecute f)])" :expected "[false false false]"}
   ;; java.nio.file.Files/isReadable etc. (what babashka.fs/readable? routes to)
   ;; answer from the same predicate, so the two spellings cannot disagree
-  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro2.txt\") (spit \"/tmp/jolt-access-ro2.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro2.txt\" (fs/str->posix \"r--r--r--\")) [(fs/readable? \"/tmp/jolt-access-ro2.txt\") (fs/writable? \"/tmp/jolt-access-ro2.txt\") (fs/executable? \"/tmp/jolt-access-ro2.txt\")])" :expected "[true false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-access-ro2.txt\")] (fs/delete-if-exists p) (spit p \"x\") (fs/set-posix-file-permissions p (fs/str->posix \"r--r--r--\")) [(fs/readable? p) (fs/writable? p) (fs/executable? p)]))" :expected "[true false false]"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File (io/file \"/a/b\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File \"/a/b\"))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (type (io/file \"/a\"))))" :expected "\"class java.io.File\""}
@@ -622,14 +622,14 @@
   {:suite "io" :expr "(do (require (quote [clojure.string :as s])) (boolean (some (fn [p] (s/ends-with? p \"README.md\")) (file-seq \".\"))))" :expected "true"}
   {:suite "io" :expr "(string? (slurp \"README.md\"))" :expected "true"}
   {:suite "io" :label "slurp accepts the IReader used by *in*" :expr "(with-in-str \"one\\ntwo\" (slurp *in*))" :expected "\"one\\ntwo\""}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"hello\""}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"ab\""}
+  {:suite "io" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-test.txt\")] (do (spit p \"hello\") (slurp p)))" :expected "\"hello\""}
+  {:suite "io" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-test.txt\")] (do (spit p \"a\") (spit p \"b\" :append true) (slurp p)))" :expected "\"ab\""}
   ;; spit stages into a temp file and renames over the target, so OVERWRITING is
   ;; the case that broke on Windows, where a rename onto an existing destination
   ;; is refused (#1074): the second spit to any path failed, as did the first
   ;; spit to a File/createTempFile target. The Windows half needs that platform
   ;; (.github/workflows/tests.yml); these rows keep the POSIX half honest.
-  {:suite "io" :label "spit overwrites an existing file" :expr "(do (spit \"/tmp/jolt-io-overwrite.txt\" \"first\") (spit \"/tmp/jolt-io-overwrite.txt\" \"second\") (slurp \"/tmp/jolt-io-overwrite.txt\"))" :expected "\"second\""}
+  {:suite "io" :label "spit overwrites an existing file" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-overwrite.txt\")] (do (spit p \"first\") (spit p \"second\") (slurp p)))" :expected "\"second\""}
   {:suite "io" :label "spit overwrites a file the runtime just created" :expr "(let [f (java.io.File/createTempFile \"jolt-spit\" \".txt\")] (spit f \"written\") (let [v (slurp f)] (.delete f) v))" :expected "\"written\""}
   ;; The PATH-LIST separator is not the file separator. It is ":" here and ";" on
   ;; Windows, where ":" is the drive suffix — babashka.fs/split-paths and
@@ -659,7 +659,7 @@
   ;; JVM's new File(this, name) — a relative directory lists relative children.
   ;; They used to answer absolute paths, so a caller relativizing the result
   ;; against the directory it passed in (classpath scanning) got ../.. garbage.
-  {:suite "io" :expr "(do (.mkdirs (java.io.File. \"/tmp/jolt-ls-test/d\")) (spit \"/tmp/jolt-ls-test/d/a.txt\" \"x\") (with-out-str (print (mapv str (.listFiles (java.io.File. \"/tmp/jolt-ls-test/d\"))))))" :expected "\"[/tmp/jolt-ls-test/d/a.txt]\""}
+  {:suite "io" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-ls-test/d\")] (do (.mkdirs (java.io.File. d)) (spit (str d \"/a.txt\") \"x\") (with-out-str (print (mapv (fn [f] [(.isAbsolute f) (.getName f)]) (.listFiles (java.io.File. d)))))))" :expected "\"[[true a.txt]]\""}
   {:suite "io" :expr "(do (.mkdirs (java.io.File. \"target/jolt-ls-rel/sub\")) (spit \"target/jolt-ls-rel/sub/a.txt\" \"x\") (mapv str (file-seq (java.io.File. \"target/jolt-ls-rel\"))))" :expected "[\"target/jolt-ls-rel\" \"target/jolt-ls-rel/sub\" \"target/jolt-ls-rel/sub/a.txt\"]"}
   {:suite "io" :expr "(do (.mkdirs (java.io.File. \"target/jolt-ls-rel/sub\")) (mapv str (.listFiles (java.io.File. \"./target/jolt-ls-rel/\"))))" :expected "[\"./target/jolt-ls-rel/sub\"]"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/file \"README.md\"))))" :expected "true"}

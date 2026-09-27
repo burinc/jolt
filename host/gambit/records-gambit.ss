@@ -440,6 +440,22 @@
 (define chez-record-fields-tbl
   (make-hashtable string-hash string=?))
 
+(define chez-infer-map-mu (make-mutex))
+
+(define chez-infer-registry-gen 0)
+
+(define chez-record-shapes-memo #f)
+
+(define chez-protocol-methods-memo #f)
+
+(define (chez-infer-registry-bump!)
+  (jolt-with-mutex
+    chez-infer-map-mu
+    (set! chez-infer-registry-gen
+      (fx+ chez-infer-registry-gen 1))
+    (set! chez-record-shapes-memo #f)
+    (set! chez-protocol-methods-memo #f)))
+
 (define (register-record-shape! ctor-key field-kws
          field-tags type-tag)
   (jolt-with-mutex
@@ -452,7 +468,8 @@
     (hashtable-set!
       chez-record-dbl-tbl
       type-tag
-      (list->vector (map chez-double-tag? field-tags)))))
+      (list->vector (map chez-double-tag? field-tags))))
+  (chez-infer-registry-bump!))
 
 (define (chez-shape-simple-name s)
   (let loop ((i (- (string-length s) 1)))
@@ -493,7 +510,7 @@
       ((char=? (string-ref k i) #\/) (substring k 0 i))
       (else (loop (+ i 1))))))
 
-(define (chez-record-shapes-map)
+(define (chez-record-shapes-map-build)
   (let ((by-name (make-hashtable string-hash string=?))
         (kw-fields (keyword #f "fields"))
         (kw-tags (keyword #f "tags"))
@@ -553,7 +570,7 @@
              (car ks))
             (else (loop (cdr ks))))))))
 
-(define (chez-protocol-methods-map)
+(define (chez-protocol-methods-map-build)
   (let ((out (jolt-hash-map)))
     (let-values (((ks vs)
                   (jolt-with-mutex
@@ -568,6 +585,30 @@
         ks
         vs))
     out))
+
+(define (chez-record-shapes-map)
+  (let ((gen chez-infer-registry-gen))
+    (let ((memo chez-record-shapes-memo))
+      (if (and memo (fx=? (car memo) gen))
+          (cdr memo)
+          (let ((m (chez-record-shapes-map-build)))
+            (jolt-with-mutex
+              chez-infer-map-mu
+              (when (fx=? chez-infer-registry-gen gen)
+                (set! chez-record-shapes-memo (cons gen m))))
+            m)))))
+
+(define (chez-protocol-methods-map)
+  (let ((gen chez-infer-registry-gen))
+    (let ((memo chez-protocol-methods-memo))
+      (if (and memo (fx=? (car memo) gen))
+          (cdr memo)
+          (let ((m (chez-protocol-methods-map-build)))
+            (jolt-with-mutex
+              chez-infer-map-mu
+              (when (fx=? chez-infer-registry-gen gen)
+                (set! chez-protocol-methods-memo (cons gen m))))
+            m)))))
 
 (define (jrec-field-index r k)
   (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
@@ -1496,10 +1537,12 @@
     (hashtable-delete! type-registry type-tag)
     (hashtable-delete! type-method-index type-tag)
     (hashtable-delete! type-class-memo type-tag)
-    (hashtable-delete! clone-registry type-tag)))
+    (hashtable-delete! clone-registry type-tag))
+  (chez-infer-registry-bump!))
 
 (define (prune-type-registry! keep?)
   (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+  (chez-infer-registry-bump!)
   (vector-for-each
     (lambda (k)
       (unless (keep? k)
@@ -1585,6 +1628,7 @@
                  (chez-type-owns-lookup? type-tag))
         (jrdesc-mask-fields! desc))))
   (remove-clone! type-tag proto method)
+  (chez-infer-registry-bump!)
   (if #f #f))
 
 (define (find-protocol-method type-tag proto method)
@@ -1964,6 +2008,7 @@
               (string-append ns "/" m)
               (cons proto-name m)))))
       (seq->list method-names)))
+  (chez-infer-registry-bump!)
   jolt-nil)
 
 (define host-type-set
@@ -3395,6 +3440,7 @@
     (jolt-with-mutex
       rec-tbl-mu
       (hashtable-set! chez-record-type-tbl tag #t))
+    (chez-infer-registry-bump!)
     (let ((protos (filter
                     (lambda (s) (not (string=? s "clojure.lang.IType")))
                     (jch-direct-supers tag))))

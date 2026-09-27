@@ -446,7 +446,7 @@
     "                   (map jolt-fiber-state fs))\n"
     "           (exit 1)))\n"))
   (set! no-poller-path
-    (string-append "/tmp/jolt-fibers-process-io-no-poller-probe-" (number->string (get-process-id)) ".ss"))
+    (string-append (host-temp-dir) "/jolt-fibers-process-io-no-poller-probe-" (number->string (get-process-id)) ".ss"))
   (let ((p (open-output-file no-poller-path 'replace)))
     (display no-poller-script p)
     (close-output-port p))

@@ -24,7 +24,7 @@ cmd='(require (quote jolt.deps)) (jolt.deps/add-deps (quote {:deps {org.clojure/
 
 # one timed run against cache dir $1; prints the real seconds
 one_run() {
-  t="/tmp/aotperf.$$"
+  t="${TMPDIR:-/tmp}/aotperf.$$"
   JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$1" JOLT_QUIET=1 /usr/bin/time -p "$jolt" -e "$cmd" >/dev/null 2>>"$t"
   out="$(grep '^real' "$t" | awk '{print $2}')"
   rm -f "$t"; echo "$out"

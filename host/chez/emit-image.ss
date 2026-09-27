@@ -98,6 +98,44 @@
          (and (pair? items) (symbol-t? (car items))
               (string=? (symbol-t-name (car items)) "ns")))))
 
+;; --- parsed top-level forms, shared by a build's two walks -------------------
+;; `jolt build` reads and parses every app source TWICE: once in build.ss
+;; bld-wp-infer! (to analyze + type it) and once in the emit walk (to consume
+;; that analyzed IR positionally — one pop per form). Both read the same file
+;; with the same reader and must see the same form sequence, so parsing is
+;; exactly the kind of work the second walk can reuse instead of repeating.
+;; Measured on kmet's 311 namespaces, same binary, alternating runs: emit's
+;; per-namespace walk 40.1/41.2s with the cache against 46.3/47.2s without
+;; (the wp walk's 5.0-5.6s parse, the first one, is unchanged either way).
+;; The emit hook builds new forms rather than mutating them, so sharing is safe.
+;;
+;; Keyed by namespace with the SOURCE STRING it was parsed from, compared by
+;; value: an in-process rebuild (nREPL, a second `build` in one session) after an
+;; edit parses afresh instead of serving the previous source's forms.
+;; JOLT_NO_FORM_CACHE=1 opts out — the same two walks then parse as before, at
+;; the cost of the second parse — for a build on a memory-tight box, since the
+;; cache holds every namespace's forms from the wp walk until its emit walk
+;; reads them.
+(define ei-form-cache-off? (and (getenv "JOLT_NO_FORM_CACHE") #t))
+(define ei-form-cache (make-hashtable string-hash string=?))
+(define (ei-read-all-for ns-name src)
+  (if ei-form-cache-off?
+      (ei-read-all src)
+      (let ((e (hashtable-ref ei-form-cache ns-name #f)))
+        (if (and e (string=? (car e) src))
+            (cdr e)
+            (let ((forms (ei-read-all src)))
+              (hashtable-set! ei-form-cache ns-name (cons src forms))
+              forms)))))
+(define (ei-form-cache-clear!) (hashtable-clear! ei-form-cache))
+;; Hand a parse to the next walk that asks ei-read-all-for for it. The graph's
+;; scan (build.ss bld-scan-forms) fills this for sources it could read in normal
+;; mode, so the wp walk skips its own parse of them; the wp walk fills it for the
+;; rest before the emit walk consumes it.
+(define (ei-form-cache-put! ns-name src forms)
+  (unless ei-form-cache-off?
+    (hashtable-set! ei-form-cache ns-name (cons src forms))))
+
 ;; ei-macro-form? / ei-defmacro->fn moved to compile-eval.ss (ce-macro-form? /
 ;; ce-defmacro->fn, loaded before this) — shared with the runtime defmacro spine.
 
@@ -297,7 +335,7 @@
     (dynamic-wind
       jolt-ns-load-vars-push!
       (lambda ()
-        (let loop ((forms (ei-read-all src)) (ord 0))
+        (let loop ((forms (ei-read-all-for ns-name src)) (ord 0))
           (unless (null? forms)
             (let ((f (if hook (hook (car forms)) (car forms))))
               ;; ord mirrors the loader's per-file top-level form counter
@@ -404,12 +442,18 @@
         (let* ((form (if (eq? kind 'macro) (car f) f))
                (ctx (make-analyze-ctx ns))
                (cached (ei-next-cached ns))
-               (ir (jolt-ce-run-passes (or cached (jolt-ce-analyze ctx form)) ctx (ei-unit)))
+               (analyzed (or cached
+                             (ei-timed "emit: analyze (uncached)"
+                               (lambda () (jolt-ce-analyze ctx form)))))
+               (ir (ei-timed "emit: run-passes"
+                     (lambda () (jolt-ce-run-passes analyzed ctx (ei-unit)))))
                (str (if (eq? kind 'macro)
-                        (ei-macro-string ns nm (ei-emit-top ir nm) (ei-emit-meta ns (cdr f) #f) #f)
-                        (jolt-ce-emit-top ir)))
+                        (ei-macro-string ns nm
+                          (ei-timed "emit: emit-macro" (lambda () (ei-emit-top ir nm)))
+                          (ei-emit-meta ns (cdr f) #f) #f)
+                        (ei-timed "emit: emit-top" (lambda () (jolt-ce-emit-top ir)))))
                (fqn (if (eq? kind 'macro) (string-append ns "/" nm) (dce-def-fqn ir)))
-               (refs (dce-app-refs ir str)))
+               (refs (ei-timed "emit: dce-refs" (lambda () (dce-app-refs ir str)))))
           (set! acc (cons (if fqn (dce-rec #f fqn refs str (dce-def-init-runs? ir)) (dce-rec #t #f refs str)) acc)))))
     (reverse acc)))
 

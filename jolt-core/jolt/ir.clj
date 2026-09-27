@@ -259,53 +259,92 @@
 ;; child nodes pass through unchanged, so walks built on this are TOTAL over the
 ;; op set (an unknown op recurses nowhere rather than being silently dropped).
 ;;
+;; A child f hands back unchanged (identical?) is kept, and a node whose every
+;; child is kept is returned AS IS instead of freshly assoc'd — so a pass that
+;; rewrites one call site leaves the rest of the tree shared with its input. That
+;; is what turns the per-form walks (const-fold, inline, flatten-lets,
+;; scalar-replace, numeric annotate) from a full-tree copy each into work
+;; proportional to the subtree they actually change: on kmet's build they are
+;; ~10s of `emit: run-passes`, nearly all of it allocation of rebuilt nodes.
+;; Sharing is sound because IR values are immutable and every consumer compares
+;; by value; the identity-keyed backend caches (hoisted literals, quote sharing)
+;; key on the user's literal OBJECTS, which sharing does not clone or merge.
+;;
 ;; Uses cond/=/get only — same constructs as the passes that consume it, so it
 ;; loads at the same compiler tier with no new macro dependency.
+(defn- assoc-ir [node kvs]
+  (let [n (count kvs)]
+    (loop [i 0 out nil]
+      (if (>= i n)
+        (if (nil? out) node out)
+        (let [k (nth kvs i) v (nth kvs (+ i 1))]
+          (if (nil? out)
+            (if (identical? (get node k) v)
+              (recur (+ i 2) nil)
+              (recur (+ i 2) (assoc node k v)))
+            (recur (+ i 2) (assoc out k v))))))))
+
+(defn- mapv-ir [f coll]
+  (let [n (count coll)]
+    (loop [i 0 out nil]
+      (if (>= i n)
+        (if (nil? out) coll out)
+        (let [c (f (nth coll i))]
+          (cond
+            (some? out) (recur (inc i) (conj out c))
+            (identical? c (nth coll i)) (recur (inc i) nil)
+            ;; first changed element: rebuild the resulting vector with the
+            ;; prefix already walked (f is still called once per element).
+            :else (recur (inc i)
+                         (loop [j 0 v []]
+                           (if (= j i) (conj v c) (recur (inc j) (conj v (nth coll j))))))))))))
+
 (defn map-ir-children [f node]
   (let [op (get node :op)]
     (cond
-      (= op :if)     (assoc node :test (f (get node :test))
-                                 :then (f (get node :then))
-                                 :else (f (get node :else)))
-      (= op :do)     (assoc node :statements (mapv f (get node :statements))
-                                 :ret (f (get node :ret)))
-      (= op :throw)  (assoc node :expr (f (get node :expr)))
-      (= op :coerce) (assoc node :expr (f (get node :expr)))
-      (= op :set-var) (assoc node :val (f (get node :val)))
-      (= op :set-field) (assoc node :obj (f (get node :obj)) :val (f (get node :val)))
-      (= op :defmacro) (assoc node :fn (f (get node :fn)))
-      (= op :ffi-callable) (assoc node :fn (f (get node :fn)))
-      (= op :invoke) (assoc node :fn (f (get node :fn))
-                                 :args (mapv f (get node :args)))
-      (= op :vector) (assoc node :items (mapv f (get node :items)))
-      (= op :set)    (assoc node :items (mapv f (get node :items)))
-      (= op :map)    (assoc node :pairs (mapv (fn [pr] [(f (nth pr 0)) (f (nth pr 1))])
-                                              (get node :pairs)))
-      (= op :let)    (assoc node :bindings (mapv (fn [b] [(nth b 0) (f (nth b 1))])
-                                                 (get node :bindings))
-                                 :body (f (get node :body)))
-      (= op :loop)   (assoc node :bindings (mapv (fn [b] [(nth b 0) (f (nth b 1))])
-                                                 (get node :bindings))
-                                 :body (f (get node :body)))
-      (= op :recur)  (assoc node :args (mapv f (get node :args)))
-      (= op :fn)     (assoc node :arities (mapv (fn [a] (assoc a :body (f (get a :body))))
-                                                (get node :arities)))
-      (= op :def)    (let [n (if (get node :init) (assoc node :init (f (get node :init))) node)]
-                       (if (get node :meta-expr)
-                         (assoc n :meta-expr (f (get node :meta-expr)))
-                         n))
-      (= op :host-call) (assoc node :target (f (get node :target))
-                                    :args (mapv f (get node :args)))
-      (= op :host-new) (assoc node :args (mapv f (get node :args)))
+      (= op :if)     (assoc-ir node [:test (f (get node :test))
+                                     :then (f (get node :then))
+                                     :else (f (get node :else))])
+      (= op :do)     (assoc-ir node [:statements (mapv-ir f (get node :statements))
+                                     :ret (f (get node :ret))])
+      (= op :throw)  (assoc-ir node [:expr (f (get node :expr))])
+      (= op :coerce) (assoc-ir node [:expr (f (get node :expr))])
+      (= op :set-var) (assoc-ir node [:val (f (get node :val))])
+      (= op :set-field) (assoc-ir node [:obj (f (get node :obj)) :val (f (get node :val))])
+      (= op :defmacro) (assoc-ir node [:fn (f (get node :fn))])
+      (= op :ffi-callable) (assoc-ir node [:fn (f (get node :fn))])
+      (= op :invoke) (assoc-ir node [:fn (f (get node :fn))
+                                     :args (mapv-ir f (get node :args))])
+      (= op :vector) (assoc-ir node [:items (mapv-ir f (get node :items))])
+      (= op :set)    (assoc-ir node [:items (mapv-ir f (get node :items))])
+      (= op :map)    (assoc-ir node [:pairs (mapv-ir (fn [pr] [(f (nth pr 0)) (f (nth pr 1))])
+                                                     (get node :pairs))])
+      (= op :let)    (assoc-ir node [:bindings (mapv-ir (fn [b] [(nth b 0) (f (nth b 1))])
+                                                        (get node :bindings))
+                                     :body (f (get node :body))])
+      (= op :loop)   (assoc-ir node [:bindings (mapv-ir (fn [b] [(nth b 0) (f (nth b 1))])
+                                                        (get node :bindings))
+                                     :body (f (get node :body))])
+      (= op :recur)  (assoc-ir node [:args (mapv-ir f (get node :args))])
+      (= op :fn)     (assoc-ir node [:arities (mapv-ir (fn [a] (assoc-ir a [:body (f (get a :body))]))
+                                                       (get node :arities))])
+      (= op :def)    (let [kvs (if (get node :init) [:init (f (get node :init))] [])
+                           kvs (if (get node :meta-expr)
+                                 (conj kvs :meta-expr (f (get node :meta-expr)))
+                                 kvs)]
+                       (assoc-ir node kvs))
+      (= op :host-call) (assoc-ir node [:target (f (get node :target))
+                                        :args (mapv-ir f (get node :args))])
+      (= op :host-new) (assoc-ir node [:args (mapv-ir f (get node :args))])
       ;; :catch-body / :finally are optional; recurse them only when PRESENT.
       ;; Assoc'ing them nil-when-absent would turn the node into a phm (jolt's
       ;; nil-valued-key representation) and force backend densification — so we
       ;; preserve the node's shape and never introduce a nil key.
       (= op :try)
-      (let [n (assoc node :body (f (get node :body)))
-            n (if (get node :catch-body) (assoc n :catch-body (f (get node :catch-body))) n)
-            n (if (get node :finally) (assoc n :finally (f (get node :finally))) n)]
-        n)
+      (let [kvs [:body (f (get node :body))]
+            kvs (if (get node :catch-body) (conj kvs :catch-body (f (get node :catch-body))) kvs)
+            kvs (if (get node :finally) (conj kvs :finally (f (get node :finally))) kvs)]
+        (assoc-ir node kvs))
       ;; :const :local :var :host :host-static :the-var :quote — no child nodes
       :else node)))
 

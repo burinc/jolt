@@ -35,8 +35,8 @@
 ;; random across PROCESSES — Chez seeds its generator the same way every start,
 ;; so every run of this file picked the identical name and two concurrent runs
 ;; deleted each other's image ("image: no such file", from whichever lost).
-(define tmp (string-append "/tmp/jolt-image-test-" (number->string (get-process-id)) ".jimg"))
-(define refstub-tmp (string-append "/tmp/jolt-image-refstub-" (number->string (get-process-id)) ".txt"))
+(define tmp (string-append (host-temp-dir) "/jolt-image-test-" (number->string (get-process-id)) ".jimg"))
+(define refstub-tmp (string-append (host-temp-dir) "/jolt-image-refstub-" (number->string (get-process-id)) ".txt"))
 (define (cleanup!) (when (file-exists? tmp) (delete-file tmp)))
 
 ;; --- Chez substrate the format depends on ------------------------------------
@@ -173,8 +173,14 @@
      "[(re-find $rt \"y\\nx\") (.flags $rt)]"               "[\"x\" 8]")
 (rtu "class token" "String"     "[(str $rt) (instance? $rt \"x\")]"
      "[\"class java.lang.String\" true]")
-(rtu "File"        "(java.io.File. \"/tmp\")"
-     "[(.getPath $rt) (.isDirectory $rt)]"                   "[\"/tmp\" true]")
+;; a File drops a trailing separator, and macOS's TMPDIR ends in one
+(define tmp-root
+  (let ((d (host-temp-dir)))
+    (if (and (> (string-length d) 1) (char=? (string-ref d (- (string-length d) 1)) #\/))
+        (substring d 0 (- (string-length d) 1))
+        d)))
+(rtu "File"        (string-append "(java.io.File. \"" tmp-root "\")")
+     "[(.getPath $rt) (.isDirectory $rt)]"                   (string-append "[\"" tmp-root "\" true]"))
 
 ;; arrays and StringBuilder are mutable host objects: contents, and still writable
 (rtu "byte-array"   "(byte-array [1 2 3])"      "(vec $rt)"  "[1 2 3]")

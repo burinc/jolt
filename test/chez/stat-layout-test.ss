@@ -49,7 +49,7 @@
 ;; ---- and the offsets it lands on actually read the file --------------------
 ;; A file whose mode we just set: the layout is right only if st_mode reads back
 ;; the mode we chose, which no offset that merely happens to carry S_IFDIR would.
-(define tmp (string-append "/tmp/jolt-stat-layout-" (number->string (sa-real-time-ms))))
+(define tmp (string-append (host-temp-dir) "/jolt-stat-layout-" (number->string (sa-real-time-ms))))
 (when probe-buf
   (close-port (open-file-output-port tmp (file-options no-fail)))
   (guard (e (#t #f))
