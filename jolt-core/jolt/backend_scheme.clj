@@ -2847,11 +2847,16 @@
       :else op)))
 
 ;; IFn dispatch for a LITERAL callee (Clojure's "value as fn"): a keyword looks
-;; itself up in its arg; a map/set/vector literal looks up its arg.
-(defn- ifn-kind [fnode]
+;; itself up in its arg; a map/set/vector literal looks up its arg. Only at an
+;; arity the callee's invoke has — Keyword and APersistentMap take one or two
+;; args, APersistentSet and APersistentVector one. Any other count is nil, so
+;; the call goes through jolt-invoke and throws the callee's ArityException
+;; rather than a lookup quietly dropping the extra args (#1162).
+(defn- ifn-kind [fnode nargs]
   (case (:op fnode)
-    :const (when (keyword? (:val fnode)) :keyword)
-    (:map :set :vector) :coll
+    :const (when (and (keyword? (:val fnode)) (<= 1 nargs 2)) :keyword)
+    :map (when (<= 1 nargs 2) :coll)
+    (:set :vector) (when (= 1 nargs) :coll)
     nil))
 
 ;; Polymorphic inline-cache width. MUST match jolt-pic-n in host/chez/records.ss:
@@ -3041,7 +3046,7 @@
         ;; jolt-dynamic-tail-lines). A dynamic non-tail site still registers nothing.
         _ (when tl (register-callsite! tl (or (static-callee fnode) (when tail? "?")) tail?))
         nop (native-op fnode (count args))
-        kind (ifn-kind fnode)
+        kind (ifn-kind fnode (count args))
         ;; order args left-to-right (build receives the spliced operand strings)
         order-args (fn [build] (ordered-call arg-nodes args build))
         defstr (fn [as] (if (> (count as) 1) (str " " (nth as 1)) ""))
@@ -3292,7 +3297,7 @@
       (= kind :coll)
       (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
                     (fn [[c & as]]
-                      (str (if (and (= :vector (:op fnode)) (= 1 (count as)))
+                      (str (if (= :vector (:op fnode))
                              "(jolt-nth "
                              "(jolt-get ")
                            c " " (str/join " " as) ")")))

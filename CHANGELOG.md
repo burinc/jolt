@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A keyword, set or vector called with the wrong number of arguments throws
+  `ArityException` (#1162).** A literal callee was lowered straight to `get`/`nth`
+  whatever the argument count, so `(:a 1 2 3)` answered 2, `(#{1} 1 2)` 1 and
+  `([1 2] 0 1)` 1, and `(:a)`/`({:a 1})` reported the arity of an anonymous
+  `get`. Those calls now go through the ordinary invoke and throw the callee's
+  own message (`Wrong number of args (0) passed to: :a`), and the inliner no
+  longer counts an over-arity lookup as pure, so a discarded one still throws.
+- **A `jolt.loader` root lookup racing a private load no longer answers the
+  context's half-built namespace (jolt-fmvc).** The root checked whether a
+  context owned the name before looking the namespace up, so a context that
+  claimed and created the name between the two reads had its namespace handed
+  out as the host's. A second context loading the same name could link it
+  mid-evaluation, with vars missing. It showed up once as loaderconf case 13
+  throwing under memory pressure.
 - **Non-Unicode charsets work on bionic (#1148).** `getBytes`, `String`'s
   decoding constructor, `URLEncoder`/`URLDecoder` and the stateful ISO-2022-JP
   cases went through Android's partial libc iconv: `iconv_open` resolves there
