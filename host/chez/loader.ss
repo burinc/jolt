@@ -1410,21 +1410,14 @@
 
 ;; Any macro var the namespace owns — defmacro/definline flag it directly, and so
 ;; does a re-export that copies a macro's meta onto a fresh var (ns.ss
-;; var-meta-sync-macro!), which no emitted-text scan would catch. O(one scan of
-;; var-table) per COMPILE (a miss), which is noise beside the compile itself.
+;; var-meta-sync-macro!), which no emitted-text scan would catch. ns-cells-list is
+;; the namespace's own bucket in rt.ss's ns-cells-index: O(vars in ns), where the
+;; var-table prefix scan this replaced was O(every var in the image) per compile.
 (define (aot-ns-has-macro-var? ns)
-  (let* ((prefix (string-append ns "/")) (pn (string-length prefix))
-         (ks (jolt-with-mutex var-table-mu (hashtable-keys var-table))))
-    (let loop ((i 0))
-      (cond
-        ((fx>=? i (vector-length ks)) #f)
-        (else
-         (let ((k (vector-ref ks i)))
-           (if (and (fx>=? (string-length k) pn)
-                    (string=? prefix (substring k 0 pn))
-                    (macro-var? (hashtable-ref var-table k #f)))
-               #t
-               (loop (fx+ i 1)))))))))
+  (let loop ((cs (ns-cells-list ns)))
+    (cond ((null? cs) #f)
+          ((macro-var? (car cs)) #t)
+          (else (loop (cdr cs))))))
 
 ;; The namespace part of a "<ns>/<name>" table key: ns names hold no '/', so the
 ;; FIRST slash separates.
