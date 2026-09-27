@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered English. The probe and `locale-name` now read the category back and
   compare locale roots; a request the OS did not honor answers nil, and
   jolt.time's bundled tables take over.
+- **`ProcessBuilder.start` returns after the child has exec'd on bionic
+  (#1148).** Android's `posix_spawn` returns as soon as it forks, before the
+  child has closed the descriptors it should not inherit, so a listener the
+  parent closed right after `start` could still be bound in the child. Every
+  spawn now waits on a close-on-exec pipe, as glibc, musl and Darwin already
+  do internally.
 - **`Math/PI`/`Math/E` and `clojure.math`'s are the JDK's literal constants,
   not the host libm's `atan(1)`/`exp(1)` (#1148).** bionic's `exp(1)` is one ulp
   high, so `Math/E` — and everything built on it, `jolt.infix`'s `e` among
@@ -36,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CFLAGS+=-fPIC` (so `jolt build --library` links there), CTS matches its
   baseline, and the fixtures that assumed off-Android behavior or a glibc
   provisioning path branch on the platform. `ci/termux-build.sh` installs the
-  sqlite package the smoke fixture's per-OS map names.
+  libsqlite package the smoke fixture's per-OS map names.
 
 ## [0.8.13] - 2026-09-26
 
