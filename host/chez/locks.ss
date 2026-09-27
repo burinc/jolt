@@ -255,7 +255,16 @@
 ;; difference between them is that one branch.
 (define jolt-lock-parked (list 'jolt-lock-parked))   ; unique; never a decision
 
-(define (jolt-lock-wait mu decide)
+(define (jolt-lock-wait mu decide) (jolt-lock-wait/abandon mu decide #f))
+
+;; An interrupt (fibers.ss) raised out of a park is the one exit decide never
+;; sees, so a registration decide removes on its own exits would outlive the
+;; wait. With ABANDON? true, decide also takes one argument, and is called with
+;; it (outside mu) just before that raise, to drop such a registration. It is
+;; decide itself rather than a separate thunk because the caller that needs it
+;; (jolt-cv-wait/ibox) sits on the settled-deref path, where one more closure
+;; per call is measurable.
+(define (jolt-lock-wait/abandon mu decide abandon?)
   ;; before decide, which registers the waiter under mu
   (jolt-fiber-may-park! 'jolt-lock-wait)
   (let retake ()
@@ -264,8 +273,15 @@
           ;; mu is released here. jolt-current-fiber still answers this fiber —
           ;; the switch is what clears that register — and the state it needs is
           ;; already 'parked, set by decide under mu.
-          (begin (jolt-fiber-to-scheduler! (jolt-current-fiber))
-                 (retake))
+          (let ((f (jolt-current-fiber)))
+            ;; An interrupt (fibers.ss) ends the wait instead of letting the
+            ;; decision be retaken: its wake is not "something changed".
+            (when (jolt-fiber-switch-for-park? f)
+              (jolt-fiber-to-scheduler! f))
+            (when (and abandon? (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+              (decide 'abandon))
+            (jolt-fiber-check-interrupt! f)
+            (retake))
           r))))
 
 ;; --- blocking, and who is allowed to do it ----------------------------------
@@ -496,8 +512,14 @@
   ;; RETAKES that thunk when a parked fiber resumes: a loop-local would forget a
   ;; registration the park had already made, and the entry would outlive the wait.
   (let ((entry #f))
-    (jolt-lock-wait mu
-      (lambda ()
+    (jolt-lock-wait/abandon mu
+      (case-lambda
+       ((_)
+        ;; abandoned by a fiber interrupt: the wait is over, deregister
+        (when entry
+          (jolt-with-mutex mu (jolt-interrupt-wait-remove! ibox entry))
+          (set! entry #f)))
+       (()
         (let loop ()
           ;; The flag FIRST, on every round. That ordering is what gives the
           ;; already-set case for free — a thread whose flag is set when it calls a
@@ -560,7 +582,8 @@
                   (if deadline
                       (jolt-condition-wait cv mu (jolt-millis->time deadline))
                       (jolt-condition-wait cv mu))
-                  (loop)))))))))))
+                  (loop)))))))))
+      #t)))
 
 ;; --- interruptible waiting --------------------------------------------------
 ;; (jolt-cv-wait-interruptibly who mu cv deadline decide)

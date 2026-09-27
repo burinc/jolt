@@ -147,10 +147,16 @@
   (let* ((park? (jolt-with-mutex (alt-handler-wmu h)
                   (if (vector-ref (alt-handler-mailbox h) 0)
                       #f
-                      (begin (jolt-fiber-state-set! f 'parked) #t)))))
-    (if park?
-        (jolt-sm-park! f resume)
-        (begin (enable-interrupts) (resume)))))
+                      (jolt-fiber-commit-park! f h)))))
+    (cond
+      (park? (jolt-sm-park! f resume))
+      ;; an interrupt is pending (fibers.ss): abandon the wait and raise, inside
+      ;; the driver's handler, which marks the fiber dead and closes its channel
+      ((and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+       (enable-interrupts)
+       (alt-claim! h)
+       (jolt-fiber-check-interrupt! f))
+      (else (enable-interrupts) (resume)))))
 
 ;; --- the driver -------------------------------------------------------------
 ;; The fiber thunk of a CPS'd body. It runs on the first entry AND on every
@@ -180,12 +186,29 @@
           (go-chan-finish! w e))            ; publishes the failure, then closes w
         (jolt-fiber-dead! f e))
       (lambda ()
-        (let ((step (jolt-fiber-sm f)))
-          ;; 'running marks "a driver is on the stack" — see jolt-sm-park!
-          (jolt-fiber-sm-set! f 'running)
-          (if (procedure? step)
-              (step)
-              (jolt-invoke body-fn (lambda (v) (jolt-sm-finish! w f v)))))))))
+        ;; The handler a cheap park committed on, or #f on the first entry. It is
+        ;; cleared here, as the full park clears it on its way back, so a later
+        ;; park that is not a channel wait is never taken for one by interrupt!.
+        (let ((h (jolt-fiber-parked-on f)))
+          (when h
+            (jolt-fiber-parked-on-set! f #f)
+            ;; an interrupt is raised before the step runs, so the step never
+            ;; reads the mailbox the wake left empty, and the wait is claimed
+            ;; first so no value lands in it after the fiber is gone
+            (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+              (alt-claim! h)))
+          (jolt-fiber-check-interrupt! f)
+          (let ((step (jolt-fiber-sm f)))
+            ;; 'running marks "a driver is on the stack" — see jolt-sm-park!
+            (jolt-fiber-sm-set! f 'running)
+            (cond
+              ;; Resumed with nothing delivered: a wake from a registration an
+              ;; interrupt left behind (see jolt-fiber-waiter-wait!). Commit to
+              ;; the same wait again.
+              ((and h (not (vector-ref (alt-handler-mailbox h) 0)))
+               (jolt-sm-commit! f h step))
+              ((procedure? step) (step))
+              (else (jolt-invoke body-fn (lambda (v) (jolt-sm-finish! w f v)))))))))))
 
 ;; The terminal continuation on a fiber. The value cannot simply be returned: after
 ;; a cheap park nothing is left on the stack to return through, so the delivery and

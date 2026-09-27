@@ -78,8 +78,11 @@
           carrier
           (mutable sm)
           (mutable monitors)
-          (mutable sic))
-  (nongenerative jolt-fiber-v4))
+          (mutable sic)
+          (mutable interrupt)
+          (mutable parked-on)
+          (mutable mask))
+  (nongenerative jolt-fiber-v5))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -612,7 +615,8 @@
                ;; leaves the depth one higher than it found it, the stored sic
                ;; grows without bound, and jolt-adjust-interrupts! turns a drain
                ;; quadratic: 10k yields still finished, 200k hung.
-               (enable-interrupts))
+               (enable-interrupts)
+               (jolt-fiber-check-interrupt! f))
         (error 'sa-fiber-yield "yield called outside a fiber"))))
 
 ;; Park WITHOUT re-enqueueing: the fiber is not runnable until sa-fiber-resume.
@@ -625,9 +629,10 @@
     (if f
         (begin (jolt-fiber-may-park! 'jolt-fiber-park!)  ; before 'parked commits
                (disable-interrupts)
-               (jolt-fiber-state-set! f 'parked)
-               (jolt-fiber-to-scheduler! f)
-               (enable-interrupts))          ; balance, see sa-fiber-yield
+               (when (jolt-fiber-commit-park! f #f)
+                 (jolt-fiber-to-scheduler! f))
+               (enable-interrupts)           ; balance, see sa-fiber-yield
+               (jolt-fiber-check-interrupt! f))
         (error 'jolt-fiber-park! "park called outside a fiber"))))
 
 ;; (sa-fiber-resume f) -> void. Make a PARKED fiber runnable again (enqueue on
@@ -672,7 +677,7 @@
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c #f '() 0)))
+              c #f '() 0 #f #f 0)))
       (jolt-fiber-enqueue! c f)
       f)))
 
@@ -874,7 +879,10 @@
        (jolt-fiber-state-set! f 'ready)
        (jolt-fiber-enqueue! (jolt-fiber-carrier f) f)
        ;; re-armed by jolt-fiber-arm-preempt! when this fiber is next dispatched
-       (jolt-fiber-to-scheduler! f)))))
+       (jolt-fiber-to-scheduler! f)
+       ;; Resumed. A compute-bound fiber that was interrupted meets it here, on
+       ;; its next quantum, the only safe point it ever reaches.
+       (jolt-fiber-check-interrupt! f)))))
 
 ;; Arm around a dispatch, disarm on the way back to the drain loop, so the
 ;; scheduler itself is never preempted. Installing the handler per dispatch
@@ -914,6 +922,159 @@
 ;; its own tick — so the borrow would silently outlive itself.
 (define (jolt-fiber-rearm-preempt!)
   (if (jolt-current-fiber) (jolt-fiber-arm-preempt!) (set-timer 0)))
+
+;; --- interrupts (an Erlang exit signal: raise in a fiber from outside) -------
+;; A fiber otherwise stops only when its body returns or raises. An interrupt
+;; asks another fiber to raise a given throwable, the way an Erlang process that
+;; receives an exit signal dies wherever it is -- in a receive, in a long
+;; computation, parked on a channel.
+;;
+;; The fiber raises it ITSELF, at points where it is already safe for it to be
+;; switched out: the tail of a yield or a park, a park that finds the interrupt
+;; pending as it commits, the resume from a preemption, and the entry of a CPS'd
+;; body's driver. So a raise never lands inside a runtime critical section -- a
+;; preemption is refused while a counted lock is held, and every park asserts
+;; none is -- and never between a commit and its switch. A compute-bound fiber
+;; raises within one quantum; a parked one at once, since interrupt! wakes it.
+;;
+;; Waking a parked fiber must not lose a value. A fiber parked on a channel wait
+;; is woken by claiming the wait's alt handler -- the one-shot claim an alts!
+;; timeout makes -- so no channel can deliver into it afterwards; if a delivery
+;; won the claim, it wakes the fiber itself, and the value is the last thing the
+;; fiber took. Any other park (a deref, the poller) is woken with sa-fiber-resume;
+;; whatever it waited for finds a fiber that is not 'parked when it comes, which
+;; sa-fiber-resume ignores.
+;;
+;; The race a wake could lose -- an interrupt landing just before the fiber
+;; commits to a park, so the wake finds it running and the park then waits
+;; forever -- is closed by the carrier's run-queue mutex: a park commits under
+;; it (jolt-fiber-commit-park!), reading the pending interrupt, and interrupt!
+;; reads the fiber's state and wait under it after setting the interrupt. One of
+;; the two sees the other. The run-queue mutex is the last lock in the order
+;; (async.ss), so taking it inside a channel wait's wmu closes no cycle.
+;;
+;; The pending field is set under the monitor mutex, the lock jolt-fiber-finish!
+;; publishes the terminal state through: an interrupt either reaches a fiber that
+;; has not finished, or is refused.
+
+;; Commit fiber F to a park on alt handler H (#f for a park that is not a channel
+;; wait), unless an interrupt is pending. #t when committed ('parked); #f when an
+;; interrupt is pending, in which case nothing changed and the caller must not
+;; park but raise (jolt-fiber-check-interrupt!) once its region is closed.
+(define (jolt-fiber-commit-park! f h)
+  (let ((mu (jolt-carrier-mu (jolt-fiber-carrier f))))
+    (jolt-lock! mu)
+    (let ((park? (not (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f))))))
+      (when park?
+        (jolt-fiber-parked-on-set! f h)
+        (jolt-fiber-state-set! f 'parked))
+      (jolt-unlock! mu)
+      park?)))
+
+;; For a park committed by a decision taken under some other lock (jolt-lock-wait:
+;; a monitor, a condition variable, the load barrier) -- the fiber is 'parked
+;; and registered as a waiter, the lock released, the switch not yet made. #t
+;; means switch. #f means an interrupt is pending and the park is taken back:
+;; the fiber is 'running again, and a later wake of its stale registration finds
+;; it not 'parked and does nothing. When a wake already queued it, it must still
+;; switch, and raises on its way back.
+(define (jolt-fiber-switch-for-park? f)
+  (let ((mu (jolt-carrier-mu (jolt-fiber-carrier f))))
+    (jolt-lock! mu)
+    (let ((take-back? (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f))
+                           (eq? (jolt-fiber-state f) 'parked))))
+      (when take-back? (jolt-fiber-state-set! f 'running))
+      (jolt-unlock! mu)
+      (not take-back?))))
+
+;; (jolt-fiber-interrupt! f throwable) -> #t if F will raise THROWABLE, #f if F
+;; had already finished. Callable from any thread or fiber.
+(define (jolt-fiber-interrupt! f throwable)
+  (let ((live? (jolt-with-mutex jolt-fiber-monitor-mu
+                 (let ((st (jolt-fiber-state f)))
+                   (and (not (eq? st 'done)) (not (eq? st 'dead))
+                        (begin (jolt-fiber-interrupt-set! f throwable) #t))))))
+    (when live?
+      (let* ((mu (jolt-carrier-mu (jolt-fiber-carrier f)))
+             (parked-on (begin (jolt-lock! mu)
+                               (let ((r (and (eq? (jolt-fiber-state f) 'parked)
+                                             ;; masked: raised when it unmasks, not woken now
+                                             (fx=? 0 (jolt-fiber-mask f))
+                                             (or (jolt-fiber-parked-on f) 'park))))
+                                 (jolt-unlock! mu)
+                                 r))))
+        (cond
+          ((not parked-on) (void))          ; running or queued: it raises at its next safe point
+          ((eq? parked-on 'park) (sa-fiber-resume f))
+          ((alt-claim! parked-on) (sa-fiber-resume f))
+          (else (void)))))                  ; a delivery won the claim and wakes it
+    live?))
+
+;; Raise F's pending interrupt, on F. The raise leaves the interrupt depth where
+;; the fiber's own code runs -- the depth its carrier starts every fiber at --
+;; which is what the park site whose tail this is would have restored had it
+;; returned, since a raise does not unwind the count.
+(define (jolt-fiber-check-interrupt! f)
+  (let ((e (and f (fx=? 0 (jolt-fiber-mask f)) (jolt-fiber-interrupt f))))
+    (when e
+      (jolt-fiber-interrupt-set! f #f)
+      (jolt-fiber-parked-on-set! f #f)
+      (jolt-adjust-interrupts! (jolt-current-disable-count)
+                               (jolt-carrier-sic (jolt-fiber-carrier f)))
+      (jolt-throw e))))
+
+;; --- masking ----------------------------------------------------------------
+;; A region that must not be torn by an interrupt -- a process telling its links
+;; it died, a cleanup that must finish -- runs masked, as Haskell's mask does: an
+;; interrupt arriving then stays pending, and is raised when the region is left.
+;; unmasked opens an interruptible region inside a masked one, so the shape
+;;
+;;   (masked (fn [] (let [r (try (unmasked body) (catch ...))] (cleanup r))))
+;;
+;; lets body be interrupted and never cleanup. The mask is a per-fiber count,
+;; written only by the fiber itself, so it needs no lock; it survives a park, and
+;; a masked fiber parked when an interrupt comes is left parked (interrupt!
+;; skips the wake), since it would only defer the raise.
+;;
+;; A park inside either region escapes through its winds and a resume rewinds
+;; them, so both keep the count across a park, as the loader's claim does: the
+;; before-thunk acts on the first entry only, the after-thunk not while a park
+;; unwinds (jolt-park-unwinding?).
+(define (jolt-fiber-masked thunk)
+  (let ((f (jolt-current-fiber)))
+    (if (not f)
+        (thunk)
+        (let ((entered #f))
+          (dynamic-wind
+            (lambda ()
+              (unless entered
+                (set! entered #t)
+                (jolt-fiber-mask-set! f (fx+ 1 (jolt-fiber-mask f)))))
+            thunk
+            (lambda ()
+              (unless (jolt-park-unwinding?)
+                (jolt-fiber-mask-set! f (fx- (jolt-fiber-mask f) 1))
+                ;; leaving the outermost masked region: a pending interrupt lands
+                (when (fx=? 0 (jolt-fiber-mask f))
+                  (jolt-fiber-check-interrupt! f)))))))))
+
+(define (jolt-fiber-unmasked thunk)
+  (let ((f (jolt-current-fiber)))
+    (if (not f)
+        (thunk)
+        (let ((saved #f))
+          (dynamic-wind
+            (lambda ()
+              (unless saved
+                (set! saved (jolt-fiber-mask f))
+                (jolt-fiber-mask-set! f 0)))
+            (lambda ()
+              ;; an interrupt that waited for the mask to open lands at once
+              (jolt-fiber-check-interrupt! f)
+              (thunk))
+            (lambda ()
+              (unless (jolt-park-unwinding?)
+                (jolt-fiber-mask-set! f saved))))))))
 
 ;; --- monitors (the observable half of swish's, erlang.ss:434) ----------------
 ;; A fiber that dies is otherwise unobservable. fibers-async.ss and sm.ss both
@@ -1133,6 +1294,8 @@
         ;;
         ;; So the escape discipline above is the invariant. Keep it.
         (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
+                    ;; interrupted before it ever ran: it dies on entry
+                    (jolt-fiber-check-interrupt! f)
                     ((jolt-fiber-thunk f)))))
           (jolt-fiber-done! f r)))))
     (else (error 'jolt-fiber-run "fiber in unexpected state"

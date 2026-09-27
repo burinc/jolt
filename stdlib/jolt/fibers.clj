@@ -18,6 +18,8 @@
 ;;     monitor! receives it, (state f) answers :dead.
 ;;   - preemption is always on (a compute-bound body cannot starve its
 ;;     carrier); the quantum is set-preempt-ticks!, floored, never zero.
+;;   - interrupt! makes another fiber raise a throwable wherever it is: at its
+;;     next park, yield or preemption, or at once if it is parked.
 (ns jolt.fibers)
 
 (defn spawn
@@ -51,6 +53,32 @@
   (if (jolt.host/fiber?)
     (jolt.host/fiber-yield)
     (throw (ex-info "yield called off a fiber" {}))))
+
+(defn interrupt!
+  "Make fib raise throwable, the way an Erlang process dies of an exit signal
+  wherever it is. A parked fiber is woken and raises at once -- a channel wait
+  it was parked in is abandoned, so no value is lost to it; a running fiber
+  raises at its next park, yield or preemption, so within one quantum. The
+  fiber's own try/catch sees the throwable as if the body had thrown it, and a
+  fiber that does not catch it dies with it (join rethrows it, monitor! gets it).
+  Returns true, or false when fib had already finished."
+  [fib throwable]
+  (jolt.host/fiber-interrupt! fib throwable))
+
+(defn masked
+  "Run (f) with interrupts deferred: an interrupt! arriving meanwhile stays
+  pending and is raised when the outermost masked region is left. For a
+  region that must not be torn, like the cleanup after a body. Off a fiber
+  it just runs (f)."
+  [f]
+  (jolt.host/fiber-masked f))
+
+(defn unmasked
+  "Run (f) interruptible again inside a masked region -- the body of the
+  (masked (fn [] ... (unmasked body) ... cleanup)) shape, where body may be
+  interrupted and cleanup may not. A pending interrupt lands at once."
+  [f]
+  (jolt.host/fiber-unmasked f))
 
 (defn state
   "The fiber's scheduling state: :ready (queued), :running, :parked (waiting
