@@ -23,12 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`JOLT_AOT_ASYNC=1` compiles AOT cache misses in a background worker.** On a
-  miss the namespace has already been loaded; the fasl only serves later runs,
-  so a child of the built jolt compiles it while the program starts (atomic
-  temp + rename; a job lost to a worker's idle exit simply misses again). Off by
-  default — source mode's `bin/jolt` has no spawnable jolt and compiles in
-  process.
+- **AOT cache misses compile in a background worker.** On a miss the namespace
+  has already been loaded; the fasl only serves later runs, so a detached child
+  of the built jolt compiles it while the program starts (atomic temp + rename;
+  a job lost to a worker's idle exit simply misses again). On by default for
+  built jolts on Linux/macOS — the worker exits when its parent does — and
+  `JOLT_AOT_ASYNC=0` restores the in-process compile. Source mode's `bin/jolt`
+  has no spawnable jolt and always compiles in process.
 
 ## [0.8.13] - 2026-09-26
 

@@ -436,10 +436,11 @@ in that effective root.
   edit to an ordinary function recompiles that namespace alone; a dependent that
   assumed an inert dependency is re-verified when its cached fasl loads. `jolt
   build` (direct-linked/inferred) always keeps the conservative whole-closure key.
-- **`JOLT_AOT_ASYNC=1`** — compile AOT cache misses in a background worker of the
-  running binary instead of blocking the run that missed; the run starts once the
-  namespace is loaded, and the fasl is ready for the next one. Off by default;
-  source mode (`bin/jolt`) has no spawnable jolt and compiles in process.
+- **`JOLT_AOT_ASYNC=0`** — compile AOT cache misses in-process instead of in a
+  background worker. On by default for a built jolt: the run that missed does not
+  wait, and the fasl is ready for the next one (the worker exits once its parent
+  is gone, or after ~10s without a job). Source mode (`bin/jolt`) has no
+  spawnable jolt and always compiles in process.
 
 ## REPL and editor integration
 

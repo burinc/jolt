@@ -732,23 +732,29 @@ else
 fi
 rm -rf "$cache_x" "$xlib"
 
-# --- Phase 7: async fasl compilation (JOLT_AOT_ASYNC) -------------------------
+# --- Phase 7: async fasl compilation ------------------------------------------
 # A miss's fasl compiles in a background worker of the running binary; the run
-# itself must not wait. This needs a built jolt (source mode's bin/jolt would
-# spawn a plain Chez), so it skips without target/release/jolt, like (k).
+# itself must not wait. On by default, and JOLT_AOT_ASYNC=0 must put the compile
+# back in the run (the fasl is there when it exits). Needs a built jolt — source
+# mode's bin/jolt would spawn a plain Chez — so it skips without
+# target/release/jolt, like (k).
 async_bin="target/release/jolt"
 if [ ! -x "$async_bin" ]; then
   echo "SKIP: (z) async worker needs $async_bin (make testbin)"
 else
   alib="$(mktemp -d)"; mkdir -p "$alib/src/alib"; printf '{:paths ["src"]}\n' > "$alib/deps.edn"
   printf '(ns alib.core)\n(defn val [] 7)\n' > "$alib/src/alib/core.clj"
-  cache_z="$(mktemp -d)"
-  zrun() {
-    JOLT_AOT_ASYNC=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_z" JOLT_QUIET=1 JOLT_DEBUG=1 "$async_bin" -e "
-      (require 'jolt.deps) (jolt.deps/add-deps {:deps {'alib/alib {:local/root \"$alib\"}}})
-      (require 'alib.core) (println (alib.core/val))" 2>&1
+  zprog="(require 'jolt.deps) (jolt.deps/add-deps {:deps {'alib/alib {:local/root \"$alib\"}}}) (require 'alib.core) (println (alib.core/val))"
+  zrun() {  # $1: cache dir; worker on (the default)
+    env -u JOLT_AOT_ASYNC JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$1" JOLT_QUIET=1 JOLT_DEBUG=1 \
+      "$async_bin" -e "$zprog" 2>&1
   }
-  z_cold="$(zrun || true)"
+  zrun_off() {  # $1: cache dir; in-process compile
+    env -u JOLT_AOT_ASYNC JOLT_AOT_ASYNC=0 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$1" JOLT_QUIET=1 JOLT_DEBUG=1 \
+      "$async_bin" -e "$zprog" 2>&1
+  }
+  cache_z="$(mktemp -d)"
+  z_cold="$(zrun "$cache_z" || true)"
   # the worker is a separate process: wait for its artifact, then prove it is
   # served. A crashed or mis-dispatched worker never writes one.
   i=0
@@ -757,18 +763,29 @@ else
     sleep 0.25; i=$((i+1))
   done
   z_so="$(find "$cache_z" -name '*.so' | wc -l | tr -d ' ')"
-  z_warm="$(zrun || true)"
+  z_warm="$(zrun "$cache_z" || true)"
   if echo "$z_cold" | grep -q '^7$' \
      && echo "$z_cold" | grep -q 'queued alib.core' \
      && [ "$z_so" -ge 1 ] \
      && echo "$z_warm" | grep -q '^7$' \
      && echo "$z_warm" | grep -q 'hit alib.core'; then
-    echo "PASS: (z) async miss queued to a worker, later runs hit the worker's fasl"; pass=$((pass+1))
+    echo "PASS: (z) a default-run miss queued to a worker, later runs hit its fasl"; pass=$((pass+1))
   else
     echo "FAIL: (z) cold=$(echo "$z_cold" | tail -1) queued=$(echo "$z_cold" | grep -c 'queued alib.core') so=$z_so warm=$(echo "$z_warm" | tail -1) hit=$(echo "$z_warm" | grep -c 'hit alib.core')"
     fails=$((fails+1))
   fi
-  rm -rf "$cache_z" "$alib"
+  cache_z2="$(mktemp -d)"
+  z_off="$(zrun_off "$cache_z2" || true)"
+  z_off_so="$(find "$cache_z2" -name '*.so' | wc -l | tr -d ' ')"
+  if echo "$z_off" | grep -q '^7$' \
+     && ! echo "$z_off" | grep -q 'queued' \
+     && [ "$z_off_so" -ge 1 ]; then
+    echo "PASS: (z2) JOLT_AOT_ASYNC=0 compiles in-process and leaves the fasl"; pass=$((pass+1))
+  else
+    echo "FAIL: (z2) out=$(echo "$z_off" | tail -1) queued=$(echo "$z_off" | grep -c 'queued') so=$z_off_so"
+    fails=$((fails+1))
+  fi
+  rm -rf "$cache_z" "$cache_z2" "$alib"
 fi
 
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing

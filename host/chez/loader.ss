@@ -1024,20 +1024,19 @@
 ;; On a miss the namespace has ALREADY been analyzed, emitted and evaluated in
 ;; this process; the .scm → .so compile exists only for FUTURE runs. Compiling it
 ;; inline blocks the run that missed — 10.3s of a 24s edit run on kmet's 65-file
-;; cascade. With JOLT_AOT_ASYNC=1 each miss is handed to one background worker:
-;; a child of this jolt reading job lines from a manifest as the parent appends
-;; them. It is off by default; JOLT_AOT_ASYNC=0/empty keeps the in-process
-;; compile. Any failure — no executable to name, a non-jolt executable (source
-;; mode's bin/jolt runs a plain Chez), an unwritable manifest — falls back to
-;; compiling here, so a run never depends on the worker's machinery.
+;; cascade. Each miss is instead handed to one background worker — a detached
+;; child of this executable reading job lines from a manifest as the parent
+;; appends them — started on the first miss of the process and exited once the
+;; parent is gone and no job has arrived for ~10s. JOLT_AOT_ASYNC=0 opts back
+;; into the in-process compile. Any failure — no executable to name, a non-jolt
+;; executable (source mode's bin/jolt runs a plain Chez), an unwritable manifest,
+;; a host with no POSIX spawn — falls back to compiling here, so a run
+;; never depends on the worker's machinery.
 ;;
 ;; Nothing waits on the worker: a program that exits first leaves it compiling
 ;; the cache it will read next time. A worker that idles out between two misses
 ;; loses only jobs already handed to it (their namespaces miss again next run);
 ;; the parent never tracks completion, so there is no protocol to get wrong.
-(define (aot-env-on? name)
-  (let ((e (getenv name)))
-    (and (string? e) (fx>? (string-length e) 0) (not (aot-env-off? name)))))
 (define (aot-cstring bv)
   (let loop ((i 0))
     (if (or (fx=? i (bytevector-length bv)) (fx=? 0 (bytevector-u8-ref bv i)))
@@ -1064,15 +1063,17 @@
                     (and (fx>? n 0) (aot-cstring buf))))))
           (else #f)))))
   (and (string? aot-self-exe-memo) (file-exists? aot-self-exe-memo) aot-self-exe-memo))
-(define aot-worker-capable-memo 'unset)
+;; #t only in a built jolt/app binary. Its launcher (build-jolt.ss
+;; jb-emit-launcher) sets jolt-standalone-binary before dispatching; source mode —
+;; bin/jolt runs a plain Chez — leaves it #f, so there is no jolt to spawn and
+;; the compile happens in-process. No probe is needed to tell them apart, and a
+;; launcher that cannot spawn itself (exec denied, binary moved) still falls
+;; back: aot-worker-start! reports #f and the caller compiles here.
+(define jolt-standalone-binary #f)
 (define (aot-worker-capable? exe)
-  (when (eq? aot-worker-capable-memo 'unset)
-    (set! aot-worker-capable-memo
-      (guard (e (else #f))
-        (zero? (jolt-sh (string-append (sh-quote exe) " --aot-worker-probe </dev/null >/dev/null 2>&1"))))))
-  (and aot-worker-capable-memo #t))
+  (and jolt-standalone-binary (string? exe) #t))
 (define (aot-async?)
-  (and (aot-env-on? "JOLT_AOT_ASYNC")
+  (and (not (aot-env-off? "JOLT_AOT_ASYNC"))
        (not (ldr-build-aot-cache?))
        (case (sa-os-family) ((linux macos) #t) (else #f))))
 (define aot-worker-state (vector #f #f))   ; #(manifest out-port) once started
@@ -1123,21 +1124,43 @@
                                 (string? (cadr x)) x)))))
               (loop (cdr lines) (if job (cons job acc) acc)))))))
 ;; Entry for `jolt --aot-worker MANIFEST`: compile every job as it appears, at
-;; most every 50ms, and exit after ~10s with none (the parent starts another if
-;; it has more to hand over; see the note above).
+;; most every 50ms, and exit once the parent is gone or ~10s pass with none (the
+;; parent starts another if it has more to hand over; see the note above).
+;;
+;; The parent's pid is in the manifest's name (aot-jobs-<pid>.edn) — it wrote
+;; that file, and it is the one that keeps appending to it. kill(pid, 0) is the
+;; aliveness probe: 0 for a process of this uid. A host where the probe itself
+;; fails reads as dead, which costs only the jobs in flight (their namespaces
+;; miss again next run).
+(define (aot-manifest-owner manifest)
+  (guard (e (else #f))
+    (let* ((base (path-last manifest))
+           (pre "aot-jobs-") (suf ".edn")
+           (n (string-length base)) (pn (string-length pre)) (sn (string-length suf)))
+      (and (fx>? n (fx+ pn sn))
+           (string=? pre (substring base 0 pn))
+           (string=? suf (substring base (fx- n sn) n))
+           (string->number (substring base pn (fx- n sn)))))))
+(define (aot-proc-alive? pid)
+  (guard (e (else #f))
+    (let ((f (jolt-foreign-proc-safe "kill" '(int int) 'int)))
+      (and f (fx=? 0 (f pid 0))))))
 (define (aot-compile-worker manifest)
-  (let loop ((done 0) (idle 0))
-    (let ((jobs (aot-manifest-jobs manifest)))
-      (cond
-        ((> (length jobs) done)
-         (aot-run-job! (list-ref jobs done))
-         (loop (fx+ done 1) 0))
-        ((fx>=? idle 200) #t)
-        ;; make-time is (type NANOSECONDS seconds): 50ms. The reversed reading
-        ;; slept for a year and a half — and with it the whole async cache, since
-        ;; a worker that never wakes never sees the jobs appended after its first
-        ;; look at the manifest.
-        (else (sleep (make-time 'time-duration 50000000 0)) (loop done (fx+ idle 1)))))))
+  (let ((owner (aot-manifest-owner manifest)))
+    (let loop ((done 0) (idle 0))
+      (let ((jobs (aot-manifest-jobs manifest)))
+        (cond
+          ((> (length jobs) done)
+           (aot-run-job! (list-ref jobs done))
+           (loop (fx+ done 1) 0))
+          ;; the parent is gone: no job can arrive after it
+          ((and owner (not (aot-proc-alive? owner))) #t)
+          ((fx>=? idle 200) #t)
+          ;; make-time is (type NANOSECONDS seconds): 50ms. The reversed reading
+          ;; slept for a year and a half — and with it the whole async cache, since
+          ;; a worker that never wakes never sees the jobs appended after its first
+          ;; look at the manifest.
+          (else (sleep (make-time 'time-duration 50000000 0)) (loop done (fx+ idle 1))))))))
 (def-var! "jolt.host" "aot-compile-worker"
   (lambda (manifest) (aot-compile-worker (jolt-str-render-one manifest)) jolt-nil))
 
