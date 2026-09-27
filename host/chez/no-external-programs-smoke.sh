@@ -56,9 +56,12 @@ got="$(run -e '(let [e (.environment (ProcessBuilder. ["true"]))] [(.get e "JOLT
 pass=$((pass + 1))
 
 # The child sees the parent's environment. /bin/sh is spawned by absolute path;
-# `printenv` would need PATH, so the shell's own expansion reads the variable.
+# the value is read with the SHELL'S OWN expansion, so nothing has to be found
+# on PATH — echo is a builtin (printf is NOT one in Android's mksh: it is
+# /system/bin/printf, which an empty PATH cannot reach, and the child would
+# print "inaccessible or not found" instead of the variable).
 echo "no-external-programs smoke: a child inherits the environment, $label"
-got="$(run -e '(let [p (.start (ProcessBuilder. ["/bin/sh" "-c" "printf %s \"$JOLT_SMOKE_MARK\""]))] (.waitFor p) (slurp (.getInputStream p)))' 2>&1 | tail -1)"
+got="$(run -e '(let [p (.start (ProcessBuilder. ["/bin/sh" "-c" "echo -n $JOLT_SMOKE_MARK"]))] (.waitFor p) (slurp (.getInputStream p)))' 2>&1 | tail -1)"
 [ "$got" = '"present"' ] || fail "child environment — want \"present\", got \`$got\`"
 pass=$((pass + 1))
 

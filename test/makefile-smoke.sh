@@ -9,15 +9,31 @@ cd "$root"
 # Command-line variables also propagate to nested Makes through these flags.
 unset CC JOLT_CC CHEZ CHEZSCHEME MAKEFLAGS MAKEOVERRIDES GAMBIT_PREFIX JOLT_REQUIRE_GAMBIT
 
+# bionic (Android/Termux) provisions Chez through host/chez/bionic-provision-chez.sh
+# instead of makes' chezscheme.mk + xPack GCC: that GCC is a glibc binary the
+# Android loader cannot exec. The provisioning checks below therefore expect no
+# pinned GCC there; the host cc links, and bionic-provision-chez.sh passes
+# CFLAGS+=-fPIC for the same PIC kernel every other provision builds.
+bionic=0
+case "$(cc -dumpmachine 2>/dev/null)" in *android*) bionic=1 ;; esac
+
 tmp="$(mktemp -d)"
 # A provision-armed Makefile parse mkdirs .cache/local (local.mk runs at parse;
 # no downloads happen there). If a check dies mid-run, don't leave those dirs
-# behind on a checkout that never provisioned.
+# behind on a checkout that never provisioned. Recorded BEFORE the first make
+# runs: an early failure here must not delete a toolchain that was already
+# provisioned when the gate started.
+had_provision_dirs=0
+[ -e "$root/.cache/local" ] && had_provision_dirs=1
 trap 'rm -rf "$tmp"; if [ "${had_provision_dirs:-0}" -eq 0 ] && [ -e "$root/.cache/local" ]; then rm -rf "$root/.cache/local"; fi' EXIT
 
 fake_chez="$tmp/chez"
 cat >"$fake_chez" <<'FAKE'
-#!/usr/bin/env bash
+#!/bin/sh
+# /bin/sh, not /usr/bin/env bash: this script is EXECUTED (make runs the fake
+# Chez directly), and Android/Termux has no /usr/bin/env — the kernel answers
+# ENOENT and make reports the recipe as error 126. /bin/sh exists on bionic
+# (/bin is a symlink to /system/bin) and on every POSIX host.
 case ${1-} in
   -q)
     cat >/dev/null
@@ -130,7 +146,7 @@ fake_chez_bin() {
 
   mkdir -p "$dir"
   cat >"$dir/chez" <<FAKE
-#!/usr/bin/env bash
+#!/bin/sh
 case \${1-} in
   -q)
     prog=\$(cat)
@@ -194,11 +210,19 @@ check_provision_fallback() {  local bin out
 
   out="$(PATH="$bin:$PATH" make -C "$root" -f "$probe_mk" --no-print-directory -s inspect-chez)"
 
-  grep -Fx "gcc-origin=file" <<<"$out" >/dev/null || {
-    echo "provisioning did not arm despite no qualifying system Chez:" >&2
-    echo "$out" >&2
-    exit 1
-  }
+  if [ "$bionic" -eq 1 ]; then
+    grep -Fx "gcc-origin=undefined" <<<"$out" >/dev/null || {
+      echo "bionic provisioning armed makes' glibc GCC provisioning too:" >&2
+      echo "$out" >&2
+      exit 1
+    }
+  else
+    grep -Fx "gcc-origin=file" <<<"$out" >/dev/null || {
+      echo "provisioning did not arm despite no qualifying system Chez:" >&2
+      echo "$out" >&2
+      exit 1
+    }
+  fi
   # Against LOCAL-ROOT as the Makefile computes it, not against a hardcoded
   # .cache/local: the nix develop shell puts the provisioned toolchain somewhere
   # else entirely, and a pattern anchored on this checkout asserts the layout
@@ -211,11 +235,20 @@ check_provision_fallback() {  local bin out
     echo "$out" >&2
     exit 1
   }
-  grep -E "^joltcc-env=${root_dir%/}/gcc-[0-9.-]+/bin/gcc$" <<<"$out" >/dev/null || {
-    echo "provisioning armed but JOLT_CC not pinned to the provisioned GCC:" >&2
-    echo "$out" >&2
-    exit 1
-  }
+  if [ "$bionic" -eq 1 ]; then
+    # No xPack GCC on bionic, so JOLT_CC is empty and build.ss falls back to cc.
+    grep -Fx "joltcc-env=" <<<"$out" >/dev/null || {
+      echo "bionic JOLT_CC is not the host cc (empty):" >&2
+      echo "$out" >&2
+      exit 1
+    }
+  else
+    grep -E "^joltcc-env=${root_dir%/}/gcc-[0-9.-]+/bin/gcc$" <<<"$out" >/dev/null || {
+      echo "provisioning armed but JOLT_CC not pinned to the provisioned GCC:" >&2
+      echo "$out" >&2
+      exit 1
+    }
+  fi
 }
 
 # A Chez on PATH that answers NOTHING (broken install, stub, wrong binary) must
@@ -228,7 +261,7 @@ check_broken_chez_falls_back() {
 
   bin="$tmp/broken"
   mkdir -p "$bin"
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$bin/chez"
+  printf '#!/bin/sh\nexit 0\n' >"$bin/chez"
   chmod +x "$bin/chez"
   ln -sf chez "$bin/chezscheme"
   ln -sf chez "$bin/scheme"
@@ -236,11 +269,21 @@ check_broken_chez_falls_back() {
 
   out="$(PATH="$bin:$PATH" make -C "$root" -f "$probe_mk" --no-print-directory -s inspect-chez)"
 
-  grep -Fx "gcc-origin=file" <<<"$out" >/dev/null || {
-    echo "a silent Chez on PATH was selected instead of falling back to provisioning:" >&2
-    echo "$out" >&2
-    exit 1
-  }
+  if [ "$bionic" -eq 1 ]; then
+    local root_dir
+    root_dir="$(sed -n 's/^local-root=//p' <<<"$out")"
+    grep -E "^jolt-chez=${root_dir%/}/chezscheme-[0-9.]+/bin/scheme$" <<<"$out" >/dev/null || {
+      echo "a silent Chez on PATH was not replaced by the pinned provision:" >&2
+      echo "$out" >&2
+      exit 1
+    }
+  else
+    grep -Fx "gcc-origin=file" <<<"$out" >/dev/null || {
+      echo "a silent Chez on PATH was selected instead of falling back to provisioning:" >&2
+      echo "$out" >&2
+      exit 1
+    }
+  fi
 }
 
 # The gambit gates find gsi/gsc under GAMBIT_PREFIX (brew's prefix when unset;
@@ -293,9 +336,6 @@ check_gambit_detection() {
     }
   done
 }
-
-had_provision_dirs=0
-[ -e "$root/.cache/local" ] && had_provision_dirs=1
 
 check_system_chez_preferred
 check_provision_fallback

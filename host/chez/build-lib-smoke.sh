@@ -21,11 +21,20 @@ trap 'rm -rf "$work"' EXIT
 # cross-smoke workflow, so pin the wiring it rests on here, where no cross
 # toolchain is needed. Both cases fail before any compile, so they also run on a
 # machine the preflight below skips.
+#
+# The target must be a machine OTHER than this host, or bld-cross? is #f and
+# the cross path (where both messages live) is never entered: on an aarch64
+# host, --target tarm64le built a native library and the second check below
+# saw no hint. Pick the other architecture's real tag.
+case "$(uname -m)" in
+  aarch64|arm64) cross_target=ta6le ;;
+  *)             cross_target=tarm64le ;;
+esac
 echo "build-lib smoke: --library composes with --target"
 # 1. the CLI forwards --target through a library build (it used to reject the
 #    combination outright), so the missing pack is what it complains about.
 out="$( (unset JOLT_TARGET_PACK; JOLT_PWD="$app" "$jolt" build --library \
-          -m libadd.core -o "$work/never" --target tarm64le) 2>&1 )"
+          -m libadd.core -o "$work/never" --target "$cross_target") 2>&1 )"
 case "$out" in
   *"needs a target pack"*) ;;
   *) echo "  FAIL: --library --target should ask for a target pack, got:"
@@ -35,7 +44,7 @@ esac
 #    "Provide a target pack" hint is emitted only when bld-cross? is true.
 mkdir -p "$work/emptypack"
 out="$(JOLT_PWD="$app" "$jolt" build --library -m libadd.core -o "$work/never" \
-        --target tarm64le --target-pack "$work/emptypack" 2>&1 )"
+        --target "$cross_target" --target-pack "$work/emptypack" 2>&1 )"
 case "$out" in
   *"Provide a target pack"*) ;;
   *) echo "  FAIL: --library --target-pack should reach the cross toolchain check, got:"

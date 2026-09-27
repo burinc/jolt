@@ -36,10 +36,11 @@ apt-get -y -o Dpkg::Options::=--force-confnew upgrade
 # clang: cc. make/git/curl: the build and Chez provisioning. which: makes'
 # init.mk looks bash up with it. xxd: build-jolt embeds the boot as C bytes.
 # binutils: readelf for the dependency report. zip, perl: tools the gates use
-# (a :local/root jar fixture, the manifest check).
+# (a :local/root jar fixture, the manifest check). sqlite: libsqlite3.so.0 is the
+# fixture smoke's per-OS map names, and Termux does not carry it by default.
 # The rest are the link line's libraries (build.ss bld-link-libs, bionic arm):
 # ncurses for the expression editor, libuuid, and libiconv (bionic has no iconv).
-apt-get install -y clang make git curl which xxd binutils zip perl \
+apt-get install -y clang make git curl which xxd binutils zip perl sqlite \
   ncurses libuuid libiconv
 
 # Termux has no /tmp.
