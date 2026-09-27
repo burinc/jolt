@@ -754,6 +754,20 @@
               (str u)))
           source-exts)))
 
+(defn- host-ns
+  "The namespace the host has installed under NS-NAME, or nil when it has none
+   or a context owns the name. The order of the two reads is the point: a
+   context claims a name BEFORE its evaluation creates the namespace
+   (mark-private!), so a namespace seen here was either claimed already — and
+   the ownership read after it sees the claim — or is the host's. Asking
+   private-ns? first leaves a window in which a context claims and creates the
+   name between the two reads, and the root answers a context's half-built
+   namespace as its own (jolt-fmvc)."
+  [ns-name]
+  (when-let [n (find-ns (symbol ns-name))]
+    (when-not (private-ns? ns-name)
+      n)))
+
 (defn- host-locate
   [req]
   (case (:kind req)
@@ -762,40 +776,61 @@
     ;; loaded yet but CAN load locates as a source location, so the load goes
     ;; through the host's own loader (AOT cache included) instead of leaking
     ;; to whatever `require` the evaluated form calls.
-    :ns (when-not (private-ns? (:name req))
-          (if-let [n (find-ns (symbol (:name req)))]
-            [{:kind :ns :handle n}]
+    :ns (if-let [n (host-ns (:name req))]
+          [{:kind :ns :handle n}]
+          (when-not (or (private-ns? (:name req)) (find-ns (symbol (:name req))))
             (when-let [u (host-ns-location (:name req))]
               [{:kind :ns :file u}])))
     :var (let [[ns-name var-name] (str/split (:name req) #"/" 2)]
-           (when (and ns-name var-name (not (private-ns? ns-name)))
-             (let [ns-sym (symbol ns-name)]
-               ;; ns-resolve also answers a CLASS for a capitalized name
-               ;; (clojure.core/String); a :var hit carries a cell, so only a
-               ;; var is one
-               (when (find-ns ns-sym)
-                 (let [v (ns-resolve ns-sym (symbol var-name))]
-                   (when (var? v)
-                     [{:kind :var :cell v}]))))))
+           (when (and ns-name var-name)
+             ;; ns-resolve also answers a CLASS for a capitalized name
+             ;; (clojure.core/String); a :var hit carries a cell, so only a
+             ;; var is one
+             (when-let [ns-obj (host-ns ns-name)]
+               (let [v (ns-resolve ns-obj (symbol var-name))]
+                 ;; the cell was read after the ownership check; re-check so a
+                 ;; claim that landed in between is not answered either
+                 (when (and (var? v) (identical? ns-obj (host-ns ns-name)))
+                   [{:kind :var :cell v}])))))
     :resource (when-let [u (host-resource (:name req))]
                 [{:kind :resource :url (str u)}])
     nil))
 
+(defn- host-ns-changed!
+  [ns-name]
+  (throw (ex-info (str "namespace " ns-name " was taken over by a context while the"
+                       " root was loading it")
+                  {:type :loader/unreadable :kind :ns :name ns-name})))
+
 (defn- host-ns-vars
+  "ns-interns reads the registry by NAME, so the snapshot is the handle's only
+   while the handle is still the installed, host-owned namespace — checked
+   after the read, or a context that claimed the name meanwhile would have its
+   cells linked as the root's."
   [home ns-obj]
-  (when ns-obj (ns-interns ns-obj)))
+  (when ns-obj
+    (let [vars (ns-interns ns-obj)
+          nm (str (ns-name ns-obj))]
+      (when-not (identical? ns-obj (host-ns nm))
+        (host-ns-changed! nm))
+      vars)))
 
 (defn- host-load-ns
   "The root's reader: a namespace the host does not have loaded yet loads
    through the host's own loader (global source roots, AOT cache and all)."
   [home hit req]
-  (or (find-ns (symbol (:name hit)))
-      (do
-        (jolt.host/load-namespace (:name hit))
-        (or (find-ns (symbol (:name hit)))
-            (throw (ex-info (str "the host has no namespace " (:name hit))
-                            {:type :loader/unreadable
-                             :kind :ns :name (:name hit)}))))))
+  (let [nm (:name hit)]
+    (or (host-ns nm)
+        (do
+          (when (private-ns? nm)
+            (host-ns-changed! nm))
+          (jolt.host/load-namespace nm)
+          (or (host-ns nm)
+              (if (private-ns? nm)
+                (host-ns-changed! nm)
+                (throw (ex-info (str "the host has no namespace " nm)
+                                {:type :loader/unreadable
+                                 :kind :ns :name nm}))))))))
 
 (defonce ^:private root-loader
   (delay (make-loader {:id "root"

@@ -10,6 +10,7 @@
 add-reader-features!
 add-shutdown-hook
 allow-unresolved-vars?
+aot-compile-worker
 as-subvec
 array-value?
 available-processors

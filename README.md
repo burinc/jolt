@@ -430,6 +430,17 @@ in that effective root.
   default (zero cost); a checker error never breaks a compile.
 - **`JOLT_DEBUG`** — verbose dependency resolution (the fetching / using-cache /
   skipping lines that are otherwise quiet) and the host static-shim drift warning.
+- **`JOLT_AOT_NARROW=0`** — restore the conservative AOT cache key. By default a
+  plain `jolt run` keys a namespace on the compile-time surface its dependencies
+  contribute (macros, records/protocols, forwarded vars, data readers), so an
+  edit to an ordinary function recompiles that namespace alone; a dependent that
+  assumed an inert dependency is re-verified when its cached fasl loads. `jolt
+  build` (direct-linked/inferred) always keeps the conservative whole-closure key.
+- **`JOLT_AOT_ASYNC=0`** — compile AOT cache misses in-process instead of in a
+  background worker. On by default for a built jolt: the run that missed does not
+  wait, and the fasl is ready for the next one (the worker finishes its jobs and
+  exits once its parent is gone). Source mode (`bin/jolt`) has no
+  spawnable jolt and always compiles in process.
 
 ## REPL and editor integration
 

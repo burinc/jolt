@@ -17,6 +17,7 @@
 (ns jolt-locale-probe-test)
 
 (require '[jolt.ffi :as ffi])
+(require '[clojure.string :as str])
 
 (def failures (atom []))
 
@@ -31,13 +32,21 @@
 ;; LC_TIME is 2 on glibc, 5 on macOS — the same split tz-primitives.ss keys on.
 (def LC_TIME (if (= "Mac OS X" (System/getProperty "os.name")) 5 2))
 
+;; The PROCESS default is not a constant: bionic's setlocale(NULL) answers
+;; "C.UTF-8" for an unset category (Android hardcodes it), where glibc and macOS
+;; answer "C". The property this file exists for is that the boot probe and
+;; locale-name leave LC_TIME where the process started, so the expectation is
+;; this host's own default. Detection matches ffi.ss's Android/Termux rule.
+(def android? (boolean (or (System/getenv "TERMUX_VERSION") (System/getenv "ANDROID_ROOT"))))
+(def process-default (if android? "C.UTF-8" "C"))
+
 ;; NULL queries the current locale instead of setting it, so this reads LC_TIME
 ;; without disturbing it (jolt.ffi carries nil across :string as of 0.7.24).
 (ffi/defcfn c-setlocale "setlocale" [:int :string] :string)
 
 ;; A C process starts every category in "C" and jolt must hand it back that way.
 (check-eq "the boot probe leaves LC_TIME at the process default"
-          (c-setlocale LC_TIME nil) "C")
+          (c-setlocale LC_TIME nil) process-default)
 
 ;; A caller's own choice must survive a locale-aware format call — and the choice
 ;; has to be something other than "C" for the check to have teeth: restoring to a
@@ -53,15 +62,26 @@
   (println "  .. (skipped: libc has no en_US.UTF-8, so locale-name is inert here)"))
 (c-setlocale LC_TIME "C")
 
+;; The locale's identity without its codeset, matching tz-primitives.ss's
+;; tzp-locale-root: "en_US.UTF-8" and "en_US.utf8" are the same locale.
+(defn locale-root [n]
+  (-> n (str/split #"[.@]" 2) first (str/replace "-" "_")))
+
 ;; An UNINSTALLED locale must read as nil, not as a name borrowed from whichever
 ;; locale was current. Every box has "C"; essentially none has all of these, and
 ;; a name coming back for one that setlocale refused is the bug. Where a locale
 ;; IS installed a real name is correct, so each check accepts nil or a name and
 ;; the gate is that the two agree — a name only when setlocale took the locale.
+;;
+;; "Took the locale" is the read-back test, not the non-nil return: bionic's
+;; setlocale answers "C.UTF-8" for a locale it does not have, so its return
+;; alone reports every locale as installed while locale-name (correctly) stays
+;; nil. The runtime asks the same question the same way.
 (doseq [[id libc] [["fr" "fr_FR.UTF-8"] ["ja" "ja_JP.UTF-8"]
                    ["de" "de_DE.UTF-8"] ["ru" "ru_RU.UTF-8"]]]
-  (let [installed? (some? (do (c-setlocale LC_TIME "C")
-                             (c-setlocale LC_TIME libc)))]
+  (let [set (do (c-setlocale LC_TIME "C")
+                (c-setlocale LC_TIME libc))
+        installed? (and (some? set) (= (locale-root set) (locale-root libc)))]
     (c-setlocale LC_TIME "C")
     (check-eq (str "locale-name \"" id "\" answers only if " libc " is installed")
               (some? (jolt.host/locale-name id 0 1 "%B"))

@@ -18,6 +18,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside it, like Haskell's `mask`, so cleanup after an interruptible body
   can't be torn.
 
+### Fixed
+
+- **A keyword, set or vector called with the wrong number of arguments throws
+  `ArityException` (#1162).** A literal callee was lowered straight to `get`/`nth`
+  whatever the argument count, so `(:a 1 2 3)` answered 2, `(#{1} 1 2)` 1 and
+  `([1 2] 0 1)` 1, and `(:a)`/`({:a 1})` reported the arity of an anonymous
+  `get`. Those calls now go through the ordinary invoke and throw the callee's
+  own message (`Wrong number of args (0) passed to: :a`), and the inliner no
+  longer counts an over-arity lookup as pure, so a discarded one still throws.
+- **A `jolt.loader` root lookup racing a private load no longer answers the
+  context's half-built namespace (jolt-fmvc).** The root checked whether a
+  context owned the name before looking the namespace up, so a context that
+  claimed and created the name between the two reads had its namespace handed
+  out as the host's. A second context loading the same name could link it
+  mid-evaluation, with vars missing. It showed up once as loaderconf case 13
+  throwing under memory pressure.
+- **Non-Unicode charsets work on bionic (#1148).** `getBytes`, `String`'s
+  decoding constructor, `URLEncoder`/`URLDecoder` and the stateful ISO-2022-JP
+  cases went through Android's partial libc iconv: `iconv_open` resolves there
+  but cannot name Shift_JIS, EUC-JP, ISO-2022-JP or windows-1252, and Termux's
+  GNU library exports only `libiconv_*`. The charset layer now collects every
+  provider and uses the first that can name the charset, so those encodings
+  work and one no provider has still raises `UnsupportedEncodingException`.
+- **`jolt.host/locale-name` returns nil for a locale bionic did not actually
+  switch to (#1148).** bionic's `setlocale` accepts an unavailable locale and
+  silently keeps C.UTF-8, where glibc returns NULL, so jolt's boot probe
+  believed an `en_US.UTF-8` locale was installed and every localized format
+  answered English. The probe and `locale-name` now read the category back and
+  compare locale roots; a request the OS did not honor answers nil, and
+  jolt.time's bundled tables take over.
+- **`ProcessBuilder.start` returns after the child has exec'd on bionic
+  (#1148).** Android's `posix_spawn` returns as soon as it forks, before the
+  child has closed the descriptors it should not inherit, so a listener the
+  parent closed right after `start` could still be bound in the child. Every
+  spawn now waits on a close-on-exec pipe, as glibc, musl and Darwin already
+  do internally.
+- **`Math/PI`/`Math/E` and `clojure.math`'s are the JDK's literal constants,
+  not the host libm's `atan(1)`/`exp(1)` (#1148).** bionic's `exp(1)` is one ulp
+  high, so `Math/E` — and everything built on it, `jolt.infix`'s `e` among
+  them — answered a different double than the JVM's.
+
+### Changed
+
+- **The bionic CI job runs the full CI gate (#1148).** `make bionic-ci` no
+  longer skips the ten gates that used to fail on Android/Termux: the charset
+  layer finds libiconv, the provisioned Chez kernel is built with
+  `CFLAGS+=-fPIC` (so `jolt build --library` links there), CTS matches its
+  baseline, and the fixtures that assumed off-Android behavior or a glibc
+  provisioning path branch on the platform. `ci/termux-build.sh` installs the
+  libsqlite package the smoke fixture's per-OS map names.
+
+- **The run-path AOT cache narrows its key to a dependency's compile-time
+  surface.** With direct-linking and whole-program inference off (plain `jolt
+  run`), a dependency that defines no macros, records/types/protocols,
+  forwarded `:refer`s, or data readers cannot change a consumer's emitted code,
+  so the consumer no longer folds that dependency's source. Editing an ordinary
+  function recompiles that namespace alone; its consumers hit their cached
+  fasls and read the new value through the dependency's var. A consumer whose
+  cached fasl assumed an inert dependency is re-verified once the fasl's own
+  requires have loaded, so a dependency that gained a macro invalidates it.
+  `jolt build` (direct-linked/inferred) keeps the conservative key; set
+  `JOLT_AOT_NARROW=0` to keep it everywhere.
+
+### Added
+
+- **AOT cache misses compile in a background worker.** On a miss the namespace
+  has already been loaded; the fasl only serves later runs, so a detached child
+  of the built jolt compiles it while the program starts (atomic temp + rename;
+  a job the worker could not finish simply misses again). On by default for
+  built jolts on Linux/macOS — the worker finishes its jobs and exits after its
+  parent does — and
+  `JOLT_AOT_ASYNC=0` restores the in-process compile. Source mode's `bin/jolt`
+  has no spawnable jolt and always compiles in process.
+
 ## [0.8.13] - 2026-09-26
 
 Mostly memory and lazy seqs. The heap ceiling now bounds the whole heap as `-Xmx`

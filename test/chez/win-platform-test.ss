@@ -746,15 +746,18 @@
 ;; One trivial program per platform. cmd.exe is the Windows one precisely because
 ;; it is what the old sh string was being handed to — `cmd /c echo ok` printed
 ;; nothing at all and exited 0 before the CreateProcessW path.
-(define echo-argv    (if live-windows? '("cmd" "/c" "echo" "ok")        '("/bin/sh" "-c" "echo ok")))
+;; The POSIX one is "sh", found on PATH, not "/bin/sh": termux-docker has no /bin
+;; at all (termux-exec rewrites a /bin/sh exec, but the resolver stats the
+;; absolute name first and reports it missing), and Termux's sh is on PATH.
+(define echo-argv    (if live-windows? '("cmd" "/c" "echo" "ok")        '("sh" "-c" "echo ok")))
 ;; The redirect goes first on Windows: cmd echoes everything up to the operator,
 ;; so `echo err 1>&2` writes "err " with the space.
-(define stderr-argv  (if live-windows? '("cmd" "/c" "1>&2" "echo" "err") '("/bin/sh" "-c" "echo err 1>&2")))
-(define exit3-argv   (if live-windows? '("cmd" "/c" "exit" "3")          '("/bin/sh" "-c" "exit 3")))
+(define stderr-argv  (if live-windows? '("cmd" "/c" "1>&2" "echo" "err") '("sh" "-c" "echo err 1>&2")))
+(define exit3-argv   (if live-windows? '("cmd" "/c" "exit" "3")          '("sh" "-c" "exit 3")))
 ;; An argument holding a space must arrive as ONE argument. On Windows the
 ;; command-line builder quotes it, so cmd's echo prints the quotes back —
 ;; which is the observable difference from it having been split into two.
-(define spaced-argv  (if live-windows? '("cmd" "/c" "echo" "a b")        '("/bin/sh" "-c" "echo $#" "sh" "a b")))
+(define spaced-argv  (if live-windows? '("cmd" "/c" "echo" "a b")        '("sh" "-c" "echo $#" "sh" "a b")))
 (define spaced-want  (if live-windows? "\"a b\"\n" "1\n"))
 
 (call-with-values (lambda () (run-child echo-argv))

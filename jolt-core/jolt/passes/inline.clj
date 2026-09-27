@@ -595,6 +595,21 @@
 ;; the ArithmeticException. Add nothing here that can throw on a legal input.
 (def ^:private pure-fns op-registry/pure-ops)
 
+;; A call at an arity its callee lacks throws ArityException, so it is neither
+;; pure nor total however pure the callee: dropping (:k m x y) would swallow the
+;; throw (#1162). A keyword invokes at one or two args; a registry op at what its
+;; :arity admits (stricter than Clojure for some, e.g. (= x) — which only costs a
+;; fold). A callee with no recorded arity keeps the old answer.
+(defn- invoke-arity-ok? [node]
+  (let [f (get node :fn)
+        n (count (get node :args))]
+    (cond
+      (kw-callee? f) (<= 1 n 2)
+      (contains? #{:var :host} (get f :op))
+      (let [ok (op-registry/op-arity (get f :name))]
+        (or (nil? ok) (boolean (ok n))))
+      :else true)))
+
 (defn- pure-fn? [f]
   (let [op (get f :op)]
     (cond
@@ -619,6 +634,7 @@
       ;; :invoke is pure only for a known-pure fn / record ctor, and only its ARGS
       ;; are folded (not the :fn position) — so it can't go through the uniform fold.
       (= op :invoke) (and (or (pure-fn? (get node :fn)) (ctor-shape node))
+                          (invoke-arity-ok? node)
                           (every? pure? (get node :args)))
       ;; leaves (:const/:local/:var/:host/:the-var/:quote) fold to true; :if/:do/
       ;; :let/:vector/:set/:map AND their children's purity. :throw is safe-op? (an
@@ -656,6 +672,7 @@
       ;; :throw always throws — discarding it swallows the exception.
       (= op :throw) false
       (= op :invoke) (and (or (total-fn? (get node :fn)) (ctor-shape node))
+                          (invoke-arity-ok? node)
                           (every? total? (get node :args)))
       (safe-op? op) (reduce-ir-children (fn [ok c] (and ok (total? c))) true node)
       :else false)))

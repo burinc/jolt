@@ -13,7 +13,11 @@
 ;; complex plane for out-of-domain real inputs) becomes +nan.0, matching Java;
 ;; real results stay flonums, NaN/Inf pass through. real? is #f on a Chez complex.
 (define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
-(define math-pi (acos -1.0))
+;; java.lang.Math's PI/E are compile-time double literals in the JDK, not the
+;; host libm's atan(1)/exp(1) — pin the same doubles so a platform whose libm
+;; rounds exp(1) one ulp high (bionic's) still answers the JVM's value.
+(define math-pi 3.141592653589793)
+(define math-e 2.718281828459045)
 ;; Every Math method takes numbers (PI/E are values, not methods), and each one
 ;; hands its argument to a Chez numeric primitive. Check at the boundary: the
 ;; condition Chez raises for a wrong-typed operand carries no class, so it would
@@ -83,7 +87,7 @@
         (cons "scalb" (lambda (x n) (->dbl (* (exact->inexact x) (expt 2.0 (jnum->exact n))))))
         (cons "max" (lambda (a b) (if (> a b) a b))) (cons "min" (lambda (a b) (if (< a b) a b)))
         (cons "signum" (lambda (x) (cond ((< x 0) -1.0) ((> x 0) 1.0) (else 0.0))))
-        (cons "PI" (->dbl (* 4 (atan 1)))) (cons "E" (->dbl (exp 1)))
+        (cons "PI" math-pi) (cons "E" math-e)
         (cons "random" (lambda args (jolt-random 1.0))))))
 
 ;; Thread: real OS threads back futures/promises.

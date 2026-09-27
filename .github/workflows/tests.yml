@@ -128,8 +128,9 @@ jobs:
 
   # The gate on bionic (Android/Termux, #943): jolt and its pinned Chez build in
   # termux/termux-docker on an arm64 runner, the release smokes run there
-  # (ci/termux-build.sh), and then `make bionic-ci` -- the CI gate minus the gates
-  # still tracked as failing on bionic (the Makefile lists them). Android has no
+  # (ci/termux-build.sh), and then `make bionic-ci` -- the full CI gate: the ten
+  # gates #1148 used to exclude (charsets, PIC kernel, CTS, the off-Android
+  # fixtures) all pass on bionic now. Android has no
   # /tmp and many gates' fixtures write there by name, so the entrypoint makes one
   # as root before dropping to the Termux user: the gates are there to exercise
   # jolt, and jolt itself uses $TMPDIR.

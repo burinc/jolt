@@ -72,11 +72,19 @@ jobs=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
 echo "bionic-provision-chez: building Chez Scheme $version with $cc"
 (
   cd "$src"
+  # CFLAGS+=-fPIC, same as ci/glibc-floor-build.sh: libkernel.a (and the
+  # liblz4.a/libz.a built beside it) is bundled INTO the jolt that is built with
+  # this Chez, and `jolt build --library` folds it into a shared object, which
+  # an archive compiled without -fPIC cannot go into (buildlibsmoke: ld.lld
+  # "relocation R_AARCH64_ADR_PREL_PG_HI21 ... recompile with -fPIC). The
+  # relink falls back to -no-pie for an archive it cannot fix, but the one jolt
+  # carries is jolt's to get right.
   ./configure \
     --installprefix="$prefix" \
     --disable-x11 \
     --disable-curses \
     --threads \
+    CFLAGS+=-fPIC \
     CC="$cc" \
     LIBS=-liconv
   make -j"$jobs"
