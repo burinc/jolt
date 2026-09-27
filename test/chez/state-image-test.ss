@@ -173,8 +173,14 @@
      "[(re-find $rt \"y\\nx\") (.flags $rt)]"               "[\"x\" 8]")
 (rtu "class token" "String"     "[(str $rt) (instance? $rt \"x\")]"
      "[\"class java.lang.String\" true]")
-(rtu "File"        (string-append "(java.io.File. \"" (host-temp-dir) "\")")
-     "[(.getPath $rt) (.isDirectory $rt)]"                   (string-append "[\"" (host-temp-dir) "\" true]"))
+;; a File drops a trailing separator, and macOS's TMPDIR ends in one
+(define tmp-root
+  (let ((d (host-temp-dir)))
+    (if (and (> (string-length d) 1) (char=? (string-ref d (- (string-length d) 1)) #\/))
+        (substring d 0 (- (string-length d) 1))
+        d)))
+(rtu "File"        (string-append "(java.io.File. \"" tmp-root "\")")
+     "[(.getPath $rt) (.isDirectory $rt)]"                   (string-append "[\"" tmp-root "\" true]"))
 
 ;; arrays and StringBuilder are mutable host objects: contents, and still writable
 (rtu "byte-array"   "(byte-array [1 2 3])"      "(vec $rt)"  "[1 2 3]")
