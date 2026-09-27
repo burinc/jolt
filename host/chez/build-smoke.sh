@@ -457,7 +457,9 @@ fi
 # reads nor writes the user's ~/.jolt cache.
 fwd_cache="$(dirname "$out")/aot-cache"
 warm_out="$(dirname "$out")/app-warm"
-(cd "$app" && JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$fwd_cache" \
+# JOLT_AOT_ASYNC=0: the check below reads the artifact as soon as the run exits,
+# and a built jolt otherwise hands the compile to a worker that may still be at it.
+(cd "$app" && JOLT_PWD="$app" JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$fwd_cache" \
    "$joltabs" run -m app.core --fwdref >/dev/null 2>&1)
 # ...and the run has to have actually cached something, or this case proves
 # nothing while still passing — the failure mode a warm-cache gate is most

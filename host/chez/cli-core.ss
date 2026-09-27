@@ -442,6 +442,12 @@
       ;; is not a jolt (under the dev launcher the process is a plain Chez).
       ((and (pair? cli-args) (string=? (car cli-args) "--build-worker-probe"))
        (display "jolt-build-worker\n"))
+      ;; --aot-worker MANIFEST — internal: the run-path AOT cache compiling its
+      ;; misses off the startup path (loader.ss aot-enqueue-compile!), spawned by
+      ;; a run whose launcher set jolt-standalone-binary. Ahead of project
+      ;; resolution, like --build-worker.
+      ((and (pair? cli-args) (string=? (car cli-args) "--aot-worker") (pair? (cdr cli-args)))
+       ((var-deref "jolt.host" "aot-compile-worker") (cadr cli-args)))
       ;; -e EXPR [args…] — evaluate one expression and print it (blank for nil).
       ;; Each top-level form is read, compiled, and evaled in sequence so each
       ;; form is visible to the next, matching JVM load semantics. The argv after

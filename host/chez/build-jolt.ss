@@ -242,6 +242,9 @@
 (scheme-start
   (lambda args
     (jolt-startup-profile-mark! \"heap built (scheme-start entered)\")
+    ;; this process can spawn copies of itself: the async AOT worker's gate
+    ;; (loader.ss aot-worker-capable?)
+    (set! jolt-standalone-binary #t)
     (set-source-roots! " (ldr-install-roots-str) ")
     (jolt-startup-profile-mark! \"source roots + data readers\")
     ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
