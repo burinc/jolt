@@ -10,6 +10,11 @@
 #
 # Needs the test.check jar in ~/.m2 (or network on first run) for both hosts.
 set -e
+# A relative $JOLT_BIN names a path from the caller's directory; pin it before
+# the cd below moves us into bench/.
+case "${JOLT_BIN:-}" in
+  */*) JOLT_BIN="$(cd "$(dirname "$JOLT_BIN")" && pwd)/$(basename "$JOLT_BIN")" ;;
+esac
 cd "$(dirname "$0")"
 root="$(cd .. && pwd)"
 # $JOLT_BIN points the run at another jolt (a built binary), as run.sh does.

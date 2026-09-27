@@ -17,55 +17,59 @@ and which compiler pass or runtime seam it exists to watch.
 
 ## Scorecard
 
-Measured 2026-09-09 on an Apple Silicon MacBook Pro (M1 Pro, macOS 26.3): jolt 0.8.6 (the tree of
-commit 871ef34c) built as `target/release/jolt`, OpenJDK 20.0.1, Chez 10.4.1. Sorted by
-ratio; the AOT rows first, then `startup`, then the run-mode rows.
+Measured 2026-09-26 on an Apple Silicon MacBook Pro (M1 Max, macOS 26.3): jolt 0.8.13 (the tree of commit ad4618f1) built as `target/release/jolt`, OpenJDK 20.0.1, Chez 10.4.1. Sorted by ratio; the AOT rows first, then `startup`, then the run-mode rows.
 
 | Benchmark | vs JVM | jolt (ms) | JVM (ms) | What it measures |
 |---|---:|---:|---:|---|
-| `arrays-unhinted` | **0.01×** | 59.9 | 10831.2 | the same array code without type hints |
-| `char-scan-unhinted` | **0.01×** | 113 | 7764 | the same scan without type hints |
-| `gc-arrays` | **0.02×** | 29.7 | 1725.7 | major-collection pause with a large typed array live (read jolt ms only, see below) |
-| `typed-records` | **0.03×** | 10.7 | 310.3 | records with `^double`/`^long`/`^String` field types at construction and every read |
-| `typed-records-unhinted` | **0.07×** | 19.9 | 292.6 | the same records without field types |
-| `string-ops-unhinted` | **0.10×** | 302 | 2958 | the same string interop without type hints |
-| `vecops` | **0.26×** | 4.1 | 15.9 | vector concat (`into`), `subvec` windows, split/rejoin (the RRB axis) |
-| `tak` | **0.36×** | 6.7 | 18.7 | deep three-way self-recursion + integer arith |
-| `stm` | **0.81×** | 122.0 | 151.5 | ref creation, `dosync` `ref-set`/`alter`, `deref` in a loop |
-| `dispatch` | **1.2×** | 65.6 | 56.6 | megamorphic protocol dispatch |
-| `fib` | **1.4×** | 9.3 | 6.8 | recursion: call overhead + integer arith |
-| `loop-recur` | **1.5×** | 28.5 | 18.8 | tight `loop`/`recur` with `mod`/`quot`/`bit-xor` per iteration |
-| `collections` | **1.5×** | 16.6 | 10.9 | persistent map/vector churn + map/filter/take/reduce over the result |
-| `mandelbrot` | **1.5×** | 21.9 | 14.2 | pure float compute, no allocation or dispatch |
-| `mathfns-unhinted` | **1.9×** | 41.9 | 22.2 | the same math without type hints |
-| `binary-trees` | **1.9×** | 75.3 | 39.4 | escaping short-lived records: allocation / GC pressure |
-| `literals` | **2.2×** | 55 | 25 | constant map/vector/set literals and quoted forms in a fn body, boolean predicates (per-form constant pool) |
-| `mathfns` | **2.3×** | 41.3 | 17.8 | `java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles |
-| `sorted-access` | **2.4×** | 31.0 | 13.1 | shape-answered reads: `count`/`drop` on a vector seq, `rseq`, `first` of a sorted map/set |
-| `seqs` | **2.4×** | 346.7 | 144.9 | lazy-seq + HOF pipelines: `map`/`filter`/`reduce`, `every?`, `iterate`/`take`, `mapcat` |
-| `transients` | **2.5×** | 154 | 61 | bulk map/set building through `into`, `assoc!`/`conj!`, `zipmap`/`frequencies`/`group-by` |
-| `hash-eq` | **2.6×** | 480 | 186 | hashing vectors/maps/sets/records/seqs, collection-keyed lookups, `=` on equal and unequal collections |
-| `printing` | **2.7×** | 752.4 | 282.2 | `pr-str` over scalars and namespaced maps, `print` into a rebound `*out*`, `format` with numeric directives and flags |
-| `mono-dispatch` | **2.7×** | 37.0 | 13.8 | monomorphic protocol dispatch (devirt / inline cache can fire) |
-| `nth-access` | **2.7×** | 62.3 | 23.2 | `nth` on a vector, small and large, with and without a default |
-| `string-ops` | **3.0×** | 298 | 98 | `.indexOf`/`.startsWith`/`.substring`/`.toLowerCase` on hinted strings, `clojure.string`, keyword `.getName` |
-| `executors` | **3.2×** | 1328.8 | 421.7 | `java.util.concurrent`: fire-and-forget enqueue, submit/get, growth to 64 blocking tasks, four producers on one pool |
-| `keyed-lookup` | **3.6×** | 91 | 25 | hashing keywords/symbols/strings and looking them up in small maps |
-| `lazy-threads` | **3.7×** | 237.4 | 64.8 | lazy pipelines after a `Thread` has existed (cells claimed by CAS, no mutex per cell) |
-| `arrays` | **3.7×** | 592.8 | 160.0 | primitive `double-array` throughput (hinted `aget`/`aset`) |
-| `apply-rest` | **3.8×** | 222.1 | 58.3 | `apply` of `+ max min < <=` and a user variadic over a million-element rest (streamed, not materialized) |
-| `transducers` | **4.0×** | 124.6 | 30.8 | transducer pipelines (`comp` of `map`/`filter`/`take`) |
-| `byte-arrays` | **4.5×** | 167.0 | 37.5 | raw bytes in bulk: block copies, a drained stream, `String`↔`byte[]`, hinted `^bytes` access |
-| `string-build` | **4.5×** | 183 | 41 | `StringBuilder` in a loop and transducer-over-`join` |
-| `char-scan` | **6.0×** | 108 | 18 | `.charAt` per code point with the `int`/`long`/`unchecked-*` casts, a `case` state machine |
-| `compile-forms` | **8.3×** | 817.1 | 98.5 | **compiling**, not running: `load-string` of 200 top-level defns and of one `deftest` holding 200 `is` forms |
-| `sorted-build` | **13.3×** | 701.3 | 52.6 | `into` a sorted-map/sorted-set in and out of key order, `sorted-map-by`, replace-every-key (one tree walk per insert) |
-| `startup` | **0.19×** | 84 | 443 | a built hello-world, whole process from exec to exit, best of 7 (JVM: `java -cp … clojure.main -m hello`) |
-| `mix-64` ×100000 (run mode) | **5.8×** | 30.5 | 5.3 | SplitMix `mix-64`: 64-bit integer arithmetic (heap bignums past the 61-bit fixnum) |
-| `deftype+protocol` ×100000 (run mode) | **3.5×** | 23.0 | 6.5 | open-world deftype allocation + protocol dispatch |
-| `split + rand-long` ×20000 (run mode) | **12.1×** | 43.7 | 3.6 | the PRNG: bignum 64-bit arithmetic + dispatch |
-| `gen/large-integer` ×2000 (run mode) | **4.9×** | 41.5 | 8.5 | `gen/large-integer`: arithmetic + rose-tree generator machinery |
-| `(gen/vector gen/large-integer)` ×500 (run mode) | **12.2×** | 461.9 | 38.0 | element generation + generator machinery |
+| `arrays-unhinted` | **0.00×** | 53.9 | 11536.4 | the same array code without type hints |
+| `char-scan-unhinted` | **0.01×** | 88 | 8011 | the same scan without type hints |
+| `gc-arrays` | **0.02×** | 33.0 | 2098.0 | major-collection pause with a large typed array live (read jolt ms only, see below) |
+| `typed-records` | **0.03×** | 9.5 | 309.9 | records with `^double`/`^long`/`^String` field types at construction and every read |
+| `typed-records-unhinted` | **0.05×** | 14.6 | 314.2 | the same records without field types |
+| `string-ops-unhinted` | **0.07×** | 213 | 3090 | the same string interop without type hints |
+| `vecops` | **0.18×** | 3.1 | 17.0 | vector concat (`into`), `subvec` windows, split/rejoin (the RRB axis) |
+| `tak` | **0.40×** | 8.0 | 20.2 | deep three-way self-recursion + integer arith |
+| `collections` | **0.70×** | 8.3 | 11.8 | persistent map/vector churn + map/filter/take/reduce over the result |
+| `dispatch` | **0.76×** | 44.0 | 57.7 | megamorphic protocol dispatch |
+| `metadata` | **0.92×** | 87 | 95 | `with-meta`/`meta`/`vary-meta`, ops that carry meta (`assoc`/`conj`/`into` on a meta-bearing coll), a positioned form tree rebuilt with meta kept |
+| `stm` | **0.92×** | 110.6 | 120.5 | ref creation, `dosync` `ref-set`/`alter`, `deref` in a loop |
+| `mandelbrot` | **0.93×** | 14.0 | 15.0 | pure float compute, no allocation or dispatch |
+| `sorted-access` | **1.1×** | 15.3 | 14.5 | shape-answered reads: `count`/`drop` on a vector seq, `rseq`, `first` of a sorted map/set |
+| `seqs` | **1.1×** | 168.7 | 150.7 | lazy-seq + HOF pipelines: `map`/`filter`/`reduce`, `every?`, `iterate`/`take`, `mapcat` |
+| `literals` | **1.1×** | 28 | 25 | constant map/vector/set literals and quoted forms in a fn body, boolean predicates (per-form constant pool) |
+| `binary-trees` | **1.2×** | 49.7 | 40.8 | escaping short-lived records: allocation / GC pressure |
+| `nth-access` | **1.3×** | 39.2 | 30.9 | `nth` on a vector, small and large, with and without a default |
+| `fib` | **1.3×** | 9.3 | 7.2 | recursion: call overhead + integer arith |
+| `loop-recur` | **1.4×** | 26.0 | 19.2 | tight `loop`/`recur` with `mod`/`quot`/`bit-xor` per iteration |
+| `hash-eq` | **1.4×** | 262 | 187 | hashing vectors/maps/sets/records/seqs, collection-keyed lookups, `=` on equal and unequal collections |
+| `transients` | **1.5×** | 118 | 77 | bulk map/set building through `into`, `assoc!`/`conj!`, `zipmap`/`frequencies`/`group-by` |
+| `lazy-threads` | **1.6×** | 111.2 | 67.4 | lazy pipelines after a `Thread` has existed (cells claimed by CAS, no mutex per cell) |
+| `cst-format` | **1.7×** | 86.1 | 51.9 | the source-formatter shape: a CST of one 10-key map per token, then an atom-per-node mutating walk building the output with `str` |
+| `mathfns-unhinted` | **1.7×** | 43.9 | 25.8 | the same math without type hints |
+| `string-scan` | **1.8×** | 3070 | 1751 | `clojure.string` over a large payload: split/replace/trim, and whether a literal pattern reaches the regex engine |
+| `coll-dispatch` | **1.9×** | 126 | 67 | kind dispatch on small collections: `get`/`assoc` on a 4-key map, a first/next walk, `count`/`conj`/`nth`/`=` on short lists and vectors |
+| `string-ops` | **2.1×** | 213 | 102 | `.indexOf`/`.startsWith`/`.substring`/`.toLowerCase` on hinted strings, `clojure.string`, keyword `.getName` |
+| `mono-dispatch` | **2.2×** | 32.4 | 14.5 | monomorphic protocol dispatch (devirt / inline cache can fire) |
+| `host-io` | **2.2×** | 1081 | 483 | reading THROUGH the `java.io` shim: a form off a reader, a chunked `char[]` drain, `String`↔`char[]` |
+| `string-build` | **2.3×** | 113 | 50 | `StringBuilder` in a loop and transducer-over-`join` |
+| `mathfns` | **2.3×** | 43.0 | 18.9 | `java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles |
+| `printing` | **2.4×** | 602.9 | 250.9 | `pr-str` over scalars and namespaced maps, `print` into a rebound `*out*`, `format` with numeric directives and flags |
+| `keyed-lookup` | **2.5×** | 68 | 27 | hashing keywords/symbols/strings and looking them up in small maps |
+| `apply-rest` | **2.6×** | 156.0 | 60.5 | `apply` of `+ max min < <=` and a user variadic over a million-element rest (streamed, not materialized) |
+| `parallel-colls` | **2.9×** | 282 | 98 | eight threads, each on its own values: `assoc`/`conj`/`swap!`/`str`/`hash`/`re-find`/`with-meta` (what the runtime shares behind their backs) |
+| `executors` | **3.0×** | 1470.4 | 483.5 | `java.util.concurrent`: fire-and-forget enqueue, submit/get, growth to 64 blocking tasks, four producers on one pool |
+| `arrays` | **3.3×** | 550.4 | 168.1 | primitive `double-array` throughput (hinted `aget`/`aset`) |
+| `byte-arrays` | **3.3×** | 135.7 | 40.6 | raw bytes in bulk: block copies, a drained stream, `String`↔`byte[]`, hinted `^bytes` access |
+| `transducers` | **3.5×** | 115.7 | 32.7 | transducer pipelines (`comp` of `map`/`filter`/`take`) |
+| `char-scan` | **5.3×** | 85 | 16 | `.charAt` per code point with the `int`/`long`/`unchecked-*` casts, a `case` state machine |
+| `sorted-build` | **6.4×** | 357.9 | 56.2 | `into` a sorted-map/sorted-set in and out of key order, `sorted-map-by`, replace-every-key (one tree walk per insert) |
+| `compile-forms` | **6.9×** | 710.3 | 102.5 | **compiling**, not running: `load-string` of 200 top-level defns and of one `deftest` holding 200 `is` forms |
+| `startup` | **0.15×** | 77 | 509 | a built hello-world, whole process from exec to exit, best of 7 (JVM: `java -cp … clojure.main -m hello`) |
+| `mix-64` ×100000 (run mode) | **7.6×** | 31.1 | 4.1 | SplitMix `mix-64`: 64-bit integer arithmetic (heap bignums past the 61-bit fixnum) |
+| `deftype+protocol` ×100000 (run mode) | **0.95×** | 7.0 | 7.4 | open-world deftype allocation + protocol dispatch |
+| `split + rand-long` ×20000 (run mode) | **8.7×** | 33.2 | 3.8 | the PRNG: bignum 64-bit arithmetic + dispatch |
+| `gen/large-integer` ×2000 (run mode) | **2.2×** | 20.0 | 9.0 | `gen/large-integer`: arithmetic + rose-tree generator machinery |
+| `(gen/vector gen/large-integer)` ×500 (run mode) | **5.9×** | 224.8 | 37.8 | element generation + generator machinery |
 
 **vs JVM** is jolt ÷ JVM Clojure on the same source: lower is better, and
 under 1.0× jolt is faster. Every row is from one `bench/run.sh` followed by one
@@ -88,6 +92,12 @@ Reading it:
   `System/gc` is a hint there and a full collection here.
 - **`*-unhinted`** rows are the same source with the type hints removed — what
   a hint buys, and what unhinted library code pays.
+- **`parallel-colls`** is eight threads doing the same per-call work on their
+  own values, so `mean:` is a wall clock that a lock anywhere on those paths
+  multiplies. It prints its one-thread time and the per-thread slowdown above
+  `mean:`; read the slowdown against the JVM's, which sits near 2× on the same
+  machine because eight threads share one allocator and one memory bus there
+  too. Noisier than a single-threaded row (±10%).
 - **`compile-forms`** measures jolt compiling, not running. The reference
   builds bytecode and generates no native code at load; jolt asks Chez for
   optimized native code for every form, which is roughly half its time.
@@ -191,6 +201,17 @@ What 0.8.6's performance changes are covered by: `byte-arrays` (hinted
 rest, var roots that stream), `compile-forms` and `literals` (the constant
 pool keyed by form identity), `printing` (`format`), and `startup` (the boot
 image codecs and the LZ4 ceiling fallback).
+
+What the 2026-09 round after 0.8.8 is covered by: `parallel-colls` (the four
+process-wide locks that were on per-call paths, the atom's compare-and-swap,
+and metadata as a field — eight threads on their own values, where a shared
+lock shows as a per-thread slowdown), `metadata` (meta in a slot of the
+collection record: `with-meta` is a copy, a carry is a slot read), and
+`coll-dispatch` (the record predicates and accessors in front of every
+collection op open-coded, and the collection layouts loaded ahead of the
+dispatchers so it applies to them; `make recordinline` gates the mechanism,
+the row says what it is worth). `cst-format` is the end-to-end row those
+three feed.
 
 ## A/B against a change
 

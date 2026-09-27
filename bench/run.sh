@@ -20,6 +20,11 @@
 # Building needs Chez's kernel dev files (libkernel.a + scheme.h) and a C compiler,
 # the same as `jolt build`; set JOLT_CHEZ_CSV to override the detected csv dir.
 set -e
+# A relative $JOLT_BIN names a path from the caller's directory; pin it before
+# the cd below moves us into bench/.
+case "${JOLT_BIN:-}" in
+  */*) JOLT_BIN="$(cd "$(dirname "$JOLT_BIN")" && pwd)/$(basename "$JOLT_BIN")" ;;
+esac
 cd "$(dirname "$0")"
 root="$(cd .. && pwd)"
 # $JOLT_BIN points the suite at another jolt — a released binary, or the one a
