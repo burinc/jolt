@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A heap near its `JOLT_MAX_HEAP` ceiling no longer overshoots it during the
+  ceiling's own full collection (jolt-exoj).** The collection marks the old
+  generations in place, but Chez still copies sparse segments, and one
+  collection of every generation held all those copies beside their sources: a
+  program with ~140MB spread over the younger old generations peaked at 322MB
+  under a 256MB ceiling, and gcpolicy's ceiling check failed intermittently
+  under CPU contention. When the younger generations hold more than the free
+  room, the collection now goes a generation at a time, so the peak is the heap
+  plus the largest step. Below the soft limit the collection also fires after
+  a quarter of the remaining room rather than half, leaving it room to copy
+  into. Both workloads now peak at 269-274MB, and `JOLT_GC_LOG` lines show the
+  running peak.
 - **A built image marks its app namespaces loaded, so a runtime `require` of
   one is a no-op.** The app emit pre-registered every linked namespace
   (`intern-ns!`) but never marked it loaded, so a `require` after startup — a
