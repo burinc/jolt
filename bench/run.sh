@@ -69,12 +69,20 @@ trap 'rm -rf "$bindir"' EXIT
 # name:default-arg, each sized to run in a few seconds. Axes: see README.md.
 BENCHES="fib:30 tak:24 loop-recur:20000 mandelbrot:200 arrays:40000 arrays-unhinted:1000 byte-arrays:400 gc-arrays:150 mathfns:1000000 mathfns-unhinted:1000000 collections:30000 vecops:60000 seqs:20000 lazy-threads:100000 apply-rest:1000000 sorted-access:40000 sorted-build:20000 nth-access:1000000 transducers:20000 transients:50000 keyed-lookup:3000 hash-eq:2000 literals:100000 string-build:60000 string-ops:100000 string-ops-unhinted:100000 char-scan:40000 char-scan-unhinted:40000 printing:300 mono-dispatch:2000 dispatch:2000 binary-trees:14 typed-records:100000 typed-records-unhinted:100000 stm:200000 executors:60000 compile-forms:200 host-io:200 string-scan:40 cst-format:80 coll-dispatch:200000 metadata:100000 parallel-colls:200000"
 
+# A row is one summary line, then indented detail lines the scorecard reads for
+# the README's prose: every line a bench printed (its `runs:`, and any phase
+# split or per-thread slowdown), per host, plus the plain-release mean under
+# MODE_A and a node reference where bench/<ns>.js exists.
+detail() {   # detail <host> <output>
+  printf '%s\n' "$2" | grep . | sed "s/^/  $1: /"
+}
 run_one() {
   ns="${1%%:*}"; arg="${2:-${1##*:}}"
   if ! "$jolt" build -m "$ns" -o "$bindir/$ns" --direct-link --opt >/dev/null 2>&1; then
     printf '%-16s  jolt build FAILED\n' "$ns"; return
   fi
-  jmean=$("$bindir/$ns" "$arg" 2>/dev/null | awk '/^mean:/{print $2}')
+  jout=$("$bindir/$ns" "$arg" 2>/dev/null)
+  jmean=$(printf '%s\n' "$jout" | awk '/^mean:/{print $2}')
   # mode A: the plain-release binary (no --direct-link --opt) — what a default
   # `jolt build` ships. Tracked so a release-mode win or regression is visible.
   rmean=""
@@ -83,21 +91,23 @@ run_one() {
       rmean=$("$bindir/$ns-rel" "$arg" 2>/dev/null | awk '/^mean:/{print $2}')
     fi
   fi
+  vout=""
   if [ -z "$NO_JVM" ]; then
-    vmean=$(clojure -Sdeps '{:paths ["."]}' -M -m "$ns" "$arg" 2>/dev/null | awk '/^mean:/{print $2}')
+    vout=$(clojure -Sdeps '{:paths ["."]}' -M -m "$ns" "$arg" 2>/dev/null)
+    vmean=$(printf '%s\n' "$vout" | awk '/^mean:/{print $2}')
     ratio=$(awk "BEGIN{ if (\"$vmean\"+0>0 && \"$jmean\"+0>0) printf \"%.1fx\", (\"$jmean\"+0)/(\"$vmean\"+0); else printf \"-\" }")
-    if [ -n "$MODE_A" ]; then
-      rratio=$(awk "BEGIN{ if (\"$vmean\"+0>0 && \"$rmean\"+0>0) printf \"%.1fx\", (\"$rmean\"+0)/(\"$vmean\"+0); else printf \"-\" }")
-      printf '%-16s opt %9s ms (%s)   release %9s ms (%s)   jvm %8s ms\n' \
-        "$ns" "${jmean:--}" "$ratio" "${rmean:--}" "$rratio" "${vmean:--}"
-    else
-      printf '%-16s jolt %9s ms   jvm %8s ms   %s\n' "$ns" "${jmean:--}" "${vmean:--}" "$ratio"
-    fi
-  elif [ -n "$MODE_A" ]; then
-    printf '%-16s opt %9s ms   release %9s ms\n' "$ns" "${jmean:--}" "${rmean:--}"
+    printf '%-16s jolt %9s ms   jvm %8s ms   %s\n' "$ns" "${jmean:--}" "${vmean:--}" "$ratio"
   else
     printf '%-16s jolt %9s ms\n' "$ns" "${jmean:--}"
   fi
+  [ -n "$MODE_A" ] && printf '  release: %s ms\n' "${rmean:--}"
+  detail jolt "$jout"
+  [ -n "$vout" ] && detail jvm "$vout"
+  js="$(echo "$ns" | tr - _).js"
+  if [ -f "$js" ] && command -v node >/dev/null 2>&1; then
+    detail node "$(node "$js" "$arg" 2>/dev/null)"
+  fi
+  return 0
 }
 
 # The startup row: every bench above times the compute INSIDE a running binary,
@@ -142,6 +152,20 @@ elif [ -n "$1" ]; then
   run_one "$spec" "$2"
 else
   echo "jolt benchmark suite — optimized AOT binaries${NO_JVM:+ }${NO_JVM:-, vs JVM Clojure}"
+  # What the sitting ran on, read by bench/scorecard.clj for the README's
+  # "Measured …" line — recorded here because it is true of this run, not of
+  # whenever the table is rendered.
+  echo "env date: $(date +%Y-%m-%d)"
+  if [ "$(uname)" = Darwin ]; then
+    echo "env machine: $(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion)"
+  else
+    echo "env machine: $(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo), $(uname -sr)"
+  fi
+  echo "env jolt: $("$jolt" --version 2>/dev/null)"
+  [ -z "$NO_JVM" ] && echo "env jvm: $(java -version 2>&1 | head -1)"
+  echo "env chez: $("${JOLT_CHEZ:-$(command -v chez || command -v scheme || command -v petite)}" --version 2>&1)"
+  command -v node >/dev/null 2>&1 && echo "env node: $(node --version)"
+  echo "env mode-a: ${MODE_A:+yes}"
   for spec in $BENCHES; do run_one "$spec"; done
   run_startup
 fi
