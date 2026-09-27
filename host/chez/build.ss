@@ -2078,8 +2078,21 @@
           ;; defines no vars of its own (only a defmethod) so ns-has-vars? can't
           ;; vouch for it and its own (ns) form hasn't run yet.
           (put-string out "\n;; === app namespace pre-registration ===\n")
-          (for-each (lambda (p) (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n")))
-                    ordered)
+          ;; The marks matter as much as the interning: the image is about to
+          ;; define every one of these namespaces and run its top-level forms
+          ;; (jolt-app-init!), so a runtime require of one must dedup to a
+          ;; no-op. Unmarked, the loader reads the source from the embedded
+          ;; roots again and re-evaluates the namespace IN PLACE — re-running
+          ;; side effects and re-binding forward references against the
+          ;; now-populated var table (the reload window #451's emit-walk fix
+          ;; does not cover, since this load is not the emit walk). The CLI AOT
+          ;; emit marks jolt.main/jolt.deps for exactly this reason
+          ;; (bld-emit-cli-aot).
+          (for-each
+            (lambda (p)
+              (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n"))
+              (put-string out (string-append "(ldr-mark-loaded! " (ei-str-lit (car p)) ")\n")))
+            ordered)
           (bld-emit-startup-profile-mark! out "app namespace registration")
           ;; The app's forms are DECLARED here and RUN from the launcher — see
           ;; bld-defer-app-strs. The profile mark rides along into the init body,

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A built image marks its app namespaces loaded, so a runtime `require` of
+  one is a no-op.** The app emit pre-registered every linked namespace
+  (`intern-ns!`) but never marked it loaded, so a `require` after startup — a
+  library's lazy load, an extension host's requires, kmet's extension-load
+  `host-requires!` — missed the loader's dedup, read the source from the
+  embedded roots again and re-evaluated the namespace IN PLACE. Top-level side
+  effects re-ran, and a bare symbol compiled before a same-namespace
+  redefinition of a `clojure.core` name (the #451 shape: `(get env
+  "HTTPS_PROXY")` above a same-ns `(defn get …)`) was re-resolved against the
+  now-populated var table: the built program threw `class java.lang.String
+  cannot be cast to class clojure.lang.Associative` where `jolt run` was fine
+  (reported against kmet, whose `src` is embedded and whose extension loader
+  requires host namespaces at startup; only the app build was exposed — the
+  CLI AOT emit already marks `jolt.main`/`jolt.deps`).
 - **A keyword, set or vector called with the wrong number of arguments throws
   `ArityException` (#1162).** A literal callee was lowered straight to `get`/`nth`
   whatever the argument count, so `(:a 1 2 3)` answered 2, `(#{1} 1 2)` 1 and
