@@ -834,6 +834,24 @@
                   (proc-fa-close fa fd))))
             (guard (e (#t '())) (directory-list dir)))))))
 
+;; The shell every fd-level spawn goes through (as `sh -c "exec prog args"`).
+;; /bin/sh on every POSIX host but one: Android has no /bin before 10, and a
+;; container built from its system image (termux-docker) has none at all, while
+;; /system/bin/sh is always there. Termux's app hides the gap by preloading
+;; termux-exec, which rewrites a /bin/sh exec, but a jolt started without that
+;; preload (env -i, a service, a plain adb shell) could spawn nothing. Decided
+;; once, on first spawn.
+(define proc-posix-shell
+  (let ((sh #f))
+    (lambda ()
+      (or sh
+          (let ((found (if (or (file-exists? "/bin/sh")
+                               (not (file-exists? "/system/bin/sh")))
+                           "/bin/sh"
+                           "/system/bin/sh")))
+            (set! sh found)
+            found)))))
+
 ;; --- start() returns after the child has exec'd --------------------------------
 ;; The JDK's start() does not return until the child has exec'd (or failed to),
 ;; and glibc, musl and Darwin's posix_spawn wait the same way. bionic's does not:
@@ -959,7 +977,8 @@
                        (if out-p (list (car out-p) (cdr out-p)) '())
                        (if err-p (list (car err-p) (cdr err-p)) '())
                        (if barrier (list (car barrier) (cdr barrier)) '()))))
-        (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
+        (let* ((shell (proc-posix-shell))
+               (argv (proc-marshal-argv (list shell "-c" sh-cmd)))
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
                            (proc-child-env-pairs))))
@@ -967,7 +986,7 @@
                ;; SETSIGMASK — so the child inherits this thread's signal mask,
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask
-                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa (or attr 0) (car argv) (car envp)))))
+                     (lambda () (proc-c-spawn pidbuf shell fa (or attr 0) (car argv) (car envp)))))
                (pid (sa-foreign-ref 'int pidbuf 0)))
           (proc-fa-destroy fa)
           (when attr (proc-attr-destroy attr) (sa-foreign-free attr))
