@@ -1,5 +1,6 @@
 (ns app.core
   (:require [app.util :as util :refer [greet]]
+            [app.embedded :as emb]
             [clojure.java.io :as io]
             [jolt.image :as img]))
 
@@ -115,6 +116,18 @@
     (println "dd-apply:" (apply util/dd-caller nil))
     (println "dd-call: " (util/dd-caller))
     (println "dd-late: " (util/dd-late)))
+  ;; --rerequire: the image already loaded app.embedded (whose source is ALSO
+  ;; embedded, unlike app.util's), so requiring it again at runtime must be a
+  ;; no-op. loaded-stamp is a fresh Object per evaluation, and the apply-forced
+  ;; fwd-get pins the #451 hazard: a re-evaluated fwd-get links the now-visible
+  ;; ns-local `get` and throws String→Associative — the runtime side of #451,
+  ;; outside the emit walk that fix gated (kmet's extension loader requires host
+  ;; namespaces at startup; its src is embedded exactly like this fixture's).
+  (when (= (first args) "--rerequire")
+    (let [stamp emb/loaded-stamp]
+      (require 'app.embedded)
+      (println "re-require same-stamp:" (identical? stamp emb/loaded-stamp))
+      (println "re-require fwd-get:  " (apply emb/fwd-get [{"K" 41} "K"]))))
   ;; --fwdref: a symbol compiled BEFORE a same-ns redefinition must resolve to
   ;; the clojure.core var in the built binary too — the emit walk re-analyzes
   ;; against the fully-loaded process where app.util/get already exists, and

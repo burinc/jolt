@@ -613,6 +613,10 @@ gcpolicy: testbin
 	 echo "gcpolicy: JOLT_MAX_HEAP=256m with ~100MB held -> total after collections $${after}MB, peak $$((pk / 1048576))MB, max $$((mx / 1048576))MB"; \
 	 [ -n "$$after" ] && [ $$((after * 1048576 * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: a collection left the total heap at $${after}MB, more than 10% over JOLT_MAX_HEAP=256m: the ceiling bounds the TOTAL heap, as -Xmx does, within the collector's working room"; exit 1; }; \
 	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the total heap peaked at $$pk during collections, more than 10% over JOLT_MAX_HEAP=256m (v0.8.12 peaked 23% over)"; exit 1; }; \
+	 fdir=$$(mktemp -d); \
+	 set -- $$(cd "$$fdir" && JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m "$(CURDIR)/$$j" run "$(CURDIR)/test/gc_ceiling_forced_test.clj" 2>&1 | sed -n 's/^peak //p'); pk=$$1; mx=$$3; rmdir "$$fdir"; \
+	 echo "gcpolicy: a ceiling-forced full collection with ~140MB spread over the older generations -> peak $$(($${pk:-0} / 1048576))MB"; \
+	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the heap peaked at $${pk:-?} in a ceiling-forced full collection, more than 10% over JOLT_MAX_HEAP=256m: one collection of every generation holds its copies beside their sources (collect it a generation at a time; jolt-exoj)"; exit 1; }; \
 	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
 	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
 	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -eq 67108864 ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
