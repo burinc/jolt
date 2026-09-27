@@ -1990,8 +1990,9 @@ check '(do (require (quote jolt.nrepl)) (if @(var jolt.nrepl/windows?) :close-on
 # dlopen'd garbage). The spec map names a library present on both gate
 # platforms (libsqlite3 ships with macOS and the Ubuntu runners); a map with
 # no entry for the running platform must raise naming the missing key, not
-# silently load nothing.
-check '(do (require (quote jolt.ffi)) (jolt.ffi/load-library {:darwin "libsqlite3.0.dylib" :linux "libsqlite3.so.0" :windows "winsqlite3.dll"}) :map-form-ok)' ':map-form-ok'
+# silently load nothing. The :linux entry is a candidate list because Termux's
+# libsqlite package ships only the unversioned libsqlite3.so.
+check '(do (require (quote jolt.ffi)) (jolt.ffi/load-library {:darwin "libsqlite3.0.dylib" :linux ["libsqlite3.so.0" "libsqlite3.so"] :windows "winsqlite3.dll"}) :map-form-ok)' ':map-form-ok'
 check '(do (require (quote jolt.ffi)) (try (jolt.ffi/load-library {:no-such-os "x.so"}) :no-raise (catch Exception e (if (clojure.string/includes? (ex-message e) "entry in the per-OS spec") :named-raise :wrong-message))))' ':named-raise'
 
 # clojure.main wraps repl / -e / -m in with-bindings, so a top-level
