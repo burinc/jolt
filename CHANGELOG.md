@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The run-path AOT cache narrows its key to a dependency's compile-time
+  surface.** With direct-linking and whole-program inference off (plain `jolt
+  run`), a dependency that defines no macros, records/types/protocols,
+  forwarded `:refer`s, or data readers cannot change a consumer's emitted code,
+  so the consumer no longer folds that dependency's source. Editing an ordinary
+  function recompiles that namespace alone; its consumers hit their cached
+  fasls and read the new value through the dependency's var. A consumer whose
+  cached fasl assumed an inert dependency is re-verified once the fasl's own
+  requires have loaded, so a dependency that gained a macro invalidates it.
+  `jolt build` (direct-linked/inferred) keeps the conservative key; set
+  `JOLT_AOT_NARROW=0` to keep it everywhere.
+
+### Added
+
+- **`JOLT_AOT_ASYNC=1` compiles AOT cache misses in a background worker.** On a
+  miss the namespace has already been loaded; the fasl only serves later runs,
+  so a child of the built jolt compiles it while the program starts (atomic
+  temp + rename; a job lost to a worker's idle exit simply misses again). Off by
+  default — source mode's `bin/jolt` has no spawnable jolt and compiles in
+  process.
+
 ## [0.8.13] - 2026-09-26
 
 Mostly memory and lazy seqs. The heap ceiling now bounds the whole heap as `-Xmx`
