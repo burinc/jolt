@@ -732,6 +732,37 @@ else
 fi
 rm -rf "$cache_x" "$xlib"
 
+# An inert dep still decides WHICH vars a consumer's compile can see: a var it
+# drops makes a qualified reference a compile error, and under :refer :all a
+# var it gains shadows a bare clojure.core symbol. Both must reach the consumer
+# — its cached artifact is compiled against the old var set — so an inert dep
+# is folded by its var names rather than as a constant.
+slib="$(mktemp -d)"; mkdir -p "$slib/src/slib" "$slib/src/sapp"
+printf '{:paths ["src"]}\n' > "$slib/deps.edn"
+printf '(ns slib.core)\n(defn v [] 1)\n(defn w [] 2)\n' > "$slib/src/slib/core.clj"
+printf '(ns sapp.core (:require [slib.core :refer :all]))\n(defn run [] [(inc 1) (slib.core/w)])\n' > "$slib/src/sapp/core.clj"
+cache_s="$(mktemp -d)"
+srun() {
+  JOLT_AOT_NARROW=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_s" JOLT_QUIET=1 JOLT_DEBUG=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'sapp/sapp {:local/root \"$slib\"}}})
+    (println (try (require 'sapp.core) (pr-str ((resolve 'sapp.core/run)))
+                  (catch Throwable t (str \"threw \" (ex-message t)))))" 2>&1
+}
+s_cold="$(srun || true)"; s_warm="$(srun || true)"
+printf '(ns slib.core)\n(defn v [] 1)\n(defn w [] 2)\n(defn inc [x] :shadowed)\n' > "$slib/src/slib/core.clj"
+s_gain="$(srun || true)"
+printf '(ns slib.core)\n(defn v [] 1)\n(defn inc [x] :shadowed)\n' > "$slib/src/slib/core.clj"
+s_drop="$(srun || true)"
+if echo "$s_warm" | grep -q '^\[2 2\]$' \
+   && echo "$s_gain" | grep -q '^\[:shadowed 2\]$' \
+   && echo "$s_drop" | grep -q '^threw .*slib.core/w'; then
+  echo "PASS: (x2) a var an inert dep gains or drops reaches its consumer"; pass=$((pass+1))
+else
+  echo "FAIL: (x2) warm=$(echo "$s_warm" | tail -1) gain=$(echo "$s_gain" | tail -1) drop=$(echo "$s_drop" | tail -1)"
+  fails=$((fails+1))
+fi
+rm -rf "$cache_s" "$slib"
+
 # --- Phase 7: async fasl compilation ------------------------------------------
 # A miss's fasl compiles in a background worker of the running binary; the run
 # itself must not wait. On by default, and JOLT_AOT_ASYNC=0 must put the compile
@@ -785,7 +816,29 @@ else
     echo "FAIL: (z2) out=$(echo "$z_off" | tail -1) queued=$(echo "$z_off" | grep -c 'queued') so=$z_off_so"
     fails=$((fails+1))
   fi
-  rm -rf "$cache_z" "$cache_z2" "$alib"
+  # A long-running program that misses again after the worker has gone idle:
+  # the worker must still be there to take the job (it does not idle out while
+  # its parent lives), and it removes its manifest once the parent is gone.
+  printf '(ns alib.late)\n(defn val [] 8)\n' > "$alib/src/alib/late.clj"
+  cache_z3="$(mktemp -d)"
+  env -u JOLT_AOT_ASYNC JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_z3" JOLT_QUIET=1 "$async_bin" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'alib/alib {:local/root \"$alib\"}}})
+    (require 'alib.core) (Thread/sleep 12000) (require 'alib.late)" >/dev/null 2>&1 || true
+  i=0
+  while [ "$i" -lt 60 ]; do
+    [ "$(find "$cache_z3" -name 'alib.late-*.so' | wc -l | tr -d ' ')" -ge 1 ] \
+      && [ "$(find "$cache_z3" -name 'aot-jobs-*.edn' | wc -l | tr -d ' ')" -eq 0 ] && break
+    sleep 0.25; i=$((i+1))
+  done
+  z3_so="$(find "$cache_z3" -name 'alib.late-*.so' | wc -l | tr -d ' ')"
+  z3_mf="$(find "$cache_z3" -name 'aot-jobs-*.edn' | wc -l | tr -d ' ')"
+  if [ "$z3_so" -ge 1 ] && [ "$z3_mf" -eq 0 ]; then
+    echo "PASS: (z3) a miss after the worker idled still compiles; the manifest is removed"; pass=$((pass+1))
+  else
+    echo "FAIL: (z3) late fasl=$z3_so manifests-left=$z3_mf log=$(cat "$cache_z3"/*/*/aot-jobs-*.log 2>/dev/null | head -3)"
+    fails=$((fails+1))
+  fi
+  rm -rf "$cache_z" "$cache_z2" "$cache_z3" "$alib"
 fi
 
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing

@@ -438,8 +438,8 @@ in that effective root.
   build` (direct-linked/inferred) always keeps the conservative whole-closure key.
 - **`JOLT_AOT_ASYNC=0`** — compile AOT cache misses in-process instead of in a
   background worker. On by default for a built jolt: the run that missed does not
-  wait, and the fasl is ready for the next one (the worker exits once its parent
-  is gone, or after ~10s without a job). Source mode (`bin/jolt`) has no
+  wait, and the fasl is ready for the next one (the worker finishes its jobs and
+  exits once its parent is gone). Source mode (`bin/jolt`) has no
   spawnable jolt and always compiles in process.
 
 ## REPL and editor integration

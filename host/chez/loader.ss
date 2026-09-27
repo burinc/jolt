@@ -912,8 +912,12 @@
 ;; through its var cell at RUNTIME — with direct-linking and whole-program
 ;; inference both off (the plain `jolt run` posture), the emitter never binds or
 ;; splices a dependency's procedure — so a dependency defining none of those
-;; compile-time things cannot change a consumer's emitted code, and the
-;; consumer's key need not fold that dependency at all.
+;; compile-time things changes a consumer's emitted code only through WHICH
+;; vars it has: a qualified reference to a var that is gone is a compile error,
+;; and under `:refer :all`/`:use` a var the dependency gains can shadow a bare
+;; symbol that resolved to clojure.core before. Such a dependency contributes
+;; the digest of its var names (its "surface"), not of its source, so a body
+;; edit leaves its consumers' keys alone and adding or removing a var does not.
 ;;
 ;; The conservative closure stays for every posture where a dependency's
 ;; compiled body CAN be baked into a consumer: `jolt build` (direct-link and/or
@@ -931,12 +935,13 @@
 ;; The ordering problem: a consumer's key is computed BEFORE its deps load, so an
 ;; edited dependency has no `.ct` for its new source hash yet — the moment the
 ;; narrowing would help most, the flag is unknown. The consumer's own sidecar
-;; (`<base-for-own>.cti`) records which of its direct deps contributed the inert
-;; constant when it was compiled. A dep with a missing flag that appears there is
-;; assumed inert again (the key stays stable across the edit), and a HIT is then
-;; verified after the artifact's own requires have loaded the deps: every assumed
-;; dep must now read inert, or the artifact was compiled against a dependency
-;; whose compile-time surface has since moved (gained/lost a macro, record, …)
+;; (`<base-for-own>.cti`) records which of its direct deps were folded by surface
+;; when it was compiled, and the surface each had. A dep with a missing flag that
+;; appears there is assumed to have that surface still (the key stays stable
+;; across the edit), and a HIT is then verified after the artifact's own
+;; requires have loaded the deps: every assumed dep must now be inert with the
+;; recorded surface, or the artifact was compiled against a dependency whose
+;; compile-time surface has since moved (gained/lost a var, macro, record, …)
 ;; and is discarded and recompiled from source. So an edit to an inert namespace
 ;; recompiles that namespace alone; an edit that changes a compile-time surface
 ;; invalidates its consumers exactly as before.
@@ -954,13 +959,29 @@
        (not hc-optimize?)
        (not (ldr-build-aot-cache?))))
 (define (aot-ct-sidecar base) (string-append base ".ct"))
-(define (aot-write-ct! base relevant?)
+;; The var names a namespace interns, with the private flag (a consumer's
+;; reference to a private var does not compile), as one hex digest. Asked after
+;; the capture load, so it is what the namespace's top levels defined.
+(define (aot-ns-surface name)
+  (let ((names (sort string<?
+                     (fold-left (lambda (acc c)
+                                  (if (var-cell-defined? c)
+                                      (cons (string-append (var-cell-name c)
+                                                           (if (var-private? c) " p" ""))
+                                            acc)
+                                      acc))
+                                '() (ns-cells-list name)))))
+    (number->string
+      (fold-left (lambda (h n) (aot-hash-mix h (aot-content-hash n))) 19 names)
+      16)))
+(define (aot-write-ct! base relevant? surface)
   (guard (e (else #f))
     (let ((out (open-output-file (aot-ct-sidecar base) 'replace)))
-      (put-string out (if relevant? "1\n" "0\n"))
+      (put-string out (if relevant? "1\n" (string-append "0 " surface "\n")))
       (close-port out))))
 ;; The compile-time state of a namespace, keyed by its CURRENT source hash:
-;;   inert    — its artifact says it defines nothing a consumer's compile bakes in
+;;   a string — inert: its artifact says it defines nothing a consumer's compile
+;;              bakes in beyond its var names; the string is their digest
 ;;   relevant — it defines (or may define) macros/records/protocols/forwarded vars
 ;;   unknown  — no artifact for this exact source (just edited, never compiled)
 (define aot-ct-state-memo (make-hashtable string-hash string=?))
@@ -975,49 +996,79 @@
                         (if (not (file-exists? p))
                             'unknown
                             (let ((s (read-file-string p)))
-                              (if (and (fx>? (string-length s) 0)
-                                       (char=? #\0 (string-ref s 0)))
-                                  'inert 'relevant)))))))
+                              (cond
+                                ((and (fx>? (string-length s) 0)
+                                      (char=? #\1 (string-ref s 0)))
+                                 'relevant)
+                                ((aot-ct-inert-surface s))
+                                (else 'unknown))))))))
           (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-ct-state-memo name v))
           v))))
-;; The direct deps a compiled namespace folded as the inert constant, recorded
-;; for the next run (when their flag may be missing again). Named by the
-;; namespace's own hash, like the other sidecars.
+;; "0 <surface>" → the surface string; anything else (an older "0" with no
+;; digest included) → #f.
+(define (aot-ct-inert-surface s)
+  (let ((n (string-length s)))
+    (and (fx>? n 2) (char=? #\0 (string-ref s 0)) (char=? #\space (string-ref s 1))
+         (let loop ((e 2))
+           (if (or (fx=? e n) (char=? #\newline (string-ref s e)))
+               (and (fx>? e 2) (substring s 2 e))
+               (loop (fx+ e 1)))))))
+;; The direct deps a compiled namespace folded by surface, each with the surface
+;; it folded ("<dep> <surface>" lines), recorded for the next run (when their
+;; flag may be missing again). Named by the namespace's own hash, like the other
+;; sidecars.
 (define (aot-cti-sidecar base) (string-append base ".cti"))
-(define (aot-write-cti! base names)
+(define (aot-write-cti! base pairs)
   (guard (e (else #f))
     (let ((out (open-output-file (aot-cti-sidecar base) 'replace)))
-      (for-each (lambda (n) (put-string out n) (put-string out "\n"))
-                (sort string<? names))
+      (for-each (lambda (pr)
+                  (put-string out (car pr)) (put-string out " ")
+                  (put-string out (cdr pr)) (put-string out "\n"))
+                (sort (lambda (a b) (string<? (car a) (car b))) pairs))
       (close-port out))))
+;; The recorded .cti as an alist dep → surface.
 (define aot-assumed-memo (make-hashtable string-hash string=?))
 (define (aot-assumed-inert name own)
   (or (hashtable-ref aot-assumed-memo name #f)
-      (let ((v (aot-read-dep-list (aot-cti-sidecar (aot-base-for-own name own)))))
+      (let ((v (fold-right
+                 (lambda (line acc)
+                   (let ((sp (let loop ((i 0))
+                               (cond ((fx=? i (string-length line)) #f)
+                                     ((char=? #\space (string-ref line i)) i)
+                                     (else (loop (fx+ i 1)))))))
+                     (if (and sp (fx>? sp 0) (fx<? (fx+ sp 1) (string-length line)))
+                         (cons (cons (substring line 0 sp)
+                                     (substring line (fx+ sp 1) (string-length line)))
+                               acc)
+                         acc)))
+                 '()
+                 (aot-read-dep-list (aot-cti-sidecar (aot-base-for-own name own))))))
         (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-assumed-memo name v))
         v)))
-;; Did DEP contribute the inert constant to a key computed with ASSUMED (the
-;; recorded list of the namespace being keyed) in force?
-(define (aot-dep-constant? dep assumed)
+;; The surface DEP contributes to a key computed with ASSUMED (the recorded
+;; alist of the namespace being keyed) in force, or #f when it contributes its
+;; whole digest.
+(define (aot-dep-surface dep assumed)
   (and (aot-narrow?)
-       (case (aot-ct-state dep)
-         ((inert) #t)
-         ((relevant) #f)
-         (else (and (member dep assumed) #t)))))
+       (let ((st (aot-ct-state dep)))
+         (cond ((string? st) st)
+               ((eq? st 'relevant) #f)
+               (else (let ((a (assoc dep assumed))) (and a (cdr a))))))))
 ;; The digest a consumer folds for one dependency. An inert dependency
-;; contributes a constant; everything else keeps its whole compiled contribution.
+;; contributes its surface; everything else keeps its whole compiled contribution.
 (define (aot-dep-contribution dep assumed)
-  (if (aot-dep-constant? dep assumed)
-      17
-      (aot-ns-digest dep)))
+  (let ((sf (aot-dep-surface dep assumed)))
+    (if sf
+        (aot-hash-mix 17 (aot-content-hash sf))
+        (aot-ns-digest dep))))
 ;; After a HIT, the artifact's own requires have loaded its deps: every dep the
-;; key ASSUMED inert must read inert now, or the artifact predates a change to
-;; that dep's compile-time surface. 'unknown still means the dep never loaded —
-;; equally untrustworthy.
+;; key ASSUMED (dep . surface) must now read inert with that same surface, or the
+;; artifact predates a change to that dep's compile-time surface. 'unknown still
+;; means the dep never loaded — equally untrustworthy.
 (define (aot-assumptions-hold? assumed-now)
   (let loop ((ds assumed-now))
     (cond ((null? ds) #t)
-          ((eq? (aot-ct-state (car ds)) 'inert) (loop (cdr ds)))
+          ((equal? (aot-ct-state (caar ds)) (cdar ds)) (loop (cdr ds)))
           (else #f))))
 
 ;; --- compiling the fasl off the startup path ----------------------------------
@@ -1027,16 +1078,16 @@
 ;; cascade. Each miss is instead handed to one background worker — a detached
 ;; child of this executable reading job lines from a manifest as the parent
 ;; appends them — started on the first miss of the process and exited once the
-;; parent is gone and no job has arrived for ~10s. JOLT_AOT_ASYNC=0 opts back
+;; parent is gone and its jobs are done. JOLT_AOT_ASYNC=0 opts back
 ;; into the in-process compile. Any failure — no executable to name, a non-jolt
 ;; executable (source mode's bin/jolt runs a plain Chez), an unwritable manifest,
 ;; a host with no POSIX spawn — falls back to compiling here, so a run
 ;; never depends on the worker's machinery.
 ;;
 ;; Nothing waits on the worker: a program that exits first leaves it compiling
-;; the cache it will read next time. A worker that idles out between two misses
-;; loses only jobs already handed to it (their namespaces miss again next run);
-;; the parent never tracks completion, so there is no protocol to get wrong.
+;; the cache it will read next time. A job a worker could not compile (or a
+;; worker killed mid-job) only misses again next run; the parent never tracks
+;; completion, so there is no protocol to get wrong.
 (define (aot-cstring bv)
   (let loop ((i 0))
     (if (or (fx=? i (bytevector-length bv)) (fx=? 0 (bytevector-u8-ref bv i)))
@@ -1123,9 +1174,13 @@
                            (and (pair? x) (string? (car x)) (pair? (cdr x))
                                 (string? (cadr x)) x)))))
               (loop (cdr lines) (if job (cons job acc) acc)))))))
-;; Entry for `jolt --aot-worker MANIFEST`: compile every job as it appears, at
-;; most every 50ms, and exit once the parent is gone or ~10s pass with none (the
-;; parent starts another if it has more to hand over; see the note above).
+;; Entry for `jolt --aot-worker MANIFEST`: compile every job as it appears and
+;; exit once the parent is gone and every job it wrote is done. The worker does
+;; NOT exit on idleness while the parent lives: the parent keeps one open port to
+;; its manifest for its whole life and never starts a second worker, so a job
+;; appended after an idle exit would be lost, and with it the cache for every
+;; namespace a long-running program requires late. An idle worker polls from
+;; 50ms backing off to ~1s, so it costs one small read a second.
 ;;
 ;; The parent's pid is in the manifest's name (aot-jobs-<pid>.edn) — it wrote
 ;; that file, and it is the one that keeps appending to it. kill(pid, 0) is the
@@ -1145,6 +1200,14 @@
   (guard (e (else #f))
     (let ((f (jolt-foreign-proc-safe "kill" '(int int) 'int)))
       (and f (fx=? 0 (f pid 0))))))
+;; The manifest and an empty log go with the worker: each run that missed has
+;; its own pair, and nothing else reads them once the parent is gone.
+(define (aot-worker-cleanup! manifest)
+  (guard (e (else #f)) (delete-file manifest #f))
+  (let ((log (string-append manifest ".log")))
+    (guard (e (else #f))
+      (when (and (file-exists? log) (fx=? 0 (string-length (read-file-string log))))
+        (delete-file log #f)))))
 (define (aot-compile-worker manifest)
   (let ((owner (aot-manifest-owner manifest)))
     (let loop ((done 0) (idle 0))
@@ -1153,14 +1216,20 @@
           ((> (length jobs) done)
            (aot-run-job! (list-ref jobs done))
            (loop (fx+ done 1) 0))
-          ;; the parent is gone: no job can arrive after it
-          ((and owner (not (aot-proc-alive? owner))) #t)
-          ((fx>=? idle 200) #t)
-          ;; make-time is (type NANOSECONDS seconds): 50ms. The reversed reading
-          ;; slept for a year and a half — and with it the whole async cache, since
-          ;; a worker that never wakes never sees the jobs appended after its first
+          ;; the parent is gone: no job can arrive after it, and the read above
+          ;; came after its last flush
+          ((and owner (not (aot-proc-alive? owner)))
+           (aot-worker-cleanup! manifest))
+          ;; no owner to watch (a manifest not named by a pid): the old idle
+          ;; window, ~10s at the capped poll
+          ((and (not owner) (fx>=? idle 20)) #t)
+          ;; make-time is (type NANOSECONDS seconds). The reversed reading slept
+          ;; for a year and a half — and with it the whole async cache, since a
+          ;; worker that never wakes never sees the jobs appended after its first
           ;; look at the manifest.
-          (else (sleep (make-time 'time-duration 50000000 0)) (loop done (fx+ idle 1))))))))
+          ;; The nanosecond field must stay below 1e9, so the 1s cap is 950ms.
+          (else (sleep (make-time 'time-duration (fxmin 950000000 (fx* 50000000 (fx+ idle 1))) 0))
+                (loop done (fx+ idle 1))))))))
 (def-var! "jolt.host" "aot-compile-worker"
   (lambda (manifest) (aot-compile-worker (jolt-str-render-one manifest)) jolt-nil))
 
@@ -1522,9 +1591,13 @@
           ;; constant, so a later run whose dep flags are missing again can make the
           ;; same assumption and then VERIFY it after a hit (aot-assumptions-hold?).
           (when (aot-narrow?)
-            (aot-write-ct! (aot-base-for-own name own) (aot-ct-relevant? name))
+            (aot-write-ct! (aot-base-for-own name own) (aot-ct-relevant? name)
+                           (aot-ns-surface name))
             (aot-write-cti! (aot-base-for-own name own)
-                            (filter (lambda (d) (aot-dep-constant? d assumed)) deps))
+                            (fold-right (lambda (d acc)
+                                          (let ((sf (aot-dep-surface d assumed)))
+                                            (if sf (cons (cons d sf) acc) acc)))
+                                        '() deps))
             (jolt-with-mutex ldr-tbl-mu
               (hashtable-delete! aot-ct-state-memo name)
               (hashtable-delete! aot-assumed-memo name)))
@@ -1703,9 +1776,11 @@
             ;; deps the key is folding as a constant only because their current flag
             ;; is missing and the recorded assumption says inert — the ones a HIT
             ;; has to verify after the artifact's requires have loaded them.
-            (assumed-now (filter (lambda (d) (and (eq? (aot-ct-state d) 'unknown)
-                                                  (member d assumed)))
-                                 deps)))
+            (assumed-now (fold-right
+                           (lambda (d acc)
+                             (let ((a (and (eq? (aot-ct-state d) 'unknown) (assoc d assumed))))
+                               (if a (cons a acc) acc)))
+                           '() deps)))
        (if (file-exists? so)
            (begin (aot-info (string-append "hit " name))
                   (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
