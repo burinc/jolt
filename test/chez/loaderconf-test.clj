@@ -866,6 +866,41 @@
       (chk "and reads that resource, not the request name"
            (str/includes? (slurp s) "(ns jolt.loader")))))
 
+;; --- 37. the root never answers a name a context is claiming ----------------
+;; The root hides a context's namespace, and "does a context own it" and "is it
+;; installed" are two reads. A context claims the name before it creates the
+;; namespace, so reading them in the other order let a claim land in between:
+;; the root answered the context's half-built namespace as the host's, and a
+;; second context loading the same name linked it — with vars missing, since
+;; the snapshot ran mid-evaluation (case 13 threw nil-as-IFn once under memory
+;; pressure). This parks a root lookup between the two reads through the
+;; private seam, so the interleaving is pinned instead of left to the scheduler.
+(defcase 37 "a root lookup racing a private load answers nothing of it"
+  (let [d (write! (root-dir "claimrace") "libcr.clj" "(ns libcr) (defn who [] :private)")
+        orig @#'l/private-ns?]
+    (doseq [req [{:kind :ns :name "libcr"} {:kind :var :name "libcr/who"}]]
+      (let [ctx (l/classpath [d] {:parent (l/root)})
+            spy-thread (promise) parked (promise) resume (promise)]
+        (with-redefs [l/private-ns?
+                      (fn [nm]
+                        (let [r (orig nm)]
+                          (when (and (= nm "libcr")
+                                     (identical? (Thread/currentThread) @spy-thread)
+                                     (not (realized? parked)))
+                            (deliver parked true)
+                            (deref resume 5000 nil))
+                          r))]
+          (let [spy (future
+                      (deliver spy-thread (Thread/currentThread))
+                      (l/find (l/root) req))]
+            ;; with a correct ordering the lookup may finish without parking
+            (deref parked 2000 nil)
+            (l/load ctx {:kind :ns :name "libcr"})
+            (deliver resume true)
+            (chk (str "the root answers no " (name (:kind req)) " a context owns")
+                 (empty? @spy))))
+        (l/unload! ctx)))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])
