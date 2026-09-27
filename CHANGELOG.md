@@ -126,6 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- nREPL `eval` and `load-file` send output as it is printed, each flush (every
+  `println`) its own `out` or `err` message, instead of all of it in one message
+  just before the value (#1153). `jolt.nrepl/evaluate` takes an optional map
+  `{:out f :err f}` of callbacks that do the same for eval middleware; with two
+  arguments it still captures `*out*` and returns it whole.
 - `jolt CMD --help` (or `-h`) prints that command's usage for every built-in
   command. None of them knew the flag: `nrepl-server --help` dropped it and started
   a server on the default port, `repl --help` started a REPL, and `run`, `build`

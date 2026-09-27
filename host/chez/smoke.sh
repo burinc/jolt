@@ -1970,6 +1970,14 @@ check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a 
 # actually relies on. POSIX only — Windows has no FD_CLOEXEC (it controls
 # inheritance with HANDLE_FLAG_INHERIT), so there this asserts nothing rather
 # than asserting the wrong thing.
+# nREPL eval streams *out* as it is flushed (#1153): the eval itself sees the
+# chunk its first println sent before it returns, and the built-in op sends
+# each flush as its own `out` ahead of the value. A trailing print that never
+# flushed still goes out before `done`. The two-argument evaluate still
+# captures and returns :out whole, for middleware written against it.
+check '(do (require (quote jolt.nrepl)) (def seen (atom [])) (let [r (jolt.nrepl/evaluate "(println :a) (let [n (count @user/seen)] (println :b) n)" "user" {:out #(swap! seen conj %)})] [(:value r) (:out r) @seen]))' '["1" "" [":a\n" ":b\n"]]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(print \"a\") (println \"b\") (print \"c\") :v" :reply #(swap! sent conj %)}) (mapv #(or (get % "out") (get % "value")) @sent)))' '["ab\n" "c" ":v"]'
+check '(do (require (quote jolt.nrepl)) (:out (jolt.nrepl/evaluate "(println 1) 2" "user")))' '"1\n"'
 check '(do (require (quote jolt.nrepl)) (if @(var jolt.nrepl/windows?) :close-on-exec (let [fd ((var jolt.nrepl/listen-socket) 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
 
 # jolt.ffi/load-library's per-OS map form — documented since the FFI docs
