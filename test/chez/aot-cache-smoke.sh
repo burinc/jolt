@@ -888,6 +888,50 @@ else
 fi
 rm -rf "$cache_aa"
 
+# --- (ad) a Maven release jar is keyed by stat, not by reading it ------------
+# A release artifact in the local Maven repository never changes in place, so
+# its entries' keys are kept per (jar, mtime) and a warm run reads no source at
+# all. A SNAPSHOT is republished under the same path and keeps full hashing, and
+# a jar rewritten in place (a repaired download) has a new mtime and is re-read.
+ad_m2="$tmp/ad-m2"
+for v in 1.0.0 1.1.0-SNAPSHOT; do
+  mkdir -p "$ad_m2/exp/exp/$v"
+  cp "$aa/exp.jar" "$ad_m2/exp/exp/$v/exp-$v.jar"
+  printf '<project><modelVersion>4.0.0</modelVersion><groupId>exp</groupId><artifactId>exp</artifactId><version>%s</version></project>\n' "$v" \
+    > "$ad_m2/exp/exp/$v/exp-$v.pom"
+done
+cache_ad="$(mktemp -d)"
+adrun() {
+  JOLT_MAVEN_REPOSITORY="$ad_m2" JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ad" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:mvn/version \"$1\"}}})
+    (require 'exp.top) (println (exp.top/answer))" 2>&1
+}
+adrun 1.0.0 >/dev/null
+ad_rel="$(adrun 1.0.0)"
+adrun 1.1.0-SNAPSHOT >/dev/null
+ad_snap="$(adrun 1.1.0-SNAPSHOT)"
+if echo "$ad_rel" | grep -q '^5$' && echo "$ad_rel" | grep -q 'hit exp.dep' \
+   && [ "$(echo "$ad_rel" | grep -c 'hash exp' || true)" -eq 0 ] \
+   && echo "$ad_snap" | grep -q '^5$' \
+   && [ "$(echo "$ad_snap" | grep -c 'hash exp' || true)" -eq 2 ]; then
+  echo "PASS: (ad) a release jar warm-starts on stat alone; a SNAPSHOT still hashes"; pass=$((pass+1))
+else
+  echo "FAIL: (ad) release: out=$(echo "$ad_rel" | tail -1) hashed=$(echo "$ad_rel" | grep -c 'hash exp' || true) (want 0); snapshot: out=$(echo "$ad_snap" | tail -1) hashed=$(echo "$ad_snap" | grep -c 'hash exp' || true) (want 2)"
+  fails=$((fails+1))
+fi
+# the release jar rewritten in place with new content: a new mtime, a new read
+sleep 1
+printf '(ns exp.dep)\n(defn v [] 6)\n' > "$aa/dep6.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$ad_m2/exp/exp/1.0.0/exp-1.0.0.jar" \
+  "exp/dep.clj=$aa/dep6.clj" "exp/top.clj=$aa/src/exp/top.clj" >/dev/null 2>&1 || true
+ad_new="$(adrun 1.0.0)"
+if echo "$ad_new" | grep -q '^6$'; then
+  echo "PASS: (ad2) a release jar rewritten in place is read again"; pass=$((pass+1))
+else
+  echo "FAIL: (ad2) after rewriting the release jar: out=$(echo "$ad_new" | tail -1) (want 6)"; fails=$((fails+1))
+fi
+rm -rf "$cache_ad" "$ad_m2"
+
 # --- (ab) a reload in the same process still sees an edit --------------------
 # The key a load reuses from the dep walk is only good for the source it was read
 # from: dropping the namespace from *loaded-libs* and requiring it again after an

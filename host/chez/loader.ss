@@ -915,8 +915,9 @@
 ;; the previous fasl. Do not "optimize" this back to a sampling hash: the whole
 ;; cost is one linear pass over source jolt is about to compile anyway.
 (define (aot-cache-key bv)
-  (string-append (number->string (bytevector-length bv) 16) "-"
-                 (number->string (aot-bytes-hash bv) 16)))
+  (aot-cache-key-of (bytevector-length bv) (aot-bytes-hash bv)))
+(define (aot-cache-key-of len hash)
+  (string-append (number->string len 16) "-" (number->string hash 16)))
 (define (aot-info msg)
   (when (getenv "JOLT_DEBUG")
     (display (string-append "[jolt.aot] " msg "\n") (current-error-port))))
@@ -1313,9 +1314,105 @@
 (define (aot-file-digest path)
   (guard (e (else 0))
     (if (if (jar-path? path) (jar-path-exists? path) (file-exists? path))
-        (let ((bv (read-file-bytes path)))
-          (aot-hash-mix (bytevector-length bv) (aot-bytes-hash bv)))
+        (let ((lh (aot-content-of path)))
+          (aot-hash-mix (car lh) (cdr lh)))
         0)))
+;; PATH's (length . FNV-1a hash), from the release-jar store when PATH is an
+;; entry of one (below), else from reading it.
+(define (aot-content-of path)
+  (let* ((stamp (aot-source-stamp path))
+         (known (aot-release-entry-lookup path stamp)))
+    (or known
+        (let* ((bv (read-file-bytes path))
+               (lh (cons (bytevector-length bv) (aot-bytes-hash bv))))
+          (aot-release-entry-record! path stamp lh)
+          lh))))
+
+;; --- release jars, keyed by stat ----------------------------------------------
+;; A Maven release artifact is never republished under the same path, so what
+;; its entries hash to is fixed once read. jolt.deps names those roots
+;; (add-immutable-roots!), and for an entry of one the (length . hash) is kept on
+;; disk per jar and modification time — a warm start then stats the jar and
+;; reads none of it, where it otherwise inflated and hashed every source of the
+;; closure only to learn that nothing changed. A jar rewritten in place (a
+;; repaired download) has a new mtime and a new store. Everything else — a
+;; SNAPSHOT, a :local/root jar, a directory — keeps full content hashing.
+(define ldr-immutable-roots (make-hashtable string-hash string=?))
+(def-var! "jolt.host" "add-immutable-roots!"
+  (lambda (roots)
+    (jolt-with-mutex ldr-tbl-mu
+      (for-each (lambda (r) (when (string? r) (hashtable-set! ldr-immutable-roots r #t)))
+                (seq->list roots)))
+    jolt-nil))
+;; FILE's jar and entry when FILE is an entry of a release jar, else #f.
+(define (aot-release-entry file)
+  (let ((parts (jar-path-split file)))
+    (and parts
+         (let ((jar (file-url->path (car parts))))
+           (and (hashtable-ref ldr-immutable-roots jar #f)
+                (cons jar (uri-decode-lenient (cdr parts))))))))
+;; jar -> #(stamp table), the table entry -> (length . hash)
+(define aot-release-stores (make-hashtable string-hash string=?))
+(define (aot-release-store-path jar stamp)
+  (string-append (aot-cache-subdir) "/jars/" (aot-cache-sanitize jar)
+                 "-" (number->string stamp 16) ".keys"))
+;; One line per entry: length and hash in hex, then the entry name, which is last
+;; because it may hold spaces. A line that doesn't parse is skipped; its entry is
+;; just read again.
+(define (aot-release-store-read path)
+  (let ((tbl (make-hashtable string-hash string=?)))
+    (for-each
+      (lambda (line)
+        (let* ((sp1 (aot-index-of line #\space 0))
+               (sp2 (and sp1 (aot-index-of line #\space (fx+ sp1 1))))
+               (len (and sp2 (string->number (substring line 0 sp1) 16)))
+               (hash (and sp2 (string->number (substring line (fx+ sp1 1) sp2) 16))))
+          (when (and len hash)
+            (hashtable-set! tbl (substring line (fx+ sp2 1) (string-length line))
+                            (cons len hash)))))
+      (aot-read-dep-list path))
+    tbl))
+(define (aot-index-of s c from)
+  (let loop ((i from))
+    (cond ((fx>=? i (string-length s)) #f)
+          ((char=? (string-ref s i) c) i)
+          (else (loop (fx+ i 1))))))
+(define (aot-release-store jar stamp)
+  (let ((st (hashtable-ref aot-release-stores jar #f)))
+    (if (and st (eqv? (vector-ref st 0) stamp))
+        (vector-ref st 1)
+        (let ((tbl (aot-release-store-read (aot-release-store-path jar stamp))))
+          (jolt-with-mutex ldr-tbl-mu
+            (hashtable-set! aot-release-stores jar (vector stamp tbl)))
+          tbl))))
+(define (aot-release-entry-lookup file stamp)
+  (and (fixnum? stamp)
+       (let ((je (aot-release-entry file)))
+         (and je (hashtable-ref (aot-release-store (car je) stamp) (cdr je) #f)))))
+;; Remember an entry read from a release jar, and rewrite the jar's store (temp +
+;; rename, so a concurrent reader sees the old store or the new one). Best
+;; effort: a store that can't be written only means reading the entry again.
+(define (aot-release-entry-record! file stamp lh)
+  (when (fixnum? stamp)
+    (let ((je (aot-release-entry file)))
+      (when je
+        (let ((tbl (aot-release-store (car je) stamp))
+              (path (aot-release-store-path (car je) stamp)))
+          (jolt-with-mutex ldr-tbl-mu
+            (hashtable-set! tbl (cdr je) lh)
+            (guard (e (else #f))
+              (aot-mkdir-p (path-parent path))
+              (let* ((tmp (string-append path ".tmp" (number->string (get-process-id))))
+                     (out (open-output-file tmp 'replace)))
+                (let-values (((ks vs) (hashtable-entries tbl)))
+                  (vector-for-each
+                    (lambda (k v)
+                      (put-string out (number->string (car v) 16)) (put-string out " ")
+                      (put-string out (number->string (cdr v) 16)) (put-string out " ")
+                      (put-string out k) (put-string out "\n"))
+                    ks vs))
+                (close-port out)
+                (rename-replace! tmp path)))))))))
 ;; The PATH is folded alongside its content, so gaining or losing an entry moves
 ;; the digest even when the contents happen to coincide. Sorted, like the deps, so
 ;; the result doesn't depend on the order the reads happened to be recorded in.
@@ -1368,11 +1465,19 @@
           (sa-file-mtime-ms (if parts (file-url->path (car parts)) file))))))
 ;; Read FILE and key it: (values key bytes stamp). The stamp is taken before the
 ;; read, so a write racing the read leaves a stamp that no longer matches.
+;; An entry of a release jar whose key is already stored answers without a read,
+;; and #f in place of the bytes.
 (define (aot-read-own-key name file)
-  (aot-info (string-append "hash " name))
   (let* ((stamp (aot-source-stamp file))
-         (bv (ldr-read-source-bytes file)))
-    (values (aot-cache-key bv) bv stamp)))
+         (known (aot-release-entry-lookup file stamp)))
+    (if known
+        (values (aot-cache-key-of (car known) (cdr known)) #f stamp)
+        (begin
+          (aot-info (string-append "hash " name))
+          (let* ((bv (ldr-read-source-bytes file))
+                 (lh (cons (bytevector-length bv) (aot-bytes-hash bv))))
+            (aot-release-entry-record! file stamp lh)
+            (values (aot-cache-key-of (car lh) (cdr lh)) bv stamp))))))
 ;; Record NAME's key. A key that MOVED within this process (the source was edited
 ;; and reloaded) leaves every digest folded from the old one stale, so those memos
 ;; go with it and the next consult recomputes them.
@@ -1423,10 +1528,10 @@
         (values (vector-ref m 0)
                 (delay (let-values (((k bv stamp) (aot-read-own-key name file)))
                          (aot-remember-own-key! name k file stamp)
-                         (cons k (ldr-source-bytes->string file bv)))))
+                         (cons k (ldr-source-bytes->string file (or bv (ldr-read-source-bytes file)))))))
         (let-values (((k bv stamp) (aot-read-own-key name file)))
           (aot-remember-own-key! name k file stamp)
-          (values k (delay (cons k (ldr-source-bytes->string file bv))))))))
+          (values k (delay (cons k (ldr-source-bytes->string file (or bv (ldr-read-source-bytes file))))))))))
 (define (aot-base-for-own name own) (string-append (aot-cache-subdir) "/"
                                                    (aot-cache-sanitize name) "-" own))
 ;; Fold the dep keys into one integer. Sorted, so the digest doesn't depend on the
