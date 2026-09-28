@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`seq` on a `PersistentQueue` is O(1) (#1172).** It built the whole element
+  list before returning the first cell, so `first`, `rest` and `next` on a
+  queue cost its size. The seq now walks the front and then the reversed rear
+  lazily, one cell at a time.
 - **A warm AOT-cache start reads each namespace's source once (#1161).** A
   dependency's key was computed while its consumer folded the dep digest and
   then again, from a second read, when the dependency loaded, so every

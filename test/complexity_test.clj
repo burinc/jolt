@@ -273,6 +273,32 @@
              #(touch m2)
              "persistent! is rebuilding the whole map instead of freezing only the nodes the writes claimed (transients.ss jolt-persistent!, collections.ss enode-freeze)"))
 
+    ;; A PersistentQueue's seq walks its front list and then its rear, and hands
+    ;; back the first cell without touching the rest. Building the whole element
+    ;; list up front made (first q) -- and every seq/rest/next over a queue --
+    ;; linear in the queue: a BFS that peeks via first slowed with its frontier.
+    ;; Both shapes: conj'd only (one front element, the rest in the rear) and
+    ;; popped once (everything moved to the front).
+    (let [q-of (fn [n] (into clojure.lang.PersistentQueue/EMPTY (range n)))
+          q1 (q-of n1)         q2 (q-of n2)
+          p1 (pop (conj q1 n1)) p2 (pop (conj q2 n2))]
+      (when-not (and (= 0 (first q1)) (= 1 (first p1)) (= 1 (second q1))
+                     (= (range n1) (seq q1)) (= (range 1 (inc n1)) (seq p1))
+                     (= n1 (count (seq q1))) (= (range 1 n1) (rest q1))
+                     (nil? (seq clojure.lang.PersistentQueue/EMPTY))
+                     (= [3] (seq (conj clojure.lang.PersistentQueue/EMPTY 3)))
+                     (= (next (conj clojure.lang.PersistentQueue/EMPTY 3)) nil))
+        (println "FAIL complexity queue-seq: wrong values before timing")
+        (System/exit 1))
+      (judge "first queue"
+             #(first q1)
+             #(first q2)
+             "seq on a PersistentQueue is building every element before returning the first (queue->seq, java/natives-queue.ss)")
+      (judge "first popped queue"
+             #(first (next p1))
+             #(first (next p2))
+             "seq on a PersistentQueue is building every element before returning the first (queue->seq, java/natives-queue.ss)"))
+
     (if (pos? @failures)
       (do (println (str "complexity: " @failures " section(s) failed"))
           (System/exit 1))
