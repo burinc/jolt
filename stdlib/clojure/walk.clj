@@ -23,6 +23,10 @@
     ; (rewrite-clj's #() reader bumps an arg-count atom during the walk, read right
     ; after) runs now, not lazily when the result is later realized.
     (seq? form) (outer (with-meta (doall (map inner form)) (meta form)))
+    ; a set, or any other collection, rebuilt from its walked elements as
+    ; Clojure's (coll? form) branch does: without it a set was never walked
+    ; into, so postwalk-replace left a set's elements alone
+    (coll? form) (outer (with-meta (into (empty form) (map inner form)) (meta form)))
     :else (outer form)))
 
 (defn postwalk
