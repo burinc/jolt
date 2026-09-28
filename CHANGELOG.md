@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.14] - 2026-09-28
+
+Android arm64 ships again as a prebuilt Termux binary, with bionic fixes for
+charsets, locales, process spawning and `Math/E`. The run-path AOT cache
+recompiles less after an edit, reads each source once, and compiles misses in a
+background worker. Fibers can be interrupted, pprint's code-dispatch lays out
+code like the reference, and closing a reader or finishing a child process no
+longer leaks descriptors.
+
 ### Added
 
 - A prebuilt **Android arm64** binary (`jolt-<ver>-aarch64-android.tar.gz`) for
@@ -23,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a value. `masked` defers interrupts over a region and `unmasked` reopens one
   inside it, like Haskell's `mask`, so cleanup after an interruptible body
   can't be torn.
+- **AOT cache misses compile in a background worker.** On a miss the namespace
+  has already been loaded; the fasl only serves later runs, so a detached child
+  of the built jolt compiles it while the program starts (atomic temp + rename;
+  a job the worker could not finish simply misses again). On by default for
+  built jolts on Linux/macOS — the worker finishes its jobs and exits after its
+  parent does — and `JOLT_AOT_ASYNC=0` restores the in-process compile. Source
+  mode's `bin/jolt` has no spawnable jolt and always compiles in process.
 
 ### Fixed
 
@@ -151,6 +167,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent closed right after `start` could still be bound in the child. Every
   spawn now waits on a close-on-exec pipe, as glibc, musl and Darwin already
   do internally.
+- **`Process.waitFor(n, unit)` returns on time.** It subtracted a 10 ms step
+  per poll instead of reading a clock, so every pause's overrun accumulated: a
+  1000 ms wait came back after ~1170 ms and 5000 ms after ~5840. It now waits
+  against a deadline and returns within a couple of milliseconds of it.
 - **`Math/PI`/`Math/E` and `clojure.math`'s are the JDK's literal constants,
   not the host libm's `atan(1)`/`exp(1)` (#1148).** bionic's `exp(1)` is one ulp
   high, so `Math/E` — and everything built on it, `jolt.infix`'s `e` among
@@ -165,7 +185,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   baseline, and the fixtures that assumed off-Android behavior or a glibc
   provisioning path branch on the platform. `ci/termux-build.sh` installs the
   libsqlite package the smoke fixture's per-OS map names.
-
 - **The run-path AOT cache narrows its key to a dependency's compile-time
   surface.** With direct-linking and whole-program inference off (plain `jolt
   run`), a dependency that defines no macros, records/types/protocols,
@@ -177,17 +196,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires have loaded, so a dependency that gained a macro invalidates it.
   `jolt build` (direct-linked/inferred) keeps the conservative key; set
   `JOLT_AOT_NARROW=0` to keep it everywhere.
-
-### Added
-
-- **AOT cache misses compile in a background worker.** On a miss the namespace
-  has already been loaded; the fasl only serves later runs, so a detached child
-  of the built jolt compiles it while the program starts (atomic temp + rename;
-  a job the worker could not finish simply misses again). On by default for
-  built jolts on Linux/macOS — the worker finishes its jobs and exits after its
-  parent does — and
-  `JOLT_AOT_ASYNC=0` restores the in-process compile. Source mode's `bin/jolt`
-  has no spawnable jolt and always compiles in process.
 
 ## [0.8.13] - 2026-09-26
 
