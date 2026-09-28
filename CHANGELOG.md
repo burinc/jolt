@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt.loader/eval-in`: evaluate a source string in a context.** `eval` and
+  `load-string` never consult the ambient loader (`with-loader`), because the
+  context-carrying rewrite is bound only while a namespace source the loader
+  itself reads compiles; a string evaluated under `with-loader` therefore
+  requires from the runtime's global roots. `(eval-in l ns-name source)`
+  evaluates SOURCE form by form in NS-NAME through L: `require`, `use`,
+  `refer`, `resolve`, `ns-resolve` and `find-var` carry the context, a
+  dependency the loader cannot serve fails `:loader/unreadable`, and the last
+  form's value is returned. A name the loader already owns is evaluated in
+  place (var cells other code links stay); an installed namespace the loader
+  does not own is refused rather than evicted; the namespace and its var links
+  are installed in the loader, so `resolve`/`find` answer them and `unload!`
+  unmaps the namespace. An `(ns NS-NAME ...)` prefix is allowed (its requires
+  are preloaded through the loader); an `ns` form for another name is refused
+  before it runs, and a form that leaves NS-NAME — `in-ns`, or a switch
+  nested in a `do` — fails `:loader/bad-request` when it returns.
+  Evaluating through a policy wrapper (`allow`, `deny`, …) owns the namespace
+  at the nearest ancestor that releases one, so the base loader's `unload!`
+  unmaps it.
+
 ## [0.8.14] - 2026-09-28
 
 Android arm64 ships again as a prebuilt Termux binary, with bionic fixes for

@@ -44,10 +44,14 @@
 
   Two tiers decide which loader answers. Linkage follows the DEFINING loader:
   code compiled for a context resolves through that context for its whole life,
-  whoever calls it and on whatever thread. Dynamic loading — `require` reached
-  through a value, `eval`, REPL forms, framework resource probes — follows the
-  AMBIENT loader, the thread parameter `with-loader` binds, which is inherited
-  by threads and fibers.
+  whoever calls it and on whatever thread. Dynamic loading follows the AMBIENT
+  loader, the thread parameter `with-loader` binds, which is inherited by
+  threads and fibers — resource and classloader lookups resolve through it,
+  and source entered in a context is `eval-in`, which evaluates a string form
+  by form with the context's require/resolve rewrite in force. Plain `eval`
+  and `load-string` are not context entry points: compilation has no defining
+  namespace to key the rewrite to, so they resolve in `*ns*` against the
+  runtime's global roots, like the reference's.
 
   ── Implementation status ────────────────────────────────────────────────
   Implemented: the protocol, the generic resolution body, the link table and
@@ -656,6 +660,23 @@
 
 (defn- private-ns? [nm] (boolean (seq (get @private-ns-owners nm))))
 
+(defn- owns-private?
+  "Does L own NS-NAME's private registration?"
+  [l ns-name]
+  (contains? (get @private-ns-owners ns-name) (:id l)))
+
+(defn- owning-loader
+  "The loader whose `unload!` releases a namespace evaluated by `eval-in`: L
+   itself when it releases one (a roots loader), else the nearest ancestor
+   that does, else L. A policy wrapper (`allow`, `deny`, `pool`) mints a loader
+   whose teardown releases nothing of its own, so a namespace evaluated
+   through one has to be owned where the teardown lives."
+  [l]
+  (loop [l l]
+    (if (or (:release-fn l) (nil? (:parent l)))
+      l
+      (recur (:parent l)))))
+
 ;; The evict-evaluate-snapshot window mutates the PROCESS-GLOBAL registry under
 ;; one name, so it is serialized by name across every loader — the per-loader
 ;; claim in load-hit only orders loads within one loader. A loader never holds
@@ -953,8 +974,8 @@
   nil)
 
 (defn current-loader
-  "The ambient loader — the one dynamic loading follows on this thread or
-   fiber. The root loader unless `with-loader` bound another."
+  "The ambient loader — the one resource and classloader lookup follows on
+   this thread or fiber. The root loader unless `with-loader` bound another."
   []
   (or *current-loader* (root)))
 
@@ -1459,6 +1480,68 @@
                 (remove-ns (symbol ns-name)))
               (throw e))))))))
 
+(defn- declared-ns-name
+  "The namespace name an `ns` form declares, or nil when F is not one. The
+   qualified spelling counts too, so `(clojure.core/ns other)` cannot slip a
+   namespace switch past `eval-in`'s check."
+  [f]
+  (when (and (seq? f) (symbol? (first f)))
+    (let [head (first f)]
+      (when (and (= "ns" (name head))
+                 (or (nil? (namespace head))
+                     (= "clojure.core" (namespace head)))
+                 (symbol? (second f)))
+        (second f)))))
+
+(defn- bad-ns-form!
+  [ns-name declared]
+  (throw (ex-info (str "eval-in evaluates in " ns-name
+                       " but the source declares namespace " declared)
+                  {:type :loader/bad-request :kind :ns :name ns-name})))
+
+(defn- read-prefix
+  "Read forms through the first `ns` form, or the whole source when there is
+   none — the same prefix a file load reads ahead, so an ns form's requires
+   can be preloaded before the private-load claim is taken."
+  [r]
+  (let [eof (Object.)]
+    (loop [xs []]
+      (let [f (read r false eof)]
+        (cond
+          (identical? eof f) xs
+          (ns-form? f) (conj xs f)
+          :else (recur (conj xs f)))))))
+
+(defn- eval-source-forms
+  "Evaluate the already-read PREFIX forms, then every remaining form of R, and
+   answer the value of the last one (nil when there is none). Forms are read
+   one at a time — after the preceding form ran — so an `ns` form's aliases
+   and refers are in force for the reader, the way a file load reads. Every
+   `ns` form must declare NS-NAME, and every form must leave `*ns*` on
+   NS-NAME: a top-level `ns` for another name is refused before it runs, and
+   a form that switches with `in-ns` (or a switch nested in a `do`) fails once
+   it returns, so the rest of the evaluation stays in the context."
+  [r prefix ns-name]
+  (let [eof (Object.)
+        eval-form (fn [f]
+                    (when-let [declared (declared-ns-name f)]
+                      (when-not (= ns-name (str declared))
+                        (bad-ns-form! ns-name declared)))
+                    (let [v (eval f)]
+                      (when-not (= ns-name (str (clojure.core/ns-name *ns*)))
+                        (throw (ex-info (str "eval-in in " ns-name
+                                             " left its namespace for "
+                                             (clojure.core/ns-name *ns*))
+                                        {:type :loader/bad-request
+                                         :kind :ns :name ns-name})))
+                      v))
+        last (reduce (fn [_ f] (eval-form f)) nil prefix)]
+    (loop [result last]
+      (let [f (read r false eof)]
+        (if (identical? eof f)
+          result
+          (recur (eval-form f)))))))
+
 (defn- source-roots-ns-load
   "The backend's namespace reader: a namespace already linked through the home
    loader is re-used, never re-evaluated — sharing by reference is the point of
@@ -1645,6 +1728,102 @@
       (preload-dep! l (namespace sym)))
     (or (resolve l {:kind :var :name (str sym)})
         (find-var sym))))
+
+(defn eval-in
+  "Evaluate SOURCE — a string of forms, read and evaluated one at a time — in
+   the namespace NS-NAME of loader L, and answer the value of the last form.
+
+   The evaluation runs in the context: a `require`, `use`, `refer`, `resolve`,
+   `ns-resolve` or `find-var` call in SOURCE compiles to its context-carrying
+   form, so it resolves through L's roots, delegate chain and policies, never
+   through the runtime's globals, and a dependency L cannot serve fails
+   :loader/unreadable. The rewrite holds while the compiling namespace is
+   NS-NAME.
+
+   NS-NAME must be a name the loader that would release it owns, or one that
+   is not installed: evaluating into an installed namespace another loader or
+   the host owns is refused rather than evicted. A second call for the same
+   NS-NAME keeps the installed namespace and evaluates in place (a REPL, not a
+   reload), so var cells other code already links stay. The namespace's link
+   and its var links are installed where its teardown lives: L when it
+   releases one (a roots loader), else the nearest ancestor that does —
+   evaluating through a policy wrapper hands the namespace to the base
+   loader's `unload!`. Links are table-local as everywhere, so `resolve` finds
+   them on the loader they were installed on (the base under a wrapper), while
+   `find` answers them through the wrapper too.
+
+   SOURCE may begin with an `(ns NS-NAME ...)` form; its requires are
+   preloaded through L before evaluation. An `ns` form read at top level for
+   any other name is refused before it runs, and a form that leaves NS-NAME
+   (via `in-ns`, or a switch nested in a `do`) fails :loader/bad-request when
+   it returns. Code that runs after such a switch inside the same form is
+   already past the gate — this is a contract check, not a sandbox.
+
+   SOURCE is read the way a source file is: host data readers apply, and
+   `*read-eval*` is the caller's, so bind it false to refuse `#=`. OPTS:
+   - :file  the value bound to `*file*` during the evaluation (default nil,
+            as `load-string` binds for a reader with no path)."
+  ([l ns-name source] (eval-in l ns-name source nil))
+  ([l ns-name source {:keys [file]}]
+   (check-live! l)
+   (when-not (string? source)
+     (throw (ex-info "eval-in needs a source string"
+                     {:type :loader/bad-request :kind :ns :name (str ns-name)})))
+   (let [ns-name (str ns-name)
+         sym (symbol ns-name)
+         owner (owning-loader l)]
+     ;; a claim is taken before the namespace is created, so the name has to be
+     ;; one create-ns accepts before anything is claimed
+     (when (or (namespace sym) (str/blank? ns-name))
+       (throw (ex-info (str "eval-in needs a simple namespace name, got "
+                            (pr-str ns-name))
+                       {:type :loader/bad-request :kind :ns :name ns-name})))
+     ;; before the source is read: a registered data reader runs during read
+     (check-live! owner)
+     (let [r (java.io.PushbackReader. (java.io.StringReader. source))
+           prefix (read-prefix r)]
+       (when-let [declared (some declared-ns-name prefix)]
+         (when-not (= ns-name (str declared))
+           (bad-ns-form! ns-name declared)))
+       (doseq [dep (required-ns-names prefix)]
+         (preload-dep! l dep)
+         (ensure-servable! l ns-name dep))
+       (with-private-load-claim
+         ns-name
+         (fn []
+           (let [installed (find-ns sym)]
+             (when (and installed (not (owns-private? owner ns-name)))
+               (throw (ex-info (str "loader " (:id owner)
+                                    " does not own namespace " ns-name
+                                    ", which is already installed; evaluate in a"
+                                    " name this loader owns or one that is not"
+                                    " installed")
+                               {:type :loader/bad-request :kind :ns :name ns-name})))
+             (when-not installed (claim-private! owner ns-name))
+             (let [n (or installed (create-ns sym))
+                   fresh? (nil? installed)]
+               (try
+                 (binding [*ns* n
+                           *file* file
+                           jolt.host/*invoke-rewrite*
+                           (context-rewriter (:id l) ns-name)]
+                   (let [result (eval-source-forms r prefix ns-name)
+                         ;; the ns link and its var links, as a source load
+                         ;; installs them: the value is the handle map the code
+                         ;; backend's ns-vars-fn reads, so `unload!` can unmap
+                         ;; the namespace, and the vars resolve even when OWNER
+                         ;; has no snapshot fn of its own.
+                         handle {:handle n :vars (ns-interns n)}
+                         hit {:kind :ns :name ns-name :loader owner}]
+                     (install-link! owner [:ns ns-name] hit handle)
+                     (doseq [[vname cell] (:vars handle)]
+                       (let [nm (str ns-name "/" vname)
+                             vhit {:kind :var :name nm :cell cell :loader owner}]
+                         (install-link! owner [:var nm] vhit cell)))
+                     result))
+                 (catch :default e
+                   (when fresh? (remove-ns sym))
+                   (throw e)))))))))))
 
 ;; --- constructors ---------------------------------------------------------
 
