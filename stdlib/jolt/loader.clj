@@ -1499,18 +1499,23 @@
                        " but the source declares namespace " declared)
                   {:type :loader/bad-request :kind :ns :name ns-name})))
 
-(defn- read-prefix
-  "Read forms through the first `ns` form, or the whole source when there is
-   none — the same prefix a file load reads ahead, so an ns form's requires
-   can be preloaded before the private-load claim is taken."
-  [r]
-  (let [eof (Object.)]
-    (loop [xs []]
-      (let [f (read r false eof)]
-        (cond
-          (identical? eof f) xs
-          (ns-form? f) (conj xs f)
-          :else (recur (conj xs f)))))))
+(defn- read-leading-ns
+  "SOURCE's first form and the reader positioned after it when that form is an
+   `ns` form, else nil. Only a leading ns form is read ahead — its requires are
+   preloaded before the private-load claim is taken — because every other form
+   has to be read inside the evaluation, in NS-NAME with the aliases the forms
+   before it installed: read ahead, `::k` and a syntax quote would resolve in
+   the caller's namespace. The peek reads with no data readers and no `#=`, so
+   a first form that is not an ns form ran nothing when it is read again."
+  [source]
+  (let [r (java.io.PushbackReader. (java.io.StringReader. source))]
+    (try
+      (let [f (binding [*read-eval* false
+                        *data-readers* {}
+                        *default-data-reader-fn* nil]
+                (read r false r))]
+        (when (declared-ns-name f) [f r]))
+      (catch :default _ nil))))
 
 (defn- eval-source-forms
   "Evaluate the already-read PREFIX forms, then every remaining form of R, and
@@ -1535,8 +1540,8 @@
                                         {:type :loader/bad-request
                                          :kind :ns :name ns-name})))
                       v))
-        last (reduce (fn [_ f] (eval-form f)) nil prefix)]
-    (loop [result last]
+        prefix-result (reduce (fn [_ f] (eval-form f)) nil prefix)]
+    (loop [result prefix-result]
       (let [f (read r false eof)]
         (if (identical? eof f)
           result
@@ -1780,8 +1785,9 @@
                        {:type :loader/bad-request :kind :ns :name ns-name})))
      ;; before the source is read: a registered data reader runs during read
      (check-live! owner)
-     (let [r (java.io.PushbackReader. (java.io.StringReader. source))
-           prefix (read-prefix r)]
+     (let [[ns-form r] (or (read-leading-ns source)
+                           [nil (java.io.PushbackReader. (java.io.StringReader. source))])
+           prefix (if ns-form [ns-form] [])]
        (when-let [declared (some declared-ns-name prefix)]
          (when-not (= ns-name (str declared))
            (bad-ns-form! ns-name declared)))
@@ -1803,8 +1809,14 @@
              (let [n (or installed (create-ns sym))
                    fresh? (nil? installed)]
                (try
+                 ;; the compiler flags are bracketed as a source load and
+                 ;; load-string bracket them, so a (set! *warn-on-reflection*
+                 ;; true) in SOURCE ends with the evaluation
                  (binding [*ns* n
                            *file* file
+                           *warn-on-reflection* *warn-on-reflection*
+                           *assert* *assert*
+                           *unchecked-math* *unchecked-math*
                            jolt.host/*invoke-rewrite*
                            (context-rewriter (:id l) ns-name)]
                    (let [result (eval-source-forms r prefix ns-name)
