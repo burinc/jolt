@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A prebuilt **Android arm64** binary (`jolt-<ver>-aarch64-android.tar.gz`) for
+  Termux, built and checked in `termux/termux-docker` on each release (#943,
+  #1148). It needs Termux's `ncurses`, `libuuid` and `libiconv`; the install
+  script picks it on Android and says which packages to add if one is missing.
+  The bionic CI job now runs the full CI gate, so the build is no longer held
+  out of releases.
 - **`jolt.fibers/interrupt!`, `masked` and `unmasked`.** `interrupt!` makes
   another fiber raise a throwable wherever it is (spinning, parked on a
   channel, in a deref, in a CPS'd go body), the way an Erlang process dies of
