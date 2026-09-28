@@ -33,7 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memoized before those namespaces had written their dependency sidecars, so
   the first run stored every artifact under a key the next run never
   computed. Each namespace compiled once more on the second run, and the reader
-  namespace itself on the third.
+  namespace itself on the third. A namespace the reader namespace requires now
+  publishes its artifact once the reader namespace's sidecars exist, so it
+  hits on the second run as well.
+- **A warm start no longer reads Maven release jars at all.** A released
+  version is never republished under the same path, so each entry's key is
+  kept per jar and modification time, and an unchanged closure from Maven
+  release jars costs a stat per jar instead of inflating and hashing every
+  source. SNAPSHOTs, `:local/root` jars and directories keep full content
+  hashing. A require's jar reads also share one open reader per archive
+  instead of opening the file per entry; nothing holds a jar open between
+  requires.
 - **A heap near its `JOLT_MAX_HEAP` ceiling no longer overshoots it during the
   ceiling's own full collection (jolt-exoj).** The collection marks the old
   generations in place, but Chez still copies sparse segments, and one
