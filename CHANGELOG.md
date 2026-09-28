@@ -29,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at the nearest ancestor that releases one, so the base loader's `unload!`
   unmaps it.
 
+### Fixed
+
+- **A closed `java.net.Socket`'s streams no longer read or write its old fd.**
+  `read` and `write` on a stream taken before `.close` went straight to the fd
+  number, which the next socket to open reuses: the stale stream took that
+  socket's bytes and sent to its peer. They now throw
+  `java.net.SocketException "Socket closed"`, as `available` already did and
+  as the JVM does; zero-length calls still answer `0` / `nil`, like the JVM's
+  (#1183).
+- **The rest of a closed `Socket` answers like the JVM's.** `getInputStream`,
+  `getOutputStream`, `connect` and `ServerSocket.accept` on a closed socket throw
+  `SocketException "Socket is closed"`, and `getLocalPort` of an unbound socket
+  is `-1` instead of a `getsockname` on an fd that may be another socket's.
+
 ## [0.8.14] - 2026-09-28
 
 Android arm64 ships again as a prebuilt Termux binary, with bionic fixes for
