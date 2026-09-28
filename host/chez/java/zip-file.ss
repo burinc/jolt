@@ -298,7 +298,11 @@
 ;; (zipdir-file-reader) and closes it with the stream.
 
 ;; A reader over a file port of its own, and the thunk that closes it.
+;; zipdir-reader-opens counts them, which is how the loader's gate sees that a
+;; require reads a jar through one reader rather than one per entry.
+(define zipdir-reader-opens 0)
 (define (zipdir-file-reader path)
+  (set! zipdir-reader-opens (+ zipdir-reader-opens 1))
   (let ((in (open-file-input-port path))
         (mu (make-mutex)))
     (values (zipdir-port-reader in mu)
@@ -347,15 +351,60 @@
              got)))
      #f #f close!)))
 
-;; The compressed bytes of ENT, from a reader opened for the call.
+;; A read scope: while one is open on this thread, whole-entry reads of an
+;; archive share one reader, opened on the first read and closed when the scope
+;; ends. The loader opens one around a require (loader.ss load-namespace*), whose
+;; entries are read in a burst: a fresh descriptor per entry was most of the
+;; non-inflate cost of a read. Outside a scope nothing holds the archive open,
+;; so a jar can be replaced between reads — Windows refuses to replace an open
+;; file. Readers are keyed by the zipdir, not the path: a jar replaced at the
+;; same path is a new zipdir (zipdir-for), and an old descriptor would read the
+;; old file.
+;;
+;; The scope closes its readers on ANY exit, a fiber park included; a resumed
+;; load that reads again just opens a new one.
+;;
+;; The parameter holds (thread-id . readers) and a scope answers only on the
+;; thread that opened it. A forked thread starts with its creator's parameter
+;; values, so a thread a namespace's top level starts would otherwise share the
+;; require's unlocked table, and once the require closed it, open readers into it
+;; that nothing closes.
+(define zipdir-read-scope (make-thread-parameter #f))
+(define (zipdir-scope-readers)
+  (let ((s (zipdir-read-scope)))
+    (and s (eqv? (car s) (get-thread-id)) (cdr s))))
+(define (call-with-zipdir-read-scope thunk)
+  (if (zipdir-scope-readers)
+      (thunk)
+      (let ((readers (make-eq-hashtable)))
+        (dynamic-wind
+          (lambda () #f)
+          (lambda () (parameterize ((zipdir-read-scope (cons (get-thread-id) readers))) (thunk)))
+          (lambda ()
+            (let-values (((ds rs) (hashtable-entries readers)))
+              (hashtable-clear! readers)
+              (vector-for-each (lambda (r) ((cdr r))) rs)))))))
+;; The reader for D in the open scope, opening it on first use.
+(define (zipdir-scoped-reader readers d)
+  (or (hashtable-ref readers d #f)
+      (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))
+        (let ((r (cons read-at! close!)))
+          (hashtable-set! readers d r)
+          r))))
+(define (zipdir-raw-bytes-via read-at! ent)
+  (let ((bv (zipdir-read-at read-at! (zipdir-data-offset read-at! ent) (zdirent-csize ent))))
+    (or bv (zip-zerror "ZipFile invalid LOC header (bad signature)"))))
+;; The compressed bytes of ENT: through the scope's reader when one is open,
+;; else from a reader opened for the call.
 (define (zipdir-raw-bytes d ent)
-  (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))
-    (dynamic-wind
-      (lambda () #f)
-      (lambda ()
-        (let ((bv (zipdir-read-at read-at! (zipdir-data-offset read-at! ent) (zdirent-csize ent))))
-          (or bv (zip-zerror "ZipFile invalid LOC header (bad signature)"))))
-      close!)))
+  (let ((readers (zipdir-scope-readers)))
+    (if readers
+        (zipdir-raw-bytes-via (car (zipdir-scoped-reader readers d)) ent)
+        (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))
+          (dynamic-wind
+            (lambda () #f)
+            (lambda () (zipdir-raw-bytes-via read-at! ent))
+            close!)))))
 
 ;; Raw-deflate BV inflated, expecting SIZE bytes: one zlib stream, fed a window
 ;; at a time and asked for a window at a time. SIZE is the central directory's

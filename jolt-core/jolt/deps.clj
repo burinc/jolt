@@ -1152,6 +1152,15 @@
         ;; steps, so their compiled/generated assets will be missing; the
         ;; caller warns with the lib names.
         :prep (vec (keep (fn [{:keys [lib edn]}] (when (:deps/prep-lib edn) lib)) infos))
+        ;; The roots that are Maven RELEASE artifacts: a released version is
+        ;; never republished under the same path, so the loader may key its
+        ;; entries by the jar's stat instead of reading them on every start. A
+        ;; SNAPSHOT is republished in place and is left out.
+        :immutable-roots (vec (keep (fn [{:keys [lib root]}]
+                                      (let [v (:mvn/version (get libmap lib))]
+                                        (when (and (string? v) (not (str/ends-with? v "-SNAPSHOT")))
+                                          root)))
+                                    infos))
         :libs libmap
         :trace (:trace expansion)
         ;; The edges -Sgraph renders. Their labels come from :libs above, which
@@ -1770,6 +1779,7 @@
           ;; from there. tools.deps' --skip-cp draws the line in the same place:
           ;; the merged edn and argmap, without calc-basis.
           {dep-roots :roots dep-natives :natives dep-provides :provides
+           dep-immutable-roots :immutable-roots
            prep-libs :prep dep-trace :trace dep-graph :graph dep-libs :libs
            dep-min-versions :min-versions dep-allow-dynamic :allow-dynamic}
           (when-not cp
@@ -1797,6 +1807,8 @@
      ;; With :cp the given roots ARE the answer — they replace the project's own
      ;; paths too, like the clj CLI, where -Scp is the whole classpath.
      {:roots (dedup-by identity (or cp (concat project-roots dep-roots)))
+      ;; with :cp nothing was resolved, so nothing is known to be a release
+      :immutable-roots (if cp [] (vec dep-immutable-roots))
       :main-opts main-opts
       ;; the combined alias args map — the CLI's -X/-T read :exec-fn /
       ;; :exec-args / :ns-default / :ns-aliases from it.
@@ -1913,12 +1925,13 @@
   ([deps-map] (add-deps deps-map nil))
   ([{:keys [deps] :as m} _opts]
    (let [base (or (getenv "JOLT_PWD") ".")
-         {:keys [roots natives]}
+         {:keys [roots natives immutable-roots]}
          (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo m)]
                                       (abspath base r))]
            (resolve-deps deps base))
          current (vec (jolt.host/source-roots))
          added (vec (remove (set current) (dedup-by identity roots)))]
+     (jolt.host/add-immutable-roots! immutable-roots)
      (when (seq added)
        (jolt.host/set-source-roots! (into current added)))
      (when (seq natives)

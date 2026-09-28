@@ -871,7 +871,80 @@ for aaroot in "$aa" "$aa/exp.jar"; do
     fails=$((fails+1))
   fi
 done
+# ...and a require reads a jar's entries through one open reader, not one per
+# entry: the outermost load opens it on first read and closes it on the way out.
+rm -rf "$cache_aa"; mkdir -p "$cache_aa"
+aarun "$aa/exp.jar" >/dev/null
+aa_opens="$(JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_aa" JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:local/root \"$aa/exp.jar\"}}})
+  (let [before (jolt.host/scheme-eval-string \"zipdir-reader-opens\")]
+    (require 'exp.top)
+    (println (- (jolt.host/scheme-eval-string \"zipdir-reader-opens\") before)
+             (jolt.host/scheme-eval-string \"(zipdir-scope-readers)\")))" 2>&1 | tail -1)"
+if [ "$aa_opens" = "1 false" ]; then
+  echo "PASS: (aa2) a warm require from a jar opens it once and closes it"; pass=$((pass+1))
+else
+  echo "FAIL: (aa2) jar reader opens / scope after the require: '$aa_opens' (want '1 false')"; fails=$((fails+1))
+fi
+# ...and the scope is the loading thread's alone. A Chez thread starts with its
+# creator's thread-parameter values, so a thread forked by a namespace's top level
+# used to hold the require's reader table: it read through it unlocked from a
+# second thread, and after the require closed it, reopened readers nothing closed.
+printf '(ns exp.fork)\n(def seen (promise))\n(doto (Thread. (fn [] (deliver seen (boolean (jolt.host/scheme-eval-string "(zipdir-scope-readers)")))))\n  (.start) (.join))\n' > "$aa/fork.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$aa/fork.jar" "exp/fork.clj=$aa/fork.clj" >/dev/null 2>&1 || true
+aa_fork="$(JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/fork {:local/root \"$aa/fork.jar\"}}})
+  (require 'exp.fork) (println @exp.fork/seen)" 2>&1 | tail -1)"
+if [ "$aa_fork" = "false" ]; then
+  echo "PASS: (aa3) a thread forked inside a jar require has no reader scope of its own"; pass=$((pass+1))
+else
+  echo "FAIL: (aa3) forked thread's reader scope inside a jar require: '$aa_fork' (want 'false')"; fails=$((fails+1))
+fi
 rm -rf "$cache_aa"
+
+# --- (ad) a Maven release jar is keyed by stat, not by reading it ------------
+# A release artifact in the local Maven repository never changes in place, so
+# its entries' keys are kept per (jar, mtime) and a warm run reads no source at
+# all. A SNAPSHOT is republished under the same path and keeps full hashing, and
+# a jar rewritten in place (a repaired download) has a new mtime and is re-read.
+ad_m2="$tmp/ad-m2"
+for v in 1.0.0 1.1.0-SNAPSHOT; do
+  mkdir -p "$ad_m2/exp/exp/$v"
+  cp "$aa/exp.jar" "$ad_m2/exp/exp/$v/exp-$v.jar"
+  printf '<project><modelVersion>4.0.0</modelVersion><groupId>exp</groupId><artifactId>exp</artifactId><version>%s</version></project>\n' "$v" \
+    > "$ad_m2/exp/exp/$v/exp-$v.pom"
+done
+cache_ad="$(mktemp -d)"
+adrun() {
+  JOLT_MAVEN_REPOSITORY="$ad_m2" JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ad" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:mvn/version \"$1\"}}})
+    (require 'exp.top) (println (exp.top/answer))" 2>&1
+}
+adrun 1.0.0 >/dev/null
+ad_rel="$(adrun 1.0.0)"
+adrun 1.1.0-SNAPSHOT >/dev/null
+ad_snap="$(adrun 1.1.0-SNAPSHOT)"
+if echo "$ad_rel" | grep -q '^5$' && echo "$ad_rel" | grep -q 'hit exp.dep' \
+   && [ "$(echo "$ad_rel" | grep -c 'hash exp' || true)" -eq 0 ] \
+   && echo "$ad_snap" | grep -q '^5$' \
+   && [ "$(echo "$ad_snap" | grep -c 'hash exp' || true)" -eq 2 ]; then
+  echo "PASS: (ad) a release jar warm-starts on stat alone; a SNAPSHOT still hashes"; pass=$((pass+1))
+else
+  echo "FAIL: (ad) release: out=$(echo "$ad_rel" | tail -1) hashed=$(echo "$ad_rel" | grep -c 'hash exp' || true) (want 0); snapshot: out=$(echo "$ad_snap" | tail -1) hashed=$(echo "$ad_snap" | grep -c 'hash exp' || true) (want 2)"
+  fails=$((fails+1))
+fi
+# the release jar rewritten in place with new content: a new mtime, a new read
+sleep 1
+printf '(ns exp.dep)\n(defn v [] 6)\n' > "$aa/dep6.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$ad_m2/exp/exp/1.0.0/exp-1.0.0.jar" \
+  "exp/dep.clj=$aa/dep6.clj" "exp/top.clj=$aa/src/exp/top.clj" >/dev/null 2>&1 || true
+ad_new="$(adrun 1.0.0)"
+if echo "$ad_new" | grep -q '^6$'; then
+  echo "PASS: (ad2) a release jar rewritten in place is read again"; pass=$((pass+1))
+else
+  echo "FAIL: (ad2) after rewriting the release jar: out=$(echo "$ad_new" | tail -1) (want 6)"; fails=$((fails+1))
+fi
+rm -rf "$cache_ad" "$ad_m2"
 
 # --- (ab) a reload in the same process still sees an edit --------------------
 # The key a load reuses from the dep walk is only good for the source it was read
@@ -910,20 +983,49 @@ acrun() {
     (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rd/rd {:local/root \"$ac\"}}})
     (require 'rd.plain) (println (rd.plain/v))" 2>&1
 }
-# A namespace the reader namespace itself requires still misses once more: it
-# compiles while the reader namespace's own compile is open above it, before
-# that namespace's sidecars exist, so its key can't fold their final digest.
+# That includes a namespace the reader namespace itself requires: it compiles
+# while the reader namespace's own compile is open above it, before that
+# namespace's sidecars exist, so its artifact is keyed once they do.
 acrun >/dev/null
 ac_warm="$(acrun)"
-ac_third="$(acrun)"
 if echo "$ac_warm" | grep -q '^7$' && echo "$ac_warm" | grep -q 'hit rd.plain' \
-   && echo "$ac_warm" | grep -q 'hit rd.readers' && ! echo "$ac_third" | grep -q 'miss '; then
+   && echo "$ac_warm" | grep -q 'hit rd.readers' && echo "$ac_warm" | grep -q 'hit rd.util' \
+   && ! echo "$ac_warm" | grep -q 'miss '; then
   echo "PASS: (ac) a project with data readers hits on its second run"; pass=$((pass+1))
 else
-  echo "FAIL: (ac) second run: $(echo "$ac_warm" | grep -E 'hit |miss ' | tr '\n' ' ') third: $(echo "$ac_third" | grep -E 'hit |miss ' | tr '\n' ' ')"
+  echo "FAIL: (ac) second run: $(echo "$ac_warm" | grep -E 'hit |miss ' | tr '\n' ' ')"
   fails=$((fails+1))
 fi
 rm -rf "$cache_ac"
+# ...and two reader namespaces, one requiring the other. The data_readers scan
+# loads one before the other exists in the cache, so what it compiled folded a
+# digest the next run could not reproduce and missed again. Both name orders,
+# since the scan's order follows the table.
+for ac2_order in a z; do
+  if [ "$ac2_order" = a ]; then ac2_o=ra; ac2_i=rz; else ac2_o=rz; ac2_i=ra; fi
+  ac2="$tmp/ac2-$ac2_order"; mkdir -p "$ac2/src/rn"
+  printf '{rn/o rn.%s/read-o rn/i rn.%s/read-i}\n' "$ac2_o" "$ac2_i" > "$ac2/src/data_readers.clj"
+  printf '(ns rn.leaf)\n(defn label [x] (str "tagged:" x))\n' > "$ac2/src/rn/leaf.clj"
+  printf '(ns rn.%s (:require [rn.leaf :as l]))\n(defn read-i [x] (l/label x))\n' "$ac2_i" > "$ac2/src/rn/$ac2_i.clj"
+  printf '(ns rn.%s (:require [rn.%s :as i]))\n(defn read-o [x] (i/read-i x))\n' "$ac2_o" "$ac2_i" > "$ac2/src/rn/$ac2_o.clj"
+  printf '(ns rn.plain)\n(defn v [] 7)\n' > "$ac2/src/rn/plain.clj"
+  cache_ac2="$(mktemp -d)"
+  ac2run() {
+    JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ac2" JOLT_QUIET=1 "$jolt" -e "
+      (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rn/rn {:local/root \"$ac2\"}}})
+      (require 'rn.plain) (println (rn.plain/v))" 2>&1
+  }
+  ac2run >/dev/null
+  ac2_warm="$(ac2run)"
+  if echo "$ac2_warm" | grep -q '^7$' && [ "$(echo "$ac2_warm" | grep -c 'hit rn\.' || true)" -eq 4 ] \
+     && ! echo "$ac2_warm" | grep -q 'miss '; then
+    echo "PASS: (ac2) nested reader namespaces ($ac2_order) hit on the second run"; pass=$((pass+1))
+  else
+    echo "FAIL: (ac2) nested reader namespaces ($ac2_order), second run: $(echo "$ac2_warm" | grep -E 'hit |miss ' | tr '\n' ' ')"
+    fails=$((fails+1))
+  fi
+  rm -rf "$cache_ac2"
+done
 
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.

@@ -33,7 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memoized before those namespaces had written their dependency sidecars, so
   the first run stored every artifact under a key the next run never
   computed. Each namespace compiled once more on the second run, and the reader
-  namespace itself on the third.
+  namespace itself on the third. A namespace the reader namespace requires now
+  publishes its artifact once the reader namespace's sidecars exist, and
+  anything compiled during the data_readers scan waits for the scan to finish,
+  so a reader namespace that requires another reader namespace hits on the
+  second run as well.
+- **A warm start no longer reads Maven release jars at all.** A released
+  version is never republished under the same path, so each entry's key is
+  kept per jar and modification time, and an unchanged closure from Maven
+  release jars costs a stat per jar instead of inflating and hashing every
+  source. SNAPSHOTs, `:local/root` jars and directories keep full content
+  hashing. A require's jar reads also share one open reader per archive
+  instead of opening the file per entry; nothing holds a jar open between
+  requires.
 - **A large top-level form compiles in near-linear time again.** Since a bare
   top-level fn got a constant pool, its pool was one `let*`, which Chez
   compiles quadratically in the number of bindings: a `(fn [] …)` holding 400

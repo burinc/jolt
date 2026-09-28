@@ -194,7 +194,8 @@
 ;; class providers and load its native deps.
 (defn- apply-project!
   ([resolved] (apply-project! resolved true))
-  ([{:keys [roots natives provides replaces features project-dir]} strict?]
+  ([{:keys [roots immutable-roots natives provides replaces features project-dir]} strict?]
+   (jolt.host/add-immutable-roots! immutable-roots)
    (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
    ;; Before the providers: those matter at the first class REFERENCE, this one
    ;; at the first form read, and reading comes first.
