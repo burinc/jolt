@@ -1457,19 +1457,7 @@
   (cond
     ((eq? aot-readers-digest-memo 'unset)
      (set! aot-readers-digest-memo 'computing)
-     (let* ((tbl (guard (e (#t #f)) (data-readers-table)))
-            (names
-             (if (not (pmap? tbl))
-                 '()
-                 (sort string<?
-                       (pmap-fold tbl
-                                  (lambda (k v acc)
-                                    (let ((ns (cond ((and (symbol-t? v) (string? (symbol-t-ns v)))
-                                                     (symbol-t-ns v))
-                                                    ((var-cell? v) (var-cell-ns v))
-                                                    (else #f))))
-                                      (if (and ns (not (member ns acc))) (cons ns acc) acc)))
-                                  '()))))
+     (let* ((names (sort string<? (aot-reader-namespaces)))
             (d (fold-left (lambda (h ns) (aot-hash-mix h (aot-ns-digest ns))) 17 names)))
        (set! aot-readers-digest-memo d)
        d))
@@ -1641,90 +1629,137 @@
       (aot-tbl-has-ns? chez-protocol-methods-tbl name)
       (aot-ns-forwards-ref? name)))
 
+;; Compiles whose sidecars are not written yet: name -> the publishes waiting on
+;; it (below). A data reader's namespace in here makes the readers digest — which
+;; every key folds — provisional, since that namespace's digest reads sidecars it
+;; has yet to write.
+(define aot-open-compiles (make-hashtable string-hash string=?))
+;; The namespaces the registered data readers live in.
+(define (aot-reader-namespaces)
+  (let ((tbl (guard (e (#t #f)) (data-readers-table))))
+    (if (not (pmap? tbl))
+        '()
+        (pmap-fold tbl
+                   (lambda (k v acc)
+                     (let ((ns (cond ((and (symbol-t? v) (string? (symbol-t-ns v)))
+                                      (symbol-t-ns v))
+                                     ((var-cell? v) (var-cell-ns v))
+                                     (else #f))))
+                       (if (and ns (not (member ns acc))) (cons ns acc) acc)))
+                   '()))))
+;; Publish now, or queue it on the open compile of a reader namespace other than
+;; NAME. A namespace a data reader's namespace requires compiles inside that
+;; namespace's compile, so a base computed then folds a readers digest the next
+;; run can't reproduce, and the artifact would miss once more for nothing.
+(define (aot-publish-when-readers-settle! name publish!)
+  (let ((open (jolt-with-mutex ldr-tbl-mu
+                (let loop ((rs (aot-reader-namespaces)))
+                  (cond ((null? rs) #f)
+                        ((and (not (string=? (car rs) name))
+                              (hashtable-contains? aot-open-compiles (car rs)))
+                         (hashtable-set! aot-open-compiles (car rs)
+                                         (cons publish! (hashtable-ref aot-open-compiles (car rs) '())))
+                         (car rs))
+                        (else (loop (cdr rs))))))))
+    (if open
+        (aot-info (string-append "deferred " name " until " open " settles"))
+        (publish!))))
 (define (aot-compile-and-cache name file src own)
   (let ((sink (aot-new-dep-sink))
         ;; the files this compile reads, collected the same way and for the same
         ;; reason (io.ss io-file-read-sink). A nested require binds its own, so a
         ;; dependency's reads are recorded against the dependency.
-        (res-sink (vector '())))
-    (let* ((stamps (vector file '()))
-           (captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink)
-                                    (jolt-def-ordinal-sink stamps))
-                       (aot-capture-load file src))))
-      (unless (and (string? captured) (fx>? (string-length captured) 0))
-        (aot-info (string-append "nothing captured for " name ", not caching")))
-      (when (and (string? captured) (fx>? (string-length captured) 0))
-        (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
-               (res (vector-ref res-sink 0))
-               ;; the dep list this namespace assumed inert when its key was computed
-               ;; (or when its previous artifact was written) — read once so the
-               ;; base and the .cti it records agree.
-               (assumed (aot-assumed-inert name own))
-               (obase (aot-base-for-own name own)))
-          (aot-mkdir-p (path-parent obase))
-          ;; the sidecars are named by the own hash alone, so the next run can read
-          ;; them back before it is able to compute the full key.
-          (aot-write-dep-list! (aot-dep-sidecar obase) deps)
-          (aot-write-res-list! (aot-res-sidecar obase) res)
-          ;; this run already computed digests for `name` from the OLD sidecars;
-          ;; drop them so the base below, and a later require in the same process,
-          ;; see the new ones. The readers digest folds namespace digests too —
-          ;; `name` may be a data reader's namespace, or below one — and every key
-          ;; folds it. Memoized from before these sidecars existed, it keyed every
-          ;; artifact this run wrote on a value the next run can't reproduce, so a
-          ;; project using a library with data readers missed on everything once
-          ;; more, and the reader's namespace (whose own key folds its own
-          ;; digest) twice.
-          (jolt-with-mutex ldr-tbl-mu
-            (hashtable-delete! aot-dep-digest-memo name)
-            (hashtable-delete! aot-res-digest-memo name)
-            (unless (eq? aot-readers-digest-memo 'computing)
-              (set! aot-readers-digest-memo 'unset)))
-          ;; ...and the compile-time-relevance flag that lets a later run skip an
-          ;; inert dependency (aot-narrow?). Only computed/kept when narrowing is
-          ;; in force; a missing sidecar reads as "unknown" and stays conservative.
-          ;; The .cti records the direct deps whose key contribution was the inert
-          ;; constant, so a later run whose dep flags are missing again can make the
-          ;; same assumption and then VERIFY it after a hit (aot-assumptions-hold?).
-          (let* ((base (aot-base-full name own deps res))
-                 (scm (string-append base ".scm"))
-                 (so  (string-append base ".so"))
-                 (pid (number->string (get-process-id)))
-                 (tmp-scm (string-append base ".tmp" pid ".scm"))
-                 (tmp-so  (string-append base ".tmp" pid ".so")))
-            (when (aot-narrow?)
-              (aot-write-ct! obase (aot-ct-relevant? name) (aot-ns-surface name))
-              (aot-write-cti! obase
-                              (fold-right (lambda (d acc)
-                                            (let ((sf (aot-dep-surface d assumed)))
-                                              (if sf (cons (cons d sf) acc) acc)))
-                                          '() deps))
-              (jolt-with-mutex ldr-tbl-mu
-                (hashtable-delete! aot-ct-state-memo name)
-                (hashtable-delete! aot-assumed-memo name)))
-            (guard (e (else (aot-info (string-append "compile failed for " name))
-                            (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
-              (let ((out (open-output-file tmp-scm 'replace)))
-                (put-string out captured)
-                ;; the first-def stamps this load made, replayed against whatever
-                ;; file the artifact is loaded for (aot-replay-def-ordinals!)
-                (put-string out (format "\n(aot-replay-def-ordinals! '~s)" (reverse (vector-ref stamps 1))))
-                (put-string out (format "\n(aot-mark-complete! ~s)\n" name))
-                (close-output-port out))
-              (rename-replace! tmp-scm scm)
-              ;; The fasl is for FUTURE runs; with a worker (JOLT_AOT_ASYNC=1) it
-              ;; compiles there and this run starts without waiting. Otherwise the
-              ;; in-process compile: compile-file prints "compiling X with output to
-              ;; Y" per file to current-output-port by default — swallow it so a
-              ;; cache miss can't corrupt the running program's stdout.
-              (if (aot-enqueue-compile! scm so)
-                  (aot-info (string-append "queued " name))
-                  (begin
-                    (parameterize ((current-output-port (open-output-string)))
-                      (sa-compile-file scm tmp-so #f))
-                    (rename-replace! tmp-so so)
-                    (unless (file-exists? so)
-                      (aot-info (string-append "no .so produced for " name))))))))))))
+        (res-sink (vector '()))
+        (stamps (vector file '())))
+    ;; open until the sidecars are written; an unwind drops whatever was queued
+    ;; on it, which then only misses next run
+    (dynamic-wind
+      (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles name '())))
+      (lambda ()
+        (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink)
+                                       (jolt-def-ordinal-sink stamps))
+                          (aot-capture-load file src))))
+          (unless (and (string? captured) (fx>? (string-length captured) 0))
+            (aot-info (string-append "nothing captured for " name ", not caching")))
+          (when (and (string? captured) (fx>? (string-length captured) 0))
+            (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
+                   (res (vector-ref res-sink 0))
+                   (obase (aot-base-for-own name own)))
+              (aot-write-sidecars! name own obase deps res)
+              (let ((waiting (jolt-with-mutex ldr-tbl-mu
+                               (let ((q (hashtable-ref aot-open-compiles name '())))
+                                 (hashtable-delete! aot-open-compiles name)
+                                 q))))
+                (aot-publish-when-readers-settle!
+                  name (lambda () (aot-publish-artifact! name own deps res captured stamps)))
+                (for-each (lambda (publish!) (publish!)) (reverse waiting)))))))
+      (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles name))))))
+;; Everything a later run reads back BEFORE it can compute the full key: the
+;; sidecars are named by the own hash alone.
+(define (aot-write-sidecars! name own obase deps res)
+  ;; the dep list this namespace assumed inert when its key was computed (or when
+  ;; its previous artifact was written), which the .cti below records
+  (let ((assumed (aot-assumed-inert name own)))
+    (aot-mkdir-p (path-parent obase))
+    (aot-write-dep-list! (aot-dep-sidecar obase) deps)
+    (aot-write-res-list! (aot-res-sidecar obase) res)
+    ;; ...and the compile-time-relevance flag that lets a later run skip an
+    ;; inert dependency (aot-narrow?). Only computed/kept when narrowing is
+    ;; in force; a missing sidecar reads as "unknown" and stays conservative.
+    ;; The .cti records the direct deps whose key contribution was the inert
+    ;; constant, so a later run whose dep flags are missing again can make the
+    ;; same assumption and then VERIFY it after a hit (aot-assumptions-hold?).
+    (when (aot-narrow?)
+      (aot-write-ct! obase (aot-ct-relevant? name) (aot-ns-surface name))
+      (aot-write-cti! obase
+                      (fold-right (lambda (d acc)
+                                    (let ((sf (aot-dep-surface d assumed)))
+                                      (if sf (cons (cons d sf) acc) acc)))
+                                  '() deps)))
+    ;; this run already computed digests for `name` from the OLD sidecars; drop
+    ;; them so the base, and a later require in the same process, see the new
+    ;; ones. The readers digest folds namespace digests too — `name` may be a
+    ;; data reader's namespace, or below one — and every key folds it. Memoized
+    ;; from before these sidecars existed, it keyed every artifact this run wrote
+    ;; on a value the next run can't reproduce.
+    (jolt-with-mutex ldr-tbl-mu
+      (hashtable-delete! aot-dep-digest-memo name)
+      (hashtable-delete! aot-res-digest-memo name)
+      (hashtable-delete! aot-ct-state-memo name)
+      (hashtable-delete! aot-assumed-memo name)
+      (unless (eq? aot-readers-digest-memo 'computing)
+        (set! aot-readers-digest-memo 'unset)))))
+;; The artifact under its full key: the captured Scheme, then its fasl.
+(define (aot-publish-artifact! name own deps res captured stamps)
+  (let* ((base (aot-base-full name own deps res))
+         (scm (string-append base ".scm"))
+         (so  (string-append base ".so"))
+         (pid (number->string (get-process-id)))
+         (tmp-scm (string-append base ".tmp" pid ".scm"))
+         (tmp-so  (string-append base ".tmp" pid ".so")))
+    (guard (e (else (aot-info (string-append "compile failed for " name))
+                    (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
+      (let ((out (open-output-file tmp-scm 'replace)))
+        (put-string out captured)
+        ;; the first-def stamps this load made, replayed against whatever
+        ;; file the artifact is loaded for (aot-replay-def-ordinals!)
+        (put-string out (format "\n(aot-replay-def-ordinals! '~s)" (reverse (vector-ref stamps 1))))
+        (put-string out (format "\n(aot-mark-complete! ~s)\n" name))
+        (close-output-port out))
+      (rename-replace! tmp-scm scm)
+      ;; The fasl is for FUTURE runs; with a worker (JOLT_AOT_ASYNC=1) it
+      ;; compiles there and this run starts without waiting. Otherwise the
+      ;; in-process compile: compile-file prints "compiling X with output to
+      ;; Y" per file to current-output-port by default — swallow it so a
+      ;; cache miss can't corrupt the running program's stdout.
+      (if (aot-enqueue-compile! scm so)
+          (aot-info (string-append "queued " name))
+          (begin
+            (parameterize ((current-output-port (open-output-string)))
+              (sa-compile-file scm tmp-so #f))
+            (rename-replace! tmp-so so)
+            (unless (file-exists? so)
+              (aot-info (string-append "no .so produced for " name))))))))
 ;; Evaluate a namespace's top-level forms from COMPILED code — an embedded fasl,
 ;; an AOT-cached .so, a classpath artifact. RT.load brackets a compiled class's
 ;; init with the compiler-flag vars exactly as Compiler.load brackets a source

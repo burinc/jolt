@@ -910,17 +910,17 @@ acrun() {
     (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rd/rd {:local/root \"$ac\"}}})
     (require 'rd.plain) (println (rd.plain/v))" 2>&1
 }
-# A namespace the reader namespace itself requires still misses once more: it
-# compiles while the reader namespace's own compile is open above it, before
-# that namespace's sidecars exist, so its key can't fold their final digest.
+# That includes a namespace the reader namespace itself requires: it compiles
+# while the reader namespace's own compile is open above it, before that
+# namespace's sidecars exist, so its artifact is keyed once they do.
 acrun >/dev/null
 ac_warm="$(acrun)"
-ac_third="$(acrun)"
 if echo "$ac_warm" | grep -q '^7$' && echo "$ac_warm" | grep -q 'hit rd.plain' \
-   && echo "$ac_warm" | grep -q 'hit rd.readers' && ! echo "$ac_third" | grep -q 'miss '; then
+   && echo "$ac_warm" | grep -q 'hit rd.readers' && echo "$ac_warm" | grep -q 'hit rd.util' \
+   && ! echo "$ac_warm" | grep -q 'miss '; then
   echo "PASS: (ac) a project with data readers hits on its second run"; pass=$((pass+1))
 else
-  echo "FAIL: (ac) second run: $(echo "$ac_warm" | grep -E 'hit |miss ' | tr '\n' ' ') third: $(echo "$ac_third" | grep -E 'hit |miss ' | tr '\n' ' ')"
+  echo "FAIL: (ac) second run: $(echo "$ac_warm" | grep -E 'hit |miss ' | tr '\n' ' ')"
   fails=$((fails+1))
 fi
 rm -rf "$cache_ac"
