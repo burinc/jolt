@@ -841,6 +841,90 @@ else
   rm -rf "$cache_z" "$cache_z2" "$cache_z3" "$alib"
 fi
 
+# --- (aa) a warm run reads and hashes each source once (#1161) ---------------
+# A dependency's own key is computed while its consumer folds the dep digest, and
+# again when the dependency itself loads. The second has to come from the first:
+# for a jar root every read is an inflate + CRC + hash of the whole entry. The
+# "hash" aot-info line fires once per source actually read for a key.
+aa="$tmp/aa"; mkdir -p "$aa/src/exp"
+printf '(ns exp.dep)\n(defn v [] 5)\n' > "$aa/src/exp/dep.clj"
+printf '(ns exp.top (:require [exp.dep :as d]))\n(defn answer [] (d/v))\n' > "$aa/src/exp/top.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$aa/exp.jar" \
+  "exp/dep.clj=$aa/src/exp/dep.clj" "exp/top.clj=$aa/src/exp/top.clj" >/dev/null 2>&1 || true
+cache_aa="$(mktemp -d)"
+aarun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_aa" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:local/root \"$1\"}}})
+    (require 'exp.top) (println (exp.top/answer))" 2>&1
+}
+for aaroot in "$aa" "$aa/exp.jar"; do
+  rm -rf "$cache_aa"; mkdir -p "$cache_aa"
+  aarun "$aaroot" >/dev/null
+  aa_warm="$(aarun "$aaroot")"
+  aa_dep="$(echo "$aa_warm" | grep -c 'hash exp.dep$' || true)"
+  aa_top="$(echo "$aa_warm" | grep -c 'hash exp.top$' || true)"
+  if echo "$aa_warm" | grep -q '^5$' && echo "$aa_warm" | grep -q 'hit exp.dep' \
+     && [ "$aa_dep" -eq 1 ] && [ "$aa_top" -eq 1 ]; then
+    echo "PASS: (aa) warm run from $(basename "$aaroot") hashes each source once"; pass=$((pass+1))
+  else
+    echo "FAIL: (aa) warm run from $(basename "$aaroot"): out=$(echo "$aa_warm" | tail -1) dep hashed $aa_dep, top hashed $aa_top (want 1 each)"
+    fails=$((fails+1))
+  fi
+done
+rm -rf "$cache_aa"
+
+# --- (ab) a reload in the same process still sees an edit --------------------
+# The key a load reuses from the dep walk is only good for the source it was read
+# from: dropping the namespace from *loaded-libs* and requiring it again after an
+# equal-length edit has to read the new source, not serve the old artifact.
+ab="$tmp/ab"; mkdir -p "$ab/src/rl"
+printf '(ns rl.core)\n(defn v [] 11)\n' > "$ab/src/rl/core.clj"
+cache_ab="$(mktemp -d)"
+ab_out="$(JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ab" JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rl/rl {:local/root \"$ab\"}}})
+  (require 'rl.core) (println (rl.core/v))
+  (spit \"$ab/src/rl/core.clj\" \"(ns rl.core)\\n(defn v [] 22)\\n\")
+  (dosync (alter @#'clojure.core/*loaded-libs* disj 'rl.core))
+  (require 'rl.core) (println (rl.core/v))" 2>&1 | tail -2 | tr '\n' ' ')"
+if [ "$ab_out" = "11 22 " ]; then
+  echo "PASS: (ab) an in-process reload after an edit loads the edit"; pass=$((pass+1))
+else
+  echo "FAIL: (ab) got '$ab_out' (want '11 22 ')"; fails=$((fails+1))
+fi
+rm -rf "$cache_ab"
+
+# --- (ac) a library with data readers is cached in one run -------------------
+# Every key folds the digest of each data reader's namespace. Computed before
+# that namespace had compiled and written its sidecars, it keyed every artifact
+# of the first run on a value no later run reproduces, so the whole project
+# missed a second time (and the reader namespace a third). Only a reader
+# namespace with requires of its own moves: a leaf's digest has no sidecar.
+ac="$tmp/ac"; mkdir -p "$ac/src/rd"
+printf '{rd/tag rd.readers/read-tag}\n' > "$ac/src/data_readers.clj"
+printf '(ns rd.util)\n(defn label [x] (str "tagged:" x))\n' > "$ac/src/rd/util.clj"
+printf '(ns rd.readers (:require [rd.util :as u]))\n(defn read-tag [x] (u/label x))\n' > "$ac/src/rd/readers.clj"
+printf '(ns rd.plain)\n(defn v [] 7)\n' > "$ac/src/rd/plain.clj"
+cache_ac="$(mktemp -d)"
+acrun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ac" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rd/rd {:local/root \"$ac\"}}})
+    (require 'rd.plain) (println (rd.plain/v))" 2>&1
+}
+# A namespace the reader namespace itself requires still misses once more: it
+# compiles while the reader namespace's own compile is open above it, before
+# that namespace's sidecars exist, so its key can't fold their final digest.
+acrun >/dev/null
+ac_warm="$(acrun)"
+ac_third="$(acrun)"
+if echo "$ac_warm" | grep -q '^7$' && echo "$ac_warm" | grep -q 'hit rd.plain' \
+   && echo "$ac_warm" | grep -q 'hit rd.readers' && ! echo "$ac_third" | grep -q 'miss '; then
+  echo "PASS: (ac) a project with data readers hits on its second run"; pass=$((pass+1))
+else
+  echo "FAIL: (ac) second run: $(echo "$ac_warm" | grep -E 'hit |miss ' | tr '\n' ' ') third: $(echo "$ac_third" | grep -E 'hit |miss ' | tr '\n' ' ')"
+  fails=$((fails+1))
+fi
+rm -rf "$cache_ac"
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 

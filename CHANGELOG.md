@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A warm AOT-cache start reads each namespace's source once (#1161).** A
+  dependency's key was computed while its consumer folded the dep digest and
+  then again, from a second read, when the dependency loaded, so every
+  dependency was read and hashed twice; from a jar that meant inflating and
+  CRC-checking the entry twice. The load now reuses the walk's key when the
+  file's mtime is unchanged, and only on a namespace's first load in the
+  process. Keys also hash the source's bytes, so a hit no longer decodes the
+  source at all.
+- **A project using a library with data readers is cached after one run.**
+  Every key folds the digests of the reader namespaces, and that digest was
+  memoized before those namespaces had written their dependency sidecars, so
+  the first run stored every artifact under a key the next run never
+  computed. Each namespace compiled once more on the second run, and the reader
+  namespace itself on the third.
 - **A heap near its `JOLT_MAX_HEAP` ceiling no longer overshoots it during the
   ceiling's own full collection (jolt-exoj).** The collection marks the old
   generations in place, but Chez still copies sparse segments, and one

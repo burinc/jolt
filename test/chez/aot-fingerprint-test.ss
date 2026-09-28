@@ -83,13 +83,15 @@
     (= (aot-content-hash "jolt aot cache fingerprint vector") 955009679))
 
 ;; --- (c) the namespace key moves on a mid-file same-length edit ---------------
-;; aot-cache-key is length + content hash. Length alone cannot see this edit.
+;; aot-cache-key is byte length + content hash over the source's bytes. Length
+;; alone cannot see this edit.
 (let* ((pad (make-string 2000 #\space))
        (src1 (string-append "(ns a.b)" pad "(defn f [] 42)" pad))
        (src2 (string-append "(ns a.b)" pad "(defn f [] 99)" pad)))
   (ok "(c) aot-cache-key differs for a mid-file same-length edit"
       (and (= (string-length src1) (string-length src2))
-           (not (string=? (aot-cache-key src1) (aot-cache-key src2))))))
+           (not (string=? (aot-cache-key (string->utf8 src1))
+                          (aot-cache-key (string->utf8 src2)))))))
 
 ;; --- (d) the source-tree runtime fingerprint ---------------------------------
 ;; Running from a checkout there is no baked fingerprint, so the generation dir
