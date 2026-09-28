@@ -1048,7 +1048,11 @@
         (values cbuf (jnum->exact (cadr rest)) (jnum->exact (caddr rest)))
         (values cbuf 0 (ja-len cbuf)))))
 
-(define (sr-s self) (vector-ref (jhost-state self) 0))
+;; close drops the string; every read reaches it through sr-s, which then
+;; raises what a closed java.io.StringReader does.
+(define (sr-s self)
+  (or (vector-ref (jhost-state self) 0)
+      (throw-jvm 'java.io.IOException "Stream closed")))
 (define (sr-pos self) (vector-ref (jhost-state self) 1))
 (define (sr-pos! self p) (vector-set! (jhost-state self) 1 p))
 (register-host-methods! "string-reader"
@@ -1067,8 +1071,8 @@
                                     (let ((n (min len (- slen p))))
                                       (let loop ((i 0)) (when (< i n) (ja-set! cbuf (+ off i) (string-ref s (+ p i))) (loop (+ i 1))))
                                       (sr-pos! self (+ p n)) (->num n))))))))))
-        (cons "mark" (lambda (self . _) (vector-set! (jhost-state self) 2 (sr-pos self)) jolt-nil))
-        (cons "reset" (lambda (self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
+        (cons "mark" (lambda (self . _) (sr-s self) (vector-set! (jhost-state self) 2 (sr-pos self)) jolt-nil))
+        (cons "reset" (lambda (self) (sr-s self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
         (cons "skip" (lambda (self n) (let ((n (jnum->exact n)))
                                         (sr-pos! self (min (string-length (sr-s self)) (+ (sr-pos self) n))) (->num n))))
         ;; readLine: the next line without its terminator, nil at EOF — what
@@ -1099,8 +1103,8 @@
                         (let loop ((acc '()))
                           (let ((l (record-method-dispatch self "readLine" jolt-nil)))
                             (if (jolt-nil? l) (list->cseq (reverse acc)) (loop (cons l acc)))))))
-        (cons "ready" (lambda (self) #t))
-        (cons "close" (lambda (self) jolt-nil))))
+        (cons "ready" (lambda (self) (sr-s self) #t))
+        (cons "close" (lambda (self) (vector-set! (jhost-state self) 0 #f) jolt-nil))))
 
 ;; ---- PushbackReader ---------------------------------------------------------
 ;; state: a vector #(wrapped-reader pushed-list line-numbering? line column skip-lf?

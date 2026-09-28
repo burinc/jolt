@@ -723,6 +723,44 @@
             [r (<= 2000 waited 2250)])
           [false true])
 
+;; Reading a child's output as text closes its pipe. slurp of an InputStream,
+;; and closing an io/reader or InputStreamReader over one, reach the stream
+;; underneath, as on the JVM; a closed text reader that left the pipe open leaked
+;; two descriptors per :string run and three per sh, and nothing reclaims a pipe.
+;; 20 runs each, judged against a slack of a few descriptors for whatever the
+;; runtime opens on its own in between.
+(defn- open-fds [] (count (.list (java.io.File. "/dev/fd"))))
+(defn- fd-growth [f]
+  (f)                                   ; the first run opens anything lazy
+  (let [before (open-fds)]
+    (dotimes [_ 20] (f))
+    (- (open-fds) before)))
+(check-eq "process :out/:err :string closes both pipes"
+          (<= (fd-growth #(deref (process {:in "" :out :string :err :string} "true"))) 4)
+          true)
+(check-eq "sh closes its pipes"
+          (<= (fd-growth #(sh "true")) 4)
+          true)
+(check-eq "slurp of a Process stream closes it"
+          (<= (fd-growth #(let [pr (.start (java.lang.ProcessBuilder. ["true"]))]
+                            (slurp (.getInputStream pr)) (slurp (.getErrorStream pr))
+                            (.close (.getOutputStream pr)) (.waitFor pr)))
+              4)
+          true)
+;; A child's pipes are let go of at its exit when nothing is waiting in them, as
+;; the JDK does, so output nobody reads does not hold descriptors until a
+;; collection; output written before the exit is still there to read after it,
+;; and stdin is closed, so a write to it then raises.
+(check-eq "unread pipes are released at exit"
+          (<= (fd-growth #(deref (process "true"))) 4)
+          true)
+(check-eq "output survives the exit, stdin does not"
+          (let [pr (.start (java.lang.ProcessBuilder. ["sh" "-c" "echo x; exit 3"]))]
+            [(.waitFor pr) (slurp (.getInputStream pr))
+             (try (doto (.getOutputStream pr) (.write (.getBytes "zz")) (.flush)) :wrote
+                  (catch Exception _ :threw))])
+          [3 "x\n" :threw])
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
