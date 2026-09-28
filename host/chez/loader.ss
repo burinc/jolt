@@ -2631,10 +2631,15 @@
       ;; that DECLARES it, whichever way the load was reached — the class-miss
       ;; autoload, or a plain require from another provider's install namespace
       ;; (host-static.ss lib-with-install-ns-mark, jolt#926).
+      ;;
+      ;; The load's jar reads share one reader per archive (zip-file.ss
+      ;; call-with-zipdir-read-scope); a nested load joins the outer one's scope.
       (dynamic-wind
         (lambda () (ldr-assert-claim! name))
         (lambda ()
-          (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))
+          (call-with-zipdir-read-scope
+            (lambda ()
+              (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
           (set! finished? #t))
         (lambda ()
           (unless (jolt-park-unwinding?)

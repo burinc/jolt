@@ -871,6 +871,21 @@ for aaroot in "$aa" "$aa/exp.jar"; do
     fails=$((fails+1))
   fi
 done
+# ...and a require reads a jar's entries through one open reader, not one per
+# entry: the outermost load opens it on first read and closes it on the way out.
+rm -rf "$cache_aa"; mkdir -p "$cache_aa"
+aarun "$aa/exp.jar" >/dev/null
+aa_opens="$(JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_aa" JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/exp {:local/root \"$aa/exp.jar\"}}})
+  (let [before (jolt.host/scheme-eval-string \"zipdir-reader-opens\")]
+    (require 'exp.top)
+    (println (- (jolt.host/scheme-eval-string \"zipdir-reader-opens\") before)
+             (jolt.host/scheme-eval-string \"(zipdir-read-scope)\")))" 2>&1 | tail -1)"
+if [ "$aa_opens" = "1 false" ]; then
+  echo "PASS: (aa2) a warm require from a jar opens it once and closes it"; pass=$((pass+1))
+else
+  echo "FAIL: (aa2) jar reader opens / scope after the require: '$aa_opens' (want '1 false')"; fails=$((fails+1))
+fi
 rm -rf "$cache_aa"
 
 # --- (ab) a reload in the same process still sees an edit --------------------
