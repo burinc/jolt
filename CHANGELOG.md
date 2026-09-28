@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hashing. A require's jar reads also share one open reader per archive
   instead of opening the file per entry; nothing holds a jar open between
   requires.
+- **A large top-level form compiles in near-linear time again.** Since a bare
+  top-level fn got a constant pool, its pool was one `let*`, which Chez
+  compiles quadratically in the number of bindings: a `(fn [] …)` holding 400
+  `(is …)` forms took 1.7s to compile, up from 1.2s. The pool is now emitted as
+  flat `let` layers by dependency depth, and the same form takes about 1.05s.
+  compilescaling had been failing CI intermittently on this.
 - **A heap near its `JOLT_MAX_HEAP` ceiling no longer overshoots it during the
   ceiling's own full collection (jolt-exoj).** The collection marks the old
   generations in place, but Chez still copies sparse segments, and one
