@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed too; a pipe that is dropped unread is released once collected. The
   descriptor is freed only after the last read or write on it returns, so a
   close from another thread no longer races an operation in flight.
+- **`clojure.pprint/code-dispatch` lays out code like the reference (#1177).**
+  It printed every list as a plain list, so `defn`, `let`, `if`, `cond`,
+  `condp`, `ns` and the rest broke after their head, and `#(...)` came out as
+  `(fn* [p__1#] ...)`. The reference's code table is ported, so those forms
+  keep their name, params, bindings or test on the first line, pair clauses
+  and bindings, and `#(...)` prints with `%` params. Along the way,
+  `(cl-format true ...)` called from a dispatch fn now writes into the active
+  pretty writer as on the JVM; it buffered separately, so a pretty directive
+  in it crashed.
+- **An `instance?` miss while the Gambit seed prelude loads no longer kills
+  the def.** The memo asked a host fn Gambit defines only after the prelude,
+  so the def threw and the seed's load guard dropped it silently. It is now
+  defined beside the memo on both hosts.
 - **`seq` on a `PersistentQueue` is O(1) (#1172).** It built the whole element
   list before returning the first cell, so `first`, `rest` and `next` on a
   queue cost its size. The seq now walks the front and then the reversed rear

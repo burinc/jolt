@@ -2011,7 +2011,13 @@
 
 (defn- execute-format
   ([stream format args]
+   ;; true means *out*. Inside a pretty-print (a dispatch fn calling
+   ;; (cl-format true ...)) that is the active pretty writer, and output must go
+   ;; straight into it as on the JVM: buffering it separately loses the column
+   ;; and hands pretty directives (~:@_) a writer with no logical blocks.
+   ;; Elsewhere *out* is a host port, so the text is buffered and printed.
    (let [sb (StringBuilder.)
+         stream (if (and (true? stream) (pretty-writer? *out*)) *out* stream)
          real-stream (if (or (not stream) (true? stream))
                        (->StringBufferWriter sb)
                        stream)
@@ -2136,8 +2142,202 @@
 (defmethod simple-dispatch :default [obj] (pprint-simple-default obj))
 
 ;;; code dispatch
+;;
+;; The reference's code table (clojure/pprint/dispatch.clj *code-table*): a list
+;; whose head names a known form gets that form's layout -- defn keeps its name
+;; and params on the first line, let pairs its bindings, cond pairs its clauses,
+;; (fn* [..] ..) prints as #(..) with % params, and so on. Anything else is a
+;; plain code list.
 
 (declare ^{:arglists '([alis])} pprint-simple-code-list)
+
+(defn- brackets
+  "Figure out which kind of brackets to use"
+  [form]
+  (if (vector? form)
+    ["[" "]"]
+    ["(" ")"]))
+
+(defn- pprint-ns-reference
+  "Pretty print a single reference (import, use, etc.) from a namespace decl"
+  [reference]
+  (if (sequential? reference)
+    (let [[start end] (brackets reference)
+          [keyw & args] reference]
+      (pprint-logical-block :prefix start :suffix end
+        ((formatter-out "~w~:i") keyw)
+        (loop [args args]
+          (when (seq args)
+            ((formatter-out " "))
+            (let [arg (first args)]
+              (if (sequential? arg)
+                (let [[start end] (brackets arg)]
+                  (pprint-logical-block :prefix start :suffix end
+                    (if (and (= (count arg) 3) (keyword? (second arg)))
+                      (let [[ns kw lis] arg]
+                        ((formatter-out "~w ~w ") ns kw)
+                        (if (sequential? lis)
+                          ((formatter-out (if (vector? lis)
+                                            "~<[~;~@{~w~^ ~:_~}~;]~:>"
+                                            "~<(~;~@{~w~^ ~:_~}~;)~:>"))
+                           lis)
+                          (write-out lis)))
+                      (apply (formatter-out "~w ~:i~@{~w~^ ~:_~}") arg)))
+                  (when (next args)
+                    ((formatter-out "~_"))))
+                (do
+                  (write-out arg)
+                  (when (next args)
+                    ((formatter-out "~:_"))))))
+            (recur (next args))))))
+    (when reference (write-out reference))))
+
+(defn- pprint-ns
+  "The pretty print dispatch chunk for the ns macro"
+  [alis]
+  (if (next alis)
+    (let [[ns-sym ns-name & stuff] alis
+          [doc-str stuff] (if (string? (first stuff))
+                            [(first stuff) (next stuff)]
+                            [nil stuff])
+          [attr-map references] (if (map? (first stuff))
+                                  [(first stuff) (next stuff)]
+                                  [nil stuff])]
+      (pprint-logical-block :prefix "(" :suffix ")"
+        ((formatter-out "~w ~1I~@_~w") ns-sym ns-name)
+        (when (or doc-str attr-map (seq references))
+          ((formatter-out "~@:_")))
+        (when doc-str
+          (cl-format true "\"~a\"~:[~;~:@_~]" doc-str (or attr-map (seq references))))
+        (when attr-map
+          ((formatter-out "~w~:[~;~:@_~]") attr-map (seq references)))
+        (loop [references references]
+          (pprint-ns-reference (first references))
+          (when-let [references (next references)]
+            (pprint-newline :linear)
+            (recur references)))))
+    (write-out alis)))
+
+;; something that looks like a simple def
+(def ^{:private true} pprint-hold-first (formatter-out "~:<~w~^ ~@_~w~^ ~_~@{~w~^ ~_~}~:>"))
+
+;; the params and body of a defn with a single arity
+(defn- single-defn [alis has-doc-str?]
+  (if (seq alis)
+    (do
+      (if has-doc-str?
+        ((formatter-out " ~_"))
+        ((formatter-out " ~@_")))
+      ((formatter-out "~{~w~^ ~_~}") alis))))
+
+;; the param and body sublists of a defn with multiple arities
+(defn- multi-defn [alis has-doc-str?]
+  (if (seq alis)
+    ((formatter-out " ~_~{~w~^ ~_~}") alis)))
+
+(defn- pprint-defn [alis]
+  (if (next alis)
+    (let [[defn-sym defn-name & stuff] alis
+          [doc-str stuff] (if (string? (first stuff))
+                            [(first stuff) (next stuff)]
+                            [nil stuff])
+          [attr-map stuff] (if (map? (first stuff))
+                             [(first stuff) (next stuff)]
+                             [nil stuff])]
+      (pprint-logical-block :prefix "(" :suffix ")"
+        ((formatter-out "~w ~1I~@_~w") defn-sym defn-name)
+        (if doc-str
+          ((formatter-out " ~_~w") doc-str))
+        (if attr-map
+          ((formatter-out " ~_~w") attr-map))
+        ;; the multi-defn case works for malformed defns too
+        (cond
+          (vector? (first stuff)) (single-defn stuff (or doc-str attr-map))
+          :else (multi-defn stuff (or doc-str attr-map)))))
+    (pprint-simple-code-list alis)))
+
+(defn- pprint-binding-form [binding-vec]
+  (pprint-logical-block :prefix "[" :suffix "]"
+    (print-length-loop [binding binding-vec]
+      (when (seq binding)
+        (pprint-logical-block binding
+          (write-out (first binding))
+          (when (next binding)
+            (-write *out* " ")
+            (pprint-newline :miser)
+            (write-out (second binding))))
+        (when (next (rest binding))
+          (-write *out* " ")
+          (pprint-newline :linear)
+          (recur (next (rest binding))))))))
+
+(defn- pprint-let [alis]
+  (let [base-sym (first alis)]
+    (pprint-logical-block :prefix "(" :suffix ")"
+      (if (and (next alis) (vector? (second alis)))
+        (do
+          ((formatter-out "~w ~1I~@_") base-sym)
+          (pprint-binding-form (second alis))
+          ((formatter-out " ~_~{~w~^ ~_~}") (next (rest alis))))
+        (pprint-simple-code-list alis)))))
+
+(def ^{:private true} pprint-if (formatter-out "~:<~1I~w~^ ~@_~w~@{ ~_~w~}~:>"))
+
+(defn- pprint-cond [alis]
+  (pprint-logical-block :prefix "(" :suffix ")"
+    (pprint-indent :block 1)
+    (write-out (first alis))
+    (when (next alis)
+      (-write *out* " ")
+      (pprint-newline :linear)
+      (print-length-loop [alis (next alis)]
+        (when alis
+          (pprint-logical-block alis
+            (write-out (first alis))
+            (when (next alis)
+              (-write *out* " ")
+              (pprint-newline :miser)
+              (write-out (second alis))))
+          (when (next (rest alis))
+            (-write *out* " ")
+            (pprint-newline :linear)
+            (recur (next (rest alis)))))))))
+
+(defn- pprint-condp [alis]
+  (if (> (count alis) 3)
+    (pprint-logical-block :prefix "(" :suffix ")"
+      (pprint-indent :block 1)
+      (apply (formatter-out "~w ~@_~w ~@_~w ~_") alis)
+      (print-length-loop [alis (seq (drop 3 alis))]
+        (when alis
+          (pprint-logical-block alis
+            (write-out (first alis))
+            (when (next alis)
+              (-write *out* " ")
+              (pprint-newline :miser)
+              (write-out (second alis))))
+          (when (next (rest alis))
+            (-write *out* " ")
+            (pprint-newline :linear)
+            (recur (next (rest alis)))))))
+    (pprint-simple-code-list alis)))
+
+;; the symbols bound by an enclosing #() anonymous function
+(def ^:dynamic ^{:private true} *symbol-map* {})
+
+(defn- pprint-anon-func [alis]
+  (let [args (second alis)
+        nlis (first (rest (rest alis)))]
+    (if (vector? args)
+      (binding [*symbol-map* (if (= 1 (count args))
+                               {(first args) "%"}
+                               (into {}
+                                     (map
+                                       #(vector %1 (str \% %2))
+                                       args
+                                       (range 1 (inc (count args))))))]
+        ((formatter-out "~<#(~;~@{~w~^ ~_~}~;)~:>") nlis))
+      (pprint-simple-code-list alis))))
 
 (defn- pprint-simple-code-list [alis]
   (pprint-logical-block :prefix "(" :suffix ")"
@@ -2150,14 +2350,51 @@
           (pprint-newline :linear)
           (recur (next alis)))))))
 
+;; Take a map with symbols as keys and add versions with no namespace.
+(defn- two-forms [amap]
+  (into {}
+        (mapcat
+          identity
+          (for [x amap]
+            [x [(symbol (name (first x))) (second x)]]))))
+
+(defn- add-core-ns [amap]
+  (let [core "clojure.core"]
+    (into {}
+          (map #(let [[s f] %]
+                  (if (not (or (namespace s) (special-symbol? s)))
+                    [(symbol core (name s)) f]
+                    %))
+               amap))))
+
+(def ^:dynamic ^{:private true} *code-table*
+  (two-forms
+    (add-core-ns
+      {'def pprint-hold-first, 'defonce pprint-hold-first,
+       'defn pprint-defn, 'defn- pprint-defn, 'defmacro pprint-defn, 'fn pprint-defn,
+       'let pprint-let, 'loop pprint-let, 'binding pprint-let,
+       'with-local-vars pprint-let, 'with-open pprint-let, 'when-let pprint-let,
+       'if-let pprint-let, 'doseq pprint-let, 'dotimes pprint-let,
+       'when-first pprint-let,
+       'if pprint-if, 'if-not pprint-if, 'when pprint-if, 'when-not pprint-if,
+       'cond pprint-cond, 'condp pprint-condp,
+       'fn* pprint-anon-func,
+       '. pprint-hold-first, '.. pprint-hold-first, '-> pprint-hold-first,
+       'locking pprint-hold-first, 'struct pprint-hold-first,
+       'struct-map pprint-hold-first, 'ns pprint-ns})))
+
 (defn- pprint-code-list [alis]
   (if-not (pprint-reader-macro alis)
-    (pprint-simple-code-list alis)))
+    (if-let [special-form (*code-table* (first alis))]
+      (special-form alis)
+      (pprint-simple-code-list alis))))
 
 (defn- pprint-code-symbol [sym]
-  (if *print-suppress-namespaces*
-    (print (name sym))
-    (pr sym)))
+  (if-let [arg-num (sym *symbol-map*)]
+    (print arg-num)
+    (if *print-suppress-namespaces*
+      (print (name sym))
+      (pr sym))))
 
 (defmulti code-dispatch
   "The pretty print dispatch function for pretty printing Clojure code."

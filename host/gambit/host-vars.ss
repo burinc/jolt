@@ -150,9 +150,8 @@
 ;; own arm answering (jolt-truthy? …) turned a pass into a definitive false —
 ;; the first library to register one shadowed every arm after it — and made the
 ;; library's answer look like a builtin one to instance-check's verdict memo,
-;; which must never cache what library code says (records-interop.ss).
-(define user-instance-checks '())
-(define (user-instance-checks-empty?) (null? user-instance-checks))
+;; which must never cache what library code says (records-interop.ss, which also
+;; holds user-instance-checks so it is bound before the seed prelude loads).
 (register-instance-check-user-arm!
   (lambda (type-sym val)
     (let ((tname (symbol-t-name type-sym)))

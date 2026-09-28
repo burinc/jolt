@@ -44,6 +44,13 @@
 (define (register-instance-check-user-arm! f)
   (register-instance-check-arm! f)
   (set! instance-check-user-arm f))
+;; The fns that arm asks, in registration order. Defined here, beside the memo
+;; that reads it, not in the host file that registers the arm: Gambit includes
+;; that file (host-vars.ss) after the seed prelude, and an instance? miss while
+;; the prelude loads -- clojure.pprint compiling a format with a numeric param
+;; -- died on the unbound name and silently dropped the def.
+(define user-instance-checks '())
+(define (user-instance-checks-empty?) (null? user-instance-checks))
 
 ;; Object / java.lang.Object is the root of the type hierarchy: every non-nil
 ;; value is an instance of Object; nil is not an instance of anything. This is
