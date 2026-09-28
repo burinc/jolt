@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(cl-format true ...)` called from a dispatch fn now writes into the active
   pretty writer as on the JVM; it buffered separately, so a pretty directive
   in it crashed.
+- **An `instance?` miss while the Gambit seed prelude loads no longer kills
+  the def.** The memo asked a host fn Gambit defines only after the prelude,
+  so the def threw and the seed's load guard dropped it silently. It is now
+  defined beside the memo on both hosts.
 - **`seq` on a `PersistentQueue` is O(1) (#1172).** It built the whole element
   list before returning the first cell, so `first`, `rest` and `next` on a
   queue cost its size. The seq now walks the front and then the reversed rear

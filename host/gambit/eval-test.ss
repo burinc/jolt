@@ -184,6 +184,10 @@
        "[3 \\b \"cba\" 3 true]")
 (check "(with-out-str (clojure.pprint/pprint {:a [1 2] :b \"x\"}))" "\"{:a [1 2], :b \\\"x\\\"}\\n\"")
 (check "(clojure.pprint/cl-format nil \"~5d|~a|~{~a~^,~}\" 42 :x [1 2 3])" "\"   42|:x|1,2,3\"")
+;; code-dispatch's table: pprint-if is a top-level formatter with a numeric
+;; param (~1I), compiled while the seed prelude loads; an instance? miss there
+;; once hit an unbound host fn and the def was dropped
+(check "(binding [clojure.pprint/*print-right-margin* 24] (with-out-str (clojure.pprint/with-pprint-dispatch clojure.pprint/code-dispatch (clojure.pprint/pprint '(defn f [x] (if (pos? x) (inc x) (dec x)))))))" "\"(defn \\n  f\\n  [x]\\n  (if\\n    (pos? x)\\n    (inc x)\\n    (dec x)))\\n\"")
 (check "(clojure.pprint/cl-format nil \"~,2f\" 3.14159)" "\"3.14\"")
 (check "(with-out-str (clojure.pprint/print-table [{:a 1 :b 2}]))"
        "\"\\n| :a | :b |\\n|----+----|\\n|  1 |  2 |\\n\"")

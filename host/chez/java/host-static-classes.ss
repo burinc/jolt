@@ -2041,7 +2041,7 @@
 
 ;; Pluggable instance? — a library registers (fn [class-name-string val] -> true
 ;; | false | nil); nil means "not my class, fall through". First non-nil wins.
-(define user-instance-checks '())
+;; user-instance-checks lives in records-interop.ss.
 (register-instance-check-user-arm!
   (lambda (type-sym val)
     (let ((tname (symbol-t-name type-sym)))
@@ -2052,7 +2052,6 @@
               (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
 ;; the bump retires every instance? answer cached while no library arm existed
 ;; (records-interop.ss jolt-instance-site) — the arm may claim any of them now
-(define (user-instance-checks-empty?) (null? user-instance-checks))
 (def-var! "clojure.core" "__register-instance-check!"
   (lambda (f)
     (set! user-instance-checks (append user-instance-checks (list f)))
