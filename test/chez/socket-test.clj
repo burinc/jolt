@@ -304,6 +304,29 @@
               (.available (.getInputStream b-peer)) 0)
     (finally (.close b-peer) (.close b) (.close a-peer) (.close server))))
 
+;; the rest of a closed socket's surface answers from the object, never the fd
+;; (which may be another socket's by now), and raises what the JVM raises.
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      a      (java.net.Socket. "127.0.0.1" port)
+      a-peer (.accept server)
+      u      (java.net.Socket.)
+      raised (fn [f] (try (f) :no-throw
+                          (catch java.net.SocketException e [:socket-exception (ex-message e)])))]
+  (check-eq "an unbound socket's local port is -1" (.getLocalPort u) -1)
+  (.close a) (.close u)
+  (check-eq "getInputStream on a closed socket" (raised #(.getInputStream a))
+            [:socket-exception "Socket is closed"])
+  (check-eq "getOutputStream on a closed socket" (raised #(.getOutputStream a))
+            [:socket-exception "Socket is closed"])
+  (check-eq "a closed unbound socket's local port is -1" (.getLocalPort u) -1)
+  (check-eq "connect on a closed socket"
+            (raised #(.connect u (java.net.InetSocketAddress. "127.0.0.1" port)))
+            [:socket-exception "Socket is closed"])
+  (.close a-peer) (.close server)
+  (check-eq "accept on a closed server socket" (raised #(.accept server))
+            [:socket-exception "Socket is closed"]))
+
 ;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
 ;; It answered 0 always, which java.io permits ("an estimate") but which leaves
 ;; (pos? (.available in)) false forever. ioctl is variadic, and binding it

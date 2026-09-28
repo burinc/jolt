@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.net.SocketException "Socket closed"`, as `available` already did and
   as the JVM does; zero-length calls still answer `0` / `nil`, like the JVM's
   (#1183).
+- **The rest of a closed `Socket` answers like the JVM's.** `getInputStream`,
+  `getOutputStream`, `connect` and `ServerSocket.accept` on a closed socket throw
+  `SocketException "Socket is closed"`, and `getLocalPort` of an unbound socket
+  is `-1` instead of a `getsockname` on an fd that may be another socket's.
 
 ## [0.8.14] - 2026-09-28
 

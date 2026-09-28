@@ -308,9 +308,12 @@
       (poller/forget! fd)))
   nil)
 
-(defn- socket-connect! [self endpoint]
+(defn- ensure-socket-open! [self]
   (when (jolt.host/ref-get self :closed?)
-    (throw (java.io.IOException. "Socket closed")))
+    (throw (java.net.SocketException. "Socket is closed"))))
+
+(defn- socket-connect! [self endpoint]
+  (ensure-socket-open! self)
   (when (jolt.host/ref-get self :connected?)
     (throw (java.io.IOException. "Already connected")))
   (let [h  (str (jolt.host/ref-get endpoint :host))
@@ -342,12 +345,14 @@
 
    "getInputStream"
    (fn [self]
+     (ensure-socket-open! self)
      (doto (tt :socket-input-stream "java.net.SocketInputStream")
        (jolt.host/ref-put! :fd (jolt.host/ref-get self :fd))
        (jolt.host/ref-put! :socket self)))
 
    "getOutputStream"
    (fn [self]
+     (ensure-socket-open! self)
      (doto (tt :socket-output-stream "java.net.SocketOutputStream")
        (jolt.host/ref-put! :fd (jolt.host/ref-get self :fd))
        (jolt.host/ref-put! :socket self)))
@@ -356,8 +361,9 @@
    "isConnected"  (fn [self] (boolean (jolt.host/ref-get self :connected?)))
    "isClosed"     (fn [self] (boolean (jolt.host/ref-get self :closed?)))
    "isBound"      (fn [self] (boolean (jolt.host/ref-get self :connected?)))
-   "getLocalPort" (fn [self] (or (jolt.host/ref-get self :local-port)
-                                 (local-port (jolt.host/ref-get self :fd))))
+   ;; -1 until connected, as Java answers for an unbound socket. Never asked of
+   ;; the fd: once closed its number may be another socket's.
+   "getLocalPort" (fn [self] (or (jolt.host/ref-get self :local-port) -1))
    "getPort"      (fn [self] (or (jolt.host/ref-get self :port) 0))
    "toString"     socket->str
 
@@ -595,7 +601,7 @@
   {"accept"
    (fn [self]
      (when (jolt.host/ref-get self :closed?)
-       (throw (java.io.IOException. "ServerSocket closed")))
+       (throw (java.net.SocketException. "Socket is closed")))
      ;; A no-arg socket has an fd but nothing is listening on it, so accept would
      ;; block or fail obscurely. Java names the case.
      (when-not (jolt.host/ref-get self :bound?)
