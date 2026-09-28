@@ -901,6 +901,124 @@
                  (empty? @spy))))
         (l/unload! ctx)))))
 
+;; --- 38. eval-in: a source string evaluates in the context -------------------
+;; `eval`/`load-string` never consult the ambient loader, because the
+;; context-carrying rewrite is bound only while a namespace source the loader
+;; itself reads compiles; a string evaluated under `with-loader` therefore
+;; requires from the runtime's global roots. `eval-in` is the loaded-source
+;; code path for a string: the hook is bound around the evaluation, so
+;; require/resolve/... carry the context.
+(defcase 38 "eval-in evaluates a source string in a context and gates requires"
+  (let [d (write! (root-dir "evalin") "libev.clj" "(ns libev) (defn v [] :evaluated)")
+        ctx (l/classpath [d] {:parent (l/isolated)})]
+    (chk "a body answers the last form's value"
+         (= 3 (l/eval-in ctx "script.a" "1 2 3")))
+    (l/eval-in ctx "script.b" "(def x 7)")
+    (chk "a def interns a var that resolves through the context"
+         (= 7 (val-of (l/resolve ctx {:kind :var :name "script.b/x"}))))
+    (chk "a require loads through the context's roots"
+         (= :evaluated (l/eval-in ctx "script.c" "(require '[libev :as e]) (e/v)")))
+    (chk "an ns form's requires load through the context too"
+         (= :evaluated (l/eval-in ctx "script.d"
+                                  "(ns script.d (:require [libev :as e])) (e/v)")))
+    (let [err (try (l/eval-in ctx "script.e" "(require '[clojure.string :as s])")
+                   nil (catch :default e e))]
+      (chk "a dependency the context cannot serve is refused"
+           (= :loader/unreadable (:type (ex-data err))))
+      (chk "and the dependency is named"
+           (some? (re-find #"clojure.string" (ex-message err)))))
+    (let [err (try (l/eval-in ctx "script.f" "(ns other.name) 1")
+                   nil (catch :default e e))]
+      (chk "an ns form for another name is refused"
+           (= :loader/bad-request (:type (ex-data err)))))
+    (let [err (try (l/eval-in ctx "script.g" "(ns script.g) 1 (ns other.escape) 2")
+                   nil (catch :default e e))]
+      (chk "an ns form later in the source is refused"
+           (= :loader/bad-request (:type (ex-data err))))
+      (chk "and did not install its namespace" (nil? (find-ns 'other.escape)))
+      (chk "and the fresh namespace rolled back" (nil? (find-ns 'script.g))))
+    (let [err (try (l/eval-in ctx "script.h"
+                              "(ns script.h) (clojure.core/ns other.esc2) 2")
+                   nil (catch :default e e))]
+      (chk "the qualified spelling is refused too"
+           (= :loader/bad-request (:type (ex-data err))))
+      (chk "and did not install its namespace" (nil? (find-ns 'other.esc2))))
+    (let [err (try (l/eval-in ctx "script.i"
+                              "(eval '(require '[clojure.string :as s])) 1")
+                   nil (catch :default e e))]
+      (chk "a runtime eval in the source is still gated"
+           (= :loader/unreadable (:type (ex-data err)))))
+    (let [err (try (l/eval-in ctx "script.l"
+                              "(in-ns 'other.left) (require '[clojure.string :as s])")
+                   nil (catch :default e e))]
+      (chk "a top-level in-ns fails the evaluation"
+           (= :loader/bad-request (:type (ex-data err)))))
+    (let [err (try (l/eval-in ctx "script.m" "(do (in-ns 'other.mid))")
+                   nil (catch :default e e))]
+      (chk "a switch nested in a top-level form fails it too"
+           (= :loader/bad-request (:type (ex-data err)))))
+    (chk "the :file option is bound to *file*"
+         (= "custom.txt" (l/eval-in ctx "script.j" "*file*" {:file "custom.txt"})))
+    (chk "and *file* defaults to nil"
+         (nil? (l/eval-in ctx "script.k" "*file*")))
+    (let [err (try (l/eval-in ctx "clojure.string" "1")
+                   nil (catch :default e e))]
+      (chk "an installed namespace the loader does not own is refused"
+           (= :loader/bad-request (:type (ex-data err)))))
+    (let [err (try (l/eval-in ctx "a/b" "1")
+                   nil (catch :default e e))]
+      (chk "a non-simple namespace name is refused"
+           (= :loader/bad-request (:type (ex-data err)))))
+    ;; a loader with no namespace backend of its own still links what was
+    ;; evaluated through it, so its vars resolve
+    (let [custom (l/->loader (fn [_req] nil))]
+      (chk "a custom loader answers the evaluated value"
+           (= 5 (l/eval-in custom "script.custom" "(def c 5) c")))
+      (chk "and links the evaluated var"
+           (= 5 (val-of (l/resolve custom {:kind :var :name "script.custom/c"})))))))
+
+;; --- 39. eval-in keeps the namespace across calls ----------------------------
+;; Eval into the same name is a REPL, not a reload: the installed namespace and
+;; its cells stay, so a var another compilation already links keeps working.
+(defcase 39 "eval-in re-evaluates in place and unload! unmaps the namespace"
+  (let [ctx (l/classpath [(root-dir "evalin2")] {:parent (l/isolated)})]
+    (l/eval-in ctx "script.re" "(def counter 0)")
+    (let [cell (l/resolve ctx {:kind :var :name "script.re/counter"})]
+      (chk "the var resolves after the first call" (some? cell))
+      (l/eval-in ctx "script.re" "(def counter (inc counter))")
+      (chk "the second call keeps the namespace (same cell)"
+           (identical? cell (l/resolve ctx {:kind :var :name "script.re/counter"})))
+      (chk "and evaluates in place" (= 1 (val-of cell))))
+    (chk "the namespace link is installed"
+         (seq (l/find ctx {:kind :ns :name "script.re"})))
+    (l/unload! ctx)
+    (chk "unload! unmaps the context's namespace"
+         (nil? (find-ns 'script.re))))
+  ;; a policy wrapper releases nothing of its own, so the name belongs to the
+  ;; loader whose unload! can release it — the base — while the wrapper's own
+  ;; policy still gates the evaluation's requires
+  (let [base (l/classpath [(write! (root-dir "evalin3") "libw.clj"
+                                   "(ns libw) (defn v [] :w)")]
+                          {:parent (l/isolated)})
+        wrapped (l/allow base #{"script"})]
+    (l/eval-in wrapped "script.w" "(def v :wrapped)")
+    (chk "a wrapper evaluates through its base"
+         (= :wrapped (val-of (l/resolve base {:kind :var :name "script.w/v"}))))
+    (chk "and find answers it through the wrapper too"
+         (some? (first (l/find wrapped {:kind :var :name "script.w/v"}))))
+    (let [denied (l/deny base #{"libw"})
+          err (try (l/eval-in denied "script.g" "(require '[libw :as w]) (w/v)")
+                   nil (catch :default e e))]
+      (chk "the wrapper's policy gates the evaluation's requires"
+           (:loader/denied (ex-data err))))
+    (l/unload! base)
+    (chk "the base's unload! unmaps a wrapper-evaluated namespace"
+         (nil? (find-ns 'script.w)))
+    (let [err (try (l/eval-in wrapped "script.dead" "1")
+                   nil (catch :default e e))]
+      (chk "an unloaded owner refuses further evaluation"
+           (= :loader/unloaded (:type (ex-data err)))))))
+
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]
   (reset! failures [])
