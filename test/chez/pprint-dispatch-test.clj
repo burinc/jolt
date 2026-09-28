@@ -86,6 +86,90 @@
      "foo.bar/baz\n"
      "code-dispatch keeps a symbol's namespace without suppression")
 
+;; --- code-dispatch: the code table ----------------------------------------------
+;; A list whose head names a known form gets that form's layout, as in the
+;; reference's *code-table*. Expected strings are Clojure 1.12.0's output.
+(defn- code-out [margin form]
+  (binding [clojure.pprint/*print-right-margin* margin
+            clojure.pprint/*print-pprint-dispatch* clojure.pprint/code-dispatch]
+    (out form)))
+
+(ok= (code-out 72 '(defn classify [{:keys [text limit]}]
+                     (let [n (or limit 25) words (clojure.string/split text #" ")]
+                       (if (> (count words) n) {:severity "high" :count (count words)} {:severity "low"}))))
+     (str "(defn classify [{:keys [text limit]}]\n"
+          "  (let [n (or limit 25) words (clojure.string/split text #\" \")]\n"
+          "    (if (> (count words) n)\n"
+          "      {:severity \"high\", :count (count words)}\n"
+          "      {:severity \"low\"})))\n")
+     "code-dispatch: defn, let and if hold their head arguments")
+(ok= (code-out 72 '(fn [xs] (cond (empty? xs) {:error "no items to process here"}
+                                  (> (count xs) 10) (take 10 (sort-by :name xs))
+                                  :else (map #(assoc % :seen true) xs))))
+     (str "(fn [xs]\n"
+          "  (cond\n"
+          "    (empty? xs) {:error \"no items to process here\"}\n"
+          "    (> (count xs) 10) (take 10 (sort-by :name xs))\n"
+          "    :else (map #(assoc % :seen true) xs)))\n")
+     "code-dispatch: cond pairs its clauses and #() prints as the reader form")
+(ok= (code-out 72 '(ns my.app.core "The core namespace of the application here." {:author "someone"}
+                     (:require [clojure.string :as str] [clojure.set :refer [union intersection difference]]
+                               [my.app.db :as db])
+                     (:import (java.util Date UUID) [java.io File])))
+     (str "(ns my.app.core\n"
+          "  \"The core namespace of the application here.\"\n"
+          "  {:author \"someone\"}\n"
+          "  (:require [clojure.string :as str]\n"
+          "            [clojure.set :refer [union intersection difference]]\n"
+          "            [my.app.db :as db])\n"
+          "  (:import (java.util Date UUID) [java.io File]))\n")
+     "code-dispatch: ns keeps its name on the head line and aligns libspecs")
+(ok= (code-out 72 '(condp = x 1 "one one one one one one" 2 "two two two two two two two"
+                     "something else entirely here"))
+     (str "(condp = x\n"
+          "  1 \"one one one one one one\"\n"
+          "  2 \"two two two two two two two\"\n"
+          "  \"something else entirely here\")\n")
+     "code-dispatch: condp pairs its clauses")
+(ok= (code-out 72 '(defn- helper "A docstring that is reasonably long for the test."
+                     ([a] (helper a 1)) ([a b] (+ a b b b b b b b b b b b b b b b b))))
+     (str "(defn- helper\n"
+          "  \"A docstring that is reasonably long for the test.\"\n"
+          "  ([a] (helper a 1))\n"
+          "  ([a b] (+ a b b b b b b b b b b b b b b b b)))\n")
+     "code-dispatch: a multi-arity defn- with a docstring")
+(ok= (code-out 72 '(map #(+ %1 %2 100000000 200000000 300000000 400000000) first-list-of-things second-list))
+     (str "(map\n"
+          "  #(+ %1 %2 100000000 200000000 300000000 400000000)\n"
+          "  first-list-of-things\n"
+          "  second-list)\n")
+     "code-dispatch: #() numbers its params past one")
+(ok= (code-out 72 '(let [a-very-long-binding-name (compute-something-expensive with-arguments)
+                         another-binding-name (other-computation a-very-long-binding-name)]
+                     (+ a-very-long-binding-name another-binding-name)))
+     (str "(let [a-very-long-binding-name (compute-something-expensive\n"
+          "                                 with-arguments)\n"
+          "      another-binding-name (other-computation\n"
+          "                             a-very-long-binding-name)]\n"
+          "  (+ a-very-long-binding-name another-binding-name))\n")
+     "code-dispatch: let bindings break in pairs")
+(ok= (code-out 72 '(-> request (assoc :user current-user) (update :count inc) (dissoc :password :secret)))
+     (str "(-> request\n"
+          " (assoc :user current-user)\n"
+          " (update :count inc)\n"
+          " (dissoc :password :secret))\n")
+     "code-dispatch: -> holds its first argument")
+
+;; (cl-format true ...) inside a dispatch fn writes into the active pretty
+;; writer, so its pretty directives see the enclosing logical block (pprint-ns
+;; does this for a docstring).
+(ok= (binding [clojure.pprint/*print-pprint-dispatch*
+               (fn [x] (clojure.pprint/pprint-logical-block :prefix "<" :suffix ">"
+                         (clojure.pprint/cl-format true "~a~:@_~a" (first x) (second x))))]
+       (out [:a :b]))
+     "<:a\n :b>\n"
+     "cl-format true inside a dispatch fn writes into the pretty writer")
+
 ;; --- the interop form core.logic uses: (. simple-dispatch addMethod Type f) -----
 ;; These mutate the dispatch table. On a record's class (an IPersistentMap) the
 ;; exact-class method must win over the built-in IPersistentMap arm.
