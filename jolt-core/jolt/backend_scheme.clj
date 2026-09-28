@@ -783,6 +783,44 @@
          (every? (fn [k] (and (= :const (:op k)) (keyword? (:val k)))) ks)
          (apply distinct? (map :val ks)))))
 
+;; The pool's bindings as flat `let` layers by dependency depth: layer 0 holds the
+;; constants that reference no other constant, layer k those whose deepest
+;; reference is in layer k-1. A pool is mostly keywords, symbols and var cells
+;; that reference nothing, so this is two or three layers.
+;;
+;; It was one let*, which Chez compiles as one nested scope per binding, and that
+;; is quadratic in the pool: 1600 bindings took 56 ms where the same bindings in a
+;; flat let took 10, 3200 took 230 against 36. A bare top-level fn has had a pool
+;; since the keyword re-intern fix, so a (fn [] …) holding 400 (is …) forms went
+;; from 850 ms to 1.4 s of Chez compile on output that had got SMALLER, and
+;; compilescaling's 1x->4x ratio climbed from 4.3 to 7 on CI. A reference to a
+;; label inside a string literal can only put an entry a layer too deep, which is
+;; still bound before everything that reads it.
+;;
+;; The labels are found by a string scan, not a regex: the compiler runs in
+;; profiles built without the regex group (gambitprofile).
+(defn- pool-label-refs [expr]
+  (let [n (count expr)]
+    (loop [from 0 acc []]
+      (if-let [i (str/index-of expr "_kc$" from)]
+        (let [j (loop [j (+ i 4)]
+                  (if (and (< j n) (let [c (nth expr j)] (and (>= (int c) 48) (<= (int c) 57))))
+                    (recur (inc j))
+                    j))]
+          (recur j (if (> j (+ i 4)) (conj acc (subs expr i j)) acc)))
+        acc))))
+
+(defn- pool-layers [consts]
+  (let [depth (volatile! {})]
+    (reduce (fn [layers [nm _ expr]]
+              (let [d (reduce (fn [d ref] (if-let [rd (get @depth ref)] (max d (inc rd)) d))
+                              0
+                              (pool-label-refs expr))]
+                (vswap! depth assoc nm d)
+                (update layers d (fnil conj []) (str "(" nm " " expr ")"))))
+            []
+            consts)))
+
 (defn- emit-with-scope [cells? emit-thunk]
   (let [cells (when cells? (atom []))
         pool (atom {})
@@ -791,18 +829,20 @@
                       *const-pool* pool
                       *const-ids* ids]
               (emit-thunk))
-        ;; constants bind eagerly (value first); lazy cache cells start #f. Ordered
-        ;; by INSERTION so a constant that references an earlier one (a hoisted
-        ;; collection literal over its hoisted keywords) is bound after it; see
-        ;; hoist-const. Deterministic for a given emit, which is what the seed
-        ;; fixpoint needs.
-        consts (map (fn [p] (str "(" (first (val p)) " " (nth (val p) 2) ")"))
-                    (sort-by (comp second val) @pool))
-        lazies (map (fn [c] (str "(" c " #f)")) (when cells @cells))
-        binds  (concat consts lazies)]
-    (if (seq binds)
-      ;; let*, not let: the consts can depend on each other now.
-      (str "(let* (" (str/join " " binds) ") " raw ")")
+        ;; constants bind eagerly (value first); lazy cache cells start #f. Walked
+        ;; in INSERTION order, which is topological: a constant that references an
+        ;; earlier one (a hoisted collection literal over its hoisted keywords) was
+        ;; interned after it; see hoist-const. Deterministic for a given emit,
+        ;; which is what the seed fixpoint needs.
+        consts (map val (sort-by (comp second val) @pool))
+        layers (pool-layers consts)
+        layers (if (and cells (seq @cells))
+                 (update layers 0 (fnil into []) (map (fn [c] (str "(" c " #f)")) @cells))
+                 layers)]
+    (if (seq layers)
+      (reduce (fn [inner layer] (str "(let (" (str/join " " layer) ") " inner ")"))
+              raw
+              (rseq layers))
       raw)))
 (defn- emit-with-cells [emit-thunk] (emit-with-scope true emit-thunk))
 

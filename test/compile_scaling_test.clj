@@ -61,7 +61,11 @@
 (def ^:private factor 4)
 ;; Linear measures 4.0, quadratic 16. Measured 4.3-4.4 at this sizing on both
 ;; sides of the pool change, so the line goes at 7.0: well clear of a loaded
-;; machine, and less than half way to quadratic.
+;; machine, and less than half way to quadratic. It read 6.2-6.9 locally and
+;; failed on CI once a bare top-level fn got a constant pool: the pool was one
+;; let*, which Chez compiles quadratically, and this arm IS a bare top-level fn.
+;; Emitting the pool as flat let layers (backend_scheme.clj pool-layers) put it
+;; back at 4.7-5.0.
 (def ^:private max-shape 7.0)
 (def ^:private clear-shape 12.0)
 
