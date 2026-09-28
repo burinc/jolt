@@ -1657,6 +1657,9 @@
   {:suite "walk" :expr "(do (require (quote [clojure.walk :as w])) (w/prewalk-replace {'* '* 'y 3} '(* y y)))" :expected "(* 3 3)"}
   {:suite "walk" :expr "(do (require (quote [clojure.walk :as w])) (w/postwalk-replace {:a 1 :b 2} '(:a [:b :a])))" :expected "(1 [2 1])"}
   {:suite "walk" :expr "(do (require (quote [clojure.walk :as w])) (w/postwalk-replace {1 :one} [1 2 1]))" :expected "[:one 2 :one]"}
+  {:suite "walk" :expr "(do (require (quote [clojure.walk :as w])) (w/walk inc identity #{1 3}))" :expected "#{4 2}"}
+  {:suite "walk" :expr "(do (require (quote [clojure.walk :as w])) (w/postwalk-replace {1 :one} {:a #{1 2}}))" :expected "{:a #{:one 2}}"}
+  {:suite "walk" :expr "(do (require (quote [clojure.walk :as w])) (sorted-set? (w/postwalk identity (sorted-set 3 1 2))))" :expected "true"}
   {:suite "walk" :expr "(do (require (quote [clojure.template :as t])) (t/apply-template '[x y] '(+ x y) '(1 2)))" :expected "(+ 1 2)"}
   {:suite "shadowing" :expr "(let [if (fn [a b c] :L)] (if true 1 2))" :expected "1"}
   {:suite "shadowing" :expr "(let [quote (fn [_] :L)] (quote x))" :expected "x"}
