@@ -2031,15 +2031,20 @@
         (cons "toString" (lambda (self) (string-append "#<Process pid=" (number->string (proc-p-pid self)) ">")))))
 
 ;; timed waitFor -> #t if exited within `ms`, else #f (polls at ~10ms).
+;; Against a deadline, not a count of steps: each pause runs a little past its
+;; step and the liveness check costs time too, so counting steps waited ~17%
+;; past what was asked (1000 ms came back at ~1170, 5000 at ~5840).
 (define (proc-wait-timed st ms)
-  (let ((step 10))
-    (let loop ((remaining ms))
-      (cond ((not (proc-alive? st)) #t)
-            ((<= remaining 0) #f)
-            ;; a fiber parks for the step rather than sleeping its carrier
-            (else (jolt-interrupt-poll-check! "Process.waitFor")
-                  (jolt-pause-ms step)
-                  (loop (- remaining step)))))))
+  (let ((step 10)
+        (deadline (+ (now-millis) ms)))
+    (let loop ()
+      (let ((remaining (- deadline (now-millis))))
+        (cond ((not (proc-alive? st)) #t)
+              ((<= remaining 0) #f)
+              ;; a fiber parks for the step rather than sleeping its carrier
+              (else (jolt-interrupt-poll-check! "Process.waitFor")
+                    (jolt-pause-ms (min step remaining))
+                    (loop)))))))
 
 ;; --- java.lang.ProcessHandle (destroy-tree) ----------------------------------
 ;; descendants asks the OS for the live tree under a pid — jolt tracks nothing
