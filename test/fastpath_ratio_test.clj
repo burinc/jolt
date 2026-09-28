@@ -160,8 +160,15 @@
         v (f)]
     [(/ (- (System/nanoTime) t) 1e6) v]))
 
+;; Each sample starts from a fresh collection. An arm that allocates a few MB per
+;; call (chars-copy builds a 1.5M-character string on both sides) trips a
+;; collection every call or two, and which arm pays for it depends on where the
+;; allocation counter happened to stand: the same binary read chars-copy at 0.33,
+;; 0.34 and 1.40 in three runs, and 2.43 on a bionic runner against a 1.5
+;; ceiling. After a collect the phase is the same for both arms, and twelve
+;; ratios read 0.40-0.42.
 (defn- best-of [k f]
-  (reduce min (map first (repeatedly k #(timed f)))))
+  (reduce min (map first (repeatedly k #(do (System/gc) (timed f))))))
 
 (def ^:private failures (atom []))
 
