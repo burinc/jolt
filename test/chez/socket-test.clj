@@ -264,6 +264,46 @@
     (.close (.getInputStream conn))
     (check-eq "stream close closes socket" (.isClosed conn) true)))
 
+;; a closed socket's streams raise instead of touching the fd: the number is
+;; free once closed, and the next socket to open gets it. Without the guard A's
+;; read takes B's first byte and A's write reaches B's peer (jolt#1183). The JVM
+;; prints SocketException "Socket closed" for every call below.
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      a      (java.net.Socket. "127.0.0.1" port)
+      a-peer (.accept server)
+      a-in   (.getInputStream a)
+      a-out  (.getOutputStream a)
+      _      (.close a)
+      b      (java.net.Socket. "127.0.0.1" port)
+      b-peer (.accept server)
+      raised (fn [f] (try (f) :no-throw
+                          (catch java.net.SocketException e [:socket-exception (ex-message e)])))]
+  (try
+    (let [msg (.getBytes "hello-B" "UTF-8")]
+      (.write (.getOutputStream b-peer) msg 0 (alength msg)))
+    (check-eq "read() on a closed socket" (raised #(.read a-in)) [:socket-exception "Socket closed"])
+    (check-eq "read(b) on a closed socket" (raised #(.read a-in (byte-array 4)))
+              [:socket-exception "Socket closed"])
+    (check-eq "read(b off len) on a closed socket" (raised #(.read a-in (byte-array 4) 0 4))
+              [:socket-exception "Socket closed"])
+    (check-eq "write(int) on a closed socket" (raised #(.write a-out 65))
+              [:socket-exception "Socket closed"])
+    (check-eq "write(b) on a closed socket" (raised #(.write a-out (.getBytes "from-A")))
+              [:socket-exception "Socket closed"])
+    (check-eq "write(b off len) on a closed socket" (raised #(.write a-out (.getBytes "from-A") 0 6))
+              [:socket-exception "Socket closed"])
+    ;; zero-length calls never reach the fd, and the JVM answers them closed
+    (check-eq "zero-length calls on a closed socket"
+              [(.read a-in (byte-array 0)) (.read a-in (byte-array 4) 0 0)
+               (.write a-out (byte-array 0)) (.write a-out (byte-array 4) 0 0)]
+              [0 0 nil nil])
+    (let [buf (byte-array 64) n (.read (.getInputStream b) buf 0 64)]
+      (check-eq "the next socket keeps its own bytes" (String. buf 0 n "UTF-8") "hello-B"))
+    (check-eq "the next socket's peer got nothing from the closed one"
+              (.available (.getInputStream b-peer)) 0)
+    (finally (.close b-peer) (.close b) (.close a-peer) (.close server))))
+
 ;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
 ;; It answered 0 always, which java.io permits ("an estimate") but which leaves
 ;; (pos? (.available in)) false forever. ioctl is variadic, and binding it

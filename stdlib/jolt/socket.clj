@@ -415,18 +415,24 @@
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
 
+;; A stream of a closed socket must not reach its fd: close frees the number,
+;; and the next socket to open is handed it, so a read would take that socket's
+;; bytes and a write would send to its peer (jolt#1183). The socket carries the
+;; flag, so this is a KNOWN error and raises what Java raises — SocketException,
+;; a subclass of IOException, so a catch of either sees it. A zero-length read
+;; or write never reaches the fd and answers 0 / nil on a closed socket, as the
+;; JVM's does, so callers guard after that shortcut.
+(defn- ensure-open! [stream]
+  (when (jolt.host/ref-get (jolt.host/ref-get stream :socket) :closed?)
+    (throw (java.net.SocketException. "Socket closed"))))
+
 ;; InputStream.available — the same question the JVM asks, through the same
 ;; syscall: ioctl(fd, FIONREAD, &n) reports what has arrived without reading it
 ;; or waiting for more. The binding is what has to be right; see c-ioctl above.
 (defn- socket-available [self]
-  ;; Closed is an error on both, and here it is a KNOWN one — the socket carries
-  ;; the flag — so it raises rather than answering, where a recv error can only
-  ;; read as EOF. SocketException is the class Java raises and a subclass of
-  ;; IOException, so a catch of either sees it. Asking the kernel is also not an
-  ;; option once the fd is closed: the number is free to be reused by the next
-  ;; socket, and the count would be somebody else's.
-  (when (jolt.host/ref-get (jolt.host/ref-get self :socket) :closed?)
-    (throw (java.net.SocketException. "Socket closed")))
+  ;; Closed raises rather than answering 0, where a recv error can only read as
+  ;; EOF; asking the kernel would count some other socket's bytes.
+  (ensure-open! self)
   (let [fd (jolt.host/ref-get self :fd)
         out (ffi/alloc 4)]
     (try
@@ -443,6 +449,7 @@
   {"read"
    (fn
      ([self]
+      (ensure-open! self)
       (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
         (try
           (let [{:keys [n]} (do-recv fd buf 1)]
@@ -451,7 +458,7 @@
      ([self b]
       (let [fd (jolt.host/ref-get self :fd) len (alength b)]
         (if (zero? len) 0
-            (let [buf (ffi/alloc len)]
+            (let [_ (ensure-open! self) buf (ffi/alloc len)]
               (try
                 (let [{:keys [n bytes]} (do-recv fd buf len)]
                   (if (pos? n) (do (dotimes [i n] (aset b i (nth bytes i))) n) -1))
@@ -459,7 +466,7 @@
      ([self b off len]
       (let [fd (jolt.host/ref-get self :fd)]
         (if (zero? len) 0
-            (let [buf (ffi/alloc len)]
+            (let [_ (ensure-open! self) buf (ffi/alloc len)]
               (try
                 (let [{:keys [n bytes]} (do-recv fd buf len)]
                   (if (pos? n) (do (dotimes [i n] (aset b (+ off i) (nth bytes i))) n) -1))
@@ -480,6 +487,7 @@
 
 (defn- write-bytes! [self bytes off len]
   (when (pos? len)
+    (ensure-open! self)
     (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]
       (try
         (dotimes [i len]
@@ -501,7 +509,9 @@
      ([self b]
       (if (bytes? b)
         (write-bytes! self b 0 (alength b))
-        (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
+        (let [_ (ensure-open! self)
+              fd (jolt.host/ref-get self :fd)
+              buf (ffi/alloc 1)]
           (try
             (ffi/write buf :uint8 (bit-and (int b) 0xff))
             (send-fully! fd buf 1)
