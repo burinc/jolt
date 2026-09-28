@@ -671,10 +671,15 @@
 
 ;; A port collected without being closed hands its lifetime back here; drained
 ;; at each spawn, which is when the process is about to want descriptors.
+;; Dequeuing from a guardian is not safe from two threads at once: spawning
+;; threads draining it together corrupted it (an invalid memory reference within
+;; a few hundred spawns on bionic), so the drain holds a lock. Registering needs
+;; none, since it goes on the calling thread's own list until a collection.
 (define proc-fd-guardian (make-guardian))
+(define proc-fd-guardian-mutex (make-mutex))
 (define (proc-fd-collect-released!)
   (let loop ()
-    (let ((l (proc-fd-guardian)))
+    (let ((l (jolt-with-mutex proc-fd-guardian-mutex (proc-fd-guardian))))
       (when l (proc-fd-shut! l) (loop)))))
 
 ;; the stdin lifetime of each live child port, for proc-shut-stdin!

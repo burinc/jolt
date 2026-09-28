@@ -751,6 +751,23 @@
 ;; the JDK does, so output nobody reads does not hold descriptors until a
 ;; collection; output written before the exit is still there to read after it,
 ;; and stdin is closed, so a write to it then raises.
+;; Pipes dropped unread are released through a guardian that every spawn drains,
+;; so spawning threads drain it together. Unserialized, that corrupted it: every
+;; run of this on bionic either raised an invalid memory reference or killed the
+;; process. Four threads spawning at once, then one more on this thread, round
+;; after round, so collections keep handing dropped ports to concurrent drains.
+(check-eq "spawning threads drain dropped pipes without corrupting them"
+          (let [errs (atom [])
+                safe #(try (let [pr (.start (java.lang.ProcessBuilder. ["sh" "-c" "echo $$"]))]
+                             (slurp (.getInputStream pr)) (.waitFor pr))
+                           (catch Throwable e (swap! errs conj (ex-message e))))]
+            (dotimes [_ 40]
+              (let [ts (mapv (fn [_] (Thread. #(dotimes [_ 16] (safe)))) (range 4))]
+                (doseq [t ts] (.start t))
+                (doseq [t ts] (.join t))
+                (safe)))
+            (take 3 @errs))
+          [])
 (check-eq "unread pipes are released at exit"
           (<= (fd-growth #(deref (process "true"))) 4)
           true)
