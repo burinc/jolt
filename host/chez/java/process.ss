@@ -602,132 +602,204 @@
 ;; failed"`). A short write returns its count and Chez's port machinery
 ;; re-calls for the rest.
 ;;
-;; The `closed?` box each port allocates alongside its buf is what makes the
-;; close proc safe against a fiber PARKED in that retry loop. Close is three
-;; steps -- free buf, close fd, forget the fd -- and the third wakes any parked
-;; waiter through jolt.io-poller. That wake is ASYNCHRONOUS: jolt.host's
-;; fiber-resume -> sa-fiber-resume (host/chez/fibers.ss) only flips the fiber to
-;; 'ready and enqueues it on its carrier's run queue; the fiber's continuation
-;; runs later, on the carrier thread. Between the wake and that continuation
-;; there is a real scheduling gap, and by then buf is already free()d
-;; (sa-foreign-free is a bare foreign-free -- no pooling, no quarantine) and fd
-;; is already closed. A closed fd number is immediately eligible for reuse by
-;; ANY concurrent pipe/socket/open/accept anywhere in the process -- POSIX hands
-;; out the lowest free number, and jolt.process exists to support many
-;; concurrent spawns -- so without the flag the woken fiber's (retry) calls
-;; proc-c-read/proc-c-write with a fd that is valid again but belongs to
-;; something else entirely, handing the kernel a pointer into freed memory. That
-;; stale retry could also re-register the reused fd with jolt.io-poller,
-;; cross-talking with its new owner's registration. proc-spawn-fd-mutex does not
-;; help: it covers only the pipe()-through-posix_spawn sequence, not close and
-;; not fd allocation in general.
+;; Each port's fd and buf are owned by a lifetime (proc-fd-life): a count of the
+;; reads and writes in flight, and a shut? flag. Shutting stops new operations,
+;; wakes a fiber parked on the fd (proc-poller-forget!), and releases -- frees
+;; buf, closes fd -- only when the count reaches zero, so the release is done by
+;; whichever of the closer or the last operation out comes second. That is the
+;; JDK's FileDescriptor use count, and it is what makes a shut from another
+;; thread safe: a closed fd number is reused at once by any open/pipe/accept in
+;; the process, so an operation still holding it would read, write, or register
+;; with jolt.io-poller on someone else's descriptor, into freed memory. The
+;; forget runs while the fd is still ours, both at the shut and again just
+;; before the close.
 ;;
-;; So the close proc sets closed? FIRST, before it frees, closes, or forgets,
-;; and the retry loop tests it at the TOP of EVERY iteration -- the first one
-;; included, not just the one after a park. The ordering is what makes that test
-;; sound rather than hopeful: set-box! happens before proc-poller-forget!, which
-;; reaches sa-fiber-resume, which takes and releases the carrier's mutex to
-;; enqueue the fiber; the carrier thread takes that SAME mutex in
-;; jolt-fiber-dequeue! before it can run the fiber at all. A release/acquire
-;; pair on one mutex, so the #t is published to the woken fiber -- it cannot
-;; observe a stale #f, and it cannot have cached the read across the park, since
-;; the park sits behind proc-poller-wait-ready's opaque var-deref'd call. Same
-;; box/set-box!/unbox shape concurrency.ss uses for its own cross-thread flag
-;; (agents-shutdown?).
+;; A port is shut by close-port, by reading a true EOF on it (the write end is
+;; gone for good, and the JVM's pipe stream likewise lets go of its descriptor
+;; once the child exits), by proc-shut-stdin! when the child's exit is
+;; recorded (the JDK closes a child's stdin then), and, for a pipe nobody read
+;; to the end or closed, by the guardian below once the port is unreachable.
 ;;
-;; Each side short-circuits the way it already reports a dead pipe: the read
-;; side returns 0 (the `(else 0)` EOF convention below), the write side raises
-;; (the `error 'process` convention below) -- with its own message, so a port
-;; closed under a parked write is not misreported as a failing child.
+;; A shut port reads as EOF and raises on write, with its own message, so a
+;; port shut under a parked write is not misreported as a failing child.
 ;;
-;; Deliberately NOT covered: a close racing a syscall already IN FLIGHT on
-;; another thread rather than parked. That caller read fd and buf before any
-;; flag could be set, so no flag can help it; it is a pre-existing hazard of
-;; closing a port other threads are actively using, not something this adds.
-;;
-;; Also NOT covered: a fiber that has decided to call proc-poller-wait-ready but
-;; has not yet registered when close runs -- forget! finds nothing to drop,
-;; then the fiber registers on an already-dead fd. That is a strand (a hang),
-;; not a use-after-free; closing it needs coordination on the jolt.io-poller
-;; side (a register/forget race), left out of scope here. Pre-existing,
-;; not introduced by this fix.
+;; Not covered: a fiber that has decided to call proc-poller-wait-ready but has
+;; not yet registered when the shut runs registers on a live fd that nothing will
+;; wake if the pipe stays quiet. That is a strand (a hang), not a use-after-free;
+;; closing it needs coordination on the jolt.io-poller side.
 (define proc-fd-buf-size 32768)
+(define-record-type proc-fd-life
+  (fields fd buf mutex (mutable busy) (mutable shut?) (mutable released?))
+  (nongenerative jolt-proc-fd-life-v1))
+(define (proc-fd-life-new fd)
+  (make-proc-fd-life fd (sa-foreign-alloc proc-fd-buf-size) (make-mutex) 0 #f #f))
+;; -> #t with the operation counted, or #f when the port is already shut
+(define (proc-fd-enter! l)
+  (jolt-with-mutex (proc-fd-life-mutex l)
+    (and (not (proc-fd-life-shut? l))
+         (begin (proc-fd-life-busy-set! l (fx+ (proc-fd-life-busy l) 1)) #t))))
+;; the release, claimed under the mutex and run outside it
+(define (proc-fd-claim-release! l)
+  (and (proc-fd-life-shut? l) (fx=? (proc-fd-life-busy l) 0)
+       (not (proc-fd-life-released? l))
+       (begin (proc-fd-life-released?-set! l #t) #t)))
+(define (proc-fd-release! l)
+  (proc-poller-forget! (proc-fd-life-fd l))
+  (sa-foreign-free (proc-fd-life-buf l))
+  (proc-c-close (proc-fd-life-fd l)))
+(define (proc-fd-leave! l)
+  (when (jolt-with-mutex (proc-fd-life-mutex l)
+          (proc-fd-life-busy-set! l (fx- (proc-fd-life-busy l) 1))
+          (proc-fd-claim-release! l))
+    (proc-fd-release! l)))
+(define (proc-fd-shut! l)
+  (let ((first? (jolt-with-mutex (proc-fd-life-mutex l)
+                  (and (not (proc-fd-life-shut? l))
+                       (begin (proc-fd-life-shut?-set! l #t) #t)))))
+    (when first?
+      (proc-poller-forget! (proc-fd-life-fd l))
+      (when (jolt-with-mutex (proc-fd-life-mutex l) (proc-fd-claim-release! l))
+        (proc-fd-release! l)))))
+;; OP inside a counted operation; SHUT is the answer for a port already shut
+(define (proc-fd-op l shut op)
+  (if (proc-fd-enter! l)
+      (let ((r (guard (e (#t (proc-fd-leave! l) (raise e))) (op))))
+        (proc-fd-leave! l)
+        r)
+      (shut)))
+(define (proc-fd-shut-now? l) (proc-fd-life-shut? l))
+
+;; A port collected without being closed hands its lifetime back here; drained
+;; at each spawn, which is when the process is about to want descriptors.
+;; Dequeuing from a guardian is not safe from two threads at once: spawning
+;; threads draining it together corrupted it (an invalid memory reference within
+;; a few hundred spawns on bionic), so the drain holds a lock. Registering needs
+;; none, since it goes on the calling thread's own list until a collection.
+(define proc-fd-guardian (make-guardian))
+(define proc-fd-guardian-mutex (make-mutex))
+(define (proc-fd-collect-released!)
+  (let loop ()
+    (let ((l (jolt-with-mutex proc-fd-guardian-mutex (proc-fd-guardian))))
+      (when l (proc-fd-shut! l) (loop)))))
+
+;; the stdin lifetime of each live child port, for proc-shut-stdin!
+(define proc-fd-lives (make-weak-eq-hashtable))
+(define proc-fd-lives-mutex (make-mutex))
+(define (proc-fd-register! port l)
+  (proc-fd-guardian port l)
+  (jolt-with-mutex proc-fd-lives-mutex (hashtable-set! proc-fd-lives port l))
+  port)
+(define (proc-fd-life-of port)
+  (jolt-with-mutex proc-fd-lives-mutex (hashtable-ref proc-fd-lives port #f)))
+
 (define (proc-fd-input-port fd)
-  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
-        (closed? (box #f)))
-    (make-custom-binary-input-port
-      (string-append "process-fd-" (number->string fd))
-      (lambda (bv start n)
-        (let ((want (min n proc-fd-buf-size)))
-          (let retry ()
-            ;; Top of EVERY iteration, first one included: a fiber woken by the
-            ;; close proc's proc-poller-forget! resumes HERE, and buf is freed and fd
-            ;; closed (possibly reused) by then. Read as EOF without touching
-            ;; either -- same answer the (else 0) branch below would give for a
-            ;; closed fd's EBADF, reached without the syscall.
-            (if (unbox closed?)
-                0
-                (let ((got (proc-c-read fd buf want)))
-                  (cond
-                    ((> got 0)
-                     (let loop ((i 0))
-                       (when (< i got)
-                         (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
-                         (loop (+ i 1))))
-                     got)
-                    ((= got 0) 0)
-                    ((= (proc-errno) proc-EINTR) (retry))
-                    ((= (proc-errno) proc-EAGAIN)
-                     (if (proc-poller-wait-ready fd (jolt-keyword "read"))
-                         (retry)
-                         (begin
-                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
-                           (retry))))
-                    (else 0)))))))
-      #f #f
-      ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
-      ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
-      (lambda ()
-        (set-box! closed? #t)
-        (sa-foreign-free buf) (proc-c-close fd) (proc-poller-forget! fd)))))
+  (proc-fd-collect-released!)
+  (let* ((l (proc-fd-life-new fd))
+         (buf (proc-fd-life-buf l)))
+    (proc-fd-register!
+      (make-custom-binary-input-port
+        (string-append "process-fd-" (number->string fd))
+        (lambda (bv start n)
+          (proc-fd-op l (lambda () 0)
+            (lambda ()
+              (let ((want (min n proc-fd-buf-size)))
+                (let retry ()
+                  ;; top of every iteration: a fiber woken by a shut resumes here
+                  (if (proc-fd-shut-now? l)
+                      0
+                      (let ((got (proc-c-read fd buf want)))
+                        (cond
+                          ((> got 0)
+                           (let loop ((i 0))
+                             (when (< i got)
+                               (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
+                               (loop (+ i 1))))
+                           got)
+                          ;; the write end is gone and nothing more can arrive: let
+                          ;; go of the descriptor now (released when this read leaves)
+                          ((= got 0) (proc-fd-shut! l) 0)
+                          ((= (proc-errno) proc-EINTR) (retry))
+                          ((= (proc-errno) proc-EAGAIN)
+                           (if (proc-poller-wait-ready fd (jolt-keyword "read"))
+                               (retry)
+                               (begin
+                                 (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                                   (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                                 (retry))))
+                          (else 0)))))))))
+        #f #f
+        (lambda () (proc-fd-shut! l)))
+      l)))
 (define (proc-fd-output-port fd)
-  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
-        (closed? (box #f)))
-    (make-custom-binary-output-port
-      (string-append "process-fd-" (number->string fd))
-      (lambda (bv start n)
-        (let ((want (min n proc-fd-buf-size)))
-          (let loop ((i 0))
-            (when (< i want)
-              (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
-              (loop (+ i 1))))
-          (let retry ()
-            ;; Top of EVERY iteration, first one included -- the read side's
-            ;; twin, and the branch a fiber woken by the close proc lands on.
-            ;; Raises rather than returning a count, matching the (else ...)
-            ;; convention below; its own message because the child is fine here,
-            ;; the port under this write is not.
-            (if (unbox closed?)
-                (error 'process "write to closed pipe" fd)
-                (let ((wrote (proc-c-write fd buf want)))
-                  (cond
-                    ((>= wrote 0) wrote)
-                    ((= (proc-errno) proc-EINTR) (retry))
-                    ((= (proc-errno) proc-EAGAIN)
-                     (if (proc-poller-wait-ready fd (jolt-keyword "write"))
-                         (retry)
-                         (begin
-                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
-                           (retry))))
-                    (else (error 'process "write to child failed" fd))))))))
-      #f #f
-      ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
-      ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
-      (lambda ()
-        (set-box! closed? #t)
-        (sa-foreign-free buf) (proc-c-close fd) (proc-poller-forget! fd)))))
+  (proc-fd-collect-released!)
+  (let* ((l (proc-fd-life-new fd))
+         (buf (proc-fd-life-buf l))
+         (shut-write (lambda () (error 'process "write to closed pipe" fd))))
+    (proc-fd-register!
+      (make-custom-binary-output-port
+        (string-append "process-fd-" (number->string fd))
+        (lambda (bv start n)
+          (proc-fd-op l shut-write
+            (lambda ()
+              (let ((want (min n proc-fd-buf-size)))
+                (let loop ((i 0))
+                  (when (< i want)
+                    (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
+                    (loop (+ i 1))))
+                (let retry ()
+                  ;; the read side's twin, and the branch a fiber woken by a shut
+                  ;; lands on
+                  (if (proc-fd-shut-now? l)
+                      (shut-write)
+                      (let ((wrote (proc-c-write fd buf want)))
+                        (cond
+                          ((>= wrote 0) wrote)
+                          ((= (proc-errno) proc-EINTR) (retry))
+                          ((= (proc-errno) proc-EAGAIN)
+                           (if (proc-poller-wait-ready fd (jolt-keyword "write"))
+                               (retry)
+                               (begin
+                                 (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                                   (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                                 (retry))))
+                          (else (error 'process "write to child failed" fd))))))))))
+        #f #f
+        (lambda () (proc-fd-shut! l)))
+      l)))
+;; A child's stdout or stderr at its exit: let go of now when nobody is reading
+;; it and the kernel holds nothing for it, so a child whose output was never
+;; read does not keep its pipes until a collection -- the JDK closes them at
+;; exit. With bytes waiting, or a read in flight, the reader's EOF (or the
+;; guardian) releases it instead, and nothing it could still read is lost.
+(define (proc-fd-waiting fd)
+  (let ((f (fionread-proc)))
+    (and f
+         (let* ((out (sa-foreign-alloc 4))
+                (n (guard (_ (#t #f))
+                     (sa-foreign-set! 'int out 0 0)
+                     (and (>= (f fd fionread-request out) 0) (sa-foreign-ref 'int out 0)))))
+           (sa-foreign-free out)
+           n))))
+(define (proc-fd-shut-if-idle! l)
+  (when (jolt-with-mutex (proc-fd-life-mutex l)
+          (and (not (proc-fd-life-shut? l))
+               (fx=? (proc-fd-life-busy l) 0)
+               (eqv? (proc-fd-waiting (proc-fd-life-fd l)) 0)
+               (begin (proc-fd-life-shut?-set! l #t) #t)))
+    (proc-fd-release! l)))
+(define (proc-shut-idle-output! st)
+  (for-each (lambda (is)
+              (let ((l (and (in-stream? is) (proc-fd-life-of (in-stream-port is)))))
+                (when l (proc-fd-shut-if-idle! l))))
+            (list (proc-p-stdout-is st) (proc-p-stderr-is st))))
+
+;; The child's stdin once its exit is recorded: nothing can read what is written
+;; now, and the JDK closes it at exit (a later write raises). Bytes still in the
+;; Chez port's buffer are dropped with it. A no-op for a stdin that is not a
+;; pipe port of ours.
+(define (proc-shut-stdin! st)
+  (let ((l (proc-fd-life-of (proc-p-stdin-port st))))
+    (when l (proc-fd-shut! l))))
 
 ;; What the API hands back for a stream that was INHERITED: the JVM's null
 ;; streams. Reads are at EOF from the start; writes are accepted and dropped.
@@ -1910,6 +1982,13 @@
 ;; proc-wait-timed already polls for exactly this reason; this is the last caller
 ;; that did not. Backs off 0.2ms -> 10ms so a short-lived child is still reaped
 ;; promptly while a long-lived one costs ~100 wakeups a second.
+;; Every exit status is recorded here, under the process mutex: the box, and the
+;; child's stdin let go of (proc-shut-stdin!).
+(define (proc-record-exit! st code)
+  (set-box! (proc-p-exit-box st) code)
+  (proc-shut-stdin! st)
+  (proc-shut-idle-output! st)
+  code)
 (define proc-poll-step-max 10)                   ; 10ms
 ;; ONE reap attempt, under the mutex. -> the exit status, or #f meaning "ask again".
 ;; The mutex is what stops two callers reaping the same child at once, and one
@@ -1922,7 +2001,7 @@
           (lambda (rc decoded err)
             (cond
               ((and decoded (= rc (proc-p-pid st)))
-               (set-box! (proc-p-exit-box st) decoded) decoded)
+               (proc-record-exit! st decoded) decoded)
               ;; another caller reaped it between our check and our wait
               ((unbox (proc-p-exit-box st)))
               ;; still running (WNOHANG rc = 0), or merely interrupted: both mean
@@ -1931,7 +2010,7 @@
               ;; unwaitable (ECHILD) or waitpid unavailable — no number of retries
               ;; changes that.
               (else (let ((c (proc-lost-status st)))
-                      (set-box! (proc-p-exit-box st) c) c))))))))
+                      (proc-record-exit! st c) c))))))))
 
 ;; THE PAUSE IS OUTSIDE THE MUTEX, and the loop is out here with it. This used to
 ;; hold proc-p-mutex across the entire poll, which is for as long as the child runs.
@@ -1969,9 +2048,9 @@
         (call-with-values (lambda () (proc-status-once st))
           (lambda (rc decoded err)
             (cond ((= rc 0) #t)                      ; still running
-                  (decoded (set-box! (proc-p-exit-box st) decoded) #f)
+                  (decoded (proc-record-exit! st decoded) #f)
                   ((and (< rc 0) (= err proc-EINTR)) #t)   ; no answer yet, assume alive
-                  (else (set-box! (proc-p-exit-box st) (proc-lost-status st)) #f)))))))
+                  (else (proc-record-exit! st (proc-lost-status st)) #f)))))))
 
 ;; Records a terminating signal we sent, so proc-lost-status can still give the
 ;; right answer for a child that something else reaps before we get to it.
@@ -2018,13 +2097,13 @@
             (or (unbox (proc-p-exit-box self))
                 (call-with-values (lambda () (proc-status-once self))
                   (lambda (rc decoded err)
-                    (cond (decoded (set-box! (proc-p-exit-box self) decoded) (->num decoded))
+                    (cond (decoded (proc-record-exit! self decoded) (->num decoded))
                           ;; unwaitable: it HAS exited (something else reaped it), so
                           ;; report the recoverable status rather than claiming it is
                           ;; still running — exitValue would otherwise throw forever.
                           ((and (< rc 0) (not (= err proc-EINTR)))
                            (let ((c (proc-lost-status self)))
-                             (set-box! (proc-p-exit-box self) c) (->num c)))
+                             (proc-record-exit! self c) (->num c)))
                           (else (throw-jvm (quote IllegalThreadStateException) "process has not exited")))))))))
         (cons "toHandle" (lambda (self) (make-proc-handle (proc-p-pid self))))
         (cons "onExit"   (lambda (self) (make-proc-completable self)))

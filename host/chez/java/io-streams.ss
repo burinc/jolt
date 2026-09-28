@@ -1414,7 +1414,12 @@
              (ja-bytes->bv! arr pos bv start n)
              (set! pos (fx+ pos n))
              n)))
-     #f #f (lambda () #f))))
+     #f #f
+     ;; close reaches the wrapped stream, as InputStreamReader's does: a text
+     ;; reader over a pipe that stopped here left the pipe open for good. Nothing
+     ;; closes this port except a caller that owns the stream -- a copy or a
+     ;; drain through it leaves it open.
+     (lambda () (record-method-dispatch in "close" jolt-nil)))))
 ;; …and one dispatch that fills a caller-supplied range, for the pushback
 ;; port below, which asks the wrapped stream for exactly what its own buffer
 ;; wants rather than reading ahead of it.
@@ -1685,8 +1690,13 @@
             (else (prev r))))))
 
 ;; slurp a char-reader (drain chars) or a byte in-stream (drain bytes -> decode).
-(let ((prev jolt-slurp))
-  (set! jolt-slurp
+;; slurp is a with-open over a reader on the JVM, so a stream or reader handed
+;; to it is closed once read, or when reading it throws.
+(define (slurp-closes? src)
+  (or (in-stream? src) (user-in-stream? src) (char-reader? src) (reader-adapter? src)
+      (user-reader? src) (reader-jhost? src)))
+(let* ((prev jolt-slurp)
+       (slurp-source
         (lambda (src . opts)
           (cond
             ((char-reader? src) (drain-reader src))
@@ -1699,7 +1709,15 @@
             ;; the same adapter io/reader hands back for one
             ((user-in-stream? src) (decode-bytevector (user-in-stream-bytes src) (slurp-encoding opts)))
             ((user-reader? src) (drain-reader (make-reader-adapter src)))
-            (else (apply prev src opts)))))
+            (else (apply prev src opts))))))
+  (set! jolt-slurp
+        (lambda (src . opts)
+          (if (slurp-closes? src)
+              (let ((text (guard (e (#t (jolt-close src) (raise e)))
+                            (apply slurp-source src opts))))
+                (jolt-close src)
+                text)
+              (apply slurp-source src opts))))
   (def-var! "clojure.core" "slurp" jolt-slurp))
 
 ;; spit to a stream or writer writes INTO it and closes it, as on the JVM where

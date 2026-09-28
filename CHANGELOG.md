@@ -20,6 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Closing a text reader over a stream closes the stream (#1175).** An
+  `InputStreamReader`, or an `io/reader` over an `InputStream`, stopped at its
+  own port on close and left the stream open, and `slurp` closed nothing it was
+  handed. Every `jolt.process` run with `:out :string` leaked the child's
+  stdout and stderr pipes for good (`sh` leaked three descriptors), and file
+  streams stayed open until a collection. `slurp` now closes the stream or
+  reader it reads, as the JVM's `with-open` does, and a closed `StringReader`
+  raises `IOException: Stream closed` instead of reading on.
+- **A child process's pipes are released like the JDK's.** `jolt.process`
+  copies a child's output with `io/copy`, which closes nothing, and `sh` never
+  closes stdin, so fixing the reader alone left every run leaking. A pipe now
+  lets go of its descriptor once a read reaches its end, stdin is closed when
+  the child's exit is recorded, and at exit an idle, empty stdout or stderr is
+  closed too; a pipe that is dropped unread is released once collected. The
+  descriptor is freed only after the last read or write on it returns, so a
+  close from another thread no longer races an operation in flight.
 - **`seq` on a `PersistentQueue` is O(1) (#1172).** It built the whole element
   list before returning the first cell, so `first`, `rest` and `next` on a
   queue cost its size. The seq now walks the front and then the reversed rear
