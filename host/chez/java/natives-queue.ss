@@ -15,7 +15,6 @@
   (if (null? (jolt-queue-front q))
       (make-jolt-queue (list x) '() (fx+ (jolt-queue-cnt q) 1))
       (make-jolt-queue (jolt-queue-front q) (cons x (jolt-queue-rear q)) (fx+ (jolt-queue-cnt q) 1))))
-(define (queue->list q) (append (jolt-queue-front q) (reverse (jolt-queue-rear q))))
 (define (queue-peek q) (if (null? (jolt-queue-front q)) jolt-nil (car (jolt-queue-front q))))
 (define (queue-pop q)
   (let ((f (jolt-queue-front q)))
@@ -26,8 +25,27 @@
           (else (make-jolt-queue (cdr f) (jolt-queue-rear q) (fx- (jolt-queue-cnt q) 1))))))
 
 ;; --- extend the collection dispatchers to see a jolt-queue ------------------
-(define (queue->seq x)
-  (let ((l (queue->list x))) (if (null? l) jolt-nil (list->cseq l))))
+;; The seq realizes the front in blocks of queue-seq-block cells, each block
+;; ending in a lazy tail, and moves to the reversed rear once the front runs
+;; out: (seq q) and (first q) are O(1) as on the JVM, and a full walk forces one
+;; tail per block rather than per element. The tail is a lazy-src so a seq over a
+;; queue still travels in a state image.
+(define queue-seq-block 32)
+(define lz-queue-walk
+  (register-lazy-src! 'queue-walk (lambda (f r) (queue-walk f r))))
+(define (queue-walk f r)
+  (cond ((pair? f) (queue-block f r queue-seq-block))
+        ((null? r) jolt-nil)
+        (else (queue-walk (reverse r) '()))))
+(define (queue-block f r k)
+  (let ((more (cdr f)))
+    (cond ((pair? more)
+           (if (fx=? k 1)
+               (cseq-lazy (car f) (make-lazy-src lz-queue-walk more r))
+               (cseq-realized (car f) (queue-block more r (fx- k 1)))))
+          ((null? r) (cseq-realized (car f) jolt-nil))
+          (else (cseq-lazy (car f) (make-lazy-src lz-queue-walk '() r))))))
+(define (queue->seq x) (queue-walk (jolt-queue-front x) (jolt-queue-rear x)))
 (register-seq-arm! jolt-queue? queue->seq)
 (register-count-arm! jolt-queue? (lambda (x) (jolt-queue-cnt x)))
 (register-empty-arm! jolt-queue? (lambda (x) (fx=? 0 (jolt-queue-cnt x))))
