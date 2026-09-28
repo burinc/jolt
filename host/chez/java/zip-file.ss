@@ -363,14 +363,23 @@
 ;;
 ;; The scope closes its readers on ANY exit, a fiber park included; a resumed
 ;; load that reads again just opens a new one.
+;;
+;; The parameter holds (thread-id . readers) and a scope answers only on the
+;; thread that opened it. A forked thread starts with its creator's parameter
+;; values, so a thread a namespace's top level starts would otherwise share the
+;; require's unlocked table, and once the require closed it, open readers into it
+;; that nothing closes.
 (define zipdir-read-scope (make-thread-parameter #f))
+(define (zipdir-scope-readers)
+  (let ((s (zipdir-read-scope)))
+    (and s (eqv? (car s) (get-thread-id)) (cdr s))))
 (define (call-with-zipdir-read-scope thunk)
-  (if (zipdir-read-scope)
+  (if (zipdir-scope-readers)
       (thunk)
       (let ((readers (make-eq-hashtable)))
         (dynamic-wind
           (lambda () #f)
-          (lambda () (parameterize ((zipdir-read-scope readers)) (thunk)))
+          (lambda () (parameterize ((zipdir-read-scope (cons (get-thread-id) readers))) (thunk)))
           (lambda ()
             (let-values (((ds rs) (hashtable-entries readers)))
               (hashtable-clear! readers)
@@ -388,7 +397,7 @@
 ;; The compressed bytes of ENT: through the scope's reader when one is open,
 ;; else from a reader opened for the call.
 (define (zipdir-raw-bytes d ent)
-  (let ((readers (zipdir-read-scope)))
+  (let ((readers (zipdir-scope-readers)))
     (if readers
         (zipdir-raw-bytes-via (car (zipdir-scoped-reader readers d)) ent)
         (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))

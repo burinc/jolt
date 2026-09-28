@@ -880,11 +880,25 @@ aa_opens="$(JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_aa" JOLT_QUIET=1 "$jolt" -e 
   (let [before (jolt.host/scheme-eval-string \"zipdir-reader-opens\")]
     (require 'exp.top)
     (println (- (jolt.host/scheme-eval-string \"zipdir-reader-opens\") before)
-             (jolt.host/scheme-eval-string \"(zipdir-read-scope)\")))" 2>&1 | tail -1)"
+             (jolt.host/scheme-eval-string \"(zipdir-scope-readers)\")))" 2>&1 | tail -1)"
 if [ "$aa_opens" = "1 false" ]; then
   echo "PASS: (aa2) a warm require from a jar opens it once and closes it"; pass=$((pass+1))
 else
   echo "FAIL: (aa2) jar reader opens / scope after the require: '$aa_opens' (want '1 false')"; fails=$((fails+1))
+fi
+# ...and the scope is the loading thread's alone. A Chez thread starts with its
+# creator's thread-parameter values, so a thread forked by a namespace's top level
+# used to hold the require's reader table: it read through it unlocked from a
+# second thread, and after the require closed it, reopened readers nothing closed.
+printf '(ns exp.fork)\n(def seen (promise))\n(doto (Thread. (fn [] (deliver seen (boolean (jolt.host/scheme-eval-string "(zipdir-scope-readers)")))))\n  (.start) (.join))\n' > "$aa/fork.clj"
+JOLT_PWD="$aa" JOLT_QUIET=1 "$jolt" run "$root/tools/mkjar.clj" "$aa/fork.jar" "exp/fork.clj=$aa/fork.clj" >/dev/null 2>&1 || true
+aa_fork="$(JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'exp/fork {:local/root \"$aa/fork.jar\"}}})
+  (require 'exp.fork) (println @exp.fork/seen)" 2>&1 | tail -1)"
+if [ "$aa_fork" = "false" ]; then
+  echo "PASS: (aa3) a thread forked inside a jar require has no reader scope of its own"; pass=$((pass+1))
+else
+  echo "FAIL: (aa3) forked thread's reader scope inside a jar require: '$aa_fork' (want 'false')"; fails=$((fails+1))
 fi
 rm -rf "$cache_aa"
 
@@ -983,6 +997,35 @@ else
   fails=$((fails+1))
 fi
 rm -rf "$cache_ac"
+# ...and two reader namespaces, one requiring the other. The data_readers scan
+# loads one before the other exists in the cache, so what it compiled folded a
+# digest the next run could not reproduce and missed again. Both name orders,
+# since the scan's order follows the table.
+for ac2_order in a z; do
+  if [ "$ac2_order" = a ]; then ac2_o=ra; ac2_i=rz; else ac2_o=rz; ac2_i=ra; fi
+  ac2="$tmp/ac2-$ac2_order"; mkdir -p "$ac2/src/rn"
+  printf '{rn/o rn.%s/read-o rn/i rn.%s/read-i}\n' "$ac2_o" "$ac2_i" > "$ac2/src/data_readers.clj"
+  printf '(ns rn.leaf)\n(defn label [x] (str "tagged:" x))\n' > "$ac2/src/rn/leaf.clj"
+  printf '(ns rn.%s (:require [rn.leaf :as l]))\n(defn read-i [x] (l/label x))\n' "$ac2_i" > "$ac2/src/rn/$ac2_i.clj"
+  printf '(ns rn.%s (:require [rn.%s :as i]))\n(defn read-o [x] (i/read-i x))\n' "$ac2_o" "$ac2_i" > "$ac2/src/rn/$ac2_o.clj"
+  printf '(ns rn.plain)\n(defn v [] 7)\n' > "$ac2/src/rn/plain.clj"
+  cache_ac2="$(mktemp -d)"
+  ac2run() {
+    JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ac2" JOLT_QUIET=1 "$jolt" -e "
+      (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rn/rn {:local/root \"$ac2\"}}})
+      (require 'rn.plain) (println (rn.plain/v))" 2>&1
+  }
+  ac2run >/dev/null
+  ac2_warm="$(ac2run)"
+  if echo "$ac2_warm" | grep -q '^7$' && [ "$(echo "$ac2_warm" | grep -c 'hit rn\.' || true)" -eq 4 ] \
+     && ! echo "$ac2_warm" | grep -q 'miss '; then
+    echo "PASS: (ac2) nested reader namespaces ($ac2_order) hit on the second run"; pass=$((pass+1))
+  else
+    echo "FAIL: (ac2) nested reader namespaces ($ac2_order), second run: $(echo "$ac2_warm" | grep -E 'hit |miss ' | tr '\n' ' ')"
+    fails=$((fails+1))
+  fi
+  rm -rf "$cache_ac2"
+done
 
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.

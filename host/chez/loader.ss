@@ -299,14 +299,17 @@
     (unless (null? tags)
       (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port))))
 (define (load-data-readers!)
-  (for-each
+  ;; one settle point for the whole scan: see aot-call-with-readers-batch
+  (aot-call-with-readers-batch
+   (lambda ()
+    (for-each
     (lambda (root)
       ;; data_readers.{jolt,clj,cljc}, in the same precedence as a namespace's
       ;; source (ldr-source-exts below) — first one found on this root wins,
       ;; inside a jar root as on disk.
       (let ((f (ldr-root-source root "data_readers")))
         (when f (merge-data-readers-file f))))
-    source-roots))
+    source-roots))))
 
 ;; --- namespace -> file path -------------------------------------------------
 ;; "app.commonmark-test" -> "app/commonmark_test": split on '.', munge '-'->'_'
@@ -1735,10 +1738,33 @@
       (aot-ns-forwards-ref? name)))
 
 ;; Compiles whose sidecars are not written yet: name -> the publishes waiting on
-;; it (below). A data reader's namespace in here makes the readers digest — which
-;; every key folds — provisional, since that namespace's digest reads sidecars it
-;; has yet to write.
+;; it (below), each (name . publish!). A data reader's namespace in here makes
+;; the readers digest — which every key folds — provisional, since that
+;; namespace's digest reads sidecars it has yet to write.
 (define aot-open-compiles (make-hashtable string-hash string=?))
+;; ...and the eager load of the data_readers namespaces (load-data-readers!), under
+;; a key no namespace can have. Until the batch is done, a reader namespace it has
+;; yet to reach has no sidecars, so a key folded then is provisional too: with two
+;; reader namespaces where one requires the other, the one loaded first and its
+;; requires were keyed before the second had compiled, and missed on the next run.
+(define aot-readers-batch-key "#data_readers")
+(define (aot-call-with-readers-batch thunk)
+  (if (jolt-with-mutex ldr-tbl-mu (hashtable-contains? aot-open-compiles aot-readers-batch-key))
+      (thunk)
+      (dynamic-wind
+        (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles aot-readers-batch-key '())))
+        (lambda () (thunk) (aot-settle! aot-readers-batch-key))
+        (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles aot-readers-batch-key))))))
+;; KEY's compile (or the batch) has settled: close it and publish what waited on
+;; it. Each goes back through aot-publish-when-readers-settle!, since another
+;; settle point may still be open above this one.
+(define (aot-settle! key)
+  (let ((waiting (jolt-with-mutex ldr-tbl-mu
+                   (let ((q (hashtable-ref aot-open-compiles key '())))
+                     (hashtable-delete! aot-open-compiles key)
+                     q))))
+    (for-each (lambda (w) (aot-publish-when-readers-settle! (car w) (cdr w)))
+              (reverse waiting))))
 ;; The namespaces the registered data readers live in.
 (define (aot-reader-namespaces)
   (let ((tbl (guard (e (#t #f)) (data-readers-table))))
@@ -1752,18 +1778,20 @@
                                      (else #f))))
                        (if (and ns (not (member ns acc))) (cons ns acc) acc)))
                    '()))))
-;; Publish now, or queue it on the open compile of a reader namespace other than
-;; NAME. A namespace a data reader's namespace requires compiles inside that
-;; namespace's compile, so a base computed then folds a readers digest the next
-;; run can't reproduce, and the artifact would miss once more for nothing.
+;; Publish now, or queue it on the reader batch or the open compile of a reader
+;; namespace other than NAME. A namespace a data reader's namespace requires
+;; compiles inside that namespace's compile, so a base computed then folds a
+;; readers digest the next run can't reproduce, and the artifact would miss once
+;; more for nothing.
 (define (aot-publish-when-readers-settle! name publish!)
   (let ((open (jolt-with-mutex ldr-tbl-mu
-                (let loop ((rs (aot-reader-namespaces)))
+                (let loop ((rs (cons aot-readers-batch-key (aot-reader-namespaces))))
                   (cond ((null? rs) #f)
                         ((and (not (string=? (car rs) name))
                               (hashtable-contains? aot-open-compiles (car rs)))
                          (hashtable-set! aot-open-compiles (car rs)
-                                         (cons publish! (hashtable-ref aot-open-compiles (car rs) '())))
+                                         (cons (cons name publish!)
+                                               (hashtable-ref aot-open-compiles (car rs) '())))
                          (car rs))
                         (else (loop (cdr rs))))))))
     (if open
@@ -1784,20 +1812,17 @@
         (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink)
                                        (jolt-def-ordinal-sink stamps))
                           (aot-capture-load file src))))
-          (unless (and (string? captured) (fx>? (string-length captured) 0))
-            (aot-info (string-append "nothing captured for " name ", not caching")))
-          (when (and (string? captured) (fx>? (string-length captured) 0))
-            (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
-                   (res (vector-ref res-sink 0))
-                   (obase (aot-base-for-own name own)))
-              (aot-write-sidecars! name own obase deps res)
-              (let ((waiting (jolt-with-mutex ldr-tbl-mu
-                               (let ((q (hashtable-ref aot-open-compiles name '())))
-                                 (hashtable-delete! aot-open-compiles name)
-                                 q))))
+          (if (and (string? captured) (fx>? (string-length captured) 0))
+              (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
+                     (res (vector-ref res-sink 0))
+                     (obase (aot-base-for-own name own)))
+                (aot-write-sidecars! name own obase deps res)
                 (aot-publish-when-readers-settle!
-                  name (lambda () (aot-publish-artifact! name own deps res captured stamps)))
-                (for-each (lambda (publish!) (publish!)) (reverse waiting)))))))
+                  name (lambda () (aot-publish-artifact! name own deps res captured stamps))))
+              (aot-info (string-append "nothing captured for " name ", not caching")))
+          ;; with or without sidecars this namespace's digest is final now, so
+          ;; what waited on it goes ahead either way
+          (aot-settle! name)))
       (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles name))))))
 ;; Everything a later run reads back BEFORE it can compute the full key: the
 ;; sidecars are named by the own hash alone.
