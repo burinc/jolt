@@ -957,6 +957,16 @@
                    nil (catch :default e e))]
       (chk "a switch nested in a top-level form fails it too"
            (= :loader/bad-request (:type (ex-data err)))))
+    (chk "a form without an ns prefix reads in the context's namespace"
+         (= :script.n/k (l/eval-in ctx "script.n" "::k")))
+    (chk "and a syntax quote resolves there"
+         (= 'script.o/foo (l/eval-in ctx "script.o" "`foo")))
+    (chk "an alias a require installed is in force for the next form's read"
+         (= :libev/x (l/eval-in ctx "script.p" "(require '[libev :as e]) ::e/x")))
+    (let [before *warn-on-reflection*]
+      (l/eval-in ctx "script.q" "(set! *warn-on-reflection* true)")
+      (chk "a compiler flag set! in the source ends with the evaluation"
+           (= before *warn-on-reflection*)))
     (chk "the :file option is bound to *file*"
          (= "custom.txt" (l/eval-in ctx "script.j" "*file*" {:file "custom.txt"})))
     (chk "and *file* defaults to nil"
