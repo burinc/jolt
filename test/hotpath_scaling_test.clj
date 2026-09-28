@@ -54,9 +54,18 @@
 ;; which reads as the long arm being superlinear — the deque row read 8.33 on a
 ;; 4-vs-16 expectation that way, then the tokenizer row 8.50. A miss is measured
 ;; once more before it counts; a regression misses twice.
+;;
+;; Each sample starts from a fresh collection, as fastpath_ratio_test's do. The
+;; timeout arms allocate ~0.6MB and ~2.4MB, and the pending timers they arm stay
+;; live, so a collection that trips inside the big arm copies them all and the
+;; small arm rarely pays one: with the nursery pinned at 4MB the row read 6.3-6.8
+;; against its linear 4, and a CI run read 8.37 and then 8.38 against the 8.0
+;; ceiling. After a collect neither arm reaches the nursery floor, and the row
+;; reads 3.8-4.2 at every nursery size from 4MB up.
 (defn- judge-thunks [label fa fb ceiling detail]
-  (let [measure (fn []
-                  (let [ts (doall (repeatedly 5 #(vector (first (timed fa)) (first (timed fb)))))]
+  (let [sample (fn [f] (System/gc) (first (timed f)))
+        measure (fn []
+                  (let [ts (doall (repeatedly 5 #(vector (sample fa) (sample fb))))]
                     [(reduce min (map first ts)) (reduce min (map second ts))]))
         [ta tb] (measure)
         ratio (double (/ tb (max 0.05 ta)))]
