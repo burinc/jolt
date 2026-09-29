@@ -79,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a child process's pipe stream under a thread blocked reading it likewise ends
   the read with `-1` instead of hanging. A write to a dead peer throws
   `SocketException` rather than a plain `IOException`, as on the JVM.
+
 ## [0.8.14] - 2026-09-28
 
 Android arm64 ships again as a prebuilt Termux binary, with bionic fixes for
