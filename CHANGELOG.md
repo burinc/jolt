@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jolt.image` writes records whose type implements a protocol.** `dump!`
+  refused any such record, inline in `defrecord` or through `extend-protocol`,
+  with `cannot write #<procedure>`, while `scan` called it clean: the type's
+  per-process dispatch cache rode along in the image. The image now carries the
+  type without the cache, and a restored record is relinked to the live type of
+  the same name and fields, so it dispatches as before.
 - **A closed `java.net.Socket`'s streams no longer read or write its old fd.**
   `read` and `write` on a stream taken before `.close` went straight to the fd
   number, which the next socket to open reuses: the stale stream took that
