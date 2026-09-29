@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `getOutputStream`, `connect` and `ServerSocket.accept` on a closed socket throw
   `SocketException "Socket is closed"`, and `getLocalPort` of an unbound socket
   is `-1` instead of a `getsockname` on an fd that may be another socket's.
+- **Closing a socket wakes the calls blocked on it.** A thread blocked in `read`,
+  `write`, `accept` or `connect` hung for good when another thread closed the
+  socket; it now throws `SocketException` — `"Socket closed"`, or
+  `"Broken pipe"` for a write — as the JVM's does. A fiber was woken, but its
+  read then retried on the freed fd number, which the next socket had been
+  handed. The fd now stays open until the last call using it has left. Closing
+  a child process's pipe stream under a thread blocked reading it likewise ends
+  the read with `-1` instead of hanging. A write to a dead peer throws
+  `SocketException` rather than a plain `IOException`, as on the JVM.
 
 ## [0.8.14] - 2026-09-28
 

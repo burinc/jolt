@@ -254,7 +254,67 @@
     (str (or (jolt.host/ref-get h :address) (jolt.host/ref-get h :host)))
     (str h)))
 
-(defn- connect-fd! [fd host port]
+;; -- fd lifetime ---------------------------------------------------------------
+;; A socket's fd is live while any operation is using it. Closing marks the
+;; socket closed, which stops new operations, and wakes the ones blocked on it
+;; (poller/cancel!); the fd itself is closed by whichever of the closer or the
+;; last operation out comes second. That is the JDK's shape, and the reason is
+;; the same: a closed fd number is handed to the next socket or pipe the process
+;; opens, so an operation that retried on it would read that socket's bytes or
+;; write to its peer (jolt#1183, jolt-hmnr). process.ss counts its pipe fds the
+;; same way.
+;;
+;; Windows has no poller to wake anything: its sockets are blocking, and only
+;; closesocket makes a blocked recv or accept return. So close releases the fd
+;; at once there, and the woken operation raises on seeing the socket closed.
+(defn- fd-release! [fd]
+  (poller/forget! fd)
+  (c-close fd))
+
+;; Under the owner's lock: claims the release, answering the fd to close, when the
+;; socket is closed and nothing is using it (or FORCE?).
+(defn- claim-release! [owner force?]
+  (when (and (jolt.host/ref-get owner :closed?)
+             (or force? (zero? (or (jolt.host/ref-get owner :ops) 0)))
+             (not (jolt.host/ref-get owner :released?)))
+    (jolt.host/ref-put! owner :released? true)
+    (jolt.host/ref-get owner :fd)))
+
+(defn- op-enter! [owner]
+  (locking owner
+    (when (jolt.host/ref-get owner :closed?)
+      (throw (java.net.SocketException. "Socket closed")))
+    (jolt.host/ref-put! owner :ops (inc (or (jolt.host/ref-get owner :ops) 0)))))
+
+(defn- op-leave! [owner]
+  (when-let [fd (locking owner
+                  (jolt.host/ref-put! owner :ops (dec (jolt.host/ref-get owner :ops)))
+                  (claim-release! owner false))]
+    (fd-release! fd)))
+
+(defmacro ^:private with-op [owner & body]
+  `(let [o# ~owner]
+     (op-enter! o#)
+     (try ~@body (finally (op-leave! o#)))))
+
+(defn- close-owner! [owner]
+  (let [[first? fd] (locking owner
+                      (if (jolt.host/ref-get owner :closed?)
+                        [false nil]
+                        (do (jolt.host/ref-put! owner :closed? true)
+                            [true (claim-release! owner windows?)])))]
+    (cond
+      fd (fd-release! fd)
+      first? (poller/cancel! (jolt.host/ref-get owner :fd))))
+  nil)
+
+;; An operation woken by close raises what the JVM's does: a read, accept or
+;; connect "Socket closed", a write cut off mid-send "Broken pipe".
+(defn- raise-if-closed! [owner msg]
+  (when (jolt.host/ref-get owner :closed?)
+    (throw (java.net.SocketException. msg))))
+
+(defn- connect-fd! [owner fd host port]
   ;; resolve + connect; frees the sockaddr either way. Returns the resolved ip.
   ;; The fd is O_NONBLOCK (fibers R8), so connect answers EINPROGRESS; wait for
   ;; writability (parking on a fiber, blocking kevent on a thread — the same
@@ -267,6 +327,7 @@
                  (zero? r) 0
                  (poller/connect-pending? e)
                  (do (poller/wait-ready fd :write)
+                     (raise-if-closed! owner "Socket closed")
                      (let [e (poller/so-error fd)]
                        (if (zero? e)
                          0
@@ -288,7 +349,7 @@
     (when (= 2 (count args))
       (let [h  (host-arg->str (first args))
             p  (int (second args))
-            ip (try (connect-fd! fd h p)
+            ip (try (connect-fd! inst fd h p)
                     (catch java.io.IOException e (c-close fd) (throw e)))]
         (jolt.host/ref-put! inst :connected? true)
         (jolt.host/ref-put! inst :host h)
@@ -297,16 +358,7 @@
         (jolt.host/ref-put! inst :local-port (local-port fd))))
     inst))
 
-(defn- socket-close! [self]
-  (when-not (jolt.host/ref-get self :closed?)
-    (jolt.host/ref-put! self :closed? true)
-    (let [fd (jolt.host/ref-get self :fd)]
-      (c-close fd)
-      ;; close first, then forget: forget! wakes any reader still parked on the
-      ;; fd (no event is coming — close removed it from the kernel set), and a
-      ;; woken read must see EBADF, not EAGAIN-and-repark on a dying socket.
-      (poller/forget! fd)))
-  nil)
+(defn- socket-close! [self] (close-owner! self))
 
 (defn- ensure-socket-open! [self]
   (when (jolt.host/ref-get self :closed?)
@@ -316,15 +368,16 @@
   (ensure-socket-open! self)
   (when (jolt.host/ref-get self :connected?)
     (throw (java.io.IOException. "Already connected")))
-  (let [h  (str (jolt.host/ref-get endpoint :host))
-        p  (jolt.host/ref-get endpoint :port)
-        fd (jolt.host/ref-get self :fd)
-        ip (connect-fd! fd h p)]
-    (jolt.host/ref-put! self :connected? true)
-    (jolt.host/ref-put! self :host h)
-    (jolt.host/ref-put! self :remote-addr (ip->str ip))
-    (jolt.host/ref-put! self :port p)
-    (jolt.host/ref-put! self :local-port (local-port fd)))
+  (with-op self
+    (let [h  (str (jolt.host/ref-get endpoint :host))
+          p  (jolt.host/ref-get endpoint :port)
+          fd (jolt.host/ref-get self :fd)
+          ip (connect-fd! self fd h p)]
+      (jolt.host/ref-put! self :connected? true)
+      (jolt.host/ref-put! self :host h)
+      (jolt.host/ref-put! self :remote-addr (ip->str ip))
+      (jolt.host/ref-put! self :port p)
+      (jolt.host/ref-put! self :local-port (local-port fd))))
   nil)
 
 (defn- socket->str [self]
@@ -380,7 +433,7 @@
        (jolt.host/ref-put! :port (jolt.host/ref-get self :port))))})
 
 ;; -- SocketInputStream -------------------------------------------------------
-(defn- io-call [op fd wait-kind]
+(defn- io-call [owner op fd wait-kind]
   ;; Run one blocking-capable syscall with the fd in O_NONBLOCK mode (fibers
   ;; R8). EAGAIN waits for readiness — parking the fiber on the poller when
   ;; there is a current fiber, blocking on a private kevent/epoll_wait when
@@ -390,24 +443,34 @@
   ;; :capture-native-error) — every binding io-call drives is declared that
   ;; way. The errno is spent on that classification and not returned, so a
   ;; caller sees a terminal failure only as a negative result.
-  (loop []
-    (let [[r e] (op)]
-      (cond
-        (and (neg? r) (poller/eintr? e)) (recur)
-        (and (neg? r) (poller/eagain? e)) (do (poller/wait-ready fd wait-kind) (recur))
-        :else
-        (do
-          ;; A negative return that is neither retryable nor a wait is where a
-          ;; socket read turns into EOF (do-recv below), and the caller then sees
-          ;; a closed connection with no reason attached. It is the one place a
-          ;; syscall failure goes quiet, so say what it was when asked.
-          (when (and (neg? r) (jolt.host/getenv "JOLT_DEBUG"))
-            (binding [*out* *err*]
-              (println "jolt.socket: fd" fd wait-kind "syscall failed, errno" e
-                       "- answered as EOF")))
-          r)))))
+  ;;
+  ;; OWNER is the socket: the call counts as one of its operations, so a close
+  ;; meanwhile wakes the wait and leaves the fd open until this call has left.
+  ;; A socket found closed after a wait, or behind a failure, raises.
+  (with-op owner
+    (let [closed-msg (if (= wait-kind :write) "Broken pipe" "Socket closed")]
+      (loop []
+        (let [[r e] (op)]
+          (cond
+            (and (neg? r) (poller/eintr? e)) (recur)
+            (and (neg? r) (poller/eagain? e))
+            (do (poller/wait-ready fd wait-kind)
+                (raise-if-closed! owner closed-msg)
+                (recur))
+            :else
+            (do
+              (when (neg? r) (raise-if-closed! owner closed-msg))
+              ;; A negative return that is neither retryable nor a wait is where a
+              ;; socket read turns into EOF (do-recv below), and the caller then
+              ;; sees a closed connection with no reason attached. It is the one
+              ;; place a syscall failure goes quiet, so say what it was when asked.
+              (when (and (neg? r) (jolt.host/getenv "JOLT_DEBUG"))
+                (binding [*out* *err*]
+                  (println "jolt.socket: fd" fd wait-kind "syscall failed, errno" e
+                           "- answered as EOF")))
+              r)))))))
 
-(defn- do-recv [fd buf len]
+(defn- do-recv [owner fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
   ;; also reads as EOF. Java throws SocketException there — documented
   ;; divergence. What is left of the error is a CHOICE, not a limitation:
@@ -416,7 +479,7 @@
   ;; already gone by this point — io-call loops on EINTR and waits out EAGAIN
   ;; — so every negative n here is terminal. Narrowing that to SocketException
   ;; on ECONNRESET means widening io-call's contract to hand the errno back.
-  (let [n (io-call #(c-recv fd buf len 0) fd :read)]
+  (let [n (io-call owner #(c-recv fd buf len 0) fd :read)]
     (if (pos? n)
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
@@ -439,17 +502,18 @@
   ;; Closed raises rather than answering 0, where a recv error can only read as
   ;; EOF; asking the kernel would count some other socket's bytes.
   (ensure-open! self)
-  (let [fd (jolt.host/ref-get self :fd)
-        out (ffi/alloc 4)]
-    (try
+  (with-op (jolt.host/ref-get self :socket)
+    (let [fd (jolt.host/ref-get self :fd)
+          out (ffi/alloc 4)]
       (ffi/write out :int 0)
       ;; a failed ioctl reads as "nothing there", the way a failed recv reads as
       ;; EOF. c-ioctl is not on a retry path, so it is bound without
       ;; :capture-native-error and its errno is never captured to say more
       ;; with — unlike the recv side, where the errno exists and io-call
       ;; spends it on classification.
-      (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
-      (finally (ffi/free out)))))
+      (try
+        (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
+        (finally (ffi/free out))))))
 
 (def ^:private socket-input-stream-methods
   {"read"
@@ -458,7 +522,7 @@
       (ensure-open! self)
       (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
         (try
-          (let [{:keys [n]} (do-recv fd buf 1)]
+          (let [{:keys [n]} (do-recv (jolt.host/ref-get self :socket) fd buf 1)]
             (if (pos? n) (bit-and (ffi/read buf :uint8 0) 0xff) -1))
           (finally (ffi/free buf)))))
      ([self b]
@@ -466,7 +530,7 @@
         (if (zero? len) 0
             (let [_ (ensure-open! self) buf (ffi/alloc len)]
               (try
-                (let [{:keys [n bytes]} (do-recv fd buf len)]
+                (let [{:keys [n bytes]} (do-recv (jolt.host/ref-get self :socket) fd buf len)]
                   (if (pos? n) (do (dotimes [i n] (aset b i (nth bytes i))) n) -1))
                 (finally (ffi/free buf)))))))
      ([self b off len]
@@ -474,21 +538,21 @@
         (if (zero? len) 0
             (let [_ (ensure-open! self) buf (ffi/alloc len)]
               (try
-                (let [{:keys [n bytes]} (do-recv fd buf len)]
+                (let [{:keys [n bytes]} (do-recv (jolt.host/ref-get self :socket) fd buf len)]
                   (if (pos? n) (do (dotimes [i n] (aset b (+ off i) (nth bytes i))) n) -1))
                 (finally (ffi/free buf))))))))
    "available" (fn [self] (socket-available self))
    "close"     (fn [self] (socket-close! (jolt.host/ref-get self :socket)))})
 
 ;; -- SocketOutputStream ------------------------------------------------------
-(defn- send-fully! [fd buf len]
+(defn- send-fully! [owner fd buf len]
   ;; loop over short sends; a non-positive return is a dead peer (EPIPE /
   ;; ECONNRESET) — throw like Java rather than silently dropping the rest.
   (loop [off 0]
     (when (< off len)
-      (let [s (io-call #(c-send fd (+ buf off) (- len off) msg-nosignal) fd :write)]
+      (let [s (io-call owner #(c-send fd (+ buf off) (- len off) msg-nosignal) fd :write)]
         (when-not (pos? s)
-          (throw (java.io.IOException. "Broken pipe")))
+          (throw (java.net.SocketException. "Broken pipe")))
         (recur (+ off s))))))
 
 (defn- write-bytes! [self bytes off len]
@@ -498,7 +562,7 @@
       (try
         (dotimes [i len]
           (ffi/write buf :uint8 (bit-and (aget bytes (+ off i)) 0xff) i))
-        (send-fully! fd buf len)
+        (send-fully! (jolt.host/ref-get self :socket) fd buf len)
         (finally (ffi/free buf))))))
 
 (def ^:private socket-output-stream-methods
@@ -520,7 +584,7 @@
               buf (ffi/alloc 1)]
           (try
             (ffi/write buf :uint8 (bit-and (int b) 0xff))
-            (send-fully! fd buf 1)
+            (send-fully! (jolt.host/ref-get self :socket) fd buf 1)
             (finally (ffi/free buf))))))
      ([self bytes off len] (write-bytes! self bytes off len)))
    "flush" (fn [self] nil)
@@ -609,7 +673,7 @@
      (let [sa (ffi/alloc 16) lenp (ffi/alloc 4)]
        (try
          (ffi/write lenp :int 16)
-         (let [cfd (io-call #(c-accept (jolt.host/ref-get self :fd) sa lenp)
+         (let [cfd (io-call self #(c-accept (jolt.host/ref-get self :fd) sa lenp)
                             (jolt.host/ref-get self :fd) :read)]
            (when (neg? cfd) (throw (java.io.IOException. "accept() failed")))
            (guard-fd! cfd)
@@ -625,12 +689,7 @@
 
    "close"
    (fn [self]
-     (when-not (jolt.host/ref-get self :closed?)
-       (jolt.host/ref-put! self :closed? true)
-       (let [fd (jolt.host/ref-get self :fd)]
-         (c-close fd)
-         (poller/forget! fd)))   ; see socket-close!
-     nil)
+     (close-owner! self))
 
    "bind"
    (fn
