@@ -458,6 +458,160 @@
                 [java.net.SocketException "Socket closed"]))))
 
 
+;; -- SO_TIMEOUT and the timed connect (jolt-lang/jolt#1191, #1192) -------------
+;; Every expectation here was read off JDK 20, messages included. A timed-out
+;; read or accept raises SocketTimeoutException and leaves the socket open and
+;; usable; a timed-out or refused connect closes it.
+(defn thrown [f]
+  (try (f) :no-throw
+       (catch Exception e [(.getSimpleName (class e)) (ex-message e)])))
+
+(defn elapsed-ms [f]
+  (let [t0 (System/currentTimeMillis)]
+    [(f) (- (System/currentTimeMillis) t0)]))
+
+(with-pair
+  (fn [server client conn]
+    (check-eq "getSoTimeout defaults to 0" (.getSoTimeout client) 0)
+    (.setSoTimeout client 300)
+    (check-eq "getSoTimeout round-trips" (.getSoTimeout client) 300)
+    (check-eq "a negative SO_TIMEOUT is refused"
+              (thrown #(.setSoTimeout client -1))
+              ["IllegalArgumentException" "timeout can't be negative"])
+    (check-eq "an accepted socket does not inherit the listener's timeout"
+              (.getSoTimeout conn) 0)
+    (let [in (.getInputStream client)
+          [r ms] (elapsed-ms #(thrown (fn [] (.read in))))]
+      (check-eq "a read with nothing to read times out" r
+                ["SocketTimeoutException" "Read timed out"])
+      (check-eq "…after about the timeout" (<= 250 ms 2000) true)
+      (check-eq "…and is an InterruptedIOException"
+                (try (.read in) (catch java.io.InterruptedIOException _ :caught))
+                :caught)
+      (check-eq "…and leaves the socket open" (.isClosed client) false)
+      (.write (.getOutputStream conn) (.getBytes "ok" "UTF-8") 0 2)
+      (let [buf (byte-array 8)
+            n (.read in buf 0 8)]
+        (check-eq "the next read after a timeout gets the data" (String. buf 0 n "UTF-8") "ok"))
+      ;; bytes already there are returned, whatever the timeout
+      (.write (.getOutputStream conn) 65)
+      (check-eq "a read with data waiting returns it" (.read in) 65)
+      (check-eq "the timed-out read is not EOF"
+                (thrown #(.read in (byte-array 4)))
+                ["SocketTimeoutException" "Read timed out"])
+      ;; 0 is infinite again
+      (.setSoTimeout client 0)
+      (future (Thread/sleep 400) (.write (.getOutputStream conn) 66))
+      (check-eq "SO_TIMEOUT 0 blocks until data" (.read in) 66))
+    (.close client)
+    (check-eq "setSoTimeout on a closed socket"
+              (thrown #(.setSoTimeout client 5)) ["SocketException" "Socket is closed"])
+    (check-eq "getSoTimeout on a closed socket"
+              (thrown #(.getSoTimeout client)) ["SocketException" "Socket is closed"])))
+
+(let [server (java.net.ServerSocket. 0)]
+  (check-eq "ServerSocket getSoTimeout defaults to 0" (.getSoTimeout server) 0)
+  (.setSoTimeout server 200)
+  (check-eq "ServerSocket getSoTimeout round-trips" (.getSoTimeout server) 200)
+  (check-eq "ServerSocket refuses a negative timeout"
+            (thrown #(.setSoTimeout server -1)) ["IllegalArgumentException" "timeout < 0"])
+  (let [[r ms] (elapsed-ms #(thrown (fn [] (.accept server))))]
+    (check-eq "accept with nobody dialing times out" r
+              ["SocketTimeoutException" "Accept timed out"])
+    (check-eq "…after about the timeout" (<= 150 ms 2000) true))
+  (let [c (java.net.Socket. "127.0.0.1" (.getLocalPort server))
+        a (.accept server)]
+    (check-eq "the listener still accepts after a timeout" (.isConnected a) true)
+    (.close a) (.close c))
+  (.close server)
+  (check-eq "ServerSocket getSoTimeout on a closed socket"
+            (thrown #(.getSoTimeout server)) ["SocketException" "Socket is closed"]))
+
+;; The same on a fiber: the timeout wakes the parked fiber with the exception, not
+;; EOF and not a hang, and close still wins over a timeout that has not expired.
+(with-pair
+  (fn [server client conn]
+    (.setSoTimeout client 200)
+    (let [p (promise)]
+      (fib/spawn (fn [] (deliver p (thrown #(.read (.getInputStream client))))))
+      (check-eq "a fiber's read times out" (deref p 5000 :hung)
+                ["SocketTimeoutException" "Read timed out"]))
+    (let [p (promise)]
+      (fib/spawn (fn [] (deliver p (thrown #(.read (.getInputStream client))))))
+      (Thread/sleep 50)
+      (.write (.getOutputStream conn) 67)
+      (check-eq "a fiber's timed read still gets data that arrives in time"
+                (deref p 5000 :hung) :no-throw))
+    (.setSoTimeout client 5000)
+    (let [p (promise)]
+      (fib/spawn (fn [] (deliver p (thrown #(.read (.getInputStream client))))))
+      (Thread/sleep 200)
+      (.close client)
+      (check-eq "close wakes a fiber in a timed read" (deref p 3000 :hung)
+                ["SocketException" "Socket closed"]))))
+
+(let [server (java.net.ServerSocket. 0)
+      p (promise)]
+  (.setSoTimeout server 200)
+  (fib/spawn (fn [] (deliver p (thrown #(.accept server)))))
+  (check-eq "a fiber's accept times out" (deref p 5000 :hung)
+            ["SocketTimeoutException" "Accept timed out"])
+  (.close server))
+
+;; connect(endpoint, timeout). A listener that never accepts, with a backlog of
+;; one, stops completing handshakes once the queue is full, so a connect to it
+;; hangs until its timeout — on the JVM as here. macOS stalls the second dial,
+;; Linux the third; the loop takes whichever.
+(defn dial-until-stalled [port ms]
+  (loop [held [] i 0]
+    (let [s (java.net.Socket.)
+          [r el] (elapsed-ms #(thrown (fn [] (.connect s (java.net.InetSocketAddress. "127.0.0.1" port) ms))))]
+      (if (and (= r :no-throw) (< i 16))
+        (recur (conj held s) (inc i))
+        {:held held :result r :ms el :closed? (.isClosed s)}))))
+
+(let [server (java.net.ServerSocket. 0 1)
+      {:keys [held result ms closed?]} (dial-until-stalled (.getLocalPort server) 300)]
+  (check-eq "a connect that cannot complete times out" result
+            ["SocketTimeoutException" "Connect timed out"])
+  (check-eq "…after about the timeout" (<= 250 ms 2000) true)
+  (check-eq "…and closes the socket" closed? true)
+  (let [p (promise) port (.getLocalPort server)]
+    (fib/spawn (fn [] (deliver p (thrown #(.connect (java.net.Socket.)
+                                                    (java.net.InetSocketAddress. "127.0.0.1" port) 200)))))
+    (check-eq "a fiber's connect times out" (deref p 5000 :hung)
+              ["SocketTimeoutException" "Connect timed out"]))
+  (let [s (java.net.Socket.) p (promise) port (.getLocalPort server)]
+    (future (deliver p (thrown #(.connect s (java.net.InetSocketAddress. "127.0.0.1" port) 5000))))
+    (Thread/sleep 200)
+    (.close s)
+    (check-eq "close wakes a timed connect" (deref p 3000 :hung)
+              ["SocketException" "Socket closed"]))
+  (doseq [s held] (.close s))
+  (.close server))
+
+(let [s (java.net.Socket.)]
+  (check-eq "a negative connect timeout is refused"
+            (thrown #(.connect s (java.net.InetSocketAddress. "127.0.0.1" 1) -1))
+            ["IllegalArgumentException" "connect: timeout can't be negative"])
+  (check-eq "…and leaves the socket open" (.isClosed s) false)
+  (.close s))
+
+(let [server (java.net.ServerSocket. 0)
+      port (.getLocalPort server)
+      s (java.net.Socket.)]
+  (.close server)
+  (check-eq "a refused connect is a ConnectException"
+            (thrown #(.connect s (java.net.InetSocketAddress. "127.0.0.1" port) 1000))
+            ["ConnectException" "Connection refused"])
+  (check-eq "…and closes the socket" (.isClosed s) true))
+
+(let [server (java.net.ServerSocket. 0)
+      s (java.net.Socket.)]
+  (.connect s (java.net.InetSocketAddress. "127.0.0.1" (.getLocalPort server)) 1000)
+  (check-eq "a timed connect that completes is connected" (.isConnected s) true)
+  (.close s) (.close server))
+
 ;; -- host identity: InetAddress statics + NetworkInterface --------------------
 ;; What a program asks about the machine it is on. The loopback interface is
 ;; found by the address it carries, not by name — it is lo0 on macOS and lo on

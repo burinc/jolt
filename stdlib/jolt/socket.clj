@@ -10,16 +10,16 @@
   stream classes with the host class registry.
 
   Deliberate divergences from the JVM (test/conformance/known-divergences.edn):
-  a recv error reads as EOF (-1) rather than throwing, .connect ignores its
-  timeout argument (always blocking), and toString formats are approximate.
-  IPv4 only.
+  a recv error reads as EOF (-1) rather than throwing, and toString formats are
+  approximate. IPv4 only.
 
   On Windows, additionally: sockets are blocking, because the readiness poller is
   kqueue/epoll and there is none there — so a fiber blocked on a socket holds its
-  carrier rather than parking, which is a jolt superset java.net never promised —
-  and NetworkInterface enumerates nothing, for want of a GetAdaptersAddresses
-  walk. Both are recorded entries; InetAddress and the sockets themselves work
-  (jolt-lang/jolt#1107)."
+  carrier rather than parking, which is a jolt superset java.net never promised,
+  and SO_TIMEOUT and the connect timeout are accepted but not enforced, since
+  both are waits on that poller — and NetworkInterface enumerates nothing, for
+  want of a GetAdaptersAddresses walk. These are recorded entries; InetAddress
+  and the sockets themselves work (jolt-lang/jolt#1107)."
   (:require [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]
             [jolt.winsock :as winsock]
@@ -153,7 +153,7 @@
         (if (= addr 4294967295) ;; INADDR_NONE: not a numeric IP, try DNS
           (let [he (c-gethostbyname hp)]
             (when (ffi/null? he)
-              (throw (java.io.IOException. (str "unknown host: " host))))
+              (throw (java.net.UnknownHostException. (str host))))
             (let [h-addr-list (ffi/read he :uptr 24)
                   h-addr (ffi/read h-addr-list :uptr 0)]
               (ffi/read h-addr :uint 0)))
@@ -314,29 +314,41 @@
   (when (jolt.host/ref-get owner :closed?)
     (throw (java.net.SocketException. msg))))
 
-(defn- connect-fd! [owner fd host port]
+;; connect's errno for a peer that refused, which java.net reports as its own
+;; exception class rather than the generic failure.
+(def ^:private ECONNREFUSED (cond macos? 61 windows? 10061 :else 111))
+
+(defn- connect-fd! [owner fd host port deadline]
   ;; resolve + connect; frees the sockaddr either way. Returns the resolved ip.
   ;; The fd is O_NONBLOCK (fibers R8), so connect answers EINPROGRESS; wait for
   ;; writability (parking on a fiber, blocking kevent on a thread — the same
   ;; dispatch every other IO path uses), then read SO_ERROR for the verdict.
+  ;; DEADLINE (epoch ms, or nil for none) bounds that wait: connect(endpoint,
+  ;; timeout). Blocking Windows sockets never get there, so the bound is not
+  ;; enforced on Windows (recorded divergence, jolt-lang/jolt#1107).
   (let [ip (resolve-host host)
         sa (make-sockaddr ip port)
-        r  (loop []
-             (let [[r e] (c-connect fd sa 16)]
-               (cond
-                 (zero? r) 0
-                 (poller/connect-pending? e)
-                 (do (poller/wait-ready fd :write)
+        ;; 0 when connected, else the failure's errno (-1 when there is none)
+        e  (try
+             (loop []
+               (let [[r e] (c-connect fd sa 16)]
+                 (cond
+                   (zero? r) 0
+                   (poller/connect-pending? e)
+                   (let [t (poller/wait-ready fd :write deadline)]
                      (raise-if-closed! owner "Socket closed")
+                     (when (= t :timeout)
+                       (throw (java.net.SocketTimeoutException. "Connect timed out")))
                      (let [e (poller/so-error fd)]
-                       (if (zero? e)
-                         0
-                         (if (poller/connect-pending? e) (recur) -1))))
-                 :else r)))]
-    (ffi/free sa)
-    (when (neg? r)
-      (throw (java.io.IOException. (str "connect failed: " host ":" port))))
-    ip))
+                       (cond (zero? e) 0
+                             (poller/connect-pending? e) (recur)
+                             :else e)))
+                   :else (if (pos? e) e -1))))
+             (finally (ffi/free sa)))]
+    (cond
+      (zero? e) ip
+      (= e ECONNREFUSED) (throw (java.net.ConnectException. "Connection refused"))
+      :else (throw (java.io.IOException. (str "connect failed: " host ":" port))))))
 
 ;; -- Socket ------------------------------------------------------------------
 
@@ -349,8 +361,8 @@
     (when (= 2 (count args))
       (let [h  (host-arg->str (first args))
             p  (int (second args))
-            ip (try (connect-fd! inst fd h p)
-                    (catch java.io.IOException e (c-close fd) (throw e)))]
+            ip (try (connect-fd! inst fd h p nil)
+                    (catch java.io.IOException e (fd-release! fd) (throw e)))]
         (jolt.host/ref-put! inst :connected? true)
         (jolt.host/ref-put! inst :host h)
         (jolt.host/ref-put! inst :remote-addr (ip->str ip))
@@ -364,21 +376,51 @@
   (when (jolt.host/ref-get self :closed?)
     (throw (java.net.SocketException. "Socket is closed"))))
 
-(defn- socket-connect! [self endpoint]
+(defn- socket-connect! [self endpoint timeout]
+  ;; The JDK's order: the timeout is validated before the socket's state, and
+  ;; timeout 0 is the untimed connect the 1-arity is.
+  (when (neg? timeout)
+    (throw (IllegalArgumentException. "connect: timeout can't be negative")))
   (ensure-socket-open! self)
   (when (jolt.host/ref-get self :connected?)
-    (throw (java.io.IOException. "Already connected")))
-  (with-op self
-    (let [h  (str (jolt.host/ref-get endpoint :host))
-          p  (jolt.host/ref-get endpoint :port)
-          fd (jolt.host/ref-get self :fd)
-          ip (connect-fd! self fd h p)]
-      (jolt.host/ref-put! self :connected? true)
-      (jolt.host/ref-put! self :host h)
-      (jolt.host/ref-put! self :remote-addr (ip->str ip))
-      (jolt.host/ref-put! self :port p)
-      (jolt.host/ref-put! self :local-port (local-port fd))))
+    (throw (java.net.SocketException. "Already connected")))
+  ;; A connect that fails closes the socket, as the JDK's does — a refused or
+  ;; timed-out socket is not left half-connected for the caller to reuse.
+  (try
+    (with-op self
+      (let [h  (str (jolt.host/ref-get endpoint :host))
+            p  (jolt.host/ref-get endpoint :port)
+            fd (jolt.host/ref-get self :fd)
+            ip (connect-fd! self fd h p (when (pos? timeout)
+                                          (+ (System/currentTimeMillis) timeout)))]
+        (jolt.host/ref-put! self :connected? true)
+        (jolt.host/ref-put! self :host h)
+        (jolt.host/ref-put! self :remote-addr (ip->str ip))
+        (jolt.host/ref-put! self :port p)
+        (jolt.host/ref-put! self :local-port (local-port fd))))
+    (catch java.io.IOException e
+      (close-owner! self)
+      (throw e)))
   nil)
+
+;; SO_TIMEOUT: milliseconds a read (Socket) or an accept (ServerSocket) may wait
+;; before raising SocketTimeoutException; 0, the default, waits forever. It bounds
+;; each call, not the connection, and a timeout leaves the socket usable. The
+;; JDK validates it after the closed check; the two classes word the negative
+;; case differently. Accepted sockets start at 0 — they do not inherit it.
+(defn- so-timeout [self] (or (jolt.host/ref-get self :so-timeout) 0))
+
+(defn- set-so-timeout! [self ms negative-msg]
+  (when (jolt.host/ref-get self :closed?)
+    (throw (java.net.SocketException. "Socket is closed")))
+  (when (neg? ms) (throw (IllegalArgumentException. negative-msg)))
+  (jolt.host/ref-put! self :so-timeout (int ms))
+  nil)
+
+(defn- get-so-timeout [self]
+  (when (jolt.host/ref-get self :closed?)
+    (throw (java.net.SocketException. "Socket is closed")))
+  (so-timeout self))
 
 (defn- socket->str [self]
   (if (jolt.host/ref-get self :connected?)
@@ -391,10 +433,11 @@
 (def ^:private socket-methods
   {"connect"
    (fn
-     ([self endpoint] (socket-connect! self endpoint))
-     ;; Java's timeout is milliseconds-until-abort; this connect is always
-     ;; blocking (equivalent to timeout 0). Divergence, documented in the ns.
-     ([self endpoint _timeout] (socket-connect! self endpoint)))
+     ([self endpoint] (socket-connect! self endpoint 0))
+     ([self endpoint timeout] (socket-connect! self endpoint (int timeout))))
+
+   "setSoTimeout" (fn [self ms] (set-so-timeout! self ms "timeout can't be negative"))
+   "getSoTimeout" get-so-timeout
 
    "getInputStream"
    (fn [self]
@@ -433,7 +476,9 @@
        (jolt.host/ref-put! :port (jolt.host/ref-get self :port))))})
 
 ;; -- SocketInputStream -------------------------------------------------------
-(defn- io-call [owner op fd wait-kind]
+(defn- io-call
+  ([owner op fd wait-kind] (io-call owner op fd wait-kind 0 nil))
+  ([owner op fd wait-kind timeout-ms timeout-msg]
   ;; Run one blocking-capable syscall with the fd in O_NONBLOCK mode (fibers
   ;; R8). EAGAIN waits for readiness — parking the fiber on the poller when
   ;; there is a current fiber, blocking on a private kevent/epoll_wait when
@@ -447,16 +492,24 @@
   ;; OWNER is the socket: the call counts as one of its operations, so a close
   ;; meanwhile wakes the wait and leaves the fd open until this call has left.
   ;; A socket found closed after a wait, or behind a failure, raises.
+  ;;
+  ;; A positive TIMEOUT-MS bounds the whole call (SO_TIMEOUT): the waits share
+  ;; one deadline, and running out raises SocketTimeoutException with
+  ;; TIMEOUT-MSG — never a -1 that a read would take for EOF. A close that lands
+  ;; first still raises as a close.
   (with-op owner
-    (let [closed-msg (if (= wait-kind :write) "Broken pipe" "Socket closed")]
+    (let [closed-msg (if (= wait-kind :write) "Broken pipe" "Socket closed")
+          deadline (when (pos? timeout-ms) (+ (System/currentTimeMillis) timeout-ms))]
       (loop []
         (let [[r e] (op)]
           (cond
             (and (neg? r) (poller/eintr? e)) (recur)
             (and (neg? r) (poller/eagain? e))
-            (do (poller/wait-ready fd wait-kind)
-                (raise-if-closed! owner closed-msg)
-                (recur))
+            (let [t (poller/wait-ready fd wait-kind deadline)]
+              (raise-if-closed! owner closed-msg)
+              (when (= t :timeout)
+                (throw (java.net.SocketTimeoutException. timeout-msg)))
+              (recur))
             :else
             (do
               (when (neg? r) (raise-if-closed! owner closed-msg))
@@ -468,7 +521,7 @@
                 (binding [*out* *err*]
                   (println "jolt.socket: fd" fd wait-kind "syscall failed, errno" e
                            "- answered as EOF")))
-              r)))))))
+              r))))))))
 
 (defn- do-recv [owner fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
@@ -479,7 +532,8 @@
   ;; already gone by this point — io-call loops on EINTR and waits out EAGAIN
   ;; — so every negative n here is terminal. Narrowing that to SocketException
   ;; on ECONNRESET means widening io-call's contract to hand the errno back.
-  (let [n (io-call owner #(c-recv fd buf len 0) fd :read)]
+  (let [n (io-call owner #(c-recv fd buf len 0) fd :read
+                   (so-timeout owner) "Read timed out")]
     (if (pos? n)
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
@@ -674,7 +728,8 @@
        (try
          (ffi/write lenp :int 16)
          (let [cfd (io-call self #(c-accept (jolt.host/ref-get self :fd) sa lenp)
-                            (jolt.host/ref-get self :fd) :read)]
+                            (jolt.host/ref-get self :fd) :read
+                            (so-timeout self) "Accept timed out")]
            (when (neg? cfd) (throw (java.io.IOException. "accept() failed")))
            (guard-fd! cfd)
            (doto (tt :socket "java.net.Socket")
@@ -690,6 +745,9 @@
    "close"
    (fn [self]
      (close-owner! self))
+
+   "setSoTimeout" (fn [self ms] (set-so-timeout! self ms "timeout < 0"))
+   "getSoTimeout" get-so-timeout
 
    "bind"
    (fn

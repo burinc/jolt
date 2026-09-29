@@ -23,7 +23,9 @@
 ;; kevent/epoll_wait) are closed with a control pipe, the textbook shape: the
 ;; pipe read end is always in the poller's set, a registration writes a byte to
 ;; the write end, and the poller drains pending registrations into its kq/epoll
-;; on every wake. Never a timed poll, never a sleep in the wait path.
+;; on every wake. Never a timed poll, never a sleep in the wait path. (A timed
+;; wait — SO_TIMEOUT, a timed connect — bounds the WAITER, not the poller: see
+;; wait-ready's deadline arity.)
 ;;
 ;; Locking: the table (fds, pending, pipe) is mutated under ONE monitor (pm).
 ;; The fiber's commit-to-park (jolt.host/fiber-park-commit!) runs under pm, and
@@ -602,30 +604,78 @@
 ;; registration fires immediately — no missed wakeup). Either way it also returns
 ;; when the fd is cancelled (cancel!), so the caller has to check whether its
 ;; owner is closing before it retries.
+;;
+;; (wait-ready fd filt deadline-ms) is the same wait bounded by an epoch-ms
+;; deadline, answering :timeout when the deadline passed first and nil otherwise
+;; (SO_TIMEOUT and the timed connect, jolt-lang/jolt#1191/#1192). The poller's own
+;; wait stays untimed: a thread bounds its private kevent/epoll_wait, and a fiber
+;; is woken at the deadline by the runtime's one timer thread (jolt.host/timer-at!).
+
+;; Under pm: register the current fiber as a waiter on (fd, filt) and commit it to
+;; park. True when committed — the caller must then switch — false when the wait
+;; is already over (the fd is cancelled, or a ready flag answers it).
+(defn- commit-wait! [fd filt]
+  (ensure-started!)
+  (let [e (get-in @state [:fds fd filt])]
+    (cond
+      (contains? (:cancelled @state) fd) false
+      (and e (:ready e))
+      (do (swap! stale-consumes inc)
+          (swap! state assoc-in [:fds fd filt :ready] false) false)
+      :else
+      (do (swap! state assoc-in [:fds fd filt]
+                 {:waiters (conj (or (:waiters e) []) (jolt.host/current-fiber))
+                  :ready false})
+          ;; The guard is per (fd, FILTER). Keyed by fd alone it
+          ;; skipped the registration whenever the OTHER direction of
+          ;; the same fd was already queued, and that filter then never
+          ;; reached the kernel at all.
+          (when-not (contains? (get (:pending @state) fd #{}) filt)
+            (swap! state update-in [:pending fd] (fnil conj #{}) filt)
+            (pipe-write!))
+          (jolt.host/fiber-park-commit!)
+          true))))
+
 (defn wait-fiber [fd filt]
-  (let [park? (locking pm
-                (ensure-started!)
-                (let [e (get-in @state [:fds fd filt])]
-                  (cond
-                    (contains? (:cancelled @state) fd) false
-                    (and e (:ready e))
-                    (do (swap! stale-consumes inc)
-                        (swap! state assoc-in [:fds fd filt :ready] false) false)
-                    :else
-                    (do (swap! state assoc-in [:fds fd filt]
-                               {:waiters (conj (or (:waiters e) []) (jolt.host/current-fiber))
-                                :ready false})
-                        ;; The guard is per (fd, FILTER). Keyed by fd alone it
-                        ;; skipped the registration whenever the OTHER direction of
-                        ;; the same fd was already queued, and that filter then never
-                        ;; reached the kernel at all.
-                        (when-not (contains? (get (:pending @state) fd #{}) filt)
-                          (swap! state update-in [:pending fd] (fnil conj #{}) filt)
-                          (pipe-write!))
-                        (jolt.host/fiber-park-commit!)
-                        true))))]
-    (when park?
-      (jolt.host/fiber-to-scheduler!))))
+  (when (locking pm (commit-wait! fd filt))
+    (jolt.host/fiber-to-scheduler!)))
+
+;; Under pm: take fiber F off (fd, filt)'s waiters. True when it was there — then
+;; nothing else will resume it, and whoever took it must.
+(defn- unpark-waiter! [fd filt f]
+  (let [ws (get-in @state [:fds fd filt :waiters])]
+    (when (some #(identical? % f) ws)
+      (swap! state assoc-in [:fds fd filt :waiters] (filterv #(not (identical? % f)) ws))
+      true)))
+
+;; The timed fiber wait. The deadline thunk and the wait decide under pm who wakes
+;; the fiber: the thunk resumes it only if it is still parked on THIS (fd, filt) —
+;; if the poller took it first, the readiness wins and the caller retries its
+;; syscall. W is this wait's own record, so a thunk left behind by an earlier wait
+;; of the same fiber (the timer cannot be cancelled) finds :done? and does nothing.
+;; The timer is armed before the commit; a deadline that passes before the fiber
+;; commits leaves :expired? for the commit to see, so it never parks past it.
+;; The entry the poller keeps for the fd after a timeout is the same stale
+;; registration a woken waiter leaves: it fires once, finds no waiter, is retired.
+(defn- wait-fiber-until [fd filt deadline]
+  (let [f (jolt.host/current-fiber)
+        w (atom {:expired? false :timed-out? false :done? false})]
+    (jolt.host/timer-at!
+      deadline
+      (fn []
+        (when (locking pm
+                (when-not (:done? @w)
+                  (swap! w assoc :expired? true)
+                  (when (unpark-waiter! fd filt f)
+                    (swap! w assoc :timed-out? true)
+                    true)))
+          (jolt.host/fiber-resume f))))
+    (let [park? (locking pm (if (:expired? @w) :expired (commit-wait! fd filt)))]
+      (if (= park? :expired)
+        :timeout
+        (do (try (when park? (jolt.host/fiber-to-scheduler!))
+                 (finally (locking pm (swap! w assoc :done? true))))
+            (when (:timed-out? @w) :timeout))))))
 
 ;; A thread waiter registers its wake handle — its private kqueue, which carries
 ;; an EVFILT_USER event, or an eventfd in its private epoll set — so cancel! can
@@ -646,36 +696,74 @@
         (swap! state assoc-in [:threads fd] hs)
         (swap! state update :threads dissoc fd)))))
 
+;; The blocking wait itself, bounded by DEADLINE (epoch ms) when there is one.
+;; Answers :timeout once the deadline has passed, nil when the wait returned for
+;; any other reason. EINTR, and a timed wait that returns early, go round again;
+;; with no deadline this is the plain untimed wait it always was.
+(defn- remaining-ms [deadline] (- deadline (System/currentTimeMillis)))
+
+(defn- kevent-wait! [kq ev deadline]
+  (if (nil? deadline)
+    (loop []
+      (when (neg? (c-kevent kq ffi/null 0 ev 1 ffi/null)) (recur)))
+    (let [ts (ffi/alloc 16)]
+      (try
+        (loop []
+          (let [ms (remaining-ms deadline)]
+            (if (<= ms 0)
+              :timeout
+              (do (ffi/write ts :int64 (quot ms 1000) 0)
+                  (ffi/write ts :int64 (* (rem ms 1000) 1000000) 8)
+                  (when-not (pos? (c-kevent kq ffi/null 0 ev 1 ts)) (recur))))))
+        (finally (ffi/free ts))))))
+
+(defn- epoll-wait! [ep ev deadline]
+  (if (nil? deadline)
+    (loop []
+      (when (neg? (c-epoll-wait ep ev 1 -1)) (recur)))
+    (loop []
+      (let [ms (remaining-ms deadline)]
+        (if (<= ms 0)
+          :timeout
+          (when-not (pos? (c-epoll-wait ep ev 1 (min ms 2147483647))) (recur)))))))
+
 ;; A failed registration returns without waiting: the caller retries its syscall,
 ;; which reports what is wrong with the fd.
-(defn wait-thread [fd filt]
-  (if macos?
-    (let [kq (c-kqueue) ch (ffi/alloc (* 2 KEVENT-SIZE)) ev (ffi/alloc KEVENT-SIZE) h {:kq kq}]
-      (try
-        (kevent-put! ch 0 fd (if (= filt :read) EVFILT-READ EVFILT-WRITE) EV-ADD)
-        (kevent-put! ch 1 0 EVFILT-USER (bit-or EV-ADD EV-CLEAR))
-        (when (and (not (neg? (c-kevent kq ch 2 ffi/null 0 ffi/null)))
-                   (thread-enter! fd h))
-          (try
-            (loop []
-              (when (neg? (c-kevent kq ffi/null 0 ev 1 ffi/null)) (recur)))
-            (finally (thread-leave! fd h))))
-        (finally (ffi/free ch) (ffi/free ev) (c-close kq))))
-    (let [ep (c-epoll-create1 0)
-          efd (c-eventfd 0 (bit-or EFD-NONBLOCK EFD-CLOEXEC))
-          ev (ffi/alloc EPOLL-EVENT-SIZE)
-          h {:efd efd}]
-      (try
-        (when (and (not (neg? (ep-ctl! ep EPOLL-ADD fd filt)))
-                   (not (neg? (ep-ctl! ep EPOLL-ADD efd :read)))
-                   (thread-enter! fd h))
-          (try
-            (loop []
-              (when (neg? (c-epoll-wait ep ev 1 -1)) (recur)))
-            (finally (thread-leave! fd h))))
-        (finally (ffi/free ev) (c-close efd) (c-close ep))))))
+(defn wait-thread
+  ([fd filt] (wait-thread fd filt nil))
+  ([fd filt deadline]
+   (if macos?
+     (let [kq (c-kqueue) ch (ffi/alloc (* 2 KEVENT-SIZE)) ev (ffi/alloc KEVENT-SIZE) h {:kq kq}]
+       (try
+         (kevent-put! ch 0 fd (if (= filt :read) EVFILT-READ EVFILT-WRITE) EV-ADD)
+         (kevent-put! ch 1 0 EVFILT-USER (bit-or EV-ADD EV-CLEAR))
+         (when (and (not (neg? (c-kevent kq ch 2 ffi/null 0 ffi/null)))
+                    (thread-enter! fd h))
+           (try
+             (kevent-wait! kq ev deadline)
+             (finally (thread-leave! fd h))))
+         (finally (ffi/free ch) (ffi/free ev) (c-close kq))))
+     (let [ep (c-epoll-create1 0)
+           efd (c-eventfd 0 (bit-or EFD-NONBLOCK EFD-CLOEXEC))
+           ev (ffi/alloc EPOLL-EVENT-SIZE)
+           h {:efd efd}]
+       (try
+         (when (and (not (neg? (ep-ctl! ep EPOLL-ADD fd filt)))
+                    (not (neg? (ep-ctl! ep EPOLL-ADD efd :read)))
+                    (thread-enter! fd h))
+           (try
+             (epoll-wait! ep ev deadline)
+             (finally (thread-leave! fd h))))
+         (finally (ffi/free ev) (c-close efd) (c-close ep)))))))
 
-(defn wait-ready [fd filt]
-  (if (jolt.host/fiber?)
-    (wait-fiber fd filt)
-    (wait-thread fd filt)))
+(defn wait-ready
+  ([fd filt]
+   (if (jolt.host/fiber?)
+     (wait-fiber fd filt)
+     (wait-thread fd filt)))
+  ([fd filt deadline]
+   (cond
+     (nil? deadline) (wait-ready fd filt)
+     (<= (remaining-ms deadline) 0) :timeout
+     (jolt.host/fiber?) (wait-fiber-until fd filt deadline)
+     :else (wait-thread fd filt deadline))))

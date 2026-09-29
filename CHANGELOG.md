@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Evaluating through a policy wrapper (`allow`, `deny`, …) owns the namespace
   at the nearest ancestor that releases one, so the base loader's `unload!`
   unmaps it.
+- **`Socket`/`ServerSocket` `setSoTimeout`/`getSoTimeout`.** A read or an
+  accept that waits longer than SO_TIMEOUT raises
+  `java.net.SocketTimeoutException` ("Read timed out"/"Accept timed out") and
+  leaves the socket usable, on threads and on fibers; 0 is still forever.
+  The poller gained a deadline arity for this, and a parked fiber is woken by
+  the runtime's shared timer, so untimed waits are unchanged. Not enforced on
+  Windows, whose sockets are blocking (recorded divergence) (#1191).
 
 ### Changed
 
@@ -47,6 +54,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   small but are not reclaimed; that waits for per-context var tables.
 
 ### Fixed
+
+- **`Socket.connect(endpoint, timeout)` honours its timeout.** It was accepted
+  and ignored, so a connect to a peer that never answered blocked until the OS
+  gave up. It now raises `SocketTimeoutException` ("Connect timed out"), a
+  negative timeout is an `IllegalArgumentException`, a refused connect is a
+  `ConnectException` rather than a bare `IOException`, and a failed connect
+  closes the socket as the JDK's does. "Already connected" is a
+  `SocketException` and an unresolvable host an `UnknownHostException`, also
+  as on the JDK (#1192).
 
 - **`unsigned-bit-shift-right` by zero keeps a negative long.** A shift count
   of 0 (or any multiple of 64) returned the operand's unsigned value as a
