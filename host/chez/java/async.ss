@@ -607,6 +607,15 @@
     (fork-thread timeout-thread))
   (jolt-unlock! timeout-mu))
 
+;; The same facility for the Clojure layer: jolt.io-poller wakes a fiber parked
+;; on a socket once its SO_TIMEOUT or connect deadline passes. F runs on the
+;; timer thread, so it must not block; the poller's thunk takes its table lock
+;; and resumes the fiber after releasing it.
+(def-var! "jolt.host" "timer-at!"
+  (lambda (deadline-ms f)
+    (jolt-timer-at! deadline-ms (lambda () (jolt-invoke f)))
+    jolt-nil))
+
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
   (let ((w (ac-make 0 'unbuffered #f)))

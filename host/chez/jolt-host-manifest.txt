@@ -231,6 +231,7 @@ table?
 tagged-table
 thread-id
 throwable
+timer-at!
 transient-associative?
 type-satisfies?
 tz-backend
