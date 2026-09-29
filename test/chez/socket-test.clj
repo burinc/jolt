@@ -355,12 +355,19 @@
 
 (with-pair
   (fn [server client conn]
-    ;; the peer never reads, so the send buffer fills and a write blocks
+    ;; The peer never reads, so the send buffer fills and a write blocks. A slow
+    ;; machine can still be copying a chunk when close lands, and the next write
+    ;; then raises "Socket closed", which is also what the JVM does there; what
+    ;; matters is that the writer wakes and raises.
     (let [out (.getOutputStream client)
-          chunk (byte-array (* 64 1024))]
+          chunk (byte-array (* 64 1024))
+          r (blocked-then-closed #(loop [] (.write out chunk) (recur)) client)]
       (check-eq "close wakes a thread blocked in write"
-                (blocked-then-closed #(loop [] (.write out chunk) (recur)) client)
-                [:socket-exception "Broken pipe"]))))
+                (if (contains? #{[:socket-exception "Broken pipe"]
+                                 [:socket-exception "Socket closed"]} r)
+                  :raised
+                  r)
+                :raised))))
 
 ;; The same on a fiber, where the woken read used to retry recv on the fd number
 ;; close had freed: B, opened right after, is handed that number, and A's read
