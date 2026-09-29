@@ -307,5 +307,29 @@
     (eq? (jolt-fiber-result t7-deref) (keyword #f "delivered")))
 (ok "7d. and left no deadline pending" (= base-timers (pending-timers)))
 
+;; --- 8. a raise the wait survives keeps its deadline -----------------------------
+;; The timed wait drops its deadline when a raise passes through it. A raise
+;; that a handler further out RESUMES does not end the wait, so the deadline has
+;; to come back, or the fiber parks with nothing left to wake it at the deadline.
+(printf "\n== 8. a resumed raise inside a timed fiber wait keeps its deadline ==\n")
+(define t8-mu (make-mutex))
+(define t8-cv (make-condition))
+(define t8-raised? #f)
+(define t8
+  (sa-fiber-spawn
+    (lambda ()
+      (with-exception-handler
+        (lambda (c) 'resumed)
+        (lambda ()
+          (jolt-cv-wait t8-mu t8-cv (+ (now-millis) 200)
+            (lambda (timed-out?)
+              (unless t8-raised?
+                (set! t8-raised? #t)
+                (raise-continuable 'passing-through))
+              (if timed-out? 'timed-out jolt-cv-again))))))))
+(wait-until (lambda () (eq? (jolt-fiber-state t8) 'done)) 15.0 "8. resumed wait still timed out")
+(ok "8a. the wait answered at its deadline" (eq? (jolt-fiber-result t8) 'timed-out))
+(ok "8b. and left no deadline pending" (= base-timers (pending-timers)))
+
 (printf "\nfibers-io: ~a checks, ~a failures\n" total fails)
 (exit (if (zero? fails) 0 1))
