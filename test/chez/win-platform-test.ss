@@ -688,6 +688,13 @@
 (same "url->path: UNC host"            (file-url->path-for #t "file://srv/sh/a")          "//srv/sh/a")
 (same "url->path: drive root"          (file-url->path-for #t "file:/C:/")                "C:/")
 (same "url->path: a stray % is literal" (file-url->path-for #t "file:/C:/100%/x")         "C:/100%/x")
+
+;; new File(URI) / Path.of(URI) (jolt-lang/jolt#1198) share the drive rule with
+;; the URL reader: the URI's "/C:/..." path is the Windows path "C:/...".
+(same "uri->file: drive"               (uri->file-path-for #t (uri-parse "file:///C:/Users/x/a.txt")) "C:/Users/x/a.txt")
+(same "uri->file: escaped space"       (uri->file-path-for #t (uri-parse "file:/C:/has%20space/x"))   "C:/has space/x")
+(same "uri->file: drive root"          (uri->file-path-for #t (uri-parse "file:///C:/"))              "C:/")
+(same "uri->file: posix keeps /C:"     (uri->file-path-for #f (uri-parse "file:///C:/x"))             "/C:/x")
 (same "url->path: utf-8 escapes"       (file-url->path-for #f "file:/a/%C3%A4")           "/a/\x00e4;")
 ;; POSIX keeps the leading "/", and a path whose first segment merely LOOKS like
 ;; a drive is still a POSIX path

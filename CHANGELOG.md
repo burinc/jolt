@@ -55,6 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`new File(uri)`, `Paths.get(uri)` and `Path.of(uri)` read the URI's path.**
+  They took the URI's string as the path, so `file:///tmp/a%20b` became the
+  relative path `file:/tmp/a%20b` and nothing under it existed. They now decode
+  the path of a `file:` URI and refuse the rest with the JDK's messages — an
+  authority (even `localhost`), a query, a fragment, an opaque or relative URI;
+  `Paths.get` of another scheme is a `FileSystemNotFoundException`.
+  `clojure.java.io/file` of a URI reads it the lenient way, through its URL, as
+  Clojure does (#1198).
+
 - **`java.time`'s `Month` overloads.** `LocalDate/of`, `LocalDateTime/of`,
   `YearMonth/of`, `MonthDay/of` and `Year.atMonth` take a `java.time.Month`
   where the month number goes, as the JDK's do; a `Month` was a
