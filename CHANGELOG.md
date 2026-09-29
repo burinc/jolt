@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`unsigned-bit-shift-right` by zero keeps a negative long.** A shift count
+  of 0 (or any multiple of 64) returned the operand's unsigned value as a
+  BigInt, so `(unsigned-bit-shift-right -1 0)` read `18446744073709551615N`
+  instead of `-1`. The result now wraps back to a signed long like Java's
+  `>>>` (#1187).
 - **`jolt.image` writes records whose type implements a protocol.** `dump!`
   refused any such record, inline in `defrecord` or through `extend-protocol`,
   with `cannot write #<procedure>`, while `scan` called it clean: the type's
