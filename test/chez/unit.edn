@@ -552,6 +552,9 @@
   {:suite "insttime" :expr "(instance? java.time.LocalDateTime (LocalDateTime/parse \"2020-03-05T13:45:30\"))" :expected "true"}
   {:suite "insttime" :expr "(str (.toInstant #inst \"2020-03-05T13:45:30Z\"))" :expected "\"2020-03-05T13:45:30Z\""}
   {:suite "insttime" :expr "(str (LocalDate/of 2020 3 5))" :expected "\"2020-03-05\""}
+  ;; the JDK's Month overloads of `of` (jolt-lang/jolt#1197): a Month where the
+  ;; month number goes, on every type that takes one
+  {:suite "insttime" :expr "(mapv str [(LocalDate/of 2026 java.time.Month/SEPTEMBER 29) (LocalDateTime/of 2026 java.time.Month/SEPTEMBER 29 12 34) (LocalDateTime/of 2026 java.time.Month/SEPTEMBER 29 12 34 56) (LocalDateTime/of 2026 java.time.Month/SEPTEMBER 29 12 34 56 7) (java.time.YearMonth/of 2026 java.time.Month/FEBRUARY) (java.time.MonthDay/of java.time.Month/FEBRUARY 29) (.atMonth (java.time.Year/of 2026) java.time.Month/MAY)])" :expected "[\"2026-09-29\" \"2026-09-29T12:34\" \"2026-09-29T12:34:56\" \"2026-09-29T12:34:56.000000007\" \"2026-02\" \"--02-29\" \"2026-05\"]"}
   {:suite "insttime" :expr "(.toMillis (Duration/between (Instant/ofEpochMilli 0) (Instant/ofEpochMilli 5000)))" :expected "5000"}
   {:suite "insttime" :expr "(.toEpochMilli (Instant/parse \"2020-01-01T00:00:00Z\"))" :expected "1577836800000"}
   ;; A java.time.Instant is an inst through clojure.core's Inst protocol, which

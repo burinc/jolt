@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`java.time`'s `Month` overloads.** `LocalDate/of`, `LocalDateTime/of`,
+  `YearMonth/of`, `MonthDay/of` and `Year.atMonth` take a `java.time.Month`
+  where the month number goes, as the JDK's do; a `Month` was a
+  `ClassCastException`. `LocalDateTime/ofInstant` and an `ofEpochSecond` that
+  applies its offset come from jolt-lang/time, which owns zones (#1197).
+
 - **Spawned processes start with `SIGPIPE` at its default, as on the JVM.**
   The runtime ignores `SIGPIPE` for its own writes, and an ignored signal
   survives `exec`, so every child and everything it ran inherited it. A

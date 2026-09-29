@@ -33,7 +33,7 @@
    "length"     (fn [y] (if (u/leap? (year-val y)) 366 365))
    "plusYears"  (fn [y n] (year (+ (year-val y) (u/->long n))))
    "minusYears" (fn [y n] (year (- (year-val y) (u/->long n))))
-   "atMonth"    (fn [y m] (year-month (year-val y) (u/->long m)))
+   "atMonth"    (fn [y m] (year-month (year-val y) (e/month-num m)))
    "atDay"      (fn [y doy] (l/local-date (+ (days-from-civil (year-val y) 1 1) (dec (u/->long doy)))))
    "isBefore"   (fn [y o] (< (year-val y) (year-val o)))
    "isAfter"    (fn [y o] (> (year-val y) (year-val o)))
@@ -102,7 +102,7 @@
    "toString"      ym->string})
 
 (statics! ["YearMonth" "java.time.YearMonth"]
-  {"of"    (fn [y m] (year-month (u/->long y) (u/->long m)))
+  {"of"    (fn [y m] (year-month (u/->long y) (e/month-num m)))
    "now"   (fn [& args] (let [[y m _] (civil-from-days (u/floor-div (impl/clock-millis (first args)) 86400000))] (year-month y m)))
    "parse" (fn [s & _] (let [d (str s)]
                          (year-month (or (u/digits-at d 0 4) (throw (ex-info "could not parse YearMonth" {})))
@@ -132,7 +132,7 @@
    "hashCode" (fn [x] (+ (* (md-month x) 100) (md-day x))) "toString" md->string})
 
 (statics! ["MonthDay" "java.time.MonthDay"]
-  {"of" (fn [m d] (month-day (u/->long m) (u/->long d)))
+  {"of" (fn [m d] (month-day (e/month-num m) (u/->long d)))
    "parse" (fn [s & _] (let [d (str s) o (if (= "--" (subs d 0 2)) 2 0)]
                          (month-day (u/digits-at d o 2) (u/digits-at d (+ o 3) 2))))
    "now" (fn [& args] (let [[_ m dd] (civil-from-days (u/floor-div (impl/clock-millis (first args)) 86400000))] (month-day m dd)))})
