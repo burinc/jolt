@@ -556,6 +556,30 @@
   (jolt-foreign-proc-safe "posix_spawn_file_actions_addinherit_np" '(void* int) 'int))
 (define proc-POSIX-SPAWN-CLOEXEC-DEFAULT #x4000)   ; <sys/spawn.h>, Darwin
 
+;; A child starts with SIGPIPE at SIG_DFL, as the JVM's do (jolt-lang/jolt#1196).
+;; This process ignores SIGPIPE — Chez's runtime does, so a write to a closed pipe
+;; answers EPIPE instead of killing jolt — and an IGNORED disposition survives
+;; exec, unlike a handler. Left alone, every child and everything it runs saw a
+;; closed pipe as an error: `yes | head` printed "Broken pipe" from yes and exited
+;; through its error path instead of dying of the signal. The shell cannot undo it
+;; either; POSIX has a non-interactive sh keep a signal ignored on entry ignored.
+;; POSIX_SPAWN_SETSIGDEF resets the signals in the attribute's set in the child,
+;; between fork and exec. The flag is 4 and SIGPIPE 13 on every host that spawns
+;; here (Linux glibc/musl/bionic, Darwin). sigset_t is 4 bytes on Darwin and 128
+;; on glibc; a posix_spawnattr_t is a pointer on Darwin and bionic and 336 bytes
+;; on glibc — the allocations below cover the widest.
+(define proc-attr-setsigdefault
+  (jolt-foreign-proc-safe "posix_spawnattr_setsigdefault" '(void* void*) 'int))
+(define proc-c-sigemptyset (jolt-foreign-proc-safe "sigemptyset" '(void*) 'int))
+(define proc-c-sigaddset   (jolt-foreign-proc-safe "sigaddset"   '(void* int) 'int))
+(define proc-POSIX-SPAWN-SETSIGDEF #x04)
+(define proc-SIGPIPE 13)
+(define proc-attr-bytes 512)
+(define proc-sigset-bytes 256)
+(define (proc-sigdefault-ok?)
+  (and proc-attr-init proc-attr-setflags proc-attr-destroy proc-attr-setsigdefault
+       proc-c-sigemptyset proc-c-sigaddset #t))
+
 ;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
 ;; extension's own bindings (fcntl, errno) are gated separately by
 ;; proc-nonblock-ok? above: losing parking is a performance story, losing this
@@ -1021,14 +1045,24 @@
              (err-p (and (not inherit-err?) (mk-pipe #t #f)))
              (barrier (proc-exec-barrier-pipe))
              (fa (sa-foreign-alloc 128))
-             ;; posix_spawnattr_t is one pointer on Darwin, the only place this
-             ;; is allocated; 64 bytes leaves room for a wider layout regardless.
-             (attr (and (proc-cloexec-default?) (sa-foreign-alloc 64)))
+             (cloexec? (proc-cloexec-default?))
+             (sigdef? (proc-sigdefault-ok?))
+             (attr (and (or cloexec? sigdef?) (sa-foreign-alloc proc-attr-bytes)))
              (pidbuf (sa-foreign-alloc 8)))
         (proc-fa-init fa)
         (when attr
           (proc-attr-init attr)
-          (proc-attr-setflags attr proc-POSIX-SPAWN-CLOEXEC-DEFAULT)
+          (proc-attr-setflags attr
+            (fxior (if cloexec? proc-POSIX-SPAWN-CLOEXEC-DEFAULT 0)
+                   (if sigdef? proc-POSIX-SPAWN-SETSIGDEF 0)))
+          (when sigdef?
+            (let ((set (sa-foreign-alloc proc-sigset-bytes)))
+              (proc-c-sigemptyset set)
+              (proc-c-sigaddset set proc-SIGPIPE)
+              ;; the attribute keeps its own copy
+              (proc-attr-setsigdefault attr set)
+              (sa-foreign-free set))))
+        (when cloexec?
           ;; An inherited stream has no dup2 naming it, so under the flag it
           ;; would be closed with everything else: name it.
           (when inherit-in?  (proc-fa-inherit fa 0))
@@ -1045,7 +1079,7 @@
         ;; LAST of the file actions, so the dup2s above have already moved the
         ;; child's ends onto 0/1/2 by the time everything else goes. Under
         ;; CLOEXEC_DEFAULT the kernel does this part.
-        (unless attr
+        (unless cloexec?
           (proc-close-inherited-fds!
             fa (append (if in-p  (list (car in-p)  (cdr in-p))  '())
                        (if out-p (list (car out-p) (cdr out-p)) '())
@@ -1056,7 +1090,7 @@
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
                            (proc-child-env-pairs))))
-               ;; attrp is NULL — or carries only the CLOEXEC_DEFAULT flag, never
+               ;; attrp carries CLOEXEC_DEFAULT and SETSIGDEF at most, never
                ;; SETSIGMASK — so the child inherits this thread's signal mask,
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask

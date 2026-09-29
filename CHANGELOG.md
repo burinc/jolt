@@ -55,6 +55,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`new File(uri)`, `Paths.get(uri)` and `Path.of(uri)` read the URI's path.**
+  They took the URI's string as the path, so `file:///tmp/a%20b` became the
+  relative path `file:/tmp/a%20b` and nothing under it existed. They now decode
+  the path of a `file:` URI and refuse the rest with the JDK's messages — an
+  authority (even `localhost`), a query, a fragment, an opaque or relative URI;
+  `Paths.get` of another scheme is a `FileSystemNotFoundException`.
+  `clojure.java.io/file` of a URI reads it the lenient way, through its URL, as
+  Clojure does (#1198).
+
+- **`java.time`'s `Month` overloads.** `LocalDate/of`, `LocalDateTime/of`,
+  `YearMonth/of`, `MonthDay/of` and `Year.atMonth` take a `java.time.Month`
+  where the month number goes, as the JDK's do; a `Month` was a
+  `ClassCastException`. `LocalDateTime/ofInstant` and an `ofEpochSecond` that
+  applies its offset come from jolt-lang/time, which owns zones (#1197).
+
+- **Spawned processes start with `SIGPIPE` at its default, as on the JVM.**
+  The runtime ignores `SIGPIPE` for its own writes, and an ignored signal
+  survives `exec`, so every child and everything it ran inherited it. A
+  producer whose consumer exited early (`yes | head`, `cmd | grep -q`) got
+  `EPIPE` and ran its error path — "Broken pipe" on stderr, a different exit
+  status — instead of being ended by the signal. A shell cannot undo that
+  itself, so the spawn now resets it (#1196).
+
 - **A timed wait on a fiber no longer pins the fiber until its deadline.** The
   runtime's timer had no cancel, so a fiber's timed socket read, accept or
   connect, or a timed `deref`, left its deadline armed after the wait ended,

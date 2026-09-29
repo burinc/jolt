@@ -119,7 +119,7 @@
 (declare ldt? ldt-epoch-day ldt-nod)
 
 (statics! ["LocalDate" "java.time.LocalDate"]
-  {"of"         (fn [y m d] (ld-of (u/->long y) (u/->long m) (u/->long d)))
+  {"of"         (fn [y m d] (ld-of (u/->long y) (e/month-num m) (u/->long d)))
    "ofEpochDay" (fn [n] (local-date (u/->long n)))
    "ofYearDay"  (fn [y doy] (local-date (+ (days-from-civil (u/->long y) 1 1) (dec (u/->long doy)))))
    "parse"      (fn [s & _] (local-date (parse-iso-date (str s))))
@@ -289,9 +289,9 @@
 
 (statics! ["LocalDateTime" "java.time.LocalDateTime"]
   {"of"      (fn ([d t] (local-dt (ld-epoch-day d) (lt-nano-of-day t)))
-                ([y mo d h mi] (local-dt (days-from-civil (u/->long y) (u/->long mo) (u/->long d)) (u/hmsn->nano (u/->long h) (u/->long mi) 0 0)))
-                ([y mo d h mi s] (local-dt (days-from-civil (u/->long y) (u/->long mo) (u/->long d)) (u/hmsn->nano (u/->long h) (u/->long mi) (u/->long s) 0)))
-                ([y mo d h mi s nano] (local-dt (days-from-civil (u/->long y) (u/->long mo) (u/->long d)) (u/hmsn->nano (u/->long h) (u/->long mi) (u/->long s) (u/->long nano)))))
+                ([y mo d h mi] (local-dt (days-from-civil (u/->long y) (e/month-num mo) (u/->long d)) (u/hmsn->nano (u/->long h) (u/->long mi) 0 0)))
+                ([y mo d h mi s] (local-dt (days-from-civil (u/->long y) (e/month-num mo) (u/->long d)) (u/hmsn->nano (u/->long h) (u/->long mi) (u/->long s) 0)))
+                ([y mo d h mi s nano] (local-dt (days-from-civil (u/->long y) (e/month-num mo) (u/->long d)) (u/hmsn->nano (u/->long h) (u/->long mi) (u/->long s) (u/->long nano)))))
    "ofEpochSecond" (fn [secs nano _off]
                      (let [es (u/->long secs)]
                        (local-dt (u/floor-div es 86400) (+ (* (u/floor-mod es 86400) nps) (u/->long nano)))))

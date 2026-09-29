@@ -682,6 +682,7 @@
 (jch-register-supers! "java.nio.file.NotDirectoryException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.NotLinkException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.DirectoryNotEmptyException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.FileSystemNotFoundException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.net.UnknownHostException" '("java.io.IOException"))
 (jch-register-supers! "java.net.SocketException" '("java.io.IOException"))
 (jch-register-supers! "java.net.ConnectException" '("java.net.SocketException"))

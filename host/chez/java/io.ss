@@ -546,7 +546,12 @@
     (if (null? cs)
         ;; (io/file url) strips the scheme — File of url.toURI on the JVM; only a
         ;; file: url names a path. url-file-coercion is defined below; call-time ref.
-        (if (and (null? rest) (jhost? path) (string=? (jhost-tag path) "url")) (url-file-coercion path) (make-jfile p))
+        (cond ((null? rest)
+               (cond ((url-jhost? path) (url-file-coercion path))
+                     ;; as-file of a URI is as-file of its URL (clojure.java.io)
+                     ((uri-jhost? path) (url-spec-file-coercion (uri-field path 'string)))
+                     (else (make-jfile p))))
+              (else (make-jfile p)))
         (loop (string-append p "/" (file-path-of (car cs))) (cdr cs)))))
 ;; the on-disk path of a value: a relative path resolves against JOLT_PWD.
 (define (jfile-fs f) (project-relative (file-path-of f)))
@@ -652,14 +657,48 @@
                          (string-append "//" host path)))
                    rest))
          (p (uri-decode-lenient rest)))
-    (if (and windows?
-             (>= (string-length p) 3)
-             (char=? (string-ref p 0) #\/)
-             (windows-drive-prefix? (substring p 1 (string-length p)))
-             (or (= (string-length p) 3) (path-separator-char? (string-ref p 3))))
-        (substring p 1 (string-length p))
-        p)))
+    (uri-path->drive-path windows? p)))
 (define (file-url->path spec) (file-url->path-for (win32?) spec))
+
+;; A URI path names a drive as "/C:/..."; on Windows the path is "C:/...".
+(define (uri-path->drive-path windows? p)
+  (if (and windows?
+           (>= (string-length p) 3)
+           (char=? (string-ref p 0) #\/)
+           (windows-drive-prefix? (substring p 1 (string-length p)))
+           (or (= (string-length p) 3) (path-separator-char? (string-ref p 3))))
+      (substring p 1 (string-length p))
+      p))
+
+;; new File(URI), and the default filesystem's getPath(URI) under Paths.get and
+;; Path.of (jolt-lang/jolt#1198). Unlike a file: URL, which clojure.java.io reads
+;; leniently above, the JDK takes only an absolute, hierarchical file: URI with
+;; no authority, query or fragment, and says which rule failed, in this order.
+;; A localhost authority is refused here, not dropped. Both callers used to hand
+;; the URI's string on as the path, so "file:///tmp/a%20b" became the relative
+;; path "file:/tmp/a%20b".
+(define (uri->file-path-for windows? u)
+  (define (bad msg) (throw-jvm 'IllegalArgumentException msg))
+  (let ((scheme (uri-field u 'scheme)))
+    (when (jolt-nil? scheme) (bad "URI is not absolute"))
+    (when (uri-opaque? u) (bad "URI is not hierarchical"))
+    (unless (string-ci=? scheme "file") (bad "URI scheme is not \"file\""))
+    (unless (jolt-nil? (uri-field u 'authority)) (bad "URI has an authority component"))
+    (unless (jolt-nil? (uri-field u 'fragment)) (bad "URI has a fragment component"))
+    (unless (jolt-nil? (uri-field u 'query)) (bad "URI has a query component"))
+    (let ((p (uri-field u 'dec-path)))
+      (when (or (jolt-nil? p) (string=? p "")) (bad "URI path component is empty"))
+      (uri-path->drive-path windows? p))))
+(define (uri->file-path u) (uri->file-path-for (win32?) u))
+;; Path.of(URI): the scheme picks the filesystem provider first, and only the
+;; default one ("file") is installed.
+(define (nio-uri->path u)
+  (let ((scheme (uri-field u 'scheme)))
+    (cond ((jolt-nil? scheme) (throw-jvm 'IllegalArgumentException "Missing scheme"))
+          ((string-ci=? scheme "file") (uri->file-path u))
+          (else (jolt-throw (jolt-host-throwable
+                              "java.nio.file.FileSystemNotFoundException"
+                              (string-append "Provider \"" scheme "\" not installed")))))))
 
 ;; The path a STRING names as a clojure.java.io source or sink. Its Coercions
 ;; try (URL. s) before (File. s), so "file:/a/b" is the file /a/b rather than a
@@ -2577,17 +2616,19 @@
 ;; io/as-file of a file: URL yields the file it points at (JVM: new
 ;; File(url.toURI())); a URL with any other protocol has no filesystem path —
 ;; IllegalArgumentException, as the JVM's File(URI) throws.
-(define (url-file-coercion u)
-  (if (string=? (url-protocol (url-spec u)) "file")
-      (make-jfile (file-url->path (url-spec u)))
-      (throw-jvm 'IllegalArgumentException (string-append "Not a file: " (url-spec u)))))
+(define (url-file-coercion u) (url-spec-file-coercion (url-spec u)))
+(define (url-spec-file-coercion spec)
+  (if (string=? (url-protocol spec) "file")
+      (make-jfile (file-url->path spec))
+      (throw-jvm 'IllegalArgumentException (string-append "Not a file: " spec))))
 (def-var! "clojure.java.io" "as-file"
   ;; Clojure extends Coercions to nil, so (io/as-file nil) is nil -- NOT a File
   ;; whose path is "". The difference is load-bearing one call downstream, where
   ;; the JVM raises on the nil and jolt was quietly reading the process's cwd.
   (lambda (x) (cond ((jolt-nil? x) x)
                     ((jfile? x) x)
-                    ((and (jhost? x) (string=? (jhost-tag x) "url")) (url-file-coercion x))
+                    ((url-jhost? x) (url-file-coercion x))
+                    ((uri-jhost? x) (url-spec-file-coercion (uri-field x 'string)))
                     (else (make-jfile (file-path-of x))))))
 ;; "reader" is bound by natives-array.ss (loaded later) so a char[] argument is
 ;; handled; that binding delegates here via jolt-io-reader for everything else.
@@ -3048,6 +3089,7 @@
 (define (jolt-file-ctor a . rest)
   (cond ((pair? rest) (jolt-make-file (jolt-file-join a (car rest))))
         ((jolt-nil? a) (throw-jvm (quote NullPointerException) jolt-nil))
+        ((uri-jhost? a) (make-jfile (uri->file-path a)))
         (else (jolt-make-file a))))
 (register-class-ctor! "File" jolt-file-ctor)
 ;; File statics: the platform separators plus createTempFile / listRoots.

@@ -552,6 +552,9 @@
   {:suite "insttime" :expr "(instance? java.time.LocalDateTime (LocalDateTime/parse \"2020-03-05T13:45:30\"))" :expected "true"}
   {:suite "insttime" :expr "(str (.toInstant #inst \"2020-03-05T13:45:30Z\"))" :expected "\"2020-03-05T13:45:30Z\""}
   {:suite "insttime" :expr "(str (LocalDate/of 2020 3 5))" :expected "\"2020-03-05\""}
+  ;; the JDK's Month overloads of `of` (jolt-lang/jolt#1197): a Month where the
+  ;; month number goes, on every type that takes one
+  {:suite "insttime" :expr "(mapv str [(LocalDate/of 2026 java.time.Month/SEPTEMBER 29) (LocalDateTime/of 2026 java.time.Month/SEPTEMBER 29 12 34) (LocalDateTime/of 2026 java.time.Month/SEPTEMBER 29 12 34 56) (LocalDateTime/of 2026 java.time.Month/SEPTEMBER 29 12 34 56 7) (java.time.YearMonth/of 2026 java.time.Month/FEBRUARY) (java.time.MonthDay/of java.time.Month/FEBRUARY 29) (.atMonth (java.time.Year/of 2026) java.time.Month/MAY)])" :expected "[\"2026-09-29\" \"2026-09-29T12:34\" \"2026-09-29T12:34:56\" \"2026-09-29T12:34:56.000000007\" \"2026-02\" \"--02-29\" \"2026-05\"]"}
   {:suite "insttime" :expr "(.toMillis (Duration/between (Instant/ofEpochMilli 0) (Instant/ofEpochMilli 5000)))" :expected "5000"}
   {:suite "insttime" :expr "(.toEpochMilli (Instant/parse \"2020-01-01T00:00:00Z\"))" :expected "1577836800000"}
   ;; A java.time.Instant is an inst through clojure.core's Inst protocol, which
@@ -2262,6 +2265,20 @@
   ;; the URL toURI gave for it; "file:///abs" is the JDK's other spelling.
   {:suite "file-url" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt url sp\") f (str d \"/x.txt\")] (.mkdirs (java.io.File. d)) (spit f \"payload\") [(slurp (.toURL (.toURI (java.io.File. f)))) (slurp (clojure.java.io/as-url (java.io.File. f))) (slurp (str \"file://\" (.getAbsolutePath (java.io.File. f)))) (boolean (re-find #\"%20\" (str (.toURI (java.io.File. f)))))])" :expected "[\"payload\" \"payload\" \"payload\" true]"}
   {:suite "file-url" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt url sp\") f (str d \"/x.txt\")] (.mkdirs (java.io.File. d)) (spit f \"payload\") (= (.getAbsolutePath (clojure.java.io/as-file (.toURL (.toURI (java.io.File. f))))) (.getAbsolutePath (java.io.File. f))))" :expected "true"}
+  ;; URI -> File/Path (jolt-lang/jolt#1198): File(URI), Paths.get(URI) and
+  ;; Path.of(URI) took the URI's string as the path, so "file:///tmp/a%20b" was
+  ;; the relative path "file:/tmp/a%20b". The JDK decodes the path of a file: URI
+  ;; and rejects everything else with its own message, in this order; Paths.get
+  ;; names a missing scheme and an unknown one differently from File.
+  {:suite "file-uri" :expr "(mapv (fn [s] (let [f (java.io.File. (java.net.URI. s))] [(.getPath f) (.getName f) (.isAbsolute f)])) [\"file:///data/tmp/a%20b\" \"file:/data/tmp/a%20b\" \"file:///a/b/\" \"file:///a%25b\" \"file:///\"])" :expected "[[\"/data/tmp/a b\" \"a b\" true] [\"/data/tmp/a b\" \"a b\" true] [\"/a/b\" \"b\" true] [\"/a%b\" \"a%b\" true] [\"/\" \"\" true]]"}
+  {:suite "file-uri" :expr "(mapv (fn [s] (try (java.io.File. (java.net.URI. s)) (catch Exception e [(.getName (class e)) (ex-message e)]))) [\"file://localhost/x\" \"http://example.com/x\" \"file:///x?q=1\" \"file:///x#f\" \"file:x\" \"/abs/x\"])" :expected "[[\"java.lang.IllegalArgumentException\" \"URI has an authority component\"] [\"java.lang.IllegalArgumentException\" \"URI scheme is not \\\"file\\\"\"] [\"java.lang.IllegalArgumentException\" \"URI has a query component\"] [\"java.lang.IllegalArgumentException\" \"URI has a fragment component\"] [\"java.lang.IllegalArgumentException\" \"URI is not hierarchical\"] [\"java.lang.IllegalArgumentException\" \"URI is not absolute\"]]"}
+  {:suite "file-uri" :expr "[(str (java.nio.file.Paths/get (java.net.URI. \"file:///data/tmp/a%20b\"))) (str (java.nio.file.Path/of (java.net.URI. \"file:/data/tmp/a%20b\"))) (str (java.nio.file.Paths/get (java.net.URI. \"file:///a/b/\")))]" :expected "[\"/data/tmp/a b\" \"/data/tmp/a b\" \"/a/b\"]"}
+  {:suite "file-uri" :expr "(mapv (fn [s] (try (java.nio.file.Paths/get (java.net.URI. s)) (catch Exception e [(.getName (class e)) (ex-message e)]))) [\"http://example.com/x\" \"/abs/x\" \"file://localhost/x\" \"file:x\"])" :expected "[[\"java.nio.file.FileSystemNotFoundException\" \"Provider \\\"http\\\" not installed\"] [\"java.lang.IllegalArgumentException\" \"Missing scheme\"] [\"java.lang.IllegalArgumentException\" \"URI has an authority component\"] [\"java.lang.IllegalArgumentException\" \"URI is not hierarchical\"]]"}
+  ;; the round trip the idiom is for: a real file through toURI and back
+  {:suite "file-uri" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt uri sp\") f (java.io.File. d \"x.txt\")] (.mkdirs (java.io.File. d)) (spit f \"payload\") [(.exists (java.io.File. (.toURI f))) (slurp (java.io.File. (.toURI f))) (= (.getAbsolutePath f) (str (java.nio.file.Paths/get (.toURI f))))])" :expected "[true \"payload\" true]"}
+  ;; io/file of a URI goes through URL on the JVM, which is the lenient reading:
+  ;; a localhost authority is dropped rather than refused
+  {:suite "file-uri" :expr "[(str (clojure.java.io/file (java.net.URI. \"file:///a%20b\"))) (str (clojure.java.io/file (java.net.URI. \"file://localhost/a%20b\"))) (try (clojure.java.io/file (java.net.URI. \"http://x/y\")) (catch IllegalArgumentException e (ex-message e)))]" :expected "[\"/a b\" \"/a b\" \"Not a file: http://x/y\"]"}
   ;; FileTime (jolt-lang/jolt#1119): from(Instant) looked up a Scheme inst-ms that
   ;; does not exist, so fs/set-last-modified-time with an Instant raised "variable
   ;; inst-ms is not bound"; from(long, TimeUnit) is the other JDK overload; and the

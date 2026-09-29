@@ -14,6 +14,10 @@
 (defn month [n] (impl/value :jolt.time/month {:value n}))
 (defn month-val [e] (impl/field e :value))
 (defn- month-name [e] (nth u/month-names (dec (month-val e))))
+;; A month argument: the JDK overloads every `of` that takes a month number with
+;; one that takes a Month (LocalDate, LocalDateTime, YearMonth, MonthDay).
+(defn month-num [m]
+  (if (= :jolt.time/month (impl/type-of m)) (month-val m) (u/->long m)))
 
 (impl/register-type! :jolt.time/month
   {:eq   (fn [a b] (= (month-val a) (month-val b)))

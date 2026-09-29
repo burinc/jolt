@@ -500,25 +500,34 @@
 ;; deref 1.15x against a 1.1x ceiling (release binary, A/B/A). Threaded through,
 ;; the fast path is an `(if ibox ...)` that falls through (jolt-a0f1).
 (define (jolt-cv-wait/ibox mu cv deadline decide ibox who)
-  ;; Registered OUTSIDE mu, and only for a fiber. Outside because the timer's
-  ;; thunks run with timeout-mu released but registering takes it, so doing this
-  ;; under mu would order mu above timeout-mu here and below it there.
+  ;; The deadline wake is registered only for a fiber; a thread waits on cv with
+  ;; the deadline itself. It is cancelled as the wait ends, however it ends, so a
+  ;; timed deref answered in a millisecond does not leave its wake — and, through
+  ;; mu and cv, whatever those keep reachable — pending on the timer until the
+  ;; deadline. Arming and cancelling only take timeout-mu, a leaf (async.ss: no
+  ;; thunk runs under it), so the handler below may do either at the raise point,
+  ;; under mu or not.
   ;;
-  ;; The deadline is cancelled as the wait ends, however it ends, so a timed deref
-  ;; answered in a millisecond does not leave its wake — and, through mu and cv,
-  ;; whatever those keep reachable — pending on the timer until the deadline. The
-  ;; cancel on a raise runs at the raise point, possibly under mu; that is sound
-  ;; because cancelling only takes timeout-mu, which is a leaf (async.ss).
+  ;; A raise passing through is not necessarily the end of the wait: a handler
+  ;; further out may resume it. So the handler cancels, and if the raise comes
+  ;; back, re-arms — otherwise the resumed wait parks with nothing to wake it at
+  ;; its deadline. A wake that had already been collected to run is not re-armed;
+  ;; it is on its way. The park's own may-park! assertion (the park/lock gate
+  ;; wants it in jolt-cv-wait/park, next to the commit) runs after arming; when it
+  ;; refuses, its raise passes through the handler and the wake is cancelled.
   (if (and deadline (jolt-current-fiber))
-      (begin
-        ;; before the deadline timer registers a wake for this wait
-        (jolt-fiber-may-park! who)
-        (let* ((timer (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv)))))
-               (r (with-exception-handler
-                    (lambda (e) (jolt-timer-cancel! timer) (raise-continuable e))
-                    (lambda () (jolt-cv-wait/park mu cv deadline decide ibox who)))))
-          (jolt-timer-cancel! timer)
-          r))
+      (let* ((arm (lambda ()
+                    (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv))))))
+             (timer (arm))
+             (r (with-exception-handler
+                  (lambda (e)
+                    (let* ((pending? (jolt-timer-cancel! timer))
+                           (v (raise-continuable e)))
+                      (when pending? (set! timer (arm)))
+                      v))
+                  (lambda () (jolt-cv-wait/park mu cv deadline decide ibox who)))))
+        (jolt-timer-cancel! timer)
+        r)
       (jolt-cv-wait/park mu cv deadline decide ibox who)))
 
 (define (jolt-cv-wait/park mu cv deadline decide ibox who)

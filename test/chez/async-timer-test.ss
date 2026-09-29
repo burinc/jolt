@@ -136,8 +136,8 @@
   (ok "6g. and leaves far alone" (= 1 (pending-count))))
 
 ;; --- 7. the heap order survives arbitrary removals -----------------------------
-;; Removing from the middle moves the last entry into the hole, which may have to
-;; go up or down. Insert a scrambled band, cancel every third, and let the rest
+;; A cancel leaves its entry in place with no thunk; the timer drops it when it
+;; reaches the top. Insert a scrambled band, cancel every third, and let the rest
 ;; fire: every survivor fires, no cancelled one does, and they fire in deadline
 ;; order (each thunk records its deadline).
 (printf "\n== 7. cancels from the middle keep the heap ordered ==\n")
