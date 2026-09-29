@@ -14,6 +14,7 @@
 (ns loaderconf-test
   (:require [jolt.loader :as l]
             [jolt.fs :as fs]
+            [jolt.host :as host]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.core.async :as async]))
@@ -1028,6 +1029,35 @@
                    nil (catch :default e e))]
       (chk "an unloaded owner refuses further evaluation"
            (= :loader/unloaded (:type (ex-data err)))))))
+
+;; --- 40. unload! releases the loader, not the id -----------------------------
+;; A compiled call site carries the loader's id, not the object, so the
+;; registry must keep an answer for the id after unload! — but only a closed
+;; stand-in: the loader graph becomes collectable, and a stale call still fails
+;; :loader/unloaded rather than :loader/bad-context.
+(defn- unloaded-context
+  "Build a context whose evaluated function requires at run time, unload it,
+   and return the function plus a weak reference. The context itself stays
+   inside this frame, so the registry is its only strong holder."
+  []
+  (let [d (write! (root-dir "evict") "libev.clj"
+                  "(ns libev) (defn v [] :evicted)")
+        ctx (l/classpath [d] {:parent (l/isolated)})]
+    (l/eval-in ctx "script.stale"
+               "(defn late [] (require '[libev :as e]) (e/v))")
+    (let [late (val-of (l/resolve ctx {:kind :var :name "script.stale/late"}))
+          wr (java.lang.ref.WeakReference. ctx)]
+      (l/unload! ctx)
+      {:late late :wr wr})))
+
+(defcase 40 "unload! releases the loader's graph; a stale call site stays mapped"
+  (let [{:keys [late wr]} (unloaded-context)]
+    (let [err (try (late) nil (catch :default e e))]
+      (chk "a stale runtime require still names its closed context"
+           (= :loader/unloaded (:type (ex-data err)))))
+    (host/gc-full!)
+    (chk "the unloaded loader is collectable"
+         (nil? (.get wr)))))
 
 ;; --- runner -----------------------------------------------------------------
 (defn run-case [[n title body]]

@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A deftype `equals` that reads the other instance's field pays this per key a
   map lookup compares, so a map keyed on core.logic-style LVars probes about
   1.25x faster.
+- **`jolt.loader`: `unload!` releases the loader's graph.** The id→loader
+  registry (`loaders-by-id`) used to keep every loader ever constructed
+  reachable, so a process that minted a context per request accumulated them.
+  `unload!` now replaces the entry with a closed stand-in carrying the id and
+  an unloaded state: links, closures, roots and the delegate become
+  collectable, while evaluated source that still carries the id keeps failing
+  `:loader/unloaded` rather than `:loader/bad-context`. The stand-ins are
+  small but are not reclaimed; that waits for per-context var tables.
 
 ### Fixed
 
@@ -71,7 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a child process's pipe stream under a thread blocked reading it likewise ends
   the read with `-1` instead of hanging. A write to a dead peer throws
   `SocketException` rather than a plain `IOException`, as on the JVM.
-
 ## [0.8.14] - 2026-09-28
 
 Android arm64 ships again as a prebuilt Termux binary, with bionic fixes for

@@ -140,10 +140,15 @@
   a sound per-context artifact cache belongs with per-context var tables.
 
   One bookkeeping note: `loaders-by-id` — what evaluated source uses to find
-  the loader that owns it — keeps every loader ever constructed reachable, so
-  a process that mints a context per request accumulates them. A loader's
-  facade lives on the loader, not in a side table, so it adds no retention of
-  its own."
+  the loader that owns it — keeps an entry for every loader ever constructed,
+  so a process that mints a context per request accumulates them. `unload!`
+  swaps the entry for a closed stand-in that carries the id and an unloaded
+  state and nothing else: the loader's graph (links, closures, roots,
+  delegate) becomes collectable, while evaluated source that still carries
+  the id keeps failing :loader/unloaded instead of :loader/bad-context. The
+  stand-ins themselves are small but are not reclaimed — retiring those
+  names is the per-context var tables work above. A loader's facade lives on
+  the loader, not in a side table, so it adds no retention of its own."
   (:refer-clojure :exclude [find resolve load])
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
@@ -529,6 +534,8 @@
     [base []]))
 
 (declare ^:private root-loader)
+;; defined with the id registry below, after the impl record
+(declare ^:private evict!)
 
 (defn- unload-run
   "The generic teardown. The host root is refused: it is the host's global
@@ -544,18 +551,21 @@
             base {:namespaces (count (filter #(= :ns (ffirst %)) links))
                   :registrations (count (filter #(= :class (ffirst %)) links))}
             [released errors] (teardown l base)]
+        (evict! l)
         {:unloaded true
          :already false
          :released released
          :in-flight in-flight
          :raced (pos? in-flight)
          :errors errors})
-      {:unloaded true
-       :already true
-       :released {}
-       :in-flight (count @(:in-flight state))
-       :raced false
-       :errors []})))
+      (do
+        (evict! l)
+        {:unloaded true
+         :already true
+         :released {}
+         :in-flight (count @(:in-flight state))
+         :raced false
+         :errors []}))))
 
 (defrecord LoaderImpl [id parent delegate-fn locate-fn gate-fn open-fn
                        release-fn ns-load-fn ns-vars-fn info state]
@@ -602,6 +612,24 @@
   (or (get @loaders-by-id id)
       (throw (ex-info (str "no loader registered as " (pr-str id))
                       {:type :loader/bad-context :loader-id id}))))
+
+(defn- closed-loader
+  "The registry stand-in for an unloaded loader: the id, an unloaded state and
+   nothing else — no link table, closures, roots or delegate — so the loader's
+   graph becomes collectable while evaluated source that still carries the id
+   keeps failing :loader/unloaded rather than :loader/bad-context."
+  [id]
+  (->LoaderImpl id nil nil nil nil nil nil nil nil nil
+                {:links (atom {}) :in-flight (atom {}) :unloaded? (atom true)
+                 :facade (atom nil)}))
+
+(defn- evict!
+  "Close L's registry entry (see `closed-loader`). A no-op when the id is not
+   registered — `reset-context-state!` may have dropped it already."
+  [l]
+  (let [id (:id l)]
+    (swap! loaders-by-id
+           (fn [m] (if (contains? m id) (assoc m id (closed-loader id)) m)))))
 
 (def ^:private id-counter (atom 0))
 
