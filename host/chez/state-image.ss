@@ -144,6 +144,32 @@
 ;; hashtable through the transform. The record's own fields and its extension map
 ;; are the value, and those are walked.
 (define (image-opaque-field? v) (jrdesc? v))
+;; The descriptor's ptable is the one part of it that is NOT type data: it is a
+;; per-process dispatch cache of impl procedures, keyed by per-process interned
+;; (proto . method) gensyms, filled the moment the type implements a protocol
+;; (inline in defrecord/deftype, or by extend-protocol/extend-type). Riding raw
+;; in the fasl it carried those procedures with it, so a record whose type
+;; implemented any protocol refused at a bare #<procedure> the walk never saw
+;; (scan, which does not look inside the descriptor, called it clean). The cache
+;; could not have been used after a restore anyway — its keys are gensyms of the
+;; writing process — and a #f ptable is the supported "use the string registry"
+;; state (the one a redefinition leaves on a stale descriptor). So the write side
+;; substitutes a ptable-less copy, one per descriptor so the instances still
+;; share it, and the read side relinks to the live descriptor for the tag when
+;; the type is defined with the same fields, restoring the fast path and every
+;; descriptor-identity property (field masking, jrdesc-ifc-of) along with it.
+(define (image-desc-for-write d memo)
+  (if (not (jrdesc-ptable d))
+      d
+      (or (hashtable-ref memo d #f)
+          (let ((c (make-jrdesc-rec (jrdesc-tag d) (jrdesc-fkeys d) (jrdesc-index d) #f)))
+            (hashtable-set! memo d c)
+            c))))
+(define (image-desc-for-restore d)
+  (let ((live (hashtable-ref chez-tag-desc (jrdesc-tag d) #f)))
+    (if (and live (not (eq? live d)) (equal? (jrdesc-fkeys live) (jrdesc-fkeys d)))
+        live
+        d)))
 
 ;; --- path-tracking walker ------------------------------------------------------
 ;; fasl-write's externals-pred sees objects but not where they live, and an
@@ -1827,8 +1853,11 @@
                           (if (fx<? i n)
                               (let* ((f (vector-ref fs i))
                                      (v (image-record-field-ref f x))
-                                     (w (if (image-opaque-field? v) v
-                                            (walk v (cons (symbol->string (car f)) path)))))
+                                     (w (cond
+                                          ((not (image-opaque-field? v))
+                                           (walk v (cons (symbol->string (car f)) path)))
+                                          (restore? (image-desc-for-restore v))
+                                          (else (image-desc-for-write v memo)))))
                                 (vector-set! vals i w)
                                 (set! dirty (or dirty (not (eq? v w))))
                                 (loop (fx+ i 1)))

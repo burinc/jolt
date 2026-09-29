@@ -919,6 +919,37 @@
                (jolt-compile-eval (string-append "(jolt.host/image-read \"" tmp "\")") "user"))))
       (let ((a (jolt-nth g 0)) (b (jolt-nth g 1)))
         (and (jrec? a) (jrec? b) (eq? (jrec-desc a) (jrec-desc b))))))
+;; A type that implements a protocol fills its descriptor's ptable, a per-process
+;; cache of impl procedures. It rode raw in the fasl, so such a record refused at
+;; "cannot write #<procedure> at <unknown>" (inline in defrecord or by
+;; extend-protocol alike) while scan, which does not look inside the descriptor,
+;; called it clean. The record travels; the restored one still dispatches.
+(ev "(defprotocol ImgProtoP (imgp-f [x]))")
+(ev "(defrecord ImgInline [a] ImgProtoP (imgp-f [_] [:inline a]))")
+(ev "(defrecord ImgExtended [a])")
+(ev "(extend-protocol ImgProtoP ImgExtended (imgp-f [x] [:extended (:a x)]))")
+(is "scan finds nothing in a record whose type implements a protocol"
+    "(count (jolt.host/image-scan [(->ImgInline 1) (->ImgExtended 2)]))" "0")
+(is "an inline-protocol record round-trips and still dispatches"
+    (string-append "(let [r " (rt-expr "(->ImgInline 1)") "] [(= r (->ImgInline 1)) (satisfies? ImgProtoP r) (imgp-f r)])")
+    "[true true [:inline 1]]")
+(is "an extend-protocol record round-trips and still dispatches"
+    (string-append "(let [r " (rt-expr "(->ImgExtended 2)") "] [(= r (->ImgExtended 2)) (satisfies? ImgProtoP r) (imgp-f r)])")
+    "[true true [:extended 2]]")
+;; the write side strips the cache from a COPY: the live type keeps its fast path
+(ok "dumping a protocol record leaves the live descriptor's ptable in place"
+    (begin
+      (ev (string-append "(jolt.host/image-write! \"" tmp "\" (->ImgInline 3))"))
+      (let ((d (hashtable-ref chez-tag-desc "user.ImgInline" #f)))
+        (and d (jrdesc-ptable d) #t))))
+;; and the read side relinks to the live descriptor, so a restored instance is
+;; the same type as a fresh one down to descriptor identity
+(ok "a restored protocol record shares the live type's descriptor"
+    (let ((g (begin
+               (ev (string-append "(jolt.host/image-write! \"" tmp "\" [(->ImgInline 4) (->ImgExtended 5)])"))
+               (jolt-compile-eval (string-append "(jolt.host/image-read \"" tmp "\")") "user"))))
+      (and (eq? (jrec-desc (jolt-nth g 0)) (hashtable-ref chez-tag-desc "user.ImgInline" #f))
+           (eq? (jrec-desc (jolt-nth g 1)) (hashtable-ref chez-tag-desc "user.ImgExtended" #f)))))
 ;; symbols are not interned and compare by ns/name, so a copy must still work as a key
 (is "symbol-keyed lookup works"              (string-append "(get " (rt-expr "{'a 1}") " 'a)") "1")
 (is "string-keyed lookup works"              (string-append "(get " (rt-expr "{\"s\" 1}") " \"s\")") "1")
