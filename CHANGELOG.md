@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A timed wait on a fiber no longer pins the fiber until its deadline.** The
+  runtime's timer had no cancel, so a fiber's timed socket read, accept or
+  connect, or a timed `deref`, left its deadline armed after the wait ended,
+  and the timer held the fiber until it passed. With a long `SO_TIMEOUT` that
+  kept one finished fiber per parked read alive for the whole timeout. Waits
+  now cancel their deadline when they end; arming costs the same as before.
+
 - **`Socket.connect(endpoint, timeout)` honours its timeout.** It was accepted
   and ignored, so a connect to a peer that never answered blocked until the OS
   gave up. It now raises `SocketTimeoutException` ("Connect timed out"), a

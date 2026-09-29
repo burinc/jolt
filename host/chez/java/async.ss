@@ -510,15 +510,29 @@
 ;;     once true never stops being true.
 (define timeout-mu (make-mutex))
 (define timeout-cv (make-condition))
-;; Pending timeouts as a binary min-heap on deadline — #(deadline . thunk)
+;; Pending timeouts as a binary min-heap on deadline — (deadline . thunk)
 ;; entries in timeout-heap[0..n), guarded by timeout-mu like the sorted list it
 ;; replaces. The list insert walked O(k) per (timeout ms) with k pending —
 ;; O(k^2) to arm a burst — and the consumer only ever takes the MIN, which is
 ;; the heap's O(log k) case. Entries with EQUAL deadlines pop in arbitrary
 ;; order; they were already batched into one collect, so nothing promised an
 ;; order between them.
+;;
+;; CANCELLING IS LAZY. A wait that ends before its deadline — a timed socket read
+;; that got its data, a timed deref that got its value — cancels its entry
+;; (jolt-timer-cancel!), which drops the thunk on the spot: the entry's cdr
+;; becomes #f, so the heap no longer keeps the waiter, or anything the thunk
+;; closes over, reachable. Before this, a fiber that parked with a 5-minute
+;; SO_TIMEOUT stayed pinned by the heap for 5 minutes after its read returned.
+;; The dead entry itself stays in place and is dropped when it reaches the top;
+;; once dead entries outnumber live ones the heap is rebuilt from the live ones,
+;; so it never holds more than twice what is pending. An eager remove would need
+;; every entry to carry its slot, and keeping that slot current costs every sift
+;; a write — measured at 1.25x on arming, which pays for cancels that most
+;; deadlines never see. This way arming is unchanged and a cancel is O(1).
 (define timeout-heap (make-vector 64 #f))
 (define timeout-heap-n 0)
+(define timeout-heap-dead 0)       ; cancelled entries still in the heap
 (define timeout-running? #f)       ; the one timer thread has been forked
 
 (define (theap-less? a b) (< (car a) (car b)))
@@ -536,33 +550,52 @@
               (begin (vector-set! timeout-heap i pv) (sift p))
               (vector-set! timeout-heap i entry)))))
   (set! timeout-heap-n (fx+ timeout-heap-n 1)))
+;; Put ITEM at slot i of a heap of n entries and sift it down into place.
+(define (theap-sift-down! i item n)
+  (let sift ((i i))
+    (let* ((l (fx+ (fx* 2 i) 1))
+           (r (fx+ l 1))
+           (m (if (and (fx<? l n) (theap-less? (vector-ref timeout-heap l) item)) l i))
+           (m (if (and (fx<? r n)
+                       (theap-less? (vector-ref timeout-heap r)
+                                    (if (fx=? m i) item (vector-ref timeout-heap m))))
+                  r m)))
+      (if (fx=? m i)
+          (vector-set! timeout-heap i item)
+          (begin (vector-set! timeout-heap i (vector-ref timeout-heap m)) (sift m))))))
 (define (theap-pop-min!)
   (let ((top (vector-ref timeout-heap 0))
         (n (fx- timeout-heap-n 1)))
     (set! timeout-heap-n n)
     (let ((item (vector-ref timeout-heap n)))
       (vector-set! timeout-heap n #f)
-      (when (fx>? n 0)
-        (let sift ((i 0))
-          (let* ((l (fx+ (fx* 2 i) 1))
-                 (r (fx+ l 1))
-                 (m (if (and (fx<? l n) (theap-less? (vector-ref timeout-heap l) item)) l i))
-                 (m (if (and (fx<? r n)
-                             (theap-less? (vector-ref timeout-heap r)
-                                          (if (fx=? m i) item (vector-ref timeout-heap m))))
-                        r m)))
-            (if (fx=? m i)
-                (vector-set! timeout-heap i item)
-                (begin (vector-set! timeout-heap i (vector-ref timeout-heap m)) (sift m)))))))
+      (when (fx>? n 0) (theap-sift-down! 0 item n)))
     top))
+;; Drop the dead entries and restore the order bottom-up, O(n).
+(define (theap-compact!)
+  (let ((n timeout-heap-n))
+    (let copy ((i 0) (j 0))
+      (if (fx<? i n)
+          (let ((e (vector-ref timeout-heap i)))
+            (vector-set! timeout-heap i #f)
+            (if (cdr e)
+                (begin (vector-set! timeout-heap j e) (copy (fx+ i 1) (fx+ j 1)))
+                (copy (fx+ i 1) j)))
+          (begin
+            (set! timeout-heap-n j)
+            (set! timeout-heap-dead 0)
+            (do ((k (fx- (fxquotient j 2) 1) (fx- k 1))) ((fx<? k 0))
+              (theap-sift-down! k (vector-ref timeout-heap k) j)))))))
 
 ;; -> #t iff the new entry became the earliest deadline, i.e. the caller must
 ;; signal the timer to re-read its wake time (same contract as the old list:
-;; empty, or strictly earlier than the previous minimum).
-(define (timeout-insert! deadline-ms thunk)
+;; empty, or strictly earlier than the previous minimum). A dead minimum only
+;; makes that answer #f where it could have been #t — the timer then wakes at
+;; the dead deadline, which is no later than it was already going to.
+(define (timeout-insert! entry)
   (let ((prev-min (theap-min)))
-    (theap-insert! (cons deadline-ms thunk))
-    (or (not prev-min) (< deadline-ms (car prev-min)))))
+    (theap-insert! entry)
+    (or (not prev-min) (< (car entry) (car prev-min)))))
 
 ;; Everything due, removed from the list, newest deadline last. Called with
 ;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
@@ -570,8 +603,17 @@
 (define (timeout-collect-due!)
   (let due ((acc '()))
     (cond
+      ;; a cancelled entry that reached the top is dropped whatever its deadline
+      ((let ((m (theap-min))) (and m (not (cdr m))))
+       (theap-pop-min!)
+       (set! timeout-heap-dead (fx- timeout-heap-dead 1))
+       (due acc))
       ((let ((m (theap-min))) (and m (<= (car m) (now-millis))))
-       (due (cons (cdr (theap-pop-min!)) acc)))
+       ;; the cdr is cleared as the entry leaves, so a cancel from here on
+       ;; answers #f: the thunk is already on its way to run
+       (let* ((e (theap-pop-min!)) (thunk (cdr e)))
+         (set-cdr! e #f)
+         (due (cons thunk acc))))
       ((pair? acc) (reverse acc))
       (else
        (let ((m (theap-min)))
@@ -598,23 +640,51 @@
 
 ;; (jolt-timer-at! deadline-ms thunk) — run thunk on the timer thread once the
 ;; epoch-millisecond deadline has passed. The one deadline facility in the runtime.
+;; Answers the entry, which is the handle jolt-timer-cancel! takes; a caller with
+;; no use for cancelling ignores it.
 (define (jolt-timer-at! deadline-ms thunk)
-  (jolt-lock! timeout-mu)
-  (when (timeout-insert! deadline-ms thunk)
-    (condition-signal timeout-cv))
-  (unless timeout-running?
-    (set! timeout-running? #t)
-    (fork-thread timeout-thread))
-  (jolt-unlock! timeout-mu))
+  (let ((e (cons deadline-ms thunk)))
+    (jolt-lock! timeout-mu)
+    (when (timeout-insert! e)
+      (condition-signal timeout-cv))
+    (unless timeout-running?
+      (set! timeout-running? #t)
+      (fork-thread timeout-thread))
+    (jolt-unlock! timeout-mu)
+    e))
+
+;; (jolt-timer-cancel! handle) — drop a pending deadline before it fires, so the
+;; heap lets go of its thunk now rather than at the deadline. #t when it was still
+;; pending and its thunk will not run; #f when it had already been collected to
+;; run (it may be running now), or was cancelled before. timeout-mu is a leaf
+;; lock — no thunk runs under it — so this is safe to call holding any other lock.
+;; No signal: a cancelled minimum wakes the timer at its old deadline, which
+;; drops it and re-reads.
+(define (jolt-timer-cancel! e)
+  (jolt-with-mutex timeout-mu
+    (and (cdr e)
+         (begin
+           (set-cdr! e #f)
+           (set! timeout-heap-dead (fx+ timeout-heap-dead 1))
+           (when (and (fx>? timeout-heap-n 64)
+                      (fx>? (fx* 2 timeout-heap-dead) timeout-heap-n))
+             (theap-compact!))
+           #t))))
+
+;; Deadlines still to fire, not counting cancelled ones awaiting their drop.
+(define (timeout-pending-count) (fx- timeout-heap-n timeout-heap-dead))
 
 ;; The same facility for the Clojure layer: jolt.io-poller wakes a fiber parked
 ;; on a socket once its SO_TIMEOUT or connect deadline passes. F runs on the
 ;; timer thread, so it must not block; the poller's thunk takes its table lock
-;; and resumes the fiber after releasing it.
+;; and resumes the fiber after releasing it. timer-at! answers the handle
+;; timer-cancel! takes, which a wait that ends first uses to drop its deadline.
 (def-var! "jolt.host" "timer-at!"
   (lambda (deadline-ms f)
-    (jolt-timer-at! deadline-ms (lambda () (jolt-invoke f)))
-    jolt-nil))
+    (jolt-timer-at! deadline-ms (lambda () (jolt-invoke f)))))
+
+(def-var! "jolt.host" "timer-cancel!"
+  (lambda (h) (jolt-timer-cancel! h)))
 
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)

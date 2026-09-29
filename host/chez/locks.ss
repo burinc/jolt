@@ -500,13 +500,29 @@
 ;; deref 1.15x against a 1.1x ceiling (release binary, A/B/A). Threaded through,
 ;; the fast path is an `(if ibox ...)` that falls through (jolt-a0f1).
 (define (jolt-cv-wait/ibox mu cv deadline decide ibox who)
-  ;; before the deadline timer below registers a wake for this wait
-  (jolt-fiber-may-park! who)
   ;; Registered OUTSIDE mu, and only for a fiber. Outside because the timer's
   ;; thunks run with timeout-mu released but registering takes it, so doing this
   ;; under mu would order mu above timeout-mu here and below it there.
-  (when (and deadline (jolt-current-fiber))
-    (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv)))))
+  ;;
+  ;; The deadline is cancelled as the wait ends, however it ends, so a timed deref
+  ;; answered in a millisecond does not leave its wake — and, through mu and cv,
+  ;; whatever those keep reachable — pending on the timer until the deadline. The
+  ;; cancel on a raise runs at the raise point, possibly under mu; that is sound
+  ;; because cancelling only takes timeout-mu, which is a leaf (async.ss).
+  (if (and deadline (jolt-current-fiber))
+      (begin
+        ;; before the deadline timer registers a wake for this wait
+        (jolt-fiber-may-park! who)
+        (let* ((timer (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv)))))
+               (r (with-exception-handler
+                    (lambda (e) (jolt-timer-cancel! timer) (raise-continuable e))
+                    (lambda () (jolt-cv-wait/park mu cv deadline decide ibox who)))))
+          (jolt-timer-cancel! timer)
+          r))
+      (jolt-cv-wait/park mu cv deadline decide ibox who)))
+
+(define (jolt-cv-wait/park mu cv deadline decide ibox who)
+  (jolt-fiber-may-park! who)
   ;; The (mu . cv) this wait is findable by while it is willing to be interrupted,
   ;; or #f. It lives OUT here and not inside the thunk below because jolt-lock-wait
   ;; RETAKES that thunk when a parked fiber resumes: a loop-local would forget a
