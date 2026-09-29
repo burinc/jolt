@@ -89,6 +89,7 @@
 (ffi/defcfn c-epoll-create1 "epoll_create1" [:int] :int)
 (ffi/defcfn c-epoll-ctl "epoll_ctl" [:int :int :int :pointer] :int)
 (ffi/defcfn c-epoll-wait "epoll_wait" [:int :pointer :int :int] :int :blocking)
+(ffi/defcfn c-eventfd "eventfd" [:uint :int] :int)
 
 ;; -- fd helpers (the socket layer's syscall surface) ---------------------------
 (defn errno [] (ffi/errno))
@@ -125,6 +126,11 @@
 (def ^:private EVFILT-WRITE -2)
 (def ^:private EV-ADD 1)
 (def ^:private EV-DELETE 2)
+(def ^:private EV-CLEAR 0x20)
+(def ^:private EVFILT-USER -10)
+(def ^:private NOTE-TRIGGER 0x01000000)
+(def ^:private EFD-NONBLOCK 0x800)
+(def ^:private EFD-CLOEXEC 0x80000)
 (def ^:private KEVENT-SIZE 32)      ; struct kevent: uptr ident @0, i16 filter @8, u16 flags @10, u32 fflags @12, iptr data @16, ptr udata @24
 (def ^:private EPOLLIN 0x1)
 (def ^:private EPOLLOUT 0x4)
@@ -203,13 +209,15 @@
             rd [:read]
             :else [:read :write]))))
 
-(defn- kevent-put! [buf i fd filt flags]
-  (let [o (* i KEVENT-SIZE)]
-    (ffi/write buf :uptr fd o)
-    (ffi/write buf :int (bit-or (bit-and filt 0xffff) (bit-shift-left flags 16)) (+ o 8))
-    (ffi/write buf :uint 0 (+ o 12))
-    (ffi/write buf :int64 0 (+ o 16))
-    (ffi/write buf :uptr 0 (+ o 24))))
+(defn- kevent-put!
+  ([buf i fd filt flags] (kevent-put! buf i fd filt flags 0))
+  ([buf i fd filt flags fflags]
+   (let [o (* i KEVENT-SIZE)]
+     (ffi/write buf :uptr fd o)
+     (ffi/write buf :int (bit-or (bit-and filt 0xffff) (bit-shift-left flags 16)) (+ o 8))
+     (ffi/write buf :uint fflags (+ o 12))
+     (ffi/write buf :int64 0 (+ o 16))
+     (ffi/write buf :uptr 0 (+ o 24)))))
 
 (defn- ep-ctl! [ep op fd filt]
   (let [ev (ffi/alloc EPOLL-EVENT-SIZE)]
@@ -240,6 +248,8 @@
 ;;   :pending  {fd #{filt ...}}  ; registered by a fiber, not yet in the poller's set
 ;;   :pipe     [r w]       ; control pipe — registration wake
 ;;   :kq       n           ; the poller's kqueue / epoll fd
+;;   :cancelled #{fd ...}  ; closing: every wait on the fd returns at once
+;;   :threads  {fd #{handle ...}}  ; thread waiters' wake handles (wait-thread)
 ;;
 ;; Both are keyed by (fd, FILTER), not by fd, because that is what a registration
 ;; actually is: kqueue keys a registration by (ident, filter), and the two
@@ -270,7 +280,8 @@
 ;; read by nobody, which made the round's critical section look like it was
 ;; protecting something it was not.)
 (def ^:private pm (Object.))
-(def ^:private state (atom {:fds {} :pending {} :pipe nil :kq nil :started? false}))
+(def ^:private state (atom {:fds {} :pending {} :pipe nil :kq nil :started? false
+                            :cancelled #{} :threads {}}))
 
 ;; how many times the poller entered its blocking wait — the R8 gate-3 handle
 (def waits (atom 0))
@@ -454,8 +465,12 @@
           (if (= fd (pipe-read!))
             (do (drain-pipe!) (recur (rest evs) dels woken))
             (let [e (get-in @state [:fds fd filt])]
+              ;; Nobody is waiting on this direction any more: cancel! dropped the
+              ;; entry while the fd stays open until its last operation leaves. The
+              ;; registration is still in the kernel set and level-triggered, so
+              ;; retire it, or it fires on every round until the fd closes.
               (if (nil? e)
-                (recur (rest evs) dels woken)
+                (recur (rest evs) (conj dels [fd filt]) woken)
                 (do (swap! state assoc-in [:fds fd filt :ready] true)
                     (swap! state assoc-in [:fds fd filt :waiters] [])
                     (recur (rest evs) (conj dels [fd filt]) (into woken (:waiters e))))))))))))
@@ -485,22 +500,53 @@
                 (doseq [f woken] (jolt.host/fiber-resume f))
                 (recur new-del))))))
 
-;; The fd's story ends with its socket. Drop the table entry and any pending
-;; registration, and wake anything still parked on it: the kernel auto-removes
-;; a closed fd from the kqueue/epoll set, so no event is coming for a parked
-;; reader — a close racing a parked read otherwise sleeps forever. The woken
-;; read sees EBADF/EOF and surfaces through the normal error path. This also
-;; means a REUSED fd number always starts with a fresh entry: a previous
-;; owner's ready=true tombstone (set by its final event, consumable only by a
-;; next wait that never came) made every new socket's first wait skip its park
-;; and re-register — one extra wake/park race per socket per round, which is
-;; the amplification that made the park-commit race observable at all.
+;; Wake one thread waiter (wait-thread). Under pm: a waiter unregisters under pm
+;; before it closes its kqueue/eventfd, so the number named here is still its.
+(defn- thread-wake! [h]
+  (if macos?
+    (let [ch (ffi/alloc KEVENT-SIZE)]
+      (try (kevent-put! ch 0 0 EVFILT-USER 0 NOTE-TRIGGER)
+           (c-kevent (:kq h) ch 1 ffi/null 0 ffi/null)
+           (finally (ffi/free ch))))
+    (let [b (ffi/alloc 8)]
+      (try (ffi/write b :int64 1)
+           (c-write (:efd h) b 8)
+           (finally (ffi/free b))))))
+
+;; The fd's owner is closing it. Every wait on the fd returns now, and every
+;; later one returns at once, until forget!: parked fibers are resumed, and
+;; threads blocked in wait-thread are woken through their own wake handle, since
+;; nothing about the fd itself will ever signal them. Each woken caller sees its
+;; owner closed and raises instead of retrying.
+;;
+;; The fd must still be open, and must stay open until every operation on it has
+;; left — that is the owner's use count (jolt.socket, process.ss). Closing it
+;; first frees the number for the next socket or pipe, and a woken operation
+;; would then retry on someone else's descriptor.
+(defn cancel! [fd]
+  (let [woken (locking pm
+                (let [e (get-in @state [:fds fd])]
+                  (swap! state (fn [s] (-> s
+                                           (update :cancelled conj fd)
+                                           (update :pending dissoc fd)
+                                           (update :fds dissoc fd))))
+                  (doseq [h (get-in @state [:threads fd])] (thread-wake! h))
+                  (into (vec (:waiters (:read e))) (:waiters (:write e)))))]
+    (doseq [f woken] (jolt.host/fiber-resume f))))
+
+;; The fd's story ends with its owner: it is about to be closed and nothing is
+;; using it. Drop every trace of it, so the next owner of the number starts
+;; fresh — a previous owner's ready=true tombstone, or its cancelled mark, would
+;; otherwise answer the new owner's first wait. Anything still waiting is woken
+;; as cancel! would, which only matters to an owner that skipped cancel!.
 (defn forget! [fd]
   (let [woken (locking pm
                 (let [e (get-in @state [:fds fd])]
-                  (swap! state update :pending dissoc fd)
-                  (swap! state update :fds dissoc fd)
-                  ;; every direction's waiters — the fd is going away for both
+                  (doseq [h (get-in @state [:threads fd])] (thread-wake! h))
+                  (swap! state (fn [s] (-> s
+                                           (update :cancelled disj fd)
+                                           (update :pending dissoc fd)
+                                           (update :fds dissoc fd))))
                   (into (vec (:waiters (:read e))) (:waiters (:write e)))))]
     (doseq [f woken] (jolt.host/fiber-resume f))))
 
@@ -553,14 +599,19 @@
 ;; (wait-ready fd :read|:write) -> void. Fiber-aware: parks the current fiber on
 ;; readiness and returns when the poller wakes it; on a plain thread, blocks in
 ;; a private kevent/epoll_wait (level-triggered, so a readiness that raced the
-;; registration fires immediately — no missed wakeup).
+;; registration fires immediately — no missed wakeup). Either way it also returns
+;; when the fd is cancelled (cancel!), so the caller has to check whether its
+;; owner is closing before it retries.
 (defn wait-fiber [fd filt]
   (let [park? (locking pm
                 (ensure-started!)
                 (let [e (get-in @state [:fds fd filt])]
-                  (if (and e (:ready e))
+                  (cond
+                    (contains? (:cancelled @state) fd) false
+                    (and e (:ready e))
                     (do (swap! stale-consumes inc)
                         (swap! state assoc-in [:fds fd filt :ready] false) false)
+                    :else
                     (do (swap! state assoc-in [:fds fd filt]
                                {:waiters (conj (or (:waiters e) []) (jolt.host/current-fiber))
                                 :ready false})
@@ -576,23 +627,53 @@
     (when park?
       (jolt.host/fiber-to-scheduler!))))
 
+;; A thread waiter registers its wake handle — its private kqueue, which carries
+;; an EVFILT_USER event, or an eventfd in its private epoll set — so cancel! can
+;; reach it. Both the fd and the wake event are in the set BEFORE the handle is
+;; published: a cancel! that finds the handle can always trigger it. And the
+;; cancelled check is made under the same lock as the publish, so a cancel! that
+;; ran first is never missed.
+(defn- thread-enter! [fd h]
+  (locking pm
+    (when-not (contains? (:cancelled @state) fd)
+      (swap! state update-in [:threads fd] (fnil conj #{}) h)
+      true)))
+
+(defn- thread-leave! [fd h]
+  (locking pm
+    (let [hs (disj (get-in @state [:threads fd]) h)]
+      (if (seq hs)
+        (swap! state assoc-in [:threads fd] hs)
+        (swap! state update :threads dissoc fd)))))
+
+;; A failed registration returns without waiting: the caller retries its syscall,
+;; which reports what is wrong with the fd.
 (defn wait-thread [fd filt]
   (if macos?
-    (let [kq (c-kqueue) ch (ffi/alloc KEVENT-SIZE) ev (ffi/alloc KEVENT-SIZE)]
+    (let [kq (c-kqueue) ch (ffi/alloc (* 2 KEVENT-SIZE)) ev (ffi/alloc KEVENT-SIZE) h {:kq kq}]
       (try
         (kevent-put! ch 0 fd (if (= filt :read) EVFILT-READ EVFILT-WRITE) EV-ADD)
-        (loop []
-          (when (neg? (c-kevent kq ch 1 ev 1 ffi/null)) (recur)))
+        (kevent-put! ch 1 0 EVFILT-USER (bit-or EV-ADD EV-CLEAR))
+        (when (and (not (neg? (c-kevent kq ch 2 ffi/null 0 ffi/null)))
+                   (thread-enter! fd h))
+          (try
+            (loop []
+              (when (neg? (c-kevent kq ffi/null 0 ev 1 ffi/null)) (recur)))
+            (finally (thread-leave! fd h))))
         (finally (ffi/free ch) (ffi/free ev) (c-close kq))))
-    (let [ep (c-epoll-create1 0) ev (ffi/alloc EPOLL-EVENT-SIZE)]
+    (let [ep (c-epoll-create1 0)
+          efd (c-eventfd 0 (bit-or EFD-NONBLOCK EFD-CLOEXEC))
+          ev (ffi/alloc EPOLL-EVENT-SIZE)
+          h {:efd efd}]
       (try
-        (ffi/write ev :uint (if (= filt :read) EPOLLIN EPOLLOUT))
-        (ffi/write ev :uint fd EPOLL-DATA-OFFSET)
-        (ffi/write ev :uint 0 (+ EPOLL-DATA-OFFSET 4))
-        (c-epoll-ctl ep EPOLL-ADD fd ev)
-        (loop []
-          (when (neg? (c-epoll-wait ep ev 1 -1)) (recur)))
-        (finally (ffi/free ev) (c-close ep))))))
+        (when (and (not (neg? (ep-ctl! ep EPOLL-ADD fd filt)))
+                   (not (neg? (ep-ctl! ep EPOLL-ADD efd :read)))
+                   (thread-enter! fd h))
+          (try
+            (loop []
+              (when (neg? (c-epoll-wait ep ev 1 -1)) (recur)))
+            (finally (thread-leave! fd h))))
+        (finally (ffi/free ev) (c-close efd) (c-close ep))))))
 
 (defn wait-ready [fd filt]
   (if (jolt.host/fiber?)

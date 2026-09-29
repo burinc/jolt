@@ -327,6 +327,73 @@
   (check-eq "accept on a closed server socket" (raised #(.accept server))
             [:socket-exception "Socket is closed"]))
 
+;; Closing a socket is how another thread stops a blocked read or accept, and the
+;; blocked call raises. It used to wait on in a private kqueue/epoll that close
+;; never signalled, so it hung for good. The JVM prints
+;; [SocketException "Socket closed"] for each of these; a write stuck on a full
+;; send buffer answers "Broken pipe" there instead.
+(defn blocked-then-closed [call target]
+  (let [p (promise)
+        _ (future (deliver p (try (call) :no-throw
+                                  (catch java.net.SocketException e
+                                    [:socket-exception (ex-message e)]))))]
+    (Thread/sleep 200)
+    (.close target)
+    (deref p 5000 :hung)))
+
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)]
+      (check-eq "close wakes a thread blocked in read"
+                (blocked-then-closed #(.read in) conn)
+                [:socket-exception "Socket closed"]))))
+
+(let [server (java.net.ServerSocket. 0)]
+  (check-eq "close wakes a thread blocked in accept"
+            (blocked-then-closed #(.accept server) server)
+            [:socket-exception "Socket closed"]))
+
+(with-pair
+  (fn [server client conn]
+    ;; The peer never reads, so the send buffer fills and a write blocks. A slow
+    ;; machine can still be copying a chunk when close lands, and the next write
+    ;; then raises "Socket closed", which is also what the JVM does there; what
+    ;; matters is that the writer wakes and raises.
+    (let [out (.getOutputStream client)
+          chunk (byte-array (* 64 1024))
+          r (blocked-then-closed #(loop [] (.write out chunk) (recur)) client)]
+      (check-eq "close wakes a thread blocked in write"
+                (if (contains? #{[:socket-exception "Broken pipe"]
+                                 [:socket-exception "Socket closed"]} r)
+                  :raised
+                  r)
+                :raised))))
+
+;; The same on a fiber, where the woken read used to retry recv on the fd number
+;; close had freed: B, opened right after, is handed that number, and A's read
+;; took B's bytes. A's fd stays reserved until its read has left.
+(require '[jolt.fibers :as fib])
+(let [server (java.net.ServerSocket. 0)
+      port   (.getLocalPort server)
+      a      (java.net.Socket. "127.0.0.1" port)
+      a-peer (.accept server)
+      a-in   (.getInputStream a)
+      p      (promise)
+      _      (fib/spawn (fn [] (deliver p (try (.read a-in) :no-throw
+                                               (catch java.net.SocketException e
+                                                 [:socket-exception (ex-message e)])))))
+      _      (Thread/sleep 200)
+      _      (.close a)
+      b      (java.net.Socket. "127.0.0.1" port)
+      b-peer (.accept server)]
+  (try
+    (.write (.getOutputStream b-peer) (.getBytes "B" "UTF-8") 0 1)
+    (check-eq "close wakes a fiber blocked in read" (deref p 5000 :hung)
+              [:socket-exception "Socket closed"])
+    (check-eq "the woken fiber left the next socket's bytes alone"
+              (.read (.getInputStream b)) (int \B))
+    (finally (.close b-peer) (.close b) (.close a-peer) (.close server))))
+
 ;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
 ;; It answered 0 always, which java.io permits ("an estimate") but which leaves
 ;; (pos? (.available in)) false forever. ioctl is variadic, and binding it

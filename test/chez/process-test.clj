@@ -778,6 +778,19 @@
                   (catch Exception _ :threw))])
           [3 "x\n" :threw])
 
+;; Closing a child's stdout under a thread blocked reading it ends the read with
+;; EOF, as the JVM's does (it prints -1). With the readiness poller loaded, the
+;; thread waits on it, and close never woke that wait, so the read hung.
+(require 'jolt.io-poller)
+(check-eq "closing a pipe wakes a thread blocked reading it"
+          (let [pr (.start (java.lang.ProcessBuilder. ["sleep" "5"]))
+                in (.getInputStream pr)
+                r  (future (.read in))]
+            (Thread/sleep 200)
+            (.close in)
+            (try (deref r 5000 :hung) (finally (.destroy pr))))
+          -1)
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

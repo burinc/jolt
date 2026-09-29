@@ -176,17 +176,22 @@
         #f
         (begin (jolt-invoke2 f fd filt-kw) #t))))
 
+;; Bridge to jolt.io-poller/cancel!: a port being shut wakes every wait on its fd,
+;; parked fiber or blocked thread, and makes any later wait return at once until
+;; the release forgets the fd. Without it a thread blocked in the poller's private
+;; wait never learned of the shut, and a fiber that registered just after the shut
+;; slept on a quiet pipe for good. Same unbound-var guard as proc-poller-forget!.
+(define (proc-poller-cancel! fd)
+  (let ((f (var-deref "jolt.io-poller" "cancel!")))
+    (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
+
 ;; Bridge to jolt.io-poller/forget!, same shape as proc-poller-wait-ready above.
-;; A closed fd is auto-removed from the kernel's kqueue/epoll set, so no
-;; event is ever coming for a fiber still parked on it -- without telling
-;; the poller to drop its registration, that fiber sleeps forever, and a
-;; leaked ready=true tombstone in the poller's shared :fds table (keyed by
-;; bare fd integer, shared with jolt.socket) can then be consumed by a
-;; REUSED fd number belonging to an unrelated later socket. Mirrors
-;; jolt.socket's socket-close! (stdlib/jolt/socket.clj), which does the
-;; identical close-then-forget for the same reason. Same unbound-var guard
-;; as proc-poller-wait-ready, and no autoload: a poller that was never loaded
-;; holds no registration for this fd, so there is nothing to forget.
+;; Run by the release, just before the close: the poller's table is keyed by bare
+;; fd number and shared with jolt.socket, so anything it still holds for this fd
+;; -- a ready=true tombstone, the cancelled mark -- would otherwise answer the
+;; first wait of whatever socket or pipe is handed the number next. jolt.socket's
+;; release does the same. Same unbound-var guard as proc-poller-wait-ready, and
+;; no autoload: a poller that was never loaded holds nothing for this fd.
 (define (proc-poller-forget! fd)
   (let ((f (var-deref "jolt.io-poller" "forget!")))
     (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
@@ -604,15 +609,16 @@
 ;;
 ;; Each port's fd and buf are owned by a lifetime (proc-fd-life): a count of the
 ;; reads and writes in flight, and a shut? flag. Shutting stops new operations,
-;; wakes a fiber parked on the fd (proc-poller-forget!), and releases -- frees
+;; wakes whatever is waiting on the fd (proc-poller-cancel!), and releases -- frees
 ;; buf, closes fd -- only when the count reaches zero, so the release is done by
 ;; whichever of the closer or the last operation out comes second. That is the
 ;; JDK's FileDescriptor use count, and it is what makes a shut from another
 ;; thread safe: a closed fd number is reused at once by any open/pipe/accept in
 ;; the process, so an operation still holding it would read, write, or register
-;; with jolt.io-poller on someone else's descriptor, into freed memory. The
-;; forget runs while the fd is still ours, both at the shut and again just
-;; before the close.
+;; with jolt.io-poller on someone else's descriptor, into freed memory. The shut
+;; cancels the fd with the poller (proc-poller-cancel!), which wakes whatever is
+;; waiting on it, and the release forgets it just before the close; both run
+;; while the fd is still ours.
 ;;
 ;; A port is shut by close-port, by reading a true EOF on it (the write end is
 ;; gone for good, and the JVM's pipe stream likewise lets go of its descriptor
@@ -622,11 +628,7 @@
 ;;
 ;; A shut port reads as EOF and raises on write, with its own message, so a
 ;; port shut under a parked write is not misreported as a failing child.
-;;
-;; Not covered: a fiber that has decided to call proc-poller-wait-ready but has
-;; not yet registered when the shut runs registers on a live fd that nothing will
-;; wake if the pipe stays quiet. That is a strand (a hang), not a use-after-free;
-;; closing it needs coordination on the jolt.io-poller side.
+
 (define proc-fd-buf-size 32768)
 (define-record-type proc-fd-life
   (fields fd buf mutex (mutable busy) (mutable shut?) (mutable released?))
@@ -657,7 +659,7 @@
                   (and (not (proc-fd-life-shut? l))
                        (begin (proc-fd-life-shut?-set! l #t) #t)))))
     (when first?
-      (proc-poller-forget! (proc-fd-life-fd l))
+      (proc-poller-cancel! (proc-fd-life-fd l))
       (when (jolt-with-mutex (proc-fd-life-mutex l) (proc-fd-claim-release! l))
         (proc-fd-release! l)))))
 ;; OP inside a counted operation; SHUT is the answer for a port already shut

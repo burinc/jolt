@@ -253,7 +253,7 @@
                             (c-clobber-scalar 9))
                           result))]
                (try
-                 (= 1 (io-call op fd :read))
+                 (= 1 (io-call conn op fd :read))
                  (finally
                    (ffi/free buf)
                    (.close conn)
@@ -282,7 +282,7 @@
                (try
                  (do
                    (ffi/write lenp :int 16)
-                   (reset! accepted-fd (io-call op server-fd :read))
+                   (reset! accepted-fd (io-call server op server-fd :read))
                    (not (neg? @accepted-fd)))
                  (finally
                    (when-not (neg? @accepted-fd) (raw-close @accepted-fd))
