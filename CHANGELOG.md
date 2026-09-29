@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Spawned processes start with `SIGPIPE` at its default, as on the JVM.**
+  The runtime ignores `SIGPIPE` for its own writes, and an ignored signal
+  survives `exec`, so every child and everything it ran inherited it. A
+  producer whose consumer exited early (`yes | head`, `cmd | grep -q`) got
+  `EPIPE` and ran its error path — "Broken pipe" on stderr, a different exit
+  status — instead of being ended by the signal. A shell cannot undo that
+  itself, so the spawn now resets it (#1196).
+
 - **A timed wait on a fiber no longer pins the fiber until its deadline.** The
   runtime's timer had no cancel, so a fiber's timed socket read, accept or
   connect, or a timed `deref`, left its deadline armed after the wait ended,

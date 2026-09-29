@@ -791,6 +791,16 @@
             (try (deref r 5000 :hung) (finally (.destroy pr))))
           -1)
 
+;; A child starts with SIGPIPE at SIG_DFL, as the JVM's do (jolt-lang/jolt#1196).
+;; The runtime ignores SIGPIPE for its own writes, and an ignored disposition
+;; survives exec, so a producer whose consumer quit early got EPIPE and took its
+;; error path ("yes: stdout: Broken pipe") instead of dying quietly. No shell can
+;; undo it: POSIX forbids a non-interactive sh resetting a signal ignored on entry.
+(check-eq "a child's SIGPIPE is at its default"
+          (let [err (:err (sh ["sh" "-c" "yes e | head -c 100000 >&2"] {:err :string}))]
+            [(count err) (str/includes? err "Broken pipe")])
+          [100000 false])
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
