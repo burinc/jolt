@@ -85,9 +85,11 @@
 ;; unsigned-bit-shift-right: LOGICAL right shift over a 64-bit long (Java >>>),
 ;; so a negative operand shifts in zeros from its 64-bit two's-complement window
 ;; ((>>> -1 1) = 2^63-1), not the sign. The shift count is taken mod 64.
+;; wrap64 the result: a zero shift leaves bit 63 set, so the unsigned window
+;; must read back as the signed long ((>>> -1 0) = -1, not 2^64-1).
 (define (jolt-unsigned-bit-shift-right x n)
-  (bitwise-arithmetic-shift-right (bitwise-and (->int x) #xFFFFFFFFFFFFFFFF)
-                                  (bitwise-and (->int n) 63)))
+  (wrap64 (bitwise-arithmetic-shift-right (bitwise-and (->int x) #xFFFFFFFFFFFFFFFF)
+                                          (shift-mask n))))
 
 ;; ---- string->scalar parsers -------------------------------------------------
 (define (ascii-digit? c) (and (char>=? c #\0) (char<=? c #\9)))
