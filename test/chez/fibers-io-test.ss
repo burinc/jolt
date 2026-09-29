@@ -269,5 +269,43 @@
 (ok "6. close marks the sockets closed"
     (jolt=2 (jv-nth r6 4) (jolt-vector #t #t #t)))
 
+;; --- 7. a timed wait that ends early drops its deadline -------------------------
+;; A fiber's timed wait arms the shared timer; one that ends before the deadline
+;; must take that entry back out. Left behind, it pins the fiber (through the
+;; timer's thunk) until the deadline, so a server with a long SO_TIMEOUT held
+;; one dead fiber per parked read for the whole timeout (jolt-lang/jolt#1191
+;; follow-up). Counted directly on the heap: every wait below parks for real
+;; and is answered long before its hour-long deadline.
+(printf "\n== 7. timed fiber waits answered early leave no timer behind ==\n")
+(define (pending-timers) (jolt-with-mutex timeout-mu (timeout-pending-count)))
+(define base-timers (pending-timers))
+(ev "(def t7-ss (java.net.ServerSocket. 0))")
+(ev "(def t7-client (java.net.Socket. \"127.0.0.1\" (.getLocalPort t7-ss)))")
+(ev "(def t7-srv (.accept t7-ss))")
+(ev "(.setSoTimeout t7-client 3600000)")
+(define t7-read (ev "(fn [] (.read (.getInputStream t7-client)))"))
+(define t7-write (ev "(fn [] (.write (.getOutputStream t7-srv) 7))"))
+(define t7-reads
+  (let loop ((i 0) (acc '()))
+    (if (= i 20)
+        (reverse acc)
+        (let ((f (sa-fiber-spawn t7-read)))
+          (wait-until (lambda () (eq? (jolt-fiber-state f) 'parked)) 15.0 "7. timed read parked")
+          (t7-write)
+          (wait-until (lambda () (eq? (jolt-fiber-state f) 'done)) 15.0 "7. timed read resumed")
+          (loop (+ i 1) (cons (jolt-fiber-result f) acc))))))
+(ok "7a. every timed read got its byte" (for-all (lambda (r) (eqv? r 7)) t7-reads))
+(ok "7b. and no read left its deadline pending" (= base-timers (pending-timers)))
+(ev "(do (.close t7-client) (.close t7-srv) (.close t7-ss))")
+;; the same seam under a timed deref, which parks through jolt-cv-wait
+(ev "(def t7-p (promise))")
+(define t7-deref (sa-fiber-spawn (ev "(fn [] (deref t7-p 3600000 :timed-out))")))
+(wait-until (lambda () (eq? (jolt-fiber-state t7-deref) 'parked)) 15.0 "7. timed deref parked")
+(ev "(deliver t7-p :delivered)")
+(wait-until (lambda () (eq? (jolt-fiber-state t7-deref) 'done)) 15.0 "7. timed deref resumed")
+(ok "7c. the timed deref got the value"
+    (eq? (jolt-fiber-result t7-deref) (keyword #f "delivered")))
+(ok "7d. and left no deadline pending" (= base-timers (pending-timers)))
+
 (printf "\nfibers-io: ~a checks, ~a failures\n" total fails)
 (exit (if (zero? fails) 0 1))

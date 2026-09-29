@@ -44,8 +44,9 @@
 ;; channel is removed under timeout-mu BEFORE the mutex drops, so by the time a
 ;; take has returned and this can acquire it, a fired timeout is already gone.
 ;; the pending store is a binary min-heap now (async.ss timeout-heap); its live
-;; count is the heap fill, read under the same lock as before.
-(define (pending-count) (jolt-with-mutex timeout-mu timeout-heap-n))
+;; count is the heap fill less the cancelled entries still in it, read under the
+;; same lock as before.
+(define (pending-count) (jolt-with-mutex timeout-mu (timeout-pending-count)))
 
 (printf "== the shared (timeout ms) timer ==\n")
 
@@ -111,6 +112,82 @@
 (printf "\n== 5. a deadline in the past closes immediately ==\n")
 (let ((ms (take-ms (jolt-async-timeout 0))))
   (ok "5a. (timeout 0) closes at once" (< ms 1000)))
+
+;; --- 6. cancelling a pending deadline ----------------------------------------
+;; A wait that ends before its deadline takes the entry out (jolt-timer-cancel!),
+;; so the heap stops holding the thunk — and everything the thunk closes over —
+;; the moment the wait is over rather than at the deadline.
+(printf "\n== 6. a cancelled deadline leaves the heap and never runs ==\n")
+(define fired-6 #f)
+(let ((h (jolt-timer-at! (+ (now-millis) 100) (lambda () (set! fired-6 #t)))))
+  (ok "6a. armed: pending grows by one" (= 2 (pending-count)))
+  (ok "6b. cancel answers #t for a pending entry" (eq? #t (jolt-timer-cancel! h)))
+  (ok "6c. it stops counting as pending at once" (= 1 (pending-count)))
+  (ok "6c'. and the heap has let go of its thunk" (not (cdr h)))
+  (ok "6d. a second cancel answers #f" (eq? #f (jolt-timer-cancel! h)))
+  (take-ms (jolt-async-timeout 300))
+  (ok "6e. its thunk never ran" (not fired-6)))
+;; cancelling after it fired is a no-op that says so
+(let* ((ch (jolt-async-timeout 1))
+       (h (jolt-timer-at! (now-millis) (lambda () #t))))
+  (jolt-async-take ch)
+  (take-ms (jolt-async-timeout 20))
+  (ok "6f. cancel after firing answers #f" (eq? #f (jolt-timer-cancel! h)))
+  (ok "6g. and leaves far alone" (= 1 (pending-count))))
+
+;; --- 7. the heap order survives arbitrary removals -----------------------------
+;; Removing from the middle moves the last entry into the hole, which may have to
+;; go up or down. Insert a scrambled band, cancel every third, and let the rest
+;; fire: every survivor fires, no cancelled one does, and they fire in deadline
+;; order (each thunk records its deadline).
+(printf "\n== 7. cancels from the middle keep the heap ordered ==\n")
+(define fired-7 '())
+(let* ((base (+ (now-millis) 200))
+       (n 300)
+       (hs (let loop ((i 0) (acc '()))
+             (if (= i n)
+                 (reverse acc)
+                 (let* ((d (+ base (modulo (* i 7919) n)))
+                        (h (jolt-timer-at! d (lambda ()
+                                               (jolt-with-mutex timeout-mu
+                                                 (set! fired-7 (cons d fired-7)))))))
+                   (loop (+ i 1) (cons (cons d h) acc))))))
+       (kept (let loop ((hs hs) (i 0) (acc '()))
+               (cond ((null? hs) acc)
+                     ((= 0 (modulo i 3)) (jolt-timer-cancel! (cdar hs)) (loop (cdr hs) (+ i 1) acc))
+                     (else (loop (cdr hs) (+ i 1) (cons (caar hs) acc)))))))
+  (ok "7a. pending is far plus the survivors" (= (+ 1 (length kept)) (pending-count)))
+  (take-ms (jolt-async-timeout (+ n 400)))
+  (let ((fired (reverse (jolt-with-mutex timeout-mu fired-7))))
+    (ok "7b. exactly the survivors fired" (equal? (sort < fired) (sort < kept)))
+    (ok "7c. in deadline order"
+        (let loop ((l fired)) (or (null? l) (null? (cdr l))
+                                  (and (<= (car l) (cadr l)) (loop (cdr l))))))
+    (ok "7d. only far is left" (= 1 (pending-count)))))
+
+;; --- 8. dead entries do not accumulate -----------------------------------------
+;; Cancelled entries are dropped lazily, so what bounds the heap is the rebuild:
+;; once the dead outnumber the live, the heap is compacted to the live ones. Arm a
+;; far band, cancel almost all of it, and the heap is back near its live size,
+;; still ordered for what is left.
+(printf "\n== 8. cancelled entries are compacted away ==\n")
+(let* ((base (+ (now-millis) 3600000))
+       (hs (let loop ((i 0) (acc '()))
+             (if (= i 2000) acc
+                 (loop (+ i 1) (cons (jolt-timer-at! (+ base (modulo (* i 7919) 2000)) (lambda () #t)) acc))))))
+  (for-each jolt-timer-cancel! (list-tail hs 10))
+  (ok "8a. ten of the band are still pending, plus far" (= 11 (pending-count)))
+  (ok "8b. the heap holds at most twice what is pending (plus the floor)"
+      (<= (jolt-with-mutex timeout-mu timeout-heap-n) (max 64 (* 2 11))))
+  (ok "8c. the rebuilt heap is still a heap"
+      (jolt-with-mutex timeout-mu
+        (let loop ((i 1))
+          (or (>= i timeout-heap-n)
+              (and (<= (car (vector-ref timeout-heap (quotient (- i 1) 2)))
+                       (car (vector-ref timeout-heap i)))
+                   (loop (+ i 1)))))))
+  (for-each jolt-timer-cancel! (list-head hs 10))
+  (ok "8d. and only far is left" (= 1 (pending-count))))
 
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))

@@ -651,31 +651,34 @@
 ;; The timed fiber wait. The deadline thunk and the wait decide under pm who wakes
 ;; the fiber: the thunk resumes it only if it is still parked on THIS (fd, filt) —
 ;; if the poller took it first, the readiness wins and the caller retries its
-;; syscall. W is this wait's own record, so a thunk left behind by an earlier wait
-;; of the same fiber (the timer cannot be cancelled) finds :done? and does nothing.
-;; The timer is armed before the commit; a deadline that passes before the fiber
-;; commits leaves :expired? for the commit to see, so it never parks past it.
+;; syscall. W is this wait's own record, so a thunk that fires after the wait is
+;; over — the cancel below lost the race to the timer thread — finds :done? and
+;; does nothing. The timer is armed before the commit; a deadline that passes
+;; before the fiber commits leaves :expired? for the commit to see, so it never
+;; parks past it. A wait that ends first cancels its deadline, so the timer does
+;; not hold the fiber until a long SO_TIMEOUT runs out.
 ;; The entry the poller keeps for the fd after a timeout is the same stale
 ;; registration a woken waiter leaves: it fires once, finds no waiter, is retired.
 (defn- wait-fiber-until [fd filt deadline]
   (let [f (jolt.host/current-fiber)
-        w (atom {:expired? false :timed-out? false :done? false})]
-    (jolt.host/timer-at!
-      deadline
-      (fn []
-        (when (locking pm
-                (when-not (:done? @w)
-                  (swap! w assoc :expired? true)
-                  (when (unpark-waiter! fd filt f)
-                    (swap! w assoc :timed-out? true)
-                    true)))
-          (jolt.host/fiber-resume f))))
-    (let [park? (locking pm (if (:expired? @w) :expired (commit-wait! fd filt)))]
-      (if (= park? :expired)
-        :timeout
-        (do (try (when park? (jolt.host/fiber-to-scheduler!))
-                 (finally (locking pm (swap! w assoc :done? true))))
-            (when (:timed-out? @w) :timeout))))))
+        w (atom {:expired? false :timed-out? false :done? false})
+        timer (jolt.host/timer-at!
+                deadline
+                (fn []
+                  (when (locking pm
+                          (when-not (:done? @w)
+                            (swap! w assoc :expired? true)
+                            (when (unpark-waiter! fd filt f)
+                              (swap! w assoc :timed-out? true)
+                              true)))
+                    (jolt.host/fiber-resume f))))
+        park? (locking pm (if (:expired? @w) :expired (commit-wait! fd filt)))]
+    (if (= park? :expired)
+      :timeout
+      (do (try (when park? (jolt.host/fiber-to-scheduler!))
+               (finally (locking pm (swap! w assoc :done? true))
+                        (jolt.host/timer-cancel! timer)))
+          (when (:timed-out? @w) :timeout)))))
 
 ;; A thread waiter registers its wake handle — its private kqueue, which carries
 ;; an EVFILT_USER event, or an eventfd in its private epoll set — so cancel! can
