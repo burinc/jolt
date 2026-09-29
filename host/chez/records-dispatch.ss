@@ -908,6 +908,29 @@
            (let ((r ((cdar as) obj method-name rest-args)))
              (if (eq? r 'pass) (loop (cdr as)) r)))))))
 
+;; A (.-name x) call site with no arguments keeps a per-site cache of the last
+;; record type it read and that type's slot for NAME: the box holds one
+;; immutable (desc . slot) pair, replaced whole so a racing reader never sees a
+;; desc paired with another type's slot. A hit is a type test, an eq? and the
+;; slot read; record-method-dispatch's shortcut paid a weak-table lookup per
+;; read (~39 ns), and a deftype equals reading the other instance's field paid
+;; it per key a map probe compared. Anything else — not a record, a name that
+;; is not a declared field, an extend-class! override at the head of the arms —
+;; takes record-method-dispatch exactly as the site did before.
+(define (jrec-field-site-make) (box #f))
+(define (jrec-field-site-ref site obj method-name)
+  (let ((c (unbox site)))
+    (if (and c (jrec? obj) (eq? (jrec-desc obj) (car c))
+             (not (fx=? (caar method-dispatch-arms) arm-priority-user-override)))
+        (jrec-field-ref obj (cdr c))
+        (let ((slot (and (jrec? obj)
+                         (not (fx=? (caar method-dispatch-arms) arm-priority-user-override))
+                         (jrec-dash-field-index obj method-name))))
+          (if slot
+              (begin (set-box! site (cons (jrec-desc obj) slot))
+                     (jrec-field-ref obj slot))
+              (record-method-dispatch obj method-name (jolt-vector)))))))
+
 ;; Strings are the most common interop receiver in library code (honeysql's
 ;; format path alone is .charAt/.length/.indexOf/.toString per entity), and the
 ;; base's string? case sat BELOW every arm — each call walked getclass, dotform

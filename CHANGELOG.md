@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at the nearest ancestor that releases one, so the base loader's `unload!`
   unmaps it.
 
+### Changed
+
+- **`(.-field x)` on a deftype or defrecord caches its slot at the call site.**
+  A field read looked the name up in the type's table on every call (~40 ns);
+  each site now remembers the last type it read and that type's slot (~14 ns).
+  A deftype `equals` that reads the other instance's field pays this per key a
+  map lookup compares, so a map keyed on core.logic-style LVars probes about
+  1.25x faster.
+
 ### Fixed
 
 - **`unsigned-bit-shift-right` by zero keeps a negative long.** A shift count

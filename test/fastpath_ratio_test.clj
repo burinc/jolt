@@ -124,7 +124,10 @@
 ;;                      The reference is the same lookup over defrecord keys,
 ;;                      whose = is structural with no method to call, so the
 ;;                      ratio is what calling a declared equals adds per key
-;;                      (4.66 -> 2.3; the JVM ~1.0).
+;;                      (4.66 -> 2.3; the JVM ~1.0). The field read then went
+;;                      through record-method-dispatch's per-type table, ~40 ns
+;;                      of every compare; a per-site cache of the receiver's type
+;;                      and slot made it ~14 (2.3 -> 1.65).
 ;;
 ;;   record-eq          = on two records walked every registered equality arm
 ;;                      (the record arm registered first, so it was asked last)
@@ -167,8 +170,17 @@
 ;; 0.34 and 1.40 in three runs, and 2.43 on a bionic runner against a 1.5
 ;; ceiling. After a collect the phase is the same for both arms, and twelve
 ;; ratios read 0.40-0.42.
-(defn- best-of [k f]
-  (reduce min (map first (repeatedly k #(do (System/gc) (timed f))))))
+;;
+;; The two arms' samples alternate rather than run as two blocks. The gate runs
+;; under make -j beside other gates, and a neighbour's burst lasting a few
+;; hundred milliseconds landed on one arm's whole block: record-key-get read
+;; 2.2-2.9 on main's CI runs and then 3.29 and 4.60 on one, 3.61 and 3.58 on
+;; another, with nothing changed. Alternating puts a burst on both arms, so
+;; the per-arm minimum still compares like with like.
+(defn- best-of-pair [k fast slow]
+  (let [ps (vec (repeatedly k #(vector (do (System/gc) (first (timed fast)))
+                                       (do (System/gc) (first (timed slow))))))]
+    [(reduce min (map first ps)) (reduce min (map second ps))]))
 
 (def ^:private failures (atom []))
 
@@ -177,8 +189,7 @@
    CEILING. Re-measures once in the band below CLEAR, as io_scaling_test.clj does."
   [label fast-arm slow-arm ceiling clear]
   (let [ratio (fn []
-                (let [f (best-of samples fast-arm)
-                      s (best-of samples slow-arm)]
+                (let [[f s] (best-of-pair samples fast-arm slow-arm)]
                   ;; a floor on the denominator: an arm that measures as ~0 would
                   ;; make any numerator look infinite
                   (/ s (max f 0.05))))

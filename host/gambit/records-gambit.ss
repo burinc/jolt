@@ -3111,6 +3111,28 @@
            (let ((r ((cdar as) obj method-name rest-args)))
              (if (eq? r 'pass) (loop (cdr as)) r)))))))
 
+(define (jrec-field-site-make) (box #f))
+
+(define (jrec-field-site-ref site obj method-name)
+  (let ((c (unbox site)))
+    (if (and c
+             (jrec? obj)
+             (eq? (jrec-desc obj) (car c))
+             (not (fx=?
+                    (caar method-dispatch-arms)
+                    arm-priority-user-override)))
+        (jrec-field-ref obj (cdr c))
+        (let ((slot (and (jrec? obj)
+                         (not (fx=?
+                                (caar method-dispatch-arms)
+                                arm-priority-user-override))
+                         (jrec-dash-field-index obj method-name))))
+          (if slot
+              (begin
+                (set-box! site (cons (jrec-desc obj) slot))
+                (jrec-field-ref obj slot))
+              (record-method-dispatch obj method-name (jolt-vector)))))))
+
 (define (method-rest-args->list rest-args)
   (cond
     ((jolt-nil? rest-args) '())
