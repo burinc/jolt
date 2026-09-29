@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.15] - 2026-09-29
+
+Sockets gain read, accept and connect timeouts, and a closed socket behaves
+like the JVM's: its streams stop touching a reused fd and blocked callers wake.
+`jolt.loader/eval-in` evaluates a string inside a loader context, and
+`unload!` lets the loader be collected. Also fixed: spawned children inherit
+`SIGPIPE` ignored, `file:` URIs as paths, `java.time` `Month` overloads,
+image dumps of protocol-implementing records, and `clojure.walk` over sets.
+
 ### Added
 
 - **`jolt.loader/eval-in`: evaluate a source string in a context.** `eval` and
@@ -63,13 +72,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Paths.get` of another scheme is a `FileSystemNotFoundException`.
   `clojure.java.io/file` of a URI reads it the lenient way, through its URL, as
   Clojure does (#1198).
-
 - **`java.time`'s `Month` overloads.** `LocalDate/of`, `LocalDateTime/of`,
   `YearMonth/of`, `MonthDay/of` and `Year.atMonth` take a `java.time.Month`
   where the month number goes, as the JDK's do; a `Month` was a
   `ClassCastException`. `LocalDateTime/ofInstant` and an `ofEpochSecond` that
   applies its offset come from jolt-lang/time, which owns zones (#1197).
-
 - **Spawned processes start with `SIGPIPE` at its default, as on the JVM.**
   The runtime ignores `SIGPIPE` for its own writes, and an ignored signal
   survives `exec`, so every child and everything it ran inherited it. A
@@ -77,14 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EPIPE` and ran its error path — "Broken pipe" on stderr, a different exit
   status — instead of being ended by the signal. A shell cannot undo that
   itself, so the spawn now resets it (#1196).
-
 - **A timed wait on a fiber no longer pins the fiber until its deadline.** The
   runtime's timer had no cancel, so a fiber's timed socket read, accept or
   connect, or a timed `deref`, left its deadline armed after the wait ended,
   and the timer held the fiber until it passed. With a long `SO_TIMEOUT` that
   kept one finished fiber per parked read alive for the whole timeout. Waits
   now cancel their deadline when they end; arming costs the same as before.
-
 - **`Socket.connect(endpoint, timeout)` honours its timeout.** It was accepted
   and ignored, so a connect to a peer that never answered blocked until the OS
   gave up. It now raises `SocketTimeoutException` ("Connect timed out"), a
@@ -93,7 +98,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closes the socket as the JDK's does. "Already connected" is a
   `SocketException` and an unresolvable host an `UnknownHostException`, also
   as on the JDK (#1192).
-
 - **`unsigned-bit-shift-right` by zero keeps a negative long.** A shift count
   of 0 (or any multiple of 64) returned the operand's unsigned value as a
   BigInt, so `(unsigned-bit-shift-right -1 0)` read `18446744073709551615N`
@@ -125,6 +129,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a child process's pipe stream under a thread blocked reading it likewise ends
   the read with `-1` instead of hanging. A write to a dead peer throws
   `SocketException` rather than a plain `IOException`, as on the JVM.
+- **`clojure.walk` walks into sets.** `walk` had no branch for a set, so a set
+  fell through to `outer` with its elements untouched:
+  `(walk inc identity #{1 3})` was `#{1 3}` and `postwalk-replace` left a set's
+  elements alone. Any other collection is now rebuilt with
+  `(into (empty form) (map inner form))`, as in Clojure, which also keeps a
+  sorted set sorted.
 
 ## [0.8.14] - 2026-09-28
 
