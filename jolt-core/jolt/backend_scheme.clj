@@ -3646,6 +3646,13 @@
       (supported-host-methods m)
       (str "(jolt-host-call " (chez-str-lit m) " " t
            (if (empty? args) "" (str " " (str/join " " args))) ")")
+      ;; (.-name x): a field read. The site caches the record type it last read
+      ;; and that type's slot (records-dispatch.ss jrec-field-site-ref); any
+      ;; other receiver takes record-method-dispatch as below.
+      (and chez? (empty? args) (str/starts-with? m "-") (> (count m) 1)
+           *const-pool* (var-cache?))
+      (str "(jrec-field-site-ref " (hoist-const-per-site "(jrec-field-site-make)") " "
+           t " " (chez-str-lit m) ")")
       ;; An UNPROVEN receiver whose method has a string or keyword
       ;; direct form: test the receiver's type at the site and take
       ;; that form, with the generic dispatch as the slow arm — the
