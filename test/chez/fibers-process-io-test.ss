@@ -427,9 +427,18 @@
     ;; on the same commit. Now nothing is on a clock: the readers park until we send
     ;; EOF below, so if parking did NOT free a carrier sib can never run at all and
     ;; the wait times out, which is the real property this check is for.
-    "(define sib (sa-fiber-spawn (lambda () (if ((all-state? 'parked)) 606 -1))))\n"
-    "(define sib-ran (and (wait-until (lambda () (eq? (jolt-fiber-state sib) 'done)) 5.0)\n"
-    "                     (eqv? (jolt-fiber-result sib) 606)))\n"
+    ;; sib records the readers' states rather than requiring both 'parked at
+    ;; the instant it runs: parked2 has already seen both parked, neither can
+    ;; finish before the EOF below, and a reader passing through 'ready or
+    ;; 'running on the other carrier as it re-parks is not a failure. The old
+    ;; check failed once on a bionic runner with both readers parked before and
+    ;; done after, its report silent on sib itself (it prints sib now). A reader that never parked
+    ;; (the blocking fallback) fails parked2, and one stuck on a carrier leaves
+    ;; the other free, so what sib proves is that it ran before any reader was
+    ;; done.
+    "(define sib (sa-fiber-spawn (lambda () (map jolt-fiber-state fs))))\n"
+    "(define sib-ran (and (wait-until (lambda () (eq? (jolt-fiber-state sib) 'done)) 15.0)\n"
+    "                     (let ((r (jolt-fiber-result sib))) (and (list? r) (not (memq 'done r))))))\n"
     "(define post (poller-loaded?))\n"
     ;; only now let the readers finish: closing our end of each stdin is the EOF
     ;; their `cat` is waiting for.
@@ -440,10 +449,10 @@
     "         parked2 sib-ran post done2 (equal? r2 (list \"npf\" \"npf\")))\n"
     "    (begin (printf \"NO-POLLER-PROBE OK thread-read=~,1fms\\n\" el1) (exit 0))\n"
     "    (begin (printf (string-append \"NO-POLLER-PROBE FAIL pre=~a r1=~a el1=~,1fms mid=~a\"\n"
-    "                                  \" parked2=~a sib-ran=~a post=~a done2=~a r2=~s\"\n"
+    "                                  \" parked2=~a sib-ran=~a sib=~a/~s post=~a done2=~a r2=~s\"\n"
     "                                  \" states=~a\\n\")\n"
-    "                   pre r1 el1 mid parked2 sib-ran post done2 r2\n"
-    "                   (map jolt-fiber-state fs))\n"
+    "                   pre r1 el1 mid parked2 sib-ran (jolt-fiber-state sib) (jolt-fiber-result sib)\n"
+    "                   post done2 r2 (map jolt-fiber-state fs))\n"
     "           (exit 1)))\n"))
   (set! no-poller-path
     (string-append (host-temp-dir) "/jolt-fibers-process-io-no-poller-probe-" (number->string (get-process-id)) ".ss"))

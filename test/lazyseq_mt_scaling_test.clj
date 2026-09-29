@@ -19,14 +19,15 @@
 ;;
 ;;   SCALING — one workload, timed before any thread exists and again after one
 ;;   has existed, in ONE process. The ratio is the judge: the per-cell mutex
-;;   design measures ~5 (the second arm is mostly collector), the claim ~1.5.
+;;   design measures ~5 (the second arm is mostly collector), the claim ~1.75
+;;   (two atomic operations and an unwind guard on every first force, ~28 ns).
 ;;   Only the ratio is read, so machine speed and load do not matter.
 
 (ns lazyseq-mt-scaling-test)
 
 (def ^:private walkers 8)
 (def ^:private n 20000)
-;; The claim design measures ~1.5 (the release fence and the counted claim on
+;; The claim design measures ~1.75 (the release fence and the counted claim on
 ;; every first force) and a mutex per cell ~5; the line sits well above the
 ;; first with room for a loaded CI runner, and well below the failure it guards.
 (def ^:private max-ratio 2.5)
@@ -92,12 +93,21 @@
     (f)
     (/ (- (System/nanoTime) t0) 1000000.0)))
 
+;; Best of several runs per arm, each from a fresh collection: one run per arm
+;; read 1.7-2.0 on CI for months and then 3.13 (186ms, 582ms) once, under make
+;; -j beside other gates. The arms cannot alternate -- one of them is "before
+;; any thread" -- so each takes the minimum of its own runs; a burst long enough
+;; to cover all of them is not what this gate is looking for, a per-cell mutex
+;; (~5) slows every run.
+(def ^:private runs 5)
+(defn- best-ms [f] (reduce min (repeatedly runs #(do (System/gc) (time-ms f)))))
+
 (defn- check-scaling []
   (work)                                                ; warm
-  (let [before (time-ms work)
+  (let [before (best-ms work)
         t (Thread. (fn [] nil))]
     (.start t) (.join t)                               ; a thread has EXISTED; it need not be alive
-    (let [after (time-ms work)
+    (let [after (best-ms work)
           ratio (/ after before)]
       (println (format "lazyseq-mt-scaling: %.0fms before any thread, %.0fms after one existed, ratio %.2f (ceiling %.1f)"
                        before after ratio max-ratio))
