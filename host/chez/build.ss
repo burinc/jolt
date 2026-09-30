@@ -338,7 +338,7 @@
 (define (bld-xpatch) (string-append (bld-target-pack) "/xpatch"))
 
 (define (bld-have-cc?)
-  (> (string-length (bld-sh-capture "command -v cc")) 0))
+  (> (string-length (bld-sh-capture (string-append "command -v " (bld-sh-quote (bld-cc))))) 0))
 
 (define (bld-check-toolchain)
   (let ((hint (if (bld-cross?)
@@ -3347,10 +3347,12 @@
     (parameterize ((bld-bundled-archives archives))
       ;; bld-link-executable, not bld-system: the kernel spilled just above is
       ;; the one archive in this link jolt built itself, and it is not PIC.
-      (bld-link-executable "cc"
+      ;; (bld-cc), as build-with-cc and the static preload link with: JOLT_CC
+      ;; names the compiler the kernel was built with (#788)
+      (bld-link-executable (bld-cc)
         (lambda (extra)
           (string-append
-            "cc -O2 " (bld-export-symbols-flag) extra
+            (bld-cc) " -O2 " (bld-export-symbols-flag) extra
             "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
             native-link " " (bld-link-libs)))
         (string-append builddir "/relink.log")))))
