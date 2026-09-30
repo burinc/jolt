@@ -102,29 +102,48 @@
 ;; put hands a value to a taker that is gone, and a later taker takes the value of
 ;; a put that threw. jolt retracts instead (known-divergences.edn).
 ;;
-;; (ac-intr-wait! mu cv wait) — with MU held and the op committed to waiting:
-;; #f when the calling thread is interrupted (flag consumed, nothing waited), else
-;; runs WAIT (which waits on cv, releasing mu) and answers #t. The registration is
-;; locks.ss's jolt-cv-wait-interruptibly protocol: the waiter lists (mu . cv)
-;; against its interrupt box and re-reads the flag after, because the interrupter
-;; sets the flag BEFORE reading the registry and takes mu to wake — so it either
-;; found the entry and its broadcast waits on the mu held here, or it did not and
-;; the re-read sees its flag. Threads only: a fiber never reaches these waits
-;; (the fiber ops divert first, fibers-async.ss).
-(define (ac-intr-wait! mu cv wait)
+;; (ac-intr-wait! mu cv wait reg) — with MU held and the op committed to waiting.
+;; REG is what the previous round answered: #f before the first wait, else the
+;; op's registration. Answers #f when the calling thread is interrupted (flag
+;; consumed, registration dropped, nothing waited), else runs WAIT (which waits on
+;; cv, releasing mu) and answers the registration to pass to the next round.
+;;
+;; The registration is locks.ss's jolt-cv-wait-interruptibly protocol: the waiter
+;; lists (mu . cv) against its interrupt box and re-reads the flag after, because
+;; the interrupter sets the flag BEFORE reading the registry and takes mu to wake —
+;; so it either found the entry and its broadcast waits on the mu held here, or it
+;; did not and the re-read sees its flag. It is made ONCE PER OP and kept across
+;; wakes, and the op drops it (ac-unreg!) on every way out. Made per round, it put
+;; two operations on the registry's one global mutex into every wake, and a put to
+;; a channel with 1000 threads blocked in <!! wakes all 1000 (the condition is a
+;; broadcast): 2000 contended acquisitions per put, which cost a 1000-taker fan-out
+;; about 35%. Kept across rounds, a wake reads the flag and nothing else, since the
+;; mu held from that read to the next wait closes the same window the re-read does.
+;; Threads only: a fiber never reaches these waits (the fiber ops divert first,
+;; fibers-async.ss).
+(define (ac-intr-wait! mu cv wait reg)
   (let ((b (current-interrupt-box)))
-    (if (jolt-interrupt-take! b)
-        #f
-        (let ((e (cons mu cv)))
-          (jolt-interrupt-wait-add! b e)
-          (if (jolt-interrupt-take! b)
-              (begin (jolt-interrupt-wait-remove! b e) #f)
-              (begin (wait) (jolt-interrupt-wait-remove! b e) #t))))))
+    (cond
+      ((jolt-interrupt-take! b) (ac-unreg! reg) #f)
+      ((pair? reg) (wait) reg)
+      (else
+       (let ((e (cons mu cv)))
+         (jolt-interrupt-wait-add! b e)
+         (if (jolt-interrupt-take! b)
+             (begin (jolt-interrupt-wait-remove! b e) #f)
+             (begin (wait) e)))))))
 
-;; One wait on the channel's condition: #t woken, #f interrupted (INTR? only).
-(define (ac-wait! ch intr?)
+;; Drop an op's registration, if it made one (REG from ac-intr-wait!, or #f/#t).
+(define (ac-unreg! reg)
+  (when (pair? reg) (jolt-interrupt-wait-remove! (current-interrupt-box) reg)))
+(define-syntax ac-done                  ; (ac-done reg value): leave the op
+  (syntax-rules () ((_ reg e) (begin (ac-unreg! reg) e))))
+
+;; One wait on the channel's condition: the next REG, or #f when interrupted
+;; (INTR? only). A non-interruptible wait answers #t and never registers.
+(define (ac-wait! ch intr? reg)
   (if intr?
-      (ac-intr-wait! (async-chan-mu ch) (async-chan-cv ch) (lambda () (ac-cv-wait ch)))
+      (ac-intr-wait! (async-chan-mu ch) (async-chan-cv ch) (lambda () (ac-cv-wait ch)) reg)
       (begin (ac-cv-wait ch) #t)))
 
 (define (ac-qnew) (vector '() '() 0))
@@ -367,13 +386,14 @@
            ;; Fixed buffered with xform: wait for room, then apply xform.
            ;; The xform step may overfill transiently (e.g. mapcat); the NEXT put
            ;; will wait again.
-           (let loop ()
-             (cond ((async-chan-closed? ch) #f)
+           (let loop ((reg #f))
+             (cond ((async-chan-closed? ch) (ac-done reg #f))
                    ((< (ac-qlen ch) (async-chan-cap ch))
+                    (ac-unreg! reg)
                     (let ((r (ac-xrf-apply ch v)))
                       (when (jolt-reduced? r) (ac-close! ch))
                       #t))
-                   ((ac-wait! ch intr?) (loop))
+                   ((ac-wait! ch intr? reg) => loop)
                    (else (jolt-interrupted-throw! ">!!"))))
            ;; Unbuffered with xform: apply immediately (output goes to rendezvous queue)
            (let ((r (ac-xrf-apply ch v)))
@@ -390,18 +410,19 @@
                      #t)
           (else
            (if (> (async-chan-cap ch) 0)
-               (let loop ()                                    ; buffered fixed: wait for room
-                 (cond ((async-chan-closed? ch) #f)
+               (let loop ((reg #f))                            ; buffered fixed: wait for room
+                 (cond ((async-chan-closed? ch) (ac-done reg #f))
                        ((< (ac-qlen ch) (async-chan-cap ch))
+                        (ac-unreg! reg)
                         (ac-qpush! ch (cons v #f)) (ac-notify! ch) #t)
-                       ((ac-wait! ch intr?) (loop))
+                       ((ac-wait! ch intr? reg) => loop)
                        (else (jolt-interrupted-throw! ">!!"))))
                (let* ((box (vector #f)) (entry (cons v box)))  ; unbuffered: rendezvous
                  (ac-qpush! ch entry)
                  (ac-notify! ch)
-                 (let loop ()
-                   (cond ((vector-ref box 0) #t)
-                         ((ac-wait! ch intr?) (loop))
+                 (let loop ((reg #f))
+                   (cond ((vector-ref box 0) (ac-done reg #t))
+                         ((ac-wait! ch intr? reg) => loop)
                          ;; Interrupted before any taker reached it: the entry is
                          ;; still queued (only a take removes it, and a take sets
                          ;; box), so retract it — a put that threw must not hand
@@ -429,14 +450,14 @@
 (define (jolt-async-take!! ch) (ac-take ch #t))
 (define (ac-take ch intr?)
   (jolt-with-mutex (async-chan-mu ch)
-    (let loop ()
+    (let loop ((reg #f))
       (cond ((eq? (async-chan-kind ch) 'promise)
-             (cond ((not (ac-qempty? ch)) (ac-peek ch))
-                   ((async-chan-closed? ch) jolt-nil)
-                   ((ac-take-wait ch intr?) (loop))
+             (cond ((not (ac-qempty? ch)) (ac-done reg (ac-peek ch)))
+                   ((async-chan-closed? ch) (ac-done reg jolt-nil))
+                   ((ac-take-wait ch intr? reg) => loop)
                    (else (jolt-interrupted-throw! "<!!"))))
-            ((not (ac-qempty? ch)) (ac-take-head! ch))
-            ((async-chan-closed? ch) jolt-nil)
+            ((not (ac-qempty? ch)) (ac-done reg (ac-take-head! ch)))
+            ((async-chan-closed? ch) (ac-done reg jolt-nil))
             ;; drain an alt-putter if one is parked (no xform chans — those
             ;; complete immediately into the buffer via ac-buf-give!)
             ((and (pair? (async-chan-alt-putters ch))
@@ -451,22 +472,22 @@
                      (let ((box (vector #f)))
                        (ac-qpush! ch (cons v box))
                        (ac-broadcast! ch))
-                     (ac-take-head! ch))
-                   (loop))))  ; dead registration, retry
+                     (ac-done reg (ac-take-head! ch)))
+                   (loop reg))))  ; dead registration, retry
             ;; An interrupted take leaves nothing behind: it holds no value (it
             ;; only ever takes one under mu and returns it) and ac-take-wait gives
             ;; its takew count back, so an offer! after the throw no longer
             ;; mistakes it for a waiting taker.
-            ((ac-take-wait ch intr?) (loop))
+            ((ac-take-wait ch intr? reg) => loop)
             (else (jolt-interrupted-throw! "<!!"))))))
 
 ;; park in a take, tracking the waiter count so a concurrent offer! to an
-;; unbuffered channel can see that a taker is ready.
-(define (ac-take-wait ch intr?)
+;; unbuffered channel can see that a taker is ready. Answers as ac-wait! does.
+(define (ac-take-wait ch intr? reg)
   (async-chan-takew-set! ch (fx+ 1 (async-chan-takew ch)))
-  (let ((woke? (ac-wait! ch intr?)))
+  (let ((next (ac-wait! ch intr? reg)))
     (async-chan-takew-set! ch (fx- (async-chan-takew ch) 1))
-    woke?))
+    next))
 
 ;; non-blocking take for alts!/poll!: a value, jolt-nil (closed+empty), or ac-poll-empty.
 ;; Drains pending alt-putters when the queue is empty (same drain path as jolt-async-take).
@@ -1062,10 +1083,10 @@
                                  (await-mailbox
                                   (lambda (intr?)
                                     (jolt-with-mutex wmu
-                                      (let wait-loop ()
-                                        (cond ((vector-ref mb 0) #t)
-                                              ((not intr?) (wait) (wait-loop))
-                                              ((ac-intr-wait! wmu wcv wait) (wait-loop))
+                                      (let wait-loop ((reg #f))
+                                        (cond ((vector-ref mb 0) (ac-done reg #t))
+                                              ((not intr?) (wait) (wait-loop #f))
+                                              ((ac-intr-wait! wmu wcv wait reg) => wait-loop)
                                               (else #f)))))))
                             (cond
                               ((await-mailbox intr?)
