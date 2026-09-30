@@ -95,6 +95,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `ThreadFactory`'s Thread runs the pool worker.** A pool asked its
+  factory for a Thread only to read its daemon flag and name, and ran the
+  worker on a thread of its own, so a factory that wraps the Runnable it is
+  handed (to set up context, count, catch) never saw its wrapper run, and
+  `Thread/currentThread` in a task was not the factory's Thread. The pool now
+  starts the Thread `newThread` answers, as the JVM does. A task handed to
+  `execute` that throws ends its worker as there: the throw goes to the
+  thread's uncaught-exception handler and the pool starts a replacement.
+  `Thread.setUncaughtExceptionHandler`/`getUncaughtExceptionHandler` and
+  `Thread/setDefaultUncaughtExceptionHandler`/`getDefaultUncaughtExceptionHandler`
+  are implemented, and a `Thread`'s body that throws goes through them.
 - **`cancel(true)` interrupts the task it cancels.** On an executor's future
   (`submit`, a scheduled task, `invokeAll`'s deadline, `invokeAny`'s losers,
   `future-cancel`) and on a `FutureTask` run on a pool or a `Thread`, cancel

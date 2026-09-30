@@ -1945,9 +1945,7 @@
                ;; surface a thread body's throw like the JVM's default uncaught-
               ;; exception handler; the thread still completes (isAlive/join
               ;; semantics unchanged). Reporting failures are swallowed.
-              (guard (e (#t (guard (_ (#t #f))
-                              (display "Exception in Thread body:\n" (current-error-port))
-                              (jolt-report-throwable e (current-error-port)))))
+              (guard (e (#t (jolt-thread-uncaught! self e "Exception in Thread body:\n")))
                 ;; runnable->thunk and not a bare jolt-invoke: Thread(Runnable)
                 ;; accepts any Runnable on the JVM, and a FutureTask is one (it is
                 ;; registered as such in the class graph). Invoking it directly
@@ -2043,7 +2041,40 @@
           jolt-nil))
         (cons "isVirtual" (lambda (self) #f))
         ;; its group while it lives; nil once it has terminated, as on the JVM
-        (cons "getThreadGroup" (lambda (self) (thread-group-of self)))))
+        (cons "getThreadGroup" (lambda (self) (thread-group-of self)))
+        (cons "setUncaughtExceptionHandler" (lambda (self h)
+          (vector-set! (jhost-state self) 11 (if (jolt-nil? h) #f h))
+          jolt-nil))
+        ;; nil once the thread has terminated, whatever was set; before that the
+        ;; handler set on it, else its ThreadGroup (itself a handler on the JVM)
+        (cons "getUncaughtExceptionHandler" (lambda (self)
+          (let ((st (jhost-state self)))
+            (cond ((vector-ref st 1) jolt-nil)
+                  ((vector-ref st 11) => values)
+                  (else (thread-group-of self))))))))
+
+;; --- uncaught exceptions ---------------------------------------------------
+;; A throw that ends a thread goes to that thread's handler if it has one, else
+;; to the default handler (Thread/setDefaultUncaughtExceptionHandler), else it is
+;; reported — which is the JVM's dispatch through the thread's ThreadGroup. A
+;; handler's own throw is ignored, as the JVM ignores it.
+(define default-uncaught-handler #f)
+(define (jolt-thread-uncaught! th e label)
+  (let* ((x (jolt-unwrap-throw e))
+         (h (or (and th (jhost? th) (vector-ref (jhost-state th) 11))
+                default-uncaught-handler)))
+    (if h
+        (guard (_ (#t #f)) (jolt-fi-call h "uncaughtException" th x))
+        (guard (_ (#t #f))
+          (display label (current-error-port))
+          (jolt-report-throwable e (current-error-port))))))
+(let ((statics
+       (list (cons "setDefaultUncaughtExceptionHandler"
+                   (lambda (h) (set! default-uncaught-handler (if (jolt-nil? h) #f h)) jolt-nil))
+             (cons "getDefaultUncaughtExceptionHandler"
+                   (lambda () (or default-uncaught-handler jolt-nil))))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
 
 ;; --- java.lang.ThreadGroup --------------------------------------------------
 ;; A minimal, consistent model: the JVM's two built-in groups, "system" and its
@@ -2113,10 +2144,7 @@
         (cons "isDaemon" (lambda (self) #f))
         ;; a ThreadGroup is its threads' uncaught-exception handler by default
         (cons "uncaughtException" (lambda (self th e)
-          (guard (_ (#t #f))
-            (display "Exception in Thread body:\n" (current-error-port))
-            (jolt-report-throwable e (current-error-port)))
-          jolt-nil))
+          (jolt-thread-uncaught! #f e "Exception in Thread body:\n") jolt-nil))
         (cons "toString" (lambda (self)
           (string-append "java.lang.ThreadGroup[name=" (vector-ref (jhost-state self) 0)
                          ",maxpri=" (number->string (vector-ref (jhost-state self) 2)) "]")))))
@@ -2412,25 +2440,29 @@
                                     (jolt-cv-wake! (vector-ref st 11))
                                     (fx=? 0 (vector-ref st 4)))))
                   (when none-left? (raise e)))))
-    ;; What the worker is born as. A pool with a ThreadFactory asks it for the
-    ;; worker's Thread, once per worker as the JVM does, and takes that Thread's
-    ;; daemon flag and name; the Thread itself is not started — the worker is
-    ;; this fork, so a factory that wraps the Runnable it is handed does not see
-    ;; its wrapper run. Without one, the pool's own flag.
-    (let* ((factory (vector-ref st 17))
+    ;; A pool with a ThreadFactory hands it the worker, as the JVM's does —
+    ;; newThread(worker) — and STARTS the Thread it answers: the worker runs on
+    ;; that Thread, so Thread/currentThread in a task is it (its name, daemon
+    ;; flag, priority and uncaught-exception handler), and a factory that wraps
+    ;; the Runnable it was handed sees its wrapper run. Without a factory, the
+    ;; worker is a thread of the pool's own daemon status (a factory answering
+    ;; nil gets the same).
+    (let* ((worker (lambda ()
+                     (*txn* #f)                ; not the creating thread's txn
+                     (rdr-default-modes!)      ; nor the reader modes of a read it forked from
+                     (executor-worker-loop st)
+                     jolt-nil))
+           (factory (vector-ref st 17))
            (t (and factory
-                   (let ((t (record-method-dispatch factory "newThread"
-                                                    (jolt-list (lambda () jolt-nil)))))
-                     (and (not (jolt-nil? t)) t))))
-           (daemon (if t
-                       (jolt-truthy? (record-method-dispatch t "isDaemon" jolt-nil))
-                       (vector-ref st 16)))
-           (name (and t (record-method-dispatch t "getName" jolt-nil))))
-      (fork-thread/daemon daemon (lambda ()
-        (*txn* #f)      ; worker must not inherit the creating thread's txn
-        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
-        (when (string? name) (jolt-thread-name-set! (get-thread-id) name))
-        (executor-worker-loop st))))))
+                   (let ((t (record-method-dispatch factory "newThread" (jolt-list worker))))
+                     (and (not (jolt-nil? t)) t)))))
+      (if t
+          (record-method-dispatch t "start" jolt-nil)
+          (fork-thread/daemon (vector-ref st 16)
+            (lambda ()
+              (guard (e (#t (jolt-thread-uncaught! (current-thread-handle) e
+                                                   "Exception in executor task:\n")))
+                (worker))))))))
 
 ;; Dequeue, with the mutex held. Callers test queue-depth first.
 (define (executor-dequeue! st)
@@ -2565,10 +2597,16 @@
       (when arriving?
         (set! arriving? #f)
         (vector-set! st 12 (fx- (vector-ref st 12) 1))))
-    (guard (e (#t (jolt-with-mutex (vector-ref st 2) (arrived!) (executor-worker-exit! st))
-                  (guard (_ (#t #f))
-                    (display "Exception in executor worker:\n" (current-error-port))
-                    (jolt-report-throwable e (current-error-port)))))
+    ;; A worker that ends ABRUPTLY — an executed task threw — gives its slot
+    ;; back and, unless the pool is stopping, starts its replacement, as the
+    ;; JVM's processWorkerExit does; then the throw goes on to end this thread,
+    ;; where its uncaught-exception handler sees it (executor-spawn-worker!).
+    (guard (e (#t (let ((again? (jolt-with-mutex (vector-ref st 2)
+                                  (arrived!) (executor-worker-exit! st)
+                                  (and (not (executor-stopping? st))
+                                       (executor-claim-worker! st)))))
+                    (when again? (executor-spawn-worker! st))
+                    (raise e))))
       (let loop ()
         (let ((job (jolt-with-mutex (vector-ref st 2)
                      ;; Out of STARTING and into whatever executor-take-job! decides,
@@ -2819,11 +2857,11 @@
   (list (cons "submit" executor-submit)
         (cons "execute" (lambda (self thunk*)
           (let ((thunk (runnable->thunk thunk*)))
+            ;; A task's throw is NOT caught here: on the JVM it ends the worker
+            ;; running it, goes to that thread's uncaught-exception handler, and
+            ;; the pool starts a replacement (executor-worker-loop*).
             (executor-enqueue! self (lambda () (dyn-binding-stack '())   ; no conveyance, as submit
-              (guard (e (#t (guard (_ (#t #f))
-                              (display "Exception in executor task:\n" (current-error-port))
-                              (jolt-report-throwable e (current-error-port)))))
-                (jolt-invoke thunk))))
+              (jolt-invoke thunk)))
           jolt-nil)))
         ;; Shutdown wakes BOTH conditions, and every waiter on each: task-cond so
         ;; that all the idle workers see the flag and leave (the one place a
