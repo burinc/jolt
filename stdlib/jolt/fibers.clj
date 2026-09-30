@@ -7,10 +7,13 @@
 ;; rather than pinning the carrier.
 ;;
 ;; What the runtime pins (host/chez/fibers.ss) and this API inherits:
+;;   - a fiber is a virtual thread: Thread/currentThread inside it is its own
+;;     java.lang.Thread (isVirtual true), with its own interrupt flag, so
+;;     (.interrupt t) throws that fiber alone out of an interruptible wait.
 ;;   - a fiber is bound to its carrier (an OS thread of the pool) for life;
-;;     a blocking foreign call or Thread/sleep in a body pins that carrier
-;;     and strands the fibers queued behind it. Park-capable waits — channel
-;;     ops, deref, jolt.socket IO, jolt.process subprocess pipe IO — are the
+;;     a blocking foreign call in a body pins that carrier and strands the
+;;     fibers queued behind it. Park-capable waits — channel ops, deref,
+;;     Thread/sleep, jolt.socket IO, jolt.process subprocess pipe IO — are the
 ;;     ones to use inside a body.
 ;;   - spawn conveys the caller's dynamic bindings; *txn* never conveys (a
 ;;     child cannot join the parent's STM transaction).
@@ -19,7 +22,10 @@
 ;;   - preemption is always on (a compute-bound body cannot starve its
 ;;     carrier); the quantum is set-preempt-ticks!, floored, never zero.
 ;;   - interrupt! makes another fiber raise a throwable wherever it is: at its
-;;     next park, yield or preemption, or at once if it is parked.
+;;     next park, yield or preemption, or at once if it is parked. That is an
+;;     asynchronous exception, a different thing from Thread.interrupt, which
+;;     only sets the fiber's flag and throws InterruptedException out of an
+;;     interruptible wait (a park on <!, >! or alts! is not one).
 (ns jolt.fibers)
 
 (defn spawn

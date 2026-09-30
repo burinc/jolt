@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A fiber is a virtual thread.** `Thread/currentThread` inside a fiber (an
+  `io-thread`, a `go` block on the `:fiber` backend, a `jolt.fibers/spawn`) is
+  the fiber's own `java.lang.Thread`: the same object for its whole life,
+  distinct from every other fiber's, `isVirtual` and `isDaemon` true, its own
+  `threadId`, and the empty name a JDK 21 virtual thread gets. It used to be
+  the carrier's thread, shared by every fiber on that carrier. Each fiber has
+  its own interrupt flag, so `.interrupt` throws exactly that fiber out of an
+  interruptible wait (`<!!`, `>!!`, `alts!!`, a promise or future deref,
+  `Thread.join`, `Object.wait`, `lockInterruptibly`, `Thread/sleep`) and leaves
+  every other fiber alone; it used to wake every fiber parked on the carrier and
+  let one of them take it. `Thread/sleep` on a fiber parks it with a deadline
+  and gives the carrier to other fibers, and is interruptible mid-sleep; it
+  used to sleep the carrier. `Thread/yield` on a fiber yields to the carrier's
+  other fibers.
+
+  `Thread/startVirtualThread` and `Thread/ofVirtual` (`name`, `start`,
+  `unstarted`, `factory`) start virtual threads as fibers, certified against
+  JDK 21. A `go` block on the `:fiber` backend is a virtual thread too, where
+  core.async on the JVM runs go blocks on a platform thread pool; that is
+  recorded in `known-divergences.edn`. `jolt.fibers/interrupt!` is unchanged:
+  it raises an arbitrary throwable in a fiber at its next park, which
+  `Thread.interrupt` does not.
+
 - **`java.util.concurrent.CompletableFuture`.** `(CompletableFuture.)` was "No
   matching ctor", so nothing written against the class ran. It is a Future and
   a CompletionStage now: `complete`, `completeExceptionally`, `cancel`,

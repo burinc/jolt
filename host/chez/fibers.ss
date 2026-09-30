@@ -85,8 +85,21 @@
           ;; the handler of this fiber's latest interruptible channel wait
           ;; (<!!, >!!, alts!!), or #f if it never made one — see
           ;; jolt-fiber-commit-park/ibox!
-          (mutable iwait))
-  (nongenerative jolt-fiber-v6))
+          (mutable iwait)
+          ;; A fiber is a VIRTUAL THREAD: its own interrupt flag, which every
+          ;; interruptible wait and Thread/interrupted read while it runs
+          ;; (host-static-methods.ss current-interrupt-box), and its own
+          ;; java.lang.Thread object, made the first time someone asks for it
+          ;; (java/io.ss current-thread-handle). The box is made on first use
+          ;; (jolt-fiber-ibox!), so a fiber that never meets an interruptible
+          ;; wait or its own Thread object does not carry one.
+          (mutable ibox)
+          (mutable thread)
+          ;; what a park through jolt-lock-wait is, for Thread.getState when it
+          ;; is not plain WAITING: TIMED_WAITING for a wait with a deadline,
+          ;; BLOCKED for entering a monitor. #f otherwise, cleared on the resume.
+          (mutable wstate))
+  (nongenerative jolt-fiber-v7))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -320,8 +333,8 @@
   (fields mu cv (mutable head) (mutable tail)
           (mutable sched-k) sched-slice (mutable thread) (mutable stop?)
           (mutable sm-parks) (mutable chan-parks) (mutable preempts)
-          (mutable sic) (mutable iwaits))
-  (nongenerative jolt-carrier-v5))
+          (mutable sic))
+  (nongenerative jolt-carrier-v6))
 
 ;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
 ;; parking fiber, on its own carrier's field, so no two threads touch one field.
@@ -419,7 +432,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0)))
         (set! jolt-fiber-carriers v)))
     (jolt-unlock! jolt-fiber-rr-mu)))
 
@@ -674,14 +687,28 @@
 ;; (dyn-binding-stack) for a thread today; *txn* is always #f so a child
 ;; spawned inside a dosync cannot join the parent's transaction (ref-sets into
 ;; the parent's log would be committed by the parent, not the child).
-(define (sa-fiber-spawn thunk)
+(define (sa-fiber-spawn thunk) (jolt-fiber-spawn* thunk #f #f))
+
+;; F's interrupt box, made the first time it is needed. Only F's own code or a
+;; spawn that binds a Thread object before F runs reaches here, so no two threads
+;; race to make it.
+(define (jolt-fiber-ibox! f)
+  (or (jolt-fiber-ibox f)
+      (let ((b (box #f))) (jolt-fiber-ibox-set! f b) b)))
+
+;; The same, with the fiber's interrupt box given and a hook run on the new fiber
+;; BEFORE it can run: a virtual thread started from a Thread object (java/
+;; concurrency.ss) binds that object to the fiber there, so the fiber's own
+;; Thread/currentThread can never see it unbound.
+(define (jolt-fiber-spawn* thunk ibox before-run)
   (let ((c (jolt-fiber-pick!)))
     (let ((f (make-jolt-fiber
               'ready thunk #f #f #f #f
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c #f '() 0 #f #f 0 #f)))
+              c #f '() 0 #f #f 0 #f ibox #f #f)))
+      (when before-run (before-run f))
       (jolt-fiber-enqueue! c f)
       f)))
 
@@ -965,33 +992,26 @@
 ;; wait), unless an interrupt is pending. #t when committed ('parked); #f when an
 ;; interrupt is pending, in which case nothing changed and the caller must not
 ;; park but raise (jolt-fiber-check-interrupt!) once its region is closed.
-;; The same commit for a wait a Thread.interrupt of the carrier may end (<!!, >!!,
-;; alts!!). IBOX is the carrier's interrupt box. 'interrupted when its flag was
+;; The same commit for a wait a Thread.interrupt of this FIBER may end (<!!, >!!,
+;; alts!!). IBOX is the fiber's own interrupt box. 'interrupted when its flag was
 ;; set: consumed here, and nothing committed. Read under the carrier's run-queue
-;; mutex, the lock the carrier's interrupt wake takes, so an interrupt either set
-;; the flag before this read and is seen, or wakes a fiber already 'parked. One
-;; fiber consumes it, since the carrier's fibers commit under the same mutex.
+;; mutex, the lock jolt-fiber-iwait-wake! takes, so an interrupt either set the
+;; flag before this read and is seen, or finds the fiber already 'parked and
+;; resumes it.
 ;;
-;; HOW THE INTERRUPT FINDS THE FIBER, and why it is per carrier. A fiber's
-;; interrupt identity is its carrier's box (locks.ss jolt-cv-wait-interruptibly),
-;; so the carrier registers ONE wake against that box, the first time any of its
-;; fibers waits this way, and keeps a weak set of the fibers that have. Each park
-;; only records its handler in the fiber's iwait field; a fiber joins the set on
-;; its first such wait and is never taken out, because the wake resumes only a
-;; fiber 'parked on the very handler its iwait names, and a handler belongs to one
-;; op. Registering each wait in the global registry instead put two operations on
-;; its one mutex into every park, and with two carriers ping-ponging that mutex
-;; bounced between them: an actor round trip on ensemble cost 8% more.
+;; HOW THE INTERRUPT FINDS THE FIBER. A fiber is a virtual thread with its own
+;; Thread object and flag (java/io.ss), so .interrupt knows the fiber it means and
+;; wakes it directly: the park records its handler in the fiber's iwait field, and
+;; the wake resumes the fiber only while it is 'parked on that very handler. There
+;; is no registry to add to or take out of, so the park writes one field under a
+;; mutex it already holds.
 (define (jolt-fiber-commit-park/ibox! f h ibox)
-  (let* ((c (jolt-fiber-carrier f)) (mu (jolt-carrier-mu c)))
-    (unless (jolt-carrier-iwaits c) (jolt-carrier-iwaits-init! c ibox))
+  (let ((mu (jolt-carrier-mu (jolt-fiber-carrier f))))
     (jolt-lock! mu)
     (let ((r (cond
                ((and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f))) #f)
                ((unbox ibox) (set-box! ibox #f) 'interrupted)
                (else
-                (unless (jolt-fiber-iwait f)
-                  (hashtable-set! (jolt-carrier-iwaits c) f #t))
                 (jolt-fiber-iwait-set! f h)
                 (jolt-fiber-parked-on-set! f h)
                 (jolt-fiber-state-set! f 'parked)
@@ -999,27 +1019,19 @@
       (jolt-unlock! mu)
       r)))
 
-;; Only the carrier's own thread runs its fibers, so this runs once per carrier
-;; with nothing to race; the wake reads the field after the table is in it.
-(define (jolt-carrier-iwaits-init! c ibox)
-  (let ((t (make-weak-eq-hashtable)))
-    (jolt-carrier-iwaits-set! c t)
-    (jolt-interrupt-wait-add! ibox (lambda () (jolt-carrier-interrupt-wake! c)))))
-
-;; The carrier's interrupt wake: resume every fiber parked in an interruptible
-;; wait. Each re-commits, the first reads and clears the flag and throws, and the
-;; rest park again.
-(define (jolt-carrier-interrupt-wake! c)
-  (let ((mu (jolt-carrier-mu c)))
+;; The interrupt's wake for F (java/concurrency.ss, Thread.interrupt on a virtual
+;; thread): resume F if it is parked in an interruptible channel wait. It
+;; re-commits, reads its flag and throws. A handler belongs to one op, so a wake
+;; that lands after that op ended finds parked-on and iwait disagreeing and does
+;; nothing.
+(define (jolt-fiber-iwait-wake! f)
+  (let* ((c (jolt-fiber-carrier f)) (mu (jolt-carrier-mu c)))
     (jolt-lock! mu)
-    (vector-for-each
-      (lambda (f)
-        (when (and (eq? (jolt-fiber-state f) 'parked)
-                   (jolt-fiber-iwait f)
-                   (eq? (jolt-fiber-parked-on f) (jolt-fiber-iwait f)))
-          (jolt-fiber-state-set! f 'ready)
-          (jolt-fiber-enqueue!/locked c f)))
-      (hashtable-keys (jolt-carrier-iwaits c)))
+    (when (and (eq? (jolt-fiber-state f) 'parked)
+               (jolt-fiber-iwait f)
+               (eq? (jolt-fiber-parked-on f) (jolt-fiber-iwait f)))
+      (jolt-fiber-state-set! f 'ready)
+      (jolt-fiber-enqueue!/locked c f))
     (jolt-unlock! mu)))
 
 (define (jolt-fiber-commit-park! f h)

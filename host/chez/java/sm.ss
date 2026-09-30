@@ -167,9 +167,8 @@
 ;; __sm-put!! come here, and <! / >! park exactly as before.
 ;;
 ;; The shape is Kotlin's suspendCancellableCoroutine. While the op waits, the
-;; fiber is findable from its carrier's interrupt box: the carrier's one wake
-;; resumes it while it is parked on this op's handler (fibers.ss
-;; jolt-fiber-commit-park/ibox!). The resume re-enters jolt-sm-drive, which
+;; interrupt of this fiber's Thread resumes it while it is parked on this op's
+;; handler (fibers.ss jolt-fiber-iwait-wake!). The resume re-enters jolt-sm-drive, which
 ;; finds the mailbox empty and commits to the same wait again — and that
 ;; commit reads the flag, consumes it, CLAIMS the handler so no channel
 ;; can deliver into it, takes the dead handler off the channel, and raises

@@ -1183,8 +1183,9 @@
 ;;   count  reentrancy depth for the owner
 ;;   cv     thread waiters; condition-wait releases bk atomically with blocking
 ;;   fibers parked fiber waiters, resumed by the release
-;;   box    the interrupt box of the thread the owner took it on — the THREAD
-;;          identity, which is what monitor-owner? needs when the owner is a fiber
+;;   box    the interrupt box of the OS thread the owner took it on — the THREAD
+;;          identity (current-os-thread-box, not the fiber's own box), which is
+;;          what monitor-owner? needs when the owner is a fiber
 ;;   wcv    the WAIT SET's condition — Object.wait/notify, not monitor entry
 ;;   waiters the wait set itself, FIFO. The last two are the condition-variable
 ;;          half and are documented at monitor-object-wait! below; every monitor
@@ -1242,7 +1243,7 @@
     (or (eq? owner me)
         (and (jolt-fiber? owner)
              (not (jolt-current-fiber))
-             (eq? (vector-ref m monitor-i-box) (current-interrupt-box))
+             (eq? (vector-ref m monitor-i-box) (current-os-thread-box))
              (memq (jolt-fiber-state owner) '(done dead))
              #t))))
 
@@ -1266,6 +1267,7 @@
     (if f
         (begin
           (vector-set! m monitor-i-fibers (cons f (vector-ref m monitor-i-fibers)))
+          (jolt-fiber-wstate-set! f (thread-enter-state))
           (jolt-fiber-state-set! f 'parked)
           jolt-lock-parked)
         (begin
@@ -1295,7 +1297,7 @@
                #f)
               ((not owner)
                (vector-set! m monitor-i-owner me)
-               (vector-set! m monitor-i-box (current-interrupt-box))
+               (vector-set! m monitor-i-box (current-os-thread-box))
                (vector-set! m monitor-i-count 1)
                #f)
               ;; a thread's wait ends under this same bk, so it loops HERE; a fiber
@@ -1325,7 +1327,7 @@
            #t)
           ((not owner)
            (vector-set! m monitor-i-owner me)
-           (vector-set! m monitor-i-box (current-interrupt-box))
+           (vector-set! m monitor-i-box (current-os-thread-box))
            (vector-set! m monitor-i-count 1)
            #t)
           (else #f))))))
@@ -1936,6 +1938,8 @@
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
                                                "Thread already started")))
             (vector-set! st 5 #t)  ; mark started before forking
+            (if (jthread-fiber st)
+                (start-virtual-thread! self)
             ;; born with the object's daemon flag; the object is registered as
             ;; the thread's by the parent once the fork returns (below) and by the
             ;; child as its first act, so it is what every way of asking finds
@@ -1984,7 +1988,7 @@
                         (hashtable-set! thread-priorities-by-id id (vector-ref st 9)))))
                   (jolt-with-mutex (vector-ref st 2)
                     (unless (vector-ref st 7) (vector-set! st 7 id)))
-                  (register-thread-object! id self))))
+                  (register-thread-object! id self)))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
@@ -2015,10 +2019,13 @@
         (cons "isAlive" (lambda (self) (jthread-alive? (jhost-state self))))
         ;; flag then poke, so a wait already parked on a condition this thread
         ;; registered is thrown out of it rather than merely told afterwards
+        ;; A virtual thread's fiber is also woken from a channel wait directly:
+        ;; those register nowhere (fibers.ss jolt-fiber-iwait-wake!).
         (cons "interrupt" (lambda (self . _)
-          (let ((b (vector-ref (jhost-state self) 4)))
+          (let* ((st (jhost-state self)) (b (vector-ref st 4)))
             (set-box! b #t)
-            (jolt-interrupt-wake-waits! b))
+            (jolt-interrupt-wake-waits! b)
+            (let ((f (jthread-fiber st))) (when (jolt-fiber? f) (jolt-fiber-iwait-wake! f))))
           jolt-nil))
         (cons "isInterrupted" (lambda (self) (and (unbox (vector-ref (jhost-state self) 4)) #t)))
         ;; once running, the thread's name is the id-keyed table's, which is what
@@ -2052,12 +2059,15 @@
         (cons "getPriority" (lambda (self)
           (let ((st (jhost-state self)))
             (if (jthread-id st) (jolt-thread-priority (jthread-id st)) (vector-ref st 9)))))
+        ;; a virtual thread's priority is always NORM_PRIORITY; the argument is
+        ;; still checked, and then ignored, as the JVM does
         (cons "setPriority" (lambda (self p)
           (let ((st (jhost-state self)) (p (jolt-thread-priority-arg p)))
-            (vector-set! st 9 p)
-            (when (jthread-id st) (jolt-thread-priority-set! (jthread-id st) p)))
+            (unless (jthread-fiber st)
+              (vector-set! st 9 p)
+              (when (jthread-id st) (jolt-thread-priority-set! (jthread-id st) p))))
           jolt-nil))
-        (cons "isVirtual" (lambda (self) #f))
+        (cons "isVirtual" (lambda (self) (and (jthread-fiber (jhost-state self)) #t)))
         ;; its group while it lives; nil once it has terminated, as on the JVM
         (cons "getThreadGroup" (lambda (self) (thread-group-of self)))
         ;; NEW before start, TERMINATED after; while it runs, what it is waiting in
@@ -2239,6 +2249,76 @@
 (let ((statics (list (cons "getThreadMXBean" (lambda () the-thread-mx-bean)))))
   (register-class-statics! "ManagementFactory" statics)
   (register-class-statics! "java.lang.management.ManagementFactory" statics))
+
+;; --- virtual threads --------------------------------------------------------
+;; getState for a virtual thread is its fiber's: RUNNABLE while it runs or waits
+;; for a turn, WAITING while parked, or what the park recorded (TIMED_WAITING for a
+;; wait with a deadline, BLOCKED entering a monitor). NEW and TERMINATED are the
+;; object's own, answered before the hook.
+(set! jolt-thread-state-hook
+  (lambda (th)
+    (let ((f (jthread-fiber (jhost-state th))))
+      (and (jolt-fiber? f)
+           (case (jolt-fiber-state f)
+             ((parked) (symbol->string (or (jolt-fiber-wstate f) 'WAITING)))
+             ((done dead) "TERMINATED")
+             (else "RUNNABLE"))))))
+;; A virtual thread's group while it lives, as the JVM's: "VirtualThreads", under
+;; "system".
+(define virtual-thread-group (make-thread-group "VirtualThreads" system-thread-group))
+;; A virtual thread is a fiber (fibers.ss), and its Thread object is the one
+;; Thread/currentThread answers inside it (io.ss virtual-thread-object). Its fiber
+;; slot is 'virtual on an object made by a builder and not started yet, then the fiber.
+;; The body's throw is reported as an uncaught exception, as the JVM's default
+;; handler does, and the fiber ends normally.
+(define (start-virtual-thread! obj)
+  (let* ((st (jhost-state obj))
+         (r (vector-ref st 0))
+         (thunk (lambda ()
+                  (*txn* #f)
+                  (guard (e (#t (jolt-thread-uncaught! obj e "Exception in virtual thread:\n")))
+                    (when r (jolt-invoke (runnable->thunk r))))
+                  jolt-nil)))
+    (jolt-fiber-spawn* thunk (vector-ref st 4) (lambda (f) (bind-virtual-thread! obj f)))
+    (jolt-fiber-ensure-carrier!)
+    obj))
+(define (unstarted-virtual-thread r name)
+  (let ((obj (make-thread-object r name #f #f #t 5 (box #f))))
+    (jthread-fiber-set! (jhost-state obj) 'virtual)
+    (vector-set! (jhost-state obj) 12 virtual-thread-group)
+    obj))
+;; Thread.ofVirtual(): a builder. name(String) names every thread it makes;
+;; name(prefix, start) numbers them from start. unstarted/start/factory as on the
+;; JVM. State #(name counter).
+(define (vbuilder-next-name! st)
+  (let ((n (vector-ref st 1)))
+    (if n
+        (begin (vector-set! st 1 (+ n 1))
+               (string-append (vector-ref st 0) (number->string n)))
+        (vector-ref st 0))))
+(define (vbuilder-unstarted st r) (unstarted-virtual-thread r (vbuilder-next-name! st)))
+(register-host-methods! "vthread-builder"
+  (list (cons "name" (lambda (self nm . start)
+          (let ((st (jhost-state self)))
+            (vector-set! st 0 (jolt-final-str nm))
+            (vector-set! st 1 (if (pair? start) (jnum->exact (car start)) #f)))
+          self))
+        (cons "unstarted" (lambda (self r) (vbuilder-unstarted (jhost-state self) r)))
+        (cons "start" (lambda (self r)
+          (let ((t (vbuilder-unstarted (jhost-state self) r)))
+            (vector-set! (jhost-state t) 5 #t)
+            (start-virtual-thread! t))))
+        (cons "factory" (lambda (self) (make-jhost "vthread-factory" (jhost-state self))))))
+(register-host-methods! "vthread-factory"
+  (list (cons "newThread" (lambda (self r) (vbuilder-unstarted (jhost-state self) r)))))
+(let ((statics (list (cons "ofVirtual" (lambda () (make-jhost "vthread-builder" (vector "" #f))))
+                     (cons "startVirtualThread"
+                           (lambda (r)
+                             (let ((t (unstarted-virtual-thread r "")))
+                               (vector-set! (jhost-state t) 5 #t)
+                               (start-virtual-thread! t)))))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))

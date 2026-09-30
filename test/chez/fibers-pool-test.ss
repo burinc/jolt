@@ -36,9 +36,9 @@
 ;;      finally running exactly once at the real exit — the check that
 ;;      justifies R4 keeping the park-unwinding flag in a virtual register
 ;;      (per thread) instead of a global (shared across carriers).
-;;   6. a fiber that blocks its carrier by other means (a plain Thread/sleep)
-;;      does NOT stop other carriers, and its own carrier's queued fibers DO
-;;      wait — the documented pinning behavior.
+;;   6. a fiber's Thread/sleep parks it rather than blocking its carrier:
+;;      its own carrier's queued fibers run during the nap, as a virtual
+;;      thread's carrier does.
 ;;
 ;; The gate mutates the pool size between sections via
 ;; jolt-fiber-carrier-count-set! + jolt-fiber-pool-reset! (stop threads, drop
@@ -284,14 +284,15 @@
 (ok "5. finally 1 ran exactly once" (jolt=2 (jv-nth r5 4) (jolt-vector (keyword #f "f1"))))
 (ok "5. finally 2 ran exactly once" (jolt=2 (jv-nth r5 5) (jolt-vector (keyword #f "f2"))))
 
-;; --- 6. a fiber that blocks its carrier (Thread/sleep) -----------------------
+;; --- 6. a fiber's Thread/sleep parks it (virtual-thread semantics) -----------
 ;; RR at N=2: a lands on carrier 0, b on carrier 1, c back on carrier 0 (queued
-;; behind a). a sleeps 1500 ms — blocking its OS thread — so b (other carrier)
-;; finishes long before a wakes, and c (same carrier, queued) finishes only
-;; after. Assert the ORDER in the shared log, which is causal and free of
-;; absolute timing: b before a, a before c. The bounded wait inside the body
-;; (max 7 s) fails the section cleanly if a fiber never completes.
-(printf "\n== 6. a fiber that blocks its carrier (Thread/sleep) ==\n")
+;; behind a). a sleeps 1500 ms. A fiber is a virtual thread, and a virtual
+;; thread's sleep unmounts it, so c runs on carrier 0 while a sleeps: both b and c
+;; finish before a wakes. This used to pin the opposite (the sleep held carrier 0
+;; and c waited behind it). Assert the ORDER in the shared log, which is causal
+;; and free of absolute timing. The bounded wait inside the body (max 7 s) fails
+;; the section cleanly if a fiber never completes.
+(printf "\n== 6. a fiber's Thread/sleep parks it ==\n")
 (jolt-fiber-carrier-count-set! 2)
 (jolt-fiber-pool-reset!)
 (define r6 (ev "
@@ -309,8 +310,8 @@
 (define ic6 (jv-index-of r6 (keyword #f "cdone")))
 (ok "6. the other carrier kept working (b done before a woke)"
     (and ib6 ia6 (< ib6 ia6)))
-(ok "6. the blocked carrier's queued fibers wait (c after a woke)"
-    (and ia6 ic6 (< ia6 ic6)))
+(ok "6. the sleeping fiber's carrier ran its queued fiber (c before a woke)"
+    (and ia6 ic6 (< ic6 ia6)))
 
 (printf "\nfibers-pool: ~a checks, ~a failures\n" total fails)
 (exit (if (zero? fails) 0 1))

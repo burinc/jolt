@@ -127,7 +127,22 @@
         (let ((b (box #f))) (hashtable-set! thread-boxes-by-id id b) b))))
 (define (thread-box-forget! id)
   (jolt-with-mutex thread-boxes-mu (hashtable-delete! thread-boxes-by-id id)))
+;;
+;; ON A FIBER the answer is the FIBER's box, not its carrier's. A fiber is a
+;; virtual thread: interrupting it must end its own wait and no other, and
+;; Thread/interrupted must read its own flag. The carrier is an implementation
+;; detail the fiber's code never sees, as a JVM virtual thread never sees its
+;; carrier. Slot 0 is the running fiber, or fixnum 0 on a thread and on a
+;; carrier between fibers (fibers.ss), so a thread pays one register read and a
+;; fixnum test for the check.
 (define (current-interrupt-box)
+  (let ((f (virtual-register 0)))
+    (if (fixnum? f) (current-os-thread-box) (jolt-fiber-ibox! f))))
+;; The OS THREAD's box whatever is mounted on it: the identity of the thread
+;; itself, for the few places that mean the thread and not the code running on it
+;; (a monitor's record of which thread a fiber took it on, a Thread object made
+;; for a thread by id).
+(define (current-os-thread-box)
   (let ((b (virtual-register jolt-vreg-interrupt-box)))
     (if (box? b)
         b
@@ -169,33 +184,23 @@
 ;; an interrupt; the deadline is what ends the sleep otherwise, read from the clock
 ;; by decide rather than signalled (jolt-cv-wait, host/chez/locks.ss).
 ;;
-;; A FIBER still sleeps its CARRIER, and that is deliberate rather than an omission.
-;; Thread/sleep is a user-facing request to stop a THREAD, a go block doing it stops
-;; its carrier on the JVM too, and test/chez/fibers-pool-test.ss case 6 asserts
-;; exactly that. jolt.host's jolt-pause-ms is the park-with-a-deadline for runtime
-;; code that must not take its carrier away; this is not that.
+;; A FIBER parks the same way, with the deadline registered on the timer, and gives
+;; its carrier to other fibers for the length of the nap: a fiber is a virtual
+;; thread, and a JVM virtual thread's sleep unmounts it. Interruptible mid-sleep
+;; like a thread's, through the fiber's own flag. It used to sleep the CARRIER,
+;; which stopped every other fiber placed on it for the duration and could only
+;; honour an interrupt that was already set.
 (define (jolt-thread-sleep-ms ms)
-  (let ((ms (exact (floor ms))))
-    (if (jolt-current-fiber)
-        (begin
-          ;; The ALREADY-SET half of the rule, which a bare sleep silently dropped:
-          ;; entering any interruptible op with the flag set throws without waiting,
-          ;; and a fiber reads that flag on its carrier's box like every other wait
-          ;; here. What a fiber cannot get is the other half — Chez's sleep has no
-          ;; wakeup, so an interrupt arriving DURING the nap is not seen until it
-          ;; ends. That is in known-divergences.edn rather than papered over: closing
-          ;; it means parking the fiber with a deadline, and releasing the carrier is
-          ;; the thing fibers-pool-test case 6 deliberately pins the other way.
-          (jolt-interrupt-poll-check! "sleep interrupted")
-          (sleep (make-time 'time-duration (* (remainder ms 1000) 1000000) (quotient ms 1000))))
-        (let ((mu (make-mutex)) (cv (make-condition)))
-          (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (now-millis) ms)
-            (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))))
+  (let ((ms (exact (floor ms))) (mu (make-mutex)) (cv (make-condition)))
+    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (now-millis) ms)
+      (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
     jolt-nil))
 
 (define thread-statics
   (list (cons "sleep" (lambda (ms . _) (jolt-thread-sleep-ms (jolt-need-num ms))))
-        (cons "yield" (lambda _ (thread-yield!)))
+        ;; a fiber yields to the other fibers on its carrier, as a virtual
+        ;; thread yields its carrier; not while it holds a counted lock
+        (cons "yield" (lambda _ (unless (jolt-fiber-wait-turn! 0) (thread-yield!)) jolt-nil))
         (cons "interrupted" (lambda _ (let* ((b (current-interrupt-box)) (v (unbox b)))
                                         (set-box! b #f) (and v #t))))))
 (register-class-statics! "Thread" thread-statics)

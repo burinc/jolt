@@ -2913,7 +2913,9 @@
 ;;
 ;; State (concurrency.ss reads the same slots):
 ;;   #(thunk done? mutex cond interrupt-box started? name-box thread-id daemon
-;;     priority java-id uncaught-handler thread-group)
+;;     priority java-id uncaught-handler thread-group fiber)
+;; fiber is the fiber a VIRTUAL thread's object stands for, #f for a platform
+;; thread's (virtual-thread-object below).
 ;; thread-id is the runtime's (get-thread-id) of the running thread, #f before
 ;; start; java-id is getId/threadId, assigned at construction as the JVM assigns
 ;; it, 1 for the boot thread as the JVM's main is. Once a thread runs, its name,
@@ -2929,7 +2931,37 @@
               (vector thunk #f (make-mutex) (make-condition) ibox started? (box name) tid
                       daemon priority
                       (if (eqv? tid jolt-boot-thread-id) 1 (next-java-thread-id!))
-                      #f #f)))
+                      #f #f #f)))
+;; A fiber's Thread object: a JVM virtual thread's surface. Its flag is the fiber's
+;; own box, it is a daemon, its name is the empty string a virtual thread gets when
+;; none is given, and it has no runtime thread id (slot 7 #f), since the OS thread
+;; under it changes nothing about it. It is started, and done once the fiber
+;; finishes, which is what isAlive and join read; the fiber's monitor marks it.
+;; The fiber slot's index, named: the thread object's slots are shared with
+;; concurrency.ss and grow.
+(define jthread-fiber-slot 13)
+(define (jthread-fiber st) (vector-ref st jthread-fiber-slot))
+(define (jthread-fiber-set! st f) (vector-set! st jthread-fiber-slot f))
+(define (virtual-thread-object f)
+  (let ((obj (make-thread-object #f "" #t #f #t 5 (jolt-fiber-ibox! f))))
+    (bind-virtual-thread! obj f)
+    obj))
+;; Make OBJ fiber F's Thread: the fiber slot, the fiber's field, and done when it ends.
+(define (bind-virtual-thread! obj f)
+  (let ((st (jhost-state obj)))
+    (jthread-fiber-set! st f)
+    (vector-set! st 12 virtual-thread-group)          ; its ThreadGroup (concurrency.ss)
+    (jolt-fiber-thread-set! f obj)
+    (jolt-fiber-monitor! f
+      (lambda (_err)
+        (jolt-with-mutex (vector-ref st 2)
+          (vector-set! st 1 #t)
+          (jolt-cv-wake! (vector-ref st 3)))))))
+;; The fiber's object, made once. Only the fiber's own code and whoever it hands
+;; the object to can ask, and the fiber runs on one thread at a time, so the
+;; field needs no lock when the fiber asks for itself.
+(define (fiber-thread-object f)
+  (or (jolt-fiber-thread f) (virtual-thread-object f)))
 ;; Names live in an id-keyed table for the same reason, under the handle mutex:
 ;; a thread parameter is only readable by its own thread. A thread nobody named
 ;; answers the JVM's default shape — the boot thread is "main", anything else
@@ -2994,21 +3026,29 @@
     (jolt-with-mutex thread-handles-mutex
       (or (hashtable-ref thread-handles-by-id id #f)
           (let ((obj (make-thread-object #f #f #t id #f 5
-                                         (if mine? (current-interrupt-box) (thread-box-for-id! id)))))
+                                         (if mine? (current-os-thread-box) (thread-box-for-id! id)))))
             (unless (or mine? (thread-handle-alive? id))
               (vector-set! (jhost-state obj) 1 #t))              ; already finished
             (hashtable-set! thread-handles-by-id id obj)
             obj)))))
+;; On a fiber, the FIBER's object: a fiber is a virtual thread, and its carrier is
+;; not something its code can see (the JVM hides a virtual thread's carrier the
+;; same way).
 (define (current-thread-handle)
-  (let ((c (thread-handle-cell))
-        (id (get-thread-id)))
-    (if (and (pair? c) (eqv? (car c) id))
-        (cdr c)
-        (let ((h (thread-object-for-id! id)))
-          (thread-handle-cell (cons id h))
-          h))))
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (fiber-thread-object f)
+        (let ((c (thread-handle-cell))
+              (id (get-thread-id)))
+          (if (and (pair? c) (eqv? (car c) id))
+              (cdr c)
+              (let ((h (thread-object-for-id! id)))
+                (thread-handle-cell (cons id h))
+                h))))))
 (define (thread-handle-for-id id)
-  (if (eqv? id (get-thread-id)) (current-thread-handle) (thread-object-for-id! id)))
+  (if (and (eqv? id (get-thread-id)) (not (jolt-current-fiber)))
+      (current-thread-handle)
+      (thread-object-for-id! id)))
 ;; A thread that ends: its object is no longer alive (join returns), and the
 ;; tables keyed by its id let go. The object keeps what it knew.
 (set! jolt-thread-exit-hook
