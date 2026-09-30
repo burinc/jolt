@@ -109,11 +109,12 @@
 ;; cv, releasing mu) and answers the registration to pass to the next round.
 ;;
 ;; The registration is locks.ss's jolt-cv-wait-interruptibly protocol: the waiter
-;; lists (mu . cv) against its interrupt box and re-reads the flag after, because
-;; the interrupter sets the flag BEFORE reading the registry and takes mu to wake —
-;; so it either found the entry and its broadcast waits on the mu held here, or it
-;; did not and the re-read sees its flag. It is made ONCE PER OP and kept across
-;; wakes, and the op drops it (ac-unreg!) on every way out. Made per round, it put
+;; lists (mu . cv) where its interrupt box's wake will find it and re-reads the
+;; flag after, because the interrupter sets the flag BEFORE the wake reads the
+;; entry and takes mu to wake — so it either found the entry and its broadcast
+;; waits on the mu held here, or it did not and the re-read sees its flag. It is
+;; made ONCE PER OP and kept across wakes, and the op drops it (ac-unreg!) on every
+;; way out; the listing itself is the thread's standing cell below. Made per round, it put
 ;; two operations on the registry's one global mutex into every wake, and a put to
 ;; a channel with 1000 threads blocked in <!! wakes all 1000 (the condition is a
 ;; broadcast): 2000 contended acquisitions per put, which cost a 1000-taker fan-out
@@ -121,23 +122,57 @@
 ;; mu held from that read to the next wait closes the same window the re-read does.
 ;; Threads only: a fiber never reaches these waits (the fiber ops divert first,
 ;; fibers-async.ss).
+
+;; Drop an op's registration, if it made one (REG from ac-intr-wait!, or #f/#t).
+;; A plain write: a wake that still reads the old entry broadcasts on a condition
+;; nobody it concerns is waiting on, which every waiter already survives.
+(define-syntax ac-unreg!                ; a macro: it sits on every op's exit
+  (syntax-rules () ((_ reg) (let ((r reg)) (when (vector? r) (vector-set! r 1 #f))))))
+(define-syntax ac-done                  ; (ac-done reg value): leave the op
+  (syntax-rules () ((_ reg e) (begin (ac-unreg! reg) e))))
+
 (define (ac-intr-wait! mu cv wait reg)
   (let ((b (current-interrupt-box)))
     (cond
       ((jolt-interrupt-take! b) (ac-unreg! reg) #f)
-      ((pair? reg) (wait) reg)
+      ((vector? reg) (wait) reg)
       (else
-       (let ((e (cons mu cv)))
-         (jolt-interrupt-wait-add! b e)
-         (if (jolt-interrupt-take! b)
-             (begin (jolt-interrupt-wait-remove! b e) #f)
-             (begin (wait) e)))))))
+       (let* ((cell (ac-thread-wait-cell b)) (cmu (vector-ref cell 0)))
+         ;; the entry is written and the flag re-read under the cell's mutex,
+         ;; which the wake takes to read the entry after setting the flag: one of
+         ;; the two sees the other's write
+         (jolt-lock! cmu)
+         (vector-set! cell 1 (cons mu cv))
+         (let ((set? (jolt-interrupt-take! b)))
+           (jolt-unlock! cmu)
+           (if set?
+               (begin (vector-set! cell 1 #f) #f)
+               (begin (wait) cell))))))))
 
-;; Drop an op's registration, if it made one (REG from ac-intr-wait!, or #f/#t).
-(define (ac-unreg! reg)
-  (when (pair? reg) (jolt-interrupt-wait-remove! (current-interrupt-box) reg)))
-(define-syntax ac-done                  ; (ac-done reg value): leave the op
-  (syntax-rules () ((_ reg e) (begin (ac-unreg! reg) e))))
+;; THE THREAD'S STANDING REGISTRATION. A thread waits on one channel at a time, so
+;; instead of adding and removing a registry entry per op — a global mutex and two
+;; hashtable operations, about 5% of a thread-to-thread <!!/>!! handoff — each
+;; thread registers ONE wake against its box, the first time it blocks here, and
+;; points a cell at the (mu . cv) of whatever it is waiting on now. The cell is
+;; #(mutex entry), kept in a virtual register with the box it was made for, since a
+;; thread can adopt another box (a future's worker, a Thread.). Slot 11, rt.ss's
+;; map.
+(define jolt-vreg-chan-wait 11)
+(define (ac-thread-wait-cell b)
+  (let ((v (virtual-register jolt-vreg-chan-wait)))
+    (if (and (pair? v) (eq? (car v) b))
+        (cdr v)
+        (let ((cell (vector (make-mutex) #f)))
+          (jolt-interrupt-wait-add! b
+            (lambda ()
+              (let ((cmu (vector-ref cell 0)))
+                (jolt-lock! cmu)
+                (let ((e (vector-ref cell 1)))
+                  (jolt-unlock! cmu)
+                  ;; outside the cell's mutex: the waiter takes it under mu
+                  (when e (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e))))))))
+          (set-virtual-register! jolt-vreg-chan-wait (cons b cell))
+          cell))))
 
 ;; One wait on the channel's condition: the next REG, or #f when interrupted
 ;; (INTR? only). A non-interruptible wait answers #t and never registers.
