@@ -1193,6 +1193,7 @@
     ("scheduled-executor" . "java.util.concurrent.ScheduledThreadPoolExecutor")
     ("scheduled-future" . "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask")
     ("completable-future" . "java.util.concurrent.CompletableFuture")
+    ("thread-group" . "java.lang.ThreadGroup")
     ("cf-delayed-executor" . "java.util.concurrent.CompletableFuture$DelayedExecutor")
     ("future-state" . "java.util.concurrent.Future$State")
     ("instant" . "java.time.Instant")

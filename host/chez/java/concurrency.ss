@@ -1852,8 +1852,11 @@
 ;; thread of priority 3 has priority 3.
 (define (make-jthread thunk name)
   (let ((me (get-thread-id)))
-    (make-thread-object thunk (or name (next-jthread-name)) #f #f
-                        (jolt-thread-daemon? me) (jolt-thread-priority me) (box #f))))
+    (let ((t (make-thread-object thunk (or name (next-jthread-name)) #f #f
+                                 (jolt-thread-daemon? me) (jolt-thread-priority me) (box #f))))
+      ;; its creator's group, as on the JVM
+      (vector-set! (jhost-state t) 12 (thread-group-of (current-thread-handle)))
+      t)))
 ;; slot 7: the id of the thread the start forked, #f until then. A rename needs
 ;; it to reach the id-keyed name table the handles read.
 (define (jthread-id st) (vector-ref st 7))
@@ -1876,13 +1879,24 @@
 ;; Thread(), Thread(runnable) and Thread(runnable, name) — the name argument used
 ;; to be accepted and dropped, so a thread the caller had named answered with a
 ;; generated one.
+;; The group forms too — Thread(group, target), Thread(group, target, name),
+;; Thread(group, target, name, stackSize) and Thread(group, name) — and
+;; Thread(String name), whose lone string is the name and not a target.
+(define (thread-ctor-args args)            ; -> (group target name)
+  (let* ((group (and (pair? args) (thread-group? (car args)) (car args)))
+         (rest (if group (cdr args) args))
+         (str-arg (lambda (x) (if (jolt-nil? x) #f (jolt-final-str x)))))
+    (cond ((null? rest) (list group #f #f))
+          ((string? (car rest)) (list group #f (car rest)))           ; (name)
+          (else (list group (if (jolt-nil? (car rest)) #f (car rest))
+                      (if (pair? (cdr rest)) (str-arg (cadr rest)) #f))))))
 (for-each (lambda (nm)
             (register-class-ctor! nm
               (lambda args
-                (make-jthread (if (null? args) #f (car args))
-                              (if (or (null? args) (null? (cdr args)) (jolt-nil? (cadr args)))
-                                  #f
-                                  (jolt-final-str (cadr args)))))))
+                (let* ((a (thread-ctor-args args))
+                       (t (make-jthread (cadr a) (caddr a))))
+                  (when (car a) (vector-set! (jhost-state t) 12 (car a)))
+                  t))))
           '("Thread" "java.lang.Thread"))
 (register-host-methods! "user-thread"
   ;; another thread's frames live on its own continuation, which this thread
@@ -2027,7 +2041,94 @@
             (vector-set! st 9 p)
             (when (jthread-id st) (jolt-thread-priority-set! (jthread-id st) p)))
           jolt-nil))
-        (cons "isVirtual" (lambda (self) #f))))
+        (cons "isVirtual" (lambda (self) #f))
+        ;; its group while it lives; nil once it has terminated, as on the JVM
+        (cons "getThreadGroup" (lambda (self) (thread-group-of self)))))
+
+;; --- java.lang.ThreadGroup --------------------------------------------------
+;; A minimal, consistent model: the JVM's two built-in groups, "system" and its
+;; child "main" (every thread jolt runs that no one placed elsewhere is in main,
+;; as the JVM's main thread, its pools' and its futures' threads are), groups a
+;; program makes, and a thread's membership, which a new Thread takes from its
+;; creator. activeCount counts live threads in a group and its subgroups.
+;; State: #(name parent max-priority subgroups).
+(define (make-thread-group name parent)
+  (let ((g (make-jhost "thread-group" (vector name parent 10 '()))))
+    (when parent
+      (let ((pst (jhost-state parent)))
+        (jolt-with-mutex thread-groups-mu
+          (vector-set! pst 3 (cons g (vector-ref pst 3))))))
+    g))
+(define thread-groups-mu (make-mutex))
+(define (thread-group? x) (and (jhost? x) (string=? (jhost-tag x) "thread-group")))
+(define system-thread-group (make-thread-group "system" #f))
+(define main-thread-group (make-thread-group "main" system-thread-group))
+(define (thread-group-parent g) (vector-ref (jhost-state g) 1))
+;; A thread's group: the one it was made in, main when nobody placed it, and nil
+;; once it has terminated.
+(define (thread-group-of th)
+  (let ((st (jhost-state th)))
+    (if (vector-ref st 1) jolt-nil (or (vector-ref st 12) main-thread-group))))
+(define (thread-group-within? g ancestor)
+  (let loop ((g g)) (and g (or (eq? g ancestor) (loop (thread-group-parent g))))))
+(define (live-thread-objects)
+  (let loop ((ids (cons (get-thread-id) (cons jolt-boot-thread-id (live-thread-ids)))) (seen '()) (acc '()))
+    (cond ((null? ids) acc)
+          ((memv (car ids) seen) (loop (cdr ids) seen acc))
+          (else (loop (cdr ids) (cons (car ids) seen) (cons (thread-handle-for-id (car ids)) acc))))))
+(define (thread-group-active-count g)
+  (let loop ((ts (live-thread-objects)) (n 0))
+    (if (null? ts)
+        n
+        (let ((tg (thread-group-of (car ts))))
+          (loop (cdr ts) (if (and (thread-group? tg) (thread-group-within? tg g)) (+ n 1) n))))))
+(define (thread-group-subgroups g)
+  (jolt-with-mutex thread-groups-mu (vector-ref (jhost-state g) 3)))
+(define (thread-group-group-count g)
+  (let loop ((gs (thread-group-subgroups g)) (n 0))
+    (if (null? gs) n (loop (cdr gs) (+ n 1 (thread-group-group-count (car gs)))))))
+;; ThreadGroup(name) is a child of the current thread's group; ThreadGroup(parent, name).
+(for-each (lambda (nm)
+            (register-class-ctor! nm
+              (case-lambda
+                ((name) (make-thread-group (jolt-final-str name)
+                                           (let ((g (thread-group-of (current-thread-handle))))
+                                             (if (thread-group? g) g main-thread-group))))
+                ((parent name)
+                 (unless (thread-group? parent) (throw-jvm 'NullPointerException jolt-nil))
+                 (make-thread-group (jolt-final-str name) parent)))))
+          '("ThreadGroup" "java.lang.ThreadGroup"))
+(register-host-methods! "thread-group"
+  (list (cons "getName" (lambda (self) (vector-ref (jhost-state self) 0)))
+        (cons "getParent" (lambda (self) (or (thread-group-parent self) jolt-nil)))
+        (cons "getMaxPriority" (lambda (self) (vector-ref (jhost-state self) 2)))
+        (cons "setMaxPriority" (lambda (self p)
+          (let ((n (jnum->exact p)))
+            (when (and (integer? n) (<= 1 n 10)) (vector-set! (jhost-state self) 2 n)))
+          jolt-nil))
+        ;; true of this group and of any group under it
+        (cons "parentOf" (lambda (self g) (and (thread-group? g) (thread-group-within? g self) #t)))
+        (cons "activeCount" (lambda (self) (thread-group-active-count self)))
+        (cons "activeGroupCount" (lambda (self) (thread-group-group-count self)))
+        (cons "isDaemon" (lambda (self) #f))
+        ;; a ThreadGroup is its threads' uncaught-exception handler by default
+        (cons "uncaughtException" (lambda (self th e)
+          (guard (_ (#t #f))
+            (display "Exception in Thread body:\n" (current-error-port))
+            (jolt-report-throwable e (current-error-port)))
+          jolt-nil))
+        (cons "toString" (lambda (self)
+          (string-append "java.lang.ThreadGroup[name=" (vector-ref (jhost-state self) 0)
+                         ",maxpri=" (number->string (vector-ref (jhost-state self) 2)) "]")))))
+(register-str-render! thread-group?
+  (lambda (g) (string-append "java.lang.ThreadGroup[name=" (vector-ref (jhost-state g) 0)
+                             ",maxpri=" (number->string (vector-ref (jhost-state g) 2)) "]")))
+;; Thread/activeCount: the live threads in the current thread's group.
+(let ((statics (list (cons "activeCount"
+                           (lambda () (let ((g (thread-group-of (current-thread-handle))))
+                                        (if (thread-group? g) (thread-group-active-count g) 0)))))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))

@@ -80,6 +80,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `put!`/`take!` callbacks, `core.async`'s mixed and compute executors and
   the io poller run on daemon threads, so none of them holds the process up.
 
+### Added
+
+- **`java.lang.ThreadGroup` and `Thread.getThreadGroup`.** A minimal model of
+  the JVM's: the built-in `system` group and its child `main`, which every
+  thread is in unless placed elsewhere (as the JVM's main thread, its pools'
+  and its futures' threads are); `(ThreadGroup. name)` and
+  `(ThreadGroup. parent name)`; the `Thread` constructors that take a group;
+  a new `Thread` in its creator's group; `getName`, `getParent`, `parentOf`,
+  `activeCount` (live threads in the group and its subgroups),
+  `activeGroupCount`, `getMaxPriority`; `Thread/activeCount`; and
+  `getThreadGroup` answering nil once a thread has terminated.
+  `(Thread. "name")` now takes its string as the name rather than as a target.
+
 ### Fixed
 
 - **`cancel(true)` interrupts the task it cancels.** On an executor's future

@@ -2913,7 +2913,7 @@
 ;;
 ;; State (concurrency.ss reads the same slots):
 ;;   #(thunk done? mutex cond interrupt-box started? name-box thread-id daemon
-;;     priority java-id)
+;;     priority java-id uncaught-handler thread-group)
 ;; thread-id is the runtime's (get-thread-id) of the running thread, #f before
 ;; start; java-id is getId/threadId, assigned at construction as the JVM assigns
 ;; it, 1 for the boot thread as the JVM's main is. Once a thread runs, its name,
@@ -2928,7 +2928,8 @@
   (make-jhost "user-thread"
               (vector thunk #f (make-mutex) (make-condition) ibox started? (box name) tid
                       daemon priority
-                      (if (eqv? tid jolt-boot-thread-id) 1 (next-java-thread-id!)))))
+                      (if (eqv? tid jolt-boot-thread-id) 1 (next-java-thread-id!))
+                      #f #f)))
 ;; Names live in an id-keyed table for the same reason, under the handle mutex:
 ;; a thread parameter is only readable by its own thread. A thread nobody named
 ;; answers the JVM's default shape — the boot thread is "main", anything else
