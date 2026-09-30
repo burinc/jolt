@@ -164,6 +164,48 @@ EOF
   rm -rf "$app/.jolt"
 fi
 
+# --- a :static-only spec loads nothing while the build runs ------------------
+# The build resolves a :static native through the preloaded archive. Loading the
+# project's natives into the build process derived conventional shared-object
+# names from the spec's :name ("greet" -> libgreet.dylib) for a spec that
+# declares no candidates, :static ones included — so whatever the loader found
+# under that name answered the build's calls instead of the archive being
+# linked, and for {:name "crypto"} on macOS the loader found Apple's
+# libcrypto.dylib, which aborts the process that opens it. A decoy libgreet on
+# the loader's path answers 99 where the archive answers 42; a macro calls the
+# native while the build runs and bakes the answer in.
+cc -c "$work/greet.c" -o "$work/greet.o" && ar rcs "$work/libgreet.a" "$work/greet.o"
+mkdir -p "$work/decoy"
+printf 'int jolt_static_answer(void) { return 99; }\n' > "$work/decoy.c"
+cc $shared "$work/decoy.c" -o "$work/decoy/libgreet.$soext"
+cat > "$app/deps.edn" <<EOF
+{:paths ["src"]
+ :jolt/native [{:name "greet" :static {:archive "$work/libgreet.a"}}]}
+EOF
+cp "$app/src/app/core.clj" "$work/core.clj.saved"
+cat > "$app/src/app/core.clj" <<'EOF'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn answer "jolt_static_answer" [] :int)
+(defmacro answer-while-building [] (answer))
+(defn -main [& _]
+  (println "answer:" (answer) (answer-while-building)))
+EOF
+rm -rf "$app/.jolt" "$out.build"
+echo "static-native smoke: building (a :static-only spec with a same-named shared object on the loader path)"
+if ! DYLD_LIBRARY_PATH="$work/decoy" LD_LIBRARY_PATH="$work/decoy" JOLT_PWD="$app" \
+     "$jolt" build -m app.core -o "$out" >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build with a decoy shared object exited non-zero"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42 42" ]; then
+  echo "  FAIL: the build resolved a :static native through a derived shared-object name"
+  echo "--- want ---"; echo "answer: 42 42"; echo "--- got ----"; echo "$got"; exit 1
+fi
+cp "$work/core.clj.saved" "$app/src/app/core.clj"
+rm -rf "$app/.jolt" "$work/decoy"
+
 # --- one archive calling into another (jolt-lang/jolt#1205) ------------------
 # libssl.a calls into libcrypto.a; here libdep.a calls into libbase.a, and the
 # dependent one is declared FIRST. The namespace calls it while it loads, so the

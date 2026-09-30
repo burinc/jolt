@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `:static` native no longer loads a shared object by its name.** For a
+  `:jolt/native` spec that declares no candidates for the platform, `jolt run`
+  and `jolt build` try the conventional names of its `:name`
+  (`libcrypto.dylib` for `"crypto"`) — for `:static` specs too, whose symbols
+  come from their archive. Whatever the loader found then answered the build's
+  calls in place of the archive, and for `{:name "crypto" :static …}` on macOS
+  it found Apple's `libcrypto.dylib`, which aborts the process. A `:static`
+  spec now loads only the candidates it declares.
 - **`clojure.java.io` takes a socket's streams.** `io/reader`, `io/writer`,
   `io/input-stream`, `io/output-stream`, `io/copy`, `slurp` and `spit` all
   raised "Cannot open" over a `Socket`'s `getInputStream` or
