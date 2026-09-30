@@ -104,6 +104,38 @@
          (slurp (java.net.URL. (str "jar:" (.toURI (io/file jar-path)) "!/data.txt")))
          "in-jar"))
 
+;; --- #1203: jolt.loader opens a file: resource hit -------------------------------
+;; The loader stripped "file:" with (subs url 5), so the drive form a resource
+;; URL has on Windows, file:/C:/…, became /C:/… and could not be opened; on every
+;; platform a %hh escape or a localhost authority was left in the path. A hit's
+;; URL is the JDK's spelling: absolute, the drive behind a "/", escaped.
+(require '[jolt.loader :as jl])
+(let [d (under "res dir")
+      f (str d "/r.txt")
+      abs (str (fs/absolutize f))
+      uri (str (.toURI (io/file abs)))
+      slashed (str/replace abs "\\" "/")
+      url-path (if windows? (str "/" slashed) slashed)
+      located (fn [url] (jl/->loader (fn [req] (when (= :resource (:kind req))
+                                                 {:kind :resource :url url}))))]
+  (fs/create-dirs d)
+  (spit f "resource")
+  (doseq [[label url] [["an escaped file: URI" uri]
+                       ["a localhost authority" (str "file://localhost" url-path)]
+                       ["an empty authority" (str "file://" url-path)]
+                       ["the unescaped spelling" (str "file:" url-path)]]]
+    (let [l (located url)
+          hit (first (jl/find l {:kind :resource :name "r.txt"}))]
+      (check (str "#1203 open-hit: " label) (slurp (jl/open-hit l hit)) "resource")
+      (check (str "#1203 getResource: " label)
+             (slurp (.getResource (jl/as-classloader l) "r.txt")) "resource")))
+  (let [l (jl/classpath [d])
+        hit (first (jl/find l {:kind :resource :name "r.txt"}))]
+    (check "#1203 a classpath root's hit is the JDK's URL" (:url hit) uri)
+    (check "#1203 ...and opens" (slurp (jl/open-hit l hit)) "resource")
+    (check "#1203 ...and getResource answers the same URL"
+           (str (.getResource (jl/as-classloader l) "r.txt")) uri)))
+
 ;; --- #1119: last-modified time ---------------------------------------------------
 (let [d (under "lock")
       now (System/currentTimeMillis)]

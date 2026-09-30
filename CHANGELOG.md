@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jolt.loader` opens `file:` resource hits on Windows.** It dropped the
+  scheme with `(subs url 5)`, so a resource's `file:/C:/proj/…` became
+  `/C:/proj/…`, which Windows reads as a path on the current drive; on every
+  platform a `%20` escape or a `localhost` authority stayed in the path. The
+  path is now read through `clojure.java.io`'s `file:` URL handling. A
+  classpath root's hit carries the URL the JDK's classloader would
+  (`File.toURI`: `file:/C:/…`, escaped) instead of `file:C:/…` with the name
+  unescaped (#1203).
 - **`jolt build` creates a missing output directory from a Windows path.** The
   walk that creates `<out>.build` (and the AOT cache's directories) took a
   path's parent by splitting on `/` only, so `C:\proj\out\app.exe` had no
