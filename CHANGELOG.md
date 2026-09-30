@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both separators and stops at a drive or UNC root. A bare-name `JOLT_CHEZ`
   (`scheme`, found on `PATH`) no longer fails the same way when `build.ss`
   loads (#1207).
+- **`:static` archives that call into each other build.** To let the app's
+  foreign calls resolve while it builds, each `:static {:archive …}` native was
+  turned into a throwaway shared object of its own, so one archive calling into
+  another (OpenSSL's `libssl.a` into `libcrypto.a`) was left with undefined
+  references: Windows refused to load it, and so did macOS and Linux whenever
+  the dependent archive was declared first. The build now makes one object from
+  all of the app's archives. An archive that is not position-independent is
+  still skipped with a warning without affecting the rest, and an archive two
+  natives name is linked once (#1205).
 
 ## [0.8.15] - 2026-09-29
 

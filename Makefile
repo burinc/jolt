@@ -1385,9 +1385,11 @@ vfaslceiling:
 buildscaling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/build-scaling-test.ss
 
-# The directories `jolt build` creates, and the Chez it runs (#1207):
-# bld-mkdir-p ends its walk at a root instead of recursing with #f, and build.ss
-# loads under a bare-name JOLT_CHEZ. The Windows path spellings are winpath's.
+# The build driver's :static native plumbing below `jolt build` (#1205, #1207):
+# the build-time preload resolves one archive against another (one object from
+# all of them, a dependent archive first here), a non-PIC archive in the set is
+# skipped on its own, the same archive is linked once, bld-mkdir-p ends its walk
+# at a root, and build.ss loads under a bare-name JOLT_CHEZ.
 buildnatives:
 	@$(CHEZ) --script test/chez/build-natives-test.ss
 

@@ -164,6 +164,49 @@ EOF
   rm -rf "$app/.jolt"
 fi
 
+# --- one archive calling into another (jolt-lang/jolt#1205) ------------------
+# libssl.a calls into libcrypto.a; here libdep.a calls into libbase.a, and the
+# dependent one is declared FIRST. The namespace calls it while it loads, so the
+# build process itself has to resolve it — which it could not while each archive
+# was preloaded as a shared object of its own: the dependent one's reference to
+# the other stayed undefined and its load was refused.
+cat > "$work/base.c" <<'EOF'
+int jolt_static_base(void) { return 40; }
+EOF
+cat > "$work/dep.c" <<'EOF'
+int jolt_static_base(void);
+int jolt_static_dep(void) { return jolt_static_base() + 2; }
+EOF
+cc -fPIC -c "$work/base.c" -o "$work/base.o" && ar rcs "$work/libbase.a" "$work/base.o"
+cc -fPIC -c "$work/dep.c" -o "$work/dep.o" && ar rcs "$work/libdep.a" "$work/dep.o"
+cat > "$app/deps.edn" <<EOF
+{:paths ["src"]
+ :jolt/native [{:name "dep"  :static {:archive "$work/libdep.a"}}
+               {:name "base" :static {:archive "$work/libbase.a"}}]}
+EOF
+cp "$app/src/app/core.clj" "$work/core.clj.saved"
+cat > "$app/src/app/core.clj" <<'EOF'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn dep-answer "jolt_static_dep" [] :int)
+(def at-load (dep-answer))
+(defn -main [& _]
+  (println "answer:" at-load (dep-answer)))
+EOF
+rm -rf "$app/.jolt" "$out.build"
+echo "static-native smoke: building (an archive that calls into another)"
+if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build with dependent static archives exited non-zero (jolt#1205)"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42 42" ]; then
+  echo "  FAIL: dependent static archives binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+cp "$work/core.clj.saved" "$app/src/app/core.clj"
+rm -rf "$app/.jolt"
+
 # --- --dynamic: runtime load ------------------------------------------------
 # Rebuild the shared object (static phase deleted it) and give the spec a runtime
 # candidate; --dynamic loads it at startup instead of linking the archive.
@@ -323,4 +366,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + non-PIC archive + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"

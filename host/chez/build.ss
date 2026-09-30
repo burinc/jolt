@@ -1272,6 +1272,19 @@
            (put-string out (string-append "(jolt-build-load-native (list " cand-lits ") #t #f)\n"))))))
     (seq->list natives)))
 
+;; The "static" natives' link forms, each once. The same archive named by two
+;; specs would otherwise be force-loaded twice, which is a duplicate definition of
+;; every symbol in it.
+(define (bld-static-forms natives)
+  (let loop ((es (seq->list natives)) (acc '()))
+    (if (null? es)
+        (reverse acc)
+        (let ((parts (bld-strs (car es))))
+          (loop (cdr es)
+                (if (and (string=? (car parts) "static") (not (member (cdr parts) acc)))
+                    (cons (cdr parts) acc)
+                    acc))))))
+
 ;; The cc link fragment for the "static" natives: each archive must be FORCE-loaded
 ;; (the linker would otherwise drop an archive member main.c never references) and,
 ;; on Linux, the executable's symbols exported into the dynamic table so the
@@ -1280,55 +1293,75 @@
 ;; is statically linked. Entry forms: ["static" "archive" path] | ["static" "lib"
 ;; name libdir].
 (define (bld-native-link-flags natives)
-  (fold-left
-    (lambda (acc entry)
-      (let ((parts (bld-strs entry)))
-        (if (string=? (car parts) "static")
-            (string-append acc " " (bld-one-static-link (cdr parts)))
-            acc)))
-    "" (seq->list natives)))
+  (fold-left (lambda (acc form) (string-append acc " " (bld-one-static-link form)))
+             "" (bld-static-forms natives)))
 
 ;; A statically-linked native is only in the OUTPUT binary, but build step 1
 ;; evaluates the app's `foreign-procedure` forms in THIS process (to register its
-;; macros/vars), and Chez resolves a foreign entry eagerly. So make the archive's
-;; symbols resolvable here: build a throwaway shared object from it (force-loading
-;; every member) and load it. The output binary still cc-links the static archive;
-;; this temp .so is build-time only. Only the "archive" form is preloaded — the
-;; "lib" form names a system library the OS loader already finds by soname.
+;; macros/vars), and Chez resolves a foreign entry eagerly. So make the archives'
+;; symbols resolvable here: build a throwaway shared object from them (force-
+;; loading every member) and load it. The output binary still cc-links the static
+;; archives; this temp object is build-time only. Only the "archive" form is
+;; preloaded — the "lib" form names a system library the OS loader already finds
+;; by soname.
 ;;
-;; An archive compiled without -fPIC cannot become a shared object at all — no
-;; linker flag makes an absolute relocation work in a library the loader may map
-;; anywhere — so that one is skipped rather than fatal (jolt#1060). The binary's
-;; own link still gets it (a non-PIE executable, see bld-link-executable); what
-;; is lost is only build-time resolution, which matters when a macro or a
-;; top-level form CALLS the native while the build runs. The same hole the
-;; ["static" "lib" …] form has always had, and the warning says so.
+;; ONE object from every archive, not one per archive (jolt-lang/jolt#1205): an
+;; archive that calls into another — libssl.a into libcrypto.a — must resolve
+;; against it the way it will in the binary. Built alone, its references to the
+;; other were left undefined; a PE loader cannot bind those at all, and an ELF or
+;; Mach-O loader binding at load time refuses the object whenever the dependent
+;; archive happened to load first.
+;;
+;; An archive compiled without -fPIC cannot become part of a shared object at all
+;; — no linker flag makes an absolute relocation work in a library the loader may
+;; map anywhere — so that one is left out rather than fatal (jolt#1060). The
+;; binary's own link still gets it (a non-PIE executable, see
+;; bld-link-executable); what is lost is only build-time resolution, which
+;; matters when a macro or a top-level form CALLS the native while the build
+;; runs. The same hole the ["static" "lib" …] form has always had, and the
+;; warning says so. The combined link names no culprit, so when it fails that way
+;; each archive is linked alone to find the ones that are not position-
+;; independent, and the object is rebuilt from the rest.
+(define (bld-preload-link-cmd archives so)
+  (let ((qs (apply string-append (map (lambda (a) (string-append " " (bld-sh-quote a))) archives))))
+    (if bld-osx?
+        (string-append (bld-cc) " -dynamiclib -undefined dynamic_lookup -Wl,-all_load" qs
+                       " -o " (bld-sh-quote so))
+        (string-append (bld-cc) " -shared -Wl,--whole-archive" qs " -Wl,--no-whole-archive"
+                       " -Wl,--unresolved-symbols=ignore-all -o " (bld-sh-quote so)))))
+
+(define (bld-preload-so builddir name)
+  (string-append builddir "/" name (if bld-osx? ".dylib" ".so")))
+
+(define (bld-warn-not-pic archive)
+  (display (string-append
+             "jolt build: warning: " archive " is not position-independent, so its\n"
+             "  symbols cannot be resolved while the build runs (it is still linked into\n"
+             "  the binary). Compile it with -fPIC if the build itself has to call it.\n")))
+
 (define (bld-preload-static-natives! natives builddir)
-  (let ((n 0))
-    (for-each
-      (lambda (entry)
-        (let ((parts (bld-strs entry)))
-          (when (and (string=? (car parts) "static") (string=? (cadr parts) "archive"))
-            (let* ((archive (caddr parts))
-                   (so (string-append builddir "/native-" (number->string n)
-                                      (if bld-osx? ".dylib" ".so")))
-                   (log (string-append so ".log"))
-                   (cmd (if bld-osx?
-                            (string-append "cc -dynamiclib -undefined dynamic_lookup -Wl,-all_load '"
-                                           archive "' -o '" so "'")
-                            (string-append "cc -shared -Wl,--whole-archive '" archive
-                                           "' -Wl,--no-whole-archive -Wl,--unresolved-symbols=ignore-all -o '" so "'"))))
-              (set! n (+ n 1))
-              (let ((rc (bld-system->log cmd log)))
-                (cond
-                  ((zero? rc) (bld-echo-log log) (sa-load-shared-object so))
-                  ((bld-pie-relocation-error? (bld-log-string log))
-                   (display (string-append
-                              "jolt build: warning: " archive " is not position-independent, so its\n"
-                              "  symbols cannot be resolved while the build runs (it is still linked into\n"
-                              "  the binary). Compile it with -fPIC if the build itself has to call it.\n")))
-                  (else (bld-echo-log log) (bld-command-failed rc cmd))))))))
-      (seq->list natives))))
+  (let loop ((archives (map cadr (filter (lambda (f) (string=? (car f) "archive"))
+                                         (bld-static-forms natives)))))
+    (unless (null? archives)
+      (let* ((so (bld-preload-so builddir "native-static"))
+             (log (string-append so ".log"))
+             (cmd (bld-preload-link-cmd archives so))
+             (rc (bld-system->log cmd log)))
+        (cond
+          ((zero? rc) (bld-echo-log log) (sa-load-shared-object so))
+          ((bld-pie-relocation-error? (bld-log-string log))
+           (let ((not-pic
+                   (filter (lambda (a)
+                             (let* ((probe (bld-preload-so builddir "native-probe"))
+                                    (plog (string-append probe ".log")))
+                               (and (not (zero? (bld-system->log (bld-preload-link-cmd (list a) probe) plog)))
+                                    (bld-pie-relocation-error? (bld-log-string plog)))))
+                           archives)))
+             (when (null? not-pic)
+               (bld-echo-log log) (bld-command-failed rc cmd))
+             (for-each bld-warn-not-pic not-pic)
+             (loop (filter (lambda (a) (not (member a not-pic))) archives))))
+          (else (bld-echo-log log) (bld-command-failed rc cmd)))))))
 
 (define (bld-one-static-link form)
   (let ((kind (car form)))
