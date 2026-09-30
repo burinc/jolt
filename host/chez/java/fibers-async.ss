@@ -224,11 +224,12 @@
 ;; With a box the answer is #f when the wait was interrupted through it: the flag
 ;; is consumed and the handler CLAIMED, so no channel can deliver into it and the
 ;; caller throws InterruptedException. This is the fiber half of
-;; jolt-cv-wait-interruptibly's protocol (locks.ss), on the handler's own (wmu .
-;; wcv): the entry is registered against the box, and the flag is read under wmu
-;; right before each commit, the same wmu the interrupter's wake takes — so an
-;; interrupt either lands before the read and is seen, or finds the fiber listed
-;; on wcv and resumes it, and the resumed round reads it. Several fibers on one
+;; jolt-cv-wait-interruptibly's protocol (locks.ss): the carrier's one wake is
+;; listed against the box, and the flag is read at each commit under the carrier's
+;; run-queue mutex, the lock that wake takes (fibers.ss
+;; jolt-fiber-commit-park/ibox!) — so an interrupt either lands before the read and
+;; is seen, or finds the fiber 'parked and resumes it, and the resumed round reads
+;; it. Several fibers on one
 ;; carrier are all woken and the first to read the flag consumes it; the rest park
 ;; again (known-divergences.edn, the fiber-sharing-a-carrier entry).
 ;;
@@ -243,10 +244,8 @@
     ;; the take/put ops checked before registering; alts! registers its shared
     ;; handler in async.ss and arrives here first
     (jolt-fiber-may-park! 'jolt-fiber-waiter-wait!)
-    (let* ((wmu (alt-handler-wmu h)) (wcv (alt-handler-wcv h))
-           (mb (alt-handler-mailbox h))
-           (entry (and ibox (cons wmu wcv))))
-      (when entry (jolt-interrupt-wait-add! ibox entry))
+    (let* ((wmu (alt-handler-wmu h))
+           (mb (alt-handler-mailbox h)))
       ;; Commit and park are ONE region with interrupts disabled — see
       ;; jolt-sm-commit!. The park records the depth (swish's pcb-sic) and the
       ;; resume is restored to it, so the resumed path must NOT enable again; only
@@ -258,17 +257,12 @@
                       (jolt-with-mutex wmu
                         (cond
                           ((vector-ref mb 0) #f)
-                          ;; read AND cleared here, under wmu, so no other fiber on
-                          ;; this carrier can consume the same interrupt
-                          ((and ibox (jolt-interrupt-take! ibox)) 'interrupted)
-                          (else
-                           ;; listed on wcv for the interrupter's wake; taken off
-                           ;; again below, whichever way the wait ends
-                           (when ibox (jolt-cv-register! wcv f))
-                           ;; #f too when an interrupt is pending (fibers.ss): then
-                           ;; the wait is abandoned, and claimed below so no value
-                           ;; lands in it
-                           (jolt-fiber-commit-park! f h))))))
+                          ;; #f too when an interrupt is pending (fibers.ss): then
+                          ;; the wait is abandoned, and claimed below so no value
+                          ;; lands in it. With a box, 'interrupted when its flag was
+                          ;; set, read and cleared under the carrier's mutex.
+                          (ibox (jolt-fiber-commit-park/ibox! f h ibox))
+                          (else (jolt-fiber-commit-park! f h))))))
                  (cond
                    ((eq? park? 'interrupted) #t)
                    (else
@@ -291,9 +285,6 @@
         ;; same enable the no-park path does.
         (enable-interrupts)
         (jolt-fiber-parked-on-set! f #f)
-        (when entry
-          (jolt-interrupt-wait-remove! ibox entry)
-          (jolt-with-mutex wmu (jolt-cv-unregister! wcv f)))
         (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
           ;; the wait is over either way: a value already in the mailbox was taken
           ;; by a fiber that is dying, and an empty one must never be filled

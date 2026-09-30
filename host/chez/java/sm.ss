@@ -167,12 +167,11 @@
 ;; __sm-put!! come here, and <! / >! park exactly as before.
 ;;
 ;; The shape is Kotlin's suspendCancellableCoroutine. While the op waits, the
-;; fiber is listed against its carrier's interrupt box by a wake procedure, which
-;; the interrupter calls (locks.ss jolt-interrupt-wake-waits!) and which resumes
-;; the fiber under the handler's wmu while the wait is still live. The resume
-;; re-enters jolt-sm-drive, which finds the mailbox empty and commits to the same
-;; wait again — and that
-;; commit reads the flag under wmu, consumes it, CLAIMS the handler so no channel
+;; fiber is findable from its carrier's interrupt box: the carrier's one wake
+;; resumes it while it is parked on this op's handler (fibers.ss
+;; jolt-fiber-commit-park/ibox!). The resume re-enters jolt-sm-drive, which
+;; finds the mailbox empty and commits to the same wait again — and that
+;; commit reads the flag, consumes it, CLAIMS the handler so no channel
 ;; can deliver into it, takes the dead handler off the channel, and raises
 ;; InterruptedException from inside the driver. If the claim is lost, a delivery
 ;; is already under way: the flag is put back and the wait finishes with that
@@ -194,52 +193,24 @@
 ;; handler reports it and closes the result channel — exactly what the capture
 ;; path's go-spawn guard does with the same InterruptedException.
 (define-record-type sm-wait
-  (fields (mutable step) h ch put? ibox (mutable entry))
-  (nongenerative sm-wait-v1))
-
-;; The wait's registry entry. It resumes the fiber only while ENTRY is still set,
-;; read under wmu, and the release below clears it under the same wmu: so an
-;; interrupter that read the registry just before the wait ended finds it over and
-;; does nothing, rather than resuming a fiber that has since parked on something
-;; else. A resume that lands while the fiber is not 'parked is a no-op anyway
-;; (sa-fiber-resume), and the commit reads the flag under wmu after listing, so a
-;; wake cannot be lost between them.
-(define (jolt-sm-wait-waker f w)
-  (lambda ()
-    (jolt-with-mutex (alt-handler-wmu (sm-wait-h w))
-      (when (sm-wait-entry w) (sa-fiber-resume f)))))
-
-;; Undo the wait's interrupt registration. Idempotent.
-(define (jolt-sm-wait-release! f w)
-  (let ((e (sm-wait-entry w)))
-    (when e
-      (let ((wmu (alt-handler-wmu (sm-wait-h w))))
-        (jolt-lock! wmu) (sm-wait-entry-set! w #f) (jolt-unlock! wmu))
-      (jolt-interrupt-wait-remove! (sm-wait-ibox w) e))))
+  (fields step h ch put? ibox)
+  (nongenerative sm-wait-v2))
 
 ;; jolt-sm-commit! with the interrupt arm. W holds the step to resume with.
 (define (jolt-sm-commit!/intr f w)
   (jolt-fiber-may-park! 'jolt-sm-commit!)
   (let* ((h (sm-wait-h w)) (wmu (alt-handler-wmu h))
          (ibox (sm-wait-ibox w)))
-    ;; listed once per op; kept across wakes and dropped as the op ends
-    (unless (sm-wait-entry w)
-      (let ((e (jolt-sm-wait-waker f w)))
-        ;; no lock: nothing can reach the waker until the add publishes it
-        (sm-wait-entry-set! w e)
-        (jolt-interrupt-wait-add! ibox e)))
     (disable-interrupts)
     (let ((park? (jolt-with-mutex wmu
                    (cond
                      ((vector-ref (alt-handler-mailbox h) 0) #f)
-                     ;; read AND cleared under wmu, so no other fiber on this
-                     ;; carrier can consume the same interrupt
-                     ((jolt-interrupt-take! ibox) 'interrupted)
-                     (else (jolt-fiber-commit-park! f h))))))
+                     ;; 'interrupted when the flag was set, read and cleared
+                     ;; under the carrier's mutex (fibers.ss)
+                     (else (jolt-fiber-commit-park/ibox! f h ibox))))))
       (cond
         ((eq? park? 'interrupted)
          (enable-interrupts)
-         (jolt-sm-wait-release! f w)
          (if (alt-claim! h)
              (begin
                (jolt-fiber-drop-waiter! (sm-wait-ch w) h (sm-wait-put? w))
@@ -251,12 +222,10 @@
         ;; a fiber interrupt is pending (fibers.ss), as in jolt-sm-commit!
         ((and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
          (enable-interrupts)
-         (jolt-sm-wait-release! f w)
          (alt-claim! h)
          (jolt-fiber-check-interrupt! f))
         (else
          (enable-interrupts)
-         (jolt-sm-wait-release! f w)
          ((sm-wait-step w)))))))
 
 ;; --- the driver -------------------------------------------------------------
@@ -297,9 +266,7 @@
             ;; reads the mailbox the wake left empty, and the wait is claimed
             ;; first so no value lands in it after the fiber is gone
             (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
-              (alt-claim! h)
-              (let ((w (jolt-fiber-sm f)))
-                (when (sm-wait? w) (jolt-sm-wait-release! f w)))))
+              (alt-claim! h)))
           (jolt-fiber-check-interrupt! f)
           (let ((step (jolt-fiber-sm f)))
             ;; 'running marks "a driver is on the stack" — see jolt-sm-park!
@@ -313,9 +280,7 @@
                (if (sm-wait? step)
                    (jolt-sm-commit!/intr f step)
                    (jolt-sm-commit! f h step)))
-              ((sm-wait? step)
-               (jolt-sm-wait-release! f step)
-               ((sm-wait-step step)))
+              ((sm-wait? step) ((sm-wait-step step)))
               ((procedure? step) (step))
               (else (jolt-invoke body-fn (lambda (v) (jolt-sm-finish! w f v)))))))))))
 
@@ -393,7 +358,7 @@
 ;; Park on handler H, cheaply; interruptibly when INTR?.
 (define (jolt-sm-park-on! f h ch put? intr? resume)
   (if intr?
-      (jolt-sm-commit!/intr f (make-sm-wait resume h ch put? (current-interrupt-box) #f))
+      (jolt-sm-commit!/intr f (make-sm-wait resume h ch put? (current-interrupt-box)))
       (jolt-sm-commit! f h resume)))
 
 (define (jolt-sm-fiber-take f ch k intr?)
