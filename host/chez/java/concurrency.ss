@@ -1258,8 +1258,15 @@
           (jolt-fiber-state-set! f 'parked)
           jolt-lock-parked)
         (begin
-          (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))
+          ;; BLOCKED, as the JVM reports a thread entering a monitor; a
+          ;; ReentrantLock's acquire says WAITING instead (thread-enter-state)
+          (call-with-thread-state (thread-enter-state)
+            (lambda ()
+              (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))))
           #f))))
+;; What a thread waiting in monitor-wait! is: BLOCKED for a monitor (locking), and
+;; WAITING for a ReentrantLock, which parks on the JVM rather than blocking.
+(define thread-enter-state (make-thread-parameter 'BLOCKED))
 
 ;; The decision is made under bk; a fiber's SWITCH is made outside it, and then the
 ;; whole decision is retaken, because a resume says only that something changed. All
@@ -2042,6 +2049,17 @@
         (cons "isVirtual" (lambda (self) #f))
         ;; its group while it lives; nil once it has terminated, as on the JVM
         (cons "getThreadGroup" (lambda (self) (thread-group-of self)))
+        ;; NEW before start, TERMINATED after; while it runs, what it is waiting in
+        ;; (locks.ss records it), else RUNNABLE. A thread object the fiber layer
+        ;; answers for (jolt-thread-state-hook) reports what that says.
+        (cons "getState" (lambda (self)
+          (let ((st (jhost-state self)))
+            (thread-state-constant
+              (cond ((not (vector-ref st 5)) "NEW")
+                    ((vector-ref st 1) "TERMINATED")
+                    ((jolt-thread-state-hook self) => values)
+                    (else (let ((w (and (jthread-id st) (thread-wait-state (jthread-id st)))))
+                            (if w (symbol->string w) "RUNNABLE"))))))))
         (cons "setUncaughtExceptionHandler" (lambda (self h)
           (vector-set! (jhost-state self) 11 (if (jolt-nil? h) #f h))
           jolt-nil))
@@ -2157,6 +2175,37 @@
                                         (if (thread-group? g) (thread-group-active-count g) 0)))))))
   (register-class-statics! "Thread" statics)
   (register-class-statics! "java.lang.Thread" statics))
+
+;; --- java.lang.Thread$State --------------------------------------------------
+;; The enum getState answers, one object per constant so = compares them.
+(define thread-state-names '("NEW" "RUNNABLE" "BLOCKED" "WAITING" "TIMED_WAITING" "TERMINATED"))
+(define thread-state-constants
+  (map (lambda (nm) (cons nm (make-jhost "thread-state" nm))) thread-state-names))
+(define (thread-state-constant nm) (cdr (assoc nm thread-state-constants)))
+;; For a thread the runtime does not track by id — a fiber's own Thread object —
+;; the fiber layer answers its state name here ("WAITING" while it is parked, say),
+;; or #f to fall through to the OS-thread answer.
+(define jolt-thread-state-hook (lambda (th) #f))
+(let ((statics (append thread-state-constants
+                       (list (cons "values" (lambda () (apply jolt-vector (map cdr thread-state-constants))))
+                             (cons "valueOf"
+                                   (lambda (nm)
+                                     (let ((hit (assoc (jolt-final-str nm) thread-state-constants)))
+                                       (if hit
+                                           (cdr hit)
+                                           (throw-jvm 'IllegalArgumentException
+                                                      (string-append "No enum constant java.lang.Thread.State."
+                                                                     (jolt-final-str nm)))))))))))
+  (register-class-statics! "java.lang.Thread$State" statics)
+  (register-class-statics! "Thread$State" statics))
+(register-host-methods! "thread-state"
+  (list (cons "name" (lambda (self) (jhost-state self)))
+        (cons "toString" (lambda (self) (jhost-state self)))
+        (cons "ordinal" (lambda (self)
+          (let loop ((ns thread-state-names) (i 0))
+            (if (string=? (car ns) (jhost-state self)) i (loop (cdr ns) (+ i 1))))))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "thread-state")))
+                      (lambda (x) (jhost-state x)))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))
@@ -4029,7 +4078,9 @@
 (register-host-methods! "reentrant-lock"
   ;; An uninterruptible acquire: a fiber contender parks on the monitor's waiter
   ;; list and a thread waits on its condition. monitor-exit! wakes both.
-  (list (cons "lock" (lambda (self) (monitor-enter! (rlock-monitor self)) jolt-nil))
+  (list (cons "lock" (lambda (self)
+          (parameterize ((thread-enter-state 'WAITING)) (monitor-enter! (rlock-monitor self)))
+          jolt-nil))
         ;; monitor-exit! is where "unlock from a non-owner throws" already lives, and
         ;; it throws the IllegalMonitorStateException the JVM does.
         (cons "unlock" (lambda (self) (monitor-exit! (rlock-monitor self)) jolt-nil))
@@ -4042,23 +4093,27 @@
           (let* ((m (rlock-monitor self))
                  (ms (tu-args->ms args))
                  (deadline (and ms (ms->deadline ms))))
-            (let attempt ()
-              (cond ((monitor-try-enter! m) #t)
-                    ;; Chez has no timed acquire, so poll. The wait is bounded by the
-                    ;; deadline; the round yields first so the holder can run.
-                    ((and deadline (time<=? (current-time 'time-utc) deadline))
-                     (monitor-poll-round!)
-                     (attempt))
-                    (else #f))))))
+            (call-with-thread-state 'TIMED_WAITING
+              (lambda ()
+                (let attempt ()
+                  (cond ((monitor-try-enter! m) #t)
+                        ;; Chez has no timed acquire, so poll. The wait is bounded by the
+                        ;; deadline; the round yields first so the holder can run.
+                        ((and deadline (time<=? (current-time 'time-utc) deadline))
+                         (monitor-poll-round!)
+                         (attempt))
+                        (else #f))))))))
         (cons "lockInterruptibly" (lambda (self)
           (let ((m (rlock-monitor self))
                 (me (current-interrupt-box)))
             (rlock-interrupted-check! me)
-            (let loop ()
-              (unless (monitor-try-enter! m)
-                (monitor-poll-round!)
-                (rlock-interrupted-check! me)
-                (loop)))
+            (call-with-thread-state 'WAITING
+              (lambda ()
+                (let loop ()
+                  (unless (monitor-try-enter! m)
+                    (monitor-poll-round!)
+                    (rlock-interrupted-check! me)
+                    (loop)))))
             jolt-nil)))
         ;; isLocked is "held by ANY thread"; getHoldCount and isHeldByCurrentThread are
         ;; about the CURRENT one, and the count is 0 rather than the raw depth for a

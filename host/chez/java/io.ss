@@ -3018,6 +3018,7 @@
                    (hashtable-delete! thread-handles-by-id id)
                    o))))
       (thread-box-forget! id)
+      (thread-state-forget! id)
       (when obj
         (let ((st (jhost-state obj)))
           (jolt-with-mutex (vector-ref st 2)

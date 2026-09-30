@@ -82,6 +82,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Thread.getState` and the `Thread$State` enum.** NEW before `start`,
+  TERMINATED after the thread ends, and while it runs what it is actually
+  doing, as the JVM reports it: WAITING in an untimed wait (`join`, a promise
+  or future deref, `<!!`/`>!!`, `Object.wait`, a latch, a queue `take`, a
+  `ReentrantLock` acquire), TIMED_WAITING in a timed one (`Thread/sleep`, a
+  timed deref, `wait` or `await`), BLOCKED waiting to enter a `locking`
+  monitor, RUNNABLE otherwise. `Thread$State/values` and `valueOf` work. A
+  fiber's state is left to the fiber layer through a hook.
 - **`java.lang.ThreadGroup` and `Thread.getThreadGroup`.** A minimal model of
   the JVM's: the built-in `system` group and its child `main`, which every
   thread is in unless placed elsewhere (as the JVM's main thread, its pools'

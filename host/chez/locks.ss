@@ -323,14 +323,54 @@
 ;; ever reached by a thread" a fact rather than an intention: every one of these was
 ;; documented as thread-only, and the four that were wrong about it were found by
 ;; asking rather than by reading.
+;; --- what a THREAD is doing, for Thread.getState ------------------------------
+;; Every thread that waits records it in a box of its own: WAITING or
+;; TIMED_WAITING while it is in a condition wait (below), BLOCKED while it waits to
+;; enter a monitor (java/concurrency.ss), nothing — RUNNABLE — otherwise. Another
+;; thread reads it by the thread's id. The box is made on a thread's first wait and
+;; found again through a thread parameter; the parameter carries the owning id
+;; because a forked thread inherits it. Writing it costs a box store on a wait that
+;; is about to block anyway. A fiber never waits here; its state is the fiber
+;; layer's to report (jolt-thread-state-hook, java/concurrency.ss).
+(define thread-state-boxes (make-eqv-hashtable))          ; thread id -> box
+(define thread-state-mu (make-mutex))
+(define thread-state-cell (make-thread-parameter #f))     ; (thread id . box)
+(define (thread-state-box)
+  (let ((c (thread-state-cell)) (id (get-thread-id)))
+    (if (and (pair? c) (eqv? (car c) id))
+        (cdr c)
+        (let ((b (box #f)))
+          (jolt-with-mutex thread-state-mu (hashtable-set! thread-state-boxes id b))
+          (thread-state-cell (cons id b))
+          b))))
+;; The recorded state of thread ID — WAITING, TIMED_WAITING or BLOCKED — or #f.
+(define (thread-wait-state id)
+  (let ((b (jolt-with-mutex thread-state-mu (hashtable-ref thread-state-boxes id #f))))
+    (and b (unbox b))))
+(define (thread-state-forget! id)
+  (jolt-with-mutex thread-state-mu (hashtable-delete! thread-state-boxes id)))
+;; Run THUNK recorded as STATE, for a wait that is not a condition wait (a polled
+;; lock acquire) or that is one of a more specific kind (entering a monitor). An
+;; outer state wins over the inner condition wait's.
+(define (call-with-thread-state state thunk)
+  (let* ((b (thread-state-box)) (old (unbox b)))
+    (set-box! b (or old state))
+    (dynamic-wind void thunk (lambda () (set-box! b old)))))
 (define jolt-condition-wait
   (case-lambda
     ((cv mu)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
-     (condition-wait cv mu))
+     (let* ((b (thread-state-box)) (old (unbox b)))
+       (set-box! b (or old 'WAITING))
+       (condition-wait cv mu)
+       (set-box! b old)))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
-     (condition-wait cv mu abs-time))))
+     (let* ((b (thread-state-box)) (old (unbox b)))
+       (set-box! b (or old 'TIMED_WAITING))
+       (let ((r (condition-wait cv mu abs-time)))
+         (set-box! b old)
+         r)))))
 
 ;; --- the wait beneath the fiber layer ---------------------------------------
 ;; (jolt-stop-the-world-wait cv mu timeout) -> #t signalled | #f timed out

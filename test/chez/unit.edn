@@ -375,6 +375,10 @@
   ;; own: a go block on a fiber answers for its carrier, which is a daemon too.
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] [(a/<!! (a/thread (me))) (a/<!! (a/go (me))) (a/<!! (a/thread (.isDaemon (Thread. (fn []))))) (a/<!! (a/io-thread (me))) (a/<!! (a/thread-call me :compute))]))" :expected "[true true true true true]"}
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (a/<!! (a/go [(jolt.host/fiber?) (.isDaemon (Thread/currentThread))]))))" :expected "[true true]"}
+  ;; A thread blocked in a core.async channel op is WAITING (<!!, >!!, and alts!!
+  ;; over a timeout channel, which parks untimed). Probed on JVM Clojure 1.12.5 +
+  ;; core.async 1.9.865 / JDK 21: ["WAITING" "WAITING" "WAITING"].
+  {:suite "threads / state" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) d (a/chan) ts [(Thread. (fn [] (a/<!! c))) (Thread. (fn [] (a/>!! d 1))) (Thread. (fn [] (a/alts!! [(a/chan) (a/timeout 10000)])))]] (doseq [t ts] (.setDaemon t true) (.start t)) (Thread/sleep 200) (let [r (mapv (fn [t] (str (.getState t))) ts)] (a/close! c) (a/<!! d) r)))" :expected "[\"WAITING\" \"WAITING\" \"WAITING\"]"}
   {:suite "threads / name" :expr "(.getName (Thread/currentThread))" :expected "\"main\""}
   {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))))) (not= \"main\" (deref p 5000 :timeout)))" :expected "true"}
   {:suite "threads / name" :expr "(let [p (promise) t (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))) \"worker-x\")] (.start t) [(.getName t) (deref p 5000 :timeout)])" :expected "[\"worker-x\" \"worker-x\"]"}
