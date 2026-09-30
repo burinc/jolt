@@ -661,6 +661,13 @@
 (jch-register-supers! "java.io.UncheckedIOException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.util.concurrent.RejectedExecutionException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.util.concurrent.ExecutionException" '("java.lang.Exception"))
+;; The other three java.util.concurrent exceptions a caller constructs or matches
+;; on. TimeoutException was already thrown by the runtime (a timed Future.get, an
+;; invokeAny) and a catch naming it matched, but with no row here the ctor sweep
+;; gave it no constructor and it did not answer instance? Exception.
+(jch-register-supers! "java.util.concurrent.TimeoutException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.BrokenBarrierException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.CompletionException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.time.DateTimeException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.time.format.DateTimeParseException" '("java.time.DateTimeException"))
 (jch-register-supers! "java.text.ParseException" '("java.lang.Exception"))

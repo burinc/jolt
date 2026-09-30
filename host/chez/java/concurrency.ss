@@ -191,7 +191,7 @@
 ;; takes the registry's mutex and then each waiter's, and the worker may itself be
 ;; waiting on something; doing that under mu here would order this future's mutex
 ;; above the whole set of them for no reason.
-(define (jolt-future-cancel f)
+(define (jolt-future-cancel f . interrupt?)
   (let ((cancelled (jolt-with-mutex (jolt-future-mu f)
                      (if (jolt-future-done? f)
                          #f
@@ -199,7 +199,8 @@
                                 (jolt-future-done?-set! f #t)
                                 (jolt-cv-wake! (jolt-future-cv f))
                                 #t)))))
-    (when cancelled
+    ;; Future.cancel(false) cancels without interrupting the worker
+    (when (and cancelled (or (null? interrupt?) (car interrupt?)))
       (let ((b (jolt-future-ibox f)))
         (set-box! b #t)
         (jolt-interrupt-wake-waits! b)))
@@ -559,6 +560,31 @@
     (if (jolt-agent? obj)
         (let* ((rest (if (jolt-nil? rest-args) (quote ()) (seq->list rest-args)))
                (f (jagent-method method-name (length rest))))
+          (if f (apply f obj rest) (quote pass)))
+        (quote pass))))
+
+;; --- java.util.concurrent.Future on a clojure.core future --------------------
+;; A future is a reify of IDeref, IBlockingDeref, IPending and Future on the JVM,
+;; and records-dispatch.ss answers the IDeref half (.deref, the no-arg .get). The
+;; Future half was missing: (.get f 100 TimeUnit/MILLISECONDS), .isDone,
+;; .isCancelled and .cancel all failed with "No matching method". Same tier as the
+;; agent arm below it, on a disjoint type.
+(define jfuture-timeout (list 'jfuture-timeout))
+(define (jfuture-get-2 f amount unit)
+  (let ((r (jolt-future-deref-timed f (tu->ms amount unit) jfuture-timeout)))
+    (if (eq? r jfuture-timeout) (future-timeout-throw) r)))
+(define (jfuture-method name argc)
+  (cond ((string=? name "get")         (and (fx=? argc 2) jfuture-get-2))
+        ((string=? name "isDone")      (and (fx=? argc 0) jolt-future-done?))
+        ((string=? name "isCancelled") (and (fx=? argc 0) jolt-future-cancelled?))
+        ((string=? name "cancel")
+         (and (fx=? argc 1) (lambda (f b) (jolt-future-cancel f (jolt-truthy? b)))))
+        (else #f)))
+(register-method-arm! arm-priority-agent
+  (lambda (obj method-name rest-args)
+    (if (jolt-future? obj)
+        (let* ((rest (if (jolt-nil? rest-args) (quote ()) (seq->list rest-args)))
+               (f (jfuture-method method-name (length rest))))
           (if f (apply f obj rest) (quote pass)))
         (quote pass))))
 

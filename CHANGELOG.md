@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`java.util.concurrent.TimeoutException` can be constructed.**
+  `(TimeoutException.)` and `(TimeoutException. "msg")` raised "No matching ctor
+  found", and the one the runtime throws from a timed `Future.get` did not answer
+  `instance? Exception`. `BrokenBarrierException` and `CompletionException` had
+  the same gap. All three now have the JDK's constructors and superclasses.
+
+- **A `future` answers `java.util.concurrent.Future`'s methods.** `(.get f 100
+  TimeUnit/MILLISECONDS)`, `.isDone`, `.isCancelled` and `.cancel` on a
+  `clojure.core/future` raised "No matching method"; only the no-arg `.get` and
+  `.deref` worked. The timed `.get` throws `TimeoutException`, and
+  `(.cancel f false)` cancels without interrupting the worker.
+
+- **An exception built from a cause takes the cause's `toString` as its
+  message.** `(ExecutionException. (IllegalStateException. "bad"))` had a nil
+  message; the JVM's `Throwable(Throwable)` sets it to
+  `"java.lang.IllegalStateException: bad"`, and jolt now does too, for every
+  exception class.
+
 ## [0.8.15] - 2026-09-29
 
 Sockets gain read, accept and connect timeouts, and a closed socket behaves

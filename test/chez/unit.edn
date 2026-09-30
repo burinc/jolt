@@ -1864,6 +1864,12 @@
   ;;
   ;; A submit after shutdown is REJECTED rather than queued-and-abandoned.
   {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.shutdown ex) (try (.submit ex (fn [] 1)) :no-throw (catch java.util.concurrent.RejectedExecutionException e :rejected)))" :expected ":rejected"}
+  ;; The TimeoutException a timed Future.get throws is an Exception, as on the JVM.
+  {:suite "executor-timeout" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor) f (.submit ex ^Callable (fn [] (Thread/sleep 2000) 1))] (try (.get f 10 java.util.concurrent.TimeUnit/MILLISECONDS) (catch java.util.concurrent.TimeoutException e [(.getName (class e)) (instance? Exception e) (instance? RuntimeException e)]) (finally (.shutdownNow ex))))" :expected "[\"java.util.concurrent.TimeoutException\" true false]"}
+  ;; A clojure.core future is a java.util.concurrent.Future on the JVM, so its
+  ;; timed .get, .isDone, .isCancelled and .cancel reflect. Certified on JVM 1.12.
+  {:suite "future / Future methods" :expr "(let [f (future (Thread/sleep 2000) 1)] [(try (.get f 10 java.util.concurrent.TimeUnit/MILLISECONDS) (catch java.util.concurrent.TimeoutException e :timeout)) (.isDone f) (.isCancelled f) (.cancel f true) (.isDone f) (.isCancelled f) (future-cancelled? f)])" :expected "[:timeout false false true true true true]"}
+  {:suite "future / Future methods" :expr "(let [f (future 5)] [(.get f 1 java.util.concurrent.TimeUnit/SECONDS) (.isDone f) (.cancel f false) (.isCancelled f)])" :expected "[5 true false false]"}
   ;; and so is an execute, catchable as the RuntimeException it is on the JVM
   {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (.shutdown ex) (try (.execute ex (fn [] 1)) :no-throw (catch RuntimeException e :rejected)))" :expected ":rejected"}
   ;; close BLOCKS until the work is done, which is what makes it usable as the
