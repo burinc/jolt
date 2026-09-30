@@ -69,6 +69,11 @@
 (ffi/defcfn c-gethostname  "gethostname"  [:pointer :size_t] :int)
 (ffi/defcfn c-getnameinfo  "getnameinfo"
   [:pointer :uint :pointer :uint :pointer :uint :int] :int :blocking)
+;; shutdown(fd, how): the half-close. SHUT_RD 0 and SHUT_WR 1 on Linux and BSD,
+;; and Winsock's SD_RECEIVE / SD_SEND carry the same two numbers.
+(ffi/defcfn c-shutdown    "shutdown"    [:int :int] :int {:capture-native-error true})
+(def ^:private SHUT-RD 0)
+(def ^:private SHUT-WR 1)
 
 ;; The rest differ by platform in signature, not only in value, so they live in
 ;; the taken branch — a symbol that exists on one OS only (closesocket on
@@ -317,6 +322,7 @@
 ;; connect's errno for a peer that refused, which java.net reports as its own
 ;; exception class rather than the generic failure.
 (def ^:private ECONNREFUSED (cond macos? 61 windows? 10061 :else 111))
+(def ^:private ENOTCONN (cond macos? 57 windows? 10057 :else 107))
 
 (defn- connect-fd! [owner fd host port deadline]
   ;; resolve + connect; frees the sockaddr either way. Returns the resolved ip.
@@ -375,6 +381,36 @@
 (defn- ensure-socket-open! [self]
   (when (jolt.host/ref-get self :closed?)
     (throw (java.net.SocketException. "Socket is closed"))))
+
+;; getInputStream, getOutputStream and the two shutdowns refuse a socket that is
+;; not connected, in the JDK's order: closed first, then unconnected.
+(defn- ensure-socket-connected! [self]
+  (ensure-socket-open! self)
+  (when-not (jolt.host/ref-get self :connected?)
+    (throw (java.net.SocketException. "Socket is not connected"))))
+
+;; shutdownInput / shutdownOutput (jolt-lang/jolt#1208). The flag is the JDK's
+;; isInputShutdown / isOutputShutdown: set once the call succeeds, kept after
+;; close, and asked by the streams, since what the JDK answers after a half-close
+;; is decided by the flag rather than by the kernel — a read after shutdownInput
+;; is EOF even over data that had already arrived, which Linux would still hand
+;; back. A write after shutdownOutput reaches send and fails there with EPIPE, as
+;; the JDK's does. The shutdown also wakes a read parked on the poller, which
+;; then sees the flag.
+(defn- socket-shutdown! [self how flag already]
+  (ensure-socket-connected! self)
+  (when (jolt.host/ref-get self flag)
+    (throw (java.net.SocketException. already)))
+  (with-op self
+    (let [[r e] (c-shutdown (jolt.host/ref-get self :fd) how)]
+      ;; ENOTCONN is not an error here, as it is not in the JDK's Net.shutdown:
+      ;; macOS answers it once both directions have seen a FIN, and the socket
+      ;; is then as shut down as the caller asked
+      (when (and (neg? r) (not= e ENOTCONN))
+        (throw (java.net.SocketException.
+                 (if windows? (str "shutdown failed: WSA error " e) (ffi/errno-message e)))))))
+  (jolt.host/ref-put! self flag true)
+  nil)
 
 (defn- socket-connect! [self endpoint timeout]
   ;; The JDK's order: the timeout is validated before the socket's state, and
@@ -441,7 +477,9 @@
 
    "getInputStream"
    (fn [self]
-     (ensure-socket-open! self)
+     (ensure-socket-connected! self)
+     (when (jolt.host/ref-get self :in-shutdown?)
+       (throw (java.net.SocketException. "Socket input is shutdown")))
      ;; :jolt/in-stream: a java.io.InputStream to clojure.java.io's coercions
      ;; (io-streams.ss user-in-stream?), so io/reader, slurp and io/copy take it
      (doto (tt :socket-input-stream "java.net.SocketInputStream")
@@ -451,13 +489,21 @@
 
    "getOutputStream"
    (fn [self]
-     (ensure-socket-open! self)
+     (ensure-socket-connected! self)
+     (when (jolt.host/ref-get self :out-shutdown?)
+       (throw (java.net.SocketException. "Socket output is shutdown")))
      (doto (tt :socket-output-stream "java.net.SocketOutputStream")
        (jolt.host/ref-put! :jolt/out-stream true)
        (jolt.host/ref-put! :fd (jolt.host/ref-get self :fd))
        (jolt.host/ref-put! :socket self)))
 
    "close"        socket-close!
+   "shutdownInput"
+   (fn [self] (socket-shutdown! self SHUT-RD :in-shutdown? "Socket input is already shutdown"))
+   "shutdownOutput"
+   (fn [self] (socket-shutdown! self SHUT-WR :out-shutdown? "Socket output is already shutdown"))
+   "isInputShutdown"  (fn [self] (boolean (jolt.host/ref-get self :in-shutdown?)))
+   "isOutputShutdown" (fn [self] (boolean (jolt.host/ref-get self :out-shutdown?)))
    "isConnected"  (fn [self] (boolean (jolt.host/ref-get self :connected?)))
    "isClosed"     (fn [self] (boolean (jolt.host/ref-get self :closed?)))
    "isBound"      (fn [self] (boolean (jolt.host/ref-get self :connected?)))
@@ -527,6 +573,11 @@
                            "- answered as EOF")))
               r))))))))
 
+;; A read of a socket whose input is shut down is EOF, whatever the kernel still
+;; holds (see socket-shutdown!).
+(defn- input-shutdown? [stream]
+  (jolt.host/ref-get (jolt.host/ref-get stream :socket) :in-shutdown?))
+
 (defn- do-recv [owner fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
   ;; also reads as EOF. Java throws SocketException there — documented
@@ -536,8 +587,13 @@
   ;; already gone by this point — io-call loops on EINTR and waits out EAGAIN
   ;; — so every negative n here is terminal. Narrowing that to SocketException
   ;; on ECONNRESET means widening io-call's contract to hand the errno back.
-  (let [n (io-call owner #(c-recv fd buf len 0) fd :read
-                   (so-timeout owner) "Read timed out")]
+  (let [n (if (jolt.host/ref-get owner :in-shutdown?)
+            -1
+            (io-call owner #(c-recv fd buf len 0) fd :read
+                     (so-timeout owner) "Read timed out"))
+        ;; a read parked when shutdownInput landed is woken by it, and may find
+        ;; data that arrived meanwhile; the JDK answers EOF there too
+        n (if (jolt.host/ref-get owner :in-shutdown?) -1 n)]
     (if (pos? n)
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
@@ -558,20 +614,23 @@
 ;; or waiting for more. The binding is what has to be right; see c-ioctl above.
 (defn- socket-available [self]
   ;; Closed raises rather than answering 0, where a recv error can only read as
-  ;; EOF; asking the kernel would count some other socket's bytes.
+  ;; EOF; asking the kernel would count some other socket's bytes. A shut-down
+  ;; input has nothing to read, whatever arrived.
   (ensure-open! self)
-  (with-op (jolt.host/ref-get self :socket)
-    (let [fd (jolt.host/ref-get self :fd)
-          out (ffi/alloc 4)]
-      (ffi/write out :int 0)
-      ;; a failed ioctl reads as "nothing there", the way a failed recv reads as
-      ;; EOF. c-ioctl is not on a retry path, so it is bound without
-      ;; :capture-native-error and its errno is never captured to say more
-      ;; with — unlike the recv side, where the errno exists and io-call
-      ;; spends it on classification.
-      (try
-        (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
-        (finally (ffi/free out))))))
+  (if (input-shutdown? self)
+    0
+    (with-op (jolt.host/ref-get self :socket)
+      (let [fd (jolt.host/ref-get self :fd)
+            out (ffi/alloc 4)]
+        (ffi/write out :int 0)
+        ;; a failed ioctl reads as "nothing there", the way a failed recv reads
+        ;; as EOF. c-ioctl is not on a retry path, so it is bound without
+        ;; :capture-native-error and its errno is never captured to say more
+        ;; with — unlike the recv side, where the errno exists and io-call
+        ;; spends it on classification.
+        (try
+          (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
+          (finally (ffi/free out)))))))
 
 (def ^:private socket-input-stream-methods
   {"read"

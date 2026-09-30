@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Socket.shutdownOutput`, `shutdownInput`, `isOutputShutdown` and
+  `isInputShutdown`.** The half-close, as on the JVM: after `shutdownOutput`
+  the peer reads EOF, this side still reads, and a write throws "Broken
+  pipe"; after `shutdownInput` reads return EOF, even over data that had
+  already arrived, and writes still work. A read blocked on another thread or
+  parked on a fiber wakes with EOF. A second call, a closed or unconnected
+  socket, and `getInputStream`/`getOutputStream` of a shut-down side throw
+  `SocketException` with the JDK's messages, and the state survives `close`.
+  `getInputStream` and `getOutputStream` of an unconnected socket now throw
+  "Socket is not connected" as the JDK's do. Without the half-close a proxy
+  closing a socket its peer was still reading got a reset on Windows (#1208).
+
 ### Fixed
 
 - **`clojure.java.io` takes a socket's streams.** `io/reader`, `io/writer`,

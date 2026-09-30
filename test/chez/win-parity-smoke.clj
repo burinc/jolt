@@ -136,6 +136,38 @@
     (check "#1203 ...and getResource answers the same URL"
            (str (.getResource (jl/as-classloader l) "r.txt")) uri)))
 
+;; --- #1208: Socket half-close -----------------------------------------------------
+;; Winsock's shutdown takes SD_SEND / SD_RECEIVE, and a proxy that closed without
+;; half-closing first got a reset on Windows where Linux closed gracefully. The
+;; exchange a proxy pumps: the client sends and half-closes, the server reads to
+;; EOF and answers, the client reads the answer, and each side's state is named.
+(defn- read-all [in]
+  (loop [acc []]
+    (let [b (.read in)]
+      (if (neg? b) (String. (byte-array acc) "UTF-8") (recur (conj acc b))))))
+(let [ss (java.net.ServerSocket. 0)
+      c (java.net.Socket. "127.0.0.1" (.getLocalPort ss))
+      s (.accept ss)
+      cin (.getInputStream c)
+      cout (.getOutputStream c)
+      msg (fn [f] (try (f) :ok (catch java.net.SocketException e (.getMessage e))))]
+  (try
+    (.write cout (.getBytes "req" "UTF-8"))
+    (.shutdownOutput c)
+    (let [req (read-all (.getInputStream s))]
+      (.write (.getOutputStream s) (.getBytes (str "echo:" req) "UTF-8"))
+      (.shutdownOutput s)
+      (check "#1208 shutdownOutput: the peer reads to EOF and answers"
+             [req (read-all cin) (.isOutputShutdown c) (.isInputShutdown c) (.isClosed c)]
+             ["req" "echo:req" true false false]))
+    (check "#1208 a write after shutdownOutput throws" (msg #(.write cout 1)) "Broken pipe")
+    (check "#1208 shutdownOutput twice" (msg #(.shutdownOutput c)) "Socket output is already shutdown")
+    (.shutdownInput c)
+    (check "#1208 shutdownInput reads EOF"
+           [(.isInputShutdown c) (.read cin) (msg #(.getInputStream c))]
+           [true -1 "Socket input is shutdown"])
+    (finally (.close s) (.close c) (.close ss))))
+
 ;; --- #1119: last-modified time ---------------------------------------------------
 (let [d (under "lock")
       now (System/currentTimeMillis)]
