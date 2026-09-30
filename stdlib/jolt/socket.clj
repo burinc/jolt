@@ -442,7 +442,10 @@
    "getInputStream"
    (fn [self]
      (ensure-socket-open! self)
+     ;; :jolt/in-stream: a java.io.InputStream to clojure.java.io's coercions
+     ;; (io-streams.ss user-in-stream?), so io/reader, slurp and io/copy take it
      (doto (tt :socket-input-stream "java.net.SocketInputStream")
+       (jolt.host/ref-put! :jolt/in-stream true)
        (jolt.host/ref-put! :fd (jolt.host/ref-get self :fd))
        (jolt.host/ref-put! :socket self)))
 
@@ -450,6 +453,7 @@
    (fn [self]
      (ensure-socket-open! self)
      (doto (tt :socket-output-stream "java.net.SocketOutputStream")
+       (jolt.host/ref-put! :jolt/out-stream true)
        (jolt.host/ref-put! :fd (jolt.host/ref-get self :fd))
        (jolt.host/ref-put! :socket self)))
 

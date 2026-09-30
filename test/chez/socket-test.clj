@@ -3,7 +3,8 @@
 ;; for "SOCKET-TEST OK"). Every server binds port 0 (kernel-assigned), so
 ;; parallel gates never collide on a port.
 (ns socket-test
-  (:require [clojure.string :as str]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 (require 'jolt.socket)
 
@@ -393,6 +394,23 @@
     (check-eq "the woken fiber left the next socket's bytes alone"
               (.read (.getInputStream b)) (int \B))
     (finally (.close b-peer) (.close b) (.close a-peer) (.close server))))
+
+;; A socket's streams are java.io streams to clojure.java.io: io/reader,
+;; io/writer, io/input-stream, io/output-stream and io/copy all raised "Cannot
+;; open" over them, so the ordinary (io/reader (.getInputStream sock)) did not
+;; work. Measured against JDK 21 (the flush is the JVM's: io/output-stream is a
+;; BufferedOutputStream there).
+(with-pair
+  (fn [server c s]
+    (io/copy "abc\n" (.getOutputStream c))
+    (let [w (io/writer (.getOutputStream c))] (.write w "de\n") (.flush w))
+    (let [o (io/output-stream (.getOutputStream c))]
+      (io/copy (.getBytes "x\ny\n" "UTF-8") o)
+      (.flush o))
+    (.close c)
+    (check-eq "clojure.java.io reads and writes a socket's streams"
+              [(vec (line-seq (io/reader (io/input-stream (.getInputStream s))))) (.isClosed c)]
+              [["abc" "de" "x" "y"] true])))
 
 ;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
 ;; It answered 0 always, which java.io permits ("an estimate") but which leaves

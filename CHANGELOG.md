@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`clojure.java.io` takes a socket's streams.** `io/reader`, `io/writer`,
+  `io/input-stream`, `io/output-stream`, `io/copy`, `slurp` and `spit` all
+  raised "Cannot open" over a `Socket`'s `getInputStream` or
+  `getOutputStream`, so `(line-seq (io/reader (.getInputStream sock)))` did
+  not work. They drive them as the `java.io` streams they are.
+
 - **`jolt.loader` opens `file:` resource hits on Windows.** It dropped the
   scheme with `(subs url 5)`, so a resource's `file:/C:/proj/…` became
   `/C:/proj/…`, which Windows reads as a path on the current drive; on every
