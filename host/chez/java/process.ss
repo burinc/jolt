@@ -2304,16 +2304,21 @@
                 (jt-optional #t (make-proc-handle p))
                 jt-optional-empty))))))
 
-;; --- CompletableFuture (Process.onExit().thenRun(f)) -------------------------
-;; A minimal one-shot: thenRun spawns a thread that waits for the process to exit
-;; and then runs the callback. Enough for babashka's :shutdown / :exit-fn hooks.
-(define (make-proc-completable proc-st) (make-jhost "jolt-completable" proc-st))
-(register-host-methods! "jolt-completable"
-  (list (cons "thenRun" (lambda (self f)
-          (let ((proc-st (jhost-state self)))
-            (fork-thread (lambda () (guard (e (#t #f)) (proc-wait-blocking proc-st) (jolt-invoke f)))))
-          self))
-        (cons "thenApply" (lambda (self f) self))))
+;; --- Process.onExit ------------------------------------------------------------
+;; A CompletableFuture (concurrency.ss) that completes with the Process once it has
+;; exited, as the JVM's does, so every stage method works on it. It was a stub
+;; that answered thenRun and nothing else, and whose thenApply returned the stub
+;; without calling the function. A thread waits for the exit; a wait that fails
+;; fails the future with what it threw.
+(define (make-proc-completable proc)
+  (let ((d (make-cf)))
+    (fork-thread
+     (lambda ()
+       (let ((r (guard (e (#t (make-cf-alt (jolt-unwrap-throw e))))
+                  (proc-wait-blocking proc)
+                  proc)))
+         (cf-settle! d r #f))))
+    d))
 
 ;; --- java.lang.Runtime shutdown hooks ----------------------------------------
 ;; addShutdownHook registers a Thread hook to run at jolt exit; babashka.process's

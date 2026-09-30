@@ -561,6 +561,19 @@
     (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
               (hm-keys-ordered self))
     m))
+;; (jolt-fi-call f method arg ...) — call the java.util.function argument of a
+;; host method: a Clojure fn (or any invokable, a keyword or a map) is invoked,
+;; and a reify / deftype implementing the interface has its one method called by
+;; name. Clojure 1.12 coerces a fn to the interface at the call site, so both
+;; shapes reach a JVM method; jolt has no coercion, so a shim that only
+;; jolt-invokes its argument refused the reify with "cannot be cast to
+;; clojure.lang.IFn" — (.computeIfAbsent m k (reify Function (apply [_ k] …)))
+;; failed that way while the comment below said it worked.
+(define (jolt-fi-call f method . args)
+  (cond ((procedure? f) (apply jolt-invoke f args))
+        ((iface-method f method (fx+ 1 (length args)))
+         (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args))))
+        (else (apply jolt-invoke f args))))
 (define hashmap-methods
   (list (cons "put" (lambda (self k v) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                                           (hm-note-key! self k)
@@ -581,7 +594,7 @@
         (cons "computeIfAbsent" (lambda (self k f)
           (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
             (if (jolt-nil? old)
-                (let ((v (jolt-invoke1 f k)))
+                (let ((v (jolt-fi-call f "apply" k)))
                   (unless (jolt-nil? v)
                     (hm-note-key! self k)
                     (hashtable-set! (hm-tbl self) k v))
@@ -591,20 +604,20 @@
           (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
             (if (jolt-nil? old)
                 jolt-nil
-                (let ((v (jolt-invoke2 f k old)))
+                (let ((v (jolt-fi-call f "apply" k old)))
                   (if (jolt-nil? v)
                       (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)
                       (begin (hashtable-set! (hm-tbl self) k v) v)))))))
         (cons "compute" (lambda (self k f)
           (let* ((old (hashtable-ref (hm-tbl self) k jolt-nil))
-                 (v (jolt-invoke2 f k old)))
+                 (v (jolt-fi-call f "apply" k old)))
             (cond ((not (jolt-nil? v))
                    (hm-note-key! self k) (hashtable-set! (hm-tbl self) k v) v)
                   ((jolt-nil? old) jolt-nil)
                   (else (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)))))
         (cons "merge" (lambda (self k v f)
           (let* ((old (hashtable-ref (hm-tbl self) k jolt-nil))
-                 (v (if (jolt-nil? old) v (jolt-invoke2 f old v))))
+                 (v (if (jolt-nil? old) v (jolt-fi-call f "apply" old v))))
             (if (jolt-nil? v)
                 (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)
                 (begin (hm-note-key! self k) (hashtable-set! (hm-tbl self) k v) v)))))
@@ -617,7 +630,7 @@
                 (hashtable-set! (hm-tbl self) k v) old)
               jolt-nil)))
         (cons "forEach" (lambda (self f)
-          (for-each (lambda (k) (jolt-invoke2 f k (hashtable-ref (hm-tbl self) k jolt-nil)))
+          (for-each (lambda (k) (jolt-fi-call f "accept" k (hashtable-ref (hm-tbl self) k jolt-nil)))
                     (hm-keys-ordered self))
           jolt-nil))
         (cons "containsKey" (lambda (self k) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
@@ -879,11 +892,11 @@
           (let loop ((v (unbox (atomic-box self))))
             ;; atomic-cas! deliberately re-normalizes V and N. This keeps every
             ;; CAS caller behind one typed boundary; conversion is idempotent.
-            (let ((n (atomic-convert self (jolt-invoke f v))))
+            (let ((n (atomic-convert self (jolt-fi-call f "apply" v))))
               (if (atomic-cas! self v n) n (loop (unbox (atomic-box self))))))))
         (cons "getAndUpdate" (lambda (self f)
           (let loop ((v (unbox (atomic-box self))))
-            (let ((n (atomic-convert self (jolt-invoke f v))))
+            (let ((n (atomic-convert self (jolt-fi-call f "apply" v))))
               (if (atomic-cas! self v n) v (loop (unbox (atomic-box self))))))))
         (cons "incrementAndGet"
           (lambda (self) (atomic-numeric-transition! self 1 #f)))
@@ -2877,8 +2890,8 @@
         (cons "isEmpty" (lambda (o) (not (opt-present? o))))
         (cons "get" (lambda (o) (if (opt-present? o) (opt-value o) (throw-jvm 'NoSuchElementException "No value present"))))
         (cons "orElse" (lambda (o d) (if (opt-present? o) (opt-value o) d)))
-        (cons "orElseGet" (lambda (o f) (if (opt-present? o) (opt-value o) (jolt-invoke f))))
-        (cons "ifPresent" (lambda (o f) (when (opt-present? o) (jolt-invoke f (opt-value o))) jolt-nil))
+        (cons "orElseGet" (lambda (o f) (if (opt-present? o) (opt-value o) (jolt-fi-call f "get"))))
+        (cons "ifPresent" (lambda (o f) (when (opt-present? o) (jolt-fi-call f "accept" (opt-value o))) jolt-nil))
         (cons "toString" (lambda (o) (if (opt-present? o)
                                          (string-append "Optional[" (jolt-str-render-one (opt-value o)) "]")
                                          "Optional.empty")))))

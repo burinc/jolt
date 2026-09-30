@@ -1064,6 +1064,15 @@
 (jch-register-supers! "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask"
                       '("java.util.concurrent.FutureTask"
                         "java.util.concurrent.RunnableScheduledFuture"))
+;; CompletableFuture (concurrency.ss): a Future and a CompletionStage, and the
+;; enum its state() answers. delayedExecutor's Executor is a nested class.
+(jch-register-supers! "java.util.concurrent.CompletionStage" '())
+(jch-mark-interface! "java.util.concurrent.CompletionStage")
+(jch-register-supers! "java.util.concurrent.CompletableFuture"
+                      '("java.util.concurrent.Future" "java.util.concurrent.CompletionStage"))
+(jch-register-supers! "java.util.concurrent.CompletableFuture$DelayedExecutor"
+                      '("java.util.concurrent.Executor"))
+(jch-register-supers! "java.util.concurrent.Future$State" '("java.lang.Enum"))
 ;; locks, latches and the four atomics. Every one of these had a shim with
 ;; methods and NO class row, so (class x) answered the :object placeholder and
 ;; (instance? java.util.concurrent.locks.Lock a-reentrant-lock) was false.
@@ -1183,6 +1192,9 @@
     ("j-future" . "java.util.concurrent.FutureTask")
     ("scheduled-executor" . "java.util.concurrent.ScheduledThreadPoolExecutor")
     ("scheduled-future" . "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask")
+    ("completable-future" . "java.util.concurrent.CompletableFuture")
+    ("cf-delayed-executor" . "java.util.concurrent.CompletableFuture$DelayedExecutor")
+    ("future-state" . "java.util.concurrent.Future$State")
     ("instant" . "java.time.Instant")
     ("local-date" . "java.time.LocalDate")
     ("local-time" . "java.time.LocalTime")

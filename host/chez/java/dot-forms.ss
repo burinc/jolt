@@ -183,6 +183,13 @@
         ;; invokes it — so code holding a fn as a Comparator calls it this way.
         ((and (procedure? obj) (string=? mname "compare") (pair? rest) (pair? (cdr rest)))
          (jolt-invoke obj (car rest) (cadr rest)))
+        ;; (.run f) / (.call f): a fn is a Runnable and a Callable — AFn.run and
+        ;; AFn.call invoke it with no arguments — so an Executor handed a fn as
+        ;; its task runs it this way. run answers nil, call the fn's value.
+        ((and (procedure? obj) (null? rest) (string=? mname "run"))
+         (jolt-invoke obj) jolt-nil)
+        ((and (procedure? obj) (null? rest) (string=? mname "call"))
+         (jolt-invoke obj))
         ;; a transient (ITransientCollection/Set/Map): .contains / .valAt / .count —
         ;; test.check's distinct-collection gen uses (.contains transient-set k).
         ((jolt-transient? obj)

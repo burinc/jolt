@@ -171,6 +171,8 @@
     ("Collections" "unmodifiableMap" 1)
     ("Collections" "unmodifiableSet" 1)
     ("Compiler" "eval" 1 2)
+    ("CompletableFuture" "allOf" varargs)
+    ("CompletableFuture" "anyOf" varargs)
     ("Executors" "newCachedThreadPool" 0 1)
     ("Executors" "newFixedThreadPool" 1 2)
     ("Executors" "newScheduledThreadPool" 1 2)

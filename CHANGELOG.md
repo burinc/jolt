@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`java.util.concurrent.CompletableFuture`.** `(CompletableFuture.)` was "No
+  matching ctor", so nothing written against the class ran. It is a Future and
+  a CompletionStage now: `complete`, `completeExceptionally`, `cancel`,
+  `obtrudeValue`/`obtrudeException`, the statics `completedFuture`,
+  `failedFuture`, `supplyAsync`, `runAsync`, `allOf`, `anyOf` and
+  `delayedExecutor`; `get` and its timed overload, `join`, `getNow`,
+  `resultNow`, `exceptionNow`, `state` and the predicates; and the stage
+  methods — `thenApply`, `thenAccept`, `thenRun`, `thenCompose`,
+  `thenCombine`, `thenAcceptBoth`, `runAfterBoth`, the `Either` three,
+  `handle`, `whenComplete`, `exceptionally`, `exceptionallyCompose`, each with
+  its `Async` forms — plus `orTimeout`, `completeOnTimeout`, `completeAsync`,
+  `copy` and `toCompletableFuture`. The exception wrapping is the JVM's: a
+  dependent stage fails with a `CompletionException` over the cause, `get`
+  raises `ExecutionException` and `join` `CompletionException`, and
+  `exceptionally`/`handle` see the raw throwable on the stage that failed and
+  the wrapped one downstream. Dependents registered before completion run
+  newest first, as the JVM's do. `get` and `deref` are interruptible and `join`
+  is not, from a thread or a fiber; a completion race has one winner and a
+  callback registered while the future completes runs exactly once. A
+  function argument can be a Clojure fn or a reified `java.util.function`
+  interface, an `Executor` any pool shim or a reify. The async pool is a
+  cached thread pool rather than the ForkJoin common pool. 83 corpus rows
+  certify the surface against Clojure 1.12.5 on JDK 21; the interrupt and
+  fiber cases are unit rows and `fiber-blocking.clj` cases. Two details are
+  documented divergences: `whenComplete` cannot record the action's throwable
+  as suppressed, and async stages do not run on threads named
+  `ForkJoinPool.commonPool-worker-N`. Left out: `completedStage`,
+  `failedStage` and `minimalCompletionStage` (the `MinimalStage` view), and
+  `defaultExecutor`.
+
 ### Fixed
 
 - **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
@@ -59,6 +91,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message; the JVM's `Throwable(Throwable)` sets it to
   `"java.lang.IllegalStateException: bad"`, and jolt now does too, for every
   exception class.
+
+- **`Process.onExit` returns a real CompletableFuture** that completes with the
+  Process. It was a stub that answered `thenRun` only, and its `thenApply`
+  returned the stub without calling the function.
+- **`future?`, `future-done?`, `future-cancel` and `future-cancelled?` accept
+  any `java.util.concurrent.Future`**, as they do on the JVM — a `FutureTask`,
+  an executor's future, a CompletableFuture. `(future? a-future-task)` was
+  false and `future-done?` threw on one; on a value that is not a Future the
+  last three are now the JVM's `ClassCastException`, and so is `realized?` of
+  a FutureTask, which answered `false`.
+- **A reified `Callable` or `Runnable` submitted to an executor runs.** It was
+  invoked as a fn, so its future failed with "cannot be cast to
+  clojure.lang.IFn". `(.run f)` and `(.call f)` on a fn work too.
+- **Reified `java.util.function` arguments** to `HashMap`'s `computeIfAbsent`,
+  `computeIfPresent`, `compute`, `merge` and `forEach`,
+  `AtomicReference.updateAndGet`/`getAndUpdate`, and `Optional.orElseGet`/
+  `ifPresent` are called through their method; they failed the same way.
+- **A timed `Future.get` that runs out raises `TimeoutException` with no
+  message**, as the JVM does. It said "timed out waiting for the task".
 
 ## [0.8.15] - 2026-09-29
 
