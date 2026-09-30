@@ -313,6 +313,9 @@
 ;; rename or a direct-linked build cannot make the scan blind instead of failing.
 (define sm-call-take "(var-deref \"clojure.core.async\" \"__sm-take\")")
 (define sm-call-put  "(var-deref \"clojure.core.async\" \"__sm-put\")")
+;; <!! / >!!'s own kind, the cheap park with the interrupt arm (sm.ss)
+(define sm-call-take!! "(var-deref \"clojure.core.async\" \"__sm-take!!\")")
+(define sm-call-put!!  "(var-deref \"clojure.core.async\" \"__sm-put!!\")")
 
 ;; A form with a constant pool (a def, or a top-level form holding a fn) reads a
 ;; var through a cell the pool binds once — (_kc$N (jolt-var "ns" "name")) at the
@@ -345,7 +348,8 @@
                  (loop (fx+ j m)
                        (string-replace-all s (string-append "(var-cell-deref " cell ")") (cdr op)))))))))
    s
-   (list (cons "__sm-take" sm-call-take) (cons "__sm-put" sm-call-put))))
+   (list (cons "__sm-take" sm-call-take) (cons "__sm-put" sm-call-put)
+         (cons "__sm-take!!" sm-call-take!!) (cons "__sm-put!!" sm-call-put!!))))
 (define (emit-scheme src)
   (canonical-park-spellings (jolt-analyze-emit-form (jolt-ce-read src) "user")))
 
@@ -366,6 +370,10 @@
          (or (pair? winds) (loop (fx+ i (string-length sm-call-take)) depth winds)))
         ((at? i sm-call-put)
          (or (pair? winds) (loop (fx+ i (string-length sm-call-put)) depth winds)))
+        ((at? i sm-call-take!!)
+         (or (pair? winds) (loop (fx+ i (string-length sm-call-take!!)) depth winds)))
+        ((at? i sm-call-put!!)
+         (or (pair? winds) (loop (fx+ i (string-length sm-call-put!!)) depth winds)))
         ((char=? (string-ref s i) #\")
          (let skip ((j (fx+ i 1)))
            (cond ((fx>=? j n) #f)
@@ -403,6 +411,10 @@
             (gate-sub? (emit-scheme "(go (<! ch))") sm-call-take) #t)
 (gate-check "1c. and the put spelling too"
             (gate-sub? (emit-scheme "(go (>! ch 1))") sm-call-put) #t)
+(gate-check "1c. and <!!'s interruptible spelling"
+            (gate-sub? (emit-scheme "(go (<!! ch))") sm-call-take!!) #t)
+(gate-check "1c. and >!!'s"
+            (gate-sub? (emit-scheme "(go (>!! ch 1))") sm-call-put!!) #t)
 
 (for-each
  (lambda (p)
@@ -422,7 +434,31 @@
   ;; a rewritten park BEFORE a wind, and a wind inside a continuation the pass
   ;; built: legal, and the shape most likely to trip a sloppier check
   (cons "a park, then a wind"     "(go (do (<! ch) (try :a (finally :b))))")
-  (cons "a wind, then a park"     "(go (do (try :a (finally :b)) (<! ch)))")))
+  (cons "a wind, then a park"     "(go (do (try :a (finally :b)) (<! ch)))")
+  (cons "a blocking take"         "(go (<!! ch))")
+  (cons "a blocking put"          "(go (>!! ch 1))")
+  (cons "a blocking take in a try" "(go (try (<!! ch) (finally :x)))")))
+
+;; --- 1e. no cheap park inside a HANDLER ---------------------------------------
+;; The interruptible cheap park (sm.ss jolt-sm-commit!/intr) raises
+;; InterruptedException from the driver's re-entry, not from the <!! as written,
+;; so no handler live at the park is live at the raise. That is only the capture
+;; path's outcome if no rewritten park ever sits inside a handler — and a
+;; try/catch with no finally emits no dynamic-wind, so 1c cannot see one. The pass
+;; guarantees it by keeping `try` opaque; these check the emission.
+(define (count-sub s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0) (c 0))
+      (cond ((fx>? (fx+ i m) n) c)
+            ((string=? (substring s i (fx+ i m)) sub) (loop (fx+ i m) (fx+ c 1)))
+            (else (loop (fx+ i 1) c))))))
+(gate-check "1e. a <!! inside try/catch is not rewritten"
+            (gate-sub? (emit-scheme "(go (try (<!! ch) (catch Exception e :x)))") sm-call-take!!) #f)
+(gate-check "1e. a >!! inside try/catch is not rewritten"
+            (gate-sub? (emit-scheme "(go (try (>!! ch 1) (catch Exception e :x)))") sm-call-put!!) #f)
+(gate-check "1e. beside a try, only the park outside it is rewritten"
+            (count-sub (emit-scheme "(go (do (<!! ch) (try (<!! ch) (catch Exception e :x))))")
+                       sm-call-take!!) 1)
 
 ;; --- 1d. the winds the scan above CANNOT see --------------------------------
 ;; What 1c reads is the emitted Scheme, so it only ever sees a wind the BACK END
@@ -637,13 +673,17 @@
 ;; sm-cps-seq's ordering can go wrong silently
 (gate-check "put: channel and value in source order, k last"
             (gate-sub? x-put "__sm-put ch 1 k__") #t)
-;; >!! and <!! are NOT park ops to the pass: Thread.interrupt throws out of them
-;; and not out of a park, and the cheap park has no interrupt arm, so they stay
-;; ordinary calls (async.clj sm-park-kind).
-(gate-check ">!! is not a park op to the pass"
-            (gate-sub? (go-expansion "(go (clojure.core.async/>!! ch 1))") "__sm-") #f)
-(gate-check "<!! is not a park op to the pass"
-            (gate-sub? (go-expansion "(go (clojure.core.async/<!! ch))") "__sm-") #f)
+;; >!! and <!! are park ops of their OWN kind: Thread.interrupt throws out of
+;; them and not out of <! / >!, so they rewrite to the ops whose cheap park has
+;; the interrupt arm, and <! / >! do not (async.clj sm-park-kind).
+(gate-check ">!! -> __sm-put!!"
+            (gate-sub? (go-expansion "(go (clojure.core.async/>!! ch 1))") "__sm-put!!") #t)
+(gate-check "<!! -> __sm-take!!"
+            (gate-sub? (go-expansion "(go (clojure.core.async/<!! ch))") "__sm-take!!") #t)
+(gate-check "<! -> not the interruptible op"
+            (gate-sub? (go-expansion "(go (clojure.core.async/<! ch))") "__sm-take!!") #f)
+(gate-check ">! -> not the interruptible op"
+            (gate-sub? (go-expansion "(go (clojure.core.async/>! ch 1))") "__sm-put!!") #f)
 (gate-check "put through a call -> go-spawn"
             (gate-sub? (go-expansion "(go (helper-put ch 1))") "__sm-") #f)
 

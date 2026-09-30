@@ -1248,13 +1248,14 @@
      (jolt-fiber-state-set! f 'running)
      (cond
        ((jolt-fiber-k f) ((jolt-fiber-k f)))
-       ;; An sm RESUME (a pending step, not #f/'running): the thunk is java/sm.ss's
+       ;; An sm RESUME (a pending step, not #f/'running — a procedure, or an sm-wait
+       ;; record for an interruptible <!! / >!! park): the thunk is java/sm.ss's
        ;; driver, which installs its own handler and escapes to the scheduler
        ;; itself. Guarding it here would be redundant AND wrong — this handler
        ;; marks the fiber dead without closing the body's go channel, so a reader
        ;; of that channel would wait forever. Skipping it also keeps the guard's
        ;; call/cc off the resume path the cheap park exists to make cheap.
-       ((procedure? (jolt-fiber-sm f))
+       ((let ((sm (jolt-fiber-sm f))) (and sm (not (eq? sm 'running))))
         ((jolt-fiber-thunk f))
         ;; Unreachable: jolt-sm-drive parks, finishes, or dies, and each of those
         ;; escapes to the scheduler through the carrier's sched-k. But it is the

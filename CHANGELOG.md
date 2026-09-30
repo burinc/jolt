@@ -25,9 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   promise's handler registered, so there a later put is swallowed by the taker
   that threw and a later take receives the value of a put that threw; that
   difference is recorded in `known-divergences.edn`. The fiber side follows the
-  0.7.26 rule for fibers sharing a carrier. `<!!` and `>!!` inside a `go` body
-  are no longer rewritten into the cheap park, since that park has no interrupt
-  arm; they are ordinary blocking calls there, as on the JVM.
+  0.7.26 rule for fibers sharing a carrier. Inside a `go` body `<!!` and `>!!`
+  keep the cheap park (a stored closure rather than a captured stack, about 1.3
+  KB per parked block against 5.1 KB), which now carries the interrupt arm;
+  `<!`, `>!` and `alts!` keep the one without it.
 
 - **`java.util.concurrent.TimeoutException` can be constructed.**
   `(TimeoutException.)` and `(TimeoutException. "msg")` raised "No matching ctor

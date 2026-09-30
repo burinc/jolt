@@ -522,6 +522,12 @@
   ;; ...and a fiber's <! is not interruptible. Thread/interrupted reads the flag
   ;; AND clears it, so the row leaves no set flag on a carrier later rows share.
   {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (let [v (a/<! c)] [(jolt.host/fiber?) v (Thread/interrupted)]))] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 50) (a/>!! c 5) (deref (future (a/<!! g)) 5000 :hung)))))" :expected "[true 5 true]"}
+  ;; With no try around it, a <!! / >!! in a go body is a CHEAP park (the pass
+  ;; rewrites it to __sm-take!! / __sm-put!!), and that park carries the interrupt
+  ;; arm too: the body dies with InterruptedException, which go-monitor reports,
+  ;; and the channel is left as it was — no taker counted, no value queued.
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (a/<!! c) :took) mon (a/go-monitor g)] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 100) [(a/offer! c 1) (a/poll! c) (let [e (deref (future (a/<!! mon)) 5000 :hung)] (if (instance? Throwable e) (.getName (class e)) e)) (deref (future (a/<!! g)) 5000 :hung)]))))" :expected "[nil nil \"java.lang.InterruptedException\" nil]"}
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (a/>!! c :v) :put) mon (a/go-monitor g)] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 100) [(a/offer! c 1) (a/poll! c) (let [e (deref (future (a/<!! mon)) 5000 :hung)] (if (instance? Throwable e) (.getName (class e)) e)) (deref (future (a/<!! g)) 5000 :hung)]))))" :expected "[nil nil \"java.lang.InterruptedException\" nil]"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}

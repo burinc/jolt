@@ -48,13 +48,21 @@
 ;; that expands to a park is invisible to the pre-scan, which costs it the cheap
 ;; park and nothing else.
 ;;
-;; <!! and >!! are NOT park ops to the pass. They wait the same way <! and >! do,
-;; but a Thread.interrupt throws out of them and not out of a park (async.ss
-;; ac-intr-wait!), and the cheap park has no interrupt arm. So a <!! in a go body
-;; stays an ordinary call, as it is on the JVM, where it blocks the dispatch
-;; thread rather than parking.
+;; <!! and >!! are park ops too, but of their OWN kind: a Thread.interrupt throws
+;; out of them and not out of <! / >! (async.ss ac-intr-wait!), so they rewrite to
+;; __sm-take!! / __sm-put!!, whose cheap park carries the interrupt arm
+;; (sm.ss jolt-sm-commit!/intr), and <! / >! keep the arm-less one.
 (def ^:private sm-take-var #'clojure.core.async/<!)
+(def ^:private sm-take!!-var #'clojure.core.async/<!!)
 (def ^:private sm-put-var #'clojure.core.async/>!)
+(def ^:private sm-put!!-var #'clojure.core.async/>!!)
+
+;; park kind -> the op the pass emits for it
+(def ^:private sm-park-ops
+  {:take 'clojure.core.async/__sm-take
+   :take!! 'clojure.core.async/__sm-take!!
+   :put 'clojure.core.async/__sm-put
+   :put!! 'clojure.core.async/__sm-put!!})
 
 ;; Forms the pass does not look inside. A park in one of them stays where it is;
 ;; a park-free one is emitted whole.
@@ -138,15 +146,17 @@
 ;; descends, and sm-expand hands it to the expander so a macro sees the scope the
 ;; analyzer would have shown it.
 (defn- sm-park-kind
-  "nil, :take or :put — and only when sym resolves to the exact var. A local of
-  the same name shadows it."
+  "nil, :take, :take!!, :put or :put!! — and only when sym resolves to the exact
+  var. A local of the same name shadows it."
   [ctx sym]
   (when (and (symbol? sym) (not (contains? (:env ctx) sym)))
     (let [v (resolve (:env ctx) sym)]
       (cond
         (nil? v) nil
         (identical? v sm-take-var) :take
+        (identical? v sm-take!!-var) :take!!
         (identical? v sm-put-var) :put
+        (identical? v sm-put!!-var) :put!!
         :else nil))))
 
 (defn- sm-parks? [ctx form]
@@ -357,9 +367,7 @@
           (sm-cps-seq ctx (vec (rest ex))
                       (fn [_ args]
                         (apply list
-                               (if (= pk :take)
-                                 'clojure.core.async/__sm-take
-                                 'clojure.core.async/__sm-put)
+                               (sm-park-ops pk)
                                (concat args [k]))))
 
           (= sf 'do) (sm-cps-body ctx (rest ex) k)
