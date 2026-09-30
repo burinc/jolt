@@ -2392,7 +2392,15 @@
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).
         (cons "runFinalization" (lambda (self) jolt-nil))
-        (cons "exec" (lambda (self . args) (proc-runtime-exec args)))))
+        (cons "exec" (lambda (self . args) (proc-runtime-exec args)))
+        ;; Runtime.halt: end the process NOW — no shutdown hooks and no wait for
+        ;; live threads, which is what separates it from System/exit. Our own
+        ;; buffered output is flushed first, as the JVM's System.out has none.
+        (cons "halt" (lambda (self code)
+          (guard (_ (#t #f)) (flush-output-port (current-output-port)))
+          (guard (_ (#t #f)) (flush-output-port (current-error-port)))
+          (let ((n (jnum->exact code)))
+            (if c-underscore-exit (c-underscore-exit n) (exit n)))))))
 (register-class-statics! "java.lang.Runtime" (list (cons "getRuntime" (lambda () the-jolt-runtime))))
 
 ;; instance? and (class x) for the ProcessBuilder / Process / Redirect shims are

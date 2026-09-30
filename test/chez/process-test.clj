@@ -805,3 +805,7 @@
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
       (println "PROCESS-TEST FAILED:" (count @failures))))
+
+;; Done with the agent system's pools (futures, agents): end them, as a JVM
+;; program does, or their idle workers hold the process up for their keep-alive.
+(shutdown-agents)

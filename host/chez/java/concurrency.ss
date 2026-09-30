@@ -104,11 +104,16 @@
 ;; fork; we also install an explicit snapshot for certainty). The result — value
 ;; or thrown condition — is latched and broadcast; a cancel that already finalized
 ;; the future makes the late result a no-op.
+;; A future runs on the agent system's cached pool on the JVM, so after
+;; shutdown-agents it is refused, and after it finishes its worker idles for the
+;; pool's keep-alive, holding the process up (exit-linger!, below).
 (define (jolt-future-call thunk)
+  (when (jolt-agents-shutdown?)
+    (jolt-throw (jolt-host-throwable "java.util.concurrent.RejectedExecutionException" jolt-nil)))
   (let* ((ibox (box #f))
          (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) ibox))
          (snap (dyn-binding-stack)))
-    (fork-thread
+    (fork-agent-thread
      (lambda ()
        (*txn* #f)                          ; child thread must not inherit parent's txn
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
@@ -124,7 +129,8 @@
              (jolt-future-ok?-set! f (car r))
              (jolt-future-payload-set! f (cdr r))
              (jolt-future-done?-set! f #t))
-           (jolt-cv-wake! (jolt-future-cv f))))))
+           (jolt-cv-wake! (jolt-future-cv f)))
+         (exit-linger-after-task!))))
     f))
 
 ;; Wrap a task's captured throw in an ExecutionException, the original as the
@@ -309,7 +315,74 @@
 ;; workers still drain their queues). Mirrors the JVM executor shutdown.
 (define agents-shutdown? (box #f))
 (define (jolt-agents-shutdown?) (unbox agents-shutdown?))
-(define (jolt-shutdown-agents) (set-box! agents-shutdown? #t) jolt-nil)
+(define (jolt-shutdown-agents)
+  (set-box! agents-shutdown? #t)
+  (exit-release-pools!)
+  jolt-nil)
+
+;; --- the process's exit wait ----------------------------------------------------
+;; The JVM ends when the program's main returns only once every live non-daemon
+;; thread has finished; clojure.main does nothing else, so a script whose last act
+;; starts work on a non-daemon thread waits for it. The live count is kept where
+;; every thread is forked (lazy-bridge.ss, exit-nondaemon-live), and a thread's
+;; daemon flag is the one Thread.isDaemon answers, so the two cannot disagree.
+;;
+;; Two more holds stand for the agent system's pools, which jolt does not run
+;; (futures and agent actions get threads of their own) but whose idle workers
+;; keep a JVM up all the same, certified with timing probes on JDK 21:
+;;
+;;   future / future-call / pmap / send-off  the cached "solo" pool: its worker
+;;       idles 60s after its last task, so the process ends 60s after the last one
+;;       finishes. exit-linger-after-task! is called as each task ends, on the
+;;       task's own thread, and only a non-daemon one counts (a pool thread made
+;;       on a daemon thread is a daemon).
+;;   send / await / await-for  the fixed pool: its workers never time out, so
+;;       after one of these the process never ends by itself.
+;;
+;; shutdown-agents ends both at once; what is still running is waited for, as the
+;; JVM's shutdown lets running tasks finish. System/exit, Runtime.halt and an
+;; uncaught error end the process without any of this, as there.
+;; A babashka task (`jolt run`) is the one entry that is not clojure.main: bb's
+;; agent pools are made of DAEMON threads (certified on bb: a future's, a
+;; send-off's isDaemon is true), so a task that leaves a future running ends
+;; without it, and nothing lingers. jolt.main switches this on before a task runs.
+;; A plain Thread and an Executors pool behave as on the JVM under bb too.
+(define agent-threads-daemon? #f)
+(def-var! "jolt.host" "agent-threads-daemon!"
+  (lambda () (set! agent-threads-daemon? #t) jolt-nil))
+(define (fork-agent-thread thunk)
+  (if agent-threads-daemon? (fork-thread/daemon #t thunk) (fork-thread thunk)))
+(define solo-pool-keep-alive-ms 60000)     ; Executors.newCachedThreadPool's 60L, SECONDS
+(define (exit-linger-after-task!)
+  (unless (jolt-thread-daemon? (get-thread-id))
+    (let ((until (+ (now-millis) solo-pool-keep-alive-ms)))
+      (jolt-with-mutex exit-mu
+        (unless exit-pools-shut?
+          (when (or (not exit-linger-until) (> until exit-linger-until))
+            (set! exit-linger-until until)))))))
+(define (exit-hold-pooled!)
+  (unless (or agent-threads-daemon? (jolt-thread-daemon? (get-thread-id)))
+    (jolt-with-mutex exit-mu
+      (unless exit-pools-shut? (set! exit-pooled-held? #t)))))
+(define (exit-release-pools!)
+  (jolt-with-mutex exit-mu
+    (set! exit-pools-shut? #t)
+    (set! exit-pooled-held? #f)
+    (set! exit-linger-until #f)
+    (condition-broadcast exit-cv)))
+;; Blocks the calling THREAD until nothing holds the process up. Called at
+;; process end on the main thread (the CLI's normal return and a built binary's
+;; launcher), never from a fiber.
+(define (jolt-await-user-threads!)
+  (jolt-with-mutex exit-mu
+    (let loop ()
+      (cond
+        ((fx>? exit-nondaemon-live 0) (jolt-condition-wait exit-cv exit-mu) (loop))
+        (exit-pooled-held? (jolt-condition-wait exit-cv exit-mu) (loop))
+        ((and exit-linger-until (> exit-linger-until (now-millis)))
+         (jolt-condition-wait exit-cv exit-mu (jolt-millis->time exit-linger-until))
+         (loop))
+        (else (void))))))
 
 ;; Thread-local list of (agent f . args) sent from within the action currently
 ;; running on this thread (#f outside an action). Holds nested sends until the
@@ -391,7 +464,7 @@
     (jagent-q-push! a (cons f args))
     (unless (jolt-agent-running? a)
       (jolt-agent-running?-set! a #t)
-      (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
+      (fork-agent-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
   a)
 
 ;; Dispatch the held nested sends accumulated on this thread, returning the count
@@ -421,6 +494,8 @@
                      (begin (jolt-agent-running?-set! a #f)
                             (jolt-cv-wake! (jolt-agent-cv a)) #f)
                      (jagent-q-pop! a)))))
+      ;; idle: the pool worker this stands for would linger (exit wait, below)
+      (unless act (exit-linger-after-task!))
       (when act
         (parameterize ((*agent-nested* (box '())))
           (let ((err #f))
@@ -452,12 +527,28 @@
 ;; them identically — one serialized worker per agent — observably a superset of
 ;; the JVM fixed/cached pool split.) A send after shutdown-agents, to a failed
 ;; agent, inside a transaction, or from within an action is handled specially.
+;; A send after shutdown-agents is the pool REJECTING the action, which the JVM's
+;; Agent catches and hands to the agent's error handler: the send itself returns
+;; the agent and the action never runs (certified: (send a inc) after
+;; shutdown-agents answers the agent). It used to throw RejectedExecutionException.
+;;
+;; send and send-off differ only in the pool the JVM runs the action on, and so in
+;; what keeps the process up after it: send's fixed pool for good, send-off's cached
+;; pool for its keep-alive (the exit wait, below). send-via takes the caller's
+;; executor and holds nothing of the agent system's.
 (define (jolt-agent-send a f . args)
+  (exit-hold-pooled!)
+  (apply jolt-agent-dispatch a f args))
+(define (jolt-agent-send-off a f . args)
+  (apply jolt-agent-dispatch a f args))
+(define (jolt-agent-dispatch a f . args)
   (cond
     ((jolt-agents-shutdown?)
-     (jolt-throw (jolt-host-throwable
-                  "java.util.concurrent.RejectedExecutionException"
-                  "Agent pool has been shut down")))
+     (let ((handler (jolt-agent-err-handler a)))
+       (unless (jolt-nil? handler)
+         (guard (_ (#t #f))
+           (jolt-invoke handler a (jolt-host-throwable
+                                   "java.util.concurrent.RejectedExecutionException" jolt-nil))))))
     ((not (jolt-nil? (jolt-agent-err a)))
      (jolt-throw (jolt-host-throwable "java.lang.RuntimeException"
                                       "Agent is failed, needs restart")))
@@ -494,8 +585,11 @@
 ;; it, which is the same two cases the retake makes one: the agent failed before we
 ;; got here, or it failed while we waited (the worker halts and wakes us). Either
 ;; way the JVM throws on a failed agent rather than returning normally.
+;; await and await-for dispatch their latch action with send on the JVM, so they
+;; hold the process up as a send does.
 (define (jolt-agent-await . agents)
   (jolt-agent-await-check)
+  (unless (null? agents) (exit-hold-pooled!))
   (for-each
     (lambda (a)
       (jolt-cv-wait-interruptibly "agent await" (jolt-agent-mu a) (jolt-agent-cv a) #f
@@ -511,6 +605,7 @@
     (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "await-for in transaction")))
   (when (jolt-in-agent-action?)
     (jolt-throw (jolt-host-throwable "java.lang.Exception" "Can't await in agent action")))
+  (unless (null? agents) (exit-hold-pooled!))
   (let ((deadline (ms->deadline-millis ms)) (ok #t))
     (for-each
       (lambda (a)
@@ -676,7 +771,7 @@
           (cond (clear? (jagent-q-clear! a))
                 ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
                  (jolt-agent-running?-set! a #t)
-                 (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
+                 (fork-agent-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
   ;; Agent.restart answers the NEW STATE, not the agent (and clear-agent-errors,
   ;; which is restart-agent over the current state, answers that state in turn).
   new-state)
@@ -941,10 +1036,10 @@
 (def-var! "clojure.core" "agent" jolt-agent-new)
 (def-var! "clojure.core" "agent?" jolt-agent?)
 (def-var! "clojure.core" "send" jolt-agent-send)
-(def-var! "clojure.core" "send-off" jolt-agent-send)
+(def-var! "clojure.core" "send-off" jolt-agent-send-off)
 ;; send-via takes an executor jolt has no model for; behave as send and ignore it.
 (def-var! "clojure.core" "send-via"
-  (lambda (_exec a f . args) (apply jolt-agent-send a f args)))
+  (lambda (_exec a f . args) (apply jolt-agent-dispatch a f args)))
 ;; Documented superset no-ops: jolt has no executor pool, so these accept and
 ;; ignore their argument, returning nil (as the JVM setters would).
 (def-var! "clojure.core" "set-agent-send-executor!" (lambda (_e) jolt-nil))
@@ -1769,29 +1864,12 @@
 ;; flag said when it STARTED, and setDaemon on a live thread is an
 ;; IllegalThreadStateException. jolt used to exit the moment -main returned,
 ;; live threads or not, and accept setDaemon silently, so a program whose work
-;; ran on a Thread it started lost that work at exit. Each non-daemon start
-;; counts itself in and its completion counts itself out; the CLI's normal-
-;; return path and a built binary's launcher wait for zero before the shutdown
-;; hooks run (jolt-await-user-threads!). System/exit does not wait -- neither
-;; does the JVM's.
+;; ran on a Thread it started lost that work at exit. The fork counts a non-
+;; daemon thread in and its end counts it out (lazy-bridge.ss), whatever started
+;; it; the CLI's normal-return path and a built binary's launcher wait before the
+;; shutdown hooks run (jolt-await-user-threads!). System/exit does not wait --
+;; neither does the JVM's.
 (define (jthread-daemon? st) (vector-ref st 8))
-(define user-threads-mu (make-mutex))
-(define user-threads-cv (make-condition))
-(define user-threads-live 0)
-(define (user-thread-started!)
-  (jolt-with-mutex user-threads-mu (set! user-threads-live (+ user-threads-live 1))))
-(define (user-thread-finished!)
-  (jolt-with-mutex user-threads-mu
-    (set! user-threads-live (- user-threads-live 1))
-    (when (<= user-threads-live 0) (jolt-cv-wake! user-threads-cv))))
-;; Blocks the calling THREAD until every started non-daemon Thread has finished.
-;; Called at process end on the main thread, never from a fiber.
-(define (jolt-await-user-threads!)
-  (jolt-with-mutex user-threads-mu
-    (let loop ()
-      (when (> user-threads-live 0)
-        (jolt-condition-wait user-threads-cv user-threads-mu)
-        (loop)))))
 ;; alive = started and not yet completed. join waits on exactly this, so a thread
 ;; that was never started is not waited for at all (JVM: isAlive is false before
 ;; .start, so join returns at once).
@@ -1818,7 +1896,6 @@
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
                                                "Thread already started")))
             (vector-set! st 5 #t)  ; mark started before forking
-            (unless (jthread-daemon? st) (user-thread-started!))
             ;; born with the object's daemon flag, so the handle currentThread
             ;; and getAllStackTraces give for it answers the same
             (fork-thread/daemon (jthread-daemon? st) (lambda ()
@@ -1856,8 +1933,7 @@
                 (let ((th (vector-ref st 0))) (when th (jolt-invoke (runnable->thunk th)))))
               (jolt-with-mutex (vector-ref st 2)
                  (vector-set! st 1 #t)
-                 (jolt-cv-wake! (vector-ref st 3)))
-              (unless (jthread-daemon? st) (user-thread-finished!))))
+                 (jolt-cv-wake! (vector-ref st 3)))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
@@ -1974,9 +2050,9 @@
 ;; #f unconditionally, which left invokeAll's deadline and invokeAny's losers with
 ;; nothing to cancel WITH.
 ;;
-;; Cancelling a task that is already RUNNING does not stop it: an executor worker
-;; carries no interrupt flag for a cancel to set (the same limit shutdownNow
-;; documents below). The future still finalizes as cancelled, so .get raises and
+;; Cancelling a task that is already RUNNING does not stop it: cancel(true) on the
+;; JVM interrupts the worker, which jolt does not do from a future (shutdownNow
+;; does interrupt its workers, below). The future still finalizes as cancelled, so .get raises and
 ;; the late result is dropped, exactly as a cancel that lands during the JVM's
 ;; own window does.
 (define (make-j-future) (make-jhost "j-future" (vector 'new jolt-nil #f (make-mutex) (make-condition))))
@@ -2116,7 +2192,8 @@
                                   cap core-n max-n keep-alive-ms 0 0 (make-condition) 0
                                   '() #f 0
                                   (and (pair? spec) (car spec) #t)
-                                  (and (pair? spec) (pair? (cdr spec)) (cadr spec))))))
+                                  (and (pair? spec) (pair? (cdr spec)) (cadr spec))
+                                  '() #f))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -2291,7 +2368,8 @@
                         (scheduled-future-run! sf st))))
           ((and (vector-ref st 0) (null? (vector-ref st 13)))
            (executor-worker-exit! st))                     ; shutdown + drained
-          ((and (vector-ref st 8) (fx>? (vector-ref st 4) (vector-ref st 6)))
+          ;; above core, or any worker once allowCoreThreadTimeOut is on
+          ((and (vector-ref st 8) (or (vector-ref st 19) (fx>? (vector-ref st 4) (vector-ref st 6))))
            (let ((dl (or deadline (+ (now-millis) (vector-ref st 8)))))
              (if (>= (now-millis) dl)
                  (executor-worker-exit! st)                ; idle past keep-alive
@@ -2315,6 +2393,16 @@
   ;; over-spawn it prevents, because the growth rule would then read a taker that
   ;; is never coming and decline to grow for good — a pool that strands the task
   ;; instead of one that runs it on a thread too many.
+  ;; Slot 18 lists the live workers' interrupt boxes, so shutdownNow can
+  ;; interrupt the tasks they are running, as the JVM's does.
+  (let ((box (current-interrupt-box)))
+    (jolt-with-mutex (vector-ref st 2) (vector-set! st 18 (cons box (vector-ref st 18))))
+    (dynamic-wind
+      void
+      (lambda () (executor-worker-loop* st))
+      (lambda ()
+        (jolt-with-mutex (vector-ref st 2) (vector-set! st 18 (remq box (vector-ref st 18))))))))
+(define (executor-worker-loop* st)
   (let ((arriving? #t))
     (define (arrived!)
       (when arriving?
@@ -2365,11 +2453,8 @@
 ;; returned rather than discarded: the returned procedures are callable, and calling
 ;; one runs that task on the caller's thread, the same recovery .run gives there.
 ;;
-;; What jolt CANNOT do is the other half of shutdownNow, interrupting the tasks
-;; already running: the workers do not carry an interrupt flag for a shutdown to
-;; set, so a task in Thread/sleep or a blocking read keeps going. The JVM
-;; interrupts those threads. Tracked; a worker would have to adopt an interrupt box
-;; the way Thread.start does.
+;; The other half of shutdownNow, interrupting the tasks already running, is in
+;; executor-shutdown-now! below: each worker registers its interrupt box.
 (define (executor-drain-queue! st)
   (let* ((q (unbox (vector-ref st 1)))
          (jobs (append (car q) (reverse (cdr q)))))
@@ -2379,6 +2464,13 @@
     jobs))
 (define (executor-shutdown-now! st)
   (vector-set! st 0 #t)
+  ;; ...and interrupt what is running: each worker's flag, then a poke at whatever
+  ;; interruptible wait it is in (the protocol Thread.interrupt uses). A task in
+  ;; Thread/sleep or a deref is thrown out with InterruptedException, and one that
+  ;; polls Thread/interrupted sees it; the worker then finds the pool shut and
+  ;; drained and exits.
+  (for-each (lambda (b) (set-box! b #t) (jolt-interrupt-wake-waits! b))
+            (jolt-with-mutex (vector-ref st 2) (vector-ref st 18)))
   (let ((dropped (jolt-with-mutex (vector-ref st 2)
                    ;; the delayed tasks come back too, in due order after the
                    ;; immediate ones, and come back AS THEY ARE — the JVM hands the
@@ -2626,6 +2718,18 @@
                             (else (loop (cdr futs) (cdr r)))))))))))
         (cons "shutdown" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
         (cons "shutdownNow" (lambda (self) (executor-shutdown-now! (jhost-state self))))
+        ;; ThreadPoolExecutor.allowCoreThreadTimeOut: core workers retire after the
+        ;; keep-alive too, so an idle pool stops holding the process up. The JVM
+        ;; refuses it for a pool whose keep-alive is not positive.
+        (cons "allowCoreThreadTimeOut" (lambda (self on)
+          (let ((st (jhost-state self)) (on (jolt-truthy? on)))
+            (when (and on (not (and (vector-ref st 8) (> (vector-ref st 8) 0))))
+              (throw-jvm 'IllegalArgumentException "Core threads must have nonzero keep alive times"))
+            (jolt-with-mutex (vector-ref st 2)
+              (vector-set! st 19 on)
+              (jolt-cv-wake! (vector-ref st 3))))   ; idle core workers: start timing
+          jolt-nil))
+        (cons "allowsCoreThreadTimeOut" (lambda (self) (and (vector-ref (jhost-state self) 19) #t)))
         ;; close is shutdown plus an unbounded awaitTermination, and it BLOCKS —
         ;; "blocks until all tasks have completed execution", as the JVM has it
         ;; since 19. It used to return the moment the flag was set, so the one

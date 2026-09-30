@@ -113,3 +113,7 @@
   (do (println "DYN-BINDING FAILED")
       (doseq [f @failures] (println "  " f))
       (System/exit 1)))
+
+;; Done with the agent system's pools (futures, agents): end them, as a JVM
+;; program does, or their idle workers hold the process up for their keep-alive.
+(shutdown-agents)

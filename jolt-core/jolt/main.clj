@@ -743,6 +743,10 @@
     ;; tolerant: see load-natives! — the task may be the build step for a
     ;; :jolt/native library that does not exist yet
     (apply-project! resolved false)
+    ;; babashka's exit rule, not clojure.main's: bb's future and agent threads are
+    ;; daemons, so a task ends without waiting on them (a Thread it starts, or a
+    ;; pool it never shuts down, still holds the process up, as there)
+    (jolt.host/agent-threads-daemon!)
     ;; a task is an entry too (clojure.main -T): its body is user code running
     ;; after the load, and :run-main-opts lands in run-ns' own entry frame.
     (with-entry-bindings

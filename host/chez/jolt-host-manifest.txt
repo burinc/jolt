@@ -10,6 +10,7 @@
 add-immutable-roots!
 add-reader-features!
 add-shutdown-hook
+agent-threads-daemon!
 allow-unresolved-vars?
 aot-compile-worker
 as-subvec

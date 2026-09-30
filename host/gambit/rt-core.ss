@@ -1544,6 +1544,7 @@
 (define (jolt-java-future? x) #f)
 (define jolt-agent-new (jolt-conc-unsupported 'agent))
 (define jolt-agent-send (jolt-conc-unsupported 'send))
+(define jolt-agent-send-off (jolt-conc-unsupported 'send-off))
 (define jolt-agent-await (jolt-conc-unsupported 'await))
 (define jolt-agent-error (jolt-conc-unsupported 'agent-error))
 (define jolt-agent-restart (jolt-conc-unsupported 'restart-agent))

@@ -228,7 +228,7 @@ check '(require [clojure.java.io :as io] [clojure.string :as s])
 check '(eval (quote (+ 1 2)))' '3'
 check '(load-string "(def y 5) (* y y)")' '25'
 check '(defmacro add1 [x] (list (quote +) x 1)) (add1 10)' '11'
-check '(deref (future (+ 1 2)))' '3'
+check '(let [r (deref (future (+ 1 2)))] (shutdown-agents) r)' '3'
 check '(/ 1 2)' '1/2'
 check '(= 3 3.0)' 'false'
 check '(== 3 3.0)' 'true'
@@ -1659,7 +1659,7 @@ if [ -n "$cpu_want" ]; then
   check '(jolt.host/available-processors)' "$cpu_want"
   # pmap sizes its look-ahead window from it, so a broken count degrades pmap
   # rather than failing it — assert the seam is wired, not just present.
-  check '(count (pmap inc (range 100)))' '100'
+  check '(let [n (count (pmap inc (range 100)))] (shutdown-agents) n)' '100'
 fi
 
 # jolt.parser — the general parser-combinator core, running rm-hull/jasentaa's

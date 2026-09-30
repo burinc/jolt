@@ -134,13 +134,16 @@
        (not (await-for 50 slow))))
 
 ;; --- agents: shutdown-agents ----------------------------------------------
-;; After shutdown-agents, send throws RejectedExecutionException; in-flight
-;; workers may finish their queues.
-(let [a (agent 0)]
+;; After shutdown-agents the pool rejects the action, and the JVM's Agent hands
+;; that RejectedExecutionException to the agent's error handler rather than
+;; throwing it from send: send returns the agent and the action never runs
+;; (JVM Clojure 1.12.5 / JDK 21: [true "java.util.concurrent.RejectedExecutionException" 0]).
+(let [seen (promise)
+      a (agent 0 :error-handler (fn [_ e] (deliver seen (.getName (class e)))))]
   (shutdown-agents)
-  (chk "agents: send after shutdown throws RejectedExecutionException"
-       (instance? java.util.concurrent.RejectedExecutionException
-                  (try (send a inc) nil (catch Throwable e e)))))
+  (chk "agents: send after shutdown goes to the error handler"
+       (= [true "java.util.concurrent.RejectedExecutionException" 0]
+          [(identical? a (send a inc)) (deref seen 2000 :none) @a])))
 
 (if (empty? @failures)
   (println "TAP-AGENTS OK")

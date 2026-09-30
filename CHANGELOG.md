@@ -39,6 +39,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failedStage` and `minimalCompletionStage` (the `MinimalStage` view), and
   `defaultExecutor`.
 
+### Changed
+
+- **The process waits for its non-daemon threads before it exits, as the JVM
+  does.** jolt used to end the moment `-main`, a script, `-e` or the REPL
+  returned, waiting only for a `Thread.` the program had started itself, so work
+  still running on a future, an agent or an executor was silently dropped. The
+  rule is now clojure.main's, each case measured against JVM Clojure 1.12.5 on
+  JDK 21: every live non-daemon thread holds the process up, whatever started
+  it, and daemon threads never do. That includes the idle holds a JVM Clojure
+  program has — **this is the part that can change how an existing script
+  behaves**:
+  - after a `future`, `pmap`, `pcalls` or `send-off`, the process stays up for
+    60 s after the last one finishes (the agent system's cached pool keeps its
+    idle worker that long), unless the program calls `shutdown-agents`;
+  - after a `send`, `await` or `await-for` it does not end by itself at all
+    (that pool's workers never time out) until `shutdown-agents`;
+  - an Executors pool that is never shut down keeps it up for good, as a
+    non-daemon thread blocked forever does; after `.shutdown` it ends once the
+    queue drains.
+
+  A script that relied on exiting with a future or a pool still pending now
+  waits, or hangs, exactly as it would on the JVM; end it the JVM way, with
+  `shutdown-agents`, `.shutdown`, a daemon thread, or `System/exit`.
+  `System/exit`, `Runtime.halt` (new) and an uncaught error still end the
+  process at once; shutdown hooks run after the wait, as there. Daemon threads
+  are never waited for: `core.async`'s `thread`, `go` and `io-thread`,
+  CompletableFuture's async pool, a pool whose `ThreadFactory` makes daemons,
+  and jolt's own runtime threads. `jolt run <task>` follows babashka's rule
+  instead of clojure.main's: bb's future and agent threads are daemons, so a
+  task does not wait on them (a `Thread.` it starts, or a pool it never shuts
+  down, still holds the process up there as here). Built binaries wait the same
+  way as the CLI.
+
+  Along with it, as on the JVM: a `future` after `shutdown-agents` throws
+  `RejectedExecutionException`, and a `send` after it returns the agent and
+  hands the rejection to the agent's error handler (it used to throw);
+  `shutdownNow` interrupts the tasks its workers are running (it used to leave
+  them running); `ThreadPoolExecutor.allowCoreThreadTimeOut` is implemented;
+  and `put!`/`take!` callbacks, `core.async`'s mixed and compute executors and
+  the io poller run on daemon threads, so none of them holds the process up.
+
 ### Fixed
 
 - **`Thread.isDaemon` answers for every thread.** `(.isDaemon
@@ -57,10 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live thread's handle is `IllegalThreadStateException`, as on the JVM. The
   handle also gains `isAlive`, `isVirtual`, `threadId`, and `getPriority`/
   `setPriority`, which both representations now share: validated to 1–10,
-  inherited by a new `Thread.`, and carried to the started thread. One exit
-  difference is recorded in `known-divergences.edn`: jolt still exits without
-  waiting for work pending on a future, an agent or an executor, where the JVM
-  stays up for those non-daemon threads.
+  inherited by a new `Thread.`, and carried to the started thread.
 - **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
   deref'ing a promise, so `.interrupt` throws `InterruptedException` out of them
   and clears the flag. jolt kept waiting and left the flag set, so a worker shut
