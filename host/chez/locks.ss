@@ -390,6 +390,18 @@
     (hashtable-set! jolt-cv-waiters cv
                     (cons f (hashtable-ref jolt-cv-waiters cv '())))))
 
+;; For a wait that registered F on cv but can end without a wake of cv — a fiber
+;; channel wait listed here only so an interrupt can reach it, and finished by a
+;; delivery instead (fibers-async.ss jolt-fiber-waiter-wait!/ibox). Call with the
+;; waiter's mu held, as registration is, so a waker either drains F first or finds
+;; it gone; a stale entry would otherwise resume F later, parked on something else.
+(define (jolt-cv-unregister! cv f)
+  (jolt-with-mutex jolt-cv-waiters-mu
+    (let ((fs (remq f (hashtable-ref jolt-cv-waiters cv '()))))
+      (if (null? fs)
+          (hashtable-delete! jolt-cv-waiters cv)
+          (hashtable-set! jolt-cv-waiters cv fs)))))
+
 ;; Drained as it is read, so a fiber that goes on to wait again registers itself
 ;; afresh and no resume is ever delivered twice.
 (define (jolt-cv-take-waiters! cv)

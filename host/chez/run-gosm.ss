@@ -637,8 +637,13 @@
 ;; sm-cps-seq's ordering can go wrong silently
 (gate-check "put: channel and value in source order, k last"
             (gate-sub? x-put "__sm-put ch 1 k__") #t)
-(gate-check ">!! is the same op to the pass"
-            (gate-sub? (go-expansion "(go (clojure.core.async/>!! ch 1))") "__sm-put") #t)
+;; >!! and <!! are NOT park ops to the pass: Thread.interrupt throws out of them
+;; and not out of a park, and the cheap park has no interrupt arm, so they stay
+;; ordinary calls (async.clj sm-park-kind).
+(gate-check ">!! is not a park op to the pass"
+            (gate-sub? (go-expansion "(go (clojure.core.async/>!! ch 1))") "__sm-") #f)
+(gate-check "<!! is not a park op to the pass"
+            (gate-sub? (go-expansion "(go (clojure.core.async/<!! ch))") "__sm-") #f)
 (gate-check "put through a call -> go-spawn"
             (gate-sub? (go-expansion "(go (helper-put ch 1))") "__sm-") #f)
 

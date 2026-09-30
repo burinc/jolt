@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
+  deref'ing a promise, so `.interrupt` throws `InterruptedException` out of them
+  and clears the flag. jolt kept waiting and left the flag set, so a worker shut
+  down by interrupting it hung in its channel read. They now throw and clear the
+  flag, on a thread and on a fiber; a flag already set makes an op that would
+  have to wait throw at once, and an op that can complete immediately completes
+  and leaves the flag set, as the JVM's does. The parking ops `<!`, `>!` and
+  `alts!` are not interruptible, as a parked go block holds no thread on the
+  JVM, and neither is the runtime's own channel plumbing.
+
+  An interrupted op leaves nothing behind: a take holds no value and is no
+  longer counted as a waiting taker, a put on an unbuffered channel is
+  retracted, and an `alts!!` has claimed none of its ops. The JVM leaves the
+  promise's handler registered, so there a later put is swallowed by the taker
+  that threw and a later take receives the value of a put that threw; that
+  difference is recorded in `known-divergences.edn`. The fiber side follows the
+  0.7.26 rule for fibers sharing a carrier. `<!!` and `>!!` inside a `go` body
+  are no longer rewritten into the cheap park, since that park has no interrupt
+  arm; they are ordinary blocking calls there, as on the JVM.
+
 - **`java.util.concurrent.TimeoutException` can be constructed.**
   `(TimeoutException.)` and `(TimeoutException. "msg")` raised "No matching ctor
   found", and the one the runtime throws from a timed `Future.get` did not answer
