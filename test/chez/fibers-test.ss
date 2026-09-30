@@ -390,18 +390,25 @@
 ;; the stack becomes O(depth) and the ratio explodes. The absolutes are printed
 ;; for the record and asserted only against a ceiling loose enough to be
 ;; meaningless as noise (a 20x blowup, not a 2x one).
+;;
+;; Each depth is timed three times and the fastest run is kept. Interference
+;; from other work on the machine only ever makes a run slower, so the minimum
+;; is the run closest to the switch's own cost; one descheduled run used to
+;; decide the ratio (8.7x once under a loaded full gate, 1.2x when rerun).
 (define old-trip (collect-trip-bytes))
 (collect-trip-bytes 100000000000)          ; no gen-0 during the timed region
-(collect (collect-maximum-generation))
-(define sw-t0 (mono-nanos))
-(ok "switch: timed run (1 frame)" (sw-bench-depth 0))
-(define switch-ns
-  (/ (exact->inexact (- (mono-nanos) sw-t0)) (* 2.0 SW-N SW-M)))
-(collect (collect-maximum-generation))
-(define deep-t0 (mono-nanos))
-(ok "switch: timed run (40 frames)" (sw-bench-depth 40))
-(define deep-switch-ns
-  (/ (exact->inexact (- (mono-nanos) deep-t0)) (* 2.0 SW-N SW-M)))
+(define (sw-best-ns depth label)
+  (let loop ((i 0) (best #f))
+    (if (fx=? i 3)
+        best
+        (begin
+          (collect (collect-maximum-generation))
+          (let ((t0 (mono-nanos)))
+            (ok label (sw-bench-depth depth))
+            (let ((ns (/ (exact->inexact (- (mono-nanos) t0)) (* 2.0 SW-N SW-M))))
+              (loop (fx+ i 1) (if best (min best ns) ns))))))))
+(define switch-ns (sw-best-ns 0 "switch: timed run (1 frame)"))
+(define deep-switch-ns (sw-best-ns 40 "switch: timed run (40 frames)"))
 (collect-trip-bytes old-trip)
 (define depth-ratio (/ deep-switch-ns (max 1.0 switch-ns)))
 (printf "  switch: ~a ns at 1 frame, ~a ns at 40 frames (depth ratio ~a)\n"
