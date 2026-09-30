@@ -82,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cancel(true)` interrupts the task it cancels.** On an executor's future
+  (`submit`, a scheduled task, `invokeAll`'s deadline, `invokeAny`'s losers,
+  `future-cancel`) and on a `FutureTask` run on a pool or a `Thread`, cancel
+  marked the future and the task ran on to completion; the running thread is
+  now interrupted, as on the JVM, and `cancel(false)` still leaves it to finish.
+  A pool worker clears its interrupt before its next task, as the JVM's
+  `ThreadPoolExecutor` does, so a cancel does not leak into unrelated work. A
+  `FutureTask` cancelled while it runs stays cancelled (its result used to
+  overwrite the cancellation), `FutureTask.cancel` wins over a running task,
+  and a `FutureTask` takes a reified `Callable`.
 - **A thread has one `java.lang.Thread` object.** Inside a thread started from
   `(Thread. f)`, `(Thread/currentThread)` was a separate handle, never
   `identical?` to the object, and the two answered different members: the

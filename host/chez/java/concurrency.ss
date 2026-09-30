@@ -2077,38 +2077,67 @@
 ;; #f unconditionally, which left invokeAll's deadline and invokeAny's losers with
 ;; nothing to cancel WITH.
 ;;
-;; Cancelling a task that is already RUNNING does not stop it: cancel(true) on the
-;; JVM interrupts the worker, which jolt does not do from a future (shutdownNow
-;; does interrupt its workers, below). The future still finalizes as cancelled, so .get raises and
-;; the late result is dropped, exactly as a cancel that lands during the JVM's
-;; own window does.
+;; Cancelling a task that is already RUNNING finalizes the future as cancelled —
+;; .get raises and the late result is dropped — and cancel(true) also interrupts
+;; the thread running it (task-runners, below), as the JVM's does.
 (define (make-j-future) (make-jhost "j-future" (vector 'new jolt-nil #f (make-mutex) (make-condition))))
 (define (j-future-settled? status) (and (memq status '(done cancelled)) #t))
 ;; A missed deadline, as a value the waiter can test: eq?-unique, so no task
 ;; result can be mistaken for one.
 (define j-future-timed-out (list 'j-future-timed-out))
+;; THE RUNNER, for cancel(true). A task future records the interrupt box of the
+;; thread running it while it runs — under the future's own mutex, the one its
+;; claim and its completion take — so a cancel that finds it still unsettled
+;; finds the runner too, and one that finds it settled interrupts nobody. Kept
+;; aside rather than in the futures' vectors because three layouts share this
+;; (j-future, the scheduled future that extends it, FutureTask).
+(define task-runners (make-weak-eq-hashtable))
+(define task-runners-mu (make-mutex))
+(define (task-runner-set! fut)
+  (jolt-with-mutex task-runners-mu (hashtable-set! task-runners fut (current-interrupt-box))))
+(define (task-runner-clear! fut)
+  (jolt-with-mutex task-runners-mu (hashtable-delete! task-runners fut)))
+(define (task-runner fut)
+  (jolt-with-mutex task-runners-mu (hashtable-ref task-runners fut #f)))
+;; cancel(true)'s second half: the runner's flag is SET under the future's mutex
+;; (so it cannot land after the task has completed and the worker moved on), and
+;; the poke that throws it out of an interruptible wait comes after, outside it.
+;; A stale poke reaching the worker's next task finds the flag cleared and waits
+;; on (executor-worker-loop* clears it before each task, as the JVM's runWorker
+;; does).
+(define (task-interrupt-runner! b)
+  (when b (jolt-interrupt-wake-waits! b)))
 (define (j-future-complete! self thunk)
   (let ((st (jhost-state self)))
     ;; claim the task, or leave it alone: a cancelled future's thunk never runs.
     (when (jolt-with-mutex (vector-ref st 3)
             (and (eq? (vector-ref st 0) 'new)
-                 (begin (vector-set! st 0 'running) #t)))
+                 (begin (vector-set! st 0 'running) (task-runner-set! self) #t)))
       (let ((r (guard (e (#t (vector-set! st 2 e) #f)) (jolt-invoke thunk))))
         (jolt-with-mutex (vector-ref st 3)
+          (task-runner-clear! self)
           ;; a cancel that landed while this ran keeps the future cancelled
           (unless (eq? (vector-ref st 0) 'cancelled)
             (unless (vector-ref st 2) (vector-set! st 1 r))
             (vector-set! st 0 'done))
           (jolt-cv-wake! (vector-ref st 4)))))))
-;; Answers #t iff THIS call cancelled it, as Future.cancel does.
-(define (j-future-cancel! self)
-  (let ((st (jhost-state self)))
-    (jolt-with-mutex (vector-ref st 3)
-      (if (j-future-settled? (vector-ref st 0))
-          #f
-          (begin (vector-set! st 0 'cancelled)
-                 (jolt-cv-wake! (vector-ref st 4))
-                 #t)))))
+;; Future.cancel(mayInterruptIfRunning): wins over a task that has not settled,
+;; running or not, and with MAY set interrupts the thread running it — which is
+;; what cancel(true), future-cancel, invokeAll's deadline and invokeAny's losers
+;; all mean on the JVM. It used to only mark the future, and the task ran on.
+(define (j-future-cancel! self . may)
+  (let* ((st (jhost-state self))
+         (may? (and (pair? may) (car may)))
+         (r (jolt-with-mutex (vector-ref st 3)
+              (if (j-future-settled? (vector-ref st 0))
+                  #f
+                  (let ((b (and may? (task-runner self))))
+                    (vector-set! st 0 'cancelled)
+                    (when b (set-box! b #t))
+                    (jolt-cv-wake! (vector-ref st 4))
+                    (or b #t))))))
+    (when (box? r) (task-interrupt-runner! r))
+    (and r #t)))
 ;; get() waits for the task; get(timeout, unit) gives up at the deadline and throws
 ;; TimeoutException, like the JVM. The timeout used to be discarded, so the bounded
 ;; overload waited forever on a task that never finished.
@@ -2145,7 +2174,7 @@
   (list (cons "get" j-future-get)
         (cons "isDone" (lambda (self) (j-future-settled? (vector-ref (jhost-state self) 0))))
         (cons "isCancelled" (lambda (self) (eq? (vector-ref (jhost-state self) 0) 'cancelled)))
-        (cons "cancel" (lambda (self . _) (j-future-cancel! self)))))
+        (cons "cancel" (lambda (self may) (j-future-cancel! self (jolt-truthy? may))))))
 ;; executor-service state: #(shutdown? queue-box queue-mutex task-cond
 ;; live-workers advisory-queue-capacity core-workers max-workers keep-alive-ms
 ;; idle-workers queue-depth term-cond starting-workers delayed lead seq) — the
@@ -2220,7 +2249,7 @@
                                   '() #f 0
                                   (and (pair? spec) (car spec) #t)
                                   (and (pair? spec) (pair? (cdr spec)) (cadr spec))
-                                  '() #f))))
+                                  '() #f #f))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -2447,7 +2476,13 @@
                      ;; executor-idle-wait!, and is never absent from all three.
                      (arrived!)
                      (executor-take-job! st))))
-          (when job (job) (loop)))))))
+          ;; the JVM's runWorker clears the worker's interrupt before each task
+          ;; (unless the pool is stopping), so a cancel(true) that reached the
+          ;; last task is not carried into the next one
+          (when job
+            (unless (executor-stopping? st) (set-box! (current-interrupt-box) #f))
+            (job)
+            (loop)))))))
 
 ;; shutdown: stop accepting, let what is queued drain — the delayed one-shots
 ;; included, which the workers wait out (executor-take-job!). The periodic tasks
@@ -2489,8 +2524,12 @@
     (set-cdr! q '())
     (vector-set! st 10 0)
     jobs))
+;; Slot 20: STOP, which only shutdownNow reaches — the state in which a worker
+;; keeps its interrupt rather than having it cleared before a task.
+(define (executor-stopping? st) (vector-ref st 20))
 (define (executor-shutdown-now! st)
   (vector-set! st 0 #t)
+  (vector-set! st 20 #t)
   ;; ...and interrupt what is running: each worker's flag, then a poke at whatever
   ;; interruptible wait it is in (the protocol Thread.interrupt uses). A task in
   ;; Thread/sleep or a deref is thrown out with InterruptedException, and one that
@@ -2711,7 +2750,7 @@
                 (if (eq? j-future-timed-out
                          (guard (e (#t #f))
                            (j-future-get-until (car fs) deadline (lambda () j-future-timed-out))))
-                    (for-each j-future-cancel! fs)
+                    (for-each (lambda (f) (j-future-cancel! f #t)) fs)
                     (loop (cdr fs)))))
             (apply jolt-vector futs))))
         ;; invokeAny answers the first task that succeeded, skipping the ones that
@@ -2729,7 +2768,7 @@
             (when (null? ts)
               (throw-jvm (quote IllegalArgumentException) "tasks is empty"))
             (let* ((all (executor-submit-all self ts))
-                   (cancel-rest! (lambda (fs) (for-each j-future-cancel! fs))))
+                   (cancel-rest! (lambda (fs) (for-each (lambda (f) (j-future-cancel! f #t)) fs))))
               (let loop ((futs all) (err #f))
                 (if (null? futs)
                     (raise err)                       ; every task failed
@@ -2941,21 +2980,28 @@
 
 ;; FutureTask — a run-once task with a blocking get. State:
 ;; #(status override-flag override value error mutex cond thunk); status is one
-;; of new/running/done/cancelled. cancel wins only before run starts (the JVM
-;; can interrupt a RUNNING task; jolt cannot, so cancel answers #f there).
+;; of new/running/done/cancelled. cancel wins until the task settles, and
+;; cancel(true) interrupts the thread running it, as on the JVM.
 (define (make-future-task thunk override-flag override)
   (make-jhost "future-task"
-              (vector 'new override-flag override jolt-nil #f (make-mutex) (make-condition) thunk)))
+              ;; a reified Callable or Runnable is called through its method, as
+              ;; submit calls one (it was invoked as a fn and failed the task)
+              (vector 'new override-flag override jolt-nil #f (make-mutex) (make-condition)
+                      (runnable->thunk thunk))))
 (define (future-task? x) (and (jhost? x) (string=? (jhost-tag x) "future-task")))
 (define (future-task-run! self)
   (let ((st (jhost-state self)))
     (when (jolt-with-mutex (vector-ref st 5)
             (and (eq? (vector-ref st 0) 'new)
-                 (begin (vector-set! st 0 'running) #t)))
+                 (begin (vector-set! st 0 'running) (task-runner-set! self) #t)))
       (let ((r (guard (e (#t (vector-set! st 4 e) jolt-nil)) (jolt-invoke (vector-ref st 7)))))
         (jolt-with-mutex (vector-ref st 5)
-          (vector-set! st 3 (if (vector-ref st 1) (vector-ref st 2) r))
-          (vector-set! st 0 'done)
+          (task-runner-clear! self)
+          ;; a cancel that landed while it ran keeps it cancelled, as the JVM's
+          ;; does (this used to overwrite it with the result)
+          (unless (eq? (vector-ref st 0) 'cancelled)
+            (vector-set! st 3 (if (vector-ref st 1) (vector-ref st 2) r))
+            (vector-set! st 0 'done))
           (jolt-cv-wake! (vector-ref st 6)))))
     jolt-nil))
 (for-each (lambda (nm) (register-class-ctor! nm
@@ -2995,14 +3041,20 @@
         (cons "get" future-task-get)
         (cons "isDone" (lambda (self) (and (memq (vector-ref (jhost-state self) 0) '(done cancelled)) #t)))
         (cons "isCancelled" (lambda (self) (eq? (vector-ref (jhost-state self) 0) 'cancelled)))
-        (cons "cancel" (lambda (self . _)
-          (let ((st (jhost-state self)))
-            (jolt-with-mutex (vector-ref st 5)
-              (if (eq? (vector-ref st 0) 'new)
-                  (begin (vector-set! st 0 'cancelled)
-                         (jolt-cv-wake! (vector-ref st 6))
-                         #t)
-                  #f)))))
+        ;; cancel wins while the task has not settled, running or not, and
+        ;; cancel(true) interrupts the thread running it (j-future-cancel!)
+        (cons "cancel" (lambda (self may)
+          (let* ((st (jhost-state self))
+                 (r (jolt-with-mutex (vector-ref st 5)
+                      (if (memq (vector-ref st 0) '(new running))
+                          (let ((b (and (jolt-truthy? may) (task-runner self))))
+                            (vector-set! st 0 'cancelled)
+                            (when b (set-box! b #t))
+                            (jolt-cv-wake! (vector-ref st 6))
+                            (or b #t))
+                          #f))))
+            (when (box? r) (task-interrupt-runner! r))
+            (and r #t))))
         (cons "toString" (lambda (self)
           (string-append "FutureTask[" (symbol->string (vector-ref (jhost-state self) 0)) "]")))))
 ;; submit/execute above route a FutureTask through its own run (a Runnable on
@@ -3163,9 +3215,10 @@
   (let ((st (jhost-state sf)))
     (when (jolt-with-mutex (vector-ref st 3)
             (and (eq? (vector-ref st 0) 'new)
-                 (begin (vector-set! st 0 'running) #t)))
+                 (begin (vector-set! st 0 'running) (task-runner-set! sf) #t)))
       (let* ((r (guard (e (#t (vector-set! st 2 e) #f)) (jolt-invoke (vector-ref st 7))))
              (again? (jolt-with-mutex (vector-ref st 3)
+                       (task-runner-clear! sf)
                        (let ((again? (cond ((eq? (vector-ref st 0) 'cancelled) #f)
                                            ((vector-ref st 2) (vector-set! st 0 'done) #f)
                                            ((sf-periodic? sf) (vector-set! st 0 'new) #t)
