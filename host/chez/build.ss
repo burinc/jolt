@@ -514,7 +514,11 @@
     (bld-nt?
           ;; -static: a single-file exe (no libwinpthread/libgcc/lz4 DLL deps) —
      ;; required for a distributable binary and for TLS init consistency.
-     "-static -llz4 -lz -lws2_32 -lrpcrt4 -lole32 -luuid -ladvapi32 -luser32 -lshell32 -lm")
+     ;; -lcrypt32: OpenSSL 3's static libcrypto.a calls the CryptoAPI certificate
+     ;; store (CertOpenStore and the rest), so an app that links it as a :static
+     ;; native could not link without it (jolt-lang/jolt#1206). An import library
+     ;; costs nothing when nothing references it.
+     "-static -llz4 -lz -lws2_32 -lcrypt32 -lrpcrt4 -lole32 -luuid -ladvapi32 -luser32 -lshell32 -lm")
     ;; Linux: the Chez kernel pulls in compression (lz4/z), the expression
     ;; editor (ncurses + terminfo), threads, dlopen, libuuid, and clock_gettime.
     ;;
@@ -1310,7 +1314,12 @@
 ;; against it the way it will in the binary. Built alone, its references to the
 ;; other were left undefined; a PE loader cannot bind those at all, and an ELF or
 ;; Mach-O loader binding at load time refuses the object whenever the dependent
-;; archive happened to load first.
+;; archive happened to load first. On Windows the object also links the
+;; binary's own system libraries (bld-link-libs): a DLL resolves its imports when
+;; it loads, not from the process it loads into, so an archive calling CryptoAPI
+;; or Winsock needs those import libraries here as much as in the final link.
+;; Elsewhere an undefined symbol resolves against the running process, which
+;; already has libc and the kernel's libraries.
 ;;
 ;; An archive compiled without -fPIC cannot become part of a shared object at all
 ;; — no linker flag makes an absolute relocation work in a library the loader may
@@ -1328,6 +1337,7 @@
         (string-append (bld-cc) " -dynamiclib -undefined dynamic_lookup -Wl,-all_load" qs
                        " -o " (bld-sh-quote so))
         (string-append (bld-cc) " -shared -Wl,--whole-archive" qs " -Wl,--no-whole-archive"
+                       (if bld-nt? (string-append " " (bld-link-libs)) "")
                        " -Wl,--unresolved-symbols=ignore-all -o " (bld-sh-quote so)))))
 
 (define (bld-preload-so builddir name)

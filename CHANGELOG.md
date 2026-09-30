@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all of the app's archives. An archive that is not position-independent is
   still skipped with a warning without affecting the rest, and an archive two
   natives name is linked once (#1205).
+- **Windows static builds link OpenSSL 3.** The Windows link line lacked
+  `-lcrypt32`, and OpenSSL 3's static `libcrypto.a` calls the CryptoAPI
+  certificate store, so an app linking it as a `:static` native failed its
+  final link. The build-time preload of `:static` archives now also links the
+  same system libraries on Windows, where a DLL has to resolve its imports
+  when it loads (#1206).
 
 ## [0.8.15] - 2026-09-29
 
