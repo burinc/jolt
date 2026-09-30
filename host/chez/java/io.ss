@@ -2902,19 +2902,33 @@
              (cons "sneakyThrow" (lambda (t) (jolt-throw t))))))
   (register-class-statics! "Util" util-statics)
   (register-class-statics! "clojure.lang.Util" util-statics))
-;; Thread/currentThread -> a fresh thread jhost wrapping THIS thread's interrupt
-;; flag (the box from current-interrupt-box, host-static.ss), so .interrupt from
-;; any thread sets the target thread's flag and .isInterrupted reads it without
-;; clearing (instance semantics; the static Thread/interrupted reads-and-clears).
-;; getContextClassLoader hands back the loader.
-;; A handle STANDS FOR one thread, and every question asked through it is about
-;; that thread — including when some other thread is holding it, which is the
-;; only shape Thread/getAllStackTraces hands back. So the id travels IN the
-;; handle: reading (get-thread-id) here answered about whoever was asking, so
-;; every entry in that map reported the caller's id and its name was the constant
-;; "main". State is (interrupt-box . thread-id).
-(define (thread-handle-box h) (car (jhost-state h)))
-(define (thread-handle-id h) (cdr (jhost-state h)))
+;; java.lang.Thread — ONE object per thread, whoever asks and however. A thread
+;; started from a (Thread. f) object IS that object: its Thread/currentThread, the
+;; key getAllStackTraces gives for it, and a handle anyone took for it earlier are
+;; all identical? to it, as on the JVM. A thread jolt did not start from a Thread
+;; object (main, a future's, a pool worker, a core.async thread, a fiber carrier)
+;; gets one made the first time anyone asks, kept for as long as it lives. It used
+;; to be two representations — the Thread object and a separate currentThread
+;; handle — which answered some members each and were never identical?.
+;;
+;; State (concurrency.ss reads the same slots):
+;;   #(thunk done? mutex cond interrupt-box started? name-box thread-id daemon
+;;     priority java-id)
+;; thread-id is the runtime's (get-thread-id) of the running thread, #f before
+;; start; java-id is getId/threadId, assigned at construction as the JVM assigns
+;; it, 1 for the boot thread as the JVM's main is. Once a thread runs, its name,
+;; daemon status and priority live in the id-keyed tables below and in
+;; lazy-bridge.ss, so an object made for it from another thread reads the same.
+(define java-thread-id-next 2)                 ; 1 is main's
+(define java-thread-id-mu (make-mutex))
+(define (next-java-thread-id!)
+  (jolt-with-mutex java-thread-id-mu
+    (let ((n java-thread-id-next)) (set! java-thread-id-next (+ n 1)) n)))
+(define (make-thread-object thunk name started? tid daemon priority ibox)
+  (make-jhost "user-thread"
+              (vector thunk #f (make-mutex) (make-condition) ibox started? (box name) tid
+                      daemon priority
+                      (if (eqv? tid jolt-boot-thread-id) 1 (next-java-thread-id!)))))
 ;; Names live in an id-keyed table for the same reason, under the handle mutex:
 ;; a thread parameter is only readable by its own thread. A thread nobody named
 ;; answers the JVM's default shape — the boot thread is "main", anything else
@@ -2948,105 +2962,78 @@
 ;; (whose end is the process's), or a thread jolt started that has not finished.
 (define (thread-handle-alive? id)
   (or (eqv? id (get-thread-id)) (eqv? id jolt-boot-thread-id) (jolt-started-thread? id)))
-(register-host-methods! "thread"
-  ;; TCCL follows the ambient loader the way io/resource's 1-arity does: inside
-  ;; `with-loader` it is that context's facade (so a library finding its own
-  ;; resources the Java way gets the context's roots), outside one the host
-  ;; singleton. `current-base-loader` answers with the facade itself, and only a
-  ;; classloader-shaped answer (a jhost, or a tagged table like the facade) is
-  ;; taken — a library that rebound RT/baseLoader to something else keeps the
-  ;; historical answer, the rule the resource path above follows too. There is no
-  ;; setContextClassLoader: the getter is ambient-derived, not per-thread state.
-  (list (cons "getContextClassLoader"
-              (lambda (self)
-                (let ((cl (current-base-loader)))
-                  (if (and cl (or (jhost? cl) (htable? cl))) cl the-classloader))))
-        (cons "getName" (lambda (self) (jolt-thread-name (thread-handle-id self))))
-        (cons "setName" (lambda (self nm)
-                          (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
-                          jolt-nil))
-        (cons "getId" (lambda (self) (thread-handle-id self)))
-        (cons "threadId" (lambda (self) (thread-handle-id self)))
-        ;; Daemon status is the thread's, recorded where it was forked
-        ;; (lazy-bridge.ss), so every handle for it and its Thread object agree.
-        (cons "isDaemon" (lambda (self) (jolt-thread-daemon? (thread-handle-id self))))
-        ;; Every thread a handle can name is alive or has been, and setDaemon is
-        ;; refused on a live one; one that has finished keeps its status here,
-        ;; as its Thread object is the thing to change it through.
-        (cons "setDaemon" (lambda (self d)
-                            (if (thread-handle-alive? (thread-handle-id self))
-                                (jolt-throw (jolt-host-throwable
-                                             "java.lang.IllegalThreadStateException" jolt-nil))
-                                (jolt-thread-daemon-set! (thread-handle-id self) (jolt-truthy? d)))
-                            jolt-nil))
-        (cons "isAlive" (lambda (self) (thread-handle-alive? (thread-handle-id self))))
-        (cons "isVirtual" (lambda (self) #f))
-        (cons "getPriority" (lambda (self) (jolt-thread-priority (thread-handle-id self))))
-        (cons "setPriority" (lambda (self p)
-                              (jolt-thread-priority-set! (thread-handle-id self)
-                                                         (jolt-thread-priority-arg p))
-                              jolt-nil))
-        ;; the calling thread's frames, reconstructed the way an uncaught error's
-        ;; backtrace is (source-registry.ss); another thread's stack is not
-        ;; reachable, so it answers an empty array.
-        (cons "getStackTrace" (lambda (self)
-                                (if (eqv? (thread-handle-id self) (get-thread-id))
-                                    (jolt-current-stack-trace)
-                                    (jolt-vector))))
-        ;; The flag first, then the poke: a waiter woken by the poke reads the
-        ;; flag, so a wake that arrives before it is set says nothing. Waking is
-        ;; what turns .interrupt from "the target will notice next time it looks"
-        ;; into the JVM's "the target is thrown out of its wait now"
-        ;; (jolt-cv-wait-interruptibly, host/chez/locks.ss).
-        (cons "interrupt" (lambda (self)
-                            (let ((b (thread-handle-box self)))
-                              (when (box? b)
-                                (set-box! b #t)
-                                (jolt-interrupt-wake-waits! b)))
-                            jolt-nil))
-        (cons "isInterrupted" (lambda (self)
-                                (let ((b (thread-handle-box self)))
-                                  (and (box? b) (unbox b) #t))))))
-;; ONE handle per thread, cached in a thread parameter. The JVM's
-;; Thread/currentThread is identity-stable, and code relies on it: keying a map by
-;; the current thread, or comparing two calls with identical?/=. Allocating a fresh
-;; jhost per call made every such comparison false — tools.logging's suite tags each
-;; log entry with its calling thread and then asks whether it was logged directly.
-;; The cell carries the owning thread's id for the same reason current-interrupt-box
-;; does: a Chez thread parameter is inherited by a forked thread, and a child must
-;; not report the parent's handle as its own.
-(define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . handle)
-;; Mirror of the per-thread cache keyed by thread id, so another thread can name
-;; this one — Thread/getAllStackTraces has to hand back the SAME handle
-;; currentThread does, or a caller cannot find itself in the map.
+;; A running thread is alive while it runs: it is the caller, the boot thread
+;; (whose end is the process's), or a thread jolt started that has not finished.
+(define (thread-handle-alive? id)
+  (or (eqv? id (get-thread-id)) (eqv? id jolt-boot-thread-id) (jolt-started-thread? id)))
+;; TCCL follows the ambient loader the way io/resource's 1-arity does: inside
+;; `with-loader` it is that context's facade (so a library finding its own
+;; resources the Java way gets the context's roots), outside one the host
+;; singleton. `current-base-loader` answers with the facade itself, and only a
+;; classloader-shaped answer (a jhost, or a tagged table like the facade) is
+;; taken — a library that rebound RT/baseLoader to something else keeps the
+;; historical answer, the rule the resource path above follows too. There is no
+;; setContextClassLoader: the getter is ambient-derived, not per-thread state.
+(define (thread-context-class-loader)
+  (let ((cl (current-base-loader)))
+    (if (and cl (or (jhost? cl) (htable? cl))) cl the-classloader)))
+;; The object for each running thread, by id, so another thread finds the same
+;; one; and this thread's own, cached in a thread parameter. The cell carries the
+;; owning thread's id because a Chez thread parameter is inherited by a forked
+;; thread, and a child must not report the parent's object as its own.
+(define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . object)
 (define thread-handles-by-id (make-eqv-hashtable))
 (define thread-handles-mutex (make-mutex))
+;; Thread.start: the started thread IS its object. Registered by the parent right
+;; after the fork and again by the child, so it is there whichever runs first.
+(define (register-thread-object! id obj)
+  (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id obj)))
+(define (thread-object-for-id! id)
+  (let ((mine? (eqv? id (get-thread-id))))
+    (jolt-with-mutex thread-handles-mutex
+      (or (hashtable-ref thread-handles-by-id id #f)
+          (let ((obj (make-thread-object #f #f #t id #f 5
+                                         (if mine? (current-interrupt-box) (thread-box-for-id! id)))))
+            (unless (or mine? (thread-handle-alive? id))
+              (vector-set! (jhost-state obj) 1 #t))              ; already finished
+            (hashtable-set! thread-handles-by-id id obj)
+            obj)))))
 (define (current-thread-handle)
   (let ((c (thread-handle-cell))
         (id (get-thread-id)))
     (if (and (pair? c) (eqv? (car c) id))
         (cdr c)
-        (let ((h (make-jhost "thread" (cons (current-interrupt-box) id))))
+        (let ((h (thread-object-for-id! id)))
           (thread-handle-cell (cons id h))
-          (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
           h))))
-;; A handle for a thread that has never asked who it is. Its interrupt box is its
-;; own, so .interrupt through it does not reach that thread — the thread adopts a
-;; real handle the moment it calls currentThread.
 (define (thread-handle-for-id id)
-  (if (eqv? id (get-thread-id))
-      (current-thread-handle)              ; the caller must find ITSELF in the map
-      (or (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
-          (let ((h (make-jhost "thread" (cons (box #f) id))))
-            (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
-            h))))
+  (if (eqv? id (get-thread-id)) (current-thread-handle) (thread-object-for-id! id)))
+;; A thread that ends: its object is no longer alive (join returns), and the
+;; tables keyed by its id let go. The object keeps what it knew.
+(set! jolt-thread-exit-hook
+  (lambda (id)
+    (let ((obj (jolt-with-mutex thread-handles-mutex
+                 (let ((o (hashtable-ref thread-handles-by-id id #f)))
+                   (hashtable-delete! thread-handles-by-id id)
+                   o))))
+      (thread-box-forget! id)
+      (when obj
+        (let ((st (jhost-state obj)))
+          (jolt-with-mutex (vector-ref st 2)
+            (vector-set! st 1 #t)
+            (jolt-cv-wake! (vector-ref st 3))))))))
+(set! jolt-thread-box-adopted-hook
+  (lambda (id b)
+    (let ((obj (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))))
+      (when obj (vector-set! (jhost-state obj) 4 b)))))
 ;; Thread/getAllStackTraces: the live threads mapped to EMPTY stack traces. jolt
 ;; reifies no call stack (TCO erases caller frames) and .getStackTrace is already
 ;; an empty StackTraceElement[], so the traces are honestly empty; the thread set
 ;; is real, which is what the callers want — ring's suites count threads before
-;; and after a request to check for leaks.
+;; and after a request to check for leaks. The boot thread is among them, as the
+;; JVM's main is, whoever asks.
 (define (all-stack-traces)
-  (let loop ((ids (cons (get-thread-id) (live-thread-ids)))
+  (let loop ((ids (cons (get-thread-id) (cons jolt-boot-thread-id (live-thread-ids))))
              (seen '())
              (m empty-pmap))
     (cond ((null? ids) m)

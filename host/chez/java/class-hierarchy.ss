@@ -1291,11 +1291,6 @@
     ;; answered false to (instance? ThreadLocal x).
     ("threadlocal" . "java.lang.ThreadLocal")
     ("inheritable-threadlocal" . "java.lang.InheritableThreadLocal")
-    ;; Thread/currentThread hands back a "thread" handle (io.ss) while (Thread. f)
-    ;; makes a "user-thread" (concurrency.ss). Two tags, ONE class — like the two
-    ;; writer tags and the two field tags above. Only user-thread had a row, so the
-    ;; handle every caller actually gets from currentThread reported :object.
-    ("thread" . "java.lang.Thread")
     ;; the four atomics (host-static-classes.ss), one tag each so instance? can
     ;; tell the Number-extending pair from the other two
     ("atomic-integer" . "java.util.concurrent.atomic.AtomicInteger")

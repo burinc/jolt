@@ -321,6 +321,9 @@
 (define exit-mu (make-mutex))
 (define exit-cv (make-condition))
 (define exit-nondaemon-live 0)
+;; What a thread's end means to its java.lang.Thread object (io.ss): it is no
+;; longer alive, join returns, and the id-keyed tables let it go.
+(define jolt-thread-exit-hook (lambda (id) (void)))
 ;; The pools behind clojure.core's future/send-off (a cached pool: a worker idles
 ;; 60s after its last task before it exits) and send (a fixed pool: its workers
 ;; never exit). jolt runs that work on threads of its own, so the pool's idle
@@ -358,6 +361,7 @@
                           (if (hashtable-contains? live-threads id)
                               (hashtable-delete! live-threads id)
                               (hashtable-set! live-threads id 'done)))
+                        (jolt-thread-exit-hook id)
                         (unless d (exit-nondaemon-leave!)))))))))))
          (id (sa-thread-id-of t)))
     (when id

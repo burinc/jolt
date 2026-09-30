@@ -82,6 +82,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A thread has one `java.lang.Thread` object.** Inside a thread started from
+  `(Thread. f)`, `(Thread/currentThread)` was a separate handle, never
+  `identical?` to the object, and the two answered different members: the
+  handle had no `join`, the object no `getId` or `getContextClassLoader`. Now
+  the started thread IS its object — its `currentThread`, its key in
+  `getAllStackTraces`, and a handle another thread took for it earlier are all
+  the same object — and every thread jolt did not start from a `Thread.`
+  (main, futures, pool workers, core.async threads) has one stable object
+  made the first time anyone asks. Every member answers through it the same
+  way: `join` and `isAlive` work on any thread's object, `getId`/`threadId`
+  are assigned at construction (main is 1, as on the JVM) rather than once
+  started, and `getAllStackTraces` now includes the main thread when another
+  thread asks. `getState` and `getThreadGroup` are still not implemented.
 - **`Thread.isDaemon` answers for every thread.** `(.isDaemon
   (Thread/currentThread))` was "No matching field found" everywhere — on the
   main thread, in a future, a `go` block, an executor task, even in a started

@@ -1852,10 +1852,8 @@
 ;; thread of priority 3 has priority 3.
 (define (make-jthread thunk name)
   (let ((me (get-thread-id)))
-    (make-jhost "user-thread"
-                (vector thunk #f (make-mutex) (make-condition) (box #f) #f
-                        (box (or name (next-jthread-name))) #f
-                        (jolt-thread-daemon? me) (jolt-thread-priority me)))))
+    (make-thread-object thunk (or name (next-jthread-name)) #f #f
+                        (jolt-thread-daemon? me) (jolt-thread-priority me) (box #f))))
 ;; slot 7: the id of the thread the start forked, #f until then. A rename needs
 ;; it to reach the id-keyed name table the handles read.
 (define (jthread-id st) (vector-ref st 7))
@@ -1889,16 +1887,27 @@
 (register-host-methods! "user-thread"
   ;; another thread's frames live on its own continuation, which this thread
   ;; cannot walk: an empty StackTraceElement[]
-  (list (cons "getStackTrace" (lambda (self) (jolt-vector)))
+  (list
+        ;; the calling thread's frames, reconstructed the way an uncaught error's
+        ;; backtrace is (source-registry.ss); another thread's stack is not
+        ;; reachable, so it answers an empty array
+        (cons "getStackTrace" (lambda (self)
+          (if (eqv? (jthread-id (jhost-state self)) (get-thread-id))
+              (jolt-current-stack-trace)
+              (jolt-vector))))
+        (cons "getId" (lambda (self) (vector-ref (jhost-state self) 10)))
+        (cons "threadId" (lambda (self) (vector-ref (jhost-state self) 10)))
+        (cons "getContextClassLoader" (lambda (self) (thread-context-class-loader)))
         (cons "start" (lambda (self)
           (let ((st (jhost-state self)))
             (when (vector-ref st 5)
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
                                                "Thread already started")))
             (vector-set! st 5 #t)  ; mark started before forking
-            ;; born with the object's daemon flag, so the handle currentThread
-            ;; and getAllStackTraces give for it answers the same
-            (fork-thread/daemon (jthread-daemon? st) (lambda ()
+            ;; born with the object's daemon flag; the object is registered as
+            ;; the thread's by the parent once the fork returns (below) and by the
+            ;; child as its first act, so it is what every way of asking finds
+            (let ((t (fork-thread/daemon (jthread-daemon? st) (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
                (rdr-default-modes!)                ; and not the reader modes of a read it forked from
                ;; Adopt the Thread object's own interrupt flag, so .interrupt from
@@ -1910,9 +1919,8 @@
                (vector-set! st 7 (get-thread-id))
                (jolt-thread-name-set! (get-thread-id) (unbox (vector-ref st 6)))
                (jolt-thread-priority-set! (get-thread-id) (vector-ref st 9))
-               ;; and register that handle now, so a handle someone else takes for
-               ;; this thread before it first asks who it is is the live one
-               (current-thread-handle)
+               (register-thread-object! (get-thread-id) self)
+               (thread-handle-cell (cons (get-thread-id) self))
                ;; Thread.start conveys NOTHING: the new thread begins with no
                ;; thread bindings on the JVM, and bound-fn is how a body carries
                ;; the caller's in. Chez hands a forked thread the forking thread's
@@ -1933,7 +1941,20 @@
                 (let ((th (vector-ref st 0))) (when th (jolt-invoke (runnable->thunk th)))))
               (jolt-with-mutex (vector-ref st 2)
                  (vector-set! st 1 #t)
-                 (jolt-cv-wake! (vector-ref st 3)))))
+                 (jolt-cv-wake! (vector-ref st 3)))))))
+              (let ((id (sa-thread-id-of t)))
+                (when id
+                  ;; the id-keyed name and priority first: getName and
+                  ;; getPriority read them as soon as slot 7 is set
+                  ;; ...unless the child already has, and may have renamed itself
+                  (jolt-with-mutex thread-handles-mutex
+                    (unless (hashtable-contains? thread-names-by-id id)
+                      (hashtable-set! thread-names-by-id id (unbox (vector-ref st 6)))
+                      (unless (eqv? 5 (vector-ref st 9))
+                        (hashtable-set! thread-priorities-by-id id (vector-ref st 9)))))
+                  (jolt-with-mutex (vector-ref st 2)
+                    (unless (vector-ref st 7) (vector-set! st 7 id)))
+                  (register-thread-object! id self))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
@@ -1970,7 +1991,11 @@
             (jolt-interrupt-wake-waits! b))
           jolt-nil))
         (cons "isInterrupted" (lambda (self) (and (unbox (vector-ref (jhost-state self) 4)) #t)))
-        (cons "getName" (lambda (self) (unbox (vector-ref (jhost-state self) 6))))
+        ;; once running, the thread's name is the id-keyed table's, which is what
+        ;; an executor's ThreadFactory and a rename from inside write
+        (cons "getName" (lambda (self)
+          (let ((st (jhost-state self)))
+            (if (jthread-id st) (jolt-thread-name (jthread-id st)) (unbox (vector-ref st 6))))))
         ;; A rename after .start has to reach the running thread too, or the two
         ;; spellings of the same thread's name disagree.
         (cons "setName" (lambda (self nm)
@@ -1988,7 +2013,9 @@
             ;; a thread that has finished: its handle must keep agreeing
             (when (jthread-id st) (jolt-thread-daemon-set! (jthread-id st) (vector-ref st 8))))
           jolt-nil))
-        (cons "isDaemon" (lambda (self) (and (jthread-daemon? (jhost-state self)) #t)))
+        (cons "isDaemon" (lambda (self)
+          (let ((st (jhost-state self)))
+            (if (jthread-id st) (jolt-thread-daemon? (jthread-id st)) (and (jthread-daemon? st) #t)))))
         ;; Priority: advisory, as the JVM documents it, and jolt schedules no
         ;; differently for it — but it is stored, validated and inherited as there,
         ;; and once started it is the thread's, so the handle reads the same value.
