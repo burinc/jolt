@@ -541,6 +541,13 @@
   ;; leave the value in the channel (known-divergences.edn: the JVM also answers
   ;; true there, and drops the value).
   {:suite "core.async / rendezvous" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) to (a/timeout 100) [v p] (a/alts!! [c [c :v] to] :priority true)] [v (= p to) (a/poll! c)]))" :expected "[nil true nil]"}
+  ;; A buffer past the fixnum range (Long/MAX_VALUE, how a "practically unbounded"
+  ;; channel is often spelled) is a bignum capacity, so the capacity checks must
+  ;; not be fixnum-only.
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE)] [(a/offer! c 1) (a/>!! c 2) (a/poll! c) (a/<!! c)]))" :expected "[true true 1 2]"}
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE)] [(first (a/alts!! [[c 1]])) (first (a/alts!! [c]))]))" :expected "[true 1]"}
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE) r (a/thread (a/<!! c))] (Thread/sleep 50) [(a/offer! c 1) (a/<!! r)]))" :expected "[true 1]"}
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (a/chan Long/MAX_VALUE)] (a/<!! (a/go (a/>! c 1) (a/<! c))))))" :expected "1"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}

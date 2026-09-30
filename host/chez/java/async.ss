@@ -370,7 +370,7 @@
       ;; true only when a live taker received it. A handler never pairs with
       ;; itself: an alts!! that both takes from and puts to the same channel is
       ;; two ops that cannot be each other's partner.
-      (when (and (fx=? (async-chan-cap ch) 0) (not (async-chan-xrf ch)))
+      (when (and (eqv? (async-chan-cap ch) 0) (not (async-chan-xrf ch)))
         (let pair-loop ()
           (when (and (pair? (async-chan-alt-putters ch))
                      (pair? (async-chan-alt-takers ch)))
@@ -1209,7 +1209,7 @@
                                                (memq (async-chan-kind ch) '(dropping sliding promise))
                                                (and (> (async-chan-cap ch) 0)
                                                     (< (ac-qlen ch) (async-chan-cap ch)))
-                                               (and (fx=? (async-chan-cap ch) 0)
+                                               (and (eqv? (async-chan-cap ch) 0)
                                                     (ac-thread-taker-free? ch)))))
                                       (cond
                                         ((not ready?)
