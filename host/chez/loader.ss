@@ -850,6 +850,10 @@
 (define (aot-file-seconds path)
   (guard (e (else 0))
     (div (sa-file-mtime-ms path) 1000)))
+;; Windows refuses to delete a read-only file, and git writes its objects
+;; read-only, so a failed delete clears the attribute (Chez's chmod goes through
+;; _wchmod there) and tries once more. Without it a partial git clone could not
+;; be scrubbed, and every retry of the clone failed on the leftover directory.
 (define (aot-delete-tree path)
   (guard (e (else #f))
     (if (and (file-directory? path) (not (file-symbolic-link? path)))
@@ -857,7 +861,10 @@
           (for-each (lambda (f) (aot-delete-tree (string-append path "/" f)))
                     (directory-list path))
           (delete-directory path))
-        (delete-file path #f))))
+        (or (delete-file path #f)
+            (begin
+              (guard (e (else #f)) (chmod path #o666))
+              (delete-file path #f))))))
 ;; Drop every generation that is neither the current one nor among the few most
 ;; recently used. The grace period keeps a generation another live process may be
 ;; midway through: worst case that process misses and recompiles (mkdir -p and the
