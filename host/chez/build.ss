@@ -68,8 +68,10 @@
   (display (bld-log-string log)))
 
 ;; mkdir -p without a subprocess (the self-contained build shells out to nothing).
+;; path-parent answers #f at a root or a bare name, which ends the walk
+;; (jolt-lang/jolt#1207: a Windows path used to have no parent at all).
 (define (bld-mkdir-p dir)
-  (unless (or (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
+  (unless (or (not dir) (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
     (bld-mkdir-p (path-parent dir))
     ;; tolerate only the benign race (someone else created it) — a real mkdir
     ;; failure (permissions) used to surface later as a less specific
@@ -272,13 +274,14 @@
 
 ;; The directory holding an executable named the way the shell would find it. A
 ;; BARE command name — JOLT_CHEZ=scheme, which runs perfectly well since PATH is
-;; what locates it — has no directory part to take, and path-parent answers "" for
-;; it where dirname answers ".": unhandled, the csv candidate built from it became
-;; an absolute "/../lib/csv<ver>" off the filesystem root. PATH is the only thing
-;; that knows where such a name lives, so ask it.
+;; what locates it — has no directory part to take: path-parent answers #f for it
+;; (Chez's own path-parent, which io.ss shadows, answers ""), where dirname
+;; answers ".". Unhandled, the csv candidate built from it became an absolute
+;; "/../lib/csv<ver>" off the filesystem root, and then a string=? on #f. PATH is
+;; the only thing that knows where such a name lives, so ask it.
 (define (bld-exe-dir exe)
   (let ((parent (path-parent exe)))
-    (if (string=? parent "")
+    (if (or (not parent) (string=? parent ""))
         (let ((p (bld-sh-capture
                   (string-append "dirname \"$(command -v " (bld-sh-quote exe) ")\""))))
           (if (> (string-length p) 0) p "."))

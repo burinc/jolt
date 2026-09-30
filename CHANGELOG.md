@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`jolt build` creates a missing output directory from a Windows path.** The
+  walk that creates `<out>.build` (and the AOT cache's directories) took a
+  path's parent by splitting on `/` only, so `C:\proj\out\app.exe` had no
+  parent and the walk handed `#f` to a string comparison. It now splits on
+  both separators and stops at a drive or UNC root. A bare-name `JOLT_CHEZ`
+  (`scheme`, found on `PATH`) no longer fails the same way when `build.ss`
+  loads (#1207).
+
 ## [0.8.15] - 2026-09-29
 
 Sockets gain read, accept and connect timeouts, and a closed socket behaves

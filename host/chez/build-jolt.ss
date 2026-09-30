@@ -77,7 +77,9 @@
 
 (define jb-build (string-append jb-out ".build"))
 (bld-check-toolchain)
-(bld-system (string-append "mkdir -p '" (path-parent jb-out) "' '" jb-build "'"))
+;; a bare output name has no directory part (path-parent answers #f): its
+;; directory is the current one
+(bld-system (string-append "mkdir -p '" (or (path-parent jb-out) ".") "' '" jb-build "'"))
 
 ;; --- 0. compile the launcher stub -------------------------------------------
 ;; A Windows linker names its output "<name>.exe" whatever -o says, so the stub
