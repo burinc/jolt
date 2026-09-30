@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   KB per parked block against 5.1 KB), which now carries the interrupt arm;
   `<!`, `>!` and `alts!` keep the one without it.
 
+- **An unbuffered put succeeds only when a live taker receives the value.**
+  `offer!`, `put!`, `alts!`'s put and a fiber's `>!` counted a thread blocked in
+  `<!!` as room for any number of puts, so two `offer!`s in a row to one blocked
+  taker both answered true and the second value waited in the channel for
+  whoever took next. A parked taker was likewise counted by looking at it rather
+  than claiming it, so a taker whose `alts!!` completed on another port in
+  between left the put answered true and its value buffered. A put now claims a
+  parked taker before handing it the value, counts blocked threads against the
+  values already queued for them, and pairs a parked putter with a parked taker
+  by claiming both together; an `alts!!` that takes from and puts to the same
+  channel no longer pairs with itself.
+
 - **`java.util.concurrent.TimeoutException` can be constructed.**
   `(TimeoutException.)` and `(TimeoutException. "msg")` raised "No matching ctor
   found", and the one the runtime throws from a timed `Future.get` did not answer

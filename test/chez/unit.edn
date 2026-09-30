@@ -528,6 +528,19 @@
   ;; and the channel is left as it was — no taker counted, no value queued.
   {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (a/<!! c) :took) mon (a/go-monitor g)] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 100) [(a/offer! c 1) (a/poll! c) (let [e (deref (future (a/<!! mon)) 5000 :hung)] (if (instance? Throwable e) (.getName (class e)) e)) (deref (future (a/<!! g)) 5000 :hung)]))))" :expected "[nil nil \"java.lang.InterruptedException\" nil]"}
   {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (a/>!! c :v) :put) mon (a/go-monitor g)] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 100) [(a/offer! c 1) (a/poll! c) (let [e (deref (future (a/<!! mon)) 5000 :hung)] (if (instance? Throwable e) (.getName (class e)) e)) (deref (future (a/<!! g)) 5000 :hung)]))))" :expected "[nil nil \"java.lang.InterruptedException\" nil]"}
+  ;; An unbuffered put succeeds only when a live taker receives the value. offer!
+  ;; used to count a thread blocked in <!! as room for ANY number of puts, so two
+  ;; offers in a row both answered true and the second value sat in the channel
+  ;; for whoever took next. JVM core.async answers [true nil 1 nil].
+  {:suite "core.async / rendezvous" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) t (a/thread (a/<!! c))] (Thread/sleep 50) [(a/offer! c 1) (a/offer! c 2) (a/<!! t) (a/poll! c)]))" :expected "[true nil 1 nil]"}
+  {:suite "core.async / rendezvous" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (a/chan) t (a/go (a/<! c))] (Thread/sleep 50) [(a/offer! c 1) (a/offer! c 2) (a/<!! t) (a/poll! c)])))" :expected "[true nil 1 nil]"}
+  ;; A parked putter and a parked taker are paired by claiming BOTH handlers
+  ;; together, and a handler is never paired with itself: an alts!! that takes
+  ;; from and puts to the same empty channel waits for a partner (here the
+  ;; timeout). It used to claim its own put against its own take, answer true, and
+  ;; leave the value in the channel (known-divergences.edn: the JVM also answers
+  ;; true there, and drops the value).
+  {:suite "core.async / rendezvous" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) to (a/timeout 100) [v p] (a/alts!! [c [c :v] to] :priority true)] [v (= p to) (a/poll! c)]))" :expected "[nil true nil]"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}

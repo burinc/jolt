@@ -197,6 +197,56 @@
     (and (alt-handler-active? h)
          (begin (alt-handler-active?-set! h #f) #t))))
 
+;; (alt-claim-pair! putter taker) -> 'ok when BOTH were claimed together, else
+;; which one was already dead ('putter / 'taker), with neither claimed. Pairing a
+;; parked putter with a parked taker commits two handlers, and claiming them one
+;; after the other cannot be undone when the second claim loses: the first is
+;; then spent on an exchange that never happened. So both fmus are held for the
+;; check and the claim. Each is a leaf taken for a field test, but a handler can
+;; be a putter on one channel and a taker on another (one alts!!), so two pairings
+;; could take the same two in opposite orders: the second is TRIED, and on failure
+;; the first is let go and the pair retried, which cannot deadlock.
+(define (alt-claim-pair! p t)
+  (let ((pm (alt-handler-fmu p)) (tm (alt-handler-fmu t)))
+    (let retry ()
+      (jolt-lock! pm)
+      (if (jolt-lock! tm #f)
+          (let ((r (cond ((not (alt-handler-active? p)) 'putter)
+                         ((not (alt-handler-active? t)) 'taker)
+                         (else (alt-handler-active?-set! p #f)
+                               (alt-handler-active?-set! t #f)
+                               'ok))))
+            (jolt-unlock! tm)
+            (jolt-unlock! pm)
+            r)
+          (begin (jolt-unlock! pm) (retry))))))
+
+;; Hand V straight to the first live alt-taker on CH (mu held), claiming it FIRST:
+;; #t when one received it, #f when none was live. Dead registrations met on the
+;; way are dropped. Claim-then-commit is the rendezvous: a put that answered true
+;; after only SEEING an active taker could lose that taker to its alts!!'s other
+;; port, or to an interrupt, before claiming it, and leave the value buffered for
+;; whoever took next.
+(define (ac-hand-to-taker! ch v)
+  (let loop ()
+    (let ((ts (async-chan-alt-takers ch)))
+      (and (pair? ts)
+           (let ((h (car ts)))
+             (async-chan-alt-takers-set! ch (cdr ts))
+             (if (alt-claim! h)
+                 (begin (alt-deliver! h v ch) #t)
+                 (loop)))))))
+
+;; A thread blocked in a take (takew) is not a handler and cannot be claimed, but
+;; it can be COUNTED: it takes one queued rendezvous value when it wakes, and a
+;; value queued on it is never abandoned (a woken take takes what is there before
+;; it reads the interrupt flag). So an unbuffered channel has room for a put
+;; without a waiting putter only while blocked takers outnumber the values already
+;; queued for them. Testing takew > 0 instead let two offers in a row both answer
+;; true to one blocked taker, the second value left for a later one.
+(define (ac-thread-taker-free? ch)
+  (> (async-chan-takew ch) (ac-qlen ch)))
+
 ;; alt-deliver! — call ONLY after alt-claim! returned #t. The mailbox write and
 ;; the wake decision happen under wmu so a fiber-waiter's park (which checks the
 ;; mailbox and sets its state under the SAME wmu, see jolt-fiber-waiter-wait!)
@@ -251,7 +301,7 @@
                  (else
                   (if (> (async-chan-cap ch) 0)
                       (< (ac-qlen ch) (async-chan-cap ch))
-                      (> (async-chan-takew ch) 0))))
+                      (ac-thread-taker-free? ch))))
                (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
                (if (alt-claim! h)
                    (begin
@@ -279,31 +329,32 @@
                    (set! progress #t)) ; dead registration
                (drain-putters))
               (else #f)))))
-      ;; Step 3: pair alt-putters with alt-takers directly (unbuffered channels
-      ;; where a putter and taker are both parked). Only when a blocking taker
-      ;; or active alt-taker exists to consume the value.
-      (let pair-loop ()
-        (when (and (pair? (async-chan-alt-putters ch))
-                   (pair? (async-chan-alt-takers ch))
-                   (or (> (async-chan-takew ch) 0)
-                       (ormap (lambda (h) (alt-handler-active? h))
-                              (async-chan-alt-takers ch))))
-          (let* ((hp (car (async-chan-alt-putters ch)))
-                 (h (car hp)) (v (cdr hp)))
-            (if (alt-claim! h)
-                (begin
-                  (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-                  ;; Commit the value: unbuffered rendezvous push
-                  (let ((box (vector #f)))
-                    (ac-qpush! ch (cons v box))
-                    (ac-broadcast! ch))
-                  (alt-deliver! h #t ch)
-                  (set! progress #t)
-                  (pair-loop))
-                (begin
-                  (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-                  (set! progress #t)
-                  (pair-loop))))))
+      ;; Step 3: pair a parked alt-putter with a parked alt-taker directly, on an
+      ;; unbuffered channel. Both handlers are claimed together (alt-claim-pair!)
+      ;; and the value goes straight into the taker's mailbox, so the putter hears
+      ;; true only when a live taker received it. A handler never pairs with
+      ;; itself: an alts!! that both takes from and puts to the same channel is
+      ;; two ops that cannot be each other's partner.
+      (when (and (fx=? (async-chan-cap ch) 0) (not (async-chan-xrf ch)))
+        (let pair-loop ()
+          (when (and (pair? (async-chan-alt-putters ch))
+                     (pair? (async-chan-alt-takers ch)))
+            (let* ((hp (car (async-chan-alt-putters ch)))
+                   (h (car hp)) (v (cdr hp))
+                   (t (find (lambda (x) (not (eq? x h))) (async-chan-alt-takers ch))))
+              (when t
+                (case (alt-claim-pair! h t)
+                  ((ok)
+                   (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
+                   (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))
+                   (alt-deliver! t v ch)
+                   (alt-deliver! h #t ch))
+                  ((putter)
+                   (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch))))
+                  (else
+                   (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))))
+                (set! progress #t)
+                (pair-loop))))))
       (when progress (loop))))
   (ac-broadcast! ch))
 
@@ -534,15 +585,15 @@
            (if (< (ac-qlen ch) (async-chan-cap ch))
                (begin (ac-qpush! ch (cons v #f)) (ac-notify! ch) 'ok)
                'full))
-          ;; a waiting taker makes the rendezvous possible: a thread parked in a
-          ;; blocking take (takew), or a fiber parked as an alt-taker (R3 — the
-          ;; fiber's <! registers an alt-handler, invisible to takew). Without
-          ;; the alt-taker clause, offer!/put! to an unbuffered channel would
-          ;; report 'full while a fiber waited, and put! would fork a thread
-          ;; instead of completing on the caller.
-          ((or (> (async-chan-takew ch) 0)
-               (ormap (lambda (h) (alt-handler-active? h))
-                      (async-chan-alt-takers ch)))
+          ;; a waiting taker makes the rendezvous possible: a fiber or alts!!
+          ;; parked as an alt-taker (R3 — the fiber's <! registers an
+          ;; alt-handler, invisible to takew), claimed before the value is handed
+          ;; over, or a thread blocked in a take that no queued value is already
+          ;; spoken for by. Without the alt-taker clause, offer!/put! to an
+          ;; unbuffered channel would report 'full while a fiber waited, and put!
+          ;; would fork a thread instead of completing on the caller.
+          ((ac-hand-to-taker! ch v) 'ok)
+          ((ac-thread-taker-free? ch)
            (let ((box (vector #f)))
              (ac-qpush! ch (cons v box))
              (ac-notify! ch)
@@ -1124,7 +1175,7 @@
                                                (and (> (async-chan-cap ch) 0)
                                                     (< (ac-qlen ch) (async-chan-cap ch)))
                                                (and (fx=? (async-chan-cap ch) 0)
-                                                    (> (async-chan-takew ch) 0)))))
+                                                    (ac-thread-taker-free? ch)))))
                                       (cond
                                         ((not ready?)
                                          (async-chan-alt-putters-set! ch

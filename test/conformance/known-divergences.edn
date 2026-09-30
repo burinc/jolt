@@ -996,6 +996,18 @@
    :check :prose
    :why "timing-dependent: asserts when a sleep returns relative to an interrupt"
    :note "Entering the sleep with the flag ALREADY set does throw, so the pre-set half matches. Only mid-sleep delivery is missing. Pinned by the last \"interrupt / blocking fibers\" row in test/chez/unit.edn, which also shows the flag surviving the nap. A fiber that must be interruptible mid-wait should park on a promise, or in <!! / >!! / alts!! on a channel, rather than sleep."}
+  ;; An alts that both takes from and puts to the same unbuffered channel. On the
+  ;; JVM the put finds the alts's own take registered and commits against it: the
+  ;; alts answers [true ch] and the value goes to a callback nobody reads. jolt
+  ;; claims a putter and a taker together and never pairs a handler with itself, so
+  ;; the two ops wait for real partners.
+  {:category :concurrency-model
+   :behavior "(let [c (chan)] (alts!! [c [c :v] (timeout 100)] :priority true))"
+   :jvm "[true c] — the put pairs with the alts's own take, and :v is lost"
+   :jolt "[nil timeout-chan] — neither op completes, and nothing is lost or left in c"
+   :check :prose
+   :why "the JVM answer loses a value, and the jolt answer depends on a timeout firing"
+   :note "Probed on core.async 1.9.865. Pinned by the \"core.async / rendezvous\" rows in test/chez/unit.edn; the pairing is alt-claim-pair! in host/chez/java/async.ss."}
   ;; The blocking channel ops: <!!, >!! and alts!! throw InterruptedException and
   ;; clear the flag, as on the JVM, and a flag already set makes an op that would
   ;; wait throw at once while one that can complete completes. What differs is what
