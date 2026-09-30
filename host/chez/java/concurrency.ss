@@ -741,7 +741,7 @@
 (define (start-tap-thread!)
   (unless (unbox tap-thread-started?)
     (set-box! tap-thread-started? #t)
-    (fork-thread
+    (fork-thread/daemon #t                 ; clojure.core's tap-loop thread is a daemon
      (lambda ()
        (*txn* #f)
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
@@ -1752,10 +1752,15 @@
     (let ((n jthread-name-counter))
       (set! jthread-name-counter (+ n 1))
       (string-append "Thread-" (number->string n)))))
+;; Slots 8 and 9, daemon and priority, start as the CREATING thread's, which is
+;; the JVM's rule: a Thread made on a daemon thread is a daemon, and one made on a
+;; thread of priority 3 has priority 3.
 (define (make-jthread thunk name)
-  (make-jhost "user-thread"
-              (vector thunk #f (make-mutex) (make-condition) (box #f) #f
-                      (box (or name (next-jthread-name))) #f #f)))
+  (let ((me (get-thread-id)))
+    (make-jhost "user-thread"
+                (vector thunk #f (make-mutex) (make-condition) (box #f) #f
+                        (box (or name (next-jthread-name))) #f
+                        (jolt-thread-daemon? me) (jolt-thread-priority me)))))
 ;; slot 7: the id of the thread the start forked, #f until then. A rename needs
 ;; it to reach the id-keyed name table the handles read.
 (define (jthread-id st) (vector-ref st 7))
@@ -1814,7 +1819,9 @@
                                                "Thread already started")))
             (vector-set! st 5 #t)  ; mark started before forking
             (unless (jthread-daemon? st) (user-thread-started!))
-            (fork-thread (lambda ()
+            ;; born with the object's daemon flag, so the handle currentThread
+            ;; and getAllStackTraces give for it answers the same
+            (fork-thread/daemon (jthread-daemon? st) (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
                (rdr-default-modes!)                ; and not the reader modes of a read it forked from
                ;; Adopt the Thread object's own interrupt flag, so .interrupt from
@@ -1825,6 +1832,7 @@
                ;; Thread/currentThread (and getAllStackTraces) hands out
                (vector-set! st 7 (get-thread-id))
                (jolt-thread-name-set! (get-thread-id) (unbox (vector-ref st 6)))
+               (jolt-thread-priority-set! (get-thread-id) (vector-ref st 9))
                ;; and register that handle now, so a handle someone else takes for
                ;; this thread before it first asks who it is is the live one
                (current-thread-handle)
@@ -1899,11 +1907,24 @@
         (cons "setDaemon" (lambda (self flag)
           (let ((st (jhost-state self)))
             (when (jthread-alive? st)
-              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
-                                               "Thread is alive")))
-            (vector-set! st 8 (and (jolt-truthy? flag) #t)))
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException" jolt-nil)))
+            (vector-set! st 8 (and (jolt-truthy? flag) #t))
+            ;; a thread that has finished: its handle must keep agreeing
+            (when (jthread-id st) (jolt-thread-daemon-set! (jthread-id st) (vector-ref st 8))))
           jolt-nil))
-        (cons "isDaemon" (lambda (self) (and (jthread-daemon? (jhost-state self)) #t)))))
+        (cons "isDaemon" (lambda (self) (and (jthread-daemon? (jhost-state self)) #t)))
+        ;; Priority: advisory, as the JVM documents it, and jolt schedules no
+        ;; differently for it — but it is stored, validated and inherited as there,
+        ;; and once started it is the thread's, so the handle reads the same value.
+        (cons "getPriority" (lambda (self)
+          (let ((st (jhost-state self)))
+            (if (jthread-id st) (jolt-thread-priority (jthread-id st)) (vector-ref st 9)))))
+        (cons "setPriority" (lambda (self p)
+          (let ((st (jhost-state self)) (p (jolt-thread-priority-arg p)))
+            (vector-set! st 9 p)
+            (when (jthread-id st) (jolt-thread-priority-set! (jthread-id st) p)))
+          jolt-nil))
+        (cons "isVirtual" (lambda (self) #f))))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))
@@ -2084,11 +2105,18 @@
 ;; way, which is why the test is a depth against a count rather than a handoff.
 (define executor-unbounded-workers 2147483647)   ; Integer.MAX_VALUE, as the JVM passes
 (define cached-pool-keep-alive-ms 60000)         ; 60L, TimeUnit.SECONDS, as the JVM passes
-(define (make-executor* tag core-n max-n keep-alive-ms cap)
+;; SPEC is (daemon factory), both optional: slots 16 and 17, what the pool's
+;; workers are born as. A pool Executors builds with its defaultThreadFactory has
+;; non-daemon workers, which is the default; a ForkJoin-style pool's are daemons;
+;; and a ThreadFactory the caller passed decides for itself, per worker, through
+;; the Thread its newThread answers (executor-spawn-worker!).
+(define (make-executor* tag core-n max-n keep-alive-ms cap . spec)
   (let ((self (make-jhost tag
                           (vector #f (box (cons '() '())) (make-mutex) (make-condition) 0
                                   cap core-n max-n keep-alive-ms 0 0 (make-condition) 0
-                                  '() #f 0))))
+                                  '() #f 0
+                                  (and (pair? spec) (car spec) #t)
+                                  (and (pair? spec) (pair? (cdr spec)) (cadr spec))))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -2099,19 +2127,26 @@
             (executor-spawn-worker! st))
           (spawn (fx- k 1))))
       self)))
-;; A fixed pool: n eager workers that never retire, and the advisory capacity a
-;; ThreadPoolExecutor's queue argument contributes to .getQueue's view.
-(define (make-executor n-workers . cap)
-  (make-executor* "executor-service" n-workers n-workers #f (if (null? cap) #f (car cap))))
-;; newCachedThreadPool / newVirtualThreadPerTaskExecutor.
-(define (make-cached-executor)
-  (make-executor* "executor-service" 0 executor-unbounded-workers cached-pool-keep-alive-ms #f))
+;; newCachedThreadPool / newVirtualThreadPerTaskExecutor. SPEC as make-executor*.
+(define (make-cached-executor . spec)
+  (apply make-executor* "executor-service" 0 executor-unbounded-workers cached-pool-keep-alive-ms #f spec))
 ;; newScheduledThreadPool / newSingleThreadScheduledExecutor / the
 ;; ScheduledThreadPoolExecutor ctor: a fixed pool (the JVM's grows to
 ;; Integer.MAX_VALUE on paper and never does in practice, its queue being
 ;; unbounded) whose tag adds the three schedule methods.
-(define (make-scheduled-executor n-workers)
-  (make-executor* "scheduled-executor" n-workers n-workers #f #f))
+(define (make-scheduled-executor n-workers . spec)
+  (apply make-executor* "scheduled-executor" n-workers n-workers #f #f spec))
+
+;; The ThreadFactory argument of an Executors factory or a pool constructor, or
+;; #f: anything answering newThread. (A RejectedExecutionHandler in the same
+;; position of the other ThreadPoolExecutor overload does not.)
+(define (thread-factory-arg x)
+  (and (not (jolt-nil? x)) (not (procedure? x))
+       (or (iface-method x "newThread" 2)
+           (and (jhost? x) (host-method-ref (jhost-tag x) "newThread")))
+       x))
+(define (thread-factory-in args)
+  (let loop ((as args)) (cond ((null? as) #f) ((thread-factory-arg (car as)) => values) (else (loop (cdr as))))))
 
 ;; Claim a worker slot, or answer #f because the pool is at max. Called with the
 ;; queue mutex HELD, and the slot is claimed BEFORE the fork rather than counted
@@ -2143,10 +2178,25 @@
                                     (jolt-cv-wake! (vector-ref st 11))
                                     (fx=? 0 (vector-ref st 4)))))
                   (when none-left? (raise e)))))
-    (fork-thread (lambda ()
-      (*txn* #f)      ; worker must not inherit the creating thread's txn
-      (rdr-default-modes!)                ; and not the reader modes of a read it forked from
-      (executor-worker-loop st)))))
+    ;; What the worker is born as. A pool with a ThreadFactory asks it for the
+    ;; worker's Thread, once per worker as the JVM does, and takes that Thread's
+    ;; daemon flag and name; the Thread itself is not started — the worker is
+    ;; this fork, so a factory that wraps the Runnable it is handed does not see
+    ;; its wrapper run. Without one, the pool's own flag.
+    (let* ((factory (vector-ref st 17))
+           (t (and factory
+                   (let ((t (record-method-dispatch factory "newThread"
+                                                    (jolt-list (lambda () jolt-nil)))))
+                     (and (not (jolt-nil? t)) t))))
+           (daemon (if t
+                       (jolt-truthy? (record-method-dispatch t "isDaemon" jolt-nil))
+                       (vector-ref st 16)))
+           (name (and t (record-method-dispatch t "getName" jolt-nil))))
+      (fork-thread/daemon daemon (lambda ()
+        (*txn* #f)      ; worker must not inherit the creating thread's txn
+        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
+        (when (string? name) (jolt-thread-name-set! (get-thread-id) name))
+        (executor-worker-loop st))))))
 
 ;; Dequeue, with the mutex held. Callers test queue-depth first.
 (define (executor-dequeue! st)
@@ -2436,14 +2486,17 @@
       ((spawn) (executor-spawn-worker! st))
       ((reject) (executor-reject-task! st))
       (else (void)))))
-(let ((single (lambda _ (make-executor 1)))
-      (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
+(let ((single (lambda args (make-executor* "executor-service" 1 1 #f #f #f (thread-factory-in args))))
+      (fixed  (lambda (n . args)
+                (let ((n (max 1 (jnum->exact n))))
+                  (make-executor* "executor-service" n n #f #f #f (thread-factory-in args)))))
       ;; the two scheduled factories: the same fixed pools under the tag that
       ;; answers schedule (jolt-hgjo). newSingleThreadScheduledExecutor's class
       ;; is a private delegating wrapper on the JVM, which jolt does not model —
       ;; it reports the pool it wraps, as newSingleThreadExecutor already does.
-      (scheduled-single (lambda _ (make-scheduled-executor 1)))
-      (scheduled-fixed  (lambda (n . _) (make-scheduled-executor (max 1 (jnum->exact n)))))
+      (scheduled-single (lambda args (make-scheduled-executor 1 #f (thread-factory-in args))))
+      (scheduled-fixed  (lambda (n . args)
+                          (make-scheduled-executor (max 1 (jnum->exact n)) #f (thread-factory-in args))))
       ;; cached / virtual-thread-per-task: the two factories that are UNBOUNDED on
       ;; the JVM. A cached pool is (0, Integer.MAX_VALUE, 60s, SynchronousQueue)
       ;; there, and a virtual thread per task is a thread per task with no pool at
@@ -2461,14 +2514,15 @@
       ;; substitution — a pooled thread for a fresh virtual one, which nothing here
       ;; can tell apart, since jolt has no thread-locals and a task's identity is
       ;; its own.
-      (cached (lambda _ (make-cached-executor)))
+      (cached (lambda args (make-cached-executor #f (thread-factory-in args))))
       ;; newWorkStealingPool is NOT one of those and stays a fixed pool: a
       ;; ForkJoinPool is sized at availableProcessors, because work stealing is for
       ;; CPU-bound tasks that would only contend if there were more of them than
       ;; cores. It does grow past that, but only to REPLACE a worker the JVM can
       ;; see is blocked in a join, which is a thing jolt cannot see; a flat 32 sits
       ;; between the two bounds and errs toward not stranding a blocking task.
-      (stealing (lambda _ (make-executor 32))))
+      ;; ForkJoinPool's workers are daemons.
+      (stealing (lambda _ (make-executor* "executor-service" 32 32 #f #f #t))))
   (for-each (lambda (nm) (register-class-statics! nm
               (list (cons "newSingleThreadExecutor" single)
                     (cons "newSingleThreadScheduledExecutor" scheduled-single)
@@ -2609,7 +2663,7 @@
 ;; (ThreadPoolExecutor. 1 1 keepAlive unit (ArrayBlockingQueue. n)) plus
 ;; FutureTask. ArrayBlockingQueue is a real bounded blocking queue (fiber-aware
 ;; through jolt-cv-wait); FutureTask a run-once future; the ThreadPoolExecutor
-;; ctor builds on make-executor above, sized by maximumPoolSize, its queue
+;; ctor builds on make-executor* above, sized by maximumPoolSize, its queue
 ;; argument contributing capacity to .getQueue's view. Tasks flow through the
 ;; executor's own unbounded queue — the JVM REJECTS a submit when the bounded
 ;; queue is full, jolt queues it; that is the deliberate divergence here.
@@ -2834,7 +2888,8 @@
 
 ;; ThreadPoolExecutor ctor: (core max keepAlive unit [queue] [factory]
 ;; [handler]) — core, max and keepAlive all reach the pool now that the pool can
-;; grow and retire; factory and handler are accepted and ignored. The workers up
+;; grow and retire; a factory decides each worker's daemon flag and name
+;; (executor-spawn-worker!), and a handler is accepted and ignored. The workers up
 ;; to core are eager, the rest appear as tasks arrive with nobody idle, and an
 ;; above-core worker retires after keepAlive.
 ;;
@@ -2854,7 +2909,8 @@
                      ;; idle" and stays 0.
                      (keep (and (>= (length rest) 2) (tu->ms (car rest) (cadr rest)))))
                 (make-executor* "executor-service" core-n max-n keep
-                                (and q (vector-ref (jhost-state q) 0)))))))
+                                (and q (vector-ref (jhost-state q) 0))
+                                #f (thread-factory-in (if (>= (length rest) 3) (cddr rest) '())))))))
           '("ThreadPoolExecutor" "java.util.concurrent.ThreadPoolExecutor"))
 ;; .getQueue answers a live VIEW of the executor's internal queue — size reads
 ;; the real depth, remainingCapacity subtracts it from the advisory capacity
@@ -3028,7 +3084,8 @@
 ;; one worker, as every pool here (a pool with no worker runs nothing; the JVM's
 ;; ensurePrestart starts one on demand for core 0).
 (for-each (lambda (nm) (register-class-ctor! nm
-            (lambda (core-n . _) (make-scheduled-executor (max 1 (jnum->exact core-n))))))
+            (lambda (core-n . rest)
+              (make-scheduled-executor (max 1 (jnum->exact core-n)) #f (thread-factory-in rest)))))
           '("ScheduledThreadPoolExecutor" "java.util.concurrent.ScheduledThreadPoolExecutor"))
 ;; The future's own members over the j-future's: Delayed's getDelay (remaining
 ;; time in UNIT, negative once overdue, truncated toward zero as TimeUnit.convert
@@ -3160,7 +3217,8 @@
 (define cf-default-pool-mu (make-mutex))
 (define (cf-default-executor)
   (jolt-with-mutex cf-default-pool-mu
-    (unless cf-default-pool (set! cf-default-pool (make-cached-executor)))
+    ;; daemon workers, as the commonPool's are
+    (unless cf-default-pool (set! cf-default-pool (make-cached-executor #t)))
     cf-default-pool))
 ;; Hand THUNK to an Executor: 'default is the async pool, anything else answers
 ;; execute(Runnable) — a pool shim, a delayedExecutor, a reified Executor. The

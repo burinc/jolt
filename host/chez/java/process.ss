@@ -495,7 +495,7 @@
                     (flush-output-port dst) #t)))))
 (define (proc-pump src dst close-dst?)
   (let ((m (make-mutex)) (c (make-condition)) (done (box #f)))
-    (fork-thread
+    (fork-thread/daemon #t                 ; jolt's own plumbing, like the JVM's process reaper
       (lambda ()
         (guard (e (#t #f))
           (let loop () (when (proc-copy-chunk src dst) (loop))))
@@ -2312,7 +2312,7 @@
 ;; fails the future with what it threw.
 (define (make-proc-completable proc)
   (let ((d (make-cf)))
-    (fork-thread
+    (fork-thread/daemon #t                 ; the JVM's process reaper thread is a daemon
      (lambda ()
        (let ((r (guard (e (#t (make-cf-alt (jolt-unwrap-throw e))))
                   (proc-wait-blocking proc)

@@ -284,15 +284,40 @@
 ;; POSIX mask primitives are up; the identity below is what a host without them
 ;; (Windows, Gambit) keeps.
 (define jolt-fork-sigmask-guard (lambda (fork) (fork)))
+;; DAEMON STATUS, per thread id, for Thread.isDaemon — asked of the Thread object
+;; a (Thread. f) built, of the handle Thread/currentThread gives the thread itself,
+;; or of the handle getAllStackTraces gives someone else, and all three must agree.
+;; So it lives here, where every thread is born, and not in any one
+;; representation. Only daemons have an entry (absent is false, as for the boot
+;; thread), and an entry is never dropped, as the name table in io.ss is not:
+;; a thread that has finished still answers what it was.
+;;
+;; A thread is born with its creator's status, which is the JVM's rule for a new
+;; Thread. A fork site that stands for a JVM thread whose status is FIXED — a
+;; pool's worker made by Executors.defaultThreadFactory (never a daemon), a
+;; core.async or ForkJoin thread (always one) — says so with fork-thread/daemon.
+;; The answer is recorded by the parent after the fork and by the child as its
+;; first act, under live-threads-mutex, so it is there whichever runs first.
+(define thread-daemons (make-eqv-hashtable))              ; id -> #t
+(define (jolt-thread-daemon? id)
+  (jolt-with-mutex live-threads-mutex (hashtable-ref thread-daemons id #f)))
+(define (thread-daemon-record! id d)
+  (jolt-with-mutex live-threads-mutex
+    (if d (hashtable-set! thread-daemons id #t) (hashtable-delete! thread-daemons id))))
+;; (jolt-thread-daemon-set! id d) — setDaemon on a Thread object that has
+;; finished (the JVM allows it then), so its handle keeps agreeing with it.
+(define (jolt-thread-daemon-set! id d) (thread-daemon-record! id (and d #t)))
 (define %ls-orig-fork-thread fork-thread)
-(define (%ls-fork-thread mark-mt? thunk)
+(define (%ls-fork-thread mark-mt? daemon thunk)
   (when mark-mt? (jolt-mark-mt!))
-  (let* ((t (jolt-fork-sigmask-guard
+  (let* ((d (if (eq? daemon 'inherit) (jolt-thread-daemon? (get-thread-id)) (and daemon #t)))
+         (t (jolt-fork-sigmask-guard
              (lambda ()
                (%ls-orig-fork-thread
                 (lambda ()
                   (*txn* #f)
                   (rdr-default-modes!)
+                  (thread-daemon-record! (get-thread-id) d)
                   (let ((id (get-thread-id)))
                     (dynamic-wind
                       (lambda () #f)
@@ -304,12 +329,15 @@
                               (hashtable-set! live-threads id 'done)))))))))))
          (id (sa-thread-id-of t)))
     (when id
+      (thread-daemon-record! id d)
       (jolt-with-mutex live-threads-mutex
         (if (eq? 'done (hashtable-ref live-threads id #f))
             (hashtable-delete! live-threads id)
             (hashtable-set! live-threads id #t))))
     t))
-(define (fork-thread thunk) (%ls-fork-thread #t thunk))
+(define (fork-thread thunk) (%ls-fork-thread #t 'inherit thunk))
+;; (fork-thread/daemon d thunk): a thread whose daemon status is D whoever forks it.
+(define (fork-thread/daemon d thunk) (%ls-fork-thread #t d thunk))
 
 ;; A thread that parks in a foreign call and runs no jolt code until something
 ;; wakes it has not made the process multi-threaded, and saying that it has is not
@@ -321,7 +349,7 @@
 ;; multi-threaded before any jolt code can reach it: for the watcher that is hook
 ;; registration (concurrency.ss), which is the moment a second mutator becomes
 ;; possible at all.
-(define (fork-thread-dormant thunk) (%ls-fork-thread #f thunk))
+(define (fork-thread-dormant thunk) (%ls-fork-thread #f #t thunk))
 
 ;; coll->cells: coerce a `lazy-seq` body's result to a seq | nil -- except a lazy
 ;; seq, handed back unforced for force-lazyseq to walk in its loop (the

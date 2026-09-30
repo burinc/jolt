@@ -41,6 +41,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Thread.isDaemon` answers for every thread.** `(.isDaemon
+  (Thread/currentThread))` was "No matching field found" everywhere — on the
+  main thread, in a future, a `go` block, an executor task, even in a started
+  `Thread.` looking at itself — because the handle `currentThread` and
+  `getAllStackTraces` hand out had no such method, only the `(Thread. f)`
+  object did. Daemon status is now recorded where each thread is forked, so
+  the object and every handle for the thread agree. The values are the JVM's,
+  each probed on JDK 21: the main thread, futures, agents and executor workers
+  are not daemons; `core.async` thread, `go` and `io-thread` threads, the tap
+  thread, a work-stealing pool's and CompletableFuture's async threads are; a
+  `Thread.` inherits its creator's status, as on the JVM, where it was always
+  false. A `ThreadFactory` passed to `Executors` or a pool constructor was
+  ignored; it now decides each worker's daemon flag and name. `setDaemon` on a
+  live thread's handle is `IllegalThreadStateException`, as on the JVM. The
+  handle also gains `isAlive`, `isVirtual`, `threadId`, and `getPriority`/
+  `setPriority`, which both representations now share: validated to 1–10,
+  inherited by a new `Thread.`, and carried to the started thread. One exit
+  difference is recorded in `known-divergences.edn`: jolt still exits without
+  waiting for work pending on a future, an agent or an executor, where the JVM
+  stays up for those non-daemon threads.
 - **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
   deref'ing a promise, so `.interrupt` throws `InterruptedException` out of them
   and clears the flag. jolt kept waiting and left the flag set, so a worker shut
