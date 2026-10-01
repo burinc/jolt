@@ -145,6 +145,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Attributes set on a finished thread stick.** A thread's exit hook ran
+  after its body had already woken `join`, and copied the thread's name,
+  priority and daemon flag onto the object a second time, undoing a
+  `setDaemon`, `setName` or `setPriority` made after the join. It was about one
+  run in two thousand under contention; now the thread is finished once.
+
 - **A `ThreadFactory`'s Thread runs the pool worker.** A pool asked its
   factory for a Thread only to read its daemon flag and name, and ran the
   worker on a thread of its own, so a factory that wraps the Runnable it is
