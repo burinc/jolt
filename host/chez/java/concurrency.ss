@@ -2217,6 +2217,8 @@
   (let ((t (current-time 'time-thread)))
     (+ (* (time-second t) 1000000000) (time-nanosecond t))))
 (define the-thread-mx-bean (make-jhost "thread-mx-bean" #f))
+;; How many mutexes the runtime has allocated so far (locks.ss).
+(def-var! "jolt.host" "mutex-allocations" (lambda () (unbox jolt-mutex-allocations)))
 (register-host-methods! "thread-mx-bean"
   (list (cons "getCurrentThreadCpuTime" (lambda (self) (current-thread-cpu-nanos)))
         (cons "getCurrentThreadUserTime" (lambda (self) (current-thread-cpu-nanos)))

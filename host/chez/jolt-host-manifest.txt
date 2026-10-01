@@ -176,6 +176,7 @@ mkdirs!
 monitor-enter
 monitor-exit
 mono-nanos
+mutex-allocations
 munge-name
 namespace-for
 ns-shaped-name?

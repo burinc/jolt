@@ -47,6 +47,7 @@
 ;; Slot 7: how many locks this carrier currently holds. Per thread, like the
 ;; other virtual registers, and a fresh thread starts it at fixnum 0 — which is
 ;; the correct answer for a thread that never runs fibers.
+
 (define jolt-vreg-locks 7)
 (define (jolt-locks-held) (virtual-register jolt-vreg-locks))
 ;; Always ERR TOWARDS HELD. enter! runs BEFORE the acquire and exit! runs AFTER
