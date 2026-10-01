@@ -128,6 +128,9 @@
   ;; scaling first: it needs the single-threaded arm, and once-only forks threads
   (check-scaling)
   (check-once-only)
-  (println "lazyseq-mt-scaling: passed"))
+  (println "lazyseq-mt-scaling: passed")
+  ;; the walkers ran on futures; let the pool go so the process exits now
+  ;; rather than after the agent pools' idle linger, as on the JVM
+  (shutdown-agents))
 
 (-main)
