@@ -531,15 +531,16 @@
 ;; or it leaks. bind must NOT close, because Java leaves a failed bind's socket
 ;; open — the caller still holds it and is the one who closes or retries.
 (defn- bind-listen! [fd bind-host port backlog close-on-failure?]
-  (let [[sa len] (make-sockaddr-in bind-host port)]
-    (when (neg? (first (native/c-bind fd sa len)))
+  ;; any failure closes fd when asked, an unknown bind host included
+  (try
+    (let [[sa len] (make-sockaddr-in bind-host port)]
+      (when (neg? (first (try (native/c-bind fd sa len) (finally (ffi/free sa)))))
+        (throw (java.io.IOException. (str "bind failed on port " port))))
+      (when (neg? (first (native/c-listen fd backlog)))
+        (throw (java.io.IOException. "listen() failed"))))
+    (catch :default e
       (when close-on-failure? (native/c-close fd))
-      (ffi/free sa)
-      (throw (java.io.IOException. (str "bind failed on port " port))))
-    (ffi/free sa)
-    (when (neg? (first (native/c-listen fd backlog)))
-      (when close-on-failure? (native/c-close fd))
-      (throw (java.io.IOException. "listen() failed")))))
+      (throw e))))
 
 (defn- server-ctor [& args]
   ;; [] [port] [port backlog] [port backlog bindAddr]. The arg'd forms bind the
@@ -670,8 +671,9 @@
 ;; -- host identity: local host + network interfaces ---------------------------
 
 (defn- ifaddr-entries
-  "One map per getifaddrs entry with an IPv4 address or a MAC: {:name :ip :mac}.
-  java.net here is IPv4 only, so the v6 entries native answers are dropped.
+  "One map per getifaddrs entry: {:name :ip :mac}. java.net here is IPv4 only,
+  so a v6 entry keeps only its name — an interface with no IPv4 address (utun,
+  wg, a v6-only link) still exists and getByName still finds it.
 
   Empty on Windows, which has no getifaddrs (native/interface-addresses).
   getLocalHost answers from gethostname plus the resolver, which is the primary
@@ -679,10 +681,11 @@
   NetworkInterface enumerates nothing there, recorded in
   test/conformance/known-divergences.edn (jolt-lang/jolt#1107)."
   []
-  (keep (fn [{:keys [family] :as e}]
-          (cond (= family native/af-inet) (dissoc e :family)
-                (:mac e) e))
-        (native/interface-addresses)))
+  (map (fn [{:keys [family] :as e}]
+         (if (= family native/af-inet)
+           (dissoc e :family)
+           (dissoc e :family :ip)))
+       (native/interface-addresses)))
 
 ;; -- InetAddress --------------------------------------------------------------
 (defn- inet-address-ctor [& _]

@@ -64,6 +64,9 @@
     {:af-inet        2
      :af-inet6       (case os :macos 30 :windows 23 10)
      :sock-stream    1
+     ;; or'd into socket()'s type (and accept4's flags) for an fd that is
+     ;; close-on-exec from birth; the BSDs and Winsock have no such flag
+     :sock-cloexec   (when-not bsd? 0x80000)
      :sol-socket     (if bsd? 0xffff 1)
      :so-reuseaddr   (if bsd? 4 2)
      ;; Linux load-balances new connections over every socket bound to the
@@ -121,6 +124,7 @@
 (def af-inet        (:af-inet consts))
 (def af-inet6       (:af-inet6 consts))
 (def sock-stream    (:sock-stream consts))
+(def sock-cloexec   (:sock-cloexec consts))
 (def sol-socket     (:sol-socket consts))
 (def so-reuseaddr   (:so-reuseaddr consts))
 (def so-reuseport   (:so-reuseport consts))
@@ -181,8 +185,6 @@
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int {:capture-native-error true})
 (ffi/defcfn c-bind        "bind"        [:int :pointer :int] :int {:capture-native-error true})
 (ffi/defcfn c-listen      "listen"      [:int :int] :int {:capture-native-error true})
-(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int
-  {:blocking true :capture-native-error true})
 (ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
   {:blocking true :capture-native-error true})
 (ffi/defcfn c-shutdown    "shutdown"    [:int :int] :int {:capture-native-error true})
@@ -215,6 +217,8 @@
     (ffi/defcfn c-send  "send" [:int :pointer :int :int] :int
       {:blocking true :capture-native-error true})
     (ffi/defcfn c-close "closesocket" [:int] :int {:capture-native-error true})
+    (ffi/defcfn c-accept "accept" [:int :pointer :pointer] :int
+      {:blocking true :capture-native-error true})
     (ffi/defcfn c-poll  "WSAPoll" [:pointer :uint :int] :int
       {:blocking true :capture-native-error true})
     (ffi/defcfn c-ioctl "ioctlsocket" [:int :int :pointer] :int {:capture-native-error true})
@@ -226,6 +230,15 @@
     (ffi/defcfn c-send  "send" [:int :pointer :size_t :int] :ssize_t
       {:blocking true :capture-native-error true})
     (ffi/defcfn c-close "close" [:int] :int {:capture-native-error true})
+    ;; Linux accepts close-on-exec in one call, so a process spawned on another
+    ;; thread never sees the connection; macOS has no accept4 and guard-accepted!
+    ;; sets it after
+    (if sock-cloexec
+      (do (ffi/defcfn c-accept4 "accept4" [:int :pointer :pointer :int] :int
+            {:blocking true :capture-native-error true})
+          (defn c-accept [fd addr addrlen] (c-accept4 fd addr addrlen sock-cloexec)))
+      (ffi/defcfn c-accept "accept" [:int :pointer :pointer] :int
+        {:blocking true :capture-native-error true}))
     (ffi/defcfn c-poll  "poll" [:pointer :int :int] :int
       {:blocking true :capture-native-error true})
     ;; ioctl and fcntl are variadic; the :varargs marker puts the third argument
@@ -268,6 +281,7 @@
    10060 "Connection timed out" 10061 "Connection refused"
    10065 "No route to host" 10093 "WSAStartup not yet performed"
    11001 "No such host is known" 11002 "Nonauthoritative host not found"
+   11003 "This is a nonrecoverable error"
    11004 "Valid name, no data record of requested type"})
 
 (defn error-message
@@ -410,7 +424,7 @@
   (msg-nosignal); Windows has no SIGPIPE."
   [family]
   (winsock/ensure!)
-  (let [[fd e] (c-socket family sock-stream 0)]
+  (let [[fd e] (c-socket family (bit-or sock-stream (or sock-cloexec 0)) 0)]
     (when (neg? fd)
       (throw (java.io.IOException. (str "socket() failed: " (error-message e)))))
     (close-on-exec! fd)
@@ -533,7 +547,7 @@
               {:family fam :addr sa :addrlen len :ip (sockaddr-ip sa)})))
         [af-inet af-inet6]))
 
-(declare getaddrinfo-addrs)
+(declare getaddrinfo-addrs free-addrs!)
 
 (defn- ai-addr
   "An addrinfo entry's ai_addr. ai_canonname and ai_addr trade places between
@@ -563,49 +577,60 @@
   (free-addrs!). Duplicates (a name listed twice in /etc/hosts) come back once.
 
   opts: :family (af-inet or af-inet6; default either), :passive? (AI_PASSIVE,
-  for an address to bind)."
+  for an address to bind). A nil host with :passive? is the wildcard address,
+  nil without it the loopback, as getaddrinfo answers a NULL node."
   ([host port] (resolve-addrs host port nil))
   ([host port {:keys [family] :as opts}]
    (winsock/ensure!)
-   (if-let [lit (literal-addr (str host) port family)]
+   (if-let [lit (when host (literal-addr (str host) port family))]
      {:addrs [lit]}
      (getaddrinfo-addrs host port opts))))
 
 (defn- getaddrinfo-addrs
   [host port {:keys [family passive?]}]
-   (let [node  (ffi/string->ptr (str host))
+   ;; a NULL node, not "": AI_PASSIVE answers the wildcard only for NULL. Node
+   ;; and service cannot both be NULL, so a NULL node names the port.
+   (let [node  (if host (ffi/string->ptr (str host)) ffi/null)
+         svc   (if host ffi/null (ffi/string->ptr (str port)))
          hints (ffi/alloc addrinfo-size)
          resp  (ffi/alloc 8)]
      (try
        (ffi/write hints :int (if passive? ai-passive 0) 0)
        (ffi/write hints :int (or family 0) 4)
        (ffi/write hints :int sock-stream 8)
-       (let [rc (c-getaddrinfo node ffi/null hints resp)]
+       (let [rc (c-getaddrinfo node svc hints resp)]
          (if-not (zero? rc)
            {:error rc :message (gai-message rc)}
-           (let [head (ffi/read resp :pointer)]
-             (loop [ai head out [] seen #{}]
-               (if (or (nil? ai) (ffi/null? ai))
-                 (do (when-not (or (nil? head) (ffi/null? head)) (c-freeaddrinfo head))
-                     {:addrs out})
-                 (let [fam     (ffi/read ai :int 4)
-                       addrlen (ffi/read ai :int 16)
-                       src     (ai-addr ai fam)
-                       k (when (and (or (= fam af-inet) (= fam af-inet6))
-                                    (pos? addrlen)
-                                    src)
-                           [fam (mapv #(ffi/read src :uint8 %) (range addrlen))])
-                       entry (when (and k (not (contains? seen k)))
-                               (let [sa (ffi/alloc addrlen)]
-                                 (dotimes [i addrlen]
-                                   (ffi/write sa :uint8 (ffi/read src :uint8 i) i))
-                                 (set-sockaddr-port! sa port)
-                                 {:family fam :addr sa :addrlen addrlen
-                                  :ip (sockaddr-ip sa)}))]
-                   (recur (ffi/read ai :pointer 40)
-                          (if entry (conj out entry) out)
-                          (if k (conj seen k) seen))))))))
-       (finally (ffi/free node) (ffi/free hints) (ffi/free resp)))))
+           (let [head (ffi/read resp :pointer)
+                 ;; what has been copied so far, freed if the walk throws
+                 copied (volatile! [])]
+             (try
+               (loop [ai head out [] seen #{}]
+                 (if (or (nil? ai) (ffi/null? ai))
+                   (do (vreset! copied nil)
+                       {:addrs out})
+                   (let [fam     (ffi/read ai :int 4)
+                         addrlen (ffi/read ai :int 16)
+                         src     (ai-addr ai fam)
+                         k (when (and (or (= fam af-inet) (= fam af-inet6))
+                                      (pos? addrlen)
+                                      src)
+                             [fam (mapv #(ffi/read src :uint8 %) (range addrlen))])
+                         entry (when (and k (not (contains? seen k)))
+                                 (let [sa (ffi/alloc addrlen)]
+                                   (dotimes [i addrlen]
+                                     (ffi/write sa :uint8 (ffi/read src :uint8 i) i))
+                                   (vswap! copied conj {:addr sa})
+                                   (set-sockaddr-port! sa port)
+                                   {:family fam :addr sa :addrlen addrlen
+                                    :ip (sockaddr-ip sa)}))]
+                     (recur (ffi/read ai :pointer 40)
+                            (if entry (conj out entry) out)
+                            (if k (conj seen k) seen)))))
+             (finally
+               (when-not (or (nil? head) (ffi/null? head)) (c-freeaddrinfo head))
+               (when-let [c @copied] (free-addrs! c)))))))
+       (finally (if host (ffi/free node) (ffi/free svc)) (ffi/free hints) (ffi/free resp)))))
 
 (defn free-addrs!
   "Free the :addr of every entry resolve-addrs answered."

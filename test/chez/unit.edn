@@ -1089,6 +1089,12 @@
   ;; the poller's wake pair: b is a's own peer, and both ends skip Nagle so a
   ;; one-byte wake is not held behind an unacknowledged one
   {:suite "winsock" :expr "(do (require (quote [jolt.socket.native :as n])) (let [[a b] (n/loopback-pair)] (try [(= (n/local-address a) (n/peer-address b)) (pos? (n/get-int-option a n/ipproto-tcp n/tcp-nodelay)) (pos? (n/get-int-option b n/ipproto-tcp n/tcp-nodelay))] (finally (n/c-close a) (n/c-close b)))))" :expected "[true true true]"}
+  ;; SOCK_CLOEXEC is Linux's (bionic included); the BSDs and Winsock have none
+  {:suite "winsock" :expr "(do (require (quote jolt.socket.native)) (mapv #(:sock-cloexec (jolt.socket.native/consts-for %)) [:linux :macos :windows]))" :expected "[524288 nil nil]"}
+  ;; a nil host with :passive? is getaddrinfo's NULL node: the wildcard to bind
+  {:suite "winsock" :expr "(do (require (quote [jolt.socket.native :as n])) (let [{:keys [addrs]} (n/resolve-addrs nil 80 {:passive? true :family n/af-inet})] (try (mapv :ip addrs) (finally (n/free-addrs! addrs)))))" :expected "[\"0.0.0.0\"]"}
+  ;; every interface getifaddrs names is a NetworkInterface, v6-only ones too
+  {:suite "winsock" :expr "(do (require (quote jolt.socket.native)) (= (set (map :name (jolt.socket.native/interface-addresses))) (set (map #(.getName %) (enumeration-seq (java.net.NetworkInterface/getNetworkInterfaces))))))" :expected "true"}
   ;; A numeric literal is parsed, never resolved: getaddrinfo goes through a
   ;; resolver daemon on bionic, and a container without one failed "0.0.0.0".
   {:suite "winsock" :expr "(do (require (quote jolt.socket.native)) (let [r (jolt.socket.native/resolve-addrs \"0.0.0.0\" 80 {:family jolt.socket.native/af-inet}) a (first (:addrs r))] (jolt.socket.native/free-addrs! (:addrs r)) [(:ip a) (:addrlen a) (count (:addrs r))]))" :expected "[\"0.0.0.0\" 16 1]"}
