@@ -436,6 +436,18 @@
      ["app.core/res" "allowlib.core/dynaload"]
      (:allow-dynamic (deps/resolve-project "test/chez/allow-dynamic-app")))
 
+;; A failed git clone is scrubbed with delete-tree! before the next attempt.
+;; Git writes its objects read-only, and Windows refuses to delete a read-only
+;; file, so the scrub used to leave the partial clone behind and every retry
+;; failed with "destination path already exists".
+(let [root (str (System/getProperty "java.io.tmpdir") "/delete-tree-" (System/currentTimeMillis))
+      obj (str root "/.git/objects/pack/pack-1.pack")]
+  (jolt.host/mkdirs! (str root "/.git/objects/pack"))
+  (spit obj "pack")
+  (.setReadOnly (java.io.File. obj))
+  (is= "delete-tree! removes a tree holding a read-only file" true (jolt.host/delete-tree! root))
+  (is= "and nothing of it is left" false (jolt.host/file-exists? root)))
+
 (println (str "deps-expand: " (- @checks @failures) "/" @checks " passed"))
 (when (pos? @failures)
   (System/exit 1))

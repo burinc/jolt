@@ -213,6 +213,58 @@
 ;; failed GetFileAttributesW (INVALID_FILE_ATTRIBUTES) reaches this as
 (hid "win unreadable path is not hidden" #t #f "gone.clj" #f)
 
+;; --- the directory half of an output path (jolt-lang/jolt#1207) ---------------
+;; build.ss bld-mkdir-p and loader.ss aot-mkdir-p walk up with path-parent until
+;; something exists. It split on "/" only, so a native Windows path —
+;; "C:\proj\out\app.exe.build" — had no parent at all, and the walk recursed with
+;; #f into a string=?. Even a "/"-spelled drive path bottomed out at "C:", which
+;; is the drive's CURRENT directory rather than its root. #f is the answer for
+;; a root or a bare name: there is nothing above it to create.
+(define (parent label windows? given want)
+  (let ((got (path-parent-for windows? given)))
+    (set! total (+ total 1))
+    (unless (equal? got want)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a (windows? ~s): ~s -> ~s, want ~s\n" label windows? given got want))))
+
+(parent "posix nested"            #f "/a/b"        "/a")
+(parent "posix under the root"    #f "/a"          "/")
+(parent "posix root"              #f "/"           #f)
+(parent "posix relative"          #f "a/b"         "a")
+(parent "posix bare name"         #f "a"           #f)
+(parent "posix empty"             #f ""            #f)
+(parent "posix trailing sep"      #f "/a/b/"       "/a/b")
+(parent "posix backslash is a name" #f "/a/b\\c"   "/a")
+(parent "posix drive spelling is a name" #f "C:/a" "C:")
+
+(parent "win backslash"           #t "C:\\proj\\out\\app.exe.build" "C:\\proj\\out")
+(parent "win backslash under root" #t "C:\\proj"   "C:\\")
+(parent "win backslash root"      #t "C:\\"        #f)
+(parent "win slash"               #t "C:/proj/out" "C:/proj")
+(parent "win slash under root"    #t "C:/proj"     "C:/")
+(parent "win slash root"          #t "C:/"         #f)
+(parent "win mixed"               #t "C:\\proj/out\\x" "C:\\proj/out")
+(parent "win bare drive"          #t "C:"          #f)
+(parent "win drive-relative"      #t "C:a"         "C:")
+(parent "win unc"                 #t "\\\\srv\\sh\\a\\b" "\\\\srv\\sh\\a")
+(parent "win unc under the share" #t "\\\\srv\\sh\\a" "\\\\srv\\sh")
+(parent "win unc share is a root" #t "\\\\srv\\sh" #f)
+(parent "win unc forward"         #t "//srv/sh/a"  "//srv/sh")
+(parent "win rooted on the current drive" #t "\\a" "\\")
+(parent "win relative"            #t "a\\b"        "a")
+(parent "win bare name"           #t "a"           #f)
+
+;; The walk itself, as bld-mkdir-p takes it: every parent until one exists, and
+;; it ends — a #f is where it stops, never an argument to the next step.
+(define (walk windows? exists p)
+  (let loop ((p p) (acc '()))
+    (if (or (not p) (member p exists)) (reverse acc) (loop (path-parent-for windows? p) (cons p acc)))))
+(set! total (+ total 1))
+(let ((got (walk #t '() "C:\\proj\\out\\app.exe.build")))
+  (unless (equal? got '("C:\\proj\\out\\app.exe.build" "C:\\proj\\out" "C:\\proj" "C:\\"))
+    (set! fails (+ fails 1))
+    (printf "FAIL: the drive walk ends at the root: ~s\n" got)))
+
 (if (> fails 0)
     (begin (printf "WIN-PATH FAILURES: ~a of ~a\n" fails total) (exit 1))
     (printf "WIN-PATH OK (~a checks)\n" total))
