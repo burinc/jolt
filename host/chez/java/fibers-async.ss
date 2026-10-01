@@ -86,7 +86,14 @@
 ;; (jolt-fiber-<! ch) -> value | nil (closed). Fiber-side take: a buffered
 ;; value, a waiting putter, or a closed channel complete immediately (no
 ;; capture); an empty open channel registers an alt-taker and parks.
-(define (jolt-fiber-<! ch)
+;;
+;; INTR? is #t for <!! only: the park is then interruptible through the carrier's
+;; interrupt box, the way a fiber's blocking deref is (locks.ss
+;; jolt-cv-wait-interruptibly) — see jolt-fiber-waiter-wait!/ibox. An interrupted
+;; take is claimed before it throws, so nothing is delivered into it, and its dead
+;; handler is taken off the channel.
+(define (jolt-fiber-<! ch) (jolt-fiber-<!* ch #f))
+(define (jolt-fiber-<!* ch intr?)
   (jolt-fiber-may-park! 'clojure.core.async/<!)   ; before registering as a taker
   (jolt-chan-lock! ch)
   (let ((r (ac-poll!/locked ch)))
@@ -100,15 +107,21 @@
                 v)
               (begin
                 (jolt-chan-unlock! ch)
-                (vector-ref (jolt-fiber-waiter-wait! h) 1))))
+                (let ((mb (jolt-fiber-waiter-wait!/ibox h (and intr? (current-interrupt-box)))))
+                  (if mb
+                      (vector-ref mb 1)
+                      (begin (jolt-fiber-drop-waiter! ch h #f)
+                             (jolt-interrupted-throw! "<!!")))))))
         (begin
           (jolt-chan-unlock! ch)
           r))))
 
 ;; (jolt-fiber->! ch v) -> #t | #f (closed). Fiber-side put: room or a waiting
 ;; taker completes immediately (no capture); a full channel registers an
-;; alt-putter and parks.
-(define (jolt-fiber->! ch v)
+;; alt-putter and parks. INTR? as for jolt-fiber-<!*: #t for >!!, and an
+;; interrupted put is claimed first, so its value never reaches a taker.
+(define (jolt-fiber->! ch v) (jolt-fiber->!* ch v #f))
+(define (jolt-fiber->!* ch v intr?)
   (jolt-fiber-may-park! 'clojure.core.async/>!)   ; before registering as a putter
   (async-check-put! v)                   ; throws — keep it outside the mutex
   (jolt-chan-lock! ch)
@@ -127,7 +140,21 @@
                  ok)
               (begin
                 (jolt-chan-unlock! ch)
-                (vector-ref (jolt-fiber-waiter-wait! h) 1))))))))
+                (let ((mb (jolt-fiber-waiter-wait!/ibox h (and intr? (current-interrupt-box)))))
+                  (if mb
+                      (vector-ref mb 1)
+                      (begin (jolt-fiber-drop-waiter! ch h #t)
+                             (jolt-interrupted-throw! ">!!")))))))))))
+
+;; Take a claimed (dead) handler off CH's waiter list. ac-notify! would drop it
+;; on its next pass anyway; this keeps an interrupted op from leaving it there
+;; until then.
+(define (jolt-fiber-drop-waiter! ch h put?)
+  (jolt-with-mutex (async-chan-mu ch)
+    (if put?
+        (async-chan-alt-putters-set! ch
+          (remp (lambda (hp) (eq? (car hp) h)) (async-chan-alt-putters ch)))
+        (async-chan-alt-takers-set! ch (remq h (async-chan-alt-takers ch))))))
 
 ;; The fiber wakeup strategy — alt-deliver! dispatches through this hook so
 ;; async.ss (loaded before fibers.ss) never forward-references a fiber
@@ -190,69 +217,106 @@
 ;; the alts! fiber await needs the port; <! / >! need only the value.
 ;; Contract unchanged otherwise: call with the channel mutex RELEASED; the
 ;; commit-to-park decision is atomic with alt-deliver!'s mailbox write.
-(define (jolt-fiber-waiter-wait! h)
+(define (jolt-fiber-waiter-wait! h) (jolt-fiber-waiter-wait!/ibox h #f))
+
+;; IBOX is the carrier's interrupt box for a blocking op (<!!, >!!, alts!!), or #f
+;; for a parking one, which is every other caller and waits exactly as before.
+;; With a box the answer is #f when the wait was interrupted through it: the flag
+;; is consumed and the handler CLAIMED, so no channel can deliver into it and the
+;; caller throws InterruptedException. This is the fiber half of
+;; jolt-cv-wait-interruptibly's protocol (locks.ss): the carrier's one wake is
+;; listed against the box, and the flag is read at each commit under the carrier's
+;; run-queue mutex, the lock that wake takes (fibers.ss
+;; jolt-fiber-commit-park/ibox!) — so an interrupt either lands before the read and
+;; is seen, or finds the fiber 'parked and resumes it, and the resumed round reads
+;; it. Several fibers on one
+;; carrier are all woken and the first to read the flag consumes it; the rest park
+;; again (known-divergences.edn, the fiber-sharing-a-carrier entry).
+;;
+;; The flag is read only when the fiber would park, so a delivery that is already
+;; in the mailbox wins, as it does for a thread (async.ss ac-intr-wait!). And if
+;; the claim is lost, a delivery is already under way: the flag is put back and the
+;; wait finishes uninterruptibly with that value.
+(define (jolt-fiber-waiter-wait!/ibox h ibox)
   (let ((f (jolt-current-fiber)))
     (unless f
       (error 'jolt-fiber-waiter-wait! "channel wait outside a fiber"))
     ;; the take/put ops checked before registering; alts! registers its shared
     ;; handler in async.ss and arrives here first
     (jolt-fiber-may-park! 'jolt-fiber-waiter-wait!)
-    ;; Commit and park are ONE region with interrupts disabled — see
-    ;; jolt-sm-commit!. The park records the depth (swish's pcb-sic) and the
-    ;; resume is restored to it, so the resumed path must NOT enable again; only
-    ;; the no-park path does.
-    (disable-interrupts)
-    (let wait ()
-      (let ((park?
-             (jolt-with-mutex (alt-handler-wmu h)
-               (if (vector-ref (alt-handler-mailbox h) 0)
-                   #f
-                   ;; #f too when an interrupt is pending (fibers.ss): then the
-                   ;; wait is abandoned, and claimed below so no value lands in it
-                   (jolt-fiber-commit-park! f h)))))
-        (when park?
-          (jolt-fiber-bump-chan-parks! f)
-          (jolt-fiber-to-scheduler! f))
-        ;; Resumed with nothing delivered and no interrupt to raise: a wake from a
-        ;; registration an interrupt left behind (the waiter list of a deref or a
-        ;; monitor the fiber was raised out of). Park again; the resume restored
-        ;; the depth the park was taken at, so the region is still open.
-        (when (and park?
-                   (not (vector-ref (alt-handler-mailbox h) 0))
-                   (not (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))))
-          (wait))))
-    ;; Balances the disable above on BOTH paths: the park returns here when the
-    ;; fiber is resumed (restored to the depth it parked at), so it owes the
-    ;; same enable the no-park path does.
-    (enable-interrupts)
-    (jolt-fiber-parked-on-set! f #f)
-    (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
-      ;; the wait is over either way: a value already in the mailbox was taken
-      ;; by a fiber that is dying, and an empty one must never be filled
-      (alt-claim! h)
-      (jolt-fiber-check-interrupt! f))
-    (alt-handler-mailbox h)))
+    (let* ((wmu (alt-handler-wmu h))
+           (mb (alt-handler-mailbox h)))
+      ;; Commit and park are ONE region with interrupts disabled — see
+      ;; jolt-sm-commit!. The park records the depth (swish's pcb-sic) and the
+      ;; resume is restored to it, so the resumed path must NOT enable again; only
+      ;; the no-park path does.
+      (disable-interrupts)
+      (let ((interrupted?
+             (let wait ()
+               (let ((park?
+                      (jolt-with-mutex wmu
+                        (cond
+                          ((vector-ref mb 0) #f)
+                          ;; #f too when an interrupt is pending (fibers.ss): then
+                          ;; the wait is abandoned, and claimed below so no value
+                          ;; lands in it. With a box, 'interrupted when its flag was
+                          ;; set, read and cleared under the carrier's mutex.
+                          (ibox (jolt-fiber-commit-park/ibox! f h ibox))
+                          (else (jolt-fiber-commit-park! f h))))))
+                 (cond
+                   ((eq? park? 'interrupted) #t)
+                   (else
+                    (when park?
+                      (jolt-fiber-bump-chan-parks! f)
+                      (jolt-fiber-to-scheduler! f))
+                    ;; Resumed with nothing delivered and no interrupt to raise: a
+                    ;; wake from a registration an interrupt left behind (the waiter
+                    ;; list of a deref or a monitor the fiber was raised out of), or
+                    ;; the carrier's interrupt, which the next round reads. Park
+                    ;; again; the resume restored the depth the park was taken at,
+                    ;; so the region is still open.
+                    (if (and park?
+                             (not (vector-ref mb 0))
+                             (not (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))))
+                        (wait)
+                        #f)))))))
+        ;; Balances the disable above on BOTH paths: the park returns here when the
+        ;; fiber is resumed (restored to the depth it parked at), so it owes the
+        ;; same enable the no-park path does.
+        (enable-interrupts)
+        (jolt-fiber-parked-on-set! f #f)
+        (when (and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+          ;; the wait is over either way: a value already in the mailbox was taken
+          ;; by a fiber that is dying, and an empty one must never be filled
+          (alt-claim! h)
+          (jolt-fiber-check-interrupt! f))
+        (cond
+          ((not interrupted?) mb)
+          ((alt-claim! h) #f)
+          (else
+           (set-box! ibox #t)
+           (jolt-fiber-waiter-wait!/ibox h #f)))))))
 
 ;; The fiber alts! await: park on the already-registered shared handler and
 ;; return [val port]. Registered by async.ss's __do-alts with wake = the
 ;; fiber, so alt-deliver! resumes the fiber; this is the mirror of the thread
 ;; waiter's condition-wait on the same mailbox.
-(define (jolt-fiber-alt-await h)
-  (let ((mb (jolt-fiber-waiter-wait! h)))
-    (jolt-vector (vector-ref mb 1) (vector-ref mb 2))))
+(define (jolt-fiber-alt-await h ibox)
+  (let ((mb (jolt-fiber-waiter-wait!/ibox h ibox)))
+    (and mb (jolt-vector (vector-ref mb 1) (vector-ref mb 2)))))
 
 ;; <! / >! / <!! / >!! dispatch on "am I on a fiber?" — the vreg read (R0's 2ns
 ;; dispatch). On a fiber they park (the R3 primitives, and — R5's decision —
-;; <!! / >!! park exactly the same way: parking a blocking take preserves its
-;; observable semantics without holding the OS thread, so on a fiber there is
-;; no difference between <! and <!!, or between >! and >!!); on a plain thread
-;; they are the blocking ops of today, so :thread-backend go bodies (real
-;; threads), bare <!! on a thread, and the conformance gate's expectations are
-;; byte-for-byte unchanged.
+;; <!! / >!! park the same way: parking a blocking take preserves its observable
+;; semantics without holding the OS thread); on a plain thread they are the
+;; blocking ops, so :thread-backend go bodies (real threads) and bare <!! on a
+;; thread block. The one difference between the pairs is interruption: <!! / >!!
+;; answer .interrupt with InterruptedException on either kind of waiter, as a
+;; JVM thread blocked in them does, and <! / >! do not (async.ss ac-intr-wait!).
 (cca-def! "<!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
 (cca-def! ">!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
-(cca-def! "<!!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
-(cca-def! ">!!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
+(cca-def! "<!!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<!* ch #t) (jolt-async-take!! ch))))
+(cca-def! ">!!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->!* ch v #t) (jolt-async-give!! ch v))))
 
 ;; (fiber-execute runnable) -> nil. Run RUNNABLE on a fiber and forget it: no
 ;; result channel, no join. This is the spawn behind the :io Executor that

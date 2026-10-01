@@ -1048,7 +1048,7 @@
 ;; value in fibers.ss so the standalone gate can load it without rt.ss. Slot 1
 ;; was freed by R3 (jolt-230w), which moved the R1 ring/mark vregs onto the
 ;; continuation, and re-claimed by fibers.ss for park-unwinding; the next free
-;; slot is 10. The surviving slots keep their R2 numbers.
+;; slot is 12. The surviving slots keep their R2 numbers.
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
@@ -1073,6 +1073,9 @@
 ;;   child the parent's stored VALUE, which is the one thing ThreadLocal promises
 ;;   it will not do (jolt-uecg). InheritableThreadLocal, whose contract is the
 ;;   opposite, keeps a per-instance thread parameter and its inheritance.
+;; slot 11: java/async.ss jolt-vreg-chan-wait — (box . cell): the cell a thread
+;;   blocked in <!! / >!! / alts!! points at the channel it waits on, so the one
+;;   interrupt wake registered for its box can find it
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic

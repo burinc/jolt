@@ -1475,8 +1475,12 @@
       (cond
         ((string? a0) (jolt-host-throwable canonical a0 cause))
         ((jolt-nil? a0) (jolt-host-throwable canonical jolt-nil))
-        ;; (E. cause): a lone throwable arg is the cause, message nil.
-        ((and (null? rest) (ex-info-map? a0)) (jolt-host-throwable canonical jolt-nil a0))
+        ;; (E. cause): a lone throwable arg is the cause, and the message is the
+        ;; cause's toString, as Throwable(Throwable) sets it on the JVM —
+        ;; (ExecutionException. (IllegalStateException. "bad")) has the message
+        ;; "java.lang.IllegalStateException: bad", not nil.
+        ((and (null? rest) (ex-info-map? a0))
+         (jolt-host-throwable canonical (jolt-str-render-one a0) a0))
         (else (jolt-host-throwable canonical (jolt-str-render-one a0) cause))))))
 (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
   (vector-for-each

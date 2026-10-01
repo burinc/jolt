@@ -142,7 +142,9 @@
       (cond
         ((string? a0) (jolt-host-throwable canonical a0 cause))
         ((jolt-nil? a0) (jolt-host-throwable canonical jolt-nil))
-        ((and (null? rest) (ex-info-map? a0)) (jolt-host-throwable canonical jolt-nil a0))
+        ;; (E. cause): the message is the cause's toString, as on the JVM
+        ((and (null? rest) (ex-info-map? a0))
+         (jolt-host-throwable canonical (jolt-str-render-one a0) a0))
         (else (jolt-host-throwable canonical (jolt-str-render-one a0) cause))))))
 (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
   (vector-for-each

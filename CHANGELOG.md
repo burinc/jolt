@@ -23,6 +23,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
+  deref'ing a promise, so `.interrupt` throws `InterruptedException` out of them
+  and clears the flag. jolt kept waiting and left the flag set, so a worker shut
+  down by interrupting it hung in its channel read. They now throw and clear the
+  flag, on a thread and on a fiber; a flag already set makes an op that would
+  have to wait throw at once, and an op that can complete immediately completes
+  and leaves the flag set, as the JVM's does. The parking ops `<!`, `>!` and
+  `alts!` are not interruptible, as a parked go block holds no thread on the
+  JVM, and neither is the runtime's own channel plumbing.
+
+  An interrupted op leaves nothing behind: a take holds no value and is no
+  longer counted as a waiting taker, a put on an unbuffered channel is
+  retracted, and an `alts!!` has claimed none of its ops. The JVM leaves the
+  promise's handler registered, so there a later put is swallowed by the taker
+  that threw and a later take receives the value of a put that threw; that
+  difference is recorded in `known-divergences.edn`. The fiber side follows the
+  0.7.26 rule for fibers sharing a carrier. Inside a `go` body `<!!` and `>!!`
+  keep the cheap park (a stored closure rather than a captured stack, about 1.3
+  KB per parked block against 5.1 KB), which now carries the interrupt arm;
+  `<!`, `>!` and `alts!` keep the one without it.
+
+- **An unbuffered put succeeds only when a live taker receives the value.**
+  `offer!`, `put!`, `alts!`'s put and a fiber's `>!` counted a thread blocked in
+  `<!!` as room for any number of puts, so two `offer!`s in a row to one blocked
+  taker both answered true and the second value waited in the channel for
+  whoever took next. A parked taker was likewise counted by looking at it rather
+  than claiming it, so a taker whose `alts!!` completed on another port in
+  between left the put answered true and its value buffered. A put now claims a
+  parked taker before handing it the value, counts blocked threads against the
+  values already queued for them, and pairs a parked putter with a parked taker
+  by claiming both together; an `alts!!` that takes from and puts to the same
+  channel no longer pairs with itself.
+
+- **`java.util.concurrent.TimeoutException` can be constructed.**
+  `(TimeoutException.)` and `(TimeoutException. "msg")` raised "No matching ctor
+  found", and the one the runtime throws from a timed `Future.get` did not answer
+  `instance? Exception`. `BrokenBarrierException` and `CompletionException` had
+  the same gap. All three now have the JDK's constructors and superclasses.
+
+- **A `future` answers `java.util.concurrent.Future`'s methods.** `(.get f 100
+  TimeUnit/MILLISECONDS)`, `.isDone`, `.isCancelled` and `.cancel` on a
+  `clojure.core/future` raised "No matching method"; only the no-arg `.get` and
+  `.deref` worked. The timed `.get` throws `TimeoutException`, and
+  `(.cancel f false)` cancels without interrupting the worker.
+
+- **An exception built from a cause takes the cause's `toString` as its
+  message.** `(ExecutionException. (IllegalStateException. "bad"))` had a nil
+  message; the JVM's `Throwable(Throwable)` sets it to
+  `"java.lang.IllegalStateException: bad"`, and jolt now does too, for every
+  exception class.
+
 - **A `:static` native no longer loads a shared object by its name.** For a
   `:jolt/native` spec that declares no candidates for the platform, `jolt run`
   and `jolt build` try the conventional names of its `:name`
@@ -1924,7 +1975,6 @@ boot revived with the gates that keep it alive.
   overtaken class land as any library's on a runtime class do, and the warning
   names the library to upgrade. The refusal remains what it was for: two
   declared providers of one class.
-
 
 ## [0.8.8] - 2026-09-15
 

@@ -48,13 +48,21 @@
 ;; that expands to a park is invisible to the pre-scan, which costs it the cheap
 ;; park and nothing else.
 ;;
-;; <!! and >!! are the same ops as <! and >!: identical on a fiber (parking a
-;; blocking take preserves what it means without holding the carrier) and already
-;; identical on a thread.
-(def ^:private sm-take-var-1 #'clojure.core.async/<!)
-(def ^:private sm-take-var-2 #'clojure.core.async/<!!)
-(def ^:private sm-put-var-1 #'clojure.core.async/>!)
-(def ^:private sm-put-var-2 #'clojure.core.async/>!!)
+;; <!! and >!! are park ops too, but of their OWN kind: a Thread.interrupt throws
+;; out of them and not out of <! / >! (async.ss ac-intr-wait!), so they rewrite to
+;; __sm-take!! / __sm-put!!, whose cheap park carries the interrupt arm
+;; (sm.ss jolt-sm-commit!/intr), and <! / >! keep the arm-less one.
+(def ^:private sm-take-var #'clojure.core.async/<!)
+(def ^:private sm-take!!-var #'clojure.core.async/<!!)
+(def ^:private sm-put-var #'clojure.core.async/>!)
+(def ^:private sm-put!!-var #'clojure.core.async/>!!)
+
+;; park kind -> the op the pass emits for it
+(def ^:private sm-park-ops
+  {:take 'clojure.core.async/__sm-take
+   :take!! 'clojure.core.async/__sm-take!!
+   :put 'clojure.core.async/__sm-put
+   :put!! 'clojure.core.async/__sm-put!!})
 
 ;; Forms the pass does not look inside. A park in one of them stays where it is;
 ;; a park-free one is emitted whole.
@@ -138,15 +146,17 @@
 ;; descends, and sm-expand hands it to the expander so a macro sees the scope the
 ;; analyzer would have shown it.
 (defn- sm-park-kind
-  "nil, :take or :put — and only when sym resolves to the exact var. A local of
-  the same name shadows it."
+  "nil, :take, :take!!, :put or :put!! — and only when sym resolves to the exact
+  var. A local of the same name shadows it."
   [ctx sym]
   (when (and (symbol? sym) (not (contains? (:env ctx) sym)))
     (let [v (resolve (:env ctx) sym)]
       (cond
         (nil? v) nil
-        (or (identical? v sm-take-var-1) (identical? v sm-take-var-2)) :take
-        (or (identical? v sm-put-var-1) (identical? v sm-put-var-2)) :put
+        (identical? v sm-take-var) :take
+        (identical? v sm-take!!-var) :take!!
+        (identical? v sm-put-var) :put
+        (identical? v sm-put!!-var) :put!!
         :else nil))))
 
 (defn- sm-parks? [ctx form]
@@ -357,9 +367,7 @@
           (sm-cps-seq ctx (vec (rest ex))
                       (fn [_ args]
                         (apply list
-                               (if (= pk :take)
-                                 'clojure.core.async/__sm-take
-                                 'clojure.core.async/__sm-put)
+                               (sm-park-ops pk)
                                (concat args [k]))))
 
           (= sf 'do) (sm-cps-body ctx (rest ex) k)
@@ -450,11 +458,8 @@
     (let [r (clojure.core.async/__poll! port)]
       (when (not= r ::none) [r port]))))
 
-(defn do-alts
-  "Returns [val port] for the first ready op among ports. ports is a vector of
-  take ports and/or [channel val] put specs. opts may include :priority true
-  (try in order) and :default val (return [val :default] if none ready)."
-  [ports opts]
+(defn- do-alts*
+  [ports opts blocking?]
   (assert (pos? (count ports)) "alts must have at least one channel operation")
   (let [ports (vec ports)
         n (count ports)
@@ -475,17 +480,28 @@
         hit
         (if has-default
           [(:default opts) :default]
-          (clojure.core.async/__do-alts ports (boolean (:priority opts))))))))
+          (clojure.core.async/__do-alts ports (boolean (:priority opts)) blocking?))))))
 
+(defn do-alts
+  "Returns [val port] for the first ready op among ports. ports is a vector of
+  take ports and/or [channel val] put specs. opts may include :priority true
+  (try in order) and :default val (return [val :default] if none ready)."
+  [ports opts]
+  (do-alts* ports opts false))
+
+;; alts!! is the blocking one, and the only one a Thread.interrupt reaches: it
+;; throws InterruptedException out of the wait with no op completed, as the JVM's
+;; promise deref does. alts! parks, and a parked go block holds no thread.
 (defn alts!!
   "Completes at most one of several channel operations. ports is a vector of take
   ports and/or [channel val] put specs. Returns [val port]. Blocks until ready."
   [ports & {:as opts}]
-  (do-alts ports opts))
+  (do-alts* ports opts true))
 
 (defn alts!
   "Like alts!!. Parking and blocking alts are the same operation in jolt: on a
-  thread-backed go both block, and on a fiber both park."
+  thread-backed go both block, and on a fiber both park. Only alts!! is
+  interruptible."
   [ports & {:as opts}]
   (do-alts ports opts))
 

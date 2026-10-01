@@ -493,6 +493,66 @@
   ;; with Thread/interrupted proves it was set all along AND clears it, so this row
   ;; cannot leak a set flag onto a carrier the later rows share.
   {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) out (promise)] (a/go (deliver carrier (Thread/currentThread)) (deliver out [(try (Thread/sleep 1200) :no-throw (catch InterruptedException e :threw)) (Thread/interrupted)])) (let [c (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt c) (deref out 5000 :timeout)))))" :expected "[:no-throw true]"}
+  ;; THE BLOCKING CHANNEL OPS. <!!, >!! and alts!! block by deref'ing a promise on
+  ;; the JVM, so .interrupt throws InterruptedException out of them and clears the
+  ;; flag. jolt also leaves nothing behind: an interrupted take holds no value and
+  ;; is no longer counted as a waiting taker (the offer! answers nil), an
+  ;; interrupted put is retracted (the poll! answers nil), and an interrupted
+  ;; alts!! has claimed no op. The JVM leaves its handler registered in all three
+  ;; (known-divergences.edn), so those tails are jolt's.
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) t (promise) done (promise)] (a/thread (deliver t (Thread/currentThread)) (deliver done (try [:took (a/<!! c)] (catch InterruptedException e [:interrupted (.isInterrupted (Thread/currentThread))])))) (deref t 5000 nil) (Thread/sleep 100) (.interrupt (deref t)) [(deref done 5000 :hung) (a/offer! c 1)]))" :expected "[[:interrupted false] nil]"}
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) t (promise) done (promise)] (a/thread (deliver t (Thread/currentThread)) (deliver done (try [:put (a/>!! c :v)] (catch InterruptedException e [:interrupted (.isInterrupted (Thread/currentThread))])))) (deref t 5000 nil) (Thread/sleep 100) (.interrupt (deref t)) [(deref done 5000 :hung) (a/poll! c)]))" :expected "[[:interrupted false] nil]"}
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan 1) t (promise) done (promise)] (a/>!! c 1) (a/thread (deliver t (Thread/currentThread)) (deliver done (try [:put (a/>!! c 2)] (catch InterruptedException e [:interrupted (.isInterrupted (Thread/currentThread))])))) (deref t 5000 nil) (Thread/sleep 100) (.interrupt (deref t)) [(deref done 5000 :hung) (a/poll! c) (a/poll! c)]))" :expected "[[:interrupted false] 1 nil]"}
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) d (a/chan) t (promise) done (promise)] (a/thread (deliver t (Thread/currentThread)) (deliver done (let [t0 (System/nanoTime)] (try [:alts (a/alts!! [c [d :v] (a/timeout 30000)])] (catch InterruptedException e [:interrupted (.isInterrupted (Thread/currentThread)) (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))) (deref t 5000 nil) (Thread/sleep 100) (.interrupt (deref t)) [(deref done 5000 :hung) (a/poll! d) (a/offer! c 1)]))" :expected "[[:interrupted false true] nil nil]"}
+  ;; A flag already set: an op that would wait throws at once, before registering
+  ;; anything; an op that can complete completes and leaves the flag set, as the
+  ;; JVM's does (it returns from take!/put! without reaching the promise).
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (deref (future (.interrupt (Thread/currentThread)) (let [c (a/chan) d (a/chan)] [(try (a/<!! c) (catch InterruptedException e :interrupted)) (Thread/interrupted) (do (.interrupt (Thread/currentThread)) (try (a/>!! c 1) (catch InterruptedException e :interrupted))) (Thread/interrupted) (a/poll! c) (do (.interrupt (Thread/currentThread)) (try (a/alts!! [c [d 1]]) (catch InterruptedException e :interrupted))) (Thread/interrupted) (a/poll! d) (a/offer! c 1)])) 5000 :hung))" :expected "[:interrupted false :interrupted false nil :interrupted false nil nil]"}
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (deref (future (let [c (a/chan 2)] (a/>!! c 1) (.interrupt (Thread/currentThread)) [(a/<!! c) (a/>!! c 2) (first (a/alts!! [c])) (Thread/interrupted)])) 5000 :hung))" :expected "[1 true 2 true]"}
+  ;; ...including a put to an unbuffered channel a thread is already blocked
+  ;; taking from: the taker was counted, so the put completes without waiting and
+  ;; the flag stays set. It used to wait, see the flag, withdraw the value and
+  ;; throw, leaving the taker blocked. JVM core.async answers [true true 1].
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) t (a/thread (a/<!! c))] (Thread/sleep 100) (deref (future (.interrupt (Thread/currentThread)) [(try (a/>!! c 1) (catch InterruptedException e :interrupted)) (Thread/interrupted) (first (a/alts!! [t (a/timeout 5000)]))]) 5000 :hung)))" :expected "[true true 1]"}
+  ;; <! is a PARK, and a parked go block holds no thread to interrupt, so a go body
+  ;; on the default :thread backend waits on through an interrupt of the thread it
+  ;; runs on and sees the flag still set afterwards.
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [t (promise) c (a/chan) g (a/go (deliver t (Thread/currentThread)) (let [v (a/<! c)] [v (Thread/interrupted)]))] (deref t 5000 nil) (Thread/sleep 100) (.interrupt (deref t)) (Thread/sleep 50) (a/>!! c 5) (deref (future (a/<!! g)) 5000 :hung)))" :expected "[5 true]"}
+  ;; The same on a fiber, where the interrupt reaches the carrier's box and the
+  ;; parked fiber registered under it (the 0.7.26 fiber rule, known-divergences.edn).
+  ;; The try keeps the CPS pass off the op, though it leaves <!! alone either way.
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) out (promise) c (a/chan)] (a/go (deliver carrier [(jolt.host/fiber?) (Thread/currentThread)]) (deliver out (try (a/<!! c) :took (catch InterruptedException e :threw)))) (let [[fib? t] (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) [fib? (deref out 5000 :hung) (a/offer! c 1)]))))" :expected "[true :threw nil]"}
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) out (promise) c (a/chan)] (a/go (deliver carrier [(jolt.host/fiber?) (Thread/currentThread)]) (deliver out (try (a/>!! c :v) :put (catch InterruptedException e :threw)))) (let [[fib? t] (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) [fib? (deref out 5000 :hung) (a/poll! c)]))))" :expected "[true :threw nil]"}
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) out (promise) c (a/chan) d (a/chan)] (a/go (deliver carrier [(jolt.host/fiber?) (Thread/currentThread)]) (deliver out (try (a/alts!! [c [d :v]]) (catch InterruptedException e :threw)))) (let [[fib? t] (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) [fib? (deref out 5000 :hung) (a/poll! d) (a/offer! c 1)]))))" :expected "[true :threw nil nil]"}
+  ;; ...and a fiber's <! is not interruptible. Thread/interrupted reads the flag
+  ;; AND clears it, so the row leaves no set flag on a carrier later rows share.
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (let [v (a/<! c)] [(jolt.host/fiber?) v (Thread/interrupted)]))] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 50) (a/>!! c 5) (deref (future (a/<!! g)) 5000 :hung)))))" :expected "[true 5 true]"}
+  ;; With no try around it, a <!! / >!! in a go body is a CHEAP park (the pass
+  ;; rewrites it to __sm-take!! / __sm-put!!), and that park carries the interrupt
+  ;; arm too: the body dies with InterruptedException, which go-monitor reports,
+  ;; and the channel is left as it was — no taker counted, no value queued.
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (a/<!! c) :took) mon (a/go-monitor g)] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 100) [(a/offer! c 1) (a/poll! c) (let [e (deref (future (a/<!! mon)) 5000 :hung)] (if (instance? Throwable e) (.getName (class e)) e)) (deref (future (a/<!! g)) 5000 :hung)]))))" :expected "[nil nil \"java.lang.InterruptedException\" nil]"}
+  {:suite "interrupt / blocking channels fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) c (a/chan) g (a/go (deliver carrier (Thread/currentThread)) (a/>!! c :v) :put) mon (a/go-monitor g)] (let [t (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt t) (Thread/sleep 100) [(a/offer! c 1) (a/poll! c) (let [e (deref (future (a/<!! mon)) 5000 :hung)] (if (instance? Throwable e) (.getName (class e)) e)) (deref (future (a/<!! g)) 5000 :hung)]))))" :expected "[nil nil \"java.lang.InterruptedException\" nil]"}
+  ;; An unbuffered put succeeds only when a live taker receives the value. offer!
+  ;; used to count a thread blocked in <!! as room for ANY number of puts, so two
+  ;; offers in a row both answered true and the second value sat in the channel
+  ;; for whoever took next. JVM core.async answers [true nil 1 nil].
+  {:suite "core.async / rendezvous" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) t (a/thread (a/<!! c))] (Thread/sleep 50) [(a/offer! c 1) (a/offer! c 2) (a/<!! t) (a/poll! c)]))" :expected "[true nil 1 nil]"}
+  {:suite "core.async / rendezvous" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (a/chan) t (a/go (a/<! c))] (Thread/sleep 50) [(a/offer! c 1) (a/offer! c 2) (a/<!! t) (a/poll! c)])))" :expected "[true nil 1 nil]"}
+  ;; A parked putter and a parked taker are paired by claiming BOTH handlers
+  ;; together, and a handler is never paired with itself: an alts!! that takes
+  ;; from and puts to the same empty channel waits for a partner (here the
+  ;; timeout). It used to claim its own put against its own take, answer true, and
+  ;; leave the value in the channel (known-divergences.edn: the JVM also answers
+  ;; true there, and drops the value).
+  {:suite "core.async / rendezvous" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) to (a/timeout 100) [v p] (a/alts!! [c [c :v] to] :priority true)] [v (= p to) (a/poll! c)]))" :expected "[nil true nil]"}
+  ;; A buffer past the fixnum range (Long/MAX_VALUE, how a "practically unbounded"
+  ;; channel is often spelled) is a bignum capacity, so the capacity checks must
+  ;; not be fixnum-only.
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE)] [(a/offer! c 1) (a/>!! c 2) (a/poll! c) (a/<!! c)]))" :expected "[true true 1 2]"}
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE)] [(first (a/alts!! [[c 1]])) (first (a/alts!! [c]))]))" :expected "[true 1]"}
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE) r (a/thread (a/<!! c))] (Thread/sleep 50) [(a/offer! c 1) (a/<!! r)]))" :expected "[true 1]"}
+  {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (a/chan Long/MAX_VALUE)] (a/<!! (a/go (a/>! c 1) (a/<! c))))))" :expected "1"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}
@@ -1864,6 +1924,12 @@
   ;;
   ;; A submit after shutdown is REJECTED rather than queued-and-abandoned.
   {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.shutdown ex) (try (.submit ex (fn [] 1)) :no-throw (catch java.util.concurrent.RejectedExecutionException e :rejected)))" :expected ":rejected"}
+  ;; The TimeoutException a timed Future.get throws is an Exception, as on the JVM.
+  {:suite "executor-timeout" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor) f (.submit ex ^Callable (fn [] (Thread/sleep 2000) 1))] (try (.get f 10 java.util.concurrent.TimeUnit/MILLISECONDS) (catch java.util.concurrent.TimeoutException e [(.getName (class e)) (instance? Exception e) (instance? RuntimeException e)]) (finally (.shutdownNow ex))))" :expected "[\"java.util.concurrent.TimeoutException\" true false]"}
+  ;; A clojure.core future is a java.util.concurrent.Future on the JVM, so its
+  ;; timed .get, .isDone, .isCancelled and .cancel reflect. Certified on JVM 1.12.
+  {:suite "future / Future methods" :expr "(let [f (future (Thread/sleep 2000) 1)] [(try (.get f 10 java.util.concurrent.TimeUnit/MILLISECONDS) (catch java.util.concurrent.TimeoutException e :timeout)) (.isDone f) (.isCancelled f) (.cancel f true) (.isDone f) (.isCancelled f) (future-cancelled? f)])" :expected "[:timeout false false true true true true]"}
+  {:suite "future / Future methods" :expr "(let [f (future 5)] [(.get f 1 java.util.concurrent.TimeUnit/SECONDS) (.isDone f) (.cancel f false) (.isCancelled f)])" :expected "[5 true false false]"}
   ;; and so is an execute, catchable as the RuntimeException it is on the JVM
   {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (.shutdown ex) (try (.execute ex (fn [] 1)) :no-throw (catch RuntimeException e :rejected)))" :expected ":rejected"}
   ;; close BLOCKS until the work is done, which is what makes it usable as the

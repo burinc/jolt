@@ -158,6 +158,76 @@
        (jolt-fiber-check-interrupt! f))
       (else (enable-interrupts) (resume)))))
 
+;; --- the interruptible cheap park (<!! / >!! in a CPS'd go body) -------------
+;; <!! and >!! answer Thread.interrupt with InterruptedException and <! / >! do
+;; not (async.ss ac-intr-wait!). The capture park gets that from
+;; jolt-fiber-waiter-wait!/ibox; this is the same protocol for the cheap park, so
+;; a go body parked in <!! costs a stored closure rather than a captured stack.
+;; The pass keeps the kinds apart (async.clj sm-park-kind): only __sm-take!! and
+;; __sm-put!! come here, and <! / >! park exactly as before.
+;;
+;; The shape is Kotlin's suspendCancellableCoroutine. While the op waits, the
+;; fiber is findable from its carrier's interrupt box: the carrier's one wake
+;; resumes it while it is parked on this op's handler (fibers.ss
+;; jolt-fiber-commit-park/ibox!). The resume re-enters jolt-sm-drive, which
+;; finds the mailbox empty and commits to the same wait again — and that
+;; commit reads the flag, consumes it, CLAIMS the handler so no channel
+;; can deliver into it, takes the dead handler off the channel, and raises
+;; InterruptedException from inside the driver. If the claim is lost, a delivery
+;; is already under way: the flag is put back and the wait finishes with that
+;; value, as it does on the capture path and on a thread.
+;;
+;; WHY RAISING HERE IS THE CAPTURE PATH'S OUTCOME. The raise does not happen at the
+;; <!! as written — the stack that held it is gone — but at the driver's re-entry,
+;; so no user handler that was live at the park is live at the raise. That is
+;; equivalent only because there never is one: the pass emits no cheap park inside
+;; a handler. `try` is in sm-opaque (async.clj), so a park inside one is left as a
+;; plain call and parks by capture, and so is every form that establishes a handler
+;; or a wind, since each puts its body behind a try or an fn* (binding, locking,
+;; dosync, with-open, and any macro, because the pass expands before it looks); an
+;; fn* is opaque too. run-gosm.ss pins both halves on the emitted Scheme: 1c finds
+;; no rewritten park inside a dynamic-wind (try/finally, binding), and 1e finds
+;; none inside a try/catch, which emits a handler and no wind for 1c to see.
+;; A park's argument is evaluated before the op, never inside a callee's extent. So
+;; an exception at a cheap park site can only leave the go body, where the driver's
+;; handler reports it and closes the result channel — exactly what the capture
+;; path's go-spawn guard does with the same InterruptedException.
+(define-record-type sm-wait
+  (fields step h ch put? ibox)
+  (nongenerative sm-wait-v2))
+
+;; jolt-sm-commit! with the interrupt arm. W holds the step to resume with.
+(define (jolt-sm-commit!/intr f w)
+  (jolt-fiber-may-park! 'jolt-sm-commit!)
+  (let* ((h (sm-wait-h w)) (wmu (alt-handler-wmu h))
+         (ibox (sm-wait-ibox w)))
+    (disable-interrupts)
+    (let ((park? (jolt-with-mutex wmu
+                   (cond
+                     ((vector-ref (alt-handler-mailbox h) 0) #f)
+                     ;; 'interrupted when the flag was set, read and cleared
+                     ;; under the carrier's mutex (fibers.ss)
+                     (else (jolt-fiber-commit-park/ibox! f h ibox))))))
+      (cond
+        ((eq? park? 'interrupted)
+         (enable-interrupts)
+         (if (alt-claim! h)
+             (begin
+               (jolt-fiber-drop-waiter! (sm-wait-ch w) h (sm-wait-put? w))
+               (jolt-interrupted-throw! (if (sm-wait-put? w) ">!!" "<!!")))
+             (begin
+               (set-box! ibox #t)
+               (jolt-sm-commit! f h (sm-wait-step w)))))
+        (park? (jolt-sm-park! f w))
+        ;; a fiber interrupt is pending (fibers.ss), as in jolt-sm-commit!
+        ((and (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
+         (enable-interrupts)
+         (alt-claim! h)
+         (jolt-fiber-check-interrupt! f))
+        (else
+         (enable-interrupts)
+         ((sm-wait-step w)))))))
+
 ;; --- the driver -------------------------------------------------------------
 ;; The fiber thunk of a CPS'd body. It runs on the first entry AND on every
 ;; resume, because jolt-fiber-resume* enters through the thunk whenever k is
@@ -203,10 +273,14 @@
             (jolt-fiber-sm-set! f 'running)
             (cond
               ;; Resumed with nothing delivered: a wake from a registration an
-              ;; interrupt left behind (see jolt-fiber-waiter-wait!). Commit to
-              ;; the same wait again.
+              ;; interrupt left behind (see jolt-fiber-waiter-wait!), or, for an
+              ;; interruptible wait, the carrier's interrupt, which the commit
+              ;; reads. Commit to the same wait again.
               ((and h (not (vector-ref (alt-handler-mailbox h) 0)))
-               (jolt-sm-commit! f h step))
+               (if (sm-wait? step)
+                   (jolt-sm-commit!/intr f step)
+                   (jolt-sm-commit! f h step)))
+              ((sm-wait? step) ((sm-wait-step step)))
               ((procedure? step) (step))
               (else (jolt-invoke body-fn (lambda (v) (jolt-sm-finish! w f v)))))))))))
 
@@ -269,10 +343,25 @@
   (let ((f (jolt-current-fiber)))
     (if f
         (begin (jolt-sm-check-driver! 'clojure.core.async/__sm-take f)
-               (jolt-sm-fiber-take f ch k))
+               (jolt-sm-fiber-take f ch k #f))
         (jolt-invoke k (jolt-async-take ch)))))
 
-(define (jolt-sm-fiber-take f ch k)
+;; <!! — the same op with the interrupt arm (jolt-sm-commit!/intr); on a thread,
+;; the interruptible blocking take.
+(define (jolt-sm-take!! ch k)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin (jolt-sm-check-driver! 'clojure.core.async/__sm-take!! f)
+               (jolt-sm-fiber-take f ch k #t))
+        (jolt-invoke k (jolt-async-take!! ch)))))
+
+;; Park on handler H, cheaply; interruptibly when INTR?.
+(define (jolt-sm-park-on! f h ch put? intr? resume)
+  (if intr?
+      (jolt-sm-commit!/intr f (make-sm-wait resume h ch put? (current-interrupt-box)))
+      (jolt-sm-commit! f h resume)))
+
+(define (jolt-sm-fiber-take f ch k intr?)
   (jolt-fiber-may-park! 'clojure.core.async/<!)   ; before registering as a taker
   (jolt-chan-lock! ch)
   (let ((r (ac-poll!/locked ch)))
@@ -286,8 +375,8 @@
                 (jolt-invoke k v))
               (begin
                 (jolt-chan-unlock! ch)
-                (jolt-sm-commit!
-                 f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))
+                (jolt-sm-park-on!
+                 f h ch #f intr? (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))
         (begin
           (jolt-chan-unlock! ch)
           (jolt-invoke k r)))))
@@ -296,10 +385,17 @@
   (let ((f (jolt-current-fiber)))
     (if f
         (begin (jolt-sm-check-driver! 'clojure.core.async/__sm-put f)
-               (jolt-sm-fiber-put f ch v k))
+               (jolt-sm-fiber-put f ch v k #f))
         (jolt-invoke k (jolt-async-give ch v)))))
 
-(define (jolt-sm-fiber-put f ch v k)
+(define (jolt-sm-put!! ch v k)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin (jolt-sm-check-driver! 'clojure.core.async/__sm-put!! f)
+               (jolt-sm-fiber-put f ch v k #t))
+        (jolt-invoke k (jolt-async-give!! ch v)))))
+
+(define (jolt-sm-fiber-put f ch v k intr?)
   (jolt-fiber-may-park! 'clojure.core.async/>!)   ; before registering as a putter
   ;; the nil check BEFORE the mutex: it throws, and this path releases by hand
   (async-check-put! v)
@@ -319,9 +415,11 @@
                (jolt-invoke k ok))
              (begin
                (jolt-chan-unlock! ch)
-               (jolt-sm-commit!
-                f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))))))
+               (jolt-sm-park-on!
+                f h ch #t intr? (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))))))
 
 (cca-def! "__sm-spawn" jolt-sm-spawn)
 (cca-def! "__sm-take" jolt-sm-take)
 (cca-def! "__sm-put" jolt-sm-put)
+(cca-def! "__sm-take!!" jolt-sm-take!!)
+(cca-def! "__sm-put!!" jolt-sm-put!!)

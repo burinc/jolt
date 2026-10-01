@@ -977,12 +977,12 @@
   ;; A go block that interrupts (Thread/currentThread) and then blocks does throw on
   ;; both — that part matches.
   {:category :concurrency-model
-   :behavior "(.interrupt t) for a dispatch thread t while several go blocks are parked in blocking derefs that ran on it"
+   :behavior "(.interrupt t) for a dispatch thread t while several go blocks are parked in blocking derefs, or in <!! / >!! / alts!!, that ran on it"
    :jvm "a parked go block holds no thread; only whatever is running on t at that moment can be interrupted"
    :jolt "the parked fibers registered against t's interrupt box are all woken and one of them consumes the interrupt and throws"
    :check :prose
    :why "needs several go blocks parked on one dispatch thread with an interrupt landing mid-park"
-   :note "jolt has no per-fiber interrupt flag to key on and .interrupt is handed a box and nothing else. The check CLEARS, so one interrupt still produces exactly one InterruptedException — but which fiber gets it is not determined. Pinned by the \"interrupt / blocking fibers\" rows in test/chez/unit.edn, which bind *go-backend* :fiber — go defaults to :thread, so an unbound (go ...) runs on an OS thread and tests nothing about fibers. The reasoning is at jolt-cv-wait-interruptibly in host/chez/locks.ss."}
+   :note "jolt has no per-fiber interrupt flag to key on and .interrupt is handed a box and nothing else. The check CLEARS, so one interrupt still produces exactly one InterruptedException — but which fiber gets it is not determined. Pinned by the \"interrupt / blocking fibers\" rows in test/chez/unit.edn, which bind *go-backend* :fiber — go defaults to :thread, so an unbound (go ...) runs on an OS thread and tests nothing about fibers. The reasoning is at jolt-cv-wait-interruptibly in host/chez/locks.ss; the channel ops follow the same rule through jolt-fiber-waiter-wait!/ibox in host/chez/java/fibers-async.ss, pinned by the \"interrupt / blocking channels fibers\" rows."}
   ;; A fiber's Thread/sleep gets the ALREADY-SET half of the rule but not the other
   ;; half. Chez's sleep has no wakeup, and Thread/sleep on a fiber deliberately
   ;; sleeps its CARRIER (fibers-pool-test case 6 pins that, and a go block doing
@@ -995,7 +995,40 @@
    :jolt "the sleep runs to its full duration; the flag is set and readable the moment it returns"
    :check :prose
    :why "timing-dependent: asserts when a sleep returns relative to an interrupt"
-   :note "Entering the sleep with the flag ALREADY set does throw, so the pre-set half matches. Only mid-sleep delivery is missing. Pinned by the last \"interrupt / blocking fibers\" row in test/chez/unit.edn, which also shows the flag surviving the nap. A fiber that must be interruptible mid-wait should park on a promise or channel rather than sleep."}
+   :note "Entering the sleep with the flag ALREADY set does throw, so the pre-set half matches. Only mid-sleep delivery is missing. Pinned by the last \"interrupt / blocking fibers\" row in test/chez/unit.edn, which also shows the flag surviving the nap. A fiber that must be interruptible mid-wait should park on a promise, or in <!! / >!! / alts!! on a channel, rather than sleep."}
+  ;; An alts that both takes from and puts to the same unbuffered channel. On the
+  ;; JVM the put finds the alts's own take registered and commits against it: the
+  ;; alts answers [true ch] and the value goes to a callback nobody reads. jolt
+  ;; claims a putter and a taker together and never pairs a handler with itself, so
+  ;; the two ops wait for real partners.
+  {:category :concurrency-model
+   :behavior "(let [c (chan)] (alts!! [c [c :v] (timeout 100)] :priority true))"
+   :jvm "[true c] — the put pairs with the alts's own take, and :v is lost"
+   :jolt "[nil timeout-chan] — neither op completes, and nothing is lost or left in c"
+   :check :prose
+   :why "the JVM answer loses a value, and the jolt answer depends on a timeout firing"
+   :note "Probed on core.async 1.9.865. Pinned by the \"core.async / rendezvous\" rows in test/chez/unit.edn; the pairing is alt-claim-pair! in host/chez/java/async.ss."}
+  ;; The blocking channel ops: <!!, >!! and alts!! throw InterruptedException and
+  ;; clear the flag, as on the JVM, and a flag already set makes an op that would
+  ;; wait throw at once while one that can complete completes. What differs is what
+  ;; the interrupted op leaves behind. JVM core.async blocks by deref'ing a promise
+  ;; its handler will deliver, and the throw out of that deref does not take the
+  ;; handler off the channel. So a later put hands its value to the taker that is
+  ;; gone, and a later taker takes the value of a put that threw — probed on
+  ;; core.async 1.9.865: after an interrupted (<!! c), (offer! c 1) answers true and
+  ;; the 1 is never seen again; after an interrupted (>!! c :v), (poll! c) answers
+  ;; :v; after an interrupted (alts!! [c [d :v]]), (poll! d) answers :v. jolt
+  ;; retracts the op before it throws, so each of those answers nil and no value is
+  ;; lost or delivered by an op that failed. For the same reason, when a delivery
+  ;; races the interrupt and wins, jolt returns the value and leaves the flag set
+  ;; (the op completed first), where the JVM throws with the value already taken.
+  {:category :concurrency-model
+   :behavior "(let [c (chan)] (interrupt a thread blocked in (<!! c)) (offer! c 1)) — likewise (poll! c) after an interrupted (>!! c :v), and (poll! d) after an interrupted (alts!! [c [d :v]])"
+   :jvm "true — the interrupted taker's handler is still registered and swallows the 1; the poll! answers :v, delivered by a put that threw"
+   :jolt "nil — the interrupted op was retracted before it threw, so nothing is taken or delivered on its behalf"
+   :check :prose
+   :why "needs a thread blocked in a channel op with an interrupt landing mid-wait"
+   :note "Pinned by the \"interrupt / blocking channels\" rows in test/chez/unit.edn. The mechanism is ac-intr-wait! in host/chez/java/async.ss. The parking ops (<!, >!, alts!) are not interruptible on either runtime; on jolt's default :thread go backend a go body IS its thread, so an interrupt of that thread leaves the flag set where the go body reads it afterwards (the JVM resumes a parked go on a pool thread with its own flag)."}
   ;; The piped streams are the one blocking read left outside the interruptible set.
   {:category :concurrency-model
    :behavior "(.interrupt t) while t is blocked in (.read a-PipedInputStream)"

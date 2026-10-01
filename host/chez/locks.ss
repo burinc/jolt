@@ -658,23 +658,41 @@
 ;; waiting — one interrupt, one InterruptedException, as on the JVM. The reachable
 ;; shape is a go block that interrupts (Thread/currentThread), which is its carrier;
 ;; test/chez/unit.edn pins it and known-divergences.edn records it.
-(define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> (mu . cv) list
+(define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> entry set
 (define jolt-interrupt-waits-mu (make-mutex))
 
+;; An ENTRY is what the interrupter wakes: a (mu . cv) pair, poked as
+;; (jolt-with-mutex mu (jolt-cv-wake! cv)), or a procedure of no arguments that
+;; does its own waking — the cheap park's, which resumes one fiber directly rather
+;; than listing it on a condition (java/sm.ss jolt-sm-commit!/intr).
+;;
+;; Per box the entries are a SET (an eq table), not a list. A thread has one wait
+;; at a time, but a carrier's box is shared by every fiber parked on it, and ten
+;; thousand go blocks parked in <!! on one carrier made each removal a remq over
+;; ten thousand entries. The set is kept when it empties: it is weak-keyed with its
+;; box, so it goes when the thread does, and a thread that waits again reuses it.
+;;
 ;; Both called with the waiter's mu held. The table's own mutex is a leaf — taken
 ;; around one hashtable operation with nothing inside it — so it cannot be part of
 ;; a cycle, the same argument jolt-cv-waiters-mu rests on.
+;;
+;; jolt-lock! / jolt-unlock! by hand rather than jolt-with-mutex: nothing between
+;; them can raise, and a go body parked in <!! pays for both on every park, where
+;; the dynamic-wind was a measurable share.
 (define (jolt-interrupt-wait-add! b entry)
-  (jolt-with-mutex jolt-interrupt-waits-mu
-    (hashtable-set! jolt-interrupt-waits b
-                    (cons entry (hashtable-ref jolt-interrupt-waits b '())))))
+  (jolt-lock! jolt-interrupt-waits-mu)
+  (let ((es (or (hashtable-ref jolt-interrupt-waits b #f)
+                (let ((t (make-eq-hashtable)))
+                  (hashtable-set! jolt-interrupt-waits b t)
+                  t))))
+    (hashtable-set! es entry #t))
+  (jolt-unlock! jolt-interrupt-waits-mu))
 
 (define (jolt-interrupt-wait-remove! b entry)
-  (jolt-with-mutex jolt-interrupt-waits-mu
-    (let ((es (remq entry (hashtable-ref jolt-interrupt-waits b '()))))
-      (if (null? es)
-          (hashtable-delete! jolt-interrupt-waits b)
-          (hashtable-set! jolt-interrupt-waits b es)))))
+  (jolt-lock! jolt-interrupt-waits-mu)
+  (let ((es (hashtable-ref jolt-interrupt-waits b #f)))
+    (when es (hashtable-delete! es entry)))
+  (jolt-unlock! jolt-interrupt-waits-mu))
 
 ;; (jolt-interrupt-wake-waits! b) — poke every condition the thread owning b is
 ;; willing to be interrupted out of. Call AFTER setting the flag: the flag is what
@@ -688,8 +706,14 @@
 ;; at a time.
 (define (jolt-interrupt-wake-waits! b)
   (let ((es (jolt-with-mutex jolt-interrupt-waits-mu
-              (hashtable-ref jolt-interrupt-waits b '()))))
-    (for-each (lambda (e) (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e)))) es)))
+              (let ((t (hashtable-ref jolt-interrupt-waits b #f)))
+                (if t (hashtable-keys t) '#())))))
+    (vector-for-each
+      (lambda (e)
+        (if (procedure? e)
+            (e)
+            (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e)))))
+      es)))
 
 ;; The flag, read-and-cleared — java.lang.Thread's own rule for a wait that throws:
 ;; "the interrupted status is cleared and an InterruptedException is thrown."
