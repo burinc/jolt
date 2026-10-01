@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error codes. Every call answers `[result error]`, the error captured on the
   call's own return path. `consts-for` gives the numbers for macOS, Linux and
   Windows. jolt.socket, jolt.nrepl and jolt.mvn-http are rebuilt on it, so
-  their sockets are close-on-exec and each carries no bindings of its own.
+  their sockets are close-on-exec (from birth on Linux: SOCK_CLOEXEC and
+  accept4) and each carries no bindings of its own.
 
 - **A fiber is a virtual thread.** `Thread/currentThread` inside a fiber (an
   `io-thread`, a `go` block on the `:fiber` backend, a `jolt.fibers/spawn`) is
@@ -161,8 +162,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fd.** stop closed the listen socket under a blocked accept(), which Linux
   does not wake, so the thread stayed in accept() on a number the next socket
   could take. The listener is non-blocking now and the accept loop waits in
-  poll slices; stop waits for it to leave, then closes the socket, so the port
-  is free when stop returns.
+  poll slices and closes the socket as it leaves; stop waits for it, so the
+  port is free when stop returns.
+
+- **A `ServerSocket` whose bind address does not resolve closes its socket.**
+  The constructor threw UnknownHostException and left the fd it had opened.
 
 - **A `ThreadFactory`'s Thread runs the pool worker.** A pool asked its
   factory for a Thread only to read its daemon flag and name, and ran the
