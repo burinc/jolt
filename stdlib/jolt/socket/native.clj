@@ -110,7 +110,8 @@
      ;; struct addrinfo: four ints, then ai_addrlen at 16 (socklen_t, or size_t
      ;; on Windows — the low half is the same bytes), then three pointers. The
      ;; BSDs and Windows put ai_canonname at 24 and ai_addr at 32; glibc swaps
-     ;; them. ai_next is at 40 everywhere.
+     ;; them; bionic, which is Linux to os.name, has the BSD order. So this is
+     ;; only where to look first (see ai-addr). ai_next is at 40 everywhere.
      :ai-addr-offset (if bsd? 32 24)}))
 
 (def consts (consts-for os))
@@ -194,7 +195,6 @@
 (ffi/defcfn c-inet-ntop    "inet_ntop"    [:int :pointer :pointer :uint] :pointer)
 (ffi/defcfn c-inet-pton    "inet_pton"    [:int :pointer :pointer] :int)
 (ffi/defcfn c-gethostname  "gethostname"  [:pointer :size_t] :int)
-(ffi/defcfn c-gethostbyname "gethostbyname" [:pointer] :pointer :blocking)
 (ffi/defcfn c-getnameinfo  "getnameinfo"
   [:pointer :uint :pointer :uint :pointer :uint :int] :int :blocking)
 
@@ -531,41 +531,28 @@
 
 (declare getaddrinfo-addrs)
 
-(defn- hostent-addrs
-  "IPv4 entries for host from gethostbyname, the resolver of last resort.
-  Bionic's getaddrinfo hands every lookup — localhost included — to the netd
-  daemon and fails where there is none (a termux container), while
-  gethostbyname reads /etc/hosts first. struct hostent: h_addr_list, a
-  NULL-terminated array of pointers to 4-byte addresses, is at 24 on every
-  64-bit platform."
-  [host port]
-  (let [hp (ffi/string->ptr (str host))]
-    (try
-      (let [he (c-gethostbyname hp)]
-        (when-not (or (nil? he) (ffi/null? he))
-          (let [lst (ffi/read he :pointer 24)]
-            (loop [i 0 out [] seen #{}]
-              (let [p (ffi/read lst :pointer (* i 8))]
-                (if (or (nil? p) (ffi/null? p))
-                  out
-                  (let [ip (str/join "." (map #(ffi/read p :uint8 %) (range 4)))]
-                    (if (contains? seen ip)
-                      (recur (inc i) out seen)
-                      (let [[sa len] (make-sockaddr af-inet ip port)]
-                        (recur (inc i)
-                               (conj out {:family af-inet :addr sa :addrlen len :ip ip})
-                               (conj seen ip)))))))))))
-      (finally (ffi/free hp)))))
+(defn- ai-addr
+  "An addrinfo entry's ai_addr. ai_canonname and ai_addr trade places between
+  libcs, and bionic reports itself as Linux while keeping the BSD order, so the
+  pointer is checked rather than trusted: without AI_CANONNAME only one of the
+  two slots is set, and it is the sockaddr whose family is ai_family. The
+  platform's usual offset is tried first."
+  [ai fam]
+  (let [first-off (:ai-addr-offset consts)]
+    (some (fn [off]
+            (let [p (ffi/read ai :pointer off)]
+              (when (and p (not (ffi/null? p)) (= fam (sockaddr-family p)))
+                p)))
+          [first-off (if (= 24 first-off) 32 24)])))
 
 (defn resolve-addrs
   "The addresses host names, as data: {:addrs [{:family :addr :addrlen :ip} ...]}
   or {:error code :message text}. Numeric literals and names, v4 and v6.
 
-  A literal is parsed with inet_pton and never reaches the resolver, which is
-  what the java.net shim did before this layer existed (inet_addr first) and
-  what keeps \"0.0.0.0\" working where getaddrinfo goes through a resolver
-  daemon that may not be there — bionic in a container is one. A v6 literal
-  with a scope zone (fe80::1%en0) is not inet_pton's, and takes getaddrinfo.
+  A literal is parsed with inet_pton and never reaches the resolver, as the
+  java.net shim did before this layer existed (inet_addr first): no lookup
+  for what is already an address. A v6 literal with a scope zone
+  (fe80::1%en0) is not inet_pton's, and takes getaddrinfo.
 
   Each :addr is a sockaddr of OUR allocation with port already written in — the
   getaddrinfo chain is freed before returning — and is the caller's to free
@@ -578,19 +565,13 @@
    (winsock/ensure!)
    (if-let [lit (literal-addr (str host) port family)]
      {:addrs [lit]}
-     (let [r (getaddrinfo-addrs host port opts)]
-       (if (and (:error r) (or (nil? family) (= family af-inet)))
-         (if-let [addrs (seq (hostent-addrs host port))]
-           {:addrs (vec addrs)}
-           r)
-         r)))))
+     (getaddrinfo-addrs host port opts))))
 
 (defn- getaddrinfo-addrs
   [host port {:keys [family passive?]}]
    (let [node  (ffi/string->ptr (str host))
          hints (ffi/alloc addrinfo-size)
-         resp  (ffi/alloc 8)
-         ai-addr-offset (:ai-addr-offset consts)]
+         resp  (ffi/alloc 8)]
      (try
        (ffi/write hints :int (if passive? ai-passive 0) 0)
        (ffi/write hints :int (or family 0) 4)
@@ -605,10 +586,10 @@
                      {:addrs out})
                  (let [fam     (ffi/read ai :int 4)
                        addrlen (ffi/read ai :int 16)
-                       src     (ffi/read ai :pointer ai-addr-offset)
+                       src     (ai-addr ai fam)
                        k (when (and (or (= fam af-inet) (= fam af-inet6))
                                     (pos? addrlen)
-                                    (not (ffi/null? src)))
+                                    src)
                            [fam (mapv #(ffi/read src :uint8 %) (range addrlen))])
                        entry (when (and k (not (contains? seen k)))
                                (let [sa (ffi/alloc addrlen)]
