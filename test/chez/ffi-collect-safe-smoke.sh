@@ -35,6 +35,7 @@ out=$("$JOLT" -e "
   @reader
   (cs-close rfd) (cs-close wfd)
   (jolt.ffi/free fds) (jolt.ffi/free buf)
+  (shutdown-agents)
   (println \"ffi-collect-safe:\" r))" </dev/null 2>&1 | tail -1)
 echo "$out"
 case "$out" in

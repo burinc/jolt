@@ -17,20 +17,26 @@
 ;;   and a producer that throws throws the SAME failure to every walker. This is
 ;;   the contract the lock-free read path must not weaken.
 ;;
-;;   SCALING — one workload, timed before any thread exists and again after one
-;;   has existed, in ONE process. The ratio is the judge: the per-cell mutex
-;;   design measures ~5 (the second arm is mostly collector), the claim ~1.75
-;;   (two atomic operations and an unwind guard on every first force, ~28 ns).
-;;   Only the ratio is read, so machine speed and load do not matter.
+;;   SCALING — one workload, run before any thread exists and again after one
+;;   has existed, in ONE process, judged by COUNTING the mutexes it allocates
+;;   (jolt.host/mutex-allocations, host/chez/scheme-adapter-runtime.ss). That count is exactly what
+;;   the guarded regression changes: a mutex per lazy cell once a thread has
+;;   existed is ~600,000 for this workload (one per claimed force), and the claim
+;;   design allocates none in either arm. The count is the cause of the old slowdown (a finalized object
+;;   per cell, each visited by every collection), so judging it judges the
+;;   slowdown without a clock: it reads the same on an idle machine and a loaded
+;;   one, where a timed ratio (~1.75 for the claim, ~5 for a mutex per cell)
+;;   drifted toward its ceiling with the runner's neighbours. The time of each
+;;   arm is still printed, as information.
 
 (ns lazyseq-mt-scaling-test)
 
 (def ^:private walkers 8)
 (def ^:private n 20000)
-;; The claim design measures ~1.75 (the release fence and the counted claim on
-;; every first force) and a mutex per cell ~5; the line sits well above the
-;; first with room for a loaded CI runner, and well below the failure it guards.
-(def ^:private max-ratio 2.5)
+;; Mutexes the scaling workload may allocate in an arm. The claim design
+;; allocates none; a few would be a runtime structure made once (a pool growing,
+;; say), and the regression is one per cell, ~600,000 per run.
+(def ^:private max-mutexes 16)
 
 (defn- fail [msg]
   (println (str "FAIL lazyseq-mt-scaling: " msg))
@@ -88,38 +94,43 @@
       (recur (inc i) (+ acc (count (vec (map inc (take 3 (iterate inc i)))))))
       acc)))
 
-(defn- time-ms [f]
-  (let [t0 (System/nanoTime)]
-    (f)
-    (/ (- (System/nanoTime) t0) 1000000.0)))
+;; Each arm: the mutexes allocated (the judge) and the thread's CPU time (shown).
+(def ^:private cpu-bean (java.lang.management.ManagementFactory/getThreadMXBean))
 
-;; Best of several runs per arm, each from a fresh collection: one run per arm
-;; read 1.7-2.0 on CI for months and then 3.13 (186ms, 582ms) once, under make
-;; -j beside other gates. The arms cannot alternate -- one of them is "before
-;; any thread" -- so each takes the minimum of its own runs; a burst long enough
-;; to cover all of them is not what this gate is looking for, a per-cell mutex
-;; (~5) slows every run.
-(def ^:private runs 5)
-(defn- best-ms [f] (reduce min (repeatedly runs #(do (System/gc) (time-ms f)))))
+(defn- arm []
+  (System/gc)
+  (let [m0 (jolt.host/mutex-allocations)
+        c0 (.getCurrentThreadCpuTime cpu-bean)]
+    (work)
+    [(- (jolt.host/mutex-allocations) m0)
+     (/ (- (.getCurrentThreadCpuTime cpu-bean) c0) 1000000.0)]))
+
+(def ^:private runs 3)
+(defn- arms [] (vec (repeatedly runs arm)))
 
 (defn- check-scaling []
   (work)                                                ; warm
-  (let [before (best-ms work)
+  (let [before (arms)
         t (Thread. (fn [] nil))]
     (.start t) (.join t)                               ; a thread has EXISTED; it need not be alive
-    (let [after (best-ms work)
-          ratio (/ after before)]
-      (println (format "lazyseq-mt-scaling: %.0fms before any thread, %.0fms after one existed, ratio %.2f (ceiling %.1f)"
-                       before after ratio max-ratio))
-      (when (> ratio max-ratio)
-        (fail (str "lazy realization slows down once a thread has existed — a mutex is being "
-                   "allocated per lazy cell again (host/chez/seq.ss seq-more / "
+    (let [after (arms)
+          cpu (fn [rs] (reduce min (map second rs)))]
+      (println (format (str "lazyseq-mt-scaling: mutexes allocated per arm %s before any thread, %s after "
+                            "one existed (limit %d); CPU %.0fms -> %.0fms (ratio %.2f, not judged)")
+                       (mapv first before) (mapv first after) max-mutexes
+                       (cpu before) (cpu after) (/ (cpu after) (cpu before))))
+      (when-let [bad (seq (filter #(> % max-mutexes) (map first (concat before after))))]
+        (fail (str "lazy realization allocates mutexes (" (first bad) " in one run of the workload) — "
+                   "a mutex is being allocated per lazy cell again (host/chez/seq.ss seq-more / "
                    "host/chez/lazy-bridge.ss force-lazyseq)."))))))
 
 (defn -main [& _]
   ;; scaling first: it needs the single-threaded arm, and once-only forks threads
   (check-scaling)
   (check-once-only)
-  (println "lazyseq-mt-scaling: passed"))
+  (println "lazyseq-mt-scaling: passed")
+  ;; the walkers ran on futures; let the pool go so the process exits now
+  ;; rather than after the agent pools' idle linger, as on the JVM
+  (shutdown-agents))
 
 (-main)

@@ -1074,3 +1074,7 @@
       passed (count (filter true? (doall (map run-case ordered))))]
   (println (format "LOADERCONF %d/%d" passed (count ordered)))
   (fs/delete-tree tmp))
+
+;; Done with the agent system's pools (futures, agents): end them, as a JVM
+;; program does, or their idle workers hold the process up for their keep-alive.
+(shutdown-agents)

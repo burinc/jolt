@@ -23,3 +23,7 @@
 (if (empty? @failures)
   (println "CTXVARS OK")
   (doseq [f @failures] (println "FAIL:" f)))
+
+;; Done with the agent system's pools (futures, agents): end them, as a JVM
+;; program does, or their idle workers hold the process up for their keep-alive.
+(shutdown-agents)

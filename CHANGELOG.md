@@ -39,6 +39,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failedStage` and `minimalCompletionStage` (the `MinimalStage` view), and
   `defaultExecutor`.
 
+- **`ManagementFactory/getThreadMXBean`** with the current thread's CPU clock:
+  `getCurrentThreadCpuTime`, `getCurrentThreadUserTime` (the same total — the
+  runtime's thread clock does not split user from system time) and the
+  `is...Supported`/`Enabled` checks.
+- **`Thread.getState` and the `Thread$State` enum.** NEW before `start`,
+  TERMINATED after the thread ends, and while it runs what it is actually
+  doing, as the JVM reports it: WAITING in an untimed wait (`join`, a promise
+  or future deref, `<!!`/`>!!`, `Object.wait`, a latch, a queue `take`, a
+  `ReentrantLock` acquire), TIMED_WAITING in a timed one (`Thread/sleep`, a
+  timed deref, `wait` or `await`), BLOCKED waiting to enter a `locking`
+  monitor, RUNNABLE otherwise. `Thread$State/values` and `valueOf` work. A
+  fiber's state is left to the fiber layer through a hook.
+- **`java.lang.ThreadGroup` and `Thread.getThreadGroup`.** A minimal model of
+  the JVM's: the built-in `system` group and its child `main`, which every
+  thread is in unless placed elsewhere (as the JVM's main thread, its pools'
+  and its futures' threads are); `(ThreadGroup. name)` and
+  `(ThreadGroup. parent name)`; the `Thread` constructors that take a group;
+  a new `Thread` in its creator's group; `getName`, `getParent`, `parentOf`,
+  `activeCount` (live threads in the group and its subgroups),
+  `activeGroupCount`, `getMaxPriority`; `Thread/activeCount`; and
+  `getThreadGroup` answering nil once a thread has terminated.
+  `(Thread. "name")` now takes its string as the name rather than as a target.
+
 - **`Socket.shutdownOutput`, `shutdownInput`, `isOutputShutdown` and
   `isInputShutdown`.** The half-close, as on the JVM: after `shutdownOutput`
   the peer reads EOF, this side still reads, and a write throws "Broken
@@ -51,8 +74,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Socket is not connected" as the JDK's do. Without the half-close a proxy
   closing a socket its peer was still reading got a reset on Windows (#1208).
 
+### Changed
+
+- **The process waits for its non-daemon threads before it exits, as the JVM
+  does.** jolt used to end the moment `-main`, a script, `-e` or the REPL
+  returned, waiting only for a `Thread.` the program had started itself, so work
+  still running on a future, an agent or an executor was silently dropped. The
+  rule is now clojure.main's, each case measured against JVM Clojure 1.12.5 on
+  JDK 21: every live non-daemon thread holds the process up, whatever started
+  it, and daemon threads never do. That includes the idle holds a JVM Clojure
+  program has — **this is the part that can change how an existing script
+  behaves**:
+  - after a `future`, `pmap`, `pcalls` or `send-off`, the process stays up for
+    60 s after the last one finishes (the agent system's cached pool keeps its
+    idle worker that long), unless the program calls `shutdown-agents`;
+  - after a `send`, `await` or `await-for` it does not end by itself at all
+    (that pool's workers never time out) until `shutdown-agents`;
+  - an Executors pool that is never shut down keeps it up for good, as a
+    non-daemon thread blocked forever does; after `.shutdown` it ends once the
+    queue drains.
+
+  A script that relied on exiting with a future or a pool still pending now
+  waits, or hangs, exactly as it would on the JVM; end it the JVM way, with
+  `shutdown-agents`, `.shutdown`, a daemon thread, or `System/exit`.
+  `System/exit`, `Runtime.halt` (new) and an uncaught error still end the
+  process at once; shutdown hooks run after the wait, as there. Daemon threads
+  are never waited for: `core.async`'s `thread`, `go` and `io-thread`,
+  CompletableFuture's async pool, `newVirtualThreadPerTaskExecutor`, a pool
+  whose `ThreadFactory` makes daemons, and jolt's own runtime threads. A future
+  or send-off is never a daemon, whatever thread starts it. `jolt run <task>` follows babashka's rule
+  instead of clojure.main's: bb's future and agent threads are daemons, so a
+  task does not wait on them (a `Thread.` it starts, or a pool it never shuts
+  down, still holds the process up there as here). Built binaries wait the same
+  way as the CLI. `jolt build` and its compile workers do not: they are the
+  compiler, and a namespace that starts a future at load (to be compiled, it is
+  loaded) must not hold the build up for the pool's keep-alive.
+
+  Along with it, as on the JVM: a `future` after `shutdown-agents` throws
+  `RejectedExecutionException`, and a `send` after it returns the agent and
+  hands the rejection to the agent's error handler (it used to throw);
+  `shutdownNow` interrupts the tasks its workers are running (it used to leave
+  them running); `ThreadPoolExecutor.allowCoreThreadTimeOut` is implemented;
+  and `put!`/`take!` callbacks, `core.async`'s mixed and compute executors and
+  the io poller run on daemon threads, so none of them holds the process up.
+  jolt's nREPL server runs on plain threads rather than futures, so evaluating
+  `(shutdown-agents)` over a connection leaves it serving the next one.
+
 ### Fixed
 
+- **A `ThreadFactory`'s Thread runs the pool worker.** A pool asked its
+  factory for a Thread only to read its daemon flag and name, and ran the
+  worker on a thread of its own, so a factory that wraps the Runnable it is
+  handed (to set up context, count, catch) never saw its wrapper run, and
+  `Thread/currentThread` in a task was not the factory's Thread. The pool now
+  starts the Thread `newThread` answers, as the JVM does. A task handed to
+  `execute` that throws ends its worker as there: the throw goes to the
+  thread's uncaught-exception handler and the pool starts a replacement.
+  `Thread.setUncaughtExceptionHandler`/`getUncaughtExceptionHandler` and
+  `Thread/setDefaultUncaughtExceptionHandler`/`getDefaultUncaughtExceptionHandler`
+  are implemented, and a `Thread`'s body that throws goes through them.
+- **`cancel(true)` interrupts the task it cancels.** On an executor's future
+  (`submit`, a scheduled task, `invokeAll`'s deadline, `invokeAny`'s losers,
+  `future-cancel`) and on a `FutureTask` run on a pool or a `Thread`, cancel
+  marked the future and the task ran on to completion; the running thread is
+  now interrupted, as on the JVM, and `cancel(false)` still leaves it to finish.
+  A pool worker clears its interrupt before its next task, as the JVM's
+  `ThreadPoolExecutor` does, so a cancel does not leak into unrelated work. A
+  `FutureTask` cancelled while it runs stays cancelled (its result used to
+  overwrite the cancellation), `FutureTask.cancel` wins over a running task,
+  and a `FutureTask` takes a reified `Callable`.
+- **A thread has one `java.lang.Thread` object.** Inside a thread started from
+  `(Thread. f)`, `(Thread/currentThread)` was a separate handle, never
+  `identical?` to the object, and the two answered different members: the
+  handle had no `join`, the object no `getId` or `getContextClassLoader`. Now
+  the started thread IS its object — its `currentThread`, its key in
+  `getAllStackTraces`, and a handle another thread took for it earlier are all
+  the same object — and every thread jolt did not start from a `Thread.`
+  (main, futures, pool workers, core.async threads) has one stable object
+  made the first time anyone asks. Every member answers through it the same
+  way: `join` and `isAlive` work on any thread's object, `getId`/`threadId`
+  are assigned at construction (main is 1, as on the JVM) rather than once
+  started, and `getAllStackTraces` now includes the main thread when another
+  thread asks. `getState` and `getThreadGroup` are still not implemented.
 - **`Thread.isDaemon` answers for every thread.** `(.isDaemon
   (Thread/currentThread))` was "No matching field found" everywhere — on the
   main thread, in a future, a `go` block, an executor task, even in a started
@@ -69,10 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live thread's handle is `IllegalThreadStateException`, as on the JVM. The
   handle also gains `isAlive`, `isVirtual`, `threadId`, and `getPriority`/
   `setPriority`, which both representations now share: validated to 1–10,
-  inherited by a new `Thread.`, and carried to the started thread. One exit
-  difference is recorded in `known-divergences.edn`: jolt still exits without
-  waiting for work pending on a future, an agent or an executor, where the JVM
-  stays up for those non-daemon threads.
+  inherited by a new `Thread.`, and carried to the started thread.
 - **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
   deref'ing a promise, so `.interrupt` throws `InterruptedException` out of them
   and clears the flag. jolt kept waiting and left the flag set, so a worker shut

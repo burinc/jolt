@@ -594,7 +594,11 @@
                   (c-kevent kq ch 1 ffi/null 0 ffi/null)
                   (finally (ffi/free ch))))
               (ep-ctl! kq EPOLL-ADD r :read))
-            (future (poller-loop kq))))
+            ;; a daemon thread, not a future: the poller runs for the life of
+            ;; the process, and a non-daemon thread would keep it from ending
+            (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
+              (.setDaemon true)
+              (.start))))
         (finally (ffi/free pfds))))))
 
 ;; -- the wait API --------------------------------------------------------------

@@ -122,18 +122,6 @@
    :check {:expr "(let [ex (java.util.concurrent.Executors/newScheduledThreadPool 1)] (try (.getName (class (.submit ex ^java.util.concurrent.Callable (fn [] 1)))) (finally (.shutdown ex))))"
            :jvm "\"java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask\""
            :jolt "\"java.util.concurrent.FutureTask\""}}
-  ;; Process exit and the threads that do not keep it up. Thread.isDaemon answers
-  ;; per the JVM for every kind of thread (corpus "interop / Thread daemon and
-  ;; priority", unit "threads / daemon"), but on exit jolt waits only for the
-  ;; non-daemon Threads a program started itself (jolt-await-user-threads!,
-  ;; concurrency.ss). Probed by running a script whose last form hands 500ms of
-  ;; work to each kind of thread and prints when it is done.
-  {:category :host-model
-   :behavior "a script that ends with work still pending on a future, an agent, or a non-daemon executor pool"
-   :jvm "the JVM stays up for it: those threads are not daemons, so the work finishes — and the process then lingers until the pool's keep-alive (60s for future/agent without shutdown-agents; forever for an executor never shut down)"
-   :jolt "the process exits when the script returns and the pending work is dropped, although isDaemon on those threads answers false as on the JVM; a Thread the program started itself is waited for, as on the JVM"
-   :check :prose
-   :why "exit behaviour is a property of the process, not of a value one expression can return"}
   ;; CompletableFuture. The stage graph, its exception wrapping and its waits are
   ;; certified by the corpus rows under "interop / completable future"; these are
   ;; the two details of it jolt does not reproduce.
@@ -965,11 +953,11 @@
   {:category :host-model
    :behavior "java.lang.management.ManagementFactory/getMemoryMXBean and the MXBean API"
    :jvm "returns a MemoryMXBean reporting heap/non-heap usage, GC counts, and more"
-   :jolt "absent; resolve answers nil and the call raises \"Unknown class java.lang.management.ManagementFactory\""
-   :check {:expr "(pr-str (resolve 'java.lang.management.ManagementFactory))"
-           :jvm "\"java.lang.management.ManagementFactory\""
-           :jolt "\"nil\""}
-   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}
+   :jolt "absent: ManagementFactory answers only getThreadMXBean (the current thread's CPU clock); getMemoryMXBean and the rest raise"
+   :check {:expr "(try (java.lang.management.ManagementFactory/getMemoryMXBean) :present (catch Throwable e :absent))"
+           :jvm ":present"
+           :jolt ":absent"}
+   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is the rest of JMX. Affects criterium's benchmark reporting, not its timing."}
   ;; A recv error reads as EOF: io-call classifies the captured errno itself and
   ;; returns only the syscall result, so ECONNRESET reaches the read side as a
   ;; bare -1 with no way to raise Java's SocketException for it.

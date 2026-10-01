@@ -375,10 +375,23 @@
   ;; own: a go block on a fiber answers for its carrier, which is a daemon too.
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] [(a/<!! (a/thread (me))) (a/<!! (a/go (me))) (a/<!! (a/thread (.isDaemon (Thread. (fn []))))) (a/<!! (a/io-thread (me))) (a/<!! (a/thread-call me :compute))]))" :expected "[true true true true true]"}
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (a/<!! (a/go [(jolt.host/fiber?) (.isDaemon (Thread/currentThread))]))))" :expected "[true true]"}
+  ;; A thread blocked in a core.async channel op is WAITING (<!!, >!!, and alts!!
+  ;; over a timeout channel, which parks untimed). Probed on JVM Clojure 1.12.5 +
+  ;; core.async 1.9.865 / JDK 21: ["WAITING" "WAITING" "WAITING"].
+  {:suite "threads / state" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) d (a/chan) ts [(Thread. (fn [] (a/<!! c))) (Thread. (fn [] (a/>!! d 1))) (Thread. (fn [] (a/alts!! [(a/chan) (a/timeout 10000)])))]] (doseq [t ts] (.setDaemon t true) (.start t)) (Thread/sleep 200) (let [r (mapv (fn [t] (str (.getState t))) ts)] (a/close! c) (a/<!! d) r)))" :expected "[\"WAITING\" \"WAITING\" \"WAITING\"]"}
   ;; A future and a send-off run on the agent pools, whose threads are never
   ;; daemons, even when a daemon thread (here core.async's) starts them; they used
   ;; to inherit the creator's status. JVM: [false false].
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] (a/<!! (a/thread [(deref (future (me)) 5000 :hung) (let [ag (agent nil) p (promise)] (send-off ag (fn [_] (deliver p (me)))) (deref p 5000 :hung))]))))" :expected "[false false]"}
+  ;; A finished Thread keeps what it was: the id-keyed tables a running thread's
+  ;; name, priority and daemon flag live in let go of it at exit, and the object
+  ;; holds them from then on (a rename while it ran included). JVM: [true "w" 3]
+  ;; and ["late" 7 false].
+  {:suite "threads / finished" :expr "(let [t (Thread. (fn []))] (.setDaemon t true) (.setName t \"w\") (.setPriority t 3) (.start t) (.join t) [(.isDaemon t) (.getName t) (.getPriority t)])" :expected "[true \"w\" 3]"}
+  {:suite "threads / finished" :expr "(let [l (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.await l)))] (.start t) (.setName t \"late\") (.setPriority t 7) (.countDown l) (.join t) [(.getName t) (.getPriority t) (.isAlive t)])" :expected "[\"late\" 7 false]"}
+  ;; newVirtualThreadPerTaskExecutor runs its tasks on daemon threads, as every
+  ;; virtual thread is one. JVM: true.
+  {:suite "threads / daemon" :expr "(let [ex (java.util.concurrent.Executors/newVirtualThreadPerTaskExecutor)] (try (deref (.submit ex (reify java.util.concurrent.Callable (call [_] (.isDaemon (Thread/currentThread)))))) (finally (.shutdown ex))))" :expected "true"}
   {:suite "threads / name" :expr "(.getName (Thread/currentThread))" :expected "\"main\""}
   {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))))) (not= \"main\" (deref p 5000 :timeout)))" :expected "true"}
   {:suite "threads / name" :expr "(let [p (promise) t (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))) \"worker-x\")] (.start t) [(.getName t) (deref p 5000 :timeout)])" :expected "[\"worker-x\" \"worker-x\"]"}
@@ -1968,6 +1981,12 @@
   ;; empty list and running it all anyway. The first task is known to be running
   ;; before the five are queued, so the count is not a race.
   {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (deref go 5000 :timeout))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[5 0 true]"}
+  ;; ...and the same with the blocked task ending the moment it is interrupted, 40
+  ;; times per pool kind: shutdownNow interrupted the workers BEFORE it drained the
+  ;; queue, so a worker woken by it could take the queue first and run every queued
+  ;; task — [0 5 true] instead of [5 0 true], intermittently on CI. A spinning task
+  ;; makes the race land about half the time. True on JVM Clojure 1.12.5 / JDK 21.
+  {:suite "executor-shutdown" :expr "(every? true? (for [mk [#(java.util.concurrent.Executors/newFixedThreadPool 1) #(java.util.concurrent.Executors/newScheduledThreadPool 1) #(java.util.concurrent.ThreadPoolExecutor. 1 1 0 java.util.concurrent.TimeUnit/SECONDS (java.util.concurrent.LinkedBlockingQueue.))] _ (range 40)] (let [ex (mk) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (loop [] (when-not (or (realized? go) (Thread/interrupted)) (recur))))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) (= [5 0 true] [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)])))))" :expected "true"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
   ;; bytes-allocated reads the heap as it stands: live data AND garbage not yet

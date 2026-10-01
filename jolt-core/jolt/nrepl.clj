@@ -462,16 +462,25 @@
                    port " (127.0.0.1) — .nrepl-port written"))
      (when (seq middleware) (println (str ";; middleware: " (str/join " " middleware))))
      (println ";; connect your editor; ^C to stop")
-      (future
-        ;; A stop closes fd, which makes the blocking accept() return an error; the
-        ;; @stopped check then breaks the loop instead of spinning on the dead fd.
-        (loop []
-         (let [conn (c-accept fd ffi/null ffi/null)]
-           (when-not @stopped
-             (when (>= conn 0)
-               (future (try (handle-conn conn handler)
-                            (catch :default e (println "nrepl conn error:" (err-msg e)) (c-close conn)))))
-             (recur)))))
+      ;; Plain threads, not futures: the server is not on the agent pool, so an
+      ;; eval'd (shutdown-agents) — the usual last form of a -main — must not
+      ;; leave the next accept unable to start its connection.
+      (.start
+       (Thread.
+        (bound-fn []
+          ;; A stop closes fd, which makes the blocking accept() return an error;
+          ;; the @stopped check then breaks the loop instead of spinning on the
+          ;; dead fd.
+          (loop []
+            (let [conn (c-accept fd ffi/null ffi/null)]
+              (when-not @stopped
+                (when (>= conn 0)
+                  (.start
+                   (Thread.
+                    (bound-fn []
+                      (try (handle-conn conn handler)
+                           (catch :default e (println "nrepl conn error:" (err-msg e)) (c-close conn)))))))
+                (recur)))))))
       (fn stop []
         (when (compare-and-set! stopped false true)
           (c-close fd)

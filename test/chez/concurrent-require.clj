@@ -537,3 +537,7 @@
                "siblings, requiring-resolve takes no process-wide lock"))))
 
 (-main)
+
+;; Done with the agent system's pools (futures, agents): end them, as a JVM
+;; program does, or their idle workers hold the process up for their keep-alive.
+(shutdown-agents)

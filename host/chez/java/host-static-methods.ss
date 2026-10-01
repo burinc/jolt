@@ -114,13 +114,29 @@
 ;; and so do Thread/interrupted, .isInterrupted, monitor enter/exit and
 ;; ReentrantLock's owner check.
 (define jolt-vreg-interrupt-box 9)      ; rt.ss owns the slot map; 0-8 were taken
+;; Every thread's box is also recorded under its thread id, so a Thread object
+;; made for a thread by SOMEONE ELSE (getAllStackTraces) carries that thread's
+;; real flag: the one it will find itself, and the one waits register under.
+;; Whichever of the two asks first creates it; the entry goes when the thread ends
+;; (io.ss, jolt-thread-exit-hook).
+(define thread-boxes-by-id (make-eqv-hashtable))
+(define thread-boxes-mu (make-mutex))
+(define (thread-box-for-id! id)
+  (jolt-with-mutex thread-boxes-mu
+    (or (hashtable-ref thread-boxes-by-id id #f)
+        (let ((b (box #f))) (hashtable-set! thread-boxes-by-id id b) b))))
+(define (thread-box-forget! id)
+  (jolt-with-mutex thread-boxes-mu (hashtable-delete! thread-boxes-by-id id)))
 (define (current-interrupt-box)
   (let ((b (virtual-register jolt-vreg-interrupt-box)))
     (if (box? b)
         b
-        (let ((nb (box #f)))
+        (let ((nb (thread-box-for-id! (get-thread-id))))
           (set-virtual-register! jolt-vreg-interrupt-box nb)
           nb))))
+;; Set by io.ss: re-point the Thread object already made for this thread, if any,
+;; at the box it adopts, so it and the thread keep one flag.
+(define jolt-thread-box-adopted-hook (lambda (id b) (void)))
 ;; A thread jolt itself forked already HAS a flag — the box its Thread object hands
 ;; .interrupt — so it must not lazily allocate a second one. The child adopts that
 ;; box as its own before running the body; without this, .interrupt from outside
@@ -128,6 +144,9 @@
 ;; the ordinary interruption idiom never reached the worker.
 (define (adopt-interrupt-box! b)
   (set-virtual-register! jolt-vreg-interrupt-box b)
+  (let ((id (get-thread-id)))
+    (jolt-with-mutex thread-boxes-mu (hashtable-set! thread-boxes-by-id id b))
+    (jolt-thread-box-adopted-hook id b))
   b)
 (define (clear-thread-interrupt!) (set-box! (current-interrupt-box) #f))
 

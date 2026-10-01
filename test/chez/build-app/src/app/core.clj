@@ -205,4 +205,7 @@
   (println "greet-default:" (util/greet :unknown))
   (println "greet-loud:" (util/greet :loud))
   (println "greet-soft:" (util/greet :soft))
-  (println "boot-threads:" boot-future boot-thread))
+  (println "boot-threads:" boot-future boot-thread)
+  ;; the future above ran on the agent system's pool: end it, as a JVM program
+  ;; does, so the binary exits now rather than after the pool's keep-alive
+  (shutdown-agents))

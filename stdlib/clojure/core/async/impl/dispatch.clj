@@ -47,12 +47,19 @@
 (def ^:private mixed-executor
   (reify Executor
     (execute [_ r]
-      (.start (Thread. r (str "async-mixed-" (swap! thread-counter inc)))))))
+      ;; a daemon, as core.async's own threads are: it must not hold the
+      ;; process up once the program is done
+      (doto (Thread. r (str "async-mixed-" (swap! thread-counter inc)))
+        (.setDaemon true)
+        (.start)))))
 
 ;; Lazy: a flow that never runs a :compute step never builds the pool. (A cached
 ;; pool forks no worker until a task arrives, so this no longer costs a thread at
 ;; load either way.)
-(def ^:private compute-executor (delay (Executors/newCachedThreadPool)))
+(def ^:private compute-executor
+  (delay (Executors/newCachedThreadPool
+          (reify java.util.concurrent.ThreadFactory
+            (newThread [_ r] (doto (Thread. ^Runnable r) (.setDaemon true)))))))
 
 (defn executor-for
   "Given a workload tag, returns the Executor for it. The tags are :io, :compute

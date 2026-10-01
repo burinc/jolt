@@ -1468,8 +1468,29 @@
 (define (sa-string-copy-range! to at from start end)
   (string-copy! from start to at (fx- end start)))
 
+;; Every Chez mutex the runtime allocates is counted. A mutex is a finalized
+;; object — the collector visits each one — so how many a workload allocates is
+;; a cost in itself, and the lazy-seq scaling gate (test/lazyseq_mt_scaling_test.clj)
+;; asserts on this count: realizing lazy cells must allocate none per cell, before
+;; or after a thread has existed. Read through jolt.host/mutex-allocations.
+;; #%make-mutex names Chez's primitive outright: the devboot and the binary are
+;; compiled as ONE program, where a plain `make-mutex` here would be this file's
+;; own definition below and the wrapper would call itself. Here and not in
+;; locks.ss because naming a primitive that way is the Chez target's business.
+(define %chez-make-mutex #%make-mutex)
+(define jolt-mutex-allocations (box 0))
+(define (count-mutex-allocation!)
+  (let retry ()
+    (let ((n (unbox jolt-mutex-allocations)))
+      (unless (box-cas! jolt-mutex-allocations n (fx+ n 1)) (retry)))))
+(define make-mutex
+  (case-lambda
+    (() (count-mutex-allocation!) (%chez-make-mutex))
+    ((name) (count-mutex-allocation!) (%chez-make-mutex name))))
+
 ;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
 ;; is a macro, so it must be defined before this load rather than captured at
 ;; run time the way the sa-* seams are.
 (load "host/chez/locks.ss")
 (load "host/chez/fibers.ss")
+

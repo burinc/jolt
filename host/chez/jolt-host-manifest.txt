@@ -10,6 +10,7 @@
 add-immutable-roots!
 add-reader-features!
 add-shutdown-hook
+agent-threads-daemon!
 allow-unresolved-vars?
 aot-compile-worker
 as-subvec
@@ -175,6 +176,7 @@ mkdirs!
 monitor-enter
 monitor-exit
 mono-nanos
+mutex-allocations
 munge-name
 namespace-for
 ns-shaped-name?

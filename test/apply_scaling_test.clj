@@ -121,6 +121,9 @@
                       "jolt-register-variadic! on the comparison chains)."))
         (System/exit 1))))
   (println "apply-scaling termination: comparison chains stream an unbounded rest")
-  (println "apply-scaling: passed"))
+  (println "apply-scaling: passed")
+  ;; the walkers ran on futures; let the pool go so the process exits now
+  ;; rather than after the agent pools' idle linger, as on the JVM
+  (shutdown-agents))
 
 (-main)
