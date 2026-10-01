@@ -82,7 +82,6 @@ jolt.process
 jolt.reader
 jolt.scheme
 jolt.socket
-jolt.socket.native
 jolt.tasks
 jolt.time.amount
 jolt.time.base

@@ -18,8 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode, FIONREAD, and error classification that knows errno from Winsock's
   error codes. Every call answers `[result error]`, the error captured on the
   call's own return path. `consts-for` gives the numbers for macOS, Linux and
-  Windows. jolt.socket is rebuilt on it, which also makes its sockets
-  close-on-exec.
+  Windows. jolt.socket, jolt.nrepl and jolt.mvn-http are rebuilt on it, so
+  their sockets are close-on-exec and each carries no bindings of its own.
 
 - **A fiber is a virtual thread.** `Thread/currentThread` inside a fiber (an
   `io-thread`, a `go` block on the `:fiber` backend, a `jolt.fibers/spawn`) is
@@ -156,6 +156,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(shutdown-agents)` over a connection leaves it serving the next one.
 
 ### Fixed
+
+- **Stopping the nREPL server no longer leaves its accept thread on a freed
+  fd.** stop closed the listen socket under a blocked accept(), which Linux
+  does not wake, so the thread stayed in accept() on a number the next socket
+  could take. The listener is non-blocking now and the accept loop waits in
+  poll slices; stop waits for it to leave, then closes the socket, so the port
+  is free when stop returns.
 
 - **A `ThreadFactory`'s Thread runs the pool worker.** A pool asked its
   factory for a Thread only to read its daemon flag and name, and ran the

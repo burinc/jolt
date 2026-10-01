@@ -886,6 +886,33 @@
             (.getProperty p "k"))
           "default")
 
+;; -- jolt.socket.native: the addrinfo layout probe (#979) ------------------------
+;; ai_canonname and ai_addr trade places between libcs (glibc: ai_addr at 24; the
+;; BSDs, Win64 and bionic: 32), and bionic calls itself Linux, so the resolver
+;; finds ai_addr by checking which slot holds a sockaddr of ai_family. A node is
+;; built by hand in each layout, so every host checks both — including the one
+;; that broke Android when the offset came from os.name.
+(require '[jolt.socket.native :as native] '[jolt.ffi :as ffi])
+(let [ai-addr @(ns-resolve 'jolt.socket.native 'ai-addr)
+      [sa _] (native/make-sockaddr native/af-inet "10.1.2.3" 80)
+      node (fn [off]
+             (let [ai (ffi/alloc 48)]
+               (ffi/write ai :int native/af-inet 4)
+               (ffi/write ai :pointer sa off)
+               ai))
+      glibc (node 24)
+      bsd (node 32)
+      canon (ffi/string->ptr "example.org")
+      both (doto (node 32) (ffi/write :pointer canon 24))
+      none (ffi/alloc 48)]
+  (try
+    (check-eq "ai_addr probe: glibc order" (native/sockaddr-ip (ai-addr glibc native/af-inet)) "10.1.2.3")
+    (check-eq "ai_addr probe: BSD/bionic order" (native/sockaddr-ip (ai-addr bsd native/af-inet)) "10.1.2.3")
+    (check-eq "ai_addr probe: a canonname in the other slot is not taken for it"
+              (native/sockaddr-ip (ai-addr both native/af-inet)) "10.1.2.3")
+    (check-eq "ai_addr probe: no address in either slot" (ai-addr none native/af-inet) nil)
+    (finally (doseq [p [sa glibc bsd canon both none]] (ffi/free p)))))
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

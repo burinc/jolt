@@ -13,6 +13,7 @@
   On Windows the sockets are ws2_32 + WSAStartup + closesocket."
   (:require [jolt.ffi :as ffi]
             [jolt.winsock :as winsock]
+            [jolt.socket.native :as native]
             [clojure.string :as str]))
 
 (def ^:private os-name
@@ -156,83 +157,18 @@
   []
   @native-libs)
 
-;; --- BSD socket layer. On POSIX these are the process's own symbols (libc);
-;; on Windows they live in ws2_32.dll (loaded, with WSAStartup, by ensure-native!
-;; before the first call), which exports the same getaddrinfo/socket/connect/
-;; recv/send names plus closesocket. ---
-(ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
-  {:blocking true :capture-native-error true})   ; [rc errno] — see connect-error-message
-(ffi/defcfn c-close       "close"       [:int] :int)
-(ffi/defcfn c-closesocket "closesocket" [:int] :int)              ; Windows sockets
-(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-getaddrinfo "getaddrinfo" [:pointer :pointer :pointer :pointer] :int :blocking)
-(ffi/defcfn c-freeaddrinfo "freeaddrinfo" [:pointer] :void)
-(ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
+;; --- sockets: jolt.socket.native, which carries the per-platform bindings,
+;; numbers and struct layouts (including bionic's BSD-ordered addrinfo, #979).
+;; ws2_32 + WSAStartup on Windows come from ensure-native! before the first call.
 
 ;; SO_RCVTIMEO/SO_SNDTIMEO bound every blocking socket call so a stalled or
 ;; malicious repo can't wedge dependency resolution forever (a timed-out recv
-;; returns -1 -> recv-bytes throws -> fetch returns false). Levels/names differ by
-;; platform; the option value is a struct timeval (POSIX, 16 bytes LP64) or a
-;; DWORD of milliseconds (Windows).
-(def ^:private sol-socket   (if (or macos? windows?) 0xffff 1))
-(def ^:private so-rcvtimeo  (if (or macos? windows?) 0x1006 20))
-(def ^:private so-sndtimeo  (if (or macos? windows?) 0x1005 21))
+;; returns -1 -> recv-bytes throws -> fetch returns false).
 (def ^:private socket-timeout-ms 30000)
 
 (defn- set-timeouts! [fd ms]
-  (if windows?
-    (let [buf (ffi/alloc 4)]
-      (ffi/write buf :int ms)
-      (c-setsockopt fd sol-socket so-rcvtimeo buf 4)
-      (c-setsockopt fd sol-socket so-sndtimeo buf 4)
-      (ffi/free buf))
-    (let [tv (ffi/alloc 16)]
-      (ffi/write tv :long (quot ms 1000))
-      (ffi/write tv :long (* (rem ms 1000) 1000) 8)
-      (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
-      (c-setsockopt fd sol-socket so-sndtimeo tv 16)
-      (ffi/free tv))))
-
-;; struct addrinfo field offsets. Everything up to ai_addrlen is laid out the
-;; same everywhere; the two pointers after it are not. glibc orders them
-;; ai_addr (24) then ai_canonname (32); the BSD order — macOS, Win64 AND
-;; bionic/Android — is ai_canonname (24) then ai_addr (32).
-(def ^:private O-ai-family 4)
-(def ^:private O-ai-socktype 8)
-(def ^:private O-ai-protocol 12)
-(def ^:private O-ai-addrlen 16)
-(def ^:private O-ai-addr-glibc 24)
-(def ^:private O-ai-addr-bsd 32)
-(def ^:private O-ai-next 40)
-
-;; os.name cannot tell the two orders apart: Android reports "Linux" but its
-;; libc is bionic, so picking 24 there reads the NULL ai_canonname, hands
-;; connect() a NULL sockaddr, and every candidate fails EFAULT — no dependency
-;; outside the local Maven cache can be fetched (issue #979). The layout is
-;; probed off the live result node instead. The hints never carry
-;; AI_CANONNAME, so ai_canonname is NULL on every entry getaddrinfo returns
-;; and ai_addr never is: whichever slot holds a non-NULL pointer is ai_addr.
-;; Only if the probe cannot discriminate (both slots set, which no libc here
-;; does without AI_CANONNAME) does os.name decide, as it did before.
-(def ^:private O-ai-addr-fallback (if (or macos? windows?) O-ai-addr-bsd O-ai-addr-glibc))
-
-(defn- pick-ai-addr-offset
-  "Which of the two offsets holds ai_addr, given the pointers a result node
-  carries at 24 and 32."
-  [p24 p32]
-  (cond
-    (and (ffi/null? p24) (not (ffi/null? p32))) O-ai-addr-bsd
-    (and (ffi/null? p32) (not (ffi/null? p24))) O-ai-addr-glibc
-    :else O-ai-addr-fallback))
-
-(defn- ai-addr
-  "The ai_addr pointer of one getaddrinfo result node."
-  [ai]
-  (let [p24 (ffi/read ai :pointer O-ai-addr-glibc)
-        p32 (ffi/read ai :pointer O-ai-addr-bsd)]
-    (if (= O-ai-addr-glibc (pick-ai-addr-offset p24 p32)) p24 p32)))
+  (native/set-timeout! fd native/so-rcvtimeo ms)
+  (native/set-timeout! fd native/so-sndtimeo ms))
 
 ;; Every candidate failing used to be reported as "connection refused", which
 ;; is a guess: the exhaustion says only that the LAST connect failed, and for
@@ -247,41 +183,29 @@
          :else      (str " (errno " err ": " (ffi/errno-message err) ")"))))
 
 (defn- connect
-  "Resolve host:port and open a connected TCP socket; return its fd."
+  "Resolve host:port and open a connected TCP socket; return its fd. Every
+  address the name resolves to is tried in order; the error reported when all
+  fail is the last connect's."
   [host port]
-  (let [node (ffi/string->ptr (str host))
-        service (ffi/string->ptr (str port))
-        respp (ffi/alloc (ffi/sizeof :pointer))
-        hints (ffi/alloc 48)]
-    ;; SOCK_STREAM in ai_socktype, else getaddrinfo also returns UDP entries
-    ;; and connect() on a datagram socket spuriously "succeeds". Every other
-    ;; field of the hints must be 0, which ffi/alloc already made them.
-    (ffi/write hints :int 1 O-ai-socktype)
+  (let [{:keys [addrs error]} (native/resolve-addrs host port)]
+    (when error
+      (throw (ex-info (str "lookup failed: " host) {:host host})))
     (try
-      (let [rc (c-getaddrinfo node service hints respp)]
-        (when-not (zero? rc)
-          (throw (ex-info (str "lookup failed: " host) {:host host})))
-        (let [res (ffi/read respp :pointer)]
-          (try
-            (loop [ai res err nil]
-              (if (ffi/null? ai)
-                (throw (ex-info (connect-error-message host port err)
-                                {:host host :port port :error err}))
-                (let [fam (ffi/read ai :int O-ai-family)
-                      sockt (ffi/read ai :int O-ai-socktype)
-                      proto (ffi/read ai :int O-ai-protocol)
-                      addrlen (ffi/read ai :int O-ai-addrlen)
-                      addr (ai-addr ai)
-                      fd (c-socket fam sockt proto)]
-                  (if (neg? fd)
-                    (recur (ffi/read ai :pointer O-ai-next) err)
-                    (let [[rc code] (c-connect fd addr addrlen)]
-                      (if (zero? rc)
-                        (do (set-timeouts! fd socket-timeout-ms) fd)
-                        (do (if windows? (c-closesocket fd) (c-close fd))
-                            (recur (ffi/read ai :pointer O-ai-next) code))))))))
-            (finally (c-freeaddrinfo res)))))
-      (finally (ffi/free node) (ffi/free service) (ffi/free respp) (ffi/free hints)))))
+      (loop [[a & more] addrs err nil]
+        (if (nil? a)
+          (throw (ex-info (connect-error-message host port err)
+                          {:host host :port port :error err}))
+          (let [[fd e] (native/c-socket (:family a) native/sock-stream 0)]
+            (if (neg? fd)
+              (recur more (or err e))
+              (let [[rc code] (native/c-connect fd (:addr a) (:addrlen a))]
+                (if (zero? rc)
+                  (do (native/close-on-exec! fd)
+                      (set-timeouts! fd socket-timeout-ms)
+                      fd)
+                  (do (native/c-close fd)
+                      (recur more code))))))))
+      (finally (native/free-addrs! addrs)))))
 
 (def ^:private recv-bufsize 65536)
 
@@ -290,7 +214,7 @@
   [fd]
   (let [buf (ffi/alloc recv-bufsize)]
     (try
-      (let [got (c-recv fd buf recv-bufsize 0)]
+      (let [[got _] (native/c-recv fd buf recv-bufsize 0)]
         (cond (pos? got) (ffi/read-array buf got)
               (zero? got) nil
               :else (throw (ex-info "recv failed" {}))))
@@ -302,12 +226,12 @@
       (ffi/write-array buf data)
       (loop [off 0]
         (when (< off n)
-          (let [sent (c-send fd (+ buf off) (- n off) 0)]
+          (let [[sent _] (native/c-send fd (+ buf off) (- n off) native/msg-nosignal)]
             (if (pos? sent) (recur (+ off sent))
                 (throw (ex-info "send failed" {}))))))
       (finally (ffi/free buf)))))
 
-(defn- close-sock [fd] (if windows? (c-closesocket fd) (c-close fd)) nil)
+(defn- close-sock [fd] (native/c-close fd) nil)
 
 ;; --- OpenSSL TLS client (memory-BIO) ---
 (def ^:private WANT-READ 2)
