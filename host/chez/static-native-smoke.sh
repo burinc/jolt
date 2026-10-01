@@ -164,6 +164,91 @@ EOF
   rm -rf "$app/.jolt"
 fi
 
+# --- a :static-only spec loads nothing while the build runs ------------------
+# The build resolves a :static native through the preloaded archive. Loading the
+# project's natives into the build process derived conventional shared-object
+# names from the spec's :name ("greet" -> libgreet.dylib) for a spec that
+# declares no candidates, :static ones included — so whatever the loader found
+# under that name answered the build's calls instead of the archive being
+# linked, and for {:name "crypto"} on macOS the loader found Apple's
+# libcrypto.dylib, which aborts the process that opens it. A decoy libgreet on
+# the loader's path answers 99 where the archive answers 42; a macro calls the
+# native while the build runs and bakes the answer in.
+cc -c "$work/greet.c" -o "$work/greet.o" && ar rcs "$work/libgreet.a" "$work/greet.o"
+mkdir -p "$work/decoy"
+printf 'int jolt_static_answer(void) { return 99; }\n' > "$work/decoy.c"
+cc $shared "$work/decoy.c" -o "$work/decoy/libgreet.$soext"
+cat > "$app/deps.edn" <<EOF
+{:paths ["src"]
+ :jolt/native [{:name "greet" :static {:archive "$work/libgreet.a"}}]}
+EOF
+cp "$app/src/app/core.clj" "$work/core.clj.saved"
+cat > "$app/src/app/core.clj" <<'EOF'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn answer "jolt_static_answer" [] :int)
+(defmacro answer-while-building [] (answer))
+(defn -main [& _]
+  (println "answer:" (answer) (answer-while-building)))
+EOF
+rm -rf "$app/.jolt" "$out.build"
+echo "static-native smoke: building (a :static-only spec with a same-named shared object on the loader path)"
+if ! DYLD_LIBRARY_PATH="$work/decoy" LD_LIBRARY_PATH="$work/decoy" JOLT_PWD="$app" \
+     "$jolt" build -m app.core -o "$out" >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build with a decoy shared object exited non-zero"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42 42" ]; then
+  echo "  FAIL: the build resolved a :static native through a derived shared-object name"
+  echo "--- want ---"; echo "answer: 42 42"; echo "--- got ----"; echo "$got"; exit 1
+fi
+cp "$work/core.clj.saved" "$app/src/app/core.clj"
+rm -rf "$app/.jolt" "$work/decoy"
+
+# --- one archive calling into another (jolt-lang/jolt#1205) ------------------
+# libssl.a calls into libcrypto.a; here libdep.a calls into libbase.a, and the
+# dependent one is declared FIRST. The namespace calls it while it loads, so the
+# build process itself has to resolve it — which it could not while each archive
+# was preloaded as a shared object of its own: the dependent one's reference to
+# the other stayed undefined and its load was refused.
+cat > "$work/base.c" <<'EOF'
+int jolt_static_base(void) { return 40; }
+EOF
+cat > "$work/dep.c" <<'EOF'
+int jolt_static_base(void);
+int jolt_static_dep(void) { return jolt_static_base() + 2; }
+EOF
+cc -fPIC -c "$work/base.c" -o "$work/base.o" && ar rcs "$work/libbase.a" "$work/base.o"
+cc -fPIC -c "$work/dep.c" -o "$work/dep.o" && ar rcs "$work/libdep.a" "$work/dep.o"
+cat > "$app/deps.edn" <<EOF
+{:paths ["src"]
+ :jolt/native [{:name "dep"  :static {:archive "$work/libdep.a"}}
+               {:name "base" :static {:archive "$work/libbase.a"}}]}
+EOF
+cp "$app/src/app/core.clj" "$work/core.clj.saved"
+cat > "$app/src/app/core.clj" <<'EOF'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn dep-answer "jolt_static_dep" [] :int)
+(def at-load (dep-answer))
+(defn -main [& _]
+  (println "answer:" at-load (dep-answer)))
+EOF
+rm -rf "$app/.jolt" "$out.build"
+echo "static-native smoke: building (an archive that calls into another)"
+if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build with dependent static archives exited non-zero (jolt#1205)"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42 42" ]; then
+  echo "  FAIL: dependent static archives binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+cp "$work/core.clj.saved" "$app/src/app/core.clj"
+rm -rf "$app/.jolt"
+
 # --- --dynamic: runtime load ------------------------------------------------
 # Rebuild the shared object (static phase deleted it) and give the spec a runtime
 # candidate; --dynamic loads it at startup instead of linking the archive.
@@ -323,4 +408,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + non-PIC archive + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"

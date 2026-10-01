@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling compilepathsmoke makefilesmoke versionsmoke attributioncheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
@@ -1390,6 +1390,14 @@ vfaslceiling:
 # the per-unit compile/convert caches.
 buildscaling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/build-scaling-test.ss
+
+# The build driver's :static native plumbing below `jolt build` (#1205, #1207):
+# the build-time preload resolves one archive against another (one object from
+# all of them, a dependent archive first here), a non-PIC archive in the set is
+# skipped on its own, the same archive is linked once, bld-mkdir-p ends its walk
+# at a root, and build.ss loads under a bare-name JOLT_CHEZ.
+buildnatives:
+	@$(CHEZ) --script test/chez/build-natives-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The
