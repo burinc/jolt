@@ -70,7 +70,7 @@
 
 ;; Which backend this process uses. JOLT_IO_POLLER=poll selects the WSAPoll one
 ;; on POSIX too, where native/c-poll is poll(2) with the same contract: that is
-;; how the Windows backend runs under the POSIX gates (make fibers-pollbackend),
+;; how the Windows backend runs under the POSIX gates (make fiberspoll),
 ;; rather than only on a Windows runner.
 (def ^:private poll-backend?
   (or windows? (= "poll" (jolt.host/getenv "JOLT_IO_POLLER"))))
@@ -309,11 +309,30 @@
              (if poll-backend? (native/c-send w b 1 0) (c-write w b 1))
              (finally (ffi/free b)))))))
 
+(defn- open-wake-pair! []
+  (let [[r w] (native/loopback-pair)]
+    (native/set-blocking! r false)
+    (native/set-blocking! w false)
+    (swap! state assoc :pipe [r w])))
+
+;; Under pm, as every pipe-write! is, so no writer holds the old pair's fds
+;; while they are closed.
 (defn- drain-pipe! []
   (let [r (pipe-read!) b (ffi/alloc 64)]
     (try
       (if poll-backend?
-        (loop [] (when (pos? (first (native/c-recv r b 64 0))) (recur)))
+        (loop []
+          (let [[n e] (native/c-recv r b 64 0)]
+            (cond
+              (pos? n) (recur)
+              (and (neg? n) (or (native/eagain? e) (native/eintr? e))) nil
+              ;; end of stream or a hard error: the pair is dead (reset by
+              ;; something outside), and its read end would report ready on
+              ;; every round from now on — a spinning poller. Replace it.
+              :else (let [[_ w] (:pipe @state)]
+                      (open-wake-pair!)
+                      (native/c-close r)
+                      (native/c-close w)))))
         (loop [] (when-not (neg? (c-read r b 64)) (recur))))
       (finally (ffi/free b)))))
 
@@ -522,8 +541,10 @@
                                (bit-or (if (:read fs) native/pollin 0)
                                        (if (:write fs) native/pollout 0)))))
       (swap! waits inc)
-      (let [[rc _] (native/c-poll pfds n -1)]
-        (when-not (neg? rc)
+      (let [[rc e] (native/c-poll pfds n -1)]
+        ;; a signal is not a failure: an empty round, and the next one rebuilds
+        (if (neg? rc)
+          (when (native/eintr? e) [])
           (loop [i 0 acc []]
             (if (< i n)
               (let [rev (native/pollfd-revents pfds i)
@@ -624,7 +645,10 @@
                 (let [e (get-in @state [:fds fd])]
                   (doseq [h (get-in @state [:threads fd])] (thread-wake! h))
                   ;; WSAPoll is holding the fd in its current set; wake it so the
-                  ;; next round's set leaves the fd out before its number is reused
+                  ;; next round's set leaves the fd out. The owner may close the
+                  ;; fd before that round, and a new socket given the number can
+                  ;; then see a spurious wake from the old set — harmless, every
+                  ;; woken operation retries its call
                   (when (and poll-backend? e) (pipe-write!))
                   (swap! state (fn [s] (-> s
                                            (update :cancelled disj fd)
@@ -658,13 +682,11 @@
                         (:fds s)))}))
 
 (defn- ensure-started-wsapoll! []
-  (let [[r w] (native/loopback-pair)]
-    (native/set-blocking! r false)
-    (native/set-blocking! w false)
-    (swap! state assoc :pipe [r w] :started? true)
-    (doto (Thread. wsapoll-loop "jolt-io-poller")
-      (.setDaemon true)
-      (.start))))
+  (open-wake-pair!)
+  (swap! state assoc :started? true)
+  (doto (Thread. wsapoll-loop "jolt-io-poller")
+    (.setDaemon true)
+    (.start)))
 
 (defn- ensure-started! []
   ;; under pm. One poller thread per process, started on the first fiber wait.

@@ -351,11 +351,14 @@ narrowhash:
 # Windows backend's parking, wake channel, cancel and timed waits are exercised
 # by every POSIX gate run, not only on a Windows runner.
 fiberspoll:
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poll-backend-active.clj
 	@JOLT_IO_POLLER=poll $(CHEZ) --script test/chez/fibers-io-test.ss
 	@out="$$(JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/socket-test.clj 2>&1)"; \
 	  if printf '%s' "$$out" | grep -q 'SOCKET-TEST OK'; then echo "fiberspoll: socket-test OK"; \
 	  else printf '%s\n' "$$out" | tail -5; echo "fiberspoll: socket-test FAILED"; exit 1; fi
 	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/win-parity-smoke.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-registration.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-retirement.clj
 
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
