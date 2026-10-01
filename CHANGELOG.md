@@ -82,6 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ManagementFactory/getThreadMXBean`** with the current thread's CPU clock:
+  `getCurrentThreadCpuTime`, `getCurrentThreadUserTime` (the same total — the
+  runtime's thread clock does not split user from system time) and the
+  `is...Supported`/`Enabled` checks.
 - **`Thread.getState` and the `Thread$State` enum.** NEW before `start`,
   TERMINATED after the thread ends, and while it runs what it is actually
   doing, as the JVM reports it: WAITING in an untimed wait (`join`, a promise

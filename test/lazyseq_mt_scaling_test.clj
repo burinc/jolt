@@ -21,7 +21,9 @@
 ;;   has existed, in ONE process. The ratio is the judge: the per-cell mutex
 ;;   design measures ~5 (the second arm is mostly collector), the claim ~1.75
 ;;   (two atomic operations and an unwind guard on every first force, ~28 ns).
-;;   Only the ratio is read, so machine speed and load do not matter.
+;;   Only the ratio is read, so machine speed does not matter, and both arms are
+;;   timed by the thread's CPU clock, so load from other processes does not
+;;   either (check-scaling).
 
 (ns lazyseq-mt-scaling-test)
 
@@ -88,29 +90,44 @@
       (recur (inc i) (+ acc (count (vec (map inc (take 3 (iterate inc i)))))))
       acc)))
 
-(defn- time-ms [f]
-  (let [t0 (System/nanoTime)]
-    (f)
-    (/ (- (System/nanoTime) t0) 1000000.0)))
+;; THE CLOCK IS THE THREAD'S CPU, not the wall. What this gate guards is work
+;; done ON this thread — the claim on every first force, and the collector, which
+;; runs on the thread that triggers it — and with nothing else running the two
+;; agree to the millisecond. Under load they do not: other processes holding the
+;; CPU stretch the wall time of whichever arm they overlap, and the arms cannot
+;; alternate (one of them is "before any thread"). That is how this gate failed
+;; on CI with 171ms before and ~558ms in EVERY run after (ratio 3.25) while every
+;; other run of every branch read 1.7-1.9: a load burst covering the second arm.
+;; Reproduced locally by starting 24 busy processes as the second arm begins:
+;; wall 108 -> 504ms (ratio 4.68), CPU 108 -> 215ms (ratio 2.00). Both are
+;; printed so a slow run says which kind it was.
+(def ^:private cpu-bean (java.lang.management.ManagementFactory/getThreadMXBean))
 
-;; Best of several runs per arm, each from a fresh collection: one run per arm
-;; read 1.7-2.0 on CI for months and then 3.13 (186ms, 582ms) once, under make
-;; -j beside other gates. The arms cannot alternate -- one of them is "before
-;; any thread" -- so each takes the minimum of its own runs; a burst long enough
-;; to cover all of them is not what this gate is looking for, a per-cell mutex
-;; (~5) slows every run.
+(defn- time-run [f]
+  (let [w0 (System/nanoTime)
+        c0 (.getCurrentThreadCpuTime cpu-bean)]
+    (f)
+    [(/ (- (.getCurrentThreadCpuTime cpu-bean) c0) 1000000.0)
+     (/ (- (System/nanoTime) w0) 1000000.0)]))
+
+;; Best of several runs per arm, each from a fresh collection: the minimum is the
+;; run least disturbed by anything else on the machine.
 (def ^:private runs 5)
-(defn- best-ms [f] (reduce min (repeatedly runs #(do (System/gc) (time-ms f)))))
+(defn- best [f]
+  (let [rs (vec (repeatedly runs #(do (System/gc) (time-run f))))]
+    [(reduce min (map first rs)) (reduce min (map second rs))]))
 
 (defn- check-scaling []
   (work)                                                ; warm
-  (let [before (best-ms work)
+  (let [[before-cpu before-wall] (best work)
         t (Thread. (fn [] nil))]
     (.start t) (.join t)                               ; a thread has EXISTED; it need not be alive
-    (let [after (best-ms work)
-          ratio (/ after before)]
-      (println (format "lazyseq-mt-scaling: %.0fms before any thread, %.0fms after one existed, ratio %.2f (ceiling %.1f)"
-                       before after ratio max-ratio))
+    (let [[after-cpu after-wall] (best work)
+          ratio (/ after-cpu before-cpu)]
+      (println (format (str "lazyseq-mt-scaling: CPU %.0fms before any thread, %.0fms after one existed, "
+                            "ratio %.2f (ceiling %.1f); wall %.0fms -> %.0fms, ratio %.2f")
+                       before-cpu after-cpu ratio max-ratio
+                       before-wall after-wall (/ after-wall before-wall)))
       (when (> ratio max-ratio)
         (fail (str "lazy realization slows down once a thread has existed — a mutex is being "
                    "allocated per lazy cell again (host/chez/seq.ss seq-more / "

@@ -953,11 +953,11 @@
   {:category :host-model
    :behavior "java.lang.management.ManagementFactory/getMemoryMXBean and the MXBean API"
    :jvm "returns a MemoryMXBean reporting heap/non-heap usage, GC counts, and more"
-   :jolt "absent; resolve answers nil and the call raises \"Unknown class java.lang.management.ManagementFactory\""
-   :check {:expr "(pr-str (resolve 'java.lang.management.ManagementFactory))"
-           :jvm "\"java.lang.management.ManagementFactory\""
-           :jolt "\"nil\""}
-   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}
+   :jolt "absent: ManagementFactory answers only getThreadMXBean (the current thread's CPU clock); getMemoryMXBean and the rest raise"
+   :check {:expr "(try (java.lang.management.ManagementFactory/getMemoryMXBean) :present (catch Throwable e :absent))"
+           :jvm ":present"
+           :jolt ":absent"}
+   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is the rest of JMX. Affects criterium's benchmark reporting, not its timing."}
   ;; A recv error reads as EOF: io-call classifies the captured errno itself and
   ;; returns only the syscall result, so ECONNRESET reaches the read side as a
   ;; bare -1 with no way to raise Java's SocketException for it.

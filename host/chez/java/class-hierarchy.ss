@@ -1073,6 +1073,11 @@
 (jch-register-supers! "java.util.concurrent.CompletableFuture$DelayedExecutor"
                       '("java.util.concurrent.Executor"))
 (jch-register-supers! "java.util.concurrent.Future$State" '("java.lang.Enum"))
+;; ManagementFactory/getThreadMXBean (concurrency.ss): the JDK's own class for it.
+(jch-register-supers! "java.lang.management.ManagementFactory" '())
+(jch-register-supers! "java.lang.management.ThreadMXBean" '())
+(jch-mark-interface! "java.lang.management.ThreadMXBean")
+(jch-register-supers! "com.sun.management.internal.HotSpotThreadImpl" '("java.lang.management.ThreadMXBean"))
 ;; locks, latches and the four atomics. Every one of these had a shim with
 ;; methods and NO class row, so (class x) answered the :object placeholder and
 ;; (instance? java.util.concurrent.locks.Lock a-reentrant-lock) was false.
@@ -1194,6 +1199,7 @@
     ("scheduled-future" . "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask")
     ("completable-future" . "java.util.concurrent.CompletableFuture")
     ("thread-group" . "java.lang.ThreadGroup")
+    ("thread-mx-bean" . "com.sun.management.internal.HotSpotThreadImpl")
     ("thread-state" . "java.lang.Thread$State")
     ("cf-delayed-executor" . "java.util.concurrent.CompletableFuture$DelayedExecutor")
     ("future-state" . "java.util.concurrent.Future$State")

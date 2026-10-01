@@ -2207,6 +2207,26 @@
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "thread-state")))
                       (lambda (x) (jhost-state x)))
 
+;; --- java.lang.management.ThreadMXBean (the current thread's CPU clock) -----
+;; ManagementFactory/getThreadMXBean, for what callers time with it: the CPU time
+;; of the CALLING thread, which — unlike wall time — does not grow while other
+;; processes hold the CPU. Chez's thread clock counts user and system time
+;; together, so getCurrentThreadUserTime answers the same total (the JVM's
+;; excludes system time; it is never larger than the CPU time on either).
+(define (current-thread-cpu-nanos)
+  (let ((t (current-time 'time-thread)))
+    (+ (* (time-second t) 1000000000) (time-nanosecond t))))
+(define the-thread-mx-bean (make-jhost "thread-mx-bean" #f))
+(register-host-methods! "thread-mx-bean"
+  (list (cons "getCurrentThreadCpuTime" (lambda (self) (current-thread-cpu-nanos)))
+        (cons "getCurrentThreadUserTime" (lambda (self) (current-thread-cpu-nanos)))
+        (cons "isCurrentThreadCpuTimeSupported" (lambda (self) #t))
+        (cons "isThreadCpuTimeSupported" (lambda (self) #t))
+        (cons "isThreadCpuTimeEnabled" (lambda (self) #t))))
+(let ((statics (list (cons "getThreadMXBean" (lambda () the-thread-mx-bean)))))
+  (register-class-statics! "ManagementFactory" statics)
+  (register-class-statics! "java.lang.management.ManagementFactory" statics))
+
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))
           '("CountDownLatch" "java.util.concurrent.CountDownLatch"))
