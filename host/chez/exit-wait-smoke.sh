@@ -53,6 +53,10 @@ held() { # label program
 # -- pending work on non-daemon threads is waited for --------------------------
 ends "pending future is finished" 0 ":done" \
   '(future (Thread/sleep 1000) (println :done)) (shutdown-agents)'
+# a future is an agent-pool thread, not a daemon, even when a daemon thread
+# (core.async's) starts it
+ends "a future started on a daemon thread is finished" 0 ":done" \
+  "(require '[clojure.core.async :as a]) (a/<!! (a/thread (future (Thread/sleep 1000) (println :done)))) (future (Thread/sleep 1500) (shutdown-agents))"
 ends "pending pmap is finished" 0 "\[2 3\]" '(println (vec (pmap inc [1 2]))) (shutdown-agents)'
 ends "pending send-off is finished" 0 ":done" \
   '(send-off (agent 0) (fn [_] (Thread/sleep 1000) (println :done))) (shutdown-agents)'

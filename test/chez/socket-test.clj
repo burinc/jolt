@@ -3,7 +3,8 @@
 ;; for "SOCKET-TEST OK"). Every server binds port 0 (kernel-assigned), so
 ;; parallel gates never collide on a port.
 (ns socket-test
-  (:require [clojure.string :as str]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 (require 'jolt.socket)
 
@@ -393,6 +394,130 @@
     (check-eq "the woken fiber left the next socket's bytes alone"
               (.read (.getInputStream b)) (int \B))
     (finally (.close b-peer) (.close b) (.close a-peer) (.close server))))
+
+;; Half-close (jolt-lang/jolt#1208): shutdownOutput sends FIN and keeps the read
+;; direction, shutdownInput reads EOF and keeps the write direction, and the two
+;; is*Shutdown predicates report it. Every expected value below is what JDK 21
+;; answers for the same forms over loopback TCP (certify.clj over these forms as
+;; corpus rows: 6/6 certified). They cannot live in the corpus itself, whose
+;; runner has no jolt.socket to install.
+(defn- sock-msg [f]
+  (try (f) :ok (catch java.net.SocketException e (.getMessage e))))
+
+(with-pair
+  (fn [server c s]
+    (.write (.getOutputStream c) 120)
+    (let [before (.isOutputShutdown c)
+          _ (.shutdownOutput c)
+          si (.getInputStream s)]
+      (.write (.getOutputStream s) 122)
+      (check-eq "shutdownOutput sends the peer EOF and leaves this side reading"
+                [before (.isOutputShutdown c) (.isInputShutdown c)
+                 (.read si) (.read si) (.read si)
+                 (.read (.getInputStream c)) (.isClosed c) (.isConnected c)]
+                [false true false 120 -1 -1 122 false true]))))
+
+(with-pair
+  (fn [server c s]
+    (let [o (.getOutputStream c)]
+      (.shutdownOutput c)
+      (check-eq "after shutdownOutput a write throws and the state is named"
+                [(sock-msg #(.write o 1)) (sock-msg #(.write o (byte-array [1 2])))
+                 (sock-msg #(.write o (byte-array 0))) (sock-msg #(.flush o))
+                 (sock-msg #(.shutdownOutput c)) (sock-msg #(.getOutputStream c))
+                 (sock-msg #(.getInputStream c))]
+                ["Broken pipe" "Broken pipe" :ok :ok "Socket output is already shutdown"
+                 "Socket output is shutdown" :ok]))))
+
+(with-pair
+  (fn [server c s]
+    (.write (.getOutputStream s) 113)
+    (Thread/sleep 100)
+    (let [i (.getInputStream c)]
+      (.shutdownInput c)
+      (check-eq "shutdownInput reads EOF over pending data and leaves this side writing"
+                [(.isInputShutdown c) (.isOutputShutdown c)
+                 (.read i) (.read i (byte-array 4)) (.read i (byte-array 4) 0 4)
+                 (.read i (byte-array 0)) (.available i)
+                 (.readLine (java.io.BufferedReader. (java.io.InputStreamReader. i)))
+                 (sock-msg #(.getInputStream c)) (sock-msg #(.shutdownInput c))
+                 (do (.write (.getOutputStream c) 119) (.read (.getInputStream s)))]
+                [true false -1 -1 -1 0 0 nil "Socket input is shutdown"
+                 "Socket input is already shutdown" 119]))))
+
+(let [u (java.net.Socket.)]
+  (check-eq "a half-close needs a connected, open socket"
+            [(sock-msg #(.shutdownOutput u)) (sock-msg #(.shutdownInput u))
+             (.isOutputShutdown u) (.isInputShutdown u)
+             (sock-msg #(.getInputStream u)) (sock-msg #(.getOutputStream u))
+             (do (.close u) (sock-msg #(.shutdownOutput u))) (sock-msg #(.getInputStream u))]
+            ["Socket is not connected" "Socket is not connected" false false
+             "Socket is not connected" "Socket is not connected"
+             "Socket is closed" "Socket is closed"]))
+
+(with-pair
+  (fn [server c s]
+    (.shutdownOutput c)
+    (.close c)
+    (check-eq "the half-closed state outlives close, which then refuses a shutdown"
+              [(.isOutputShutdown c) (.isInputShutdown c) (sock-msg #(.shutdownOutput c))
+               (sock-msg #(.shutdownInput c)) (sock-msg #(.getInputStream c))]
+              [true false "Socket is closed" "Socket is closed" "Socket is closed"])))
+
+(with-pair
+  (fn [server c s]
+    (let [f (future (.read (.getInputStream c)))]
+      (Thread/sleep 200)
+      (.shutdownInput c)
+      (check-eq "shutdownInput wakes a thread blocked in read with EOF"
+                (deref f 5000 :blocked) -1))))
+
+;; On a fiber the read is parked on the poller rather than blocked in recv, and
+;; the shutdown has to reach it the same way.
+(with-pair
+  (fn [server c s]
+    (let [p (promise)
+          in (.getInputStream c)]
+      (fib/spawn (fn [] (deliver p (try (.read in) (catch Throwable e [:threw (str e)])))))
+      (Thread/sleep 200)
+      (.shutdownInput c)
+      (check-eq "shutdownInput wakes a fiber blocked in read with EOF"
+                (deref p 5000 :blocked) -1))))
+
+;; The peer of a half-closed socket sees a whole conversation: request, FIN,
+;; then the response and the close — what a proxy pumping one direction does.
+(with-pair
+  (fn [server c s]
+    (let [co (.getOutputStream c)]
+      (.write co (.getBytes "request" "UTF-8"))
+      (.shutdownOutput c)
+      ;; not slurp: it closes the stream, and closing a socket's stream closes
+      ;; the socket, on the JVM as here
+      (let [in (.getInputStream s)
+            req (loop [acc []]
+                  (let [b (.read in)]
+                    (if (neg? b) (String. (byte-array acc) "UTF-8") (recur (conj acc b)))))]
+        (.write (.getOutputStream s) (.getBytes (str "echo:" req) "UTF-8"))
+        (.close s)
+        (check-eq "a request half-closed by the client reads to EOF, and the reply arrives"
+                  (slurp (.getInputStream c)) "echo:request")))))
+
+;; A socket's streams are java.io streams to clojure.java.io: io/reader,
+;; io/writer, io/input-stream, io/output-stream and io/copy all raised "Cannot
+;; open" over them, so the ordinary (io/reader (.getInputStream sock)) did not
+;; work. Measured against JDK 21 (the flush is the JVM's: io/output-stream is a
+;; BufferedOutputStream there).
+(with-pair
+  (fn [server c s]
+    (io/copy "abc\n" (.getOutputStream c))
+    (let [w (io/writer (.getOutputStream c))] (.write w "de\n") (.flush w))
+    (let [o (io/output-stream (.getOutputStream c))]
+      (io/copy (.getBytes "x\ny\n" "UTF-8") o)
+      (.flush o))
+    (.shutdownOutput c)
+    (check-eq "clojure.java.io reads and writes a socket's streams"
+              [(vec (line-seq (io/reader (io/input-stream (.getInputStream s))))) (.isClosed c)]
+              [["abc" "de" "x" "y"] false])))
 
 ;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
 ;; It answered 0 always, which java.io permits ("an estimate") but which leaves

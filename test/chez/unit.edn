@@ -379,6 +379,10 @@
   ;; over a timeout channel, which parks untimed). Probed on JVM Clojure 1.12.5 +
   ;; core.async 1.9.865 / JDK 21: ["WAITING" "WAITING" "WAITING"].
   {:suite "threads / state" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) d (a/chan) ts [(Thread. (fn [] (a/<!! c))) (Thread. (fn [] (a/>!! d 1))) (Thread. (fn [] (a/alts!! [(a/chan) (a/timeout 10000)])))]] (doseq [t ts] (.setDaemon t true) (.start t)) (Thread/sleep 200) (let [r (mapv (fn [t] (str (.getState t))) ts)] (a/close! c) (a/<!! d) r)))" :expected "[\"WAITING\" \"WAITING\" \"WAITING\"]"}
+  ;; A future and a send-off run on the agent pools, whose threads are never
+  ;; daemons, even when a daemon thread (here core.async's) starts them; they used
+  ;; to inherit the creator's status. JVM: [false false].
+  {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] (a/<!! (a/thread [(deref (future (me)) 5000 :hung) (let [ag (agent nil) p (promise)] (send-off ag (fn [_] (deliver p (me)))) (deref p 5000 :hung))]))))" :expected "[false false]"}
   {:suite "threads / name" :expr "(.getName (Thread/currentThread))" :expected "\"main\""}
   {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))))) (not= \"main\" (deref p 5000 :timeout)))" :expected "true"}
   {:suite "threads / name" :expr "(let [p (promise) t (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))) \"worker-x\")] (.start t) [(.getName t) (deref p 5000 :timeout)])" :expected "[\"worker-x\" \"worker-x\"]"}
@@ -531,6 +535,11 @@
   ;; JVM's does (it returns from take!/put! without reaching the promise).
   {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (deref (future (.interrupt (Thread/currentThread)) (let [c (a/chan) d (a/chan)] [(try (a/<!! c) (catch InterruptedException e :interrupted)) (Thread/interrupted) (do (.interrupt (Thread/currentThread)) (try (a/>!! c 1) (catch InterruptedException e :interrupted))) (Thread/interrupted) (a/poll! c) (do (.interrupt (Thread/currentThread)) (try (a/alts!! [c [d 1]]) (catch InterruptedException e :interrupted))) (Thread/interrupted) (a/poll! d) (a/offer! c 1)])) 5000 :hung))" :expected "[:interrupted false :interrupted false nil :interrupted false nil nil]"}
   {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (deref (future (let [c (a/chan 2)] (a/>!! c 1) (.interrupt (Thread/currentThread)) [(a/<!! c) (a/>!! c 2) (first (a/alts!! [c])) (Thread/interrupted)])) 5000 :hung))" :expected "[1 true 2 true]"}
+  ;; ...including a put to an unbuffered channel a thread is already blocked
+  ;; taking from: the taker was counted, so the put completes without waiting and
+  ;; the flag stays set. It used to wait, see the flag, withdraw the value and
+  ;; throw, leaving the taker blocked. JVM core.async answers [true true 1].
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) t (a/thread (a/<!! c))] (Thread/sleep 100) (deref (future (.interrupt (Thread/currentThread)) [(try (a/>!! c 1) (catch InterruptedException e :interrupted)) (Thread/interrupted) (first (a/alts!! [t (a/timeout 5000)]))]) 5000 :hung)))" :expected "[true true 1]"}
   ;; <! is a PARK, and a parked go block holds no thread to interrupt, so a go body
   ;; on the default :thread backend waits on through an interrupt of the thread it
   ;; runs on and sees the flag still set afterwards.

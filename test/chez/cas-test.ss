@@ -132,6 +132,37 @@
 (ok "3. every atom reached the final round"
     (let check ((i 0)) (or (fx=? i n3) (and (eqv? (jolt-deref (car (vector-ref pairs i))) rounds) (check (fx+ i 1))))))
 
+;; --- 4. sa-box-cas! with neighbouring boxes under set-box! ------------------
+;; box-cas! is the same one-shot ldxr/stxr. CompletableFuture's either-stages
+;; claim the winning side with it, so a spurious #f there dropped a completion.
+(printf "\n== 4. sa-box-cas! with 8 threads set-box!-ing the neighbouring box ==\n")
+(define b0 (box 'a))
+(ok "4. sa-box-cas! swaps when the box is eq? to old" (eq? #t (sa-box-cas! b0 'a 'x)))
+(ok "4. ...and refuses when it is not" (eq? #f (sa-box-cas! b0 'a 'y)))
+(ok "4. ...and the box stayed" (eq? (unbox b0) 'x))
+(define n4 500000)
+(define bpairs (let ((v (make-vector n4)))
+                 (let fill ((i 0))
+                   (when (fx<? i n4)
+                     (vector-set! v i (cons (box 0) (box 0)))
+                     (fill (fx+ i 1))))
+                 v))
+(define spurious4
+  (with-writers
+    (lambda (i) (set-box! (cdr (vector-ref bpairs (fxmod i n4))) i))
+    (lambda ()
+      (let round ((r 0) (bad 0))
+        (if (fx<? r rounds)
+            (round (fx+ r 1)
+                   (let loop ((i 0) (bad bad))
+                     (if (fx<? i n4)
+                         (loop (fx+ i 1)
+                               (if (sa-box-cas! (car (vector-ref bpairs i)) r (fx+ r 1)) bad (fx+ bad 1)))
+                         bad)))
+            bad)))))
+(printf "  ~a attempts, ~a spurious failure(s)\n" (* n4 rounds) spurious4)
+(ok "4. sa-box-cas! never refused a box that held the expected value" (= spurious4 0))
+
 (printf "\ncas-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "cas-test: PASS — compare-and-swap is strong\n") (exit 0))

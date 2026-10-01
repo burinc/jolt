@@ -62,6 +62,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failedStage` and `minimalCompletionStage` (the `MinimalStage` view), and
   `defaultExecutor`.
 
+- **`ManagementFactory/getThreadMXBean`** with the current thread's CPU clock:
+  `getCurrentThreadCpuTime`, `getCurrentThreadUserTime` (the same total — the
+  runtime's thread clock does not split user from system time) and the
+  `is...Supported`/`Enabled` checks.
+- **`Thread.getState` and the `Thread$State` enum.** NEW before `start`,
+  TERMINATED after the thread ends, and while it runs what it is actually
+  doing, as the JVM reports it: WAITING in an untimed wait (`join`, a promise
+  or future deref, `<!!`/`>!!`, `Object.wait`, a latch, a queue `take`, a
+  `ReentrantLock` acquire), TIMED_WAITING in a timed one (`Thread/sleep`, a
+  timed deref, `wait` or `await`), BLOCKED waiting to enter a `locking`
+  monitor, RUNNABLE otherwise. `Thread$State/values` and `valueOf` work. A
+  fiber's state is left to the fiber layer through a hook.
+- **`java.lang.ThreadGroup` and `Thread.getThreadGroup`.** A minimal model of
+  the JVM's: the built-in `system` group and its child `main`, which every
+  thread is in unless placed elsewhere (as the JVM's main thread, its pools'
+  and its futures' threads are); `(ThreadGroup. name)` and
+  `(ThreadGroup. parent name)`; the `Thread` constructors that take a group;
+  a new `Thread` in its creator's group; `getName`, `getParent`, `parentOf`,
+  `activeCount` (live threads in the group and its subgroups),
+  `activeGroupCount`, `getMaxPriority`; `Thread/activeCount`; and
+  `getThreadGroup` answering nil once a thread has terminated.
+  `(Thread. "name")` now takes its string as the name rather than as a target.
+
+- **`Socket.shutdownOutput`, `shutdownInput`, `isOutputShutdown` and
+  `isInputShutdown`.** The half-close, as on the JVM: after `shutdownOutput`
+  the peer reads EOF, this side still reads, and a write throws "Broken
+  pipe"; after `shutdownInput` reads return EOF, even over data that had
+  already arrived, and writes still work. A read blocked on another thread or
+  parked on a fiber wakes with EOF. A second call, a closed or unconnected
+  socket, and `getInputStream`/`getOutputStream` of a shut-down side throw
+  `SocketException` with the JDK's messages, and the state survives `close`.
+  `getInputStream` and `getOutputStream` of an unconnected socket now throw
+  "Socket is not connected" as the JDK's do. Without the half-close a proxy
+  closing a socket its peer was still reading got a reset on Windows (#1208).
+
 ### Changed
 
 - **The process waits for its non-daemon threads before it exits, as the JVM
@@ -104,31 +139,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them running); `ThreadPoolExecutor.allowCoreThreadTimeOut` is implemented;
   and `put!`/`take!` callbacks, `core.async`'s mixed and compute executors and
   the io poller run on daemon threads, so none of them holds the process up.
-
-### Added
-
-- **`ManagementFactory/getThreadMXBean`** with the current thread's CPU clock:
-  `getCurrentThreadCpuTime`, `getCurrentThreadUserTime` (the same total — the
-  runtime's thread clock does not split user from system time) and the
-  `is...Supported`/`Enabled` checks.
-- **`Thread.getState` and the `Thread$State` enum.** NEW before `start`,
-  TERMINATED after the thread ends, and while it runs what it is actually
-  doing, as the JVM reports it: WAITING in an untimed wait (`join`, a promise
-  or future deref, `<!!`/`>!!`, `Object.wait`, a latch, a queue `take`, a
-  `ReentrantLock` acquire), TIMED_WAITING in a timed one (`Thread/sleep`, a
-  timed deref, `wait` or `await`), BLOCKED waiting to enter a `locking`
-  monitor, RUNNABLE otherwise. `Thread$State/values` and `valueOf` work. A
-  fiber's state is left to the fiber layer through a hook.
-- **`java.lang.ThreadGroup` and `Thread.getThreadGroup`.** A minimal model of
-  the JVM's: the built-in `system` group and its child `main`, which every
-  thread is in unless placed elsewhere (as the JVM's main thread, its pools'
-  and its futures' threads are); `(ThreadGroup. name)` and
-  `(ThreadGroup. parent name)`; the `Thread` constructors that take a group;
-  a new `Thread` in its creator's group; `getName`, `getParent`, `parentOf`,
-  `activeCount` (live threads in the group and its subgroups),
-  `activeGroupCount`, `getMaxPriority`; `Thread/activeCount`; and
-  `getThreadGroup` answering nil once a thread has terminated.
-  `(Thread. "name")` now takes its string as the name rather than as a target.
 
 ### Fixed
 
@@ -252,6 +262,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ifPresent` are called through their method; they failed the same way.
 - **A timed `Future.get` that runs out raises `TimeoutException` with no
   message**, as the JVM does. It said "timed out waiting for the task".
+
+- **A `:static` native no longer loads a shared object by its name.** For a
+  `:jolt/native` spec that declares no candidates for the platform, `jolt run`
+  and `jolt build` try the conventional names of its `:name`
+  (`libcrypto.dylib` for `"crypto"`) — for `:static` specs too, whose symbols
+  come from their archive. Whatever the loader found then answered the build's
+  calls in place of the archive, and for `{:name "crypto" :static …}` on macOS
+  it found Apple's `libcrypto.dylib`, which aborts the process. A `:static`
+  spec now loads only the candidates it declares.
+- **`clojure.java.io` takes a socket's streams.** `io/reader`, `io/writer`,
+  `io/input-stream`, `io/output-stream`, `io/copy`, `slurp` and `spit` all
+  raised "Cannot open" over a `Socket`'s `getInputStream` or
+  `getOutputStream`, so `(line-seq (io/reader (.getInputStream sock)))` did
+  not work. They drive them as the `java.io` streams they are.
+
+- **`jolt.loader` opens `file:` resource hits on Windows.** It dropped the
+  scheme with `(subs url 5)`, so a resource's `file:/C:/proj/…` became
+  `/C:/proj/…`, which Windows reads as a path on the current drive; on every
+  platform a `%20` escape or a `localhost` authority stayed in the path. The
+  path is now read through `clojure.java.io`'s `file:` URL handling. A
+  classpath root's hit carries the URL the JDK's classloader would
+  (`File.toURI`: `file:/C:/…`, escaped) instead of `file:C:/…` with the name
+  unescaped (#1203).
+- **`jolt build` creates a missing output directory from a Windows path.** The
+  walk that creates `<out>.build` (and the AOT cache's directories) took a
+  path's parent by splitting on `/` only, so `C:\proj\out\app.exe` had no
+  parent and the walk handed `#f` to a string comparison. It now splits on
+  both separators and stops at a drive or UNC root. A bare-name `JOLT_CHEZ`
+  (`scheme`, found on `PATH`) no longer fails the same way when `build.ss`
+  loads (#1207).
+- **`:static` archives that call into each other build.** To let the app's
+  foreign calls resolve while it builds, each `:static {:archive …}` native was
+  turned into a throwaway shared object of its own, so one archive calling into
+  another (OpenSSL's `libssl.a` into `libcrypto.a`) was left with undefined
+  references: Windows refused to load it, and so did macOS and Linux whenever
+  the dependent archive was declared first. The build now makes one object from
+  all of the app's archives. An archive that is not position-independent is
+  still skipped with a warning without affecting the rest, and an archive two
+  natives name is linked once (#1205).
+- **Windows static builds link OpenSSL 3.** The Windows link line lacked
+  `-lcrypt32`, and OpenSSL 3's static `libcrypto.a` calls the CryptoAPI
+  certificate store, so an app linking it as a `:static` native failed its
+  final link. The build-time preload of `:static` archives now also links the
+  same system libraries on Windows, where a DLL has to resolve its imports
+  when it loads (#1206).
 
 ## [0.8.15] - 2026-09-29
 
@@ -2109,7 +2164,6 @@ boot revived with the gates that keep it alive.
   overtaken class land as any library's on a runtime class do, and the warning
   names the library to upgrade. The refusal remains what it was for: two
   declared providers of one class.
-
 
 ## [0.8.8] - 2026-09-15
 

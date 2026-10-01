@@ -350,8 +350,10 @@
 (define agent-threads-daemon? #f)
 (def-var! "jolt.host" "agent-threads-daemon!"
   (lambda () (set! agent-threads-daemon? #t) jolt-nil))
+;; Otherwise an agent pool thread is never a daemon, whatever thread starts it,
+;; as clojure.core's pools are not, so the exit waits for it.
 (define (fork-agent-thread thunk)
-  (if agent-threads-daemon? (fork-thread/daemon #t thunk) (fork-thread thunk)))
+  (fork-thread/daemon agent-threads-daemon? thunk))
 (define solo-pool-keep-alive-ms 60000)     ; Executors.newCachedThreadPool's 60L, SECONDS
 (define (exit-linger-after-task!)
   (unless (jolt-thread-daemon? (get-thread-id))
@@ -3839,7 +3841,7 @@
   (cf-require! f)
   (let* ((b (cf-as-cf other)) (d (make-cf)) (claimed (box #f))
          (fire (lambda (r)
-                 (when (box-cas! claimed #f #t)
+                 (when (sa-box-cas! claimed #f #t)
                    (if (cf-alt? r)
                        (cf-settle! d (cf-encode-relay r) #f)
                        (cf-fire! d exec

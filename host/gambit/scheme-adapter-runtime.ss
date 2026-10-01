@@ -70,6 +70,14 @@
             (begin (vector-set! r k new) #t)
             #f)))))
 
+;; sa-box-cas!: the same swap on a box, under the same mutex.
+(define (sa-box-cas! b old new)
+  (jwm-call sa-record-cas-mu
+    (lambda ()
+      (if (eq? (unbox b) old)
+          (begin (set-box! b new) #t)
+          #f))))
+
 (define (sa-gc-collect)
   #f)
 
