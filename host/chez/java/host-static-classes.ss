@@ -569,11 +569,25 @@
 ;; jolt-invokes its argument refused the reify with "cannot be cast to
 ;; clojure.lang.IFn" — (.computeIfAbsent m k (reify Function (apply [_ k] …)))
 ;; failed that way while the comment below said it worked.
-(define (jolt-fi-call f method . args)
-  (cond ((procedure? f) (apply jolt-invoke f args))
-        ((iface-method f method (fx+ 1 (length args)))
-         (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args))))
-        (else (apply jolt-invoke f args))))
+;; The fixed arities keep a plain fn's call free of the rest list and apply.
+(define jolt-fi-call
+  (case-lambda
+    ((f method)
+     (if (and (not (procedure? f)) (iface-method f method 1))
+         (record-method-dispatch f method jolt-nil)
+         (jolt-invoke f)))
+    ((f method a)
+     (if (and (not (procedure? f)) (iface-method f method 2))
+         (record-method-dispatch f method (list->cseq (list a)))
+         (jolt-invoke1 f a)))
+    ((f method a b)
+     (if (and (not (procedure? f)) (iface-method f method 3))
+         (record-method-dispatch f method (list->cseq (list a b)))
+         (jolt-invoke2 f a b)))
+    ((f method . args)
+     (if (and (not (procedure? f)) (iface-method f method (fx+ 1 (length args))))
+         (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args)))
+         (apply jolt-invoke f args)))))
 (define hashmap-methods
   (list (cons "put" (lambda (self k v) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                                           (hm-note-key! self k)

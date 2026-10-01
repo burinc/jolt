@@ -108,7 +108,9 @@
   (let* ((ibox (box #f))
          (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) ibox))
          (snap (dyn-binding-stack)))
-    (fork-thread
+    ;; a future runs on clojure.core's agent pool, whose threads are never daemons,
+    ;; whatever thread asked for it
+    (fork-thread/daemon #f
      (lambda ()
        (*txn* #f)                          ; child thread must not inherit parent's txn
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
@@ -391,7 +393,8 @@
     (jagent-q-push! a (cons f args))
     (unless (jolt-agent-running? a)
       (jolt-agent-running?-set! a #t)
-      (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
+      ;; an agent pool thread, never a daemon (as a future's)
+      (fork-thread/daemon #f (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
   a)
 
 ;; Dispatch the held nested sends accumulated on this thread, returning the count
@@ -676,7 +679,7 @@
           (cond (clear? (jagent-q-clear! a))
                 ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
                  (jolt-agent-running?-set! a #t)
-                 (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
+                 (fork-thread/daemon #f (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
   ;; Agent.restart answers the NEW STATE, not the agent (and clear-agent-errors,
   ;; which is restart-agent over the current state, answers that state in turn).
   new-state)
@@ -3345,7 +3348,7 @@
   (cf-require! f)
   (let* ((b (cf-as-cf other)) (d (make-cf)) (claimed (box #f))
          (fire (lambda (r)
-                 (when (box-cas! claimed #f #t)
+                 (when (sa-box-cas! claimed #f #t)
                    (if (cf-alt? r)
                        (cf-settle! d (cf-encode-relay r) #f)
                        (cf-fire! d exec

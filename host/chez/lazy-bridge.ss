@@ -288,16 +288,18 @@
 ;; a (Thread. f) built, of the handle Thread/currentThread gives the thread itself,
 ;; or of the handle getAllStackTraces gives someone else, and all three must agree.
 ;; So it lives here, where every thread is born, and not in any one
-;; representation. Only daemons have an entry (absent is false, as for the boot
-;; thread), and an entry is never dropped, as the name table in io.ss is not:
-;; a thread that has finished still answers what it was.
+;; representation. Only live daemons have an entry (absent is false, as for the
+;; boot thread): the entry goes when the thread ends, since ids are never reused
+;; and a program forking daemons would otherwise grow the table without bound. A
+;; (Thread. f) object keeps its own flag, so it still answers once finished.
 ;;
 ;; A thread is born with its creator's status, which is the JVM's rule for a new
 ;; Thread. A fork site that stands for a JVM thread whose status is FIXED — a
 ;; pool's worker made by Executors.defaultThreadFactory (never a daemon), a
 ;; core.async or ForkJoin thread (always one) — says so with fork-thread/daemon.
-;; The answer is recorded by the parent after the fork and by the child as its
-;; first act, under live-threads-mutex, so it is there whichever runs first.
+;; The answer is recorded by the child as its first act and by the parent after
+;; the fork, under live-threads-mutex, so it is there whichever runs first; the
+;; parent records nothing for a child that has already finished.
 (define thread-daemons (make-eqv-hashtable))              ; id -> #t
 (define (jolt-thread-daemon? id)
   (jolt-with-mutex live-threads-mutex (hashtable-ref thread-daemons id #f)))
@@ -324,16 +326,18 @@
                       thunk
                       (lambda ()
                         (jolt-with-mutex live-threads-mutex
+                          (hashtable-delete! thread-daemons id)
                           (if (hashtable-contains? live-threads id)
                               (hashtable-delete! live-threads id)
                               (hashtable-set! live-threads id 'done)))))))))))
          (id (sa-thread-id-of t)))
     (when id
-      (thread-daemon-record! id d)
       (jolt-with-mutex live-threads-mutex
         (if (eq? 'done (hashtable-ref live-threads id #f))
             (hashtable-delete! live-threads id)
-            (hashtable-set! live-threads id #t))))
+            (begin
+              (hashtable-set! live-threads id #t)
+              (if d (hashtable-set! thread-daemons id #t) (hashtable-delete! thread-daemons id))))))
     t))
 (define (fork-thread thunk) (%ls-fork-thread #t 'inherit thunk))
 ;; (fork-thread/daemon d thunk): a thread whose daemon status is D whoever forks it.

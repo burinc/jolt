@@ -375,6 +375,10 @@
   ;; own: a go block on a fiber answers for its carrier, which is a daemon too.
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] [(a/<!! (a/thread (me))) (a/<!! (a/go (me))) (a/<!! (a/thread (.isDaemon (Thread. (fn []))))) (a/<!! (a/io-thread (me))) (a/<!! (a/thread-call me :compute))]))" :expected "[true true true true true]"}
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (a/<!! (a/go [(jolt.host/fiber?) (.isDaemon (Thread/currentThread))]))))" :expected "[true true]"}
+  ;; A future and a send-off run on the agent pools, whose threads are never
+  ;; daemons, even when a daemon thread (here core.async's) starts them; they used
+  ;; to inherit the creator's status. JVM: [false false].
+  {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] (a/<!! (a/thread [(deref (future (me)) 5000 :hung) (let [ag (agent nil) p (promise)] (send-off ag (fn [_] (deliver p (me)))) (deref p 5000 :hung))]))))" :expected "[false false]"}
   {:suite "threads / name" :expr "(.getName (Thread/currentThread))" :expected "\"main\""}
   {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))))) (not= \"main\" (deref p 5000 :timeout)))" :expected "true"}
   {:suite "threads / name" :expr "(let [p (promise) t (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))) \"worker-x\")] (.start t) [(.getName t) (deref p 5000 :timeout)])" :expected "[\"worker-x\" \"worker-x\"]"}
