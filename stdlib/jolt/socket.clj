@@ -390,7 +390,7 @@
     (throw (java.net.SocketException. "Socket is not connected"))))
 
 ;; shutdownInput / shutdownOutput (jolt-lang/jolt#1208). The flag is the JDK's
-;; isInputShutdown / isOutputShutdown: set once the call succeeds, kept after
+;; isInputShutdown / isOutputShutdown: set by a call that succeeds, kept after
 ;; close, and asked by the streams, since what the JDK answers after a half-close
 ;; is decided by the flag rather than by the kernel — a read after shutdownInput
 ;; is EOF even over data that had already arrived, which Linux would still hand
@@ -401,15 +401,18 @@
   (ensure-socket-connected! self)
   (when (jolt.host/ref-get self flag)
     (throw (java.net.SocketException. already)))
+  ;; the flag goes up before the call: the shutdown wakes a parked read, which
+  ;; must find it set rather than recv data SHUT_RD left queued
+  (jolt.host/ref-put! self flag true)
   (with-op self
     (let [[r e] (c-shutdown (jolt.host/ref-get self :fd) how)]
       ;; ENOTCONN is not an error here, as it is not in the JDK's Net.shutdown:
       ;; macOS answers it once both directions have seen a FIN, and the socket
       ;; is then as shut down as the caller asked
       (when (and (neg? r) (not= e ENOTCONN))
+        (jolt.host/ref-put! self flag false)
         (throw (java.net.SocketException.
                  (if windows? (str "shutdown failed: WSA error " e) (ffi/errno-message e)))))))
-  (jolt.host/ref-put! self flag true)
   nil)
 
 (defn- socket-connect! [self endpoint timeout]

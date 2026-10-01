@@ -17,7 +17,19 @@ name: windows-static
 on:
   workflow_dispatch:
   pull_request:
+    paths:
+      - '.github/workflows/windows-static.yml'
+      - 'host/chez/build.ss'
+      - 'host/chez/build-jolt.ss'
+      - 'host/chez/loader.ss'
+      - 'host/chez/java/io.ss'
+      - 'host/chez/java/io-streams.ss'
+      - 'stdlib/jolt/loader.clj'
+      - 'stdlib/jolt/socket.clj'
+      - 'test/chez/win-*.ss'
+      - 'test/chez/win-parity-smoke.clj'
   push:
+    branches: [main]
     paths:
       - '.github/workflows/windows-static.yml'
       - 'host/chez/build.ss'

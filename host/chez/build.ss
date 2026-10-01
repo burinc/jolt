@@ -1772,7 +1772,7 @@
     ;; procedure forms eval below) with an actionable message.
     (unless (bld-have-cc?)
       (error 'jolt-build
-        "static native linking needs a C compiler (cc) on PATH; install one, or pass --dynamic to load the library at runtime."))
+        "static native linking needs a C compiler (JOLT_CC, or cc on PATH); install one, or pass --dynamic to load the library at runtime."))
     ;; Preload static archives' symbols into this process so step 1's foreign-
     ;; procedure evals resolve; the .build dir must exist first.
     (bld-mkdir-p (string-append out-path ".build"))
