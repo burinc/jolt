@@ -531,6 +531,11 @@
   ;; JVM's does (it returns from take!/put! without reaching the promise).
   {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (deref (future (.interrupt (Thread/currentThread)) (let [c (a/chan) d (a/chan)] [(try (a/<!! c) (catch InterruptedException e :interrupted)) (Thread/interrupted) (do (.interrupt (Thread/currentThread)) (try (a/>!! c 1) (catch InterruptedException e :interrupted))) (Thread/interrupted) (a/poll! c) (do (.interrupt (Thread/currentThread)) (try (a/alts!! [c [d 1]]) (catch InterruptedException e :interrupted))) (Thread/interrupted) (a/poll! d) (a/offer! c 1)])) 5000 :hung))" :expected "[:interrupted false :interrupted false nil :interrupted false nil nil]"}
   {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (deref (future (let [c (a/chan 2)] (a/>!! c 1) (.interrupt (Thread/currentThread)) [(a/<!! c) (a/>!! c 2) (first (a/alts!! [c])) (Thread/interrupted)])) 5000 :hung))" :expected "[1 true 2 true]"}
+  ;; ...including a put to an unbuffered channel a thread is already blocked
+  ;; taking from: the taker was counted, so the put completes without waiting and
+  ;; the flag stays set. It used to wait, see the flag, withdraw the value and
+  ;; throw, leaving the taker blocked. JVM core.async answers [true true 1].
+  {:suite "interrupt / blocking channels" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) t (a/thread (a/<!! c))] (Thread/sleep 100) (deref (future (.interrupt (Thread/currentThread)) [(try (a/>!! c 1) (catch InterruptedException e :interrupted)) (Thread/interrupted) (first (a/alts!! [t (a/timeout 5000)]))]) 5000 :hung)))" :expected "[true true 1]"}
   ;; <! is a PARK, and a parked go block holds no thread to interrupt, so a go body
   ;; on the default :thread backend waits on through an interrupt of the thread it
   ;; runs on and sees the flag still set afterwards.

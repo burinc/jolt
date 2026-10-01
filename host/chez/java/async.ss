@@ -254,7 +254,9 @@
             (jolt-unlock! tm)
             (jolt-unlock! pm)
             r)
-          (begin (jolt-unlock! pm) (retry))))))
+          ;; let the holder of tm finish before trying again, so two pairings
+          ;; taking the pair in opposite orders cannot keep failing in step
+          (begin (jolt-unlock! pm) (sleep (make-time 'time-duration 1000 0)) (retry))))))
 
 ;; Hand V straight to the first live alt-taker on CH (mu held), claiming it FIRST:
 ;; #t when one received it, #f when none was live. Dead registrations met on the
@@ -370,26 +372,30 @@
       ;; true only when a live taker received it. A handler never pairs with
       ;; itself: an alts!! that both takes from and puts to the same channel is
       ;; two ops that cannot be each other's partner.
+      ;; The first putter with a partner pairs, not only the head: a head putter
+      ;; whose one taker is itself must not keep a later putter from that taker.
       (when (and (eqv? (async-chan-cap ch) 0) (not (async-chan-xrf ch)))
         (let pair-loop ()
-          (when (and (pair? (async-chan-alt-putters ch))
-                     (pair? (async-chan-alt-takers ch)))
-            (let* ((hp (car (async-chan-alt-putters ch)))
-                   (h (car hp)) (v (cdr hp))
-                   (t (find (lambda (x) (not (eq? x h))) (async-chan-alt-takers ch))))
-              (when t
-                (case (alt-claim-pair! h t)
-                  ((ok)
-                   (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch)))
-                   (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))
-                   (alt-deliver! t v ch)
-                   (alt-deliver! h #t ch))
-                  ((putter)
-                   (async-chan-alt-putters-set! ch (cdr (async-chan-alt-putters ch))))
-                  (else
-                   (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))))
-                (set! progress #t)
-                (pair-loop))))))
+          (when (pair? (async-chan-alt-takers ch))
+            (let scan ((ps (async-chan-alt-putters ch)))
+              (when (pair? ps)
+                (let* ((hp (car ps)) (h (car hp)) (v (cdr hp))
+                       (t (find (lambda (x) (not (eq? x h))) (async-chan-alt-takers ch))))
+                  (if (not t)
+                      (scan (cdr ps))
+                      (begin
+                        (case (alt-claim-pair! h t)
+                          ((ok)
+                           (async-chan-alt-putters-set! ch (remq hp (async-chan-alt-putters ch)))
+                           (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))
+                           (alt-deliver! t v ch)
+                           (alt-deliver! h #t ch))
+                          ((putter)
+                           (async-chan-alt-putters-set! ch (remq hp (async-chan-alt-putters ch))))
+                          (else
+                           (async-chan-alt-takers-set! ch (remq t (async-chan-alt-takers ch)))))
+                        (set! progress #t)
+                        (pair-loop)))))))))
       (when progress (loop))))
   (ac-broadcast! ch))
 
@@ -503,11 +509,16 @@
                         (ac-qpush! ch (cons v #f)) (ac-notify! ch) #t)
                        ((ac-wait! ch intr? reg) => loop)
                        (else (jolt-interrupted-throw! ">!!"))))
-               (let* ((box (vector #f)) (entry (cons v box)))  ; unbuffered: rendezvous
+               (let* ((box (vector #f)) (entry (cons v box))  ; unbuffered: rendezvous
+                      ;; a blocked thread taker is counted before the push: it
+                      ;; takes this value when it wakes and never abandons it, so
+                      ;; the put is done now, as on the JVM, and an interrupt
+                      ;; flag already set stays set rather than withdrawing it
+                      (taken? (ac-thread-taker-free? ch)))
                  (ac-qpush! ch entry)
                  (ac-notify! ch)
                  (let loop ((reg #f))
-                   (cond ((vector-ref box 0) (ac-done reg #t))
+                   (cond ((or taken? (vector-ref box 0)) (ac-done reg #t))
                          ((ac-wait! ch intr? reg) => loop)
                          ;; Interrupted before any taker reached it: the entry is
                          ;; still queued (only a take removes it, and a take sets
