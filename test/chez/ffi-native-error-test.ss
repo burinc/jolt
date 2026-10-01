@@ -224,7 +224,7 @@
     (evb "(let [a (c-fail-err 42) _ (c-clobber-scalar 7)] (and (= (first a) -1) (= (second a) 42)))"))
 
 ;; --- socket consumer: recv classification uses the captured pair --------------
-;; Exercise the production jolt.socket binding and retry loop, not merely the
+;; Exercise the production jolt.socket.native binding and jolt.socket's retry loop, not merely the
 ;; lower-level FFI contract above.  The accepted loopback fd is nonblocking and
 ;; has no bytes available, so its first recv returns EAGAIN.  Before io-call can
 ;; classify that result, the operation sends one byte (making the fd readable)
@@ -244,7 +244,7 @@
                    buf (ffi/alloc 1)
                    out (.getOutputStream client)
                    first? (atom true)
-                   raw-recv (deref (ns-resolve 'jolt.socket 'c-recv))
+                   raw-recv (deref (ns-resolve 'jolt.socket.native 'c-recv))
                    io-call (deref (ns-resolve 'jolt.socket 'io-call))
                    op (fn []
                         (let [result (raw-recv fd buf 1 0)]
@@ -268,8 +268,8 @@
                    sa (ffi/alloc 16)
                    lenp (ffi/alloc 4)
                    first? (atom true)
-                   raw-accept (deref (ns-resolve 'jolt.socket 'c-accept))
-                   raw-close (deref (ns-resolve 'jolt.socket 'c-close))
+                   raw-accept (deref (ns-resolve 'jolt.socket.native 'c-accept))
+                   raw-close (deref (ns-resolve 'jolt.socket.native 'c-close))
                    io-call (deref (ns-resolve 'jolt.socket 'io-call))
                    op (fn []
                         (let [result (raw-accept server-fd sa lenp)]
