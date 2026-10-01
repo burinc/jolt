@@ -122,6 +122,35 @@
    :check {:expr "(let [ex (java.util.concurrent.Executors/newScheduledThreadPool 1)] (try (.getName (class (.submit ex ^java.util.concurrent.Callable (fn [] 1)))) (finally (.shutdown ex))))"
            :jvm "\"java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask\""
            :jolt "\"java.util.concurrent.FutureTask\""}}
+  ;; Process exit and the threads that do not keep it up. Thread.isDaemon answers
+  ;; per the JVM for every kind of thread (corpus "interop / Thread daemon and
+  ;; priority", unit "threads / daemon"), but on exit jolt waits only for the
+  ;; non-daemon Threads a program started itself (jolt-await-user-threads!,
+  ;; concurrency.ss). Probed by running a script whose last form hands 500ms of
+  ;; work to each kind of thread and prints when it is done.
+  {:category :host-model
+   :behavior "a script that ends with work still pending on a future, an agent, or a non-daemon executor pool"
+   :jvm "the JVM stays up for it: those threads are not daemons, so the work finishes — and the process then lingers until the pool's keep-alive (60s for future/agent without shutdown-agents; forever for an executor never shut down)"
+   :jolt "the process exits when the script returns and the pending work is dropped, although isDaemon on those threads answers false as on the JVM; a Thread the program started itself is waited for, as on the JVM"
+   :check :prose
+   :why "exit behaviour is a property of the process, not of a value one expression can return"}
+  ;; CompletableFuture. The stage graph, its exception wrapping and its waits are
+  ;; certified by the corpus rows under "interop / completable future"; these are
+  ;; the two details of it jolt does not reproduce.
+  {:category :host-model
+   :behavior "whenComplete whose action throws over a stage that already failed"
+   :jvm "the stage keeps its own failure and the action's throwable is added to it with addSuppressed"
+   :jolt "the stage keeps its own failure; jolt throwables carry no suppressed list (getSuppressed is always empty), so the action's throwable is dropped"
+   :check {:expr "(let [c (.whenComplete (java.util.concurrent.CompletableFuture/failedFuture (RuntimeException. \"boom\")) (fn [v e] (throw (IllegalStateException. \"wc\"))))] (try (.join c) (catch Throwable e (count (.getSuppressed (.getCause e))))))"
+           :jvm "1"
+           :jolt "0"}}
+  {:category :host-model
+   :behavior "the thread an async stage runs on"
+   :jvm "a ForkJoinPool.commonPool worker (\"ForkJoinPool.commonPool-worker-N\"), and orTimeout/completeOnTimeout fire on the \"CompletableFutureDelayScheduler\" thread"
+   :jolt "a worker of a cached thread pool jolt makes on first use (the pool newCachedThreadPool builds, which does not hold the process open either); a timeout fires on the runtime's shared timer and is handed to that pool, so dependents never run on the timer thread"
+   :check {:expr "(.startsWith (.join (java.util.concurrent.CompletableFuture/supplyAsync (fn [] (.getName (Thread/currentThread))))) \"ForkJoinPool.commonPool-worker-\")"
+           :jvm "true"
+           :jolt "false"}}
   {:category :host-model
    :behavior "(contains? P :on) / :on-interface / :method-builders on a protocol value"
    :jvm "true — defprotocol also generates the interface my.ns.P, and these three keys describe it"

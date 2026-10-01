@@ -1406,6 +1406,14 @@
     (cond ((#%$record-cas! r i old new) #t)
           ((eq? (#%$record-ref r i) old) (retry))
           (else #f))))
+;; (sa-box-cas! b old new) -> the same strong compare-and-swap on a box: box-cas!
+;; refuses spuriously on Apple silicon just as $record-cas! does, so a one-shot
+;; claim built on it can be lost by every claimant.
+(define (sa-box-cas! b old new)
+  (let retry ()
+    (cond ((box-cas! b old new) #t)
+          ((eq? (unbox b) old) (retry))
+          (else #f))))
 
 ;; (sa-disable-count) -> how many nested disable-interrupts this thread is
 ;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and

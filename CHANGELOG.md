@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`java.util.concurrent.CompletableFuture`.** `(CompletableFuture.)` was "No
+  matching ctor", so nothing written against the class ran. It is a Future and
+  a CompletionStage now: `complete`, `completeExceptionally`, `cancel`,
+  `obtrudeValue`/`obtrudeException`, the statics `completedFuture`,
+  `failedFuture`, `supplyAsync`, `runAsync`, `allOf`, `anyOf` and
+  `delayedExecutor`; `get` and its timed overload, `join`, `getNow`,
+  `resultNow`, `exceptionNow`, `state` and the predicates; and the stage
+  methods — `thenApply`, `thenAccept`, `thenRun`, `thenCompose`,
+  `thenCombine`, `thenAcceptBoth`, `runAfterBoth`, the `Either` three,
+  `handle`, `whenComplete`, `exceptionally`, `exceptionallyCompose`, each with
+  its `Async` forms — plus `orTimeout`, `completeOnTimeout`, `completeAsync`,
+  `copy` and `toCompletableFuture`. The exception wrapping is the JVM's: a
+  dependent stage fails with a `CompletionException` over the cause, `get`
+  raises `ExecutionException` and `join` `CompletionException`, and
+  `exceptionally`/`handle` see the raw throwable on the stage that failed and
+  the wrapped one downstream. Dependents registered before completion run
+  newest first, as the JVM's do. `get` and `deref` are interruptible and `join`
+  is not, from a thread or a fiber; a completion race has one winner and a
+  callback registered while the future completes runs exactly once. A
+  function argument can be a Clojure fn or a reified `java.util.function`
+  interface, an `Executor` any pool shim or a reify. The async pool is a
+  cached thread pool rather than the ForkJoin common pool. 83 corpus rows
+  certify the surface against Clojure 1.12.5 on JDK 21; the interrupt and
+  fiber cases are unit rows and `fiber-blocking.clj` cases. Two details are
+  documented divergences: `whenComplete` cannot record the action's throwable
+  as suppressed, and async stages do not run on threads named
+  `ForkJoinPool.commonPool-worker-N`. Left out: `completedStage`,
+  `failedStage` and `minimalCompletionStage` (the `MinimalStage` view), and
+  `defaultExecutor`.
+
 - **`Socket.shutdownOutput`, `shutdownInput`, `isOutputShutdown` and
   `isInputShutdown`.** The half-close, as on the JVM: after `shutdownOutput`
   the peer reads EOF, this side still reads, and a write throws "Broken
@@ -23,6 +53,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Thread.isDaemon` answers for every thread.** `(.isDaemon
+  (Thread/currentThread))` was "No matching field found" everywhere — on the
+  main thread, in a future, a `go` block, an executor task, even in a started
+  `Thread.` looking at itself — because the handle `currentThread` and
+  `getAllStackTraces` hand out had no such method, only the `(Thread. f)`
+  object did. Daemon status is now recorded where each thread is forked, so
+  the object and every handle for the thread agree. The values are the JVM's,
+  each probed on JDK 21: the main thread, futures, agents and executor workers
+  are not daemons; `core.async` thread, `go` and `io-thread` threads, the tap
+  thread, a work-stealing pool's and CompletableFuture's async threads are; a
+  `Thread.` inherits its creator's status, as on the JVM, where it was always
+  false. A `ThreadFactory` passed to `Executors` or a pool constructor was
+  ignored; it now decides each worker's daemon flag and name. `setDaemon` on a
+  live thread's handle is `IllegalThreadStateException`, as on the JVM. The
+  handle also gains `isAlive`, `isVirtual`, `threadId`, and `getPriority`/
+  `setPriority`, which both representations now share: validated to 1–10,
+  inherited by a new `Thread.`, and carried to the started thread. One exit
+  difference is recorded in `known-divergences.edn`: jolt still exits without
+  waiting for work pending on a future, an agent or an executor, where the JVM
+  stays up for those non-daemon threads.
 - **`<!!`, `>!!` and `alts!!` are interrupted.** On the JVM these block by
   deref'ing a promise, so `.interrupt` throws `InterruptedException` out of them
   and clears the flag. jolt kept waiting and left the flag set, so a worker shut
@@ -73,6 +123,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message; the JVM's `Throwable(Throwable)` sets it to
   `"java.lang.IllegalStateException: bad"`, and jolt now does too, for every
   exception class.
+
+- **`Process.onExit` returns a real CompletableFuture** that completes with the
+  Process. It was a stub that answered `thenRun` only, and its `thenApply`
+  returned the stub without calling the function.
+- **`future?`, `future-done?`, `future-cancel` and `future-cancelled?` accept
+  any `java.util.concurrent.Future`**, as they do on the JVM — a `FutureTask`,
+  an executor's future, a CompletableFuture. `(future? a-future-task)` was
+  false and `future-done?` threw on one; on a value that is not a Future the
+  last three are now the JVM's `ClassCastException`, and so is `realized?` of
+  a FutureTask, which answered `false`.
+- **A reified `Callable` or `Runnable` submitted to an executor runs.** It was
+  invoked as a fn, so its future failed with "cannot be cast to
+  clojure.lang.IFn". `(.run f)` and `(.call f)` on a fn work too.
+- **Reified `java.util.function` arguments** to `HashMap`'s `computeIfAbsent`,
+  `computeIfPresent`, `compute`, `merge` and `forEach`,
+  `AtomicReference.updateAndGet`/`getAndUpdate`, and `Optional.orElseGet`/
+  `ifPresent` are called through their method; they failed the same way.
+- **A timed `Future.get` that runs out raises `TimeoutException` with no
+  message**, as the JVM does. It said "timed out waiting for the task".
 
 - **A `:static` native no longer loads a shared object by its name.** For a
   `:jolt/native` spec that declares no candidates for the platform, `jolt run`

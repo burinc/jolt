@@ -108,7 +108,9 @@
   (let* ((ibox (box #f))
          (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) ibox))
          (snap (dyn-binding-stack)))
-    (fork-thread
+    ;; a future runs on clojure.core's agent pool, whose threads are never daemons,
+    ;; whatever thread asked for it
+    (fork-thread/daemon #f
      (lambda ()
        (*txn* #f)                          ; child thread must not inherit parent's txn
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
@@ -206,11 +208,38 @@
         (jolt-interrupt-wake-waits! b)))
     cancelled))
 
+
+;; future? / future-done? / future-cancelled? / future-cancel over ANY
+;; java.util.concurrent.Future, as clojure.core defines them on the JVM:
+;; (instance? Future x), .isDone, .isCancelled and .cancel(true). A jolt future
+;; answers from its record; a FutureTask, an executor's future, a
+;; ScheduledFutureTask or a CompletableFuture (or a reify of Future) through its
+;; own methods. They used to accept the jolt future only, so (future? a-FutureTask)
+;; was false and future-done? threw on one. Anything that is not a Future is the
+;; JVM's failed cast.
+(define future-type-sym (jolt-symbol #f "java.util.concurrent.Future"))
+(define (jolt-java-future? x)
+  (let ((r (instance-check future-type-sym x))) (and r (not (jolt-nil? r)))))
+(define (jolt-any-future? x) (or (jolt-future? x) (jolt-java-future? x)))
+(define (future-cast-error x)
+  (jolt-throw
+   (jolt-host-throwable "java.lang.ClassCastException"
+     (string-append "class " (guard (e (#t "?")) (jolt-class-name x))
+                    " cannot be cast to class java.util.concurrent.Future"))))
+(define (future-method x name . args)
+  (record-method-dispatch x name (if (null? args) jolt-nil (list->cseq args))))
 (define (jolt-native-future-done? x)
-  (if (jolt-future? x) (jolt-future-done? x)
-      (jolt-throw (jolt-ex-info "future-done? requires a future" (jolt-hash-map)))))
+  (cond ((jolt-future? x) (jolt-future-done? x))
+        ((jolt-java-future? x) (jolt-truthy? (future-method x "isDone")))
+        (else (future-cast-error x))))
 (define (jolt-native-future-cancelled? x)
-  (and (jolt-future? x) (jolt-future-cancelled? x)))
+  (cond ((jolt-future? x) (jolt-future-cancelled? x))
+        ((jolt-java-future? x) (jolt-truthy? (future-method x "isCancelled")))
+        (else (future-cast-error x))))
+(define (jolt-any-future-cancel x)
+  (cond ((jolt-future? x) (jolt-future-cancel x))
+        ((jolt-java-future? x) (jolt-truthy? (future-method x "cancel" #t)))
+        (else (future-cast-error x))))
 
 ;; --- promises ---------------------------------------------------------------
 ;; A blocking promise (like the JVM): deref parks until deliver, then caches the
@@ -364,7 +393,8 @@
     (jagent-q-push! a (cons f args))
     (unless (jolt-agent-running? a)
       (jolt-agent-running?-set! a #t)
-      (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
+      ;; an agent pool thread, never a daemon (as a future's)
+      (fork-thread/daemon #f (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
   a)
 
 ;; Dispatch the held nested sends accumulated on this thread, returning the count
@@ -649,7 +679,7 @@
           (cond (clear? (jagent-q-clear! a))
                 ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
                  (jolt-agent-running?-set! a #t)
-                 (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
+                 (fork-thread/daemon #f (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
   ;; Agent.restart answers the NEW STATE, not the agent (and clear-agent-errors,
   ;; which is restart-agent over the current state, answers that state in turn).
   new-state)
@@ -714,7 +744,7 @@
 (define (start-tap-thread!)
   (unless (unbox tap-thread-started?)
     (set-box! tap-thread-started? #t)
-    (fork-thread
+    (fork-thread/daemon #t                 ; clojure.core's tap-loop thread is a daemon
      (lambda ()
        (*txn* #f)
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
@@ -895,8 +925,8 @@
 
 ;; --- bind into clojure.core -------------------------------------------------
 (def-var! "clojure.core" "future-call" jolt-future-call)
-(def-var! "clojure.core" "future-cancel" jolt-future-cancel)
-(def-var! "clojure.core" "future?" jolt-future?)
+(def-var! "clojure.core" "future-cancel" jolt-any-future-cancel)
+(def-var! "clojure.core" "future?" jolt-any-future?)
 (def-var! "clojure.core" "future-done?" jolt-native-future-done?)
 (def-var! "clojure.core" "future-cancelled?" jolt-native-future-cancelled?)
 (def-var! "clojure.core" "promise" jolt-promise-new)
@@ -1725,10 +1755,15 @@
     (let ((n jthread-name-counter))
       (set! jthread-name-counter (+ n 1))
       (string-append "Thread-" (number->string n)))))
+;; Slots 8 and 9, daemon and priority, start as the CREATING thread's, which is
+;; the JVM's rule: a Thread made on a daemon thread is a daemon, and one made on a
+;; thread of priority 3 has priority 3.
 (define (make-jthread thunk name)
-  (make-jhost "user-thread"
-              (vector thunk #f (make-mutex) (make-condition) (box #f) #f
-                      (box (or name (next-jthread-name))) #f #f)))
+  (let ((me (get-thread-id)))
+    (make-jhost "user-thread"
+                (vector thunk #f (make-mutex) (make-condition) (box #f) #f
+                        (box (or name (next-jthread-name))) #f
+                        (jolt-thread-daemon? me) (jolt-thread-priority me)))))
 ;; slot 7: the id of the thread the start forked, #f until then. A rename needs
 ;; it to reach the id-keyed name table the handles read.
 (define (jthread-id st) (vector-ref st 7))
@@ -1787,7 +1822,9 @@
                                                "Thread already started")))
             (vector-set! st 5 #t)  ; mark started before forking
             (unless (jthread-daemon? st) (user-thread-started!))
-            (fork-thread (lambda ()
+            ;; born with the object's daemon flag, so the handle currentThread
+            ;; and getAllStackTraces give for it answers the same
+            (fork-thread/daemon (jthread-daemon? st) (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
                (rdr-default-modes!)                ; and not the reader modes of a read it forked from
                ;; Adopt the Thread object's own interrupt flag, so .interrupt from
@@ -1798,6 +1835,7 @@
                ;; Thread/currentThread (and getAllStackTraces) hands out
                (vector-set! st 7 (get-thread-id))
                (jolt-thread-name-set! (get-thread-id) (unbox (vector-ref st 6)))
+               (jolt-thread-priority-set! (get-thread-id) (vector-ref st 9))
                ;; and register that handle now, so a handle someone else takes for
                ;; this thread before it first asks who it is is the live one
                (current-thread-handle)
@@ -1872,11 +1910,24 @@
         (cons "setDaemon" (lambda (self flag)
           (let ((st (jhost-state self)))
             (when (jthread-alive? st)
-              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
-                                               "Thread is alive")))
-            (vector-set! st 8 (and (jolt-truthy? flag) #t)))
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException" jolt-nil)))
+            (vector-set! st 8 (and (jolt-truthy? flag) #t))
+            ;; a thread that has finished: its handle must keep agreeing
+            (when (jthread-id st) (jolt-thread-daemon-set! (jthread-id st) (vector-ref st 8))))
           jolt-nil))
-        (cons "isDaemon" (lambda (self) (and (jthread-daemon? (jhost-state self)) #t)))))
+        (cons "isDaemon" (lambda (self) (and (jthread-daemon? (jhost-state self)) #t)))
+        ;; Priority: advisory, as the JVM documents it, and jolt schedules no
+        ;; differently for it — but it is stored, validated and inherited as there,
+        ;; and once started it is the thread's, so the handle reads the same value.
+        (cons "getPriority" (lambda (self)
+          (let ((st (jhost-state self)))
+            (if (jthread-id st) (jolt-thread-priority (jthread-id st)) (vector-ref st 9)))))
+        (cons "setPriority" (lambda (self p)
+          (let ((st (jhost-state self)) (p (jolt-thread-priority-arg p)))
+            (vector-set! st 9 p)
+            (when (jthread-id st) (jolt-thread-priority-set! (jthread-id st) p)))
+          jolt-nil))
+        (cons "isVirtual" (lambda (self) #f))))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))
@@ -1986,8 +2037,8 @@
 (define (j-future-get* self ms on-timeout)
   (j-future-get-until self (and ms (ms->deadline-millis ms)) on-timeout))
 (define (future-timeout-throw)
-  (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
-                                   "timed out waiting for the task")))
+  ;; no message: FutureTask.get's TimeoutException carries none on the JVM
+  (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil)))
 (define (j-future-get self . args)
   (j-future-get* self (tu-args->ms args) future-timeout-throw))
 (register-host-methods! "j-future"
@@ -2057,11 +2108,18 @@
 ;; way, which is why the test is a depth against a count rather than a handoff.
 (define executor-unbounded-workers 2147483647)   ; Integer.MAX_VALUE, as the JVM passes
 (define cached-pool-keep-alive-ms 60000)         ; 60L, TimeUnit.SECONDS, as the JVM passes
-(define (make-executor* tag core-n max-n keep-alive-ms cap)
+;; SPEC is (daemon factory), both optional: slots 16 and 17, what the pool's
+;; workers are born as. A pool Executors builds with its defaultThreadFactory has
+;; non-daemon workers, which is the default; a ForkJoin-style pool's are daemons;
+;; and a ThreadFactory the caller passed decides for itself, per worker, through
+;; the Thread its newThread answers (executor-spawn-worker!).
+(define (make-executor* tag core-n max-n keep-alive-ms cap . spec)
   (let ((self (make-jhost tag
                           (vector #f (box (cons '() '())) (make-mutex) (make-condition) 0
                                   cap core-n max-n keep-alive-ms 0 0 (make-condition) 0
-                                  '() #f 0))))
+                                  '() #f 0
+                                  (and (pair? spec) (car spec) #t)
+                                  (and (pair? spec) (pair? (cdr spec)) (cadr spec))))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -2072,19 +2130,26 @@
             (executor-spawn-worker! st))
           (spawn (fx- k 1))))
       self)))
-;; A fixed pool: n eager workers that never retire, and the advisory capacity a
-;; ThreadPoolExecutor's queue argument contributes to .getQueue's view.
-(define (make-executor n-workers . cap)
-  (make-executor* "executor-service" n-workers n-workers #f (if (null? cap) #f (car cap))))
-;; newCachedThreadPool / newVirtualThreadPerTaskExecutor.
-(define (make-cached-executor)
-  (make-executor* "executor-service" 0 executor-unbounded-workers cached-pool-keep-alive-ms #f))
+;; newCachedThreadPool / newVirtualThreadPerTaskExecutor. SPEC as make-executor*.
+(define (make-cached-executor . spec)
+  (apply make-executor* "executor-service" 0 executor-unbounded-workers cached-pool-keep-alive-ms #f spec))
 ;; newScheduledThreadPool / newSingleThreadScheduledExecutor / the
 ;; ScheduledThreadPoolExecutor ctor: a fixed pool (the JVM's grows to
 ;; Integer.MAX_VALUE on paper and never does in practice, its queue being
 ;; unbounded) whose tag adds the three schedule methods.
-(define (make-scheduled-executor n-workers)
-  (make-executor* "scheduled-executor" n-workers n-workers #f #f))
+(define (make-scheduled-executor n-workers . spec)
+  (apply make-executor* "scheduled-executor" n-workers n-workers #f #f spec))
+
+;; The ThreadFactory argument of an Executors factory or a pool constructor, or
+;; #f: anything answering newThread. (A RejectedExecutionHandler in the same
+;; position of the other ThreadPoolExecutor overload does not.)
+(define (thread-factory-arg x)
+  (and (not (jolt-nil? x)) (not (procedure? x))
+       (or (iface-method x "newThread" 2)
+           (and (jhost? x) (host-method-ref (jhost-tag x) "newThread")))
+       x))
+(define (thread-factory-in args)
+  (let loop ((as args)) (cond ((null? as) #f) ((thread-factory-arg (car as)) => values) (else (loop (cdr as))))))
 
 ;; Claim a worker slot, or answer #f because the pool is at max. Called with the
 ;; queue mutex HELD, and the slot is claimed BEFORE the fork rather than counted
@@ -2116,10 +2181,25 @@
                                     (jolt-cv-wake! (vector-ref st 11))
                                     (fx=? 0 (vector-ref st 4)))))
                   (when none-left? (raise e)))))
-    (fork-thread (lambda ()
-      (*txn* #f)      ; worker must not inherit the creating thread's txn
-      (rdr-default-modes!)                ; and not the reader modes of a read it forked from
-      (executor-worker-loop st)))))
+    ;; What the worker is born as. A pool with a ThreadFactory asks it for the
+    ;; worker's Thread, once per worker as the JVM does, and takes that Thread's
+    ;; daemon flag and name; the Thread itself is not started — the worker is
+    ;; this fork, so a factory that wraps the Runnable it is handed does not see
+    ;; its wrapper run. Without one, the pool's own flag.
+    (let* ((factory (vector-ref st 17))
+           (t (and factory
+                   (let ((t (record-method-dispatch factory "newThread"
+                                                    (jolt-list (lambda () jolt-nil)))))
+                     (and (not (jolt-nil? t)) t))))
+           (daemon (if t
+                       (jolt-truthy? (record-method-dispatch t "isDaemon" jolt-nil))
+                       (vector-ref st 16)))
+           (name (and t (record-method-dispatch t "getName" jolt-nil))))
+      (fork-thread/daemon daemon (lambda ()
+        (*txn* #f)      ; worker must not inherit the creating thread's txn
+        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
+        (when (string? name) (jolt-thread-name-set! (get-thread-id) name))
+        (executor-worker-loop st))))))
 
 ;; Dequeue, with the mutex held. Callers test queue-depth first.
 (define (executor-dequeue! st)
@@ -2409,14 +2489,17 @@
       ((spawn) (executor-spawn-worker! st))
       ((reject) (executor-reject-task! st))
       (else (void)))))
-(let ((single (lambda _ (make-executor 1)))
-      (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
+(let ((single (lambda args (make-executor* "executor-service" 1 1 #f #f #f (thread-factory-in args))))
+      (fixed  (lambda (n . args)
+                (let ((n (max 1 (jnum->exact n))))
+                  (make-executor* "executor-service" n n #f #f #f (thread-factory-in args)))))
       ;; the two scheduled factories: the same fixed pools under the tag that
       ;; answers schedule (jolt-hgjo). newSingleThreadScheduledExecutor's class
       ;; is a private delegating wrapper on the JVM, which jolt does not model —
       ;; it reports the pool it wraps, as newSingleThreadExecutor already does.
-      (scheduled-single (lambda _ (make-scheduled-executor 1)))
-      (scheduled-fixed  (lambda (n . _) (make-scheduled-executor (max 1 (jnum->exact n)))))
+      (scheduled-single (lambda args (make-scheduled-executor 1 #f (thread-factory-in args))))
+      (scheduled-fixed  (lambda (n . args)
+                          (make-scheduled-executor (max 1 (jnum->exact n)) #f (thread-factory-in args))))
       ;; cached / virtual-thread-per-task: the two factories that are UNBOUNDED on
       ;; the JVM. A cached pool is (0, Integer.MAX_VALUE, 60s, SynchronousQueue)
       ;; there, and a virtual thread per task is a thread per task with no pool at
@@ -2434,14 +2517,15 @@
       ;; substitution — a pooled thread for a fresh virtual one, which nothing here
       ;; can tell apart, since jolt has no thread-locals and a task's identity is
       ;; its own.
-      (cached (lambda _ (make-cached-executor)))
+      (cached (lambda args (make-cached-executor #f (thread-factory-in args))))
       ;; newWorkStealingPool is NOT one of those and stays a fixed pool: a
       ;; ForkJoinPool is sized at availableProcessors, because work stealing is for
       ;; CPU-bound tasks that would only contend if there were more of them than
       ;; cores. It does grow past that, but only to REPLACE a worker the JVM can
       ;; see is blocked in a join, which is a thing jolt cannot see; a flat 32 sits
       ;; between the two bounds and errs toward not stranding a blocking task.
-      (stealing (lambda _ (make-executor 32))))
+      ;; ForkJoinPool's workers are daemons.
+      (stealing (lambda _ (make-executor* "executor-service" 32 32 #f #f #t))))
   (for-each (lambda (nm) (register-class-statics! nm
               (list (cons "newSingleThreadExecutor" single)
                     (cons "newSingleThreadScheduledExecutor" scheduled-single)
@@ -2582,7 +2666,7 @@
 ;; (ThreadPoolExecutor. 1 1 keepAlive unit (ArrayBlockingQueue. n)) plus
 ;; FutureTask. ArrayBlockingQueue is a real bounded blocking queue (fiber-aware
 ;; through jolt-cv-wait); FutureTask a run-once future; the ThreadPoolExecutor
-;; ctor builds on make-executor above, sized by maximumPoolSize, its queue
+;; ctor builds on make-executor* above, sized by maximumPoolSize, its queue
 ;; argument contributing capacity to .getQueue's view. Tasks flow through the
 ;; executor's own unbounded queue — the JVM REJECTS a submit when the bounded
 ;; queue is full, jolt queues it; that is the deliberate divergence here.
@@ -2776,6 +2860,7 @@
     (cond ((string=? tag "future-task") future-task-get*)
           ((string=? tag "j-future") j-future-get*)
           ((string=? tag "scheduled-future") j-future-get*)   ; the same five slots (below)
+          ((string=? tag "completable-future") cf-get*)      ; CompletableFuture (below)
           (else #f))))
 (register-host-methods! "future-task"
   (list (cons "run" (lambda (self) (future-task-run! self)))
@@ -2793,15 +2878,21 @@
         (cons "toString" (lambda (self)
           (string-append "FutureTask[" (symbol->string (vector-ref (jhost-state self) 0)) "]")))))
 ;; submit/execute above route a FutureTask through its own run (a Runnable on
-;; the JVM); anything else is an invokable thunk.
+;; the JVM), and a reify or deftype implementing Callable or Runnable through its
+;; call or run — invoking one directly was "cannot be cast to clojure.lang.IFn",
+;; so (.submit pool (reify Callable (call [_] …))) failed its future. Anything
+;; else is an invokable thunk.
 (define (runnable->thunk x)
-  (if (future-task? x)
-      (lambda () (future-task-run! x) jolt-nil)
-      x))
+  (cond ((future-task? x) (lambda () (future-task-run! x) jolt-nil))
+        ((procedure? x) x)
+        ((iface-method x "call" 1) (lambda () (record-method-dispatch x "call" jolt-nil)))
+        ((iface-method x "run" 1) (lambda () (record-method-dispatch x "run" jolt-nil) jolt-nil))
+        (else x)))
 
 ;; ThreadPoolExecutor ctor: (core max keepAlive unit [queue] [factory]
 ;; [handler]) — core, max and keepAlive all reach the pool now that the pool can
-;; grow and retire; factory and handler are accepted and ignored. The workers up
+;; grow and retire; a factory decides each worker's daemon flag and name
+;; (executor-spawn-worker!), and a handler is accepted and ignored. The workers up
 ;; to core are eager, the rest appear as tasks arrive with nobody idle, and an
 ;; above-core worker retires after keepAlive.
 ;;
@@ -2821,7 +2912,8 @@
                      ;; idle" and stays 0.
                      (keep (and (>= (length rest) 2) (tu->ms (car rest) (cadr rest)))))
                 (make-executor* "executor-service" core-n max-n keep
-                                (and q (vector-ref (jhost-state q) 0)))))))
+                                (and q (vector-ref (jhost-state q) 0))
+                                #f (thread-factory-in (if (>= (length rest) 3) (cddr rest) '())))))))
           '("ThreadPoolExecutor" "java.util.concurrent.ThreadPoolExecutor"))
 ;; .getQueue answers a live VIEW of the executor's internal queue — size reads
 ;; the real depth, remainingCapacity subtracts it from the advisory capacity
@@ -2995,7 +3087,8 @@
 ;; one worker, as every pool here (a pool with no worker runs nothing; the JVM's
 ;; ensurePrestart starts one on demand for core 0).
 (for-each (lambda (nm) (register-class-ctor! nm
-            (lambda (core-n . _) (make-scheduled-executor (max 1 (jnum->exact core-n))))))
+            (lambda (core-n . rest)
+              (make-scheduled-executor (max 1 (jnum->exact core-n)) #f (thread-factory-in rest)))))
           '("ScheduledThreadPoolExecutor" "java.util.concurrent.ScheduledThreadPoolExecutor"))
 ;; The future's own members over the j-future's: Delayed's getDelay (remaining
 ;; time in UNIT, negative once overdue, truncated toward zero as TimeUnit.convert
@@ -3014,6 +3107,560 @@
           (cond ((eq? self other) 0) ((sf-before? self other) -1) ((sf-before? other self) 1) (else 0))))
         (cons "isPeriodic" (lambda (self) (sf-periodic? self)))
         (cons "run" (lambda (self) (scheduled-future-run! self (vector-ref (jhost-state self) 9)) jolt-nil))))
+
+;; --- java.util.concurrent.CompletableFuture ----------------------------------
+;; A settable Future whose completion drives a graph of dependent stages. State:
+;;   #(result mutex condition dependents)
+;; result is cf-pending until the future settles, then the value itself (nil is
+;; jolt-nil, so false and nil results need no box) or a cf-alt carrying the
+;; throwable — the JVM's AltResult, and for the same reason: a result slot that
+;; holds either a value or a failure, written once under the mutex.
+;;
+;; DEPENDENTS are thunks of one argument, the result, pushed onto a list while
+;; the future is pending and run by whichever call settles it, AFTER the mutex is
+;; released. A thunk registered once the future has settled runs at once in the
+;; registering thread instead. Both decisions are taken under the mutex, so every
+;; thunk runs exactly once: either it was on the list when the settle took it, or
+;; the registrar saw the result and ran it itself. The list is a stack and runs
+;; newest first, which is the order the JVM's Treiber stack of completions runs
+;; them in (certified: five thenRuns registered 0..4 run 4 3 2 1 0).
+;;
+;; THE EXCEPTION WRAPPING is the JVM's, and it is what most code catching around
+;; a CompletableFuture depends on, so it is spelled out:
+;;   - completeExceptionally / failedFuture / orTimeout store the throwable RAW;
+;;   - a dependent stage stores a failure WRAPPED in CompletionException, once
+;;     (a failure that already is one is reused, not wrapped again), and so does
+;;     supplyAsync's own failure;
+;;   - get throws ExecutionException over the underlying cause (unwrapping one
+;;     CompletionException), join and getNow throw CompletionException (wrapping
+;;     a raw failure), and a CancellationException is rethrown as is by both;
+;;   - exceptionally / handle / whenComplete hand their function the stored
+;;     throwable: raw on the stage that failed, the CompletionException on a
+;;     stage downstream of it.
+;;
+;; get is interruptible, as every jolt wait a JVM caller can name is (locks.ss,
+;; jolt-cv-wait-interruptibly); join is NOT, on the JVM or here: it keeps waiting
+;; and leaves the interrupt flag set. Both park a fiber rather than block its
+;; carrier, through the same seam.
+(define-record-type cf-alt (fields ex) (nongenerative jolt-cf-alt-v1))
+(define cf-pending (list 'cf-pending))
+(define cf-timed-out (list 'cf-timed-out))
+(define (cf-pending? r) (eq? r cf-pending))
+(define (make-cf* r) (make-jhost "completable-future" (vector r (make-mutex) (make-condition) '())))
+(define (make-cf) (make-cf* cf-pending))
+(define (cf? x) (and (jhost? x) (string=? (jhost-tag x) "completable-future")))
+;; The result, read under the mutex: it is published by another thread, and the
+;; lock is what orders the read after the write on a weakly-ordered machine.
+(define (cf-result c)
+  (let ((st (jhost-state c)))
+    (jolt-with-mutex (vector-ref st 1) (vector-ref st 0))))
+
+;; Class tests on a stored throwable, by the class graph like a catch clause.
+(define (cf-exc-isa? x simple)
+  (and (jolt-ex-info-record? x) (exception-isa? (last-dot (ex-info-class x)) simple)))
+(define (cf-cancellation? x) (cf-exc-isa? x "CancellationException"))
+(define (cf-completion? x) (cf-exc-isa? x "CompletionException"))
+(define (cf-cause x) (if (jolt-ex-info-record? x) (jolt-ex-info-record-cause x) jolt-nil))
+(define (cf-npe) (throw-jvm 'NullPointerException jolt-nil))
+
+;; new CompletionException(x): the message is x.toString(), as Throwable(cause) makes it.
+(define (cf-completion-exception x)
+  (jolt-host-throwable "java.util.concurrent.CompletionException" (jolt-str-render-one x) x))
+(define (cf-new-cancellation)
+  (jolt-host-throwable "java.util.concurrent.CancellationException" jolt-nil))
+;; encodeThrowable(x): a failure a dependent stage stores.
+(define (cf-encode-throwable x)
+  (make-cf-alt (if (cf-completion? x) x (cf-completion-exception x))))
+;; encodeRelay(r): a source's result carried into a dependent — a value as is, a
+;; raw failure wrapped, an already-wrapped one reused (the same AltResult).
+(define (cf-encode-relay r)
+  (if (and (cf-alt? r) (not (cf-completion? (cf-alt-ex r))))
+      (make-cf-alt (cf-completion-exception (cf-alt-ex r)))
+      r))
+
+;; Settle C with R — a value or a cf-alt. #t iff this call did it. FORCE? is
+;; obtrude's overwrite of a result already there. Dependents run after the
+;; mutex is released, in the settling thread.
+(define (cf-settle! c r force?)
+  (let* ((st (jhost-state c))
+         (deps (jolt-with-mutex (vector-ref st 1)
+                 (and (or force? (cf-pending? (vector-ref st 0)))
+                      (let ((ds (vector-ref st 3)))
+                        (vector-set! st 0 r)
+                        (vector-set! st 3 '())
+                        (jolt-cv-wake! (vector-ref st 2))
+                        ds)))))
+    (and deps
+         (begin (for-each (lambda (d) (d r)) deps) #t))))
+
+;; Run (thunk result) once C has settled: now, or from whichever call settles it.
+(define (cf-when-done! c thunk)
+  (let* ((st (jhost-state c))
+         (r (jolt-with-mutex (vector-ref st 1)
+              (let ((r (vector-ref st 0)))
+                (when (cf-pending? r)
+                  (vector-set! st 3 (cons thunk (vector-ref st 3))))
+                r))))
+    (unless (cf-pending? r) (thunk r))))
+
+;; Settle D with what THUNK answers, or with the failure it throws, wrapped.
+(define (cf-complete-with! d thunk)
+  (cf-settle! d (guard (e (#t (cf-encode-throwable (jolt-unwrap-throw e)))) (thunk)) #f))
+
+;; The functional-interface argument of a stage method — a Clojure fn, or a
+;; reified Function/Supplier/Consumer/Runnable/BiFunction/BiConsumer — goes
+;; through jolt-fi-call (host-static-classes.ss), named for its one method.
+(define cf-fn-call jolt-fi-call)
+(define (cf-require! x) (when (jolt-nil? x) (cf-npe)) x)
+
+;; The async pool: the JVM's is ForkJoinPool.commonPool. jolt's is a cached pool
+;; (the one newCachedThreadPool builds), made on first use, whose workers do not
+;; hold the process open — the commonPool's are daemons too.
+(define cf-default-pool #f)
+(define cf-default-pool-mu (make-mutex))
+(define (cf-default-executor)
+  (jolt-with-mutex cf-default-pool-mu
+    ;; daemon workers, as the commonPool's are
+    (unless cf-default-pool (set! cf-default-pool (make-cached-executor #t)))
+    cf-default-pool))
+;; Hand THUNK to an Executor: 'default is the async pool, anything else answers
+;; execute(Runnable) — a pool shim, a delayedExecutor, a reified Executor. The
+;; thunk is a jolt fn, so it is a Runnable to code that calls (.run r).
+(define (cf-execute! exec thunk)
+  (let ((e (if (eq? exec 'default) (cf-default-executor) exec)))
+    (record-method-dispatch e "execute" (jolt-list (lambda () (thunk) jolt-nil)))))
+;; Run a dependent's work inline (EXEC #f) or on EXEC. An executor that refuses
+;; the task (a shut-down pool) fails the dependent with the rejection, as the
+;; JVM's claim() does.
+(define (cf-fire! d exec thunk)
+  (if exec
+      (guard (e (#t (cf-settle! d (cf-encode-throwable (jolt-unwrap-throw e)) #f)))
+        (cf-execute! exec thunk))
+      (thunk)))
+;; The two overloads of an *Async method: without an Executor it is the async
+;; pool, with one it is that (a nil one is a NullPointerException). G takes the
+;; executor ahead of the function; a two-stage method passes the other stage.
+(define (cf-async-1 g)
+  (case-lambda ((self f) (g self 'default f))
+               ((self f e) (g self (cf-require! e) f))))
+(define (cf-async-2 g)
+  (case-lambda ((self o f) (g self o 'default f))
+               ((self o f e) (g self o (cf-require! e) f))))
+
+;; Another CompletionStage argument, as the CompletableFuture its methods read.
+(define (cf-as-cf x)
+  (cond ((cf? x) x)
+        ((jolt-nil? x) (cf-npe))
+        ((iface-method x "toCompletableFuture" 1)
+         (cf-as-cf (record-method-dispatch x "toCompletableFuture" jolt-nil)))
+        (else (throw-jvm 'ClassCastException
+                         (string-append "class " (guard (e (#t "?")) (jolt-class-name x))
+                                        " cannot be cast to class java.util.concurrent.CompletionStage")))))
+
+;; reportGet / reportJoin: a settled result as get and join answer it.
+(define (cf-report-get r)
+  (if (cf-alt? r)
+      (let ((x (cf-alt-ex r)))
+        (if (cf-cancellation? x)
+            (jolt-throw x)
+            (let ((x (if (and (cf-completion? x) (not (jolt-nil? (cf-cause x)))) (cf-cause x) x)))
+              (jolt-throw (jolt-host-throwable "java.util.concurrent.ExecutionException"
+                                               (jolt-str-render-one x) x)))))
+      r))
+(define (cf-report-join r)
+  (if (cf-alt? r)
+      (let ((x (cf-alt-ex r)))
+        (jolt-throw (if (or (cf-cancellation? x) (cf-completion? x)) x (cf-completion-exception x))))
+      r))
+
+;; The wait. The result is read FIRST: a future that has settled answers even to
+;; a thread whose interrupt flag is set (JVM: get and join both return it and
+;; leave the flag alone), where the wait seam would throw before looking.
+(define (cf-await c who interruptible? deadline)
+  (let ((r (cf-result c)))
+    (if (not (cf-pending? r))
+        r
+        (let* ((st (jhost-state c))
+               (decide (lambda (timed-out?)
+                         (let ((r (vector-ref st 0)))
+                           (cond ((not (cf-pending? r)) r)
+                                 (timed-out? cf-timed-out)
+                                 (else jolt-cv-again))))))
+          (if interruptible?
+              (jolt-cv-wait-interruptibly who (vector-ref st 1) (vector-ref st 2) deadline decide)
+              (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) deadline decide))))))
+(define (cf-timeout-throw)
+  (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil)))
+;; get and its timed overload, in the shape future-shim-get* hands deref.
+(define (cf-get* c ms on-timeout)
+  (let ((r (cf-await c "CompletableFuture.get" #t (and ms (ms->deadline-millis ms)))))
+    (if (eq? r cf-timed-out) (on-timeout) (cf-report-get r))))
+
+(define (cf-cancelled? c)
+  (let ((r (cf-result c))) (and (cf-alt? r) (cf-cancellation? (cf-alt-ex r)))))
+
+;; --- the stage methods --------------------------------------------------------
+;; thenApply / thenAccept / thenRun and their Async forms. A failure is carried
+;; to the dependent inline, without the executor — the JVM propagates before it
+;; claims — and only the function call goes to the executor.
+(define (cf-uni src exec f kind)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-settle! d (cf-encode-relay r) #f)
+            (cf-fire! d exec
+              (lambda ()
+                (cf-complete-with! d
+                  (lambda ()
+                    (case kind
+                      ((apply) (cf-fn-call f "apply" r))
+                      ((accept) (cf-fn-call f "accept" r) jolt-nil)
+                      (else (cf-fn-call f "run") jolt-nil)))))))))
+    d))
+
+;; thenCombine / thenAcceptBoth / runAfterBoth: both sides settle first, then the
+;; first failure in (this, other) order wins, or the function runs.
+(define (cf-both a other exec f kind)
+  (cf-require! f)
+  (let ((b (cf-as-cf other)) (d (make-cf)))
+    (cf-when-done! a
+      (lambda (r)
+        (cf-when-done! b
+          (lambda (s)
+            (cond ((cf-alt? r) (cf-settle! d (cf-encode-relay r) #f))
+                  ((cf-alt? s) (cf-settle! d (cf-encode-relay s) #f))
+                  (else
+                   (cf-fire! d exec
+                     (lambda ()
+                       (cf-complete-with! d
+                         (lambda ()
+                           (case kind
+                             ((apply) (cf-fn-call f "apply" r s))
+                             ((accept) (cf-fn-call f "accept" r s) jolt-nil)
+                             (else (cf-fn-call f "run") jolt-nil))))))))))))
+    d))
+
+;; applyToEither / acceptEither / runAfterEither: whichever side settles first,
+;; this one if both already have. The claim box makes the loser a no-op.
+(define (cf-either a other exec f kind)
+  (cf-require! f)
+  (let* ((b (cf-as-cf other)) (d (make-cf)) (claimed (box #f))
+         (fire (lambda (r)
+                 (when (sa-box-cas! claimed #f #t)
+                   (if (cf-alt? r)
+                       (cf-settle! d (cf-encode-relay r) #f)
+                       (cf-fire! d exec
+                         (lambda ()
+                           (cf-complete-with! d
+                             (lambda ()
+                               (case kind
+                                 ((apply) (cf-fn-call f "apply" r))
+                                 ((accept) (cf-fn-call f "accept" r) jolt-nil)
+                                 (else (cf-fn-call f "run") jolt-nil)))))))))))
+    (cf-when-done! a fire)
+    (cf-when-done! b fire)
+    d))
+
+;; Settle D with whatever stage G settles with, relayed — thenCompose's second half.
+(define (cf-relay-stage! d g)
+  (let ((g (guard (e (#t (cf-settle! d (cf-encode-throwable (jolt-unwrap-throw e)) #f) #f))
+             (if (jolt-nil? g)
+                 (throw-jvm 'NullPointerException "the function answered null where a CompletionStage is required")
+                 (cf-as-cf g)))))
+    (when g
+      (cf-when-done! g (lambda (s) (cf-settle! d (cf-encode-relay s) #f))))))
+;; Call F for the stage it answers, or settle D with the failure: #f then.
+(define (cf-call-for-stage d f method arg)
+  (guard (e (#t (cf-settle! d (cf-encode-throwable (jolt-unwrap-throw e)) #f) #f))
+    (cons 'stage (cf-fn-call f method arg))))
+
+(define (cf-compose src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-settle! d (cf-encode-relay r) #f)
+            (cf-fire! d exec
+              (lambda ()
+                (let ((g (cf-call-for-stage d f "apply" r)))
+                  (when g (cf-relay-stage! d (cdr g)))))))))
+    d))
+
+(define (cf-exceptionally-compose src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-fire! d exec
+              (lambda ()
+                (let ((g (cf-call-for-stage d f "apply" (cf-alt-ex r))))
+                  (when g (cf-relay-stage! d (cdr g))))))
+            (cf-settle! d r #f))))
+    d))
+
+;; handle: the function sees (value, nil) or (nil, the stored throwable) and its
+;; answer is the dependent's value.
+(define (cf-handle src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (cf-fire! d exec
+          (lambda ()
+            (cf-complete-with! d
+              (lambda ()
+                (if (cf-alt? r)
+                    (cf-fn-call f "apply" jolt-nil (cf-alt-ex r))
+                    (cf-fn-call f "apply" r jolt-nil))))))))
+    d))
+
+;; whenComplete: the action sees what handle's function sees; the dependent
+;; keeps the source's result, unless the action throws over a NORMAL result,
+;; which then fails the dependent. (The JVM also records the action's throw as
+;; suppressed on an earlier failure; jolt throwables carry no suppressed list.)
+(define (cf-when-complete src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (cf-fire! d exec
+          (lambda ()
+            (let ((thrown (guard (e (#t (jolt-unwrap-throw e)))
+                            (if (cf-alt? r)
+                                (cf-fn-call f "accept" jolt-nil (cf-alt-ex r))
+                                (cf-fn-call f "accept" r jolt-nil))
+                            cf-pending)))
+              (cf-settle! d
+                          (if (or (eq? thrown cf-pending) (cf-alt? r))
+                              (cf-encode-relay r)
+                              (cf-encode-throwable thrown))
+                          #f))))))
+    d))
+
+;; exceptionally: a value passes through inline; a failure goes to the function.
+(define (cf-exceptionally src exec f)
+  (cf-require! f)
+  (let ((d (make-cf)))
+    (cf-when-done! src
+      (lambda (r)
+        (if (cf-alt? r)
+            (cf-fire! d exec
+              (lambda () (cf-complete-with! d (lambda () (cf-fn-call f "apply" (cf-alt-ex r))))))
+            (cf-settle! d r #f))))
+    d))
+
+;; supplyAsync / runAsync / completeAsync. An executor that refuses the task
+;; raises to the caller here, as it does on the JVM.
+(define (cf-async-supply d s exec kind)
+  (cf-require! s)
+  (cf-execute! exec
+    (lambda ()
+      (cf-complete-with! d
+        (lambda ()
+          (if (eq? kind 'supply) (cf-fn-call s "get") (begin (cf-fn-call s "run") jolt-nil))))))
+  d)
+
+(define (cf-stage-list args)
+  (let ((xs (if (and (= 1 (length args)) (not (cf? (car args))))
+                (let ((s (jolt-seq (cf-require! (car args)))))
+                  (if (jolt-nil? s) '() (seq->list s)))
+                args)))
+    (let loop ((xs xs) (acc '()))
+      (if (null? xs) (reverse acc) (loop (cdr xs) (cons (cf-as-cf (car xs)) acc))))))
+
+;; allOf: settles once every stage has, with nil, or with the first failure in
+;; argument order (the JVM's tree of pairwise relays prefers the left side at
+;; every node, which is the same thing).
+(define (cf-all-of cfs)
+  (let ((d (make-cf)) (left (box (length cfs))))
+    (if (null? cfs)
+        (cf-settle! d jolt-nil #f)
+        (for-each
+          (lambda (c)
+            (cf-when-done! c
+              (lambda (_)
+                (when (let retry ()
+                        (let ((n (unbox left)))
+                          (if (box-cas! left n (fx- n 1)) (fx=? n 1) (retry))))
+                  (cf-settle! d
+                              (let loop ((cs cfs))
+                                (if (null? cs)
+                                    jolt-nil
+                                    (let ((r (cf-result (car cs))))
+                                      (if (cf-alt? r) (cf-encode-relay r) (loop (cdr cs))))))
+                              #f)))))
+          cfs))
+    d))
+;; anyOf: the first stage to settle, and of stages already settled the first in
+;; argument order (each registers in turn, and one already settled fires as it
+;; registers). Of none, a future that never completes.
+(define (cf-any-of cfs)
+  (let ((d (make-cf)))
+    (for-each (lambda (c) (cf-when-done! c (lambda (r) (cf-settle! d (cf-encode-relay r) #f)))) cfs)
+    d))
+
+;; orTimeout / completeOnTimeout. The deadline is the shared timer's (async.ss),
+;; and the settle is handed to the async pool rather than run on the timer
+;; thread, so dependents never run there; settling the future cancels the timer.
+(define (cf-on-timeout! self amount unit r)
+  (when (cf-pending? (cf-result self))
+    (let ((e (jolt-timer-at! (ms->deadline-millis (tu->ms amount unit))
+               (lambda () (cf-execute! 'default (lambda () (cf-settle! self (r) #f)))))))
+      (cf-when-done! self (lambda (_) (jolt-timer-cancel! e)))))
+  self)
+
+;; CompletableFuture.delayedExecutor(delay, unit[, executor]): an Executor that
+;; hands each task to the base executor once the delay has passed.
+(define (make-cf-delayed-executor amount unit base)
+  (make-jhost "cf-delayed-executor" (vector (tu->ms amount unit) base)))
+(register-host-methods! "cf-delayed-executor"
+  (list (cons "execute" (lambda (self r)
+          (cf-require! r)
+          (let ((st (jhost-state self)))
+            (jolt-timer-at! (ms->deadline-millis (vector-ref st 0))
+              (lambda () (cf-execute! (vector-ref st 1) (lambda () (cf-fn-call r "run"))))))
+          jolt-nil))
+        (cons "toString" (lambda (self) "java.util.concurrent.CompletableFuture$DelayedExecutor"))))
+
+;; java.util.concurrent.Future.State, what state() answers: an enum, so each
+;; constant is one object and = compares them by identity.
+(define future-state-constants
+  (map (lambda (nm) (cons nm (make-jhost "future-state" nm)))
+       '("RUNNING" "SUCCESS" "FAILED" "CANCELLED")))
+(define (future-state nm) (cdr (assoc nm future-state-constants)))
+(register-class-statics! "java.util.concurrent.Future$State" future-state-constants)
+(register-class-statics! "Future$State" future-state-constants)
+(register-host-methods! "future-state"
+  (list (cons "name" (lambda (self) (jhost-state self)))
+        (cons "toString" (lambda (self) (jhost-state self)))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "future-state")))
+                      (lambda (x) (jhost-state x)))
+
+(define (cf-to-string self)
+  (let* ((st (jhost-state self))
+         (snap (jolt-with-mutex (vector-ref st 1)
+                 (cons (vector-ref st 0) (length (vector-ref st 3)))))
+         (r (car snap)) (n (cdr snap)))
+    (string-append
+      "java.util.concurrent.CompletableFuture@"
+      ;; Integer.toHexString of the identity hash: unsigned, lowercase
+      (string-downcase (number->string (bitwise-and (jolt-identity-hasheq self) #xFFFFFFFF) 16))
+      (cond ((cf-pending? r)
+             (if (fx=? n 0)
+                 "[Not completed]"
+                 (string-append "[Not completed, " (number->string n) " dependents]")))
+            ((cf-alt? r) (string-append "[Completed exceptionally: " (jolt-str-render-one (cf-alt-ex r)) "]"))
+            (else "[Completed normally]")))))
+(register-str-render! cf? cf-to-string)
+
+(for-each (lambda (nm) (register-class-ctor! nm (case-lambda (() (make-cf)))))
+          '("CompletableFuture" "java.util.concurrent.CompletableFuture"))
+(let ((statics
+       (list
+         (cons "completedFuture" (lambda (v) (make-cf* v)))
+         (cons "failedFuture" (lambda (x) (make-cf* (make-cf-alt (cf-require! x)))))
+         (cons "supplyAsync" (case-lambda
+           ((s) (cf-async-supply (make-cf) s 'default 'supply))
+           ((s exec) (cf-require! s) (cf-async-supply (make-cf) s (cf-require! exec) 'supply))))
+         (cons "runAsync" (case-lambda
+           ((r) (cf-async-supply (make-cf) r 'default 'run))
+           ((r exec) (cf-require! r) (cf-async-supply (make-cf) r (cf-require! exec) 'run))))
+         (cons "allOf" (lambda cfs (cf-all-of (cf-stage-list cfs))))
+         (cons "anyOf" (lambda cfs (cf-any-of (cf-stage-list cfs))))
+         (cons "delayedExecutor" (case-lambda
+           ((amount unit) (make-cf-delayed-executor amount (cf-require! unit) 'default))
+           ((amount unit exec) (make-cf-delayed-executor amount (cf-require! unit) (cf-require! exec))))))))
+  (register-class-statics! "CompletableFuture" statics)
+  (register-class-statics! "java.util.concurrent.CompletableFuture" statics))
+
+(register-host-methods! "completable-future"
+  (list
+    (cons "complete" (lambda (self v) (cf-settle! self v #f)))
+    (cons "completeExceptionally" (lambda (self x) (cf-settle! self (make-cf-alt (cf-require! x)) #f)))
+    ;; cancel(mayInterruptIfRunning): the flag is ignored on the JVM too — a
+    ;; CompletableFuture has no thread of its own to interrupt. It answers true
+    ;; for a future that is cancelled, whichever call cancelled it.
+    (cons "cancel" (lambda (self _may-interrupt)
+      (or (cf-settle! self (make-cf-alt (cf-new-cancellation)) #f)
+          (cf-cancelled? self))))
+    (cons "isDone" (lambda (self) (not (cf-pending? (cf-result self)))))
+    (cons "isCancelled" (lambda (self) (cf-cancelled? self)))
+    (cons "isCompletedExceptionally" (lambda (self) (cf-alt? (cf-result self))))
+    (cons "get" (case-lambda
+      ((self) (cf-get* self #f cf-timeout-throw))
+      ((self amount unit) (cf-get* self (tu->ms amount unit) cf-timeout-throw))))
+    (cons "join" (lambda (self) (cf-report-join (cf-await self "CompletableFuture.join" #f #f))))
+    (cons "getNow" (lambda (self v)
+      (let ((r (cf-result self))) (if (cf-pending? r) v (cf-report-join r)))))
+    (cons "resultNow" (lambda (self)
+      (let ((r (cf-result self)))
+        (if (or (cf-pending? r) (cf-alt? r))
+            (throw-jvm 'IllegalStateException jolt-nil)
+            r))))
+    (cons "exceptionNow" (lambda (self)
+      (let ((r (cf-result self)))
+        (if (and (cf-alt? r) (not (cf-cancellation? (cf-alt-ex r))))
+            (let ((x (cf-alt-ex r)))
+              (if (and (cf-completion? x) (not (jolt-nil? (cf-cause x)))) (cf-cause x) x))
+            (throw-jvm 'IllegalStateException jolt-nil)))))
+    (cons "state" (lambda (self)
+      (let ((r (cf-result self)))
+        (future-state (cond ((cf-pending? r) "RUNNING")
+                            ((not (cf-alt? r)) "SUCCESS")
+                            ((cf-cancellation? (cf-alt-ex r)) "CANCELLED")
+                            (else "FAILED"))))))
+    (cons "obtrudeValue" (lambda (self v) (cf-settle! self v #t) jolt-nil))
+    (cons "obtrudeException" (lambda (self x) (cf-settle! self (make-cf-alt (cf-require! x)) #t) jolt-nil))
+    (cons "getNumberOfDependents" (lambda (self)
+      (let ((st (jhost-state self)))
+        (jolt-with-mutex (vector-ref st 1) (length (vector-ref st 3))))))
+    (cons "toCompletableFuture" (lambda (self) self))
+    (cons "copy" (lambda (self)
+      (let ((d (make-cf)))
+        (cf-when-done! self (lambda (r) (cf-settle! d (cf-encode-relay r) #f)))
+        d)))
+    (cons "newIncompleteFuture" (lambda (self) (make-cf)))
+    (cons "toString" cf-to-string)
+    (cons "orTimeout" (lambda (self amount unit)
+      (cf-on-timeout! self amount (cf-require! unit)
+        (lambda () (make-cf-alt (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil))))))
+    (cons "completeOnTimeout" (lambda (self v amount unit)
+      (cf-on-timeout! self amount (cf-require! unit) (lambda () v))))
+    (cons "completeAsync" (case-lambda
+      ((self s) (cf-async-supply self s 'default 'supply))
+      ((self s exec) (cf-require! s) (cf-async-supply self s (cf-require! exec) 'supply))))
+    (cons "thenApply" (lambda (self f) (cf-uni self #f f 'apply)))
+    (cons "thenApplyAsync" (cf-async-1 (lambda (self exec f) (cf-uni self exec f 'apply))))
+    (cons "thenAccept" (lambda (self f) (cf-uni self #f f 'accept)))
+    (cons "thenAcceptAsync" (cf-async-1 (lambda (self exec f) (cf-uni self exec f 'accept))))
+    (cons "thenRun" (lambda (self f) (cf-uni self #f f 'run)))
+    (cons "thenRunAsync" (cf-async-1 (lambda (self exec f) (cf-uni self exec f 'run))))
+    (cons "thenCombine" (lambda (self o f) (cf-both self o #f f 'apply)))
+    (cons "thenCombineAsync" (cf-async-2 (lambda (self o exec f) (cf-both self o exec f 'apply))))
+    (cons "thenAcceptBoth" (lambda (self o f) (cf-both self o #f f 'accept)))
+    (cons "thenAcceptBothAsync" (cf-async-2 (lambda (self o exec f) (cf-both self o exec f 'accept))))
+    (cons "runAfterBoth" (lambda (self o f) (cf-both self o #f f 'run)))
+    (cons "runAfterBothAsync" (cf-async-2 (lambda (self o exec f) (cf-both self o exec f 'run))))
+    (cons "applyToEither" (lambda (self o f) (cf-either self o #f f 'apply)))
+    (cons "applyToEitherAsync" (cf-async-2 (lambda (self o exec f) (cf-either self o exec f 'apply))))
+    (cons "acceptEither" (lambda (self o f) (cf-either self o #f f 'accept)))
+    (cons "acceptEitherAsync" (cf-async-2 (lambda (self o exec f) (cf-either self o exec f 'accept))))
+    (cons "runAfterEither" (lambda (self o f) (cf-either self o #f f 'run)))
+    (cons "runAfterEitherAsync" (cf-async-2 (lambda (self o exec f) (cf-either self o exec f 'run))))
+    (cons "thenCompose" (lambda (self f) (cf-compose self #f f)))
+    (cons "thenComposeAsync" (cf-async-1 (lambda (self exec f) (cf-compose self exec f))))
+    (cons "handle" (lambda (self f) (cf-handle self #f f)))
+    (cons "handleAsync" (cf-async-1 (lambda (self exec f) (cf-handle self exec f))))
+    (cons "whenComplete" (lambda (self f) (cf-when-complete self #f f)))
+    (cons "whenCompleteAsync" (cf-async-1 (lambda (self exec f) (cf-when-complete self exec f))))
+    (cons "exceptionally" (lambda (self f) (cf-exceptionally self #f f)))
+    (cons "exceptionallyAsync" (cf-async-1 (lambda (self exec f) (cf-exceptionally self exec f))))
+    (cons "exceptionallyCompose" (lambda (self f) (cf-exceptionally-compose self #f f)))
+    (cons "exceptionallyComposeAsync" (cf-async-1 (lambda (self exec f) (cf-exceptionally-compose self exec f))))))
 
 ;; java.util.concurrent.locks.ReentrantLock — a reentrant mutual-exclusion lock.
 ;; State: #(monitor), one MONITOR record of its own (make-monitor above), not the

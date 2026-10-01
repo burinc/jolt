@@ -25,7 +25,7 @@
 ;; and is never woken is a hang too, and it would pass a test that only checked the
 ;; untimed paths.
 (require '[clojure.core.async :as a])
-(import '[java.util.concurrent CountDownLatch Executors TimeUnit])
+(import '[java.util.concurrent CompletableFuture CountDownLatch Executors TimeUnit TimeoutException])
 
 (alter-var-root #'clojure.core.async/*fiber-carrier-count* (constantly 1))
 
@@ -198,6 +198,23 @@
                            [(into {} [(first a1) (first a2)]) @runs]
                            :HUNG)])))
 
+;; 24-28. CompletableFuture: get, join, deref and a dependent's join all park
+;; until the releaser completes the future, and a timed get is woken at its
+;; deadline with the TimeoutException.
+(let [c (CompletableFuture.)]
+  (probe :cf-get (fn [] (.get c)) #(.complete c :completed)))
+(let [c (CompletableFuture.)]
+  (probe :cf-join (fn [] (.join c)) #(.complete c :completed)))
+(let [c (CompletableFuture.)]
+  (probe :cf-deref (fn [] (deref c)) #(.complete c :completed)))
+(let [c (CompletableFuture.)
+      d (.thenApply c inc)]
+  (probe :cf-dependent (fn [] (.join d)) #(.complete c 1)))
+(let [c (CompletableFuture.)]
+  (probe :cf-get-deadline
+         (fn [] (try (.get c 150 TimeUnit/MILLISECONDS) (catch TimeoutException _ :timed-out)))
+         nil))
+
 (def expected
   {:promise :delivered
    :promise-timed :delivered
@@ -221,7 +238,12 @@
    :lazy-filterv [1]
    :lazy-timed-wait [:sibling-ran]
    :lazy-contended-locking [:got]
-   :lazy-shared-cell [{:first :one :second :one} 1]})
+   :lazy-shared-cell [{:first :one :second :one} 1]
+   :cf-get :completed
+   :cf-join :completed
+   :cf-deref :completed
+   :cf-dependent 2
+   :cf-get-deadline :timed-out})
 
 (let [got (into {} @results)
       bad (remove (fn [[k v]] (= v (get expected k))) (seq got))

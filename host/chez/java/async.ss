@@ -836,7 +836,7 @@
       (condition-signal timeout-cv))
     (unless timeout-running?
       (set! timeout-running? #t)
-      (fork-thread timeout-thread))
+      (fork-thread/daemon #t timeout-thread))      ; a runtime thread: never keeps the process up
     (jolt-unlock! timeout-mu)
     e))
 
@@ -997,7 +997,8 @@
     ;; registry with no entry for it, and every later monitor would read the
     ;; missing entry as "nothing to report" — the clean-completion answer.
     (go-chan-register! w)
-    (fork-thread
+    ;; a daemon, as core.async's thread and go pools' threads are on the JVM
+    (fork-thread/daemon #t
      (lambda ()
        (*txn* #f)                          ; go/thread body must not inherit parent's txn
        (dyn-binding-stack snap)

@@ -368,6 +368,17 @@
   ;; is what Thread/getAllStackTraces hands back.
   {:suite "threads / id" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) seen (atom nil) t (Thread. (fn [] (reset! seen (.getId (Thread/currentThread))) (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)))] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [ids (into #{} (map #(.getId %) (keys (Thread/getAllStackTraces))))] (.countDown release) (contains? ids @seen)))" :expected "true"}
   {:suite "threads / id" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)))] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [ths (keys (Thread/getAllStackTraces)) ids (map #(.getId %) ths)] (.countDown release) (= (count ths) (count (set ids)))))" :expected "true"}
+  ;; Daemon status of the core.async threads, which the corpus cannot carry (the
+  ;; oracle has no core.async on its classpath). Probed on JVM Clojure 1.12.5 +
+  ;; core.async 1.9.865 / JDK 21: thread, go, io-thread and thread-call's threads
+  ;; are all daemons, and a Thread made on one inherits it. The fiber row is jolt's
+  ;; own: a go block on a fiber answers for its carrier, which is a daemon too.
+  {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] [(a/<!! (a/thread (me))) (a/<!! (a/go (me))) (a/<!! (a/thread (.isDaemon (Thread. (fn []))))) (a/<!! (a/io-thread (me))) (a/<!! (a/thread-call me :compute))]))" :expected "[true true true true true]"}
+  {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (a/<!! (a/go [(jolt.host/fiber?) (.isDaemon (Thread/currentThread))]))))" :expected "[true true]"}
+  ;; A future and a send-off run on the agent pools, whose threads are never
+  ;; daemons, even when a daemon thread (here core.async's) starts them; they used
+  ;; to inherit the creator's status. JVM: [false false].
+  {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] (a/<!! (a/thread [(deref (future (me)) 5000 :hung) (let [ag (agent nil) p (promise)] (send-off ag (fn [_] (deliver p (me)))) (deref p 5000 :hung))]))))" :expected "[false false]"}
   {:suite "threads / name" :expr "(.getName (Thread/currentThread))" :expected "\"main\""}
   {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))))) (not= \"main\" (deref p 5000 :timeout)))" :expected "true"}
   {:suite "threads / name" :expr "(let [p (promise) t (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))) \"worker-x\")] (.start t) [(.getName t) (deref p 5000 :timeout)])" :expected "[\"worker-x\" \"worker-x\"]"}
@@ -467,6 +478,17 @@
   ;; re-acquire on its way out, so a runtime that threw from the wait set and left
   ;; the monitor free reads :lost-monitor here rather than passing.
   {:suite "interrupt / blocking" :expr "(let [o (Object.) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (locking o (let [t0 (System/nanoTime) r (try (.wait o 30000) :no-throw (catch InterruptedException e :threw))] [r (< (quot (- (System/nanoTime) t0) 1000000) 3000) (.isInterrupted (Thread/currentThread)) (try (.notify o) :owns-monitor (catch IllegalMonitorStateException e :lost-monitor))])))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true false :owns-monitor]"}
+  ;; CompletableFuture: get and deref are interruptible, join is NOT —
+  ;; on the JVM join keeps waiting through an interrupt and returns with the flag
+  ;; still set, and a future that has already settled answers get and join even
+  ;; to a thread whose flag is set (the result is read before the wait). Every
+  ;; row below was run on JVM Clojure 1.12.5 / JDK 21 and answers the same there.
+  {:suite "interrupt / blocking" :expr "(let [c (java.util.concurrent.CompletableFuture.) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.get c) :no-throw (catch InterruptedException e [:threw (.isInterrupted (Thread/currentThread))]))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[[:threw false] true]"}
+  {:suite "interrupt / blocking" :expr "(let [c (java.util.concurrent.CompletableFuture.) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.get c 30 java.util.concurrent.TimeUnit/SECONDS) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [c (java.util.concurrent.CompletableFuture.) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref c) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [c (java.util.concurrent.CompletableFuture.) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try [(.join c) (.isInterrupted (Thread/currentThread))] (catch Throwable e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [early (deref out 300 :still-waiting)] (.complete c :v) [early (deref out 5000 :timeout)]))" :expected "[:still-waiting [:v true]]"}
+  {:suite "interrupt / blocking" :expr "(let [c (java.util.concurrent.CompletableFuture.) t (Thread/currentThread) t0 (System/nanoTime)] (future (Thread/sleep 4000) (.complete c :late)) (.interrupt t) (let [r (try (.get c) :no-throw (catch InterruptedException e :threw))] [r (< (quot (- (System/nanoTime) t0) 1000000) 2000) (.isInterrupted t)]))" :expected "[:threw true false]"}
+  {:suite "interrupt / blocking" :expr "(let [c (java.util.concurrent.CompletableFuture/completedFuture 1)] [(do (.interrupt (Thread/currentThread)) [(.get c) (Thread/interrupted)]) (do (.interrupt (Thread/currentThread)) [(.join c) (Thread/interrupted)]) (do (.interrupt (Thread/currentThread)) [(deref c) (Thread/interrupted)])])" :expected "[[1 true] [1 true] [1 true]]"}
   ;; THE FIBER ROWS, and they bind *go-backend* :fiber ON PURPOSE — go defaults to
   ;; :thread, so an unbound (go ...) row runs on a plain OS thread and re-tests the
   ;; thread rows above rather than the fiber path. (jolt.host/fiber?) is carried in
@@ -553,6 +575,13 @@
   {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE)] [(first (a/alts!! [[c 1]])) (first (a/alts!! [c]))]))" :expected "[true 1]"}
   {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan Long/MAX_VALUE) r (a/thread (a/<!! c))] (Thread/sleep 50) [(a/offer! c 1) (a/<!! r)]))" :expected "[true 1]"}
   {:suite "core.async / big buffer" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (a/chan Long/MAX_VALUE)] (a/<!! (a/go (a/>! c 1) (a/<! c))))))" :expected "1"}
+  ;; CompletableFuture on a fiber: get parks and is thrown out by an interrupt of
+  ;; the carrier, set before the wait or arriving during it; join parks and is
+  ;; not, and the flag it leaves set is read (and cleared) by Thread/interrupted so
+  ;; it cannot leak onto the carrier the later rows share.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (java.util.concurrent.CompletableFuture.)] (future (Thread/sleep 4000) (.complete c :late)) (a/<!! (a/go [(jolt.host/fiber?) (do (.interrupt (Thread/currentThread)) (try (.get c) :no-throw (catch InterruptedException e :threw)))])))))" :expected "[true :threw]"}
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (java.util.concurrent.CompletableFuture.) carrier (promise) out (promise)] (a/go (deliver carrier [(jolt.host/fiber?) (Thread/currentThread)]) (deliver out (try (.get c) :no-throw (catch InterruptedException e :threw)))) (let [[fib? car] (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt car) [fib? (deref out 5000 :timeout)]))))" :expected "[true :threw]"}
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (java.util.concurrent.CompletableFuture.)] (future (Thread/sleep 200) (.complete c :late)) (a/<!! (a/go [(jolt.host/fiber?) (do (.interrupt (Thread/currentThread)) (try (.join c) (catch Throwable e :threw))) (Thread/interrupted)])))))" :expected "[true :late true]"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}

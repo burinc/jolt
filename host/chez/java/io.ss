@@ -2939,6 +2939,27 @@
       (if (eqv? id jolt-boot-thread-id)
           "main"
           (string-append "Thread-" (number->string id)))))
+;; Priorities, id-keyed like the names and for the same reason. Only a priority
+;; other than NORM_PRIORITY (5) has an entry.
+(define thread-priorities-by-id (make-eqv-hashtable))
+(define (jolt-thread-priority id)
+  (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-priorities-by-id id 5)))
+(define (jolt-thread-priority-set! id p)
+  (jolt-with-mutex thread-handles-mutex
+    (if (eqv? p 5)
+        (hashtable-delete! thread-priorities-by-id id)
+        (hashtable-set! thread-priorities-by-id id p))))
+;; Thread.setPriority's argument: MIN_PRIORITY..MAX_PRIORITY, else
+;; IllegalArgumentException (with no message, as the JVM's).
+(define (jolt-thread-priority-arg p)
+  (let ((n (and (number? p) (jnum->exact p))))
+    (if (and (integer? n) (<= 1 n 10))
+        n
+        (throw-jvm 'IllegalArgumentException jolt-nil))))
+;; A handle's thread is alive while it runs: it is the caller, the boot thread
+;; (whose end is the process's), or a thread jolt started that has not finished.
+(define (thread-handle-alive? id)
+  (or (eqv? id (get-thread-id)) (eqv? id jolt-boot-thread-id) (jolt-started-thread? id)))
 (register-host-methods! "thread"
   ;; TCCL follows the ambient loader the way io/resource's 1-arity does: inside
   ;; `with-loader` it is that context's facade (so a library finding its own
@@ -2957,6 +2978,26 @@
                           (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
                           jolt-nil))
         (cons "getId" (lambda (self) (thread-handle-id self)))
+        (cons "threadId" (lambda (self) (thread-handle-id self)))
+        ;; Daemon status is the thread's, recorded where it was forked
+        ;; (lazy-bridge.ss), so every handle for it and its Thread object agree.
+        (cons "isDaemon" (lambda (self) (jolt-thread-daemon? (thread-handle-id self))))
+        ;; Every thread a handle can name is alive or has been, and setDaemon is
+        ;; refused on a live one; one that has finished keeps its status here,
+        ;; as its Thread object is the thing to change it through.
+        (cons "setDaemon" (lambda (self d)
+                            (if (thread-handle-alive? (thread-handle-id self))
+                                (jolt-throw (jolt-host-throwable
+                                             "java.lang.IllegalThreadStateException" jolt-nil))
+                                (jolt-thread-daemon-set! (thread-handle-id self) (jolt-truthy? d)))
+                            jolt-nil))
+        (cons "isAlive" (lambda (self) (thread-handle-alive? (thread-handle-id self))))
+        (cons "isVirtual" (lambda (self) #f))
+        (cons "getPriority" (lambda (self) (jolt-thread-priority (thread-handle-id self))))
+        (cons "setPriority" (lambda (self p)
+                              (jolt-thread-priority-set! (thread-handle-id self)
+                                                         (jolt-thread-priority-arg p))
+                              jolt-nil))
         ;; the calling thread's frames, reconstructed the way an uncaught error's
         ;; backtrace is (source-registry.ss); another thread's stack is not
         ;; reachable, so it answers an empty array.
