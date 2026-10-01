@@ -549,9 +549,12 @@
 ;; what keeps the process up after it: send's fixed pool for good, send-off's cached
 ;; pool for its keep-alive (the exit wait, below). send-via takes the caller's
 ;; executor and holds nothing of the agent system's.
+;; The fixed pool gains a worker only once an action reaches it: a send that
+;; throws (a failed agent) or is rejected holds nothing up.
 (define (jolt-agent-send a f . args)
-  (exit-hold-pooled!)
-  (apply jolt-agent-dispatch a f args))
+  (apply jolt-agent-dispatch a f args)
+  (unless (jolt-agents-shutdown?) (exit-hold-pooled!))
+  a)
 (define (jolt-agent-send-off a f . args)
   (apply jolt-agent-dispatch a f args))
 (define (jolt-agent-dispatch a f . args)
@@ -678,8 +681,10 @@
   (jolt-with-mutex (jolt-agent-mu a) (jagent-q-count a)))
 (define (jagent-restart-2 a new-state clear?)
   (jolt-agent-restart a new-state (keyword #f "clear-actions") (jolt-truthy? clear?)))
+;; The action runs on jolt's agent worker whatever executor is named; it holds
+;; the exit as that worker does (the 60s linger), not as the fixed send pool.
 (define (jagent-dispatch-3 a f args _exec)
-  (apply jolt-agent-send a f (rd-args->list args)))
+  (apply jolt-agent-dispatch a f (rd-args->list args)))
 (define (jagent-method name argc)
   (cond ((string=? name "getError")        (and (fx=? argc 0) jolt-agent-error))
         ((string=? name "getErrorMode")    (and (fx=? argc 0) jolt-agent-get-error-mode))
@@ -1891,6 +1896,20 @@
 ;; shutdown hooks run (jolt-await-user-threads!). System/exit does not wait --
 ;; neither does the JVM's.
 (define (jthread-daemon? st) (vector-ref st 8))
+;; The runtime id of a thread that is running, else #f. While it runs its name,
+;; daemon status and priority are the id-keyed tables' (every object for it reads
+;; the same); once it has finished they are the object's own slots, which the exit
+;; hook (io.ss) filled before the tables let go.
+(define (jthread-running-id st) (and (not (vector-ref st 1)) (jthread-id st)))
+;; Read one of those: the table's answer, unless the thread finished while it was
+;; read — the hook sets done before it deletes the entry, so a read that missed
+;; the entry for that reason sees done and takes the slot.
+(define (jthread-attr st table-ref slot-ref)
+  (let ((id (jthread-running-id st)))
+    (if id
+        (let ((v (table-ref id)))
+          (if (vector-ref st 1) (slot-ref st) v))
+        (slot-ref st))))
 ;; alive = started and not yet completed. join waits on exactly this, so a thread
 ;; that was never started is not waited for at all (JVM: isAlive is false before
 ;; .start, so join returns at once).
@@ -1979,14 +1998,18 @@
                   ;; the id-keyed name and priority first: getName and
                   ;; getPriority read them as soon as slot 7 is set
                   ;; ...unless the child already has, and may have renamed itself
+                  ;; Nothing is registered for a thread that has already
+                  ;; finished: its exit hook has run, and an entry made now
+                  ;; would outlive it (ids are never reused).
                   (jolt-with-mutex thread-handles-mutex
-                    (unless (hashtable-contains? thread-names-by-id id)
-                      (hashtable-set! thread-names-by-id id (unbox (vector-ref st 6)))
-                      (unless (eqv? 5 (vector-ref st 9))
-                        (hashtable-set! thread-priorities-by-id id (vector-ref st 9)))))
+                    (when (jolt-started-thread? id)
+                      (unless (hashtable-contains? thread-names-by-id id)
+                        (hashtable-set! thread-names-by-id id (unbox (vector-ref st 6)))
+                        (unless (eqv? 5 (vector-ref st 9))
+                          (hashtable-set! thread-priorities-by-id id (vector-ref st 9))))
+                      (hashtable-set! thread-handles-by-id id self)))
                   (jolt-with-mutex (vector-ref st 2)
-                    (unless (vector-ref st 7) (vector-set! st 7 id)))
-                  (register-thread-object! id self))))
+                    (unless (vector-ref st 7) (vector-set! st 7 id))))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
@@ -2027,13 +2050,13 @@
         ;; an executor's ThreadFactory and a rename from inside write
         (cons "getName" (lambda (self)
           (let ((st (jhost-state self)))
-            (if (jthread-id st) (jolt-thread-name (jthread-id st)) (unbox (vector-ref st 6))))))
+            (jthread-attr st jolt-thread-name (lambda (st) (unbox (vector-ref st 6)))))))
         ;; A rename after .start has to reach the running thread too, or the two
         ;; spellings of the same thread's name disagree.
         (cons "setName" (lambda (self nm)
           (let* ((st (jhost-state self)) (s (jolt-final-str nm)))
             (set-box! (vector-ref st 6) s)
-            (when (jthread-id st) (jolt-thread-name-set! (jthread-id st) s)))
+            (when (jthread-running-id st) (jolt-thread-name-set! (jthread-id st) s)))
           jolt-nil))
         ;; refused while the thread is ALIVE, as Thread.setDaemon checks isAlive():
         ;; before start and after it has finished the flag can still be set.
@@ -2041,23 +2064,21 @@
           (let ((st (jhost-state self)))
             (when (jthread-alive? st)
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException" jolt-nil)))
-            (vector-set! st 8 (and (jolt-truthy? flag) #t))
-            ;; a thread that has finished: its handle must keep agreeing
-            (when (jthread-id st) (jolt-thread-daemon-set! (jthread-id st) (vector-ref st 8))))
+            (vector-set! st 8 (and (jolt-truthy? flag) #t)))
           jolt-nil))
         (cons "isDaemon" (lambda (self)
           (let ((st (jhost-state self)))
-            (if (jthread-id st) (jolt-thread-daemon? (jthread-id st)) (and (jthread-daemon? st) #t)))))
+            (jthread-attr st jolt-thread-daemon? (lambda (st) (and (jthread-daemon? st) #t))))))
         ;; Priority: advisory, as the JVM documents it, and jolt schedules no
         ;; differently for it — but it is stored, validated and inherited as there,
         ;; and once started it is the thread's, so the handle reads the same value.
         (cons "getPriority" (lambda (self)
           (let ((st (jhost-state self)))
-            (if (jthread-id st) (jolt-thread-priority (jthread-id st)) (vector-ref st 9)))))
+            (jthread-attr st jolt-thread-priority (lambda (st) (vector-ref st 9))))))
         (cons "setPriority" (lambda (self p)
           (let ((st (jhost-state self)) (p (jolt-thread-priority-arg p)))
             (vector-set! st 9 p)
-            (when (jthread-id st) (jolt-thread-priority-set! (jthread-id st) p)))
+            (when (jthread-running-id st) (jolt-thread-priority-set! (jthread-id st) p)))
           jolt-nil))
         (cons "isVirtual" (lambda (self) #f))
         ;; its group while it lives; nil once it has terminated, as on the JVM
@@ -2905,6 +2926,10 @@
       ;; can tell apart, since jolt has no thread-locals and a task's identity is
       ;; its own.
       (cached (lambda args (make-cached-executor #f (thread-factory-in args))))
+      ;; ...whose workers are daemons, as every virtual thread is: a script that
+      ;; never closes the executor exits when it returns, not 60s after its last
+      ;; task.
+      (vcached (lambda _ (make-cached-executor #t)))
       ;; newWorkStealingPool is NOT one of those and stays a fixed pool: a
       ;; ForkJoinPool is sized at availableProcessors, because work stealing is for
       ;; CPU-bound tasks that would only contend if there were more of them than
@@ -2917,7 +2942,7 @@
               (list (cons "newSingleThreadExecutor" single)
                     (cons "newSingleThreadScheduledExecutor" scheduled-single)
                     (cons "newFixedThreadPool" fixed) (cons "newScheduledThreadPool" scheduled-fixed)
-                    (cons "newVirtualThreadPerTaskExecutor" cached)
+                    (cons "newVirtualThreadPerTaskExecutor" vcached)
                     (cons "newCachedThreadPool" cached) (cons "newWorkStealingPool" stealing))))
             '("Executors" "java.util.concurrent.Executors")))
 ;; submit, as a named procedure: invokeAll and invokeAny below are defined in

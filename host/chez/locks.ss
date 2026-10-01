@@ -361,17 +361,12 @@
   (case-lambda
     ((cv mu)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
-     (let* ((b (thread-state-box)) (old (unbox b)))
-       (set-box! b (or old 'WAITING))
-       (condition-wait cv mu)
-       (set-box! b old)))
+     ;; dynamic-wind: an interrupt handler that escapes the wait must not leave
+     ;; the thread reading WAITING
+     (call-with-thread-state 'WAITING (lambda () (condition-wait cv mu))))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
-     (let* ((b (thread-state-box)) (old (unbox b)))
-       (set-box! b (or old 'TIMED_WAITING))
-       (let ((r (condition-wait cv mu abs-time)))
-         (set-box! b old)
-         r)))))
+     (call-with-thread-state 'TIMED_WAITING (lambda () (condition-wait cv mu abs-time))))))
 
 ;; --- the wait beneath the fiber layer ---------------------------------------
 ;; (jolt-stop-the-world-wait cv mu timeout) -> #t signalled | #f timed out

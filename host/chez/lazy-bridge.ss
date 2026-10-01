@@ -306,9 +306,6 @@
 (define (thread-daemon-record! id d)
   (jolt-with-mutex live-threads-mutex
     (if d (hashtable-set! thread-daemons id #t) (hashtable-delete! thread-daemons id))))
-;; (jolt-thread-daemon-set! id d) — setDaemon on a Thread object that has
-;; finished (the JVM allows it then), so its handle keeps agreeing with it.
-(define (jolt-thread-daemon-set! id d) (thread-daemon-record! id (and d #t)))
 ;; WHAT KEEPS THE PROCESS UP, as on the JVM: it ends when the program's main
 ;; returns only once every live non-daemon thread has finished (clojure.main
 ;; returns, and the JVM waits for them). Every jolt thread is forked below, so the
@@ -360,11 +357,14 @@
                       thunk
                       (lambda ()
                         (jolt-with-mutex live-threads-mutex
-                          (hashtable-delete! thread-daemons id)
                           (if (hashtable-contains? live-threads id)
                               (hashtable-delete! live-threads id)
                               (hashtable-set! live-threads id 'done)))
+                        ;; the hook reads the daemon entry into the Thread
+                        ;; object before it goes
                         (jolt-thread-exit-hook id)
+                        (jolt-with-mutex live-threads-mutex
+                          (hashtable-delete! thread-daemons id))
                         (unless d (exit-nondaemon-leave!)))))))))))
          (id (sa-thread-id-of t)))
     (when id
