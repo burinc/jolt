@@ -632,6 +632,38 @@
               (when-not (or (str/blank? nm) (= nm ip)) nm)))
           (finally (ffi/free buf) (ffi/free sa)))))))
 
+;; -- loopback pair ----------------------------------------------------------------
+
+(defn loopback-pair
+  "Two connected TCP sockets over 127.0.0.1, as [a b], both close-on-exec — a
+  socketpair that works on Windows, where the only thing WSAPoll can wait on is
+  a socket, so a wake channel for a poll loop has to be one. Throws
+  IOException when any step fails, closing what it opened."
+  []
+  (let [l (new-socket af-inet)
+        opened (atom [])                  ; l is closed by the finally
+        fail (fn [what e]
+               (doseq [fd @opened] (c-close fd))
+               (throw (java.io.IOException. (str "loopback-pair: " what ": " (error-message e)))))]
+    (try
+      (let [[sa len] (make-sockaddr af-inet "127.0.0.1" 0)]
+        (try
+          (let [[r e] (c-bind l sa len)] (when (neg? r) (fail "bind" e)))
+          (let [[r e] (c-listen l 1)] (when (neg? r) (fail "listen" e)))
+          (set-sockaddr-port! sa (local-port l))
+          (let [a (new-socket af-inet)]
+            (swap! opened conj a)
+            (let [[r e] (c-connect a sa len)] (when (neg? r) (fail "connect" e)))
+            (let [[psa plen] (alloc-sockaddr)]
+              (try
+                (let [[b e] (c-accept l psa plen)]
+                  (when (neg? b) (fail "accept" e))
+                  (guard-accepted! b)
+                  [a b])
+                (finally (ffi/free psa) (ffi/free plen)))))
+          (finally (ffi/free sa))))
+      (finally (c-close l)))))
+
 ;; -- poll -----------------------------------------------------------------------------
 ;; One array of pollfds: entry i at i * pollfd-size. fd at 0, events and revents
 ;; as shorts after it.

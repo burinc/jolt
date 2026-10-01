@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A readiness poller on Windows.** jolt.io-poller has a WSAPoll backend, so
+  sockets on Windows are non-blocking and wait on it the way they wait on
+  kqueue and epoll elsewhere: a fiber reading a socket parks instead of holding
+  its carrier, `setSoTimeout` bounds a read or accept, the connect timeout is
+  enforced, and `close` wakes a read blocked on another thread. Those were
+  recorded Windows divergences. `JOLT_IO_POLLER=poll` selects the same backend
+  over poll(2) on POSIX, which is how the gates exercise it there.
+
 - **`jolt.socket.native`, the fd-level socket layer.** The C socket calls
   jolt.socket used privately are now a public namespace for code that wants
   sockets without the java.net object model, such as an HTTP server that owns

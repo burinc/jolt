@@ -13,13 +13,11 @@
   a recv error reads as EOF (-1) rather than throwing, and toString formats are
   approximate. IPv4 only.
 
-  On Windows, additionally: sockets are blocking, because the readiness poller is
-  kqueue/epoll and there is none there — so a fiber blocked on a socket holds its
-  carrier rather than parking, which is a jolt superset java.net never promised,
-  and SO_TIMEOUT and the connect timeout are accepted but not enforced, since
-  both are waits on that poller — and NetworkInterface enumerates nothing, for
-  want of a GetAdaptersAddresses walk. These are recorded entries; InetAddress
-  and the sockets themselves work (jolt-lang/jolt#1107)."
+  Sockets are non-blocking on every platform and wait on jolt.io-poller — kqueue,
+  epoll, or WSAPoll on Windows — so a fiber parks rather than holding its
+  carrier, and SO_TIMEOUT and the connect timeout are deadlines on that wait.
+  On Windows NetworkInterface enumerates nothing, for want of a
+  GetAdaptersAddresses walk; that is a recorded entry (jolt-lang/jolt#1107)."
   (:require [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]
             [jolt.socket.native :as native]
@@ -30,7 +28,6 @@
 ;; knows macOS, Linux and Windows apart (jolt-lang/jolt#1107 is what answering
 ;; Linux's numbers on Windows cost). What is left here is the java.net object
 ;; model over it.
-(def ^:private windows? (= :windows native/os))
 
 ;; -- sockaddr helpers ---------------------------------------------------------
 
@@ -54,16 +51,9 @@
 (defn- guard-fd! [fd]
   ;; accepted fds don't reliably inherit socket options — close-on-exec and
   ;; SO_NOSIGPIPE go on every fd we hand out (native/guard-accepted!), and
-  ;; O_NONBLOCK so the R8 readiness interception can park a fiber instead of
-  ;; pinning its carrier.
-  ;;
-  ;; nonblock! is a no-op on Windows, deliberately: there is no readiness poller
-  ;; there (jolt.io-poller is kqueue/epoll), so a non-blocking socket would answer
-  ;; WSAEWOULDBLOCK with nothing able to wait for it. Blocking sockets are also
-  ;; what the JVM's own java.net.Socket is — the non-blocking fd plus the poller
-  ;; is jolt's fiber extension over it, not the java.net contract — so this is a
-  ;; missing jolt superset on Windows, not a missing java.net behaviour. Recorded
-  ;; in test/conformance/known-divergences.edn (jolt-lang/jolt#1107).
+  ;; non-blocking mode so the R8 readiness interception can park a fiber instead
+  ;; of pinning its carrier. That is O_NONBLOCK on POSIX and FIONBIO on Windows,
+  ;; where the WSAPoll backend does the waiting.
   (native/guard-accepted! fd)
   (poller/nonblock! fd))
 
@@ -104,20 +94,17 @@
 ;; the same: a closed fd number is handed to the next socket or pipe the process
 ;; opens, so an operation that retried on it would read that socket's bytes or
 ;; write to its peer (jolt#1183, jolt-hmnr). process.ss counts its pipe fds the
-;; same way.
-;;
-;; Windows has no poller to wake anything: its sockets are blocking, and only
-;; closesocket makes a blocked recv or accept return. So close releases the fd
-;; at once there, and the woken operation raises on seeing the socket closed.
+;; same way. Windows included: its sockets wait on the WSAPoll backend, which
+;; cancel! wakes like the others.
 (defn- fd-release! [fd]
   (poller/forget! fd)
   (native/c-close fd))
 
 ;; Under the owner's lock: claims the release, answering the fd to close, when the
-;; socket is closed and nothing is using it (or FORCE?).
-(defn- claim-release! [owner force?]
+;; socket is closed and nothing is using it.
+(defn- claim-release! [owner]
   (when (and (jolt.host/ref-get owner :closed?)
-             (or force? (zero? (or (jolt.host/ref-get owner :ops) 0)))
+             (zero? (or (jolt.host/ref-get owner :ops) 0))
              (not (jolt.host/ref-get owner :released?)))
     (jolt.host/ref-put! owner :released? true)
     (jolt.host/ref-get owner :fd)))
@@ -131,7 +118,7 @@
 (defn- op-leave! [owner]
   (when-let [fd (locking owner
                   (jolt.host/ref-put! owner :ops (dec (jolt.host/ref-get owner :ops)))
-                  (claim-release! owner false))]
+                  (claim-release! owner))]
     (fd-release! fd)))
 
 (defmacro ^:private with-op [owner & body]
@@ -144,7 +131,7 @@
                       (if (jolt.host/ref-get owner :closed?)
                         [false nil]
                         (do (jolt.host/ref-put! owner :closed? true)
-                            [true (claim-release! owner windows?)])))]
+                            [true (claim-release! owner)])))]
     (cond
       fd (fd-release! fd)
       first? (poller/cancel! (jolt.host/ref-get owner :fd))))
@@ -162,8 +149,8 @@
   ;; writability (parking on a fiber, blocking kevent on a thread — the same
   ;; dispatch every other IO path uses), then read SO_ERROR for the verdict.
   ;; DEADLINE (epoch ms, or nil for none) bounds that wait: connect(endpoint,
-  ;; timeout). Blocking Windows sockets never get there, so the bound is not
-  ;; enforced on Windows (recorded divergence, jolt-lang/jolt#1107).
+  ;; timeout). Windows answers WSAEWOULDBLOCK where POSIX says EINPROGRESS, and
+  ;; native/connect-pending? knows both.
   (let [ip (resolve-host host)
         [sa len] (native/make-sockaddr native/af-inet ip port)
         ;; 0 when connected, else the failure's errno (-1 when there is none)

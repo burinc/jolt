@@ -14,6 +14,12 @@
          '[clojure.string :as str])
 
 (def windows? (str/starts-with? (System/getProperty "os.name") "Windows"))
+
+;; ONE carrier for the fiber rows below: a fiber that blocked its carrier on a
+;; socket instead of parking would then stop every other fiber, which is what
+;; they assert does not happen. Set before anything spawns.
+(require 'jolt.fibers)
+(jolt.fibers/set-carrier-count! 1)
 (def fails (atom 0))
 (def total (atom 0))
 
@@ -167,6 +173,73 @@
            [(.isInputShutdown c) (.read cin) (msg #(.getInputStream c))]
            [true -1 "Socket input is shutdown"])
     (finally (.close s) (.close c) (.close ss))))
+
+;; --- sockets wait on jolt.io-poller everywhere --------------------------------------
+;; Windows sockets were blocking, for want of a readiness poller there: a fiber
+;; reading one held its carrier, and SO_TIMEOUT and the connect timeout were
+;; stored but never enforced. The WSAPoll backend makes them what they are on
+;; POSIX.
+(defn- pair []
+  (let [ss (java.net.ServerSocket. 0)
+        c (java.net.Socket. "127.0.0.1" (.getLocalPort ss))
+        s (.accept ss)]
+    [ss c s]))
+
+(let [[ss c s] (pair)]
+  (try
+    (.setSoTimeout s 300)
+    (let [t0 (System/currentTimeMillis)
+          r (try (.read (.getInputStream s)) :no-timeout
+                 (catch java.net.SocketTimeoutException e (.getMessage e)))
+          dt (- (System/currentTimeMillis) t0)]
+      (check "SO_TIMEOUT: a read with no data times out"
+             [r (<= 250 dt 5000)] ["Read timed out" true]))
+    (.write (.getOutputStream c) 65)
+    (check "SO_TIMEOUT: the socket still reads after a timeout"
+           (.read (.getInputStream s)) 65)
+    (finally (.close s) (.close c) (.close ss))))
+
+(let [ss (java.net.ServerSocket. 0)]
+  (try
+    (.setSoTimeout ss 300)
+    (check "SO_TIMEOUT: accept with no client times out"
+           (try (.accept ss) :accepted
+                (catch java.net.SocketTimeoutException e (.getMessage e)))
+           "Accept timed out")
+    (finally (.close ss))))
+
+(check "connect to a closed port is refused"
+       (let [ss (java.net.ServerSocket. 0) port (.getLocalPort ss)]
+         (.close ss)
+         (try (java.net.Socket. "127.0.0.1" (int port)) :connected
+              (catch java.net.ConnectException e (.getMessage e))))
+       "Connection refused")
+
+(let [[ss c s] (pair)
+      r (promise)
+      t (Thread. (fn [] (deliver r (try (.read (.getInputStream s)) :read
+                                         (catch java.net.SocketException e (.getMessage e))))))]
+  (.start t)
+  (Thread/sleep 200)
+  (.close s)
+  (check "close wakes a read blocked on another thread"
+         (deref r 3000 :still-blocked) "Socket closed")
+  (.close c) (.close ss))
+
+;; eight fibers park reading silent sockets on the ONE carrier, and a ninth
+;; still runs; then every reader gets its byte
+(let [pairs (vec (repeatedly 8 pair))
+      readers (mapv (fn [[_ _ s]] (jolt.fibers/spawn (fn [] (.read (.getInputStream s)))))
+                    pairs)
+      other (jolt.fibers/spawn (fn [] :ran))]
+  (try
+    (check "fibers park on socket reads: another fiber still runs"
+           (jolt.fibers/join other 3000 :starved) :ran)
+    (doseq [[_ c _] pairs] (.write (.getOutputStream c) 7))
+    (check "fibers park on socket reads: every reader wakes with its byte"
+           (mapv #(jolt.fibers/join % 3000 :stuck) readers) (vec (repeat 8 7)))
+    (finally
+      (doseq [[ss c s] pairs] (.close s) (.close c) (.close ss)))))
 
 ;; --- #1119: last-modified time ---------------------------------------------------
 (let [d (under "lock")
