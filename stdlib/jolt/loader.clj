@@ -348,10 +348,14 @@
           (concat (delegate-hits l req) (locate-hits l req)))))
 
 (defn- file-url-path
-  "The filesystem path inside a file: URL string, or the string itself."
+  "The filesystem path inside a file: URL string, or the string itself. Read
+   through the runtime's own file: URL reading, not by dropping the scheme: a
+   URL path is not a filesystem path. It escapes (%20), it may carry an empty
+   or localhost authority, and on Windows it names a drive as /C:/…, which is a
+   path on the current drive's root that opens nothing (jolt-lang/jolt#1203)."
   [s]
   (if (and (string? s) (str/starts-with? s "file:"))
-    (subs s 5)
+    (str (io/as-file (io/as-url s)))
     s))
 
 (def ^:private host-base-loader
@@ -1142,13 +1146,16 @@
                             :let [f (root-file root (:name req))]
                             :when f]
                         (cond-> {:kind :resource
-                                 ;; an embedded key is its own location; a URL
-                                 ;; path is "/"-separated, and the file path
-                                 ;; renders with "\\" on Windows
+                                 ;; an embedded key is its own location; a
+                                 ;; file's is the URL the JDK's classloader
+                                 ;; hands out, File.toURI's: absolute, the drive
+                                 ;; behind a "/" (file:/C:/…), escaped — so it
+                                 ;; reads back as the same file whatever its
+                                 ;; name holds (jolt-lang/jolt#1203)
                                  :url (cond
                                         (or (embedded-root? root)
                                             (str/starts-with? f "jar:file:")) f
-                                        :else (str "file:" (if (= "\\" java.io.File/separator) (str/replace f "\\" "/") f)))}
+                                        :else (str (.toURI (java.io.File. f))))}
                           (embedded-root? root) (assoc :embedded? true))))
       nil)))
 

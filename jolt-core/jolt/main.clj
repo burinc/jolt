@@ -144,7 +144,17 @@
       (doseq [spec natives]
         (if (:process spec)
           (jolt.ffi/load-library)
-          (let [cands (native-candidates spec plat base)
+          (let [;; a :static spec's conventional names are not derived here: its
+                ;; symbols come from its archive (preloaded by `jolt build`,
+                ;; linked into the binary), and a same-named shared object the
+                ;; loader happens to find is a different library — it answered
+                ;; the build's calls in the archive's place, and for "crypto"
+                ;; on macOS it is Apple's libcrypto.dylib, which aborts the
+                ;; process. Candidates the spec DECLARES are still loaded.
+                cands (if (:static spec)
+                        (mapv #(native-candidate (native-root spec plat base) %)
+                              (native-declared spec plat))
+                        (native-candidates spec plat base))
                 ;; Load the native RTLD_LOCAL and register its handle, so the
                 ;; spec's defcfns resolve from the handle (isolated from the
                 ;; process-global namespace) rather than depending on global

@@ -756,13 +756,28 @@
 ;; quietly read as latin-1.
 (define (declares-class? x fqn)
   (and (jreify? x) (member fqn (jreify-host-tags x)) #t))
-(define (user-in-stream? x) (declares-class? x "java.io.InputStream"))
+;; A stdlib class built on a host tagged-table (jolt.socket's SocketInputStream
+;; and SocketOutputStream) says the same with a marker key, :jolt/in-stream or
+;; :jolt/out-stream: it answers the whole java.io contract, read(byte[],int,int)
+;; or write(byte[],int,int) included, so every coercion site can drive it the
+;; way it drives a reify. Without it (io/reader (.getInputStream sock)) — the
+;; ordinary way to read a socket in Clojure — and slurp, io/copy, io/writer and
+;; io/output-stream over a socket's streams all raised "Cannot open".
+;; :jolt/input-stream is an older, narrower marker (a read()-only byte shim that
+;; slurp and io/copy drain a byte at a time) and is left as it is.
+(define (marked-stream? x k)
+  (and (htable? x) (jolt-truthy? (jolt-ref-get x k))))
+(define in-stream-marker (keyword "jolt" "in-stream"))
+(define out-stream-marker (keyword "jolt" "out-stream"))
+(define (user-in-stream? x)
+  (or (declares-class? x "java.io.InputStream") (marked-stream? x in-stream-marker)))
 ;; …and the other three java.io roots a reify/proxy extends. Each is the class it
 ;; declares to every coercion site — slurp, spit, io/reader, io/writer, io/copy,
 ;; io/input-stream, io/output-stream — which drive it through the read / write
 ;; the class leaves abstract, as the JVM's IOFactory does; the methods the class
 ;; supplies for free come from the tables below.
-(define (user-out-stream? x) (declares-class? x "java.io.OutputStream"))
+(define (user-out-stream? x)
+  (or (declares-class? x "java.io.OutputStream") (marked-stream? x out-stream-marker)))
 (define (user-writer? x) (declares-class? x "java.io.Writer"))
 ;; A value io/reader and BufferedReader should adapt rather than reject: not one
 ;; of jolt's own reader jhosts (those pass through), but something that answers
