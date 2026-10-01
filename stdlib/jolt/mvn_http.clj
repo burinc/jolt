@@ -217,7 +217,7 @@
         (if (nil? a)
           (throw (ex-info (connect-error-message host port err)
                           {:host host :port port :error err}))
-          (let [[fd e] (native/c-socket (:family a) native/sock-stream 0)]
+          (let [[fd e] (native/c-socket (:family a) (bit-or native/sock-stream (or native/sock-cloexec 0)) 0)]
             (if (neg? fd)
               (recur more (or err e))
               ;; close-on-exec before connect: a subprocess spawned while the
