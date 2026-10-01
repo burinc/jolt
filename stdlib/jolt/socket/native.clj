@@ -194,6 +194,7 @@
 (ffi/defcfn c-inet-ntop    "inet_ntop"    [:int :pointer :pointer :uint] :pointer)
 (ffi/defcfn c-inet-pton    "inet_pton"    [:int :pointer :pointer] :int)
 (ffi/defcfn c-gethostname  "gethostname"  [:pointer :size_t] :int)
+(ffi/defcfn c-gethostbyname "gethostbyname" [:pointer] :pointer :blocking)
 (ffi/defcfn c-getnameinfo  "getnameinfo"
   [:pointer :uint :pointer :uint :pointer :uint :int] :int :blocking)
 
@@ -530,6 +531,32 @@
 
 (declare getaddrinfo-addrs)
 
+(defn- hostent-addrs
+  "IPv4 entries for host from gethostbyname, the resolver of last resort.
+  Bionic's getaddrinfo hands every lookup — localhost included — to the netd
+  daemon and fails where there is none (a termux container), while
+  gethostbyname reads /etc/hosts first. struct hostent: h_addr_list, a
+  NULL-terminated array of pointers to 4-byte addresses, is at 24 on every
+  64-bit platform."
+  [host port]
+  (let [hp (ffi/string->ptr (str host))]
+    (try
+      (let [he (c-gethostbyname hp)]
+        (when-not (or (nil? he) (ffi/null? he))
+          (let [lst (ffi/read he :pointer 24)]
+            (loop [i 0 out [] seen #{}]
+              (let [p (ffi/read lst :pointer (* i 8))]
+                (if (or (nil? p) (ffi/null? p))
+                  out
+                  (let [ip (str/join "." (map #(ffi/read p :uint8 %) (range 4)))]
+                    (if (contains? seen ip)
+                      (recur (inc i) out seen)
+                      (let [[sa len] (make-sockaddr af-inet ip port)]
+                        (recur (inc i)
+                               (conj out {:family af-inet :addr sa :addrlen len :ip ip})
+                               (conj seen ip)))))))))))
+      (finally (ffi/free hp)))))
+
 (defn resolve-addrs
   "The addresses host names, as data: {:addrs [{:family :addr :addrlen :ip} ...]}
   or {:error code :message text}. Numeric literals and names, v4 and v6.
@@ -551,7 +578,12 @@
    (winsock/ensure!)
    (if-let [lit (literal-addr (str host) port family)]
      {:addrs [lit]}
-     (getaddrinfo-addrs host port opts))))
+     (let [r (getaddrinfo-addrs host port opts)]
+       (if (and (:error r) (or (nil? family) (= family af-inet)))
+         (if-let [addrs (seq (hostent-addrs host port))]
+           {:addrs (vec addrs)}
+           r)
+         r)))))
 
 (defn- getaddrinfo-addrs
   [host port {:keys [family passive?]}]
