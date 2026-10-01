@@ -688,6 +688,11 @@
 (same "url->path: UNC host"            (file-url->path-for #t "file://srv/sh/a")          "//srv/sh/a")
 (same "url->path: drive root"          (file-url->path-for #t "file:/C:/")                "C:/")
 (same "url->path: a stray % is literal" (file-url->path-for #t "file:/C:/100%/x")         "C:/100%/x")
+;; what jolt.loader opens a resource hit through now (jolt-lang/jolt#1203): it
+;; dropped the scheme with (subs url 5), leaving "/C:/proj/…", which Windows
+;; resolved to "\C:\proj\…" on the current drive
+(same "url->path: a loader resource hit" (file-url->path-for #t "file:/C:/proj/src/res/x.txt") "C:/proj/src/res/x.txt")
+(same "url->path: a hit under an escaped root" (file-url->path-for #t "file:/C:/my%20proj/res/x.txt") "C:/my proj/res/x.txt")
 
 ;; new File(URI) / Path.of(URI) (jolt-lang/jolt#1198) share the drive rule with
 ;; the URL reader: the URI's "/C:/..." path is the Windows path "C:/...".

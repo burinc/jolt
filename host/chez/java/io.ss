@@ -824,16 +824,28 @@
                 (else (loop (+ i 1)))))
     (throw-jvm (quote java.io.IOException) "Invalid file path")))
 
-;; "/a/b" -> "/a", "/a" -> "/", "/" -> #f. The directory half of an output
-;; path, POSIX-only on purpose: its callers are the AOT cache and the build
-;; driver (loader.ss aot-mkdir-p, build-jolt.ss), which write under paths jolt
-;; itself composed with "/". Canonicalization no longer uses it -- that walk
-;; needs the platform's root form and lives below.
-(define (path-parent p)
-  (let loop ((i (- (string-length p) 1)))
-    (cond ((< i 0) #f)
-          ((char=? (string-ref p i) #\/) (if (= i 0) "/" (substring p 0 i)))
-          (else (loop (- i 1))))))
+;; The directory half of an output path: "/a/b" -> "/a", "/a" -> "/", and #f for
+;; a root or a bare name, which have nothing above them to create. Its callers
+;; walk up with it until something exists (build.ss bld-mkdir-p, loader.ss
+;; aot-mkdir-p) or take an executable's directory (build.ss, build-jolt.ss).
+;;
+;; Those paths are not only ones jolt composed with "/": `jolt build -o` takes
+;; whatever the user typed, and on Windows that is "C:\proj\out\app.exe". The
+;; POSIX-only version found no "/" in it and answered #f for its parent, which
+;; the walk then handed to string=? (jolt-lang/jolt#1207). So it splits on the
+;; platform's separators and stops at the platform's root: "C:\a" -> "C:\",
+;; "\\srv\sh\a" -> "\\srv\sh", and a drive or share root is terminal. The
+;; spelling is kept — a parent is a prefix of the path, never a re-rendering.
+;; The platform is a parameter so the Windows rows are pinned from a POSIX host
+;; (test/chez/win-path-test.ss).
+(define (path-parent-for windows? p)
+  (let ((root (path-root-end windows? p)))
+    (let loop ((i (- (string-length p) 1)))
+      (cond ((< i root)
+             (and (> root 0) (< root (string-length p)) (substring p 0 root)))
+            ((path-sep-for? windows? (string-ref p i)) (substring p 0 i))
+            (else (loop (- i 1)))))))
+(define (path-parent p) (path-parent-for (win32?) p))
 
 ;; --- the lexical half of canonicalization ------------------------------------
 ;; Everything below splits a path ONCE into its root and the segments under it,

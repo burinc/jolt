@@ -1644,7 +1644,7 @@
 ;; cache dir was never created and open-output-file failed. Native mkdir +
 ;; path-parent recursion is portable (mirrors build.ss bld-mkdir-p).
 (define (aot-mkdir-p dir)
-  (unless (or (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
+  (unless (or (not dir) (string=? dir "") (string=? dir "/") (string=? dir ".") (file-exists? dir))
     (aot-mkdir-p (path-parent dir))
     ;; tolerate the benign race (created concurrently); re-raise a real failure.
     (guard (e (#t (unless (file-exists? dir) (raise e))))
