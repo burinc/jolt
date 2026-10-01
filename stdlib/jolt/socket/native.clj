@@ -518,9 +518,27 @@
 (def ^:private addrinfo-size 48)
 (def ^:private ai-passive 1)
 
+(defn- literal-addr
+  "The resolve-addrs entry for host when it is a numeric literal of an allowed
+  family, else nil."
+  [host port family]
+  (some (fn [fam]
+          (when (or (nil? family) (= family fam))
+            (when-let [[sa len] (make-sockaddr fam host port)]
+              {:family fam :addr sa :addrlen len :ip (sockaddr-ip sa)})))
+        [af-inet af-inet6]))
+
+(declare getaddrinfo-addrs)
+
 (defn resolve-addrs
-  "getaddrinfo for host, as data: {:addrs [{:family :addr :addrlen :ip} ...]} or
-  {:error code :message text}. Numeric literals and names, v4 and v6.
+  "The addresses host names, as data: {:addrs [{:family :addr :addrlen :ip} ...]}
+  or {:error code :message text}. Numeric literals and names, v4 and v6.
+
+  A literal is parsed with inet_pton and never reaches the resolver, which is
+  what the java.net shim did before this layer existed (inet_addr first) and
+  what keeps \"0.0.0.0\" working where getaddrinfo goes through a resolver
+  daemon that may not be there — bionic in a container is one. A v6 literal
+  with a scope zone (fe80::1%en0) is not inet_pton's, and takes getaddrinfo.
 
   Each :addr is a sockaddr of OUR allocation with port already written in — the
   getaddrinfo chain is freed before returning — and is the caller's to free
@@ -529,8 +547,14 @@
   opts: :family (af-inet or af-inet6; default either), :passive? (AI_PASSIVE,
   for an address to bind)."
   ([host port] (resolve-addrs host port nil))
-  ([host port {:keys [family passive?]}]
+  ([host port {:keys [family] :as opts}]
    (winsock/ensure!)
+   (if-let [lit (literal-addr (str host) port family)]
+     {:addrs [lit]}
+     (getaddrinfo-addrs host port opts))))
+
+(defn- getaddrinfo-addrs
+  [host port {:keys [family passive?]}]
    (let [node  (ffi/string->ptr (str host))
          hints (ffi/alloc addrinfo-size)
          resp  (ffi/alloc 8)
@@ -564,7 +588,7 @@
                    (recur (ffi/read ai :pointer 40)
                           (if entry (conj out entry) out)
                           (if k (conj seen k) seen))))))))
-       (finally (ffi/free node) (ffi/free hints) (ffi/free resp))))))
+       (finally (ffi/free node) (ffi/free hints) (ffi/free resp)))))
 
 (defn free-addrs!
   "Free the :addr of every entry resolve-addrs answered."
