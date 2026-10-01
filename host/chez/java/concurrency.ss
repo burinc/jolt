@@ -374,6 +374,17 @@
 ;; process end on the main thread (the CLI's normal return and a built binary's
 ;; launcher), never from a fiber.
 (define (jolt-await-user-threads!)
+  (unless exit-wait-skipped? (await-exit-holds!)))
+;; The tooling commands — `jolt build` and its compile workers, the AOT cache
+;; worker — are the compiler, not the program: they load the program's
+;; namespaces to compile them, and a namespace whose top level starts a future
+;; or a pool would otherwise hold the compiler up for that pool's keep-alive
+;; (60s per build for test/chez/build-app, whose app.core derefs a future at
+;; load). They end when their work is done, as a build tool's compile process
+;; does. Set by the CLI dispatch before the command runs.
+(define exit-wait-skipped? #f)
+(define (jolt-skip-exit-wait!) (set! exit-wait-skipped? #t))
+(define (await-exit-holds!)
   (jolt-with-mutex exit-mu
     (let loop ()
       (cond

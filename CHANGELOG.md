@@ -70,7 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of clojure.main's: bb's future and agent threads are daemons, so a
   task does not wait on them (a `Thread.` it starts, or a pool it never shuts
   down, still holds the process up there as here). Built binaries wait the same
-  way as the CLI.
+  way as the CLI. `jolt build` and its compile workers do not: they are the
+  compiler, and a namespace that starts a future at load (to be compiled, it is
+  loaded) must not hold the build up for the pool's keep-alive.
 
   Along with it, as on the JVM: a `future` after `shutdown-agents` throws
   `RejectedExecutionException`, and a `send` after it returns the agent and

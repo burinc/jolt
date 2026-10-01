@@ -436,6 +436,7 @@
       ;; Ahead of everything else so a worker started in a project directory never
       ;; resolves the project.
       ((and (pair? cli-args) (string=? (car cli-args) "--build-worker") (pair? (cdr cli-args)))
+       (jolt-skip-exit-wait!)
        (prepare-build!)
        ((var-deref "jolt.host" "build-compile-worker") (cadr cli-args)))
       ;; …and asks this first, so it never hands a worker argv to something that
@@ -447,6 +448,7 @@
       ;; a run whose launcher set jolt-standalone-binary. Ahead of project
       ;; resolution, like --build-worker.
       ((and (pair? cli-args) (string=? (car cli-args) "--aot-worker") (pair? (cdr cli-args)))
+       (jolt-skip-exit-wait!)
        ((var-deref "jolt.host" "aot-compile-worker") (cadr cli-args)))
       ;; -e EXPR [args…] — evaluate one expression and print it (blank for nil).
       ;; Each top-level form is read, compiled, and evaled in sequence so each
@@ -468,6 +470,7 @@
       ;; otherwise dispatch the argv through jolt.main/-main
       (else
        (when (jolt-cli-build-cmd? cli-args)
+         (jolt-skip-exit-wait!)                ; a compiler, not the program
          (prepare-build!))
        (load-namespace "jolt.main")
        (let ((mainv (var-deref "jolt.main" "-main")))

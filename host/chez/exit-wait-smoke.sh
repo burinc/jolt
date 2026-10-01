@@ -117,5 +117,15 @@ if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q ":returned" && ! printf '%s' "$
 out=$(cd "$tmp/bbtask" && JOLT_NO_USER_DEPS=1 perl -e 'alarm shift; exec @ARGV' "$CAP" "$J" run th 2>&1); rc=$?
 if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q ":thread-done"; then ok; else bad "a task waits for a Thread it started"; fi
 
+# `jolt build` is the compiler, not the program: it loads the app's namespaces
+# to compile them, and build-app's app.core derefs a future at load, which would
+# hold a program up for the pool's 60s keep-alive. The build ends when its work
+# is done.
+t0=$(date +%s)
+out=$(JOLT_PWD="$root/test/chez/build-app" JOLT_RUNTIME_CACHE_DIR="$tmp/rtcache" "$J" build -m app.core -o "$tmp/built" 2>&1); rc=$?
+t1=$(date +%s)
+# the build itself takes well under 30s; waiting on the pool would add 60
+if [ "$rc" = 0 ] && [ -x "$tmp/built" ] && [ $((t1 - t0)) -lt 40 ]; then ok; else bad "jolt build does not wait for the app's pools ($((t1 - t0))s)"; fi
+
 echo "exit-wait smoke: $pass passed, $fail failed"
 [ "$fail" = 0 ]
