@@ -1946,10 +1946,13 @@
         ;; the calling thread's frames, reconstructed the way an uncaught error's
         ;; backtrace is (source-registry.ss); another thread's stack is not
         ;; reachable, so it answers an empty array
+        ;; Self is the running fiber's own object on a fiber (a virtual thread's
+        ;; object has no thread id), the thread's on a thread.
         (cons "getStackTrace" (lambda (self)
-          (if (eqv? (jthread-id (jhost-state self)) (get-thread-id))
-              (jolt-current-stack-trace)
-              (jolt-vector))))
+          (let* ((st (jhost-state self)) (f (jolt-current-fiber)))
+            (if (if f (eq? (jthread-fiber st) f) (eqv? (jthread-id st) (get-thread-id)))
+                (jolt-current-stack-trace)
+                (jolt-vector)))))
         (cons "getId" (lambda (self) (vector-ref (jhost-state self) 10)))
         (cons "threadId" (lambda (self) (vector-ref (jhost-state self) 10)))
         (cons "getContextClassLoader" (lambda (self) (thread-context-class-loader)))
@@ -2043,14 +2046,13 @@
           jolt-nil))
         (cons "isAlive" (lambda (self) (jthread-alive? (jhost-state self))))
         ;; flag then poke, so a wait already parked on a condition this thread
-        ;; registered is thrown out of it rather than merely told afterwards
-        ;; A virtual thread's fiber is also woken from a channel wait directly:
-        ;; those register nowhere (fibers.ss jolt-fiber-iwait-wake!).
+        ;; registered is thrown out of it rather than merely told afterwards. A
+        ;; virtual thread's fiber owns its box, so the poke also resumes it from a
+        ;; channel wait (locks.ss jolt-interrupt-owner-set!).
         (cons "interrupt" (lambda (self . _)
           (let* ((st (jhost-state self)) (b (vector-ref st 4)))
             (set-box! b #t)
-            (jolt-interrupt-wake-waits! b)
-            (let ((f (jthread-fiber st))) (when (jolt-fiber? f) (jolt-fiber-iwait-wake! f))))
+            (jolt-interrupt-wake-waits! b))
           jolt-nil))
         (cons "isInterrupted" (lambda (self) (and (unbox (vector-ref (jhost-state self) 4)) #t)))
         ;; once running, the thread's name is the id-keyed table's, which is what
@@ -2067,8 +2069,14 @@
           jolt-nil))
         ;; refused while the thread is ALIVE, as Thread.setDaemon checks isAlive():
         ;; before start and after it has finished the flag can still be set.
+        ;; A virtual thread is always a daemon: false is refused before the
+        ;; liveness check, as Thread.setDaemon orders them.
         (cons "setDaemon" (lambda (self flag)
           (let ((st (jhost-state self)))
+            (when (and (not (jolt-truthy? flag))
+                       (let ((f (jthread-fiber st))) (or (eq? f 'virtual) (jolt-fiber? f))))
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                                               "'false' not legal for virtual threads")))
             (when (jthread-alive? st)
               (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException" jolt-nil)))
             (vector-set! st 8 (and (jolt-truthy? flag) #t)))
@@ -2312,13 +2320,18 @@
     obj))
 ;; Thread.ofVirtual(): a builder. name(String) names every thread it makes;
 ;; name(prefix, start) numbers them from start. unstarted/start/factory as on the
-;; JVM. State #(name counter).
+;; JVM. State #(name counter mutex). A factory is a SNAPSHOT of its builder's name
+;; and counter, counting on its own from there, and is thread-safe as the JDK's
+;; is (the mutex); a builder is not, and has none.
 (define (vbuilder-next-name! st)
-  (let ((n (vector-ref st 1)))
-    (if n
-        (begin (vector-set! st 1 (+ n 1))
-               (string-append (vector-ref st 0) (number->string n)))
-        (vector-ref st 0))))
+  (define (next!)
+    (let ((n (vector-ref st 1)))
+      (if n
+          (begin (vector-set! st 1 (+ n 1))
+                 (string-append (vector-ref st 0) (number->string n)))
+          (vector-ref st 0))))
+  (let ((mu (vector-ref st 2)))
+    (if mu (jolt-with-mutex mu (next!)) (next!))))
 (define (vbuilder-unstarted st r) (unstarted-virtual-thread r (vbuilder-next-name! st)))
 (register-host-methods! "vthread-builder"
   (list (cons "name" (lambda (self nm . start)
@@ -2331,10 +2344,12 @@
           (let ((t (vbuilder-unstarted (jhost-state self) r)))
             (vector-set! (jhost-state t) 5 #t)
             (start-virtual-thread! t))))
-        (cons "factory" (lambda (self) (make-jhost "vthread-factory" (jhost-state self))))))
+        (cons "factory" (lambda (self)
+          (let ((st (jhost-state self)))
+            (make-jhost "vthread-factory" (vector (vector-ref st 0) (vector-ref st 1) (make-mutex))))))))
 (register-host-methods! "vthread-factory"
   (list (cons "newThread" (lambda (self r) (vbuilder-unstarted (jhost-state self) r)))))
-(let ((statics (list (cons "ofVirtual" (lambda () (make-jhost "vthread-builder" (vector "" #f))))
+(let ((statics (list (cons "ofVirtual" (lambda () (make-jhost "vthread-builder" (vector "" #f #f))))
                      (cons "startVirtualThread"
                            (lambda (r)
                              (let ((t (unstarted-virtual-thread r "")))

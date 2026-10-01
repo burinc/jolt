@@ -585,6 +585,16 @@
   {:suite "virtual threads / fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [t (promise) c (a/chan) g (a/go (deliver t (Thread/currentThread)) (a/<! c) :done) th (deref t 5000 nil)] (.join th 50) (let [alive (.isAlive th)] (a/close! c) [alive (do (.join th) (.isAlive th)) (a/<!! g)]))))" :expected "[true false :done]"}
   ;; io-thread runs on a virtual thread, as on the JVM; thread does not.
   {:suite "virtual threads / fibers" :expr "(do (require (quote [clojure.core.async :as a])) [(a/<!! (a/io-thread (.isVirtual (Thread/currentThread)))) (a/<!! (a/thread (.isVirtual (Thread/currentThread))))])" :expected "[true false]"}
+  ;; cancel(true) reaches a virtual thread parked in a channel op: the runner it
+  ;; records is the fiber's box, and interrupting that box resumes the fiber. JVM
+  ;; core.async 1.9.865 answers [true :interrupted true] and [true true :interrupted
+  ;; :interrupted 1 true]: it leaves the interrupted op's handler registered
+  ;; (known-divergences.edn), so the offer!/poll! tails are jolt's.
+  {:suite "interrupt / cancel virtual threads" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) out (promise) ft (java.util.concurrent.FutureTask. (fn [] (deliver out (try (a/<!! c) :took (catch InterruptedException e :interrupted)))))] (Thread/startVirtualThread ft) (Thread/sleep 150) [(.cancel ft true) (deref out 3000 :hung) (a/offer! c 1)]))" :expected "[true :interrupted nil]"}
+  {:suite "interrupt / cancel virtual threads" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan) d (a/chan) o1 (promise) o2 (promise) f1 (java.util.concurrent.FutureTask. (fn [] (deliver o1 (try (a/>!! c 1) :put (catch InterruptedException e :interrupted))))) f2 (java.util.concurrent.FutureTask. (fn [] (deliver o2 (try (a/alts!! [d]) :alts (catch InterruptedException e :interrupted)))))] (Thread/startVirtualThread f1) (Thread/startVirtualThread f2) (Thread/sleep 150) [(.cancel f1 true) (.cancel f2 true) (deref o1 3000 :hung) (deref o2 3000 :hung) (a/poll! c) (a/offer! d 1)]))" :expected "[true true :interrupted :interrupted nil nil]"}
+  ;; ...and a go body's cheap park (<!! with no try around it) the same way: the
+  ;; body dies with InterruptedException and the channel is left as it was.
+  {:suite "interrupt / cancel virtual threads" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [c (a/chan) ft (promise) g (a/go (let [t (java.util.concurrent.FutureTask. (fn [] (a/<!! c) :took))] (deliver ft t) (.run t) (try (.get t) (catch Exception e (.getName (class e))))))] (Thread/sleep 150) [(.cancel (deref ft 3000 nil) true) (deref (future (a/<!! g)) 5000 :hung) (a/offer! c 1)])))" :expected "[true \"java.util.concurrent.CancellationException\" nil]"}
   ;; An unbuffered put succeeds only when a live taker receives the value. offer!
   ;; used to count a thread blocked in <!! as room for ANY number of puts, so two
   ;; offers in a row both answered true and the second value sat in the channel

@@ -736,16 +736,33 @@
 ;; here would unregister a waiter that is still waiting, and the next interrupt
 ;; would not reach it. The entries are woken OUTSIDE the table's mutex, so this path holds one lock
 ;; at a time.
+;;
+;; A box can also have an OWNER, registered once for its life rather than per
+;; wait: a fiber owns its box (fibers.ss jolt-fiber-ibox!), and its channel waits
+;; register nowhere and are resumed through the fiber itself. So whoever holds a
+;; fiber's box — a FutureTask's cancel(true), a pool's shutdownNow, Thread.interrupt
+;; — reaches those waits by this same call, with nothing to know about fibers:
+;; jolt-interrupt-owner-wake, set by fibers.ss, is handed the owner. Ephemeron-
+;; keyed, so an owner that holds its own box (a fiber does) is not kept by it.
+(define jolt-interrupt-owners (make-ephemeron-eq-hashtable))  ; interrupt box -> owner
+(define jolt-interrupt-owner-wake #f)
+(define (jolt-interrupt-owner-set! b owner)
+  (jolt-lock! jolt-interrupt-waits-mu)
+  (hashtable-set! jolt-interrupt-owners b owner)
+  (jolt-unlock! jolt-interrupt-waits-mu))
 (define (jolt-interrupt-wake-waits! b)
-  (let ((es (jolt-with-mutex jolt-interrupt-waits-mu
-              (let ((t (hashtable-ref jolt-interrupt-waits b #f)))
-                (if t (hashtable-keys t) '#())))))
+  (let-values (((es owner)
+                (jolt-with-mutex jolt-interrupt-waits-mu
+                  (let ((t (hashtable-ref jolt-interrupt-waits b #f)))
+                    (values (if t (hashtable-keys t) '#())
+                            (hashtable-ref jolt-interrupt-owners b #f))))))
     (vector-for-each
       (lambda (e)
         (if (procedure? e)
             (e)
             (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e)))))
-      es)))
+      es)
+    (when (and owner jolt-interrupt-owner-wake) (jolt-interrupt-owner-wake owner))))
 
 ;; The flag, read-and-cleared — java.lang.Thread's own rule for a wait that throws:
 ;; "the interrupted status is cleared and an InterruptedException is thrown."

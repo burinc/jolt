@@ -694,7 +694,13 @@
 ;; race to make it.
 (define (jolt-fiber-ibox! f)
   (or (jolt-fiber-ibox f)
-      (let ((b (box #f))) (jolt-fiber-ibox-set! f b) b)))
+      (let ((b (box #f))) (jolt-fiber-ibox-set! f b) (jolt-fiber-own-ibox! f b) b)))
+
+;; Make F the owner of interrupt box B (locks.ss jolt-interrupt-owner-set!): an
+;; interrupt delivered through the box resumes F from an interruptible channel
+;; wait (jolt-fiber-iwait-wake!, installed below as the owners' wake), whoever
+;; holds the box.
+(define (jolt-fiber-own-ibox! f b) (jolt-interrupt-owner-set! b f))
 
 ;; The same, with the fiber's interrupt box given and a hook run on the new fiber
 ;; BEFORE it can run: a virtual thread started from a Thread object (java/
@@ -708,6 +714,7 @@
                                 (jolt-slice-ns-param)
                                 #f)
               c #f '() 0 #f #f 0 #f ibox #f #f)))
+      (when ibox (jolt-fiber-own-ibox! f ibox))
       (when before-run (before-run f))
       (jolt-fiber-enqueue! c f)
       f)))
@@ -1033,6 +1040,8 @@
       (jolt-fiber-state-set! f 'ready)
       (jolt-fiber-enqueue!/locked c f))
     (jolt-unlock! mu)))
+
+(set! jolt-interrupt-owner-wake jolt-fiber-iwait-wake!)
 
 (define (jolt-fiber-commit-park! f h)
   (let ((mu (jolt-carrier-mu (jolt-fiber-carrier f))))
