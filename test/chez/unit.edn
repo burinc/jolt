@@ -1963,6 +1963,12 @@
   ;; empty list and running it all anyway. The first task is known to be running
   ;; before the five are queued, so the count is not a race.
   {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (deref go 5000 :timeout))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[5 0 true]"}
+  ;; ...and the same with the blocked task ending the moment it is interrupted, 40
+  ;; times per pool kind: shutdownNow interrupted the workers BEFORE it drained the
+  ;; queue, so a worker woken by it could take the queue first and run every queued
+  ;; task — [0 5 true] instead of [5 0 true], intermittently on CI. A spinning task
+  ;; makes the race land about half the time. True on JVM Clojure 1.12.5 / JDK 21.
+  {:suite "executor-shutdown" :expr "(every? true? (for [mk [#(java.util.concurrent.Executors/newFixedThreadPool 1) #(java.util.concurrent.Executors/newScheduledThreadPool 1) #(java.util.concurrent.ThreadPoolExecutor. 1 1 0 java.util.concurrent.TimeUnit/SECONDS (java.util.concurrent.LinkedBlockingQueue.))] _ (range 40)] (let [ex (mk) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (loop [] (when-not (or (realized? go) (Thread/interrupted)) (recur))))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) (= [5 0 true] [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)])))))" :expected "true"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
   ;; bytes-allocated reads the heap as it stands: live data AND garbage not yet

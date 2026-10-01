@@ -2598,7 +2598,8 @@
 ;; the waits above carry deadlines rather than durations.
 (define (executor-take-job! st)
   (let poll ((deadline #f))
-    (cond ((fx>? (vector-ref st 10) 0) (executor-lead-handoff! st) (executor-dequeue! st))
+    (cond ((executor-stopping? st) (executor-worker-exit! st))    ; shutdownNow: take nothing
+          ((fx>? (vector-ref st 10) 0) (executor-lead-handoff! st) (executor-dequeue! st))
           ((executor-delayed-due? st)                      ; the head's time has come
            (let ((sf (executor-delayed-pop! st)))
              (executor-lead-handoff! st)
@@ -2716,25 +2717,33 @@
 ;; keeps its interrupt rather than having it cleared before a task.
 (define (executor-stopping? st) (vector-ref st 20))
 (define (executor-shutdown-now! st)
-  (vector-set! st 0 #t)
-  (vector-set! st 20 #t)
-  ;; ...and interrupt what is running: each worker's flag, then a poke at whatever
-  ;; interruptible wait it is in (the protocol Thread.interrupt uses). A task in
-  ;; Thread/sleep or a deref is thrown out with InterruptedException, and one that
-  ;; polls Thread/interrupted sees it; the worker then finds the pool shut and
-  ;; drained and exits.
-  (for-each (lambda (b) (set-box! b #t) (jolt-interrupt-wake-waits! b))
-            (jolt-with-mutex (vector-ref st 2) (vector-ref st 18)))
-  (let ((dropped (jolt-with-mutex (vector-ref st 2)
-                   ;; the delayed tasks come back too, in due order after the
-                   ;; immediate ones, and come back AS THEY ARE — the JVM hands the
-                   ;; ScheduledFutureTasks over neither cancelled nor done, and each
-                   ;; still answers .run.
-                   (let ((jobs (append (executor-drain-queue! st) (vector-ref st 13))))
-                     (vector-set! st 13 '())
-                     (jolt-cv-wake! (vector-ref st 3))
-                     (jolt-cv-wake! (vector-ref st 11))
-                     jobs))))
+  ;; STOP, and the queue drained, under ONE hold of the queue mutex, and the
+  ;; workers interrupted only after it. A worker takes its next task under that
+  ;; same mutex and takes none once it reads STOP (executor-take-job!), which is
+  ;; the JVM's getTask; so no queued task can slip past the drain and run. The
+  ;; interrupt used to come first: a worker it woke could take the mutex ahead
+  ;; of the drain and run what was queued, and shutdownNow handed back nothing
+  ;; for tasks that had run anyway (unit row executor-shutdown, seen on CI).
+  (let* ((boxes #f)
+         (dropped (jolt-with-mutex (vector-ref st 2)
+                    (vector-set! st 0 #t)
+                    (vector-set! st 20 #t)
+                    ;; the delayed tasks come back too, in due order after the
+                    ;; immediate ones, and come back AS THEY ARE — the JVM hands the
+                    ;; ScheduledFutureTasks over neither cancelled nor done, and each
+                    ;; still answers .run.
+                    (let ((jobs (append (executor-drain-queue! st) (vector-ref st 13))))
+                      (vector-set! st 13 '())
+                      (set! boxes (vector-ref st 18))
+                      (jolt-cv-wake! (vector-ref st 3))
+                      (jolt-cv-wake! (vector-ref st 11))
+                      jobs))))
+    ;; ...then interrupt what is running: each worker's flag, then a poke at
+    ;; whatever interruptible wait it is in (the protocol Thread.interrupt uses).
+    ;; A task in Thread/sleep or a deref is thrown out with InterruptedException,
+    ;; and one that polls Thread/interrupted sees it; the worker then finds the
+    ;; pool stopped and exits.
+    (for-each (lambda (b) (set-box! b #t) (jolt-interrupt-wake-waits! b)) boxes)
     (apply jolt-vector dropped)))
 
 ;; The wait awaitTermination and close share. DEADLINE #f waits for as long as it
