@@ -984,35 +984,26 @@
   ;; deref, agent await, Thread.sleep/join, CountDownLatch.await, a task Future's
   ;; get, a blocking queue take/put, awaitTermination and Process.waitFor all throw
   ;; InterruptedException and leave the flag cleared, as on the JVM (jolt-qdi8).
-  ;; What remains divergent is narrower, and both halves are listed here.
   ;;
-  ;; A FIBER has no interrupt flag of its own. jolt's interrupt identity is the
-  ;; thread's interrupt box, and N fibers SHARE a carrier, so an interrupt aimed at
-  ;; a carrier can be consumed by a different parked fiber than the interrupter had
-  ;; in mind. On the JVM a parked go block occupies no thread at all, so there is
-  ;; nothing on that thread to interrupt but the block currently running.
-  ;; A go block that interrupts (Thread/currentThread) and then blocks does throw on
-  ;; both — that part matches.
+  ;; A FIBER IS A VIRTUAL THREAD, with its own Thread object and its own interrupt
+  ;; flag, so interrupting one fiber throws that fiber and no other out of its wait,
+  ;; and a fiber's Thread/sleep parks it and is interruptible — as a JDK 21 virtual
+  ;; thread's does. io-thread runs on one, as on the JVM. What stays different is a
+  ;; go block on the :fiber backend: core.async 1.9.865 runs go blocks on its :mixed
+  ;; pool of PLATFORM threads (dispatch/executor-for :core-async-dispatch), so
+  ;; Thread/currentThread inside one is whichever pool thread runs that segment, and
+  ;; may differ after each park. jolt's :fiber go block is a fiber, so it answers
+  ;; the fiber's own virtual thread, the same one for the block's whole life.
+  ;; Interrupting it reaches that block's blocking waits (<!!, deref, sleep), never
+  ;; its parks (<!, >!, alts!), which matches what interrupting the pool thread a
+  ;; running go block is on does to that block on the JVM.
   {:category :concurrency-model
-   :behavior "(.interrupt t) for a dispatch thread t while several go blocks are parked in blocking derefs, or in <!! / >!! / alts!!, that ran on it"
-   :jvm "a parked go block holds no thread; only whatever is running on t at that moment can be interrupted"
-   :jolt "the parked fibers registered against t's interrupt box are all woken and one of them consumes the interrupt and throws"
+   :behavior "(binding [*go-backend* :fiber] (<!! (go [(.isVirtual (Thread/currentThread)) (.getName (Thread/currentThread))])))"
+   :jvm "go blocks run on core.async's platform dispatch pool: [false \"async-mixed-N\"], and the thread can change across a park"
+   :jolt "[true \"\"] — the go block's own virtual thread, stable for its life"
    :check :prose
-   :why "needs several go blocks parked on one dispatch thread with an interrupt landing mid-park"
-   :note "jolt has no per-fiber interrupt flag to key on and .interrupt is handed a box and nothing else. The check CLEARS, so one interrupt still produces exactly one InterruptedException — but which fiber gets it is not determined. Pinned by the \"interrupt / blocking fibers\" rows in test/chez/unit.edn, which bind *go-backend* :fiber — go defaults to :thread, so an unbound (go ...) runs on an OS thread and tests nothing about fibers. The reasoning is at jolt-cv-wait-interruptibly in host/chez/locks.ss; the channel ops follow the same rule through jolt-fiber-waiter-wait!/ibox in host/chez/java/fibers-async.ss, pinned by the \"interrupt / blocking channels fibers\" rows."}
-  ;; A fiber's Thread/sleep gets the ALREADY-SET half of the rule but not the other
-  ;; half. Chez's sleep has no wakeup, and Thread/sleep on a fiber deliberately
-  ;; sleeps its CARRIER (fibers-pool-test case 6 pins that, and a go block doing
-  ;; Thread/sleep occupies its thread on the JVM too), so there is nothing to poke.
-  ;; Parking the fiber with a deadline instead would fix it and would also release
-  ;; the carrier, which is the behavior that gate deliberately pins the other way.
-  {:category :concurrency-model
-   :behavior "(.interrupt carrier) while a fiber on it is inside (Thread/sleep n) — under (binding [*go-backend* :fiber] ...)"
-   :jvm "a go block's Thread/sleep runs on a pool thread and throws InterruptedException at once"
-   :jolt "the sleep runs to its full duration; the flag is set and readable the moment it returns"
-   :check :prose
-   :why "timing-dependent: asserts when a sleep returns relative to an interrupt"
-   :note "Entering the sleep with the flag ALREADY set does throw, so the pre-set half matches. Only mid-sleep delivery is missing. Pinned by the last \"interrupt / blocking fibers\" row in test/chez/unit.edn, which also shows the flag surviving the nap. A fiber that must be interruptible mid-wait should park on a promise, or in <!! / >!! / alts!! on a channel, rather than sleep."}
+   :why "*go-backend* :fiber has no JVM counterpart; the default :thread backend runs a go block on a platform thread, as the JVM does"
+   :note "Pinned by the \"virtual threads / fibers\" rows in test/chez/unit.edn. The fiber's Thread object is virtual-thread-object in host/chez/java/io.ss and its flag is read by current-interrupt-box in host/chez/java/host-static-methods.ss."}
   ;; An alts that both takes from and puts to the same unbuffered channel. On the
   ;; JVM the put finds the alts's own take registered and commits against it: the
   ;; alts answers [true ch] and the value goes to a callback nobody reads. jolt

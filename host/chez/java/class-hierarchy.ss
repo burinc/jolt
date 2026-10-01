@@ -1187,6 +1187,8 @@
 (define jhost-tag->fqn (make-hashtable string-hash string=?))
 (for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
   '(("user-thread" . "java.lang.Thread")
+    ("vthread-builder" . "java.lang.ThreadBuilders$VirtualThreadBuilder")
+    ("vthread-factory" . "java.lang.ThreadBuilders$VirtualThreadFactory")
     ("abq" . "java.util.concurrent.ArrayBlockingQueue")
     ("lbq" . "java.util.concurrent.LinkedBlockingQueue")
     ("future-task" . "java.util.concurrent.FutureTask")

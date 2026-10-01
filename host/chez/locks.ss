@@ -279,6 +279,7 @@
             ;; decision be retaken: its wake is not "something changed".
             (when (jolt-fiber-switch-for-park? f)
               (jolt-fiber-to-scheduler! f))
+            (jolt-fiber-wstate-set! f #f)
             (when (and abandon? (jolt-fiber-interrupt f) (fx=? 0 (jolt-fiber-mask f)))
               (decide 'abandon))
             (jolt-fiber-check-interrupt! f)
@@ -637,6 +638,7 @@
                  ((jolt-current-fiber)
                   => (lambda (f)
                        (jolt-cv-register! cv f)
+                       (when deadline (jolt-fiber-wstate-set! f 'TIMED_WAITING))
                        (jolt-fiber-state-set! f 'parked)
                        jolt-lock-parked))
                  (else
@@ -684,16 +686,12 @@
 ;; already-delivered promise takes no lock this file did not already take, and
 ;; allocates nothing this file did not already allocate.
 ;;
-;; THE IDENTITY IS THE INTERRUPT BOX, not the fiber, and that is a decision rather
-;; than an oversight. The flag lives in the box, .interrupt is handed a box and
-;; nothing else, and jolt has no per-fiber interrupt flag to key on — so a fiber
-;; waiting here registers under the box of the carrier it is running on (a fiber
-;; cannot migrate, so that box is stable for its lifetime) and is woken when that
-;; thread is interrupted. Every waiter woken re-checks, and the check CLEARS, so
-;; exactly one of them consumes the interrupt and throws while the rest go back to
-;; waiting — one interrupt, one InterruptedException, as on the JVM. The reachable
-;; shape is a go block that interrupts (Thread/currentThread), which is its carrier;
-;; test/chez/unit.edn pins it and known-divergences.edn records it.
+;; THE IDENTITY IS THE INTERRUPT BOX. A thread's box is its own; a FIBER's is the
+;; fiber's own too (current-interrupt-box answers it while the fiber runs), since a
+;; fiber is a virtual thread with its own Thread object and flag. So a fiber
+;; waiting here registers under its own box and is woken when IT is interrupted,
+;; and no other fiber on its carrier is disturbed. Every waiter woken re-checks,
+;; and the check CLEARS — one interrupt, one InterruptedException, as on the JVM.
 (define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> entry set
 (define jolt-interrupt-waits-mu (make-mutex))
 
@@ -702,11 +700,10 @@
 ;; does its own waking — the cheap park's, which resumes one fiber directly rather
 ;; than listing it on a condition (java/sm.ss jolt-sm-commit!/intr).
 ;;
-;; Per box the entries are a SET (an eq table), not a list. A thread has one wait
-;; at a time, but a carrier's box is shared by every fiber parked on it, and ten
-;; thousand go blocks parked in <!! on one carrier made each removal a remq over
-;; ten thousand entries. The set is kept when it empties: it is weak-keyed with its
-;; box, so it goes when the thread does, and a thread that waits again reuses it.
+;; Per box the entries are a SET (an eq table), not a list, so a removal does not
+;; scan whatever else a box has listed. The set is kept when it empties: it is
+;; weak-keyed with its box, so it goes when the thread or fiber does, and one that
+;; waits again reuses it.
 ;;
 ;; Both called with the waiter's mu held. The table's own mutex is a leaf — taken
 ;; around one hashtable operation with nothing inside it — so it cannot be part of
@@ -736,20 +733,36 @@
 ;;
 ;; READ AND NOT DRAINED, unlike jolt-cv-take-waiters!. An entry is owned by the wait
 ;; that made it and is removed by that wait when it stops waiting, so deleting it
-;; here would unregister a waiter that is still waiting — the one that did not win
-;; the flag, when several share a carrier — and the next interrupt would not reach
-;; it. The entries are woken OUTSIDE the table's mutex, so this path holds one lock
+;; here would unregister a waiter that is still waiting, and the next interrupt
+;; would not reach it. The entries are woken OUTSIDE the table's mutex, so this path holds one lock
 ;; at a time.
+;;
+;; A box can also have an OWNER, registered once for its life rather than per
+;; wait: a fiber owns its box (fibers.ss jolt-fiber-ibox!), and its channel waits
+;; register nowhere and are resumed through the fiber itself. So whoever holds a
+;; fiber's box — a FutureTask's cancel(true), a pool's shutdownNow, Thread.interrupt
+;; — reaches those waits by this same call, with nothing to know about fibers:
+;; jolt-interrupt-owner-wake, set by fibers.ss, is handed the owner. Ephemeron-
+;; keyed, so an owner that holds its own box (a fiber does) is not kept by it.
+(define jolt-interrupt-owners (make-ephemeron-eq-hashtable))  ; interrupt box -> owner
+(define jolt-interrupt-owner-wake #f)
+(define (jolt-interrupt-owner-set! b owner)
+  (jolt-lock! jolt-interrupt-waits-mu)
+  (hashtable-set! jolt-interrupt-owners b owner)
+  (jolt-unlock! jolt-interrupt-waits-mu))
 (define (jolt-interrupt-wake-waits! b)
-  (let ((es (jolt-with-mutex jolt-interrupt-waits-mu
-              (let ((t (hashtable-ref jolt-interrupt-waits b #f)))
-                (if t (hashtable-keys t) '#())))))
+  (let-values (((es owner)
+                (jolt-with-mutex jolt-interrupt-waits-mu
+                  (let ((t (hashtable-ref jolt-interrupt-waits b #f)))
+                    (values (if t (hashtable-keys t) '#())
+                            (hashtable-ref jolt-interrupt-owners b #f))))))
     (vector-for-each
       (lambda (e)
         (if (procedure? e)
             (e)
             (jolt-with-mutex (car e) (jolt-cv-wake! (cdr e)))))
-      es)))
+      es)
+    (when (and owner jolt-interrupt-owner-wake) (jolt-interrupt-owner-wake owner))))
 
 ;; The flag, read-and-cleared — java.lang.Thread's own rule for a wait that throws:
 ;; "the interrupted status is cleared and an InterruptedException is thrown."

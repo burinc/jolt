@@ -87,8 +87,8 @@
 ;; value, a waiting putter, or a closed channel complete immediately (no
 ;; capture); an empty open channel registers an alt-taker and parks.
 ;;
-;; INTR? is #t for <!! only: the park is then interruptible through the carrier's
-;; interrupt box, the way a fiber's blocking deref is (locks.ss
+;; INTR? is #t for <!! only: the park is then interruptible through the fiber's
+;; own interrupt flag, the way a fiber's blocking deref is (locks.ss
 ;; jolt-cv-wait-interruptibly) — see jolt-fiber-waiter-wait!/ibox. An interrupted
 ;; take is claimed before it throws, so nothing is delivered into it, and its dead
 ;; handler is taken off the channel.
@@ -219,19 +219,17 @@
 ;; commit-to-park decision is atomic with alt-deliver!'s mailbox write.
 (define (jolt-fiber-waiter-wait! h) (jolt-fiber-waiter-wait!/ibox h #f))
 
-;; IBOX is the carrier's interrupt box for a blocking op (<!!, >!!, alts!!), or #f
+;; IBOX is the fiber's own interrupt box for a blocking op (<!!, >!!, alts!!), or #f
 ;; for a parking one, which is every other caller and waits exactly as before.
 ;; With a box the answer is #f when the wait was interrupted through it: the flag
 ;; is consumed and the handler CLAIMED, so no channel can deliver into it and the
 ;; caller throws InterruptedException. This is the fiber half of
-;; jolt-cv-wait-interruptibly's protocol (locks.ss): the carrier's one wake is
-;; listed against the box, and the flag is read at each commit under the carrier's
-;; run-queue mutex, the lock that wake takes (fibers.ss
-;; jolt-fiber-commit-park/ibox!) — so an interrupt either lands before the read and
-;; is seen, or finds the fiber 'parked and resumes it, and the resumed round reads
-;; it. Several fibers on one
-;; carrier are all woken and the first to read the flag consumes it; the rest park
-;; again (known-divergences.edn, the fiber-sharing-a-carrier entry).
+;; jolt-cv-wait-interruptibly's protocol (locks.ss), without a registry: the flag
+;; is read at each commit under the carrier's run-queue mutex, and Thread.interrupt
+;; of this fiber takes that mutex to wake it (fibers.ss jolt-fiber-iwait-wake!) —
+;; so an interrupt either lands before the read and is seen, or finds the fiber
+;; 'parked and resumes it, and the resumed round reads it. No other fiber is
+;; woken.
 ;;
 ;; The flag is read only when the fiber would park, so a delivery that is already
 ;; in the mailbox wins, as it does for a thread (async.ss ac-intr-wait!). And if
@@ -272,7 +270,7 @@
                     ;; Resumed with nothing delivered and no interrupt to raise: a
                     ;; wake from a registration an interrupt left behind (the waiter
                     ;; list of a deref or a monitor the fiber was raised out of), or
-                    ;; the carrier's interrupt, which the next round reads. Park
+                    ;; this fiber's interrupt, which the next round reads. Park
                     ;; again; the resume restored the depth the park was taken at,
                     ;; so the region is still open.
                     (if (and park?

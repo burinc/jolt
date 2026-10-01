@@ -368,6 +368,7 @@
     ("string-reader" "read" 0 1 3)
     ("url" "openConnection" 0 1)
     ("user-thread" "interrupt" 0)
+    ("vthread-builder" "name" 1 2)
     ("user-thread" "join" 0 1 2)
     ("writer" "append" 1 3)
     ("writer" "write" 1 3)

@@ -238,7 +238,14 @@
 (ok "14. an interrupt reaches a go body's deref after a delivered cheap park" (eq? #t r14))
 
 ;; --- 15. an interruptible wait an interrupt ended leaves no registration --------
-(define waits-before (hashtable-size jolt-interrupt-waits))
+;; Counted as ENTRIES across every box's set: a box's set is kept when it empties
+;; (locks.ss), and each fiber has a box of its own, so the number of boxes is not
+;; the number of registrations.
+(define (interrupt-wait-entries)
+  (let-values (((ks vs) (hashtable-entries jolt-interrupt-waits)))
+    (let loop ((i 0) (n 0))
+      (if (fx=? i (vector-length vs)) n (loop (fx+ i 1) (+ n (hashtable-size (vector-ref vs i))))))))
+(define waits-before (interrupt-wait-entries))
 (ev "
 (let [p (promise)
       w (f/spawn (fn [] (try @p (catch Throwable _ :caught))))]
@@ -246,7 +253,7 @@
   (f/interrupt! w (ex-info \"leave deref\" {}))
   (outcome w))")
 (ok "15. the interrupted deref deregistered from its interrupt box"
-    (= waits-before (hashtable-size jolt-interrupt-waits)))
+    (= waits-before (interrupt-wait-entries)))
 
 (printf "~a/~a passed\n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
