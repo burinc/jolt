@@ -3037,12 +3037,16 @@
   (let ((mine? (eqv? id (get-thread-id))))
     (jolt-with-mutex thread-handles-mutex
       (or (hashtable-ref thread-handles-by-id id #f)
-          (let ((obj (make-thread-object #f #f #t id #f 5
-                                         (if mine? (current-os-thread-box) (thread-box-for-id! id)))))
-            (unless (or mine? (thread-handle-alive? id))
-              (vector-set! (jhost-state obj) 1 #t))              ; already finished
-            (hashtable-set! thread-handles-by-id id obj)
-            obj)))))
+          (if (or mine? (thread-handle-alive? id))
+              (let ((obj (make-thread-object #f #f #t id #f 5
+                                             (if mine? (current-os-thread-box) (thread-box-for-id! id)))))
+                (hashtable-set! thread-handles-by-id id obj)
+                obj)
+              ;; already finished, its exit hook run: an object that registers
+              ;; nothing, or the entries would outlive the thread
+              (let ((obj (make-thread-object #f (jolt-thread-name id) #t id #f 5 (box #f))))
+                (vector-set! (jhost-state obj) 1 #t)
+                obj))))))
 ;; On a fiber, the FIBER's object: a fiber is a virtual thread, and its carrier is
 ;; not something its code can see (the JVM hides a virtual thread's carrier the
 ;; same way).
@@ -3071,11 +3075,23 @@
                    o))))
       (thread-box-forget! id)
       (thread-state-forget! id)
+      ;; the object takes over the name, priority and daemon status the tables
+      ;; held, and is marked done, BEFORE the entries go (concurrency.ss
+      ;; jthread-attr relies on that order)
       (when obj
-        (let ((st (jhost-state obj)))
+        (let ((st (jhost-state obj))
+              (nm (jolt-thread-name id))
+              (pr (jolt-thread-priority id))
+              (dm (jolt-thread-daemon? id)))
           (jolt-with-mutex (vector-ref st 2)
+            (set-box! (vector-ref st 6) nm)
+            (vector-set! st 9 pr)
+            (vector-set! st 8 dm)
             (vector-set! st 1 #t)
-            (jolt-cv-wake! (vector-ref st 3))))))))
+            (jolt-cv-wake! (vector-ref st 3)))))
+      (jolt-with-mutex thread-handles-mutex
+        (hashtable-delete! thread-names-by-id id)
+        (hashtable-delete! thread-priorities-by-id id)))))
 (set! jolt-thread-box-adopted-hook
   (lambda (id b)
     (let ((obj (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))))

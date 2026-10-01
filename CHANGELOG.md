@@ -123,8 +123,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `System/exit`, `Runtime.halt` (new) and an uncaught error still end the
   process at once; shutdown hooks run after the wait, as there. Daemon threads
   are never waited for: `core.async`'s `thread`, `go` and `io-thread`,
-  CompletableFuture's async pool, a pool whose `ThreadFactory` makes daemons,
-  and jolt's own runtime threads. `jolt run <task>` follows babashka's rule
+  CompletableFuture's async pool, `newVirtualThreadPerTaskExecutor`, a pool
+  whose `ThreadFactory` makes daemons, and jolt's own runtime threads. A future
+  or send-off is never a daemon, whatever thread starts it. `jolt run <task>` follows babashka's rule
   instead of clojure.main's: bb's future and agent threads are daemons, so a
   task does not wait on them (a `Thread.` it starts, or a pool it never shuts
   down, still holds the process up there as here). Built binaries wait the same
@@ -139,6 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them running); `ThreadPoolExecutor.allowCoreThreadTimeOut` is implemented;
   and `put!`/`take!` callbacks, `core.async`'s mixed and compute executors and
   the io poller run on daemon threads, so none of them holds the process up.
+  jolt's nREPL server runs on plain threads rather than futures, so evaluating
+  `(shutdown-agents)` over a connection leaves it serving the next one.
 
 ### Fixed
 
