@@ -399,39 +399,45 @@
       (let [acceptor
             (Thread.
              (bound-fn []
-               (loop []
-                 (when-not @stopped
-                   (let [[conn e] (native/c-accept fd ffi/null ffi/null)]
-                     (cond
-                       (>= conn 0)
-                       (do
-                         ;; macOS and Windows hand the listener's non-blocking
-                         ;; mode down; the connection is read blocking
-                         (native/set-blocking! conn true)
-                         (native/guard-accepted! conn)
-                         (.start
-                          (Thread.
-                           (bound-fn []
-                             (try (handle-conn conn handler)
-                                  (catch :default e
-                                    (println "nrepl conn error:" (err-msg e))
-                                    (native/c-close conn)))))))
-                       (native/eagain? e) (native/poll-one fd native/pollin accept-poll-ms)
-                       (native/eintr? e) nil
-                       ;; anything else (EMFILE, say) persists until something is
-                       ;; released; do not spin on it
-                       :else (Thread/sleep accept-poll-ms))
-                     (recur))))))]
+               ;; the loop owns the fd: it closes it on the way out, so the
+               ;; number is never freed while an accept() may still use it,
+               ;; and a loop that dies (Thread. failing, say) frees the port
+               (try
+                 (loop []
+                   (when-not @stopped
+                     (let [[conn e] (native/c-accept fd ffi/null ffi/null)]
+                       (cond
+                         (>= conn 0)
+                         (do
+                           ;; macOS and Windows hand the listener's non-blocking
+                           ;; mode down; the connection is read blocking
+                           (native/set-blocking! conn true)
+                           (native/guard-accepted! conn)
+                           (.start
+                            (Thread.
+                             (bound-fn []
+                               (try (handle-conn conn handler)
+                                    (catch :default e
+                                      (println "nrepl conn error:" (err-msg e))
+                                      (native/c-close conn)))))))
+                         (native/eagain? e)
+                         ;; a failing poll answers at once; wait the slice anyway
+                         (when (neg? (native/poll-one fd native/pollin accept-poll-ms))
+                           (Thread/sleep accept-poll-ms))
+                         (native/eintr? e) nil
+                         ;; anything else (EMFILE, say) persists until something is
+                         ;; released; do not spin on it
+                         :else (Thread/sleep accept-poll-ms))
+                       (recur))))
+               (finally (native/c-close fd)))))]
         (.start acceptor)
       (fn stop []
         (when (compare-and-set! stopped false true)
-          (.join acceptor (* 20 accept-poll-ms))
-          ;; still in a slice past that means something is wrong; leave the fd
-          ;; open rather than free a number the loop may yet call accept() on
-          (when-not (.isAlive acceptor)
-            (native/c-close fd))
-          ;; delete-file!, not the raw Chez delete-file this used to call: that
-          ;; one RAISES when the file is already gone, so a stop after someone
-          ;; cleaned the port file up threw out of the shutdown path.
-          (jolt.host/delete-file! ".nrepl-port"))
+          ;; the loop closes the fd as it leaves, within a slice; the join is
+          ;; what makes the port free when stop returns
+          (try (.join acceptor (* 20 accept-poll-ms))
+               ;; delete-file!, not the raw Chez delete-file this used to call:
+               ;; that one RAISES when the file is already gone, so a stop after
+               ;; someone cleaned the port file up threw out of the shutdown path.
+               (finally (jolt.host/delete-file! ".nrepl-port"))))
         nil)))))

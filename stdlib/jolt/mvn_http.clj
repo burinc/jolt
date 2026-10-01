@@ -179,8 +179,30 @@
   (str "could not connect to " host ":" port
        (cond
          (nil? err) ""
+         (= err :timeout) (str " (no answer in " socket-timeout-ms "ms)")
          windows?   (str " (error " err ")")
          :else      (str " (errno " err ": " (ffi/errno-message err) ")"))))
+
+(defn- connect-one
+  "Connect fd to one resolved address within socket-timeout-ms: nil when
+  connected, else the error (:timeout for none in time). The connect runs
+  non-blocking and is waited for with poll — SO_SNDTIMEO bounds a connect only
+  on Linux, and a black-holed address would otherwise hold each attempt for the
+  kernel's SYN timeout (minutes) before the next address is tried."
+  [fd a]
+  (native/set-blocking! fd false)
+  (let [[rc code] (native/c-connect fd (:addr a) (:addrlen a))
+        err (cond
+              (zero? rc) nil
+              (not (native/connect-pending? code)) code
+              :else
+              (let [ev (native/poll-one fd native/pollout socket-timeout-ms)]
+                (cond
+                  (zero? ev) :timeout
+                  (neg? ev) -1
+                  :else (let [e (native/pending-error fd)] (when-not (zero? e) e)))))]
+    (when-not err (native/set-blocking! fd true))
+    err))
 
 (defn- connect
   "Resolve host:port and open a connected TCP socket; return its fd. Every
@@ -198,10 +220,12 @@
           (let [[fd e] (native/c-socket (:family a) native/sock-stream 0)]
             (if (neg? fd)
               (recur more (or err e))
-              (let [[rc code] (native/c-connect fd (:addr a) (:addrlen a))]
-                (if (zero? rc)
-                  (do (native/close-on-exec! fd)
-                      (set-timeouts! fd socket-timeout-ms)
+              ;; close-on-exec before connect: a subprocess spawned while the
+              ;; connect waits must not inherit the socket
+              (let [_ (native/close-on-exec! fd)
+                    code (connect-one fd a)]
+                (if (nil? code)
+                  (do (set-timeouts! fd socket-timeout-ms)
                       fd)
                   (do (native/c-close fd)
                       (recur more code))))))))
