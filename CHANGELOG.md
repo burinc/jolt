@@ -182,6 +182,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collections do. Under a 200MB ceiling with ~100MB held, the churn loop
   also runs 1.2x faster.
 
+- **A vector sliced just past a trie boundary can be conj'd onto.**
+  `(reduce conj (subvec (vec (range 1100)) 0 1025) (range 3000))` threw
+  `vector-length: ... is not a vector`. When the tail of a relaxed vector was
+  pushed into its trie, the root could come back as a plain node over a
+  relaxed child, which the next conj read as a classic trie. The root now
+  stays relaxed.
+
 - **A `ServerSocket` whose bind address does not resolve closes its socket.**
   The constructor threw UnknownHostException and left the fd it had opened.
 
