@@ -2620,6 +2620,7 @@
                                  (do ((i 0 (fx+ i 1))) ((fx=? i len) out)
                                    (ja-set! out i (ja-ref a (+ f i)))))))
          (cons "sort" arrays-sort)
+         (cons "deepEquals" (lambda (a b) (objects-deep-equals? a b)))
          ;; Arrays.toString is "[a, b]" — comma-separated element toString, "null"
          ;; for a nil array. It used to print the elements as a jolt VECTOR, which
          ;; renders "[a b]" (no commas) and pr-quotes a string element.
@@ -2649,7 +2650,11 @@
   (cond ((eq? a b) #t)
         ((or (jolt-nil? a) (jolt-nil? b)) #f)
         ((and (jolt-array? a) (jolt-array? b))
-         (and (eq? (jolt-array-kind a) (jolt-array-kind b))
+         ;; Arrays.deepEquals0: two reference arrays (any component class — a
+         ;; String[] against an Object[]) compare element-wise, two primitive
+         ;; arrays only when their element type is the same
+         (and (let ((ka (jolt-array-kind a)) (kb (jolt-array-kind b)))
+                (or (eq? ka kb) (and (na-ref-kind? ka) (na-ref-kind? kb))))
               (= (ja-len a) (ja-len b))
               (let loop ((i 0))
                 (or (fx=? i (ja-len a))

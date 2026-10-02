@@ -192,6 +192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   UnsupportedOperationException as on 1.12. `cycle` is a `clojure.lang.Cycle`.
 - `#(%a)` and other bad arg literals read as symbols instead of raising.
 - An ArityException past 20 arguments says `(> 20)`.
+- `Objects/deepEquals` was false for two typed reference arrays (a `String[]`
+  against another, or against an `Object[]`); `Arrays/deepEquals` was missing.
 - A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque
   `#object` under `pr`, compared unequal to the Clojure collection with the same
   elements, and had the wrong `str`/`toString`.
