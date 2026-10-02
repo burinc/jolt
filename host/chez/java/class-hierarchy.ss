@@ -833,7 +833,7 @@
 (jch-register-supers! "java.lang.Appendable" '())
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
-(jch-register-supers! "java.nio.CharBuffer" '("java.lang.CharSequence" "java.lang.Appendable"))
+(jch-register-supers! "java.nio.CharBuffer" '("java.nio.Buffer" "java.lang.Comparable" "java.lang.CharSequence" "java.lang.Appendable" "java.lang.Readable"))
 (jch-register-supers! "java.nio.charset.CharsetDecoder" '())
 (jch-register-supers! "java.nio.charset.CharsetEncoder" '())
 (jch-register-supers! "java.nio.charset.CoderResult" '())
@@ -1168,7 +1168,7 @@
 (jch-register-supers! "java.util.Date" '("java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "java.sql.Date" '("java.util.Date"))
 (jch-register-supers! "java.sql.Timestamp" '("java.util.Date"))
-(jch-register-supers! "java.nio.ByteBuffer" '("java.lang.Comparable"))
+(jch-register-supers! "java.nio.ByteBuffer" '("java.nio.Buffer" "java.lang.Comparable"))
 ;; java.nio.file (nio-file.ss). The JVM's concrete classes here are private
 ;; implementation details (sun.nio.fs.UnixPath, sun.nio.fs.MacOSXFileSystem), so
 ;; the shims report the public interface a caller can actually name, the way the
@@ -1238,6 +1238,15 @@
     ("nio-path-matcher" . "java.nio.file.PathMatcher")
     ("byte-buffer" . "java.nio.ByteBuffer")
     ("char-buffer" . "java.nio.CharBuffer")
+    ;; the typed buffers and ByteOrder (byte-buffer.ss); a view CharBuffer is its
+    ;; own representation, the same class
+    ("nio-char-buffer" . "java.nio.CharBuffer")
+    ("short-buffer" . "java.nio.ShortBuffer")
+    ("int-buffer" . "java.nio.IntBuffer")
+    ("long-buffer" . "java.nio.LongBuffer")
+    ("float-buffer" . "java.nio.FloatBuffer")
+    ("double-buffer" . "java.nio.DoubleBuffer")
+    ("byte-order" . "java.nio.ByteOrder")
     ("coder-result" . "java.nio.charset.CoderResult")
     ("coding-error-action" . "java.nio.charset.CodingErrorAction")
     ("arraylist" . "java.util.ArrayList")

@@ -368,6 +368,32 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v (fx+ off i) (na-u8->byte (bytevector-u8-ref bv (fx+ bvoff i))))))))
 
+;; --- the java.nio buffer seam ------------------------------------------------
+;; java/byte-buffer.ss is shared with Gambit, which has no arrays; these are the
+;; array operations it asks the host for (rt-core.ss answers them there).
+;;
+;; A heap ByteBuffer reads and writes the OCTETS of the byte array it wraps, so
+;; a write through either is visible to the other. A byte array restored from an
+;; image older than the bytevector backing still holds a boxed vector; it moves
+;; onto a bytevector here, once, which every ja-* accessor reads the same way.
+(define (nb-host-bytes a)
+  (and (jolt-array? a) (eq? (jolt-array-kind a) 'byte)
+       (let ((v (jolt-array-vec a)))
+         (if (bytevector? v)
+             v
+             (let ((bv (make-bytevector (vector-length v))))
+               (do ((i 0 (fx+ i 1))) ((fx=? i (vector-length v)))
+                 (bytevector-s8-set! bv i (na-byte-of (vector-ref v i))))
+               (jolt-array-vec-set! a bv)
+               bv)))))
+(define (nb-host-new-bytes n) (make-jolt-array (make-bytevector n 0) 'byte))
+(define (nb-host-array? a kind) (and (jolt-array? a) (eq? (jolt-array-kind a) kind)))
+(define (nb-host-array-len a) (ja-len a))
+(define (nb-host-array-ref a i) (ja-ref a i))
+(define (nb-host-array-set! a i v) (ja-set! a i v))
+(define (nb-host-new-array kind n)
+  (make-jolt-array (na-make-backing n kind (case kind ((float double) 0.0) ((char) #\nul) (else 0))) kind))
+
 ;; A byte array's elements are signed-byte-folded by na-list->backing, the same
 ;; coercion aset applies through na-elem-of — so (into-array Byte/TYPE …) stores
 ;; bytes rather than whatever magnitude it was handed.
