@@ -12,10 +12,10 @@
 ;; the way babashka.version does on bb.
 (def-var! "clojure.core" "*jolt-version*" (jolt-version-string))
 
-;; *clojure-version* — a map {:major 1 :minor 11 :incremental 0 :qualifier nil}.
+;; *clojure-version* — a map {:major 1 :minor 12 :incremental 0 :qualifier nil}.
 (def-dynvar! "clojure.core" "*clojure-version*"
   (jolt-hash-map (keyword #f "major") 1
-                 (keyword #f "minor") 11
+                 (keyword #f "minor") 12
                  (keyword #f "incremental") 0
                  (keyword #f "qualifier") jolt-nil))
 

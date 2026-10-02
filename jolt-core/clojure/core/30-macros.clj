@@ -106,6 +106,9 @@
     (cond
       local? `(instance-check ~t ~x)
       pkey `(instance-check ~pkey ~x)
+      ;; an array class symbol (String/1, long/2) evaluates to its Class
+      (and (symbol? t) (namespace t) (contains? #{"1" "2" "3" "4" "5" "6" "7" "8" "9"} (name t)))
+      `(instance-check ~t ~x)
       (and (symbol? t)
            (when-let [v (clojure.core/resolve t)]
              ;; resolve hands back the class itself for a class mapping; a var

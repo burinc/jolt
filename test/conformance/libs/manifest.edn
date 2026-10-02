@@ -264,7 +264,7 @@
    ;; joda-time. It briefly read as loading-with-no-tests while jolt matched :bb
    ;; and took the empty arm (#894 re-recorded it that way); #893 dropped :bb, so
    ;; the :clj arm and its load failure are back. pass/fail/error are unchanged.
-   :expect {:tests 31 :pass 115 :fail 1 :error 3 :load-fail 1}}
+   :expect {:tests 31 :pass 116 :fail 0 :error 3 :load-fail 1}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"
@@ -503,7 +503,7 @@
    ;;     allocation (4.6x the collections, each stopping the world); the row
    ;;     runs in ~4 minutes, and :timeout 2400 is headroom for a loaded CI
    ;;     runner, not the expected cost.
-   :expect {:tests 219 :pass 13269 :fail 26 :error 9 :load-fail 1}}
+   :expect {:tests 219 :pass 13271 :fail 24 :error 9 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
