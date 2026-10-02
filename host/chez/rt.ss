@@ -2522,6 +2522,9 @@
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
+;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
+;; Self-contained; ahead of byte-buffer.ss, which encodes floats with them.
+(load "host/chez/java/math.ss")
 (load "host/chez/java/byte-buffer.ss")          ; java.nio.ByteBuffer over a byte-array
 (load "host/chez/java/charset-coding.ss")       ; CharBuffer + the CharsetDecoder decode loop
 
@@ -2557,10 +2560,6 @@
 ;; __read-tagged. Loads after inst-time.ss — __read-tagged reuses its #uuid/#inst
 ;; constructors, and the reader needs the full value/collection layer above.
 (load "host/chez/reader.ss")
-
-;; clojure.math: native flonum-math shims def-var!'d into the
-;; clojure.math ns. Self-contained (only def-var! + Chez math), order-independent.
-(load "host/chez/java/math.ss")
 
 ;; reader/macro runtime support: #?() feature set, reader-conditional + re-matcher
 ;; tagged-map ctors, macroexpand. After ns.ss; macroexpand call-time-refs the macro

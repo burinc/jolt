@@ -196,74 +196,22 @@
 (define (bb-bulk-set! b idx src soff n)
   (nb-store-copy! (nb-array-octets src) soff (bb-backing b) (fx+ (bb-off b) idx) n))
 
-;; --- IEEE 754 encodings, in exact arithmetic ----------------------------------
-;; R7RS only, so the file is the same on every target: a double is an unsigned
-;; 64-bit pattern (sign, 11 exponent bits, 52 mantissa bits), a float an unsigned
-;; 32-bit one (sign, 8, 23). A NaN encodes as the JDK's canonical one.
-(define nb-2^52 (expt 2 52))
-(define nb-2^23 (expt 2 23))
-(define (nb-negative? x) (or (< x 0.0) (eqv? x -0.0)))
-;; e with 2^e <= m < 2^(e+1), for an exact positive rational m
-(define (nb-binary-exponent m)
-  (let loop ((e (exact (floor (log (inexact m) 2)))))
-    (cond ((> (expt 2 e) m) (loop (- e 1)))
-          ((<= (expt 2 (+ e 1)) m) (loop (+ e 1)))
-          (else e))))
-(define (nb-dbl->bits x)
-  (let ((x (inexact x)))
-    (+ (if (nb-negative? x) (expt 2 63) 0)
-       (cond ((nan? x) #x7ff8000000000000)
-             ((infinite? x) #x7ff0000000000000)
-             ((= x 0.0) 0)
-             (else
-              (let* ((m (exact (abs x))) (e (nb-binary-exponent m)))
-                (if (>= e -1022)
-                    (+ (* (+ e 1023) nb-2^52) (- (* m (expt 2 (- 52 e))) nb-2^52))
-                    (* m (expt 2 1074)))))))))
-(define (nb-bits->dbl b)
-  (let* ((r (bitwise-and b #x7fffffffffffffff))
-         (field (bitwise-arithmetic-shift-right r 52))
-         (mant (bitwise-and r #xfffffffffffff))
-         (mag (cond ((= field 2047) (if (= mant 0) +inf.0 +nan.0))
-                    ((= field 0) (inexact (* mant (expt 2 -1074))))
-                    (else (inexact (* (+ nb-2^52 mant) (expt 2 (- field 1075))))))))
-    (if (>= b (expt 2 63)) (- mag) mag)))
-;; The float pattern of an exact positive rational, rounded once to single
-;; precision (half-even), overflowing to infinity as the JDK's d2f does.
-(define (nb-flt-mag-bits m)
-  (let ((e (nb-binary-exponent m)))
-    (if (>= e -126)
-        (let* ((q (round (* m (expt 2 (- 23 e)))))
-               (e (if (= q (expt 2 24)) (+ e 1) e))
-               (q (if (= q (expt 2 24)) nb-2^23 q)))
-          (if (> e 127) #x7f800000 (+ (* (+ e 127) nb-2^23) (- q nb-2^23))))
-        ;; subnormal; a round up to 2^23 is the smallest normal's pattern
-        (round (* m (expt 2 149))))))
-(define (nb-flt->bits x)
-  (let ((x (inexact x)))
-    (+ (if (nb-negative? x) #x80000000 0)
-       (cond ((nan? x) #x7fc00000)
-             ((infinite? x) #x7f800000)
-             ((= x 0.0) 0)
-             (else (nb-flt-mag-bits (exact (abs x))))))))
+;; --- IEEE 754 encodings ----------------------------------------------------
+;; The bit patterns are math.ss's dbl->bits / bits->dbl / flt->bits / bits->flt
+;; (exact arithmetic, the same on every target; math.ss is loaded on both). What
+;; is this file's own is how a FLOAT reads back.
+;;
 ;; The float a pattern holds, as jolt holds a float: a double. jolt has no
-;; single-precision type — (float 0.1) is the double 0.1 — so the double is the
+;; single-precision type -- (float 0.1) is the double 0.1 -- so the double is the
 ;; SHORTEST decimal that reads back as this float, the digits Float.toString
 ;; prints. Then (.getFloat b) after (.putFloat b 0.1) is 0.1, prints as the JVM's
 ;; does, and equals (float 0.1).
 (define (nb-bits->flt b)
-  (let* ((r (bitwise-and b #x7fffffff))
-         (field (bitwise-arithmetic-shift-right r 23))
-         (mant (bitwise-and r #x7fffff))
-         (neg? (>= b #x80000000)))
-    (cond ((= field 255) (if (= mant 0) (if neg? -inf.0 +inf.0) +nan.0))
-          ((= r 0) (if neg? -0.0 0.0))
-          (else
-           (let* ((m (if (= field 0)
-                         (* mant (expt 2 -149))
-                         (* (+ nb-2^23 mant) (expt 2 (- field 150)))))
-                  (d (nb-shortest-float m r)))
-             (if neg? (- d) d))))))
+  (let ((x (bits->flt b)))
+    (if (or (nan? x) (infinite? x) (= x 0.0))
+        x
+        (let ((d (nb-shortest-float (exact (abs x)) (bitwise-and b #x7fffffff))))
+          (if (< x 0.0) (- d) d)))))
 (define (nb-decimal-exponent m)          ; e with 10^e <= m < 10^(e+1)
   (let loop ((e (exact (floor (/ (log (inexact m)) (log 10))))))
     (cond ((> (expt 10 e) m) (loop (- e 1)))
@@ -272,7 +220,8 @@
 ;; Float.toString writes at least one digit after the point, so in its
 ;; scientific range (below 10^-3, from 10^7) the shortest form has two
 ;; significant digits: Float.MIN_VALUE is 1.4E-45, the closest two-digit
-;; decimal, never 1.0E-45.
+;; decimal, never 1.0E-45. M is the float's exact magnitude, BITS its pattern
+;; without the sign.
 (define (nb-shortest-float m bits)
   (let ((e10 (nb-decimal-exponent m)))
     (let loop ((n (if (or (< m 1/1000) (>= m 10000000)) 2 1)))
@@ -280,7 +229,7 @@
           (inexact m)
           (let* ((s (expt 10 (- e10 (- n 1))))
                  (cand (* (round (/ m s)) s)))
-            (if (and (> cand 0) (= (nb-flt-mag-bits cand) bits))
+            (if (and (> cand 0) (= (flt->bits cand) bits))
                 (inexact cand)
                 (loop (+ n 1))))))))
 
@@ -302,12 +251,12 @@
     ((long) (nb-signed u 64))
     ((char) (nb-code->char u))
     ((float) (nb-bits->flt u))
-    (else (nb-bits->dbl u))))
+    (else (bits->dbl u))))
 (define (nb-encode kind v)
   (case kind
     ((char) (nb-char-code v))
-    ((float) (nb-flt->bits (jolt-need-num v)))
-    ((double) (nb-dbl->bits (jolt-need-num v)))
+    ((float) (flt->bits (jolt-need-num v)))
+    ((double) (dbl->bits (jolt-need-num v)))
     (else (nb-int v))))
 ;; A value as an element of a host typed array of KIND.
 (define (nb-array-elem kind v)
