@@ -391,6 +391,12 @@
 (define (nb-host-array-len a) (ja-len a))
 (define (nb-host-array-ref a i) (ja-ref a i))
 (define (nb-host-array-set! a i v) (ja-set! a i v))
+(define (nb-host-chars->string a from to)   ; a char array's [from, to) as a string
+  (let ((v (jolt-array-vec a)))
+    (if (string? v)
+        (substring v from to)
+        (let ((s (make-string (fx- to from))))
+          (do ((i from (fx+ i 1))) ((fx=? i to) s) (string-set! s (fx- i from) (ja-ref a i)))))))
 (define (nb-host-new-array kind n)
   (make-jolt-array (na-make-backing n kind (case kind ((float double) 0.0) ((char) #\nul) (else 0))) kind))
 

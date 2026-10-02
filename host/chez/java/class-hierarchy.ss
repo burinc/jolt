@@ -1237,9 +1237,7 @@
     ("nio-filesystem" . "java.nio.file.FileSystem")
     ("nio-path-matcher" . "java.nio.file.PathMatcher")
     ("byte-buffer" . "java.nio.ByteBuffer")
-    ("char-buffer" . "java.nio.CharBuffer")
-    ;; the typed buffers and ByteOrder (byte-buffer.ss); a view CharBuffer is its
-    ;; own representation, the same class
+    ;; java.nio's buffers and ByteOrder (byte-buffer.ss)
     ("nio-char-buffer" . "java.nio.CharBuffer")
     ("short-buffer" . "java.nio.ShortBuffer")
     ("int-buffer" . "java.nio.IntBuffer")

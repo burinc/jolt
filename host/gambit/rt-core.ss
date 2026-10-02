@@ -1459,6 +1459,7 @@
 (define (nb-host-array-ref a i) (nb-no-arrays "java.nio buffer array read"))
 (define (nb-host-array-set! a i v) (nb-no-arrays "java.nio buffer array write"))
 (define (nb-host-new-array kind n) (nb-no-arrays "java.nio typed buffer allocate"))
+(define (nb-host-chars->string a from to) (nb-no-arrays "java.nio CharBuffer array read"))
 (define (jinst? x) #f)
 (define (jfile? x) #f)
 (define (jbigdec? x) #f)

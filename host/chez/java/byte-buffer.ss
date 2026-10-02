@@ -269,18 +269,22 @@
     (else (nb-int v))))
 
 ;; Element I (0..cap-1) of any buffer.
+;; A third mode, 'string, is CharBuffer/wrap over a CharSequence: the JDK's
+;; StringCharBuffer, read-only, reading the string itself.
 (define (nb-ref b i)
-  (let ((kind (nb-kind b)))
-    (if (eq? (nb-mode b) 'array)
-        (nb-host-array-ref (bb-backing b) (fx+ (bb-off b) i))
-        (let ((w (nb-width kind)))
-          (nb-decode kind (nb-load (bb-backing b) (fx+ (bb-off b) (fx* i w)) w (nb-order b)))))))
+  (let ((kind (nb-kind b)) (mode (nb-mode b)))
+    (cond ((eq? mode 'bytes)
+           (let ((w (nb-width kind)))
+             (nb-decode kind (nb-load (bb-backing b) (fx+ (bb-off b) (fx* i w)) w (nb-order b)))))
+          ((eq? mode 'array) (nb-host-array-ref (bb-backing b) (fx+ (bb-off b) i)))
+          (else (string-ref (bb-backing b) (fx+ (bb-off b) i))))))
 (define (nb-set! b i v)
-  (let ((kind (nb-kind b)))
-    (if (eq? (nb-mode b) 'array)
-        (nb-host-array-set! (bb-backing b) (fx+ (bb-off b) i) (nb-array-elem kind v))
-        (let ((w (nb-width kind)))
-          (nb-store! (bb-backing b) (fx+ (bb-off b) (fx* i w)) w (nb-order b) (nb-encode kind v))))))
+  (let ((kind (nb-kind b)) (mode (nb-mode b)))
+    (cond ((eq? mode 'bytes)
+           (let ((w (nb-width kind)))
+             (nb-store! (bb-backing b) (fx+ (bb-off b) (fx* i w)) w (nb-order b) (nb-encode kind v))))
+          ((eq? mode 'array) (nb-host-array-set! (bb-backing b) (fx+ (bb-off b) i) (nb-array-elem kind v)))
+          (else (nb-read-only)))))
 
 ;; --- ByteOrder ---------------------------------------------------------------
 ;; Two interned constants; a buffer holds the symbol, the constant is what
@@ -320,6 +324,7 @@
     (cond ((eq? (nb-kind b) 'byte)
            (string-append (if (nb-direct? b) "java.nio.DirectByteBuffer" "java.nio.HeapByteBuffer") r))
           ((eq? (nb-mode b) 'array) (string-append "java.nio.Heap" t "Buffer" r))
+          ((eq? (nb-mode b) 'string) "java.nio.StringCharBuffer")
           ((nb-direct? b)
            (string-append "java.nio.Direct" t "Buffer" r (if (eq? (nb-order b) (nb-native-order)) "U" "S")))
           (else (string-append "java.nio.ByteBufferAs" t "Buffer" r (if (eq? (nb-order b) 'big) "B" "L"))))))
@@ -335,6 +340,7 @@
 (jch-register-supers! "java.nio.DirectByteBuffer" '("java.nio.MappedByteBuffer"))
 (jch-register-supers! "java.nio.DirectByteBufferR" '("java.nio.DirectByteBuffer"))
 (jch-register-supers! "java.nio.ByteOrder" '())
+(jch-register-supers! "java.nio.StringCharBuffer" '("java.nio.CharBuffer"))
 (jch-register-supers! "java.nio.InvalidMarkException" '("java.lang.IllegalStateException"))
 (jch-register-supers! "java.nio.ReadOnlyBufferException" '("java.lang.UnsupportedOperationException"))
 (for-each
@@ -405,6 +411,37 @@
                          ((arr) (wrap arr 0 (if (nb-host-array? arr kind) (nb-host-array-len arr) 0)))
                          ((arr off len) (wrap arr (nb-int off) (nb-int len)))))))))
   '(short int long float double))
+
+;; CharBuffer: allocate and wrap(char[]) over a char array, sharing it, as the
+;; JDK's HeapCharBuffer; wrap(CharSequence) over the text, read-only, as its
+;; StringCharBuffer. Both in native order, which is the JDK's for either.
+(define (nb-char-allocate n)
+  (let ((n (nb-int n)))
+    (when (fx<? n 0) (nb-iae (string-append "capacity < 0: (" (nb-n n) " < 0)")))
+    (let ((arr (nb-host-new-array 'char n)))
+      (make-nb 'char 'array arr 0 n 0 n (nb-native-order) 0 arr))))
+(define (nb-char-wrap x start end)
+  (if (nb-host-array? x 'char)
+      (let ((n (nb-host-array-len x)))
+        (nb-check-range start (fx- end start) n)
+        (make-nb 'char 'array x 0 n start end (nb-native-order) 0 x))
+      (let* ((s (if (string? x) x (jolt-str-render-one x))) (n (string-length s)))
+        (when (or (fx<? start 0) (fx>? start n) (fx<? end start) (fx>? end n)) (nb-ioobe))
+        (make-nb 'char 'string s 0 n start end (nb-native-order) nb-flag-ro #f))))
+(define (nb-char-seq-len x)
+  (cond ((nb-host-array? x 'char) (nb-host-array-len x))
+        ((string? x) (string-length x))
+        (else (string-length (jolt-str-render-one x)))))
+(register-class-statics! "java.nio.CharBuffer"
+  (list
+    (cons "allocate" nb-char-allocate)
+    (cons "wrap" (case-lambda
+                   ((x) (nb-char-wrap x 0 (nb-char-seq-len x)))
+                   ;; (char[] off len), but (CharSequence start end)
+                   ((x a b) (let ((a (nb-int a)) (b (nb-int b)))
+                              (if (nb-host-array? x 'char)
+                                  (nb-char-wrap x a (fx+ a b))
+                                  (nb-char-wrap x a b))))))))
 
 ;; --- derived buffers -----------------------------------------------------------
 ;; slice/duplicate/asReadOnlyBuffer of a ByteBuffer start BIG_ENDIAN, as the
@@ -530,8 +567,11 @@
 ;; A CharBuffer is its remaining characters; every other buffer names its class
 ;; and its three indexes.
 (define (nb-char-string b from to)        ; elements [from, to) as a string
-  (let ((s (make-string (fx- to from))))
-    (do ((i from (fx+ i 1))) ((fx=? i to) s) (string-set! s (fx- i from) (nb-ref b i)))))
+  (case (nb-mode b)
+    ((string) (substring (bb-backing b) (fx+ (bb-off b) from) (fx+ (bb-off b) to)))
+    ((array) (nb-host-chars->string (bb-backing b) (fx+ (bb-off b) from) (fx+ (bb-off b) to)))
+    (else (let ((s (make-string (fx- to from))))
+            (do ((i from (fx+ i 1))) ((fx=? i to) s) (string-set! s (fx- i from) (nb-ref b i)))))))
 (define (nb-render b)
   (if (eq? (nb-kind b) 'char)
       (nb-char-string b (bb-pos b) (bb-limit b))
@@ -691,14 +731,15 @@
     (cons "isReadOnly" nb-ro?)
     (cons "isDirect" nb-direct?)
     (cons "hasArray" (lambda (b) (and (nb-array b) (not (nb-ro? b)) #t)))
+    ;; no backing array is asked before read-only, as the JDK tests hb first
     (cons "array" (lambda (b)
-                    (cond ((nb-ro? b) (nb-read-only))
-                          ((nb-array b))
-                          (else (nb-throw "java.lang.UnsupportedOperationException" jolt-nil)))))
+                    (cond ((not (nb-array b)) (nb-throw "java.lang.UnsupportedOperationException" jolt-nil))
+                          ((nb-ro? b) (nb-read-only))
+                          (else (nb-array b)))))
     (cons "arrayOffset" (lambda (b)
-                          (cond ((nb-ro? b) (nb-read-only))
-                                ((nb-array b) (bb-off b))
-                                (else (nb-throw "java.lang.UnsupportedOperationException" jolt-nil)))))
+                          (cond ((not (nb-array b)) (nb-throw "java.lang.UnsupportedOperationException" jolt-nil))
+                                ((nb-ro? b) (nb-read-only))
+                                (else (bb-off b)))))
     (cons "order" (lambda (b) (nb-order-object (nb-order b))))
     (cons "slice" (case-lambda
                     ((b) (nb-slice b (bb-pos b) (nb-remaining b)))

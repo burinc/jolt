@@ -225,6 +225,9 @@
        "[true 32 5]")
 (check "(let [b (java.nio.ByteBuffer/allocate 4)] (.putInt b 16909060) (.flip b) (.get b) (.compact b) [(.position b) (.get b 0) (.get b 2)])"
        "[3 2 4]")
+;; a StringCharBuffer needs no array, so CharBuffer/wrap of a string is here too
+(check "(let [s (java.nio.CharBuffer/wrap \"hi\") v (.asCharBuffer (doto (java.nio.ByteBuffer/allocate 4) (.putChar \\h) (.putChar \\i) .flip))] [(= s v) (.hashCode s) (str (.subSequence s 1 2)) (.getName (class s)) (.isReadOnly s)])"
+       "[true 4320 \"i\" \"java.nio.StringCharBuffer\" true]")
 
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")
