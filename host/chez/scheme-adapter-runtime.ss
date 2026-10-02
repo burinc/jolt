@@ -1116,7 +1116,7 @@
              (if room
                  (let ((saved (in-place-minimum-generation)))
                    (dynamic-wind
-                     (lambda () (in-place-minimum-generation (min saved sa-gc-tight-generation)))
+                     (lambda () (in-place-minimum-generation 1))
                      (lambda () (sa-collect-tight room))
                      (lambda () (in-place-minimum-generation saved))))
                  (collect (collect-maximum-generation)))))))
@@ -1129,33 +1129,28 @@
             (observe (- t1 t0) (- t1 last-end))
             (set! last-end t1))))))
   #t)
-;; A tight full collection within ROOM free bytes. Marking in place does not
-;; keep a tight collection from copying: Chez still copies a segment whose chunk
-;; is under a quarter used, or that was marked before and is now under three
-;; quarters live, and after a run of tight young collections that can be most of
-;; the younger generations. A copied object's source is freed only when its
-;; collection ends, so one (collect max) peaks at the heap in use plus everything
-;; it copies: the gcpolicy gate's forced case, with ~140MB in generations 1-3
-;; and none yet in the oldest, peaked at 322MB under a 256MB ceiling.
+;; A tight full collection within ROOM free bytes: every generation from 1 up
+;; is marked where it is rather than copied, in ONE collection. Chez marks a
+;; segment only when its generation is at least both in-place-minimum-generation
+;; and the collection's min-tg (gc.c), so (collect max 1 max) with the minimum at
+;; 1 copies generation 0 and the sparse segments Chez always recopies (a chunk
+;; under a quarter used, a segment marked before and now under three quarters
+;; live), and promotes the rest in place.
 ;;
-;; So when the younger generations hold more than ROOM, collect them a step at a
-;; time first -- 1 into 2, 2 into 3, up to the one below the oldest -- and then
-;; everything into the oldest. A step frees its sources before the next copies,
-;; so the peak is the heap plus the largest step (269MB there). The steps are
-;; passes a single collection would not make, so they are only taken when the
-;; younger generations would not fit: once the oldest holds the compacted bulk,
-;; one collection copies little, and staging every forced collection ran that
-;; gate 1.15x slower.
+;; A copying collection peaks at what the heap holds plus everything it copies,
+;; since a source is freed only when the collection ends. The collection this
+;; replaces staged 1 into 2, 2 into 3, then everything, so each step copied a
+;; whole generation: on bionic a scheduled promotion had just left 251MB held
+;; under a 256MB ceiling, the first step copied generation 1's 35MB on top, and
+;; the gcpolicy gate peaked at 317MB. Marking in place needs no to-space, which
+;; is how GHC treats the oldest generation near -M and why HotSpot's full
+;; collections are in place. The young collections keep the minimum at 2 (1
+;; fragmented more over a long run); only this one marks generation 1.
+;;
+;; ROOM is unused: the collection no longer needs any to fit.
 (define (sa-collect-tight room)
   (let ((cmg (collect-maximum-generation)))
-    (when (> (let sum ((g 1) (n 0))
-               (if (fx< g cmg) (sum (fx+ g 1) (+ n (bytes-allocated g))) n))
-             room)
-      (let loop ((g 1))
-        (when (fx< g (fx- cmg 1))
-          (collect g (fx+ g 1))
-          (loop (fx+ g 1)))))
-    (collect cmg)))
+    (collect cmg 1 cmg)))
 
 ;; The collection the hook runs in place of Chez's (collect). Chez's schedule
 ;; collects generation g every radix^g collections and otherwise only

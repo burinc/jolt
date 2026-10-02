@@ -165,6 +165,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A collection forced by the heap ceiling no longer copies its way past
+  it.** It collected the younger generations one step at a time, each step
+  copying a whole generation on top of what the heap already held; when a
+  scheduled promotion had just run, the gcpolicy gate's 256MB ceiling peaked
+  at 317MB. It is one collection now that marks every generation from 1 up in
+  place, as GHC treats its oldest generation near `-M` and HotSpot's full
+  collections do. Under a 200MB ceiling with ~100MB held, the churn loop
+  also runs 1.2x faster.
+
 - **A `ServerSocket` whose bind address does not resolve closes its socket.**
   The constructor threw UnknownHostException and left the fd it had opened.
 
