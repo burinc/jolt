@@ -1829,7 +1829,23 @@
 ;; counts only when it was running THIS namespace — a require nested in a form
 ;; loads another namespace's defs, and those are not visible to the requiring
 ;; file at any ordinal.
+;; The defs a cached artifact's load makes in its own namespace, for the loader
+;; to take back if it then recompiles in this same process (loader.ss
+;; aot-safe-load-or-recompile). #f, or #(ns table): TABLE maps "ns/name" to
+;; whether that var was already defined before the load's first def of it. Only
+;; NS is recorded — a require nested in the load defines another namespace's
+;; vars for real, and the recompile will not load that namespace again.
+(define jolt-def-capture (make-parameter #f))
+(define (jolt-def-capture-note! cap ns name)
+  (when (string=? ns (vector-ref cap 0))
+    (let ((k (string-append ns "/" name)) (t (vector-ref cap 1)))
+      (unless (hashtable-contains? t k)
+        (hashtable-set! t k (jolt-with-mutex var-table-mu
+                              (let ((c (hashtable-ref var-table k #f)))
+                                (and c (var-cell-defined? c) #t))))))))
 (define (var-def-ordinal-set! ns name)
+  (let ((cap (jolt-def-capture)))
+    (when cap (jolt-def-capture-note! cap ns name)))
   (let loop ((fs (jolt-load-frames)) (inner #t))
     (unless (null? fs)
       (let ((f (car fs)))
@@ -2570,6 +2586,15 @@
 ;; backing; extends count/nth/seq/get/ref-put! so the overlay aget/aset/alength see
 ;; it. After the dispatchers it chains.
 (load "host/chez/java/natives-array.ss")
+
+;; java.util.stream: Stream / IntStream / LongStream / DoubleStream over lazy
+;; seqs, Collectors, and Collection.stream(). After natives-array.ss (toArray,
+;; Arrays/stream) and host-static-classes.ss (Optional, the collection shims).
+(load "host/chez/java/streams.ss")
+
+;; java.util.function default methods (negate/andThen/…) for every implementer,
+;; the lambdas they answer, and Function/identity & co. After streams.ss.
+(load "host/chez/java/fi-defaults.ss")
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and

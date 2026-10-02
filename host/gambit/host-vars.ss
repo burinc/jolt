@@ -301,7 +301,7 @@
 (def-var! "jolt.host" "fn-form-parse"
   (gambit-unsupported-fn "fn-form-parse" "there is no fn-form registry on this target"))
 
-(degrade-core-vars! '("aclone" "into-array" "to-array" "object-array" "int-array"
+(degrade-core-vars! '("aclone" "into-array" "to-array" "make-array" "object-array" "int-array"
                       "long-array" "double-array" "float-array" "boolean-array"
                       "byte-array" "char-array" "short-array")
                     "arrays are not wired up on this target (java/natives-array.ss)")

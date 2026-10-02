@@ -104,6 +104,7 @@
     (vector-set! v sk-range         "clojure.lang.Range")
     (vector-set! v sk-iterate       "clojure.lang.Iterate")
     (vector-set! v sk-repeat        "clojure.lang.Repeat")
+    (vector-set! v sk-cycle         "clojure.lang.Cycle")
     (vector-set! v sk-array-seq     "clojure.lang.ArraySeq")
     (vector-set! v sk-array-int     "clojure.lang.ArraySeq$ArraySeq_int")
     (vector-set! v sk-array-long    "clojure.lang.ArraySeq$ArraySeq_long")

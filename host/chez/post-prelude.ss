@@ -79,6 +79,10 @@
         ;; ...and neither is a java.util.concurrent.Future that is not a clojure
         ;; future (a FutureTask, a CompletableFuture): the overlay would read it
         ;; through its own future? test and answer false.
+        ;; ...except an Iterate (iterate, the unbounded range) or a Cycle, which
+        ;; are IPending: a cell's first element is computed with the cell, so
+        ;; each answers true, as the JVM's do once their first is known.
+        ((and (cseq? x) (let ((k (cseq-kind x))) (or (fx=? k sk-iterate) (fx=? k sk-cycle)))) #t)
         ((or (cseq? x) (empty-list-t? x) (jolt-java-future? x))
          (jolt-throw (jolt-host-throwable
                       "java.lang.ClassCastException"
