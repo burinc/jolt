@@ -665,6 +665,19 @@
       ;; dot-coll-method).
       ((and (string=? method-name "forEach") (pair? rest) (null? (cdr rest)) (rd-java-list? obj))
        (car (dot-coll-method obj method-name rest)))
+;; IReduce.reduce(f) / IReduceInit.reduce(f, init) on the seq classes that
+      ;; implement it — Iterate, Cycle, Repeat, the ranges and a PersistentList —
+      ;; as the class model claims (class-hierarchy.ss): reduce itself, reduced
+      ;; honored.
+      ((and (string=? method-name "reduce") (pair? rest) (fx<=? (length rest) 2)
+            (or (empty-list-t? obj)
+                (and (cseq? obj)
+                     (let ((k (cseq-kind obj)))
+                       (or (fx=? k sk-iterate) (fx=? k sk-cycle) (fx=? k sk-repeat)
+                           (fx=? k sk-long-range) (fx=? k sk-range) (fx=? k sk-list))))))
+       (if (null? (cdr rest))
+           (jolt-reduce (car rest) obj)
+           (jolt-reduce (car rest) (cadr rest) obj)))
       ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /
       ;; seq) — -1 when absent, like the JVM (medley/index-of reads this).
       ((or (string=? method-name "indexOf") (string=? method-name "lastIndexOf"))

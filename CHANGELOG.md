@@ -199,6 +199,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the next saw it. A pipeline now pulls one element at a time. Added
   `Collectors/groupingBy`, `toMap` and `partitioningBy`, `summaryStatistics` and
   `mapMulti`; `Stream.toList` is an unmodifiable List rather than a vector.
+- `realized?` threw on `cycle`, `iterate` and `(range)`; they are IPending and
+  IReduce (with `.reduce`), as on the JVM.
 - `.hashCode` of a seq or list was its hasheq instead of `List.hashCode`, and
   ArrayList/HashSet/HashMap had no `.equals`/`.hashCode`.
 - A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque

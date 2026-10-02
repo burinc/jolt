@@ -578,14 +578,22 @@
 ;; interface is grafted on from there). NOT Counted, though the JVM's is: jolt's
 ;; range is one chunk followed by a lazy continuation, so it cannot answer its own
 ;; length without realizing the whole thing.
-(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq" "clojure.lang.IReduce" "clojure.lang.IDrop"))
 ;; The non-all-longs range — (range 0 1.0 0.1) and friends. Same shape as
 ;; LongRange, and chunked for the same reason.
-(jch-register-supers! "clojure.lang.Range" '("clojure.lang.ASeq"))
-(jch-register-supers! "clojure.lang.Iterate" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.Range" '("clojure.lang.ASeq" "clojure.lang.IReduce"))
+;; iterate (and the unbounded range) and cycle are IPending — realized? answers
+;; for their first cell — and reduce themselves (IReduce), as on the JVM.
+(jch-register-supers! "clojure.lang.Iterate" '("clojure.lang.ASeq" "clojure.lang.IPending" "clojure.lang.IReduce"))
+(jch-register-supers! "clojure.lang.Cycle" '("clojure.lang.ASeq" "clojure.lang.IPending" "clojure.lang.IReduce"))
 ;; (range start end 0), which the JVM answers with Repeat.create(start). Lazy and
 ;; unbounded, so not chunked and not Counted.
-(jch-register-supers! "clojure.lang.Repeat" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.Repeat" '("clojure.lang.ASeq" "clojure.lang.IReduce" "clojure.lang.IDrop"))
+;; IReduce is IReduceInit's two-arity extension; IDrop is drop's fast path (1.12).
+(jch-register-supers! "clojure.lang.IReduce" '("clojure.lang.IReduceInit"))
+(jch-mark-interface! "clojure.lang.IReduce")
+(jch-register-supers! "clojure.lang.IDrop" '())
+(jch-mark-interface! "clojure.lang.IDrop")
 (jch-register-supers! "clojure.lang.PersistentQueue" '("clojure.lang.IPersistentList" "clojure.lang.IPersistentCollection" "java.util.Collection"))
 ;; scalars / named / callable
 (jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable" "java.io.Serializable"))
