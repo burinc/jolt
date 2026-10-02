@@ -197,8 +197,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least two significant digits and picks the two nearest the value, so
   `Double/MIN_VALUE` is `4.9E-324`; jolt padded the shortest digits and printed
   `5.0E-324`, and `9.9E-324` as `1.0E-323`. Checked against the JVM over every
-  subnormal below 2000 ulps and 20,000 random ones. Number printing is one
-  shared file for both hosts now.
+  subnormal below 2000 ulps and 20,000 random ones. `format` starts from the
+  same digits, so `(format "%.2e" 4.9E-324)` is `"4.90e-324"`, and number
+  printing is one shared file for both hosts now.
 
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux

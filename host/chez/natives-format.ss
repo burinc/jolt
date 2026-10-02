@@ -90,7 +90,14 @@
              (dot (str-index mant #\.))
              (int-part (if dot (substring mant 0 dot) mant))
              (frac-part (if dot (substring mant (fx+ dot 1) (string-length mant)) "")))
-        (digits-normalize (string-append int-part frac-part) (+ e10 (string-length int-part))))))
+        (let-values (((digits point)
+                      (digits-normalize (string-append int-part frac-part) (+ e10 (string-length int-part)))))
+          ;; Formatter starts from Double.toString's digits, which for a
+          ;; one-digit subnormal are the two nearest its value (4.9E-324, not 5)
+          (let ((two (and (fx=? (string-length digits) 1) (not (string=? digits "0"))
+                          (fl< (flabs (inexact x)) 2.2250738585072014e-308)
+                          (flonum-two-digits (flabs (inexact x))))))
+            (if two (values (car two) (cdr two)) (values digits point)))))))
 ;; (digits-round digits n) -> (cons digits* carry?): the first n digits, rounded
 ;; half up on the one after them -- java.util.Formatter's applyPrecision looks
 ;; at exactly that one digit. carry? says the round went past the top digit
