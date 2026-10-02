@@ -256,6 +256,10 @@
     ;; native map itself and resolves find-other by name for every other type — so
     ;; an app that only ever calls find has no IR edge to it
     "clojure.core/find-other"
+    ;; java.util.TreeMap (java/tree-map.ss) is a sorted-map-by in a mutable root
+    ;; and navigates it with subseq / rsubseq and the comparison fns they test with
+    "clojure.core/sorted-map-by" "clojure.core/subseq" "clojure.core/rsubseq"
+    "clojure.core/<" "clojure.core/<=" "clojure.core/>" "clojure.core/>="
     ;; FileTime.from(Instant) (nio-file.ss) reads the Instant's epoch millis
     ;; through inst-ms, so fs/set-last-modified-time with an Instant needs it
     "clojure.core/inst-ms"))

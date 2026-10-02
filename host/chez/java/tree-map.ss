@@ -30,8 +30,9 @@
 ;;
 ;; Needs jutil-colls.ss (the Map / Set seam and jolt-fi-call), host-table.ss's
 ;; sorted-coll op access (sc-call, kw-op-*), and clojure.core's sorted-map-by /
-;; subseq / rsubseq, which are read at call time — this file loads before the
-;; prelude.
+;; subseq / rsubseq and the comparison fns they take, read at call time — this
+;; file loads before the prelude. Each is spelled as a literal var-deref so the
+;; tree-shaker's runtime roots (dce.ss) can keep it.
 
 ;; ---- natural ordering ---------------------------------------------------------
 (define (tm-class-name x)
@@ -143,7 +144,6 @@
     old))
 (define (tm-seq-head s)
   (let ((s (jolt-seq s))) (if (jolt-nil? s) #f (seq-first s))))
-(define (tm-core f) (var-deref "clojure.core" f))
 (define (tm-always c z) #t)
 (define (tmr-first r) (let ((e (jolt-first (tmr-sm r)))) (if (jolt-nil? e) #f e)))
 ;; the greatest entry, by an rsubseq whose test always holds: an O(log n) walk
@@ -151,12 +151,14 @@
 ;; first), so the comparisons it makes are ones the map can answer.
 (define (tmr-desc-all r)
   (let ((f (tmr-first r)))
-    (if f (jolt-invoke (tm-core "rsubseq") (tmr-sm r) tm-always (jolt-nth f 0)) jolt-nil)))
+    (if f (jolt-invoke (var-deref "clojure.core" "rsubseq") (tmr-sm r) tm-always (jolt-nth f 0)) jolt-nil)))
 (define (tmr-last r) (tm-seq-head (tmr-desc-all r)))
 (define (tmr-asc-from r k incl?)
-  (jolt-invoke (tm-core "subseq") (tmr-sm r) (tm-core (if incl? ">=" ">")) k))
+  (jolt-invoke (var-deref "clojure.core" "subseq") (tmr-sm r)
+               (if incl? (var-deref "clojure.core" ">=") (var-deref "clojure.core" ">")) k))
 (define (tmr-desc-from r k incl?)
-  (jolt-invoke (tm-core "rsubseq") (tmr-sm r) (tm-core (if incl? "<=" "<")) k))
+  (jolt-invoke (var-deref "clojure.core" "rsubseq") (tmr-sm r)
+               (if incl? (var-deref "clojure.core" "<=") (var-deref "clojure.core" "<")) k))
 (define (tmr-ceiling r k incl?) (tm-seq-head (tmr-asc-from r k incl?)))
 (define (tmr-floor r k incl?) (tm-seq-head (tmr-desc-from r k incl?)))
 
