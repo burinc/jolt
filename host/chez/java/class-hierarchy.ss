@@ -357,10 +357,10 @@
 ;; Class.getModifiers is a JVM bitmask; jolt derives it from the graph rather than
 ;; from bytecode it does not have. Visibility is PUBLIC unless the class is in the
 ;; visibility table below (package-private contributes nothing, private its own
-;; bit); a nested class — a $ in a modeled name — is STATIC, since every nested
-;; class the graph models is a static nested class on the JVM and jolt models no
-;; inner (instance-bound) one; INTERFACE implies ABSTRACT the way javac emits it;
-;; and FINAL / ABSTRACT / ENUM come from the marks below.
+;; bit); a nested class — a $ in a modeled name — is STATIC unless it is marked
+;; INNER below (an instance-bound or anonymous class, which the JVM reports
+;; without the bit: TreeMap$Values, AbstractMap$2); INTERFACE implies ABSTRACT the
+;; way javac emits it; and FINAL / ABSTRACT / ENUM come from the marks below.
 ;;
 ;; The lists were derived by probing the reference JVM for every java.* class and
 ;; every nested class this graph models (Class/getModifiers on each), so they say
@@ -377,6 +377,7 @@
 (define jch-final-set (make-hashtable string-hash string=?))
 (define jch-abstract-set (make-hashtable string-hash string=?))
 (define jch-enum-set (make-hashtable string-hash string=?))
+(define jch-inner-set (make-hashtable string-hash string=?))
 ;; name -> the visibility bits that REPLACE public for that class
 (define jch-visibility-tbl (make-hashtable string-hash string=?))
 (define (jch-mark-final! name)
@@ -385,6 +386,8 @@
   (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-abstract-set name #t)))
 (define (jch-mark-enum! name)
   (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-enum-set name #t)))
+(define (jch-mark-inner! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-inner-set name #t)))
 (define (jch-mark-package-private! name)
   (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-visibility-tbl name 0)))
 (define (jch-mark-private! name)
@@ -398,7 +401,8 @@
 (define (jch-modifiers name)
   (let ((n (if (jch-known? name) (jch-fqn-of-simple name) name)))
     (+ (hashtable-ref jch-visibility-tbl n jch-mod-public)
-       (if (and (str-has-dollar? n) (jch-known-exact? n)) jch-mod-static 0)
+       (if (and (str-has-dollar? n) (jch-known-exact? n) (not (hashtable-ref jch-inner-set n #f)))
+           jch-mod-static 0)
        (if (jch-final? n) jch-mod-final 0)
        (if (jch-interface? n) jch-mod-interface 0)
        (if (jch-abstract? n) jch-mod-abstract 0)
@@ -946,9 +950,7 @@
 ;; java.util.TreeMap / TreeSet and the views they hand out (tree-map.ss), with
 ;; the sorted/navigable/sequenced interfaces between them and Map / Set, and
 ;; the Comparator objects Comparator/reverseOrder and naturalOrder return.
-;; Direct supers and modifiers probed on JDK 21. TreeMap$Values / $EntrySet are
-;; INNER classes there (modifiers 0); the graph's nested-class rule reports
-;; them static.
+;; Direct supers and modifiers probed on JDK 21.
 (jch-register-supers! "java.util.SequencedMap" '("java.util.Map"))
 (jch-register-supers! "java.util.SortedMap" '("java.util.SequencedMap"))
 (jch-register-supers! "java.util.NavigableMap" '("java.util.SortedMap"))
@@ -972,6 +974,51 @@
 (jch-register-supers! "java.util.TreeMap$EntrySet" '("java.util.AbstractSet"))
 (jch-register-supers! "java.util.TreeMap$PrivateEntryIterator" '("java.util.Iterator"))
 (jch-register-supers! "java.util.TreeMap$Entry" '("java.util.Map$Entry"))
+;; java.util.Spliterator: an interface with no super-interfaces, which the
+;; sub-map key iterators implement
+(jch-register-supers! "java.util.Spliterator" '())
+(jch-mark-interface! "java.util.Spliterator")
+;; the concrete iterators and a sub-map's entry-set and values views
+(jch-register-supers! "java.util.TreeMap$EntryIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$KeyIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$ValueIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapIterator" '("java.util.Iterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.Spliterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.Spliterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$EntrySetView" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+  '("java.util.TreeMap$NavigableSubMap$EntrySetView"))
+(jch-register-supers! "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"
+  '("java.util.TreeMap$NavigableSubMap$EntrySetView"))
+(jch-register-supers! "java.util.AbstractMap$2" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.AbstractMap$2$1" '("java.util.Iterator"))
+(define jch-treemap-iterator-classes
+  '("java.util.TreeMap$EntryIterator" "java.util.TreeMap$KeyIterator" "java.util.TreeMap$ValueIterator"
+    "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator"
+    "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator"
+    "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator"
+    "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator"))
+(for-each jch-mark-final! jch-treemap-iterator-classes)
+(for-each jch-mark-final!
+          '("java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+            "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"))
+(for-each jch-mark-abstract!
+          '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.TreeMap$NavigableSubMap$EntrySetView"))
+;; package-private and INNER (no static bit) on JDK 21, modifiers 0 / 16 / 1024
+(for-each (lambda (n) (jch-mark-package-private! n) (jch-mark-inner! n))
+          (append jch-treemap-iterator-classes
+                  '("java.util.TreeMap$PrivateEntryIterator" "java.util.TreeMap$Values" "java.util.TreeMap$EntrySet"
+                    "java.util.TreeMap$NavigableSubMap$SubMapIterator"
+                    "java.util.TreeMap$NavigableSubMap$EntrySetView"
+                    "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+                    "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"
+                    "java.util.AbstractMap$2" "java.util.AbstractMap$2$1")))
 (jch-register-supers! "java.util.AbstractMap$SimpleImmutableEntry" '("java.util.Map$Entry" "java.io.Serializable"))
 (jch-register-supers! "java.util.TreeSet"
   '("java.util.AbstractSet" "java.util.NavigableSet" "java.lang.Cloneable" "java.io.Serializable"))
@@ -1384,9 +1431,18 @@
     ("treeset" . "java.util.TreeSet")
     ("treemap-entry" . "java.util.TreeMap$Entry")
     ("immutable-entry" . "java.util.AbstractMap$SimpleImmutableEntry")
-    ;; every TreeMap iterator's abstract base: the JDK's concrete one depends on
-    ;; the view (KeyIterator, SubMapEntryIterator, …), which this does not model
-    ("treemap-iterator" . "java.util.TreeMap$PrivateEntryIterator")
+    ;; a sub-map's entrySet() and values(), and the iterators: one tag per JDK class
+    ("treemap-asc-entryset" . "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView")
+    ("treemap-desc-entryset" . "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView")
+    ("treemap-submap-values" . "java.util.AbstractMap$2")
+    ("treemap-entry-iterator" . "java.util.TreeMap$EntryIterator")
+    ("treemap-key-iterator" . "java.util.TreeMap$KeyIterator")
+    ("treemap-value-iterator" . "java.util.TreeMap$ValueIterator")
+    ("treemap-submap-entry-iterator" . "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator")
+    ("treemap-submap-key-iterator" . "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator")
+    ("treemap-desc-submap-entry-iterator" . "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator")
+    ("treemap-desc-submap-key-iterator" . "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator")
+    ("treemap-submap-value-iterator" . "java.util.AbstractMap$2$1")
     ("reverse-comparator" . "java.util.Collections$ReverseComparator")
     ("reverse-comparator2" . "java.util.Collections$ReverseComparator2")
     ("natural-comparator" . "java.util.Comparators$NaturalOrderComparator")

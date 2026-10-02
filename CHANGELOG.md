@@ -26,7 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `val`, destructuring and `into`, print as `k=v`, and are not vectors, as on
   the JVM. `Comparator/reverseOrder`, `Comparator/naturalOrder` and
   `Collections/reverseOrder` are new too, and all of it runs on the Gambit
-  target as well.
+  target as well. Views and iterators report the JDK 21 classes, supers and
+  modifiers: `TreeMap$KeyIterator` for the map's keys,
+  `NavigableSubMap$DescendingSubMapEntryIterator` for a descending map's
+  entries, `AbstractMap$2` for a sub-map's values, and inner classes such as
+  `TreeMap$Values` without the static bit.
 
   ```clojure
   (let [m (java.util.TreeMap. {:c 3 :a 1 :b 2})

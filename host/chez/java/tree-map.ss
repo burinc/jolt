@@ -163,19 +163,23 @@
 (define (tmr-floor r k incl?) (tm-seq-head (tmr-desc-from r k incl?)))
 
 ;; ---- views ------------------------------------------------------------------------
-;; A view's state is #(root lo lo-incl hi hi-incl descending?); lo / hi are
-;; tm-unbounded for an open end. The tag says what the view IS (a map, a key
+;; A view's state is #(root lo lo-incl hi hi-incl descending? sub?); lo / hi are
+;; tm-unbounded for an open end. sub? is whether the view came from a
+;; head/tail/sub/descending map or set, which on the JDK is a NavigableSubMap
+;; even when it ends up unbounded ((.descendingMap (.descendingMap m))): the
+;; classes of its entry set, values and iterators follow from it. The tag says what the view IS (a map, a key
 ;; set, values, entries, a TreeSet); the bounds and direction are the same
 ;; machinery for all of them.
 (define tm-unbounded (list 'tm-unbounded))
-(define (make-tm-view tag root lo lo-incl hi hi-incl desc?)
-  (make-jhost tag (vector root lo lo-incl hi hi-incl desc?)))
+(define (make-tm-view tag root lo lo-incl hi hi-incl desc? . sub)
+  (make-jhost tag (vector root lo lo-incl hi hi-incl desc? (and (pair? sub) (car sub)))))
 (define (v-root v) (vector-ref (jhost-state v) 0))
 (define (v-lo v) (vector-ref (jhost-state v) 1))
 (define (v-lo-incl v) (vector-ref (jhost-state v) 2))
 (define (v-hi v) (vector-ref (jhost-state v) 3))
 (define (v-hi-incl v) (vector-ref (jhost-state v) 4))
 (define (v-desc? v) (vector-ref (jhost-state v) 5))
+(define (v-sub? v) (vector-ref (jhost-state v) 6))
 (define (v-cmp v a b) ((tmr-cmpf (v-root v)) a b))
 (define (v-unbounded? v) (and (eq? (v-lo v) tm-unbounded) (eq? (v-hi v) tm-unbounded)))
 (define (v-too-low? v k)
@@ -275,7 +279,7 @@
            (when (> (cmpf lo hi) 0) (throw-jvm 'IllegalArgumentException "fromKey > toKey")))
           (else (unless (eq? lo tm-unbounded) (cmpf lo lo))
                 (unless (eq? hi tm-unbounded) (cmpf hi hi)))))
-  (make-tm-view tag (v-root v) lo lo-incl hi hi-incl desc?))
+  (make-tm-view tag (v-root v) lo lo-incl hi hi-incl desc? #t))
 (define (v-check-bound v k incl? which)
   (unless (v-in-range/incl? v k incl?)
     (throw-jvm 'IllegalArgumentException (string-append which " out of range"))))
@@ -296,9 +300,9 @@
       (v-make-sub v tag to to-incl from from-incl #t)
       (v-make-sub v tag from from-incl to to-incl #f)))
 (define (v-flip v tag)
-  (make-tm-view tag (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) (not (v-desc? v))))
+  (make-tm-view tag (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) (not (v-desc? v)) #t))
 (define (v-retag v tag)
-  (make-tm-view tag (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) (v-desc? v)))
+  (make-tm-view tag (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) (v-desc? v) (v-sub? v)))
 
 ;; list helpers spelled out: the R6RS memp / find / for-all are not on every target
 (define (tm-find pred xs)
@@ -310,12 +314,21 @@
 (define (tm-map-tag desc?) (if desc? "treemap-desc-sub" "treemap-asc-sub"))
 (define tm-map-tags '("treemap" "treemap-asc-sub" "treemap-desc-sub"))
 (define tm-set-tags '("treeset" "treemap-keyset"))
+;; values() and entrySet() are TreeMap$Values and $EntrySet on the map itself and
+;; other classes on a sub-map, so each has a tag per JDK class (classes follow tags)
+(define tm-values-tags '("treemap-values" "treemap-submap-values"))
+(define tm-entryset-tags '("treemap-entryset" "treemap-asc-entryset" "treemap-desc-entryset"))
+(define (tm-values-tag v) (if (v-sub? v) "treemap-submap-values" "treemap-values"))
+(define (tm-entryset-tag v)
+  (cond ((not (v-sub? v)) "treemap-entryset")
+        ((v-desc? v) "treemap-desc-entryset")
+        (else "treemap-asc-entryset")))
 (define (tm-tag-in? x tags) (and (jhost? x) (member (jhost-tag x) tags) #t))
 (define (tm-map? x) (tm-tag-in? x tm-map-tags))
 (define (tm-set? x) (tm-tag-in? x tm-set-tags))
 (define (tm-view? x)
-  (tm-tag-in? x '("treemap" "treemap-asc-sub" "treemap-desc-sub" "treeset" "treemap-keyset"
-                  "treemap-values" "treemap-entryset")))
+  (tm-tag-in? x (append '("treemap" "treemap-asc-sub" "treemap-desc-sub" "treeset" "treemap-keyset")
+                        tm-values-tags tm-entryset-tags)))
 ;; what a view's iteration yields, by what it is
 ;; ---- entries ---------------------------------------------------------------------------
 ;; What iteration hands out is a TreeMap$Entry: a live entry whose setValue
@@ -356,7 +369,7 @@
 (define (tm-elems v)
   (let ((t (jhost-tag v)))
     (cond ((member t tm-set-tags) (v-keys v))
-          ((string=? t "treemap-values") (map e-val (v-entries v)))
+          ((member t tm-values-tags) (map e-val (v-entries v)))
           (else (v-live-entries v)))))
 (define (tm-elems-seq v) (list->cseq (tm-elems v)))
 (define (tm-no-such-element) (throw-jvm 'NoSuchElementException jolt-nil))
@@ -421,8 +434,11 @@
 (register-class-ctor! "java.util.TreeSet" ts-ctor)
 
 ;; ---- the NavigableMap surface ---------------------------------------------------------
-(define (tm-key-set v desc?)
-  (make-tm-view "treemap-keyset" (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) desc?))
+;; SUB? overrides the view's own: descendingKeySet() is descendingMap()'s key
+;; set on the JDK, a sub-map view even on the map itself
+(define (tm-key-set v desc? . sub)
+  (make-tm-view "treemap-keyset" (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) desc?
+                (if (pair? sub) (car sub) (v-sub? v))))
 (define treemap-methods
   (list
     (cons "size" (lambda (self) (v-size self)))
@@ -442,9 +458,9 @@
     (cons "putAll" (lambda (self m) (tm-fill-map! self m) jolt-nil))
     (cons "keySet" (lambda (self) (tm-key-set self (v-desc? self))))
     (cons "navigableKeySet" (lambda (self) (tm-key-set self (v-desc? self))))
-    (cons "descendingKeySet" (lambda (self) (tm-key-set self (not (v-desc? self)))))
-    (cons "values" (lambda (self) (v-retag self "treemap-values")))
-    (cons "entrySet" (lambda (self) (v-retag self "treemap-entryset")))
+    (cons "descendingKeySet" (lambda (self) (tm-key-set self (not (v-desc? self)) #t)))
+    (cons "values" (lambda (self) (v-retag self (tm-values-tag self))))
+    (cons "entrySet" (lambda (self) (v-retag self (tm-entryset-tag self))))
     ;; Map's default methods. A key mapped to nil counts as absent, like the
     ;; JDK's; each returns what the JDK's returns (the previous value for
     ;; putIfAbsent, the new one for the compute/merge family).
@@ -529,11 +545,19 @@
 ;; the view it came from — the JDK idiom for filtering a TreeMap in place.
 ;; State: #(view remaining-entries last-entry-or-#f project) where project maps
 ;; an entry to what next() hands back.
-(define (make-tm-iterator v entries project)
-  (make-jhost "treemap-iterator" (vector v entries #f project)))
+;; One tag per JDK iterator class (classes follow tags), all sharing these
+;; methods: the map's own Entry/Key/ValueIterator, a sub-map's SubMap* and
+;; DescendingSubMap* iterators, and a sub-map values() view's anonymous one.
+(define tm-iterator-tags
+  '("treemap-entry-iterator" "treemap-key-iterator" "treemap-value-iterator"
+    "treemap-submap-entry-iterator" "treemap-submap-key-iterator"
+    "treemap-desc-submap-entry-iterator" "treemap-desc-submap-key-iterator"
+    "treemap-submap-value-iterator"))
+(define (make-tm-iterator tag v entries project)
+  (make-jhost tag (vector v entries #f project)))
 (define (tmi-ref it i) (vector-ref (jhost-state it) i))
 (define (tmi-set! it i x) (vector-set! (jhost-state it) i x))
-(register-host-methods! "treemap-iterator"
+(define treemap-iterator-methods
   (list (cons "hasNext" (lambda (self) (pair? (tmi-ref self 1))))
         (cons "next" (lambda (self)
                        (let ((es (tmi-ref self 1)))
@@ -547,15 +571,31 @@
                            (tmr-remove! (v-root (tmi-ref self 0)) (e-key e))
                            (tmi-set! self 2 #f)
                            jolt-nil)))))
+(for-each (lambda (t) (register-host-methods! t treemap-iterator-methods)) tm-iterator-tags)
 ;; (iterator-seq it) / (seq it): what the iterator has not handed out yet
-(register-seq-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "treemap-iterator")))
+(register-seq-arm! (lambda (x) (tm-tag-in? x tm-iterator-tags))
                    (lambda (it) (list->cseq (map (tmi-ref it 3) (tmi-ref it 1)))))
+;; DESC? is a descendingIterator() call, which on the JDK goes through the
+;; map's descending key set — a sub-map — even on the map itself.
 (define (tm-iterator v desc?)
   (let* ((t (jhost-tag v))
          (es (v-entries v))
-         (es (if desc? (reverse es) es)))
-    (make-tm-iterator v es (cond ((member t tm-set-tags) e-key)
-                                 ((string=? t "treemap-values") e-val)
+         (es (if desc? (reverse es) es))
+         (kind (cond ((member t tm-set-tags) 'key) ((member t tm-values-tags) 'value) (else 'entry)))
+         (sub? (or desc? (v-sub? v)))
+         (down? (if desc? (not (v-desc? v)) (v-desc? v)))
+         (tag (cond ((not sub?) (case kind
+                                  ((key) "treemap-key-iterator")
+                                  ((value) "treemap-value-iterator")
+                                  (else "treemap-entry-iterator")))
+                    ((eq? kind 'value) "treemap-submap-value-iterator")
+                    (down? (if (eq? kind 'key) "treemap-desc-submap-key-iterator"
+                               "treemap-desc-submap-entry-iterator"))
+                    (else (if (eq? kind 'key) "treemap-submap-key-iterator"
+                              "treemap-submap-entry-iterator")))))
+    (make-tm-iterator tag v es (case kind
+                                 ((key) e-key)
+                                 ((value) e-val)
                                  (else (lambda (e) (tm-live-entry v e)))))))
 
 ;; ---- the NavigableSet surface: TreeSet and a map's key set -------------------------------
@@ -612,7 +652,7 @@
 (define (tm-entry-in? v e)
   (and (or (jolt-map-entry? e) (jutil-entry? e))
        (let ((x (v-ref v (e-key e)))) (and (not (eq? x tm-absent)) (jolt=2 x (e-val e))))))
-(register-host-methods! "treemap-values"
+(define treemap-values-methods
   (list (cons "size" (lambda (self) (v-size self)))
         (cons "isEmpty" (lambda (self) (v-empty? self)))
         (cons "contains" (lambda (self x)
@@ -623,7 +663,7 @@
                            (if e (begin (tmr-remove! (v-root self) (e-key e)) #t) #f))))
         (cons "clear" (lambda (self) (v-clear! self)))
         (cons "iterator" (lambda (self) (tm-iterator self #f)))))
-(register-host-methods! "treemap-entryset"
+(define treemap-entryset-methods
   (list (cons "size" (lambda (self) (v-size self)))
         (cons "isEmpty" (lambda (self) (v-empty? self)))
         (cons "contains" (lambda (self e) (tm-entry-in? self e)))
@@ -633,12 +673,14 @@
                              #f)))
         (cons "clear" (lambda (self) (v-clear! self)))
         (cons "iterator" (lambda (self) (tm-iterator self #f)))))
+(for-each (lambda (t) (register-host-methods! t treemap-values-methods)) tm-values-tags)
+(for-each (lambda (t) (register-host-methods! t treemap-entryset-methods)) tm-entryset-tags)
 
 ;; ---- what the rest of the runtime sees ----------------------------------------------------
 (for-each (lambda (t) (register-jutil-coll! t 'map v-entries)) tm-map-tags)
 (for-each (lambda (t) (register-jutil-coll! t 'set v-keys)) tm-set-tags)
-(register-jutil-coll! "treemap-entryset" 'entries v-live-entries)
-(register-jutil-coll! "treemap-values" 'coll tm-elems)
+(for-each (lambda (t) (register-jutil-coll! t 'entries v-live-entries)) tm-entryset-tags)
+(for-each (lambda (t) (register-jutil-coll! t 'coll tm-elems)) tm-values-tags)
 ;; (seq m) walks the entries (RT.seq over an Iterable); count is size().
 (register-seq-arm! tm-view? tm-elems-seq)
 (register-count-arm! tm-view? v-size)
@@ -650,4 +692,4 @@
 (register-contains-arm! (lambda (x) (tm-tag-in? x '("treemap" "treemap-asc-sub" "treemap-desc-sub"
                                                     "treeset" "treemap-keyset")))
                         v-contains?)
-(register-contains-arm! (lambda (x) (tm-tag-in? x '("treemap-entryset"))) tm-entry-in?)
+(register-contains-arm! (lambda (x) (tm-tag-in? x tm-entryset-tags)) tm-entry-in?)
