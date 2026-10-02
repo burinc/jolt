@@ -54,7 +54,11 @@
                        (even (cond ((= v (* (- d 1/2) unit)) (- d 1))
                                    ((= v (* (+ d 1/2) unit)) (+ d 1))
                                    (else #f)))
-                       (s (and even (number->string even))))
+                       ;; and only when that neighbour reads back as x: a unit
+                       ;; wider than the double's spacing leaves the host's
+                       ;; digits the only ones that do
+                       (s (and even (= (exact->inexact (* even unit)) x)
+                               (number->string even))))
                   (and s (fx=? (string-length s) dlen)
                        (let loop ((k dlen))
                          (if (and (fx>? k 1) (char=? (string-ref s (fx- k 1)) #\0))
