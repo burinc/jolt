@@ -1462,6 +1462,10 @@
 ;; (string-copy! from from-start to to-start count).
 (define (sa-string-copy-range! to at from start end)
   (string-copy! from start to at (fx- end start)))
+;; (sa-bytevector-copy-range! to at from start end): the same reorder over Chez's
+;; R6RS (bytevector-copy! from from-start to to-start count).
+(define (sa-bytevector-copy-range! to at from start end)
+  (bytevector-copy! from start to at (fx- end start)))
 
 ;; Every Chez mutex the runtime allocates is counted. A mutex is a finalized
 ;; object — the collector visits each one — so how many a workload allocates is

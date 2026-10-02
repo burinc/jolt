@@ -352,6 +352,12 @@ sa-vector-append
 #     INTO the source (the first block-copy subs did exactly that on gsi).
 #     string-copy! is blocklisted for that reason.
 sa-string-copy-range!
+#   (sa-bytevector-copy-range! to at from start end) -> unspecified: the same
+#     shape over bytevectors, and the same trap: Chez's bytevector-copy! is the
+#     R6RS (from from-start to to-start count), Gambit's and Guile's the R7RS
+#     (to at from start end). Overlap-safe, as both are specified to be — a
+#     ByteBuffer compact moves a region of one bytevector down onto itself.
+sa-bytevector-copy-range!
 #
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are
