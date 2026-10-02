@@ -2597,6 +2597,7 @@
 (load "host/chez/java/text-normalize.ss")       ; java.text.Normalizer's quick-check fast paths
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
+(load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
 (load "host/chez/java/byte-buffer.ss")          ; java.nio.ByteBuffer over a byte-array
 (load "host/chez/java/charset-coding.ss")       ; CharBuffer + the CharsetDecoder decode loop

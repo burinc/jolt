@@ -1831,11 +1831,23 @@
                  (cond ((jolt-reduced? acc) acc)
                        ((fx>=? j clen) (outer k acc))
                        (else (inner (fx+ j 1) (fx+ k 1) (step acc k (vector-ref chunk j))))))))))))
+;; IKVReduce over a java.util.Map shim: its entries in iteration order, or #f
+;; for anything else. The java layer (java/jutil-colls.ss) set!s this; it is a
+;; hook rather than a predicate list here because the shims are its to know.
+(define jolt-reduce-kv-entries (lambda (x) #f))
 (define (jolt-reduce-kv f init coll)
   (let ((r (cond
              ((pmap? coll) (pmap-kv-reduce coll f init))
              ((pvec? coll) (vec-kv-reduce coll f init))
              ((jolt-nil? coll) init)
+             ((jolt-reduce-kv-entries coll)
+              => (lambda (es)
+                   (let ((step (kv-step f)))
+                     (let loop ((acc init) (es es))
+                       (cond ((null? es) acc)
+                             ((jolt-reduced? acc) acc)
+                             (else (loop (step acc (jolt-nth (car es) 0) (jolt-nth (car es) 1))
+                                         (cdr es))))))))
              ((iface-method coll "kvreduce" 3) => (lambda (m) (jolt-invoke m coll f init)))
              ((jolt-map? coll)
               (let ((step (kv-step f)))

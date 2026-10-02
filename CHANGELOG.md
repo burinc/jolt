@@ -166,6 +166,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The java.util collection shims compare, hash and print like the JVM's.**
+  `(= (java.util.HashMap. {:a 1}) {:a 1})` was false from both sides, and the
+  same for HashSet against a set and ArrayList / LinkedList against a vector
+  or list; `pr-str` and `str` of every one of them was `#object[...]`; `hash`
+  and `.hashCode` disagreed or were missing; and `reduce-kv` refused a
+  HashMap. A Map, Set or List shim now equals the persistent collection with
+  the same contents, hashes as its `hashCode`, prints as a map, set or vector
+  with `pr` and as `{a=1}` / `[a, b]` with `str`, and a Map reduces with
+  `reduce-kv`. An ArrayDeque, which is not a List, still compares by identity.
+
+  ```clojure
+  [(= (java.util.HashMap. {:a 1}) {:a 1}) (pr-str (java.util.ArrayList. ["a" nil]))
+   (str (java.util.HashMap. {:a nil}))]
+  ;; => [true "[\"a\" nil]" "{:a=null}"]
+  ```
+
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux
   does not wake, so the thread stayed in accept() on a number the next socket

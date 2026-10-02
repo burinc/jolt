@@ -220,10 +220,10 @@
 ;; sorted-map-by / sorted-set-by cannot drift apart on which values they accept.
 ;; iface-method + record-method-dispatch live in records.ss (loaded later);
 ;; resolved at call time.
-;; A host-shim Comparator object (String/CASE_INSENSITIVE_ORDER) keeps its
-;; `compare` in the jhost method table, not the deftype/reify one. The java host
-;; layer (host-static.ss, loaded later) set!s this to look there; the Gambit
-;; boot, which has no jhost, keeps the #f default.
+;; A host-shim Comparator object (String/CASE_INSENSITIVE_ORDER,
+;; Comparator/reverseOrder) keeps its `compare` in the jhost method table, not
+;; the deftype/reify one. The java layer (java/jutil-colls.ss, loaded later on
+;; both targets) set!s this to look there.
 (define jhost-compare-method? (lambda (x) #f))
 (define (jolt-comparator-fn cmp)
   (if (or (iface-method cmp "compare" #f) (jhost-compare-method? cmp))

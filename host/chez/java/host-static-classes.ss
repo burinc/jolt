@@ -150,8 +150,7 @@
     (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
-    (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))
-    (cons "toString" (lambda (self) (jolt-pr-str (list->cseq (al->list self)))))))
+    (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))))
 ;; java.util.SequencedCollection (JDK 21): List and Deque both have it, so the
 ;; first/last accessors and mutators sit on the shared ArrayList table and
 ;; LinkedList / ArrayDeque inherit them. On an empty list the accessors raise
@@ -211,6 +210,12 @@
                        (string=? (jhost-tag x) "arraydeque")
                        (string=? (jhost-tag x) "arrays-aslist"))))
 (register-seq-arm! al-family? (lambda (x) (list->cseq (al->list x))))
+;; ArrayList is a RandomAccess List (printed [..]), LinkedList a List (printed
+;; (..)), ArrayDeque only a Collection: = and hash by identity, str its toString
+;; (java/jutil-colls.ss).
+(register-jutil-coll! "arraylist" 'ralist al->list)
+(register-jutil-coll! "linkedlist" 'list al->list)
+(register-jutil-coll! "arraydeque" 'coll al->list)
 
 ;; ---- StringWriter -----------------------------------------------------------
 ;; Writer.write(int) writes the CHAR for that code; append(char) appends the char.
@@ -561,33 +566,7 @@
     (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
               (hm-keys-ordered self))
     m))
-;; (jolt-fi-call f method arg ...) — call the java.util.function argument of a
-;; host method: a Clojure fn (or any invokable, a keyword or a map) is invoked,
-;; and a reify / deftype implementing the interface has its one method called by
-;; name. Clojure 1.12 coerces a fn to the interface at the call site, so both
-;; shapes reach a JVM method; jolt has no coercion, so a shim that only
-;; jolt-invokes its argument refused the reify with "cannot be cast to
-;; clojure.lang.IFn" — (.computeIfAbsent m k (reify Function (apply [_ k] …)))
-;; failed that way while the comment below said it worked.
-;; The fixed arities keep a plain fn's call free of the rest list and apply.
-(define jolt-fi-call
-  (case-lambda
-    ((f method)
-     (if (and (not (procedure? f)) (iface-method f method 1))
-         (record-method-dispatch f method jolt-nil)
-         (jolt-invoke f)))
-    ((f method a)
-     (if (and (not (procedure? f)) (iface-method f method 2))
-         (record-method-dispatch f method (list->cseq (list a)))
-         (jolt-invoke1 f a)))
-    ((f method a b)
-     (if (and (not (procedure? f)) (iface-method f method 3))
-         (record-method-dispatch f method (list->cseq (list a b)))
-         (jolt-invoke2 f a b)))
-    ((f method . args)
-     (if (and (not (procedure? f)) (iface-method f method (fx+ 1 (length args))))
-         (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args)))
-         (apply jolt-invoke f args)))))
+;; jolt-fi-call (java/jutil-colls.ss) calls a java.util.function argument.
 (define hashmap-methods
   (list (cons "put" (lambda (self k v) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                                           (hm-note-key! self k)
@@ -663,8 +642,7 @@
         (cons "values" (lambda (self) (apply jolt-vector
                           (map (lambda (k) (hashtable-ref (hm-tbl self) k jolt-nil))
                                (hm-keys-ordered self)))))
-        (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))
-        (cons "toString" (lambda (self) (jolt-pr-str (hm->pmap self))))))
+        (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
@@ -975,9 +953,16 @@
         ;; JVM and had none here at all, so (.toArray h) was "No matching field
         ;; found: toArray for class java.util.HashSet". Same jcoll-to-array the
         ;; ArrayList family uses, over the set's own iteration order.
-        (cons "toArray" (lambda (self . args) (jcoll-to-array (hs->list self) args)))
-        (cons "toString" (lambda (self) (jolt-pr-str (apply jolt-hash-set (hs->list self)))))))
+        (cons "toArray" (lambda (self . args) (jcoll-to-array (hs->list self) args)))))
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
+;; the HashMap family and HashSet are a java.util.Map / Set to =, hash, pr, str
+;; and reduce-kv (java/jutil-colls.ss), in their insertion order.
+(define (hm-entries self)
+  (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
+       (hm-keys-ordered self)))
+(register-jutil-coll! "hashmap" 'map hm-entries)
+(register-jutil-coll! "properties" 'map hm-entries)
+(register-jutil-coll! "hashset" 'set hs->list)
 (register-get-arm! hm-hashmap?
                    (lambda (coll k d) (hashtable-ref (hm-tbl coll) k d)))
 ;; count / contains? over the mutable map shim (clojure.core/count + contains?,
@@ -2415,12 +2400,13 @@
   (let ((read-only (lambda (name) (cdr (assoc name arraylist-methods)))))
     (append
       (map (lambda (n) (cons n (read-only n)))
-           '("get" "set" "size" "isEmpty" "contains" "toArray" "iterator" "toString"))
+           '("get" "set" "size" "isEmpty" "contains" "toArray" "iterator"))
       (list (cons "getFirst" al-first) (cons "getLast" al-last))
       (map (lambda (e) (cons (car e) (host-arity-of (cdr e) #t aslist-unsupported)))
            '(("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0)
              ("addFirst" 1) ("addLast" 1) ("removeFirst" 0) ("removeLast" 0))))))
 (register-host-methods! "arrays-aslist" arrays-aslist-methods)
+(register-jutil-coll! "arrays-aslist" 'ralist al->list)
 
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
@@ -3017,12 +3003,8 @@
         'pass)))
 ;; (seq a-HashMap) walks its entries, like RT.seqFrom over a java.util.Map.
 (register-seq-arm! hm-hashmap? (lambda (x) (jolt-seq (hm->pmap x))))
-;; The single place that knows which java.util shims are Iterable/seqable on the
-;; JVM (ArrayList/LinkedList/ArrayDeque via al-family?, HashSet, HashMap);
-;; post-prelude's clojure.core/seqable? patch consults this instead of carrying
-;; its own tag list.
-(define (jhost-seqable-shim? x)
-  (or (al-family? x) (hs-hashset? x) (hm-hashmap? x)))
+;; Which shims are Iterable (seqable?) is the java.util registry's answer
+;; (jutil-colls.ss jhost-seqable-shim?): every shim above registers there.
 ;; a MapEntry does not carry meta on the JVM (AMapEntry); deny IObj/IMeta so the
 ;; pvec backing doesn't claim it.
 (register-instance-check-arm!

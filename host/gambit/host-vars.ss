@@ -253,7 +253,7 @@
 ;; the interop registries are host-statics.ss, which loads before the prelude:
 ;; its own (import …) forms intern class tokens through class-model.ss.)
 (define (reader-jhost? x) #f)
-(define (jhost-seqable-shim? x) #f)
+;; jhost-seqable-shim? is java/jutil-colls.ss's, which this boot includes.
 ;; No array can be built here (every constructor is degraded below), so nothing
 ;; is one; the host callables are multimethods, since no promise exists either.
 (def-var! "jolt.host" "array-value?" (lambda (x) jolt-nil))

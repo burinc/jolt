@@ -546,12 +546,6 @@
                   (host-arity-declared host-method-arities tag (car p) (cdr p) #t)))
               members)))
 
-;; The comparator seam (natives-seq.ss jolt-comparator-fn) asks whether a value
-;; is a shim object whose tag registers a `compare` method — a Comparator held
-;; by the host (String/CASE_INSENSITIVE_ORDER) rather than by a deftype/reify.
-(set! jhost-compare-method?
-  (lambda (x)
-    (and (jhost? x) (host-method-ref (jhost-tag x) "compare") #t)))
 
 ;; ---- how two tags relate ----------------------------------------------------
 ;; A tag is a REPRESENTATION: the procedures in its table read the state vector
