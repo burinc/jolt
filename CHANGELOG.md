@@ -20,7 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NullPointerException and keys that do not compare (a keyword and a string,
   a Long and a Double) are ClassCastException, as on the JVM. The tree is
   clojure.core's own sorted map held in a mutable root, so a copy or `clone`
-  is O(1). `Comparator/reverseOrder`, `Comparator/naturalOrder` and
+  is O(1). The entries iteration hands out are `TreeMap$Entry` objects whose
+  `setValue` writes through to the map; `firstEntry`, `floorEntry` and the
+  other navigation methods answer immutable snapshots. Both work with `key`,
+  `val`, destructuring and `into`, print as `k=v`, and are not vectors, as on
+  the JVM. `Comparator/reverseOrder`, `Comparator/naturalOrder` and
   `Collections/reverseOrder` are new too, and all of it runs on the Gambit
   target as well.
 

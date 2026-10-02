@@ -221,6 +221,7 @@
                    (tmap-put! t (pvec-nth-d x 0 jolt-nil) (pvec-nth-d x 1 jolt-nil))
                    (throw-jvm 'IllegalArgumentException "Vector arg to map conj must be a pair")))
     ((pmap? x) (pmap-fold-fwd x (lambda (k v acc) (tmap-put! t k v) acc) 0))
+    ((jolt-host-entry x) => (lambda (kv) (tmap-put! t (car kv) (cdr kv))))
     (else (throw-jvm (quote IllegalArgumentException) "conj!: a transient map takes a map entry or a map"))))
 
 ;; (conj!) -> fresh transient vector; (conj! coll) -> the 1-arity transducer-

@@ -141,6 +141,47 @@
             (list (cons "equals" (lambda (self o) (jutil-equals? self o)))
                   (cons "hashCode" (lambda (self) (jutil-hash-code self)))))))
 
+;; ---- java.util.Map$Entry host objects ----------------------------------------------
+;; An entry a java.util shim hands out (TreeMap$Entry, SimpleImmutableEntry)
+;; registers its tag with a procedure answering its (key . value). That is what
+;; makes it a Map.Entry to the rest of the runtime: map-entry?, key / val, nth
+;; and destructuring, count, conj onto a map (collections.ss jolt-host-entry),
+;; = against another Map.Entry by key and value (and never against a vector:
+;; a MapEntry's equiv wants a List), hash as Map.Entry.hashCode (k ^ v), and
+;; str as k=v. pr is the #object form over that toString, as on the JVM.
+(define jutil-entry-tbl (make-hashtable string-hash string=?))
+(define (register-jutil-entry! tag kv)
+  (hashtable-set! jutil-entry-tbl tag kv)
+  (register-host-methods! tag
+    (list (cons "getKey" (lambda (self) (car (kv self))))
+          (cons "getValue" (lambda (self) (cdr (kv self))))
+          (cons "toString" (lambda (self) (jutil-entry-string-of self)))
+          (cons "equals" (lambda (self o) (jutil-entry-equals? self o)))
+          (cons "hashCode" (lambda (self) (jutil-entry-hash self))))))
+(define (jutil-entry-kv x)
+  (and (jhost? x)
+       (let ((f (hashtable-ref jutil-entry-tbl (jhost-tag x) #f)))
+         (and f (f x)))))
+(define (jutil-entry? x)
+  (and (jhost? x) (hashtable-ref jutil-entry-tbl (jhost-tag x) #f) #t))
+(set! jolt-host-entry jutil-entry-kv)
+(define (jutil-entry-string-of x)
+  (let ((kv (jutil-entry-kv x)))
+    (string-append (jutil-elem-string x (car kv)) "=" (jutil-elem-string x (cdr kv)))))
+(define (jutil-entry-equals? a b)
+  (let ((ka (jutil-entry-kv a)) (kb (jutil-entry-kv b)))
+    (and ka kb (jolt=2 (car ka) (car kb)) (jolt=2 (cdr ka) (cdr kb)) #t)))
+(define (jutil-entry-hash x)
+  (let ((kv (jutil-entry-kv x)))
+    (i32 (bitwise-xor (jolt-java-hashcode (car kv)) (jolt-java-hashcode (cdr kv))))))
+(register-eq-arm! (lambda (a b) (and (jutil-entry? a) (jutil-entry? b))) jutil-entry-equals?)
+(register-hash-arm! jutil-entry? jutil-entry-hash)
+(register-str-render! jutil-entry? jutil-entry-string-of)
+(register-count-arm! jutil-entry? (lambda (x) 2))
+;; map-entry? is (instance? java.util.Map$Entry x) on the JVM
+(def-var! "clojure.core" "map-entry?"
+  (lambda (x) (or (jolt-map-entry? x) (jutil-entry? x))))
+
 ;; ---- host Comparator objects -------------------------------------------------------
 ;; The comparator seam (natives-seq.ss jolt-comparator-fn) asks whether a value
 ;; is a shim object whose tag registers a `compare` method — a Comparator held

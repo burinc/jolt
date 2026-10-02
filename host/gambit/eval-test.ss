@@ -219,6 +219,9 @@
 (check "[(try (.put (java.util.TreeMap.) nil 1) (catch NullPointerException e :npe)) (try (let [m (java.util.TreeMap.)] (.put m :a 1) (.put m \"b\" 2)) (catch ClassCastException e :cce)) (= (java.util.TreeMap. {:a 1}) {:a 1}) (reduce-kv (fn [a k v] (conj a k v)) [] (java.util.TreeMap. {2 :b 1 :a}))]"
        "[:npe :cce true [1 :a 2 :b]]")
 
+(check "(let [m (java.util.TreeMap. {:a 1 :b 2})] (doseq [e (.entrySet m)] (.setValue e (* 10 (val e)))) [(str m) (str (first m)) (into {} m) (try (.setValue (.firstEntry m) 0) (catch UnsupportedOperationException e :uoe))])"
+       "[\"{:a=10, :b=20}\" \":a=10\" {:a 10, :b 20} :uoe]")
+
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")
 (let ((scm (jolt-analyze-emit-form

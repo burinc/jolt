@@ -2256,7 +2256,8 @@
 ;; characters). A plain 2-element vector is accepted where the JVM casts: jolt
 ;; reads a vector of pairs as a seq of entries, a documented superset.
 (define (entry-like? e)
-  (and (pvec? e) (= 2 (pvec-count e))))
+  (or (and (pvec? e) (= 2 (pvec-count e)))
+      (and (jolt-host-entry e) #t)))
 (define (entry-cast-error e)
   (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
                 (string-append

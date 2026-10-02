@@ -971,6 +971,8 @@
 (jch-register-supers! "java.util.TreeMap$Values" '("java.util.AbstractCollection"))
 (jch-register-supers! "java.util.TreeMap$EntrySet" '("java.util.AbstractSet"))
 (jch-register-supers! "java.util.TreeMap$PrivateEntryIterator" '("java.util.Iterator"))
+(jch-register-supers! "java.util.TreeMap$Entry" '("java.util.Map$Entry"))
+(jch-register-supers! "java.util.AbstractMap$SimpleImmutableEntry" '("java.util.Map$Entry" "java.io.Serializable"))
 (jch-register-supers! "java.util.TreeSet"
   '("java.util.AbstractSet" "java.util.NavigableSet" "java.lang.Cloneable" "java.io.Serializable"))
 (jch-register-supers! "java.util.Collections$ReverseComparator" '("java.util.Comparator" "java.io.Serializable"))
@@ -981,12 +983,13 @@
             "java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$PrivateEntryIterator"))
 (for-each jch-mark-final!
           '("java.util.TreeMap$AscendingSubMap" "java.util.TreeMap$DescendingSubMap"
-            "java.util.TreeMap$KeySet" "java.util.Comparators$NaturalOrderComparator"))
+            "java.util.TreeMap$KeySet" "java.util.Comparators$NaturalOrderComparator"
+            "java.util.TreeMap$Entry"))
 (for-each jch-mark-package-private!
           '("java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$AscendingSubMap"
             "java.util.TreeMap$DescendingSubMap" "java.util.TreeMap$KeySet"
             "java.util.TreeMap$Values" "java.util.TreeMap$EntrySet"
-            "java.util.Comparators$NaturalOrderComparator"))
+            "java.util.Comparators$NaturalOrderComparator" "java.util.TreeMap$Entry"))
 (for-each jch-mark-private!
           '("java.util.Collections$ReverseComparator" "java.util.Collections$ReverseComparator2"))
 (jch-mark-enum! "java.util.Comparators$NaturalOrderComparator")
@@ -1372,6 +1375,8 @@
     ("treemap-values" . "java.util.TreeMap$Values")
     ("treemap-entryset" . "java.util.TreeMap$EntrySet")
     ("treeset" . "java.util.TreeSet")
+    ("treemap-entry" . "java.util.TreeMap$Entry")
+    ("immutable-entry" . "java.util.AbstractMap$SimpleImmutableEntry")
     ;; every TreeMap iterator's abstract base: the JDK's concrete one depends on
     ;; the view (KeyIterator, SubMapEntryIterator, …), which this does not model
     ("treemap-iterator" . "java.util.TreeMap$PrivateEntryIterator")

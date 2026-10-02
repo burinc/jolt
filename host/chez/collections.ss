@@ -372,6 +372,12 @@
 (define (jolt-vector . xs) (make-pvec (list->vector xs)))
 (define (make-map-entry k v) (make-pvec (vector k v) #t))
 (define (jolt-map-entry? x) (and (pvec? x) (eq? (pvec-ent x) #t)))
+;; A HOST java.util.Map$Entry (a TreeMap$Entry, an AbstractMap$SimpleImmutableEntry)
+;; as (key . value), or #f for anything else. jolt-map-entry? above stays the
+;; clojure.lang.MapEntry question; this one is what nth, conj onto a map and
+;; clojure.core/map-entry? also accept, as RT.nth and APersistentMap.cons accept
+;; any Map.Entry. The java layer (java/jutil-colls.ss) set!s it.
+(define jolt-host-entry (lambda (x) #f))
 (define (jolt-subvec-view? x) (and (pvec? x) (eq? (pvec-ent x) (quote subvec))))
 
 ;; ============================================================================
@@ -1392,14 +1398,18 @@
     (if (jolt-nil? s)
         acc
         (let ((e (seq-first s)))
-          (if (and (pvec? e) (fx=? 2 (pvec-count e)))
-              (loop (jolt-seq (seq-more s))
-                    (pmap-assoc acc (pvec-nth-d e 0 jolt-nil) (pvec-nth-d e 1 jolt-nil)))
+          (cond
+            ((and (pvec? e) (fx=? 2 (pvec-count e)))
+             (loop (jolt-seq (seq-more s))
+                   (pmap-assoc acc (pvec-nth-d e 0 jolt-nil) (pvec-nth-d e 1 jolt-nil))))
+            ((jolt-host-entry e)
+             => (lambda (kv) (loop (jolt-seq (seq-more s)) (pmap-assoc acc (car kv) (cdr kv)))))
+            (else
               (jolt-throw
                (jolt-host-throwable
                 "java.lang.ClassCastException"
                 (string-append "class " (guard (c (#t "?")) (jolt-class-name e))
-                               " cannot be cast to class java.util.Map$Entry"))))))))
+                               " cannot be cast to class java.util.Map$Entry")))))))))
 
 (define (jolt-conj1 coll x)
   (cond ((pvec? coll) (pvec-conj coll x))   ; nil is a valid vector/set element
@@ -1426,6 +1436,7 @@
                 (if (fx=? 2 (pvec-count x))
                     (pmap-assoc coll (pvec-nth-d x 0 jolt-nil) (pvec-nth-d x 1 jolt-nil))
                     (throw-jvm (quote IllegalArgumentException) "Vector arg to map conj must be a pair")))
+               ((jolt-host-entry x) => (lambda (kv) (pmap-assoc coll (car kv) (cdr kv))))
                ;; jolt-seq raises the JVM's own "Don't know how to create ISeq
                ;; from: X" for a value that is not seqable at all.
                (else (conj-map-entries coll x))))
@@ -1579,6 +1590,10 @@
               ;; RT.nth reads a CharSequence by charAt once Indexed has missed —
               ;; jrec-charseq-method (records.ss) resolves at call time.
               ((jrec-charseq-method coll "charAt") => (lambda (m) (jolt-invoke m coll i)))
+              ;; RT.nthFrom reads a Map.Entry: 0 is the key, 1 the value
+              ((jolt-host-entry coll)
+               => (lambda (kv) (case i ((0) (car kv)) ((1) (cdr kv))
+                                 (else (throw-jvm 'IndexOutOfBoundsException jolt-nil)))))
               (else (unsupported-on-type "nth" coll)))))
     ((coll i d)
      (jolt-nth-nil-idx! i)
@@ -1591,6 +1606,8 @@
              ((jrec-charseq-method coll "charAt")
               => (lambda (m) (let ((n (jolt-count coll)))
                                (if (and (fx>=? i 0) (fx<? i n)) (jolt-invoke m coll i) d))))
+             ((jolt-host-entry coll)
+              => (lambda (kv) (case i ((0) (car kv)) ((1) (cdr kv)) (else d))))
              ;; NOT (else d). RT.nth's notFound answers an out-of-range INDEX on a
              ;; type that HAS nth; a type with no nth raises here exactly as it does
              ;; in the two-arity above. Returning d instead turned "you cannot index

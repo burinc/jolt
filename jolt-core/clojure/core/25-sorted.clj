@@ -300,6 +300,8 @@
     (nil? x) sm
     (map? x) (reduce (fn [m e] (sm-assoc-1 m (first e) (second e))) sm (seq x))
     (and (vector? x) (= 2 (count x))) (sm-assoc-1 sm (nth x 0) (nth x 1))
+    ;; any other java.util.Map$Entry (a TreeMap's), as APersistentMap.cons takes
+    (map-entry? x) (sm-assoc-1 sm (key x) (val x))
     :else (throw (ex-info "conj on a sorted-map requires a [key value] pair or a map" {}))))
 
 (defn- sm-conj-many [sm xs] (reduce sm-conj-1 sm xs))

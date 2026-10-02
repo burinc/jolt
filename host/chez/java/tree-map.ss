@@ -24,9 +24,9 @@
 ;;     swapping floor<->ceiling and lower<->higher); the root map is the view
 ;;     with no bounds.
 ;;
-;; Entries are clojure.lang.MapEntry values (the JVM's TreeMap$Entry also works
-;; with key / val / destructuring, but prints as k=v and its setValue writes
-;; through); an iterator walks a snapshot of its view and removes through it.
+;; Iteration hands out live TreeMap$Entry objects whose setValue writes through,
+;; the navigation methods immutable snapshots (see "entries" below); an iterator
+;; walks a snapshot of its view and removes through it.
 ;;
 ;; Needs jutil-colls.ss (the Map / Set seam), jolt-fi-call (records-dispatch.ss), host-table.ss's
 ;; sorted-coll op access (sc-call, kw-op-*), and clojure.core's sorted-map-by /
@@ -317,16 +317,52 @@
   (tm-tag-in? x '("treemap" "treemap-asc-sub" "treemap-desc-sub" "treeset" "treemap-keyset"
                   "treemap-values" "treemap-entryset")))
 ;; what a view's iteration yields, by what it is
+;; ---- entries ---------------------------------------------------------------------------
+;; What iteration hands out is a TreeMap$Entry: a live entry whose setValue
+;; writes through to the map, and whose getValue reads the map (the JDK's entry
+;; IS the tree node, so a later put shows through it). Once its key has left the
+;; map it keeps the last value it saw. firstEntry / floorEntry / pollFirstEntry
+;; and the rest export an AbstractMap$SimpleImmutableEntry snapshot instead,
+;; whose setValue is UnsupportedOperationException. Both are java.util.Map$Entry
+;; objects to the runtime through jutil-colls.ss — key / val / nth, map-entry?,
+;; conj onto a map, k=v toString — and neither is a vector, as on the JVM.
+;; State: #(root key last-value) and #(key value).
+(define (tm-live-entry v e)
+  (make-jhost "treemap-entry" (vector (v-root v) (e-key e) (e-val e))))
+(define (tm-live-entry-value self)
+  (let* ((st (jhost-state self))
+         (x (sc-call (tmr-sm (vector-ref st 0)) kw-op-get (vector-ref st 1) tm-absent)))
+    (if (eq? x tm-absent) (vector-ref st 2) (begin (vector-set! st 2 x) x))))
+(register-jutil-entry! "treemap-entry"
+  (lambda (self) (cons (vector-ref (jhost-state self) 1) (tm-live-entry-value self))))
+(register-host-methods! "treemap-entry"
+  (list (cons "setValue"
+              (lambda (self x)
+                (let* ((st (jhost-state self)) (r (vector-ref st 0)) (k (vector-ref st 1))
+                       (old (tm-live-entry-value self)))
+                  (unless (eq? (sc-call (tmr-sm r) kw-op-get k tm-absent) tm-absent)
+                    (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k x))))
+                  (vector-set! st 2 x)
+                  old)))))
+(define (tm-snapshot-entry e)
+  (make-jhost "immutable-entry" (vector (e-key e) (e-val e))))
+(register-jutil-entry! "immutable-entry"
+  (lambda (self) (cons (vector-ref (jhost-state self) 0) (vector-ref (jhost-state self) 1))))
+(register-host-methods! "immutable-entry"
+  (list (cons "setValue" (lambda (self x) (throw-jvm 'UnsupportedOperationException jolt-nil)))))
+(define (v-live-entries v) (map (lambda (e) (tm-live-entry v e)) (v-entries v)))
+
+;; what a view's iteration yields, by what it is
 (define (tm-elems v)
   (let ((t (jhost-tag v)))
     (cond ((member t tm-set-tags) (v-keys v))
           ((string=? t "treemap-values") (map e-val (v-entries v)))
-          (else (v-entries v)))))
+          (else (v-live-entries v)))))
 (define (tm-elems-seq v) (list->cseq (tm-elems v)))
 (define (tm-no-such-element) (throw-jvm 'NoSuchElementException jolt-nil))
 (define (tm-key-or-throw e) (if e (e-key e) (tm-no-such-element)))
 (define (tm-key-or-nil e) (if e (e-key e) jolt-nil))
-(define (tm-entry-or-nil e) (if e e jolt-nil))
+(define (tm-entry-or-nil e) (if e (tm-snapshot-entry e) jolt-nil))
 
 ;; ---- constructors ---------------------------------------------------------------------
 (define (tm-fill-map! v m)
@@ -520,7 +556,7 @@
          (es (if desc? (reverse es) es)))
     (make-tm-iterator v es (cond ((member t tm-set-tags) e-key)
                                  ((string=? t "treemap-values") e-val)
-                                 (else (lambda (e) e))))))
+                                 (else (lambda (e) (tm-live-entry v e)))))))
 
 ;; ---- the NavigableSet surface: TreeSet and a map's key set -------------------------------
 ;; The two differ in add (a key set has no value to put, so it refuses) and in
@@ -574,7 +610,7 @@
 
 ;; ---- values() and entrySet() ------------------------------------------------------------
 (define (tm-entry-in? v e)
-  (and (jolt-map-entry? e)
+  (and (or (jolt-map-entry? e) (jutil-entry? e))
        (let ((x (v-ref v (e-key e)))) (and (not (eq? x tm-absent)) (jolt=2 x (e-val e))))))
 (register-host-methods! "treemap-values"
   (list (cons "size" (lambda (self) (v-size self)))
@@ -601,7 +637,7 @@
 ;; ---- what the rest of the runtime sees ----------------------------------------------------
 (for-each (lambda (t) (register-jutil-coll! t 'map v-entries)) tm-map-tags)
 (for-each (lambda (t) (register-jutil-coll! t 'set v-keys)) tm-set-tags)
-(register-jutil-coll! "treemap-entryset" 'entries v-entries)
+(register-jutil-coll! "treemap-entryset" 'entries v-live-entries)
 (register-jutil-coll! "treemap-values" 'coll tm-elems)
 ;; (seq m) walks the entries (RT.seq over an Iterable); count is size().
 (register-seq-arm! tm-view? tm-elems-seq)
