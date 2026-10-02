@@ -897,6 +897,62 @@
           '(short int long float double))
 
 ;; --- CharBuffer views ----------------------------------------------------------
+;; One character at element I, the single-char get/put a decode loop or a
+;; reader runs per character, so a char-array buffer goes straight to the array
+;; (nb-host-char-ref / -set!) instead of through nb-ref's kind walk.
+(define (nb-char-ref b i)
+  (case (nb-mode b)
+    ((array) (nb-host-char-ref (bb-backing b) (fx+ (bb-off b) i)))
+    ((string) (string-ref (bb-backing b) (fx+ (bb-off b) i)))
+    (else (nb-ref b i))))
+(define (nb-char-set! b i c)
+  (if (and (eq? (nb-mode b) 'array) (char? c))
+      (nb-host-char-set! (bb-backing b) (fx+ (bb-off b) i) c)
+      (nb-set! b i c)))
+(define (nb-char-get1 b)
+  (let* ((st (nb-st b)) (p (vector-ref st 1)))
+    (if (fx<? p (vector-ref st 2))
+        (let ((store (vector-ref st 0)) (i (fx+ (vector-ref st 3) p)))
+          (vector-set! st 1 (fx+ p 1))
+          (case (vector-ref st 10)
+            ((array) (nb-host-char-ref store i))
+            ((string) (string-ref store i))
+            (else (nb-ref b p))))
+        (nb-underflow))))
+(define (nb-char-put1 b x)
+  (let* ((st (nb-st b)) (p (vector-ref st 1)))
+    (cond ((not (char? x)) (nb-put b x))
+          ((fx=? 1 (fxand (vector-ref st 7) nb-flag-ro)) (nb-read-only))
+          ((fx<? p (vector-ref st 2))
+           (if (eq? (vector-ref st 10) 'array)
+               (nb-host-char-set! (vector-ref st 0) (fx+ (vector-ref st 3) p) x)
+               (nb-set! b p x))
+           (vector-set! st 1 (fx+ p 1))
+           b)
+          (else (nb-overflow)))))
+;; A writer for a loop that appends many characters to one CharBuffer (the
+;; decode loop): (put c) answers #f when the buffer is full. Over a char array
+;; whose backing is a string it resolves that string once, so a character is a
+;; string-set! and a position bump, as the string-backed CharBuffer was. The
+;; array cannot change representation mid-loop: only a non-char store does that.
+(define (nb-char-appender b)
+  (let* ((st (nb-st b))
+         (raw (and (eq? (vector-ref st 10) 'array) (nb-host-char-string (vector-ref st 0))))
+         (off (vector-ref st 3)))
+    (cond
+      ((nb-ro? b)                         ; full is still OVERFLOW; a write raises
+       (lambda (c) (and (fx<? (vector-ref st 1) (vector-ref st 2)) (nb-read-only))))
+      (raw
+        (lambda (c)
+          (let ((p (vector-ref st 1)))
+            (and (fx<? p (vector-ref st 2))
+                 (begin (string-set! raw (fx+ off p) c) (vector-set! st 1 (fx+ p 1)) #t)))))
+      (else
+       (lambda (c)
+         (let ((p (vector-ref st 1)))
+           (and (fx<? p (vector-ref st 2))
+                (begin (nb-char-set! b p c) (vector-set! st 1 (fx+ p 1)) #t))))))))
+
 ;; A CharSequence: length/charAt/subSequence over the REMAINING characters, and
 ;; toString is them.
 (register-host-methods! "nio-char-buffer"
@@ -908,7 +964,7 @@
       (cons "charAt" (lambda (b i)
                        (let ((i (nb-int i)))
                          (if (and (fx>=? i 0) (fx<? i (nb-remaining b)))
-                             (nb-ref b (fx+ (bb-pos b) i))
+                             (nb-char-ref b (fx+ (bb-pos b) i))
                              (nb-ioobe)))))
       (cons "subSequence" (lambda (b start end)
                             (let ((start (nb-int start)) (end (nb-int end)) (n (nb-remaining b)))
@@ -921,8 +977,14 @@
                        (if (char? x)
                            (nb-put b x)
                            (let ((s (jolt-str-render-one x))) (nb-put-string! b s 0 (string-length s))))))
+      (cons "get" (case-lambda
+                    ((b) (nb-char-get1 b))
+                    ((b x) (nb-get b x))
+                    ((b x y) (nb-get b x y))
+                    ((b x y z) (nb-get b x y z))
+                    ((b x y z w) (nb-get b x y z w))))
       (cons "put" (case-lambda
-                    ((b x) (nb-put b x))
+                    ((b x) (nb-char-put1 b x))
                     ((b x y) (nb-put b x y))
                     ((b x y z) (nb-put b x y z))
                     ((b x y z w) (nb-put b x y z w)))))))

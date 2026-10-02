@@ -21,21 +21,7 @@
 ;; A CharBuffer is byte-buffer.ss's: a char-array buffer from allocate or
 ;; wrap(char[]), the read-only string one from wrap(CharSequence), or a view of
 ;; a ByteBuffer. The decode loop below writes into whichever the caller hands it,
-;; through these few names.
-(define (cbuf-pos b) (bb-pos b))
-(define (cbuf-pos! b n) (bb-pos! b n))
-(define (cbuf-limit! b n) (bb-limit! b n))
-(define (char-buffer-allocate n) (nb-char-allocate n))
-;; Append one character at the buffer's position. #f when the buffer is full,
-;; which is the OVERFLOW the decode loop reports; a read-only buffer is the
-;; JDK's ReadOnlyBufferException.
-(define (cbuf-put-char! b c)
-  (let ((p (bb-pos b)))
-    (and (fx<? p (bb-limit b))
-         (begin (when (nb-ro? b) (nb-read-only))
-                (nb-set! b p c)
-                (bb-pos! b (fx+ p 1))
-                #t))))
+;; through nb-char-appender.
 
 ;; --- java.nio.charset.CodingErrorAction --------------------------------------
 ;; An enum, modeled the way TimeUnit and Normalizer.Form are: one interned jhost
@@ -192,14 +178,16 @@
 ;;                offending bytes.
 (define (decoder-decode-into d in out end-of-input?)
   (let ((kind (decoder-kind (charset-name (decoder-charset d))))
-        (on-malformed (decoder-action-name (decoder-malformed-action d))))
+        (on-malformed (decoder-action-name (decoder-malformed-action d)))
+        ;; appends one char, #f when out is full (the OVERFLOW result)
+        (put (nb-char-appender out)))
     (define (emit-string s)         ; #f when out has no room for all of it
       (let loop ((i 0))
         (cond ((fx>=? i (string-length s)) #t)
-              ((cbuf-put-char! out (string-ref s i)) (loop (fx+ i 1)))
+              ((put (string-ref s i)) (loop (fx+ i 1)))
               (else #f))))
     (define (emit-code cp)
-      (cbuf-put-char! out (integer->char cp)))
+      (put (integer->char cp)))
     (let loop ()
       (let ((p (bb-pos in)) (limit (bb-limit in)))
         (if (fx>=? p limit)
@@ -244,10 +232,11 @@
          (bv (make-bytevector n)))
     (do ((i 0 (fx+ i 1))) ((fx=? i n)) (bytevector-u8-set! bv i (decoder-byte in (+ p i))))
     (bb-pos! in (bb-limit in))
-    (let ((s (decode-bytevector bv (list (charset-name (decoder-charset d))))))
+    (let ((s (decode-bytevector bv (list (charset-name (decoder-charset d)))))
+          (put (nb-char-appender out)))
       (let loop ((i 0))
         (cond ((fx>=? i (string-length s)) coder-underflow)
-              ((cbuf-put-char! out (string-ref s i)) (loop (fx+ i 1)))
+              ((put (string-ref s i)) (loop (fx+ i 1)))
               (else coder-overflow))))))
 
 (define (decoder-decode d in out end-of-input?)
@@ -262,11 +251,11 @@
   (let* ((n (max 1 (- (bb-limit in) (bb-pos in))))
          ;; one char per byte is the ceiling for every charset here: a multi-byte
          ;; sequence decodes to one char, and a replacement is one char too.
-         (out (char-buffer-allocate n))
+         (out (nb-char-allocate n))
          (r (decoder-decode d in out #t)))
     (when (coder-result-error? r) (coder-result-throw r))
-    (cbuf-limit! out (cbuf-pos out))
-    (cbuf-pos! out 0)
+    (bb-limit! out (bb-pos out))
+    (bb-pos! out 0)
     out))
 
 (register-host-methods! "charset-decoder"

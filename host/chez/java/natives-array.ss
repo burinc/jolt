@@ -391,6 +391,21 @@
 (define (nb-host-array-len a) (ja-len a))
 (define (nb-host-array-ref a i) (ja-ref a i))
 (define (nb-host-array-set! a i v) (ja-set! a i v))
+;; One char of a char array: a string backing (every char array that only ever
+;; held chars) is one string-ref/-set!; anything else takes ja-ref/ja-set!,
+;; which also raises the out-of-range index.
+(define (nb-host-char-ref a i)
+  (let ((v (jolt-array-vec a)))
+    (if (and (string? v) (fixnum? i) (fx>=? i 0) (fx<? i (string-length v)))
+        (string-ref v i)
+        (ja-ref a i))))
+(define (nb-host-char-set! a i c)
+  (let ((v (jolt-array-vec a)))
+    (if (and (string? v) (fixnum? i) (fx>=? i 0) (fx<? i (string-length v)))
+        (string-set! v i c)
+        (ja-set! a i c))))
+(define (nb-host-char-string a)          ; the string a char array holds, or #f
+  (let ((v (jolt-array-vec a))) (and (string? v) v)))
 (define (nb-host-chars->string a from to)   ; a char array's [from, to) as a string
   (let ((v (jolt-array-vec a)))
     (if (string? v)
