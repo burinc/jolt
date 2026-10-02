@@ -768,7 +768,7 @@
               (string-downcase
                 (number->string n (if (and (fixnum? radix) (fx<=? 2 radix 36)) radix 10)))))
            (else (dispatch-miss n method args))))
-    ((string=? method "hashCode") (->num (jnum->exact n)))
+    ((string=? method "hashCode") (jolt-java-number-hashcode n))
     ;; Double/Float .isNaN / .isInfinite (a non-flonum is neither).
     ((string=? method "isNaN") (and (flonum? n) (not (= n n))))
     ((string=? method "isInfinite") (and (flonum? n) (infinite? n)))

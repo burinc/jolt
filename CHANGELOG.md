@@ -182,6 +182,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ;; => [true "[\"a\" nil]" "{:a=null}"]
   ```
 
+- **`.hashCode` of a number or a seq is the JVM's.** A Long outside int range
+  answered itself rather than `(int)(v ^ v>>>32)`, a double its truncation
+  (`(.hashCode 1.5)` was 1, not 1073217536), `##NaN` threw, and a list or lazy
+  seq answered its `hash` instead of the List hash (`(.hashCode '(1 2))` is
+  994). The Map, Set and List hashes are built from these, so they were wrong
+  for any collection holding such a value.
+
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux
   does not wake, so the thread stayed in accept() on a number the next socket
