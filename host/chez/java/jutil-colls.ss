@@ -33,18 +33,38 @@
 ;;   ralist  a RandomAccess java.util.List (ArrayList, Arrays$ArrayList)
 ;;   list    any other java.util.List (LinkedList)
 ;;   coll    a Collection that is none of those (ArrayDeque): str only
+;; The Map$Entry host objects below share the table under the kind entry, so
+;; =, hash and str each walk ONE arm for every java.util host value — the arm
+;; walk is paid by every value no fast path claims (a uuid's hash, an atom's =).
 (define jutil-colls-tbl (make-hashtable string-hash string=?))
 (define (register-jutil-coll! tag kind elems)
   (hashtable-set! jutil-colls-tbl tag (vector kind elems))
   (register-host-methods! tag (jutil-object-methods kind)))
-(define (jutil-coll-entry x)
-  (and (jhost? x) (hashtable-ref jutil-colls-tbl (jhost-tag x) #f)))
+;; The last tag looked up, as one (tag-object . entry) pair: a pair is published
+;; by a single reference write, so a racing reader sees the old pair or the new
+;; one, never half of either. A pr or = over a run of the same shim then skips
+;; the string hash, which is most of what the arm costs.
+(define jutil-tag-cache (cons #f #f))
+(define (jutil-tag-entry x)
+  (and (jhost? x)
+       (let ((tag (jhost-tag x)) (c jutil-tag-cache))
+         (if (eq? (car c) tag)
+             (cdr c)
+             (let ((e (hashtable-ref jutil-colls-tbl tag #f)))
+               (set! jutil-tag-cache (cons tag e))
+               e)))))
+(define (jutil-any-kind x)
+  (let ((e (jutil-tag-entry x))) (and e (vector-ref e 0))))
+;; the collection kind, or #f — never entry
 (define (jutil-coll-kind x)
-  (let ((e (jutil-coll-entry x))) (and e (vector-ref e 0))))
-(define (jutil-coll-elems x) ((vector-ref (jutil-coll-entry x) 1) x))
+  (let ((k (jutil-any-kind x))) (and k (not (eq? k 'entry)) k)))
+(define (jutil-coll-elems x) ((vector-ref (jutil-tag-entry x) 1) x))
 ;; a shim the JVM compares by contents (everything but a bare Collection)
 (define (jutil-equiv-coll? x)
   (let ((k (jutil-coll-kind x))) (and k (not (eq? k 'coll)))))
+;; what the = and hash arms claim: a content-compared shim or an entry
+(define (jutil-equiv-value? x)
+  (let ((k (jutil-any-kind x))) (and k (not (eq? k 'coll)))))
 ;; Iterable on the JVM: seq, seqable?, reduce walk it. post-prelude's seqable?
 ;; consults this.
 (define (jhost-seqable-shim? x) (and (jutil-coll-kind x) #t))
@@ -63,13 +83,18 @@
     (else x)))
 (define (jutil-plain x) (if (jutil-equiv-coll? x) (jutil-coll->persistent x) x))
 (define (jutil-equals? a b)
-  (if (jolt=2 (jutil-plain a) (jutil-plain b)) #t #f))
-(register-eq-arm! (lambda (a b) (or (jutil-equiv-coll? a) (jutil-equiv-coll? b)))
+  (cond ((or (eq? (jutil-any-kind a) 'entry) (eq? (jutil-any-kind b) 'entry))
+         (jutil-entry-equals? a b))
+        ((jolt=2 (jutil-plain a) (jutil-plain b)) #t)
+        (else #f)))
+(register-eq-arm! (lambda (a b) (or (and (jhost? a) (jutil-equiv-value? a))
+                                    (and (jhost? b) (jutil-equiv-value? b))))
                   jutil-equals?)
 
 ;; ---- hashCode -----------------------------------------------------------------
 (define (jutil-hash-code x)
-  (case (jutil-coll-kind x)
+  (case (jutil-any-kind x)
+    ((entry) (jutil-entry-hash x))
     ((map entries) (fold-left (lambda (h e)
                         (i32 (+ h (bitwise-xor (jolt-java-hashcode (jolt-nth e 0))
                                                (jolt-java-hashcode (jolt-nth e 1))))))
@@ -77,30 +102,37 @@
     ((set) (fold-left (lambda (h e) (i32 (+ h (jolt-java-hashcode e)))) 0 (jutil-coll-elems x)))
     (else (fold-left (lambda (h e) (i32 (+ (* 31 h) (jolt-java-hashcode e)))) 1
                      (jutil-coll-elems x)))))
-(register-hash-arm! jutil-equiv-coll? jutil-hash-code)
+;; jhost? is asked inline: this arm sits in the walk every unclaimed value's
+;; hash pays (a uuid's, a record's), so a non-host value must leave in one test.
+(register-hash-arm! (lambda (x) (and (jhost? x) (jutil-equiv-value? x))) jutil-hash-code)
 
 ;; ---- toString -----------------------------------------------------------------
 ;; String.valueOf of each element: null is "null", a collection holding itself
 ;; renders "(this Map)" / "(this Collection)" instead of recursing forever.
 (define (jutil-elem-string self x)
   (cond ((eq? x self) (if (eq? (jutil-coll-kind self) 'map) "(this Map)" "(this Collection)"))
+        ((string? x) x)
         ((jolt-nil? x) "null")
         (else (jolt-str-one x))))
+(define (jutil-ek e) (if (pvec? e) (pvec-nth-d e 0 jolt-nil) (jolt-nth e 0)))
+(define (jutil-ev e) (if (pvec? e) (pvec-nth-d e 1 jolt-nil) (jolt-nth e 1)))
 (define (jutil-entry-string self e)
-  (string-append (jutil-elem-string self (jolt-nth e 0)) "=" (jutil-elem-string self (jolt-nth e 1))))
+  (string-append (jutil-elem-string self (jutil-ek e)) "=" (jutil-elem-string self (jutil-ev e))))
 (define (jutil-to-string x)
-  (if (eq? (jutil-coll-kind x) 'map)
-      (string-append "{"
-        (jolt-str-join-comma (map (lambda (e) (jutil-entry-string x e)) (jutil-coll-elems x)))
-        "}")
-      (string-append "["
-        (jolt-str-join-comma
-          (map (if (eq? (jutil-coll-kind x) 'entries)
-                   (lambda (e) (jutil-entry-string x e))
-                   (lambda (e) (jutil-elem-string x e)))
-               (jutil-coll-elems x)))
-        "]")))
-(register-str-render! jutil-coll-kind jutil-to-string)
+  (let* ((te (jutil-tag-entry x)) (kind (vector-ref te 0)))
+    (case kind
+      ((entry) (jutil-entry-string-of x))
+      ((map) (string-append "{"
+               (jolt-str-join-comma (map (lambda (e) (jutil-entry-string x e)) ((vector-ref te 1) x)))
+               "}"))
+      (else (string-append "["
+              (jolt-str-join-comma
+                (map (if (eq? kind 'entries)
+                         (lambda (e) (jutil-entry-string x e))
+                         (lambda (e) (jutil-elem-string x e)))
+                     ((vector-ref te 1) x)))
+              "]")))))
+(register-str-render! jutil-any-kind jutil-to-string)
 
 ;; ---- pr -----------------------------------------------------------------------
 ;; The readable printer's map/set/list shapes, honoring *print-length* and
@@ -111,20 +143,27 @@
 (define (jutil-pr x)
   (if (not (jolt-pr-readable?))
       (jolt-object-repr x #f)
-      (let ((kind (jutil-coll-kind x)))
+      (let* ((te (jutil-tag-entry x)) (kind (vector-ref te 0)))
         (if (jolt-print-hash?) "#"
             (with-deeper-print
-              (let ((s (list->cseq (jutil-coll-elems x))))
+              (let ((xs ((vector-ref te 1) x)))
                 (case kind
                   ((map) (string-append "{"
                            (jolt-str-join-comma
-                             (jolt-limited-seq-strs s
-                               (lambda (e) (string-append (jolt-pr-readable (jolt-nth e 0)) " "
-                                                          (jolt-pr-readable (jolt-nth e 1))))))
+                             (jutil-limited-strs xs
+                               (lambda (e) (string-append (jolt-pr-readable (jutil-ek e)) " "
+                                                          (jolt-pr-readable (jutil-ev e))))))
                            "}"))
-                  ((set entries) (string-append "#{" (jolt-str-join (jolt-limited-seq-strs s jolt-pr-readable)) "}"))
-                  ((ralist) (string-append "[" (jolt-str-join (jolt-limited-seq-strs s jolt-pr-readable)) "]"))
-                  (else (string-append "(" (jolt-str-join (jolt-limited-seq-strs s jolt-pr-readable)) ")")))))))))
+                  ((set entries) (string-append "#{" (jolt-str-join (jutil-limited-strs xs jolt-pr-readable)) "}"))
+                  ((ralist) (string-append "[" (jolt-str-join (jutil-limited-strs xs jolt-pr-readable)) "]"))
+                  (else (string-append "(" (jolt-str-join (jutil-limited-strs xs jolt-pr-readable)) ")")))))))))
+;; render at most *print-length* of a list, then "..."
+(define (jutil-limited-strs xs render)
+  (let ((lim (jolt-print-length)))
+    (let loop ((xs xs) (i 0) (acc '()))
+      (cond ((null? xs) (reverse acc))
+            ((and lim (fx>=? i lim)) (reverse (cons "..." acc)))
+            (else (loop (cdr xs) (fx+ i 1) (cons (render (car xs)) acc)))))))
 (register-pr-readable-arm! jutil-equiv-coll? jutil-pr)
 
 ;; ---- reduce-kv ----------------------------------------------------------------
@@ -149,21 +188,18 @@
 ;; = against another Map.Entry by key and value (and never against a vector:
 ;; a MapEntry's equiv wants a List), hash as Map.Entry.hashCode (k ^ v), and
 ;; str as k=v. pr is the #object form over that toString, as on the JVM.
-(define jutil-entry-tbl (make-hashtable string-hash string=?))
 (define (register-jutil-entry! tag kv)
-  (hashtable-set! jutil-entry-tbl tag kv)
+  (hashtable-set! jutil-colls-tbl tag (vector 'entry kv))
   (register-host-methods! tag
     (list (cons "getKey" (lambda (self) (car (kv self))))
           (cons "getValue" (lambda (self) (cdr (kv self))))
           (cons "toString" (lambda (self) (jutil-entry-string-of self)))
           (cons "equals" (lambda (self o) (jutil-entry-equals? self o)))
           (cons "hashCode" (lambda (self) (jutil-entry-hash self))))))
+(define (jutil-entry? x) (eq? (jutil-any-kind x) 'entry))
 (define (jutil-entry-kv x)
-  (and (jhost? x)
-       (let ((f (hashtable-ref jutil-entry-tbl (jhost-tag x) #f)))
-         (and f (f x)))))
-(define (jutil-entry? x)
-  (and (jhost? x) (hashtable-ref jutil-entry-tbl (jhost-tag x) #f) #t))
+  (let ((e (jutil-tag-entry x)))
+    (and e (eq? (vector-ref e 0) 'entry) ((vector-ref e 1) x))))
 (set! jolt-host-entry jutil-entry-kv)
 (define (jutil-entry-string-of x)
   (let ((kv (jutil-entry-kv x)))
@@ -174,9 +210,6 @@
 (define (jutil-entry-hash x)
   (let ((kv (jutil-entry-kv x)))
     (i32 (bitwise-xor (jolt-java-hashcode (car kv)) (jolt-java-hashcode (cdr kv))))))
-(register-eq-arm! (lambda (a b) (and (jutil-entry? a) (jutil-entry? b))) jutil-entry-equals?)
-(register-hash-arm! jutil-entry? jutil-entry-hash)
-(register-str-render! jutil-entry? jutil-entry-string-of)
 (register-count-arm! jutil-entry? (lambda (x) 2))
 ;; map-entry? is (instance? java.util.Map$Entry x) on the JVM
 (def-var! "clojure.core" "map-entry?"
