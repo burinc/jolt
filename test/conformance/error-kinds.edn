@@ -119,9 +119,6 @@
  "A host interop form that does not parse: (. target member ...), (.method
   target ...) or (.-field target) with a missing or non-symbol member."
 
- :analyze/invalid-method-reference
- "A qualified instance method (Class/.method) used as a value rather than called."
-
  :analyze/invalid-macro-value
  "A macro's var used as a value. Macros exist only at compile time."
 

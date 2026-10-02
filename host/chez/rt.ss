@@ -2648,6 +2648,11 @@
 ;; it. After the dispatchers it chains.
 (load "host/chez/java/natives-array.ss")
 
+;; java.util.stream: Stream / IntStream / LongStream / DoubleStream over lazy
+;; seqs, Collectors, and Collection.stream(). After natives-array.ss (toArray,
+;; Arrays/stream) and host-static-classes.ss (Optional, the collection shims).
+(load "host/chez/java/streams.ss")
+
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and
 ;; natives-array.ss (the byte-array <-> bytevector bridge).

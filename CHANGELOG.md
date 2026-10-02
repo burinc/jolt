@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Clojure 1.12.** `*clojure-version*` reports 1.12, and the 1.12 language
+  features jolt was missing are in: `Class/new` and `Class/.method` as values
+  (with `^[...]` param-tags picking the arity), array class symbols (`String/1`,
+  `long/2`) as values, hints and `instance?`/`resolve` targets, a
+  `^java.util.function.Predicate`-style hinted let binding adapting a fn to the
+  interface, `IDeref` types as `Supplier`s, and `java.util.stream` with
+  `stream-seq!`, `stream-reduce!`, `stream-transduce!` and `stream-into!`.
+  Collections answer `.stream`, and `forEach`/`removeIf`/`replaceAll`/`sort`
+  take fns. `partitionv`, `partitionv-all` (now with its transducer arity) and
+  `splitv-at` are the reference definitions. clojure.java.process,
+  clojure.java.basis, clojure.repl.deps and clojure.tools.deps.interop are not
+  ported.
+
 - **A readiness poller on Windows.** jolt.io-poller has a WSAPoll backend, so
   sockets on Windows are non-blocking and wait on it the way they wait on
   kqueue and epoll elsewhere: a fiber reading a socket parks instead of holding
@@ -165,6 +178,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(shutdown-agents)` over a connection leaves it serving the next one.
 
 ### Fixed
+
+- **SCI's constructor reflection.** `Class.getConstructors` and
+  `getParameterTypes` answer typed arrays (`Constructor[]`, `Class[]`) instead
+  of vectors, which an `^objects` aget refused, and `Constructor.newInstance`
+  spreads an Object[] argument (nil is no arguments) the way the JVM does. With
+  `clojure.lang.Compiler/subsumes` added, `(Exception. "m")`, `@(delay 1)` and
+  `case` work through SCI's reflector. Reference arrays carry their component
+  class: `(into-array String ...)` is a `String[]`, an untyped `into-array` takes
+  the first element's class, and `make-array` builds every dimension.
+- `Class.isAssignableFrom` answered true for Object against a primitive class.
+- Hashing an infinite `iterate`, `cycle`, `repeat` or `(range)` hung; it throws
+  UnsupportedOperationException as on 1.12. `cycle` is a `clojure.lang.Cycle`.
+- `#(%a)` and other bad arg literals read as symbols instead of raising.
+- An ArityException past 20 arguments says `(> 20)`.
+- A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque
+  `#object` under `pr`, compared unequal to the Clojure collection with the same
+  elements, and had the wrong `str`/`toString`.
 
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux

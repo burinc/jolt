@@ -187,6 +187,7 @@
          (if (fx>=? i n) h
              (loop (fx+ i 1) (i32 (+ (* 31 h) (jolt-java-hashcode (pvec-nth-d x i jolt-nil)))))))))
     ((or (cseq? x) (empty-list-t? x) (jolt-lazyseq? x))
+     (seq-hash-refuse-unbounded! (jolt-seq x))
      (let loop ((s (jolt-seq x)) (h 1))
        (if (jolt-nil? s) h
            (loop (jolt-seq (seq-more s)) (i32 (+ (* 31 h) (jolt-java-hashcode (seq-first s))))))))

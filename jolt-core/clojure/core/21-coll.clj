@@ -245,23 +245,8 @@
 (defn update-vals [m f]
   (reduce-kv (fn [acc k v] (assoc acc k (f v))) {} m))
 
-;; Vector-returning partition variants (1.11): lazy seqs OF vectors.
-(defn partitionv
-  ([n coll] (map vec (partition n coll)))
-  ([n step coll] (map vec (partition n step coll)))
-  ([n step pad coll] (map vec (partition n step pad coll))))
-
-;; partition-all is a lazy-tier fn (40-lazy) — declared so partitionv-all
-;; compiles; bound by the time anything calls it.
-(declare partition-all)
-
-(defn partitionv-all
-  ([n coll] (map vec (partition-all n coll)))
-  ([n step coll] (map vec (partition-all n step coll))))
-
-;; First part a vector, rest a seq — matching the reference implementation.
-(defn splitv-at [n coll]
-  [(vec (take n coll)) (drop n coll)])
+;; partitionv / partitionv-all / splitv-at (1.12) live in 40-lazy, beside
+;; partition-all, whose transducer partitionv-all's one-arity form is.
 
 ;; with-redefs-fn: temporarily set each var's ROOT to the mapped value, run
 ;; the thunk, restore the saved roots even on throw. The with-redefs macro
@@ -384,7 +369,7 @@
    (fn [a b c & args]
      (apply f (if (nil? a) x a) (if (nil? b) y b) (if (nil? c) z c) args))))
 
-(defn clojure-version [] "1.11.0-jolt")
+(defn clojure-version [] "1.12.0-jolt")
 
 ;; bigdec is a host fn (host/chez/java/bigdec.ss) — a real BigDecimal value type.
 ;; numerator/denominator are host natives (converters.ss) over Chez's exact

@@ -1853,7 +1853,11 @@
      '("[J" "Object"))
     ((and (jolt-array? obj) (eq? (jolt-array-kind obj) 'double))
      '("[D" "Object"))
-    ((jolt-array? obj) '("[Ljava.lang.Object;" "Object"))
+    ((jolt-array? obj)
+     (let ((k (jolt-array-kind obj)))
+       (if (string? k)
+           (list (na-kind-class-name k) "[Ljava.lang.Object;" "Object")
+           '("[Ljava.lang.Object;" "Object"))))
     ((regex-t? obj) (jch-tags "java.util.regex.Pattern"))
     ((matcher-t? obj) (jch-tags "java.util.regex.Matcher"))
     ((juuid? obj) (jch-tags "java.util.UUID"))
@@ -1950,7 +1954,7 @@
                         'ArityException
                         (string-append
                           "Wrong number of args ("
-                          (number->string n)
+                          (jvm-arity-count n)
                           ") passed to: "
                           ctor-name))))))))
     (class-ctor-set! tag ctor)
@@ -2044,6 +2048,22 @@
         "OutputStream" "java.io.OutputStream"))
     h))
 
+(define (na-kind-class-name k)
+  (case k
+    ((int) "[I")
+    ((long) "[J")
+    ((short) "[S")
+    ((double) "[D")
+    ((float) "[F")
+    ((boolean) "[Z")
+    ((byte) "[B")
+    ((char) "[C")
+    (else
+     (cond
+       ((not (string? k)) "[Ljava.lang.Object;")
+       ((char=? (string-ref k 0) #\[) (string-append "[" k))
+       (else (string-append "[L" k ";"))))))
+
 (define (strip-prefix s p)
   (let ((pl (string-length p)))
     (and (> (string-length s) pl)
@@ -2075,6 +2095,9 @@
             (or (jch-known? base) (jch-known? type-name)))
        (jch-last-segment type-name))
       ((dotted-name? type-name) type-name)
+      ((and (fx>? (string-length type-name) 1)
+            (char=? (string-ref type-name 0) #\[))
+       type-name)
       (else #f))))
 
 (define (mark-extend! tag proto-name)
@@ -2723,6 +2746,16 @@
                 (let ((v (jolt-first s)))
                   (jiterator-cur-set! obj (jolt-rest s))
                   v))))
+         ((and (string=? method-name "forEachRemaining")
+               (pair? rest))
+          (let loop ()
+            (let ((s (jolt-seq (jiterator-cur obj))))
+              (if (jolt-nil? s)
+                  jolt-nil
+                  (begin
+                    (jiterator-cur-set! obj (jolt-rest s))
+                    (jolt-fi-call (car rest) "accept" (jolt-first s))
+                    (loop))))))
          (else (dispatch-miss obj method-name rest))))
       ((string=? method-name "iterator")
        (make-jiterator (jolt-seq obj)))
@@ -2906,7 +2939,10 @@
                      (let loop ((s (jolt-seq obj)))
                        (and (not (jolt-nil? s))
                             (or (jolt-truthy?
-                                  (jolt-invoke (car rest) (seq-first s)))
+                                  (jolt-fi-call
+                                    (car rest)
+                                    "test"
+                                    (seq-first s)))
                                 (loop (jolt-seq (seq-more s)))))))
                 (throw-jvm 'UnsupportedOperationException "")
                 #f))
@@ -2918,6 +2954,11 @@
                 (string=? method-name "sort"))
             jolt-nil)
            (else (throw-jvm 'UnsupportedOperationException "")))))
+      ((and (string=? method-name "forEach")
+            (pair? rest)
+            (null? (cdr rest))
+            (rd-java-list? obj))
+       (car (dot-coll-method obj method-name rest)))
       ((or (string=? method-name "indexOf")
            (string=? method-name "lastIndexOf"))
        (let ((target (car rest))
@@ -2995,6 +3036,29 @@
            " found taking " (number->string argc) " args for class "
            (guard (e (#t "?")) (jolt-class-name obj))))))))
 
+(define jolt-fi-call
+  (case-lambda
+    ((f method)
+     (if (and (not (procedure? f)) (iface-method f method 1))
+         (record-method-dispatch f method jolt-nil)
+         (jolt-invoke f)))
+    ((f method a)
+     (if (and (not (procedure? f)) (iface-method f method 2))
+         (record-method-dispatch f method (list->cseq (list a)))
+         (jolt-invoke1 f a)))
+    ((f method a b)
+     (if (and (not (procedure? f)) (iface-method f method 3))
+         (record-method-dispatch f method (list->cseq (list a b)))
+         (jolt-invoke2 f a b)))
+    ((f method . args)
+     (if (and (not (procedure? f))
+              (iface-method f method (fx+ 1 (length args))))
+         (record-method-dispatch
+           f
+           method
+           (if (null? args) jolt-nil (list->cseq args)))
+         (apply jolt-invoke f args)))))
+
 (define (dot-coll-method obj name args)
   (cond
     ((string=? name "count") (list (jolt-count obj)))
@@ -3016,6 +3080,13 @@
                  (else (loop (jolt-seq (seq-more s))))))))))
     ((string=? name "size") (list (jolt-count obj)))
     ((string=? name "isEmpty") (list (jolt-empty? obj)))
+    ((string=? name "forEach")
+     (let loop ((s (jolt-seq obj)))
+       (if (jolt-nil? s)
+           (list jolt-nil)
+           (begin
+             (jolt-fi-call (car args) "accept" (seq-first s))
+             (loop (jolt-seq (seq-more s)))))))
     ((string=? name "hashCode") (list (jolt-java-hashcode obj)))
     ((string=? name "cons") (list (jolt-conj obj (car args))))
     ((or (string=? name "assoc") (string=? name "assocN"))

@@ -563,6 +563,98 @@
       (= 1 n) (first v)
       :else (do-node (subvec v 0 (dec n)) (peek v)))))
 
+;; ---- functional-interface coercion of a hinted let binding (Clojure 1.12) ---
+;; (let [^java.util.function.Predicate p even?] (.test p 2)): a binding hinted
+;; with a functional interface adapts a fn init to that interface, as the JVM's
+;; FISupport.maybeEmitFIAdapter does — only when the value is an IFn and not
+;; already an instance of the interface. The adapter's method returns the fn's
+;; result converted to the method's return type the way the JVM's FnInvokers do:
+;; a boolean return is a Boolean CAST, a numeric one the RT cast (2.7 -> 2).
+;; Runnable, Callable and Comparator are absent: a fn already is one of each.
+;; Each entry: interface -> [method arity return].
+(def ^:private fi-interfaces
+  {"java.util.function.Function" ["apply" 1 :obj]
+   "java.util.function.BiFunction" ["apply" 2 :obj]
+   "java.util.function.UnaryOperator" ["apply" 1 :obj]
+   "java.util.function.BinaryOperator" ["apply" 2 :obj]
+   "java.util.function.IntFunction" ["apply" 1 :obj]
+   "java.util.function.LongFunction" ["apply" 1 :obj]
+   "java.util.function.DoubleFunction" ["apply" 1 :obj]
+   "java.util.function.Predicate" ["test" 1 :bool]
+   "java.util.function.BiPredicate" ["test" 2 :bool]
+   "java.util.function.IntPredicate" ["test" 1 :bool]
+   "java.util.function.LongPredicate" ["test" 1 :bool]
+   "java.util.function.DoublePredicate" ["test" 1 :bool]
+   "java.util.function.Consumer" ["accept" 1 :void]
+   "java.util.function.BiConsumer" ["accept" 2 :void]
+   "java.util.function.IntConsumer" ["accept" 1 :void]
+   "java.util.function.LongConsumer" ["accept" 1 :void]
+   "java.util.function.DoubleConsumer" ["accept" 1 :void]
+   "java.util.function.ObjIntConsumer" ["accept" 2 :void]
+   "java.util.function.ObjLongConsumer" ["accept" 2 :void]
+   "java.util.function.ObjDoubleConsumer" ["accept" 2 :void]
+   "java.util.function.Supplier" ["get" 0 :obj]
+   "java.util.function.BooleanSupplier" ["getAsBoolean" 0 :bool]
+   "java.util.function.IntSupplier" ["getAsInt" 0 :int]
+   "java.util.function.LongSupplier" ["getAsLong" 0 :long]
+   "java.util.function.DoubleSupplier" ["getAsDouble" 0 :double]
+   "java.util.function.ToIntFunction" ["applyAsInt" 1 :int]
+   "java.util.function.ToLongFunction" ["applyAsLong" 1 :long]
+   "java.util.function.ToDoubleFunction" ["applyAsDouble" 1 :double]
+   "java.util.function.ToIntBiFunction" ["applyAsInt" 2 :int]
+   "java.util.function.ToLongBiFunction" ["applyAsLong" 2 :long]
+   "java.util.function.ToDoubleBiFunction" ["applyAsDouble" 2 :double]
+   "java.util.function.IntUnaryOperator" ["applyAsInt" 1 :int]
+   "java.util.function.LongUnaryOperator" ["applyAsLong" 1 :long]
+   "java.util.function.DoubleUnaryOperator" ["applyAsDouble" 1 :double]
+   "java.util.function.IntBinaryOperator" ["applyAsInt" 2 :int]
+   "java.util.function.LongBinaryOperator" ["applyAsLong" 2 :long]
+   "java.util.function.DoubleBinaryOperator" ["applyAsDouble" 2 :double]
+   "java.util.function.IntToLongFunction" ["applyAsLong" 1 :long]
+   "java.util.function.IntToDoubleFunction" ["applyAsDouble" 1 :double]
+   "java.util.function.LongToIntFunction" ["applyAsInt" 1 :int]
+   "java.util.function.LongToDoubleFunction" ["applyAsDouble" 1 :double]
+   "java.util.function.DoubleToIntFunction" ["applyAsInt" 1 :int]
+   "java.util.function.DoubleToLongFunction" ["applyAsLong" 1 :long]
+   "java.io.FileFilter" ["accept" 1 :bool]
+   "java.io.FilenameFilter" ["accept" 2 :bool]})
+
+;; The functional interface a binding's ^tag names, as its FQN, or nil. The tag is
+;; written the way any class is: fully qualified, or a name an :import maps.
+(defn- fi-tag-class [ctx bsym]
+  (let [tag (get (form-sym-meta bsym) :tag)
+        nm (cond (form-sym? tag) (if (form-sym-ns tag) nil (form-sym-name tag))
+                 (string? tag) tag
+                 :else nil)]
+    (when nm
+      (if (contains? fi-interfaces nm)
+        nm
+        (let [r (resolve-global ctx (symbol nm))
+              fqn (if (= :class (:kind r)) (:name r) (resolve-class-hint nm))]
+          (when (contains? fi-interfaces fqn) fqn))))))
+
+(defn- fi-adapt-form [fqn init]
+  (let [[mname arity ret] (get fi-interfaces fqn)
+        v (symbol "fi__value")
+        ps (mapv #(symbol (str "a" % "__fi")) (range arity))
+        call (apply list v ps)
+        body (case ret
+               ;; the JVM CASTS to Boolean (no truthiness): a non-boolean raises
+               :bool (list (symbol "clojure.core" "cast") (symbol "java.lang.Boolean") call)
+               :int (list (symbol "clojure.core" "int") call)
+               :long (list (symbol "clojure.core" "long") call)
+               :double (list (symbol "clojure.core" "double") call)
+               :void (list 'do call nil)
+               call)
+        iface (symbol fqn)]
+    (list 'let* [v init]
+          (list 'if (list 'if (list (symbol "clojure.core" "ifn?") v)
+                          (list 'if (list (symbol "clojure.core" "instance?") iface v) false true)
+                          false)
+                (list (symbol "clojure.core" "reify") iface
+                      (list (symbol mname) (into [(symbol "fi__this")] ps) body))
+                v))))
+
 (defn- analyze-bindings [ctx bvec env]
   ;; Checked BEFORE the walk, because the walk reads pairs: an odd vector sent
   ;; (nth bvec (inc i)) past the end and the user got the raw fault that came
@@ -578,7 +670,11 @@
           (analysis-error :analyze/invalid-binding
                           "Bad binding form, expected symbol"))
         (let [nm (form-sym-name bsym)
-              init0 (analyze ctx (nth bvec (inc i)) env)
+              fi (fi-tag-class ctx bsym)
+              init0 (analyze ctx (if fi
+                                   (fi-adapt-form fi (nth bvec (inc i)))
+                                   (nth bvec (inc i)))
+                             env)
               ;; a ^doubles/^floats/^longs/^ints let binding tags its init with the
               ;; array kind so jolt.passes.numeric seeds the local for the unboxed
               ;; flvector aget/aset path (mirrors the :ahints param route).
@@ -1884,18 +1980,86 @@
     (throw (ex-info msg (diagnostic-data :analyze/unresolved-symbol
                                          (current-form-position) extra)))))
 
+;; ---- Clojure 1.12 qualified methods and array class symbols ----------------
+;; The JVM descriptor letter of each primitive an array class symbol may name
+;; (long/2 is long[][], "[[J").
+(def ^:private array-prim-letters
+  {"boolean" "Z" "byte" "B" "char" "C" "short" "S" "int" "I" "long" "J"
+   "float" "F" "double" "D"})
+
+;; `Component/N` names an N-dimensional array class (Compiler.maybeArrayClass):
+;; a qualified symbol whose name is ONE digit 1-9.
+(defn- array-class-dims [nm]
+  (when (and (= 1 (count nm)) (contains? #{"1" "2" "3" "4" "5" "6" "7" "8" "9"} nm))
+    (parse-long nm)))
+
+;; The JVM name of the array class `cname/dims` names — "[[J" for long/2,
+;; "[Ljava.lang.String;" for String/1 — or nil when cname is no class. The
+;; component resolves the way a class symbol does: a primitive, an auto-imported
+;; or :import-ed class, a deftype, or a fully-qualified name.
+(defn- array-class-name [ctx cname dims]
+  (let [prefix (apply str (repeat dims "["))
+        letter (get array-prim-letters cname)]
+    (if letter
+      (str prefix letter)
+      (let [r (resolve-global ctx (symbol cname))
+            fqn (cond (= :class (:kind r)) (:name r)
+                      (resolve-class-hint cname) (resolve-class-hint cname)
+                      (host-class-name? cname) cname
+                      :else nil)]
+        (when fqn (str prefix "L" fqn ";"))))))
+
+;; Fresh parameter names for a synthesized method-value fn. The `__qm` suffix
+;; keeps them out of the way of any name the method's class symbol could use.
+(defn- qm-params [n] (mapv #(symbol (str "p" % "__qm")) (range n)))
+
+;; `Class/new` and `Class/.method` in VALUE position (Clojure 1.12 method values)
+;; are fns. With :param-tags (^[long String] Foo/.bar) the arity is known, so the
+;; fn calls the member directly; without them the fn is variadic and reaches the
+;; member reflectively, which is what the JVM compiles an unresolved method value
+;; to. The forms are analyzed like any written fn.
+(defn- method-value-form [cname mname ptags]
+  (let [csym (symbol cname)
+        ctor? (= mname "new")
+        n (when (vector? ptags) (count ptags))]
+    (if n
+      (let [ps (qm-params n)]
+        (if ctor?
+          (list 'fn* ps (apply list 'new csym ps))
+          (let [t (symbol "target__qm")]
+            (list 'fn* (into [t] ps) (apply list '. t (symbol (subs mname 1)) ps)))))
+      (let [a (symbol "args__qm")]
+        (if ctor?
+          (list 'fn* ['& a]
+                (list (symbol "clojure.lang.Reflector" "invokeConstructor")
+                      csym (list (symbol "clojure.core" "to-array") a)))
+          (let [t (symbol "target__qm")]
+            (list 'fn* [t '& a]
+                  (list (symbol "clojure.lang.Reflector" "invokeInstanceMethod")
+                        t (subs mname 1) (list (symbol "clojure.core" "to-array") a)))))))))
+
 (defn- analyze-symbol [ctx form env]
   (let [nm (form-sym-name form) ns (form-sym-ns form)]
     (cond
       (and (nil? ns) (local? env nm))
         (let [h (get (:hints env) nm)] (if h (assoc (local nm) :hint h) (local nm)))
-      ;; Qualified instance method (Clojure 1.12) used as a value — not yet
-      ;; supported as a method reference. The call form (Class/.method target ...)
-      ;; works; a bare Class/.method as a value is a residual.
+      ;; Qualified instance method (Clojure 1.12) used as a value: a fn of the
+      ;; target and the method's arguments.
       (and ns (> (count nm) 1) (= "." (subs nm 0 1)))
-        (analysis-error :analyze/invalid-method-reference
-         (str "Qualified instance method " (str ns "/" nm)
-              " used as value; value form not yet supported. Use (.method target ...) or (Class/.method target ...) instead."))
+        (analyze ctx (method-value-form ns nm (get (form-sym-meta form) :param-tags)) env)
+      ;; `Class/new` used as a value — a fn over the constructor — unless the ns
+      ;; half is a namespace that really has a var named `new`.
+      (and ns (= nm "new") (not= :var (:kind (resolve-global ctx form))))
+        (analyze ctx (method-value-form ns nm (get (form-sym-meta form) :param-tags)) env)
+      ;; `Component/N` — an array class symbol (Clojure 1.12): the Class object,
+      ;; as any class symbol evaluates to.
+      (and ns (array-class-dims nm) (not= :var (:kind (resolve-global ctx form))))
+        (let [cn (array-class-name ctx ns (array-class-dims nm))]
+          (if cn
+            (invoke (var-ref "jolt.host" "jolt-class-for") [(const cn)])
+            (analysis-error :analyze/unresolved-symbol
+                            (str "Unable to resolve component classname: " ns)
+                            {:jolt.error/symbol (str ns "/" nm)})))
       ns (let [r (resolve-global ctx form)]
            (if (= :var (:kind r))
              (or (macro-value-fn ctx form r)
@@ -2172,6 +2336,12 @@
             (let [n (form-sym-name head)]
               (analyze-ctor ctx (str (form-sym-ns head) "/" (subs n 0 (dec (count n))))
                             (rest items) env))
+          ;; (Class/new arg*) — the qualified constructor (Clojure 1.12), the same
+          ;; call as (Class. arg*). A namespace with a var named `new` keeps its call.
+          (and (form-sym? head) (form-sym-ns head) (not shadowed)
+               (= "new" (form-sym-name head))
+               (not= :var (:kind (resolve-global ctx head))))
+            (analyze-ctor ctx (form-sym-ns head) (rest items) env)
           ;; (Class/.method target arg*) — qualified instance method call (Clojure 1.12).
           ;; The class part is a type hint; dispatch on the first arg's runtime type.
           (and (form-sym? head) (form-sym-ns head)

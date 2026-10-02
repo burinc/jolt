@@ -402,6 +402,15 @@
               (let ((s (jolt-seq (jiterator-cur obj))))
                 (if (jolt-nil? s) (throw-jvm (quote NoSuchElementException) "iterator exhausted")
                     (let ((v (jolt-first s))) (jiterator-cur-set! obj (jolt-rest s)) v))))
+             ;; Iterator.forEachRemaining(Consumer): drains what is left
+             ((and (string=? method-name "forEachRemaining") (pair? rest))
+              (let loop ()
+                (let ((s (jolt-seq (jiterator-cur obj))))
+                  (if (jolt-nil? s)
+                      jolt-nil
+                      (begin (jiterator-cur-set! obj (jolt-rest s))
+                             (jolt-fi-call (car rest) "accept" (jolt-first s))
+                             (loop))))))
              (else (dispatch-miss obj method-name rest))))
       ((string=? method-name "iterator") (make-jiterator (jolt-seq obj)))
       ;; clojure.lang.Keyword interop: a Keyword carries an interned `sym` field
@@ -642,7 +651,7 @@
             (if (and (not empty?)
                      (let loop ((s (jolt-seq obj)))
                        (and (not (jolt-nil? s))
-                            (or (jolt-truthy? (jolt-invoke (car rest) (seq-first s)))
+                            (or (jolt-truthy? (jolt-fi-call (car rest) "test" (seq-first s)))
                                 (loop (jolt-seq (seq-more s)))))))
                 (throw-jvm 'UnsupportedOperationException "")
                 #f))
@@ -651,6 +660,11 @@
             (throw-jvm 'NoSuchElementException ""))
            ((or (string=? method-name "replaceAll") (string=? method-name "sort")) jolt-nil)
            (else (throw-jvm 'UnsupportedOperationException "")))))
+      ;; Iterable.forEach over a list / seq / range — every one is a
+      ;; java.util.List on the JVM (vectors, maps and sets answer it in
+      ;; dot-coll-method).
+      ((and (string=? method-name "forEach") (pair? rest) (null? (cdr rest)) (rd-java-list? obj))
+       (car (dot-coll-method obj method-name rest)))
       ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /
       ;; seq) — -1 when absent, like the JVM (medley/index-of reads this).
       ((or (string=? method-name "indexOf") (string=? method-name "lastIndexOf"))
@@ -758,6 +772,34 @@
                                  (number->string argc) " args for class "
                                  (guard (e (#t "?")) (jolt-class-name obj))))))))
 
+;; (jolt-fi-call f method arg ...) — call the java.util.function argument of a
+;; host method: a Clojure fn (or any invokable, a keyword or a map) is invoked,
+;; and a reify / deftype implementing the interface has its one method called by
+;; name. Clojure 1.12 coerces a fn to the interface at the call site, so both
+;; shapes reach a JVM method; jolt has no coercion, so a shim that only
+;; jolt-invokes its argument refused the reify with "cannot be cast to
+;; clojure.lang.IFn" — (.computeIfAbsent m k (reify Function (apply [_ k] …)))
+;; failed that way while the comment below said it worked.
+;; The fixed arities keep a plain fn's call free of the rest list and apply.
+(define jolt-fi-call
+  (case-lambda
+    ((f method)
+     (if (and (not (procedure? f)) (iface-method f method 1))
+         (record-method-dispatch f method jolt-nil)
+         (jolt-invoke f)))
+    ((f method a)
+     (if (and (not (procedure? f)) (iface-method f method 2))
+         (record-method-dispatch f method (list->cseq (list a)))
+         (jolt-invoke1 f a)))
+    ((f method a b)
+     (if (and (not (procedure? f)) (iface-method f method 3))
+         (record-method-dispatch f method (list->cseq (list a b)))
+         (jolt-invoke2 f a b)))
+    ((f method . args)
+     (if (and (not (procedure? f)) (iface-method f method (fx+ 1 (length args))))
+         (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args)))
+         (apply jolt-invoke f args)))))
+
 ;; --- the java.util collection surface of a jolt collection --------------------
 ;; count/seq/nth/get/containsKey/contains/size/isEmpty/hashCode, the
 ;; IPersistent* mutators, the java.util.Map views and .iterator/.reduce, as
@@ -788,6 +830,15 @@
                          (else (loop (jolt-seq (seq-more s))))))))))
     ((string=? name "size")    (list (jolt-count obj)))
     ((string=? name "isEmpty") (list (jolt-empty? obj)))
+    ;; Iterable.forEach(Consumer): every element in seq order — a map's are its
+    ;; entries, which is the overload the JVM's reflective call picks for a map.
+    ((string=? name "forEach")
+     (let loop ((s (jolt-seq obj)))
+       (if (jolt-nil? s)
+           (list jolt-nil)
+           (begin (jolt-fi-call (car args) "accept" (seq-first s))
+                  (loop (jolt-seq (seq-more s)))))))
+
     ;; java.util.{Map,Set,List}.hashCode — the Java collection hashCode, so a
     ;; jolt builtin matches a library's own type computing the same (flatland).
     ((string=? name "hashCode") (list (jolt-java-hashcode obj)))

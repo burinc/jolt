@@ -599,6 +599,47 @@
 ;; extends ARef.
 (jch-register-supers! "clojure.lang.IReference" '("clojure.lang.IMeta"))
 (jch-register-supers! "clojure.lang.AReference" '("clojure.lang.IReference"))
+;; Clojure 1.12: IDeref extends the five java.util.function suppliers, so every
+;; reference type (atom, delay, future, promise, var, volatile, reduced) is a
+;; Supplier — (.get (atom 1)) and (instance? Supplier (delay 1)).
+(jch-register-supers! "clojure.lang.IDeref"
+  '("java.util.function.Supplier" "java.util.function.BooleanSupplier"
+    "java.util.function.IntSupplier" "java.util.function.LongSupplier"
+    "java.util.function.DoubleSupplier"))
+;; The java.util.function interfaces themselves, so a reify of one is an instance
+;; of it, a ^Predicate / ^Function hint resolves to its FQN (the analyzer's
+;; functional-interface coercion of a hinted let binding reads that), and an
+;; :import of one names a class jolt models. UnaryOperator and BinaryOperator
+;; extend Function and BiFunction, as in the JDK.
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.util.function.Supplier" "java.util.function.BooleanSupplier"
+            "java.util.function.IntSupplier" "java.util.function.LongSupplier"
+            "java.util.function.DoubleSupplier"
+            "java.util.function.Function" "java.util.function.BiFunction"
+            "java.util.function.IntFunction" "java.util.function.LongFunction"
+            "java.util.function.DoubleFunction"
+            "java.util.function.Predicate" "java.util.function.BiPredicate"
+            "java.util.function.IntPredicate" "java.util.function.LongPredicate"
+            "java.util.function.DoublePredicate"
+            "java.util.function.Consumer" "java.util.function.BiConsumer"
+            "java.util.function.IntConsumer" "java.util.function.LongConsumer"
+            "java.util.function.DoubleConsumer" "java.util.function.ObjIntConsumer"
+            "java.util.function.ObjLongConsumer" "java.util.function.ObjDoubleConsumer"
+            "java.util.function.ToIntFunction" "java.util.function.ToLongFunction"
+            "java.util.function.ToDoubleFunction" "java.util.function.ToIntBiFunction"
+            "java.util.function.ToLongBiFunction" "java.util.function.ToDoubleBiFunction"
+            "java.util.function.IntUnaryOperator" "java.util.function.LongUnaryOperator"
+            "java.util.function.DoubleUnaryOperator" "java.util.function.IntBinaryOperator"
+            "java.util.function.LongBinaryOperator" "java.util.function.DoubleBinaryOperator"
+            "java.util.function.IntToLongFunction" "java.util.function.IntToDoubleFunction"
+            "java.util.function.LongToIntFunction" "java.util.function.LongToDoubleFunction"
+            "java.util.function.DoubleToIntFunction" "java.util.function.DoubleToLongFunction"))
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.io.FileFilter" "java.io.FilenameFilter"))
+(jch-register-supers! "java.util.function.UnaryOperator" '("java.util.function.Function"))
+(jch-mark-interface! "java.util.function.UnaryOperator")
+(jch-register-supers! "java.util.function.BinaryOperator" '("java.util.function.BiFunction"))
+(jch-mark-interface! "java.util.function.BinaryOperator")
 (jch-register-supers! "clojure.lang.IRef" '("clojure.lang.IDeref"))
 (jch-register-supers! "clojure.lang.ARef" '("clojure.lang.AReference" "clojure.lang.IRef"))
 (jch-register-supers! "clojure.lang.IAtom" '())
@@ -1147,6 +1188,22 @@
 (jch-mark-interface! "java.util.Enumeration")
 (jch-register-supers! "java.util.StringTokenizer" '("java.util.Enumeration"))
 (jch-register-supers! "java.util.Optional" '())
+;; java.util.stream: each pipeline head is its stream interface, and every
+;; stream a BaseStream, which is AutoCloseable.
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.util.stream.Collector"))
+(jch-register-supers! "java.util.stream.BaseStream" '("java.lang.AutoCloseable"))
+(jch-mark-interface! "java.util.stream.BaseStream")
+(for-each (lambda (n)
+            (jch-register-supers! n '("java.util.stream.BaseStream"))
+            (jch-mark-interface! n))
+          '("java.util.stream.Stream" "java.util.stream.IntStream"
+            "java.util.stream.LongStream" "java.util.stream.DoubleStream"))
+(jch-register-supers! "java.util.stream.ReferencePipeline$Head" '("java.util.stream.Stream"))
+(jch-register-supers! "java.util.stream.IntPipeline$Head" '("java.util.stream.IntStream"))
+(jch-register-supers! "java.util.stream.LongPipeline$Head" '("java.util.stream.LongStream"))
+(jch-register-supers! "java.util.stream.DoublePipeline$Head" '("java.util.stream.DoubleStream"))
+(jch-register-supers! "java.util.stream.Collectors$CollectorImpl" '("java.util.stream.Collector"))
 (jch-register-supers! "java.util.Base64" '())
 (jch-register-supers! "java.util.Base64$Encoder" '())
 (jch-register-supers! "java.util.Base64$Decoder" '())
@@ -1313,6 +1370,12 @@
     ("splittable-random" . "java.util.SplittableRandom")
     ("securerandom" . "java.security.SecureRandom")
     ("optional" . "java.util.Optional")
+    ;; java.util.stream (streams.ss): the JDK's pipeline head classes
+    ("stream" . "java.util.stream.ReferencePipeline$Head")
+    ("int-stream" . "java.util.stream.IntPipeline$Head")
+    ("long-stream" . "java.util.stream.LongPipeline$Head")
+    ("double-stream" . "java.util.stream.DoublePipeline$Head")
+    ("stream-collector" . "java.util.stream.Collectors$CollectorImpl")
     ("string-tokenizer" . "java.util.StringTokenizer")
     ("b64-encoder" . "java.util.Base64$Encoder")
     ("b64-decoder" . "java.util.Base64$Decoder")
