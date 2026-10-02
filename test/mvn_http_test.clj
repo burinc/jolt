@@ -20,9 +20,7 @@
 (def windows-libdirs  (var jolt.mvn-http/windows-openssl-libdirs-for))
 (def openssl-libdirs  (var jolt.mvn-http/openssl-libdirs-for))
 (def transport-error  (var jolt.mvn-http/transport-load-error))
-(def pick-ai-addr-offset (var jolt.mvn-http/pick-ai-addr-offset))
 (def connect-error-message (var jolt.mvn-http/connect-error-message))
-(def ai-addr-fallback @(var jolt.mvn-http/O-ai-addr-fallback))
 (def max-attempts     @(var jolt.mvn-http/max-attempts))
 (def windows?         @(var jolt.mvn-http/windows?))
 
@@ -168,21 +166,8 @@
        (str/includes? (transport-error "x") "JOLT_OPENSSL_LIBDIR")
        "transport error names the remedy")
 
-  ;; --- struct addrinfo layout probe (#979) -----------------------------------
-  ;; ai_addr sits at 24 under glibc and at 32 under the BSD order, which is what
-  ;; macOS, Win64 AND bionic/Android use — and os.name calls bionic "Linux", so
-  ;; the offset cannot come from the platform name. getaddrinfo is asked without
-  ;; AI_CANONNAME, so the NULL slot is ai_canonname and the other is ai_addr.
-  (ok= 32 (pick-ai-addr-offset 0 0x7f0000001000)
-       "ai_addr probe: NULL at 24 means the BSD order (bionic, macOS)")
-  (ok= 24 (pick-ai-addr-offset 0x7f0000001000 0)
-       "ai_addr probe: NULL at 32 means the glibc order")
-  ;; Inconclusive nodes fall back to what os.name implies, i.e. the pre-#979
-  ;; behaviour — never to a guess that could hand connect() a NULL sockaddr.
-  (ok= ai-addr-fallback (pick-ai-addr-offset 0 0)
-       "ai_addr probe: both slots NULL falls back to the platform default")
-  (ok= ai-addr-fallback (pick-ai-addr-offset 0x7f0000001000 0x7f0000002000)
-       "ai_addr probe: both slots set falls back to the platform default")
+  ;; The struct addrinfo layout probe (#979) lives with the resolver now, in
+  ;; jolt.socket.native, and is tested there (test/chez/socket-test.clj).
 
   ;; --- connect failure reporting (#979) --------------------------------------
   ;; Exhausting the candidates used to be reported as "connection refused" no

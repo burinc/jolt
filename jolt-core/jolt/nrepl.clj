@@ -1,7 +1,7 @@
 (ns jolt.nrepl
   "A minimal, extensible nREPL server for jolt, so an editor (CIDER / Calva /
   Cursive) can connect and develop a project live. Speaks bencode over a loopback
-  TCP socket bound through jolt.ffi. Built in: clone, describe, eval, load-file,
+  TCP socket (jolt.socket.native). Built in: clone, describe, eval, load-file,
   close — enough to connect and eval, with the project's deps on the roots and
   native libs loaded (jolt.main applies the project first), so (require '[lib])
   works.
@@ -19,113 +19,37 @@
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
-            [jolt.winsock :as winsock]
+            [jolt.socket.native :as native]
             [jolt.analyzer :as ana]))
 
 ;; --- sockets (loopback server) ---------------------------------------------
-(def ^:private os-name
-  (str/lower-case (or (System/getProperty "os.name") "")))
-(def ^:private macos?   (str/includes? os-name "mac"))
-(def ^:private windows? (str/includes? os-name "win"))
+;; The calls, numbers and per-platform shapes are jolt.socket.native's.
 
-;; Load the library that provides the socket symbols BEFORE the foreign-fn
-;; bindings below — defcfn resolves the C entry point when the def is evaluated
-;; (at ns load), so the symbols must already be available. POSIX: the running
-;; process's own libc symbols. Windows: the Winsock DLL (ws2_32), whose symbols
-;; are NOT in jolt.exe's export table even though it's linked in — without this
-;; explicit load, (ffi/defcfn c-socket "socket" ...) fails at load with
-;; "no entry for socket".
-(if windows?
-  (ffi/load-library "ws2_32.dll")
-  (ffi/load-library))
+(defn- listen-socket
+  "A listening socket on 127.0.0.1:port, close-on-exec — without that every
+  subprocess an eval spawns holds a duplicate, and the port stays bound for as
+  long as any of them lives (seen with a server's Prolog sessions holding
+  7888) — and non-blocking, so the accept loop waits in poll slices and a stop
+  never has to close the fd under an accept() (see start). Throws on failure,
+  closing the fd."
+  [port]
+  (let [fd (native/new-socket native/af-inet)
+        fail (fn [what e]
+               (native/c-close fd)
+               (throw (ex-info (str what " failed on port " port ": " (native/error-message e))
+                               {:port port :errno e})))]
+    (native/set-listener-reuse! fd)
+    (let [[sa len] (native/make-sockaddr native/af-inet "127.0.0.1" port)]
+      (try
+        (let [[r e] (native/c-bind fd sa len)] (when (neg? r) (fail "bind()" e)))
+        (finally (ffi/free sa))))
+    (let [[r e] (native/c-listen fd 16)] (when (neg? r) (fail "listen()" e)))
+    (let [[r e] (native/set-blocking! fd false)] (when (neg? r) (fail "set non-blocking" e)))
+    fd))
 
-;; A socket is an int fd on POSIX; on Win64 it's a SOCKET (uintptr_t) handle, but
-;; those are small kernel handle values that round-trip through :int, and the
-;; INVALID_SOCKET error sentinel (~0) reads back as -1 — so the fd checks below
-;; work unchanged on both.
-(ffi/defcfn c-socket     "socket"     [:int :int :int] :int)
-(ffi/defcfn c-bind       "bind"       [:int :pointer :int] :int)
-(ffi/defcfn c-listen     "listen"     [:int :int] :int)
-(ffi/defcfn c-setsockopt "setsockopt" [:int :int :int :pointer :int] :int)
-(ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
-
-;; recv/send and the socket-close call differ by platform. Winsock's recv/send
-;; take an int length and return int (not ssize_t), and a socket is closed with
-;; closesocket, not close. A symbol that exists on only one OS (closesocket on
-;; Windows, close on POSIX) can only be bound there, so these live in the taken
-;; platform branch — jolt interns the vars from both branches at analysis time,
-;; so later references resolve either way.
-(if windows?
-  (do
-    (ffi/defcfn c-recv  "recv"        [:int :pointer :int :int] :int :blocking)
-    (ffi/defcfn c-send  "send"        [:int :pointer :int :int] :int :blocking)
-    (ffi/defcfn c-close "closesocket" [:int] :int))
-  (do
-    (ffi/defcfn c-recv  "recv"  [:int :pointer :size_t :int] :ssize_t :blocking)
-    (ffi/defcfn c-send  "send"  [:int :pointer :size_t :int] :ssize_t :blocking)
-    (ffi/defcfn c-close "close" [:int] :int)
-    ;; fcntl is variadic (int fd, int cmd, ...). The :varargs marker sits at the
-    ;; fixed/variadic boundary; a fixed-arity binding silently corrupts the
-    ;; stack-passed argument on Apple arm64. POSIX only — Windows controls
-    ;; inheritance with HANDLE_FLAG_INHERIT, not FD_CLOEXEC.
-    (ffi/defcfn c-fcntl     "fcntl" [:int :int :varargs :int] :int)))
-
-(def ^:private AF-INET 2)
-(def ^:private SOCK-STREAM 1)
-;; Linux can ask socket(2) for close-on-exec directly; macOS and Windows cannot.
-(def ^:private sock-cloexec (if (or macos? windows?) 0 0x80000))
-;; SOL_SOCKET / SO_REUSEADDR: 0xffff / 4 on macOS and Windows, 1 / 2 on Linux.
-(def ^:private sol-socket (if (or macos? windows?) 0xffff 1))
-(def ^:private so-reuse   (if (or macos? windows?) 4 2))
-
-(defn- make-sockaddr [port]
-  ;; ffi/alloc zeroes the block, so the padding and the bytes below are already 0.
-  (let [sa (ffi/alloc 16)]
-    (if macos?
-      (do (ffi/write sa :uint8 16) (ffi/write sa :uint8 AF-INET 1))
-      (ffi/write sa :uint8 AF-INET))
-    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)
-    (ffi/write sa :uint8 (bit-and port 0xff) 3)
-    (ffi/write sa :uint8 127 4) (ffi/write sa :uint8 1 7)   ; 127.0.0.1
-    sa))
-
-(defn- close-on-exec!
-  "Mark the listen fd so a child process does not inherit it.
-
-  Without this every subprocess spawned from a process running an nREPL holds a
-  duplicate of the listening socket, and the port stays bound for as long as any
-  of them lives. Seen directly: a veriframe server with four Prolog sessions
-  showed `jolt` and four `swipl` all holding 127.0.0.1:7888 on fd 10, so killing
-  the server left the port bound by engine subprocesses and the next start could
-  not bind its nREPL.
-
-  Best effort, and POSIX only: failing to set it costs inheritance, not
-  correctness, and Windows has no FD_CLOEXEC (it uses HANDLE_FLAG_INHERIT).
-  F_SETFD is 2 and FD_CLOEXEC is 1 on both macOS and Linux."
-  [fd]
-  (when-not windows?
-    (try (c-fcntl fd 2 1) (catch Throwable _ nil)))
-  fd)
-
-(defn- listen-socket [port]
-  ;; Winsock, once per process, before the first socket call — shared with
-  ;; jolt.socket and jolt.mvn-http rather than carried here, which is what this
-  ;; used to be (jolt-lang/jolt#1107). A no-op off Windows.
-  (winsock/ensure!)
-  ;; SOCK_CLOEXEC where the platform has it, so the fd is never briefly
-  ;; inheritable between socket() and fcntl(). Linux only; macOS relies on the
-  ;; fcntl below, and Windows on neither.
-  (let [fd (c-socket AF-INET (bit-or SOCK-STREAM sock-cloexec) 0)]
-    (when (neg? fd) (throw (ex-info "socket() failed" {})))
-    ;; not on Windows: there SO_REUSEADDR lets a second listener take a busy port
-    ;; (jolt.socket's new-fd! says more)
-    (when-not windows?
-      (let [opt (ffi/alloc 4)] (ffi/write opt :int 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt)))
-    (let [sa (make-sockaddr port)]
-      (when (neg? (c-bind fd sa 16)) (c-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
-      (ffi/free sa))
-    (when (neg? (c-listen fd 16)) (c-close fd) (throw (ex-info "listen() failed" {})))
-    (close-on-exec! fd)))
+(def ^:private accept-poll-ms
+  "The longest the accept loop waits before it looks at the stop flag again."
+  100)
 
 ;; bytes flow as latin1 strings on the wire (1 char = 1 byte). Text fields that
 ;; may carry unicode (code / value / out) convert at the boundary.
@@ -135,14 +59,14 @@
 (def ^:private bufsize 65536)
 (defn- recv-str [fd]
   (let [buf (ffi/alloc bufsize)]
-    (try (let [n (c-recv fd buf bufsize 0)]
+    (try (let [[n _] (native/c-recv fd buf bufsize 0)]
            (when (pos? n) (String. (ffi/read-array buf n) "ISO-8859-1")))
          (finally (ffi/free buf)))))
 
 (defn- send-str [fd s]
   (let [data (byte-array (map int s)) n (alength data) buf (ffi/alloc (max 1 n))]
     (try (ffi/write-array buf data)
-         (loop [off 0] (when (< off n) (let [sent (c-send fd (+ buf off) (- n off) 0)]
+         (loop [off 0] (when (< off n) (let [[sent _] (native/c-send fd (+ buf off) (- n off) native/msg-nosignal)]
                                          (when (pos? sent) (recur (+ off sent))))))
          (finally (ffi/free buf)))))
 
@@ -420,7 +344,7 @@
     (loop [buf ""]
       (let [chunk (recv-str fd)]
         (if (nil? chunk)
-          (c-close fd)
+          (native/c-close fd)
           (let [rest-buf (loop [b (str buf chunk)]
                            (let [r (bdecode b 0)]
                              (if (nil? r) b
@@ -465,27 +389,55 @@
       ;; Plain threads, not futures: the server is not on the agent pool, so an
       ;; eval'd (shutdown-agents) — the usual last form of a -main — must not
       ;; leave the next accept unable to start its connection.
-      (.start
-       (Thread.
-        (bound-fn []
-          ;; A stop closes fd, which makes the blocking accept() return an error;
-          ;; the @stopped check then breaks the loop instead of spinning on the
-          ;; dead fd.
-          (loop []
-            (let [conn (c-accept fd ffi/null ffi/null)]
-              (when-not @stopped
-                (when (>= conn 0)
-                  (.start
-                   (Thread.
-                    (bound-fn []
-                      (try (handle-conn conn handler)
-                           (catch :default e (println "nrepl conn error:" (err-msg e)) (c-close conn)))))))
-                (recur)))))))
+      ;;
+      ;; The listen fd is non-blocking and the loop waits in poll slices, looking
+      ;; at `stopped` between them. A stop used to close the fd under a blocked
+      ;; accept(): Linux does not wake an accept for that, so the thread stayed
+      ;; in it holding a freed fd NUMBER, and the next socket the process opened
+      ;; could be accepted on. The loop leaves within a slice instead, and stop
+      ;; closes the fd once it has.
+      (let [acceptor
+            (Thread.
+             (bound-fn []
+               ;; the loop owns the fd: it closes it on the way out, so the
+               ;; number is never freed while an accept() may still use it,
+               ;; and a loop that dies (Thread. failing, say) frees the port
+               (try
+                 (loop []
+                   (when-not @stopped
+                     (let [[conn e] (native/c-accept fd ffi/null ffi/null)]
+                       (cond
+                         (>= conn 0)
+                         (do
+                           ;; macOS and Windows hand the listener's non-blocking
+                           ;; mode down; the connection is read blocking
+                           (native/set-blocking! conn true)
+                           (native/guard-accepted! conn)
+                           (.start
+                            (Thread.
+                             (bound-fn []
+                               (try (handle-conn conn handler)
+                                    (catch :default e
+                                      (println "nrepl conn error:" (err-msg e))
+                                      (native/c-close conn)))))))
+                         (native/eagain? e)
+                         ;; a failing poll answers at once; wait the slice anyway
+                         (when (neg? (native/poll-one fd native/pollin accept-poll-ms))
+                           (Thread/sleep accept-poll-ms))
+                         (native/eintr? e) nil
+                         ;; anything else (EMFILE, say) persists until something is
+                         ;; released; do not spin on it
+                         :else (Thread/sleep accept-poll-ms))
+                       (recur))))
+               (finally (native/c-close fd)))))]
+        (.start acceptor)
       (fn stop []
         (when (compare-and-set! stopped false true)
-          (c-close fd)
-          ;; delete-file!, not the raw Chez delete-file this used to call: that
-          ;; one RAISES when the file is already gone, so a stop after someone
-          ;; cleaned the port file up threw out of the shutdown path.
-          (jolt.host/delete-file! ".nrepl-port"))
-        nil))))
+          ;; the loop closes the fd as it leaves, within a slice; the join is
+          ;; what makes the port free when stop returns
+          (try (.join acceptor (* 20 accept-poll-ms))
+               ;; delete-file!, not the raw Chez delete-file this used to call:
+               ;; that one RAISES when the file is already gone, so a stop after
+               ;; someone cleaned the port file up threw out of the shutdown path.
+               (finally (jolt.host/delete-file! ".nrepl-port"))))
+        nil)))))

@@ -1967,14 +1967,9 @@ check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a 
 # checked it, and the failure surfaces much later as a port that outlived its
 # server, which nobody attributes to the right change.
 #
-# Asks the descriptor itself — fcntl(F_GETFD) & FD_CLOEXEC — on an ephemeral
-# port, so no subprocess and no fixed port number are involved. It asserts the
-# PROPERTY, not one mechanism: macOS reaches it through the fcntl in
-# close-on-exec! (verified: removing that call turns this red here), Linux
-# through SOCK_CLOEXEC on socket() as well, so each platform checks the path it
-# actually relies on. POSIX only — Windows has no FD_CLOEXEC (it controls
-# inheritance with HANDLE_FLAG_INHERIT), so there this asserts nothing rather
-# than asserting the wrong thing.
+# Asks the descriptor itself, on an ephemeral port, so no subprocess and no fixed
+# port number are involved: native/close-on-exec? reads FD_CLOEXEC on POSIX and
+# HANDLE_FLAG_INHERIT on Windows.
 # nREPL eval streams *out* as it is flushed (#1153): the eval itself sees the
 # chunk its first println sent before it returns, and the built-in op sends
 # each flush as its own `out` ahead of the value. A trailing print that never
@@ -1983,7 +1978,12 @@ check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a 
 check '(do (require (quote jolt.nrepl)) (def seen (atom [])) (let [r (jolt.nrepl/evaluate "(println :a) (let [n (count @user/seen)] (println :b) n)" "user" {:out #(swap! seen conj %)})] [(:value r) (:out r) @seen]))' '["1" "" [":a\n" ":b\n"]]'
 check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(print \"a\") (println \"b\") (print \"c\") :v" :reply #(swap! sent conj %)}) (mapv #(or (get % "out") (get % "value")) @sent)))' '["ab\n" "c" ":v"]'
 check '(do (require (quote jolt.nrepl)) (:out (jolt.nrepl/evaluate "(println 1) 2" "user")))' '"1\n"'
-check '(do (require (quote jolt.nrepl)) (if @(var jolt.nrepl/windows?) :close-on-exec (let [fd ((var jolt.nrepl/listen-socket) 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
+check '(do (require (quote jolt.nrepl) (quote [jolt.socket.native :as n])) (let [fd ((var jolt.nrepl/listen-socket) 0) c (n/close-on-exec? fd)] (n/c-close fd) (if c :close-on-exec :inheritable)))' ':close-on-exec'
+# The server end to end: an eval over TCP, then stop, then a second server on the
+# SAME port. stop used to close the listen fd under a blocked accept(), which on
+# Linux leaves the thread in accept() on a freed number; now it waits for the
+# accept loop to leave, and the restart is what proves the port came back.
+check '(do (require (quote jolt.nrepl)) (let [port (let [ss (java.net.ServerSocket. 0)] (try (.getLocalPort ss) (finally (.close ss)))) round (fn [] (let [stop (with-out-str (def st (jolt.nrepl/start port))) s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) msg "d4:code7:(+ 1 2)2:op4:evale" buf (byte-array 4096)] (.write out (.getBytes msg "ISO-8859-1")) (Thread/sleep 300) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) (boolean (re-find #"5:value1:3" r)))))] [(round) (round)]))' '[true true]'
 
 # jolt.ffi/load-library's per-OS map form — documented since the FFI docs
 # existed, implemented only in 0.7.10 (it rendered the map to a string and
