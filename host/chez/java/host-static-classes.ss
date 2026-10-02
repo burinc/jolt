@@ -963,6 +963,14 @@
 (register-jutil-coll! "hashmap" 'map hm-entries)
 (register-jutil-coll! "properties" 'map hm-entries)
 (register-jutil-coll! "hashset" 'set hs->list)
+;; Collection.toArray on the TreeSet / TreeMap views (java/tree-map.ss), which
+;; are shared with targets that have no Java arrays.
+(for-each (lambda (tag)
+            (register-host-methods! tag
+              (list (cons "toArray" (case-lambda
+                                      ((self) (jcoll-to-array (tm-elems self) '()))
+                                      ((self a) (jcoll-to-array (tm-elems self) (list a))))))))
+          '("treeset" "treemap-keyset" "treemap-values" "treemap-entryset"))
 (register-get-arm! hm-hashmap?
                    (lambda (coll k d) (hashtable-ref (hm-tbl coll) k d)))
 ;; count / contains? over the mutable map shim (clojure.core/count + contains?,

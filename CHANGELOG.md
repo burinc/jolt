@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`java.util.TreeMap` and `java.util.TreeSet`.** `(java.util.TreeMap. {...})`
+  was "No matching ctor". Both are mutable now, ordered by natural ordering, a
+  Clojure fn, a reified `java.util.Comparator` or `Comparator/reverseOrder`,
+  with the full NavigableMap / NavigableSet surface: put/get/remove and the
+  compute/merge family, first/last/poll, floor/ceiling/lower/higher, and
+  headMap/tailMap/subMap, descendingMap and the key sets as live views, so a
+  write through a view lands in the map and a put outside its range is
+  IllegalArgumentException. A nil key under natural ordering is
+  NullPointerException and keys that do not compare (a keyword and a string,
+  a Long and a Double) are ClassCastException, as on the JVM. The tree is
+  clojure.core's own sorted map held in a mutable root, so a copy or `clone`
+  is O(1). `Comparator/reverseOrder`, `Comparator/naturalOrder` and
+  `Collections/reverseOrder` are new too, and all of it runs on the Gambit
+  target as well.
+
+  ```clojure
+  (let [m (java.util.TreeMap. {:c 3 :a 1 :b 2})
+        h (.headMap m :c)]
+    (.put h :aa 0)
+    [(str m) (.floorKey m :bb) (try (.put h :z 9) (catch IllegalArgumentException _ :out))])
+  ;; => ["{:a=1, :aa=0, :b=2, :c=3}" :b :out]
+  ```
+
 - **A readiness poller on Windows.** jolt.io-poller has a WSAPoll backend, so
   sockets on Windows are non-blocking and wait on it the way they wait on
   kqueue and epoll elsewhere: a fiber reading a socket parks instead of holding

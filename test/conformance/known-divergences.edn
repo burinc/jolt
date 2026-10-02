@@ -90,6 +90,17 @@
   ;; ctor would mint objects of the old layout answering the new methods. Keeping
   ;; the whole old definition alive per call site needs a descriptor-versioned
   ;; method table — out of scope for a REPL-redefinition detail.
+  ;; A TreeMap's entries (seq, entrySet, firstEntry, …) are clojure.lang.MapEntry
+  ;; values, the same entries the HashMap shim hands out. key / val / .getKey /
+  ;; destructuring agree with the JVM's TreeMap$Entry; its class, its toString
+  ;; (k=v) and setValue writing through to the map do not.
+  {:category :host-model
+   :behavior "the entries a java.util.TreeMap hands out"
+   :jvm "java.util.TreeMap$Entry, printing as k=v, setValue writes through"
+   :jolt "clojure.lang.MapEntry, printing as [k v], immutable"
+   :check {:expr "[(.getName (class (first (java.util.TreeMap. {:a 1})))) (str (first (java.util.TreeMap. {:a 1})))]"
+           :jvm "[\"java.util.TreeMap$Entry\" \":a=1\"]"
+           :jolt "[\"clojure.lang.MapEntry\" \"[:a 1]\"]"}}
   {:category :host-model
    :behavior "(T. …) that ran before T is redefined"
    :jvm "keeps constructing the class it first linked against (the old definition); a site first run after the redefinition links the new one"

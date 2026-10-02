@@ -91,6 +91,7 @@
 (##include "../chez/java/string-builder.ss")
 (##include "../chez/java/dot-forms.ss")
 (##include "../chez/java/jutil-colls.ss")
+(##include "../chez/java/tree-map.ss")
 
 ;; ---- G3: the cross-minted compiler on gsi (jolt-mj95.4) ----------------------
 ;;

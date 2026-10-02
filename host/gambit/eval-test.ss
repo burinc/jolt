@@ -198,6 +198,18 @@
 (check "[(str (class [])) (str Sequential) (pr-str Long)]"
        "[\"class clojure.lang.PersistentVector\" \"interface clojure.lang.Sequential\" \"java.lang.Long\"]")
 
+;; java/tree-map.ss + java/jutil-colls.ss (shared with Chez): a TreeMap over
+;; clojure.core's sorted map, its live views, TreeSet, the Comparator statics,
+;; and the java.util.Map seam (=, pr, str, reduce-kv). Values from the Chez build.
+(check "(let [m (java.util.TreeMap. {:c 3 :a 1 :b 2})] [(vec (keys m)) (str m) (pr-str m) (.firstKey m) (.floorKey m :bb) (vec (keys (.headMap m :b true)))])"
+       "[[:a :b :c] \"{:a=1, :b=2, :c=3}\" \"{:a 1, :b 2, :c 3}\" :a :b [:a :b]]")
+(check "(let [m (java.util.TreeMap. >) d (.descendingMap m)] (.put m 1 :a) (.put d 3 :c) [(vec (keys m)) (vec (keys d)) (count m) (get m 3) (try (.put (.headMap m 2) 0 :x) (catch IllegalArgumentException e :iae))])"
+       "[[3 1] [1 3] 2 :c :iae]")
+(check "(let [s (java.util.TreeSet. (java.util.Comparator/reverseOrder))] (.addAll s [1 3 2]) [(vec s) (.first s) (vec (.headSet s 2)) (= s #{1 2 3}) (str s)])"
+       "[[3 2 1] 3 [3] true \"[3, 2, 1]\"]")
+(check "[(try (.put (java.util.TreeMap.) nil 1) (catch NullPointerException e :npe)) (try (let [m (java.util.TreeMap.)] (.put m :a 1) (.put m \"b\" 2)) (catch ClassCastException e :cce)) (= (java.util.TreeMap. {:a 1}) {:a 1}) (reduce-kv (fn [a k v] (conj a k v)) [] (java.util.TreeMap. {2 :b 1 :a}))]"
+       "[:npe :cce true [1 :a 2 :b]]")
+
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")
 (let ((scm (jolt-analyze-emit-form
