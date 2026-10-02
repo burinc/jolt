@@ -1,12 +1,13 @@
-;; clojure.math — host shim over native flonum math.
+;; clojure.math and java.lang.Math — one implementation for both, over the
+;; host's numeric procedures. Portable: R7RS arithmetic plus jolt's own runtime
+;; names, so the Chez and Gambit hosts include the same file.
 ;;
 ;; clojure.math is registered as native bindings, NOT a .clj file — so there's no
-;; source tier to emit. The def-var! shims here back each clojure.math fn over
-;; Chez's native procedures. The analyzer knows the clojure.math ns exists, so a
-;; ref like clojure.math/sqrt lowers to a var-deref; these cells back it at
-;; runtime.
+;; source tier to emit. The def-var! shims here back each clojure.math fn. The
+;; analyzer knows the clojure.math ns exists, so a ref like clojure.math/sqrt
+;; lowers to a var-deref; these cells back it at runtime.
 ;;
-;; jolt is all-flonum, so every result is a flonum (inputs arrive as flonums; Chez
+;; Every clojure.math result is a double (inputs arrive as flonums; the host's
 ;; sqrt/sin/expt/... return flonums for flonum args). Semantics match
 ;; Clojure 1.11 clojure.math: round = floor(x+0.5), rint = round-half-even,
 ;; floor/ceil/floor-div return doubles, to-degrees/to-radians via PI.
@@ -14,7 +15,7 @@
 ;; clojure.math's PI/E are java.lang.Math's, which the JDK defines as compile-time
 ;; double literals — not the host libm's atan(1)/exp(1). Pinned as literals so a
 ;; host whose libm rounds exp(1) one ulp high (bionic's) still answers the JVM's
-;; value, the same reason host-static-methods.ss pins its copies.
+;; value. java.lang.Math's PI and E below are these.
 (define jolt-math-pi 3.141592653589793)
 (define jolt-math-e 2.718281828459045)
 
@@ -43,7 +44,6 @@
          (cond ((> r jolt-math-long-max) jolt-math-long-max)
                ((< r jolt-math-long-min) jolt-math-long-min)
                (else (exact r))))))))
-(define (jolt-math-signum x) (cond ((< x 0.0) -1.0) ((> x 0.0) 1.0) (else 0.0)))
 (define (jolt-math-to-degrees r) (/ (* r 180.0) jolt-math-pi))
 (define (jolt-math-to-radians d) (/ (* d jolt-math-pi) 180.0))
 ;; java.lang.Math.hypot — scale by a power of 2 (exact) so a^2+b^2 can't overflow
@@ -103,6 +103,147 @@
 (define (jolt-math-floor-mod a b)
   (let ((a (exact (truncate a))) (b (exact (truncate b)))) (- a (* b (floor (/ a b))))))
 
+;; --- IEEE 754 bit-level ops ---------------------------------------------------
+;; The JDK defines copySign/nextUp/nextDown/nextAfter/ulp/getExponent on the raw
+;; bit pattern, so -0.0 keeps its sign and a step is exactly one representable
+;; double. The pattern is computed here in exact arithmetic, R7RS only, so this
+;; file is the same on every host: an unsigned 64-bit integer, sign bit on top,
+;; 11 exponent bits, 52 mantissa bits. For a negative double a larger pattern is
+;; a larger magnitude. A NaN reads as the JVM's canonical one (sign clear): the
+;; sign of a NaN is not observable without a host bit cast.
+(define dbl-sign-bit (expt 2 63))
+(define dbl-mant-unit (expt 2 52))
+(define dbl-min-value 4.9406564584124654e-324)
+(define (dbl-negative? x) (or (< x 0.0) (eqv? x -0.0)))
+;; e with 2^e <= m < 2^(e+1), for an exact positive rational m
+(define (dbl-binary-exponent m)
+  (let loop ((e (exact (floor (log (inexact m) 2)))))
+    (cond ((> (expt 2 e) m) (loop (- e 1)))
+          ((<= (expt 2 (+ e 1)) m) (loop (+ e 1)))
+          (else e))))
+(define (dbl->bits x)
+  (let ((x (exact->inexact x)))
+    (+ (if (dbl-negative? x) dbl-sign-bit 0)
+       (cond ((nan? x) (+ (* 2047 dbl-mant-unit) (expt 2 51)))
+             ((infinite? x) (* 2047 dbl-mant-unit))
+             ((= x 0.0) 0)
+             (else
+              (let* ((m (exact (abs x))) (e (dbl-binary-exponent m)))
+                (if (>= e -1022)
+                    (+ (* (+ e 1023) dbl-mant-unit) (- (* m (expt 2 (- 52 e))) dbl-mant-unit))
+                    (* m (expt 2 1074)))))))))          ; subnormal
+(define (bits->dbl b)
+  (let* ((r (modulo b dbl-sign-bit))
+         (field (quotient r dbl-mant-unit))
+         (mant (remainder r dbl-mant-unit))
+         (mag (cond ((= field 2047) (if (= mant 0) +inf.0 +nan.0))
+                    ((= field 0) (exact->inexact (* mant (expt 2 -1074))))
+                    (else (exact->inexact (* (+ dbl-mant-unit mant) (expt 2 (- field 1075))))))))
+    (if (>= b dbl-sign-bit) (- mag) mag)))
+
+(define (jolt-math-copy-sign m s)
+  (let* ((m (exact->inexact (jolt-need-num m)))
+         (a (if (dbl-negative? m) (- m) m)))
+    (if (dbl-negative? (exact->inexact (jolt-need-num s))) (- a) a)))
+
+;; Math.signum: NaN and both zeros come back as themselves
+(define (jolt-math-signum x)
+  (let ((x (exact->inexact (jolt-need-num x))))
+    (cond ((nan? x) x) ((> x 0.0) 1.0) ((< x 0.0) -1.0) (else x))))
+
+;; one representable double up / down; d+0.0 folds -0.0 into 0.0 first, as the
+;; JDK does, so both zeros step to the same neighbour
+(define (jolt-math-next-up x)
+  (let ((d (+ (exact->inexact (jolt-need-num x)) 0.0)))
+    (cond ((or (nan? d) (= d +inf.0)) d)
+          ((= d 0.0) dbl-min-value)
+          (else (bits->dbl (if (> d 0.0) (+ (dbl->bits d) 1) (- (dbl->bits d) 1)))))))
+(define (jolt-math-next-down x)
+  (let ((d (+ (exact->inexact (jolt-need-num x)) 0.0)))
+    (cond ((or (nan? d) (= d -inf.0)) d)
+          ((= d 0.0) (- dbl-min-value))
+          (else (bits->dbl (if (> d 0.0) (- (dbl->bits d) 1) (+ (dbl->bits d) 1)))))))
+(define (jolt-math-next-after start direction)
+  (let ((s (exact->inexact (jolt-need-num start)))
+        (d (exact->inexact (jolt-need-num direction))))
+    (cond ((> s d) (jolt-math-next-down s))
+          ((< s d) (jolt-math-next-up s))
+          ((= s d) d)
+          (else (+ s d)))))                        ; a NaN
+
+;; Math.getExponent: the unbiased exponent field; 1024 for Inf/NaN, -1023 for
+;; zero and subnormals
+(define (jolt-math-get-exponent x)
+  (- (quotient (modulo (dbl->bits (jolt-need-num x)) dbl-sign-bit) dbl-mant-unit) 1023))
+
+;; Math.ulp: the gap to the next double away from zero
+(define (jolt-math-ulp x)
+  (let* ((d (exact->inexact (jolt-need-num x))) (e (jolt-math-get-exponent d)))
+    (cond ((= e 1024) (abs d))                     ; Inf -> Inf, NaN -> NaN
+          ((= e -1023) dbl-min-value)              ; zero, subnormal
+          (else (exact->inexact (expt 2 (- e 52)))))))
+
+;; Math.scalb: d * 2^n rounded once, in exact arithmetic so a result that lands
+;; among the subnormals rounds as the JDK's does. n is clamped first: past
+;; +/-2200 every finite non-zero d has already overflowed or underflowed.
+(define (jolt-math-scalb x n)
+  (let ((d (exact->inexact (jolt-need-num x)))
+        (n (max -2200 (min 2200 (exact (truncate (jolt-need-num n)))))))
+    (if (or (nan? d) (infinite? d) (= d 0.0))
+        d
+        (let ((r (exact->inexact (* (exact d) (expt 2 n)))))
+          (if (= r 0.0) (jolt-math-copy-sign 0.0 d) r)))))
+
+;; Math.IEEEremainder: x - y*n with n = x/y rounded half-even, exactly. A zero
+;; result takes x's sign.
+(define (jolt-math-ieee-remainder x y)
+  (let ((x (exact->inexact (jolt-need-num x))) (y (exact->inexact (jolt-need-num y))))
+    (cond ((or (nan? x) (nan? y) (infinite? x) (= y 0.0)) +nan.0)
+          ((infinite? y) x)
+          (else
+           (let* ((ex (exact x)) (ey (exact y))
+                  (r (exact->inexact (- ex (* ey (round (/ ex ey)))))))
+             (if (= r 0.0) (jolt-math-copy-sign 0.0 x) r))))))
+
+;; Math.max / Math.min: a double argument makes it the double overload, where NaN
+;; wins and -0.0 is below 0.0; two integers compare as longs. Two distinct
+;; ordered doubles take one compare; the zero and NaN rules only run on a tie or
+;; an unordered pair.
+(define (jolt-math-max a b)
+  (if (and (flonum? a) (flonum? b))
+      (cond ((fl> a b) a)
+            ((fl< a b) b)
+            ((fl= a b) (if (dbl-negative? a) b a))        ; equal: only ±0.0 differ
+            ((nan? a) a)
+            (else b))
+      (if (or (flonum? a) (flonum? b))
+          (jolt-math-max (exact->inexact a) (exact->inexact b))
+          (if (> a b) a b))))
+(define (jolt-math-min a b)
+  (if (and (flonum? a) (flonum? b))
+      (cond ((fl< a b) a)
+            ((fl> a b) b)
+            ((fl= a b) (if (dbl-negative? a) a b))
+            ((nan? a) a)
+            (else b))
+      (if (or (flonum? a) (flonum? b))
+          (jolt-math-min (exact->inexact a) (exact->inexact b))
+          (if (< a b) a b))))
+
+;; Math.addExact and kin over longs: the exact result, or ArithmeticException
+;; "long overflow" when it leaves the long range
+(define (jolt-math-long-exact r)
+  (if (and (>= r -9223372036854775808) (<= r 9223372036854775807))
+      r
+      (throw-jvm 'ArithmeticException "long overflow")))
+(define (exact-long x) (exact (truncate (jolt-need-num x))))
+(define (jolt-math-add-exact a b) (jolt-math-long-exact (+ (exact-long a) (exact-long b))))
+(define (jolt-math-subtract-exact a b) (jolt-math-long-exact (- (exact-long a) (exact-long b))))
+(define (jolt-math-multiply-exact a b) (jolt-math-long-exact (* (exact-long a) (exact-long b))))
+(define (jolt-math-increment-exact a) (jolt-math-long-exact (+ (exact-long a) 1)))
+(define (jolt-math-decrement-exact a) (jolt-math-long-exact (- (exact-long a) 1)))
+(define (jolt-math-negate-exact a) (jolt-math-long-exact (- (exact-long a))))
+
 ;; clojure.math fns always return a DOUBLE; Chez's sqrt/expt/sin/floor/... return
 ;; EXACT for exact args ((sqrt 9) -> 3, (sin 0) -> 0), so coerce.
 (define (m1 f) (lambda (x) (exact->inexact (f (jolt-need-num x)))))
@@ -149,3 +290,142 @@
 (def-var! "clojure.math" "floor-mod" jolt-math-floor-mod)
 (def-var! "clojure.math" "E" jolt-math-e)
 (def-var! "clojure.math" "PI" jolt-math-pi)
+(def-var! "clojure.math" "IEEE-remainder" jolt-math-ieee-remainder)
+(def-var! "clojure.math" "copy-sign" jolt-math-copy-sign)
+(def-var! "clojure.math" "get-exponent" jolt-math-get-exponent)
+(def-var! "clojure.math" "next-after" jolt-math-next-after)
+(def-var! "clojure.math" "next-up" jolt-math-next-up)
+(def-var! "clojure.math" "next-down" jolt-math-next-down)
+(def-var! "clojure.math" "ulp" jolt-math-ulp)
+(def-var! "clojure.math" "scalb" jolt-math-scalb)
+(def-var! "clojure.math" "random" (lambda () (jolt-random 1.0)))
+(def-var! "clojure.math" "add-exact" jolt-math-add-exact)
+(def-var! "clojure.math" "subtract-exact" jolt-math-subtract-exact)
+(def-var! "clojure.math" "multiply-exact" jolt-math-multiply-exact)
+(def-var! "clojure.math" "increment-exact" jolt-math-increment-exact)
+(def-var! "clojure.math" "decrement-exact" jolt-math-decrement-exact)
+(def-var! "clojure.math" "negate-exact" jolt-math-negate-exact)
+
+;; ---- java.lang.Math -------------------------------------------------------
+;; java.lang.Math: sqrt/pow/floor/ceil/trig/log/exp always return a DOUBLE on the
+;; JVM (Chez's sqrt/expt return EXACT for exact args, e.g. (sqrt 9) -> 3), so coerce
+;; to flonum. round -> long (exact); abs/max/min preserve the argument's type.
+(define (->dbl x) (exact->inexact (jolt-need-num x)))
+;; Every Math method takes numbers (PI/E are values, not methods), and each one
+;; hands its argument to a host numeric primitive. Check at the boundary: the
+;; condition Chez raises for a wrong-typed operand carries no class, so it would
+;; escape as #object[:object] with no catch clause able to select it. The hot path
+;; does not come through here — a Math call over proven flonums lowers to a native
+;; Chez flonum op (jolt.passes.numeric).
+(define (math-checked entry)
+  (let ((f (cdr entry)))
+    (if (procedure? f)
+        (cons (car entry)
+              (host-arity-like f (lambda args (apply f (map jolt-need-num args)))))
+        entry)))
+(register-class-statics! "Math"
+  (map math-checked
+  (list (cons "sqrt" (lambda (x) (real-or-nan (sqrt x))))
+        ;; cbrt/log10 (and hypot/expm1/log1p below) share the clojure.math impls
+        ;; above so Math/x and clojure.math/x never diverge.
+        (cons "cbrt" (lambda (x) (jolt-math-cbrt (->dbl x))))
+        (cons "pow" (lambda (a b) (real-or-nan (expt a b))))
+        ;; hypot/expm1/log1p route to the numerically-stable clojure.math impls
+        ;; so Math/hypot doesn't overflow and expm1/log1p keep
+        ;; full precision near zero.
+        (cons "hypot" (lambda (a b) (jolt-math-hypot (->dbl a) (->dbl b))))
+        (cons "floor" (lambda (x) (->dbl (floor x))))
+        (cons "ceil" (lambda (x) (->dbl (ceiling x))))
+        (cons "round" (lambda (x) (jolt-math-round x)))     ; JVM Math.round -> long (NaN/Inf/saturate/half-up)
+        (cons "rint" (lambda (x) (->dbl (round x))))            ; round-half-even -> double
+        ;; Math.floorDiv/floorMod: integer floor division / modulus (long -> long).
+        (cons "floorDiv" (lambda (a b) (exact (floor (/ a b)))))
+        (cons "floorMod" (lambda (a b) (exact (- a (* b (floor (/ a b)))))))
+        (cons "abs" (lambda (x) (abs x)))
+        (cons "sin" (lambda (x) (->dbl (sin x)))) (cons "cos" (lambda (x) (->dbl (cos x))))
+        (cons "tan" (lambda (x) (->dbl (tan x)))) (cons "asin" (lambda (x) (real-or-nan (asin x))))
+        (cons "acos" (lambda (x) (real-or-nan (acos x)))) (cons "atan" (lambda (x) (->dbl (atan x))))
+        ;; Math.atan2(y, x) — Chez's 2-arg atan is (atan y x).
+        (cons "atan2" (lambda (y x) (->dbl (atan y x))))
+        (cons "sinh" (lambda (x) (->dbl (sinh x)))) (cons "cosh" (lambda (x) (->dbl (cosh x))))
+        (cons "tanh" (lambda (x) (->dbl (tanh x))))
+        (cons "log" (lambda (x) (real-or-nan (log x)))) (cons "log10" (lambda (x) (jolt-math-log10 (->dbl x))))
+        (cons "log1p" (lambda (x) (jolt-math-log1p (->dbl x))))
+        (cons "exp" (lambda (x) (->dbl (exp x))))
+        (cons "expm1" (lambda (x) (jolt-math-expm1 (->dbl x))))
+        (cons "toRadians" (lambda (d) (->dbl (/ (* d jolt-math-pi) 180.0))))
+        (cons "toDegrees" (lambda (r) (->dbl (/ (* r 180.0) jolt-math-pi))))
+        (cons "copySign" (lambda (m s) (jolt-math-copy-sign m s)))
+        ;; the IEEE 754 bit-level ops and the exact long arithmetic, shared with
+        ;; clojure.math; test.check's double generator uses
+        ;; getExponent and scalb
+        (cons "getExponent" (lambda (x) (jolt-math-get-exponent x)))
+        (cons "scalb" (lambda (x n) (jolt-math-scalb x n)))
+        (cons "nextUp" (lambda (x) (jolt-math-next-up x)))
+        (cons "nextDown" (lambda (x) (jolt-math-next-down x)))
+        (cons "nextAfter" (lambda (s d) (jolt-math-next-after s d)))
+        (cons "ulp" (lambda (x) (jolt-math-ulp x)))
+        (cons "IEEEremainder" (lambda (x y) (jolt-math-ieee-remainder x y)))
+        (cons "addExact" (lambda (a b) (jolt-math-add-exact a b)))
+        (cons "subtractExact" (lambda (a b) (jolt-math-subtract-exact a b)))
+        (cons "multiplyExact" (lambda (a b) (jolt-math-multiply-exact a b)))
+        (cons "incrementExact" (lambda (a) (jolt-math-increment-exact a)))
+        (cons "decrementExact" (lambda (a) (jolt-math-decrement-exact a)))
+        (cons "negateExact" (lambda (a) (jolt-math-negate-exact a)))
+        (cons "max" (lambda (a b) (jolt-math-max a b))) (cons "min" (lambda (a b) (jolt-math-min a b)))
+        (cons "signum" (lambda (x) (jolt-math-signum x)))
+        (cons "PI" jolt-math-pi) (cons "E" jolt-math-e)
+        (cons "random" (lambda args (jolt-random 1.0))))))
+
+;; ---- Double / Float bit casts -----------------------------------------------
+;; Over the bit patterns above, as the JVM's signed long/int. doubleToLongBits
+;; folds every NaN into the canonical 0x7ff8000000000000; the raw form would keep
+;; a NaN's payload, which no host here exposes, so the two agree.
+(define (unsigned->signed u width)
+  (if (>= u (expt 2 (- width 1))) (- u (expt 2 width)) u))
+(define (jolt-double->long-bits x)
+  (unsigned->signed (dbl->bits (jolt-need-num x)) 64))
+(define (jolt-long-bits->double n)
+  (bits->dbl (modulo (exact (jolt-need-num n)) (expt 2 64))))
+
+;; Float: the argument is cast like (float x) (RT.floatCast: past Float/MAX_VALUE,
+;; an infinity included, is IllegalArgumentException), rounded once to single
+;; precision (8 exponent bits, 23 mantissa bits, half-even), then encoded.
+(define (flt->bits x)
+  (let ((x (exact->inexact x)))
+    (+ (if (dbl-negative? x) (expt 2 31) 0)
+       (cond ((nan? x) #x7fc00000)
+             ((infinite? x) #x7f800000)
+             ((= x 0.0) 0)
+             (else
+              (let* ((m (exact (abs x))) (e (dbl-binary-exponent m)))
+                (if (>= e -126)
+                    (let* ((q (round (* m (expt 2 (- 23 e)))))   ; 2^23..2^24
+                           (e (if (= q (expt 2 24)) (+ e 1) e))
+                           (q (if (= q (expt 2 24)) (expt 2 23) q)))
+                      (if (> e 127)
+                          #x7f800000
+                          (+ (* (+ e 127) (expt 2 23)) (- q (expt 2 23)))))
+                    ;; subnormal; a round up to 2^23 is the smallest normal's
+                    ;; pattern, which the sum already spells
+                    (round (* m (expt 2 149))))))))))
+(define (bits->flt b)
+  (let* ((r (modulo b (expt 2 31)))
+         (field (quotient r (expt 2 23)))
+         (mant (remainder r (expt 2 23)))
+         (mag (cond ((= field 255) (if (= mant 0) +inf.0 +nan.0))
+                    ((= field 0) (exact->inexact (* mant (expt 2 -149))))
+                    (else (exact->inexact (* (+ (expt 2 23) mant) (expt 2 (- field 150))))))))
+    (if (>= b (expt 2 31)) (- mag) mag)))
+(define (jolt-float->int-bits x) (unsigned->signed (flt->bits (jolt-float x)) 32))
+(define (jolt-int-bits->float n)
+  (bits->flt (modulo (exact (jolt-need-num n)) (expt 2 32))))
+
+(register-class-statics! "Double"
+  (list (cons "doubleToLongBits" (lambda (x) (jolt-double->long-bits x)))
+        (cons "doubleToRawLongBits" (lambda (x) (jolt-double->long-bits x)))
+        (cons "longBitsToDouble" (lambda (n) (jolt-long-bits->double n)))))
+(register-class-statics! "Float"
+  (list (cons "floatToIntBits" (lambda (x) (jolt-float->int-bits x)))
+        (cons "floatToRawIntBits" (lambda (x) (jolt-float->int-bits x)))
+        (cons "intBitsToFloat" (lambda (n) (jolt-int-bits->float n)))))

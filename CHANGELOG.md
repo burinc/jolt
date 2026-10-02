@@ -32,6 +32,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ;; => ["{:a=1, :aa=0, :b=2, :c=3}" :b :out]
   ```
 
+- **Clojure 1.12.** `*clojure-version*` reports 1.12, and the 1.12 language
+  features jolt was missing are in: `Class/new` and `Class/.method` as values
+  (with `^[...]` param-tags picking the arity), array class symbols (`String/1`,
+  `long/2`) as values, hints and `instance?`/`resolve` targets, a
+  `^java.util.function.Predicate`-style hinted let binding adapting a fn to the
+  interface, `IDeref` types as `Supplier`s, and `java.util.stream` with
+  `stream-seq!`, `stream-reduce!`, `stream-transduce!` and `stream-into!`.
+  Collections answer `.stream`, and `forEach`/`removeIf`/`replaceAll`/`sort`
+  take fns. `partitionv`, `partitionv-all` (now with its transducer arity) and
+  `splitv-at` are the reference definitions. clojure.java.process,
+  clojure.java.basis, clojure.repl.deps and clojure.tools.deps.interop are not
+  ported.
+
+- **The rest of `clojure.math`.** `IEEE-remainder`, `copy-sign`,
+  `get-exponent`, `next-after`, `next-up`, `next-down`, `ulp`, `scalb`,
+  `random`, and the exact long arithmetic (`add-exact`, `subtract-exact`,
+  `multiply-exact`, `increment-exact`, `decrement-exact`, `negate-exact`, which
+  raise ArithmeticException "long overflow"), with the `java.lang.Math`
+  statics behind them (`Math/nextUp`, `Math/addExact`, …). All 45 vars
+  upstream defines are there now; 15 were missing. `java.lang.Math` and
+  `clojure.math` are one portable file, so the Gambit host has both too (it
+  had no `clojure.math` at all, and `Math` there was only `floor` and `abs`).
+
+- **`Double/doubleToLongBits`, `doubleToRawLongBits`, `longBitsToDouble` and
+  the `Float` int-bits trio.** `floatToIntBits` casts like `(float x)`, so a
+  value past `Float/MAX_VALUE` is IllegalArgumentException as on the JVM, and
+  `intBitsToFloat` answers the float's value as a double, since jolt has one
+  flonum type.
+
 - **A readiness poller on Windows.** jolt.io-poller has a WSAPoll backend, so
   sockets on Windows are non-blocking and wait on it the way they wait on
   kqueue and epoll elsewhere: a fiber reading a socket parks instead of holding
@@ -189,28 +218,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The java.util collection shims compare, hash and print like the JVM's.**
-  `(= (java.util.HashMap. {:a 1}) {:a 1})` was false from both sides, and the
-  same for HashSet against a set and ArrayList / LinkedList against a vector
-  or list; `pr-str` and `str` of every one of them was `#object[...]`; `hash`
-  and `.hashCode` disagreed or were missing; and `reduce-kv` refused a
-  HashMap. A Map, Set or List shim now equals the persistent collection with
-  the same contents, hashes as its `hashCode`, prints as a map, set or vector
-  with `pr` and as `{a=1}` / `[a, b]` with `str`, and a Map reduces with
-  `reduce-kv`. An ArrayDeque, which is not a List, still compares by identity.
+- **SCI's constructor reflection.** `Class.getConstructors` and
+  `getParameterTypes` answer typed arrays (`Constructor[]`, `Class[]`) instead
+  of vectors, which an `^objects` aget refused, and `Constructor.newInstance`
+  spreads an Object[] argument (nil is no arguments) the way the JVM does. With
+  `clojure.lang.Compiler/subsumes` added, `(Exception. "m")`, `@(delay 1)` and
+  `case` work through SCI's reflector. Reference arrays carry their component
+  class: `(into-array String ...)` is a `String[]`, an untyped `into-array` takes
+  the first element's class, and `make-array` builds every dimension.
+- `Class.isAssignableFrom` answered true for Object against a primitive class.
+- Hashing an infinite `iterate`, `cycle`, `repeat` or `(range)` hung; it throws
+  UnsupportedOperationException as on 1.12. `cycle` is a `clojure.lang.Cycle`.
+- `#(%a)` and other bad arg literals read as symbols instead of raising.
+- An ArityException past 20 arguments says `(> 20)`.
+- `Objects/deepEquals` was false for two typed reference arrays (a `String[]`
+  against another, or against an `Object[]`); `Arrays/deepEquals` was missing.
+- Stream `anyMatch`/`allMatch`/`noneMatch` realized the whole stream first, so
+  they never returned on an infinite one, and every stage ran a whole chunk
+  before the next saw it. A pipeline now pulls one element at a time. Added
+  `Collectors/groupingBy`, `toMap` and `partitioningBy`, `summaryStatistics` and
+  `mapMulti`; `Stream.toList` is an unmodifiable List rather than a vector.
+- `realized?` threw on `cycle`, `iterate` and `(range)`; they are IPending and
+  IReduce (with `.reduce`), as on the JVM.
+- A `^Predicate`/`^Function`-hinted local had none of the interface's default
+  methods (`negate`, `and`, `andThen`, `compose`, ...); any reify of the
+  interface now answers them. A non-fn under the hint is a ClassCastException
+  and a Predicate fn answering nil a NullPointerException, as on the JVM.
+- `.forEach` on a persistent map with a fn is the JVM's ambiguity error; a
+  BiConsumer or Consumer picks its overload.
+- `to-array-2d` returns an `Object[][]`. An unknown array component
+  (`NoSuch/1`) raises ClassNotFoundException.
+- `.hashCode` of a seq or list was its hasheq instead of `List.hashCode`, and
+  ArrayList/HashSet/HashMap had no `.equals`/`.hashCode`.
+- A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque
+  `#object` under `pr`, compared unequal to the Clojure collection with the same
+  elements, had the wrong `str`/`toString`, hashed (`hash`) differently from its
+  `.hashCode`, and `reduce-kv` refused a HashMap. One registry shared by both
+  hosts (`java/jutil-colls.ss`) answers all of these for every java.util shim.
+- `.hashCode` of a number was not Java's: a long outside int range answered
+  itself, a double its truncation (`(.hashCode 1.5)` was 1, not 1073217536)
+  and `##NaN` threw, so the List/Set/Map hashes built on them were wrong too.
+
+- **`Math/copySign`, `max`, `min` and `signum` follow the JVM on -0.0 and
+  NaN.**
 
   ```clojure
-  [(= (java.util.HashMap. {:a 1}) {:a 1}) (pr-str (java.util.ArrayList. ["a" nil]))
-   (str (java.util.HashMap. {:a nil}))]
-  ;; => [true "[\"a\" nil]" "{:a=null}"]
+  [(Math/copySign 2.0 -0.0) (Math/min -0.0 0.0) (Math/max ##NaN 1.0) (Math/signum -0.0)]
+  ;; before: [2.0 0.0 1.0 0.0]
+  ;; after:  [-2.0 -0.0 ##NaN -0.0]
   ```
 
-- **`.hashCode` of a number or a seq is the JVM's.** A Long outside int range
-  answered itself rather than `(int)(v ^ v>>>32)`, a double its truncation
-  (`(.hashCode 1.5)` was 1, not 1073217536), `##NaN` threw, and a list or lazy
-  seq answered its `hash` instead of the List hash (`(.hashCode '(1 2))` is
-  994). The Map, Set and List hashes are built from these, so they were wrong
-  for any collection holding such a value.
+  A mixed long/double `Math/max` returns a double, as the double overload does.
+
+- **A subnormal double prints as `Double.toString` does.** The JVM prints at
+  least two significant digits and picks the two nearest the value, so
+  `Double/MIN_VALUE` is `4.9E-324`; jolt padded the shortest digits and printed
+  `5.0E-324`, and `9.9E-324` as `1.0E-323`. Checked against the JVM over every
+  subnormal below 2000 ulps and 20,000 random ones. `format` starts from the
+  same digits, so `(format "%.2e" 4.9E-324)` is `"4.90e-324"`, and number
+  printing is one shared file for both hosts now.
 
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux
@@ -227,6 +293,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   place, as GHC treats its oldest generation near `-M` and HotSpot's full
   collections do. Under a 200MB ceiling with ~100MB held, the churn loop
   also runs 1.2x faster.
+
+- **A vector sliced just past a trie boundary can be conj'd onto.**
+  `(reduce conj (subvec (vec (range 1100)) 0 1025) (range 3000))` threw
+  `vector-length: ... is not a vector`. When the tail of a relaxed vector was
+  pushed into its trie, the root could come back as a plain node over a
+  relaxed child, which the next conj read as a classic trie. The root now
+  stays relaxed.
 
 - **A `ServerSocket` whose bind address does not resolve closes its socket.**
   The constructor threw UnknownHostException and left the fd it had opened.

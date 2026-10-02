@@ -1,94 +1,11 @@
-;; host-static-methods.ss — the `Class/member` static surface: java.lang.Math,
-;; System (properties/env), Thread, the Long/Integer/Double/Character/String static
+;; host-static-methods.ss — the `Class/member` static surface: System
+;; (properties/env), Thread, the Long/Integer/Double/Character/String static
 ;; methods, java.text.NumberFormat, and the Class registry. Registers into
 ;; host-static.ss's class-statics table (loaded just before this); instantiable host
 ;; object classes (ArrayList, StringBuilder, …) live in host-static-classes.ss.
+;; java.lang.Math is math.ss's, beside clojure.math, which shares its impls.
 
 ;; ---- java.lang statics ------------------------------------------------------
-;; java.lang.Math: sqrt/pow/floor/ceil/trig/log/exp always return a DOUBLE on the
-;; JVM (Chez's sqrt/expt return EXACT for exact args, e.g. (sqrt 9) -> 3), so coerce
-;; to flonum. round -> long (exact); abs/max/min preserve the argument's type.
-(define (->dbl x) (exact->inexact (jolt-need-num x)))
-;; a complex result (Chez extends sqrt/expt/log/asin/acos and log's kin onto the
-;; complex plane for out-of-domain real inputs) becomes +nan.0, matching Java;
-;; real results stay flonums, NaN/Inf pass through. real? is #f on a Chez complex.
-(define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
-;; java.lang.Math's PI/E are compile-time double literals in the JDK, not the
-;; host libm's atan(1)/exp(1) — pin the same doubles so a platform whose libm
-;; rounds exp(1) one ulp high (bionic's) still answers the JVM's value.
-(define math-pi 3.141592653589793)
-(define math-e 2.718281828459045)
-;; Every Math method takes numbers (PI/E are values, not methods), and each one
-;; hands its argument to a Chez numeric primitive. Check at the boundary: the
-;; condition Chez raises for a wrong-typed operand carries no class, so it would
-;; escape as #object[:object] with no catch clause able to select it. The hot path
-;; does not come through here — a Math call over proven flonums lowers to a native
-;; Chez flonum op (jolt.passes.numeric).
-(define (math-checked entry)
-  (let ((f (cdr entry)))
-    (if (procedure? f)
-        (cons (car entry)
-              (host-arity-like f (lambda args (apply f (map jolt-need-num args)))))
-        entry)))
-(register-class-statics! "Math"
-  (map math-checked
-  (list (cons "sqrt" (lambda (x) (real-or-nan (sqrt x))))
-        ;; cbrt/log10 (and hypot/expm1/log1p below) share the clojure.math impls
-        ;; in math.ss (loaded after; the lambda bodies resolve at call time) so
-        ;; Math/x and clojure.math/x never diverge.
-        (cons "cbrt" (lambda (x) (jolt-math-cbrt (->dbl x))))
-        (cons "pow" (lambda (a b) (real-or-nan (expt a b))))
-        ;; hypot/expm1/log1p route to the numerically-stable clojure.math impls
-        ;; (defined later in math.ss; the lambda body resolves at call time, after
-        ;; math.ss has loaded) so Math/hypot doesn't overflow and expm1/log1p keep
-        ;; full precision near zero.
-        (cons "hypot" (lambda (a b) (jolt-math-hypot (->dbl a) (->dbl b))))
-        (cons "floor" (lambda (x) (->dbl (floor x))))
-        (cons "ceil" (lambda (x) (->dbl (ceiling x))))
-        (cons "round" (lambda (x) (jolt-math-round x)))     ; JVM Math.round -> long (NaN/Inf/saturate/half-up)
-        (cons "rint" (lambda (x) (->dbl (round x))))            ; round-half-even -> double
-        ;; Math.floorDiv/floorMod: integer floor division / modulus (long -> long).
-        (cons "floorDiv" (lambda (a b) (exact (floor (/ a b)))))
-        (cons "floorMod" (lambda (a b) (exact (- a (* b (floor (/ a b)))))))
-        (cons "abs" (lambda (x) (abs x)))
-        (cons "sin" (lambda (x) (->dbl (sin x)))) (cons "cos" (lambda (x) (->dbl (cos x))))
-        (cons "tan" (lambda (x) (->dbl (tan x)))) (cons "asin" (lambda (x) (real-or-nan (asin x))))
-        (cons "acos" (lambda (x) (real-or-nan (acos x)))) (cons "atan" (lambda (x) (->dbl (atan x))))
-        ;; Math.atan2(y, x) — Chez's 2-arg atan is (atan y x).
-        (cons "atan2" (lambda (y x) (->dbl (atan y x))))
-        (cons "sinh" (lambda (x) (->dbl (sinh x)))) (cons "cosh" (lambda (x) (->dbl (cosh x))))
-        (cons "tanh" (lambda (x) (->dbl (tanh x))))
-        (cons "log" (lambda (x) (real-or-nan (log x)))) (cons "log10" (lambda (x) (jolt-math-log10 (->dbl x))))
-        (cons "log1p" (lambda (x) (jolt-math-log1p (->dbl x))))
-        (cons "exp" (lambda (x) (->dbl (exp x))))
-        (cons "expm1" (lambda (x) (jolt-math-expm1 (->dbl x))))
-        (cons "toRadians" (lambda (d) (->dbl (/ (* d math-pi) 180.0))))
-        (cons "toDegrees" (lambda (r) (->dbl (/ (* r 180.0) math-pi))))
-        (cons "copySign" (lambda (m s) (->dbl (if (< s 0.0) (- (abs m)) (abs m)))))
-        ;; getExponent: the unbiased binary exponent of a double (floor(log2|x|));
-        ;; scalb: x * 2^n. test.check's double generator uses both.
-        ;; Extracts the IEEE 754 exponent field via bit operations — the log-based
-        ;; approach loses precision for subnormals and large/small values.
-        (cons "getExponent" (lambda (x)
-                              (let ((bv (make-bytevector 8)))
-                                (bytevector-ieee-double-native-set! bv 0 x)
-                                ;; Detect native endianness: 1.0 = 0x3FF0000000000000.
-                                ;; On little-endian the LSB (0x00) is at offset 0.
-                                (let* ((end (let ((t (make-bytevector 8)))
-                                              (bytevector-ieee-double-native-set! t 0 1.0)
-                                              (if (= (bytevector-u8-ref t 0) 0)
-                                                  (endianness little)
-                                                  (endianness big))))
-                                       (bits (bytevector-u64-ref bv 0 end))
-                                       (raw-exp (bitwise-and (bitwise-arithmetic-shift-right bits 52) #x7FF)))
-                                  (cond ((= raw-exp 0) -1023)        ; zero or subnormal
-                                        ((= raw-exp #x7FF) 1024)     ; infinity or NaN
-                                        (else (- raw-exp 1023)))))))
-        (cons "scalb" (lambda (x n) (->dbl (* (exact->inexact x) (expt 2.0 (jnum->exact n))))))
-        (cons "max" (lambda (a b) (if (> a b) a b))) (cons "min" (lambda (a b) (if (< a b) a b)))
-        (cons "signum" (lambda (x) (cond ((< x 0) -1.0) ((> x 0) 1.0) (else 0.0))))
-        (cons "PI" math-pi) (cons "E" math-e)
-        (cons "random" (lambda args (jolt-random 1.0))))))
 
 ;; Thread: real OS threads back futures/promises.
 ;;  - sleep parks the calling thread for `ms` ms (a worker sleeping doesn't block
@@ -460,9 +377,11 @@
   (unless (and (jolt-array? src) (jolt-array? dst))
     (throw-jvm 'ArrayStoreException "arraycopy operands must be arrays"))
   ;; A copy between different element kinds is the JVM's ArrayStoreException;
-  ;; only reference arrays are allowed to differ, and jolt models those as one
-  ;; kind, so equal kinds is the whole rule here.
-  (unless (eq? (jolt-array-kind src) (jolt-array-kind dst))
+  ;; only reference arrays may differ (the JVM then checks each element as it
+  ;; stores, which jolt does not — its element store is unchecked, see
+  ;; known-divergences :typed-array-store), so two reference kinds are compatible.
+  (unless (or (eq? (jolt-array-kind src) (jolt-array-kind dst))
+              (and (na-ref-kind? (jolt-array-kind src)) (na-ref-kind? (jolt-array-kind dst))))
     (throw-jvm 'ArrayStoreException "arraycopy between arrays of different types"))
   (let ((sp (na-idx src-pos)) (dp (na-idx dst-pos)) (n (na-idx len))
         (slen (ja-len src)) (dlen (ja-len dst)))
@@ -1043,7 +962,16 @@
 ;; very token the type's values report.
 (define (class-for-name nm . _)
   (cond
-    ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
+    ;; an array class by its JVM name ("[I", "[Ljava.lang.String;") is a Class
+    ;; like any other, when its innermost component is one forName knows
+    ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[))
+     (let ((parts (hsc-array-parts nm)))
+       (if (and parts (or (member (car parts) jclass-primitive-names)
+                          (string=? (car parts) "java.lang.Object")
+                          (forname-known? (car parts))
+                          (let ((c (jch-registered-name (car parts)))) (and c (forname-known? c)))))
+           (jolt-class-for nm)
+           (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm)))))
     ((forname-known? nm) (jolt-class-for nm))
     ((let ((c (jch-registered-name nm))) (and c (forname-known? c) c)) => jolt-class-for)
     (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm)))))

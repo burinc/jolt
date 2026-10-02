@@ -415,6 +415,35 @@
                  (step* (step k)))))))
    (step initk)))
 
+;; Clojure 1.12's java.util.stream consumers, ported as written: each reads the
+;; stream through its .iterator, so reduce honors `reduced` and the stream is
+;; consumed (a terminal operation). jolt's Stream is java/streams.ss.
+(defn stream-reduce!
+  ([f s]
+   (reduce f (iterator-seq (.iterator s))))
+  ([f init s]
+   (reduce f init (iterator-seq (.iterator s)))))
+
+(defn stream-seq! [stream]
+  (iterator-seq (.iterator stream)))
+
+(defn stream-transduce!
+  ([xform f stream] (stream-transduce! xform f (f) stream))
+  ([xform f init stream]
+   (let [f (xform f)
+         ret (stream-reduce! f init stream)]
+     (f ret))))
+
+(defn stream-into!
+  ([to stream]
+   (if (instance? clojure.lang.IEditableCollection to)
+     (with-meta (persistent! (stream-reduce! conj! (transient to) stream)) (meta to))
+     (stream-reduce! conj to stream)))
+  ([to xform stream]
+   (if (instance? clojure.lang.IEditableCollection to)
+     (with-meta (persistent! (stream-transduce! xform conj! (transient to) stream)) (meta to))
+     (stream-transduce! xform conj to stream))))
+
 ;; print-simple — print without print-method dispatch (no print-meta in jolt).
 (defn print-simple [o w]
   (.write w (str o)))

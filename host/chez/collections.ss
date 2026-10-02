@@ -233,7 +233,11 @@
        (let* ((tail-node (pvec-tail p))
               (pushed (rrb-push-leaf (pvec-root p) shift tail-node)))
          (if pushed
-             (mk-pvec (fx+ cnt 1) shift pushed (vector x) (pv-derived-ent p))
+             ;; rrb-mk-node gives back a plain vector when the children's
+             ;; offsets line up, though its last child may still be relaxed
+             ;; (a slice one past a trie boundary): a plain root promises a
+             ;; classic trie, so the root stays relaxed
+             (mk-pvec (fx+ cnt 1) shift (rrb-force-relaxed pushed shift) (vector x) (pv-derived-ent p))
              (let ((trie-cnt (fx- cnt pv-width)))   ; count already in the trie
                (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
                         (make-rrbnode (vector trie-cnt cnt)

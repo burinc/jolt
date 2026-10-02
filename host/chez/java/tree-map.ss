@@ -28,7 +28,7 @@
 ;; with key / val / destructuring, but prints as k=v and its setValue writes
 ;; through); an iterator walks a snapshot of its view and removes through it.
 ;;
-;; Needs jutil-colls.ss (the Map / Set seam and jolt-fi-call), host-table.ss's
+;; Needs jutil-colls.ss (the Map / Set seam), jolt-fi-call (records-dispatch.ss), host-table.ss's
 ;; sorted-coll op access (sc-call, kw-op-*), and clojure.core's sorted-map-by /
 ;; subseq / rsubseq and the comparison fns they take, read at call time — this
 ;; file loads before the prelude. Each is spelled as a literal var-deref so the

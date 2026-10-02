@@ -548,7 +548,12 @@
         ((and (jolt-array? obj) (eq? (jolt-array-kind obj) 'int)) '("[I" "Object"))
         ((and (jolt-array? obj) (eq? (jolt-array-kind obj) 'long)) '("[J" "Object"))
         ((and (jolt-array? obj) (eq? (jolt-array-kind obj) 'double)) '("[D" "Object"))
-        ((jolt-array? obj) '("[Ljava.lang.Object;" "Object"))
+        ;; a typed reference array (String[], int[][]) is also an Object[]
+        ((jolt-array? obj)
+         (let ((k (jolt-array-kind obj)))
+           (if (string? k)
+               (list (na-kind-class-name k) "[Ljava.lang.Object;" "Object")
+               '("[Ljava.lang.Object;" "Object"))))
         ;; host value types with a distinct record repr (not jhost-backed): a regex,
         ;; a #uuid, a #inst Date, a BigDecimal — each derives its ancestry from the
         ;; class graph. A #inst is a java.util.Date (NOT a java.sql.Timestamp — the
@@ -688,7 +693,7 @@
                           (if (jolt-nil? m) r (jolt-with-meta r m))))
                        (else
                         (throw-jvm (quote ArityException)
-                          (string-append "Wrong number of args (" (number->string n)
+                          (string-append "Wrong number of args (" (jvm-arity-count n)
                                          ") passed to: " ctor-name))))))))
     ;; Register the ctor under its fully-qualified tag ("ns.Name") — a bare
     ;; (Name. …) in the DEFINING ns is qualified to this by the analyzer, so a
@@ -800,6 +805,17 @@
                 "BufferedReader" "java.io.BufferedReader" "FilterReader" "java.io.FilterReader"
                 "InputStream" "java.io.InputStream" "OutputStream" "java.io.OutputStream"))
     h))
+;; JVM array class name for an array of KIND ((class (int-array 3)) -> "[I", like
+;; the JVM's Class.getName for arrays): a String[] is "[Ljava.lang.String;", and
+;; an array whose component is itself an array prefixes one more "[". A reference
+;; array's kind is its component class name (java/natives-array.ss).
+(define (na-kind-class-name k)
+  (case k
+    ((int) "[I") ((long) "[J") ((short) "[S") ((double) "[D")
+    ((float) "[F") ((boolean) "[Z") ((byte) "[B") ((char) "[C")
+    (else (cond ((not (string? k)) "[Ljava.lang.Object;")
+                ((char=? (string-ref k 0) #\[) (string-append "[" k))
+                (else (string-append "[L" k ";"))))))
 (define (strip-prefix s p)
   (let ((pl (string-length p)))
     (and (> (string-length s) pl) (string=? (substring s 0 pl) p) (substring s pl (string-length s)))))
@@ -852,6 +868,9 @@
       ;; well: it is already the tag format, so a forward extend by fully-qualified
       ;; name lands correctly instead of being prefixed twice.
       ((dotted-name? type-name) type-name)
+      ;; an array class name ("[[I", "[Ljava.lang.String;") is the tag an array
+      ;; of that class reports (value-host-tags), whether or not it has a dot
+      ((and (fx>? (string-length type-name) 1) (char=? (string-ref type-name 0) #\[)) type-name)
       (else #f))))
 ;; An extend/extend-type/extend-protocol registration marks the tag as an
 ;; extender of the protocol (recorded inside type-registry so the per-case prune

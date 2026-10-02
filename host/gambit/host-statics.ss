@@ -174,18 +174,15 @@
 ;; ---- the statics the seed reaches -----------------------------------------------
 ;; Each is the member Chez registers in host-static-methods.ss, with the same
 ;; body, so a call answers the same on both targets. Long/parseLong is
-;; cl-format's number parser (java-parse.ss carries the throw); Math/floor and
-;; Math/abs are cl-format's float formatting; Character/isWhitespace and
-;; String/join are clojure.main's; the clojure.lang.Util family, MapEntry/create
-;; and Murmur3/hashOrdered are the gvec's (clojure/core/60-gvec.clj);
+;; cl-format's number parser (java-parse.ss carries the throw);
+;; Character/isWhitespace and String/join are clojure.main's; java.lang.Math is
+;; the shared math.ss, included after this file; the clojure.lang.Util family,
+;; MapEntry/create and Murmur3/hashOrdered are the gvec's (clojure/core/60-gvec.clj);
 ;; PersistentList/EMPTY the gvec's empty; RT/REQUIRE_LOCK the object
 ;; serialized-require locks. The Compiler statics (munge, demunge, eval) are
 ;; registered by compile-eval.ss at its load, into the same table.
 (register-class-statics! "Long"
   (list (cons "parseLong" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "long")))))
-(register-class-statics! "Math"
-  (list (cons "floor" (lambda (x) (exact->inexact (floor (jolt-need-num x)))))
-        (cons "abs" (lambda (x) (abs x)))))
 ;; JVM Character.isWhitespace: Unicode whitespace MINUS the no-break spaces the
 ;; JVM excludes (U+00A0/U+2007/U+202F).
 (register-class-statics! "Character"

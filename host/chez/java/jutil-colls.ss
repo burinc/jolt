@@ -22,7 +22,7 @@
 ;; Needs the jhost record and register-host-methods! (host-static.ss on Chez,
 ;; host/gambit/host-statics.ss), the arm registries (values.ss, printing.ss,
 ;; converters.ss) and jolt-java-hashcode (natives-misc.ss). Loads before
-;; host-static-classes.ss, which calls jolt-fi-call and registers into it.
+;; host-static-classes.ss, which registers into it.
 
 ;; ---- the registry -------------------------------------------------------------
 ;; tag -> #(kind elems). kind is one of
@@ -140,34 +140,6 @@
             '()
             (list (cons "equals" (lambda (self o) (jutil-equals? self o)))
                   (cons "hashCode" (lambda (self) (jutil-hash-code self)))))))
-
-;; ---- java.util.function arguments ------------------------------------------------
-;; (jolt-fi-call f method arg ...) — call the java.util.function argument of a
-;; host method: a Clojure fn (or any invokable, a keyword or a map) is invoked,
-;; and a reify / deftype implementing the interface has its one method called by
-;; name. Clojure 1.12 coerces a fn to the interface at the call site, so both
-;; shapes reach a JVM method; jolt has no coercion, so a shim that only
-;; jolt-invoked its argument refused the reify with "cannot be cast to
-;; clojure.lang.IFn".
-;; The fixed arities keep a plain fn's call free of the rest list and apply.
-(define jolt-fi-call
-  (case-lambda
-    ((f method)
-     (if (and (not (procedure? f)) (iface-method f method 1))
-         (record-method-dispatch f method jolt-nil)
-         (jolt-invoke f)))
-    ((f method a)
-     (if (and (not (procedure? f)) (iface-method f method 2))
-         (record-method-dispatch f method (list->cseq (list a)))
-         (jolt-invoke1 f a)))
-    ((f method a b)
-     (if (and (not (procedure? f)) (iface-method f method 3))
-         (record-method-dispatch f method (list->cseq (list a b)))
-         (jolt-invoke2 f a b)))
-    ((f method . args)
-     (if (and (not (procedure? f)) (iface-method f method (fx+ 1 (length args))))
-         (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args)))
-         (apply jolt-invoke f args)))))
 
 ;; ---- host Comparator objects -------------------------------------------------------
 ;; The comparator seam (natives-seq.ss jolt-comparator-fn) asks whether a value

@@ -149,7 +149,7 @@
       (when (fx<? step steps)
         (let* ((slot (rnd 6)) (pair (vector-ref pool slot))
                (m (car pair)) (p (cdr pair)) (n (pvec-cnt p))
-               (op (rnd 10)))
+               (op (rnd 11)))
           (when (getenv "RRB_TRACE")
             (printf "seed ~a step ~a op ~a slot ~a n ~a\n" seed step op slot n))
           (cond
@@ -182,6 +182,13 @@
                     (p2 (pvec-slice p a b))
                     (m2 (list-slice m a b)))
                (when (check! p2 m2 seed step) (vector-set! pool slot (cons m2 p2)))))
+            ;; a run of conjs long enough to push the tail into the trie
+            ((fx=? op 9)
+             (let loop ((k (fx+ 33 (rnd 38))) (p p) (m m))
+               (if (fx=? k 0)
+                   (when (check! p m seed step) (vector-set! pool slot (cons m p)))
+                   (let ((x (rnd 100000)))
+                     (loop (fx- k 1) (pvec-conj p x) (append m (list x)))))))
             ;; rebuild a fresh classic vector into the slot
             (else (vector-set! pool slot (fresh-pair (rnd 300)))))
           (step-loop (fx+ step 1)))))))
@@ -216,6 +223,20 @@
   (when (<= seed 300)
     (run-sequence seed 40)
     (loop (+ seed 1))))
+;; a slice one past a trie boundary, conj'd until its tail is pushed into the
+;; relaxed root twice: the push must leave the root relaxed, never a plain
+;; vector over a relaxed child, which a later conj reads as a classic trie
+(for-each
+  (lambda (n end)
+    (let loop ((k 0)
+               (p (pvec-slice (cdr (fresh-pair n)) 0 end))
+               (m (list-slice (car (fresh-pair n)) 0 end)))
+      (when (fx<? k 70)
+        (let* ((x (fx+ 1000000 k)) (p2 (pvec-conj p x)) (m2 (append m (list x))))
+          (when (check! p2 m2 9004 (list end k))
+            (loop (fx+ k 1) p2 m2))))))
+  '(1100 2000 33000 40000 1100)
+  '(1025 1025 32769 35000 1057))
 (check-jolt-walk 9001)
 (check-jolt-walk 9002)
 

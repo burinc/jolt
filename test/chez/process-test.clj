@@ -622,12 +622,21 @@
 ;; The same thing said exactly, where the OS will show the table: three stdio
 ;; pipes, no jolt source file, no socket. Linux-only (/proc); the port case above
 ;; is the portable half.
+;; Read until the table settles: a freshly exec'd `sleep` opens files of its own
+;; for a moment (the dynamic loader's ld.so.cache and libc, setlocale's locale
+;; files) as fd 3, and a read that lands there sees it. A descriptor jolt leaked
+;; is there on every read, so it still fails.
 (when (fs/exists? "/proc/self/fd")
   (let [child (process ["sleep" "30"])
-        fds   (-> (sh ["ls" (str "/proc/" (.pid (:proc child)) "/fd")]) :out
-                  str/split-lines)]
+        read-fds #(->> (sh ["ls" (str "/proc/" (.pid (:proc child)) "/fd")]) :out
+                       str/split-lines (remove str/blank?) sort vec)
+        fds   (loop [n 0]
+                (let [fds (read-fds)]
+                  (if (or (= fds ["0" "1" "2"]) (>= n 20))
+                    fds
+                    (do (Thread/sleep 50) (recur (inc n))))))]
     (check-eq "a child's descriptor table is its own stdio and nothing else"
-              (vec (sort (remove str/blank? fds))) ["0" "1" "2"])
+              fds ["0" "1" "2"])
     (p/destroy child)
     @child))
 

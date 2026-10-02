@@ -93,13 +93,13 @@
       ((null? (cdr args))
        (let ((dst (car args)))
          (unless (and (jolt-array? dst)
-                      (eq? (jolt-array-kind dst) 'object))
+                      (na-ref-kind? (jolt-array-kind dst)))
            (jolt-cast-throw dst "[Ljava.lang.Object;"))
          (let ((cap (ja-len dst)))
            (if (fx<? cap n)
-               ;; Jolt models reference arrays with one object kind, so the
-               ;; replacement retains the strongest component type available.
-               (make-jolt-array (list->vector elems) 'object)
+               ;; toArray(T[]) answers an array of the argument's own runtime
+               ;; type, so a too-small String[] is replaced by a String[].
+               (make-jolt-array (list->vector elems) (jolt-array-kind dst))
                (begin
                  (let fill ((i 0) (es elems))
                    (unless (null? es)
@@ -122,8 +122,40 @@
     (cond ((null? args) (make-arraylist '()))
           ((number? (car args)) (make-arraylist '()))
           (else (make-arraylist (seq->list (jolt-seq (car args))))))))
+;; toString / equals / hashCode of the collection shims come from the shared
+;; java.util registry (java/jutil-colls.ss); each shim registers below.
+
+;; The default methods java.lang.Iterable, java.util.Collection and java.util.List
+;; give every collection, over a shim's element list. The function argument is a
+;; java.util.function interface, so it goes through jolt-fi-call: a Clojure fn is
+;; invoked (1.12 coerces it) and a reify implementing the interface has its
+;; method called. A Predicate answer counts by truthiness — the JVM would cast it
+;; to Boolean, and a fn returning a non-boolean raises there (a superset here).
+(define (jcoll-for-each elems f)
+  (for-each (lambda (x) (jolt-fi-call f "accept" x)) elems)
+  jolt-nil)
+(define (jcoll-keep elems pred)
+  (filter (lambda (x) (not (jolt-truthy? (jolt-fi-call pred "test" x)))) elems))
+;; List.sort(Comparator): a nil comparator is the natural order; the sort is
+;; stable, as the JDK's is.
+(define (jcoll-sorted elems cmp)
+  (list-sort (cmp->less (if (jolt-nil? cmp) jolt-compare cmp)) elems))
+(define (al-reset! self xs)
+  (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil))
+  (al-cnt! self 0) (al-head! self 0)
+  (for-each (lambda (x) (al-push! self x)) xs))
 (define arraylist-methods
   (list
+    (cons "forEach" (lambda (self f) (jcoll-for-each (al->list self) f)))
+    (cons "removeIf" (lambda (self pred)
+                       (let* ((xs (al->list self)) (keep (jcoll-keep xs pred)))
+                         (if (fx=? (length keep) (length xs))
+                             #f
+                             (begin (al-reset! self keep) #t)))))
+    (cons "replaceAll" (lambda (self f)
+                         (do ((i 0 (fx+ i 1))) ((fx=? i (al-cnt self)) jolt-nil)
+                           (al-set! self i (jolt-fi-call f "apply" (al-ref self i))))))
+    (cons "sort" (lambda (self cmp) (al-reset! self (jcoll-sorted (al->list self) cmp)) jolt-nil))
     (cons "add" (lambda (self . a)
                   ;; (.add x) -> append+true; (.add i x) -> insert at i, returns nil.
                   (if (= 1 (length a))
@@ -194,7 +226,12 @@
 ;; capacity arg is a hint on the JVM — an empty deque here.)
 (define (make-arraydeque xs)
   (let ((al (make-arraylist xs))) (make-jhost "arraydeque" (jhost-state al))))
-(register-host-methods! "arraydeque" linkedlist-methods)
+;; An ArrayDeque is only a Collection: it keeps Object's identity equals and
+;; hashCode, where the List shims compare element-wise.
+(register-host-methods! "arraydeque"
+  (append (list (cons "equals" (lambda (self o) (eq? self o)))
+                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self)))))
+          (filter (lambda (p) (not (member (car p) '("equals" "hashCode")))) linkedlist-methods)))
 (let ((ctor (lambda args
               (cond ((null? args) (make-arraydeque '()))
                     ((number? (car args)) (make-arraydeque '()))
@@ -208,14 +245,9 @@
   (and (jhost? x) (or (string=? (jhost-tag x) "arraylist")
                        (string=? (jhost-tag x) "linkedlist")
                        (string=? (jhost-tag x) "arraydeque")
-                       (string=? (jhost-tag x) "arrays-aslist"))))
+                       (string=? (jhost-tag x) "arrays-aslist")
+                       (string=? (jhost-tag x) "immutable-list"))))
 (register-seq-arm! al-family? (lambda (x) (list->cseq (al->list x))))
-;; ArrayList is a RandomAccess List (printed [..]), LinkedList a List (printed
-;; (..)), ArrayDeque only a Collection: = and hash by identity, str its toString
-;; (java/jutil-colls.ss).
-(register-jutil-coll! "arraylist" 'ralist al->list)
-(register-jutil-coll! "linkedlist" 'list al->list)
-(register-jutil-coll! "arraydeque" 'coll al->list)
 
 ;; ---- StringWriter -----------------------------------------------------------
 ;; Writer.write(int) writes the CHAR for that code; append(char) appends the char.
@@ -566,7 +598,7 @@
     (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
               (hm-keys-ordered self))
     m))
-;; jolt-fi-call (java/jutil-colls.ss) calls a java.util.function argument.
+;; jolt-fi-call (records-dispatch.ss) calls the java.util.function argument.
 (define hashmap-methods
   (list (cons "put" (lambda (self k v) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                                           (hm-note-key! self k)
@@ -624,6 +656,13 @@
               jolt-nil)))
         (cons "forEach" (lambda (self f)
           (for-each (lambda (k) (jolt-fi-call f "accept" k (hashtable-ref (hm-tbl self) k jolt-nil)))
+                    (hm-keys-ordered self))
+          jolt-nil))
+        ;; Map.replaceAll(BiFunction): every value becomes f(key, value)
+        (cons "replaceAll" (lambda (self f)
+          (for-each (lambda (k)
+                      (hashtable-set! (hm-tbl self) k
+                                      (jolt-fi-call f "apply" k (hashtable-ref (hm-tbl self) k jolt-nil))))
                     (hm-keys-ordered self))
           jolt-nil))
         (cons "containsKey" (lambda (self k) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
@@ -953,16 +992,33 @@
         ;; JVM and had none here at all, so (.toArray h) was "No matching field
         ;; found: toArray for class java.util.HashSet". Same jcoll-to-array the
         ;; ArrayList family uses, over the set's own iteration order.
-        (cons "toArray" (lambda (self . args) (jcoll-to-array (hs->list self) args)))))
+        (cons "toArray" (lambda (self . args) (jcoll-to-array (hs->list self) args)))
+        (cons "forEach" (lambda (self f) (jcoll-for-each (hs->list self) f)))
+        (cons "removeIf" (lambda (self pred)
+                           (let* ((xs (hs->list self)) (keep (jcoll-keep xs pred)))
+                             (for-each (lambda (x)
+                                         (unless (memq x keep)
+                                           (hashtable-delete! (hm-tbl self) x)
+                                           (hm-drop-key! self x)))
+                                       xs)
+                             (not (fx=? (length keep) (length xs))))))))
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
+
 ;; the HashMap family and HashSet are a java.util.Map / Set to =, hash, pr, str
-;; and reduce-kv (java/jutil-colls.ss), in their insertion order.
+;; and reduce-kv (java/jutil-colls.ss), in their insertion order. An ArrayList
+;; (and Arrays$ArrayList, ImmutableCollections$ListN) is a RandomAccess List,
+;; printed [..]; a LinkedList a List, printed (..); an ArrayDeque only a
+;; Collection, which keeps the identity equals/hashCode registered above and
+;; prints as #object over its toString.
 (define (hm-entries self)
   (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
        (hm-keys-ordered self)))
 (register-jutil-coll! "hashmap" 'map hm-entries)
 (register-jutil-coll! "properties" 'map hm-entries)
 (register-jutil-coll! "hashset" 'set hs->list)
+(register-jutil-coll! "arraylist" 'ralist al->list)
+(register-jutil-coll! "linkedlist" 'list al->list)
+(register-jutil-coll! "arraydeque" 'coll al->list)
 ;; Collection.toArray on the TreeSet / TreeMap views (java/tree-map.ss), which
 ;; are shared with targets that have no Java arrays.
 (for-each (lambda (tag)
@@ -1516,12 +1572,12 @@
 (register-class-ctor! "ArityException"
   (lambda (actual name . _)
     (jolt-host-throwable "clojure.lang.ArityException"
-      (string-append "Wrong number of args (" (jolt-str-render-one actual)
+      (string-append "Wrong number of args (" (jvm-arity-count actual)
                      ") passed to: " (if (string? name) name (jolt-str-render-one name))))))
 (register-class-ctor! "clojure.lang.ArityException"
   (lambda (actual name . _)
     (jolt-host-throwable "clojure.lang.ArityException"
-      (string-append "Wrong number of args (" (jolt-str-render-one actual)
+      (string-append "Wrong number of args (" (jvm-arity-count actual)
                      ") passed to: " (if (string? name) name (jolt-str-render-one name))))))
 
 ;; java.text.ParseException(String s, int errorOffset): unlike the exceptions
@@ -2200,8 +2256,8 @@
 (register-host-methods! "class"
   (list (cons "getConstructors" (lambda (self) (class-constructors self)))
         (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
-        (cons "getAnnotations" (lambda (self) (make-jolt-array (vector) 'objects)))
-        (cons "getDeclaredAnnotations" (lambda (self) (make-jolt-array (vector) 'objects)))))
+        (cons "getAnnotations" (lambda (self) (make-jolt-array (vector) "java.lang.annotation.Annotation")))
+        (cons "getDeclaredAnnotations" (lambda (self) (make-jolt-array (vector) "java.lang.annotation.Annotation")))))
 
 ;; ---- java.lang.reflect.Modifier ---------------------------------------------
 ;; The bit constants and their predicates, the JVM's values, over whatever int a
@@ -2253,7 +2309,11 @@
 ;; arity-counting caller finds the same two it would on the JVM.
 (define ctor-arity-probe '(0 1 2 3 4 5))
 (define (ctor-obj cls arity) (make-jhost "class-ctor" (vector cls arity)))
+;; A Constructor[], as Class.getConstructors answers.
 (define (class-constructors cls)
+  (make-jolt-array (list->vector (seq->list (jolt-seq (class-constructor-list cls))))
+                   "java.lang.reflect.Constructor"))
+(define (class-constructor-list cls)
   (let* ((nm (jclass-name cls))
          (dbl (hashtable-ref chez-record-dbl-tbl nm #f)))
     (cond
@@ -2284,16 +2344,25 @@
   (list (cons "getParameterCount" (lambda (self) (->num (vector-ref (jhost-state self) 1))))
         (cons "getParameterTypes"
               (lambda (self)
-                (apply jolt-vector
-                       (make-list (vector-ref (jhost-state self) 1) (jolt-class-for "java.lang.Object")))))
+                (make-jolt-array (make-vector (vector-ref (jhost-state self) 1)
+                                              (jolt-class-for "java.lang.Object"))
+                                 "java.lang.Class")))
         (cons "getDeclaringClass" (lambda (self) (vector-ref (jhost-state self) 0)))
         ;; Constructor.getName is the DECLARING CLASS's fully qualified name on
         ;; the JVM, not a member name of its own.
         (cons "getName" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))
         (cons "getModifiers" (lambda (self) (->num 1)))
-        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) 'objects)))
+        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) "java.lang.Class")))
         (cons "setAccessible" (lambda (self v) jolt-nil))
-        (cons "newInstance" (lambda (self . args) (apply reflect-construct (vector-ref (jhost-state self) 0) args)))
+        ;; Constructor.newInstance(Object... initargs): from Clojure the varargs
+        ;; arrive as ONE array, which is the argument list, and a nil is the empty
+        ;; one (sci.impl.reflector's box-args answers nil for no parameters) — the
+        ;; same contract Method.invoke reads (java/natives-array.ss). Arguments
+        ;; spelled out loose pass straight through.
+        (cons "newInstance"
+              (lambda (self . args)
+                (apply reflect-construct (vector-ref (jhost-state self) 0)
+                       (reflect-varargs args))))
         ;; the JVM's shape — "public user.Foo(java.lang.Object, java.lang.Object)".
         ;; It used to print the bare class name, which is also what getName answers,
         ;; so two constructors of different arity were indistinguishable in output.
@@ -2309,6 +2378,14 @@
 ;; dynamic form of an interop call jolt already performs, so they route to the
 ;; same registries rather than to a second mechanism.
 (define (reflect-args a) (if (jolt-nil? a) '() (seq->list (jolt-seq a))))
+;; The trailing Object... of a reflective call (Constructor.newInstance,
+;; Method.invoke) as the argument list: a lone array IS the list, a lone nil is
+;; the empty one — as on the JVM, where a null varargs array means none — and
+;; loose arguments are themselves.
+(define (reflect-varargs args)
+  (cond ((and (pair? args) (null? (cdr args)) (jolt-array? (car args))) (ja->list (car args)))
+        ((and (pair? args) (null? (cdr args)) (jolt-nil? (car args))) '())
+        (else args)))
 (define (reflect-construct cls . args)
   (apply host-new (if (jclass? cls) (jclass-name cls) (jolt-str-render-one cls)) args))
 ;; clojure.lang.Var / Symbol / Keyword statics — all four used to raise "No
@@ -2399,7 +2476,7 @@
 ;; fresh one, the looseness String/format already has.
 (define (arrays-as-list . args)
   (let ((arr (if (and (= 1 (length args)) (jolt-array? (car args))
-                      (eq? (jolt-array-kind (car args)) 'object))
+                      (na-ref-kind? (jolt-array-kind (car args))))
                  (car args)
                  (make-jolt-array (list->vector args) 'object))))
     (make-jhost "arrays-aslist" (vector (jolt-array-vec arr) (ja-len arr) 0))))
@@ -2415,6 +2492,23 @@
              ("addFirst" 1) ("addLast" 1) ("removeFirst" 0) ("removeLast" 0))))))
 (register-host-methods! "arrays-aslist" arrays-aslist-methods)
 (register-jutil-coll! "arrays-aslist" 'ralist al->list)
+
+;; An unmodifiable List (java.util.ImmutableCollections$ListN) — what
+;; Stream.toList and List.copyOf answer: every reader of the ArrayList table, and
+;; every mutator, set included, raises UnsupportedOperationException. Same state
+;; layout as the ArrayList, #(backing count head).
+(define (make-immutable-list xs)
+  (make-jhost "immutable-list" (vector (list->vector xs) (length xs) 0)))
+(register-host-methods! "immutable-list"
+  (append
+    (map (lambda (n) (cons n (cdr (assoc n arraylist-methods))))
+         '("get" "size" "isEmpty" "contains" "toArray" "iterator" "forEach"))
+    (list (cons "getFirst" al-first) (cons "getLast" al-last))
+    (map (lambda (e) (cons (car e) (host-arity-of (cdr e) #t aslist-unsupported)))
+         '(("set" 2) ("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0) ("removeIf" 1)
+           ("replaceAll" 1) ("sort" 1) ("addFirst" 1) ("addLast" 1)
+           ("removeFirst" 0) ("removeLast" 0)))))
+(register-jutil-coll! "immutable-list" 'ralist al->list)
 
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
@@ -2465,6 +2559,7 @@
                                  (do ((i 0 (fx+ i 1))) ((fx=? i len) out)
                                    (ja-set! out i (ja-ref a (+ f i)))))))
          (cons "sort" arrays-sort)
+         (cons "deepEquals" (lambda (a b) (objects-deep-equals? a b)))
          ;; Arrays.toString is "[a, b]" — comma-separated element toString, "null"
          ;; for a nil array. It used to print the elements as a jolt VECTOR, which
          ;; renders "[a b]" (no commas) and pr-quotes a string element.
@@ -2494,7 +2589,11 @@
   (cond ((eq? a b) #t)
         ((or (jolt-nil? a) (jolt-nil? b)) #f)
         ((and (jolt-array? a) (jolt-array? b))
-         (and (eq? (jolt-array-kind a) (jolt-array-kind b))
+         ;; Arrays.deepEquals0: two reference arrays (any component class — a
+         ;; String[] against an Object[]) compare element-wise, two primitive
+         ;; arrays only when their element type is the same
+         (and (let ((ka (jolt-array-kind a)) (kb (jolt-array-kind b)))
+                (or (eq? ka kb) (and (na-ref-kind? ka) (na-ref-kind? kb))))
               (= (ja-len a) (ja-len b))
               (let loop ((i 0))
                 (or (fx=? i (ja-len a))
@@ -2518,7 +2617,7 @@
          (cons "hash" (lambda xs
                         (->num (objects-hash-of
                                  (if (and (= 1 (length xs)) (jolt-array? (car xs))
-                                          (eq? (jolt-array-kind (car xs)) 'object))
+                                          (na-ref-kind? (jolt-array-kind (car xs))))
                                      (ja->list (car xs))
                                      xs)))))
          (cons "toString"
@@ -3295,9 +3394,33 @@
         ((rsv-registration-class v)
          => (lambda (root) (if (rsv-mapping-visible? v ns) root jolt-nil)))
         (else v)))
+;; An array class symbol — Component/N, N one digit 1-9 (Clojure 1.12) — resolves
+;; to that array's Class when the component does, and raises the reference's
+;; ClassNotFoundException "Unable to resolve component classname" when it does not. #f for any other
+;; symbol. The component is a primitive name or whatever class the bare symbol
+;; resolves to in the namespace.
+(define rsv-array-prim-letters
+  '(("boolean" . "Z") ("byte" . "B") ("char" . "C") ("short" . "S") ("int" . "I")
+    ("long" . "J") ("float" . "F") ("double" . "D")))
+(define (rsv-array-class sym resolve-component)
+  (and (symbol-t? sym) (string? (symbol-t-ns sym))
+       (let ((nm (symbol-t-name sym)))
+         (and (fx=? (string-length nm) 1) (char<=? #\1 (string-ref nm 0) #\9)))
+       (let* ((cn (symbol-t-ns sym))
+              (dims (fx- (char->integer (string-ref (symbol-t-name sym) 0)) (char->integer #\0)))
+              (prefix (make-string dims #\[))
+              (letter (assoc cn rsv-array-prim-letters)))
+         (if letter
+             (jolt-class-for (string-append prefix (cdr letter)))
+             (let ((c (resolve-component (jolt-symbol #f cn))))
+               (if (jclass? c)
+                   (jolt-class-for (string-append prefix "L" (jclass-name c) ";"))
+                   (throw-jvm 'ClassNotFoundException
+                              (string-append "Unable to resolve component classname: " cn))))))))
 (def-var! "clojure.core" "resolve"
   (case-lambda
-    ((sym) (rsv-through (jolt-resolve sym) sym (chez-current-ns)))
+    ((sym) (or (rsv-array-class sym (lambda (s) (rsv-through (jolt-resolve s) s (chez-current-ns))))
+               (rsv-through (jolt-resolve sym) sym (chez-current-ns))))
     ;; the &env arity: a local named sym answers nil, never a class
     ((env sym) (if (and (pmap? env) (pmap-contains? env sym))
                    jolt-nil
