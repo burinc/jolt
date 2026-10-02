@@ -96,18 +96,8 @@
 ;; which alone lets a process hold twice its data. The heap ceiling lowers it as
 ;; the heap nears the limit (rt.ss). Contract: best effort. Degradation: a target
 ;; that does not return memory ignores it.
-;;
-;; Chez applies the ratio only when a collection reaches generation
-;; release-minimum-generation, by default the oldest, which only the policy's
-;; full collections touch. The young schedule's own collection of the
-;; generation below it (every radix^3 collections) freed memory that then stayed
-;; held, and a ceiling-forced collection right after copied on top of it: on
-;; bionic the gcpolicy gate held 69MB freed and peaked 23% over a 256MB ceiling.
-;; So the generation below the oldest releases too; every generation (0) was
-;; worse, the steady release and re-acquire fragmenting the heap.
 (define (sa-gc-reserve-ratio! r)
-  (heap-reserve-ratio (inexact r))
-  (release-minimum-generation (max 1 (fx- (collect-maximum-generation) 1))))
+  (heap-reserve-ratio (inexact r)))
 
 ;; (sa-gc-tight! on?) -> void
 ;; Collect TIGHT while ON?: objects already in the older generations are marked

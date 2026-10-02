@@ -158,13 +158,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A heap ceiling holds when a scheduled collection precedes a forced one.**
-  Chez gave freed memory back only when it collected the oldest generation, so
-  the young schedule's collection of the one below kept what it freed, and a
-  ceiling-forced collection right after copied on top of it: the gcpolicy
-  gate's 256MB ceiling peaked at 317MB on Android. That generation releases too
-  now.
-
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux
   does not wake, so the thread stayed in accept() on a number the next socket
