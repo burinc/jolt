@@ -3077,18 +3077,12 @@
       (thread-state-forget! id)
       ;; the object takes over the name, priority and daemon status the tables
       ;; held, and is marked done, BEFORE the entries go (concurrency.ss
-      ;; jthread-attr relies on that order)
+      ;; jthread-finish!; a thread whose body already finished it keeps what
+      ;; it has, which may since have been set on the object)
       (when obj
-        (let ((st (jhost-state obj))
-              (nm (jolt-thread-name id))
-              (pr (jolt-thread-priority id))
-              (dm (jolt-thread-daemon? id)))
+        (let ((st (jhost-state obj)))
           (jolt-with-mutex (vector-ref st 2)
-            (set-box! (vector-ref st 6) nm)
-            (vector-set! st 9 pr)
-            (vector-set! st 8 dm)
-            (vector-set! st 1 #t)
-            (jolt-cv-wake! (vector-ref st 3)))))
+            (jthread-finish! st id))))
       (jolt-with-mutex thread-handles-mutex
         (hashtable-delete! thread-names-by-id id)
         (hashtable-delete! thread-priorities-by-id id)))))
