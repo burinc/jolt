@@ -305,6 +305,26 @@
 (define (char-array-chunk x off cnt who)
   (jvm-range-check who (ja-len x) off (+ off cnt))
   (char-array-region x off cnt))
+;; A fresh byte backing of N bytes, all FILL. From 64KB up it is one the collector
+;; never copies (sa-make-large-bytevector): copied, a live 8MB byte array cost a
+;; full collection ~1ms instead of ~100us, depending only on where its segments
+;; landed (#1225). Below that a copy costs microseconds, and pinning small ones
+;; would only fragment the heap.
+(define na-large-bytes 65536)
+(define (na-new-bytes n fill)
+  ;; < not fx<?: a size past the fixnum range must reach make-bytevector's own error
+  (if (< n na-large-bytes)
+      (make-bytevector n fill)
+      (let ((bv (sa-make-large-bytevector n)))
+        (unless (fx=? fill 0) (bytevector-fill! bv fill))
+        bv)))
+(define (na-bytes-copy bv)
+  (let ((n (bytevector-length bv)))
+    (if (fx<? n na-large-bytes)
+        (bytevector-copy bv)
+        (let ((r (sa-make-large-bytevector n)))
+          (bytevector-copy! bv 0 r 0 n)
+          r))))
 ;; A fresh backing holding the same elements — aclone's copy, and the one
 ;; java.util.Arrays hands its copyOf results.
 (define (ja-copy a)
@@ -312,7 +332,7 @@
     (cond ((vector? v) (vector-copy v))
           ((fxvector? v) (fxvector-copy v))
           ((string? v) (string-copy v))
-          ((bytevector? v) (bytevector-copy v))
+          ((bytevector? v) (na-bytes-copy v))
           (else (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
                   (do ((i 0 (fx+ i 1))) ((fx=? i n) r) (flvector-set! r i (flvector-ref v i))))))))
 ;; --- building a backing -----------------------------------------------------
@@ -323,7 +343,7 @@
   (let ((n (exact n)))
     (cond ((na-fl-kind? kind) (make-flvector n (if (flonum? init) init (exact->inexact init))))
           ((na-fx-kind? kind) (if (fixnum? init) (make-fxvector n init) (make-vector n init)))
-          ((eq? kind 'byte) (make-bytevector n (na-byte-of init)))
+          ((eq? kind 'byte) (na-new-bytes n (na-byte-of init)))
           ;; A char array is a Chez STRING: the elements are characters and a
           ;; string is the carrier that holds them unboxed, exactly as an
           ;; fxvector holds an int array's. It also removes a conversion at
@@ -347,7 +367,7 @@
         ;; every element narrowed on the way in, so the seq of a byte array
         ;; agrees with what a raw-byte consumer reads out of it
         ((eq? kind 'byte)
-         (let* ((n (length lst)) (bv (make-bytevector n)))
+         (let* ((n (length lst)) (bv (na-new-bytes n 0)))
            (let loop ((i 0) (l lst))
              (if (null? l) bv (begin (bytevector-s8-set! bv i (na-byte-of (car l))) (loop (+ i 1) (cdr l)))))))
         (else (list->vector lst))))
@@ -413,7 +433,7 @@
                  (bytevector-s8-set! bv i (na-byte-of (vector-ref v i))))
                (jolt-array-vec-set! a bv)
                bv)))))
-(define (nb-host-new-bytes n) (make-jolt-array (make-bytevector n 0) 'byte))
+(define (nb-host-new-bytes n) (make-jolt-array (na-new-bytes n 0) 'byte))
 (define (nb-host-array? a kind) (and (jolt-array? a) (eq? (jolt-array-kind a) kind)))
 (define (nb-host-array-len a) (ja-len a))
 (define (nb-host-array-ref a i) (ja-ref a i))
@@ -564,7 +584,7 @@
 ;; Files/readAllBytes, Base64, FFI — funnels through here. One block copy now
 ;; that the two carriers agree on representation; the copy stays because the
 ;; caller's bytevector is usually a buffer it goes on writing into.
-(define (na-bv->bytearray bv) (make-jolt-array (bytevector-copy bv) 'byte))
+(define (na-bv->bytearray bv) (make-jolt-array (na-bytes-copy bv) 'byte))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
 ;; carrier — a Chez bytevector (what the charset encoders produce) — and a string's
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.
