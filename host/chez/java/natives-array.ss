@@ -47,14 +47,24 @@
 ;; through the interner so a simple name and a deftype's registered spelling land
 ;; on the one JVM name its values report; Object is the plain 'object kind.
 (define (na-type-kind t)
-  (let* ((n (cond ((string? t) t) ((jclass? t) (jclass-name t)) (else #f)))
-         (hit (and n (assoc n na-prim-type-kinds))))
-    (cond (hit (cdr hit))
-          ((not n) 'object)
-          (else (let ((jvm (jclass-jvm-name (if (jclass? t) t (jolt-class-for n)))))
-                  (if (or (string=? jvm "java.lang.Object") (string=? jvm "Object"))
-                      'object
-                      jvm))))))
+  (cond ((string? t) (if (assoc t na-prim-type-kinds) (na-name-kind t) (na-name-kind (jclass-name (jolt-class-for t)))))
+        ((jclass? t) (na-name-kind (jclass-name t)))
+        (else 'object)))
+;; A class NAME's array kind. The JVM spelling is jch-munge-segments of the name,
+;; a pure function of the string, so each name's answer is computed once: every
+;; into-array / make-array asks, and the munge walk cost them 2x. Reads are the
+;; bare hashtable-ref; only a first-ever name takes the lock to publish.
+(define na-name-kind-tbl (make-hashtable string-hash string=?))
+(define na-name-kind-mu (make-mutex))
+(define (na-name-kind n)
+  (or (hashtable-ref na-name-kind-tbl n #f)
+      (let* ((hit (assoc n na-prim-type-kinds))
+             (k (if hit
+                    (cdr hit)
+                    (let ((jvm (jch-munge-segments n)))
+                      (if (or (string=? jvm "java.lang.Object") (string=? jvm "Object")) 'object jvm)))))
+        (jolt-with-mutex na-name-kind-mu (hashtable-set! na-name-kind-tbl n k))
+        k)))
 ;; The kind of an array whose elements are arrays of KIND — make-array's outer
 ;; dimensions, and (class (make-array String 1 1)) is String[][].
 (define (na-array-of-kind k) (na-kind-class-name k))
@@ -536,12 +546,12 @@
 (define (na-make-array a . rest)
   (let* ((typed? (not (number? a)))
          (kind (if typed? (na-type-kind a) 'object))
-         (dims (map (lambda (d) (exact (na-idx d))) (if typed? rest (list a)))))
+         (dims (if typed? rest (list a))))
     (let build ((kind kind) (dims dims))
       (if (null? (cdr dims))
-          (make-jolt-array (na-make-backing (car dims) kind (na-zero-of kind)) kind)
-          (let ((v (make-vector (car dims))))
-            (do ((i 0 (fx+ i 1))) ((fx=? i (car dims)))
+          (make-jolt-array (na-make-backing (exact (na-idx (car dims))) kind (na-zero-of kind)) kind)
+          (let* ((n (exact (na-idx (car dims)))) (v (make-vector n)))
+            (do ((i 0 (fx+ i 1))) ((fx=? i n))
               (vector-set! v i (build kind (cdr dims))))
             (make-jolt-array v (let wrap ((k kind) (n (length (cdr dims))))
                                  (if (fx=? n 0) k (wrap (na-array-of-kind k) (fx- n 1))))))))))
@@ -557,21 +567,33 @@
 ;; a CopyOption there and not here — so a check would refuse arrays the JVM
 ;; builds. Recorded in known-divergences.edn (:permissive).
 (define (na-ref-array-of kind x)
-  (make-jolt-array (na-list->backing (seq->list (jolt-seq x)) kind) kind))
+  (make-jolt-array (list->vector (seq->list (jolt-seq x))) kind))
+;; The array kind the untyped into-array takes from its first element: the
+;; common heads by their Scheme type (the class arms cost more than the array),
+;; anything else through its class name.
+(define (na-head-kind head)
+  (cond ((jolt-nil? head) 'object)
+        ((fixnum? head) "java.lang.Long")
+        ((string? head) "java.lang.String")
+        ((keyword-t? head) "clojure.lang.Keyword")
+        ((flonum? head) "java.lang.Double")
+        ((symbol-t? head) "clojure.lang.Symbol")
+        ((char? head) "java.lang.Character")
+        ((boolean? head) "java.lang.Boolean")
+        (else (let ((n (jolt-class-name head)))
+                ;; a boxed head names its wrapper class, never a primitive kind
+                (let ((k (if (string? n) (na-name-kind n) 'object)))
+                  (if (na-ref-kind? k) k 'object))))))
 (define (na-into-array a . rest)
   (if (pair? rest)
       (let ((kind (na-type-kind a)))
         (if (na-ref-kind? kind)
             (na-ref-array-of kind (car rest))
             (na-from-seq (car rest) kind)))
-      (let* ((s (jolt-seq a))
-             (head (if (jolt-nil? s) jolt-nil (jolt-first s)))
-             (kind (if (jolt-nil? head)
-                       'object
-                       (let ((n (jolt-class-name head)))
-                         (if (string? n) (na-type-kind (jolt-class-for n)) 'object)))))
-        ;; a boxed head names its wrapper class, never a primitive kind
-        (na-ref-array-of (if (na-ref-kind? kind) kind 'object) a))))
+      (let* ((xs (seq->list (jolt-seq a)))
+             (kind (if (null? xs) 'object (na-head-kind (car xs)))))
+        ;; a reference array's backing is a plain vector (na-list->backing's else)
+        (make-jolt-array (list->vector xs) kind))))
 (define (na-to-array coll)          (na-from-seq coll 'object))
 (define (na-aclone arr)
   (if (jolt-array? arr)
