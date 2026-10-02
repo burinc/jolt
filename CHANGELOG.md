@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A float reads back as the shortest decimal that names it, so `(.getFloat
   b)` after `(.putFloat b 0.1)` is `0.1`, which is what `(float 0.1)` is on
-  jolt.
+  jolt. The same file runs on the Gambit target, where a buffer's bytes are a
+  bytevector; there are no arrays there, so `.array` and the typed buffers'
+  `wrap` and `allocate` are not available.
 
 - **A readiness poller on Windows.** jolt.io-poller has a WSAPoll backend, so
   sockets on Windows are non-blocking and wait on it the way they wait on
