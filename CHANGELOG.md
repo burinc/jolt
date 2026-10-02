@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.socket.native`, the fd-level socket layer.** The C socket calls
+  jolt.socket used privately are now a public namespace for code that wants
+  sockets without the java.net object model, such as an HTTP server that owns
+  its accept loop: socket/bind/listen/accept/connect/recv/send/shutdown/close,
+  setsockopt with per-OS timeout encoding, sockaddr build and parse for IPv4
+  and IPv6, getaddrinfo, poll (WSAPoll on Windows), close-on-exec, blocking
+  mode, FIONREAD, and error classification that knows errno from Winsock's
+  error codes. Every call answers `[result error]`, the error captured on the
+  call's own return path. `consts-for` gives the numbers for macOS, Linux and
+  Windows. jolt.socket is rebuilt on it, which also makes its sockets
+  close-on-exec (from birth on Linux: SOCK_CLOEXEC and accept4).
+
 - **A fiber is a virtual thread.** `Thread/currentThread` inside a fiber (an
   `io-thread`, a `go` block on the `:fiber` backend, a `jolt.fibers/spawn`) is
   the fiber's own `java.lang.Thread`: the same object for its whole life,
@@ -144,6 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(shutdown-agents)` over a connection leaves it serving the next one.
 
 ### Fixed
+
+- **A `ServerSocket` whose bind address does not resolve closes its socket.**
+  The constructor threw UnknownHostException and left the fd it had opened.
 
 - **Attributes set on a finished thread stick.** A thread's exit hook ran
   after its body had already woken `join`, and copied the thread's name,

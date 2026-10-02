@@ -102,6 +102,13 @@
 (defn eagain? ([] (= EAGAIN (errno))) ([e] (= EAGAIN e)))
 (defn eintr? ([] (= EINTR (errno))) ([e] (= EINTR e)))
 (defn connect-pending? [e] (or (= EINPROGRESS e) (= EALREADY e)))
+(defn available?
+  "Whether this platform has a readiness backend: kqueue on macOS, epoll on
+  Linux. Windows has none yet, so sockets there stay blocking (nonblock! is a
+  no-op), and a caller that needs to park on readiness — a server running a
+  fiber per connection — has to use threads instead."
+  []
+  (not windows?))
 (defn nonblock! [fd]
   ;; A no-op on Windows, and deliberately so. O_NONBLOCK is fcntl, which Windows
   ;; does not have — the ioctlsocket(FIONBIO) equivalent does exist — but setting
