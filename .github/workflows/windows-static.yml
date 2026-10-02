@@ -27,6 +27,7 @@ on:
       - 'stdlib/jolt/loader.clj'
       - 'stdlib/jolt/socket.clj'
       - 'stdlib/jolt/socket/native.clj'
+      - 'stdlib/jolt/io_poller.clj'
       - 'test/chez/win-*.ss'
       - 'test/chez/win-parity-smoke.clj'
   push:
@@ -41,6 +42,7 @@ on:
       - 'stdlib/jolt/loader.clj'
       - 'stdlib/jolt/socket.clj'
       - 'stdlib/jolt/socket/native.clj'
+      - 'stdlib/jolt/io_poller.clj'
       - 'test/chez/win-*.ss'
       - 'test/chez/win-parity-smoke.clj'
 

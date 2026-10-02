@@ -119,7 +119,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
-  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
+  devbootsmoke devirt directlink ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy lazyretain \
   deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
@@ -189,7 +189,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives compilepathsmoke makefilesmoke versionsmoke attributioncheck \
   systemstreams utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers gosm asynctimer interruptnest threadsafety cas flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -345,6 +345,21 @@ narrowhash:
 # carrier. It runs with the pool pinned to ONE carrier, which is what makes "8
 # bodies parked at the same time, all of them resuming" mean that a fiber released
 # its carrier rather than held it.
+# The WSAPoll backend jolt.io-poller uses on Windows, run on POSIX: with
+# JOLT_IO_POLLER=poll the poller is the poll(2) one, which is the same code over
+# the same contract (native/c-poll is poll there and WSAPoll on Windows). So the
+# Windows backend's parking, wake channel, cancel and timed waits are exercised
+# by every POSIX gate run, not only on a Windows runner.
+fiberspoll:
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poll-backend-active.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script test/chez/fibers-io-test.ss
+	@out="$$(JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/socket-test.clj 2>&1)"; \
+	  if printf '%s' "$$out" | grep -q 'SOCKET-TEST OK'; then echo "fiberspoll: socket-test OK"; \
+	  else printf '%s\n' "$$out" | tail -5; echo "fiberspoll: socket-test FAILED"; exit 1; fi
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/win-parity-smoke.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-registration.clj
+	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-retirement.clj
+
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss

@@ -77,6 +77,8 @@
      :so-rcvtimeo    (if bsd? 0x1006 20)
      :so-nosigpipe   (when mac? 0x1022)
      :ipproto-ipv6   41
+     :ipproto-tcp    6
+     :tcp-nodelay    1
      :ipv6-v6only    (if bsd? 27 26)
      ;; macOS suppresses SIGPIPE per socket with SO_NOSIGPIPE instead
      :msg-nosignal   (if bsd? 0 0x4000)
@@ -131,6 +133,8 @@
 (def so-rcvtimeo    (:so-rcvtimeo consts))
 (def so-nosigpipe   (:so-nosigpipe consts))
 (def ipproto-ipv6   (:ipproto-ipv6 consts))
+(def ipproto-tcp    (:ipproto-tcp consts))
+(def tcp-nodelay    (:tcp-nodelay consts))
 (def ipv6-v6only    (:ipv6-v6only consts))
 (def msg-nosignal   (:msg-nosignal consts))
 (def msg-peek       (:msg-peek consts))
@@ -656,6 +660,59 @@
             (let [nm (ffi/ptr->string buf)]
               (when-not (or (str/blank? nm) (= nm ip)) nm)))
           (finally (ffi/free buf) (ffi/free sa)))))))
+
+;; -- loopback pair ----------------------------------------------------------------
+
+(defn- loopback-pair-once
+  "One try at loopback-pair: [a b], or nil when what accept() answered is not a's
+  peer — another local process connected to the listener first."
+  []
+  (let [l (new-socket af-inet)
+        opened (atom [])                  ; l is closed by the finally
+        fail (fn [what e]
+               (doseq [fd @opened] (c-close fd))
+               (throw (java.io.IOException. (str "loopback-pair: " what ": " (error-message e)))))]
+    (try
+      (let [[sa len] (make-sockaddr af-inet "127.0.0.1" 0)]
+        (try
+          (let [[r e] (c-bind l sa len)] (when (neg? r) (fail "bind" e)))
+          (let [[r e] (c-listen l 1)] (when (neg? r) (fail "listen" e)))
+          (set-sockaddr-port! sa (local-port l))
+          (let [a (new-socket af-inet)]
+            (swap! opened conj a)
+            (let [[r e] (c-connect a sa len)] (when (neg? r) (fail "connect" e)))
+            (let [[psa plen] (alloc-sockaddr)]
+              (try
+                (let [[b e] (c-accept l psa plen)]
+                  (when (neg? b) (fail "accept" e))
+                  (guard-accepted! b)
+                  (if (= (local-address a) (peer-address b))
+                    [a b]
+                    (do (c-close b) (c-close a) nil)))
+                (finally (ffi/free psa) (ffi/free plen)))))
+          (finally (ffi/free sa))))
+      (finally (c-close l)))))
+
+(defn loopback-pair
+  "Two connected TCP sockets over 127.0.0.1, as [a b], both close-on-exec — a
+  socketpair that works on Windows, where the only thing WSAPoll can wait on is
+  a socket, so a wake channel for a poll loop has to be one. Throws
+  IOException when any step fails, closing what it opened.
+
+  The accepted end is checked to be a's peer: the listener is on an open
+  loopback port, and a stranger connecting first would otherwise be handed back
+  as b. Both ends are TCP_NODELAY, so a one-byte write is not held by Nagle
+  behind an unacknowledged earlier one (up to the delayed-ACK timer, 200ms on
+  Windows)."
+  []
+  (loop [tries 3]
+    (if-let [[a b :as pair] (loopback-pair-once)]
+      (do (set-int-option! a ipproto-tcp tcp-nodelay 1)
+          (set-int-option! b ipproto-tcp tcp-nodelay 1)
+          pair)
+      (if (pos? (dec tries))
+        (recur (dec tries))
+        (throw (java.io.IOException. "loopback-pair: another connection took the listener"))))))
 
 ;; -- poll -----------------------------------------------------------------------------
 ;; One array of pollfds: entry i at i * pollfd-size. fd at 0, events and revents
