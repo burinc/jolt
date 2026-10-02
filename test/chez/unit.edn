@@ -965,7 +965,7 @@
   {:suite "charset-decoder" :expr "(let [d (doto (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (.onMalformedInput java.nio.charset.CodingErrorAction/REPLACE))] (str (.decode d (java.nio.ByteBuffer/wrap (byte-array [104 -1 105])))))" :expected "\"h�i\""}
   {:suite "charset-decoder" :expr "(try (str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (java.nio.ByteBuffer/wrap (byte-array [104 -1 105])))) (catch java.nio.charset.CharacterCodingException e (.getName (class e))))" :expected "\"java.nio.charset.MalformedInputException\""}
   {:suite "charset-decoder" :expr "[(str (.decode (.newDecoder (java.nio.charset.Charset/forName \"ISO-8859-1\")) (java.nio.ByteBuffer/wrap (byte-array [-27 -28])))) (str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-16BE\")) (java.nio.ByteBuffer/wrap (.getBytes \"hé\" \"UTF-16BE\"))))]" :expected "[\"åä\" \"hé\"]"}
-  {:suite "charset-decoder" :expr "(let [b (java.nio.CharBuffer/allocate 8)] (.put b \"ab\") (.put b \\c) [(.position b) (str (.flip b)) (.remaining b) (.getName (class b))])" :expected "[3 \"abc\" 3 \"java.nio.CharBuffer\"]"}
+  {:suite "charset-decoder" :expr "(let [b (java.nio.CharBuffer/allocate 8)] (.put b \"ab\") (.put b \\c) [(.position b) (str (.flip b)) (.remaining b) (.getName (class b))])" :expected "[3 \"abc\" 3 \"java.nio.HeapCharBuffer\"]"}
 
 
   ;; --- regex line terminators (gh-956) ----------------------------------------

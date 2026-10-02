@@ -133,9 +133,9 @@
                     (+ (* (+ e 1023) dbl-mant-unit) (- (* m (expt 2 (- 52 e))) dbl-mant-unit))
                     (* m (expt 2 1074)))))))))          ; subnormal
 (define (bits->dbl b)
-  (let* ((r (modulo b dbl-sign-bit))
-         (field (quotient r dbl-mant-unit))
-         (mant (remainder r dbl-mant-unit))
+  (let* ((r (bitwise-and b #x7fffffffffffffff))
+         (field (bitwise-arithmetic-shift-right r 52))
+         (mant (bitwise-and r #xfffffffffffff))
          (mag (cond ((= field 2047) (if (= mant 0) +inf.0 +nan.0))
                     ((= field 0) (exact->inexact (* mant (expt 2 -1074))))
                     (else (exact->inexact (* (+ dbl-mant-unit mant) (expt 2 (- field 1075))))))))
@@ -397,22 +397,27 @@
        (cond ((nan? x) #x7fc00000)
              ((infinite? x) #x7f800000)
              ((= x 0.0) 0)
-             (else
-              (let* ((m (exact (abs x))) (e (dbl-binary-exponent m)))
-                (if (>= e -126)
-                    (let* ((q (round (* m (expt 2 (- 23 e)))))   ; 2^23..2^24
-                           (e (if (= q (expt 2 24)) (+ e 1) e))
-                           (q (if (= q (expt 2 24)) (expt 2 23) q)))
-                      (if (> e 127)
-                          #x7f800000
-                          (+ (* (+ e 127) (expt 2 23)) (- q (expt 2 23)))))
-                    ;; subnormal; a round up to 2^23 is the smallest normal's
-                    ;; pattern, which the sum already spells
-                    (round (* m (expt 2 149))))))))))
+             (else (flt-mag->bits (exact (abs x))))))))
+;; The pattern, sign clear, of an exact positive rational M rounded once to
+;; single precision. Taking M exact rather than a double is what lets a caller
+;; ask about a decimal without rounding it to a double first (byte-buffer.ss
+;; finding the shortest digits of a float).
+(define (flt-mag->bits m)
+  (let ((e (dbl-binary-exponent m)))
+    (if (>= e -126)
+        (let* ((q (round (* m (expt 2 (- 23 e)))))   ; 2^23..2^24
+               (e (if (= q (expt 2 24)) (+ e 1) e))
+               (q (if (= q (expt 2 24)) (expt 2 23) q)))
+          (if (> e 127)
+              #x7f800000
+              (+ (* (+ e 127) (expt 2 23)) (- q (expt 2 23)))))
+        ;; subnormal; a round up to 2^23 is the smallest normal's
+        ;; pattern, which the sum already spells
+        (round (* m (expt 2 149))))))
 (define (bits->flt b)
-  (let* ((r (modulo b (expt 2 31)))
-         (field (quotient r (expt 2 23)))
-         (mant (remainder r (expt 2 23)))
+  (let* ((r (bitwise-and b #x7fffffff))
+         (field (bitwise-arithmetic-shift-right r 23))
+         (mant (bitwise-and r #x7fffff))
          (mag (cond ((= field 255) (if (= mant 0) +inf.0 +nan.0))
                     ((= field 0) (exact->inexact (* mant (expt 2 -149))))
                     (else (exact->inexact (* (+ (expt 2 23) mant) (expt 2 (- field 150))))))))

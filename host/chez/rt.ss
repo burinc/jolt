@@ -1829,7 +1829,23 @@
 ;; counts only when it was running THIS namespace — a require nested in a form
 ;; loads another namespace's defs, and those are not visible to the requiring
 ;; file at any ordinal.
+;; The defs a cached artifact's load makes in its own namespace, for the loader
+;; to take back if it then recompiles in this same process (loader.ss
+;; aot-safe-load-or-recompile). #f, or #(ns table): TABLE maps "ns/name" to
+;; whether that var was already defined before the load's first def of it. Only
+;; NS is recorded — a require nested in the load defines another namespace's
+;; vars for real, and the recompile will not load that namespace again.
+(define jolt-def-capture (make-parameter #f))
+(define (jolt-def-capture-note! cap ns name)
+  (when (string=? ns (vector-ref cap 0))
+    (let ((k (string-append ns "/" name)) (t (vector-ref cap 1)))
+      (unless (hashtable-contains? t k)
+        (hashtable-set! t k (jolt-with-mutex var-table-mu
+                              (let ((c (hashtable-ref var-table k #f)))
+                                (and c (var-cell-defined? c) #t))))))))
 (define (var-def-ordinal-set! ns name)
+  (let ((cap (jolt-def-capture)))
+    (when cap (jolt-def-capture-note! cap ns name)))
   (let loop ((fs (jolt-load-frames)) (inner #t))
     (unless (null? fs)
       (let ((f (car fs)))
@@ -2524,6 +2540,9 @@
 (load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
 (load "host/chez/java/tree-map.ss")            ; TreeMap / TreeSet + Comparator objects (shared)
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
+;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
+;; Self-contained; ahead of byte-buffer.ss, which encodes floats with them.
+(load "host/chez/java/math.ss")
 (load "host/chez/java/byte-buffer.ss")          ; java.nio.ByteBuffer over a byte-array
 (load "host/chez/java/charset-coding.ss")       ; CharBuffer + the CharsetDecoder decode loop
 
@@ -2559,10 +2578,6 @@
 ;; __read-tagged. Loads after inst-time.ss — __read-tagged reuses its #uuid/#inst
 ;; constructors, and the reader needs the full value/collection layer above.
 (load "host/chez/reader.ss")
-
-;; clojure.math: native flonum-math shims def-var!'d into the
-;; clojure.math ns. Self-contained (only def-var! + Chez math), order-independent.
-(load "host/chez/java/math.ss")
 
 ;; reader/macro runtime support: #?() feature set, reader-conditional + re-matcher
 ;; tagged-map ctors, macroexpand. After ns.ss; macroexpand call-time-refs the macro

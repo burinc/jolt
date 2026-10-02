@@ -1445,6 +1445,24 @@
 ;; unreachable (unbound-allowlist.txt).
 (define (jolt-array? x) #f)
 (define (jolt-array-kind x) #f)
+;; The array seam java/byte-buffer.ss asks for (Chez: natives-array.ss). No byte
+;; array exists here, so a ByteBuffer owns a bare bytevector and has no .array;
+;; nothing is a typed array, so IntBuffer/wrap and a view's bulk T[] transfers
+;; refuse the argument before reaching the accessors, which raise if they ever do.
+(define (nb-host-bytes a) #f)
+(define (nb-host-new-bytes n) #f)
+(define (nb-host-array? a kind) #f)
+(define (nb-no-arrays who)
+  (jolt-throw (jolt-host-throwable "java.lang.UnsupportedOperationException"
+                                   (string-append who ": arrays are not wired up on this target"))))
+(define (nb-host-array-len a) (nb-no-arrays "java.nio buffer array length"))
+(define (nb-host-array-ref a i) (nb-no-arrays "java.nio buffer array read"))
+(define (nb-host-array-set! a i v) (nb-no-arrays "java.nio buffer array write"))
+(define (nb-host-new-array kind n) (nb-no-arrays "java.nio typed buffer allocate"))
+(define (nb-host-chars->string a from to) (nb-no-arrays "java.nio CharBuffer array read"))
+(define (nb-host-char-string a) #f)
+(define (nb-host-char-ref a i) (nb-no-arrays "java.nio CharBuffer array read"))
+(define (nb-host-char-set! a i c) (nb-no-arrays "java.nio CharBuffer array write"))
 (define (jinst? x) #f)
 (define (jfile? x) #f)
 (define (jbigdec? x) #f)

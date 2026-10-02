@@ -18,78 +18,10 @@
 ;; (the charset jhost + decode-bytevector).
 
 ;; --- java.nio.CharBuffer -----------------------------------------------------
-;; state #(chars position limit); capacity is the backing string's length. The
-;; backing is a Chez string rather than a jolt char-array because every producer
-;; and consumer here is text: .toString is the whole point of the class for a
-;; decoding caller, and a string makes it a substring rather than a rebuild.
-(define (cbuf? x) (and (jhost? x) (string=? (jhost-tag x) "char-buffer")))
-(define (cbuf-chars b) (vector-ref (jhost-state b) 0))
-(define (cbuf-pos b) (vector-ref (jhost-state b) 1))
-(define (cbuf-limit b) (vector-ref (jhost-state b) 2))
-(define (cbuf-pos! b n) (vector-set! (jhost-state b) 1 n))
-(define (cbuf-limit! b n) (vector-set! (jhost-state b) 2 n))
-(define (cbuf-capacity b) (string-length (cbuf-chars b)))
-(define (make-char-buffer chars pos limit) (make-jhost "char-buffer" (vector chars pos limit)))
-(define (char-buffer-allocate n) (make-char-buffer (make-string n #\nul) 0 n))
-;; CharBuffer/wrap over a CharSequence is read-only on the JVM, so copying the
-;; text is not a divergence a caller can observe through the read side, and it
-;; keeps one backing type for every buffer here.
-(define (char-buffer-wrap x)
-  (let ((s (if (string? x) (string-copy x) (string-copy (jolt-str-render-one x)))))
-    (make-char-buffer s 0 (string-length s))))
-;; The JVM's CharBuffer.toString is the REMAINING characters, not the whole
-;; backing — which is what makes (.toString (.flip out)) the decoded text.
-(define (cbuf-remaining-string b) (substring (cbuf-chars b) (cbuf-pos b) (cbuf-limit b)))
-;; Append one character at the buffer's position. #f when the buffer is full,
-;; which is the OVERFLOW the decode loop reports.
-(define (cbuf-put-char! b c)
-  (let ((p (cbuf-pos b)))
-    (and (fx<? p (cbuf-limit b))
-         (begin (string-set! (cbuf-chars b) p c) (cbuf-pos! b (fx+ p 1)) #t))))
-(register-class-statics! "java.nio.CharBuffer"
-  (list (cons "allocate" (lambda (n) (char-buffer-allocate (jnum->exact n))))
-        (cons "wrap" char-buffer-wrap)))
-(register-host-methods! "char-buffer"
-  (list
-   (cons "position" (lambda (self . a)
-                      (if (pair? a) (begin (cbuf-pos! self (jnum->exact (car a))) self) (->num (cbuf-pos self)))))
-   (cons "limit" (lambda (self . a)
-                   (if (pair? a) (begin (cbuf-limit! self (jnum->exact (car a))) self) (->num (cbuf-limit self)))))
-   (cons "capacity" (lambda (self) (->num (cbuf-capacity self))))
-   (cons "remaining" (lambda (self) (->num (- (cbuf-limit self) (cbuf-pos self)))))
-   (cons "hasRemaining" (lambda (self) (> (cbuf-limit self) (cbuf-pos self))))
-   (cons "length" (lambda (self) (->num (- (cbuf-limit self) (cbuf-pos self)))))
-   (cons "flip" (lambda (self) (cbuf-limit! self (cbuf-pos self)) (cbuf-pos! self 0) self))
-   (cons "clear" (lambda (self) (cbuf-pos! self 0) (cbuf-limit! self (cbuf-capacity self)) self))
-   (cons "rewind" (lambda (self) (cbuf-pos! self 0) self))
-   ;; compact: the remaining characters move to the front and the buffer is left
-   ;; ready to be filled again — position after them, limit at capacity.
-   (cons "compact" (lambda (self)
-                     (let* ((s (cbuf-chars self)) (p (cbuf-pos self)) (n (- (cbuf-limit self) p)))
-                       (do ((i 0 (fx+ i 1))) ((fx=? i n)) (string-set! s i (string-ref s (fx+ p i))))
-                       (cbuf-pos! self n)
-                       (cbuf-limit! self (cbuf-capacity self))
-                       self)))
-   (cons "charAt" (lambda (self i) (string-ref (cbuf-chars self) (+ (cbuf-pos self) (jnum->exact i)))))
-   (cons "get" (lambda (self . a)
-                 (cond
-                   ((null? a) (let ((p (cbuf-pos self))) (cbuf-pos! self (+ p 1)) (string-ref (cbuf-chars self) p)))
-                   ((number? (car a)) (string-ref (cbuf-chars self) (jnum->exact (car a))))
-                   (else (throw-jvm (quote UnsupportedOperationException)
-                                    "java.nio.CharBuffer/get: only get() and get(int) are supported")))))
-   (cons "put" (lambda (self x . _)
-                 (let ((s (if (char? x) (string x) (if (cbuf? x) (cbuf-remaining-string x) (jolt-str-render-one x)))))
-                   (let loop ((i 0))
-                     (when (fx<? i (string-length s))
-                       (unless (cbuf-put-char! self (string-ref s i))
-                         (throw-jvm (quote java.nio.BufferOverflowException) "java.nio.CharBuffer/put"))
-                       (loop (fx+ i 1))))
-                   (when (cbuf? x) (cbuf-pos! x (cbuf-limit x)))
-                   self)))
-   (cons "append" (lambda (self x) (record-method-dispatch self "put" (jolt-list x)) self))
-   (cons "toString" cbuf-remaining-string)))
-(register-str-render! cbuf? cbuf-remaining-string)
-(register-class-arm! cbuf? (lambda (x) "java.nio.CharBuffer"))
+;; A CharBuffer is byte-buffer.ss's: a char-array buffer from allocate or
+;; wrap(char[]), the read-only string one from wrap(CharSequence), or a view of
+;; a ByteBuffer. The decode loop below writes into whichever the caller hands it,
+;; through nb-char-appender.
 
 ;; --- java.nio.charset.CodingErrorAction --------------------------------------
 ;; An enum, modeled the way TimeUnit and Normalizer.Form are: one interned jhost
@@ -246,14 +178,16 @@
 ;;                offending bytes.
 (define (decoder-decode-into d in out end-of-input?)
   (let ((kind (decoder-kind (charset-name (decoder-charset d))))
-        (on-malformed (decoder-action-name (decoder-malformed-action d))))
+        (on-malformed (decoder-action-name (decoder-malformed-action d)))
+        ;; appends one char, #f when out is full (the OVERFLOW result)
+        (put (nb-char-appender out)))
     (define (emit-string s)         ; #f when out has no room for all of it
       (let loop ((i 0))
         (cond ((fx>=? i (string-length s)) #t)
-              ((cbuf-put-char! out (string-ref s i)) (loop (fx+ i 1)))
+              ((put (string-ref s i)) (loop (fx+ i 1)))
               (else #f))))
     (define (emit-code cp)
-      (cbuf-put-char! out (integer->char cp)))
+      (put (integer->char cp)))
     (let loop ()
       (let ((p (bb-pos in)) (limit (bb-limit in)))
         (if (fx>=? p limit)
@@ -298,10 +232,11 @@
          (bv (make-bytevector n)))
     (do ((i 0 (fx+ i 1))) ((fx=? i n)) (bytevector-u8-set! bv i (decoder-byte in (+ p i))))
     (bb-pos! in (bb-limit in))
-    (let ((s (decode-bytevector bv (list (charset-name (decoder-charset d))))))
+    (let ((s (decode-bytevector bv (list (charset-name (decoder-charset d)))))
+          (put (nb-char-appender out)))
       (let loop ((i 0))
         (cond ((fx>=? i (string-length s)) coder-underflow)
-              ((cbuf-put-char! out (string-ref s i)) (loop (fx+ i 1)))
+              ((put (string-ref s i)) (loop (fx+ i 1)))
               (else coder-overflow))))))
 
 (define (decoder-decode d in out end-of-input?)
@@ -316,11 +251,11 @@
   (let* ((n (max 1 (- (bb-limit in) (bb-pos in))))
          ;; one char per byte is the ceiling for every charset here: a multi-byte
          ;; sequence decodes to one char, and a replacement is one char too.
-         (out (char-buffer-allocate n))
+         (out (nb-char-allocate n))
          (r (decoder-decode d in out #t)))
     (when (coder-result-error? r) (coder-result-throw r))
-    (cbuf-limit! out (cbuf-pos out))
-    (cbuf-pos! out 0)
+    (bb-limit! out (bb-pos out))
+    (bb-pos! out 0)
     out))
 
 (register-host-methods! "charset-decoder"
