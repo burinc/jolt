@@ -177,6 +177,15 @@
 (check "[(munge \"a-b?\") (clojure.lang.Compiler/demunge \"a_b_QMARK_\")]" "[\"a_b_QMARK_\" \"a-b?\"]")
 (check "[(Math/floor 2.5) (Math/abs -3) (String/join \",\" [\"a\" \"b\"]) (Character/isWhitespace \\space) (clojure.lang.Util/equiv 1 1)]"
        "[2.0 3 \"a,b\" true true]")
+;; java.lang.Math and clojure.math are math.ss, shared with Chez; number
+;; printing is number-print.ss, also shared (a subnormal prints its two nearest
+;; digits, as Double.toString does).
+(check "[(clojure.math/sqrt 16) (clojure.math/next-up 1.0) (clojure.math/ulp 1.0) (str (clojure.math/copy-sign 1.0 -0.0)) (clojure.math/IEEE-remainder 11.0 3.0) (clojure.math/get-exponent 1024.5)]"
+       "[4.0 1.0000000000000002 2.220446049250313E-16 \"-1.0\" -1.0 10]")
+(check "[(try (clojure.math/add-exact 9223372036854775807 1) (catch ArithmeticException e (ex-message e))) (Math/multiplyExact 6 7) (str (Math/min -0.0 0.0)) (Math/signum -2.5)]"
+       "[\"long overflow\" 42 \"-0.0\" -1.0]")
+(check "[(Double/doubleToLongBits 1.5) (str (Double/longBitsToDouble 1)) (Float/floatToIntBits 0.1) (str 9.9E-324)]"
+       "[4609434218613702656 \"4.9E-324\" 1036831949 \"9.9E-324\"]")
 (check "[(= (class (Object.)) Object) (identical? (Object.) (Object.)) (System/getProperty \"line.separator\")]"
        "[true false \"\\n\"]")
 (check "(let [sb (StringBuilder.)] (.append sb \"a\") (.append sb 1) (.append sb \\c) (str sb))" "\"a1c\"")
