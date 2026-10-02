@@ -122,8 +122,6 @@
 
 ;; --- the store: octets in a bytevector or in foreign memory ------------------
 (define (bb-direct-backing addr cap) (vector 'jolt-direct-buffer addr cap))
-(define (bb-direct-backing? x)
-  (and (vector? x) (fx=? (vector-length x) 3) (eq? (vector-ref x 0) 'jolt-direct-buffer)))
 (define (nb-faddr st) (vector-ref st 1))
 (define-syntax nb-u8
   (syntax-rules ()
@@ -186,7 +184,6 @@
 ;; --- one byte, signed, as a byte[] element is ---------------------------------
 (define (nb-s8 u) (if (fx<? u 128) u (fx- u 256)))
 (define (bb-byte-ref b i) (nb-s8 (nb-u8 (bb-backing b) (fx+ (bb-off b) i))))
-(define (bb-byte-set! b i v) (nb-u8-set! (bb-backing b) (fx+ (bb-off b) i) (fxand (nb-int v) #xff)))
 
 ;; Buffer <-> jolt byte-array block moves, by byte index into the buffer — the
 ;; seam zip-base.ss and charset-coding.ss share with get/put below.
