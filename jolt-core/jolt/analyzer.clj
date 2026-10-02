@@ -638,22 +638,33 @@
         v (symbol "fi__value")
         ps (mapv #(symbol (str "a" % "__fi")) (range arity))
         call (apply list v ps)
+        r (symbol "fi__ret")
+        ;; a primitive return unboxes the fn's answer, so nil is the JVM's
+        ;; NullPointerException before any conversion
+        unbox (fn [conv]
+                (list 'let* [r call]
+                      (list 'if (list (symbol "clojure.core" "nil?") r)
+                            (list 'throw (list 'new (symbol "java.lang.NullPointerException")))
+                            (conv r))))
         body (case ret
                ;; the JVM CASTS to Boolean (no truthiness): a non-boolean raises
-               :bool (list (symbol "clojure.core" "cast") (symbol "java.lang.Boolean") call)
-               :int (list (symbol "clojure.core" "int") call)
-               :long (list (symbol "clojure.core" "long") call)
-               :double (list (symbol "clojure.core" "double") call)
+               :bool (unbox #(list (symbol "clojure.core" "cast") (symbol "java.lang.Boolean") %))
+               :int (unbox #(list (symbol "clojure.core" "int") %))
+               :long (unbox #(list (symbol "clojure.core" "long") %))
+               :double (unbox #(list (symbol "clojure.core" "double") %))
                :void (list 'do call nil)
                call)
         iface (symbol fqn)]
+    ;; An IFn that is not already an instance gets the adapter; anything else is
+    ;; checked by the cast the JVM's checkcast is — nil and an instance pass, any
+    ;; other value is a ClassCastException.
     (list 'let* [v init]
           (list 'if (list 'if (list (symbol "clojure.core" "ifn?") v)
                           (list 'if (list (symbol "clojure.core" "instance?") iface v) false true)
                           false)
                 (list (symbol "clojure.core" "reify") iface
                       (list (symbol mname) (into [(symbol "fi__this")] ps) body))
-                v))))
+                (list (symbol "clojure.core" "cast") iface v)))))
 
 (defn- analyze-bindings [ctx bvec env]
   ;; Checked BEFORE the walk, because the walk reads pairs: an odd vector sent
@@ -2057,9 +2068,10 @@
         (let [cn (array-class-name ctx ns (array-class-dims nm))]
           (if cn
             (invoke (var-ref "jolt.host" "jolt-class-for") [(const cn)])
-            (analysis-error :analyze/unresolved-symbol
-                            (str "Unable to resolve component classname: " ns)
-                            {:jolt.error/symbol (str ns "/" nm)})))
+            ;; the reference's ClassNotFoundException, which the position box
+            ;; (as-analysis-diagnostic) carries as the cause of the positioned
+            ;; compile error, as a CompilerException carries it on the JVM
+            (throw (ClassNotFoundException. (str "Unable to resolve component classname: " ns)))))
       ns (let [r (resolve-global ctx form)]
            (if (= :var (:kind r))
              (or (macro-value-fn ctx form r)

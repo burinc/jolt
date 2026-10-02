@@ -201,6 +201,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mapMulti`; `Stream.toList` is an unmodifiable List rather than a vector.
 - `realized?` threw on `cycle`, `iterate` and `(range)`; they are IPending and
   IReduce (with `.reduce`), as on the JVM.
+- A `^Predicate`/`^Function`-hinted local had none of the interface's default
+  methods (`negate`, `and`, `andThen`, `compose`, ...); any reify of the
+  interface now answers them. A non-fn under the hint is a ClassCastException
+  and a Predicate fn answering nil a NullPointerException, as on the JVM.
+- `.forEach` on a persistent map with a fn is the JVM's ambiguity error; a
+  BiConsumer or Consumer picks its overload.
+- `to-array-2d` returns an `Object[][]`. An unknown array component
+  (`NoSuch/1`) raises ClassNotFoundException.
 - `.hashCode` of a seq or list was its hasheq instead of `List.hashCode`, and
   ArrayList/HashSet/HashMap had no `.equals`/`.hashCode`.
 - A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque

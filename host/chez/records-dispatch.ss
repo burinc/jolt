@@ -745,11 +745,21 @@
 ;; miss is a miss, as it was.
 (define abstract-class-method-hook #f)
 (define (set-abstract-class-method-hook! f) (set! abstract-class-method-hook f))
+;; An interface's DEFAULT methods (Predicate.negate, Function.andThen, …) answer
+;; for any value that implements the interface and has no method of that name
+;; itself — a reify, a deftype, or a functional-interface value jolt built —
+;; as the JVM's interface dispatch does. java/fi-defaults.ss installs the lookup;
+;; it answers a procedure of (self arg ...) or #f.
+(define iface-default-hook #f)
+(define (set-iface-default-hook! f) (set! iface-default-hook f))
 (define (dispatch-miss obj method-name args)
-  (let ((f (and class-ext-fallback-hook (class-ext-fallback-hook obj method-name))))
-    (if f
-        (apply jolt-invoke f obj args)
-        (no-method-throw method-name obj (length args)))))
+  (let ((d (and iface-default-hook (iface-default-hook obj method-name (length args)))))
+    (if d
+        (apply d obj args)
+        (let ((f (and class-ext-fallback-hook (class-ext-fallback-hook obj method-name))))
+          (if f
+              (apply jolt-invoke f obj args)
+              (no-method-throw method-name obj (length args)))))))
 
 ;; The end of the dispatch chain. A method call on nil is the JVM's
 ;; NullPointerException; anything else is its IllegalArgumentException ("No
@@ -798,25 +808,44 @@
 ;; jolt-invokes its argument refused the reify with "cannot be cast to
 ;; clojure.lang.IFn" — (.computeIfAbsent m k (reify Function (apply [_ k] …)))
 ;; failed that way while the comment below said it worked.
+;; A functional-interface value jolt builds itself — what Predicate.negate or
+;; Function.andThen answers (java/fi-defaults.ss) — is a jhost tagged
+;; "fi-lambda:<interface>" whose state is #(proc): it is called through proc.
 ;; The fixed arities keep a plain fn's call free of the rest list and apply.
+(define (fi-lambda? f)
+  (and (jhost? f)
+       (let ((t (jhost-tag f)))
+         (and (string? t) (fx>? (string-length t) 10)
+              (char=? (string-ref t 0) #\f) (char=? (string-ref t 2) #\-)
+              (char=? (string-ref t 9) #\:)
+              (string=? (substring t 0 10) "fi-lambda:")))))
+(define (fi-lambda-proc f) (vector-ref (jhost-state f) 0))
 (define jolt-fi-call
   (case-lambda
     ((f method)
-     (if (and (not (procedure? f)) (iface-method f method 1))
-         (record-method-dispatch f method jolt-nil)
-         (jolt-invoke f)))
+     (cond ((procedure? f) (jolt-invoke f))
+           ((iface-method f method 1) (record-method-dispatch f method jolt-nil))
+           ((fi-lambda? f) ((fi-lambda-proc f)))
+           (else (jolt-invoke f))))
     ((f method a)
-     (if (and (not (procedure? f)) (iface-method f method 2))
-         (record-method-dispatch f method (list->cseq (list a)))
-         (jolt-invoke1 f a)))
+     (cond ((procedure? f) (jolt-invoke1 f a))
+           ((iface-method f method 2) (record-method-dispatch f method (list->cseq (list a))))
+           ((fi-lambda? f) ((fi-lambda-proc f) a))
+           (else (jolt-invoke1 f a))))
     ((f method a b)
-     (if (and (not (procedure? f)) (iface-method f method 3))
-         (record-method-dispatch f method (list->cseq (list a b)))
-         (jolt-invoke2 f a b)))
+     (cond ((procedure? f) (jolt-invoke2 f a b))
+           ((iface-method f method 3) (record-method-dispatch f method (list->cseq (list a b))))
+           ((fi-lambda? f) ((fi-lambda-proc f) a b))
+           (else (jolt-invoke2 f a b))))
     ((f method . args)
-     (if (and (not (procedure? f)) (iface-method f method (fx+ 1 (length args))))
-         (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args)))
-         (apply jolt-invoke f args)))))
+     (cond ((procedure? f) (apply jolt-invoke f args))
+           ((iface-method f method (fx+ 1 (length args)))
+            (record-method-dispatch f method (if (null? args) jolt-nil (list->cseq args))))
+           ((fi-lambda? f) (apply (fi-lambda-proc f) args))
+           (else (apply jolt-invoke f args))))))
+;; Is x an instance of the named class (a reify or deftype declaring it)?
+(define (rd-instance-of? cname x)
+  (and (not (procedure? x)) (jolt-truthy? (instance-check cname x))))
 
 ;; --- the java.util collection surface of a jolt collection --------------------
 ;; count/seq/nth/get/containsKey/contains/size/isEmpty/hashCode, the
@@ -848,14 +877,33 @@
                          (else (loop (jolt-seq (seq-more s))))))))))
     ((string=? name "size")    (list (jolt-count obj)))
     ((string=? name "isEmpty") (list (jolt-empty? obj)))
-    ;; Iterable.forEach(Consumer): every element in seq order — a map's are its
-    ;; entries, which is the overload the JVM's reflective call picks for a map.
+    ;; Iterable.forEach(Consumer): every element in seq order. A map is both an
+    ;; Iterable and a java.util.Map, so it has two one-argument forEach
+    ;; overloads, and the JVM's reflective call picks one only when the argument
+    ;; is an instance of exactly one parameter type: a BiConsumer gets (k v), a
+    ;; Consumer the entries, and a fn — which 1.12 coerces to either — is the
+    ;; ambiguity the JVM reports.
     ((string=? name "forEach")
-     (let loop ((s (jolt-seq obj)))
-       (if (jolt-nil? s)
-           (list jolt-nil)
-           (begin (jolt-fi-call (car args) "accept" (seq-first s))
+     (let ((f (car args)))
+       (cond
+         ((and (jolt-map? obj) (rd-instance-of? "java.util.function.BiConsumer" f)
+               (not (rd-instance-of? "java.util.function.Consumer" f)))
+          (let loop ((s (jolt-seq obj)))
+            (if (jolt-nil? s)
+                (list jolt-nil)
+                (let ((e (seq-first s)))
+                  (jolt-fi-call f "accept" (jolt-nth e 0) (jolt-nth e 1))
                   (loop (jolt-seq (seq-more s)))))))
+         ((and (jolt-map? obj)
+               (not (and (rd-instance-of? "java.util.function.Consumer" f)
+                         (not (rd-instance-of? "java.util.function.BiConsumer" f)))))
+          (throw-jvm 'IllegalArgumentException "More than one matching method found: forEach"))
+         (else
+          (let loop ((s (jolt-seq obj)))
+            (if (jolt-nil? s)
+                (list jolt-nil)
+                (begin (jolt-fi-call f "accept" (seq-first s))
+                       (loop (jolt-seq (seq-more s))))))))))
 
     ;; java.util.{Map,Set,List}.hashCode — the Java collection hashCode, so a
     ;; jolt builtin matches a library's own type computing the same (flatland).
