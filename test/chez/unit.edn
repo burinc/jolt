@@ -388,6 +388,12 @@
   ;; holds them from then on (a rename while it ran included). JVM: [true "w" 3]
   ;; and ["late" 7 false].
   {:suite "threads / finished" :expr "(let [t (Thread. (fn []))] (.setDaemon t true) (.setName t \"w\") (.setPriority t 3) (.start t) (.join t) [(.isDaemon t) (.getName t) (.getPriority t)])" :expected "[true \"w\" 3]"}
+  ;; Attributes set AFTER join stick. The thread's exit hook runs after its body
+  ;; has woken join, and used to copy the id-keyed tables over the object again,
+  ;; so a setDaemon/setName/setPriority between the two was undone — about one
+  ;; run in two thousand under contention, and once in CI. Many threads at once
+  ;; is what makes the hook land in the window.
+  {:suite "threads / finished" :expr "(let [r (fn [] (let [t (Thread. (fn []))] (.start t) (.join t) (.setDaemon t true) (.setName t \"x\") (.setPriority t 2) [(.isDaemon t) (.getName t) (.getPriority t)]))] (frequencies (apply concat (pmap (fn [_] (repeatedly 400 r)) (range 8)))))" :expected "{[true \"x\" 2] 3200}"}
   {:suite "threads / finished" :expr "(let [l (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.await l)))] (.start t) (.setName t \"late\") (.setPriority t 7) (.countDown l) (.join t) [(.getName t) (.getPriority t) (.isAlive t)])" :expected "[\"late\" 7 false]"}
   ;; newVirtualThreadPerTaskExecutor runs its tasks on daemon threads, as every
   ;; virtual thread is one. JVM: true.

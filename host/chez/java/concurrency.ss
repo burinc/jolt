@@ -1916,6 +1916,21 @@
 ;; that was never started is not waited for at all (JVM: isAlive is false before
 ;; .start, so join returns at once).
 (define (jthread-alive? st) (and (vector-ref st 5) (not (vector-ref st 1))))
+;; Under st's mutex: the thread is done. The object takes the name, priority and
+;; daemon status the id-keyed tables held, is marked done and its joiners woken,
+;; in that order (jthread-attr relies on it) — ONCE. The body's end and the exit
+;; hook (io.ss) both finish a thread, and the hook runs after the body has
+;; already woken join; copying the tables again there overwrote whatever the
+;; joiner had set since. Thread.setDaemon is legal on a finished thread, so
+;; (.join t) (.setDaemon t true) (.isDaemon t) answered false whenever the hook
+;; landed between the two.
+(define (jthread-finish! st id)
+  (unless (vector-ref st 1)
+    (set-box! (vector-ref st 6) (jolt-thread-name id))
+    (vector-set! st 9 (jolt-thread-priority id))
+    (vector-set! st 8 (jolt-thread-daemon? id))
+    (vector-set! st 1 #t)
+    (jolt-cv-wake! (vector-ref st 3))))
 ;; JVM Thread() is legal: the target is null and run/start are no-ops.
 ;; Thread(), Thread(runnable) and Thread(runnable, name) — the name argument used
 ;; to be accepted and dropped, so a thread the caller had named answered with a
@@ -1998,8 +2013,7 @@
                 ;; hung — a FutureTask is a shim value, not a procedure.
                 (let ((th (vector-ref st 0))) (when th (jolt-invoke (runnable->thunk th)))))
               (jolt-with-mutex (vector-ref st 2)
-                 (vector-set! st 1 #t)
-                 (jolt-cv-wake! (vector-ref st 3)))))))
+                 (jthread-finish! st (get-thread-id)))))))
               (let ((id (sa-thread-id-of t)))
                 (when id
                   ;; the id-keyed name and priority first: getName and
