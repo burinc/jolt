@@ -869,6 +869,11 @@
 ;; boot has no provider registry to ask — records-dispatch.ss's defrecord
 ;; `create` takes the merge, so the name has to exist.
 (define (class-statics-merge! name members) (register-class-statics! name members))
+;; Chez gives a checked member wrapper the arities of the procedure it wraps
+;; (make-arity-wrapper-procedure), so a reflective arity probe sees the JVM's.
+;; Gambit has no arity masks and its static sites do not probe one: the
+;; wrapper is the member, and a wrong-count call fails inside it.
+(define (host-arity-like f wrapper) wrapper)
 ;; A member-table write, which on Chez also moves the epoch its static-site caches
 ;; validate against. Gambit's sites do not cache (host-statics.ss), so it is the write.
 (define (class-statics-member-set! h member v) (hashtable-set! h member v))

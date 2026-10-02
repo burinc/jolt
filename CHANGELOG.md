@@ -22,6 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clojure.java.basis, clojure.repl.deps and clojure.tools.deps.interop are not
   ported.
 
+- **The rest of `clojure.math`.** `IEEE-remainder`, `copy-sign`,
+  `get-exponent`, `next-after`, `next-up`, `next-down`, `ulp`, `scalb`,
+  `random`, and the exact long arithmetic (`add-exact`, `subtract-exact`,
+  `multiply-exact`, `increment-exact`, `decrement-exact`, `negate-exact`, which
+  raise ArithmeticException "long overflow"), with the `java.lang.Math`
+  statics behind them (`Math/nextUp`, `Math/addExact`, …). All 45 vars
+  upstream defines are there now; 15 were missing. `java.lang.Math` and
+  `clojure.math` are one portable file, so the Gambit host has both too (it
+  had no `clojure.math` at all, and `Math` there was only `floor` and `abs`).
+
+- **`Double/doubleToLongBits`, `doubleToRawLongBits`, `longBitsToDouble` and
+  the `Float` int-bits trio.** `floatToIntBits` casts like `(float x)`, so a
+  value past `Float/MAX_VALUE` is IllegalArgumentException as on the JVM, and
+  `intBitsToFloat` answers the float's value as a double, since jolt has one
+  flonum type.
+
 - **A readiness poller on Windows.** jolt.io-poller has a WSAPoll backend, so
   sockets on Windows are non-blocking and wait on it the way they wait on
   kqueue and epoll elsewhere: a fiber reading a socket parks instead of holding
@@ -214,6 +230,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque
   `#object` under `pr`, compared unequal to the Clojure collection with the same
   elements, and had the wrong `str`/`toString`.
+
+- **`Math/copySign`, `max`, `min` and `signum` follow the JVM on -0.0 and
+  NaN.**
+
+  ```clojure
+  [(Math/copySign 2.0 -0.0) (Math/min -0.0 0.0) (Math/max ##NaN 1.0) (Math/signum -0.0)]
+  ;; before: [2.0 0.0 1.0 0.0]
+  ;; after:  [-2.0 -0.0 ##NaN -0.0]
+  ```
+
+  A mixed long/double `Math/max` returns a double, as the double overload does.
+
+- **A subnormal double prints as `Double.toString` does.** The JVM prints at
+  least two significant digits and picks the two nearest the value, so
+  `Double/MIN_VALUE` is `4.9E-324`; jolt padded the shortest digits and printed
+  `5.0E-324`, and `9.9E-324` as `1.0E-323`. Checked against the JVM over every
+  subnormal below 2000 ulps and 20,000 random ones. `format` starts from the
+  same digits, so `(format "%.2e" 4.9E-324)` is `"4.90e-324"`, and number
+  printing is one shared file for both hosts now.
 
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux
