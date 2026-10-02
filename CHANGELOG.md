@@ -208,6 +208,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A double halfway between two 16- or 17-digit decimals prints the even
+  one.** Chez breaks that tie upward and `Double.toString` to the even digit,
+  so a few long doubles printed one digit off the JVM.
+
+  ```clojure
+  (pr-str 1.3381632805467082E15)
+  ;; before: "1.3381632805467083E15"
+  ;; after:  "1.3381632805467082E15"
+  ```
+
 - **ByteBuffer raises the JDK's exceptions and reports the JDK's classes.**
   Reading or writing past the limit was `ArrayIndexOutOfBoundsException` (or
   wrote past the limit into the backing array) where the JDK throws
