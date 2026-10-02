@@ -1027,6 +1027,45 @@ for ac2_order in a z; do
   rm -rf "$cache_ac2"
 done
 
+# --- (ae) a recovery recompile does not see the failed load's later defs ------
+# recover! recompiles in the process the damaged artifact already ran in. That
+# load defined the namespace's vars, so a (defn get ...) BELOW a (get m k) was
+# visible when the recompile analyzed the earlier form: f bound to the ns's own
+# get, and the poisoned artifact was published for every later run (#1219). A
+# fresh process resolves that get to clojure.core. Damaged two ways: a truncated
+# .so (the load raises or stops short) and one missing its completion marker.
+ae="$tmp/ae"; mkdir -p "$ae/src"
+printf '(ns shadow-ns)\n\n(defn f []\n  (get {:a 1} :a))\n\n(defn get\n  [url opts]\n  [:shadow url opts])\n' > "$ae/src/shadow_ns.clj"
+for ae_mode in truncate unmark; do
+  cache_ae="$(mktemp -d)"
+  aerun() {
+    JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ae" JOLT_QUIET=1 "$jolt" -e "
+      (require 'jolt.deps) (jolt.deps/add-deps {:deps {'ae/ae {:local/root \"$ae\"}}})
+      (require 'shadow-ns) (println (shadow-ns/f))" 2>/dev/null | tail -1
+  }
+  ae_cold="$(aerun)"
+  ae_so="$(find "$cache_ae" -name 'shadow-ns-*.so' | head -1)"
+  ae_damaged=0
+  if [ "$ae_mode" = truncate ] && [ -n "$ae_so" ]; then
+    ae_size="$(wc -c < "$ae_so" | tr -d ' ')"
+    head -c $((ae_size - 16)) "$ae_so" > "$ae_so.t" && mv "$ae_so.t" "$ae_so" && ae_damaged=1
+  elif [ "$ae_mode" = unmark ] && [ -n "$ae_so" ] && [ -n "$chez_bin" ]; then
+    ae_scm="${ae_so%.so}.scm"
+    grep -v 'aot-mark-complete!' "$ae_scm" > "$ae_scm.cut"
+    printf '(compile-file "%s" "%s")\n' "$ae_scm.cut" "$ae_so" | "$chez_bin" -q >/dev/null 2>&1 && ae_damaged=1
+  fi
+  ae_recover="$(aerun)"
+  ae_next="$(aerun)"
+  if [ "$ae_damaged" = 0 ]; then
+    echo "SKIP: (ae) $ae_mode: no artifact to damage (or no chez on PATH)"
+  elif [ "$ae_cold" = "1" ] && [ "$ae_recover" = "1" ] && [ "$ae_next" = "1" ]; then
+    echo "PASS: (ae) $ae_mode: recovery recompile resolves get to clojure.core, cache not poisoned"; pass=$((pass+1))
+  else
+    echo "FAIL: (ae) $ae_mode: cold='$ae_cold' recover='$ae_recover' next='$ae_next' (expected 1 each)"; fails=$((fails+1))
+  fi
+  rm -rf "$cache_ae"
+done
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 

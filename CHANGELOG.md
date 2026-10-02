@@ -195,6 +195,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Recovering a damaged AOT cache entry no longer compiles against the
+  failed load's own definitions** (#1219). When a cached artifact was
+  truncated, incomplete or built on a stale assumption, jolt recompiled the
+  namespace in the same process the artifact had just run in. Its later
+  definitions were already in place, so a `(get m k)` above a same-namespace
+  `(defn get ...)` bound to the namespace's `get` instead of `clojure.core`'s,
+  and the result went back into the cache for every later run:
+
+  ```clojure
+  (ns shadow-ns)
+  (defn f [] (get {:a 1} :a))
+  (defn get [url opts] [:shadow url opts])
+  ;; after a truncated cache entry, before: (shadow-ns/f) => [:shadow {:a 1} :a]
+  ;;                                after:  (shadow-ns/f) => 1
+  ```
+
+  The recovery now takes back the definitions the failed load made before it
+  recompiles, so it compiles what a fresh process would.
+
 - **SCI's constructor reflection.** `Class.getConstructors` and
   `getParameterTypes` answer typed arrays (`Constructor[]`, `Class[]`) instead
   of vectors, which an `^objects` aget refused, and `Constructor.newInstance`
