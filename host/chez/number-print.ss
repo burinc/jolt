@@ -28,6 +28,43 @@
          (let ((s (number->string n)))
            (cons (if (char=? (string-ref s 1) #\0) (substring s 0 1) s) point)))))
 
+;; At 16 or 17 significant digits the double can lie exactly halfway between
+;; two decimals of that length that both read back as it, and the host and the
+;; JVM may break that tie differently: Chez rounds it up, Double.toString to the
+;; even digit (1338163280546708.25 is 1.3381632805467082E15 on the JVM,
+;; -650605845684.15625 is -6.506058456841562E11). Only an odd last digit D can
+;; be the wrong side of a tie, with the double exactly half a unit of the last
+;; place from D; that needs x * 2^(1-p) to be an odd integer, which is checked
+;; first in flonum arithmetic, so an ordinary long double costs a parity test
+;; and a few float operations, never the exact arithmetic. Answers the even neighbour's digits, or
+;; #f to keep the host's.
+(define (flonum-long-digits x digits point)
+  (let ((dlen (string-length digits)))
+    (and (odd? (char->integer (string-ref digits (fx- dlen 1))))   ; #\1 is 49
+         (let ((p (- point dlen)))                 ; the last digit's place
+           ;; x * 2^(1-p) is an odd integer: exact in flonum arithmetic, since
+           ;; scaling by a power of two only moves the exponent
+           (and (if (< p 0)
+                    (let ((y (* x (expt 2.0 (- 1 p)))))
+                      (and (= y (round y)) (not (= (* y 0.5) (round (* y 0.5))))))
+                    (and (> p 0) (integer? x)))
+                (let* ((v (exact x))
+                       (d (string->number digits))
+                       (unit (expt 10 p))
+                       (even (cond ((= v (* (- d 1/2) unit)) (- d 1))
+                                   ((= v (* (+ d 1/2) unit)) (+ d 1))
+                                   (else #f)))
+                       ;; and only when that neighbour reads back as x: a unit
+                       ;; wider than the double's spacing leaves the host's
+                       ;; digits the only ones that do
+                       (s (and even (= (exact->inexact (* even unit)) x)
+                               (number->string even))))
+                  (and s (fx=? (string-length s) dlen)
+                       (let loop ((k dlen))
+                         (if (and (fx>? k 1) (char=? (string-ref s (fx- k 1)) #\0))
+                             (loop (fx- k 1))
+                             (substring s 0 k))))))))))
+
 (define (jolt-flonum->string x)
   (let* ((s (number->string x))
          (neg? (char=? (string-ref s 0) #\-))
@@ -68,6 +105,8 @@
                    (if (and (fx>? i 1) (char=? (string-ref digits (fx- i 1)) #\0))
                        (loop (fx- i 1)) i)))
            (digits (substring digits 0 dlen))
+           (digits (or (and (fx>=? dlen 16) (flonum-long-digits (flabs x) digits point)) digits))
+           (dlen (string-length digits))
            ;; Double.toString never prints fewer than two significant digits, and
            ;; it picks the two-digit decimal NEAREST the double rather than padding
            ;; the shortest one with a 0. For a normal double that is the same

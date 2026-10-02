@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The rest of `java.nio.ByteBuffer`, the typed buffers and `ByteOrder`.**
+  A buffer has a byte order now (`ByteOrder/BIG_ENDIAN`, `LITTLE_ENDIAN`,
+  `nativeOrder`; `.order` reads and sets it) and every multi-byte get and put
+  honours it. `getFloat`/`putFloat`/`getDouble`/`putDouble`, `mark`/`reset`,
+  `isDirect`, `isReadOnly`, `equals`/`hashCode`/`compareTo`/`mismatch` over the
+  remaining bytes, `slice(index, length)`, the absolute bulk forms
+  (`get(int, byte[])`, `put(int, byte[], int, int)`, `put(int, ByteBuffer, int,
+  int)`) and `toString` are there, and `=`, `hash` and `compare` on buffers
+  agree with them. `asShortBuffer`, `asCharBuffer`, `asIntBuffer`,
+  `asLongBuffer`, `asFloatBuffer` and `asDoubleBuffer` are views sharing the
+  buffer's bytes, and `IntBuffer`, `LongBuffer`, `ShortBuffer`, `FloatBuffer`
+  and `DoubleBuffer` have `wrap` and `allocate` over their arrays.
+
+  ```clojure
+  (let [b (.order (ByteBuffer/allocate 12) ByteOrder/LITTLE_ENDIAN)]
+    (.putInt b 1) (.putDouble b 1.0) (vec (.array b)))
+  ;; before: No dependency provides java.nio.ByteOrder
+  ;; after:  [1 0 0 0 0 0 0 0 0 0 -16 63]
+  ```
+
+  A float reads back as the shortest decimal that names it, so `(.getFloat
+  b)` after `(.putFloat b 0.1)` is `0.1`, which is what `(float 0.1)` is on
+  jolt. The same file runs on the Gambit target, where a buffer's bytes are a
+  bytevector; there are no arrays there, so `.array` and the typed buffers'
+  `wrap` and `allocate` are not available.
+
 - **Clojure 1.12.** `*clojure-version*` reports 1.12, and the 1.12 language
   features jolt was missing are in: `Class/new` and `Class/.method` as values
   (with `^[...]` param-tags picking the arity), array class symbols (`String/1`,
@@ -194,6 +220,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(shutdown-agents)` over a connection leaves it serving the next one.
 
 ### Fixed
+
+- **A double halfway between two 16- or 17-digit decimals prints the even
+  one.** Chez breaks that tie upward and `Double.toString` to the even digit,
+  so a few long doubles printed one digit off the JVM.
+
+  ```clojure
+  (pr-str 1.3381632805467082E15)
+  ;; before: "1.3381632805467083E15"
+  ;; after:  "1.3381632805467082E15"
+  ```
+
+- **ByteBuffer raises the JDK's exceptions and reports the JDK's classes.**
+  Reading or writing past the limit was `ArrayIndexOutOfBoundsException` (or
+  wrote past the limit into the backing array) where the JDK throws
+  `BufferUnderflowException`, `BufferOverflowException` or, for an absolute
+  index, `IndexOutOfBoundsException`; `position` and `limit` accepted any
+  value, and a limit below the position left the position past it.
+  `asReadOnlyBuffer` returned a writable buffer. `(class b)` was
+  `java.nio.ByteBuffer` for every buffer and `(instance? java.nio.Buffer b)`
+  was false; it is `java.nio.HeapByteBuffer`, `DirectByteBuffer` or their
+  read-only classes now, as on the JDK, and `allocateDirect` answers
+  `isDirect` true and `hasArray` false. `CharBuffer/allocate` is a
+  `java.nio.HeapCharBuffer`, and `CharBuffer/wrap` of a string is the
+  read-only `java.nio.StringCharBuffer` it is on the JDK, so a `put` into it
+  throws `ReadOnlyBufferException` instead of writing to a copy.
+  `CharBuffer/wrap` of a `char[]` shares the array, with `wrap(arr, off, len)`
+  setting position and limit as the JDK does, `wrap` of a StringBuilder
+  reads it live, and `equals`, `hashCode`,
+  `compareTo` and `mismatch` agree across every kind of CharBuffer, a
+  ByteBuffer's `asCharBuffer` view included.
 
 - **Recovering a damaged AOT cache entry no longer compiles against the
   failed load's own definitions** (#1219). When a cached artifact was

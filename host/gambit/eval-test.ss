@@ -206,6 +206,28 @@
        "[\"java.lang.Long\" \"String\" true \"class java.lang.Number\"]")
 (check "[(str (class [])) (str Sequential) (pr-str Long)]"
        "[\"class clojure.lang.PersistentVector\" \"interface clojure.lang.Sequential\" \"java.lang.Long\"]")
+;; java/byte-buffer.ss (shared with Chez): ByteBuffer over a bytevector — the
+;; widths, byte order, the exact-arithmetic float codecs, views, the JDK's
+;; exceptions and value semantics, and compact's in-place block move
+(check "(let [b (java.nio.ByteBuffer/allocate 16)] (.putInt b 258) (.putDouble b 1.5) (.flip b) [(.getInt b) (.getDouble b) (.remaining b)])"
+       "[258 1.5 0]")
+(check "(let [b (.order (java.nio.ByteBuffer/allocate 4) java.nio.ByteOrder/LITTLE_ENDIAN)] (.putInt b 1) (.rewind b) [(.get b) (.get b 1) (str (.order b))])"
+       "[1 0 \"LITTLE_ENDIAN\"]")
+(check "(let [b (java.nio.ByteBuffer/allocate 4)] (.putFloat b 0.1) [(.getFloat b 0) (.getInt b 0)])"
+       "[0.1 1036831949]")
+(check "[(str (java.nio.ByteBuffer/allocate 2)) (.getName (class (java.nio.ByteBuffer/allocateDirect 1))) (instance? java.nio.Buffer (java.nio.ByteBuffer/allocate 1))]"
+       "[\"java.nio.HeapByteBuffer[pos=0 lim=2 cap=2]\" \"java.nio.DirectByteBuffer\" true]")
+(check "(let [b (java.nio.ByteBuffer/allocate 8) i (.asIntBuffer b)] (.put i 1 7) [(.getInt b 4) (str (.asCharBuffer (doto (java.nio.ByteBuffer/allocate 4) (.putChar \\h) (.putChar \\i) .flip)))])"
+       "[7 \"hi\"]")
+(check "[(try (.getInt (java.nio.ByteBuffer/allocate 2)) (catch java.nio.BufferUnderflowException e :underflow)) (try (.put (.asReadOnlyBuffer (java.nio.ByteBuffer/allocate 1)) (byte 1)) (catch java.nio.ReadOnlyBufferException e :read-only))]"
+       "[:underflow :read-only]")
+(check "[(= (java.nio.ByteBuffer/allocate 2) (java.nio.ByteBuffer/allocate 2)) (.hashCode (doto (java.nio.ByteBuffer/allocate 2) (.put (byte 1)) .flip)) (compare (doto (java.nio.ByteBuffer/allocate 1) (.put 0 (byte 5))) (java.nio.ByteBuffer/allocate 1))]"
+       "[true 32 5]")
+(check "(let [b (java.nio.ByteBuffer/allocate 4)] (.putInt b 16909060) (.flip b) (.get b) (.compact b) [(.position b) (.get b 0) (.get b 2)])"
+       "[3 2 4]")
+;; a StringCharBuffer needs no array, so CharBuffer/wrap of a string is here too
+(check "(let [s (java.nio.CharBuffer/wrap \"hi\") v (.asCharBuffer (doto (java.nio.ByteBuffer/allocate 4) (.putChar \\h) (.putChar \\i) .flip))] [(= s v) (.hashCode s) (str (.subSequence s 1 2)) (.getName (class s)) (.isReadOnly s)])"
+       "[true 4320 \"i\" \"java.nio.StringCharBuffer\" true]")
 
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")

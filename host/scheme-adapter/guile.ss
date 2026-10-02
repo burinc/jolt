@@ -195,6 +195,8 @@
 ;;   sa-vector-append                     UNIMPLEMENTED  Guile: vector-append (R7RS).
 ;;   sa-string-copy-range!                UNIMPLEMENTED  Guile: string-copy! (SRFI-13 /
 ;;                                        R7RS) has the contract's argument order.
+;;   sa-bytevector-copy-range!            UNIMPLEMENTED  Guile: R7RS bytevector-copy!
+;;                                        has the contract's argument order.
 
 ;; ---------------------------------------------------------------------------
 ;; tier: misc
