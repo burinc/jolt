@@ -5,7 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.16] - 2026-10-02
+
+jolt reports Clojure 1.12 and has what it added: `Class/new` and
+`Class/.method` values, array class symbols, functional-interface adaptation
+and `java.util.stream`. Threads follow the JVM: the process waits for its
+non-daemon threads before it exits (a behaviour change, see Changed), a fiber
+is a virtual thread, and channel ops and futures are interruptible, with
+`CompletableFuture` new. `java.util.TreeMap` and `TreeSet` are new, and
+`java.nio.ByteBuffer` and `clojure.math` are complete, all on the Gambit host
+too. Windows gets a readiness poller for sockets. Also fixed: a damaged AOT
+cache entry no longer recompiles against its own later definitions, subnormal
+and tied doubles print as the JVM prints them, and conj onto a vector sliced
+just past a trie boundary.
 
 ### Added
 
@@ -251,6 +263,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(shutdown-agents)` over a connection leaves it serving the next one.
 
 ### Fixed
+
+- **A failed git clone can be retried on Windows.** `fetch-git!` clears its
+  staging directory with `delete-tree!` before each attempt, but git writes its
+  objects read-only, Windows refuses to delete a read-only file, and the
+  failure was swallowed. The partial clone stayed and every retry died on
+  "destination path ... already exists and is not an empty directory".
+  `delete-tree!` now clears the read-only attribute on a file it cannot delete
+  and tries again.
 
 - **A double halfway between two 16- or 17-digit decimals prints the even
   one.** Chez breaks that tie upward and `Double.toString` to the even digit,
