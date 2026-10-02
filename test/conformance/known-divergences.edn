@@ -1082,41 +1082,6 @@
    :check :prose
    :why "Windows-only; the gate runs on whichever host invoked it"
    :note "POSIX is unaffected and enumerates through getifaddrs as before. InetAddress/getLocalHost and getByName DO work on Windows — they go through gethostname and the resolver, not the interface table. Code that needs a Windows adapter list has no answer here yet; the fix is a GetAdaptersAddresses walk."}
-  ;; A socket on jolt is set O_NONBLOCK so a fiber that would block can park on
-  ;; jolt.io-poller instead of pinning its carrier (fibers R8). That poller is
-  ;; kqueue or epoll, and Windows has neither: WSAPoll is a stateless poll rather
-  ;; than a kernel-held registration set, and its own wake channel would have to
-  ;; be a loopback socket pair, since it accepts only sockets. So sockets stay
-  ;; BLOCKING on Windows (jolt-lang/jolt#1107).
-  ;;
-  ;; Worth being precise about which direction this diverges in: blocking is what
-  ;; java.net.Socket IS on the JVM — the non-blocking descriptor and the readiness
-  ;; poller are jolt's fiber extension OVER java.net, not part of its contract.
-  ;; What Windows is missing is therefore a jolt superset, not a java.net
-  ;; behaviour, and the visible consequence is throughput under fibers rather than
-  ;; a different answer from any java.net call.
-  {:category :host-model
-   :behavior "a fiber blocked on a java.net socket read or write ON WINDOWS"
-   :jvm "n/a — the JVM has no fibers over java.net.Socket; a virtual thread unmounts because the JDK's own socket implementation is non-blocking underneath"
-   :jolt "the fiber's carrier thread blocks in recv/send; the fibers queued behind it wait"
-   :check :prose
-   :why "Windows-only; the gate runs on whichever host invoked it"
-   :note "POSIX is unaffected — kqueue/epoll park the fiber as before. Every java.net call answers the same value on Windows; only the concurrency of a fiber pool changes. jolt.io-poller/nonblock! is the no-op that makes this deliberate rather than a broken non-blocking socket with nothing able to wait for it."}
-  ;; SO_TIMEOUT and connect(endpoint, timeout) are waits on that same poller: a
-  ;; read, accept or pending connect that hits EAGAIN/EINPROGRESS waits with a
-  ;; deadline (jolt-lang/jolt#1191, #1192). A blocking Windows socket never gets
-  ;; to that wait. SO_RCVTIMEO would bound a recv there, but Winsock leaves a
-  ;; socket whose blocking recv timed out in an indeterminate state, which is not
-  ;; the JDK's "the socket remains valid", and it does nothing for accept or
-  ;; connect — the JDK's Windows implementation is non-blocking plus a poll for
-  ;; exactly this reason.
-  {:category :host-model
-   :behavior "(.setSoTimeout socket 500) then a read with no data, or (.connect socket endpoint 500) to a peer that never answers, ON WINDOWS"
-   :jvm "throws java.net.SocketTimeoutException after ~500 ms"
-   :jolt "the value is stored and getSoTimeout reports it, but the read, accept or connect blocks until the OS resolves it"
-   :check :prose
-   :why "Windows-only; the gate runs on whichever host invoked it"
-   :note "POSIX enforces both, on threads and fibers (test/chez/socket-test.clj). The fix is the same one the fiber divergence above needs: a Windows readiness wait."}
   {:category :host-model
    :behavior "(System/getProperty \"line.separator\") and clojure.core/system-newline, ON WINDOWS"
    :jvm "\"\\r\\n\" — the platform's own convention"
