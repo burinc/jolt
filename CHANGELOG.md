@@ -194,6 +194,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An ArityException past 20 arguments says `(> 20)`.
 - `Objects/deepEquals` was false for two typed reference arrays (a `String[]`
   against another, or against an `Object[]`); `Arrays/deepEquals` was missing.
+- Stream `anyMatch`/`allMatch`/`noneMatch` realized the whole stream first, so
+  they never returned on an infinite one, and every stage ran a whole chunk
+  before the next saw it. A pipeline now pulls one element at a time. Added
+  `Collectors/groupingBy`, `toMap` and `partitioningBy`, `summaryStatistics` and
+  `mapMulti`; `Stream.toList` is an unmodifiable List rather than a vector.
 - `.hashCode` of a seq or list was its hasheq instead of `List.hashCode`, and
   ArrayList/HashSet/HashMap had no `.equals`/`.hashCode`.
 - A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque

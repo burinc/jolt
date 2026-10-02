@@ -276,7 +276,8 @@
   (and (jhost? x) (or (string=? (jhost-tag x) "arraylist")
                        (string=? (jhost-tag x) "linkedlist")
                        (string=? (jhost-tag x) "arraydeque")
-                       (string=? (jhost-tag x) "arrays-aslist"))))
+                       (string=? (jhost-tag x) "arrays-aslist")
+                       (string=? (jhost-tag x) "immutable-list"))))
 (register-seq-arm! al-family? (lambda (x) (list->cseq (al->list x))))
 
 ;; ---- StringWriter -----------------------------------------------------------
@@ -1072,7 +1073,8 @@
      "}")))
 (define (jcoll-printed? x)
   (and (jhost? x)
-       (member (jhost-tag x) '("hashmap" "properties" "arraylist" "arrays-aslist" "linkedlist" "hashset"))
+       (member (jhost-tag x) '("hashmap" "properties" "arraylist" "arrays-aslist" "immutable-list"
+                                "linkedlist" "hashset"))
        #t))
 (define (jcoll-print x render)
   (let ((t (jhost-tag x)))
@@ -1088,7 +1090,7 @@
 ;; element. Only mixed pairs reach the arm walk (two vectors, maps or sets are
 ;; answered ahead of it), and an ArrayDeque is no List, so it stays unequal.
 (define (jlist-shim? x)
-  (and (jhost? x) (member (jhost-tag x) '("arraylist" "linkedlist" "arrays-aslist")) #t))
+  (and (jhost? x) (member (jhost-tag x) '("arraylist" "linkedlist" "arrays-aslist" "immutable-list")) #t))
 (define (jeq-sequential? x)
   (or (pvec? x) (cseq? x) (empty-list-t? x) (jolt-lazyseq? x) (jlist-shim? x)))
 (define (jeq-set? x) (or (pset? x) (hs-hashset? x)))
@@ -2596,6 +2598,23 @@
            '(("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0)
              ("addFirst" 1) ("addLast" 1) ("removeFirst" 0) ("removeLast" 0))))))
 (register-host-methods! "arrays-aslist" arrays-aslist-methods)
+
+;; An unmodifiable List (java.util.ImmutableCollections$ListN) — what
+;; Stream.toList and List.copyOf answer: every reader of the ArrayList table, and
+;; every mutator, set included, raises UnsupportedOperationException. Same state
+;; layout as the ArrayList, #(backing count head).
+(define (make-immutable-list xs)
+  (make-jhost "immutable-list" (vector (list->vector xs) (length xs) 0)))
+(register-host-methods! "immutable-list"
+  (append
+    (map (lambda (n) (cons n (cdr (assoc n arraylist-methods))))
+         '("get" "size" "isEmpty" "contains" "toArray" "iterator" "toString" "forEach"
+           "equals" "hashCode"))
+    (list (cons "getFirst" al-first) (cons "getLast" al-last))
+    (map (lambda (e) (cons (car e) (host-arity-of (cdr e) #t aslist-unsupported)))
+         '(("set" 2) ("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0) ("removeIf" 1)
+           ("replaceAll" 1) ("sort" 1) ("addFirst" 1) ("addLast" 1)
+           ("removeFirst" 0) ("removeLast" 0)))))
 
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the

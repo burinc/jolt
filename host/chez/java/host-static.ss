@@ -283,6 +283,7 @@
     ("arraylist" "addAll" 1 2)
     ("arraylist" "toArray" 0 1)
     ("arrays-aslist" "toArray" 0 1)
+    ("immutable-list" "toArray" 0 1)
     ("byte-buffer" "get" 0 1 2 3 4)
     ("byte-buffer" "getChar" 0 1)
     ("byte-buffer" "getInt" 0 1)
