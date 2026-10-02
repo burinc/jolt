@@ -197,8 +197,9 @@
   (nb-store-copy! (nb-array-octets src) soff (bb-backing b) (fx+ (bb-off b) idx) n))
 
 ;; --- IEEE 754 encodings ----------------------------------------------------
-;; The bit patterns are math.ss's dbl->bits / bits->dbl / flt->bits / bits->flt
-;; (exact arithmetic, the same on every target; math.ss is loaded on both). What
+;; The bit patterns are math.ss's dbl->bits, bits->dbl, flt->bits, bits->flt and
+;; flt-mag->bits (exact arithmetic, the same on every target; math.ss is loaded
+;; on both). What
 ;; is this file's own is how a FLOAT reads back.
 ;;
 ;; The float a pattern holds, as jolt holds a float: a double. jolt has no
@@ -229,7 +230,7 @@
           (inexact m)
           (let* ((s (expt 10 (- e10 (- n 1))))
                  (cand (* (round (/ m s)) s)))
-            (if (and (> cand 0) (= (flt->bits cand) bits))
+            (if (and (> cand 0) (= (flt-mag->bits cand) bits))
                 (inexact cand)
                 (loop (+ n 1))))))))
 
