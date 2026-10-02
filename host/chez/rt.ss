@@ -460,8 +460,8 @@
 ;; bounded by HARD, and a live set that cannot fit still raises.
 ;;
 ;; Under SOFT the wait is a quarter of that room, not half. The forced collection
-;; needs room of its own: a tight one still copies the sparse old segments
-;; (sa-collect-tight), and waiting for half the room put the first one at
+;; needs room of its own: a tight one still copies the nursery and the sparse
+;; old segments (sa-collect-tight), and waiting for half the room put the first one at
 ;; 199MB of a 256MB ceiling with ~90MB to copy, peaking at 291MB. A quarter
 ;; still keeps a live set just under SOFT from collecting after every young
 ;; collection.
