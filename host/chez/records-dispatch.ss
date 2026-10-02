@@ -684,7 +684,12 @@
                  (else (loop (jolt-seq (seq-more s))))))))
       ;; universal Object methods on any remaining value (boolean, etc.).
       ((string=? method-name "toString") (jolt-str-render-one obj))
-      ((string=? method-name "hashCode") (jolt-hash obj))
+      ;; a seq or list is a java.util.List: List.hashCode (31*h + e.hashCode),
+      ;; which an infinite one refuses (CLJ-2839) — not its hasheq
+      ((string=? method-name "hashCode")
+       (if (or (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj))
+           (jolt-java-hashcode obj)
+           (jolt-hash obj)))
       ((string=? method-name "equals") (and (pair? rest) (if (jolt= obj (car rest)) #t #f)))
       ;; __methodImplCache is the JVM's per-fn protocol-method cache. jolt does not
       ;; cache protocol dispatch, so a read is nil (and the paired set! is a no-op):

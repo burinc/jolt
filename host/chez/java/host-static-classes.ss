@@ -135,6 +135,13 @@
       (fold-left (lambda (a s) (string-append a ", " s)) (car strs) (cdr strs))))
 (define (jcoll-tostring self elems)
   (string-append "[" (jcoll-join (map (lambda (x) (jtostring-of x self "(this Collection)")) elems)) "]"))
+(define (jlist-hashcode elems)
+  (fold-left (lambda (h x) (i32 (+ (* 31 h) (jolt-java-hashcode x)))) 1 elems))
+(define (jset-hashcode elems)
+  (fold-left (lambda (h x) (i32 (+ h (jolt-java-hashcode x)))) 0 elems))
+;; Object.equals of a java.util collection: itself, or (jcoll-equiv?, below) a
+;; List against a List, a Set against a Set, a Map against a Map.
+(define (jcoll-equals? self o) (or (eq? self o) (jcoll-equiv? self o)))
 (define (jmap-tostring self)
   (string-append
    "{"
@@ -202,7 +209,11 @@
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
     (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))
-    (cons "toString" (lambda (self) (jcoll-tostring self (al->list self))))))
+    (cons "toString" (lambda (self) (jcoll-tostring self (al->list self))))
+    ;; List.equals / List.hashCode: element-wise against any java.util.List
+    ;; (a vector, a seq, another list shim), and 31*h + e.hashCode from 1.
+    (cons "equals" (lambda (self o) (jcoll-equals? self o)))
+    (cons "hashCode" (lambda (self) (jlist-hashcode (al->list self))))))
 ;; java.util.SequencedCollection (JDK 21): List and Deque both have it, so the
 ;; first/last accessors and mutators sit on the shared ArrayList table and
 ;; LinkedList / ArrayDeque inherit them. On an empty list the accessors raise
@@ -246,7 +257,12 @@
 ;; capacity arg is a hint on the JVM — an empty deque here.)
 (define (make-arraydeque xs)
   (let ((al (make-arraylist xs))) (make-jhost "arraydeque" (jhost-state al))))
-(register-host-methods! "arraydeque" linkedlist-methods)
+;; An ArrayDeque is only a Collection: it keeps Object's identity equals and
+;; hashCode, where the List shims compare element-wise.
+(register-host-methods! "arraydeque"
+  (append (list (cons "equals" (lambda (self o) (eq? self o)))
+                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self)))))
+          (filter (lambda (p) (not (member (car p) '("equals" "hashCode")))) linkedlist-methods)))
 (let ((ctor (lambda args
               (cond ((null? args) (make-arraydeque '()))
                     ((number? (car args)) (make-arraydeque '()))
@@ -696,7 +712,14 @@
                           (map (lambda (k) (hashtable-ref (hm-tbl self) k jolt-nil))
                                (hm-keys-ordered self)))))
         (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))
-        (cons "toString" (lambda (self) (jmap-tostring self)))))
+        (cons "toString" (lambda (self) (jmap-tostring self)))
+        ;; Map.equals / Map.hashCode (the sum of key.hashCode ^ value.hashCode)
+        (cons "equals" (lambda (self o) (jcoll-equals? self o)))
+        (cons "hashCode" (lambda (self)
+          (fold-left (lambda (h k)
+                       (i32 (+ h (bitwise-xor (jolt-java-hashcode k)
+                                              (jolt-java-hashcode (hashtable-ref (hm-tbl self) k jolt-nil))))))
+                     0 (hm-keys-ordered self))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
@@ -1017,7 +1040,10 @@
                                            (hm-drop-key! self x)))
                                        xs)
                              (not (fx=? (length keep) (length xs))))))
-        (cons "toString" (lambda (self) (jcoll-tostring self (hs->list self))))))
+        (cons "toString" (lambda (self) (jcoll-tostring self (hs->list self))))
+        ;; Set.equals / Set.hashCode (the sum of the elements' hashCodes)
+        (cons "equals" (lambda (self o) (jcoll-equals? self o)))
+        (cons "hashCode" (lambda (self) (jset-hashcode (hs->list self))))))
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
 
 ;; pr of the mutable java.util collections, as core_print.clj's print-method

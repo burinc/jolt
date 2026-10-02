@@ -194,6 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An ArityException past 20 arguments says `(> 20)`.
 - `Objects/deepEquals` was false for two typed reference arrays (a `String[]`
   against another, or against an `Object[]`); `Arrays/deepEquals` was missing.
+- `.hashCode` of a seq or list was its hasheq instead of `List.hashCode`, and
+  ArrayList/HashSet/HashMap had no `.equals`/`.hashCode`.
 - A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque
   `#object` under `pr`, compared unequal to the Clojure collection with the same
   elements, and had the wrong `str`/`toString`.
