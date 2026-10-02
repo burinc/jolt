@@ -1026,7 +1026,7 @@
               (list (cons "toArray" (case-lambda
                                       ((self) (jcoll-to-array (tm-elems self) '()))
                                       ((self a) (jcoll-to-array (tm-elems self) (list a))))))))
-          '("treeset" "treemap-keyset" "treemap-values" "treemap-entryset"))
+          (append '("treeset" "treemap-keyset") tm-values-tags tm-entryset-tags))
 (register-get-arm! hm-hashmap?
                    (lambda (coll k d) (hashtable-ref (hm-tbl coll) k d)))
 ;; count / contains? over the mutable map shim (clojure.core/count + contains?,
