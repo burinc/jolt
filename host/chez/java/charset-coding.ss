@@ -18,7 +18,8 @@
 ;; (the charset jhost + decode-bytevector).
 
 ;; --- java.nio.CharBuffer -----------------------------------------------------
-;; state #(chars position limit); capacity is the backing string's length. The
+;; state #(chars position limit read-only?); capacity is the backing string's
+;; length. The
 ;; backing is a Chez string rather than a jolt char-array because every producer
 ;; and consumer here is text: .toString is the whole point of the class for a
 ;; decoding caller, and a string makes it a substring rather than a rebuild.
@@ -29,14 +30,19 @@
 (define (cbuf-pos! b n) (vector-set! (jhost-state b) 1 n))
 (define (cbuf-limit! b n) (vector-set! (jhost-state b) 2 n))
 (define (cbuf-capacity b) (string-length (cbuf-chars b)))
-(define (make-char-buffer chars pos limit) (make-jhost "char-buffer" (vector chars pos limit)))
-(define (char-buffer-allocate n) (make-char-buffer (make-string n #\nul) 0 n))
-;; CharBuffer/wrap over a CharSequence is read-only on the JVM, so copying the
-;; text is not a divergence a caller can observe through the read side, and it
-;; keeps one backing type for every buffer here.
+(define (make-char-buffer chars pos limit ro?) (make-jhost "char-buffer" (vector chars pos limit ro?)))
+(define (cbuf-read-only? b) (vector-ref (jhost-state b) 3))
+(define (char-buffer-allocate n) (make-char-buffer (make-string n #\nul) 0 n #f))
+;; CharBuffer/wrap over a CharSequence is a read-only StringCharBuffer on the
+;; JVM, so copying the text is not a divergence a caller can observe through
+;; the read side, and it keeps one backing type for every buffer here. A write
+;; is the JDK's ReadOnlyBufferException.
 (define (char-buffer-wrap x)
   (let ((s (if (string? x) (string-copy x) (string-copy (jolt-str-render-one x)))))
-    (make-char-buffer s 0 (string-length s))))
+    (make-char-buffer s 0 (string-length s) #t)))
+(define (cbuf-check-writable b)
+  (when (cbuf-read-only? b)
+    (jolt-throw (jolt-host-throwable "java.nio.ReadOnlyBufferException" jolt-nil))))
 ;; The JVM's CharBuffer.toString is the REMAINING characters, not the whole
 ;; backing — which is what makes (.toString (.flip out)) the decoded text.
 (define (cbuf-remaining-string b) (substring (cbuf-chars b) (cbuf-pos b) (cbuf-limit b)))
@@ -64,7 +70,10 @@
    (cons "rewind" (lambda (self) (cbuf-pos! self 0) self))
    ;; compact: the remaining characters move to the front and the buffer is left
    ;; ready to be filled again — position after them, limit at capacity.
+   (cons "isReadOnly" cbuf-read-only?)
+   (cons "isDirect" (lambda (self) #f))
    (cons "compact" (lambda (self)
+                     (cbuf-check-writable self)
                      (let* ((s (cbuf-chars self)) (p (cbuf-pos self)) (n (- (cbuf-limit self) p)))
                        (do ((i 0 (fx+ i 1))) ((fx=? i n)) (string-set! s i (string-ref s (fx+ p i))))
                        (cbuf-pos! self n)
@@ -78,6 +87,7 @@
                    (else (throw-jvm (quote UnsupportedOperationException)
                                     "java.nio.CharBuffer/get: only get() and get(int) are supported")))))
    (cons "put" (lambda (self x . _)
+                 (cbuf-check-writable self)
                  (let ((s (if (char? x) (string x) (if (cbuf? x) (cbuf-remaining-string x) (jolt-str-render-one x)))))
                    (let loop ((i 0))
                      (when (fx<? i (string-length s))
@@ -89,7 +99,8 @@
    (cons "append" (lambda (self x) (record-method-dispatch self "put" (jolt-list x)) self))
    (cons "toString" cbuf-remaining-string)))
 (register-str-render! cbuf? cbuf-remaining-string)
-(register-class-arm! cbuf? (lambda (x) "java.nio.CharBuffer"))
+(register-class-arm! cbuf? (lambda (x) (if (cbuf-read-only? x) "java.nio.StringCharBuffer" "java.nio.HeapCharBuffer")))
+(jch-register-supers! "java.nio.StringCharBuffer" '("java.nio.CharBuffer"))
 
 ;; --- java.nio.charset.CodingErrorAction --------------------------------------
 ;; An enum, modeled the way TimeUnit and Normalizer.Form are: one interned jhost

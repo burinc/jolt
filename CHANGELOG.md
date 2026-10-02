@@ -202,7 +202,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.nio.ByteBuffer` for every buffer and `(instance? java.nio.Buffer b)`
   was false; it is `java.nio.HeapByteBuffer`, `DirectByteBuffer` or their
   read-only classes now, as on the JDK, and `allocateDirect` answers
-  `isDirect` true and `hasArray` false.
+  `isDirect` true and `hasArray` false. `CharBuffer/allocate` is a
+  `java.nio.HeapCharBuffer`, and `CharBuffer/wrap` of a string is the
+  read-only `java.nio.StringCharBuffer` it is on the JDK, so a `put` into it
+  throws `ReadOnlyBufferException` instead of writing to a copy.
 
 - **Stopping the nREPL server no longer leaves its accept thread on a freed
   fd.** stop closed the listen socket under a blocked accept(), which Linux
