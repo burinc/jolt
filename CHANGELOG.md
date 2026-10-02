@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`java.util.TreeMap` and `java.util.TreeSet`.** `(java.util.TreeMap. {...})`
+  was "No matching ctor". Both are mutable now, ordered by natural ordering, a
+  Clojure fn, a reified `java.util.Comparator` or `Comparator/reverseOrder`,
+  with the full NavigableMap / NavigableSet surface: put/get/remove and the
+  compute/merge family, first/last/poll, floor/ceiling/lower/higher, and
+  headMap/tailMap/subMap, descendingMap and the key sets as live views, so a
+  write through a view lands in the map and a put outside its range is
+  IllegalArgumentException. A nil key under natural ordering is
+  NullPointerException and keys that do not compare (a keyword and a string,
+  a Long and a Double) are ClassCastException, as on the JVM. The tree is
+  clojure.core's own sorted map held in a mutable root, so a copy or `clone`
+  is O(1). The entries iteration hands out are `TreeMap$Entry` objects whose
+  `setValue` writes through to the map; `firstEntry`, `floorEntry` and the
+  other navigation methods answer immutable snapshots. Both work with `key`,
+  `val`, destructuring and `into`, print as `k=v`, and are not vectors, as on
+  the JVM. `Comparator/reverseOrder`, `Comparator/naturalOrder` and
+  `Collections/reverseOrder` are new too, and all of it runs on the Gambit
+  target as well.
+
+  ```clojure
+  (let [m (java.util.TreeMap. {:c 3 :a 1 :b 2})
+        h (.headMap m :c)]
+    (.put h :aa 0)
+    [(str m) (.floorKey m :bb) (try (.put h :z 9) (catch IllegalArgumentException _ :out))])
+  ;; => ["{:a=1, :aa=0, :b=2, :c=3}" :b :out]
+  ```
+
 - **The rest of `java.nio.ByteBuffer`, the typed buffers and `ByteOrder`.**
   A buffer has a byte order now (`ByteOrder/BIG_ENDIAN`, `LITTLE_ENDIAN`,
   `nativeOrder`; `.order` reads and sets it) and every multi-byte get and put
@@ -304,7 +331,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ArrayList/HashSet/HashMap had no `.equals`/`.hashCode`.
 - A `java.util` HashMap, ArrayList, LinkedList or HashSet printed as an opaque
   `#object` under `pr`, compared unequal to the Clojure collection with the same
-  elements, and had the wrong `str`/`toString`.
+  elements, had the wrong `str`/`toString`, hashed (`hash`) differently from its
+  `.hashCode`, and `reduce-kv` refused a HashMap. One registry shared by both
+  hosts (`java/jutil-colls.ss`) answers all of these for every java.util shim.
+- `.hashCode` of a number was not Java's: a long outside int range answered
+  itself, a double its truncation (`(.hashCode 1.5)` was 1, not 1073217536)
+  and `##NaN` threw, so the List/Set/Map hashes built on them were wrong too.
 
 - **`Math/copySign`, `max`, `min` and `signum` follow the JVM on -0.0 and
   NaN.**

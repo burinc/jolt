@@ -2537,6 +2537,8 @@
 (load "host/chez/java/text-normalize.ss")       ; java.text.Normalizer's quick-check fast paths
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
+(load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
+(load "host/chez/java/tree-map.ss")            ; TreeMap / TreeSet + Comparator objects (shared)
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
 ;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
 ;; Self-contained; ahead of byte-buffer.ss, which encodes floats with them.

@@ -92,6 +92,8 @@
 (##include "../chez/java/class-model.ss")
 (##include "../chez/java/string-builder.ss")
 (##include "../chez/java/dot-forms.ss")
+(##include "../chez/java/jutil-colls.ss")
+(##include "../chez/java/tree-map.ss")
 ;; java.nio's buffers and ByteOrder, over bytevectors (no byte arrays here: a
 ;; ByteBuffer has no .array, and the typed buffers exist only as views).
 (##include "../chez/java/byte-buffer.ss")

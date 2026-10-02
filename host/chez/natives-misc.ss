@@ -165,6 +165,23 @@
 (define (java-symbol-hash name ns)
   (java-hash-combine (java-string-hash name) (if ns (java-string-hash ns) 0)))
 
+;; Number.hashCode: Long's (int)(v ^ v>>>32) inside long range (BigInt's too —
+;; it hashes its long part the same way), the BigInteger hash outside it,
+;; Double's over doubleToLongBits (one canonical NaN), Ratio's numerator ^
+;; denominator. Not the hasheq clojure.core/hash answers for a number.
+(define (jolt-java-number-hashcode n)
+  (cond ((flonum? n)
+         (let ((bits (if (= n n) (double-to-raw-bits n) #x7ff8000000000000)))
+           (i32 (bitwise-xor bits (bitwise-arithmetic-shift-right bits 32)))))
+        ((and (exact? n) (integer? n))
+         (if (and (>= n -9223372036854775808) (<= n 9223372036854775807))
+             (let ((u (bitwise-and n #xFFFFFFFFFFFFFFFF)))
+               (i32 (bitwise-xor u (bitwise-arithmetic-shift-right u 32))))
+             (big-integer-hashcode n)))
+        ((exact? n) (i32 (bitwise-xor (big-integer-hashcode (numerator n))
+                                      (big-integer-hashcode (denominator n)))))
+        (else (jolt-hash n))))
+
 ;; Java .hashCode() for a collection (java.util.Map/Set/List semantics), NOT the
 ;; Murmur3 hasheq that clojure.core/hash uses. A library computing .hashCode on its
 ;; own collection type (flatland's OrderedMap via APersistentMap/mapHash, OrderedSet
@@ -176,6 +193,7 @@
 (define (jolt-java-hashcode x)
   (cond
     ((jolt-nil? x) 0)
+    ((number? x) (jolt-java-number-hashcode x))
     ((pmap? x)
      (pmap-fold x (lambda (k v a)
                     (i32 (+ a (bitwise-xor (jolt-java-hashcode k) (jolt-java-hashcode v))))) 0))

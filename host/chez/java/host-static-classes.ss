@@ -122,34 +122,8 @@
     (cond ((null? args) (make-arraylist '()))
           ((number? (car args)) (make-arraylist '()))
           (else (make-arraylist (seq->list (jolt-seq (car args))))))))
-;; Java's toString for the collection shims — AbstractCollection's "[a, b]" and
-;; AbstractMap's "{k=v, k2=v2}", each element by its own toString (String.valueOf:
-;; nil is "null"), and the collection itself, met inside itself, as "(this
-;; Collection)" / "(this Map)" rather than an endless recursion.
-(define (jtostring-of x self what)
-  (cond ((eq? x self) what)
-        ((jolt-nil? x) "null")
-        (else (jolt-str-render-one x))))
-(define (jcoll-join strs)
-  (if (null? strs) ""
-      (fold-left (lambda (a s) (string-append a ", " s)) (car strs) (cdr strs))))
-(define (jcoll-tostring self elems)
-  (string-append "[" (jcoll-join (map (lambda (x) (jtostring-of x self "(this Collection)")) elems)) "]"))
-(define (jlist-hashcode elems)
-  (fold-left (lambda (h x) (i32 (+ (* 31 h) (jolt-java-hashcode x)))) 1 elems))
-(define (jset-hashcode elems)
-  (fold-left (lambda (h x) (i32 (+ h (jolt-java-hashcode x)))) 0 elems))
-;; Object.equals of a java.util collection: itself, or (jcoll-equiv?, below) a
-;; List against a List, a Set against a Set, a Map against a Map.
-(define (jcoll-equals? self o) (or (eq? self o) (jcoll-equiv? self o)))
-(define (jmap-tostring self)
-  (string-append
-   "{"
-   (jcoll-join (map (lambda (k)
-                      (string-append (jtostring-of k self "(this Map)") "="
-                                     (jtostring-of (hashtable-ref (hm-tbl self) k jolt-nil) self "(this Map)")))
-                    (hm-keys-ordered self)))
-   "}"))
+;; toString / equals / hashCode of the collection shims come from the shared
+;; java.util registry (java/jutil-colls.ss); each shim registers below.
 
 ;; The default methods java.lang.Iterable, java.util.Collection and java.util.List
 ;; give every collection, over a shim's element list. The function argument is a
@@ -208,12 +182,7 @@
     (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
-    (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))
-    (cons "toString" (lambda (self) (jcoll-tostring self (al->list self))))
-    ;; List.equals / List.hashCode: element-wise against any java.util.List
-    ;; (a vector, a seq, another list shim), and 31*h + e.hashCode from 1.
-    (cons "equals" (lambda (self o) (jcoll-equals? self o)))
-    (cons "hashCode" (lambda (self) (jlist-hashcode (al->list self))))))
+    (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))))
 ;; java.util.SequencedCollection (JDK 21): List and Deque both have it, so the
 ;; first/last accessors and mutators sit on the shared ArrayList table and
 ;; LinkedList / ArrayDeque inherit them. On an empty list the accessors raise
@@ -712,15 +681,7 @@
         (cons "values" (lambda (self) (apply jolt-vector
                           (map (lambda (k) (hashtable-ref (hm-tbl self) k jolt-nil))
                                (hm-keys-ordered self)))))
-        (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))
-        (cons "toString" (lambda (self) (jmap-tostring self)))
-        ;; Map.equals / Map.hashCode (the sum of key.hashCode ^ value.hashCode)
-        (cons "equals" (lambda (self o) (jcoll-equals? self o)))
-        (cons "hashCode" (lambda (self)
-          (fold-left (lambda (h k)
-                       (i32 (+ h (bitwise-xor (jolt-java-hashcode k)
-                                              (jolt-java-hashcode (hashtable-ref (hm-tbl self) k jolt-nil))))))
-                     0 (hm-keys-ordered self))))))
+        (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
@@ -1040,100 +1001,32 @@
                                            (hashtable-delete! (hm-tbl self) x)
                                            (hm-drop-key! self x)))
                                        xs)
-                             (not (fx=? (length keep) (length xs))))))
-        (cons "toString" (lambda (self) (jcoll-tostring self (hs->list self))))
-        ;; Set.equals / Set.hashCode (the sum of the elements' hashCodes)
-        (cons "equals" (lambda (self o) (jcoll-equals? self o)))
-        (cons "hashCode" (lambda (self) (jset-hashcode (hs->list self))))))
+                             (not (fx=? (length keep) (length xs))))))))
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
 
-;; pr of the mutable java.util collections, as core_print.clj's print-method
-;; for java.util.Map ({k v, …}), java.util.RandomAccess ([…]), java.util.List
-;; ((…)) and java.util.Set (#{…}) renders them under *print-readably*: element by
-;; element, readably. They printed as an opaque #object[java.util.HashMap] here.
-;; print (not readably) is print-object on the JVM, the #object form, and str is
-;; Java's toString ({:a=1}); both keep what they had. An ArrayDeque is only a
-;; Collection, which has no print-method, so it keeps the #object form.
-(define (jcoll-print-seq open close xs render)
-  (string-append open
-                 (if (null? xs) ""
-                     (fold-left (lambda (a x) (string-append a " " (render x)))
-                                (render (car xs)) (cdr xs)))
-                 close))
-(define (jcoll-print-map self render)
-  (let ((ks (hm-keys-ordered self)))
-    (string-append
-     "{"
-     (if (null? ks) ""
-         (fold-left (lambda (a k) (string-append a ", " (render k) " "
-                                                 (render (hashtable-ref (hm-tbl self) k jolt-nil))))
-                    (string-append (render (car ks)) " "
-                                   (render (hashtable-ref (hm-tbl self) (car ks) jolt-nil)))
-                    (cdr ks)))
-     "}")))
-(define (jcoll-printed? x)
-  (and (jhost? x)
-       (member (jhost-tag x) '("hashmap" "properties" "arraylist" "arrays-aslist" "immutable-list"
-                                "linkedlist" "hashset"))
-       #t))
-(define (jcoll-print x render)
-  (let ((t (jhost-tag x)))
-    (cond ((or (string=? t "hashmap") (string=? t "properties")) (jcoll-print-map x render))
-          ((string=? t "hashset") (jcoll-print-seq "#{" "}" (hs->list x) render))
-          ((string=? t "linkedlist") (jcoll-print-seq "(" ")" (al->list x) render))
-          (else (jcoll-print-seq "[" "]" (al->list x) render)))))
-(register-pr-readable-arm! jcoll-printed?
-  (lambda (x) (if (jolt-pr-readable?) (jcoll-print x jolt-pr-readable) (jolt-object-repr x #f))))
-;; = between a mutable java.util collection and a Clojure one, or two of them, is
-;; Clojure's equiv: a List against any sequential (APersistentVector / ASeq accept
-;; a java.util.List), a Set against a set and a Map against a map, element by
-;; element. Only mixed pairs reach the arm walk (two vectors, maps or sets are
-;; answered ahead of it), and an ArrayDeque is no List, so it stays unequal.
-(define (jlist-shim? x)
-  (and (jhost? x) (member (jhost-tag x) '("arraylist" "linkedlist" "arrays-aslist" "immutable-list")) #t))
-(define (jeq-sequential? x)
-  (or (pvec? x) (cseq? x) (empty-list-t? x) (jolt-lazyseq? x) (jlist-shim? x)))
-(define (jeq-set? x) (or (pset? x) (hs-hashset? x)))
-(define (jeq-map? x) (or (pmap? x) (hm-hashmap? x)))
-(define (jeq-set-has? s x)
-  (if (hs-hashset? s) (hashtable-contains? (hm-tbl s) x) (jolt-truthy? (jolt-contains? s x))))
-(define (jeq-map-entries m)   ; ((k . v) ...)
-  (if (hm-hashmap? m)
-      (map (lambda (k) (cons k (hashtable-ref (hm-tbl m) k jolt-nil))) (hm-keys-ordered m))
-      (map (lambda (e) (cons (jolt-nth e 0) (jolt-nth e 1))) (seq->list (jolt-seq m)))))
-(define (jeq-map-get m k miss)
-  (if (hm-hashmap? m)
-      (hashtable-ref (hm-tbl m) k miss)
-      (if (jolt-truthy? (jolt-contains? m k)) (jolt-get m k) miss)))
-(define (jcoll-equiv? a b)
-  (cond
-    ((and (jeq-sequential? a) (jeq-sequential? b))
-     (let loop ((x (seq->list (jolt-seq a))) (y (seq->list (jolt-seq b))))
-       (cond ((and (null? x) (null? y)) #t)
-             ((or (null? x) (null? y)) #f)
-             ((jolt=2 (car x) (car y)) (loop (cdr x) (cdr y)))
-             (else #f))))
-    ((and (jeq-set? a) (jeq-set? b))
-     (let ((xs (seq->list (jolt-seq a))))
-       (and (= (length xs) (length (seq->list (jolt-seq b))))
-            (for-all (lambda (x) (jeq-set-has? b x)) xs))))
-    ((and (jeq-map? a) (jeq-map? b))
-     (let ((es (jeq-map-entries a)) (miss (list 'miss)))
-       (and (= (length es) (length (jeq-map-entries b)))
-            (for-all (lambda (e) (let ((v (jeq-map-get b (car e) miss)))
-                                   (and (not (eq? v miss)) (jolt=2 (cdr e) v))))
-                     es))))
-    (else #f)))
-(register-eq-arm!
-  (lambda (a b)
-    (or (and (or (jlist-shim? a) (jlist-shim? b)) (jeq-sequential? a) (jeq-sequential? b))
-        (and (or (hs-hashset? a) (hs-hashset? b)) (jeq-set? a) (jeq-set? b))
-        (and (or (hm-hashmap? a) (hm-hashmap? b)) (jeq-map? a) (jeq-map? b))))
-  jcoll-equiv?)
-
-;; str is the collection's own toString, as on the JVM
-(register-str-render! (lambda (x) (or (jcoll-printed? x) (and (jhost? x) (string=? (jhost-tag x) "arraydeque"))))
-                      (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
+;; the HashMap family and HashSet are a java.util.Map / Set to =, hash, pr, str
+;; and reduce-kv (java/jutil-colls.ss), in their insertion order. An ArrayList
+;; (and Arrays$ArrayList, ImmutableCollections$ListN) is a RandomAccess List,
+;; printed [..]; a LinkedList a List, printed (..); an ArrayDeque only a
+;; Collection, which keeps the identity equals/hashCode registered above and
+;; prints as #object over its toString.
+(define (hm-entries self)
+  (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
+       (hm-keys-ordered self)))
+(register-jutil-coll! "hashmap" 'map hm-entries)
+(register-jutil-coll! "properties" 'map hm-entries)
+(register-jutil-coll! "hashset" 'set hs->list)
+(register-jutil-coll! "arraylist" 'ralist al->list)
+(register-jutil-coll! "linkedlist" 'list al->list)
+(register-jutil-coll! "arraydeque" 'coll al->list)
+;; Collection.toArray on the TreeSet / TreeMap views (java/tree-map.ss), which
+;; are shared with targets that have no Java arrays.
+(for-each (lambda (tag)
+            (register-host-methods! tag
+              (list (cons "toArray" (case-lambda
+                                      ((self) (jcoll-to-array (tm-elems self) '()))
+                                      ((self a) (jcoll-to-array (tm-elems self) (list a))))))))
+          '("treeset" "treemap-keyset" "treemap-values" "treemap-entryset"))
 (register-get-arm! hm-hashmap?
                    (lambda (coll k d) (hashtable-ref (hm-tbl coll) k d)))
 ;; count / contains? over the mutable map shim (clojure.core/count + contains?,
@@ -2592,12 +2485,13 @@
   (let ((read-only (lambda (name) (cdr (assoc name arraylist-methods)))))
     (append
       (map (lambda (n) (cons n (read-only n)))
-           '("get" "set" "size" "isEmpty" "contains" "toArray" "iterator" "toString"))
+           '("get" "set" "size" "isEmpty" "contains" "toArray" "iterator"))
       (list (cons "getFirst" al-first) (cons "getLast" al-last))
       (map (lambda (e) (cons (car e) (host-arity-of (cdr e) #t aslist-unsupported)))
            '(("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0)
              ("addFirst" 1) ("addLast" 1) ("removeFirst" 0) ("removeLast" 0))))))
 (register-host-methods! "arrays-aslist" arrays-aslist-methods)
+(register-jutil-coll! "arrays-aslist" 'ralist al->list)
 
 ;; An unmodifiable List (java.util.ImmutableCollections$ListN) — what
 ;; Stream.toList and List.copyOf answer: every reader of the ArrayList table, and
@@ -2608,13 +2502,13 @@
 (register-host-methods! "immutable-list"
   (append
     (map (lambda (n) (cons n (cdr (assoc n arraylist-methods))))
-         '("get" "size" "isEmpty" "contains" "toArray" "iterator" "toString" "forEach"
-           "equals" "hashCode"))
+         '("get" "size" "isEmpty" "contains" "toArray" "iterator" "forEach"))
     (list (cons "getFirst" al-first) (cons "getLast" al-last))
     (map (lambda (e) (cons (car e) (host-arity-of (cdr e) #t aslist-unsupported)))
          '(("set" 2) ("add" 1 2) ("addAll" 1 2) ("remove" 1) ("clear" 0) ("removeIf" 1)
            ("replaceAll" 1) ("sort" 1) ("addFirst" 1) ("addLast" 1)
            ("removeFirst" 0) ("removeLast" 0)))))
+(register-jutil-coll! "immutable-list" 'ralist al->list)
 
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
@@ -3216,12 +3110,8 @@
         'pass)))
 ;; (seq a-HashMap) walks its entries, like RT.seqFrom over a java.util.Map.
 (register-seq-arm! hm-hashmap? (lambda (x) (jolt-seq (hm->pmap x))))
-;; The single place that knows which java.util shims are Iterable/seqable on the
-;; JVM (ArrayList/LinkedList/ArrayDeque via al-family?, HashSet, HashMap);
-;; post-prelude's clojure.core/seqable? patch consults this instead of carrying
-;; its own tag list.
-(define (jhost-seqable-shim? x)
-  (or (al-family? x) (hs-hashset? x) (hm-hashmap? x)))
+;; Which shims are Iterable (seqable?) is the java.util registry's answer
+;; (jutil-colls.ss jhost-seqable-shim?): every shim above registers there.
 ;; a MapEntry does not carry meta on the JVM (AMapEntry); deny IObj/IMeta so the
 ;; pvec backing doesn't claim it.
 (register-instance-check-arm!

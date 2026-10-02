@@ -563,12 +563,6 @@
                   (host-arity-declared host-method-arities tag (car p) (cdr p) #t)))
               members)))
 
-;; The comparator seam (natives-seq.ss jolt-comparator-fn) asks whether a value
-;; is a shim object whose tag registers a `compare` method — a Comparator held
-;; by the host (String/CASE_INSENSITIVE_ORDER) rather than by a deftype/reify.
-(set! jhost-compare-method?
-  (lambda (x)
-    (and (jhost? x) (host-method-ref (jhost-tag x) "compare") #t)))
 
 ;; ---- how two tags relate ----------------------------------------------------
 ;; A tag is a REPRESENTATION: the procedures in its table read the state vector
@@ -791,7 +785,7 @@
               (string-downcase
                 (number->string n (if (and (fixnum? radix) (fx<=? 2 radix 36)) radix 10)))))
            (else (dispatch-miss n method args))))
-    ((string=? method "hashCode") (->num (jnum->exact n)))
+    ((string=? method "hashCode") (jolt-java-number-hashcode n))
     ;; Double/Float .isNaN / .isInfinite (a non-flonum is neither).
     ((string=? method "isNaN") (and (flonum? n) (not (= n n))))
     ((string=? method "isInfinite") (and (flonum? n) (infinite? n)))

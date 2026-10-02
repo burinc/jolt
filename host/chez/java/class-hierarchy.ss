@@ -943,6 +943,56 @@
 (jch-register-supers! "java.util.Hashtable" '("java.util.Map"))
 (jch-register-supers! "java.util.Properties" '("java.util.Hashtable"))
 (jch-register-supers! "java.util.HashSet" '("java.util.Set"))
+;; java.util.TreeMap / TreeSet and the views they hand out (tree-map.ss), with
+;; the sorted/navigable/sequenced interfaces between them and Map / Set, and
+;; the Comparator objects Comparator/reverseOrder and naturalOrder return.
+;; Direct supers and modifiers probed on JDK 21. TreeMap$Values / $EntrySet are
+;; INNER classes there (modifiers 0); the graph's nested-class rule reports
+;; them static.
+(jch-register-supers! "java.util.SequencedMap" '("java.util.Map"))
+(jch-register-supers! "java.util.SortedMap" '("java.util.SequencedMap"))
+(jch-register-supers! "java.util.NavigableMap" '("java.util.SortedMap"))
+(jch-register-supers! "java.util.SequencedSet" '("java.util.SequencedCollection" "java.util.Set"))
+(jch-register-supers! "java.util.SortedSet" '("java.util.Set" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.NavigableSet" '("java.util.SortedSet"))
+(for-each jch-mark-interface!
+          '("java.util.SequencedMap" "java.util.SortedMap" "java.util.NavigableMap"
+            "java.util.SequencedSet" "java.util.SortedSet" "java.util.NavigableSet"))
+(jch-register-supers! "java.util.AbstractMap" '("java.util.Map"))
+(jch-register-supers! "java.util.AbstractCollection" '("java.util.Collection"))
+(jch-register-supers! "java.util.AbstractSet" '("java.util.AbstractCollection" "java.util.Set"))
+(jch-register-supers! "java.util.TreeMap"
+  '("java.util.AbstractMap" "java.util.NavigableMap" "java.lang.Cloneable" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap"
+  '("java.util.AbstractMap" "java.util.NavigableMap" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeMap$AscendingSubMap" '("java.util.TreeMap$NavigableSubMap"))
+(jch-register-supers! "java.util.TreeMap$DescendingSubMap" '("java.util.TreeMap$NavigableSubMap"))
+(jch-register-supers! "java.util.TreeMap$KeySet" '("java.util.AbstractSet" "java.util.NavigableSet"))
+(jch-register-supers! "java.util.TreeMap$Values" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.TreeMap$EntrySet" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.TreeMap$PrivateEntryIterator" '("java.util.Iterator"))
+(jch-register-supers! "java.util.TreeMap$Entry" '("java.util.Map$Entry"))
+(jch-register-supers! "java.util.AbstractMap$SimpleImmutableEntry" '("java.util.Map$Entry" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeSet"
+  '("java.util.AbstractSet" "java.util.NavigableSet" "java.lang.Cloneable" "java.io.Serializable"))
+(jch-register-supers! "java.util.Collections$ReverseComparator" '("java.util.Comparator" "java.io.Serializable"))
+(jch-register-supers! "java.util.Collections$ReverseComparator2" '("java.util.Comparator" "java.io.Serializable"))
+(jch-register-supers! "java.util.Comparators$NaturalOrderComparator" '("java.lang.Enum" "java.util.Comparator"))
+(for-each jch-mark-abstract!
+          '("java.util.AbstractMap" "java.util.AbstractCollection" "java.util.AbstractSet"
+            "java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$PrivateEntryIterator"))
+(for-each jch-mark-final!
+          '("java.util.TreeMap$AscendingSubMap" "java.util.TreeMap$DescendingSubMap"
+            "java.util.TreeMap$KeySet" "java.util.Comparators$NaturalOrderComparator"
+            "java.util.TreeMap$Entry"))
+(for-each jch-mark-package-private!
+          '("java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$AscendingSubMap"
+            "java.util.TreeMap$DescendingSubMap" "java.util.TreeMap$KeySet"
+            "java.util.TreeMap$Values" "java.util.TreeMap$EntrySet"
+            "java.util.Comparators$NaturalOrderComparator" "java.util.TreeMap$Entry"))
+(for-each jch-mark-private!
+          '("java.util.Collections$ReverseComparator" "java.util.Collections$ReverseComparator2"))
+(jch-mark-enum! "java.util.Comparators$NaturalOrderComparator")
 
 ;; ---- the rows typed.clojure's annotation corpus names ------------------------
 ;; typed.ann.clojure.base's override-classes resolves every class it annotates
@@ -1324,6 +1374,22 @@
     ("hashmap" . "java.util.HashMap")
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")
+    ;; tree-map.ss: a TreeMap, its views, a TreeSet, and the Comparator objects
+    ("treemap" . "java.util.TreeMap")
+    ("treemap-asc-sub" . "java.util.TreeMap$AscendingSubMap")
+    ("treemap-desc-sub" . "java.util.TreeMap$DescendingSubMap")
+    ("treemap-keyset" . "java.util.TreeMap$KeySet")
+    ("treemap-values" . "java.util.TreeMap$Values")
+    ("treemap-entryset" . "java.util.TreeMap$EntrySet")
+    ("treeset" . "java.util.TreeSet")
+    ("treemap-entry" . "java.util.TreeMap$Entry")
+    ("immutable-entry" . "java.util.AbstractMap$SimpleImmutableEntry")
+    ;; every TreeMap iterator's abstract base: the JDK's concrete one depends on
+    ;; the view (KeyIterator, SubMapEntryIterator, …), which this does not model
+    ("treemap-iterator" . "java.util.TreeMap$PrivateEntryIterator")
+    ("reverse-comparator" . "java.util.Collections$ReverseComparator")
+    ("reverse-comparator2" . "java.util.Collections$ReverseComparator2")
+    ("natural-comparator" . "java.util.Comparators$NaturalOrderComparator")
     ;; io writer/reader shims: *out* is a PrintWriter like the JVM REPL's
     ("port-writer" . "java.io.PrintWriter")
     ("print-writer" . "java.io.PrintWriter")
