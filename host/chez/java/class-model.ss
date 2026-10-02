@@ -54,14 +54,61 @@
           (else (loop (fx- i 1))))))
 ;; Class.getSimpleName drops the package and, for a nested class, the enclosing
 ;; class too. Class.getCanonicalName spells nesting with a dot instead of a `$`.
+;;
+;; An array class has neither of its own: the JVM spells both as the component's
+;; followed by one "[]" per dimension (String[], int[][]).
 (define (hsc-simple-name cn)
-  (let ((i (hsc-nesting-dollar cn)))
-    (if i (substring cn (fx+ i 1) (string-length cn)) (hsc-last-segment cn))))
+  (let ((arr (hsc-array-parts cn)))
+    (if arr
+        (hsc-array-spelling (hsc-simple-name (car arr)) (cdr arr))
+        (let ((i (hsc-nesting-dollar cn)))
+          (if i (substring cn (fx+ i 1) (string-length cn)) (hsc-last-segment cn))))))
 (define (hsc-canonical-name cn)
-  (let ((i (hsc-nesting-dollar cn)))
-    (if i
-        (string-append (hsc-canonical-name (substring cn 0 i))
-                       "." (substring cn (fx+ i 1) (string-length cn)))
+  (let ((arr (hsc-array-parts cn)))
+    (if arr
+        (hsc-array-spelling (hsc-canonical-name (car arr)) (cdr arr))
+        (let ((i (hsc-nesting-dollar cn)))
+          (if i
+              (string-append (hsc-canonical-name (substring cn 0 i))
+                             "." (substring cn (fx+ i 1) (string-length cn)))
+              cn)))))
+(define (hsc-array-spelling base dims)
+  (if (fx=? dims 0) base (hsc-array-spelling (string-append base "[]") (fx- dims 1))))
+
+;; An array class's JVM name ("[[I", "[Ljava.lang.String;") taken apart into its
+;; innermost component class's name and its dimension count — ("int" . 2),
+;; ("java.lang.String" . 1) — or #f for a name that is no array class.
+(define hsc-array-prim-letters
+  '((#\B . "byte") (#\C . "char") (#\D . "double") (#\F . "float")
+    (#\I . "int") (#\J . "long") (#\S . "short") (#\Z . "boolean")))
+(define (hsc-array-parts cn)
+  (let ((n (string-length cn)))
+    (let loop ((i 0))
+      (cond ((fx>=? i n) #f)
+            ((char=? (string-ref cn i) #\[) (loop (fx+ i 1)))
+            ((fx=? i 0) #f)
+            ((and (fx=? i (fx- n 1)) (assv (string-ref cn i) hsc-array-prim-letters))
+             => (lambda (p) (cons (cdr p) i)))
+            ((and (char=? (string-ref cn i) #\L) (fx>? n (fx+ i 2))
+                  (char=? (string-ref cn (fx- n 1)) #\;))
+             (cons (substring cn (fx+ i 1) (fx- n 1)) i))
+            (else #f)))))
+;; Class.getComponentType's NAME: one dimension off — "[[I" -> "[I",
+;; "[Ljava.lang.String;" -> "java.lang.String", "[I" -> "int". #f for a non-array.
+(define (hsc-component-name cn)
+  (let ((arr (hsc-array-parts cn)))
+    (and arr
+         (if (fx>? (cdr arr) 1)
+             (substring cn 1 (string-length cn))
+             (car arr)))))
+;; How Clojure 1.12 PRINTS an array class (Util.arrayTypeToSymbol): the innermost
+;; component's name, a slash, and the dimension count — java.lang.String/1, int/2
+;; — the same spelling the reader takes as an array class symbol. Past nine
+;; dimensions it falls back to the JVM name, as the reference does.
+(define (hsc-array-print-name cn)
+  (let ((arr (hsc-array-parts cn)))
+    (if (and arr (fx<=? (cdr arr) 9))
+        (string-append (car arr) "/" (number->string (cdr arr)))
         cn)))
 
 ;; java.lang.Class value: (class x) / (.getClass x) return one. It renders like
@@ -177,6 +224,32 @@
 (define (jclass-primitive? x)
   (and (member (jclass-name x) jclass-primitive-names) #t))
 
+;; Class.isAssignableFrom over two class NAMES: can a value of class CNAME be
+;; used where TNAME is wanted? A primitive class is assignable only from itself
+;; (Object.isAssignableFrom(long.class) is false: the graph's isa? roots every
+;; name at Object, and a primitive is no Object). Arrays are covariant, as on the
+;; JVM — a String[] is an Object[] and a CharSequence[], an int[][] is an
+;; Object[] and an Object — while a primitive array is only its own class.
+(define (jclass-name-assignable? tname cname)
+  (let ((tl (string-length tname)) (cl (string-length cname)))
+    (cond ((string=? tname cname) #t)
+          ((or (member tname jclass-primitive-names) (member cname jclass-primitive-names)) #f)
+          ((and (fx>? cl 1) (char=? (string-ref cname 0) #\[))
+           (cond ((or (string=? tname "java.lang.Object") (string=? tname "Object")
+                      (string=? tname "java.lang.Cloneable") (string=? tname "java.io.Serializable"))
+                  #t)
+                 ((not (and (fx>? tl 1) (char=? (string-ref tname 0) #\[))) #f)
+                 ;; Object[] takes every reference array: one of objects, or of arrays
+                 ((string=? tname "[Ljava.lang.Object;")
+                  (or (char=? (string-ref cname 1) #\L) (char=? (string-ref cname 1) #\[)))
+                 ((and (char=? (string-ref tname 1) #\L) (char=? (string-ref cname 1) #\L))
+                  (jch-isa? (substring cname 2 (fx- cl 1)) (substring tname 2 (fx- tl 1))))
+                 ((and (char=? (string-ref tname 1) #\[) (char=? (string-ref cname 1) #\[))
+                  (jclass-name-assignable? (substring tname 1 tl) (substring cname 1 cl)))
+                 (else #f)))
+          ((and (fx>? tl 1) (char=? (string-ref tname 0) #\[)) #f)
+          (else (jch-isa? cname tname)))))
+
 ;; Class.toString says which kind it is: "interface java.util.List",
 ;; "class java.lang.String" — and a primitive, alone, is just its own name
 ;; ("long"). ONE renderer, so (str c) and (.toString c) cannot drift: they used
@@ -187,12 +260,14 @@
         ((jch-interface? (jclass-name x)) (string-append "interface " (jclass-jvm-name x)))
         (else (string-append "class " (jclass-jvm-name x)))))
 (register-str-render! jclass? jclass-tostring)
-(register-pr-arm! jclass? (lambda (x) (jclass-jvm-name x)))
+;; pr of an array class is its 1.12 symbol spelling (hsc-array-print-name).
+(define (jclass-print-name x) (hsc-array-print-name (jclass-jvm-name x)))
+(register-pr-arm! jclass? jclass-print-name)
 ;; print/println of a Class prints the bare name (getName), like pr — the JVM's
 ;; print-method for Class ignores *print-readably*. Only str is "class <name>".
 (let ((prev (var-deref "clojure.core" "__print1")))
   (def-var! "clojure.core" "__print1"
-    (lambda (x) (if (jclass? x) (jclass-jvm-name x) (jolt-invoke1 prev x)))))
+    (lambda (x) (if (jclass? x) (jclass-print-name x) (jolt-invoke1 prev x)))))
 (register-host-methods! "class"
   (list (cons "getName" (lambda (self) (jclass-jvm-name self)))
         (cons "getCanonicalName" (lambda (self) (hsc-canonical-name (jclass-jvm-name self))))
@@ -200,24 +275,11 @@
         (cons "toString" jclass-tostring)
         (cons "isArray" (lambda (self) (let ((n (jclass-name self)))
                                          (and (fx>? (string-length n) 0) (char=? (string-ref n 0) #\[)))))
-        ;; Class.getComponentType: for an array class returns the element class;
-        ;; for a non-array returns nil. JVM: [Ljava.lang.Long; → java.lang.Long.
+        ;; Class.getComponentType: for an array class the element class — itself
+        ;; an array class for a multi-dimensional one ([[I -> [I); nil otherwise.
         (cons "getComponentType" (lambda (self)
-                                   (let ((n (jclass-name self)))
-                                     (cond ((and (fx>? (string-length n) 2) (char=? (string-ref n 0) #\[)
-                                                 (char=? (string-ref n 1) #\L) (char=? (string-ref n (- (string-length n) 1)) #\;))
-                                            (jolt-class-for (substring n 2 (- (string-length n) 1))))
-                                           ((and (fx>? (string-length n) 1) (char=? (string-ref n 0) #\[))
-                                            (cond ((char=? (string-ref n 1) #\B) (jolt-class-for "byte"))
-                                                  ((char=? (string-ref n 1) #\C) (jolt-class-for "char"))
-                                                  ((char=? (string-ref n 1) #\D) (jolt-class-for "double"))
-                                                  ((char=? (string-ref n 1) #\F) (jolt-class-for "float"))
-                                                  ((char=? (string-ref n 1) #\I) (jolt-class-for "int"))
-                                                  ((char=? (string-ref n 1) #\J) (jolt-class-for "long"))
-                                                  ((char=? (string-ref n 1) #\S) (jolt-class-for "short"))
-                                                  ((char=? (string-ref n 1) #\Z) (jolt-class-for "boolean"))
-                                                  (else jolt-nil)))
-                                           (else jolt-nil)))))
+                                   (let ((c (hsc-component-name (jclass-name self))))
+                                     (if c (jolt-class-for c) jolt-nil))))
         ;; Class.isInstance(o) == (instance? class o); core.logic's deftype .equals
         ;; uses (.. this getClass (isInstance o)).
         (cons "isInstance" (lambda (self o) (if (instance-check self o) #t #f)))
@@ -242,7 +304,7 @@
         ;; either side answers too.
         (cons "isAssignableFrom" (lambda (self other)
                                    (let ((ka (class-key self)) (kb (class-key other)))
-                                     (if (and ka kb (jch-isa? kb ka)) #t #f))))
+                                     (if (and ka kb (jclass-name-assignable? ka kb)) #t #f))))
         ;; Class.cast: the JVM's checked narrowing — the value back when it is
         ;; already an instance, a ClassCastException otherwise. A reflective
         ;; interpreter casts every argument to its parameter type before the

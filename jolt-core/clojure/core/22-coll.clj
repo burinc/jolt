@@ -303,7 +303,14 @@
 
 (defn array-seq [arr & _] (seq arr))
 
-(defn to-array-2d [coll] (to-array (map to-array coll)))
+;; An Object[][] like the reference's (make-array of Object[]), each row an Object[].
+(defn to-array-2d [coll]
+  (let [ret (make-array (class (object-array 0)) (count coll))]
+    (loop [i 0 xs (seq coll)]
+      (when xs
+        (aset ret i (to-array (first xs)))
+        (recur (inc i) (next xs))))
+    ret))
 
 ;; Wrapping (unchecked) coercions: truncate to the width and sign-fold like the
 ;; JVM primitive conversions ((unchecked-byte 200) is -56); unchecked-char wraps

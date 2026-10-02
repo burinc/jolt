@@ -377,9 +377,11 @@
   (unless (and (jolt-array? src) (jolt-array? dst))
     (throw-jvm 'ArrayStoreException "arraycopy operands must be arrays"))
   ;; A copy between different element kinds is the JVM's ArrayStoreException;
-  ;; only reference arrays are allowed to differ, and jolt models those as one
-  ;; kind, so equal kinds is the whole rule here.
-  (unless (eq? (jolt-array-kind src) (jolt-array-kind dst))
+  ;; only reference arrays may differ (the JVM then checks each element as it
+  ;; stores, which jolt does not — its element store is unchecked, see
+  ;; known-divergences :typed-array-store), so two reference kinds are compatible.
+  (unless (or (eq? (jolt-array-kind src) (jolt-array-kind dst))
+              (and (na-ref-kind? (jolt-array-kind src)) (na-ref-kind? (jolt-array-kind dst))))
     (throw-jvm 'ArrayStoreException "arraycopy between arrays of different types"))
   (let ((sp (na-idx src-pos)) (dp (na-idx dst-pos)) (n (na-idx len))
         (slen (ja-len src)) (dlen (ja-len dst)))
@@ -960,7 +962,16 @@
 ;; very token the type's values report.
 (define (class-for-name nm . _)
   (cond
-    ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
+    ;; an array class by its JVM name ("[I", "[Ljava.lang.String;") is a Class
+    ;; like any other, when its innermost component is one forName knows
+    ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[))
+     (let ((parts (hsc-array-parts nm)))
+       (if (and parts (or (member (car parts) jclass-primitive-names)
+                          (string=? (car parts) "java.lang.Object")
+                          (forname-known? (car parts))
+                          (let ((c (jch-registered-name (car parts)))) (and c (forname-known? c)))))
+           (jolt-class-for nm)
+           (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm)))))
     ((forname-known? nm) (jolt-class-for nm))
     ((let ((c (jch-registered-name nm))) (and c (forname-known? c) c)) => jolt-class-for)
     (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm)))))

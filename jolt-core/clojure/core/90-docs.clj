@@ -1693,6 +1693,22 @@
   "Returns a lazy sequence of vector partitions, but may include\n  partitions with fewer than n items at the end.\n  Returns a stateful transducer when no collection is provided."
   '([n] [n coll] [n step coll])
   nil)
+(attach-core-doc-meta! "clojure.core" "stream-reduce!"
+  "Works like reduce but takes a java.util.stream.BaseStream as its source.\n  Honors 'reduced', is a terminal operation on the stream"
+  '([f s] [f init s])
+  nil)
+(attach-core-doc-meta! "clojure.core" "stream-seq!"
+  "Takes a java.util.stream.BaseStream instance s and returns a seq of its\n  contents. This is a terminal operation on the stream."
+  '([stream])
+  nil)
+(attach-core-doc-meta! "clojure.core" "stream-transduce!"
+  "Works like transduce but takes a java.util.stream.BaseStream as its source.\n  This is a terminal operation on the stream."
+  '([xform f stream] [xform f init stream])
+  nil)
+(attach-core-doc-meta! "clojure.core" "stream-into!"
+  "Returns a new coll consisting of coll with all of the items of the\n  stream conjoined. This is a terminal operation on the stream."
+  '([to stream] [to xform stream])
+  nil)
 (attach-core-doc-meta! "clojure.core" "pcalls"
   "Executes the no-arg fns in parallel, returning a lazy sequence of\n  their values"
   '([& fns])

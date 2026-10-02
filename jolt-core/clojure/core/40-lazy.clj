@@ -130,13 +130,8 @@
                    (cons (f idx (first s)) (mapi (inc idx) (rest s)))))))]
      (mapi 0 coll))))
 
-;; --- cycle ---
-;; Lazy, like the JVM: never counts coll, so it terminates on a lazy/infinite
-;; argument instead of forcing it.
-(defn cycle [coll]
-  (if (seq coll)
-    (lazy-seq (concat coll (cycle coll)))
-    ()))
+;; --- cycle --- is native (seq.ss jolt-cycle): clojure.lang.Cycle, lazy over
+;; coll's seq, and the seq kind its hash refuses on (CLJ-2839).
 
 ;; --- repeatedly --- ((f) throws on a non-fn; (take n …) throws on a non-number
 ;; count — both enforced by the host (jolt-call / take), so the canonical
@@ -203,6 +198,40 @@
                (when (seq s)
                  (cons (take n s) (go (nthrest s step))))))]
      (go coll))))
+
+;; Clojure 1.12's vector partitions, ported as written: each partition is built
+;; with (into [] (take n) …) and the walk advances by nthrest/drop, so a step past
+;; the end stops cleanly and the pad arity tops up only the last partition.
+(defn partitionv
+  ([n coll]
+   (partitionv n n coll))
+  ([n step coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [p (into [] (take n) s)]
+         (when (= n (count p))
+           (cons p (partitionv n step (nthrest s step))))))))
+  ([n step pad coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [p (into [] (take n) s)]
+         (if (= n (count p))
+           (cons p (partitionv n step pad (nthrest s step)))
+           (list (into [] (take n) (concat p pad)))))))))
+
+(defn partitionv-all
+  ([n]
+   (partition-all n))
+  ([n coll]
+   (partitionv-all n n coll))
+  ([n step coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [seg (into [] (take n) coll)]
+         (cons seg (partitionv-all n step (drop step s))))))))
+
+(defn splitv-at [n coll]
+  [(into [] (take n) coll) (drop n coll)])
 
 ;; --- canonical lazy + transducer arities -------------------------------------
 

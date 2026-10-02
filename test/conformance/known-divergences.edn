@@ -14,7 +14,7 @@
    :impl-detail
    "representation detail: syntax-quote yields a list? (JVM yields a Cons)",
   :seq-type-model
-  "jolt reifies the JVM's specialized seq class for nearly every producer now (Cons/Iterate/LongRange/Range/Repeat/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). What still collapses to LazySeq is cycle (JVM: Cycle) — see its :entries row below. Values and laziness are correct, only (class …) differs. jolt-aei7",
+  "jolt reifies the JVM's specialized seq class for nearly every producer now (Cons/Iterate/LongRange/Range/Repeat/Cycle/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). The :documented entries under this category are the classes that still differ. Values and laziness are correct, only (class …) differs. jolt-aei7",
   :chunking-model
   "jolt now chunks range/vector seqs through map/filter like the JVM (forcing one element realizes the whole ~32-element chunk). What remains finer-grained: dedupe realizes 0 at construction where the JVM's sequence transformer forces the first chunk just to build the seq. (mapcat realizes like the JVM's (apply concat …): four elements, or the first chunk.) jolt-mm6v",
   :integer-box-model
@@ -381,6 +381,21 @@
            :jvm "throws ClassCastException"
            :jolt "5"}
    :note "Unchecked data argument; a map behaves identically. Verified against Clojure 1.12.5."}
+  ;; A reference array's elements are not checked against its component class:
+  ;; the JVM raises "array element type mismatch" from into-array and
+  ;; ArrayStoreException from aset, while jolt stores the value. Typed arrays
+  ;; carry their component class (into-array String … is a String[]), but jolt's
+  ;; class model does not know every JDK class's ancestry — a StandardCopyOption
+  ;; is a CopyOption on the JVM and not here — so a check would refuse arrays the
+  ;; JVM builds. A superset: an array of the right elements behaves identically.
+  {:category :permissive
+   :behavior "(into-array String [1]) — an element that is not of the component class"
+   :jvm "throws IllegalArgumentException"
+   :jolt "a String[] holding 1"
+   :check {:expr "(vec (into-array String [1]))"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[1]"}
+   :note "aset into a typed array is unchecked the same way. Verified against Clojure 1.12.5."}
   ;; doseq with an unknown keyword among its bindings: the reference fails from
   ;; inside its own expansion (a NullPointerException, its "steppair" is null),
   ;; while for refuses the same keyword by name. jolt refuses both by name.
@@ -1656,12 +1671,6 @@
   {:suite "untested / chunk family (eager equivalents) + cat",
    :label "chunk round-trip",
    :category :host-model}
-  ;; A seq now reports the concrete clojure.lang class of whatever produced it
-  ;; (cons, vector seq, string seq, keys, vals, rseq, sort, range, iterate,
-  ;; repeat, the map/set seq views, drop over an IDrop coll), so those rows
-  ;; certify. cycle is still modelled as a lazy seq and keeps its class; the JVM
-  ;; has clojure.lang.Cycle.
-  {:suite "seq-type-model / remaining class collapse", :label "cycle", :category :seq-type-model}
   {:suite "chunking-model / unchunked realization granularity", :label "dedupe is fully lazy at construction", :category :chunking-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "byte class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "short class", :category :integer-box-model}

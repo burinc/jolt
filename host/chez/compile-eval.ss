@@ -110,6 +110,19 @@
 ;; every pair that meets only after escaping (a? and a_QMARK_).
 (define (compiler-munge s)
   (class-munge-name (if (string? s) s (jolt-str-render-one s))))
+;; clojure.lang.Compiler/subsumes — does the parameter-type array c1 make a
+;; strictly better match than c2 (same length)? Every position must be equal, a
+;; reference type where c2 has a primitive, or assignable to c2's; at least one
+;; must differ. Compiler.java's rule, which SCI's reflector uses to choose among
+;; members of one arity.
+(define (compiler-subsumes c1 c2)
+  (let loop ((a (seq->list (jolt-seq c1))) (b (seq->list (jolt-seq c2))) (better #f))
+    (cond ((or (null? a) (null? b)) better)
+          ((equal? (class-key (car a)) (class-key (car b))) (loop (cdr a) (cdr b) better))
+          ((or (and (not (jclass-primitive? (car a))) (jclass-primitive? (car b)))
+               (jclass-name-assignable? (class-key (car b)) (class-key (car a))))
+           (loop (cdr a) (cdr b) #t))
+          (else #f))))
 ;; clojure.lang.Compiler/eval — evaluate a form in the current namespace, which is
 ;; clojure.core/eval below. typedclojure's analyzer calls the static directly
 ;; ((. clojure.lang.Compiler (eval frm))) so a user rebinding of eval cannot
@@ -122,7 +135,8 @@
                      (cons "CHAR_MAP" compiler-char-map)
                      (cons "munge" compiler-munge)
                      (cons "demunge" compiler-demunge)
-                     (cons "eval" compiler-eval))))
+                     (cons "eval" compiler-eval)
+                     (cons "subsumes" compiler-subsumes))))
   (register-class-statics! "Compiler" members)
   (register-class-statics! "clojure.lang.Compiler" members))
 
