@@ -233,7 +233,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only `java.nio.StringCharBuffer` it is on the JDK, so a `put` into it
   throws `ReadOnlyBufferException` instead of writing to a copy.
   `CharBuffer/wrap` of a `char[]` shares the array, with `wrap(arr, off, len)`
-  setting position and limit as the JDK does, and `equals`, `hashCode`,
+  setting position and limit as the JDK does, `wrap` of a StringBuilder
+  reads it live, and `equals`, `hashCode`,
   `compareTo` and `mismatch` agree across every kind of CharBuffer, a
   ByteBuffer's `asCharBuffer` view included.
 

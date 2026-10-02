@@ -272,13 +272,23 @@
 ;; Element I (0..cap-1) of any buffer.
 ;; A third mode, 'string, is CharBuffer/wrap over a CharSequence: the JDK's
 ;; StringCharBuffer, read-only, reading the string itself.
+;; A StringCharBuffer reads its CharSequence LIVE, as the JDK's does: a later
+;; append or setCharAt on a wrapped StringBuilder shows through the buffer. A
+;; String is its own text; anything else is asked for its text at each read
+;; (a StringBuilder's is its cached string, so that is no copy per read).
+(define (nb-live-char store k)
+  (let ((s (if (string? store) store (jolt-str-render-one store))))
+    (if (fx<? k (string-length s)) (string-ref s k) (nb-ioobe))))
+(define (nb-live-substring store from to)
+  (let ((s (if (string? store) store (jolt-str-render-one store))))
+    (if (fx<=? to (string-length s)) (substring s from to) (nb-ioobe))))
 (define (nb-ref b i)
   (let ((kind (nb-kind b)) (mode (nb-mode b)))
     (cond ((eq? mode 'bytes)
            (let ((w (nb-width kind)))
              (nb-decode kind (nb-load (bb-backing b) (fx+ (bb-off b) (fx* i w)) w (nb-order b)))))
           ((eq? mode 'array) (nb-host-array-ref (bb-backing b) (fx+ (bb-off b) i)))
-          (else (string-ref (bb-backing b) (fx+ (bb-off b) i))))))
+          (else (nb-live-char (bb-backing b) (fx+ (bb-off b) i))))))
 (define (nb-set! b i v)
   (let ((kind (nb-kind b)) (mode (nb-mode b)))
     (cond ((eq? mode 'bytes)
@@ -426,9 +436,9 @@
       (let ((n (nb-host-array-len x)))
         (nb-check-range start (fx- end start) n)
         (make-nb 'char 'array x 0 n start end (nb-native-order) 0 x))
-      (let* ((s (if (string? x) x (jolt-str-render-one x))) (n (string-length s)))
+      (let ((n (nb-char-seq-len x)))
         (when (or (fx<? start 0) (fx>? start n) (fx<? end start) (fx>? end n)) (nb-ioobe))
-        (make-nb 'char 'string s 0 n start end (nb-native-order) nb-flag-ro #f))))
+        (make-nb 'char 'string x 0 n start end (nb-native-order) nb-flag-ro #f))))
 (define (nb-char-seq-len x)
   (cond ((nb-host-array? x 'char) (nb-host-array-len x))
         ((string? x) (string-length x))
@@ -450,9 +460,9 @@
 ;; slice has no mark; a duplicate keeps it.
 (define (nb-derived-order b) (if (eq? (nb-kind b) 'byte) 'big (nb-order b)))
 (define (nb-elem-off b i)                 ; where element I of B starts in its store
-  (if (eq? (nb-mode b) 'array)
-      (fx+ (bb-off b) i)
-      (fx+ (bb-off b) (fx* i (nb-width (nb-kind b))))))
+  (if (eq? (nb-mode b) 'bytes)
+      (fx+ (bb-off b) (fx* i (nb-width (nb-kind b))))
+      (fx+ (bb-off b) i)))
 (define (nb-slice b index len)
   (make-nb (nb-kind b) (nb-mode b) (bb-backing b) (nb-elem-off b index) len 0 len
            (nb-derived-order b) (nb-flags b) (nb-array b)))
@@ -569,7 +579,7 @@
 ;; and its three indexes.
 (define (nb-char-string b from to)        ; elements [from, to) as a string
   (case (nb-mode b)
-    ((string) (substring (bb-backing b) (fx+ (bb-off b) from) (fx+ (bb-off b) to)))
+    ((string) (nb-live-substring (bb-backing b) (fx+ (bb-off b) from) (fx+ (bb-off b) to)))
     ((array) (nb-host-chars->string (bb-backing b) (fx+ (bb-off b) from) (fx+ (bb-off b) to)))
     (else (let ((s (make-string (fx- to from))))
             (do ((i from (fx+ i 1))) ((fx=? i to) s) (string-set! s (fx- i from) (nb-ref b i)))))))
@@ -904,7 +914,7 @@
 (define (nb-char-ref b i)
   (case (nb-mode b)
     ((array) (nb-host-char-ref (bb-backing b) (fx+ (bb-off b) i)))
-    ((string) (string-ref (bb-backing b) (fx+ (bb-off b) i)))
+    ((string) (nb-live-char (bb-backing b) (fx+ (bb-off b) i)))
     (else (nb-ref b i))))
 (define (nb-char-set! b i c)
   (if (and (eq? (nb-mode b) 'array) (char? c))
@@ -917,7 +927,7 @@
           (vector-set! st 1 (fx+ p 1))
           (case (vector-ref st 10)
             ((array) (nb-host-char-ref store i))
-            ((string) (string-ref store i))
+            ((string) (nb-live-char store i))
             (else (nb-ref b p))))
         (nb-underflow))))
 (define (nb-char-put1 b x)
