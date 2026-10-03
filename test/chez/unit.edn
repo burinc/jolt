@@ -2084,6 +2084,15 @@
   {:suite "deftype-method" :expr "(do (defprotocol P (m [_ o])) (defrecord R [n] P (m [_ _] n)) (m (->R 5) :x))" :expected "5"}
   {:suite "deftype-method" :expr "(do (defprotocol P2 (m2 [_ o])) (deftype T [n] P2 (m2 [_ _] n)) (m2 (->T 7) :x))" :expected "7"}
   {:suite "protocol-host" :expr "(do (defprotocol Q (e [_])) (extend-protocol Q clojure.lang.Var (e [_] :var)) [(satisfies? Q (var map)) (e (var map))])" :expected "[true :var]"}
+  ;; protocol-resolve memoizes its walk over a plain value's host tags by
+  ;; (protocol method, tag list), stamped with the registry's epoch: an extend
+  ;; after a call must still reach the next call, each method resolves on its
+  ;; own, a number's spliced tag list is memoized too, and a miss still throws.
+  {:suite "protocol-host" :expr "(do (defprotocol Rm (rm [_])) (extend-protocol Rm Object (rm [_] :obj)) (let [a (rm [1])] (extend-protocol Rm clojure.lang.IPersistentVector (rm [_] :vec)) [a (rm [1]) (rm {:a 1})]))" :expected "[:obj :vec :obj]"}
+  {:suite "protocol-host" :expr "(do (defprotocol Rm2 (r2 [_])) (extend-protocol Rm2 clojure.lang.PersistentVector (r2 [_] 1)) (let [a (r2 [1])] (extend-protocol Rm2 clojure.lang.PersistentVector (r2 [_] 2)) [a (r2 [1])]))" :expected "[1 2]"}
+  {:suite "protocol-host" :expr "(do (defprotocol Rm3 (ra [_]) (rb [_])) (extend-protocol Rm3 Object (ra [_] :a) (rb [_] :b)) [(ra [1]) (rb [1]) (ra [2]) (rb {:x 1})])" :expected "[:a :b :a :b]"}
+  {:suite "protocol-host" :expr "(do (defprotocol Rm4 (r4 [_])) (extend-protocol Rm4 Number (r4 [_] :n) Long (r4 [_] :l)) [(r4 1) (r4 1.5) (r4 2) (r4 2.5)])" :expected "[:l :n :l :n]"}
+  {:suite "protocol-host" :expr "(do (defprotocol Rm5 (r5 [_])) (extend-protocol Rm5 String (r5 [_] :s)) (r5 \"a\") (r5 \"b\") (r5 [1]))" :expected :throws}
 
   ;; Clojure 1.13 (1.13.0-alpha1) parity. Ahead of the JVM 1.12.5 the corpus
   ;; certifies against, so these live here rather than as certified corpus rows.

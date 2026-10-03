@@ -988,6 +988,46 @@
                                 (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
                                   (if (string? n) n "?"))))))
 
+;; protocol-resolve's walk over a plain value's host tags, memoized per
+;; (protocol method, tag list) the way satisfies? memoizes its own walk
+;; (records-dispatch.ss satisfies-memo), and stamped with the same two epochs:
+;; the registry's (jolt-proto-epoch, bumped by every registration, prune and
+;; inline marker) and the class graph's (jch-graph-epoch, which changes what a
+;; tag list holds). The method is its interned key (intern-pm-key: two eq?-refs
+;; on the name objects the call site passes) and the list is keyed eq?, so only
+;; a list the class graph hands out and keeps is ever stored (graph-owned-tags?)
+;; -- one built per call could never hit again. Without it every call walked
+;; the value's tags through the string-keyed registry, three string hashes a
+;; tag, until one had the method: a protocol extended to Object cost ~5 us a
+;; call on a vector and ~3.5 us on a map, which is what core.logic's unifier
+;; pays on every term it walks. Read unlocked, written under jch-cache-mutex
+;; with both epochs re-checked, as satisfies-memo is.
+(define resolve-memo (make-eq-hashtable))
+(define (resolve-by-host-tags proto-name method-name obj tags)
+  (let* ((k (intern-pm-key proto-name method-name))
+         (inner (hashtable-ref resolve-memo k #f))
+         (e (and inner (hashtable-ref inner tags #f))))
+    (if (and e
+             (fx= (vector-ref e 0) jolt-proto-epoch)
+             (fx= (vector-ref e 1) jch-graph-epoch))
+        (vector-ref e 2)
+        (let* ((pe jolt-proto-epoch)
+               (ge jch-graph-epoch)
+               (f (let loop ((ts tags))
+                    (cond ((null? ts) #f)
+                          ((find-protocol-method (car ts) proto-name method-name))
+                          (else (loop (cdr ts)))))))
+          (unless f (protocol-miss-throw proto-name method-name obj))
+          (when (graph-owned-tags? tags)
+            (jolt-with-mutex jch-cache-mutex
+              (when (and (fx= pe jolt-proto-epoch) (fx= ge jch-graph-epoch))
+                (let ((t (or (hashtable-ref resolve-memo k #f)
+                             (let ((t (make-weak-eq-hashtable)))
+                               (hashtable-set! resolve-memo k t)
+                               t))))
+                  (hashtable-set! t tags (vector pe ge f))))))
+          f))))
+
 ;; protocol-resolve: the impl procedure for obj — by record type tag, a reify's
 ;; instance-local method, or the protocol's extended impls over obj's host tags.
 ;; Raises if none implements the method. The dispatchN entry points apply it
@@ -1012,11 +1052,7 @@
                 (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
                       ((find-protocol-method (car tags) proto-name method-name))
                       (else (loop (cdr tags))))))))
-    (else
-     (let loop ((tags (value-host-tags obj)))
-       (cond ((null? tags) (protocol-miss-throw proto-name method-name obj))
-             ((find-protocol-method (car tags) proto-name method-name))
-             (else (loop (cdr tags))))))))
+    (else (resolve-by-host-tags proto-name method-name obj (value-host-tags obj)))))
 ;; Fixed-arity entry points the protocol-method shims call: no rest-list, no seq
 ;; round-trip — apply the resolved impl directly. defprotocol emits one clause per
 ;; declared arity that calls the matching dispatchN.
