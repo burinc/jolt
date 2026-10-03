@@ -116,6 +116,15 @@
         (evv "(long-array 8192)")
         (full!)
         (< (- (bytes-allocated) before) (* 16 1024 1024)))))
+;; ...and so does a collection the program asks for (System/gc), which runs no
+;; collect-request-handler: without it a dropped 64MB long array stayed locked,
+;; and live, through every System/gc until the next pin (the gc-arrays bench's
+;; bytes phase, 2.3x).
+(ok "a dropped large array is unpinned by System/gc with no later pin"
+    ;; keep the pin's box, not the array: the box is #f once the lock is undone
+    (let ((b (hashtable-ref sa-pin-boxes (evv "(long-array (* 4 1024 1024))") #f)))
+      (evv "(System/gc)")
+      (and b (not (unbox b)))))
 ;; ...and so does every collection jolt schedules, so one big array dropped with
 ;; no other pin after it does not stay locked for the rest of the run. The gate
 ;; boot leaves Chez's own collect-request-handler in place; a binary and the CLI

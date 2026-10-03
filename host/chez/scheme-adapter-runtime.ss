@@ -61,9 +61,13 @@
                                (raise e))))
                (collect (collect-maximum-generation))
                'ok)))
-      (when (and (eq? r 'busy) (fx>? tries 0))
-        (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
-        (loop (fx- tries 1))))))
+      (case r
+        ;; no collect-request-handler ran, so undo the pins of arrays this one
+        ;; found dead here, or they stay locked (and live) until the next pin
+        ((ok) (sa-pin-drain-after-collect!))
+        ((busy) (when (fx>? tries 0)
+                  (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
+                  (loop (fx- tries 1))))))))
 
 ;; (sa-gc-max-generation) -> exact integer
 ;; The deepest collectable generation, for callers mapping JVM generations.
