@@ -6,7 +6,18 @@
 ;; to see a jolt-array (backed by a Chez vector). Loaded after host-table.ss (ref-put!),
 ;; transients.ss, seq.ss (the dispatchers it chains).
 
-(define-record-type jolt-array (fields (mutable vec) kind) (nongenerative jolt-array-v1))
+(define-record-type (jolt-array %make-jolt-array jolt-array?)
+  (fields (mutable vec) kind) (nongenerative jolt-array-v1))
+;; Every array is built here, so this is where a large long or double backing is
+;; pinned (na-pin-large!). The size test is inline rather than a record protocol
+;; or a call: either made building a small array ~15% dearer.
+(define (make-jolt-array vec kind)
+  (let ((a (%make-jolt-array vec kind)))
+    (when (if (fxvector? vec)
+              (fx>=? (fxvector-length vec) 8192)
+              (and (flvector? vec) (fx>=? (flvector-length vec) 8192)))
+      (na-pin-large! a vec))
+    a))
 
 ;; An array's kind is one of the eight primitive symbols, 'object for an
 ;; Object[], or — for any other reference array — its COMPONENT class's JVM name
@@ -210,6 +221,8 @@
   (let* ((v (jolt-array-vec a)) (n (fxvector-length v)) (w (make-vector n 0)))
     (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! w i (fxvector-ref v i)))
     (jolt-array-vec-set! a w)
+    ;; the fxvector is garbage now; a pin would hold it for the array's life
+    (when (na-large-backing? v) (sa-unpin-for-owner! a))
     w))
 ;; The char backing's counterpart to ja-promote!, and it exists for the same
 ;; reason: a Chez string holds CHARACTERS, and jolt cannot stop a program from
@@ -318,6 +331,19 @@
       (let ((bv (sa-make-large-bytevector n)))
         (unless (fx=? fill 0) (bytevector-fill! bv fill))
         bv)))
+;; A long, int or double array's backing (an fxvector or flvector) of 64KB and up
+;; is pinned to its array for the array's life (sa-pin-for-owner!), for the reason
+;; a byte array of that size is immobile: Chez has no immobile fxvector or flvector
+;; to allocate instead, and a mobile one in a mostly free chunk is copied at every
+;; full collection -- a 64KB fxvector in a bare Chez heap is, every time (#1227). A
+;; huge one (2MB up) is pinned by Chez itself only when it took fresh segments.
+;; Pinning instead of a bytevector backing keeps the typed-array hot paths on
+;; fxvector and flvector ops.
+;; 8192 elements is na-large-bytes of 8-byte slots, written out in make-jolt-array.
+(define (na-large-backing? v)
+  (or (and (fxvector? v) (fx>=? (fxvector-length v) 8192))
+      (and (flvector? v) (fx>=? (flvector-length v) 8192))))
+(define (na-pin-large! a v) (sa-pin-for-owner! a v))
 (define (na-bytes-copy bv)
   (let ((n (bytevector-length bv)))
     (if (fx<? n na-large-bytes)

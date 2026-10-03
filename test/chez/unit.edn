@@ -4,6 +4,12 @@
   {:suite "large-bytes" :expr "(let [a (byte-array 70000 (byte -1))] (System/gc) [(alength a) (aget a 0) (aget a 69999)])" :expected "[70000 -1 -1]"}
   {:suite "large-bytes" :expr "(let [a (byte-array 70000 200)] [(aget a 0) (reduce + (take 4 a))])" :expected "[-56 -224]"}
   {:suite "large-bytes" :expr "(let [a (byte-array 70000) b (aclone a)] (aset b 69999 (byte 5)) (System/gc) [(aget a 69999) (aget b 69999) (java.util.Arrays/equals a b)])" :expected "[0 5 false]"}
+  ;; From 64KB a long, int or double array's backing is pinned to the array (#1227):
+  ;; the values are the ones the unpinned one held, and a widened one keeps them.
+  {:suite "large-fx" :expr "(let [a (long-array 70000 -7)] (System/gc) [(alength a) (aget a 0) (aget a 69999) (reduce + (take 3 a))])" :expected "[70000 -7 -7 -21]"}
+  {:suite "large-fx" :expr "(let [a (double-array 70000 1.5) b (aclone a)] (aset b 69999 2.5) (System/gc) [(aget a 69999) (aget b 69999) (java.util.Arrays/equals a b)])" :expected "[1.5 2.5 false]"}
+  {:suite "large-fx" :expr "(let [a (int-array (range 70000))] (System/gc) [(aget a 0) (aget a 69999) (alength (java.util.Arrays/copyOf a 80000))])" :expected "[0 69999 80000]"}
+  {:suite "large-fx" :expr "(let [a (long-array 70000)] (aset a 1 Long/MAX_VALUE) (System/gc) [(aget a 0) (aget a 1) (alength a)])" :expected "[0 9223372036854775807 70000]"}
   {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (@#'jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$./]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
   {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (@#'jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core/mm\\$\" s)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}

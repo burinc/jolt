@@ -1145,6 +1145,7 @@
         (let ((t0 (sa-monotonic-ns)))
           (sa-collect-young!)
           (maintain collect-full!)
+          (sa-pin-drain-after-collect!)
           (let ((t1 (sa-monotonic-ns)))
             (observe (- t1 t0) (- t1 last-end))
             (set! last-end t1))))))
@@ -1512,4 +1513,60 @@
 ;; run time the way the sa-* seams are.
 (load "host/chez/locks.ss")
 (load "host/chez/fibers.ss")
+
+;; (sa-pin-for-owner! owner obj) -> void
+;; (sa-unpin-for-owner! owner) -> void
+;; Keep OBJ where it is -- marked in place by every collection, never copied --
+;; for as long as OWNER is reachable, or until sa-unpin-for-owner! (which also
+;; runs when OWNER pins something else: an owner holds at most one pin). Then OBJ
+;; is an ordinary object again, reclaimed once nothing else holds it. It is the
+;; large-array backings that have no immobile constructor, the fxvector and
+;; flvector a long or double array lives in (rt natives-array.ss), hazarded
+;; exactly as a byte array was before sa-make-large-bytevector: a mobile backing
+;; in a mostly free chunk is copied at every full collection (#1227).
+;;
+;; A locked object is a root, so a guardian cannot watch OBJ itself: it watches
+;; OWNER, and the box it hands back is what says OBJ is still locked. Every lock
+;; is undone exactly once -- Chez's unlock-object decrements the segment's pin
+;; count without checking the object was locked, so a second unlock would unpin
+;; whatever else shares the segment. Dead owners are drained on each pin and after
+;; each collection (sa-gc-install-after-collect!'s handler). The handler only
+;; TRIES the mutex: a thread parked at the collection rendezvous may hold it, and
+;; waiting there would deadlock; the next pin or collection drains instead.
+;; Contract: OBJ is not relocated while pinned, and nothing pinned outlives its
+;; owner by more than a collection. Degradation: both no-op (a collector that
+;; does not move such objects, or one that cannot be asked not to).
+(define sa-pin-guardian (make-guardian))
+(define sa-pin-boxes (make-weak-eq-hashtable))
+(define sa-pin-mutex (make-mutex))
+;; under sa-pin-mutex
+(define (sa-pin-release! b)
+  (when (unbox b)
+    (unlock-object (unbox b))
+    (set-box! b #f)))
+(define (sa-pin-drain-locked!)
+  (let loop ()
+    (let ((b (sa-pin-guardian)))
+      (when b (sa-pin-release! b) (loop)))))
+(define (sa-pin-for-owner! owner obj)
+  (jolt-with-mutex sa-pin-mutex
+    (sa-pin-drain-locked!)
+    (let ((old (hashtable-ref sa-pin-boxes owner #f)))
+      (when old (sa-pin-release! old)))
+    (lock-object obj)
+    (let ((b (box obj)))
+      (hashtable-set! sa-pin-boxes owner b)
+      (sa-pin-guardian owner b))))
+(define (sa-unpin-for-owner! owner)
+  (jolt-with-mutex sa-pin-mutex
+    (let ((b (hashtable-ref sa-pin-boxes owner #f)))
+      (when b
+        (sa-pin-release! b)
+        (hashtable-delete! sa-pin-boxes owner)))))
+(define (sa-pin-drain-after-collect!)
+  (when (jolt-lock! sa-pin-mutex #f)
+    (dynamic-wind
+      void
+      sa-pin-drain-locked!
+      (lambda () (jolt-unlock! sa-pin-mutex)))))
 

@@ -182,6 +182,11 @@
 ;; Permitted degradation: an ordinary bytevector; Gambit has no immobile
 ;; allocation to ask for.
 (define (sa-make-large-bytevector n) (make-bytevector n 0))
+;; (sa-pin-for-owner! owner obj) / (sa-unpin-for-owner! owner) -> void
+;; Permitted degradation: both no-op; Gambit cannot be asked not to move an
+;; object, and does not load the arrays that ask.
+(define (sa-pin-for-owner! owner obj) (if #f #f))
+(define (sa-unpin-for-owner! owner) (if #f #f))
 
 ;; (sa-gc-reserve-ratio! r) -> void
 ;; Permitted degradation: Gambit sizes its own heap reserve, so this is ignored.
