@@ -1875,7 +1875,10 @@ rm -rf "$(dirname "$inc_app")"
 # dependencies here are deleted before the binary runs — the "other machine".
 # One dep is a directory, one a jar; the png is not valid UTF-8 and must come
 # back byte-for-byte; the project's own resources/ copy of shared.txt shadows
-# the dependency's, as the project's paths come first on a classpath.
+# the dependency's, as the project's paths come first on a classpath. Sources
+# are baked only where the binary still reads them: dirlib.core is compiled into
+# the image, so its .clj is left out, but the file it (load)s runs in the binary.
+# ClojureScript sources are never baked: jolt does not load them.
 echo "build smoke: dependency resources embedded (uberjar-style)"
 dr="$(mktemp -d)"
 mkdir -p "$dr/app/src/dr" "$dr/app/resources" "$dr/dirlib/src/dirlib" "$dr/dirlib/resources/dirlib" "$dr/jarlib/src/jarlib" "$dr/jarlib/res"
@@ -1886,7 +1889,13 @@ printf '\211PNG\r\n\032\n\377\000\376' > "$dr/dirlib/resources/dirlib/pixel.png"
 cat > "$dr/dirlib/src/dirlib/core.clj" <<'DR_EOF'
 (ns dirlib.core (:require [clojure.java.io :as io]))
 (def template (slurp (io/resource "dirlib/template.txt")))
+(load "core_impl")
 DR_EOF
+cat > "$dr/dirlib/src/dirlib/core_impl.clj" <<'DR_EOF'
+(in-ns 'dirlib.core)
+(def loaded "from a (load)ed file")
+DR_EOF
+printf '(ns dirlib.core)' > "$dr/dirlib/src/dirlib/core.cljs"
 printf 'jar template' > "$dr/jarlib/res/jarlib.txt"
 cat > "$dr/jarlib/src/jarlib/core.clj" <<'DR_EOF'
 (ns jarlib.core (:require [clojure.java.io :as io]))
@@ -1907,7 +1916,9 @@ cat > "$dr/app/src/dr/core.clj" <<'DR_EOF'
                     (let [out (java.io.ByteArrayOutputStream.)]
                       (io/copy in out)
                       (vec (.toByteArray out)))))
-  (println "source:" (some? (io/resource "dirlib/core.clj"))))
+  (println "load:" d/loaded)
+  (println "baked source:" (io/resource "dirlib/core.clj"))
+  (println "cljs:" (io/resource "dirlib/core.cljs")))
 DR_EOF
 if ! JOLT_PWD="$dr/app" "$jolt" build -m dr.core -o "$dr/bin" >"$dr/build.log" 2>&1; then
   echo "  FAIL: dependency-resource build exited non-zero"; tail -20 "$dr/build.log"; exit 1
@@ -1918,7 +1929,9 @@ want_dr='dir: dir template
 jar: jar template
 shared: from the project
 png: [-119 80 78 71 13 10 26 10 -1 0 -2]
-source: true'
+load: from a (load)ed file
+baked source: nil
+cljs: nil'
 if [ "$got_dr" != "$want_dr" ]; then
   echo "  FAIL: dependency resources did not travel with the binary"
   echo "--- want ---"; echo "$want_dr"

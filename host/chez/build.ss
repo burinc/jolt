@@ -1433,8 +1433,13 @@
 ;; wins, the project's own paths shadow every dependency, and a name jolt itself
 ;; supplies (an install root, or a source this jolt carries embedded) stays
 ;; jolt's — an embedded key outranks every root at runtime, so baking a
-;; library's copy of, say, babashka/fs.clj would replace jolt's. Compiled JVM
-;; classes are left out: nothing in jolt can load one.
+;; library's copy of, say, babashka/fs.clj would replace jolt's. Left out:
+;; compiled JVM classes and ClojureScript sources, which jolt never loads, and
+;; the source of every
+;; namespace the build compiled into the image, which the binary never reads
+;; again (its namespaces are pre-registered, so a require of one is a no-op).
+;; Any other source stays: a file a namespace (load)s runs in the binary, and a
+;; namespace reached only at runtime is loaded from its embedded copy.
 
 ;; The dependency roots: every source root that is not one of the project's own
 ;; paths (EXT-ROOTS, project-relative, resolved the way jolt.deps resolves them
@@ -1469,10 +1474,20 @@
 
 (define (bld-root-has? root name) (and (cdr (resource-candidate root name)) #t))
 
+;; Is NAME the source file of one of the namespaces in BAKED — a table of their
+;; root-relative paths without extension (ns-name->rel)?
+(define (bld-baked-source? baked name)
+  (exists (lambda (ext)
+            (and (bld-suffix? name ext)
+                 (hashtable-ref baked (substring name 0 (- (string-length name) (string-length ext))) #f)))
+          ldr-source-exts))
+
 ;; ((name . bytes) ...) to bake from the dependency roots, first root first.
-(define (bld-dep-resources ext-roots embed-dirs)
+(define (bld-dep-resources ext-roots embed-dirs baked-ns)
   (let ((seen (make-hashtable string-hash string=?))
+        (baked (make-hashtable string-hash string=?))
         (project (bld-project-roots ext-roots)))
+    (for-each (lambda (n) (hashtable-set! baked (ns-name->rel n) #t)) baked-ns)
     ;; a project :embed file is baked under its own name below; the dependency's
     ;; copy would be overwritten by it, so it is not baked at all
     (for-each (lambda (root)
@@ -1492,6 +1507,8 @@
                         (else
                          (hashtable-set! seen n #t)
                          (if (or (bld-suffix? n ".class")
+                                 (bld-suffix? n ".cljs")
+                                 (bld-baked-source? baked n)
                                  (embedded-resource-has? n)
                                  (exists (lambda (r) (bld-root-has? r n)) project)
                                  (exists (lambda (r) (bld-root-has? r n)) ldr-install-roots))
@@ -1501,13 +1518,14 @@
                   (bld-root-files (car roots))))))))
 
 ;; Emit register-embedded-resource! per file under each embed dir, after the
-;; dependency roots' files (bld-dep-resources). Emitted BEFORE the app forms.
+;; dependency roots' files (bld-dep-resources; BAKED-NS names the namespaces
+;; compiled into the image). Emitted BEFORE the app forms.
 ;; File contents are read at BUILD time and emitted as bytevector literals —
 ;; flat.ss top-level forms run at every startup with no source on disk, so
 ;; reading the file at runtime would fail.
-(define (bld-emit-embeds out embed-dirs ext-roots)
+(define (bld-emit-embeds out embed-dirs ext-roots baked-ns)
   (for-each (lambda (nb) (bld-emit-embedded-resource out (car nb) (cdr nb)))
-            (bld-dep-resources ext-roots embed-dirs))
+            (bld-dep-resources ext-roots embed-dirs baked-ns))
   (for-each
     (lambda (root)
       (when (file-directory? root)
@@ -2201,7 +2219,7 @@
           (bld-emit-natives out natives 'required)
           (bld-emit-startup-profile-mark! out "required native libraries")
            (put-string out "\n;; === embedded resources ===\n")
-           (bld-emit-embeds out embed-dirs ext-roots)
+           (bld-emit-embeds out embed-dirs ext-roots (map car ordered))
             (bld-emit-data-readers out)
            ;; set-source-roots!* (not the scanning set-source-roots!): data readers
            ;; are baked just above, and re-scanning would eagerly reload reader
