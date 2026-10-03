@@ -178,6 +178,11 @@
 ;; ignored.
 (define (sa-gc-tight! on?) (if #f #f))
 
+;; (sa-make-large-bytevector n) -> bytevector
+;; Permitted degradation: an ordinary bytevector; Gambit has no immobile
+;; allocation to ask for.
+(define (sa-make-large-bytevector n) (make-bytevector n 0))
+
 ;; (sa-gc-reserve-ratio! r) -> void
 ;; Permitted degradation: Gambit sizes its own heap reserve, so this is ignored.
 (define (sa-gc-reserve-ratio! r) (if #f #f))

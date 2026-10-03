@@ -116,6 +116,26 @@
   (in-place-minimum-generation
     (if on? (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
 
+;; (sa-make-large-bytevector n) -> bytevector
+;; A fresh zero-filled bytevector of N bytes that the collector marks where it is
+;; instead of copying, for a large pointer-free backing (rt natives-array.ss: byte
+;; arrays from 64KB up). Chez pins a huge allocation on its own (segment.c
+;; S_find_segments: over 128 segments, must_mark), but only when the request
+;; takes FRESH segments. One served from the free segments of an existing chunk
+;; is an ordinary mobile object, and a full collection marks a segment in place
+;; only when its chunk is at least a quarter used (gc.c
+;; chunk_sufficiently_compact) -- so in a chunk a bigger freed object left nearly
+;; empty it is copied, at every full collection, each copy reusing free segments
+;; again. A live 8MB byte array after a freed 64MB long array cost ~1ms a full
+;; collection instead of ~100us that way, on a layout no program controls
+;; (#1225). An immobile object is always marked, and still reclaimed when
+;; unreachable. Contract: a mutable bytevector of length N, all zero.
+;; Degradation: an ordinary bytevector.
+(define (sa-make-large-bytevector n)
+  (let ((bv (make-immobile-bytevector n)))
+    (bytevector-fill! bv 0)
+    bv))
+
 ;; (sa-max-memory-bytes) -> exact integer
 ;; Peak heap bytes: the most the collector has held from the OS since the last
 ;; sa-reset-max-memory-bytes! (or since boot) -- the high-water mark behind

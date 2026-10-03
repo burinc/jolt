@@ -146,7 +146,9 @@ system
 # sa-reset-max-memory-bytes! and may answer the current total (a target that
 # keeps no peak answers "now"), in which case sa-reset-max-memory-bytes! may
 # no-op; sa-gc-reserve-ratio! may be ignored by a target that sizes its own
-# reserve, and sa-gc-tight! by one without an in-place collection mode; sa-gc-trip-bytes may answer 0 where no trip threshold exists (the
+# reserve, and sa-gc-tight! by one without an in-place collection mode;
+# sa-make-large-bytevector may answer an ordinary bytevector where the
+# collector cannot be asked not to move one; sa-gc-trip-bytes may answer 0 where no trip threshold exists (the
 # apply-scaling gate floors a footprint reading at it, and 0 is no floor);
 # sa-gc-install-after-collect! may answer
 # #f without installing anything, which leaves the heap unbounded as it was
@@ -170,6 +172,7 @@ sa-gc-trip-bytes!
 sa-gc-trip-bytes
 sa-gc-reserve-ratio!
 sa-gc-tight!
+sa-make-large-bytevector
 sa-reset-max-memory-bytes!
 sa-gc-install-after-collect!
 sa-gc-install-stall-watch!

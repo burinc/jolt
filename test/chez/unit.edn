@@ -1,4 +1,9 @@
 [
+  ;; From 64KB a byte array's backing is an immobile bytevector (#1225): the
+  ;; values are the ones the ordinary one held.
+  {:suite "large-bytes" :expr "(let [a (byte-array 70000 (byte -1))] (System/gc) [(alength a) (aget a 0) (aget a 69999)])" :expected "[70000 -1 -1]"}
+  {:suite "large-bytes" :expr "(let [a (byte-array 70000 200)] [(aget a 0) (reduce + (take 4 a))])" :expected "[-56 -224]"}
+  {:suite "large-bytes" :expr "(let [a (byte-array 70000) b (aclone a)] (aset b 69999 (byte 5)) (System/gc) [(aget a 69999) (aget b 69999) (java.util.Arrays/equals a b)])" :expected "[0 5 false]"}
   {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (@#'jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$./]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
   {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (@#'jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core/mm\\$\" s)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}
