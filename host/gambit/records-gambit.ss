@@ -2200,6 +2200,40 @@
           (let ((n (guard (e (#t #f)) (jolt-class-name obj))))
             (if (string? n) n "?"))))))
 
+(define resolve-memo (make-eq-hashtable))
+
+(define (resolve-by-host-tags proto-name method-name obj
+         tags)
+  (let* ((k (intern-pm-key proto-name method-name))
+         (inner (hashtable-ref resolve-memo k #f))
+         (e (and inner (hashtable-ref inner tags #f))))
+    (if (and e
+             (fx= (vector-ref e 0) jolt-proto-epoch)
+             (fx= (vector-ref e 1) jch-graph-epoch))
+        (vector-ref e 2)
+        (let* ((pe jolt-proto-epoch)
+               (ge jch-graph-epoch)
+               (f (let loop ((ts tags))
+                    (cond
+                      ((null? ts) #f)
+                      ((find-protocol-method
+                         (car ts)
+                         proto-name
+                         method-name))
+                      (else (loop (cdr ts)))))))
+          (unless f (protocol-miss-throw proto-name method-name obj))
+          (when (graph-owned-tags? tags)
+            (jolt-with-mutex
+              jch-cache-mutex
+              (when (and (fx= pe jolt-proto-epoch)
+                         (fx= ge jch-graph-epoch))
+                (let ((t (or (hashtable-ref resolve-memo k #f)
+                             (let ((t (make-weak-eq-hashtable)))
+                               (hashtable-set! resolve-memo k t)
+                               t))))
+                  (hashtable-set! t tags (vector pe ge f))))))
+          f))))
+
 (define (protocol-resolve proto-name method-name obj)
   (cond
     ((and (jrec? obj)
@@ -2223,12 +2257,11 @@
                ((find-protocol-method (car tags) proto-name method-name))
                (else (loop (cdr tags))))))))
     (else
-     (let loop ((tags (value-host-tags obj)))
-       (cond
-         ((null? tags)
-          (protocol-miss-throw proto-name method-name obj))
-         ((find-protocol-method (car tags) proto-name method-name))
-         (else (loop (cdr tags))))))))
+     (resolve-by-host-tags
+       proto-name
+       method-name
+       obj
+       (value-host-tags obj)))))
 
 (define (protocol-dispatch1 proto-name method-name obj)
   ((protocol-resolve proto-name method-name obj) obj))
