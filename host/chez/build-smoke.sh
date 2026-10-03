@@ -1868,4 +1868,63 @@ if ! grep -q 'cannot include no.such.ns' "$(dirname "$out")/inc-bad.log"; then
 fi
 rm -rf "$(dirname "$inc_app")"
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include)"
+# --- dependencies' resources are baked in, like an uberjar (#1232) ----------
+# A library that reads its OWN resource (selmer.validator slurps its error
+# template at load) found it through the build machine's absolute dependency
+# roots, so the binary worked where it was built and died everywhere else. The
+# dependencies here are deleted before the binary runs — the "other machine".
+# One dep is a directory, one a jar; the png is not valid UTF-8 and must come
+# back byte-for-byte; the project's own resources/ copy of shared.txt shadows
+# the dependency's, as the project's paths come first on a classpath.
+echo "build smoke: dependency resources embedded (uberjar-style)"
+dr="$(mktemp -d)"
+mkdir -p "$dr/app/src/dr" "$dr/app/resources" "$dr/dirlib/src/dirlib" "$dr/dirlib/resources/dirlib" "$dr/jarlib/src/jarlib" "$dr/jarlib/res"
+printf '{:paths ["src" "resources"]}\n' > "$dr/dirlib/deps.edn"
+printf 'dir template' > "$dr/dirlib/resources/dirlib/template.txt"
+printf 'from the dep' > "$dr/dirlib/resources/shared.txt"
+printf '\211PNG\r\n\032\n\377\000\376' > "$dr/dirlib/resources/dirlib/pixel.png"
+cat > "$dr/dirlib/src/dirlib/core.clj" <<'DR_EOF'
+(ns dirlib.core (:require [clojure.java.io :as io]))
+(def template (slurp (io/resource "dirlib/template.txt")))
+DR_EOF
+printf 'jar template' > "$dr/jarlib/res/jarlib.txt"
+cat > "$dr/jarlib/src/jarlib/core.clj" <<'DR_EOF'
+(ns jarlib.core (:require [clojure.java.io :as io]))
+(def template (slurp (io/resource "jarlib.txt")))
+DR_EOF
+(cd "$dr/jarlib/src" && zip -qr "$dr/jarlib.jar" .) && (cd "$dr/jarlib/res" && zip -qr "$dr/jarlib.jar" .)
+printf 'from the project' > "$dr/app/resources/shared.txt"
+printf '{:paths ["src" "resources"]\n :deps {dr/dirlib {:local/root "%s"} dr/jarlib {:local/root "%s"}}}\n' \
+  "$dr/dirlib" "$dr/jarlib.jar" > "$dr/app/deps.edn"
+cat > "$dr/app/src/dr/core.clj" <<'DR_EOF'
+(ns dr.core
+  (:require [clojure.java.io :as io] [dirlib.core :as d] [jarlib.core :as j]))
+(defn -main [& _]
+  (println "dir:" d/template)
+  (println "jar:" j/template)
+  (println "shared:" (some-> (io/resource "shared.txt") slurp))
+  (println "png:" (with-open [in (io/input-stream (io/resource "dirlib/pixel.png"))]
+                    (let [out (java.io.ByteArrayOutputStream.)]
+                      (io/copy in out)
+                      (vec (.toByteArray out)))))
+  (println "source:" (some? (io/resource "dirlib/core.clj"))))
+DR_EOF
+if ! JOLT_PWD="$dr/app" "$jolt" build -m dr.core -o "$dr/bin" >"$dr/build.log" 2>&1; then
+  echo "  FAIL: dependency-resource build exited non-zero"; tail -20 "$dr/build.log"; exit 1
+fi
+rm -rf "$dr/dirlib" "$dr/jarlib" "$dr/jarlib.jar"
+got_dr="$(cd "$dr/app" && JOLT_PWD="$dr/app" "$dr/bin" 2>&1)"
+want_dr='dir: dir template
+jar: jar template
+shared: from the project
+png: [-119 80 78 71 13 10 26 10 -1 0 -2]
+source: true'
+if [ "$got_dr" != "$want_dr" ]; then
+  echo "  FAIL: dependency resources did not travel with the binary"
+  echo "--- want ---"; echo "$want_dr"
+  echo "--- got ----"; echo "$got_dr"
+  exit 1
+fi
+rm -rf "$dr"
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include + dep-resources)"
