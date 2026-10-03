@@ -264,6 +264,13 @@ just past a trie boundary.
 
 ### Fixed
 
+- **A full collection no longer copies a large live byte array** (#1225). A
+  byte array of 64KB or more is now one the collector marks in place. Chez
+  pins a huge allocation only when it takes fresh segments from the OS, so an
+  8MB array that landed in the free space of an older chunk was copied at
+  every full collection instead: ~1ms each rather than ~100µs on Linux, on a
+  layout no program controls. Smaller arrays are unchanged.
+
 - **A failed git clone can be retried on Windows.** `fetch-git!` clears its
   staging directory with `delete-tree!` before each attempt, but git writes its
   objects read-only, Windows refuses to delete a read-only file, and the
