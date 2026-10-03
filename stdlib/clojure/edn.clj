@@ -11,8 +11,19 @@
 ;; Re-attach the source value's metadata to each rebuilt collection — read-string
 ;; preserves reader metadata (^:ref […]) but this rebuild would otherwise drop it,
 ;; which a metadata-driven config lib (aero/integrant) relies on.
+;;
+;; Most of a document is scalars, and they go first: asking a string or a number
+;; for :jolt/type is a get dispatch apiece, which was an eighth of reading a big
+;; document. A map is rebuilt through a transient, and a collection with no
+;; metadata keeps none, rather than a with-meta of nil.
+(declare edn->value)
+
+(defn- with-meta-of [v opts x]
+  (if-let [m (meta x)] (with-meta v (edn->value opts m)) v))
+
 (defn- edn->value [opts x]
   (cond
+    (or (nil? x) (string? x) (number? x) (keyword? x) (symbol? x) (boolean? x) (char? x)) x
     ;; Reader FORMS are detected by :jolt/type tag, never by map? — strict map?
     ;; (correctly) excludes tagged structs, so the old (and (map? x) ...) guard
     ;; would skip them.
@@ -45,13 +56,15 @@
           (get opts :default) ((get opts :default) tag-sym v)
           :else (__read-tagged tag v)))
     (map? x)
-      (with-meta (into {} (map (fn [e] [(edn->value opts (key e)) (edn->value opts (val e))]) x)) (edn->value opts (meta x)))
-    (vector? x) (with-meta (mapv (fn [v] (edn->value opts v)) x) (edn->value opts (meta x)))
+      (with-meta-of (persistent! (reduce-kv (fn [m k v] (assoc! m (edn->value opts k) (edn->value opts v)))
+                                            (transient {}) x))
+                    opts x)
+    (vector? x) (with-meta-of (mapv (fn [v] (edn->value opts v)) x) opts x)
     ;; a constructed set: recurse into its elements too, so a tagged literal
     ;; inside #{…} gets the :readers/:default treatment (aero's #ref in a set).
-    (set? x) (with-meta (set (map (fn [v] (edn->value opts v)) x)) (edn->value opts (meta x)))
+    (set? x) (with-meta-of (set (map (fn [v] (edn->value opts v)) x)) opts x)
     ;; edn lists are lists (list? holds), not lazy seqs
-    (seq? x) (with-meta (apply list (map (fn [v] (edn->value opts v)) x)) (edn->value opts (meta x)))
+    (seq? x) (with-meta-of (apply list (map (fn [v] (edn->value opts v)) x)) opts x)
     :else x))
 
 ;; Private helper, NOT named read-string: an unqualified (read-string …) call
