@@ -89,8 +89,13 @@ case "$(uname -s)" in
   *)      lib="$work/libadd.so" ;;
 esac
 
-echo "build-lib smoke: compiling libadd.core -> $lib"
-build_out="$(JOLT_PWD="$app" "$jolt" build --library -m libadd.core -o "$lib" 2>&1)"
+# -o names the library WITHOUT a suffix, the README's form: the build appends the
+# platform's .so/.dylib (jolt#1235), so "$lib" is where it must land.
+echo "build-lib smoke: compiling libadd.core -o $work/libadd -> $lib"
+build_out="$(JOLT_PWD="$app" "$jolt" build --library -m libadd.core -o "$work/libadd" 2>&1)"
+if [ -f "$work/libadd" ]; then
+  echo "  FAIL: -o $work/libadd wrote the library with no suffix, want $lib"; exit 1
+fi
 if [ ! -f "$lib" ]; then
   # A shared object folds Chez's libkernel.a in, so that archive must be PIC. A
   # kernel built without -fPIC (the common default, incl. a stock source build)
@@ -102,6 +107,14 @@ if [ ! -f "$lib" ]; then
   echo "  FAIL: jolt build --library produced no shared library"
   printf '%s\n' "$build_out"
   exit 1
+fi
+
+# The install name follows the file name, suffix included.
+if [ "$(uname -s)" = Darwin ] && command -v otool >/dev/null 2>&1; then
+  case "$(otool -D "$lib")" in
+    *"@rpath/libadd.dylib"*) ;;
+    *) echo "  FAIL: install name, want @rpath/libadd.dylib, got:"; otool -D "$lib"; exit 1 ;;
+  esac
 fi
 
 echo "build-lib smoke: compiling driver + calling add(2,3) through dlopen"
