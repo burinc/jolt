@@ -5,27 +5,6 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- **`jolt_library_release_thread`, a fourth symbol in a `jolt build --library`
-  object's C ABI.** The thread that calls `jolt_library_init` stays an active
-  jolt thread after init returns, so an embedder that parks it in host code (a
-  GUI run loop, a game's frame loop, a `pthread_join`) holds every other
-  thread's collection off for good: the first `:collect-safe` call from a
-  thread the embedder started that needs to collect waits forever, with the
-  two-second stall report as the only sign (#1234). Calling
-  `jolt_library_release_thread()` once after init deactivates that thread.
-  From then on every call in, from it too, goes through a `:collect-safe`
-  export, which activates its caller on the way in. `jolt_library_shutdown` now
-  reactivates the calling thread before it tears the runtime down, since
-  shutting down runs Scheme on that thread; for an embedder that never releases,
-  nothing changes. `host/chez/build-lib-smoke.sh` gains the case: init, release,
-  park the main thread in `pthread_join` while a worker makes 20000 allocating
-  calls, shut down. Without the release that driver stalls until its own
-  30-second alarm kills it.
-
 ## [0.8.16] - 2026-10-02
 
 jolt reports Clojure 1.12 and has what it added: `Class/new` and
