@@ -5,6 +5,81 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.17] - 2026-10-04
+
+A built binary now carries its dependencies' resources, as an uberjar does, so
+it runs away from the machine that built it. A `--library` object gains
+`jolt_library_release_thread`, and `-o libadd` gets its platform suffix.
+Large typed arrays no longer get copied at every full collection, protocol
+calls on plain values are memoized, and `clojure.edn` reads about 2.5x faster.
+
+### Added
+
+- **`jolt_library_release_thread`** (#1234). A `jolt build --library` object's
+  C ABI gains a fourth symbol, `void jolt_library_release_thread(void)`, which
+  deactivates the thread that called `jolt_library_init`. An embedder that
+  parks that thread (in `pthread_join`, say) while workers call in through
+  `:collect-safe` exports no longer stalls the collector waiting on it. Every
+  later call in, from that thread too, activates its caller on the way in, and
+  `jolt_library_shutdown` reactivates the calling thread before it tears the
+  runtime down, so it can be called from a released thread. An embedder that
+  never releases sees no change.
+
+### Changed
+
+- **`jolt build` embeds dependencies' files in the binary, like an uberjar**
+  (#1232). Before, only the project's `:jolt/build {:embed [...]}` dirs were
+  baked in, and the binary found a dependency's own resources through the
+  build machine's gitlibs and `~/.m2` paths. A library that reads one at load
+  (`selmer.validator` slurps its error template) worked where it was built and
+  died everywhere else with `Cannot open <nil> as a Reader.` Every dependency
+  root, directory or jar, is now packed under the name `io/resource` asks for,
+  with classpath precedence: the first root holding a name wins, the project's
+  own paths shadow every dependency, and a name jolt supplies itself stays
+  jolt's. `.class` and `.cljs` files are left out, as are the sources of
+  namespaces compiled into the image. The binary no longer puts dependency
+  roots on its source path at startup, so a resource it does not carry fails
+  on the build machine too instead of only after it ships.
+
+### Fixed
+
+- **`jolt build --library -o libadd` writes `libadd.so` / `libadd.dylib` /
+  `libadd.dll`** (#1235), as the README says. It wrote `libadd` with no
+  suffix and the install name `@rpath/libadd`. The target's suffix is
+  appended when the `-o` name has no extension; a name that has one
+  (`libadd.so.1`) is left as given.
+
+- **Embedded files are read as bytes.** A non-UTF-8 `:embed` resource, such as
+  an image, was decoded as UTF-8 when it was baked and came out corrupted. It
+  now round-trips byte for byte.
+
+- **A full collection no longer copies a large live array** (#1225, #1227).
+  Chez pins a huge allocation only when it takes fresh segments from the OS,
+  so an 8MB array that landed in the free space of an older chunk was copied
+  at every full collection: ~1ms each rather than ~100µs on Linux, on a layout
+  no program controls. A byte array of 64KB or more is now an immobile
+  bytevector, and a long, int, short, double or float array of 8192 elements
+  or more has its backing locked for the array's life and released when the
+  array dies, including after `System/gc`. Smaller arrays are unchanged, and
+  so is element access.
+
+### Performance
+
+- **A protocol call on a plain value is memoized.** On a value that is not a
+  record or a reify, each call walked the value's host tags through the
+  string-keyed registry, hashing three strings per tag. The answer is now kept
+  per method and tag list and dropped on any registration or class-graph
+  change. On a protocol extended to `Object`, a call on a vector goes from
+  ~4.3µs to ~0.23µs and on a map from ~2.8µs to ~0.24µs; core.logic's unifier,
+  which dispatches a protocol on every term it walks, gains the most.
+
+- **`clojure.edn/read-string` is about 2.5x faster on large documents.** The
+  rebuild after parsing returns scalars at once instead of asking each one for
+  its `:jolt/type` twice, rebuilds a map with `reduce-kv` into a transient
+  instead of a lazy seq of entry vectors, and skips `with-meta` for a
+  collection with no metadata. A 4.7MB document reads in 1.55s, down from
+  3.8s.
+
 ## [0.8.16] - 2026-10-02
 
 jolt reports Clojure 1.12 and has what it added: `Class/new` and
@@ -263,13 +338,6 @@ just past a trie boundary.
   `(shutdown-agents)` over a connection leaves it serving the next one.
 
 ### Fixed
-
-- **A full collection no longer copies a large live byte array** (#1225). A
-  byte array of 64KB or more is now one the collector marks in place. Chez
-  pins a huge allocation only when it takes fresh segments from the OS, so an
-  8MB array that landed in the free space of an older chunk was copied at
-  every full collection instead: ~1ms each rather than ~100µs on Linux, on a
-  layout no program controls. Smaller arrays are unchanged.
 
 - **A failed git clone can be retried on Windows.** `fetch-git!` clears its
   staging directory with `delete-tree!` before each attempt, but git writes its
