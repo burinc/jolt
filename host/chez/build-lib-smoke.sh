@@ -113,4 +113,23 @@ if [ "$got" != "5 8 1" ] || [ "$rc" != "0" ]; then
   echo "  FAIL: exports — want '5 8 1' rc 0, got '$got' rc $rc"; exit 1
 fi
 
-echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup)"
+# The #1234 handoff: release the init thread, park it in host code while a
+# thread the embedder started calls a :collect-safe export that allocates, then
+# shut down from the released thread. Before jolt_library_release_thread the
+# worker's first collection waited forever on the parked init thread. The driver
+# arms alarm(30), so a hang comes back as a SIGALRM death. POSIX threads only.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "build-lib smoke: release-thread handoff skipped (POSIX threads driver)" ;;
+  *)
+    echo "build-lib smoke: init, release the thread, call in from a worker, shut down"
+    if ! cc -O2 "$app/driver-release.c" -ldl -lpthread -o "$work/driver-release" 2>"$work/driver-release.err"; then
+      echo "  FAIL: release driver compile failed"; cat "$work/driver-release.err"; exit 1
+    fi
+    got="$("$work/driver-release" "$lib" 2>&1)"; rc=$?
+    if [ "$got" != "20255 20000" ] || [ "$rc" != "0" ]; then
+      echo "  FAIL: release-thread handoff, want '20255 20000' rc 0, got '$got' rc $rc"; exit 1
+    fi ;;
+esac
+
+echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup, and a released init thread)"

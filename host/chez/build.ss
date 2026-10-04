@@ -3478,7 +3478,8 @@
 ;; --- shared-library link (jolt build --library) -----------------------------
 ;; The cc path adapted to emit a shared object instead of an executable: the same
 ;; compile-file + make-boot-file + xxd boot embedding, but a library.c stub
-;; (jolt_library_init / jolt_lookup / jolt_library_shutdown instead of main) and
+;; (jolt_library_init / jolt_lookup / jolt_library_release_thread /
+;; jolt_library_shutdown instead of main) and
 ;; a -shared/-dynamiclib link. Only the cc path supports libraries today — the
 ;; self-contained append-to-prebuilt-stub path would need a library stub variant
 ;; baked into the distributed jolt (a follow-up).
@@ -3518,7 +3519,16 @@
     "  Sbuild_heap(0, jolt_register_zlib);\n"
     "  Sforeign_symbol(\"jolt_set_lookup_addr\", (void*)jolt_set_lookup_addr);\n"
     "  return Sscheme_start(argc, (const char**)argv); }\n"
-    "void jolt_library_shutdown(void) { Sscheme_deinit(); }\n"))
+    "/* The thread that called jolt_library_init stays an ACTIVE Chez thread when\n"
+    "   init returns. Parked in host code (a run loop, a frame loop, a join), it\n"
+    "   never reaches a safe point, so a collection started by any other thread\n"
+    "   waits on it for good (#1234). Releasing it deactivates that thread; from\n"
+    "   then on every call in, from it too, goes through a :collect-safe export,\n"
+    "   which activates its caller on the way in. Repeating it is a no-op. */\n"
+    "void jolt_library_release_thread(void) { Sdeactivate_thread(); }\n"
+    "/* Sscheme_deinit runs Scheme on the calling thread, so a released thread is\n"
+    "   reactivated first. Sactivate_thread is a no-op on an active thread. */\n"
+    "void jolt_library_shutdown(void) { Sactivate_thread(); Sscheme_deinit(); }\n"))
 
 ;; The library scheme-start tail BODY: publish the export table to the embedder,
 ;; then return 0 so Sscheme_start returns to jolt_library_init's caller. The guard
