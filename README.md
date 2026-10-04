@@ -626,7 +626,7 @@ The Jolt side publishes entry points with `jolt.ffi/export!`:
 ```
 
 ```bash
-jolt build --library -m libadd.core -o libadd   # => libadd.so / libadd.dylib
+jolt build --library -m libadd.core -o libadd   # => libadd.so / libadd.dylib / libadd.dll
 ```
 
 The C side `dlopen`s it, calls `jolt_library_init` once, then resolves each

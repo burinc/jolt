@@ -1567,6 +1567,18 @@
 (define (bld-suffix? s suf)
   (let ((n (string-length s)) (m (string-length suf)))
     (and (>= n m) (string=? (substring s (- n m) n) suf))))
+;; Does the last segment of path P carry an extension? A leading dot (a dotfile)
+;; is not one. Both separators count, so a Windows -o is read the same way.
+(define (bld-has-extension? p)
+  (let loop ((i (fx- (string-length p) 1)))
+    (cond ((fx<? i 1) #f)
+          ((memv (string-ref p i) '(#\/ #\\)) #f)
+          ((char=? (string-ref p i) #\.)
+           (not (memv (string-ref p (fx- i 1)) '(#\/ #\\))))
+          (else (loop (fx- i 1))))))
+;; The shared-library suffix for the OUTPUT's platform.
+(define (bld-library-suffix)
+  (cond ((bld-tgt-nt?) ".dll") ((bld-tgt-osx?) ".dylib") (else ".so")))
 ;; --- derive namespace roots from the require graph ---------------------------
 ;; Data-reader namespaces load during project setup, before build-binary arms its
 ;; ns-loaded hook, so the entry walk records nothing for them. Collect their ns
@@ -1858,11 +1870,15 @@
         (error 'jolt-build (string-append "cannot include " n " — no source file on the roots"))))
     includes)
   ;; Windows executables carry .exe; normalize here so the append-payload and
-  ;; cc paths agree and the shell can run the result. A library keeps its own
-  ;; suffix (.dll/.so/.dylib) — never rewrite it to .exe.
-  (let ((out-path (if (and (bld-tgt-nt?) (not library?) (not (bld-suffix? out-path ".exe")))
-                      (string-append out-path ".exe")
-                      out-path)))
+  ;; cc paths agree and the shell can run the result. A library keeps whatever
+  ;; suffix -o gave it (never rewritten to .exe), but a bare `-o libadd` gets the
+  ;; target's .so/.dylib/.dll appended (jolt#1235) — otherwise the file and its
+  ;; @rpath install name carry no suffix and -ladd style linking cannot find it.
+  (let ((out-path (cond ((and (bld-tgt-nt?) (not library?) (not (bld-suffix? out-path ".exe")))
+                         (string-append out-path ".exe"))
+                        ((and library? (not (bld-has-extension? out-path)))
+                         (string-append out-path (bld-library-suffix)))
+                        (else out-path))))
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
   ;; always takes build-shared, any cross build takes a spawned cc path, and
