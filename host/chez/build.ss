@@ -1405,19 +1405,133 @@
       acc
       (directory-list dir))))
 
-;; Emit register-embedded-resource! per file under each embed dir. Emitted BEFORE
-;; the app forms. File contents are read at BUILD time and emitted as bytevector
-;; literals (1B/char) — flat.ss top-level forms run at every startup with no source
-;; on disk, so read-file-string at runtime would fail.
-(define (bld-emit-embeds out embed-dirs)
+;; A file's bytes as a Scheme expression that rebuilds them. Text that is valid
+;; UTF-8 goes out as (string->utf8 "…"), the compact spelling; anything else (an
+;; image, a font, a keystore) as a #vu8 literal, because decoding it as UTF-8
+;; would replace every invalid sequence with U+FFFD and bake a corrupted copy.
+(define (bld-bytes-lit bv)
+  (let ((s (utf8->string bv)))
+    (if (bytevector=? (string->utf8 s) bv)
+        (ei-bytes-lit s)
+        (with-output-to-string (lambda () (write bv))))))
+
+(define (bld-emit-embedded-resource out name bv)
+  (put-string out (string-append
+                    "(register-embedded-resource! " (ei-str-lit name)
+                    " " (bld-bytes-lit bv) ")\n")))
+
+;; --- dependency roots, packed like an uberjar (#1232) ------------------------
+;; A dependency's files are reached through the roots the build resolved: its
+;; gitlibs checkout, its ~/.m2 jar, its :local/root. Those are absolute paths on
+;; the BUILD machine, so a library that reads its own resource
+;; (selmer.validator slurps "selmer-error-template.html" at load) worked there
+;; and nowhere else. The build bakes every dependency root into the binary
+;; instead, the way an uberjar packs the whole classpath, keyed by the
+;; root-relative name io/resource asks for.
+;;
+;; The classpath's precedence carries over: the first root that holds a name
+;; wins, the project's own paths shadow every dependency, and a name jolt itself
+;; supplies (an install root, or a source this jolt carries embedded) stays
+;; jolt's — an embedded key outranks every root at runtime, so baking a
+;; library's copy of, say, babashka/fs.clj would replace jolt's. Left out:
+;; compiled JVM classes and ClojureScript sources, which jolt never loads, and
+;; the source of every
+;; namespace the build compiled into the image, which the binary never reads
+;; again (its namespaces are pre-registered, so a require of one is a no-op).
+;; Any other source stays: a file a namespace (load)s runs in the binary, and a
+;; namespace reached only at runtime is loaded from its embedded copy.
+
+;; The dependency roots: every source root that is not one of the project's own
+;; paths (EXT-ROOTS, project-relative, resolved the way jolt.deps resolves them
+;; against JOLT_PWD), one of its :embed dirs, or one of jolt's install roots.
+(define (bld-project-roots ext-roots)
+  (let ((pdir (or (getenv "JOLT_PWD") ".")))
+    (map (lambda (r) (if (path-absolute? r) r (string-append pdir "/" r)))
+         (bld-strs ext-roots))))
+(define (bld-dep-roots ext-roots embed-dirs)
+  (let ((own (append (bld-project-roots ext-roots) (bld-strs embed-dirs) ldr-install-roots)))
+    (filter (lambda (r) (and (string? r) (not (member r own))))
+            (get-source-roots))))
+
+;; (name . thunk) per file under ROOT, the thunk reading its bytes: a directory
+;; is walked, a jar's entries are listed from its central directory.
+(define (bld-root-files root)
+  (cond
+    ((file-directory? root)
+     (map (lambda (rp) (cons (car rp) (lambda () (read-file-bytes-on-disk (cdr rp)))))
+          (reverse (bld-walk-files root "" '()))))
+    ((root-jar-index root)
+     => (lambda (d)
+          (fold-right
+            (lambda (n acc)
+              (if (bld-suffix? n "/")
+                  acc
+                  (cons (cons n (lambda () (zipdir-entry-bytes d (hashtable-ref (zipdir-table d) n #f))))
+                        acc)))
+            '()
+            (zipdir-names d))))
+    (else '())))
+
+(define (bld-root-has? root name) (and (cdr (resource-candidate root name)) #t))
+
+;; Is NAME the source file of one of the namespaces in BAKED — a table of their
+;; root-relative paths without extension (ns-name->rel)?
+(define (bld-baked-source? baked name)
+  (exists (lambda (ext)
+            (and (bld-suffix? name ext)
+                 (hashtable-ref baked (substring name 0 (- (string-length name) (string-length ext))) #f)))
+          ldr-source-exts))
+
+;; ((name . bytes) ...) to bake from the dependency roots, first root first.
+(define (bld-dep-resources ext-roots embed-dirs baked-ns)
+  (let ((seen (make-hashtable string-hash string=?))
+        (baked (make-hashtable string-hash string=?))
+        (project (bld-project-roots ext-roots)))
+    (for-each (lambda (n) (hashtable-set! baked (ns-name->rel n) #t)) baked-ns)
+    ;; a project :embed file is baked under its own name below; the dependency's
+    ;; copy would be overwritten by it, so it is not baked at all
+    (for-each (lambda (root)
+                (when (file-directory? root)
+                  (for-each (lambda (rp) (hashtable-set! seen (car rp) #t))
+                            (bld-walk-files root "" '()))))
+              (bld-strs embed-dirs))
+    (let loop ((roots (bld-dep-roots ext-roots embed-dirs)) (acc '()))
+      (if (null? roots)
+          (reverse acc)
+          (loop (cdr roots)
+                (fold-left
+                  (lambda (acc f)
+                    (let ((n (car f)))
+                      (cond
+                        ((hashtable-ref seen n #f) acc)
+                        (else
+                         (hashtable-set! seen n #t)
+                         (if (or (bld-suffix? n ".class")
+                                 (bld-suffix? n ".cljs")
+                                 (bld-baked-source? baked n)
+                                 (embedded-resource-has? n)
+                                 (exists (lambda (r) (bld-root-has? r n)) project)
+                                 (exists (lambda (r) (bld-root-has? r n)) ldr-install-roots))
+                             acc
+                             (cons (cons n ((cdr f))) acc))))))
+                  acc
+                  (bld-root-files (car roots))))))))
+
+;; Emit register-embedded-resource! per file under each embed dir, after the
+;; dependency roots' files (bld-dep-resources; BAKED-NS names the namespaces
+;; compiled into the image). Emitted BEFORE the app forms.
+;; File contents are read at BUILD time and emitted as bytevector literals —
+;; flat.ss top-level forms run at every startup with no source on disk, so
+;; reading the file at runtime would fail.
+(define (bld-emit-embeds out embed-dirs ext-roots baked-ns)
+  (for-each (lambda (nb) (bld-emit-embedded-resource out (car nb) (cdr nb)))
+            (bld-dep-resources ext-roots embed-dirs baked-ns))
   (for-each
     (lambda (root)
       (when (file-directory? root)
         (for-each
           (lambda (rp)
-            (put-string out (string-append
-                              "(register-embedded-resource! " (ei-str-lit (car rp))
-                              " " (ei-bytes-lit (read-file-string (cdr rp))) ")\n")))
+            (bld-emit-embedded-resource out (car rp) (read-file-bytes-on-disk (cdr rp))))
           (bld-walk-files root "" '()))))
     (bld-strs embed-dirs)))
 
@@ -2105,15 +2219,20 @@
           (bld-emit-natives out natives 'required)
           (bld-emit-startup-profile-mark! out "required native libraries")
            (put-string out "\n;; === embedded resources ===\n")
-           (bld-emit-embeds out embed-dirs)
+           (bld-emit-embeds out embed-dirs ext-roots (map car ordered))
             (bld-emit-data-readers out)
            ;; set-source-roots!* (not the scanning set-source-roots!): data readers
            ;; are baked just above, and re-scanning would eagerly reload reader
            ;; namespaces via jolt-compile-eval-form — dropped by a tree-shaken binary.
+           ;; Not the dependency roots: they are absolute paths into this
+           ;; machine's checkouts, which let a resource the binary did not carry
+           ;; resolve here and fail on every other machine (#1232). Their files
+           ;; are embedded above.
            (put-string out (string-append
                              "(set-source-roots!* (list "
-                             (fold-left (lambda (s r) (string-append s (ei-str-lit r) " ")) ""
-                                        (get-source-roots))
+                             (let ((deps (bld-dep-roots ext-roots embed-dirs)))
+                               (fold-left (lambda (s r) (if (member r deps) s (string-append s (ei-str-lit r) " "))) ""
+                                          (get-source-roots)))
                              "))\n"))
           (bld-emit-startup-profile-mark! out "embedded resources and source roots")
           ;; Pre-register every app namespace in ns-registry BEFORE any app form
