@@ -633,9 +633,12 @@ The C side `dlopen`s it, calls `jolt_library_init` once, then resolves each
 entry by name with `jolt_lookup` and casts to its type;
 [Native Interop](https://jolt-lang.github.io/docs/native-interop.html) has the
 full example, the type keywords (the same ones `foreign-fn` uses), and the
-threading limits. The same `--opt`/`--dev`/`--direct-link`/`--closed-world` flags
-apply, and the same Chez kernel development files + C compiler are required to
-link.
+threading limits. An embedder whose init thread then goes off to host code (a
+run loop, a frame loop) calls `jolt_library_release_thread` once after init, so
+that thread no longer holds other threads' collections, and calls in only
+through `:collect-safe` exports from then on. The same
+`--opt`/`--dev`/`--direct-link`/`--closed-world` flags apply, and the same Chez
+kernel development files + C compiler are required to link.
 
 ## Documentation
 

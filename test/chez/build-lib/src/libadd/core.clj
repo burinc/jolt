@@ -30,3 +30,13 @@
       1
       0)))
 (ffi/export! "gzip_ok" gzip-ok [] :int)
+
+;; alloc_work is the export the release-thread driver calls from a thread the
+;; embedder started (#1234). It is :collect-safe because it arrives on a foreign
+;; thread, and it allocates on every call so that a loop of them needs a
+;; collection: the point at which a parked, still-active init thread used to
+;; hold every other thread off for good.
+(defn alloc-work [n]
+  (let [v (mapv inc (range 256))]
+    (+ n (count v))))
+(ffi/export! "alloc_work" alloc-work [:int] :int :collect-safe)
