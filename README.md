@@ -458,6 +458,18 @@ Port `0` lets the OS pick a free port, and `.nrepl-port` names the one it bound.
 From code, `(jolt.nrepl/start 0)` returns the stop fn with that port as its
 `:port` metadata.
 
+A program that starts its own server from somewhere other than the project an
+editor opens (a host application loading a `--library` build, say) can say where
+the port file goes with `:port-file`, or pass `nil` to write none; the stop fn
+deletes the file `start` wrote:
+
+```clojure
+(require '[jolt.nrepl :as nrepl])
+(def stop (nrepl/start 0 nil {:port-file "/path/to/project/.nrepl-port"}))
+(:port (meta stop))   ;=> e.g. 53018
+(stop)                ; closes the server and deletes the port file it wrote
+```
+
 The server runs in dev mode — calls deref their var, so redefining a function
 takes effect on the next call without restarting the process. The built-in
 handler speaks `clone`/`describe`/`eval`/`load-file`/`close`; everything past
