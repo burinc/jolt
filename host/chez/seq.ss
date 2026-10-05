@@ -139,7 +139,13 @@
 (define (cseq-realized/k head tail kind) (make-cseq head tail kind jolt-nil))
 (define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk sk-cons jolt-nil))
 (define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk kind jolt-nil))
-(define (cseq-list head tail) (make-cseq head tail sk-list jolt-nil))   ; a PersistentList node
+;; A PersistentList node. Onto nil, or onto a cell that knows its count, it is a
+;; counted cseqn (PersistentList._count); onto anything else (a lazy tail, a
+;; Cons) it stays a plain cell, whose count walks until it reaches a counted one.
+(define (cseq-list head tail)
+  (cond ((jolt-nil? tail) (make-cseqn head tail sk-list jolt-nil 1))
+        ((cseqn? tail) (make-cseqn head tail sk-list jolt-nil (fx+ (cseqn-cnt tail) 1)))
+        (else (make-cseq head tail sk-list jolt-nil))))
 
 ;; --- a lazy cell's thunk, as DATA ---------------------------------------------
 ;; A thunk built in Scheme carries its captured values where nothing can read
@@ -548,13 +554,17 @@
 ;; ============================================================================
 ;; jolt-seq — coerce a seqable to a non-empty seq, or jolt-nil when empty
 ;; ============================================================================
+;; Built whole, so every cell knows how many follow it: a counted cseqn chain,
+;; at no cost in size (values.ss).
 (define (list->cseq xs)               ; Scheme list -> realized cseq chain (jolt-nil if empty)
-  (if (null? xs) jolt-nil (cseq-realized (car xs) (list->cseq (cdr xs)))))
+  (list->cseq/k xs sk-cons))
 ;; …with every cell of the chain carrying one flavor. A collection's seq view is
 ;; the same class all the way down on the JVM ((next (keys m)) is another KeySeq),
 ;; so the kind goes on the whole chain and not just its head.
 (define (list->cseq/k xs kind)
-  (if (null? xs) jolt-nil (cseq-realized/k (car xs) (list->cseq/k (cdr xs) kind) kind)))
+  (if (null? xs) jolt-nil
+      (let ((t (list->cseq/k (cdr xs) kind)))
+        (make-cseqn (car xs) t kind jolt-nil (if (jolt-nil? t) 1 (fx+ (cseqn-cnt t) 1))))))
 
 ;; ---- variadic rest: passing a LAZY tail through a Chez rest parameter --------
 ;; A Chez rest parameter must be a proper list, so `apply` would have to realize
@@ -788,7 +798,7 @@
 ;; The remainder is the test itself and is the price of the distinction.
 (define (jolt-cons x coll)
   (if (jolt-nil? coll)
-      (make-cseq x jolt-nil sk-list jolt-nil)
+      (make-cseqn x jolt-nil sk-list jolt-nil 1)
       (make-cseq x (jolt-seq coll) sk-cons jolt-nil)))
 ;; Scheme list -> a jolt PersistentList. For (list …) and quoted list literals
 ;; (the emitter lowers '(a b) to (jolt-list a b)).
@@ -802,7 +812,9 @@
     (if (jolt-nil? s)
         acc
         (loop (jolt-seq (seq-more s))
-              (cseq-realized/k (seq-first s) (if (empty-list-t? acc) jolt-nil acc) sk-list)))))
+              (if (empty-list-t? acc)
+                  (make-cseqn (seq-first s) jolt-nil sk-list jolt-nil 1)
+                  (make-cseqn (seq-first s) acc sk-list jolt-nil (fx+ (cseqn-cnt acc) 1)))))))
 (define (jolt-last coll) (let loop ((s (jolt-seq coll)) (last jolt-nil))
                            (if (jolt-nil? s) last (loop (jolt-seq (seq-more s)) (seq-first s)))))
 ;; nth over a seq (walks; forces lazily). default? selects the 3-arg behavior.

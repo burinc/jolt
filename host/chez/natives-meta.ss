@@ -132,9 +132,11 @@
     ((cseq? x)
      (let* ((t (cseq-tail x))
             (t2 (if (force-pending? t) (make-lazy-src lz-rest x #f) t)))
-       (if (cseqv? x)
-           (make-cseqv (cseq-head x) (if t t2 t) (cseq-kind x) m (cseq-cvec x) (cseq-ci x) (cseq-crest x))
-           (make-cseq (cseq-head x) t2 (cseq-kind x) m))))
+       (cond ((cseqv? x)
+              (make-cseqv (cseq-head x) (if t t2 t) (cseq-kind x) m (cseq-cvec x) (cseq-ci x) (cseq-crest x)))
+             ;; a counted cell's copy heads the same elements, so keeps the count
+             ((cseqn? x) (make-cseqn (cseq-head x) t2 (cseq-kind x) m (cseqn-cnt x)))
+             (else (make-cseq (cseq-head x) t2 (cseq-kind x) m)))))
     ((empty-list-t? x) (make-empty-list-t m))
     ;; LazySeq.withMeta is new LazySeq(meta, seq()): the copy is REALIZED and
     ;; shares the forced seq, so the body runs once for both, and forcing X here

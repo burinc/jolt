@@ -1661,9 +1661,18 @@
         ;; standalone chunk followed by an arbitrary, possibly lazy rest, so its
         ;; length is not known without forcing — ChunkedCons is deliberately not
         ;; Counted on the JVM either.
+        ;;
+        ;; A counted cell (cseqn: a list node, a string/array/reverse-vector seq)
+        ;; answers the same way -- PersistentList._count, StringSeq's and RSeq's
+        ;; index arithmetic. A ChunkedCons is passed a whole chunk at a time, its
+        ;; rest taken as the chunk's crest; for a range's chunk whose rest is not
+        ;; built yet that rest is counted from its bounds (range-rest-count), so
+        ;; (count (range n)) is O(1) as LongRange's is.
         ((cseq? coll)
          (let loop ((s coll) (n 0))
            (cond ((jolt-nil? s) n)
+                 ;; a counted cell (cseqn: a list node, PersistentList._count)
+                 ((cseqn? s) (fx+ n (cseqn-cnt s)))
                  ((and (cseq-cvec s) (not (cseq-crest s)))
                   (fx+ n (fx- (pvec-count (cseq-cvec s)) (cseq-ci s))))
                  (else (loop (jolt-seq (seq-more s)) (fx+ n 1))))))
