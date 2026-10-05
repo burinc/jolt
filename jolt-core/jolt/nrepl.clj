@@ -15,7 +15,8 @@
   plus :reply — a thread-safe (fn [response-map]) that adds id/session and sends.
   Public seam for middleware: respond, evaluate, register-ops!, new-session.
 
-  Writes .nrepl-port in the project dir so editors auto-detect the port."
+  Writes .nrepl-port in the working directory (or wherever start's :port-file
+  says) so editors auto-detect the port."
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
@@ -356,24 +357,31 @@
             (recur rest-buf)))))))
 
 (defn start
-  "Start the nREPL server on `port` (loopback only; 0 lets the OS pick a free
-  port). `middleware` is a vector of deps.edn :nrepl/middleware symbols to
-  compose over the built-in handler.
+  "Start the nREPL server on `port` (loopback only; 0 asks the OS for any free
+  port). `middleware` is a vector of deps.edn :nrepl/middleware symbols to compose
+  over the built-in handler. `opts`:
+
+    :port-file  where to write the bound port, so an editor can find the server.
+                Defaults to .nrepl-port in the working directory; nil writes no
+                file. A program that starts its own server from somewhere other
+                than the project (a host application loading a --library build,
+                say) points this at the project's .nrepl-port.
 
   Binds the socket synchronously, so a startup failure (e.g. the port is already
   in use) is thrown to the caller rather than swallowed by the accept thread, then
-  accepts connections on a background thread and returns immediately. Writes
-  .nrepl-port. Does NOT block — the caller keeps the process alive (jolt.main
-  parks the main thread in jolt.host/park-until-interrupt, which also runs the
-  main-thread pump, so main-thread-affine work an eval starts, such as a UI
-  toolkit's event loop, marshals onto the main thread via call-on-main-thread).
+  accepts connections on a background thread and returns immediately. Does NOT
+  block — the caller keeps the process alive (jolt.main parks the main thread in
+  jolt.host/park-until-interrupt, which also runs the main-thread pump, so
+  main-thread-affine work an eval starts, such as a UI toolkit's event loop,
+  marshals onto the main thread via call-on-main-thread).
 
   Returns a zero-arg stop fn: it stops the accept loop, closes the listen socket
-  (freeing the port), and removes .nrepl-port. Calling it more than once is a
-  no-op. The stop fn's metadata carries :port, the port actually bound, which
-  is also the one the banner and .nrepl-port report."
-  ([port] (start port nil))
-  ([port middleware]
+  (freeing the port), and removes the port file it wrote. Calling it more than
+  once is a no-op. Its metadata carries :port, the port actually bound (the OS's
+  pick when `port` is 0), and :port-file, the file written or nil."
+  ([port] (start port nil {}))
+  ([port middleware] (start port middleware {}))
+  ([port middleware opts]
    ;; An nREPL session is REPL-driven development: trace by default so an uncaught
    ;; error in code evaluated over the connection shows a tail-frame backtrace, with
    ;; no JOLT_TRACE needed. Covers both `nrepl-server` and an app that starts its
@@ -383,10 +391,18 @@
          fd (listen-socket port)                  ; throws on bind/listen failure
          ;; port 0 asks the kernel for any free port; getsockname says which
          port (let [bound (native/local-port fd)] (if (pos? bound) bound port))
+         requested (if (contains? opts :port-file) (:port-file opts) ".nrepl-port")
+         ;; absolute, so the delete hits the file spit wrote: spit resolves a
+         ;; relative path against the started-from directory, delete-file!
+         ;; against the process's (bin/jolt cd's to the repo root). nil when the
+         ;; write fails, so stop never deletes a file it did not write.
+         port-file (when requested
+                     (let [port-file (.getAbsolutePath (io/file requested))]
+                       (try (spit port-file (str port)) port-file (catch :default _ nil))))
          stopped (atom false)]
-     (try (spit ".nrepl-port" (str port)) (catch :default _ nil))
      (println (str "jolt " (jolt.host/jolt-version) " nREPL server started on port "
-                   port " (127.0.0.1) — .nrepl-port written"))
+                   port " (127.0.0.1)"
+                   (when port-file (str " — " requested " written"))))
      (when (seq middleware) (println (str ";; middleware: " (str/join " " middleware))))
      (println ";; connect your editor; ^C to stop")
       ;; Plain threads, not futures: the server is not on the agent pool, so an
@@ -443,6 +459,6 @@
                 ;; delete-file!, not the raw Chez delete-file this used to call:
                 ;; that one RAISES when the file is already gone, so a stop after
                 ;; someone cleaned the port file up threw out of the shutdown path.
-                (finally (jolt.host/delete-file! ".nrepl-port"))))
+                (finally (when port-file (jolt.host/delete-file! port-file)))))
          nil)
-       {:port port})))))
+       {:port port :port-file port-file})))))
