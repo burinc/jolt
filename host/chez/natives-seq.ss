@@ -316,7 +316,8 @@
 (define (vec->rseq v i)
   (if (fx<? i 0)
       jolt-nil
-      (cseq-lazy/k (pvec-nth-d v i jolt-nil) (make-lazy-src lz-vec-rseq v i) sk-rseq)))
+      ;; counted (cseqn): an RSeq's count() is i+1
+      (make-cseqn (pvec-nth-d v i jolt-nil) (make-lazy-src lz-vec-rseq v i) sk-rseq jolt-nil (fx+ i 1))))
 (define (jolt-rseq coll)
   (cond
     ((pvec? coll)

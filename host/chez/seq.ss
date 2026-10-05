@@ -633,9 +633,11 @@
   (if (fx>=? i (pvec-count v)) jolt-nil
       (cseq-vec (pvec-nth-d v i jolt-nil) v i kind)))
 ;; A string's characters. clojure.lang.StringSeq, and the tail is one too.
+;; Counted, as StringSeq is: the cell knows the characters left from its index.
 (define (str->seq s i)
-  (if (fx>=? i (string-length s)) jolt-nil
-      (cseq-lazy/k (string-ref s i) (make-lazy-src lz-str-seq s i) sk-string-seq)))
+  (let ((n (string-length s)))
+    (if (fx>=? i n) jolt-nil
+        (make-cseqn (string-ref s i) (make-lazy-src lz-str-seq s i) sk-string-seq jolt-nil (fx- n i)))))
 ;; ---- seq arms: host types register here instead of set!-wrapping jolt-seq ----
 ;; Arms dispatch newest-registration-first (cons front, walk head-first), matching
 ;; the precedence the set! chains produced. The built-in types stay inline in
@@ -1918,6 +1920,22 @@
                            (jolt-make-lazy-src lz-range v (list end step kind))
                            kind))))
     (else jolt-empty-list)))
+;; How many elements a range's not-yet-built continuation (a chunk's crest, the
+;; lz-range node above) will produce, from its start/end/step alone -- LongRange's
+;; count(). #f once the node has been forced (its answer is then the next chunk,
+;; which the caller walks to: one step per 32 elements), or when the bounds are
+;; not all exact: a flonum range accumulates by repeated addition, and its length
+;; is what that addition does, not what the division says (clojure.lang.Range is
+;; not Counted either).
+(define (range-rest-count cr)
+  (and (jolt-lazyseq? cr)
+       (let ((t (jolt-lazyseq-thunk cr)))
+         (and (lazy-src? t) (eq? (lazy-src-fn t) lz-range)
+              (let ((v (lazy-src-a t)) (end (car (lazy-src-b t))) (step (cadr (lazy-src-b t))))
+                (and (exact? v) (exact? end) (exact? step)
+                     (cond ((> step 0) (if (< v end) (ceiling (/ (- end v) step)) 0))
+                           ((< step 0) (if (> v end) (ceiling (/ (- v end) (- step))) 0))
+                           (else #f))))))))
 ;; Which range class the args select. clojure.core/range sends every argument
 ;; through `int?` and takes clojure.lang.LongRange only when they ALL pass,
 ;; clojure.lang.Range otherwise — so a double bound or step, or a ratio, gets Range
