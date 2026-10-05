@@ -28,7 +28,8 @@
 ;; wall time whatever its speed, and the batch self-calibrates past the ~1us
 ;; timer granularity, so neither end needs a hand-tuned constant.
 
-(ns complexity-test)
+(ns complexity-test
+  (:require [clojure.set]))
 
 (def ^:private n1 50000)
 (def ^:private n2 200000)
@@ -297,7 +298,36 @@
       (judge "first popped queue"
              #(first (next p1))
              #(first (next p2))
-             "seq on a PersistentQueue is building every element before returning the first (queue->seq, java/natives-queue.ss)"))
+             "seq on a PersistentQueue is building every element before returning the first (queue->seq, java/natives-queue.ss)")
+      ;; q1 is the boundary shape: one front element, the rest in the rear, so
+      ;; popping it moves the rear to the front. The JVM's rear is a vector that
+      ;; becomes the front in O(1); a reversed-list rear had to be reversed, and
+      ;; a persistent q1 paid that again on every pop. Its hash is cached
+      ;; (PersistentQueue._hasheq), so a repeat hash must not re-walk it.
+      (when-not (and (= (range 1 n1) (seq (pop q1))) (= (hash q1) (hash (vec (range n1)))))
+        (println "FAIL complexity queue-pop: wrong values before timing")
+        (System/exit 1))
+      (judge "pop queue at boundary"
+             #(pop q1)
+             #(pop q2)
+             "pop at the front/rear boundary is copying the rear instead of making it the front (queue-pop, java/natives-queue.ss)")
+      (judge "hash queue"
+             #(hash q1)
+             #(hash q2)
+             "a queue's hash is recomputed on every call instead of cached (seq-hasheq-cached wrapper, java/natives-queue.ss)"))
+
+    ;; clojure.set/difference walks the SMALLER side: taking a big set out of a
+    ;; small one costs the small one, as the reference's two-way branch does. A
+    ;; plain (reduce disj s1 s2) walked all of s2.
+    (let [b1 (set (range n1)) b2 (set (range n2))]
+      (when-not (and (= #{-1} (clojure.set/difference #{1 2 -1} b1))
+                     (= #{1 3} (clojure.set/difference #{1 2 3} #{2 9 10 11})))
+        (println "FAIL complexity set-difference: wrong values before timing")
+        (System/exit 1))
+      (judge "difference small big"
+             #(clojure.set/difference #{1 2 -1} b1)
+             #(clojure.set/difference #{1 2 -1} b2)
+             "difference is disj-ing every element of the bigger second set instead of filtering the smaller first one (stdlib/clojure/set.clj)"))
 
     (if (pos? @failures)
       (do (println (str "complexity: " @failures " section(s) failed"))
