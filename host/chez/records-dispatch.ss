@@ -966,9 +966,8 @@
             (else (cons (car as) (ins (cdr as))))))))
 ;; Named priorities for register-method-arm!, in ascending dispatch order
 ;; (lowest is tried first — see record-method-dispatch). Each name mirrors its
-;; arm's role; two disjoint-type arms may share a tier (regex-t and nio-path
-;; both sit just above jfile at 42). Values are unchanged from the prior magic
-;; numbers — this is a readability rename only.
+;; arm's role; two disjoint-type arms may share a tier (nio-path sits just
+;; above jfile at 42).
 ;; Library overrides sit above every built-in arm: the whole point of the tier is
 ;; that jolt's own method for the class does not get a say. Registered lazily by
 ;; java/class-extensions.ss, so a process that never calls jolt.host/extend-class!
@@ -981,10 +980,16 @@
 ;; after this file (the Gambit host has no monitors and no such arm).
 (define arm-priority-monitor 5)       ; Object.wait/.notify/.notifyAll — universal too
 (define arm-priority-string 6)       ; string receivers — the base's string? case hoisted
+;; Pattern and Matcher, hoisted the way strings were: a tokenizer calls
+;; .region/.lookingAt/.group per token, and at 42 each call first walked the
+;; stream, dotform, date and file arms, every one of which passes on a regex-t or
+;; matcher-t (the dotform arm's field read too: it answers only records and maps,
+;; so a dashed name on a Matcher reached the regex arm either way). ~220 ns of
+;; dispatch per Matcher call, against ~9 for a StringBuilder method.
+(define arm-priority-regex 7)        ; regex-t (Pattern) / matcher-t (Matcher) surface
 (define arm-priority-dotform 30)      ; -field accessor + dot-form method dispatch
 (define arm-priority-date 40)         ; java.util.Date (jinst) method surface
 (define arm-priority-file 41)         ; java.io.File (jfile) methods
-(define arm-priority-regex 42)        ; regex-t (Pattern) .split/.matcher surface
 (define arm-priority-nio-path 42)     ; java.nio.file.Path methods (above jfile)
 (define arm-priority-htable 43)       ; tagged htable method registry
 (define arm-priority-host-type 44)    ; jhost/number/string per-type dispatch
