@@ -356,9 +356,9 @@
             (recur rest-buf)))))))
 
 (defn start
-  "Start the nREPL server on `port` (a concrete port; loopback only). `middleware`
-  is a vector of deps.edn :nrepl/middleware symbols to compose over the built-in
-  handler.
+  "Start the nREPL server on `port` (loopback only; 0 lets the OS pick a free
+  port). `middleware` is a vector of deps.edn :nrepl/middleware symbols to
+  compose over the built-in handler.
 
   Binds the socket synchronously, so a startup failure (e.g. the port is already
   in use) is thrown to the caller rather than swallowed by the accept thread, then
@@ -370,7 +370,8 @@
 
   Returns a zero-arg stop fn: it stops the accept loop, closes the listen socket
   (freeing the port), and removes .nrepl-port. Calling it more than once is a
-  no-op."
+  no-op. The stop fn's metadata carries :port, the port actually bound, which
+  is also the one the banner and .nrepl-port report."
   ([port] (start port nil))
   ([port middleware]
    ;; An nREPL session is REPL-driven development: trace by default so an uncaught
@@ -380,6 +381,8 @@
    (jolt.host/enable-trace!)
    (let [handler (build-handler (resolve-middleware (or middleware [])))
          fd (listen-socket port)                  ; throws on bind/listen failure
+         ;; port 0 asks the kernel for any free port; getsockname says which
+         port (let [bound (native/local-port fd)] (if (pos? bound) bound port))
          stopped (atom false)]
      (try (spit ".nrepl-port" (str port)) (catch :default _ nil))
      (println (str "jolt " (jolt.host/jolt-version) " nREPL server started on port "
@@ -431,13 +434,15 @@
                        (recur))))
                (finally (native/c-close fd)))))]
         (.start acceptor)
-      (fn stop []
-        (when (compare-and-set! stopped false true)
-          ;; the loop closes the fd as it leaves, within a slice; the join is
-          ;; what makes the port free when stop returns
-          (try (.join acceptor (* 20 accept-poll-ms))
-               ;; delete-file!, not the raw Chez delete-file this used to call:
-               ;; that one RAISES when the file is already gone, so a stop after
-               ;; someone cleaned the port file up threw out of the shutdown path.
-               (finally (jolt.host/delete-file! ".nrepl-port"))))
-        nil)))))
+      (with-meta
+       (fn stop []
+         (when (compare-and-set! stopped false true)
+           ;; the loop closes the fd as it leaves, within a slice; the join is
+           ;; what makes the port free when stop returns
+           (try (.join acceptor (* 20 accept-poll-ms))
+                ;; delete-file!, not the raw Chez delete-file this used to call:
+                ;; that one RAISES when the file is already gone, so a stop after
+                ;; someone cleaned the port file up threw out of the shutdown path.
+                (finally (jolt.host/delete-file! ".nrepl-port"))))
+         nil)
+       {:port port})))))

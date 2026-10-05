@@ -1984,6 +1984,9 @@ check '(do (require (quote jolt.nrepl) (quote [jolt.socket.native :as n])) (let 
 # Linux leaves the thread in accept() on a freed number; now it waits for the
 # accept loop to leave, and the restart is what proves the port came back.
 check '(do (require (quote jolt.nrepl)) (let [port (let [ss (java.net.ServerSocket. 0)] (try (.getLocalPort ss) (finally (.close ss)))) round (fn [] (let [stop (with-out-str (def st (jolt.nrepl/start port))) s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) msg "d4:code7:(+ 1 2)2:op4:evale" buf (byte-array 4096)] (.write out (.getBytes msg "ISO-8859-1")) (Thread/sleep 300) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) (boolean (re-find #"5:value1:3" r)))))] [(round) (round)]))' '[true true]'
+# Port 0: the kernel picks the port, and the banner, .nrepl-port and the stop
+# fn's :port metadata all name the one it bound. They used to report 0.
+check '(do (require (quote jolt.nrepl)) (let [banner (with-out-str (def st (jolt.nrepl/start 0))) port (:port (meta st)) file (slurp ".nrepl-port") s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) buf (byte-array 4096)] (.write out (.getBytes "d4:code7:(+ 1 2)2:op4:evale" "ISO-8859-1")) (Thread/sleep 300) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) [(pos? port) (= file (str port)) (boolean (re-find (re-pattern (str "on port " port " ")) banner)) (boolean (re-find #"5:value1:3" r))])))' '[true true true true]'
 
 # jolt.ffi/load-library's per-OS map form — documented since the FFI docs
 # existed, implemented only in 0.7.10 (it rendered the map to a string and
