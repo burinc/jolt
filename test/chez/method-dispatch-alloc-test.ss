@@ -45,5 +45,20 @@
     (and (record-method-dispatch m "region" (jolt-vector 3 100))
          (= 3 (record-method-dispatch m "regionStart" jolt-nil))))
 
+;; The regex arm sits right after strings, so a Matcher call no longer walks the
+;; arms that only ever pass on one (stream, dotform, date, file). Nanoseconds are
+;; not a gate, so pin the order, and that what used to reach the arm late —
+;; a dashed name, an unknown method — still fails the same way early.
+(ok "the regex arm is tried before every arm that passes on a Matcher"
+    (< arm-priority-string arm-priority-regex
+       (min arm-priority-stream arm-priority-dotform arm-priority-date arm-priority-file)))
+(define (failure thunk)
+  (guard (e (#t (record-method-dispatch e "getMessage" jolt-nil))) (thunk) #f))
+(ok "a dashed field read on a Matcher is still No matching field"
+    (equal? (failure (lambda () (record-method-dispatch m "-foo" jolt-nil)))
+            "No matching field found: foo for class java.util.regex.Matcher"))
+(ok "an unknown Matcher method still misses"
+    (string? (failure (lambda () (record-method-dispatch m "nope" jolt-nil)))))
+
 (printf "method-dispatch-alloc: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

@@ -3250,13 +3250,13 @@
 
 (define arm-priority-string 6)
 
+(define arm-priority-regex 7)
+
 (define arm-priority-dotform 30)
 
 (define arm-priority-date 40)
 
 (define arm-priority-file 41)
-
-(define arm-priority-regex 42)
 
 (define arm-priority-nio-path 42)
 
