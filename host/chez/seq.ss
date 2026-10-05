@@ -1755,6 +1755,14 @@
     (else (reduce-seq f acc (jolt-seq from)))))
 (define (jolt-into to from)
   (cond
+    ;; a plain vector taking a source that is all tail (<= 32 elements): copy
+    ;; the chunk onto to's tail, as the transient fold would. catvec's
+    ;; rebalance costs ~5x this for (into v [x]), the shape of an accumulator.
+    ;; pvec-append-flat is transients.ss's, bound by call time.
+    ((and (pvec? to) (pvec? from) (not (pvec-ent to))
+          (fx>? (pvec-cnt from) 0)
+          (fx=? (pvec-cnt from) (vector-length (pvec-tail from))))
+     (meta-carry to (pvec-append-flat to (pvec-tail from) (pvec-cnt from))))
     ;; two non-empty vectors: O(log n) RRB concatenation instead of a linear
     ;; element fold. Empty operands fall through — pvec-catvec answers those
     ;; with an INPUT identity, which would surface `from` (and any metadata
