@@ -122,6 +122,8 @@
                    (= (count (tree-seq coll? seq c4)) 4001)
                    (= (take 3 (tree-seq coll? seq c1)) [c1 499 (second c1)])
                    (= (first (sorted-map)) nil) (= (first (sorted-set)) nil)
+                   (= (take 3 sm2) [[0 0] [1 1] [2 2]]) (= (first (rseq ss2)) (dec n2))
+                   (= (first (keys sm1)) 0) (= (hash sm1) (hash (into {} sm1))) (not= ss1 ss2)
                    (= (clojure.string/index-of src1 "bar)" 4) 5)
                    (= (clojure.string/index-of src1 "(foo" 1) 9)
                    (= (clojure.string/index-of src1 "zzz" 4) nil)
@@ -189,6 +191,33 @@
            #(first ss1)
            #(first ss2)
            "first on a sorted set is materializing the tree instead of walking to its leftmost node (25-sorted.clj :first)")
+
+    ;; the seq views themselves: a stack walk, O(log n) to the head (jolt-iz4)
+    (judge "take 3 sorted-map"
+           #(doall (take 3 sm1))
+           #(doall (take 3 sm2))
+           "seq on a sorted map is materializing the tree instead of walking it lazily (host-table.ss sc-tree-seq)")
+
+    (judge "first rseq sorted-set"
+           #(first (rseq ss1))
+           #(first (rseq ss2))
+           "rseq on a sorted set is materializing the tree instead of walking it lazily (host-table.ss sc-tree-seq)")
+
+    (judge "first keys sorted-map"
+           #(first (keys sm1))
+           #(first (keys sm2))
+           "keys of a sorted map is materializing the tree instead of walking it lazily (host-table.ss sc-tree-seq)")
+
+    ;; hash is cached on the value, and = of different sizes is a count compare
+    (judge "hash sorted-map"
+           #(hash sm1)
+           #(hash sm2)
+           "hash of a sorted map is not cached (host-table.ss sorted-hash)")
+
+    (judge "= sorted-sets of different sizes"
+           #(= ss1 ss2)
+           #(= ss2 ss1)
+           "= of two sorted sets is not comparing counts first (host-table.ss sorted-fast=)")
 
     ;; A parser reads its input through a WINDOW: it cuts a fixed span out of the
     ;; source at the position it has reached, over and over, and the source is the

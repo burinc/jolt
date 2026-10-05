@@ -237,6 +237,15 @@
 (rtu "infinite iterate walked"
      "(let [s (iterate inc 0)] (first s) (rest s))"
      "(vec (take 3 $rt))"                                    "[1 2 3]")
+;; a sorted coll's seq is a lazy tree walk: past its first 32-node chunk, the
+;; frontier is the walk's stack of tree nodes, which travels as data
+(rtu "sorted walk past a chunk"
+     "(let [s (seq (into (sorted-map) (map (fn [i] [i i]) (range 100))))] (nth s 40) (nthnext s 30))"
+     "[(vec (take 3 $rt)) (count $rt) (class $rt)]"
+     "[[[30 30] [31 31] [32 32]] 70 clojure.lang.PersistentTreeMap$Seq]")
+(rtu "sorted rseq unrealized"
+     "(rseq (into (sorted-set) (range 100)))"
+     "[(vec (take 3 (drop 31 $rt))) (count $rt)]"                "[[68 67 66] 100]")
 ;; cycle and repeat are clojure.core OVERLAY fns -- their thunk is a fn literal in
 ;; clojure.core. Those used to be unregisterable, so anything built from one
 ;; refused; core's literals register now and they travel like any other.

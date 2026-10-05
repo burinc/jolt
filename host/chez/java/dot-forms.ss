@@ -91,18 +91,13 @@
     ((string=? method "entryKey") (jolt-first (car rest)))   ; map entry -> its key
     ((string=? method "seq")                                 ; (.seq sc) or (.seq sc ascending?)
      (if (or (null? rest) (jolt-truthy? (car rest))) (jolt-seq obj) (jolt-rseq obj)))
-    ;; (.seqFrom sc k ascending?) — the entries from k onward, in order. Done with a
-    ;; comparator filter over the seq (jolt has no tree cursor), like subseq.
+    ;; (.seqFrom sc k ascending?) — the entries (a set's elements) from k onward, in
+    ;; order: the tree walk seeked to k in O(log n), as PersistentTreeMap.seqFrom.
     ((string=? method "seqFrom")
-     (let* ((k (car rest)) (asc (jolt-truthy? (cadr rest)))
-            (cmp (jolt-ref-get obj sorted-cmp-kw))
-            (cmpf (if (jolt-nil? cmp) jolt-compare cmp))
-            (es (seq->list (jolt-seq obj)))
-            (keep (filter (lambda (e)
-                            (let ((c (jnum->exact (jolt-invoke cmpf (jolt-first e) k))))
-                              (if asc (>= c 0) (<= c 0))))
-                          es)))
-       (list->cseq (if asc keep (reverse keep)))))
+     (let ((cmp (jolt-ref-get obj sorted-cmp-kw)))
+       (sc-tree-seq-from (jolt-ref-get obj kw-tree) (jolt-truthy? (cadr rest))
+                         (if (htable-sorted-map? obj) 0 1)
+                         (if (jolt-nil? cmp) jolt-compare cmp) (car rest))))
     (else (dispatch-miss obj method rest))))
 
 ;; The receivers the arm below answers for — every branch of its cond tests
