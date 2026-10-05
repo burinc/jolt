@@ -2325,7 +2325,31 @@
 ;; consistent with the persistent vector's element-wise =/hash so a vector and a
 ;; list of the same elements are jolt= and hash alike.
 ;; ============================================================================
+;; How many elements X has, when that is known without walking or realizing
+;; anything -- #f otherwise. The JVM's Counted, as ASeq.equiv and
+;; APersistentVector.doEquiv consult it: a vector, (), a counted cell (cseqn: a
+;; list, a string/array/reverse-vector seq), a vector's own seq, and a range whose
+;; next chunk is not yet built (range-rest-count).
+(define (seq-known-count x)
+  (cond ((pvec? x) (pvec-count x))
+        ((cseqn? x) (cseqn-cnt x))
+        ((cseqv? x)
+         (let ((here (fx- (pvec-count (cseqv-cvec x)) (cseqv-ci x))) (cr (cseqv-crest x)))
+           (if cr
+               (let ((k (range-rest-count cr))) (and k (+ here k)))
+               here)))
+        ((empty-list-t? x) 0)
+        (else #f)))
+;; Two sequential colls whose counts are both known and differ are unequal, so the
+;; walk is skipped -- ASeq.equiv's `this instanceof Counted && obj instanceof
+;; Counted && count() != count()`. Only when BOTH are known: counting a lazy side
+;; would realize it, which the walk below may never have to do.
 (define (seq=? a b)
+  (let ((ca (seq-known-count a)))
+    (if (and ca (let ((cb (seq-known-count b))) (and cb (not (= ca cb)))))
+        #f
+        (seq=?-walk a b))))
+(define (seq=?-walk a b)
   (let loop ((sa (jolt-seq a)) (sb (jolt-seq b)))
     (cond ((and (jolt-nil? sa) (jolt-nil? sb)) #t)
           ((or (jolt-nil? sa) (jolt-nil? sb)) #f)
