@@ -122,6 +122,9 @@
 ;; an ordinary, same-machine, non-cross build too, without requiring a
 ;; source checkout that happens not to carry the stub.
 (define bld-signable (make-parameter #f))
+;; deps.edn :jolt/build {:exclude-resources [glob …]}: dependency-root files
+;; NOT to bake into the binary (bld-dep-resources), as a list of glob strings.
+(define bld-exclude-resources (make-parameter '()))
 ;; The effective target machine, and whether this is a cross build.
 (define (bld-eff-machine) (or (bld-target) bld-machine))
 (define (bld-cross?) (and (bld-target) (not (string=? (bld-target) bld-machine)) #t))
@@ -1434,10 +1437,11 @@
 ;; supplies (an install root, or a source this jolt carries embedded) stays
 ;; jolt's — an embedded key outranks every root at runtime, so baking a
 ;; library's copy of, say, babashka/fs.clj would replace jolt's. Left out:
-;; compiled JVM classes and ClojureScript sources, which jolt never loads, and
-;; the source of every
-;; namespace the build compiled into the image, which the binary never reads
-;; again (its namespaces are pre-registered, so a require of one is a no-op).
+;; compiled JVM classes and ClojureScript sources, which jolt never loads; any
+;; file the project excludes (deps.edn :jolt/build {:exclude-resources [glob …]});
+;; and the source of every namespace the build compiled into the image, which
+;; the binary never reads again (its namespaces are pre-registered, so a require
+;; of one is a no-op).
 ;; Any other source stays: a file a namespace (load)s runs in the binary, and a
 ;; namespace reached only at runtime is loaded from its embedded copy.
 
@@ -1482,6 +1486,37 @@
                  (hashtable-ref baked (substring name 0 (- (string-length name) (string-length ext))) #f)))
           ldr-source-exts))
 
+;; Does glob PAT match the root-relative resource NAME? `*` is any run within one
+;; path segment, `**` any run across segments (so `**/` also matches no
+;; directory at all), `?` one character other than `/`; a pattern ending in `/`
+;; names everything under that directory. Everything else matches itself.
+(define (bld-glob-match? pat name)
+  (let* ((pat (if (bld-suffix? pat "/") (string-append pat "**") pat))
+         (pn (string-length pat)) (sn (string-length name)))
+    (let m ((i 0) (j 0))
+      (cond
+        ((= i pn) (= j sn))
+        ((char=? (string-ref pat i) #\*)
+         (if (and (< (+ i 1) pn) (char=? (string-ref pat (+ i 1)) #\*))
+             (let ((k (+ i 2)))
+               (or (and (< k pn) (char=? (string-ref pat k) #\/) (m (+ k 1) j))
+                   (let try ((jj j))
+                     (or (m k jj) (and (< jj sn) (try (+ jj 1)))))))
+             (let try ((jj j))
+               (or (m (+ i 1) jj)
+                   (and (< jj sn) (not (char=? (string-ref name jj) #\/)) (try (+ jj 1)))))))
+        ((= j sn) #f)
+        ((char=? (string-ref pat i) #\?)
+         (and (not (char=? (string-ref name j) #\/)) (m (+ i 1) (+ j 1))))
+        (else (and (char=? (string-ref pat i) (string-ref name j)) (m (+ i 1) (+ j 1))))))))
+
+;; Did the project exclude NAME from the baked dependency resources? A dependency
+;; can ship files no jolt program reads — ClojureScript externs (`*.ext.js`,
+;; Closure compiler input) are the large case, an 11 MB js-joda one among them
+;; — and only the project can tell such a file from a `.js` it serves.
+(define (bld-resource-excluded? name)
+  (exists (lambda (pat) (bld-glob-match? pat name)) (bld-exclude-resources)))
+
 ;; ((name . bytes) ...) to bake from the dependency roots, first root first.
 (define (bld-dep-resources ext-roots embed-dirs baked-ns)
   (let ((seen (make-hashtable string-hash string=?))
@@ -1508,6 +1543,7 @@
                          (hashtable-set! seen n #t)
                          (if (or (bld-suffix? n ".class")
                                  (bld-suffix? n ".cljs")
+                                 (bld-resource-excluded? n)
                                  (bld-baked-source? baked n)
                                  (embedded-resource-has? n)
                                  (exists (lambda (r) (bld-root-has? r n)) project)
@@ -3759,7 +3795,8 @@
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
                    (bld-boot-mode (bld-opt-boot-mode opt 2))
-                   (bld-signable (bld-opt-bool opt 4)))
+                   (bld-signable (bld-opt-bool opt 4))
+                   (bld-exclude-resources (bld-opt-strs opt 6)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
@@ -3771,7 +3808,8 @@
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
-                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2))
+                   (bld-exclude-resources (bld-opt-strs opt 6)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)

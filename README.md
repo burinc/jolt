@@ -596,6 +596,23 @@ jolt build -m myapp.core --include myapp.plugin
 An include with no source file on the roots fails the build, rather than baking
 nothing and leaving the failure to the binary's first lookup.
 
+A built binary carries its dependencies' resources, the way an uberjar packs
+the classpath, so a library that reads its own files at runtime still finds
+them. Compiled `.class` files and ClojureScript sources are left out, since jolt
+loads neither. Anything else a dependency ships gets baked in, including files
+no jolt program reads, such as ClojureScript externs, which can run to
+megabytes. Leave those out by name. Each pattern is a glob matched against the
+path `io/resource` asks for: `*` stays within a directory, `**` crosses
+directories, and a trailing `/` covers everything under that directory:
+
+```clojure
+:jolt/build {:exclude-resources ["**.ext.js"     ; ClojureScript externs
+                                 "cljsjs/"]}     ; a whole directory
+```
+
+An excluded file is gone from the binary, and `io/resource` answers `nil` for
+it. Only the project's own `deps.edn` is read for this key.
+
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the
 image but compresses it with gzip, and `--boot plain` drops it altogether:
