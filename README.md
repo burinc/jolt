@@ -454,6 +454,9 @@ Both resolve the `deps.edn` in the current directory first, so the project's
 source roots and native libraries are loaded — `(require '[my.ns])` works live.
 `nrepl-server` writes a `.nrepl-port` file in the project dir, so CIDER / Calva /
 Cursive auto-detect the port; override it with the argument or `JOLT_NREPL_PORT`.
+Port `0` lets the OS pick a free port, and `.nrepl-port` names the one it bound.
+From code, `(jolt.nrepl/start 0)` returns the stop fn with that port as its
+`:port` metadata.
 
 The server runs in dev mode — calls deref their var, so redefining a function
 takes effect on the next call without restarting the process. The built-in
