@@ -2919,7 +2919,7 @@
           (parameterize ((ldr-verbose? verbose?))
             (k (and (member "reload" flags) #t)))))))
 
-(def-var! "clojure.core" "load-file" jolt-load-file)
+(def-var! "clojure.core" "load-file" (lambda (p) (jolt-load-file (host-user-path p))))
 
 ;; The directory of a namespace's resource path: "clojure.tools.reader-test" ->
 ;; "clojure/tools" (drop the last segment of ns-name->rel). "" for a top-level ns.
@@ -2961,7 +2961,20 @@
 ;; and bash — /bin/sh on macOS and several Linuxes — does not clear it. The
 ;; child and everything it starts would then ignore ^C and a plain `kill`.
 (define (jolt-sh cmd) (jolt-with-empty-sigmask (lambda () (system cmd))))
-(def-var! "jolt.host" "sh" jolt-sh)
+;; The Clojure-facing sh runs where a ProcessBuilder child does: in the user's
+;; directory, not the checkout bin/jolt cd'd to (#1241) — so a bb.edn string
+;; task sees the project — and without JOLT_PWD, which names THIS process's
+;; directory and would hand a child jolt the parent's (process.ss,
+;; proc-child-env-pairs). jolt-sh itself stays as is: the runtime's own callers
+;; (the AOT worker spawn) mean the process cwd. Windows runs `system` through
+;; cmd.exe and has no bin/jolt, so it is left alone.
+(define (user-dir-sh-prefix)
+  (let ((dir (proc-effective-dir #f)))
+    (if (and dir (not (eq? (sa-os-family) 'windows))
+             (not (string=? dir (current-directory))))
+        (string-append "cd " (sh-quote dir) " || exit 1\nunset JOLT_PWD\n")
+        "")))
+(def-var! "jolt.host" "sh" (lambda (cmd) (jolt-sh (string-append (user-dir-sh-prefix) cmd))))
 
 (define (jolt-sh-out cmd)
   (call-with-values
@@ -2978,7 +2991,8 @@
     (apply string-append
       (map (lambda (c) (if (char=? c #\') "'\\''" (string c))) (string->list s)))
     "'"))
-(def-var! "jolt.host" "sh-out" jolt-sh-out)
+(def-var! "jolt.host" "sh-out"
+  (lambda (cmd) (jolt-sh-out (string-append (user-dir-sh-prefix) cmd))))
 
 ;; Expose source-root control + ns loading to Clojure (jolt.main / jolt.deps).
 (def-var! "jolt.host" "set-source-roots!"
@@ -2999,12 +3013,12 @@
 ;; it resolves the project, before any of the project compiles.
 (def-var! "jolt.host" "replace-builtin-ns!"
   (lambda (n) (replace-builtin-ns! (jolt-str-render-one n)) jolt-nil))
-(def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? p) #t #f)))
+(def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? (host-user-path p)) #t #f)))
 ;; …and whether it is a DIRECTORY, which file-exists? also answers #t for. A bare
 ;; argv token is dispatched as a file to run before a :tasks lookup (main.clj's
 ;; run-file-arg?), so `jolt test` in any project with a test/ dir — which is every
 ;; jolt library — took the file path and died decoding a directory.
-(def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? p) #t #f)))
+(def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? (host-user-path p)) #t #f)))
 ;; jolt.host/getenv is defined in rt.ss, not here — the compiler image reads it
 ;; as it loads, which is before this file (see the comment there).
 
@@ -3030,17 +3044,26 @@
   (if (eq? (sa-os-family) 'windows)
       (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list p)))
       p))
+;; A path a Clojure caller hands jolt.host, as the filesystem should see it: a
+;; relative one resolves against the user's directory (JOLT_PWD), as java.io's
+;; do (io.ss project-relative), not against the checkout bin/jolt cd'd to —
+;; otherwise (spit "a") then (jolt.host/delete-file! "a") touched two different
+;; files (#1241). When the two directories agree (a built binary sets no
+;; JOLT_PWD and never cd's) the path is left as given, so nothing changes there.
+(define (host-user-path p)
+  (host-fs-path
+    (if (string=? (jolt-user-dir) (current-directory)) p (project-relative p))))
 (def-var! "jolt.host" "mkdirs!"
-  (lambda (p) (if (mkdirs! (host-fs-path p)) #t #f)))
+  (lambda (p) (if (mkdirs! (host-user-path p)) #t #f)))
 ;; `rm -f`: an absent path is success, not failure.
 (def-var! "jolt.host" "delete-file!"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (if (file-exists? p) (if (delete-path! p) #t #f) #t))))
 ;; `rm -rf`, reusing the AOT cache's pruner (which does not follow symlinks).
 (def-var! "jolt.host" "delete-tree!"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (aot-delete-tree p)
       (if (file-exists? p) #f #t))))
 ;; `mv` within one filesystem: rename(2), which is the atomicity the publish
@@ -3049,24 +3072,24 @@
 ;; (java/io.ss rename-replace!, jolt-lang/jolt#1074).
 (def-var! "jolt.host" "rename-file!"
   (lambda (from to)
-    (guard (e (#t #f)) (rename-replace! (host-fs-path from) (host-fs-path to)) #t)))
+    (guard (e (#t #f)) (rename-replace! (host-user-path from) (host-user-path to)) #t)))
 ;; last-modified in epoch milliseconds, 0 when absent — what `test -nt` compared.
 (def-var! "jolt.host" "file-mtime"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (if (file-exists? p) (sa-file-mtime-ms p) 0))))
 ;; directory entries (names only), nil when p is not a directory — the pieces a
 ;; `find` walk is built from on the Clojure side.
 (def-var! "jolt.host" "list-dir"
   (lambda (p)
-    (let ((p (host-fs-path p)))
+    (let ((p (host-user-path p)))
       (if (file-directory? p)
           (guard (e (#t jolt-nil)) (list->cseq (directory-list p)))
           jolt-nil))))
 ;; …and whether it is a symlink, so that walk can decline to follow one, as
 ;; `find` does by default.
 (def-var! "jolt.host" "symlink?"
-  (lambda (p) (if (file-symbolic-link? (host-fs-path p)) #t #f)))
+  (lambda (p) (if (file-symbolic-link? (host-user-path p)) #t #f)))
 
 ;; --- jars on the roots (jolt.host) -------------------------------------------
 ;; What jolt.deps and jolt.loader ask about a jar: whether a file is a whole
