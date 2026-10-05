@@ -3679,4 +3679,14 @@
   ;; deftype those used to ask instance?, which asked the predicate again — an
   ;; unbounded recursion (hung 0.8.11) once the type had been redefined
   {:suite "dispatch-caches" :expr "(do (clojure.core/__register-class! (fn [x] (and (map? x) (coll? x) (vector? x) false)) (fn [_] \"uhang.C\") (fn [_] [\"uhang.C\"])) (load-string \"(ns uhang.ns) (defprotocol P (p [_])) (deftype T [] P (p [_] 1)) (deftype T []) [(satisfies? P (T.)) (instance? uhang.ns.P (T.)) (map? (T.))]\"))" :expected "[false false false]"}
+  ;; Counted seqs (jolt-d5g, jolt-4j4, jolt-40b): a list, a string/array/reverse-vector
+  ;; seq and a long range count without a walk, and stay counted down their rest;
+  ;; = between two of them compares counts first. Values pinned to JVM Clojure 1.12.
+  {:suite "counted-seqs" :expr "(let [l (list 1 2 3)] [(count l) (count (rest l)) (count (pop l)) (count (conj l 0)) (count (next l)) (counted? (rest l)) (counted? (pop l))])" :expected "[3 2 2 4 2 true true]"}
+  {:suite "counted-seqs" :expr "[(counted? (seq \"abc\")) (counted? (next (seq \"abc\"))) (counted? (rseq [1 2])) (counted? (seq (int-array 2))) (counted? (seq (object-array 2))) (counted? (range 3)) (counted? (rest (range 40))) (counted? (range 0 1 0.5)) (counted? (cons 1 '(2))) (counted? (lazy-seq nil))]" :expected "[true true true true true true true false false false]"}
+  {:suite "counted-seqs" :expr "[(count (seq \"hello\")) (count (next (seq \"hello\"))) (count (rseq [1 2 3 4])) (count (next (rseq [1 2 3 4]))) (count (seq (long-array 5))) (count (next (seq (long-array 5))))]" :expected "[5 4 4 3 5 4]"}
+  {:suite "counted-seqs" :expr "[(count (range 3 100 7)) (count (range 100 3 -7)) (count (range 1/2 10 1/3)) (count (range 0 1 0.1)) (count (range 10 0)) (count (rest (range 100)))]" :expected "[14 14 29 11 0 99]"}
+  {:suite "counted-seqs" :expr "(let [r (range 100)] (dorun r) [(count r) (count (drop 40 r)) (count (rest r)) (count (nthrest r 33))])" :expected "[100 60 99 67]"}
+  {:suite "counted-seqs" :expr "[(count (with-meta (list 1 2 3) {:a 1})) (count (with-meta (seq \"abc\") {:a 1})) (count (into () (range 10))) (count (reverse (range 40))) (count (cons 0 (list 1 2)))]" :expected "[3 3 10 40 3]"}
+  {:suite "counted-seqs" :expr "[(= [1 2 3] '(1 2 3)) (= [1 2 3] '(1 2)) (= '(1 2) [1 2 3]) (= (range 3) [0 1 2]) (= (range 4) '(0 1 2)) (= (seq \"ab\") [\\a \\b]) (= (rseq [1 2]) '(2 1)) (= () []) (= '(1) []) (= (range 3) (list 0 1 2 3))]" :expected "[true false false true false true true true false false]"}
 ]

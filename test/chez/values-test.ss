@@ -361,5 +361,69 @@
 (ok "first arm rejects cseq"   (raises? (lambda () (register-first-arm! cseq? (lambda (x) x)))))
 (ok "first arm rejects nil"    (raises? (lambda () (register-first-arm! jolt-nil?-fn (lambda (x) x)))))
 
+;; --- counted cells: count without a walk, = by count first ---------------------
+;; A PersistentList knows its _count; a StringSeq, an ArraySeq and an RSeq their
+;; index; a LongRange its bounds (seq.ss cseqn, range-rest-count). Pinned by
+;; allocation, which is deterministic where wall time is not: walking any of these
+;; allocates per element (a string's or an rseq's cells, a range's chunks, a
+;; vector's seq cells for =), and the O(1) answers allocate nothing per element.
+(define (bytes-of thunk)
+  (collect)
+  (let ((b0 (sstats-bytes (statistics))))
+    (thunk)
+    (- (sstats-bytes (statistics)) b0)))
+(define big-n 100000)
+(define big-list (apply jolt-list (iota big-n)))
+(ok "a list is a counted cell" (cseqn? big-list))
+(ok "count of a list" (= big-n (jolt-count big-list)))
+(ok "a list's rest is counted" (and (cseqn? (jolt-rest big-list)) (= (- big-n 1) (jolt-count (jolt-rest big-list)))))
+(ok "a list's next is counted" (cseqn? (jolt-next big-list)))
+(ok "a list's pop is counted" (and (cseqn? (jolt-pop big-list)) (= (- big-n 1) (jolt-count (jolt-pop big-list)))))
+(ok "conj onto a list is counted" (and (cseqn? (jolt-conj1 big-list 'x)) (= (+ big-n 1) (jolt-count (jolt-conj1 big-list 'x)))))
+(ok "conj onto () is counted" (and (cseqn? (jolt-conj1 jolt-empty-list 1)) (= 1 (jolt-count (jolt-conj1 jolt-empty-list 1)))))
+(ok "(cons x nil) is a counted list" (and (cseqn? (jolt-cons 1 jolt-nil)) (= 1 (jolt-count (jolt-cons 1 jolt-nil)))))
+(ok "reverse is a counted list" (let ((r (jolt-reverse (jolt-vector 1 2 3)))) (and (cseqn? r) (= 3 (jolt-count r)))))
+;; the count is read from the cell, not walked: a cell claiming 7 behind a tail
+;; that throws when forced still counts 7
+(ok "count reads a counted cell's field"
+    (= 7 (jolt-count (make-cseqn 'x (lambda () (error 'test "walked")) sk-list jolt-nil 7))))
+;; a Cons and a lazy cell know no count, so are not counted cells; count still walks them
+(ok "cons onto a list is not a counted cell" (not (cseqn? (jolt-cons 0 big-list))))
+(ok "count of a cons onto a list" (= (+ big-n 1) (jolt-count (jolt-cons 0 big-list))))
+(ok "a lazy cell is not a counted cell" (not (cseqn? (cseq-lazy 1 (lambda () jolt-nil)))))
+(ok "count of a list allocates nothing per element" (< (bytes-of (lambda () (jolt-count big-list))) 1024))
+(define big-str (make-string big-n #\a))
+(ok "count of a string seq" (= big-n (jolt-count (jolt-seq big-str))))
+(ok "count of a string seq's next" (= (- big-n 1) (jolt-count (jolt-next (jolt-seq big-str)))))
+(ok "count of a string seq allocates nothing per element"
+    (< (bytes-of (lambda () (jolt-count (jolt-seq big-str)))) 1024))
+(define big-vec (apply jolt-vector (iota big-n)))
+(ok "count of an rseq" (= big-n (jolt-count (jolt-rseq big-vec))))
+(ok "count of an rseq's next" (= (- big-n 1) (jolt-count (jolt-next (jolt-rseq big-vec)))))
+(ok "count of an rseq allocates nothing per element"
+    (< (bytes-of (lambda () (jolt-count (jolt-rseq big-vec)))) 1024))
+(ok "count of a range" (= 1000000 (jolt-count (jolt-range 1000000))))
+(ok "count of a stepped range" (= 14 (jolt-count (jolt-range 3 100 7))))
+(ok "count of a descending range" (= 14 (jolt-count (jolt-range 100 3 -7))))
+(ok "count of a ratio range" (= 29 (jolt-count (jolt-range 1/2 10 1/3))))
+(ok "count of a flonum range walks it" (= 11 (jolt-count (jolt-range 0 1 0.1))))
+(ok "count of a range's rest" (= 999999 (jolt-count (jolt-rest (jolt-range 1000000)))))
+(ok "count of a range allocates nothing per element"
+    (< (bytes-of (lambda () (jolt-count (jolt-range 1000000)))) 4096))
+(let ((r (jolt-range 1000)))
+  (jolt-count (jolt-vec r))           ; realize every chunk
+  (ok "count of a realized range" (= 1000 (jolt-count r))))
+;; = compares known counts before walking: a vector against a list one longer
+;; answers without building the vector's seq cells
+(define big-list+1 (jolt-conj1 big-list 'x))
+(ok "= of differing known counts is false" (not (jolt=2 big-vec big-list+1)))
+(ok "= of differing known counts does not walk"
+    (< (bytes-of (lambda () (jolt=2 big-vec big-list+1))) 1024))
+(ok "= of equal counts still walks" (jolt=2 big-vec big-list))
+(ok "= of equal counts, differing element" (not (jolt=2 (jolt-vector 1 2 3) (jolt-list 1 2 4))))
+(ok "= range against a shorter list" (not (jolt=2 (jolt-range 4) (jolt-list 0 1 2))))
+(ok "= string seq against a vector" (jolt=2 (jolt-seq "ab") (jolt-vector #\a #\b)))
+(ok "= with a lazy side walks" (not (jolt=2 (cseq-lazy 1 (lambda () jolt-nil)) (jolt-list 1 2))))
+
 (printf "values-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))
