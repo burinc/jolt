@@ -863,7 +863,15 @@
     (if (hamt=? 0 (hamt-and bm bit)) node
         (let* ((i (hamt-arr-index bm bit)) (child (vector-ref arr i)))
           (cond
-            ((hnode? child) (make-hnode bm (vec-set arr i (node-dissoc child (fx+ shift 5) h k removed))))
+            ;; A child the removal empties is dropped from this node, as the
+            ;; reference's BitmapIndexedNode.without drops a null child. Left in
+            ;; place, emptied branches pile up at the front of a map drained in
+            ;; iteration order, and every later seq/first has to step over them.
+            ((hnode? child)
+             (let ((nc (node-dissoc child (fx+ shift 5) h k removed)))
+               (cond ((eq? nc child) node)
+                     ((hamt=? 0 (hnode-bm nc)) (make-hnode (hamt-and bm (hamt-not bit)) (vec-remove arr i)))
+                     (else (make-hnode bm (vec-set arr i nc))))))
             ((hcoll? child)
              (if (assoc-jolt k (hcoll-alist child))
                  (begin (set-box! removed #t)
@@ -977,8 +985,7 @@
             (else (set-box! added #t)
                   (vector-set! arr i (split-leaf (fx+ shift 5) (car child) (cdr child) h k v))))))))
 
-;; Mirrors node-dissoc, including leaving an emptied interior node in place
-;; rather than collapsing it (node-dissoc does the same).
+;; Mirrors node-dissoc, including dropping an interior node the removal empties.
 (define (enode-dissoc! nd shift h k removed)
   (let ((bit (hamt-bitpos h shift)) (bm (enode-bm nd)))
     (unless (hamt=? 0 (hamt-and bm bit))
@@ -987,7 +994,10 @@
           ((or (enode? child) (hnode? child))
            (let ((c (enode-claim child)))
              (vector-set! arr i c)
-             (enode-dissoc! c (fx+ shift 5) h k removed)))
+             (enode-dissoc! c (fx+ shift 5) h k removed)
+             (when (hamt=? 0 (enode-bm c))
+               (enode-remove! nd i)
+               (enode-bm-set! nd (hamt-and bm (hamt-not bit))))))
           ((hcoll? child)
            (when (assoc-jolt k (hcoll-alist child))
              (set-box! removed #t)
@@ -1657,15 +1667,19 @@
         ;; Walking instead made (count (seq v)) linear where the reference is
         ;; constant: 18.8ms against 166ns over a million elements.
         ;;
-        ;; Only the crest-#f shape qualifies. A ChunkedCons (crest set) is a
-        ;; standalone chunk followed by an arbitrary, possibly lazy rest, so its
+        ;; Only the crest-#f shape answers at once. A ChunkedCons (crest set) is
+        ;; a standalone chunk followed by an arbitrary, possibly lazy rest, so its
         ;; length is not known without forcing — ChunkedCons is deliberately not
-        ;; Counted on the JVM either.
+        ;; Counted on the JVM either — but the walk takes it a chunk at a time.
         ((cseq? coll)
          (let loop ((s coll) (n 0))
            (cond ((jolt-nil? s) n)
-                 ((and (cseq-cvec s) (not (cseq-crest s)))
-                  (fx+ n (fx- (pvec-count (cseq-cvec s)) (cseq-ci s))))
+                 ((cseq-cvec s)
+                  (let ((n (fx+ n (fx- (pvec-count (cseq-cvec s)) (cseq-ci s)))))
+                    ;; a ChunkedCons: its chunk is realized, so count it whole
+                    ;; and carry on from the after-chunk rest instead of
+                    ;; building a cell per element to step across it
+                    (if (cseq-crest s) (loop (jolt-seq (cseq-crest s)) n) n)))
                  (else (loop (jolt-seq (seq-more s)) (fx+ n 1))))))
         (else (let loop ((as jolt-count-arms))
                 (cond ((null? as) (jolt-count-base coll))

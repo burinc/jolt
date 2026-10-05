@@ -1095,7 +1095,8 @@ staticsite:
 	@$(CHEZ) --script host/chez/run-staticsite.ss
 
 # Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
-# transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
+# transients a slot buffer, their seq views vector-backed; a hash map's seq view
+# is a lazy chunked walk of its trie (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
 
