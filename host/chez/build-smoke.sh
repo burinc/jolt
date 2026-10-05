@@ -1878,7 +1878,9 @@ rm -rf "$(dirname "$inc_app")"
 # the dependency's, as the project's paths come first on a classpath. Sources
 # are baked only where the binary still reads them: dirlib.core is compiled into
 # the image, so its .clj is left out, but the file it (load)s runs in the binary.
-# ClojureScript sources are never baked: jolt does not load them.
+# ClojureScript sources are never baked: jolt does not load them. A file the
+# project excludes (:jolt/build {:exclude-resources …}, #1245) is not baked
+# either — here ClojureScript externs, while a plain .js beside them still is.
 echo "build smoke: dependency resources embedded (uberjar-style)"
 dr="$(mktemp -d)"
 mkdir -p "$dr/app/src/dr" "$dr/app/resources" "$dr/dirlib/src/dirlib" "$dr/dirlib/resources/dirlib" "$dr/jarlib/src/jarlib" "$dr/jarlib/res"
@@ -1896,6 +1898,9 @@ cat > "$dr/dirlib/src/dirlib/core_impl.clj" <<'DR_EOF'
 (def loaded "from a (load)ed file")
 DR_EOF
 printf '(ns dirlib.core)' > "$dr/dirlib/src/dirlib/core.cljs"
+mkdir -p "$dr/dirlib/resources/cljsjs/dirlib/common"
+printf 'var Dirlib = {};' > "$dr/dirlib/resources/cljsjs/dirlib/common/dirlib.ext.js"
+printf 'console.log(1);' > "$dr/dirlib/resources/dirlib/app.js"
 printf 'jar template' > "$dr/jarlib/res/jarlib.txt"
 cat > "$dr/jarlib/src/jarlib/core.clj" <<'DR_EOF'
 (ns jarlib.core (:require [clojure.java.io :as io]))
@@ -1903,7 +1908,7 @@ cat > "$dr/jarlib/src/jarlib/core.clj" <<'DR_EOF'
 DR_EOF
 (cd "$dr/jarlib/src" && zip -qr "$dr/jarlib.jar" .) && (cd "$dr/jarlib/res" && zip -qr "$dr/jarlib.jar" .)
 printf 'from the project' > "$dr/app/resources/shared.txt"
-printf '{:paths ["src" "resources"]\n :deps {dr/dirlib {:local/root "%s"} dr/jarlib {:local/root "%s"}}}\n' \
+printf '{:paths ["src" "resources"]\n :deps {dr/dirlib {:local/root "%s"} dr/jarlib {:local/root "%s"}}\n :jolt/build {:exclude-resources ["**.ext.js"]}}\n' \
   "$dr/dirlib" "$dr/jarlib.jar" > "$dr/app/deps.edn"
 cat > "$dr/app/src/dr/core.clj" <<'DR_EOF'
 (ns dr.core
@@ -1918,7 +1923,9 @@ cat > "$dr/app/src/dr/core.clj" <<'DR_EOF'
                       (vec (.toByteArray out)))))
   (println "load:" d/loaded)
   (println "baked source:" (io/resource "dirlib/core.clj"))
-  (println "cljs:" (io/resource "dirlib/core.cljs")))
+  (println "cljs:" (io/resource "dirlib/core.cljs"))
+  (println "externs:" (io/resource "cljsjs/dirlib/common/dirlib.ext.js"))
+  (println "js:" (some-> (io/resource "dirlib/app.js") slurp)))
 DR_EOF
 if ! JOLT_PWD="$dr/app" "$jolt" build -m dr.core -o "$dr/bin" >"$dr/build.log" 2>&1; then
   echo "  FAIL: dependency-resource build exited non-zero"; tail -20 "$dr/build.log"; exit 1
@@ -1931,7 +1938,9 @@ shared: from the project
 png: [-119 80 78 71 13 10 26 10 -1 0 -2]
 load: from a (load)ed file
 baked source: nil
-cljs: nil'
+cljs: nil
+externs: nil
+js: console.log(1);'
 if [ "$got_dr" != "$want_dr" ]; then
   echo "  FAIL: dependency resources did not travel with the binary"
   echo "--- want ---"; echo "$want_dr"

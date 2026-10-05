@@ -1067,6 +1067,18 @@
                                           (cond (nil? v) []
                                                 (sequential? v) v
                                                 :else [v]))))
+            ;; dependency-root files NOT to bake into the binary — deps.edn
+            ;; :jolt/build {:exclude-resources [glob …]}, matched against the
+            ;; name io/resource asks for: a file no jolt program reads (a
+            ;; ClojureScript externs `*.ext.js`) that a dependency ships anyway.
+            ;; The project's only, like :embed.
+            exclude-resources (let [v (:exclude-resources build)
+                                    v (cond (nil? v) [] (sequential? v) v :else [v])]
+                                (doseq [p v]
+                                  (when-not (and (string? p) (not (str/blank? p)))
+                                    (throw (ex-info (str ":exclude-resources takes glob strings (got " (pr-str p) ")")
+                                                    {:exclude-resources p}))))
+                                (vec (distinct v)))
             ;; a shared library (callable from C/C++/Rust via jolt_library_init +
             ;; jolt_lookup) instead of an executable: --library.
             library? (some #{"--library"} flag-args)
@@ -1091,8 +1103,8 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic nil include-names)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable? include-names))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic nil include-names exclude-resources)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable? include-names exclude-resources))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
