@@ -51,6 +51,7 @@
    "lazy-threads" "lazy pipelines after a `Thread` has existed (cells claimed by CAS, no mutex per cell)"
    "apply-rest" "`apply` of `+ max min < <=` and a user variadic over a million-element rest (streamed, not materialized)"
    "sorted-access" "shape-answered reads: `count`/`drop` on a vector seq, `rseq`, `first` of a sorted map/set"
+   "coll-shapes" "shape-answered ops on a big collection: `into` a small step, queue boundary `pop`, `count` of a list/range, first of a hash/sorted map, sorted `hash`/`=`, `nthrest`, a 64-way string `case`"
    "sorted-build" "`into` a sorted-map/sorted-set in and out of key order, `sorted-map-by`, replace-every-key (one tree walk per insert)"
    "nth-access" "`nth` on a vector, small and large, with and without a default"
    "transducers" "transducer pipelines (`comp` of `map`/`filter`/`take`)"
