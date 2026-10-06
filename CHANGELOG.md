@@ -5,6 +5,96 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.18] - 2026-10-06
+
+Collection operations that Clojure answers from a collection's shape (counts,
+transients, lazy hash and sorted seqs, queue pops, `drop` on vectors and
+ranges, large `case`) no longer walk the whole collection. `jolt.nrepl/start`
+reports the port it actually bound and takes a `:port-file` option, and
+`jolt.host` paths, `load-file` and `sh` resolve against the caller's directory.
+`jolt build` can leave dependency files out of a binary, and `--signable` no
+longer needs a separate Chez install.
+
+### Added
+
+- **`:jolt/build {:exclude-resources [glob …]}`** (#1247, #1245). A built
+  binary bakes every file in its dependency roots except `.class` and `.cljs`,
+  so a dependency that ships files no jolt program reads pays for them in every
+  build. ClojureScript externs are the large case: `cljs.java-time`'s js-joda
+  externs are 11.74 MB. The project now names what to leave out, as globs
+  matched against the name `io/resource` asks for: `*` within a directory,
+  `**` across directories, `?` one character, and a trailing `/` for
+  everything under a directory. A non-string entry fails the build.
+
+- **`jolt.nrepl/start` takes an opts map with `:port-file`** (#1242, #1239).
+  `(jolt.nrepl/start 0 nil {:port-file "/path/.nrepl-port"})` writes the port
+  file there, and `{:port-file nil}` writes none. The default is still
+  `.nrepl-port` in the working directory. Stop deletes only the file `start`
+  wrote, and the stop fn's metadata carries `:port-file`, the absolute path
+  written or nil.
+
+### Changed
+
+- **Collection operations answered from their shape, as on the JVM** (#1260).
+  Each of these was O(n) in jolt where Clojure answers in O(1), O(log n) or
+  O(k):
+  - transient vectors share their source trie, so `(into v xs)` costs `xs`,
+    not `v`;
+  - `PersistentQueue` pops in O(1) and caches its hash, and
+    `clojure.set/difference` walks the smaller set;
+  - lists carry their count, and range, `rseq`, string and array seqs count
+    in O(1); `=` compares known counts first, and `counted?` matches the JVM
+    for these seq types;
+  - hash map and set seqs walk the trie lazily a chunk at a time instead of
+    copying every entry, and `dissoc` drops emptied child nodes;
+  - sorted map and set `seq`/`rseq`/`keys`/`vals`/`subseq` are lazy, with a
+    cached hash and a count-first `=`;
+  - `nthrest`/`nthnext`/`drop` jump on vectors, ranges, `(range)` and strings.
+    `(nthrest (range 10) 2147483648)` now throws `ArithmeticException`, as on
+    the JVM;
+  - a `case` above a threshold dispatches through a constant map instead of
+    testing each clause in turn.
+
+  `bench/run.sh coll-shapes 4000` goes from 5919 ms to 8.7 ms (JVM Clojure
+  1.12: 90 ms), and joins the benches the release gate watches.
+
+- **Method calls on a `Pattern` or `Matcher` dispatch right after strings**
+  (#1244). An unhinted `.region`, `.lookingAt` or `.group` call walked the
+  stream, dotform, date and file arms first. An unhinted `.regionStart` on a
+  Matcher goes from about 410 ns to 205 ns. No call answers differently.
+
+- **`jolt build --signable` links against the embedded kernel** (#1261,
+  #1255). A self-contained jolt carries the Chez boots, `scheme.h` and
+  `libkernel.a`, but `--signable` still spawned an external Chez and read the
+  kernel from a Chez install, so on macOS you had to install Chez Scheme to get
+  a signable binary. It now compiles in process and only needs a C compiler. A
+  jolt without the embedded kernel (dev `bin/jolt`) behaves as before.
+
+- **`--library` on macOS arm64 keeps Chez's code in one aligned region**
+  (#1257, #1246). A library loaded into a host with a crowded address space
+  could run up to about 1.7x slower for the life of the process, because
+  Chez's code chunks landed gigabytes apart and calls across 1 GB or 4 GB
+  boundaries mispredict. The library now carves its code chunks out of one
+  512 MB region, reusing freed ones, until jolt builds against a Chez release
+  with cisco/ChezScheme#1074. The hidden `mmap`/`munmap` it defines don't
+  affect the host process, and other platforms are unchanged.
+
+### Fixed
+
+- **`jolt.nrepl/start` with port `0` reports the port it bound** (#1240,
+  #1238). The banner and `.nrepl-port` said `0`, so nothing could find the
+  server. The stop fn carries the bound port as `:port` metadata.
+  `jolt nrepl-server 0` gets the same fix.
+
+- **`jolt.host` paths, `load-file` and `sh` resolve against the caller's
+  directory** (#1243, #1241). Under `bin/jolt`, `jolt.host`'s filesystem
+  functions (`file-exists?`, `directory?`, `mkdirs!`, `delete-file!`,
+  `delete-tree!`, `rename-file!`, `file-mtime`, `list-dir`, `symlink?`) and
+  `load-file` resolved a relative path against the jolt checkout, and
+  `jolt.host/sh`/`sh-out` (and so a `bb.edn` string task) ran there. They now
+  use the user's directory, as `java.io`, `slurp`/`spit` and `ProcessBuilder`
+  already did. A built binary is unaffected.
+
 ## [0.8.17] - 2026-10-04
 
 A built binary now carries its dependencies' resources, as an uberjar does, so
