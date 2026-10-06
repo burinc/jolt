@@ -117,6 +117,12 @@
     ;; values first — a ratio over wrong answers would mean nothing
     (when-not (and (= (count s1) n1) (= (count s2) n2)
                    (= (first (drop (- n1 2) s1)) (- n1 2))
+                   (= (nthrest v1 (- n1 2)) [(- n1 2) (- n1 1)])
+                   (= (nthnext v1 n1) nil)
+                   (= (first (drop (- n1 2) (range n1))) (- n1 2))
+                   (= (first (drop n1 (range))) n1)
+                   (= (first (drop (- n1 2) src1)) (nth src1 (- n1 2)))
+                   (= (first (nthnext (range 0 (* 3 n1) 3) (- n1 1))) (* 3 (- n1 1)))
                    (= (first (rseq v1)) (dec n1))
                    (= (last (rseq v1)) 0)
                    (= (first sm1) [0 0]) (= (first ss1) 0)
@@ -177,6 +183,35 @@
            #(drop (- n1 5) s1)
            #(drop (- n2 5) s2)
            "drop is stepping instead of jumping to the index (jolt-drop, seq.ss)")
+
+    ;; Clojure 1.12's nthrest/nthnext hand an IDrop coll the count, as drop does.
+    ;; drop on a range and on a string's seq skip to the target (seq.ss drop-walk):
+    ;; a bounded range computes the 32-element block the target falls in, the
+    ;; unbounded (range) and a StringSeq re-enter at the target position.
+    (judge "nthrest vector"
+           #(nthrest v1 (- n1 5))
+           #(nthrest v2 (- n2 5))
+           "nthrest is stepping instead of handing the vector the count (jolt-nthrest, seq.ss)")
+
+    (judge "nthnext vector"
+           #(nthnext v1 (- n1 5))
+           #(nthnext v2 (- n2 5))
+           "nthnext is stepping instead of handing the vector the count (jolt-nthnext, seq.ss)")
+
+    (judge "drop range"
+           #(first (drop (- n1 5) (range n1)))
+           #(first (drop (- n2 5) (range n2)))
+           "drop on a bounded range is walking its blocks instead of computing the target's (range-skip, seq.ss)")
+
+    (judge "drop unbounded range"
+           #(first (drop n1 (range)))
+           #(first (drop n2 (range)))
+           "drop on (range) is stepping instead of re-entering at the target (drop-walk, seq.ss)")
+
+    (judge "drop string"
+           #(first (drop (- n1 5) src1))
+           #(first (drop (- n2 5) src2))
+           "drop on a string's seq is stepping instead of re-entering at the target index (drop-walk, seq.ss)")
 
     (judge "rseq vector"
            #(rseq v1)

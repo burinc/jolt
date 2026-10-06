@@ -2059,19 +2059,78 @@
 ;; 625ns and 18.5ms when dropping a million elements. As with count, the step
 ;; loop re-checks per cell so a few plain cells in front of a vector-backed one
 ;; still reach the jump.
+;; The other skips build exactly the cell a walk would have reached, so what
+;; comes back is the same seq, flavor and chunk boundaries included:
+;;  - a ChunkedCons (a bounded range's block, a chunked map's) moves within its
+;;    chunk by index and hops a whole chunk to its rest without a cell per element;
+;;  - an unforced range block computes the block the target is in (range-skip)
+;;    when the arithmetic is exact — a double range's values are running sums, so
+;;    it hops a block at a time instead, generating each one as the walk would;
+;;  - a StringSeq cell and the unbounded (range) re-enter at the target position;
+;;  - a Repeat cell skips by its count (repeat-skip).
+;; A cell whose tail is already forced is stepped through, as before.
 ;; The seq N (a fixnum) elements into seq S, or () when S runs out first.
 (define (drop-walk n s)
   (let loop ((n n) (s s))
     (cond
       ((jolt-nil? s) jolt-empty-list)
       ((fx<=? n 0) s)
-      ;; the jump keeps the seq's own flavor: an array map's seq dropped into is
-      ;; still a PersistentArrayMap$Seq, a vector's a ChunkedSeq
-      ((and (cseq-cvec s) (not (cseq-crest s)))
-       (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
-         (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq/k v i (cseq-kind s)))))
-      ((and (fx=? (cseq-kind s) sk-repeat) (repeat-skip s n)))
+      ((cseq-cvec s)
+       => (lambda (v)
+            ;; the jump keeps the seq's own flavor: an array map's seq dropped into
+            ;; is still a PersistentArrayMap$Seq, a vector's a ChunkedSeq
+            (let ((left (fx- (pvec-count v) (cseq-ci s))) (cr (cseq-crest s)))
+              (cond ((fx<? n left)
+                     (if cr
+                         (cseq-chunked/k v (fx+ (cseq-ci s) n) cr (cseq-kind s))
+                         (vec->seq/k v (fx+ (cseq-ci s) n) (cseq-kind s))))
+                    ((not cr) jolt-empty-list)
+                    ((fx=? n left) (loop 0 (jolt-seq cr)))       ; nil there is ()
+                    ((range-skip cr (fx- n left)))
+                    (else (loop (fx- n left) (jolt-seq cr)))))))
+      ((fx=? (cseq-kind s) sk-repeat)
+       (or (repeat-skip s n) (loop (fx- n 1) (jolt-seq (seq-more s)))))
+      ((fx=? (cseq-kind s) sk-string-seq)
+       (let ((t (cseq-tail s)))
+         (if (and (lazy-src? t) (eq? (lazy-src-fn t) lz-str-seq))
+             (let ((str (lazy-src-a t)) (i (lazy-src-b t)))
+               (if (fx>=? n (fx- (string-length str) i))
+                   jolt-empty-list
+                   (str->seq str (fx+ i n))))
+             (loop (fx- n 1) (jolt-seq (seq-more s))))))
+      ((fx=? (cseq-kind s) sk-iterate)
+       (let ((t (cseq-tail s)))
+         (if (and (lazy-src? t) (eq? (lazy-src-fn t) lz-range-from))
+             (range-from (+ (cseq-head s) n))
+             (loop (fx- n 1) (jolt-seq (seq-more s))))))
       (else (loop (fx- n 1) (jolt-seq (seq-more s)))))))
+;; The seq N (>0) elements into the bounded range whose next block CR has not been
+;; generated, or #f when it is not one or its values are not exact. Blocks are
+;; seq-chunk-size long from where the range started, so the target's block starts
+;; a whole number of blocks along and is generated alone; inside it the target is
+;; an index. A double range answers #f: its values are running sums, and v+k*step
+;; rounds differently from k additions.
+(define (range-skip cr n)
+  (and (jolt-lazyseq? cr)
+       (let ((t (jolt-lazyseq-thunk cr)))
+         (and (lazy-src? t) (eq? (lazy-src-fn t) lz-range)
+              (let ((v (lazy-src-a t)) (b (lazy-src-b t)))
+                (and (exact? v) (exact? (cadr b))
+                     (let* ((step (cadr b))
+                            (j (fxremainder n seq-chunk-size))
+                            (c (range-chunked (+ v (* (fx- n j) step)) (car b) step (caddr b))))
+                       (cond ((not (cseq? c)) jolt-empty-list)
+                             ((fx=? j 0) c)
+                             ((fx<? j (pvec-count (cseq-cvec c)))
+                              (cseq-chunked/k (cseq-cvec c) j (cseq-crest c) (cseq-kind c)))
+                             (else jolt-empty-list)))))))))
+;; drop-walk for a take-drop-count: 'all walks the source to its end, realizing
+;; it as the JVM's step loop does, since that countdown never ends.
+(define (drop-walk-count c s)
+  (if (eq? c 'all)
+      (let loop ((s s))
+        (if (jolt-nil? s) jolt-empty-list (loop (jolt-seq (seq-more s)))))
+      (drop-walk c s)))
 ;; A Repeat cell N elements on, without walking: an unbounded repeat is the same
 ;; seq at every position, and a bounded one just has fewer left. #f when the
 ;; cell's tail has been forced already (its count is no longer at hand) — the
@@ -2113,12 +2172,7 @@
 (define lz-drop
   (register-lazy-src! 'drop
     (lambda (n0 coll)
-     (jolt-seq
-      (let ((c (take-drop-count n0)))
-        (if (eq? c 'all)
-            (let loop ((s (jolt-seq coll)))
-              (if (jolt-nil? s) jolt-empty-list (loop (jolt-seq (seq-more s)))))
-            (drop-walk c (jolt-seq coll))))))))
+     (jolt-seq (drop-walk-count (take-drop-count n0) (jolt-seq coll))))))
 ;; clojure.lang.IDrop — the colls Clojure 1.12's drop hands the count to, eagerly,
 ;; getting back the coll's own kind of seq: PersistentVector and its ChunkedSeq,
 ;; LongRange, Repeat, StringSeq, PersistentArrayMap and its Seq. Not Range, a
@@ -2154,6 +2208,33 @@
               (if (jolt-nil? s) jolt-empty-list (drop-walk k s)))
             (if (jolt-nil? s) jolt-empty-list s)))
       (jolt-make-lazy-src lz-drop n coll)))
+
+;; clojure.core/nthrest and nthnext, as Clojure 1.12 has them: an IDrop coll is
+;; handed the count (the skip drop-walk does), anything else is stepped — through
+;; drop-walk too, whose skips land on the very cell the step loop would. Both are
+;; eager. nthrest: coll itself for n<=0, () past the end. nthnext: (seq coll) for
+;; n<=0, nil past the end; off an IDrop coll it checks n before seqing, off any
+;; other an empty coll answers nil whatever n is, as the reference's
+;; (and xs (pos? n)) does.
+(define (jolt-nthrest coll n)
+  (if (jolt-pos? n)
+      (if (idrop-coll? coll)
+          (let* ((k (idrop-count n)) (s (jolt-seq coll)))
+            (if (jolt-nil? s) jolt-empty-list (drop-walk k s)))
+          (let ((s (jolt-seq coll)))
+            (if (jolt-nil? s) jolt-empty-list (drop-walk-count (take-drop-count n) s))))
+      coll))
+(define (jolt-nthnext coll n)
+  (define (nil-if-empty r) (if (cseq? r) r jolt-nil))
+  (if (idrop-coll? coll)
+      (if (jolt-pos? n)
+          (let* ((k (idrop-count n)) (s (jolt-seq coll)))
+            (if (jolt-nil? s) jolt-nil (nil-if-empty (drop-walk k s))))
+          (jolt-seq coll))
+      (let ((s (jolt-seq coll)))
+        (cond ((jolt-nil? s) jolt-nil)
+              ((jolt-pos? n) (nil-if-empty (drop-walk-count (take-drop-count n) s)))
+              (else s)))))
 
 ;; (iterate f x) — x, (f x), (f (f x)), … as ONE lazy cell per element.
 ;; The overlay spelling, (cons x (lazy-seq (iterate f (f x)))), costs two records
