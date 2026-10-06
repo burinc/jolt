@@ -279,12 +279,6 @@
     (mapv (fn [x] (get smap x x)) coll)
     (map (fn [x] (get smap x x)) coll)))
 
-(defn nthnext [coll n]
-  (loop [n n xs (seq coll)]
-    (if (and xs (pos? n))
-      (recur (dec n) (next xs))
-      xs)))
-
 (defn bounded-count [n coll]
   (if (counted? coll)
     (count coll)
@@ -297,17 +291,6 @@
 (defn completing
   ([f] (completing f identity))
   ([f cf] (fn ([] (f)) ([x] (cf x)) ([x y] (f x y)))))
-
-;; Matches Clojure exactly: n<=0 returns coll unchanged; for n>0 the walk yields
-;; (seq xs), and an exhausted/nil walk falls back to () via (or ... ()) — so
-;; (nthrest nil 100) is () (not nil), while (nthrest nil 0) is nil.
-(defn nthrest [coll n]
-  (if (pos? n)
-    (or (loop [n n xs coll]
-          (let [s (and (pos? n) (seq xs))]
-            (if s (recur (dec n) (rest s)) (seq xs))))
-        (list))
-    coll))
 
 (defn abs [x] (if (neg? x) (- 0 x) x))
 
