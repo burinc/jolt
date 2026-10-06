@@ -1406,8 +1406,20 @@
                            ((not (nio-dest-present? s)) (nio-no-such-file (nio-shown src)))
                            ((and (nio-dest-present? d) (not (nio-opts-have? opts copt-sym 'replace-existing)))
                             (nio-already-exists (nio-shown dst)))
-                           (else (when (nio-dest-present? d) (nio-delete1 d #t))
-                                 (nio-fs-call s (lambda () (rename-file s d)) (nio-shown src)) (->path dst)))))))))
+                           (else
+                            ;; The JDK removes the target first and reports a
+                            ;; target it cannot remove as AccessDeniedException
+                            ;; naming the TARGET. nio-delete1's delete-file fails
+                            ;; silently, so a held target (Windows AV, a handle
+                            ;; without share-delete) or an unwritable directory
+                            ;; reached rename-file still in place, and came back as
+                            ;; "File exists" on Windows and a FileSystemException
+                            ;; naming the source on POSIX (jolt-lang/jolt#1263).
+                            (when (nio-dest-present? d)
+                              (nio-delete1 d #t (nio-shown dst))
+                              (when (nio-dest-present? d)
+                                (nio-fs-throw "java.nio.file.AccessDeniedException" (nio-shown dst))))
+                            (nio-fs-call s (lambda () (rename-file s d)) (nio-shown src)) (->path dst)))))))))
   (set! files-accum-chunks (cons files-create+move files-accum-chunks)))
 
 ;; ---- nofollow timestamps (the link's own mtime, via lstat/lutimes) ----------
