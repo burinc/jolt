@@ -126,6 +126,29 @@ if [ "$got" != "5 8 1" ] || [ "$rc" != "0" ]; then
   echo "  FAIL: exports — want '5 8 1' rc 0, got '$got' rc $rc"; exit 1
 fi
 
+# Code that is compiled and then dropped frees code chunks, and new code reuses
+# the space. On macOS arm64 the library keeps code in one aligned region
+# (host/chez/stub/jolt_code_region.h, jolt#1246) through its own hidden mmap and
+# munmap, so this is the path that recycles region ranges.
+echo "build-lib smoke: compiling and dropping code inside the library"
+if ! cc -O2 "$app/driver-churn.c" -ldl -o "$work/driver-churn" 2>"$work/driver-churn.err"; then
+  echo "  FAIL: churn driver compile failed"; cat "$work/driver-churn.err"; exit 1
+fi
+got="$("$work/driver-churn" "$lib" 2>&1)"; rc=$?
+if [ "$got" != "1" ] || [ "$rc" != "0" ]; then
+  echo "  FAIL: code churn, want '1' rc 0, got '$got' rc $rc"; exit 1
+fi
+# The region's mmap/munmap must bind the kernel's calls (defined in the image)
+# without being exported, or they would stand in for the host's own.
+if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] && command -v nm >/dev/null 2>&1; then
+  if ! nm -m "$lib" | grep -qE 'non-external .* _mmap$'; then
+    echo "  FAIL: no library-local _mmap; the code region is not linked in"; exit 1
+  fi
+  if nm -gU "$lib" | grep -qE ' _(mmap|munmap)$'; then
+    echo "  FAIL: the library exports mmap/munmap"; nm -gU "$lib" | grep -E ' _(mmap|munmap)$'; exit 1
+  fi
+fi
+
 # The #1234 handoff: release the init thread, park it in host code while a
 # thread the embedder started calls a :collect-safe export that allocates, then
 # shut down from the released thread. Before jolt_library_release_thread the
@@ -145,4 +168,4 @@ case "$(uname -s)" in
     fi ;;
 esac
 
-echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup, and a released init thread)"
+echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup, code churn, and a released init thread)"

@@ -3669,12 +3669,21 @@
     (put-string p (bld-source-string "host/chez/stub/jolt_zlib.h"))
     (close-port p)))
 
+;; Write host/chez/stub/jolt_code_region.h into DIR, beside the library stub that
+;; #includes it: on macOS arm64 it keeps the library's code in one aligned region
+;; (jolt#1246). Embedded and read the same way as jolt_zlib.h.
+(define (bld-write-code-region-header! dir)
+  (let ((p (open-output-file (string-append dir "/jolt_code_region.h") 'replace)))
+    (put-string p (bld-source-string "host/chez/stub/jolt_code_region.h"))
+    (close-port p)))
+
 (define (bld-library-stub)
   (string-append
     "#include \"scheme.h\"\n"
     "#include \"jolt_zlib.h\"\n"
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
+    "#include \"jolt_code_region.h\"\n"
     (bld-boot-prefetch-defn)
     "/* jolt_set_lookup_addr is called from the built library's scheme-start\n"
     "   handler (registered via Sforeign_symbol after Sbuild_heap) to hand the\n"
@@ -3749,6 +3758,7 @@
       (close-port p))
     (bld-clear-output! out-path)
     (bld-write-zlib-header! builddir)
+    (bld-write-code-region-header! builddir)
     (bld-system (string-append
       (bld-cc) " " (bld-arch-flag) " -O2 -fPIC "
       ;; -install_name @rpath/<base> so a binary that link-edits against the dylib

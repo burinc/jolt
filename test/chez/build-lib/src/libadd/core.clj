@@ -40,3 +40,19 @@
   (let [v (mapv inc (range 256))]
     (+ n (count v))))
 (ffi/export! "alloc_work" alloc-work [:int] :int :collect-safe)
+
+;; code_churn compiles and drops thousands of small functions, collecting after
+;; each round, so the Chez kernel frees code chunks and allocates new ones. On
+;; macOS arm64 that runs through the library's code region (jolt#1246), whose
+;; freed ranges are reused; this answers 1 when every compiled function still
+;; computes the right thing.
+(defn code-churn [rounds]
+  (if (every? true?
+              (for [r (range rounds)]
+                (let [fs (mapv (fn [k] (eval (list 'fn ['x] (list '+ 'x k r)))) (range 1500))
+                      ok (= (mapv #(% 1) fs) (mapv #(+ 1 % r) (range 1500)))]
+                  (System/gc)
+                  ok)))
+    1
+    0))
+(ffi/export! "code_churn" code-churn [:int] :int)
