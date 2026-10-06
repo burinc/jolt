@@ -19,7 +19,15 @@
 ;; --- jolt.host primitives ----------------------------------------------------
 ;; A tagged-table: a string-keyed hashtable (keyword field -> value). Keyword
 ;; keys collapse to their ns/name string so interning isn't relied on.
-(define-record-type htable (fields (immutable h)) (nongenerative chez-htable-v1))
+;; `hc` caches a sorted coll's hash (#f until asked): the wrapper is immutable
+;; data once minted, so the hash is a pure function of it, like the hasheq slot a
+;; pmap carries. A racing pair of writers store the same fixnum. An htable never
+;; travels in a state image as itself (its string hashtable cannot be fasl'd; a
+;; sorted coll is rebuilt from its entries), so the layout change needs no
+;; legacy arm.
+(define-record-type (htable make-htable* htable?)
+  (fields (immutable h) (mutable hc)) (nongenerative chez-htable-v2))
+(define (make-htable h) (make-htable* h #f))
 (define (kw->key k)
   (let ((ns (keyword-t-ns k)))
     (if (and ns (not (jolt-nil? ns))) (string-append ns "/" (keyword-t-name k)) (keyword-t-name k))))
@@ -106,6 +114,7 @@
 (define kw-cmp-fn (keyword #f "cmp-fn"))
 (define kw-op-count (keyword #f "count"))
 (define kw-op-seq (keyword #f "seq"))
+(define kw-op-rseq (keyword #f "rseq"))
 (define kw-op-first (keyword #f "first"))
 (define kw-op-get (keyword #f "get"))
 (define kw-op-contains (keyword #f "contains"))
@@ -121,29 +130,100 @@
 (define (sc-op sc op-kw) (jolt-get (jolt-ref-get sc kw-ops) op-kw jolt-nil))
 (define (sc-call sc op-kw . args) (apply jolt-invoke (sc-op sc op-kw) sc args))
 
+;; --- the in-order walk over the red-black tree -------------------------------
+;; A node is the 5-slot vector [color key val left right] 25-sorted.clj builds;
+;; nil children are jolt-nil. The walk is Clojure's PersistentTreeMap$Seq: a stack
+;; of the nodes still to visit, whose top is the next one out, so the head is
+;; O(log n) away and every later step is amortized O(1). It is done here rather
+;; than in 25-sorted.clj because a per-node lazy cell written in Clojure cost
+;; 1.5x the old eager walk end to end (jolt-r8tz.7); filling a chunk of up to 32
+;; projected nodes per step in Scheme beats the eager walk instead, and the result
+;; is still a lazy seq — `first`/`take` touch one chunk, not the tree.
+(define kw-tree (keyword #f "tree"))
+(define kw-cnt (keyword #f "cnt"))
+(define kw-cmp (keyword #f "cmp"))
+(define (sc-nd-key n) (pvec-nth-in-range n 1))
+(define (sc-nd-val n) (pvec-nth-in-range n 2))
+(define (sc-nd-left n) (pvec-nth-in-range n 3))
+(define (sc-nd-right n) (pvec-nth-in-range n 4))
+;; push n and its whole near-side spine: the left one walking up, the right one down
+(define (sc-push-spine n asc? stack)
+  (if (jolt-nil? n)
+      stack
+      (sc-push-spine (if asc? (sc-nd-left n) (sc-nd-right n)) asc? (cons n stack))))
+;; what a node walks as. mode 0: a map entry (PersistentTreeMap$Seq); 1: its key
+;; (a sorted set's seq, or (keys m) — APersistentMap$KeySeq); 2: its val (ValSeq).
+(define (sc-node-proj n mode)
+  (cond ((fx=? mode 0) (make-map-entry (sc-nd-key n) (sc-nd-val n)))
+        ((fx=? mode 1) (sc-nd-key n))
+        (else (sc-nd-val n))))
+(define (sc-mode-kind mode)
+  (cond ((fx=? mode 0) sk-treemap-seq) ((fx=? mode 1) sk-key-seq) (else sk-val-seq)))
+(define sc-walk-chunk 32)
+;; The seq of what is left on STACK: a ChunkedCons-shaped cell over the next
+;; <=32 nodes, flavored as the tree seq it is (so chunked-seq? stays false, as it
+;; is on the JVM, while reduce still runs the chunk in vec-reduce's loop), whose
+;; after-chunk rest is a lazy seq over the stack that remains. The stack and the
+;; packed walk (mode*2 + ascending?) are the lazy-src's data, so a seq caught
+;; half-walked by a state image restores still lazy.
+(define (sc-stack->seq stack code)
+  (if (null? stack)
+      jolt-nil
+      (let ((asc? (fx=? (fxand code 1) 1)) (mode (fxsrl code 1))
+            (buf (make-vector sc-walk-chunk)))
+        (let loop ((i 0) (st stack))
+          (if (or (null? st) (fx=? i sc-walk-chunk))
+              (cseq-chunked/k (make-pvec (if (fx=? i sc-walk-chunk) buf (vec-copy-range buf 0 i)))
+                              0
+                              (if (null? st) jolt-nil (jolt-make-lazy-src lz-sorted-walk st code))
+                              (sc-mode-kind mode))
+              (let ((n (car st)))
+                (vector-set! buf i (sc-node-proj n mode))
+                (loop (fx+ i 1)
+                      (sc-push-spine (if asc? (sc-nd-right n) (sc-nd-left n)) asc? (cdr st)))))))))
+(define lz-sorted-walk
+  (register-lazy-src! 'sorted-walk (lambda (st code) (sc-stack->seq st code))))
+(define (sc-walk-code asc? mode) (fx+ (fx* mode 2) (if asc? 1 0)))
+;; the whole tree, ascending or descending
+(define (sc-tree-seq tree asc? mode)
+  (sc-stack->seq (sc-push-spine tree asc? '()) (sc-walk-code asc? mode)))
+;; PersistentTreeMap.seqFrom: the walk from the first key at or past K in the
+;; walk's direction, nil when there is none. The comparator is called the way
+;; seqFrom calls it, (cmp k node-key).
+(define (sc-tree-seq-from tree asc? mode cmp k)
+  (let loop ((t tree) (stack '()))
+    (if (jolt-nil? t)
+        (sc-stack->seq stack (sc-walk-code asc? mode))
+        (let ((c (jolt-invoke cmp k (sc-nd-key t))))
+          (cond ((zero? c) (sc-stack->seq (cons t stack) (sc-walk-code asc? mode)))
+                (asc? (if (negative? c) (loop (sc-nd-left t) (cons t stack)) (loop (sc-nd-right t) stack)))
+                (else (if (positive? c) (loop (sc-nd-right t) (cons t stack)) (loop (sc-nd-left t) stack))))))))
+(def-var! "jolt.host" "sorted-seq"
+  (lambda (tree asc? mode) (sc-tree-seq tree (jolt-truthy? asc?) mode)))
+(def-var! "jolt.host" "sorted-seq-from"
+  (lambda (tree asc? mode cmp k) (sc-tree-seq-from tree (jolt-truthy? asc?) mode cmp k)))
+;; every node, in order, satisfies pred (stops at the first that does not)
+(define (sc-tree-every? t pred)
+  (or (jolt-nil? t)
+      (and (sc-tree-every? (sc-nd-left t) pred)
+           (pred t)
+           (sc-tree-every? (sc-nd-right t) pred))))
+(define (sc-tree-fold t f acc)
+  (if (jolt-nil? t)
+      acc
+      (sc-tree-fold (sc-nd-right t) f (f t (sc-tree-fold (sc-nd-left t) f acc)))))
+
 ;; --- extend the collection dispatchers with a sorted arm ---------------------
-;; A sorted coll's seq is clojure.lang.PersistentTreeMap$Seq, and the :seq op hands
-;; back a seq over the vector it materialized the tree into — which is flavored as
-;; a vector's own ChunkedSeq. Re-labelling it is O(1) and copies nothing: a
-;; vector-backed cell derives its whole tail from (cvec, ci) and propagates its
-;; flavor down, so one fresh cell over the SAME backing vector re-labels the entire
-;; chain. Any other shape is left as it is rather than guessed at.
-(register-seq-arm! htable-sorted?
-  (lambda (x)
-    (let ((s (sc-call x kw-op-seq)))
-      (if (and (cseq? s) (cseq-cvec s) (not (cseq-crest s)))
-          ;; a sorted SET seqs as the keys of its backing tree, so it is a KeySeq
-          ;; there and not a $Seq — PersistentTreeSet.seq is RT.keys(impl.seq()).
-          (vec->seq/k (cseq-cvec s) (cseq-ci s)
-                      (if (htable-sorted-set? x) sk-key-seq sk-treemap-seq))
-          s))))
+;; A sorted coll's seq is the :seq op's: the lazy walk above, already flavored
+;; (a map's is a PersistentTreeMap$Seq, a set's an APersistentMap$KeySeq —
+;; PersistentTreeSet.seq is RT.keys(impl.seq())).
+(register-seq-arm! htable-sorted? (lambda (x) (sc-call x kw-op-seq)))
 ;; first on a sorted collection answers from the tree's leftmost node — the :first
 ;; op is an O(log n) spine walk (25-sorted.clj). Without this arm it went through
 ;; the generic (seq-first (jolt-seq x)), and the :seq op materializes the WHOLE
 ;; tree into a vector before the head can be read: 190ms against the reference's
 ;; 0.4us over 200k entries. Clojure answers the same question through
-;; PersistentTreeMap.min(). The generic path stays for everything else, so
-;; take/subseq still pay the materialization (bead jolt-r8tz.7).
+;; PersistentTreeMap.min(). It still saves building the first chunk of the walk.
 (register-first-arm! htable-sorted? (lambda (x) (sc-call x kw-op-first)))
 (register-count-arm! htable-sorted?
   (lambda (coll) (sc-call coll kw-op-count)))
@@ -168,13 +248,14 @@
 (define %h-keys jolt-keys)
 (set! jolt-keys (lambda (m)
   (if (htable-sorted-map? m)
-      (list->cseq (map (lambda (e) (jolt-nth e 0)) (seq->list (sc-call m kw-op-seq))))
+      (sc-tree-seq (jolt-ref-get m kw-tree) #t 1)
       (%h-keys m))))
 (define %h-vals jolt-vals)
 (set! jolt-vals (lambda (m)
   (if (htable-sorted-map? m)
-      (list->cseq (map (lambda (e) (jolt-nth e 1)) (seq->list (sc-call m kw-op-seq))))
+      (sc-tree-seq (jolt-ref-get m kw-tree) #t 2)
       (%h-vals m))))
+;; keys/vals walk the tree lazily as the KeySeq/ValSeq they are on the JVM.
 ;; sorted colls carry collection metadata like the natives-meta collections. htable?
 ;; is only in scope here (host-table loads after natives-meta), so with-meta/meta-copy
 ;; are extended by set!. A fresh-identity shallow copy of the inner table keys meta off
@@ -186,7 +267,7 @@
         (let ((h (make-hashtable string-hash string=?)))
           (vector-for-each (lambda (k) (hashtable-set! h k (hashtable-ref (htable-h x) k #f)))
                            (hashtable-keys (htable-h x)))
-          (make-htable h))
+          (make-htable* h (htable-hc x)))
         (%ht-meta-copy x))))
 (define %ht-with-meta jolt-with-meta)
 (set! jolt-with-meta
@@ -230,22 +311,80 @@
 ;; A sorted coll canonicalizes like its unordered counterpart:
 ;; a sorted-map equals ANY map (hash or sorted) with the same entries, a
 ;; sorted-set ANY set with the same elements — the comparator is irrelevant to =.
-;; Convert to the plain persistent coll and delegate to the prior jolt=2 / hash.
-;; (htable-sorted? short-circuits on a non-htable BEFORE any jolt=2, so extending
-;; jolt=2 here doesn't recurse: the inner tag compare gets two keywords.)
+;; The general answer converts to the plain persistent coll and delegates to the
+;; prior jolt=2. (htable-sorted? short-circuits on a non-htable BEFORE any jolt=2,
+;; so extending jolt=2 here doesn't recurse: the inner tag compare gets two
+;; keywords.)
 (define (sorted-map->pmap sc)
-  (fold-left (lambda (m e) (pmap-assoc m (jolt-nth e 0) (jolt-nth e 1)))
-             empty-pmap (seq->list (sc-call sc kw-op-seq))))
+  (sc-tree-fold (jolt-ref-get sc kw-tree)
+                (lambda (n m) (pmap-assoc m (sc-nd-key n) (sc-nd-val n))) empty-pmap))
 (define (sorted-set->pset sc)
-  (fold-left (lambda (s x) (pset-conj s x)) empty-pset (seq->list (sc-call sc kw-op-seq))))
+  (sc-tree-fold (jolt-ref-get sc kw-tree) (lambda (n s) (pset-conj s (sc-nd-key n))) empty-pset))
 (define (sorted->plain x) (if (htable-sorted-map? x) (sorted-map->pmap x) (sorted-set->pset x)))
-;; a sorted coll compares as its plain equivalent: normalize and re-dispatch (the
-;; normalized values aren't sorted, so this arm won't re-match — the base compares).
+;; The common pairings answer without building anything, the way APersistentMap /
+;; APersistentSet.equiv do: counts first, then one walk of the sorted tree. Against
+;; a hash coll each node is probed there (hash lookup, the same test the converted
+;; compare made); against a sorted coll with the SAME comparator the two trees walk
+;; in lockstep, which is O(n) with no comparator calls at all. 'eq / 'ne, or #f to
+;; fall back to the conversion (a different comparator, a record, a Java map, …).
+(define (sc-count x) (jolt-ref-get x kw-cnt))
+(define (sorted-fast= s o)
+  (define (verdict b) (if b 'eq 'ne))
+  (define (same-cmp? o) (eq? (jolt-ref-get s kw-cmp-fn) (jolt-ref-get o kw-cmp-fn)))
+  (define (lockstep node=?)
+    (let loop ((sa (sc-push-spine (jolt-ref-get s kw-tree) #t '()))
+               (sb (sc-push-spine (jolt-ref-get o kw-tree) #t '())))
+      (cond ((null? sa) (null? sb))
+            ((null? sb) #f)
+            (else (let ((na (car sa)) (nb (car sb)))
+                    (and (node=? na nb)
+                         (loop (sc-push-spine (sc-nd-right na) #t (cdr sa))
+                               (sc-push-spine (sc-nd-right nb) #t (cdr sb)))))))))
+  (if (htable-sorted-map? s)
+      (cond
+        ((pmap? o)
+         (verdict (and (eqv? (sc-count s) (pmap-cnt o))
+                       (sc-tree-every? (jolt-ref-get s kw-tree)
+                         (lambda (n) (let ((p (pmap-entry-at o (sc-nd-key n))))
+                                       (and p (jolt=2 (sc-nd-val n) (cdr p)))))))))
+        ((and (htable-sorted-map? o) (not (eqv? (sc-count s) (sc-count o)))) 'ne)
+        ((and (htable-sorted-map? o) (same-cmp? o))
+         (verdict (lockstep (lambda (a b) (and (jolt=2 (sc-nd-key a) (sc-nd-key b))
+                                               (jolt=2 (sc-nd-val a) (sc-nd-val b)))))))
+        (else #f))
+      (cond
+        ((pset? o)
+         (verdict (and (eqv? (sc-count s) (pset-count o))
+                       (sc-tree-every? (jolt-ref-get s kw-tree)
+                         (lambda (n) (pset-contains? o (sc-nd-key n)))))))
+        ((and (htable-sorted-set? o) (not (eqv? (sc-count s) (sc-count o)))) 'ne)
+        ((and (htable-sorted-set? o) (same-cmp? o))
+         (verdict (lockstep (lambda (a b) (jolt=2 (sc-nd-key a) (sc-nd-key b))))))
+        (else #f))))
 (register-eq-arm! (lambda (a b) (or (htable-sorted? a) (htable-sorted? b)))
-                  (lambda (a b) (jolt=2 (if (htable-sorted? a) (sorted->plain a) a)
-                                        (if (htable-sorted? b) (sorted->plain b) b))))
-;; a sorted coll hashes as its plain equivalent (jolt-hash recurses through the base).
-(register-hash-arm! htable-sorted? (lambda (x) (jolt-hash (sorted->plain x))))
+                  (lambda (a b)
+                    (let ((v (if (htable-sorted? a) (sorted-fast= a b) (sorted-fast= b a))))
+                      (if v
+                          (eq? v 'eq)
+                          ;; a sorted coll compares as its plain equivalent: normalize
+                          ;; and re-dispatch (the normalized values aren't sorted, so
+                          ;; this arm won't re-match — the base compares).
+                          (jolt=2 (if (htable-sorted? a) (sorted->plain a) a)
+                                  (if (htable-sorted? b) (sorted->plain b) b))))))
+;; A sorted coll hashes as its plain equivalent — Murmur3.hashUnordered over its
+;; entries (each the ordered hash of [k v]) or its elements, exactly the folds
+;; jolt-coll-hash runs over a pmap / pset — computed by folding the tree and cached
+;; on the wrapper, as APersistentMap caches _hasheq.
+(define (sorted-hash x)
+  (or (htable-hc x)
+      (let* ((t (jolt-ref-get x kw-tree))
+             (sum (if (htable-sorted-map? x)
+                      (sc-tree-fold t (lambda (n acc) (add32 acc (entry-hasheq (sc-nd-key n) (sc-nd-val n)))) 0)
+                      (sc-tree-fold t (lambda (n acc) (+ acc (jolt-hasheq (sc-nd-key n)))) 0)))
+             (h (mix-coll-hash sum (sc-count x))))
+        (htable-hc-set! x h)
+        h)))
+(register-hash-arm! htable-sorted? sorted-hash)
 
 ;; --- printing ----------------------------------------------------------------
 ;; sorted colls render in SORTED order (the value's :seq), not HAMT order; a

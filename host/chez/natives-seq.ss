@@ -325,9 +325,8 @@
        (if (fx=? n 0) jolt-nil (vec->rseq coll (fx- n 1)))))
     ;; a sorted coll's descending seq is still a PersistentTreeMap$Seq on the JVM
     ;; (the same class with ascending=false), not an RSeq — that one is the vector's.
-    ((htable-sorted? coll)
-     (list->cseq/k (reverse (seq->list (jolt-seq coll)))
-                   (if (htable-sorted-set? coll) sk-key-seq sk-treemap-seq)))
+    ;; The :rseq op is the lazy walk run right to left (host-table.ss).
+    ((htable-sorted? coll) (sc-call coll kw-op-rseq))
     ;; a deftype/record implementing clojure.lang.Reversible (rseq) — e.g.
     ;; data.priority-map — drives rseq through its own method.
     ((and (jrec? coll) (find-method-any-protocol (jrec-tag coll) "rseq"))
