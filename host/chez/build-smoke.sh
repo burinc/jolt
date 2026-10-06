@@ -1808,6 +1808,12 @@ fi
 # Say which of the two things was actually proved, so a green run from a dev
 # jolt is not mistaken for coverage of the stub-carrying case.
 if grep -q 'self-contained' "$(dirname "$out")/gzip-plain.log"; then
+  # A stub-carrying jolt also carries the kernel, so --signable compiles in
+  # process and links against that — no Chez install, only cc (#1255).
+  if ! grep -q 'embedded kernel, cc-linked' "$sgout.log"; then
+    echo "  FAIL: this jolt carries the kernel, but --signable did not link against it"
+    tail -5 "$sgout.log"; exit 1
+  fi
   echo "  (this jolt carries the embedded stub: --signable diverted it off that path)"
 else
   echo "  (this jolt carries no embedded stub: both paths are cc-linked here)"

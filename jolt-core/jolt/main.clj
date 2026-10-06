@@ -1089,9 +1089,9 @@
             target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))
             ;; --signable: an ordinary, same-machine executable build still
             ;; produces a structurally complete (and therefore strictly
-            ;; signable) binary by routing through the same spawned-cc path
-            ;; --target cross-compiling always uses, rather than appending the
-            ;; boot image past this jolt's own embedded launcher stub. A
+            ;; signable) binary by cc-linking the boot in as a C array (against
+            ;; this jolt's own embedded kernel when it carries one), rather than
+            ;; appending the boot image past its embedded launcher stub. A
             ;; self-contained jolt's default output has most of its bytes
             ;; outside its own Mach-O/PE/ELF image, which a strict signature
             ;; check (codesign --verify --strict on macOS) correctly refuses.
@@ -1176,8 +1176,8 @@
      "                         outside its own Mach-O/PE/ELF image, which a strict"
      "                         signature check (codesign --verify --strict on"
      "                         macOS) refuses; --signable produces a structurally"
-     "                         complete binary instead, at the cost of spawning a"
-     "                         separate Chez process and needing a C toolchain"
+     "                         complete binary instead, at the cost of needing a"
+     "                         C compiler to link it"
      "                         (no effect on --library, always structurally"
      "                         complete, or on a --target build, already forced"
      "                         onto this same path)"

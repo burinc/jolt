@@ -120,8 +120,17 @@
 ;; --target cross-compiling always takes, since the in-process compiler
 ;; can't load a target's xpatch); --signable is what makes it reachable for
 ;; an ordinary, same-machine, non-cross build too, without requiring a
-;; source checkout that happens not to carry the stub.
+;; source checkout that happens not to carry the stub. A jolt that carries the
+;; kernel files (bld-embedded-kernel?) takes build-self-contained-cc instead:
+;; the in-process compile, then the same cc link against its own kernel, so
+;; it needs a C compiler but no Chez install (jolt#1255).
 (define bld-signable (make-parameter #f))
+;; Does this process carry everything a cc link needs in place of a Chez install
+;; — the boots, scheme.h and libkernel.a (the self-contained jolt does)? Then a
+;; --signable build compiles in process and needs only the C compiler.
+(define (bld-embedded-kernel?)
+  (for-all jolt-embedded-bytes
+           '("stub/launcher" "csv/petite.boot" "csv/scheme.boot" "csv/scheme.h" "csv/libkernel.a")))
 ;; deps.edn :jolt/build {:exclude-resources [glob …]}: dependency-root files
 ;; NOT to bake into the binary (bld-dep-resources), as a list of glob strings.
 (define bld-exclude-resources (make-parameter '()))
@@ -1918,11 +1927,17 @@
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
   ;; always takes build-shared, any cross build takes a spawned cc path, and
-  ;; --signable forces that same spawned-cc path for an ordinary executable, so
-  ;; all three need the toolchain even from the self-contained jolt.
-  (when (or library? (bld-cross?) (bld-signable)
+  ;; --signable needs the same cc link for an ordinary executable — but a jolt
+  ;; carrying the kernel files (bld-embedded-kernel?) compiles in process and
+  ;; links against those, so there it needs only a C compiler (jolt#1255).
+  (when (or library? (bld-cross?)
+           (and (bld-signable) (not (bld-embedded-kernel?)))
            (not (jolt-embedded-bytes "stub/launcher")))
     (bld-check-toolchain))
+  (when (and (bld-signable) (not library?) (not (bld-cross?)) (bld-embedded-kernel?)
+             (not (bld-have-cc?)))
+    (error 'jolt-build
+      "--signable links the executable with a C compiler (JOLT_CC, or cc on PATH); install one (on macOS: xcode-select --install)."))
   ;; Static natives have to be loaded into this HOST process while the app is
   ;; emitted, so a target-architecture archive cannot be supported merely by
   ;; handing it to the target linker. Refuse before bld-preload-static-natives!
@@ -2441,12 +2456,15 @@
         ;;    embedded stub. No external Chez, no cc. The appended boot has no
         ;;    Mach-O/PE/ELF structure of its own, so a strict signature check
         ;;    (codesign --verify --strict on macOS) correctly refuses it.
-        ;;  - CC-LINKED (dev bin/jolt, any --target cross-compile, or an
-        ;;    explicit --signable): spawn a fresh Chez for compile-file/
+        ;;  - CC-LINKED (dev bin/jolt, any --target cross-compile, or --signable
+        ;;    from a jolt without the kernel): spawn a fresh Chez for compile-file/
         ;;    make-boot-file, then xxd the boot into a C array and cc-link against
         ;;    libkernel.a. Produces a structurally complete binary a strict
         ;;    signature check accepts. Kept so `make buildsmoke` still exercises
         ;;    the cc path even when run from a self-contained jolt.
+        ;;  - EMBEDDED-KERNEL CC (--signable from a self-contained jolt): the
+        ;;    in-process compile of the first path, the C-array link of the
+        ;;    second, against the kernel this jolt carries — cc, but no Chez.
         (cond
           ;; Cross-compiling (--target) always takes a spawned cc path: the
           ;; self-contained in-process compile can't load a target xpatch, and the
@@ -2464,6 +2482,12 @@
           ;; even though this jolt carries the embedded stub. Checked before
           ;; the stub branch below so it wins regardless of which jolt is
           ;; running it from.
+          ;; A self-contained jolt compiles in process and links against the
+          ;; kernel it carries (jolt#1255): no Chez install, just cc.
+          ((and (bld-signable) (bld-embedded-kernel?))
+           (build-self-contained-cc entry-ns out-path mode builddir units boot boot-h main-c
+                                    (bld-native-link-flags natives)
+                                    (and drop-compiler? (not bld-nt?))))
           ((bld-signable)
            (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
                           (bld-native-link-flags natives)
@@ -3397,12 +3421,102 @@
 ;;              defines are jv$-munged and so cannot shadow a Chez name) and no
 ;;              fingerprint (the runtime unit carries the one that identifies it).
 (define (build-self-contained entry-ns out-path mode builddir units boot native-link petite-only?)
+  (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, self-contained)\n"))
+  (let ((boot (bld-self-contained-boot! mode builddir units boot petite-only?)))
+    ;; The stub is the native launcher the boot is appended to. With no :static
+    ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
+    ;; natives it's re-linked here from the bundled kernel + launcher source so the
+    ;; archives are baked in and their symbols resolve in the running binary.
+    (bld-clear-output! out-path)
+    (if (> (string-length native-link) 0)
+        (bld-relink-stub builddir native-link out-path)
+        (jolt-spill-embedded! "stub/launcher" out-path))
+    ;; link: stub bytes ++ boot ++ frame, then make it executable.
+    (jolt-append-payload! out-path (read-file-bytes boot))
+    (jolt-chmod-755 out-path)
+    (ei-mark! "stub + payload link")
+    (display (string-append "jolt build: wrote " out-path "\n"))
+    (when bld-osx?
+      (display (string-append
+                 "jolt build: note — on macOS this binary is unsigned; to share it,\n"
+                 "  `xattr -d com.apple.quarantine " out-path "` on the target, or sign it.\n")))))
+
+;; --signable from a self-contained jolt (jolt#1255): the same in-process compile
+;; as build-self-contained, but the boot goes into the executable as a C array
+;; linked against the kernel this jolt carries — the link build-with-cc performs,
+;; with the bundled scheme.h, libkernel.a and lz4/zlib archives standing in for a
+;; Chez install. The result is structurally complete, so a strict signature check
+;; accepts it, and the only tool it needs is the system C compiler.
+(define (build-self-contained-cc entry-ns out-path mode builddir units boot boot-h main-c native-link petite-only?)
+  (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, embedded kernel, cc-linked)\n"))
+  (let ((boot (bld-self-contained-boot! mode builddir units boot petite-only?))
+        (lk (string-append builddir "/libkernel.a"))
+        (archives (bld-spill-bundled-archives builddir)))
+    (jolt-spill-embedded! "csv/scheme.h" (string-append builddir "/scheme.h"))
+    (jolt-spill-embedded! "csv/libkernel.a" lk)
+    (bld-write-boot-header! boot boot-h)
+    (ei-mark! "boot C array")
+    (bld-write-exe-main! main-c)
+    (bld-clear-output! out-path)
+    ;; bld-link-executable: the spilled kernel is not PIC (see bld-relink-stub).
+    (parameterize ((bld-bundled-archives archives))
+      (bld-link-executable (bld-cc)
+        (lambda (extra)
+          (string-append
+            (bld-cc) " -O2 " (if (> (string-length native-link) 0) (bld-export-symbols-flag) "") extra
+            "-I'" builddir "' '" main-c "' '" lk "' "
+            "-o '" out-path "' " native-link " " (bld-link-libs)))
+        (string-append builddir "/link.log")))
+    (ei-mark! "cc link")
+    (display (string-append "jolt build: wrote " out-path "\n"))))
+
+;; Write BOOT into header H as `unsigned char jolt_boot[]` + `unsigned int
+;; jolt_boot_len` — what xxd -i plus the symbol rename produce for build-with-cc,
+;; without needing xxd on a machine that has nothing but a C compiler.
+(define bld-hex-bytes
+  (let ((v (make-vector 256)))
+    (do ((i 0 (fx+ i 1))) ((fx= i 256) v)
+      (vector-set! v i (string-append "0x" (if (fx< i 16) "0" "")
+                                      (number->string i 16) ",")))))
+(define (bld-write-boot-header! boot h)
+  (let* ((bv (read-file-bytes boot))
+         (n (bytevector-length bv))
+         (p (open-output-file h 'replace)))
+    (put-string p "unsigned char jolt_boot[] = {\n")
+    (do ((i 0 (fx+ i 1))) ((fx= i n))
+      (put-string p (vector-ref bld-hex-bytes (bytevector-u8-ref bv i)))
+      (when (fx= (fxand i 15) 15) (put-char p #\newline)))
+    (put-string p (string-append "\n};\nunsigned int jolt_boot_len = " (number->string n) ";\n"))
+    (close-port p)))
+
+;; The cc-linked executable's main: boot the C-array image and start it. Writes
+;; jolt_zlib.h beside it, which it includes.
+(define (bld-write-exe-main! main-c)
+  (let ((mc (open-output-file main-c 'replace)))
+    (put-string mc
+      (string-append
+        "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
+        (bld-boot-prefetch-defn)
+        "int main(int argc, char *argv[]) {\n"
+        (bld-boot-prefetch-call)
+        "  Sscheme_init(0);\n"
+        "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
+        "  Sbuild_heap(0, jolt_register_zlib);\n"
+        "  int status = Sscheme_start(argc, (const char **)argv);\n"
+        "  Sscheme_deinit();\n  return status;\n}\n"))
+    (close-port mc))
+  (bld-write-zlib-header! (path-parent main-c)))
+
+;; Compile UNITS and make the app's boot IN THIS PROCESS from the Chez boots this
+;; jolt carries, answering the boot to embed (the vfasl image when conversion
+;; succeeded, else BOOT). Shared by the appended-stub link (build-self-contained)
+;; and the cc link of a --signable build (build-self-contained-cc).
+(define (bld-self-contained-boot! mode builddir units boot petite-only?)
   (let ((petite (string-append builddir "/petite.boot"))
         (scheme (string-append builddir "/scheme.boot"))
         (rt-key #f))
     (jolt-spill-embedded! "csv/petite.boot" petite)
     (unless petite-only? (jolt-spill-embedded! "csv/scheme.boot" scheme))
-    (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, self-contained)\n"))
     (for-each
       (lambda (u)
         (let ((src (car u)) (so (cadr u)) (kind (caddr u)))
@@ -3458,23 +3572,7 @@
           ((bld-vfasl-convert! boot vboot)
            (set! boot vboot)
            (ei-mark! "vfasl-convert")))))
-    ;; The stub is the native launcher the boot is appended to. With no :static
-    ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
-    ;; natives it's re-linked here from the bundled kernel + launcher source so the
-    ;; archives are baked in and their symbols resolve in the running binary.
-    (bld-clear-output! out-path)
-    (if (> (string-length native-link) 0)
-        (bld-relink-stub builddir native-link out-path)
-        (jolt-spill-embedded! "stub/launcher" out-path))
-    ;; link: stub bytes ++ boot ++ frame, then make it executable.
-    (jolt-append-payload! out-path (read-file-bytes boot))
-    (jolt-chmod-755 out-path)
-    (ei-mark! "stub + payload link")
-    (display (string-append "jolt build: wrote " out-path "\n"))
-    (when bld-osx?
-      (display (string-append
-                 "jolt build: note — on macOS this binary is unsigned; to share it,\n"
-                 "  `xattr -d com.apple.quarantine " out-path "` on the target, or sign it.\n")))))
+    boot))
 
 ;; Spill whichever bundled compression archives this binary carries into
 ;; BUILDDIR, and answer them as bld-bundled-archives expects. Empty for a jolt
@@ -3616,20 +3714,7 @@
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
     "s/unsigned int [A-Za-z0-9_]+_len/unsigned int jolt_boot_len/' '" boot-h "'"))
-  (let ((mc (open-output-file main-c 'replace)))
-    (put-string mc
-      (string-append
-        "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
-        (bld-boot-prefetch-defn)
-        "int main(int argc, char *argv[]) {\n"
-        (bld-boot-prefetch-call)
-        "  Sscheme_init(0);\n"
-        "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
-        "  Sbuild_heap(0, jolt_register_zlib);\n"
-        "  int status = Sscheme_start(argc, (const char **)argv);\n"
-        "  Sscheme_deinit();\n  return status;\n}\n"))
-    (close-port mc))
-  (bld-write-zlib-header! (path-parent main-c))
+  (bld-write-exe-main! main-c)
   ;; -rdynamic (Linux) exports the executable's symbols into the dynamic table so
   ;; a statically-linked native lib's symbols resolve via (load-shared-object #f)
   ;; at startup. macOS keeps unstripped executable symbols dlsym-visible already.
