@@ -1376,10 +1376,39 @@
 ;; java.io.File.renameTo keeps the bare rename-file: the JVM documents it as
 ;; platform-dependent and it fails over an existing destination on Windows too,
 ;; so matching it IS the shim's job.
+;;
+;; On Windows the rename is also retried. Real-time AV (Defender's MsMpEng) opens
+;; a freshly closed file to scan it, and while that handle is open MoveFile on it
+;; fails with ERROR_ACCESS_DENIED — "cannot rename ...: permission denied". A
+;; publish-by-rename runs microseconds after its close, the worst moment for that
+;; race, so spit failed intermittently and left its temp file behind
+;; (jolt-lang/jolt#1263). The scan finishes in milliseconds; this is the bounded
+;; retry write-file-atomic settled on for the same failure. It retries only while
+;; the source is still there and the destination is not a directory, so a rename
+;; that can never succeed fails as fast as it did.
+(define fs-retry-delays-ms '(10 25 50 100 200 400))
+(define (call-with-fs-retry thunk retry?)
+  (let loop ((delays fs-retry-delays-ms))
+    (if (null? delays)
+        (thunk)
+        (guard (e ((retry? e)
+                   (sleep (make-time 'time-duration (* (car delays) 1000000) 0))
+                   (loop (cdr delays))))
+          (thunk)))))
 (define (rename-replace! from to)
-  (when (and (eq? (sa-os-family) 'windows) (file-exists? to))
-    (delete-file to #f))
-  (rename-file from to))
+  (if (eq? (sa-os-family) 'windows)
+      (call-with-fs-retry
+       (lambda ()
+         (when (file-exists? to) (delete-file to #t))
+         (rename-file from to))
+       (lambda (e) (and (file-exists? from) (not (file-directory? to)))))
+      (rename-file from to)))
+;; Delete a file a failed publish left behind. The same AV handle that blocked the
+;; rename blocks this delete, so it waits it out too. Never raises.
+(define (delete-file-retrying! p)
+  (guard (_ (#t #f))
+    (call-with-fs-retry (lambda () (delete-file p #t))
+                        (lambda (e) (and (eq? (sa-os-family) 'windows) (file-exists? p))))))
 
 ;; --- java.net.URL (a jhost "url", state #(spec handler)) --------------------
 ;; A File.toURL value: .toString / .toExternalForm give the spec, .getPath /
@@ -2439,7 +2468,7 @@
           (with-port (guard (e ((i/o-error? e) (file-open-error given p e)))
                        (open-output-file tmp 'replace))
             (lambda (port) (put-string port text)))
-          (guard (e (#t (guard (_ (#t #f)) (delete-file tmp)) (raise e)))
+          (guard (e (#t (delete-file-retrying! tmp) (raise e)))
             (rename-replace! tmp p))))
     jolt-nil))
 

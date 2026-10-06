@@ -515,6 +515,36 @@
   (delete-file dst #f)
   (delete-path! d))
 
+;; --- the Windows AV retry (jolt-lang/jolt#1263) ------------------------------
+;; A scanner holding the freshly closed temp file is Windows-only, so the retry
+;; loop rename-replace! wraps that rename in is exercised directly here: a
+;; transient failure is waited out, a persistent one still raises the ORIGINAL
+;; error once the delays run out, and a failure retry? rejects is not retried.
+(let ((calls 0))
+  (same "a transient failure is retried until it succeeds"
+        (call-with-fs-retry
+         (lambda () (set! calls (+ calls 1))
+                 (if (< calls 3) (error 'rename-file "permission denied") 'renamed))
+         (lambda (e) #t))
+        'renamed)
+  (same "it took exactly the failing attempts plus one" calls 3))
+(let ((calls 0))
+  (ok "a persistent failure rethrows its own error"
+      (guard (e ((error? e) (string=? (condition-message e) "still locked")))
+        (call-with-fs-retry (lambda () (set! calls (+ calls 1)) (error 'rename-file "still locked"))
+                            (lambda (e) #t))
+        #f))
+  (same "a persistent failure is tried once per delay, then once more"
+        calls (+ 1 (length fs-retry-delays-ms))))
+(let ((calls 0))
+  (ok "a failure retry? rejects raises on the first attempt"
+      (guard (e (#t (= calls 1)))
+        (call-with-fs-retry (lambda () (set! calls (+ calls 1)) (error 'rename-file "is a directory"))
+                            (lambda (e) #f))
+        #f)))
+(ok "the retry budget stays around a second"
+    (<= (apply + fs-retry-delays-ms) 1000))
+
 ;; --- the Windows command line (jolt-lang/jolt#1108) --------------------------
 ;; Where posix_spawn is missing, every spawn used to go to Chez's
 ;; open-process-ports carrying proc-build-shell-command's /bin/sh string — `exec `,
