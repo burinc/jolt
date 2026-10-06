@@ -410,6 +410,12 @@
   ;; run in two thousand under contention, and once in CI. Many threads at once
   ;; is what makes the hook land in the window.
   {:suite "threads / finished" :expr "(let [r (fn [] (let [t (Thread. (fn []))] (.start t) (.join t) (.setDaemon t true) (.setName t \"x\") (.setPriority t 2) [(.isDaemon t) (.getName t) (.getPriority t)]))] (frequencies (apply concat (pmap (fn [_] (repeatedly 400 r)) (range 8)))))" :expected "{[true \"x\" 2] 3200}"}
+  ;; Threads that finish at once while futures are being created: the parent
+  ;; used to read a finished child's freed thread context for its id, often get
+  ;; the boot thread's 0, and file the child's object under it, so the boot
+  ;; thread's Thread/currentThread became that child. One round of 3200 hit it
+  ;; about four runs in ten; ten rounds (about a second) make a miss unlikely.
+  {:suite "threads / finished" :expr "(let [r (fn [] (let [t (Thread. (fn []))] (.start t) (.join t)))] (dotimes [_ 10] (dorun (pmap (fn [_] (dorun (repeatedly 400 r))) (range 8)))) (.getName (Thread/currentThread)))" :expected "\"main\""}
   {:suite "threads / finished" :expr "(let [l (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.await l)))] (.start t) (.setName t \"late\") (.setPriority t 7) (.countDown l) (.join t) [(.getName t) (.getPriority t) (.isAlive t)])" :expected "[\"late\" 7 false]"}
   ;; newVirtualThreadPerTaskExecutor runs its tasks on daemon threads, as every
   ;; virtual thread is one. JVM: true.
