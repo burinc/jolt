@@ -231,7 +231,8 @@
         (\"csv/liblz4.a\" \"jolt_liblz4_a\" \"jolt_liblz4_a_len\")
         (\"csv/libz.a\" \"jolt_libz_a\" \"jolt_libz_a_len\")
         (\"stub/launcher.c\" \"jolt_launcher_c\" \"jolt_launcher_c_len\")
-        (\"host/chez/stub/jolt_zlib.h\" \"jolt_zlib_h\" \"jolt_zlib_h_len\")))))
+        (\"host/chez/stub/jolt_zlib.h\" \"jolt_zlib_h\" \"jolt_zlib_h_len\")
+        (\"host/chez/stub/jolt_code_region.h\" \"jolt_code_region_h\" \"jolt_code_region_h_len\")))))
 
 (suppress-greeting #t)
 ;; The collector policy: a nursery sized by the time collection takes (16MB
@@ -793,6 +794,8 @@
 ;; relinks from this binary with no checkout on disk (build.ss
 ;; bld-write-zlib-header!).
 (jb-c-array "host/chez/stub/jolt_zlib.h" (string-append jb-build "/joltzlibh_data.h") "jolt_zlib_h")
+;; The library stub's code-region header (build.ss bld-write-code-region-header!).
+(jb-c-array "host/chez/stub/jolt_code_region.h" (string-append jb-build "/joltcoderegionh_data.h") "jolt_code_region_h")
 ;; The embedded stdlib fasl blob (one concatenated .so per install-owned ns).
 ;; jb-emit-stdlib-fasls! wrote it during flat.ss emission; it is absent only when
 ;; that step never ran, which never happens in a real build. A 1-byte placeholder
@@ -820,6 +823,7 @@
       "#include \"z_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
       "#include \"joltzlibh_data.h\"\n"
+      "#include \"joltcoderegionh_data.h\"\n"
       "#include \"stdlib_fasls_data.h\"\n"
       "#include \"source_blob_data.h\"\n"
       (bld-boot-prefetch-defn)
