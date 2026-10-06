@@ -140,6 +140,18 @@
 (define-record-type (cseqv make-cseqv cseqv?)
   (parent cseq) (fields cvec ci crest)
   (nongenerative chez-cseqv-v1) (sealed #t))
+;; A cell that knows how many elements it heads is the cseqn subtype, carrying
+;; cnt (this cell included): a PersistentList node (PersistentList._count), a
+;; StringSeq / ArraySeq / APersistentVector$RSeq cell (their count() is the
+;; backing length less the index), and any chain built whole from a Scheme list.
+;; jolt-count answers it in O(1) and seq=? compares two of them by count before
+;; walking. One more field costs nothing in Chez: a cseq is 40 bytes of fields and
+;; header padded to 48, and a cseqn fills that padding. A cell whose tail is lazy
+;; or unknown (a Cons, a lazy seq's cell) is never one -- its length is not known
+;; without walking.
+(define-record-type (cseqn make-cseqn cseqn?)
+  (parent cseq) (fields cnt)
+  (nongenerative chez-cseqn-v1) (sealed #t))
 ;; Macros, so they inline as the record accessors they replace did: several sit
 ;; on the step of every vector walk.
 (define-syntax cseq-cvec (syntax-rules () ((_ s) (let ((x s)) (and (cseqv? x) (cseqv-cvec x))))))

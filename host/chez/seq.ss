@@ -139,7 +139,13 @@
 (define (cseq-realized/k head tail kind) (make-cseq head tail kind jolt-nil))
 (define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk sk-cons jolt-nil))
 (define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk kind jolt-nil))
-(define (cseq-list head tail) (make-cseq head tail sk-list jolt-nil))   ; a PersistentList node
+;; A PersistentList node. Onto nil, or onto a cell that knows its count, it is a
+;; counted cseqn (PersistentList._count); onto anything else (a lazy tail, a
+;; Cons) it stays a plain cell, whose count walks until it reaches a counted one.
+(define (cseq-list head tail)
+  (cond ((jolt-nil? tail) (make-cseqn head tail sk-list jolt-nil 1))
+        ((cseqn? tail) (make-cseqn head tail sk-list jolt-nil (fx+ (cseqn-cnt tail) 1)))
+        (else (make-cseq head tail sk-list jolt-nil))))
 
 ;; --- a lazy cell's thunk, as DATA ---------------------------------------------
 ;; A thunk built in Scheme carries its captured values where nothing can read
@@ -548,13 +554,17 @@
 ;; ============================================================================
 ;; jolt-seq — coerce a seqable to a non-empty seq, or jolt-nil when empty
 ;; ============================================================================
+;; Built whole, so every cell knows how many follow it: a counted cseqn chain,
+;; at no cost in size (values.ss).
 (define (list->cseq xs)               ; Scheme list -> realized cseq chain (jolt-nil if empty)
-  (if (null? xs) jolt-nil (cseq-realized (car xs) (list->cseq (cdr xs)))))
+  (list->cseq/k xs sk-cons))
 ;; …with every cell of the chain carrying one flavor. A collection's seq view is
 ;; the same class all the way down on the JVM ((next (keys m)) is another KeySeq),
 ;; so the kind goes on the whole chain and not just its head.
 (define (list->cseq/k xs kind)
-  (if (null? xs) jolt-nil (cseq-realized/k (car xs) (list->cseq/k (cdr xs) kind) kind)))
+  (if (null? xs) jolt-nil
+      (let ((t (list->cseq/k (cdr xs) kind)))
+        (make-cseqn (car xs) t kind jolt-nil (if (jolt-nil? t) 1 (fx+ (cseqn-cnt t) 1))))))
 
 ;; ---- variadic rest: passing a LAZY tail through a Chez rest parameter --------
 ;; A Chez rest parameter must be a proper list, so `apply` would have to realize
@@ -623,9 +633,11 @@
   (if (fx>=? i (pvec-count v)) jolt-nil
       (cseq-vec (pvec-nth-d v i jolt-nil) v i kind)))
 ;; A string's characters. clojure.lang.StringSeq, and the tail is one too.
+;; Counted, as StringSeq is: the cell knows the characters left from its index.
 (define (str->seq s i)
-  (if (fx>=? i (string-length s)) jolt-nil
-      (cseq-lazy/k (string-ref s i) (make-lazy-src lz-str-seq s i) sk-string-seq)))
+  (let ((n (string-length s)))
+    (if (fx>=? i n) jolt-nil
+        (make-cseqn (string-ref s i) (make-lazy-src lz-str-seq s i) sk-string-seq jolt-nil (fx- n i)))))
 ;; ---- seq arms: host types register here instead of set!-wrapping jolt-seq ----
 ;; Arms dispatch newest-registration-first (cons front, walk head-first), matching
 ;; the precedence the set! chains produced. The built-in types stay inline in
@@ -788,7 +800,7 @@
 ;; The remainder is the test itself and is the price of the distinction.
 (define (jolt-cons x coll)
   (if (jolt-nil? coll)
-      (make-cseq x jolt-nil sk-list jolt-nil)
+      (make-cseqn x jolt-nil sk-list jolt-nil 1)
       (make-cseq x (jolt-seq coll) sk-cons jolt-nil)))
 ;; Scheme list -> a jolt PersistentList. For (list …) and quoted list literals
 ;; (the emitter lowers '(a b) to (jolt-list a b)).
@@ -802,7 +814,9 @@
     (if (jolt-nil? s)
         acc
         (loop (jolt-seq (seq-more s))
-              (cseq-realized/k (seq-first s) (if (empty-list-t? acc) jolt-nil acc) sk-list)))))
+              (if (empty-list-t? acc)
+                  (make-cseqn (seq-first s) jolt-nil sk-list jolt-nil 1)
+                  (make-cseqn (seq-first s) acc sk-list jolt-nil (fx+ (cseqn-cnt acc) 1)))))))
 (define (jolt-last coll) (let loop ((s (jolt-seq coll)) (last jolt-nil))
                            (if (jolt-nil? s) last (loop (jolt-seq (seq-more s)) (seq-first s)))))
 ;; nth over a seq (walks; forces lazily). default? selects the 3-arg behavior.
@@ -1914,6 +1928,22 @@
                            (jolt-make-lazy-src lz-range v (list end step kind))
                            kind))))
     (else jolt-empty-list)))
+;; How many elements a range's not-yet-built continuation (a chunk's crest, the
+;; lz-range node above) will produce, from its start/end/step alone -- LongRange's
+;; count(). #f once the node has been forced (its answer is then the next chunk,
+;; which the caller walks to: one step per 32 elements), or when the bounds are
+;; not all exact: a flonum range accumulates by repeated addition, and its length
+;; is what that addition does, not what the division says (clojure.lang.Range is
+;; not Counted either).
+(define (range-rest-count cr)
+  (and (jolt-lazyseq? cr)
+       (let ((t (jolt-lazyseq-thunk cr)))
+         (and (lazy-src? t) (eq? (lazy-src-fn t) lz-range)
+              (let ((v (lazy-src-a t)) (end (car (lazy-src-b t))) (step (cadr (lazy-src-b t))))
+                (and (exact? v) (exact? end) (exact? step)
+                     (cond ((> step 0) (if (< v end) (ceiling (/ (- end v) step)) 0))
+                           ((< step 0) (if (> v end) (ceiling (/ (- v end) (- step))) 0))
+                           (else #f))))))))
 ;; Which range class the args select. clojure.core/range sends every argument
 ;; through `int?` and takes clojure.lang.LongRange only when they ALL pass,
 ;; clojure.lang.Range otherwise — so a double bound or step, or a ratio, gets Range
@@ -2303,7 +2333,31 @@
 ;; consistent with the persistent vector's element-wise =/hash so a vector and a
 ;; list of the same elements are jolt= and hash alike.
 ;; ============================================================================
+;; How many elements X has, when that is known without walking or realizing
+;; anything -- #f otherwise. The JVM's Counted, as ASeq.equiv and
+;; APersistentVector.doEquiv consult it: a vector, (), a counted cell (cseqn: a
+;; list, a string/array/reverse-vector seq), a vector's own seq, and a range whose
+;; next chunk is not yet built (range-rest-count).
+(define (seq-known-count x)
+  (cond ((pvec? x) (pvec-count x))
+        ((cseqn? x) (cseqn-cnt x))
+        ((cseqv? x)
+         (let ((here (fx- (pvec-count (cseqv-cvec x)) (cseqv-ci x))) (cr (cseqv-crest x)))
+           (if cr
+               (let ((k (range-rest-count cr))) (and k (+ here k)))
+               here)))
+        ((empty-list-t? x) 0)
+        (else #f)))
+;; Two sequential colls whose counts are both known and differ are unequal, so the
+;; walk is skipped -- ASeq.equiv's `this instanceof Counted && obj instanceof
+;; Counted && count() != count()`. Only when BOTH are known: counting a lazy side
+;; would realize it, which the walk below may never have to do.
 (define (seq=? a b)
+  (let ((ca (seq-known-count a)))
+    (if (and ca (let ((cb (seq-known-count b))) (and cb (not (= ca cb)))))
+        #f
+        (seq=?-walk a b))))
+(define (seq=?-walk a b)
   (let loop ((sa (jolt-seq a)) (sb (jolt-seq b)))
     (cond ((and (jolt-nil? sa) (jolt-nil? sb)) #t)
           ((or (jolt-nil? sa) (jolt-nil? sb)) #f)

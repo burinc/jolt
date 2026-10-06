@@ -560,17 +560,17 @@
 ;; A standalone chunk plus an arbitrary, possibly lazy rest. NOT Counted — its
 ;; length is unknown without forcing, and ChunkedCons is not Counted on the JVM either.
 (jch-register-supers! "clojure.lang.ChunkedCons" '("clojure.lang.ASeq"))
-;; Array and string seqs are realized cell chains here, not indexed views, so
-;; count walks them: IndexedSeq (which extends Counted) is deliberately NOT
-;; claimed. The JVM's are Counted; jolt answers counted? false rather than
-;; promising an O(1) count it would then have to fake.
-(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq"))
+;; Array and string seqs and a vector's rseq are counted cells (seq.ss cseqn):
+;; each knows how many elements it heads, so jolt-count answers them without
+;; walking, as Counted promises — the JVM's ArraySeq and StringSeq are Counted
+;; through IndexedSeq, and RSeq directly. IndexedSeq itself is not claimed: it
+;; also promises index(), which nothing here answers.
+(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
 (for-each (lambda (prim) (jch-register-supers! (string-append "clojure.lang.ArraySeq$ArraySeq_" prim)
                                                '("clojure.lang.ArraySeq")))
           '("int" "long" "short" "double" "float" "boolean" "byte" "char"))
-(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq"))
-;; rseq is a lazy descending walk, so likewise not Counted (the JVM's RSeq is).
-(jch-register-supers! "clojure.lang.APersistentVector$RSeq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.APersistentVector$RSeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
 ;; The map/set seq views. PersistentArrayMap$Seq is Counted on the JVM; jolt
 ;; materializes it into a cell chain, so it is not claimed here either.
 (jch-register-supers! "clojure.lang.PersistentArrayMap$Seq" '("clojure.lang.ASeq"))
@@ -579,10 +579,11 @@
 (jch-register-supers! "clojure.lang.APersistentMap$KeySeq" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.APersistentMap$ValSeq" '("clojure.lang.ASeq"))
 ;; A bounded range chunks by 32 like the JVM's (sk-chunked? says so, and the
-;; interface is grafted on from there). NOT Counted, though the JVM's is: jolt's
-;; range is one chunk followed by a lazy continuation, so it cannot answer its own
-;; length without realizing the whole thing.
-(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq" "clojure.lang.IReduce" "clojure.lang.IDrop"))
+;; interface is grafted on from there). Counted, as the JVM's is: jolt-count
+;; answers a range from its first chunk and the bounds its lazy continuation
+;; holds (seq.ss range-rest-count), without realizing anything. Once later chunks
+;; HAVE been realized it steps to the first unrealized one, 32 elements a step.
+(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce" "clojure.lang.IDrop"))
 ;; The non-all-longs range — (range 0 1.0 0.1) and friends. Same shape as
 ;; LongRange, and chunked for the same reason.
 (jch-register-supers! "clojure.lang.Range" '("clojure.lang.ASeq" "clojure.lang.IReduce"))
