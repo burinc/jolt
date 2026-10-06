@@ -1093,7 +1093,9 @@
   {:suite "files-hidden" :expr "(java.nio.file.Files/isHidden (java.nio.file.Paths/get \"no-such-file-here.txt\" (make-array String 0)))" :expected "false"}
   ;; :port-file chooses the file (#1239): stop deletes the one start wrote, nil
   ;; writes none, and nothing lands in the working directory either way.
-  {:suite "nrepl-port" :expr "(do (require (quote jolt.nrepl)) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-nrepl-portfile-unit\") f (str d \"/.nrepl-port\") _ (.mkdirs (java.io.File. d)) stop (binding [*out* (java.io.StringWriter.)] (jolt.nrepl/start 0 nil {:port-file f})) written (.exists (java.io.File. f)) _ (stop) _ (stop)] [written (.exists (java.io.File. f)) (= f (:port-file (meta stop))) (.exists (java.io.File. \".nrepl-port\"))]))" :expected "[true false true false]"}
+  ;; :port-file reports the path as java.io.File normalizes it, so compare
+  ;; against that: java.io.tmpdir ends in "/" on macOS, and f then has "//" (#1258).
+  {:suite "nrepl-port" :expr "(do (require (quote jolt.nrepl)) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-nrepl-portfile-unit\") f (str d \"/.nrepl-port\") _ (.mkdirs (java.io.File. d)) stop (binding [*out* (java.io.StringWriter.)] (jolt.nrepl/start 0 nil {:port-file f})) written (.exists (java.io.File. f)) _ (stop) _ (stop)] [written (.exists (java.io.File. f)) (= (.getAbsolutePath (java.io.File. f)) (:port-file (meta stop))) (.exists (java.io.File. \".nrepl-port\"))]))" :expected "[true false true false]"}
   {:suite "nrepl-port" :expr "(do (require (quote jolt.nrepl)) (let [stop (binding [*out* (java.io.StringWriter.)] (jolt.nrepl/start 0 nil {:port-file nil}))] (stop) [(:port-file (meta stop)) (pos? (:port (meta stop))) (.exists (java.io.File. \".nrepl-port\"))]))" :expected "[nil true false]"}
   ;; jolt.winsock is the one WSAStartup, shared by jolt.socket, jolt.nrepl and
   ;; jolt.mvn-http — which used to carry two private copies between them and
