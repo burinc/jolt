@@ -28,7 +28,8 @@
 ;; wall time whatever its speed, and the batch self-calibrates past the ~1us
 ;; timer granularity, so neither end needs a hand-tuned constant.
 
-(ns complexity-test)
+(ns complexity-test
+  (:require [clojure.set]))
 
 (def ^:private n1 50000)
 (def ^:private n2 200000)
@@ -99,6 +100,12 @@
       (println (str "FAIL complexity " label ": " detail))
       (swap! failures inc))))
 
+;; A fn over a `case` of n string constants ("s0" -> 0 ...), default -1: the
+;; case row below dispatches to its LAST arm at 50 and at 200 constants.
+(defmacro ^:private string-case-fn [n]
+  (let [x (gensym "x")]
+    `(fn [~x] (case ~x ~@(mapcat (fn [i] [(str "s" i) i]) (range n)) -1))))
+
 (defn -main [& _]
   (let [v1 (vec (range n1))            v2 (vec (range n2))
         ;; source-shaped text: the window rows read a span out of the middle
@@ -116,12 +123,20 @@
     ;; values first — a ratio over wrong answers would mean nothing
     (when-not (and (= (count s1) n1) (= (count s2) n2)
                    (= (first (drop (- n1 2) s1)) (- n1 2))
+                   (= (nthrest v1 (- n1 2)) [(- n1 2) (- n1 1)])
+                   (= (nthnext v1 n1) nil)
+                   (= (first (drop (- n1 2) (range n1))) (- n1 2))
+                   (= (first (drop n1 (range))) n1)
+                   (= (first (drop (- n1 2) src1)) (nth src1 (- n1 2)))
+                   (= (first (nthnext (range 0 (* 3 n1) 3) (- n1 1))) (* 3 (- n1 1)))
                    (= (first (rseq v1)) (dec n1))
                    (= (last (rseq v1)) 0)
                    (= (first sm1) [0 0]) (= (first ss1) 0)
                    (= (count (tree-seq coll? seq c4)) 4001)
                    (= (take 3 (tree-seq coll? seq c1)) [c1 499 (second c1)])
                    (= (first (sorted-map)) nil) (= (first (sorted-set)) nil)
+                   (= (take 3 sm2) [[0 0] [1 1] [2 2]]) (= (first (rseq ss2)) (dec n2))
+                   (= (first (keys sm1)) 0) (= (hash sm1) (hash (into {} sm1))) (not= ss1 ss2)
                    (= (clojure.string/index-of src1 "bar)" 4) 5)
                    (= (clojure.string/index-of src1 "(foo" 1) 9)
                    (= (clojure.string/index-of src1 "zzz" 4) nil)
@@ -175,6 +190,35 @@
            #(drop (- n2 5) s2)
            "drop is stepping instead of jumping to the index (jolt-drop, seq.ss)")
 
+    ;; Clojure 1.12's nthrest/nthnext hand an IDrop coll the count, as drop does.
+    ;; drop on a range and on a string's seq skip to the target (seq.ss drop-walk):
+    ;; a bounded range computes the 32-element block the target falls in, the
+    ;; unbounded (range) and a StringSeq re-enter at the target position.
+    (judge "nthrest vector"
+           #(nthrest v1 (- n1 5))
+           #(nthrest v2 (- n2 5))
+           "nthrest is stepping instead of handing the vector the count (jolt-nthrest, seq.ss)")
+
+    (judge "nthnext vector"
+           #(nthnext v1 (- n1 5))
+           #(nthnext v2 (- n2 5))
+           "nthnext is stepping instead of handing the vector the count (jolt-nthnext, seq.ss)")
+
+    (judge "drop range"
+           #(first (drop (- n1 5) (range n1)))
+           #(first (drop (- n2 5) (range n2)))
+           "drop on a bounded range is walking its blocks instead of computing the target's (range-skip, seq.ss)")
+
+    (judge "drop unbounded range"
+           #(first (drop n1 (range)))
+           #(first (drop n2 (range)))
+           "drop on (range) is stepping instead of re-entering at the target (drop-walk, seq.ss)")
+
+    (judge "drop string"
+           #(first (drop (- n1 5) src1))
+           #(first (drop (- n2 5) src2))
+           "drop on a string's seq is stepping instead of re-entering at the target index (drop-walk, seq.ss)")
+
     (judge "rseq vector"
            #(rseq v1)
            #(rseq v2)
@@ -189,6 +233,33 @@
            #(first ss1)
            #(first ss2)
            "first on a sorted set is materializing the tree instead of walking to its leftmost node (25-sorted.clj :first)")
+
+    ;; the seq views themselves: a stack walk, O(log n) to the head (jolt-iz4)
+    (judge "take 3 sorted-map"
+           #(doall (take 3 sm1))
+           #(doall (take 3 sm2))
+           "seq on a sorted map is materializing the tree instead of walking it lazily (host-table.ss sc-tree-seq)")
+
+    (judge "first rseq sorted-set"
+           #(first (rseq ss1))
+           #(first (rseq ss2))
+           "rseq on a sorted set is materializing the tree instead of walking it lazily (host-table.ss sc-tree-seq)")
+
+    (judge "first keys sorted-map"
+           #(first (keys sm1))
+           #(first (keys sm2))
+           "keys of a sorted map is materializing the tree instead of walking it lazily (host-table.ss sc-tree-seq)")
+
+    ;; hash is cached on the value, and = of different sizes is a count compare
+    (judge "hash sorted-map"
+           #(hash sm1)
+           #(hash sm2)
+           "hash of a sorted map is not cached (host-table.ss sorted-hash)")
+
+    (judge "= sorted-sets of different sizes"
+           #(= ss1 ss2)
+           #(= ss2 ss1)
+           "= of two sorted sets is not comparing counts first (host-table.ss sorted-fast=)")
 
     ;; A parser reads its input through a WINDOW: it cuts a fixed span out of the
     ;; source at the position it has reached, over and over, and the source is the
@@ -297,7 +368,53 @@
       (judge "first popped queue"
              #(first (next p1))
              #(first (next p2))
-             "seq on a PersistentQueue is building every element before returning the first (queue->seq, java/natives-queue.ss)"))
+             "seq on a PersistentQueue is building every element before returning the first (queue->seq, java/natives-queue.ss)")
+      ;; q1 is the boundary shape: one front element, the rest in the rear, so
+      ;; popping it moves the rear to the front. The JVM's rear is a vector that
+      ;; becomes the front in O(1); a reversed-list rear had to be reversed, and
+      ;; a persistent q1 paid that again on every pop. Its hash is cached
+      ;; (PersistentQueue._hasheq), so a repeat hash must not re-walk it.
+      (when-not (and (= (range 1 n1) (seq (pop q1))) (= (hash q1) (hash (vec (range n1)))))
+        (println "FAIL complexity queue-pop: wrong values before timing")
+        (System/exit 1))
+      (judge "pop queue at boundary"
+             #(pop q1)
+             #(pop q2)
+             "pop at the front/rear boundary is copying the rear instead of making it the front (queue-pop, java/natives-queue.ss)")
+      (judge "hash queue"
+             #(hash q1)
+             #(hash q2)
+             "a queue's hash is recomputed on every call instead of cached (seq-hasheq-cached wrapper, java/natives-queue.ss)"))
+
+    ;; clojure.set/difference walks the SMALLER side: taking a big set out of a
+    ;; small one costs the small one, as the reference's two-way branch does. A
+    ;; plain (reduce disj s1 s2) walked all of s2.
+    (let [b1 (set (range n1)) b2 (set (range n2))]
+      (when-not (and (= #{-1} (clojure.set/difference #{1 2 -1} b1))
+                     (= #{1 3} (clojure.set/difference #{1 2 3} #{2 9 10 11})))
+        (println "FAIL complexity set-difference: wrong values before timing")
+        (System/exit 1))
+      (judge "difference small big"
+             #(clojure.set/difference #{1 2 -1} b1)
+             #(clojure.set/difference #{1 2 -1} b2)
+             "difference is disj-ing every element of the bigger second set instead of filtering the smaller first one (stdlib/clojure/set.clj)"))
+
+    ;; A large `case` dispatches through one lookup in a constant map, not a chain
+    ;; of = tests, one per arm. The chain made a dispatch to the last of 400
+    ;; string constants ~8 us; the reference's case is a hashed tableswitch.
+    ;; Fixed sits ~1.4, not 1.0 — the 200-key map lookup measures ~105 ns
+    ;; against ~70 at 50 keys (deeper trie), and the index search is two
+    ;; compares longer; the chain reads ~4.0.
+    (let [c1 (string-case-fn 50) c4 (string-case-fn 200)
+          k1 (str "s" 49) k4 (str "s" 199)]
+      (when-not (and (= 49 (c1 k1)) (= 199 (c4 k4)) (= 0 (c4 (str "s" 0)))
+                     (= -1 (c4 "s200")) (= -1 (c4 nil)) (= -1 (c4 'x)) (= -1 (c1 k4)))
+        (println "FAIL complexity case-dispatch: wrong values before timing")
+        (System/exit 1))
+      (judge "case last arm"
+             #(c1 k1)
+             #(c4 k4)
+             "case is testing its constants one = at a time instead of looking the value up (00-syntax.clj case)"))
 
     (if (pos? @failures)
       (do (println (str "complexity: " @failures " section(s) failed"))

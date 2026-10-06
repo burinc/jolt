@@ -145,5 +145,58 @@
                    (equal? (pvec-tail bulk) (pvec-tail conjd))
                    (loop (cdr ss))))))))
 
+;; --- a transient vector shares its source: O(1) creation ---------------------
+;; The JVM's TransientVector starts from the source's root and tail, so
+;; (into big-v xs) costs the xs. jolt flattened the whole source into a buffer
+;; and persistent! rebuilt the trie, so each (into v [x]) was O(count v) and a
+;; loop of them quadratic (writ's into-inside-vswap!). A source past one tail
+;; chunk is now the transient's base; conj! buffers past it and persistent!
+;; appends the buffer a chunk at a time — the shape a conj loop would build.
+(let ((bases '(33 64 65 1024 1025 1056 1057 33000)) (adds '(0 1 31 32 33 100 1100)))
+  (ok "persistent! of a based transient is the conj-built trie at every boundary"
+      (let loop ((bs bases))
+        (or (null? bs)
+            (let ((b (car bs)))
+              (and (let aloop ((as adds))
+                     (or (null? as)
+                         (let* ((k (car as))
+                                (src (let lp ((p empty-pvec) (i 0)) (if (fx= i b) p (lp (pvec-conj p i) (fx+ i 1)))))
+                                (want (let lp ((p src) (i 0)) (if (fx= i k) p (lp (pvec-conj p (fx+ b i)) (fx+ i 1)))))
+                                (t (jolt-transient-new src))
+                                (_ (do ((i 0 (fx+ i 1))) ((fx= i k)) (jolt-conj! t (fx+ b i))))
+                                (got (jolt-persistent! t)))
+                           (and (= (pvec-cnt got) (pvec-cnt want)) (= (pvec-shift got) (pvec-shift want))
+                                (equal? (pvec-root got) (pvec-root want)) (equal? (pvec-tail got) (pvec-tail want))
+                                (= b (pvec-cnt src))
+                                (aloop (cdr as))))))
+                   (loop (cdr bs))))))))
+(is "based: reads see base and buffer"
+    "(let [t (conj! (transient (vec (range 100))) :x :y)] [(count t) (get t 0) (nth t 99) (nth t 100) (get t 101) (get t 102 :none) (contains? t 101) (t 50)])"
+    "[102 0 99 :x :y :none true 50]")
+(is "based: assoc! into the base and the buffer"
+    "(let [v (vec (range 100)) t (transient v)] (conj! t 100) (assoc! t 3 :a 100 :b 101 :c) [(get t 3) (persistent! t) (= v (vec (range 100)))])"
+    (string-append "[:a [0 1 2 :a " (let lp ((i 4) (acc "")) (if (= i 100) acc (lp (+ i 1) (string-append acc (number->string i) " ")))) ":b :c] true]"))
+(is "based: pop! through the buffer into the base, then conj!"
+    "(let [v (vec (range 40)) t (conj! (transient v) :a :b)] (dotimes [_ 5] (pop! t)) (conj! t :z) [(count t) (nth t 37) (persistent! (pop! (pop! t))) (count v)])"
+    "[38 :z [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35] 40]")
+(is "based: pop! a base to empty" "(let [t (transient (vec (range 33)))] (dotimes [_ 33] (pop! t)) [(count t) (persistent! (conj! t 1))])" "[0 [1]]")
+(is "based: persistent! drops the source's meta" "(nil? (meta (persistent! (conj! (transient (with-meta (vec (range 40)) {:a 1})) 1))))" "true")
+(is "based: unchanged base drops meta too" "(nil? (meta (persistent! (transient (with-meta (vec (range 40)) {:a 1})))))" "true")
+(is "based: a subvec source comes back a plain vector"
+    "(let [r (persistent! (conj! (transient (subvec (vec (range 2000)) 7 1500)) :e))] [(type r) (count r) (first r) (nth r 1492) (peek r) (= r (conj (vec (range 7 1500)) :e))])"
+    "[clojure.lang.PersistentVector 1494 7 1499 :e true]")
+(is "based: into big from a sequence" "(let [v (into (vec (range 1000)) (range 1000 3000))] [(count v) (nth v 1999) (= v (vec (range 3000)))])" "[3000 1999 true]")
+;; (into v small-vector) appends the source's one chunk flat rather than catvec'ing
+(is "into small vector across tail boundaries"
+    "(every? (fn [[n k]] (= (into (vec (range n)) (vec (range n (+ n k)))) (vec (range (+ n k))))) (for [n [0 1 31 32 33 1055 1056 1057] k [1 2 31 32]] [n k]))"
+    "true")
+(is "into small vector keeps to's meta" "(meta (into (with-meta (vec (range 40)) {:a 1}) [1 2]))" "{:a 1}")
+(is "into small vector onto an RRB vector" "(let [v (into (subvec (vec (range 2000)) 3 1700) [:a :b])] [(count v) (nth v 0) (peek v) (= v (conj (vec (range 3 1700)) :a :b))])" "[1699 3 :b true]")
+(is "into a map entry" "(let [v (into (first {:a 1}) [2 3])] [v (map-entry? v) (vector? v)])" "[[:a 1 2 3] false true]")
+(let* ((build (jolt-compile-eval "(let [v (vec (range 100000))] (fn [] (into v (list 1))))" "user"))
+       (per (bytes-per-element 1 (lambda () (jolt-invoke0 build)))))
+  (printf "  (into 100k-vector (list x)): ~a bytes\n" per)
+  (ok "into a 100k vector allocates per element added, not per element held (<= 4096 bytes; it was O(count v))" (<= per 4096)))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

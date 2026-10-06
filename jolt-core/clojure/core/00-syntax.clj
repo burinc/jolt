@@ -694,10 +694,11 @@
                       acc))]
         `(let ~binds ~(nth steps (dec n)))))))
 
-;; case: nested =/or tests (no jump table). Test constants are NOT evaluated —
-;; symbols, lists, and composite literals (vectors/maps/sets) are quoted so their
-;; elements aren't resolved as code; a LIST in test position is an or-group of
-;; constants, while a vector/map/set is a single literal constant.
+;; case: nested =/or tests, or a constant-map lookup for a large case (below).
+;; Test constants are NOT evaluated — symbols, lists, and composite literals
+;; (vectors/maps/sets) are quoted so their elements aren't resolved as code; a
+;; LIST in test position is an or-group of constants, while a vector/map/set is
+;; a single literal constant.
 (defmacro case [expr & clauses]
   (let [g (fresh-sym)
         ;; Quote symbols, lists, and composite literals (vector/map/set) so their
@@ -746,7 +747,57 @@
                         (if (reduce (fn [f s] (or f (= s x))) false seen)
                           [x]
                           (fd (rest items) (conj seen x))))))
-        dup (first-dup (collect clauses []) [])
+        consts (collect clauses [])
+        dup (first-dup consts [])
+        ;; Table dispatch, from 9 or 16 constants (below): ONE lookup in a quoted
+        ;; constant map from test constant to clause index, then a binary search
+        ;; over the index — O(log n) fixnum compares where the chain below is n
+        ;; generic = calls. The reference gets O(1) from a tableswitch over the
+        ;; hashes; this is the same contract, hash then equality, because a map
+        ;; lookup IS hasheq then =.
+        ;;
+        ;; Only for constants whose map lookup provably agrees with the chain's =
+        ;; (and the JVM): strings, symbols, keywords, chars, nil, booleans and
+        ;; integers. Not floats — -0.0 and 0.0 are = with different hashes, and
+        ;; ##NaN — and not ratios, decimals, collections or tagged/regex literals;
+        ;; a case holding any of those keeps the chain. The quoted map is a
+        ;; constant, hoisted and built once per def (backend hoist-const-for).
+        ;; An all-keyword case stays below 65 constants: up to there the quoted
+        ;; map is an array map, whose scan is the same identity compares the chain
+        ;; already makes inline.
+        table-const? (fn [c] (or (keyword? c) (string? c) (symbol? c) (char? c) (nil? c)
+                                 (true? c) (false? c) (integer? c)))
+        nconst (count consts)
+        table? (and (nil? dup)
+                    ;; where the lookup starts paying (measured, 10k dispatches,
+                    ;; first vs last arm): a string or symbol arm is a generic =
+                    ;; call of ~12 ns, so a table of ~50 ns wins from 9 constants
+                    ;; (at 8 the quoted map is an array map, a scan like the
+                    ;; chain); an integer arm is cheaper and takes 16.
+                    (>= nconst (if (reduce (fn [a c] (or a (string? c) (symbol? c))) false consts) 9 16))
+                    (reduce (fn [ok c] (and ok (table-const? c))) true consts)
+                    (or (> nconst 64)
+                        (not (reduce (fn [ok c] (and ok (ident-const? c))) true consts))))
+        ;; [constant->index map, bodies]: clause i's constants map to i; the
+        ;; default (or the no-match throw) is the last body, the lookup's
+        ;; not-found index.
+        table (fn* tbl [cls i m bodies]
+                (if (or (empty? cls) (empty? (rest cls)))
+                  [m (conj bodies
+                           (if (empty? cls)
+                             `(throw (new IllegalArgumentException (str "No matching clause: " ~g)))
+                             (first cls)))]
+                  (let [t (first cls)
+                        m (if (seq? t) (reduce (fn [m c] (assoc m c i)) m t) (assoc m t i))]
+                    (tbl (drop 2 cls) (inc i) m (conj bodies (nth cls 1))))))
+        ;; bodies lo..hi, i known to be in that range: no equality test at a leaf.
+        bsearch (fn* bs [ix bodies lo hi]
+                  (if (= lo hi)
+                    (nth bodies lo)
+                    (let [mid (quot (+ lo hi) 2)]
+                      `(if (< ~ix ~(inc mid))
+                         ~(bs ix bodies lo mid)
+                         ~(bs ix bodies (inc mid) hi)))))
         build (fn build [cls]
                 (if (empty? cls)
                   ;; no clause matched and no default — Clojure throws
@@ -757,7 +808,15 @@
                     `(if ~(mk-test (first cls)) ~(nth cls 1) ~(build (drop 2 cls))))))]
     (if dup
       (throw (IllegalArgumentException. (str "Duplicate case test constant: " (first dup))))
-      `(let* [~g ~expr] ~(build clauses)))))
+      (if table?
+        (let [tb (table clauses 0 {} [])
+              bodies (nth tb 1)
+              n (dec (count bodies))
+              ix (fresh-sym)]
+          `(let* [~g ~expr
+                  ~ix (get (quote ~(nth tb 0)) ~g ~n)]
+             ~(bsearch ix bodies 0 n)))
+        `(let* [~g ~expr] ~(build clauses))))))
 
 ;; for/doseq share these. for-parse-groups turns a binding vector into groups
 ;; [bind coll mods], mods a vector of [kw form] in SOURCE ORDER.

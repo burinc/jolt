@@ -1,4 +1,9 @@
 [
+  ;; A hash map's or set's seq is a lazy walk of the trie, a chunk at a time
+  ;; (seq.ss hamt-chunk-seq): the values are the ones the eager copy produced.
+  {:suite "hamt-seq" :expr "(let [m (zipmap (range 1000) (range 1000)) [[k v] & more] (seq m)] [(= k v) (count more) (count (seq m)) (= (set (keys m)) (set (range 1000))) (reduce + (vals m))])" :expected "[true 999 1000 true 499500]"}
+  {:suite "hamt-seq" :expr "(loop [s (set (range 5000)) n 0] (if-let [x (first s)] (recur (disj s x) (inc n)) [n (seq s) s]))" :expected "[5000 nil #{}]"}
+  {:suite "hamt-seq" :expr "(let [s (set (range 100)) q (seq s)] [(= (seq s) q) (= (hash (seq s)) (hash q)) (count (rest q)) (some? (nth q 99 nil)) (nth q 100 :none) (= (sort q) (range 100))])" :expected "[true true 99 true :none true]"}
   ;; From 64KB a byte array's backing is an immobile bytevector (#1225): the
   ;; values are the ones the ordinary one held.
   {:suite "large-bytes" :expr "(let [a (byte-array 70000 (byte -1))] (System/gc) [(alength a) (aget a 0) (aget a 69999)])" :expected "[70000 -1 -1]"}
@@ -3679,4 +3684,31 @@
   ;; deftype those used to ask instance?, which asked the predicate again — an
   ;; unbounded recursion (hung 0.8.11) once the type had been redefined
   {:suite "dispatch-caches" :expr "(do (clojure.core/__register-class! (fn [x] (and (map? x) (coll? x) (vector? x) false)) (fn [_] \"uhang.C\") (fn [_] [\"uhang.C\"])) (load-string \"(ns uhang.ns) (defprotocol P (p [_])) (deftype T [] P (p [_] 1)) (deftype T []) [(satisfies? P (T.)) (instance? uhang.ns.P (T.)) (map? (T.))]\"))" :expected "[false false false]"}
+  ;; Counted seqs (jolt-d5g, jolt-4j4, jolt-40b): a list, a string/array/reverse-vector
+  ;; seq and a long range count without a walk, and stay counted down their rest;
+  ;; = between two of them compares counts first. Values pinned to JVM Clojure 1.12.
+  {:suite "counted-seqs" :expr "(let [l (list 1 2 3)] [(count l) (count (rest l)) (count (pop l)) (count (conj l 0)) (count (next l)) (counted? (rest l)) (counted? (pop l))])" :expected "[3 2 2 4 2 true true]"}
+  {:suite "counted-seqs" :expr "[(counted? (seq \"abc\")) (counted? (next (seq \"abc\"))) (counted? (rseq [1 2])) (counted? (seq (int-array 2))) (counted? (seq (object-array 2))) (counted? (range 3)) (counted? (rest (range 40))) (counted? (range 0 1 0.5)) (counted? (cons 1 '(2))) (counted? (lazy-seq nil))]" :expected "[true true true true true true true false false false]"}
+  {:suite "counted-seqs" :expr "[(count (seq \"hello\")) (count (next (seq \"hello\"))) (count (rseq [1 2 3 4])) (count (next (rseq [1 2 3 4]))) (count (seq (long-array 5))) (count (next (seq (long-array 5))))]" :expected "[5 4 4 3 5 4]"}
+  {:suite "counted-seqs" :expr "[(count (range 3 100 7)) (count (range 100 3 -7)) (count (range 1/2 10 1/3)) (count (range 0 1 0.1)) (count (range 10 0)) (count (rest (range 100)))]" :expected "[14 14 29 11 0 99]"}
+  {:suite "counted-seqs" :expr "(let [r (range 100)] (dorun r) [(count r) (count (drop 40 r)) (count (rest r)) (count (nthrest r 33))])" :expected "[100 60 99 67]"}
+  {:suite "counted-seqs" :expr "[(count (with-meta (list 1 2 3) {:a 1})) (count (with-meta (seq \"abc\") {:a 1})) (count (into () (range 10))) (count (reverse (range 40))) (count (cons 0 (list 1 2)))]" :expected "[3 3 10 40 3]"}
+  {:suite "counted-seqs" :expr "[(= [1 2 3] '(1 2 3)) (= [1 2 3] '(1 2)) (= '(1 2) [1 2 3]) (= (range 3) [0 1 2]) (= (range 4) '(0 1 2)) (= (seq \"ab\") [\\a \\b]) (= (rseq [1 2]) '(2 1)) (= () []) (= '(1) []) (= (range 3) (list 0 1 2 3))]" :expected "[true false false true false true true true false false]"}
+  ;; Clojure 1.12 nthrest/nthnext hand an IDrop coll the count, and drop on a
+  ;; range or a string seq skips to the target (seq.ss drop-walk): the same seqs
+  ;; the step loop reached, laziness and exhaustion included.
+  {:suite "idrop" :expr "[(nthrest [1 2 3 4 5] 3) (nthrest [1 2 3] 9) (nthrest [1 2 3] 0) (nthrest nil 2) (nthrest nil 0) (nthrest [1 2 3] 1.5)]" :expected "[(4 5) () [1 2 3] () nil (3)]"}
+  {:suite "idrop" :expr "[(nthnext [1 2 3 4 5] 3) (nthnext [1 2 3] 3) (nthnext [1 2 3] 0) (nthnext [] 0) (nthnext '() nil) (nthnext [1 2 3 4] 2.2)]" :expected "[(4 5) nil (1 2 3) nil nil (4)]"}
+  {:suite "idrop" :expr "[(class (nthrest [1 2 3] 1)) (class (nthnext (vec (range 100)) 40))]" :expected "[clojure.lang.PersistentVector$ChunkedSeq clojure.lang.PersistentVector$ChunkedSeq]"}
+  {:suite "idrop" :expr "[(class (nthrest (range 100) 40)) (first (nthrest (range 100) 40)) (nthnext (range 100) 100) (nthrest (range 100) 100) (nthnext (range 100) 99)]" :expected "[clojure.lang.LongRange 40 nil () (99)]"}
+  {:suite "idrop" :expr "[(take 3 (drop 40 (range 0 1000 3))) (take 3 (drop 40 (range 1000 0 -7))) (drop 400 (range 1000 0 -7)) (take 3 (drop 40 (rest (range 100))))]" :expected "[(120 123 126) (720 713 706) () (41 42 43)]"}
+  {:suite "idrop" :expr "[(take 3 (drop 40 (range 0.0 10.0 0.1))) (drop 400 (range 0.0 10.0 0.1)) (take 2 (nthrest (range 0.0 10.0 0.1) 33))]" :expected "[(4.000000000000002 4.100000000000001 4.200000000000001) () (3.3000000000000016 3.4000000000000017)]"}
+  {:suite "idrop" :expr "[(take 3 (drop 1000 (range))) (class (nthrest (range) 1000)) (first (nthnext (range) 1000))]" :expected "[(1000 1001 1002) clojure.lang.Iterate 1000]"}
+  {:suite "idrop" :expr "[(drop 3 \"hello\") (drop 9 \"hello\") (nthnext \"hello\" 5) (class (nthrest \"hello\" 3)) (nthrest (seq \"hello\") 5) (nthnext (seq \"hello\") 4) (drop 2 (rest (seq \"hello\")))]" :expected "[(\\l \\o) () nil clojure.lang.StringSeq () (\\o) (\\l \\o)]"}
+  {:suite "idrop" :expr "(let [r (range 100) s (seq \"abcdef\")] (doall r) (doall s) [(take 2 (drop 40 r)) (drop 2 s) (nthnext s 6)])" :expected "[(40 41) (\\c \\d \\e \\f) nil]"}
+  {:suite "idrop" :expr "[(nthrest (repeat 5 :x) 3) (nthnext (repeat 5 :x) 5) (take 3 (nthrest (repeat :x) 3)) (nthrest {:a 1 :b 2 :c 3} 1) (nthnext {:a 1 :b 2} 3)]" :expected "[(:x :x) nil (:x :x :x) ([:b 2] [:c 3]) nil]"}
+  {:suite "idrop" :expr "[(take 3 (nthrest (map inc (range 100)) 50)) (take 2 (nthnext (iterate inc 0) 50)) (nthrest (subvec [1 2 3 4 5] 1) 2) (take 3 (nthrest (cycle [1 2 3]) 4))]" :expected "[(51 52 53) (50 51) (4 5) (2 3 1)]"}
+  {:suite "idrop" :expr "[(try (nthrest (range 10) 2147483648) (catch ArithmeticException _ :overflow)) (drop 2147483648 (map inc (range 10))) (nthrest (map inc (range 10)) ##Inf)]" :expected "[:overflow () ()]"}
+  {:suite "idrop" :expr "(let [n (atom 0) s (map (fn [x] (swap! n inc) x) (take 10 (iterate inc 0)))] [(nthrest s 3) @n (nthnext s 3) @n])" :expected "[(3 4 5 6 7 8 9) 4 (3 4 5 6 7 8 9) 4]"}
+  {:suite "idrop" :expr "[(nthrest (range 10) 10) (drop 10 (range 10)) (drop 32 (range 32)) (nthnext (range 32) 32) (drop 3 (map inc [1 2 3])) (nthrest (range 64) 32) (drop 5 (seq \"hello\")) (nil? (seq (drop 10 (range 10)))) (class (drop 10 (range 10)))]" :expected "[() () () nil () (32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63) () true clojure.lang.PersistentList$EmptyList]"}
 ]

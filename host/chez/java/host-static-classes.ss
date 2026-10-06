@@ -1531,7 +1531,7 @@
 (define (indexed->rseq v i)
   (if (fx<? i 0)
       jolt-nil
-      (cseq-lazy/k (jolt-nth v i) (make-lazy-src lz-indexed-rseq v (fx- i 1)) sk-rseq)))
+      (make-cseqn (jolt-nth v i) (make-lazy-src lz-indexed-rseq v (fx- i 1)) sk-rseq jolt-nil (fx+ i 1))))
 (let ((rseq-ctor (lambda (v i) (indexed->rseq v (jnum->exact i)))))
   (register-class-ctor! "APersistentVector$RSeq" rseq-ctor)
   (register-class-ctor! "clojure.lang.APersistentVector$RSeq" rseq-ctor))

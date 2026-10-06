@@ -136,10 +136,15 @@
 ;; tail already a seq. The /k variants take the flavor; the bare ones are the
 ;; generic cell, which is the overwhelming majority of call sites.
 (define (cseq-realized head tail) (make-cseq head tail sk-cons jolt-nil))
-(define (cseq-realized/k head tail kind) (make-cseq head tail kind jolt-nil))
 (define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk sk-cons jolt-nil))
 (define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk kind jolt-nil))
-(define (cseq-list head tail) (make-cseq head tail sk-list jolt-nil))   ; a PersistentList node
+;; A PersistentList node. Onto nil, or onto a cell that knows its count, it is a
+;; counted cseqn (PersistentList._count); onto anything else (a lazy tail, a
+;; Cons) it stays a plain cell, whose count walks until it reaches a counted one.
+(define (cseq-list head tail)
+  (cond ((jolt-nil? tail) (make-cseqn head tail sk-list jolt-nil 1))
+        ((cseqn? tail) (make-cseqn head tail sk-list jolt-nil (fx+ (cseqn-cnt tail) 1)))
+        (else (make-cseq head tail sk-list jolt-nil))))
 
 ;; --- a lazy cell's thunk, as DATA ---------------------------------------------
 ;; A thunk built in Scheme carries its captured values where nothing can read
@@ -548,13 +553,17 @@
 ;; ============================================================================
 ;; jolt-seq — coerce a seqable to a non-empty seq, or jolt-nil when empty
 ;; ============================================================================
+;; Built whole, so every cell knows how many follow it: a counted cseqn chain,
+;; at no cost in size (values.ss).
 (define (list->cseq xs)               ; Scheme list -> realized cseq chain (jolt-nil if empty)
-  (if (null? xs) jolt-nil (cseq-realized (car xs) (list->cseq (cdr xs)))))
+  (list->cseq/k xs sk-cons))
 ;; …with every cell of the chain carrying one flavor. A collection's seq view is
 ;; the same class all the way down on the JVM ((next (keys m)) is another KeySeq),
 ;; so the kind goes on the whole chain and not just its head.
 (define (list->cseq/k xs kind)
-  (if (null? xs) jolt-nil (cseq-realized/k (car xs) (list->cseq/k (cdr xs) kind) kind)))
+  (if (null? xs) jolt-nil
+      (let ((t (list->cseq/k (cdr xs) kind)))
+        (make-cseqn (car xs) t kind jolt-nil (if (jolt-nil? t) 1 (fx+ (cseqn-cnt t) 1))))))
 
 ;; ---- variadic rest: passing a LAZY tail through a Chez rest parameter --------
 ;; A Chez rest parameter must be a proper list, so `apply` would have to realize
@@ -623,9 +632,11 @@
   (if (fx>=? i (pvec-count v)) jolt-nil
       (cseq-vec (pvec-nth-d v i jolt-nil) v i kind)))
 ;; A string's characters. clojure.lang.StringSeq, and the tail is one too.
+;; Counted, as StringSeq is: the cell knows the characters left from its index.
 (define (str->seq s i)
-  (if (fx>=? i (string-length s)) jolt-nil
-      (cseq-lazy/k (string-ref s i) (make-lazy-src lz-str-seq s i) sk-string-seq)))
+  (let ((n (string-length s)))
+    (if (fx>=? i n) jolt-nil
+        (make-cseqn (string-ref s i) (make-lazy-src lz-str-seq s i) sk-string-seq jolt-nil (fx- n i)))))
 ;; ---- seq arms: host types register here instead of set!-wrapping jolt-seq ----
 ;; Arms dispatch newest-registration-first (cons front, walk head-first), matching
 ;; the precedence the set! chains produced. The built-in types stay inline in
@@ -642,22 +653,85 @@
   (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
 
-;; A map's entries, keys or vals as a VECTOR-BACKED seq of the given flavor: the
-;; selected values are built once into a pvec and the cells walk it by index. So
-;; count is O(1), reduce runs vec-reduce's tight loop over the vector, and
-;; stepping allocates one cell — where a cons chain cost a cell, a list pair and
-;; an entry per element up front, all before the first element was read. The
-;; vector is filled from its END through pmap-fold, whose visit order is the
-;; reverse of iteration order, so the view reads in iteration order in both
-;; modes. The flavor keeps the class answer (PersistentArrayMap$Seq, KeySeq…)
-;; and keeps chunked-seq? false: chunking is a property of the flavor, not of
-;; the representation.
-(define (pmap-view-seq m sel kind)
+;; A map's entries, keys or vals, and a set's elements, as a seq of the given
+;; flavor. MODE picks what each element is: 0 the entry, 1 the key, 2 the value.
+;;
+;; A hash-mode map is walked LAZILY, a chunk at a time (hamt-chunk-seq below),
+;; the way PersistentHashMap's NodeSeq is: (seq m), (first m), (keys m) and a
+;; `(when (seq m) …)` cost one descent plus one chunk, not a copy of the map.
+;; Building the whole view up front made every one of those O(n) — a worklist
+;; that takes `first` and then `disj`s it was quadratic.
+;;
+;; An array-mode map is small (or an explicit array-map someone chose) and stays
+;; VECTOR-BACKED: the selected values are built once into a pvec and the cells
+;; walk it by index, so count is O(1) and reduce runs vec-reduce's tight loop.
+;; The vector is filled from its END through pmap-fold, whose visit order is the
+;; reverse of iteration order, so the view reads in iteration order.
+;;
+;; The flavor keeps the class answer (PersistentArrayMap$Seq, KeySeq…) and keeps
+;; chunked-seq? false: chunking is a property of the flavor, not of the
+;; representation.
+(define (pmap-seq-sel mode k v)
+  (cond ((fx=? mode 0) (make-map-entry k v)) ((fx=? mode 1) k) (else v)))
+(define (pmap-view-seq m mode kind)
   (let ((n (pmap-cnt m)))
-    (if (fx=? n 0) jolt-nil
-        (let ((v (make-vector n)))
-          (pmap-fold m (lambda (k val i) (vector-set! v i (sel k val)) (fx- i 1)) (fx- n 1))
-          (cseq-vec (vector-ref v 0) (make-pvec v #f) 0 kind)))))
+    (cond
+      ((fx=? n 0) jolt-nil)
+      ((hnode? (pmap-root m)) (hamt-chunk-seq m mode '(0)))
+      (else
+       (let ((v (make-vector n)))
+         (pmap-fold m (lambda (k val i) (vector-set! v i (pmap-seq-sel mode k val)) (fx- i 1)) (fx- n 1))
+         (cseq-vec (vector-ref v 0) (make-pvec v #f) 0 kind))))))
+;; --- the lazy HAMT walk -------------------------------------------------------
+;; Each chunk is up to 32 leaves, read depth-first in exactly the order the
+;; vector fill above produced: a node's slots ascending, a child node's leaves in
+;; place of its slot, and a collision bucket's alist REVERSED (node-fold visits it
+;; forward, and the view reverses the visit). A chunk is a ChunkedCons cell of the
+;; map's own flavor whose after-chunk rest is a lazy cell for the next chunk, so
+;; walking within a chunk allocates nothing beyond the cell, and the walk as a
+;; whole stays O(n).
+;;
+;; Where the next chunk starts is a PATH of slot indices from the root — data,
+;; so the lazy cell is a lazy-src over (map, mode . path) and travels in a state
+;; image like any other producer. Resuming re-descends the path: O(depth) per
+;; chunk, i.e. O(log32 n), the same as NodeSeq's first.
+(define (hamt-slot-vec x)              ; a branch's slots, as a vector to index
+  (if (hnode? x) (hnode-arr x) (list->vector (reverse (hcoll-alist x)))))
+(define (hamt-mode-kind mode)
+  (cond ((fx=? mode 0) sk-hashmap-seq) ((fx=? mode 1) sk-key-seq) (else sk-val-seq)))
+(define lz-hamt-chunk
+  (register-lazy-src! 'hamt-chunk
+    (lambda (m mode+path) (hamt-chunk-seq m (car mode+path) (cdr mode+path)))))
+(define (hamt-chunk-seq m mode path)
+  (let ((buf (make-vector seq-chunk-size)))
+    ;; descend PATH: every index but the last names the branch being walked
+    (let descend ((vec (hnode-arr (pmap-root m))) (path path) (parents '()))
+      (if (pair? (cdr path))
+          (descend (hamt-slot-vec (vector-ref vec (car path))) (cdr path)
+                   (cons (cons vec (car path)) parents))
+          (let walk ((vec vec) (i (car path)) (parents parents) (n 0))
+            (cond
+              ((fx>=? i (vector-length vec))     ; this branch is done: pop it
+               (if (null? parents)
+                   (hamt-chunk-cell m mode buf n #f)
+                   (walk (caar parents) (fx+ (cdar parents) 1) (cdr parents) n)))
+              ((fx=? n seq-chunk-size)           ; full, and more follows: resume here
+               (hamt-chunk-cell m mode buf n
+                 (let up ((ps parents) (acc (list i)))
+                   (if (null? ps) acc (up (cdr ps) (cons (cdar ps) acc))))))
+              (else
+               (let ((x (vector-ref vec i)))
+                 (if (pair? x)
+                     (begin (vector-set! buf n (pmap-seq-sel mode (car x) (cdr x)))
+                            (walk vec (fx+ i 1) parents (fx+ n 1)))
+                     (walk (hamt-slot-vec x) 0 (cons (cons vec i) parents) n))))))))))
+(define (hamt-chunk-cell m mode buf n next)
+  (if (fx=? n 0)
+      jolt-nil
+      (cseq-chunked/k (make-pvec (if (fx=? n seq-chunk-size) buf (vec-copy-range buf 0 n)))
+                      0
+                      (if next (jolt-make-lazy-src lz-hamt-chunk m (cons mode next)) jolt-nil)
+                      (hamt-mode-kind mode))))
 (define (jolt-seq x)
   (cond
     ((jolt-nil? x) jolt-nil)
@@ -669,11 +743,11 @@
     ((empty-list-t? x) jolt-nil)
     ((pvec? x) (vec->seq x 0))
     ;; array mode and hash mode are different classes on the JVM, the same split
-    ;; (class …) already reports for the map itself. The view is vector-backed
-    ;; (pmap-view-seq): one entries vector, walked by index.
-    ((pmap? x) (pmap-view-seq x make-map-entry (if (pmap-array? x) sk-arraymap-seq sk-hashmap-seq)))
+    ;; (class …) already reports for the map itself. pmap-view-seq walks a
+    ;; hash-mode map lazily, a chunk at a time, and indexes an array map's vector.
+    ((pmap? x) (pmap-view-seq x 0 (if (pmap-array? x) sk-arraymap-seq sk-hashmap-seq)))
     ;; a set's seq is RT.keys over its backing map, i.e. an APersistentMap$KeySeq
-    ((pset? x) (list->cseq/k (pset-fold x cons '()) sk-key-seq))
+    ((pset? x) (pmap-view-seq (pset-m x) 1 sk-key-seq))
     ((string? x) (str->seq x 0))
     (else (let loop ((as jolt-seq-arms))
             (cond ((null? as) (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
@@ -788,7 +862,7 @@
 ;; The remainder is the test itself and is the price of the distinction.
 (define (jolt-cons x coll)
   (if (jolt-nil? coll)
-      (make-cseq x jolt-nil sk-list jolt-nil)
+      (make-cseqn x jolt-nil sk-list jolt-nil 1)
       (make-cseq x (jolt-seq coll) sk-cons jolt-nil)))
 ;; Scheme list -> a jolt PersistentList. For (list …) and quoted list literals
 ;; (the emitter lowers '(a b) to (jolt-list a b)).
@@ -802,7 +876,9 @@
     (if (jolt-nil? s)
         acc
         (loop (jolt-seq (seq-more s))
-              (cseq-realized/k (seq-first s) (if (empty-list-t? acc) jolt-nil acc) sk-list)))))
+              (if (empty-list-t? acc)
+                  (make-cseqn (seq-first s) jolt-nil sk-list jolt-nil 1)
+                  (make-cseqn (seq-first s) acc sk-list jolt-nil (fx+ (cseqn-cnt acc) 1)))))))
 (define (jolt-last coll) (let loop ((s (jolt-seq coll)) (last jolt-nil))
                            (if (jolt-nil? s) last (loop (jolt-seq (seq-more s)) (seq-first s)))))
 ;; nth over a seq (walks; forces lazily). default? selects the 3-arg behavior.
@@ -1755,6 +1831,14 @@
     (else (reduce-seq f acc (jolt-seq from)))))
 (define (jolt-into to from)
   (cond
+    ;; a plain vector taking a source that is all tail (<= 32 elements): copy
+    ;; the chunk onto to's tail, as the transient fold would. catvec's
+    ;; rebalance costs ~5x this for (into v [x]), the shape of an accumulator.
+    ;; pvec-append-flat is transients.ss's, bound by call time.
+    ((and (pvec? to) (pvec? from) (not (pvec-ent to))
+          (fx>? (pvec-cnt from) 0)
+          (fx=? (pvec-cnt from) (vector-length (pvec-tail from))))
+     (meta-carry to (pvec-append-flat to (pvec-tail from) (pvec-cnt from))))
     ;; two non-empty vectors: O(log n) RRB concatenation instead of a linear
     ;; element fold. Empty operands fall through — pvec-catvec answers those
     ;; with an INPUT identity, which would surface `from` (and any metadata
@@ -1906,6 +1990,22 @@
                            (jolt-make-lazy-src lz-range v (list end step kind))
                            kind))))
     (else jolt-empty-list)))
+;; How many elements a range's not-yet-built continuation (a chunk's crest, the
+;; lz-range node above) will produce, from its start/end/step alone -- LongRange's
+;; count(). #f once the node has been forced (its answer is then the next chunk,
+;; which the caller walks to: one step per 32 elements), or when the bounds are
+;; not all exact: a flonum range accumulates by repeated addition, and its length
+;; is what that addition does, not what the division says (clojure.lang.Range is
+;; not Counted either).
+(define (range-rest-count cr)
+  (and (jolt-lazyseq? cr)
+       (let ((t (jolt-lazyseq-thunk cr)))
+         (and (lazy-src? t) (eq? (lazy-src-fn t) lz-range)
+              (let ((v (lazy-src-a t)) (end (car (lazy-src-b t))) (step (cadr (lazy-src-b t))))
+                (and (exact? v) (exact? end) (exact? step)
+                     (cond ((> step 0) (if (< v end) (ceiling (/ (- end v) step)) 0))
+                           ((< step 0) (if (> v end) (ceiling (/ (- v end) (- step))) 0))
+                           (else #f))))))))
 ;; Which range class the args select. clojure.core/range sends every argument
 ;; through `int?` and takes clojure.lang.LongRange only when they ALL pass,
 ;; clojure.lang.Range otherwise — so a double bound or step, or a ratio, gets Range
@@ -1958,19 +2058,78 @@
 ;; 625ns and 18.5ms when dropping a million elements. As with count, the step
 ;; loop re-checks per cell so a few plain cells in front of a vector-backed one
 ;; still reach the jump.
+;; The other skips build exactly the cell a walk would have reached, so what
+;; comes back is the same seq, flavor and chunk boundaries included:
+;;  - a ChunkedCons (a bounded range's block, a chunked map's) moves within its
+;;    chunk by index and hops a whole chunk to its rest without a cell per element;
+;;  - an unforced range block computes the block the target is in (range-skip)
+;;    when the arithmetic is exact — a double range's values are running sums, so
+;;    it hops a block at a time instead, generating each one as the walk would;
+;;  - a StringSeq cell and the unbounded (range) re-enter at the target position;
+;;  - a Repeat cell skips by its count (repeat-skip).
+;; A cell whose tail is already forced is stepped through, as before.
 ;; The seq N (a fixnum) elements into seq S, or () when S runs out first.
 (define (drop-walk n s)
   (let loop ((n n) (s s))
     (cond
       ((jolt-nil? s) jolt-empty-list)
       ((fx<=? n 0) s)
-      ;; the jump keeps the seq's own flavor: an array map's seq dropped into is
-      ;; still a PersistentArrayMap$Seq, a vector's a ChunkedSeq
-      ((and (cseq-cvec s) (not (cseq-crest s)))
-       (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
-         (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq/k v i (cseq-kind s)))))
-      ((and (fx=? (cseq-kind s) sk-repeat) (repeat-skip s n)))
+      ((cseq-cvec s)
+       => (lambda (v)
+            ;; the jump keeps the seq's own flavor: an array map's seq dropped into
+            ;; is still a PersistentArrayMap$Seq, a vector's a ChunkedSeq
+            (let ((left (fx- (pvec-count v) (cseq-ci s))) (cr (cseq-crest s)))
+              (cond ((fx<? n left)
+                     (if cr
+                         (cseq-chunked/k v (fx+ (cseq-ci s) n) cr (cseq-kind s))
+                         (vec->seq/k v (fx+ (cseq-ci s) n) (cseq-kind s))))
+                    ((not cr) jolt-empty-list)
+                    ((fx=? n left) (loop 0 (jolt-seq cr)))       ; nil there is ()
+                    ((range-skip cr (fx- n left)))
+                    (else (loop (fx- n left) (jolt-seq cr)))))))
+      ((fx=? (cseq-kind s) sk-repeat)
+       (or (repeat-skip s n) (loop (fx- n 1) (jolt-seq (seq-more s)))))
+      ((fx=? (cseq-kind s) sk-string-seq)
+       (let ((t (cseq-tail s)))
+         (if (and (lazy-src? t) (eq? (lazy-src-fn t) lz-str-seq))
+             (let ((str (lazy-src-a t)) (i (lazy-src-b t)))
+               (if (fx>=? n (fx- (string-length str) i))
+                   jolt-empty-list
+                   (str->seq str (fx+ i n))))
+             (loop (fx- n 1) (jolt-seq (seq-more s))))))
+      ((fx=? (cseq-kind s) sk-iterate)
+       (let ((t (cseq-tail s)))
+         (if (and (lazy-src? t) (eq? (lazy-src-fn t) lz-range-from))
+             (range-from (+ (cseq-head s) n))
+             (loop (fx- n 1) (jolt-seq (seq-more s))))))
       (else (loop (fx- n 1) (jolt-seq (seq-more s)))))))
+;; The seq N (>0) elements into the bounded range whose next block CR has not been
+;; generated, or #f when it is not one or its values are not exact. Blocks are
+;; seq-chunk-size long from where the range started, so the target's block starts
+;; a whole number of blocks along and is generated alone; inside it the target is
+;; an index. A double range answers #f: its values are running sums, and v+k*step
+;; rounds differently from k additions.
+(define (range-skip cr n)
+  (and (jolt-lazyseq? cr)
+       (let ((t (jolt-lazyseq-thunk cr)))
+         (and (lazy-src? t) (eq? (lazy-src-fn t) lz-range)
+              (let ((v (lazy-src-a t)) (b (lazy-src-b t)))
+                (and (exact? v) (exact? (cadr b))
+                     (let* ((step (cadr b))
+                            (j (fxremainder n seq-chunk-size))
+                            (c (range-chunked (+ v (* (fx- n j) step)) (car b) step (caddr b))))
+                       (cond ((not (cseq? c)) jolt-empty-list)
+                             ((fx=? j 0) c)
+                             ((fx<? j (pvec-count (cseq-cvec c)))
+                              (cseq-chunked/k (cseq-cvec c) j (cseq-crest c) (cseq-kind c)))
+                             (else jolt-empty-list)))))))))
+;; drop-walk for a take-drop-count: 'all walks the source to its end, realizing
+;; it as the JVM's step loop does, since that countdown never ends.
+(define (drop-walk-count c s)
+  (if (eq? c 'all)
+      (let loop ((s s))
+        (if (jolt-nil? s) jolt-empty-list (loop (jolt-seq (seq-more s)))))
+      (drop-walk c s)))
 ;; A Repeat cell N elements on, without walking: an unbounded repeat is the same
 ;; seq at every position, and a bounded one just has fewer left. #f when the
 ;; cell's tail has been forced already (its count is no longer at hand) — the
@@ -2012,12 +2171,7 @@
 (define lz-drop
   (register-lazy-src! 'drop
     (lambda (n0 coll)
-     (jolt-seq
-      (let ((c (take-drop-count n0)))
-        (if (eq? c 'all)
-            (let loop ((s (jolt-seq coll)))
-              (if (jolt-nil? s) jolt-empty-list (loop (jolt-seq (seq-more s)))))
-            (drop-walk c (jolt-seq coll))))))))
+     (jolt-seq (drop-walk-count (take-drop-count n0) (jolt-seq coll))))))
 ;; clojure.lang.IDrop — the colls Clojure 1.12's drop hands the count to, eagerly,
 ;; getting back the coll's own kind of seq: PersistentVector and its ChunkedSeq,
 ;; LongRange, Repeat, StringSeq, PersistentArrayMap and its Seq. Not Range, a
@@ -2053,6 +2207,33 @@
               (if (jolt-nil? s) jolt-empty-list (drop-walk k s)))
             (if (jolt-nil? s) jolt-empty-list s)))
       (jolt-make-lazy-src lz-drop n coll)))
+
+;; clojure.core/nthrest and nthnext, as Clojure 1.12 has them: an IDrop coll is
+;; handed the count (the skip drop-walk does), anything else is stepped — through
+;; drop-walk too, whose skips land on the very cell the step loop would. Both are
+;; eager. nthrest: coll itself for n<=0, () past the end. nthnext: (seq coll) for
+;; n<=0, nil past the end; off an IDrop coll it checks n before seqing, off any
+;; other an empty coll answers nil whatever n is, as the reference's
+;; (and xs (pos? n)) does.
+(define (jolt-nthrest coll n)
+  (if (jolt-pos? n)
+      (if (idrop-coll? coll)
+          (let* ((k (idrop-count n)) (s (jolt-seq coll)))
+            (if (jolt-nil? s) jolt-empty-list (drop-walk k s)))
+          (let ((s (jolt-seq coll)))
+            (if (jolt-nil? s) jolt-empty-list (drop-walk-count (take-drop-count n) s))))
+      coll))
+(define (jolt-nthnext coll n)
+  (define (nil-if-empty r) (if (cseq? r) r jolt-nil))
+  (if (idrop-coll? coll)
+      (if (jolt-pos? n)
+          (let* ((k (idrop-count n)) (s (jolt-seq coll)))
+            (if (jolt-nil? s) jolt-nil (nil-if-empty (drop-walk k s))))
+          (jolt-seq coll))
+      (let ((s (jolt-seq coll)))
+        (cond ((jolt-nil? s) jolt-nil)
+              ((jolt-pos? n) (nil-if-empty (drop-walk-count (take-drop-count n) s)))
+              (else s)))))
 
 ;; (iterate f x) — x, (f x), (f (f x)), … as ONE lazy cell per element.
 ;; The overlay spelling, (cons x (lazy-seq (iterate f (f x)))), costs two records
@@ -2275,19 +2456,17 @@
         (let ((e (seq-first s)))
           (unless (entry-like? e) (entry-cast-error e))
           (loop (jolt-seq (seq-more s)) (cons (jolt-nth e idx jolt-nil) acc))))))
-(define (sel-key k v) k)
-(define (sel-val k v) v)
 (define (jolt-keys m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (pmap-view-seq m sel-key sk-key-seq))
+        ((pmap? m) (pmap-view-seq m 1 sk-key-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (pmap-view-seq m sel-key sk-key-seq))
+        ((pmap? (jolt-seq m)) (pmap-view-seq m 1 sk-key-seq))
         (else (entry-seq-part m 0 sk-key-seq))))
 (define (jolt-vals m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (pmap-view-seq m sel-val sk-val-seq))
+        ((pmap? m) (pmap-view-seq m 2 sk-val-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (pmap-view-seq m sel-val sk-val-seq))
+        ((pmap? (jolt-seq m)) (pmap-view-seq m 2 sk-val-seq))
         (else (entry-seq-part m 1 sk-val-seq))))
 
 ;; ============================================================================
@@ -2295,7 +2474,31 @@
 ;; consistent with the persistent vector's element-wise =/hash so a vector and a
 ;; list of the same elements are jolt= and hash alike.
 ;; ============================================================================
+;; How many elements X has, when that is known without walking or realizing
+;; anything -- #f otherwise. The JVM's Counted, as ASeq.equiv and
+;; APersistentVector.doEquiv consult it: a vector, (), a counted cell (cseqn: a
+;; list, a string/array/reverse-vector seq), a vector's own seq, and a range whose
+;; next chunk is not yet built (range-rest-count).
+(define (seq-known-count x)
+  (cond ((pvec? x) (pvec-count x))
+        ((cseqn? x) (cseqn-cnt x))
+        ((cseqv? x)
+         (let ((here (fx- (pvec-count (cseqv-cvec x)) (cseqv-ci x))) (cr (cseqv-crest x)))
+           (if cr
+               (let ((k (range-rest-count cr))) (and k (+ here k)))
+               here)))
+        ((empty-list-t? x) 0)
+        (else #f)))
+;; Two sequential colls whose counts are both known and differ are unequal, so the
+;; walk is skipped -- ASeq.equiv's `this instanceof Counted && obj instanceof
+;; Counted && count() != count()`. Only when BOTH are known: counting a lazy side
+;; would realize it, which the walk below may never have to do.
 (define (seq=? a b)
+  (let ((ca (seq-known-count a)))
+    (if (and ca (let ((cb (seq-known-count b))) (and cb (not (= ca cb)))))
+        #f
+        (seq=?-walk a b))))
+(define (seq=?-walk a b)
   (let loop ((sa (jolt-seq a)) (sb (jolt-seq b)))
     (cond ((and (jolt-nil? sa) (jolt-nil? sb)) #t)
           ((or (jolt-nil? sa) (jolt-nil? sb)) #f)

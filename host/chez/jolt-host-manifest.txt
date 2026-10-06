@@ -224,6 +224,8 @@ set-var!
 sh
 sh-out
 slice
+sorted-seq
+sorted-seq-from
 source-roots
 stash-inline!
 static-member

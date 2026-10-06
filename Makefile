@@ -125,7 +125,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
   hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
-  shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
+  shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
@@ -182,7 +182,7 @@ install: build
 
 CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
-  transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
+  transient sortedcoll rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
@@ -918,6 +918,11 @@ continuations:
 flow:
 	@bin/jolt run test/chez/flow-test.clj
 
+# Sorted colls: the lazy tree walk behind seq/rseq/keys/vals/subseq, and hash/=
+# answered from the tree. Values pinned to the JVM; scaling pinned as allocation.
+sortedcoll:
+	@$(CHEZ) --script test/chez/sorted-test.ss
+
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
 	@$(CHEZ) --script test/chez/transient-test.ss
@@ -1095,7 +1100,8 @@ staticsite:
 	@$(CHEZ) --script host/chez/run-staticsite.ss
 
 # Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
-# transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
+# transients a slot buffer, their seq views vector-backed; a hash map's seq view
+# is a lazy chunked walk of its trie (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
 

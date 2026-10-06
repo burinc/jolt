@@ -294,6 +294,8 @@
 (def-var! "clojure.core" "reduce-kv" jolt-reduce-kv)
 (def-var! "clojure.core" "take-while" jolt-take-while)
 (def-var! "clojure.core" "drop-while" jolt-drop-while)
+(def-var! "clojure.core" "nthrest" jolt-nthrest)
+(def-var! "clojure.core" "nthnext" jolt-nthnext)
 (def-var! "clojure.core" "partition" jolt-partition)
 (def-var! "clojure.core" "sort" jolt-sort)
 (def-var! "clojure.core" "identical?" jolt-identical?-fn)
@@ -316,7 +318,8 @@
 (define (vec->rseq v i)
   (if (fx<? i 0)
       jolt-nil
-      (cseq-lazy/k (pvec-nth-d v i jolt-nil) (make-lazy-src lz-vec-rseq v i) sk-rseq)))
+      ;; counted (cseqn): an RSeq's count() is i+1
+      (make-cseqn (pvec-nth-d v i jolt-nil) (make-lazy-src lz-vec-rseq v i) sk-rseq jolt-nil (fx+ i 1))))
 (define (jolt-rseq coll)
   (cond
     ((pvec? coll)
@@ -324,9 +327,8 @@
        (if (fx=? n 0) jolt-nil (vec->rseq coll (fx- n 1)))))
     ;; a sorted coll's descending seq is still a PersistentTreeMap$Seq on the JVM
     ;; (the same class with ascending=false), not an RSeq — that one is the vector's.
-    ((htable-sorted? coll)
-     (list->cseq/k (reverse (seq->list (jolt-seq coll)))
-                   (if (htable-sorted-set? coll) sk-key-seq sk-treemap-seq)))
+    ;; The :rseq op is the lazy walk run right to left (host-table.ss).
+    ((htable-sorted? coll) (sc-call coll kw-op-rseq))
     ;; a deftype/record implementing clojure.lang.Reversible (rseq) — e.g.
     ;; data.priority-map — drives rseq through its own method.
     ((and (jrec? coll) (find-method-any-protocol (jrec-tag coll) "rseq"))

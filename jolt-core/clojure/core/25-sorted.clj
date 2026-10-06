@@ -220,14 +220,10 @@
     (tree-collect (nd-right t) proj
                   (conj (tree-collect (nd-left t) proj acc) (proj t)))))
 
-;; NOTE the seq below stays EAGER on purpose. A lazy in-order walk (the reference's
-;; stack-based PersistentTreeMap$Seq) makes first/take O(log n) but costs 1.5x on a
-;; FULL walk here, because jolt's per-cell overhead is higher than the JVM's and the
-;; explicit stack allocates per node — measured 108ms -> 164ms over 200k even with
-;; the walk chunked 32 at a time (larger chunks were worse still: 175ms at 128,
-;; 179ms at 512). Routing `first` to the spine walk above gets the headline case
-;; without that trade. Making take/subseq lazy too needs the per-cell cost down
-;; first — bead jolt-r8tz.7.
+;; The seq is NOT built here. jolt.host/sorted-seq walks the tree with an explicit
+;; stack (Clojure's PersistentTreeMap$Seq) in the host, a chunk of up to 32 nodes
+;; at a time: O(log n) to the first element, and a full walk cheaper than running
+;; the tree into a vector was. mode 0 walks map entries, 1 keys, 2 vals.
 
 (defn- make-sorted [tag tree cnt cmp cmp-fn ops]
   (-> (jolt.host/tagged-table tag)
@@ -237,7 +233,7 @@
       (jolt.host/ref-put! :cmp-fn cmp-fn)
       (jolt.host/ref-put! :ops ops)))
 
-;; entries as a vector (ascending), the materialized form seq/rseq/subseq use.
+;; entries as a vector (ascending).
 (defn- sc-entries [sc proj]
   (tree-collect (sfield sc :tree) proj []))
 
@@ -337,8 +333,8 @@
 (def ^:private sm-ops
   {:count    (fn [sm] (sfield sm :cnt))
    :entries  (fn [sm] (sc-entries sm map-entry))
-   :seq      (fn [sm] (seq (sc-entries sm map-entry)))
-   :rseq     (fn [sm] (seq (vec (reverse (sc-entries sm map-entry)))))
+   :seq      (fn [sm] (jolt.host/sorted-seq (sfield sm :tree) true 0))
+   :rseq     (fn [sm] (jolt.host/sorted-seq (sfield sm :tree) false 0))
    :first    (fn [sm] (when-let [t (sfield sm :tree)] (map-entry (nd-leftmost t))))
    :get      sm-get
    :entry-at sm-entry-at
@@ -351,8 +347,8 @@
 (def ^:private ss-ops
   {:count    (fn [ss] (sfield ss :cnt))
    :entries  (fn [ss] (sc-entries ss nd-key))
-   :seq      (fn [ss] (seq (sc-entries ss nd-key)))
-   :rseq     (fn [ss] (seq (vec (reverse (sc-entries ss nd-key)))))
+   :seq      (fn [ss] (jolt.host/sorted-seq (sfield ss :tree) true 1))
+   :rseq     (fn [ss] (jolt.host/sorted-seq (sfield ss :tree) false 1))
    :first    (fn [ss] (when-let [t (sfield ss :tree)] (nd-key (nd-leftmost t))))
    :get      ss-get
    :contains (fn [ss x] (not (nil? (tree-lookup (sfield ss :tree) (the-cmp ss) x))))
@@ -383,84 +379,22 @@
 ;; keep entries whose (cmp entry-key k) satisfies (test _ 0). Returns a seq or
 ;; nil, like Clojure.
 ;;
-;; Walks the red-black tree from the comparator bound (O(log n) seek) then
-;; lazily walks in-order successors (subseq) or predecessors (rsubseq).
+;; clojure.core's own definitions, over Sorted.seqFrom: jolt.host/sorted-seq-from
+;; seeks the bound in O(log n) and hands back the same lazy stack walk seq uses,
+;; so walking on costs amortized O(1) per entry in either direction.
 
-(defn- sc-proj [sc] (if (sorted-map? sc) map-entry nd-key))
+(defn- sc-mode [sc] (if (sorted-map? sc) 0 1))
 
-;; Find the leftmost node whose key satisfies (test (cmp key k) 0).
-(defn- seek-leftmost [tree cmp test k]
-  (letfn [(go [node best]
-            (if node
-              (let [c (cmp (nd-key node) k)]
-                (if (test c 0)
-                  (go (nd-left node) node)
-                  (if (or (identical? test <) (identical? test <=))
-                    (go (nd-left node) best)
-                    (go (nd-right node) best))))
-              best))]
-    (go tree nil)))
+;; clojure.core/mk-bound-fn
+(defn- mk-bound-fn [sc test k]
+  (let [cmp (the-cmp sc) map? (sorted-map? sc)]
+    (fn [e] (test (cmp (if map? (key e) e) k) 0))))
 
-;; Find the rightmost node whose key satisfies (test (cmp key k) 0).
-(defn- seek-rightmost [tree cmp test k]
-  (letfn [(go [node best]
-            (if node
-              (let [c (cmp (nd-key node) k)]
-                (if (test c 0)
-                  (go (nd-right node) node)
-                  (if (or (identical? test <) (identical? test <=))
-                    (go (nd-left node) best)
-                    (go (nd-right node) best))))
-              best))]
-    (go tree nil)))
+(defn- seq-from [sc k asc?]
+  (jolt.host/sorted-seq-from (sfield sc :tree) asc? (sc-mode sc) (the-cmp sc) k))
 
-;; In-order successor: find the next node after `node` in the tree rooted at `root`.
-(defn- inorder-succ [root node cmp]
-  (let [right (nd-right node)]
-    (if right
-      (letfn [(leftmost [n] (if-let [l (nd-left n)] (recur l) n))]
-        (leftmost right))
-      (let [key (nd-key node)]
-        (letfn [(find-anc [n succ]
-                  (if n
-                    (let [c (cmp key (nd-key n))]
-                      (cond (neg? c) (find-anc (nd-left n) n)
-                            (pos? c) (find-anc (nd-right n) succ)
-                            :else succ))
-                    succ))]
-          (find-anc root nil))))))
-
-;; In-order predecessor: find the previous node before `node` in the tree rooted at `root`.
-(defn- inorder-pred [root node cmp]
-  (let [left (nd-left node)]
-    (if left
-      (letfn [(rightmost [n] (if-let [r (nd-right n)] (recur r) n))]
-        (rightmost left))
-      (let [key (nd-key node)]
-        (letfn [(find-anc [n pred]
-                  (if n
-                    (let [c (cmp key (nd-key n))]
-                      (cond (pos? c) (find-anc (nd-right n) n)
-                            (neg? c) (find-anc (nd-left n) pred)
-                            :else pred))
-                    pred))]
-          (find-anc root nil))))))
-
-(defn- subseq-from [root node cmp proj stop-test stop-k]
-  (lazy-seq
-    (when node
-      (let [key (nd-key node)]
-        (when (or (not stop-test) (stop-test (cmp key stop-k) 0))
-          (cons (proj node)
-                (subseq-from root (inorder-succ root node cmp) cmp proj stop-test stop-k)))))))
-
-(defn- rsubseq-from [root node cmp proj stop-test stop-k]
-  (lazy-seq
-    (when node
-      (let [key (nd-key node)]
-        (when (or (not stop-test) (stop-test (cmp key stop-k) 0))
-          (cons (proj node)
-                (rsubseq-from root (inorder-pred root node cmp) cmp proj stop-test stop-k)))))))
+(defn- sc-seq [sc asc?]
+  (jolt.host/sorted-seq (sfield sc :tree) asc? (sc-mode sc)))
 
 (defn- assert-sorted [sc]
   (when-not (sorted? sc)
@@ -469,35 +403,27 @@
 (defn subseq
   ([sc test k]
    (assert-sorted sc)
-   (let [tree (sfield sc :tree)
-         cmp (the-cmp sc)
-         proj (sc-proj sc)
-         start (seek-leftmost tree cmp test k)]
-     (when start
-       (subseq-from tree start cmp proj test k))))
+   (let [include (mk-bound-fn sc test k)]
+     (if (or (identical? test >) (identical? test >=))
+       (when-let [s (seq-from sc k true)]
+         (if (include (first s)) s (next s)))
+       (take-while include (sc-seq sc true)))))
   ([sc start-test start-k end-test end-k]
    (assert-sorted sc)
-   (let [tree (sfield sc :tree)
-         cmp (the-cmp sc)
-         proj (sc-proj sc)
-         start (seek-leftmost tree cmp start-test start-k)]
-     (when start
-       (subseq-from tree start cmp proj end-test end-k)))))
+   (when-let [s (seq-from sc start-k true)]
+     (take-while (mk-bound-fn sc end-test end-k)
+                 (if ((mk-bound-fn sc start-test start-k) (first s)) s (next s))))))
 
 (defn rsubseq
   ([sc test k]
    (assert-sorted sc)
-   (let [tree (sfield sc :tree)
-         cmp (the-cmp sc)
-         proj (sc-proj sc)
-         start (seek-rightmost tree cmp test k)]
-     (when start
-       (rsubseq-from tree start cmp proj test k))))
+   (let [include (mk-bound-fn sc test k)]
+     (if (or (identical? test <) (identical? test <=))
+       (when-let [s (seq-from sc k false)]
+         (if (include (first s)) s (next s)))
+       (take-while include (sc-seq sc false)))))
   ([sc start-test start-k end-test end-k]
    (assert-sorted sc)
-   (let [tree (sfield sc :tree)
-         cmp (the-cmp sc)
-         proj (sc-proj sc)
-         start (seek-rightmost tree cmp end-test end-k)]
-     (when start
-       (rsubseq-from tree start cmp proj start-test start-k)))))
+   (when-let [s (seq-from sc end-k false)]
+     (take-while (mk-bound-fn sc start-test start-k)
+                 (if ((mk-bound-fn sc end-test end-k) (first s)) s (next s))))))

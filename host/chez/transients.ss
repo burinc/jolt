@@ -2,9 +2,14 @@
 ;; collection on persistent!. conj!/assoc!/dissoc!/disj!/pop! mutate in place
 ;; (amortized O(1)); persistent! converts back to a pvec / pmap / pset once.
 ;;
-;;   vec : a growable Scheme vector (capacity) + a fill count `n`. conj!/pop! are
-;;         O(1) amortized — the old copy-on-write rebuilt the whole vector per op,
-;;         so building an N-vector was O(N^2).
+;;   vec : the SOURCE pvec as a shared, untouched base (in `ord`) + a growable
+;;         Scheme vector of the elements conj!ed past it + the total count `n`.
+;;         Creating the transient is O(1) like the JVM's TransientVector, so
+;;         (into big-v small-xs) costs the xs, not the whole of big-v; conj! is
+;;         O(1) amortized and persistent! appends the buffer onto the base a
+;;         32-chunk at a time. assoc!/pop! inside the base are O(log32 n)
+;;         persistent ops on it. A source that fits in one tail chunk is
+;;         copied into the buffer outright (base #f).
 ;;   map : an EDITABLE HAMT (collections.ss enode) sharing the source map's root
 ;;         — a write claims each node on its path once and then mutates in
 ;;         place, so persistent! only has to freeze the claimed spine. An
@@ -28,7 +33,8 @@
 ;; test is on the node types, never vector?: a target may represent records
 ;; as vectors.) In both `n` is the entry count (array mode uses slots 0 .. 2n-1). A
 ;; transient SET is always hash mode, like PersistentHashSet. For a vector `n`
-;; is the element count. `ord` is unused.
+;; is the element count and `ord` the base pvec (or #f); `ord` is unused by the
+;; other kinds.
 ;;
 ;; Array mode promotes to hash mode when a new key would grow the map past its
 ;; CAPACITY — TransientArrayMap's rule: max(8 entries, the source map's size),
@@ -47,10 +53,12 @@
 (define (jolt-transient-new coll)
   (cond
     ((pvec? coll)
-     (let* ((v (pvec-v coll)) (cnt (vector-length v)) (cap (fxmax tvec-min-cap cnt))
-            (buf (make-vector cap jolt-nil)))
-       (sa-vector-copy-range! buf 0 v 0 cnt)
-       (make-jolt-transient 'vec buf cnt #t #f)))
+     (let ((cnt (pvec-cnt coll)))
+       (if (fx<=? cnt pv-width)
+           (let ((buf (make-vector (fxmax tvec-min-cap cnt) jolt-nil)))
+             (sa-vector-copy-range! buf 0 (pvec-v coll) 0 cnt)
+             (make-jolt-transient 'vec buf cnt #t #f))
+           (make-jolt-transient 'vec (make-vector tvec-min-cap jolt-nil) cnt #t coll))))
     ((pmap? coll)
      ;; The source's mode rides along. An array-mode map's slots are copied
      ;; into a buffer of max(16, its own length) slots and it comes back an
@@ -169,13 +177,19 @@
   (jolt-transient-active-set! t #f)
   (case (jolt-transient-kind t)
     ((vec)
-     (let ((buf (jolt-transient-buf t)) (cnt (jolt-transient-n t)))
-       ;; exact fit: hand off the buffer (no other reference exists, and the
-       ;; transient is now inactive so it can't mutate it). Else trim to size —
-       ;; a pvec's backing length must equal its count.
-       (if (fx=? cnt (vector-length buf))
-           (make-pvec buf)
-           (make-pvec (vec-copy-range buf 0 cnt)))))
+     (let ((buf (jolt-transient-buf t)) (cnt (jolt-transient-n t)) (base (jolt-transient-ord t)))
+       (cond
+         ;; based: the buffered tail goes onto the shared trie; the result is a
+         ;; plain vector without the source's metadata or kind (the JVM's
+         ;; persistent() builds a fresh PersistentVector, meta null)
+         (base
+          (let ((p (pvec-append-flat base buf (fx- cnt (pvec-cnt base)))))
+            (%mk-pvec (pvec-cnt p) (pvec-shift p) (pvec-root p) (pvec-tail p) #f 0 jolt-nil)))
+         ;; exact fit: hand off the buffer (no other reference exists, and the
+         ;; transient is now inactive so it can't mutate it). Else trim to size —
+         ;; a pvec's backing length must equal its count.
+         ((fx=? cnt (vector-length buf)) (make-pvec buf))
+         (else (make-pvec (vec-copy-range buf 0 cnt))))))
       ((map)
        (let ((buf (jolt-transient-buf t)) (n (jolt-transient-n t)))
          (if (not (or (enode? buf) (hnode? buf)))
@@ -195,23 +209,55 @@
     (else (jolt-transient-buf t))))))
 
 ;; --- in-place mutation -------------------------------------------------------
+;; A transient vector's index space: [0, off) is the base pvec, [off, n) the
+;; buffer from slot 0.
+(define (tvec-off t) (let ((base (jolt-transient-ord t))) (if base (pvec-cnt base) 0)))
+(define (tvec-ref t i)                   ; i already in bounds
+  (let ((off (tvec-off t)))
+    (if (fx<? i off)
+        (pvec-nth-in-range (jolt-transient-ord t) i)
+        (vector-ref (jolt-transient-buf t) (fx- i off)))))
 (define (tvec-ensure! t need)            ; grow capacity to >= need by doubling
   (let ((buf (jolt-transient-buf t)))
     (when (fx>? need (vector-length buf))
       (let* ((ncap (let grow ((c (fxmax tvec-min-cap (vector-length buf)))) (if (fx>=? c need) c (grow (fx* 2 c)))))
-             (nbuf (make-vector ncap jolt-nil)) (cnt (jolt-transient-n t)))
-        (sa-vector-copy-range! nbuf 0 buf 0 cnt)
+             (nbuf (make-vector ncap jolt-nil)))
+        (sa-vector-copy-range! nbuf 0 buf 0 (fx- (jolt-transient-n t) (tvec-off t)))
         (jolt-transient-buf-set! t nbuf)))))
 (define (tvec-conj1! t x)
-  (let ((cnt (jolt-transient-n t)))
-    (tvec-ensure! t (fx+ cnt 1))
-    (vector-set! (jolt-transient-buf t) cnt x)
+  (let ((cnt (jolt-transient-n t)) (off (tvec-off t)))
+    (tvec-ensure! t (fx+ (fx- cnt off) 1))
+    (vector-set! (jolt-transient-buf t) (fx- cnt off) x)
     (jolt-transient-n-set! t (fx+ cnt 1))))
 (define (tvec-assoc1! t i x)
-  (let ((i (->idx i)) (cnt (jolt-transient-n t)))
-    (cond ((and (fixnum? i) (fx>=? i 0) (fx<? i cnt)) (vector-set! (jolt-transient-buf t) i x))
+  (let ((i (->idx i)) (cnt (jolt-transient-n t)) (off (tvec-off t)))
+    (cond ((and (fixnum? i) (fx>=? i 0) (fx<? i off))
+           (jolt-transient-ord-set! t (pvec-assoc (jolt-transient-ord t) i x)))
+          ((and (fixnum? i) (fx>=? i off) (fx<? i cnt)) (vector-set! (jolt-transient-buf t) (fx- i off) x))
           ((and (fixnum? i) (fx=? i cnt)) (tvec-conj1! t x))
           (else (throw-jvm (quote IndexOutOfBoundsException) "assoc!: index out of bounds")))))
+(define (tvec-pop1! t)
+  (let ((cnt (jolt-transient-n t)))
+    (cond ((fx=? cnt 0) (throw-jvm (quote IllegalStateException) "pop!: can't pop empty transient vector"))
+          ;; nothing buffered: the last element is the base's
+          ((fx=? cnt (tvec-off t)) (jolt-transient-ord-set! t (pvec-pop (jolt-transient-ord t))))
+          (else (vector-set! (jolt-transient-buf t) (fx- (fx- cnt (tvec-off t)) 1) jolt-nil)))
+    (jolt-transient-n-set! t (fx- cnt 1))))
+;; p with buf[0, k) appended: top the tail up to a full chunk in one copy, and
+;; let pvec-conj push it into the trie (one path copy per 32 elements) — never
+;; the per-element tail copy a conj loop would pay.
+(define (pvec-append-flat p buf k)
+  (let loop ((p p) (i 0))
+    (if (fx=? i k)
+        p
+        (let* ((tail (pvec-tail p)) (tl (vector-length tail)))
+          (if (fx<? tl pv-width)
+              (let* ((m (fxmin (fx- pv-width tl) (fx- k i))) (nt (make-vector (fx+ tl m))))
+                (sa-vector-copy-range! nt 0 tail 0 tl)
+                (sa-vector-copy-range! nt tl buf i (fx+ i m))
+                (loop (mk-pvec (fx+ (pvec-cnt p) m) (pvec-shift p) (pvec-root p) nt (pv-derived-ent p))
+                      (fx+ i m)))
+              (loop (pvec-conj p (vector-ref buf i)) (fx+ i 1)))))))
 ;; conj! onto a transient map: a [k v] pair (vector/map-entry) or a whole map.
 (define (tmap-conj-entry! t x)
   (cond
@@ -293,9 +339,7 @@
     (else
   (jolt-trans-check t "pop!")
   (case (jolt-transient-kind t)
-    ((vec) (let ((cnt (jolt-transient-n t)))
-             (if (fx=? cnt 0) (throw-jvm (quote IllegalStateException) "pop!: can't pop empty transient vector")
-                 (jolt-transient-n-set! t (fx- cnt 1)))))
+    ((vec) (tvec-pop1! t))
     (else (jolt-transient-buf-set! t (jolt-pop (jolt-transient-buf t)))))
   t)))
 
@@ -331,7 +375,7 @@
 (define (t-get t k d)
   (jolt-trans-check t "get")
   (case (jolt-transient-kind t)
-    ((vec) (let ((i (->idx k))) (if (tvec-in-bounds? t i) (vector-ref (jolt-transient-buf t) i) d)))
+    ((vec) (let ((i (->idx k))) (if (tvec-in-bounds? t i) (tvec-ref t i) d)))
     ((map) (if (tmap-array? t)
                (let* ((buf (jolt-transient-buf t)) (i (amap-index buf (fx* 2 (jolt-transient-n t)) k)))
                  (if (fx<? i 0) d (vector-ref buf (fx+ i 1))))
