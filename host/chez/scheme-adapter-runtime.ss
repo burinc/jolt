@@ -710,18 +710,6 @@
               (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
         '())))
 
-;; (sa-thread-id-of t) -> fixnum | #f
-;; The numeric id a thread OBJECT's own get-thread-id answers, read from any
-;; thread: its context's thread number. Contract: the id, or #f once the
-;; thread has exited (its context is released and the object marks it dead).
-;; Degradation: #f — the caller then records nothing for the thread.
-(define (sa-thread-id-of t)
-  (guard (e (#t #f))
-    (let ((tc (#%$thread-tc t)))
-      (and (not (eqv? tc 0))
-           (let ((n (#%$tc-field 'threadno tc)))
-             (and (fixnum? n) n))))))
-
 ;; (sa-procedure-info x) -> (name . ((free-name . value) ...)) | #f
 ;; A procedure's inspector name and live free-variable captures, in
 ;; registration order — what the image graph needs to serialize closures
@@ -1517,6 +1505,33 @@
 ;; run time the way the sa-* seams are.
 (load "host/chez/locks.ss")
 (load "host/chez/fibers.ss")
+
+;; (sa-thread-id-of t) -> fixnum | #f
+;; The numeric id a thread OBJECT's own get-thread-id answers, read from any
+;; thread: its context's thread number. Contract: the id, or #f once the
+;; thread has exited (its context is released and the object marks it dead).
+;; Degradation: #f — the caller then records nothing for the thread.
+;;
+;; Both reads happen under Chez's thread-context mutex, interrupts off, as its own
+;; with-tc-mutex does. An exiting thread frees its context and only then marks
+;; the object dead, both under that mutex, and a new thread's context is malloc'd
+;; and copied from its parent's under it too. Read without it, a child that had
+;; just finished could hand back a freed context, and the threadno read from that
+;; memory was whatever was there now: often 0, the boot thread's number, copied
+;; in for a thread the boot thread was creating. Thread.start then filed the
+;; child's object under the boot thread, whose Thread/currentThread became the
+;; child. Defined after locks.ss, since jolt-with-mutex is a macro.
+(define (sa-thread-id-of t)
+  (guard (e (#t #f))
+    (dynamic-wind
+      disable-interrupts
+      (lambda ()
+        (jolt-with-mutex #%$tc-mutex
+          (let ((tc (#%$thread-tc t)))
+            (and (not (eqv? tc 0))
+                 (let ((n (#%$tc-field 'threadno tc)))
+                   (and (fixnum? n) n))))))
+      enable-interrupts)))
 
 ;; (sa-pin-for-owner! owner obj) -> void
 ;; (sa-unpin-for-owner! owner) -> void
