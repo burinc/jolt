@@ -1236,9 +1236,7 @@
      (if (jolt-transient? coll)
          (if (eq? (jolt-transient-kind coll) 'vec)
              (let ((idx (->idx i)))
-               (if (tvec-in-bounds? coll idx)
-                   (tvec-ref coll idx)
-                   d))
+               (if (tvec-in-bounds? coll idx) (tvec-ref coll idx) d))
              (%r-jolt-nth (jolt-transient-buf coll) i d))
          (%r-jolt-nth coll i d)))))
 

@@ -136,7 +136,6 @@
 ;; tail already a seq. The /k variants take the flavor; the bare ones are the
 ;; generic cell, which is the overwhelming majority of call sites.
 (define (cseq-realized head tail) (make-cseq head tail sk-cons jolt-nil))
-(define (cseq-realized/k head tail kind) (make-cseq head tail kind jolt-nil))
 (define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk sk-cons jolt-nil))
 (define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk kind jolt-nil))
 ;; A PersistentList node. Onto nil, or onto a cell that knows its count, it is a
