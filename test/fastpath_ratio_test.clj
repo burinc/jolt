@@ -60,10 +60,13 @@
 ;;                      A char array of n elements is a flat 4-byte-per-character
 ;;                      string the collector never traces; a boxed vector of the
 ;;                      same n is n POINTERS at 8 bytes that it traces on every
-;;                      major GC. So allocating a char array must be FASTER than
-;;                      allocating a long array of the same length — the ceiling
-;;                      here is deliberately below 1.0, and a boxed char backing
-;;                      brings it straight back to parity (0.49 -> 1.02).
+;;                      major GC. So a char array must hold half the heap of a
+;;                      long array of the same length: 0.50, where a boxed char
+;;                      backing reads 1.00 (as object-array does). Measured in
+;;                      BYTES, not time: timed, this arm's cost was set by the
+;;                      adaptive nursery the earlier arms left behind — the same
+;;                      binary read 0.29 to 0.53 across nursery sizes, and CI
+;;                      runners 0.81 and 0.87 against the 0.8 ceiling.
 ;;
 ;;   substring-scan     str-index-of is the widest-reach scan in the string
 ;;                      layer: indexOf, contains, literal split and both literal
@@ -198,6 +201,34 @@
             (do (println (format "  %s: %.2f — in the re-measure band, sampling again" label r1))
                 (ratio))
             r1)]
+    (println (format "  %-18s ratio %6.2f  (ceiling %.1f)%s"
+                     label r ceiling (if (> r ceiling) "  <-- REGRESSED" "")))
+    (when (> r ceiling)
+      (swap! failures conj (format "%s: ratio %.2f exceeds ceiling %.1f" label r ceiling)))
+    r))
+
+;; The heap bytes 16 results of MK hold, from a fresh collection. Exact on this
+;; host (used memory is Chez's bytes-allocated), and 16 arrays of the size
+;; char-alloc makes stay under the smallest nursery jolt runs (16MB), so no
+;; collection lands between the two readings. Best of SAMPLES: anything else
+;; allocating meanwhile only adds.
+(defn- bytes-held [mk]
+  (let [rt (Runtime/getRuntime)
+        used #(- (.totalMemory rt) (.freeMemory rt))]
+    (reduce min
+            (repeatedly samples
+                        #(do (System/gc)
+                             (let [u0 (used)
+                                   held (vec (repeatedly 16 mk))
+                                   u1 (used)]
+                               (when (empty? held) (throw (ex-info "unreachable" {})))
+                               (- u1 u0)))))))
+
+(defn- judge-bytes!
+  "judge!, for a ratio of heap bytes held rather than of time: deterministic, so
+   no re-measure band."
+  [label ref-mk mk ceiling]
+  (let [r (/ (double (bytes-held mk)) (max 1 (bytes-held ref-mk)))]
     (println (format "  %-18s ratio %6.2f  (ceiling %.1f)%s"
                      label r ceiling (if (> r ceiling) "  <-- REGRESSED" "")))
     (when (> r ceiling)
@@ -365,12 +396,9 @@
           #(count (String. chars-array))
           1.35 2.5)
 
-  ;; ...and allocating one must beat allocating a long array of the same length,
-  ;; because its backing is half as wide and is never traced by the collector.
-  (judge! "char-alloc"
-          #(dotimes [_ 200] (alength (long-array 65536)))
-          #(dotimes [_ 200] (alength (char-array 65536)))
-          0.8 1.5)
+  ;; ...and a char array must take half the heap of a long array of the same
+  ;; length, because its backing is half as wide and is never traced.
+  (judge-bytes! "char-alloc" #(long-array 65536) #(char-array 65536) 0.8)
 
   ;; Searching for a multi-character needle must cost about what searching for a
   ;; single CHARACTER costs — the reference arm takes str-char-index, which never
