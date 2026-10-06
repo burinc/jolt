@@ -100,6 +100,12 @@
       (println (str "FAIL complexity " label ": " detail))
       (swap! failures inc))))
 
+;; A fn over a `case` of n string constants ("s0" -> 0 ...), default -1: the
+;; case row below dispatches to its LAST arm at 50 and at 200 constants.
+(defmacro ^:private string-case-fn [n]
+  (let [x (gensym "x")]
+    `(fn [~x] (case ~x ~@(mapcat (fn [i] [(str "s" i) i]) (range n)) -1))))
+
 (defn -main [& _]
   (let [v1 (vec (range n1))            v2 (vec (range n2))
         ;; source-shaped text: the window rows read a span out of the middle
@@ -392,6 +398,23 @@
              #(clojure.set/difference #{1 2 -1} b1)
              #(clojure.set/difference #{1 2 -1} b2)
              "difference is disj-ing every element of the bigger second set instead of filtering the smaller first one (stdlib/clojure/set.clj)"))
+
+    ;; A large `case` dispatches through one lookup in a constant map, not a chain
+    ;; of = tests, one per arm. The chain made a dispatch to the last of 400
+    ;; string constants ~8 us; the reference's case is a hashed tableswitch.
+    ;; Fixed sits ~1.4, not 1.0 — the 200-key map lookup measures ~105 ns
+    ;; against ~70 at 50 keys (deeper trie), and the index search is two
+    ;; compares longer; the chain reads ~4.0.
+    (let [c1 (string-case-fn 50) c4 (string-case-fn 200)
+          k1 (str "s" 49) k4 (str "s" 199)]
+      (when-not (and (= 49 (c1 k1)) (= 199 (c4 k4)) (= 0 (c4 (str "s" 0)))
+                     (= -1 (c4 "s200")) (= -1 (c4 nil)) (= -1 (c4 'x)) (= -1 (c1 k4)))
+        (println "FAIL complexity case-dispatch: wrong values before timing")
+        (System/exit 1))
+      (judge "case last arm"
+             #(c1 k1)
+             #(c4 k4)
+             "case is testing its constants one = at a time instead of looking the value up (00-syntax.clj case)"))
 
     (if (pos? @failures)
       (do (println (str "complexity: " @failures " section(s) failed"))
