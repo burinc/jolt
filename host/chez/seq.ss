@@ -654,22 +654,85 @@
   (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
 
-;; A map's entries, keys or vals as a VECTOR-BACKED seq of the given flavor: the
-;; selected values are built once into a pvec and the cells walk it by index. So
-;; count is O(1), reduce runs vec-reduce's tight loop over the vector, and
-;; stepping allocates one cell — where a cons chain cost a cell, a list pair and
-;; an entry per element up front, all before the first element was read. The
-;; vector is filled from its END through pmap-fold, whose visit order is the
-;; reverse of iteration order, so the view reads in iteration order in both
-;; modes. The flavor keeps the class answer (PersistentArrayMap$Seq, KeySeq…)
-;; and keeps chunked-seq? false: chunking is a property of the flavor, not of
-;; the representation.
-(define (pmap-view-seq m sel kind)
+;; A map's entries, keys or vals, and a set's elements, as a seq of the given
+;; flavor. MODE picks what each element is: 0 the entry, 1 the key, 2 the value.
+;;
+;; A hash-mode map is walked LAZILY, a chunk at a time (hamt-chunk-seq below),
+;; the way PersistentHashMap's NodeSeq is: (seq m), (first m), (keys m) and a
+;; `(when (seq m) …)` cost one descent plus one chunk, not a copy of the map.
+;; Building the whole view up front made every one of those O(n) — a worklist
+;; that takes `first` and then `disj`s it was quadratic.
+;;
+;; An array-mode map is small (or an explicit array-map someone chose) and stays
+;; VECTOR-BACKED: the selected values are built once into a pvec and the cells
+;; walk it by index, so count is O(1) and reduce runs vec-reduce's tight loop.
+;; The vector is filled from its END through pmap-fold, whose visit order is the
+;; reverse of iteration order, so the view reads in iteration order.
+;;
+;; The flavor keeps the class answer (PersistentArrayMap$Seq, KeySeq…) and keeps
+;; chunked-seq? false: chunking is a property of the flavor, not of the
+;; representation.
+(define (pmap-seq-sel mode k v)
+  (cond ((fx=? mode 0) (make-map-entry k v)) ((fx=? mode 1) k) (else v)))
+(define (pmap-view-seq m mode kind)
   (let ((n (pmap-cnt m)))
-    (if (fx=? n 0) jolt-nil
-        (let ((v (make-vector n)))
-          (pmap-fold m (lambda (k val i) (vector-set! v i (sel k val)) (fx- i 1)) (fx- n 1))
-          (cseq-vec (vector-ref v 0) (make-pvec v #f) 0 kind)))))
+    (cond
+      ((fx=? n 0) jolt-nil)
+      ((hnode? (pmap-root m)) (hamt-chunk-seq m mode '(0)))
+      (else
+       (let ((v (make-vector n)))
+         (pmap-fold m (lambda (k val i) (vector-set! v i (pmap-seq-sel mode k val)) (fx- i 1)) (fx- n 1))
+         (cseq-vec (vector-ref v 0) (make-pvec v #f) 0 kind))))))
+;; --- the lazy HAMT walk -------------------------------------------------------
+;; Each chunk is up to 32 leaves, read depth-first in exactly the order the
+;; vector fill above produced: a node's slots ascending, a child node's leaves in
+;; place of its slot, and a collision bucket's alist REVERSED (node-fold visits it
+;; forward, and the view reverses the visit). A chunk is a ChunkedCons cell of the
+;; map's own flavor whose after-chunk rest is a lazy cell for the next chunk, so
+;; walking within a chunk allocates nothing beyond the cell, and the walk as a
+;; whole stays O(n).
+;;
+;; Where the next chunk starts is a PATH of slot indices from the root — data,
+;; so the lazy cell is a lazy-src over (map, mode . path) and travels in a state
+;; image like any other producer. Resuming re-descends the path: O(depth) per
+;; chunk, i.e. O(log32 n), the same as NodeSeq's first.
+(define (hamt-slot-vec x)              ; a branch's slots, as a vector to index
+  (if (hnode? x) (hnode-arr x) (list->vector (reverse (hcoll-alist x)))))
+(define (hamt-mode-kind mode)
+  (cond ((fx=? mode 0) sk-hashmap-seq) ((fx=? mode 1) sk-key-seq) (else sk-val-seq)))
+(define lz-hamt-chunk
+  (register-lazy-src! 'hamt-chunk
+    (lambda (m mode+path) (hamt-chunk-seq m (car mode+path) (cdr mode+path)))))
+(define (hamt-chunk-seq m mode path)
+  (let ((buf (make-vector seq-chunk-size)))
+    ;; descend PATH: every index but the last names the branch being walked
+    (let descend ((vec (hnode-arr (pmap-root m))) (path path) (parents '()))
+      (if (pair? (cdr path))
+          (descend (hamt-slot-vec (vector-ref vec (car path))) (cdr path)
+                   (cons (cons vec (car path)) parents))
+          (let walk ((vec vec) (i (car path)) (parents parents) (n 0))
+            (cond
+              ((fx>=? i (vector-length vec))     ; this branch is done: pop it
+               (if (null? parents)
+                   (hamt-chunk-cell m mode buf n #f)
+                   (walk (caar parents) (fx+ (cdar parents) 1) (cdr parents) n)))
+              ((fx=? n seq-chunk-size)           ; full, and more follows: resume here
+               (hamt-chunk-cell m mode buf n
+                 (let up ((ps parents) (acc (list i)))
+                   (if (null? ps) acc (up (cdr ps) (cons (cdar ps) acc))))))
+              (else
+               (let ((x (vector-ref vec i)))
+                 (if (pair? x)
+                     (begin (vector-set! buf n (pmap-seq-sel mode (car x) (cdr x)))
+                            (walk vec (fx+ i 1) parents (fx+ n 1)))
+                     (walk (hamt-slot-vec x) 0 (cons (cons vec i) parents) n))))))))))
+(define (hamt-chunk-cell m mode buf n next)
+  (if (fx=? n 0)
+      jolt-nil
+      (cseq-chunked/k (make-pvec (if (fx=? n seq-chunk-size) buf (vec-copy-range buf 0 n)))
+                      0
+                      (if next (jolt-make-lazy-src lz-hamt-chunk m (cons mode next)) jolt-nil)
+                      (hamt-mode-kind mode))))
 (define (jolt-seq x)
   (cond
     ((jolt-nil? x) jolt-nil)
@@ -681,11 +744,11 @@
     ((empty-list-t? x) jolt-nil)
     ((pvec? x) (vec->seq x 0))
     ;; array mode and hash mode are different classes on the JVM, the same split
-    ;; (class …) already reports for the map itself. The view is vector-backed
-    ;; (pmap-view-seq): one entries vector, walked by index.
-    ((pmap? x) (pmap-view-seq x make-map-entry (if (pmap-array? x) sk-arraymap-seq sk-hashmap-seq)))
+    ;; (class …) already reports for the map itself. pmap-view-seq walks a
+    ;; hash-mode map lazily, a chunk at a time, and indexes an array map's vector.
+    ((pmap? x) (pmap-view-seq x 0 (if (pmap-array? x) sk-arraymap-seq sk-hashmap-seq)))
     ;; a set's seq is RT.keys over its backing map, i.e. an APersistentMap$KeySeq
-    ((pset? x) (list->cseq/k (pset-fold x cons '()) sk-key-seq))
+    ((pset? x) (pmap-view-seq (pset-m x) 1 sk-key-seq))
     ((string? x) (str->seq x 0))
     (else (let loop ((as jolt-seq-arms))
             (cond ((null? as) (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
@@ -2313,19 +2376,17 @@
         (let ((e (seq-first s)))
           (unless (entry-like? e) (entry-cast-error e))
           (loop (jolt-seq (seq-more s)) (cons (jolt-nth e idx jolt-nil) acc))))))
-(define (sel-key k v) k)
-(define (sel-val k v) v)
 (define (jolt-keys m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (pmap-view-seq m sel-key sk-key-seq))
+        ((pmap? m) (pmap-view-seq m 1 sk-key-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (pmap-view-seq m sel-key sk-key-seq))
+        ((pmap? (jolt-seq m)) (pmap-view-seq m 1 sk-key-seq))
         (else (entry-seq-part m 0 sk-key-seq))))
 (define (jolt-vals m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (pmap-view-seq m sel-val sk-val-seq))
+        ((pmap? m) (pmap-view-seq m 2 sk-val-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (pmap-view-seq m sel-val sk-val-seq))
+        ((pmap? (jolt-seq m)) (pmap-view-seq m 2 sk-val-seq))
         (else (entry-seq-part m 1 sk-val-seq))))
 
 ;; ============================================================================

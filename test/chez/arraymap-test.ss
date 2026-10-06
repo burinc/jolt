@@ -4,7 +4,8 @@
 ;; carries (a small map is one slot vector, never a trie; its transient is a
 ;; slot buffer; its seq view is vector-backed) and the promotion thresholds at
 ;; the representation level, so a regression back to a trie-backed small map
-;; fails here even where every value test still passes.
+;; fails here even where every value test still passes. It also pins the other
+;; mode's seq view: a hash map's is a lazy walk of the trie, a chunk at a time.
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
@@ -54,7 +55,7 @@
     (let ((s (jolt-seq (evv "{:a 1 :b 2 :c 3}"))))
       (and (cseq? s) (cseq-cvec s) (fx=? (cseq-kind s) sk-arraymap-seq)
            (fx=? 3 (pvec-count (cseq-cvec s))))))
-(ok "seq of a hash map carries its entries vector"
+(ok "seq of a hash map carries its first chunk"
     (let ((s (jolt-seq (evv "(hash-map :a 1 :b 2)"))))
       (and (cseq? s) (cseq-cvec s) (fx=? (cseq-kind s) sk-hashmap-seq))))
 (ok "keys and vals are vector-backed"
@@ -64,6 +65,82 @@
 (ok "rest of the seq view is still vector-backed"
     (let ((s (jolt-seq (evv "{:a 1 :b 2 :c 3}"))))
       (cseq-cvec (jolt-seq (seq-more s)))))
+
+;; --- a hash map's seq view is LAZY: one chunk per step, not a copy ------------
+;; (seq m), (first m), (keys m) and a set's seq used to build every entry before
+;; the first was read, so `(when (seq m) …)` was O(n) and a worklist that takes
+;; `first` and `disj`s it was quadratic. The view is now a walk of the trie, a
+;; 32-leaf chunk at a time (seq.ss hamt-chunk-seq). Allocation is deterministic,
+;; so these pin it in bytes rather than in time.
+(define (bytes-of thunk)
+  (thunk)
+  (let ((b0 (sstats-bytes (statistics))))
+    (do ((i 0 (fx+ i 1))) ((fx= i 10)) (thunk))
+    (quotient (- (sstats-bytes (statistics)) b0) 10)))
+(define small-m (evv "(zipmap (range 1000) (range 1000))"))
+(define big-m (evv "(zipmap (range 64000) (range 64000))"))
+(define small-s (evv "(set (range 1000))"))
+(define big-s (evv "(set (range 64000))"))
+(ok "seq of a hash map is a ChunkedCons of the map's flavor, not the whole map"
+    (let ((s (jolt-seq big-m)))
+      (and (cseq? s) (cseq-crest s) (fx=? (cseq-kind s) sk-hashmap-seq)
+           (fx<=? (pvec-count (cseq-cvec s)) 32))))
+(let ((check (lambda (name f small big)
+               (let ((a (bytes-of (lambda () (f small)))) (b (bytes-of (lambda () (f big)))))
+                 (printf "  ~a: ~a bytes at 1k, ~a at 64k\n" name a b)
+                 ;; one chunk of 32: ~0.8KB of keys, ~3.9KB of map entries
+                 ;; (each entry is a pvec). The old fill was ~100 bytes per
+                 ;; entry of the WHOLE map: ~6MB at 64k.
+                 (ok (string-append name " costs one chunk at any size (<= 6KB, and 64x the map adds <= 1KB)")
+                     (and (<= a 6144) (<= b 6144) (<= b (+ a 1024))))))))
+  (check "seq of a hash map" jolt-seq small-m big-m)
+  (check "first of a hash map" jolt-first small-m big-m)
+  (check "keys of a hash map" jolt-keys small-m big-m)
+  (check "vals of a hash map" jolt-vals small-m big-m)
+  (check "seq of a set" jolt-seq small-s big-s))
+;; the worklist: (first s) then (disj s x) until empty. Linear per element means
+;; bytes per element hold flat as the set grows four times; quadratic is ~4x.
+(let* ((drain (evv "(fn [s] (loop [s s n 0] (if-let [x (first s)] (recur (disj s x) (inc n)) n)))"))
+       (per (lambda (n) (let ((s (evv (format "(set (range ~a))" n))))
+                          (quotient (bytes-of (lambda () (jolt-invoke drain s))) n))))
+       (a (per 4000)) (b (per 16000)))
+  (printf "  first/disj worklist: ~a bytes/element at 4k, ~a at 16k\n" a b)
+  (ok "a first/disj worklist stays linear (bytes/element ratio <= 1.5, quadratic ~4)" (<= b (* 3/2 a))))
+(let ((per (quotient (bytes-of (lambda () (jolt-count (jolt-seq big-m)))) 64000)))
+  (printf "  full walk (count (seq m)) over 64k: ~a bytes/entry\n" per)
+  ;; ~96 of it is the map entry itself. The eager fill was ~113, all of it paid
+  ;; before the first element; walking a chunk at a time must not cost much more.
+  (ok "a full walk of the view stays cheap (<= 150 bytes per entry)" (<= per 150)))
+;; disj drops an emptied branch, as BitmapIndexedNode.without does: draining
+;; most of a set leaves no empty node for the next seq to step over.
+(ok "draining a set leaves no empty branch in its trie"
+    (let* ((s (evv "(reduce disj (set (range 5000)) (range 4990))"))
+           (persistent-t (evv "(persistent! (reduce disj! (transient (set (range 5000))) (range 4990)))")))
+      (define (no-empty? nd)
+        (let ((arr (hnode-arr nd)))
+          (let loop ((i 0))
+            (or (fx=? i (vector-length arr))
+                (let ((c (vector-ref arr i)))
+                  (and (or (not (hnode? c)) (and (not (fx=? 0 (vector-length (hnode-arr c)))) (no-empty? c)))
+                       (loop (fx+ i 1))))))))
+      (and (no-empty? (pmap-root (pset-m s))) (no-empty? (pmap-root (pset-m persistent-t)))
+           (fx=? 10 (pset-count s)) (fx=? 10 (pset-count persistent-t)))))
+;; the order is exactly the one the old vector fill produced: the reverse of
+;; pmap-fold's visit, collision buckets included. corpus rows depend on it.
+(ok "the lazy view reads in pmap-fold order (entries, keys, vals, sets, collisions)"
+    (let ((same? (lambda (m)
+                   (let ((ks (pmap-fold m (lambda (k v a) (cons k a)) '()))
+                         (vs (pmap-fold m (lambda (k v a) (cons v a)) '())))
+                     (and (equal? ks (seq->list (jolt-keys m)))
+                          (equal? vs (seq->list (jolt-vals m)))
+                          (equal? ks (map (lambda (e) (jolt-nth e 0 #f)) (seq->list (jolt-seq m)))))))))
+      (and (same? small-m) (same? big-m)
+           (same? (evv "(reduce dissoc (zipmap (range 3000) (range 3000)) (range 0 3000 3))"))
+           (same? (evv "(into (zipmap (range 40) (range 40)) (map vector (for [a [\"Aa\" \"BB\"] b [\"Aa\" \"BB\"] c [\"Aa\" \"BB\"]] (str a b c)) (range)))"))
+           (equal? (pset-fold big-s cons '()) (seq->list (jolt-seq big-s))))))
+(is "the lazy view counts, destructures and compares like the old one"
+    "(let [m (zipmap (range 100) (range 100)) [[k v] & more] (seq m)] [(count (seq m)) (count more) (= (seq m) (seq m)) (= (vec (seq m)) (vec (map (fn [k] [k (m k)]) (keys m))))])"
+    "[100 99 true true]")
 
 ;; --- transients: a slot buffer with the reference's capacity rule -------------
 (ok "transient of an array map is a 16-slot buffer"
