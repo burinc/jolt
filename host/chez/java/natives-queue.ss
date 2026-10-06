@@ -1,51 +1,62 @@
 ;; natives-queue.ss — clojure.lang.PersistentQueue for the Chez host.
 ;;
-;; A functional queue: a `front` Scheme list (the dequeue end, head = front of the
-;; queue) + a reversed `rear` Scheme list (the enqueue end, head = most recent).
-;; conj adds to rear; peek/first read front; pop drops the front, rebalancing
-;; rear->front when front empties — amortized O(1). A queue is jolt-sequential?, so
-;; seq=?/seq-hash give cross-type equality (= [1 2 3] (queue 1 2 3)) for free, like
-;; the JVM. Loaded after seq/collections/lazy-bridge/records/host-table so every
-;; dispatcher it chains is at its latest binding.
+;; Clojure's layout: a `front` pvec read from index `fi` (the dequeue end) and
+;; a `rear` pvec (the enqueue end, in order). conj appends to rear; peek/first
+;; read front[fi]; pop advances fi, and when front runs out the rear BECOMES
+;; the front in O(1) — the JVM's f = RT.seq(r). The old layout kept the rear as
+;; a reversed list and reversed it on that boundary, and since a queue is
+;; persistent, every pop of the same boundary queue paid the O(n) reverse again.
+;; A queue is jolt-sequential?, so seq=?/seq-hash give cross-type equality
+;; (= [1 2 3] (queue 1 2 3)) for free, like the JVM; its hash is cached like a
+;; seq head's (hasheq.ss). Loaded after seq/collections/lazy-bridge/records/
+;; host-table so every dispatcher it chains is at its latest binding.
 
-(define-record-type jolt-queue (fields front rear cnt) (nongenerative jolt-queue-v1))
-(define jolt-queue-empty (make-jolt-queue '() '() 0))
+(define-record-type jolt-queue (fields front fi rear cnt (mutable h))
+  (nongenerative jolt-queue-v2)
+  (protocol (lambda (new) (lambda (f fi r cnt) (new f fi r cnt #f)))))
+(define jolt-queue-empty (make-jolt-queue empty-pvec 0 empty-pvec 0))
 
 (define (queue-conj q x)
-  (if (null? (jolt-queue-front q))
-      (make-jolt-queue (list x) '() (fx+ (jolt-queue-cnt q) 1))
-      (make-jolt-queue (jolt-queue-front q) (cons x (jolt-queue-rear q)) (fx+ (jolt-queue-cnt q) 1))))
-(define (queue-peek q) (if (null? (jolt-queue-front q)) jolt-nil (car (jolt-queue-front q))))
+  (if (fx=? 0 (jolt-queue-cnt q))
+      (make-jolt-queue (jolt-vector x) 0 empty-pvec 1)
+      (make-jolt-queue (jolt-queue-front q) (jolt-queue-fi q)
+                       (pvec-conj (jolt-queue-rear q) x) (fx+ (jolt-queue-cnt q) 1))))
+(define (queue-peek q)
+  (if (fx=? 0 (jolt-queue-cnt q)) jolt-nil (pvec-nth-in-range (jolt-queue-front q) (jolt-queue-fi q))))
 (define (queue-pop q)
-  (let ((f (jolt-queue-front q)))
+  (let ((n (jolt-queue-cnt q)) (fi (fx+ (jolt-queue-fi q) 1)))
     ;; popping an empty PersistentQueue returns it (Clojure's pop: if f==null
     ;; return this) — unlike a vector, which throws.
-    (cond ((null? f) q)
-          ((null? (cdr f)) (make-jolt-queue (reverse (jolt-queue-rear q)) '() (fx- (jolt-queue-cnt q) 1)))
-          (else (make-jolt-queue (cdr f) (jolt-queue-rear q) (fx- (jolt-queue-cnt q) 1))))))
+    (cond ((fx=? n 0) q)
+          ((fx<? fi (pvec-cnt (jolt-queue-front q)))
+           (make-jolt-queue (jolt-queue-front q) fi (jolt-queue-rear q) (fx- n 1)))
+          (else (make-jolt-queue (jolt-queue-rear q) 0 empty-pvec (fx- n 1))))))
 
 ;; --- extend the collection dispatchers to see a jolt-queue ------------------
 ;; The seq realizes the front in blocks of queue-seq-block cells, each block
-;; ending in a lazy tail, and moves to the reversed rear once the front runs
-;; out: (seq q) and (first q) are O(1) as on the JVM, and a full walk forces one
-;; tail per block rather than per element. The tail is a lazy-src so a seq over a
-;; queue still travels in a state image.
+;; ending in a lazy tail, and moves on to the rear once the front runs out:
+;; (seq q) and (first q) are O(1) as on the JVM, and a full walk forces one
+;; tail per block rather than per element. The tail is a lazy-src (its first
+;; argument the (front . index) pair) so a seq over a queue still travels in a
+;; state image.
 (define queue-seq-block 32)
 (define lz-queue-walk
-  (register-lazy-src! 'queue-walk (lambda (f r) (queue-walk f r))))
-(define (queue-walk f r)
-  (cond ((pair? f) (queue-block f r queue-seq-block))
-        ((null? r) jolt-nil)
-        (else (queue-walk (reverse r) '()))))
-(define (queue-block f r k)
-  (let ((more (cdr f)))
-    (cond ((pair? more)
+  (register-lazy-src! 'queue-walk (lambda (fi r) (queue-walk (car fi) (cdr fi) r))))
+(define (queue-walk f i r)
+  (cond ((fx<? i (pvec-cnt f)) (queue-block f i r queue-seq-block))
+        ((fx=? 0 (pvec-cnt r)) jolt-nil)
+        (else (queue-walk r 0 empty-pvec))))
+(define (queue-block f i r k)
+  (let ((x (pvec-nth-in-range f i)) (j (fx+ i 1)))
+    (cond ((fx<? j (pvec-cnt f))
            (if (fx=? k 1)
-               (cseq-lazy (car f) (make-lazy-src lz-queue-walk more r))
-               (cseq-realized (car f) (queue-block more r (fx- k 1)))))
-          ((null? r) (cseq-realized (car f) jolt-nil))
-          (else (cseq-lazy (car f) (make-lazy-src lz-queue-walk '() r))))))
-(define (queue->seq x) (queue-walk (jolt-queue-front x) (jolt-queue-rear x)))
+               (cseq-lazy x (make-lazy-src lz-queue-walk (cons f j) r))
+               (cseq-realized x (queue-block f j r (fx- k 1)))))
+          ((fx=? 0 (pvec-cnt r)) (cseq-realized x jolt-nil))
+          (else (cseq-lazy x (make-lazy-src lz-queue-walk (cons r 0) empty-pvec))))))
+(define (queue->seq x)
+  (if (fx=? 0 (jolt-queue-cnt x)) jolt-nil
+      (queue-walk (jolt-queue-front x) (jolt-queue-fi x) (jolt-queue-rear x))))
 (register-seq-arm! jolt-queue? queue->seq)
 (register-count-arm! jolt-queue? (lambda (x) (jolt-queue-cnt x)))
 (register-empty-arm! jolt-queue? (lambda (x) (fx=? 0 (jolt-queue-cnt x))))
@@ -54,7 +65,16 @@
 (define %q-pop jolt-pop)
 (set! jolt-pop (lambda (x) (if (jolt-queue? x) (queue-pop x) (%q-pop x))))
 (register-conj-arm! jolt-queue? queue-conj)
-;; sequential => seq=?/seq-hash handle queue equality + hashing.
+;; sequential => seq=?/seq-hash handle queue equality + hashing. The hash is
+;; cached in the queue (PersistentQueue._hasheq): a queue is immutable, and
+;; without the cache every (hash q) re-walked it through a fresh seq.
+(define %q-seq-hasheq-cached seq-hasheq-cached)
+(set! seq-hasheq-cached
+  (lambda (x)
+    (if (jolt-queue? x)
+        (or (jolt-queue-h x)
+            (let ((h (hash-ordered (jolt-seq x)))) (jolt-queue-h-set! x h) h))
+        (%q-seq-hasheq-cached x))))
 (define %q-sequential? jolt-sequential?)
 (set! jolt-sequential? (lambda (x) (or (jolt-queue? x) (%q-sequential? x))))
 
