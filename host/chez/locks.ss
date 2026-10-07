@@ -55,10 +55,15 @@
 ;; quite held yet or no longer is. That costs at most a deferred preemption; the
 ;; other order would leave a real window where the lock is held and the count
 ;; says otherwise, which is the bug this file exists to prevent.
-(define (jolt-locks-enter!)
-  (set-virtual-register! jolt-vreg-locks (fx+ 1 (virtual-register jolt-vreg-locks))))
-(define (jolt-locks-exit!)
-  (set-virtual-register! jolt-vreg-locks (fx- (virtual-register jolt-vreg-locks) 1)))
+;; Syntax and not procedures: the object monitor's masked enter and exit
+;; (java/concurrency.ss) take the count on every `locking`, where a call each way
+;; was a measurable share of the section.
+(define-syntax jolt-locks-enter!
+  (syntax-rules ()
+    ((_) (set-virtual-register! 7 (fx+ 1 (virtual-register 7))))))
+(define-syntax jolt-locks-exit!
+  (syntax-rules ()
+    ((_) (set-virtual-register! 7 (fx- (virtual-register 7) 1)))))
 
 ;; NOTE on how a refused preemption is remembered. It is NOT remembered here.
 ;; The obvious design — a pending flag, honoured when the outermost region exits

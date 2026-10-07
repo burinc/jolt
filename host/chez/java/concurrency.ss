@@ -1338,7 +1338,23 @@
 ;; whole decision is retaken, because a resume says only that something changed. All
 ;; three of those are jolt-lock-wait (host/chez/locks.ss), which is this protocol
 ;; named once rather than open-coded at each of the sites that needs it.
-(define (monitor-enter! m)
+;;
+;; THE MASKED ENTER. It returns with this thread's counted-lock depth one higher
+;; (jolt-locks-enter!, host/chez/locks.ss), and the caller drops it once whatever
+;; releases the monitor on an escape is in place. run-interruptible leaves its body
+;; by jumping out of a timer interrupt, and a fiber interrupt is raised where a
+;; preemption resumed, so any event check could be the last thing this thread does
+;; in here: one between the claim and the caller's wind left the monitor held for
+;; the life of the process, and one inside the claim left it held at depth 0. Both
+;; of those handlers hold off while the depth is above zero, so from before the
+;; claim until the wind is installed no escape can land
+;; (test/chez/monitor-escape-test.ss). The count rather than disable-interrupts
+;; because it is what those two handlers already test, and a virtual-register
+;; increment where disable/enable-interrupts cost every `locking` a fifth of its time.
+;; Never across a wait: the slow path drops it before it blocks or parks, and takes
+;; it again only to commit.
+(define (monitor-enter-masked! m)
+  (jolt-locks-enter!)
   (let* ((me (monitor-self)) (w (vector-ref m monitor-i-owner)))
     (cond
       ((and (not w) (monitor-claim! m me)) (void))
@@ -1346,15 +1362,21 @@
       ;; count is the owner's alone
       ((eq? (monitor-word-id w) me)
        (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count))))
-      (else (monitor-enter-slow! m me)))))
+      (else (jolt-locks-exit!) (monitor-enter-slow! m me)))))
+(define (monitor-enter! m)
+  (monitor-enter-masked! m)
+  (jolt-locks-exit!))
 (define (monitor-enter-slow! m me)
   (jolt-lock-wait (vector-ref m monitor-i-bk)
     (lambda ()
       (let loop ()
         (let ((w (vector-ref m monitor-i-owner)))
           (cond
-            ((not w) (if (monitor-claim! m me) #f (loop)))
+            ((not w)
+             (jolt-locks-enter!)
+             (if (monitor-claim! m me) #f (begin (jolt-locks-exit!) (loop))))
             ((eq? (monitor-word-id w) me)
+             (jolt-locks-enter!)
              (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
              #f)
             ;; held by someone else: mark the word contended BEFORE waiting, so the
@@ -1437,7 +1459,12 @@
 ;; relying on that mutex being last in the order. Broadcast and not signal, for
 ;; loader.ss's reason: the waiters re-check a condition that will be true for exactly
 ;; one of them.
-(define (monitor-exit! m)
+;;
+;; MASKED? is the release a masked enter pairs with: the caller raised the
+;; counted-lock depth before it, and this drops it once the monitor is released —
+;; and before the IllegalMonitorState throw, which must not leave it raised.
+(define (monitor-exit! m) (monitor-exit* m #f))
+(define (monitor-exit* m masked?)
   (let* ((me (monitor-self)) (w (vector-ref m monitor-i-owner)) (n (vector-ref m monitor-i-count)))
     (cond
       ;; reentrant exit by the owner: its own count, no word change
@@ -1447,23 +1474,24 @@
       ;; since, and then the slow exit wakes it.
       ((and (eq? w me) (begin (memory-order-release) (vector-cas! m monitor-i-owner me #f)))
        (void))
-      (else (monitor-exit-slow! m me)))))
-(define (monitor-exit-slow! m me)
-  (let ()
-    (let ((wake
-           (jolt-with-mutex (vector-ref m monitor-i-bk)
-             (unless (monitor-owner? m me)
-               (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
-                                                "not lock owner")))
-             (vector-set! m monitor-i-count (fx- (vector-ref m monitor-i-count) 1))
-             (if (fx=? 0 (vector-ref m monitor-i-count))
-                 (let ((fs (vector-ref m monitor-i-fibers)))
-                   (monitor-release-word! m)
-                   (vector-set! m monitor-i-fibers '())
-                   (condition-broadcast (vector-ref m monitor-i-cv))
-                   fs)
-                 '()))))
-      (for-each sa-fiber-resume wake))))
+      (else (monitor-exit-slow! m me masked?)))
+    (when masked? (jolt-locks-exit!))))
+(define (monitor-exit-slow! m me masked?)
+  (let ((wake
+         (jolt-with-mutex (vector-ref m monitor-i-bk)
+           (unless (monitor-owner? m me)
+             (when masked? (jolt-locks-exit!))
+             (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
+                                              "not lock owner")))
+           (vector-set! m monitor-i-count (fx- (vector-ref m monitor-i-count) 1))
+           (if (fx=? 0 (vector-ref m monitor-i-count))
+               (let ((fs (vector-ref m monitor-i-fibers)))
+                 (monitor-release-word! m)
+                 (vector-set! m monitor-i-fibers '())
+                 (condition-broadcast (vector-ref m monitor-i-cv))
+                 fs)
+               '()))))
+    (for-each sa-fiber-resume wake)))
 
 ;; The enter happens OUTSIDE the dynamic-wind, and the exit asks whether this is a
 ;; real exit. Both halves matter and neither is the obvious spelling.
@@ -1494,12 +1522,41 @@
 ;; rewritten, with controls for the parks either side of the monitor that must stay
 ;; cheap, and section 2 checks that the monitor is actually released afterwards by having
 ;; a second go block take it.
+;;
+;; NEITHER END MAY BE ESCAPED, and that is why the release on a normal return is in
+;; the body. run-interruptible leaves by jumping out of a timer interrupt, so any
+;; event check can be the escape point (see monitor-enter-masked!):
+;;
+;;   the enter leaves the counted-lock depth raised and the body drops it, so the
+;;   wind is in place before an escape can land after the claim. The body and not the
+;;   before-thunk, because a resume re-runs the before-thunk.
+;;
+;;   dynamic-wind pops the winder BEFORE it calls the after-thunk, and the
+;;   after-thunk's own entry is a check, so an escape there skipped the release
+;;   that the after-thunk was about to make. So a normal return releases inside the
+;;   body, still wound and masked across the release and the flag that tells the
+;;   after-thunk it is done. The after-thunk is left the raises and
+;;   escapes, which are already under way when it runs.
+;;
+;; A body that let go of the monitor itself (a bare monitor-exit) gets the exit's
+;; IllegalMonitorStateException, as a synchronized block's own monitorexit does on
+;; the JVM; monitor-exit* drops the mask before it throws.
 (define (jolt-call-with-monitor m thunk)
-  (monitor-enter! m)
-  (dynamic-wind
-    (lambda () #f)
-    thunk
-    (lambda () (unless (jolt-park-unwinding?) (monitor-exit! m)))))
+  (monitor-enter-masked! m)
+  (let ((held #t))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda ()
+        (jolt-locks-exit!)
+        (let ((r (thunk)))
+          (jolt-locks-enter!)
+          (set! held #f)
+          (monitor-exit* m #t)
+          r))
+      (lambda ()
+        (when (and held (not (jolt-park-unwinding?)))
+          (set! held #f)
+          (monitor-exit! m))))))
 ;; A caller that holds an object's monitor already (a StringBuffer resolves its
 ;; own once, at construction) enters it through jolt-call-with-monitor directly;
 ;; the table lookup is the same monitor either way.
@@ -1559,7 +1616,8 @@
 ;; JVM's rule that an interrupted wait reacquires before it throws.
 
 ;; Enter the wait set and release the monitor outright; answers the hold count to
-;; restore. The fiber contenders are resumed OUTSIDE bk for monitor-exit!'s reason
+;; restore, masked (the counted-lock depth one higher) so the caller can record it
+;; before an escape could land — see monitor-object-wait!. The fiber contenders are resumed OUTSIDE bk for monitor-exit!'s reason
 ;; — sa-fiber-resume takes a carrier's run-queue mutex, and keeping the two apart
 ;; means this path closes no cycle at all.
 ;;
@@ -1572,6 +1630,8 @@
              (unless (monitor-owner? m me)
                (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
                                                 "current thread is not owner")))
+             ;; masked until the caller has recorded the count it must restore
+             (jolt-locks-enter!)
              (let ((saved (vector-ref m monitor-i-count))
                    (fs (vector-ref m monitor-i-fibers)))
                (vector-set! m monitor-i-waiters
@@ -1601,6 +1661,7 @@
             #t))))
 
 ;; Take the monitor again at the depth it was released at, and leave the wait set.
+;; Returns masked, like monitor-enter-masked!; the caller drops it.
 ;;
 ;; threw? is the interrupted exit, and the one case that has to hand a notification
 ;; ON: a waiter that was notified and then interrupted before it could return has
@@ -1609,7 +1670,7 @@
 ;; alternative is a lost wakeup on a wait set that may still hold the only thread
 ;; able to make progress.
 (define (monitor-wait-exit! m saved w threw?)
-  (monitor-enter! m)
+  (monitor-enter-masked! m)
   (jolt-with-mutex (vector-ref m monitor-i-bk)
     (vector-set! m monitor-i-count saved)
     (let ((ws (vector-ref m monitor-i-waiters)))
@@ -1621,26 +1682,46 @@
            (jolt-cv-wake! (vector-ref m monitor-i-wcv))))
         (else (void))))))
 
+;;
+;; Between the release and the re-acquire the monitor is NOT held, and every way out
+;; has to take it back first or the enclosing section's exit throws
+;; IllegalMonitorState. The guard covers a raise and the wind covers an escape
+;; (run-interruptible jumps out of a timer interrupt; a guard does not see that). The
+;; release and each re-acquire run masked (see monitor-enter-masked!) up to the point
+;; where `saved` says which state this is in, so no escape lands between the two
+;; (test/chez/monitor-escape-test.ss). A park unwinds the wind too, and is not an exit.
 (define (monitor-object-wait! m ms)
   (let* ((me (monitor-self))
          (w (box #f))
-         (saved (monitor-wait-enter! m me w))
-         (deadline (and ms (+ (now-millis) ms))))
-    (guard (e (#t (monitor-wait-exit! m saved w #t) (raise e)))
-      (jolt-cv-wait-interruptibly "Object.wait"
-        (vector-ref m monitor-i-bk) (vector-ref m monitor-i-wcv) deadline
-        (lambda (timed-out?)
-          (cond ((unbox w) #t)
-                ;; the deadline is read by decide, never signalled, so a timeout
-                ;; leaving the wait set HERE is atomic with the decision: a notify
-                ;; that had already marked us takes the arm above instead.
-                (timed-out?
-                 (vector-set! m monitor-i-waiters
-                              (remq w (vector-ref m monitor-i-waiters)))
-                 #t)
-                (else jolt-cv-again)))))
-    (monitor-wait-exit! m saved w #f)
-    jolt-nil))
+         (deadline (and ms (+ (now-millis) ms)))
+         (saved #f))
+    (define (retake! threw?)
+      (monitor-wait-exit! m saved w threw?)
+      (set! saved #f)
+      (jolt-locks-exit!))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda ()
+        (set! saved (monitor-wait-enter! m me w))
+        (jolt-locks-exit!)
+        (guard (e (#t (retake! #t) (raise e)))
+          (jolt-cv-wait-interruptibly "Object.wait"
+            (vector-ref m monitor-i-bk) (vector-ref m monitor-i-wcv) deadline
+            (lambda (timed-out?)
+              (cond ((unbox w) #t)
+                    ;; the deadline is read by decide, never signalled, so a timeout
+                    ;; leaving the wait set HERE is atomic with the decision: a notify
+                    ;; that had already marked us takes the arm above instead.
+                    (timed-out?
+                     (vector-set! m monitor-i-waiters
+                                  (remq w (vector-ref m monitor-i-waiters)))
+                     #t)
+                    (else jolt-cv-again)))))
+        (retake! #f)
+        jolt-nil)
+      (lambda ()
+        (when (and saved (not (jolt-park-unwinding?)))
+          (retake! #t))))))
 
 (define (monitor-notify! m all?)
   (let ((me (monitor-self)))
@@ -1861,7 +1942,22 @@
                     (let ((handler
                            (lambda ()
                         (cond
-                          ((and (box? token) (unbox token)) (k interrupt-sentinel))
+                          ((and (box? token) (unbox token))
+                           ;; Not while this thread holds a counted lock. The
+                           ;; escape skips any cleanup that has not started, and
+                           ;; jolt-with-mutex's edges are the place that costs: an
+                           ;; escape between the count and the wind left the count
+                           ;; up for good (no preemption on that carrier again, every
+                           ;; park refused), and one at the after-thunk's entry —
+                           ;; the winder already popped — left the mutex held. The
+                           ;; count goes up first and comes down last
+                           ;; (host/chez/locks.ss), so a zero count is outside both
+                           ;; edges. The preempt handler refuses on the same test
+                           ;; and retries the same way.
+                           (if (fx=? 0 (jolt-locks-held))
+                               (k interrupt-sentinel)
+                               (begin (set! armed (jolt-fiber-preempt-retry-ticks))
+                                      (set-timer armed))))
                           (else
                            (set! borrowed (fx+ borrowed armed))
                            (cond
