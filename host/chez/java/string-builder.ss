@@ -12,14 +12,27 @@
 ;; throw-jvm; loads after those and before anything that constructs a builder.
 
 ;; ---- StringBuilder ----------------------------------------------------------
-;; state: #(buf len owner cache monitor) — java.lang.AbstractStringBuilder's
-;; shape. buf's length IS the capacity, sized and grown by the JDK's rules (16 by
-;; default, length + 16 from a String, (max needed (+ (* 2 old) 2)) when an edit
-;; outgrows it), and every edit happens in place, so building an n-char string is
-;; O(n) and a read between appends (charAt, length) is O(1).
+;; state: #(buf len owner cache monitor pend flushed cap)
+;;   buf     the flushed text, buf[0, flushed), edited in place
+;;   len     the whole length, flushed and pending
+;;   pend    the pieces appended since the last flush, newest first; they hold
+;;           len - flushed chars
+;;   cap     capacity() — java.lang.AbstractStringBuilder's number, by its rules
+;;           (16 by default, length + 16 from a String, (max needed (+ (* 2 old) 2))
+;;           when an edit outgrows it), kept as arithmetic
 ;;
-;; toString hands out a COPY of buf[0, len), so no String a caller holds ever
-;; aliases the buffer, and the copy is cached until the next write clears it.
+;; An append conses its piece onto pend and copies nothing. Chez strings are four
+;; bytes a char, and a buffer that copied each piece in, grew by copying, and
+;; copied out again at toString moved every char three times; building 2000 times
+;; a 4000-char string from 40-char pieces took 140ms that way against 58ms for a
+;; join. So toString joins buf's text and the pending pieces in one copy, and only
+;; a read or edit by index (charAt, insert, setCharAt ...) flushes pend into buf.
+;; buf then grows to the logical capacity, so appends interleaved with charAt stay
+;; amortized O(1) instead of copying the whole text per read.
+;;
+;; toString hands out a fresh string, so no String a caller holds ever aliases the
+;; buffer, and it is cached until the next write clears it. Pending pieces are
+;; strings jolt treats as immutable; nothing here writes to one.
 ;;
 ;; A StringBuilder is unsynchronized, as on the JDK, which makes no promise to
 ;; threads that race one (its own can lose a racing append outright). A
@@ -35,26 +48,75 @@
 ;; (sb-append! sb-str sb-length sb-char-at) for a StringBuilder and the locking
 ;; ones (sb-append*! sb-str* sb-length* sb-char-at*) for a StringBuffer.
 (define (make-sb-state s cap)
-  (let ((buf (make-string cap)) (n (string-length s)))
-    (unless (fx=? n 0) (sa-string-copy-range! buf 0 s 0 n))
-    (vector buf n #f #f #f)))
+  (let ((n (string-length s)))
+    (vector "" n #f #f #f (if (fx=? n 0) '() (list s)) 0 cap)))
 (define-syntax sb-wrote! (syntax-rules () ((_ st) (vector-set! st 3 #f))))
 
 ;; --- operations on the state vector: no locking here ---------------------------
-;; ensureCapacityInternal: grow to at least min, by the JDK's growth rule.
+;; Copy piece[0, pn) into buf at n. A short piece goes char by char: string-copy!
+;; is a library call that checks its arguments, which is most of the cost of a
+;; one-char piece; from about four chars on the call is the faster copy.
+(define (%sb-copy-in! buf n piece pn)
+  (if (fx<? pn 4)
+      (let loop ((i 0))
+        (when (fx<? i pn)
+          (string-set! buf (fx+ n i) (string-ref piece i))
+          (loop (fx+ i 1))))
+      (sa-string-copy-range! buf n piece 0 pn)))
+;; Copy the pending pieces into dst, ending at `end`: they are newest first, so
+;; each one goes just below the one after it.
+(define (%sb-copy-pending! dst end pend)
+  (let loop ((ps pend) (at end))
+    (unless (null? ps)
+      (let* ((p (car ps)) (pn (string-length p)) (from (fx- at pn)))
+        (%sb-copy-in! dst from p pn)
+        (loop (cdr ps) from)))))
+;; ensureCapacityInternal's arithmetic on the logical capacity.
+(define (%sb-grow-cap! st min)
+  (let ((cap (vector-ref st 7)))
+    (when (fx>? min cap) (vector-set! st 7 (fxmax min (fx+ (fx* 2 cap) 2))))))
+;; Move the pending pieces into buf, growing it to the logical capacity, so buf
+;; holds the whole text. Every read or edit by index starts here.
+(define (%sb-flush! st)
+  (let ((pend (vector-ref st 5)) (n (vector-ref st 1)))
+    (unless (null? pend)
+      (when (fx>? n (string-length (vector-ref st 0)))
+        (let ((nb (make-string (fxmax n (vector-ref st 7)))) (fl (vector-ref st 6)))
+          (sa-string-copy-range! nb 0 (vector-ref st 0) 0 fl)
+          (vector-set! st 0 nb)))
+      (%sb-copy-pending! (vector-ref st 0) n pend)
+      (vector-set! st 5 '())
+      (vector-set! st 6 n))))
+(define-syntax %sb-flushed
+  (syntax-rules () ((_ st) (unless (null? (vector-ref st 5)) (%sb-flush! st)))))
+;; The new length after an edit in place, which runs flushed: all of it is in buf.
+(define (%sb-set-length! st n)
+  (vector-set! st 1 n)
+  (vector-set! st 6 n)
+  (sb-wrote! st))
+;; ensureCapacityInternal for an edit in place: flushed, with room for min.
 (define (%sb-ensure! st min)
-  (let* ((buf (vector-ref st 0)) (cap (string-length buf)))
-    (when (fx>? min cap)
-      (let ((nb (make-string (fxmax min (fx+ (fx* 2 cap) 2)))))
+  (%sb-flushed st)
+  (%sb-grow-cap! st min)
+  (let ((buf (vector-ref st 0)))
+    (when (fx>? min (string-length buf))
+      (let ((nb (make-string (vector-ref st 7))))
         (sa-string-copy-range! nb 0 buf 0 (vector-ref st 1))
         (vector-set! st 0 nb)))))
 ;; toString, append and charAt are macros so the unsynchronized primitives below
 ;; carry their bodies inline (no second call per append) while the locked table
 ;; expands the very same text.
 (define (%sb-materialize! st)
-  (let* ((n (vector-ref st 1)) (out (make-string n)))
-    (sa-string-copy-range! out 0 (vector-ref st 0) 0 n)
+  (let* ((n (vector-ref st 1)) (pend (vector-ref st 5)) (out (make-string n))
+         (fl (vector-ref st 6)))
+    (sa-string-copy-range! out 0 (vector-ref st 0) 0 fl)
+    (%sb-copy-pending! out n pend)
     (vector-set! st 3 out)
+    ;; The joined text stands in for everything before it: nothing writes to out,
+    ;; so it is a pending piece like any other, and the next toString copies it as
+    ;; one block instead of walking every piece again.
+    (vector-set! st 5 (list out))
+    (vector-set! st 6 0)
     out))
 (define-syntax %sb-str
   (syntax-rules () ((_ st) (let ((s st)) (or (vector-ref s 3) (%sb-materialize! s))))))
@@ -63,30 +125,30 @@
     ((_ st* piece*)
      (let* ((st st*) (piece piece*) (pn (string-length piece)))
        (unless (fx=? pn 0)
-         (let* ((n (vector-ref st 1)) (nn (fx+ n pn)))
-           (when (fx>? nn (string-length (vector-ref st 0))) (%sb-ensure! st nn))
-           (sa-string-copy-range! (vector-ref st 0) n piece 0 pn)
+         (let ((nn (fx+ (vector-ref st 1) pn)))
+           (when (fx>? nn (vector-ref st 7)) (%sb-grow-cap! st nn))
+           (vector-set! st 5 (cons piece (vector-ref st 5)))
            (vector-set! st 1 nn)
            (sb-wrote! st)))))))
 ;; Replace buf[s, e) with piece, in place: the one primitive insert, delete,
 ;; replace and deleteCharAt are spelled in. The tail moves first (string-copy!
 ;; copies as if through a temporary, so the overlap is safe).
 (define (%sb-splice! st s e piece)
+  (%sb-flushed st)
   (let* ((n (vector-ref st 1)) (pn (string-length piece))
          (nn (fx+ (fx- n (fx- e s)) pn)))
     (%sb-ensure! st nn)
     (let ((buf (vector-ref st 0)))
       (sa-string-copy-range! buf (fx+ s pn) buf e n)
       (sa-string-copy-range! buf s piece 0 pn)
-      (vector-set! st 1 nn)
-      (sb-wrote! st))))
+      (%sb-set-length! st nn))))
 ;; charAt over the live buffer, with String.charAt's check against the length.
 (define-syntax %sb-char-at
   (syntax-rules ()
     ((_ st* i*)
      (let* ((st st*) (n (vector-ref st 1)) (i (jolt->idx i*)))
        (if (and (fixnum? i) (fx>=? i 0) (fx<? i n))
-           (string-ref (vector-ref st 0) i)
+           (begin (%sb-flushed st) (string-ref (vector-ref st 0) i))
            (char-index-oob i n))))))
 
 ;; --- the unsynchronized primitives: StringBuilder and the emitter's fast path --
@@ -148,9 +210,10 @@
 (define (char-array-arg? x) (and (jolt-array? x) (eq? (jolt-array-kind x) 'char)))
 (define (sb-piece x)
   ;; string first: this runs on the open-coded .append path (sb-direct-emit), where
-  ;; a string is nearly every argument, and render-piece would reach its own string
-  ;; arm only after two failed tests.
+  ;; a string is nearly every argument and a char the next most common, and
+  ;; render-piece would reach its own arms for them only after failed tests.
   (cond ((string? x) x)
+        ((char? x) (string x))
         ((char-array-arg? x) (char-array->string x))
         (else (render-piece x))))
 (define (sb-piece-range x a b who)
@@ -229,7 +292,7 @@
       (cons "length" (lambda (self) (guard (st self) (->num (vector-ref st 1)))))
       (cons "isEmpty" (lambda (self) (guard (st self) (fx=? 0 (vector-ref st 1)))))
       (cons "charAt" (lambda (self i) (guard (st self) (%sb-char-at st i))))
-      (cons "capacity" (lambda (self) (guard (st self) (->num (string-length (vector-ref st 0))))))
+      (cons "capacity" (lambda (self) (guard (st self) (->num (vector-ref st 7)))))
       (cons "ensureCapacity"
             (lambda (self m)
               (let ((m (jnum->exact m)))
@@ -238,11 +301,13 @@
       (cons "trimToSize"
             (lambda (self)
               (guard (st self)
+                (%sb-flushed st)
                 (let ((n (vector-ref st 1)))
-                  (when (fx<? n (string-length (vector-ref st 0)))
+                  (when (fx<? n (vector-ref st 7))
                     (let ((nb (make-string n)))
                       (sa-string-copy-range! nb 0 (vector-ref st 0) 0 n)
-                      (vector-set! st 0 nb)))))
+                      (vector-set! st 0 nb)
+                      (vector-set! st 7 n)))))
               jolt-nil))
       (cons "setLength"
             (lambda (self n)
@@ -256,8 +321,7 @@
                     (when (fx>? n cur)
                       (let ((buf (vector-ref st 0)))
                         (do ((i cur (fx+ i 1))) ((fx=? i n)) (string-set! buf i #\nul))))
-                    (vector-set! st 1 n)
-                    (sb-wrote! st))))
+                    (%sb-set-length! st n))))
               jolt-nil))
       (cons "substring"
             (case-lambda
@@ -294,11 +358,13 @@
                             (guard (st self)
                               (let ((i (jnum->exact i)))
                                 (sb-check-index i (vector-ref st 1))
+                                (%sb-flushed st)
                                 (->num (char->integer (string-ref (vector-ref st 0) i)))))))
       (cons "codePointBefore" (lambda (self i)
                                 (guard (st self)
                                   (let ((j (- (jnum->exact i) 1)))
                                     (sb-check-index j (vector-ref st 1))
+                                    (%sb-flushed st)
                                     (->num (char->integer (string-ref (vector-ref st 0) j)))))))
       ;; jolt's strings hold code points, so a count or offset in code points is
       ;; the same count in chars; the bounds are still the JDK's.
@@ -320,6 +386,7 @@
                             (guard (st self)
                               (let ((i (jnum->exact i)))
                                 (sb-check-index i (vector-ref st 1))
+                                (%sb-flushed st)
                                 (string-set! (vector-ref st 0) i c)
                                 (sb-wrote! st))))
                           jolt-nil))
@@ -375,6 +442,7 @@
               jolt-nil))
       (cons "reverse" (lambda (self)
                         (guard (st self)
+                          (%sb-flushed st)
                           (let ((buf (vector-ref st 0)) (n (vector-ref st 1)))
                             (let loop ((i 0) (j (fx- n 1)))
                               (when (fx<? i j)

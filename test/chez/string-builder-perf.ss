@@ -104,4 +104,31 @@
           (/ (round (* 10 ratio)) 10.0))
   (when (> ratio 8.0) (fail! "append is superlinear")))
 
+;; Building costs a copy of each char, not three. Chez strings are four bytes a
+;; char, and a buffer that copied each piece in, grew by copying and copied out at
+;; toString took 2.4x a join of the same pieces (100 40-char pieces, built 2000
+;; times: 140ms against 58ms). The builder joins its pending pieces once at
+;; toString. Measured against clojure.string/join over the same pieces (whose seq
+;; walk and per-element render are most of its cost), a build reads ~0.49x and the
+;; copying buffer read ~0.92x, so the bar sits between them. A ratio in one
+;; process, so a loaded machine moves both sides.
+(define medium-piece "\"0123456789012345678901234567890123456789\"")
+(define (medium-build-expr n)
+  (string-append "(dotimes [_ " (number->string n) "]"
+                 "  (let [sb (StringBuilder.)]"
+                 "    (dotimes [_ 100] (.append sb " medium-piece "))"
+                 "    (.toString sb)))"))
+(define (medium-join-expr n)
+  (string-append "(let [ps (vec (repeat 100 " medium-piece "))]"
+                 "  (dotimes [_ " (number->string n) "] (clojure.string/join ps)))"))
+(jolt-compile-eval "(require 'clojure.string)" "user")
+(jolt-compile-eval (medium-build-expr 200) "user")
+(jolt-compile-eval (medium-join-expr 200) "user")
+(let* ((build (best-ms (medium-build-expr 2000)))
+       (join (best-ms (medium-join-expr 2000)))
+       (ratio (/ build (max join 0.001))))
+  (printf "medium pieces: a build costs ~ax a join of the same pieces\n"
+          (/ (round (* 100 ratio)) 100.0))
+  (when (> ratio 0.7) (fail! "building copies each char more than once")))
+
 (if failed? (exit 1) (begin (printf "PASS\n") (exit 0)))
