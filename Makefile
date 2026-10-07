@@ -129,7 +129,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck noticecheck \
+.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck noticecheck monitormodel \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
         gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
@@ -1504,6 +1504,13 @@ attributioncheck:
 # source's copyright line or the release packaging drifts from it.
 noticecheck:
 	@sh tools/noticecheck.sh
+
+# The object monitor's lock-free owner word (host/chez/java/concurrency.ss),
+# model-checked over every interleaving. Manual: it needs SWI-Prolog, which the CI
+# images do not carry. Run it after touching monitor-enter!/monitor-exit!.
+monitormodel:
+	@command -v swipl >/dev/null || { echo "monitormodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
+	@swipl -q -g main -t halt tools/monitor-model.pl
 
 # Install the repository's git hooks into .git/hooks (copies, so a clone that
 # never runs this is unaffected; re-run after a hook changes).
