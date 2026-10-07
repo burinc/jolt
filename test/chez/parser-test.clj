@@ -157,6 +157,26 @@ We laughed about payin' rent 'cause the county jails they're free"
 ;; monad do* / >>= sanity
 (chk= "do*-return" ((m/do* (m/return 42)) "in") (list [42 "in"]))
 
+;; >>= must yield its results lazily. The first success of a many-shaped parser
+;; is one walk down the input, so each level's continuation runs once. A bind
+;; that realizes ahead (mapcat's apply concat pulls several results per level,
+;; and each pulls its own level below) runs them quadratically: 42602 calls for
+;; 400 chars, and (many any) over 8000 chars took seconds. Counting is exact.
+(let [calls (atom 0)
+      many* (fn many* [p]
+              (pc/or-else (m/>>= p (fn [a]
+                                   (m/>>= (many* p) (fn [as]
+                                                    (swap! calls inc)
+                                                    (m/return (cons a as))))))
+                          (m/return nil)))
+      n 300
+      [v tail] (first ((many* pb/any) (apply str (repeat n \a))))]
+  (chk= "many-first-length" [(count v) (seq tail)] [n nil])
+  (chk= "many-first-linear" @calls n))
+;; ...and lazy changes no answer: every success, longest first, in order.
+(chk= "many-all-results" (map (fn [[v t]] [(apply str v) (apply str t)]) ((pc/many pb/any) "aaa"))
+      [["aaa" ""] ["aa" "a"] ["a" "aa"] ["" "aaa"]])
+
 ;; ---------------------------------------------------------------------- report
 (if (empty? @failures)
   (println "PARSER OK")
