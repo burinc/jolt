@@ -757,9 +757,29 @@
                   (else (loop (cdr as))))))))
 
 (define (jolt-sequential? x) (or (pvec? x) (cseq? x) (empty-list-t? x)))
-(define (seq->list s)                  ; force a finite seq to a Scheme list
+;; Force a finite seq to a Scheme list. A vector-backed cell (a vector's own seq,
+;; or a ChunkedCons) already holds its remaining elements as v[ci..count), so
+;; they are copied out of v rather than stepped through a cell each: this is how
+;; nearly every runtime seam turns a collection into a list (object-array,
+;; into-array, apply, the java.util ctors), and stepping cost a cell per element.
+(define (seq->list s)
   (let loop ((s (jolt-seq s)) (acc '()))
-    (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (seq-more s)) (cons (seq-first s) acc)))))
+    (cond
+      ((jolt-nil? s) (reverse acc))
+      ((and (cseqv? s) (cseqv-cvec s))
+       (let ((v (cseqv-cvec s)) (cr (cseqv-crest s)) (i0 (cseqv-ci s)))
+         (let ((n (pvec-count v)))
+           (if cr
+               (let copy ((i i0) (acc acc))
+                 (if (fx<? i n)
+                     (copy (fx+ i 1) (cons (pvec-nth-in-range v i) acc))
+                     (loop (jolt-seq cr) acc)))
+               ;; nothing follows v: build its run back to front, no reverse
+               (let copy ((i (fx- n 1)) (tail '()))
+                 (if (fx>=? i i0)
+                     (copy (fx- i 1) (cons (pvec-nth-in-range v i) tail))
+                     (if (null? acc) tail (append (reverse acc) tail))))))))
+      (else (loop (jolt-seq (seq-more s)) (cons (seq-first s) acc))))))
 
 ;; ============================================================================
 ;; the seq leaf ops the emitter lowers core fns to
