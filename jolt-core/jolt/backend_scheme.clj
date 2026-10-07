@@ -79,7 +79,7 @@
       (= m "toLowerCase") (when (= argc 0) (str "(string-downcase " t ")"))
       (= m "trim")        (when (= argc 0) (str "(str-trim " t ")"))
       (= m "hashCode")    (when (= argc 0) (str "(java-string-hash " t ")"))
-      (= m "charAt")      (when (= argc 1) (str "(string-ref " t " (jolt->idx " a0 "))"))
+      (= m "charAt")      (when (= argc 1) (str "(jolt-char-at " t " " a0 ")"))
       (= m "indexOf")     (when (or (= argc 1) (= argc 2))
                             (let [from (if (= argc 2) (str "(jolt->idx " a1 ")") "0")]
                               (str "(str-index-of-any " t " " a0 " " from ")")))
@@ -190,7 +190,7 @@
       (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
       (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
       (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
-      (= m "charAt")    (when (= argc 1) (str "(string-ref (sb-str " t ") (jolt->idx " a0 "))"))
+      (= m "charAt")    (when (= argc 1) (str "(sb-char-at " t " " a0 ")"))
       :else nil)))
 
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
@@ -1025,7 +1025,7 @@
                   "str-index-of" "str-index-of-any" "str-replace-literal"
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
-                  "sb-append!" "sb-str" "sb-length" "sb-piece" "->num"
+                  "sb-append!" "sb-str" "sb-length" "sb-piece" "sb-char-at" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).

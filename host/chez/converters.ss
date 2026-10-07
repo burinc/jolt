@@ -122,6 +122,19 @@
 ;; one — this sits on the proven-string .charAt/.substring path, so it must not
 ;; call anything for the common case.
 (define (jolt->idx n) (if (fixnum? n) n (exact (truncate (jolt-need-num n)))))
+;; String.charAt and every CharSequence charAt over a string's characters
+;; (StringBuilder reads its buffer through the same check): an index outside
+;; [0, length) is the JVM's StringIndexOutOfBoundsException with its message,
+;; not Chez's string-ref error.
+(define (char-index-oob i n)
+  (throw-jvm 'StringIndexOutOfBoundsException
+             (string-append "Index " (number->string i) " out of bounds for length "
+                            (number->string n))))
+(define (jolt-char-at s i)
+  (let ((i (jolt->idx i)))
+    (if (and (fixnum? i) (fx>=? i 0) (fx<? i (string-length s)))
+        (string-ref s i)
+        (char-index-oob i (string-length s)))))
 
 ;; Chez's `substring` walks the span a character at a time; allocating the result
 ;; and asking for the block move is ~3.7x faster for the spans a parser, a reader

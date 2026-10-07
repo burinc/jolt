@@ -78,6 +78,20 @@
         "(pr-str [(let [w (StringWriter.)] (.print (PrintWriter. w) \"xy\") (str w)) (let [b (StringBuilder.)] (.print (PrintWriter. b) \"zw\") (str b))])"
         "[\"xy\" \"zw\"]")
 
+;; A read between appends must not re-join the whole buffer: a formatter that
+;; appends a token and then looks at the line so far (charAt, length) made that
+;; O(line) per token while the buffer was a chunk list joined on read.
+(define (interleave-expr n)
+  (string-append "(let [sb (StringBuilder.)]"
+                 "  (dotimes [i " (number->string n) "] (.append sb \"abcdefgh\") (.charAt sb i))"
+                 "  (.length sb))"))
+(jolt-compile-eval (interleave-expr 2000) "user")
+(let* ((small (best-ms (interleave-expr 8000)))
+       (large (best-ms (interleave-expr 32000)))
+       (ratio (/ large (max small 0.001))))
+  (printf "interleaved charAt: 4x the appends cost ~ax the time\n" (/ (round (* 10 ratio)) 10.0))
+  (when (> ratio 8.0) (fail! "a read between appends is superlinear")))
+
 ;; Warm up so the first measurement is not paying one-time costs.
 (jolt-compile-eval (build-expr 2000) "user")
 
