@@ -391,12 +391,10 @@
       (= op :let)
       (let [res (reduce (fn [acc b]
                           (let [te (nth acc 0) binds (nth acc 1)
-                                ir (an (nth b 1) te)
-                                ;; a ^doubles/… let binding (analyzer tagged its init
-                                ;; :akind) seeds the array kind, overriding the init's
-                                ;; own numeric kind — so (aget it i) in the body unboxes.
-                                k (or (get (nth b 1) :akind) (nth ir 0))]
-                            [(assoc te (nth b 0) k) (conj binds [(nth b 0) (nth ir 1)])]))
+                                ;; a ^doubles/… let binding's init is a :coerce of the
+                                ;; array kind, which answers that kind like any coerce
+                                ir (an (nth b 1) te)]
+                            [(assoc te (nth b 0) (nth ir 0)) (conj binds [(nth b 0) (nth ir 1)])]))
                         [tenv []] (get node :bindings))
             br (an (get node :body) (nth res 0))]
         [(nth br 0) (assoc node :bindings (nth res 1) :body (nth br 1))])

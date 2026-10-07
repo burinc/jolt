@@ -13,8 +13,11 @@
 ;; these are pure over ref-put!/get.
 (defn vreset! [vol newval]
   (jolt.host/ref-put! vol :val newval) newval)
-(defn vswap! [vol f & args]
-  (vreset! vol (apply f (get vol :val) args)))
+;; A macro, as on the JVM: (vswap! v conj x) is (conj @v x) at the call site,
+;; so the swap is a direct call at its own arity, never a rest list and apply.
+;; Like the reference it names vol twice.
+(defmacro vswap! [vol f & args]
+  `(vreset! ~vol (~f (deref ~vol) ~@args)))
 
 (defn ffirst [coll] (first (first coll)))
 (defn nfirst [coll] (next (first coll)))

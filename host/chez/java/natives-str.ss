@@ -818,7 +818,7 @@
     ;; (honeysql, string codecs); a miss at the bottom of the chain cost ~100ns
     ;; per call in the string arm. Order is behavior-neutral, keep it stable.
     ((string=? method "length") (string-length s))   ; exact int (= JVM)
-    ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
+    ((string=? method "charAt") (jolt-char-at s (arg 0)))
     ((string=? method "toString") s)
     ((string=? method "indexOf")
      (str-index-of-any s (str-arg (arg 0))

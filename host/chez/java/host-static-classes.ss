@@ -298,7 +298,7 @@
 ;; Same accumulator as StringBuilder, and for the same reason: writing to a
 ;; StringWriter a piece at a time — which is what printStackTrace and every
 ;; print-to-a-writer path does — used to copy the whole buffer per write.
-(register-class-ctor! "StringWriter" (lambda args (make-jhost "writer" (vector "" '() 0))))
+(register-class-ctor! "StringWriter" (lambda args (make-jhost "writer" (make-sb-state ""))))
 (register-host-methods! "writer"
   (list (cons "write" (lambda (self x . rest) (sb-append! self (writer-piece-range x rest)) jolt-nil))
         (cons "append" (lambda (self x . rest) (sb-append! self (append-text x rest)) self))

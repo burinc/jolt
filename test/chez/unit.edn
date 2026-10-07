@@ -2418,9 +2418,9 @@
  {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'amap))))" :expected "true"}
  {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'areduce))))" :expected "true"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'def-aset))" :expected "false"}
- ;; naa9 — vswap! is a fn on jolt, macro on JVM
- {:suite "naa9-vswap-fn" :expr "(boolean (:macro (meta (resolve 'vswap!))))" :expected "false"}
- {:suite "naa9-vswap-fn" :expr "(some? (resolve 'vswap!))" :expected "true"}
+ ;; naa9 — vswap! is a macro, as on the JVM
+ {:suite "naa9-vswap-macro" :expr "(boolean (:macro (meta (resolve 'vswap!))))" :expected "true"}
+ {:suite "naa9-vswap-macro" :expr "(some? (resolve 'vswap!))" :expected "true"}
   ;; Stage D — binding does not auto-deref var-cell
   {:suite "binding-no-autoderef" :expr "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :expected "\"clojure.lang.Var\""}
   ;; Stage B — getAbsoluteFile/getCanonicalFile share getAbsolutePath's JOLT_PWD base

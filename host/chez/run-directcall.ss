@@ -142,9 +142,13 @@
   (gate-check "a StringBuilder receiver still reaches the generic arm"
               (ev "(user/uselen (doto (StringBuilder.) (.append \"ab\")))") 2))
 (let ((e (emit-dl "(def usecharat (fn [s i] (.charAt s i)))")))
-  (gate-check "unhinted .charAt takes the direct form" (gate-sub? e "(string-ref _ht$") #t)
+  ;; the direct form is String.charAt's checked read, not a bare string-ref
+  (gate-check "unhinted .charAt takes the direct form" (gate-sub? e "(jolt-char-at _ht$") #t)
   (run-emit e)
-  (gate-check "unhinted .charAt on a string answers" (call "usecharat" "abc" 1) #\b))
+  (gate-check "unhinted .charAt on a string answers" (call "usecharat" "abc" 1) #\b)
+  (gate-check "unhinted .charAt out of range is the JVM's message"
+              (ev "(try (user/usecharat \"abc\" 3) (catch StringIndexOutOfBoundsException e (ex-message e)))")
+              "Index 3 out of bounds for length 3"))
 (let ((e (emit-dl "(def usename (fn [k] (.getName k)))")))
   (gate-check "unhinted .getName tests for a keyword" (gate-sub? e "(keyword-t? _ht$") #t)
   (gate-check "unhinted .getName takes the keyword direct form" (gate-sub? e "(keyword-t-name _ht$") #t)
