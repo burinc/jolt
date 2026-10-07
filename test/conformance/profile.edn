@@ -458,10 +458,6 @@
    :label "with-redefs restores on throw",
    :bucket :uncertifiable,
    :features [:host/jvm-interop]}
-  {:suite "macros / vswap! divergence",
-   :label "vswap! is a macro on JVM, fn on jolt",
-   :bucket :divergent,
-   :features [:host/jvm-interop]}
   {:suite "metadata / type hints",
    :label "type hint in let",
    :bucket :jvm-raises,
