@@ -92,7 +92,15 @@
             description = "Clojure implementation on Chez Scheme";
             homepage = "https://jolt-lang.net";
             # jolt itself, plus what NOTICE lists as embedded in the binary
-            license = with pkgs.lib.licenses; [ epl20 epl10 asl20 mit bsd2 bsd3 zlib ];
+            license = with pkgs.lib.licenses; [
+              epl20
+              epl10
+              asl20
+              mit
+              bsd2
+              bsd3
+              zlib
+            ];
             mainProgram = "jolt";
           };
         };
