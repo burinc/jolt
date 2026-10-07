@@ -5,6 +5,90 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.19] - 2026-10-07
+
+Monitors take an uncontended `locking` without a mutex, `StringBuffer` is
+synchronized as on the JDK, and `StringBuilder` and `StringBuffer` gain the
+rest of the JDK's API. An interrupted evaluation no longer leaves a monitor or a
+runtime lock held. `jolt.parser`'s `many` is linear, and release archives
+carry the notices for the third-party code jolt ships.
+
+### Added
+
+- **The rest of `StringBuilder`/`StringBuffer`'s JDK API** (#1270).
+  `capacity`, `ensureCapacity`, `trimToSize`, `appendCodePoint`,
+  `codePointBefore`, `codePointCount`, `offsetByCodePoints`, `compareTo`,
+  `chars`, `codePoints` and `lastIndexOf(str, from)`, with the JDK's initial
+  capacities and growth. `String` gains `codePointBefore`, `codePointCount`,
+  `offsetByCodePoints`, `chars` and `codePoints`. Out-of-range errors carry the
+  JDK's messages.
+
+- **`NOTICE` and `licenses/` in release archives and the Nix flake** (#1269).
+  They list each embedded or adapted work (Chez Scheme, zlib, LZ4, irregex,
+  Grenadine, babashka's fs/process/cli and task runner, the Clojure and
+  ClojureScript ports, jasentaa) with its copyright holder and license. Files
+  with upstream code carry the upstream copyright line.
+
+### Changed
+
+- **`vswap!` is a macro**, as on the JVM (#1268).
+
+### Performance
+
+- **An uncontended `locking` takes no mutex** (#1271). The monitor's owner is a
+  word that the uncontended enter and exit take and release with one
+  compare-and-swap; a contender marks it before it waits, so the owner's exit
+  wakes it. Measured against the 0.8.18 release binary:
+
+  ```
+  (locking o nil) x 1M                 405-493 ms -> 92-103 ms
+  nested locking x 1M                  332-351 ms -> 161-176 ms
+  4 threads contending, 100k each      310-362 ms -> 79-99 ms
+  ```
+
+- **`jolt.parser`'s `many` is linear** (#1267). `>>=` realized results ahead
+  at every level, so taking the first parse of a recursive parser was
+  quadratic. `(many any)` over 8000 chars goes from 12-14 s to 27-31 ms.
+
+- **Array-hinted locals keep their hint through inlining** (#1268). A
+  `^longs`/`^objects`/`^doubles` let binding lost its hint when the inliner
+  rebuilt it, so every `aget` went through the generic `nth`. Array-hinted fns
+  are inline candidates again.
+
+- **`StringBuilder` reads between appends are O(1)** (#1268, #1273). A
+  `charAt` or `length` between appends joined the whole buffer, so a formatter
+  that looks at the line so far paid O(line) per token. 50k appends each
+  followed by a `charAt` go from 785-836 ms to 1 ms; building without reads
+  costs what it did.
+
+### Fixed
+
+- **`StringBuffer` is synchronized** (#1270). It shared `StringBuilder`'s
+  unsynchronized store, so threads appending to one could lose writes or fault.
+  Its methods now run under its own monitor and compose with
+  `(locking sb ...)`. `StringWriter` writes into a `StringBuffer` and
+  `getBuffer` returns it. `(.delete sb 2 1)` throws as on the JDK instead of
+  succeeding. The lock makes an uncontended append about 65 ns, up from about
+  5 ns unsynchronized.
+
+- **An interrupted evaluation no longer leaves a lock held** (#1272).
+  `jolt.host/run-interruptible`, which interrupts an nREPL eval, ends its body
+  from a timer interrupt, and an interrupt landing at the edge of a `locking`,
+  an `Object.wait` or an internal lock could leave the monitor held for the
+  life of the process, or the thread's lock count raised so fibers on it were
+  never preempted again. The interrupt now waits until the thread holds no
+  lock, and the monitor's enter, exit and wait cannot be split by one.
+
+- **`(.getName (Thread/currentThread))` on the main thread** could answer
+  `"Thread-<n>"` after many short-lived threads had started (#1264). Reading a
+  child thread's id raced with Chez freeing its thread context.
+
+- **`spit` on Windows retries while antivirus holds the temp file** (#1265,
+  #1263). It failed intermittently with `cannot rename ... permission denied`
+  and left the `.spit-tmp-*` file behind. `Files/move` with
+  `REPLACE_EXISTING` over a target it cannot delete raises
+  `AccessDeniedException` naming the target, as on the JDK.
+
 ## [0.8.18] - 2026-10-06
 
 Collection operations that Clojure answers from a collection's shape (counts,
