@@ -1184,9 +1184,12 @@
 (define monitor-table-lock (make-mutex))
 ;; #(bk owner count cv fibers box wcv waiters)
 ;;   bk     the bookkeeping mutex — held across a decision, never across a body
-;;   owner  the FIBER when a fiber holds it, else the thread's interrupt box
-;;          (current-interrupt-box, an identity that is safe under
-;;          fork-inheritance), or #f when free
+;;   owner  the OWNER WORD: the FIBER when a fiber holds it, else the thread's
+;;          interrupt box (current-interrupt-box, an identity that is safe under
+;;          fork-inheritance), or #f when free — or that identity wrapped in a
+;;          monitor-contended record once some contender is waiting for it. The
+;;          uncontended enter and exit are one compare-and-swap on this word and
+;;          never take bk; see "the owner word" below
 ;;   count  reentrancy depth for the owner
 ;;   cv     thread waiters; condition-wait releases bk atomically with blocking
 ;;   fibers parked fiber waiters, resumed by the release
@@ -1213,6 +1216,49 @@
 ;; is exactly this (jolt-ga8o). One implementation, two locks.
 (define (make-monitor)
   (vector (make-mutex) #f 0 (make-condition) '() #f (make-condition) '()))
+
+;; --- the owner word -------------------------------------------------------------
+;; A thin lock. An uncontended enter is CAS #f -> me and an uncontended exit is
+;; CAS me -> #f, with no bk and no wake. What makes the exit safe without bk is
+;; that "somebody is waiting" lives in the SAME word: a contender, under bk and
+;; before it waits, swaps owner X for (monitor-contended X), so the owner's
+;; me -> #f CAS fails and it takes the slow exit, which frees the word and wakes
+;; the waiters under bk. A waiter cannot be missed, because it marks the word
+;; before it waits and the slow exit needs the bk the waiter holds until its wait
+;; releases it; no store-load fence is needed, because both sides agree through
+;; one CAS'd location.
+;;
+;; Model-checked in tools/monitor-model.pl (`make monitormodel`; every interleaving
+;; of three contexts, no spurious wakeups so a lost one cannot be rescued by a
+;; retry): mutual exclusion, no deadlock, every waiter can leave its wait and is
+;; always covered by the contended mark or a pending broadcast, and with two
+;; contexts each can always re-enter. The mutant whose fast exit frees a contended
+;; word leaves a waiter uncovered, and the run fails if the model stops seeing it.
+;; Change the protocol here, change the model there.
+;;
+;; vector-cas! is a WEAK compare-and-swap on arm64 (measured: 34 spurious failures
+;; in 10^8 uncontended attempts). A spurious failure only moves an enter or an exit
+;; onto its slow path, which handles every word it can find; the model allows the
+;; slow release from an uncontended word for that reason.
+;;
+;; count and box belong to the owner: only the context holding the word writes
+;; them, so the reentrant enter and exit touch them without bk too.
+(define-record-type monitor-contended (fields id) (nongenerative jolt-monitor-contended-v1))
+(define (monitor-word-id w) (if (monitor-contended? w) (monitor-contended-id w) w))
+(define (monitor-owner-id m) (monitor-word-id (vector-ref m monitor-i-owner)))
+;; Take a free word for me: CAS #f -> me, then the owner's own fields.
+(define (monitor-claim! m me)
+  (and (vector-cas! m monitor-i-owner #f me)
+       (begin
+         (memory-order-acquire)
+         (vector-set! m monitor-i-box (current-os-thread-box))
+         (vector-set! m monitor-i-count 1)
+         #t)))
+;; Free the word outright (bk held): the slow exit and Object.wait's release.
+(define (monitor-release-word! m)
+  (vector-set! m monitor-i-box #f)
+  (memory-order-release)
+  (vector-set! m monitor-i-owner #f))
 
 (define (object-monitor obj)
   (jolt-with-mutex monitor-table-lock
@@ -1246,7 +1292,7 @@
 ;; fiber on the same carrier does not match (it has a current fiber), and neither does
 ;; another thread (its interrupt box differs).
 (define (monitor-owner? m me)
-  (let ((owner (vector-ref m monitor-i-owner)))
+  (let ((owner (monitor-owner-id m)))
     (or (eq? owner me)
         (and (jolt-fiber? owner)
              (not (jolt-current-fiber))
@@ -1293,25 +1339,34 @@
 ;; three of those are jolt-lock-wait (host/chez/locks.ss), which is this protocol
 ;; named once rather than open-coded at each of the sites that needs it.
 (define (monitor-enter! m)
-  (let ((me (monitor-self)))
-    (jolt-lock-wait (vector-ref m monitor-i-bk)
-      (lambda ()
-        (let loop ()
-          (let ((owner (vector-ref m monitor-i-owner)))
-            (cond
-              ((eq? owner me)
-               (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
-               #f)
-              ((not owner)
-               (vector-set! m monitor-i-owner me)
-               (vector-set! m monitor-i-box (current-os-thread-box))
-               (vector-set! m monitor-i-count 1)
-               #f)
-              ;; a thread's wait ends under this same bk, so it loops HERE; a fiber
-              ;; answers jolt-lock-parked and jolt-lock-wait retakes this decision
-              ;; from the top once something has resumed it.
-              (else (or (monitor-wait! m) (loop))))))))
-    (void)))
+  (let* ((me (monitor-self)) (w (vector-ref m monitor-i-owner)))
+    (cond
+      ((and (not w) (monitor-claim! m me)) (void))
+      ;; reentrant: the word is mine (a contender may have wrapped it), and the
+      ;; count is the owner's alone
+      ((eq? (monitor-word-id w) me)
+       (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count))))
+      (else (monitor-enter-slow! m me)))))
+(define (monitor-enter-slow! m me)
+  (jolt-lock-wait (vector-ref m monitor-i-bk)
+    (lambda ()
+      (let loop ()
+        (let ((w (vector-ref m monitor-i-owner)))
+          (cond
+            ((not w) (if (monitor-claim! m me) #f (loop)))
+            ((eq? (monitor-word-id w) me)
+             (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
+             #f)
+            ;; held by someone else: mark the word contended BEFORE waiting, so the
+            ;; holder's fast exit fails and it wakes us. A failed mark means the
+            ;; word moved; decide again. A thread's wait ends under this same bk,
+            ;; so it loops HERE; a fiber answers jolt-lock-parked and jolt-lock-wait
+            ;; retakes this decision from the top once something has resumed it.
+            ((monitor-contended? w) (or (monitor-wait! m) (loop)))
+            ((vector-cas! m monitor-i-owner w (make-monitor-contended w))
+             (or (monitor-wait! m) (loop)))
+            (else (loop)))))))
+  (void))
 
 ;; The same decision without the wait: #t if this context now holds the monitor,
 ;; #f if something else does. ReentrantLock.tryLock is the caller, and the reason
@@ -1325,19 +1380,13 @@
 ;; section. Here bk is dropped before the caller runs a line of its body, so
 ;; jolt-locks-held is zero inside the section and the section is preemptible.
 (define (monitor-try-enter! m)
-  (let ((me (monitor-self)))
-    (jolt-with-mutex (vector-ref m monitor-i-bk)
-      (let ((owner (vector-ref m monitor-i-owner)))
-        (cond
-          ((eq? owner me)
-           (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
-           #t)
-          ((not owner)
-           (vector-set! m monitor-i-owner me)
-           (vector-set! m monitor-i-box (current-os-thread-box))
-           (vector-set! m monitor-i-count 1)
-           #t)
-          (else #f))))))
+  (let* ((me (monitor-self)) (w (vector-ref m monitor-i-owner)))
+    (cond
+      ((not w) (monitor-claim! m me))
+      ((eq? (monitor-word-id w) me)
+       (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
+       #t)
+      (else #f))))
 
 ;; The three questions ReentrantLock exposes. All strict eq? against monitor-self,
 ;; NOT monitor-owner?: that predicate's second arm exists so a TERMINAL fiber's own
@@ -1346,12 +1395,12 @@
 ;; because the alternative is leaking the monitor; a query has no such excuse.
 (define (monitor-held-by-self? m)
   (jolt-with-mutex (vector-ref m monitor-i-bk)
-    (eq? (vector-ref m monitor-i-owner) (monitor-self))))
+    (eq? (monitor-owner-id m) (monitor-self))))
 ;; getHoldCount is "holds by the CURRENT thread" on the JVM — 0 for anyone else,
 ;; not the raw depth.
 (define (monitor-self-count m)
   (jolt-with-mutex (vector-ref m monitor-i-bk)
-    (if (eq? (vector-ref m monitor-i-owner) (monitor-self))
+    (if (eq? (monitor-owner-id m) (monitor-self))
         (vector-ref m monitor-i-count)
         0)))
 (define (monitor-locked? m)
@@ -1389,7 +1438,18 @@
 ;; loader.ss's reason: the waiters re-check a condition that will be true for exactly
 ;; one of them.
 (define (monitor-exit! m)
-  (let ((me (monitor-self)))
+  (let* ((me (monitor-self)) (w (vector-ref m monitor-i-owner)) (n (vector-ref m monitor-i-count)))
+    (cond
+      ;; reentrant exit by the owner: its own count, no word change
+      ((and (eq? (monitor-word-id w) me) (fx>? n 1))
+       (vector-set! m monitor-i-count (fx- n 1)))
+      ;; uncontended release: me -> #f. Fails only if a contender marked the word
+      ;; since, and then the slow exit wakes it.
+      ((and (eq? w me) (begin (memory-order-release) (vector-cas! m monitor-i-owner me #f)))
+       (void))
+      (else (monitor-exit-slow! m me)))))
+(define (monitor-exit-slow! m me)
+  (let ()
     (let ((wake
            (jolt-with-mutex (vector-ref m monitor-i-bk)
              (unless (monitor-owner? m me)
@@ -1398,8 +1458,7 @@
              (vector-set! m monitor-i-count (fx- (vector-ref m monitor-i-count) 1))
              (if (fx=? 0 (vector-ref m monitor-i-count))
                  (let ((fs (vector-ref m monitor-i-fibers)))
-                   (vector-set! m monitor-i-owner #f)
-                   (vector-set! m monitor-i-box #f)
+                   (monitor-release-word! m)
                    (vector-set! m monitor-i-fibers '())
                    (condition-broadcast (vector-ref m monitor-i-cv))
                    fs)
@@ -1517,8 +1576,7 @@
                    (fs (vector-ref m monitor-i-fibers)))
                (vector-set! m monitor-i-waiters
                             (append (vector-ref m monitor-i-waiters) (list w)))
-               (vector-set! m monitor-i-owner #f)
-               (vector-set! m monitor-i-box #f)
+               (monitor-release-word! m)
                (vector-set! m monitor-i-count 0)
                (vector-set! m monitor-i-fibers '())
                (condition-broadcast (vector-ref m monitor-i-cv))
