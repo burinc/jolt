@@ -14,12 +14,18 @@
   (fn [input]
     (list [v input])))
 
+;; Each result is fed to f only when the caller reaches it. mapcat (apply
+;; concat) realizes a few results ahead at every level, and in a recursive
+;; parser like many each of those realizes ahead below it, so taking the first
+;; parse went quadratic (on the JVM as well).
 (defn >>= [m f]
   (fn [input]
-    (->>
-     m
-     (bind input)
-     (mapcat (fn [[v tail]] (bind tail (f v)))))))
+    ((fn step [rs]
+       (lazy-seq
+        (when-let [rs (seq rs)]
+          (let [[v tail] (first rs)]
+            (concat (bind tail (f v)) (step (rest rs)))))))
+     (bind input m))))
 
 (defn- merge-bind [body bind]
   (if (and (not= clojure.lang.Symbol (type bind))
