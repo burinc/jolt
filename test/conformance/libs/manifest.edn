@@ -503,7 +503,7 @@
    ;;     allocation (4.6x the collections, each stopping the world); the row
    ;;     runs in ~4 minutes, and :timeout 2400 is headroom for a loaded CI
    ;;     runner, not the expected cost.
-   :expect {:tests 219 :pass 13271 :fail 24 :error 9 :load-fail 1}}
+   :expect {:tests 219 :pass 13272 :fail 23 :error 9 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
