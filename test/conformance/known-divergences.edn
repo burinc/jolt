@@ -1695,10 +1695,6 @@
     {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Long is true", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "float class collapses to Double", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Float is true", :category :integer-box-model}
-    ;; naa9: vswap! is a macro on the JVM (:macro true) for inline performance;
-   ;; jolt implements it as a regular function. Semantics are equivalent — the
-   ;; JVM macro is a perf inline, not a semantic difference.
-   {:suite "macros / vswap! divergence", :label "vswap! is a macro on JVM, fn on jolt", :category :host-model}
    {:suite "string-model / codepoint strings", :label "count of astral string", :category :string-model}
    {:suite "string-model / codepoint strings", :label "seq counts codepoints", :category :string-model}
    {:suite "string-model / codepoint strings", :label "subs across astral boundary", :category :string-model}

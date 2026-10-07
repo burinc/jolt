@@ -83,8 +83,11 @@
 ;; notify each watch (k ref old new), in insertion order (alist is reverse-built,
 ;; so walk it reversed to match add order).
 (define (jolt-atom-notify a old new)
-  (for-each (lambda (kv) (jolt-invoke (cdr kv) (car kv) a old new))
-            (reverse (jolt-atom-watches a))))
+  (let ((ws (jolt-atom-watches a)))
+    ;; nearly every atom has none, and this runs on every swap!/reset!
+    (unless (null? ws)
+      (for-each (lambda (kv) (jolt-invoke (cdr kv) (car kv) a old new))
+                (reverse ws)))))
 
 ;; deref reads an atom; it also unwraps a `reduced` (Clojure @(reduced x) => x,
 ;; which the overlay's `unreduced` relies on). The reduced record is in seq.ss.

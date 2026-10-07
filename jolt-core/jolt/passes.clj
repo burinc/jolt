@@ -44,28 +44,6 @@
 (defn- inline-eligible? [ctx node]
   (and (jolt.ir/single-fixed-arity-fn-def? node)
        (not (jolt.ir/closed-world-opt-out? (:meta node)))
-       ;; ...and not array-hinted. A ^doubles/^longs/^ints param types its local
-       ;; through the ARITY (numeric/arity-env reads :ahints off it), and a spliced
-       ;; body has no arity -- the stash carries :nhints, which survive as a
-       ;; coerce-node on the wrapping let, but there is no coercion that says "this
-       ;; local is a flvector", so the copy falls off the unboxed path. bench/arrays
-       ;; went 229.7 -> 1272.6ms the moment :loop became spliceable and dot's
-       ;; (aget a i) started emitting jolt-nth instead of flvector-ref.
-       ;;
-       ;; Refused at the stash, so it is not a missed optimization discovered late:
-       ;; an array-hinted fn simply is not an inline candidate until the splicer can
-       ;; carry a param's array type, which needs the numeric pass to take a
-       ;; declared kind on a let-bound local. Costs nothing against the state before
-       ;; :loop landed -- these fns are nearly all loops, so none of them were
-       ;; spliceable then either.
-       ;;
-       ;; This covers EVERY array kind, not just :doubles. The boxed kinds have no
-       ;; unboxed path to fall off, but they do have jolt-vaget, and a spliced copy
-       ;; loses that too: measured, an (aget ^objects a i) in a spliceable fn emitted
-       ;; jolt-vaget in the standalone definition and jolt-nth in all three spliced
-       ;; copies -- which is every call on the hot path. Narrowing this to :doubles
-       ;; cost the entire boxed-array win and bought nothing.
-       (not (seq (:ahints (first (:arities (:init node))))))
        ;; ...and not a var this program defines more than once. A stash is a
        ;; promise that the body a call site copies is the body that var will
        ;; have, and a second def breaks it for every caller compiled before it:
@@ -96,7 +74,11 @@
     ;; no caller type could be inferred — so a splice has to carry them for the
     ;; same reason it carries :nhints. The splicer puts them on the substituted
     ;; locals (try-inline rec-hint), since the copy has no arity to hang them on.
+    ;; :ahints (^longs/^doubles/... params) are spliced like :nhints: each binds
+    ;; once under a :coerce of its kind, which is how the numeric pass types an
+    ;; array local whether it came from a let or a param.
     {:params (:params a) :body (:body a) :nhints (:nhints a) :phints (:phints a)
+     :ahints (:ahints a)
      :ret (:ret-nhint a)
      ;; the stash-graph edges splice-cycle-member? (inline.clj) walks to refuse
      ;; inlining a recursive cluster; computed once here, on the analyzed body.

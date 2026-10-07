@@ -194,21 +194,22 @@
 (gate-check "a shadowing inner binder still shadows after the splice"
             (ilg-call "(fn [] (let [a 100] (ilg-shadow a)))") "202")
 
-;; 5. an ARRAY-HINTED callee is not a candidate at all. ^doubles/^longs/^ints
-;;    type their local through the arity (numeric/arity-env reads :ahints off
-;;    it), and a spliced body has no arity: :nhints survive as a coerce-node on
-;;    the wrapping let, but nothing says "this local is a flvector", so the copy
-;;    falls off the unboxed path. Caught by bench/arrays going 229.7 -> 1272.6ms
-;;    when :loop became spliceable and dot's (aget a i) started emitting jolt-nth
-;;    instead of flvector-ref -- a 5.4x regression that every behavioural gate
-;;    passed, because the answers were all still right.
-;;
-;;    Asserted on the name (the call survives) rather than on flvector-ref, so it
-;;    pins the refusal itself and not the emission that happens to follow from it.
+;; 5. an ARRAY-HINTED callee splices and its copy stays on the typed path.
+;;    The splice binds each ^doubles/^longs/... param under a :coerce of its
+;;    kind, the same carrier a ^double/^long param and an array-hinted let use,
+;;    so the numeric pass types the copy's local. Before that carrier existed
+;;    these fns were refused outright: when :loop became spliceable, dot's
+;;    (aget a i) emitted jolt-nth in every copy and bench/arrays went 229.7 ->
+;;    1272.6ms while every behavioural gate passed. So this asserts the
+;;    emission, not only the answer.
 (evals "(defn ilg-adot ^double [^doubles v ^long n] (loop [i 0 acc 0.0] (if (< i n) (recur (inc i) (+ acc (aget v i))) acc)))")
 (ilg-emit "(defn ilg-adot ^double [^doubles v ^long n] (loop [i 0 acc 0.0] (if (< i n) (recur (inc i) (+ acc (aget v i))) acc)))")
-(gate-check "an array-hinted callee is never spliced"
-            (gate-sub? (ilg-emit "(defn ilg-uses-adot [v] (ilg-adot v 4))") "ilg-adot") #t)
+(let ((e (ilg-emit "(defn ilg-uses-adot [v] (ilg-adot v 4))")))
+  (gate-check "an array-hinted callee is spliced" (gate-sub? e "ilg-adot") #f)
+  (gate-check "...and its copy reads the flvector unboxed" (gate-sub? e "flvector-ref") #t)
+  (gate-check "...never through jolt-nth" (gate-sub? e "jolt-nth") #f))
+(gate-check "...and answers what the call did"
+            (ilg-call "(fn [] (ilg-adot (double-array [1.0 2.0 3.0 4.0]) 4))") "10.0")
 
 (set-direct-link-flag! #f)
 (set-optimize! #f)

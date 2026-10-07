@@ -16,11 +16,10 @@
 (def-var! "clojure.core" "remove-watch" jolt-remove-watch)
 (def-var! "clojure.core" "set-validator!" jolt-set-validator!)
 (def-var! "clojure.core" "get-validator" jolt-get-validator)
-;; volatiles: a Chez volatile is a jvol record, but the overlay vreset!/vswap!/
+;; volatiles: a Chez volatile is a jvol record, but the overlay vreset!/
 ;; volatile? drive it via jolt.host/ref-put!+get / :jolt/type (tagged-table only).
 ;; Override with the native versions (defined in natives-transduce.ss).
 (def-var! "clojure.core" "vreset!" jolt-vreset!)
-(def-var! "clojure.core" "vswap!" jolt-vswap!)
 (def-var! "clojure.core" "volatile?" jolt-volatile-pred?)
 ;; bound?: the overlay reads (get v :root) — nil on a Chez var-cell record, so it
 ;; would wrongly report every var unbound. Native version (defined in vars.ss).

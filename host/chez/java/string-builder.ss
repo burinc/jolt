@@ -12,51 +12,57 @@
 ;; throw-jvm; loads after those and before anything that constructs a builder.
 
 ;; ---- StringBuilder ----------------------------------------------------------
-;; state: #(materialised-string pending-chunks-reversed pending-length).
+;; state: #(buf len str) — the JVM's AbstractStringBuilder shape. buf is a
+;; string whose first len characters are the content; its length is the
+;; capacity, doubled when an append outgrows it, so building an n-char string
+;; is O(n) (the obvious one-string representation copied the whole buffer per
+;; append: clojure.data.json reading an 88KB string value took 623ms, see
+;; test/chez/string-builder-perf.ss). length and charAt read buf directly, so a
+;; read between appends costs O(1) the way it does on the JVM; the chunk list
+;; this replaced re-joined the whole buffer on every such read, which made a
+;; formatter that appends a token and then looks at its line O(line) per token.
 ;;
-;; Appends accumulate as a list of chunks and are joined only when something
-;; reads the buffer. The obvious representation — one string, appended to with
-;; string-append — copies the whole buffer on every append, which makes building
-;; an n-char string O(n^2). That is not theoretical: clojure.data.json reads a
-;; quoted string a character at a time into a StringBuilder, so one 88KB JSON
-;; string value cost 623ms to parse against 30ms for the same bytes spread over
-;; many short values. See test/chez/string-builder-perf.ss.
-;;
-;; Every other method still reads through sb-str, so it flushes first and
-;; behaves exactly as before; only append and the two size reads skip the join.
+;; str caches the content as a String once asked, until the next write. That is
+;; also what keeps a handed-out String immutable: buf is only ever written past
+;; len by an append that fits its capacity, and a buffer that IS a String (one
+;; installed by sb-set! or the constructor) is exactly full, so the first append
+;; to it allocates a new buffer instead.
+(define (make-sb-state s) (vector s (string-length s) s))
 (define (sb-str self)
-  (let* ((st (jhost-state self))
-         (pending (vector-ref st 1)))
-    (if (null? pending)
-        (vector-ref st 0)
-        (let* ((base (vector-ref st 0))
-               (blen (string-length base))
-               (out (make-string (+ blen (vector-ref st 2)))))
-          (sa-string-copy-range! out 0 base 0 blen)
-          (let loop ((cs (reverse pending)) (i blen))
-            (if (null? cs)
-                (begin (vector-set! st 0 out)
-                       (vector-set! st 1 '())
-                       (vector-set! st 2 0)
-                       out)
-                (let* ((c (car cs)) (n (string-length c)))
-                  (sa-string-copy-range! out i c 0 n)
-                  (loop (cdr cs) (+ i n)))))))))
+  (let ((st (jhost-state self)))
+    (or (vector-ref st 2)
+        (let* ((buf (vector-ref st 0)) (n (vector-ref st 1))
+               (out (make-string n)))
+          (sa-string-copy-range! out 0 buf 0 n)
+          (vector-set! st 2 out)
+          out))))
 (define (sb-set! self s)
   (let ((st (jhost-state self)))
     (vector-set! st 0 s)
-    (vector-set! st 1 '())
-    (vector-set! st 2 0)))
-;; O(1): the chunk is retained as-is and nothing is copied until a read.
+    (vector-set! st 1 (string-length s))
+    (vector-set! st 2 s)))
+;; Amortised O(1): copies only the piece, except when the capacity doubles.
 (define (sb-append! self piece)
-  (let ((st (jhost-state self)))
-    (vector-set! st 1 (cons piece (vector-ref st 1)))
-    (vector-set! st 2 (+ (vector-ref st 2) (string-length piece)))))
-;; Size without flushing, so the common `while (.length sb) < n: append` shape
-;; does not force a join per iteration and put the O(n^2) straight back.
-(define (sb-length self)
-  (let ((st (jhost-state self)))
-    (+ (string-length (vector-ref st 0)) (vector-ref st 2))))
+  (let ((pn (string-length piece)))
+    (unless (fx=? pn 0)
+      (let* ((st (jhost-state self))
+             (buf (vector-ref st 0)) (n (vector-ref st 1)) (need (fx+ n pn)))
+        (let ((buf (if (fx<=? need (string-length buf))
+                       buf
+                       (let ((nb (make-string (fxmax need (fx+ (fx* 2 (string-length buf)) 16)))))
+                         (sa-string-copy-range! nb 0 buf 0 n)
+                         (vector-set! st 0 nb)
+                         nb))))
+          (sa-string-copy-range! buf n piece 0 pn)
+          (vector-set! st 1 need)
+          (vector-set! st 2 #f))))))
+(define (sb-length self) (vector-ref (jhost-state self) 1))
+;; charAt over the live buffer, with String.charAt's check against the length.
+(define (sb-char-at self i)
+  (let* ((st (jhost-state self)) (n (vector-ref st 1)) (i (jolt->idx i)))
+    (if (and (fixnum? i) (fx>=? i 0) (fx<? i n))
+        (string-ref (vector-ref st 0) i)
+        (char-index-oob i n))))
 (define (render-piece x)
   (cond ((jolt-nil? x) "null") ((char? x) (string x)) ((string? x) x)
         (else (jolt-str-render-one x))))
@@ -112,11 +118,10 @@
 (define (string-builder-state args)
   ;; a numeric first arg is a CAPACITY hint, not content; nil is the
   ;; NullPointerException the JVM's String ctor raises.
-  (vector (cond ((null? args) "")
-                ((jolt-nil? (car args)) (throw-jvm 'NullPointerException "str"))
-                ((number? (car args)) "")
-                (else (render-piece (car args))))
-          '() 0))
+  (make-sb-state (cond ((null? args) "")
+                       ((jolt-nil? (car args)) (throw-jvm 'NullPointerException "str"))
+                       ((number? (car args)) "")
+                       (else (render-piece (car args))))))
 (register-class-ctor! "StringBuilder"
   (lambda args (make-jhost "string-builder" (string-builder-state args))))
 (define string-builder-methods
@@ -133,7 +138,7 @@
                  self)))
         (cons "toString" (lambda (self) (sb-str self)))
         (cons "length" (lambda (self) (->num (sb-length self))))
-        (cons "charAt" (lambda (self i) (string-ref (sb-str self) (jnum->exact i))))
+        (cons "charAt" (lambda (self i) (sb-char-at self i)))
         (cons "setLength" (lambda (self n)
                             (let ((cur (sb-str self)) (n (jnum->exact n)))
                               (sb-set! self (if (< n (string-length cur))
