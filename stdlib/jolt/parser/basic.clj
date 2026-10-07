@@ -1,3 +1,6 @@
+;;   Portions of this file are adapted from jasentaa (https://github.com/rm-hull/jasentaa),
+;;   Copyright (c) 2016 Richard Hull. MIT License (licenses/MIT-jasentaa.txt).
+
 ;; Primitive character parsers, adapted from rm-hull/jasentaa (MIT).
 
 (ns jolt.parser.basic

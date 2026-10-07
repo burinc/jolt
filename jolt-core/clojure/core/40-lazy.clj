@@ -1,3 +1,8 @@
+;;   Portions of this file are from ClojureScript's src/main/cljs/cljs/core.cljs,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.core — lazy tier. Canonical CLJS-based lazy seq fns.
 ;; Loaded after 30-macros.clj, so lazy-seq macro is available.
 ;;

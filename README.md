@@ -341,6 +341,11 @@ word gets you.
 
 ## Tasks that parse their arguments
 
+jolt's task runner is modelled on [babashka's tasks](https://book.babashka.org/#tasks):
+it reads the same `:tasks` map, with the same `:depends`, `:requires`, `:init`,
+`:enter` and `:leave` semantics, and its `:exec-fn` / `:cmd` dispatch is adapted
+from babashka's implementation (see [NOTICE](NOTICE)).
+
 A `bb.edn` (or `deps.edn`) `:tasks` entry normally holds a body to run. An entry
 that names an `:exec-fn` instead — or a `:cmd` tree of them — has its arguments
 parsed by [babashka.cli](https://github.com/babashka/cli) first, which is
@@ -692,3 +697,8 @@ backends, and the test gates are in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 ## License
 
 [Eclipse Public License 2.0](https://www.eclipse.org/legal/epl-2.0/)
+
+jolt builds on other people's work: Chez Scheme, Clojure and ClojureScript,
+babashka and its fs, process and cli libraries, and others. [NOTICE](NOTICE)
+lists each one with its copyright and license, and [licenses/](licenses/) holds
+the license texts. Those parts stay under their own licenses.

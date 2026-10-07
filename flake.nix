@@ -71,6 +71,9 @@
             runHook preInstall
             mkdir -p "$out/bin"
             install -m755 target/release/jolt "$out/bin/jolt"
+            mkdir -p "$out/share/doc/jolt"
+            cp LICENSE NOTICE "$out/share/doc/jolt/"
+            cp -R licenses "$out/share/doc/jolt/licenses"
             runHook postInstall
           '';
 
@@ -88,7 +91,16 @@
           meta = {
             description = "Clojure implementation on Chez Scheme";
             homepage = "https://jolt-lang.net";
-            license = pkgs.lib.licenses.epl20;
+            # jolt itself, plus what NOTICE lists as embedded in the binary
+            license = with pkgs.lib.licenses; [
+              epl20
+              epl10
+              asl20
+              mit
+              bsd2
+              bsd3
+              zlib
+            ];
             mainProgram = "jolt";
           };
         };

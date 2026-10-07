@@ -1,3 +1,6 @@
+;;   Portions of this file are adapted from jasentaa (https://github.com/rm-hull/jasentaa),
+;;   Copyright (c) 2016 Richard Hull. MIT License (licenses/MIT-jasentaa.txt).
+
 ;; Source-location tracking + parse-error reporting, adapted from
 ;; rm-hull/jasentaa (MIT). Parse failures are signalled with a natural jolt
 ;; ex-info carrying :offset/:line/:col rather than a host exception class.

@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/core.clj and core_print.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.core — IO tier: the *in* reader family.
 ;;
 ;; *in* is a dynamic var holding a READER: a reify over IReader whose ops close

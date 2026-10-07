@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/template.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; Verbatim from clojure.template (Stuart Sierra) — pure Clojure over
 ;; clojure.walk, which jolt ships. Added so honeysql's :clj branch (which
 ;; requires clojure.template) loads.

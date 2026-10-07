@@ -129,7 +129,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck \
+.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck noticecheck \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
         gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives compilepathsmoke makefilesmoke versionsmoke attributioncheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest threadsafety cas flow
 TEST-GATES := submodules selfhost ci
@@ -1498,6 +1498,12 @@ versionsmoke:
 # range with full history.
 attributioncheck:
 	@sh tools/attributioncheck.sh
+
+# NOTICE names every third-party work jolt embeds or adapts, with its license
+# text in licenses/; this fails when a submodule, a license file, a named
+# source's copyright line or the release packaging drifts from it.
+noticecheck:
+	@sh tools/noticecheck.sh
 
 # Install the repository's git hooks into .git/hooks (copies, so a clone that
 # never runs this is unaffected; re-run after a hook changes).

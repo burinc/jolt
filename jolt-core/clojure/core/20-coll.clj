@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/core.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.core — collection tier. Pure, eager fns expressed as compositions of
 ;; already-frozen core primitives (reduce/assoc/get/conj/filter/vec/count/>=).
 ;; No host internals, no laziness, no macros — so they compile cleanly and stay

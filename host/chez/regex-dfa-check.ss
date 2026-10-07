@@ -37,6 +37,8 @@
   (call-with-output-file pin-path
     (lambda (p)
       (display ";; PINNED COPY — do not edit by hand.\n" p)
+      (display ";; Code from irregex, Copyright (c) 2005-2024 Alex Shinn, BSD-style license\n" p)
+      (display ";; (licenses/BSD-irregex.txt).\n" p)
       (display ";;\n" p)
       (display ";; irregex's own nfa->dfa, as of the currently checked-out\n" p)
       (display ";; vendor/irregex. host/chez/regex-dfa.ss is jolt's replacement for it,\n" p)

@@ -1,4 +1,6 @@
 ;; PINNED COPY — do not edit by hand.
+;; Code from irregex, Copyright (c) 2005-2024 Alex Shinn, BSD-style license
+;; (licenses/BSD-irregex.txt).
 ;;
 ;; irregex's own sre->procedure, as of the currently checked-out
 ;; vendor/irregex. host/chez/java/regex-anchor-sre.scm is jolt's

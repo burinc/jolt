@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/test.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ; Jolt Standard Library: clojure.test
 ;
 ; A practical subset of clojure.test for running real test suites under Jolt:

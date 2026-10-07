@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/gvec.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; vector-of: primitive-typed persistent vectors, the reference's gvec.clj as a
 ;; core tier. The types are clojure.core.Vec / VecSeq / ArrayChunk, as on the JVM;
 ;; the array managers sit on jolt's typed arrays (int-array …) and the

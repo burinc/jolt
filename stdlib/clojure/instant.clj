@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/instant.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.instant — RFC3339 timestamp parsing and the `#inst` reader
 ;; constructors. The parser and the range validation are the reference
 ;; implementation's, unchanged (they are pure Clojure); only the constructors are

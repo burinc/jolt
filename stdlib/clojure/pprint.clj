@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/pprint/,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.pprint — a column-aware pretty printer and a Common Lisp compatible
 ;; cl-format. The writer accumulates into a StringBuilder; pprint/write/cl-format
 ;; bind *out* (this ns's own dynamic binding) to a pretty-writer over it and emit
