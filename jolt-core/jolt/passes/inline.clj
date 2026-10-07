@@ -467,7 +467,10 @@
         (if stash
           (let [params (get stash :params)
                 body (get stash :body)
-                nh (reduce (fn [m pr] (assoc m (nth pr 0) (nth pr 1))) {} (get stash :nhints))
+                ;; param name -> declared ^double/^long or array kind; both
+                ;; bind under a :coerce of that kind
+                nh (reduce (fn [m pr] (assoc m (nth pr 0) (nth pr 1)))
+                           {} (concat (get stash :nhints) (get stash :ahints)))
                 ;; declared ^Record param hints, param name -> ctor-key
                 ph (reduce (fn [m pr] (assoc m (nth pr 0) (nth pr 1))) {} (get stash :phints))
                 ret (get stash :ret)
@@ -488,6 +491,8 @@
                     ;; wrapping let, so they evaluate exactly once in source order.
                     ;; A ^double/^long param always binds (no copy-prop) so its
                     ;; entry coercion runs — preserving the called fn's semantics.
+                    ;; An array-hinted one binds the same way: its coerce emits
+                    ;; nothing, but it is what types the local for aget/aset.
                     ;; A ^Record param is a DECLARATION, not an inferred fact: it
                     ;; types the param whether or not the caller's argument type
                     ;; could be inferred (types.clj seeds an arity from :phints for

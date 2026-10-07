@@ -686,11 +686,14 @@
                                    (fi-adapt-form fi (nth bvec (inc i)))
                                    (nth bvec (inc i)))
                              env)
-              ;; a ^doubles/^floats/^longs/^ints let binding tags its init with the
-              ;; array kind so jolt.passes.numeric seeds the local for the unboxed
-              ;; flvector aget/aset path (mirrors the :ahints param route).
+              ;; a ^doubles/^longs/^objects/... let binding wraps its init in a
+              ;; :coerce of the array kind, so jolt.passes.numeric seeds the local
+              ;; for the direct aget/aset paths. A node, not a key on the init:
+              ;; the inline fixpoint rebuilds inits (flatten hoists a let-valued
+              ;; one, a splice replaces an invoke), and a key on the old node was
+              ;; lost with it. The back end emits an array-kind coerce as its expr.
               ak (ahint-of ctx bsym)
-              init (if ak (assoc init0 :akind ak) init0)]
+              init (if ak (coerce-node ak init0) init0)]
           ;; an explicit hint wins; init-proves-hint only fills in where the
           ;; programmer wrote nothing.
           (recur (+ i 2) (let [e (add-hint (add-locals env [nm]) nm

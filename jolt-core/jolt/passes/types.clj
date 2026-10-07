@@ -1037,8 +1037,10 @@
       ;; its inlined copies. A hint must never cost, so the body is inferred and
       ;; the node rebuilt around it; the coercion's own kind is what it answers.
       (= op :coerce)
-      (let [r (infer (get node :expr) tenv env)]
-        [(if (= :double (get node :kind)) :double :num)
+      ;; An array-kind coerce (a ^longs/^objects/... let init) is no number.
+      (let [r (infer (get node :expr) tenv env)
+            k (get node :kind)]
+        [(cond (= :double k) :double (= :long k) :num :else :any)
          (assoc node :expr (nth r 1))])
 
       ;; Anything with no arm above. Answering :any is right — this pass has no

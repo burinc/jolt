@@ -164,4 +164,44 @@
             (keyword #f "aioobe"))
 (gate-check "(8) get on an array stays non-throwing OOB (returns default)"
             (ev "(get (int-array 3) 99 :d)") (keyword #f "d"))
+;; --- the array kind survives the optimizing passes ---------------------------
+;; The rows above emit straight from the analyzer. A `jolt build` runs the
+;; inline fixpoint first, which rebuilds let bindings: flatten hoists a
+;; let-valued init, a splice replaces an invoke init. The kind used to ride on
+;; the init node as a key, so a rebuilt init dropped it and every (aget a i)
+;; fell back to jolt-nth. standard-clojure-style's format loop binds its kind
+;; array exactly this way (an init that fills the array, then returns it).
+(define run-passes (var-deref "jolt.passes" "run-passes"))
+(define (emit-opt src)
+  (emit (run-passes (anode src) (make-analyze-ctx "user") U)))
+(set-optimize! #t)
+(set-direct-link-flag! #t)
+(let ((e (emit-opt "(def _ (fn [n i] (let [^longs a (let [b (long-array n)] (aset b 0 1) b)] (aget a i))))")))
+  (gate-check "(9) ^longs local over a let init, flattened: still jolt-vaget" (gate-sub? e "(jolt-vaget a i)") #t)
+  (gate-check "(9) ...and no jolt-nth" (gate-sub? e "jolt-nth") #f))
+(let ((e (emit-opt "(def _ (fn [n i] (let [^objects a (let [b (object-array n)] b)] (fn [] (aget a i)))))")))
+  (gate-check "(9a) ^objects local captured by a closure, flattened: jolt-vaget" (gate-sub? e "(jolt-vaget a i)") #t))
+(let ((e (emit-opt "(def _ (fn [n ^long i] (let [^doubles a (let [b (double-array n)] b)] (+ 1.0 (aget a i)))))")))
+  (gate-check "(9b) ^doubles local over a let init, flattened: unboxed read" (gate-sub? e "flvector-ref") #t))
+;; A spliced callee takes its array params through the same carrier: the
+;; splice binds each hinted param once, wrapped in a :coerce of its kind, as it
+;; does a ^double/^long one. Before, an array-hinted fn was refused as an inline
+;; candidate outright, because the copy came out on jolt-nth.
+(jolt-compile-eval "(defn flarr-cell [^longs a i] (aget a i))" "user")
+(jolt-compile-eval "(defn flarr-dot [^doubles a ^doubles b ^long n] (loop [i 0 s 0.0] (if (< i n) (recur (inc i) (+ s (* (aget a i) (aget b i)))) s)))" "user")
+(emit-opt "(defn flarr-cell [^longs a i] (aget a i))")
+(emit-opt "(defn flarr-dot [^doubles a ^doubles b ^long n] (loop [i 0 s 0.0] (if (< i n) (recur (inc i) (+ s (* (aget a i) (aget b i)))) s)))")
+(let ((e (emit-opt "(defn flarr-use-1 [x j] (inc (flarr-cell x j)))")))
+  (gate-check "(9c) an array-hinted callee is spliced" (gate-sub? e "flarr-cell") #f)
+  (gate-check "(9c) ...and its copy reads with jolt-vaget" (gate-sub? e "jolt-vaget") #t)
+  (gate-check "(9c) ...not jolt-nth" (gate-sub? e "jolt-nth") #f))
+(let ((e (emit-opt "(defn flarr-use-2 [x y] (flarr-dot x y 3))")))
+  (gate-check "(9d) a ^doubles loop callee is spliced" (gate-sub? e "flarr-dot") #f)
+  (gate-check "(9d) ...and its copy stays unboxed" (gate-sub? e "flvector-ref") #t)
+  (gate-check "(9d) ...not jolt-nth" (gate-sub? e "jolt-nth") #f))
+(gate-check "(9e) the spliced copy answers what the call did"
+            (ev "(let [a (double-array [1.0 2.0 3.0])] (flarr-dot a a 3))") 14.0)
+(set-direct-link-flag! #f)
+(set-optimize! #f)
+
 (gate-summary "flarr")
