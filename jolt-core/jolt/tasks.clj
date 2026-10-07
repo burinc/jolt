@@ -1,3 +1,9 @@
+;;   Portions of this file are adapted from babashka's
+;;   src/babashka/impl/tasks.clj (https://github.com/babashka/babashka),
+;;   Copyright (c) Michiel Borkent. The task semantics follow babashka's.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 (ns jolt.tasks
   "The task runner behind `jolt <task>` / `jolt run <task>` / `jolt tasks`.
 

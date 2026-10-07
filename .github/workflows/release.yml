@@ -487,7 +487,8 @@ jobs:
           ver="${JOLT_TAG}"
           name="jolt-${ver}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
-          cp README.md LICENSE "dist/${name}/"
+          cp README.md LICENSE NOTICE "dist/${name}/"
+          cp -R licenses "dist/${name}/licenses"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp target/release/jolt.exe "dist/${name}/jolt.exe"
             ( cd dist && zip -r "${name}.zip" "${name}" && sha256sum "${name}.zip" > "${name}.zip.sha256" )

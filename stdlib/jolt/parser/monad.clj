@@ -1,3 +1,6 @@
+;;   Portions of this file are adapted from jasentaa (https://github.com/rm-hull/jasentaa),
+;;   Copyright (c) 2016 Richard Hull. MIT License (licenses/MIT-jasentaa.txt).
+
 ;; Minimal monadic-parser core, adapted from rm-hull/jasentaa
 ;; (MIT). A parser is a fn from input to a seq of [value remaining] results;
 ;; do* threads them together.

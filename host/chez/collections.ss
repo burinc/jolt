@@ -384,8 +384,9 @@
 ;; RRB concat / slice — O(log n) pvec-catvec and pvec-slice
 ;;
 ;; The concat/rebalance plan, size-table search, and take/drop node surgery are
-;; ported from Racket's treelist (racket/collects/racket/treelist.rkt, MIT or
-;; Apache-2.0), adapted to this file's node shapes: leaves are element chunks,
+;; ported from Racket's treelist (racket/collects/racket/treelist.rkt),
+;; Copyright (c) PLT Design Inc. and contributors, used under the MIT License
+;; (licenses/MIT-racket.txt), adapted to this file's node shapes: leaves are element chunks,
 ;; regular branches are Scheme vectors, relaxed branches are rrbnode records,
 ;; and the vector keeps Clojure's tail (treelist has none; the tail seam
 ;; follows clojure/core.rrb-vector, with L'orange's RRB thesis arbitrating).

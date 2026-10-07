@@ -1,5 +1,8 @@
 ;; regex-anchor-sre.scm — O(1) look-behind for single-character anchors (jolt #1062).
 ;;
+;; Adapted from irregex's sre->procedure, Copyright (c) 2005-2024 Alex Shinn,
+;; BSD-style license (licenses/BSD-irregex.txt).
+;;
 ;; `sre->procedure` below is a verbatim copy of the vendored IrRegex definition
 ;; (vendor/irregex/irregex.scm), redefined globally so it wins over the vendored
 ;; one at load time.  The changes are marked "jolt #1062" and are these: the

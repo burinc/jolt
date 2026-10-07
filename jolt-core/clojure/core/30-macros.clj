@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/core.clj,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.core — macro tier. Macros expressed in Clojure (defmacro + syntax-quote).
 ;; Loaded after the fn tiers, so a macro here may use any already-frozen core
 ;; fn/macro.

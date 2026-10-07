@@ -1,0 +1,125 @@
+Jolt
+Copyright (c) Dmitri Sotnikov and contributors.
+Licensed under the Eclipse Public License 2.0 (LICENSE).
+
+Jolt includes and derives from the third-party works listed below. Each part
+stays under the license its authors gave it; the full texts are in licenses/.
+A file that carries code from one of these works says so in its header.
+
+
+Embedded in every jolt binary
+-----------------------------
+
+Chez Scheme
+  https://github.com/cisco/ChezScheme
+  Copyright 1984-2026 Cisco Systems, Inc.
+  Apache License 2.0: licenses/Apache-2.0.txt
+  Chez Scheme's own notice, which also covers the zlib and LZ4 libraries it
+  builds with: licenses/ChezScheme-NOTICE.txt
+
+zlib
+  Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler
+  zlib license: licenses/zlib.txt
+
+LZ4
+  Copyright (c) 2011-2020, Yann Collet
+  BSD 2-Clause license: licenses/BSD-2-lz4.txt
+
+irregex (vendor/irregex)
+  https://github.com/ashinn/irregex
+  Copyright (c) 2005-2024 Alex Shinn
+  BSD-style license: licenses/BSD-irregex.txt
+  jolt replaces two irregex procedures with modified copies:
+  host/chez/regex-dfa.ss (nfa->dfa) and host/chez/java/regex-anchor-sre.scm
+  (sre->procedure); host/chez/regex-dfa-upstream.scm and
+  host/chez/regex-anchor-sre-upstream.scm pin the originals.
+
+babashka.fs (vendor/fs) - the implementation behind jolt.fs
+  https://github.com/babashka/fs
+  Copyright (c) Michiel Borkent
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+
+babashka.process (vendor/process) - the implementation behind jolt.process
+  https://github.com/babashka/process
+  Copyright (c) Michiel Borkent
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+
+babashka.cli (vendor/cli) - the implementation behind jolt.cli
+  https://github.com/babashka/cli
+  Copyright (c) 2022 babashka
+  MIT License: licenses/MIT-babashka-cli.txt
+
+Grenadine (vendor/grenadine, vendor/grenadine-generated)
+  https://github.com/clojurestar/grenadine
+  Derived from tools.deps, Copyright (c) Rich Hickey and contributors
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+  Grenadine also includes code from Apache Maven, Copyright 2001-2019 The
+  Apache Software Foundation, under the Apache License 2.0
+  (licenses/Apache-2.0.txt); its notice: licenses/Apache-Maven-NOTICE.txt
+
+
+Code adapted into jolt's own sources
+------------------------------------
+
+babashka
+  https://github.com/babashka/babashka
+  Copyright (c) Michiel Borkent
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+  jolt-core/jolt/tasks.clj follows babashka's task semantics, and its
+  babashka.cli dispatch for :exec-fn / :cmd tasks is adapted from
+  src/babashka/impl/tasks.clj.
+
+Clojure
+  https://github.com/clojure/clojure
+  Copyright (c) Rich Hickey and contributors
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+  jolt's clojure.core overlay and its clojure.* standard library namespaces
+  implement Clojure's API and carry its docstrings throughout; the files
+  ported from a Clojure source file name it in their headers. clojure.repl is in part
+  Copyright (c) Chris Houser.
+  Ported files: stdlib/clojure/pprint.clj stdlib/clojure/main.clj
+  stdlib/clojure/repl.clj stdlib/clojure/reflect.clj stdlib/clojure/instant.clj
+  stdlib/clojure/template.clj stdlib/clojure/walk.clj stdlib/clojure/set.clj
+  stdlib/clojure/string.clj stdlib/clojure/test.clj stdlib/clojure/zip.clj
+  stdlib/clojure/data.clj stdlib/clojure/datafy.clj stdlib/clojure/stacktrace.clj
+  stdlib/clojure/java/shell.clj stdlib/clojure/java/javadoc.clj
+  stdlib/clojure/java/browse.clj jolt-core/clojure/core/20-coll.clj
+  jolt-core/clojure/core/30-macros.clj jolt-core/clojure/core/50-io.clj
+  jolt-core/clojure/core/60-gvec.clj jolt-core/clojure/core/90-docs.clj
+
+ClojureScript
+  https://github.com/clojure/clojurescript
+  Copyright (c) Rich Hickey and contributors
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+  jolt-core/clojure/core/25-sorted.clj (PersistentTreeMap) and
+  jolt-core/clojure/core/40-lazy.clj (lazy sequence functions).
+
+core.async
+  https://github.com/clojure/core.async
+  Copyright (c) Rich Hickey and contributors
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+  stdlib/clojure/core/async.clj and stdlib/clojure/core/async/flow.clj.
+
+tools.deps
+  https://github.com/clojure/tools.deps
+  Copyright (c) Rich Hickey and contributors
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+  jolt-core/jolt/deps/edn.clj and jolt-core/jolt/deps/ext.clj.
+
+jasentaa
+  https://github.com/rm-hull/jasentaa
+  Copyright (c) 2016 Richard Hull
+  MIT License: licenses/MIT-jasentaa.txt
+  stdlib/jolt/parser.clj and stdlib/jolt/parser/.
+
+infix
+  https://github.com/rm-hull/infix
+  Copyright (c) 2016 Richard Hull
+  MIT License: licenses/MIT-infix.txt
+  stdlib/jolt/infix.clj and stdlib/jolt/infix/.
+
+Racket treelist
+  https://github.com/racket/racket (racket/collects/racket/treelist.rkt)
+  Copyright (c) PLT Design Inc. and contributors
+  MIT License: licenses/MIT-racket.txt
+  The RRB vector in host/chez/collections.ss.

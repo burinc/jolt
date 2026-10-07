@@ -1,5 +1,8 @@
 ;; regex-dfa.ss — jolt's nfa->dfa, replacing the vendored irregex one.
 ;;
+;; Adapted from irregex's nfa->dfa, Copyright (c) 2005-2024 Alex Shinn,
+;; BSD-style license (licenses/BSD-irregex.txt).
+;;
 ;; irregex compiles a group-free pattern to a DFA (regex.ss says why capturing
 ;; patterns keep the backtracker instead). The conversion is Laurikari's tagged
 ;; NFA->DFA: each DFA state is a MULTI-STATE, a vector with one slot per NFA

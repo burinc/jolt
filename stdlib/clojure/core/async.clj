@@ -1,3 +1,8 @@
+;;   Portions of this file are from core.async's src/main/clojure/clojure/core/async.clj,
+;;   Copyright (c) Rich Hickey and contributors. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; clojure.core.async — higher-level dataflow API over the channel primitives.
 ;;
 ;; The primitives (chan, <!, >!, <!!, >!!, close!, put!, take!, offer!, timeout,

@@ -1,4 +1,6 @@
 ;; PINNED COPY — do not edit by hand.
+;; Code from irregex, Copyright (c) 2005-2024 Alex Shinn, BSD-style license
+;; (licenses/BSD-irregex.txt).
 ;;
 ;; irregex's own nfa->dfa, as of the currently checked-out
 ;; vendor/irregex. host/chez/regex-dfa.ss is jolt's replacement for it,

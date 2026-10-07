@@ -1,3 +1,8 @@
+;;   Portions of this file are from Clojure's src/clj/clojure/repl.clj,
+;;   Copyright (c) Chris Houser, Dec 2008. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ; Jolt Standard Library: clojure.repl
 ; Partial port from Clojure 1.12's clojure.repl: the special-form documentation
 ; data (special-doc-map / special-doc) and the metadata-driven interactive fns

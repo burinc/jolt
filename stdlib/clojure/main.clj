@@ -1,5 +1,10 @@
 ;; Jolt Standard Library: clojure.main
 ; Part of the image (emit-image.ss), like clojure.repl: edits here need a remint.
+;   Portions of this file are from Clojure's src/clj/clojure/main.clj,
+;   Copyright (c) Rich Hickey. All rights reserved.
+;   The use and distribution terms for that software are covered by the
+;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ; Ported from Clojure 1.13's clojure.main (EPL, Rich Hickey / Stephen C. Gilardi):
 ; the exception machinery (root-cause, stack-element-str, ex-triage, ex-str,
 ; err->msg, repl-caught, report-error) and the reusable REPL (with-bindings,
