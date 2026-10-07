@@ -374,14 +374,16 @@
 (defn- kw-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
     (or (= s "Keyword") (= s "clojure.lang.Keyword"))))
-;; StringBuffer is the same store behind a second class name (one jhost tag over
-;; the identical state vector), so the direct-emit bodies — which call sb-append!
-;; / sb-str on that vector — are correct for it unchanged, and the legacy builder
-;; gets the same fast path rather than the slow one for being older.
+;; :sb is StringBuilder and :sbuf StringBuffer. Both take the direct-emit path,
+;; but a StringBuffer is synchronized, as on the JDK, so its direct forms are the
+;; locking primitives (sb-append*! / sb-str* ...) where a StringBuilder's are the
+;; unsynchronized ones.
 (defn- sb-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
-    (or (= s "StringBuilder") (= s "java.lang.StringBuilder")
-        (= s "StringBuffer") (= s "java.lang.StringBuffer"))))
+    (or (= s "StringBuilder") (= s "java.lang.StringBuilder"))))
+(defn- sbuf-tag? [t]
+  (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
+    (or (= s "StringBuffer") (= s "java.lang.StringBuffer"))))
 (defn- hint-of [ctx sym]
   (let [m (form-sym-meta sym)]
     (cond
@@ -392,6 +394,7 @@
                     (str-tag? t) :str
                     (kw-tag? t) :kw
                     (sb-tag? t) :sb
+                    (sbuf-tag? t) :sbuf
                     :else nil)))))
 
 ;; A hint the INIT proves rather than the programmer writes. (StringBuilder.) can
@@ -403,9 +406,9 @@
 ;; binding position, no flow analysis, no reassignment to worry about since a let
 ;; local is immutable.
 (defn- init-proves-hint [init]
-  (when (and (= :host-new (get init :op))
-             (sb-tag? (get init :class)))
-    :sb))
+  (when (= :host-new (get init :op))
+    (cond (sb-tag? (get init :class)) :sb
+          (sbuf-tag? (get init :class)) :sbuf)))
 (defn- add-hint [env nm h]
   (if h (assoc env :hints (assoc (:hints env) nm h)) env))
 
@@ -1533,9 +1536,9 @@
 ;; here would fix it, but nothing writes that shape and the generic path already
 ;; handles it correctly.
 (defn- sb-target-type [raw target]
-  (when (or (and (form-sym? raw) (sb-tag? (get (form-sym-meta raw) :tag)))
-            (= :sb (:hint target)))
-    :sb))
+  (let [tag (when (form-sym? raw) (get (form-sym-meta raw) :tag))]
+    (cond (or (sb-tag? tag) (= :sb (:hint target))) :sb
+          (or (sbuf-tag? tag) (= :sbuf (:hint target))) :sbuf)))
 
 ;; The list form's source position on a node, when the reader recorded one —
 ;; the same stamp an :invoke carries. A host call in tail position stores it as
@@ -1557,7 +1560,7 @@
              :args (mapv #(analyze ctx % env) (drop 2 items))}
       (str-target-type raw target) (assoc :target-type :str)
       (kw-target-type raw target) (assoc :target-type :kw)
-      (sb-target-type raw target) (assoc :target-type :sb))))
+      (sb-target-type raw target) (assoc :target-type (sb-target-type raw target)))))
 
 ;; A constructor head: `Class.` — a symbol ending in "." (but not the member
 ;; access `.method` / `..` forms). `(Class. args*)` builds an instance.

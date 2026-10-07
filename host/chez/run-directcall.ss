@@ -210,5 +210,18 @@
                 (stub 1) #f)
               #t))
 
+;; A StringBuilder local takes the unsynchronized direct forms; a StringBuffer
+;; local takes the locking ones, because the JDK's StringBuffer methods are
+;; synchronized. Routing a StringBuffer through sb-append! would race.
+(let ((e (emit-dl "(def usesbld (fn [] (let [sb (StringBuilder.)] (.append sb \"x\") (.charAt sb 0) (.toString sb))))")))
+  (gate-check "a StringBuilder local appends unsynchronized" (gate-sub? e "(sb-append! ") #t)
+  (gate-check "...and never through the locking form" (gate-sub? e "sb-append*!") #f))
+(let ((e (emit-dl "(def usesbuf (fn [] (let [sb (StringBuffer.)] (.append sb \"x\") (.charAt sb 0) (.length sb) (.toString sb))))")))
+  (gate-check "a StringBuffer local appends under its lock" (gate-sub? e "(sb-append*! ") #t)
+  (gate-check "...reads under it too" (and (gate-sub? e "(sb-char-at* ") (gate-sub? e "(sb-length* ") (gate-sub? e "(sb-str* ")) #t)
+  (gate-check "...and never through the unsynchronized forms"
+              (or (gate-sub? e "(sb-append! ") (gate-sub? e "(sb-str ") (gate-sub? e "(sb-char-at ")) #f)
+  (run-emit e)
+  (gate-check "the locked direct forms answer" (call "usesbuf") "x"))
 (gate-summary "directcall")
 

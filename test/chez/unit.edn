@@ -2418,6 +2418,14 @@
  {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'amap))))" :expected "true"}
  {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'areduce))))" :expected "true"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'def-aset))" :expected "false"}
+ ;; StringBuffer and StringWriter are synchronized, as on the JDK: concurrent
+ ;; appends all land, a buffer's own methods are atomic against each other, and
+ ;; (locking sb ...) takes the same monitor its methods do. Before, a StringBuffer
+ ;; shared StringBuilder's unsynchronized store and racing appends faulted.
+ {:suite "stringbuffer-sync" :expr "(let [sb (StringBuffer.) ts (mapv (fn [_] (Thread. (fn [] (dotimes [_ 5000] (.append sb \"ab\"))))) (range 4))] (run! #(.start %) ts) (run! #(.join %) ts) (.length sb))" :expected "40000"}
+ {:suite "stringbuffer-sync" :expr "(let [w (java.io.StringWriter.) ts (mapv (fn [_] (Thread. (fn [] (dotimes [_ 5000] (.write w \"ab\"))))) (range 4))] (run! #(.start %) ts) (run! #(.join %) ts) (count (str w)))" :expected "40000"}
+ {:suite "stringbuffer-sync" :expr "(let [sb (StringBuffer. \"seed\") ts (mapv (fn [_] (Thread. (fn [] (dotimes [_ 2000] (.insert sb 0 \"xy\") (.delete sb 0 1))))) (range 4))] (run! #(.start %) ts) (run! #(.join %) ts) (.length sb))" :expected "8004"}
+ {:suite "stringbuffer-sync" :expr "(let [sb (StringBuffer.) seen (atom #{}) ts (mapv (fn [_] (Thread. (fn [] (dotimes [_ 1000] (locking sb (let [n (.length sb)] (.append sb \"x\") (swap! seen conj n))))))) (range 4))] (run! #(.start %) ts) (run! #(.join %) ts) (count @seen))" :expected "4000"}
  ;; naa9 — vswap! is a macro, as on the JVM
  {:suite "naa9-vswap-macro" :expr "(boolean (:macro (meta (resolve 'vswap!))))" :expected "true"}
  {:suite "naa9-vswap-macro" :expr "(some? (resolve 'vswap!))" :expected "true"}

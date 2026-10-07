@@ -418,6 +418,17 @@
                      (let ((r (stream-find s (lambda (x) #t))))
                        (if r (jt-optional #t (car r)) jt-optional-empty))))))
 (for-each (lambda (p) (register-host-methods! (car p) (stream-methods))) stream-tags)
+
+;; CharSequence.chars / codePoints: an IntStream of the characters. jolt's
+;; strings hold code points, so the two answer the same. String's arms
+;; (natives-str.ss) and the builders' both come here.
+(define (string->int-stream s)
+  (make-stream 'int (list->cseq (map char->integer (string->list s)))))
+(for-each (lambda (tag)
+            (register-host-methods! tag
+              (list (cons "chars" (lambda (self) (string->int-stream (sb-str* self))))
+                    (cons "codePoints" (lambda (self) (string->int-stream (sb-str* self)))))))
+          '("string-builder" "string-buffer"))
 ;; a stream seqs and reduces like the iterator it is, so (seq s) / (into [] s)
 ;; and a reify over it see its elements (consuming it, as any iteration does)
 (register-seq-arm! stream? (lambda (s) (jolt-seq (stream-take! s))))
