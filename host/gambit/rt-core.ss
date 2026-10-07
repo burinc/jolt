@@ -1407,7 +1407,8 @@
         (let ((m (make-mutex)))
           (hashtable-set! %monitor-tbl obj m)
           m))))
-(define (jolt-with-monitor obj thunk) (jwm-call (object-monitor obj) thunk))
+(define (jolt-call-with-monitor m thunk) (jwm-call m thunk))
+(define (jolt-with-monitor obj thunk) (jolt-call-with-monitor (object-monitor obj) thunk))
 (def-var! "jolt.host" "with-monitor" jolt-with-monitor)
 
 ;; source-registry.ss is excluded (introspect off on this target); the def

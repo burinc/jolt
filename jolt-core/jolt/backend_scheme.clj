@@ -182,15 +182,20 @@
 ;; where a char[] becomes its characters rather than "#object[[C]". Open-coding
 ;; render-piece here meant a ^StringBuilder-tagged target got the rendering while an
 ;; untyped one got the characters.
-(defn- sb-direct-emit [m argc t args]
-  (let [a0 (first args)]
+;; LOCKED? is a StringBuffer (:sbuf): the same forms over the primitives that take
+;; the buffer's monitor, since the JDK's StringBuffer methods are synchronized.
+(defn- sb-direct-emit [m argc t args locked?]
+  (let [a0 (first args)
+        [app st len ch] (if locked?
+                          ["sb-append*!" "sb-str*" "sb-length*" "sb-char-at*"]
+                          ["sb-append!" "sb-str" "sb-length" "sb-char-at"])]
     (cond
       (= m "append")    (when (= argc 1)
-                          (str "(begin (sb-append! " t " (sb-piece " a0 ")) " t ")"))
-      (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
-      (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
-      (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
-      (= m "charAt")    (when (= argc 1) (str "(sb-char-at " t " " a0 ")"))
+                          (str "(begin (" app " " t " (sb-piece " a0 ")) " t ")"))
+      (= m "toString")  (when (= argc 0) (str "(" st " " t ")"))
+      (= m "length")    (when (= argc 0) (str "(->num (" len " " t "))"))
+      (= m "isEmpty")   (when (= argc 0) (str "(fx=? (" len " " t ") 0)"))
+      (= m "charAt")    (when (= argc 1) (str "(" ch " " t " " a0 ")"))
       :else nil)))
 
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
@@ -1026,6 +1031,7 @@
                   "java-string-hash" "java-symbol-hash"
                   "keyword-t-ns" "keyword-t-name"
                   "sb-append!" "sb-str" "sb-length" "sb-piece" "sb-char-at" "->num"
+                  "sb-append*!" "sb-str*" "sb-length*" "sb-char-at*"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).
@@ -3640,7 +3646,9 @@
                      (when (= :kw (:target-type node))
                        (keyword-direct-emit m (count args) t args))
                      (when (= :sb (:target-type node))
-                       (sb-direct-emit m (count args) t args))))]
+                       (sb-direct-emit m (count args) t args false))
+                     (when (= :sbuf (:target-type node))
+                       (sb-direct-emit m (count args) t args true))))]
     (cond
       direct direct
       (supported-host-methods m)

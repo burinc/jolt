@@ -1435,13 +1435,16 @@
 ;; rewritten, with controls for the parks either side of the monitor that must stay
 ;; cheap, and section 2 checks that the monitor is actually released afterwards by having
 ;; a second go block take it.
-(define (jolt-with-monitor obj thunk)
-  (let ((m (object-monitor obj)))
-    (monitor-enter! m)
-    (dynamic-wind
-      (lambda () #f)
-      thunk
-      (lambda () (unless (jolt-park-unwinding?) (monitor-exit! m))))))
+(define (jolt-call-with-monitor m thunk)
+  (monitor-enter! m)
+  (dynamic-wind
+    (lambda () #f)
+    thunk
+    (lambda () (unless (jolt-park-unwinding?) (monitor-exit! m)))))
+;; A caller that holds an object's monitor already (a StringBuffer resolves its
+;; own once, at construction) enters it through jolt-call-with-monitor directly;
+;; the table lookup is the same monitor either way.
+(define (jolt-with-monitor obj thunk) (jolt-call-with-monitor (object-monitor obj) thunk))
 (def-var! "jolt.host" "with-monitor" jolt-with-monitor)
 
 ;; The bare halves of the same monitor, for the (monitor-enter x) /

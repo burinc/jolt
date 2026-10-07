@@ -12,57 +12,108 @@
 ;; throw-jvm; loads after those and before anything that constructs a builder.
 
 ;; ---- StringBuilder ----------------------------------------------------------
-;; state: #(buf len str) — the JVM's AbstractStringBuilder shape. buf is a
-;; string whose first len characters are the content; its length is the
-;; capacity, doubled when an append outgrows it, so building an n-char string
-;; is O(n) (the obvious one-string representation copied the whole buffer per
-;; append: clojure.data.json reading an 88KB string value took 623ms, see
-;; test/chez/string-builder-perf.ss). length and charAt read buf directly, so a
-;; read between appends costs O(1) the way it does on the JVM; the chunk list
-;; this replaced re-joined the whole buffer on every such read, which made a
-;; formatter that appends a token and then looks at its line O(line) per token.
+;; state: #(buf len owner cache monitor) — java.lang.AbstractStringBuilder's
+;; shape. buf's length IS the capacity, sized and grown by the JDK's rules (16 by
+;; default, length + 16 from a String, (max needed (+ (* 2 old) 2)) when an edit
+;; outgrows it), and every edit happens in place, so building an n-char string is
+;; O(n) and a read between appends (charAt, length) is O(1).
 ;;
-;; str caches the content as a String once asked, until the next write. That is
-;; also what keeps a handed-out String immutable: buf is only ever written past
-;; len by an append that fits its capacity, and a buffer that IS a String (one
-;; installed by sb-set! or the constructor) is exactly full, so the first append
-;; to it allocates a new buffer instead.
-(define (make-sb-state s) (vector s (string-length s) s))
-(define (sb-str self)
-  (let ((st (jhost-state self)))
-    (or (vector-ref st 2)
-        (let* ((buf (vector-ref st 0)) (n (vector-ref st 1))
-               (out (make-string n)))
-          (sa-string-copy-range! out 0 buf 0 n)
-          (vector-set! st 2 out)
-          out))))
-(define (sb-set! self s)
-  (let ((st (jhost-state self)))
-    (vector-set! st 0 s)
-    (vector-set! st 1 (string-length s))
-    (vector-set! st 2 s)))
-;; Amortised O(1): copies only the piece, except when the capacity doubles.
-(define (sb-append! self piece)
-  (let ((pn (string-length piece)))
-    (unless (fx=? pn 0)
-      (let* ((st (jhost-state self))
-             (buf (vector-ref st 0)) (n (vector-ref st 1)) (need (fx+ n pn)))
-        (let ((buf (if (fx<=? need (string-length buf))
-                       buf
-                       (let ((nb (make-string (fxmax need (fx+ (fx* 2 (string-length buf)) 16)))))
-                         (sa-string-copy-range! nb 0 buf 0 n)
-                         (vector-set! st 0 nb)
-                         nb))))
-          (sa-string-copy-range! buf n piece 0 pn)
-          (vector-set! st 1 need)
-          (vector-set! st 2 #f))))))
-(define (sb-length self) (vector-ref (jhost-state self) 1))
+;; toString hands out a COPY of buf[0, len), so no String a caller holds ever
+;; aliases the buffer, and the copy is cached until the next write clears it.
+;;
+;; A StringBuilder is unsynchronized, as on the JDK, which makes no promise to
+;; threads that race one (its own can lose a racing append outright). A
+;; StringBuffer is synchronized: monitor is its own object monitor, resolved once
+;; at construction, and each of its methods runs under it — `synchronized` on the
+;; JDK's methods, so it composes with (locking sb ...) and is reentrant. A
+;; StringWriter writes into a StringBuffer (owner, its getBuffer) and shares that
+;; store and monitor, as the JDK's StringWriter synchronizes on its buf.
+;;
+;; The two are separate method tables expanded from ONE definition (sb-methods
+;; below), so StringBuilder pays nothing for the lock and the bodies cannot drift.
+;; The emitter's proven-type fast path calls the unsynchronized primitives
+;; (sb-append! sb-str sb-length sb-char-at) for a StringBuilder and the locking
+;; ones (sb-append*! sb-str* sb-length* sb-char-at*) for a StringBuffer.
+(define (make-sb-state s cap)
+  (let ((buf (make-string cap)) (n (string-length s)))
+    (unless (fx=? n 0) (sa-string-copy-range! buf 0 s 0 n))
+    (vector buf n #f #f #f)))
+(define-syntax sb-wrote! (syntax-rules () ((_ st) (vector-set! st 3 #f))))
+
+;; --- operations on the state vector: no locking here ---------------------------
+;; ensureCapacityInternal: grow to at least min, by the JDK's growth rule.
+(define (%sb-ensure! st min)
+  (let* ((buf (vector-ref st 0)) (cap (string-length buf)))
+    (when (fx>? min cap)
+      (let ((nb (make-string (fxmax min (fx+ (fx* 2 cap) 2)))))
+        (sa-string-copy-range! nb 0 buf 0 (vector-ref st 1))
+        (vector-set! st 0 nb)))))
+;; toString, append and charAt are macros so the unsynchronized primitives below
+;; carry their bodies inline (no second call per append) while the locked table
+;; expands the very same text.
+(define (%sb-materialize! st)
+  (let* ((n (vector-ref st 1)) (out (make-string n)))
+    (sa-string-copy-range! out 0 (vector-ref st 0) 0 n)
+    (vector-set! st 3 out)
+    out))
+(define-syntax %sb-str
+  (syntax-rules () ((_ st) (let ((s st)) (or (vector-ref s 3) (%sb-materialize! s))))))
+(define-syntax %sb-append!
+  (syntax-rules ()
+    ((_ st* piece*)
+     (let* ((st st*) (piece piece*) (pn (string-length piece)))
+       (unless (fx=? pn 0)
+         (let* ((n (vector-ref st 1)) (nn (fx+ n pn)))
+           (when (fx>? nn (string-length (vector-ref st 0))) (%sb-ensure! st nn))
+           (sa-string-copy-range! (vector-ref st 0) n piece 0 pn)
+           (vector-set! st 1 nn)
+           (sb-wrote! st)))))))
+;; Replace buf[s, e) with piece, in place: the one primitive insert, delete,
+;; replace and deleteCharAt are spelled in. The tail moves first (string-copy!
+;; copies as if through a temporary, so the overlap is safe).
+(define (%sb-splice! st s e piece)
+  (let* ((n (vector-ref st 1)) (pn (string-length piece))
+         (nn (fx+ (fx- n (fx- e s)) pn)))
+    (%sb-ensure! st nn)
+    (let ((buf (vector-ref st 0)))
+      (sa-string-copy-range! buf (fx+ s pn) buf e n)
+      (sa-string-copy-range! buf s piece 0 pn)
+      (vector-set! st 1 nn)
+      (sb-wrote! st))))
 ;; charAt over the live buffer, with String.charAt's check against the length.
-(define (sb-char-at self i)
-  (let* ((st (jhost-state self)) (n (vector-ref st 1)) (i (jolt->idx i)))
-    (if (and (fixnum? i) (fx>=? i 0) (fx<? i n))
-        (string-ref (vector-ref st 0) i)
-        (char-index-oob i n))))
+(define-syntax %sb-char-at
+  (syntax-rules ()
+    ((_ st* i*)
+     (let* ((st st*) (n (vector-ref st 1)) (i (jolt->idx i*)))
+       (if (and (fixnum? i) (fx>=? i 0) (fx<? i n))
+           (string-ref (vector-ref st 0) i)
+           (char-index-oob i n))))))
+
+;; --- the unsynchronized primitives: StringBuilder and the emitter's fast path --
+(define (sb-str self) (%sb-str (jhost-state self)))
+(define (sb-append! self piece) (%sb-append! (jhost-state self) piece))
+(define (sb-length self) (vector-ref (jhost-state self) 1))
+(define (sb-char-at self i) (%sb-char-at (jhost-state self) i))
+
+;; --- any builder: the seams handed a StringBuilder, StringBuffer or StringWriter
+;; (a PrintWriter's target, str, the CharSequence arms) take the lock when the
+;; store has one.
+(define-syntax sb-guarded
+  (syntax-rules ()
+    ((_ (st self) body ...)
+     (let ((st (jhost-state self)))
+       (jolt-call-with-monitor (vector-ref st 4) (lambda () body ...))))))
+(define-syntax sb-unguarded
+  (syntax-rules () ((_ (st self) body ...) (let ((st (jhost-state self))) body ...))))
+(define (sb-str* self)
+  (if (vector-ref (jhost-state self) 4) (sb-guarded (st self) (%sb-str st)) (sb-str self)))
+(define (sb-append*! self piece)
+  (if (vector-ref (jhost-state self) 4) (sb-guarded (st self) (%sb-append! st piece)) (sb-append! self piece)))
+(define (sb-length* self)
+  (if (vector-ref (jhost-state self) 4) (sb-guarded (st self) (vector-ref st 1)) (sb-length self)))
+(define (sb-char-at* self i)
+  (if (vector-ref (jhost-state self) 4) (sb-guarded (st self) (%sb-char-at st i)) (sb-char-at self i)))
+
 (define (render-piece x)
   (cond ((jolt-nil? x) "null") ((char? x) (string x)) ((string? x) x)
         (else (jolt-str-render-one x))))
@@ -107,140 +158,244 @@
       (char-array-chunk x (jnum->exact a) (jnum->exact b) who)
       (append-text x (list a b))))
 
-;; Every index-taking StringBuilder method reports the same way the JVM does.
-(define (sb-range-check s start end)
-  (let ((n (string-length s)))
-    (when (or (< start 0) (> end n) (> start end))
-      (throw-jvm (quote StringIndexOutOfBoundsException)
-                 (string-append "start " (number->string start) ", end " (number->string end)
-                                ", length " (number->string n))))))
+;; The JDK's checks, with its messages: an index is checkIndex's, a span is
+;; checkRangeSIOOBE's (jvm-range-check above), and an insert offset reports the
+;; span [offset, length) it fell outside.
+(define (sb-check-offset off n)
+  (when (or (< off 0) (> off n))
+    (throw-jvm 'StringIndexOutOfBoundsException
+               (string-append "Range [" (number->string off) ", " (number->string n)
+                              ") out of bounds for length " (number->string n)))))
+(define (sb-check-index i n)
+  (unless (and (fixnum? i) (fx>=? i 0) (fx<? i n)) (char-index-oob i n)))
 
-(define (string-builder-state args)
-  ;; a numeric first arg is a CAPACITY hint, not content; nil is the
-  ;; NullPointerException the JVM's String ctor raises.
-  (make-sb-state (cond ((null? args) "")
-                       ((jolt-nil? (car args)) (throw-jvm 'NullPointerException "str"))
-                       ((number? (car args)) "")
-                       (else (render-piece (car args))))))
+;; A capacity argument that is negative is the array allocation's failure, as on
+;; the JDK; content starts with room for 16 more.
+(define (sb-new-state args)
+  (cond ((null? args) (make-sb-state "" 16))
+        ((jolt-nil? (car args)) (throw-jvm 'NullPointerException "str"))
+        ((number? (car args))
+         (let ((cap (jnum->exact (car args))))
+           (when (< cap 0) (throw-jvm 'NegativeArraySizeException (number->string cap)))
+           (make-sb-state "" cap)))
+        (else (let ((s (render-piece (car args))))
+                (make-sb-state s (fx+ (string-length s) 16))))))
+;; A synchronized builder locks on itself, which only exists once it is made.
+(define (make-locked-sb tag st)
+  (let ((h (make-jhost tag st)))
+    (vector-set! st 2 h)
+    (vector-set! st 4 (object-monitor h))
+    h))
+
+;; The JDK compares builders char by char, then by length.
+(define (sb-compare a b)
+  (let ((na (string-length a)) (nb (string-length b)))
+    (let loop ((i 0))
+      (cond ((or (fx=? i na) (fx=? i nb)) (fx- na nb))
+            ((char=? (string-ref a i) (string-ref b i)) (loop (fx+ i 1)))
+            (else (fx- (char->integer (string-ref a i)) (char->integer (string-ref b i))))))))
+
+;; The method table, once. GUARD is sb-unguarded (StringBuilder) or sb-guarded
+;; (StringBuffer): each method body runs inside it with st bound to the store.
+;; A piece to append is rendered BEFORE the guard, so a user toString never runs
+;; under the buffer's lock.
+;;
+;; The overloaded members are case-lambdas, not one rest-taking arm: the arities
+;; are the overload set the JVM resolves against, and host-arity-ok? reads them
+;; off the procedure (host-static.ss). One arm that picked its extra arguments
+;; out of a list is how (.append sb "x" 1) reached `cadr` on a one-element list
+;; and reported Chez's "incorrect list structure" for what is an arity error.
+(define-syntax sb-methods
+  (syntax-rules ()
+    ((_ guard)
+     (list
+      (cons "append"
+            (case-lambda
+              ((self x) (let ((p (sb-piece x))) (guard (st self) (%sb-append! st p))) self)
+              ((self x a b)
+               (let ((p (sb-piece-range x a b (quote IndexOutOfBoundsException))))
+                 (guard (st self) (%sb-append! st p)))
+               self)))
+      (cons "appendCodePoint"
+            (lambda (self cp)
+              (let ((c (jnum->exact cp)))
+                (unless (and (integer? c) (<= 0 c #x10FFFF) (not (<= #xD800 c #xDFFF)))
+                  (throw-jvm 'IllegalArgumentException
+                             (string-append "Not a valid Unicode code point: 0x"
+                                            (string-upcase (number->string (bitwise-and c #xFFFFFFFF) 16)))))
+                (let ((p (string (integer->char c)))) (guard (st self) (%sb-append! st p)))
+                self)))
+      (cons "toString" (lambda (self) (guard (st self) (%sb-str st))))
+      (cons "length" (lambda (self) (guard (st self) (->num (vector-ref st 1)))))
+      (cons "isEmpty" (lambda (self) (guard (st self) (fx=? 0 (vector-ref st 1)))))
+      (cons "charAt" (lambda (self i) (guard (st self) (%sb-char-at st i))))
+      (cons "capacity" (lambda (self) (guard (st self) (->num (string-length (vector-ref st 0))))))
+      (cons "ensureCapacity"
+            (lambda (self m)
+              (let ((m (jnum->exact m)))
+                (when (> m 0) (guard (st self) (%sb-ensure! st m))))
+              jolt-nil))
+      (cons "trimToSize"
+            (lambda (self)
+              (guard (st self)
+                (let ((n (vector-ref st 1)))
+                  (when (fx<? n (string-length (vector-ref st 0)))
+                    (let ((nb (make-string n)))
+                      (sa-string-copy-range! nb 0 (vector-ref st 0) 0 n)
+                      (vector-set! st 0 nb)))))
+              jolt-nil))
+      (cons "setLength"
+            (lambda (self n)
+              (let ((n (jnum->exact n)))
+                (when (< n 0)
+                  (throw-jvm 'StringIndexOutOfBoundsException
+                             (string-append "String index out of range: " (number->string n))))
+                (guard (st self)
+                  (let ((cur (vector-ref st 1)))
+                    (%sb-ensure! st n)
+                    (when (fx>? n cur)
+                      (let ((buf (vector-ref st 0)))
+                        (do ((i cur (fx+ i 1))) ((fx=? i n)) (string-set! buf i #\nul))))
+                    (vector-set! st 1 n)
+                    (sb-wrote! st))))
+              jolt-nil))
+      (cons "substring"
+            (case-lambda
+              ((self start) (let ((cur (guard (st self) (%sb-str st))) (s (jnum->exact start)))
+                              (jvm-range-check 'StringIndexOutOfBoundsException (string-length cur) s (string-length cur))
+                              (substring cur s (string-length cur))))
+              ((self start end) (let ((cur (guard (st self) (%sb-str st)))
+                                      (s (jnum->exact start)) (e (jnum->exact end)))
+                                  (jvm-range-check 'StringIndexOutOfBoundsException (string-length cur) s e)
+                                  (substring cur s e)))))
+      ;; CharSequence.subSequence — AbstractStringBuilder returns substring(a, b),
+      ;; i.e. a String, which is itself a CharSequence.
+      (cons "subSequence" (lambda (self a b)
+                            (let ((cur (guard (st self) (%sb-str st)))
+                                  (s (jnum->exact a)) (e (jnum->exact b)))
+                              (jvm-range-check 'StringIndexOutOfBoundsException (string-length cur) s e)
+                              (substring cur s e))))
+      (cons "indexOf"
+            (case-lambda
+              ((self needle)
+               (->num (str-index-of (guard (st self) (%sb-str st)) (render-piece needle) 0)))
+              ((self needle from)
+               (->num (str-index-of (guard (st self) (%sb-str st)) (render-piece needle)
+                                    (max 0 (jnum->exact from)))))))
+      (cons "lastIndexOf"
+            (case-lambda
+              ((self needle) (->num (str-last-index-of (guard (st self) (%sb-str st)) (render-piece needle))))
+              ((self needle from)
+               (let* ((cur (guard (st self) (%sb-str st)))
+                      (i (str-last-find (render-piece needle) cur
+                                        (max -1 (min (jnum->exact from) (string-length cur))))))
+                 (->num (if (jolt-nil? i) -1 i))))))
+      (cons "codePointAt" (lambda (self i)
+                            (guard (st self)
+                              (let ((i (jnum->exact i)))
+                                (sb-check-index i (vector-ref st 1))
+                                (->num (char->integer (string-ref (vector-ref st 0) i)))))))
+      (cons "codePointBefore" (lambda (self i)
+                                (guard (st self)
+                                  (let ((j (- (jnum->exact i) 1)))
+                                    (sb-check-index j (vector-ref st 1))
+                                    (->num (char->integer (string-ref (vector-ref st 0) j)))))))
+      ;; jolt's strings hold code points, so a count or offset in code points is
+      ;; the same count in chars; the bounds are still the JDK's.
+      (cons "codePointCount" (lambda (self b e)
+                               (let ((b (jnum->exact b)) (e (jnum->exact e))
+                                     (n (guard (st self) (vector-ref st 1))))
+                                 (jvm-range-check 'IndexOutOfBoundsException n b e)
+                                 (->num (- e b)))))
+      (cons "offsetByCodePoints" (lambda (self i k)
+                                   (let* ((i (jnum->exact i)) (r (+ i (jnum->exact k)))
+                                          (n (guard (st self) (vector-ref st 1))))
+                                     (when (or (< i 0) (> i n) (< r 0) (> r n))
+                                       (throw-jvm 'IndexOutOfBoundsException jolt-nil))
+                                     (->num r))))
+      (cons "compareTo" (lambda (self other)
+                          (->num (sb-compare (guard (st self) (%sb-str st)) (sb-str* other)))))
+      (cons "setCharAt" (lambda (self i ch)
+                          (let ((c (string-ref (render-piece ch) 0)))
+                            (guard (st self)
+                              (let ((i (jnum->exact i)))
+                                (sb-check-index i (vector-ref st 1))
+                                (string-set! (vector-ref st 0) i c)
+                                (sb-wrote! st))))
+                          jolt-nil))
+      (cons "deleteCharAt" (lambda (self i)
+                             (guard (st self)
+                               (let ((i (jnum->exact i)))
+                                 (sb-check-index i (vector-ref st 1))
+                                 (%sb-splice! st i (fx+ i 1) "")))
+                             self))
+      ;; delete and replace clamp the end to the length, then check, as the JDK does.
+      (cons "delete" (lambda (self start end)
+                       (guard (st self)
+                         (let* ((n (vector-ref st 1)) (s (jnum->exact start)) (e (min n (jnum->exact end))))
+                           (jvm-range-check 'StringIndexOutOfBoundsException n s e)
+                           (%sb-splice! st s e "")))
+                       self))
+      (cons "replace" (lambda (self start end txt)
+                        (let ((p (render-piece txt)))
+                          (guard (st self)
+                            (let* ((n (vector-ref st 1)) (s (jnum->exact start)) (e (min n (jnum->exact end))))
+                              (jvm-range-check 'StringIndexOutOfBoundsException n s e)
+                              (%sb-splice! st s e p))))
+                        self))
+      (cons "insert"
+            (let ((ins (lambda (self offset p)
+                         (guard (st self)
+                           (let ((o (jnum->exact offset)))
+                             (sb-check-offset o (vector-ref st 1))
+                             (%sb-splice! st o o p)))
+                         self)))
+              (case-lambda
+                ((self offset x) (ins self offset (sb-piece x)))
+                ((self offset x a b)
+                 (ins self offset (sb-piece-range x a b (quote StringIndexOutOfBoundsException)))))))
+      ;; .getChars srcBegin srcEnd dst dstBegin — the CharSequence copy-out the
+      ;; String method already had (natives-str.ss). Both ends are checked before
+      ;; anything is written, so a bad request does not leave the destination half
+      ;; filled; the destination's own error is the plain IndexOutOfBounds.
+      (cons "getChars"
+            (lambda (self src-begin src-end dst dst-begin)
+              (let* ((cur (guard (st self) (%sb-str st)))
+                     (s (jnum->exact src-begin)) (e (jnum->exact src-end))
+                     (d (jnum->exact dst-begin)))
+                (jvm-range-check (quote StringIndexOutOfBoundsException) (string-length cur) s e)
+                (jvm-range-check (quote IndexOutOfBoundsException) (ja-len dst) d (+ d (- e s)))
+                (let ((v (jolt-array-vec dst)))
+                  (if (string? v)
+                      (sa-string-copy-range! v d cur s e)
+                      (let loop ((i s) (j d))
+                        (when (fx<? i e)
+                          (ja-set! dst j (string-ref cur i))
+                          (loop (fx+ i 1) (fx+ j 1)))))))
+              jolt-nil))
+      (cons "reverse" (lambda (self)
+                        (guard (st self)
+                          (let ((buf (vector-ref st 0)) (n (vector-ref st 1)))
+                            (let loop ((i 0) (j (fx- n 1)))
+                              (when (fx<? i j)
+                                (let ((c (string-ref buf i)))
+                                  (string-set! buf i (string-ref buf j))
+                                  (string-set! buf j c)
+                                  (loop (fx+ i 1) (fx- j 1)))))
+                            (sb-wrote! st)))
+                        self))))))
+
 (register-class-ctor! "StringBuilder"
-  (lambda args (make-jhost "string-builder" (string-builder-state args))))
-(define string-builder-methods
-  ;; The overloaded members are case-lambdas, not one rest-taking arm: the arities
-  ;; are the overload set the JVM resolves against, and host-arity-ok? reads them
-  ;; off the procedure (host-static.ss). One arm that picked its extra arguments
-  ;; out of a list is how (.append sb "x" 1) reached `cadr` on a one-element list
-  ;; and reported Chez's "incorrect list structure" for what is an arity error.
-  (list (cons "append"
-              (case-lambda
-                ((self x) (sb-append! self (sb-piece x)) self)
-                ((self x a b)
-                 (sb-append! self (sb-piece-range x a b (quote IndexOutOfBoundsException)))
-                 self)))
-        (cons "toString" (lambda (self) (sb-str self)))
-        (cons "length" (lambda (self) (->num (sb-length self))))
-        (cons "charAt" (lambda (self i) (sb-char-at self i)))
-        (cons "setLength" (lambda (self n)
-                            (let ((cur (sb-str self)) (n (jnum->exact n)))
-                              (sb-set! self (if (< n (string-length cur))
-                                                (substring cur 0 n)
-                                                (string-append cur (make-string (- n (string-length cur)) #\nul)))))
-                            jolt-nil))
-        (cons "isEmpty" (lambda (self) (= 0 (sb-length self))))
-        (cons "substring"
-              (case-lambda
-                ((self start) (let* ((cur (sb-str self)) (s (jnum->exact start)))
-                                (sb-range-check cur s (string-length cur))
-                                (substring cur s (string-length cur))))
-                ((self start end) (let* ((cur (sb-str self)) (s (jnum->exact start))
-                                         (e (jnum->exact end)))
-                                    (sb-range-check cur s e)
-                                    (substring cur s e)))))
-        ;; CharSequence.subSequence — AbstractStringBuilder returns substring(a, b),
-        ;; i.e. a String, which is itself a CharSequence.
-        (cons "subSequence" (lambda (self a b)
-                              (let* ((cur (sb-str self)) (s (jnum->exact a)) (e (jnum->exact b)))
-                                (sb-range-check cur s e)
-                                (substring cur s e))))
-        (cons "indexOf"
-              (case-lambda
-                ((self needle) (->num (str-index-of (sb-str self) (render-piece needle) 0)))
-                ((self needle from)
-                 (->num (str-index-of (sb-str self) (render-piece needle) (jnum->exact from))))))
-        (cons "lastIndexOf" (lambda (self needle)
-                              (->num (str-last-index-of (sb-str self) (render-piece needle)))))
-        (cons "setCharAt" (lambda (self i ch)
-                            (let* ((cur (sb-str self)) (i (jnum->exact i)))
-                              (sb-range-check cur i (+ i 1))
-                              (sb-set! self (string-append (substring cur 0 i) (render-piece ch)
-                                                           (substring cur (+ i 1) (string-length cur)))))
-                            jolt-nil))
-        (cons "deleteCharAt" (lambda (self i)
-                               (let* ((cur (sb-str self)) (i (jnum->exact i)))
-                                 (sb-range-check cur i (+ i 1))
-                                 (sb-set! self (string-append (substring cur 0 i)
-                                                              (substring cur (+ i 1) (string-length cur)))))
-                               self))
-        ;; delete clamps its end to the length, the way the JVM does.
-        (cons "delete" (lambda (self start end)
-                         (let* ((cur (sb-str self)) (n (string-length cur))
-                                (s (jnum->exact start)) (e (min n (jnum->exact end))))
-                           (sb-range-check cur s (max s e))
-                           (sb-set! self (string-append (substring cur 0 s) (substring cur (max s e) n))))
-                         self))
-        (cons "replace" (lambda (self start end txt)
-                          (let* ((cur (sb-str self)) (n (string-length cur))
-                                 (s (jnum->exact start)) (e (min n (jnum->exact end))))
-                            (sb-range-check cur s (max s e))
-                            (sb-set! self (string-append (substring cur 0 s) (render-piece txt)
-                                                         (substring cur (max s e) n))))
-                          self))
-        (cons "insert"
-              (let ((ins (lambda (self offset piece)
-                           (let* ((cur (sb-str self)) (n (string-length cur))
-                                  (i (jnum->exact offset)))
-                             (sb-range-check cur i i)
-                             (sb-set! self (string-append (substring cur 0 i) piece
-                                                          (substring cur i n))))
-                           self)))
-                (case-lambda
-                  ((self offset x) (ins self offset (sb-piece x)))
-                  ((self offset x a b)
-                   (ins self offset
-                        (sb-piece-range x a b (quote StringIndexOutOfBoundsException)))))))
-        ;; .getChars srcBegin srcEnd dst dstBegin — the CharSequence copy-out the
-        ;; String method already had (natives-str.ss). Both ends are checked before
-        ;; anything is written, so a bad request does not leave the destination half
-        ;; filled; the destination's own error is the plain IndexOutOfBounds.
-        (cons "getChars"
-              (lambda (self src-begin src-end dst dst-begin)
-                (let* ((cur (sb-str self))
-                       (s (jnum->exact src-begin)) (e (jnum->exact src-end))
-                       (d (jnum->exact dst-begin)))
-                  (jvm-range-check (quote StringIndexOutOfBoundsException) (string-length cur) s e)
-                  (jvm-range-check (quote IndexOutOfBoundsException) (ja-len dst) d (+ d (- e s)))
-                  (let ((v (jolt-array-vec dst)))
-                    (if (string? v)
-                        (sa-string-copy-range! v d cur s e)
-                        (let loop ((i s) (j d))
-                          (when (fx<? i e)
-                            (ja-set! dst j (string-ref cur i))
-                            (loop (fx+ i 1) (fx+ j 1)))))))
-                jolt-nil))
-        (cons "reverse" (lambda (self)
-                          (sb-set! self (list->string (reverse (string->list (sb-str self)))))
-                          self))))
-(register-host-methods! "string-builder" string-builder-methods)
+  (lambda args (make-jhost "string-builder" (sb-new-state args))))
+(register-host-methods! "string-builder" (sb-methods sb-unguarded))
 
-;; StringBuffer — the legacy synchronized builder, over the SAME store and the
-;; same method set. Nothing in jolt runs two threads into one builder, so the
-;; synchronization is not observable and the only thing that must differ is the
-;; class a value reports: a second tag, not a second ctor onto "string-builder",
-;; because (class (StringBuffer.)) and (instance? StringBuffer x) have to answer
-;; with the class the caller wrote. rewrite-clj's reader (cljfmt's parser) builds
-;; one per token, which is what made the gap load-bearing.
+;; StringBuffer — the JDK's synchronized builder: the same store and the same
+;; method bodies, each under the buffer's own monitor, and a second tag so
+;; (class …) and instance? answer the class the caller wrote. rewrite-clj's reader
+;; (cljfmt's parser) builds one per token.
 (register-class-ctor! "StringBuffer"
-  (lambda args (make-jhost "string-buffer" (string-builder-state args))))
-(register-host-methods! "string-buffer" string-builder-methods)
+  (lambda args (make-locked-sb "string-buffer" (sb-new-state args))))
+(register-host-methods! "string-buffer" (sb-methods sb-guarded))
 
 ;; (str sb) / print a StringBuilder -> its accumulated content, like the JVM
 ;; (str calls toString). Without this str renders the opaque host object.
@@ -252,7 +407,7 @@
 (define (sb-jhost? x) (or (sb-builder-jhost? x) (sb-buffer-jhost? x)))
 (define (sb-class-name x)
   (if (sb-buffer-jhost? x) "java.lang.StringBuffer" "java.lang.StringBuilder"))
-(register-str-render! sb-jhost? sb-str)
+(register-str-render! sb-jhost? sb-str*)
 ;; A StringBuilder IS a java.lang.CharSequence, so it answers (class …),
 ;; instance? through the class graph, and the three RT entry points that name a
 ;; CharSequence — count is its length, seq walks its characters, nth reads one.
@@ -266,5 +421,5 @@
     (if (and (sb-jhost? val) (symbol-t? type-sym))
         (jch-isa? (sb-class-name val) (symbol-t-name type-sym))
         'pass)))
-(register-count-arm! sb-jhost? (lambda (x) (sb-length x)))
-(register-seq-arm! sb-jhost? (lambda (x) (jolt-seq (sb-str x))))
+(register-count-arm! sb-jhost? (lambda (x) (sb-length* x)))
+(register-seq-arm! sb-jhost? (lambda (x) (jolt-seq (sb-str* x))))
