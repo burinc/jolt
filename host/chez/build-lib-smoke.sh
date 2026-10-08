@@ -169,9 +169,10 @@ case "$(uname -s)" in
 esac
 
 # A host that handles its own faults (a .NET or Java runtime does) keeps them
-# after init only with a Chez that passes a fault on a thread not running
-# Scheme code to the handler installed before its own; an older Chez aborts the
-# host with "invalid memory reference". Reported here; JOLT_EXPECT_HOST_FAULTS=1
+# after init, after jolt_library_shutdown and after a second init only with a
+# Chez that passes a fault on a thread not running Scheme code to the handler
+# installed before its own, and gives the signals back at deinit; an older Chez
+# aborts the host with "invalid memory reference". Reported here; JOLT_EXPECT_HOST_FAULTS=1
 # makes it a failure, for a Chez known to have the fix.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
@@ -183,10 +184,14 @@ case "$(uname -s)" in
     fi
     got="$("$work/driver-signals" "$lib" 2>&1)"; rc=$?
     before="$(printf '%s\n' "$got" | sed -n 's/^before load: //p')"
-    if [ "$rc" = "0" ] && [ -n "$before" ] && printf '%s\n' "$got" | grep -qx "after load: $before"; then
+    kept=1
+    for stage in "after load" "after shutdown" "after reinit"; do
+      printf '%s\n' "$got" | grep -qx "$stage: $before" || kept=
+    done
+    if [ "$rc" = "0" ] && [ -n "$before" ] && [ -n "$kept" ]; then
       echo "  host fault handling: kept"
     elif [ -n "${JOLT_EXPECT_HOST_FAULTS:-}" ]; then
-      echo "  FAIL: host fault handling, want the host's handler after init, got rc $rc:"; printf '%s\n' "$got"; exit 1
+      echo "  FAIL: host fault handling, want the host's handler after init, shutdown and a second init, got rc $rc:"; printf '%s\n' "$got"; exit 1
     else
       echo "  host fault handling: lost (this Chez aborts on a host's own fault; rc $rc)"
     fi ;;

@@ -683,8 +683,9 @@ SIGILL when the library initialises. A host that handles those signals itself
 exception) loses them: after `jolt_library_init`, such a fault in host code
 reaches Chez's handler, which reports `invalid memory reference` and aborts the
 process. A Chez that passes a fault on a thread not running Scheme code to the
-handler installed before its own fixes this; `host/chez/build-lib-smoke.sh`
-reports which kind it linked.
+handler installed before its own, and gives the signals back at
+`jolt_library_shutdown`, fixes this; `host/chez/build-lib-smoke.sh` reports
+which kind it linked.
 
 ## Documentation
 

@@ -9,7 +9,11 @@
  * fault on a thread not running Scheme code to the handler installed before
  * it, the host's handler runs and the host carries on.
  *
- * Prints "before load: 11" (or 10, SIGBUS) and "after load: <same>", exit 0.
+ * The same holds after jolt_library_shutdown (Sscheme_deinit), when Chez no
+ * longer owns the signals, and after a second jolt_library_init.
+ *
+ * Prints "before load: 11" (or 10, SIGBUS), then "after load", "after
+ * shutdown" and "after reinit" with the same number, exit 0.
  */
 #include <dlfcn.h>
 #include <setjmp.h>
@@ -55,5 +59,14 @@ int main(int argc, char **argv) {
   if (!init || init(0, 0) != 0) { fprintf(stderr, "jolt_library_init failed\n"); return 1; }
   if (release) release();
   printf("after load: %d\n", fault_in_host());
+  fflush(stdout);
+  void (*shutdown)(void) = (void (*)(void))dlsym(h, "jolt_library_shutdown");
+  if (!shutdown) { fprintf(stderr, "missing jolt_library_shutdown\n"); return 1; }
+  shutdown();
+  printf("after shutdown: %d\n", fault_in_host());
+  fflush(stdout);
+  if (init(0, 0) != 0) { fprintf(stderr, "second jolt_library_init failed\n"); return 1; }
+  if (release) release();
+  printf("after reinit: %d\n", fault_in_host());
   return 0;
 }
