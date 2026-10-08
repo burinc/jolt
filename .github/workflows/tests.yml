@@ -561,7 +561,7 @@ jobs:
           '@
           $out = (& $scheme --script host\chez\cli.ss $probe 2>&1 | Out-String).Trim()
           Write-Host $out
-          if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE: $out" }
+          if ($LASTEXITCODE -ne 0) { throw "exit ${LASTEXITCODE}: $out" }
           if ($out -ne '[:done true true]') { throw "the close under a parked read: $out" }
 
       # The resolver's HTTPS transport on Windows: ws2_32 sockets and the
