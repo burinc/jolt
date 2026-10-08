@@ -1682,8 +1682,6 @@
   {:suite "seq-type-model / specialized seq classes", :label "bigint of a small bound is a long here", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Byte is false", :category :integer-box-model}
     {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Long is true", :category :integer-box-model}
-  {:suite "integer-box-model / narrow int class collapses to Long", :label "float class collapses to Double", :category :integer-box-model}
-  {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Float is true", :category :integer-box-model}
    {:suite "string-model / codepoint strings", :label "count of astral string", :category :string-model}
    {:suite "string-model / codepoint strings", :label "seq counts codepoints", :category :string-model}
    {:suite "string-model / codepoint strings", :label "subs across astral boundary", :category :string-model}

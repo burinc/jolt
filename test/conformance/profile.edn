@@ -313,15 +313,7 @@
    :bucket :divergent,
    :features [:host/jvm-interop]}
   {:suite "integer-box-model / narrow int class collapses to Long",
-   :label "float class collapses to Double",
-   :bucket :divergent,
-   :features [:host/jvm-interop]}
-  {:suite "integer-box-model / narrow int class collapses to Long",
    :label "instance? Byte is false",
-   :bucket :divergent,
-   :features [:host/jvm-interop]}
-  {:suite "integer-box-model / narrow int class collapses to Long",
-   :label "instance? Float is true",
    :bucket :divergent,
    :features [:host/jvm-interop]}
   {:suite "integer-box-model / narrow int class collapses to Long",
