@@ -654,11 +654,23 @@
 ;; port shut under a parked write is not misreported as a failing child.
 
 (define proc-fd-buf-size 32768)
+;; RELEASE frees what the port owns and closes its descriptor; WAKE stops a wait
+;; parked on it; WAITING answers the bytes the kernel holds for it, or #f when it
+;; cannot say. They are the platform's: a descriptor here, a HANDLE for the
+;; Windows ports (proc-win-input-port), which share the counting.
 (define-record-type proc-fd-life
-  (fields fd buf mutex (mutable busy) (mutable shut?) (mutable released?))
-  (nongenerative jolt-proc-fd-life-v1))
+  (fields fd buf mutex (mutable busy) (mutable shut?) (mutable released?)
+          release wake waiting)
+  (nongenerative jolt-proc-fd-life-v2))
 (define (proc-fd-life-new fd)
-  (make-proc-fd-life fd (sa-foreign-alloc proc-fd-buf-size) (make-mutex) 0 #f #f))
+  (let ((buf (sa-foreign-alloc proc-fd-buf-size)))
+    (make-proc-fd-life fd buf (make-mutex) 0 #f #f
+                       (lambda ()
+                         (proc-poller-forget! fd)
+                         (sa-foreign-free buf)
+                         (proc-c-close fd))
+                       (lambda () (proc-poller-cancel! fd))
+                       (lambda () (proc-fd-waiting fd)))))
 ;; -> #t with the operation counted, or #f when the port is already shut
 (define (proc-fd-enter! l)
   (jolt-with-mutex (proc-fd-life-mutex l)
@@ -669,10 +681,7 @@
   (and (proc-fd-life-shut? l) (fx=? (proc-fd-life-busy l) 0)
        (not (proc-fd-life-released? l))
        (begin (proc-fd-life-released?-set! l #t) #t)))
-(define (proc-fd-release! l)
-  (proc-poller-forget! (proc-fd-life-fd l))
-  (sa-foreign-free (proc-fd-life-buf l))
-  (proc-c-close (proc-fd-life-fd l)))
+(define (proc-fd-release! l) ((proc-fd-life-release l)))
 (define (proc-fd-leave! l)
   (when (jolt-with-mutex (proc-fd-life-mutex l)
           (proc-fd-life-busy-set! l (fx- (proc-fd-life-busy l) 1))
@@ -683,7 +692,7 @@
                   (and (not (proc-fd-life-shut? l))
                        (begin (proc-fd-life-shut?-set! l #t) #t)))))
     (when first?
-      (proc-poller-cancel! (proc-fd-life-fd l))
+      ((proc-fd-life-wake l))
       (when (jolt-with-mutex (proc-fd-life-mutex l) (proc-fd-claim-release! l))
         (proc-fd-release! l)))))
 ;; OP inside a counted operation; SHUT is the answer for a port already shut
@@ -810,7 +819,7 @@
   (when (jolt-with-mutex (proc-fd-life-mutex l)
           (and (not (proc-fd-life-shut? l))
                (fx=? (proc-fd-life-busy l) 0)
-               (eqv? (proc-fd-waiting (proc-fd-life-fd l)) 0)
+               (eqv? ((proc-fd-life-waiting l)) 0)
                (begin (proc-fd-life-shut?-set! l #t) #t)))
     (proc-fd-release! l)))
 (define (proc-shut-idle-output! st)
@@ -1615,58 +1624,80 @@
 ;; _open_osfhandle to reuse the fd ports instead would tie jolt's pipes to
 ;; whichever C runtime happened to answer, which is a class of Windows bug worth
 ;; not having.
-(define (proc-win-input-port h)
+;;
+;; They share the descriptor ports' lifetime: a ReadFile parked on an idle pipe
+;; is writing into the port's buffer when another thread closes the port (the
+;; way a caller unblocks readers of a child that keeps its pipes open), so the
+;; buffer and the HANDLE are released by whichever of the close and the last
+;; operation out comes second, never under a call still using them. A synchronous
+;; ReadFile is not cancelled by closing its HANDLE, on the JVM either: the read
+;; parked at the close returns when the pipe next delivers, and answers EOF.
+;;
+;; The lifetime for HANDLE H, and the 4-byte count its ReadFile/WriteFile reports
+;; into, which it also owns.
+(define (proc-win-life h)
   (let ((buf (sa-foreign-alloc proc-fd-buf-size))
-        (nread (sa-foreign-alloc 4))
-        (closed? (box #f)))
-    (make-custom-binary-input-port
-      (string-append "process-handle-" (number->string h))
-      (lambda (bv start n)
-        (let ((want (min n proc-fd-buf-size)))
-          (if (unbox closed?)
-              0
-              (let ((ok ((proc-win-read-file) h buf want nread 0)))
-                ;; A pipe whose write ends have all closed fails the read with
-                ;; ERROR_BROKEN_PIPE rather than returning zero bytes — that IS
-                ;; the EOF, and reporting it as an error would turn every normal
-                ;; child exit into one. A zero-byte success is EOF too.
-                (if (= ok 0)
-                    0
-                    (let ((got (sa-foreign-ref 'unsigned-32 nread 0)))
-                      (let loop ((i 0))
-                        (when (< i got)
-                          (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
-                          (loop (+ i 1))))
-                      got))))))
-      #f #f
-      (lambda ()
-        (set-box! closed? #t)
-        (sa-foreign-free buf) (sa-foreign-free nread)
-        ((proc-win-close-handle) h)))))
+        (count (sa-foreign-alloc 4)))
+    (values (make-proc-fd-life h buf (make-mutex) 0 #f #f
+                               (lambda ()
+                                 (sa-foreign-free buf)
+                                 (sa-foreign-free count)
+                                 ((proc-win-close-handle) h))
+                               (lambda () #f)
+                               (lambda () #f))
+            count)))
+(define (proc-win-input-port h)
+  (proc-fd-collect-released!)
+  (let*-values (((l nread) (proc-win-life h))
+                ((buf) (proc-fd-life-buf l)))
+    (proc-fd-register!
+      (make-custom-binary-input-port
+        (string-append "process-handle-" (number->string h))
+        (lambda (bv start n)
+          (proc-fd-op l (lambda () 0)
+            (lambda ()
+              (let ((want (min n proc-fd-buf-size)))
+                (let ((ok ((proc-win-read-file) h buf want nread 0)))
+                  ;; A pipe whose write ends have all closed fails the read with
+                  ;; ERROR_BROKEN_PIPE rather than returning zero bytes — that IS
+                  ;; the EOF, and reporting it as an error would turn every normal
+                  ;; child exit into one. A zero-byte success is EOF too. A read
+                  ;; that was in flight when the port closed answers EOF as well.
+                  (if (or (= ok 0) (proc-fd-shut-now? l))
+                      0
+                      (let ((got (sa-foreign-ref 'unsigned-32 nread 0)))
+                        (let loop ((i 0))
+                          (when (< i got)
+                            (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
+                            (loop (+ i 1))))
+                        got)))))))
+        #f #f
+        (lambda () (proc-fd-shut! l)))
+      l)))
 
 (define (proc-win-output-port h)
-  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
-        (nwrote (sa-foreign-alloc 4))
-        (closed? (box #f)))
-    (make-custom-binary-output-port
-      (string-append "process-handle-" (number->string h))
-      (lambda (bv start n)
-        (let ((want (min n proc-fd-buf-size)))
-          (let loop ((i 0))
-            (when (< i want)
-              (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
-              (loop (+ i 1))))
-          (if (unbox closed?)
-              (error 'process "write to closed pipe" h)
-              (let ((ok ((proc-win-write-file) h buf want nwrote 0)))
-                (if (= ok 0)
-                    (error 'process "write to child failed" h)
-                    (sa-foreign-ref 'unsigned-32 nwrote 0))))))
-      #f #f
-      (lambda ()
-        (set-box! closed? #t)
-        (sa-foreign-free buf) (sa-foreign-free nwrote)
-        ((proc-win-close-handle) h)))))
+  (proc-fd-collect-released!)
+  (let*-values (((l nwrote) (proc-win-life h))
+                ((buf) (proc-fd-life-buf l))
+                ((shut-write) (lambda () (error 'process "write to closed pipe" h))))
+    (proc-fd-register!
+      (make-custom-binary-output-port
+        (string-append "process-handle-" (number->string h))
+        (lambda (bv start n)
+          (proc-fd-op l shut-write
+            (lambda ()
+              (let ((want (min n proc-fd-buf-size)))
+                (let loop ((i 0))
+                  (when (< i want)
+                    (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
+                    (loop (+ i 1))))
+                (let ((ok ((proc-win-write-file) h buf want nwrote 0)))
+                  (if (= ok 0)
+                      (error 'process "write to child failed" h)
+                      (sa-foreign-ref 'unsigned-32 nwrote 0)))))))
+        #f #f
+        (lambda () (proc-fd-shut! l)))
+      l)))
 
 ;; --- reaping through the process handle --------------------------------------
 ;; There is no waitpid here. WaitForSingleObject(h, 0) decides whether the child

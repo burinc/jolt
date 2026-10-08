@@ -265,6 +265,47 @@
     (set! fails (+ fails 1))
     (printf "FAIL: the drive walk ends at the root: ~s\n" got)))
 
+;; --- the long spelling (jolt-lang/jolt#1281) ----------------------------------
+;; getCanonicalPath on Windows replaces each existing component with the name
+;; its directory lists, so an 8.3 alias and a miscased name both come back as the
+;; real one. The listing is a table here; on Windows it is FindFirstFileW.
+(define listing
+  '(("C:/Users/MARKO~1.KOC" . "Marko.Kocic")
+    ("C:/Users" . "Users")
+    ("C:/users" . "Users")
+    ("C:/Users/Marko.Kocic" . "Marko.Kocic")
+    ("C:/Users/Marko.Kocic/AppData" . "AppData")
+    ("C:/Users/Marko.Kocic/AppData/Local" . "Local")
+    ("C:/Users/Marko.Kocic/AppData/Local/Temp" . "Temp")
+    ("C:/Users/Marko.Kocic/appdata" . "AppData")
+    ("//srv/sh/Dir" . "Dir")
+    ("//srv/sh/dir" . "Dir")))
+(define (listed p) (let ((e (assoc p listing))) (and e (cdr e))))
+(define (long label given want)
+  (let ((got (win32-long-path-with listed given)))
+    (set! total (+ total 1))
+    (unless (equal? got want)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a: ~s -> ~s, want ~s\n" label given got want))))
+(long "short profile name" "C:\\Users\\MARKO~1.KOC\\AppData\\Local\\Temp"
+      "C:/Users/Marko.Kocic/AppData/Local/Temp")
+(long "trailing separator" "C:\\Users\\MARKO~1.KOC\\AppData\\Local\\Temp\\"
+      "C:/Users/Marko.Kocic/AppData/Local/Temp")
+(long "case and drive letter" "c:/users/Marko.Kocic/appdata" "C:/Users/Marko.Kocic/AppData")
+(long "dots fold first" "C:/Users/x/../MARKO~1.KOC/./AppData" "C:/Users/Marko.Kocic/AppData")
+(long "drive root" "c:\\" "C:/")
+(long "unc" "\\\\srv\\sh\\dir" "//srv/sh/Dir")
+(long "missing component" "C:/Users/nobody/x" #f)
+(long "a wildcard names no file" "C:/Users/*" #f)
+(long "relative" "Users" #f)
+
+(set! total (+ total 1))
+(unless (and (string=? (win32-strip-final-prefix "\\\\?\\C:\\Users\\Marko.Kocic") "C:\\Users\\Marko.Kocic")
+             (string=? (win32-strip-final-prefix "\\\\?\\UNC\\srv\\sh\\d") "\\\\srv\\sh\\d")
+             (string=? (win32-strip-final-prefix "C:\\x") "C:\\x"))
+  (set! fails (+ fails 1))
+  (printf "FAIL: GetFinalPathNameByHandleW prefixes\n"))
+
 (if (> fails 0)
     (begin (printf "WIN-PATH FAILURES: ~a of ~a\n" fails total) (exit 1))
     (printf "WIN-PATH OK (~a checks)\n" total))
