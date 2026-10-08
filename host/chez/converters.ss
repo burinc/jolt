@@ -271,11 +271,22 @@
                  (string-append (if (string? p) p (jolt-str-render-one p))
                                 (number->string n)))))
 
+;; A java.lang.Float. Chez has one flonum, but a Float is not a Double: it
+;; prints Float.toString's digits ((float 0.1) is 0.1, its double value
+;; 0.10000000149011612), classes as java.lang.Float and hashes as
+;; Float.hashCode. So a float is a value of its own holding the single-precision
+;; value as a flonum, and arithmetic widens it to a double as the JVM does
+;; (float.ss registers it with the numeric tower, the printer, = and hash).
+(define-record-type jfloat (fields fl) (nongenerative chez-jfloat-v1))
+;; A Float as the double it widens to; anything else unchanged.
+(define (jfloat-unbox x) (if (jfloat? x) (jfloat-fl x) x))
+
 ;; a numeric type outside Chez's tower converts through this hook (bigdec).
 (define (jolt-double-slow x) (jolt-num-cast-throw x))
 (define (jolt-double x)
   (cond ((char? x) (exact->inexact (char->integer x)))
         ((number? x) (exact->inexact x))
+        ((jfloat? x) (jfloat-fl x))
         (else (jolt-double-slow x))))
 
 ;; compare: 3-way, returns an EXACT integer (= JVM compare -> int).
@@ -486,26 +497,31 @@
 (def-var! "clojure.core" "unchecked-long" jolt-unchecked-long)
 (def-var! "clojure.core" "unchecked-int" jolt-unchecked-int)
 (def-var! "clojure.core" "double" jolt-double)
-;; float: Chez has no single-float type, so the value stays a flonum, but it is
-;; the nearest single-precision value (flsingle; Gambit's is an f32vector
-;; store in prelude-shims.ss), as the JVM's float holds:
-;; (double (float 0.3)) is 0.30000001192092896 and (float Double/MIN_VALUE) is
-;; 0.0. The cast range-checks against Float/MAX_VALUE first, like
-;; RT.floatCast (an infinity is out of range; NaN passes).
+;; float: a jfloat holding the nearest single-precision value (flsingle;
+;; Gambit's is an f32vector store in prelude-shims.ss), as the JVM's float
+;; holds: (double (float 0.3)) is 0.30000001192092896 and (float
+;; Double/MIN_VALUE) is 0.0. The cast range-checks against Float/MAX_VALUE
+;; first, like RT.floatCast (an infinity is out of range; NaN passes).
+;;
+;; jolt-float->flonum is the cast's value as the double it widens to: what an
+;; arithmetic operand needs, so a typed (* (float x) 2.0) never builds the
+;; jfloat (jolt.passes.numeric's :float kind).
 (define fl-float-max 3.4028234663852886e38)
-(define (jolt-float x)
-  (let ((d (jolt-double x)))
-    (cond
-      ((not (flonum? d)) d)
-      ((and (not (nan? d)) (or (< d (- fl-float-max)) (> d fl-float-max)))
-       (jolt-cast-range-throw "float" x))
-      (else (flsingle d)))))
+(define (jolt-float->flonum x)
+  (if (jfloat? x)
+      (jfloat-fl x)
+      (let ((d (jolt-double x)))
+        (if (and (not (nan? d)) (or (< d (- fl-float-max)) (> d fl-float-max)))
+            (jolt-cast-range-throw "float" x)
+            (flsingle d)))))
+(define (jolt-float x) (if (jfloat? x) x (make-jfloat (jolt-float->flonum x))))
 (def-var! "clojure.core" "float" jolt-float)
 ;; unchecked-float: the same rounding without the range check, so a double past
 ;; Float/MAX_VALUE is an infinity, like the JVM's (float) primitive conversion.
+(define (jolt-unchecked-float->flonum x)
+  (if (jfloat? x) (jfloat-fl x) (flsingle (jolt-double x))))
 (define (jolt-unchecked-float x)
-  (let ((d (jolt-double x)))
-    (if (flonum? d) (flsingle d) d)))
+  (if (jfloat? x) x (make-jfloat (jolt-unchecked-float->flonum x))))
 (def-var! "clojure.core" "unchecked-float" jolt-unchecked-float)
 ;; numerator/denominator: jolt ratios are Chez exact rationals; a non-ratio is
 ;; the JVM's Ratio cast failure.

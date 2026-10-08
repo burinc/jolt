@@ -510,24 +510,19 @@
         (cons "TRUE" #t) (cons "FALSE" #f)))
 
 (register-class-ctor! "Double" ->double)
-(register-class-ctor! "Float" ->double)
+(register-class-ctor! "Float" (lambda (x) (jolt-parse-float x)))
 (register-class-statics! "Double"
   (list (cons "TYPE" "double")
         (cons "parseDouble" parse-double-or-throw)
         (cons "valueOf" ->double)
         (cons "toString" (lambda (x) (jolt-str-render-one (->double x))))
-        (cons "isNaN" (lambda (x) (and (flonum? x) (nan? x))))
-        (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
+        ;; a Float argument widens, as the double parameter takes it
+        (cons "isNaN" (lambda (x) (let ((d (jfloat-unbox x))) (and (flonum? d) (nan? d)))))
+        (cons "isInfinite" (lambda (x) (let ((d (jfloat-unbox x))) (and (flonum? d) (infinite? d)))))
         (cons "MAX_VALUE" 1.7976931348623157e308) (cons "MIN_VALUE" 4.9e-324)
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0) (cons "NaN" +nan.0)))
-;; Float's specials. Its bounds, parsing and printing round to single precision
-;; and live with the float codecs in math.ss.
-(register-class-statics! "Float"
-  (list (cons "TYPE" "float")
-        (cons "isNaN" (lambda (x) (and (flonum? x) (nan? x))))
-        (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
-        (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0)
-        (cons "NaN" +nan.0)))
+;; Float's values, parsing and printing live with the float codecs in math.ss.
+(register-class-statics! "Float" (list (cons "TYPE" "float")))
 
 ;; Character: the JVM's classification is the Unicode general category, and Chez's
 ;; char-general-category IS that property (the same table the JVM reads), so

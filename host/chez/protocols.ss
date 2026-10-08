@@ -466,7 +466,8 @@
   ;; lists that stopped at Number / CharSequence, so (instance? Comparable 1) was
   ;; false while (isa? Long Comparable) was true — and a protocol extended to an
   ;; interface a number implements never reached one.
-  (cond ((flonum? obj) (jch-tags-plus "java.lang.Double" '("java.lang.Float" "Float")))
+  (cond ((flonum? obj) (jch-tags "java.lang.Double"))
+        ((jfloat? obj) (jch-tags "java.lang.Float"))
         ((and (number? obj) (exact? obj) (not (integer? obj))) (jch-tags "clojure.lang.Ratio"))
         ;; exact integers split at the LONG RANGE (issue #627), the same
         ;; boundary the printer's N suffix uses — NOT the fixnum range: Chez

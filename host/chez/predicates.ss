@@ -35,7 +35,9 @@
 ;; non-integer (= JVM Ratio). rational? = exact (integer or ratio; jolt has no
 ;; BigDecimal). decimal? is always false (no BigDecimal type).
 (define (jolt-integer? x) (and (number? x) (exact? x) (integer? x)))
-(define (jolt-float? x) (and (number? x) (flonum? x)))
+;; float? is Double or Float; double? only a Double (a jfloat is a Float).
+(define (jolt-float? x) (or (flonum? x) (jfloat? x)))
+(define (jolt-double? x) (flonum? x))
 ;; ratio?/rational? live in the overlay (clojure/core/20-coll.clj), built on the
 ;; jolt.host tower tests. decimal? stays native: the optional bigdec module
 ;; (java/bigdec.ss) re-binds it to jbigdec?, so it can't be a static overlay const.

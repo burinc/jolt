@@ -322,6 +322,7 @@
              cls (mapv (fn [r] (let [k (nth r 0) nd (nth r 1)]
                                  (cond (= k :double) :double
                                        (= k :long) :long
+                                       (= k :float) :float
                                        (= k :bigdec) :bigdec
                                        (int-lit? nd) (if (fixnum-lit? (get nd :val)) :wild :wild-big)
                                        :else :no)))
@@ -343,7 +344,10 @@
            ;; widened to flonum — JVM long->double widening == fixnum->flonum, so this
            ;; is value-neutral), :wild (an integer literal coerced to flonum), or a
            ;; bigdec LITERAL — double contagion: (+ 1.5M 2.0) => 3.5 Double, the bigdec
-           ;; contributing its double value. A let-bound bigdec (kind :bigdec, not a
+           ;; contributing its double value. A :float operand (a (float x) cast, a
+           ;; jfloat) widens to the double it holds, as the JVM widens a primitive
+           ;; float, so it joins too: the back end unboxes it (:fl-unbox) and a cast
+           ;; in operand position never builds the jfloat at all. A let-bound bigdec (kind :bigdec, not a
            ;; literal) can't be turned into a compile-time flonum, so it de-opts to the
            ;; generic bigdec-aware op. min/max return the ORIGINAL operand and `=` is
            ;; exactness-aware (0 != 0.0), so int/bigdec-literal/:long contagion is
@@ -351,8 +355,8 @@
            ;; to flonum would also change exactness there). fl< and friends compare
            ;; numerically, so coercing stays sound.
            (and ds (pos? n)
-                (some (fn [c] (= c :double)) cls)
-                (every? (fn [[c nd]] (or (= c :double) (= c :long) (= c :wild) (= c :wild-big)
+                (some (fn [c] (or (= c :double) (= c :float))) cls)
+                (every? (fn [[c nd]] (or (= c :double) (= c :long) (= c :float) (= c :wild) (= c :wild-big)
                                          (and (= c :bigdec) (bigdec-lit? nd))))
                         (map vector cls argnodes))
                 (or (not (contains? #{"min" "max" "="} nm))
@@ -365,6 +369,7 @@
            (let [args' (mapv (fn [[c nd]] (cond (int-lit? nd) (assoc nd :val (double (get nd :val)))
                                                 (bigdec-lit? nd) (bigdec-lit->flonum nd)
                                                 (= c :long) (assoc nd :fl-coerce true)
+                                                (= c :float) (assoc nd :fl-unbox true)
                                                 :else nd))
                              (map vector cls argnodes))]
              [(propagate ds) (assoc node1 :args args' :num-kind :double)])

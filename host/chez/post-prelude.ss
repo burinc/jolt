@@ -113,7 +113,7 @@
 (def-var! "clojure.core" "integer?" jolt-integer?)
 (def-var! "clojure.core" "int?" jolt-integer?)
 (def-var! "clojure.core" "float?" jolt-float?)
-(def-var! "clojure.core" "double?" jolt-float?)
+(def-var! "clojure.core" "double?" jolt-double?)
 ;; ratio?/rational? now live (correctly) in the overlay, so they no longer need a
 ;; native re-assertion here. decimal? stays (bigdec re-binds it).
 (def-var! "clojure.core" "decimal?" jolt-decimal?)

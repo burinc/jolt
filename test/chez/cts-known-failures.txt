@@ -11,7 +11,6 @@ clojure.core-test.byte 1 0
 # branch asserts. See the :string-model entry in known-divergences.edn.
 clojure.core-test.char 1 0
 clojure.core-test.dec 1 0
-clojure.core-test.double-qmark 3 0
 # eq / not-eq: ##NaN rows the suite itself flags as arguably-undefined.
 # (= (list ##NaN) (list ##NaN)) is true on the JVM only because the compiler
 # hands both lists the same boxed Double and Util.equiv short-circuits on

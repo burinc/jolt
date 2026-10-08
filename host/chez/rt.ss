@@ -961,6 +961,7 @@
 (define (jolt->fl x)
   (cond ((flonum? x) x)
         ((number? x) (exact->inexact x))
+        ((jfloat? x) (jfloat-fl x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
 ;; Spliced, like the predicates in values.ss (see jolt-nil? there for why).
@@ -2705,6 +2706,7 @@
 ;; printing. Loads LAST so its set!-wraps of jolt-class/jolt=2/the printers sit
 ;; outermost over every earlier extension.
 (load "host/chez/java/bigdec.ss")
+(load "host/chez/float.ss")                       ; java.lang.Float as a value (jfloat)
 
 ;; The library seam for extending / overriding a class jolt already part-shims.
 ;; After every java shim and after bigdec.ss's class-arm wraps, so the class name

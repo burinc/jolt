@@ -300,7 +300,7 @@
 (defn abs [x] (if (neg? x) (- 0 x) x))
 
 (defn NaN? [x]
-  (if (number? x) (not (= x x)) (throw (ClassCastException. "NaN? requires a number"))))
+  (if (number? x) (not (== x x)) (throw (ClassCastException. "NaN? requires a number"))))
 
 ;; No distinct host object / undefined types on Jolt.
 (defn object? [x] false)

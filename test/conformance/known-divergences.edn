@@ -897,28 +897,17 @@
    :check :prose
    :why "both runtimes agree here: the entry is guidance about which form to use, not a divergence"
    :note "Both agree here: Integer/toHexString is 32 bits wide on both, so a signed byte gives eight digits on both. Listed only to point at the portable forms — Byte/toUnsignedInt or (bit-and b 0xff) — since format's %x DOES infer its width and is the case that diverges (see the :entries row for numbers / unsigned string conversions)."}
-  ;; The same collapse on the float side: one flonum type reported as Double, and
-  ;; instance? answers to both Float and Double so either check written against the
-  ;; JVM keeps working.
+  ;; The same collapse on the int side: one fixnum type reported as Long, and
+  ;; instance? answers to both Integer and Long so either check written against
+  ;; the JVM keeps working.
   {:category :integer-box-model
-   :behavior "(class (float 1.5)), (instance? Float 1.5)"
-   :jvm "java.lang.Float, false"
-   :jolt "java.lang.Double, true"
-   :check {:expr "[(.getName (class (float 1.5))) (instance? Float 1.5)]"
-           :jvm "[\"java.lang.Float\" false]"
-           :jolt "[\"java.lang.Double\" true]"}
-   :note "Chez has one flonum. instance? is deliberately permissive for Float/Double and Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset."}
-  ;; The same collapse at the java.nio seam and in printing: a float read out of
-  ;; a buffer, like (float x), is a Double holding the float's exact value, so it
-  ;; prints every digit of that value where the JVM prints Float.toString's.
-  {:category :integer-box-model
-   :behavior "(pr-str (float 0.1)), (.getFloat b) on a ByteBuffer, (.get fb) on a FloatBuffer"
-   :jvm "a java.lang.Float, printed as Float.toString's shortest digits (0.1); widened to double it is 0.10000000149011612, and a NaN keeps its payload bits"
-   :jolt "a Double holding the float's exact value (0.10000000149011612), equal to the JVM's widened value and to (float 0.1), printed with a double's digits; a NaN re-encodes as the canonical 0x7fc00000"
-   :check {:expr "(let [b (java.nio.ByteBuffer/allocate 4)] (.putFloat b 0.1) [(pr-str (.getFloat b 0)) (double (.getFloat b 0)) (pr-str (float 0.1))])"
-           :jvm "[\"0.1\" 0.10000000149011612 \"0.1\"]"
-           :jolt "[\"0.10000000149011612\" 0.10000000149011612 \"0.10000000149011612\"]"}
-   :note "Chez has one flonum, so jolt cannot tell a float from a double holding the same value and prints both as a double. Values agree with the JVM: (float x) rounds to single precision, and putFloat rounds exactly as the JDK does (every finite pattern round-trips byte for byte, checked against JDK 21 over 4000 random patterns). NaN payloads are not observable on jolt: the encoders are exact arithmetic over the value, which has no payload to read."}
+   :behavior "(class (int 1)), (instance? Integer 1)"
+   :jvm "java.lang.Integer, false"
+   :jolt "java.lang.Long, true"
+   :check {:expr "[(.getName (class (int 1))) (instance? Integer 1)]"
+           :jvm "[\"java.lang.Integer\" false]"
+           :jolt "[\"java.lang.Long\" true]"}
+   :note "Chez has one fixnum. instance? is deliberately permissive for Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset. Float is its own value (a jfloat), so Float and Double answer as on the JVM."}
   ;; Thread.getStackTrace names the frames jolt can reconstruct: the live
   ;; continuation, plus callers TCO erased that the compile-time callsite tables
   ;; name (a static tail edge, or the one most recent tail site bridging a gap).

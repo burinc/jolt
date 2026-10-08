@@ -392,7 +392,7 @@
 ;; an infinity included, is IllegalArgumentException), rounded once to single
 ;; precision (8 exponent bits, 23 mantissa bits, half-even), then encoded.
 (define (flt->bits x)
-  (let ((x (exact->inexact x)))
+  (let ((x (jolt-double x)))
     (+ (if (dbl-negative? x) (expt 2 31) 0)
        (cond ((nan? x) #x7fc00000)
              ((infinite? x) #x7f800000)
@@ -422,9 +422,9 @@
                     ((= field 0) (exact->inexact (* mant (expt 2 -149))))
                     (else (exact->inexact (* (+ (expt 2 23) mant) (expt 2 (- field 150))))))))
     (if (>= b (expt 2 31)) (- mag) mag)))
-(define (jolt-float->int-bits x) (unsigned->signed (flt->bits (jolt-float x)) 32))
+(define (jolt-float->int-bits x) (unsigned->signed (flt->bits (jolt-float->flonum x)) 32))
 (define (jolt-int-bits->float n)
-  (bits->flt (modulo (exact (jolt-need-num n)) (expt 2 32))))
+  (make-jfloat (bits->flt (modulo (exact (jolt-need-num n)) (expt 2 32)))))
 
 (register-class-statics! "Double"
   (list (cons "doubleToLongBits" (lambda (x) (jolt-double->long-bits x)))
@@ -437,7 +437,7 @@
 ;; form has two significant digits: Float.MIN_VALUE is 1.4E-45, never 1.0E-45.
 ;; Answers the decimal as a double, whose own printing then spells it.
 (define (flt-shortest x)
-  (let ((x (jolt-float x)))
+  (let ((x (jolt-unchecked-float->flonum x)))
     (if (or (nan? x) (infinite? x) (= x 0.0))
         x
         (let* ((m (exact (abs x)))
@@ -458,14 +458,32 @@
 ;; Float.parseFloat/valueOf: the parsed double rounded to single precision, past
 ;; the float range an infinity (a parse does not range-check like the cast).
 (define (jolt-parse-float s)
-  (let ((d (if (number? s) (exact->inexact s) (parse-double-or-throw s))))
-    (if (flonum? d) (flsingle d) d)))
+  (if (or (number? s) (jfloat? s))
+      (make-jfloat (jolt-unchecked-float->flonum s))
+      (make-jfloat (flsingle (parse-double-or-throw s)))))
+;; Float.compare: numeric order, then -0.0 below 0.0 and NaN above everything,
+;; which is the order of the signed bit patterns.
+(define (jolt-float-compare a b)
+  (let ((x (jolt-float->flonum a)) (y (jolt-float->flonum b)))
+    (cond ((< x y) -1)
+          ((> x y) 1)
+          (else (let ((bx (unsigned->signed (flt->bits x) 32))
+                      (by (unsigned->signed (flt->bits y) 32)))
+                  (cond ((= bx by) 0) ((< bx by) -1) (else 1)))))))
 
 (register-class-statics! "Float"
   (list (cons "parseFloat" jolt-parse-float) (cons "valueOf" jolt-parse-float)
         (cons "toString" (lambda (x) (jolt-str-render-one (flt-shortest x))))
-        ;; the float bounds' exact values, so (float Float/MAX_VALUE) is in range
-        (cons "MAX_VALUE" 3.4028234663852886e38) (cons "MIN_VALUE" 1.401298464324817e-45)
+        (cons "compare" jolt-float-compare)
+        (cons "isNaN" (lambda (x) (nan? (jolt-double x))))
+        (cons "isInfinite" (lambda (x) (infinite? (jolt-double x))))
+        ;; Floats, as on the JVM: (str Float/MAX_VALUE) is 3.4028235E38
+        (cons "MAX_VALUE" (make-jfloat 3.4028234663852886e38))
+        (cons "MIN_VALUE" (make-jfloat 1.401298464324817e-45))
+        (cons "MIN_NORMAL" (make-jfloat 1.1754943508222875e-38))
+        (cons "POSITIVE_INFINITY" (make-jfloat +inf.0))
+        (cons "NEGATIVE_INFINITY" (make-jfloat -inf.0))
+        (cons "NaN" (make-jfloat +nan.0))
         (cons "floatToIntBits" (lambda (x) (jolt-float->int-bits x)))
         (cons "floatToRawIntBits" (lambda (x) (jolt-float->int-bits x)))
         (cons "intBitsToFloat" (lambda (n) (jolt-int-bits->float n)))))

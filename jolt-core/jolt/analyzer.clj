@@ -26,6 +26,7 @@
                                form-inst? form-inst-source form-uuid? form-uuid-source
                                form-bigdec? form-bigdec-source
                                form-bigdec-value? form-bigdec-value-source
+                               form-float-value? form-float-value-double
                                form-inst-value? form-inst-value-source
                                form-uuid-value? form-uuid-value-source
                                form-ns-value? form-ns-value-name
@@ -2173,7 +2174,8 @@
 ;; becomes a :coerce node carrying the checked runtime helper, so it feeds the
 ;; numeric lattice like a ^double/^long hint: (* (double x) 2.0) emits fl*. The
 ;; helper preserves clojure.core's full JVM semantics (checked, not bare
-;; jolt->fl). float -> double-kind (Jolt has no single-float); int ->
+;; jolt->fl). float -> its own :float kind (a jfloat, which an arithmetic op
+;; takes as the double it widens to: jolt.passes.numeric); int ->
 ;; long-kind (Jolt's integer-box model), routing to jolt-int-cast so the JVM int
 ;; range is still enforced. Returns {:kind .. :cast-fn ..} or nil. n is the full
 ;; item count (head + args).
@@ -2182,7 +2184,7 @@
     (cond (= hname "double") {:kind :double :cast-fn "jolt-double"}
           (= hname "long")   {:kind :long   :cast-fn "jolt-long-cast"}
           (= hname "int")    {:kind :long   :cast-fn "jolt-int-cast"}
-          (= hname "float")  {:kind :double :cast-fn "jolt-float"}
+          (= hname "float")  {:kind :float  :cast-fn "jolt-float"}
           ;; byte/short narrow to a RANGE, so their answer is a fixnum on every
           ;; tower jolt has (jolt-checked-cast returns a value inside [lo,hi] or
           ;; throws) — :long, the same kind `int` takes, and for the same reason.
@@ -2199,7 +2201,8 @@
           ;; the same reason a ^long param is admitted. Before this they were
           ;; ordinary var calls and left every loop counter they fed untyped.
           (= hname "unchecked-long") {:kind :long :cast-fn "jolt-unchecked-long"}
-          (= hname "unchecked-int")  {:kind :long :cast-fn "jolt-unchecked-int"})))
+          (= hname "unchecked-int")  {:kind :long :cast-fn "jolt-unchecked-int"}
+          (= hname "unchecked-float") {:kind :float :cast-fn "jolt-unchecked-float"})))
 
 ;; The compile-time hook over calls through a var (jolt.host/invoke-rewriter,
 ;; nil unless something bound jolt.host/*invoke-rewrite*): (f var-ns var-name
@@ -2603,6 +2606,9 @@
      ;; the tagged literal, rebuilt from the value's canonical string. Without this
      ;; an embedded 1M / #inst / #uuid value died as "unsupported form".
      (form-bigdec-value? form) {:op :bigdec :source (form-bigdec-value-source form)}
+     ;; a Float has no literal, so a live one embeds as the cast that makes it
+     (form-float-value? form)
+     (analyze ctx (list (symbol "clojure.core" "float") (form-float-value-double form)) env)
      (form-inst-value? form) {:op :inst :source (form-inst-value-source form)}
      (form-uuid-value? form) {:op :uuid :source (form-uuid-value-source form)}
      ;; a live namespace value spliced into a form (~*ns* in a macro) -> a

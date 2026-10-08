@@ -202,11 +202,9 @@
 ;; on both). What
 ;; is this file's own is how a FLOAT reads back.
 ;;
-;; The float a pattern holds, as jolt holds a float: a double with the float's
-;; exact value, which is what (float x) rounds to (converters.ss) and what the
-;; JVM's Float widens to. Then (.getFloat b) after (.putFloat b 0.1) equals
-;; (float 0.1), both 0.10000000149011612.
-(define (nb-bits->flt b) (bits->flt b))
+;; The float a pattern holds is a Float (a jfloat, converters.ss), so
+;; (.getFloat b) after (.putFloat b 0.1) prints 0.1 and equals (float 0.1).
+(define (nb-bits->flt b) (make-jfloat (bits->flt b)))
 
 ;; --- element kinds -------------------------------------------------------------
 ;; What a stored unsigned W-octet integer reads as, and what an argument stores.

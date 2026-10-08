@@ -81,6 +81,8 @@ fn-form-parse
 form-bigdec-source
 form-bigdec-value-source
 form-bigdec-value?
+form-float-value-double
+form-float-value?
 form-bigdec?
 form-char-code
 form-char?
