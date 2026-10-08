@@ -961,7 +961,11 @@
                    "java.lang.ClassCastException"
                    (string-append "class " (jolt-class-name x)
                                   " cannot be cast to class " target)))))
-(define (jolt-need-num x) (if (number? x) x (jolt-num-cast-throw x)))
+;; A Float (a jfloat) is taken as the double it widens to.
+(define (jolt-need-num x)
+  (cond ((number? x) x)
+        ((jfloat? x) (jfloat-fl x))
+        (else (jolt-num-cast-throw x))))
 ;; A number as a JVM long: the truncating coercion the host-method arms
 ;; (records-dispatch.ss compareTo) and compile-eval.ss read through. Here, in
 ;; the shared tier, because those files are shared — it used to sit in

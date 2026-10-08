@@ -897,28 +897,17 @@
    :check :prose
    :why "both runtimes agree here: the entry is guidance about which form to use, not a divergence"
    :note "Both agree here: Integer/toHexString is 32 bits wide on both, so a signed byte gives eight digits on both. Listed only to point at the portable forms — Byte/toUnsignedInt or (bit-and b 0xff) — since format's %x DOES infer its width and is the case that diverges (see the :entries row for numbers / unsigned string conversions)."}
-  ;; The same collapse on the float side: one flonum type reported as Double, and
-  ;; instance? answers to both Float and Double so either check written against the
-  ;; JVM keeps working.
+  ;; The same collapse on the int side: one fixnum type reported as Long, and
+  ;; instance? answers to both Integer and Long so either check written against
+  ;; the JVM keeps working.
   {:category :integer-box-model
-   :behavior "(class (float 1.5)), (instance? Float 1.5)"
-   :jvm "java.lang.Float, false"
-   :jolt "java.lang.Double, true"
-   :check {:expr "[(.getName (class (float 1.5))) (instance? Float 1.5)]"
-           :jvm "[\"java.lang.Float\" false]"
-           :jolt "[\"java.lang.Double\" true]"}
-   :note "Chez has one flonum. instance? is deliberately permissive for Float/Double and Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset."}
-  ;; The same collapse at the java.nio seam: a float read out of a buffer has no
-  ;; Float to be, so it is the double jolt's (float x) would have made of the
-  ;; digits Float.toString prints.
-  {:category :integer-box-model
-   :behavior "(.getFloat b) on a ByteBuffer, (.get fb) on a FloatBuffer"
-   :jvm "a java.lang.Float; widened to double it is the float's exact value (0.10000000149011612 for 0.1f), and a NaN keeps its payload bits"
-   :jolt "a Double holding the shortest decimal that reads back as that float (0.1), so it prints as the JVM's Float does and equals (float 0.1); a NaN re-encodes as the canonical 0x7fc00000"
-   :check {:expr "(let [b (java.nio.ByteBuffer/allocate 4)] (.putFloat b 0.1) (double (.getFloat b 0)))"
-           :jvm "0.10000000149011612"
-           :jolt "0.1"}
-   :note "putFloat rounds to single precision exactly as the JDK does (every finite pattern round-trips byte for byte, checked against JDK 21 over 4000 random patterns). NaN payloads are not observable on jolt: the encoders are exact arithmetic over the value, which has no payload to read."}
+   :behavior "(class (int 1)), (instance? Integer 1)"
+   :jvm "java.lang.Integer, false"
+   :jolt "java.lang.Long, true"
+   :check {:expr "[(.getName (class (int 1))) (instance? Integer 1)]"
+           :jvm "[\"java.lang.Integer\" false]"
+           :jolt "[\"java.lang.Long\" true]"}
+   :note "Chez has one fixnum. instance? is deliberately permissive for Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset. Float is its own value (a jfloat), so Float and Double answer as on the JVM."}
   ;; Thread.getStackTrace names the frames jolt can reconstruct: the live
   ;; continuation, plus callers TCO erased that the compile-time callsite tables
   ;; name (a static tail edge, or the one most recent tail site bridging a gap).
@@ -1693,8 +1682,6 @@
   {:suite "seq-type-model / specialized seq classes", :label "bigint of a small bound is a long here", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Byte is false", :category :integer-box-model}
     {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Long is true", :category :integer-box-model}
-  {:suite "integer-box-model / narrow int class collapses to Long", :label "float class collapses to Double", :category :integer-box-model}
-  {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Float is true", :category :integer-box-model}
    {:suite "string-model / codepoint strings", :label "count of astral string", :category :string-model}
    {:suite "string-model / codepoint strings", :label "seq counts codepoints", :category :string-model}
    {:suite "string-model / codepoint strings", :label "subs across astral boundary", :category :string-model}

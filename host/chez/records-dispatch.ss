@@ -1003,6 +1003,9 @@
 ;; not see it and the members need a tier; the file that owns the value model
 ;; owns them, and it loads long after this one.
 (define arm-priority-bigdec 46)     ; java.math.BigDecimal's instance members
+;; float.ss registers java.lang.Float's instance members here, for the same
+;; reason: a jfloat is a record of its own, not a number the host-type tier sees.
+(define arm-priority-float 47)      ; java.lang.Float's instance members
 ;; A nil receiver is a NullPointerException before any arm looks: the JVM
 ;; cannot invoke anything on null. (.toString nil) used to answer "" and
 ;; (.equals nil 1) false through the universal Object arm.

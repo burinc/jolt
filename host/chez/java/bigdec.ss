@@ -86,6 +86,8 @@
 (define (jolt-bigdec x)
   (cond
     ((jbigdec? x) x)
+    ;; BigDecimal.valueOf of the double a Float widens to, as clojure.core/bigdec
+    ((jfloat? x) (jolt-bigdec (jfloat-fl x)))
     ((and (number? x) (exact? x) (integer? x)) (make-jbigdec x 0))
     ((and (number? x) (exact? x) (rational? x)) (jbd-rational->bigdec x))
     ((string? x) (jolt-bigdec-from-string x))
@@ -401,7 +403,8 @@
 ;; SHORTEST decimal print of the double, not its exact binary value — so
 ;; (rationalize 1.1) is 11/10. A bigdec is exact already; other exacts pass through.
 (define (jolt-rationalize x)
-  (cond ((jbigdec? x) (/ (jbigdec-unscaled x) (expt 10 (jbigdec-scale x))))
+  (cond ((jfloat? x) (jolt-rationalize (jfloat-fl x)))
+        ((jbigdec? x) (/ (jbigdec-unscaled x) (expt 10 (jbigdec-scale x))))
         ((flonum? x)
          (if (or (nan? x) (infinite? x))
              (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
