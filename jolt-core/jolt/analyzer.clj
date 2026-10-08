@@ -454,15 +454,17 @@
 ;; A primitive ARRAY hint on a param. Drives the aget/aset fast paths
 ;; (jolt.passes.numeric):
 ;;
-;;   :doubles  the UNBOXED flvector-ref/-set! path — a double/float array's backing
+;;   :doubles  the UNBOXED flvector-ref/-set! path — a double array's backing
 ;;             is a Chez flvector, so an element reads back a proven :double.
-;;             floats share the flvector kind.
+;;   :floats   the same flvector path, but an element is a Float: it reads back
+;;             :float (the double an fl op takes, a jfloat anywhere else) and a
+;;             store rounds to single precision.
 ;;   :longs :ints :bytes :objects
 ;;             the kind's own backing (fxvector/bytevector/vector) read direct, but
 ;;             no result type (it can widen past a fixnum) and no jolt-nth walk.
 (defn- tag->akind [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
-    (cond (= s "doubles") :doubles (= s "floats") :doubles
+    (cond (= s "doubles") :doubles (= s "floats") :floats
           (= s "longs") :longs (= s "ints") :ints
           (= s "bytes") :bytes (= s "objects") :objects
           :else nil)))

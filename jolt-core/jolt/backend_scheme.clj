@@ -1175,7 +1175,7 @@
              " (jolt->fl " t ")))"))
       ;; a :float operand of a :double op: a float cast already emitted its
       ;; double (the :coerce arm); anything else of the kind holds a jfloat
-      (and (:fl-unbox node) (not (= :coerce (:op node))))
+      (and (:fl-unbox node) (not (= :coerce (:op node))) (not (:fl-float node)))
       (str "(jfloat-unbox " s ")")
       :else s)))
 
@@ -2168,7 +2168,7 @@
         ;; it — and every proven aget/aset on that param indexes it directly
         ;; (*array-vecs*). The params themselves shadow any outer hoist.
         ah (into {} (:ahints a))
-        avecs (into {} (keep (fn [o] (when (= :doubles (get ah o))
+        avecs (into {} (keep (fn [o] (when (contains? #{:doubles :floats} (get ah o))
                                        [(munge-name o) (fresh-label "_av$")]))
                              orig))
         av (merge (apply dissoc *array-vecs* (concat params (when restp [restp]))) avecs)
@@ -3216,29 +3216,36 @@
       ;; check is the bounds contract on the hot path (a pre-check regresses ~11%).
       ;; A ^doubles PARAM (the local is in *array-vecs*) reads the flvector its
       ;; arity bound at entry; any other proven array re-reads the accessor.
+      ;; A ^floats read (:fl-float) is the Float unless an fl op takes it
+      ;; (:fl-unbox), which reads the double it holds and allocates nothing.
       (:fl-aget node)
       (let [an (first arg-nodes)
             hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
         (order-args
          (fn [as]
-           (if (:fl-idx-long node)
-             (str "(flvector-ref " (or hv (str "(jolt-array-vec " (first as) ")")) " " (second as) ")")
-             (str "(jolt-flaget " (str/join " " as) ")")))))
+           (let [r (if (:fl-idx-long node)
+                     (str "(flvector-ref " (or hv (str "(jolt-array-vec " (first as) ")")) " " (second as) ")")
+                     (str "(jolt-flaget " (str/join " " as) ")"))]
+             (if (and (:fl-float node) (not (:fl-unbox node))) (str "(make-jfloat " r ")") r)))))
       ;; (aset ^doubles a i v): proven index AND :double value (:fl-idx-long +
       ;; :fl-val-double) store inline — (let ((v V)) (flvector-set! (jolt-array-vec A)
       ;; I v) v) — and return the stored value (JVM contract; the let evaluates V once).
       ;; Otherwise keep (jolt-flaset A I V), which owns exact->inexact for a non-double.
+      ;; ^floats (:fl-float) rounds the value to single precision as it stores it,
+      ;; and answers the Float unless an fl op takes the result (:fl-unbox).
       (:fl-aset node)
       (let [an (first arg-nodes)
-            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
+            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))
+            fl? (:fl-float node)]
         (order-args
          (fn [as]
-           (if (and (:fl-idx-long node) (:fl-val-double node))
-             (let [v (fresh-label "_v$")]
-               (str "(let ((" v " " (nth as 2) ")) (flvector-set! "
-                    (or hv (str "(jolt-array-vec " (first as) ")"))
-                    " " (second as) " " v ") " v ")"))
-             (str "(jolt-flaset " (str/join " " as) ")")))))
+           (let [r (if (and (:fl-idx-long node) (:fl-val-double node))
+                     (let [v (fresh-label "_v$")]
+                       (str "(let ((" v " " (if fl? (str "(flsingle " (nth as 2) ")") (nth as 2)) ")) (flvector-set! "
+                            (or hv (str "(jolt-array-vec " (first as) ")"))
+                            " " (second as) " " v ") " v ")"))
+                     (str "(" (if fl? "jolt-flaset-float" "jolt-flaset") " " (str/join " " as) ")"))]
+             (if (and fl? (not (:fl-unbox node))) (str "(make-jfloat " r ")") r)))))
       ;; (aget ^longs/^ints/^bytes/^objects a i) and its aset twin. A boxed backing
       ;; cannot unbox, so there is no inline form and no hoisted vector — the win is
       ;; skipping jolt-nth's dispatch walk, which the call already gets.
