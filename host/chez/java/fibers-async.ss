@@ -402,6 +402,8 @@
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"
   (lambda (fib throwable) (if (jolt-fiber-interrupt! fib throwable) #t #f)))
+(def-var! "jolt.host" "fiber-kill!"
+  (lambda (fib throwable) (if (jolt-fiber-kill! fib throwable) #t #f)))
 (def-var! "jolt.host" "fiber-masked" (lambda (f) (jolt-fiber-masked (lambda () (jolt-invoke f)))))
 (def-var! "jolt.host" "fiber-unmasked" (lambda (f) (jolt-fiber-unmasked (lambda () (jolt-invoke f)))))
 ;; Unguarded full collect for the R8 gate: System/gc swallows Chez's

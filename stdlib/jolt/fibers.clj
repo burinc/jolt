@@ -21,6 +21,9 @@
 ;;     monitor! receives it, (state f) answers :dead.
 ;;   - preemption is always on (a compute-bound body cannot starve its
 ;;     carrier); the quantum is set-preempt-ticks!, floored, never zero.
+;;   - kill! is interrupt! that no catch can swallow: the fiber escapes to the
+;;     edge of its outermost unmasked region, or its entry, running only its
+;;     finally blocks on the way.
 ;;   - interrupt! makes another fiber raise a throwable wherever it is: at its
 ;;     next park, yield or preemption, or at once if it is parked. That is an
 ;;     asynchronous exception, a different thing from Thread.interrupt, which
@@ -70,6 +73,18 @@
   Returns true, or false when fib had already finished."
   [fib throwable]
   (jolt.host/fiber-interrupt! fib throwable))
+
+(defn kill!
+  "Make fib die of throwable as an Erlang process dies of kill: delivered as
+  interrupt! is, but no try/catch of fib's can catch it. At its safe point fib
+  escapes -- its finally blocks run, its catch clauses do not -- to its
+  outermost unmasked region, where the throwable is raised in the masked code
+  around it (the cleanup of the masked/unmasked shape), or, outside any, to its
+  entry, and fib dies with it. A masked region defers it as it defers an
+  interrupt. A later interrupt! does not replace a pending kill. Returns true,
+  or false when fib had already finished."
+  [fib throwable]
+  (jolt.host/fiber-kill! fib throwable))
 
 (defn masked
   "Run (f) with interrupts deferred: an interrupt! arriving meanwhile stays
