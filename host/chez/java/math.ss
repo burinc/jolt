@@ -328,7 +328,81 @@
         (cons (car entry)
               (host-arity-like f (lambda args (apply f (map jolt-need-num args)))))
         entry)))
+;; --- java.lang.Math's float overloads ------------------------------------------
+;; A Float argument picks Math's float overload where there is one, so the answer
+;; is a Float computed at single precision: (Math/ulp (float 2.5)) is the gap to
+;; the next FLOAT, 2.3841858E-7, not the next double. round(float) is an int.
+;; Anything else (a double among the arguments, or a method with no float
+;; overload) keeps the double path in java/math.ss.
+(define flt-min-value 1.401298464324817e-45)
+(define (flt-of-bits b) (jfloat-fl (jolt-int-bits->float b)))
+(define (flt-bits x) (flt->bits x))
+;; the unbiased exponent field of a float's pattern: 128 for Inf/NaN, -127 for
+;; zero and subnormals
+(define (flt-exponent d)
+  (- (bitwise-and (bitwise-arithmetic-shift-right (flt-bits d) 23) #xff) 127))
+(define (flt-next-up d)
+  (let ((d (+ d 0.0)))
+    (cond ((or (nan? d) (= d +inf.0)) d)
+          ((= d 0.0) flt-min-value)
+          ((> d 0.0) (flt-of-bits (+ (flt-bits d) 1)))
+          (else (flt-of-bits (- (flt-bits d) 1))))))
+(define (flt-next-down d)
+  (let ((d (+ d 0.0)))
+    (cond ((or (nan? d) (= d -inf.0)) d)
+          ((= d 0.0) (- flt-min-value))
+          ((> d 0.0) (flt-of-bits (- (flt-bits d) 1)))
+          (else (flt-of-bits (+ (flt-bits d) 1))))))
+(define (flt-ulp d)
+  (let ((e (flt-exponent d)))
+    (cond ((= e 128) (abs d))
+          ((= e -127) flt-min-value)
+          (else (exact->inexact (expt 2 (- e 23)))))))
+(define (flt-result d) (make-jfloat (jolt-unchecked-float->flonum d)))
+(define (math-float-overload name double-impl float-impl)
+  (cons name
+        (lambda (x)
+          (if (jfloat? x) (float-impl (jfloat-fl x)) (double-impl (jolt-need-num x))))))
+(define (math-float-overload2 name double-impl float-impl)
+  (cons name
+        (lambda (x y)
+          (if (jfloat? x) (float-impl (jfloat-fl x) y) (double-impl (jolt-need-num x) (jolt-need-num y))))))
+(define (both-floats name double-impl float-impl)
+  (cons name
+        (lambda (a b)
+          (if (and (jfloat? a) (jfloat? b))
+              (make-jfloat (float-impl (jfloat-fl a) (jfloat-fl b)))
+              (double-impl (jolt-need-num a) (jolt-need-num b))))))
+
+(define math-float-overloads
+  (list
+    (math-float-overload "abs" abs (lambda (d) (make-jfloat (abs d))))
+    (math-float-overload "signum" jolt-math-signum (lambda (d) (make-jfloat (jolt-math-signum d))))
+    (math-float-overload "ulp" jolt-math-ulp (lambda (d) (make-jfloat (flt-ulp d))))
+    (math-float-overload "nextUp" jolt-math-next-up (lambda (d) (make-jfloat (flt-next-up d))))
+    (math-float-overload "nextDown" jolt-math-next-down (lambda (d) (make-jfloat (flt-next-down d))))
+    (math-float-overload "getExponent" jolt-math-get-exponent flt-exponent)
+    ;; Math.round(float): an int, so past the int range it saturates there
+    (math-float-overload "round" jolt-math-round
+      (lambda (d) (max -2147483648 (min 2147483647 (jolt-math-round d)))))
+    ;; nextAfter(float, double) and scalb(float, int): the second argument is
+    ;; whatever it is, the result a float
+    (math-float-overload2 "nextAfter" jolt-math-next-after
+      (lambda (d dir)
+        (let ((dir (jolt-double dir)))
+          (make-jfloat
+            (cond ((> d dir) (flt-next-down d))
+                  ((< d dir) (flt-next-up d))
+                  ((= d dir) (jolt-unchecked-float->flonum dir))
+                  (else (+ d dir)))))))
+    (math-float-overload2 "scalb" jolt-math-scalb
+      (lambda (d n) (flt-result (jolt-math-scalb d n))))
+    (both-floats "max" jolt-math-max jolt-math-max)
+    (both-floats "min" jolt-math-min jolt-math-min)
+    (both-floats "copySign" jolt-math-copy-sign jolt-math-copy-sign)))
+
 (register-class-statics! "Math"
+  (append math-float-overloads
   (map math-checked
   (list (cons "sqrt" (lambda (x) (real-or-nan (sqrt x))))
         ;; cbrt/log10 (and hypot/expm1/log1p below) share the clojure.math impls
@@ -341,12 +415,10 @@
         (cons "hypot" (lambda (a b) (jolt-math-hypot (->dbl a) (->dbl b))))
         (cons "floor" (lambda (x) (->dbl (floor x))))
         (cons "ceil" (lambda (x) (->dbl (ceiling x))))
-        (cons "round" (lambda (x) (jolt-math-round x)))     ; JVM Math.round -> long (NaN/Inf/saturate/half-up)
         (cons "rint" (lambda (x) (->dbl (round x))))            ; round-half-even -> double
         ;; Math.floorDiv/floorMod: integer floor division / modulus (long -> long).
         (cons "floorDiv" (lambda (a b) (exact (floor (/ a b)))))
         (cons "floorMod" (lambda (a b) (exact (- a (* b (floor (/ a b)))))))
-        (cons "abs" (lambda (x) (abs x)))
         (cons "sin" (lambda (x) (->dbl (sin x)))) (cons "cos" (lambda (x) (->dbl (cos x))))
         (cons "tan" (lambda (x) (->dbl (tan x)))) (cons "asin" (lambda (x) (real-or-nan (asin x))))
         (cons "acos" (lambda (x) (real-or-nan (acos x)))) (cons "atan" (lambda (x) (->dbl (atan x))))
@@ -360,16 +432,9 @@
         (cons "expm1" (lambda (x) (jolt-math-expm1 (->dbl x))))
         (cons "toRadians" (lambda (d) (->dbl (/ (* d jolt-math-pi) 180.0))))
         (cons "toDegrees" (lambda (r) (->dbl (/ (* r 180.0) jolt-math-pi))))
-        (cons "copySign" (lambda (m s) (jolt-math-copy-sign m s)))
         ;; the IEEE 754 bit-level ops and the exact long arithmetic, shared with
         ;; clojure.math; test.check's double generator uses
         ;; getExponent and scalb
-        (cons "getExponent" (lambda (x) (jolt-math-get-exponent x)))
-        (cons "scalb" (lambda (x n) (jolt-math-scalb x n)))
-        (cons "nextUp" (lambda (x) (jolt-math-next-up x)))
-        (cons "nextDown" (lambda (x) (jolt-math-next-down x)))
-        (cons "nextAfter" (lambda (s d) (jolt-math-next-after s d)))
-        (cons "ulp" (lambda (x) (jolt-math-ulp x)))
         (cons "IEEEremainder" (lambda (x y) (jolt-math-ieee-remainder x y)))
         (cons "addExact" (lambda (a b) (jolt-math-add-exact a b)))
         (cons "subtractExact" (lambda (a b) (jolt-math-subtract-exact a b)))
@@ -377,10 +442,8 @@
         (cons "incrementExact" (lambda (a) (jolt-math-increment-exact a)))
         (cons "decrementExact" (lambda (a) (jolt-math-decrement-exact a)))
         (cons "negateExact" (lambda (a) (jolt-math-negate-exact a)))
-        (cons "max" (lambda (a b) (jolt-math-max a b))) (cons "min" (lambda (a b) (jolt-math-min a b)))
-        (cons "signum" (lambda (x) (jolt-math-signum x)))
         (cons "PI" jolt-math-pi) (cons "E" jolt-math-e)
-        (cons "random" (lambda args (jolt-random 1.0))))))
+        (cons "random" (lambda args (jolt-random 1.0)))))))
 
 ;; ---- Double / Float bit casts -----------------------------------------------
 ;; Over the bit patterns above, as the JVM's signed long/int. doubleToLongBits
