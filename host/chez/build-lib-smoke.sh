@@ -168,4 +168,33 @@ case "$(uname -s)" in
     fi ;;
 esac
 
+# A host that handles its own faults (a .NET or Java runtime does) keeps them
+# after init, after jolt_library_shutdown and after a second init only with a
+# Chez that passes a fault on a thread not running Scheme code to the handler
+# installed before its own, and gives the signals back at deinit; an older Chez
+# aborts the host with "invalid memory reference". Reported here; JOLT_EXPECT_HOST_FAULTS=1
+# makes it a failure, for a Chez known to have the fix.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "build-lib smoke: host fault handling skipped (POSIX signals driver)" ;;
+  *)
+    echo "build-lib smoke: a host's own fault after init goes to the host's handler"
+    if ! cc -O0 "$app/driver-signals.c" -ldl -o "$work/driver-signals" 2>"$work/driver-signals.err"; then
+      echo "  FAIL: signals driver compile failed"; cat "$work/driver-signals.err"; exit 1
+    fi
+    got="$("$work/driver-signals" "$lib" 2>&1)"; rc=$?
+    before="$(printf '%s\n' "$got" | sed -n 's/^before load: //p')"
+    kept=1
+    for stage in "after load" "after shutdown" "after reinit"; do
+      printf '%s\n' "$got" | grep -qx "$stage: $before" || kept=
+    done
+    if [ "$rc" = "0" ] && [ -n "$before" ] && [ -n "$kept" ]; then
+      echo "  host fault handling: kept"
+    elif [ -n "${JOLT_EXPECT_HOST_FAULTS:-}" ]; then
+      echo "  FAIL: host fault handling, want the host's handler after init, shutdown and a second init, got rc $rc:"; printf '%s\n' "$got"; exit 1
+    else
+      echo "  host fault handling: lost (this Chez aborts on a host's own fault; rc $rc)"
+    fi ;;
+esac
+
 echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 + gzip_ok()=1 via dlopen+jolt_lookup, code churn, and a released init thread)"

@@ -677,6 +677,16 @@ through `:collect-safe` exports from then on. The same
 `--opt`/`--dev`/`--direct-link`/`--closed-world` flags apply, and the same Chez
 kernel development files + C compiler are required to link.
 
+Chez Scheme installs process-wide handlers for SIGSEGV, SIGBUS, SIGFPE and
+SIGILL when the library initialises. A host that handles those signals itself
+(a .NET or Java runtime does, to turn a null dereference in its own code into an
+exception) loses them: after `jolt_library_init`, such a fault in host code
+reaches Chez's handler, which reports `invalid memory reference` and aborts the
+process. A Chez that passes a fault on a thread not running Scheme code to the
+handler installed before its own, and gives the signals back at
+`jolt_library_shutdown`, fixes this; `host/chez/build-lib-smoke.sh` reports
+which kind it linked.
+
 ## Documentation
 
 Full documentation is at **[jolt-lang.github.io](https://jolt-lang.github.io)** —
