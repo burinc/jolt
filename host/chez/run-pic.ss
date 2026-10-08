@@ -106,7 +106,6 @@
                     (iota (jolt-count (var-deref "user" "tag-xs")))))
            (bad 0)
            (m (make-mutex))
-           (done (make-condition))
            (left 8))
       (define (work)
         (let loop ((n 0) (wrong 0))
@@ -122,11 +121,13 @@
         (fork-thread
          (lambda ()
            (let ((w (work)))
-             (with-mutex m
+             (jolt-with-mutex m
                (set! bad (fx+ bad w))
-               (set! left (fx- left 1))
-               (condition-signal done))))))
-      (with-mutex m (let wait () (unless (fx= left 0) (condition-wait done m) (wait))))
+               (set! left (fx- left 1)))))))
+      (let wait ()
+        (unless (fx= 0 (jolt-with-mutex m left))
+          (sleep (make-time 'time-duration 1000000 0))
+          (wait)))
       (gate-check "PIC shared by 8 threads over 8 types: no wrong impl" bad 0))))
 
 ;; a monomorphic site (the inference proved one receiver type) keeps the devirt
