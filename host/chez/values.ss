@@ -14,6 +14,19 @@
 
 ;; --- nil ---------------------------------------------------------------------
 (define-record-type jolt-nil-t (fields) (nongenerative jolt-nil-v1))
+
+;; A java.lang.Float. Chez has one flonum, but a Float is not a Double: it
+;; prints Float.toString's digits ((float 0.1) is 0.1, its double value
+;; 0.10000000149011612), classes as java.lang.Float and hashes as
+;; Float.hashCode. So a float is a value of its own holding the single-precision
+;; value as a flonum, and arithmetic widens it to a double as the JVM does:
+;; converters.ss makes one, float.ss registers it with the numeric tower, the
+;; printer, = and hash. Defined here, ahead of every file whose numeric helpers
+;; take one, because record ops are open-coded and none may name it earlier.
+(define-record-type jfloat (fields fl) (nongenerative chez-jfloat-v1))
+;; A Float as the double it widens to; anything else unchanged.
+(define (jfloat-unbox x) (if (jfloat? x) (jfloat-fl x) x))
+
 ;; Has a second OS thread ever been started? #f until the first fork-thread
 ;; (lazy-bridge.ss shadows it to flip this), never #f again. The lock-free
 ;; paths that are only unsafe under real concurrency — a lazy node's first

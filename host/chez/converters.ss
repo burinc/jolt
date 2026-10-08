@@ -271,16 +271,6 @@
                  (string-append (if (string? p) p (jolt-str-render-one p))
                                 (number->string n)))))
 
-;; A java.lang.Float. Chez has one flonum, but a Float is not a Double: it
-;; prints Float.toString's digits ((float 0.1) is 0.1, its double value
-;; 0.10000000149011612), classes as java.lang.Float and hashes as
-;; Float.hashCode. So a float is a value of its own holding the single-precision
-;; value as a flonum, and arithmetic widens it to a double as the JVM does
-;; (float.ss registers it with the numeric tower, the printer, = and hash).
-(define-record-type jfloat (fields fl) (nongenerative chez-jfloat-v1))
-;; A Float as the double it widens to; anything else unchanged.
-(define (jfloat-unbox x) (if (jfloat? x) (jfloat-fl x) x))
-
 ;; a numeric type outside Chez's tower converts through this hook (bigdec).
 (define (jolt-double-slow x) (jolt-num-cast-throw x))
 (define (jolt-double x)
