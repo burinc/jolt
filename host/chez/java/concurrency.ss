@@ -1901,6 +1901,7 @@
   ;; real exit — the borrow would hand the carrier its own handler a second time
   ;; and lose whatever an enclosing borrow had installed.
   (let* ((prev-handler (timer-interrupt-handler))
+         (outer-bindings (dyn-binding-stack))
          ;; Captured once, like prev-handler. On a real off-fiber exit from a
          ;; nested borrow the restored outer handler needs a fresh poll tick.
          (owner (get-thread-id))
@@ -1934,8 +1935,15 @@
                          interrupt-check-ticks)))
               (set! armed n)
               (set-timer n))))
+         ;; This wind's own edges are masked (jolt-wind*, locks.ss). A deferred
+         ;; interrupt re-arms a short retry, and when the body returned normally
+         ;; that retry could land at this after-thunk's entry, the winder already
+         ;; popped: the escape then left this handler installed and armed, and the
+         ;; next tick jumped back into an extent that had already returned.
+         (lv (jolt-locks-held))
          (r (call/cc
               (lambda (k)
+                (jolt-locks-enter!)
                 (dynamic-wind
                   (lambda ()
                     (set! borrowed 0)
@@ -1986,7 +1994,7 @@
                       (interrupt-poll-stack (cons owner (cons handler outer-stack)))
                       (timer-interrupt-handler handler)
                       (arm!)))
-                  (lambda () (thunk))
+                  (jolt-masked-body thunk)
                   ;; Runs on every way out of the body, the park included. Disarm
                   ;; BEFORE restoring the handler: the other order leaves a window
                   ;; where the borrowed tick can fall due on the scheduler's
@@ -2007,9 +2015,16 @@
                     (cond
                       ((jolt-current-fiber) (jolt-fiber-rearm-preempt!))
                       ((pair? outer-stack) (set-timer interrupt-check-ticks))
-                      (else (jolt-fiber-rearm-preempt!)))))))))
+                      (else (jolt-fiber-rearm-preempt!)))
+                    (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))))
     (if (eq? r interrupt-sentinel)
-        (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t)))
+        (begin
+          ;; The bindings the interrupted body left. Its winds are masked at their
+          ;; edges, but a `binding` pops in a user finally, and the escape can land
+          ;; in that finally's code before the pop. Everything inside the extent was
+          ;; abandoned, so the stack goes back to what it was on the way in.
+          (dyn-binding-stack outer-bindings)
+          (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t))))
         r)))
 (def-var! "jolt.host" "make-interrupt" jolt-make-interrupt)
 (def-var! "jolt.host" "interrupt!" jolt-interrupt!)

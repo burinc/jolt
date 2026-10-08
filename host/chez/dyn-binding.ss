@@ -74,13 +74,13 @@
 ;; Absolute, not relative, for the same reason parameterize is written that way:
 ;; a relative edit is only correct if the stack is exactly as deep as it was, and
 ;; an escape is precisely when it is not.
+;;
+;; Masked at both edges (jolt-wind*, host/chez/locks.ss): an interrupt's escape
+;; between the push and the wind left the frame on the stack, and one between the
+;; thunk's return and the after-thunk left it there too.
 (define (dyn-with-frame pairs thunk)
   (let ((outer (dyn-binding-stack)))
-    (dyn-push-frame! pairs)
-    (dynamic-wind
-      (lambda () #f)
-      thunk
-      (lambda () (dyn-binding-stack outer)))))
+    (jolt-wind* (lambda () #f) (dyn-push-frame! pairs) thunk (dyn-binding-stack outer))))
 
 ;; --- reading a var -----------------------------------------------------------
 ;; THE GATE, and why every read below opens with it.

@@ -426,7 +426,12 @@
         (cond
           ((not (force-pending? (get-tail cell))) (body))
           ((not c)
-           (let ((claim (cons force-claim-token me)))
+           ;; Masked from before the claim until the wind holds it, and from the
+           ;; body's return until it is released (jolt-wind*, locks.ss): an
+           ;; interrupt's escape in either gap left the claim held, and every
+           ;; other forcer of the cell waited on it for good.
+           (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
+             (jolt-locks-enter!)
              (if (sa-record-cas! cell L #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire
                  ;; makes every store the previous holder released visible to this
@@ -438,9 +443,9 @@
                    (memory-order-acquire)
                    (dynamic-wind
                      jolt-finally-in
-                     body
-                     (lambda () (memory-order-release) (sa-record-cas! cell L claim #f))))
-                 (retry spins))))
+                     (jolt-masked-body body)
+                     (jolt-masked-after lv (memory-order-release) (sa-record-cas! cell L claim #f))))
+                 (begin (jolt-locks-exit!) (retry spins)))))
           ((and (pair? c) (eq? (car c) force-claim-token))
            (if (eqv? (cdr c) me)
                (body)                                   ; this owner's own claim: recursion
@@ -523,20 +528,26 @@
           ((jolt-lazyseq? w) (force-lazyseq w))
           ((not w) (let ((r (cseq-cvec-more s #t))) (cseq-publish-tail! s r) r))
           (else
+           ;; Masked from before the claim until the wind holds it (jolt-wind*,
+           ;; locks.ss): an escape between the two left the cell claimed by an
+           ;; owner that would never publish. The body publishes before it
+           ;; returns, so the far edge needs nothing.
            (let ((claim (make-tail-claim w me force-claim-token)))
+             (jolt-locks-enter!)
              (if (sa-record-cas! s cseq-tail-index w claim)
                  (let ((done #f))
                    (memory-order-acquire)
                    (dynamic-wind
                      jolt-finally-in
                      (lambda ()
+                       (jolt-locks-exit!)
                        (let ((r (cseq-run-tail w)))
                          (memory-order-release)
                          (sa-record-cas! s cseq-tail-index claim r)
                          (set! done #t)
                          r))
                      (lambda () (unless done (sa-record-cas! s cseq-tail-index claim w)))))
-                 (retry spins)))))))))
+                 (begin (jolt-locks-exit!) (retry spins))))))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil; the empty-list-t
 ;; record (one field, its metadata) is defined in values.ss. A metadata-bearing

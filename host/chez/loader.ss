@@ -1758,10 +1758,11 @@
 (define (aot-call-with-readers-batch thunk)
   (if (jolt-with-mutex ldr-tbl-mu (hashtable-contains? aot-open-compiles aot-readers-batch-key))
       (thunk)
-      (dynamic-wind
+      (jolt-wind*
         (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles aot-readers-batch-key '())))
+        #f
         (lambda () (thunk) (aot-settle! aot-readers-batch-key))
-        (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles aot-readers-batch-key))))))
+        (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles aot-readers-batch-key)))))
 ;; KEY's compile (or the batch) has settled: close it and publish what waited on
 ;; it. Each goes back through aot-publish-when-readers-settle!, since another
 ;; settle point may still be open above this one.
@@ -1813,8 +1814,9 @@
         (stamps (vector file '())))
     ;; open until the sidecars are written; an unwind drops whatever was queued
     ;; on it, which then only misses next run
-    (dynamic-wind
+    (jolt-wind*
       (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-open-compiles name '())))
+      #f
       (lambda ()
         (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink)
                                        (jolt-def-ordinal-sink stamps))
@@ -1830,7 +1832,7 @@
           ;; with or without sidecars this namespace's digest is final now, so
           ;; what waited on it goes ahead either way
           (aot-settle! name)))
-      (lambda () (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles name))))))
+      (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-open-compiles name)))))
 ;; Everything a later run reads back BEFORE it can compute the full key: the
 ;; sidecars are named by the own hash alone.
 (define (aot-write-sidecars! name own obase deps res)
@@ -2692,7 +2694,12 @@
                (or (ldr-wait-for-load! name deadline) (loop)))
               ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
                (ldr-decided! me 'loaded))                     ; step 4
-              (else (hashtable-set! ldr-loading name me)      ; step 6
+              ;; step 6. Masked from the claim on (jolt-wind*, locks.ss), and
+              ;; load-namespace* drops it once its wind holds the claim: an
+              ;; interrupt's escape in between left the claim standing and every
+              ;; later require of the namespace waiting on it.
+              (else (hashtable-set! ldr-loading name me)
+                    (jolt-locks-enter!)
                     (ldr-decided! me 'claimed)))))))))
 
 ;; Step 11: drop the claim and wake everyone waiting on this namespace. Broadcast
@@ -2757,7 +2764,8 @@
     ;; read AFTER claiming, not before: while this thread was waiting in step 2
     ;; another may have loaded the namespace and then had its own load fail, and
     ;; a stale #t here would make the guard below skip the rollback.
-    (let ((was-loaded? (ns-dedup-loaded? name))
+    (let ((lv (fx- (jolt-locks-held) 1))
+          (was-loaded? (ns-dedup-loaded? name))
           (finished? #f))
       ;; step 11/12: drop the claim and wake the waiters on EVERY exit. dynamic-wind
       ;; and not a guard: a guard only sees a raise, and any other way out of the
@@ -2799,14 +2807,20 @@
       ;;
       ;; The load's jar reads share one reader per archive (zip-file.ss
       ;; call-with-zipdir-read-scope); a nested load joins the outer one's scope.
+      ;;
+      ;; ldr-begin-load! returned masked; the wind drops the mask as the body
+      ;; starts and holds it again from the body's return through the release
+      ;; (jolt-wind*, locks.ss), so no escape lands with the claim unowned by a
+      ;; winder. lv is the depth before ldr-begin-load! raised it.
       (dynamic-wind
         (lambda () (ldr-assert-claim! name))
-        (lambda ()
-          (call-with-zipdir-read-scope
-            (lambda ()
-              (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
-          (set! finished? #t))
-        (lambda ()
+        (jolt-masked-body
+          (lambda ()
+            (call-with-zipdir-read-scope
+              (lambda ()
+                (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
+            (set! finished? #t)))
+        (jolt-masked-cleanup lv
           (unless (jolt-park-unwinding?)
             (unless (or finished? was-loaded?) (ldr-unmark-loaded! name))
             (ldr-end-load! name)))))))
@@ -2831,8 +2845,11 @@
          ;; that used to reach it — a load leaving *ns* pointing at the file it was
          ;; part way through is the kind of damage that surfaces three forms later
          ;; somewhere else, so it happens however the body exits.
-         (dynamic-wind
+         ;; Masked at its edges (jolt-wind*, locks.ss), so an interrupt cannot
+         ;; skip the restore.
+         (jolt-wind*
            (lambda () #f)
+           #f
            (lambda ()
              (guard (e (else
                          (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
@@ -2845,7 +2862,7 @@
                  ((cpath-compiling-dir file)
                   => (lambda (dir) (cpath-compile-load name file dir)))
                  (else (aot-load-or-compile name file force?)))))
-           (lambda () (set-chez-ns! saved)))   ; the current ns is thread-local
+           (set-chez-ns! saved))   ; the current ns is thread-local
          ;; the hook feeds `jolt build`, which needs the SOURCE path; an
          ;; artifact-only namespace has none to give.
          (ns-loaded-hook name (or file art))))
@@ -2879,10 +2896,7 @@
 ;; duration, so an `ns` form in the loaded file never leaks into the caller.
 (define (load-jolt-file/restoring-ns path)
   (let ((saved (chez-current-ns)))
-    (dynamic-wind
-      (lambda () #f)
-      (lambda () (load-jolt-file path))
-      (lambda () (set-chez-ns! saved)))))
+    (jolt-wind* (lambda () #f) #f (lambda () (load-jolt-file path)) (set-chez-ns! saved))))
 
 ;; load-file: load an explicit path, in the current ns.
 (define (jolt-load-file path)

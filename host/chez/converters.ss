@@ -70,11 +70,14 @@
 ;; non-readable rendering into every later pr in this thread if the renderer
 ;; throws.
 (define (jolt-print-one v)
-  (let ((prev (virtual-register jolt-vreg-print-readably)))
+  ;; masked at its far edge (locks.ss), so an interrupt cannot leave the thread
+  ;; printing non-readably. The restore is a store, so the plain after-thunk.
+  (let ((prev (virtual-register jolt-vreg-print-readably)) (lv (jolt-locks-held)))
+    (jolt-locks-enter!)
     (dynamic-wind
       (lambda () (set-virtual-register! jolt-vreg-print-readably #f))
-      (lambda () (jolt-pr-readable v))
-      (lambda () (set-virtual-register! jolt-vreg-print-readably prev)))))
+      (jolt-masked-body (lambda () (jolt-pr-readable v)))
+      (jolt-masked-after lv (set-virtual-register! jolt-vreg-print-readably prev)))))
 (def-var! "clojure.core" "__print1" jolt-print-one)
 
 ;; str: a top-level string/scalar renders as jolt-str-render-one (raw string,

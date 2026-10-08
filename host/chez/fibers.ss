@@ -1126,16 +1126,21 @@
   (let ((f (jolt-current-fiber)))
     (if (not f)
         (thunk)
-        (let ((entered #f))
+        ;; The wind's own edges are masked against an escape (jolt-wind*,
+        ;; locks.ss); the counted-lock mask is dropped before the pending
+        ;; interrupt is raised, which would otherwise leave it held.
+        (let ((entered #f) (lv (jolt-locks-held)))
+          (jolt-locks-enter!)
           (dynamic-wind
             (lambda ()
               (unless entered
                 (set! entered #t)
                 (jolt-fiber-mask-set! f (fx+ 1 (jolt-fiber-mask f)))))
-            thunk
+            (jolt-masked-body thunk)
             (lambda ()
               (unless (jolt-park-unwinding?)
                 (jolt-fiber-mask-set! f (fx- (jolt-fiber-mask f) 1))
+                (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))
                 ;; leaving the outermost masked region: a pending interrupt lands
                 (when (fx=? 0 (jolt-fiber-mask f))
                   (jolt-fiber-check-interrupt! f)))))))))
@@ -1144,17 +1149,19 @@
   (let ((f (jolt-current-fiber)))
     (if (not f)
         (thunk)
-        (let ((saved #f))
+        (let ((saved #f) (lv (jolt-locks-held)))
+          (jolt-locks-enter!)
           (dynamic-wind
             (lambda ()
               (unless saved
                 (set! saved (jolt-fiber-mask f))
                 (jolt-fiber-mask-set! f 0)))
-            (lambda ()
-              ;; an interrupt that waited for the mask to open lands at once
-              (jolt-fiber-check-interrupt! f)
-              (thunk))
-            (lambda ()
+            (jolt-masked-body
+              (lambda ()
+                ;; an interrupt that waited for the mask to open lands at once
+                (jolt-fiber-check-interrupt! f)
+                (thunk)))
+            (jolt-masked-after lv
               (unless (jolt-park-unwinding?)
                 (jolt-fiber-mask-set! f saved))))))))
 
