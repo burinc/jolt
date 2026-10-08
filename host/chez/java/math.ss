@@ -19,12 +19,42 @@
 (define jolt-math-pi 3.141592653589793)
 (define jolt-math-e 2.718281828459045)
 
+;; Math.cbrt is fdlibm's cbrt (the JDK's FdLibm.Cbrt), ported over the high
+;; word of the double so every host answers the JVM's digits. The host libm's
+;; pow does not: bionic's pow(2.5, 1/3) lands one ulp from glibc's and the
+;; JVM's, and with 1/3 already rounded a tiny input drifts further. fdlibm is
+;; itself not always correctly rounded (cbrt 2.5 is one ulp low), and that is
+;; the answer the JVM gives.
+(define (cbrt-with-hi x h)                          ; the subnormal path keeps the low word
+  (sa-bits->flonum (+ (* h 4294967296) (bitwise-and (sa-flonum->bits x) #xffffffff))))
 (define (jolt-math-cbrt x)
-  ;; sign-aware so negative inputs stay real (expt of a negative flonum to a
-  ;; fractional power goes complex).
-  (if (< x 0.0)
-      (- (expt (- x) (/ 1.0 3.0)))
-      (expt x (/ 1.0 3.0))))
+  (let* ((x (exact->inexact x))
+         (hx0 (sa-flonum-hi32 x))
+         (sign (bitwise-and hx0 #x80000000))
+         (hx (bitwise-xor hx0 sign)))
+    (cond
+      ((>= hx #x7ff00000) (fl+ x x))                       ; NaN, Inf
+      ((fl= x 0.0) x)                                     ; +-0
+      (else
+       (let* ((x (flabs x))
+              (t (if (< hx #x00100000)                      ; subnormal
+                     (let ((t (fl* 18014398509481984.0 x))) ; 2^54
+                       (cbrt-with-hi t (+ (quotient (sa-flonum-hi32 t) 3) 696219795)))
+                     (sa-hi32->flonum (+ (quotient hx 3) 715094163))))
+              (r (fl/ (fl* t t) x))
+              (s (fl+ 5.42857142857142815906e-01 (fl* r t)))
+              (t (fl* t (fl+ 3.57142857142857150787e-01
+                             (fl/ 1.60714285714285720630e+00
+                                  (fl+ s 1.41428571428571436819e+00
+                                       (fl/ -7.05306122448979611050e-01 s))))))
+              ;; chop t to 20 bits and make it larger than cbrt(x)
+              (t (sa-hi32->flonum (+ (sa-flonum-hi32 t) 1)))
+              (s (fl* t t))
+              (r (fl/ x s))
+              (w (fl+ t t))
+              (r (fl/ (fl- r t) (fl+ w r)))
+              (t (fl+ t (fl* t r))))
+         (if (= sign 0) t (fl- t)))))))
 
 ;; java.lang.Math.round(double) -> long: NaN->0, +Inf->Long/MAX_VALUE, -Inf->
 ;; Long/MIN_VALUE, out-of-long-range saturates, and the greatest double below 0.5
@@ -106,11 +136,10 @@
 ;; --- IEEE 754 bit-level ops ---------------------------------------------------
 ;; The JDK defines copySign/nextUp/nextDown/nextAfter/ulp/getExponent on the raw
 ;; bit pattern, so -0.0 keeps its sign and a step is exactly one representable
-;; double. The pattern is computed here in exact arithmetic, R7RS only, so this
-;; file is the same on every host: an unsigned 64-bit integer, sign bit on top,
-;; 11 exponent bits, 52 mantissa bits. For a negative double a larger pattern is
-;; a larger magnitude. A NaN reads as the JVM's canonical one (sign clear): the
-;; sign of a NaN is not observable without a host bit cast.
+;; double. The pattern comes from the host (sa-flonum->bits): an unsigned 64-bit
+;; integer, sign bit on top, 11 exponent bits, 52 mantissa bits. For a negative
+;; double a larger pattern is a larger magnitude. A NaN reads as the JVM's
+;; canonical one, as doubleToLongBits answers it.
 (define dbl-sign-bit (expt 2 63))
 (define dbl-mant-unit (expt 2 52))
 (define dbl-min-value 4.9406564584124654e-324)
@@ -123,23 +152,10 @@
           (else e))))
 (define (dbl->bits x)
   (let ((x (exact->inexact x)))
-    (+ (if (dbl-negative? x) dbl-sign-bit 0)
-       (cond ((nan? x) (+ (* 2047 dbl-mant-unit) (expt 2 51)))
-             ((infinite? x) (* 2047 dbl-mant-unit))
-             ((= x 0.0) 0)
-             (else
-              (let* ((m (exact (abs x))) (e (dbl-binary-exponent m)))
-                (if (>= e -1022)
-                    (+ (* (+ e 1023) dbl-mant-unit) (- (* m (expt 2 (- 52 e))) dbl-mant-unit))
-                    (* m (expt 2 1074)))))))))          ; subnormal
-(define (bits->dbl b)
-  (let* ((r (bitwise-and b #x7fffffffffffffff))
-         (field (bitwise-arithmetic-shift-right r 52))
-         (mant (bitwise-and r #xfffffffffffff))
-         (mag (cond ((= field 2047) (if (= mant 0) +inf.0 +nan.0))
-                    ((= field 0) (exact->inexact (* mant (expt 2 -1074))))
-                    (else (exact->inexact (* (+ dbl-mant-unit mant) (expt 2 (- field 1075))))))))
-    (if (>= b dbl-sign-bit) (- mag) mag)))
+    (if (nan? x)
+        (+ (* 2047 dbl-mant-unit) (expt 2 51))
+        (sa-flonum->bits x))))
+(define (bits->dbl b) (sa-bits->flonum b))
 
 (define (jolt-math-copy-sign m s)
   (let* ((m (exact->inexact (jolt-need-num m)))

@@ -395,6 +395,17 @@ vector-copy
 hashtable-values
 hashtable-cells
 scheme-version
+# sa-flonum->bits / sa-bits->flonum (added for java.lang.Math): a flonum's IEEE
+# 754 binary64 pattern as an unsigned 64-bit integer, and back. Every bit is
+# kept, a NaN's payload and sign included. Math's bit-level ops read and build
+# doubles through them. sa-flonum-hi32 is the pattern's upper 32 bits (a fixnum
+# on any 64-bit host, where the full pattern is often a bignum) and
+# sa-hi32->flonum the double with those upper bits and zero lower ones: fdlibm's
+# cbrt works on the high word.
+sa-flonum->bits
+sa-bits->flonum
+sa-flonum-hi32
+sa-hi32->flonum
 #
 # tier: coroutines
 # Stackful green threads sharing one OS thread (the carrier) — the fibers
