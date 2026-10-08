@@ -2557,6 +2557,7 @@
 ;; extensions sit over every prior shim.
 (load "host/chez/java/io.ss")
 (load "host/chez/java/nio-file.ss")             ; java.nio.file: Path / Paths / PathMatcher
+(load "host/chez/terminal.ss")                  ; the console under the REPL line editor
 
 ;; #inst values + the java.util/java.text date layer: jinst (RFC3339 ms), Date,
 ;; sql.Date/Timestamp, Calendar, TimeZone, SimpleDateFormat. Loads LAST — it

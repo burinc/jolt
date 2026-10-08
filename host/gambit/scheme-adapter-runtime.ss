@@ -627,6 +627,26 @@
           (begin (jolt-fiber-run f) (loop))
           #f))))
 
+;; ---- terminal tier (capability: terminal) -----------------------------------
+;; No terminal on this target, the contract's permitted degradation: the
+;; terminal is never claimed, and the REPL reads lines as it does from a pipe.
+(define (sa-term-open) #f)
+(define (sa-term-closed . _) (error "sa-term: no terminal on this target"))
+(define sa-term-raw! sa-term-closed)
+(define sa-term-cooked! sa-term-closed)
+(define sa-term-read-char sa-term-closed)
+(define sa-term-size sa-term-closed)
+(define sa-term-write-char sa-term-closed)
+(define sa-term-char-width sa-term-closed)
+(define sa-term-flush sa-term-closed)
+(define sa-term-move! sa-term-closed)
+(define sa-term-clear! sa-term-closed)
+(define sa-term-cr! sa-term-closed)
+(define sa-term-lf! sa-term-closed)
+(define sa-term-bell! sa-term-closed)
+(define sa-term-pause! sa-term-closed)
+(define sa-term-color! sa-term-closed)
+
 ;; --- capability-unchecked ---------------------------------------------------
 ;; The unchecked fixnum / vector primitives (CONTRACT.txt): this target expands
 ;; them to the checked primitives — the permitted degradation.

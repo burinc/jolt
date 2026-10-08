@@ -429,3 +429,45 @@ sa-fiber-spawn
 sa-fiber-yield
 sa-fiber-resume
 sa-fiber-run-all
+#
+# tier: capability-terminal
+# The console under the interactive REPL's line editor (jolt.line-editor),
+# defined in host/chez/scheme-adapter-runtime.ss over the kernel's expression
+# editor entries. Every name but sa-term-open needs the terminal claimed first.
+# Shapes:
+#   (sa-term-open) -> bool: claim stdin/stdout as a terminal the editor can
+#     drive; #f when either is not a terminal or the terminal cannot move the
+#     cursor (TERM=dumb). Idempotent.
+#   (sa-term-raw!) / (sa-term-cooked!) -> void: enter / leave raw mode: no
+#     echo, no line buffering, no signal keys (^C and ^Z arrive as chars), and
+#     no output post-processing, so a newline is written as sa-term-cr! plus
+#     sa-term-lf!.
+#   (sa-term-read-char) -> char | eof object | 'resize: block for one char;
+#     special keys arrive as their ANSI escape sequences on every target.
+#   (sa-term-size) -> (rows . cols)
+#   (sa-term-write-char c) / (sa-term-char-width c): write one char; the
+#     columns a char occupies (0 for combining, 2 for wide).
+#   (sa-term-flush) -> void: make written output visible.
+#   (sa-term-move! dir n): dir one of up down left right; n <= 0 is a no-op.
+#   (sa-term-clear! what): what one of eol eos screen.
+#   (sa-term-cr!) (sa-term-lf!) (sa-term-bell!) (sa-term-pause!): column 0;
+#     down a line, scrolling at the bottom; the bell; suspend the process (^Z).
+#   (sa-term-color! id background?): -1 resets, 0-7 the base colors, 8-15
+#     their bright forms.
+# Permitted degradation: no terminal. sa-term-open answers #f and the rest
+# raise; the REPL then reads lines as it does from a pipe. Gambit does this.
+sa-term-open
+sa-term-raw!
+sa-term-cooked!
+sa-term-read-char
+sa-term-size
+sa-term-write-char
+sa-term-char-width
+sa-term-flush
+sa-term-move!
+sa-term-clear!
+sa-term-cr!
+sa-term-lf!
+sa-term-bell!
+sa-term-pause!
+sa-term-color!

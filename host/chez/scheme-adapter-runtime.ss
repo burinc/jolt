@@ -1446,6 +1446,88 @@
 (define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
 
 
+;; ---- terminal tier (capability: terminal) -----------------------------------
+;; The interactive REPL's line editor drives the console through the terminal
+;; layer of Chez's own expression editor: the kernel's "(cs)ee_*" entries, a
+;; terminfo implementation on Unix and a console-API one on Windows, where key
+;; presses come back as the same ANSI escape sequences a Unix terminal sends.
+;; Cursor motion and clearing go through them rather than through escape
+;; sequences written to stdout, which is what makes the editor portable to the
+;; Windows console.
+;;
+;; A kernel configured --disable-curses has no expeditor and none of these
+;; entries, so they are looked up when the terminal is first claimed, never at
+;; load: sa-term-open answers #f there and the REPL keeps its plain reader.
+;; ee_read_char deactivates the calling thread while it blocks, so a collection
+;; or another thread's work proceeds while the editor waits for a key.
+(define sa-term-procs #f)  ; vector of the entry points once claimed, else #f
+
+(define (sa-term-proc i)
+  (if sa-term-procs
+      (vector-ref sa-term-procs i)
+      (error 'sa-term "the terminal is not open")))
+
+(define (sa-term-open)
+  (or (and sa-term-procs #t)
+      (and (foreign-entry? "(cs)ee_init_term")
+           ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
+           (begin
+             (set! sa-term-procs
+               (vector
+                 (foreign-procedure "(cs)ee_raw" () void)                       ; 0
+                 (foreign-procedure "(cs)ee_noraw" () void)                     ; 1
+                 (foreign-procedure "(cs)ee_read_char" (boolean) scheme-object) ; 2
+                 (foreign-procedure "(cs)ee_get_screen_size" () scheme-object)  ; 3
+                 (foreign-procedure "(cs)ee_write_char" (wchar_t) void)         ; 4
+                 (foreign-procedure "(cs)ee_char_width" (wchar_t) int)          ; 5
+                 (foreign-procedure "(cs)ee_flush" () void)                     ; 6
+                 (foreign-procedure "(cs)ee_up" (integer-32) void)              ; 7
+                 (foreign-procedure "(cs)ee_down" (integer-32) void)            ; 8
+                 (foreign-procedure "(cs)ee_left" (integer-32) void)            ; 9
+                 (foreign-procedure "(cs)ee_right" (integer-32) void)           ; 10
+                 (foreign-procedure "(cs)ee_clr_eol" () void)                   ; 11
+                 (foreign-procedure "(cs)ee_clr_eos" () void)                   ; 12
+                 (foreign-procedure "(cs)ee_clear_screen" () void)              ; 13
+                 (foreign-procedure "(cs)ee_carriage_return" () void)           ; 14
+                 (foreign-procedure "(cs)ee_line_feed" () void)                 ; 15
+                 (foreign-procedure "(cs)ee_bell" () void)                      ; 16
+                 (foreign-procedure "(cs)ee_pause" () void)                     ; 17
+                 (foreign-procedure "(cs)ee_set_color" (int boolean) void)))    ; 18
+             #t))))
+
+(define (sa-term-raw!) ((sa-term-proc 0)))
+(define (sa-term-cooked!) ((sa-term-proc 1)))
+
+;; A char, the eof object, or 'resize when the window changed size.
+(define (sa-term-read-char)
+  (let ((c ((sa-term-proc 2) #t)))
+    (if (eq? c #t) 'resize c)))
+
+(define (sa-term-size) ((sa-term-proc 3)))
+(define (sa-term-write-char c) ((sa-term-proc 4) c))
+(define (sa-term-char-width c) ((sa-term-proc 5) c))
+(define (sa-term-flush) ((sa-term-proc 6)))
+
+(define (sa-term-move! dir n)
+  (when (> n 0)
+    ((sa-term-proc (case dir ((up) 7) ((down) 8) ((left) 9) ((right) 10)
+                     (else (error 'sa-term-move! "unknown direction" dir))))
+     n)))
+
+(define (sa-term-clear! what)
+  ((sa-term-proc (case what ((eol) 11) ((eos) 12) ((screen) 13)
+                   (else (error 'sa-term-clear! "unknown region" what))))))
+
+(define (sa-term-cr!) ((sa-term-proc 14)))
+(define (sa-term-lf!) ((sa-term-proc 15)))
+(define (sa-term-bell!) ((sa-term-proc 16)))
+(define (sa-term-pause!) ((sa-term-proc 17)))
+
+;; Color ids are the expeditor's: -1 resets, 0-7 the base colors (black red
+;; green yellow blue magenta cyan white), 8-15 their bright forms.
+(define (sa-term-color! id background?) ((sa-term-proc 18) id background?))
+
+
 ;; --- capability-unchecked ---------------------------------------------------
 ;; Unchecked fixnum / vector primitives, SYNTAX (CONTRACT.txt). A call site
 ;; carries its own range proof; here each is the #3% primitive — what the
