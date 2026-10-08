@@ -706,6 +706,16 @@
             (fn [] (read-entry ed (str (ns-name *ns*) "=> "))))))
       repl-read-form))
 
+(defn- repl-eval
+  "Evaluate an entry so that ^C interrupts it: while it runs, SIGINT trips token
+  instead of ending the process, stopping a computation and throwing a sleep or
+  a deref out with InterruptedException. Between entries ^C is the exit it
+  always was."
+  [form token]
+  (jolt.host/interrupt-on-sigint! token)
+  (try (jolt.host/run-interruptible token (fn [] (load-string form)))
+       (finally (jolt.host/interrupt-on-sigint! nil))))
+
 ;; `jolt repl`: resolve the project so deps (git libs) are on the roots and
 ;; native libs are loaded — same context a run gets, so (require '[some.lib])
 ;; works in the REPL — then the session. -M reaches the session directly, with
@@ -737,19 +747,25 @@
           (str/blank? form)
           (recur read-entry)
           :else
-          (do
-            (try (let [v (load-string form)]
+          (let [token (jolt.host/make-interrupt)]
+            (try (let [v (repl-eval form token)]
                    (var-set #'clojure.core/*3 *2)
                    (var-set #'clojure.core/*2 *1)
                    (var-set #'clojure.core/*1 v)
+                   ;; the body caught the interrupt and returned
+                   (when (jolt.host/interrupted? token) (println))
                    (println (pr-str v)))
                  (catch :default e
                    (var-set #'clojure.core/*e e)
-                   (println "error:" (or (ex-message e)
-                                         (try ((resolve 'jolt.host/condition-message) e) (catch :default _ nil))
-                                         (pr-str e)))
-                   (when-let [bt (jolt.host/backtrace-string)]
-                     (print bt))))
+                   (let [interrupted? (jolt.host/interrupted? token)]
+                     ;; off the line the terminal echoed ^C on
+                     (when interrupted? (println))
+                     (println "error:" (or (when interrupted? "Evaluation interrupted")
+                                           (ex-message e)
+                                           (try ((resolve 'jolt.host/condition-message) e) (catch :default _ nil))
+                                           (pr-str e)))
+                     (when-let [bt (and (not interrupted?) (jolt.host/backtrace-string))]
+                       (print bt)))))
             (recur read-entry)))))))
 
 ;; A bb.edn / deps.edn :tasks entry. The semantics live in jolt.tasks — required

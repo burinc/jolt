@@ -815,7 +815,8 @@
   (case k
     :eof (if (str/blank? (:text st)) (do (finish! ed st nil) {:done nil}) {:state st})
     :ctrl-d (if (empty? (:text st)) (do (finish! ed st nil) {:done nil}) {:state (edit st :delete)})
-    :interrupt (do (finish! ed st "^C") {:done ""})
+    ;; ^C abandons what is typed, and on an empty entry ends the session
+    :interrupt (do (finish! ed st "^C") {:done (when-not (empty? (:text st)) "")})
     :enter (if (submit? (:text st) (:cursor st))
              (do (finish! ed st nil) {:done (:text st)})
              {:state (edit st :newline)})
@@ -838,7 +839,8 @@
 
 (defn read-entry
   "Read one entry at the terminal after prompt. Returns its text (\"\" when
-  Ctrl-C abandons it), or nil at end of input (Ctrl-D on an empty entry)."
+  Ctrl-C abandons it), or nil at end of input (Ctrl-D or Ctrl-C on an empty
+  entry)."
   [ed prompt]
   ;; whatever jolt printed has to reach the terminal before the editor draws
   (flush)

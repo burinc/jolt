@@ -182,6 +182,7 @@ munge-name
 namespace-for
 ns-shaped-name?
 park-until-interrupt
+interrupt-on-sigint!
 pop
 protocol-key-of
 protocol-methods

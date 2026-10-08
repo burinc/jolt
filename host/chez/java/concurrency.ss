@@ -4934,6 +4934,40 @@
 ;; the whole of what is left to do.
 (define c-underscore-exit (jolt-foreign-proc-safe "_exit" '(int) 'void))
 
+;; ^C during a REPL evaluation interrupts the evaluation instead of the process.
+;; While a target is installed here, SIGINT trips it and the process carries on;
+;; with none installed SIGINT is the shutdown it always was. A target is the
+;; evaluation's run-interruptible token, which stops a computation, and the
+;; evaluating thread's interrupt box, set and poked as Thread.interrupt does, which
+;; throws it out of a sleep or a deref the token's timer cannot reach. Where the
+;; watcher is not armed (no POSIX signal masks, as on Windows) ^C reaches Chez's
+;; keyboard-interrupt handler on the installing thread instead, so that handler is
+;; swapped for the duration.
+(define jolt-sigint-target (box #f))       ; (token . interrupt-box) or #f
+(define jolt-sigint-saved-kih (box #f))
+(define (jolt-sigint-trip! target)
+  (set-box! (car target) #t)
+  (set-box! (cdr target) #t)
+  (jolt-interrupt-wake-waits! (cdr target)))
+(define (jolt-interrupt-on-sigint! token)
+  (cond
+    ((box? token)
+     (let ((target (cons token (current-interrupt-box))))
+       (unless (unbox jolt-sigint-saved-kih)
+         (set-box! jolt-sigint-saved-kih (keyboard-interrupt-handler)))
+       (keyboard-interrupt-handler (lambda () (jolt-sigint-trip! target)))
+       (set-box! jolt-sigint-target target)))
+    (else
+     (let ((target (unbox jolt-sigint-target)))
+       (set-box! jolt-sigint-target #f)
+       ;; an interrupt the evaluation did not consume must not reach the next one
+       (when (and target (unbox (car target)))
+         (set-box! (cdr target) #f)))
+     (when (unbox jolt-sigint-saved-kih)
+       (keyboard-interrupt-handler (unbox jolt-sigint-saved-kih))
+       (set-box! jolt-sigint-saved-kih #f))))
+  jolt-nil)
+
 ;; Taking these signals over means their default "terminate now" disposition no
 ;; longer applies, so a program with nothing to clean up has to stay killable
 ;; even when its main thread is somewhere Scheme cannot be resumed from — parked
@@ -4971,13 +5005,17 @@
             (let ((sigbuf (sa-foreign-alloc 8)))
               (let loop ()
                 (if (= 0 (c-sigwait jolt-shutdown-sigset sigbuf))
-                    (let ((sig (sa-foreign-ref 'int sigbuf 0)))
-                      (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
-                      (guard (_ (#t #f)) (flush-output-port (current-output-port)))
-                      (guard (_ (#t #f)) (flush-output-port (current-error-port)))
-                      ;; 128+signal is the status a shell reports for a process
-                      ;; killed by that signal, and what the JVM exits with here.
-                      (c-underscore-exit (+ 128 sig)))
+                    (let ((sig (sa-foreign-ref 'int sigbuf 0))
+                          (target (unbox jolt-sigint-target)))
+                      (if (and (= sig 2) target)
+                          (begin (jolt-sigint-trip! target) (loop))
+                          (begin
+                            (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
+                            (guard (_ (#t #f)) (flush-output-port (current-output-port)))
+                            (guard (_ (#t #f)) (flush-output-port (current-error-port)))
+                            ;; 128+signal is the status a shell reports for a process
+                            ;; killed by that signal, and what the JVM exits with here.
+                            (c-underscore-exit (+ 128 sig)))))
                     (loop))))))))) ; EINTR — ask again
   jolt-nil)
 
@@ -5011,6 +5049,7 @@
 (def-var! "jolt.host" "add-shutdown-hook" jolt-add-shutdown-hook)
 (def-var! "jolt.host" "block-sigint" (lambda () (jolt-set-sigint-blocked #t)))
 (def-var! "jolt.host" "park-until-interrupt" jolt-park-until-interrupt)
+(def-var! "jolt.host" "interrupt-on-sigint!" jolt-interrupt-on-sigint!)
 
 ;; reference types report their JVM classes ((class (agent 1)) is
 ;; clojure.lang.Agent). The IDeref/IRef/IPending/IFn/IBlockingDeref answers come
