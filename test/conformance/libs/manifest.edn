@@ -503,7 +503,7 @@
    ;;     allocation (4.6x the collections, each stopping the world); the row
    ;;     runs in ~4 minutes, and :timeout 2400 is headroom for a loaded CI
    ;;     runner, not the expected cost.
-   :expect {:tests 219 :pass 13272 :fail 23 :error 9 :load-fail 1}}
+   :expect {:tests 219 :pass 13275 :fail 20 :error 9 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
@@ -603,7 +603,7 @@
    ;; and #659 picked the range flavor from the argument types. The row had not been
    ;; re-recorded since before #648, so part of that 3 was slack this gate had been
    ;; carrying — a regression in those rows would have read as "ok".
-   :expect {:tests 58 :pass 52 :fail 6 :error 0}}
+   :expect {:tests 58 :pass 53 :fail 5 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]
