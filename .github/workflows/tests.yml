@@ -495,6 +495,75 @@ jobs:
             throw "the Path root / tmpdir / listRoots answers were not Windows-shaped: $out (want $want)"
           }
 
+      # getCanonicalPath and toRealPath answer the long spelling of a path given
+      # with an 8.3 alias, as the JVM does, so a directory named through %TEMP%
+      # (which carries the short profile name) and through a child's cwd compare
+      # equal (#1281). The alias comes from the filesystem itself; a volume with
+      # short names disabled has none to give, and the step says so and passes.
+      - name: Canonical paths expand 8.3 short names
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          # %TEMP% rather than RUNNER_TEMP: the runner's work drive has short
+          # names disabled, the system drive does not
+          $long = Join-Path $env:TEMP 'Long Directory Name For Jolt'
+          New-Item -ItemType Directory -Force -Path $long | Out-Null
+          $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($long).ShortPath
+          Add-Type -Namespace Jolt -Name Win -MemberDefinition @'
+          [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+          public static extern uint GetLongPathNameW(string s, System.Text.StringBuilder b, uint n);
+          '@
+          $sb = New-Object System.Text.StringBuilder 1024
+          [void][Jolt.Win]::GetLongPathNameW($short, $sb, 1024)
+          $expected = $sb.ToString()
+          Write-Host "short=$short long=$expected"
+          if ($short -eq $expected) { Write-Host 'no 8.3 alias on this volume; nothing to check'; exit 0 }
+          $env:WINSHORT_DIR = $short
+          $probe = Join-Path $env:RUNNER_TEMP 'canon.clj'
+          Set-Content -Path $probe -Value @'
+          (require '[babashka.fs :as fs])
+          (let [short (System/getenv "WINSHORT_DIR")]
+            (prn [(.getCanonicalPath (java.io.File. short))
+                  (str (fs/real-path short))
+                  (str (fs/canonicalize short))]))
+          '@
+          $out = (& $scheme --script host\chez\cli.ss $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $l = $expected.Replace('\', '\\')
+          $want = '["' + $l + '" "' + $l + '" "' + $l + '"]'
+          if ($out -ne $want) { throw "a short name was not expanded: $out (want $want)" }
+
+      # Closing a child's output stream while other threads are parked reading
+      # it: the close used to free the buffer ReadFile was writing into (#1283).
+      # The readers stay parked until the child next writes, as on the JVM; what
+      # matters is that the close returns and nothing crashes.
+      - name: Closing a pipe under a parked read
+        shell: powershell
+        run: |
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          $probe = Join-Path $env:RUNNER_TEMP 'pipeclose.clj'
+          Set-Content -Path $probe -Value @'
+          (require '[babashka.process :as p])
+          (let [proc (p/process {:out :pipe :err :pipe}
+                                "cmd" "/c" "ping -n 6 127.0.0.1 >NUL & echo late")
+                out (:out proc)
+                err (:err proc)
+                r1 (future (try (slurp out) (catch Exception _ :closed)))
+                r2 (future (try (slurp err) (catch Exception _ :closed)))]
+            (Thread/sleep 1500)
+            (.close out)
+            (.close err)
+            (System/gc)
+            @proc
+            (prn [:done (string? @r1) (string? @r2)]))
+          (System/exit 0)
+          '@
+          $out = (& $scheme --script host\chez\cli.ss $probe 2>&1 | Out-String).Trim()
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { throw "exit ${LASTEXITCODE}: $out" }
+          if ($out -ne '[:done true true]') { throw "the close under a parked read: $out" }
+
       # The resolver's HTTPS transport on Windows: ws2_32 sockets and the
       # OpenSSL DLLs discovered under Git for Windows' mingw64/bin. The runner
       # image also has an OpenSSL of its own on PATH, which the bare-name

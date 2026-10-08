@@ -5,14 +5,16 @@
 ;; receiver's descriptor identity (an eq? scan over <= jolt-pic-n cached descs +
 ;; a global epoch guard) instead of re-walking the protocol string tables each
 ;; call. This gate pins the emission and the runtime contract:
-;;   * the emitted form carries the PIC machinery (jolt-pic-make/install/rebuild,
+;;   * the emitted form carries the PIC machinery (jolt-pic-empty/add,
 ;;     jrec-pic-desc, the jolt-proto-epoch guard) and NOT the devirt cell — a
 ;;     monomorphic site keeps the faster devirt path;
 ;;   * evaluating the def and calling it across distinct record types returns each
 ;;     type's own impl (megamorphic correctness), and stays correct on a repeat
 ;;     (the warmed cache serves the hit);
 ;;   * after an extend-type re-registers an impl at runtime (bumping the epoch),
-;;     a subsequent call returns the NEW impl — the cache invalidated and rebuilt.
+;;     a subsequent call returns the NEW impl — the cache invalidated and rebuilt;
+;;   * threads sharing one site across more types than it caches each get their
+;;     own receiver's impl, every call (jolt#1284).
 ;;
 ;;   chez --script host/chez/run-pic.ss
 (import (chezscheme))
@@ -57,9 +59,8 @@
 
 (let ((e (pic-emit)))
   ;; emission: the PIC machinery is present.
-  (gate-check "emit uses the PIC cache vector" (gate-sub? e "jolt-pic-make") #t)
-  (gate-check "emit installs on miss"          (gate-sub? e "jolt-pic-install") #t)
-  (gate-check "emit rebuilds on stale epoch"   (gate-sub? e "jolt-pic-rebuild") #t)
+  (gate-check "emit uses the PIC cache vector" (gate-sub? e "jolt-pic-empty") #t)
+  (gate-check "emit builds a new cache on miss" (gate-sub? e "jolt-pic-add") #t)
   (gate-check "emit reads the desc identity"   (gate-sub? e "jrec-pic-desc") #t)
   (gate-check "emit guards on the epoch"       (gate-sub? e "jolt-proto-epoch") #t)
   ;; a polymorphic site is NOT the monomorphic devirt path.
@@ -76,7 +77,58 @@
   ;; protocol-method bumps jolt-proto-epoch), so the cached site must rebuild and
   ;; serve the NEW impl rather than the stale cached one.
   (evals "(extend-type Circle Shape (area [s] (* (:r s) 100)))")
-  (gate-check "PIC invalidates after extend-type" (jolt-invoke (var-deref "user" "usearea") (var-deref "user" "c")) 700))
+  (gate-check "PIC invalidates after extend-type" (jolt-invoke (var-deref "user" "usearea") (var-deref "user" "c")) 700)
+  ;; one site, eight receiver types (twice the cache width, so every thread keeps
+  ;; missing), eight threads. Each call must get its own receiver's impl: a cache
+  ;; written in place by several threads handed a desc another type's impl, or
+  ;; overran the vector into its epoch slot.
+  (evals "(defprotocol Tag (tag [x]))")
+  (evals "(do (defrecord T0 [v]) (defrecord T1 [v]) (defrecord T2 [v]) (defrecord T3 [v])
+              (defrecord T4 [v]) (defrecord T5 [v]) (defrecord T6 [v]) (defrecord T7 [v]))")
+  (evals "(extend-protocol Tag T0 (tag [_] 0) T1 (tag [_] 1) T2 (tag [_] 2) T3 (tag [_] 3)
+                               T4 (tag [_] 4) T5 (tag [_] 5) T6 (tag [_] 6) T7 (tag [_] 7))")
+  (evals "(def tag-xs (vec (for [i (range 50) k (range 8)]
+                            ((nth [->T0 ->T1 ->T2 ->T3 ->T4 ->T5 ->T6 ->T7] k) k))))")
+  (let* ((dn  (analyze (make-analyze-ctx "user") (jolt-ce-read "(def usetag (fn [x] (tag x)))")))
+         (ar0 (jolt-nth (jolt-get (jolt-get dn (kw "init")) (kw "arities")) 0))
+         (inv (jolt-get ar0 (kw "body")))
+         (dn2 (jolt-assoc dn (kw "init")
+                          (jolt-assoc (jolt-get dn (kw "init")) (kw "arities")
+                                      (jolt-vector (jolt-assoc ar0 (kw "body")
+                                                               (jolt-assoc inv (kw "proto") "user/Tag" (kw "method") "tag"))))))
+         (_ (set-direct-link! #t))
+         (e (emit-top-form dn2)))
+    (set-direct-link! #f)
+    (run-emit e)
+    (jolt-mark-mt!)
+    (let* ((usetag (var-deref "user" "usetag"))
+           (xs (map (lambda (i) (jolt-nth (var-deref "user" "tag-xs") i))
+                    (iota (jolt-count (var-deref "user" "tag-xs")))))
+           (bad 0)
+           (m (make-mutex))
+           (left 8))
+      (define (work)
+        (let loop ((n 0) (wrong 0))
+          (if (fx= n 200)
+              wrong
+              (loop (fx+ n 1)
+                    (fold-left (lambda (w x)
+                                 (if (guard (c (#t #f))
+                                       (eqv? (jolt-invoke usetag x) (jolt-get x (kw "v"))))
+                                     w (fx+ w 1)))
+                               wrong xs)))))
+      (do ((i 0 (fx+ i 1))) ((fx= i 8))
+        (fork-thread
+         (lambda ()
+           (let ((w (work)))
+             (jolt-with-mutex m
+               (set! bad (fx+ bad w))
+               (set! left (fx- left 1)))))))
+      (let wait ()
+        (unless (fx= 0 (jolt-with-mutex m left))
+          (sleep (make-time 'time-duration 1000000 0))
+          (wait)))
+      (gate-check "PIC shared by 8 threads over 8 types: no wrong impl" bad 0))))
 
 ;; a monomorphic site (the inference proved one receiver type) keeps the devirt
 ;; path, not the PIC: annotate :devirt-type and confirm no PIC machinery emits.
@@ -92,7 +144,7 @@
   (let ((e (emit-top-form dn2)))
     (set-direct-link! #f)
     (gate-check "monomorphic site uses devirt, not PIC" (gate-sub? e "devirt-resolve") #t)
-    (gate-check "monomorphic site emits no PIC vector"   (gate-sub? e "jolt-pic-make") #f)))
+    (gate-check "monomorphic site emits no PIC vector"   (gate-sub? e "jolt-pic-empty") #f)))
 
 ;; ---- per-descriptor fast path regression (perf/round1 fix) ----------------  
 ;; find-protocol-method-desc must return non-#f for ALL types registered in
@@ -149,7 +201,7 @@
     (contagion-prepass! U (jolt-vector ring-def ddn2) "user")
     (contagion-prepass-done! U)
     (let ((e (pic-emit)))
-      (gate-check "PIC over eligible impl still uses the PIC path" (gate-sub? e "jolt-pic-make") #t)
+      (gate-check "PIC over eligible impl still uses the PIC path" (gate-sub? e "jolt-pic-empty") #t)
       (gate-check "PIC over eligible impl never emits devirt-resolve-fl" (gate-sub? e "devirt-resolve-fl") #f))))
 
 (gate-summary "pic")

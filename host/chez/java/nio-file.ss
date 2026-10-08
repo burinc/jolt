@@ -1283,7 +1283,7 @@
 ;; resolve symlinks; #f if the path is absent. One binding of realpath(3) for
 ;; the whole runtime, in java/io.ss, which loads before this file and needs it
 ;; for File.getCanonicalPath.
-(define (nio-realpath fp) (jfile-realpath fp))
+(define (nio-realpath fp) (if (win32?) (win32-final-path fp) (jfile-realpath fp)))
 (define (nio-mode->perm-set mode)
   (let ((low (bitwise-and mode #o777)))
     (make-perm-set
