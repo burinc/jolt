@@ -1244,17 +1244,20 @@
 ;; caller, i.e. the threads that have not reached a safe point.
 ;; Degradation: answer #f without installing anything, leaving the target's
 ;; own rendezvous in place (no diagnostic, the behaviour of every release
-;; before 0.8.9). The copy is of ONE protocol, so it is installed only on the
-;; Chez it was read from — 10.4 — and only when every name it needs is bound;
-;; a Chez whose protocol has not been compared answers #f rather than run a
-;; rendezvous it might disagree with. The ffi gate (make ffi) asserts the
+;; before 0.8.9). The copy is of ONE protocol, so it is installed only on a
+;; Chez whose protocol was compared with it, and only when every name it needs
+;; is bound; any other Chez answers #f rather than run a rendezvous it might
+;; disagree with. Compared: 10.4 (read from), and 10.5, whose s/7.ss
+;; $collect-rendezvous and s/library.ss are unchanged from v10.4.1 (checked at
+;; cisco/ChezScheme 35c2f4b3, 10.5.0 pre-release; the c/ changes since touch
+;; W^X code pages and gen-0 marking, not the rendezvous). The ffi gate (make ffi) asserts the
 ;; watch is live on the Chez CI builds, so a Chez bump re-asks the question.
 (define (sa-gc-install-stall-watch! seconds on-stall)
   (let ((se (#%$system-environment)))
     (define (bound? name) (top-level-bound? name se))
     (define (sysval name) (top-level-value name se))
     (and (call-with-values scheme-version-number
-           (lambda (major minor sub) (and (= major 10) (= minor 4))))
+           (lambda (major minor sub) (and (= major 10) (memv minor '(4 5)))))
          (bound? '$collect-rendezvous)
          (bound? '$collect-cond) (bound? '$collect-thread0-cond)
          (bound? '$tc-mutex) (bound? '$active-threads)
