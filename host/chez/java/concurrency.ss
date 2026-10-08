@@ -4945,10 +4945,18 @@
 ;; swapped for the duration.
 (define jolt-sigint-target (box #f))       ; (token . interrupt-box) or #f
 (define jolt-sigint-saved-kih (box #f))
+;; Tripping and uninstalling take this mutex, so the watcher cannot read a target,
+;; lose the race to the uninstall, and then set the REPL thread's interrupt box
+;; for the NEXT entry. Only the boxes are set under it; the wake is outside.
+(define jolt-sigint-mu (make-mutex))
+;; #f when the target was already uninstalled: the signal is then the shutdown.
 (define (jolt-sigint-trip! target)
-  (set-box! (car target) #t)
-  (set-box! (cdr target) #t)
-  (jolt-interrupt-wake-waits! (cdr target)))
+  (and (jolt-with-mutex jolt-sigint-mu
+         (and (eq? (unbox jolt-sigint-target) target)
+              (begin (set-box! (car target) #t)
+                     (set-box! (cdr target) #t)
+                     #t)))
+       (begin (jolt-interrupt-wake-waits! (cdr target)) #t)))
 (define (jolt-interrupt-on-sigint! token)
   (cond
     ((box? token)
@@ -4956,13 +4964,14 @@
        (unless (unbox jolt-sigint-saved-kih)
          (set-box! jolt-sigint-saved-kih (keyboard-interrupt-handler)))
        (keyboard-interrupt-handler (lambda () (jolt-sigint-trip! target)))
-       (set-box! jolt-sigint-target target)))
+       (jolt-with-mutex jolt-sigint-mu (set-box! jolt-sigint-target target))))
     (else
-     (let ((target (unbox jolt-sigint-target)))
-       (set-box! jolt-sigint-target #f)
-       ;; an interrupt the evaluation did not consume must not reach the next one
-       (when (and target (unbox (car target)))
-         (set-box! (cdr target) #f)))
+     (jolt-with-mutex jolt-sigint-mu
+       (let ((target (unbox jolt-sigint-target)))
+         (set-box! jolt-sigint-target #f)
+         ;; an interrupt the evaluation did not consume must not reach the next one
+         (when (and target (unbox (car target)))
+           (set-box! (cdr target) #f))))
      (when (unbox jolt-sigint-saved-kih)
        (keyboard-interrupt-handler (unbox jolt-sigint-saved-kih))
        (set-box! jolt-sigint-saved-kih #f))))
@@ -5007,8 +5016,8 @@
                 (if (= 0 (c-sigwait jolt-shutdown-sigset sigbuf))
                     (let ((sig (sa-foreign-ref 'int sigbuf 0))
                           (target (unbox jolt-sigint-target)))
-                      (if (and (= sig 2) target)
-                          (begin (jolt-sigint-trip! target) (loop))
+                      (if (and (= sig 2) target (jolt-sigint-trip! target))
+                          (loop)
                           (begin
                             (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
                             (guard (_ (#t #f)) (flush-output-port (current-output-port)))
