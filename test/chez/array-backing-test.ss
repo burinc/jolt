@@ -91,15 +91,22 @@
     (let ((a (evv "(doto (long-array 3) (aset 0 Long/MAX_VALUE))")))
       (and (eq? 'vector (backing-of a)) (eq? 'long (jolt-array-kind a)))))
 (ok "a bignum INIT is born widened"
-    (eq? 'vector (backing-of (evv "(long-array 2 (*' Long/MAX_VALUE 2))"))))
+    (eq? 'vector (backing-of (evv "(long-array 2 Long/MAX_VALUE)"))))
 (ok "a bignum in the seq is born widened"
-    (eq? 'vector (backing-of (evv "(long-array [1 (*' Long/MAX_VALUE 2)])"))))
-(ok "a non-integer store widens too"
-    (eq? 'vector (backing-of (evv "(doto (int-array 2) (aset 0 1.5))"))))
+    (eq? 'vector (backing-of (evv "(long-array [1 Long/MAX_VALUE])"))))
+;; a store narrows to the kind before it is stored, so a value past the long
+;; range wraps (Number.longValue) and a non-integer truncates: neither widens
+(ok "a value past the long range wraps, and stays unboxed"
+    (eq? 'fxvector (backing-of (evv "(long-array 2 (*' Long/MAX_VALUE 2))"))))
+(ok "a non-integer store narrows, and stays unboxed"
+    (eq? 'fxvector (backing-of (evv "(doto (int-array 2) (aset 0 1.5))"))))
 (ok "a fixnum store does NOT widen"
     (eq? 'fxvector (backing-of (evv "(doto (long-array 2) (aset 0 -1) (aset 1 1152921504606846975))"))))
 (ok "the hinted aset widens as the generic one does"
-    (eq? 'vector (backing-of (evv "(let [a (long-array 2)] ((fn [^longs x ^long i v] (aset x i v)) a 0 (*' Long/MAX_VALUE 2)) a)"))))
+    (eq? 'vector (backing-of (evv "(let [a (long-array 2)] ((fn [^longs x ^long i v] (aset x i v)) a 0 Long/MAX_VALUE) a)"))))
+(is "the hinted aset narrows as the generic one does"
+    "(let [a (int-array 2)] ((fn [^ints x ^long i v] (aset x i v)) a 0 (* 3 1000000000)) (vec a))"
+    "[-1294967296 0]")
 
 ;; a widened array is an ordinary array afterwards — every op reads it
 (is "widened: read back" "(let [a (long-array 3)] (aset a 0 Long/MAX_VALUE) [(aget a 0) (vec a) (count a) (alength a)])"
@@ -160,7 +167,7 @@
 
 ;; --- byte elements stay signed, whichever door they came in -------------------
 (is "byte narrowing at every entry point"
-    "[(vec (byte-array [200 -1 127])) (let [a (byte-array 2)] (aset a 0 200) (aset-byte a 1 300) (vec a)) (vec (into-array Byte/TYPE [200])) (let [a (byte-array 1)] (java.util.Arrays/fill a 200) (vec a))]"
+    "[(vec (byte-array [200 -1 127])) (let [a (byte-array 2)] (aset a 0 200) (aset a 1 300) (vec a)) (vec (into-array Byte/TYPE [200])) (let [a (byte-array 1)] (java.util.Arrays/fill a 200) (vec a))]"
     "[[-56 -1 127] [-56 44] [-56] [-56]]")
 (is "and round-trip through a String and back"
     "(let [bs (byte-array [-1 0 127 -128 65])] (vec (.getBytes (String. bs \"ISO-8859-1\") \"ISO-8859-1\")))"

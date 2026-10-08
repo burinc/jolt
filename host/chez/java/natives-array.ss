@@ -917,19 +917,34 @@
           ;; any other string operation's.
           ((string? v) (ja-ref a j))
           (else (flvector-ref v j)))))
+;; The store narrows to the array's kind first, as the untyped aset does
+;; (na-elem-of): an ^ints store of 3000000000 keeps its low 32 bits and an
+;; ^longs store of 1.5 is 1, rather than the hint letting the raw value in. It
+;; answers what it stored, as the JVM's aset does.
+;; A fixnum already in the kind's range is the common store and goes straight
+;; in; an fxvector backs only long, int and short.
 (define (jolt-vaset a i v)
-  (let ((bk (jolt-array-vec a)) (j (if (fixnum? i) i (exact (na-idx i)))))
+  (let ((bk (jolt-array-vec a)))
+    (if (and (fixnum? v) (fxvector? bk) (fixnum? i)
+             (let ((k (jolt-array-kind a)))
+               (or (eq? k 'long)
+                   (if (eq? k 'int) (fx<=? -2147483648 v 2147483647) (fx<=? -32768 v 32767)))))
+        (begin (fxvector-set! bk i v) v)
+        (jolt-vaset-coerce a bk i v))))
+(define (jolt-vaset-coerce a bk i v)
+  (let* ((j (if (fixnum? i) i (exact (na-idx i))))
+         (x (na-elem-of (jolt-array-kind a) v)))
     (cond ((fxvector? bk)
-           (if (fixnum? v) (fxvector-set! bk j v) (vector-set! (ja-promote! a) j v)))
+           (if (fixnum? x) (fxvector-set! bk j x) (vector-set! (ja-promote! a) j x)))
           ((vector? bk)
            (if (and (fixnum? j) (fx<? -1 j (vector-length bk)))
-               (vector-set! bk j v)
+               (vector-set! bk j x)
                (na-oob-throw j (vector-length bk))))
           ;; a lying hint over a string-backed char array — see jolt-vaget. The
           ;; else arm used to assume a boxed vector and would read
           ;; (vector-length bk) off a string.
-          (else (ja-set! a j v)))
-    v))
+          (else (ja-set! a j x)))
+    x))
 
 ;; (aset ^bytes a i v) — the byte kind's own store target, split from jolt-vaset
 ;; rather than folded into it because a byte array is the one kind whose store
