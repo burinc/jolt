@@ -694,6 +694,18 @@
         :else       (let [nb (str buf "\n" line)]
                       (if (repl-form-complete? nb) nb (recur nb)))))))
 
+(defn- repl-entry-reader
+  "How the session reads an entry. A terminal gets jolt.line-editor (multi-line
+  editing with parinfer keeping the parens balanced, docs, history); anything
+  else, a pipe or a script or TERM=dumb, keeps repl-read-form, so input that is
+  not typed is read exactly as written. The editor ns loads only when used."
+  []
+  (or (when (jolt.host/term-open?)
+        (when-let [ed ((requiring-resolve 'jolt.line-editor/editor))]
+          (let [read-entry (requiring-resolve 'jolt.line-editor/read-entry)]
+            (fn [] (read-entry ed (str (ns-name *ns*) "=> "))))))
+      repl-read-form))
+
 ;; `jolt repl`: resolve the project so deps (git libs) are on the roots and
 ;; native libs are loaded — same context a run gets, so (require '[some.lib])
 ;; works in the REPL — then the session. -M reaches the session directly, with
@@ -713,13 +725,18 @@
   (push-thread-bindings {#'clojure.core/*repl* true
                          #'clojure.core/*1 nil #'clojure.core/*2 nil
                          #'clojure.core/*3 nil #'clojure.core/*e nil})
-  (loop []
-    (let [form (repl-read-form)]
+  (loop [read-entry (repl-entry-reader)]
+    (let [form (read-entry)]
       (when form
         ;; :repl/quit / :exit exit the loop — a reliable gesture that works in any
         ;; terminal, unlike ^D (some terminals/editors don't deliver it as EOF).
-        (if (#{:repl/quit :exit} (try (read-string form) (catch :default _ nil)))
+        (cond
+          (#{:repl/quit :exit} (try (read-string form) (catch :default _ nil)))
           nil
+          ;; an entry the editor submitted blank, or abandoned with ^C
+          (str/blank? form)
+          (recur read-entry)
+          :else
           (do
             (try (let [v (load-string form)]
                    (var-set #'clojure.core/*3 *2)
@@ -733,7 +750,7 @@
                                          (pr-str e)))
                    (when-let [bt (jolt.host/backtrace-string)]
                      (print bt))))
-            (recur)))))))
+            (recur read-entry)))))))
 
 ;; A bb.edn / deps.edn :tasks entry. The semantics live in jolt.tasks — required
 ;; here only when a task actually runs, so the CLI's startup closure (and the

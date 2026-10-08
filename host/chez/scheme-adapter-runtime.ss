@@ -1498,9 +1498,10 @@
 (define (sa-term-raw!) ((sa-term-proc 0)))
 (define (sa-term-cooked!) ((sa-term-proc 1)))
 
-;; A char, the eof object, or 'resize when the window changed size.
-(define (sa-term-read-char)
-  (let ((c ((sa-term-proc 2) #t)))
+;; A char, the eof object, or 'resize when the window changed size; without
+;; block?, #f when no input is waiting.
+(define (sa-term-read-char block?)
+  (let ((c ((sa-term-proc 2) block?)))
     (if (eq? c #t) 'resize c)))
 
 (define (sa-term-size) ((sa-term-proc 3)))

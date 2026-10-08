@@ -112,6 +112,12 @@ jasentaa
   MIT License: licenses/MIT-jasentaa.txt
   stdlib/jolt/parser.clj and stdlib/jolt/parser/.
 
+clojure-cli.repl
+  https://github.com/clojure/clojure-cli.repl
+  Copyright (c) 2026 Jarrod Taylor and contributors
+  Eclipse Public License 1.0: licenses/EPL-1.0.txt
+  The token scanner, doc preview and Enter rule in stdlib/jolt/line_editor.clj.
+
 Parinfer (parinfer.js 3.13.1)
   https://github.com/parinfer/parinfer.js
   Copyright (c) 2015 Shaun Williams and contributors

@@ -2,8 +2,8 @@
 ;; jolt.host vars over the adapter's terminal tier (sa-term-*, CONTRACT.txt
 ;; capability-terminal). jolt.line-editor is the only caller; everything about
 ;; editing lives there, this file only translates values: eof reads as nil, a
-;; resize as :resize, the screen size as a (rows cols) list, and the motion and
-;; clear regions as keywords.
+;; resize as :resize, nothing waiting as false, the screen size as a (rows
+;; cols) list, and the motion and clear regions as keywords.
 
 (define term-kw-resize (keyword #f "resize"))
 
@@ -16,9 +16,10 @@
 (def-var! "jolt.host" "term-raw!" (lambda () (sa-term-raw!) jolt-nil))
 (def-var! "jolt.host" "term-cooked!" (lambda () (sa-term-cooked!) jolt-nil))
 
+;; Blocking unless block? is false, when false means nothing is waiting.
 (def-var! "jolt.host" "term-read-char"
-  (lambda ()
-    (let ((c (sa-term-read-char)))
+  (lambda (block?)
+    (let ((c (sa-term-read-char (and block? (not (jolt-nil? block?))))))
       (cond ((eof-object? c) jolt-nil)
             ((eq? c 'resize) term-kw-resize)
             (else c)))))

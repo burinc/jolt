@@ -442,7 +442,8 @@ sa-fiber-run-all
 #     echo, no line buffering, no signal keys (^C and ^Z arrive as chars), and
 #     no output post-processing, so a newline is written as sa-term-cr! plus
 #     sa-term-lf!.
-#   (sa-term-read-char) -> char | eof object | 'resize: block for one char;
+#   (sa-term-read-char block?) -> char | eof object | 'resize | #f: one char,
+#     blocking when block? (only then can #f, nothing waiting, not come back);
 #     special keys arrive as their ANSI escape sequences on every target.
 #   (sa-term-size) -> (rows . cols)
 #   (sa-term-write-char c) / (sa-term-char-width c): write one char; the
