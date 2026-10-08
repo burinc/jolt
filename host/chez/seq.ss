@@ -430,7 +430,7 @@
            ;; body's return until it is released (jolt-wind*, locks.ss): an
            ;; interrupt's escape in either gap left the claim held, and every
            ;; other forcer of the cell waited on it for good.
-           (let ((claim (cons force-claim-token me)) (lv (jolt-locks-depth)))
+           (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
              (jolt-locks-enter!)
              (if (sa-record-cas! cell L #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire

@@ -2764,7 +2764,7 @@
     ;; read AFTER claiming, not before: while this thread was waiting in step 2
     ;; another may have loaded the namespace and then had its own load fail, and
     ;; a stale #t here would make the guard below skip the rollback.
-    (let ((lv (fx- (jolt-locks-depth) 1))
+    (let ((lv (fx- (jolt-locks-held) 1))
           (was-loaded? (ns-dedup-loaded? name))
           (finished? #f))
       ;; step 11/12: drop the claim and wake the waiters on EVERY exit. dynamic-wind
@@ -2820,7 +2820,7 @@
               (lambda ()
                 (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
             (set! finished? #t)))
-        (jolt-masked-after lv
+        (jolt-masked-cleanup lv
           (unless (jolt-park-unwinding?)
             (unless (or finished? was-loaded?) (ldr-unmark-loaded! name))
             (ldr-end-load! name)))))))

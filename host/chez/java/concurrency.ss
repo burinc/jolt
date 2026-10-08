@@ -1940,7 +1940,7 @@
          ;; that retry could land at this after-thunk's entry, the winder already
          ;; popped: the escape then left this handler installed and armed, and the
          ;; next tick jumped back into an extent that had already returned.
-         (lv (jolt-locks-depth))
+         (lv (jolt-locks-held))
          (r (call/cc
               (lambda (k)
                 (jolt-locks-enter!)
@@ -2016,7 +2016,7 @@
                       ((jolt-current-fiber) (jolt-fiber-rearm-preempt!))
                       ((pair? outer-stack) (set-timer interrupt-check-ticks))
                       (else (jolt-fiber-rearm-preempt!)))
-                    (when (fx>? (jolt-locks-depth) lv) (jolt-locks-exit!))))))))
+                    (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))))
     (if (eq? r interrupt-sentinel)
         (begin
           ;; The bindings the interrupted body left. Its winds are masked at their

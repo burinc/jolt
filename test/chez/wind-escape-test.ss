@@ -76,7 +76,7 @@
                 (jolt-ce-read "(fn [] (try (do (jolt.host/scheme-started!) :body) (finally (jolt.host/scheme-noop))))")
                 "user"))
          (drop "(set-virtual-register! 7 (fx- (virtual-register 7) 1)))")
-         (after-head "(lambda () (if (fx>? (virtual-register 7)")
+         (after-head "(lambda () (if (fx> (virtual-register 7)")
          (i (let find ((k 0))
               (cond ((> (+ k (string-length after-head)) (string-length scm)) #f)
                     ((string=? after-head (substring scm k (+ k (string-length after-head)))) k)
@@ -142,6 +142,15 @@
                        (condition-wait c m (make-time 'time-duration 50000000 0))
                        (wait (+ n 1))))))
                (or (not last-seq) done)))))
+
+;; 8. A cleanup that raises. It runs masked on a normal exit and drops the mask
+;; last, so jolt-wind* runs it in a wind that drops the mask as the raise unwinds:
+;; a depth left up would keep every later interrupt off this thread.
+(ok "a jolt-wind* cleanup that raises leaves the depth where it was"
+    (let ((l0 (jolt-locks-held)))
+      (and (eq? 'boom (guard (e (#t e))
+                        (jolt-wind* (lambda () #f) #f (lambda () 1) (raise 'boom))))
+           (= l0 (jolt-locks-held)))))
 
 (printf "~a/~a wind escape assertions passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

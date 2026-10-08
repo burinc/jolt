@@ -3555,15 +3555,16 @@
       ;; raised again as it returns and dropped as the finally starts, which then
       ;; runs unmasked and may park. The finally tells a normal exit from a raise
       ;; or an escape by the depth: only the normal exit left it above the level
-      ;; at entry. Inline register ops and not the jolt-locks procedures, because
-      ;; a call is itself a place Chez checks for the interrupt.
+      ;; at entry. Inline register ops and not the jolt-locks syntax, because the
+      ;; emission is also eval'd where only procedures are bound (Gambit's eval
+      ;; sees no shim macro, which is also why this says fx> and not fx>?).
       (let [lv (fresh-label "_wl$")
             r (fresh-label "_wr$")]
         (str "(let ((" lv " (virtual-register 7))) (set-virtual-register! 7 (fx+ " lv " 1))"
              " (dynamic-wind jolt-finally-in"
              " (lambda () (set-virtual-register! 7 (fx- (virtual-register 7) 1))"
              " (let ((" r " " core ")) (set-virtual-register! 7 (fx+ (virtual-register 7) 1)) " r "))"
-             " (lambda () (if (fx>? (virtual-register 7) " lv ") (set-virtual-register! 7 (fx- (virtual-register 7) 1)))"
+             " (lambda () (if (fx> (virtual-register 7) " lv ") (set-virtual-register! 7 (fx- (virtual-register 7) 1)))"
              " " (binding [*tail?* false] (emit fin)) ")))"))
       core)))
 

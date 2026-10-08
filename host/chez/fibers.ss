@@ -1129,7 +1129,7 @@
         ;; The wind's own edges are masked against an escape (jolt-wind*,
         ;; locks.ss); the counted-lock mask is dropped before the pending
         ;; interrupt is raised, which would otherwise leave it held.
-        (let ((entered #f) (lv (jolt-locks-depth)))
+        (let ((entered #f) (lv (jolt-locks-held)))
           (jolt-locks-enter!)
           (dynamic-wind
             (lambda ()
@@ -1140,7 +1140,7 @@
             (lambda ()
               (unless (jolt-park-unwinding?)
                 (jolt-fiber-mask-set! f (fx- (jolt-fiber-mask f) 1))
-                (when (fx>? (jolt-locks-depth) lv) (jolt-locks-exit!))
+                (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))
                 ;; leaving the outermost masked region: a pending interrupt lands
                 (when (fx=? 0 (jolt-fiber-mask f))
                   (jolt-fiber-check-interrupt! f)))))))))
@@ -1149,7 +1149,7 @@
   (let ((f (jolt-current-fiber)))
     (if (not f)
         (thunk)
-        (let ((saved #f) (lv (jolt-locks-depth)))
+        (let ((saved #f) (lv (jolt-locks-held)))
           (jolt-locks-enter!)
           (dynamic-wind
             (lambda ()
