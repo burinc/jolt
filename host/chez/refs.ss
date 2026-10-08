@@ -146,11 +146,9 @@
 ;; is what fn* opacity gives dosync (java/sm.ss's invariant; run-gosm.ss checks it).
 (define (dyn-with-txn txn thunk)
   (let ((outer (*txn*)))
-    (*txn* txn)
-    (dynamic-wind
-      (lambda () #f)
-      thunk
-      (lambda () (*txn* outer)))))
+    ;; masked at its edges (jolt-wind*, locks.ss): an interrupt's escape at either
+    ;; left *txn* set, and the thread ran on as if inside the transaction
+    (jolt-wind* (lambda () #f) (*txn* txn) thunk (*txn* outer))))
 
 ;; --- in-txn log helpers ------------------------------------------------------
 

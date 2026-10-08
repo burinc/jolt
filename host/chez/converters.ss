@@ -71,10 +71,13 @@
 ;; throws.
 (define (jolt-print-one v)
   (let ((prev (virtual-register jolt-vreg-print-readably)))
-    (dynamic-wind
+    ;; masked at its edges (jolt-wind*, locks.ss), so an interrupt cannot leave
+    ;; the thread printing non-readably
+    (jolt-wind*
       (lambda () (set-virtual-register! jolt-vreg-print-readably #f))
+      #f
       (lambda () (jolt-pr-readable v))
-      (lambda () (set-virtual-register! jolt-vreg-print-readably prev)))))
+      (set-virtual-register! jolt-vreg-print-readably prev))))
 (def-var! "clojure.core" "__print1" jolt-print-one)
 
 ;; str: a top-level string/scalar renders as jolt-str-render-one (raw string,

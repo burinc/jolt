@@ -277,12 +277,15 @@
   (with-output-to-string
     (lambda ()
       (let ((cell (var-cell-lookup "clojure.core" "*out*")))
-        (dynamic-wind
+        ;; masked at its edges (jolt-wind*, locks.ss): an interrupt's escape
+        ;; before the pop left *out* bound to this dead string port
+        (jolt-wind*
           (lambda ()
             (when cell
               (jolt-push-thread-bindings (jolt-hash-map cell (var-cell-root cell)))))
+          #f
           (lambda () (parameterize ((jolt-pprint-hook-suppressed #t)) (jolt-invoke thunk)))
-          (lambda () (when cell (jolt-pop-thread-bindings))))))))
+          (when cell (jolt-pop-thread-bindings)))))))
 
 ;; __eprint / __eprintf: stderr seams. Flush each write — like the JVM's
 ;; auto-flushing System.err — so a long-running process (a server that never
