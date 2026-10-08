@@ -112,6 +112,12 @@ jasentaa
   MIT License: licenses/MIT-jasentaa.txt
   stdlib/jolt/parser.clj and stdlib/jolt/parser/.
 
+Parinfer (parinfer.js 3.13.1)
+  https://github.com/parinfer/parinfer.js
+  Copyright (c) 2015 Shaun Williams and contributors
+  MIT License: licenses/MIT-parinfer.txt
+  stdlib/jolt/parinfer.clj, and the case suite in test/chez/parinfer-cases.edn.
+
 infix
   https://github.com/rm-hull/infix
   Copyright (c) 2016 Richard Hull

@@ -72,6 +72,7 @@ jolt.infix.math.trig
 jolt.io-poller
 jolt.loader
 jolt.nrepl
+jolt.parinfer
 jolt.parser
 jolt.parser.basic
 jolt.parser.collections

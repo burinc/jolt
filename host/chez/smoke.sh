@@ -1684,6 +1684,17 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.parinfer — the parinfer.js port, replaying parinfer.js's own case suite
+# (indent, paren and smart mode). The file self-checks and prints one marker.
+parinfer_out="$($jolt run test/chez/parinfer-test.clj 2>/dev/null)"
+if printf '%s' "$parinfer_out" | grep -q 'PARINFER OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: parinfer"
+  printf '%s\n' "$parinfer_out" | grep -v OK | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # A data reader that returns a CODE form (deps.edn data_readers.clj -> reader fn)
 # must have its result spliced in and COMPILED, like Clojure — #code [:x] becomes
 # (+ 40 2) and evaluates to 42, not the literal list. A project run so the source

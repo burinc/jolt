@@ -1,0 +1,469 @@
+;; Converted from parinfer.js test/cases/*.json (Parinfer 3.13.1,
+;; https://github.com/parinfer/parinfer.js). Copyright (c) 2015 Shaun
+;; Williams and contributors, MIT License: licenses/MIT-parinfer.txt.
+;; Keys are kebab-cased and error names are keywords; values are unchanged.
+;; The markdown source of each case is dropped.
+[
+ {:id 1000 :mode :indent :text "(defn foo\n  [arg\n  ret"
+  :options {}
+  :result {:text "(defn foo\n  [arg]\n  ret)" :success true}}
+ {:id 1005 :mode :indent :text "(defn foo\n  [arg\n   ret"
+  :options {}
+  :result {:text "(defn foo\n  [arg\n   ret])" :success true}}
+ {:id 1010 :mode :indent :text "(defn foo\n[arg\n   ret"
+  :options {}
+  :result {:text "(defn foo)\n[arg\n   ret]" :success true}}
+ {:id 1015 :mode :indent :text "(defn foo\n[arg\nret"
+  :options {}
+  :result {:text "(defn foo)\n[arg]\nret" :success true}}
+ {:id 1020 :mode :indent :text "(defn foo\n  [arg\n  ret\n\n(defn foo\n  [arg\n  ret"
+  :options {}
+  :result {:text "(defn foo\n  [arg]\n  ret)\n\n(defn foo\n  [arg]\n  ret)" :success true}}
+ {:id 1025 :mode :indent :text "bar)"
+  :options {}
+  :result {:text "bar" :success true}}
+ {:id 1030 :mode :indent :text "(def foo [a b]]"
+  :options {}
+  :result {:text "(def foo [a b])" :success true}}
+ {:id 1035 :mode :indent :text "(let [x {:foo 1 :bar 2]\n  x)"
+  :options {}
+  :result {:text "(let [x {:foo 1 :bar 2}]\n  x)" :success true}}
+ {:id 1040 :mode :indent :text "(foo [a (b] c)"
+  :options {:cursor-x 9 :cursor-line 0}
+  :result {:cursor-x 9 :cursor-line 0 :error {:name :unmatched-close-paren :line-no 0 :x 10} :text "(foo [a (b] c)" :success false}}
+ {:id 1045 :mode :indent :text "(def foo \"as"
+  :options {}
+  :result {:error {:name :unclosed-quote :line-no 0 :x 9} :text "(def foo \"as" :success false}}
+ {:id 1050 :mode :indent :text "(defn foo [a \"])"
+  :options {}
+  :result {:error {:name :unclosed-quote :line-no 0 :x 13} :text "(defn foo [a \"])" :success false}}
+ {:id 1055 :mode :indent :text "(defn foo\n  \"This is docstring.\n  Line 2 here.\"\n  ret"
+  :options {}
+  :result {:text "(defn foo\n  \"This is docstring.\n  Line 2 here.\"\n  ret)" :success true}}
+ {:id 1060 :mode :indent :text "(let [a \"Hello\nWorld\"\n      b 2\n  ret"
+  :options {}
+  :result {:text "(let [a \"Hello\nWorld\"\n      b 2]\n  ret)" :success true}}
+ {:id 1065 :mode :indent :text "(let [a \"])\"\n      b 2"
+  :options {}
+  :result {:text "(let [a \"])\"\n      b 2])" :success true}}
+ {:id 1070 :mode :indent :text "(def foo \"\\\"\""
+  :options {}
+  :result {:text "(def foo \"\\\"\")" :success true}}
+ {:id 1075 :mode :indent :text "()\"\n\""
+  :options {}
+  :result {:text "()\"\n\"" :success true}}
+ {:id 1080 :mode :indent :text "\"\"foo\""
+  :options {:cursor-x 1 :cursor-line 0}
+  :result {:cursor-x 1 :cursor-line 0 :error {:name :unclosed-quote :line-no 0 :x 5} :text "\"\"foo\"" :success false}}
+ {:id 1085 :mode :indent :text "(def foo\n  \"\n  \"(a b)\n      c\")"
+  :options {:cursor-x 3 :cursor-line 1}
+  :result {:cursor-x 3 :cursor-line 1 :error {:name :unclosed-quote :line-no 3 :x 7} :text "(def foo\n  \"\n  \"(a b)\n      c\")" :success false}}
+ {:id 1090 :mode :indent :text "(for [col columns]\n  \"\n  [:div.td {:style \"max-width: 500px;\"}])"
+  :options {:cursor-x 3 :cursor-line 1}
+  :result {:cursor-x 3 :cursor-line 1 :error {:name :quote-danger :line-no 2 :x 37} :text "(for [col columns]\n  \"\n  [:div.td {:style \"max-width: 500px;\"}])" :success false}}
+ {:id 1095 :mode :indent :text "(def foo [a b]\n  ; \"my multiline\n  ; docstring.\"\nret)"
+  :options {}
+  :result {:text "(def foo [a b])\n  ; \"my multiline\n  ; docstring.\"\nret" :success true}}
+ {:id 1100 :mode :indent :text "(def foo [a b]\n  ; \"\"\\\"\nret)"
+  :options {}
+  :result {:text "(def foo [a b])\n  ; \"\"\\\"\nret" :success true}}
+ {:id 1105 :mode :indent :text "(defn foo [a b\n  \\[\n  ret"
+  :options {}
+  :result {:text "(defn foo [a b]\n  \\[\n  ret)" :success true}}
+ {:id 1110 :mode :indent :text "(defn foo [a b]\n  ret\\)"
+  :options {}
+  :result {:text "(defn foo [a b]\n  ret\\))" :success true}}
+ {:id 1115 :mode :indent :text "{:tag-open \\[ :tag-close \\]}\n{:tag-open \\[ :tag-close \\]}"
+  :options {}
+  :result {:text "{:tag-open \\[ :tag-close \\]}\n{:tag-open \\[ :tag-close \\]}" :success true}}
+ {:id 1120 :mode :indent :text "(def foo \\;"
+  :options {}
+  :result {:text "(def foo \\;)" :success true}}
+ {:id 1125 :mode :indent :text "(def foo \\,\n(def bar \\ ; <-- space"
+  :options {}
+  :result {:text "(def foo \\,)\n(def bar \\ ); <-- space" :success true}}
+ {:id 1130 :mode :indent :text "(foo [a b\\\n  c)"
+  :options {}
+  :result {:error {:name :eol-backslash :line-no 0 :x 9} :text "(foo [a b\\\n  c)" :success false}}
+ {:id 1135 :mode :indent :text "(def foo ;)"
+  :options {}
+  :result {:text "(def foo) ;)" :success true}}
+ {:id 1140 :mode :indent :text "(let [a 1\n      b 2\n      c {:foo 1\n         ;; :bar 2}]\n  ret)"
+  :options {}
+  :result {:text "(let [a 1\n      b 2\n      c {:foo 1}]\n         ;; :bar 2}]\n  ret)" :success true}}
+ {:id 1145 :mode :indent :text "(let [a 1 ;; a comment\n  ret)"
+  :options {}
+  :result {:text "(let [a 1] ;; a comment\n  ret)" :success true}}
+ {:id 1150 :mode :indent :text "; hello \\n world"
+  :options {}
+  :result {:text "; hello \\n world" :success true}}
+ {:id 1155 :mode :indent :text "(def b )"
+  :options {:cursor-x 7 :cursor-line 0}
+  :result {:cursor-x 7 :cursor-line 0 :text "(def b )" :success true}}
+ {:id 1160 :mode :indent :text "(def b )"
+  :options {}
+  :result {:text "(def b)" :success true}}
+ {:id 1165 :mode :indent :text "(def b [[c d] ])"
+  :options {:cursor-x 14 :cursor-line 0}
+  :result {:cursor-x 14 :cursor-line 0 :text "(def b [[c d] ])" :success true}}
+ {:id 1170 :mode :indent :text "(def b [[c d] ])"
+  :options {}
+  :result {:text "(def b [[c d]])" :success true}}
+ {:id 1175 :mode :indent :text "(let [a 1])\n  ret)"
+  :options {}
+  :result {:text "(let [a 1]\n  ret)" :success true}}
+ {:id 1180 :mode :indent :text "(let [a 1])\n  ret)"
+  :options {:cursor-x 11 :cursor-line 0}
+  :result {:cursor-x 11 :cursor-line 0 :text "(let [a 1])\n  ret" :success true}}
+ {:id 1185 :mode :indent :text "(let [a 1]) 2\n  ret"
+  :options {}
+  :result {:text "(let [a 1]) 2\n  ret" :success true}}
+ {:id 1190 :mode :indent :text "(let [a 1])\n  ret)"
+  :options {:cursor-x 10 :cursor-line 0}
+  :result {:cursor-x 10 :cursor-line 0 :text "(let [a 1]\n  ret)" :success true}}
+ {:id 1195 :mode :indent :text "(let [a 1]) ;\n  ret"
+  :options {:cursor-x 13 :cursor-line 0}
+  :result {:cursor-x 12 :cursor-line 0 :text "(let [a 1] ;\n  ret)" :success true}}
+ {:id 1200 :mode :indent :text "(foo)}}}}"
+  :options {:cursor-x 9 :cursor-line 0}
+  :result {:cursor-x 5 :cursor-line 0 :text "(foo)" :success true}}
+ {:id 1205 :mode :indent :text "(foo}}}})"
+  :options {:cursor-x 8 :cursor-line 0}
+  :result {:cursor-x 4 :cursor-line 0 :text "(foo)" :success true}}
+ {:id 1210 :mode :indent :text "(foo\n  ) bar"
+  :options {}
+  :result {:error {:name :leading-close-paren :line-no 1 :x 2} :text "(foo\n  ) bar" :success false}}
+ {:id 1215 :mode :indent :text "(foo\n  ); comment"
+  :options {}
+  :result {:text "(foo)\n  ; comment" :success true}}
+ {:id 1220 :mode :indent :text "[(foo\n  )] bar"
+  :options {}
+  :result {:error {:name :leading-close-paren :line-no 1 :x 2} :text "[(foo\n  )] bar" :success false}}
+ {:id 1225 :mode :indent :text "(foo [bar (...] baz)"
+  :options {:cursor-x 11 :cursor-line 0}
+  :result {:cursor-x 11 :cursor-line 0 :error {:name :unmatched-close-paren :line-no 0 :x 14} :text "(foo [bar (...] baz)" :success false}}
+ {:id 1230 :mode :indent :text "(foo [bar (] baz)])"
+  :options {:cursor-x 12 :cursor-line 0}
+  :result {:cursor-x 12 :cursor-line 0 :error {:name :unmatched-close-paren :line-no 0 :x 11} :text "(foo [bar (] baz)])" :success false}}
+ {:id 1235 :mode :indent :text "[... (foo [bar ] baz]  ...)]"
+  :options {:cursor-x 16 :cursor-line 0}
+  :result {:cursor-x 16 :cursor-line 0 :error {:name :unmatched-close-paren :line-no 0 :x 20} :text "[... (foo [bar ] baz]  ...)]" :success false}}
+ {:id 1240 :mode :indent :text "(let [{:keys foo bar]} my-map])"
+  :options {:cursor-x 13 :cursor-line 0}
+  :result {:cursor-x 13 :cursor-line 0 :error {:name :unmatched-close-paren :line-no 0 :x 20} :text "(let [{:keys foo bar]} my-map])" :success false}}
+ {:id 1245 :mode :indent :text "(a (b (c)) d) e)"
+  :options {:cursor-x 10 :cursor-line 0}
+  :result {:cursor-x 10 :cursor-line 0 :text "(a (b (c)) d) e" :success true}}
+ {:id 1250 :mode :indent :text "(a (b (c() d) e)"
+  :options {:cursor-x 9 :cursor-line 0}
+  :result {:cursor-x 9 :cursor-line 0 :text "(a (b (c() d) e))" :success true}}
+ {:id 1255 :mode :indent :text "(f [x (a (b c() d) y] g)"
+  :options {:cursor-x 14 :cursor-line 0}
+  :result {:cursor-x 14 :cursor-line 0 :error {:name :unmatched-close-paren :line-no 0 :x 20} :text "(f [x (a (b c() d) y] g)" :success false}}
+ {:id 1260 :mode :indent :text "(foo\n  bar) baz) qux"
+  :options {:cursor-x 6 :cursor-line 1}
+  :result {:cursor-x 6 :cursor-line 1 :error {:name :unmatched-close-paren :line-no 1 :x 10} :text "(foo\n  bar) baz) qux" :success false}}
+ {:id 1265 :mode :indent :text "(foo\n  [bar\n   bar) baz\n   bar])"
+  :options {:cursor-x 7 :cursor-line 2}
+  :result {:cursor-x 7 :cursor-line 2 :error {:name :unmatched-close-paren :line-no 2 :x 6} :text "(foo\n  [bar\n   bar) baz\n   bar])" :success false}}
+ {:id 1270 :mode :indent :text "(foo\n  [bar]\nbar) baz"
+  :options {:cursor-x 0 :cursor-line 2}
+  :result {:cursor-x 0 :cursor-line 2 :error {:name :unmatched-close-paren :line-no 2 :x 3} :text "(foo\n  [bar]\nbar) baz" :success false}}
+ {:id 1275 :mode :indent :text "(foo\n [bar]\n  bar) baz"
+  :options {:cursor-x 2 :cursor-line 2}
+  :result {:cursor-x 2 :cursor-line 2 :error {:name :unmatched-close-paren :line-no 2 :x 5} :text "(foo\n [bar]\n  bar) baz" :success false}}
+ {:id 1280 :mode :indent :text "(foo\n [bar\n bar]) baz"
+  :options {}
+  :result {:error {:name :unmatched-close-paren :line-no 2 :x 4} :text "(foo\n [bar\n bar]) baz" :success false}}
+ {:id 1285 :mode :indent :text "(foo bar ;)"
+  :options {:cursor-x 10 :cursor-line 0}
+  :result {:cursor-x 11 :cursor-line 0 :text "(foo bar) ;)" :success true}}
+ {:id 1290 :mode :indent :text "(let [x 1\n      y 2;])"
+  :options {:cursor-x 10 :cursor-line 1}
+  :result {:cursor-x 12 :cursor-line 1 :text "(let [x 1\n      y 2]);])" :success true}}
+ {:id 1295 :mode :indent :text "("
+  :options {:cursor-x 1 :cursor-line 0}
+  :result {:cursor-x 1 :cursor-line 0 :text "()" :success true}}
+ {:id 1300 :mode :indent :text "(def x [1 2 3])\n(def y 2)\n"
+  :options {:cursor-x 0 :cursor-line 2}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 1 :arg-x 5}] :cursor-x 0 :cursor-line 2 :text "(def x [1 2 3])\n(def y 2)\n" :success true}}
+ {:id 1305 :mode :indent :text "(foo bar\n  (baz boo))\n"
+  :options {:cursor-x 0 :cursor-line 2}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 0} {:x 2 :ch "(" :line-no 1 :arg-x 7}] :cursor-x 0 :cursor-line 2 :text "(foo bar\n  (baz boo))\n" :success true}}
+ {:id 1310 :mode :indent :text "(let [a {:foo 1}\n      \n      bar [1 2 3]]\n  bar)"
+  :options {:cursor-x 6 :cursor-line 1}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 0} {:x 5 :ch "[" :line-no 0} {:x 8 :ch "{" :line-no 0 :arg-x 14}] :cursor-x 6 :cursor-line 1 :text "(let [a {:foo 1}\n      \n      bar [1 2 3]]\n  bar)" :success true}}
+ {:id 1315 :mode :indent :text "(let [a {:foo 1}\n      bar (func 1 2 3)]\n  \n  bar)"
+  :options {:cursor-x 2 :cursor-line 2}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 0} {:x 5 :ch "[" :line-no 0} {:x 10 :ch "(" :line-no 1 :arg-x 16}] :cursor-x 2 :cursor-line 2 :text "(let [a {:foo 1}\n      bar (func 1 2 3)]\n  \n  bar)" :success true}}
+ {:id 1320 :mode :indent :text "(defn foo\n  \"hello, this is a docstring\"\n  [a b]\n  (let [sum (+ a b)\n        prod (* a b)]\n     {:sum sum\n      :prod prod}))"
+  :options {}
+  :result {:paren-trails [{:line-no 2 :start-x 6 :end-x 7} {:line-no 3 :start-x 18 :end-x 19} {:line-no 4 :start-x 19 :end-x 21} {:line-no 6 :start-x 16 :end-x 19}] :text "(defn foo\n  \"hello, this is a docstring\"\n  [a b]\n  (let [sum (+ a b)\n        prod (* a b)]\n     {:sum sum\n      :prod prod}))" :success true}}
+ {:id 1400 :mode :indent :text "(def foo \\,\n(def bar \\ # <-- space"
+  :options {:comment-chars ["#"]}
+  :result {:text "(def foo \\,)\n(def bar \\ )# <-- space" :success true}}
+ {:id 1405 :mode :indent :text "(def foo q)"
+  :options {:comment-chars "q"}
+  :result {:text "(def foo) q)" :success true}}
+ {:id 1410 :mode :indent :text "(def foo [a b]\n  # \"my multiline\n  # docstring.\"\nret)"
+  :options {:comment-chars ["#"]}
+  :result {:text "(def foo [a b])\n  # \"my multiline\n  # docstring.\"\nret" :success true}}
+ {:id 1415 :mode :indent :text "(let [a 1\n      b 2\n      c {:foo 1\n         ## :bar 2}]\n  ret)"
+  :options {:comment-chars "#"}
+  :result {:text "(let [a 1\n      b 2\n      c {:foo 1}]\n         ## :bar 2}]\n  ret)" :success true}}
+ {:id 2315 :mode :indent :text "(let ((}{ 2\n      (]]] 5\n  (- }{ ]]]"
+  :options {:open-paren-chars "(" :close-paren-chars ")"}
+  :result {:text "(let ((}{ 2)\n      (]]] 5))\n  (- }{ ]]]))" :success true}}
+ {:id 2000 :mode :paren :text "(let [foo 1]\nfoo)"
+  :options {}
+  :result {:text "(let [foo 1]\n foo)" :success true}}
+ {:id 2005 :mode :paren :text "(let [foo 1]\n      foo)"
+  :options {}
+  :result {:text "(let [foo 1]\n     foo)" :success true}}
+ {:id 2010 :mode :paren :text "(let [foo {:a 1}]\n           foo)"
+  :options {}
+  :result {:text "(let [foo {:a 1}]\n     foo)" :success true}}
+ {:id 2015 :mode :paren :text "(let [foo 1]\n      foo)\n\n(let [foo 1]\nfoo)"
+  :options {}
+  :result {:text "(let [foo 1]\n     foo)\n\n(let [foo 1]\n foo)" :success true}}
+ {:id 2020 :mode :paren :text "(let [foo [1 2 3]]\n      (-> foo\n          (map inc)))"
+  :options {}
+  :result {:text "(let [foo [1 2 3]]\n     (-> foo\n         (map inc)))" :success true}}
+ {:id 2025 :mode :paren :text "(let [foo 1\n      ]; <-- spaces\n  foo)"
+  :options {}
+  :result {:text "(let [foo 1]\n      ; <-- spaces\n  foo)" :success true}}
+ {:id 2030 :mode :paren :text "(let [foo 1\n      bar 2\n\n     ] (+ foo bar\n  ); <-- spaces\n)"
+  :options {}
+  :result {:text "(let [foo 1\n      bar 2]\n\n     (+ foo bar))\n  ; <-- spaces\n" :success true}}
+ {:id 2035 :mode :paren :text "(def x [1 2 3 4\n         5 6 7 8])"
+  :options {}
+  :result {:text "(def x [1 2 3 4\n         5 6 7 8])" :success true}}
+ {:id 2040 :mode :paren :text "  (assoc x\n:foo 1\n     :bar 2)"
+  :options {}
+  :result {:text "  (assoc x\n   :foo 1\n     :bar 2)" :success true}}
+ {:id 2045 :mode :paren :text "(foo"
+  :options {}
+  :result {:error {:name :unclosed-paren :line-no 0 :x 0} :text "(foo" :success false}}
+ {:id 2050 :mode :paren :text "(defn foo\n[arg arg2\nbar"
+  :options {}
+  :result {:error {:name :unclosed-paren :line-no 1 :x 0} :text "(defn foo\n[arg arg2\nbar" :success false}}
+ {:id 2055 :mode :paren :text "(foo})"
+  :options {}
+  :result {:error {:name :unmatched-close-paren :line-no 0 :x 4} :text "(foo})" :success false}}
+ {:id 2060 :mode :paren :text "(foo\n  })"
+  :options {}
+  :result {:error {:name :unmatched-close-paren :line-no 1 :x 2} :text "(foo\n  })" :success false}}
+ {:id 2065 :mode :paren :text "(defn foo\n  [arg\n  bar)"
+  :options {}
+  :result {:error {:name :unmatched-close-paren :line-no 2 :x 5} :text "(defn foo\n  [arg\n  bar)" :success false}}
+ {:id 2070 :mode :paren :text "; hello \\n world"
+  :options {}
+  :result {:text "; hello \\n world" :success true}}
+ {:id 2075 :mode :paren :text "(def foo \\,)\n(def bar \\ )"
+  :options {}
+  :result {:text "(def foo \\,)\n(def bar \\ )" :success true}}
+ {:id 2080 :mode :paren :text "(foo [a b]\\\nc)"
+  :options {}
+  :result {:error {:name :eol-backslash :line-no 0 :x 10} :text "(foo [a b]\\\nc)" :success false}}
+ {:id 2085 :mode :paren :text "(def foo\n  \"hello\n  bar)"
+  :options {}
+  :result {:error {:name :unclosed-quote :line-no 1 :x 2} :text "(def foo\n  \"hello\n  bar)" :success false}}
+ {:id 2090 :mode :paren :text "(def foo [a b]\n  ; \"my string\nret)"
+  :options {}
+  :result {:error {:name :quote-danger :line-no 1 :x 4} :text "(def foo [a b]\n  ; \"my string\nret)" :success false}}
+ {:id 2095 :mode :paren :text "(def foo [a b]\n  ; \"my multiline\n  ; docstring.\"\nret)"
+  :options {}
+  :result {:text "(def foo [a b]\n  ; \"my multiline\n  ; docstring.\"\n ret)" :success true}}
+ {:id 2100 :mode :paren :text "( )\"\n\""
+  :options {}
+  :result {:text "( )\"\n\"" :success true}}
+ {:id 2105 :mode :paren :text "(foo )"
+  :options {:cursor-x 5 :cursor-line 0}
+  :result {:cursor-x 5 :cursor-line 0 :text "(foo )" :success true}}
+ {:id 2110 :mode :paren :text "(foo [1 2 3 ] )"
+  :options {:cursor-x 12 :cursor-line 0}
+  :result {:cursor-x 12 :cursor-line 0 :text "(foo [1 2 3 ] )" :success true}}
+ {:id 2115 :mode :paren :text "(foo )"
+  :options {}
+  :result {:text "(foo)" :success true}}
+ {:id 2120 :mode :paren :text "(foo [1 2 3 ] )"
+  :options {}
+  :result {:text "(foo [1 2 3])" :success true}}
+ {:id 2125 :mode :paren :text "(foo [a b\n])"
+  :options {:cursor-x 0 :cursor-line 1}
+  :result {:cursor-x 6 :cursor-line 1 :text "(foo [a b\n      ])" :success true}}
+ {:id 2130 :mode :paren :text "(foo [1 2 3\n 4 5 6\n 7 8 9])"
+  :options {:cursor-x 8 :cursor-line 2}
+  :result {:cursor-x 13 :cursor-line 2 :text "(foo [1 2 3\n      4 5 6\n      7 8 9])" :success true}}
+ {:id 2135 :mode :paren :text "(let [foo 1\n           ; comment 1\n           bar 2\n           baz 3])\n           ; comment 2"
+  :options {:changes [{:line-no 0 :x 5 :old-text "    " :new-text ""}]}
+  :result {:text "(let [foo 1\n       ; comment 1\n       bar 2\n       baz 3])\n       ; comment 2" :success true}}
+ {:id 2140 :mode :paren :text "(def foo\n      ; comment 1\n      bar)\n      ; comment 2"
+  :options {:changes [{:line-no 0 :x 0 :old-text "   " :new-text ""}]}
+  :result {:text "(def foo\n   ; comment 1\n   bar)\n   ; comment 2" :success true}}
+ {:id 2145 :mode :paren :text "(def foo (bar\n       4 5 6\n       ; comment 1\n       7 8 9))\n       ; comment 2"
+  :options {:changes [{:line-no 0 :x 4 :old-text "" :new-text " foo"}]}
+  :result {:text "(def foo (bar\n           4 5 6\n           ; comment 1\n           7 8 9))\n           ; comment 2" :success true}}
+ {:id 2150 :mode :paren :text "(foo (if some-condition\n         println) foo {:foo 1\n                          :bar 2})"
+  :options {:changes [{:line-no 0 :x 1 :old-text "my-fn" :new-text "foo"} {:line-no 1 :x 18 :old-text "my-fun" :new-text "foo"}]}
+  :result {:text "(foo (if some-condition\n       println) foo {:foo 1\n                     :bar 2})" :success true}}
+ {:id 2155 :mode :paren :text "(foo [bar baz]\n       1 2 3\n       4 5 6)"
+  :options {}
+  :result {:text "(foo [bar baz]\n     1 2 3\n     4 5 6)" :success true}}
+ {:id 2160 :mode :paren :text "(foo [bar baz\n         ]; <-- spaces\n       1 2 3\n       4 5 6)"
+  :options {}
+  :result {:text "(foo [bar baz]\n         ; <-- spaces\n     1 2 3\n     4 5 6)" :success true}}
+ {:id 2165 :mode :paren :text "(defn foo\n  \"hello, this is a docstring\"\n  [a b]\n  (let [sum (+ a b)\n        prod (* a b)]\n     {:sum sum\n      :prod prod}))"
+  :options {}
+  :result {:paren-trails [{:line-no 2 :start-x 6 :end-x 7} {:line-no 3 :start-x 18 :end-x 19} {:line-no 4 :start-x 19 :end-x 21} {:line-no 6 :start-x 16 :end-x 19}] :text "(defn foo\n  \"hello, this is a docstring\"\n  [a b]\n  (let [sum (+ a b)\n        prod (* a b)]\n     {:sum sum\n      :prod prod}))" :success true}}
+ {:id 2170 :mode :paren :text "  (foo\n  (bar\n    baz))"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    (bar\n      baz))" :success true}}
+ {:id 2175 :mode :paren :text "  (foo\n    (bar\n    baz))"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "} {:line-no 1 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    (bar\n      baz))" :success true}}
+ {:id 2180 :mode :paren :text "  (foo\n      (bar\n        baz))"
+  :options {:changes [{:line-no 1 :x 0 :old-text "" :new-text "  "} {:line-no 2 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n      (bar\n        baz))" :success true}}
+ {:id 2185 :mode :paren :text "  (foo\n  bar\n  baz)"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    bar\n    baz)" :success true}}
+ {:id 2190 :mode :paren :text "  (foo\n    bar\n  baz)"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "} {:line-no 1 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    bar\n    baz)" :success true}}
+ {:id 2195 :mode :paren :text "(foo\n    bar\n    baz)"
+  :options {:changes [{:line-no 1 :x 0 :old-text "" :new-text "  "} {:line-no 2 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "(foo\n    bar\n    baz)" :success true}}
+ {:id 2200 :mode :paren :text "(def x [1 2 3])\n(def y 2)\n"
+  :options {:cursor-x 0 :cursor-line 2}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 1 :arg-x 5}] :cursor-x 0 :cursor-line 2 :text "(def x [1 2 3])\n(def y 2)\n" :success true}}
+ {:id 2205 :mode :paren :text "(foo bar\n  (baz boo))\n"
+  :options {:cursor-x 0 :cursor-line 2}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 0} {:x 2 :ch "(" :line-no 1 :arg-x 7}] :cursor-x 0 :cursor-line 2 :text "(foo bar\n  (baz boo))\n" :success true}}
+ {:id 2210 :mode :paren :text "(let [a {:foo 1}\n      \n      bar [1 2 3]]\n  bar)"
+  :options {:cursor-x 6 :cursor-line 1}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 0} {:x 5 :ch "[" :line-no 0} {:x 8 :ch "{" :line-no 0 :arg-x 14}] :cursor-x 6 :cursor-line 1 :text "(let [a {:foo 1}\n      \n      bar [1 2 3]]\n  bar)" :success true}}
+ {:id 2215 :mode :paren :text "(let [a {:foo 1}\n      bar (func 1 2 3)]\n  \n  bar)"
+  :options {:cursor-x 2 :cursor-line 2}
+  :result {:tab-stops [{:x 0 :ch "(" :line-no 0} {:x 5 :ch "[" :line-no 0} {:x 10 :ch "(" :line-no 1 :arg-x 16}] :cursor-x 2 :cursor-line 2 :text "(let [a {:foo 1}\n      bar (func 1 2 3)]\n  \n  bar)" :success true}}
+ {:id 2300 :mode :paren :text "(let [foo 1\n      ]# <-- spaces\n  foo)"
+  :options {:comment-chars "#"}
+  :result {:text "(let [foo 1]\n      # <-- spaces\n  foo)" :success true}}
+ {:id 2305 :mode :paren :text "(let [foo 1\n      bar 2\n\n     ] (+ foo bar\n  )% <-- spaces\n)"
+  :options {:comment-chars [";" "%"]}
+  :result {:text "(let [foo 1\n      bar 2]\n\n     (+ foo bar))\n  % <-- spaces\n" :success true}}
+ {:id 2310 :mode :paren :text "(def foo [a b]\n  # \"my string\nret)"
+  :options {:comment-chars ["#"]}
+  :result {:error {:name :quote-danger :line-no 1 :x 4} :text "(def foo [a b]\n  # \"my string\nret)" :success false}}
+ {:id 1420 :mode :paren :text "(let ((}{ 2)\n      (]]] 5))\n  (- }{ ]]]))"
+  :options {:open-paren-chars "(" :close-paren-chars ")"}
+  :result {:text "(let ((}{ 2)\n      (]]] 5))\n  (- }{ ]]]))" :success true}}
+ {:id 3000 :mode :smart :text "(let [a 1\n      ])"
+  :options {:cursor-x 6 :cursor-line 1}
+  :result {:cursor-x 6 :cursor-line 1 :text "(let [a 1\n      ])" :success true}}
+ {:id 3005 :mode :smart :text "(let [a 1\n      ]); <-- spaces"
+  :options {}
+  :result {:text "(let [a 1])\n      ; <-- spaces" :success true}}
+ {:id 3010 :mode :smart :text "(let [a 1\n      ] (+ a 2))"
+  :options {:cursor-x 6 :cursor-line 1}
+  :result {:cursor-x 6 :cursor-line 1 :text "(let [a 1\n      ] (+ a 2))" :success true}}
+ {:id 3015 :mode :smart :text "(let [a 1\n      ] (+ a 2))"
+  :options {}
+  :result {:text "(let [a 1]\n     (+ a 2))" :success true}}
+ {:id 3020 :mode :smart :text "(let [a 1\n  ] (+ a 2))"
+  :options {:cursor-x 2 :cursor-line 1}
+  :result {:cursor-x 6 :cursor-line 1 :text "(let [a 1\n      ] (+ a 2))" :success true}}
+ {:id 3025 :mode :smart :text "(let [a 1\n      ])"
+  :options {:cursor-x 7 :cursor-line 1}
+  :result {:cursor-x 5 :cursor-line 1 :text "(let [a 1]\n     )" :success true}}
+ {:id 3030 :mode :smart :text ")"
+  :options {:cursor-x 0 :cursor-line 0 :changes [{:line-no 0 :x 0 :old-text "(" :new-text ""}]}
+  :result {:cursor-x 0 :cursor-line 0 :text "" :success true}}
+ {:id 3035 :mode :smart :text "(foo\n  ))"
+  :options {:cursor-x 2 :cursor-line 1 :changes [{:line-no 1 :x 2 :old-text "(bar" :new-text ""}]}
+  :result {:cursor-x 2 :cursor-line 1 :text "(foo\n  )" :success true}}
+ {:id 3040 :mode :smart :text "(foo\n  })"
+  :options {:cursor-x 3 :cursor-line 1}
+  :result {:cursor-x 2 :cursor-line 1 :text "(foo\n  )" :success true}}
+ {:id 3045 :mode :smart :text "(foo\n  ) foo} bar"
+  :options {:cursor-x 12 :cursor-line 1}
+  :result {:cursor-x 12 :cursor-line 1 :error {:name :unmatched-close-paren :line-no 1 :x 7} :text "(foo\n  ) foo} bar" :success false}}
+ {:id 3050 :mode :smart :text "(foo\n  ) (bar"
+  :options {:cursor-x 8 :cursor-line 1}
+  :result {:cursor-x 8 :cursor-line 1 :error {:name :unclosed-paren :line-no 1 :x 4} :text "(foo\n  ) (bar" :success false}}
+ {:id 3055 :mode :smart :text "(foo (bar)\n      baz)"
+  :options {:changes [{:line-no 1 :x 5 :old-text "" :new-text " "}]}
+  :result {:text "(foo (bar\n      baz))" :success true}}
+ {:id 3060 :mode :smart :text "(foo\n{:a 1\n   :b 2})"
+  :options {:changes [{:line-no 1 :x 0 :old-text "  " :new-text ""}]}
+  :result {:text "(foo)\n{:a 1\n :b 2}" :success true}}
+ {:id 3065 :mode :smart :text "(foo)\n  {:a 1\n :b 2}"
+  :options {:changes [{:line-no 1 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "(foo\n  {:a 1\n   :b 2})" :success true}}
+ {:id 3070 :mode :smart :text "(foo\n  {:a 1\n:b 2})"
+  :options {:changes [{:line-no 2 :x 0 :old-text "   " :new-text ""}]}
+  :result {:text "(foo\n  {:a 1})\n:b 2" :success true}}
+ {:id 3075 :mode :smart :text "(defn foo\n[a b]\n  bar)"
+  :options {:changes [{:line-no 1 :x 0 :old-text "  " :new-text ""}]}
+  :result {:text "(defn foo)\n[a b\n  bar]" :success true}}
+ {:id 3080 :mode :smart :text "(defn foo\n    [a b]\n    bar)"
+  :options {:changes [{:line-no 0 :x 0 :old-text "  " :new-text ""}]}
+  :result {:text "(defn foo\n  [a b]\n  bar)" :success true}}
+ {:id 3085 :mode :smart :text "(defn foo\n    [a b]\n    ; comment 1\n    bar)\n    ; comment 2"
+  :options {:changes [{:line-no 0 :x 0 :old-text "  " :new-text ""}]}
+  :result {:text "(defn foo\n  [a b]\n  ; comment 1\n  bar)\n  ; comment 2" :success true}}
+ {:id 3090 :mode :smart :text "(defn foo\n[a b\n   c d]\n  bar\n  baz)"
+  :options {:cursor-x 0 :cursor-line 1 :changes [{:line-no 1 :x 0 :old-text "  " :new-text ""}]}
+  :result {:cursor-x 0 :cursor-line 1 :text "(defn foo)\n[a b\n c d]\n  bar\n  baz" :success true}}
+ {:id 3095 :mode :smart :text "(defn foo)\n[a b\n c d]\n  bar\n  baz"
+  :options {:cursor-x 0 :cursor-line 1}
+  :result {:cursor-x 0 :cursor-line 1 :text "(defn foo)\n[a b\n c d]\n  bar\n  baz" :success true}}
+ {:id 3100 :mode :smart :text "(foo (if some-condition\n         println) foo {:foo 1\n                          :bar 2})"
+  :options {:changes [{:line-no 0 :x 1 :old-text "my-fn" :new-text "foo"} {:line-no 1 :x 18 :old-text "my-fun" :new-text "foo"}]}
+  :result {:text "(foo (if some-condition\n       println) foo {:foo 1\n                     :bar 2})" :success true}}
+ {:id 3105 :mode :smart :text "((((1\n        2\n        3)))\n    4)"
+  :options {:cursor-x 1 :cursor-line 0 :changes [{:line-no 0 :x 1 :old-text "foo " :new-text ""}]}
+  :result {:cursor-x 1 :cursor-line 0 :text "((((1\n    2\n    3)))\n    4)" :success true}}
+ {:id 3110 :mode :smart :text "((((1\n    2\n    3)))\n    4)"
+  :options {:prev-cursor-x 1 :prev-cursor-line 0}
+  :result {:text "((((1\n    2\n    3)))\n 4)" :success true}}
+ {:id 3115 :mode :smart :text "((((1\n    2\n    3)))\n    4)"
+  :options {:cursor-x 2 :cursor-line 0 :prev-cursor-x 1 :prev-cursor-line 0}
+  :result {:cursor-x 2 :cursor-line 0 :text "((((1\n    2\n    3)))\n 4)" :success true}}
+ {:id 3120 :mode :smart :text "  (foo\n  (bar\n    baz))"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    (bar\n      baz))" :success true}}
+ {:id 3125 :mode :smart :text "  (foo\n    (bar\n    baz))"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "} {:line-no 1 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    (bar\n      baz))" :success true}}
+ {:id 3130 :mode :smart :text "  (foo\n      (bar\n        baz))"
+  :options {:changes [{:line-no 1 :x 0 :old-text "" :new-text "  "} {:line-no 2 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n      (bar\n        baz))" :success true}}
+ {:id 3135 :mode :smart :text "  (foo\n  bar\n  baz)"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    bar\n    baz)" :success true}}
+ {:id 3140 :mode :smart :text "  (foo\n    bar\n  baz)"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "  "} {:line-no 1 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "  (foo\n    bar\n    baz)" :success true}}
+ {:id 3145 :mode :smart :text "(foo\n    bar\n    baz)"
+  :options {:changes [{:line-no 1 :x 0 :old-text "" :new-text "  "} {:line-no 2 :x 0 :old-text "" :new-text "  "}]}
+  :result {:text "(foo\n    bar\n    baz)" :success true}}
+ {:id 3150 :mode :smart :text "((reduce-kv (fn [m k v]\n            {}\n            {})))"
+  :options {:changes [{:line-no 0 :x 0 :old-text "" :new-text "("} {:line-no 1 :x 11 :old-text "" :new-text " "} {:line-no 2 :x 11 :old-text "" :new-text " "} {:line-no 2 :x 16 :old-text "" :new-text ")"}]}
+  :result {:text "((reduce-kv (fn [m k v])\n            {}\n            {}))" :success true}}
+ {:id 3155 :mode :smart :text "(let [a 1]\n  (\n    (foo)))"
+  :options {:changes [{:line-no 1 :x 2 :old-text "" :new-text "("} {:line-no 2 :x 2 :old-text "" :new-text "  "} {:line-no 2 :x 9 :old-text "" :new-text ")"}]}
+  :result {:text "(let [a 1]\n  (\n    (foo)))" :success true}}
+ {:id 3160 :mode :smart :text "(let [a 1]\n  (let [a 1]\n    (foo))\n  (foo))"
+  :options {:changes [{:line-no 1 :x 2 :old-text "" :new-text "(let [a 1]\n  (foo))"} {:line-no 2 :x 2 :old-text "" :new-text "  "}]}
+  :result {:text "(let [a 1]\n  (let [a 1]\n    (foo))\n  (foo))" :success true}}
+ {:id 3165 :mode :smart :text "{:a {:b (Integer/valueOf (-> \"\"\n                             (.length)))}}"
+  :options {:changes [{:line-no 0 :x 4 :old-text "                " :new-text ""} {:line-no 0 :x 8 :old-text "             " :new-text ""} {:line-no 1 :x 29 :old-text "                             " :new-text ""}]}
+  :result {:text "{:a {:b (Integer/valueOf (-> \"\"\n                             (.length)))}}" :success true}}
+ {:id 3200 :mode :smart :text "(let [a 1\n      ])$ <-- spaces"
+  :options {:comment-chars [";" "$"]}
+  :result {:text "(let [a 1])\n      $ <-- spaces" :success true}}
+ {:id 3205 :mode :smart :text "(defn foo\n    [a b]\n    # comment 1\n    bar)\n    # comment 2"
+  :options {:comment-chars ["#"] :changes [{:line-no 0 :x 0 :old-text "  " :new-text ""}]}
+  :result {:text "(defn foo\n  [a b]\n  # comment 1\n  bar)\n  # comment 2" :success true}}
+]
