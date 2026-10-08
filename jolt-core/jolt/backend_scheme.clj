@@ -2905,17 +2905,18 @@
     (:set :vector) (when (= 1 nargs) :coll)
     nil))
 
-;; Polymorphic inline-cache width. MUST match jolt-pic-n in host/chez/records.ss:
-;; the emitted scan reads slots [0..2N) and the epoch slot at 2N+1 of the cache
-;; vector jolt-pic-make allocates, so the two must agree.
+;; Polymorphic inline-cache width. MUST match jolt-pic-n in host/chez/protocols.ss:
+;; the emitted scan reads slots [0..2N) and the epoch slot at 2N of the cache
+;; vectors jolt-pic-empty and jolt-pic-add make, so the two must agree.
 (def ^:private pic-n 4)
-(def ^:private pic-epoch-idx (+ (* 2 pic-n) 1))
+(def ^:private pic-epoch-idx (* 2 pic-n))
 ;; the eq? scan over a PIC cache's N (desc . impl) pairs: each clause returns the
 ;; impl when its cached desc is eq? to d. Strung together with `or` so a hit short-
-;; circuits; a full miss falls through to the install helper (the caller appends it).
-;; v is always a length-(2N+2) jolt-pic-make vector (the cache cell starts #f and is
-;; only ever set to one), and the indices are constants below its length, so the
-;; vector type/bounds checks are redundant -- emit the per-site unsafe variant.
+;; circuits; a full miss falls through to the add helper (the caller appends it).
+;; v is always a length-(2N+1) cache vector (the cell starts #f, read as
+;; jolt-pic-empty, and is only ever set to one), and the indices are constants
+;; below its length, so the vector type/bounds checks are redundant -- emit the
+;; per-site unsafe variant.
 (defn- pic-scan-clauses [v d]
   (str/join " "
             (for [i (range pic-n)]
@@ -3183,19 +3184,25 @@
                         (let [c (fresh-label "_picv$")
                               scan (pic-scan-clauses v d)]
                           (swap! cells conj c)
-                          ;; hot path inlined: bind the receiver, the cache vector
-                          ;; (lazily allocated on first call), and its desc; then, if
-                          ;; the epoch still matches, eq?-scan the cached descs and
-                          ;; apply the hit impl directly — no helper call after warmup.
-                          ;; A miss (no cached desc / stale epoch) resolves + (re)fills
-                          ;; via the jolt-pic-install/-rebuild helpers.
-                          (str "(let* ((" r " " (first as) ")"
-                               " (" v " (or " c " (let ((_nv (jolt-pic-make))) (set! " c " _nv) _nv)))"
-                               " (" d " (jrec-pic-desc " r ")))"
-                               " ((if (and " d " (" (unsafe-prefix) "fx= (" (unsafe-prefix) "vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
-                                " (or " scan " (jolt-pic-install " v " " d " " proto " " method " " r "))"
-                                " (jolt-pic-rebuild " v " " d " " proto " " method " " r "))"
-                                " " apply-args "))"))
+                          ;; hot path inlined: bind the receiver, the site's cache
+                          ;; vector and the receiver's desc; then, if the epoch still
+                          ;; matches, eq?-scan the cached descs and apply the hit impl
+                          ;; directly — no helper call after warmup. A miss (no cached
+                          ;; desc / stale epoch) has jolt-pic-add build the next cache
+                          ;; and the cell is set! to it: a cache vector is shared by
+                          ;; every thread calling here, so none is written in place.
+                          ;; A full cache gets the impl back instead (megamorphic).
+                          ;; A receiver with no desc resolves without caching.
+                          (let [miss (str "(let ((_nv (jolt-pic-add " v " " d " " proto " " method " " r ")))"
+                                          " (if (procedure? _nv) _nv"
+                                          " (begin (set! " c " _nv) (" (unsafe-prefix) "vector-ref _nv 1))))")]
+                            (str "(let* ((" r " " (first as) ")"
+                                 " (" v " (or " c " jolt-pic-empty))"
+                                 " (" d " (jrec-pic-desc " r ")))"
+                                 " ((if (and " d " (" (unsafe-prefix) "fx= (" (unsafe-prefix) "vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
+                                 " (or " scan " " miss ")"
+                                 " (if " d " " miss " (protocol-resolve " proto " " method " " r ")))"
+                                 " " apply-args "))")))
                         (str "(let* ((" r " " (first as) "))"
                              " ((protocol-resolve " proto " " method " " r ") " apply-args "))")))))
       ;; a java.lang.Math call jolt.passes.numeric proved is over flonum operands:

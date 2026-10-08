@@ -1069,46 +1069,56 @@
 
 ;; ---- per-site polymorphic inline cache (PIC) --------------------------------
 ;; The back end emits, at each protocol call site it recognizes under --opt, a
-;; cache keyed on the receiver's descriptor identity: a small mutable vector cell
-;; holding N (desc . impl) pairs + a round-robin write cursor + the epoch at which
-;; the cache was populated. The emitted call inlines the eq? scan over the cached
-;; descs (no string hashing, no table walk, no helper call after warmup); a miss
-;; (uncached desc) or a stale epoch resolves via these helpers and (re)fills the
-;; cache. The epoch guard invalidates the whole cache when ANY register-protocol-
-;; method runs after it was populated, so an extend-type at runtime can't leave a
-;; cached site serving a pre-extension impl. jolt-pic-n is the cache width — 4
-;; covers the megamorphic bench; a monomorphic site stays on the devirt path above.
+;; cache keyed on the receiver's descriptor identity: a vector of N (desc . impl)
+;; pairs, most recent first, and the epoch at which they were resolved. The
+;; emitted call inlines the eq? scan over the cached descs (no string hashing, no
+;; table walk, no helper call after warmup); a miss (uncached desc) or a stale
+;; epoch resolves through jolt-pic-add, which returns the site's next cache. The
+;; epoch guard invalidates the whole cache when ANY register-protocol-method runs
+;; after it was resolved, so an extend-type at runtime can't leave a cached site
+;; serving a pre-extension impl. jolt-pic-n is the cache width — 4 covers the
+;; megamorphic bench; a monomorphic site stays on the devirt path below.
+;;
+;; Every thread calling the function shares the site's cache, so a cache vector
+;; is never written once published: a miss builds a new one and the site cell is
+;; set! to it, a single pointer store. A reader holds whichever vector it loaded,
+;; whose pairs and epoch always agree. Two threads missing at once each publish
+;; their own and one entry is lost, which costs a later miss and nothing else.
+;;
+;; A site that has filled its cache in the current epoch is megamorphic: a miss
+;; there resolves without caching, so a site seeing more types than it holds
+;; keeps the types it has rather than allocating a cache per call.
 (define jolt-pic-n 4)
-(define (jolt-pic-make)
-  ;; #(d0 i0 d1 i1 d2 i2 d3 i3 cursor epoch): 2N entries + cursor + epoch.
-  ;; epoch starts at -1 (jolt-proto-epoch is always >= 0) so the very first call
-  ;; misses the epoch guard and rebuilds, seeding slot 0 + stamping the real epoch.
-  (let ((v (make-vector (+ (* jolt-pic-n 2) 2) #f)))
-    (vector-set! v (* jolt-pic-n 2) 0)
-    (vector-set! v (+ (* jolt-pic-n 2) 1) -1)
+;; #(d0 i0 d1 i1 d2 i2 d3 i3 epoch). The empty cache every site starts from: its
+;; epoch, -1, never matches jolt-proto-epoch, so the first call misses.
+(define jolt-pic-empty
+  (let ((v (make-vector (+ (* jolt-pic-n 2) 1) #f)))
+    (vector-set! v (* jolt-pic-n 2) -1)
     v))
-;; cache current, desc not found: resolve + round-robin install into the cursor slot.
-(define (jolt-pic-install v d proto method obj)
-  (let ((f (protocol-resolve proto method obj)))
-    (when d
-      (let ((slot (* (vector-ref v (* jolt-pic-n 2)) 2)))
-        (vector-set! v slot d)
-        (vector-set! v (fx+ slot 1) f)
-        (vector-set! v (* jolt-pic-n 2)
-                     (if (fx= (vector-ref v (* jolt-pic-n 2)) (fx- jolt-pic-n 1))
-                         0 (fx+ (vector-ref v (* jolt-pic-n 2)) 1)))))
-    f))
-;; epoch stale (an extension ran) or first population: clear, resolve, seed slot 0.
-(define (jolt-pic-rebuild v d proto method obj)
-  (let ((f (protocol-resolve proto method obj)))
-    (when d
-      (let loop ((i 0))
-        (when (fx< i (* jolt-pic-n 2)) (vector-set! v i #f) (loop (fx+ i 1))))
-      (vector-set! v 0 d)
-      (vector-set! v 1 f)
-      (vector-set! v (* jolt-pic-n 2) 1)
-      (vector-set! v (+ (* jolt-pic-n 2) 1) jolt-proto-epoch))
-    f))
+;; A miss on desc d in cache v: the impl, when v is full and current, else the
+;; site's next cache, with d and its impl in slot 0 followed by v's entries when
+;; they are of the current epoch. The epoch is read before resolving, so an
+;; extension that lands in between leaves the new cache stale rather than holding
+;; a pre-extension impl under the new epoch.
+(define (jolt-pic-add v d proto method obj)
+  (let* ((e jolt-proto-epoch)
+         (top (* jolt-pic-n 2))
+         (current? (eqv? (vector-ref v top) e)))
+    (if (and current? (vector-ref v (fx- top 2)))
+        (protocol-resolve proto method obj)
+        (let ((f (protocol-resolve proto method obj))
+              (nv (make-vector (fx+ top 1) #f)))
+          (vector-set! nv 0 d)
+          (vector-set! nv 1 f)
+          (when current?
+            (let loop ((i 2))
+              (when (fx< i top)
+                (vector-set! nv i (vector-ref v (fx- i 2)))
+                (loop (fx+ i 1)))))
+          (vector-set! nv top e)
+          ;; the vector's contents must be visible before the pointer to it is
+          (when jolt-mt? (memory-order-release))
+          nv))))
 
 ;; devirt-resolve: the impl for a call the inference proved monomorphic. Try the
 ;; static type tag directly (the fast path that skips receiver-type computation),

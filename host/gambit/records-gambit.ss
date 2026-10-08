@@ -2282,38 +2282,29 @@
 
 (define jolt-pic-n 4)
 
-(define (jolt-pic-make)
-  (let ((v (make-vector (+ (* jolt-pic-n 2) 2) #f)))
-    (vector-set! v (* jolt-pic-n 2) 0)
-    (vector-set! v (+ (* jolt-pic-n 2) 1) -1)
+(define jolt-pic-empty
+  (let ((v (make-vector (+ (* jolt-pic-n 2) 1) #f)))
+    (vector-set! v (* jolt-pic-n 2) -1)
     v))
 
-(define (jolt-pic-install v d proto method obj)
-  (let ((f (protocol-resolve proto method obj)))
-    (when d
-      (let ((slot (* (vector-ref v (* jolt-pic-n 2)) 2)))
-        (vector-set! v slot d)
-        (vector-set! v (fx+ slot 1) f)
-        (vector-set!
-          v
-          (* jolt-pic-n 2)
-          (if (fx= (vector-ref v (* jolt-pic-n 2)) (fx- jolt-pic-n 1))
-              0
-              (fx+ (vector-ref v (* jolt-pic-n 2)) 1)))))
-    f))
-
-(define (jolt-pic-rebuild v d proto method obj)
-  (let ((f (protocol-resolve proto method obj)))
-    (when d
-      (let loop ((i 0))
-        (when (fx< i (* jolt-pic-n 2))
-          (vector-set! v i #f)
-          (loop (fx+ i 1))))
-      (vector-set! v 0 d)
-      (vector-set! v 1 f)
-      (vector-set! v (* jolt-pic-n 2) 1)
-      (vector-set! v (+ (* jolt-pic-n 2) 1) jolt-proto-epoch))
-    f))
+(define (jolt-pic-add v d proto method obj)
+  (let* ((e jolt-proto-epoch)
+         (top (* jolt-pic-n 2))
+         (current? (eqv? (vector-ref v top) e)))
+    (if (and current? (vector-ref v (fx- top 2)))
+        (protocol-resolve proto method obj)
+        (let ((f (protocol-resolve proto method obj))
+              (nv (make-vector (fx+ top 1) #f)))
+          (vector-set! nv 0 d)
+          (vector-set! nv 1 f)
+          (when current?
+            (let loop ((i 2))
+              (when (fx< i top)
+                (vector-set! nv i (vector-ref v (fx- i 2)))
+                (loop (fx+ i 1)))))
+          (vector-set! nv top e)
+          (when jolt-mt? (memory-order-release))
+          nv))))
 
 (define (devirt-resolve type-tag proto-name method-name obj)
   (or (find-protocol-method type-tag proto-name method-name)
