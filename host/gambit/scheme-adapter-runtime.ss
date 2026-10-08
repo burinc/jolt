@@ -242,6 +242,13 @@
 ;; Byte order of the host. Contract: the byte order. The gambit target's
 ;; double-to-raw-bits byte layout (hasheq.ss) assumes little-endian; both
 ;; supported platforms (arm64/x86-64 macOS and linux) are little-endian.
+;; (sa-flonum->bits x) / (sa-bits->flonum b): binary64 pattern as an unsigned
+;; 64-bit integer and back; the high-word pair is the upper 32 bits of it.
+(define (sa-flonum->bits x) (##flonum->ieee754-64 x))
+(define (sa-bits->flonum b) (##ieee754-64->flonum b))
+(define (sa-flonum-hi32 x) (quotient (##flonum->ieee754-64 x) 4294967296))
+(define (sa-hi32->flonum h) (##ieee754-64->flonum (* h 4294967296)))
+
 (define (sa-endian)
   'little)
 

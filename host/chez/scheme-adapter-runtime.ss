@@ -660,6 +660,47 @@
 ;; Byte order of the host. Contract: the byte order. Degradation: none — the
 ;; runtime always knows its own byte order, so a tag that does not name one is
 ;; answered by native-endianness rather than by #f.
+;; (sa-flonum->bits x) / (sa-bits->flonum b): binary64 pattern as an unsigned
+;; 64-bit integer and back, through an 8-byte buffer of the call's own (a
+;; shared one would race between threads).
+(define (sa-flonum->bits x)
+  (let ((bv (make-bytevector 8)))
+    (bytevector-ieee-double-set! bv 0 x (endianness little))
+    (bytevector-u64-ref bv 0 (endianness little))))
+(define (sa-bits->flonum b)
+  (let ((bv (make-bytevector 8)))
+    (bytevector-u64-set! bv 0 b (endianness little))
+    (bytevector-ieee-double-ref bv 0 (endianness little))))
+;; The high word is read straight out of the flonum, without a buffer, which is
+;; most of a bit cast's cost (fdlibm's cbrt makes four). The payload's offset in
+;; the object is found once at load by scanning forward from the object's start
+;; for 2.5's bytes; a flonum's payload sits inside its first 16 bytes, so the
+;; scan never reads outside the object. The high word is the payload's upper
+;; half in the machine's byte order.
+(define sa-flonum-disp
+  (let loop ((d 0))
+    (cond ((fx> d 8) (error 'sa-flonum-disp "no flonum payload"))
+          ((eqv? (#%$object-ref 'double 2.5 d) 2.5) d)
+          (else (loop (fx+ d 1))))))
+(define sa-flonum-hi-disp
+  (if (eq? (native-endianness) (endianness little)) (fx+ sa-flonum-disp 4) sa-flonum-disp))
+(define (sa-flonum-hi32 x) (#%$object-ref 'unsigned-32 x sa-flonum-hi-disp))
+;; Built arithmetically, exactly: (1 + m/2^20) * 2^(e-1023) for a normal field,
+;; m * 2^-1042 for a subnormal one, each power of two from a table.
+(define sa-pow2-base 1100)
+(define sa-pow2
+  (let ((v (make-flvector 2200)))
+    (do ((k 0 (fx+ k 1))) ((fx= k 2200) v)
+      (flvector-set! v k (inexact (expt 2 (- k sa-pow2-base)))))))
+(define (sa-hi32->flonum h)
+  (let* ((e (fxand (fxsrl h 20) #x7ff))
+         (m (fxand h #xfffff))
+         (mag (cond ((fx= e #x7ff) (if (fx= m 0) +inf.0 +nan.0))
+                    ((fx= e 0) (fl* (fixnum->flonum m) (flvector-ref sa-pow2 (fx- sa-pow2-base 1042))))
+                    (else (fl* (fixnum->flonum (fx+ #x100000 m))
+                               (flvector-ref sa-pow2 (fx+ sa-pow2-base (fx- e 1043))))))))
+    (if (fx= 0 (fxand h #x80000000)) mag (fl- mag))))
+
 (define (sa-endian)
   (or (sa-endian-for-tag (sa-host-tag)) (native-endianness)))
 
