@@ -709,6 +709,13 @@
 ;; R6RS real->flonum: seq.ss's numeric macros widen an exact operand with it
 ;; before every mixed fl* / fl+, so (* 2 1.5) reached an unbound global.
 (define (real->flonum x) (exact->inexact x))
+;; Chez flsingle: the nearest single-precision value, as a flonum
+;; (converters.ss's (float x)). An f32vector store rounds the same way, C's
+;; double-to-float conversion (round half even, a tiny double flushes to 0.0).
+(define (flsingle x)
+  (let ((v (make-f32vector 1)))
+    (f32vector-set! v 0 x)
+    (f32vector-ref v 0)))
 
 ;; Chez bignum?: an exact integer outside the fixnum range (natives-format.ss).
 (define (bignum? x) (and (exact-integer? x) (not (fixnum? x))))

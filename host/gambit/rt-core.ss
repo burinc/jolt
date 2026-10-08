@@ -119,6 +119,7 @@
 (define (jolt->fl x)
   (cond ((flonum? x) x)
         ((number? x) (exact->inexact x))
+        ((jfloat? x) (jfloat-fl x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
 ;; Mirrors rt.ss's spliced jolt-not (see values.ss jolt-nil? for why these are

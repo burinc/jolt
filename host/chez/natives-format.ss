@@ -396,6 +396,8 @@
 (define (fmt-real d a flags width render)
   (cond
     ((jolt-nil? a) (fmt-pad "null" flags width #f))
+    ;; Formatter prints a Float as the double it widens to
+    ((jfloat? a) (fmt-real d (jfloat-fl a) flags width render))
     ((flonum? a)
      (cond ((nan? a) (fmt-sign-pad #f "NaN" flags width #f))
            ((infinite? a) (fmt-sign-pad (< a 0) "Infinity" flags width #f))
@@ -410,6 +412,7 @@
 (define (fmt-hex-real d a flags width prec)
   (cond
     ((jolt-nil? a) (fmt-pad "null" flags width #f))
+    ((jfloat? a) (fmt-hex-real d (jfloat-fl a) flags width prec))
     ((flonum? a)
      (cond ((nan? a) (fmt-sign-pad #f "NaN" flags width #f))
            ((infinite? a) (fmt-sign-pad (< a 0) "Infinity" flags width #f))

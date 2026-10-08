@@ -1166,13 +1166,18 @@
     ;; Guard the fixnum case instead of widening the contract: the fast path is
     ;; the same inlined fixnum->flonum, and a bignum falls to jolt->fl, which
     ;; converts it exactly as the reference's long->double does.
-    (if (:fl-coerce node)
+    (cond
+      (:fl-coerce node)
       (let [t (fresh-label "_fc$")]
         (str "(let ((" t " " s "))"
              " (if (fixnum? " t ")"
              " (fixnum->flonum " t ")"
              " (jolt->fl " t ")))"))
-      s)))
+      ;; a :float operand of a :double op: a float cast already emitted its
+      ;; double (the :coerce arm); anything else of the kind holds a jfloat
+      (and (:fl-unbox node) (not (= :coerce (:op node))))
+      (str "(jfloat-unbox " s ")")
+      :else s)))
 
 ;; A Chez string literal. Every char outside printable ASCII becomes a
 ;; codepoint hex escape \x<cp>; ; the named escapes (\n \t \r \" \\) match what
@@ -3868,6 +3873,10 @@
                  (contains? #{"jolt-long-cast" "jolt-unchecked-long"} (:cast-fn node))
                  (let [t (fresh-label "_lc$")]
                    (str "(let ((" t " " e ")) (if (fixnum? " t ") " t " (" (:cast-fn node) " " t ")))"))
+                 ;; a float cast whose value an fl op takes (:fl-unbox, numeric
+                 ;; pass) hands it the double it widens to, never building the jfloat
+                 (and (:fl-unbox node) (contains? #{"jolt-float" "jolt-unchecked-float"} (:cast-fn node)))
+                 (str "(" (:cast-fn node) "->flonum " e ")")
                  (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
                      (= :double (:kind node)) (emit-nhint-coerce :double e)
                      (= :long (:kind node)) (emit-nhint-coerce :long e)

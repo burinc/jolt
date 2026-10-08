@@ -181,6 +181,10 @@
 ;; string. Long/BigInt/Ratio already round-trip as plain number constants; these are
 ;; the host-object constants that had no VALUE path (only a tagged-form path).
 ;; jbigdec?/jinst?/juuid? and the string accessors resolve at call time (runtime).
+;; A Float has no literal syntax, so it embeds as the cast that makes it:
+;; the analyzer emits (clojure.core/float <its double>).
+(define (hc-float-value? x) (jfloat? x))
+(define (hc-float-value-double x) (jfloat-fl x))
 (define (hc-bigdec-value? x) (jbigdec? x))
 (define (hc-bigdec-value-source x) (jbigdec->string x))
 (define (hc-inst-value? x) (jinst? x))
@@ -1002,6 +1006,8 @@
   (def-var! "jolt.host" "invoke-rewriter" hc-invoke-rewriter)
   (def-var! "jolt.host" "form-bigdec?" hc-bigdec?)
   (def-var! "jolt.host" "form-bigdec-source" hc-bigdec-source)
+  (def-var! "jolt.host" "form-float-value?" hc-float-value?)
+  (def-var! "jolt.host" "form-float-value-double" hc-float-value-double)
   (def-var! "jolt.host" "form-bigdec-value?" hc-bigdec-value?)
   (def-var! "jolt.host" "form-bigdec-value-source" hc-bigdec-value-source)
   (def-var! "jolt.host" "form-inst-value?" hc-inst-value?)

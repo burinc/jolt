@@ -276,6 +276,7 @@
 (define (jolt-double x)
   (cond ((char? x) (exact->inexact (char->integer x)))
         ((number? x) (exact->inexact x))
+        ((jfloat? x) (jfloat-fl x))
         (else (jolt-double-slow x))))
 
 ;; compare: 3-way, returns an EXACT integer (= JVM compare -> int).
@@ -486,17 +487,32 @@
 (def-var! "clojure.core" "unchecked-long" jolt-unchecked-long)
 (def-var! "clojure.core" "unchecked-int" jolt-unchecked-int)
 (def-var! "clojure.core" "double" jolt-double)
-;; float: Chez has no single-float type, so the value stays a flonum — but the
-;; cast range-checks against Float/MAX_VALUE like RT.floatCast (an infinity is
-;; out of range; NaN passes).
+;; float: a jfloat holding the nearest single-precision value (flsingle;
+;; Gambit's is an f32vector store in prelude-shims.ss), as the JVM's float
+;; holds: (double (float 0.3)) is 0.30000001192092896 and (float
+;; Double/MIN_VALUE) is 0.0. The cast range-checks against Float/MAX_VALUE
+;; first, like RT.floatCast (an infinity is out of range; NaN passes).
+;;
+;; jolt-float->flonum is the cast's value as the double it widens to: what an
+;; arithmetic operand needs, so a typed (* (float x) 2.0) never builds the
+;; jfloat (jolt.passes.numeric's :float kind).
 (define fl-float-max 3.4028234663852886e38)
-(define (jolt-float x)
-  (let ((d (jolt-double x)))
-    (if (and (flonum? d) (not (nan? d))
-             (or (< d (- fl-float-max)) (> d fl-float-max)))
-        (jolt-cast-range-throw "float" x)
-        d)))
+(define (jolt-float->flonum x)
+  (if (jfloat? x)
+      (jfloat-fl x)
+      (let ((d (jolt-double x)))
+        (if (and (not (nan? d)) (or (< d (- fl-float-max)) (> d fl-float-max)))
+            (jolt-cast-range-throw "float" x)
+            (flsingle d)))))
+(define (jolt-float x) (if (jfloat? x) x (make-jfloat (jolt-float->flonum x))))
 (def-var! "clojure.core" "float" jolt-float)
+;; unchecked-float: the same rounding without the range check, so a double past
+;; Float/MAX_VALUE is an infinity, like the JVM's (float) primitive conversion.
+(define (jolt-unchecked-float->flonum x)
+  (if (jfloat? x) (jfloat-fl x) (flsingle (jolt-double x))))
+(define (jolt-unchecked-float x)
+  (if (jfloat? x) x (make-jfloat (jolt-unchecked-float->flonum x))))
+(def-var! "clojure.core" "unchecked-float" jolt-unchecked-float)
 ;; numerator/denominator: jolt ratios are Chez exact rationals; a non-ratio is
 ;; the JVM's Ratio cast failure.
 (define (jolt-ratio-part name f)

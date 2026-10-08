@@ -258,7 +258,7 @@
           ;; na-byte-of's truncate/mask/fold is three operations to answer itself.
           ((bytevector? v)
            (bytevector-s8-set! v i (if (and (fixnum? x) (fx<=? -128 x 127)) x (na-byte-of x))))
-          (else (flvector-set! v i (if (flonum? x) x (exact->inexact x)))))))
+          (else (flvector-set! v i (if (flonum? x) x (jolt-double x)))))))
 ;; Element-wise equality over two arrays — java.util.Arrays/equals. Same backing
 ;; type on both sides is one `equal?` over the backing (a bytevector or fxvector
 ;; comparison is a block compare); a promoted array meeting an unpromoted one is
@@ -367,7 +367,7 @@
 ;; same rule as promotion, decided once at construction.
 (define (na-make-backing n kind init)
   (let ((n (exact n)))
-    (cond ((na-fl-kind? kind) (make-flvector n (if (flonum? init) init (exact->inexact init))))
+    (cond ((na-fl-kind? kind) (make-flvector n (if (flonum? init) init (jolt-double init))))
           ((na-fx-kind? kind) (if (fixnum? init) (make-fxvector n init) (make-vector n init)))
           ((eq? kind 'byte) (na-new-bytes n (na-byte-of init)))
           ;; A char array is a Chez STRING: the elements are characters and a
@@ -385,7 +385,7 @@
   (cond ((na-fl-kind? kind)
          (let* ((n (length lst)) (fv (make-flvector n 0.0)))
            (let loop ((i 0) (l lst))
-             (if (null? l) fv (begin (flvector-set! fv i (exact->inexact (car l))) (loop (+ i 1) (cdr l)))))))
+             (if (null? l) fv (begin (flvector-set! fv i (jolt-double (car l))) (loop (+ i 1) (cdr l)))))))
         ((and (na-fx-kind? kind) (for-all fixnum? lst)) (list->fxvector lst))
         ;; every element coercible to a character, or the array starts boxed
         ((and (eq? kind 'char) (for-all (lambda (c) (na-char-of c)) lst))
@@ -807,7 +807,7 @@
 ;; unboxed write target for (aset ^doubles a i v): direct flvector-set!, returning
 ;; the stored flonum (JVM aset returns the val). Same fixnum-first index path.
 (define (jolt-flaset a i v)
-  (let ((fv (if (flonum? v) v (exact->inexact v))))
+  (let ((fv (if (flonum? v) v (jolt-double v))))
     (flvector-set! (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i))) fv) fv))
 
 ;; The NON-flvector counterparts, for (aget ^longs a i) / (aset ^ints a i v) /

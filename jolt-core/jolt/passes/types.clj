@@ -1041,7 +1041,7 @@
       ;; does not change its value, so it answers what its expr is.
       (let [r (infer (get node :expr) tenv env)
             k (get node :kind)]
-        [(cond (= :double k) :double (= :long k) :num :else (nth r 0))
+        [(cond (= :double k) :double (= :long k) :num (= :float k) :num :else (nth r 0))
          (assoc node :expr (nth r 1))])
 
       ;; Anything with no arm above. Answering :any is right — this pass has no

@@ -1794,10 +1794,8 @@
 
 (define (value-host-tags obj)
   (cond
-    ((flonum? obj)
-     (jch-tags-plus
-       "java.lang.Double"
-       '("java.lang.Float" "Float")))
+    ((flonum? obj) (jch-tags "java.lang.Double"))
+    ((jfloat? obj) (jch-tags "java.lang.Float"))
     ((and (number? obj) (exact? obj) (not (integer? obj)))
      (jch-tags "clojure.lang.Ratio"))
     ((and (number? obj) (exact? obj) (integer? obj))
@@ -3265,6 +3263,8 @@
 (define arm-priority-agent 45)
 
 (define arm-priority-bigdec 46)
+
+(define arm-priority-float 47)
 
 (define (record-method-dispatch obj method-name rest-args)
   (when (jolt-nil? obj)

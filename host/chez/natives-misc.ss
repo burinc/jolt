@@ -107,6 +107,7 @@
 ;; truncated integer, ratio → quotient, integer → exact integer.
 (define (jolt-bigint x)
   (cond ((string? x) (parse-int-or-throw x 10 "big"))
+        ((jfloat? x) (jolt-bigint (jfloat-fl x)))
         ((flonum? x)
          (if (or (finite? x) (zero? x))
              (inexact->exact (truncate x))
