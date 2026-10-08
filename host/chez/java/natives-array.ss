@@ -209,7 +209,11 @@
 (define (ja-ref a i)
   (let ((v (jolt-array-vec a)))
     (ja-check v i)
-    (ja-backing-ref v i)))
+    (let ((x (ja-backing-ref v i)))
+      (if (flonum? x) (na-fl-elem a x) x))))
+;; An element of a double or float array, as the array answers it: a float[]
+;; element is a java.lang.Float (a jfloat over the flonum the flvector holds).
+(define (na-fl-elem a x) (if (eq? (jolt-array-kind a) 'float) (make-jfloat x) x))
 ;; Widen an fxvector backing to a boxed vector, in place, and answer the new one.
 ;; THE one place an array's representation changes after construction: jolt's
 ;; integers promote to bignums past Chez's 2^60 fixnum ceiling (that is the whole
@@ -283,6 +287,8 @@
     (cond ((vector? v) (vector->list v))
           ((fxvector? v) (fxvector->list v))
           ((string? v) (string->list v))
+          ((flvector? v) (let loop ((i (fx- (flvector-length v) 1)) (acc '()))
+                           (if (fx<? i 0) acc (loop (fx- i 1) (cons (na-fl-elem a (flvector-ref v i)) acc)))))
           (else (let loop ((i (fx- (ja-backing-len v) 1)) (acc '()))
                   (if (fx<? i 0) acc (loop (fx- i 1) (cons (ja-backing-ref v i) acc))))))))
 ;; ---- char[] as characters ---------------------------------------------------
@@ -366,8 +372,8 @@
 ;; fxvector, anything non-numeric — starts the array boxed rather than raising:
 ;; same rule as promotion, decided once at construction.
 (define (na-make-backing n kind init)
-  (let ((n (exact n)))
-    (cond ((na-fl-kind? kind) (make-flvector n (if (flonum? init) init (jolt-double init))))
+  (let ((n (exact n)) (init (na-elem-of kind init)))
+    (cond ((na-fl-kind? kind) (make-flvector n init))
           ((na-fx-kind? kind) (if (fixnum? init) (make-fxvector n init) (make-vector n init)))
           ((eq? kind 'byte) (na-new-bytes n (na-byte-of init)))
           ;; A char array is a Chez STRING: the elements are characters and a
@@ -382,10 +388,12 @@
                               (if c (make-string n c) (make-vector n init))))
           (else (make-vector n init)))))
 (define (na-list->backing lst kind)
+  (na-list->backing* (if (na-coerced-kind? kind) (map (lambda (x) (na-elem-of kind x)) lst) lst) kind))
+(define (na-list->backing* lst kind)
   (cond ((na-fl-kind? kind)
          (let* ((n (length lst)) (fv (make-flvector n 0.0)))
            (let loop ((i 0) (l lst))
-             (if (null? l) fv (begin (flvector-set! fv i (jolt-double (car l))) (loop (+ i 1) (cdr l)))))))
+             (if (null? l) fv (begin (flvector-set! fv i (car l)) (loop (+ i 1) (cdr l)))))))
         ((and (na-fx-kind? kind) (for-all fixnum? lst)) (list->fxvector lst))
         ;; every element coercible to a character, or the array starts boxed
         ((and (eq? kind 'char) (for-all (lambda (c) (na-char-of c)) lst))
@@ -555,11 +563,51 @@
 (define (na-byte-of v)
   (if (fixnum? v)
       (na-u8->byte (fxand v #xff))
-      (na-u8->byte (bitwise-and (exact (truncate v)) #xff))))
-;; Narrow a value being STORED into an array to its element kind. Only 'byte has a
-;; range jolt must maintain (the u8 <-> s8 bridge above depends on it); the other
-;; kinds hold whatever integer/flonum they are given, as they always have.
-(define (na-elem-of kind v) (if (eq? kind 'byte) (na-byte-of v) v))
+      (let ((b (na-integral-of v 8)))
+        (if (fixnum? b) b (jolt-num-cast-throw v)))))
+
+;; What a value becomes when it is STORED in a primitive array: Number's
+;; xxxValue, which is how Numbers.T_array fills one from a seq or an init and how
+;; the JVM narrows a primitive. An int[] holds (int) of what it is given — 1.7 is
+;; 1, 1/2 is 0, 1.5M is 1 — a double saturates at the int range first, and a
+;; short[] or byte[] keeps the low bits of that; a long[] wraps a bignum to 64
+;; bits; a double[] holds the double value and a float[] the nearest float.
+;; A value the JVM would refuse (a string into an int[], its ClassCastException)
+;; is stored as it is, as before: the superset, and the backing widens to hold
+;; it. A byte[] alone refuses, as its bytevector backing has nowhere to put it.
+(define (na-coerced-kind? kind) (memq kind '(int long short byte double float)))
+(define (na-elem-of kind v)
+  (case kind
+    ((int) (if (and (fixnum? v) (fx<=? -2147483648 v 2147483647)) v (na-integral-of v 32)))
+    ((long) (if (fixnum? v) v (na-integral-of v 64)))
+    ((short) (if (and (fixnum? v) (fx<=? -32768 v 32767)) v (na-integral-of v 16)))
+    ((byte) (if (and (fixnum? v) (fx<=? -128 v 127)) v (na-byte-of v)))
+    ((double) (if (flonum? v) v (jolt-double v)))
+    ((float) (flsingle (if (flonum? v) v (jolt-double v))))
+    (else v)))
+;; Two's-complement BITS-wide fold of an exact integer.
+(define (na-wrap n bits)
+  (let ((m (bitwise-bit-field n 0 bits)))
+    (if (bitwise-bit-set? m (- bits 1)) (- m (expt 2 bits)) m)))
+;; The JLS narrowing of a double: NaN is 0, a long saturates at 64 bits, and an
+;; int and anything narrower saturates at 32 before keeping its low bits.
+(define (na-double->integral d bits)
+  (if (nan? d)
+      0
+      (let ((w (if (= bits 64) 64 32)))
+        (na-wrap (cond ((>= d (expt 2.0 (- w 1))) (- (expt 2 (- w 1)) 1))
+                       ((<= d (- (expt 2.0 (- w 1)))) (- (expt 2 (- w 1))))
+                       (else (exact (truncate d))))
+                 bits))))
+(define (na-integral-of v bits)
+  (cond ((and (number? v) (exact? v)) (na-wrap (if (integer? v) v (truncate v)) bits))
+        ((flonum? v) (na-double->integral v bits))
+        ((jfloat? v) (na-double->integral (jfloat-fl v) bits))
+        ;; a code point: the JVM's char widens to int in a primitive store
+        ((char? v) (na-wrap (char->integer v) bits))
+        ;; BigDecimal.intValue/longValue: truncate, then the low bits
+        ((jolt-num-slow? v) (na-wrap (jolt-cast-truncate-slow v) bits))
+        (else v)))
 
 ;; --- constructors -----------------------------------------------------------
 (define (na-object-array a . rest)  (na-num-array a rest jolt-nil 'object))
@@ -701,16 +749,24 @@
 ;; invariant intact (aget / seq / (String. bytes) all agree) where a raw store
 ;; would break it.
 (define (na-aset! arr i v) (na-array-set! arr i v))
-(define (na-aset-int arr i v)     (na-aset! arr i v))
-(define (na-aset-long arr i v)    (na-aset! arr i v))
-(define (na-aset-short arr i v)   (na-aset! arr i v))
-(define (na-aset-double arr i v)  (na-aset! arr i v))
-(define (na-aset-float arr i v)   (na-aset! arr i v))
-(define (na-aset-char arr i v)    (na-aset! arr i v))
-(define (na-aset-boolean arr i v) (na-aset! arr i v))
-(define (na-aset-byte arr i v)
-  (let ((b (na-byte-of v)))
-    (ja-set! arr (exact (na-idx i)) b) b))
+;; aset-int and its siblings are clojure.core's def-aset: the value goes through
+;; the checked cast of its type ((aset-int a 0 1e10) is out of range, as (int
+;; 1e10) is) and the call returns the value it was handed, not the stored one.
+(define (na-typed-aset cast)
+  (lambda (arr i v) (na-aset! arr i (cast v)) v))
+;; aset-int's value arrives boxed, so the JVM casts it with RT.intCast(Object):
+;; a double goes through longCast first, and one past the int range is the
+;; ArithmeticException "integer overflow", not the IllegalArgumentException a
+;; primitive (int 1e10) raises.
+(define na-aset-int
+  (na-typed-aset (lambda (v) (jolt-int-cast (if (flonum? v) (jolt-long-cast v) v)))))
+(define na-aset-long    (na-typed-aset jolt-long-cast))
+(define na-aset-short   (na-typed-aset jolt-short-cast))
+(define na-aset-byte    (na-typed-aset jolt-byte-cast))
+(define na-aset-double  (na-typed-aset jolt-double))
+(define na-aset-float   (na-typed-aset jolt-float))
+(define na-aset-char    (na-typed-aset jolt-char))
+(define na-aset-boolean (na-typed-aset jolt-boolean))
 
 ;; --- coercions (identity on arrays; byte/short are masked scalar casts) ------
 (define (na-bytes x) (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) x (na-byte-array x)))
@@ -770,8 +826,9 @@
 ;; (na-idx k)) on a fixnum is two procedure calls to answer k itself, 9ns of an
 ;; untyped store.
 (define (na-array-set! a k v)
-  (let ((sv (na-elem-of (jolt-array-kind a) v)))
-    (ja-set! a (if (fixnum? k) k (exact (na-idx k))) sv) sv))
+  (let* ((kind (jolt-array-kind a)) (sv (na-elem-of kind v)))
+    (ja-set! a (if (fixnum? k) k (exact (na-idx k))) sv)
+    (if (eq? kind 'float) (make-jfloat sv) sv)))
 (define %na-ref-put! jolt-ref-put!)
 (set! jolt-ref-put!
   (lambda (t k v)
@@ -808,6 +865,12 @@
 ;; the stored flonum (JVM aset returns the val). Same fixnum-first index path.
 (define (jolt-flaset a i v)
   (let ((fv (if (flonum? v) v (jolt-double v))))
+    (flvector-set! (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i))) fv) fv))
+
+;; The ^floats store: jolt-flaset rounded to single precision, answering the
+;; double it stored (the back end makes the Float when one is wanted).
+(define (jolt-flaset-float a i v)
+  (let ((fv (flsingle (if (flonum? v) v (jolt-double v)))))
     (flvector-set! (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i))) fv) fv))
 
 ;; The NON-flvector counterparts, for (aget ^longs a i) / (aset ^ints a i v) /
@@ -854,19 +917,34 @@
           ;; any other string operation's.
           ((string? v) (ja-ref a j))
           (else (flvector-ref v j)))))
+;; The store narrows to the array's kind first, as the untyped aset does
+;; (na-elem-of): an ^ints store of 3000000000 keeps its low 32 bits and an
+;; ^longs store of 1.5 is 1, rather than the hint letting the raw value in. It
+;; answers what it stored, as the JVM's aset does.
+;; A fixnum already in the kind's range is the common store and goes straight
+;; in; an fxvector backs only long, int and short.
 (define (jolt-vaset a i v)
-  (let ((bk (jolt-array-vec a)) (j (if (fixnum? i) i (exact (na-idx i)))))
+  (let ((bk (jolt-array-vec a)))
+    (if (and (fixnum? v) (fxvector? bk) (fixnum? i)
+             (let ((k (jolt-array-kind a)))
+               (or (eq? k 'long)
+                   (if (eq? k 'int) (fx<=? -2147483648 v 2147483647) (fx<=? -32768 v 32767)))))
+        (begin (fxvector-set! bk i v) v)
+        (jolt-vaset-coerce a bk i v))))
+(define (jolt-vaset-coerce a bk i v)
+  (let* ((j (if (fixnum? i) i (exact (na-idx i))))
+         (x (na-elem-of (jolt-array-kind a) v)))
     (cond ((fxvector? bk)
-           (if (fixnum? v) (fxvector-set! bk j v) (vector-set! (ja-promote! a) j v)))
+           (if (fixnum? x) (fxvector-set! bk j x) (vector-set! (ja-promote! a) j x)))
           ((vector? bk)
            (if (and (fixnum? j) (fx<? -1 j (vector-length bk)))
-               (vector-set! bk j v)
+               (vector-set! bk j x)
                (na-oob-throw j (vector-length bk))))
           ;; a lying hint over a string-backed char array — see jolt-vaget. The
           ;; else arm used to assume a boxed vector and would read
           ;; (vector-length bk) off a string.
-          (else (ja-set! a j v)))
-    v))
+          (else (ja-set! a j x)))
+    x))
 
 ;; (aset ^bytes a i v) — the byte kind's own store target, split from jolt-vaset
 ;; rather than folded into it because a byte array is the one kind whose store

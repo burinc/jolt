@@ -396,6 +396,17 @@
            :jvm "throws IllegalArgumentException"
            :jolt "[1]"}
    :note "aset into a typed array is unchecked the same way. Verified against Clojure 1.12.5."}
+  ;; A primitive array coerces what it is handed. The JVM's reflective aset and
+  ;; into-array refuse a value whose box does not match the element type; jolt
+  ;; stores the value narrowed as Numbers.T_array would.
+  {:category :permissive
+   :behavior "(aset (int-array 1) 0 2.9), (into-array Long/TYPE [1.5]) — a number of another type"
+   :jvm "throws IllegalArgumentException (argument type mismatch)"
+   :jolt "stores it as the element type's xxxValue: 2, 1"
+   :check {:expr "(let [a (int-array 1)] (aset a 0 2.9) [(vec a) (vec (into-array Long/TYPE [1.5]))])"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[[2] [1]]"}
+   :note "The same narrowing int-array, aset-int and Arrays/fill apply, where the JVM agrees. Verified against Clojure 1.12.5."}
   ;; doseq with an unknown keyword among its bindings: the reference fails from
   ;; inside its own expansion (a NullPointerException, its "steppair" is null),
   ;; while for refuses the same keyword by name. jolt refuses both by name.

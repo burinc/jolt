@@ -268,9 +268,14 @@
       ;; (jolt-array-vec A) I) INLINE — keeping the value unboxed across the procedure
       ;; boundary instead of boxing at the jolt-flaget call. An unproven index keeps
       ;; (jolt-flaget A I), which owns the fixnum?/na-idx coercion.
-      (and (= nm "aget") (= n 2) (= :doubles (nth (nth ars 0) 0)))
-      (let [ikind (nth (nth ars 1) 0) inode (nth (nth ars 1) 1)]
-        [:double (cond-> (assoc node1 :fl-aget true)
+      ;; A ^floats read is the same flvector read typed :float (:fl-float): an fl
+      ;; op takes the double, anything else gets the Float (the back end).
+      (and (= nm "aget") (= n 2) (contains? #{:doubles :floats} (nth (nth ars 0) 0)))
+      (let [ikind (nth (nth ars 1) 0) inode (nth (nth ars 1) 1)
+            fl? (= :floats (nth (nth ars 0) 0))]
+        [(if fl? :float :double)
+         (cond-> (assoc node1 :fl-aget true)
+                   fl? (assoc :fl-float true)
                    (or (= ikind :long)
                        (and (int-lit? inode) (fixnum-lit? (get inode :val))))
                    (assoc :fl-idx-long true))])
@@ -304,15 +309,23 @@
       ;; :fl-val-double; when BOTH hold the back end emits (flvector-set! ...) inline
       ;; (returning the stored value — JVM contract). Otherwise it keeps (jolt-flaset
       ;; ...), which owns exact->inexact for an int / non-double value.
-      (and (= nm "aset") (= n 3) (= :doubles (nth (nth ars 0) 0)))
+      ;; ^floats stores the same way, rounded to single precision, and answers the
+      ;; Float (:fl-float). A :float value (a (float x) cast) stores the double it
+      ;; holds, unboxed like any :float operand.
+      (and (= nm "aset") (= n 3) (contains? #{:doubles :floats} (nth (nth ars 0) 0)))
       (let [ikind (nth (nth ars 1) 0) inode (nth (nth ars 1) 1)
-            vkind (nth (nth ars 2) 0)]
-        [:double (cond-> (assoc node1 :fl-aset true)
+            vkind (nth (nth ars 2) 0)
+            fl? (= :floats (nth (nth ars 0) 0))]
+        [(if fl? :float :double)
+         (cond-> (assoc node1 :fl-aset true)
+                   fl? (assoc :fl-float true)
                    (or (= ikind :long)
                        (and (int-lit? inode) (fixnum-lit? (get inode :val))))
                    (assoc :fl-idx-long true)
-                   (= vkind :double)
-                   (assoc :fl-val-double true))])
+                   (or (= vkind :double) (= vkind :float))
+                   (assoc :fl-val-double true)
+                   (= vkind :float)
+                   (update :args (fn [as] (assoc as 2 (assoc (nth as 2) :fl-unbox true)))))])
       (nil? nm) [nil node1]
       :else
        (let [;; per-operand class: :double / :long / :bigdec (typed), :wild (a
