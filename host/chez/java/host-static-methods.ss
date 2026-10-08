@@ -520,16 +520,12 @@
         (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
         (cons "MAX_VALUE" 1.7976931348623157e308) (cons "MIN_VALUE" 4.9e-324)
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0) (cons "NaN" +nan.0)))
-;; Float's bounds and specials are the float ones, not double's — data.json's
-;; suite round-trips them by name. jolt has one flonum type, so the values are
-;; doubles carrying the float magnitudes.
+;; Float's specials. Its bounds, parsing and printing round to single precision
+;; and live with the float codecs in math.ss.
 (register-class-statics! "Float"
   (list (cons "TYPE" "float")
-        (cons "parseFloat" parse-double-or-throw) (cons "valueOf" ->double)
-        (cons "toString" (lambda (x) (jolt-str-render-one (->double x))))
         (cons "isNaN" (lambda (x) (and (flonum? x) (nan? x))))
         (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
-        (cons "MAX_VALUE" 3.4028235e38) (cons "MIN_VALUE" 1.4e-45)
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0)
         (cons "NaN" +nan.0)))
 

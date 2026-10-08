@@ -501,6 +501,12 @@
        (jolt-cast-range-throw "float" x))
       (else (bits->flt (flt->bits d))))))
 (def-var! "clojure.core" "float" jolt-float)
+;; unchecked-float: the same rounding without the range check, so a double past
+;; Float/MAX_VALUE is an infinity, like the JVM's (float) primitive conversion.
+(define (jolt-unchecked-float x)
+  (let ((d (jolt-double x)))
+    (if (flonum? d) (flsingle d) d)))
+(def-var! "clojure.core" "unchecked-float" jolt-unchecked-float)
 ;; numerator/denominator: jolt ratios are Chez exact rationals; a non-ratio is
 ;; the JVM's Ratio cast failure.
 (define (jolt-ratio-part name f)

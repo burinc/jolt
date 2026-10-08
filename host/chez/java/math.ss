@@ -430,7 +430,42 @@
   (list (cons "doubleToLongBits" (lambda (x) (jolt-double->long-bits x)))
         (cons "doubleToRawLongBits" (lambda (x) (jolt-double->long-bits x)))
         (cons "longBitsToDouble" (lambda (n) (jolt-long-bits->double n)))))
+;; Float.toString: the shortest decimal that reads back as the float, which is
+;; not a double's shortest digits now that (float 0.1) holds the float's exact
+;; value 0.10000000149011612. Float.toString writes at least one digit after
+;; the point, so in its scientific range (below 10^-3, from 10^7) the shortest
+;; form has two significant digits: Float.MIN_VALUE is 1.4E-45, never 1.0E-45.
+;; Answers the decimal as a double, whose own printing then spells it.
+(define (flt-shortest x)
+  (let ((x (jolt-float x)))
+    (if (or (nan? x) (infinite? x) (= x 0.0))
+        x
+        (let* ((m (exact (abs x)))
+               (bits (flt-mag->bits m))
+               (e10 (let loop ((e (exact (floor (/ (log (inexact m)) (log 10))))))
+                      (cond ((> (expt 10 e) m) (loop (- e 1)))
+                            ((<= (expt 10 (+ e 1)) m) (loop (+ e 1)))
+                            (else e))))
+               (d (let loop ((n (if (or (< m 1/1000) (>= m 10000000)) 2 1)))
+                    (if (> n 9)
+                        (inexact m)
+                        (let* ((s (expt 10 (- e10 (- n 1))))
+                               (cand (* (round (/ m s)) s)))
+                          (if (and (> cand 0) (= (flt-mag->bits cand) bits))
+                              (inexact cand)
+                              (loop (+ n 1))))))))
+          (if (< x 0.0) (- d) d)))))
+;; Float.parseFloat/valueOf: the parsed double rounded to single precision, past
+;; the float range an infinity (a parse does not range-check like the cast).
+(define (jolt-parse-float s)
+  (let ((d (if (number? s) (exact->inexact s) (parse-double-or-throw s))))
+    (if (flonum? d) (flsingle d) d)))
+
 (register-class-statics! "Float"
-  (list (cons "floatToIntBits" (lambda (x) (jolt-float->int-bits x)))
+  (list (cons "parseFloat" jolt-parse-float) (cons "valueOf" jolt-parse-float)
+        (cons "toString" (lambda (x) (jolt-str-render-one (flt-shortest x))))
+        ;; the float bounds' exact values, so (float Float/MAX_VALUE) is in range
+        (cons "MAX_VALUE" 3.4028234663852886e38) (cons "MIN_VALUE" 1.401298464324817e-45)
+        (cons "floatToIntBits" (lambda (x) (jolt-float->int-bits x)))
         (cons "floatToRawIntBits" (lambda (x) (jolt-float->int-bits x)))
         (cons "intBitsToFloat" (lambda (n) (jolt-int-bits->float n)))))
