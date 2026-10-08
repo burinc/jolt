@@ -70,8 +70,10 @@ jolt.infix.math.constants
 jolt.infix.math.core
 jolt.infix.math.trig
 jolt.io-poller
+jolt.line-editor
 jolt.loader
 jolt.nrepl
+jolt.parinfer
 jolt.parser
 jolt.parser.basic
 jolt.parser.collections

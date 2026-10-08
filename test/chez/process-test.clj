@@ -504,6 +504,46 @@
   (fs/delete-if-exists readyf)
   (fs/delete-if-exists hookf))
 
+;; The REPL's ^C: while an interrupt token is installed (interrupt-on-sigint!),
+;; SIGINT interrupts the evaluation and the process goes on — a computation, a
+;; sleep, a stdin read and a deref alike. An interrupt does not outlive its
+;; evaluation (the sleep after them finishes), and with nothing installed SIGINT
+;; is the 130 exit again.
+(let [readyf (str (fs/create-temp-file {:prefix "jp-repl-int-" :suffix ".txt"}))
+      prog (str "(defn step [ready f]"
+                "  (let [t (jolt.host/make-interrupt)]"
+                "    (jolt.host/interrupt-on-sigint! t)"
+                "    (spit \"" readyf "\" ready)"
+                "    (try (jolt.host/run-interruptible t f) :finished"
+                "         (catch :default e (if (jolt.host/interrupted? t) :interrupted (ex-message e)))"
+                "         (finally (jolt.host/interrupt-on-sigint! nil)))))"
+                "(println (step \"1\" (fn [] (loop [] (recur)))))"
+                "(println (step \"2\" (fn [] (Thread/sleep 30000))))"
+                "(println (step \"3\" (fn [] (read-line))))"
+                "(println (step \"4\" (fn [] @(promise))))"
+                "(println (step \"5\" (fn [] (Thread/sleep 300))))"
+                "(flush)"
+                "(spit \"" readyf "\" \"6\")"
+                "(Thread/sleep 30000)")
+      proc (process [jolt-bin "-e" prog] {:out :string :err :string})
+      await-ready (fn [s]
+                    (loop [n 0]
+                      (when (and (< n 400) (not= s (slurp readyf)))
+                        (Thread/sleep 25)
+                        (recur (inc n))))
+                    (Thread/sleep 200))
+      sigint! #(sh ["sh" "-c" (str "kill -INT " (.pid (:proc proc)))])]
+  (doseq [s ["1" "2" "3" "4"]] (await-ready s) (sigint!))
+  (await-ready "6")
+  (sigint!)
+  (loop [n 0] (when (and (< n 100) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+  (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+  (check-eq "SIGINT interrupts each evaluation and the process goes on"
+            (str/split-lines (:out @proc))
+            [":interrupted" ":interrupted" ":interrupted" ":interrupted" ":finished"])
+  (check-eq "and with no evaluation installed SIGINT exits 130" (:exit @proc) 130)
+  (fs/delete-if-exists readyf))
+
 ;; …and no signal may be swallowed by a thread that was already running, nor
 ;; depend on WHICH thread registered the hook. The kernel delivers to a thread
 ;; that does not block the signal, so before the watcher was armed up front it

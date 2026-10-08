@@ -1684,6 +1684,29 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.parinfer — the parinfer.js port, replaying parinfer.js's own case suite
+# (indent, paren and smart mode). The file self-checks and prints one marker.
+parinfer_out="$($jolt run test/chez/parinfer-test.clj 2>/dev/null)"
+if printf '%s' "$parinfer_out" | grep -q 'PARINFER OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: parinfer"
+  printf '%s\n' "$parinfer_out" | grep -v OK | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# jolt.line-editor — the interactive REPL's editing model, driven without a
+# terminal: parinfer-balanced typing and deleting, the Enter rule, newline
+# indentation, key decoding and layout. The file self-checks.
+line_editor_out="$($jolt run test/chez/line-editor-test.clj 2>/dev/null)"
+if printf '%s' "$line_editor_out" | grep -q 'LINE-EDITOR OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: line-editor"
+  printf '%s\n' "$line_editor_out" | grep -v OK | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # A data reader that returns a CODE form (deps.edn data_readers.clj -> reader fn)
 # must have its result spliced in and COMPILED, like Clojure — #code [:x] becomes
 # (+ 40 2) and evaluates to 42, not the literal list. A project run so the source

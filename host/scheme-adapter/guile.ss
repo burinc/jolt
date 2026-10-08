@@ -241,6 +241,29 @@
 ;;                                        are unusable — `go` then falls back to an OS
 ;;                                        thread (the plan's documented degradation).
 
+;; ---------------------------------------------------------------------------
+;; tier: capability-terminal (the interactive REPL's line editor)
+;; ---------------------------------------------------------------------------
+;;   sa-term-open           UNIMPLEMENTED  #f is the permitted degradation (the REPL keeps
+;;                                        its plain reader). A real one: isatty on fds 0/1
+;;                                        plus termios through Guile's FFI, or ncurses.
+;;   sa-term-raw!           UNIMPLEMENTED  ?? tcsetattr via FFI (cfmakeraw flags).
+;;   sa-term-cooked!        UNIMPLEMENTED  ?? restore the saved termios.
+;;   sa-term-read-char      UNIMPLEMENTED  read-char on a raw fd 0 port; must verify it
+;;                                        does not block other threads, and map SIGWINCH
+;;                                        to 'resize.
+;;   sa-term-size           UNIMPLEMENTED  ?? ioctl TIOCGWINSZ via FFI.
+;;   sa-term-write-char     UNIMPLEMENTED  write-char to the console port.
+;;   sa-term-char-width     UNIMPLEMENTED  ?? wcwidth via FFI.
+;;   sa-term-flush          UNIMPLEMENTED  force-output.
+;;   sa-term-move!          UNIMPLEMENTED  ANSI CSI A/B/D/C, or terminfo via ncurses.
+;;   sa-term-clear!         UNIMPLEMENTED  ANSI CSI K / J / 2J.
+;;   sa-term-cr!            UNIMPLEMENTED  #\return.
+;;   sa-term-lf!            UNIMPLEMENTED  #\newline.
+;;   sa-term-bell!          UNIMPLEMENTED  #\alarm.
+;;   sa-term-pause!         UNIMPLEMENTED  (kill 0 SIGTSTP).
+;;   sa-term-color!         UNIMPLEMENTED  ANSI SGR.
+
 ;; ===========================================================================
 ;; gate-time half (mirrors chez.ss's assertion pass) — UNIMPLEMENTED
 ;; ===========================================================================
