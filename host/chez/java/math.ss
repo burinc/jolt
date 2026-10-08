@@ -256,17 +256,22 @@
 (define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
 (define (m1c f) (lambda (x) (real-or-nan (f (jolt-need-num x)))))
 (define (m2c f) (lambda (a b) (real-or-nan (f (jolt-need-num a) (jolt-need-num b)))))
+;; the clojure.math fns implemented above take their numbers as given; these
+;; take any jolt number first, as the m1/m2 wrappers do (a Float is the double
+;; it widens to, which is what clojure.math's ^double parameters receive)
+(define (n1 f) (lambda (x) (f (jolt-need-num x))))
+(define (n2 f) (lambda (a b) (f (jolt-need-num a) (jolt-need-num b))))
 (def-var! "clojure.math" "sqrt" (m1c sqrt))
-(def-var! "clojure.math" "cbrt" jolt-math-cbrt)
+(def-var! "clojure.math" "cbrt" (n1 jolt-math-cbrt))
 (def-var! "clojure.math" "pow" (m2c expt))
 (def-var! "clojure.math" "exp" (m1 exp))
-(def-var! "clojure.math" "expm1" jolt-math-expm1)
+(def-var! "clojure.math" "expm1" (n1 jolt-math-expm1))
 (def-var! "clojure.math" "log" (m1c log))
 ;; base-10 log via Chez's base-arg log — also backs java.lang.Math/log10 so the
 ;; two never disagree.
 (define (jolt-math-log10 x) (real-or-nan (log x 10.0)))
-(def-var! "clojure.math" "log10" jolt-math-log10)
-(def-var! "clojure.math" "log1p" jolt-math-log1p)
+(def-var! "clojure.math" "log10" (n1 jolt-math-log10))
+(def-var! "clojure.math" "log1p" (n1 jolt-math-log1p))
 (def-var! "clojure.math" "sin" (m1 sin))
 (def-var! "clojure.math" "cos" (m1 cos))
 (def-var! "clojure.math" "tan" (m1 tan))
@@ -274,20 +279,20 @@
 (def-var! "clojure.math" "acos" (m1c acos))
 (def-var! "clojure.math" "atan" (m1 atan))
 ;; clojure.math/atan2 is atan2(y, x); Chez's 2-arg atan is (atan y x).
-(def-var! "clojure.math" "atan2" (lambda (y x) (exact->inexact (atan y x))))
+(def-var! "clojure.math" "atan2" (m2 atan))
 (def-var! "clojure.math" "sinh" (m1 sinh))
 (def-var! "clojure.math" "cosh" (m1 cosh))
 (def-var! "clojure.math" "tanh" (m1 tanh))
 (def-var! "clojure.math" "floor" (m1 floor))
 (def-var! "clojure.math" "ceil" (m1 ceiling))
 (def-var! "clojure.math" "rint" (m1 round))
-(def-var! "clojure.math" "round" jolt-math-round)
+(def-var! "clojure.math" "round" (n1 jolt-math-round))
 (def-var! "clojure.math" "signum" jolt-math-signum)
-(def-var! "clojure.math" "to-degrees" jolt-math-to-degrees)
-(def-var! "clojure.math" "to-radians" jolt-math-to-radians)
-(def-var! "clojure.math" "hypot" jolt-math-hypot)
-(def-var! "clojure.math" "floor-div" jolt-math-floor-div)
-(def-var! "clojure.math" "floor-mod" jolt-math-floor-mod)
+(def-var! "clojure.math" "to-degrees" (n1 jolt-math-to-degrees))
+(def-var! "clojure.math" "to-radians" (n1 jolt-math-to-radians))
+(def-var! "clojure.math" "hypot" (n2 jolt-math-hypot))
+(def-var! "clojure.math" "floor-div" (n2 jolt-math-floor-div))
+(def-var! "clojure.math" "floor-mod" (n2 jolt-math-floor-mod))
 (def-var! "clojure.math" "E" jolt-math-e)
 (def-var! "clojure.math" "PI" jolt-math-pi)
 (def-var! "clojure.math" "IEEE-remainder" jolt-math-ieee-remainder)
@@ -426,8 +431,19 @@
 (define (jolt-int-bits->float n)
   (make-jfloat (bits->flt (modulo (exact (jolt-need-num n)) (expt 2 32)))))
 
+;; Double.compare: numeric order, except that -0.0 sorts below 0.0 and NaN above
+;; everything, itself included equal to itself; that tie-break is the bit
+;; patterns compared as signed longs.
+(define (jolt-double-compare a b)
+  (let ((a (exact->inexact (jolt-need-num a))) (b (exact->inexact (jolt-need-num b))))
+    (cond ((< a b) -1)
+          ((> a b) 1)
+          (else (let ((x (jolt-double->long-bits a)) (y (jolt-double->long-bits b)))
+                  (cond ((= x y) 0) ((< x y) -1) (else 1)))))))
+
 (register-class-statics! "Double"
-  (list (cons "doubleToLongBits" (lambda (x) (jolt-double->long-bits x)))
+  (list (cons "compare" (lambda (a b) (jolt-double-compare a b)))
+        (cons "doubleToLongBits" (lambda (x) (jolt-double->long-bits x)))
         (cons "doubleToRawLongBits" (lambda (x) (jolt-double->long-bits x)))
         (cons "longBitsToDouble" (lambda (n) (jolt-long-bits->double n)))))
 ;; Float.toString: the shortest decimal that reads back as the float, which is
