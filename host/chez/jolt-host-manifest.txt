@@ -59,6 +59,7 @@ fiber-carrier-count
 fiber-carrier-count-set!
 fiber-instance?
 fiber-interrupt!
+fiber-kill!
 fiber-masked
 fiber-monitor!
 fiber-park-commit!

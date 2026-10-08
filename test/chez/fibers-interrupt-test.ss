@@ -255,5 +255,65 @@
 (ok "15. the interrupted deref deregistered from its interrupt box"
     (= waits-before (interrupt-wait-entries)))
 
+;; --- 16. kill!: an interrupt no catch can swallow ------------------------------
+;; An Erlang kill: the fiber leaves by escape, not by a raise, so its own
+;; try/catch never sees it -- only its finally blocks run. It lands at the
+;; outermost unmasked region (raised there, in the masked cleanup) or, outside
+;; any, at the fiber's entry, and the fiber dies with the throwable.
+(define r16 (ev "
+(let [w (f/spawn (fn [] (loop [] (try (reduce + (range 1000)) (catch Throwable _ nil)) (recur))))]
+  (a/<!! (a/timeout 20))
+  [(f/kill! w (ex-info \"killed\" {})) (outcome w)])"))
+(ok "16. kill! answers true for a live fiber" (eq? #t (jv-nth r16 0)))
+(ok "16. a fiber that catches everything in a loop still dies of a kill"
+    (died? (jv-nth r16 1) "killed"))
+
+(define r17 (ev "
+(let [w (f/spawn (fn [] (try (a/<!! (a/chan)) (catch Throwable _ (loop [] (recur))))))]
+  (a/<!! (a/timeout 20))
+  (f/kill! w (ex-info \"killed parked\" {}))
+  (outcome w))"))
+(ok "17. a parked fiber is killed past its catch" (died? r17 "killed parked"))
+
+(define r18 (ev "
+(let [log (atom [])
+      w (f/spawn (fn []
+                   (f/masked
+                    (fn []
+                      (let [r (try (f/unmasked
+                                    (fn [] (loop []
+                                             (try (a/<!! (a/chan))
+                                                  (catch Throwable _ (swap! log conj :caught-in-body))
+                                                  (finally (swap! log conj :finally)))
+                                             (recur))))
+                                   (catch Throwable e [:landed (ex-message e)]))]
+                        (swap! log conj :cleanup)
+                        r)))))]
+  (a/<!! (a/timeout 20))
+  (f/kill! w (ex-info \"to the edge\" {}))
+  [(outcome w) @log])"))
+(ok "18. a kill lands at the unmasked edge, where the masked cleanup catches it"
+    (jolt=2 (jv-nth r18 0) (jolt-vector (keyword #f "landed") "to the edge")))
+(ok "18. the body's catch never saw it, its finally ran, the cleanup ran"
+    (jolt=2 (jv-nth r18 1) (jolt-vector (keyword #f "finally") (keyword #f "cleanup"))))
+
+(define r19 (ev "
+(let [w (f/spawn (fn [] (loop [] (try (a/<!! (a/chan)) (catch Throwable _ nil)) (recur))))]
+  (a/<!! (a/timeout 20))
+  (f/kill! w (ex-info \"the kill\" {}))
+  (f/interrupt! w (ex-info \"an interrupt\" {}))
+  (outcome w))"))
+(ok "19. an interrupt after a kill does not replace it" (died? r19 "the kill"))
+
+(define r20 (ev "(let [w (f/spawn (fn [] :done))] (f/join w) (f/kill! w (ex-info \"late\" {})))"))
+(ok "20. a finished fiber refuses the kill" (eq? #f r20))
+
+(define r21 (ev "
+(let [w (f/spawn (fn [] (f/masked (fn [] (a/<!! (a/timeout 60)) :masked-done))))]
+  (a/<!! (a/timeout 20))
+  (f/kill! w (ex-info \"after mask\" {}))
+  (outcome w))"))
+(ok "21. a kill waits for a masked region, then the fiber dies" (died? r21 "after mask"))
+
 (printf "~a/~a passed\n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

@@ -98,8 +98,14 @@
           ;; what a park through jolt-lock-wait is, for Thread.getState when it
           ;; is not plain WAITING: TIMED_WAITING for a wait with a deadline,
           ;; BLOCKED for entering a monitor. #f otherwise, cleared on the resume.
-          (mutable wstate))
-  (nongenerative jolt-fiber-v7))
+          (mutable wstate)
+          ;; where a kill (jolt-fiber-kill!) leaves to: the continuation of the
+          ;; fiber's entry, and of its outermost unmasked region while it is in
+          ;; one (#f otherwise). A kill escapes rather than raises, so no guard
+          ;; -- no try/catch -- between the safe point and here sees it.
+          (mutable exit-k)
+          (mutable edge-k))
+  (nongenerative jolt-fiber-v8))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -713,7 +719,7 @@
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c #f '() 0 #f #f 0 #f ibox #f #f)))
+              c #f '() 0 #f #f 0 #f ibox #f #f #f #f)))
       (when ibox (jolt-fiber-own-ibox! f ibox))
       (when before-run (before-run f))
       (jolt-fiber-enqueue! c f)
@@ -1071,11 +1077,26 @@
 
 ;; (jolt-fiber-interrupt! f throwable) -> #t if F will raise THROWABLE, #f if F
 ;; had already finished. Callable from any thread or fiber.
+;; A kill is an interrupt that leaves by escape: pending, it is this record in
+;; the fiber's interrupt field, which every "is an interrupt pending" test reads
+;; as true; only jolt-fiber-check-interrupt! tells it apart.
+(define-record-type jolt-kill
+  (fields throwable)
+  (nongenerative jolt-kill-v1))
+
 (define (jolt-fiber-interrupt! f throwable)
+  (jolt-fiber-deliver-interrupt! f throwable))
+
+;; Set F's pending interrupt to PAYLOAD -- a throwable, or a jolt-kill -- and
+;; wake F if it is parked. A kill already pending is not replaced: it is final.
+(define (jolt-fiber-deliver-interrupt! f payload)
   (let ((live? (jolt-with-mutex jolt-fiber-monitor-mu
                  (let ((st (jolt-fiber-state f)))
                    (and (not (eq? st 'done)) (not (eq? st 'dead))
-                        (begin (jolt-fiber-interrupt-set! f throwable) #t))))))
+                        (begin
+                          (unless (jolt-kill? (jolt-fiber-interrupt f))
+                            (jolt-fiber-interrupt-set! f payload))
+                          #t))))))
     (when live?
       (let* ((mu (jolt-carrier-mu (jolt-fiber-carrier f)))
              (parked-on (begin (jolt-lock! mu)
@@ -1092,6 +1113,16 @@
           (else (void)))))                  ; a delivery won the claim and wakes it
     live?))
 
+;; Kill F with THROWABLE, as Erlang's kill: delivered as an interrupt is, but at
+;; its safe point F escapes instead of raising, so no try/catch of F's sees it
+;; and only its finally blocks (dynamic-wind exits) run. It lands at F's
+;; outermost unmasked region, and is raised there, in the masked code around
+;; it -- the cleanup the mask exists for -- or, outside any, at F's entry, and F
+;; dies with it. A CPS'd go body has no stack to escape and is raised into as an
+;; interrupt is. #f when F had already finished.
+(define (jolt-fiber-kill! f throwable)
+  (jolt-fiber-deliver-interrupt! f (make-jolt-kill throwable)))
+
 ;; Raise F's pending interrupt, on F. The raise leaves the interrupt depth where
 ;; the fiber's own code runs -- the depth its carrier starts every fiber at --
 ;; which is what the park site whose tail this is would have restored had it
@@ -1099,11 +1130,27 @@
 (define (jolt-fiber-check-interrupt! f)
   (let ((e (and f (fx=? 0 (jolt-fiber-mask f)) (jolt-fiber-interrupt f))))
     (when e
-      (jolt-fiber-interrupt-set! f #f)
       (jolt-fiber-parked-on-set! f #f)
       (jolt-adjust-interrupts! (jolt-current-disable-count)
                                (jolt-carrier-sic (jolt-fiber-carrier f)))
-      (jolt-throw e))))
+      (if (jolt-kill? e)
+          ;; A kill stays pending until it lands, so a finally that reaches a
+          ;; safe point on the way out escapes again, to the same place.
+          (let ((out (or (jolt-fiber-edge-k f) (jolt-fiber-exit-k f))))
+            (if out
+                (out e)
+                (begin (jolt-fiber-interrupt-set! f #f)
+                       (jolt-throw (jolt-kill-throwable e)))))
+          (begin (jolt-fiber-interrupt-set! f #f)
+                 (jolt-throw e))))))
+
+;; What an escape target does with what reached it: a kill is raised here, where
+;; it landed, and is no longer pending; anything else is the value it returned.
+(define (jolt-fiber-landed f v)
+  (if (jolt-kill? v)
+      (begin (when (eq? v (jolt-fiber-interrupt f)) (jolt-fiber-interrupt-set! f #f))
+             (jolt-throw (jolt-kill-throwable v)))
+      v))
 
 ;; --- masking ----------------------------------------------------------------
 ;; A region that must not be torn by an interrupt -- a process telling its links
@@ -1145,25 +1192,35 @@
                 (when (fx=? 0 (jolt-fiber-mask f))
                   (jolt-fiber-check-interrupt! f)))))))))
 
+;; The outermost unmasked region is where a kill lands: its edge-k is set on
+;; entry and cleared on exit (a park's unwind and rewind leave it, as they leave
+;; the mask), and the kill is raised once the mask is back, after the region.
 (define (jolt-fiber-unmasked thunk)
   (let ((f (jolt-current-fiber)))
     (if (not f)
         (thunk)
-        (let ((saved #f) (lv (jolt-locks-held)))
-          (jolt-locks-enter!)
-          (dynamic-wind
-            (lambda ()
-              (unless saved
-                (set! saved (jolt-fiber-mask f))
-                (jolt-fiber-mask-set! f 0)))
-            (jolt-masked-body
-              (lambda ()
-                ;; an interrupt that waited for the mask to open lands at once
-                (jolt-fiber-check-interrupt! f)
-                (thunk)))
-            (jolt-masked-after lv
-              (unless (jolt-park-unwinding?)
-                (jolt-fiber-mask-set! f saved))))))))
+        (jolt-fiber-landed f
+          (call/cc
+            (lambda (out)
+              (let ((saved #f) (outermost? #f) (lv (jolt-locks-held)))
+                (jolt-locks-enter!)
+                (dynamic-wind
+                  (lambda ()
+                    (unless saved
+                      (set! saved (jolt-fiber-mask f))
+                      (jolt-fiber-mask-set! f 0)
+                      (unless (jolt-fiber-edge-k f)
+                        (set! outermost? #t)
+                        (jolt-fiber-edge-k-set! f out))))
+                  (jolt-masked-body
+                    (lambda ()
+                      ;; an interrupt that waited for the mask to open lands at once
+                      (jolt-fiber-check-interrupt! f)
+                      (thunk)))
+                  (jolt-masked-after lv
+                    (unless (jolt-park-unwinding?)
+                      (when outermost? (jolt-fiber-edge-k-set! f #f))
+                      (jolt-fiber-mask-set! f saved)))))))))))
 
 ;; --- monitors (the observable half of swish's, erlang.ss:434) ----------------
 ;; A fiber that dies is otherwise unobservable. fibers-async.ss and sm.ss both
@@ -1384,9 +1441,15 @@
         ;;
         ;; So the escape discipline above is the invariant. Keep it.
         (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
-                    ;; interrupted before it ever ran: it dies on entry
-                    (jolt-fiber-check-interrupt! f)
-                    ((jolt-fiber-thunk f)))))
+                    ;; the entry is where a kill outside any unmasked region
+                    ;; lands, raised inside this guard so the fiber dies of it
+                    (jolt-fiber-landed f
+                      (call/cc
+                        (lambda (exit)
+                          (jolt-fiber-exit-k-set! f exit)
+                          ;; interrupted before it ever ran: it dies on entry
+                          (jolt-fiber-check-interrupt! f)
+                          ((jolt-fiber-thunk f))))))))
           (jolt-fiber-done! f r)))))
     (else (error 'jolt-fiber-run "fiber in unexpected state"
                  (jolt-fiber-state f)))))
