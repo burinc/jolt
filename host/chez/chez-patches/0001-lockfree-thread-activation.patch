@@ -1,0 +1,401 @@
+diff --git a/c/externs.h b/c/externs.h
+index 1a293aa..0f45a19 100644
+--- a/c/externs.h
++++ b/c/externs.h
+@@ -284,7 +284,9 @@ extern ptr S_bytevector_uncompress(ptr dest_bv, iptr d_start, iptr d_count,
+ /* thread.c */
+ extern void S_thread_init(void);
+ extern ptr S_create_thread_object(const char *who, ptr p_tc);
++extern iptr S_convert_native_threads(void);
+ #ifdef PTHREADS
++extern uptr S_collections_done;
+ extern ptr S_fork_thread(ptr thunk);
+ extern ptr S_make_mutex(void);
+ extern void S_mutex_free(scheme_mutex_t *m);
+@@ -296,6 +298,7 @@ extern s_thread_cond_t *S_make_condition(void);
+ extern void S_condition_free(s_thread_cond_t *c);
+ extern IBOOL S_condition_wait(s_thread_cond_t *c, scheme_mutex_t *m, ptr t);
+ extern INT S_activate_thread(void);
++extern INT S_lockfree_activation(void);
+ extern void S_unactivate_thread(int mode);
+ #endif
+ 
+diff --git a/c/gcwrapper.c b/c/gcwrapper.c
+index 8d53d97..081bf8a 100644
+--- a/c/gcwrapper.c
++++ b/c/gcwrapper.c
+@@ -1184,13 +1184,65 @@ void S_fixup_counts(ptr counts) {
+   RTDCOUNTSTIMESTAMP(counts) = S_G.gctimestamp[0];
+ }
+ 
++#ifdef PTHREADS
++/* An inactive thread is in C (a collect-safe foreign call, a condition
++   wait), and the C stack holds a return address into the code it came
++   from, which the collector cannot see. Deactivation used to lock that
++   code on every call; it is locked here instead, for the one stretch
++   it could move, and only for the threads that are inactive now. The
++   collector holds the tc mutex, so no thread can come back to Scheme
++   (reactivate_thread waits for the mutex) until it is unlocked. */
++static int compare_code_ptrs(const void *a, const void *b) {
++  uptr x = (uptr)*(const ptr *)a, y = (uptr)*(const ptr *)b;
++  return x < y ? -1 : x > y;
++}
++
++static ptr *lock_inactive_threads_code(ptr tc, iptr *n) {
++  ptr ls, *locked; iptr i = 0, j, k;
++  locked = (ptr *)malloc(sizeof(ptr) * (S_nthreads + 1));
++  if (locked == NULL) S_error_abort("out of memory locking inactive threads' code");
++  for (ls = S_threads; ls != Snil; ls = Scdr(ls)) {
++    ptr t_tc = (ptr)THREADTC(Scar(ls));
++    if (t_tc != tc && !ACTIVE(t_tc)) {
++      ptr code = CP(t_tc);
++      if (code != (ptr)0 && !FIXMEDIATE(code)) {
++        if (Sprocedurep(code)) CP(t_tc) = code = CLOSCODE(code);
++        locked[i++] = code;
++      }
++    }
++  }
++  /* Threads parked in the same place share one code object (a thousand
++     workers waiting in one loop), and every lock is an entry on a list the
++     unlock scans: lock each object once. */
++  qsort(locked, i, sizeof(ptr), compare_code_ptrs);
++  for (j = 0, k = 0; j < i; j += 1) {
++    if (k == 0 || locked[j] != locked[k - 1]) locked[k++] = locked[j];
++  }
++  for (j = 0; j < k; j += 1) Slock_object(locked[j]);
++  *n = k;
++  return locked;
++}
++
++static void unlock_inactive_threads_code(ptr *locked, iptr n) {
++  iptr i;
++  for (i = 0; i < n; i += 1) Sunlock_object(locked[i]);
++  free(locked);
++}
++#endif
++
+ ptr S_do_gc(IGEN max_cg, IGEN min_tg, IGEN max_tg, ptr count_roots) {
+   ptr tc = get_thread_context();
+   ptr code, result;
++#ifdef PTHREADS
++  ptr *inactive_code; iptr inactive_count;
++#endif
+ 
+   code = CP(tc);
+   if (Sprocedurep(code)) code = CLOSCODE(code);
+   Slock_object(code);
++#ifdef PTHREADS
++  inactive_code = lock_inactive_threads_code(tc, &inactive_count);
++#endif
+ 
+  /* Scheme side grabs mutex before calling S_do_gc */
+   THREAD_GC(tc)->during_alloc += 1;
+@@ -1312,6 +1364,10 @@ ptr S_do_gc(IGEN max_cg, IGEN min_tg, IGEN max_tg, ptr count_roots) {
+ 
+   THREAD_GC(tc)->during_alloc -= 1;
+ 
++#ifdef PTHREADS
++  unlock_inactive_threads_code(inactive_code, inactive_count);
++  S_collections_done += 1;
++#endif
+   Sunlock_object(code);
+ 
+   return result;
+diff --git a/c/prim.c b/c/prim.c
+index 638663a..b9c54f9 100644
+--- a/c/prim.c
++++ b/c/prim.c
+@@ -195,6 +195,10 @@ void S_prim_init(void) {
+     Sforeign_symbol("(cs)maxmembytes", (void *)S_maxmembytes);
+     Sforeign_symbol("(cs)resetmaxmembytes", (void *)S_resetmaxmembytes);
+     Sforeign_symbol("(cs)do_gc", (void *)S_do_gc);
++#ifdef PTHREADS
++    Sforeign_symbol("(cs)lockfree_activation", (void *)S_lockfree_activation);
++#endif
++    Sforeign_symbol("(cs)convert_native_threads", (void *)S_convert_native_threads);
+     Sforeign_symbol("(cs)check_heap_enabledp", (void *)s_check_heap_enabledp);
+     Sforeign_symbol("(cs)enable_check_heap", (void *)s_enable_check_heap);
+     Sforeign_symbol("(cs)check_heap_errors", (void *)s_check_heap_errors);
+diff --git a/c/thread.c b/c/thread.c
+index bf11431..18bec33 100644
+--- a/c/thread.c
++++ b/c/thread.c
+@@ -67,6 +67,7 @@ ptr S_create_thread_object(const char *who, ptr p_tc) {
+     tgc = &S_G.main_thread_gc;
+     GCDATA(tc) = TO_PTR(tgc);
+     tgc->tc = tc;
++    tgc->native_state = native_running;
+   } else { /* clone parent */
+     ptr p_v = PARAMETERS(p_tc);
+     iptr i, n = Svector_length(p_v);
+@@ -106,6 +107,7 @@ ptr S_create_thread_object(const char *who, ptr p_tc) {
+       tgc->dirty_segments[i] = NULL;
+     tgc->queued_fire = 0;
+     tgc->preserve_ownership = 0;
++    tgc->native_state = native_running;
+ 
+     v = S_vector_in(tc, space_new, 0, n);
+ 
+@@ -188,6 +190,110 @@ ptr S_create_thread_object(const char *who, ptr p_tc) {
+ }
+ 
+ #ifdef PTHREADS
++/* Collect-safe foreign calls without the tc mutex.
++
++   A collect-safe call used to deactivate the thread outright: take the tc
++   mutex, lock the code object the call returns into, give up the thread's
++   place in $active-threads, and undo all of it on return. Instead, the
++   thread now only marks itself native_in_native in its own word and stays
++   counted. That is a CAS each way and nothing shared.
++
++   Whoever looks at $active-threads has to see such a thread gone from
++   it, as a deactivating call always showed it: the "only one thread
++   active" checks in collect and compute-size-increments, and the
++   rendezvous deciding to collect. So the first two call S_convert_native_threads under the tc
++   mutex before they read it (s/7.ss, s/inspect.ss), and a thread about to
++   wait for a collection (S_condition_wait on a collect condition) does the
++   same: every native_in_native thread is deactivated on its behalf,
++   native_in_native -> native_converted, ACTIVE cleared, count lowered. A
++   waiter that converted anyone goes round its loop again instead of
++   waiting for a thread that is not coming. Only readers pay for the walk
++   over the thread list; taking the tc mutex for anything else does not.
++
++   A thread returning from C claims its word back, native_in_native ->
++   native_running, and goes on. If it was converted meanwhile, it takes
++   the tc mutex (which a collection in progress holds until it is done,
++   and under which the conversion finished) and reactivates.
++
++   The CASes on the word decide every race between the thread and a
++   converter. The one that remains is a thread entering C just as a
++   collection is requested: it marks itself and then reads
++   collect-request-pending, with a full fence between, so either it sees
++   the request and deactivates itself the ordinary way, or a converter
++   that looks after the request was set finds it marked.
++
++   The code a native thread returns into is locked by S_do_gc for the
++   collection's length, as it is for every inactive thread. */
++
++/* A StoreLoad barrier. atomic.h's fences are store or acquire fences, and
++   on some compilers (MSVC on x64) none at all, so this one is spelled out. */
++#if defined(_MSC_VER)
++# define NATIVE_FULL_FENCE() MemoryBarrier()
++#else
++# define NATIVE_FULL_FENCE() __sync_synchronize()
++#endif
++
++static IBOOL native_state_cas(thread_gc *tgc, uptr from, uptr to) {
++  /* the arm64 CAS can fail spuriously, so a failure only counts when the
++     word really holds something else */
++  for (;;) {
++    if (tgc->native_state != from) return 0;
++    if (COMPARE_AND_SWAP_PTR(&tgc->native_state, TO_VOIDP(from), TO_VOIDP(to))) return 1;
++  }
++}
++
++/* With the tc mutex held: deactivate every thread sitting in C as
++   native_in_native, so that a reader of $active-threads sees it gone, as a
++   deactivating collect-safe call always showed it. Answers how many were.
++   A thread converted when no collection follows only pays the ordinary
++   reactivation on its way back. */
++iptr S_convert_native_threads(void) {
++  ptr ls; iptr n = 0;
++  for (ls = S_threads; ls != Snil; ls = Scdr(ls)) {
++    ptr t_tc = (ptr)THREADTC(Scar(ls));
++    thread_gc *tgc = THREAD_GC(t_tc);
++    if (native_state_cas(tgc, native_in_native, native_converted)) {
++      ACTIVE(t_tc) = 0;
++      SETSYMVAL(S_G.active_threads_id,
++       FIX(UNFIX(SYMVAL(S_G.active_threads_id)) - 1));
++      n += 1;
++    }
++  }
++  return n;
++}
++
++/* S_do_gc counts collections; a collect waiter records the count it
++   converted native threads for (S_condition_wait). Both under the tc mutex. */
++uptr S_collections_done;
++static uptr collect_waiters_converted = (uptr)-1;
++
++/* Back from C: claim the thread's place again. */
++static void return_from_native(ptr tc) {
++  thread_gc *tgc = THREAD_GC(tc);
++  if (native_state_cas(tgc, native_in_native, native_running)) return;
++  if (tgc->native_state == native_converted) {
++    /* The converter takes the word first and then, still under the tc
++       mutex, clears ACTIVE and gives up the count; ACTIVE is only
++       settled once that mutex is free, so read it under the mutex rather
++       than through reactivate_thread's unlocked check. The mutex is also
++       what a collection in progress holds until it is done. */
++    tc_mutex_acquire();
++    if (!ACTIVE(tc)) {
++      SETSYMVAL(S_G.active_threads_id,
++       FIX(UNFIX(SYMVAL(S_G.active_threads_id)) + 1));
++      ACTIVE(tc) = 1;
++    }
++    tgc->native_state = native_running;
++    tc_mutex_release();
++  } else
++    reactivate_thread(tc)
++}
++
++/* Present only in a kernel with this scheme: a caller can ask with
++   (foreign-entry? "(cs)lockfree_activation") whether collect-safe calls
++   are cheap here. */
++INT S_lockfree_activation(void) { return 1; }
++
+ IBOOL Sactivate_thread(void) { /* create or reactivate current thread */
+   ptr tc = get_thread_context();
+ 
+@@ -199,7 +305,7 @@ IBOOL Sactivate_thread(void) { /* create or reactivate current thread */
+     s_thread_setspecific(S_tc_key, TO_VOIDP(THREADTC(thread)));
+     return 1;
+   } else {
+-    reactivate_thread(tc)
++    return_from_native(tc);
+     return 0;
+   }
+ }
+@@ -210,8 +316,8 @@ int S_activate_thread(void) { /* Like Sactivate_thread(), but returns a mode to
+   if (tc == (ptr)0) {
+     Sactivate_thread();
+     return unactivate_mode_destroy;
+-  } else if (!ACTIVE(tc)) {
+-    reactivate_thread(tc);
++  } else if (THREAD_GC(tc)->native_state != native_running || !ACTIVE(tc)) {
++    return_from_native(tc);
+     return unactivate_mode_deactivate;
+   } else
+     return unactivate_mode_noop;
+@@ -233,7 +339,20 @@ void S_unactivate_thread(int mode) { /* Reverts a previous S_activate_thread() e
+ 
+ void Sdeactivate_thread(void) { /* deactivate current thread */
+   ptr tc = get_thread_context();
+-  if (tc != (ptr)0) deactivate_thread(tc)
++  thread_gc *tgc;
++  if (tc == (ptr)0 || !ACTIVE(tc)) return;
++  tgc = THREAD_GC(tc);
++  if (tgc->native_state != native_running) return;
++  tgc->native_state = native_in_native;
++  NATIVE_FULL_FENCE(); /* the mark is visible before the request is read */
++  if (Sboolean_value(*(volatile ptr *)&SYMVAL(S_G.collect_request_pending_id))) {
++    /* a collection is wanted: give up the thread's place now, as a
++       deactivation always did, unless a waiter already has */
++    tc_mutex_acquire();
++    if (native_state_cas(tgc, native_in_native, native_converted))
++      deactivate_thread(tc)
++    tc_mutex_release();
++  }
+ }
+ 
+ int Sdestroy_thread(void) { /* destroy current thread */
+@@ -540,6 +659,17 @@ IBOOL S_condition_wait(s_thread_cond_t *c, scheme_mutex_t *m, ptr t) {
+ 
+   is_collect = (c == &S_collect_cond || c == &S_collect_thread0_cond);
+ 
++  /* a thread in a collect-safe call is still counted active: deactivate it
++     on its behalf and let the caller look at the count again rather than
++     wait for a thread that is not coming (see Sdeactivate_thread). Once per
++     collection is enough: a thread that enters C after this walk sees the
++     request already pending and deactivates itself, so the other waiters
++     (every thread in the process, in a rendezvous) skip the walk. */
++  if (is_collect && collect_waiters_converted != S_collections_done) {
++    collect_waiters_converted = S_collections_done;
++    if (S_convert_native_threads() > 0) return 1;
++  }
++
+   if (is_collect) {
+     /* Remember the index where we record this tc, because a thread
+        might temporarily wait for collection, but then get woken
+@@ -590,3 +720,9 @@ IBOOL S_condition_wait(s_thread_cond_t *c, scheme_mutex_t *m, ptr t) {
+   }
+ }
+ #endif /* PTHREADS */
++
++#ifndef PTHREADS
++/* (cs)convert_native_threads is called by collect whatever the build;
++   without threads there is no one to convert. */
++iptr S_convert_native_threads(void) { return 0; }
++#endif
+diff --git a/c/types.h b/c/types.h
+index 440bd68..f579b6b 100644
+--- a/c/types.h
++++ b/c/types.h
+@@ -367,14 +367,14 @@ typedef struct {
+    can proceed.  if we happen to be the collecting thread, the active
+    thread count is zero, in which case we don't signal.  collection
+    is not permitted to happen when interrupts are disabled, so we
+-   don't let anything happen in that case. */
++   don't let anything happen in that case.
++
++   The code an inactive thread returns into is not locked here: S_do_gc
++   locks it for every inactive thread, for the one stretch it could
++   move (lock_inactive_threads_code in gcwrapper.c). */
+ #define deactivate_thread_signal_collect(tc, check_collect) {  \
+   if (ACTIVE(tc)) {\
+-    ptr code;\
+     tc_mutex_acquire();\
+-    code = CP(tc);\
+-    if (Sprocedurep(code)) CP(tc) = code = CLOSCODE(code);\
+-    Slock_object(code);\
+     SETSYMVAL(S_G.active_threads_id,\
+      FIX(UNFIX(SYMVAL(S_G.active_threads_id)) - 1));\
+     if (check_collect \
+@@ -393,7 +393,6 @@ typedef struct {
+     tc_mutex_acquire();                         \
+     SETSYMVAL(S_G.active_threads_id,\
+      FIX(UNFIX(SYMVAL(S_G.active_threads_id)) + 1));\
+-    Sunlock_object(CP(tc));\
+     ACTIVE(tc) = 1;\
+     tc_mutex_release()\
+   }\
+@@ -464,9 +463,18 @@ typedef struct {
+ #define AS_IMPLICIT_ATOMIC(T, X) X
+ #endif
+ 
++/* thread_gc.native_state: a thread in a collect-safe foreign call (or in
++   C after a collect-safe callable returns) that has not given up its
++   place in $active-threads; see Sdeactivate_thread in thread.c. */
++#define native_running   0
++#define native_in_native 1  /* in C, still counted active */
++#define native_converted 2  /* in C, deactivated on its behalf */
++
+ typedef struct thread_gc {
+   ptr tc;
+ 
++  volatile uptr native_state;
++
+   int during_alloc;
+   IBOOL queued_fire;
+   IBOOL preserve_ownership;
+diff --git a/s/7.ss b/s/7.ss
+index 992f099..2451115 100644
+--- a/s/7.ss
++++ b/s/7.ss
+@@ -809,9 +809,13 @@
+   (define start-bytes 0)
+   (define allocated-after-max 0)
+   (define docollect
+-    (let ([do-gc (foreign-procedure "(cs)do_gc" (int int int ptr) ptr)])
++    (let ([do-gc (foreign-procedure "(cs)do_gc" (int int int ptr) ptr)]
++          [convert-native-threads (foreign-procedure "(cs)convert_native_threads" () iptr)])
+       (lambda (p)
+         (with-tc-mutex
++          ;; a thread in a collect-safe call stays counted until someone
++          ;; looks (c/thread.c Sdeactivate_thread): count it out first
++          (convert-native-threads)
+           (unless (= $active-threads 1)
+             ($oops 'collect "cannot collect when multiple threads are active"))
+           (let-values ([(trip g gmintarget gmaxtarget count-roots reset-alloc-after?)
+diff --git a/s/inspect.ss b/s/inspect.ss
+index 2030b36..ce4118f 100644
+--- a/s/inspect.ss
++++ b/s/inspect.ss
+@@ -3096,6 +3096,7 @@
+           (unless (list? x*) ($oops who "~s is not a list" x*))
+           (let ([g (filter-generation who g)])
+             (with-tc-mutex
++             ((foreign-procedure "(cs)convert_native_threads" () iptr))
+              (unless (= $active-threads 1)
+                ($oops who "cannot count when multiple threads are active"))
+              (count_size_increments x* g)))]))))

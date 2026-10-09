@@ -51,6 +51,7 @@ jobs:
         run: |
           git clone --depth 1 --branch v10.4.1 --recurse-submodules \
             https://github.com/cisco/ChezScheme.git "$HOME/chez-src"
+          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" "$HOME/chez-src"
 
       - name: Cache Chez install
         id: cache-chez

@@ -172,6 +172,7 @@ jobs:
         run: |
           git clone --depth 1 --branch v10.4.1 --recurse-submodules \
             https://github.com/cisco/ChezScheme.git "$HOME/chez-src"
+          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" "$HOME/chez-src"
 
       - name: Cache Chez Scheme (Linux)
         if: runner.os == 'Linux' && !matrix.termux
@@ -179,7 +180,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/chez-opt
-          key: chez-manylinux2014-v10.4.1-static-pic-v2
+          key: chez-manylinux2014-v10.4.1-static-pic-v2-${{ hashFiles('host/chez/chez-patches/*.patch') }}
 
       - name: Build jolt in ${{ matrix.container-build }} (Linux)
         if: runner.os == 'Linux' && !matrix.termux
@@ -213,16 +214,50 @@ jobs:
             '${{ matrix.termux }}' env JOLT_VERSION="$JOLT_VERSION" sh /src/ci/termux-build.sh
           cat target/release/bionic-report.txt
 
-      # --- macOS: Homebrew chezscheme ships `chez` plus the csv kernel dev files
-      # (libkernel.a, scheme.h, *.boot), which is all build-jolt needs — and,
-      # since it vendors lz4 rather than depending on the formula, the matching
-      # liblz4.a next to them. The lz4 keg is only build.ss's fallback source of
-      # a static archive for a Chez that arrived without one: the link names an
-      # archive, never a dylib, so nothing installed here can become a runtime
-      # dependency of the shipped binary (asserted below). ---
-      - name: Install Chez Scheme (macOS)
+      # --- macOS: Chez built from source with jolt's kernel patches
+      # (ci/apply-chez-patches.sh), installed with the csv kernel dev files
+      # (libkernel.a, scheme.h, *.boot) and the vendored liblz4.a / libz.a next
+      # to them, which is all build-jolt needs. Homebrew's chezscheme is the
+      # stock kernel, and the binary links whichever kernel this is. The lz4 keg
+      # is only build.ss's fallback source of a static archive for a Chez that
+      # arrived without one: the link names an archive, never a dylib, so
+      # nothing installed here can become a runtime dependency of the shipped
+      # binary (asserted below). ---
+      - name: Install lz4 (macOS)
         if: runner.os == 'macOS'
-        run: brew install chezscheme lz4
+        run: brew install lz4
+
+      - name: Cache Chez Scheme (macOS)
+        if: runner.os == 'macOS'
+        id: cache-chez-mac
+        uses: actions/cache@v5
+        with:
+          path: ~/chez-mac
+          key: chez-${{ matrix.os }}-v10.4.1-min11-${{ hashFiles('host/chez/chez-patches/*.patch') }}
+
+      - name: Build Chez Scheme from source (macOS)
+        if: runner.os == 'macOS' && steps.cache-chez-mac.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 --recurse-submodules \
+            https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" /tmp/chez-src
+          cd /tmp/chez-src
+          # minos, as the cross row pins it: the kernel is linked into the
+          # shipped binary, which must load on Macs older than the runner.
+          ./configure --installprefix="$HOME/chez-mac" --threads --disable-x11 \
+            CFLAGS="-mmacosx-version-min=11.0"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: Put chez on PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Installed as `scheme`; the build invokes `chez`. A wrapper next to
+          # scheme keeps argv0 so Chez finds its boot files, and lets build.ss
+          # derive the csv dir (libkernel.a/scheme.h) from it.
+          printf '#!/bin/sh\nexec %s/bin/scheme "$@"\n' "$HOME/chez-mac" > "$HOME/chez-mac/bin/chez"
+          chmod +x "$HOME/chez-mac/bin/chez"
+          echo "$HOME/chez-mac/bin" >> "$GITHUB_PATH"
 
       # --- Windows: MSYS2/MinGW-w64 toolchain + Chez built from source (ta6nt).
       # The whole job runs in the msys2 shell so cc/xxd/paths behave; the
@@ -249,12 +284,13 @@ jobs:
         uses: actions/cache@v5
         with:
           path: chez-install
-          key: chez-${{ matrix.os }}-v10.4.1-mingw64
+          key: chez-${{ matrix.os }}-v10.4.1-mingw64-${{ hashFiles('host/chez/chez-patches/*.patch') }}
 
       - name: Build Chez Scheme from source (Windows)
         if: runner.os == 'Windows' && steps.cache-chez-win.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" /tmp/chez-src
           cd /tmp/chez-src
           ./configure --threads
           make -j"$(nproc)"
@@ -296,13 +332,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/chez-cross
-          key: chez-cross-v10.4.1-tarm64osx-${{ matrix.cross }}-v1
+          key: chez-cross-v10.4.1-tarm64osx-${{ matrix.cross }}-v1-${{ hashFiles('host/chez/chez-patches/*.patch') }}
 
       - name: Build ${{ matrix.cross }} boots/xpatch + cross kernel
         if: matrix.cross && steps.cache-chez-cross.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v10.4.1 --recurse-submodules \
             https://github.com/cisco/ChezScheme ~/chez-cross
+          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" ~/chez-cross
           cd ~/chez-cross
           ./configure -m=tarm64osx && make -j"$(sysctl -n hw.ncpu)"
           make bootquick XM=${{ matrix.cross }}

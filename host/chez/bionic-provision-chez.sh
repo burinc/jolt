@@ -66,6 +66,9 @@ if [ ! -f "$src/Makefile" ]; then
   rm -rf "$src"
   tar -C "$tmp" -xzf "$tar"
 fi
+# jolt's kernel patches, as every CI Chez build applies them (idempotent, so
+# a resumed extract is fine).
+sh "$(dirname "$0")/../../ci/apply-chez-patches.sh" "$src"
 
 jobs=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
 

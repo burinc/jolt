@@ -40,13 +40,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/chez
-          key: chez-cross-v10.4.1-ta6le-tarm64le-pic-v2
+          key: chez-cross-v10.4.1-ta6le-tarm64le-pic-v2-${{ hashFiles('host/chez/chez-patches/*.patch') }}
 
       - name: Build Chez host + tarm64le boot files + cross kernel
         if: steps.cache-chez.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v10.4.1 --recurse-submodules \
             https://github.com/cisco/ChezScheme ~/chez
+          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" ~/chez
           cd ~/chez
           ./configure -m=ta6le --disable-x11
           make -j"$(nproc)"
