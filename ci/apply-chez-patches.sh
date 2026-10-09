@@ -49,6 +49,12 @@ fi
 for p in "$here"/host/chez/chez-patches/*.patch; do
   [ -f "$p" ] || continue
   name=$(basename "$p")
+  # A CRLF checkout (Windows, without the -text attribute in .gitattributes)
+  # turns every line into a mismatch against Chez's LF sources.
+  if ! tr -d '\r' < "$p" | cmp -s - "$p"; then
+    echo "apply-chez-patches: $name has CRLF line endings; it must be checked out as written (.gitattributes)" >&2
+    exit 1
+  fi
   if applied "$p"; then
     echo "apply-chez-patches: $name already applied"
   else
