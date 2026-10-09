@@ -680,12 +680,17 @@ kernel development files + C compiler are required to link.
 Chez Scheme installs process-wide handlers for SIGSEGV, SIGBUS, SIGFPE and
 SIGILL when the library initialises. A host that handles those signals itself
 (a .NET or Java runtime does, to turn a null dereference in its own code into an
-exception) loses them: after `jolt_library_init`, such a fault in host code
-reaches Chez's handler, which reports `invalid memory reference` and aborts the
-process. A Chez that passes a fault on a thread not running Scheme code to the
-handler installed before its own, and gives the signals back at
-`jolt_library_shutdown`, fixes this; `host/chez/build-lib-smoke.sh` reports
-which kind it linked.
+exception) keeps that handling: the library passes a fault to the handler the
+host had installed when it comes from a thread that is not running jolt code (a
+thread that never called in, one whose export call has returned, or the init
+thread after `jolt_library_release_thread`), and gives the signals back at
+`jolt_library_shutdown`. A host whose init thread runs its own code should
+therefore call `jolt_library_release_thread`; until then jolt treats a fault on
+that thread as its own. One case still goes to the host: a fault in jolt code
+while the released init thread is inside an export, which a host handler
+usually reports as a crash rather than a jolt exception. On other threads, a
+fault in jolt code (an `ffi/read` through a bad pointer) is still a jolt
+exception.
 
 ## Documentation
 

@@ -56,3 +56,12 @@
     1
     0))
 (ffi/export! "code_churn" code-churn [:int] :int)
+
+;; scheme_fault reads through a null pointer and answers 1 when jolt turns the
+;; fault into an exception. The signals driver calls it while a host owns
+;; SIGSEGV too (#1277): a fault in Scheme code is still jolt's to handle, while
+;; one in host code goes to the host. :collect-safe so a host thread can call it.
+(defn scheme-fault []
+  (try (ffi/read ffi/null :int) 0
+       (catch Throwable _ 1)))
+(ffi/export! "scheme_fault" scheme-fault [] :int :collect-safe)
