@@ -169,31 +169,30 @@ case "$(uname -s)" in
 esac
 
 # A host that handles its own faults (a .NET or Java runtime does) keeps them
-# after init, after jolt_library_shutdown and after a second init only with a
-# Chez that passes a fault on a thread not running Scheme code to the handler
-# installed before its own, and gives the signals back at deinit; an older Chez
-# aborts the host with "invalid memory reference". Reported here; JOLT_EXPECT_HOST_FAULTS=1
-# makes it a failure, for a Chez known to have the fix.
+# (#1277). Chez installs process-wide SIGSEGV/SIGBUS/SIGFPE/SIGILL handlers at
+# init and treats every fault as Scheme's; the library stub chains a fault on a
+# thread not running Scheme code to the handler installed before Chez's, and
+# gives the signals back at jolt_library_shutdown. A fault in Scheme code is
+# still jolt's exception. The driver prints what each stage saw.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     echo "build-lib smoke: host fault handling skipped (POSIX signals driver)" ;;
   *)
     echo "build-lib smoke: a host's own fault after init goes to the host's handler"
-    if ! cc -O0 "$app/driver-signals.c" -ldl -o "$work/driver-signals" 2>"$work/driver-signals.err"; then
+    if ! cc -O0 "$app/driver-signals.c" -ldl -lpthread -o "$work/driver-signals" 2>"$work/driver-signals.err"; then
       echo "  FAIL: signals driver compile failed"; cat "$work/driver-signals.err"; exit 1
     fi
     got="$("$work/driver-signals" "$lib" 2>&1)"; rc=$?
     before="$(printf '%s\n' "$got" | sed -n 's/^before load: //p')"
-    kept=1
-    for stage in "after load" "after shutdown" "after reinit"; do
-      printf '%s\n' "$got" | grep -qx "$stage: $before" || kept=
-    done
-    if [ "$rc" = "0" ] && [ -n "$before" ] && [ -n "$kept" ]; then
-      echo "  host fault handling: kept"
-    elif [ -n "${JOLT_EXPECT_HOST_FAULTS:-}" ]; then
-      echo "  FAIL: host fault handling, want the host's handler after init, shutdown and a second init, got rc $rc:"; printf '%s\n' "$got"; exit 1
-    else
-      echo "  host fault handling: lost (this Chez aborts on a host's own fault; rc $rc)"
+    want="before load: $before
+scheme fault: 1
+after load: $before
+worker: 1 $before
+after shutdown: $before
+after reinit: $before"
+    if [ "$rc" != "0" ] || [ -z "$before" ] || [ "$before" = "0" ] || [ "$got" != "$want" ]; then
+      echo "  FAIL: host fault handling, want rc 0 and:"; printf '%s\n' "$want"
+      echo "  got rc $rc:"; printf '%s\n' "$got"; exit 1
     fi ;;
 esac
 

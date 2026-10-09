@@ -3762,6 +3762,14 @@
     (put-string p (bld-source-string "host/chez/stub/jolt_code_region.h"))
     (close-port p)))
 
+;; Write host/chez/stub/jolt_host_faults.h into DIR, beside the library stub that
+;; #includes it: it keeps a host's own SIGSEGV/SIGBUS/SIGFPE/SIGILL handling
+;; (jolt#1277). Embedded and read the same way as jolt_zlib.h.
+(define (bld-write-host-faults-header! dir)
+  (let ((p (open-output-file (string-append dir "/jolt_host_faults.h") 'replace)))
+    (put-string p (bld-source-string "host/chez/stub/jolt_host_faults.h"))
+    (close-port p)))
+
 (define (bld-library-stub)
   (string-append
     "#include \"scheme.h\"\n"
@@ -3769,6 +3777,7 @@
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
     "#include \"jolt_code_region.h\"\n"
+    "#include \"jolt_host_faults.h\"\n"
     (bld-boot-prefetch-defn)
     "/* jolt_set_lookup_addr is called from the built library's scheme-start\n"
     "   handler (registered via Sforeign_symbol after Sbuild_heap) to hand the\n"
@@ -3779,9 +3788,11 @@
     "int jolt_library_init(int argc, char** argv) {\n"
     "  if (!argv) argc = 0;  /* Sscheme_start reads argv[0..argc-1]; a NULL argv means no args */\n"
     (bld-boot-prefetch-call)
+    "  jolt_save_host_faults();\n"
     "  Sscheme_init(0);\n"
     "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
     "  Sbuild_heap(0, jolt_register_zlib);\n"
+    "  jolt_chain_faults();\n"
     "  Sforeign_symbol(\"jolt_set_lookup_addr\", (void*)jolt_set_lookup_addr);\n"
     "  return Sscheme_start(argc, (const char**)argv); }\n"
     "/* The thread that called jolt_library_init stays an ACTIVE Chez thread when\n"
@@ -3790,10 +3801,11 @@
     "   waits on it for good (#1234). Releasing it deactivates that thread; from\n"
     "   then on every call in, from it too, goes through a :collect-safe export,\n"
     "   which activates its caller on the way in. Repeating it is a no-op. */\n"
-    "void jolt_library_release_thread(void) { Sdeactivate_thread(); }\n"
+    "void jolt_library_release_thread(void) { Sdeactivate_thread(); jolt_faults_thread_released(1); }\n"
     "/* Sscheme_deinit runs Scheme on the calling thread, so a released thread is\n"
     "   reactivated first. Sactivate_thread is a no-op on an active thread. */\n"
-    "void jolt_library_shutdown(void) { Sactivate_thread(); Sscheme_deinit(); }\n"))
+    "void jolt_library_shutdown(void) {\n"
+    "  jolt_faults_thread_released(0); Sactivate_thread(); Sscheme_deinit(); jolt_restore_host_faults(); }\n"))
 
 ;; The library scheme-start tail BODY: publish the export table to the embedder,
 ;; then return 0 so Sscheme_start returns to jolt_library_init's caller. The guard
@@ -3844,6 +3856,7 @@
     (bld-clear-output! out-path)
     (bld-write-zlib-header! builddir)
     (bld-write-code-region-header! builddir)
+    (bld-write-host-faults-header! builddir)
     (bld-system (string-append
       (bld-cc) " " (bld-arch-flag) " -O2 -fPIC "
       ;; -install_name @rpath/<base> so a binary that link-edits against the dylib
