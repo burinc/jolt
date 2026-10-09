@@ -39,7 +39,12 @@ extern pthread_key_t S_tc_key;
 static const int jolt_fault_sig[JOLT_FAULT_SIGNALS] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL };
 static struct sigaction jolt_host_fault_act[JOLT_FAULT_SIGNALS];
 static struct sigaction jolt_chez_fault_act[JOLT_FAULT_SIGNALS];
-static __thread int jolt_thread_released;
+/* The released init thread, kept as a global rather than a __thread: a
+   dlopen'd library's TLS can go through __tls_get_addr, which on older glibc
+   allocates on a thread's first access, and that first access would be in
+   the signal handler. */
+static pthread_t jolt_released_thread;
+static volatile sig_atomic_t jolt_have_released;
 
 static void jolt_fault(int sig, siginfo_t *si, void *ctx);
 
@@ -70,7 +75,8 @@ static int jolt_run_fault_handler(const struct sigaction *a, int sig, siginfo_t 
 static void jolt_fault(int sig, siginfo_t *si, void *ctx) {
   int i = jolt_fault_index(sig);
   if (i >= 0) {
-    if ((jolt_thread_released || pthread_getspecific(S_tc_key) == NULL)
+    if ((pthread_getspecific(S_tc_key) == NULL
+         || (jolt_have_released && pthread_equal(pthread_self(), jolt_released_thread)))
         && jolt_run_fault_handler(&jolt_host_fault_act[i], sig, si, ctx))
       return;
     if (jolt_run_fault_handler(&jolt_chez_fault_act[i], sig, si, ctx)) return;
@@ -93,7 +99,7 @@ static void jolt_save_host_faults(void) {
 /* After Sbuild_heap, once Chez's handlers are in. */
 static void jolt_chain_faults(void) {
   int i;
-  jolt_thread_released = 0;
+  jolt_have_released = 0;
   for (i = 0; i < JOLT_FAULT_SIGNALS; i++) {
     struct sigaction a;
     if (sigaction(jolt_fault_sig[i], NULL, &a) != 0 || jolt_is_fault_handler(&a)) continue;
@@ -106,7 +112,10 @@ static void jolt_chain_faults(void) {
 
 /* jolt_library_release_thread hands the calling thread back to host code;
    jolt_library_shutdown takes it back before Sscheme_deinit runs Scheme. */
-static void jolt_faults_thread_released(int released) { jolt_thread_released = released; }
+static void jolt_faults_thread_released(int released) {
+  if (released) jolt_released_thread = pthread_self();
+  jolt_have_released = released;
+}
 
 /* After Sscheme_deinit: the signals are the host's again. */
 static void jolt_restore_host_faults(void) {
