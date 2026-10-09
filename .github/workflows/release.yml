@@ -201,6 +201,29 @@ jobs:
       # Makefile's bionic path provisions the pinned Chez); the script copies
       # the binary back into the workspace, which the container's unprivileged
       # user can only write where the host has opened it up. ---
+      - name: Month (Termux image cache key)
+        if: matrix.termux
+        id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      # The image comes from the cache, not Docker Hub, when it can: anonymous
+      # pulls from the shared runners hit Docker Hub's rate limit (ci/pull-image.sh).
+      - name: Restore Termux image
+        if: matrix.termux
+        id: termux-image
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/termux-image.tar
+          key: termux-docker-aarch64-${{ steps.month.outputs.month }}
+      - name: Pull Termux image
+        if: matrix.termux
+        run: sh ci/pull-image.sh '${{ matrix.termux }}' "$HOME/termux-image.tar"
+      - name: Save Termux image
+        if: matrix.termux && steps.termux-image.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/termux-image.tar
+          key: termux-docker-aarch64-${{ steps.month.outputs.month }}
+
       - name: Build jolt in Termux (Android)
         if: matrix.termux
         env:
