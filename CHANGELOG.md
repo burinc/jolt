@@ -5,6 +5,139 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.20] - 2026-10-08
+
+A float is a `java.lang.Float` rounded to single precision, and primitive
+arrays narrow what they store as the JVM does. A host that loads a jolt
+library keeps its own fault and interrupt handling. The terminal REPL gets a
+line editor with parinfer, and `jolt.fibers` gains `kill!`. Protocol call
+sites in `--opt` builds are safe under concurrent callers, and two Windows
+bugs are fixed: 8.3 short names in canonical paths, and a crash when a pipe
+is closed under a reader.
+
+### Added
+
+- **A line editor for `jolt repl` at a terminal** (#1276). Multi-line entries
+  with indentation, parinfer smart mode keeping closers balanced, docs for the
+  symbol at the cursor (Alt-D, again for the full doc), Tab completion, and
+  history in `~/.jolt_repl_history`. Enter submits a complete entry with the
+  cursor at its end and opens an indented line otherwise; Alt-Enter always
+  submits, Ctrl-J always opens a line. ^C during an evaluation interrupts it
+  and the REPL carries on; at the prompt it clears the entry, and exits on an
+  empty one. Piped input, scripts and `TERM=dumb` keep the plain reader. Works
+  on the Windows console as well as Unix terminals.
+
+- **`jolt.parinfer`**, a port of parinfer.js 3.13.1 (#1276), with its 154
+  upstream cases as a gate.
+
+- **`jolt.fibers/kill!`** (#1275). An interrupt is a throwable, so a fiber
+  that catches `Throwable` in a loop swallowed `interrupt!` for good, and a
+  supervisor could never stop it. `kill!` escapes through a continuation
+  instead: no catch sees it, only `finally` blocks run, and it lands at the
+  fiber's outermost unmasked region (or its entry, which ends the fiber). A
+  later `interrupt!` does not replace a pending kill.
+
+### Changed
+
+- **A float is a `java.lang.Float`, rounded to single precision** (#1285).
+  `(double (float 0.3))` is 0.30000001192092896 and `(float Double/MIN_VALUE)`
+  is 0.0, as on the JVM.
+
+  ```clojure
+  (class (float 0.1))       ;; java.lang.Float (was java.lang.Double)
+  (pr-str (float 1/3))      ;; "0.33333334"
+  (= (float 0.5) 0.5)       ;; true
+  (= (float 0.1) 0.1)       ;; false
+  ```
+
+  `float?`, `instance? Float` and `extend-protocol` on Float dispatch on it,
+  `hash` is Float's hasheq, and arithmetic widens to Double. Float's methods
+  and statics, `(Float. x)`, ByteBuffer `getFloat` and Math's float overloads
+  answer Floats where the JDK does. `(float Float/MAX_VALUE)` no longer throws
+  "Value out of range for float". `Double/compare` is added. A hinted or cast
+  float stays unboxed, but a Float passed through generic code is now an
+  allocated value: a `reduce` over floats went from 19 to 36 ns/op and `mapv
+  float` from 91 to 116. Code that uses doubles is unaffected.
+
+- **Primitive arrays narrow what they store** (#1289). `(aget (int-array
+  [1.7]) 0)` was 1.7 and a long-array could hold a bignum. Stores through
+  array constructors, `aset`, `into-array` and `Arrays/fill` now narrow as
+  `Number.xxxValue` does: int[] holds `(int x)` (saturating a double first),
+  short[] and byte[] keep the low bits, long[] wraps a bignum to 64 bits, and
+  float[] holds the nearest float and reads back a Float. `aset-int`,
+  `aset-long` and the rest throw out of range, as `(byte 300)` does. A hinted
+  `(aset ^ints a 0 3000000000)` now stores -1294967296, as the JVM does.
+  `^floats` joins `^doubles` as a compiler hint. Where the JVM refuses a store
+  (a Double into a long[] through `aset`), jolt narrows; that is a documented
+  divergence.
+
+- **`Math/cbrt` and `clojure.math/cbrt` are fdlibm's**, as the JDK's are
+  (#1288). They went through the host libm's `pow`, so the last digit depended
+  on the platform: `(Math/cbrt 1e-300)` was 1.0000000000000127E-100 against
+  the JVM's 1.0E-100, and Android differed from Linux at 2.5. They now give
+  the JVM's digits, at about 1.27x the cost of the libm call (79 to 100 ns).
+
+### Fixed
+
+- **A host that loads a jolt library keeps its own signal handling** (#1277,
+  #1290, #1291). Chez takes SIGSEGV, SIGBUS, SIGFPE and SIGILL for the whole
+  process at init, so a .NET or JVM host aborted with "invalid memory
+  reference" on a null dereference in its own code. A fault on a thread that
+  isn't running jolt code now goes to the host's handler, run as the kernel
+  would have run it (its alternate stack, `sa_mask`, `SA_NODEFER` and
+  `SA_RESETHAND`), and the signals are given back at
+  `jolt_library_shutdown`. A fault in jolt code is still a jolt exception.
+  SIGINT and SIGQUIT stay the host's: before, a ^C sent to the host left an
+  interrupt pending in Chez that made `jolt_library_shutdown` exit the
+  process with 255. SIGPIPE is ignored while the library is loaded only if
+  the host left it at the default. A host whose init thread runs its own code
+  should call `jolt_library_release_thread`. On macOS, `SA_RESETHAND` is not
+  honoured (macOS does not report it back), and after a fault in jolt code
+  taken on a thread's alternate stack, that thread's later signals run on its
+  normal stack. A fault in jolt code while the released init thread is inside
+  an export still goes to the host; cisco/ChezScheme#1076 fixes that in Chez.
+
+- **Protocol call sites in `--opt` builds under concurrent callers** (#1284,
+  #1286). A site's inline cache was rewritten in place on a miss, so threads
+  calling one function over several record types failed with "`fx=`:
+  `#<jrdesc>` is not a fixnum", an out-of-range `vector-set!`, or dispatch to
+  the wrong type's method. A cache is never written once published now, and
+  a site that has filled its cache stops caching. An 8-type site went from 37
+  to 19 ns/call.
+
+- **`finally` and other cleanups survive an interrupted evaluation** (#1274).
+  `run-interruptible` (REPL ^C, nREPL interrupt) could land between a cleanup's
+  setup and its body, or between the body and the cleanup, leaving a
+  `binding` frame on the stack, `*out*` bound to a dead string port from
+  `with-out-str`, a transaction still open on the thread, a lazy seq claimed
+  so every other forcer waited for good, or a namespace load claim held so
+  later requires waited. Cleanups are masked across those edges now. A bare
+  `try`/`finally` costs about 1.5 ns more.
+
+- **Windows: `getCanonicalPath` spells 8.3 short names long** (#1281, #1287).
+  `%TEMP%` carries the short profile name and a child's cwd the long one, so
+  the two never compared equal. Each existing component is replaced with the
+  name its directory lists, as the JDK does, which also fixes case.
+  `Path.toRealPath` (`fs/real-path`) resolves links through
+  `GetFinalPathNameByHandleW`.
+
+- **Windows: closing a process stream while another thread reads it** (#1283,
+  #1287) freed the buffer the read was writing into, a segfault (exit 139, or
+  127 with one reader). Windows pipe ports now share the POSIX ports' lifetime,
+  which releases on the later of the close and the last operation out; the
+  parked reader answers EOF.
+
+### Performance
+
+- **`Math/nextUp`, `Math/ulp` and `Double/doubleToLongBits` are faster**
+  (#1288): 650 to 106, 530 to 218 and 387 to 82 ns/call, taking a double's bit
+  pattern from the host instead of building it in exact arithmetic.
+
+### Internal
+
+- The GC stall watch installs on Chez 10.5 as well as 10.4, after comparing
+  `$collect-rendezvous` between the two (#1279).
+
 ## [0.8.19] - 2026-10-07
 
 Monitors take an uncontended `locking` without a mutex, `StringBuffer` is
