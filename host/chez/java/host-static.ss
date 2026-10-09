@@ -1041,7 +1041,7 @@
          ;; the fully-qualified spellings the runtime provides, as declared
          (stale (filter (lambda (c) (taken? c)) classes))
          (kept (filter (lambda (c) (not (taken? c))) cs)))
-    (when (pair? stale)
+    (when (and (pair? stale) (jolt-warnings?))
       (fprintf (current-error-port)
                "warning: ~a claims ~a, which this jolt provides; the runtime's ~a and the ~a dropped — upgrade ~a\n"
                install-ns
@@ -1168,7 +1168,7 @@
          (begin (hashtable-set! lib-claim-warned-tbl k #t) #t))))
 
 (define (provider-claim-drop! name owner members)
-  (when (claim-warn-once? "drop" name)
+  (when (and (jolt-warnings?) (claim-warn-once? "drop" name))
     (fprintf (current-error-port)
              "warning: dropping ~a — ~a declares that class (:jolt/provides, RFC 0014) and implements ~a; a library may only register the classes it declares\n"
              (if (null? members)

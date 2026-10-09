@@ -54,6 +54,9 @@ runall() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>/dev/null; }
 # JOLT_DEBUG-only, and a note that fires where its advice cannot be taken is as
 # much a defect as a missing one.
 rundebug() { JOLT_PWD="$APP" JOLT_QUIET=1 JOLT_DEBUG=1 "$JOLT" "$@" 2>&1; }
+# stdout+stderr with the runtime's warnings on: they are opt-in (#1292), and
+# runfull above runs without them.
+runwarn() { JOLT_PWD="$APP" JOLT_QUIET=1 JOLT_WARNINGS=1 "$JOLT" "$@" 2>&1; }
 
 # baseline: project deps only
 check "project dep resolves (liba)" "liba A" "$(run run -m appver)"
@@ -357,13 +360,17 @@ check "constructing a library class autoloads" "fixture-builder" "$(run -A:time 
 # names the library, not refused: the runtime's class answers, and the
 # library's other claims still autoload it. Refusing made a jolt upgrade fail
 # every such project at resolution with nothing the project could change.
-out="$(runfull -A:prov3 run -m appprovstale)"
+out="$(runwarn -A:prov3 run -m appprovstale)"
 check "a stale claim is dropped and the runtime's class answers" "crc:891568578 stale-skf:x"       "$(printf '%s\n' "$out" | tail -1)"
 case "$out" in
   *"provstale.install claims java.util.zip.CRC32, which this jolt provides"*"upgrade"*)
     check "the dropped claim is reported, naming the library" ok ok ;;
   *) check "the dropped claim is reported, naming the library" "warning naming provstale.install and java.util.zip.CRC32" "$(printf '%s' "$out" | head -2)" ;;
 esac
+# ...and only when asked: by default the runtime writes nothing to the
+# program's stderr, and the program still runs the same.
+out="$(runfull -A:prov3 run -m appprovstale)"
+check "a stale claim says nothing without JOLT_WARNINGS" "crc:891568578 stale-skf:x" "$out"
 
 # Off the roots the reference reports that nothing provides the class — and
 # deliberately does NOT name a library (RFC 0014). Which library supplies
@@ -406,7 +413,7 @@ check "a late squatting registration does not take the class over" \
       "$(runall -A:prov run -m appprovboth | tr '\n' ' ' | sed 's/ $//')"
 # The drop is reported: the library asked for something it did not get, and the
 # symptom would otherwise surface somewhere else entirely.
-out="$(runfull -A:prov run -m appprovboth)"
+out="$(runwarn -A:prov run -m appprovboth)"
 case "$out" in
   *"dropping a registration for java.security.Signature"*)
     check "the dropped registration is reported" ok ok ;;
@@ -580,7 +587,7 @@ replcheck "unsupported :main-opts names the accepted forms" "accepted: -m NS, -e
 # failed load was at must not stick: it used to blame every later, unrelated
 # error on that file ("at .../clj_time/core.clj:254:1" under a CLI arg error).
 RB="$root/test/chez/deps-alias/rdrbroken"
-runrb() { JOLT_PWD="$RB" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
+runrb() { JOLT_PWD="$RB" JOLT_QUIET=1 JOLT_WARNINGS=1 "$JOLT" "$@" 2>&1; }
 after_report() { printf '%s\n' "$1" | sed -n '/^Unhandled exception/,$p'; }
 warning_block() { printf '%s\n' "$1" | sed '/^Unhandled exception/,$d'; }
 out="$(runrb -X:x)"
@@ -589,6 +596,11 @@ replcheck "data-reader load warning names the namespace and cause" \
 replcheck "data-reader load warning says where it failed" "rb/rdr.clj:3:" "$(warning_block "$out")"
 replcheck "data-reader load warning names the tags it takes down" "#rb/up" "$out"
 replcheck "the CLI's own error still reports after the warning" "No function to execute" "$out"
+# without JOLT_WARNINGS (#1292) the CLI's error is all there is
+out_quiet="$(JOLT_PWD="$RB" JOLT_QUIET=1 "$JOLT" -X:x 2>&1)"
+check "data-reader load warning is opt-in" "0" \
+      "$(printf '%s\n' "$out_quiet" | grep -c 'data-reader namespace')"
+replcheck "the CLI's error reports without the warning" "No function to execute" "$out_quiet"
 check "a caught data-reader load leaves no stale 'at' location" "0" \
       "$(after_report "$out" | grep -cE '^  (at|--> )')"
 # same leak through a require caught in user code

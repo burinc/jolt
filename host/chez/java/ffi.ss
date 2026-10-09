@@ -562,6 +562,10 @@
 ;; resolution is correct and always was. A raise would turn those into a
 ;; regression; silence is what the issue is about.
 ;;
+;; Reported under JOLT_WARNINGS (rt.ss jolt-warnings?): the error port is the
+;; program's, so the runtime writes there only when asked (#1292). The
+;; jolt.ffi/defining-libraries answers the same question without it.
+;;
 ;; Once per symbol, not once per call. The emitted binding caches its address,
 ;; so a repeat would only appear if a caller resolved the same name again — and
 ;; a warning that repeats is a warning that gets filtered out.
@@ -576,7 +580,7 @@
     (cond ((hashtable-ref ffi-dup-reported sym #f) #f)
           (else (hashtable-set! ffi-dup-reported sym #t) #t))))
 (define (ffi-report-duplicate! sym defs)
-  (when (ffi-dup-claim! sym)
+  (when (and (jolt-warnings?) (ffi-dup-claim! sym))
     (let ((p (current-error-port)))
       (display (string-append
                  "jolt.ffi: duplicate native symbol " sym " — defined by "
@@ -1378,6 +1382,18 @@
 (def-var! "jolt.ffi" "loaded?" (lambda (n) (if (ffi-loaded? n) #t #f)))
 (def-var! "jolt.ffi" "load-native" jolt-ffi-load-native)
 (def-var! "jolt.ffi" "defining-libraries" jolt-ffi-defining-libraries)
+;; jolt.ffi/on-gc-stall's native half (rt.ss jolt-gc-stall-set-reporter!): F
+;; nil restores the default report; otherwise F gets the report as a map.
+(def-var! "jolt.ffi" "__gc-stall-reporter!"
+  (lambda (f seconds)
+    (jolt-gc-stall-set-reporter!
+      (and (not (jolt-nil? f))
+           (lambda (secs threads callbacks message)
+             (jolt-invoke1 f (jolt-hash-map (jolt-keyword "seconds") secs
+                                            (jolt-keyword "threads") threads
+                                            (jolt-keyword "callbacks") callbacks
+                                            (jolt-keyword "message") message))))
+      (and (not (jolt-nil? seconds)) seconds))))
 (def-var! "jolt.ffi" "dlsym-native" jolt-ffi-dlsym-native)
 (def-var! "jolt.ffi" "load-system-library" ffi-load-system-library)
 ;; jolt.main/load-natives! reads it to build the fallback candidates for a spec

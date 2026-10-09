@@ -374,6 +374,21 @@
   ;; not worded "out of memory": host-faults.ss would classify it as one
   (error 'jolt (string-append name "=" v " is not valid: expected " what ".")))
 (define (heap-from-env) (env-bytes "JOLT_MAX_HEAP" #t))
+;; An on/off switch from the environment: unset, "", "0", "false" and "off" are
+;; off, anything else on. Read where it is used, never cached at load: rt.ss is
+;; loaded into the heap at build time, and the switch belongs to the process.
+(define (jolt-env-flag? name)
+  (let ((v (getenv name)))
+    (and v (not (member (string-downcase v) '("" "0" "false" "off"))))))
+;; JOLT_WARNINGS=1: the runtime's own warnings about the process — a library
+;; claiming a class this jolt provides, a duplicated native symbol, a
+;; data-reader namespace that failed to load. Off by default: they go to the
+;; error port, which belongs to the program (a full-screen TUI cannot have them
+;; interleaved with its frames, and cannot intercept them either), so the
+;; runtime writes there only when asked (#1292).
+;; Errors, uncaught-exception reports and anything the program prints itself
+;; are not warnings and are unaffected.
+(define (jolt-warnings?) (jolt-env-flag? "JOLT_WARNINGS"))
 ;; JOLT_MAX_RAM_PERCENTAGE (default 25) of the smaller of physical RAM and any
 ;; cgroup limit, the JVM's -XX:MaxRAMPercentage and its default. #f when neither can be read, which leaves jolt unbounded
 ;; rather than guessing a ceiling that could break a working program.
@@ -416,7 +431,8 @@
     ;; than reported, keeping Runtime.maxMemory honest.
     (let ((soft (and ceiling (exact (floor (* ceiling 3/4))))))
       (set! gc-live-after-full (sa-bytes-allocated))
-      (set! gc-log? (let ((v (getenv "JOLT_GC_LOG"))) (and v (not (member v '("" "0" "false" "off"))))))
+      (set! gc-log? (jolt-env-flag? "JOLT_GC_LOG"))
+      (jolt-gc-stall-setup!)
       (unless (sa-gc-install-after-collect!
                 (lambda (collect-full!)
                   (set! gc-full-this-time #f)
@@ -856,36 +872,94 @@
 ;; running jolt through a :collect-safe callback, and in that shape the
 ;; reporting thread is the waiting callback.
 ;;
-;; Installed at the end of this file, at load, on every driver: unlike the
-;; heap ceiling it reads nothing from the process, and a gate booting the
-;; runtime from source needs it as much as a built binary does. At the END so
-;; that everything the report calls (locks.ss, printing.ss, lazy-bridge.ss)
+;; The report is opt-in (#1292): JOLT_GC_STALL=1 writes it at two seconds,
+;; JOLT_GC_STALL=<seconds> at that threshold (so a knowingly slow call can be
+;; given more room; "1" is the switch, so one second is spelled "1.0"). Unset,
+;; nothing is written: the report goes to the error port, which belongs to the
+;; program, and a full-screen TUI can neither intercept it nor live with it
+;; interleaved into its frames. Only the WRITE is gated — the watch is installed
+;; either way, so the rendezvous, the collection and the stall are identical
+;; whichever way it is set.
+;;
+;; A program or an embedder can take the report instead (jolt.ffi/on-gc-stall,
+;; java/ffi.ss): a procedure that receives it, and optionally its own
+;; threshold. That is opt-in by itself, so it runs whether JOLT_GC_STALL is set
+;; or not — a --library host's stderr need not be jolt's (#1234), and a TUI
+;; may want the report in its own log. It runs where the report does: on a
+;; thread waiting for the collection, with the tc mutex released and
+;; interrupts disabled. It may allocate and write to a port; it must not wait
+;; for another thread (every one of them is stopped or parked), and anything it
+;; raises is dropped, since there is no one to raise to.
+;;
+;; Installed once, at the end of this file, at load, on every driver, so a gate
+;; booting the runtime from source has it as much as a built binary does. The
+;; threshold goes in as a thunk the watch reads at each wait, so the switch can
+;; be read again at process start (jolt-install-gc-policy!: a built heap ran
+;; this file in the BUILD's process, and the switch is the running one's) and
+;; the threshold changed by on-gc-stall, without installing again. At the END
+;; so that everything the report calls (locks.ss, printing.ss, lazy-bridge.ss)
 ;; is loaded before the first rendezvous that could take the timeout.
 (define jolt-ffi-callbacks-active (box 0))
-(define jolt-gc-stall-seconds 2)
+(define jolt-gc-stall-default-seconds 2)
+(define jolt-gc-stall-env-seconds #f)       ; JOLT_GC_STALL's threshold, #f = off
+(define jolt-gc-stall-reporter #f)          ; on-gc-stall's procedure, or #f
+(define jolt-gc-stall-reporter-seconds #f)  ; its own threshold, or #f
+(define jolt-gc-stall-watch-installed? #f)
+(define (jolt-gc-stall-seconds)
+  (or jolt-gc-stall-reporter-seconds jolt-gc-stall-env-seconds
+      jolt-gc-stall-default-seconds))
+;; #f when the report is off, else the threshold in seconds.
+(define (jolt-gc-stall-from-env)
+  (let ((v (getenv "JOLT_GC_STALL")))
+    (cond ((not (jolt-env-flag? "JOLT_GC_STALL")) #f)
+          ((member (string-downcase v) '("1" "true" "on")) jolt-gc-stall-default-seconds)
+          (else (let ((n (string->number v)))
+                  (if (jolt-gc-stall-threshold? n)
+                      n
+                      (gc-config-error "JOLT_GC_STALL" v
+                                       "1, true, on, or a threshold in seconds")))))))
+(define (jolt-gc-stall-threshold? n)
+  (and n (real? n) (> n 0) (< n 86400)))
+(define (jolt-gc-stall-setup!)
+  (set! jolt-gc-stall-env-seconds (jolt-gc-stall-from-env)))
+;; PROC (seconds threads callbacks message) or #f for the default report;
+;; SECONDS a threshold or #f for JOLT_GC_STALL's (or the default). Answers
+;; whether this target has the watch at all.
+(define (jolt-gc-stall-set-reporter! proc seconds)
+  (set! jolt-gc-stall-reporter-seconds (and proc seconds))
+  (set! jolt-gc-stall-reporter proc)
+  jolt-gc-stall-watch-installed?)
 (define (jolt-on-foreign-thread?)
   (let ((id (get-thread-id)))
     (and (not (eqv? id jolt-boot-thread-id))
          (not (jolt-started-thread? id)))))
+(define (jolt-gc-stall-message seconds unreached callbacks)
+  (format
+    (string-append
+      "jolt.ffi: a garbage collection has been waiting ~a s for ~a thread~a to reach a safe point.\n"
+      "  Every thread running jolt code reaches one within microseconds. A thread parked in a\n"
+      "  foreign call that is not marked :blocking never does, and every other thread now waits\n"
+      "  for that call to return."
+      (if (> callbacks 0)
+          (string-append
+            " ~a :collect-safe callback~a in progress: if the parked call is\n"
+            "  waiting for its answer, the two wait for each other for good.")
+          "~a~a")
+      " Mark the outbound call\n"
+      "  :blocking — see the :collect-safe notes on foreign-callable in jolt.ffi.\n")
+    seconds unreached (if (= unreached 1) "" "s")
+    (if (> callbacks 0) callbacks "")
+    (cond ((= callbacks 0) "") ((= callbacks 1) " is") (else "s are"))))
 (define (jolt-report-gc-stall unreached)
-  (let ((callbacks (max (unbox jolt-ffi-callbacks-active)
-                        (if (jolt-on-foreign-thread?) 1 0))))
-    (jolt-eprintf
-      (string-append
-        "jolt.ffi: a garbage collection has been waiting ~a s for ~a thread~a to reach a safe point.\n"
-        "  Every thread running jolt code reaches one within microseconds. A thread parked in a\n"
-        "  foreign call that is not marked :blocking never does, and every other thread now waits\n"
-        "  for that call to return."
-        (if (> callbacks 0)
-            (string-append
-              " ~a :collect-safe callback~a in progress: if the parked call is\n"
-              "  waiting for its answer, the two wait for each other for good.")
-            "~a~a")
-        " Mark the outbound call\n"
-        "  :blocking — see the :collect-safe notes on foreign-callable in jolt.ffi.\n")
-      jolt-gc-stall-seconds unreached (if (= unreached 1) "" "s")
-      (if (> callbacks 0) callbacks "")
-      (cond ((= callbacks 0) "") ((= callbacks 1) " is") (else "s are")))))
+  (let ((reporter jolt-gc-stall-reporter))
+    (when (or reporter jolt-gc-stall-env-seconds)
+      (let* ((callbacks (max (unbox jolt-ffi-callbacks-active)
+                             (if (jolt-on-foreign-thread?) 1 0)))
+             (seconds (jolt-gc-stall-seconds))
+             (message (jolt-gc-stall-message seconds unreached callbacks)))
+        (if reporter
+            (guard (_ (#t #f)) (reporter seconds unreached callbacks message))
+            (jolt-eprint message))))))
 
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")
@@ -2391,6 +2465,9 @@
     (set! entropy-warned? #t)
     ;; Loud, once: silently degrading a CSPRNG to a clock-seeded PRNG is how
     ;; guessable session ids ship. Uniqueness still holds; unpredictability does not.
+    ;; Not under JOLT_WARNINGS (#1292): it fires only when the process really
+    ;; has no entropy source, which no platform jolt ships lacks, so it is
+    ;; never noise, and opting in to a security downgrade's notice is wrong.
     (display "jolt: no OS entropy source available -- random-uuid is falling back to the seeded PRNG\n"
              (console-error-port))))
 
@@ -2729,5 +2806,6 @@
 
 ;; The stall watch (see "a stalled collection says so" above): after every
 ;; load, so a rendezvous that times out finds the reporter's dependencies.
-(define jolt-gc-stall-watch-installed?
+(jolt-gc-stall-setup!)
+(set! jolt-gc-stall-watch-installed?
   (sa-gc-install-stall-watch! jolt-gc-stall-seconds jolt-report-gc-stall))

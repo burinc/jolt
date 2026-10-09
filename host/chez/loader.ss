@@ -274,30 +274,31 @@
                      a)
                  #f)))))
 
-;; The warning for a data_readers namespace that failed to load — everything the
-;; reader needs to act on it: which namespace, why, WHERE it failed (the throw's
+;; The warning (under JOLT_WARNINGS, rt.ss jolt-warnings?) for a data_readers
+;; namespace that failed to load — everything the reader needs to act on it: which namespace, why, WHERE it failed (the throw's
 ;; own position, in the shape the uncaught report uses), and which tags of the
 ;; file now have no reader. The load's position does not outlive the warning:
 ;; load-jolt-file* unwinds it, so the next error in the process is not reported
 ;; "at" this namespace's failing form.
 (define (ldr-warn-reader-ns-failed! ns-name e readers)
-  (let ((port (current-error-port))
-        (msg (guard (_ (#t "(unprintable error)"))
-               ((var-deref "jolt.host" "condition-message") e)))
-        (where (jolt-throwable-source-string e))
-        (tags (sort string<?
-                    (pmap-fold readers
-                               (lambda (k v a)
-                                 (if (and (symbol-t? v) (equal? (symbol-t-ns v) ns-name))
-                                     (cons (string-append "#" (jolt-pr-str k)) a)
-                                     a))
-                               '()))))
-    (display (string-append "jolt: warning: data-reader namespace " ns-name
-                            " failed to load: " msg "\n")
-             port)
-    (when where (display (string-append "  at " where "\n") port))
-    (unless (null? tags)
-      (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port))))
+  (when (jolt-warnings?)
+    (let ((port (current-error-port))
+          (msg (guard (_ (#t "(unprintable error)"))
+                 ((var-deref "jolt.host" "condition-message") e)))
+          (where (jolt-throwable-source-string e))
+          (tags (sort string<?
+                      (pmap-fold readers
+                                 (lambda (k v a)
+                                   (if (and (symbol-t? v) (equal? (symbol-t-ns v) ns-name))
+                                       (cons (string-append "#" (jolt-pr-str k)) a)
+                                       a))
+                                 '()))))
+      (display (string-append "jolt: warning: data-reader namespace " ns-name
+                              " failed to load: " msg "\n")
+               port)
+      (when where (display (string-append "  at " where "\n") port))
+      (unless (null? tags)
+        (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port)))))
 (define (load-data-readers!)
   ;; one settle point for the whole scan: see aot-call-with-readers-batch
   (aot-call-with-readers-batch
@@ -1184,8 +1185,9 @@
   (let* ((scm (car job))
          (so (cadr job))
          (tmp (string-append so ".part" (number->string (get-process-id)))))
-    (guard (e (else (display (string-append "jolt: aot worker: compile failed for " scm "\n")
-                              (current-error-port))
+    (guard (e (else (when (jolt-warnings?)
+                      (display (string-append "jolt: aot worker: compile failed for " scm "\n")
+                               (current-error-port)))
                     (guard (e2 (#t #f)) (delete-file tmp #f))))
       (parameterize ((current-output-port (open-output-string)))
         (sa-compile-file scm tmp #f))
