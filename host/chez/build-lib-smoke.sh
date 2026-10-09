@@ -171,9 +171,12 @@ esac
 # A host that handles its own faults (a .NET or Java runtime does) keeps them
 # (#1277). Chez installs process-wide SIGSEGV/SIGBUS/SIGFPE/SIGILL handlers at
 # init and treats every fault as Scheme's; the library stub chains a fault on a
-# thread not running Scheme code to the handler installed before Chez's, and
-# gives the signals back at jolt_library_shutdown. A fault in Scheme code is
-# still jolt's exception. The driver prints what each stage saw.
+# thread not running Scheme code to the handler installed before Chez's, runs
+# it as the kernel would have (the host's alternate stack, sa_mask and
+# SA_RESETHAND), and gives the signals back at jolt_library_shutdown. A fault in
+# Scheme code is still jolt's exception. SIGINT and SIGQUIT stay the host's, and
+# SIGPIPE is ignored only while the library is loaded. The driver prints what
+# each stage saw.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     echo "build-lib smoke: host fault handling skipped (POSIX signals driver)" ;;
@@ -183,14 +186,26 @@ case "$(uname -s)" in
       echo "  FAIL: signals driver compile failed"; cat "$work/driver-signals.err"; exit 1
     fi
     got="$("$work/driver-signals" "$lib" 2>&1)"; rc=$?
-    before="$(printf '%s\n' "$got" | sed -n 's/^before load: //p')"
-    want="before load: $before
+    # 11, or 10 where a null dereference raises SIGBUS
+    sig="$(printf '%s\n' "$got" | sed -n 's/^before load: \([0-9]*\) .*/\1/p')"
+    # macOS hides SA_RESETHAND from sigaction, and keeps a thread "on its
+    # alternate stack" after Chez's _longjmp out of a Scheme fault taken there
+    # (driver-signals.c)
+    case "$(uname -s)" in
+      Darwin) oneshot=0; alt_after_scheme=0 ;;
+      *)      oneshot="$sig"; alt_after_scheme=1 ;;
+    esac
+    want="one-shot: 1 $oneshot
+before load: $sig 1 1
 scheme fault: 1
-after load: $before
-worker: 1 $before
-after shutdown: $before
-after reinit: $before"
-    if [ "$rc" != "0" ] || [ -z "$before" ] || [ "$before" = "0" ] || [ "$got" != "$want" ]; then
+after load: $sig 1 1
+signals after load: host host ign 1
+worker: $sig 1 1, 1, $sig $alt_after_scheme 1
+after shutdown: $sig 1 1
+signals after shutdown: host host dfl 1
+after reinit: $sig 1 1
+signals after reinit: host host ign 1"
+    if [ "$rc" != "0" ] || { [ "$sig" != "11" ] && [ "$sig" != "10" ]; } || [ "$got" != "$want" ]; then
       echo "  FAIL: host fault handling, want rc 0 and:"; printf '%s\n' "$want"
       echo "  got rc $rc:"; printf '%s\n' "$got"; exit 1
     fi ;;
