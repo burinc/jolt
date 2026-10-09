@@ -6,9 +6,10 @@
 ;; thread that is in C, and back), sleepers in collect-safe usleep, sleepers in
 ;; a freshly compiled foreign procedure (young code the collector would move
 ;; if nothing locked it), plain callers, and a thread taking the tc mutex
-;; from Scheme over and over (each acquire deactivates the threads in
-;; collect-safe calls on their behalf). Every result is checked, a thread that
-;; raises is reported, and the run must finish.
+;; from Scheme over and over, against the collections and returns that take
+;; it to convert threads in collect-safe calls and to undo a conversion.
+;; Every result is checked, a thread that raises is reported, and the run
+;; must finish.
 (load-shared-object #f)
 (define usleep (foreign-procedure __collect_safe "usleep" (unsigned-32) int))
 (define qsort (foreign-procedure __collect_safe "qsort" (void* size_t size_t void*) void))
@@ -44,10 +45,12 @@
       (f 3000)
       (unless (fx= 0 (f 1)) (fail! "fresh usleep")))))
 ;; Take the tc mutex from Scheme the way with-tc-mutex does (record
-;; definitions, the expander, port and hashtable internals all do): with
-;; the lockfree-activation patch every such acquire deactivates the
-;; threads sitting in collect-safe calls on their behalf, so this makes
-;; those conversions, and the returns that follow them, constant.
+;; definitions, the expander, port and hashtable internals all do). A plain
+;; acquire converts nothing: only collect, compute-size-increments and a
+;; thread waiting for a collection deactivate the threads sitting in
+;; collect-safe calls on their behalf, and a converted thread takes this
+;; mutex on its way back. This contends with both, and checks the count
+;; those conversions keep never drops below this thread's own place.
 (define (tc-mutex-taker rounds)
   (let ([tcm #%$tc-mutex])
     (do ([r 0 (fx+ r 1)]) ((fx= r rounds))

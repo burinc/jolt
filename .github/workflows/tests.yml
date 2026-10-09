@@ -147,6 +147,25 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+      - name: Month (Termux image cache key)
+        id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      # The image comes from the cache, not Docker Hub, when it can: anonymous
+      # pulls from the shared runners hit Docker Hub's rate limit (ci/pull-image.sh).
+      - name: Restore Termux image
+        id: termux-image
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/termux-image.tar
+          key: termux-docker-aarch64-${{ steps.month.outputs.month }}
+      - name: Pull Termux image
+        run: sh ci/pull-image.sh termux/termux-docker:aarch64 "$HOME/termux-image.tar"
+      - name: Save Termux image
+        if: steps.termux-image.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/termux-image.tar
+          key: termux-docker-aarch64-${{ steps.month.outputs.month }}
       - name: Build and gate jolt in Termux
         run: |
           mkdir -p target/release
