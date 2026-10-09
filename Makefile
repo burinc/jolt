@@ -899,6 +899,7 @@ ffi:
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
 	@sh test/chez/ffi-gc-stall-test.sh
+	@sh test/chez/collect-safe-activation-test.sh "$(CHEZ)"
 
 # zlib bindings (host/chez/java/zlib.ss): the z_stream layout, entry-point
 # resolution, checksums, round trips, error codes, dictionaries, parameter
