@@ -692,6 +692,18 @@ usually reports as a crash rather than a jolt exception. On other threads, a
 fault in jolt code (an `ffi/read` through a bad pointer) is still a jolt
 exception.
 
+The host's handler runs as the kernel would have run it: on its alternate
+signal stack if it asked for `SA_ONSTACK`, under its `sa_mask` and
+`SA_NODEFER`, and once only under `SA_RESETHAND`. A host fault with no handler
+to run kills the process as it would have without the library. SIGINT and
+SIGQUIT stay the host's while the library is loaded. SIGPIPE is ignored while
+it is loaded if the host left it at the default, so a write to a closed pipe
+or socket returns EPIPE instead of killing the process. All three are the
+host's again after `jolt_library_shutdown`. macOS has two limits: `sigaction`
+doesn't report `SA_RESETHAND` back, so a one-shot handler runs every time; and
+after a fault in jolt code taken on a thread's alternate stack, that thread's
+later signals run on its normal stack.
+
 ## Documentation
 
 Full documentation is at **[jolt-lang.github.io](https://jolt-lang.github.io)** —
