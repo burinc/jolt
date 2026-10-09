@@ -1264,10 +1264,13 @@
 ;; So the rendezvous itself is where the stall is seen. This installs a copy
 ;; of Chez 10.4's $collect-rendezvous (s/7.ss) whose waits carry a timeout:
 ;; a thread that has waited SECONDS with the request still pending and other
-;; threads still active calls ON-STALL once per stalled request — with the
-;; tc mutex released and interrupts disabled, so it may allocate and print
+;; threads still active calls ON-STALL once per stalled request — with the tc
+;; mutex released and interrupts disabled, so it may allocate and print
 ;; without re-entering the rendezvous — then goes on waiting exactly as
-;; before. The protocol is otherwise the original's: the same conditions,
+;; before. SECONDS is a positive real, or a thunk answering one, read at each
+;; wait: a caller that changes its threshold later does so through the thunk
+;; rather than by installing again, which would swap the copy under a thread
+;; already waiting in it. The protocol is otherwise the original's: the same conditions,
 ;; the same last-one-standing rule, the same hand-over to the main thread
 ;; when it is waiting, so a stall that ends (the call returned) completes the
 ;; collection as it always did. $collect-rendezvous is immutable in the system
@@ -1306,7 +1309,10 @@
          (let ((tc-mutex (sysval '$tc-mutex))
                (collect-cond (sysval '$collect-cond))
                (thread0-cond (sysval '$collect-thread0-cond))
-               (timeout (make-time 'time-duration 0 seconds))
+               ;; the time object for the threshold last read, rebuilt only
+               ;; when the threshold changes
+               (timeout-for #f)
+               (timeout #f)
                ;; #t once ON-STALL has run for the request now pending; cleared
                ;; where the request is cleared, so the next stall reports again.
                (reported? #f)
@@ -1316,8 +1322,16 @@
            (define (pending-set! v) (#%$set-top-level-value! '$collect-request-pending v))
            ;; condition-wait's #t is a signal, #f the timeout. On a timeout with
            ;; the request still pending and others still active, report once.
+           (define (current-timeout)
+             (let ((secs (if (procedure? seconds) (seconds) seconds)))
+               (unless (eqv? secs timeout-for)
+                 (let* ((ns (exact (round (* secs 1000000000))))
+                        (s (quotient ns 1000000000)))
+                   (set! timeout (make-time 'time-duration (- ns (* s 1000000000)) s))
+                   (set! timeout-for secs)))
+               timeout))
            (define (timed-wait c)
-             (or (jolt-stop-the-world-wait c tc-mutex timeout)
+             (or (jolt-stop-the-world-wait c tc-mutex (current-timeout))
                  (begin
                    (when (and (pending?) (> (active-threads) 1) (not reported?))
                      (set! reported? #t)

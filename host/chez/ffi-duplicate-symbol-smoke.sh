@@ -18,7 +18,9 @@
 #
 # This gate pins both halves, and the second is the one that matters: the
 # footgun build is reported, and the correct build is NOT. A false positive here
-# would train people to ignore the warning.
+# would train people to ignore the warning. The warning is written under
+# JOLT_WARNINGS only (#1292), so the rows set it, and one row checks the
+# default run says nothing.
 set -eu
 
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
@@ -83,7 +85,7 @@ cat > "$work/footgun.clj" <<EOF
 (println "OWN" (get-mouse))
 (println "WIDGET" (widget-read))
 EOF
-out="$("$jolt" run "$work/footgun.clj" 2>&1)" || { echo "$out"; report "footgun fixture did not run"; }
+out="$(JOLT_WARNINGS=1 "$jolt" run "$work/footgun.clj" 2>&1)" || { echo "$out"; report "footgun fixture did not run"; }
 
 echo "$out" | grep -q "DEFINERS 2" \
   || report "defining-libraries did not report both natives (got: $(echo "$out" | grep DEFINERS || echo none))"
@@ -96,6 +98,15 @@ echo "$out" | grep -q "libwidget-static" \
 # The private copy really is a second copy — the widget cannot see the write.
 echo "$out" | grep -q "WIDGET 0" \
   || report "fixture did not reproduce the two-copies behaviour (got: $(echo "$out" | grep WIDGET || echo none))"
+
+# --- the warning is opt-in (#1292) ---------------------------------------------
+# The error port is the program's; without JOLT_WARNINGS the runtime writes
+# nothing there, and defining-libraries still answers the question.
+out0="$(env -u JOLT_WARNINGS "$jolt" run "$work/footgun.clj" 2>&1)" || { echo "$out0"; report "footgun fixture did not run without JOLT_WARNINGS"; }
+echo "$out0" | grep -q "DEFINERS 2" \
+  || report "defining-libraries did not report both natives without JOLT_WARNINGS"
+echo "$out0" | grep -q "duplicate native symbol" \
+  && report "the duplicate-symbol warning was written without JOLT_WARNINGS"
 
 # --- the correct build is NOT reported ----------------------------------------
 cat > "$work/correct.clj" <<EOF
@@ -110,7 +121,7 @@ cat > "$work/correct.clj" <<EOF
 (println "OWN" (get-mouse))
 (println "WIDGET" (widget-read))
 EOF
-out2="$("$jolt" run "$work/correct.clj" 2>&1)" || { echo "$out2"; report "correct fixture did not run"; }
+out2="$(JOLT_WARNINGS=1 "$jolt" run "$work/correct.clj" 2>&1)" || { echo "$out2"; report "correct fixture did not run"; }
 
 echo "$out2" | grep -q "DEFINERS 1" \
   || report "defining-libraries over-reported for the correctly linked build (got: $(echo "$out2" | grep DEFINERS || echo none))"
@@ -139,7 +150,7 @@ cat > "$work/shadow.clj" <<EOF
 (println "SHADOW" (c-abs -4))
 (println "DEFINERS" (count (ffi/defining-libraries "abs")))
 EOF
-out3="$("$jolt" run "$work/shadow.clj" 2>&1)" || { echo "$out3"; report "shadow fixture did not run"; }
+out3="$(JOLT_WARNINGS=1 "$jolt" run "$work/shadow.clj" 2>&1)" || { echo "$out3"; report "shadow fixture did not run"; }
 
 echo "$out3" | grep -q "SHADOW 1004" \
   || report "the declared native no longer shadows the global namespace (got: $(echo "$out3" | grep SHADOW || echo none))"
@@ -156,7 +167,7 @@ cat > "$work/once.clj" <<EOF
 (ffi/defcfn get-mouse "state_get_mouse" [] :int)
 (dotimes [_ 5] (get-mouse))
 EOF
-n="$("$jolt" run "$work/once.clj" 2>&1 | grep -c "duplicate native symbol" || true)"
+n="$(JOLT_WARNINGS=1 "$jolt" run "$work/once.clj" 2>&1 | grep -c "duplicate native symbol" || true)"
 [ "$n" = "1" ] || report "warning fired $n times for one symbol, expected once"
 
 if [ "$fails" -eq 0 ]; then
