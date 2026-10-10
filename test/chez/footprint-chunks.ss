@@ -4,6 +4,7 @@
 ;; oversize chunk the moment it empties (gc.c), so one that stays near-empty is
 ;; held by a segment that cannot move. Prints one line:
 ;;   PINNED <chunks> <bytes> HELD <current-memory-bytes> LIVE <bytes-allocated>
+;;     PEAK <maximum-memory-bytes>
 ;; Loaded into a running jolt with the report path bound as footprint-report,
 ;; after a System/gc (a bare (collect) here refuses whenever another jolt thread
 ;; is active, which on Linux it is at startup).
@@ -14,8 +15,8 @@
       (if (eof-object? l)
           (begin
             (close-port p)
-            (printf "PINNED ~a ~a HELD ~a LIVE ~a\n" n bytes
-                    (current-memory-bytes) (bytes-allocated)))
+            (printf "PINNED ~a ~a HELD ~a LIVE ~a PEAK ~a\n" n bytes
+                    (current-memory-bytes) (bytes-allocated) (maximum-memory-bytes)))
           ;; a chunk row: 0xADDR 0xBYTES (+ 0xHDR bytes @ 0xADDR) USED of SEGS
           (let* ((ip (open-input-string l)) (addr (read ip)))
             (if (and (symbol? addr)

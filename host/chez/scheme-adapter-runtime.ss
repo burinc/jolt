@@ -1144,6 +1144,21 @@
       (vfasl-convert-file in out #f))
     #t))
 
+;; (sa-strip-compile-time-info! in out) -> boolean
+;; Copy the compiled object file IN to OUT without its compile-time
+;; information: the visit-time code and expander data of its macros
+;; (define-syntax transformers, their syntax objects and ribcages), plus any
+;; inspector and source annotations. What remains is the code that runs. For a
+;; binary that cannot expand Scheme code at run time (booted from petite, no
+;; compiler): 3.3MB of a closed-world app's 20MB runtime heap, and a third of
+;; its runtime fasl. Contract: OUT loads and runs as IN does. Degradation: #f
+;; (OUT not written), and the caller ships IN.
+(define (sa-strip-compile-time-info! in out)
+  (guard (e (#t (sa-delete-partial! out) #f))
+    (strip-fasl-file in out (fasl-strip-options compile-time-information inspector-source
+                                                source-annotations profile-source))
+    #t))
+
 ;; (sa-gc-install-after-collect! maintain observe) -> boolean
 ;; Hook every collection: the target performs its normal collection, then calls
 ;; (MAINTAIN collect-full!) -- collect-full! collects EVERY generation now, the

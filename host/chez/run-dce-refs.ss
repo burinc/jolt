@@ -501,5 +501,60 @@
                             (dce-rec #f "gate.app/helper" '("clojure.core/eval") "" #f)))
               #t))
 
+;; --- namespace-gated top-level forms ------------------------------------------
+;; The prelude carries clojure.pprint, clojure.set, clojure.main ... beside
+;; clojure.core. A namespace's top-level forms (defmethods, declares, fn-form
+;; registrations) run when it loads, so the shake keeps them only when the
+;; namespace is live: required by the app (an "ns:" ref), or holding a def the
+;; graph reaches. Kept as roots unconditionally, they kept 227 of pprint's 245
+;; defs in a hello app.
+(let* ((rec (lambda (fqn refs) (dce-rec #f fqn refs (string-append "(" fqn ")"))))
+       (opt (list (dce-rec-gated '("gate.opt/helper") "(gate.opt-effect)" "gate.opt")
+                  (rec "gate.opt/helper" '())
+                  (rec "gate.opt/api" '("gate.opt/helper"))))
+       (strs (lambda (app) (let-values (((core-strs app-strs dc) (dce-shake opt app "gate.app/-main" '())))
+                             core-strs))))
+  (let ((core (strs (list (rec "gate.app/-main" '())))))
+    (gate-check "gated: an unloaded namespace's top-level form is dropped"
+                (and (member "(gate.opt-effect)" core) #t) #f)
+    (gate-check "gated: ...and so is what only it referenced"
+                (and (member "(gate.opt/helper)" core) #t) #f))
+  (let ((core (strs (list (rec "gate.app/-main" '("gate.opt/api"))))))
+    (gate-check "gated: reaching a def makes its namespace live (form kept)"
+                (and (member "(gate.opt-effect)" core) #t) #t)
+    (gate-check "gated: ...and the live form's references are roots"
+                (and (member "(gate.opt/helper)" core) #t) #t))
+  (let ((core (strs (list (rec "gate.app/-main" '()) (dce-rec #t #f '("ns:gate.opt") "(require-it)")))))
+    (gate-check "gated: a required namespace is live without any def reached"
+                (and (member "(gate.opt-effect)" core) #t) #t)))
+
+;; A static (require 'x.y) names its namespaces as ns: refs, so a namespace the
+;; code requires at run time keeps its load effects.
+(let ((req (analyze (make-analyze-ctx "app.core")
+                    (jolt-ce-read "(fn [] (require '[clojure.pprint :as pp]))"))))
+  (gate-check "a static require yields an ns: ref"
+              (has? "ns:clojure.pprint" (dce-collect-refs '() req)) #t))
+
+;; Prelude forms: a def is prunable by its var, a form whose only effect is one
+;; var's metadata or declaration goes with that var, a namespace's other forms
+;; are gated on it, and clojure.core's are always kept.
+(let ((cls (lambda (src) (let ((r (dce-blob-form-record (with-input-from-string src read))))
+                           (list (dce-rec-keep? r) (dce-rec-fqn r) (dce-rec-gate-ns r))))))
+  (gate-check "prelude: doc metadata goes with its var"
+              (cls "(guard (e (#t #f)) (jv$clojure.core/attach-core-doc-meta! \"clojure.core\" \"frequencies\" \"doc\" (jolt-list)))")
+              '(#f "clojure.core/frequencies" #f))
+  (gate-check "prelude: a declare with its meta goes with its var"
+              (cls "(guard (e (#t #f)) (begin (set-var-meta! \"clojure.pprint\" \"emit-nl\" (jolt-hash-map)) (declare-var! \"clojure.pprint\" \"emit-nl\")))")
+              '(#f "clojure.pprint/emit-nl" #f))
+  (gate-check "prelude: another namespace's top-level form is gated on it"
+              (cls "(guard (e (#t #f)) (begin (image-register-fn-form! \"jfn$clojure.pprint/$9\" (image-fn-form-src \"(fn* [x] x)\") \"clojure.pprint\" (jolt-vector)) (jolt-invoke2 (var-deref \"clojure.core\" \"x\") 1 2)))")
+              '(#t #f "clojure.pprint"))
+  (gate-check "prelude: a form reaching into one other namespace is gated on it"
+              (cls "(guard (e (#t #f)) (let* ((a (var-deref \"clojure.core\" \"alter-var-root\")) (b (jolt-var \"clojure.pprint\" \"*print-pprint-dispatch*\")) (c (var-deref \"clojure.pprint\" \"simple-dispatch\"))) (jolt-invoke2 a b c)))")
+              '(#t #f "clojure.pprint"))
+  (gate-check "prelude: clojure.core's top-level form is always kept"
+              (cls "(guard (e (#t #f)) (jolt-invoke2 (var-deref \"clojure.core\" \"__import\") 1 2))")
+              '(#t #f #f)))
+
 (gate-summary "dce-refs")
 
