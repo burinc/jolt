@@ -2182,9 +2182,9 @@
 ;; past what was asked (1000 ms came back at ~1170, 5000 at ~5840).
 (define (proc-wait-timed st ms)
   (let ((step 10)
-        (deadline (+ (now-millis) ms)))
+        (deadline (+ (mono-millis) ms)))
     (let loop ()
-      (let ((remaining (- deadline (now-millis))))
+      (let ((remaining (- deadline (mono-millis))))
         (cond ((not (proc-alive? st)) #t)
               ((<= remaining 0) #f)
               ;; a fiber parks for the step rather than sleeping its carrier

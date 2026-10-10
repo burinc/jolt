@@ -109,7 +109,7 @@
 ;; honour an interrupt that was already set.
 (define (jolt-thread-sleep-ms ms)
   (let ((ms (exact (floor ms))) (mu (make-mutex)) (cv (make-condition)))
-    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (now-millis) ms)
+    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (mono-millis) ms)
       (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
     jolt-nil))
 
@@ -303,6 +303,13 @@
 
 (define (now-millis)
   (let ((t (current-time 'time-utc)))
+    (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
+;; The clock every DEADLINE in the runtime is on: milliseconds from an arbitrary
+;; origin, never stepping (System/nanoTime's clock, in millis). now-millis is the
+;; wall clock, for dating things; a deadline read off it fires early or holds on
+;; for hours when ntp or a user steps the clock mid-wait (#1303).
+(define (mono-millis)
+  (let ((t (current-time 'time-monotonic)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
 
 ;; clojure.core/current-time-ms — epoch milliseconds.

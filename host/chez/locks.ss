@@ -459,7 +459,7 @@
 ;;
 ;; decide runs with mu HELD and is passed one argument, whether the deadline has
 ;; passed. It answers jolt-cv-again to wait for a change, or any other value to
-;; finish. deadline is epoch milliseconds, or #f for an unbounded wait.
+;; finish. deadline is in mono-millis, or #f for an unbounded wait.
 ;;
 ;; This is jolt-lock-wait with the two waiter kinds filled in, so it inherits the
 ;; properties that primitive exists for: the switch happens with mu released, the
@@ -554,12 +554,14 @@
 ;; the same task in 5.2us.
 (define (jolt-cv-signal-one! cv) (condition-signal cv))
 
-;; Absolute epoch millis -> the absolute time object Chez's condition-wait wants.
+;; A mono-millis deadline -> the time left until it, as the time-duration Chez's
+;; condition-wait takes for a relative timeout. Relative and not an absolute
+;; time-utc: Chez's absolute form is the wall clock, and the deadline is not.
 ;; Floored to an exact integer first: make-time will not take a flonum field, and a
 ;; deadline arriving as one is a caller's arithmetic, not something to trust.
-(define (jolt-millis->time ms)
-  (let ((ms (exact (floor ms))))
-    (make-time 'time-utc (* 1000000 (mod ms 1000)) (div ms 1000))))
+(define (jolt-deadline->timeout deadline)
+  (let ((ms (max 0 (- (exact (floor deadline)) (mono-millis)))))
+    (make-time 'time-duration (* 1000000 (mod ms 1000)) (div ms 1000))))
 
 ;; (jolt-pause-ms ms) — pause THIS execution context for ms, whatever it is: a
 ;; thread sleeps, and a fiber parks until the deadline and gives its carrier up in
@@ -584,7 +586,7 @@
 (define (jolt-pause-ms ms)
   (if (jolt-current-fiber)
       (let ((mu (make-mutex)) (cv (make-condition)))
-        (jolt-cv-wait mu cv (+ (now-millis) ms)
+        (jolt-cv-wait mu cv (+ (mono-millis) ms)
           (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
         (void))
       (sleep (ms->duration ms))))
@@ -677,12 +679,12 @@
                        ;; the report would name this wait instead.
                        (with-exception-handler
                          (lambda (e) (jolt-interrupt-wait-remove! ibox entry) (raise-continuable e))
-                         (lambda () (decide (and deadline (>= (now-millis) deadline)))))
+                         (lambda () (decide (and deadline (>= (mono-millis) deadline)))))
                        ;; NOT REGISTERED — nothing to clean up, so decide runs with
                        ;; nothing wrapped around it. This is the arm every
                        ;; non-interruptible wait takes, and the one a wait that
                        ;; answers on its first run takes.
-                       (decide (and deadline (>= (now-millis) deadline))))))
+                       (decide (and deadline (>= (mono-millis) deadline))))))
             (cond
               ((not (eq? r jolt-cv-again))
                (when entry (jolt-interrupt-wait-remove! ibox entry) (set! entry #f))
@@ -712,7 +714,7 @@
                        jolt-lock-parked))
                  (else
                   (if deadline
-                      (jolt-condition-wait cv mu (jolt-millis->time deadline))
+                      (jolt-condition-wait cv mu (jolt-deadline->timeout deadline))
                       (jolt-condition-wait cv mu))
                   (loop)))))))))
       #t)))
