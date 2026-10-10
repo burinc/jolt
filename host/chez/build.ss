@@ -742,7 +742,17 @@
 ;; clear the buffer (mkgc.ss), Chez compacts before each segment, and an
 ;; oversize chunk is freed once it empties (chez-patches/0002), so the peak is
 ;; one segment's buffer.
-(define bld-segment-source-bytes (* 1024 1024))
+;;
+;; A segment's image is placed as ONE contiguous block. At 1MB of source that
+;; block was 289 segments (4.6MB), more than a standard 129-segment (2MB) chunk,
+;; so when the free segments the earlier buffers left were fragmented it took a
+;; fresh oversize chunk and the fragments stayed held. Which way it went was
+;; layout luck: 28 comment lines in records-interop.ss moved a closed-world
+;; hello's boot peak from 43MB to 47MB, and jolt held a 12MB chunk with one
+;; segment in use. At 256KB a block is ~1.2MB and fits a standard chunk: the
+;; same app peaks at 41MB whatever the layout, for 0.3MB more binary (1.5%
+;; on jolt itself) and under 2% on startup.
+(define bld-segment-source-bytes (* 256 1024))
 (define bld-segment-out #f)        ; the port bld-emit-runtime is segmenting
 (define bld-segment-pending 0)     ; source bytes emitted since the last break
 (define (bld-segment-count! out n)
@@ -754,13 +764,69 @@
     (set! bld-segment-pending 0)
     (put-string out "(define jolt-boot-segment-break '$install-library-entry)\n")))
 
+;; Does LINE leave its file at a top-level boundary? Breaks only at file ends
+;; could not keep segments near the size above: a large file overshot it by its
+;; whole length. ST is the file's reader state carried across lines,
+;; #(depth mode block-depth): mode is code, string, or bar (a |symbol|). A line
+;; ending in a quote, quasiquote, unquote or datum-comment prefix is not a
+;; boundary, since its datum is on the next line. A break placed inside a string
+;; would change the string without failing the compile, so every inlined file
+;; must end clean (bld-form-state-clean?) or the build stops.
+(define (bld-make-form-state) (vector 0 'code 0))
+(define (bld-form-state-clean? st)
+  (and (eqv? (vector-ref st 0) 0) (eq? (vector-ref st 1) 'code) (eqv? (vector-ref st 2) 0)))
+(define (bld-scan-line! st line)
+  (let ((n (string-length line)))
+    (let loop ((i 0) (depth (vector-ref st 0)) (mode (vector-ref st 1))
+               (blk (vector-ref st 2)) (last #f))
+      (define (done)
+        (vector-set! st 0 depth) (vector-set! st 1 mode) (vector-set! st 2 blk)
+        (and (fx= depth 0) (eq? mode 'code) (fx= blk 0)
+             (not (memv last '(#\' #\` #\, #\@ #\;)))))
+      (define (at? j c) (and (fx< j n) (char=? (string-ref line j) c)))
+      (if (fx>= i n)
+          (done)
+          (let ((c (string-ref line i)))
+            (cond
+              ((fx> blk 0)
+               (cond ((and (char=? c #\|) (at? (fx+ i 1) #\#)) (loop (fx+ i 2) depth mode (fx- blk 1) last))
+                     ((and (char=? c #\#) (at? (fx+ i 1) #\|)) (loop (fx+ i 2) depth mode (fx+ blk 1) last))
+                     (else (loop (fx+ i 1) depth mode blk last))))
+              ((eq? mode 'string)
+               (cond ((char=? c #\\) (loop (fx+ i 2) depth mode blk last))
+                     ((char=? c #\") (loop (fx+ i 1) depth 'code blk #\"))
+                     (else (loop (fx+ i 1) depth mode blk last))))
+              ((eq? mode 'bar)
+               (cond ((char=? c #\\) (loop (fx+ i 2) depth mode blk last))
+                     ((char=? c #\|) (loop (fx+ i 1) depth 'code blk #\|))
+                     (else (loop (fx+ i 1) depth mode blk last))))
+              ((char=? c #\;) (done))
+              ((char=? c #\") (loop (fx+ i 1) depth 'string blk c))
+              ((char=? c #\|) (loop (fx+ i 1) depth 'bar blk c))
+              ((char=? c #\#)
+               (cond ((at? (fx+ i 1) #\|) (loop (fx+ i 2) depth mode 1 last))
+                     ;; a char literal: its first char is never a delimiter
+                     ((at? (fx+ i 1) #\\) (loop (fx+ i 3) depth mode blk #\a))
+                     ((at? (fx+ i 1) #\;) (loop (fx+ i 2) depth mode blk #\;))
+                     (else (loop (fx+ i 1) depth mode blk c))))
+              ((memv c '(#\( #\[)) (loop (fx+ i 1) (fx+ depth 1) mode blk c))
+              ((memv c '(#\) #\])) (loop (fx+ i 1) (fx- depth 1) mode blk c))
+              ((memv c '(#\space #\tab)) (loop (fx+ i 1) depth mode blk last))
+              (else (loop (fx+ i 1) depth mode blk c))))))))
+
 ;; Emit one line to OUT, recursively inlining a `(load ...)` of a repo file.
 (define (bld-inline-line line out depth)
   (when (> depth 50) (error 'jolt-build "load nesting too deep"))
   (let ((p (bld-load-path line)))
     (if p
-        (begin
-          (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+        (let ((st (bld-make-form-state)))
+          ;; a full segment ends at the first top-level boundary, not the file's end
+          (for-each (lambda (l)
+                      (bld-inline-line l out (+ depth 1))
+                      (when (bld-scan-line! st l) (bld-segment-break! out)))
+                    (bld-file-lines p))
+          (unless (bld-form-state-clean? st)
+            (error 'jolt-build "lost track of top-level forms (segment breaks) in" p st))
           (when bld-profile-inline?
             (bld-emit-startup-profile-mark! out (string-append "inlined " p)))
           ;; the end of an inlined file is a top-level boundary (the profile

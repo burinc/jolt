@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
 TEST-GATES := submodules selfhost ci
@@ -1454,6 +1454,12 @@ buildscaling:
 # at a root, and build.ss loads under a bare-name JOLT_CHEZ.
 buildnatives:
 	@$(CHEZ) --script test/chez/build-natives-test.ss
+
+# Where the runtime's boot image segments end: at top-level form
+# boundaries inside a file, not only at file ends, so a segment's image stays
+# under a standard chunk; a scanner that loses its place stops the build.
+buildsegments:
+	@$(CHEZ) --script test/chez/build-segments-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The
