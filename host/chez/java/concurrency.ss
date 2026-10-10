@@ -5070,4 +5070,18 @@
 (register-class-arm! jolt-delay? (lambda (x) "clojure.lang.Delay"))
 (register-class-arm! (lambda (x) (jvol? x)) (lambda (x) "clojure.lang.Volatile"))
 (register-class-arm! (lambda (x) (var-cell? x)) (lambda (x) "clojure.lang.Var"))
+;; ...and instance? memoizes these four by kind (records-interop.ss ref-kind-key).
+;; The future probe is a bare record: making one through future-call starts a thread.
+(set-ref-kind-extra-hook!
+  (lambda (x)
+    (cond ((jolt-delay? x) "clojure.lang.Delay")
+          ((jolt-promise? x) "clojure.core$promise$reify__0")
+          ((jolt-future? x) "clojure.core$future_call$reify__0")
+          ((jolt-agent? x) "clojure.lang.Agent")
+          (else #f)))
+  (lambda ()
+    (list (jolt-make-delay (lambda () jolt-nil))
+          (jolt-promise-new)
+          (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) #f)
+          (jolt-agent-new jolt-nil))))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "user-thread"))) (lambda (x) "java.lang.Thread"))

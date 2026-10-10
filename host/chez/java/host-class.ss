@@ -76,7 +76,18 @@
           (probe-if-available (lambda () jrec-fast-type-probe))
           (probe-if-available (lambda () (make-reified (jolt-hash-map))))))
 (define (class-arm-reject-fast-type! who pred)
-  (reject-fast-type-claim! who pred (class-fast-probes) "the (class x) fast path"))
+  (reject-fast-type-claim! who pred (class-fast-probes) "the (class x) fast path")
+  (reject-fast-type-claim! who pred (ref-kind-probes) "instance?'s per-kind memo"))
+;; The reference and deferred values instance? memoizes by kind
+;; (records-interop.ss ref-kind-key). The runtime's own class arms name their
+;; classes, one arm per type, so the answer is a function of the kind; a library
+;; arm could decide from what one holds, and the memo would keep its first answer.
+(define (ref-kind-probes)
+  (append (probe-if-available (lambda () (jolt-atom-new 0)))
+          (probe-if-available (lambda () (jolt-ref-new 0)))
+          (probe-if-available (lambda () (make-jvol 0)))
+          (probe-if-available (lambda () (jolt-var "clojure.core" "*ns*")))
+          (ref-kind-extra-probes)))
 
 ;; ---- seq flavor -> JVM class --------------------------------------------------
 ;; The one place the sk-* tags a cseq cell carries (seq.ss) become clojure.lang.*
