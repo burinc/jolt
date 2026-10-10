@@ -180,7 +180,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient sortedcoll rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -602,6 +602,14 @@ lazyretain: testbin
 	 done; \
 	 [ "$$fails" = 0 ] || exit 1; \
 	 echo "lazyretain: $$n cases in constant memory under a 256MB heap"
+
+# What a process holds beyond its data (test/chez/footprint-test.sh): no boot
+# chunk pinned near-empty on a patched kernel (chez-patches/0002), the embedded
+# boot arrays in a read-only section (madvise dirtied them in writable data), and
+# a GC live baseline measured after a collection rather than over the boot's
+# garbage.
+footprint: testbin
+	@sh test/chez/footprint-test.sh target/release/jolt
 
 # The nursery follows the collector's time share, bounded by the live set
 # (rt.ss jolt-install-gc-policy!): a churning program grows it past the 16MB floor

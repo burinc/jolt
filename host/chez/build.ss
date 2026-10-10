@@ -3470,7 +3470,7 @@
     (ei-mark! "cc link")
     (display (string-append "jolt build: wrote " out-path "\n"))))
 
-;; Write BOOT into header H as `unsigned char jolt_boot[]` + `unsigned int
+;; Write BOOT into header H as `const unsigned char jolt_boot[]` + `unsigned int
 ;; jolt_boot_len` — what xxd -i plus the symbol rename produce for build-with-cc,
 ;; without needing xxd on a machine that has nothing but a C compiler.
 (define bld-hex-bytes
@@ -3482,7 +3482,7 @@
   (let* ((bv (read-file-bytes boot))
          (n (bytevector-length bv))
          (p (open-output-file h 'replace)))
-    (put-string p "unsigned char jolt_boot[] = {\n")
+    (put-string p "const unsigned char jolt_boot[] = {\n")
     (do ((i 0 (fx+ i 1))) ((fx= i n))
       (put-string p (vector-ref bld-hex-bytes (bytevector-u8-ref bv i)))
       (when (fx= (fxand i 15) 15) (put-char p #\newline)))
@@ -3500,7 +3500,7 @@
         "int main(int argc, char *argv[]) {\n"
         (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
-        "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
+        "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, jolt_boot_len);\n"
         "  Sbuild_heap(0, jolt_register_zlib);\n"
         "  int status = Sscheme_start(argc, (const char **)argv);\n"
         "  Sscheme_deinit();\n  return status;\n}\n"))
@@ -3712,7 +3712,7 @@
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
-    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
+    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/const unsigned char jolt_boot[]/; "
     "s/unsigned int [A-Za-z0-9_]+_len/unsigned int jolt_boot_len/' '" boot-h "'"))
   (bld-write-exe-main! main-c)
   ;; -rdynamic (Linux) exports the executable's symbols into the dynamic table so
@@ -3790,7 +3790,7 @@
     (bld-boot-prefetch-call)
     "  jolt_save_host_faults();\n"
     "  Sscheme_init(0);\n"
-    "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
+    "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, (iptr)jolt_boot_len);\n"
     "  Sbuild_heap(0, jolt_register_zlib);\n"
     "  jolt_chain_faults();\n"
     "  Sforeign_symbol(\"jolt_set_lookup_addr\", (void*)jolt_set_lookup_addr);\n"
@@ -3847,7 +3847,7 @@
       (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
-    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "
+    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/const unsigned char jolt_boot[]/; "
     "s/unsigned int [A-Za-z0-9_]+_len/unsigned int jolt_boot_len/' '" boot-h "'"))
   (let ((lc (string-append builddir "/library.c")))
     (let ((p (open-output-file lc 'replace)))

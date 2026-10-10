@@ -7,10 +7,14 @@
  *
  * (see host/chez/java/io.ss jolt-append-payload!). At startup the stub locates
  * its own executable, reads the trailing 16-byte frame to find the boot, and
- * registers the boot as a region of the executable itself: the Chez kernel
- * reads it through the fd during Sbuild_heap and closes it when done. No
+ * maps the boot read-only out of the executable itself and registers the
+ * mapping, unmapped once Sbuild_heap has consumed it (where mapping is not
+ * available, the Chez kernel reads the region through the fd instead). No
  * external boot file, no Chez install, and no resident copy — a malloc'd
- * payload here stayed dirty for the life of the process (7-14 MB per app).
+ * payload here stayed dirty for the life of the process (7-14 MB per app). A
+ * mapping's pages are clean and file-backed, and a patched kernel
+ * (chez-patches/0003) uncompresses the boot straight out of them, where the fd
+ * path first copies each compressed segment into the heap.
  *
  * Built once at jolt-build time against the Chez kernel (libkernel.a + scheme.h)
  * by host/chez/build-jolt.ss; the resulting binary is embedded into jolt and
@@ -30,6 +34,7 @@
 #include <mach-o/dyld.h>
 #include <fcntl.h>
 #include <libproc.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
 static int self_path(char *buf, uint32_t size) {
@@ -50,6 +55,7 @@ static int open_self(const char *path) { return _open(path, _O_RDONLY | _O_BINAR
 #else
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 static int self_path(char *buf, uint32_t size) {
   ssize_t n = readlink("/proc/self/exe", buf, (size_t)size - 1);
   if (n < 0) return -1;
@@ -81,6 +87,36 @@ static void prefetch_boot_region(int fd, long off, uint64_t len) {
   (void)fd;
   (void)off;
   (void)len;
+#endif
+}
+
+/* Map the boot region read-only, answering the boot's first byte (and, through
+   BASE/MAPLEN, what to unmap) with FD closed, or NULL where there is no mmap or
+   it fails, which leaves the fd path and FD open for it. */
+static void *map_boot_region(int fd, long off, uint64_t len, void **base, size_t *maplen) {
+#if defined(_WIN32)
+  (void)fd; (void)off; (void)len; (void)base; (void)maplen;
+  return NULL;
+#else
+  long pagesize = sysconf(_SC_PAGESIZE);
+  long start;
+  void *p;
+  if (pagesize <= 0 || len == 0 || len > (uint64_t)SIZE_MAX - (uint64_t)pagesize) return NULL;
+  start = off - (off % pagesize);
+  p = mmap(NULL, (size_t)(off - start) + (size_t)len, PROT_READ, MAP_PRIVATE, fd, (off_t)start);
+  if (p == MAP_FAILED) return NULL;
+  close(fd);
+  *base = p;
+  *maplen = (size_t)(off - start) + (size_t)len;
+  return (char *)p + (off - start);
+#endif
+}
+
+static void unmap_boot_region(void *base, size_t maplen) {
+#if defined(_WIN32)
+  (void)base; (void)maplen;
+#else
+  if (base != NULL) munmap(base, maplen);
 #endif
 }
 
@@ -249,14 +285,24 @@ int main(int argc, char *argv[]) {
   startup_profile_mark(startup_profile, startup_started, &startup_last,
                        "prefetch boot payload");
 
+  void *map_base = NULL;
+  size_t map_len = 0;
+  void *boot = map_boot_region(fd, boot_off, boot_len, &map_base, &map_len);
+
   Sscheme_init(0);
   startup_profile_mark(startup_profile, startup_started, &startup_last,
                        "Sscheme_init");
-  /* final arg: close the fd when the boot is consumed */
-  Sregister_boot_file_fd_region("jolt", fd, (iptr)boot_off, (iptr)boot_len, 1);
+  if (boot != NULL) {
+    Sregister_boot_file_bytes("jolt", boot, (iptr)boot_len);
+  } else {
+    /* final arg: close the fd when the boot is consumed */
+    Sregister_boot_file_fd_region("jolt", fd, (iptr)boot_off, (iptr)boot_len, 1);
+  }
   startup_profile_mark(startup_profile, startup_started, &startup_last,
                        "register boot payload");
   Sbuild_heap(0, jolt_register_zlib);
+  /* the heap holds copies of everything; nothing points into the boot now */
+  unmap_boot_region(map_base, map_len);
   startup_profile_mark(startup_profile, startup_started, &startup_last,
                        "Sbuild_heap");
   int status = Sscheme_start(argc, (const char **)argv);
