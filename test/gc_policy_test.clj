@@ -35,8 +35,10 @@
 ;; For the refresh: a full collection the program asks for measures the live set
 ;; as the policy's own do, so the older generations' allowance afterwards is sized
 ;; from what is live NOW. Held data grows the allowance past its 64MB minimum;
-;; dropped and collected, it goes back. Before, System/gc left the policy's
-;; figure where its last own full collection put it.
+;; dropped and collected, it shrinks with the live set. It need not land on the
+;; minimum: building the held data can cross the old-generation limit, and a
+;; full collection the policy runs then may raise its growth factor. Before,
+;; System/gc left the policy's figure where its last own full collection put it.
 (defn- refresh []
   (reset! held (vec (map (fn [i] {:i i :s (str "held-" i)}) (range 600000))))
   (System/gc)
