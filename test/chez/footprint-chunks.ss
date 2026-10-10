@@ -4,8 +4,9 @@
 ;; oversize chunk the moment it empties (gc.c), so one that stays near-empty is
 ;; held by a segment that cannot move. Prints one line:
 ;;   PINNED <chunks> <bytes> HELD <current-memory-bytes> LIVE <bytes-allocated>
-;; Loaded into a running jolt with the report path bound as footprint-report.
-(collect (collect-maximum-generation))
+;; Loaded into a running jolt with the report path bound as footprint-report,
+;; after a System/gc (a bare (collect) here refuses whenever another jolt thread
+;; is active, which on Linux it is at startup).
 ((foreign-procedure "(cs)s_showalloc" (boolean string) void) #f footprint-report)
 (let ((p (open-input-file footprint-report)))
   (let loop ((n 0) (bytes 0))

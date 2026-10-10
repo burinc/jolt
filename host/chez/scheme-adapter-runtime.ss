@@ -48,12 +48,18 @@
 ;; active" when any OTHER thread is active at that instant, and jolt always
 ;; has service threads (io-poller, fiber carriers, the timer) that are
 ;; collect-safe while blocked but active for the microseconds between waits —
-;; so a single attempt can lose that race at any time. Retry over a short
-;; window; a thread that stays active through all of it (a compute loop)
-;; degrades the call to a no-op, because System.gc must hint, never throw.
-;; Any other collector error still raises.
+;; so a single attempt can lose that race at any time. Where jolt's own
+;; collect-request handler is installed, a refused attempt asks it for the full
+;; collection and joins the rendezvous every automatic collection uses: the
+;; handler runs once all threads have stopped, which is when Chez allows it, so
+;; a compute loop on another thread no longer turns System.gc into a no-op (nor
+;; a startup check that needs the boot's garbage gone, rt.ss). Without the
+;; handler, retry over a short window and degrade to a no-op, because
+;; System.gc must hint, never throw. Any other collector error still raises.
+(define sa-full-collect-requested? #f)
+(define sa-collect-handler-installed? #f)
 (define (sa-gc-collect)
-  (let loop ((tries 100))
+  (let loop ((tries (if sa-collect-handler-installed? 0 100)))
     (let ((r (guard (e (#t (if (and (message-condition? e)
                                     (string=? (condition-message e)
                                               "cannot collect when multiple threads are active"))
@@ -65,9 +71,13 @@
         ;; no collect-request-handler ran, so undo the pins of arrays this one
         ;; found dead here, or they stay locked (and live) until the next pin
         ((ok) (sa-pin-drain-after-collect!))
-        ((busy) (when (fx>? tries 0)
-                  (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
-                  (loop (fx- tries 1))))))))
+        ((busy) (cond
+                  (sa-collect-handler-installed?
+                   (set! sa-full-collect-requested? #t)
+                   (collect-rendezvous))
+                  ((fx>? tries 0)
+                   (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
+                   (loop (fx- tries 1)))))))))
 
 ;; (sa-gc-max-generation) -> exact integer
 ;; The deepest collectable generation, for callers mapping JVM generations.
@@ -1175,13 +1185,22 @@
                  (collect (collect-maximum-generation)))))))
     (collect-request-handler
       (lambda ()
-        (let ((t0 (sa-monotonic-ns)))
-          (sa-collect-young!)
-          (maintain collect-full!)
-          (sa-pin-drain-after-collect!)
-          (let ((t1 (sa-monotonic-ns)))
-            (observe (- t1 t0) (- t1 last-end))
-            (set! last-end t1))))))
+        (if sa-full-collect-requested?
+            ;; sa-gc-collect's full collection, run here because another thread
+            ;; was active: what its direct path does, and no more -- it is not a
+            ;; young collection for the nursery's time share to count
+            (begin
+              (set! sa-full-collect-requested? #f)
+              (collect (collect-maximum-generation))
+              (sa-pin-drain-after-collect!))
+            (let ((t0 (sa-monotonic-ns)))
+              (sa-collect-young!)
+              (maintain collect-full!)
+              (sa-pin-drain-after-collect!)
+              (let ((t1 (sa-monotonic-ns)))
+                (observe (- t1 t0) (- t1 last-end))
+                (set! last-end t1)))))))
+  (set! sa-collect-handler-installed? #t)
   #t)
 ;; A tight full collection within ROOM free bytes: every generation from 1 up
 ;; is marked where it is rather than copied, in ONE collection. Chez marks a

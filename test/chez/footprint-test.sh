@@ -3,7 +3,7 @@
 # repo root with the binary to check (default target/release/jolt):
 #   sh test/chez/footprint-test.sh [jolt]
 #
-# Three rows, each a leak of memory that was measured, not modeled:
+# The rows, each a leak of memory that was measured, not modeled:
 #   - pinned chunks: a vfasl boot loads straight into the static generation
 #     while its temporary buffers (the decompressed image, the relocations) live
 #     in chunks of their own. A stock kernel hands such a chunk's spare aligned
@@ -29,6 +29,7 @@ fail=0
 
 # --- pinned chunks ------------------------------------------------------------
 cat > "$tmp/probe.clj" <<EOF
+(System/gc)
 (println (jolt.host/scheme-eval-string
   "(begin (define footprint-report \"$tmp/alloc.txt\")
           (load \"test/chez/footprint-chunks.ss\")
@@ -75,6 +76,17 @@ if [ -z "$heap" ] || [ -z "$base" ]; then
 fi
 if [ "$base" -gt $((heap + 1)) ]; then
   echo "FAIL: GC baseline ${base}MB exceeds the heap after the first collection (${heap}MB)" >&2
+  fail=1
+fi
+
+# --- System/gc under a busy thread ----------------------------------------------
+# A full collection is refused while another thread is active, and System/gc
+# used to retry briefly and then do nothing, so with a compute loop running it
+# was a no-op (and so was the collection the startup ceiling check depends on).
+# It joins the collector's rendezvous now; a weakly held object must clear.
+cleared=$(JOLT_NO_USER_DEPS=1 "$J" test/chez/gc-under-threads.clj 2>&1 | tail -n 1)
+if [ "$cleared" != "cleared true" ]; then
+  echo "FAIL: System/gc with a busy thread did not collect ($cleared)" >&2
   fail=1
 fi
 
