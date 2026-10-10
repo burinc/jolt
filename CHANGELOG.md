@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Timeouts no longer follow the wall clock.** Every runtime deadline
+  (timed waits and derefs, `Thread/sleep`, `Process.waitFor`, executor
+  keep-alive and scheduling, `tryLock`, socket timeouts, core.async `timeout`)
+  was read off the wall clock, so stepping the system clock fired a wait early
+  or held it for as long as the step. They now use the monotonic clock, as the
+  JVM does. `jolt.host/timer-at!` and `jolt.io-poller/wait-ready` take
+  deadlines on that clock; `jolt.io-poller/clock-ms` builds one (#1303).
 - **Division by zero raises where the JVM raises.** `(/ x y)` on boxed
   operands is `Numbers.divide(Object, Object)`, which raises `Divide by zero`
   for any zero divisor, `0.0` included, unless an operand is NaN. jolt answered
