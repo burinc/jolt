@@ -729,6 +729,31 @@
 ;; shipped binary carries the coarse set, and each mark costs a statistics call.
 (define bld-profile-inline? (and (getenv "JOLT_PROFILE_INLINE") #t))
 
+;; --- boot image segments ----------------------------------------------------
+;; A vfasl boot is loaded one image segment at a time, each decompressed into a
+;; buffer that lives beside the static image it is building, and
+;; vfasl-convert-file folds every entry it can into ONE segment. The runtime
+;; was one segment: 60MB of buffer next to 62MB of image, a boot peak of 2.2x
+;; jolt's live heap (and 2.5x a closed-world app's). The converter closes a
+;; segment at an entry that mentions the symbol $install-library-entry (Chez
+;; s/vfasl.ss fasl-can-combine?, which documents that a non-boot mention only
+;; costs sharing), so bld-emit-runtime puts a top-level define naming it at a
+;; form boundary every BLD-SEGMENT-SOURCE-BYTES of emitted source. Collections
+;; clear the buffer (mkgc.ss), Chez compacts before each segment, and an
+;; oversize chunk is freed once it empties (chez-patches/0002), so the peak is
+;; one segment's buffer.
+(define bld-segment-source-bytes (* 1024 1024))
+(define bld-segment-out #f)        ; the port bld-emit-runtime is segmenting
+(define bld-segment-pending 0)     ; source bytes emitted since the last break
+(define (bld-segment-count! out n)
+  (when (eq? out bld-segment-out)
+    (set! bld-segment-pending (+ bld-segment-pending n))))
+;; At a top-level boundary of OUT: end the segment if it is full.
+(define (bld-segment-break! out)
+  (when (and (eq? out bld-segment-out) (>= bld-segment-pending bld-segment-source-bytes))
+    (set! bld-segment-pending 0)
+    (put-string out "(define jolt-boot-segment-break '$install-library-entry)\n")))
+
 ;; Emit one line to OUT, recursively inlining a `(load ...)` of a repo file.
 (define (bld-inline-line line out depth)
   (when (> depth 50) (error 'jolt-build "load nesting too deep"))
@@ -737,14 +762,20 @@
         (begin
           (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
           (when bld-profile-inline?
-            (bld-emit-startup-profile-mark! out (string-append "inlined " p))))
-        (begin (put-string out line) (put-string out "\n")))))
+            (bld-emit-startup-profile-mark! out (string-append "inlined " p)))
+          ;; the end of an inlined file is a top-level boundary (the profile
+          ;; mark above relies on the same)
+          (bld-segment-break! out))
+        (begin (put-string out line) (put-string out "\n")
+               (bld-segment-count! out (+ (string-length line) 1))))))
 
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
 ;; shaken clojure.core defs, or #f) replaces the 'prelude blob; drop-compiler? (a
 ;; closed AOT app that never compiles from source) omits 'image + 'compile-eval —
 ;; the analyzer/back end are dead weight in the binary (~0.8MB).
 (define (bld-emit-runtime out drop-compiler? core-strs)
+  (set! bld-segment-out out)
+  (set! bld-segment-pending 0)
   (bld-emit-startup-profile-preamble out)
   (bld-emit-startup-profile-mark! out "runtime begin")
   (for-each
@@ -754,7 +785,10 @@
                 ((eq? entry 'prelude)
                  (if core-strs
                      (begin
-                       (for-each (lambda (s) (put-string out s) (put-string out "\n"))
+                       (for-each (lambda (s)
+                                   (put-string out s) (put-string out "\n")
+                                   (bld-segment-count! out (+ (string-length s) 1))
+                                   (bld-segment-break! out))
                                  core-strs)
                        #t)
                      (begin
@@ -773,7 +807,8 @@
           (bld-emit-startup-profile-mark!
             out
             (string-append "runtime " (bld-runtime-entry-label entry))))))
-    bld-runtime-manifest))
+    bld-runtime-manifest)
+  (set! bld-segment-out #f))
 
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +
@@ -1846,6 +1881,13 @@
 ;; of WHY such a namespace is preloaded, and covers any image that ever seeds
 ;; the CLI closure earlier.
 ;; Result: deps first, roots last.
+;; ns name -> the namespaces its forms require, as the closure scan read them.
+;; The shake roots each as an "ns:" ref on the namespace's ns-form records, so a
+;; required namespace embedded in the prelude keeps its load effects
+;; (dce-rec-gated) even when nothing in it is referenced. Not cleared per call:
+;; a build runs the closure more than once (its data-reader namespaces too), a
+;; rescan overwrites its entry, and only namespaces in this build are looked up.
+(define bld-ns-required (make-hashtable string-hash string=?))
 (define (bld-require-closure names)
   (let ((visited (make-hashtable string-hash string=?))
         (order '()))
@@ -1860,8 +1902,10 @@
                              (not (hashtable-ref bld-boot-loaded name #f))
                              ;; preloaded only in the CLI image, not in an app's
                              (ldr-cli-aot? name)))
-                (let ((forms (bld-scan-forms name file)))
-                  (dfs (append (bld-ns-class-providers* forms) (bld-ns-requires* forms))))
+                (let* ((forms (bld-scan-forms name file))
+                       (reqs (bld-ns-requires* forms)))
+                  (hashtable-set! bld-ns-required name reqs)
+                  (dfs (append (bld-ns-class-providers* forms) reqs)))
                 (set! order (cons (cons name file) order)))))
           (dfs (cdr ns)))))
     (reverse order)))
@@ -2167,9 +2211,11 @@
                                     (set! per-ns
                                       (cons (append
                                               (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
-                                              (map (lambda (s) (dce-rec #t #f '() s))
-                                                   (ei-timed "emit: ns-prelude"
-                                                     (lambda () (bld-ns-prelude (car nf) src))))
+                                              (let ((reqs (map dce-ns-ref
+                                                               (hashtable-ref bld-ns-required (car nf) '()))))
+                                                (map (lambda (s) (dce-rec #t #f reqs s))
+                                                     (ei-timed "emit: ns-prelude"
+                                                       (lambda () (bld-ns-prelude (car nf) src)))))
                                               (ei-timed "emit: per-ns total"
                                                 (lambda () (ei-emit-ns-records (car nf) src)))
                                               (list
@@ -2656,6 +2702,35 @@
           (if (memq (caddr u) '(runtime runtime-shaken)) bld-runtime-chez-params (bld-mode-params mode))
           (car u) (cadr u))))
     "" units))
+
+;; X.so -> X-stripped.so (java/io.ss shadows Chez's path-root with its own).
+(define (bld-stripped-so-path so)
+  (let ((n (string-length so)))
+    (string-append (if (and (fx> n 3) (string=? (substring so (fx- n 3) n) ".so"))
+                       (substring so 0 (fx- n 3))
+                       so)
+                   "-stripped.so")))
+
+;; The script-side bld-strip-runtime-units, for a boot assembled in a fresh Chez
+;; (build-with-cc): the strip-fasl-file forms for each runtime unit, and UNITS
+;; renamed to the stripped copies they write.
+(define (bld-units-strip-forms units)
+  (fold-left
+    (lambda (acc u)
+      (if (memq (caddr u) '(runtime runtime-shaken))
+          (string-append acc
+            "(strip-fasl-file " (ei-str-lit (cadr u)) " "
+            (ei-str-lit (bld-stripped-so-path (cadr u)))
+            " (fasl-strip-options compile-time-information inspector-source"
+            " source-annotations profile-source))\n")
+          acc))
+    "" units))
+(define (bld-units-stripped units)
+  (map (lambda (u)
+         (if (memq (caddr u) '(runtime runtime-shaken))
+             (list (car u) (bld-stripped-so-path (cadr u)) (caddr u))
+             u))
+       units))
 
 ;; Every unit's object file, quoted, in load order — the make-boot-file tail.
 (define (bld-units-so-args units)
@@ -3356,7 +3431,9 @@
   (let* ((cache (and rt-key
                      (string-append rt-key "." (bld-files-key base-boots) "."
                                     (symbol->string (bld-vfasl-codec))
-                                    (if petite-only? ".petite" "") ".vfasl")))
+                                    ;; petite-only images are built from the
+                                    ;; stripped runtime (bld-strip-runtime-units)
+                                    (if petite-only? ".petite-stripped" "") ".vfasl")))
          (out (string-append builddir "/base.vfasl")))
     (if (and cache (bld-cache-fetch! cache out))
         (begin (ei-mark! "runtime vfasl (cached)") out)
@@ -3411,6 +3488,22 @@
                       (let ((vso (string-append (cadr (car us)) ".vfasl")))
                         (and (bld-vfasl-unit! (cadr (car us)) vso)
                              (loop (cdr us) (cons vso acc)))))))))))
+
+;; A binary booted from petite has no compiler, so nothing in it can expand
+;; Scheme code, and the runtime half's compile-time information -- its macros'
+;; transformers and expander data -- is dead weight: 3.3MB of a closed-world
+;; app's runtime heap. Answer UNITS with each runtime unit's fasl replaced by a
+;; stripped copy beside it (the original stays, it is the cached one); a unit
+;; that will not strip ships as it was.
+(define (bld-strip-runtime-units units)
+  (map (lambda (u)
+         (if (memq (caddr u) '(runtime runtime-shaken))
+             (let ((out (bld-stripped-so-path (cadr u))))
+               (if (sa-strip-compile-time-info! (cadr u) out)
+                   (list (car u) out (caddr u))
+                   u))
+             u))
+       units))
 
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
@@ -3532,6 +3625,7 @@
       units)
     (bld-compile-app-units! builddir mode (filter (lambda (u) (eq? (caddr u) 'app)) units)
                             (not (or (bld-cross?) (bld-vfasl-disabled?))))
+    (when petite-only? (set! units (bld-strip-runtime-units units)))
     ;; A compiler-dropped binary (no runtime eval) boots from petite alone —
     ;; scheme.boot is the Chez compiler, ~5 MB of heap and ~1 MB of binary it
     ;; would never call. Chez's interpreter (petite) can't create a
@@ -3687,6 +3781,9 @@
           ;; mode's row. No kernel prologue here — a fresh Chez has nothing of
           ;; jolt's in its interaction environment to shadow a kernel name.
           (bld-units-compile-forms units mode)
+          ;; no compiler, no use for the runtime's compile-time information
+          ;; (bld-strip-runtime-units)
+          (if petite-only? (bld-units-strip-forms units) "")
           ;; petite-only boot when the compiler image was dropped (see
           ;; build-self-contained). The unit fasls follow the Chez boots in the
           ;; order they were compiled.
@@ -3695,7 +3792,7 @@
           (if petite-only?
               ""
               (string-append "  " (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n"))
-          (bld-units-so-args units) ")\n"
+          (bld-units-so-args (if petite-only? (bld-units-stripped units) units)) ")\n"
           ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
           ;; constants the way make-boot-file above does — see build-jolt.ss.
           ;; --boot decides the codec, or omits the conversion (jolt#886).

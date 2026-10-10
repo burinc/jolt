@@ -21,7 +21,14 @@
 ;; or a constant) -- see dce-def-init-runs?. Optional, #f when not given: keep
 ;; records are roots anyway and prelude records are never rooted by it.
 (define (dce-rec keep? fqn refs str . init-runs)
-  (vector keep? fqn refs str (and (pair? init-runs) (car init-runs) #t)))
+  (vector keep? fqn refs str (and (pair? init-runs) (car init-runs) #t) #f))
+;; A top-level form of namespace NS other than clojure.core (a defmethod, a
+;; declare, a fn-form registration): it runs when NS loads, so it is kept, and
+;; its refs are roots, only when NS is live -- required (an "ns:NS" ref) or
+;; holding a reached def. See dce-reach.
+(define (dce-rec-gated refs str ns)
+  (vector #t #f refs str #f ns))
+(define (dce-rec-gate-ns r) (vector-ref r 5))
 (define (dce-rec-init-runs? r) (vector-ref r 4))
 (define (dce-rec-keep? r) (vector-ref r 0))
 (define (dce-rec-fqn r)   (vector-ref r 1))
@@ -98,6 +105,19 @@
              (let ((args (jolt-seq (jolt-get node dce-kw-args))))
                (and (not (jolt-nil? args))
                     (not (for-all dce-static-arg? (seq->list args)))))))))
+;; "ns:<name>" for every symbol in a static load's constant argument -- the
+;; namespace names, and harmlessly its aliases and :refer names too: an ns: ref
+;; only matters for a namespace with gated forms.
+(define (dce-ns-ref name) (string-append "ns:" name))
+(define dce-kw-form (keyword #f "form"))
+(define (dce-const-ns-refs v acc)
+  (cond ((symbol-t? v) (cons (dce-ns-ref (symbol-t-name v)) acc))
+        ((or (string? v) (keyword-t? v) (number? v) (char? v) (boolean? v) (jolt-nil? v)) acc)
+        (else
+         (let ((s (guard (e (#t jolt-nil)) (jolt-seq v))))
+           (if (jolt-nil? s)
+               acc
+               (fold-left (lambda (a x) (dce-const-ns-refs x a)) acc (seq->list s)))))))
 (define (dce-collect-refs acc node)
   (let ((op (jolt-get node dce-kw-op)))
     (cond ((or (eq? op dce-kw-var) (eq? op dce-kw-the-var))
@@ -115,7 +135,13 @@
              (let ((args (jolt-seq (jolt-get node dce-kw-args))))
                (if (jolt-nil? args)
                    acc
-                   (fold-left dce-collect-refs acc (seq->list args))))))
+                   ;; a static load names its namespaces: each is live (dce-reach)
+                   (let ((acc (if (dce-dynamic-load? node)
+                                  acc
+                                  (fold-left (lambda (a arg)
+                                               (dce-const-ns-refs (jolt-get arg dce-kw-form) a))
+                                             acc (seq->list args)))))
+                     (fold-left dce-collect-refs acc (seq->list args)))))))
           (else (dce-reduce-children dce-collect-refs acc node)))))
 
 ;; The fqn of a bare top-level def (the only prunable IR form), else #f.
@@ -384,6 +410,81 @@
             (car xs))))
     (else #f)))
 
+;; --- prelude form classification ----------------------------------------------
+;; Ops whose only effect is on the one var they name.
+(define dce-var-attached-ops
+  '(set-var-meta! declare-var! mark-macro! jv$clojure.core/attach-core-doc-meta!))
+;; FORM's statements: the body of its guard, with nested begins flattened.
+(define (dce-statements form)
+  (let flat ((xs (if (and (pair? form) (eq? (car form) 'guard) (pair? (cdr form)))
+                     (cddr form)
+                     (list form))))
+    (cond ((null? xs) '())
+          ((and (pair? (car xs)) (eq? (caar xs) 'begin))
+           (append (flat (cdar xs)) (flat (cdr xs))))
+          (else (cons (car xs) (flat (cdr xs)))))))
+(define (dce-var-op-target x ops)
+  (and (pair? x) (memq (car x) ops)
+       (pair? (cdr x)) (string? (cadr x)) (pair? (cddr x)) (string? (caddr x))
+       (string-append (cadr x) "/" (caddr x))))
+;; "ns/name" when every statement of FORM only attaches to that one var (its doc
+;; metadata, its declaration, its macro flag): such a form lives or dies with
+;; the var, as its def does. Without this, clojure.core's docstrings were kept
+;; for every var a shake dropped (295KB of prelude source).
+(define (dce-var-attached-fqn form)
+  (let ((xs (dce-statements form)))
+    (and (pair? xs)
+         (let ((t (dce-var-op-target (car xs) dce-var-attached-ops)))
+           (and t (for-all (lambda (x) (equal? (dce-var-op-target x dce-var-attached-ops) t)) (cdr xs))
+                t)))))
+;; The namespace FORM was compiled in, when it says: the ns of a fn form it
+;; registers, else of the first var it defines or attaches to; #f when none.
+(define dce-ns-ops (append '(def-var! def-var-with-meta! def-var-plain! def-var-linked!) dce-var-attached-ops))
+(define (dce-find-pair x pred)
+  (and (pair? x)
+       (if (pred x)
+           x
+           (let loop ((ys x))
+             (and (pair? ys)
+                  (or (dce-find-pair (car ys) pred) (loop (cdr ys))))))))
+;; With neither, REFS decide: a form that reaches into exactly one namespace
+;; besides clojure.core belongs to it -- pprint's
+;; (alter-var-root #'*print-pprint-dispatch* (constantly simple-dispatch))
+;; names no def of its own, and kept as core's it rooted all of pprint.
+(define (dce-refs-ns refs)
+  (let ((nss (fold-left (lambda (acc r)
+                          (let ((ns (dce-fqn-ns r)))
+                            (if (and ns (not (string=? ns "clojure.core")) (not (member ns acc)))
+                                (cons ns acc)
+                                acc)))
+                        '() refs)))
+    (and (= (length nss) 1) (car nss))))
+(define (dce-form-ns form refs)
+  (let ((reg (dce-find-pair form
+               (lambda (x) (and (eq? (car x) 'image-register-fn-form!)
+                                (list? x) (fx>= (length x) 4) (string? (cadddr x)))))))
+    (if reg
+        (cadddr reg)
+        (let ((op (dce-find-pair form (lambda (x) (dce-var-op-target x dce-ns-ops)))))
+          (if op (cadr op) (dce-refs-ns refs))))))
+;; One prelude FORM as a DCE record: a def is prunable by its var; a form that
+;; only attaches to one var is prunable by that var; another namespace's
+;; top-level form is gated on the namespace (dce-rec-gated); the rest
+;; (clojure.core's own effects) is always kept.
+(define (dce-blob-form-record form)
+  (let ((b (dce-unwrap form))
+        (str (with-output-to-string (lambda () (write form))))
+        (refs (dce-sexp-refs form '())))
+    (let ((d (dce-def-var-form b)))
+      (cond
+        (d (dce-rec #f (string-append (cadr d) "/" (caddr d)) refs str))
+        ((dce-var-attached-fqn form) => (lambda (fqn) (dce-rec #f fqn refs str)))
+        (else
+         (let ((ns (dce-form-ns form refs)))
+           (if (and ns (not (string=? ns "clojure.core")))
+               (dce-rec-gated refs str ns)
+               (dce-rec #t #f refs str))))))))
+
 ;; str re-serializes the read form (compiled identically; comments/whitespace are
 ;; irrelevant).
 (define (dce-blob-records path)
@@ -406,24 +507,16 @@
         (let ((form (if (null? forms) (eof-object) (car forms))))
           (if (eof-object? form)
               (reverse acc)
-              (let ((b (dce-unwrap form))
-                    (str (with-output-to-string (lambda () (write form))))
-                    (refs (dce-sexp-refs form '())))
+              (let ((r (dce-blob-form-record form)))
                 ;; the shaken prelude is this re-serialization — a datum that
                 ;; does not round-trip (shared structure, unwritable value)
                 ;; would silently corrupt clojure.core, so prove it reads back
                 ;; identical before using it.
-                (unless (equal? form (with-input-from-string str read))
+                (unless (equal? form (with-input-from-string (dce-rec-str r) read))
                   (error 'jolt-build
                          "tree-shake: a prelude form does not round-trip through write/read"
                          (if (pair? form) (car form) form)))
-                (loop (cons
-                         (let ((d (dce-def-var-form b)))
-                           (if d
-                               (dce-rec #f (string-append (cadr d) "/" (caddr d)) refs str)
-                               (dce-rec #t #f refs str)))
-                        acc)
-                      (cdr forms))))))))))
+                (loop (cons r acc) (cdr forms))))))))))
 
 ;; A reader fn reached ONLY via runtime (read-string "#my/tag ..") resolves through
 ;; *data-readers* var-deref — invisible to the IR graph. The baked *data-readers* map
@@ -482,18 +575,27 @@
 ;; spliced set for what the binary keeps, so a kept callee's load-time var
 ;; lookups still find every def they name.
 ;; inline-spliced-fqns is host-contract.ss; loaded well before build.ss loads this.
+;; A gated record's refs are not roots here: they go into GATED, ns -> refs,
+;; for dce-reach to add once the namespace is live.
 (define (dce-build-graph records entry-main)
   (let ((edges (make-hashtable string-hash string=?))
+        (gated (make-hashtable string-hash string=?))
         (roots (append (dce-data-reader-roots)
                        (cons entry-main dce-runtime-core-roots))))
     (for-each (lambda (r)
-                (if (dce-rec-keep? r)
-                    (set! roots (append (dce-rec-refs r) roots))
-                    (hashtable-update! edges (dce-rec-fqn r)
-                      (lambda (old) (append (dce-rec-refs r) old))
-                      '())))
+                (cond
+                  ((dce-rec-gate-ns r)
+                   => (lambda (ns)
+                        (hashtable-update! gated ns
+                          (lambda (old) (append (dce-rec-refs r) old)) '())))
+                  ((dce-rec-keep? r)
+                   (set! roots (append (dce-rec-refs r) roots)))
+                  (else
+                   (hashtable-update! edges (dce-rec-fqn r)
+                     (lambda (old) (append (dce-rec-refs r) old))
+                     '()))))
               records)
-    (values edges roots (inline-spliced-fqns))))
+    (values edges roots (inline-spliced-fqns) gated)))
 
 ;; Closure of roots over edges -> a reached set (hashtable fqn -> #t). The append
 ;; copies only the visited node's OWN edge list and shares (cdr work) — append
@@ -511,8 +613,40 @@
                      (dfs (append (or (hashtable-ref edges fq #f) '()) (cdr work))))))))
     reached))
 
+;; The reach with namespace gating: a namespace with gated forms is live when
+;; an "ns:NS" ref is reached (a require names it) or a def in it is, and then
+;; its gated refs are roots too -- to a fixpoint, since they reach further. A
+;; live namespace is recorded in the answer as its "ns:NS" key, which is what
+;; dce-rec-reached? reads for a gated record.
+(define (dce-fqn-ns fqn)
+  (let loop ((i 0))
+    (cond ((fx= i (string-length fqn)) #f)
+          ((char=? (string-ref fqn i) #\/) (substring fqn 0 i))
+          (else (loop (fx+ i 1))))))
+(define (dce-ns-ref-ns k)
+  (and (fx> (string-length k) 3) (string=? (substring k 0 3) "ns:") (substring k 3 (string-length k))))
+(define (dce-reach edges roots gated)
+  (let loop ((roots roots) (live '()))
+    (let* ((reached (dce-reachable edges roots))
+           (new (fold-left
+                  (lambda (acc k)
+                    (let ((ns (or (dce-ns-ref-ns k) (dce-fqn-ns k))))
+                      (if (and ns (hashtable-contains? gated ns)
+                               (not (member ns live)) (not (member ns acc)))
+                          (cons ns acc)
+                          acc)))
+                  '() (vector->list (hashtable-keys reached)))))
+      (if (null? new)
+          (begin
+            (for-each (lambda (ns) (hashtable-set! reached (dce-ns-ref ns) #t)) live)
+            reached)
+          (loop (fold-left (lambda (rs ns) (append (hashtable-ref gated ns '()) rs)) roots new)
+                (append new live))))))
+
 (define (dce-rec-reached? r reached)
-  (or (dce-rec-keep? r) (hashtable-ref reached (dce-rec-fqn r) #f)))
+  (cond ((dce-rec-gate-ns r) => (lambda (ns) (hashtable-ref reached (dce-ns-ref ns) #f)))
+        ((dce-rec-keep? r) #t)
+        (else (hashtable-ref reached (dce-rec-fqn r) #f))))
 
 ;; Scan the KEPT records: does any resolve a var at runtime (bail), and does any need
 ;; the compiler? Returns (values bail? bail-why bail-hint needs-compiler?). bail-why
@@ -617,14 +751,14 @@
           (map (lambda (r) (and (dce-rec-init-runs? r) (dce-rec-fqn r))) records)))
 (define (dce-needs-compiler? core-records app-records entry-main allow)
   (let ((all (append core-records app-records)))
-    (let-values (((edges roots spliced) (dce-build-graph all entry-main)))
+    (let-values (((edges roots spliced gated) (dce-build-graph all entry-main)))
       ;; Nothing is pruned in this build, so every app def whose init RUNS at
       ;; load is a root, not only what -main reaches: an unreferenced
       ;; (def x (eval ...)) needs the compiler as surely as -main calling it,
       ;; and rooted at -main alone the binary booted from petite and died in
       ;; that def's init. A defn only binds (dce-def-init-runs?), so a library
       ;; that DEFINES an eval-calling fn nobody reaches drops it still.
-      (let ((reached (dce-reachable edges (append (dce-app-init-roots app-records) roots))))
+      (let ((reached (dce-reach edges (append (dce-app-init-roots app-records) roots) gated)))
         (let-values (((bail why hint needs-compiler compile-why) (dce-bail-scan all reached allow)))
           (or bail needs-compiler))))))
 
@@ -637,14 +771,14 @@
 ;; deps.edn key that would allow every def it named, so the path from
 ;; "skipped" to "kept" is one paste.
 (define (dce-shake core-records app-records entry-main allow)
-  (let-values (((edges roots spliced)
+  (let-values (((edges roots spliced gated)
                 (dce-build-graph (append core-records app-records) entry-main)))
-    (let* ((reached (dce-reachable edges roots))
+    (let* ((reached (dce-reach edges roots gated))
            ;; what the binary keeps: the reachable code, plus the spliced
            ;; callees kept for frame identity closed over what they reference
            (kept (if (null? spliced)
                      reached
-                     (dce-reachable edges (append spliced roots)))))
+                     (dce-reach edges (append spliced roots) gated))))
       (let-values (((bail why hint needs-compiler compile-why)
                     (dce-bail-scan (append core-records app-records) reached allow)))
         (let ((drop-compiler? (and (not bail) (not needs-compiler))))

@@ -609,7 +609,7 @@ lazyretain: testbin
 # a GC live baseline measured after a collection rather than over the boot's
 # garbage.
 footprint: testbin
-	@sh test/chez/footprint-test.sh target/release/jolt
+	@sh test/chez/footprint-test.sh target/release/jolt "$(CHEZ)"
 
 # The nursery follows the collector's time share, bounded by the live set
 # (rt.ss jolt-install-gc-policy!): a churning program grows it past the 16MB floor
