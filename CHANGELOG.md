@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Arithmetic that mixes a Float with a double is about 1.6x faster. It was
   dispatched twice, through the variadic `+` and then a second time after
   unboxing.
+- A timed `poll` or `offer` on `LinkedBlockingQueue` and `ArrayBlockingQueue`
+  that can complete at once costs the same as the untimed one (#1303). It
+  built the whole interruptible wait first, which made a timed poll on a
+  queue with data in it 1.4x slower on macOS and 4.9x on aarch64 Termux.
+  `take` and `put` get the same fast path.
 
 ### Fixed
 

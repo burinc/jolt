@@ -3414,24 +3414,45 @@
     (vector-set! st 4 (fx- (vector-ref st 4) 1))
     (jolt-cv-wake! (vector-ref st 2))
     v))
-;; blocking take/put; deadline #f waits forever. take answers (v . #t) so a #f
-;; ELEMENT stays distinct from a timeout's #f.
-(define (abq-take-wait self deadline)
+;; blocking take/put; timeout is the (n unit) argument list, or #f to wait
+;; forever. take answers (v . #t) so a #f ELEMENT stays distinct from a timeout's
+;; #f.
+;;
+;; Each first tries the op outright, and only builds the wait (deadline, ibox,
+;; handler, interrupt registration) when that fails: a timed poll on a queue with
+;; data in it was paying all of that to run decide once, 1.5-5x an untimed poll
+;; (#1303). The JDK makes the same split — lockInterruptibly, then the count
+;; check, then the wait. Its lockInterruptibly throws on a set flag even when an
+;; element is ready, so the fast path stands aside for a set flag and the wait,
+;; which checks the flag first, throws and clears it.
+(define (abq-take-now st)
+  (and (not (unbox (current-interrupt-box)))
+       (jolt-with-mutex (vector-ref st 1)
+         (and (fx>? (vector-ref st 4) 0) (cons (abq-deq! st) #t)))))
+(define (abq-put-now st v)
+  (and (not (unbox (current-interrupt-box)))
+       (jolt-with-mutex (vector-ref st 1)
+         (and (fx<? (vector-ref st 4) (vector-ref st 0)) (begin (abq-enq! st v) #t)))))
+(define (abq-take-wait self timeout)
   (let ((st (jhost-state self)))
-    (jolt-cv-wait-interruptibly "BlockingQueue.take"
-                                (vector-ref st 1) (vector-ref st 2) deadline
-      (lambda (timed-out?)
-        (cond ((fx>? (vector-ref st 4) 0) (cons (abq-deq! st) #t))
-              (timed-out? #f)
-              (else jolt-cv-again))))))
-(define (abq-put-wait self v deadline)
+    (or (abq-take-now st)
+        (jolt-cv-wait-interruptibly "BlockingQueue.take"
+                                    (vector-ref st 1) (vector-ref st 2)
+                                    (and timeout (ms->deadline-millis (tu-args->ms timeout)))
+          (lambda (timed-out?)
+            (cond ((fx>? (vector-ref st 4) 0) (cons (abq-deq! st) #t))
+                  (timed-out? #f)
+                  (else jolt-cv-again)))))))
+(define (abq-put-wait self v timeout)
   (let ((st (jhost-state self)))
-    (jolt-cv-wait-interruptibly "BlockingQueue.put"
-                                (vector-ref st 1) (vector-ref st 2) deadline
-      (lambda (timed-out?)
-        (cond ((fx<? (vector-ref st 4) (vector-ref st 0)) (abq-enq! st v) #t)
-              (timed-out? #f)
-              (else jolt-cv-again))))))
+    (or (abq-put-now st v)
+        (jolt-cv-wait-interruptibly "BlockingQueue.put"
+                                    (vector-ref st 1) (vector-ref st 2)
+                                    (and timeout (ms->deadline-millis (tu-args->ms timeout)))
+          (lambda (timed-out?)
+            (cond ((fx<? (vector-ref st 4) (vector-ref st 0)) (abq-enq! st v) #t)
+                  (timed-out? #f)
+                  (else jolt-cv-again)))))))
 (for-each (lambda (nm) (register-class-ctor! nm
             ;; (cap) / (cap fair) — fairness is accepted and ignored
             (lambda (cap . _) (make-abq (jnum->exact cap)))))
@@ -3463,7 +3484,7 @@
                   (if (fx<? (vector-ref st 4) (vector-ref st 0))
                       (begin (abq-enq! st v) #t)
                       #f)))
-              (abq-put-wait self v (ms->deadline-millis (tu-args->ms args))))))
+              (abq-put-wait self v args))))
         (cons "put" (lambda (self v) (abq-put-wait self v #f) jolt-nil))
         (cons "take" (lambda (self) (car (abq-take-wait self #f))))
         (cons "poll" (lambda (self . args)
@@ -3471,7 +3492,7 @@
               (let ((st (jhost-state self)))
                 (jolt-with-mutex (vector-ref st 1)
                   (if (fx>? (vector-ref st 4) 0) (abq-deq! st) jolt-nil)))
-              (let ((r (abq-take-wait self (ms->deadline-millis (tu-args->ms args)))))
+              (let ((r (abq-take-wait self args)))
                 (if r (car r) jolt-nil)))))
         (cons "peek" (lambda (self)
           (let ((st (jhost-state self)))
