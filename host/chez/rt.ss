@@ -413,6 +413,11 @@
     ;; maximum heap" for `java -Xmx1m`), so say so plainly and name a floor.
     ;; Deliberately NOT worded "out of memory": this is a configuration error,
     ;; and host-faults.ss would otherwise classify it as OutOfMemoryError.
+    ;; No collection has run yet, so the heap still holds the boot's garbage
+    ;; (163MB against 62MB live): collect before refusing, or a 150m ceiling --
+    ;; and the default one in a 512MB container -- reads as under the runtime.
+    (when (and ceiling (<= ceiling (sa-bytes-allocated)))
+      (sa-gc-collect))
     (when (and ceiling (<= ceiling (sa-bytes-allocated)))
       (error 'jolt
              (string-append
@@ -430,11 +435,20 @@
     ;; before 0.8.5, with a fixed nursery — so the ceiling is forgotten rather
     ;; than reported, keeping Runtime.maxMemory honest.
     (let ((soft (and ceiling (exact (floor (* ceiling 3/4))))))
+      ;; a placeholder until the first collection measures it (below)
       (set! gc-live-after-full (sa-bytes-allocated))
       (set! gc-log? (jolt-env-flag? "JOLT_GC_LOG"))
       (jolt-gc-stall-setup!)
       (unless (sa-gc-install-after-collect!
                 (lambda (collect-full!)
+                  ;; The live baseline the nursery bound and the old-generation
+                  ;; growth limit are sized from. Read before any collection it
+                  ;; counted the boot's garbage (155MB for 62MB live) and both
+                  ;; ran 2.5x loose until a full collection replaced it; after
+                  ;; this collection's young pass, it is what survived.
+                  (unless gc-live-measured?
+                    (set! gc-live-measured? #t)
+                    (set! gc-live-after-full (sa-bytes-allocated)))
                   (set! gc-full-this-time #f)
                   (set! gc-full-ms-this-time 0)
                   (gc-collect-old-when-grown! collect-full!)
@@ -770,6 +784,7 @@
 ;; the allowance grows by half, up to 8x live, and below a quarter of it shrinks
 ;; back toward 2x. A program with little churn keeps the tight bound.
 (define gc-live-after-full 0)
+(define gc-live-measured? #f)
 (define gc-full-this-time #f)
 (define gc-full-ms-this-time 0)
 (define gc-old-factor 2.0)
