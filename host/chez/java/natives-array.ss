@@ -1011,12 +1011,16 @@
 ;; element values ((line-seq (io/reader (.getBytes "a\nb"))) was ("971098")).
 ;; Every other array kind goes to jolt-io-reader, whose byte[] arm decodes it and
 ;; which refuses the rest the way the JVM does.
+;; A char[] is characters already, so :encoding has nothing to decode -- but the
+;; options are still checked, as io/reader checks them for any source.
 (def-var! "clojure.java.io" "reader"
-  (lambda (x)
+  (lambda (x . opts)
     (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
-        (host-new "StringReader"
-                  (apply string-append (map jolt-str-render-one (seq->list (jolt-seq x)))))
-        (jolt-io-reader x))))
+        (begin
+          (io-opts-check! opts)
+          (host-new "StringReader"
+                    (apply string-append (map jolt-str-render-one (seq->list (jolt-seq x))))))
+        (apply jolt-io-reader x opts))))
 
 ;; --- bind into clojure.core -------------------------------------------------
 (for-each (lambda (p) (def-var! "clojure.core" (car p) (cdr p)))

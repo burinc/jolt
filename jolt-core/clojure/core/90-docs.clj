@@ -2681,6 +2681,54 @@
   "Reads one object from the string s. Returns nil when s is nil or empty.\n\n  Reads data in the edn format (subset of Clojure data):\n  http://edn-format.org\n\n  opts is a map as per clojure.edn/read"
   '([s] [opts s])
   nil)
+(attach-core-doc-meta! "clojure.java.io" "as-file"
+  "Coerce argument to a file."
+  '([x])
+  'java.io.File)
+(attach-core-doc-meta! "clojure.java.io" "as-relative-path"
+  "Take an as-file-able thing and return a string if it is\n   a relative path, else IllegalArgumentException."
+  '([x])
+  (jolt.host/jolt-class-for "java.lang.String"))
+(attach-core-doc-meta! "clojure.java.io" "as-url"
+  "Coerce argument to a URL."
+  '([x])
+  'java.net.URL)
+(attach-core-doc-meta! "clojure.java.io" "copy"
+  "Copies input to output.  Returns nil or throws IOException.\n  Input may be an InputStream, Reader, File, byte[], char[], or String.\n  Output may be an OutputStream, Writer, or File.\n\n  Options are key/value pairs and may be one of\n\n    :buffer-size  buffer size to use, default is 1024.\n    :encoding     encoding to use if converting between\n                  byte and char streams.   \n\n  Does not close any streams except those it opens itself \n  (on a File)."
+  '([input output & opts])
+  nil)
+(attach-core-doc-meta! "clojure.java.io" "delete-file"
+  "Delete file f. If silently is nil or false, raise an exception on failure, else return the value of silently."
+  '([f & [silently]])
+  nil)
+(attach-core-doc-meta! "clojure.java.io" "file"
+  "Returns a java.io.File, passing each arg to as-file.  Multiple-arg\n   versions treat the first argument as parent and subsequent args as\n   children relative to the parent."
+  '([arg] [parent child] [parent child & more])
+  (jolt.host/jolt-class-for "java.io.File"))
+(attach-core-doc-meta! "clojure.java.io" "input-stream"
+  "Attempts to coerce its argument into an open java.io.InputStream.\n   Default implementations always return a java.io.BufferedInputStream.\n\n   Default implementations are defined for InputStream, File, URI, URL,\n   Socket, byte array, and String arguments.\n\n   If the argument is a String, it tries to resolve it first as a URI, then\n   as a local file name.  URIs with a 'file' protocol are converted to\n   local file names.\n\n   Should be used inside with-open to ensure the InputStream is properly\n   closed."
+  '([x & opts])
+  (jolt.host/jolt-class-for "java.io.InputStream"))
+(attach-core-doc-meta! "clojure.java.io" "make-parents"
+  "Given the same arg(s) as for file, creates all parent directories of\n   the file they represent."
+  '([f & more])
+  nil)
+(attach-core-doc-meta! "clojure.java.io" "output-stream"
+  "Attempts to coerce its argument into an open java.io.OutputStream.\n   Default implementations always return a java.io.BufferedOutputStream.\n\n   Default implementations are defined for OutputStream, File, URI, URL,\n   Socket, and String arguments.\n\n   If the argument is a String, it tries to resolve it first as a URI, then\n   as a local file name.  URIs with a 'file' protocol are converted to\n   local file names.\n\n   Should be used inside with-open to ensure the OutputStream is\n   properly closed."
+  '([x & opts])
+  (jolt.host/jolt-class-for "java.io.OutputStream"))
+(attach-core-doc-meta! "clojure.java.io" "reader"
+  "Attempts to coerce its argument into an open java.io.Reader.\n   Default implementations always return a java.io.BufferedReader.\n\n   Default implementations are provided for Reader, BufferedReader,\n   InputStream, File, URI, URL, Socket, byte arrays, character arrays,\n   and String.\n\n   If argument is a String, it tries to resolve it first as a URI, then\n   as a local file name.  URIs with a 'file' protocol are converted to\n   local file names.\n\n   Should be used inside with-open to ensure the Reader is properly\n   closed."
+  '([x & opts])
+  (jolt.host/jolt-class-for "java.io.Reader"))
+(attach-core-doc-meta! "clojure.java.io" "resource"
+  "Returns the URL for a named resource. Use the context class loader\n   if no loader is specified."
+  '([n] [n loader])
+  (jolt.host/jolt-class-for "java.net.URL"))
+(attach-core-doc-meta! "clojure.java.io" "writer"
+  "Attempts to coerce its argument into an open java.io.Writer.\n   Default implementations always return a java.io.BufferedWriter.\n\n   Default implementations are provided for Writer, BufferedWriter,\n   OutputStream, File, URI, URL, Socket, and String.\n\n   If the argument is a String, it tries to resolve it first as a URI, then\n   as a local file name.  URIs with a 'file' protocol are converted to\n   local file names.\n\n   Should be used inside with-open to ensure the Writer is properly\n   closed."
+  '([x & opts])
+  (jolt.host/jolt-class-for "java.io.Writer"))
 (attach-core-doc-meta! "clojure.pprint" "*print-base*"
   "The base to use for printing integers and rationals."
   nil

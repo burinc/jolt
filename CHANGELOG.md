@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fibers are parked elsewhere. Images are written as format 11; older images
   still restore.
 
+### Fixed
+
+- **`clojure.java.io/writer`, `reader` and `input-stream` take Clojure's
+  options.** They accepted one argument, so `(io/writer f :append true)` and
+  `(io/reader f :encoding "ISO-8859-1")` were an `ArityException`, and there
+  was no way to open a writer that appends. `:append` and `:encoding` now work
+  on files, paths and URLs, `slurp` and `spit` honour `:encoding`, and a key
+  without a value is the `IllegalArgumentException` Clojure raises. A file
+  writer now truncates when it is opened and writes through a real port
+  instead of rewriting the whole file at every flush. The four openers carry
+  Clojure's docstrings and arglists (#1316).
+- **Charsets other than UTF-8 are honoured by the reader and writer
+  constructors.** `InputStreamReader`, `OutputStreamWriter`, `FileReader` and
+  `FileWriter` accepted a charset and used UTF-8 anyway, and a `Charset`
+  passed to `FileWriter` was read as the append flag. ISO-8859-1 and US-ASCII
+  now write `?` for a character they cannot hold, and US-ASCII decodes a byte
+  past 127 as U+FFFD, where `€` used to encode as byte 0xAC.
+
 ## [0.8.21] - 2026-10-11
 
 jolt and the binaries it builds hold about half the memory they did: `jolt -e`

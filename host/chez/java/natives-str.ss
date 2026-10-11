@@ -665,10 +665,16 @@
     (let ((cs (charset-canonical-down name)))
       (cond
         ((string=? cs "utf-8") (string->utf8 s))
+        ;; one byte per char, and a char the charset cannot hold is the JVM
+        ;; encoder's replacement byte, `?`. Masking the code point to its low
+        ;; byte wrote some other character: (.getBytes "€" "ISO-8859-1") was
+        ;; [-84], the low byte of U+20AC, where the JVM answers [63].
         ((member cs '("iso-8859-1" "us-ascii"))
-         (let* ((n (string-length s)) (bv (make-bytevector n)))
+         (let* ((n (string-length s)) (bv (make-bytevector n))
+                (top (if (string=? cs "us-ascii") 127 255)))
            (do ((i 0 (+ i 1))) ((= i n) bv)
-             (bytevector-u8-set! bv i (bitwise-and (char->integer (string-ref s i)) #xff)))))
+             (let ((c (char->integer (string-ref s i))))
+               (bytevector-u8-set! bv i (if (fx<=? c top) c 63))))))
         ((string=? cs "utf-16be") (string->utf16 s (endianness big)))
         ((string=? cs "utf-16le") (string->utf16 s (endianness little)))
         ((string=? cs "utf-16")
