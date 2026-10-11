@@ -9,7 +9,7 @@
 ;; and this is the one row where jolt wins on ALGORITHM rather than constants.
 ;;
 ;; Portable Clojure (jolt + JVM Clojure).
-;;   bench/run.sh vecops 60000
+;;   bench/run.sh vecops 600000
 (ns vecops)
 
 ;; pairwise concat: fold k chunk-vectors into one. Linear in total elements per
@@ -50,7 +50,7 @@
        (split-rejoin (vec (range (quot n 4))) 48))))
 
 (defn -main [& args]
-  (let [n (if (seq args) (Integer/parseInt (first args)) 60000)]
+  (let [n (if (seq args) (Integer/parseInt (first args)) 600000)]
     (dotimes [_ 2] (run (quot n 4)))                     ; warmup
     (let [runs 3
           times (mapv (fn [_]
