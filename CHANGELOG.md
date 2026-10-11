@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Waking a condition nobody waits on no longer takes a process-wide lock.**
+  Every enqueue and dequeue on a blocking queue, and every future, promise or
+  latch that settles, looked for parked fibers in a global table under one
+  mutex, whether or not any fiber was parked. A wake now reads a count first
+  and skips the table when no fiber is parked on any condition. An `offer` and
+  `poll` pair on a `LinkedBlockingQueue` went from 180 ns to 105 ns on macOS.
+
 ## [0.8.21] - 2026-10-11
 
 jolt and the binaries it builds hold about half the memory they did: `jolt -e`

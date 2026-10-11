@@ -331,5 +331,47 @@
 (ok "8a. the wait answered at its deadline" (eq? (jolt-fiber-result t8) 'timed-out))
 (ok "8b. and left no deadline pending" (= base-timers (pending-timers)))
 
+;; --- 9. a wake with no parked fiber skips the waiter table (#1311) ----------------
+;; jolt-cv-wake! reads a count of registered conditions before taking the table
+;; lock. The fast path must not lose a real waiter, the count must drain back to
+;; zero once the waiter is resumed, and a wake with nothing registered must not
+;; touch jolt-cv-waiters-mu at all — shown here by holding that lock on another
+;; thread while the wake runs.
+(printf "\n== 9. waking a condition with no parked fiber ==\n")
+(define t9-mu (make-mutex))
+(define t9-cv (make-condition))
+(define t9-ready? #f)
+(define t9
+  (sa-fiber-spawn
+    (lambda ()
+      (jolt-cv-wait t9-mu t9-cv #f
+        (lambda (_) (if t9-ready? 'woken jolt-cv-again))))))
+(wait-until (lambda () (eq? (jolt-fiber-state t9) 'parked)) 15.0 "9. fiber parked on the condition")
+(ok "9a. a parked fiber counts" (fx>? jolt-cv-waiter-count 0))
+(jolt-with-mutex t9-mu (set! t9-ready? #t) (jolt-cv-wake! t9-cv))
+(wait-until (lambda () (eq? (jolt-fiber-state t9) 'done)) 15.0 "9. parked fiber resumed")
+(ok "9b. the wake reached the parked fiber" (eq? (jolt-fiber-result t9) 'woken))
+(ok "9c. and the count drained" (fx=? 0 jolt-cv-waiter-count))
+(define t9-held (make-mutex))
+(define t9-hold-cv (make-condition))
+(define t9-state 'starting)
+(fork-thread
+  (lambda ()
+    (mutex-acquire jolt-cv-waiters-mu)
+    (with-mutex t9-held
+      (set! t9-state 'holding)
+      (condition-broadcast t9-hold-cv)
+      (let loop () (unless (eq? t9-state 'release) (condition-wait t9-hold-cv t9-held) (loop))))
+    (mutex-release jolt-cv-waiters-mu)))
+(with-mutex t9-held
+  (let loop () (unless (eq? t9-state 'holding) (condition-wait t9-hold-cv t9-held) (loop))))
+(define t9-woke? #f)
+(fork-thread
+  (lambda () (jolt-with-mutex t9-mu (jolt-cv-wake! t9-cv)) (set! t9-woke? #t)))
+(define t9-deadline (+ (mono-millis) 2000))
+(let loop () (unless (or t9-woke? (> (mono-millis) t9-deadline)) (sleep (make-time 'time-duration 1000000 0)) (loop)))
+(ok "9d. a wake with no fiber waiting did not wait for the table lock" t9-woke?)
+(with-mutex t9-held (set! t9-state 'release) (condition-broadcast t9-hold-cv))
+
 (printf "\nfibers-io: ~a checks, ~a failures\n" total fails)
 (exit (if (zero? fails) 0 1))

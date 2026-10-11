@@ -491,18 +491,34 @@
 (define jolt-cv-waiters (make-weak-eq-hashtable))   ; condition -> parked fibers
 (define jolt-cv-waiters-mu (make-mutex))
 
+;; How many conditions have a fiber registered, written only under
+;; jolt-cv-waiters-mu and read WITHOUT it by jolt-cv-wake!, so a wake when no fiber
+;; is parked on any condition skips the table lock and lookup (#1311). The unlocked
+;; read is sound because a registration and the wake that must see it are ordered
+;; by the condition's own mu: jolt-cv-register! runs inside decide, under mu, and
+;; jolt-cv-wake! is called with that same mu held, so the waker's acquire of mu
+;; follows the registrant's release of it and sees the store. A count that is stale
+;; in the other direction — a condition collected out of the weak table before it
+;; was drained — only sends a wake through the slow path, which answers '().
+(define jolt-cv-waiter-count 0)
+
 (define (jolt-cv-register! cv f)
   (jolt-with-mutex jolt-cv-waiters-mu
     (hashtable-set! jolt-cv-waiters cv
-                    (cons f (hashtable-ref jolt-cv-waiters cv '())))))
+                    (cons f (hashtable-ref jolt-cv-waiters cv '())))
+    (set! jolt-cv-waiter-count (hashtable-size jolt-cv-waiters))))
 
 ;; Drained as it is read, so a fiber that goes on to wait again registers itself
 ;; afresh and no resume is ever delivered twice.
 (define (jolt-cv-take-waiters! cv)
-  (jolt-with-mutex jolt-cv-waiters-mu
-    (let ((fs (hashtable-ref jolt-cv-waiters cv '())))
-      (unless (null? fs) (hashtable-delete! jolt-cv-waiters cv))
-      fs)))
+  (if (fx=? 0 jolt-cv-waiter-count)
+      '()
+      (jolt-with-mutex jolt-cv-waiters-mu
+        (let ((fs (hashtable-ref jolt-cv-waiters cv '())))
+          (unless (null? fs)
+            (hashtable-delete! jolt-cv-waiters cv)
+            (set! jolt-cv-waiter-count (hashtable-size jolt-cv-waiters)))
+          fs))))
 
 ;; (jolt-cv-wake! cv) — call with mu HELD, after changing the state decide reads.
 ;; The replacement for a bare condition-broadcast on any condition a fiber can wait
