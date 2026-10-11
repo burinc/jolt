@@ -730,7 +730,13 @@
 ;; weak table would keep every interned string alive through that value. Lookup
 ;; is unlocked and the insert re-checks under the lock, the double-check the
 ;; symbol-string pool (values.ss) uses for the same reason.
-(define jolt-str-intern-pool (make-ephemeron-hashtable string-hash string=?))
+;;
+;; Once an interned string is collected its entry's key reads #!bwp, and a later
+;; lookup or resize hands that to the table's procedures, so both take any key:
+;; the bare string=? threw on the first intern to land in such a bucket.
+(define (str-intern-hash s) (if (string? s) (string-hash s) 0))
+(define (str-intern=? a b) (and (string? a) (string? b) (string=? a b)))
+(define jolt-str-intern-pool (make-ephemeron-hashtable str-intern-hash str-intern=?))
 (define jolt-str-intern-mu (make-mutex))
 (define (jolt-str-intern s)
   (or (hashtable-ref jolt-str-intern-pool s #f)

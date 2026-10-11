@@ -1705,6 +1705,7 @@
   {:suite "interop / String methods" :label "dot-form" :expected "\"hi\"" :actual "(. \"HI\" toLowerCase)" :portability :jvm}
   {:suite "interop / String methods" :label ".trim" :expected "\"x\"" :actual "(.trim \"  x  \")" :portability :jvm}
   {:suite "interop / String methods" :label ".intern answers one object per content" :expected "[false true true true]" :actual "(let [a (str \"in\" \"tern\") b (str \"int\" \"ern\")] [(identical? a b) (identical? (.intern a) (.intern b)) (= \"intern\" (.intern a)) (identical? (.intern a) (.intern (.intern b)))])" :portability :jvm}
+  {:suite "interop / String methods" :label ".intern after interned strings were collected" :expected "[true \"gc-3-1999\"]" :actual "(do (dotimes [r 4] (dotimes [i 2000] (.intern (str \"gc-\" r \"-\" i))) (System/gc)) [(identical? (.intern (str \"gc-\" 0 \"-\" 7)) (.intern (str \"gc-0\" \"-7\"))) (.intern (str \"gc-3-\" 1999))])"}
   {:suite "interop / String methods" :label ".length" :expected "3" :actual "(.length \"abc\")" :portability :jvm}
   {:suite "interop / String methods" :label ".isEmpty" :expected "[true false]" :actual "[(.isEmpty \"\") (.isEmpty \"a\")]" :portability :jvm}
   {:suite "interop / String methods" :label ".indexOf hit" :expected "1" :actual "(.indexOf \"abc\" \"b\")" :portability :jvm}
