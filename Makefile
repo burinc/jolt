@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   hasheq narrowhash \
   protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
@@ -1353,6 +1353,12 @@ hostarity:
 # loads made each foreign miss (and inspect/object) a 2 ms walk.
 foreignhandles:
 	@$(CHEZ) --script test/chez/foreign-handles-test.ss
+
+# A host-object method call site caches what the host-type arm resolved: a
+# cached call answers what dispatch does, sees arms and methods registered
+# after it, and allocates nothing of its own.
+hostsite:
+	@$(CHEZ) --script test/chez/jhost-method-site-test.ss
 
 # An unhinted method call allocates its argument vector and at most one arg
 # list: no arm converts the rest args before testing the receiver.

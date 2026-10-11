@@ -3723,6 +3723,18 @@
 ;; (.method target arg*) as a Scheme form. A node carrying :sited-target /
 ;; :sited-args (the tail-site emission in emit*) uses those already-bound temps
 ;; instead of emitting the receiver and args itself.
+;; A call on an unproven receiver with up to three arguments and a plain name
+;; goes through a per-site cache (host-static.ss jolt-host-site-callN): a host
+;; object's method is then one tag test away, with no argument vector, and any
+;; other receiver takes record-method-dispatch as before. Needs the def's
+;; constant pool for the site's box, as the field-read site does.
+(defn- host-site-emit [t m args]
+  (when (and (<= (count args) 3) (not (str/starts-with? m "-"))
+             *const-pool* (var-cache?))
+    (str "(jolt-host-site-call" (count args) " " (hoist-const-per-site "(jolt-host-site-make)")
+         " " t " " (chez-str-lit m)
+         (apply str (map #(str " " %) args)) ")")))
+
 (defn- host-call-emit [node]
   (let [m (:method node)
         chez? (not= :gambit (target))
@@ -3764,8 +3776,9 @@
             as (mapv (fn [_] (fresh-label "_ha$")) args)
             sd (string-direct-emit m (count as) tt as)
             kd (keyword-direct-emit m (count as) tt as)
-            generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
-                         " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
+            generic (or (host-site-emit tt m as)
+                        (str "(record-method-dispatch " tt " " (chez-str-lit m)
+                             " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))"))]
         (if (or sd kd)
           (str "(let* ((" tt " " t ")"
                (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
@@ -3773,8 +3786,9 @@
                (when sd (str " ((string? " tt ") " sd ")"))
                (when kd (str " ((keyword-t? " tt ") " kd ")"))
                " (else " generic ")))")
-          (str "(record-method-dispatch " t " " (chez-str-lit m)
-               " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+          (or (host-site-emit t m args)
+              (str "(record-method-dispatch " t " " (chez-str-lit m)
+                   " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
       :else
       (str "(record-method-dispatch " t " " (chez-str-lit m)
            " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
