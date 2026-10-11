@@ -91,6 +91,34 @@
       (check-eq "write(byte[]) is binary-safe"
                 [n (mapv #(bit-and % 0xff) (take n buf))] [2 [0 255]]))))
 
+;; a write larger than the socket buffers, from an offset into the array: every
+;; byte arrives, in order, and only the [off, off+len) range. The peer reads on
+;; another thread, since the send blocks until it does.
+(with-pair
+  (fn [server client conn]
+    (let [n    (* 4 1024 1024)
+          data (byte-array n)
+          _    (dotimes [i n] (aset data i (unchecked-byte (mod i 251))))
+          off  3
+          len  (- n 10)
+          got  (future
+                 (let [in  (.getInputStream conn)
+                       out (java.io.ByteArrayOutputStream.)
+                       buf (byte-array 65536)]
+                   (loop []
+                     (let [r (.read in buf)]
+                       (when (pos? r)
+                         (.write out buf 0 r)
+                         (recur))))
+                   (.toByteArray out)))]
+      (.write (.getOutputStream client) data off len)
+      (.shutdownOutput client)
+      (let [b @got]
+        (check-eq "large write from an offset: length" (alength b) len)
+        (check-eq "large write from an offset: bytes"
+                  (java.util.Arrays/equals b (java.util.Arrays/copyOfRange data off (+ off len)))
+                  true)))))
+
 ;; read into an offset
 (with-pair
   (fn [server client conn]
