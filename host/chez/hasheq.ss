@@ -848,8 +848,6 @@
            (pset-hasheq-set! x h)
            h)))
     ((procedure? x) (procedure-hasheq x))   ; direct fallback callers too
-    ;; a reify's own hasheq / hashCode wins over identity, as a deftype's does
-    ((reify-declared-hash x) => (lambda (m) (call-declared-hash m x)))
     ;; every earlier route and both arm registries have already passed on x
     ((and (record? x) (not (eq-arm-claims? x))) (jolt-identity-hasheq x))
     ;; equal-hash can exceed the 32-bit hasheq range (a bare procedure's was
@@ -865,8 +863,6 @@
         ((and (flonum? v) (finite? v)) (i32 (exact (truncate v))))
         (else v)))
 (define (call-declared-hash m x) (declared-hash-int (jolt-invoke m x)))
-(define (reify-declared-hash x)
-  (and (jreify? x) (or (reify-method-ref x "hasheq") (reify-method-ref x "hashCode"))))
 
 ;; A record no eq arm claims is = only to itself (jolt=2-base ends in eq?), so it
 ;; is Object.hashCode on the JVM: identity. Chez's equal-hash answers ONE constant
