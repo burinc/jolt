@@ -1072,10 +1072,13 @@
                 ;; the container's placement cannot travel. A deftype with a
                 ;; declared hashCode rekeys too — over-approximate, harmless.
                 ;; So does any other record with identity equality (an atom, a
-                ;; reify, ...: hasheq.ss jolt-identity-hashed?).
+                ;; reify, ...: hasheq.ss jolt-identity-hashed?). Write side
+                ;; only: the read side walks image records and legacy layouts
+                ;; the eq arms were never meant to see, and the rekey verdict
+                ;; was already written.
                 (when (or (procedure? x)
                           (and (jrec? x) (not (jrec-record? x)))
-                          (jolt-identity-hashed? x))
+                          (and (not restore?) (jolt-identity-hashed? x)))
                   (set! proc-touched #t))
                 (cond
                   ;; scalar leaves can never hold a procedure

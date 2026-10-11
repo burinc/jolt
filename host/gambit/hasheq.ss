@@ -528,6 +528,8 @@
        (fx>= (vector-length x) 1)
        (fixnum? (vector-ref x 0))
        (table-ref jolt-record-id-table (vector-ref x 0) #f)
+       ;; records and deftypes keep the structural hash they reach here with
+       (not (jrec? x))
        (let loop ((as jolt-eq-arms))
          (cond ((null? as) #t)
                (((caar as) x x) #f)
