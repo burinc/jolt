@@ -1214,8 +1214,14 @@
 ;; lk …) and (.lock lk) are DIFFERENT locks on the JVM and stay different here,
 ;; so it gets its own record rather than the object's — but the hard part it needs
 ;; is exactly this (jolt-ga8o). One implementation, two locks.
+;; Both conditions are jolt-cvs, like every condition a value carries: a monitor
+;; travels in an image inside a ReentrantLock, and an image written before format
+;; 11 restores every condition as a jolt-cv. A raw entry condition here came back
+;; from such an image as a jolt-cv and the first contended exit's broadcast raised.
+;; Its fibers are in the fibers slot, not on the cv, so a wake of it only reaches
+;; the blocked threads -- and skips the broadcast when there are none.
 (define (make-monitor)
-  (vector (make-mutex) #f 0 (make-condition) '() #f (jolt-make-cv) '()))
+  (vector (make-mutex) #f 0 (jolt-make-cv) '() #f (jolt-make-cv) '()))
 
 ;; --- the owner word -------------------------------------------------------------
 ;; A thin lock. An uncontended enter is CAS #f -> me and an uncontended exit is
@@ -1488,7 +1494,7 @@
                (let ((fs (vector-ref m monitor-i-fibers)))
                  (monitor-release-word! m)
                  (vector-set! m monitor-i-fibers '())
-                 (condition-broadcast (vector-ref m monitor-i-cv))
+                 (jolt-cv-wake! (vector-ref m monitor-i-cv))
                  fs)
                '()))))
     (for-each sa-fiber-resume wake)))
@@ -1639,7 +1645,7 @@
                (monitor-release-word! m)
                (vector-set! m monitor-i-count 0)
                (vector-set! m monitor-i-fibers '())
-               (condition-broadcast (vector-ref m monitor-i-cv))
+               (jolt-cv-wake! (vector-ref m monitor-i-cv))
                (cons saved fs)))))
     (for-each sa-fiber-resume (cdr r))
     (car r)))

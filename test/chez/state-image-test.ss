@@ -1583,5 +1583,15 @@
 (is "v0.8.21 fixture: a restored agent's await sees its action"
     "(do (send imgcv10/ag inc) (await-for 2000 imgcv10/ag) (deref imgcv10/ag))" "2")
 
+;; A ReentrantLock carries a monitor, and the monitor's entry condition was the
+;; one a format-10 image wrote as 'condition that format 11 did not make a jolt-cv,
+;; so it restored as a jolt-cv where a raw condition was expected and the first
+;; contended unlock raised. Fixture made by v0.8.21 (format 10); permanent.
+(ok "v0.8.21 lock fixture present" (file-exists? "test/chez/fixtures/image-v0.8.21-lock.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.21-lock.image")
+(is "v0.8.21 fixture: a restored ReentrantLock hands over under contention"
+    "(let [lk imglock10/lk] (.lock lk) (let [f (future (.lock lk) (.unlock lk) :got-it)] (Thread/sleep 50) (.unlock lk) (deref f 3000 :hung)))"
+    ":got-it")
+
 (printf "~a/~a state-image assertions passed\n" (- total fails) total)
 (when (> fails 0) (exit 1))
