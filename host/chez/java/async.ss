@@ -876,7 +876,7 @@
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
   (let ((w (ac-make 0 'unbuffered #f)))
-    (jolt-timer-at! (+ (mono-millis) (exact (floor ms)))
+    (jolt-timer-at! (mono-deadline ms)
                     (lambda () (jolt-async-close! w)))
     w))
 

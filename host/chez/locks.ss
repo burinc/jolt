@@ -586,7 +586,7 @@
 (define (jolt-pause-ms ms)
   (if (jolt-current-fiber)
       (let ((mu (make-mutex)) (cv (make-condition)))
-        (jolt-cv-wait mu cv (+ (mono-millis) ms)
+        (jolt-cv-wait mu cv (mono-deadline ms)
           (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
         (void))
       (sleep (ms->duration ms))))

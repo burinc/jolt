@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was read off the wall clock, so stepping the system clock fired a wait early
   or held it for as long as the step. They now use the monotonic clock, as the
   JVM does. `jolt.host/timer-at!` and `jolt.io-poller/wait-ready` take
-  deadlines on that clock; `jolt.io-poller/clock-ms` builds one (#1303).
+  deadlines on that clock; `jolt.io-poller/deadline-ms` builds one (#1303).
 - `String.intern` answers one object per content, so
   `(identical? (.intern a) (.intern b))` holds for equal strings. It returned
   its argument.

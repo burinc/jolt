@@ -726,9 +726,11 @@
 ;;
 ;; The clock wait-ready's deadlines are on, and jolt.host/timer-at!'s: monotonic
 ;; milliseconds (System/nanoTime's clock), so a wall-clock step neither fires a
-;; socket timeout early nor holds it late. A caller builds a deadline as
-;; (+ (clock-ms) timeout-ms).
+;; socket timeout early nor holds it late. A caller builds a deadline with
+;; deadline-ms, which rounds now up: clock-ms truncates, so (+ (clock-ms) ms)
+;; came due up to 1ms before ms had passed.
 (defn clock-ms [] (quot (System/nanoTime) 1000000))
+(defn deadline-ms [timeout-ms] (+ (quot (+ (System/nanoTime) 999999) 1000000) timeout-ms))
 
 ;; (wait-ready fd filt deadline-ms) is the same wait bounded by a deadline on
 ;; clock-ms, answering :timeout when the deadline passed first and nil otherwise

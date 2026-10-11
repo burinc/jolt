@@ -27,7 +27,7 @@
 ;; entries in the shared timer, and a thread's wait is converted from it. One
 ;; clock, so the two cannot drift apart — and the monotonic one, so a wall-clock
 ;; step does not move a deadline.
-(define (ms->deadline-millis ms) (+ (mono-millis) (exact (floor ms))))
+(define (ms->deadline-millis ms) (mono-deadline ms))
 
 ;; --- java.util.concurrent.TimeUnit ------------------------------------------
 ;; A TimeUnit is a scale, so each constant is an object carrying its name and its
@@ -357,7 +357,7 @@
 (define solo-pool-keep-alive-ms 60000)     ; Executors.newCachedThreadPool's 60L, SECONDS
 (define (exit-linger-after-task!)
   (unless (jolt-thread-daemon? (get-thread-id))
-    (let ((until (+ (mono-millis) solo-pool-keep-alive-ms)))
+    (let ((until (mono-deadline solo-pool-keep-alive-ms)))
       (jolt-with-mutex exit-mu
         (unless exit-pools-shut?
           (when (or (not exit-linger-until) (> until exit-linger-until))
@@ -1693,7 +1693,7 @@
 (define (monitor-object-wait! m ms)
   (let* ((me (monitor-self))
          (w (box #f))
-         (deadline (and ms (+ (mono-millis) ms)))
+         (deadline (and ms (mono-deadline ms)))
          (saved #f))
     (define (retake! threw?)
       (monitor-wait-exit! m saved w threw?)
@@ -2946,7 +2946,7 @@
            (executor-worker-exit! st))                     ; shutdown + drained
           ;; above core, or any worker once allowCoreThreadTimeOut is on
           ((and (vector-ref st 8) (or (vector-ref st 19) (fx>? (vector-ref st 4) (vector-ref st 6))))
-           (let ((dl (or deadline (+ (mono-millis) (vector-ref st 8)))))
+           (let ((dl (or deadline (mono-deadline (vector-ref st 8)))))
              (if (>= (mono-millis) dl)
                  (executor-worker-exit! st)                ; idle past keep-alive
                  (begin (executor-idle-wait! st dl)
@@ -3364,7 +3364,7 @@
         (cons "awaitTermination" (lambda (self ms . rest)
           (executor-await-termination
             (jhost-state self)
-            (+ (mono-millis) (tu->ms ms (if (null? rest) #f (car rest)))))))))
+            (mono-deadline (tu->ms ms (if (null? rest) #f (car rest)))))))))
 
 ;; --- ArrayBlockingQueue / FutureTask / ThreadPoolExecutor --------------------
 ;; The construction Grain's SQLite write coordinator does directly:
@@ -3761,7 +3761,7 @@
 ;; catch-up), fixed-delay from the time the run finished.
 (define (sf-advance! sf)
   (let* ((st (jhost-state sf)) (p (vector-ref st 6)))
-    (vector-set! st 5 (if (> p 0) (+ (vector-ref st 5) p) (+ (mono-millis) (- p))))))
+    (vector-set! st 5 (if (> p 0) (+ (vector-ref st 5) p) (mono-deadline (- p))))))
 ;; Run SF on the calling thread: claim it (a cancelled one is skipped, as
 ;; FutureTask.run on a cancelled task does nothing), run, then settle or reset.
 ;; The worker installs the empty binding stack before calling this; the .run
@@ -3801,7 +3801,7 @@
   (when (jolt-nil? task) (throw-jvm (quote NullPointerException) jolt-nil))
   (let* ((st (jhost-state self))
          (thunk (runnable->thunk task))
-         (due (+ (mono-millis) (max 0 (tu->ms delay unit))))
+         (due (mono-deadline (max 0 (tu->ms delay unit))))
          (sf (jolt-with-mutex (vector-ref st 2)
                (and (not (vector-ref st 0))
                     (let ((sf (make-scheduled-future thunk due period-ms (vector-ref st 15) st)))

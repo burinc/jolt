@@ -189,6 +189,21 @@
   (for-each jolt-timer-cancel! (list-head hs 10))
   (ok "8d. and only far is left" (= 1 (pending-count))))
 
+;; --- 9. a deadline is never due early --------------------------------------
+;; mono-millis truncates, so a deadline built off it fell up to 1ms short of the
+;; time asked for, and a wait could end before its timeout (the JDK's never do;
+;; #1305's waitFor gate caught it on bionic). Busy-waiting on the clock takes OS
+;; wake-up latency out, which otherwise hides the shortfall; the elapsed time is
+;; read in nanoseconds on the same monotonic clock.
+(printf "\n== 9. a deadline is never due early ==\n")
+(define (mono-ns) (let ((t (current-time 'time-monotonic))) (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
+(let loop ((i 0) (short 0))
+  (if (= i 50)
+      (ok "9a. no 2ms deadline came due before 2ms had passed" (= short 0))
+      (let* ((t0 (mono-ns)) (d (mono-deadline 2)))
+        (let spin () (when (< (mono-millis) d) (spin)))
+        (loop (+ i 1) (if (< (- (mono-ns) t0) 2000000) (+ short 1) short)))))
+
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
 (printf "async-timer gate: PASS\n")

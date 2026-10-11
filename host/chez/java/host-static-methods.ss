@@ -109,7 +109,7 @@
 ;; honour an interrupt that was already set.
 (define (jolt-thread-sleep-ms ms)
   (let ((ms (exact (floor ms))) (mu (make-mutex)) (cv (make-condition)))
-    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (mono-millis) ms)
+    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (mono-deadline ms)
       (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
     jolt-nil))
 
@@ -311,6 +311,14 @@
 (define (mono-millis)
   (let ((t (current-time 'time-monotonic)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
+;; (mono-deadline ms) — the deadline ms from now, the one way to build one. Now is
+;; rounded UP: a wait ends once (mono-millis), which truncates, reaches the
+;; deadline, so a deadline off the truncated now came due up to 1ms early, and a
+;; timed wait could return before its timeout, which the JDK's never do.
+(define (mono-deadline ms)
+  (let ((t (current-time 'time-monotonic)))
+    (+ (* 1000 (time-second t)) (quotient (+ (time-nanosecond t) 999999) 1000000)
+       (exact (floor ms)))))
 
 ;; clojure.core/current-time-ms — epoch milliseconds.
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
