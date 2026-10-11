@@ -119,7 +119,7 @@
                                          (= argc 2) (str "(jolt-str-split " t " " a0 " " a1 ")")
                                          :else nil)
       (= m "subSequence")          (when (= argc 2) (str "(jolt-str-sub-sequence " t " " a0 " " a1 ")"))
-      (= m "intern")               (when (= argc 0) t)
+      (= m "intern")               (when (= argc 0) (str "(jolt-str-intern " t ")"))
       :else nil)))
 
 ;; Direct emission for (.m target …) whose target is PROVEN a keyword

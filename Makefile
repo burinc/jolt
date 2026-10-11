@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
 TEST-GATES := submodules selfhost ci
@@ -1440,6 +1440,14 @@ winparity:
 # the runtime's own heap bound would otherwise answer first.
 vfaslceiling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
+
+# Equal string constants share one object in a vfasl image (jolt-50zg,
+# chez-patches/0004): compile-file makes every literal its own object, one fasl
+# entry per form, and a hello app's heap held 788 copies of "clojure.core". The
+# patched converter keeps the first string of each content. Checked on a patched
+# kernel (or under JOLT_REQUIRE_LOCKFREE_CHEZ=1); a stock one reports and passes.
+vfaslstrings:
+	@$(CHEZ) --script test/chez/vfasl-shared-strings-test.ss
 
 # The build-side shapes `jolt build`'s back-end cost depends on (#1059): small
 # init procedures, the back end's collect trip, a failed vfasl that says so, and

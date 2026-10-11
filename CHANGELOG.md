@@ -19,9 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Arithmetic that mixes a Float with a double is about 1.6x faster. It was
   dispatched twice, through the variadic `+` and then a second time after
   unboxing.
+- Equal string literals share one object in a built binary's image, as
+  interned literals do on the JVM. Every literal was its own object, so a
+  hello app's runtime held 788 copies of `"clojure.core"`; jolt's own heap is
+  2.9MB smaller after boot and an app's is 0.8-1.6MB smaller. Needs a Chez
+  kernel with jolt's patches (`chez-patches/0004`), as release builds have.
 
 ### Fixed
 
+- `String.intern` answers one object per content, so
+  `(identical? (.intern a) (.intern b))` holds for equal strings. It returned
+  its argument.
 - **Division by zero raises where the JVM raises.** `(/ x y)` on boxed
   operands is `Numbers.divide(Object, Object)`, which raises `Divide by zero`
   for any zero divisor, `0.0` included, unless an operand is NaN. jolt answered
