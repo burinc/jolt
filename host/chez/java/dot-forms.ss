@@ -214,6 +214,10 @@
         ;; collection interop first (entry count / seq / nth / get / containsKey).
         ((and (dot-coll? obj) (dot-coll-method obj mname rest))
          => (lambda (box) (car box)))
+        ;; a sorted set is a java.util.Set: Set.hashCode, not its hasheq (a
+        ;; sorted map is a dot-coll and gets Map.hashCode above)
+        ((and (htable-sorted? obj) (string=? mname "hashCode") (null? rest))
+         (jolt-java-hashcode obj))
         ;; clojure.lang.Sorted (comparator / entryKey / seqFrom) on a sorted
         ;; map/set, before the map arm below reads the method name as a key.
         ;; data.priority-map's subseq/rsubseq reach for these.

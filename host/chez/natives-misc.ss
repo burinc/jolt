@@ -141,13 +141,15 @@
           (else d))))
 (define (jtagged-pr t) (string-append "#" (jolt-pr-str (jtagged-tag t)) " " (jolt-pr-readable (jtagged-form t))))
 (register-pr-arm! jtagged? jtagged-pr)
-;; two tagged literals are = iff same tag and (recursively) = form, like the JVM's
-;; TaggedLiteral — so they work as map keys / set members. The hash is
-;; TaggedLiteral.hashCode, 31 * hash(tag) + hash(form) over the Java hashCodes.
+;; two tagged literals are = iff tag and form are .equals, as TaggedLiteral.equals
+;; is (so 1.0 and (float 1.0) forms differ, where = would call them equal) — they
+;; work as map keys / set members. The hash is TaggedLiteral.hashCode,
+;; 31 * hash(tag) + hash(form) over the Java hashCodes, which agree with .equals.
+;; objects-equals? is a runtime forward ref (host-static-classes.ss).
 (register-eq-arm! (lambda (a b) (or (jtagged? a) (jtagged? b)))
                   (lambda (a b) (and (jtagged? a) (jtagged? b)
-                                     (jolt=2 (jtagged-tag a) (jtagged-tag b))
-                                     (jolt=2 (jtagged-form a) (jtagged-form b)))))
+                                     (objects-equals? (jtagged-tag a) (jtagged-tag b))
+                                     (objects-equals? (jtagged-form a) (jtagged-form b)))))
 (register-hash-arm! jtagged?
   (lambda (t) (i32 (+ (* 31 (jolt-java-hashcode (jtagged-tag t)))
                       (jolt-java-hashcode (jtagged-form t))))))
@@ -199,9 +201,8 @@
 ;; own collection type (flatland's OrderedMap via APersistentMap/mapHash, OrderedSet
 ;; summing element .hashCodes) must agree with jolt's builtins, so map/set/vector
 ;; .hashCode go here. Recursive: a nested collection element hashes the same way; a
-;; scalar routes to its own .hashCode. Sums use exact ints (jolt + is unbounded, as
-;; a Clojure (reduce + …) over element hashCodes is) except the map form, which
-;; mirrors APersistentMap.mapHash's 32-bit int accumulation.
+;; scalar routes to its own .hashCode. Every fold accumulates in a 32-bit int, as
+;; APersistentMap.mapHash / APersistentSet.hashCode / List.hashCode do.
 (define (jolt-java-hashcode x)
   (cond
     ((jolt-nil? x) 0)
@@ -210,7 +211,17 @@
      (pmap-fold x (lambda (k v a)
                     (i32 (+ a (bitwise-xor (jolt-java-hashcode k) (jolt-java-hashcode v))))) 0))
     ((pset? x)
-     (pset-fold x (lambda (e a) (if (jolt-nil? e) a (+ a (jolt-java-hashcode e)))) 0))
+     (pset-fold x (lambda (e a) (if (jolt-nil? e) a (i32 (+ a (jolt-java-hashcode e))))) 0))
+    ;; a sorted coll is a Map / Set too. Without this arm it fell to the else
+    ;; clause, whose record-method-dispatch "hashCode" comes straight back here.
+    ((htable-sorted-map? x)
+     (sc-tree-fold (jolt-ref-get x kw-tree)
+                   (lambda (n a) (i32 (+ a (bitwise-xor (jolt-java-hashcode (sc-nd-key n))
+                                                        (jolt-java-hashcode (sc-nd-val n))))))
+                   0))
+    ((htable-sorted-set? x)
+     (sc-tree-fold (jolt-ref-get x kw-tree)
+                   (lambda (n a) (i32 (+ a (jolt-java-hashcode (sc-nd-key n))))) 0))
     ((pvec? x)
      (let ((n (pvec-count x)))
        (let loop ((i 0) (h 1))
