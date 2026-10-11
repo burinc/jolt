@@ -345,7 +345,7 @@
          ((string=? method-name "toString") (jolt-str-render-one obj))
          (else (dispatch-miss obj method-name rest))))
       ((and (jrec? obj) (jrec-method-arity obj method-name (+ 1 (length rest))))
-       => (lambda (f) (apply jolt-invoke f obj rest)))
+       => (lambda (f) (invoke-declared-method f obj method-name rest)))
       ;; (.field inst): a deftype/record field read with no matching method.
       ;; Clojure reads the field for (.q x) just like (.-q x); a declared method
       ;; (above) wins, this is the field-accessor fallback. Declared slots only,
@@ -380,7 +380,7 @@
             (let ((f (reify-method-ref obj method-name))
                   (d (jreify-delegate obj)))
               (cond
-                (f (apply jolt-invoke f obj rest))
+                (f (invoke-declared-method f obj method-name rest))
                 ;; a proxy forwards what it does not override to the base
                 ;; instance, through the full dispatcher so the delegate gets
                 ;; whatever method resolution its own kind of value has.
@@ -1095,6 +1095,13 @@
 (register-method-arm! arm-priority-getclass
   (lambda (obj method-name rest-args)
     (if (string=? method-name "getClass") (jolt-class obj) 'pass)))
+
+;; A deftype's or reify's own method, called with self. hashCode / hasheq go
+;; through call-declared-hash (hasheq.ss): the JVM narrows their result to int.
+(define (invoke-declared-method f obj name rest)
+  (if (and (null? rest) (or (string=? name "hashCode") (string=? name "hasheq")))
+      (call-declared-hash f obj)
+      (apply jolt-invoke f obj rest)))
 
 ;; reify: instance-local method table. obj is a jreify carrying a method ht +
 ;; the protocol short-names it implements (for satisfies?/instance?).
