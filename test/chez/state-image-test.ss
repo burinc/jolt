@@ -435,6 +435,17 @@
                      "  (= #{:dt :vec} (set (map (fn [k] (get m k)) (keys m))))])")
       "[2 true]")
   (cleanup!))
+;; Same for an atom or a reify key: records with identity equality hash by a
+;; per-process id (hasheq.ss jolt-identity-hashed?), not by equal-hash.
+(begin
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\""
+                     " (into {} (map (fn [i] [(atom i) i]) (range 40))))"))
+  (is "atom-keyed map is self-consistent after restore"
+      (string-append "(let [m (jolt.host/image-read \"" tmp "\")]"
+                     " [(count m) (every? (fn [k] (= @k (get m k))) (keys m))])")
+      "[40 true]")
+  (cleanup!))
 ;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
 ;; fn — (first raw-holder) is a real core-tier closure with no registration
 (is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"

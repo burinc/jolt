@@ -848,9 +848,25 @@
            (pset-hasheq-set! x h)
            h)))
     ((procedure? x) (procedure-hasheq x))   ; direct fallback callers too
+    ((jolt-identity-hashed? x) (jolt-identity-hasheq x))
     ;; equal-hash can exceed the 32-bit hasheq range (a bare procedure's was
     ;; 669430755266); clamp so every hasheq is a JVM int.
     (else (i32 (equal-hash x)))))
+
+;; A record no eq arm claims is = only to itself (jolt=2-base ends in eq?), so it
+;; is Object.hashCode on the JVM: identity. Chez's equal-hash answers ONE constant
+;; for every record, which put every atom, delay, volatile, reify, StringBuilder,
+;; promise, agent, ... in a single collision bucket and made a map keyed by them
+;; O(n^2) to build (#1313). A record some eq arm DOES claim (uuid, File, Optional,
+;; a tagged literal) has value equality, so it needs its own hash arm; identity
+;; here would break hash/= for it. The arm walk asks (x x), the pair the arm
+;; would see comparing x with an equal value.
+(define (jolt-identity-hashed? x)
+  (and (record? x)
+       (let loop ((as jolt-eq-arms))
+         (cond ((null? as) #t)
+               (((caar as) x x) #f)
+               (else (loop (cdr as)))))))
 
 ;; ============================================================================
 ;; Quick sanity: export a helper for the natives to rebind clojure.core/hash

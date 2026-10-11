@@ -101,6 +101,14 @@
 ;; two uuids are = iff same string.
 (register-eq-arm! (lambda (a b) (or (juuid? a) (juuid? b)))
                   (lambda (a b) (and (juuid? a) (juuid? b) (string=? (juuid-s a) (juuid-s b)))))
+;; and hash as UUID.hashCode, which is what Util.hasheq answers for one: the
+;; equal-hash fallback gave every uuid the same hash (#1313).
+(define (uuid-hashcode u)
+  (let* ((hilo (bitwise-xor (uuid-msb-u u) (uuid-lsb-u u)))
+         (x (bitwise-xor (bitwise-arithmetic-shift-right hilo 32)
+                         (bitwise-and hilo #xFFFFFFFF))))
+    (if (>= x #x80000000) (- x #x100000000) x)))
+(register-hash-arm! juuid? uuid-hashcode)
 
 ;; --- bigint / biginteger -----------------------------------------------------
 ;; JVM bigint/biginteger coerce: string → parsed integer, double/float →
@@ -134,12 +142,15 @@
 (define (jtagged-pr t) (string-append "#" (jolt-pr-str (jtagged-tag t)) " " (jolt-pr-readable (jtagged-form t))))
 (register-pr-arm! jtagged? jtagged-pr)
 ;; two tagged literals are = iff same tag and (recursively) = form, like the JVM's
-;; TaggedLiteral — so they work as map keys / set members. (jolt-hash already
-;; hashes the fields structurally, so eq/hash stay consistent.)
+;; TaggedLiteral — so they work as map keys / set members. The hash is
+;; TaggedLiteral.hashCode, 31 * hash(tag) + hash(form) over the Java hashCodes.
 (register-eq-arm! (lambda (a b) (or (jtagged? a) (jtagged? b)))
                   (lambda (a b) (and (jtagged? a) (jtagged? b)
                                      (jolt=2 (jtagged-tag a) (jtagged-tag b))
                                      (jolt=2 (jtagged-form a) (jtagged-form b)))))
+(register-hash-arm! jtagged?
+  (lambda (t) (i32 (+ (* 31 (jolt-java-hashcode (jtagged-tag t)))
+                      (jolt-java-hashcode (jtagged-form t))))))
 (def-var! "clojure.core" "tagged-literal" jolt-tagged-literal)
 ;; tagged-literal? is OVERLAY (reads :jolt/type) — asserted in post-prelude.ss.
 

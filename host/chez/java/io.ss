@@ -1809,7 +1809,7 @@
       ((string=? name "compareTo")      (list (->num (let ((o (file-path-of (car args))))
                                                        (cond ((string<? p o) -1) ((string>? p o) 1) (else 0))))))
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
-      ((string=? name "hashCode")       (list (->num (string-hash p))))
+      ((string=? name "hashCode")       (list (jfile-hashcode f)))
       ((string=? name "getParent")
        (list (let ((parent (jfile-parent-path p))) (if parent (path-native parent) jolt-nil))))
       (else #f))))
@@ -3479,12 +3479,8 @@
            (uuid-cmp u o)
            (throw-jvm (quote ClassCastException)
                       (string-append (jolt-final-str o) " cannot be cast to java.util.UUID")))))
-    ((string=? m "hashCode")
-     ;; (int)(hilo >> 32) ^ (int)hilo where hilo = msb ^ lsb — the JVM fold.
-     (let* ((hilo (bitwise-xor (uuid-msb-u u) (uuid-lsb-u u)))
-            (x (bitwise-xor (bitwise-arithmetic-shift-right hilo 32)
-                            (bitwise-and hilo #xFFFFFFFF))))
-       (if (>= x #x80000000) (- x #x100000000) x)))
+    ;; (int)(hilo >> 32) ^ (int)hilo where hilo = msb ^ lsb — the JVM fold.
+    ((string=? m "hashCode") (uuid-hashcode u))
     (else 'pass)))
 (register-method-arm! arm-priority-date
   (lambda (obj method-name rest-args)
@@ -4211,6 +4207,14 @@
 (register-eq-arm! (lambda (a b) (or (jfile? a) (jfile? b)))
                   (lambda (a b) (and (jfile? a) (jfile? b)
                                      (string=? (jfile-path a) (jfile-path b)))))
+;; File.hashCode is the file system's: path.hashCode() ^ 1234321, over the
+;; lowercased path on Windows. Chez's string-hash is not a 32-bit int, so
+;; .hashCode answered numbers no JVM can produce.
+(define (jfile-hashcode f)
+  (let ((p (jfile-path f)))
+    (bitwise-xor (java-string-hashcode (if (eq? (sa-os-family) 'windows) (string-downcase p) p))
+                 1234321)))
+(register-hash-arm! jfile? jfile-hashcode)
 
 ;; (= u1 u2) is value equality by string form (the .equals method above only
 ;; serves explicit (.equals …)); hash matches so a URI works as a map key / set

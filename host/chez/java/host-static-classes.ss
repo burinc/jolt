@@ -3014,6 +3014,8 @@
 (register-eq-arm! (lambda (a b) (or (opt? a) (opt? b)))
                   (lambda (a b) (and (opt? a) (opt? b) (eq? (opt-present? a) (opt-present? b))
                                      (or (not (opt-present? a)) (jolt=2 (opt-value a) (opt-value b))))))
+;; Optional.hashCode is its value's hashCode, 0 when empty.
+(register-hash-arm! opt? (lambda (o) (if (opt-present? o) (i32 (jolt-java-hashcode (opt-value o))) 0)))
 
 ;; class hierarchy lives in class-hierarchy.ss (jvm-class-parents).
 ;; fn classes (ns$name) inherit AFunction (handled by jch-direct-supers).

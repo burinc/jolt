@@ -516,4 +516,19 @@
                 (h (mix-coll-hash (car result) (cdr result))))
            (pset-hasheq-set! x h)
            h)))
+    ((jolt-identity-hashed? x) (jolt-identity-hasheq x))
     (else (equal-hash x))))
+
+;; A record no eq arm claims is = only to itself, so it hashes by identity (see
+;; the Chez file). Here a record is a vector tagged with its registered type id
+;; (prelude-shims.ss); equal-hash walked its fields, so an atom's hash moved
+;; with its value and a swap! lost it from any map it keyed.
+(define (jolt-identity-hashed? x)
+  (and (vector? x)
+       (fx>= (vector-length x) 1)
+       (fixnum? (vector-ref x 0))
+       (table-ref jolt-record-id-table (vector-ref x 0) #f)
+       (let loop ((as jolt-eq-arms))
+         (cond ((null? as) #t)
+               (((caar as) x x) #f)
+               (else (loop (cdr as)))))))

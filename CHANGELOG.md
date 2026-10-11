@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Objects without value equality hash by identity.** Atoms, delays,
+  volatiles, refs, agents, promises, `reify` instances, `Object`,
+  `StringBuilder` and the other modeled host objects all hashed to one
+  constant, so a map or set keyed by them was a single collision bucket and
+  took O(n^2) to build. They now hash per object, as `Object.hashCode` does on
+  the JVM. UUIDs, `Optional`s, tagged literals and `File`s hashed to the same
+  constant despite being compared by value; they now hash as their JVM
+  `hashCode`. `File.hashCode` also returns the JVM's int instead of a 40-bit
+  number (#1313).
+
 ## [0.8.21] - 2026-10-11
 
 jolt and the binaries it builds hold about half the memory they did: `jolt -e`

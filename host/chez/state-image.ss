@@ -1071,8 +1071,11 @@
                 ;; (hasheq.ss jolt-identity-hasheq), so either under a key means
                 ;; the container's placement cannot travel. A deftype with a
                 ;; declared hashCode rekeys too — over-approximate, harmless.
+                ;; So does any other record with identity equality (an atom, a
+                ;; reify, ...: hasheq.ss jolt-identity-hashed?).
                 (when (or (procedure? x)
-                          (and (jrec? x) (not (jrec-record? x))))
+                          (and (jrec? x) (not (jrec-record? x)))
+                          (jolt-identity-hashed? x))
                   (set! proc-touched #t))
                 (cond
                   ;; scalar leaves can never hold a procedure
