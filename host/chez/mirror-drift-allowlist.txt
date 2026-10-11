@@ -18,6 +18,7 @@ host/chez/hasheq.ss::hash-unordered
 host/chez/hasheq.ss::java-string-hashcode
 host/chez/hasheq.ss::jolt-hasheq
 host/chez/hasheq.ss::jolt-hasheq-fallback
+host/chez/hasheq.ss::jolt-identity-hashed?
 host/chez/hasheq.ss::murmur3-fmix
 host/chez/hasheq.ss::murmur3-hash-int
 host/chez/hasheq.ss::murmur3-hash-long

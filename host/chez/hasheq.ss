@@ -848,9 +848,33 @@
            (pset-hasheq-set! x h)
            h)))
     ((procedure? x) (procedure-hasheq x))   ; direct fallback callers too
+    ;; every earlier route and both arm registries have already passed on x
+    ((and (record? x) (not (eq-arm-claims? x))) (jolt-identity-hasheq x))
     ;; equal-hash can exceed the 32-bit hasheq range (a bare procedure's was
     ;; 669430755266); clamp so every hasheq is a JVM int.
     (else (i32 (equal-hash x)))))
+
+;; A record no eq arm claims is = only to itself (jolt=2-base ends in eq?), so it
+;; is Object.hashCode on the JVM: identity. Chez's equal-hash answers ONE constant
+;; for every record, which put every atom, delay, volatile, reify, StringBuilder,
+;; promise, agent, ... in a single collision bucket and made a map keyed by them
+;; O(n^2) to build (#1313). A record some eq arm DOES claim (uuid, File, Optional,
+;; a tagged literal) has value equality, so it needs its own hash arm; identity
+;; here would break hash/= for it. The arm walk asks (x x), the pair the arm
+;; would see comparing x with an equal value.
+;;
+;; The image writer asks this of EVERY value it walks (state-image.ss), so the
+;; answer has to be jolt-hasheq's whole route, not just the fallback's last
+;; step: nil, keywords, symbols and jolt's collections are records too, and are
+;; hashed by value ahead of this.
+(define (jolt-identity-hashed? x)
+  (and (record? x)
+       (not (or (jolt-nil? x) (keyword? x) (jolt-symbol? x) (pvec? x) (pmap? x) (pset? x)
+                (jolt-sequential? x) (jrec? x)))
+       (not (exists (lambda (a) ((car a) x)) jolt-hasheq-arms))
+       (not (exists (lambda (a) ((car a) x)) jolt-hash-arms))
+       (not (eq-arm-claims? x))))
+(define (eq-arm-claims? x) (exists (lambda (a) ((car a) x x)) jolt-eq-arms))
 
 ;; ============================================================================
 ;; Quick sanity: export a helper for the natives to rebind clojure.core/hash
