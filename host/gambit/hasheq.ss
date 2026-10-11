@@ -516,7 +516,6 @@
                 (h (mix-coll-hash (car result) (cdr result))))
            (pset-hasheq-set! x h)
            h)))
-    ((reify-declared-hash x) => (lambda (m) (call-declared-hash m x)))
     ((jolt-identity-hashed? x) (jolt-identity-hasheq x))
     (else (equal-hash x))))
 
@@ -529,8 +528,6 @@
         ((and (flonum? v) (finite? v)) (i32 (exact (truncate v))))
         (else v)))
 (define (call-declared-hash m x) (declared-hash-int (jolt-invoke m x)))
-(define (reify-declared-hash x)
-  (and (jreify? x) (or (reify-method-ref x "hasheq") (reify-method-ref x "hashCode"))))
 
 ;; A record no eq arm claims is = only to itself, so it hashes by identity (see
 ;; the Chez file). Here a record is a vector tagged with its registered type id

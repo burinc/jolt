@@ -3357,6 +3357,14 @@
 (define (reify-delegate obj)
   (and (jreify? obj) (jreify-delegate obj)))
 
+(define (reify-declared-hash x)
+  (or (reify-method-ref x "hasheq")
+      (reify-method-ref x "hashCode")))
+
+(register-hash-arm!
+  (lambda (x) (and (jreify? x) (reify-declared-hash x) #t))
+  (lambda (x) (call-declared-hash (reify-declared-hash x) x)))
+
 (register-get-arm!
   jreify?
   (lambda (coll k d)

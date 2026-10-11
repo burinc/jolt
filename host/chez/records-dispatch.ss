@@ -1124,6 +1124,13 @@
               (i (hashtable-ref (car m) name #f)))
          (and i (vector-ref (cdr m) i)))))
 (define (reify-delegate obj) (and (jreify? obj) (jreify-delegate obj)))
+;; A reify's declared hasheq / hashCode is its hash, as a deftype's is, ahead of
+;; the identity hash the hasheq fallback gives a record. Registered here, where
+;; jreify? is defined: hasheq.ss loads first and may not name a record op.
+(define (reify-declared-hash x)
+  (or (reify-method-ref x "hasheq") (reify-method-ref x "hashCode")))
+(register-hash-arm! (lambda (x) (and (jreify? x) (reify-declared-hash x) #t))
+                    (lambda (x) (call-declared-hash (reify-declared-hash x) x)))
 ;; (get reify k) / (:k reify) routes to a reify's ILookup valAt — clojure.spec.alpha
 ;; reifies fspec/regex specs as clojure.lang.ILookup and reads (:args spec) off them.
 (register-get-arm! jreify?
