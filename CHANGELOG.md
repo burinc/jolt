@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Arithmetic that mixes a Float with a double is about 1.6x faster. It was
   dispatched twice, through the variadic `+` and then a second time after
   unboxing.
+- A timed `poll` or `offer` on `LinkedBlockingQueue` and `ArrayBlockingQueue`
+  that can complete at once costs the same as the untimed one (#1303). It
+  built the whole interruptible wait first, which made a timed poll on a
+  queue with data in it 1.4x slower on macOS and 4.9x on aarch64 Termux.
+  `take` and `put` get the same fast path.
 - Equal string literals share one object in a built binary's image, as
   interned literals do on the JVM. Every literal was its own object, so a
   hello app's runtime held 788 copies of `"clojure.core"`; jolt's own heap is
@@ -38,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Timeouts no longer follow the wall clock.** Every runtime deadline
+  (timed waits and derefs, `Thread/sleep`, `Process.waitFor`, executor
+  keep-alive and scheduling, `tryLock`, socket timeouts, core.async `timeout`)
+  was read off the wall clock, so stepping the system clock fired a wait early
+  or held it for as long as the step. They now use the monotonic clock, as the
+  JVM does. `jolt.host/timer-at!` and `jolt.io-poller/wait-ready` take
+  deadlines on that clock; `jolt.io-poller/deadline-ms` builds one (#1303).
 - `String.intern` answers one object per content, so
   `(identical? (.intern a) (.intern b))` holds for equal strings. It returned
   its argument.

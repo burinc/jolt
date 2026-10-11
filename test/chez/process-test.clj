@@ -763,11 +763,13 @@
 ;; clock, and every step's overrun accumulated: 1000 ms came back at ~1170,
 ;; 5000 at ~5840. The broken loop reads ~2340 here even on a fast machine, so the
 ;; upper bound leaves 250 ms for a loaded CI box and still sits below it.
+;; Timed on nanoTime, the clock the deadline is on: the wall clock truncates
+;; separately and read 1999 for a full 2000 ms wait on bionic.
 (check-eq "a timed waitFor returns at the deadline it was given"
           (let [p (.start (java.lang.ProcessBuilder. ["sleep" "30"]))
-                t0 (System/currentTimeMillis)
+                t0 (System/nanoTime)
                 r (.waitFor p 2000 java.util.concurrent.TimeUnit/MILLISECONDS)
-                waited (- (System/currentTimeMillis) t0)]
+                waited (quot (- (System/nanoTime) t0) 1000000)]
             (.destroyForcibly p)
             [r (<= 2000 waited 2250)])
           [false true])

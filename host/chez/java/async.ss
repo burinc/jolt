@@ -795,7 +795,7 @@
        (theap-pop-min!)
        (set! timeout-heap-dead (fx- timeout-heap-dead 1))
        (due acc))
-      ((let ((m (theap-min))) (and m (<= (car m) (now-millis))))
+      ((let ((m (theap-min))) (and m (<= (car m) (mono-millis))))
        ;; the cdr is cleared as the entry leaves, so a cancel from here on
        ;; answers #f: the thunk is already on its way to run
        (let* ((e (theap-pop-min!)) (thunk (cdr e)))
@@ -806,7 +806,7 @@
        (let ((m (theap-min)))
          (if (not m)
              (jolt-condition-wait timeout-cv timeout-mu)
-             (let ((wait-ms (- (car m) (now-millis))))
+             (let ((wait-ms (- (car m) (mono-millis))))
                (when (> wait-ms 0)
                  (jolt-condition-wait timeout-cv timeout-mu (ms->duration wait-ms))))))
        ;; Either deadline or signal, the answer is the same: come back and re-read
@@ -826,7 +826,7 @@
       (loop))))
 
 ;; (jolt-timer-at! deadline-ms thunk) — run thunk on the timer thread once the
-;; epoch-millisecond deadline has passed. The one deadline facility in the runtime.
+;; deadline has passed, in mono-millis (host-static-methods.ss). The one deadline facility in the runtime.
 ;; Answers the entry, which is the handle jolt-timer-cancel! takes; a caller with
 ;; no use for cancelling ignores it.
 (define (jolt-timer-at! deadline-ms thunk)
@@ -876,7 +876,7 @@
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
   (let ((w (ac-make 0 'unbuffered #f)))
-    (jolt-timer-at! (+ (now-millis) (exact (floor ms)))
+    (jolt-timer-at! (mono-deadline ms)
                     (lambda () (jolt-async-close! w)))
     w))
 

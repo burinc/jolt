@@ -724,8 +724,16 @@
 ;; when the fd is cancelled (cancel!), so the caller has to check whether its
 ;; owner is closing before it retries.
 ;;
-;; (wait-ready fd filt deadline-ms) is the same wait bounded by an epoch-ms
-;; deadline, answering :timeout when the deadline passed first and nil otherwise
+;; The clock wait-ready's deadlines are on, and jolt.host/timer-at!'s: monotonic
+;; milliseconds (System/nanoTime's clock), so a wall-clock step neither fires a
+;; socket timeout early nor holds it late. A caller builds a deadline with
+;; deadline-ms, which rounds now up: clock-ms truncates, so (+ (clock-ms) ms)
+;; came due up to 1ms before ms had passed.
+(defn clock-ms [] (quot (System/nanoTime) 1000000))
+(defn deadline-ms [timeout-ms] (+ (quot (+ (System/nanoTime) 999999) 1000000) timeout-ms))
+
+;; (wait-ready fd filt deadline-ms) is the same wait bounded by a deadline on
+;; clock-ms, answering :timeout when the deadline passed first and nil otherwise
 ;; (SO_TIMEOUT and the timed connect, jolt-lang/jolt#1191/#1192). The poller's own
 ;; wait stays untimed: a thread bounds its private kevent/epoll_wait, and a fiber
 ;; is woken at the deadline by the runtime's one timer thread (jolt.host/timer-at!).
@@ -818,11 +826,11 @@
         (swap! state assoc-in [:threads fd] hs)
         (swap! state update :threads dissoc fd)))))
 
-;; The blocking wait itself, bounded by DEADLINE (epoch ms) when there is one.
+;; The blocking wait itself, bounded by DEADLINE (clock-ms) when there is one.
 ;; Answers :timeout once the deadline has passed, nil when the wait returned for
 ;; any other reason. EINTR, and a timed wait that returns early, go round again;
 ;; with no deadline this is the plain untimed wait it always was.
-(defn- remaining-ms [deadline] (- deadline (System/currentTimeMillis)))
+(defn- remaining-ms [deadline] (- deadline (clock-ms)))
 
 (defn- kevent-wait! [kq ev deadline]
   (if (nil? deadline)

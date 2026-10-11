@@ -33,12 +33,12 @@
   (set! total (+ total 1))
   (unless pred (set! fails (+ fails 1)) (printf "  FAIL: ~a\n" name)))
 
-;; Wall clock around a take, in ms. now-millis is the timer's own clock, so a
+;; Elapsed time around a take, in ms. mono-millis is the timer's own clock, so a
 ;; measurement here and a deadline there cannot disagree about the unit.
 (define (take-ms ch)
-  (let ((t0 (now-millis)))
+  (let ((t0 (mono-millis)))
     (jolt-async-take ch)
-    (- (now-millis) t0)))
+    (- (mono-millis) t0)))
 
 ;; Read the timer's state the way the timer writes it. The entry for a closed
 ;; channel is removed under timeout-mu BEFORE the mutex drops, so by the time a
@@ -97,14 +97,14 @@
 
 ;; --- 4. the sequential shape that leaked a thread per call --------------------
 (printf "\n== 4. 100 sequential timeouts ==\n")
-(let ((t0 (now-millis)))
+(let ((t0 (mono-millis)))
   (let loop ((k 0))
     (when (< k 100)
       (jolt-async-take (jolt-async-timeout 1))
       (loop (+ k 1))))
   ;; 100 × 1ms of deadline. A generous ceiling: the point is that none of them
   ;; waited for `far`, which would be 100 × 60s.
-  (ok "4a. 100 × (timeout 1) finished promptly" (< (- (now-millis) t0) 10000)))
+  (ok "4a. 100 × (timeout 1) finished promptly" (< (- (mono-millis) t0) 10000)))
 (ok "4b. still one timer thread, still claimed" timeout-running?)
 (ok "4c. and nothing but far is pending" (= 1 (pending-count)))
 
@@ -119,7 +119,7 @@
 ;; the moment the wait is over rather than at the deadline.
 (printf "\n== 6. a cancelled deadline leaves the heap and never runs ==\n")
 (define fired-6 #f)
-(let ((h (jolt-timer-at! (+ (now-millis) 100) (lambda () (set! fired-6 #t)))))
+(let ((h (jolt-timer-at! (+ (mono-millis) 100) (lambda () (set! fired-6 #t)))))
   (ok "6a. armed: pending grows by one" (= 2 (pending-count)))
   (ok "6b. cancel answers #t for a pending entry" (eq? #t (jolt-timer-cancel! h)))
   (ok "6c. it stops counting as pending at once" (= 1 (pending-count)))
@@ -129,7 +129,7 @@
   (ok "6e. its thunk never ran" (not fired-6)))
 ;; cancelling after it fired is a no-op that says so
 (let* ((ch (jolt-async-timeout 1))
-       (h (jolt-timer-at! (now-millis) (lambda () #t))))
+       (h (jolt-timer-at! (mono-millis) (lambda () #t))))
   (jolt-async-take ch)
   (take-ms (jolt-async-timeout 20))
   (ok "6f. cancel after firing answers #f" (eq? #f (jolt-timer-cancel! h)))
@@ -142,7 +142,7 @@
 ;; order (each thunk records its deadline).
 (printf "\n== 7. cancels from the middle keep the heap ordered ==\n")
 (define fired-7 '())
-(let* ((base (+ (now-millis) 200))
+(let* ((base (+ (mono-millis) 200))
        (n 300)
        (hs (let loop ((i 0) (acc '()))
              (if (= i n)
@@ -171,7 +171,7 @@
 ;; far band, cancel almost all of it, and the heap is back near its live size,
 ;; still ordered for what is left.
 (printf "\n== 8. cancelled entries are compacted away ==\n")
-(let* ((base (+ (now-millis) 3600000))
+(let* ((base (+ (mono-millis) 3600000))
        (hs (let loop ((i 0) (acc '()))
              (if (= i 2000) acc
                  (loop (+ i 1) (cons (jolt-timer-at! (+ base (modulo (* i 7919) 2000)) (lambda () #t)) acc))))))
@@ -188,6 +188,21 @@
                    (loop (+ i 1)))))))
   (for-each jolt-timer-cancel! (list-head hs 10))
   (ok "8d. and only far is left" (= 1 (pending-count))))
+
+;; --- 9. a deadline is never due early --------------------------------------
+;; mono-millis truncates, so a deadline built off it fell up to 1ms short of the
+;; time asked for, and a wait could end before its timeout (the JDK's never do;
+;; #1305's waitFor gate caught it on bionic). Busy-waiting on the clock takes OS
+;; wake-up latency out, which otherwise hides the shortfall; the elapsed time is
+;; read in nanoseconds on the same monotonic clock.
+(printf "\n== 9. a deadline is never due early ==\n")
+(define (mono-ns) (let ((t (current-time 'time-monotonic))) (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
+(let loop ((i 0) (short 0))
+  (if (= i 50)
+      (ok "9a. no 2ms deadline came due before 2ms had passed" (= short 0))
+      (let* ((t0 (mono-ns)) (d (mono-deadline 2)))
+        (let spin () (when (< (mono-millis) d) (spin)))
+        (loop (+ i 1) (if (< (- (mono-ns) t0) 2000000) (+ short 1) short)))))
 
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))

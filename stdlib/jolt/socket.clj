@@ -148,7 +148,7 @@
   ;; The fd is O_NONBLOCK (fibers R8), so connect answers EINPROGRESS; wait for
   ;; writability (parking on a fiber, blocking kevent on a thread — the same
   ;; dispatch every other IO path uses), then read SO_ERROR for the verdict.
-  ;; DEADLINE (epoch ms, or nil for none) bounds that wait: connect(endpoint,
+  ;; DEADLINE (poller/deadline-ms, or nil for none) bounds that wait: connect(endpoint,
   ;; timeout). Windows answers WSAEWOULDBLOCK where POSIX says EINPROGRESS, and
   ;; native/connect-pending? knows both.
   (let [ip (resolve-host host)
@@ -250,7 +250,7 @@
             p  (jolt.host/ref-get endpoint :port)
             fd (jolt.host/ref-get self :fd)
             ip (connect-fd! self fd h p (when (pos? timeout)
-                                          (+ (System/currentTimeMillis) timeout)))]
+                                          (poller/deadline-ms timeout)))]
         (jolt.host/ref-put! self :connected? true)
         (jolt.host/ref-put! self :host h)
         (jolt.host/ref-put! self :remote-addr ip)
@@ -371,7 +371,7 @@
   ;; first still raises as a close.
   (with-op owner
     (let [closed-msg (if (= wait-kind :write) "Broken pipe" "Socket closed")
-          deadline (when (pos? timeout-ms) (+ (System/currentTimeMillis) timeout-ms))]
+          deadline (when (pos? timeout-ms) (poller/deadline-ms timeout-ms))]
       (loop []
         (let [[r e] (op)]
           (cond
