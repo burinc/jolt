@@ -554,7 +554,13 @@
           (lib-note-provider-registration! name)
           (class-statics-merge! name members)))))
 
+;; Bumped by every change to what a tag resolves to (register, alias, derive),
+;; so a method site's cached resolution (jolt-host-site-call*, below) knows it
+;; was filled under tables that have since moved.
+(define host-methods-epoch 0)
+(define (host-methods-changed!) (set! host-methods-epoch (fx+ host-methods-epoch 1)))
 (define (register-host-methods! tag members)
+  (host-methods-changed!)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
                (let ((h (make-hashtable string-hash string=?)))
                  (hashtable-set! host-methods-tbl tag h) h))))
@@ -583,6 +589,7 @@
 (define (alias-host-methods! tag from)
   (let ((h (or (hashtable-ref host-methods-tbl from #f)
                (error 'alias-host-methods! "no methods registered for tag" from))))
+    (host-methods-changed!)
     (hashtable-set! host-methods-tbl tag h)
     (let ((p (host-tag-parent from)))
       (when p (hashtable-set! host-methods-parent tag p)))))
@@ -618,6 +625,7 @@
       (when t
         (when (string=? t tag) (error 'derive-host-methods! "derivation cycle" tag from))
         (walk (host-tag-parent t)))))
+  (host-methods-changed!)
   (hashtable-set! host-methods-parent tag from)
   (register-host-methods! tag members))
 
@@ -688,7 +696,7 @@
 
 ;; record-method-dispatch (records.ss) gets a jhost arm: dispatch (.method obj a*)
 ;; through the tag's method table.
-(register-method-arm! arm-priority-host-type
+(define host-type-arm
   (lambda (obj method-name rest-args)
     (cond
       ((jhost? obj)
@@ -737,6 +745,71 @@
            (else (dispatch-miss obj method-name args)))))
       ((number? obj) (apply number-method method-name obj (if (jolt-nil? rest-args) '() (seq->list rest-args))))
       (else 'pass))))
+(register-method-arm! arm-priority-host-type host-type-arm)
+
+;; ---- a method call site on a host object ------------------------------------
+;; An unhinted (.size q) on a jhost walked every arm ahead of host-type-arm, each
+;; answering 'pass, then hashed the tag and the name in host-method-ref: ~120 ns
+;; before .size read its slot, plus the argument vector the call site built. The
+;; backend gives such a site a box (jolt-host-site-make) and calls
+;; jolt-host-site-callN with the arguments in place.
+;;
+;; The box holds #(tag proc arms epoch), replaced whole. It is filled only when
+;; host-type-arm is the arm that resolved the call — the walk below is
+;; record-method-dispatch's, with that one arm's lookup done here so its answer
+;; can be kept — and only for an arity the member takes. A hit needs the same
+;; tag, the arm list it was filled under (register-method-arm! rebuilds the list,
+;; so a new arm ahead is seen at once), the same host-methods-epoch, and no
+;; library override at the head of the arms (jolt.host/extend-class! adds members
+;; to that arm without rebuilding the list). Anything else takes the walk.
+(define (jolt-host-site-make) (box #f))
+(define-syntax host-site-hit
+  (syntax-rules ()
+    ((_ site obj)
+     (let ((c (unbox site)))
+       (and c (jhost? obj)
+            (let ((t (jhost-tag obj)) (ct (vector-ref c 0)))
+              (or (eq? t ct) (string=? t ct)))
+            (eq? (vector-ref c 2) method-dispatch-arms)
+            (fx=? (vector-ref c 3) host-methods-epoch)
+            (vector-ref c 1))))))
+(define (host-site-miss site obj name argl)
+  (if (and (jhost? obj)
+           (not (fx=? (caar method-dispatch-arms) arm-priority-user-override)))
+      (let ((arms method-dispatch-arms) (epoch host-methods-epoch)
+            (rest (apply jolt-vector argl)))
+        (let loop ((as arms))
+          (cond
+            ((null? as) (record-method-dispatch-base obj name rest))
+            ((eq? (cdar as) host-type-arm)
+             (let ((f (host-method-ref (jhost-tag obj) name)))
+               (if (and f (host-arity-ok? f (length argl) #t))
+                   (begin (set-box! site (vector (jhost-tag obj) f arms epoch))
+                          (apply f obj argl))
+                   (let ((r (host-type-arm obj name rest)))
+                     (if (eq? r 'pass) (loop (cdr as)) r)))))
+            (else
+             (let ((r ((cdar as) obj name rest)))
+               (if (eq? r 'pass) (loop (cdr as)) r))))))
+      (record-method-dispatch obj name (apply jolt-vector argl))))
+;; Any receiver but a jhost goes to record-method-dispatch exactly as an
+;; uncached site did, so a map's .get or a vector's .count pays one type test.
+(define (jolt-host-site-call0 site obj name)
+  (if (jhost? obj)
+      (let ((f (host-site-hit site obj))) (if f (f obj) (host-site-miss site obj name '())))
+      (record-method-dispatch obj name (jolt-vector))))
+(define (jolt-host-site-call1 site obj name a)
+  (if (jhost? obj)
+      (let ((f (host-site-hit site obj))) (if f (f obj a) (host-site-miss site obj name (list a))))
+      (record-method-dispatch obj name (jolt-vector a))))
+(define (jolt-host-site-call2 site obj name a b)
+  (if (jhost? obj)
+      (let ((f (host-site-hit site obj))) (if f (f obj a b) (host-site-miss site obj name (list a b))))
+      (record-method-dispatch obj name (jolt-vector a b))))
+(define (jolt-host-site-call3 site obj name a b c)
+  (if (jhost? obj)
+      (let ((f (host-site-hit site obj))) (if f (f obj a b c) (host-site-miss site obj name (list a b c))))
+      (record-method-dispatch obj name (jolt-vector a b c))))
 
 ;; java.lang.Number method surface (the boxed-number methods cljc code calls). The
 ;; integer projections wrap modulo their width (ring-codec relies on byteValue
