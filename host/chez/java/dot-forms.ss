@@ -210,7 +210,7 @@
         ;; (.seq pm false) must reach the 2-arg one, not dot-coll's plain seq.
         ((and (jrec? obj)
               (jrec-method-arity obj mname (+ 1 (length rest))))
-         => (lambda (f) (apply jolt-invoke f obj rest)))
+         => (lambda (f) (invoke-declared-method f obj mname rest)))
         ;; collection interop first (entry count / seq / nth / get / containsKey).
         ((and (dot-coll? obj) (dot-coll-method obj mname rest))
          => (lambda (box) (car box)))

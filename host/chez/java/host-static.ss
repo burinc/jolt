@@ -838,16 +838,6 @@
       (dispatch-miss n method args)
       (number-method-arms method n args)))
 
-;; Number.equals: the same boxed class and value. jolt's classes follow the value
-;; (a flonum is a Double, an exact integer a Long or a BigInt by range, any other
-;; exact a Ratio), so same kind and = is the test. Double.equals compares
-;; doubleToLongBits: every NaN equals every NaN, 0.0 is not -0.0.
-(define (java-number-equals? n o)
-  (and (number? o)
-       (cond ((flonum? n) (and (flonum? o) (or (and (nan? n) (nan? o)) (eqv? n o))))
-             ((exact? n) (and (exact? o) (eq? (integer? n) (integer? o)) (= n o)))
-             (else (eqv? n o)))))
-
 (define (number-method-arms method n args)
   (cond
     ((string=? method "byteValue") (let ((b (modulo (jnum->exact n) 256))) (->num (if (>= b 128) (- b 256) b))))
