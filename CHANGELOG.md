@@ -9,12 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Waking a condition nobody waits on no longer takes a process-wide lock.**
-  Every enqueue and dequeue on a blocking queue, and every future, promise or
-  latch that settles, looked for parked fibers in a global table under one
-  mutex, whether or not any fiber was parked. A wake now reads a count first
-  and skips the table when no fiber is parked on any condition. An `offer` and
-  `poll` pair on a `LinkedBlockingQueue` went from 180 ns to 105 ns on macOS.
+- **Waking a condition no longer takes a process-wide lock.** Every enqueue
+  and dequeue on a blocking queue, and every future, promise or latch that
+  settles, looked for parked fibers in a global table under one mutex, whether
+  or not anything waited, so unrelated queues and futures contended with each
+  other across threads. Each condition now keeps its own parked fibers and a
+  count of its waiting threads, and a wake with no waiters does neither the
+  lookup nor the broadcast. An `offer` and `poll` pair on a
+  `LinkedBlockingQueue` went from 180 ns to 92 ns on macOS, whether or not
+  fibers are parked elsewhere. Images are written as format 11; older images
+  still restore.
 
 ## [0.8.21] - 2026-10-11
 

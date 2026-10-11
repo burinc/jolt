@@ -108,7 +108,7 @@
 ;; which stopped every other fiber placed on it for the duration and could only
 ;; honour an interrupt that was already set.
 (define (jolt-thread-sleep-ms ms)
-  (let ((ms (exact (floor ms))) (mu (make-mutex)) (cv (make-condition)))
+  (let ((ms (exact (floor ms))) (mu (make-mutex)) (cv (jolt-make-cv)))
     (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (mono-deadline ms)
       (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
     jolt-nil))

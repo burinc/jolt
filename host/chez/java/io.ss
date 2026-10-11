@@ -3067,7 +3067,7 @@
     (let ((n java-thread-id-next)) (set! java-thread-id-next (+ n 1)) n)))
 (define (make-thread-object thunk name started? tid daemon priority ibox)
   (make-jhost "user-thread"
-              (vector thunk #f (make-mutex) (make-condition) ibox started? (box name) tid
+              (vector thunk #f (make-mutex) (jolt-make-cv) ibox started? (box name) tid
                       daemon priority
                       (if (eqv? tid jolt-boot-thread-id) 1 (next-java-thread-id!))
                       #f #f #f)))

@@ -427,16 +427,34 @@
   (let* ((b (thread-state-box)) (old (unbox b)))
     (set-box! b (or old state))
     (dynamic-wind void thunk (lambda () (set-box! b old)))))
+;;
+;; cv is a jolt-cv or a raw Chez condition. A jolt-cv counts the thread as its
+;; waiter for the length of the wait, so a wake with nobody waiting can skip the
+;; broadcast (jolt-cv-wake!); mu is held at both ends, which is what the count needs.
+;; A raw condition is for the waits no fiber can reach and no value carries: the
+;; carriers' idle wait, the timer, the loader, the main queue.
 (define jolt-condition-wait
   (case-lambda
     ((cv mu)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
      ;; dynamic-wind: an interrupt handler that escapes the wait must not leave
      ;; the thread reading WAITING
-     (call-with-thread-state 'WAITING (lambda () (condition-wait cv mu))))
+     (if (jolt-cv? cv)
+         (begin
+           (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
+           (call-with-thread-state 'WAITING (lambda () (condition-wait (jolt-cv-cond cv) mu)))
+           (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1)))
+         (call-with-thread-state 'WAITING (lambda () (condition-wait cv mu)))))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
-     (call-with-thread-state 'TIMED_WAITING (lambda () (condition-wait cv mu abs-time))))))
+     (if (jolt-cv? cv)
+         (begin
+           (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
+           (let ((r (call-with-thread-state 'TIMED_WAITING
+                      (lambda () (condition-wait (jolt-cv-cond cv) mu abs-time)))))
+             (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
+             r))
+         (call-with-thread-state 'TIMED_WAITING (lambda () (condition-wait cv mu abs-time)))))))
 
 ;; --- the wait beneath the fiber layer ---------------------------------------
 ;; (jolt-stop-the-world-wait cv mu timeout) -> #t signalled | #f timed out
@@ -467,13 +485,14 @@
 ;; no wakeup is lost, and the decision is RETAKEN rather than resumed into — which
 ;; is what makes a spurious wake harmless and is why decide must be re-runnable.
 ;;
-;; WHERE THE PARKED FIBERS LIVE. In a table keyed by the condition variable, not in
-;; a field on each waitable, because the waitables are a future record, a promise
-;; record, an agent record, four different jhost vectors, a pipe and a process
-;; latch. Keying on the condition they already have means none of those shapes
-;; change. The table's own mutex is a leaf — taken around one hashtable operation
-;; with nothing inside it — so it cannot be part of a cycle, the same argument
-;; object-monitor's table lock rests on.
+;; WHERE THE WAITERS LIVE. On the condition itself: a jolt-cv (below) is a Chez
+;; condition with the fibers parked on it and a count of the threads blocked on it,
+;; both read and written only under the mu its waiters and wakers already hold. So a
+;; wake takes no lock beyond that mu, finds its fibers without a lookup, and skips
+;; the broadcast when no thread waits — what the JDK's queues do by signalling only
+;; when a waiter exists. They used to live in one table keyed by the condition,
+;; under one process-wide mutex, which every wake of every condition took whether
+;; or not anything waited (#1311).
 ;;
 ;; THE DEADLINE IS THE CLOCK, NOT A FLAG, and that is what closes the race a timed
 ;; park would otherwise have. A fiber has nothing to wake it at the deadline, so one
@@ -488,37 +507,31 @@
 ;; directly — so it does not pay for one.
 (define jolt-cv-again (list 'jolt-cv-again))
 
-(define jolt-cv-waiters (make-weak-eq-hashtable))   ; condition -> parked fibers
-(define jolt-cv-waiters-mu (make-mutex))
+;; (jolt-make-cv) -> a condition a thread or a fiber can wait on.
+;;
+;; Every condition passed to jolt-cv-wait, jolt-cv-wake! or jolt-cv-signal-one! is
+;; one of these, and so is any condition the runtime keeps inside a value: the image
+;; writer stands one in for every 'condition it substitutes (state-image.ss). The
+;; raw Chez condition is reachable only here — host/chez/lock-check.sh refuses
+;; jolt-cv-cond anywhere else — because the thread count is only right if every
+;; thread wait goes through jolt-condition-wait, which keeps it.
+;;
+;; fibers: parked fibers, newest first. threads: threads blocked in condition-wait.
+;; Both change only with the waiters' mu held. A thread that leaves its wait by a
+;; non-local exit leaves its count behind: it cannot take it back without mu, and a
+;; count that is too high only costs a broadcast nobody hears, where one that is too
+;; low would lose a wake.
+(define-record-type (jolt-cv make-jolt-cv jolt-cv?)
+  (fields (immutable cond jolt-cv-cond)
+          (mutable fibers jolt-cv-fibers jolt-cv-fibers-set!)
+          (mutable threads jolt-cv-threads jolt-cv-threads-set!))
+  (nongenerative jolt-cv-v1)
+  (sealed #t))
+(define (jolt-make-cv) (make-jolt-cv (make-condition) '() 0))
 
-;; How many conditions have a fiber registered, written only under
-;; jolt-cv-waiters-mu and read WITHOUT it by jolt-cv-wake!, so a wake when no fiber
-;; is parked on any condition skips the table lock and lookup (#1311). The unlocked
-;; read is sound because a registration and the wake that must see it are ordered
-;; by the condition's own mu: jolt-cv-register! runs inside decide, under mu, and
-;; jolt-cv-wake! is called with that same mu held, so the waker's acquire of mu
-;; follows the registrant's release of it and sees the store. A count that is stale
-;; in the other direction — a condition collected out of the weak table before it
-;; was drained — only sends a wake through the slow path, which answers '().
-(define jolt-cv-waiter-count 0)
-
+;; Called by the fiber about to park, inside decide, with mu held.
 (define (jolt-cv-register! cv f)
-  (jolt-with-mutex jolt-cv-waiters-mu
-    (hashtable-set! jolt-cv-waiters cv
-                    (cons f (hashtable-ref jolt-cv-waiters cv '())))
-    (set! jolt-cv-waiter-count (hashtable-size jolt-cv-waiters))))
-
-;; Drained as it is read, so a fiber that goes on to wait again registers itself
-;; afresh and no resume is ever delivered twice.
-(define (jolt-cv-take-waiters! cv)
-  (if (fx=? 0 jolt-cv-waiter-count)
-      '()
-      (jolt-with-mutex jolt-cv-waiters-mu
-        (let ((fs (hashtable-ref jolt-cv-waiters cv '())))
-          (unless (null? fs)
-            (hashtable-delete! jolt-cv-waiters cv)
-            (set! jolt-cv-waiter-count (hashtable-size jolt-cv-waiters)))
-          fs))))
+  (jolt-cv-fibers-set! cv (cons f (jolt-cv-fibers cv))))
 
 ;; (jolt-cv-wake! cv) — call with mu HELD, after changing the state decide reads.
 ;; The replacement for a bare condition-broadcast on any condition a fiber can wait
@@ -535,10 +548,15 @@
 ;; this critical section lasts — and no longer, because a lock in this runtime can
 ;; no longer be held across a park at all, so every holder of mu is running and
 ;; releases in bounded time.
+;;
+;; The fiber list is drained as it is read, so a fiber that goes on to wait again
+;; registers itself afresh and no resume is ever delivered twice.
 (define (jolt-cv-wake! cv)
-  (condition-broadcast cv)
-  (let ((fs (jolt-cv-take-waiters! cv)))
-    (unless (null? fs) (for-each sa-fiber-resume fs))))
+  (unless (fx=? 0 (jolt-cv-threads cv)) (condition-broadcast (jolt-cv-cond cv)))
+  (let ((fs (jolt-cv-fibers cv)))
+    (unless (null? fs)
+      (jolt-cv-fibers-set! cv '())
+      (for-each sa-fiber-resume fs))))
 
 ;; (jolt-cv-signal-one! cv) — wake exactly ONE thread waiting on cv, with mu held.
 ;;
@@ -550,8 +568,8 @@
 ;; The two preconditions, both of which that condition meets and neither of which
 ;; the caller can be trusted to remember, so they are stated where the call is:
 ;;
-;;   NO FIBER MAY WAIT ON cv. There is no fiber half here — a parked fiber lives in
-;;   a table this does not read, so signalling would leave it parked. The executor's
+;;   NO FIBER MAY WAIT ON cv. There is no fiber half here — a parked fiber is on
+;;   the fiber list, which this does not read, so signalling would leave it parked. The executor's
 ;;   workers are threads, and jolt-condition-wait REFUSES on a fiber, so the pool
 ;;   cannot acquire a fiber waiter by accident; the pool's other waiters (its
 ;;   awaitTermination, which a fiber can reach) wait on a second condition of their
@@ -568,7 +586,8 @@
 ;; no-op task cost 152us of that; signalling one took it to 8.9us, and the pool it
 ;; needs for the same work from 134 threads to 7. Reference JVM Clojure dispatches
 ;; the same task in 5.2us.
-(define (jolt-cv-signal-one! cv) (condition-signal cv))
+(define (jolt-cv-signal-one! cv)
+  (unless (fx=? 0 (jolt-cv-threads cv)) (condition-signal (jolt-cv-cond cv))))
 
 ;; A mono-millis deadline -> the time left until it, as the time-duration Chez's
 ;; condition-wait takes for a relative timeout. Relative and not an absolute
@@ -794,7 +813,7 @@
 ;;
 ;; Both called with the waiter's mu held. The table's own mutex is a leaf — taken
 ;; around one hashtable operation with nothing inside it — so it cannot be part of
-;; a cycle, the same argument jolt-cv-waiters-mu rests on.
+;; a cycle, the same argument object-monitor's table lock rests on.
 ;;
 ;; jolt-lock! / jolt-unlock! by hand rather than jolt-with-mutex: nothing between
 ;; them can raise, and a go body parked in <!! pays for both on every park, where
@@ -818,7 +837,7 @@
 ;; willing to be interrupted out of. Call AFTER setting the flag: the flag is what
 ;; a woken waiter reads, and a wake that arrives before it is set says nothing.
 ;;
-;; READ AND NOT DRAINED, unlike jolt-cv-take-waiters!. An entry is owned by the wait
+;; READ AND NOT DRAINED, unlike a jolt-cv's fiber list. An entry is owned by the wait
 ;; that made it and is removed by that wait when it stops waiting, so deleting it
 ;; here would unregister a waiter that is still waiting, and the next interrupt
 ;; would not reach it. The entries are woken OUTSIDE the table's mutex, so this path holds one lock

@@ -313,7 +313,7 @@
 ;; to come back, or the fiber parks with nothing left to wake it at the deadline.
 (printf "\n== 8. a resumed raise inside a timed fiber wait keeps its deadline ==\n")
 (define t8-mu (make-mutex))
-(define t8-cv (make-condition))
+(define t8-cv (jolt-make-cv))
 (define t8-raised? #f)
 (define t8
   (sa-fiber-spawn
@@ -331,15 +331,15 @@
 (ok "8a. the wait answered at its deadline" (eq? (jolt-fiber-result t8) 'timed-out))
 (ok "8b. and left no deadline pending" (= base-timers (pending-timers)))
 
-;; --- 9. a wake with no parked fiber skips the waiter table (#1311) ----------------
-;; jolt-cv-wake! reads a count of registered conditions before taking the table
-;; lock. The fast path must not lose a real waiter, the count must drain back to
-;; zero once the waiter is resumed, and a wake with nothing registered must not
-;; touch jolt-cv-waiters-mu at all — shown here by holding that lock on another
-;; thread while the wake runs.
-(printf "\n== 9. waking a condition with no parked fiber ==\n")
+;; --- 9. a condition keeps its own waiters (#1311) -------------------------------
+;; A jolt-cv holds the fibers parked on it and a count of the threads blocked on
+;; it, so a wake takes no lock but the waiters' mu and skips the broadcast when no
+;; thread waits. Neither kind of waiter may be lost to that, a wake must leave
+;; another condition's fibers where they are, and both records must drain.
+(printf "\n== 9. a condition keeps its own waiters ==\n")
 (define t9-mu (make-mutex))
-(define t9-cv (make-condition))
+(define t9-cv (jolt-make-cv))
+(define t9-other (jolt-make-cv))
 (define t9-ready? #f)
 (define t9
   (sa-fiber-spawn
@@ -347,31 +347,29 @@
       (jolt-cv-wait t9-mu t9-cv #f
         (lambda (_) (if t9-ready? 'woken jolt-cv-again))))))
 (wait-until (lambda () (eq? (jolt-fiber-state t9) 'parked)) 15.0 "9. fiber parked on the condition")
-(ok "9a. a parked fiber counts" (fx>? jolt-cv-waiter-count 0))
+(ok "9a. the parked fiber is listed on its condition"
+    (jolt-with-mutex t9-mu (equal? (jolt-cv-fibers t9-cv) (list t9))))
+(jolt-with-mutex t9-mu (jolt-cv-wake! t9-other))
+(ok "9b. a wake on another condition leaves it parked"
+    (and (eq? (jolt-fiber-state t9) 'parked)
+         (jolt-with-mutex t9-mu (equal? (jolt-cv-fibers t9-cv) (list t9)))))
 (jolt-with-mutex t9-mu (set! t9-ready? #t) (jolt-cv-wake! t9-cv))
 (wait-until (lambda () (eq? (jolt-fiber-state t9) 'done)) 15.0 "9. parked fiber resumed")
-(ok "9b. the wake reached the parked fiber" (eq? (jolt-fiber-result t9) 'woken))
-(ok "9c. and the count drained" (fx=? 0 jolt-cv-waiter-count))
-(define t9-held (make-mutex))
-(define t9-hold-cv (make-condition))
-(define t9-state 'starting)
+(ok "9c. the wake reached the parked fiber" (eq? (jolt-fiber-result t9) 'woken))
+(ok "9d. and drained the list" (jolt-with-mutex t9-mu (null? (jolt-cv-fibers t9-cv))))
+(define t9-thread-ready? #f)
+(define t9-thread-result #f)
 (fork-thread
   (lambda ()
-    (mutex-acquire jolt-cv-waiters-mu)
-    (with-mutex t9-held
-      (set! t9-state 'holding)
-      (condition-broadcast t9-hold-cv)
-      (let loop () (unless (eq? t9-state 'release) (condition-wait t9-hold-cv t9-held) (loop))))
-    (mutex-release jolt-cv-waiters-mu)))
-(with-mutex t9-held
-  (let loop () (unless (eq? t9-state 'holding) (condition-wait t9-hold-cv t9-held) (loop))))
-(define t9-woke? #f)
-(fork-thread
-  (lambda () (jolt-with-mutex t9-mu (jolt-cv-wake! t9-cv)) (set! t9-woke? #t)))
-(define t9-deadline (+ (mono-millis) 2000))
-(let loop () (unless (or t9-woke? (> (mono-millis) t9-deadline)) (sleep (make-time 'time-duration 1000000 0)) (loop)))
-(ok "9d. a wake with no fiber waiting did not wait for the table lock" t9-woke?)
-(with-mutex t9-held (set! t9-state 'release) (condition-broadcast t9-hold-cv))
+    (set! t9-thread-result
+      (jolt-cv-wait t9-mu t9-cv #f
+        (lambda (_) (if t9-thread-ready? 'thread-woken jolt-cv-again))))))
+(wait-until (lambda () (jolt-with-mutex t9-mu (fx=? 1 (jolt-cv-threads t9-cv)))) 15.0
+            "9. thread blocked on the condition")
+(jolt-with-mutex t9-mu (set! t9-thread-ready? #t) (jolt-cv-wake! t9-cv))
+(wait-until (lambda () t9-thread-result) 15.0 "9. blocked thread woken")
+(ok "9e. the wake reached the blocked thread" (eq? t9-thread-result 'thread-woken))
+(ok "9f. and its count came back to zero" (jolt-with-mutex t9-mu (fx=? 0 (jolt-cv-threads t9-cv))))
 
 (printf "\nfibers-io: ~a checks, ~a failures\n" total fails)
 (exit (if (zero? fails) 0 1))

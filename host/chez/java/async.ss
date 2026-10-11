@@ -45,7 +45,7 @@
   (nongenerative alt-handler-v2))
 (define (alt-handler-alloc . wake)
   ((record-constructor (record-type-descriptor alt-handler))
-   (make-mutex) #t (make-mutex) (make-condition) (vector #f #f #f)
+   (make-mutex) #t (make-mutex) (jolt-make-cv) (vector #f #f #f)
    (if (pair? wake) (car wake) #f)))
 
 ;; --- channels ---------------------------------------------------------------
@@ -80,7 +80,7 @@
   (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch))
   (async-chan-cvw-set! ch (fx- (async-chan-cvw ch) 1)))
 (define (ac-broadcast! ch)
-  (when (fx>? (async-chan-cvw ch) 0) (condition-broadcast (async-chan-cv ch))))
+  (when (fx>? (async-chan-cvw ch) 0) (jolt-cv-wake! (async-chan-cv ch))))
 
 ;; --- the blocking ops are interruptible, the parking ones are not ------------
 ;; <!!, >!! and alts!! block a thread on the JVM by deref'ing a promise, so
@@ -306,8 +306,8 @@
       (if w
           (if jolt-fiber-wake-fn
               (jolt-fiber-wake-fn w)
-              (condition-signal (alt-handler-wcv h)))
-          (condition-signal (alt-handler-wcv h))))))
+              (jolt-cv-wake! (alt-handler-wcv h)))
+          (jolt-cv-wake! (alt-handler-wcv h))))))
 
 ;; ac-notify! — drain pending alt registrations after any channel state mutation.
 ;; Called with the channel mutex held. Loops steps 1→2→3 until a full pass makes
@@ -425,8 +425,8 @@
                       (raise e))))
       (apply jolt-invoke xrf ch v))))
 
-(define (ac-make cap kind xrf) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f xrf 0 #f '() '() 0))
-(define (ac-make/exh cap kind exh) (make-async-chan (make-mutex) (make-condition) (ac-qnew) cap kind #f #f 0 exh '() '() 0))
+(define (ac-make cap kind xrf) (make-async-chan (make-mutex) (jolt-make-cv) (ac-qnew) cap kind #f xrf 0 #f '() '() 0))
+(define (ac-make/exh cap kind exh) (make-async-chan (make-mutex) (jolt-make-cv) (ac-qnew) cap kind #f #f 0 exh '() '() 0))
 
 ;; (chan) | (chan n) | (chan buf) | (chan n|buf xform) | (chan n|buf xform exh)
 (define (jolt-async-chan . args)
