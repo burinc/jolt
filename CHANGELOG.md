@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A socket write copies the array in one step.** `OutputStream.write` on a
+  `java.net.Socket` filled its native buffer with one `ffi/write` per byte,
+  about 190 ms per MB, so a large write was bound by that copy and not by the
+  socket. It now copies with `ffi/write-array`. On macOS arm64, writing 8 MB to
+  a loopback peer went from 1.7 s to 0.18 s.
+
 ## [0.8.21] - 2026-10-11
 
 jolt and the binaries it builds hold about half the memory they did: `jolt -e`
