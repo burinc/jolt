@@ -370,6 +370,11 @@
 (wait-until (lambda () t9-thread-result) 15.0 "9. blocked thread woken")
 (ok "9e. the wake reached the blocked thread" (eq? t9-thread-result 'thread-woken))
 (ok "9f. and its count came back to zero" (jolt-with-mutex t9-mu (fx=? 0 (jolt-cv-threads t9-cv))))
+;; jolt-pause-ms parks a fiber on a private condition of its own; that one has to
+;; be a jolt-cv too, or every fiber pause (Process.waitFor's poll) raised.
+(define t9-pause (sa-fiber-spawn (lambda () (jolt-pause-ms 5) 'paused)))
+(wait-until (lambda () (eq? (jolt-fiber-state t9-pause) 'done)) 15.0 "9. pausing fiber finished")
+(ok "9g. a fiber pause parks and comes back" (eq? (jolt-fiber-result t9-pause) 'paused))
 
 (printf "\nfibers-io: ~a checks, ~a failures\n" total fails)
 (exit (if (zero? fails) 0 1))
