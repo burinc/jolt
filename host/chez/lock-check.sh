@@ -58,7 +58,13 @@ SANCTIONED='host/chez/locks.ss'
 # space or a close paren, which is the spelling every site happens to use, so the
 # hole only opened for someone wrapping a long lock expression. That is exactly
 # the quiet kind: the gate would have gone on reporting zero.
-PRIMS='(mutex-acquire|mutex-release|with-mutex|condition-wait)'
+#
+# jolt-cv-cond is scanned for the same reason as condition-wait: it is the raw
+# Chez condition inside a jolt-cv, and a jolt-cv's count of waiting threads is
+# only right while every thread waits through jolt-condition-wait. A wait on the
+# raw condition from anywhere else would go uncounted, and the wake that skips the
+# broadcast for want of a waiter would lose it.
+PRIMS='(mutex-acquire|mutex-release|with-mutex|condition-wait|jolt-cv-cond)'
 
 # COMMENTS ARE NOT CODE, and this gate reads text rather than data, so it has to
 # say so. Everything from the first `;` on a line is dropped before matching, with

@@ -111,7 +111,7 @@
   (when (jolt-agents-shutdown?)
     (jolt-throw (jolt-host-throwable "java.util.concurrent.RejectedExecutionException" jolt-nil)))
   (let* ((ibox (box #f))
-         (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) ibox))
+         (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (jolt-make-cv) ibox))
          (snap (dyn-binding-stack)))
     (fork-agent-thread
      (lambda ()
@@ -252,7 +252,7 @@
   (fields (mutable delivered?) (mutable value) mu cv)
   (nongenerative jolt-promise-v1))
 
-(define (jolt-promise-new) (make-jolt-promise #f jolt-nil (make-mutex) (make-condition)))
+(define (jolt-promise-new) (make-jolt-promise #f jolt-nil (make-mutex) (jolt-make-cv)))
 
 ;; (class a-future)/(class a-promise): both are anonymous reify instances of a
 ;; clojure.core fn on the JVM — clojure.core$future_call$reify__N /
@@ -414,7 +414,7 @@
       ((or (null? o) (null? (cdr o)))
        (let* ((em (or mode (if (jolt-nil? handler) 'fail 'continue)))
               (a (make-jolt-agent state jolt-nil validator (vector '() '()) #f
-                                  (make-mutex) (make-condition) em handler)))
+                                  (make-mutex) (jolt-make-cv) em handler)))
          (when (and (not (jolt-nil? validator)) (jolt-not (jolt-invoke validator state)))
            (jolt-iref-state-throw))
          (when (and m (not (jolt-nil? m)))
@@ -1214,8 +1214,14 @@
 ;; lk …) and (.lock lk) are DIFFERENT locks on the JVM and stay different here,
 ;; so it gets its own record rather than the object's — but the hard part it needs
 ;; is exactly this (jolt-ga8o). One implementation, two locks.
+;; Both conditions are jolt-cvs, like every condition a value carries: a monitor
+;; travels in an image inside a ReentrantLock, and an image written before format
+;; 11 restores every condition as a jolt-cv. A raw entry condition here came back
+;; from such an image as a jolt-cv and the first contended exit's broadcast raised.
+;; Its fibers are in the fibers slot, not on the cv, so a wake of it only reaches
+;; the blocked threads -- and skips the broadcast when there are none.
 (define (make-monitor)
-  (vector (make-mutex) #f 0 (make-condition) '() #f (make-condition) '()))
+  (vector (make-mutex) #f 0 (jolt-make-cv) '() #f (jolt-make-cv) '()))
 
 ;; --- the owner word -------------------------------------------------------------
 ;; A thin lock. An uncontended enter is CAS #f -> me and an uncontended exit is
@@ -1488,7 +1494,7 @@
                (let ((fs (vector-ref m monitor-i-fibers)))
                  (monitor-release-word! m)
                  (vector-set! m monitor-i-fibers '())
-                 (condition-broadcast (vector-ref m monitor-i-cv))
+                 (jolt-cv-wake! (vector-ref m monitor-i-cv))
                  fs)
                '()))))
     (for-each sa-fiber-resume wake)))
@@ -1639,7 +1645,7 @@
                (monitor-release-word! m)
                (vector-set! m monitor-i-count 0)
                (vector-set! m monitor-i-fibers '())
-               (condition-broadcast (vector-ref m monitor-i-cv))
+               (jolt-cv-wake! (vector-ref m monitor-i-cv))
                (cons saved fs)))))
     (for-each sa-fiber-resume (cdr r))
     (car r)))
@@ -2544,7 +2550,7 @@
   (register-class-statics! "Thread" statics)
   (register-class-statics! "java.lang.Thread" statics))
 
-(define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
+(define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (jolt-make-cv))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))
           '("CountDownLatch" "java.util.concurrent.CountDownLatch"))
 (register-host-methods! "count-down-latch"
@@ -2595,7 +2601,7 @@
 ;; Cancelling a task that is already RUNNING finalizes the future as cancelled —
 ;; .get raises and the late result is dropped — and cancel(true) also interrupts
 ;; the thread running it (task-runners, below), as the JVM's does.
-(define (make-j-future) (make-jhost "j-future" (vector 'new jolt-nil #f (make-mutex) (make-condition))))
+(define (make-j-future) (make-jhost "j-future" (vector 'new jolt-nil #f (make-mutex) (jolt-make-cv))))
 (define (j-future-settled? status) (and (memq status '(done cancelled)) #t))
 ;; A missed deadline, as a value the waiter can test: eq?-unique, so no task
 ;; result can be mistaken for one.
@@ -2759,8 +2765,8 @@
 ;; the Thread its newThread answers (executor-spawn-worker!).
 (define (make-executor* tag core-n max-n keep-alive-ms cap . spec)
   (let ((self (make-jhost tag
-                          (vector #f (box (cons '() '())) (make-mutex) (make-condition) 0
-                                  cap core-n max-n keep-alive-ms 0 0 (make-condition) 0
+                          (vector #f (box (cons '() '())) (make-mutex) (jolt-make-cv) 0
+                                  cap core-n max-n keep-alive-ms 0 0 (jolt-make-cv) 0
                                   '() #f 0
                                   (and (pair? spec) (car spec) #t)
                                   (and (pair? spec) (pair? (cdr spec)) (cadr spec))
@@ -3387,7 +3393,7 @@
   ;; its offer always answered false, so a bad argument surfaced as a hang with
   ;; nothing pointing at the ctor that caused it (jolt-eyi).
   (when (< cap 1) (throw-jvm (quote IllegalArgumentException) jolt-nil))
-  (make-jhost tag (vector cap (make-mutex) (make-condition) (cons '() '()) 0)))
+  (make-jhost tag (vector cap (make-mutex) (jolt-make-cv) (cons '() '()) 0)))
 (define (make-abq cap) (make-abq* "abq" cap))
 (define (abq? x) (and (jhost? x) (member (jhost-tag x) '("abq" "lbq")) #t))
 ;; the mutators run under the mutex (jolt-cv-wait's decide, or jolt-with-mutex)
@@ -3545,7 +3551,7 @@
   (make-jhost "future-task"
               ;; a reified Callable or Runnable is called through its method, as
               ;; submit calls one (it was invoked as a fn and failed the task)
-              (vector 'new override-flag override jolt-nil #f (make-mutex) (make-condition)
+              (vector 'new override-flag override jolt-nil #f (make-mutex) (jolt-make-cv)
                       (runnable->thunk thunk))))
 (define (future-task? x) (and (jhost? x) (string=? (jhost-tag x) "future-task")))
 (define (future-task-run! self)
@@ -3725,7 +3731,7 @@
 ;; the JVM runs about two thousand times a second; here it would run without bound.
 (define (make-scheduled-future thunk due period seq pool-st)
   (make-jhost "scheduled-future"
-              (vector 'new jolt-nil #f (make-mutex) (make-condition) due period thunk seq pool-st)))
+              (vector 'new jolt-nil #f (make-mutex) (jolt-make-cv) due period thunk seq pool-st)))
 (define (scheduled-future? x) (and (jhost? x) (string=? (jhost-tag x) "scheduled-future")))
 (define (sf-due sf) (vector-ref (jhost-state sf) 5))
 (define (sf-periodic? sf) (not (eqv? 0 (vector-ref (jhost-state sf) 6))))
@@ -3886,7 +3892,7 @@
 (define cf-pending (list 'cf-pending))
 (define cf-timed-out (list 'cf-timed-out))
 (define (cf-pending? r) (eq? r cf-pending))
-(define (make-cf* r) (make-jhost "completable-future" (vector r (make-mutex) (make-condition) '())))
+(define (make-cf* r) (make-jhost "completable-future" (vector r (make-mutex) (jolt-make-cv) '())))
 (define (make-cf) (make-cf* cf-pending))
 (define (cf? x) (and (jhost? x) (string=? (jhost-tag x) "completable-future")))
 ;; The result, read under the mutex: it is published by another thread, and the
@@ -4560,7 +4566,7 @@
       (let ((job (jolt-with-mutex jolt-main-queue-mu
                    (and (unbox jolt-main-pump-active)
                         (let ((j (make-jolt-main-job thunk #f #f jolt-nil
-                                                     (make-mutex) (make-condition))))
+                                                     (make-mutex) (jolt-make-cv))))
                           (jolt-main-enqueue! j)
                           (condition-signal jolt-main-queue-cv)
                           j)))))
@@ -4590,7 +4596,7 @@
       (let ((enq (jolt-with-mutex jolt-main-queue-mu
                    (and (unbox jolt-main-pump-active)
                         (let ((j (make-jolt-main-job thunk #f #f jolt-nil
-                                                     (make-mutex) (make-condition))))
+                                                     (make-mutex) (jolt-make-cv))))
                           (jolt-main-enqueue! j)
                           (condition-signal jolt-main-queue-cv)
                           #t)))))
@@ -5103,6 +5109,6 @@
   (lambda ()
     (list (jolt-make-delay (lambda () jolt-nil))
           (jolt-promise-new)
-          (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) #f)
+          (make-jolt-future #f #f #f jolt-nil (make-mutex) (jolt-make-cv) #f)
           (jolt-agent-new jolt-nil))))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "user-thread"))) (lambda (x) "java.lang.Thread"))

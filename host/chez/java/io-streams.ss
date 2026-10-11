@@ -2134,7 +2134,7 @@
   (fields mu cv (mutable front) (mutable rear) (mutable pos) (mutable nbytes)
           (mutable wclosed?) (mutable rclosed?))
   (nongenerative jpipe-v2))
-(define (new-jpipe) (make-jpipe (make-mutex) (make-condition) '() '() 0 0 #f #f))
+(define (new-jpipe) (make-jpipe (make-mutex) (jolt-make-cv) '() '() 0 0 #f #f))
 
 ;; the queue's dequeue end, rebalancing rear->front when front has drained.
 (define (jpipe-front! p)

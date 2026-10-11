@@ -846,7 +846,7 @@
     (let* ((dead (vector (make-mutex) (make-condition)))
            (healed (let-values (((g _) (image-graph-process dead 'restore #f))) g)))
       (and (mutex? (vector-ref healed 0))
-           (thread-condition? (vector-ref healed 1))
+           (jolt-cv? (vector-ref healed 1))
            (not (eq? (vector-ref healed 0) (vector-ref dead 0)))
            (not (eq? (vector-ref healed 1) (vector-ref dead 1))))))
 
@@ -1578,6 +1578,31 @@
 (is "v0.8.12 fixture: the restored channel is live: a take waiting on it is woken by a put"
     "(let [f (future (clojure.core.async/<!! imgchan8/buffered))] (Thread/sleep 50) (clojure.core.async/>!! imgchan8/buffered 9) (deref f 2000 :timeout))"
     "9")
+
+;; Format 10 wrote every condition as a 'condition placeholder; format 11 writes a
+;; jolt-cv that way, which keeps its own waiters, and these restore as one. A
+;; promise and an agent from the format-10 build must come back waitable: a
+;; thread blocked on the unkept promise is woken by a deliver, and an agent's
+;; await sees its action. Fixture made by v0.8.21 (format 10); permanent.
+(ok "v0.8.21 condition fixture present" (file-exists? "test/chez/fixtures/image-v0.8.21-cv.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.21-cv.image")
+(is "v0.8.21 fixture: imgcv10/plain" "imgcv10/plain" "7")
+(is "v0.8.21 fixture: a thread waiting on a restored promise is woken by deliver"
+    "(let [f (future (deref imgcv10/unkept 2000 :timeout))] (Thread/sleep 50) (deliver imgcv10/unkept :kept) (deref f 3000 :hung))"
+    ":kept")
+(is "v0.8.21 fixture: a kept promise keeps its value" "(deref imgcv10/kept)" "5")
+(is "v0.8.21 fixture: a restored agent's await sees its action"
+    "(do (send imgcv10/ag inc) (await-for 2000 imgcv10/ag) (deref imgcv10/ag))" "2")
+
+;; A ReentrantLock carries a monitor, and the monitor's entry condition was the
+;; one a format-10 image wrote as 'condition that format 11 did not make a jolt-cv,
+;; so it restored as a jolt-cv where a raw condition was expected and the first
+;; contended unlock raised. Fixture made by v0.8.21 (format 10); permanent.
+(ok "v0.8.21 lock fixture present" (file-exists? "test/chez/fixtures/image-v0.8.21-lock.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.8.21-lock.image")
+(is "v0.8.21 fixture: a restored ReentrantLock hands over under contention"
+    "(let [lk imglock10/lk] (.lock lk) (let [f (future (.lock lk) (.unlock lk) :got-it)] (Thread/sleep 50) (.unlock lk) (deref f 3000 :hung)))"
+    ":got-it")
 
 ;; Before #1313 every StringBuilder, atom, reify, ... hashed to one constant, so
 ;; a value image written then filed identity-keyed entries under it. The restore

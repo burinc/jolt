@@ -494,7 +494,7 @@
              (begin (if (binary-port? dst) (put-bytevector dst (string->utf8 s)) (put-string dst s))
                     (flush-output-port dst) #t)))))
 (define (proc-pump src dst close-dst?)
-  (let ((m (make-mutex)) (c (make-condition)) (done (box #f)))
+  (let ((m (make-mutex)) (c (jolt-make-cv)) (done (box #f)))
     (fork-thread/daemon #t                 ; jolt's own plumbing, like the JVM's process reaper
       (lambda ()
         (guard (e (#t #f))

@@ -60,10 +60,17 @@
 ;; forced? kind cvec ci crest lock meta) and jolt-lazyseq-v3 (thunk val realized?
 ;; error? lock meta), which restore through image-legacy-coll? below.
 ;;
-;; This build still READS versions 2 to 9: everything they can contain
+;; Version 11: a condition inside a value is a jolt-cv (locks.ss), which keeps its
+;; own waiters, and is written as an image-sync 'condition that restores as a
+;; fresh jolt-cv. A raw Chez condition, which no value should hold, is written as
+;; 'raw-condition. Formats 10 and older wrote every condition as 'condition, and
+;; every one of those sat where a jolt-cv sits now (a promise, a future, an agent,
+;; a channel, a host queue or latch), so they restore as jolt-cvs too.
+;;
+;; This build still READS versions 2 to 10: everything they can contain
 ;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
-(define jolt-image-format-version 10)
-(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10))
+(define jolt-image-format-version 11)
+(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -433,8 +440,8 @@
 ;; something actually waits, and then it is "mutex-acquire: failed: Invalid
 ;; argument" from whichever thread reached it first, with no path and no name.
 ;;
-;; kind is 'mutex or 'condition; restore mints a fresh live one. Substituting at
-;; the WALK rather than through a walker arm per bearing type makes it total:
+;; kind is 'mutex, 'condition (a jolt-cv) or 'raw-condition; restore mints a
+;; fresh live one. Substituting at the WALK rather than through a walker arm per bearing type makes it total:
 ;; jolt-promise, jolt-future, jolt-agent, the per-node lock on a lazy cell and on
 ;; a seq, async channels, the tap queue and the fibers queues all carry one, and
 ;; a record added later carries it correctly without anyone reading this file.
@@ -1116,7 +1123,10 @@
                      ;; record from a format-2 image re-mints through the
                      ;; legacy arm (same construction, val read via its own rtd)
                      ((and restore? (image-sync? x))
-                      (if (eq? (image-sync-kind x) 'condition) (make-condition) (make-mutex)))
+                      (case (image-sync-kind x)
+                        ((condition) (jolt-make-cv))
+                        ((raw-condition) (make-condition))
+                        (else (make-mutex))))
                      ((and restore? (image-ref? x))
                       (walk-ref-restore (image-ref-val x) x path))
                      ((and restore? (image-legacy-ref? x))
@@ -1444,9 +1454,18 @@
                               (cond (restore? (make-mutex))
                                     (rebuild? (make-image-sync 'mutex))
                                     (else #t)))
-                             ((thread-condition? x)
-                              (cond (restore? (make-condition))
+                             ;; before the record arm: a jolt-cv is a record,
+                             ;; but what it holds is a live primitive and the
+                             ;; fibers parked on it, neither of which travels
+                             ((jolt-cv? x)
+                              (cond (restore? (jolt-make-cv))
                                     (rebuild? (make-image-sync 'condition))
+                                    (else #t)))
+                             ;; a raw condition read back from an image is one an
+                             ;; older writer fasl'd in place of a jolt-cv's
+                             ((thread-condition? x)
+                              (cond (restore? (jolt-make-cv))
+                                    (rebuild? (make-image-sync 'raw-condition))
                                     (else #t)))
                              ((and (record? x) (record-rtd x))
                               (walk-record x path))
