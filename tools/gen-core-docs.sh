@@ -19,7 +19,7 @@ CORE_SPECS_JAR="${CORE_SPECS_JAR:-$(ls "$M2"/core.specs.alpha/*/core.specs.alpha
 INV="$(mktemp)"
 trap 'rm -f "$INV"' EXIT
 
-"$JOLT" -e '(prn (into {} (map (fn [n] [n (vec (sort (map name (keys (ns-interns (symbol n))))))]) ["clojure.core" "clojure.string" "clojure.walk" "clojure.template" "clojure.edn" "clojure.set" "clojure.pprint" "clojure.repl"])))' > "$INV"
+"$JOLT" -e '(prn (into {} (map (fn [n] [n (vec (sort (map name (keys (ns-interns (symbol n))))))]) ["clojure.core" "clojure.string" "clojure.walk" "clojure.template" "clojure.edn" "clojure.set" "clojure.pprint" "clojure.repl" "clojure.java.io"])))' > "$INV"
 
 java -cp "$CLOJURE_JAR:$SPEC_JAR:$CORE_SPECS_JAR" clojure.main \
   tools/gen-core-docs.clj "$INV" jolt-core/clojure/core/90-docs.clj

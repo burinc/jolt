@@ -50,6 +50,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An image from 0.8.21 or earlier keeps its identity-keyed entries.** A
   set of `StringBuilder`s or a map keyed by `reify` instances is rebuilt on
   restore, so lookups by the new identity hash find them.
+- **`clojure.java.io/writer`, `reader` and `input-stream` take Clojure's
+  options.** They accepted one argument, so `(io/writer f :append true)` and
+  `(io/reader f :encoding "ISO-8859-1")` were an `ArityException`, and there
+  was no way to open a writer that appends. `:append` and `:encoding` now work
+  on files, paths and URLs, `slurp` and `spit` honour `:encoding`, and a key
+  without a value is the `IllegalArgumentException` Clojure raises. A file
+  writer now truncates when it is opened and writes through a real port
+  instead of rewriting the whole file at every flush. The four openers carry
+  Clojure's docstrings and arglists (#1316).
+- **Charsets other than UTF-8 are honoured by the reader and writer
+  constructors.** `InputStreamReader`, `OutputStreamWriter`, `FileReader` and
+  `FileWriter` accepted a charset and used UTF-8 anyway, and a `Charset`
+  passed to `FileWriter` was read as the append flag. ISO-8859-1 and US-ASCII
+  now write `?` for a character they cannot hold, and US-ASCII decodes a byte
+  past 127 as U+FFFD, where `€` used to encode as byte 0xAC.
+- **A closed writer behaves like the JVM's.** Closing an encoding writer a
+  second time raised "flush-output-port: not permitted on closed port", so
+  `with-open` around a writer closed inside the body failed; it is now a no-op,
+  and a write or flush after close is `IOException` "Stream closed". `spit`
+  with an unknown `:encoding` truncates the target before raising, as the JVM
+  does. A non-UTF-8 writer no longer flushes its stream after every block,
+  which made it about 4x slower than it is now.
+- **`clojure.java.io`'s openers take a `java.net.Socket`.** `io/reader`,
+  `io/writer`, `io/input-stream` and `io/output-stream` open the socket's own
+  streams, and a socket's streams answer `readAllBytes`, `readNBytes`, `skip`
+  and the other methods `InputStream` and `OutputStream` define over `read`
+  and `write`.
 
 ## [0.8.21] - 2026-10-11
 

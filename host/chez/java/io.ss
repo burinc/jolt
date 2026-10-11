@@ -2425,13 +2425,42 @@
         ((reader-jhost? rdr) (chez-line-seq-lazy rdr))
         (else (list->cseq (chez-lines (jolt-str-render-one rdr))))))
 
-;; (slurp src :encoding "...") — pull the charset from the trailing kwargs.
-(define (slurp-encoding opts)
-  (let loop ((o opts))
-    (cond ((or (null? o) (null? (cdr o))) '())
-          ((and (keyword-t? (car o)) (string=? (keyword-t-name (car o)) "encoding"))
-           (list (jolt-str-render-one (cadr o))))
-          (else (loop (cddr o))))))
+;; The keyword options slurp, spit and the clojure.java.io openers take:
+;; (io/writer f :append true :encoding "UTF-8"). Clojure reads them as
+;; (apply hash-map opts), so a key left without a value is the
+;; IllegalArgumentException hash-map raises, and a repeated key answers its
+;; LAST value. Every opener checks through here; scanning the pairs ad hoc let
+;; a dangling key pass silently.
+(define (io-opts-check! opts)
+  (let ((n (length opts)))
+    (when (odd? n)
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "No value supplied for key: "
+                                (jolt-str-render-one (list-ref opts (- n 1))))))))
+(define (io-opt opts kw)   ; the value under KW, or nil
+  (let loop ((o opts) (hit jolt-nil))
+    (cond ((or (null? o) (null? (cdr o))) hit)
+          ((eq? (car o) kw) (loop (cddr o) (cadr o)))
+          (else (loop (cddr o) hit)))))
+(define io-kw-append (keyword #f "append"))
+(define io-kw-encoding (keyword #f "encoding"))
+;; io.clj's (boolean (:append opts)) and (or (:encoding opts) "UTF-8"): a nil or
+;; false encoding is the default, not an error.
+(define (io-append? opts) (jolt-truthy? (io-opt opts io-kw-append)))
+(define (io-encoding opts)
+  (let ((e (io-opt opts io-kw-encoding)))
+    (if (jolt-truthy? e) (charset-arg-name e) "UTF-8")))
+(define (io-utf8? name) (string=? (charset-canonical-down name) "utf-8"))
+;; The JVM opens a writer's charset by NAME, so one it does not know is
+;; UnsupportedEncodingException -- the same check Charset/forName makes, minus
+;; the IllegalCharsetNameException split, which an OutputStreamWriter does not
+;; draw.
+(define (io-encoding-known? name) (or (charset-lookup name) (iconv-known? name)))
+(define (io-check-encoding! name)
+  (unless (io-encoding-known? name)
+    (unsupported-encoding-throw name)))
+;; (slurp src :encoding "...") as the rest list decode-bytevector takes.
+(define (slurp-encoding opts) (list (io-encoding opts)))
 ;; drain a byte input-stream shim (tagged-table) one byte at a time to a bytevector.
 (define (drain-byte-stream src)
   (let loop ((acc '()))
@@ -2500,7 +2529,17 @@
               (put-string out line)
               (loop #f)))))))
 (define (jolt-slurp src . opts)
+  (io-opts-check! opts)
   (cond
+    ;; slurp is a drain of (apply io/reader src opts) on the JVM, so a charset
+    ;; other than UTF-8 on a file, path or URL decodes the way io/reader does.
+    ;; The arms below read those as UTF-8 text and ignored :encoding.
+    ((and (or (jfile? src) (string? src) (url-jhost? src) (embedded-res? src))
+          (not (io-utf8? (io-encoding opts))))
+     (let* ((r (apply jolt-io-reader src opts))
+            (text (guard (e (#t (jolt-close r) (raise e))) (drain-reader r))))
+       (jolt-close r)
+       text))
     ((jfile? src) (slurp-path (jfile-fs src) (jfile-path src)))
     ((embedded-res? src)
      (let ((c (embedded-res-content src)))
@@ -2524,13 +2563,6 @@
                          (slurp-path fp (if (file-url-string? src) (file-url->path src) src)))))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
-(define (spit-append? opts)
-  (let loop ((o opts))
-    (cond ((or (null? o) (null? (cdr o))) #f)
-          ((and (keyword-t? (car o)) (string=? (keyword-t-name (car o)) "append")
-                (jolt-truthy? (cadr o))) #t)
-          (else (loop (cddr o))))))
-
 (define io-counter-mutex (make-mutex))
 (define spit-tmp-counter 0)
 (define (jolt-spit path content . opts)
@@ -2544,18 +2576,36 @@
   (unless (or (string? path) (jfile? path) (jhost? path))
     (throw-jvm (quote IllegalArgumentException)
                (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
+  (io-opts-check! opts)
   (let* ((given (if (url-jhost? path) (url-write-path path) (file-path-of path)))
          (p (project-relative given))
-         (text (jolt-str-render-one content)))
+         (enc (io-encoding opts))
+         ;; encoded up front too, and :encoding was ignored outright before
+         (bytes (begin
+                  ;; The JVM's spit opens the target and THEN builds the writer
+                  ;; that refuses the charset, so a charset it does not know
+                  ;; still truncates the file (or creates it) before raising.
+                  (unless (io-encoding-known? enc)
+                    (close-port (open-path-guarded given p
+                                  (lambda (rp)
+                                    (open-file-output-port rp
+                                      (if (io-append? opts)
+                                          (file-options no-fail no-truncate append)
+                                          (file-options no-fail))
+                                      (buffer-mode none)))))
+                    (io-check-encoding! enc))
+                  (charset-encode-bv (jolt-str-render-one content) enc))))
     ;; The JVM opens the TARGET, so a target it cannot open fails here and names
     ;; itself. This wrote its temp file first and only discovered the target at
     ;; the rename, which came back as Chez's "cannot rename ..." inside a plain
     ;; java.io.IOException -- naming a temp path the caller never asked for
     ;; (jolt-g81).
     (when (file-directory? p) (file-open-error given p))
-    (if (spit-append? opts)
-        (with-port (open-path-guarded given p (lambda (rp) (open-output-file rp 'append)))
-          (lambda (port) (put-string port text)))
+    (if (io-append? opts)
+        (with-port (open-path-guarded given p
+                     (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate append)
+                                                         (buffer-mode block))))
+          (lambda (port) (put-bytevector port bytes)))
         (let ((tmp (string-append p ".spit-tmp-"
                                    (number->string (sa-real-time-ms)) "-"
                                    (number->string (jolt-with-mutex io-counter-mutex
@@ -2564,8 +2614,8 @@
           ;; the temp file is this function's business, but a failure to open it
           ;; is the caller's target failing, so report the target
           (with-port (guard (e ((i/o-error? e) (file-open-error given p e)))
-                       (open-output-file tmp 'replace))
-            (lambda (port) (put-string port text)))
+                       (open-file-output-port tmp (file-options no-fail) (buffer-mode block)))
+            (lambda (port) (put-bytevector port bytes)))
           (guard (e (#t (delete-file-retrying! tmp) (raise e)))
             (rename-replace! tmp p))))
     jolt-nil))
@@ -2661,7 +2711,7 @@
 ;; (read), mark/reset and pushback). The streaming java.io.FileReader /
 ;; BufferedReader classes (io-streams.ss) read a Chez port directly when a caller
 ;; wants to avoid loading the whole source.
-(define (jolt-io-reader x)
+(define (jolt-io-reader x . opts)   ; OPTS: io-streams.ss's wrapper reads them
   (cond
     ((reader-jhost? x) x)
     ((jfile? x) (io-note-file-read! (jfile-fs x))
@@ -2681,35 +2731,13 @@
     (else (throw-jvm (quote IllegalArgumentException)
                      (string-append "Cannot open <" (jolt-pr-str x) "> as a Reader.")))))
 
-;; --- clojure.java.io/writer: an existing writer passes through; a File / path
-;; gets a file-backed writer (host-static.ss "file-writer") that persists on
-;; flush/close. Mirrors io.clj's writer over the host's StringWriter/file ports.
-;; The JVM opens the file when the Writer is CONSTRUCTED, so a target it cannot
-;; open raises there. jolt's file-writer is a StringWriter over a path that
-;; spits at flush/close (host-static-classes.ss), so there was no open at all
-;; here and (io/writer <a directory>) handed back a Writer -- the failure then
-;; surfaced at close, or never (jolt-g81).
-;;
-;; The target is OPENED rather than reasoned about, for the reason
-;; open-path-guarded gives: only the open knows. Opening for append rather than
-;; truncate keeps any existing content -- the write itself still goes through
-;; jolt-spit later -- while still creating a missing file, which is what the
-;; JVM's FileWriter does too.
-(define (io-writer-target! given)
-  (let ((p (project-relative given)))
-    (close-port (open-path-guarded given p
-                  (lambda (rp)
-                    (open-file-output-port rp (file-options no-fail no-truncate append)
-                                           (buffer-mode none)))))
-    given))
-
-(define (jolt-io-writer x)
+;; --- clojure.java.io/writer: an existing StringWriter passes through. Every
+;; other arm -- a File, a path, a URL, a byte stream -- is io-streams.ss's, which
+;; loads later and has the ports: a file is an encoding writer over the same
+;; output stream io/output-stream opens, the JVM's make-writer.
+(define (jolt-io-writer x . opts)
   (cond
     ((and (jhost? x) (string=? (jhost-tag x) "writer")) x)
-    ((and (jhost? x) (string=? (jhost-tag x) "file-writer")) x)
-    ((jfile? x) (make-jhost "file-writer" (vector (io-writer-target! (jfile-path x)) "")))
-    ((url-jhost? x) (make-jhost "file-writer" (vector (io-writer-target! (url-write-path x)) "")))
-    ((string? x) (make-jhost "file-writer" (vector (io-writer-target! x) "")))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
 ;; --- clojure.java.io ns -----------------------------------------------------

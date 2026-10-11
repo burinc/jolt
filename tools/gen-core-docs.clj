@@ -8,7 +8,7 @@
 ;;
 ;; args: <jolt-vars.edn> <out-file>
 (require 'clojure.string 'clojure.walk 'clojure.template 'clojure.edn
-         'clojure.set 'clojure.pprint 'clojure.repl)
+         'clojure.set 'clojure.pprint 'clojure.repl 'clojure.java.io)
 
 (let [[inv-path out-path] *command-line-args*
       inventory (clojure.edn/read-string (slurp inv-path))

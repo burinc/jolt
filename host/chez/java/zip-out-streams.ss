@@ -270,10 +270,12 @@
 ;; an OutputStreamWriter over it does on the JDK.
 (let ((prev jolt-io-writer))
   (set! jolt-io-writer
-        (lambda (x)
+        (lambda (x . opts)
           (if (zout-of x)
-              (make-char-writer (transcoded-port (out-stream-sink-port x) utf8-tx) x)
-              (prev x))))
+              (begin
+                (io-opts-check! opts)
+                (make-charset-writer (out-stream-sink-port x) (io-encoding opts) x #f))
+              (apply prev x opts))))
   (def-var! "clojure.java.io" "writer" jolt-io-writer))
 
 (reg-ctor! '("DeflaterOutputStream" "java.util.zip.DeflaterOutputStream") make-deflater-output-stream)

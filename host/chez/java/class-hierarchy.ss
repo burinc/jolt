@@ -1455,7 +1455,6 @@
     ;; so every PrintStream reported (class x) => :object and answered false to
     ;; (instance? java.io.OutputStream x).
     ("print-stream" . "java.io.PrintStream")
-    ("file-writer" . "java.io.FileWriter")
     ("writer" . "java.io.StringWriter")
     ("string-reader" . "java.io.StringReader")
     ("pushback-reader" . "java.io.PushbackReader")
@@ -1559,13 +1558,13 @@
       (string=? t "line-numbering-pushback-reader")))
 
 ;; The jhost text sinks: values that take text through their own .write method —
-;; a StringWriter, a FileWriter, the process port-writers, a PrintWriter, a
+;; a StringWriter, the process port-writers, a PrintWriter, a
 ;; PrintStream. spit, io/copy and with-open's close all ask this, and for the same
 ;; reason as above: the set grew a fifth tag when System/out became a PrintStream,
 ;; and three hand-copied literal lists is how one of them silently stops accepting
 ;; a value the other two do ((io/copy in System/out) -> "unsupported output type").
 (define (text-sink-tag? t)
-  (or (string=? t "writer") (string=? t "file-writer")
+  (or (string=? t "writer")
       (string=? t "port-writer") (string=? t "print-writer")
       (string=? t "print-stream")))
 ;; the protocol-dispatch / instance? tag list for a jhost value's tag, or #f.

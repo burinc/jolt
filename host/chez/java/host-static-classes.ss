@@ -318,20 +318,6 @@
 ;; (str calls toString) — data.csv writes CSV to a StringWriter and reads it back.
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "writer"))) sb-str*)
 
-;; a file-backed writer (clojure.java.io/writer of a File/path): accumulates like
-;; StringWriter, then persists to the path on flush/close, so
-;; (with-open [w (io/writer "f")] (.write w …)) writes the file. State #(path buf).
-(define (fw-path self) (vector-ref (jhost-state self) 0))
-(define (fw-buf self) (vector-ref (jhost-state self) 1))
-(define (fw-append! self s) (vector-set! (jhost-state self) 1 (string-append (fw-buf self) s)))
-(define (fw-flush! self) (jolt-spit (fw-path self) (fw-buf self)))  ; jolt-spit: io.ss
-(register-host-methods! "file-writer"
-  (list (cons "write" (lambda (self x . rest) (fw-append! self (writer-piece-range x rest)) jolt-nil))
-        (cons "append" (lambda (self x . rest) (fw-append! self (append-text x rest)) self))
-        (cons "flush" (lambda (self) (fw-flush! self) jolt-nil))
-        (cons "close" (lambda (self) (fw-flush! self) jolt-nil))
-        (cons "toString" (lambda (self) (fw-buf self)))))
-
 ;; a writer over a real Chez port — the values *out* / *err* hold. write/append
 ;; push to the port (so (.write *out* s) and (binding [*out* *err*] …) work);
 ;; it isn't a buffer, so toString is empty. Lets libraries that touch *out*/*err*
@@ -1428,8 +1414,13 @@
       ;; whichever one is named here, which is how (slurp (io/input-stream f))
       ;; came to disagree with (slurp f) on the same bytes (jolt-dta.13).
       ((string=? cs "utf-8") (utf8-bytes->string bv))
-      ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
+      ((string=? cs "iso-8859-1")
        (list->string (map integer->char (bytevector->u8-list bv))))
+      ;; a byte past 127 is not ASCII, and the JVM's decoder replaces it with
+      ;; U+FFFD rather than reading it as Latin-1
+      ((string=? cs "us-ascii")
+       (list->string (map (lambda (b) (if (fx<? b 128) (integer->char b) #\xFFFD))
+                          (bytevector->u8-list bv))))
       ((or (string=? cs "utf-16") (string=? cs "utf-16be"))
        (utf16->string bv (endianness big)))   ; respects a leading BOM
       ((string=? cs "utf-16le") (utf16->string bv (endianness little)))
@@ -2014,9 +2005,14 @@
     (let ((tag (and (htable? obj) (hashtable-ref (htable-h obj) "jolt/type" #f))))
       (let* ((mh (and tag (hashtable-ref tagged-methods-tbl (tag->method-key tag) #f)))
              (f  (and mh (hashtable-ref mh method-name #f))))
-        (if f
-            (apply f obj (if (jolt-nil? rest-args) '() (seq->list rest-args)))
-            'pass)))))
+        (cond
+          (f (apply f obj (if (jolt-nil? rest-args) '() (seq->list rest-args))))
+          ;; a stream marked as answering the java.io contract inherits the
+          ;; methods InputStream / OutputStream write over read / write, as a
+          ;; proxy of either does (io-streams.ss stream-contract-method)
+          ((and tag (stream-contract-method obj method-name))
+           => (lambda (g) (apply g obj (if (jolt-nil? rest-args) '() (seq->list rest-args)))))
+          (else 'pass))))))
 
 (def-var! "clojure.core" "__register-class-methods!"
   (lambda (tag members) (register-tagged-methods! tag (jmap->static-alist members)) jolt-nil))
