@@ -1666,7 +1666,10 @@
             (loop)))))
 
 ;; (jolt-fiber-pool-make name n) -> pool. n carriers, their threads started now.
+;; Reads *fiber-preempt-ticks* as the default pool's start does, since a pool
+;; made first would otherwise run on the default quantum whatever it says.
 (define (jolt-fiber-pool-make name n)
+  (jolt-fiber-preempt-refresh!)
   (let ((p (make-jolt-pool name #f 0 (make-mutex) #f))
         (v (make-vector n)))
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
