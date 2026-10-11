@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.21] - 2026-10-11
+
+jolt and the binaries it builds hold about half the memory they did: `jolt -e`
+peaks at 83MB instead of 182MB, and a hello app at 54MB instead of 122MB.
+`:blocking` foreign calls no longer cost several times a plain call, method
+calls on host objects without a type hint stop paying a dispatch walk, and
+`instance?` on atoms, refs and delays is memoized. Fiber pools let blocking
+work run on carriers of its own. Runtime timeouts move to the monotonic clock,
+and the runtime's own warnings are opt-in.
+
 ### Added
 
 - **Fiber pools besides the default one.** `(jolt.fibers/pool {:name :io
@@ -30,11 +40,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Arithmetic that mixes a Float with a double is about 1.6x faster. It was
   dispatched twice, through the variadic `+` and then a second time after
   unboxing.
+- **jolt and built binaries hold about half the memory.** A vfasl boot left
+  oversize chunks pinned by one stray segment, the embedded boot arrays were
+  writable (so the boot prefetch dirtied every page), the GC policy took its
+  baseline before the first collection, and the boot image was decompressed in
+  one piece beside the image it was building. On macOS arm64:
+
+  | | 0.8.20 | 0.8.21 |
+  |---|---:|---:|
+  | `jolt -e '(println 1)'`, peak footprint | 181.6MB | 82.7MB |
+  | hello app, size / peak | 11.5MB / 121.7MB | 9.6MB / 54.2MB |
+  | hello app `--closed-world`, size / peak | 10.8MB / 110.8MB | 8.2MB / 39.3MB |
+
+- **`:blocking` foreign calls are cheap.** A collect-safe call deactivated the
+  thread through the global thread-context mutex on every call, so one cost
+  about 8x a plain call and serialized threads. Release builds carry a Chez
+  patch (`chez-patches/0001`) that marks the thread with a compare-and-swap
+  instead; a `:blocking` call now costs 1.5-2.7x a plain one. A jolt on a
+  stock Chez works as before.
+- **The runtime's own diagnostics are opt-in** (#1292). The GC stall report
+  needs `JOLT_GC_STALL=1` (or `=<seconds>` for another threshold), and the
+  provider-claim, duplicate native symbol, data-reader load failure and AOT
+  worker warnings need `JOLT_WARNINGS=1`, so they no longer interleave with a
+  full-screen TUI. `jolt.ffi/on-gc-stall` hands the stall report to a function
+  instead.
+- `instance?` on atoms, vars, refs, volatiles, delays, promises, futures and
+  agents is memoized by kind, as it is for other values: `(instance? Atom a)`
+  went from 0.44 µs to 0.025 µs and `(instance? IDeref d)` on a delay from
+  0.68 µs to 0.10 µs.
 - A timed `poll` or `offer` on `LinkedBlockingQueue` and `ArrayBlockingQueue`
   that can complete at once costs the same as the untimed one (#1303). It
   built the whole interruptible wait first, which made a timed poll on a
-  queue with data in it 1.4x slower on macOS and 4.9x on aarch64 Termux.
-  `take` and `put` get the same fast path.
+  queue with data in it 1.4x slower on macOS, and 4.9x on the reporter's
+  aarch64 Termux device. `take` and `put` get the same fast path.
 - **Method calls on host objects without a type hint are much cheaper.** A
   call such as `(.size q)` on a queue, an executor, or a `StringBuilder`
   reached through an unhinted local walked every dispatch arm and looked the
@@ -58,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or held it for as long as the step. They now use the monotonic clock, as the
   JVM does. `jolt.host/timer-at!` and `jolt.io-poller/wait-ready` take
   deadlines on that clock; `jolt.io-poller/deadline-ms` builds one (#1303).
+- A timed wait no longer returns up to 1ms before its timeout. Deadlines were
+  built off a clock read truncated to the millisecond; they now round up, as
+  the JDK's waits never return early.
+- `System/gc` ran no collection while another thread was active, which on
+  Linux is always at startup. It now asks for the full collection and joins
+  it. `JOLT_MAX_HEAP=150m` refused to start, reading the boot image's
+  allocation as live heap.
 - `String.intern` answers one object per content, so
   `(identical? (.intern a) (.intern b))` holds for equal strings. It returned
   its argument.
@@ -75,7 +120,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string as a double (`(+ 0.5 (f))` answered 0.5) or faulted the process on
   an integer. The site now widens a number and raises `ClassCastException` on
   anything else.
-
 - **A `java.lang.Float` crosses into C again.** 0.8.20 made `(float x)` a
   boxed `java.lang.Float` (#1285). A Chez `float` or `double` foreign position
   takes only a flonum, so passing one raised `invalid foreign-procedure
