@@ -345,7 +345,7 @@
          ((string=? method-name "toString") (jolt-str-render-one obj))
          (else (dispatch-miss obj method-name rest))))
       ((and (jrec? obj) (jrec-method-arity obj method-name (+ 1 (length rest))))
-       => (lambda (f) (apply jolt-invoke f obj rest)))
+       => (lambda (f) (invoke-declared-method f obj method-name rest)))
       ;; (.field inst): a deftype/record field read with no matching method.
       ;; Clojure reads the field for (.q x) just like (.-q x); a declared method
       ;; (above) wins, this is the field-accessor fallback. Declared slots only,
@@ -380,7 +380,7 @@
             (let ((f (reify-method-ref obj method-name))
                   (d (jreify-delegate obj)))
               (cond
-                (f (apply jolt-invoke f obj rest))
+                (f (invoke-declared-method f obj method-name rest))
                 ;; a proxy forwards what it does not override to the base
                 ;; instance, through the full dispatcher so the delegate gets
                 ;; whatever method resolution its own kind of value has.
@@ -1096,6 +1096,13 @@
   (lambda (obj method-name rest-args)
     (if (string=? method-name "getClass") (jolt-class obj) 'pass)))
 
+;; A deftype's or reify's own method, called with self. hashCode / hasheq go
+;; through call-declared-hash (hasheq.ss): the JVM narrows their result to int.
+(define (invoke-declared-method f obj name rest)
+  (if (and (null? rest) (or (string=? name "hashCode") (string=? name "hasheq")))
+      (call-declared-hash f obj)
+      (apply jolt-invoke f obj rest)))
+
 ;; reify: instance-local method table. obj is a jreify carrying a method ht +
 ;; the protocol short-names it implements (for satisfies?/instance?).
 ;; A reify may carry a DELEGATE: an object that answers any method the reify's own
@@ -1117,6 +1124,13 @@
               (i (hashtable-ref (car m) name #f)))
          (and i (vector-ref (cdr m) i)))))
 (define (reify-delegate obj) (and (jreify? obj) (jreify-delegate obj)))
+;; A reify's declared hasheq / hashCode is its hash, as a deftype's is, ahead of
+;; the identity hash the hasheq fallback gives a record. Registered here, where
+;; jreify? is defined: hasheq.ss loads first and may not name a record op.
+(define (reify-declared-hash x)
+  (or (reify-method-ref x "hasheq") (reify-method-ref x "hashCode")))
+(register-hash-arm! (lambda (x) (and (jreify? x) (reify-declared-hash x) #t))
+                    (lambda (x) (call-declared-hash (reify-declared-hash x) x)))
 ;; (get reify k) / (:k reify) routes to a reify's ILookup valAt — clojure.spec.alpha
 ;; reifies fspec/regex specs as clojure.lang.ILookup and reads (:args spec) off them.
 (register-get-arm! jreify?

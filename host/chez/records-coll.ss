@@ -106,8 +106,8 @@
 ;; double store is benign. The slot never travels — the image dump starts it
 ;; unset (state-image.ss), the way the JVM marks __hasheq transient.
 (define (jrec-hasheq-slow x)
-  (cond ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
-        ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
+  (cond ((jrec-cl x "hasheq") => (lambda (m) (call-declared-hash m x)))
+        ((jrec-cl x "hashCode") => (lambda (m) (call-declared-hash m x)))
         ((jrec-record? x)
          (let ((h (jrec-hash x))) (jrec-hasheq-set! x h) h))
         (else

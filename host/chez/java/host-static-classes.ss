@@ -2590,10 +2590,7 @@
 ;; own .equals and .hashCode take (record-method-dispatch, jolt-java-hashcode), so
 ;; Objects/equals on two jolt values answers what (.equals a b) does: an array is
 ;; equal only to itself, a vector equals a list with the same elements.
-(define (objects-equals? a b)
-  (or (eq? a b)
-      (and (not (jolt-nil? a))
-           (jolt-truthy? (record-method-dispatch a "equals" (jolt-list b))))))
+;; objects-equals? itself lives in natives-misc.ss, which both hosts load.
 (define (objects-deep-equals? a b)
   (cond ((eq? a b) #t)
         ((or (jolt-nil? a) (jolt-nil? b)) #f)
@@ -3008,12 +3005,19 @@
         (cons "orElse" (lambda (o d) (if (opt-present? o) (opt-value o) d)))
         (cons "orElseGet" (lambda (o f) (if (opt-present? o) (opt-value o) (jolt-fi-call f "get"))))
         (cons "ifPresent" (lambda (o f) (when (opt-present? o) (jolt-fi-call f "accept" (opt-value o))) jolt-nil))
+        (cons "equals" (lambda (o x) (jolt=2 o x)))
+        (cons "hashCode" (lambda (o) (opt-hashcode o)))
         (cons "toString" (lambda (o) (if (opt-present? o)
                                          (string-append "Optional[" (jolt-str-render-one (opt-value o)) "]")
                                          "Optional.empty")))))
 (register-eq-arm! (lambda (a b) (or (opt? a) (opt? b)))
                   (lambda (a b) (and (opt? a) (opt? b) (eq? (opt-present? a) (opt-present? b))
-                                     (or (not (opt-present? a)) (jolt=2 (opt-value a) (opt-value b))))))
+                                     (or (not (opt-present? a)) (objects-equals? (opt-value a) (opt-value b))))))
+;; Optional.equals is the values' .equals (1.0 and (float 1.0) differ, where =
+;; would call them equal), and Optional.hashCode is its value's hashCode, 0 when
+;; empty — the pair agrees, as = and hash have to.
+(define (opt-hashcode o) (if (opt-present? o) (i32 (jolt-java-hashcode (opt-value o))) 0))
+(register-hash-arm! opt? opt-hashcode)
 
 ;; class hierarchy lives in class-hierarchy.ss (jvm-class-parents).
 ;; fn classes (ns$name) inherit AFunction (handled by jch-direct-supers).

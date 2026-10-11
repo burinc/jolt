@@ -210,10 +210,14 @@
         ;; (.seq pm false) must reach the 2-arg one, not dot-coll's plain seq.
         ((and (jrec? obj)
               (jrec-method-arity obj mname (+ 1 (length rest))))
-         => (lambda (f) (apply jolt-invoke f obj rest)))
+         => (lambda (f) (invoke-declared-method f obj mname rest)))
         ;; collection interop first (entry count / seq / nth / get / containsKey).
         ((and (dot-coll? obj) (dot-coll-method obj mname rest))
          => (lambda (box) (car box)))
+        ;; a sorted set is a java.util.Set: Set.hashCode, not its hasheq (a
+        ;; sorted map is a dot-coll and gets Map.hashCode above)
+        ((and (htable-sorted? obj) (string=? mname "hashCode") (null? rest))
+         (jolt-java-hashcode obj))
         ;; clojure.lang.Sorted (comparator / entryKey / seqFrom) on a sorted
         ;; map/set, before the map arm below reads the method name as a key.
         ;; data.priority-map's subseq/rsubseq reach for these.
