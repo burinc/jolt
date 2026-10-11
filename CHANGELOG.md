@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fiber pools besides the default one.** `(jolt.fibers/pool {:name :io
+  :size 8})` starts a pool of carriers of its own, and `(jolt.fibers/spawn f
+  {:pool p})` runs a fiber on it for life. A fiber that pins its carrier, in a
+  blocking foreign call or a long computation, then holds up only its own
+  pool's fibers. Channels, promises, `interrupt!` and `kill!` work across
+  pools. `pool-of` names a fiber's pool, and `shutdown!` stops a pool taking
+  fibers while its carriers finish the ones already on them. The default pool
+  is unchanged.
+
 ### Changed
 
 - **A C float reaches jolt as a `java.lang.Float`**, as it reaches Clojure on

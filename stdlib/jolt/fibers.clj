@@ -31,12 +31,56 @@
 ;;     interruptible wait (a park on <!, >! or alts! is not one).
 (ns jolt.fibers)
 
+(defn pool?
+  "True when x is a pool made by pool."
+  [x]
+  (jolt.host/fiber-pool? x))
+
 (defn spawn
   "Run (f) on a fiber and return the fiber handle immediately. The body runs
   on the carrier pool; its value or error is read back with join or
-  monitor!. The caller's dynamic bindings convey; *txn* does not."
-  [f]
-  (jolt.host/fiber-spawn f))
+  monitor!. The caller's dynamic bindings convey; *txn* does not.
+
+  opts:
+    :pool  a pool made by pool to run on instead of the default one (nil is
+           the default). Throws if that pool is shut down."
+  ([f] (jolt.host/fiber-spawn f))
+  ([f {p :pool}]
+   (cond
+     (nil? p) (jolt.host/fiber-spawn f)
+     (not (pool? p)) (throw (ex-info ":pool must be a pool" {:pool p}))
+     :else (or (jolt.host/fiber-pool-spawn p f)
+               (throw (ex-info "pool is shut down" {:pool (jolt.host/fiber-pool-name p)}))))))
+
+(defn pool
+  "Make a pool of carriers apart from the default one, and start them. A
+  fiber spawned into it with (spawn f {:pool p}) runs on those carriers only,
+  for life, so a fiber that pins its carrier -- a blocking foreign call, a
+  long computation -- holds up only the fibers of its own pool. Channels,
+  promises, interrupt! and kill! work across pools as within one.
+
+  opts:
+    :name  any value, for pool-name (default nil)
+    :size  how many carriers (OS threads); defaults to the processor count"
+  ([] (pool {}))
+  ([{:keys [name size]}]
+   (jolt.host/fiber-pool-make name (or size (jolt.host/fiber-carrier-count)))))
+
+(defn pool-name "The :name pool was made with." [p] (jolt.host/fiber-pool-name p))
+
+(defn pool-size "How many carriers pool p has." [p] (jolt.host/fiber-pool-size p))
+
+(defn pool-of
+  "The pool fiber fib runs in, or nil for the default pool."
+  [fib]
+  (jolt.host/fiber-pool-of fib))
+
+(defn shutdown!
+  "Stop pool p taking fibers: a spawn into it throws from now on. Its carriers
+  run the fibers already in it to the end, parked ones included, and then
+  their threads end. Returns at once, without waiting for them."
+  [p]
+  (jolt.host/fiber-pool-shutdown! p))
 
 (defn fiber?
   "True when x is a fiber handle."

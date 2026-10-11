@@ -1585,6 +1585,23 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.fibers pools — carrier pools besides the default one: spawn into one,
+# shut it down, and a carrier pinned by a blocking foreign call holding up only
+# its own pool's fibers.
+pools_out="$($jolt run test/chez/jolt-fiber-pools-test.clj 2>&1)"
+if printf '%s' "$pools_out" | grep -q 'JOLT-FIBER-POOLS-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.fibers pools"
+  if printf '%s\n' "$pools_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$pools_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$pools_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$pools_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
 #
