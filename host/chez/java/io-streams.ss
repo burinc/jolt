@@ -771,6 +771,18 @@
 (define out-stream-marker (keyword "jolt" "out-stream"))
 (define (user-in-stream? x)
   (or (declares-class? x "java.io.InputStream") (marked-stream? x in-stream-marker)))
+;; The concrete method NAME of java.io.InputStream / OutputStream for a marked
+;; stream, or #f: what a reify declaring the class inherits (host-static.ss
+;; abstract-class-method), for a tagged-table stream that defines only the
+;; read / write the class leaves abstract. jolt.socket's SocketInputStream had
+;; no readAllBytes.
+(define (stream-contract-method obj name)
+  (let ((h (cond ((marked-stream? obj in-stream-marker)
+                  (hashtable-ref abstract-methods-tbl "java.io.InputStream" #f))
+                 ((marked-stream? obj out-stream-marker)
+                  (hashtable-ref abstract-methods-tbl "java.io.OutputStream" #f))
+                 (else #f))))
+    (and h (hashtable-ref h name #f))))
 ;; …and the other three java.io roots a reify/proxy extends. Each is the class it
 ;; declares to every coercion site — slurp, spit, io/reader, io/writer, io/copy,
 ;; io/input-stream, io/output-stream — which drive it through the read / write
@@ -988,31 +1000,49 @@
 ;; flushes its own encoder AND the stream underneath, which is what makes a
 ;; PrintStream over a logging proxy emit on (println …), since println flushes.
 (define (make-char-writer port . down)
-  (make-jhost "char-writer" (vector port (and (pair? down) (car down)))))
-(define (char-writer-downstream self)
-  (let ((st (jhost-state self))) (and (> (vector-length st) 1) (vector-ref st 1))))
+  (make-jhost "char-writer" (vector port (and (pair? down) (car down)) #f)))
+(define (char-writer-downstream self) (vector-ref (jhost-state self) 1))
+;; The byte port a charset writer encodes into (make-charset-writer), or #f. A
+;; flush has to reach it: the encoder hands it whole blocks and leaves them in
+;; its buffer, rather than flushing it once per block.
+(define (char-writer-sink self) (vector-ref (jhost-state self) 2))
+;; The port to write, or the JVM's IOException once closed, as out-stream-live-port
+;; does for the byte side: a closed Chez port raised a classless "put-string: not
+;; permitted on closed port". A second close is a no-op on the JVM, so close asks
+;; port-closed? itself.
+(define (char-writer-live-port self)
+  (let ((port (char-writer-port self)))
+    (if (port-closed? port) (io-throw "Stream closed") port)))
 (define (cw-text x) (if (number? x) (string (integer->char (jnum->exact x))) (jolt-str-render-one x)))
 (register-host-methods! "char-writer"
   (list
    (cons "write" (lambda (self x . rest)
                    ;; (write str) | (write int) | (write str off len)
                    (let ((s (cw-text x)))
-                     (put-string (char-writer-port self)
+                     (put-string (char-writer-live-port self)
                                  (if (>= (length rest) 2) (substring s (jnum->exact (car rest))
                                                                      (+ (jnum->exact (car rest)) (jnum->exact (cadr rest)))) s)))
                    jolt-nil))
-   (cons "append" (lambda (self x . rest) (put-string (char-writer-port self) (cw-text x)) self))
-   (cons "newLine" (lambda (self) (put-char (char-writer-port self) #\newline) jolt-nil))
+   (cons "append" (lambda (self x . rest) (put-string (char-writer-live-port self) (cw-text x)) self))
+   (cons "newLine" (lambda (self) (put-char (char-writer-live-port self) #\newline) jolt-nil))
    (cons "flush" (lambda (self)
-                   (flush-output-port (char-writer-port self))
+                   (flush-output-port (char-writer-live-port self))
+                   (let ((bp (char-writer-sink self)))
+                     (when (and bp (not (port-closed? bp))) (flush-output-port bp)))
                    (let ((d (char-writer-downstream self)))
                      (when d (record-method-dispatch d "flush" jolt-nil)))
                    jolt-nil))
    (cons "close" (lambda (self)
-                   (flush-output-port (char-writer-port self))
-                   (let ((d (char-writer-downstream self)))
-                     (when d (record-method-dispatch d "close" jolt-nil)))
-                   (close-port (char-writer-port self))
+                   (let ((port (char-writer-port self)))
+                     (unless (port-closed? port)
+                       (flush-output-port port)
+                       ;; before the downstream close, which may close the
+                       ;; stream the sink's buffered bytes are bound for
+                       (let ((bp (char-writer-sink self)))
+                         (when (and bp (not (port-closed? bp))) (flush-output-port bp)))
+                       (let ((d (char-writer-downstream self)))
+                         (when d (record-method-dispatch d "close" jolt-nil)))
+                       (close-port port)))
                    jolt-nil))
    (cons "toString" (lambda (self) "#<Writer>"))))
 
@@ -1031,20 +1061,35 @@
 ;; (natives-str.ss), the same encoder .getBytes uses. UTF-16 marks its byte order
 ;; once, at the start of the stream, and is plain big-endian after that -- else
 ;; the mark would reappear at every block boundary.
+;;
+;; The encoded bytes stay in bp's buffer until the writer flushes or closes,
+;; which is why only make-charset-writer calls this: it records bp so the
+;; writer's flush reaches it. Flushing bp once per block made every non-UTF-8
+;; write cost a write(2) per block, 8x the UTF-8 writer's time.
 (define (charset-output-port bp name)
   (io-check-encoding! name)
   (if (io-utf8? name)
       (transcoded-port bp utf8-tx)
-      (let ((enc name))
+      (let ((enc name) (utf16? (string=? (charset-canonical-down name) "utf-16")))
         (make-custom-textual-output-port "charset-writer"
           (lambda (str start count)
             (when (fx>? count 0)
               (put-bytevector bp (charset-encode-bv (substring str start (fx+ start count)) enc))
-              (flush-output-port bp)
-              (when (string=? (charset-canonical-down enc) "utf-16") (set! enc "UTF-16BE")))
+              (when utf16? (set! utf16? #f) (set! enc "UTF-16BE")))
             count)
           #f #f
           (lambda () (close-port bp))))))
+;; A char-writer encoding into byte port BP in charset ENC. DOWN is the stream
+;; object a flush and close also go to, or #f. OWN?: BP was opened for this
+;; writer, so a charset the host cannot write closes it again; a stream the
+;; caller handed in is left open, as the JVM's OutputStreamWriter leaves it.
+(define (make-charset-writer bp enc down own?)
+  (make-jhost "char-writer"
+    (vector (if own?
+                (guard (e (#t (close-port bp) (raise e))) (charset-output-port bp enc))
+                (charset-output-port bp enc))
+            down
+            bp)))
 ;; Reading: a one-byte charset decodes as the bytes arrive, so a pipe still
 ;; streams. A multi-byte or stateful one decodes the whole input on the first
 ;; read, through decode-bytevector -- the decoder (String. bytes cs) and slurp
@@ -1440,8 +1485,7 @@
           (let ((bp (open-file-output-port p
                       (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                       (buffer-mode block))))
-            (make-char-writer (guard (e (#t (close-port bp) (raise e)))
-                                (charset-output-port bp cs)))))))))
+            (make-charset-writer bp cs #f #t)))))))
 ;; InputStreamReader / OutputStreamWriter decode / encode the wrapped byte stream
 ;; (UTF-8 default; an explicit charset is honored only as UTF-8 here).
 ;;
@@ -1576,11 +1620,11 @@
     (when (writer-jhost? out)
       (throw-jvm (quote IllegalArgumentException)
                  "OutputStreamWriter wraps an OutputStream, not a Writer (it already takes characters)"))
-    (make-char-writer (charset-output-port (out-stream-sink-port out)
-                                           (if (and (pair? rest) (ctor-charset? (car rest)))
-                                               (charset-arg-name (car rest))
-                                               "UTF-8"))
-                      out)))
+    (make-charset-writer (out-stream-sink-port out)
+                         (if (and (pair? rest) (ctor-charset? (car rest)))
+                             (charset-arg-name (car rest))
+                             "UTF-8")
+                         out #f)))
 ;; Buffered* — Chez ports are buffered already; the wrapper is the wrapped stream.
 (for-each (lambda (n) (register-class-ctor! n (lambda (inner . _) inner)))
           '("BufferedWriter" "java.io.BufferedWriter"
@@ -1887,6 +1931,15 @@
 ;; Both take io.clj's options. A byte stream has no charset, so :encoding is
 ;; accepted and has nothing to do, as on the JVM; :append opens the output file
 ;; without truncating it.
+;; A java.net.Socket (jolt.socket builds it as a host tagged-table carrying its
+;; :class): io.clj's IOFactory opens a socket's own streams, so io/reader,
+;; io/writer, io/input-stream and io/output-stream all take one.
+(define socket-class-key (keyword #f "class"))
+(define (socket-value? x)
+  (and (htable? x)
+       (let ((c (jolt-ref-get x socket-class-key)))
+         (and (string? c) (jch-isa? c "java.net.Socket")))))
+(define (socket-stream x getter) (record-method-dispatch x getter jolt-nil))
 (define (jio-input-stream x . opts)
   (io-opts-check! opts)
   (cond ((or (in-stream? x) (user-in-stream? x)) x)
@@ -1909,6 +1962,7 @@
         ;; an entry inside a jar on the roots streams out of the archive (io.ss)
         ((jar-path? x) (jar-path-stream x))
         ((string? x) (jio-open-in-file (io-source-path x) (if (file-url-string? x) (file-url->path x) x)))
+        ((socket-value? x) (socket-stream x "getInputStream"))
         (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an InputStream.")))))
 (define (jio-output-stream x . rest)
   (io-opts-check! rest)
@@ -1932,6 +1986,7 @@
         ;; System/out and System/err are already byte streams — pass them through,
         ;; the way an out-stream passes through.
         ((and (jhost? x) (text-sink-tag? (jhost-tag x))) x)
+        ((socket-value? x) (socket-stream x "getOutputStream"))
         (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an OutputStream.")))))
 (def-var! "clojure.java.io" "input-stream" jio-input-stream)
 (def-var! "clojure.java.io" "output-stream" jio-output-stream)
@@ -1992,6 +2047,7 @@
              (jio-file-char-reader (jfile-fs x) (jfile-path x)))
             ((and (string? x) (not (jar-path? (io-source-path x))))
              (jio-file-char-reader (io-source-path x) (if (file-url-string? x) (file-url->path x) x)))
+            ((socket-value? x) (apply jolt-io-reader (socket-stream x "getInputStream") opts))
             (else (prev x)))))))
 ;; A File, a path or a URL is an encoding writer over the stream io/output-stream
 ;; opens on it, which is the JVM's make-writer, so :append reaches the open and
@@ -2005,17 +2061,17 @@
           (io-opts-check! opts)
           (let ((enc (io-encoding opts)))
           (cond ((char-writer? x) x)
-                ((out-stream? x) (make-char-writer (charset-output-port (out-stream-sink-port x) enc)))
+                ((out-stream? x) (make-charset-writer (out-stream-sink-port x) enc #f #f))
                 ((and (jhost? x) (text-sink-tag? (jhost-tag x))) x)
                 ;; a java.io.OutputStream the caller wrote is encoded into, the
                 ;; way jolt's is; a java.io.Writer the caller wrote is the writer
                 ;; (BufferedWriter. over one is the identity here)
-                ((user-out-stream? x) (make-char-writer (charset-output-port (out-stream-sink-port x) enc) x))
+                ((user-out-stream? x) (make-charset-writer (out-stream-sink-port x) enc x #f))
                 ((user-writer? x) x)
                 ((or (jfile? x) (string? x) (url-jhost? x))
                  (let ((out (apply jio-output-stream x opts)))
-                   (make-char-writer (guard (e (#t (close-port (out-stream-port out)) (raise e)))
-                                       (charset-output-port (out-stream-port out) enc)))))
+                   (make-charset-writer (out-stream-port out) enc #f #t)))
+                ((socket-value? x) (apply jolt-io-writer (socket-stream x "getOutputStream") opts))
                 (else (apply prev x opts)))))))
 ;; re-bound: the clojure.java.io vars hold the VALUE these names had when io.ss
 ;; ran, so a set! above would not reach them.

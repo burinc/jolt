@@ -274,7 +274,7 @@
           (if (zout-of x)
               (begin
                 (io-opts-check! opts)
-                (make-char-writer (charset-output-port (out-stream-sink-port x) (io-encoding opts)) x))
+                (make-charset-writer (out-stream-sink-port x) (io-encoding opts) x #f))
               (apply prev x opts))))
   (def-var! "clojure.java.io" "writer" jolt-io-writer))
 

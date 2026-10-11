@@ -913,6 +913,19 @@
     (check-eq "ai_addr probe: no address in either slot" (ai-addr none native/af-inet) nil)
     (finally (doseq [p [sa glibc bsd canon both none]] (ffi/free p)))))
 
+;; clojure.java.io's openers take a Socket itself, as io.clj's IOFactory does:
+;; its own streams, opened by getInputStream / getOutputStream
+(with-pair
+  (fn [server client conn]
+    (with-open [w (clojure.java.io/writer client)] (.write w "hi\n"))
+    (check-eq "io/writer and io/reader on a Socket"
+              (with-open [r (clojure.java.io/reader conn)] (.readLine r)) "hi")))
+(with-pair
+  (fn [server client conn]
+    (with-open [o (clojure.java.io/output-stream client)] (.write o (byte-array [1 2 3])))
+    (check-eq "io/output-stream and io/input-stream on a Socket"
+              (with-open [i (clojure.java.io/input-stream conn)] (vec (.readAllBytes i))) [1 2 3])))
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

@@ -2455,8 +2455,9 @@
 ;; UnsupportedEncodingException -- the same check Charset/forName makes, minus
 ;; the IllegalCharsetNameException split, which an OutputStreamWriter does not
 ;; draw.
+(define (io-encoding-known? name) (or (charset-lookup name) (iconv-known? name)))
 (define (io-check-encoding! name)
-  (unless (or (charset-lookup name) (iconv-known? name))
+  (unless (io-encoding-known? name)
     (unsupported-encoding-throw name)))
 ;; (slurp src :encoding "...") as the rest list decode-bytevector takes.
 (define (slurp-encoding opts) (list (io-encoding opts)))
@@ -2578,9 +2579,22 @@
   (io-opts-check! opts)
   (let* ((given (if (url-jhost? path) (url-write-path path) (file-path-of path)))
          (p (project-relative given))
-         ;; encoded up front too: a charset the host cannot write raises before
-         ;; the target is touched, and :encoding was ignored outright before
-         (bytes (charset-encode-bv (jolt-str-render-one content) (io-encoding opts))))
+         (enc (io-encoding opts))
+         ;; encoded up front too, and :encoding was ignored outright before
+         (bytes (begin
+                  ;; The JVM's spit opens the target and THEN builds the writer
+                  ;; that refuses the charset, so a charset it does not know
+                  ;; still truncates the file (or creates it) before raising.
+                  (unless (io-encoding-known? enc)
+                    (close-port (open-path-guarded given p
+                                  (lambda (rp)
+                                    (open-file-output-port rp
+                                      (if (io-append? opts)
+                                          (file-options no-fail no-truncate append)
+                                          (file-options no-fail))
+                                      (buffer-mode none)))))
+                    (io-check-encoding! enc))
+                  (charset-encode-bv (jolt-str-render-one content) enc))))
     ;; The JVM opens the TARGET, so a target it cannot open fails here and names
     ;; itself. This wrote its temp file first and only discovered the target at
     ;; the rename, which came back as Chez's "cannot rename ..." inside a plain

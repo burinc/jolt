@@ -2005,9 +2005,14 @@
     (let ((tag (and (htable? obj) (hashtable-ref (htable-h obj) "jolt/type" #f))))
       (let* ((mh (and tag (hashtable-ref tagged-methods-tbl (tag->method-key tag) #f)))
              (f  (and mh (hashtable-ref mh method-name #f))))
-        (if f
-            (apply f obj (if (jolt-nil? rest-args) '() (seq->list rest-args)))
-            'pass)))))
+        (cond
+          (f (apply f obj (if (jolt-nil? rest-args) '() (seq->list rest-args))))
+          ;; a stream marked as answering the java.io contract inherits the
+          ;; methods InputStream / OutputStream write over read / write, as a
+          ;; proxy of either does (io-streams.ss stream-contract-method)
+          ((and tag (stream-contract-method obj method-name))
+           => (lambda (g) (apply g obj (if (jolt-nil? rest-args) '() (seq->list rest-args)))))
+          (else 'pass))))))
 
 (def-var! "clojure.core" "__register-class-methods!"
   (lambda (tag members) (register-tagged-methods! tag (jmap->static-alist members)) jolt-nil))
