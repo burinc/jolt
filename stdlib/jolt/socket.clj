@@ -491,8 +491,7 @@
     (ensure-open! self)
     (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]
       (try
-        (dotimes [i len]
-          (ffi/write buf :uint8 (bit-and (aget bytes (+ off i)) 0xff) i))
+        (ffi/write-array buf bytes off len)
         (send-fully! (jolt.host/ref-get self :socket) fd buf len)
         (finally (ffi/free buf))))))
 
