@@ -578,6 +578,18 @@
            :jvm "2"
            :jolt "1"}
    :note "Inherent to code-point strings: a surrogate half is not a scalar value."}
+  ;; The JVM interns every string literal. jolt shares equal literals only where a
+  ;; vfasl image combines the compiled entries (chez-patches/0004, jolt-50zg); a
+  ;; form read for eval reads each literal as its own object, and no literal is
+  ;; in String.intern's pool, though .intern itself answers one object per content.
+  {:category :string-model
+   :behavior "two equal string literals, outside a built image"
+   :jvm "the same interned object"
+   :jolt "separate objects, equal by value"
+   :check {:expr "(pr-str (identical? \"abc\" \"abc\"))"
+           :jvm "\"true\""
+           :jolt "\"false\""}
+   :note "Tracked as jolt-8kcv: interning at load costs a slot and a pool insert per literal."}
   ;; proxy over a concrete class EXTENDS BY DELEGATION: jolt generates no classes,
   ;; so the proxy holds a real base instance, answers what its body declares and
   ;; forwards the rest. Two consequences, both inherent to delegation rather than

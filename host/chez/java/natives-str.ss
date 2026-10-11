@@ -725,6 +725,18 @@
 (define (jolt-str-last-index-of s needle) (str-last-index-of s (str-needle needle)))
 (define (jolt-str-strip s left? right?) (str-strip s left? right?))
 (define (jolt-str-to-char-array s) (na-char-array s))
+;; String.intern: one canonical object per content, the JVM's string pool. An
+;; ephemeron table, because the entry's value is its own key and an ordinary
+;; weak table would keep every interned string alive through that value. Lookup
+;; is unlocked and the insert re-checks under the lock, the double-check the
+;; symbol-string pool (values.ss) uses for the same reason.
+(define jolt-str-intern-pool (make-ephemeron-hashtable string-hash string=?))
+(define jolt-str-intern-mu (make-mutex))
+(define (jolt-str-intern s)
+  (or (hashtable-ref jolt-str-intern-pool s #f)
+      (jolt-with-mutex jolt-str-intern-mu
+        (or (hashtable-ref jolt-str-intern-pool s #f)
+            (begin (hashtable-set! jolt-str-intern-pool s s) s)))))
 (define (jolt-str-get-bytes s cs) (na-byte-array (charset-encode-bv s cs)))
 (define (jolt-str-matches? s pat) (if (irregex-match (str-irx pat) s) #t #f))
 (define (jolt-str-replace-all s pat repl) (re-replace (str-irx pat) s repl #t))
@@ -923,9 +935,7 @@
     ;; getMessage with itself; equals is value equality.
     ((or (string=? method "getMessage") (string=? method "getLocalizedMessage")) s)
     ((string=? method "equals") (jolt-str-equals? s (arg 0)))
-    ;; String.intern: jolt strings aren't pooled, but value equality holds, so the
-    ;; canonical representation is the string itself.
-    ((string=? method "intern") s)
+    ((string=? method "intern") (jolt-str-intern s))
     ;; A class token is its canonical-name string, so Class methods land here:
     ;; (.getName (.getClass x)) / (.getSimpleName …) over the name string.
     ((or (string=? method "getName") (string=? method "getCanonicalName")) s)
