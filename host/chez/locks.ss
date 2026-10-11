@@ -620,7 +620,7 @@
 ;; wait protocol the runtime has, rather than a second one written by hand.
 (define (jolt-pause-ms ms)
   (if (jolt-current-fiber)
-      (let ((mu (make-mutex)) (cv (make-condition)))
+      (let ((mu (make-mutex)) (cv (jolt-make-cv)))
         (jolt-cv-wait mu cv (mono-deadline ms)
           (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
         (void))
