@@ -516,8 +516,21 @@
                 (h (mix-coll-hash (car result) (cdr result))))
            (pset-hasheq-set! x h)
            h)))
+    ((reify-declared-hash x) => (lambda (m) (call-declared-hash m x)))
     ((jolt-identity-hashed? x) (jolt-identity-hasheq x))
     (else (equal-hash x))))
+
+;; A declared hashCode / hasheq (deftype, reify) returns an int on the JVM, so a
+;; long result is narrowed as Number.intValue does: (+ 2000000000 2000000000)
+;; hashes as -294967296. Applied where the method is called, never at install,
+;; so the stored procedure stays the user's own (images travel it by identity).
+(define (declared-hash-int v)
+  (cond ((and (number? v) (exact? v) (integer? v)) (i32 v))
+        ((and (flonum? v) (finite? v)) (i32 (exact (truncate v))))
+        (else v)))
+(define (call-declared-hash m x) (declared-hash-int (jolt-invoke m x)))
+(define (reify-declared-hash x)
+  (and (jreify? x) (or (reify-method-ref x "hasheq") (reify-method-ref x "hashCode"))))
 
 ;; A record no eq arm claims is = only to itself, so it hashes by identity (see
 ;; the Chez file). Here a record is a vector tagged with its registered type id

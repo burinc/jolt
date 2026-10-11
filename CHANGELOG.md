@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contents with `=`, so `(Optional/of 1.0)` equalled `(Optional/of (float 1.0))`
   where the JVM says false. `.equals` on a boxed number answers instead of
   raising.
+- **A declared `hashCode` or `hasheq` is narrowed to an int.** A deftype or
+  `reify` whose method returned a long past the int range hashed as that long;
+  the JVM wraps it. A `reify`'s own `hashCode` now also governs `hash`.
+- **`(Object.)` answers `.hashCode`, `.equals` and `.toString`**, and renders as
+  `java.lang.Object@<hash>` like the JVM.
 - **`.hashCode` on a sorted map no longer hangs**, and a sorted set's and a hash
   set's `.hashCode` are the JVM's 32-bit `Set.hashCode`.
 - **An image from 0.8.21 or earlier keeps its identity-keyed entries.** A
