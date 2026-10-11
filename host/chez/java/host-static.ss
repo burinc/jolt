@@ -824,7 +824,7 @@
       '(("byteValue" 0) ("shortValue" 0) ("intValue" 0) ("longValue" 0)
         ("doubleValue" 0) ("floatValue" 0) ("toString" 0 1) ("hashCode" 0)
         ("isNaN" 0) ("isInfinite" 0) ("negate" 0) ("abs" 0) ("bitLength" 0)
-        ("signum" 0) ("shiftLeft" 1) ("shiftRight" 1)))
+        ("signum" 0) ("shiftLeft" 1) ("shiftRight" 1) ("equals" 1)))
     h))
 (define (number-method method n . args)
   ;; Same shape as jolt-string-method's check, including the (pair? args) guard:
@@ -835,6 +835,16 @@
              (and m (not (bitwise-bit-set? m (length args))))))
       (dispatch-miss n method args)
       (number-method-arms method n args)))
+
+;; Number.equals: the same boxed class and value. jolt's classes follow the value
+;; (a flonum is a Double, an exact integer a Long or a BigInt by range, any other
+;; exact a Ratio), so same kind and = is the test. Double.equals compares
+;; doubleToLongBits: every NaN equals every NaN, 0.0 is not -0.0.
+(define (java-number-equals? n o)
+  (and (number? o)
+       (cond ((flonum? n) (and (flonum? o) (or (and (nan? n) (nan? o)) (eqv? n o))))
+             ((exact? n) (and (exact? o) (eq? (integer? n) (integer? o)) (= n o)))
+             (else (eqv? n o)))))
 
 (define (number-method-arms method n args)
   (cond
@@ -857,6 +867,7 @@
                 (number->string n (if (and (fixnum? radix) (fx<=? 2 radix 36)) radix 10)))))
            (else (dispatch-miss n method args))))
     ((string=? method "hashCode") (jolt-java-number-hashcode n))
+    ((string=? method "equals") (java-number-equals? n (car args)))
     ;; Double/Float .isNaN / .isInfinite (a non-flonum is neither).
     ((string=? method "isNaN") (and (flonum? n) (not (= n n))))
     ((string=? method "isInfinite") (and (flonum? n) (infinite? n)))

@@ -19,9 +19,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LinkedBlockingQueue` went from 180 ns to 92 ns on macOS, whether or not
   fibers are parked elsewhere. Images are written as format 11; older images
   still restore.
+- **A socket write copies the array in one step.** `OutputStream.write` on a
+  `java.net.Socket` filled its native buffer with one `ffi/write` per byte,
+  about 190 ms per MB, so a large write was bound by that copy and not by the
+  socket. It now copies with `ffi/write-array`. On macOS arm64, writing 8 MB to
+  a loopback peer went from 1.7 s to 0.18 s.
 
 ### Fixed
 
+- **Objects without value equality hash by identity.** Atoms, delays,
+  volatiles, refs, agents, promises, `reify` instances, `Object`,
+  `StringBuilder` and the other modeled host objects all hashed to one
+  constant, so a map or set keyed by them was a single collision bucket and
+  took O(n^2) to build. They now hash per object, as `Object.hashCode` does on
+  the JVM. UUIDs, `Optional`s, tagged literals and `File`s hashed to the same
+  constant despite being compared by value; they now hash as their JVM
+  `hashCode`. `File.hashCode` also returns the JVM's int instead of a 40-bit
+  number (#1313).
+- **`Optional` and tagged-literal `=` follow `.equals`.** They compared their
+  contents with `=`, so `(Optional/of 1.0)` equalled `(Optional/of (float 1.0))`
+  where the JVM says false. `.equals` on a boxed number answers instead of
+  raising.
+- **`.hashCode` on a sorted map no longer hangs**, and a sorted set's and a hash
+  set's `.hashCode` are the JVM's 32-bit `Set.hashCode`.
+- **An image from 0.8.21 or earlier keeps its identity-keyed entries.** A
+  set of `StringBuilder`s or a map keyed by `reify` instances is rebuilt on
+  restore, so lookups by the new identity hash find them.
 - **`clojure.java.io/writer`, `reader` and `input-stream` take Clojure's
   options.** They accepted one argument, so `(io/writer f :append true)` and
   `(io/reader f :encoding "ISO-8859-1")` were an `ArityException`, and there

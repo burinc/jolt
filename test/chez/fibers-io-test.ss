@@ -376,5 +376,21 @@
 (wait-until (lambda () (eq? (jolt-fiber-state t9-pause) 'done)) 15.0 "9. pausing fiber finished")
 (ok "9g. a fiber pause parks and comes back" (eq? (jolt-fiber-result t9-pause) 'paused))
 
+;; An interrupt ends a fiber's park without a wake, so the wake that would have
+;; drained the fiber from its condition never comes: the wait has to take itself
+;; off, or the condition holds the dead wait's continuation until its next wake.
+(define t9-never (jolt-make-cv))
+(define t9-int
+  (sa-fiber-spawn
+    (lambda ()
+      (guard (e (#t 'interrupted))
+        (jolt-cv-wait t9-mu t9-never #f (lambda (_) jolt-cv-again))))))
+(wait-until (lambda () (eq? (jolt-fiber-state t9-int) 'parked)) 15.0 "9. fiber parked to be interrupted")
+(jolt-fiber-interrupt! t9-int 'stop)
+(wait-until (lambda () (eq? (jolt-fiber-state t9-int) 'done)) 15.0 "9. interrupted fiber finished")
+(ok "9h. the interrupt ended the wait" (eq? (jolt-fiber-result t9-int) 'interrupted))
+(ok "9i. and took the fiber off its condition"
+    (jolt-with-mutex t9-mu (null? (jolt-cv-fibers t9-never))))
+
 (printf "\nfibers-io: ~a checks, ~a failures\n" total fails)
 (exit (if (zero? fails) 0 1))

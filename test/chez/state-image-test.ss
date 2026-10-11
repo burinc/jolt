@@ -435,6 +435,17 @@
                      "  (= #{:dt :vec} (set (map (fn [k] (get m k)) (keys m))))])")
       "[2 true]")
   (cleanup!))
+;; Same for an atom or a reify key: records with identity equality hash by a
+;; per-process id (hasheq.ss jolt-identity-hashed?), not by equal-hash.
+(begin
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\""
+                     " (into {} (map (fn [i] [(atom i) i]) (range 40))))"))
+  (is "atom-keyed map is self-consistent after restore"
+      (string-append "(let [m (jolt.host/image-read \"" tmp "\")]"
+                     " [(count m) (every? (fn [k] (= @k (get m k))) (keys m))])")
+      "[40 true]")
+  (cleanup!))
 ;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
 ;; fn — (first raw-holder) is a real core-tier closure with no registration
 (is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"
@@ -1592,6 +1603,18 @@
 (is "v0.8.21 fixture: a restored ReentrantLock hands over under contention"
     "(let [lk imglock10/lk] (.lock lk) (let [f (future (.lock lk) (.unlock lk) :got-it)] (Thread/sleep 50) (.unlock lk) (deref f 3000 :hung)))"
     ":got-it")
+
+;; Before #1313 every StringBuilder, atom, reify, ... hashed to one constant, so
+;; a value image written then filed identity-keyed entries under it. The restore
+;; walk rebuilds any map or set keyed by such a value, or a lookup by the new
+;; per-object hash misses. Fixture made by v0.8.21 (format 10); permanent.
+(ok "v0.8.21 identity-hash fixture present" (file-exists? "test/chez/fixtures/image-v0.8.21-idhash.image"))
+(is "v0.8.21 fixture: a StringBuilder-keyed set and an atom-keyed map find every key"
+    (string-append "(let [m (jolt.host/image-read \"test/chez/fixtures/image-v0.8.21-idhash.image\")]"
+                   " [(count (filter (fn [s] (contains? (:sb-set m) s)) (:sbs m)))"
+                   "  (count (filter (fn [a] (= @a (get (:at-map m) a))) (:ats m)))"
+                   "  (= \"sb0\" (str (first (:sbs m))))])")
+    "[40 40 true]")
 
 (printf "~a/~a state-image assertions passed\n" (- total fails) total)
 (when (> fails 0) (exit 1))
