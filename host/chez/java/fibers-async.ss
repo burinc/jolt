@@ -425,6 +425,26 @@
     (let ((fib (sa-fiber-spawn (lambda () (*txn* #f) (jolt-invoke f)))))
       (jolt-fiber-ensure-carrier!)
       fib)))
+;; Pools besides the default (fibers.ss, jolt-fiber-pool-make). A spawn into a
+;; pool is fiber-spawn with the carrier taken from the pool; nil back means the
+;; pool is shut down, which jolt.fibers/spawn reports.
+(def-var! "jolt.host" "fiber-pool-make"
+  (lambda (name n)
+    (unless (and (fixnum? n) (fx>? n 0))
+      (jolt-throw (jolt-ex-info "pool size must be a positive int"
+                                (jolt-hash-map (jolt-keyword "given") n))))
+    (jolt-fiber-pool-make name n)))
+(def-var! "jolt.host" "fiber-pool?" (lambda (x) (if (jolt-pool? x) #t #f)))
+(def-var! "jolt.host" "fiber-pool-name" (lambda (p) (jolt-pool-name p)))
+(def-var! "jolt.host" "fiber-pool-size" (lambda (p) (jolt-fiber-pool-size p)))
+(def-var! "jolt.host" "fiber-pool-of"
+  (lambda (fib) (or (jolt-fiber-pool-of fib) jolt-nil)))
+(def-var! "jolt.host" "fiber-pool-spawn"
+  (lambda (p f)
+    (or (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)))
+        jolt-nil)))
+(def-var! "jolt.host" "fiber-pool-shutdown!"
+  (lambda (p) (jolt-fiber-pool-shutdown! p) jolt-nil))
 (def-var! "jolt.host" "fiber-instance?" (lambda (x) (if (jolt-fiber? x) #t #f)))
 (def-var! "jolt.host" "fiber-yield" (lambda () (sa-fiber-yield) jolt-nil))
 ;; The callback gets what a jolt catch would bind: the unwrapped error for a

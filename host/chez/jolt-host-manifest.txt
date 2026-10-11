@@ -63,6 +63,13 @@ fiber-kill!
 fiber-masked
 fiber-monitor!
 fiber-park-commit!
+fiber-pool-make
+fiber-pool-name
+fiber-pool-of
+fiber-pool-shutdown!
+fiber-pool-size
+fiber-pool-spawn
+fiber-pool?
 fiber-preempt-ticks
 fiber-preempt-ticks-set!
 fiber-resume

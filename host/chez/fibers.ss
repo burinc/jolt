@@ -339,8 +339,13 @@
   (fields mu cv (mutable head) (mutable tail)
           (mutable sched-k) sched-slice (mutable thread) (mutable stop?)
           (mutable sm-parks) (mutable chan-parks) (mutable preempts)
-          (mutable sic))
-  (nongenerative jolt-carrier-v6))
+          (mutable sic)
+          ;; pool: the jolt-pool this carrier belongs to, or #f for the
+          ;; default pool. live: how many fibers spawned onto it have not
+          ;; finished, counted under mu for a pool carrier only, so a shut-down
+          ;; pool's carrier knows when it may stop (see jolt-fiber-pool-make).
+          pool (mutable live))
+  (nongenerative jolt-carrier-v7))
 
 ;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
 ;; parking fiber, on its own carrier's field, so no two threads touch one field.
@@ -438,7 +443,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0)))
         (set! jolt-fiber-carriers v)))
     (jolt-unlock! jolt-fiber-rr-mu)))
 
@@ -713,17 +718,20 @@
 ;; concurrency.ss) binds that object to the fiber there, so the fiber's own
 ;; Thread/currentThread can never see it unbound.
 (define (jolt-fiber-spawn* thunk ibox before-run)
-  (let ((c (jolt-fiber-pick!)))
-    (let ((f (make-jolt-fiber
-              'ready thunk #f #f #f #f
-              (make-jolt-dslice (jolt-slice-stack-param)
-                                (jolt-slice-ns-param)
-                                #f)
-              c #f '() 0 #f #f 0 #f ibox #f #f #f #f)))
-      (when ibox (jolt-fiber-own-ibox! f ibox))
-      (when before-run (before-run f))
-      (jolt-fiber-enqueue! c f)
-      f)))
+  (jolt-fiber-spawn-on* (jolt-fiber-pick!) thunk ibox before-run))
+
+;; The same, onto carrier c: the default pool's pick or a pool's.
+(define (jolt-fiber-spawn-on* c thunk ibox before-run)
+  (let ((f (make-jolt-fiber
+            'ready thunk #f #f #f #f
+            (make-jolt-dslice (jolt-slice-stack-param)
+                              (jolt-slice-ns-param)
+                              #f)
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f)))
+    (when ibox (jolt-fiber-own-ibox! f ibox))
+    (when before-run (before-run f))
+    (jolt-fiber-enqueue! c f)
+    f))
 
 ;; --- preemption (swish's quantum, erlang.ss:872 and @yield) ------------------
 ;; Without this a fiber only ever leaves its carrier at a channel op, so a
@@ -1616,3 +1624,109 @@
   (jolt-unlock! jolt-fiber-rr-mu)
   (set! jolt-fiber-pool-started? #f)
   (jolt-unlock! jolt-fiber-pool-mu))
+
+;; --- pools besides the default one --------------------------------------------
+;; A pool is a set of carriers of its own, made explicitly and sized when made,
+;; so fibers that may pin a carrier (a blocking foreign call) or hog one can be
+;; kept off the carriers that everything else runs on. The default pool above
+;; is untouched by this: no field it reads changed, and its hot paths do not
+;; know pools exist.
+;;
+;; Nothing else needs to know either. Placement is still once, at spawn, onto
+;; one of the pool's carriers by round-robin, and from then on every park,
+;; resume, interrupt and kill goes through the fiber's own carrier record, as
+;; it does in the default pool. So a fiber in one pool parks on a channel that
+;; a fiber in another puts to, and is woken onto its own carrier.
+;;
+;; Shutting a pool down refuses new spawns at once, but each carrier keeps
+;; running until every fiber placed on it has finished, parked ones included,
+;; and only then lets its thread end. The default pool's reset abandons parked
+;; fibers instead; that is a test knob, and this is not. The count of fibers
+;; still to finish (the carrier's live field) is kept under the carrier's mu,
+;; raised at spawn and lowered by a monitor on each fiber, so the default pool
+;; pays nothing for it.
+;;
+;; Lock order: pool mu, then carrier mu, which keeps the run-queue mu last.
+(define-record-type jolt-pool
+  (fields name (mutable carriers) (mutable rr) mu (mutable stopped?))
+  (nongenerative jolt-pool-v1))
+
+;; A pool carrier's loop: the default carrier loop, except a stop only ends it
+;; once nothing placed on it is left to run.
+(define (jolt-fiber-pool-carrier-loop c)
+  (let loop ()
+    (jolt-fiber-drain! c)
+    (jolt-lock! (jolt-carrier-mu c))
+    (cond
+      ((jolt-carrier-head c) (jolt-unlock! (jolt-carrier-mu c)) (loop))
+      ((and (jolt-carrier-stop? c) (fx=? 0 (jolt-carrier-live c)))
+       (jolt-unlock! (jolt-carrier-mu c)) (void))
+      (else (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+            (jolt-unlock! (jolt-carrier-mu c))
+            (loop)))))
+
+;; (jolt-fiber-pool-make name n) -> pool. n carriers, their threads started now.
+(define (jolt-fiber-pool-make name n)
+  (let ((p (make-jolt-pool name #f 0 (make-mutex) #f))
+        (v (make-vector n)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i n))
+      (vector-set! v i
+        (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
+                           (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 p 0)))
+    (jolt-pool-carriers-set! p v)
+    (do ((i 0 (fx+ i 1))) ((fx=? i n))
+      (let ((c (vector-ref v i)))
+        (jolt-carrier-thread-set! c
+          (fork-thread/daemon #t (lambda () (rdr-default-modes!) (jolt-fiber-pool-carrier-loop c))))))
+    p))
+
+(define (jolt-fiber-pool-size p) (vector-length (jolt-pool-carriers p)))
+
+;; The pool fiber f runs in, or #f for the default pool.
+(define (jolt-fiber-pool-of f) (jolt-carrier-pool (jolt-fiber-carrier f)))
+
+;; Reserve a carrier of p for one more fiber, or #f if p is shut down. The
+;; reservation is made under p's mu, so a shutdown cannot let the carrier stop
+;; between the pick and the fiber's arrival on its queue.
+(define (jolt-fiber-pool-reserve! p)
+  (jolt-lock! (jolt-pool-mu p))
+  (if (jolt-pool-stopped? p)
+      (begin (jolt-unlock! (jolt-pool-mu p)) #f)
+      (let* ((v (jolt-pool-carriers p))
+             (c (vector-ref v (mod (jolt-pool-rr p) (vector-length v)))))
+        (jolt-pool-rr-set! p (fx+ (jolt-pool-rr p) 1))
+        (jolt-lock! (jolt-carrier-mu c))
+        (jolt-carrier-live-set! c (fx+ (jolt-carrier-live c) 1))
+        (jolt-unlock! (jolt-carrier-mu c))
+        (jolt-unlock! (jolt-pool-mu p))
+        c)))
+
+;; A pool fiber has finished: one fewer for its carrier, and a stopped carrier
+;; with none left is woken to end.
+(define (jolt-fiber-pool-release! c)
+  (jolt-lock! (jolt-carrier-mu c))
+  (jolt-carrier-live-set! c (fx- (jolt-carrier-live c) 1))
+  (when (jolt-carrier-stop? c) (condition-signal (jolt-carrier-cv c)))
+  (jolt-unlock! (jolt-carrier-mu c)))
+
+;; (jolt-fiber-pool-spawn p thunk) -> fiber, or #f if p is shut down.
+(define (jolt-fiber-pool-spawn p thunk)
+  (let ((c (jolt-fiber-pool-reserve! p)))
+    (and c
+         (jolt-fiber-spawn-on* c thunk #f
+           (lambda (f) (jolt-fiber-monitor! f (lambda (err) (jolt-fiber-pool-release! c))))))))
+
+;; (jolt-fiber-pool-shutdown! p) -> void. No new spawns; each carrier ends once
+;; the fibers already on it have finished. Does not wait for them.
+(define (jolt-fiber-pool-shutdown! p)
+  (jolt-lock! (jolt-pool-mu p))
+  (unless (jolt-pool-stopped? p)
+    (jolt-pool-stopped?-set! p #t)
+    (vector-for-each
+      (lambda (c)
+        (jolt-lock! (jolt-carrier-mu c))
+        (jolt-carrier-stop?-set! c #t)
+        (condition-broadcast (jolt-carrier-cv c))
+        (jolt-unlock! (jolt-carrier-mu c)))
+      (jolt-pool-carriers p)))
+  (jolt-unlock! (jolt-pool-mu p)))
