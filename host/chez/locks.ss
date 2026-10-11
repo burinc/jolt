@@ -683,10 +683,15 @@
     (jolt-lock-wait/abandon mu
       (case-lambda
        ((_)
-        ;; abandoned by a fiber interrupt: the wait is over, deregister
-        (when entry
-          (jolt-with-mutex mu (jolt-interrupt-wait-remove! ibox entry))
-          (set! entry #f)))
+        ;; abandoned by a fiber interrupt: the wait is over, deregister. The
+        ;; interrupt resumed the fiber directly, so no wake drained it from cv's
+        ;; list; left there, cv would keep this dead wait reachable until its
+        ;; next wake.
+        (let ((f (jolt-current-fiber)))
+          (jolt-with-mutex mu
+            (jolt-cv-fibers-set! cv (remq f (jolt-cv-fibers cv)))
+            (when entry (jolt-interrupt-wait-remove! ibox entry))))
+        (set! entry #f))
        (()
         (let loop ()
           ;; The flag FIRST, on every round. That ordering is what gives the
