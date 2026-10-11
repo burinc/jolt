@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constant despite being compared by value; they now hash as their JVM
   `hashCode`. `File.hashCode` also returns the JVM's int instead of a 40-bit
   number (#1313).
+- **`Optional` and tagged-literal `=` follow `.equals`.** They compared their
+  contents with `=`, so `(Optional/of 1.0)` equalled `(Optional/of (float 1.0))`
+  where the JVM says false. `.equals` on a boxed number answers instead of
+  raising.
+- **`.hashCode` on a sorted map no longer hangs**, and a sorted set's and a hash
+  set's `.hashCode` are the JVM's 32-bit `Set.hashCode`.
+- **An image from 0.8.21 or earlier keeps its identity-keyed entries.** A
+  set of `StringBuilder`s or a map keyed by `reify` instances is rebuilt on
+  restore, so lookups by the new identity hash find them.
 
 ## [0.8.21] - 2026-10-11
 

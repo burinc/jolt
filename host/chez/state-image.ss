@@ -1065,17 +1065,28 @@
                          (touched proc-touched))
                     (set! proc-touched (or saved touched))
                     (values r touched)))))
+             ;; The read side asks its question of what the walk RETURNS: a
+             ;; live value of the current layouts, where the raw input can be an
+             ;; image record or a legacy layout the eq arms were never meant to
+             ;; see. An image written before #1313 filed a StringBuilder or a
+             ;; reify under the one constant every such record hashed to; the
+             ;; flag makes its container rebuild here.
              (walk
+              (lambda (x path)
+                (if restore?
+                    (let ((r (walk-body x path)))
+                      (when (jolt-identity-hashed? r) (set! proc-touched #t))
+                      r)
+                    (walk-body x path))))
+             (walk-body
               (lambda (x path)
                 ;; procedures AND plain deftypes hash by per-process identity
                 ;; (hasheq.ss jolt-identity-hasheq), so either under a key means
                 ;; the container's placement cannot travel. A deftype with a
                 ;; declared hashCode rekeys too — over-approximate, harmless.
                 ;; So does any other record with identity equality (an atom, a
-                ;; reify, ...: hasheq.ss jolt-identity-hashed?). Write side
-                ;; only: the read side walks image records and legacy layouts
-                ;; the eq arms were never meant to see, and the rekey verdict
-                ;; was already written.
+                ;; reify, ...: hasheq.ss jolt-identity-hashed?). On the read
+                ;; side walk asks it of the result instead (above).
                 (when (or (procedure? x)
                           (and (jrec? x) (not (jrec-record? x)))
                           (and (not restore?) (jolt-identity-hashed? x)))
@@ -1461,7 +1472,7 @@
                              (wm (if (eq? m jolt-nil) m (walk m (cons "<meta>" path)))))
                         (if (hashtable-ref memo x #f)
                             (hashtable-ref memo x #f)
-                            (if rekey
+                            (if (and rekey (not restore?))
                                 ;; a key's hash depends on a per-process fn id —
                                 ;; substitute the entries record; restore rebuilds
                                 (let ((r (make-image-rekey 'map
@@ -1469,7 +1480,9 @@
                                   (hashtable-set! memo x r)
                                   (image-carry-meta! r wm)
                                   r)
-                            (if (or dirty (not (eq? wm m)))
+                            ;; on the read side a rekey verdict means the
+                            ;; placement is stale: rebuild in this process
+                            (if (or dirty rekey (not (eq? wm m)))
                                 (let ((nx (apply jolt-hash-map
                                                  (apply append
                                                         (map (lambda (e) (list (car e) (cdr e)))
@@ -1514,13 +1527,13 @@
                              (wm (if (eq? m jolt-nil) m (walk m (cons "<meta>" path)))))
                         (if (hashtable-ref memo x #f)
                             (hashtable-ref memo x #f)
-                            (if rekey
+                            (if (and rekey (not restore?))
                                 (let ((r (make-image-rekey 'set
                                            (list->vector (reverse pairs)))))
                                   (hashtable-set! memo x r)
                                   (image-carry-meta! r wm)
                                   r)
-                            (if (or dirty (not (eq? wm m)))
+                            (if (or dirty rekey (not (eq? wm m)))
                                 (let ((nx (pset-from-pairs (reverse pairs))))
                                   (hashtable-set! memo x nx)
                                   (image-carry-meta! nx wm)

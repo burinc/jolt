@@ -1579,5 +1579,17 @@
     "(let [f (future (clojure.core.async/<!! imgchan8/buffered))] (Thread/sleep 50) (clojure.core.async/>!! imgchan8/buffered 9) (deref f 2000 :timeout))"
     "9")
 
+;; Before #1313 every StringBuilder, atom, reify, ... hashed to one constant, so
+;; a value image written then filed identity-keyed entries under it. The restore
+;; walk rebuilds any map or set keyed by such a value, or a lookup by the new
+;; per-object hash misses. Fixture made by v0.8.21 (format 10); permanent.
+(ok "v0.8.21 identity-hash fixture present" (file-exists? "test/chez/fixtures/image-v0.8.21-idhash.image"))
+(is "v0.8.21 fixture: a StringBuilder-keyed set and an atom-keyed map find every key"
+    (string-append "(let [m (jolt.host/image-read \"test/chez/fixtures/image-v0.8.21-idhash.image\")]"
+                   " [(count (filter (fn [s] (contains? (:sb-set m) s)) (:sbs m)))"
+                   "  (count (filter (fn [a] (= @a (get (:at-map m) a))) (:ats m)))"
+                   "  (= \"sb0\" (str (first (:sbs m))))])")
+    "[40 40 true]")
+
 (printf "~a/~a state-image assertions passed\n" (- total fails) total)
 (when (> fails 0) (exit 1))
