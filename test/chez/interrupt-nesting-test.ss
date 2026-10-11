@@ -32,7 +32,7 @@
     (vector-set! state 1 #t)
     (condition-broadcast (vector-ref state 4))))
 (define (probe-wait state index ms)
-  (let ((deadline (ms->deadline ms)))
+  (let ((deadline (add-duration (current-time 'time-utc) (ms->duration ms))))
     (with-mutex (vector-ref state 3)
       (let loop ()
         (cond ((vector-ref state index) #t)
