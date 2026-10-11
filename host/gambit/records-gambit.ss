@@ -947,8 +947,10 @@
 
 (define (jrec-hasheq-slow x)
   (cond
-    ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
-    ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
+    ((jrec-cl x "hasheq") =>
+     (lambda (m) (call-declared-hash m x)))
+    ((jrec-cl x "hashCode") =>
+     (lambda (m) (call-declared-hash m x)))
     ((jrec-record? x)
      (let ((h (jrec-hash x))) (jrec-hasheq-set! x h) h))
     (else
@@ -2710,7 +2712,8 @@
          (else (dispatch-miss obj method-name rest))))
       ((and (jrec? obj)
             (jrec-method-arity obj method-name (+ 1 (length rest)))) =>
-       (lambda (f) (apply jolt-invoke f obj rest)))
+       (lambda (f)
+         (invoke-declared-method f obj method-name rest)))
       ((and (jrec? obj)
             (null? rest)
             (jrec-member-field obj (keyword #f method-name))) =>
@@ -2748,7 +2751,7 @@
          (let ((f (reify-method-ref obj method-name))
                (d (jreify-delegate obj)))
            (cond
-             (f (apply jolt-invoke f obj rest))
+             (f (invoke-declared-method f obj method-name rest))
              (d (record-method-dispatch d method-name rest-args))
              ((and abstract-class-method-hook
                    (abstract-class-method-hook obj method-name)) =>
@@ -3332,6 +3335,12 @@
     (if (string=? method-name "getClass")
         (jolt-class obj)
         'pass)))
+
+(define (invoke-declared-method f obj name rest)
+  (if (and (null? rest)
+           (or (string=? name "hashCode") (string=? name "hasheq")))
+      (call-declared-hash f obj)
+      (apply jolt-invoke f obj rest)))
 
 (define-record-type jreify
   (fields methods protos delegate)

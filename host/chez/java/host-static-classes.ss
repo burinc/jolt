@@ -2586,10 +2586,7 @@
 ;; own .equals and .hashCode take (record-method-dispatch, jolt-java-hashcode), so
 ;; Objects/equals on two jolt values answers what (.equals a b) does: an array is
 ;; equal only to itself, a vector equals a list with the same elements.
-(define (objects-equals? a b)
-  (or (eq? a b)
-      (and (not (jolt-nil? a))
-           (jolt-truthy? (record-method-dispatch a "equals" (jolt-list b))))))
+;; objects-equals? itself lives in natives-misc.ss, which both hosts load.
 (define (objects-deep-equals? a b)
   (cond ((eq? a b) #t)
         ((or (jolt-nil? a) (jolt-nil? b)) #f)

@@ -141,11 +141,28 @@
           (else d))))
 (define (jtagged-pr t) (string-append "#" (jolt-pr-str (jtagged-tag t)) " " (jolt-pr-readable (jtagged-form t))))
 (register-pr-arm! jtagged? jtagged-pr)
+;; Number.equals: the same boxed class and value. jolt's classes follow the value
+;; (a flonum is a Double, an exact integer a Long or a BigInt by range, any other
+;; exact a Ratio), so same kind and = is the test. Double.equals compares
+;; doubleToLongBits: every NaN equals every NaN, 0.0 is not -0.0.
+(define (java-number-equals? n o)
+  (and (number? o)
+       (cond ((flonum? n) (and (flonum? o) (if (= n n) (eqv? n o) (not (= o o)))))
+             ((exact? n) (and (exact? o) (eq? (integer? n) (integer? o)) (= n o)))
+             (else (eqv? n o)))))
+;; Objects.equals: a's own .equals, null-safe — the seam java.util.Objects, an
+;; Optional's and a tagged literal's equality share. Numbers and strings answer
+;; here directly so the test needs no host method table.
+(define (objects-equals? a b)
+  (cond ((eq? a b) #t)
+        ((jolt-nil? a) #f)
+        ((number? a) (java-number-equals? a b))
+        ((string? a) (and (string? b) (string=? a b)))
+        (else (jolt-truthy? (record-method-dispatch a "equals" (jolt-list b))))))
 ;; two tagged literals are = iff tag and form are .equals, as TaggedLiteral.equals
 ;; is (so 1.0 and (float 1.0) forms differ, where = would call them equal) — they
 ;; work as map keys / set members. The hash is TaggedLiteral.hashCode,
 ;; 31 * hash(tag) + hash(form) over the Java hashCodes, which agree with .equals.
-;; objects-equals? is a runtime forward ref (host-static-classes.ss).
 (register-eq-arm! (lambda (a b) (or (jtagged? a) (jtagged? b)))
                   (lambda (a b) (and (jtagged? a) (jtagged? b)
                                      (objects-equals? (jtagged-tag a) (jtagged-tag b))
@@ -237,7 +254,7 @@
     ;; declared hashCode governs (flatland's types via APersistentMap/mapHash);
     ;; else the structural record hash.
     ((jrec? x) (let ((m (find-method-any-protocol (jrec-tag x) "hashCode")))
-                 (if m (jolt-invoke m x) (jrec-hash x))))
+                 (if m (call-declared-hash m x) (jrec-hash x))))
     (else (record-method-dispatch x "hashCode" jolt-nil))))
 (def-var! "jolt.host" "java-hashcode" jolt-java-hashcode)
 

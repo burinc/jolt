@@ -1247,6 +1247,15 @@
 ;; answered :object — and that keyword was what count's refusal message named.
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "object")))
                      (lambda (x) "java.lang.Object"))
+;; Object's own methods: identity hashCode (what hash answers for it), identity
+;; equals, and toString as str renders it — the default Object.toString,
+;; java.lang.Object@<hex identity hash> (host-class.ss jolt-identity-hex).
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "object")))
+                      (lambda (x) (string-append "java.lang.Object@" (jolt-identity-hex x))))
+(register-host-methods! "object"
+  (list (cons "hashCode" (lambda (o) (jolt-hasheq o)))
+        (cons "equals" (lambda (o x) (eq? o x)))
+        (cons "toString" (lambda (o) (jolt-str-render-one o)))))
 
 ;; ---- clojure.lang.LispReader$StringReader -----------------------------------
 ;; The JVM reader's string-literal handler. It is package-private, but a library
