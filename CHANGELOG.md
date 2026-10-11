@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built the whole interruptible wait first, which made a timed poll on a
   queue with data in it 1.4x slower on macOS and 4.9x on aarch64 Termux.
   `take` and `put` get the same fast path.
+- **Method calls on host objects without a type hint are much cheaper.** A
+  call such as `(.size q)` on a queue, an executor, or a `StringBuilder`
+  reached through an unhinted local walked every dispatch arm and looked the
+  method up by name each time, about 120 ns before the method ran. The call
+  site now caches what it resolved. On macOS, `.size` on a
+  `LinkedBlockingQueue` went from 137 ns to 8 ns, an `offer` and `poll` pair
+  from 484 ns to 195 ns (babashka: 214 ns), and an unhinted `StringBuilder`
+  `.length` from 170 ns to 9 ns. Calls on other receivers cost what they did.
 - Equal string literals share one object in a built binary's image, as
   interned literals do on the JVM. Every literal was its own object, so a
   hello app's runtime held 788 copies of `"clojure.core"`; jolt's own heap is
