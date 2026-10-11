@@ -321,7 +321,7 @@
       (with-exception-handler
         (lambda (c) 'resumed)
         (lambda ()
-          (jolt-cv-wait t8-mu t8-cv (+ (now-millis) 200)
+          (jolt-cv-wait t8-mu t8-cv (+ (mono-millis) 200)
             (lambda (timed-out?)
               (unless t8-raised?
                 (set! t8-raised? #t)
