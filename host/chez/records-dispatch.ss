@@ -1131,6 +1131,26 @@
   (or (reify-method-ref x "hasheq") (reify-method-ref x "hashCode")))
 (register-hash-arm! (lambda (x) (and (jreify? x) (reify-declared-hash x) #t))
                     (lambda (x) (call-declared-hash (reify-declared-hash x) x)))
+;; = on a reify or proxy follows Util.equiv. pcequiv asks the left operand's
+;; equiv when it is a collection, so a jolt collection on the left decides by its
+;; own rules (and a reify is none of them), and only otherwise the right
+;; operand's declared equiv. Neither a collection: the LEFT operand's equals,
+;; else identity. (= 1 r) is Long.equals and stays false whatever r declares.
+(define (reify-equiv=? a b)
+  (let ((ea (reify-method-ref a "equiv")))
+    (cond (ea (jolt-truthy? (jolt-invoke ea a b)))
+          ((and (not (jreify? a))
+                (or (jolt-sequential? a) (jolt-lazyseq? a) (jolt-coll? a)))
+           #f)
+          ((reify-method-ref b "equiv") => (lambda (eb) (jolt-truthy? (jolt-invoke eb b a))))
+          ((reify-method-ref a "equals") => (lambda (m) (jolt-truthy? (jolt-invoke m a b))))
+          (else (eq? a b)))))
+;; Claimed only when a side declares something that can answer: a reify that
+;; overrides neither is = only to itself, and leaving it unclaimed keeps it on
+;; the identity hash (jolt-identity-hashed?) instead of the record catch-all.
+(define (reify-declares-eq? x)
+  (and (jreify? x) (or (reify-method-ref x "equals") (reify-method-ref x "equiv")) #t))
+(register-eq-arm! (lambda (a b) (or (reify-declares-eq? a) (reify-declares-eq? b))) reify-equiv=?)
 ;; (get reify k) / (:k reify) routes to a reify's ILookup valAt — clojure.spec.alpha
 ;; reifies fspec/regex specs as clojure.lang.ILookup and reads (:args spec) off them.
 (register-get-arm! jreify?

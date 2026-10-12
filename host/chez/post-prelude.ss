@@ -107,11 +107,12 @@
 ;; path (so they stay native) but the overlay (20-coll.clj) still carries an
 ;; all-flonum int?/double? (int? -> integer?, double? -> not-integer) that
 ;; misclassifies exact rationals (e.g. (double? 1/2) -> true). Re-assert the
-;; native tower-correct versions so they win over those overlay defs. int?/double?
-;; alias integer?/float?. == is value-equality. (ratio?/rational? are now correct
-;; in the overlay, built on jolt.host tower tests, so they need no re-assertion.)
+;; native tower-correct versions so they win over those overlay defs. double?
+;; is a Double only; int? an integer in long range. == is value-equality.
+;; (ratio?/rational? are now correct in the overlay, built on jolt.host tower
+;; tests, so they need no re-assertion.)
 (def-var! "clojure.core" "integer?" jolt-integer?)
-(def-var! "clojure.core" "int?" jolt-integer?)
+(def-var! "clojure.core" "int?" jolt-int?)
 (def-var! "clojure.core" "float?" jolt-float?)
 (def-var! "clojure.core" "double?" jolt-double?)
 ;; ratio?/rational? now live (correctly) in the overlay, so they no longer need a

@@ -954,6 +954,31 @@
     (check-eq "io/output-stream and io/input-stream on a Socket"
               (with-open [i (clojure.java.io/input-stream conn)] (vec (.readAllBytes i))) [1 2 3])))
 
+;; InetAddress and InetSocketAddress are values: = and hash go by the address
+;; (and port), as their equals/hashCode do, and hash is hashCode.
+(let [a (java.net.InetAddress/getByName "127.0.0.1")
+      b (java.net.InetAddress/getByName "127.0.0.1")]
+  (check-eq "InetAddress = by address" [(= a b) (count (hash-set a b)) (= (hash a) (.hashCode a))]
+            [true 1 true])
+  (check-eq "InetAddress hashCode is the address as an int" (.hashCode a) 2130706433))
+(check-eq "InetSocketAddress = by host and port"
+          [(= (java.net.InetSocketAddress. "localhost" 80) (java.net.InetSocketAddress. "localhost" 80))
+           (= (java.net.InetSocketAddress. "localhost" 80) (java.net.InetSocketAddress. "localhost" 81))
+           (= (hash (java.net.InetSocketAddress. "localhost" 80))
+              (hash (java.net.InetSocketAddress. "localhost" 80)))]
+          [true false true])
+;; values the JVM answers: a resolved one compares and hashes by its address,
+;; an unresolved one by its host name ignoring case
+(check-eq "InetSocketAddress = and hash by resolved address"
+          [(= (java.net.InetSocketAddress. "127.0.0.1" 80) (java.net.InetSocketAddress. "127.0.0.1" 80))
+           (hash (java.net.InetSocketAddress. "127.0.0.1" 80))
+           (.hashCode (java.net.InetSocketAddress. "127.0.0.1" 80))
+           (.isUnresolved (java.net.InetSocketAddress. "no-such-host.invalid" 80))
+           (hash (java.net.InetSocketAddress. "No-Such-Host.invalid" 80))
+           (= (java.net.InetSocketAddress. "no-such-host.invalid" 80)
+              (java.net.InetSocketAddress. "NO-SUCH-HOST.invalid" 80))]
+          [true 2130706513 2130706513 true -1080077125 true])
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

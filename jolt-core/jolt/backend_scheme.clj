@@ -788,6 +788,15 @@
          (every? (fn [k] (and (= :const (:op k)) (keyword? (:val k)))) ks)
          (apply distinct? (map :val ks)))))
 
+;; Literal keys (or set elements) that cannot collide: at most one, or every one
+;; a :const and no two equal, which the reader has already checked. Any other literal is built by the checked
+;; constructor, which throws IllegalArgumentException when keys computed at run
+;; time collide, as the JVM's createWithCheck does.
+(defn- distinct-const-keys? [ks]
+  (or (empty? (rest ks))
+      (and (every? (fn [k] (= :const (:op k))) ks)
+           (apply distinct? (map :val ks)))))
+
 ;; The pool's bindings as flat `let` layers by dependency depth: layer 0 holds the
 ;; constants that reference no other constant, layer k those whose deepest
 ;; reference is in layer k-1. A pool is mostly keywords, symbols and var cells
@@ -3870,7 +3879,10 @@
      ;; since its value is not fixed at emit time.
      :vector (let [s (emit-ordered "jolt-vector" (:items node))]
                (if (const-coll-node? node) (hoist-const-per-site s) s))
-     :set (let [s (emit-ordered "jolt-hash-set" (:items node))]
+     :set (let [s (emit-ordered (if (distinct-const-keys? (:items node))
+                                  "jolt-hash-set"
+                                  "jolt-hash-set-checked")
+                                (:items node))]
             (if (const-coll-node? node) (hoist-const-per-site s) s))
      ;; A map literal whose keys are all constant keywords hands its slots to the
      ;; array map as one vector: the reader has already refused a repeated
@@ -3884,7 +3896,10 @@
                 s (if (unique-keyword-key-literal? node)
                     (ordered-call kvs (mapv emit kvs)
                       (fn [strs] (str "(amap-slots->pmap (vector " (str/join " " strs) "))")))
-                    (emit-ordered "jolt-hash-map" kvs))]
+                    (emit-ordered (if (distinct-const-keys? (map first (:pairs node)))
+                                    "jolt-hash-map"
+                                    "jolt-hash-map-checked")
+                                  kvs))]
             (if (const-coll-node? node) (hoist-const-per-site s) s))
     ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
     ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,

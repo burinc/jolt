@@ -27,6 +27,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`=` asks a reify or proxy's own `equals`.** `hash` already used a declared
+  `hashCode`, but `=` compared reifies and proxies by identity, so two of them
+  that declared themselves equal stayed unequal and a map keyed by one missed
+  the other. `=` now follows `Util.equiv`: a declared `IPersistentCollection`
+  `equiv` answers, then the left operand's `equals`.
+- **URL, Charset, InetAddress and InetSocketAddress compare by value.** `=`,
+  `hash` and set membership treated two equal ones as different objects. URL
+  compares by its spec and does not resolve the host the way the JVM's
+  `URL.equals` does. Charset also orders by name, and URL and Charset gained
+  `.hashCode`.
+- **`io/writer` returns a `BufferedWriter`.** It wraps a Writer the way
+  Clojure's `make-writer` does, so `(io/writer sw)` over a StringWriter is a
+  new object whose text reaches `sw` on flush or close. It used to return `sw`
+  itself. `(BufferedWriter. w)` builds a real wrapper, and FileWriter and
+  OutputStreamWriter report their own classes.
+- **`int?` is false past the long range and is its own fn.** It was the same
+  procedure as `integer?`, so it was true for a bignum, and so was `pos-int?`.
+  A map keyed by both `int?` and `integer?`, like spec.alpha's generator
+  table, saw one key twice. It now answers for integers in the signed 64-bit
+  range, the values that class as `java.lang.Long`.
+- **A map or set literal whose computed keys collide throws.** `(let [x 1 y 1]
+  #{x y})` threw `IllegalArgumentException: Duplicate key: 1` on the JVM but
+  quietly dropped one entry here. Literals whose keys are distinct constants
+  are built exactly as before.
+
 - **Objects without value equality hash by identity.** Atoms, delays,
   volatiles, refs, agents, promises, `reify` instances, `Object`,
   `StringBuilder` and the other modeled host objects all hashed to one

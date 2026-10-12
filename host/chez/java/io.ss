@@ -1647,6 +1647,8 @@
 (register-host-methods! "url"
   (list (cons "toString"       (lambda (self) (url-spec self)))
         (cons "toExternalForm" (lambda (self) (url-spec self)))
+        (cons "equals"         (lambda (self o) (and (url-jhost? o) (string=? (url-spec self) (url-spec o)))))
+        (cons "hashCode"       (lambda (self) (java-string-hashcode (url-spec self))))
         (cons "getProtocol"    (lambda (self) (url-protocol (url-spec self))))
         (cons "getPath"        (lambda (self) (url-path (url-spec self))))
         (cons "getFile"        (lambda (self) (url-path (url-spec self))))
@@ -4252,6 +4254,13 @@
                   (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)
                                      (string=? (uri-field a 'string) (uri-field b 'string)))))
 (register-hash-arm! uri-jhost? (lambda (x) (string-hash (uri-field x 'string))))
+;; A URL compares by its canonical spec. The JVM's URL.equals also resolves both
+;; hosts and compares addresses (a blocking DNS lookup inside =); jolt does not,
+;; so two names for one host stay unequal here.
+(register-eq-arm! (lambda (a b) (or (url-jhost? a) (url-jhost? b)))
+                  (lambda (a b) (and (url-jhost? a) (url-jhost? b)
+                                     (string=? (url-spec a) (url-spec b)))))
+(register-hash-arm! url-jhost? (lambda (x) (java-string-hashcode (url-spec x))))
 ;; (compare u1 u2) / (sort uris): URI is Comparable on the JVM, by string form
 ;; (its compareTo compares component-wise, which for two well-formed URIs is the
 ;; same order as the strings up to the first differing component).

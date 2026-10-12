@@ -194,11 +194,22 @@
     (and (has? e "(amap-slots->pmap (vector ") (not (has? e "(jolt-hash-map ")))))
 (define (kw-literal-checked? src)
   (let ((e (emitf src)))
-    (and (has? e "(jolt-hash-map ") (not (has? e "amap-slots->pmap")))))
+    (and (or (has? e "(jolt-hash-map ") (has? e "(jolt-hash-map-checked "))
+         (not (has? e "amap-slots->pmap")))))
 (ok "keyword-keyed literal with runtime values emits the direct slot build"
     (kw-literal-direct? "(fn [x y] {:a x :b y :c 3})"))
 (ok "a computed key keeps the checked constructor"
     (kw-literal-checked? "(fn [k x] {k x :b 2})"))
+;; keys that could collide at run time get the duplicate check; distinct
+;; constants, which the reader already checked, and a lone key do not
+(ok "a computed key gets the duplicate-checking constructor"
+    (has? (emitf "(fn [k x] {k x :b 2})") "(jolt-hash-map-checked "))
+(ok "distinct constant keys skip the duplicate check"
+    (not (has? (emitf "(fn [x] {\"a\" x :b 2})") "-checked")))
+(ok "a single computed key skips the duplicate check"
+    (not (has? (emitf "(fn [k x] [{k x} #{k}])") "-checked")))
+(ok "a set with computed elements gets the duplicate check"
+    (has? (emitf "(fn [x y] #{x y})") "(jolt-hash-set-checked "))
 (ok "a non-keyword constant key keeps the checked constructor"
     (kw-literal-checked? "(fn [x] {\"a\" x :b 2})"))
 (ok "past the keyword array limit the literal is hash mode via the checked constructor"

@@ -478,11 +478,10 @@
    ;;     eduction validates and parses; that is the 104 identical? failures in
    ;;     parser-test and the 12 in core-test.
    ;;
-   ;; Where the residue sits, per target/libconformance/malli.log: 9 of the 26
-   ;; failures are malli.transform-test, then core-test (4), error-test (3),
-   ;; instrument-test (3), generator-test (2), provider-test (2), swagger-test
-   ;; (2) and registry-test (1). The 9 errors are generator-test (7),
-   ;; instrument-test (1) and parser-test (1). Several
+   ;; Where the residue sits, per target/libconformance/malli.log: 9 of the 18
+   ;; failures are malli.transform-test, then core-test (3), instrument-test
+   ;; (3), error-test (1), provider-test (1) and registry-test (1). The 9 errors
+   ;; are generator-test (7), instrument-test (1) and parser-test (1). Several
    ;; draw from (mg/sample s {:seed 0}), and a fixed seed drawing different
    ;; values here than on the JVM is the same family as test.check's :tolerance,
    ;; not a malli bug.
@@ -503,7 +502,7 @@
    ;;     allocation (4.6x the collections, each stopping the world); the row
    ;;     runs in ~4 minutes, and :timeout 2400 is headroom for a loaded CI
    ;;     runner, not the expected cost.
-   :expect {:tests 219 :pass 13275 :fail 20 :error 9 :load-fail 1}}
+   :expect {:tests 219 :pass 13277 :fail 18 :error 9 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"

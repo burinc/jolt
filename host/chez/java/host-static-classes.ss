@@ -3300,7 +3300,8 @@
         (cons "newDecoder" (lambda (c) (make-jhost "charset-decoder" (vector c #f #f "\xFFFD;"))))
         (cons "canEncode" (lambda (c) #t))
         (cons "equals" (lambda (c o) (and (jhost? o) (string=? (jhost-tag o) "charset")
-                                          (string=? (charset-name c) (charset-name o)))))))
+                                          (string=? (charset-name c) (charset-name o)))))
+        (cons "hashCode" (lambda (c) (java-string-hashcode (charset-name c))))))
 ;; CharsetEncoder.canEncode: over a string, every char must fit; over a char the
 ;; char itself. A char is a Scheme char in jolt; a string a string.
 (register-host-methods! "charset-encoder"
@@ -3317,6 +3318,15 @@
 (register-host-methods! "charset-decoder"
   (list (cons "charset" (lambda (d) (vector-ref (jhost-state d) 0)))))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset"))) (lambda (x) "java.nio.charset.Charset"))
+;; Charset equality, hash and order go by canonical name, as Charset.equals,
+;; hashCode and compareTo (case-insensitive) do.
+(define (charset-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "charset")))
+(register-eq-arm! (lambda (a b) (or (charset-jhost? a) (charset-jhost? b)))
+                  (lambda (a b) (and (charset-jhost? a) (charset-jhost? b)
+                                     (string=? (charset-name a) (charset-name b)))))
+(register-hash-arm! charset-jhost? (lambda (c) (java-string-hashcode (charset-name c))))
+(register-compare-arm! (lambda (a b) (and (charset-jhost? a) (charset-jhost? b)))
+                       (lambda (a b) (jvm-string-ci-compare (charset-name a) (charset-name b))))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset-encoder"))) (lambda (x) "java.nio.charset.CharsetEncoder"))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset-decoder"))) (lambda (x) "java.nio.charset.CharsetDecoder"))
 

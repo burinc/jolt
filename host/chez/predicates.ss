@@ -35,6 +35,15 @@
 ;; non-integer (= JVM Ratio). rational? = exact (integer or ratio; jolt has no
 ;; BigDecimal). decimal? is always false (no BigDecimal type).
 (define (jolt-integer? x) (and (number? x) (exact? x) (integer? x)))
+;; int? is a fixed-precision integer, Long/Integer/Short/Byte on the JVM, which
+;; here is any integer in the signed 64-bit range: past it the value classes as
+;; clojure.lang.BigInt. Its own procedure, not integer?'s — the JVM's two are
+;; distinct fns, and a map or set literal keyed by both (spec.alpha's generator
+;; table) must not see one key twice.
+(define (jolt-int? x)
+  (or (fixnum? x)
+      (and (integer? x) (exact? x)
+           (<= -9223372036854775808 x 9223372036854775807))))
 ;; float? is Double or Float; double? only a Double (a jfloat is a Float).
 (define (jolt-float? x) (or (flonum? x) (jfloat? x)))
 (define (jolt-double? x) (flonum? x))

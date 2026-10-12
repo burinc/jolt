@@ -995,17 +995,22 @@
   (and (jhost? x)
        (member (jhost-tag x) '("char-writer" "writer" "port-writer"))
        #t))
-;; state #(port downstream): downstream is the byte stream this writer wraps, when
-;; it wraps one. flush/close have to reach it — java.io.OutputStreamWriter.flush
+;; state #(port downstream sink class): downstream is the stream this writer
+;; wraps, when it wraps one; class is the java.io class it reports, #f for a
+;; plain java.io.Writer. flush/close have to reach it — java.io.OutputStreamWriter.flush
 ;; flushes its own encoder AND the stream underneath, which is what makes a
 ;; PrintStream over a logging proxy emit on (println …), since println flushes.
 (define (make-char-writer port . down)
-  (make-jhost "char-writer" (vector port (and (pair? down) (car down)) #f)))
+  (make-jhost "char-writer" (vector port (and (pair? down) (car down)) #f #f)))
 (define (char-writer-downstream self) (vector-ref (jhost-state self) 1))
 ;; The byte port a charset writer encodes into (make-charset-writer), or #f. A
 ;; flush has to reach it: the encoder hands it whole blocks and leaves them in
 ;; its buffer, rather than flushing it once per block.
 (define (char-writer-sink self) (vector-ref (jhost-state self) 2))
+(define (char-writer-class self) (vector-ref (jhost-state self) 3))
+(define (char-writer-classed! w cls) (vector-set! (jhost-state w) 3 cls) w)
+(define (buffered-char-writer? x)
+  (and (char-writer? x) (equal? (char-writer-class x) "java.io.BufferedWriter")))
 ;; The port to write, or the JVM's IOException once closed, as out-stream-live-port
 ;; does for the byte side: a closed Chez port raised a classless "put-string: not
 ;; permitted on closed port". A second close is a no-op on the JVM, so close asks
@@ -1042,7 +1047,7 @@
                          (when (and bp (not (port-closed? bp))) (flush-output-port bp)))
                        (let ((d (char-writer-downstream self)))
                          (when d (record-method-dispatch d "close" jolt-nil)))
-                       (close-port port)))
+                       (unless (port-closed? port) (close-port port))))
                    jolt-nil))
    (cons "toString" (lambda (self) "#<Writer>"))))
 
@@ -1083,13 +1088,14 @@
 ;; object a flush and close also go to, or #f. OWN?: BP was opened for this
 ;; writer, so a charset the host cannot write closes it again; a stream the
 ;; caller handed in is left open, as the JVM's OutputStreamWriter leaves it.
-(define (make-charset-writer bp enc down own?)
+(define (make-charset-writer bp enc down own? . cls)
   (make-jhost "char-writer"
     (vector (if own?
                 (guard (e (#t (close-port bp) (raise e))) (charset-output-port bp enc))
                 (charset-output-port bp enc))
             down
-            bp)))
+            bp
+            (and (pair? cls) (car cls)))))
 ;; Reading: a one-byte charset decodes as the bytes arrive, so a pipe still
 ;; streams. A multi-byte or stateful one decodes the whole input on the first
 ;; read, through decode-bytevector -- the decoder (String. bytes cs) and slurp
@@ -1485,7 +1491,7 @@
           (let ((bp (open-file-output-port p
                       (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                       (buffer-mode block))))
-            (make-charset-writer bp cs #f #t)))))))
+            (make-charset-writer bp cs #f #t "java.io.FileWriter")))))))
 ;; InputStreamReader / OutputStreamWriter decode / encode the wrapped byte stream
 ;; (UTF-8 default; an explicit charset is honored only as UTF-8 here).
 ;;
@@ -1624,11 +1630,35 @@
                          (if (and (pair? rest) (ctor-charset? (car rest)))
                              (charset-arg-name (car rest))
                              "UTF-8")
-                         out #f)))
-;; Buffered* — Chez ports are buffered already; the wrapper is the wrapped stream.
+                         out #f "java.io.OutputStreamWriter")))
+;; BufferedOutputStream — Chez ports are buffered already; the wrapper is the
+;; wrapped stream.
 (for-each (lambda (n) (register-class-ctor! n (lambda (inner . _) inner)))
-          '("BufferedWriter" "java.io.BufferedWriter"
-            "BufferedOutputStream" "java.io.BufferedOutputStream"))
+          '("BufferedOutputStream" "java.io.BufferedOutputStream"))
+;; A BufferedWriter is its own object, as on the JVM: it reports its class, and
+;; what is written to it reaches the wrapped Writer when it flushes, closes or
+;; fills its buffer. Over a jolt char-writer it writes into that writer's port,
+;; which buffers already, and flush and close go on to the wrapped writer. Over
+;; any other Writer (a StringWriter, *out*, a proxy) it is a port of its own,
+;; buffering 8192 chars like the JVM's, that hands each block to the wrapped
+;; writer's write.
+(define (make-buffered-writer inner)
+  (char-writer-classed!
+   (if (char-writer? inner)
+       (make-char-writer (char-writer-port inner) inner)
+       (make-char-writer
+        (parameterize ((custom-port-buffer-size 8192))
+          (make-custom-textual-output-port "buffered-writer"
+            (lambda (str start count)
+              (when (fx>? count 0)
+                (record-method-dispatch inner "write"
+                                        (jolt-list (substring str start (fx+ start count)))))
+              count)
+            #f #f #f))
+        inner))
+   "java.io.BufferedWriter"))
+(reg-ctor! '("BufferedWriter" "java.io.BufferedWriter")
+  (lambda (inner . _) (make-buffered-writer inner)))
 ;; …with one exception: a Reader jolt did not build has no readLine/lines/close
 ;; of its own, so handing it back unchanged means (BufferedReader. r) silently
 ;; produces something that is not a BufferedReader. Those get the delegating
@@ -2060,17 +2090,21 @@
         (lambda (x . opts)
           (io-opts-check! opts)
           (let ((enc (io-encoding opts)))
-          (cond ((char-writer? x) x)
-                ((out-stream? x) (make-charset-writer (out-stream-sink-port x) enc #f #f))
-                ((and (jhost? x) (text-sink-tag? (jhost-tag x))) x)
+          ;; make-writer: a BufferedWriter is itself, any other Writer is
+          ;; wrapped in one, and a byte stream is encoded into by one.
+          (cond ((buffered-char-writer? x) x)
+                ((char-writer? x) (make-buffered-writer x))
+                ((out-stream? x)
+                 (make-charset-writer (out-stream-sink-port x) enc #f #f "java.io.BufferedWriter"))
+                ((and (jhost? x) (text-sink-tag? (jhost-tag x))) (make-buffered-writer x))
                 ;; a java.io.OutputStream the caller wrote is encoded into, the
-                ;; way jolt's is; a java.io.Writer the caller wrote is the writer
-                ;; (BufferedWriter. over one is the identity here)
-                ((user-out-stream? x) (make-charset-writer (out-stream-sink-port x) enc x #f))
-                ((user-writer? x) x)
+                ;; way jolt's is
+                ((user-out-stream? x)
+                 (make-charset-writer (out-stream-sink-port x) enc x #f "java.io.BufferedWriter"))
+                ((user-writer? x) (make-buffered-writer x))
                 ((or (jfile? x) (string? x) (url-jhost? x))
                  (let ((out (apply jio-output-stream x opts)))
-                   (make-charset-writer (out-stream-port out) enc #f #t)))
+                   (make-charset-writer (out-stream-port out) enc #f #t "java.io.BufferedWriter")))
                 ((socket-value? x) (apply jolt-io-writer (socket-stream x "getOutputStream") opts))
                 (else (apply prev x opts)))))))
 ;; re-bound: the clojure.java.io vars hold the VALUE these names had when io.ss
@@ -2212,7 +2246,7 @@
 (register-class-arm! out-stream? (lambda (x) "java.io.OutputStream"))
 (register-class-arm! char-reader? (lambda (x) "java.io.Reader"))
 (register-class-arm! reader-adapter? (lambda (x) "java.io.BufferedReader"))
-(register-class-arm! char-writer? (lambda (x) "java.io.Writer"))
+(register-class-arm! char-writer? (lambda (x) (or (char-writer-class x) "java.io.Writer")))
 (register-instance-check-arm!
   (lambda (type-sym val)
     (if (not (symbol-t? type-sym)) 'pass
@@ -2229,6 +2263,11 @@
                                                  "Closeable" "AutoCloseable" "Readable"))) #t)
         ((and (reader-adapter? val) (member short '("Reader" "BufferedReader"
                                                     "Closeable" "AutoCloseable" "Readable"))) #t)
+        ((and (char-writer? val) (char-writer-class val))
+         (if (or (member short '("Writer" "Closeable" "AutoCloseable" "Flushable" "Appendable"))
+                 (jch-isa? (char-writer-class val) (symbol-t-name type-sym)))
+             #t
+             'pass))
         ((and (char-writer? val) (member short '("Writer" "BufferedWriter" "FileWriter" "OutputStreamWriter"
                                                  "Closeable" "AutoCloseable" "Flushable" "Appendable"))) #t)
         (else 'pass))))))
