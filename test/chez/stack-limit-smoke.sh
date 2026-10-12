@@ -68,7 +68,12 @@ run limit JOLT_MAX_HEAP=off
 def=$(printf '%s\n' "$out" | head -1)
 case "$(uname -s)" in
   Darwin) phys=$(sysctl -n hw.memsize) ;;
-  *) phys=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) )) ;;
+  # Termux has no getconf; MemTotal is the same sysinfo total, in KiB.
+  *) if command -v getconf >/dev/null 2>&1; then
+       phys=$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) ))
+     else
+       phys=$(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB$/\1/p' /proc/meminfo) * 1024 ))
+     fi ;;
 esac
 if [ "$(ulimit -v)" != unlimited ] || [ "$(ulimit -d)" != unlimited ]; then
   echo "stacklimit: physical-RAM default skipped (this shell has a memory rlimit)"
