@@ -3326,8 +3326,7 @@
                                      (string=? (charset-name a) (charset-name b)))))
 (register-hash-arm! charset-jhost? (lambda (c) (java-string-hashcode (charset-name c))))
 (register-compare-arm! (lambda (a b) (and (charset-jhost? a) (charset-jhost? b)))
-                       (lambda (a b) (let ((x (charset-name a)) (y (charset-name b)))
-                                       (cond ((string-ci<? x y) -1) ((string-ci=? x y) 0) (else 1)))))
+                       (lambda (a b) (jvm-string-ci-compare (charset-name a) (charset-name b))))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset-encoder"))) (lambda (x) "java.nio.charset.CharsetEncoder"))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset-decoder"))) (lambda (x) "java.nio.charset.CharsetDecoder"))
 

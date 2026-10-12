@@ -931,6 +931,18 @@
            :jvm "[\"java.lang.Integer\" false]"
            :jolt "[\"java.lang.Long\" true]"}
    :note "Chez has one fixnum. instance? is deliberately permissive for Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset. Float is its own value (a jfloat), so Float and Double answer as on the JVM."}
+  ;; URL.equals and hashCode resolve the host (URLStreamHandler.hostsEqual and
+  ;; getHostAddress), a DNS lookup inside = and hash. jolt compares and hashes a
+  ;; URL by its spec, so two names for one host are unequal here and the hash
+  ;; is the spec's String.hashCode, not the JVM's sum of parts.
+  {:category :host-model
+   :behavior "(.hashCode (java.net.URL. \"http://127.0.0.1/a\"))"
+   :jvm "2133921515: protocol hash + the resolved InetAddress hash + file hash + port"
+   :jolt "1173030653, the String.hashCode of the spec"
+   :check {:expr "(.hashCode (java.net.URL. \"http://127.0.0.1/a\"))"
+           :jvm "2133921515"
+           :jolt "1173030653"}
+   :note "= and hash agree with each other, and with the JVM for any two URLs whose specs match; only URLs that differ in spelling but resolve alike diverge."}
   ;; A declared hashCode is an int method. The JVM narrows a primitive long
   ;; result with RT.intCast, which throws past int range, and a boxed Number with
   ;; intValue, which wraps. jolt has no primitive/boxed distinction to choose on,

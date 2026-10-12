@@ -967,6 +967,17 @@
            (= (hash (java.net.InetSocketAddress. "localhost" 80))
               (hash (java.net.InetSocketAddress. "localhost" 80)))]
           [true false true])
+;; values the JVM answers: a resolved one compares and hashes by its address,
+;; an unresolved one by its host name ignoring case
+(check-eq "InetSocketAddress = and hash by resolved address"
+          [(= (java.net.InetSocketAddress. "127.0.0.1" 80) (java.net.InetSocketAddress. "127.0.0.1" 80))
+           (hash (java.net.InetSocketAddress. "127.0.0.1" 80))
+           (.hashCode (java.net.InetSocketAddress. "127.0.0.1" 80))
+           (.isUnresolved (java.net.InetSocketAddress. "no-such-host.invalid" 80))
+           (hash (java.net.InetSocketAddress. "No-Such-Host.invalid" 80))
+           (= (java.net.InetSocketAddress. "no-such-host.invalid" 80)
+              (java.net.InetSocketAddress. "NO-SUCH-HOST.invalid" 80))]
+          [true 2130706513 2130706513 true -1080077125 true])
 
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
