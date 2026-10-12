@@ -40,8 +40,13 @@
         v (f)]
     [(/ (- (System/nanoTime) t) 1e6) v]))
 
+;; Each sample starts from a collected heap, as in hotpath_scaling_test.clj.
+;; Without it a collection owed by earlier allocation can land in every run of
+;; one arm, which best-of cannot filter: a CI runner measured the 16000 vector
+;; arm at 2x its usual per-element cost on all three attempts (ratio 8.2-8.3)
+;; while the same commit read 4.2 on the next run.
 (defn- best-of [k f]
-  (reduce min (map first (repeatedly k #(timed f)))))
+  (reduce min (map first (repeatedly k #(do (System/gc) (timed f))))))
 
 ;; n1 sized so the REGRESSED right-fold (~7.5e8 char copies in the 4x arm)
 ;; still finishes and fails rather than hanging the gate.
