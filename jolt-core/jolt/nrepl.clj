@@ -176,17 +176,38 @@
 (defn- printer-frame? [line]
   (#{"pr-str" "clojure.core/pr-str"} (first (str/split (str/trim line) #"\s"))))
 
+(defn- outer-frames
+  "The frames on the stack where `evaluate` was called, as StackTraceElement
+  vectors: the caller's, never the eval'd code's. evaluate's own frames don't
+  always make it into an error's trace, so cutting the trace at them can miss
+  and leave the caller's frames in; removing these is what keeps an nREPL
+  server's session worker from being named as the error's location."
+  []
+  (into #{} (map StackTraceElement->vec) (.getStackTrace (Thread/currentThread))))
+
+(defn- outer-frame-names [outer]
+  (into #{} (map (fn [[cls]] (main/demunge (str cls)))) outer))
+
+(defn- evaluate-frame?
+  "A frame line of `evaluate` itself. Its own capture can name it
+  jolt.nrepl/evaluate or render it bare, as `evaluate`."
+  [line]
+  (let [t (str/trim line)]
+    (or (str/starts-with? t "jolt.nrepl/evaluate")
+        (= "evaluate" (first (str/split t #"\s"))))))
+
 (defn- cut-at-eval
   "Frame lines (\"    ns/fn (file:line)\") down to the first of `evaluate`'s own.
   For an error while printing the value, down to evaluate's pr-str, the
   outermost one."
   ([lines] (cut-at-eval lines false))
   ([lines printing?]
-   (let [fs (take-while #(not (str/starts-with? % "    jolt.nrepl/evaluate"))
-                        (remove str/blank? lines))]
+   (let [fs (take-while #(not (evaluate-frame? %)) (remove str/blank? lines))]
      (if-let [i (when printing? (last (keep-indexed #(when (printer-frame? %2) %1) fs)))]
        (take i fs)
        fs))))
+
+(declare frame-location)
 
 (defn- eval-frames
   "The frame lines of an eval error, innermost first, cut where the eval began;
@@ -203,10 +224,13 @@
   last — the chunk writer's flush, an unrelated middleware fn. It is only
   consulted for an error raised by the eval'd code's own execution, where
   every top-level form starts the history afresh (jolt-enter-form!)."
-  [e printing?]
+  ([e printing?] (eval-frames e printing? #{}))
+  ([e printing? outer]
   (if (syntax-error? e)
     []
-    (let [own (try
+    (let [names (outer-frame-names outer)
+          inner? #(not (contains? names (some-> (frame-location %) :symbol str)))
+          own (try
                 (when (seq (.getStackTrace e))
                   (let [sw (java.io.StringWriter.)
                         _ (.printStackTrace e (java.io.PrintWriter. sw))
@@ -215,9 +239,11 @@
                     (when (str/starts-with? s head)
                       (cut-at-eval (str/split-lines (subs s (count head))) printing?))))
                 (catch :default _ nil))]
-      (vec (or (seq own)
-               (when-let [bt (try (jolt.host/backtrace-string) (catch :default _ nil))]
-                 (cut-at-eval (remove #(= (str/trim %) "trace:") (str/split-lines bt)) printing?)))))))
+      (vec (filter inner?
+                   (or (seq own)
+                       (when-let [bt (try (jolt.host/backtrace-string) (catch :default _ nil))]
+                         (cut-at-eval (remove #(= (str/trim %) "trace:") (str/split-lines bt))
+                                      printing?)))))))))
 
 (defn- frame-location
   "{:symbol :source :line} named by a frame line, nil for one that names no
@@ -269,12 +295,15 @@
             :err shows it (\"    user/f (path/x.clj:3)\"), naming the fn when the
             throwable's own frames do not
     :line   the line of the eval'd form that failed, used when no frame names
-            one (evaluate passes it; it reads it where it catches)"
+            one (evaluate passes it; it reads it where it catches)
+    :outer  the frames on the stack where evaluate was called (outer-frames),
+            which are the caller's and are left out of the trace"
   ([e] (err->msg e nil))
-  ([e {:keys [phase frame line]}]
+  ([e {:keys [phase frame line outer]}]
    (try
      (let [m (Throwable->map e)
-           m (cond-> (update m :trace #(vec (take-while (fn [f] (not (eval-boundary? (first f)))) %)))
+           m (cond-> (update m :trace #(vec (remove (or outer #{})
+                                                    (take-while (fn [f] (not (eval-boundary? (first f)))) %))))
                phase (assoc :phase phase))
            t (main/ex-triage m)
            ;; a jolt diagnostic is the throwable itself, where the JVM's
@@ -378,7 +407,8 @@
     :root-ex-class  the `root-ex` string, the class of the root cause"
   ([code ns-str] (evaluate code ns-str nil))
   ([code ns-str {on-out :out on-err :err}]
-   (let [result (atom nil) evaluated (atom false) printed (atom nil)
+   (let [outer (outer-frames)
+         result (atom nil) evaluated (atom false) printed (atom nil)
          err (atom nil) exc (atom nil) failure (atom nil)
          run (fn []
                (binding [*capturing-thread* (Thread/currentThread)]
@@ -396,14 +426,14 @@
                         (catch :default e
                           ;; read here, while the thread still says which form
                           ;; of the eval'd text was running
-                          (let [frames (eval-frames e (= @phase :print-eval-result))
+                          (let [frames (eval-frames e (= @phase :print-eval-result) outer)
                                 bt (when (seq frames)
                                      (str "  trace:\n" (str/join "\n" frames) "\n"))
                                 pos (jolt.host/current-source-position)]
                             (reset! exc e)
                             (reset! last-backtrace bt)
                             (reset! failure {:phase @phase :frame (first (filter user-frame? frames))
-                                             :line (:line pos)})
+                                             :line (:line pos) :outer outer})
                             (reset! err (str (err-msg e) (when bt (str "\n" bt))))))))))
          out (if on-out
                (let [ow (chunk-writer on-out)
