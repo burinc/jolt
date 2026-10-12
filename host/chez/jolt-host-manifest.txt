@@ -39,6 +39,7 @@ condition-message
 cpu-nanos
 current-memory-bytes
 current-fiber
+current-source-position
 ctx-for-ns
 deftype-ctor-class
 delete-file!

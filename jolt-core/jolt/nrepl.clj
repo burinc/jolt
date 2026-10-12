@@ -13,7 +13,8 @@
   and jolt.nrepl composes them over the built-in handler. The request is the
   decoded bencode map (string keys: \"op\" \"code\" \"ns\" \"id\" \"session\" …)
   plus :reply — a thread-safe (fn [response-map]) that adds id/session and sends.
-  Public seam for middleware: respond, evaluate, register-ops!, new-session.
+  Public seam for middleware: respond, evaluate, register-ops!, new-session,
+  err->msg.
 
   Writes .nrepl-port in the working directory (or wherever start's :port-file
   says) so editors auto-detect the port."
@@ -21,7 +22,8 @@
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
             [jolt.socket.native :as native]
-            [jolt.analyzer :as ana]))
+            [jolt.analyzer :as ana]
+            [clojure.main :as main]))
 
 ;; --- sockets (loopback server) ---------------------------------------------
 ;; The calls, numbers and per-platform shapes are jolt.socket.native's.
@@ -141,15 +143,159 @@
 
 (def ^:private last-backtrace (atom nil))
 (defn last-error-backtrace
-  "The host backtrace of the exception now in *e, as jolt.host/backtrace-string
-  rendered it at the moment it was thrown, or nil.
+  "The backtrace of the exception now in *e (the \"  trace:\" block evaluate
+  appended to :err), or nil.
 
-  A jolt exception value carries no stack of its own (Throwable->map has an empty
-  :trace), and the backtrace is only readable right where it was caught — so
-  `evaluate` records it here for tooling that presents the error afterwards (an
-  editor's error view, a stacktrace op), which otherwise has nothing but the
-  message to show."
+  It is the eval error's own trace, cut where the eval began, so it holds the
+  eval'd code's frames and none of the server's (see eval-frames). A read or
+  compile error in the eval'd text has none: its frames would be jolt's reader
+  or analyzer, as the CLI's report has it. `evaluate` records it here
+  for tooling that presents the error afterwards (an editor's error view, a
+  stacktrace op), which otherwise has nothing but the message to show."
   [] @last-backtrace)
+
+;; --- describing an eval error ------------------------------------------------
+
+(def ^:private syntax-phases
+  #{:read-source :macro-syntax-check :macroexpansion :compile-syntax-check :compilation})
+
+(defn- syntax-error?
+  "A read or analysis diagnostic: raised while reading or compiling the eval'd
+  text, so its frames are jolt's reader or analyzer, never the user's code."
+  [e]
+  (let [d (ex-data e)]
+    (boolean (or (= :analysis-error (:jolt.error/type d))
+                 (syntax-phases (:clojure.error/phase d))))))
+
+(defn- eval-boundary?
+  "A frame of `evaluate` itself — everything from it outward is the server."
+  [cls]
+  (str/starts-with? (str cls) "jolt.nrepl$evaluate"))
+
+(defn- cut-at-eval
+  "Frame lines (\"    ns/fn (file:line)\") down to the first of `evaluate`'s own."
+  [lines]
+  (take-while #(not (str/starts-with? % "    jolt.nrepl/evaluate"))
+              (remove str/blank? lines)))
+
+(defn- eval-frames
+  "The frame lines of an eval error, innermost first, cut where the eval began;
+  empty for a read or compile error in the eval'd text, whose frames would be
+  jolt's reader or analyzer (the CLI's report leaves them out too).
+
+  The exception's OWN capture first, as .printStackTrace renders it. It keeps
+  the live frames, but a tail call erases a frame, and for a fn eval'd over the
+  connection (no source file to check the recovery against) the erased chain is
+  not rebuilt from it — (defn f [x] (/ x 0)) then (f 1) captures nothing of f.
+  Then the thread's tail-call history (jolt.host/backtrace-string), which
+  does rebuild it. That history is the thread's, not the error's: read for a
+  reader error, which runs no jolt code before it raises, it was whatever ran
+  last — the chunk writer's flush, an unrelated middleware fn. It is only
+  consulted for an error raised by the eval'd code's own execution, where
+  every top-level form starts the history afresh (jolt-enter-form!)."
+  [e]
+  (if (syntax-error? e)
+    []
+    (let [own (try
+                (when (seq (.getStackTrace e))
+                  (let [sw (java.io.StringWriter.)
+                        _ (.printStackTrace e (java.io.PrintWriter. sw))
+                        s (str sw)
+                        head (str (.toString e) "\n")]
+                    (when (str/starts-with? s head)
+                      (cut-at-eval (str/split-lines (subs s (count head)))))))
+                (catch :default _ nil))]
+      (vec (or (seq own)
+               (when-let [bt (try (jolt.host/backtrace-string) (catch :default _ nil))]
+                 (cut-at-eval (remove #(= (str/trim %) "trace:") (str/split-lines bt)))))))))
+
+(defn- frame-location
+  "{:symbol :source :line} named by a frame line, nil for one that names no
+  Clojure fn (a host frame like map-seq)."
+  [line]
+  (when-let [[_ nm loc] (re-matches #"\s*([^\s/()]+/[^\s()]+)(?:\s+\((.*)\))?\s*" line)]
+    (let [[_ file ln] (when loc (re-matches #"(.*):(\d+)" loc))]
+      (cond-> {:symbol (symbol nm)}
+        file (assoc :source (last (str/split file #"/")))
+        ln (assoc :line (parse-long ln))))))
+
+(defn- user-frame?
+  "A frame line naming a fn outside clojure.* and jolt.* — the one ex-triage
+  would name, as it skips the core's frames."
+  [line]
+  (when-let [{:keys [symbol]} (frame-location line)]
+    (not (re-find #"^(clojure|jolt)\." (namespace symbol)))))
+
+(defn- simple-class-name [c]
+  (when c (last (str/split (name c) #"\."))))
+
+(defn- render-triage
+  "clojure.main/ex-str, except that an execution or printing error with no
+  frame and no line to name leaves the location out rather than inventing one."
+  [{:clojure.error/keys [phase symbol line source class cause spec] :as t}]
+  (if (and (#{:execution :print-eval-result} phase) (not spec))
+    (let [simple (simple-class-name class)
+          cause-type (if (or (nil? simple) (#{"Exception" "RuntimeException"} simple))
+                       ""
+                       (str " (" simple ")"))
+          where (if (or symbol line)
+                  (str " at " (when symbol (str symbol " "))
+                       "(" (or source "REPL") ":" (or line 1) ")")
+                  "")]
+      (str (if (= phase :execution) "Execution error" "Error printing return value")
+           cause-type where ".\n" (if (nil? cause) "null" cause) "\n"))
+    (main/ex-str t)))
+
+(defn err->msg
+  "The text JVM nREPL sends as `err` for an eval error: clojure.main/err->msg's
+  phase and location line, then the root cause's message, ending in a newline.
+  The frames are the exception's own, cut where `evaluate` began, so a location
+  names the user's code or nothing.
+
+  `opts` adds what the throwable cannot say about itself, all optional:
+    :phase  overrides the triage phase (evaluate passes :print-eval-result for an
+            error raised while printing the value)
+    :frame  the innermost user frame line of the error's trace, as evaluate's
+            :err shows it (\"    user/f (path/x.clj:3)\"), naming the fn when the
+            throwable's own frames do not
+    :line   the line of the eval'd form that failed, used when no frame names
+            one (evaluate passes it; it reads it where it catches)"
+  ([e] (err->msg e nil))
+  ([e {:keys [phase frame line]}]
+   (try
+     (let [m (Throwable->map e)
+           m (cond-> (update m :trace #(vec (take-while (fn [f] (not (eval-boundary? (first f)))) %)))
+               phase (assoc :phase phase))
+           t (main/ex-triage m)
+           ;; a jolt diagnostic is the throwable itself, where the JVM's
+           ;; CompilerException wraps a RuntimeException ex-str leaves unnamed
+           t (if (and (syntax-phases (:clojure.error/phase t))
+                      (:jolt.error/kind (:data (last (:via m)))))
+               (dissoc t :clojure.error/class)
+               t)
+           run-phase? (#{:execution :print-eval-result} (:clojure.error/phase t))
+           floc (when (and frame run-phase? (nil? (:clojure.error/symbol t)))
+                  (frame-location frame))
+           t (cond-> t
+               floc (assoc :clojure.error/symbol (:symbol floc))
+               (:source floc) (assoc :clojure.error/source (:source floc))
+               (:line floc) (assoc :clojure.error/line (:line floc)))
+           t (if (and line run-phase? (nil? (:clojure.error/line t)))
+               (assoc t :clojure.error/line line)
+               t)]
+       (render-triage t))
+     (catch :default _ (str (err-msg e) "\n")))))
+
+(defn- ex-class-strings
+  "nREPL's ex / root-ex: the class of the exception and of its root cause, as
+  (str (class e)) prints them. JVM nREPL wraps a read error and an error while
+  printing in an ExceptionInfo (phase :read-source / :print-eval-result), so ex
+  names that for those."
+  [e phase]
+  [(if (#{:read-source :print-eval-result} phase)
+     (str (class (ex-info "" {})))
+     (str (class e)))
+   (str (class (main/root-cause e)))])
 
 (defn- chunk-writer
   "A java.io.Writer that hands what was written to `send` in chunks: on flush (a
@@ -186,23 +332,47 @@
   writer that calls f with each chunk as it is flushed — println flushes — while
   the eval is still running, so an editor's console shows a long job's progress.
   Whatever is left unflushed is sent before this returns, and :out is then empty.
-  A future the eval starts inherits the writers, so its output streams too."
+  A future the eval starts inherits the writers, so its output streams too.
+
+  The value is printed inside the eval, under its *out* and its try: what a lazy
+  result prints as it is realized is the eval's output, and an error while
+  printing is the eval's error, as on JVM nREPL.
+
+  On an error :value is nil and :err is the message (err-msg), then a newline and
+  the trace block when the error has frames of its own (see
+  last-error-backtrace). Alongside it, for a middleware that sends what JVM
+  nREPL sends:
+    :ex             the exception (also in *e)
+    :err-msg        the `err` text, clojure.main/err->msg style (err->msg)
+    :ex-class       the `ex` string, \"class java.lang.ArithmeticException\"
+    :root-ex-class  the `root-ex` string, the class of the root cause"
   ([code ns-str] (evaluate code ns-str nil))
   ([code ns-str {on-out :out on-err :err}]
-   (let [result (atom nil) err (atom nil) exc (atom nil)
+   (let [result (atom nil) evaluated (atom false) printed (atom nil)
+         err (atom nil) exc (atom nil) failure (atom nil)
          run (fn []
                (binding [*capturing-thread* (Thread/currentThread)]
-                 (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
-                        (in-ns (symbol ns-str)))
-                      (reset! result (binding [*allow-unresolved-vars* true]
-                                       (load-string code)))
-                      (catch :default e
-                        ;; the backtrace is read here, while it still describes
-                        ;; THIS failure
-                        (reset! exc e)
-                        (let [bt (jolt.host/backtrace-string)]
-                          (reset! last-backtrace bt)
-                          (reset! err (str (err-msg e) (when bt (str "\n" bt)))))))))
+                 (let [phase (volatile! nil)]
+                   (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
+                          (in-ns (symbol ns-str)))
+                        (let [v (binding [*allow-unresolved-vars* true]
+                                  (load-string code))]
+                          (reset! result v)
+                          (reset! evaluated true)
+                          (vreset! phase :print-eval-result)
+                          (reset! printed (pr-str v)))
+                        (catch :default e
+                          ;; read here, while the thread still says which form
+                          ;; of the eval'd text was running
+                          (let [frames (eval-frames e)
+                                bt (when (seq frames)
+                                     (str "  trace:\n" (str/join "\n" frames) "\n"))
+                                pos (jolt.host/current-source-position)]
+                            (reset! exc e)
+                            (reset! last-backtrace bt)
+                            (reset! failure {:phase @phase :frame (first (filter user-frame? frames))
+                                             :line (:line pos)})
+                            (reset! err (str (err-msg e) (when bt (str "\n" bt))))))))))
          out (if on-out
                (let [ow (chunk-writer on-out)
                      ew (when on-err (chunk-writer on-err))]
@@ -216,17 +386,27 @@
      ;; and tooling (a stacktrace op) reads *e to find the last exception. These
      ;; are process-wide roots — an nREPL server has no outer REPL loop whose
      ;; thread bindings would shadow them.
+     ;; *1 moves once the code evaluated, before its value is printed, as on JVM
+     ;; nREPL: a value whose printing failed is still *1.
      ;; *e (and the backtrace beside it) survives a later successful eval, like
      ;; every REPL's does
-     (if @exc
-       (alter-var-root #'*e (constantly @exc))
-       (do (alter-var-root #'*3 (constantly *2))
-           (alter-var-root #'*2 (constantly *1))
-           (alter-var-root #'*1 (constantly @result))))
-     {:value (when (nil? @err) (pr-str @result))
-      :out out
-      :ns (str (ns-name *ns*))
-      :err @err})))
+     (when @evaluated
+       (alter-var-root #'*3 (constantly *2))
+       (alter-var-root #'*2 (constantly *1))
+       (alter-var-root #'*1 (constantly @result)))
+     (when @exc
+       (alter-var-root #'*e (constantly @exc)))
+     (cond-> {:value (when (nil? @err) @printed)
+              :out out
+              :ns (str (ns-name *ns*))
+              :err @err}
+       @exc (merge (let [e @exc
+                         {:keys [phase] :as f} @failure
+                         [ex root] (ex-class-strings e (or phase (:clojure.error/phase (ex-data e))))]
+                     {:ex e
+                      :err-msg (err->msg e f)
+                      :ex-class ex
+                      :root-ex-class root}))))))
 
 ;; ops middleware advertise via describe (built-ins + any a library registers).
 (def ^:private extra-ops (atom #{}))
@@ -307,12 +487,16 @@
       (let [code (wire-> (if (= op "load-file") (get request "file") (get request "code")))
             ;; output goes out as it is printed, each flush its own `out` (or
             ;; `err`) message, ahead of the value
-            {:keys [value ns err]} (evaluate code (get request "ns")
-                                             {:out #(respond request {"out" %})
-                                              :err #(respond request {"err" %})})]
+            {:keys [value ns err err-msg ex-class root-ex-class]}
+            (evaluate code (get request "ns")
+                      {:out #(respond request {"out" %})
+                       :err #(respond request {"err" %})})]
+        ;; an error goes out as JVM nREPL sends it: the err->msg text, then the
+        ;; classes with eval-error, then done on its own
         (if err
-          (do (respond request {"err" (str err "\n")})
-              (respond request {"ex" (str err) "status" ["eval-error" "done"]}))
+          (do (respond request {"err" err-msg})
+              (respond request {"ex" ex-class "root-ex" root-ex-class "status" ["eval-error"]})
+              (respond request {"status" ["done"]}))
           (respond request {"value" value "ns" ns "status" ["done"]})))
       :else (respond request {"status" ["done" "unknown-op"]}))))
 

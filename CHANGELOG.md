@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **nREPL eval output, errors and traces match JVM nREPL.** The value was
+  printed after the eval's `*out*` binding had ended, so what a lazy result
+  printed while it was realized went to the server's stdout instead of the
+  client, and an error while printing escaped the handler. It is now printed
+  inside the eval: the output arrives as `out`, and a printing error is an
+  eval error. An eval error is sent the way JVM nREPL sends it: `err` in
+  `clojure.main/err->msg`'s words, `ex` and `root-ex` naming the classes, and
+  `done` on its own. The trace on `:err` and in `last-error-backtrace` is the
+  error's own, cut where the eval began; a reader error used to carry whatever
+  the thread had run last (`jolt.nrepl/chunk-writer`, or a middleware fn).
+  `evaluate` also returns `:ex`, `:err-msg`, `:ex-class` and `:root-ex-class`,
+  and `jolt.nrepl/err->msg` renders the `err` text, for middleware.
+- **A stray closing delimiter is a read error in `load-string` and `-e`.**
+  `(load-string "(+ 1 2))")` and `jolt -e '(+ 1 2))'` returned 3. They now run
+  the forms before it and then raise "Unmatched delimiter: )", as the JVM
+  does. `read-string` still reads one form and stops.
 - **`=` asks a reify or proxy's own `equals`.** `hash` already used a declared
   `hashCode`, but `=` compared reifies and proxies by identity, so two of them
   that declared themselves equal stayed unequal and a map keyed by one missed
