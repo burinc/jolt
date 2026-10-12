@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(load-string "(+ 1 2))")` and `jolt -e '(+ 1 2))'` returned 3. They now run
   the forms before it and then raise "Unmatched delimiter: )", as the JVM
   does. `read-string` still reads one form and stops.
+- **A portable-bytecode build can use `jolt.socket.native`.** A
+  `:capture-native-error` binding picks its error convention from the target
+  machine, and the list had no `pb` or `tpb` machine, so a `--target tpb64l`
+  build of anything requiring `jolt.socket.native` (`jolt.nrepl` included)
+  failed with `variable error is not bound`. pb targets now capture `errno`,
+  which Chez's libffi path saves after the call on every OS. An iOS app built
+  for `tpb64l` with an nREPL builds again, and the nREPL answers on the phone.
 - **`=` asks a reify or proxy's own `equals`.** `hash` already used a declared
   `hashCode`, but `=` compared reifies and proxies by identity, so two of them
   that declared themselves equal stayed unequal and a map keyed by one missed
