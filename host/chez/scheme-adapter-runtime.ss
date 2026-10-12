@@ -1472,23 +1472,40 @@
 ;; segments pushed since, not the depth. The memo holds that segment WEAKLY;
 ;; holding it would keep the whole stack below it alive after it unwound, which
 ;; is exactly the memory a caught overflow has to give back.
+;;
+;; Identity alone does not name a segment: a one-shot continuation that returns
+;; normally is parked in the thread's cached-frame and the next call/1cc reuses
+;; the object with a new link and length (reify-cc-help, s/cpnanopass.ss), so a
+;; letcc at depth then one near the bottom would add the old depth to the new.
+;; The memo also keeps the segment's link (weakly) and length, and a segment
+;; that no longer has both is walked past.
 ;; Contract: the calling thread's stack depth in bytes, monotone in depth,
 ;; within a few segments. Degradation: #f (cannot measure); the caller then
 ;; enforces nothing.
-(define sa-stack-memo (make-thread-parameter #f))   ; weak (segment . words)
+(define sa-stack-memo (make-thread-parameter #f))   ; weak (segment . #(words link-box length))
 (define sa-ptr-bytes (foreign-sizeof 'ptr))
 (define (sa-current-stack-bytes)
   (let ((top (#%$current-stack-link))
         (bottom #%$null-continuation)
         (memo (sa-stack-memo)))
+    (define (remember! words)
+      (sa-stack-memo
+        (and (#%$continuation? top) (not (eq? top bottom))
+             (weak-cons top (vector words
+                                    (weak-cons (#%$continuation-link top) #f)
+                                    (#%$continuation-stack-clength top))))))
     (let loop ((k top) (words 0))
       (cond
         ((or (eq? k bottom) (not (#%$continuation? k)))
-         (sa-stack-memo (weak-cons top words))
+         (remember! words)
          (* words sa-ptr-bytes))
-        ((and memo (eq? k (car memo)))
-         (let ((words (+ words (cdr memo))))
-           (sa-stack-memo (weak-cons top words))
+        ((and memo
+              (eq? k (car memo))
+              (let ((v (cdr memo)))
+                (and (eq? (#%$continuation-link k) (car (vector-ref v 1)))
+                     (eqv? (#%$continuation-stack-clength k) (vector-ref v 2)))))
+         (let ((words (+ words (vector-ref (cdr memo) 0))))
+           (remember! words)
            (* words sa-ptr-bytes)))
         (else
          (loop (#%$continuation-link k)

@@ -579,7 +579,11 @@
     (jolt-stack-limit-default jolt-heap-ceiling-bytes
                               (jolt-rlimit-bytes 'as)
                               (jolt-rlimit-bytes 'data)
-                              (heap-phys-from-sysconf)))
+                              ;; a container's limit under its host's RAM, as
+                              ;; heap-default-ceiling reads them
+                              (let ((phys (heap-phys-from-sysconf))
+                                    (cg (heap-cgroup-limit)))
+                                (if (and phys cg) (min phys cg) (or phys cg)))))
   (set! jolt-stack-limit-defaulted? #t))
 ;; Called by jolt-install-gc-policy! once its ceiling is settled: a defaulted
 ;; limit is recomputed against it. One set by JOLT_STACK_LIMIT, or none
@@ -591,9 +595,14 @@
 ;; lock: the runtime's winds are masked at their edges by that count
 ;; (locks.ss), and a raise landing in one skipped its cleanup. A runaway
 ;; recursion is still allocating, so the next collection asks again.
+;; Nor while this thread is building an overflow's trace: the stack is still
+;; over the limit, and a collection during the walk would raise a second
+;; StackOverflowError inside it, which the walk's guard swallows, leaving the
+;; first with no trace.
+(define jolt-stack-overflowing (make-thread-parameter #f))
 (define (jolt-stack-check!)
   (let ((limit jolt-stack-limit-bytes))
-    (when (and limit (fx=? 0 (jolt-locks-held)))
+    (when (and limit (fx=? 0 (jolt-locks-held)) (not (jolt-stack-overflowing)))
       (let ((n (sa-current-stack-bytes)))
         (when (and n (> n limit))
           (jolt-stack-overflow! limit))))))
@@ -612,10 +621,12 @@
                " JOLT_STACK_LIMIT=<n>[k|m|g] or JOLT_STACK_LIMIT=-1.")
              jolt-nil jolt-nil 0))
         (site (let ((s (virtual-register jolt-vreg-site))) (and (pair? s) s))))
+    (jolt-stack-overflowing #t)
     (call/cc
       (lambda (k)
         (jolt-ex-info-record-capture-set!
           t (cons 'resolved (guard (e (#t '())) (jolt-continuation-recs/site k #f site))))))
+    (jolt-stack-overflowing #f)
     (jolt-throw t)))
 
 ;; The ceiling bounds the heap's TOTAL size, as -Xmx does on the JVM: the live

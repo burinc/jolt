@@ -98,6 +98,19 @@
   (ok (format "3b. repeatable (~a, ~a)" a b) (< (abs (- a b)) 65536))
   (ok (format "3c. unwound (~a)" c) (< c (quotient a 2))))
 
+;; a one-shot continuation that returned normally is reused by the next
+;; call/1cc with a new link and length, so the memo's segment identity alone
+;; does not vouch for its total: a memo naming this very segment with another
+;; link must be walked past, not added
+(let ((m (call/1cc
+           (lambda (k)
+             (let ((top (#%$current-stack-link)))
+               (sa-stack-memo (weak-cons top (vector 1000000000 (weak-cons 'elsewhere #f)
+                                                     (#%$continuation-stack-clength top))))
+               (sa-current-stack-bytes))))))
+  (ok (format "3d. a memo whose segment was relinked is not trusted (~a)" m)
+      (< m (* 1024 1024))))
+
 ;; --- 4. enforcement, in process -------------------------------------------------
 (printf "== 4. enforcement ==\n")
 (define (runaway n) (+ 1 (runaway n)))
