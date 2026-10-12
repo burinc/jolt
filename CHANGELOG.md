@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A regex match late in a string no longer costs ~60 ns per preceding
+  character (#1327).** A group-free pattern compiled to a DFA found the start of
+  its match by re-running the anchored match at every position from the search
+  origin, allocating each time, so `(re-find #"\e\[[0-9;]*[a-zA-Z]" s)` with the
+  escape 400 characters in took ~22 µs. Each position is now checked with an
+  allocation-free probe first, and the anchored match runs only where a match
+  can start: ~7 µs, and `str/replace` of escapes in a styled line is about
+  twice as fast. The search pass itself dropped a closure per character, so a
+  scan that finds nothing is ~25% faster too.
+
 - **nREPL eval output, errors and traces match JVM nREPL.** The value was
   printed after the eval's `*out*` binding had ended, so what a lazy result
   printed while it was realized went to the server's stdout instead of the

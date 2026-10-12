@@ -29,8 +29,9 @@ irregex (vendor/irregex)
   https://github.com/ashinn/irregex
   Copyright (c) 2005-2024 Alex Shinn
   BSD-style license: licenses/BSD-irregex.txt
-  jolt replaces two irregex procedures with modified copies:
-  host/chez/regex-dfa.ss (nfa->dfa) and host/chez/java/regex-anchor-sre.scm
+  jolt replaces four irregex procedures with modified copies:
+  host/chez/regex-dfa.ss (nfa->dfa, irregex-search/matches,
+  dfa-match/shortest) and host/chez/java/regex-anchor-sre.scm
   (sre->procedure); host/chez/regex-dfa-upstream.scm and
   host/chez/regex-anchor-sre-upstream.scm pin the originals.
 

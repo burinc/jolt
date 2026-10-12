@@ -145,5 +145,88 @@
 (ok "ab|a still takes the first alternative" (equal? (all-matches "ab|a" "ab") '((0 . 2))))
 (ok "foo|foobar takes the first alternative" (equal? (all-matches "foo|foobar" "foobar") '((0 . 3))))
 
+;; 6. a late match runs the anchored match ONCE (#1327). irregex's search found
+;; the leftmost start by re-running dfa-match/longest at every position from the
+;; origin, ~60ns each before reading a character, so #"\e\[[0-9;]*[a-zA-Z]" took
+;; 22us to find an escape 400 characters in. jolt's copy probes each position
+;; first and runs the anchored match only at the origin (tried directly) and
+;; where a match can start, which is always a hit. Counting the calls is the gate: no clock, and putting the
+;; per-position retry back makes the count 401.
+(fresh!)
+(define esc-pattern "\\u001b\\[[0-9;]*[a-zA-Z]")
+(define late-esc (string-append (make-string 400 #\b) (string #\esc) "[0m"))
+(ok "the escape pattern gets a DFA" (eq? (engine-of esc-pattern) 'dfa))
+(define longest-calls 0)
+(define real-longest dfa-match/longest)
+(set! dfa-match/longest
+  (lambda args (set! longest-calls (+ longest-calls 1)) (apply real-longest args)))
+(ok "a late escape is found where it is" (equal? (all-matches esc-pattern late-esc) '((400 . 404))))
+(set! longest-calls 0)
+(irx-search-from (regex-t-irx (jolt-regex esc-pattern)) late-esc 0)
+(ok "…with one anchored match, not one per preceding position" (= longest-calls 1))
+;; The origin is tried directly, without the probe, so an early match costs what
+;; it did: a late match after a near miss AT the origin takes two.
+(set! longest-calls 0)
+(irx-search-from (regex-t-irx (jolt-regex esc-pattern))
+                 (string-append (string #\esc) "x" late-esc) 0)
+(ok "…and two when the origin is a near miss" (= longest-calls 2))
+(set! dfa-match/longest real-longest)
+
+;; …and the copy answers exactly what the vendored search answered. The pinned
+;; upstream procedures are the oracle: evaluate them, run every pattern over
+;; every input under both, and compare whole match lists. The patterns are
+;; DFA-compiled ones (each row checks that), including one that can match empty
+;; (its start state accepts) and ones whose matches overlap candidate starts.
+(define search-patterns
+  '("a.*b" "x.*y|p.*q" "[a-z]+@" "(?:a*b)*" "(?:ab)+c" "\\u001b\\[[0-9;]*[a-zA-Z]"
+    "(?i)rate.?limit|timed? out|upstream.*unavailable" "b[^x]*x"))
+(define search-inputs
+  (list "" "a" "ab" "aaab" "aXXb ab a" "x1y x2y p q" "joe@ x@y @" "aabab bab b"
+        "ababc abc abababc" late-esc "bbbbxbx" "Rate Limit TIMED OUT" "zzzz"
+        (string-append "\x1b;[1;31mred" (string #\esc) "[0m plain \x1b;[K")))
+(for-each (lambda (p) (ok (format "~s gets a DFA" p) (eq? (engine-of p) 'dfa))) search-patterns)
+(define (search-matrix)
+  (map (lambda (p) (map (lambda (s) (all-matches p s)) search-inputs)) search-patterns))
+(define jolt-search (search-matrix))
+(define jolt-procs (list irregex-search/matches dfa-match/shortest))
+(define (pinned name)
+  (let lp ((ds (call-with-input-file "host/chez/regex-dfa-upstream.scm"
+                (lambda (in) (let rd ((acc '())) (let ((d (read in))) (if (eof-object? d) (reverse acc) (rd (cons d acc)))))))))
+    (if (eq? (car (cadr (car ds))) name) (car ds) (lp (cdr ds)))))
+(eval (pinned 'irregex-search/matches))
+(eval (pinned 'dfa-match/shortest))
+(define vendored-search (search-matrix))
+(set! irregex-search/matches (car jolt-procs))
+(set! dfa-match/shortest (cadr jolt-procs))
+(for-each
+  (lambda (p a b)
+    (for-each (lambda (s x y) (ok (format "~s on ~s matches the vendored search" p s) (equal? x y)))
+              search-inputs a b))
+  search-patterns jolt-search vendored-search)
+
+;; Across chunk boundaries too: a chunked source exercises the probe's chunk
+;; walk. Each input split into 3-character chunks, searched from the start.
+(define (chunked-search p s)
+  (let* ((chunks (let lp ((i 0) (acc '()))
+                   (if (>= i (string-length s)) (reverse acc)
+                       (lp (+ i 3) (cons (substring s i (min (string-length s) (+ i 3))) acc)))))
+         (cnk (make-irregex-chunker (lambda (x) (and (pair? (cdr x)) (cdr x))) car))
+         (m (and (pair? chunks) (irregex-search/chunked (regex-t-irx (jolt-regex p)) cnk chunks))))
+    (and m (irregex-match-substring m 0))))
+(define (chunked-matrix)
+  (map (lambda (p) (map (lambda (s) (chunked-search p s)) search-inputs)) search-patterns))
+(define jolt-chunked (chunked-matrix))
+(eval (pinned 'irregex-search/matches))
+(eval (pinned 'dfa-match/shortest))
+(define vendored-chunked (chunked-matrix))
+(set! irregex-search/matches (car jolt-procs))
+(set! dfa-match/shortest (cadr jolt-procs))
+(for-each
+  (lambda (p a b)
+    (for-each (lambda (s x y) (ok (format "~s on chunked ~s matches the vendored search" p s) (equal? x y)))
+              search-inputs a b))
+  search-patterns jolt-chunked vendored-chunked)
+(ok "a chunked late escape is found" (equal? (chunked-search esc-pattern late-esc) "\x1b;[0m"))
+
 (printf "regex-dfa: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

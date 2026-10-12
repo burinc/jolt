@@ -1273,7 +1273,7 @@ mirrordrift:
 mirrordrift-regen:
 	@sh host/chez/mirror-drift-check.sh --regen
 
-# host/chez/regex-dfa.ss is a COPY of one vendored irregex procedure with two
+# host/chez/regex-dfa.ss holds COPIES of three vendored irregex procedures with
 # deliberate changes. Fails when the submodule's original has moved on, so a
 # vendor bump cannot leave jolt shadowing a stale copy in silence.
 regexdfacheck:

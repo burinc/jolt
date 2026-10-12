@@ -2,8 +2,9 @@
 ;; Code from irregex, Copyright (c) 2005-2024 Alex Shinn, BSD-style license
 ;; (licenses/BSD-irregex.txt).
 ;;
-;; irregex's own nfa->dfa, as of the currently checked-out
-;; vendor/irregex. host/chez/regex-dfa.ss is jolt's replacement for it,
+;; irregex's own nfa->dfa, irregex-search/matches and
+;; dfa-match/shortest, as of the currently checked-out
+;; vendor/irregex. host/chez/regex-dfa.ss holds jolt's replacements,
 ;; and `make regexdfacheck` fails when the two stop agreeing — see
 ;; host/chez/regex-dfa-check.ss. Nothing loads this file.
 ;;
@@ -72,3 +73,70 @@
                              .
                              ,set-cmds)
                           dfa-trans))))))]))))
+(define (irregex-search/matches irx cnk init src i matches)
+  (cond
+    [(irregex-dfa irx)
+     (cond
+       [(flag-set? (irregex-flags irx) ~searcher?)
+        (cond
+          [(dfa-match/longest (irregex-dfa irx) cnk src i #f #f
+             matches 0)
+           (irregex-match-start-chunk-set! matches 0 src)
+           (irregex-match-start-index-set! matches 0 i)
+           matches]
+          [else #f])]
+       [(dfa-match/shortest (irregex-dfa/search irx) cnk src i
+          matches 0)
+        (let ([dfa (irregex-dfa irx)]
+              [get-start (chunker-get-start cnk)]
+              [get-end (chunker-get-end cnk)]
+              [get-next (chunker-get-next cnk)])
+          (let lp1 ([src src] [i i])
+            (let ([end (get-end src)])
+              (let lp2 ([i i])
+                (cond
+                  [(dfa-match/longest dfa cnk src i #f #f matches 0)
+                   (irregex-match-start-chunk-set! matches 0 src)
+                   (irregex-match-start-index-set! matches 0 i)
+                   matches]
+                  [(>= i end)
+                   (let ([next (get-next src)])
+                     (and next (lp1 next (get-start next))))]
+                  [else (lp2 (+ i 1))])))))]
+       [else #f])]
+    [else
+     (let ([res (irregex-search/backtrack irx cnk init src i
+                  matches)])
+       (if res (%irregex-match-fail-set! res #f))
+       res)]))
+(define (dfa-match/shortest dfa cnk src start matches index)
+  (let ([get-str (chunker-get-str cnk)]
+        [get-start (chunker-get-start cnk)]
+        [get-end (chunker-get-end cnk)]
+        [get-next (chunker-get-next cnk)]
+        [start-state (dfa-next-state
+                       dfa
+                       (cadr (dfa-init-state dfa)))])
+    (let lp1 ([src src] [start start] [state start-state])
+      (and src
+           (let ([str (get-str src)] [end (get-end src)])
+             (let lp2 ([i start] [state state])
+               (cond
+                 [(dfa-finalizer dfa state)
+                  (cond
+                    [index
+                     (irregex-match-end-chunk-set! matches index src)
+                     (irregex-match-end-index-set! matches index i)])
+                  #t]
+                 [(< i end)
+                  (let* ([ch (string-ref str i)]
+                         [next (find
+                                 (lambda (x)
+                                   (or (eqv? ch (car x))
+                                       (and (not (char? (car x)))
+                                            (cset-contains? (car x) ch))))
+                                 (cdr state))])
+                    (and next (lp2 (+ i 1) (dfa-next-state dfa next))))]
+                 [else
+                  (let ([next (get-next src)])
+                    (and next (lp1 next (get-start next) state)))])))))))
