@@ -14,10 +14,13 @@
   (let [t0 (System/nanoTime) _ (run f n) t1 (System/nanoTime)]
     (/ (double (- t1 t0)) n)))
 
-;; best of three, so one scheduler hiccup does not decide the ratio
-(defn best [f] (apply min (repeatedly 3 #(ns-per f 2000000))))
-
-(let [plain (best c-abs) blocking (best c-abs-blocking)
+;; Each round times the two back to back, and the ratio is the median round's.
+;; A slow stretch on a shared runner then lands on both halves of a round or
+;; spoils one round; taking each side's best separately let it land on one side
+;; only (1.5-2x usually, 3.07x once on CI).
+(let [rounds (sort-by (fn [[p b]] (/ b p))
+                     (repeatedly 7 (fn [] [(ns-per c-abs 1000000) (ns-per c-abs-blocking 1000000)])))
+      [plain blocking] (nth rounds (quot (count rounds) 2))
       lockfree (boolean (jolt.host/scheme-eval-string "(foreign-entry? \"(cs)lockfree_activation\")"))]
   (println (format "LOCKFREE %s PLAIN %.1f BLOCKING %.1f RATIO %.2f"
                    lockfree plain blocking (/ blocking plain))))
