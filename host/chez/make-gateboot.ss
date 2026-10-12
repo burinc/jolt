@@ -88,8 +88,11 @@
     (reverse order)))
 ;; Written via tmp+rename like the .so: a gate checking freshness concurrently
 ;; (parallel make) must never read a half-written list and conclude from the
-;; truncated prefix that a stale image is fresh.
+;; truncated prefix that a stale image is fresh. The old image goes first: this
+;; list describes the image about to be compiled, and if that compile fails, an
+;; old gate.so beside it would read as fresh.
 (define gb-pid (number->string (get-process-id)))
+(when (file-exists? gb-gate-so) (delete-file gb-gate-so))
 (let* ((tmp (string-append gb-inputs "." gb-pid ".tmp"))
        (out (open-output-file tmp 'replace)))
   ;; "<hash> <path>": the freshness question is whether an input still has the

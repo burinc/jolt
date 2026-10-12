@@ -188,12 +188,21 @@
            ppc32le tppc32le arm32le tarm32le
            arm64le tarm64le rv64le trv64le la64le tla64le
            i3osx ti3osx a6osx ta6osx
-           ppc32osx tppc32osx arm64osx tarm64osx)
+           ppc32osx tppc32osx arm64osx tarm64osx
+           ;; Portable bytecode makes foreign calls through libffi, and Chez's
+           ;; ffi.c saves errno after the call on every OS (GetLastError only on
+           ;; Windows, and only when asked). The target names no OS, so errno is
+           ;; the one convention that holds wherever a pb image runs.
+           pb tpb pb32l tpb32l pb32b tpb32b pb64l tpb64l pb64b tpb64b)
           #'errno-form)
          (else
-          (error 'jolt-ffi-native-error-convention-case
-                 "unsupported target machine"
-                 (eval '(#%$target-machine)))))))))
+          ;; assertion-violation, not error: this file redefines error at top
+          ;; level, and under compile-file that binding has no value while
+          ;; this transformer runs, so a plain call reported "variable error
+          ;; is not bound" instead of the message below.
+          (assertion-violation 'jolt-ffi-native-error-convention-case
+                               "unsupported target machine"
+                               (eval '(#%$target-machine)))))))))
 
 (define-syntax jolt-ffi-native-error-procedure
   (lambda (x)
