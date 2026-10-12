@@ -2018,6 +2018,63 @@ check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a 
 check '(do (require (quote jolt.nrepl)) (def seen (atom [])) (let [r (jolt.nrepl/evaluate "(println :a) (let [n (count @user/seen)] (println :b) n)" "user" {:out #(swap! seen conj %)})] [(:value r) (:out r) @seen]))' '["1" "" [":a\n" ":b\n"]]'
 check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(print \"a\") (println \"b\") (print \"c\") :v" :reply #(swap! sent conj %)}) (mapv #(or (get % "out") (get % "value")) @sent)))' '["ab\n" "c" ":v"]'
 check '(do (require (quote jolt.nrepl)) (:out (jolt.nrepl/evaluate "(println 1) 2" "user")))' '"1\n"'
+# A lazy result is realized while it is printed, and what it prints along the
+# way is the eval's output: it used to be printed after the *out* capture had
+# ended, so it went to the server's own stdout and the client never saw it. An
+# error while printing is the eval's error (JVM nREPL's :print-eval-result),
+# not a crash of the handler; *1 still holds the value, as on the JVM.
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(map (fn [x] (println \"side\" x) x) [1 2])" :reply #(swap! sent conj %)}) (mapv #(or (get % "out") (get % "value")) @sent)))' '["side 1\n" "side 2\n" "(1 2)"]'
+check '(do (require (quote jolt.nrepl)) ((juxt :value :out) (jolt.nrepl/evaluate "(map (fn [x] (println \"side\" x) x) [1 2])" "user")))' '["(1 2)" "side 1\nside 2\n"]'
+check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(map (fn [x] (/ 1 x)) [0])" "user")] [(:value r) (first (clojure.string/split-lines (:err r))) (identical? (:ex r) *e) (class *e) (seq? *1) (:err-msg r)]))' '[nil "Divide by zero" true java.lang.ArithmeticException true "Error printing return value (ArithmeticException) at (REPL:1).\nDivide by zero\n"]'
+# The trace on an eval error is the error's own, cut where the eval began: a
+# reader error in the eval'd text has none (cli-core.ss omits it too), where it
+# used to show whatever the thread had last called (the chunk writer, or an
+# unrelated middleware fn). A runtime error keeps the user frames, without
+# jolt.nrepl's or the CLI's below them, and last-error-backtrace agrees.
+check '(do (require (quote jolt.nrepl)) (jolt.host/enable-trace!) (jolt.nrepl/evaluate "(defn bt-f [x] (/ x 0)) (defn bt-g [x] (inc (bt-f x)))" "user" {:out (fn [_])}) (let [r1 (jolt.nrepl/evaluate "(bt-g 1)" "user" {:out (fn [_])}) bt1 (jolt.nrepl/last-error-backtrace) r2 (jolt.nrepl/evaluate "(defn broken [x]" "user" {:out (fn [_])})] [(boolean (re-find #"user/bt-f" (:err r1))) (boolean (re-find #"user/bt-g" (:err r1))) (boolean (re-find #"jolt\.nrepl/|jolt\.main/" (:err r1))) (= (:err r1) (str "Divide by zero\n" bt1)) (:err r2) (jolt.nrepl/last-error-backtrace)]))' '[true true false true "EOF while reading" nil]'
+# A fn eval'd over the connection that fails in a tail call is named the way
+# clojure.main names it, from the frames the trace recovers.
+check '(do (require (quote jolt.nrepl)) (jolt.host/enable-trace!) (jolt.nrepl/evaluate "(defn nf [x] (/ x 0))" "user") (:err-msg (jolt.nrepl/evaluate "(nf 1)" "user")))' '"Execution error (ArithmeticException) at user/nf (REPL:1).\nDivide by zero\n"'
+# a frame with no line names its fn's definition line, as the JVM's frame does, not the call site's
+check '(do (require (quote jolt.nrepl)) (:err-msg (jolt.nrepl/evaluate "\n\n(defn nf3 [x] (/ x 0))\n\n(nf3 1)" "user")))' '"Execution error (ArithmeticException) at user/nf3 (REPL:3).\nDivide by zero\n"'
+# an error while printing the value: the trace stops at the server's pr-str
+check '(do (require (quote jolt.nrepl)) (boolean (some #(= "pr-str" (clojure.string/trim %)) (clojure.string/split-lines (:err (jolt.nrepl/evaluate "(map (fn [x] (/ 1 x)) [0])" "user"))))))' 'false'
+# An eval error goes out as JVM nREPL sends it: err in clojure.main/err->msg's
+# words, then ex / root-ex as the CLASS of the exception and of its root cause
+# with eval-error, then done on its own. A read error is wrapped in an
+# ExceptionInfo there, so that is what ex names.
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(throw (ex-info \"outer\" {} (ArithmeticException. \"inner\")))" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Execution error (ArithmeticException) at (REPL:1).\ninner\n"} {"ex" "class clojure.lang.ExceptionInfo", "root-ex" "class java.lang.ArithmeticException", "status" ["eval-error"]} {"status" ["done"]}]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(defn broken [x]" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Syntax error reading source at (REPL:1:17).\nEOF while reading\n"} {"ex" "class clojure.lang.ExceptionInfo", "root-ex" "class java.lang.RuntimeException", "status" ["eval-error"]} {"status" ["done"]}]'
+check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "1\n\n(/ 1 0)" "user")] [(:err r) (:err-msg r) (:ex-class r) (:root-ex-class r)]))' '["Divide by zero" "Execution error (ArithmeticException) at (REPL:3).\nDivide by zero\n" "class java.lang.ArithmeticException" "class java.lang.ArithmeticException"]'
+check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(let [a] a)" "user")] [(:err-msg r) (:ex-class r)]))' '["Syntax error macroexpanding clojure.core/let at (REPL:1:1).\nBad binding form, expected matched symbol expression pairs\n" "class clojure.lang.Compiler$CompilerException"]'
+check '(do (require (quote jolt.nrepl)) (let [e (ex-info "boom" {:a 1})] [(jolt.nrepl/err->msg e) (jolt.nrepl/err->msg e {:line 4})]))' '["Execution error (ExceptionInfo).\nboom\n" "Execution error (ExceptionInfo) at (REPL:4).\nboom\n"]'
+# An undefined name is a compile error over nREPL as it is on the JVM and in
+# `jolt -e` / `jolt repl`. evaluate used to bind *allow-unresolved-vars* true,
+# so `x` interned an unbound var and returned it, and (defn f [] later) compiled
+# a reference to nothing. A forward reference across evals takes a declare.
+check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(zqx-undefined 1)" "user") d (jolt.nrepl/evaluate "(defn zqx-f [] zqx-later)" "user") ok (jolt.nrepl/evaluate "(declare zqx-fwd) (defn zqx-g [] zqx-fwd)" "user")] [(:value r) (:err r) (:value d) (some? (:err d)) (:value ok) (:err ok) (some? (resolve (quote user/zqx-undefined)))]))' '[nil "Unable to resolve symbol: zqx-undefined in this context" nil true "#'"'"'user/zqx-g" nil false]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(zqx-undefined 1)" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Syntax error compiling at (REPL:1:1).\nUnable to resolve symbol: zqx-undefined in this context\n"} {"ex" "class clojure.lang.Compiler$CompilerException", "root-ex" "class clojure.lang.Compiler$CompilerException", "status" ["eval-error"]} {"status" ["done"]}]'
+check '(do (require (quote jolt.nrepl)) (let [stop (with-out-str (def st (jolt.nrepl/start 0 nil {:port-file nil}))) port (:port (meta st)) s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) code "(zqx-undefined 1)" msg (str "d4:code" (count code) ":" code "2:op4:evale") buf (byte-array 4096)] (.write out (.getBytes msg "ISO-8859-1")) (Thread/sleep 500) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) [(boolean (re-find #"Syntax error compiling at \(REPL:1:1\)\.\nUnable to resolve symbol: zqx-undefined in this context\n" r)) (boolean (re-find #"2:ex45:class clojure\.lang\.Compiler\$CompilerException" r)) (boolean (re-find #"5:value" r))])))' '[true true false]'
+# The err text is the JVM's: jolt's "(did you mean …?)" stays on :err and the
+# exception's message, and is left out of err->msg.
+check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(mapp inc [1])" "user")] [(:err-msg r) (boolean (re-find #"did you mean map" (:err r)))]))' '["Syntax error compiling at (REPL:1:1).\nUnable to resolve symbol: mapp in this context\n" true]'
+# A stray closing delimiter after the forms is a read error, raised once the
+# forms before it have run, by load-string, -e and an nREPL eval alike. It was
+# silently dropped. read-string reads one form and stops, so it still answers.
+check '(do (def ls-stray (atom 0)) [(try (load-string "(swap! ls-stray inc))") (catch :default e (ex-message e))) @ls-stray])' '["Unmatched delimiter: )" 1]'
+check '(read-string "1)")' '1'
+check_loc '(+ 1 2))' 'Unmatched delimiter: )'
+check '(do (require (quote jolt.nrepl)) (def ev-stray (atom 0)) (let [r (jolt.nrepl/evaluate "(swap! user/ev-stray inc) ]" "user")] [(:err r) @ev-stray]))' '["Unmatched delimiter: ]" 1]'
+stray_out="$($jolt -e '(println :ran) (+ 1 2))' 2>/dev/null)"; stray_rc=$?
+if [ "$stray_rc" -ne 0 ] && [ "$stray_out" = ":ran" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: -e with a stray ) runs the forms before it, then fails"
+  echo "    want exit != 0 and stdout \`:ran\`, got $stray_rc and \`$stray_out\`"
+  fails=$((fails + 1))
+fi
+# Over the socket: the lazy result's output reaches the client as `out`.
+check '(do (require (quote jolt.nrepl)) (let [stop (with-out-str (def st (jolt.nrepl/start 0 nil {:port-file nil}))) port (:port (meta st)) s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) code "(map (fn [x] (println :side x) x) [1 2])" msg (str "d4:code" (count code) ":" code "2:op4:evale") buf (byte-array 4096)] (.write out (.getBytes msg "ISO-8859-1")) (Thread/sleep 500) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) [(boolean (re-find #"3:out\d+::side 1" r)) (boolean (re-find #"5:value5:\(1 2\)" r))])))' '[true true]'
 check '(do (require (quote jolt.nrepl) (quote [jolt.socket.native :as n])) (let [fd ((var jolt.nrepl/listen-socket) 0) c (n/close-on-exec? fd)] (n/c-close fd) (if c :close-on-exec :inheritable)))' ':close-on-exec'
 # The server end to end: an eval over TCP, then stop, then a second server on the
 # SAME port. stop used to close the listen fd under a blocked accept(), which on

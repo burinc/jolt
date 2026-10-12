@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **nREPL eval no longer accepts undefined names; use `declare`.** It bound
+  `*allow-unresolved-vars*` to true, so an undefined `x` interned an unbound
+  var and returned it, and `(defn f [] later)` compiled a reference to a name
+  nothing had defined. An undefined name is now "Unable to resolve symbol",
+  as in `jolt repl`, `-e` and JVM nREPL, and a forward reference across evals
+  needs `(declare later)` first. A compile error is reported the way JVM
+  nREPL reports it: `err` "Syntax error compiling at (REPL:1:1).", and `ex`
+  and `root-ex` both `class clojure.lang.Compiler$CompilerException`; jolt's
+  "(did you mean …?)" stays on the exception's message and is left out of
+  `err`.
 - **Waking a condition no longer takes a process-wide lock.** Every enqueue
   and dequeue on a blocking queue, and every future, promise or latch that
   settles, looked for parked fibers in a global table under one mutex, whether
@@ -43,6 +53,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **nREPL eval output, errors and traces match JVM nREPL.** The value was
+  printed after the eval's `*out*` binding had ended, so what a lazy result
+  printed while it was realized went to the server's stdout instead of the
+  client, and an error while printing escaped the handler. It is now printed
+  inside the eval: the output arrives as `out`, and a printing error is an
+  eval error. An eval error is sent the way JVM nREPL sends it: `err` in
+  `clojure.main/err->msg`'s words, `ex` and `root-ex` naming the classes, and
+  `done` on its own. The trace on `:err` and in `last-error-backtrace` is the
+  error's own, cut where the eval began; a reader error used to carry whatever
+  the thread had run last (`jolt.nrepl/chunk-writer`, or a middleware fn).
+  `evaluate` also returns `:ex`, `:err-msg`, `:ex-class` and `:root-ex-class`,
+  and `jolt.nrepl/err->msg` renders the `err` text, for middleware.
+- **A stray closing delimiter is a read error in `load-string` and `-e`.**
+  `(load-string "(+ 1 2))")` and `jolt -e '(+ 1 2))'` returned 3. They now run
+  the forms before it and then raise "Unmatched delimiter: )", as the JVM
+  does. `read-string` still reads one form and stops.
 - **An unsupported target names itself.** A `:capture-native-error` binding
   built for a target machine that the error-convention case doesn't list
   failed with `variable error is not bound`, because the case's fallback

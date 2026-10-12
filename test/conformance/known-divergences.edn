@@ -633,8 +633,9 @@
   ;; so the form either fails later with "UnresolvedVarExpr cannot be evalled" or
   ;; produces a method that fails verification (VerifyError: operand stack
   ;; underflow). jolt emits a late-bound var-ref in the compiling namespace, so
-  ;; the name works once a later eval defines it. That is what nREPL binds the
-  ;; var for, and it is the only reading under which the flag is useful.
+  ;; the name works once a later eval defines it, the only reading under which
+  ;; the flag is useful. Nothing in jolt binds it: nREPL, `jolt repl` and -e are
+  ;; strict, as on the JVM, and a forward reference takes a declare.
   ;; A require cycle on ONE thread — a.core requires b.core, whose top level
   ;; requires a.core back — is Clojure's "Cyclic load dependency" error,
   ;; detected off *pending-paths*. jolt's loader is modeled on JLS 12.4.2 class

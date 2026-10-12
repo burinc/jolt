@@ -181,6 +181,12 @@
                (if (jolt-nil? col) "?" (number->string col)))))))
 (define (jolt-current-source-string)
   (jolt-source-position-string (jolt-current-source)))
+;; The position of the top-level form this thread entered last, as a {:line
+;; :column [:file]} map, or nil. An nREPL eval reads it where it catches a
+;; failure, to say which form of the eval'd text failed (the "(REPL:3)" of
+;; clojure.main's err->msg) when no frame of the user's own names a line.
+(def-var! "jolt.host" "current-source-position"
+  (lambda () (or (jolt-current-source) jolt-nil)))
 
 ;; --- where a throwable happened -----------------------------------------
 ;; jolt-current-source answers what is evaluating NOW. A throw that crosses a
@@ -787,10 +793,14 @@
         (dyn-with-frame (or ls-file-cells '())
           (lambda ()
             (parameterize ((rdr-source-file #f))
+              ;; rdr-read-top, not rdr-read-form: a stray close delimiter is
+              ;; "Unmatched delimiter", raised when the read reaches it, after the
+              ;; forms before it have run (Compiler.load). rdr-read-form hands it
+              ;; back unconsumed, and the loop took that for the end of input.
               (let loop ((i 0) (result jolt-nil))
                 (if (>= i end)
                     result
-                    (let-values (((form j) (rdr-read-form s i end)))
+                    (let-values (((form j) (rdr-read-top s i end)))
                       (if (> j i)
                           (loop j (if (rdr-eof? form)
                                       result

@@ -2154,8 +2154,10 @@
                 ;; as do the clojure.core primitives the host declares up front.
                 ;; clojure.core/*allow-unresolved-vars* — the JVM's
                 ;; RT.ALLOW_UNRESOLVED_VARS, read here the way Compiler.resolveIn
-                ;; reads it — keeps nREPL permissive, where a name may
-                ;; legitimately arrive in a later eval.
+                ;; reads it — late-binds the name instead, for a program that
+                ;; binds it itself. jolt's REPLs do not: nREPL, `jolt repl` and
+                ;; -e are strict like the JVM's, and a name that arrives in a
+                ;; later eval needs a declare.
                 (if (allow-unresolved-vars?)
                   (var-ref (compile-ns ctx) nm)
                   (resolve-error ctx nm env)))))))

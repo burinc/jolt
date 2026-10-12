@@ -328,7 +328,10 @@
     (let ((result (let loop ((i 0) (result jolt-nil))
                     (if (>= i end)
                         result
-                        (let-values (((form j) (rdr-read-form expr i end)))
+                        ;; rdr-read-top: a stray close delimiter is an
+                        ;; unmatched-delimiter error once the forms before it
+                        ;; have run, as clojure.main -e has it, not end of input
+                        (let-values (((form j) (rdr-read-top expr i end)))
                           (if (> j i)
                               (loop j (if (rdr-eof? form)
                                           result
