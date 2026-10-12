@@ -3365,6 +3365,30 @@
   (lambda (x) (and (jreify? x) (reify-declared-hash x) #t))
   (lambda (x) (call-declared-hash (reify-declared-hash x) x)))
 
+(define (reify-equiv=? a b)
+  (let ((ea (reify-method-ref a "equiv")))
+    (cond
+      (ea (jolt-truthy? (jolt-invoke ea a b)))
+      ((and (not (jreify? a))
+            (or (jolt-sequential? a) (jolt-lazyseq? a) (jolt-coll? a)))
+       #f)
+      ((reify-method-ref b "equiv") =>
+       (lambda (eb) (jolt-truthy? (jolt-invoke eb b a))))
+      ((reify-method-ref a "equals") =>
+       (lambda (m) (jolt-truthy? (jolt-invoke m a b))))
+      (else (eq? a b)))))
+
+(define (reify-declares-eq? x)
+  (and (jreify? x)
+       (or (reify-method-ref x "equals")
+           (reify-method-ref x "equiv"))
+       #t))
+
+(register-eq-arm!
+  (lambda (a b)
+    (or (reify-declares-eq? a) (reify-declares-eq? b)))
+  reify-equiv=?)
+
 (register-get-arm!
   jreify?
   (lambda (coll k d)
