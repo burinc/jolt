@@ -2479,6 +2479,9 @@
           ;; kernel with nothing to read. Same as jolt's own launcher, and the
           ;; ceiling the JVM's MaxRAMPercentage default.
           (put-string out "(jolt-install-gc-policy!)\n")
+          ;; And the stack depth limit (rt.ss jolt-install-stack-limit!): a runaway
+          ;; recursion throws StackOverflowError instead of growing the heap.
+          (put-string out "(jolt-install-stack-limit!)\n")
           (put-string out "(scheme-start\n  (lambda args\n")
           (bld-emit-startup-profile-mark! out "scheme-start begin")
           ;; Shutdown hooks (`:shutdown` on a jolt.process, jolt.host/

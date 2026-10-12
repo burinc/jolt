@@ -9,6 +9,11 @@
 ;; A project's resolved deps roots are prepended to these by jolt.main.
 (set-source-roots! ldr-install-roots)
 
+;; The stack depth limit (rt.ss jolt-install-stack-limit!), read from this
+;; process's environment and rlimits. Here rather than beside the collector
+;; policy in cli-devcache.ss so source mode, which installs no policy, has it too.
+(jolt-install-stack-limit!)
+
 ;; JOLT_TRACE opt-in, at runtime (before any app ns compiles) so the app is traced.
 (jolt-trace-init-from-env!)
 

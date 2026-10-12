@@ -141,6 +141,19 @@
 (define (sa-gc-install-stall-watch! seconds on-stall)
   #f)
 
+;; (sa-gc-install-after-rendezvous! thunk) -> boolean
+;; (sa-current-stack-bytes) -> exact integer | #f
+;; Permitted degradation: #f from both. Gambit's collector is not a rendezvous
+;; every thread passes through, and its continuation frames are measured only by
+;; walking them. The stack is then unbounded, as it was on every target before
+;; the limit: a runaway recursion grows the heap until Gambit's own heap limit
+;; (or the JS engine's) stops it. The policy (rt.ss jolt-install-stack-limit!)
+;; is Chez's; the Gambit kernel (rt-core.ss) does not carry it.
+(define (sa-gc-install-after-rendezvous! thunk)
+  #f)
+(define (sa-current-stack-bytes)
+  #f)
+
 ;; (sa-thread-id-of t) -> fixnum | #f
 ;; Permitted degradation: #f — no per-thread number is readable from a
 ;; thread object here, so the fork wrapper records nothing for the child and

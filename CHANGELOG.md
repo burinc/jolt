@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Runaway recursion throws `StackOverflowError`.** Chez keeps a deep stack
+  on the heap, so a non-tail recursion that never ends used to allocate until
+  the heap ceiling raised `OutOfMemoryError` (a minute and a half and ~18 GB
+  later on a 64 GB machine) or, with no ceiling, until the kernel killed the
+  process. Each thread's stack now has a limit, 80% of the heap ceiling, or
+  with no ceiling (`JOLT_MAX_HEAP=off`) of `RLIMIT_AS`, else `RLIMIT_DATA`,
+  else physical RAM. Past it the recursion throws
+  `java.lang.StackOverflowError`, an `Error` that `(catch Exception e)` lets
+  through, with a message naming the limit (the JVM's is nil). On the same
+  machine the runaway now ends in `StackOverflowError` after ~38 s.
+  `JOLT_STACK_LIMIT` sets it (`512m`, `2g`) or turns it off (`-1`, `0`, `off`,
+  `none`); `jolt.host/stack-limit` reads it. The stack is measured after each
+  collection, so ordinary code pays nothing for it. Not on Gambit.
+
 ### Changed
 
 - **Waking a condition no longer takes a process-wide lock.** Every enqueue

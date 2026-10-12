@@ -159,6 +159,9 @@ system
 # a target whose collector is not a rendezvous of active threads, or a Chez
 # whose rendezvous protocol the Chez copy has not been compared against,
 # keeps its own rendezvous and reports no stall (the behaviour before 0.8.9).
+# sa-gc-install-after-rendezvous! and sa-current-stack-bytes may both answer #f
+# (no per-thread post-collection hook, or no cheap measure of a thread's
+# stack): the stack depth limit is then not enforced and reads back as none.
 sa-run-process
 sa-environment-pairs
 sa-os-release
@@ -179,6 +182,8 @@ sa-unpin-for-owner!
 sa-reset-max-memory-bytes!
 sa-gc-install-after-collect!
 sa-gc-install-stall-watch!
+sa-gc-install-after-rendezvous!
+sa-current-stack-bytes
 #
 # tier: capability-introspect
 # OUR definitions in host/chez/scheme-adapter-runtime.ss for the blocklist's
