@@ -36,8 +36,11 @@ printf '%s\n' "$out" | grep '^elapsed-ms' | sed 's/^/stacklimit: runaway x12 und
 # 2. Legitimate depth under the default.
 expect "1M frames under the default" '^1000000$' deep
 
-# 3. -1 disables; the same recursion that overflows a small limit completes.
-expect "-1 reads back as no limit" '^nil$' limit JOLT_STACK_LIMIT=-1
+# 3. -1, 0, off and none disable; the same recursion that overflows a small
+#    limit completes.
+for v in -1 0 off OFF none; do
+  expect "$v reads back as no limit" '^nil$' limit JOLT_STACK_LIMIT=$v
+done
 expect "-1: 10M frames complete" '^10000000$' bounded JOLT_STACK_LIMIT=-1
 expect "16m: 10M frames overflow" '^:stack-overflow$' bounded JOLT_STACK_LIMIT=16m
 
@@ -48,14 +51,20 @@ expect "2g" '^2147483648$' limit JOLT_STACK_LIMIT=2g
 expect "1048576" '^1048576$' limit JOLT_STACK_LIMIT=1048576
 
 # 5. A bad value is refused by name at startup, the way JOLT_MAX_HEAP's are.
-for v in abc 0 -2 1.5g 12x; do
+for v in abc -2 1.5g 12x offf; do
   run limit JOLT_STACK_LIMIT="$v"
   if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "JOLT_STACK_LIMIT=$v is not valid"; then ok; else bad "invalid $v refused"; fi
 done
 
-# 6. The default is 80% of the memory limit. Unset everywhere: physical RAM.
-#    Under `ulimit -v` (Linux; macOS refuses to set RLIMIT_AS): that limit.
-run limit
+# 6. The default is 80% of the heap ceiling in force; with no ceiling, of the
+#    memory limit: RLIMIT_AS (Linux `ulimit -v`; macOS refuses to set it), else
+#    RLIMIT_DATA, else physical RAM.
+run limits
+max=$(printf '%s\n' "$out" | head -1 | sed 's/^\[[0-9]* \([0-9]*\)\]$/\1/')
+lim=$(printf '%s\n' "$out" | head -1 | sed 's/^\[\([0-9]*\) .*/\1/')
+if [ "$rc" = 0 ] && [ -n "$max" ] && [ "$max" != 9223372036854775807 ] && [ "$lim" = "$((max * 4 / 5))" ]; then ok; else bad "default is 80% of the default heap ceiling"; fi
+expect "JOLT_MAX_HEAP=1g -> 80% of 1g" '^\[858993459 1073741824\]$' limits JOLT_MAX_HEAP=1g
+run limit JOLT_MAX_HEAP=off
 def=$(printf '%s\n' "$out" | head -1)
 case "$(uname -s)" in
   Darwin) phys=$(sysctl -n hw.memsize) ;;
@@ -63,10 +72,11 @@ case "$(uname -s)" in
 esac
 if [ "$(ulimit -v)" != unlimited ] || [ "$(ulimit -d)" != unlimited ]; then
   echo "stacklimit: physical-RAM default skipped (this shell has a memory rlimit)"
-elif [ "$rc" = 0 ] && [ "$def" = "$((phys * 4 / 5))" ]; then ok; else bad "default is 80% of physical RAM ($phys)"; fi
+elif [ "$rc" = 0 ] && [ "$def" = "$((phys * 4 / 5))" ]; then ok; else bad "JOLT_MAX_HEAP=off: default is 80% of physical RAM ($phys)"; fi
+expect "an explicit limit ignores the ceiling" '^\[67108864 1073741824\]$' limits JOLT_MAX_HEAP=1g JOLT_STACK_LIMIT=64m
 if [ "$(uname -s)" = Linux ] && (ulimit -v 16777216) 2>/dev/null; then
-  out=$(ulimit -v 16777216; env JOLT_NO_USER_DEPS=1 "$J" run "$T" limit 2>&1); rc=$?
-  if [ "$rc" = 0 ] && [ "$(printf '%s\n' "$out" | head -1)" = "$((16777216 * 1024 * 4 / 5))" ]; then ok; else bad "default under ulimit -v 16G is 80% of RLIMIT_AS"; fi
+  out=$(ulimit -v 16777216; env JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=off "$J" run "$T" limit 2>&1); rc=$?
+  if [ "$rc" = 0 ] && [ "$(printf '%s\n' "$out" | head -1)" = "$((16777216 * 1024 * 4 / 5))" ]; then ok; else bad "JOLT_MAX_HEAP=off under ulimit -v 16G: 80% of RLIMIT_AS"; fi
 else
   echo "stacklimit: RLIMIT_AS case skipped (cannot set ulimit -v here; the precedence is pinned in stack-limit-test.ss)"
 fi

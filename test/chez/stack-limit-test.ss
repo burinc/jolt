@@ -28,31 +28,56 @@
     ("64k" . 65536) ("64K" . 65536)
     ("512m" . 536870912) ("512M" . 536870912)
     ("2g" . 2147483648) ("2G" . 2147483648)
-    ("-1" . off)
+    ;; off, the spellings JOLT_MAX_HEAP takes plus -1
+    ("-1" . off) ("0" . off) ("off" . off) ("OFF" . off) ("none" . off) ("None" . off)
     ;; everything else is a configuration error, refused by name at startup
-    ("" . #f) ("abc" . #f) ("0" . #f) ("0m" . #f) ("-2" . #f) ("-1m" . #f)
-    ("1.5g" . #f) ("12x" . #f) ("m" . #f) ("2gb" . #f) (" 2g" . #f) ("off" . #f)))
+    ("" . #f) ("abc" . #f) ("0m" . #f) ("-2" . #f) ("-1m" . #f)
+    ("1.5g" . #f) ("12x" . #f) ("m" . #f) ("2gb" . #f) (" 2g" . #f) ("offf" . #f)))
 
-;; --- 2. the default: 80% of the first finite memory limit ---------------------
+;; --- 2. the default: 80% of the heap ceiling, else of the memory limit -------
 (printf "== 2. default precedence ==\n")
 (define gib (* 1024 1024 1024))
-(ok "2a. RLIMIT_AS wins over RLIMIT_DATA and RAM"
-    (= (jolt-stack-limit-default (* 8 gib) (* 4 gib) (* 64 gib)) (quotient (* 8 gib 4) 5)))
-(ok "2b. RLIMIT_DATA when RLIMIT_AS is unlimited"
-    (= (jolt-stack-limit-default #f (* 4 gib) (* 64 gib)) (quotient (* 4 gib 4) 5)))
-(ok "2c. physical RAM when neither rlimit is set"
-    (= (jolt-stack-limit-default #f #f (* 64 gib)) (quotient (* 64 gib 4) 5)))
-(ok "2d. nothing readable: no limit rather than a guess"
-    (not (jolt-stack-limit-default #f #f #f)))
-(ok "2e. an exact integer, floored"
-    (eqv? (jolt-stack-limit-default 1001 #f #f) 800))
+(ok "2a. a heap ceiling wins over every rlimit and RAM"
+    (= (jolt-stack-limit-default (* 2 gib) (* 8 gib) (* 4 gib) (* 64 gib)) (quotient (* 2 gib 4) 5)))
+(ok "2b. no ceiling: RLIMIT_AS wins over RLIMIT_DATA and RAM"
+    (= (jolt-stack-limit-default #f (* 8 gib) (* 4 gib) (* 64 gib)) (quotient (* 8 gib 4) 5)))
+(ok "2c. RLIMIT_DATA when RLIMIT_AS is unlimited"
+    (= (jolt-stack-limit-default #f #f (* 4 gib) (* 64 gib)) (quotient (* 4 gib 4) 5)))
+(ok "2d. physical RAM when neither rlimit is set"
+    (= (jolt-stack-limit-default #f #f #f (* 64 gib)) (quotient (* 64 gib 4) 5)))
+(ok "2e. nothing readable: no limit rather than a guess"
+    (not (jolt-stack-limit-default #f #f #f #f)))
+(ok "2e'. an exact integer, floored"
+    (eqv? (jolt-stack-limit-default 1001 #f #f #f) 800))
+
+;; The default follows the heap ceiling actually in force, whichever of the two
+;; is installed first: the stack limit's default is recomputed when the
+;; collector policy installs or drops its ceiling.
+(define saved-ceiling jolt-heap-ceiling-bytes)
+(set! jolt-heap-ceiling-bytes #f)
+(jolt-stack-limit-install-default!)
+(define no-ceiling-default (jolt-stack-limit))
+(set! jolt-heap-ceiling-bytes (* 1 gib))
+(jolt-stack-limit-heap-ceiling-changed!)
+(ok (format "2i. a ceiling installed after the stack limit is seen (~a)" (jolt-stack-limit))
+    (= (jolt-stack-limit) (quotient (* 1 gib 4) 5)))
+(set! jolt-heap-ceiling-bytes #f)
+(jolt-stack-limit-heap-ceiling-changed!)
+(ok "2j. and a dropped one falls back to the memory limit"
+    (equal? (jolt-stack-limit) no-ceiling-default))
+(jolt-stack-limit-set! (* 64 1024 1024))
+(set! jolt-heap-ceiling-bytes (* 1 gib))
+(jolt-stack-limit-heap-ceiling-changed!)
+(ok "2k. an explicit limit is not replaced by the ceiling's default"
+    (= (jolt-stack-limit) (* 64 1024 1024)))
+(set! jolt-heap-ceiling-bytes saved-ceiling)
 
 ;; The real readings on this host: each an exact positive integer or #f.
 (define (reading? x) (or (not x) (and (exact? x) (integer? x) (> x 0))))
 (ok "2f. RLIMIT_AS reads as bytes or #f" (reading? (jolt-rlimit-bytes 'as)))
 (ok "2g. RLIMIT_DATA reads as bytes or #f" (reading? (jolt-rlimit-bytes 'data)))
 (ok "2h. the default on this host is a number (physical RAM is readable)"
-    (let ((d (jolt-stack-limit-default (jolt-rlimit-bytes 'as) (jolt-rlimit-bytes 'data)
+    (let ((d (jolt-stack-limit-default #f (jolt-rlimit-bytes 'as) (jolt-rlimit-bytes 'data)
                                        (heap-phys-from-sysconf))))
       (and (exact? d) (> d 0))))
 

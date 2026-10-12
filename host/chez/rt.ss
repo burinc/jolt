@@ -461,7 +461,9 @@
                   (gc-size-nursery! (max 0 (- gc-ns (* gc-full-ms-this-time 1000000))) elapsed-ns)
                   (when gc-log? (gc-log-line gc-ns elapsed-ns))
                   (when ceiling (gc-check-overhead! gc-ns elapsed-ns ceiling))))
-        (set! jolt-heap-ceiling-bytes #f)))))
+        (set! jolt-heap-ceiling-bytes #f))))
+  ;; the stack limit's default is sized from the ceiling in force
+  (jolt-stack-limit-heap-ceiling-changed!))
 
 ;; --- stack depth limit ----------------------------------------------------------
 ;; Chez has no stack overflow. A stack that outgrows its segment moves the frames
@@ -474,18 +476,24 @@
 ;;
 ;; The rule is Guile's. Guile's VM stack is unbounded and grows on demand; its C
 ;; stack check errors at 80% of what the OS gives the process. jolt applies the
-;; 80% to its one stack, against memory: 80% of RLIMIT_AS if that is finite, else
-;; of RLIMIT_DATA, else of physical RAM. Computed once, at process start, and
-;; applied to each thread's stack separately, as Guile's is per thread.
+;; 80% to its one stack, against the memory the process may use. The stack's
+;; segments are heap objects and count against the heap ceiling, so that is the
+;; heap ceiling when one is in force (JOLT_MAX_HEAP, 25% of RAM or of a cgroup
+;; limit by default): a limit above it would never be reached, the recursion
+;; meeting the ceiling first as an OutOfMemoryError. With no ceiling
+;; (JOLT_MAX_HEAP=off, or source mode, which installs no collector policy) it is
+;; 80% of RLIMIT_AS if that is finite, else of RLIMIT_DATA, else of physical
+;; RAM. Applied to each thread's stack separately, as Guile's is per thread.
+;;
+;; The default follows the ceiling actually in force whichever is installed
+;; first: jolt-install-gc-policy! tells the stack limit when it sets or drops
+;; one (jolt-stack-limit-heap-ceiling-changed!), and an explicit
+;; JOLT_STACK_LIMIT is left alone.
 ;;
 ;; JOLT_STACK_LIMIT overrides it: bytes with an optional k/m/g suffix (512m, 2g),
-;; or -1 for no limit, which is what every release before this one did. Any
-;; other spelling is refused at startup by name, like JOLT_MAX_HEAP's.
-;;
-;; The stack's segments are heap objects, so they count against the heap ceiling
-;; too (JOLT_MAX_HEAP, 25% of RAM by default). A stack limit above the ceiling
-;; is never reached: the recursion meets the ceiling first and gets an
-;; OutOfMemoryError (or the GC overhead limit's), as it did before.
+;; or -1, 0, off or none for no limit, which is what every release before this
+;; one did. Any other spelling is refused at startup by name, like
+;; JOLT_MAX_HEAP's.
 ;;
 ;; The check costs nothing per call. A thread recursing without bound allocates
 ;; stack segments, so it keeps tripping collections, and after each one every
@@ -499,18 +507,20 @@
 ;; On Windows neither getrlimit nor sysconf is there, so there is no default
 ;; and the stack is unbounded unless JOLT_STACK_LIMIT sets one.
 (define jolt-stack-limit-bytes #f)       ; #f = no limit (or not installed)
+(define jolt-stack-limit-defaulted? #f)  ; the limit is the default, not the env's
 (define (jolt-stack-limit) jolt-stack-limit-bytes)
 ;; N bytes, or #f for none. Without the hook nothing would enforce a limit, so
 ;; then it reads back as none rather than as one that is not there.
 (define (jolt-stack-limit-set! n)
+  (set! jolt-stack-limit-defaulted? #f)
   (set! jolt-stack-limit-bytes
     (and n (sa-gc-install-after-rendezvous! jolt-stack-check!) n)))
-;; "-1" -> 'off; digits with an optional k/m/g suffix -> bytes; anything else #f.
+;; "-1", "0", "off", "none" (any case) -> 'off; digits with an optional k/m/g suffix -> bytes; anything else #f.
 (define (jolt-stack-limit-parse v)
   (let* ((t (string-downcase v))
          (n (string-length t)))
     (cond
-      ((string=? t "-1") 'off)
+      ((member t '("-1" "0" "off" "none")) 'off)
       ((fx=? n 0) #f)
       (else
        (let* ((mult (case (string-ref t (fx- n 1))
@@ -527,12 +537,12 @@
   (let ((v (getenv "JOLT_STACK_LIMIT")))
     (and v
          (or (jolt-stack-limit-parse v)
-             (gc-config-error "JOLT_STACK_LIMIT" v "a size like 512m or 4g, or -1 for no limit")))))
-;; 80% of the first finite limit among RLIMIT_AS, RLIMIT_DATA and physical RAM;
-;; #f when none can be read, which leaves the stack unbounded rather than
-;; guessing.
-(define (jolt-stack-limit-default as data phys)
-  (let ((base (or as data phys)))
+             (gc-config-error "JOLT_STACK_LIMIT" v "a size like 512m or 4g, or -1/0/off/none for no limit")))))
+;; 80% of the heap ceiling, else of the first finite limit among RLIMIT_AS,
+;; RLIMIT_DATA and physical RAM; #f when none can be read, which leaves the
+;; stack unbounded rather than guessing.
+(define (jolt-stack-limit-default heap as data phys)
+  (let ((base (or heap as data phys)))
     (and base (quotient (* base 4) 5))))
 ;; getrlimit's soft limit for RESOURCE ('as or 'data) in bytes, #f when it is
 ;; unlimited or unreadable. struct rlimit is two rlim_t: 64-bit on a 64-bit host,
@@ -559,13 +569,24 @@
 ;; Process start (the launchers, next to jolt-install-gc-policy!): read the
 ;; environment and the limits of the process actually running, never the build's.
 (define (jolt-install-stack-limit!)
-  (let* ((env (jolt-stack-limit-from-env))
-         (limit (cond ((eq? env 'off) #f)
-                      (env env)
-                      (else (jolt-stack-limit-default (jolt-rlimit-bytes 'as)
-                                                      (jolt-rlimit-bytes 'data)
-                                                      (heap-phys-from-sysconf))))))
-    (jolt-stack-limit-set! limit)))
+  (let ((env (jolt-stack-limit-from-env)))
+    (cond ((eq? env 'off) (jolt-stack-limit-set! #f))
+          (env (jolt-stack-limit-set! env))
+          (else (jolt-stack-limit-install-default!)))))
+;; The default, from the heap ceiling in force now.
+(define (jolt-stack-limit-install-default!)
+  (jolt-stack-limit-set!
+    (jolt-stack-limit-default jolt-heap-ceiling-bytes
+                              (jolt-rlimit-bytes 'as)
+                              (jolt-rlimit-bytes 'data)
+                              (heap-phys-from-sysconf)))
+  (set! jolt-stack-limit-defaulted? #t))
+;; Called by jolt-install-gc-policy! once its ceiling is settled: a defaulted
+;; limit is recomputed against it. One set by JOLT_STACK_LIMIT, or none
+;; installed yet, is left as it is.
+(define (jolt-stack-limit-heap-ceiling-changed!)
+  (when jolt-stack-limit-defaulted?
+    (jolt-stack-limit-install-default!)))
 ;; After each collection, on each thread. Not while the thread holds a counted
 ;; lock: the runtime's winds are masked at their edges by that count
 ;; (locks.ss), and a raise landing in one skipped its cleanup. A runaway

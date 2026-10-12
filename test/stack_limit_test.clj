@@ -60,6 +60,8 @@
     "runaway" (runaway-mode)
     ;; the effective limit: bytes, or nil when disabled
     "limit" (prn (jolt.host/stack-limit))
+    ;; the stack limit and the heap ceiling it defaults from (Long/MAX_VALUE: none)
+    "limits" (prn [(jolt.host/stack-limit) (.maxMemory (Runtime/getRuntime))])
     ;; 1M frames under whatever limit is in effect
     "deep" (prn (depth 1000000))
     ;; 10M frames (~100MB of stack): over a 16m limit, inside no limit. Well over:
