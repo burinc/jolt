@@ -172,11 +172,21 @@
   [cls]
   (str/starts-with? (str cls) "jolt.nrepl$evaluate"))
 
+;; evaluate's own pr-str of the value; outward of it is the server
+(defn- printer-frame? [line]
+  (#{"pr-str" "clojure.core/pr-str"} (first (str/split (str/trim line) #"\s"))))
+
 (defn- cut-at-eval
-  "Frame lines (\"    ns/fn (file:line)\") down to the first of `evaluate`'s own."
-  [lines]
-  (take-while #(not (str/starts-with? % "    jolt.nrepl/evaluate"))
-              (remove str/blank? lines)))
+  "Frame lines (\"    ns/fn (file:line)\") down to the first of `evaluate`'s own.
+  For an error while printing the value, down to evaluate's pr-str, the
+  outermost one."
+  ([lines] (cut-at-eval lines false))
+  ([lines printing?]
+   (let [fs (take-while #(not (str/starts-with? % "    jolt.nrepl/evaluate"))
+                        (remove str/blank? lines))]
+     (if-let [i (when printing? (last (keep-indexed #(when (printer-frame? %2) %1) fs)))]
+       (take i fs)
+       fs))))
 
 (defn- eval-frames
   "The frame lines of an eval error, innermost first, cut where the eval began;
@@ -193,7 +203,7 @@
   last — the chunk writer's flush, an unrelated middleware fn. It is only
   consulted for an error raised by the eval'd code's own execution, where
   every top-level form starts the history afresh (jolt-enter-form!)."
-  [e]
+  [e printing?]
   (if (syntax-error? e)
     []
     (let [own (try
@@ -203,11 +213,11 @@
                         s (str sw)
                         head (str (.toString e) "\n")]
                     (when (str/starts-with? s head)
-                      (cut-at-eval (str/split-lines (subs s (count head)))))))
+                      (cut-at-eval (str/split-lines (subs s (count head))) printing?))))
                 (catch :default _ nil))]
       (vec (or (seq own)
                (when-let [bt (try (jolt.host/backtrace-string) (catch :default _ nil))]
-                 (cut-at-eval (remove #(= (str/trim %) "trace:") (str/split-lines bt)))))))))
+                 (cut-at-eval (remove #(= (str/trim %) "trace:") (str/split-lines bt)) printing?)))))))
 
 (defn- frame-location
   "{:symbol :source :line} named by a frame line, nil for one that names no
@@ -284,11 +294,18 @@
            run-phase? (#{:execution :print-eval-result} (:clojure.error/phase t))
            floc (when (and frame run-phase? (nil? (:clojure.error/symbol t)))
                   (frame-location frame))
+           ;; a frame with no line: the line its fn was defined on, which is
+           ;; where the JVM's frame points for a one-line fn. Not the running
+           ;; top-level form's, which is the call site
+           fline (or (:line floc)
+                     (when floc
+                       (try (some-> (resolve (:symbol floc)) meta :line)
+                            (catch :default _ nil))))
            t (cond-> t
                floc (assoc :clojure.error/symbol (:symbol floc))
                (:source floc) (assoc :clojure.error/source (:source floc))
-               (:line floc) (assoc :clojure.error/line (:line floc)))
-           t (if (and line run-phase? (nil? (:clojure.error/line t)))
+               fline (assoc :clojure.error/line fline))
+           t (if (and line run-phase? (nil? floc) (nil? (:clojure.error/line t)))
                (assoc t :clojure.error/line line)
                t)]
        (render-triage t))
@@ -379,7 +396,7 @@
                         (catch :default e
                           ;; read here, while the thread still says which form
                           ;; of the eval'd text was running
-                          (let [frames (eval-frames e)
+                          (let [frames (eval-frames e (= @phase :print-eval-result))
                                 bt (when (seq frames)
                                      (str "  trace:\n" (str/join "\n" frames) "\n"))
                                 pos (jolt.host/current-source-position)]

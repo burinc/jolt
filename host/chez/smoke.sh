@@ -2035,6 +2035,10 @@ check '(do (require (quote jolt.nrepl)) (jolt.host/enable-trace!) (jolt.nrepl/ev
 # A fn eval'd over the connection that fails in a tail call is named the way
 # clojure.main names it, from the frames the trace recovers.
 check '(do (require (quote jolt.nrepl)) (jolt.host/enable-trace!) (jolt.nrepl/evaluate "(defn nf [x] (/ x 0))" "user") (:err-msg (jolt.nrepl/evaluate "(nf 1)" "user")))' '"Execution error (ArithmeticException) at user/nf (REPL:1).\nDivide by zero\n"'
+# a frame with no line names its fn's definition line, as the JVM's frame does, not the call site's
+check '(do (require (quote jolt.nrepl)) (:err-msg (jolt.nrepl/evaluate "\n\n(defn nf3 [x] (/ x 0))\n\n(nf3 1)" "user")))' '"Execution error (ArithmeticException) at user/nf3 (REPL:3).\nDivide by zero\n"'
+# an error while printing the value: the trace stops at the server's pr-str
+check '(do (require (quote jolt.nrepl)) (boolean (some #(= "pr-str" (clojure.string/trim %)) (clojure.string/split-lines (:err (jolt.nrepl/evaluate "(map (fn [x] (/ 1 x)) [0])" "user"))))))' 'false'
 # An eval error goes out as JVM nREPL sends it: err in clojure.main/err->msg's
 # words, then ex / root-ex as the CLASS of the exception and of its root cause
 # with eval-error, then done on its own. A read error is wrapped in an
