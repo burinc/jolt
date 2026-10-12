@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **nREPL eval no longer accepts undefined names; use `declare`.** It bound
+  `*allow-unresolved-vars*` to true, so an undefined `x` interned an unbound
+  var and returned it, and `(defn f [] later)` compiled a reference to a name
+  nothing had defined. An undefined name is now "Unable to resolve symbol",
+  as in `jolt repl`, `-e` and JVM nREPL, and a forward reference across evals
+  needs `(declare later)` first. A compile error is reported the way JVM
+  nREPL reports it: `err` "Syntax error compiling at (REPL:1:1).", and `ex`
+  and `root-ex` both `class clojure.lang.Compiler$CompilerException`; jolt's
+  "(did you mean …?)" stays on the exception's message and is left out of
+  `err`.
 - **Waking a condition no longer takes a process-wide lock.** Every enqueue
   and dequeue on a blocking queue, and every future, promise or latch that
   settles, looked for parked fibers in a global table under one mutex, whether

@@ -268,10 +268,18 @@
                phase (assoc :phase phase))
            t (main/ex-triage m)
            ;; a jolt diagnostic is the throwable itself, where the JVM's
-           ;; CompilerException wraps a RuntimeException ex-str leaves unnamed
+           ;; CompilerException wraps a RuntimeException, which ex-str leaves
+           ;; unnamed. Removing the class instead renders "Syntax error ()".
            t (if (and (syntax-phases (:clojure.error/phase t))
                       (:jolt.error/kind (:data (last (:via m)))))
-               (dissoc t :clojure.error/class)
+               (assoc t :clojure.error/class 'java.lang.RuntimeException)
+               t)
+           ;; the cause as the JVM words it: jolt's "(did you mean …?)" is a
+           ;; suffix on the same message, kept on ex-message and :err
+           d (:data (last (:via m)))
+           t (if (and (= :analyze/unresolved-symbol (:jolt.error/kind d)) (:jolt.error/symbol d))
+               (assoc t :clojure.error/cause
+                      (str "Unable to resolve symbol: " (:jolt.error/symbol d) " in this context"))
                t)
            run-phase? (#{:execution :print-eval-result} (:clojure.error/phase t))
            floc (when (and frame run-phase? (nil? (:clojure.error/symbol t)))
@@ -288,14 +296,19 @@
 
 (defn- ex-class-strings
   "nREPL's ex / root-ex: the class of the exception and of its root cause, as
-  (str (class e)) prints them. JVM nREPL wraps a read error and an error while
-  printing in an ExceptionInfo (phase :read-source / :print-eval-result), so ex
-  names that for those."
+  (str (class e)) prints them, with the JVM's wrappers where it has them. JVM
+  nREPL wraps a read error and an error while printing in an ExceptionInfo
+  (phase :read-source / :print-eval-result), so ex names that for those. A
+  compile-time error there is a Compiler$CompilerException, which root-cause
+  stops at, so it is both ex and root-ex; jolt's diagnostic is the throwable
+  itself, with no such wrapper to name."
   [e phase]
-  [(if (#{:read-source :print-eval-result} phase)
-     (str (class (ex-info "" {})))
-     (str (class e)))
-   (str (class (main/root-cause e)))])
+  (if (and (syntax-phases phase) (not= :read-source phase))
+    (let [c "class clojure.lang.Compiler$CompilerException"] [c c])
+    [(if (#{:read-source :print-eval-result} phase)
+       (str (class (ex-info "" {})))
+       (str (class e)))
+     (str (class (main/root-cause e)))]))
 
 (defn- chunk-writer
   "A java.io.Writer that hands what was written to `send` in chunks: on flush (a
@@ -355,8 +368,10 @@
                  (let [phase (volatile! nil)]
                    (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
                           (in-ns (symbol ns-str)))
-                        (let [v (binding [*allow-unresolved-vars* true]
-                                  (load-string code))]
+                        ;; strict, as clojure.main's REPL and `jolt repl`: an
+                        ;; undefined name is "Unable to resolve symbol", and a
+                        ;; forward reference across evals takes a declare
+                        (let [v (load-string code)]
                           (reset! result v)
                           (reset! evaluated true)
                           (vreset! phase :print-eval-result)
