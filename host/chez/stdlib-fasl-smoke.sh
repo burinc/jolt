@@ -2,7 +2,7 @@
 # stdlib-fasl smoke (R1): the embedded per-namespace stdlib fasls actually take.
 #
 # A built jolt compiles each install-owned stdlib namespace to a fasl at build
-# time, concatenates them into one C-array blob (jolt_stdlib_fasls, xxd'd into
+# time, concatenates them into one C-array blob (jolt_stdlib_fasls, linked into
 # the binary), and records an index the launcher hands to
 # jolt-stdlib-fasls-attach!. A require then loads the compiled code via
 # load-compiled-from-port instead of recompiling from source.
