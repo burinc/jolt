@@ -71,9 +71,16 @@
 
 (defn- is-forms [n] (body n (fn [i] (str "(clojure.test/is (= " i " " i "))"))))
 
+;; Both arms compile once, untimed, before either is measured. A fresh process's
+;; first compiles pay one-time costs, and the arm timed first took all of them:
+;; cold, this read 4.8 or 5.2 on the same binary depending on the run, and load
+;; on the machine pushed it toward the ceiling. Warm, the 1x->4x ratio reads
+;; 4.4-5.4 alike on the pool-layers fix, a midpoint and main, so the creep CI showed
+;; was this, not the compile path.
 (defn- shape-ratio []
   (let [a (is-forms n1)
         b (is-forms (* n1 factor))]
+    (timed a) (timed b)
     (/ (best-of samples #(timed b)) (best-of samples #(timed a)))))
 
 ;; --- per-quoted-form overhead ----------------------------------------------

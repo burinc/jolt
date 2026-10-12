@@ -931,6 +931,18 @@
            :jvm "[\"java.lang.Integer\" false]"
            :jolt "[\"java.lang.Long\" true]"}
    :note "Chez has one fixnum. instance? is deliberately permissive for Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset. Float is its own value (a jfloat), so Float and Double answer as on the JVM."}
+  ;; A declared hashCode is an int method. The JVM narrows a primitive long
+  ;; result with RT.intCast, which throws past int range, and a boxed Number with
+  ;; intValue, which wraps. jolt has no primitive/boxed distinction to choose on,
+  ;; so it wraps both: the boxed rule, the one that never fails.
+  {:category :integer-box-model
+   :behavior "(hash (reify Object (hashCode [_] (+ 2000000000 2000000000))))"
+   :jvm "throws ArithmeticException (integer overflow, RT.intCast of a primitive long)"
+   :jolt "-294967296, the low 32 bits, as a boxed Long result narrows on the JVM"
+   :check {:expr "(hash (reify Object (hashCode [_] (+ 2000000000 2000000000))))"
+           :jvm "throws ArithmeticException"
+           :jolt "-294967296"}
+   :note "Same for a deftype or proxy hashCode. A body that returns a value in int range agrees on both."}
   ;; Thread.getStackTrace names the frames jolt can reconstruct: the live
   ;; continuation, plus callers TCO erased that the compile-time callsite tables
   ;; name (a static tail edge, or the one most recent tail site bridging a gap).
