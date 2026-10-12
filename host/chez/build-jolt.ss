@@ -16,10 +16,10 @@
 ;;   1. emit flat.ss = runtime + compiler image (cli.ss load order) + inlined
 ;;      build.ss + every jolt-core/stdlib file as a baked string literal + the
 ;;      jolt launcher.
-;;   2. in-process compile-file + make-boot-file (profile Chez settings), error
-;;      restored around the call (the runtime shadows it; rt.ss/%chez-error).
-;;   3. xxd the jolt boot + petite/scheme boots + stub into C arrays, generate
-;;      main.c, cc-link -> out-path. The launcher reads the petite/scheme/stub
+;;   2. compile-file + make-boot-file in a fresh Chez (profile Chez settings),
+;;      with the stdlib fasls compiling in a second Chez beside it.
+;;   3. .incbin the jolt boot + petite/scheme boots + stub (one generated .S),
+;;      generate main.c, cc-link -> out-path. The launcher reads the petite/scheme/stub
 ;;      arrays via FFI on `build` (jolt-materialize-bundles!).
 
 (import (chezscheme))
@@ -98,7 +98,7 @@
 ;; ("jolt/main.clj", "clojure/string.clj") — exactly what resolve-on-roots probes
 ;; — so a built binary can load a namespace with no source on disk.
 ;;
-;; The bytes go into ONE blob (xxd'd into the binary as the C array
+;; The bytes go into ONE blob (linked into the binary as the C array
 ;; jolt_source_blob), each file its own bytevector-compress frame, and flat.ss
 ;; gets only the index. Compressed because the blob is read lazily — a namespace
 ;; that loads from source, which the boot path never does — so the ratio is free
@@ -282,24 +282,21 @@
 ;; once held the only definition.
 (define jb-bool (lambda (b) (if b "#t" "#f")))
 
-;; Filled by jb-emit-stdlib-fasls! during flat.ss emission: the single blob path
-;; (xxd'd into the binary as jolt_stdlib_fasls in step 3) and the (ns offset
-;; length) index (baked into flat.ss via the launcher's jolt-stdlib-fasls-attach!
-;; call). #f / () until then.
+;; Filled by jb-emit-stdlib-fasls! during flat.ss emission: the namespaces whose
+;; fasls go in the blob, in blob order (baked into flat.ss via the launcher's
+;; jolt-stdlib-fasls-attach! call), and their (name . so) pairs. The blob itself
+;; is assembled after the fasls compile, alongside flat.ss (step 2), and its path
+;; set then. #f / () until then.
 (define jb-stdlib-blob-path #f)
 (define jb-stdlib-index '())
+(define jb-stdlib-sos '())
 
 ;; Render jb-stdlib-index as a Scheme source list for the launcher's attach call:
-;; (("clojure.test" 0 123456) ...). This literal is the only thing baked into
-;; flat.ss for the stdlib fasls — small, regardless of how big the blob is.
+;; ("clojure.test" ...). This literal is the only thing baked into flat.ss for the
+;; stdlib fasls — small, regardless of how big the blob is.
 (define (jb-stdlib-index-str)
   (string-append "("
-    (apply string-append
-      (map (lambda (e)
-             (string-append "(" (ei-str-lit (car e)) " "
-                            (number->string (cadr e)) " "
-                            (number->string (caddr e)) ")"))
-           jb-stdlib-index))
+    (apply string-append (map (lambda (n) (string-append (ei-str-lit n) " ")) jb-stdlib-index))
     ")"))
 
 ;; Parse the manifest into (values embedded-names skip-alist). Skip lines look
@@ -398,8 +395,11 @@
 ;; step, and compile-file's every .scm -> .so. A compile failure here is a BUILD
 ;; FAILURE (not a skip): with the macro environment present there is no
 ;; legitimate reason emitted Scheme should fail to compile.
-(define (jb-compile-stdlib-sos! pairs)
-  (let ((cs (string-append jb-stdlib-dir "/compile-all.ss")))
+;;
+;; This only writes the script; step 2 runs it beside the flat.ss compile.
+(define (jb-stdlib-compile-script) (string-append jb-stdlib-dir "/compile-all.ss"))
+(define (jb-write-stdlib-compile-script! pairs)
+  (let ((cs (jb-stdlib-compile-script)))
     (let ((p (open-output-file cs 'replace)))
       (put-string p
         (string-append
@@ -433,8 +433,7 @@
                      (ei-str-lit (car sp)) " "
                      (ei-str-lit (cdr sp)) ")\n"))
                  pairs))))
-      (close-port p))
-    (bld-system (string-append bld-chez " --script '" cs "'"))))
+      (close-port p))))
 
 ;; Capture one ns's emitted Scheme to its .scm. aot-capture-load evaluates the
 ;; FILE through the normal load loop while teeing the per-form Scheme — the SAME
@@ -475,8 +474,9 @@
          (close-port outp))
        'ok))))
 
-;; Capture (aot-capture-load) every candidate ns to its own fasl, then ONE batch
-;; compile. Returns two values: (name . so) that captured OK (in load order) and
+;; Capture (aot-capture-load) every candidate ns to its own .scm, and write the
+;; ONE batch compile script for them. Returns two values: (name . so) that
+;; captured OK (in load order) and
 ;; (name . reason) that were skipped. A manifest-declared skip is never
 ;; load-attempted. A load exception is a skip with a reason; an empty capture is
 ;; a build failure (see jb-capture-stdlib-scm!).
@@ -505,49 +505,61 @@
                      (set! skips (cons (cons name (cdr r)) skips))))))))
         (jb-stdlib-candidates))
       (set-ns-loaded-hook! (lambda (name file) #f)))
-    ;; ONE batch compile with the runtime preamble loaded (see jb-compile-stdlib-sos!).
-    ;; A failure here is a BUILD FAILURE — captured Scheme must compile once the
-    ;; macro environment is present.
-    (jb-compile-stdlib-sos! (reverse to-compile))
-    (values (reverse order) (reverse skips))))
+    (jb-write-stdlib-compile-script! (reverse to-compile))
+    (values (reverse order) (reverse skips)
+            ;; the captured Scheme is what the fasls are compiled from, so its
+            ;; hash stands in for their bytes in the runtime fingerprint
+            (aot-content-hash
+              (apply string-append
+                (map (lambda (sp) (read-file-string (car sp))) (reverse to-compile)))))))
 
-;; Compile the stdlib fasls (jb-compile-stdlib-fasls!, unchanged), concatenate
-;; them into ONE blob file, and record an index of (ns offset length) into
-;; jb-stdlib-index. The blob is xxd'd into the binary as the C array
-;; jolt_stdlib_fasls (step 3, below); the index — small — is the ONLY thing baked
-;; into flat.ss for the stdlib, via the launcher's jolt-stdlib-fasls-attach! call.
-;; Putting the multi-MB fasl bytes into flat.ss as boot-image literals regresses
-;; startup (the hard floor), and ei-bytes-lit corrupts them anyway — it round-
-;; trips through utf8->string, which arbitrary binary does not survive. Runs the
-;; manifest drift check. Called inside the flat.ss emit block, before the
-;; launcher (which renders jb-stdlib-index) and before step 3 (which xxd's the
-;; blob).
+;; Capture the stdlib namespaces (jb-compile-stdlib-fasls!) and record which go
+;; in the blob. The blob is linked into the binary as the C array
+;; jolt_stdlib_fasls (step 3, below); the names — small — are the ONLY thing
+;; baked into flat.ss for the stdlib, via the launcher's jolt-stdlib-fasls-attach!
+;; call. Putting the multi-MB fasl bytes into flat.ss as boot-image literals
+;; regresses startup (the hard floor), and ei-bytes-lit corrupts them anyway — it
+;; round-trips through utf8->string, which arbitrary binary does not survive.
+;; Runs the manifest drift check. Called inside the flat.ss emit block, before
+;; the launcher (which renders jb-stdlib-index).
+;;
+;; The fasls compile in step 2, in parallel with flat.ss; nothing in flat.ss
+;; depends on their bytes. The fingerprint step hashes flat.ss, so the hash of
+;; the Scheme they compile from goes in here, and a stdlib change still moves it.
 (define (jb-emit-stdlib-fasls! out)
-  (define-values (embedded skips) (jb-compile-stdlib-fasls!))
+  (define-values (embedded skips scm-hash) (jb-compile-stdlib-fasls!))
   (jb-stdlib-manifest-check! (append (map car embedded) (map car skips)))
-  (set! jb-stdlib-blob-path (string-append jb-build "/stdlib_fasls.blob"))
-  (let ((outp (open-file-output-port jb-stdlib-blob-path (file-options no-fail) (buffer-mode block)))
-        (index '())
-        (total 0))
-    (for-each
-      (lambda (nf)
-        (let* ((name (car nf)) (bv (read-file-bytes (cdr nf))) (len (bytevector-length bv)))
-          (put-bytevector outp bv)
-          (set! index (cons (list name total len) index))
-          (set! total (+ total len))))
-      embedded)
-    ;; Empty blob (every candidate skipped): keep the C array non-degenerate so
-    ;; the symbol is well-defined and the link is unconditional. The index stays
-    ;; empty, so nothing derefs it — behavior is exactly today's source path.
-    (when (fx=? total 0)
-      (put-bytevector outp (bytevector 0)))
-    (close-port outp)
-    (set! jb-stdlib-index (reverse index)))
+  (set! jb-stdlib-index (map car embedded))
+  (set! jb-stdlib-sos embedded)
   (put-string out "\n;; === embedded stdlib fasls (per-namespace, in one C-array blob) ===\n")
+  (put-string out (string-append ";; stdlib scheme hash " (number->string scm-hash 16) "\n"))
   (for-each
     (lambda (s)
       (display (string-append "build-jolt: stdlib-fasl skip " (car s) " — " (cdr s) "\n")))
     skips))
+
+;; Concatenate the compiled stdlib fasls into ONE blob file behind a table of
+;; (offset, length) pairs, little-endian u64s, one per jb-stdlib-sos entry
+;; (java/io.ss jolt-stdlib-fasl-fetch reads it).
+(define (jb-write-stdlib-blob!)
+  (set! jb-stdlib-blob-path (string-append jb-build "/stdlib_fasls.blob"))
+  (let* ((bvs (map (lambda (nf) (read-file-bytes (cdr nf))) jb-stdlib-sos))
+         (table (make-bytevector (* 16 (length bvs))))
+         (outp (open-file-output-port jb-stdlib-blob-path (file-options no-fail) (buffer-mode block))))
+    (let loop ((bvs bvs) (i 0) (offset (bytevector-length table)))
+      (when (pair? bvs)
+        (let ((len (bytevector-length (car bvs))))
+          (bytevector-u64-set! table (* 16 i) offset (endianness little))
+          (bytevector-u64-set! table (+ (* 16 i) 8) len (endianness little))
+          (loop (cdr bvs) (fx+ i 1) (+ offset len)))))
+    (put-bytevector outp table)
+    (for-each (lambda (bv) (put-bytevector outp bv)) bvs)
+    ;; Empty blob (every candidate skipped): keep the C array non-degenerate so
+    ;; the symbol is well-defined and the link is unconditional. The index stays
+    ;; empty, so nothing derefs it — behavior is exactly today's source path.
+    (when (null? bvs)
+      (put-bytevector outp (bytevector 0)))
+    (close-port outp)))
 
 (define jb-stdlib-dir (string-append jb-build "/stdlib"))
 
@@ -735,23 +747,93 @@
         ;; does — $fasl-to-vfasl lays the image out for a specific machine.
         "(vfasl-convert-file " (ei-str-lit jb-boot) " " (ei-str-lit jb-vboot) " '())\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'"))
+  ;; The stdlib fasls compile in a second Chez beside this one: each process
+  ;; spends most of its time alone on one core (the stdlib batch loads the whole
+  ;; runtime preamble first), and neither reads the other's output. Both run to
+  ;; the end before either failure is reported; the stdlib log is shown after.
+  (let ((log (string-append jb-stdlib-dir "/compile-all.log")))
+    (bld-system (string-append
+      "( " bld-chez " --script '" (jb-stdlib-compile-script) "' > '" log "' 2>&1 & s=$!; "
+      bld-chez " --script '" cs "'; f=$?; wait $s; g=$?; cat '" log "'; "
+      "[ $f -eq 0 ] && [ $g -eq 0 ] )")))
+  (jb-write-stdlib-blob!)
   ;; …and re-run just that conversion under gzip if the image it produced is over
   ;; Chez's LZ4 fasl ceiling (build.ss). jolt's own image is nowhere near it, but
   ;; nothing here bounds it, and the failure mode is a binary that dies in
   ;; Sbuild_heap rather than one that boots slowly.
   (bld-vfasl-regzip! jb-build jb-boot jb-vboot))
 
-;; --- 3. embed boots/stub as C arrays + cc-link ------------------------------
-;; xxd a file into header H and rename its symbol to NAME / NAME_len. The array
-;; is const: nothing writes it, and in writable data the boot prefetch's madvise
-;; made every page a private dirty copy (14MB a process on macOS); read-only, the
-;; pages stay clean and shared with every other jolt running.
+;; --- 3. embed boots/stub + cc-link -------------------------------------------
+;; Each embedded file becomes a symbol NAME (its bytes) and NAME_len (an unsigned
+;; int). The bytes go in through `.incbin` in one generated assembly file rather
+;; than as `xxd -i` C arrays: those were ~190MB of hex text that cc spent ~11s
+;; parsing on every build, plus ~5s of xxd and sed. The assembler copies the file
+;; as-is. Header H only declares the array and defines the length, so main.c and
+;; the runtime's foreign-entry lookups see the same two symbols as before.
+;;
+;; The array is const: nothing writes it, and in writable data the boot
+;; prefetch's madvise made every page a private dirty copy (14MB a process on
+;; macOS); read-only, the pages stay clean and shared with every other jolt
+;; running.
+(define jb-incbins '())   ; (name . path), emitted into jb-embed-s at link time
+(define jb-embed-s (string-append jb-build "/jolt_embed.S"))
 (define (jb-c-array file h name)
-  (bld-system (string-append "xxd -i '" file "' > '" h "'"))
-  (bld-system (string-append
-    "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/const unsigned char " name "[]/; "
-    "s/unsigned int [A-Za-z0-9_]+_len/unsigned int " name "_len/' '" h "'")))
+  (let ((n (call-with-port (open-file-input-port file) port-length)))
+    (if (= n 0)
+        (jb-empty-c-array h name)
+        (let ((p (open-output-file h 'replace)))
+          (put-string p (string-append
+            "extern const unsigned char " name "[];\n"
+            "unsigned int " name "_len = " (number->string n) ";\n"))
+          (close-port p)
+          (set! jb-incbins (cons (cons name file) jb-incbins))))))
+
+;; The assembly for jb-incbins. It goes through the C preprocessor (.S), so the
+;; object format is the compiler's target, not this build host's: a cross build
+;; gets the target's section names and symbol prefix for free. The file's
+;; position is not part of its identity, so .incbin takes the path as given,
+;; relative to the cc's working directory (the repo root, like every other path
+;; in the link line); backslashes would be escapes inside the string.
+(define (jb-write-embed-s!)
+  (let ((p (open-output-file jb-embed-s 'replace)))
+    (put-string p (string-append
+      "/* generated by host/chez/build-jolt.ss */\n"
+      "#ifndef __USER_LABEL_PREFIX__\n"
+      "#define __USER_LABEL_PREFIX__\n"
+      "#endif\n"
+      "#define JOLT_CAT2(a, b) a##b\n"
+      "#define JOLT_CAT(a, b) JOLT_CAT2(a, b)\n"
+      "#define JOLT_SYM(n) JOLT_CAT(__USER_LABEL_PREFIX__, n)\n"
+      "#if defined(__APPLE__)\n"
+      "#define JOLT_RODATA .section __TEXT,__const\n"
+      "#define JOLT_OBJECT(s, n)\n"
+      "#elif defined(_WIN32)\n"
+      "#define JOLT_RODATA .section .rdata,\"dr\"\n"
+      "#define JOLT_OBJECT(s, n)\n"
+      "#else\n"
+      "#define JOLT_RODATA .section .rodata\n"
+      "#define JOLT_OBJECT(s, n) .type s, %object; .size s, n\n"
+      "#endif\n"
+      "JOLT_RODATA\n"))
+    (for-each
+      (lambda (e)
+        (let ((sym (string-append "JOLT_SYM(" (car e) ")"))
+              (n (call-with-port (open-file-input-port (cdr e)) port-length))
+              (path (list->string (map (lambda (c) (if (char=? c #\\) #\/ c))
+                                       (string->list (cdr e))))))
+          (put-string p (string-append
+            ".globl " sym "\n"
+            ".balign 16\n"
+            "JOLT_OBJECT(" sym ", " (number->string n) ")\n"
+            sym ":\n"
+            ".incbin " (ei-str-lit path) "\n"))))
+      (reverse jb-incbins))
+    ;; ELF linkers read a missing note as a request for an executable stack.
+    (put-string p (string-append
+      "#if !defined(__APPLE__) && !defined(_WIN32)\n"
+      ".section .note.GNU-stack,\"\",%progbits\n"
+      "#endif\n"))
+    (close-port p)))
 
 ;; The same header for a file that is not there: main.c's #include and the symbol
 ;; still have to exist, and a zero length is how jolt-materialize-bundles! tells
@@ -813,6 +895,7 @@
 ;; (jb-emit-source-embeds). Always written by that step, so no absent-file arm.
 (jb-c-array jb-source-blob-path (string-append jb-build "/source_blob_data.h") "jolt_source_blob")
 
+(jb-write-embed-s!)
 (define jb-main-c (string-append jb-build "/main.c"))
 (let ((mc (open-output-file jb-main-c 'replace)))
   (put-string mc
@@ -851,6 +934,6 @@
 (bld-system (string-append
   ;; the embedded jolt_* arrays must be foreign-entry-visible at runtime:
   ;; -rdynamic on ELF; on Windows an exe needs an export table (GetProcAddress).
-  (bld-cc) " " (bld-arch-flag) " -O2 " (if (bld-tgt-nt?) "-Wl,--export-all-symbols " "-rdynamic ") "-I'" (bld-csv-dir) "' -I'" jb-build "' -I'host/chez/stub' '" jb-main-c "' '"
+  (bld-cc) " " (bld-arch-flag) " -O2 " (if (bld-tgt-nt?) "-Wl,--export-all-symbols " "-rdynamic ") "-I'" (bld-csv-dir) "' -I'" jb-build "' -I'host/chez/stub' '" jb-main-c "' '" jb-embed-s "' '"
   (bld-csv-dir) "/libkernel.a' -o '" jb-out "' " (bld-link-libs)))
 (display (string-append "build-jolt: wrote " jb-out "\n"))

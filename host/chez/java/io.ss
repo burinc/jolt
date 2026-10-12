@@ -203,24 +203,29 @@
 ;; Two ways in. register-embedded-fasl! is the explicit registry: tests and other
 ;; embedders can hand a bytevector directly. The built binary does NOT bake the
 ;; (multi-MB) fasl bytes as boot-image literals — that regresses startup, since a
-;; flat.ss literal re-materializes at every Sbuild_heap. Instead build-jolt xxd's
-;; one concatenated blob into the linked binary as the C array jolt_stdlib_fasls
-;; (-rdynamic exports it) and records an index of (ns offset length) triples; the
-;; launcher calls jolt-stdlib-fasls-attach! with that index before any require.
-;; jolt-embedded-fasl then memcpy's the slice out of the C array on demand — once
-;; per ns per process, never cached.
+;; flat.ss literal re-materializes at every Sbuild_heap. Instead build-jolt links
+;; one concatenated blob into the binary as the C array jolt_stdlib_fasls
+;; (-rdynamic exports it), and the launcher calls jolt-stdlib-fasls-attach! with
+;; the namespace names in blob order before any require. jolt-embedded-fasl then
+;; memcpy's the slice out of the C array on demand — once per ns per process,
+;; never cached.
+;;
+;; The blob starts with a table of (offset, length) pairs, one per name, as
+;; little-endian u64s, offsets from the start of the blob. The table lives in
+;; the blob rather than in the launcher's attach call so flat.ss does not wait
+;; on the fasls being compiled: build-jolt compiles the two in parallel.
 (define embedded-fasls (make-hashtable string-hash string=?))
-;; ns-name -> (offset . length) into the linked jolt_stdlib_fasls C array.
+;; ns-name -> its entry number in the linked jolt_stdlib_fasls C array's table.
 ;; Populated once by the launcher's jolt-stdlib-fasls-attach!; empty in every
 ;; path that carries no such array (dev bin/jolt, devcache, app binaries).
 (define embedded-fasl-index (make-hashtable string-hash string=?))
-(define (jolt-stdlib-fasls-attach! index)
-  (for-each (lambda (entry)
-              (hashtable-set! embedded-fasl-index (car entry)
-                              (cons (cadr entry) (caddr entry))))
-            index))
-;; memcpy `length` bytes at `offset` out of the jolt_stdlib_fasls C array into a
-;; fresh bytevector. #f when the symbol is absent (dev/devcache/apps carry no such
+(define (jolt-stdlib-fasls-attach! names)
+  (let loop ((ns names) (i 0))
+    (when (pair? ns)
+      (hashtable-set! embedded-fasl-index (car ns) i)
+      (loop (cdr ns) (fx+ i 1)))))
+;; memcpy entry I's fasl out of the jolt_stdlib_fasls C array into a fresh
+;; bytevector. #f when the symbol is absent (dev/devcache/apps carry no such
 ;; array) or the fetch raises, so the caller falls back to today's source path.
 ;; sa-foreign-entry-address (foreign-entry) returns an integer address, so
 ;; base+offset is plain arithmetic. Same memcpy pattern as the launcher's
@@ -234,20 +239,24 @@
 ;; BoringSSL in /usr/lib and jolt.ffi's defcfn caches that bad fp forever
 ;; (jolt-lang/crypto, Selmer's hash filter). The same hazard exists in the
 ;; launcher's jolt-materialize-bundles! (build-jolt.ss).
-(define (jolt-stdlib-fasl-fetch offset length)
+(define (jolt-stdlib-fasl-fetch i)
   (guard (e (else #f))
     (let* ((base (sa-foreign-entry-address "jolt_stdlib_fasls"))
-           (bv (make-bytevector length))
-           (memcpy (sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)))
-      (memcpy bv (+ base offset) length)
-      bv)))
+           (memcpy (sa-foreign-procedure "memcpy" (u8* uptr uptr) void*))
+           (entry (make-bytevector 16)))
+      (memcpy entry (+ base (* 16 i)) 16)
+      (let* ((offset (bytevector-u64-ref entry 0 (endianness little)))
+             (length (bytevector-u64-ref entry 8 (endianness little)))
+             (bv (make-bytevector length)))
+        (memcpy bv (+ base offset) length)
+        bv))))
 (define (jolt-embedded-fasl name)
   (let ((v (hashtable-ref embedded-fasls name #f)))
     (cond
       ((bytevector? v) v)
       (else
-       (let ((ol (hashtable-ref embedded-fasl-index name #f)))
-         (and ol (jolt-stdlib-fasl-fetch (car ol) (cdr ol))))))))
+       (let ((i (hashtable-ref embedded-fasl-index name #f)))
+         (and i (jolt-stdlib-fasl-fetch i)))))))
 
 ;; --- embedded SOURCE, the same treatment as the fasls above -----------------
 ;; jolt-core/ and stdlib/ source is embedded so a built binary can load a
