@@ -24,14 +24,22 @@
 ;; image compiled without it holds the wide arms whatever its inputs say. Take
 ;; the source arm whenever it is set; build-jolt also writes no image then.
 (define (build-boot-cacheable?)
-  (let ((v (getenv "JOLT_NARROW_HASH"))) (not (and v (not (string=? v ""))))))
+  ;; any value, "" included, as define-width-op reads it
+  (not (getenv "JOLT_NARROW_HASH")))
 
+;; The inputs list also hashes the host Chez's boot files, so a different or
+;; rebuilt Chez reads as stale. The guard covers a Chez the list cannot see (a
+;; JOLT_CHEZ_CSV that names another install): its fasl is refused at the
+;; header, before any of it runs, and the source loads take over.
 (if (and (build-boot-cacheable?)
-         (gate-boot-image-fresh? build-boot-so build-boot-inputs))
-    (begin
-      (when (let ((m (getenv "JOLT_BUILDBOOT"))) (and m (not (string=? m ""))))
-        (display "buildboot: using target/dev/build-boot.so\n" (current-error-port)))
-      (load "target/dev/build-boot.so"))
+         (gate-boot-image-fresh? build-boot-so build-boot-inputs)
+         (guard (e (#t (display "buildboot: target/dev/build-boot.so did not load, using source\n"
+                                (current-error-port))
+                       #f))
+           (load "target/dev/build-boot.so")
+           #t))
+    (when (let ((m (getenv "JOLT_BUILDBOOT"))) (and m (not (string=? m ""))))
+      (display "buildboot: used target/dev/build-boot.so\n" (current-error-port)))
     (begin
       ;; build-boot loads begin
       (load "host/chez/scheme-adapter-runtime.ss")  ; before rt.ss: macros + top-levels in rt.ss/java/*.ss call sa-*

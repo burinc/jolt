@@ -706,7 +706,8 @@
        (not (gate-boot-image-fresh? build-boot-so build-boot-inputs))
        (let* ((lines (jb-build-boot-lines))
               (pid (number->string (get-process-id)))
-              (src (string-append jb-build-boot-dir "/build-boot-image.ss"))
+              ;; per-process like the rest: make -j builds release and debug at once
+              (src (string-append jb-build-boot-dir "/build-boot-image." pid ".ss"))
               (so-tmp (string-append build-boot-so "." pid ".tmp"))
               (cs (string-append jb-build-boot-dir "/build-boot-compile." pid ".ss")))
          (bld-system (string-append "mkdir -p '" jb-build-boot-dir "'"))
@@ -722,6 +723,12 @@
            (for-each (lambda (l) (walk (bld-load-path l))) lines)
            ;; hashed, not walked: its other load is the image itself
            (set! order (cons "host/chez/build-boot.ss" order))
+           ;; the Chez the image is compiled for: another install, or the same
+           ;; version rebuilt with a different kernel, has other boot files
+           (for-each (lambda (b)
+                       (let ((p (string-append bld-host-csv-dir "/" b)))
+                         (when (file-exists? p) (set! order (cons p order)))))
+                     '("petite.boot" "scheme.boot"))
            (let* ((tmp (string-append build-boot-inputs "." pid ".tmp"))
                   (out (open-output-file tmp 'replace)))
              (for-each (lambda (p) (put-string out (string-append (gate-boot-hash-string p) " " p "\n")))
@@ -745,6 +752,7 @@
                "(fasl-compressed #t)\n"
                "(compile-file " (ei-str-lit src) " " (ei-str-lit so-tmp) ")\n"
                "(rename-file " (ei-str-lit so-tmp) " " (ei-str-lit build-boot-so) ")\n"
+               "(delete-file " (ei-str-lit src) ")\n"
                "(delete-file " (ei-str-lit cs) ")\n"))
            (close-port p))
          (string-append bld-chez " --script '" cs "'"))))
