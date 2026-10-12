@@ -694,6 +694,18 @@
   (str (or (jolt.host/ref-get self :host) "")
        "/" (or (jolt.host/ref-get self :address) "")))
 
+;; Inet4Address.equals and hashCode go by the address alone: the host name it
+;; was looked up by plays no part, and the hash is the four octets as one int.
+(defn- inet-address= [a b]
+  (boolean (and (= :inet-address (jolt.host/ref-get b :jolt/type))
+                (= (jolt.host/ref-get a :address) (jolt.host/ref-get b :address)))))
+
+(defn- inet-address-hash [self]
+  (unchecked-int
+   (reduce (fn [acc o] (bit-or (bit-shift-left acc 8) (Integer/parseInt o)))
+           0
+           (str/split (or (jolt.host/ref-get self :address) "0.0.0.0") #"\."))))
+
 (def ^:private inet-address-methods
   {"getHostAddress" (fn [self] (or (jolt.host/ref-get self :address) "127.0.0.1"))
    ;; Resolves on first call and caches, as the JVM does — an address built
@@ -723,11 +735,8 @@
    (fn [self]
      (byte-array (mapv (fn [o] (Integer/parseInt o))
                        (str/split (or (jolt.host/ref-get self :address) "127.0.0.1") #"\."))))
-   "equals"   (fn [self other]
-                (boolean (and (= :inet-address (jolt.host/ref-get other :jolt/type))
-                              (= (jolt.host/ref-get self :address)
-                                 (jolt.host/ref-get other :address)))))
-   "hashCode" (fn [self] (hash (jolt.host/ref-get self :address)))
+   "equals"   (fn [self other] (inet-address= self other))
+   "hashCode" inet-address-hash
    "isLoopbackAddress" (fn [self] (= "127.0.0.1" (jolt.host/ref-get self :address)))
    "toString"       inet-address->str})
 
@@ -895,6 +904,30 @@
       (fn [cn val]
         (let [cs (tag->classes (jolt.host/ref-get val :jolt/type))]
           (when (and cs (contains? cs cn)) true))))
+
+    ;; = and hash on an InetAddress or InetSocketAddress are by value, as
+    ;; their equals/hashCode are. An InetSocketAddress here holds the host as
+    ;; given, so it compares as the JVM's unresolved one does: host name
+    ;; ignoring case, and port.
+    (clojure.core/__register-eq!
+      (fn [a b] (or (contains? #{:inet-address :inet-socket-address} (jolt.host/ref-get a :jolt/type))
+                    (contains? #{:inet-address :inet-socket-address} (jolt.host/ref-get b :jolt/type))))
+      (fn [a b]
+        (let [ta (jolt.host/ref-get a :jolt/type)]
+          (and (= ta (jolt.host/ref-get b :jolt/type))
+               (case ta
+                 :inet-address (inet-address= a b)
+                 :inet-socket-address
+                 (and (= (jolt.host/ref-get a :port) (jolt.host/ref-get b :port))
+                      (= (str/lower-case (str (jolt.host/ref-get a :host)))
+                         (str/lower-case (str (jolt.host/ref-get b :host))))))))))
+    (clojure.core/__register-hash!
+      (fn [x] (contains? #{:inet-address :inet-socket-address} (jolt.host/ref-get x :jolt/type)))
+      (fn [x]
+        (if (= :inet-address (jolt.host/ref-get x :jolt/type))
+          (inet-address-hash x)
+          (unchecked-int (+ (hash (str/lower-case (str (jolt.host/ref-get x :host))))
+                            (or (jolt.host/ref-get x :port) 0))))))
 
     ;; (str sock) renders through toString like Java; pred is two cheap lookups.
     (clojure.core/__register-str!

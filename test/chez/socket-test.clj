@@ -954,6 +954,20 @@
     (check-eq "io/output-stream and io/input-stream on a Socket"
               (with-open [i (clojure.java.io/input-stream conn)] (vec (.readAllBytes i))) [1 2 3])))
 
+;; InetAddress and InetSocketAddress are values: = and hash go by the address
+;; (and port), as their equals/hashCode do, and hash is hashCode.
+(let [a (java.net.InetAddress/getByName "127.0.0.1")
+      b (java.net.InetAddress/getByName "127.0.0.1")]
+  (check-eq "InetAddress = by address" [(= a b) (count (hash-set a b)) (= (hash a) (.hashCode a))]
+            [true 1 true])
+  (check-eq "InetAddress hashCode is the address as an int" (.hashCode a) 2130706433))
+(check-eq "InetSocketAddress = by host and port"
+          [(= (java.net.InetSocketAddress. "localhost" 80) (java.net.InetSocketAddress. "localhost" 80))
+           (= (java.net.InetSocketAddress. "localhost" 80) (java.net.InetSocketAddress. "localhost" 81))
+           (= (hash (java.net.InetSocketAddress. "localhost" 80))
+              (hash (java.net.InetSocketAddress. "localhost" 80)))]
+          [true false true])
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
