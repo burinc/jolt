@@ -1391,6 +1391,39 @@
   (make-pset (fold-left (lambda (m p) (pmap-put-hash m (car p) (cdr p))) empty-pmap-hash pairs)))
 (define (jolt-hash-set . xs) (let loop ((s empty-pset) (xs xs)) (if (null? xs) s (loop (pset-conj s (car xs)) (cdr xs)))))
 
+;; A literal whose keys or elements are not all distinct constants is built
+;; through these: the JVM builds it with createWithCheck, so keys that turn out
+;; equal at run time throw IllegalArgumentException naming the first of them.
+;; ((let [x 1 y 1] #{x y}) is "Duplicate key: 1".) The check is a count compare;
+;; only a literal that did collapse pays for finding the key.
+(define (literal-duplicate-key xs stride)
+  (let loop ((xs xs))
+    (let ((k (car xs)))
+      (if (let scan ((ys (list-tail xs stride)))
+            (and (pair? ys) (or (jolt=2 k (car ys)) (scan (list-tail ys stride)))))
+          (throw-jvm (quote IllegalArgumentException)
+                     (string-append "Duplicate key: " (jolt-str-render-one k)))
+          (loop (list-tail xs stride))))))
+(define jolt-hash-map-checked
+  (case-lambda
+    ((k1 v1 k2 v2)
+     (if (jolt=2 k1 k2)
+         (literal-duplicate-key (list k1 v1 k2 v2) 2)
+         (make-pmap (vector k1 v1 k2 v2) 2)))
+    (kvs
+     (let ((n2 (length kvs)))
+       (when (fxodd? n2) (odd-kvs-error "map literal entries"))
+       (let* ((n (fxsra n2 1))
+              (m (if (pam-literal-kvs? kvs n)
+                     (amap-slots->pmap (amap-from-kvs kvs n))
+                     (hash-from-kvs kvs))))
+         (if (fx=? (pmap-cnt m) n) m (literal-duplicate-key kvs 2)))))))
+(define (jolt-hash-set-checked . xs)
+  (let loop ((s empty-pset) (ys xs) (n 0))
+    (if (null? ys)
+        (if (fx=? (pset-count s) n) s (literal-duplicate-key xs 1))
+        (loop (pset-conj s (car ys)) (cdr ys) (fx+ n 1)))))
+
 ;; ============================================================================
 ;; leaf ops the emitter lowers core/clojure fns to (mirrors native-ops)
 ;; ============================================================================
