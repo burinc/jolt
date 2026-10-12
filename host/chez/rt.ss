@@ -463,6 +463,140 @@
                   (when ceiling (gc-check-overhead! gc-ns elapsed-ns ceiling))))
         (set! jolt-heap-ceiling-bytes #f)))))
 
+;; --- stack depth limit ----------------------------------------------------------
+;; Chez has no stack overflow. A stack that outgrows its segment moves the frames
+;; below into a heap object and carries on (sa-current-stack-bytes), so a runaway
+;; non-tail recursion -- (defn f [x] (inc (f x))) -- allocated ~250MB/s until the
+;; heap ceiling or the kernel stopped it. The JVM throws StackOverflowError at
+;; 10-20k frames; jolt does too, but past a limit sized from memory rather than
+;; from a fixed stack, because deep recursion is cheap here (ten million frames
+;; is ~0.4s and ~100MB) and code that relies on it should keep working.
+;;
+;; The rule is Guile's. Guile's VM stack is unbounded and grows on demand; its C
+;; stack check errors at 80% of what the OS gives the process. jolt applies the
+;; 80% to its one stack, against memory: 80% of RLIMIT_AS if that is finite, else
+;; of RLIMIT_DATA, else of physical RAM. Computed once, at process start, and
+;; applied to each thread's stack separately, as Guile's is per thread.
+;;
+;; JOLT_STACK_LIMIT overrides it: bytes with an optional k/m/g suffix (512m, 2g),
+;; or -1 for no limit, which is what every release before this one did. Any
+;; other spelling is refused at startup by name, like JOLT_MAX_HEAP's.
+;;
+;; The stack's segments are heap objects, so they count against the heap ceiling
+;; too (JOLT_MAX_HEAP, 25% of RAM by default). A stack limit above the ceiling
+;; is never reached: the recursion meets the ceiling first and gets an
+;; OutOfMemoryError (or the GC overhead limit's), as it did before.
+;;
+;; The check costs nothing per call. A thread recursing without bound allocates
+;; stack segments, so it keeps tripping collections, and after each one every
+;; thread that took part measures its own stack (the adapter's
+;; sa-gc-install-after-rendezvous!). Over the limit, it throws
+;; java.lang.StackOverflowError -- an Error, so (catch Exception e) lets it
+;; through -- from that safe point, on that thread, and the unwind gives the
+;; stack back. Being checked at collections, a stack can pass the limit by up to
+;; one nursery's worth of segments before it is seen.
+;;
+;; On Windows neither getrlimit nor sysconf is there, so there is no default
+;; and the stack is unbounded unless JOLT_STACK_LIMIT sets one.
+(define jolt-stack-limit-bytes #f)       ; #f = no limit (or not installed)
+(define (jolt-stack-limit) jolt-stack-limit-bytes)
+;; N bytes, or #f for none. Without the hook nothing would enforce a limit, so
+;; then it reads back as none rather than as one that is not there.
+(define (jolt-stack-limit-set! n)
+  (set! jolt-stack-limit-bytes
+    (and n (sa-gc-install-after-rendezvous! jolt-stack-check!) n)))
+;; "-1" -> 'off; digits with an optional k/m/g suffix -> bytes; anything else #f.
+(define (jolt-stack-limit-parse v)
+  (let* ((t (string-downcase v))
+         (n (string-length t)))
+    (cond
+      ((string=? t "-1") 'off)
+      ((fx=? n 0) #f)
+      (else
+       (let* ((mult (case (string-ref t (fx- n 1))
+                      ((#\k) 1024) ((#\m) 1048576) ((#\g) 1073741824) (else 1)))
+              (digits (if (= mult 1) t (substring t 0 (fx- n 1)))))
+         (and (fx>? (string-length digits) 0)
+              (let loop ((i 0))
+                (or (fx=? i (string-length digits))
+                    (and (char<=? #\0 (string-ref digits i) #\9) (loop (fx+ i 1)))))
+              (let ((num (string->number digits)))
+                (and (> num 0) (* num mult)))))))))
+;; JOLT_STACK_LIMIT: bytes, 'off, or #f when unset.
+(define (jolt-stack-limit-from-env)
+  (let ((v (getenv "JOLT_STACK_LIMIT")))
+    (and v
+         (or (jolt-stack-limit-parse v)
+             (gc-config-error "JOLT_STACK_LIMIT" v "a size like 512m or 4g, or -1 for no limit")))))
+;; 80% of the first finite limit among RLIMIT_AS, RLIMIT_DATA and physical RAM;
+;; #f when none can be read, which leaves the stack unbounded rather than
+;; guessing.
+(define (jolt-stack-limit-default as data phys)
+  (let ((base (or as data phys)))
+    (and base (quotient (* base 4) 5))))
+;; getrlimit's soft limit for RESOURCE ('as or 'data) in bytes, #f when it is
+;; unlimited or unreadable. struct rlimit is two rlim_t: 64-bit on a 64-bit host,
+;; an unsigned long (32-bit) on 32-bit Linux. The numbers are per kernel:
+;; RLIMIT_DATA is 2 on Linux and Darwin alike, RLIMIT_AS 9 on Linux (glibc, musl,
+;; bionic) and 5 on Darwin. RLIM_INFINITY is all ones on Linux and 2^63-1 on
+;; Darwin; both read as unlimited, along with anything past 2^62 bytes.
+(define jolt-getrlimit (jolt-foreign-proc-safe "getrlimit" '(int u8*) 'int))
+(define (jolt-rlimit-bytes resource)
+  (and jolt-getrlimit
+       (not (eq? (sa-os-family) 'windows))
+       (guard (e (#t #f))
+         (let ((code (case resource
+                       ((data) 2)
+                       ((as) (if (eq? (sa-os-family) 'macos) 5 9))
+                       (else #f)))
+               (buf (make-bytevector 16 0)))
+           (and code
+                (fx=? 0 (jolt-getrlimit code buf))
+                (let ((cur (if (fx>? (fixnum-width) 32)
+                               (bytevector-u64-native-ref buf 0)
+                               (bytevector-u32-native-ref buf 0))))
+                  (and (> cur 0) (< cur (expt 2 62)) (not (= cur #xFFFFFFFF)) cur)))))))
+;; Process start (the launchers, next to jolt-install-gc-policy!): read the
+;; environment and the limits of the process actually running, never the build's.
+(define (jolt-install-stack-limit!)
+  (let* ((env (jolt-stack-limit-from-env))
+         (limit (cond ((eq? env 'off) #f)
+                      (env env)
+                      (else (jolt-stack-limit-default (jolt-rlimit-bytes 'as)
+                                                      (jolt-rlimit-bytes 'data)
+                                                      (heap-phys-from-sysconf))))))
+    (jolt-stack-limit-set! limit)))
+;; After each collection, on each thread. Not while the thread holds a counted
+;; lock: the runtime's winds are masked at their edges by that count
+;; (locks.ss), and a raise landing in one skipped its cleanup. A runaway
+;; recursion is still allocating, so the next collection asks again.
+(define (jolt-stack-check!)
+  (let ((limit jolt-stack-limit-bytes))
+    (when (and limit (fx=? 0 (jolt-locks-held)))
+      (let ((n (sa-current-stack-bytes)))
+        (when (and n (> n limit))
+          (jolt-stack-overflow! limit))))))
+;; The throwable's trace is resolved here, at the throw, and kept as frames
+;; rather than as the continuation (rt.ss jolt-remember-throw! keeps a k for
+;; every other throwable): the continuation IS the overflowed stack, and a
+;; caught StackOverflowError held on to -- in a log, in *e -- would keep all of
+;; it alive. The per-thread throw slots still take the k for the uncaught
+;; report, and those are cleared when a catch completes.
+(define (jolt-stack-overflow! limit)
+  (let ((t (make-jolt-ex-info-record
+             "java.lang.StackOverflowError"
+             (string-append
+               "the stack limit of " (number->string limit)
+               " bytes was exceeded. Raise or disable it with"
+               " JOLT_STACK_LIMIT=<n>[k|m|g] or JOLT_STACK_LIMIT=-1.")
+             jolt-nil jolt-nil 0))
+        (site (let ((s (virtual-register jolt-vreg-site))) (and (pair? s) s))))
+    (call/cc
+      (lambda (k)
+        (jolt-ex-info-record-capture-set!
+          t (cons 'resolved (guard (e (#t '())) (jolt-continuation-recs/site k #f site))))))
+    (jolt-throw t)))
+
 ;; The ceiling bounds the heap's TOTAL size, as -Xmx does on the JVM: the live
 ;; data, the nursery and the free memory the collector keeps
 ;; (sa-total-memory-bytes, what Runtime.totalMemory answers), so totalMemory stays
@@ -2046,6 +2180,9 @@
 ;; and how far the older generations may grow past the live set before they are
 ;; collected (rt.ss gc-collect-old-when-grown!): the rest of that bound.
 (def-var! "jolt.host" "gc-old-growth-bytes" (lambda () (gc-old-growth-bytes)))
+;; The stack depth limit in effect (jolt-install-stack-limit!): bytes per
+;; thread, or nil for none.
+(def-var! "jolt.host" "stack-limit" (lambda () (or (jolt-stack-limit) jolt-nil)))
 ;; The calling thread's id, so telemetry can be read per-thread. Wrapped in a lambda
 ;; so the get-thread-id reference resolves at CALL time: a non-threaded Chez build
 ;; lacks the binding, and only a caller that actually asks for a thread id should

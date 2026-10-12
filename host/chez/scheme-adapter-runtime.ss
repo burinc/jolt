@@ -1412,8 +1412,87 @@
                         (timed-wait collect-cond)
                         (f))))))
                (lambda () (jolt-unlock! tc-mutex) (enable-interrupts))))
-           (#%$set-top-level-value! '$collect-rendezvous stall-rendezvous)
+           (#%$set-top-level-value! '$collect-rendezvous
+             (lambda () (stall-rendezvous) (sa-run-after-rendezvous)))
+           (set! sa-rendezvous-hooked? #t)
            #t))))
+
+;; (sa-gc-install-after-rendezvous! thunk) -> boolean
+;; Run THUNK on every thread that takes part in a collection, on that thread,
+;; once the collection is over: the thread that ran the collect-request handler
+;; and every one that waited for it, each from the event check that brought it
+;; to the rendezvous. So THUNK runs at a safe point of whatever the thread was
+;; doing, with interrupts enabled, and may raise there: the raise unwinds that
+;; thread's own computation, as an escape from a timer interrupt does. A thread
+;; parked in a foreign call takes no part and runs nothing.
+;;
+;; Every thread that allocates comes through here at the rate it allocates,
+;; which is what the stack limit (rt.ss jolt-install-stack-limit!) needs: Chez
+;; grows a stack by allocating segments on the heap, so a thread recursing
+;; without bound allocates, and is stopped at the next collection — on its own
+;; thread, which a collect-request handler (run by the main thread when it is
+;; active, whoever tripped the collection) cannot do. Nothing runs per call or
+;; per allocation: the cost is THUNK, once per thread per collection.
+;;
+;; The slot is the one sa-gc-install-stall-watch! writes. Its copy calls the hook
+;; itself; on a Chez the copy was not installed on, the target's own rendezvous
+;; is wrapped instead, once. One hook: a second install replaces the first.
+;; Contract: THUNK runs after each collection, on each participating thread.
+;; Degradation: answer #f without installing anything (no collection
+;; rendezvous to hook); the caller then enforces nothing.
+(define sa-after-rendezvous #f)
+(define sa-rendezvous-hooked? #f)       ; the installed $collect-rendezvous calls it
+(define (sa-run-after-rendezvous)
+  (let ((h sa-after-rendezvous)) (when h (h))))
+(define (sa-gc-install-after-rendezvous! thunk)
+  (let ((se (#%$system-environment)))
+    (and (top-level-bound? '$collect-rendezvous se)
+         (begin
+           (unless sa-rendezvous-hooked?
+             (let ((orig (top-level-value '$collect-rendezvous se)))
+               (#%$set-top-level-value! '$collect-rendezvous
+                 (lambda () (orig) (sa-run-after-rendezvous)))
+               (set! sa-rendezvous-hooked? #t)))
+           (set! sa-after-rendezvous thunk)
+           #t))))
+
+;; (sa-current-stack-bytes) -> exact integer | #f
+;; How much stack the calling thread holds: the frames of every segment below
+;; the one it is running on. Chez starts a thread on a 64KB segment and, when a
+;; call would overflow it, moves the frames below into a continuation object on
+;; the heap and carries on in a fresh segment (S_overflow, c/schsig.c), so a
+;; deep stack is a chain of those, linked from the thread's stack link, each
+;; with the length of the frames it holds. The segment being run on is left
+;; out: it is at most a few segments' worth, and reading its fill needs the
+;; frame pointer.
+;;
+;; The chain only changes at the top -- a segment is pushed, or popped when a
+;; return underflows into it -- so the walk stops at the segment it reached
+;; last time on this thread and adds what it measured there: the cost is the
+;; segments pushed since, not the depth. The memo holds that segment WEAKLY;
+;; holding it would keep the whole stack below it alive after it unwound, which
+;; is exactly the memory a caught overflow has to give back.
+;; Contract: the calling thread's stack depth in bytes, monotone in depth,
+;; within a few segments. Degradation: #f (cannot measure); the caller then
+;; enforces nothing.
+(define sa-stack-memo (make-thread-parameter #f))   ; weak (segment . words)
+(define sa-ptr-bytes (foreign-sizeof 'ptr))
+(define (sa-current-stack-bytes)
+  (let ((top (#%$current-stack-link))
+        (bottom #%$null-continuation)
+        (memo (sa-stack-memo)))
+    (let loop ((k top) (words 0))
+      (cond
+        ((or (eq? k bottom) (not (#%$continuation? k)))
+         (sa-stack-memo (weak-cons top words))
+         (* words sa-ptr-bytes))
+        ((and memo (eq? k (car memo)))
+         (let ((words (+ words (cdr memo))))
+           (sa-stack-memo (weak-cons top words))
+           (* words sa-ptr-bytes)))
+        (else
+         (loop (#%$continuation-link k)
+               (+ words (#%$continuation-stack-clength k))))))))
 
 ;; (sa-fasl-write obj port [externals-pred]) -> void
 ;; fasl-serialize OBJ to PORT, optionally under the externals predicate

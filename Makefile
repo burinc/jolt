@@ -121,7 +121,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
-  jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy lazyretain \
+  jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
   deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
   hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
@@ -180,7 +180,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient sortedcoll rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -602,6 +602,16 @@ lazyretain: testbin
 	 done; \
 	 [ "$$fails" = 0 ] || exit 1; \
 	 echo "lazyretain: $$n cases in constant memory under a 256MB heap"
+
+# The stack depth limit (rt.ss jolt-install-stack-limit!): runaway recursion
+# throws java.lang.StackOverflowError instead of growing the heap until the
+# kernel kills the process, legitimately deep recursion still runs, and
+# JOLT_STACK_LIMIT sets, disables (-1) or is refused by name. The Scheme half
+# pins what a process cannot reach on every host (the default's rlimit
+# precedence; macOS will not set RLIMIT_AS).
+stacklimit: testbin
+	@$(CHEZ) --script test/chez/stack-limit-test.ss
+	@sh test/chez/stack-limit-smoke.sh target/release/jolt
 
 # What a process holds beyond its data (test/chez/footprint-test.sh): no boot
 # chunk pinned near-empty on a patched kernel (chez-patches/0002), the embedded

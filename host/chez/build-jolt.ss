@@ -242,6 +242,8 @@
 ;; not at heap-build: it reads syscalls and the environment, both of which
 ;; belong to the running process rather than the build.
 (jolt-install-gc-policy!)
+;; The stack depth limit (rt.ss jolt-install-stack-limit!), for the same reason.
+(jolt-install-stack-limit!)
 
 (scheme-start
   (lambda args

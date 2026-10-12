@@ -994,6 +994,21 @@
            :jvm "\"java.net.URLClassLoader\""
            :jolt "\"nil\""}
    :note "Substrate-inherent, like the reflection API. Affects kaocha (via dynapath), which blocks it as a test harness for rewrite-clj / malli / ordered / tick — each of those has another upstream runner that does work."}
+  ;; How deep a recursion goes before StackOverflowError. The JVM's limit is the
+  ;; thread's stack (-Xss, 512KB-1MB by default): ten to twenty thousand Clojure
+  ;; frames. Chez grows a stack on the heap, so jolt's limit is sized from memory
+  ;; instead -- 80% of RLIMIT_AS, else RLIMIT_DATA, else physical RAM, per thread,
+  ;; set with JOLT_STACK_LIMIT (rt.ss jolt-install-stack-limit!). Past it jolt
+  ;; throws the same java.lang.StackOverflowError, an Error, so a runaway
+  ;; recursion is caught or reported the same way; only the depth differs.
+  {:category :host-model
+   :behavior "the recursion depth at which java.lang.StackOverflowError is thrown"
+   :jvm "the thread stack size: ~10-20k frames by default"
+   :jolt "a memory-sized limit (JOLT_STACK_LIMIT, default 80% of the process's memory limit): millions of frames"
+   :check {:expr "(do (defn dv-depth [n] (if (zero? n) 0 (inc (dv-depth (dec n))))) (try (dv-depth 1000000) (catch StackOverflowError _ :stack-overflow)))"
+           :jvm ":stack-overflow"
+           :jolt "1000000"}
+   :note "A superset: code that runs on the JVM runs here, and a recursion that overflows the JVM's stack completes. A runaway one throws StackOverflowError on both. On the Gambit target the stack is unbounded (no limit enforced)."}
   ;; No JMX / java.lang.management. Runtime's own memory API is present and maps
   ;; onto Chez's heap accounting (totalMemory/freeMemory/maxMemory/gc), which is
   ;; what most callers want; the MXBean layer above it is a JVM management

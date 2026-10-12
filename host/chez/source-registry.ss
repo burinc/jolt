@@ -950,9 +950,14 @@
 ;; of its throw), rendered as a throw is: the live spine, and the frames a tail
 ;; call erased recovered from that site. Not from jolt-error-continuation and the
 ;; thread's site snapshot, which belong to whatever threw last on this thread.
+;; A capture of ('resolved . recs) was resolved at the throw, because keeping
+;; its continuation would keep the stack it was thrown from (rt.ss
+;; jolt-stack-overflow!).
 (define (jolt-throwable-recs v)
   (let ((cap (jolt-thrown-cont (jolt-unwrap-throw v))))
-    (and cap (guard (e (#t #f)) (jolt-continuation-recs/site (car cap) #f (cdr cap))))))
+    (cond ((not cap) #f)
+          ((eq? (car cap) 'resolved) (cdr cap))
+          (else (guard (e (#t #f)) (jolt-continuation-recs/site (car cap) #f (cdr cap)))))))
 (define (jolt-throwable-stack-trace v)
   (let ((recs (jolt-throwable-recs v)))
     (if recs (apply jolt-vector (jolt-recs->stack-trace recs)) (jolt-vector))))
