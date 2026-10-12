@@ -57,16 +57,16 @@ if ! diff -u "$tmp/gate" "$tmp/manifest-prefix" > "$tmp/gdiff"; then
 fi
 
 # The remaining prologue sites. cli.ss / gate-boot.ss / bootstrap.ss are pinned
-# above; make-gateboot.ss, make-devboot.ss, and build-jolt.ss (its own loads AND
-# the prologue string block it emits into generated boot files) hand-mirror the
+# above; make-gateboot.ss, make-devboot.ss, and build-boot.ss (build-jolt's
+# preamble, for its own process and the stdlib compile it spawns) hand-mirror the
 # same skeleton. The drg-2767 failure mode: a new post-prelude-*.ss added to the
 # manifest and to the pinned sites but forgotten in one of these — silent,
 # perf-only (the shim never loads). So: every site must load exactly the
-# manifest's post-prelude set (own forms and emitted strings together), and the
-# two sites that mirror cli's skeleton (make-devboot, build-jolt own) must match
-# the manifest prefix through compile-eval.ss exactly, like gate-boot.ss.
+# manifest's post-prelude set, and the two sites that mirror cli's skeleton
+# (make-devboot, build-boot) must match the manifest prefix through
+# compile-eval.ss exactly, like gate-boot.ss.
 manifest_pp="$(grep -oE 'post-prelude[a-z-]*\.ss' "$tmp/manifest" | LC_ALL=C sort -u)"
-for site in host/chez/make-gateboot.ss host/chez/make-devboot.ss host/chez/build-jolt.ss; do
+for site in host/chez/make-gateboot.ss host/chez/make-devboot.ss host/chez/build-boot.ss; do
   site_pp="$(grep -oE 'post-prelude[a-z-]*\.ss' "$site" | LC_ALL=C sort -u)"
   if [ "$site_pp" != "$manifest_pp" ]; then
     echo "  FAIL: $site post-prelude loads != bld-runtime-manifest post-prelude set"
@@ -75,18 +75,14 @@ for site in host/chez/make-gateboot.ss host/chez/make-devboot.ss host/chez/build
     fail=1
   fi
 done
-# build-jolt additionally EMITS a prologue string block into generated boot
-# files; its own (load ...) forms can mask a miss there, so pin the emitted
-# block's post-prelude set too (emitted paths carry the escaped \" prefix;
-# normalized to basenames like the sets above).
-bj_emitted_pp="$(grep -oE '\\"host/chez/post-prelude[a-z-]*\.ss' host/chez/build-jolt.ss | sed -e 's|.*/||' | LC_ALL=C sort -u)"
-if [ "$bj_emitted_pp" != "$manifest_pp" ]; then
-  echo "  FAIL: build-jolt.ss emitted prologue post-prelude set != manifest"
-  echo "    manifest: $(echo $manifest_pp)"
-  echo "    emitted:  $(echo $bj_emitted_pp)"
+# build-jolt boots through build-boot.ss, in its own process and in the stdlib
+# compile script it writes; a literal runtime load creeping back into it would be
+# a fourth, unpinned mirror.
+if grep -qE 'host/chez/(scheme-adapter-runtime|rt|compile-eval|seed/prelude|seed/image|post-prelude[a-z-]*)\.ss' host/chez/build-jolt.ss; then
+  echo "  FAIL: build-jolt.ss loads the runtime itself; it boots through build-boot.ss"
   fail=1
 fi
-for site in host/chez/make-devboot.ss host/chez/build-jolt.ss; do
+for site in host/chez/make-devboot.ss host/chez/build-boot.ss; do
   sed -n '/(load "host\/chez\/scheme-adapter-runtime.ss")/,/(load "host\/chez\/compile-eval.ss")/p' "$site" \
     | grep -oE 'host/chez/[a-zA-Z0-9_/.-]+\.ss' > "$tmp/siteprefix"
   if ! diff -u "$tmp/manifest-prefix" "$tmp/siteprefix" > "$tmp/sdiff" 2>&1; then

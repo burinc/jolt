@@ -24,24 +24,7 @@
 
 (import (chezscheme))
 
-(load "host/chez/scheme-adapter-runtime.ss")  ; before rt.ss: macros + top-levels in rt.ss/java/*.ss call sa-*
-(load "host/chez/rt.ss")
-(set-chez-ns! "clojure.core")
-(load "host/chez/seed/prelude.ss")
-(load "host/chez/post-prelude.ss")
-(load "host/chez/post-prelude-str.ss")
-(set-chez-ns! "user")
-(load "host/chez/host-contract.ss")
-(load "host/chez/seed/image.ss")
-(load "host/chez/compile-eval.ss")
-;; cli-core.ss is inlined into the emitted image below, but it also has to be
-;; loaded HERE: it defines jolt.host/run-expr-string, and bld-emit-cli-aot emits
-;; jolt.main in this process — an unresolved jolt.host var would emit as a class
-;; reference and the binary's -e arm would die with "Unknown class jolt.host".
-(load "host/chez/cli-core.ss")
-(load "host/chez/png.ss")
-(load "host/chez/loader.ss")
-(load "host/chez/java/ffi.ss")
+(load "host/chez/build-boot.ss")  ; the runtime, from target/dev/build-boot.so when fresh
 (set-source-roots! ldr-install-roots)
 (load "host/chez/build.ss")   ; bld-* helpers, ei-* (emit-image), dce
 
@@ -404,22 +387,9 @@
       (put-string p
         (string-append
           "(import (chezscheme))\n"
-          ;; runtime preamble — mirror build-jolt.ss's own header (lines 27-43)
-          ;; exactly, so the macro environment matches what emitted the Scheme.
-          "(load \"host/chez/scheme-adapter-runtime.ss\")\n"
-          "(load \"host/chez/rt.ss\")\n"
-          "(set-chez-ns! \"clojure.core\")\n"
-           "(load \"host/chez/seed/prelude.ss\")\n"
-           "(load \"host/chez/post-prelude.ss\")\n"
-           "(load \"host/chez/post-prelude-str.ss\")\n"
-           "(set-chez-ns! \"user\")\n"
-          "(load \"host/chez/host-contract.ss\")\n"
-          "(load \"host/chez/seed/image.ss\")\n"
-          "(load \"host/chez/compile-eval.ss\")\n"
-          "(load \"host/chez/cli-core.ss\")\n"
-          "(load \"host/chez/png.ss\")\n"
-          "(load \"host/chez/loader.ss\")\n"
-          "(load \"host/chez/java/ffi.ss\")\n"
+          ;; runtime preamble — the same build-boot.ss build-jolt.ss loads, so
+          ;; the macro environment matches what emitted the Scheme.
+          "(load \"host/chez/build-boot.ss\")\n"
           (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
           ;; per-profile flags, mirrored from the flat.ss compile step.
           "(optimize-level " (if jb-release? "2" "0") ")\n"
@@ -704,6 +674,81 @@
 ;; Chez process gives both at once — exactly the legacy build-with-cc pass. The
 ;; in-process compile in build.ss/build-self-contained is for the distributed
 ;; jolt building (non-eval) apps, where no Chez is available.
+;; --- the build-boot image (build-boot.ss) ----------------------------------
+;; On a miss, write the image's source and input list here and answer the command
+;; that compiles it, which step 2 runs beside the flat.ss compile: ~6s against
+;; flat.ss's ~9s, so it costs no wall time, and the next build boots in ~0.4s
+;; instead of ~4.8s. #f on a hit, or when the image cannot be cached.
+;;
+;; Order is what keeps a stale image from reading as fresh. The old image goes
+;; first; the input list is hashed BEFORE the compile reads the files, so an edit
+;; landing in between leaves the image newer than its list (read as stale, the
+;; safe way round); and the image only appears, by rename, once its compile has
+;; succeeded. A failed compile leaves no image and the next build falls back to
+;; source.
+(define jb-build-boot-dir "target/dev")
+(define (jb-build-boot-lines)
+  ;; the literal block in build-boot.ss, minus comments and blank lines
+  (let loop ((ls (bld-file-lines "host/chez/build-boot.ss")) (in? #f) (acc '()))
+    (if (null? ls)
+        (error 'build-jolt "no build-boot loads block in host/chez/build-boot.ss")
+        (let* ((l (car ls))
+               (t (let trim ((i 0))
+                    (if (and (< i (string-length l)) (memv (string-ref l i) '(#\space #\tab)))
+                        (trim (+ i 1))
+                        (substring l i (string-length l))))))
+          (cond ((string=? t ";; build-boot loads begin") (loop (cdr ls) #t acc))
+                ((string=? t ";; build-boot loads end") (reverse acc))
+                ((or (not in?) (string=? t "") (char=? (string-ref t 0) #\;)) (loop (cdr ls) in? acc))
+                (else (loop (cdr ls) in? (cons t acc))))))))
+(define (jb-prepare-build-boot!)
+  (and (build-boot-cacheable?)
+       (not (gate-boot-image-fresh? build-boot-so build-boot-inputs))
+       (let* ((lines (jb-build-boot-lines))
+              (pid (number->string (get-process-id)))
+              (src (string-append jb-build-boot-dir "/build-boot-image.ss"))
+              (so-tmp (string-append build-boot-so "." pid ".tmp"))
+              (cs (string-append jb-build-boot-dir "/build-boot-compile." pid ".ss")))
+         (bld-system (string-append "mkdir -p '" jb-build-boot-dir "'"))
+         (when (file-exists? build-boot-so) (delete-file build-boot-so))
+         ;; the transitive load closure, and build-boot.ss itself: a load added to
+         ;; its block changes the image without touching any loaded file
+         (let ((seen (make-hashtable string-hash string=?)) (order '()))
+           (define (walk path)
+             (when (and path (not (hashtable-ref seen path #f)))
+               (hashtable-set! seen path #t)
+               (set! order (cons path order))
+               (for-each (lambda (l) (walk (bld-load-path l))) (bld-file-lines path))))
+           (for-each (lambda (l) (walk (bld-load-path l))) lines)
+           ;; hashed, not walked: its other load is the image itself
+           (set! order (cons "host/chez/build-boot.ss" order))
+           (let* ((tmp (string-append build-boot-inputs "." pid ".tmp"))
+                  (out (open-output-file tmp 'replace)))
+             (for-each (lambda (p) (put-string out (string-append (gate-boot-hash-string p) " " p "\n")))
+                       (reverse order))
+             (close-port out)
+             (when (file-exists? build-boot-inputs) (delete-file build-boot-inputs))
+             (rename-file tmp build-boot-inputs)))
+         (let ((out (open-output-file src 'replace)))
+           (for-each (lambda (l) (bld-inline-line l out 0)) lines)
+           (close-port out))
+         ;; compiled like make-gateboot's gate.so, in a fresh Chez so `error` and
+         ;; the other primitives the runtime shadows bind to the kernel's
+         (let ((p (open-output-file cs 'replace)))
+           (put-string p
+             (string-append
+               "(import (chezscheme))\n"
+               "(optimize-level 2)\n"
+               "(generate-inspector-information #f)\n"
+               "(generate-procedure-source-information #f)\n"
+               "(debug-on-exception #f)\n"
+               "(fasl-compressed #t)\n"
+               "(compile-file " (ei-str-lit src) " " (ei-str-lit so-tmp) ")\n"
+               "(rename-file " (ei-str-lit so-tmp) " " (ei-str-lit build-boot-so) ")\n"
+               "(delete-file " (ei-str-lit cs) ")\n"))
+           (close-port p))
+         (string-append bld-chez " --script '" cs "'"))))
+
 (define jb-flat-so (string-append jb-build "/flat.so"))
 (define jb-boot (string-append jb-build "/jolt.boot"))
 ;; the vfasl form of jb-boot — what actually gets embedded (see the conversion
@@ -751,10 +796,19 @@
   ;; spends most of its time alone on one core (the stdlib batch loads the whole
   ;; runtime preamble first), and neither reads the other's output. Both run to
   ;; the end before either failure is reported; the stdlib log is shown after.
-  (let ((log (string-append jb-stdlib-dir "/compile-all.log")))
+  ;; A build-boot image compile (on a miss) is the third: waited for so it does
+  ;; not outlive the build, but only a cache, so its failure is a warning.
+  (let ((log (string-append jb-stdlib-dir "/compile-all.log"))
+        (boot-cmd (jb-prepare-build-boot!))
+        (boot-log (string-append jb-build-boot-dir "/build-boot.log")))
     (bld-system (string-append
-      "( " bld-chez " --script '" (jb-stdlib-compile-script) "' > '" log "' 2>&1 & s=$!; "
+      "( " (if boot-cmd (string-append boot-cmd " > '" boot-log "' 2>&1 & b=$!; ") "")
+      bld-chez " --script '" (jb-stdlib-compile-script) "' > '" log "' 2>&1 & s=$!; "
       bld-chez " --script '" cs "'; f=$?; wait $s; g=$?; cat '" log "'; "
+      (if boot-cmd
+          (string-append "wait $b || echo \"build-jolt: warning: build-boot image not written, see "
+                         boot-log "\"; ")
+          "")
       "[ $f -eq 0 ] && [ $g -eq 0 ] )")))
   (jb-write-stdlib-blob!)
   ;; …and re-run just that conversion under gzip if the image it produced is over
