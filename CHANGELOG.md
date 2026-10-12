@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An unsupported target names itself.** A `:capture-native-error` binding
+  built for a target machine that the error-convention case doesn't list
+  failed with `variable error is not bound`, because the case's fallback
+  called the `error` that `rt.ss` redefines at top level, which has no value
+  while `compile-file` expands. It now raises `unsupported target machine`
+  with the machine as the irritant.
 - **A portable-bytecode build can use `jolt.socket.native`.** A
   `:capture-native-error` binding picks its error convention from the target
   machine, and the list had no `pb` or `tpb` machine, so a `--target tpb64l`

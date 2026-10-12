@@ -196,9 +196,13 @@
            pb tpb pb32l tpb32l pb32b tpb32b pb64l tpb64l pb64b tpb64b)
           #'errno-form)
          (else
-          (error 'jolt-ffi-native-error-convention-case
-                 "unsupported target machine"
-                 (eval '(#%$target-machine)))))))))
+          ;; #%error, not error: this file redefines error at top level, and
+          ;; under compile-file that binding has no value while this
+          ;; transformer runs, so a plain call reported "variable error is
+          ;; not bound" instead of the message below.
+          (#%error 'jolt-ffi-native-error-convention-case
+                   "unsupported target machine"
+                   (eval '(#%$target-machine)))))))))
 
 (define-syntax jolt-ffi-native-error-procedure
   (lambda (x)
