@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new object whose text reaches `sw` on flush or close. It used to return `sw`
   itself. `(BufferedWriter. w)` builds a real wrapper, and FileWriter and
   OutputStreamWriter report their own classes.
+- **`int?` is false past the long range and is its own fn.** It was the same
+  procedure as `integer?`, so it was true for a bignum, and so was `pos-int?`.
+  A map keyed by both `int?` and `integer?`, like spec.alpha's generator
+  table, saw one key twice. It now answers for integers in the signed 64-bit
+  range, the values that class as `java.lang.Long`.
 - **A map or set literal whose computed keys collide throws.** `(let [x 1 y 1]
   #{x y})` threw `IllegalArgumentException: Duplicate key: 1` on the JVM but
   quietly dropped one entry here. Literals whose keys are distinct constants
