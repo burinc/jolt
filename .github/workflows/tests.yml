@@ -293,6 +293,17 @@ jobs:
       - name: Gate the Windows path, PATH and process rows
         run: make CHEZ=./chez-install/bin/chez winplatform winpath winparity
 
+      # #1337: the flonum payload probe read bytes in front of 2.5, and with no
+      # fault handler in a MinGW scheme.exe that killed the process at load
+      # whenever 2.5 landed first in a fresh segment — reliably for
+      # `> f 2>&1`, where stdout and stderr share one console port. flonumdisp
+      # builds that layout on purpose; the second command is the report.
+      - name: Gate the flonum payload probe
+        run: |
+          make CHEZ=./chez-install/bin/chez flonumdisp
+          ./chez-install/bin/scheme.exe --script host/chez/cli.ss -e '(println 1)' > merged.txt 2>&1
+          tr -d '\r' < merged.txt | grep -qx 1
+
       # java.util.zip in script mode under MSYS2 (#916). There are no jolt_z_*
       # names there: zlib.ss binds the process's own zlib if scheme.exe exports
       # one, else MSYS2's zlib1.dll from /mingw64/bin (mingw-w64-x86_64-zlib,
