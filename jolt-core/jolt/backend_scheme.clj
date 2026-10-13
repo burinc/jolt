@@ -560,7 +560,8 @@
 ;; that fn. fib and tak recurse that way and nothing else, and the restore was
 ;; ~9% and ~20% of them. Whether the fn qualifies is known only once its body is
 ;; emitted, so a self-call is emitted under a per-fn placeholder head that emit-fn
-;; rewrites to jolt-site-return or begin (*self-wrap*: {:tok head :unsafe atom}).
+;; rewrites to the restore or to nothing (*self-wrap*: {:tok base :unsafe atom},
+;; site-restore).
 (def ^:dynamic *self-wrap* nil)
 ;; A tail call that may run a jolt fn disqualifies the enclosing fn.
 (defn- note-tail-call! [tail?]
@@ -2727,10 +2728,16 @@
                   (mapv emit-arity-clause (or once-marked arities)))
         ;; the self-calls' placeholder head, now that the body is known (*self-wrap*)
         clauses (if self-wrap
-                  (let [from (str "(" (:tok self-wrap) " ")
-                        to (if @(:unsafe self-wrap) "(jolt-site-return " "(begin ")]
-                    (mapv (fn [c] (mapv (fn [x] (if (string? x) (str/replace x from to) x)) c))
-                          clauses))
+                  (let [tok (:tok self-wrap)
+                        unsafe? @(:unsafe self-wrap)
+                        rd-from (str "(" tok "r)")
+                        rd-to (if unsafe? "(virtual-register 2)" "0")
+                        wr-from (str "(" tok "w ")
+                        wr-to (if unsafe? "(set-virtual-register! 2 " "(begin ")
+                        fix (fn [x] (if (string? x)
+                                      (str/replace (str/replace x rd-from rd-to) wr-from wr-to)
+                                      x))]
+                    (mapv (fn [c] (mapv fix c)) clauses))
                   clauses)
         ;; The capture must stay LIVE. Chez removes a dead one and the sharing
         ;; comes back — measured for a dead reference, a captured value used
@@ -3150,8 +3157,8 @@
     (if (seq binds)
       (str "(let* (" binds ") (jolt-site! " site ") " (plain-call callee tts) ")")
       (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")")))))
-;; A NON-tail call with tracing on is wrapped in (jolt-site-return CALL), which
-;; puts the site slot back as it was when the call returns (rt.ss). The tail sites
+;; A NON-tail call with tracing on is wrapped in site-restore, which puts the
+;; site slot (vreg 2, rt.ss jolt-vreg-site) back as it was when the call returns. The tail sites
 ;; that ran inside the call stored pairs, and once it has returned none of them is
 ;; a live frame: left in the slot, the next throw from host code -- whose
 ;; innermost frame is a host one, with nothing to check the pair against --
@@ -3161,6 +3168,16 @@
 ;; that cannot run a jolt fn (no-jolt-call-procs) is left bare.
 (defn- returning-call? [callee]
   (not (contains? no-jolt-call-procs callee)))
+;; Spelled out in Chez primitives rather than a runtime macro: a cached fasl is
+;; then compiled from text that needs nothing of the runtime to expand (the AOT
+;; cache gate recompiles one with a bare Chez), and the literal slot compiles to a
+;; load and a store. rd / wr are the read form and the write head; a self-call
+;; passes placeholders emit-fn fills in later (*self-wrap*).
+(defn- site-restore
+  ([call] (site-restore call "(virtual-register 2)" "set-virtual-register! 2"))
+  ([call rd wr]
+   (let [sv (fresh-label "_ss$") rv (fresh-label "_sr$")]
+     (str "(let ((" sv " " rd ")) (let ((" rv " " call ")) (" wr " " sv ") " rv "))"))))
 ;; Emit a call. In tail position with tracing on, a call to a DIFFERENT fn than
 ;; the enclosing one stores its site pair (sited-tail-call), and a non-tail call
 ;; restores the slot when it returns (returning-call?). Everything else —
@@ -3175,9 +3192,10 @@
        (and (trace-frames?) tail? *trace-site* (not self?))
        (sited-tail-call *trace-site* line callee operand-strs inl-chain)
        (and (trace-frames?) (not tail?) self? *self-wrap*)
-       (str "(" (:tok *self-wrap*) " " (plain-call callee operand-strs) ")")
+       (site-restore (plain-call callee operand-strs)
+                     (str "(" (:tok *self-wrap*) "r)") (str (:tok *self-wrap*) "w"))
        (and (trace-frames?) (not tail?) (returning-call? callee))
-       (str "(jolt-site-return " (plain-call callee operand-strs) ")")
+       (site-restore (plain-call callee operand-strs))
        :else (plain-call callee operand-strs)))))
 
 (defn- emit-invoke [node]
@@ -4105,7 +4123,7 @@
                       (note-tail-call! tail?)
                       (if (and (trace-frames?) (not tail?)
                                (not (contains? #{:str :kw :sb :sbuf} (:target-type node))))
-                        (str "(jolt-site-return " call ")")
+                        (site-restore call)
                         call)))))
     :let (emit-let node)
     :loop (emit-loop node)
