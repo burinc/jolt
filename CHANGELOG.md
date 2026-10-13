@@ -87,6 +87,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **stderr is its own stream on Windows (#1331).** Chez's check for whether
+  stdout and stderr are the same file compared stdout's file with itself, so
+  with both streams redirected to files, everything written to `System/err`,
+  `*err*`, uncaught-exception reports and the runtime's own diagnostics went to
+  stdout and the `2>` file stayed empty. jolt's Chez build carries the fix
+  (`host/chez/chez-patches/0005`); a jolt built against a stock Chez on Windows
+  still merges them.
+
+- **Threads starting their first child processes together on Windows all
+  start (#1331).** The kernel32 entry points behind a spawn are looked up on
+  first use, and the lookup marked itself done before it had an answer, so
+  the other threads read nothing there and failed with "ProcessBuilder: no
+  Windows spawn path". Six threads spawning at once lost five.
+
 - **`clojure.walk` hands `outer` a map entry, not a vector.** A map entry is
   also `vector?`, and `walk` met it in its vector branch, so `postwalk` rebuilt
   each entry as a plain 2-vector and its function saw `(map-entry? x)` false

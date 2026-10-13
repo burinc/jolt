@@ -927,24 +927,38 @@
 ;; jolt-foreign-proc-safe takes that branch on Windows — a compiled foreign
 ;; reference is a load-time fasl relocation there, and a missing symbol aborts
 ;; the boot before any guard can run.
-(define (win32-proc lib name args res)
+(define (win32-proc lib name args res blocking?)
   (and (win32?)
        (begin
          (win32-load-lib! lib)
          (and (sa-foreign-entry? name)
-              (guard (e (#t #f)) (sa-foreign-procedure-runtime name args res #f))))))
+              (guard (e (#t #f)) (sa-foreign-procedure-runtime name args res blocking?))))))
 
-;; Resolve ONCE, on first use, and remember the answer (including #f).
+;; Resolve on first use and remember the answer (including #f). The answer and
+;; the "resolved" mark are ONE store: a separate done? flag set before the answer
+;; let a thread arriving in between read #f, so threads starting their first
+;; child process together failed with "no Windows spawn path" (#1331). Two first
+;; callers may now both resolve, which is harmless — they get the same answer.
+(define win32-unresolved (list 'win32-unresolved))
+(define-syntax define-win32-memo
+  (syntax-rules ()
+    ((_ id resolve)
+     (define id
+       (let ((memo win32-unresolved))
+         (lambda ()
+           (when (eq? memo win32-unresolved)
+             (set! memo resolve))
+           memo))))))
 (define-syntax define-win32-proc
   (syntax-rules ()
     ((_ id lib name args res)
-     (define id
-       (let ((memo #f) (done? #f))
-         (lambda ()
-           (unless done?
-             (set! done? #t)
-             (set! memo (win32-proc lib name (quote args) (quote res))))
-           memo))))))
+     (define-win32-memo id (win32-proc lib name (quote args) (quote res) #f)))))
+;; Same, for an entry point that may block (a pipe read): the call is
+;; __collect_safe, so a thread parked in it does not hold up the collector.
+(define-syntax define-win32-proc-blocking
+  (syntax-rules ()
+    ((_ id lib name args res)
+     (define-win32-memo id (win32-proc lib name (quote args) (quote res) #t)))))
 
 ;; A NUL-terminated UTF-16LE copy of S in foreign memory — what every W entry
 ;; point takes. The caller owns it and must sa-foreign-free it. Surrogate pairs
