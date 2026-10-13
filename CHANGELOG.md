@@ -61,10 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Clojure source has always been a leaf: it stays on the roots, but the
   dependencies its POM declares are left alone, since jolt can't run them. A
   caller that runs JVM bytecode itself can now ask for those dependencies too.
-  With the option, such a jar's POM is walked the same way a Clojure jar's is,
-  so compile and runtime scope only, optional deps skipped, exclusions
-  honoured. Without it nothing changes. A nested `resolve-deps` that doesn't
-  pass the key inherits the outer value.
+  With the option, such a jar's POM is walked the same way a Clojure jar's is:
+  compile and runtime scope only, optional deps skipped, and exclusions
+  honoured when the effective POM can be built (the `pom.xml` fallback inside
+  the jar carries none). Classifiers and `<type>` are not modelled. Without
+  the option nothing changes. A nested `resolve-deps` that doesn't pass the key
+  inherits the outer value.
 
 ### Changed
 
