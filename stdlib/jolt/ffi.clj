@@ -233,8 +233,8 @@
       compile time, which is also why the descriptor must be a literal —
       (layout d) on a runtime value has nothing to compile. The same holds for
       the [:union ...] descriptor, which is otherwise babashka.ffi's.
-    - read-array and write-array copy the one-byte widths in a single block move
-      and the wider ones element by element.
+    - read-array and write-array copy every scalar width as a block move, into
+      a jolt array of that width or out of one.
     - jolt adds: (alloc n) with no arena, the with-* scoped helpers, arena?,
       arena-open?, close-arena, drain-auto-arenas!, layout-size,
       layout-alignment, field-offset, read-field, write-field, :varargs (a
@@ -1138,11 +1138,15 @@
 ;; exactly as a memcpy into a Java int[] does, which is what makes a round trip
 ;; through these byte-exact.
 ;;
-;; The one-byte widths move as one block (read-array / write-array below the
-;; dispatch, which is a single foreign block copy); the wider ones move element
-;; by element, since a jolt array of 4- or 8-byte elements has no bytevector to
-;; copy into. :string cannot be copied at all — its elements are pointers to
-;; bytes elsewhere, which a copy cannot follow.
+;; Every width moves as one block. The one-byte widths are read-array /
+;; write-array below the dispatch, a single foreign block copy into the byte
+;; array's bytevector. The wider ones are the host's __read-array-typed and
+;; __write-array-typed: one block copy through a bytevector, decoded into (or
+;; encoded from) the array's flvector or fxvector backing. Either answers false
+;; for what it does not handle — a vector of values, a long array widened to
+;; hold a bignum — and the element loop does the copy instead.
+;; :string cannot be copied at all — its elements are pointers to bytes
+;; elsewhere, which a copy cannot follow.
 (def ^:private array-byte-types
   #{:int8 :i8 :uint8 :u8 :byte :char :bool})
 
@@ -1171,11 +1175,12 @@
   (let [carrier (array-carrier t)]
     (if (nil? (:ctor carrier))
       (jolt.ffi/__read-array (+ p off) n)
-      (let [width (:width carrier)
-            element (:read-type carrier)
-            arr ((:ctor carrier) n)]
-        (dotimes [i n] (aset arr i (jolt.ffi/__read p element (+ off (* i width)))))
-        arr))))
+      (or (jolt.ffi/__read-array-typed (+ p off) (:read-type carrier) n)
+          (let [width (:width carrier)
+                element (:read-type carrier)
+                arr ((:ctor carrier) n)]
+            (dotimes [i n] (aset arr i (jolt.ffi/__read p element (+ off (* i width)))))
+            arr)))))
 
 ;; One element, written so the BITS land as they are: a value wider than its
 ;; element folds into it rather than raising, which is the write half of "the type
@@ -1195,11 +1200,14 @@
   (let [carrier (array-carrier t)]
     (if (nil? (:ctor carrier))
       (jolt.ffi/__write-array (+ p off) arr)
-      (let [width (:width carrier)
-            n (count arr)]
-        (dotimes [i n]
-          (write-array-element p carrier (nth arr i) (+ off (* i width))))
-        n))))
+      ;; The host's block encode takes the :read-type too: it picks the width
+      ;; and the family, and the encode keeps the low bits whatever the sign.
+      (or (jolt.ffi/__write-array-typed (+ p off) (:read-type carrier) arr)
+          (let [width (:width carrier)
+                n (count arr)]
+            (dotimes [i n]
+              (write-array-element p carrier (nth arr i) (+ off (* i width))))
+            n)))))
 
 (defn read-array
   "Copy elements out of foreign memory into a fresh jolt array.

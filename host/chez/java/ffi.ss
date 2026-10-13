@@ -867,6 +867,126 @@
 (def-var! "jolt.ffi" "__read-array" ffi-read-array)
 (def-var! "jolt.ffi" "__write-array" ffi-write-array)
 
+;; --- typed array moves ------------------------------------------------------
+;; The wider widths of read-array / write-array: block copies
+;; through a bytevector, decoded into (or encoded out of) the array's own
+;; backing — an flvector for float/double, an fxvector for the integer types.
+;; The per-element alternative, a foreign-ref with a type converted from its
+;; keyword at every element, is ~125ns an element against ~3ns for this. `type`
+;; is the carrier's :read-type (stdlib/jolt/ffi.clj's array-carrier stays the
+;; one place that picks the element type), so it is one of :double :float
+;; :int64 :int32 :int16; anything else answers #f and the caller keeps its
+;; element loop.
+;;
+;; The copy moves at most ffi-typed-chunk-bytes at a time through one reused
+;; bytevector, so a large array costs its own backing and no more: a single
+;; temporary the size of the whole block would double the peak of a 100MB read.
+;; 64KB is past the point where a bigger block buys any speed.
+(define ffi-typed-chunk-bytes 65536)
+(define (ffi-typed-array-kind ct)
+  (case ct
+    ((double) 'double) ((float) 'float)
+    ((integer-64) 'long) ((integer-32) 'int) ((integer-16) 'short)
+    (else #f)))
+;; Decode n elements of Chez type ct from bv (from octet 0) into arr from index
+;; off. The unboxed backings take the fast arms. An integer that is not a fixnum
+;; — an :int64 past 61 bits, or an :int32 past 30 on a 32-bit Chez — hands the
+;; rest of the chunk to ja-set!, which widens the backing once, exactly as aset
+;; does; a backing already widened goes through ja-set! from the start.
+(define (ffi-decode-into! ct bv arr off n)
+  (let ((v (jolt-array-vec arr)))
+    (define (slow! ref width from)
+      (do ((i from (fx+ i 1))) ((fx= i n))
+        (ja-set! arr (fx+ off i) (ref bv (fx* i width) (native-endianness)))))
+    (define (ints! ref native-ref width)
+      (if (fxvector? v)
+          (let loop ((i 0))
+            (when (fx< i n)
+              (let ((x (native-ref bv (fx* i width))))
+                (if (fixnum? x)
+                    (begin (fxvector-set! v (fx+ off i) x) (loop (fx+ i 1)))
+                    (slow! ref width i)))))
+          (slow! ref width 0)))
+    (case ct
+      ((double)
+       (if (flvector? v)
+           (do ((i 0 (fx+ i 1))) ((fx= i n))
+             (flvector-set! v (fx+ off i) (bytevector-ieee-double-native-ref bv (fx* i 8))))
+           (slow! bytevector-ieee-double-ref 8 0)))
+      ;; already single precision, widened to a flonum: what aset's flsingle stores
+      ((float)
+       (if (flvector? v)
+           (do ((i 0 (fx+ i 1))) ((fx= i n))
+             (flvector-set! v (fx+ off i) (bytevector-ieee-single-native-ref bv (fx* i 4))))
+           (slow! bytevector-ieee-single-ref 4 0)))
+      ((integer-64) (ints! bytevector-s64-ref bytevector-s64-native-ref 8))
+      ((integer-32) (ints! bytevector-s32-ref bytevector-s32-native-ref 4))
+      ((integer-16) (ints! bytevector-s16-ref bytevector-s16-native-ref 2)))))
+;; Copy n elements at p into arr from index off, a chunk at a time.
+(define (ffi-read-typed-chunks! ct p arr off n)
+  (let* ((width (sa-foreign-sizeof ct))
+         (per (fxquotient ffi-typed-chunk-bytes width))
+         (bv (make-bytevector (fx* (fxmin n per) width))))
+    (let loop ((done 0))
+      (when (fx< done n)
+        (let ((k (fxmin per (fx- n done))))
+          (sa-foreign-bytes-ref! (+ p (fx* done width)) bv (fx* k width))
+          (ffi-decode-into! ct bv arr (fx+ off done) k)
+          (loop (fx+ done k)))))))
+
+;; (__read-array-typed ptr type n) -> a fresh jolt array of n elements, or #f
+;; for a type this host does not decode natively.
+(define (ffi-read-array-typed ptr type n)
+  (let* ((ct (ffi-type->chez type)) (kind (ffi-typed-array-kind ct)))
+    (and kind
+         (let* ((n (jnum->exact n))
+                (arr (make-jolt-array (na-make-backing n kind (na-zero-of kind)) kind)))
+           (ffi-read-typed-chunks! ct (jnum->exact ptr) arr 0 n)
+           arr))))
+
+;; (__write-array-typed ptr type arr) -> the element count, or #f when arr is
+;; not a jolt array with an unboxed backing of the type's family (a vector, a
+;; promoted long array, a double-array written as :int32), which the caller's
+;; element loop handles as it always has. The BITS land as they are, as
+;; write-array-element writes them: an integer keeps its low width*8 bits. The
+;; 32-bit mask is a bitwise-and rather than an fxlogand: #xffffffff is not a
+;; fixnum on a 32-bit Chez.
+(define (ffi-write-array-typed ptr type arr)
+  (and (jolt-array? arr)
+       (let* ((ct (ffi-type->chez type)) (v (jolt-array-vec arr)))
+         (define (emit! width put!)
+           (let* ((n (ja-len arr)) (p (jnum->exact ptr))
+                  (per (fxquotient ffi-typed-chunk-bytes width))
+                  (bv (make-bytevector (fx* (fxmin n per) width))))
+             (let loop ((done 0))
+               (when (fx< done n)
+                 (let ((k (fxmin per (fx- n done))))
+                   (do ((i 0 (fx+ i 1))) ((fx= i k)) (put! bv (fx* i width) (fx+ done i)))
+                   (sa-foreign-bytes-set! (+ p (fx* done width)) bv (fx* k width))
+                   (loop (fx+ done k)))))
+             n))
+         (case ct
+           ((double)
+            (and (flvector? v)
+                 (emit! 8 (lambda (bv at i) (bytevector-ieee-double-native-set! bv at (flvector-ref v i))))))
+           ((float)
+            (and (flvector? v)
+                 (emit! 4 (lambda (bv at i) (bytevector-ieee-single-native-set! bv at (flvector-ref v i))))))
+           ((integer-64)
+            (and (fxvector? v)
+                 (emit! 8 (lambda (bv at i) (bytevector-s64-native-set! bv at (fxvector-ref v i))))))
+           ((integer-32)
+            (and (fxvector? v)
+                 (emit! 4 (lambda (bv at i)
+                            (bytevector-u32-native-set! bv at (bitwise-and (fxvector-ref v i) #xffffffff))))))
+           ((integer-16)
+            (and (fxvector? v)
+                 (emit! 2 (lambda (bv at i)
+                            (bytevector-u16-native-set! bv at (fxlogand (fxvector-ref v i) #xffff))))))
+           (else #f)))))
+(def-var! "jolt.ffi" "__read-array-typed" ffi-read-array-typed)
+(def-var! "jolt.ffi" "__write-array-typed" ffi-write-array-typed)
+
 ;; --- string / bytevector marshaling ------------------------------------------
 ;; A C string result already comes back as a jolt string (the `string` foreign
 ;; type). For a `void*` that points at a NUL-terminated C string, read it here.

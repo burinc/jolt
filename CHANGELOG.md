@@ -168,6 +168,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the other methods `InputStream` and `OutputStream` define over `read`
   and `write`.
 
+### Performance
+
+- **`jolt.ffi/read-array` and `write-array` with a numeric type are 20 to 45
+  times faster.** `(ffi/read-array p :double n)` read one element at a time,
+  through a var call that converted the type keyword and unboxed the pointer at
+  every element: about 120 ns an element. It now block-copies the memory and
+  decodes it straight into the array's backing, about 3 ns an element; 6000
+  doubles went from 723 to 19 µs. `write-array` encodes and block-copies the
+  same way, and 6000 doubles went from 834 to 18 µs. The copy moves 64 KB at a
+  time, so a large read allocates its array and no second copy of it, and a
+  write allocates at most 64 KB. This holds for `:double`, `:float` and the 2-,
+  4- and 8-byte integer and pointer types; the results are the same arrays as
+  before. A vector passed to `write-array`, or a `long-array` holding a value
+  past the fixnum range, still takes the element loop. Not on Gambit.
+
 ## [0.8.21] - 2026-10-11
 
 jolt and the binaries it builds hold about half the memory they did: `jolt -e`
