@@ -201,6 +201,62 @@
      ['stack_trace_test$thrower 'invoke "stack-trace-test.clj" 158]
      "StackTraceElement->vec names class and method as symbols")
 
+;; --- a tail call that RETURNED is not a frame of a later throw ------------------
+;; A tail call stores its site pair and nothing cleared it when the call returned,
+;; so the next throw from host code -- with nothing live to check the pair against
+;; -- named the returned fn as its innermost frame.
+(defn- ret-g [x] x)
+(defn- ret-f [x] (ret-g x))
+(defn- ret-host [x] (count x))
+(defn- frame-names [e] (mapv first (own-frames (.getStackTrace e))))
+(let [e (try (do (ret-f 1) (nth [] 3)) (catch Exception x x))]
+  (ok= (frame-names e) []
+       "a returned tail call (to a jolt fn) is not a frame of the next host throw"))
+(let [e (try (do (ret-host [1]) (nth [] 3)) (catch Exception x x))]
+  (ok= (frame-names e) []
+       "a returned tail call (to a host fn) is not a frame of the next host throw"))
+(defn- ret-then-throw [] (ret-f 1) (ret-host [1]) (nth [] 3))
+(let [e (try (ret-then-throw) (catch Exception x x))]
+  (ok= (first (frame-names e)) "stack_trace_test$ret_then_throw"
+       "...nor inside a fn: the fn that was running is the innermost frame")
+  (ok= (some #{"stack_trace_test$ret_f" "stack_trace_test$ret_g" "stack_trace_test$ret_host"}
+             (frame-names e))
+       nil
+       "...and the fns it called and that returned are not frames"))
+;; ...while a tail call still running when the host throws keeps its erased frames
+(defn- tail-host-thrower [] (nth [] 3))
+(let [e (try (tail-host-thrower) (catch Exception x x))]
+  (ok= (frame-names e) ["stack_trace_test$tail_host_thrower"]
+       "a tail call into a throwing host fn keeps its erased frame"))
+(let [e (try (do (ret-f 1) (tail-host-thrower)) (catch Exception x x))]
+  (ok= (frame-names e) ["stack_trace_test$tail_host_thrower"]
+       "...after a returned tail call too"))
+(defn- chain-c [v] (nth v 3))
+(defn- chain-b [v] (chain-c v))
+(defn- chain-a [v] (ret-f 1) (chain-b v))
+(let [e (try (chain-a []) (catch Exception x x))]
+  (ok= (frame-names e)
+       ["stack_trace_test$chain_c" "stack_trace_test$chain_b" "stack_trace_test$chain_a"]
+       "a tail-call chain ending in a host throw keeps every erased frame"))
+;; a fn erased by its tail call into a fn that is still running sits BELOW that fn:
+;; it is the running fn's caller, not a frame above the throw
+(defn- live-callee [v] (+ 1 (nth v 3)))
+(defn- erases-into-live [v] (live-callee v))
+(defn- calls-erases [] (let [r (erases-into-live [])] r))
+(let [e (try (calls-erases) (catch Exception x x))]
+  (ok= (take 3 (frame-names e))
+       ["stack_trace_test$live_callee" "stack_trace_test$erases_into_live"
+        "stack_trace_test$calls_erases"]
+       "an erased caller of the throwing fn is spliced below it"))
+(defn- mid-caller [] (let [r (live-callee [])] r))
+(defn- erases-into-mid [] (mid-caller))
+(defn- calls-erases-mid [] (let [r (erases-into-mid)] r))
+(let [e (try (calls-erases-mid) (catch Exception x x))]
+  (ok= (take 4 (frame-names e))
+       ["stack_trace_test$live_callee" "stack_trace_test$mid_caller"
+        "stack_trace_test$erases_into_mid" "stack_trace_test$calls_erases_mid"]
+       "...and below the live frame it called, further out"))
+
 (let [n @passes f @fails]
   (doseq [m f] (println "stack-trace FAIL " m))
   (println "STACK-TRACE-RESULT pass" n "fail" (count f))

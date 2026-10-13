@@ -30,6 +30,23 @@
 (def ^:private native-ops op-registry/native-ops)
 (def ^:private core-value-procs op-registry/core-value-procs)
 (def ^:private bool-returning-ops op-registry/bool-returning-ops)
+;; The Scheme procs of the native ops that cannot run a jolt fn: the numeric ops
+;; (every operand a number -- :num-args?, or a :dbl/:lng fast path, except `=`,
+;; which can reach a type's own equiv) and the predicates that only look at the
+;; value they are handed. Each op's :call and :fixed helpers. emit-call leaves
+;; the site-slot restore off a non-tail call to one of these (returning-call?),
+;; and a tail call to one leaves only the fn's own site pair behind
+;; (*self-wrap*).
+(def ^:private no-jolt-call-procs
+  (let [preds #{"nil?" "some?" "identical?" "not" "zero?" "pos?" "neg?" "even?" "odd?"
+                "chunked-seq?" "identity"}]
+    (into #{"jolt-throw"}
+          (for [[op spec] op-registry/op-registry
+                :when (and (not= op "=")
+                           (or (:num-args? spec) (:dbl spec) (:lng spec) (contains? preds op)))
+                proc (cons (:call spec) (vals (:fixed spec)))
+                :when proc]
+            proc))))
 (def ^:private op-arity op-registry/op-arity)
 (def ^:private fixed-arity-ops op-registry/fixed-arity-ops)
 (def ^:private dbl-ops op-registry/dbl-ops)
@@ -353,7 +370,8 @@
 ;; `;;` comment would comment out the rest of the one-line top-level form. R2
 ;; (bead jolt-knn8): the per-call (jolt-site! LINE) fixnum store is GONE — non-tail
 ;; code now compiles with no per-call instrumentation at all, so a continuation
-;; names a non-tail frame with its exact line for free. The ('ns/fn' . line) PAIR
+;; names a non-tail frame with its exact line for free (a non-tail call now only
+;; puts the site slot back when it returns, emit-call). The ('ns/fn' . line) PAIR
 ;; the innermost-frame splice needs is stored only by TAIL call emissions
 ;; (sited-tail-call / the :throw case), there AFTER the operands are temp-bound.
 ;; A pair now survives its chain's return, so the reporter validates the splice
@@ -536,6 +554,17 @@
 ;; in code outside any named fn (top-level, anonymous fns): those tail sites skip.
 (def ^:dynamic *trace-site* nil)
 (def ^:dynamic *trace-self* #{})
+;; A named fn's direct calls to ITSELF skip the restore when nothing the fn
+;; tail-calls can run a jolt fn: every tail site it has then stores the fn's own
+;; pair, and the reporter drops a pair whose fn is a live frame -- the caller is
+;; that fn. fib and tak recurse that way and nothing else, and the restore was
+;; ~9% and ~20% of them. Whether the fn qualifies is known only once its body is
+;; emitted, so a self-call is emitted under a per-fn placeholder head that emit-fn
+;; rewrites to jolt-site-return or begin (*self-wrap*: {:tok head :unsafe atom}).
+(def ^:dynamic *self-wrap* nil)
+;; A tail call that may run a jolt fn disqualifies the enclosing fn.
+(defn- note-tail-call! [tail?]
+  (when (and tail? *self-wrap*) (reset! (:unsafe *self-wrap*) true)))
 
 ;; R2 (bead jolt-knn8): compile-time callsite table, the staleness fix for the
 ;; site vreg once only tail sites write it. While emitting a def's init under
@@ -2680,10 +2709,13 @@
                       (into {} (map-indexed
                                  (fn [i nm] [nm (str "(vector-set! " once-env " " (inc i) " " once-cleared ")")])
                                  (:free-names node))))
+        self-wrap (when (and self (trace-frames?))
+                    {:tok (fresh-label "_srself$") :unsafe (atom false)})
         clauses (binding [*known-procs* (if self (assoc *known-procs* self site) *known-procs*)
                           *once-clears* once-clears
                           *trace-site* site
                           *trace-self* (cond-> #{} self (conj self) site (conj site))
+                          *self-wrap* self-wrap
                           ;; An enclosing letrec's bindings are initialised by the
                           ;; time anything in THIS body runs, so a literal nested
                           ;; here may name one — map-indexed's lazy-seq thunk
@@ -2693,6 +2725,13 @@
                           *letrec-binders* #{}
                           *fnsrc-def-init?* false]
                   (mapv emit-arity-clause (or once-marked arities)))
+        ;; the self-calls' placeholder head, now that the body is known (*self-wrap*)
+        clauses (if self-wrap
+                  (let [from (str "(" (:tok self-wrap) " ")
+                        to (if @(:unsafe self-wrap) "(jolt-site-return " "(begin ")]
+                    (mapv (fn [c] (mapv (fn [x] (if (string? x) (str/replace x from to) x)) c))
+                          clauses))
+                  clauses)
         ;; The capture must stay LIVE. Chez removes a dead one and the sharing
         ;; comes back — measured for a dead reference, a captured value used
         ;; through begin, an assigned variable and a captured fresh pair, all of
@@ -3111,17 +3150,35 @@
     (if (seq binds)
       (str "(let* (" binds ") (jolt-site! " site ") " (plain-call callee tts) ")")
       (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")")))))
+;; A NON-tail call with tracing on is wrapped in (jolt-site-return CALL), which
+;; puts the site slot back as it was when the call returns (rt.ss). The tail sites
+;; that ran inside the call stored pairs, and once it has returned none of them is
+;; a live frame: left in the slot, the next throw from host code -- whose
+;; innermost frame is a host one, with nothing to check the pair against --
+;; reported the returned fn as its innermost frame. Put back rather than cleared,
+;; because the slot can hold a genuine pair from below the call: a fn that was
+;; itself tail-called keeps its erased caller across the calls it makes. A call
+;; that cannot run a jolt fn (no-jolt-call-procs) is left bare.
+(defn- returning-call? [callee]
+  (not (contains? no-jolt-call-procs callee)))
 ;; Emit a call. In tail position with tracing on, a call to a DIFFERENT fn than
-;; the enclosing one stores its site pair (sited-tail-call). Everything else —
-;; non-tail calls, JOLT_TRACE=0, direct self-tail-calls — is a plain
-;; application, byte-identical to untraced code.
+;; the enclosing one stores its site pair (sited-tail-call), and a non-tail call
+;; restores the slot when it returns (returning-call?). Everything else —
+;; JOLT_TRACE=0, direct self-tail-calls, a tail call outside a named fn — is a
+;; plain application, byte-identical to untraced code.
 (defn- emit-call
   ([tail? callee operand-strs line] (emit-call tail? callee operand-strs line nil))
   ([tail? callee operand-strs line inl-chain]
-   (if (and (trace-frames?) tail? *trace-site*
-            (not (contains? *trace-self* callee)))
-     (sited-tail-call *trace-site* line callee operand-strs inl-chain)
-     (plain-call callee operand-strs))))
+   (let [self? (contains? *trace-self* callee)]
+     (when-not (or self? (contains? no-jolt-call-procs callee)) (note-tail-call! tail?))
+     (cond
+       (and (trace-frames?) tail? *trace-site* (not self?))
+       (sited-tail-call *trace-site* line callee operand-strs inl-chain)
+       (and (trace-frames?) (not tail?) self? *self-wrap*)
+       (str "(" (:tok *self-wrap*) " " (plain-call callee operand-strs) ")")
+       (and (trace-frames?) (not tail?) (returning-call? callee))
+       (str "(jolt-site-return " (plain-call callee operand-strs) ")")
+       :else (plain-call callee operand-strs)))))
 
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
@@ -3178,6 +3235,7 @@
            (= :var (:op fnode)) (= "clojure.core" (:ns fnode)) (= "instance-check" (:name fnode))
            (= 2 (count arg-nodes)))
       (let [site (hoist-const-per-site "(jolt-instance-site-make)")]
+        (note-tail-call! tail?)
         (order-args (fn [as] (str "(jolt-instance-site " site " " (first as) " " (second as) ")"))))
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
@@ -3189,7 +3247,9 @@
       ;; a monomorphic site (a megamorphic receiver joins to :any, no :devirt-type).
       ;; The receiver is bound once — it feeds both the resolve and the application.
       (:devirt-type node)
-      (order-args (fn [as]
+      (do
+       (note-tail-call! tail?)
+       (order-args (fn [as]
                      (let [r (fresh-label "_r$")
                           ;; a site whose impl has a contagion clone resolves the clone
                           ;; (fl* + exact->inexact on the :num operand) instead of the
@@ -3216,7 +3276,7 @@
                                              " (let ((_f " dv ")) (set! " c " (cons jolt-proto-epoch _f)) _f))"))
                                       dv)]
                       (str "(let* ((" r " " (first as) ")) ("
-                           resolver " " (str/join " " (cons r (rest as))) "))"))))
+                           resolver " " (str/join " " (cons r (rest as))) "))")))))
       ;; polymorphic inline cache: a protocol call the inference recognized (:proto)
       ;; but could NOT prove monomorphic (no :devirt-type — a megamorphic / unknown
       ;; receiver). Emit a per-site cache keyed on the receiver's descriptor identity:
@@ -3228,7 +3288,9 @@
       ;; direct protocol-resolve (still the per-descriptor fast path) when not inside
       ;; a def. The receiver is bound once and feeds both the resolve and the apply.
       (:proto node)
-      (order-args (fn [as]
+      (do
+       (note-tail-call! tail?)
+       (order-args (fn [as]
                     (let [r (fresh-label "_r$")
                           d (fresh-label "_d$")
                           v (fresh-label "_v$")
@@ -3260,7 +3322,7 @@
                                  " (if " d " " miss " (protocol-resolve " proto " " method " " r ")))"
                                  " " apply-args "))")))
                         (str "(let* ((" r " " (first as) "))"
-                             " ((protocol-resolve " proto " " method " " r ") " apply-args "))")))))
+                             " ((protocol-resolve " proto " " method " " r ") " apply-args "))"))))))
       ;; a java.lang.Math call jolt.passes.numeric proved is over flonum operands:
       ;; emit the native Chez flonum op (flsqrt/flatan/…) instead of the generic
       ;; string-keyed host-static-call, and (via its :double result kind) keep the
@@ -3353,7 +3415,8 @@
         (cond
           dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
           idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
-          :else (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")")))))
+          :else (do (note-tail-call! tail?)
+                    (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")"))))))
       ;; bit-and/or/xor/not: open-code the fixnum case, helper as the slow arm.
       ;; These moved off the raw Chez bitwise primitives — which Chez inlines to
       ;; native code — onto jolt-bit-* helpers so a bad operand raises a CLASSED
@@ -3397,7 +3460,8 @@
       ;; no-default form (a declared field is always present, so a default is never
       ;; taken).
       (= kind :keyword)
-      (let [recv (first arg-nodes)
+      (let [_ (note-tail-call! tail?)
+            recv (first arg-nodes)
             idx (when (and (= :struct (:hint recv)) (= 1 (count arg-nodes)))
                   (struct-field-index (:shape recv) (:val fnode)))
             dir (when (and idx (not (:nilable recv)))
@@ -3419,12 +3483,14 @@
       ;; before the key/default args. A VECTOR literal invokes as nth (a bad
       ;; index throws, IPersistentVector.invoke); maps/sets invoke as get.
       (= kind :coll)
-      (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
+      (do
+       (note-tail-call! tail?)
+       (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
                     (fn [[c & as]]
                       (str (if (= :vector (:op fnode))
                              "(jolt-nth "
                              "(jolt-get ")
-                           c " " (str/join " " as) ")")))
+                           c " " (str/join " " as) ")"))))
       (and (stdlib-var? fnode) (not (prelude-mode?)))
       (throw (ex-info (str "emit: unsupported stdlib fn `" (:ns fnode) "/" (:name fnode)
                            "` (no core on Chez yet)") {}))
@@ -3434,7 +3500,7 @@
       ;; instead of three string-keyed lookups and a rest list. Gated like the
       ;; instance? site, so the seed mint stays byte-identical.
       (= :host-static (:op fnode))
-      (if (and *const-pool* (var-cache?))
+      (if (do (note-tail-call! tail?) (and *const-pool* (var-cache?)))
         (let [site (hoist-const-per-site "(host-static-site-make)")]
           (order-args (fn [as]
                         (str "((host-static-proc-site " site " " (chez-str-lit (:class fnode)) " "
@@ -4011,6 +4077,7 @@
      :host-call (let [tail? *tail?*
                       sited? (and (trace-frames?) tail? *trace-site*)]
                  (binding [*tail?* false]
+                  (when sited? (note-tail-call! tail?))
                   (if sited?
                     ;; A bare local or a constant runs no tail site, so it is
                     ;; spliced as it is; only an operand that can call is bound
@@ -4030,7 +4097,16 @@
                       (if (seq binds)
                         (str "(let* (" binds ") (jolt-site! " site ") " call ")")
                         (str "(begin (jolt-site! " site ") " call ")")))
-                    (host-call-emit node))))
+                    ;; A method a library type implements runs jolt code, so a
+                    ;; non-tail call restores the slot like any other
+                    ;; (returning-call?) -- unless the receiver is proven a
+                    ;; string, keyword or string builder, a host method.
+                    (let [call (host-call-emit node)]
+                      (note-tail-call! tail?)
+                      (if (and (trace-frames?) (not tail?)
+                               (not (contains? #{:str :kw :sb :sbuf} (:target-type node))))
+                        (str "(jolt-site-return " call ")")
+                        call)))))
     :let (emit-let node)
     :loop (emit-loop node)
     :recur (emit-recur node)

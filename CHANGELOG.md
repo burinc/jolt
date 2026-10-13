@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   twice as fast. The search pass itself dropped a closure per character, so a
   scan that finds nothing is ~25% faster too.
 
+- **A tail call that already returned is no longer a frame of a later throw.**
+  A tail call stores its site so a trace can name the frame it erased, and
+  nothing cleared it when the call returned. After `(f 1)` returned, where `f`
+  tail-calls anything, `(nth [] 3)` reported `f` as the frame it threw from,
+  and inside a fn the leftover could name any fn it had called. Traced code now
+  puts the site back when a non-tail call returns; a fn's calls to itself skip
+  that when nothing it tail-calls can run jolt code, so `fib` and `tak` cost
+  what they did. A throw's erased caller of a fn still running is also placed
+  below that fn, where it was the innermost frame.
+
 - **nREPL eval output, errors and traces match JVM nREPL.** The value was
   printed after the eval's `*out*` binding had ended, so what a lazy result
   printed while it was realized went to the server's stdout instead of the

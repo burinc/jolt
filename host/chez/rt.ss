@@ -1366,11 +1366,11 @@
 (define (jolt-trace-enable!) (set! jolt-trace-on? #t))
 
 ;; TAIL call emissions store their static ('ns/fn' . line) pair here right
-;; before the call (sited-tail-call / the :throw case). Since R2 (bead
-;; jolt-knn8) NOTHING else writes it — non-tail code carries no per-call
-;; instrumentation — so the live slot can hold a returned chain's residue.
-;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
-;; reporter validates it against the callsite table before splicing.
+;; before the call (sited-tail-call / the :throw case), and a non-tail call puts
+;; it back when it returns (jolt-site-return below), so a pair in the slot is a
+;; tail call whose chain is still running. Consumers read the THROW-TIME snapshot
+;; (jolt-throw-sitep), and the reporter still validates it against the callsite
+;; table before splicing: code compiled untraced (the seed) restores nothing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
 ;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
 ;; when one starts is a returned call's residue — the reporter's validator cannot
@@ -1379,6 +1379,17 @@
 ;; slot when a form starts to compile and again when its compiled code starts to
 ;; run, since macroexpansion runs user code in between.
 (define (jolt-site-reset!) (set-virtual-register! jolt-vreg-site 0))
+;; Traced code wraps a NON-tail call in this (backend_scheme emit-call): the slot
+;; goes back to what it held before the call when the call returns. The tail
+;; sites that ran inside the call stored pairs for frames that are gone once it
+;; returns, and a pair left behind was reported as the innermost frame of the
+;; next throw from host code. Put back rather than cleared: the slot may hold a
+;; genuine pair from below the call (the running fn's own erased caller). The
+;; literal 2 is jolt-vreg-site, spelled out so the read and write compile to a
+;; load and a store.
+(define-syntax jolt-site-return
+  (syntax-rules ()
+    ((_ e) (let ((s (virtual-register 2))) (let ((v e)) (set-virtual-register! 2 s) v)))))
 ;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
 ;; catch-line snapshot when a handler is running, else the raise-time stash.
 ;; #f when unset. The reporter must validate this against the callsite table
