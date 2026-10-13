@@ -26,12 +26,31 @@
 (load "host/chez/scheme-adapter-runtime.ss")  ; before rt.ss: macros + top-levels in rt.ss/java/*.ss call sa-*
 (load "host/chez/rt.ss")
 (set-chez-ns! "clojure.core")
-(load bs-seed-prelude)
+;; The vars each seed load defines, as "ns/name" keys: the walk below must not
+;; see one before it reaches that var's def (host-contract.ss hc-mint-unwalked).
+;; A var already defined going in is the host's, and stays visible throughout.
+(define (bs-defined-keys)
+  (let ((t (make-hashtable string-hash string=?)))
+    (vector-for-each
+      (lambda (c)
+        (when (var-cell-defined? c)
+          (hashtable-set! t (string-append (var-cell-ns c) "/" (var-cell-name c)) #t)))
+      (var-table-cells))
+    t))
+(define bs-seed-defined (make-hashtable string-hash string=?))
+(define (bs-load-seed! file)
+  (let ((before (bs-defined-keys)))
+    (load file)
+    (vector-for-each
+      (lambda (k) (unless (hashtable-contains? before k)
+                    (hashtable-set! bs-seed-defined k #t)))
+      (hashtable-keys (bs-defined-keys)))))
+(bs-load-seed! bs-seed-prelude)
 (load "host/chez/post-prelude.ss")
 (load "host/chez/post-prelude-str.ss")
 (set-chez-ns! "user")
 (load "host/chez/host-contract.ss")
-(load bs-seed-image)
+(bs-load-seed! bs-seed-image)
 (load "host/chez/compile-eval.ss")
 (load "host/chez/emit-image.ss")
 ;; Mint DIRECT-LINKED: a core def binds jv$<fqn> and a core->core call applies
@@ -52,6 +71,7 @@
 ;; still boots; ei-skipped-count records how many, and the summary line lets
 ;; remint.sh fail the fixpoint pass on a nonzero count.
 (ei-reset-skipped!)
+(hc-mint-gate! bs-seed-defined)
 (let ((p (open-output-file bs-out-prelude 'replace)))
   (put-string p (jolt-emit-prelude)) (close-port p))
 (let ((p (open-output-file bs-out-image 'replace)))

@@ -23,19 +23,28 @@ while [ "$i" -lt 8 ]; do
   # an older seed may skip a form that a later pass, off the rebuilt seed, emits).
   # a bootstrap failure must leave its error readable: the temp dir dies with
   # the trap, so surface stderr before set -e aborts the loop
-  if ! "$CHEZ" --script host/chez/bootstrap.ss \
+  # JOLT_MINT_DEBUG puts each skipped form's reason in the log. A form a pass
+  # skips is missing from the seed the next pass runs, so when that form is part
+  # of the compiler, the pass that fails is a later one and its own error (an
+  # unbound jv$ name, say) points nowhere near the cause: show what the passes
+  # before it skipped, and why.
+  if ! JOLT_MINT_DEBUG=1 "$CHEZ" --script host/chez/bootstrap.ss \
       "$tmp/cur-p.ss" "$tmp/cur-i.ss" "$tmp/new-p.ss" "$tmp/new-i.ss" >/dev/null 2>"$tmp/err"; then
     echo "re-mint: bootstrap pass $i failed:" >&2
-    cat "$tmp/err" >&2
+    grep -v '^mint: ' "$tmp/err" >&2 || true
+    if [ -s "$tmp/skips" ]; then
+      echo "re-mint: forms the earlier passes skipped:" >&2
+      cat "$tmp/skips" >&2
+    fi
     exit 1
   fi
+  grep '^mint: .* raised: ' "$tmp/err" | sed "s/^/pass $i: /" >>"$tmp/skips" || true
   if diff -q "$tmp/cur-p.ss" "$tmp/new-p.ss" >/dev/null \
      && diff -q "$tmp/cur-i.ss" "$tmp/new-i.ss" >/dev/null; then
     skipped=$(sed -n 's/^mint: \([0-9][0-9]*\) form(s) skipped$/\1/p' "$tmp/err" | tail -1)
     if [ -n "$skipped" ] && [ "$skipped" -ne 0 ]; then
       echo "re-mint: $skipped form(s) failed to compile in the fixpoint pass:" >&2
-      grep '^mint: skipped ' "$tmp/err" >&2
-      echo "re-mint: JOLT_MINT_DEBUG=1 chez --script host/chez/bootstrap.ss <seed…> prints why" >&2
+      grep '^mint: .* raised: ' "$tmp/err" >&2
       exit 1
     fi
     cp "$tmp/new-p.ss" host/chez/seed/prelude.ss

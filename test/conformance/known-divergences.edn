@@ -1531,6 +1531,19 @@
            :jvm "\"Syntax error compiling at (REPL:1:1).\\nUnable to resolve symbol: zzz in this context\\n\""
            :jolt "\"Syntax error (ExceptionInfo) compiling at (REPL:1:1).\\nUnable to resolve symbol: zzz in this context\\n\""}
    :note "The phase, position and message agree. A diagnostic that keeps a JVM class keeps it here too (a NumberFormatException out of the reader, an IllegalArgumentException for a duplicate map key). Positions come from the reader's LIST forms: a bare top-level symbol (load-string \"zzz\") has none here and reports (REPL:1), where the reference's compiler takes 1:1 off its reader's cursor."}
+  ;; The reference decides at COMPILE time whether a var read can see a binding:
+  ;; Compiler.VarExpr reads the root when the var is not dynamic at the moment the
+  ;; reading fn compiles. So a fn compiled between (declare x) and
+  ;; (def ^:dynamic x …) reads the root forever, even inside its own binding of x.
+  ;; jolt checks the var's binding frame at the read, so it sees the binding.
+  {:category :impl-detail
+   :behavior "(declare x) (defn f [] (binding [x 2] x)) (def ^:dynamic x 1) (f)"
+   :jvm "1 — f was compiled while x was not dynamic, so its read of x is a root read"
+   :jolt "2 — the read sees the binding f pushed"
+   :check {:expr "(do (declare dkd-x) (defn dkd-f [] (binding [dkd-x 2] dkd-x)) (def ^:dynamic dkd-x 1) [(dkd-f) dkd-x])"
+           :jvm "[1 1]"
+           :jolt "[2 1]"}
+   :note "Declaring the var ^:dynamic, as portable code has to for the binding to mean anything, agrees on both: [2 1]."}
   ;; A macro called with the wrong number of arguments. The reference's
   ;; macroexpand1 catches the ArityException its expander raised and rethrows it
   ;; BARE (to take the &form and &env params back out of the count), so it

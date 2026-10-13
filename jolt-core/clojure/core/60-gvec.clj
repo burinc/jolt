@@ -144,7 +144,7 @@ Object
         hash)))
   (equals [this other]
     (cond (identical? this other) true
-          (or (instance? Sequential other) (instance? List other))
+          (or (instance? clojure.lang.Sequential other) (instance? List other))
           (loop [s this
                  os (seq other)]
             (if (nil? s)

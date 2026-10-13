@@ -92,6 +92,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructors, `make-array` and `jolt.ffi/read-array` raised a
   `ClassCastException` carrying Chez's "make-flvector: -1 is not a valid
   flvector length" (or the fxvector, bytevector or vector constructor's).
+
+- **The seed mint refuses a reference above its def.** `make remint` compiles
+  each source form in a process that already holds the previous seed, so a
+  `(binding [*x* …])` above `(def ^:dynamic *x* …)` failed on the first pass
+  only, then compiled against the old seed's `*x*` from the second pass on. The
+  fixpoint converged on code an in-order load rejects (the JVM's "Unable to
+  resolve var"), and when the skipped form was part of the compiler, the next
+  pass ran a compiler missing it and failed somewhere unrelated
+  (`jv$clojure.core/make-hierarchy is not bound`). The mint now hides each var
+  the seed defines until the walk reaches its def or `declare`, so the form is
+  refused on every pass with the JVM's message; a qualified reference is
+  refused as "No such var" rather than compiled as a host static call. The
+  compiler image is now walked in dependency order (the back end after the
+  passes it requires), and the forward references this turned up in
+  `clojure.core`, `clojure.pprint` and the back end are declared or reordered.
+  `remint` reports why each form was skipped, including what earlier passes
+  skipped when a later one fails. Macro bodies are exempt: they run only once
+  every tier has loaded. User code was already strict: binding an unresolvable
+  name is a compile error and a non-dynamic var is refused at runtime, as on
+  the JVM.
+
+- **Source mode no longer segfaults at load on Windows (#1337).** Finding where
+  a flonum's bits sit in the object (for `Math/cbrt`'s high-word reads) probed
+  2.5 upward from its tagged pointer, and every probe below the payload read
+  the bytes in front of the flonum. When 2.5 was the first object in a fresh
+  segment those bytes were unmapped, and a MinGW `scheme.exe`, which has no
+  handler for the fault, died with exit 139. Which object lands there depends
+  on everything allocated before it, so it showed up as
+  `scheme.exe --script host/chez/cli.ss ... > f 2>&1` crashing every time
+  while other redirections worked. The probe now counts down from above the
+  payload and never leaves the object.
+
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search

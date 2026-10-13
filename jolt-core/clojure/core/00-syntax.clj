@@ -206,6 +206,8 @@
 ;; let/loop/fn, so expanding its own body can't recurse back into destructure.
 ;; Note map? is true for symbol structs too, so the symbol? clause must come first.
 ;; def+fn* (not defn) because the defn macro is not defined until later in the tier.
+;; pr-str (20-coll) builds its error messages.
+(declare pr-str)
 (def destructure
  (fn* destructure [bindings]
   (let* [amp? (fn* [x] (and (symbol? x) (= "&" (name x))))
