@@ -2567,7 +2567,8 @@
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}
   ;; binding resolves each name through (var sym) at compile time, as the JVM's
-  ;; binding macro does: a name with no var is the compile error, naming it, and
+  ;; binding macro does: a name with no var is the compile error, naming it (the
+  ;; JVM's message, which there is the cause of a CompilerException), and
   ;; one defined only below the form is the same error, whether the binding is
   ;; at the top level or in a fn body compiled before the def runs. A non-dynamic
   ;; var compiles and is refused when the frame is pushed.
@@ -2583,8 +2584,11 @@
   {:suite "vars / binding resolution" :label "a var defined below a fn body's binding is unresolved"
    :expr "[(try (eval '(do (defn bnd-fwd [] (binding [*bnd-fwd* 1] *bnd-fwd*)) (def ^:dynamic *bnd-fwd* 0))) (catch Throwable e (ex-message e))) (resolve '*bnd-fwd*)]"
    :expected "[\"Unable to resolve var: *bnd-fwd* in this context\" nil]"}
+  ;; Declared ^:dynamic, as the JVM needs it: after a plain (declare x) the JVM
+  ;; compiles the fn's read of x as a root read and answers [1 1]; jolt reads the
+  ;; binding (known-divergences.edn).
   {:suite "vars / binding resolution" :label "a declared var binds above its def"
-   :expr "(declare *bnd-decl*) (defn bnd-decl-f [] (binding [*bnd-decl* 2] *bnd-decl*)) (def ^:dynamic *bnd-decl* 1) [(bnd-decl-f) *bnd-decl*]"
+   :expr "(declare ^:dynamic *bnd-decl*) (defn bnd-decl-f [] (binding [*bnd-decl* 2] *bnd-decl*)) (def ^:dynamic *bnd-decl* 1) [(bnd-decl-f) *bnd-decl*]"
    :expected "[2 1]"}
   {:suite "resolution / strict default" :expr "(binding [*allow-unresolved-vars* false] *allow-unresolved-vars*)" :expected "false"}
   ;; clojure.core/*allow-unresolved-vars* is the var the analyzer reads, like
