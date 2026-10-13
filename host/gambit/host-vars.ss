@@ -119,29 +119,43 @@
 ;; ---- library shim hooks: real ----------------------------------------------
 ;; The underlying arm registries are all present in the portable runtime, so a
 ;; library that models its own host values works here unchanged.
+;;
+;; The seam fns run inside the host's =/hash/str of any value, so a tail call in
+;; one must not leave its site pair in the slot after it returns (Chez's
+;; host-static-classes.ss seam-invoke1/2, which this mirrors). This boot never
+;; enables tracing and renders no frames, so nothing stores or reads a pair
+;; today; the restore keeps the two hosts alike if that changes.
+(define (seam-invoke1 f x)
+  (let* ((s (virtual-register jolt-vreg-site)) (r (jolt-invoke f x)))
+    (set-virtual-register! jolt-vreg-site s)
+    r))
+(define (seam-invoke2 f a b)
+  (let* ((s (virtual-register jolt-vreg-site)) (r (jolt-invoke f a b)))
+    (set-virtual-register! jolt-vreg-site s)
+    r))
 
 (def-var! "clojure.core" "__register-eq!"
   (lambda (pred handler)
-    (register-eq-arm! (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
-                      (lambda (a b) (jolt-truthy? (jolt-invoke handler a b))))
+    (register-eq-arm! (lambda (a b) (jolt-truthy? (seam-invoke2 pred a b)))
+                      (lambda (a b) (jolt-truthy? (seam-invoke2 handler a b))))
     jolt-nil))
 
 (def-var! "clojure.core" "__register-hash!"
   (lambda (pred handler)
-    (register-hash-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                        (lambda (x) (jolt-invoke handler x)))
+    (register-hash-arm! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
+                        (lambda (x) (seam-invoke1 handler x)))
     jolt-nil))
 
 (def-var! "clojure.core" "__register-str!"
   (lambda (pred render)
-    (register-str-render! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                          (lambda (x) (jolt-invoke render x)))
+    (register-str-render! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
+                          (lambda (x) (seam-invoke1 render x)))
     jolt-nil))
 
 (def-var! "clojure.core" "__register-pr!"
   (lambda (pred render)
-    (register-pr-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                      (lambda (x) (jolt-invoke render x)))
+    (register-pr-arm! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
+                      (lambda (x) (seam-invoke1 render x)))
     jolt-nil))
 
 ;; The library seam for instance?, the same contract as Chez's
@@ -158,7 +172,7 @@
       (let loop ((fs user-instance-checks))
         (if (null? fs)
             'pass
-            (let ((r (jolt-invoke (car fs) tname val)))
+            (let ((r (seam-invoke2 (car fs) tname val)))
               (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
 (def-var! "clojure.core" "__register-instance-check!"
   (lambda (f)
