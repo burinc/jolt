@@ -38,6 +38,27 @@
 ;; --- #1108: every subprocess spawn --------------------------------------------
 (def echo-argv (if windows? ["cmd" "/c" "echo" "hi"] ["sh" "-c" "echo hi"]))
 
+;; FIRST, before anything else here spawns: the kernel32 entry points behind a
+;; spawn are resolved on first use, and that lookup marked itself done before it
+;; had an answer, so threads starting their first child together read #f and
+;; failed with "no Windows spawn path" (#1331). Only a process's first spawns can
+;; show it, which is why this row comes ahead of the others.
+(check "#1331 concurrent first spawns all start"
+       (let [n 8
+             go (promise)
+             ts (mapv (fn [_]
+                        (future
+                          @go
+                          (try
+                            (let [pr (.start (ProcessBuilder. echo-argv))]
+                              (slurp (.getInputStream pr))
+                              (.waitFor pr))
+                            (catch Throwable e (str e)))))
+                      (range n))]
+         (deliver go true)
+         (mapv deref ts))
+       (vec (repeat 8 0)))
+
 (check "#1108 ProcessBuilder reads the child's stdout"
        (let [pr (.start (ProcessBuilder. echo-argv))
              out (str/trim (slurp (.getInputStream pr)))]

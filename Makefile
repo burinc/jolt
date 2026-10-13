@@ -188,7 +188,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
-  systemstreams closedstdout userdirpaths utf8decode \
+  systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
@@ -1916,6 +1916,12 @@ systemstreams:
 # through $(CHEZ), so the windows-deps job runs it too.
 closedstdout:
 	@sh test/chez/closed-stdout-smoke.sh $(CHEZ)
+
+# stderr is its own descriptor when stdout and stderr are two files (#1331): the
+# Windows rows are the point, so it runs the CLI through $(CHEZ) and the
+# windows-deps job runs it too.
+stderrsplit:
+	@sh test/chez/stderr-split-smoke.sh $(CHEZ)
 
 # Relative paths under bin/jolt resolve against the caller's directory, not the
 # checkout the launcher cd's to: the jolt.host filesystem functions, load-file,
