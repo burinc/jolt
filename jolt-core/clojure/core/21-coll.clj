@@ -103,6 +103,7 @@
 
 ;; Canonical flatten via tree-seq: the leaves (non-sequential nodes) in order.
 ;; Flattens lists too (sequential?), matching Clojure/CLJS.
+(declare complement comp)
 (defn flatten [coll]
   (filter (complement sequential?) (rest (tree-seq sequential? seq coll))))
 
@@ -220,21 +221,21 @@
   (let [msg-of (fn [t] (or (ex-message t) (jolt.host/condition-message t)))
         ste-vec (fn [e] [(symbol (.getClassName e)) (symbol (.getMethodName e))
                          (.getFileName e) (.getLineNumber e)])
-        trace-of (fn [t] (if (instance? Throwable t) (.getStackTrace t) []))
+        trace-of (fn [t] (if (instance-check Throwable t) (.getStackTrace t) []))
         entry (fn [t]
                 (let [c (class t)
                       m {:type (symbol (if (string? c) c (.getName c)))
                          :message (msg-of t)}
-                      m (if-let [d (ex-data t)] (assoc m :data d) m)
+                      m (let [d (ex-data t)] (if d (assoc m :data d) m))
                       st (trace-of t)]
                   (if (pos? (count st)) (assoc m :at (ste-vec (first st))) m)))
         via (loop [acc [] t o]
               (if (some? t) (recur (conj acc t) (ex-cause t)) acc))
         root (peek via)
         m {:via (mapv entry via) :trace (mapv ste-vec (trace-of (or root o)))}
-        m (if-let [c (msg-of root)] (assoc m :cause c) m)
-        m (if-let [d (ex-data root)] (assoc m :data d) m)]
-    (if-let [phase (:clojure.error/phase (ex-data o))] (assoc m :phase phase) m)))
+        m (let [c (msg-of root)] (if c (assoc m :cause c) m))
+        m (let [d (ex-data root)] (if d (assoc m :data d) m))]
+    (let [phase (:clojure.error/phase (ex-data o))] (if phase (assoc m :phase phase) m))))
 
 ;; Clojure 1.11 map transformers. An empty-map base keeps insertion order;
 ;; transformed keys canonicalize via assoc (collisions: last entry in seq order

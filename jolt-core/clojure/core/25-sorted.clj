@@ -247,8 +247,8 @@
 ;; it, which is O(n) for a question the shape answers in O(log n) — 190ms against
 ;; the reference's 0.4us over 200k entries. Clojure reaches these through
 ;; PersistentTreeMap.min()/max(), which are exactly these two walks.
-(defn- nd-leftmost [n] (if-let [l (nd-left n)] (recur l) n))
-(defn- nd-rightmost [n] (if-let [r (nd-right n)] (recur r) n))
+(defn- nd-leftmost [n] (let [l (nd-left n)] (if l (recur l) n)))
+(defn- nd-rightmost [n] (let [r (nd-right n)] (if r (recur r) n)))
 
 ;; --- sorted-map ops ---------------------------------------------------------
 ;; a real map-entry (map-entry? true), so key/val/seq destructuring work like a
