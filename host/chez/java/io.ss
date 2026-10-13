@@ -917,10 +917,14 @@
 (define win32? (lambda () (eq? (sa-os-family) 'windows)))
 
 (define win32-loaded-libs '())
+;; Load first, mark after: marking first let a second thread skip the load and
+;; ask foreign-entry? before the library was there, then remember its #f (the
+;; #1331 race again, one level down). Two first callers may both load; a second
+;; load only puts the same handle on the lookup list again.
 (define (win32-load-lib! name)
   (unless (member name win32-loaded-libs)
-    (set! win32-loaded-libs (cons name win32-loaded-libs))
-    (guard (e (#t #f)) (sa-load-shared-object name))))
+    (guard (e (#t #f)) (sa-load-shared-object name))
+    (set! win32-loaded-libs (cons name win32-loaded-libs))))
 
 ;; A Win32 entry point, or #f: #f off Windows, #f when the library or the symbol
 ;; is missing. Resolved through sa-foreign-procedure-runtime for the reason

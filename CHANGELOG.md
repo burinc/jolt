@@ -97,9 +97,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Threads starting their first child processes together on Windows all
   start (#1331).** The kernel32 entry points behind a spawn are looked up on
-  first use, and the lookup marked itself done before it had an answer, so
-  the other threads read nothing there and failed with "ProcessBuilder: no
-  Windows spawn path". Six threads spawning at once lost five.
+  first use, and the lookup (and the kernel32 load under it) marked itself
+  done before it had an answer, so the other threads read nothing there and
+  failed with "ProcessBuilder: no Windows spawn path". Six threads spawning at
+  once lost five.
 
 - **`clojure.walk` hands `outer` a map entry, not a vector.** A map entry is
   also `vector?`, and `walk` met it in its vector branch, so `postwalk` rebuilt
