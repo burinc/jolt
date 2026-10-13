@@ -2766,8 +2766,8 @@
 
 ;; load-namespace: load `name`'s source once. Marked loaded BEFORE eval so a
 ;; dependency cycle terminates (Clojure's behavior). force? (a :reload of the
-;; named lib) bypasses the dedup for THIS load only; ldr-reload-all? bypasses it
-;; for this load and every nested one in its extent. On a throw the mark is rolled
+;; named lib) bypasses the dedup for THIS load only; ldr-reload-all? reloads each
+;; namespace once in its extent (ldr-begin-load!). On a throw the mark is rolled
 ;; back IF this call made it (a retry then loads) and the caller's ns is restored —
 ;; matching Clojure, which marks a lib loaded only after success.
 (define (load-namespace name) (load-namespace* name #f))
