@@ -5,8 +5,9 @@
 ;; answers — the same values, the same array class, a backing aset and aget
 ;; still work on — for every width, at an offset, at 0, 1 and past the 8192
 ;; elements where a large backing is pinned.
-;; Run: bin/jolt run test/chez/jolt-ffi-typed-array-test.clj (smoke.sh greps for
-;; "JOLT-FFI-TYPED-ARRAY-TEST OK").
+;; Run: bin/jolt run test/chez/jolt-ffi-typed-array-test.clj, or `make ffi`;
+;; exits nonzero on a failure, and smoke.sh greps for
+;; "JOLT-FFI-TYPED-ARRAY-TEST OK".
 (ns jolt-ffi-typed-array-test)
 
 (require '[jolt.ffi :as ffi])
@@ -14,12 +15,9 @@
 (def failures (atom []))
 
 (defmacro check-eq [label got want]
-  `(do
-     (print (str "  .. " ~label "\n"))
-     (flush)
-     (let [g# ~got w# ~want]
-       (when-not (= g# w#)
-         (swap! failures conj (str ~label ": want " (pr-str w#) " got " (pr-str g#)))))))
+  `(let [g# ~got w# ~want]
+     (when-not (= g# w#)
+       (swap! failures conj (str ~label ": want " (pr-str w#) " got " (pr-str g#))))))
 
 ;; Two NaNs are not =, so compare elements with NaN spelled as a keyword
 (defn- elems [arr] (mapv #(if (and (float? %) (Double/isNaN (double %))) :nan %) arr))
@@ -99,6 +97,20 @@
       (check-eq (str "read-array " t " of " n " matches the element loop")
                 (vec got) (vec (loop-read buf t n 0)))
       (check-eq (str "read-array " t " of " n " has alength " n) (alength got) n))))
+
+;; --- a negative count -----------------------------------------------------
+;; The JVM's NegativeArraySizeException, as (double-array -1) raises, and not a
+;; Scheme constructor's message.
+(defn- thrown [f]
+  (try (f) :no-throw
+       (catch Throwable e [(.getName (class e)) (ex-message e)])))
+(doseq [t [:double :float :int64 :int32 :int16 :uint8]]
+  (check-eq (str "read-array " t " of -1 throws NegativeArraySizeException")
+            (thrown #(ffi/read-array buf t -1))
+            ["java.lang.NegativeArraySizeException" "-1"]))
+(check-eq "read-array of -3 raw octets throws NegativeArraySizeException"
+          (thrown #(ffi/read-array buf -3))
+          ["java.lang.NegativeArraySizeException" "-3"])
 
 ;; --- the answer is an ordinary array afterwards ---------------------------
 (doseq [t [:double :float :int64 :int32 :int16]
@@ -219,6 +231,8 @@
 (ffi/free huge)
 
 (if (empty? @failures)
-  (println "JOLT-FFI-TYPED-ARRAY-TEST OK")
+  (do (println "JOLT-FFI-TYPED-ARRAY-TEST OK") (flush) (System/exit 0))
   (do (doseq [f @failures] (println "FAIL:" f))
-      (println "JOLT-FFI-TYPED-ARRAY-TEST FAILED:" (count @failures))))
+      (println "JOLT-FFI-TYPED-ARRAY-TEST FAILED:" (count @failures))
+      (flush)
+      (System/exit 1)))

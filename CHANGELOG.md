@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jolt.ffi/read-array` with a negative count throws
+  `NegativeArraySizeException`**, with the count as its message, as
+  `(double-array -1)` does on the JVM. It raised a `ClassCastException`
+  carrying Chez's "make-flvector: -1 is not a valid flvector length" (or
+  make-bytevector's, for the byte form).
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search

@@ -821,8 +821,13 @@
 ;; memory is unsigned octets and a byte-array element is a signed byte — the same
 ;; fold ja-bv->bytes! / ja-bytes->bv! (natives-array.ss) own for every other
 ;; raw-byte seam, and a straight block move now that both sides are bytevectors.
+;; A negative count is the JVM's NegativeArraySizeException, as (byte-array -1)
+;; is, rather than the bytevector constructor's own complaint.
+(define (ffi-check-array-count n)
+  (when (< n 0) (throw-jvm 'NegativeArraySizeException (number->string n))))
 (define (ffi-read-array ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)))
+  (let* ((n (jnum->exact n)) (p (jnum->exact ptr))
+         (bv (begin (ffi-check-array-count n) (make-bytevector n))))
     (sa-foreign-bytes-ref! p bv n)
     (na-bv->bytearray bv)))
 
@@ -940,7 +945,8 @@
   (let* ((ct (ffi-type->chez type)) (kind (ffi-typed-array-kind ct)))
     (and kind
          (let* ((n (jnum->exact n))
-                (arr (make-jolt-array (na-make-backing n kind (na-zero-of kind)) kind)))
+                (arr (begin (ffi-check-array-count n)
+                            (make-jolt-array (na-make-backing n kind (na-zero-of kind)) kind))))
            (ffi-read-typed-chunks! ct (jnum->exact ptr) arr 0 n)
            arr))))
 
