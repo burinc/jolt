@@ -30,9 +30,12 @@ expect() {
   fi
 }
 
-# the marker file says how far the program got, whatever happened to its output
+# the marker file says how far the program got, whatever happened to its output.
+# jolt writes it, so under MSYS it needs the Windows spelling of the directory:
+# a native program reads /tmp/x as \tmp\x on the current drive.
+if command -v cygpath >/dev/null 2>&1; then jdir="$(cygpath -m "$dir")"; else jdir="$dir"; fi
 marker="$dir/marker"
-m() { printf '%s' "$marker" | sed 's/\\/\\\\/g'; }
+m() { printf '%s' "$jdir/marker"; }
 
 # --- stdout: the reader leaves after the first line ---------------------------
 rm -f "$marker"
@@ -76,7 +79,7 @@ jolt '(println "o1") (binding [*out* *err*] (println "e1")) (println "o2") (.pri
 expect "2>&1 into one file keeps the order" "$(tr -d '\r' < "$dir/both.txt")" "$(printf 'o1\ne1\no2\ne2\no3')"
 
 # --- print and flush with no newline still reach a file ----------------------
-jolt '(print "no-newline") (flush) (Thread/sleep 100) (spit "'"$(m)"'" (slurp "'"$(printf '%s' "$dir/flush.txt" | sed 's/\\/\\\\/g')"'"))' >"$dir/flush.txt"
+jolt '(print "no-newline") (flush) (Thread/sleep 100) (spit "'"$(m)"'" (slurp "'"$jdir/flush.txt"'"))' >"$dir/flush.txt"
 expect "flush delivers a partial line" "$(cat "$marker")" "no-newline"
 
 [ "$fails" -eq 0 ] && echo "closed-stdout smoke: ok"
