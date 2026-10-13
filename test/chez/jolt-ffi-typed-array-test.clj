@@ -1,5 +1,6 @@
 ;; jolt.ffi typed array moves — read-array / write-array / read-into! with a
-;; type wider than a byte. The host block-copies the memory and decodes it into
+;; type wider than a byte, including either float type with either float array
+;; and a write of an array's first n elements. The host block-copies the memory and decodes it into
 ;; (or encodes it out of) the array's flvector or fxvector backing; the property
 ;; under test is that this answers exactly what the element loop it replaced
 ;; answers — the same values, the same array class, a backing aset and aget
@@ -229,8 +230,14 @@
 (check-eq "read-into! of a negative count throws"
           (thrown-data #(ffi/read-into! buf :double (double-array 2) 0 -1))
           {:offset 0 :length -1 :capacity 2})
-(check-eq "read-into! into the wrong kind of array throws, naming the type"
-          (thrown-data #(ffi/read-into! buf :double (float-array 2) 0 2))
+(check-eq "read-into! :int32 into a short-array throws, naming the type"
+          (thrown-data #(ffi/read-into! buf :int32 (short-array 2) 0 2))
+          {:type :int32})
+(check-eq "read-into! :int32 into a long-array throws: integers fill their own width"
+          (thrown-data #(ffi/read-into! buf :int32 (long-array 2) 0 2))
+          {:type :int32})
+(check-eq "read-into! :double into an int-array throws"
+          (thrown-data #(ffi/read-into! buf :double (int-array 2) 0 2))
           {:type :double})
 (check-eq "read-into! into a vector throws"
           (thrown-data #(ffi/read-into! buf :int32 [0 0] 0 2))
@@ -251,6 +258,93 @@
 (let [dst (byte-array 3)]
   (ffi/read-into! buf :uint8 dst 0 3)
   (check-eq "read-into! :uint8 is the byte form" (vec dst) [1 -1 3]))
+
+;; --- read-into!: either float type into either float array -----------------
+;; As write-array writes :float or :double from either: a :float widens exactly
+;; into a double-array, and a :double rounds to single into a float-array, the
+;; values (float x) and aset give.
+(def float-samples [0.0 -0.0 1.5 -2.5 0.1 1e300 -1e300 1e-300 3.4e38 1.4e-45
+                    Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN])
+(doseq [[t ctor] [[:float float-array] [:float double-array]
+                  [:double double-array] [:double float-array]]
+        off [0 2]]
+  (let [n (count float-samples)
+        _ (fill! t float-samples 0)
+        want (ctor (vec (ffi/read-array buf t n)))   ; what aset stores
+        dst (ctor (+ n off))]
+    (ffi/read-into! buf t dst off n)
+    (check-eq (str "read-into! " t " into a " (if (= ctor float-array) "float" "double")
+                   "-array from index " off " stores what aset stores")
+              (elems (drop off dst)) (elems want))))
+(check-eq "read-into! :double rounds into a float-array"
+          (do (fill! :double [0.1 1e300] 0)
+              (let [d (float-array 2)] (ffi/read-into! buf :double d 0 2) (vec d)))
+          [(float 0.1) Float/POSITIVE_INFINITY])
+(check-eq "read-into! :double into a float-array stores Floats"
+          (let [d (float-array 1)] (ffi/read-into! buf :double d 0 1) (class (aget d 0)))
+          Float)
+(check-eq "read-into! :float widens exactly into a double-array"
+          (do (fill! :float [0.1] 0)
+              (let [d (double-array 1)] (ffi/read-into! buf :float d 0 1) (vec d)))
+          [(double (float 0.1))])
+(check-eq "read-into! :float into a double-array stores Doubles"
+          (let [d (double-array 1)] (ffi/read-into! buf :float d 0 1) (class (aget d 0)))
+          Double)
+
+;; --- write-array: the first n elements ------------------------------------
+;; A staging array sized for the largest batch, written part full. The bytes on
+;; either side of what was written are left as they were.
+(def sentinel (byte-array (repeat 96 -86)))   ; 0xaa in every octet
+(defn- octets [p k] (vec (ffi/read-array p k)))
+(defn- staged [t arr off n]
+  (ffi/write-array buf sentinel)
+  [(ffi/write-array buf t arr off n) (octets buf 96)])
+(let [[got bytes] (staged :double (double-array [1.5 2.5 3.5 4.5 5.5]) 8 3)]
+  (check-eq "write-array of the first 3 doubles answers 3" got 3)
+  (check-eq "write-array of the first 3 doubles leaves the bytes before the offset"
+            (subvec bytes 0 8) (vec (repeat 8 -86)))
+  (check-eq "write-array of the first 3 doubles writes exactly them"
+            (vec (ffi/read-array buf :double 3 8)) [1.5 2.5 3.5])
+  (check-eq "write-array of the first 3 doubles leaves the bytes after them"
+            (subvec bytes 32 96) (vec (repeat 64 -86))))
+(doseq [[t ctor width vs] [[:float double-array 4 [0.1 2.5 -3.5]]
+                           [:float float-array 4 [0.1 2.5 -3.5]]
+                           [:double float-array 8 [0.5 2.5 -3.5]]
+                           [:int32 int-array 4 [7 -8 9]]
+                           [:int16 short-array 2 [7 -8 9]]
+                           [:int64 long-array 8 [7 -8 9]]]]
+  (let [arr (ctor vs)
+        [_ bytes] (staged t arr 0 2)
+        whole (do (ffi/write-array buf sentinel) (ffi/write-array buf t arr) (octets buf 96))]
+    (check-eq (str "write-array " t " of the first 2 writes what the whole write writes there")
+              (subvec bytes 0 (* 2 width)) (subvec whole 0 (* 2 width)))
+    (check-eq (str "write-array " t " of the first 2 leaves the third element's bytes")
+              (subvec bytes (* 2 width) 96) (vec (repeat (- 96 (* 2 width)) -86)))))
+(let [arr (double-array [1.0 2.0 3.0])]
+  (check-eq "write-array of 0 elements answers 0 and writes nothing"
+            (staged :double arr 0 0) [0 (vec (repeat 96 -86))])
+  (check-eq "write-array of every element is the whole write"
+            (second (staged :double arr 0 3))
+            (do (ffi/write-array buf sentinel) (ffi/write-array buf :double arr) (octets buf 96)))
+  (check-eq "write-array of one past the end throws, naming the count"
+            (thrown-data #(ffi/write-array buf :double arr 0 4)) {:length 4 :capacity 3})
+  (check-eq "write-array of a negative count throws"
+            (thrown-data #(ffi/write-array buf :double arr 0 -1)) {:length -1 :capacity 3})
+  (check-eq "a refused write-array writes nothing"
+            (do (ffi/write-array buf sentinel)
+                (try (ffi/write-array buf :double arr 0 4) (catch Throwable _ nil))
+                (octets buf 96))
+            (vec (repeat 96 -86)))
+  (check-eq "write-array with a count needs a type"
+            (thrown-data #(ffi/write-array buf arr 0 2 9)) {:second arr}))
+(check-eq "write-array of the first 2 of a vector takes the element loop"
+          (do (ffi/write-array buf sentinel) (ffi/write-array buf :int32 [7 8 9] 0 2)
+              [(vec (ffi/read-array buf :int32 2)) (subvec (octets buf 96) 8 12)])
+          [[7 8] [-86 -86 -86 -86]])
+(check-eq "write-array of the first 2 of a byte-array with a one-byte type"
+          (do (ffi/write-array buf sentinel) (ffi/write-array buf :uint8 (byte-array [1 2 3]) 4 2)
+              (subvec (octets buf 96) 3 7))
+          [-86 1 2 -86])
 
 ;; --- arrays widened before the copy ---------------------------------------
 ;; A long-array that has held a bignum, or an int-array that has held a
@@ -291,7 +385,14 @@
       (let [src (ctor (map #(if (#{:double :float} t) (* -0.25 %) (- (rem % 20000) 10000)) (range n)))]
         (ffi/write-array big t src off)
         (check-eq (str "write-array " t " of " n " at offset " off " crosses chunks intact")
-                  (= (vec (loop-read big t n off)) (vec src)) true)))))
+                  (= (vec (loop-read big t n off)) (vec src)) true)
+        ;; the first n-1001: ends mid-chunk, and the last 1001 keep their old values
+        (let [k (- n 1001)
+              before (vec (loop-read big t n off))
+              src2 (ctor (map #(if (#{:double :float} t) (* 0.5 %) (- (rem % 9000) 4500)) (range n)))]
+          (ffi/write-array big t src2 off k)
+          (check-eq (str "write-array " t " of the first " k " of " n " crosses chunks and stops there")
+                    (= (vec (loop-read big t n off)) (into (vec (take k src2)) (drop k before))) true))))))
 
 ;; A value past the fixnum range in a LATER chunk widens the array there, and
 ;; every element after it, in that chunk and the next, still lands.

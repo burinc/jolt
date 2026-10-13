@@ -918,12 +918,19 @@
                     (slow! ref width i)))))
           (slow! ref width 0)))
     (case ct
+      ;; into a float-array (read-into! fills either float kind) each double is
+      ;; rounded to single, as aset's flsingle rounds it
       ((double)
-       (if (flvector? v)
-           (do ((i 0 (fx+ i 1))) ((fx= i n))
-             (flvector-set! v (fx+ off i) (bytevector-ieee-double-native-ref bv (fx* i 8))))
-           (slow! bytevector-ieee-double-ref 8 0)))
-      ;; already single precision, widened to a flonum: what aset's flsingle stores
+       (cond
+         ((not (flvector? v)) (slow! bytevector-ieee-double-ref 8 0))
+         ((eq? (jolt-array-kind arr) 'float)
+          (do ((i 0 (fx+ i 1))) ((fx= i n))
+            (flvector-set! v (fx+ off i) (flsingle (bytevector-ieee-double-native-ref bv (fx* i 8))))))
+         (else
+          (do ((i 0 (fx+ i 1))) ((fx= i n))
+            (flvector-set! v (fx+ off i) (bytevector-ieee-double-native-ref bv (fx* i 8)))))))
+      ;; already single precision, widened to a flonum: what aset's flsingle
+      ;; stores into a float-array, and exact in a double-array
       ((float)
        (if (flvector? v)
            (do ((i 0 (fx+ i 1))) ((fx= i n))
@@ -958,16 +965,21 @@
 ;; (__read-into-typed! ptr type arr off n) -> n. The typed read-into!: n
 ;; elements at ptr into an EXISTING array from index off, so a loop that reads
 ;; the same buffer every frame refills one array instead of allocating one per
-;; read. The array must be the kind read-array answers for the type — a
-;; double-array for :double — since decoding doubles into a float-array would
-;; store values a float[] cannot hold. It is the one caller that can hand the
-;; decode an array widened before the copy began (a long-array that once held a
-;; bignum), which ffi-decode-into! stores through ja-set!.
+;; read. An integer type fills the array read-array answers for it, since a
+;; narrower one could not hold its values. :float and :double each fill either
+;; a float-array or a double-array, as write-array writes either type from
+;; either: a :float widens exactly into a double-array, and a :double rounds to
+;; single into a float-array, as aset rounds it. It is the one caller that can
+;; hand the decode an array widened before the copy began (a long-array that
+;; once held a bignum), which ffi-decode-into! stores through ja-set!.
 (define (ffi-read-into-typed! ptr type arr off n)
   (let* ((ct (ffi-type->chez type)) (kind (ffi-typed-array-kind ct))
          (n (jnum->exact n)) (off (jnum->exact off)))
-    (unless (and kind (jolt-array? arr) (eq? (jolt-array-kind arr) kind))
-      (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: the array is not the one read-array answers for the type"
+    (unless (and kind (jolt-array? arr)
+                 (let ((have (jolt-array-kind arr)))
+                   (or (eq? have kind)
+                       (and (memq kind '(double float)) (memq have '(double float))))))
+      (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: the array cannot hold elements of this type"
                                 (jolt-hash-map (jolt-keyword "type") type))))
     (let ((cap (ja-len arr)))
       (when (or (< off 0) (< n 0) (> (+ off n) cap))
@@ -978,18 +990,19 @@
     (ffi-read-typed-chunks! ct (jnum->exact ptr) arr off n)
     n))
 
-;; (__write-array-typed ptr type arr) -> the element count, or #f when arr is
+;; (__write-array-typed ptr type arr n) -> n, having written the first n
+;; elements of arr (the caller has checked n against its length), or #f when arr is
 ;; not a jolt array with an unboxed backing of the type's family (a vector, a
 ;; promoted long array, a double-array written as :int32), which the caller's
 ;; element loop handles as it always has. The BITS land as they are, as
 ;; write-array-element writes them: an integer keeps its low width*8 bits. The
 ;; 32-bit mask is a bitwise-and rather than an fxlogand: #xffffffff is not a
 ;; fixnum on a 32-bit Chez.
-(define (ffi-write-array-typed ptr type arr)
+(define (ffi-write-array-typed ptr type arr n)
   (and (jolt-array? arr)
-       (let* ((ct (ffi-type->chez type)) (v (jolt-array-vec arr)))
+       (let* ((ct (ffi-type->chez type)) (v (jolt-array-vec arr)) (n (jnum->exact n)))
          (define (emit! width put!)
-           (let* ((n (ja-len arr)) (p (jnum->exact ptr))
+           (let* ((p (jnum->exact ptr))
                   (per (fxquotient ffi-typed-chunk-bytes width))
                   (bv (make-bytevector (fx* (fxmin n per) width))))
              (let loop ((done 0))

@@ -28,11 +28,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   array from each `read-array`, garbage within the frame:
   `(ffi/read-into! p :double arr off n)` fills the `double-array` it is given
   from index `off` instead. For 6000 doubles a call allocates about 4 KB where
-  `read-array` allocates 52 KB, and takes 17 µs against 19. It fills the array
-  `read-array` answers for the type (`float-array`, `int-array`,
-  `short-array`, `long-array`); `off` and `n` count elements, and a range past
-  the end of the array, or an array of another kind, throws before anything
-  is written. The four-argument byte form is unchanged. Not on Gambit.
+  `read-array` allocates 52 KB, and takes 17 µs against 19. An integer type
+  fills the array `read-array` answers for it (`int-array` for `:int32`);
+  `:float` and `:double` each fill a `float-array` or a `double-array`, as
+  `write-array` writes either from either, so a program that keeps its data in
+  `double-array`s can read `:float` into them. A `:float` widens exactly, and
+  a `:double` rounds to single in a `float-array`, as `aset` rounds it. `off`
+  and `n` count elements, and a range past the end of the array, or an array
+  that cannot hold the type's elements, throws before anything is written.
+  The four-argument byte form is unchanged. Not on Gambit.
+- **`jolt.ffi/write-array` takes an element count.**
+  `(ffi/write-array p :float staging offset n)` writes only the first `n`
+  elements, so a staging array sized for the largest batch (instance
+  matrices, draw commands, audio samples) can be written part full without
+  first copying its used part into a right-sized array. A count outside
+  `0..(alength arr)` throws before anything is written.
 
 ### Changed
 

@@ -1197,15 +1197,22 @@
       (neg? v) (jolt.ffi/__write p (:signed-type carrier) v off)
       :else (jolt.ffi/__write p element v off))))
 
-(defn- write-array-typed [p t arr off]
-  (let [carrier (array-carrier t)]
+;; n is the count of leading elements to write, nil for all of them. It is
+;; checked here, before anything is written, so the host and the element loop
+;; both see a count within the array.
+(defn- write-array-typed [p t arr off n]
+  (let [carrier (array-carrier t)
+        cap (count arr)
+        n (if (nil? n) cap n)]
+    (when-not (and (number? n) (<= 0 n cap))
+      (throw (ex-info "jolt.ffi/write-array: count outside the array"
+                      {:length n :capacity cap})))
     (if (nil? (:ctor carrier))
-      (jolt.ffi/__write-array (+ p off) arr)
+      (jolt.ffi/__write-array (+ p off) arr 0 n)
       ;; The host's block encode takes the :read-type too: it picks the width
       ;; and the family, and the encode keeps the low bits whatever the sign.
-      (or (jolt.ffi/__write-array-typed (+ p off) (:read-type carrier) arr)
-          (let [width (:width carrier)
-                n (count arr)]
+      (or (jolt.ffi/__write-array-typed (+ p off) (:read-type carrier) arr n)
+          (let [width (:width carrier)]
             (dotimes [i n]
               (write-array-element p carrier (nth arr i) (+ off (* i width))))
             n)))))
@@ -1231,22 +1238,34 @@
 
       (write-array p arr)          ; every octet of a byte-array (jolt's form)
       (write-array p arr off n)    ; n octets of it, from index off
-      (write-array p t arr)        ; arr's elements as type t
-      (write-array p t arr offset) ; the same, starting `offset` bytes in
+      (write-array p t arr)          ; arr's elements as type t
+      (write-array p t arr offset)   ; the same, starting `offset` bytes in
+      (write-array p t arr offset n) ; only arr's first n elements
 
-  The array must be the one for the type's width, as read-array answers it. A
-  value wider than its element truncates to the element, since the copy carries
-  bits and not a range."
+  The array must be the one for the type's width, as read-array answers it,
+  except that :float and :double each write from a float-array or a
+  double-array. A value wider than its element truncates to the element, since
+  the copy carries bits and not a range.
+
+  n lets a staging array sized for the largest batch be written part full,
+  without first copying its used prefix into a right-sized array. A count
+  outside 0..(alength arr) throws before anything is written. In the byte form
+  off is an index into arr; in the typed forms offset is a byte offset into p."
   ([p arr] (jolt.ffi/__write-array p arr))
   ([p a b]
    (if (keyword? a)
-     (write-array-typed p a b 0)
+     (write-array-typed p a b 0 nil)
      (throw (ex-info "jolt.ffi/write-array: expected (write-array p t arr) or (write-array p arr off n)"
                      {:second a}))))
   ([p a b c]
    (if (keyword? a)
-     (write-array-typed p a b c)
-     (jolt.ffi/__write-array p a b c))))
+     (write-array-typed p a b c nil)
+     (jolt.ffi/__write-array p a b c)))
+  ([p t arr off n]
+   (if (keyword? t)
+     (write-array-typed p t arr off n)
+     (throw (ex-info "jolt.ffi/write-array: expected (write-array p t arr offset n)"
+                     {:second t})))))
 
 (defn read-into!
   "Copy elements out of foreign memory into an EXISTING jolt array; answers n.
@@ -1254,11 +1273,13 @@
       (read-into! p arr off n)     ; n raw octets into a byte-array from index off
       (read-into! p t arr off n)   ; n elements of type t into arr from index off
 
-  The typed form fills the array read-array answers for t — a double-array for
-  :double, an int-array for :int32 — so a loop that reads the same buffer every
-  frame refills one array rather than allocating one per read. off and n count
-  ELEMENTS of arr. A range past the end of arr, or an array of another kind,
-  throws rather than writing out of bounds."
+  The typed form fills the array read-array answers for t — an int-array for
+  :int32 — so a loop that reads the same buffer every frame refills one array
+  rather than allocating one per read. :float and :double each fill a
+  float-array or a double-array: a :float widens exactly into a double-array,
+  and a :double rounds to single into a float-array, as aset rounds it. off and
+  n count ELEMENTS of arr. A range past the end of arr, or an array that cannot
+  hold the type's elements, throws before anything is written."
   ([p arr off n] (jolt.ffi/__read-into! p arr off n))
   ([p t arr off n]
    (let [carrier (array-carrier t)]
