@@ -53,6 +53,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Source mode no longer segfaults at load on Windows (#1337).** Finding where
+  a flonum's bits sit in the object (for `Math/cbrt`'s high-word reads) probed
+  2.5 upward from its tagged pointer, and every probe below the payload read
+  the bytes in front of the flonum. When 2.5 was the first object in a fresh
+  segment those bytes were unmapped, and a MinGW `scheme.exe`, which has no
+  handler for the fault, died with exit 139. Which object lands there depends
+  on everything allocated before it, so it showed up as
+  `scheme.exe --script host/chez/cli.ss ... > f 2>&1` crashing every time
+  while other redirections worked. The probe now counts down from above the
+  payload and never leaves the object.
+
 - **`(require 'x :reload-all)` reloads each namespace once, into its own
   namespace.** It turned the loaded-namespace check off for its whole extent,
   so a shared dependency reloaded again at every place it was required and the
