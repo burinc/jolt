@@ -249,6 +249,8 @@
 ;; (rest list), (seq coll), (map …) are seqs but not lists. Not extended like
 ;; map?/set?/seq?, so it migrates cleanly.
 (defn list? [x] (if (jolt.host/list? x) true false))
+;; int? (22-coll), counted? (below) and interpose (40-lazy) are defined later.
+(declare int? counted? interpose)
 (defn nat-int? [x] (and (int? x) (>= x 0)))
 (defn neg-int? [x] (and (int? x) (neg? x)))
 (defn pos-int? [x] (and (int? x) (pos? x)))

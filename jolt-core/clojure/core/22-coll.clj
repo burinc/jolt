@@ -1,5 +1,5 @@
 ;; clojure.core — collection tier, part 3 (canonical Clojure ports: find,
-;; merge-with, memoize, get-in/assoc-in/update-in, comp, transduce/into/eduction,
+;; merge-with, memoize, get-in/assoc-in/update-in, comp, transduce/into,
 ;; and the JVM-shape stubs). Continues 21-coll.clj; same constraints.
 ;; (key/val/group-by/frequencies live in 20-coll.clj.)
 
@@ -33,7 +33,7 @@
       (when (contains? m k) (jolt.host/map-entry k (get m k))))
     ;; a java.util.Map has no Clojure key object to preserve, and neither does a
     ;; transient (the JVM's TransientHashMap.entryAt mints from the probe key too)
-    (or (instance? java.util.Map m) (jolt.host/transient-associative? m))
+    (or (instance-check java.util.Map m) (jolt.host/transient-associative? m))
     (when (contains? m k) (jolt.host/map-entry k (get m k)))
     :else (throw (jolt.host/throwable
                   "java.lang.IllegalArgumentException"
@@ -323,7 +323,7 @@
 ;; unchecked-float rounds to single precision (flsingle) in converters.ss.
 (defn unchecked-double [x] (double x))
 
-;; --- transduce / into / eduction ---------------------------------------------
+;; --- transduce / into ---------------------------------------------------------
 ;; Canonical transduce: build the stacked rf once, reduce (which honors
 ;; `reduced` and steps lazy seqs incrementally), then run the completion arity.
 (defn transduce
@@ -334,32 +334,6 @@
 
 ;; into stays a host primitive: it's perf-wall hot (the into-vec bench pays ~11%
 ;; through the overlay call layers — same lesson as even?/odd?).
-
-;; Eduction — a REDUCIBLE and seqable view applying xform to coll, matching
-;; clojure.core.Eduction. Reducing one drives the transducer straight into the
-;; accumulator (the IReduceInit path, which jolt-reduce honors via iface-method)
-;; with no seq cells — which is why (reduce f init (eduction …)) beats the
-;; equivalent transduce; seq realizes lazily through `sequence`, so an infinite
-;; or expensive source is not forced.
-;;
-;; It was previously just (sequence xform coll) — a plain lazy seq — so reduce
-;; allocated a cell per element and walked it: 152ms where transduce over the
-;; same xform and source took 58ms, against the JVM's 9.2ms.
-;;
-;; Interfaces follow the JVM: Sequential (so sequential? is true) but NOT
-;; IPersistentCollection (coll? false) and NOT ISeq (seq? false), and count
-;; throws — the value is reducible and seqable, not counted.
-(deftype Eduction [xform coll]
-  clojure.lang.IReduceInit
-  (reduce [_ f init] (transduce xform (completing f) init coll))
-  clojure.lang.Sequential
-  clojure.lang.Seqable
-  (seq [_] (seq (sequence xform coll)))
-  (count [_] (throw (UnsupportedOperationException.
-                     "count not supported on this type: Eduction"))))
-
-(defn eduction [& args]
-  (->Eduction (apply comp (butlast args)) (last args)))
 
 ;; --- JVM-shape stubs and trivial shells --------------------------------------
 ;; Pure compositions or documented jolt stubs; the host keeps nothing.

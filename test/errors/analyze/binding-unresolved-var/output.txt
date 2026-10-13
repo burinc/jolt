@@ -1,0 +1,4 @@
+error[analyze/unresolved-var]: Unable to resolve var: *undefined-thing* in this context
+  --> 1:1
+   = note: raised while expanding the `binding` macro
+exit: 1
