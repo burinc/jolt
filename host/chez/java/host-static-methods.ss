@@ -126,13 +126,23 @@
           jolt-nil))))
 
 ;; Thread.sleep(millis, nanos): the nanos are part of the sleep, not ignored.
+;; Both are longs to the JVM (truncated here), and its argument checks come first:
+;; a negative millis, or nanos outside 0..999999, is IllegalArgumentException.
+(define (thread-sleep-millis-arg ms)
+  (let ((ms (jnum->exact ms)))
+    (when (negative? ms)
+      (throw-jvm (quote IllegalArgumentException) "timeout value is negative"))
+    ms))
 (define (jolt-thread-sleep-ms+ns ms ns)
-  (jolt-thread-sleep-ms (+ (jnum->exact ms) (/ (jnum->exact ns) 1000000))))
+  (let ((ms (thread-sleep-millis-arg ms)) (ns (jnum->exact ns)))
+    (when (or (negative? ns) (> ns 999999))
+      (throw-jvm (quote IllegalArgumentException) "nanosecond timeout value out of range"))
+    (jolt-thread-sleep-ms (+ ms (/ ns 1000000)))))
 
 (define thread-statics
   (list (cons "sleep" (case-lambda
-                        ((ms) (jolt-thread-sleep-ms (jolt-need-num ms)))
-                        ((ms ns) (jolt-thread-sleep-ms+ns (jolt-need-num ms) (jolt-need-num ns)))))
+                        ((ms) (jolt-thread-sleep-ms (thread-sleep-millis-arg ms)))
+                        ((ms ns) (jolt-thread-sleep-ms+ns ms ns))))
         ;; a fiber yields to the other fibers on its carrier, as a virtual
         ;; thread yields its carrier; not while it holds a counted lock
         (cons "yield" (lambda _ (unless (jolt-fiber-wait-turn! 0) (thread-yield!)) jolt-nil))

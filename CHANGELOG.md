@@ -97,7 +97,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ~1.25ms on macOS (the OS's own wake latency), `(Thread/sleep 0 100000)`
   ~0.13ms, and `(Thread/sleep 0)` yields, throwing first if the thread is
   interrupted, as the JDK's does. Other timed waits keep whole-millisecond
-  deadlines, rounded up, but no longer overshoot them.
+  deadlines, rounded up, but no longer overshoot them. `Thread/sleep` also
+  refuses a negative timeout and nanos outside 0..999999 with
+  IllegalArgumentException, as the JDK does, and `TimeUnit.sleep` of zero or
+  less returns at once without checking the interrupt flag.
 
 - **`clojure.walk` hands `outer` a map entry, not a vector.** A map entry is
   also `vector?`, and `walk` met it in its vector branch, so `postwalk` rebuilt
