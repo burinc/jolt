@@ -57,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arena-first one; a pointer and an arena differ in type, so neither order can
   be read as the other.
 
+- **`jolt.deps/resolve-deps` takes `:jvm-deps? true`.** A Maven jar with no
+  Clojure source has always been a leaf: it stays on the roots, but the
+  dependencies its POM declares are left alone, since jolt can't run them. A
+  caller that runs JVM bytecode itself can now ask for those dependencies too.
+  With the option, such a jar's POM is walked the same way a Clojure jar's is,
+  so compile and runtime scope only, optional deps skipped, exclusions
+  honoured. Without it nothing changes. A nested `resolve-deps` that doesn't
+  pass the key inherits the outer value.
+
 ### Changed
 
 - **nREPL eval no longer accepts undefined names; use `declare`.** It bound
