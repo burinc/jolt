@@ -234,7 +234,8 @@
       (layout d) on a runtime value has nothing to compile. The same holds for
       the [:union ...] descriptor, which is otherwise babashka.ffi's.
     - read-array and write-array copy every scalar width as a block move, into
-      a jolt array of that width or out of one.
+      a jolt array of that width or out of one, and read-into! takes a type to
+      fill an existing typed array the same way.
     - jolt adds: (alloc n) with no arena, the with-* scoped helpers, arena?,
       arena-open?, close-arena, drain-auto-arenas!, layout-size,
       layout-alignment, field-offset, read-field, write-field, :varargs (a
@@ -283,9 +284,9 @@
 
 ;; The primitives this namespace is built over are the host's, reached by their
 ;; reserved __ names: alloc, read, write, sizeof, string->ptr, copy, read-array,
-;; write-array, read-bytes and write-bytes are all DEFINED here, over the host
-;; functions of the same name, so each needs a name its own definition has not
-;; taken.
+;; write-array, read-into!, read-bytes and write-bytes are all DEFINED here, over
+;; the host functions of the same name, so each needs a name its own definition
+;; has not taken.
 ;;
 ;; They are called rather than captured into locals. A jolt host with no FFI
 ;; layer has none of them, and a top-level capture would then fail to LOAD this
@@ -1246,6 +1247,24 @@
    (if (keyword? a)
      (write-array-typed p a b c)
      (jolt.ffi/__write-array p a b c))))
+
+(defn read-into!
+  "Copy elements out of foreign memory into an EXISTING jolt array; answers n.
+
+      (read-into! p arr off n)     ; n raw octets into a byte-array from index off
+      (read-into! p t arr off n)   ; n elements of type t into arr from index off
+
+  The typed form fills the array read-array answers for t — a double-array for
+  :double, an int-array for :int32 — so a loop that reads the same buffer every
+  frame refills one array rather than allocating one per read. off and n count
+  ELEMENTS of arr. A range past the end of arr, or an array of another kind,
+  throws rather than writing out of bounds."
+  ([p arr off n] (jolt.ffi/__read-into! p arr off n))
+  ([p t arr off n]
+   (let [carrier (array-carrier t)]
+     (if (nil? (:ctor carrier))
+       (jolt.ffi/__read-into! p arr off n)
+       (jolt.ffi/__read-into-typed! p (:read-type carrier) arr off n)))))
 
 (defn read-bytes
   "Decode n octets at pointer p as a string; answers that string.

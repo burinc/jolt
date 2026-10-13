@@ -871,9 +871,10 @@
 ;; taken.
 (def-var! "jolt.ffi" "__read-array" ffi-read-array)
 (def-var! "jolt.ffi" "__write-array" ffi-write-array)
+(def-var! "jolt.ffi" "__read-into!" ffi-read-into!)
 
 ;; --- typed array moves ------------------------------------------------------
-;; The wider widths of read-array / write-array: block copies
+;; The wider widths of read-array / write-array / read-into!: block copies
 ;; through a bytevector, decoded into (or encoded out of) the array's own
 ;; backing — an flvector for float/double, an fxvector for the integer types.
 ;; The per-element alternative, a foreign-ref with a type converted from its
@@ -886,9 +887,11 @@
 ;; The copy moves at most ffi-typed-chunk-bytes at a time through one reused
 ;; bytevector, so a large array costs its own backing and no more: a single
 ;; temporary the size of the whole block would double the peak of a 100MB read.
-;; The chunk is all a write-array allocates, and all a read allocates beyond
-;; its array, so it is kept to a page: 1KB, 4KB and 64KB chunks measure the
-;; same speed to within noise (6000 doubles in ~19us, a million in ~2.7ms).
+;; The chunk is all a read-into! or a write-array allocates, and all a
+;; read-array allocates beyond its array, so it is kept to a page: 1KB, 4KB and
+;; 64KB chunks measure the same speed to within noise (6000 doubles in ~19us, a
+;; million in ~2.7ms), and at 64KB a frame-sized read-into! of 6000 doubles
+;; allocated 48KB a call where it now takes 4KB.
 (define ffi-typed-chunk-bytes 4096)
 (define (ffi-typed-array-kind ct)
   (case ct
@@ -952,6 +955,29 @@
            (ffi-read-typed-chunks! ct (jnum->exact ptr) arr 0 n)
            arr))))
 
+;; (__read-into-typed! ptr type arr off n) -> n. The typed read-into!: n
+;; elements at ptr into an EXISTING array from index off, so a loop that reads
+;; the same buffer every frame refills one array instead of allocating one per
+;; read. The array must be the kind read-array answers for the type — a
+;; double-array for :double — since decoding doubles into a float-array would
+;; store values a float[] cannot hold. It is the one caller that can hand the
+;; decode an array widened before the copy began (a long-array that once held a
+;; bignum), which ffi-decode-into! stores through ja-set!.
+(define (ffi-read-into-typed! ptr type arr off n)
+  (let* ((ct (ffi-type->chez type)) (kind (ffi-typed-array-kind ct))
+         (n (jnum->exact n)) (off (jnum->exact off)))
+    (unless (and kind (jolt-array? arr) (eq? (jolt-array-kind arr) kind))
+      (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: the array is not the one read-array answers for the type"
+                                (jolt-hash-map (jolt-keyword "type") type))))
+    (let ((cap (ja-len arr)))
+      (when (or (< off 0) (< n 0) (> (+ off n) cap))
+        (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: range outside the array"
+                                  (jolt-hash-map (jolt-keyword "offset") off
+                                                 (jolt-keyword "length") n
+                                                 (jolt-keyword "capacity") cap)))))
+    (ffi-read-typed-chunks! ct (jnum->exact ptr) arr off n)
+    n))
+
 ;; (__write-array-typed ptr type arr) -> the element count, or #f when arr is
 ;; not a jolt array with an unboxed backing of the type's family (a vector, a
 ;; promoted long array, a double-array written as :int32), which the caller's
@@ -993,6 +1019,7 @@
                             (bytevector-u16-native-set! bv at (fxlogand (fxvector-ref v i) #xffff))))))
            (else #f)))))
 (def-var! "jolt.ffi" "__read-array-typed" ffi-read-array-typed)
+(def-var! "jolt.ffi" "__read-into-typed!" ffi-read-into-typed!)
 (def-var! "jolt.ffi" "__write-array-typed" ffi-write-array-typed)
 
 ;; --- string / bytevector marshaling ------------------------------------------

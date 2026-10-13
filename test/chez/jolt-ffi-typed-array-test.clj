@@ -1,5 +1,5 @@
-;; jolt.ffi typed array moves — read-array / write-array with a type wider
-;; than a byte. The host block-copies the memory and decodes it into
+;; jolt.ffi typed array moves — read-array / write-array / read-into! with a
+;; type wider than a byte. The host block-copies the memory and decodes it into
 ;; (or encodes it out of) the array's flvector or fxvector backing; the property
 ;; under test is that this answers exactly what the element loop it replaced
 ;; answers — the same values, the same array class, a backing aset and aget
@@ -177,6 +177,97 @@
             (vec (ffi/read-array buf :int64 2)))
           [Long/MAX_VALUE 2])
 
+;; --- read-into!: the typed form fills an existing array -------------------
+(fill! :double [1.5 2.5 3.5] 0)
+(let [dst (double-array [9.0 9.0 9.0 9.0 9.0])]
+  (check-eq "read-into! :double answers n" (ffi/read-into! buf :double dst 1 3) 3)
+  (check-eq "read-into! :double fills from the index, nothing else"
+            (vec dst) [9.0 1.5 2.5 3.5 9.0]))
+(fill! :double [4.5 5.5] 8)
+(let [dst (double-array 2)]
+  (ffi/read-into! (+ buf 8) :double dst 0 2)
+  (check-eq "read-into! reads from the pointer it is given" (vec dst) [4.5 5.5]))
+(let [dst (double-array 3)]
+  (dotimes [_ 3] (ffi/read-into! buf :double dst 0 3))
+  (check-eq "read-into! refills the same array on every call" (vec dst) [1.5 4.5 5.5]))
+(fill! :float [0.1 -0.5] 0)
+(let [dst (float-array 2)]
+  (ffi/read-into! buf :float dst 0 2)
+  (check-eq "read-into! :float stores what read-array reads"
+            (vec dst) (vec (ffi/read-array buf :float 2)))
+  (check-eq "read-into! :float elements are Floats" (class (aget dst 0)) Float))
+(fill! :int64 [3 Long/MIN_VALUE] 0)
+(let [dst (long-array 3)]
+  (ffi/read-into! buf :int64 dst 1 2)
+  (check-eq "read-into! :int64 keeps a value past the fixnum range"
+            (vec dst) [0 3 Long/MIN_VALUE]))
+(fill! :int16 [-32768 32767] 0)
+(let [dst (short-array 2)]
+  (ffi/read-into! buf :int16 dst 0 2)
+  (check-eq "read-into! :int16 fills a short-array" (vec dst) [-32768 32767]))
+(fill! :uint32 [4294967295 7] 0)
+(let [dst (int-array 2)]
+  (ffi/read-into! buf :uint32 dst 0 2)
+  (check-eq "read-into! :uint32 lands the bits, as read-array does" (vec dst) [-1 7]))
+(let [dst (int-array 9000)]
+  (dotimes [i 9000] (ffi/write buf :int32 (- i) (* 4 i)))
+  (ffi/read-into! buf :int32 dst 0 9000)
+  (check-eq "read-into! :int32 fills a pinned-size int-array"
+            (vec dst) (vec (ffi/read-array buf :int32 9000))))
+(check-eq "read-into! of 0 elements answers 0"
+          (ffi/read-into! buf :double (double-array 2) 2 0) 0)
+(defn- thrown-data [f]
+  (try (f) :no-throw
+       (catch clojure.lang.ExceptionInfo e (ex-data e))
+       (catch Throwable e [(.getName (class e)) (ex-message e)])))
+(check-eq "read-into! past the end throws, naming the range"
+          (thrown-data #(ffi/read-into! buf :double (double-array 2) 1 2))
+          {:offset 1 :length 2 :capacity 2})
+(check-eq "read-into! at a negative index throws"
+          (thrown-data #(ffi/read-into! buf :double (double-array 2) -1 1))
+          {:offset -1 :length 1 :capacity 2})
+(check-eq "read-into! of a negative count throws"
+          (thrown-data #(ffi/read-into! buf :double (double-array 2) 0 -1))
+          {:offset 0 :length -1 :capacity 2})
+(check-eq "read-into! into the wrong kind of array throws, naming the type"
+          (thrown-data #(ffi/read-into! buf :double (float-array 2) 0 2))
+          {:type :double})
+(check-eq "read-into! into a vector throws"
+          (thrown-data #(ffi/read-into! buf :int32 [0 0] 0 2))
+          {:type :int32})
+(check-eq "read-into! of a :string throws, as read-array does"
+          (try (ffi/read-into! buf :string (long-array 2) 0 2) :no-throw
+               (catch Exception _ :threw))
+          :threw)
+(let [dst (double-array [9.0 9.0])]
+  (try (ffi/read-into! buf :double dst 1 2) (catch Throwable _ nil))
+  (check-eq "a refused read-into! writes nothing" (vec dst) [9.0 9.0]))
+
+;; the byte forms are unchanged, with or without a one-byte type
+(ffi/write-array buf (byte-array [1 -1 3]))
+(let [dst (byte-array 4)]
+  (check-eq "read-into! of bytes still answers n" (ffi/read-into! buf dst 1 3) 3)
+  (check-eq "read-into! of bytes still fills the slice" (vec dst) [0 1 -1 3]))
+(let [dst (byte-array 3)]
+  (ffi/read-into! buf :uint8 dst 0 3)
+  (check-eq "read-into! :uint8 is the byte form" (vec dst) [1 -1 3]))
+
+;; --- arrays widened before the copy ---------------------------------------
+;; A long-array that has held a bignum, or an int-array that has held a
+;; non-number, has a boxed backing; the decode stores through ja-set! into it.
+;; read-into! is the only way to hand the decode such an array.
+(ffi/write-array buf :int64 (long-array [11 -12 13]))
+(let [dst (long-array 3)]
+  (aset dst 0 Long/MAX_VALUE)
+  (ffi/read-into! buf :int64 dst 0 3)
+  (check-eq "read-into! :int64 fills a widened long-array" (vec dst) [11 -12 13]))
+(ffi/write-array buf :int32 (int-array [21 -22 23]))
+(let [dst (int-array 4)]
+  (aset dst 0 "not a number")
+  (ffi/read-into! buf :int32 dst 1 3)
+  (check-eq "read-into! :int32 fills an int-array widened by a non-number"
+            (vec (rest dst)) [21 -22 23]))
+
 (ffi/free buf)
 
 ;; --- chunk boundaries ------------------------------------------------------
@@ -193,6 +284,10 @@
     (let [want (loop-read big t n off)]
       (check-eq (str "read-array " t " of " n " at offset " off " crosses chunks intact")
                 (= (vec (ffi/read-array big t n off)) (vec want)) true)
+      (let [dst (ctor (+ n 3))]
+        (ffi/read-into! (+ big off) t dst 3 n)
+        (check-eq (str "read-into! " t " of " n " into index 3 crosses chunks intact")
+                  (= (vec (drop 3 dst)) (vec want)) true))
       (let [src (ctor (map #(if (#{:double :float} t) (* -0.25 %) (- (rem % 20000) 10000)) (range n)))]
         (ffi/write-array big t src off)
         (check-eq (str "write-array " t " of " n " at offset " off " crosses chunks intact")
@@ -233,9 +328,16 @@
 (ffi/read-array huge :double 16)   ; warm, so the measure sees only the copy
 (check-eq "read-array of 8MB of doubles allocates its array and under 64KB besides"
           (< (allocated #(ffi/read-array huge :double huge-n)) (+ (* 8 huge-n) (* 64 1024))) true)
-(let [src (double-array huge-n)]
+(let [src (double-array huge-n) dst (double-array huge-n)]
   (check-eq "write-array of 8MB of doubles allocates under 16KB"
-            (< (allocated #(ffi/write-array huge :double src)) (* 16 1024)) true))
+            (< (allocated #(ffi/write-array huge :double src)) (* 16 1024)) true)
+  ;; the point of read-into!: a refill allocates the chunk, not an array
+  (check-eq "read-into! of 8MB of doubles allocates under 16KB"
+            (< (allocated #(ffi/read-into! huge :double dst 0 huge-n)) (* 16 1024)) true))
+(let [dst (double-array 6000)]
+  (ffi/read-into! huge :double dst 0 6000)
+  (check-eq "a frame-sized read-into! of 6000 doubles allocates under 16KB, not 48KB"
+            (< (allocated #(ffi/read-into! huge :double dst 0 6000)) (* 16 1024)) true))
 (ffi/free huge)
 
 (if (empty? @failures)

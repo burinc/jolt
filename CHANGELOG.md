@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `JOLT_STACK_LIMIT` sets it (`512m`, `2g`) or turns it off (`-1`, `0`, `off`,
   `none`); `jolt.host/stack-limit` reads it. The stack is measured after each
   collection, so ordinary code pays nothing for it. Not on Gambit.
+- **`jolt.ffi/read-into!` takes a type**, to refill an existing array instead
+  of allocating a new one per read. A binding that reads the same C buffer
+  every frame (a physics engine's body positions, an audio block) got a fresh
+  array from each `read-array`, garbage within the frame:
+  `(ffi/read-into! p :double arr off n)` fills the `double-array` it is given
+  from index `off` instead. For 6000 doubles a call allocates about 4 KB where
+  `read-array` allocates 52 KB, and takes 17 µs against 19. It fills the array
+  `read-array` answers for the type (`float-array`, `int-array`,
+  `short-array`, `long-array`); `off` and `n` count elements, and a range past
+  the end of the array, or an array of another kind, throws before anything
+  is written. The four-argument byte form is unchanged. Not on Gambit.
 
 ### Changed
 
