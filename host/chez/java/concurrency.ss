@@ -72,7 +72,13 @@
         (cons "toHours"   (lambda (self n) (tu-convert self n 3600000000000)))
         (cons "toDays"    (lambda (self n) (tu-convert self n 86400000000000)))
         ;; the same interruptible sleep Thread/sleep takes (java/host-static-methods.ss)
-        (cons "sleep"     (lambda (self n) (jolt-thread-sleep-ms (tu->ms n self))))
+        ;; exact, not tu->ms's whole milliseconds: a sub-millisecond sleep is
+        ;; rounded up by the sleep, never down to nothing
+        (cons "sleep"     (lambda (self n)
+                            (jolt-thread-sleep-ms
+                              (if (time-unit? self)
+                                  (/ (* (jnum->exact n) (time-unit-scale self)) 1000000)
+                                  (jnum->exact n)))))
         (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))))
 ;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its

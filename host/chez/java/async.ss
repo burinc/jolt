@@ -795,7 +795,7 @@
        (theap-pop-min!)
        (set! timeout-heap-dead (fx- timeout-heap-dead 1))
        (due acc))
-      ((let ((m (theap-min))) (and m (<= (car m) (mono-millis))))
+      ((let ((m (theap-min))) (and m (mono-due? (car m))))
        ;; the cdr is cleared as the entry leaves, so a cancel from here on
        ;; answers #f: the thunk is already on its way to run
        (let* ((e (theap-pop-min!)) (thunk (cdr e)))
@@ -806,9 +806,8 @@
        (let ((m (theap-min)))
          (if (not m)
              (jolt-condition-wait timeout-cv timeout-mu)
-             (let ((wait-ms (- (car m) (mono-millis))))
-               (when (> wait-ms 0)
-                 (jolt-condition-wait timeout-cv timeout-mu (ms->duration wait-ms))))))
+             (unless (mono-due? (car m))
+               (jolt-condition-wait timeout-cv timeout-mu (mono-duration-until (car m))))))
        ;; Either deadline or signal, the answer is the same: come back and re-read
        ;; the min. A spurious wake costs one empty trip.
        '()))))

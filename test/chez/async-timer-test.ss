@@ -204,6 +204,37 @@
         (let spin () (when (< (mono-millis) d) (spin)))
         (loop (+ i 1) (if (< (- (mono-ns) t0) 2000000) (+ short 1) short)))))
 
+;; --- 10. a timed wait does not run past its deadline ----------------------
+;; The relative timeout a thread waits with was (- deadline (mono-millis)) ms,
+;; counted from the truncated millisecond, so it ended up to 1ms after the
+;; deadline, and (Thread/sleep 1) took 2.5ms. The timeout handed to
+;; condition-wait must not exceed the time actually left. (Thread/sleep 0) waited
+;; for the next tick of the clock, and (Thread/sleep 0 n) dropped the n.
+(printf "\n== 10. a timed wait does not run past its deadline ==\n")
+(define (duration-ns d) (+ (* 1000000000 (time-second d)) (time-nanosecond d)))
+(let loop ((i 0) (over 0))
+  (if (= i 50)
+      (ok "10a. no timeout reaches past its deadline" (= over 0))
+      (let* ((d (mono-deadline 2))
+             (left (- (* 1000000 d) (mono-ns)))
+             (w (duration-ns (jolt-deadline->timeout d))))
+        (loop (+ i 1) (if (> w left) (+ over 1) over)))))
+(define (median-ns thunk n)
+  (let ((xs (let loop ((i 0) (acc '()))
+              (if (= i n) acc
+                  (let ((t0 (mono-ns))) (thunk) (loop (+ i 1) (cons (- (mono-ns) t0) acc)))))))
+    (list-ref (sort < xs) (quotient n 2))))
+(ok "10b. sleep(0) does not wait for a clock tick"
+    (< (median-ns (lambda () (jolt-thread-sleep-ms 0)) 51) 500000))
+(ok "10c. sleep(0, 100000) is not cut to nothing"
+    (let loop ((i 0))
+      (or (= i 20)
+          (let ((t0 (mono-ns)))
+            (jolt-thread-sleep-ms+ns 0 100000)
+            (and (>= (- (mono-ns) t0) 100000) (loop (+ i 1)))))))
+(ok "10d. and not stretched to a millisecond either"
+    (< (median-ns (lambda () (jolt-thread-sleep-ms+ns 0 100000)) 51) 900000))
+
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
 (printf "async-timer gate: PASS\n")
