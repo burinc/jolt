@@ -184,7 +184,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient sortedcoll rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flarr \
+  protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
@@ -1199,6 +1199,12 @@ numeric:
 # arg or an all-integer Math/abs stays the generic string-keyed host-static-call.
 mathfl:
 	@$(CHEZ) --script host/chez/run-mathfl.ss
+
+# The flonum payload probe in scheme-adapter-runtime.ss reads nothing in front of
+# the flonum (#1337): run against a flonum at the start of a page after an
+# inaccessible one, the old upward probe faults (and kills a MinGW scheme.exe).
+flonumdisp:
+	@$(CHEZ) --script test/chez/flonum-disp-test.ss
 
 # (aget ^doubles a i): a primitive-array param hint lowers aget to an unboxed
 # flvector-ref (jolt-flaget) typed :double, so surrounding arithmetic unboxes to

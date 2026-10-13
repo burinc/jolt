@@ -682,16 +682,22 @@
     (bytevector-u64-set! bv 0 b (endianness little))
     (bytevector-ieee-double-ref bv 0 (endianness little))))
 ;; The high word is read straight out of the flonum, without a buffer, which is
-;; most of a bit cast's cost (fdlibm's cbrt makes four). The payload's offset in
-;; the object is found once at load by scanning forward from the object's start
-;; for 2.5's bytes; a flonum's payload sits inside its first 16 bytes, so the
-;; scan never reads outside the object. The high word is the payload's upper
-;; half in the machine's byte order.
-(define sa-flonum-disp
-  (let loop ((d 0))
-    (cond ((fx> d 8) (error 'sa-flonum-disp "no flonum payload"))
-          ((eqv? (#%$object-ref 'double 2.5 d) 2.5) d)
-          (else (loop (fx+ d 1))))))
+;; most of a bit cast's cost (fdlibm's cbrt makes four). The payload's offset
+;; from the tagged pointer is found once at load by probing 2.5 for its own
+;; bytes. The probe counts DOWN from 8: a flonum's storage starts at its payload
+;; (6 bytes past the pointer on 64-bit Chez) and runs 16 bytes, so a probe above
+;; the payload stays inside the object, while one below it reads the bytes in
+;; front of the object — unmapped memory when the flonum is the first object in
+;; a fresh segment, which killed scheme.exe at load on Windows (#1337). 2.5's
+;; pattern has six zero bytes under a nonzero top byte, so no probe above the
+;; payload can match it. The high word is the payload's upper half in the
+;; machine's byte order.
+(define (sa-flonum-payload-disp x)
+  (let loop ((d 8))
+    (cond ((fx< d 0) (error 'sa-flonum-disp "no flonum payload"))
+          ((eqv? (#%$object-ref 'double x d) x) d)
+          (else (loop (fx- d 1))))))
+(define sa-flonum-disp (sa-flonum-payload-disp 2.5))
 (define sa-flonum-hi-disp
   (if (eq? (native-endianness) (endianness little)) (fx+ sa-flonum-disp 4) sa-flonum-disp))
 (define (sa-flonum-hi32 x) (#%$object-ref 'unsigned-32 x sa-flonum-hi-disp))
