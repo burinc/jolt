@@ -219,21 +219,39 @@
              (left (- (* 1000000 d) (mono-ns)))
              (w (duration-ns (jolt-deadline->timeout d))))
         (loop (+ i 1) (if (> w left) (+ over 1) over)))))
-(define (median-ns thunk n)
-  (let ((xs (let loop ((i 0) (acc '()))
-              (if (= i n) acc
-                  (let ((t0 (mono-ns))) (thunk) (loop (+ i 1) (cons (- (mono-ns) t0) acc)))))))
-    (list-ref (sort < xs) (quotient n 2))))
-(ok "10b. sleep(0) does not wait for a clock tick"
-    (< (median-ns (lambda () (jolt-thread-sleep-ms 0)) 51) 500000))
+;; Timing rows compare two things measured interleaved in this one run, not a
+;; wall-clock bound: a loaded runner (the Android emulator) stretches a yield and
+;; a wake alike, and an absolute ceiling read that as a regression.
+(define (time-ns thunk) (let ((t0 (mono-ns))) (thunk) (- (mono-ns) t0)))
+(define (median xs) (list-ref (sort < xs) (quotient (length xs) 2)))
+(define (paired-medians a b n)   ; -> (median-of-a . median-of-b), interleaved
+  (let loop ((i 0) (as '()) (bs '()))
+    (if (= i n)
+        (cons (median as) (median bs))
+        (let* ((ta (time-ns a)) (tb (time-ns b)))
+          (loop (+ i 1) (cons ta as) (cons tb bs))))))
+;; sleep(0) is a yield, so it costs what a yield costs; waiting for the next tick
+;; of the millisecond clock cost ~1ms more than that.
+(ok "10b. sleep(0) costs a yield, not a clock tick"
+    (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms 0))
+                             (lambda () (unless (jolt-fiber-wait-turn! 0) (thread-yield!)))
+                             51)))
+      (or (<= (car m) (+ (* 4 (cdr m)) 200000))
+          (begin (printf "    sleep(0) ~ans vs yield ~ans\n" (car m) (cdr m)) #f))))
 (ok "10c. sleep(0, 100000) is not cut to nothing"
     (let loop ((i 0))
       (or (= i 20)
           (let ((t0 (mono-ns)))
             (jolt-thread-sleep-ms+ns 0 100000)
             (and (>= (- (mono-ns) t0) 100000) (loop (+ i 1)))))))
+;; and not rounded up to a whole millisecond, which would make it cost what
+;; sleep(1) costs
 (ok "10d. and not stretched to a millisecond either"
-    (< (median-ns (lambda () (jolt-thread-sleep-ms+ns 0 100000)) 51) 900000))
+    (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms+ns 0 100000))
+                             (lambda () (jolt-thread-sleep-ms 1))
+                             31)))
+      (or (< (car m) (* 3/4 (cdr m)))
+          (begin (printf "    sleep(0, 100000) ~ans vs sleep(1) ~ans\n" (car m) (cdr m)) #f))))
 
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
