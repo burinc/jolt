@@ -766,6 +766,10 @@
       (let [v (f)] (swap! *procure-memo* assoc k v) v))
     (f)))
 
+;; True when the caller runs JVM bytecode itself and asked for source-less Maven
+;; jars to be walked too. resolve-deps binds it for the length of one resolution.
+(def ^:private ^:dynamic *jvm-deps* nil)
+
 (defn- effective-pom-deps
   "Build a Maven dependency map from Grenadine's effective POM model. Parent
   inheritance, properties, dependency management, BOM imports, and exclusions
@@ -854,7 +858,7 @@
 (defmethod ext/coord-summary :local [lib coord] (str lib " " (:local/root coord)))
 
 (defn- mvn-info [lib coord]
-  (memoized [:info lib (ext/dep-id lib coord)]
+  (memoized [:info lib (ext/dep-id lib coord) (boolean *jvm-deps*)]
     (fn []
       (let [root (ensure-maven lib (:mvn/version coord))]
         (cond
@@ -862,8 +866,9 @@
           ;; a Maven dep with no jolt-loadable source is a LEAF: the jar
           ;; stays on the roots so io/resource can read whatever it packages,
           ;; but with no source of ours in it, the deps it declares are cljs/JVM
-          ;; tooling — no :deps and no :pom here is what stops the walk.
-          (not (has-clj-source? root)) {:root root :manifest :mvn}
+          ;; tooling — no :deps and no :pom here is what stops the walk. A caller
+          ;; with its own JVM (:jvm-deps?) gets the walk instead, through :else.
+          (and (not *jvm-deps*) (not (has-clj-source? root))) {:root root :manifest :mvn}
           ;; :pom is the fallback children-of reaches for when the effective POM
           ;; can't be built — not every jar carries one, and the ones that do
           ;; predate their own dependencyManagement, so it is second choice.
@@ -1074,14 +1079,18 @@
   (top-level or transitive); :default-deps supplies one where a dependent left
   the coordinate nil. With :trace? the result also carries the expansion
   :trace — {:log [node …] :vmap version-map}, the tools.deps trace shape, which
-  dep-tree-lines renders and trace-edn-string writes out."
+  dep-tree-lines renders and trace-edn-string writes out. With :jvm-deps?, a
+  Maven jar with no Clojure source has its POM deps walked like any other, for a
+  caller that runs JVM bytecode itself. A nested call that doesn't pass the key
+  inherits the outer value."
   ([deps base-dir] (resolve-deps deps base-dir nil))
-  ([deps base-dir {:keys [override-deps default-deps trace? graph?]}]
+  ([deps base-dir {:keys [override-deps default-deps trace? graph? jvm-deps?] :as opts}]
    ;; A nested resolve-deps inherits the outer atom, so the summary is printed
    ;; ONCE by whichever frame created it rather than once per level.
    (let [outermost? (nil? *unresolvable*)]
    (binding [*procure-memo* (or *procure-memo* (atom {}))
-             *unresolvable* (or *unresolvable* (atom []))]
+             *unresolvable* (or *unresolvable* (atom []))
+             *jvm-deps* (if (contains? opts :jvm-deps?) (boolean jvm-deps?) *jvm-deps*)]
      (let [abs #(absolutize-local % base-dir)
            top (filter-deps deps base-dir)
            override-deps (some->> override-deps (map (fn [[l c]] [l (abs c)])) (into {}))
