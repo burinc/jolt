@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cache directory jolt cannot write no longer stops a program.** The first
+  require of a library namespace created the AOT cache generation and re-raised
+  a failed mkdir, so a process whose `~/.jolt/aot-cache` (or `JOLT_CACHE_DIR`)
+  could not be created — under a sandbox that denies writing `~/.jolt`, once
+  something had deleted the directory — died with "mkdir: cannot create …".
+  A read-only generation without its `v1` directory failed the same way on its
+  first miss. The cache is now off for that process, and namespaces compile in
+  memory as with `JOLT_AOT_CACHE=0` (`JOLT_DEBUG` says why). A cache that exists
+  but is read-only still serves its hits, and a miss runs without caching.
+
 - **`clojure.walk` hands `outer` a map entry, not a vector.** A map entry is
   also `vector?`, and `walk` met it in its vector branch, so `postwalk` rebuilt
   each entry as a plain 2-vector and its function saw `(map-entry? x)` false
