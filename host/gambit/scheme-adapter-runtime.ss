@@ -677,6 +677,19 @@
 (define-syntax sa-ufx=? (syntax-rules () ((_ a b) (fx=? a b))))
 (define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (vector-ref v i))))
 (define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (vector-set! v i x))))
+;; The flonum family expands to the checked R6RS / flvector names. Nothing on
+;; this target expands them yet (typed arrays and the ffi tier are Chez-only),
+;; so they cost nothing until a caller arrives.
+(define-syntax sa-uflvector-ref (syntax-rules () ((_ v i) (flvector-ref v i))))
+(define-syntax sa-uflvector-set! (syntax-rules () ((_ v i x) (flvector-set! v i x))))
+(define-syntax sa-ubytevector-ieee-single-native-ref
+  (syntax-rules () ((_ bv at) (bytevector-ieee-single-native-ref bv at))))
+(define-syntax sa-ubytevector-ieee-single-native-set!
+  (syntax-rules () ((_ bv at x) (bytevector-ieee-single-native-set! bv at x))))
+(define-syntax sa-ubytevector-ieee-double-native-ref
+  (syntax-rules () ((_ bv at) (bytevector-ieee-double-native-ref bv at))))
+(define-syntax sa-ubytevector-ieee-double-native-set!
+  (syntax-rules () ((_ bv at x) (bytevector-ieee-double-native-set! bv at x))))
 ;; gambit's vector-copy! / string-copy! have the R7RS shape already
 (define (sa-vector-copy-range! to at from start end)
   (vector-copy! to at from start end))

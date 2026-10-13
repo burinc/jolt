@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   array from each `read-array`, garbage within the frame:
   `(ffi/read-into! p :double arr)` fills the `double-array` it is given
   instead. For 6000 doubles a call allocates about 4 KB where `read-array`
-  allocates 52 KB, and takes 17 µs against 19. It is `write-array` in the other
+  allocates 52 KB, and takes 7.6 µs against 10. It is `write-array` in the other
   direction, in babashka.ffi's argument order: `(read-into! p t arr offset)`
   reads from `offset` bytes into `p`, and `(read-into! p t arr offset index
   count)` fills `count` elements from `arr[index]`. An integer type
@@ -49,6 +49,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the array throws before anything is written. The index and count
   trail the byte offset, so position four is a byte offset in every typed
   form, as in babashka.ffi.
+- **More of babashka.ffi's API.** `(ffi/find-symbol lib sym)` searches only the
+  library `load-library` answered, and its dependencies; on Windows, where
+  libraries load into the process namespace, it throws. `ffi/with-open` is
+  `clojure.core/with-open` under babashka.ffi's name. `reinterpret` also takes
+  babashka.ffi's order, `(reinterpret p size arena cleanup?)`, beside jolt's
+  arena-first one; a pointer and an arena differ in type, so neither order can
+  be read as the other.
 
 ### Changed
 
@@ -80,11 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`jolt.ffi/read-array` with a negative count throws
-  `NegativeArraySizeException`**, with the count as its message, as
-  `(double-array -1)` does on the JVM. It raised a `ClassCastException`
-  carrying Chez's "make-flvector: -1 is not a valid flvector length" (or
-  make-bytevector's, for the byte form).
+- **A negative array length throws `NegativeArraySizeException`**, with the
+  length as its message, as on the JVM. `(double-array -1)`, the other typed
+  constructors, `make-array` and `jolt.ffi/read-array` raised a
+  `ClassCastException` carrying Chez's "make-flvector: -1 is not a valid
+  flvector length" (or the fxvector, bytevector or vector constructor's).
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search
@@ -202,18 +209,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- **`jolt.ffi/read-array` and `write-array` with a numeric type are 20 to 45
+- **`jolt.ffi/read-array` and `write-array` with a numeric type are 20 to 120
   times faster.** `(ffi/read-array p :double n)` read one element at a time,
   through a var call that converted the type keyword and unboxed the pointer at
-  every element: about 120 ns an element. It now block-copies the memory and
-  decodes it straight into the array's backing, about 3 ns an element; 6000
-  doubles went from 723 to 19 µs. `write-array` encodes and block-copies the
-  same way, and 6000 doubles went from 834 to 18 µs. The copy moves 4 KB at a
-  time, so a large read allocates its array and no second copy of it, and a
-  write allocates at most 4 KB. This holds for `:double`, `:float` and the 2-,
-  4- and 8-byte integer and pointer types; the results are the same arrays as
-  before. A vector passed to `write-array`, or a `long-array` holding a value
-  past the fixnum range, still takes the element loop. Not on Gambit.
+  every element: about 140 ns an element. It now block-copies the memory and
+  decodes it straight into the array's backing; 6000 doubles went from 830 to
+  10 µs, and 6000 ints from 585 to 25. `write-array` encodes and block-copies
+  the same way, and 6000 doubles went from 920 to 7.7 µs. A `:float` element no
+  longer boxes a flonum on the way (16 bytes an element). The copy moves 4 KB
+  at a time, so a large read allocates its array and no second copy of it,
+  and a write allocates at most 4 KB. This holds for `:double`, `:float` and
+  the 2-, 4- and 8-byte integer and pointer types; the results are the same
+  arrays as before. A vector passed to `write-array`, or a `long-array`
+  holding a value past the fixnum range, still takes the element loop. Not on
+  Gambit.
+- **`System/arraycopy` between two `double`, `float`, `long`, `int` or `short`
+  arrays is a block move**, as it already was for byte arrays: 6000 doubles
+  went from 97 to 0.8 µs, and no longer allocate a flonum each.
 
 ## [0.8.21] - 2026-10-11
 

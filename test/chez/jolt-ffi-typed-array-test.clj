@@ -302,6 +302,34 @@
 (defn- staged-range [t arr off index n]
   (ffi/write-array buf sentinel)
   [(ffi/write-array buf t arr off index n) (octets buf 96)])
+;; --- write-array: either float type from either float array ----------------
+;; The arm is picked by the backing, not the array's class: each pairing writes
+;; the octets an element-by-element ffi/write of the same values writes.
+(doseq [[t ctor width] [[:float float-array 4] [:float double-array 4]
+                        [:double double-array 8] [:double float-array 8]]]
+  (let [arr (ctor (remove #(and (= ctor float-array) (> (Math/abs (double %)) 3.4e38)) float-samples))
+        k (count arr)]
+    (dotimes [i k] (ffi/write buf t (aget arr i) (* i width)))
+    (let [want (octets buf (* k width))]
+      (ffi/write-array buf sentinel)
+      (ffi/write-array buf t arr)
+      (check-eq (str "write-array " t " from a " (if (= ctor float-array) "float" "double")
+                     "-array lands what ffi/write of each element lands")
+                (octets buf (* k width)) want))))
+
+;; --- the host primitives check their own range ----------------------------
+;; The copy loops use unchecked element access, so the range is proved in the
+;; host as well as in the stdlib that normally calls it.
+(check-eq "__read-into-typed! refuses a range past the array"
+          (thrown-data #(jolt.ffi/__read-into-typed! buf :double (double-array 2) 1 2))
+          {:index 1 :length 2 :capacity 2})
+(check-eq "__write-array-typed refuses a range past the array"
+          (thrown-data #(jolt.ffi/__write-array-typed buf :float (float-array 2) 0 3))
+          {:index 0 :length 3 :capacity 2})
+(check-eq "__read-into-typed! refuses a negative start"
+          (thrown-data #(jolt.ffi/__read-into-typed! buf :int32 (int-array 2) -1 1))
+          {:index -1 :length 1 :capacity 2})
+
 (let [[got bytes] (staged :double (double-array [1.5 2.5 3.5 4.5 5.5]) 8 3)]
   (check-eq "write-array of the first 3 doubles answers 3" got 3)
   (check-eq "write-array of the first 3 doubles leaves the bytes before the offset"
@@ -512,6 +540,20 @@
   (ffi/read-into! huge :double dst 0 0 6000)
   (check-eq "a frame-sized read-into! of 6000 doubles allocates under 16KB, not 48KB"
             (< (allocated #(ffi/read-into! huge :double dst 0 0 6000)) (* 16 1024)) true))
+;; A :float element must not box a flonum on its way between the bytevector
+;; and the array's flvector (16 bytes an element, 96KB for these 6000, through
+;; the checked single-float accessors).
+(doseq [[label f] [["read-into! :float into a float-array" #(ffi/read-into! huge :float (float-array 6000))]
+                   ["read-into! :float into a double-array" #(ffi/read-into! huge :float (double-array 6000))]]]
+  (f)
+  (check-eq (str "a " label " of 6000 allocates its array and under 16KB besides")
+            (< (allocated f) (+ (* 8 6000) (* 16 1024))) true))
+(let [fa (float-array 6000) da (double-array 6000)]
+  (doseq [[label f] [["read-into! :float into an existing float-array" #(ffi/read-into! huge :float fa)]
+                     ["write-array :float from a float-array" #(ffi/write-array huge :float fa)]
+                     ["write-array :float from a double-array" #(ffi/write-array huge :float da)]]]
+    (f)
+    (check-eq (str label " of 6000 allocates under 16KB") (< (allocated f) (* 16 1024)) true)))
 (ffi/free huge)
 
 (if (empty? @failures)

@@ -319,6 +319,27 @@
          (ffi/reinterpret a p 8 (fn [x] (reset! seen x)))
          (ffi/close-arena a)
          (try (= p @seen) (finally (ffi/free p)))))
+;; babashka.ffi puts the arena after the size, (reinterpret seg size arena
+;; cleanup?). An arena and a pointer differ in type, so jolt takes that order
+;; as well as its own arena-first one, and neither can be read as the other.
+(check "reinterpret takes babashka.ffi's order, the arena after the size"
+       (let [seen (atom nil)
+             p (ffi/alloc 8)]
+         (try
+           (and (= 16 (ffi/with-open [a (ffi/confined-arena)]
+                        (ffi/reinterpret p 16 a)
+                        (ffi/size p)))
+                (zero? (ffi/size p))
+                (do (ffi/with-open [a (ffi/confined-arena)]
+                      (ffi/reinterpret p 8 a (fn [x] (reset! seen x))))
+                    (= p @seen)))
+           (finally (ffi/free p)))))
+(check "reinterpret with neither the first nor the third argument an arena throws"
+       (rejects? #(ffi/reinterpret 1000 8 :not-an-arena)))
+(check "ffi/with-open closes what it binds, as babashka.ffi's does"
+       (let [a (ffi/confined-arena)]
+         (and (= :body (ffi/with-open [b a] (when (ffi/arena-open? b) :body)))
+              (not (ffi/arena-open? a)))))
 
 ;; The size table is keyed by ADDRESS, so an entry that outlives its allocation
 ;; answers a size for a block that never had one — and copy/clone take that as a
@@ -606,6 +627,23 @@
        (ffi/pointer? (ffi/find-symbol "strlen")))
 (check "find-symbol answers nil for one that does not"
        (nil? (ffi/find-symbol "jolt_no_such_symbol_anywhere")))
+;; babashka.ffi's library-scoped form searches the one library load-library
+;; answered (and its dependencies). Windows loads every library into the process
+;; namespace, so there is no handle to scope to and the form refuses.
+(let [libm (ffi/load-system-library "m")
+      windows? (.startsWith (str (System/getProperty "os.name")) "Windows")]
+  (if windows?
+    (check "find-symbol scoped to a library refuses on Windows"
+           (rejects? #(ffi/find-symbol libm "cos")))
+    (do
+      (check "find-symbol scoped to a library finds its symbol"
+             (= (ffi/find-symbol libm "cos") (ffi/find-symbol "cos")))
+      (check "find-symbol scoped to a library answers nil for a missing one"
+             (nil? (ffi/find-symbol libm "jolt_no_such_symbol_anywhere")))))
+  (check "find-symbol with a nil library is the unscoped search"
+         (= (ffi/find-symbol nil "strlen") (ffi/find-symbol "strlen")))
+  (check "find-symbol scoped to a library that was never loaded throws"
+         (rejects? #(ffi/find-symbol {:path "/jolt/no/such/libnothing.so"} "strlen"))))
 (check "load-system-library answers a library map naming what loaded"
        (string? (:path (ffi/load-system-library "m"))))
 ;; The real candidate comes from load-system-library rather than being written
