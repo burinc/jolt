@@ -2566,6 +2566,30 @@
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}
+  ;; binding resolves each name through (var sym) at compile time, as the JVM's
+  ;; binding macro does: a name with no var is the compile error, naming it (the
+  ;; JVM's message, which there is the cause of a CompilerException), and
+  ;; one defined only below the form is the same error, whether the binding is
+  ;; at the top level or in a fn body compiled before the def runs. A non-dynamic
+  ;; var compiles and is refused when the frame is pushed.
+  {:suite "vars / binding resolution" :label "an unresolvable name is a compile error naming it"
+   :expr "(try (eval '(binding [*bnd-undef* 1] 2)) (catch Throwable e (ex-message e)))"
+   :expected "\"Unable to resolve var: *bnd-undef* in this context\""}
+  {:suite "vars / binding resolution" :label "binding a non-dynamic var is the JVM's runtime error"
+   :expr "(do (def bnd-nd 1) (try (binding [bnd-nd 2] bnd-nd) (catch IllegalStateException e (ex-message e))))"
+   :expected "\"Can't dynamically bind non-dynamic var: user/bnd-nd\""}
+  {:suite "vars / binding resolution" :label "a var defined below a top-level binding is unresolved"
+   :expr "[(try (eval '(do (println (binding [*bnd-top* 1] *bnd-top*)) (def ^:dynamic *bnd-top* 0))) (catch Throwable e (ex-message e))) (resolve '*bnd-top*)]"
+   :expected "[\"Unable to resolve var: *bnd-top* in this context\" nil]"}
+  {:suite "vars / binding resolution" :label "a var defined below a fn body's binding is unresolved"
+   :expr "[(try (eval '(do (defn bnd-fwd [] (binding [*bnd-fwd* 1] *bnd-fwd*)) (def ^:dynamic *bnd-fwd* 0))) (catch Throwable e (ex-message e))) (resolve '*bnd-fwd*)]"
+   :expected "[\"Unable to resolve var: *bnd-fwd* in this context\" nil]"}
+  ;; Declared ^:dynamic, as the JVM needs it: after a plain (declare x) the JVM
+  ;; compiles the fn's read of x as a root read and answers [1 1]; jolt reads the
+  ;; binding (known-divergences.edn).
+  {:suite "vars / binding resolution" :label "a declared var binds above its def"
+   :expr "(declare ^:dynamic *bnd-decl*) (defn bnd-decl-f [] (binding [*bnd-decl* 2] *bnd-decl*)) (def ^:dynamic *bnd-decl* 1) [(bnd-decl-f) *bnd-decl*]"
+   :expected "[2 1]"}
   {:suite "resolution / strict default" :expr "(binding [*allow-unresolved-vars* false] *allow-unresolved-vars*)" :expected "false"}
   ;; clojure.core/*allow-unresolved-vars* is the var the analyzer reads, like
   ;; RT.ALLOW_UNRESOLVED_VARS on the JVM: bound true, an unqualified symbol with
