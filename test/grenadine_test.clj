@@ -187,6 +187,50 @@
       (.delete resource)
       (.delete directory))))
 
+;;;; A nested resolve-deps shares the outer resolution's memo. One that passes
+;;;; :jvm-deps? false must still stop at the leaf, even after the outer walk has
+;;;; memoized the walked info for the same jar, so the flag has to be part of
+;;;; the memo key. One that passes no opts inherits the outer value and walks.
+
+(let [root (str (System/getProperty "java.io.tmpdir")
+                "/jolt-grenadine-jvm-deps-nested")
+      directory (java.io.File. root)
+      resource (java.io.File. directory "endpoints.edn")
+      top {'com.cognitect.aws/endpoints {:mvn/version "1"}}
+      entered (atom false)
+      inner (atom nil)]
+  (.mkdirs directory)
+  (spit resource "{}")
+  (try
+    (with-redefs-fn
+      {(var jolt.deps/ensure-maven) (fn [_lib _version] root)
+       (var jolt.deps/effective-pom-deps)
+       (fn [lib _coord]
+         (cond
+           (= lib 'com.cognitect.aws/endpoints)
+           {'demo/jvm-only {:mvn/version "1"}}
+           ;; the child is only reached once the outer walk has memoized the
+           ;; parent's info; nest once, from there
+           (compare-and-set! entered false true)
+           (do (reset! inner {:off (deps/resolve-deps top "." {:jvm-deps? false})
+                              :inherited (deps/resolve-deps top "." nil)})
+               {})
+           :else {}))}
+      (fn []
+        (let [outer (deps/resolve-deps top "." {:jvm-deps? true})]
+          (when-not (contains? (:libs outer) 'demo/jvm-only)
+            (throw (ex-info "the outer :jvm-deps? resolution must walk"
+                            {:result outer})))
+          (when (contains? (:libs (:off @inner)) 'demo/jvm-only)
+            (throw (ex-info "a nested :jvm-deps? false must stop at the leaf"
+                            {:result (:off @inner)})))
+          (when-not (contains? (:libs (:inherited @inner)) 'demo/jvm-only)
+            (throw (ex-info "a nested call without the key must inherit :jvm-deps?"
+                            {:result (:inherited @inner)}))))))
+    (finally
+      (.delete resource)
+      (.delete directory))))
+
 ;;;; A POM Grenadine cannot model degrades to the jar's own pom.xml rather than
 ;;;; failing the whole resolution.
 

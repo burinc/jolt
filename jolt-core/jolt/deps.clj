@@ -1391,6 +1391,11 @@
        "|" (pr-str (vec (sort-by (comp str key) deps)))
        "|" (pr-str (vec (sort-by (comp str key) (:override-deps opts))))
        "|" (pr-str (vec (sort-by (comp str key) (:default-deps opts))))
+       ;; :jvm-deps? walks source-less jars, so it changes the result. It is
+       ;; resolved the way resolve-deps binds it, and only written when on, so
+       ;; every entry cached without it keeps the key it already has.
+       (when (if (contains? opts :jvm-deps?) (:jvm-deps? opts) *jvm-deps*)
+         "|jvm-deps")
        "|" runtime-version
        ;; the environment-dependent artifact roots resolution materializes into:
        ;; a run pointed at a different gitlibs (JOLT_GITLIBS_DIR — the
