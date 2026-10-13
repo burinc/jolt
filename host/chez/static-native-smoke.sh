@@ -399,6 +399,47 @@ if grep -q "loaded at runtime" "$work/build.log"; then
   cat "$work/build.log"; exit 1
 fi
 
+# --- a C++ archive: the preload object must depend on the C++ runtime -------
+# A polymorphic class emits typeinfo that refers to libstdc++'s
+# _ZTVN10__cxxabiv117__class_type_infoE, a DATA reference the loader binds when
+# the object loads, whatever --unresolved-symbols says. The build process has no
+# libstdc++, so on ELF the preload object used to fail to load:
+#   native-static.so: undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE
+# The spec's {:lib "stdc++"} is now the object's own dependency.
+if command -v c++ >/dev/null 2>&1; then
+  cxx="$work/cxx"
+  mkdir -p "$cxx/src/app"
+  cat > "$work/shape.cpp" <<'EOF2'
+struct Shape { virtual ~Shape(); virtual int sides() const; };
+Shape::~Shape() {}
+int Shape::sides() const { return 42; }
+extern "C" int jolt_static_answer(void) { Shape *s = new Shape(); int n = s->sides(); delete s; return n; }
+EOF2
+  c++ -fPIC -c "$work/shape.cpp" -o "$work/shape.o"
+  ar rcs "$work/libshape.a" "$work/shape.o"
+  cat > "$cxx/src/app/core.clj" <<'EOF2'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn answer "jolt_static_answer" [] :int)
+(defn -main [& _]
+  (println "answer:" (answer)))
+EOF2
+  cat > "$cxx/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "shape" :static {:archive "$work/libshape.a"}}
+               {:name "cxx" :optional true :static {:darwin {:lib "c++"} :linux {:lib "stdc++"}}}]}
+EOF2
+  echo "static-native smoke: building (a C++ archive that needs the C++ runtime)"
+  if ! (cd / && JOLT_PWD="$cxx" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+    echo "  FAIL: jolt build with a C++ static archive exited non-zero"; cat "$work/build.log"; exit 1
+  fi
+  got="$(cd / && "$out" 2>&1)"
+  if [ "$got" != "answer: 42" ]; then
+    echo "  FAIL: C++ static archive binary output mismatch"
+    echo "--- got ----"; echo "$got"; exit 1
+  fi
+fi
+
 # --- structural: link order (GNU ld left-to-right) --------------------------
 # Static archives that reference system symbols (libm, libpthread) must appear
 # BEFORE the -l flags for those libraries. grep build.ss for the pattern that
@@ -408,4 +449,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + C++ archive + link order)"

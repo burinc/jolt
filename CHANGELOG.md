@@ -150,6 +150,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started with `jolt.time.impl/jt?`. The site is now put back when a seam fn
   returns.
 
+- **`jolt build` with a C++ `:static` archive loads on Linux.** The build
+  preloads the archives as one shared object so the app's natives resolve
+  while it compiles. That object did not depend on the C++ runtime, and the
+  build process has none, so the loader refused it on a C++ class's typeinfo
+  (`undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE`). On ELF the
+  object now links the project's `{:lib …}` natives (`stdc++`) as its own
+  dependencies. A lib with no shared form falls back to the old link.
+
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search

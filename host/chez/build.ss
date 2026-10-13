@@ -1419,8 +1419,8 @@
 ;; symbols resolvable here: build a throwaway shared object from them (force-
 ;; loading every member) and load it. The output binary still cc-links the static
 ;; archives; this temp object is build-time only. Only the "archive" form is
-;; preloaded — the "lib" form names a system library the OS loader already finds
-;; by soname.
+;; preloaded; on ELF the "lib" forms become the object's shared dependencies
+;; (bld-preload-lib-flags, below).
 ;;
 ;; ONE object from every archive, not one per archive (jolt-lang/jolt#1205): an
 ;; archive that calls into another — libssl.a into libcrypto.a — must resolve
@@ -1444,13 +1444,29 @@
 ;; warning says so. The combined link names no culprit, so when it fails that way
 ;; each archive is linked alone to find the ones that are not position-
 ;; independent, and the object is rebuilt from the rest.
-(define (bld-preload-link-cmd archives so)
+;;
+;; On ELF the object also names the "lib" natives (-lstdc++ for a C++ archive) as
+;; its own dependencies, linked dynamically. --unresolved-symbols=ignore-all lets
+;; the link through, but the loader still has to bind a DATA reference — a C++
+;; vtable or typeinfo, _ZTVN10__cxxabiv117__class_type_infoE — when the object
+;; loads, and the running process does not have libstdc++ (jolt loads its
+;; natives RTLD_LOCAL, and the runtime itself is C). Named here, the loader pulls
+;; it in. libs is the list of ("lib" name libdir) forms.
+(define (bld-preload-lib-flags libs)
+  (apply string-append
+         (map (lambda (form)
+                (let ((name (cadr form)) (dir (caddr form)))
+                  (string-append (if (> (string-length dir) 0) (string-append " -L" (bld-sh-quote dir)) "")
+                                 " -l" name)))
+              libs)))
+
+(define (bld-preload-link-cmd archives libs so)
   (let ((qs (apply string-append (map (lambda (a) (string-append " " (bld-sh-quote a))) archives))))
     (if bld-osx?
         (string-append (bld-cc) " -dynamiclib -undefined dynamic_lookup -Wl,-all_load" qs
                        " -o " (bld-sh-quote so))
         (string-append (bld-cc) " -shared -Wl,--whole-archive" qs " -Wl,--no-whole-archive"
-                       (if bld-nt? (string-append " " (bld-link-libs)) "")
+                       (if bld-nt? (string-append " " (bld-link-libs)) (bld-preload-lib-flags libs))
                        " -Wl,--unresolved-symbols=ignore-all -o " (bld-sh-quote so)))))
 
 (define (bld-preload-so builddir name)
@@ -1464,26 +1480,31 @@
 
 (define (bld-preload-static-natives! natives builddir)
   (let loop ((archives (map cadr (filter (lambda (f) (string=? (car f) "archive"))
-                                         (bld-static-forms natives)))))
+                                         (bld-static-forms natives))))
+             (libs (filter (lambda (f) (string=? (car f) "lib")) (bld-static-forms natives))))
     (unless (null? archives)
       (let* ((so (bld-preload-so builddir "native-static"))
              (log (string-append so ".log"))
-             (cmd (bld-preload-link-cmd archives so))
+             (cmd (bld-preload-link-cmd archives libs so))
              (rc (bld-system->log cmd log)))
         (cond
           ((zero? rc) (bld-echo-log log) (sa-load-shared-object so))
+          ;; a "lib" with no shared form to depend on (only its .a, not
+          ;; position-independent) must not cost the archives their preload:
+          ;; link them as before, without the libs
+          ((and (pair? libs) (not bld-osx?) (not bld-nt?)) (loop archives '()))
           ((bld-pie-relocation-error? (bld-log-string log))
            (let ((not-pic
                    (filter (lambda (a)
                              (let* ((probe (bld-preload-so builddir "native-probe"))
                                     (plog (string-append probe ".log")))
-                               (and (not (zero? (bld-system->log (bld-preload-link-cmd (list a) probe) plog)))
+                               (and (not (zero? (bld-system->log (bld-preload-link-cmd (list a) libs probe) plog)))
                                     (bld-pie-relocation-error? (bld-log-string plog)))))
                            archives)))
              (when (null? not-pic)
                (bld-echo-log log) (bld-command-failed rc cmd))
              (for-each bld-warn-not-pic not-pic)
-             (loop (filter (lambda (a) (not (member a not-pic))) archives))))
+             (loop (filter (lambda (a) (not (member a not-pic))) archives) libs)))
           (else (bld-echo-log log) (bld-command-failed rc cmd)))))))
 
 (define (bld-one-static-link form)
