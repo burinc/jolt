@@ -291,7 +291,7 @@ jobs:
       # (spawn, PushbackReader close, file: URLs, directory mtimes) through the
       # CLI on this runner's filesystem.
       - name: Gate the Windows path, PATH and process rows
-        run: make CHEZ=./chez-install/bin/chez winplatform winpath winparity
+        run: make CHEZ=./chez-install/bin/chez winplatform winpath winparity closedstdout
 
       # java.util.zip in script mode under MSYS2 (#916). There are no jolt_z_*
       # names there: zlib.ss binds the process's own zlib if scheme.exe exports
