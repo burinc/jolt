@@ -181,73 +181,73 @@
 ;; --- read-into!: the typed form fills an existing array -------------------
 (fill! :double [1.5 2.5 3.5] 0)
 (let [dst (double-array [9.0 9.0 9.0 9.0 9.0])]
-  (check-eq "read-into! :double answers n" (ffi/read-into! buf :double dst 1 3) 3)
+  (check-eq "read-into! :double answers n" (ffi/read-into! buf :double dst 0 1 3) 3)
   (check-eq "read-into! :double fills from the index, nothing else"
             (vec dst) [9.0 1.5 2.5 3.5 9.0]))
 (fill! :double [4.5 5.5] 8)
 (let [dst (double-array 2)]
-  (ffi/read-into! (+ buf 8) :double dst 0 2)
+  (ffi/read-into! (+ buf 8) :double dst 0 0 2)
   (check-eq "read-into! reads from the pointer it is given" (vec dst) [4.5 5.5]))
 (let [dst (double-array 3)]
-  (dotimes [_ 3] (ffi/read-into! buf :double dst 0 3))
+  (dotimes [_ 3] (ffi/read-into! buf :double dst 0 0 3))
   (check-eq "read-into! refills the same array on every call" (vec dst) [1.5 4.5 5.5]))
 (fill! :float [0.1 -0.5] 0)
 (let [dst (float-array 2)]
-  (ffi/read-into! buf :float dst 0 2)
+  (ffi/read-into! buf :float dst 0 0 2)
   (check-eq "read-into! :float stores what read-array reads"
             (vec dst) (vec (ffi/read-array buf :float 2)))
   (check-eq "read-into! :float elements are Floats" (class (aget dst 0)) Float))
 (fill! :int64 [3 Long/MIN_VALUE] 0)
 (let [dst (long-array 3)]
-  (ffi/read-into! buf :int64 dst 1 2)
+  (ffi/read-into! buf :int64 dst 0 1 2)
   (check-eq "read-into! :int64 keeps a value past the fixnum range"
             (vec dst) [0 3 Long/MIN_VALUE]))
 (fill! :int16 [-32768 32767] 0)
 (let [dst (short-array 2)]
-  (ffi/read-into! buf :int16 dst 0 2)
+  (ffi/read-into! buf :int16 dst 0 0 2)
   (check-eq "read-into! :int16 fills a short-array" (vec dst) [-32768 32767]))
 (fill! :uint32 [4294967295 7] 0)
 (let [dst (int-array 2)]
-  (ffi/read-into! buf :uint32 dst 0 2)
+  (ffi/read-into! buf :uint32 dst 0 0 2)
   (check-eq "read-into! :uint32 lands the bits, as read-array does" (vec dst) [-1 7]))
 (let [dst (int-array 9000)]
   (dotimes [i 9000] (ffi/write buf :int32 (- i) (* 4 i)))
-  (ffi/read-into! buf :int32 dst 0 9000)
+  (ffi/read-into! buf :int32 dst 0 0 9000)
   (check-eq "read-into! :int32 fills a pinned-size int-array"
             (vec dst) (vec (ffi/read-array buf :int32 9000))))
 (check-eq "read-into! of 0 elements answers 0"
-          (ffi/read-into! buf :double (double-array 2) 2 0) 0)
+          (ffi/read-into! buf :double (double-array 2) 0 2 0) 0)
 (defn- thrown-data [f]
   (try (f) :no-throw
        (catch clojure.lang.ExceptionInfo e (ex-data e))
        (catch Throwable e [(.getName (class e)) (ex-message e)])))
 (check-eq "read-into! past the end throws, naming the range"
-          (thrown-data #(ffi/read-into! buf :double (double-array 2) 1 2))
-          {:offset 1 :length 2 :capacity 2})
+          (thrown-data #(ffi/read-into! buf :double (double-array 2) 0 1 2))
+          {:index 1 :length 2 :capacity 2})
 (check-eq "read-into! at a negative index throws"
-          (thrown-data #(ffi/read-into! buf :double (double-array 2) -1 1))
-          {:offset -1 :length 1 :capacity 2})
+          (thrown-data #(ffi/read-into! buf :double (double-array 2) 0 -1 1))
+          {:index -1 :length 1 :capacity 2})
 (check-eq "read-into! of a negative count throws"
-          (thrown-data #(ffi/read-into! buf :double (double-array 2) 0 -1))
-          {:offset 0 :length -1 :capacity 2})
+          (thrown-data #(ffi/read-into! buf :double (double-array 2) 0 0 -1))
+          {:index 0 :length -1 :capacity 2})
 (check-eq "read-into! :int32 into a short-array throws, naming the type"
-          (thrown-data #(ffi/read-into! buf :int32 (short-array 2) 0 2))
+          (thrown-data #(ffi/read-into! buf :int32 (short-array 2) 0 0 2))
           {:type :int32})
 (check-eq "read-into! :int32 into a long-array throws: integers fill their own width"
-          (thrown-data #(ffi/read-into! buf :int32 (long-array 2) 0 2))
+          (thrown-data #(ffi/read-into! buf :int32 (long-array 2) 0 0 2))
           {:type :int32})
 (check-eq "read-into! :double into an int-array throws"
-          (thrown-data #(ffi/read-into! buf :double (int-array 2) 0 2))
+          (thrown-data #(ffi/read-into! buf :double (int-array 2) 0 0 2))
           {:type :double})
 (check-eq "read-into! into a vector throws"
-          (thrown-data #(ffi/read-into! buf :int32 [0 0] 0 2))
+          (thrown-data #(ffi/read-into! buf :int32 [0 0] 0 0 2))
           {:type :int32})
 (check-eq "read-into! of a :string throws, as read-array does"
-          (try (ffi/read-into! buf :string (long-array 2) 0 2) :no-throw
+          (try (ffi/read-into! buf :string (long-array 2) 0 0 2) :no-throw
                (catch Exception _ :threw))
           :threw)
 (let [dst (double-array [9.0 9.0])]
-  (try (ffi/read-into! buf :double dst 1 2) (catch Throwable _ nil))
+  (try (ffi/read-into! buf :double dst 0 1 2) (catch Throwable _ nil))
   (check-eq "a refused read-into! writes nothing" (vec dst) [9.0 9.0]))
 
 ;; the byte forms are unchanged, with or without a one-byte type
@@ -256,7 +256,7 @@
   (check-eq "read-into! of bytes still answers n" (ffi/read-into! buf dst 1 3) 3)
   (check-eq "read-into! of bytes still fills the slice" (vec dst) [0 1 -1 3]))
 (let [dst (byte-array 3)]
-  (ffi/read-into! buf :uint8 dst 0 3)
+  (ffi/read-into! buf :uint8 dst 0 0 3)
   (check-eq "read-into! :uint8 is the byte form" (vec dst) [1 -1 3]))
 
 ;; --- read-into!: either float type into either float array -----------------
@@ -272,23 +272,23 @@
         _ (fill! t float-samples 0)
         want (ctor (vec (ffi/read-array buf t n)))   ; what aset stores
         dst (ctor (+ n off))]
-    (ffi/read-into! buf t dst off n)
+    (ffi/read-into! buf t dst 0 off n)
     (check-eq (str "read-into! " t " into a " (if (= ctor float-array) "float" "double")
                    "-array from index " off " stores what aset stores")
               (elems (drop off dst)) (elems want))))
 (check-eq "read-into! :double rounds into a float-array"
           (do (fill! :double [0.1 1e300] 0)
-              (let [d (float-array 2)] (ffi/read-into! buf :double d 0 2) (vec d)))
+              (let [d (float-array 2)] (ffi/read-into! buf :double d 0 0 2) (vec d)))
           [(float 0.1) Float/POSITIVE_INFINITY])
 (check-eq "read-into! :double into a float-array stores Floats"
-          (let [d (float-array 1)] (ffi/read-into! buf :double d 0 1) (class (aget d 0)))
+          (let [d (float-array 1)] (ffi/read-into! buf :double d 0 0 1) (class (aget d 0)))
           Float)
 (check-eq "read-into! :float widens exactly into a double-array"
           (do (fill! :float [0.1] 0)
-              (let [d (double-array 1)] (ffi/read-into! buf :float d 0 1) (vec d)))
+              (let [d (double-array 1)] (ffi/read-into! buf :float d 0 0 1) (vec d)))
           [(double (float 0.1))])
 (check-eq "read-into! :float into a double-array stores Doubles"
-          (let [d (double-array 1)] (ffi/read-into! buf :float d 0 1) (class (aget d 0)))
+          (let [d (double-array 1)] (ffi/read-into! buf :float d 0 0 1) (class (aget d 0)))
           Double)
 
 ;; --- write-array: the first n elements ------------------------------------
@@ -298,7 +298,10 @@
 (defn- octets [p k] (vec (ffi/read-array p k)))
 (defn- staged [t arr off n]
   (ffi/write-array buf sentinel)
-  [(ffi/write-array buf t arr off n) (octets buf 96)])
+  [(ffi/write-array buf t arr off 0 n) (octets buf 96)])
+(defn- staged-range [t arr off index n]
+  (ffi/write-array buf sentinel)
+  [(ffi/write-array buf t arr off index n) (octets buf 96)])
 (let [[got bytes] (staged :double (double-array [1.5 2.5 3.5 4.5 5.5]) 8 3)]
   (check-eq "write-array of the first 3 doubles answers 3" got 3)
   (check-eq "write-array of the first 3 doubles leaves the bytes before the offset"
@@ -327,24 +330,94 @@
             (second (staged :double arr 0 3))
             (do (ffi/write-array buf sentinel) (ffi/write-array buf :double arr) (octets buf 96)))
   (check-eq "write-array of one past the end throws, naming the count"
-            (thrown-data #(ffi/write-array buf :double arr 0 4)) {:length 4 :capacity 3})
+            (thrown-data #(ffi/write-array buf :double arr 0 0 4)) {:index 0 :length 4 :capacity 3})
   (check-eq "write-array of a negative count throws"
-            (thrown-data #(ffi/write-array buf :double arr 0 -1)) {:length -1 :capacity 3})
+            (thrown-data #(ffi/write-array buf :double arr 0 0 -1)) {:index 0 :length -1 :capacity 3})
   (check-eq "a refused write-array writes nothing"
             (do (ffi/write-array buf sentinel)
-                (try (ffi/write-array buf :double arr 0 4) (catch Throwable _ nil))
+                (try (ffi/write-array buf :double arr 0 0 4) (catch Throwable _ nil))
                 (octets buf 96))
             (vec (repeat 96 -86)))
-  (check-eq "write-array with a count needs a type"
-            (thrown-data #(ffi/write-array buf arr 0 2 9)) {:second arr}))
+  (check-eq "write-array of a range starting past the start throws, naming it"
+            (thrown-data #(ffi/write-array buf :double arr 0 2 2)) {:index 2 :length 2 :capacity 3})
+  (check-eq "write-array at a negative index throws"
+            (thrown-data #(ffi/write-array buf :double arr 0 -1 1)) {:index -1 :length 1 :capacity 3})
+  (check-eq "write-array with an index and count needs a type"
+            (thrown-data #(ffi/write-array buf arr 0 0 2 9)) {:second arr}))
 (check-eq "write-array of the first 2 of a vector takes the element loop"
-          (do (ffi/write-array buf sentinel) (ffi/write-array buf :int32 [7 8 9] 0 2)
+          (do (ffi/write-array buf sentinel) (ffi/write-array buf :int32 [7 8 9] 0 0 2)
               [(vec (ffi/read-array buf :int32 2)) (subvec (octets buf 96) 8 12)])
           [[7 8] [-86 -86 -86 -86]])
 (check-eq "write-array of the first 2 of a byte-array with a one-byte type"
-          (do (ffi/write-array buf sentinel) (ffi/write-array buf :uint8 (byte-array [1 2 3]) 4 2)
+          (do (ffi/write-array buf sentinel) (ffi/write-array buf :uint8 (byte-array [1 2 3]) 4 0 2)
               (subvec (octets buf 96) 3 7))
           [-86 1 2 -86])
+
+;; --- babashka.ffi's argument order ----------------------------------------
+;; In every typed form position four is a BYTE offset into the pointer, as in
+;; babashka.ffi (its ADR 0004): read-into! is write-array in the other
+;; direction, and a partial copy is two trailing arguments, an index into the
+;; array and a count, that leave the meaning of the first four alone.
+(fill! :double [1.5 2.5 3.5 4.5 5.5 6.5] 0)
+(let [dst (double-array 3)]
+  (check-eq "(read-into! p t arr) fills all of arr from byte 0, answering its length"
+            [(ffi/read-into! buf :double dst) (vec dst)] [3 [1.5 2.5 3.5]]))
+(let [dst (double-array 3)]
+  (check-eq "(read-into! p t arr offset) reads from offset BYTES into p"
+            [(ffi/read-into! buf :double dst 16) (vec dst)]
+            [3 (vec (ffi/read-array buf :double 3 16))]))
+(let [dst (double-array [9.0 9.0 9.0 9.0 9.0])]
+  (check-eq "(read-into! p t arr offset index count) fills count elements from index"
+            [(ffi/read-into! buf :double dst 8 1 3) (vec dst)]
+            [3 [9.0 2.5 3.5 4.5 9.0]])
+  (check-eq "and is the pointer-arithmetic form with the offset as an argument"
+            (vec dst)
+            (vec (doto (double-array [9.0 9.0 9.0 9.0 9.0])
+                   (as-> d (ffi/read-into! (+ buf 8) :double d 0 1 3))))))
+(check-eq "read-into! of the whole of an empty array answers 0"
+          (ffi/read-into! buf :double (double-array 0) 8) 0)
+(check-eq "read-into! with five arguments, the old (p t arr index count), throws"
+          (try (ffi/read-into! buf :double (double-array 3) 1 2) :no-throw
+               (catch Throwable _ :threw))
+          :threw)
+(let [arr (double-array 3)]
+  (check-eq "read-into! with three arguments needs a type"
+            (thrown-data #(ffi/read-into! buf arr 0)) {:second arr}))
+(ffi/write-array buf (byte-array [10 11 12 13 14 15 16 17]))
+(let [dst (byte-array 3)]
+  (check-eq "(read-into! p :uint8 arr offset) fills a byte-array from offset bytes in"
+            [(ffi/read-into! buf :uint8 dst 4) (vec dst)] [3 [14 15 16]]))
+(let [dst (byte-array 4)]
+  (check-eq "(read-into! p :uint8 arr offset index count) is the byte form's slice"
+            [(ffi/read-into! buf :uint8 dst 2 1 2) (vec dst)] [2 [0 12 13 0]]))
+(check-eq "(read-into! p arr off n), jolt's byte form, keeps off as an index into arr"
+          (let [dst (byte-array 4)] (ffi/read-into! buf dst 1 2) (vec dst)) [0 10 11 0])
+(check-eq "read-into! of a range past the end throws before reading"
+          (let [dst (double-array [9.0 9.0])]
+            [(thrown-data #(ffi/read-into! buf :double dst 0 1 2)) (vec dst)])
+          [{:index 1 :length 2 :capacity 2} [9.0 9.0]])
+;; write-array's partial form, the mirror image
+(let [[got bytes] (staged-range :double (double-array [1.5 2.5 3.5 4.5 5.5]) 8 1 3)]
+  (check-eq "(write-array p t arr offset index count) writes arr[index, index+count)"
+            [got (vec (ffi/read-array buf :double 3 8))] [3 [2.5 3.5 4.5]])
+  (check-eq "and nothing before offset or after the count"
+            [(subvec bytes 0 8) (subvec bytes 32 96)] [(vec (repeat 8 -86)) (vec (repeat 64 -86))]))
+(check-eq "write-array's partial form from a vector takes the element loop"
+          (do (ffi/write-array buf sentinel) (ffi/write-array buf :int32 [7 8 9] 4 1 2)
+              [(vec (ffi/read-array buf :int32 2 4)) (subvec (octets buf 96) 0 4) (subvec (octets buf 96) 12 16)])
+          [[8 9] [-86 -86 -86 -86] [-86 -86 -86 -86]])
+(check-eq "write-array's partial form with a one-byte type"
+          (do (ffi/write-array buf sentinel) (ffi/write-array buf :uint8 (byte-array [1 2 3 4]) 2 1 2)
+              (subvec (octets buf 96) 1 5))
+          [-86 2 3 -86])
+(check-eq "write-array with five arguments throws"
+          (try (ffi/write-array buf :double (double-array 3) 0 2) :no-throw
+               (catch Throwable _ :threw))
+          :threw)
+(check-eq "(write-array p arr off n), jolt's byte form, keeps off as an index into arr"
+          (do (ffi/write-array buf sentinel) (ffi/write-array buf (byte-array [1 2 3 4]) 1 2)
+              (subvec (octets buf 96) 0 3))
+          [2 3 -86])
 
 ;; --- arrays widened before the copy ---------------------------------------
 ;; A long-array that has held a bignum, or an int-array that has held a
@@ -353,12 +426,12 @@
 (ffi/write-array buf :int64 (long-array [11 -12 13]))
 (let [dst (long-array 3)]
   (aset dst 0 Long/MAX_VALUE)
-  (ffi/read-into! buf :int64 dst 0 3)
+  (ffi/read-into! buf :int64 dst 0 0 3)
   (check-eq "read-into! :int64 fills a widened long-array" (vec dst) [11 -12 13]))
 (ffi/write-array buf :int32 (int-array [21 -22 23]))
 (let [dst (int-array 4)]
   (aset dst 0 "not a number")
-  (ffi/read-into! buf :int32 dst 1 3)
+  (ffi/read-into! buf :int32 dst 0 1 3)
   (check-eq "read-into! :int32 fills an int-array widened by a non-number"
             (vec (rest dst)) [21 -22 23]))
 
@@ -379,7 +452,7 @@
       (check-eq (str "read-array " t " of " n " at offset " off " crosses chunks intact")
                 (= (vec (ffi/read-array big t n off)) (vec want)) true)
       (let [dst (ctor (+ n 3))]
-        (ffi/read-into! (+ big off) t dst 3 n)
+        (ffi/read-into! (+ big off) t dst 0 3 n)
         (check-eq (str "read-into! " t " of " n " into index 3 crosses chunks intact")
                   (= (vec (drop 3 dst)) (vec want)) true))
       (let [src (ctor (map #(if (#{:double :float} t) (* -0.25 %) (- (rem % 20000) 10000)) (range n)))]
@@ -390,7 +463,7 @@
         (let [k (- n 1001)
               before (vec (loop-read big t n off))
               src2 (ctor (map #(if (#{:double :float} t) (* 0.5 %) (- (rem % 9000) 4500)) (range n)))]
-          (ffi/write-array big t src2 off k)
+          (ffi/write-array big t src2 off 0 k)
           (check-eq (str "write-array " t " of the first " k " of " n " crosses chunks and stops there")
                     (= (vec (loop-read big t n off)) (into (vec (take k src2)) (drop k before))) true))))))
 
@@ -434,11 +507,11 @@
             (< (allocated #(ffi/write-array huge :double src)) (* 16 1024)) true)
   ;; the point of read-into!: a refill allocates the chunk, not an array
   (check-eq "read-into! of 8MB of doubles allocates under 16KB"
-            (< (allocated #(ffi/read-into! huge :double dst 0 huge-n)) (* 16 1024)) true))
+            (< (allocated #(ffi/read-into! huge :double dst 0 0 huge-n)) (* 16 1024)) true))
 (let [dst (double-array 6000)]
-  (ffi/read-into! huge :double dst 0 6000)
+  (ffi/read-into! huge :double dst 0 0 6000)
   (check-eq "a frame-sized read-into! of 6000 doubles allocates under 16KB, not 48KB"
-            (< (allocated #(ffi/read-into! huge :double dst 0 6000)) (* 16 1024)) true))
+            (< (allocated #(ffi/read-into! huge :double dst 0 0 6000)) (* 16 1024)) true))
 (ffi/free huge)
 
 (if (empty? @failures)

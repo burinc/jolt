@@ -26,23 +26,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of allocating a new one per read. A binding that reads the same C buffer
   every frame (a physics engine's body positions, an audio block) got a fresh
   array from each `read-array`, garbage within the frame:
-  `(ffi/read-into! p :double arr off n)` fills the `double-array` it is given
-  from index `off` instead. For 6000 doubles a call allocates about 4 KB where
-  `read-array` allocates 52 KB, and takes 17 µs against 19. An integer type
+  `(ffi/read-into! p :double arr)` fills the `double-array` it is given
+  instead. For 6000 doubles a call allocates about 4 KB where `read-array`
+  allocates 52 KB, and takes 17 µs against 19. It is `write-array` in the other
+  direction, in babashka.ffi's argument order: `(read-into! p t arr offset)`
+  reads from `offset` bytes into `p`, and `(read-into! p t arr offset index
+  count)` fills `count` elements from `arr[index]`. An integer type
   fills the array `read-array` answers for it (`int-array` for `:int32`);
   `:float` and `:double` each fill a `float-array` or a `double-array`, as
   `write-array` writes either from either, so a program that keeps its data in
   `double-array`s can read `:float` into them. A `:float` widens exactly, and
-  a `:double` rounds to single in a `float-array`, as `aset` rounds it. `off`
-  and `n` count elements, and a range past the end of the array, or an array
-  that cannot hold the type's elements, throws before anything is written.
-  The four-argument byte form is unchanged. Not on Gambit.
-- **`jolt.ffi/write-array` takes an element count.**
-  `(ffi/write-array p :float staging offset n)` writes only the first `n`
-  elements, so a staging array sized for the largest batch (instance
-  matrices, draw commands, audio samples) can be written part full without
-  first copying its used part into a right-sized array. A count outside
-  `0..(alength arr)` throws before anything is written.
+  a `:double` rounds to single in a `float-array`, as `aset` rounds it. A
+  range outside the array, or an array that cannot hold the type's elements,
+  throws before anything is written. The four-argument byte form,
+  `(read-into! p arr off n)` with `off` an index into the byte-array, is
+  unchanged. Not on Gambit.
+- **`jolt.ffi/write-array` writes part of an array.**
+  `(ffi/write-array p :float staging offset index count)` writes
+  `staging[index, index+count)`, so a staging array sized for the largest batch
+  (instance matrices, draw commands, audio samples) can be written part full
+  without first copying its used part into a right-sized array. A range
+  outside the array throws before anything is written. The index and count
+  trail the byte offset, so position four is a byte offset in every typed
+  form, as in babashka.ffi.
 
 ### Changed
 

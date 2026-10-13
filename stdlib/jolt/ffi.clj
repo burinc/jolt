@@ -235,7 +235,10 @@
       the [:union ...] descriptor, which is otherwise babashka.ffi's.
     - read-array and write-array copy every scalar width as a block move, into
       a jolt array of that width or out of one, and read-into! takes a type to
-      fill an existing typed array the same way.
+      fill an existing typed array the same way. The typed read-into! and
+      write-array's index-and-count form keep babashka.ffi's argument order:
+      position four is a byte offset into the pointer, and an index into the
+      array and a count trail it.
     - jolt adds: (alloc n) with no arena, the with-* scoped helpers, arena?,
       arena-open?, close-arena, drain-auto-arenas!, layout-size,
       layout-alignment, field-offset, read-field, write-field, :varargs (a
@@ -1197,24 +1200,34 @@
       (neg? v) (jolt.ffi/__write p (:signed-type carrier) v off)
       :else (jolt.ffi/__write p element v off))))
 
-;; n is the count of leading elements to write, nil for all of them. It is
-;; checked here, before anything is written, so the host and the element loop
-;; both see a count within the array.
-(defn- write-array-typed [p t arr off n]
+;; The typed array moves follow babashka.ffi's argument order (its ADR 0004):
+;; the pointer, the type, the array, then an optional BYTE offset into the
+;; pointer, then optionally an index into the array and a count. Position four
+;; is a byte offset in every typed form, so a call carried between the two
+;; libraries never reads an index there.
+;;
+;; index and n select arr[index, index+n); a nil n is the whole array. The range
+;; is checked here, before anything is written, so the host, the element loop and
+;; the one-byte route all see a range within the array.
+(defn- check-array-range [who arr index n]
+  (let [cap (count arr)]
+    (when-not (and (number? index) (number? n)
+                   (<= 0 index) (<= 0 n) (<= (+ index n) cap))
+      (throw (ex-info (str "jolt.ffi/" who ": range outside the array")
+                      {:index index :length n :capacity cap})))))
+
+(defn- write-array-typed [p t arr off index n]
   (let [carrier (array-carrier t)
-        cap (count arr)
-        n (if (nil? n) cap n)]
-    (when-not (and (number? n) (<= 0 n cap))
-      (throw (ex-info "jolt.ffi/write-array: count outside the array"
-                      {:length n :capacity cap})))
+        n (if (nil? n) (count arr) n)]
+    (check-array-range "write-array" arr index n)
     (if (nil? (:ctor carrier))
-      (jolt.ffi/__write-array (+ p off) arr 0 n)
+      (jolt.ffi/__write-array (+ p off) arr index n)
       ;; The host's block encode takes the :read-type too: it picks the width
       ;; and the family, and the encode keeps the low bits whatever the sign.
-      (or (jolt.ffi/__write-array-typed (+ p off) (:read-type carrier) arr n)
+      (or (jolt.ffi/__write-array-typed (+ p off) (:read-type carrier) arr index n)
           (let [width (:width carrier)]
             (dotimes [i n]
-              (write-array-element p carrier (nth arr i) (+ off (* i width))))
+              (write-array-element p carrier (nth arr (+ index i)) (+ off (* i width))))
             n)))))
 
 (defn read-array
@@ -1236,56 +1249,78 @@
 (defn write-array
   "Copy a jolt array's elements into foreign memory; answers the element count.
 
-      (write-array p arr)          ; every octet of a byte-array (jolt's form)
-      (write-array p arr off n)    ; n octets of it, from index off
-      (write-array p t arr)          ; arr's elements as type t
-      (write-array p t arr offset)   ; the same, starting `offset` bytes in
-      (write-array p t arr offset n) ; only arr's first n elements
+      (write-array p arr)                        ; every octet of a byte-array (jolt's form)
+      (write-array p arr off n)                  ; n octets of it, from index off
+      (write-array p t arr)                      ; arr's elements as type t
+      (write-array p t arr offset)               ; the same, starting `offset` bytes into p
+      (write-array p t arr offset index count)   ; only arr[index, index+count)
 
   The array must be the one for the type's width, as read-array answers it,
   except that :float and :double each write from a float-array or a
   double-array. A value wider than its element truncates to the element, since
   the copy carries bits and not a range.
 
-  n lets a staging array sized for the largest batch be written part full,
-  without first copying its used prefix into a right-sized array. A count
-  outside 0..(alength arr) throws before anything is written. In the byte form
-  off is an index into arr; in the typed forms offset is a byte offset into p."
+  index and count let a staging array sized for the largest batch be written
+  part full, without first copying its used part into a right-sized array. A
+  range outside the array throws before anything is written. In the typed
+  forms offset is always a byte offset into p, as in babashka.ffi; only the
+  byte form's off is an index into arr."
   ([p arr] (jolt.ffi/__write-array p arr))
   ([p a b]
    (if (keyword? a)
-     (write-array-typed p a b 0 nil)
+     (write-array-typed p a b 0 0 nil)
      (throw (ex-info "jolt.ffi/write-array: expected (write-array p t arr) or (write-array p arr off n)"
                      {:second a}))))
   ([p a b c]
    (if (keyword? a)
-     (write-array-typed p a b c nil)
+     (write-array-typed p a b c 0 nil)
      (jolt.ffi/__write-array p a b c)))
-  ([p t arr off n]
+  ([p t arr off index n]
    (if (keyword? t)
-     (write-array-typed p t arr off n)
-     (throw (ex-info "jolt.ffi/write-array: expected (write-array p t arr offset n)"
+     (write-array-typed p t arr off index n)
+     (throw (ex-info "jolt.ffi/write-array: expected (write-array p t arr offset index count)"
                      {:second t})))))
 
+(defn- read-into-typed! [p t arr off index n]
+  (let [carrier (array-carrier t)
+        n (if (nil? n) (count arr) n)]
+    (check-array-range "read-into!" arr index n)
+    (if (nil? (:ctor carrier))
+      (jolt.ffi/__read-into! (+ p off) arr index n)
+      (jolt.ffi/__read-into-typed! (+ p off) (:read-type carrier) arr index n))))
+
 (defn read-into!
-  "Copy elements out of foreign memory into an EXISTING jolt array; answers n.
+  "Copy elements out of foreign memory into an EXISTING jolt array; answers the
+  element count. write-array in the other direction.
 
-      (read-into! p arr off n)     ; n raw octets into a byte-array from index off
-      (read-into! p t arr off n)   ; n elements of type t into arr from index off
+      (read-into! p arr off n)                  ; n raw octets into a byte-array from index off
+      (read-into! p t arr)                      ; fill all of arr with elements of type t
+      (read-into! p t arr offset)               ; the same, starting `offset` bytes into p
+      (read-into! p t arr offset index count)   ; count elements into arr[index, index+count)
 
-  The typed form fills the array read-array answers for t — an int-array for
+  The typed forms fill the array read-array answers for t — an int-array for
   :int32 — so a loop that reads the same buffer every frame refills one array
   rather than allocating one per read. :float and :double each fill a
   float-array or a double-array: a :float widens exactly into a double-array,
-  and a :double rounds to single into a float-array, as aset rounds it. off and
-  n count ELEMENTS of arr. A range past the end of arr, or an array that cannot
-  hold the type's elements, throws before anything is written."
-  ([p arr off n] (jolt.ffi/__read-into! p arr off n))
-  ([p t arr off n]
-   (let [carrier (array-carrier t)]
-     (if (nil? (:ctor carrier))
-       (jolt.ffi/__read-into! p arr off n)
-       (jolt.ffi/__read-into-typed! p (:read-type carrier) arr off n)))))
+  and a :double rounds to single into a float-array, as aset rounds it. In the
+  typed forms offset is always a byte offset into p, as in babashka.ffi; only
+  the byte form's off is an index into arr. A range outside the array, or an
+  array that cannot hold the type's elements, throws before anything is
+  written."
+  ([p t arr]
+   (if (keyword? t)
+     (read-into-typed! p t arr 0 0 nil)
+     (throw (ex-info "jolt.ffi/read-into!: expected (read-into! p t arr) or (read-into! p arr off n)"
+                     {:second t}))))
+  ([p a b c]
+   (if (keyword? a)
+     (read-into-typed! p a b c 0 nil)
+     (jolt.ffi/__read-into! p a b c)))
+  ([p t arr off index n]
+   (if (keyword? t)
+     (read-into-typed! p t arr off index n)
+     (throw (ex-info "jolt.ffi/read-into!: expected (read-into! p t arr offset index count)"
+                     {:second t})))))
 
 (defn read-bytes
   "Decode n octets at pointer p as a string; answers that string.

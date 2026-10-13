@@ -962,8 +962,8 @@
            (ffi-read-typed-chunks! ct (jnum->exact ptr) arr 0 n)
            arr))))
 
-;; (__read-into-typed! ptr type arr off n) -> n. The typed read-into!: n
-;; elements at ptr into an EXISTING array from index off, so a loop that reads
+;; (__read-into-typed! ptr type arr index n) -> n. The typed read-into!: n
+;; elements at ptr into an EXISTING array from index index, so a loop that reads
 ;; the same buffer every frame refills one array instead of allocating one per
 ;; read. An integer type fills the array read-array answers for it, since a
 ;; narrower one could not hold its values. :float and :double each fill either
@@ -972,9 +972,9 @@
 ;; single into a float-array, as aset rounds it. It is the one caller that can
 ;; hand the decode an array widened before the copy began (a long-array that
 ;; once held a bignum), which ffi-decode-into! stores through ja-set!.
-(define (ffi-read-into-typed! ptr type arr off n)
+(define (ffi-read-into-typed! ptr type arr index n)
   (let* ((ct (ffi-type->chez type)) (kind (ffi-typed-array-kind ct))
-         (n (jnum->exact n)) (off (jnum->exact off)))
+         (n (jnum->exact n)) (index (jnum->exact index)))
     (unless (and kind (jolt-array? arr)
                  (let ((have (jolt-array-kind arr)))
                    (or (eq? have kind)
@@ -982,25 +982,26 @@
       (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: the array cannot hold elements of this type"
                                 (jolt-hash-map (jolt-keyword "type") type))))
     (let ((cap (ja-len arr)))
-      (when (or (< off 0) (< n 0) (> (+ off n) cap))
+      (when (or (< index 0) (< n 0) (> (+ index n) cap))
         (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: range outside the array"
-                                  (jolt-hash-map (jolt-keyword "offset") off
+                                  (jolt-hash-map (jolt-keyword "index") index
                                                  (jolt-keyword "length") n
                                                  (jolt-keyword "capacity") cap)))))
-    (ffi-read-typed-chunks! ct (jnum->exact ptr) arr off n)
+    (ffi-read-typed-chunks! ct (jnum->exact ptr) arr index n)
     n))
 
-;; (__write-array-typed ptr type arr n) -> n, having written the first n
-;; elements of arr (the caller has checked n against its length), or #f when arr is
+;; (__write-array-typed ptr type arr start n) -> n, having written arr[start,
+;; start+n) (the caller has checked the range against arr), or #f when arr is
 ;; not a jolt array with an unboxed backing of the type's family (a vector, a
 ;; promoted long array, a double-array written as :int32), which the caller's
 ;; element loop handles as it always has. The BITS land as they are, as
 ;; write-array-element writes them: an integer keeps its low width*8 bits. The
 ;; 32-bit mask is a bitwise-and rather than an fxlogand: #xffffffff is not a
 ;; fixnum on a 32-bit Chez.
-(define (ffi-write-array-typed ptr type arr n)
+(define (ffi-write-array-typed ptr type arr start n)
   (and (jolt-array? arr)
-       (let* ((ct (ffi-type->chez type)) (v (jolt-array-vec arr)) (n (jnum->exact n)))
+       (let* ((ct (ffi-type->chez type)) (v (jolt-array-vec arr))
+              (start (jnum->exact start)) (n (jnum->exact n)))
          (define (emit! width put!)
            (let* ((p (jnum->exact ptr))
                   (per (fxquotient ffi-typed-chunk-bytes width))
@@ -1008,7 +1009,7 @@
              (let loop ((done 0))
                (when (fx< done n)
                  (let ((k (fxmin per (fx- n done))))
-                   (do ((i 0 (fx+ i 1))) ((fx= i k)) (put! bv (fx* i width) (fx+ done i)))
+                   (do ((i 0 (fx+ i 1))) ((fx= i k)) (put! bv (fx* i width) (fx+ start (fx+ done i))))
                    (sa-foreign-bytes-set! (+ p (fx* done width)) bv (fx* k width))
                    (loop (fx+ done k)))))
              n))
