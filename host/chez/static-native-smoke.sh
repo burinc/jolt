@@ -399,6 +399,42 @@ if grep -q "loaded at runtime" "$work/build.log"; then
   cat "$work/build.log"; exit 1
 fi
 
+# --- an :optional native whose :static archive was never built -------------
+# Optional means the app runs without it, and a tree that skipped building an
+# optional archive is the usual case (a GPU backend on a host without the GPU).
+# The archive used to go to the linker anyway, which failed the whole build on
+# the missing file. It is loaded at runtime instead, like any optional native:
+# here its shared object is present, so the binary still answers 42.
+opt="$work/opt"
+mkdir -p "$opt/src/app" "$opt/native"
+cc $shared "$work/greet.c" -o "$opt/native/libgreet.$soext"
+cat > "$opt/src/app/core.clj" <<'EOF2'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn answer "jolt_static_answer" [] :int)
+(defn -main [& _]
+  (println "answer:" (answer)))
+EOF2
+cat > "$opt/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "greet" :optional true
+                $plat ["$opt/native/libgreet.$soext"]
+                :static {:archive "native/libgreet.a"}}]}
+EOF2
+echo "static-native smoke: building (an :optional native whose archive is missing)"
+if ! (cd / && JOLT_PWD="$opt" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build failed on an optional native's missing archive"; cat "$work/build.log"; exit 1
+fi
+if ! grep -q "greet (optional)" "$work/build.log"; then
+  echo "  FAIL: the build did not say the optional native is loaded at runtime"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42" ]; then
+  echo "  FAIL: optional native with a missing archive: binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+
 # --- structural: link order (GNU ld left-to-right) --------------------------
 # Static archives that reference system symbols (libm, libpthread) must appear
 # BEFORE the -l flags for those libraries. grep build.ss for the pattern that
@@ -408,4 +444,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + optional missing archive + link order)"
