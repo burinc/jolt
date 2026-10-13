@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A program keeps running after its output's reader goes away (#1331).**
+  `jolt app | head -1`, or a backgrounded `jolt build` whose parent stopped
+  reading, died with "broken pipe" on its next print. As on the JVM, whose
+  `System.out` is a `PrintStream`, a write that fails is now dropped,
+  `checkError` answers true, and the program carries on. This applies to
+  stdout and stderr when they are not a terminal.
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search

@@ -1247,7 +1247,13 @@
    (cons "flush" (lambda (self) (ps-flush! self)))
    (cons "close" (lambda (self) (ps-flush! self)
                    (record-method-dispatch (ps-target self) "close" jolt-nil) jolt-nil))
-   (cons "checkError" (lambda (self) #f))
+   ;; flush, then the target's own answer when it has one (System/out's
+   ;; port-writer says whether the process stream has failed)
+   (cons "checkError" (lambda (self)
+                        (ps-flush! self)
+                        (let ((t (ps-target self)))
+                          (and (jhost? t) (host-method-ref (jhost-tag t) "checkError")
+                               (jolt-truthy? (record-method-dispatch t "checkError" jolt-nil))))))
    (cons "toString" (lambda (self) "#<PrintStream>"))))
 ;; (PrintStream. out) / (PrintStream. out autoFlush). The charset arity is
 ;; accepted and ignored: jolt renders UTF-8.
