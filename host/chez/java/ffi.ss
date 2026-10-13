@@ -886,8 +886,10 @@
 ;; The copy moves at most ffi-typed-chunk-bytes at a time through one reused
 ;; bytevector, so a large array costs its own backing and no more: a single
 ;; temporary the size of the whole block would double the peak of a 100MB read.
-;; 64KB is past the point where a bigger block buys any speed.
-(define ffi-typed-chunk-bytes 65536)
+;; The chunk is all a write-array allocates, and all a read allocates beyond
+;; its array, so it is kept to a page: 1KB, 4KB and 64KB chunks measure the
+;; same speed to within noise (6000 doubles in ~19us, a million in ~2.7ms).
+(define ffi-typed-chunk-bytes 4096)
 (define (ffi-typed-array-kind ct)
   (case ct
     ((double) 'double) ((float) 'float)

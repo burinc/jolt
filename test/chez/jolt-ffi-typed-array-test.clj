@@ -180,8 +180,9 @@
 (ffi/free buf)
 
 ;; --- chunk boundaries ------------------------------------------------------
-;; The copy moves 64KB at a time — 8192 eight-byte, 16384 four-byte or 32768
-;; two-byte elements — so these sizes end mid-chunk after crossing several.
+;; The copy moves 4KB at a time — 512 eight-byte, 1024 four-byte or 2048
+;; two-byte elements — so these sizes end mid-chunk after crossing many, and
+;; cross the 8192-element pinning threshold too.
 (def big (ffi/alloc (* 8 50000)))
 (doseq [[t n] [[:double 20001] [:int64 20001] [:float 40001] [:int32 40001] [:int16 70001]]
         off [0 6]]
@@ -214,20 +215,27 @@
 (ffi/free big)
 
 ;; --- memory: a large copy costs its array, not a second copy of it --------
-;; Chez's own allocation counter, reached through jolt.scheme only to measure.
+;; Chez's own allocation counters, reached through jolt.scheme only to measure.
+;; bytes-allocated alone is the heap's CURRENT size and drops at a collection,
+;; so a collection inside the measured call would hide what it allocated; with
+;; bytes-deallocated added it is the running total, which only grows. The
+;; counter is compiled once: an eval-string per reading would itself allocate
+;; ~16KB and swamp the limits below.
 (require '[jolt.scheme :as scm])
+(def ^:private total-allocated
+  (scm/eval-string "(lambda () (+ (bytes-allocated) (bytes-deallocated)))"))
 (defn- allocated [f]
-  (let [b0 (scm/eval-string "(bytes-allocated)")]
+  (let [b0 (total-allocated)]
     (f)
-    (- (scm/eval-string "(bytes-allocated)") b0)))
+    (- (total-allocated) b0)))
 (def huge-n 1000000)
 (def huge (ffi/alloc (* 8 huge-n)))
 (ffi/read-array huge :double 16)   ; warm, so the measure sees only the copy
-(check-eq "read-array of 8MB of doubles allocates under 9MB (the array and a chunk)"
-          (< (allocated #(ffi/read-array huge :double huge-n)) (* 9 1024 1024)) true)
+(check-eq "read-array of 8MB of doubles allocates its array and under 64KB besides"
+          (< (allocated #(ffi/read-array huge :double huge-n)) (+ (* 8 huge-n) (* 64 1024))) true)
 (let [src (double-array huge-n)]
-  (check-eq "write-array of 8MB of doubles allocates under 1MB"
-            (< (allocated #(ffi/write-array huge :double src)) (* 1024 1024)) true))
+  (check-eq "write-array of 8MB of doubles allocates under 16KB"
+            (< (allocated #(ffi/write-array huge :double src)) (* 16 1024)) true))
 (ffi/free huge)
 
 (if (empty? @failures)

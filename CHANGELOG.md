@@ -181,9 +181,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every element: about 120 ns an element. It now block-copies the memory and
   decodes it straight into the array's backing, about 3 ns an element; 6000
   doubles went from 723 to 19 µs. `write-array` encodes and block-copies the
-  same way, and 6000 doubles went from 834 to 18 µs. The copy moves 64 KB at a
+  same way, and 6000 doubles went from 834 to 18 µs. The copy moves 4 KB at a
   time, so a large read allocates its array and no second copy of it, and a
-  write allocates at most 64 KB. This holds for `:double`, `:float` and the 2-,
+  write allocates at most 4 KB. This holds for `:double`, `:float` and the 2-,
   4- and 8-byte integer and pointer types; the results are the same arrays as
   before. A vector passed to `write-array`, or a `long-array` holding a value
   past the fixnum range, still takes the element loop. Not on Gambit.
