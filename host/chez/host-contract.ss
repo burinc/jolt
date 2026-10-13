@@ -258,7 +258,14 @@
         ;; a qualified ns may be a require :as alias (s/split -> clojure.string/split)
         (let ((target (or (chez-resolve-alias (chez-actx-cns ctx) qualified) qualified)))
           (var-cell-lookup target nm))
-        (or (let ((c (var-cell-lookup (chez-actx-cns ctx) nm)))
+        (or ;; an unqualified ns / in-ns is clojure.core's whatever the compile ns
+            ;; maps, as in the JVM's Compiler.lookupVar: a file's ns form is read
+            ;; in its REQUIRER's namespace, and sci.core (which excludes `ns` and
+            ;; defines its own) requiring a lib otherwise analyzed that lib's
+            ;; (ns ...) as a call to sci.core/ns.
+            (and (or (string=? nm "ns") (string=? nm "in-ns"))
+                 (var-cell-lookup "clojure.core" nm))
+            (let ((c (var-cell-lookup (chez-actx-cns ctx) nm)))
               ;; an undefined forward-intern must not shadow a real referred
               ;; or clojure.core var — e.g. the compiler ns referencing `set`,
               ;; which late-binds (interns `jolt.backend-scheme/set` undefined)

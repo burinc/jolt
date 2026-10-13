@@ -53,6 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`(require 'x :reload-all)` reloads each namespace once, into its own
+  namespace.** It turned the loaded-namespace check off for its whole extent,
+  so a shared dependency reloaded again at every place it was required and the
+  work doubled with each level of the graph; a real project's reload ran for
+  tens of minutes. Each namespace now reloads once per `:reload-all`, as on
+  the JVM. `clojure.string`, `clojure.walk` and `clojure.set` had no `ns` form,
+  so a reload that reached them evaluated them in the requiring namespace: their
+  defns landed there, and a macro it shadowed broke the load ("Can only recur
+  from tail position" in `trim-newline`). And an unqualified `ns` or `in-ns`
+  now always means `clojure.core`'s, as in the JVM compiler, so a namespace
+  that excludes `ns` and defines its own (`sci.core`) no longer breaks the
+  `ns` form of every library it requires on a reload.
+
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search

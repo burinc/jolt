@@ -6,6 +6,8 @@
 ; Jolt Standard Library: clojure.walk
 ; Tree walking for Clojure data structures.
 
+(ns clojure.walk)
+
 (defn walk
   [inner outer form]
   (cond
