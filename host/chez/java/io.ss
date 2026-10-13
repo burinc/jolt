@@ -1463,12 +1463,14 @@
             (else (loop (- i 1)))))
     (guard (e (#t #f)) (mkdir p)))
   (and (file-exists? p) (file-directory? p)))
-;; delete a file or an (empty) directory; #t on success.
+;; delete a file or an (empty) directory; #t on success, #f on failure. Without
+;; their error? argument, delete-file and delete-directory answer that boolean
+;; themselves and raise nothing (CSUG 9.16), so both branches pass it on.
 (define (delete-path! p)
   (guard (e (#t #f))
     (cond ((not (file-exists? p)) #f)
           ((file-directory? p) (delete-directory p))
-          (else (delete-file p) #t))))
+          (else (delete-file p)))))
 
 ;; rename(2) REPLACES an existing destination. Chez's rename-file is MoveFile on
 ;; Windows, which refuses one — "cannot rename A to B: file exists" — so every
