@@ -185,20 +185,25 @@
          (with-exception-handler
            (lambda (e) (if (i/o-error? e) (k (on-fail)) (raise e)))
            (lambda () body ...)))))))
-;; A port over INNER (a block-buffered textual port on the descriptor) that never
-;; raises an i/o error. Answers the port, a thunk that says whether a write has
-;; failed, and one that marks it failed (the byte path writes past the port), or
-;; three #f where the adapter cannot build one.
-(define (jolt-make-failsafe-port name inner)
-  (let ((mu (make-mutex)) (failed? #f))
+;; A port on a process stream that never raises an i/o error. OPEN makes the
+;; block-buffered textual port on the descriptor it writes through, on the first
+;; write: the port is installed at load, and the buffers (some 10KB a stream) and
+;; their codec are boot-time allocation a program that never prints does not need.
+;; Answers the port, a thunk that says whether a write has failed, and one that
+;; marks it failed (the byte path writes past the port), or three #f where the
+;; adapter cannot build one.
+(define (jolt-make-failsafe-port name open)
+  (let ((mu (make-mutex)) (failed? #f) (inner #f))
+    (define (the-inner)
+      (or inner (begin (set! inner (open)) inner)))
     (define (fail!)
       (set! failed? #t)
-      (guard (e (#t #f)) (clear-output-port inner)))
+      (when inner (guard (e (#t #f)) (clear-output-port inner))))
     (define (flush-inner!)
-      (jolt-swallow-io fail! (flush-output-port inner)))
+      (when inner (jolt-swallow-io fail! (flush-output-port inner))))
     (define (put-some! s start count)
       (unless failed?
-        (let ((end (fx+ start count)))
+        (let ((inner (the-inner)) (end (fx+ start count)))
           (let scan ((i start))
             (cond
               ((fx= i end)
@@ -212,17 +217,18 @@
               (else (scan (fx+ i 1))))))))
     (define (put! c)
       (unless failed?
-        (if (and (not (char=? c #\newline))
-                 (fx< (fx+ (textual-port-output-index inner) 1) (textual-port-output-size inner)))
-            (write-char c inner)
-            (jolt-swallow-io fail!
+        (let ((inner (the-inner)))
+          (if (and (not (char=? c #\newline))
+                   (fx< (fx+ (textual-port-output-index inner) 1) (textual-port-output-size inner)))
               (write-char c inner)
-              (when (char=? c #\newline) (flush-output-port inner))))))
+              (jolt-swallow-io fail!
+                (write-char c inner)
+                (when (char=? c #\newline) (flush-output-port inner)))))))
     (let ((p (sa-make-output-port name
                (lambda (c) (jolt-with-mutex mu (put! c)))
                (lambda (s start count) (jolt-with-mutex mu (put-some! s start count)) count)
                (lambda () (jolt-with-mutex mu (unless failed? (flush-inner!))))
-               (lambda () (jolt-with-mutex mu (clear-output-port inner)))
+               (lambda () (jolt-with-mutex mu (when inner (clear-output-port inner))))
                ;; a process stream is never really closed: close flushes, as
                ;; Chez's console ports do
                (lambda () (jolt-with-mutex mu (unless failed? (flush-inner!)))))))
@@ -255,7 +261,7 @@
          (tx (current-transcoder)))
     (define (install! name fd open set-port!)
       (and (not (jolt-std-fd-terminal? fd))
-           (let-values (((p failed? fail!) (jolt-make-failsafe-port name (open (buffer-mode block) tx))))
+           (let-values (((p failed? fail!) (jolt-make-failsafe-port name (lambda () (open (buffer-mode block) tx)))))
              (and p
                   (begin
                     (guard (e (#t #f)) (flush-output-port (if (= fd 1) out0 err0)))
