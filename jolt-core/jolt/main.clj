@@ -927,10 +927,21 @@
 ;;                            is present and --dynamic wasn't passed)
 ;;   ["req"|"opt" cand…]    — load a shared object at runtime, trying each in turn
 ;; dynamic? forces the runtime path for every lib (the --dynamic build flag).
+;;
+;; An :optional spec whose :static archive is not on disk is loaded at runtime
+;; like any other optional native, rather than handed to the linker, which fails
+;; the whole build on the missing file: optional means the app runs without it,
+;; and a tree that never built the optional archive is the common case.
+(defn- missing-optional-archive? [spec static]
+  (and (:optional spec)
+       (= "archive" (first static))
+       (not (jolt.host/file-exists? (second static)))))
+
 (defn- encode-natives [natives dynamic? base]
   (let [plat (current-platform)]
     (vec (for [spec natives]
-           (let [static (and (not dynamic?) (static-link-spec spec plat base))]
+           (let [static (and (not dynamic?) (static-link-spec spec plat base))
+                 static (when-not (missing-optional-archive? spec static) static)]
              (cond
                (:process spec) ["process"]
                static          (into ["static"] static)

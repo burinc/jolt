@@ -1357,30 +1357,10 @@
 ;; CreatePipe pipe is synchronous, and making it otherwise means OVERLAPPED
 ;; structures and completion ports through this whole layer. Correct and
 ;; blocking, rather than clever and unverifiable.
-(define proc-win-read-file
-  (let ((memo #f) (done? #f))
-    (lambda ()
-      (unless done?
-        (set! done? #t)
-        (set! memo (and proc-win?
-                        (begin (win32-load-lib! "kernel32.dll")
-                               (and (sa-foreign-entry? "ReadFile")
-                                    (guard (e (#t #f))
-                                      (sa-foreign-procedure-runtime
-                                       "ReadFile" '(void* void* unsigned-32 void* void*) 'int #t)))))))
-      memo)))
-(define proc-win-write-file
-  (let ((memo #f) (done? #f))
-    (lambda ()
-      (unless done?
-        (set! done? #t)
-        (set! memo (and proc-win?
-                        (begin (win32-load-lib! "kernel32.dll")
-                               (and (sa-foreign-entry? "WriteFile")
-                                    (guard (e (#t #f))
-                                      (sa-foreign-procedure-runtime
-                                       "WriteFile" '(void* void* unsigned-32 void* void*) 'int #t)))))))
-      memo)))
+(define-win32-proc-blocking proc-win-read-file
+  "kernel32.dll" "ReadFile" (void* void* unsigned-32 void* void*) int)
+(define-win32-proc-blocking proc-win-write-file
+  "kernel32.dll" "WriteFile" (void* void* unsigned-32 void* void*) int)
 
 ;; Every entry point the spawn needs. #f for any one of them means this path
 ;; cannot run — see proc-win-spawn-ok? below, and the loud failure in

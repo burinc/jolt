@@ -399,6 +399,126 @@ if grep -q "loaded at runtime" "$work/build.log"; then
   cat "$work/build.log"; exit 1
 fi
 
+# --- an :optional native whose :static archive was never built -------------
+# Optional means the app runs without it, and a tree that skipped building an
+# optional archive is the usual case (a GPU backend on a host without the GPU).
+# The archive used to go to the linker anyway, which failed the whole build on
+# the missing file. It is loaded at runtime instead, like any optional native:
+# here its shared object is present, so the binary still answers 42.
+opt="$work/opt"
+mkdir -p "$opt/src/app" "$opt/native"
+cc $shared "$work/greet.c" -o "$opt/native/libgreet.$soext"
+cat > "$opt/src/app/core.clj" <<'EOF2'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn answer "jolt_static_answer" [] :int)
+(defn -main [& _]
+  (println "answer:" (answer)))
+EOF2
+cat > "$opt/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "greet" :optional true
+                $plat ["$opt/native/libgreet.$soext"]
+                :static {:archive "native/libgreet.a"}}]}
+EOF2
+echo "static-native smoke: building (an :optional native whose archive is missing)"
+if ! (cd / && JOLT_PWD="$opt" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build failed on an optional native's missing archive"; cat "$work/build.log"; exit 1
+fi
+if ! grep -q "greet (optional)" "$work/build.log"; then
+  echo "  FAIL: the build did not say the optional native is loaded at runtime"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42" ]; then
+  echo "  FAIL: optional native with a missing archive: binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+
+# --- a C++ archive: the preload object must depend on the C++ runtime -------
+# A polymorphic class emits typeinfo that refers to libstdc++'s
+# _ZTVN10__cxxabiv117__class_type_infoE, a DATA reference the loader binds when
+# the object loads, whatever --unresolved-symbols says. The build process has no
+# libstdc++, so on ELF the preload object used to fail to load:
+#   native-static.so: undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE
+# The spec's {:lib "stdc++"} is now the object's own dependency.
+if command -v c++ >/dev/null 2>&1; then
+  cxx="$work/cxx"
+  mkdir -p "$cxx/src/app"
+  cat > "$work/shape.cpp" <<'EOF2'
+struct Shape { virtual ~Shape(); virtual int sides() const; };
+Shape::~Shape() {}
+int Shape::sides() const { return 42; }
+extern "C" int jolt_static_answer(void) { Shape *s = new Shape(); int n = s->sides(); delete s; return n; }
+EOF2
+  c++ -fPIC -c "$work/shape.cpp" -o "$work/shape.o"
+  ar rcs "$work/libshape.a" "$work/shape.o"
+  # The C++ runtime's name is the toolchain's: stdc++ (GNU), c++ (macOS, LLVM).
+  # Take the first one both links take: the binary's, which links a {:lib}
+  # statically off macOS (build.ss bld-one-static-link), and the preload's,
+  # which depends on its shared form. Termux has no static C++ runtime, so
+  # there is nothing for a :static {:lib} to name and the case is skipped.
+  printf 'int jolt_static_answer(void);\nint main(void) { return jolt_static_answer() != 42; }\n' > "$work/cxxmain.c"
+  cxxlib=
+  for l in stdc++ c++; do
+    if [ "$(uname -s)" = Darwin ]; then bin_l="-l$l"; else bin_l="-Wl,-Bstatic -l$l -Wl,-Bdynamic"; fi
+    if cc "$work/cxxmain.c" "$work/libshape.a" $bin_l -o "$work/cxxprobe" >/dev/null 2>&1 \
+       && cc -shared "$work/libshape.a" -l"$l" -o "$work/cxxprobe.so" >/dev/null 2>&1; then
+      cxxlib=$l; break
+    fi
+  done
+fi
+if [ -z "${cxxlib:-}" ]; then
+  echo "static-native smoke: skipped the C++ archive case (no c++, or no C++ runtime cc can link)"
+else
+  cat > "$cxx/src/app/core.clj" <<'EOF2'
+(ns app.core
+  (:require [jolt.ffi :as ffi]))
+(ffi/defcfn answer "jolt_static_answer" [] :int)
+(defn -main [& _]
+  (println "answer:" (answer)))
+EOF2
+  cat > "$cxx/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "shape" :static {:archive "$work/libshape.a"}}
+               {:name "cxx" :optional true :static {:lib "$cxxlib"}}]}
+EOF2
+  echo "static-native smoke: building (a C++ archive that needs the C++ runtime)"
+  if ! (cd / && JOLT_PWD="$cxx" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+    echo "  FAIL: jolt build with a C++ static archive exited non-zero"; cat "$work/build.log"; exit 1
+  fi
+  got="$(cd / && "$out" 2>&1)"
+  if [ "$got" != "answer: 42" ]; then
+    echo "  FAIL: C++ static archive binary output mismatch"
+    echo "--- got ----"; echo "$got"; exit 1
+  fi
+  # Beside a non-PIC archive the preload is rebuilt without it, and the C++
+  # archive still needs its runtime in that rebuild. Linux only, as above.
+  if [ "$(uname -s)" = Linux ] && cc -no-pie -E -x c /dev/null -o /dev/null 2>/dev/null; then
+    cat > "$work/nopic2.c" <<'EOF2'
+const char jolt_nopic2_data[] = "static";
+const char *jolt_nopic2(void) { return jolt_nopic2_data; }
+EOF2
+    cc -fno-pie -fno-PIC -c "$work/nopic2.c" -o "$work/nopic2.o"
+    ar rcs "$work/libnopic2.a" "$work/nopic2.o"
+    cat > "$cxx/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "shape" :static {:archive "$work/libshape.a"}}
+               {:name "nopic2" :static {:archive "$work/libnopic2.a"}}
+               {:name "cxx" :optional true :static {:lib "$cxxlib"}}]}
+EOF2
+    echo "static-native smoke: building (a C++ archive beside a non-PIC one)"
+    if ! (cd / && JOLT_PWD="$cxx" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+      echo "  FAIL: jolt build with a C++ archive beside a non-PIC one exited non-zero"; cat "$work/build.log"; exit 1
+    fi
+    got="$(cd / && "$out" 2>&1)"
+    if [ "$got" != "answer: 42" ]; then
+      echo "  FAIL: C++ archive beside a non-PIC one: binary output mismatch"
+      echo "--- got ----"; echo "$got"; exit 1
+    fi
+  fi
+fi
+
 # --- structural: link order (GNU ld left-to-right) --------------------------
 # Static archives that reference system symbols (libm, libpthread) must appear
 # BEFORE the -l flags for those libraries. grep build.ss for the pattern that
@@ -408,4 +528,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + optional missing archive + C++ archive + link order)"
