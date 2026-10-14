@@ -3075,7 +3075,7 @@
 (def-var! "jolt.host" "delete-file!"
   (lambda (p)
     (let ((p (host-user-path p)))
-      (if (file-exists? p) (if (delete-path! p) #t #f) #t))))
+      (if (file-exists? p #f) (if (delete-path! p) #t #f) #t))))
 ;; `rm -rf`, reusing the AOT cache's pruner (which does not follow symlinks).
 (def-var! "jolt.host" "delete-tree!"
   (lambda (p)

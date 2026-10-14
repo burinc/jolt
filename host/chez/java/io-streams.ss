@@ -2136,12 +2136,15 @@
     (jfile-path f)))
 (def-var! "clojure.java.io" "make-parents" jio-make-parents)
 
-;; io/delete-file: delete the file; raise unless :silently truthy.
+;; io/delete-file is (or (.delete (file f)) silently (throw ...)) in
+;; clojure.java.io, so a delete answers true and a quiet failure answers the
+;; silently value itself. The path resolves against the user's directory like
+;; every other io touch; the message names it as given.
 (define (jio-delete-file f . opts)
-  (let ((p (file-path-of f)))
-    (if (delete-path! p) jolt-nil
-        (if (and (pair? opts) (jolt-truthy? (car opts))) jolt-nil
-            (throw-jvm (quote java.io.IOException) (string-append "Couldn't delete " p))))))
+  (cond ((delete-path! (path-of f)) #t)
+        ((and (pair? opts) (jolt-truthy? (car opts))) (car opts))
+        (else (throw-jvm (quote java.io.IOException)
+                         (string-append "Couldn't delete " (file-path-of f))))))
 (def-var! "clojure.java.io" "delete-file" jio-delete-file)
 
 ;; io/copy: file/path/reader/stream/string/byte[] -> writer/stream/file/path.
