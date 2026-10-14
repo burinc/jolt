@@ -137,8 +137,8 @@
 ;; 6-8x here from memory effects alone). A bad rewrite that copies the
 ;; REMAINING work per visit is O(work-list^2): ~V^2/2 copies on the wide graph
 ;; and nothing extra on the chain, so the ratio explodes (~250x at this V).
-;; Judged best-of-3 within this one process; V is small enough that a REGRESSED
-;; walk (~112M copies) still finishes and fails rather than hanging the gate.
+;; V is small enough that a REGRESSED walk (~112M copies) still finishes and
+;; fails rather than hanging the gate.
 (define (dce-gate-wide-graph v)
   (let ((edges (make-hashtable string-hash string=?)))
     (hashtable-set! edges "root"
@@ -157,27 +157,45 @@
                         (list (string-append "c" (number->string (fx+ i 1)))))
         (loop (fx+ i 1))))
     edges))
-;; No explicit GC before timing (collect is Chez-only and portcheck-blocked):
-;; a collection landing inside one run is absorbed by the best-of-3 minimum.
-(define (dce-gate-reach-ms edges root want)
-  (let ((t0 (current-time 'time-monotonic)))
-    (let ((r (dce-reachable edges (list root))))
-      (let ((t1 (current-time 'time-monotonic)))
-        (gate-check "reachable: closure size" (hashtable-size r) want)
-        (+ (* 1000.0 (- (time-second t1) (time-second t0)))
-           (/ (- (time-nanosecond t1) (time-nanosecond t0)) 1000000.0))))))
-(define (dce-gate-best-of k thunk)
-  (let loop ((i 1) (best (thunk)))
-    (if (fx=? i k) best (loop (fx+ i 1) (min best (thunk))))))
+;; Timed as test/complexity_test.clj times its rows. The two arms alternate, one
+;; sample of each per round with the order swapped every round, so a busy stretch
+;; lands on both instead of on one arm's whole best-of block (this took best-of-3
+;; of the wide walk and then best-of-3 of the chain). Each arm is judged on its
+;; fastest sample over all rounds, since interference only ever makes a walk
+;; slower; each round starts from a full collection (sa-gc-collect, the
+;; adapter's portable System.gc); a sample is one walk of 2-7ms on the nanosecond
+;; clock; and a miss is measured once more before it counts. There is no
+;; fail-on-sight threshold: the work-list-copying walk reads ~250 on the
+;; re-measure too.
+(define (dce-gate-walk-ns edges root)
+  (let ((t0 (sa-monotonic-ns)))
+    (dce-reachable edges (list root))
+    (- (sa-monotonic-ns) t0)))
+(define (dce-gate-wide/chain wide chain)
+  (let loop ((i 0) (tw +inf.0) (tc +inf.0))
+    (if (fx=? i 7)
+        (list (/ tw 1e6) (/ tc 1e6) (/ tw (max tc 1.0)))
+        (begin
+          (sa-gc-collect)
+          (if (even? i)
+              (let* ((a (dce-gate-walk-ns wide "root")) (b (dce-gate-walk-ns chain "c0")))
+                (loop (fx+ i 1) (min tw a) (min tc b)))
+              (let* ((b (dce-gate-walk-ns chain "c0")) (a (dce-gate-walk-ns wide "root")))
+                (loop (fx+ i 1) (min tw a) (min tc b))))))))
 (let* ((v1 15000)
        (wide (dce-gate-wide-graph v1))          ; v1+2 nodes, work list ~v1 deep
-       (chain (dce-gate-chain-graph (* 2 v1)))  ; 2*v1+1 nodes, work list ~1 deep
-       (tw (dce-gate-best-of 3 (lambda () (dce-gate-reach-ms wide "root" (+ v1 2)))))
-       (tc (max 0.05 (dce-gate-best-of 3 (lambda () (dce-gate-reach-ms chain "c0" (+ (* 2 v1) 1))))))
-       (ratio (/ tw tc)))
-  (printf "dce-reachable work-list independence: wide ~ams, chain ~ams, ratio ~a (independent ~~1, work-list-copying ~~250, ceiling 5)\n"
-          tw tc ratio)
-  (gate-check "reachable: cost independent of work-list depth" (<= ratio 5.0) #t))
+       (chain (dce-gate-chain-graph (* 2 v1)))) ; 2*v1+1 nodes, work list ~1 deep
+  ;; the closures are right before their cost is judged (and this warms both)
+  (gate-check "reachable: wide closure size" (hashtable-size (dce-reachable wide '("root"))) (+ v1 2))
+  (gate-check "reachable: chain closure size" (hashtable-size (dce-reachable chain '("c0"))) (+ (* 2 v1) 1))
+  (let* ((m1 (dce-gate-wide/chain wide chain))
+         (m (if (<= (caddr m1) 5.0)
+                m1
+                (begin (printf "dce-reachable work-list independence: ratio ~,2f over 5, measuring again\n" (caddr m1))
+                       (dce-gate-wide/chain wide chain)))))
+    (printf "dce-reachable work-list independence: wide ~,2fms, chain ~,2fms, ratio ~,2f (independent ~~1, work-list-copying ~~250, ceiling 5)\n"
+            (car m) (cadr m) (caddr m))
+    (gate-check "reachable: cost independent of work-list depth" (<= (caddr m) 5.0) #t)))
 
 ;; --- dce-def-var-form: which prelude records are prunable ---------------------
 ;; A def whose value holds an anonymous fn literal is minted with its source
