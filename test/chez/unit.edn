@@ -1749,6 +1749,10 @@
   {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (with-out-str (clojure.pprint/pprint [1 2] *out*)))" :expected "\"[1 2]\\n\""}
   {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] (clojure.pprint/pprint {:a 1} (java.io.PrintWriter. sw)) (str sw)))" :expected "\"{:a 1}\\n\""}
   {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] (clojure.pprint/cl-format sw \"~a!\" 1) (str sw)))" :expected "\"1!\""}
+  ;; pprint and (cl-format true ...) print to a Writer bound to *out*, as on the JVM,
+  ;; and nothing reaches the port underneath it (the outer with-out-str stays empty)
+  {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] [(with-out-str (binding [*out* sw] (clojure.pprint/pprint {:a 1}))) (str sw)]))" :expected "[\"\" \"{:a 1}\\n\"]"}
+  {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] [(with-out-str (binding [*out* sw] (clojure.pprint/cl-format true \"~a!\" 1))) (str sw)]))" :expected "[\"\" \"1!\"]"}
   {:suite "sbdirect" :expr "(let [bos (java.io.ByteArrayOutputStream.) ps (java.io.PrintStream. bos) r (.printf ps \"%d-%s\" (to-array [1 \"b\"]))] (.flush ps) [(str bos) (identical? r ps)])" :expected "[\"1-b\" true]"}
   {:suite "strdirect" :expr "(let [str-trim (fn [_] \"SHADOWED\")] (.trim \"  a  \"))" :expected "\"a\""}
   {:suite "type" :expr "(type 5)" :expected "java.lang.Long"}
