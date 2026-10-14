@@ -2090,7 +2090,11 @@
                    type-name
                    #f))
             (not (hashtable-ref chez-deftype-tag-set type-name #f))
-            (or (jch-known? base) (jch-known? type-name)))
+            (if (dotted-name? type-name)
+                (or (jch-known-exact? type-name)
+                    (and (not (string=? base type-name))
+                         (jch-known? base)))
+                (jch-known? type-name)))
        (jch-last-segment type-name))
       ((dotted-name? type-name) type-name)
       ((and (fx>? (string-length type-name) 1)
