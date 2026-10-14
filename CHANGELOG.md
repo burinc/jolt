@@ -98,6 +98,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Thread/sleep` sleeps for what it is asked.** Since 0.8.21 a timed wait
+  on a thread counted its timeout from the truncated millisecond, so it ran up
+  to 1ms past its deadline, and `(Thread/sleep 1)` took 2.5ms. `(Thread/sleep
+  0)` waited for the next tick of the clock (~1.25ms) instead of returning,
+  and `(Thread/sleep ms nanos)` dropped the nanos, so `(Thread/sleep 0
+  100000)` was the same 1.25ms. A sleep's deadline is now exact, nanos and a
+  `TimeUnit` finer than a millisecond included: `(Thread/sleep 1)` takes
+  ~1.25ms on macOS (the OS's own wake latency), `(Thread/sleep 0 100000)`
+  ~0.13ms, and `(Thread/sleep 0)` yields, throwing first if the thread is
+  interrupted, as the JDK's does. Other timed waits keep whole-millisecond
+  deadlines, rounded up, but no longer overshoot them. `Thread/sleep` also
+  refuses a negative timeout and nanos outside 0..999999 with
+  IllegalArgumentException, as the JDK does, and `TimeUnit.sleep` of zero or
+  less returns at once without checking the interrupt flag. A zero timeout is
+  due at once: `(.poll q 0 TimeUnit/MILLISECONDS)` and `(deref p 0 nil)` waited
+  for the next clock tick, ~1.25ms a call, and now return in well under a
+  microsecond.
+
 - **stderr is its own stream on Windows (#1331).** Chez's check for whether
   stdout and stderr are the same file compared stdout's file with itself, so
   with both streams redirected to files, everything written to `System/err`,

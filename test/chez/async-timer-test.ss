@@ -204,6 +204,64 @@
         (let spin () (when (< (mono-millis) d) (spin)))
         (loop (+ i 1) (if (< (- (mono-ns) t0) 2000000) (+ short 1) short)))))
 
+;; --- 10. a timed wait does not run past its deadline ----------------------
+;; The relative timeout a thread waits with was (- deadline (mono-millis)) ms,
+;; counted from the truncated millisecond, so it ended up to 1ms after the
+;; deadline, and (Thread/sleep 1) took 2.5ms. The timeout handed to
+;; condition-wait must not exceed the time actually left. (Thread/sleep 0) waited
+;; for the next tick of the clock, and (Thread/sleep 0 n) dropped the n.
+(printf "\n== 10. a timed wait does not run past its deadline ==\n")
+(define (duration-ns d) (+ (* 1000000000 (time-second d)) (time-nanosecond d)))
+(let loop ((i 0) (over 0))
+  (if (= i 50)
+      (ok "10a. no timeout reaches past its deadline" (= over 0))
+      (let* ((d (mono-deadline 2))
+             (left (- (* 1000000 d) (mono-ns)))
+             (w (duration-ns (jolt-deadline->timeout d))))
+        (loop (+ i 1) (if (> w left) (+ over 1) over)))))
+;; Timing rows compare two things measured interleaved in this one run, not a
+;; wall-clock bound: a loaded runner (the Android emulator) stretches a yield and
+;; a wake alike, and an absolute ceiling read that as a regression.
+(define (time-ns thunk) (let ((t0 (mono-ns))) (thunk) (- (mono-ns) t0)))
+(define (median xs) (list-ref (sort < xs) (quotient (length xs) 2)))
+(define (paired-medians a b n)   ; -> (median-of-a . median-of-b), interleaved
+  (let loop ((i 0) (as '()) (bs '()))
+    (if (= i n)
+        (cons (median as) (median bs))
+        (let* ((ta (time-ns a)) (tb (time-ns b)))
+          (loop (+ i 1) (cons ta as) (cons tb bs))))))
+;; sleep(0) is a yield, so it costs what a yield costs; waiting for the next tick
+;; of the millisecond clock cost ~1ms more than that.
+(ok "10b. sleep(0) costs a yield, not a clock tick"
+    (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms 0))
+                             (lambda () (unless (jolt-fiber-wait-turn! 0) (thread-yield!)))
+                             51)))
+      (or (<= (car m) (+ (* 4 (cdr m)) 200000))
+          (begin (printf "    sleep(0) ~ans vs yield ~ans\n" (car m) (cdr m)) #f))))
+(ok "10c. sleep(0, 100000) is not cut to nothing"
+    (let loop ((i 0))
+      (or (= i 20)
+          (let ((t0 (mono-ns)))
+            (jolt-thread-sleep-ms+ns 0 100000)
+            (and (>= (- (mono-ns) t0) 100000) (loop (+ i 1)))))))
+;; and not rounded up to a whole millisecond, which would make it cost what
+;; sleep(1) costs
+(ok "10d. and not stretched to a millisecond either"
+    (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms+ns 0 100000))
+                             (lambda () (jolt-thread-sleep-ms 1))
+                             31)))
+      (or (< (car m) (* 3/4 (cdr m)))
+          (begin (printf "    sleep(0, 100000) ~ans vs sleep(1) ~ans\n" (car m) (cdr m)) #f))))
+
+;; A timeout of zero or less is already due: rounding now up made (.poll q 0 ms)
+;; and (deref p 0 nil) wait for the next tick of the clock, ~1ms a call, where
+;; the JDK's return at once.
+(ok "10e. a zero or negative timeout is due as it is made"
+    (let loop ((i 0))
+      (or (= i 50)
+          (and (mono-due? (mono-deadline 0)) (mono-due? (mono-deadline -5))
+               (loop (+ i 1))))))
+
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
 (printf "async-timer gate: PASS\n")
