@@ -1564,6 +1564,177 @@
       (bld-static-lib-links? (jolt-str-render-one name)
                              (if (string? dir) dir "")))))
 
+;; --- a {:lib} native has to supply what the app binds ----------------------
+;; A ("lib" name libdir) form is linked like any -l library: the linker keeps an
+;; archive member only when other linked code references one of its symbols. A
+;; defcfn is no such reference, because the binary looks its symbol up when it
+;; runs (jolt-ffi-dlsym-native, then the process table). So a {:lib} naming the
+;; library the app calls directly links cleanly and the binary dies at the first
+;; call with "no entry for <sym>". {:lib} is right for a library an :archive
+;; native depends on (stdc++ under a C++ archive, which the archive's own
+;; references pull in); for anything the app binds, {:archive} force-loads it.
+;; The link stays as it is; after it, every symbol the app binds that one of its
+;; {:lib} archives defines must be in the binary, or the build fails naming the
+;; :archive form that would put it there.
+
+;; The C symbols the emitted app binds. Each foreign binding emit-ffi-fn writes
+;; resolves its symbol through one of these two runtime entries, with the symbol
+;; as the string literal right after the name, so the emitted text names exactly
+;; the bindings the binary carries — after any tree shake, and including a
+;; dependency's. The static-native smoke's {:lib} case fails if either shape
+;; stops matching what the backend writes.
+(define bld-ffi-symbol-entries '("(jolt-ffi-dlsym-native \"" "(jolt-ffi-varargs-cache \""))
+(define (bld-ffi-symbols-in strs)
+  (let ((seen (make-hashtable string-hash string=?)))
+    (define (prefix-at? s i p)
+      (let ((n (string-length s)) (m (string-length p)))
+        (and (<= (+ i m) n)
+             (let loop ((k 0))
+               (or (= k m)
+                   (and (char=? (string-ref s (+ i k)) (string-ref p k)) (loop (+ k 1))))))))
+    ;; the literal opening at q (a #\"): its end, past escapes, read back by the
+    ;; Scheme reader so an escaped character comes out as the character
+    (define (literal-at s q)
+      (let ((n (string-length s)))
+        (let loop ((j (+ q 1)))
+          (cond ((>= j n) #f)
+                ((char=? (string-ref s j) #\\) (loop (+ j 2)))
+                ((char=? (string-ref s j) #\")
+                 (read (open-string-input-port (substring s q (+ j 1)))))
+                (else (loop (+ j 1)))))))
+    (for-each
+      (lambda (s)
+        (when (string? s)
+          (let ((n (string-length s)))
+            (let loop ((i 0))
+              (when (< i n)
+                (when (char=? (string-ref s i) #\()
+                  (for-each
+                    (lambda (p)
+                      (when (prefix-at? s i p)
+                        (let ((sym (literal-at s (+ i (string-length p) -1))))
+                          (when (string? sym) (hashtable-set! seen sym #t)))))
+                    bld-ffi-symbol-entries))
+                (loop (+ i 1)))))))
+      strs)
+    (vector->list (hashtable-keys seen))))
+
+(define bld-nm-tool
+  (delay
+    (let loop ((ts '("nm" "llvm-nm")))
+      (cond ((null? ts) #f)
+            ((> (string-length (bld-sh-capture (string-append "command -v " (car ts) " 2>/dev/null"))) 0)
+             (car ts))
+            (else (loop (cdr ts)))))))
+
+;; `nm -g -P` of FILE: (defined . undefined), two hashtables of C names. Mach-O
+;; names carry a leading underscore the C name does not; an archive's member
+;; headers ("libx.a[x.o]:") have one field and drop out. #f when nm fails.
+(define (bld-nm-symbols nm file builddir)
+  (let* ((log (string-append builddir "/nm.out"))
+         (rc (jolt-with-empty-sigmask
+               (lambda ()
+                 (system (bld-sh-wrap (string-append nm " -g -P " (bld-sh-quote file)
+                                                     " > '" log "' 2>/dev/null")))))))
+    (and (zero? rc)
+         (let ((defined (make-hashtable string-hash string=?))
+               (undefined (make-hashtable string-hash string=?))
+               (ip (open-input-file log)))
+           (let loop ()
+             (let ((l (get-line ip)))
+               (unless (eof-object? l)
+                 (let* ((sp (let find ((i 0))
+                              (cond ((>= i (string-length l)) #f)
+                                    ((char=? (string-ref l i) #\space) i)
+                                    (else (find (+ i 1))))))
+                        (name (and sp (substring l 0 sp)))
+                        (type (and sp (< (+ sp 1) (string-length l)) (string-ref l (+ sp 1)))))
+                   (when (and name type (> (string-length name) 0))
+                     (let ((c (if (and (bld-tgt-osx?) (char=? (string-ref name 0) #\_))
+                                  (substring name 1 (string-length name))
+                                  name)))
+                       (hashtable-set! (if (memv type '(#\U #\w #\v)) undefined defined) c #t))))
+                 (loop))))
+           (close-port ip)
+           (delete-file log)
+           (cons defined undefined)))))
+
+;; The archive a ("lib" name libdir) form links, found the way the linker finds
+;; it: the native's :libdir first, then the compiler's own search path
+;; (-print-file-name, which answers the bare name back on a miss). #f when there
+;; is none — or, on macOS, when the :libdir holds a shared form ld64 would take
+;; over the .a, which leaves nothing for this check to catch.
+(define (bld-lib-archive name dir)
+  (let ((file (string-append "lib" name ".a"))
+        (in-dir (lambda (f) (and (> (string-length dir) 0)
+                                 (file-exists? (string-append dir "/" f))
+                                 (string-append dir "/" f)))))
+    (cond
+      ((and (bld-tgt-osx?)
+            (or (in-dir (string-append "lib" name ".dylib")) (in-dir (string-append "lib" name ".tbd"))))
+       #f)
+      ((in-dir file) => (lambda (p) p))
+      (else
+       (let ((p (bld-sh-capture (string-append (bld-cc) " " (bld-arch-flag)
+                                               " -print-file-name=" file " 2>/dev/null"))))
+         (and (> (string-length p) 0) (not (string=? p file)) (file-exists? p) p))))))
+
+(define (bld-render-lib-static name dir)
+  (string-append "{:lib \"" name "\"" (if (> (string-length dir) 0) (string-append " :libdir \"" dir "\"") "") "}"))
+
+(define (bld-check-lib-native-symbols! natives app-strs out-path)
+  (let ((libs (filter (lambda (f) (string=? (car f) "lib")) (bld-static-forms natives))))
+    (unless (or (null? libs) (bld-cross?))
+      (let ((declared (bld-ffi-symbols-in app-strs))
+            (builddir (string-append out-path ".build")))
+        (unless (null? declared)
+          (let ((nm (force bld-nm-tool)))
+            (if (not nm)
+                (display "jolt build: note — no nm on PATH, so the build did not check that its :static {:lib} natives supply the symbols the app binds\n")
+                (let ((bin (bld-nm-symbols nm out-path builddir)))
+                  (if (not bin)
+                      (display (string-append "jolt build: note — nm could not read " out-path
+                                              ", so the build did not check its :static {:lib} natives\n"))
+                      ;; a name the binary defines, or imports from a library it
+                      ;; links, resolves when the binary runs
+                      (let ((absent (filter (lambda (s) (not (or (hashtable-ref (car bin) s #f)
+                                                                 (hashtable-ref (cdr bin) s #f))))
+                                            declared)))
+                        (unless (null? absent)
+                          (let ((problems
+                                  (fold-left
+                                    (lambda (acc form)
+                                      (let* ((name (cadr form)) (dir (caddr form))
+                                             (archive (bld-lib-archive name dir))
+                                             (syms (and archive (bld-nm-symbols nm archive builddir))))
+                                        (if (not syms)
+                                            acc
+                                            (let ((missing (filter (lambda (s) (hashtable-ref (car syms) s #f)) absent)))
+                                              (if (null? missing) acc
+                                                  (cons (list name dir archive (list-sort string<? missing)) acc))))))
+                                    '() libs)))
+                            (unless (null? problems)
+                              ;; the binary would fail at its first call; do not
+                              ;; leave it where it can be shipped
+                              (when (file-exists? out-path) (delete-file out-path))
+                              (error 'jolt-build (bld-lib-native-message (reverse problems))))))))))))))))
+
+(define (bld-lib-native-message problems)
+  (apply string-append
+    (map (lambda (p)
+           (let* ((name (car p)) (dir (cadr p)) (archive (caddr p)) (syms (cadddr p))
+                  (one? (null? (cdr syms)))
+                  (names (fold-left (lambda (s x) (string-append s ", " x)) (car syms) (cdr syms))))
+             (string-append
+               "the binary is missing " names ", which the app binds (defcfn) from the\n"
+               "  :jolt/native with :static " (bld-render-lib-static name dir) ".\n"
+               "  A {:lib} native is linked like any -l library: the linker keeps only the\n"
+               "  archive members other linked code calls, and a defcfn makes no such call\n"
+               "  (the binary looks " (if one? "the symbol" "each symbol") " up when it runs), so the first\n"
+               "  call would fail with \"no entry for " (car syms) "\". Link the whole archive instead:\n"
+               "    :static {:archive \"" archive "\"}\n")))
+         problems)))
+
 ;; Walk an embed root recursively; return (resource-name . abspath) pairs, where
 ;; resource-name is the "/"-joined path under the root (what io/resource is asked for).
 (define (bld-walk-files root rel acc)
@@ -2388,6 +2559,10 @@
                 (ei-form-cache-clear!)))))
         (when drop-compiler? (display "jolt build: dropping compiler image (no runtime eval)\n"))
       (ei-mark! "emit app namespaces")
+      ;; The emit walk named each file it read (jolt-enter-file!) so a failure
+      ;; in it reports where; it is over, and a later failure (the link, the
+      ;; {:lib} check) is no file's, so it must not be reported "at" the last one.
+      (jolt-current-source #f)
       (ei-acc-report!)
       (let* ((builddir (string-append out-path ".build"))
              (flat-ss  (string-append builddir "/flat.ss"))
@@ -2677,7 +2852,10 @@
           (else
            (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
                           (bld-native-link-flags natives)
-                          (and drop-compiler? (not bld-nt?)))))))))))
+                          (and drop-compiler? (not bld-nt?)))))
+        ;; 5. what the linker kept is only known from the output: a {:lib}
+        ;; native has to supply the symbols the app binds
+        (bld-check-lib-native-symbols! natives app-strs out-path)))))))
 
 ;; --- self-contained link (in-process compile + append the boot to the stub) ---
 ;; compile-file runs against the DEFAULT interaction environment, so the boot's

@@ -98,6 +98,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jolt build` refuses a `:static {:lib …}` native that cannot supply what
+  the app binds.** A `{:lib}` is linked like any `-l` library, so the linker
+  keeps only the archive members other linked code references, and a `defcfn`
+  is not such a reference: the binary looks its symbol up when it runs. Naming
+  the library the app calls directly as a `{:lib}` built cleanly and left a
+  binary that died at the first call with `foreign-procedure: no entry for
+  "…"`. After the link the build now checks, with `nm`, that every symbol the
+  app binds and a `{:lib}` archive defines is in the binary, and otherwise
+  fails naming the symbol, the native, and the `:static {:archive "…"}` form
+  (with the archive's path, found the way the linker found it) that links the
+  whole archive. A `{:lib}` the archives depend on, such as `stdc++` under a
+  C++ archive, is unaffected. Builds with no `{:lib}` native run no `nm`, and
+  one with no `nm` on PATH skips the check with a note.
+
 - **Timed waits end at their deadline, not a millisecond tick after it.** Every
   timed wait but `Thread/sleep` built its deadline as a whole millisecond
   rounded up from now, so with the wake latency on top `(deref p 1 nil)` took
