@@ -22,6 +22,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `JOLT_STACK_LIMIT` sets it (`512m`, `2g`) or turns it off (`-1`, `0`, `off`,
   `none`); `jolt.host/stack-limit` reads it. The stack is measured after each
   collection, so ordinary code pays nothing for it. Not on Gambit.
+- **`jolt.ffi/read-into!` takes a type**, to refill an existing array instead
+  of allocating a new one per read. A binding that reads the same C buffer
+  every frame (a physics engine's body positions, an audio block) got a fresh
+  array from each `read-array`, garbage within the frame:
+  `(ffi/read-into! p :double arr)` fills the `double-array` it is given
+  instead. For 6000 doubles a call allocates about 4 KB where `read-array`
+  allocates 52 KB, and takes 7.6 µs against 10. It is `write-array` in the other
+  direction, in babashka.ffi's argument order: `(read-into! p t arr offset)`
+  reads from `offset` bytes into `p`, and `(read-into! p t arr offset index
+  count)` fills `count` elements from `arr[index]`. An integer type
+  fills the array `read-array` answers for it (`int-array` for `:int32`);
+  `:float` and `:double` each fill a `float-array` or a `double-array`, as
+  `write-array` writes either from either, so a program that keeps its data in
+  `double-array`s can read `:float` into them. A `:float` widens exactly, and
+  a `:double` rounds to single in a `float-array`, as `aset` rounds it. A
+  range outside the array, or an array that cannot hold the type's elements,
+  throws before anything is written. The four-argument byte form,
+  `(read-into! p arr off n)` with `off` an index into the byte-array, is
+  unchanged. Not on Gambit.
+- **`jolt.ffi/write-array` writes part of an array.**
+  `(ffi/write-array p :float staging offset index count)` writes
+  `staging[index, index+count)`, so a staging array sized for the largest batch
+  (instance matrices, draw commands, audio samples) can be written part full
+  without first copying its used part into a right-sized array. A range
+  outside the array throws before anything is written. The index and count
+  trail the byte offset, so position four is a byte offset in every typed
+  form, as in babashka.ffi.
+- **More of babashka.ffi's API.** `(ffi/find-symbol lib sym)` searches only the
+  library `load-library` answered, and its dependencies; on Windows, where
+  libraries load into the process namespace, it throws. `ffi/with-open` is
+  `clojure.core/with-open` under babashka.ffi's name. `reinterpret` also takes
+  babashka.ffi's order, `(reinterpret p size arena cleanup?)`, beside jolt's
+  arena-first one; a pointer and an arena differ in type, so neither order can
+  be read as the other.
 
 ### Changed
 
@@ -52,6 +86,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a loopback peer went from 1.7 s to 0.18 s.
 
 ### Fixed
+
+- **A negative array length throws `NegativeArraySizeException`**, with the
+  length as its message, as on the JVM. `(double-array -1)`, the other typed
+  constructors, `make-array` and `jolt.ffi/read-array` raised a
+  `ClassCastException` carrying Chez's "make-flvector: -1 is not a valid
+  flvector length" (or the fxvector, bytevector or vector constructor's).
+
+- **A program keeps running after its output's reader goes away (#1331).**
+  `jolt app | head -1`, or a backgrounded `jolt build` whose parent stopped
+  reading, died with "broken pipe" on its next print. As on the JVM, whose
+  `System.out` is a `PrintStream`, a write that fails is now dropped,
+  `checkError` answers true, and the program carries on. This applies to
+  stdout and stderr when they are not a terminal.
 
 - **The seed mint refuses a reference above its def.** `make remint` compiles
   each source form in a process that already holds the previous seed, so a
@@ -96,6 +143,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now always means `clojure.core`'s, as in the JVM compiler, so a namespace
   that excludes `ns` and defines its own (`sci.core`) no longer breaks the
   `ns` form of every library it requires on a reload.
+
+- **A host-called seam no longer shows up in later stack traces.** The fns a
+  library registers with `__register-eq!`, `__register-hash!`, `__register-str!`
+  and the other value seams run inside the host's `=`, `hash` and `str` of any
+  value. A tail call in one stored the site of an erased frame that nothing
+  cleared on return, so the next error thrown from host code named the seam fn
+  as its innermost frame. With jolt-lang/time loaded, every nREPL error's trace
+  started with `jolt.time.impl/jt?`. The site is now put back when a seam fn
+  returns.
 
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
@@ -211,6 +267,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streams, and a socket's streams answer `readAllBytes`, `readNBytes`, `skip`
   and the other methods `InputStream` and `OutputStream` define over `read`
   and `write`.
+
+### Performance
+
+- **`jolt.ffi/read-array` and `write-array` with a numeric type are 20 to 120
+  times faster.** `(ffi/read-array p :double n)` read one element at a time,
+  through a var call that converted the type keyword and unboxed the pointer at
+  every element: about 140 ns an element. It now block-copies the memory and
+  decodes it straight into the array's backing; 6000 doubles went from 830 to
+  10 µs, and 6000 ints from 585 to 25. `write-array` encodes and block-copies
+  the same way, and 6000 doubles went from 920 to 7.7 µs. A `:float` element no
+  longer boxes a flonum on the way (16 bytes an element). The copy moves 4 KB
+  at a time, so a large read allocates its array and no second copy of it,
+  and a write allocates at most 4 KB. This holds for `:double`, `:float` and
+  the 2-, 4- and 8-byte integer and pointer types; the results are the same
+  arrays as before. A vector passed to `write-array`, or a `long-array`
+  holding a value past the fixnum range, still takes the element loop. Not on
+  Gambit.
+- **`System/arraycopy` between two `double`, `float`, `long`, `int` or `short`
+  arrays is a block move**, as it already was for byte arrays: 6000 doubles
+  went from 97 to 0.8 µs, and no longer allocate a flonum each.
 
 ## [0.8.21] - 2026-10-11
 

@@ -650,6 +650,9 @@
 ;; ---- terminal tier (capability: terminal) -----------------------------------
 ;; No terminal on this target, the contract's permitted degradation: the
 ;; terminal is never claimed, and the REPL reads lines as it does from a pipe.
+;; (sa-make-output-port name put! put-some! flush! clear! close!) -> #f: no
+;; handler-backed ports here, so the process streams stay Gambit's own.
+(define (sa-make-output-port . _) #f)
 (define (sa-term-open) #f)
 (define (sa-term-closed . _) (error "sa-term: no terminal on this target"))
 (define sa-term-raw! sa-term-closed)
@@ -677,6 +680,31 @@
 (define-syntax sa-ufx=? (syntax-rules () ((_ a b) (fx=? a b))))
 (define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (vector-ref v i))))
 (define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (vector-set! v i x))))
+;; The flonum family. Gambit binds no flvector and no R6RS bytevector-ieee
+;; accessors: its flonum vector is the f64vector, a bytevector is a u8vector,
+;; and an IEEE pattern converts through ##flonum->ieee754-32/64 and back. So
+;; these are the checked equivalents built from those, in native byte order
+;; (sa-endian: little on every supported platform). Nothing on this target
+;; calls them yet (typed arrays and the ffi tier are Chez-only); they keep the
+;; contract whole for the day something does.
+(define (sa-g-bv-uint bv at width)
+  (let loop ((k (- width 1)) (acc 0))
+    (if (< k 0) acc (loop (- k 1) (+ (* acc 256) (u8vector-ref bv (+ at k)))))))
+(define (sa-g-bv-uint-set! bv at width n)
+  (let loop ((k 0) (n n))
+    (when (< k width)
+      (u8vector-set! bv (+ at k) (bitwise-and n 255))
+      (loop (+ k 1) (arithmetic-shift n -8)))))
+(define-syntax sa-uflvector-ref (syntax-rules () ((_ v i) (f64vector-ref v i))))
+(define-syntax sa-uflvector-set! (syntax-rules () ((_ v i x) (f64vector-set! v i x))))
+(define-syntax sa-ubytevector-ieee-single-native-ref
+  (syntax-rules () ((_ bv at) (##ieee754-32->flonum (sa-g-bv-uint bv at 4)))))
+(define-syntax sa-ubytevector-ieee-single-native-set!
+  (syntax-rules () ((_ bv at x) (sa-g-bv-uint-set! bv at 4 (##flonum->ieee754-32 x)))))
+(define-syntax sa-ubytevector-ieee-double-native-ref
+  (syntax-rules () ((_ bv at) (##ieee754-64->flonum (sa-g-bv-uint bv at 8)))))
+(define-syntax sa-ubytevector-ieee-double-native-set!
+  (syntax-rules () ((_ bv at x) (sa-g-bv-uint-set! bv at 8 (##flonum->ieee754-64 x)))))
 ;; gambit's vector-copy! / string-copy! have the R7RS shape already
 (define (sa-vector-copy-range! to at from start end)
   (vector-copy! to at from start end))

@@ -1640,6 +1640,46 @@
 (define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
 
 
+;; ---- handler-backed output ports ---------------------------------------------
+;; (sa-make-output-port name put! put-some! flush! clear! close!) -> port | #f
+;; A textual output port with no buffer of its own: every character written to
+;; it reaches PUT! (char) or PUT-SOME! (string start count -> count), and
+;; flush-output-port / clear-output-port / close-port reach FLUSH!, CLEAR! and
+;; CLOSE!. R6RS custom ports cannot be this: they buffer, and their flush only
+;; drains that buffer into write!, so a port that owns a buffer further down
+;; never hears about the flush. It is how Chez builds its own console ports
+;; (s/io.ss thread-safe-console-output-port), from a port-handler record whose
+;; type is read off an existing port, since the constructor is not exported.
+;; Contract: the port described. Degradation: #f, on a Chez whose port-handler
+;; record does not have the fields compared here (10.4 and 10.5 do), or any
+;; target without handler-backed ports; the caller keeps the ports it has.
+(define sa-port-handler-fields
+  '#(ready? lookahead unget get get-some clear-input put put-some flush
+     clear-output close-port port-position set-port-position! port-length
+     set-port-length! port-nonblocking? set-port-nonblocking!))
+(define sa-port-handler-maker
+  (let ((memo 'unresolved))
+    (lambda ()
+      (when (eq? memo 'unresolved)
+        (set! memo
+          (guard (e (#t #f))
+            (let ((rtd (#%$record-type-descriptor (#%$port-handler (current-output-port)))))
+              (and (equal? (record-type-field-names rtd) sa-port-handler-fields)
+                   (record-constructor (make-record-constructor-descriptor rtd #f #f)))))))
+      memo)))
+(define (sa-make-output-port name put! put-some! flush! clear! close!)
+  (let ((mk (sa-port-handler-maker)))
+    (and mk
+         (#%$make-textual-output-port name
+           (mk #f #f #f #f #f #f
+               (lambda (who p c) (put! c))
+               (lambda (who p s start count) (put-some! s start count))
+               (lambda (who p) (flush!))
+               (lambda (who p) (clear!))
+               (lambda (who p) (close!))
+               #f #f #f #f #f #f)
+           ""))))
+
 ;; ---- terminal tier (capability: terminal) -----------------------------------
 ;; The interactive REPL's line editor drives the console through the terminal
 ;; layer of Chez's own expression editor: the kernel's "(cs)ee_*" entries, a
@@ -1735,6 +1775,16 @@
 (define-syntax sa-ufx=? (syntax-rules () ((_ a b) (#3%fx=? a b))))
 (define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (#3%vector-ref v i))))
 (define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (#3%vector-set! v i x))))
+(define-syntax sa-uflvector-ref (syntax-rules () ((_ v i) (#3%flvector-ref v i))))
+(define-syntax sa-uflvector-set! (syntax-rules () ((_ v i x) (#3%flvector-set! v i x))))
+(define-syntax sa-ubytevector-ieee-single-native-ref
+  (syntax-rules () ((_ bv at) (#3%bytevector-ieee-single-native-ref bv at))))
+(define-syntax sa-ubytevector-ieee-single-native-set!
+  (syntax-rules () ((_ bv at x) (#3%bytevector-ieee-single-native-set! bv at x))))
+(define-syntax sa-ubytevector-ieee-double-native-ref
+  (syntax-rules () ((_ bv at) (#3%bytevector-ieee-double-native-ref bv at))))
+(define-syntax sa-ubytevector-ieee-double-native-set!
+  (syntax-rules () ((_ bv at x) (#3%bytevector-ieee-double-native-set! bv at x))))
 ;; (sa-vector-copy-range! to at from start end): the R7RS shape over Chez's
 ;; (vector-copy! from from-start to to-start count).
 (define (sa-vector-copy-range! to at from start end)

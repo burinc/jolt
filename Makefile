@@ -188,7 +188,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
-  systemstreams userdirpaths utf8decode \
+  systemstreams closedstdout userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
@@ -914,6 +914,7 @@ ffi:
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
+	@bin/jolt run test/chez/jolt-ffi-typed-array-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
 	@sh test/chez/ffi-gc-stall-test.sh
@@ -1909,6 +1910,12 @@ aotcachesmoke: testbin
 # corpus row.
 systemstreams:
 	@sh test/chez/system-streams-smoke.sh
+
+# A process stream whose reader has gone away drops writes instead of raising,
+# and checkError says so, as the JVM's PrintStream does (#1331). Runs the CLI
+# through $(CHEZ), so the windows-deps job runs it too.
+closedstdout:
+	@sh test/chez/closed-stdout-smoke.sh $(CHEZ)
 
 # Relative paths under bin/jolt resolve against the caller's directory, not the
 # checkout the launcher cd's to: the jolt.host filesystem functions, load-file,
