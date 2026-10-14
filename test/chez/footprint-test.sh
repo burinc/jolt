@@ -105,8 +105,11 @@ fi
 # A vfasl boot is decompressed into one buffer per image segment, and the buffer
 # lives beside the static image it is building. One segment for the whole
 # runtime put jolt's peak at 2.2x its live heap; segmented (build.ss
-# bld-emit-runtime), the buffer is one segment's worth. The peak over the live
-# heap after boot must stay under half of it.
+# bld-emit-runtime), the buffer is one segment's worth. In the heap, each
+# segment's buffer left holes in the static image around it that no later one
+# fit, so on a stock kernel the boot keeps several chunks of empty segments;
+# jolt's kernel keeps the buffer outside the heap (chez-patches/0003). The peak
+# over the live heap after boot must stay under half of it.
 peak=$(echo "$line" | awk '{print $9}')
 live=$(echo "$line" | awk '{print $7}')
 if [ $(( (peak - live) * 2 )) -gt "$live" ]; then
