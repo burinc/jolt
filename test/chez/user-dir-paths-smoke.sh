@@ -54,6 +54,10 @@ check "delete-file! deletes the caller's file" \
   "$(run '[(jolt.host/delete-file! "b.txt") (.exists (java.io.File. "b.txt"))]')" \
   "[true false]"
 
+check "io/delete-file deletes the caller's file" \
+  "$(run '(do (require (quote [clojure.java.io :as io])) (spit "c.txt" "1") (prn [(io/delete-file "c.txt") (.exists (java.io.File. "c.txt"))]))')" \
+  "[true false]"
+
 check "mkdirs! creates in the caller's directory" \
   "$(run '[(jolt.host/mkdirs! "zz/yy") (.isDirectory (java.io.File. "zz/yy"))]')" \
   "[true true]"
@@ -95,7 +99,7 @@ check "nREPL stop removes the caller's .nrepl-port" \
 
 # Nothing landed in the checkout.
 leaked=""
-for f in a.txt b.txt zz sub link here.clj .nrepl-port; do
+for f in a.txt b.txt c.txt zz sub link here.clj .nrepl-port; do
   if [ -e "$root/$f" ] || [ -L "$root/$f" ]; then leaked="$leaked $f"; fi
 done
 check "nothing written into the checkout" "${leaked:-none}" "none"

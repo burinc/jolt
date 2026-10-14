@@ -256,6 +256,30 @@
        ["stack_trace_test$live_callee" "stack_trace_test$mid_caller"
         "stack_trace_test$erases_into_mid" "stack_trace_test$calls_erases_mid"]
        "...and below the live frame it called, further out"))
+;; a value-semantics seam is jolt code the HOST runs from inside hash/=/str of any
+;; value. Its tail call (to boolean) stored a site pair that outlived it, and the
+;; next throw from host code reported the predicate as its innermost frame:
+;; jolt-lang/time's jt? was in every nREPL error once it loaded.
+(defn- seam-claims? [v] (boolean (identical? v ::claimed)))
+(__register-hash! seam-claims? (fn [_] 0))
+(__register-str! seam-claims? (fn [_] "claimed"))
+(def ^:private seam-probe (Object.))
+(defn- seam-then-throw []
+  (let [h (hash seam-probe) s (str seam-probe) v (nth [] 3)] [h s v]))
+(let [e (try (seam-then-throw) (catch Exception x x))
+      cls (mapv #(.getClassName %) (.getStackTrace e))]
+  (ok= (some #(str/includes? % "seam_claims") cls) nil
+       "a seam the host called is not a frame of a later host throw")
+  (ok= (first (own-frames (.getStackTrace e)))
+       ["stack_trace_test$seam_then_throw" "stack-trace-test.clj"]
+       "...the fn that was running is the innermost frame"))
+;; ...while a fn that tail-calls the host fn that throws keeps its erased frame
+(defn- tail-into-host [v] (nth v 3))
+(defn- calls-tail-into-host [] (let [r (tail-into-host [])] r))
+(ok= (mapv first (take 2 (own-frames (.getStackTrace (try (calls-tail-into-host)
+                                                          (catch Exception x x))))))
+     ["stack_trace_test$tail_into_host" "stack_trace_test$calls_tail_into_host"]
+     "a tail call into a throwing host fn keeps the erased frame")
 
 (let [n @passes f @fails]
   (doseq [m f] (println "stack-trace FAIL " m))

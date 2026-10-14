@@ -146,7 +146,10 @@
     sa-foreign-procedure-blocking
     sa-foreign-callable sa-foreign-callable-collect-safe
     ;; capability-unchecked: expand to the checked primitives here
-    sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=? sa-uvector-ref sa-uvector-set!))
+    sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=? sa-uvector-ref sa-uvector-set!
+    sa-uflvector-ref sa-uflvector-set!
+    sa-ubytevector-ieee-single-native-ref sa-ubytevector-ieee-single-native-set!
+    sa-ubytevector-ieee-double-native-ref sa-ubytevector-ieee-double-native-set!))
 
 (define (bound? s)
   (or (guard (e (#t #f)) (eval s (interaction-environment)) #t)
@@ -239,6 +242,17 @@
   (check "sa-ufx=?" (sa-ufx=? 3 3) #t)
   (check "sa-uvector-ref" (sa-uvector-ref (vector 1 2 3) 1) 2)
   (check "sa-uvector-set!" (let ((v (vector 1 2 3))) (sa-uvector-set! v 1 9) (vector-ref v 1)) 9)
+  (check "sa-uflvector-set!/-ref" (let ((v (make-f64vector 3 0.))) (sa-uflvector-set! v 1 2.5) (sa-uflvector-ref v 1)) 2.5)
+  ;; native (little-endian) IEEE patterns: 1.5 is #x3fc00000 single, #x3ff8000000000000 double
+  (check "sa-ubytevector-ieee-single-native-set!"
+         (let ((bv (make-u8vector 6 0))) (sa-ubytevector-ieee-single-native-set! bv 2 1.5) bv)
+         (u8vector 0 0 0 0 #xc0 #x3f))
+  (check "sa-ubytevector-ieee-single-native-ref"
+         (sa-ubytevector-ieee-single-native-ref (u8vector 9 0 0 #xc0 #x3f) 1) 1.5)
+  (check "sa-ubytevector-ieee-double-native-set!/-ref round-trip"
+         (let ((bv (make-u8vector 8 0))) (sa-ubytevector-ieee-double-native-set! bv 0 -0.1)
+           (list (u8vector-ref bv 7) (sa-ubytevector-ieee-double-native-ref bv 0)))
+         (list #xbf -0.1))
   (check "sa-vector-copy-range! (R7RS shape)"
          (let ((to (make-vector 5 0))) (sa-vector-copy-range! to 1 (vector 7 8 9) 1 3) to)
          (vector 0 8 9 0 0))

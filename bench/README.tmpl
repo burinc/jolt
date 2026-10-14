@@ -81,7 +81,7 @@ Reading it:
   past Chez's 61-bit fixnum) and by open-world generator dispatch.
 
 Diagnostics kept out of the table because the JVM has no reference for them:
-`ffi_arenas.clj` (jolt.ffi), `image_refs.clj` (jolt.image) and `fibers/`.
+`ffi_arenas.clj` and `ffi_typed_arrays.clj` (jolt.ffi), `image_refs.clj` (jolt.image) and `fibers/`.
 Run them from this directory with `../bin/jolt -Sdeps '{:paths ["."]}' -m <ns>`
 and compare exact base and candidate runs on one host.
 

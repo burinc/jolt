@@ -2140,7 +2140,7 @@
       (let loop ((fs user-instance-checks))
         (if (null? fs)
             'pass
-            (let ((r ((car fs) tname val)))
+            (let ((r (seam-invoke2 (car fs) tname val)))
               (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
 ;; the bump retires every instance? answer cached while no library arm existed
 ;; (records-interop.ss jolt-instance-site) — the arm may claim any of them now
@@ -2151,6 +2151,22 @@
     jolt-nil))
 
 ;; ---- value-semantics seams -------------------------------------------------
+;; A seam fn is jolt code the HOST calls, from inside =/hash/str/compare/class of
+;; any value -- the compiler and the runtime included, between any two user
+;; calls. Its tail calls store their site pair (rt.ss jolt-site!) and nothing
+;; clears it on return, so the pair outlived the call: every later throw from
+;; host code reported the predicate as its innermost frame (jolt-lang/time's
+;; jolt.time.impl/jt? showed up in every nREPL error once it loaded). The host
+;; called it, so no live jolt frame can be its caller; put the slot back when it
+;; returns. A throw out of the seam fn leaves its own pair, which is genuine.
+(define (seam-invoke1 f x)
+  (let* ((s (virtual-register jolt-vreg-site)) (r (jolt-invoke f x)))
+    (set-virtual-register! jolt-vreg-site s)
+    r))
+(define (seam-invoke2 f a b)
+  (let* ((s (virtual-register jolt-vreg-site)) (r (jolt-invoke f a b)))
+    (set-virtual-register! jolt-vreg-site s)
+    r))
 ;; A library that models its own host values (java.time via jolt-lang/time) needs
 ;; those values to compare, hash, print, and order like the real thing. These
 ;; expose the internal arm registries to Clojure: pred/handler are Clojure fns,
@@ -2160,28 +2176,28 @@
 ;; =/hash/compare/print.
 (def-var! "clojure.core" "__register-eq!"
   (lambda (pred handler)
-    (register-eq-arm! (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
-                      (lambda (a b) (jolt-truthy? (jolt-invoke handler a b))))
+    (register-eq-arm! (lambda (a b) (jolt-truthy? (seam-invoke2 pred a b)))
+                      (lambda (a b) (jolt-truthy? (seam-invoke2 handler a b))))
     jolt-nil))
 (def-var! "clojure.core" "__register-hash!"
   (lambda (pred handler)
-    (register-hash-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                        (lambda (x) (jolt-invoke handler x)))
+    (register-hash-arm! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
+                        (lambda (x) (seam-invoke1 handler x)))
     jolt-nil))
 (def-var! "clojure.core" "__register-str!"
   (lambda (pred render)
-    (register-str-render! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                          (lambda (x) (jolt-invoke render x)))
+    (register-str-render! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
+                          (lambda (x) (seam-invoke1 render x)))
     jolt-nil))
 (def-var! "clojure.core" "__register-pr!"
   (lambda (pred render)
-    (register-pr-arm! (lambda (x) (jolt-truthy? (jolt-invoke pred x)))
-                      (lambda (x) (jolt-invoke render x)))
+    (register-pr-arm! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
+                      (lambda (x) (seam-invoke1 render x)))
     jolt-nil))
 (def-var! "clojure.core" "__register-compare!"
   (lambda (pred handler)
-    (register-compare-arm! (lambda (a b) (jolt-truthy? (jolt-invoke pred a b)))
-                           (lambda (a b) (jolt-invoke handler a b)))
+    (register-compare-arm! (lambda (a b) (jolt-truthy? (seam-invoke2 pred a b)))
+                           (lambda (a b) (seam-invoke2 handler a b)))
     jolt-nil))
 
 ;; __register-class! makes a library's own host values answer (class x)/(type x)
@@ -2202,11 +2218,11 @@
     (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
 (def-var! "clojure.core" "__register-class!"
   (lambda (pred class-fn tags-fn)
-    (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
-      (register-class-arm-checked! p (lambda (x) (jolt-invoke class-fn x)))
+    (let ((p (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))))
+      (register-class-arm-checked! p (lambda (x) (seam-invoke1 class-fn x)))
       (set! jt-user-value-tags-arms
             (append jt-user-value-tags-arms
-                    (list (cons p (lambda (x) (jt-jolt-strs->list (jolt-invoke tags-fn x))))))))
+                    (list (cons p (lambda (x) (jt-jolt-strs->list (seam-invoke1 tags-fn x))))))))
     jolt-nil))
 
 ;; values that carry metadata (mirrors jolt-with-meta's set in natives-meta.ss).
