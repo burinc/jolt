@@ -85,10 +85,11 @@
 ;; libc sched_yield, resolved once; fall back to a zero-length park if the symbol
 ;; isn't available.
 (define thread-yield!
-  (let ((fp #f) (tried? #f))
+  ;; One store for the answer and the mark, so a thread arriving mid-lookup
+  ;; resolves too instead of reading the #f a separate flag left behind.
+  (let ((fp 'unresolved))
     (lambda ()
-      (unless tried?
-        (set! tried? #t)
+      (when (eq? fp 'unresolved)
         (set! fp (jolt-foreign-proc-safe "sched_yield" '() 'int)))
       (if fp (fp) (sleep (make-time 'time-duration 0 0)))
       jolt-nil)))
