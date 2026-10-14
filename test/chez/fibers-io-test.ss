@@ -145,18 +145,22 @@
 (ev "(def r8-port2 (.getLocalPort r8-ss2))")
 (ev "(def r8-client2 (java.net.Socket. \"127.0.0.1\" r8-port2))")
 (ev "(def r8-srv2 (.accept r8-ss2))")
-;; a real OS thread delivers the data 300 ms late
-(ev "(def r8-w (future (Thread/sleep 300) (.write (.getOutputStream r8-srv2) (.getBytes \"threaded\" \"UTF-8\") 0 8)))")
+;; a real OS thread delivers the data 300 ms late. The clock starts BEFORE the
+;; writer exists, so the data cannot be there until 300 ms after t2 and a read
+;; that waited for it takes at least that long, however loaded the machine (load
+;; only stretches it). Started after the future, as it was, the floor had to
+;; leave room for the main thread being descheduled between the two, and was
+;; half the delay.
 (define t2 (mono-nanos))
+(ev "(def r8-w (future (Thread/sleep 300) (.write (.getOutputStream r8-srv2) (.getBytes \"threaded\" \"UTF-8\") 0 8)))")
 (define r2
   (ev "(let [b (byte-array 64) n (.read (.getInputStream r8-client2) b 0 64)] (String. b 0 n \"UTF-8\"))"))
 (define el2 (/ (exact->inexact (- (mono-nanos) t2)) 1000000.0))
 (ok "2. the thread-mode read returned the delayed data" (string=? r2 "threaded"))
-;; floor, relative to the in-run writer delay: a read that returned without
-;; waiting for the data would clock in well under this (a spin, or a wrong
-;; EAGAIN-as-EOF); a slow machine only makes the wait longer
-(ok "2. it actually waited for the writer (>= half the 300 ms delay)"
-    (> el2 150.0))
+;; a read that returned without waiting for the data (a spin, or a wrong
+;; EAGAIN-as-EOF) clocks in under the writer's delay
+(ok "2. it actually waited for the writer (>= the 300 ms delay)"
+    (>= el2 300.0))
 (printf "   thread-path read took ~,1f ms for a 300 ms delayed write\n" el2)
 
 ;; --- 3. a full collect succeeds while the poller is blocked -------------------

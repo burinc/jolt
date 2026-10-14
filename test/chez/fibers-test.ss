@@ -323,22 +323,37 @@
 
 (printf "\n== numbers (generous ceilings) ==\n")
 
-;; --- spawn: per-spawn < 5us (measured 0.84us) --------------------------------
-(define SPAWN-N 200000)
-(define spawn-t0 (mono-nanos))
-(define spawn-fibs
-  (let loop ((i 0) (acc '()))
-    (if (fx<? i SPAWN-N)
-        (loop (fx+ i 1) (cons (sa-fiber-spawn (lambda () #f)) acc))
-        acc)))
-(define spawn-us
-  (/ (exact->inexact (- (mono-nanos) spawn-t0)) 1000.0 SPAWN-N))
+;; --- spawn: per-spawn < 5us (measured 0.2-0.84us) ----------------------------
+;; An absolute ceiling, kept absolute on purpose: spawn is record + enqueue, and
+;; no control op in this process shares its cost (the switch section below
+;; records two calibrations that failed for exactly that reason). What made the
+;; old form flaky was one 200000-spawn window decided by whether it was
+;; descheduled. Now the cost is the fastest of 5 batches of 20000 spawns (~4ms
+;; each), each from a full collection with the previous batch drained, and a
+;; miss is measured once more. Load only ever slows a batch, so the minimum is
+;; the batch nearest spawn's own cost, while a spawn that really costs 5us is
+;; that slow in every batch.
+(define SPAWN-N 20000)
+(define (spawn-batch-us)
+  (collect (collect-maximum-generation))
+  (let* ((t0 (mono-nanos))
+         (fs (let loop ((i 0) (acc '()))
+               (if (fx<? i SPAWN-N)
+                   (loop (fx+ i 1) (cons (sa-fiber-spawn (lambda () #f)) acc))
+                   acc)))
+         (us (/ (exact->inexact (- (mono-nanos) t0)) 1000.0 SPAWN-N)))
+    ;; the spawned-but-never-run fibers complete immediately; drain the queue
+    (sa-fiber-run-all)
+    (ok "spawn: batch drained" (all-done? fs))
+    us))
+(define (spawn-best-us)
+  (let loop ((i 0) (best #f))
+    (if (fx=? i 5) best (loop (fx+ i 1) (let ((us (spawn-batch-us))) (if best (min best us) us))))))
+(define spawn-us (let ((us (spawn-best-us))) (if (< us 5.0) us (spawn-best-us))))
 (printf "  spawn:  ~a us/fiber (assert < 5us) -- record+enqueue only; the body\n" spawn-us)
 (printf "          has not run, so the continuation capture and about 3.5\n")
 (printf "          KB segment is NOT in this number (first park pays those)\n")
 (ok "spawn < 5us" (< spawn-us 5.0))
-;; the spawned-but-never-run fibers complete immediately; drain the queue
-(sa-fiber-run-all)
 
 ;; --- switch: depth-independence (the property, not the speed) -----------------
 ;; N fibers round-robin, each yielding M times: every park costs one switch out
@@ -363,14 +378,7 @@
   (sa-fiber-run-all)
   (all-done? fibers))
 (ok "switch: warmup run" (sw-bench-n))
-(define old-trip (collect-trip-bytes))
-(collect-trip-bytes 100000000000)          ; no gen-0 during the timed region
-(collect (collect-maximum-generation))
-(define sw-t0 (mono-nanos))
-(ok "switch: timed run" (sw-bench-n))
-(define switch-ns
-  (/ (exact->inexact (- (mono-nanos) sw-t0)) (* 2.0 SW-N SW-M)))
-(collect-trip-bytes old-trip)
+(ok "switch: warmup run (40 frames)" (sw-bench-depth 40))
 
 ;; What is asserted here is the PROPERTY, not the speed: a continuation capture
 ;; on Chez is O(1), so yielding 40 frames down must cost the same as yielding 1
@@ -391,24 +399,40 @@
 ;; for the record and asserted only against a ceiling loose enough to be
 ;; meaningless as noise (a 20x blowup, not a 2x one).
 ;;
-;; Each depth is timed three times and the fastest run is kept. Interference
-;; from other work on the machine only ever makes a run slower, so the minimum
-;; is the run closest to the switch's own cost; one descheduled run used to
-;; decide the ratio (8.7x once under a loaded full gate, 1.2x when rerun).
+;; The two depths are timed alternately, five rounds, the order flipping every
+;; round, and each keeps its fastest run (~4ms a run, from a full collection).
+;; Interference from other work on the machine only ever makes a run slower, so
+;; the minimum is the run closest to the switch's own cost, and alternating
+;; spreads a burst over both arms instead of handing it to whichever ran then.
+;; One descheduled run used to decide the ratio (8.7x once under a loaded full
+;; gate, 1.2x when rerun). A miss is measured once more: an O(depth) capture
+;; reads high on both.
 (define old-trip (collect-trip-bytes))
 (collect-trip-bytes 100000000000)          ; no gen-0 during the timed region
-(define (sw-best-ns depth label)
-  (let loop ((i 0) (best #f))
-    (if (fx=? i 3)
-        best
-        (begin
-          (collect (collect-maximum-generation))
-          (let ((t0 (mono-nanos)))
-            (ok label (sw-bench-depth depth))
-            (let ((ns (/ (exact->inexact (- (mono-nanos) t0)) (* 2.0 SW-N SW-M))))
-              (loop (fx+ i 1) (if best (min best ns) ns))))))))
-(define switch-ns (sw-best-ns 0 "switch: timed run (1 frame)"))
-(define deep-switch-ns (sw-best-ns 40 "switch: timed run (40 frames)"))
+(define (sw-run-ns depth label)
+  (collect (collect-maximum-generation))
+  (let ((t0 (mono-nanos)))
+    (ok label (sw-bench-depth depth))
+    (/ (exact->inexact (- (mono-nanos) t0)) (* 2.0 SW-N SW-M))))
+(define (sw-measure)            ; -> (ns at 1 frame . ns at 40 frames)
+  (let loop ((i 0) (s #f) (d #f))
+    (if (fx=? i 5)
+        (cons s d)
+        (let* ((pair (if (even? i)
+                         (let* ((a (sw-run-ns 0 "switch: timed run (1 frame)"))
+                                (b (sw-run-ns 40 "switch: timed run (40 frames)")))
+                           (cons a b))
+                         (let* ((b (sw-run-ns 40 "switch: timed run (40 frames)"))
+                                (a (sw-run-ns 0 "switch: timed run (1 frame)")))
+                           (cons a b)))))
+          (loop (fx+ i 1)
+                (if s (min s (car pair)) (car pair))
+                (if d (min d (cdr pair)) (cdr pair)))))))
+(define (sw-ratio m) (/ (cdr m) (max 1.0 (car m))))
+(define sw-m (let ((m (sw-measure)))
+               (if (and (< (sw-ratio m) 3.0) (< (car m) 5000.0)) m (sw-measure))))
+(define switch-ns (car sw-m))
+(define deep-switch-ns (cdr sw-m))
 (collect-trip-bytes old-trip)
 (define depth-ratio (/ deep-switch-ns (max 1.0 switch-ns)))
 (printf "  switch: ~a ns at 1 frame, ~a ns at 40 frames (depth ratio ~a)\n"

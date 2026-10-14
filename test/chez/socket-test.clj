@@ -620,8 +620,20 @@
        (catch Exception e [(.getSimpleName (class e)) (ex-message e)])))
 
 (defn elapsed-ms [f]
-  (let [t0 (System/currentTimeMillis)]
-    [(f) (- (System/currentTimeMillis) t0)]))
+  (let [t0 (System/nanoTime)]
+    [(f) (/ (- (System/nanoTime) t0) 1000000)]))
+
+;; Whether a wait due after `due` ms that took `ms` was on time. Timed on
+;; System/nanoTime, the clock the poller's deadlines are on, so the lower bound
+;; is exact: a timeout never fires before it is due, here as on the JDK (the
+;; old 50 ms of slack below the timeout was for currentTimeMillis). The upper
+;; bound only has to catch a timeout that fires far too late, and one late
+;; wakeup on a loaded machine can cross any bound, so a reading past it is
+;; taken again with `remeasure` (-> ms) and only a second late reading fails.
+(defn on-time? [due ms remeasure]
+  (and (>= ms due)
+       (or (<= ms 2000)
+           (let [ms2 (remeasure)] (<= due ms2 2000)))))
 
 (with-pair
   (fn [server client conn]
@@ -637,7 +649,9 @@
           [r ms] (elapsed-ms #(thrown (fn [] (.read in))))]
       (check-eq "a read with nothing to read times out" r
                 ["SocketTimeoutException" "Read timed out"])
-      (check-eq "…after about the timeout" (<= 250 ms 2000) true)
+      (check-eq "…not before the timeout, nor far past it"
+                (on-time? 300 ms #(second (elapsed-ms (fn [] (thrown (fn [] (.read in)))))))
+                true)
       (check-eq "…and is an InterruptedIOException"
                 (try (.read in) (catch java.io.InterruptedIOException _ :caught))
                 :caught)
@@ -696,7 +710,9 @@
   (let [[r ms] (elapsed-ms #(thrown (fn [] (.accept server))))]
     (check-eq "accept with nobody dialing times out" r
               ["SocketTimeoutException" "Accept timed out"])
-    (check-eq "…after about the timeout" (<= 150 ms 2000) true))
+    (check-eq "…not before the timeout, nor far past it"
+              (on-time? 200 ms #(second (elapsed-ms (fn [] (thrown (fn [] (.accept server)))))))
+              true))
   (let [c (java.net.Socket. "127.0.0.1" (.getLocalPort server))
         a (.accept server)]
     (check-eq "the listener still accepts after a timeout" (.isConnected a) true)
@@ -752,7 +768,11 @@
       {:keys [held result ms closed?]} (dial-until-stalled (.getLocalPort server) 300)]
   (check-eq "a connect that cannot complete times out" result
             ["SocketTimeoutException" "Connect timed out"])
-  (check-eq "…after about the timeout" (<= 250 ms 2000) true)
+  (check-eq "…not before the timeout, nor far past it"
+            (on-time? 300 ms #(let [again (dial-until-stalled (.getLocalPort server) 300)]
+                                (doseq [s (:held again)] (.close s))
+                                (:ms again)))
+            true)
   (check-eq "…and closes the socket" closed? true)
   (let [p (promise) port (.getLocalPort server)]
     (fib/spawn (fn [] (deliver p (thrown #(.connect (java.net.Socket.)

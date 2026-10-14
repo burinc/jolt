@@ -209,12 +209,20 @@
 (let [[ss c s] (pair)]
   (try
     (.setSoTimeout s 300)
-    (let [t0 (System/currentTimeMillis)
-          r (try (.read (.getInputStream s)) :no-timeout
-                 (catch java.net.SocketTimeoutException e (.getMessage e)))
-          dt (- (System/currentTimeMillis) t0)]
+    ;; On nanoTime, the clock the poller's deadlines are on, so the timeout is
+    ;; never early (exact lower bound). The cap only catches one that fires far
+    ;; too late; a reading past it is taken again before it counts, so one late
+    ;; wakeup on a loaded machine (or under Wine) does not fail the row.
+    (let [timed-read (fn []
+                       (let [t0 (System/nanoTime)
+                             r (try (.read (.getInputStream s)) :no-timeout
+                                    (catch java.net.SocketTimeoutException e (.getMessage e)))]
+                         [r (/ (- (System/nanoTime) t0) 1000000)]))
+          [r dt] (timed-read)
+          on-time? (fn [[r dt]] (and (= r "Read timed out") (<= 300 dt 5000)))]
       (check "SO_TIMEOUT: a read with no data times out"
-             [r (<= 250 dt 5000)] ["Read timed out" true]))
+             [r (>= dt 300) (or (<= dt 5000) (on-time? (timed-read)))]
+             ["Read timed out" true true]))
     (.write (.getOutputStream c) 65)
     (check "SO_TIMEOUT: the socket still reads after a timeout"
            (.read (.getInputStream s)) 65)

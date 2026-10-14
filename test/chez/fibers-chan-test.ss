@@ -328,46 +328,71 @@
 ;; everything the immediate does PLUS a context switch), and both must sit
 ;; within a generous multiple of a bare procedure call. All three are measured
 ;; in this same process — no absolute ceilings.
+;;
+;; Timed the way test/chez/rrb-scaling-test.ss times its arms: each arm is one
+;; batch of a few ms (2M calls, 200000 immediate takes, 2000 parked takes), the
+;; three run in a rotating order over 5 rounds from a full collection each, and
+;; each arm keeps its fastest batch. One reading per arm, in a fixed order, let
+;; a burst of load land on one arm and decide both comparisons. A miss is
+;; measured once more: a take that started parking, or one gone quadratic in
+;; the buffer, reads high every round.
 (printf "\n== 11. immediate vs parked (ratios vs a bare call) ==\n")
 (define CAL-N 2000000)
 (define (cal-op x) x)
-(define cal-t0 (mono-nanos))
-(define cal-sink
-  (let loop ((i CAL-N) (acc 0))
-    (if (fx>? i 0) (loop (fx- i 1) (cal-op i)) acc)))
-(define cal-ns (/ (exact->inexact (- (mono-nanos) cal-t0)) CAL-N))
+(define (cal-batch-ns)
+  (let* ((t0 (mono-nanos))
+         (sink (let loop ((i CAL-N) (acc 0))
+                 (if (fx>? i 0) (loop (fx- i 1) (cal-op i)) acc))))
+    (ok "11. calibration loop ran" (fx>=? sink 0))
+    (/ (exact->inexact (- (mono-nanos) t0)) CAL-N)))
 
 ;; immediate: take from a pre-filled buffered channel (no park, no capture)
 (define IMM-N 200000)
-(define ch11 (jolt-async-chan IMM-N))
-(let loop ((n 0)) (when (fx<? n IMM-N) (jolt-async-give ch11 1) (loop (fx+ n 1))))
-(define imm-t0 (mono-nanos))
-(define imm-sink
-  (let loop ((n 0))
-    (if (fx<? n IMM-N)
-        (begin (jolt-fiber-<! ch11) (loop (fx+ n 1)))
-        0)))
-(define imm-ns (/ (exact->inexact (- (mono-nanos) imm-t0)) IMM-N))
+(define (imm-batch-ns)
+  (let ((ch (jolt-async-chan IMM-N)))
+    (let loop ((n 0)) (when (fx<? n IMM-N) (jolt-async-give ch 1) (loop (fx+ n 1))))
+    (let* ((t0 (mono-nanos))
+           (sink (let loop ((n 0))
+                   (if (fx<? n IMM-N)
+                       (begin (jolt-fiber-<! ch) (loop (fx+ n 1)))
+                       0))))
+      (ok "11. immediate sink ran" (fx>=? sink 0))
+      (/ (exact->inexact (- (mono-nanos) t0)) IMM-N))))
 
 ;; parked: fibers each take one value from an empty channel, woken by a pump
 (define PARK-N 2000)
-(define ch11p (jolt-async-chan))
-(define park-fibs
-  (spawn-n PARK-N (lambda (_) (sa-fiber-spawn (lambda () (jolt-fiber-<! ch11p))))))
-(sa-fiber-run-all)
-(define park-t0 (mono-nanos))
-(fork-thread
-  (lambda ()
-    (let loop ((n 0)) (when (fx<? n PARK-N) (jolt-async-give ch11p n) (loop (fx+ n 1))))))
-(run-all-until (list-ref park-fibs (fx- PARK-N 1)) 15.0 "parked takes completed")
-(define park-ns (/ (exact->inexact (- (mono-nanos) park-t0)) PARK-N))
-(ok "11. calibration loop ran" (fx>=? cal-sink 0))
-(ok "11. immediate sink ran" (fx>=? imm-sink 0))
+(define (park-batch-ns)
+  (let* ((ch (jolt-async-chan))
+         (fibs (spawn-n PARK-N (lambda (_) (sa-fiber-spawn (lambda () (jolt-fiber-<! ch)))))))
+    (sa-fiber-run-all)
+    (let ((t0 (mono-nanos)))
+      (fork-thread
+        (lambda ()
+          (let loop ((n 0)) (when (fx<? n PARK-N) (jolt-async-give ch n) (loop (fx+ n 1))))))
+      (run-all-until (list-ref fibs (fx- PARK-N 1)) 15.0 "parked takes completed")
+      (run-all-until-all fibs 15.0 "every parked take completed")
+      (/ (exact->inexact (- (mono-nanos) t0)) PARK-N))))
+
+(define (chan-measure)                  ; -> #(cal imm park), fastest of each
+  (let ((best (make-vector 3 #f))
+        (arms (vector cal-batch-ns imm-batch-ns park-batch-ns)))
+    (do ((r 0 (fx+ r 1))) ((fx=? r 5) best)
+      (do ((k 0 (fx+ k 1))) ((fx=? k 3))
+        (let ((a (fxmod (fx+ r k) 3)))
+          (collect (collect-maximum-generation))
+          (let ((ns ((vector-ref arms a))))
+            (vector-set! best a (if (vector-ref best a) (min (vector-ref best a) ns) ns))))))))
+(define (chan-imm-ratio m) (/ (vector-ref m 1) (max 0.2 (vector-ref m 0))))
+(define (chan-ok? m) (and (< (chan-imm-ratio m) 200.0) (< (vector-ref m 1) (vector-ref m 2))))
+(define chan-m (let ((m (chan-measure))) (if (chan-ok? m) m (chan-measure))))
+(define cal-ns (vector-ref chan-m 0))
+(define imm-ns (vector-ref chan-m 1))
+(define park-ns (vector-ref chan-m 2))
 (printf "  immediate take: ~a ns  (bare call ~a ns; ratio ~a, assert < 200x)\n"
-        imm-ns cal-ns (/ imm-ns (max 0.2 cal-ns)))
+        imm-ns cal-ns (chan-imm-ratio chan-m))
 (printf "  parked take:    ~a ns  (ratio ~a; assert immediate < parked)\n"
         park-ns (/ park-ns (max 0.2 cal-ns)))
-(ok "11. immediate within 200x a bare call" (< (/ imm-ns (max 0.2 cal-ns)) 200.0))
+(ok "11. immediate within 200x a bare call" (< (chan-imm-ratio chan-m) 200.0))
 (ok "11. immediate strictly cheaper than parked" (< imm-ns park-ns))
 
 (printf "\nfibers-chan-test: ~a checks, ~a failure(s)\n" total fails)

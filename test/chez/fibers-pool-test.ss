@@ -167,20 +167,34 @@
 (jolt-fiber-pool-reset!)
 (define n-pool (jolt-fiber-carrier-count))
 (define m-batch (fx* 2 n-pool))
-(define iters 20000000)
-(jolt-fiber-carrier-count-set! 1)
-(jolt-fiber-pool-reset!)
-(jolt-fiber-ensure-carrier!)
-(define t-one (run-cpu-batch m-batch iters))
-(jolt-fiber-carrier-count-set! n-pool)
-(jolt-fiber-pool-reset!)
-(jolt-fiber-ensure-carrier!)
-(define t-pool (run-cpu-batch m-batch iters))
+(define iters 5000000)
+(define (pool-batch-ms carriers)
+  (jolt-fiber-carrier-count-set! carriers)
+  (jolt-fiber-pool-reset!)
+  (jolt-fiber-ensure-carrier!)
+  (run-cpu-batch m-batch iters))
+;; The two pool sizes alternate, three rounds with the order flipping, and each
+;; keeps its fastest batch: one reading each, one-carrier first, let a burst of
+;; load on one arm decide the comparison. A miss is measured once more; a pool
+;; that serialises its carriers on something reads slow every round.
+(define (pool-measure)                    ;; -> (1-carrier ms . pool ms)
+  (let loop ((i 0) (one #f) (pool #f))
+    (if (fx=? i 3)
+        (cons one pool)
+        (let* ((pair (if (even? i)
+                         (let* ((a (pool-batch-ms 1)) (b (pool-batch-ms n-pool))) (cons a b))
+                         (let* ((b (pool-batch-ms n-pool)) (a (pool-batch-ms 1))) (cons a b)))))
+          (loop (fx+ i 1)
+                (if one (min one (car pair)) (car pair))
+                (if pool (min pool (cdr pair)) (cdr pair)))))))
+(define (pool-ok? m) (< (cdr m) (* 4.0 (max (car m) 0.001))))
+(define pool-m (let ((m (pool-measure))) (if (pool-ok? m) m (pool-measure))))
+(define t-one (car pool-m))
+(define t-pool (cdr pool-m))
 (printf "  1 carrier: ~,2f ms; ~a carriers: ~,2f ms (ratio ~,2f — printed, not asserted;\n"
         t-one n-pool t-pool (/ (max t-one 0.001) (max t-pool 0.001)))
 (printf "   a shared runner often shows ~~1.0 with no parallelism to give)\n")
-(ok "1. the pool is not dramatically slower than one carrier"
-    (< t-pool (* 4.0 (max t-one 0.001))))
+(ok "1. the pool is not dramatically slower than one carrier" (pool-ok? pool-m))
 
 ;; --- 2. round-robin placement ------------------------------------------------
 ;; Spawning K fibers over N carriers puts fiber i on carrier (i mod N) — the

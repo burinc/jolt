@@ -234,17 +234,18 @@
   ;; --- 2. the same code path on a plain OS thread blocks and works ----------
   (at! "2. thread-mode")
   (printf "\n== 2. the thread path still blocks and still works ==\n")
-  (ev "(def p2 (jolt.process/process [\"sh\" \"-c\" \"sleep 0.3; printf threaded\"]))")
+  ;; the clock starts before the child exists, so its output cannot be there
+  ;; until 300 ms after t2 (see fibers-io-test.ss section 2)
   (set! t2 (mono-nanos))
+  (ev "(def p2 (jolt.process/process [\"sh\" \"-c\" \"sleep 0.3; printf threaded\"]))")
   (set! r2
     (ev "(let [b (byte-array 64) n (.read (:out p2) b 0 64)] (String. b 0 n \"UTF-8\"))"))
   (set! el2 (/ (exact->inexact (- (mono-nanos) t2)) 1000000.0))
   (ok "2. the thread-mode read returned the delayed data" (string=? r2 "threaded"))
-  ;; floor, relative to the in-run child delay: a read that returned without
-  ;; waiting for the data would clock in well under this (a spin, or a wrong
-  ;; EAGAIN-as-EOF); a slow machine only makes the wait longer
-  (ok "2. it actually waited for the child (>= half the 300 ms delay)"
-      (> el2 150.0))
+  ;; a read that returned without waiting for the data (a spin, or a wrong
+  ;; EAGAIN-as-EOF) clocks in under the child's delay
+  (ok "2. it actually waited for the child (>= the 300 ms delay)"
+      (>= el2 300.0))
   (printf "   thread-path read took ~,1f ms for a 300 ms delayed write\n" el2)
   (ev "(deref p2 5000 :reap-timeout)")
 
@@ -390,8 +391,8 @@
     "(ev \"(require 'jolt.process)\")\n"
     "(define pre (poller-loaded?))\n"
     ;; -- off a fiber: the blocking fallback, and no autoload --
-    "(ev \"(def np1 (jolt.process/process [\\\"sh\\\" \\\"-c\\\" \\\"sleep 0.3; printf npo\\\"]))\")\n"
     "(define t1 (mono-nanos))\n"
+    "(ev \"(def np1 (jolt.process/process [\\\"sh\\\" \\\"-c\\\" \\\"sleep 0.3; printf npo\\\"]))\")\n"
     "(define r1 (ev \"(let [b (byte-array 64) n (.read (:out np1) b 0 64)] (String. b 0 n \\\"UTF-8\\\"))\"))\n"
     "(define el1 (/ (exact->inexact (- (mono-nanos) t1)) 1000000.0))\n"
     "(define mid (poller-loaded?))\n"
@@ -445,7 +446,7 @@
     "(ev \"(doseq [p np2s] (.close (:in p)))\")\n"
     "(define done2 (wait-until (all-state? 'done) 15.0))\n"
     "(define r2 (map jolt-fiber-result fs))\n"
-    "(if (and (not pre) (string? r1) (string=? r1 \"npo\") (> el1 150.0) (not mid)\n"
+    "(if (and (not pre) (string? r1) (string=? r1 \"npo\") (>= el1 300.0) (not mid)\n"
     "         parked2 sib-ran post done2 (equal? r2 (list \"npf\" \"npf\")))\n"
     "    (begin (printf \"NO-POLLER-PROBE OK thread-read=~,1fms\\n\" el1) (exit 0))\n"
     "    (begin (printf (string-append \"NO-POLLER-PROBE FAIL pre=~a r1=~a el1=~,1fms mid=~a\"\n"

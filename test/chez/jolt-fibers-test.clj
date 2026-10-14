@@ -83,19 +83,23 @@
       f (fib/spawn (fn [] @p))]
   (check-eq "timed join times out" (fib/join f 50 :timed-out) :timed-out)
   (deliver p :finally)
-  (check-eq "timed join after deliver" (fib/join f 1000 :timed-out) :finally))
+  (check-eq "timed join after deliver" (fib/join f 10000 :timed-out) :finally))
 
+;; The waits below are hang caps, not timings: a callback that never runs, or a
+;; fiber that never parks, fails at the cap either way, while a correct one
+;; answers in microseconds. They were 1s, which one loaded scheduler delay could
+;; cross; 10s costs nothing when the answer comes.
 ;; monitor!: success hands the callback nil
 (let [got (promise)
       f (fib/spawn (fn [] :ok))]
   (fib/monitor! f (fn [err] (deliver got [:cb err])))
-  (check-eq "monitor on success" (deref got 1000 :cb-never-ran) [:cb nil]))
+  (check-eq "monitor on success" (deref got 10000 :cb-never-ran) [:cb nil]))
 
 ;; monitor!: a death hands it the error
 (let [got (promise)
       f (fib/spawn (fn [] (throw (ex-info "dead-fiber" {}))))]
   (fib/monitor! f (fn [err] (deliver got (ex-message err))))
-  (check-eq "monitor on death" (deref got 1000 :cb-never-ran) "dead-fiber"))
+  (check-eq "monitor on death" (deref got 10000 :cb-never-ran) "dead-fiber"))
 
 ;; monitor! on an already-finished fiber fires inline (no register-vs-die race)
 (let [f (fib/spawn (fn [] :early))]
@@ -116,7 +120,7 @@
 (let [p (promise)
       f (fib/spawn (fn [] @p))]
   (loop [tries 0]
-    (when (and (not= :parked (fib/state f)) (< tries 200))
+    (when (and (not= :parked (fib/state f)) (< tries 2000))
       (Thread/sleep 5)
       (recur (inc tries))))
   (check-eq "deref parks the fiber" (fib/state f) :parked)

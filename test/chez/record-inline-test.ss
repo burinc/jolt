@@ -259,9 +259,17 @@
 ;; names denote as values, held in top-level variables -- exactly what every
 ;; generated name WAS before the wrapper -- so the ratio is the wrapper's whole
 ;; effect and nothing else. Measured: 0.45 with the wrapper, 1.00 on the tree
-;; before it (the two arms are then the same code). The ceiling sits between,
-;; with a re-measure once in the band below a clear regression, as
-;; io_scaling_test.clj does, so one scheduler blip cannot fail the build.
+;; before it (the two arms are then the same code). The ceiling sits between.
+;;
+;; Timed as test/complexity_test.clj times its rows: the two arms alternate, one
+;; sample of each per round with the order swapped every round, so a busy stretch
+;; lands on both instead of on one arm's whole best-of block; each arm is judged
+;; on its fastest sample over all rounds, since interference only ever makes a
+;; loop slower; each round starts from a full collection; and a miss is measured
+;; once more before it counts. A sample is one 1M-iteration loop, a few
+;; milliseconds, on the nanosecond clock. There is no fail-on-sight band: one
+;; reading is never enough to fail on, and the unwrapped tree reads ~1.0 on the
+;; re-measure too.
 (define called-pmap? pmap?)
 (define called-pvec? pvec?)
 (define called-pset? pset?)
@@ -270,10 +278,13 @@
 (define called-cseq? cseq?)
 (define called-cseq-kind cseq-kind)
 (define called-pvec-cnt pvec-cnt)
-(define ratio-iters 5000000)
-(define (mono-ms)
+(define ratio-iters 1000000)
+(define ratio-rounds 11)
+(define (now-ns)
   (let ((t (current-time 'time-monotonic)))
-    (+ (* (time-second t) 1000.0) (/ (time-nanosecond t) 1e6))))
+    (+ (* (time-second t) 1000000000) (time-nanosecond t))))
+(define (sample-ns f x)
+  (let ((t0 (now-ns))) (f x) (- (now-ns) t0)))
 ;; the loop body is a boolean over X; the count keeps it live
 (define-syntax timed-loop
   (syntax-rules ()
@@ -281,10 +292,6 @@
      (lambda (x)
        (let loop ((i 0) (acc 0))
          (if (fx=? i ratio-iters) acc (loop (fx+ i 1) (if expr (fx+ acc 1) acc))))))))
-(define (best-of k f x)
-  (let loop ((k k) (b +inf.0))
-    (if (fx=? k 0) b
-        (let ((t0 (mono-ms))) (f x) (loop (fx- k 1) (min b (- (mono-ms) t0)))))))
 ;; the metadata carry's shape: five misses, then the hit and a slot read
 (define chain-open
   (timed-loop (x) (cond ((pmap? x) #f) ((pvec? x) #f) ((pset? x) #f) ((jolt-lazyseq? x) #f)
@@ -296,14 +303,29 @@
 ;; a predicate guarding an accessor: one type test when open-coded
 (define pair-open   (timed-loop (x) (and (pvec? x) (fx=? (pvec-cnt x) 3))))
 (define pair-called (timed-loop (x) (and (called-pvec? x) (fx=? (called-pvec-cnt x) 3))))
-(define (judge-ratio label open called x ceiling clear)
-  (let* ((ratio (lambda () (/ (best-of 3 open x) (max (best-of 3 called x) 0.05))))
-         (r1 (ratio))
-         (r (if (and (> r1 ceiling) (< r1 clear)) (ratio) r1)))
+;; -> open-coded / called, each arm its fastest sample over the rounds
+(define (paired-ratio open called x)
+  (open x) (called x)
+  (let loop ((i 0) (to +inf.0) (tc +inf.0))
+    (if (fx=? i ratio-rounds)
+        (/ to (max tc 1.0))
+        (begin
+          (collect (collect-maximum-generation))
+          (if (even? i)
+              (let* ((a (sample-ns open x)) (b (sample-ns called x)))
+                (loop (fx+ i 1) (min to a) (min tc b)))
+              (let* ((b (sample-ns called x)) (a (sample-ns open x)))
+                (loop (fx+ i 1) (min to a) (min tc b))))))))
+(define (judge-ratio label open called x ceiling)
+  (let* ((r1 (paired-ratio open called x))
+         (r (if (> r1 ceiling)
+                (begin (printf "  ~a: open-coded / called = ~,3f, over ~a, measuring again\n" label r1 ceiling)
+                       (paired-ratio open called x))
+                r1)))
     (printf "  ~a: open-coded / called = ~,3f (ceiling ~a)\n" label r ceiling)
     (ok (string-append label " is cheaper open-coded than called") (<= r ceiling))))
-(judge-ratio "six-arm kind chain" chain-open chain-called l 0.75 0.9)
-(judge-ratio "predicate + accessor" pair-open pair-called v 0.75 0.9)
+(judge-ratio "six-arm kind chain" chain-open chain-called l 0.75)
+(judge-ratio "predicate + accessor" pair-open pair-called v 0.75)
 
 (printf "record-inline: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

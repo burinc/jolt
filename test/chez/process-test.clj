@@ -785,18 +785,28 @@
 
 ;; A timed waitFor keeps its bound. It counted 10 ms steps instead of reading a
 ;; clock, and every step's overrun accumulated: 1000 ms came back at ~1170,
-;; 5000 at ~5840. The broken loop reads ~2340 here even on a fast machine, so the
-;; upper bound leaves 250 ms for a loaded CI box and still sits below it.
+;; 5000 at ~5840. The broken loop reads ~2340 here even on a fast machine (and
+;; more under load, where every step overruns further), so the upper bound sits
+;; 250 ms past the deadline, below it. One late wakeup on a loaded machine can
+;; cross that too, so a reading past it is taken again before it counts: the
+;; broken loop is late on both, a delayed wakeup rarely twice. The lower bound
+;; is exact and checked on every reading: a waitFor never returns early.
 ;; Timed on nanoTime, the clock the deadline is on: the wall clock truncates
 ;; separately and read 1999 for a full 2000 ms wait on bionic.
+(defn- timed-wait-for []
+  (let [p (.start (java.lang.ProcessBuilder. ["sleep" "30"]))
+        t0 (System/nanoTime)
+        r (.waitFor p 2000 java.util.concurrent.TimeUnit/MILLISECONDS)
+        waited (quot (- (System/nanoTime) t0) 1000000)]
+    (.destroyForcibly p)
+    (.waitFor p)
+    [r waited]))
 (check-eq "a timed waitFor returns at the deadline it was given"
-          (let [p (.start (java.lang.ProcessBuilder. ["sleep" "30"]))
-                t0 (System/nanoTime)
-                r (.waitFor p 2000 java.util.concurrent.TimeUnit/MILLISECONDS)
-                waited (quot (- (System/nanoTime) t0) 1000000)]
-            (.destroyForcibly p)
-            [r (<= 2000 waited 2250)])
-          [false true])
+          (let [[r waited] (timed-wait-for)]
+            [r (>= waited 2000)
+             (or (<= waited 2250)
+                 (let [[r2 waited2] (timed-wait-for)] (and (false? r2) (<= 2000 waited2 2250))))])
+          [false true true])
 
 ;; Reading a child's output as text closes its pipe. slurp of an InputStream,
 ;; and closing an io/reader or InputStreamReader over one, reach the stream
