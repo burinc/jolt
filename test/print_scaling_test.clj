@@ -10,8 +10,8 @@
 ;;
 ;; Same judgment as read_scaling_test.clj: the SHAPE, in one run — quadrupling
 ;; the element count must not quadruple the per-element cost. Linear lands near
-;; 4, the old right-fold near 16; both arms run best-of-3 and only the
-;; in-process ratio is judged. Correctness (exact rendering) is asserted on
+;; 4, the old right-fold near 16; the arms alternate and only the in-process
+;; ratio is judged. Correctness (exact rendering) is asserted on
 ;; small values here and pinned broadly by the corpus; this file is about cost.
 
 (ns print-scaling-test)
@@ -32,88 +32,90 @@
   (let [r (reduce (fn [r i] (assoc r (keyword (str "k" i)) i)) (->ExtRec) (range n))]
     (count (pr-str r))))
 
-;; nanoTime, not currentTimeMillis. The 1x arm here renders in 2-3ms, so
-;; millisecond resolution quantized it to ±33% — and that error lands straight in
-;; the ratio, since t1 is the denominator.
-(defn- timed [f]
-  (let [t (System/nanoTime)
-        v (f)]
-    [(/ (- (System/nanoTime) t) 1e6) v]))
-
+;; --- timing ---------------------------------------------------------------------
+;; The harness of read_scaling_test.clj (and test/complexity_test.clj before it):
+;; one sample of each arm per round, the order swapped every round, so a busy
+;; stretch lands on both arms rather than on one arm's whole best-of block; each
+;; arm judged on its FASTEST sample over all rounds, since interference only ever
+;; makes a run slower; and the two arms' samples take the same wall time when the
+;; render is linear (the 1x batch renders `factor` times per 4x render), so a
+;; burst is as likely to land on either.
+;;
 ;; Each sample starts from a collected heap, as in hotpath_scaling_test.clj.
 ;; Without it a collection owed by earlier allocation can land in every run of
-;; one arm, which best-of cannot filter: a CI runner measured the 16000 vector
+;; one arm, which a minimum cannot filter: a CI runner measured the 16000 vector
 ;; arm at 2x its usual per-element cost on all three attempts (ratio 8.2-8.3)
-;; while the same commit read 4.2 on the next run.
-(defn- best-of [k f]
-  (reduce min (map first (repeatedly k #(do (System/gc) (timed f))))))
+;; while the same commit read 4.2 on the next run. Both arms of the record row
+;; allocate ~n intermediate records (each assoc conses a new one), which is the
+;; same exposure.
+;;
+;; A sample is a batch sized to clear 1ms on the nanosecond clock: the 1x vector
+;; arm renders in ~0.7ms, which a millisecond clock quantized to ±33% straight
+;; into the ratio's denominator.
+(def ^:private rounds 7)
+;; ...and at least min-rounds, after which a measurement that has spent
+;; budget-ns sampling stops. A linear arm never comes near the budget; a
+;; regressed one is seconds a sample, and it is regressed in every sample, so
+;; three rounds of it decide as surely as seven and the gate fails in seconds
+;; rather than minutes.
+(def ^:private min-rounds 3)
+(def ^:private budget-ns 4e9)
+
+(defn- run-ns [f b]
+  (let [t (System/nanoTime)]
+    (dotimes [_ b] (f))
+    (- (System/nanoTime) t)))
+
+(defn- batch-size [f]
+  (loop [b 1]
+    (if (or (>= (run-ns f b) 1000000) (>= b 4096)) b (recur (* 2 b)))))
+
+(defn- paired
+  "[ms-per-call at 1x, at 4x, ratio], each arm its fastest sample over the rounds.
+  f1 does 1/k of f4's work, so its batch is k times f4's."
+  [f1 f4 k]
+  (let [b4 (batch-size f4) b1 (* k b4)
+        one (fn [f b] (System/gc) (/ (double (run-ns f b)) b))]
+    (loop [i 0 t1 ##Inf t4 ##Inf spent 0.0]
+      (if (or (= i rounds) (and (>= i min-rounds) (> spent budget-ns)))
+        [(/ t1 1e6) (/ t4 1e6) (/ t4 (max 1.0 t1))]
+        (let [[x y] (if (even? i)
+                      (let [x (one f1 b1)] [x (one f4 b4)])
+                      (let [y (one f4 b4)] [(one f1 b1) y]))]
+          (recur (inc i) (min t1 x) (min t4 y) (+ spent (* x b1) (* y b4))))))))
 
 ;; n1 sized so the REGRESSED right-fold (~7.5e8 char copies in the 4x arm)
 ;; still finishes and fails rather than hanging the gate.
-(def ^:private n1 4000)
-(def ^:private factor 4)
-(def ^:private max-ratio 8.0)
-;; best-of over this many runs per arm. best-of is the right estimator for "what
-;; does this cost when nothing interferes": interference (a GC episode, the
-;; scheduler) can only ever make a run slower, never faster.
 ;;
-;; 5 rather than 3, because the arms here are SMALL — the 1x record arm renders in
-;; ~7ms — and this gate cannot be resized the way read_scaling_test.clj was.
 ;; Per-element cost grows with n across this whole range (record: 1.77us at 4000,
 ;; 4.10 at 16000, 5.44 at 32000, 5.93 at 64000; vector: 0.61, 0.63, 1.56, 1.84),
 ;; so there is no flat regime to move onto — 16000 -> 64000 measures 9.05 on the
-;; vector arm and would fail outright. These sizes are the best window available.
-;;
-;; And not more than 5: sampling is not free, and CI runs the suite as
-;; `make -j$(nproc) test`, where a gate that holds a core longer starves the other
-;; timing gates beside it — an earlier revision of these two files did exactly that
-;; to the complexity gate, whose ceiling sits at 2.0 over 3ms measurements. Five is
-;; enough for the property: on an idle machine the reported ratios sit at 4.07-4.15
-;; and 4.39-4.42 across runs, and the retry below covers the rare episode that
-;; sampling cannot.
-(def ^:private samples 5)
-;; ...and if the ratio still comes out over the ceiling, re-measure the whole
-;; thing this many times before failing.
-;;
-;; Both arms of the record check allocate ~n intermediate records (each assoc
-;; conses a new one), so a GC episode can span every run of a best-of and inflate
-;; the arm as a whole — which best-of alone cannot filter. The record ratio
-;; measures ~4.6 against a ceiling of 8.0, so there is only ~1.7x of headroom for
-;; that to eat, and it did: this gate failed twice during one afternoon's work,
-;; once on a tree with no local changes at all (ratio 8.71).
-;;
-;; Retrying costs nothing in POWER, which is the point. A genuine quadratic
-;; regression measures ~16 — it is over the ceiling on every attempt and still
-;; fails deterministically. Only a one-off interference episode passes on retry,
-;; and that is exactly the case that was never a real failure.
-(def ^:private tries 3)
+;; vector arm and would fail outright. These sizes are the best window available;
+;; the record ratio measures ~4.6-5.2 against the ceiling of 8.0.
+(def ^:private n1 4000)
+(def ^:private factor 4)
+(def ^:private max-ratio 8.0)
 
-;; Measure t1/t4/ratio once.
-(defn- ratio-once [f1 f4]
-  (let [t1 (max 0.001 (best-of samples f1))
-        t4 (best-of samples f4)]
-    [t1 t4 (/ t4 t1)]))
+(def ^:private failures (atom 0))
 
-;; Judge one arm: report every attempt, pass on the first ratio within the
-;; ceiling, fail only when all of them exceed it.
-(defn- judge [label n1' n4' f1 f4 fail-msg]
-  (loop [attempt 1 seen []]
-    (let [[t1 t4 ratio] (ratio-once f1 f4)
-          seen (conj seen ratio)]
-      (println (format "print-scaling: %s%d %.2fms, %d %.2fms, ratio %.2f (linear ~%.1f, quadratic ~%.1f, ceiling %.1f)"
-                       label n1' t1 n4' t4 ratio
-                       (double factor) (double (* factor factor)) max-ratio))
-      (cond
-        (<= ratio max-ratio) (println "print-scaling: passed")
-        (< attempt tries)
-        (do (println (format "print-scaling: ratio %.2f over ceiling %.1f — re-measuring (attempt %d of %d)"
-                             ratio max-ratio (inc attempt) tries))
-            (recur (inc attempt) seen))
-        :else
-        (do (println (str "FAIL print-scaling: " fail-msg))
-            (println (str "  ratios over " tries " attempts: "
-                          (clojure.string/join ", " (map #(format "%.2f" %) seen))))
-            (System/exit 1))))))
+(defn- report [label [t1 t4 ratio] note]
+  (println (format "print-scaling: %s%d %.2fms, %d %.2fms, ratio %.2f (linear ~%.1f, quadratic ~%.1f, ceiling %.1f)%s"
+                   label n1 t1 (* factor n1) t4 ratio
+                   (double factor) (double (* factor factor)) max-ratio note)))
+
+;; A miss is measured once more before it counts. That costs no POWER: a
+;; quadratic render measures ~16 in every round of both measurements, while a
+;; burst long enough to spoil all seven rounds of one rarely spoils the next.
+(defn- judge [label f1 f4 fail-msg]
+  (let [m (paired f1 f4 factor)
+        m (if (<= (nth m 2) max-ratio)
+            m
+            (do (report label m " — over the ceiling, measuring again")
+                (paired f1 f4 factor)))]
+    (report label m "")
+    (when (> (nth m 2) max-ratio)
+      (println (str "FAIL print-scaling: " fail-msg))
+      (swap! failures inc))))
 
 (defn -main [& _]
   ;; exact small renders: separators, map commas, sorted-map arm
@@ -130,7 +132,7 @@
     (when-not (and (> c1 (* 4 n1)) (> c4 (* 4 factor n1)))
       (println (str "FAIL print-scaling: rendered lengths look wrong — " c1 " and " c4))
       (System/exit 1))
-    (judge "" n1 (* factor n1) #(render n1) #(render (* factor n1))
+    (judge "" #(render n1) #(render (* factor n1))
            (str "rendering scaled worse than linearly in the element count. "
                 "jolt-str-join is re-copying the joined suffix per element "
                 "(host/chez/rt.ss, host/gambit/rt-core.ss, or sorted-map-render in host-table.ss).")))
@@ -138,8 +140,11 @@
   (when-not (= (pr-str (assoc (->ExtRec) :b 2 :a 1)) "#print_scaling_test.ExtRec{:b 2, :a 1}")
     (println (str "FAIL print-scaling: wrong record rendering — " (pr-str (assoc (->ExtRec) :b 2 :a 1))))
     (System/exit 1))
-  (judge "record " n1 (* factor n1) #(render-rec n1) #(render-rec (* factor n1))
+  (judge "record " #(render-rec n1) #(render-rec (* factor n1))
          (str "record rendering scaled worse than linearly in the entry count. "
-              "jrec-field-pr is appending each entry to a growing accumulator (host/chez/records.ss).")))
+              "jrec-field-pr is appending each entry to a growing accumulator (host/chez/records.ss)."))
+  (if (pos? @failures)
+    (System/exit 1)
+    (println "print-scaling: passed")))
 
 (-main)
