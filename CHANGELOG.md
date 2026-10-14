@@ -57,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arena-first one; a pointer and an arena differ in type, so neither order can
   be read as the other.
 
+- **`jolt.deps/resolve-deps` takes `:jvm-deps? true`.** A Maven jar with no
+  Clojure source has always been a leaf: it stays on the roots, but the
+  dependencies its POM declares are left alone, since jolt can't run them. A
+  caller that runs JVM bytecode itself can now ask for those dependencies too.
+  With the option, such a jar's POM is walked the same way a Clojure jar's is:
+  compile and runtime scope only, optional deps skipped, and exclusions
+  honoured when the effective POM can be built (the `pom.xml` fallback inside
+  the jar carries none). Classifiers and `<type>` are not modelled. Without
+  the option nothing changes. A nested `resolve-deps` that doesn't pass the key
+  inherits the outer value.
+
 ### Changed
 
 - **nREPL eval no longer accepts undefined names; use `declare`.** It bound
@@ -341,6 +352,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrays as before. A vector passed to `write-array`, or a `long-array`
   holding a value past the fixnum range, still takes the element loop. Not on
   Gambit.
+- **A built program's boot peaks about 5MB lower** with jolt's Chez kernel
+  patches. Each boot image segment was uncompressed into a heap buffer that the
+  static image was then placed around, and the holes it left behind stayed
+  held: a closed-world hello peaked at 49MB for 33MB live on Android. The
+  buffer lives outside the heap now and the same program peaks at 44MB. A
+  kernel without the patches (Homebrew, a distro Chez) boots as before.
 - **`System/arraycopy` between two `double`, `float`, `long`, `int` or `short`
   arrays is a block move**, as it already was for byte arrays: 6000 doubles
   went from 97 to 0.8 µs, and no longer allocate a flonum each.
