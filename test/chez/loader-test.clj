@@ -46,6 +46,27 @@
 (require 'c :reload-all)
 (chk ":reload-all: dep d reloaded transitively" (= (vof 'd 'v) 2))
 
+;; --- (3b) :reload-all reloads each lib ONCE, however many libs require it ---
+;; clojure.core binds a fresh *loaded-libs* for the extent, so a shared dependency
+;; reloads once and is then loaded again. jolt turned the dedup off for the whole
+;; extent instead, so every require site reloaded it again — a diamond doubled the
+;; work per level, and a real dependency graph ran for tens of minutes.
+(def reloads (atom 0))
+(.mkdirs (java.io.File. (str root "/dmd")))
+(spit (str root "/dmd/base.clj") "(ns dmd.base) (swap! loader-test/reloads inc)")
+(doseq [x ["l" "r"]]
+  (spit (str root "/dmd/" x "1.clj") (str "(ns dmd." x "1 (:require dmd.base))"))
+  (spit (str root "/dmd/" x "2.clj") (str "(ns dmd." x "2 (:require dmd.l1 dmd.r1))")))
+(spit (str root "/dmd/top.clj") "(ns dmd.top (:require dmd.l2 dmd.r2))")
+(require 'dmd.top)
+(chk ":reload-all once: initial load runs base once" (= @reloads 1))
+(reset! reloads 0)
+(require 'dmd.top :reload-all)
+(chk (str ":reload-all once: base reloaded exactly once (was " @reloads ")") (= @reloads 1))
+(reset! reloads 0)
+(require 'dmd.top :reload-all)
+(chk ":reload-all once: a second :reload-all reloads base again" (= @reloads 1))
+
 ;; --- (4) a data-reader fn that resolves but throws surfaces ---------------
 ;; useboom's #boom sits inside an uncalled fn body, so a silent fallback to a
 ;; runtime call would let the require SUCCEED. With the guard narrowed, the
@@ -129,6 +150,55 @@
 (spit (str root "/lfc.clj") "(ns lfc) (throw (ex-info \"LFC\" {}))")
 (try (load-file (str root "/lfc.clj")) (catch :default _ nil))
 (chk "load-file: *ns* is restored when the file throws" (= "loader-test" (str *ns*)))
+
+;; --- (10) :reload-all reloads the image's stdlib into ITS OWN namespaces ----
+;; clojure.string, clojure.walk and clojure.set are baked into the seed and had
+;; no ns form, so a :reload-all that reached them evaluated their source in the
+;; REQUIRING namespace: their defns landed there, and a macro it shadows (a `let`
+;; that does not expand in tail position) broke clojure.string's trim-newline
+;; with "Can only recur from tail position".
+(spit (str root "/shadowlet.clj")
+      (str "(ns shadowlet (:refer-clojure :exclude [let])"
+           " (:require [clojure.string :as s] [clojure.walk :as w] [clojure.set :as st]))"
+           " (defmacro let [bs & body] `(do (clojure.core/let ~bs ~@body) nil))"
+           " (defn f [] (s/upper-case \"x\"))"))
+(require 'shadowlet)
+(let [e (try (require 'shadowlet :reload-all) nil
+             (catch :default e (in-ns 'loader-test) e))]
+  (chk (str "reload-all-stdlib: reload succeeds (" (when e (ex-message e)) ")") (nil? e)))
+(chk "reload-all-stdlib: *ns* is the caller's afterwards" (= "loader-test" (str *ns*)))
+(chk "reload-all-stdlib: clojure.string defs did not land in the requirer"
+     (nil? (ns-resolve 'shadowlet 'trim-newline)))
+(chk "reload-all-stdlib: clojure.walk defs did not land in the requirer"
+     (nil? (ns-resolve 'shadowlet 'postwalk)))
+(chk "reload-all-stdlib: clojure.set defs did not land in the requirer"
+     (nil? (ns-resolve 'shadowlet 'difference)))
+(chk "reload-all-stdlib: clojure.string still works"
+     (= "ab" (clojure.string/trim-newline "ab\r\n")))
+(chk "reload-all-stdlib: the requirer still works"
+     (= "X" (when-let [v (ns-resolve 'shadowlet 'f)] ((deref v)))))
+
+;; --- (11) an unqualified `ns` / `in-ns` always means clojure.core's ---------
+;; A file's ns form is read in the REQUIRER's namespace. sci.core excludes `ns`
+;; and defines its own, so when :reload-all re-ran its ns form and that loaded
+;; clojure.tools.reader.reader-types, the dependency's `(ns ...)` resolved to
+;; sci.core/ns and failed "Unable to resolve symbol". The JVM's Compiler.lookupVar
+;; and resolve special-case both names to clojure.core, whatever the ns maps.
+(spit (str root "/ownnsdep.clj") "(ns ownnsdep) (def v :dep)")
+(spit (str root "/ownns.clj")
+      (str "(ns ownns (:refer-clojure :exclude [ns in-ns]) (:require ownnsdep))"
+           " (defn ns [] :own) (defn in-ns [] :own) (def v :ownns)"))
+(require 'ownns)
+(let [e (try (require 'ownns :reload-all) nil
+             (catch :default e (in-ns 'loader-test) e))]
+  (chk (str "own-ns: a ns that shadows `ns` reloads its deps (" (when e (ex-message e)) ")")
+       (nil? e)))
+(chk "own-ns: *ns* is the caller's afterwards" (= "loader-test" (str *ns*)))
+(chk "own-ns: its defs are intact" (= :ownns (vof 'ownns 'v)))
+(chk "own-ns: the dep reloaded into its own ns" (= :dep (vof 'ownnsdep 'v)))
+(chk "own-ns: ns-resolve of ns is clojure.core's" (= #'clojure.core/ns (ns-resolve 'ownns 'ns)))
+(chk "own-ns: ns-resolve of in-ns is clojure.core's"
+     (= #'clojure.core/in-ns (ns-resolve 'ownns 'in-ns)))
 
 (if (empty? @failures)
   (println "LOADER OK")

@@ -72,7 +72,18 @@
         (cons "toHours"   (lambda (self n) (tu-convert self n 3600000000000)))
         (cons "toDays"    (lambda (self n) (tu-convert self n 86400000000000)))
         ;; the same interruptible sleep Thread/sleep takes (java/host-static-methods.ss)
-        (cons "sleep"     (lambda (self n) (jolt-thread-sleep-ms (tu->ms n self))))
+        ;; exact, not tu->ms's whole milliseconds: a sub-millisecond sleep is
+        ;; rounded up by the sleep, never down to nothing. A timeout <= 0 does
+        ;; nothing at all, as TimeUnit.sleep's own (timeout > 0) guard has it: no
+        ;; yield, and no InterruptedException for an already-interrupted thread.
+        (cons "sleep"     (lambda (self n)
+                            (let ((n (jnum->exact n)))
+                              (if (positive? n)
+                                  (jolt-thread-sleep-ms
+                                    (if (time-unit? self)
+                                        (/ (* n (time-unit-scale self)) 1000000)
+                                        n))
+                                  jolt-nil))))
         (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))))
 ;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its

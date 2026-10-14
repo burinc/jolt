@@ -108,6 +108,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory as with `JOLT_AOT_CACHE=0` (`JOLT_DEBUG` says why). A cache that exists
   but is read-only still serves its hits, and a miss runs without caching.
 
+- **`Thread/sleep` sleeps for what it is asked.** Since 0.8.21 a timed wait
+  on a thread counted its timeout from the truncated millisecond, so it ran up
+  to 1ms past its deadline, and `(Thread/sleep 1)` took 2.5ms. `(Thread/sleep
+  0)` waited for the next tick of the clock (~1.25ms) instead of returning,
+  and `(Thread/sleep ms nanos)` dropped the nanos, so `(Thread/sleep 0
+  100000)` was the same 1.25ms. A sleep's deadline is now exact, nanos and a
+  `TimeUnit` finer than a millisecond included: `(Thread/sleep 1)` takes
+  ~1.25ms on macOS (the OS's own wake latency), `(Thread/sleep 0 100000)`
+  ~0.13ms, and `(Thread/sleep 0)` yields, throwing first if the thread is
+  interrupted, as the JDK's does. Other timed waits keep whole-millisecond
+  deadlines, rounded up, but no longer overshoot them. `Thread/sleep` also
+  refuses a negative timeout and nanos outside 0..999999 with
+  IllegalArgumentException, as the JDK does, and `TimeUnit.sleep` of zero or
+  less returns at once without checking the interrupt flag. A zero timeout is
+  due at once: `(.poll q 0 TimeUnit/MILLISECONDS)` and `(deref p 0 nil)` waited
+  for the next clock tick, ~1.25ms a call, and now return in well under a
+  microsecond.
+
 - **stderr is its own stream on Windows (#1331).** Chez's check for whether
   stdout and stderr are the same file compared stdout's file with itself, so
   with both streams redirected to files, everything written to `System/err`,
@@ -176,6 +194,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scheme.exe --script host/chez/cli.ss ... > f 2>&1` crashing every time
   while other redirections worked. The probe now counts down from above the
   payload and never leaves the object.
+
+- **`(require 'x :reload-all)` reloads each namespace once, into its own
+  namespace.** It turned the loaded-namespace check off for its whole extent,
+  so a shared dependency reloaded again at every place it was required and the
+  work doubled with each level of the graph; a real project's reload ran for
+  tens of minutes. Each namespace now reloads once per `:reload-all`, as on
+  the JVM. `clojure.string`, `clojure.walk` and `clojure.set` had no `ns` form,
+  so a reload that reached them evaluated them in the requiring namespace: their
+  defns landed there, and a macro it shadowed broke the load ("Can only recur
+  from tail position" in `trim-newline`). And an unqualified `ns` or `in-ns`
+  now always means `clojure.core`'s, as in the JVM compiler, so a namespace
+  that excludes `ns` and defines its own (`sci.core`) no longer breaks the
+  `ns` form of every library it requires on a reload.
 
 - **A host-called seam no longer shows up in later stack traces.** The fns a
   library registers with `__register-eq!`, `__register-hash!`, `__register-str!`

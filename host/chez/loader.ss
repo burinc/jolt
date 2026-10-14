@@ -2390,10 +2390,17 @@
     lib))
 (def-var! "clojure.core" "compile" jolt-compile)
 
-;; :reload-all forces the dedup off for the whole dynamic extent of a load (the
-;; loader learns dependencies only as it loads them), so every namespace pulled in
-;; reloads too — mirroring clojure.core. :verbose prints each load to stderr.
+;; :reload-all reloads every namespace pulled in during the dynamic extent of a
+;; load (the loader learns dependencies only as it loads them) — ONCE each, which
+;; is what clojure.core gets by binding a fresh *loaded-libs* for the extent. The
+;; parameter is #f outside one, and inside it is the set of namespaces this
+;; extent has already claimed. A bare "dedup off" flag reloaded a shared
+;; dependency at every require site, so the work doubled with each level of a
+;; diamond. Mutated only under ldr-load-mu. :verbose prints each load to stderr.
 (define ldr-reload-all? (make-thread-parameter #f))
+(define (ldr-reloaded-in-extent? name)
+  (let ((seen (ldr-reload-all?)))
+    (and seen (hashtable-contains? seen name))))
 (define ldr-verbose? (make-thread-parameter #f))
 
 ;; --- the load protocol (concurrent require) ---------------------------------
@@ -2715,13 +2722,18 @@
                ;; a thread's wait ends under this lock, so it loops HERE; a fiber
                ;; answers jolt-lock-parked and comes back in at the top.
                (or (ldr-wait-for-load! name deadline) (loop)))
-              ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
-               (ldr-decided! me 'loaded))                     ; step 4
+              ;; step 4. Inside a :reload-all, "loaded" means loaded by THIS
+              ;; extent; a load that failed rolled its mark back, so it retries.
+              ((and (not force?) (ns-dedup-loaded? name)
+                    (or (not (ldr-reload-all?)) (ldr-reloaded-in-extent? name)))
+               (ldr-decided! me 'loaded))
               ;; step 6. Masked from the claim on (jolt-wind*, locks.ss), and
               ;; load-namespace* drops it once its wind holds the claim: an
               ;; interrupt's escape in between left the claim standing and every
               ;; later require of the namespace waiting on it.
-              (else (hashtable-set! ldr-loading name me)
+              (else (let ((seen (ldr-reload-all?)))
+                      (when seen (hashtable-set! seen name #t)))
+                    (hashtable-set! ldr-loading name me)
                     (jolt-locks-enter!)
                     (ldr-decided! me 'claimed)))))))))
 
@@ -2775,8 +2787,8 @@
 
 ;; load-namespace: load `name`'s source once. Marked loaded BEFORE eval so a
 ;; dependency cycle terminates (Clojure's behavior). force? (a :reload of the
-;; named lib) bypasses the dedup for THIS load only; ldr-reload-all? bypasses it
-;; for this load and every nested one in its extent. On a throw the mark is rolled
+;; named lib) bypasses the dedup for THIS load only; ldr-reload-all? reloads each
+;; namespace once in its extent (ldr-begin-load!). On a throw the mark is rolled
 ;; back IF this call made it (a retry then loads) and the caller's ns is restored —
 ;; matching Clojure, which marks a lib loaded only after success.
 (define (load-namespace name) (load-namespace* name #f))
@@ -2952,7 +2964,9 @@
     (let ((reload-all? (and (member "reload-all" flags) #t))
           (verbose? (and (member "verbose" flags) #t)))
       (if reload-all?
-          (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?)) (k #f))
+          (parameterize ((ldr-reload-all? (make-hashtable string-hash string=?))
+                         (ldr-verbose? verbose?))
+            (k #f))
           (parameterize ((ldr-verbose? verbose?))
             (k (and (member "reload" flags) #t)))))))
 

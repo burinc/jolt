@@ -108,14 +108,42 @@
 ;; like a thread's, through the fiber's own flag. It used to sleep the CARRIER,
 ;; which stopped every other fiber placed on it for the duration and could only
 ;; honour an interrupt that was already set.
+;;
+;; ms may be fractional -- Thread.sleep(ms, nanos), a TimeUnit finer than a
+;; millisecond -- and the deadline is exact (mono-deadline-exact), so the sleep
+;; lasts what was asked, not that rounded up to a millisecond boundary. A sleep
+;; of nothing is the JDK's: it throws if the thread is already interrupted and
+;; otherwise yields. It used to wait for the next tick of the millisecond clock.
 (define (jolt-thread-sleep-ms ms)
-  (let ((ms (exact (floor ms))) (mu (make-mutex)) (cv (jolt-make-cv)))
-    (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (mono-deadline ms)
-      (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
-    jolt-nil))
+  (let ((ms (exact ms)))
+    (if (<= ms 0)
+        (begin
+          (jolt-interrupt-poll-check! "sleep interrupted")
+          (unless (jolt-fiber-wait-turn! 0) (thread-yield!))
+          jolt-nil)
+        (let ((mu (make-mutex)) (cv (jolt-make-cv)))
+          (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (mono-deadline-exact ms)
+            (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
+          jolt-nil))))
+
+;; Thread.sleep(millis, nanos): the nanos are part of the sleep, not ignored.
+;; Both are longs to the JVM (truncated here), and its argument checks come first:
+;; a negative millis, or nanos outside 0..999999, is IllegalArgumentException.
+(define (thread-sleep-millis-arg ms)
+  (let ((ms (jnum->exact ms)))
+    (when (negative? ms)
+      (throw-jvm (quote IllegalArgumentException) "timeout value is negative"))
+    ms))
+(define (jolt-thread-sleep-ms+ns ms ns)
+  (let ((ms (thread-sleep-millis-arg ms)) (ns (jnum->exact ns)))
+    (when (or (negative? ns) (> ns 999999))
+      (throw-jvm (quote IllegalArgumentException) "nanosecond timeout value out of range"))
+    (jolt-thread-sleep-ms (+ ms (/ ns 1000000)))))
 
 (define thread-statics
-  (list (cons "sleep" (lambda (ms . _) (jolt-thread-sleep-ms (jolt-need-num ms))))
+  (list (cons "sleep" (case-lambda
+                        ((ms) (jolt-thread-sleep-ms (thread-sleep-millis-arg ms)))
+                        ((ms ns) (jolt-thread-sleep-ms+ns ms ns))))
         ;; a fiber yields to the other fibers on its carrier, as a virtual
         ;; thread yields its carrier; not while it holds a counted lock
         (cons "yield" (lambda _ (unless (jolt-fiber-wait-turn! 0) (thread-yield!)) jolt-nil))
@@ -315,11 +343,40 @@
 ;; (mono-deadline ms) — the deadline ms from now, the one way to build one. Now is
 ;; rounded UP: a wait ends once (mono-millis), which truncates, reaches the
 ;; deadline, so a deadline off the truncated now came due up to 1ms early, and a
-;; timed wait could return before its timeout, which the JDK's never do.
+;; timed wait could return before its timeout, which the JDK's never do. A
+;; timeout of zero or less is due already, off the truncated now: rounded up, a
+;; (.poll q 0 ms) or (deref p 0 nil) waited for the next tick, ~1ms a call.
 (define (mono-deadline ms)
   (let ((t (current-time 'time-monotonic)))
-    (+ (* 1000 (time-second t)) (quotient (+ (time-nanosecond t) 999999) 1000000)
-       (exact (floor ms)))))
+    (if (<= ms 0)
+        (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000)
+           (exact (floor ms)))
+        (+ (* 1000 (time-second t)) (quotient (+ (time-nanosecond t) 999999) 1000000)
+           (exact (floor ms))))))
+
+;; A deadline is a whole number of mono-millis everywhere except Thread/sleep,
+;; whose deadline is EXACT (mono-deadline-exact): a rational millisecond, so a
+;; sleep ends when its time has passed rather than at a millisecond rounded up
+;; from it -- which, a 1ms sleep being followed by the next, phase-locked a loop of
+;; (Thread/sleep 1) to 2ms a turn. The two kinds compare on one clock below.
+(define (mono-nanos)
+  (let ((t (current-time 'time-monotonic)))
+    (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
+(define (mono-deadline-exact ms)
+  (+ (/ (mono-nanos) 1000000) (exact ms)))
+;; (mono-due? deadline) — has the deadline passed. For a whole deadline this is
+;; exactly (>= (mono-millis) deadline); an exact one is read at full precision.
+(define (mono-due? deadline)
+  (if (fixnum? deadline)
+      (>= (mono-millis) deadline)
+      (>= (mono-nanos) (* 1000000 deadline))))
+;; (mono-duration-until deadline) — the time-duration from now until a deadline,
+;; never negative, for a relative wait. Now is read at full precision: a wait of
+;; (- deadline (mono-millis)) ms starts from the truncated millisecond and so
+;; overshoots by however far into that millisecond now was.
+(define (mono-duration-until deadline)
+  (let ((ns (max 0 (- (exact (ceiling (* 1000000 deadline))) (mono-nanos)))))
+    (make-time 'time-duration (mod ns 1000000000) (div ns 1000000000))))
 
 ;; clojure.core/current-time-ms — epoch milliseconds.
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
