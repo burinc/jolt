@@ -364,6 +364,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Starting a subprocess no longer starts a shell first.** Every
+  `ProcessBuilder.start` (and so `jolt.process`, `clojure.java.shell` and
+  babashka.process) ran `/bin/sh -c "cd DIR && exec PROG ARGS"`, and on macOS
+  that shell is bash, whose startup was most of the cost of a spawn: 5.4 ms
+  against 1.8 ms for the program alone. The program is now spawned directly,
+  as the JDK does, with the directory as a chdir file action and a merged
+  stderr as a dup2. 500 spawns of `sh -c 'echo $$'` went from 3.7 s and 3.3 s
+  of CPU to 2.1 s and 1.9 s. The shell is still used for a file redirect, for
+  a directory where `posix_spawn_file_actions_addchdir_np` is missing (glibc
+  before 2.29), and for a program that is not an ELF/Mach-O image or `#!`
+  script (an executable script with no `#!` line runs with `/bin/sh`, as on
+  the JVM). A program named without a path is looked up on jolt's own PATH,
+  as the JDK does, rather than on the child's. `JOLT_SPAWN_VIA_SHELL=1` keeps
+  the old path.
 - **`jolt.ffi/read-array` and `write-array` with a numeric type are 20 to 120
   times faster.** `(ffi/read-array p :double n)` read one element at a time,
   through a var call that converted the type keyword and unboxed the pointer at
