@@ -340,30 +340,34 @@
 (define (mono-millis)
   (let ((t (current-time 'time-monotonic)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
-;; (mono-deadline ms) — the deadline ms from now, the one way to build one. Now is
-;; rounded UP: a wait ends once (mono-millis), which truncates, reaches the
-;; deadline, so a deadline off the truncated now came due up to 1ms early, and a
-;; timed wait could return before its timeout, which the JDK's never do. A
-;; timeout of zero or less is due already, off the truncated now: rounded up, a
-;; (.poll q 0 ms) or (deref p 0 nil) waited for the next tick, ~1ms a call.
+;; (mono-deadline ms) — the deadline ms from now, the one way to build one. A
+;; positive timeout's deadline is EXACT: a rational millisecond off the clock read
+;; at full precision, so a wait ends when its time has passed, as the JDK's timed
+;; waits (all on System.nanoTime) do. It used to be a whole millisecond rounded up
+;; from now -- rounded up so a wait never returned early -- and with the wake
+;; latency on top, (deref p 1 nil) took 2ms where the JDK takes 1.1. ms may be
+;; fractional (a TimeUnit finer than a millisecond, Thread.sleep's nanos).
+;; A timeout of zero or less is due already: a whole millisecond off the truncated
+;; now, so mono-due? answers it from the cheap clock.
 (define (mono-deadline ms)
-  (let ((t (current-time 'time-monotonic)))
-    (if (<= ms 0)
+  (if (<= ms 0)
+      (let ((t (current-time 'time-monotonic)))
         (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000)
-           (exact (floor ms)))
-        (+ (* 1000 (time-second t)) (quotient (+ (time-nanosecond t) 999999) 1000000)
-           (exact (floor ms))))))
+           (exact (floor ms))))
+      (mono-deadline-exact ms)))
 
-;; A deadline is a whole number of mono-millis everywhere except Thread/sleep,
-;; whose deadline is EXACT (mono-deadline-exact): a rational millisecond, so a
-;; sleep ends when its time has passed rather than at a millisecond rounded up
-;; from it -- which, a 1ms sleep being followed by the next, phase-locked a loop of
-;; (Thread/sleep 1) to 2ms a turn. The two kinds compare on one clock below.
+;; A deadline is a number of mono-millis: a fixnum (a due one, or one built from a
+;; whole-millisecond clock read by a caller) or an exact rational. The two compare
+;; on one clock below.
 (define (mono-nanos)
   (let ((t (current-time 'time-monotonic)))
     (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
 (define (mono-deadline-exact ms)
   (+ (/ (mono-nanos) 1000000) (exact ms)))
+;; (mono-ms-until deadline) — the milliseconds left until a deadline, exact and
+;; negative once it has passed, for a poll loop that sizes its naps by it.
+(define (mono-ms-until deadline)
+  (- deadline (/ (mono-nanos) 1000000)))
 ;; (mono-due? deadline) — has the deadline passed. For a whole deadline this is
 ;; exactly (>= (mono-millis) deadline); an exact one is read at full precision.
 (define (mono-due? deadline)

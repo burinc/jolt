@@ -727,10 +727,15 @@
 ;; The clock wait-ready's deadlines are on, and jolt.host/timer-at!'s: monotonic
 ;; milliseconds (System/nanoTime's clock), so a wall-clock step neither fires a
 ;; socket timeout early nor holds it late. A caller builds a deadline with
-;; deadline-ms, which rounds now up: clock-ms truncates, so (+ (clock-ms) ms)
-;; came due up to 1ms before ms had passed.
-(defn clock-ms [] (quot (System/nanoTime) 1000000))
-(defn deadline-ms [timeout-ms] (+ (quot (+ (System/nanoTime) 999999) 1000000) timeout-ms))
+;; deadline-ms, which is exact: a ratio of milliseconds off the clock read to the
+;; nanosecond, so a timeout ends when its time has passed, as the JDK's (on
+;; System.nanoTime) do. It used to round now up to a whole millisecond, and with
+;; the wait's own latency a 1ms SO_TIMEOUT took 2.4ms where the JDK takes 1.2.
+(defn clock-ms [] (/ (System/nanoTime) 1000000))
+(defn deadline-ms [timeout-ms] (+ (clock-ms) timeout-ms))
+;; A positive time left, rounded up to a whole unit, for a syscall that takes one:
+;; rounded down, the last wait ends short of the deadline and goes round again.
+(defn- ceil-long [x] (let [q (long (quot x 1))] (if (> x q) (inc q) q)))
 
 ;; (wait-ready fd filt deadline-ms) is the same wait bounded by a deadline on
 ;; clock-ms, answering :timeout when the deadline passed first and nil otherwise
@@ -842,8 +847,9 @@
           (let [ms (remaining-ms deadline)]
             (if (<= ms 0)
               :timeout
-              (do (ffi/write ts :int64 (quot ms 1000) 0)
-                  (ffi/write ts :int64 (* (rem ms 1000) 1000000) 8)
+              (let [ns (ceil-long (* ms 1000000))]
+                (ffi/write ts :int64 (quot ns 1000000000) 0)
+                (ffi/write ts :int64 (rem ns 1000000000) 8)
                   (when-not (pos? (c-kevent kq ffi/null 0 ev 1 ts)) (recur))))))
         (finally (ffi/free ts))))))
 
@@ -855,7 +861,7 @@
       (let [ms (remaining-ms deadline)]
         (if (<= ms 0)
           :timeout
-          (when-not (pos? (c-epoll-wait ep ev 1 (min ms 2147483647))) (recur)))))))
+          (when-not (pos? (c-epoll-wait ep ev 1 (min (ceil-long ms) 2147483647))) (recur)))))))
 
 ;; Windows: WSAPoll on the one fd, in slices, so a cancel! — which can only set
 ;; the handle's flag, there being no per-wait wake channel short of a socket pair
@@ -874,7 +880,7 @@
             (and deadline (<= (remaining-ms deadline) 0)) :timeout
             :else
             (let [slice (if deadline
-                          (min wsapoll-thread-slice-ms (remaining-ms deadline))
+                          (min wsapoll-thread-slice-ms (ceil-long (remaining-ms deadline)))
                           wsapoll-thread-slice-ms)
                   rev (native/poll-one fd events (max 0 slice))]
               (if (zero? rev) (recur) nil))))

@@ -662,6 +662,31 @@
     (check-eq "getSoTimeout on a closed socket"
               (thrown #(.getSoTimeout client)) ["SocketException" "Socket is closed"])))
 
+;; A 1ms SO_TIMEOUT ends at its deadline. The poller's deadline was a whole
+;; millisecond rounded up from now, so with the wake latency on top the read took
+;; ~2.4ms where the JDK's takes ~1.2. Timed interleaved with a (Thread/sleep 1)
+;; from this run, so load stretches both; a round that noise puts behind is
+;; retried, and the rounding shows in every round.
+(defn- median-ns [xs] (nth (sort xs) (quot (count xs) 2)))
+(defn- time-ns [f] (let [t (System/nanoTime)] (f) (- (System/nanoTime) t)))
+(with-pair
+  (fn [server client conn]
+    (.setSoTimeout client 1)
+    (let [in (.getInputStream client)
+          rd #(try (.read in) (catch java.net.SocketTimeoutException _ nil))
+          sl #(Thread/sleep 1)]
+      (rd) (sl)
+      (check-eq "a 1ms read timeout never fires early"
+                (every? #(>= % 1000000) (repeatedly 5 #(time-ns rd))) true)
+      (check-eq "a 1ms read timeout costs a sleep(1), not two ticks"
+                (boolean
+                  (some (fn [_]
+                          (let [pairs (doall (repeatedly 21 #(vector (time-ns rd) (time-ns sl))))
+                                r (median-ns (map first pairs)) s (median-ns (map second pairs))]
+                            (<= r (+ (* 5/4 s) 100000))))
+                        (range 4)))
+                true))))
+
 (let [server (java.net.ServerSocket. 0)]
   (check-eq "ServerSocket getSoTimeout defaults to 0" (.getSoTimeout server) 0)
   (.setSoTimeout server 200)

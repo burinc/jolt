@@ -17,17 +17,24 @@
 
 ;; --- time helpers -----------------------------------------------------------
 ;; A relative duration / absolute deadline from a millisecond count (a jolt number).
+;; The duration is ms to the nanosecond, rounded up: ms may be a fraction (what is
+;; left of an exact deadline, a TimeUnit finer than a millisecond), and flooring it
+;; turned a pause of 0.4ms into none at all and a poll loop into a spin.
 (define (ms->duration ms)
-  (let* ((ms* (exact (floor ms)))
-         (secs (quotient ms* 1000))
-         (nanos (* (remainder ms* 1000) 1000000)))
-    (make-time 'time-duration nanos secs)))
+  (let ((ns (max 0 (exact (ceiling (* ms 1000000))))))
+    (make-time 'time-duration (remainder ns 1000000000) (quotient ns 1000000000))))
 ;; ms from now as a deadline on mono-millis, the form jolt-cv-wait and the timer
 ;; take: a fiber's deadline has to be comparable against the clock and against the
 ;; entries in the shared timer, and a thread's wait is converted from it. One
 ;; clock, so the two cannot drift apart — and the monotonic one, so a wall-clock
 ;; step does not move a deadline.
 (define (ms->deadline-millis ms) (mono-deadline ms))
+;; ms as the timeout of ONE timed wait (jolt-timeout, host/chez/locks.ss): it
+;; starts when the wait first has to wait, so a wait that answers at once reads no
+;; clock. A plain number of milliseconds is a long to the JVM, so a double is
+;; truncated; tu->ms's exact answer for a finer TimeUnit is kept.
+(define (ms->timeout ms)
+  (jolt-timeout (if (and (number? ms) (exact? ms)) ms (jnum->exact ms))))
 
 ;; --- java.util.concurrent.TimeUnit ------------------------------------------
 ;; A TimeUnit is a scale, so each constant is an object carrying its name and its
@@ -50,9 +57,18 @@
 
 ;; (amount, unit) -> milliseconds. A missing or non-TimeUnit unit leaves the amount
 ;; alone, which is the plain-milliseconds shape awaitTermination has always taken.
+;; EXACT, not truncated to a whole millisecond: (.poll q 500 MICROSECONDS) is half
+;; a millisecond, where the quotient made it no wait at all.
 (define (tu->ms amount unit)
   (let ((n (if (number? amount) (jnum->exact amount) 0)))
-    (if (time-unit? unit) (quotient (* n (time-unit-scale unit)) 1000000) n)))
+    (if (time-unit? unit)
+        ;; a unit of a millisecond or more scales by a whole number, which skips
+        ;; the rational division the polls with a timeout would pay on every call
+        (let ((scale (time-unit-scale unit)))
+          (if (fx>= scale 1000000)
+              (* n (fxquotient scale 1000000))
+              (/ (* n scale) 1000000)))
+        n)))
 
 ;; The timeout of a (… timeout unit) argument tail, in ms, or #f when absent — the
 ;; untimed overload of the same method.
@@ -187,7 +203,7 @@
 (define (jolt-future-deref-timed f ms timeout-val)
   (let ((settled (jolt-cv-wait-interruptibly "future deref"
                                (jolt-future-mu f) (jolt-future-cv f)
-                               (ms->deadline-millis ms)
+                               (ms->timeout ms)
                    (lambda (timed-out?)
                      ;; done? FIRST on both paths: a future that settled as the
                      ;; deadline passed is not a timeout, which is the re-check the
@@ -301,7 +317,7 @@
 (define (jolt-promise-deref-timed p ms timeout-val)
   (let ((got (jolt-cv-wait-interruptibly "promise deref"
                            (jolt-promise-mu p) (jolt-promise-cv p)
-                           (ms->deadline-millis ms)
+                           (ms->timeout ms)
                (lambda (timed-out?)
                  (cond ((jolt-promise-delivered? p) #t)
                        (timed-out? #f)
@@ -403,7 +419,7 @@
       (cond
         ((fx>? exit-nondaemon-live 0) (jolt-condition-wait exit-cv exit-mu) (loop))
         (exit-pooled-held? (jolt-condition-wait exit-cv exit-mu) (loop))
-        ((and exit-linger-until (> exit-linger-until (mono-millis)))
+        ((and exit-linger-until (not (mono-due? exit-linger-until)))
          (jolt-condition-wait exit-cv exit-mu (jolt-deadline->timeout exit-linger-until))
          (loop))
         (else (void))))))
@@ -1461,14 +1477,22 @@
 ;; timeout. The queue read is unlocked on purpose: it is a hint, and being wrong
 ;; either way costs one 1ms nap or one extra yield.
 (define lock-poll-nap (make-time 'time-duration 1000000 0))   ; 1ms
-(define (monitor-poll-round!)
+;; With a DEADLINE the nap is cut to what is left of it, so a bounded acquire gives
+;; up at its deadline and not up to a nap past it.
+(define monitor-poll-round!
+  (case-lambda
+    (() (monitor-poll-round* lock-poll-nap))
+    ((deadline)
+     (let ((left (mono-duration-until deadline)))
+       (monitor-poll-round* (if (time<? left lock-poll-nap) left lock-poll-nap))))))
+(define (monitor-poll-round* nap)
   (let ((f (jolt-current-fiber)))
     (cond
-      ((not f) (sleep lock-poll-nap))
+      ((not f) (sleep nap))
       (else
        (sa-fiber-yield)
        (unless (jolt-carrier-head (jolt-fiber-carrier f))
-         (sleep lock-poll-nap))))))
+         (sleep nap))))))
 
 ;; The waiters are taken and cleared under bk so no resume is delivered twice, and
 ;; they are woken OUTSIDE it: sa-fiber-resume takes the carrier's run-queue mutex,
@@ -2241,7 +2265,7 @@
             ;; the thread it joins exits.
             (jolt-cv-wait-interruptibly "Thread.join"
                           (vector-ref st 2) (vector-ref st 3)
-                          (and ms (not (= ms 0)) (ms->deadline-millis ms))
+                          (and ms (not (= ms 0)) (ms->timeout ms))
               (lambda (timed-out?)
                 (cond ((not (jthread-alive? st)) #t)
                       (timed-out? #f)
@@ -2582,7 +2606,7 @@
             ;; left of the timeout rather than restarting it
             (let ((reached (jolt-cv-wait-interruptibly "CountDownLatch.await"
                                          (vector-ref st 1) (vector-ref st 2)
-                                         (and ms (ms->deadline-millis ms))
+                                         (and ms (ms->timeout ms))
                              (lambda (timed-out?)
                                (cond ((<= (vector-ref st 0) 0) #t)
                                      (timed-out? #f)
@@ -2696,7 +2720,7 @@
           ((vector-ref st 2) (jolt-throw (task-execution-exception (vector-ref st 2))))
           (else (vector-ref st 1)))))
 (define (j-future-get* self ms on-timeout)
-  (j-future-get-until self (and ms (ms->deadline-millis ms)) on-timeout))
+  (j-future-get-until self (and ms (ms->timeout ms)) on-timeout))
 (define (future-timeout-throw)
   ;; no message: FutureTask.get's TimeoutException carries none on the JVM
   (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil)))
@@ -2964,7 +2988,7 @@
           ;; above core, or any worker once allowCoreThreadTimeOut is on
           ((and (vector-ref st 8) (or (vector-ref st 19) (fx>? (vector-ref st 4) (vector-ref st 6))))
            (let ((dl (or deadline (mono-deadline (vector-ref st 8)))))
-             (if (>= (mono-millis) dl)
+             (if (mono-due? dl)
                  (executor-worker-exit! st)                ; idle past keep-alive
                  (begin (executor-idle-wait! st dl)
                         (poll dl)))))
@@ -3381,7 +3405,7 @@
         (cons "awaitTermination" (lambda (self ms . rest)
           (executor-await-termination
             (jhost-state self)
-            (mono-deadline (tu->ms ms (if (null? rest) #f (car rest)))))))))
+            (ms->timeout (tu->ms ms (if (null? rest) #f (car rest)))))))))
 
 ;; --- ArrayBlockingQueue / FutureTask / ThreadPoolExecutor --------------------
 ;; The construction Grain's SQLite write coordinator does directly:
@@ -3455,7 +3479,7 @@
     (or (abq-take-now st)
         (jolt-cv-wait-interruptibly "BlockingQueue.take"
                                     (vector-ref st 1) (vector-ref st 2)
-                                    (and timeout (ms->deadline-millis (tu-args->ms timeout)))
+                                    (and timeout (ms->timeout (tu-args->ms timeout)))
           (lambda (timed-out?)
             (cond ((fx>? (vector-ref st 4) 0) (cons (abq-deq! st) #t))
                   (timed-out? #f)
@@ -3465,7 +3489,7 @@
     (or (abq-put-now st v)
         (jolt-cv-wait-interruptibly "BlockingQueue.put"
                                     (vector-ref st 1) (vector-ref st 2)
-                                    (and timeout (ms->deadline-millis (tu-args->ms timeout)))
+                                    (and timeout (ms->timeout (tu-args->ms timeout)))
           (lambda (timed-out?)
             (cond ((fx<? (vector-ref st 4) (vector-ref st 0)) (abq-enq! st v) #t)
                   (timed-out? #f)
@@ -3588,7 +3612,7 @@
   (let* ((st (jhost-state self))
          (r (jolt-cv-wait-interruptibly "FutureTask.get"
                           (vector-ref st 5) (vector-ref st 6)
-                          (and ms (ms->deadline-millis ms))
+                          (and ms (ms->timeout ms))
               (lambda (timed-out?)
                 (cond ((memq (vector-ref st 0) '(done cancelled)) (vector-ref st 0))
                       (timed-out? #f)
@@ -3758,7 +3782,7 @@
 (define (executor-delayed-head st)
   (let ((d (vector-ref st 13))) (and (pair? d) (car d))))
 (define (executor-delayed-due? st)
-  (let ((head (executor-delayed-head st))) (and head (>= (mono-millis) (sf-due head)) #t)))
+  (let ((head (executor-delayed-head st))) (and head (mono-due? (sf-due head)) #t)))
 (define (executor-delayed-pop! st)
   (let ((d (vector-ref st 13))) (vector-set! st 13 (cdr d)) (car d)))
 ;; Insert in due order. A NEW HEAD demotes whoever is timing the old one (their
@@ -3855,8 +3879,8 @@
 ;; into a pool that is still open.
 (derive-host-methods! "scheduled-future" "j-future"
   (list (cons "getDelay" (lambda (self unit)
-          (let ((ms (- (sf-due self) (mono-millis))))
-            (if (time-unit? unit) (quotient (* ms 1000000) (time-unit-scale unit)) ms))))
+          (let ((ms (mono-ms-until (sf-due self))))
+            (truncate (if (time-unit? unit) (/ (* ms 1000000) (time-unit-scale unit)) ms)))))
         (cons "compareTo" (lambda (self other)
           (unless (scheduled-future? other)
             (throw-jvm (quote ClassCastException)
@@ -4050,7 +4074,7 @@
   (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException" jolt-nil)))
 ;; get and its timed overload, in the shape future-shim-get* hands deref.
 (define (cf-get* c ms on-timeout)
-  (let ((r (cf-await c "CompletableFuture.get" #t (and ms (ms->deadline-millis ms)))))
+  (let ((r (cf-await c "CompletableFuture.get" #t (and ms (ms->timeout ms)))))
     (if (eq? r cf-timed-out) (on-timeout) (cf-report-get r))))
 
 (define (cf-cancelled? c)
@@ -4478,19 +4502,31 @@
         ;; was honoured but polled with (sleep), which on a fiber guaranteed it would
         ;; run to the deadline whenever the holder was a sibling.
         (cons "tryLock" (lambda (self . args)
-          (let* ((m (rlock-monitor self))
-                 (ms (tu-args->ms args))
-                 (deadline (and ms (ms->deadline-millis ms))))
-            (call-with-thread-state 'TIMED_WAITING
-              (lambda ()
-                (let attempt ()
-                  (cond ((monitor-try-enter! m) #t)
-                        ;; Chez has no timed acquire, so poll. The wait is bounded by the
-                        ;; deadline; the round yields first so the holder can run.
-                        ((and deadline (<= (mono-millis) deadline))
-                         (monitor-poll-round!)
-                         (attempt))
-                        (else #f))))))))
+          ;; The deadline is built only once the first try has failed, so an
+          ;; uncontended tryLock(timeout) reads no clock. It is exact, and the
+          ;; poll gives up once it has passed: (<= (mono-millis) deadline) kept
+          ;; trying through the whole millisecond after it, and the 1ms naps on
+          ;; top made tryLock(1ms) take 3.5ms. The timed form is interruptible,
+          ;; as the JDK's: a set flag throws before the first try, free lock or
+          ;; not, and an interrupt during the poll throws too. tryLock() is not.
+          (let ((m (rlock-monitor self))
+                (ms (tu-args->ms args)))
+            (if (not ms)
+                (monitor-try-enter! m)
+                (let ((me (current-interrupt-box)))
+                  (rlock-interrupted-check! me)
+                  (or (monitor-try-enter! m)
+                      (and (> ms 0)
+                           (let ((deadline (ms->deadline-millis ms)))
+                             (call-with-thread-state 'TIMED_WAITING
+                               (lambda ()
+                                 (let attempt ()
+                                   ;; Chez has no timed acquire, so poll. The round
+                                   ;; yields first so the holder can run.
+                                   (cond ((mono-due? deadline) (monitor-try-enter! m))
+                                         (else (monitor-poll-round! deadline)
+                                               (rlock-interrupted-check! me)
+                                               (or (monitor-try-enter! m) (attempt)))))))))))))))
         (cons "lockInterruptibly" (lambda (self)
           (let ((m (rlock-monitor self))
                 (me (current-interrupt-box)))
