@@ -113,6 +113,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value whose tags said `my.Shape` never found the method. A dotted name now
   has to be modeled under that exact spelling to be shortened.
 
+- **A cache directory jolt cannot write no longer stops a program.** The first
+  require of a library namespace created the AOT cache generation and re-raised
+  a failed mkdir, so a process whose `~/.jolt/aot-cache` (or `JOLT_CACHE_DIR`)
+  could not be created — under a sandbox that denies writing `~/.jolt`, once
+  something had deleted the directory — died with "mkdir: cannot create …".
+  A read-only generation without its `v1` directory failed the same way on its
+  first miss. The cache is now off for that process, and namespaces compile in
+  memory as with `JOLT_AOT_CACHE=0` (`JOLT_DEBUG` says why). A cache that exists
+  but is read-only still serves its hits, and a miss runs without caching.
+
+- **`Thread/sleep` sleeps for what it is asked.** Since 0.8.21 a timed wait
+  on a thread counted its timeout from the truncated millisecond, so it ran up
+  to 1ms past its deadline, and `(Thread/sleep 1)` took 2.5ms. `(Thread/sleep
+  0)` waited for the next tick of the clock (~1.25ms) instead of returning,
+  and `(Thread/sleep ms nanos)` dropped the nanos, so `(Thread/sleep 0
+  100000)` was the same 1.25ms. A sleep's deadline is now exact, nanos and a
+  `TimeUnit` finer than a millisecond included: `(Thread/sleep 1)` takes
+  ~1.25ms on macOS (the OS's own wake latency), `(Thread/sleep 0 100000)`
+  ~0.13ms, and `(Thread/sleep 0)` yields, throwing first if the thread is
+  interrupted, as the JDK's does. Other timed waits keep whole-millisecond
+  deadlines, rounded up, but no longer overshoot them. `Thread/sleep` also
+  refuses a negative timeout and nanos outside 0..999999 with
+  IllegalArgumentException, as the JDK does, and `TimeUnit.sleep` of zero or
+  less returns at once without checking the interrupt flag. A zero timeout is
+  due at once: `(.poll q 0 TimeUnit/MILLISECONDS)` and `(deref p 0 nil)` waited
+  for the next clock tick, ~1.25ms a call, and now return in well under a
+  microsecond.
+
 - **stderr is its own stream on Windows (#1331).** Chez's check for whether
   stdout and stderr are the same file compared stdout's file with itself, so
   with both streams redirected to files, everything written to `System/err`,
@@ -182,6 +210,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while other redirections worked. The probe now counts down from above the
   payload and never leaves the object.
 
+- **`(require 'x :reload-all)` reloads each namespace once, into its own
+  namespace.** It turned the loaded-namespace check off for its whole extent,
+  so a shared dependency reloaded again at every place it was required and the
+  work doubled with each level of the graph; a real project's reload ran for
+  tens of minutes. Each namespace now reloads once per `:reload-all`, as on
+  the JVM. `clojure.string`, `clojure.walk` and `clojure.set` had no `ns` form,
+  so a reload that reached them evaluated them in the requiring namespace: their
+  defns landed there, and a macro it shadowed broke the load ("Can only recur
+  from tail position" in `trim-newline`). And an unqualified `ns` or `in-ns`
+  now always means `clojure.core`'s, as in the JVM compiler, so a namespace
+  that excludes `ns` and defines its own (`sci.core`) no longer breaks the
+  `ns` form of every library it requires on a reload.
+
 - **A host-called seam no longer shows up in later stack traces.** The fns a
   library registers with `__register-eq!`, `__register-hash!`, `__register-str!`
   and the other value seams run inside the host's `=`, `hash` and `str` of any
@@ -207,6 +248,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native whose archive is not on disk is now loaded at runtime like any other
   optional native, and the build's report of runtime-loaded natives names it.
 
+- **Nor on an `:optional` native whose `:static {:lib …}` does not resolve.**
+  The `-l` flag went to the linker unconditionally, so a host without the
+  library failed the whole build (`ld: library 'foo' not found`). The build
+  now try-links the flag for an optional native, once per library, and loads
+  the native at runtime when it does not resolve, with the same
+  "(optional)" line in the build's report. A build with no optional `{:lib}`
+  native runs no probe.
+
 - **A failed file delete answers that it failed.** Deleting a file the process
   cannot unlink, such as one in a read-only directory, reported success while
   the file stayed on disk. `jolt.host/delete-file!` and
@@ -230,6 +279,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can start: ~7 µs, and `str/replace` of escapes in a styled line is about
   twice as fast. The search pass itself dropped a closure per character, so a
   scan that finds nothing is ~25% faster too.
+
+- **A tail call that already returned is no longer a frame of a later throw.**
+  A tail call stores its site so a trace can name the frame it erased, and
+  nothing cleared it when the call returned. After `(f 1)` returned, where `f`
+  tail-calls anything, `(nth [] 3)` reported `f` as the frame it threw from,
+  and inside a fn the leftover could name any fn it had called. Traced code now
+  puts the site back when a non-tail call returns; a fn's calls to itself skip
+  that when nothing it tail-calls can run jolt code, so `fib` and `tak` cost
+  what they did. A throw's erased caller of a fn still running is also placed
+  below that fn, where it was the innermost frame.
 
 - **nREPL eval output, errors and traces match JVM nREPL.** The value was
   printed after the eval's `*out*` binding had ended, so what a lazy result
@@ -338,6 +397,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Starting a subprocess no longer starts a shell first.** Every
+  `ProcessBuilder.start` (and so `jolt.process`, `clojure.java.shell` and
+  babashka.process) ran `/bin/sh -c "cd DIR && exec PROG ARGS"`, and on macOS
+  that shell is bash, whose startup was most of the cost of a spawn: 5.4 ms
+  against 1.8 ms for the program alone. The program is now spawned directly,
+  as the JDK does, with the directory as a chdir file action and a merged
+  stderr as a dup2. 500 spawns of `sh -c 'echo $$'` went from 3.7 s and 3.3 s
+  of CPU to 2.1 s and 1.9 s. The shell is still used for a file redirect, for
+  a directory where `posix_spawn_file_actions_addchdir_np` is missing (glibc
+  before 2.29), and for a program that is not an ELF/Mach-O image or `#!`
+  script (an executable script with no `#!` line runs with `/bin/sh`, as on
+  the JVM). A program named without a path is looked up on jolt's own PATH,
+  as the JDK does, rather than on the child's. `JOLT_SPAWN_VIA_SHELL=1` keeps
+  the old path.
 - **`jolt.ffi/read-array` and `write-array` with a numeric type are 20 to 120
   times faster.** `(ffi/read-array p :double n)` read one element at a time,
   through a var call that converted the type keyword and unboxed the pointer at

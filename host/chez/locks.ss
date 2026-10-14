@@ -592,11 +592,10 @@
 ;; A mono-millis deadline -> the time left until it, as the time-duration Chez's
 ;; condition-wait takes for a relative timeout. Relative and not an absolute
 ;; time-utc: Chez's absolute form is the wall clock, and the deadline is not.
-;; Floored to an exact integer first: make-time will not take a flonum field, and a
-;; deadline arriving as one is a caller's arithmetic, not something to trust.
+;; Measured from now at full precision (mono-duration-until), not from the
+;; truncated millisecond, or every timed wait runs past its deadline.
 (define (jolt-deadline->timeout deadline)
-  (let ((ms (max 0 (- (exact (floor deadline)) (mono-millis)))))
-    (make-time 'time-duration (* 1000000 (mod ms 1000)) (div ms 1000))))
+  (mono-duration-until deadline))
 
 ;; (jolt-pause-ms ms) — pause THIS execution context for ms, whatever it is: a
 ;; thread sleeps, and a fiber parks until the deadline and gives its carrier up in
@@ -719,12 +718,12 @@
                        ;; the report would name this wait instead.
                        (with-exception-handler
                          (lambda (e) (jolt-interrupt-wait-remove! ibox entry) (raise-continuable e))
-                         (lambda () (decide (and deadline (>= (mono-millis) deadline)))))
+                         (lambda () (decide (and deadline (mono-due? deadline)))))
                        ;; NOT REGISTERED — nothing to clean up, so decide runs with
                        ;; nothing wrapped around it. This is the arm every
                        ;; non-interruptible wait takes, and the one a wait that
                        ;; answers on its first run takes.
-                       (decide (and deadline (>= (mono-millis) deadline))))))
+                       (decide (and deadline (mono-due? deadline))))))
             (cond
               ((not (eq? r jolt-cv-again))
                (when entry (jolt-interrupt-wait-remove! ibox entry) (set! entry #f))

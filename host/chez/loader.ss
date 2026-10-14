@@ -892,15 +892,30 @@
                   (aot-delete-tree (cdr p)))
                 doomed))))
 ;; The generation is stamped and swept once per process, on the first consult.
+;; The cache is an optimisation, so a generation this process cannot create (a
+;; sandbox that denies ~/.jolt, a read-only mount, a root another process just
+;; deleted under a parent we may not write) turns it off for the process rather
+;; than failing the require: aot-cache-usable? gates the cache path, and a load
+;; compiles in memory as under JOLT_AOT_CACHE=0. A generation that EXISTS but is
+;; read-only stays on — its hits are served, and every write below is best effort.
 (define aot-generation-memo #f)
+(define aot-cache-unusable? #f)
 (define (aot-cache-subdir)
   (unless aot-generation-memo
     (let ((gen (aot-generation-dir)))
-      (aot-mkdir-p gen)
-      (aot-touch-used! gen)
-      (aot-prune-generations! gen)
+      (if (guard (e (else (aot-info (string-append "cache off" (ldr-condition-suffix e)))
+                          #f))
+            (aot-mkdir-p gen)
+            #t)
+          (begin
+            (aot-touch-used! gen)
+            (aot-prune-generations! gen))
+          (set! aot-cache-unusable? #t))
       (set! aot-generation-memo (string-append gen "/v1"))))
   aot-generation-memo)
+(define (aot-cache-usable?)
+  (aot-cache-subdir)
+  (not aot-cache-unusable?))
 (define (aot-cache-sanitize s)
   (list->string
     (map (lambda (c)
@@ -1841,7 +1856,9 @@
   ;; the dep list this namespace assumed inert when its key was computed (or when
   ;; its previous artifact was written), which the .cti below records
   (let ((assumed (aot-assumed-inert name own)))
-    (aot-mkdir-p (path-parent obase))
+    ;; best effort like the writes below: a read-only generation (no v1 yet)
+    ;; only means nothing is cached this run
+    (guard (e (else #f)) (aot-mkdir-p (path-parent obase)))
     (aot-write-dep-list! (aot-dep-sidecar obase) deps)
     (aot-write-res-list! (aot-res-sidecar obase) res)
     ;; ...and the compile-time-relevance flag that lets a later run skip an
@@ -1878,7 +1895,9 @@
          (pid (number->string (get-process-id)))
          (tmp-scm (string-append base ".tmp" pid ".scm"))
          (tmp-so  (string-append base ".tmp" pid ".so")))
-    (guard (e (else (aot-info (string-append "compile failed for " name))
+    ;; also the read-only cache's miss: open-output-file is refused, nothing is
+    ;; published, and the namespace (already loaded) just misses again next run
+    (guard (e (else (aot-info (string-append "could not cache " name (ldr-condition-suffix e)))
                     (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
       (let ((out (open-output-file tmp-scm 'replace)))
         (put-string out captured)
@@ -2061,7 +2080,9 @@
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
           ;; there is no key that would be safe to reuse.
-          (aot-runtime-fingerprint))
+          (aot-runtime-fingerprint)
+          ;; and a cache directory this process could not create is no cache
+          (aot-cache-usable?))
      ;; the deps and reads this ns's own load records belong to IT, not to
      ;; whoever is requiring it — bind fresh sinks so a nested load can't append
      ;; to the enclosing one. A hit binds #f on both: the fasl it loads re-runs
@@ -2369,10 +2390,17 @@
     lib))
 (def-var! "clojure.core" "compile" jolt-compile)
 
-;; :reload-all forces the dedup off for the whole dynamic extent of a load (the
-;; loader learns dependencies only as it loads them), so every namespace pulled in
-;; reloads too — mirroring clojure.core. :verbose prints each load to stderr.
+;; :reload-all reloads every namespace pulled in during the dynamic extent of a
+;; load (the loader learns dependencies only as it loads them) — ONCE each, which
+;; is what clojure.core gets by binding a fresh *loaded-libs* for the extent. The
+;; parameter is #f outside one, and inside it is the set of namespaces this
+;; extent has already claimed. A bare "dedup off" flag reloaded a shared
+;; dependency at every require site, so the work doubled with each level of a
+;; diamond. Mutated only under ldr-load-mu. :verbose prints each load to stderr.
 (define ldr-reload-all? (make-thread-parameter #f))
+(define (ldr-reloaded-in-extent? name)
+  (let ((seen (ldr-reload-all?)))
+    (and seen (hashtable-contains? seen name))))
 (define ldr-verbose? (make-thread-parameter #f))
 
 ;; --- the load protocol (concurrent require) ---------------------------------
@@ -2694,13 +2722,18 @@
                ;; a thread's wait ends under this lock, so it loops HERE; a fiber
                ;; answers jolt-lock-parked and comes back in at the top.
                (or (ldr-wait-for-load! name deadline) (loop)))
-              ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
-               (ldr-decided! me 'loaded))                     ; step 4
+              ;; step 4. Inside a :reload-all, "loaded" means loaded by THIS
+              ;; extent; a load that failed rolled its mark back, so it retries.
+              ((and (not force?) (ns-dedup-loaded? name)
+                    (or (not (ldr-reload-all?)) (ldr-reloaded-in-extent? name)))
+               (ldr-decided! me 'loaded))
               ;; step 6. Masked from the claim on (jolt-wind*, locks.ss), and
               ;; load-namespace* drops it once its wind holds the claim: an
               ;; interrupt's escape in between left the claim standing and every
               ;; later require of the namespace waiting on it.
-              (else (hashtable-set! ldr-loading name me)
+              (else (let ((seen (ldr-reload-all?)))
+                      (when seen (hashtable-set! seen name #t)))
+                    (hashtable-set! ldr-loading name me)
                     (jolt-locks-enter!)
                     (ldr-decided! me 'claimed)))))))))
 
@@ -2754,8 +2787,8 @@
 
 ;; load-namespace: load `name`'s source once. Marked loaded BEFORE eval so a
 ;; dependency cycle terminates (Clojure's behavior). force? (a :reload of the
-;; named lib) bypasses the dedup for THIS load only; ldr-reload-all? bypasses it
-;; for this load and every nested one in its extent. On a throw the mark is rolled
+;; named lib) bypasses the dedup for THIS load only; ldr-reload-all? reloads each
+;; namespace once in its extent (ldr-begin-load!). On a throw the mark is rolled
 ;; back IF this call made it (a retry then loads) and the caller's ns is restored —
 ;; matching Clojure, which marks a lib loaded only after success.
 (define (load-namespace name) (load-namespace* name #f))
@@ -2931,7 +2964,9 @@
     (let ((reload-all? (and (member "reload-all" flags) #t))
           (verbose? (and (member "verbose" flags) #t)))
       (if reload-all?
-          (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?)) (k #f))
+          (parameterize ((ldr-reload-all? (make-hashtable string-hash string=?))
+                         (ldr-verbose? verbose?))
+            (k #f))
           (parameterize ((ldr-verbose? verbose?))
             (k (and (member "reload" flags) #t)))))))
 

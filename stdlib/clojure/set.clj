@@ -6,6 +6,8 @@
 ; Jolt Standard Library: clojure.set
 ; Set operations.
 
+(ns clojure.set)
+
 (defn union
   ([] #{})
   ([s1] s1)

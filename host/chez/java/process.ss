@@ -310,6 +310,121 @@
       (proc-redir-fragment "1" rout)
       (if merge? " 2>&1" (proc-redir-fragment "2" rerr)))))
 
+;; --- spawning the program itself ---------------------------------------------
+;; The shell command above costs a whole /bin/sh per spawn: it starts, runs the
+;; `cd`, and execs the program. On macOS /bin/sh is bash, and that start is most
+;; of what a spawn costs — measured 5.4ms a spawn through `sh -c 'exec true'`
+;; against 1.8ms for true itself, CPU alike — so a program that spawns a lot
+;; (a test harness, a build script) spent two thirds of it starting shells. The
+;; JDK spawns the program directly, and so does this whenever nothing needs the
+;; shell: the argv goes to posix_spawn as a list, the environment as envp, the
+;; directory as a chdir file action, and redirectErrorStream as a dup2 of 1 onto 2.
+;;
+;; The shell stays for what it does that posix_spawn would do differently:
+;;   - a file redirect (to/from/append/DISCARD) — the shell opens it;
+;;   - a directory where posix_spawn_file_actions_addchdir_np did not resolve
+;;     (glibc before 2.29, which jolt's Linux release floor is below);
+;;   - a program that is not plainly exec'able: not found as an absolute,
+;;     executable regular file, or neither a "#!" script nor an ELF/Mach-O
+;;     image. execve answers ENOEXEC for a script with no #! line, and the JDK
+;;     and the shell both run it with /bin/sh then; bionic's posix_spawn does not
+;;     report exec failures at all (see the exec barrier below), so the check is
+;;     made here, once, rather than read back from a failed spawn.
+;; Name lookup on PATH uses this process's PATH, as the JDK does (it resolves
+;; against the parent's PATH, not the child's environment); the shell path used
+;; the child's, which differs only when the child's env replaces PATH.
+;; JOLT_SPAWN_VIA_SHELL=1 sends every spawn through the shell, for the gate rows
+;; that compare the two.
+(define proc-fa-chdir
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addchdir_np" '(void* string) 'int))
+(define (proc-via-shell-forced?)
+  (let ((v (getenv "JOLT_SPAWN_VIA_SHELL"))) (and v (not (string=? v "")) #t)))
+(define (proc-exec-image? p)
+  (guard (e (#t #f))
+    (let* ((port (open-file-input-port p))
+           (bv (get-bytevector-n port 4)))
+      (close-port port)
+      (and (bytevector? bv) (= (bytevector-length bv) 4)
+           (let ((b0 (bytevector-u8-ref bv 0)) (b1 (bytevector-u8-ref bv 1))
+                 (b2 (bytevector-u8-ref bv 2)) (b3 (bytevector-u8-ref bv 3)))
+             (or (and (= b0 #x23) (= b1 #x21))                          ; #!
+                 (and (= b0 #x7f) (= b1 #x45) (= b2 #x4c) (= b3 #x46))  ; ELF
+                 ;; Mach-O 32/64 either byte order, and a universal (fat) binary
+                 (and (memv b0 '(#xfe #xce #xcf)) (memv b1 '(#xed #xfa))
+                      (memv b2 '(#xfa #xed)) (memv b3 '(#xce #xcf #xfe)) #t)
+                 (and (= b0 #xca) (= b1 #xfe) (= b2 #xba) (= b3 #xbe))))))))
+(define (proc-direct-candidate? p)
+  (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)
+       (guard (e (#t #f)) (and (file-regular? p) (not (file-directory? p))))
+       (file-accessible? p access-x-ok)
+       (proc-exec-image? p)))
+;; -> the absolute path to hand posix_spawn, or #f for "use the shell"
+(define (proc-resolve-direct prog dir)
+  (cond
+    ((= (string-length prog) 0) #f)
+    ((char=? (string-ref prog 0) #\/) (and (proc-direct-candidate? prog) prog))
+    ((proc-has-separator-for? #f prog)
+     (let ((p (proc-path-join-for #f (or dir (current-directory)) prog)))
+       (and (proc-direct-candidate? p) p)))
+    (else
+     (let loop ((dirs (proc-path-entries-for #f (getenv "PATH"))))
+       (cond ((null? dirs) #f)
+             ;; an empty or relative entry is the shell's to interpret
+             ((or (= (string-length (car dirs)) 0)
+                  (not (char=? (string-ref (car dirs) 0) #\/)))
+              #f)
+             (else
+              (let ((p (proc-path-join-for #f (car dirs) prog)))
+                (cond ((proc-direct-candidate? p) p)
+                      ;; found but not exec'able as an image: the shell decides
+                      ((file-exists? p) #f)
+                      (else (loop (cdr dirs)))))))))))
+(define (proc-render-arg s) (if (string? s) s (jolt-str-render-one s)))
+
+;; What a spawn runs: the program path, its argv, its environment (an alist),
+;; the directory to start in (or #f), and whether stderr is stdout (dup2 1 2).
+(define (make-proc-spawn-spec path argv env dir merge?) (vector path argv env dir merge?))
+(define (proc-spec-path s) (vector-ref s 0))
+(define (proc-spec-argv s) (vector-ref s 1))
+(define (proc-spec-env s)  (vector-ref s 2))
+(define (proc-spec-dir s)  (vector-ref s 3))
+(define (proc-spec-merge? s) (vector-ref s 4))
+
+(define (proc-shell-spec st)
+  (let ((shell (proc-posix-shell)))
+    (make-proc-spawn-spec shell (list shell "-c" (proc-build-shell-command st))
+                          (proc-child-env-pairs) #f #f)))
+(define (proc-direct-spec st)
+  (let* ((cmd (proc-pb-cmd st))
+         (dir (proc-effective-dir (proc-pb-dir st)))
+         (env-map (proc-pb-env st))
+         (file-redirect? (lambda (r) (and (proc-redirect? r)
+                                          (memq (proc-redirect-kind r) '(write append read discard))
+                                          #t))))
+    (and (pair? cmd)
+         (not (proc-via-shell-forced?))
+         (not (file-redirect? (proc-pb-redir-in st)))
+         (not (file-redirect? (proc-pb-redir-out st)))
+         (not (file-redirect? (proc-pb-redir-err st)))
+         (or (not dir) proc-fa-chdir)
+         (let ((path (proc-resolve-direct (proc-render-arg (car cmd)) dir)))
+           (and path
+                (make-proc-spawn-spec
+                  path (map proc-render-arg cmd)
+                  (proc-env-with-pwd
+                    (if env-map (proc-env-map-pairs env-map) (proc-child-env-pairs))
+                    dir)
+                  dir (and (proc-pb-merge-err? st) #t)))))))
+;; The shell's `cd` set PWD for the child, and a child that asks for its
+;; directory by $PWD (pwd, any shell) answered the directory as given rather than
+;; its resolved path (/var/... rather than /private/var/... on macOS). A chdir
+;; action sets nothing, so the variable is set here instead, as the cd did.
+(define (proc-env-with-pwd env dir)
+  (if dir
+      (cons (cons "PWD" dir) (filter (lambda (p) (not (string=? (car p) "PWD"))) env))
+      env))
+(define (proc-spawn-spec st) (or (proc-direct-spec st) (proc-shell-spec st)))
+
 ;; --- java.lang.ProcessBuilder$Redirect ---------------------------------------
 ;; state: #(kind file) — kind in {inherit discard pipe write append read}.
 (define (make-proc-redirect kind file) (make-jhost "process-redirect" (vector kind file)))
@@ -999,13 +1114,15 @@
     (sa-foreign-free buf)
     (proc-c-close fd)))
 
-;; Spawn `/bin/sh -c sh-cmd` with fd-level stdio: an inherited stream gets no
-;; file action (the child keeps the parent's descriptor); the rest get pipes.
+;; Spawn SPEC (proc-spawn-spec: the program itself, or `/bin/sh -c cmd`) with
+;; fd-level stdio: an inherited stream gets no file action (the child keeps the
+;; parent's descriptor); the rest get pipes, except a stderr merged into stdout,
+;; which is a dup2 of the child's 1 onto its 2.
 ;; Returns (values stdin-port stdout-port stderr-port pid), #f for inherited
 ;; ends. attrp is NULL: signal mask and dispositions are inherited, matching
 ;; the pipe path — so the mask is corrected on this side, around the spawn
 ;; itself (see the call below).
-(define (proc-spawn-fd-level sh-cmd inherit-in? inherit-out? inherit-err?)
+(define (proc-spawn-fd-level spec inherit-in? inherit-out? inherit-err?)
   ;; nonblocking-read? / nonblocking-write? -- set O_NONBLOCK unconditionally
   ;; on the PARENT's own RETAINED end at creation (never poller-gated), so
   ;; the retry loops below
@@ -1051,7 +1168,8 @@
     (jolt-with-mutex proc-spawn-fd-mutex
       (let* ((in-p  (and (not inherit-in?)  (mk-pipe #f #t)))
              (out-p (and (not inherit-out?) (mk-pipe #t #f)))
-             (err-p (and (not inherit-err?) (mk-pipe #t #f)))
+             (merge? (proc-spec-merge? spec))
+             (err-p (and (not inherit-err?) (not merge?) (mk-pipe #t #f)))
              (barrier (proc-exec-barrier-pipe))
              (fa (sa-foreign-alloc 128))
              (cloexec? (proc-cloexec-default?))
@@ -1083,6 +1201,10 @@
                     (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
         (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
                     (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
+        ;; after stdout's own dup2, so 2 becomes whatever 1 is now: the pipe, or
+        ;; the inherited descriptor
+        (when merge? (proc-fa-dup2 fa 1 2))
+        (when (proc-spec-dir spec) (proc-fa-chdir fa (proc-spec-dir spec)))
         ;; The barrier's write end stays open until exec (it is FD_CLOEXEC).
         (when barrier (proc-fa-close fa (car barrier)))
         ;; LAST of the file actions, so the dup2s above have already moved the
@@ -1094,16 +1216,16 @@
                        (if out-p (list (car out-p) (cdr out-p)) '())
                        (if err-p (list (car err-p) (cdr err-p)) '())
                        (if barrier (list (car barrier) (cdr barrier)) '()))))
-        (let* ((shell (proc-posix-shell))
-               (argv (proc-marshal-argv (list shell "-c" sh-cmd)))
+        (let* ((path (proc-spec-path spec))
+               (argv (proc-marshal-argv (proc-spec-argv spec)))
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
-                           (proc-child-env-pairs))))
+                           (proc-spec-env spec))))
                ;; attrp carries CLOEXEC_DEFAULT and SETSIGDEF at most, never
                ;; SETSIGMASK — so the child inherits this thread's signal mask,
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask
-                     (lambda () (proc-c-spawn pidbuf shell fa (or attr 0) (car argv) (car envp)))))
+                     (lambda () (proc-c-spawn pidbuf path fa (or attr 0) (car argv) (car envp)))))
                (pid (sa-foreign-ref 'int pidbuf 0)))
           (proc-fa-destroy fa)
           (when attr (proc-attr-destroy attr) (sa-foreign-free attr))
@@ -1972,7 +2094,7 @@
               (guard (e (#t #f)) (flush-output-port (current-output-port)))
               (guard (e (#t #f)) (flush-output-port (current-error-port))))
             (call-with-values
-              (lambda () (proc-spawn-fd-level (proc-build-shell-command self)
+              (lambda () (proc-spawn-fd-level (proc-spawn-spec self)
                                               (inherit? rin) (inherit? rout) (inherit? rerr)))
               (lambda (cin cout cerr pid)
                 (let* ((child-stdin  (or cin  (proc-null-output-port)))

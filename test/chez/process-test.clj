@@ -41,6 +41,25 @@
 ;; stderr: capture, and merge into stdout
 (check-eq "err capture" (:err (sh ["sh" "-c" "echo boom 1>&2"] {:err :string})) "boom\n")
 (check-eq "err->out" (:out (sh ["sh" "-c" "echo e 1>&2"] {:err :out})) "e\n")
+;; A spawn runs the program itself where it can, with no /bin/sh in between
+;; (process.ss proc-direct-spec). What the shell did on the way has to survive
+;; that: a merged stderr lands in order on stdout and the error stream is empty,
+;; a program named without a path is found on PATH, and an executable script
+;; with no #! line still runs — execve refuses it (ENOEXEC), and the JDK and the
+;; shell run it with /bin/sh, so it goes through the shell here.
+(let [pr (.start (doto (java.lang.ProcessBuilder. ["sh" "-c" "echo a; echo b 1>&2; echo c"])
+                   (.redirectErrorStream true)))]
+  (check-eq "redirectErrorStream merges in order"
+            [(slurp (.getInputStream pr)) (slurp (.getErrorStream pr)) (.waitFor pr)]
+            ["a\nb\nc\n" "" 0]))
+(check-eq "a program named without a path is found on PATH"
+          (:out (sh ["printf" "%s-%s" "x" 1])) "x-1")
+(let [f (str (fs/create-temp-file {:prefix "jp-noshebang-" :suffix ".sh"}))]
+  (spit f "echo NO-SHEBANG \"$1\"\n")
+  (.setExecutable (java.io.File. f) true)
+  (check-eq "an executable script with no #! line runs through the shell"
+            (:out (sh [f "arg"])) "NO-SHEBANG arg\n")
+  (fs/delete-if-exists f))
 
 ;; stdin: feed a string
 (check-eq "in string" (:out (sh ["cat"] {:in "line1\nline2\n"})) "line1\nline2\n")
@@ -251,7 +270,12 @@
 ;; the child sees a tty when jolt runs on one, and successive INHERIT-stdin
 ;; children share the fd offset. Both run a nested jolt, because this test's
 ;; own stdio belongs to the smoke harness.
-(def jolt-bin (or (System/getenv "JOLT_BIN") "bin/jolt"))
+;; The jolt under test. JOLT_EXE first: smoke.sh sets it to exactly that, and
+;; bin/jolt exports itself in it. Reading only JOLT_BIN fell back to bin/jolt
+;; whenever the caller had not exported JOLT_BIN too, and a stale dev cache makes
+;; bin/jolt source mode: ~6s of CPU per child jolt, and this file starts ~20 of
+;; them, which is how a run took 140s and 115s of CPU against smoke's 120s cap.
+(def jolt-bin (or (System/getenv "JOLT_EXE") (System/getenv "JOLT_BIN") "bin/jolt"))
 (def mac? (str/includes? (System/getProperty "os.name") "Mac"))
 
 ;; a child that writes through INHERIT lands on the nested jolt's stdout

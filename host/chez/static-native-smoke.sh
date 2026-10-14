@@ -435,6 +435,50 @@ if [ "$got" != "answer: 42" ]; then
   echo "--- got ----"; echo "$got"; exit 1
 fi
 
+# --- an :optional native whose :static {:lib …} does not resolve ------------
+# The same case as above with the library named by -l instead of a path: the
+# flag went to the linker unconditionally, so a host without the library failed
+# the whole build. The build try-links the flag for an optional spec and loads
+# the native at runtime when it does not resolve.
+cat > "$opt/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "greet" :optional true
+                $plat ["$opt/native/libgreet.$soext"]
+                :static {:lib "jolt_no_such_lib_for_smoke"}}]}
+EOF2
+echo "static-native smoke: building (an :optional native whose -l lib does not resolve)"
+if ! (cd / && JOLT_PWD="$opt" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build failed on an optional native's unresolvable :lib"; cat "$work/build.log"; exit 1
+fi
+if ! grep -q "greet (optional)" "$work/build.log"; then
+  echo "  FAIL: the build did not say the optional :lib native is loaded at runtime"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42" ]; then
+  echo "  FAIL: optional native with an unresolvable :lib: binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+# ... and one that DOES resolve is still handed to the linker: only the
+# archive is in its :libdir, and the build names nothing as loaded at runtime.
+# (Not run: a {:lib} form is not force-loaded, so it supplies symbols an
+# archive references, not ones only a defcfn names.)
+mkdir -p "$opt/libdir"
+cp "$work/libgreet.a" "$opt/libdir/"
+cat > "$opt/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "greet" :optional true
+                $plat ["$opt/nowhere/libgreet.$soext"]
+                :static {:lib "greet" :libdir "libdir"}}]}
+EOF2
+echo "static-native smoke: building (an :optional native whose -l lib resolves)"
+if ! (cd / && JOLT_PWD="$opt" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build failed on an optional native's resolvable :lib"; cat "$work/build.log"; exit 1
+fi
+if grep -q "loaded at runtime" "$work/build.log"; then
+  echo "  FAIL: a resolvable optional :lib was not linked in"; cat "$work/build.log"; exit 1
+fi
+
 # --- a C++ archive: the preload object must depend on the C++ runtime -------
 # A polymorphic class emits typeinfo that refers to libstdc++'s
 # _ZTVN10__cxxabiv117__class_type_infoE, a DATA reference the loader binds when
@@ -528,4 +572,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + optional missing archive + C++ archive + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + optional missing archive + optional :lib probe + C++ archive + link order)"

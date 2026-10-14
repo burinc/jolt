@@ -678,7 +678,11 @@
          (sns (symbol-t-ns sym)) (nm (symbol-t-name sym))
          (c (if (string? sns)
                 (var-cell-lookup (or (chez-resolve-alias cns sns) sns) nm)
-                (or (var-cell-lookup cns nm)
+                ;; ns / in-ns are always clojure.core's (Compiler.maybeResolveIn),
+                ;; as the analyzer resolves them (host-contract.ss hc-resolve-cell)
+                (or (and (or (string=? nm "ns") (string=? nm "in-ns"))
+                         (var-cell-lookup "clojure.core" nm))
+                    (var-cell-lookup cns nm)
                     (let ((ref (chez-resolve-refer cns nm)))
                       (and ref (var-cell-lookup (car ref) (cdr ref))))
                     ;; the implicit clojure.core refer — blocked by a :refer-clojure
@@ -722,7 +726,11 @@
          (sns (symbol-t-ns sym)) (nm (symbol-t-name sym))
          (c (if (string? sns)
                 (var-cell-lookup (or (chez-resolve-alias cns sns) sns) nm)
-                (or (var-cell-lookup cns nm)
+                ;; ns / in-ns are always clojure.core's (Compiler.maybeResolveIn),
+                ;; as the analyzer resolves them (host-contract.ss hc-resolve-cell)
+                (or (and (or (string=? nm "ns") (string=? nm "in-ns"))
+                         (var-cell-lookup "clojure.core" nm))
+                    (var-cell-lookup cns nm)
                     (let ((ref (chez-resolve-refer cns nm)))
                       (and ref (var-cell-lookup (car ref) (cdr ref))))
                     (chez-core-refer-cell cns nm)))))
