@@ -461,8 +461,9 @@ if [ "$got" != "answer: 42" ]; then
 fi
 # ... and one that DOES resolve is still handed to the linker: only the
 # archive is in its :libdir, and the build names nothing as loaded at runtime.
-# (Not run: a {:lib} form is not force-loaded, so it supplies symbols an
-# archive references, not ones only a defcfn names.)
+# The linker then drops the archive's only member — a {:lib} form is not
+# force-loaded, and a defcfn is not a reference — so the build refuses the
+# binary (the {:lib} case below).
 mkdir -p "$opt/libdir"
 cp "$work/libgreet.a" "$opt/libdir/"
 cat > "$opt/deps.edn" <<EOF2
@@ -472,11 +473,61 @@ cat > "$opt/deps.edn" <<EOF2
                 :static {:lib "greet" :libdir "libdir"}}]}
 EOF2
 echo "static-native smoke: building (an :optional native whose -l lib resolves)"
-if ! (cd / && JOLT_PWD="$opt" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
-  echo "  FAIL: jolt build failed on an optional native's resolvable :lib"; cat "$work/build.log"; exit 1
+if (cd / && JOLT_PWD="$opt" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: a resolvable optional :lib the app binds directly built a binary that cannot call it"
+  cat "$work/build.log"; exit 1
 fi
 if grep -q "loaded at runtime" "$work/build.log"; then
   echo "  FAIL: a resolvable optional :lib was not linked in"; cat "$work/build.log"; exit 1
+fi
+if ! grep -q "the binary is missing jolt_static_answer" "$work/build.log"; then
+  echo "  FAIL: a resolvable optional :lib failed for another reason"; cat "$work/build.log"; exit 1
+fi
+
+# --- a {:lib} native the app binds directly ---------------------------------
+# {:lib} links like any -l library: the linker keeps only the archive members
+# other linked code references, and a defcfn is not one (the binary looks the
+# symbol up when it runs). Such a build used to succeed and leave a binary that
+# died at its first call with "no entry for jolt_static_answer". It fails now,
+# naming the symbol and the {:archive} form that links the whole archive; that
+# form, copied from the message, builds a binary that answers 42.
+libonly="$work/libonly"
+mkdir -p "$libonly/src/app" "$libonly/libdir"
+cc -c "$work/greet.c" -o "$work/greet.o"
+ar rcs "$libonly/libdir/libgreet.a" "$work/greet.o"
+cp "$opt/src/app/core.clj" "$libonly/src/app/core.clj"
+cat > "$libonly/deps.edn" <<'EOF2'
+{:paths ["src"]
+ :jolt/native [{:name "greet" :static {:lib "greet" :libdir "libdir"}}]}
+EOF2
+echo "static-native smoke: building (a {:lib} native the app binds directly)"
+if (cd / && JOLT_PWD="$libonly" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: a {:lib} native whose symbol only a defcfn names built a binary"
+  cat "$work/build.log"
+  echo "--- the binary says ---"; (cd / && "$out" 2>&1) | head -3; exit 1
+fi
+for want in "the binary is missing jolt_static_answer" ':static {:lib "greet"' \
+            "no entry for jolt_static_answer" ":static {:archive \"$libonly/libdir/libgreet.a\"}"; do
+  if ! grep -qF "$want" "$work/build.log"; then
+    echo "  FAIL: the {:lib} message does not say: $want"; cat "$work/build.log"; exit 1
+  fi
+done
+if [ -e "$out" ]; then
+  echo "  FAIL: the refused build left its binary behind"; exit 1
+fi
+suggested="$(sed -n 's/^ *:static {:archive "\(.*\)"}$/\1/p' "$work/build.log" | head -1)"
+cat > "$libonly/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "greet" :static {:archive "$suggested"}}]}
+EOF2
+echo "static-native smoke: building (the {:archive} form the message suggests)"
+if ! (cd / && JOLT_PWD="$libonly" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: the suggested {:archive} form did not build"; cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42" ]; then
+  echo "  FAIL: the suggested {:archive} form: binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
 fi
 
 # --- a C++ archive: the preload object must depend on the C++ runtime -------
@@ -572,4 +623,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + optional missing archive + optional :lib probe + C++ archive + link order)"
+echo "static-native smoke: passed (static default + non-PIC archive + dependent archives + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + optional missing archive + optional :lib probe + {:lib} symbol check + C++ archive + link order)"
