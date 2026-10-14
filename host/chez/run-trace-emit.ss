@@ -295,4 +295,30 @@
   (gate-check "(12b) unclosed '#|L' in a string is inert" (jolt-marker-line-at-offset e (+ istr 2)) 3)
   (gate-check "(12b) unclosed '#|L': offset past the form" (jolt-marker-line-at-offset e (+ istr 20)) 3))
 
+;; --- (13) a non-tail call puts the site slot back when it returns ----------------
+;; The emitter spells the restore with the slot's NUMBER (backend_scheme.clj
+;; site-restore, so a cached fasl needs nothing of the runtime to expand). That
+;; literal must be rt.ss's jolt-vreg-site: if the slot moves, these fail rather
+;; than the restore silently clobbering another vreg.
+(define site-rd (string-append "(virtual-register " (number->string jolt-vreg-site) ")"))
+(define site-wr (string-append "(set-virtual-register! " (number->string jolt-vreg-site) " "))
+(let ((e (emit-num "(def _ (fn rt13a [g x] (+ 1 (g x))))")))
+  (gate-check "(13) non-tail call to a jolt fn reads jolt-vreg-site" (gate-sub? e site-rd) #t)
+  (gate-check "(13) ...and writes it back" (gate-sub? e site-wr) #t))
+(let ((e (emit-num "(def _ (fn rt13b [x y] (+ 1 (* x y))))")))
+  (gate-check "(13) a numeric op takes no restore" (gate-sub? e "virtual-register") #f))
+;; fib's shape: every tail site stores the fn's own pair, so its self-calls skip
+;; the restore and no placeholder survives
+(let ((e (emit-num "(def _ (fn fib13 [n] (if (< n 2) n (+ (fib13 (- n 1)) (fib13 (- n 2))))))")))
+  (gate-check "(13) safe self-calls take no restore" (gate-sub? e "virtual-register") #f)
+  (gate-check "(13) ...and leave no placeholder" (gate-sub? e "_srself$") #f))
+;; a tail call that can run a jolt fn makes the self-calls restore
+(let ((e (emit-num "(def _ (fn fibu13 [g n] (if (< n 2) (g n) (+ (fibu13 g (- n 1)) 1))))")))
+  (gate-check "(13) unsafe self-calls restore" (gate-sub? e site-rd) #t)
+  (gate-check "(13) ...and leave no placeholder" (gate-sub? e "_srself$") #f))
+(set-trace-frames! #f)
+(let ((e (emit-num "(def _ (fn rt13c [g x] (+ 1 (g x))))")))
+  (gate-check "(13) tracing off: no restore" (gate-sub? e "virtual-register") #f))
+(set-trace-frames! #t)
+
 (gate-summary "trace-emit")

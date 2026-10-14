@@ -6,6 +6,9 @@
 ; Jolt Standard Library: clojure.string
 ; String manipulation functions using Jolt core string interop.
 
+(ns clojure.string
+  (:refer-clojure :exclude [replace reverse]))
+
 (defn blank?
   [s]
   (if (nil? s) true

@@ -202,6 +202,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while other redirections worked. The probe now counts down from above the
   payload and never leaves the object.
 
+- **`(require 'x :reload-all)` reloads each namespace once, into its own
+  namespace.** It turned the loaded-namespace check off for its whole extent,
+  so a shared dependency reloaded again at every place it was required and the
+  work doubled with each level of the graph; a real project's reload ran for
+  tens of minutes. Each namespace now reloads once per `:reload-all`, as on
+  the JVM. `clojure.string`, `clojure.walk` and `clojure.set` had no `ns` form,
+  so a reload that reached them evaluated them in the requiring namespace: their
+  defns landed there, and a macro it shadowed broke the load ("Can only recur
+  from tail position" in `trim-newline`). And an unqualified `ns` or `in-ns`
+  now always means `clojure.core`'s, as in the JVM compiler, so a namespace
+  that excludes `ns` and defines its own (`sci.core`) no longer breaks the
+  `ns` form of every library it requires on a reload.
+
 - **A host-called seam no longer shows up in later stack traces.** The fns a
   library registers with `__register-eq!`, `__register-hash!`, `__register-str!`
   and the other value seams run inside the host's `=`, `hash` and `str` of any
@@ -250,6 +263,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can start: ~7 µs, and `str/replace` of escapes in a styled line is about
   twice as fast. The search pass itself dropped a closure per character, so a
   scan that finds nothing is ~25% faster too.
+
+- **A tail call that already returned is no longer a frame of a later throw.**
+  A tail call stores its site so a trace can name the frame it erased, and
+  nothing cleared it when the call returned. After `(f 1)` returned, where `f`
+  tail-calls anything, `(nth [] 3)` reported `f` as the frame it threw from,
+  and inside a fn the leftover could name any fn it had called. Traced code now
+  puts the site back when a non-tail call returns; a fn's calls to itself skip
+  that when nothing it tail-calls can run jolt code, so `fib` and `tak` cost
+  what they did. A throw's erased caller of a fn still running is also placed
+  below that fn, where it was the innermost frame.
 
 - **nREPL eval output, errors and traces match JVM nREPL.** The value was
   printed after the eval's `*out*` binding had ended, so what a lazy result
