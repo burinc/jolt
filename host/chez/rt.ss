@@ -1507,11 +1507,11 @@
 (define (jolt-trace-enable!) (set! jolt-trace-on? #t))
 
 ;; TAIL call emissions store their static ('ns/fn' . line) pair here right
-;; before the call (sited-tail-call / the :throw case). Since R2 (bead
-;; jolt-knn8) NOTHING else writes it — non-tail code carries no per-call
-;; instrumentation — so the live slot can hold a returned chain's residue.
-;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
-;; reporter validates it against the callsite table before splicing.
+;; before the call (sited-tail-call / the :throw case), and a non-tail call puts
+;; it back when it returns (backend_scheme site-restore), so a pair in the slot is a
+;; tail call whose chain is still running. Consumers read the THROW-TIME snapshot
+;; (jolt-throw-sitep), and the reporter still validates it against the callsite
+;; table before splicing: code compiled untraced (the seed) restores nothing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
 ;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
 ;; when one starts is a returned call's residue — the reporter's validator cannot

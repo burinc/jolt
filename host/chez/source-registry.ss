@@ -897,9 +897,48 @@
                         (and (not (jolt-site-exited? site))
                              (jolt-site-evidenced? path connected? cont))
                         (jolt-site-valid? site path connected? cont cont-names))
-                    (append (srcreg-site-frames path) body)
+                    (let ((frames (srcreg-site-frames path)))
+                      (if live?
+                          (append frames body)
+                          (jolt-splice-at body (jolt-site-landing site path body) frames)))
                     body)))
             body)))))
+
+;; Where a throw's erased chain goes among the live frames: how many of them stay
+;; above it. The pair's tail call went to a fn; when that fn is still a live frame
+;; -- it threw from a non-tail call of its own, or from something it called -- the
+;; chain was its caller and goes right below it, not above everything as the
+;; innermost frame. Of the frames running that fn, the first whose own caller
+;; calls the chain's outermost fn; else the first; else none of them is live (the
+;; call went to host code, which threw) and the chain is innermost.
+(define (jolt-site-landing site path body)
+  (let ((callees (jolt-callsite-callees (car site) (jolt-marker-entry-line (cdr site))))
+        (outer-fn (car (list-ref path (fx- (length path) 1)))))
+    (if (not callees)
+        0
+        (let loop ((fs body) (i 1) (first-hit #f))
+          (cond
+            ((null? fs) (or first-hit 0))
+            ((member (srcreg-frame-nm (car fs)) callees)
+             (if (or (null? (cdr fs))
+                     (let ((oc (jolt-callsite-fn-callees (srcreg-frame-nm (cadr fs)))))
+                       (and oc (member outer-fn oc) #t)))
+                 i
+                 (loop (cdr fs) (fx+ i 1) (or first-hit i))))
+            (else (loop (cdr fs) (fx+ i 1) first-hit)))))))
+;; ...unless the frames are already there: the forward gap fill recovers the same
+;; chain when the frame below it registers a static path to the live callee.
+(define (jolt-splice-at body n frames)
+  (let loop ((n n) (bs body) (above '()))
+    (if (or (fx=? n 0) (null? bs))
+        (if (let same? ((fs frames) (bs bs))
+              (or (null? fs)
+                  (and (pair? bs)
+                       (equal? (srcreg-frame-nm (car fs)) (srcreg-frame-nm (car bs)))
+                       (same? (cdr fs) (cdr bs)))))
+            body
+            (append (reverse above) frames bs))
+        (loop (fx- n 1) (cdr bs) (cons (car bs) above)))))
 
 ;; Multi-line backtrace for an uncaught value.
 (define (jolt-backtrace-string v)
