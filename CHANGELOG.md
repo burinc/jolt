@@ -150,6 +150,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started with `jolt.time.impl/jt?`. The site is now put back when a seam fn
   returns.
 
+- **`jolt build` no longer fails on an `:optional` native's missing archive.**
+  Every `:static` archive went to the linker, optional or not, so a project
+  that declares an optional native with a `:static {:archive …}` and never
+  built it (a GPU backend on a host without the GPU) could not build at all:
+  `clang: error: no such file or directory: '…/libfoo.a'`. An optional
+  native whose archive is not on disk is now loaded at runtime like any other
+  optional native, and the build's report of runtime-loaded natives names it.
+
 - **A failed file delete answers that it failed.** Deleting a file the process
   cannot unlink, such as one in a read-only directory, reported success while
   the file stayed on disk. `jolt.host/delete-file!` and
