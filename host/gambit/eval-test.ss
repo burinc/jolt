@@ -244,6 +244,24 @@
 (check "(let [m (java.util.TreeMap. {:a 1 :b 2})] (doseq [e (.entrySet m)] (.setValue e (* 10 (val e)))) [(str m) (str (first m)) (into {} m) (try (.setValue (.firstEntry m) 0) (catch UnsupportedOperationException e :uoe))])"
        "[\"{:a=10, :b=20}\" \":a=10\" {:a 10, :b 20} :uoe]")
 
+;; ---- library value seams: __register-compare! / __register-class! ------------
+;; jolt-lang/time registers its java.time values through these at load; both
+;; were unbound here, so its install-seams! died on the first one. A tagged
+;; table stands in for a library value: it orders through the compare arm,
+;; answers (class x) through the class arm, and dispatches a protocol extended
+;; to a class its tags-fn reports.
+(check "(do (defn spt? [x] (= :spt (jolt.host/ref-get x :tag))) (defn spt [n] (doto (jolt.host/tagged-table :spt) (jolt.host/ref-put! :tag :spt) (jolt.host/ref-put! :n n))) :ok)" ":ok")
+(check "(clojure.core/__register-compare! (fn [a b] (or (spt? a) (spt? b))) (fn [a b] (compare (jolt.host/ref-get a :n) (jolt.host/ref-get b :n))))" "nil")
+(check "[(compare (spt 1) (spt 2)) (compare (spt 2) (spt 2)) (mapv #(jolt.host/ref-get % :n) (sort [(spt 3) (spt 1) (spt 2)]))]"
+       "[-1 0 [1 2 3]]")
+(check "(clojure.core/__register-class! spt? (fn [_] \"my.Spt\") (fn [_] [\"my.Spt\" \"my.Shape\"]))" "nil")
+(check "(do (defprotocol SptName (spt-name [x])) (extend-protocol SptName my.Shape (spt-name [x] :shape)) [(str (class (spt 1))) (spt-name (spt 1))])"
+       "[\"class my.Spt\" :shape]")
+;; the ctor/statics halves of the same library surface (jolt/time/*.clj call
+;; __register-class-statics! at the top level)
+(check "[(clojure.core/__register-class-statics! \"my.SptUtil\" {\"twice\" (fn [x] (* 2 x)) \"ZERO\" 0}) (clojure.core/__register-class-ctor! \"my.SptBox\" (fn [x] [:box x]))]" "[nil nil]")
+(check "[(my.SptUtil/twice 21) my.SptUtil/ZERO (my.SptBox. 1)]" "[42 0 [:box 1]]")
+
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")
 (let ((scm (jolt-analyze-emit-form

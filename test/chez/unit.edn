@@ -3763,6 +3763,11 @@
   ;; deftype those used to ask instance?, which asked the predicate again — an
   ;; unbounded recursion (hung 0.8.11) once the type had been redefined
   {:suite "dispatch-caches" :expr "(do (clojure.core/__register-class! (fn [x] (and (map? x) (coll? x) (vector? x) false)) (fn [_] \"uhang.C\") (fn [_] [\"uhang.C\"])) (load-string \"(ns uhang.ns) (defprotocol P (p [_])) (deftype T [] P (p [_] 1)) (deftype T []) [(satisfies? P (T.)) (instance? uhang.ns.P (T.)) (map? (T.))]\"))" :expected "[false false false]"}
+  ;; a dotted class a library declared through __register-class! keeps its own
+  ;; tag even when some protocol interface or class shares its last segment:
+  ;; ucoll.Shape was filed under "Shape" once any Shape existed, so the value's
+  ;; ["ucoll.Shape"] tags never found the extension
+  {:suite "dispatch-caches" :expr "(do (defprotocol UcollShape (ucs [_])) (defprotocol Shape (ushape [_])) (defrecord UcollSq [] Shape (ushape [_] 1)) (clojure.core/__register-class! (fn [x] (= :ucoll (jolt.host/ref-get x :ucoll))) (fn [_] \"ucoll.Pt\") (fn [_] [\"ucoll.Pt\" \"ucoll.Shape\"])) (extend-protocol UcollShape ucoll.Shape (ucs [_] :shape)) [(ucs (doto (jolt.host/tagged-table :ucoll) (jolt.host/ref-put! :ucoll :ucoll))) (str (class (doto (jolt.host/tagged-table :ucoll) (jolt.host/ref-put! :ucoll :ucoll))))])" :expected "[:shape \"class ucoll.Pt\"]"}
   ;; Counted seqs (jolt-d5g, jolt-4j4, jolt-40b): a list, a string/array/reverse-vector
   ;; seq and a long range count without a walk, and stay counted down their rest;
   ;; = between two of them compares counts first. Values pinned to JVM Clojure 1.12.

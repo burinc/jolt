@@ -98,6 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Gambit host has the rest of the library value seams.**
+  `__register-compare!`, `__register-class!`, `__register-class-ctor!` and
+  `__register-class-statics!` were bound only on Chez, so a library that models
+  its own host values (jolt-lang/time) failed to load on Gambit at the first
+  one it called. They are bound there now, with Chez's semantics: values order
+  through the compare arm, answer `(class x)`, and dispatch a protocol extended
+  to a class their tags name.
+
+- **A protocol extended to a library's dotted class name dispatches when
+  another class shares its last segment.** `(extend-protocol P my.Shape …)`
+  for a class declared through `__register-class!` was filed under `Shape` as
+  soon as any modeled class or protocol interface named `Shape` existed, so a
+  value whose tags said `my.Shape` never found the method. A dotted name now
+  has to be modeled under that exact spelling to be shortened.
+
 - **A cache directory jolt cannot write no longer stops a program.** The first
   require of a library namespace created the AOT cache generation and re-raised
   a failed mkdir, so a process whose `~/.jolt/aot-cache` (or `JOLT_CACHE_DIR`)

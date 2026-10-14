@@ -853,9 +853,18 @@
       ;; value-host-tags emits via jch-tags. Using base here would leave a partial
       ;; segment for nested packages (java.time.temporal.Temporal -> "temporal.Temporal"),
       ;; which no dispatch tag matches, so a class-keyed protocol never fires.
+      ;; A dotted name must be modeled under that exact spelling (or be a known
+      ;; class once its java.*/clojure.lang prefix is stripped): jch-known? falls
+      ;; back to the last segment, so my.Shape read as modeled the moment ANY
+      ;; class or protocol interface named Shape existed, and the extension was
+      ;; filed under "Shape" where a __register-class! value reporting
+      ;; "my.Shape" never looks.
       ((and (not (hashtable-ref chez-simple-name-tag type-name #f))
             (not (hashtable-ref chez-deftype-tag-set type-name #f))
-            (or (jch-known? base) (jch-known? type-name)))
+            (if (dotted-name? type-name)
+                (or (jch-known-exact? type-name)
+                    (and (not (string=? base type-name)) (jch-known? base)))
+                (jch-known? type-name)))
        (jch-last-segment type-name))
       ;; A dotted name the graph does not model and that names no deftype is still
       ;; a CLASS name: one a library declared for its own values through
