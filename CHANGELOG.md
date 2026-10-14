@@ -98,6 +98,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Timed waits end at their deadline, not a millisecond tick after it.** Every
+  timed wait but `Thread/sleep` built its deadline as a whole millisecond
+  rounded up from now, so with the wake latency on top `(deref p 1 nil)` took
+  ~2ms where the JDK takes ~1.25ms. Deadlines are exact now, and the 1ms waits
+  all cost what the JDK's do: timed `deref` of a promise or future,
+  `BlockingQueue` `poll`/`offer`, `CountDownLatch.await`,
+  `ReentrantLock.tryLock` (3.5ms before), `awaitTermination`, `Future.get`,
+  `CompletableFuture.get`, `FutureTask.get`, `Thread.join`, `Object.wait`,
+  `Process.waitFor` (2.5ms before), `await-for`, a core.async `timeout`, and a
+  socket's `SO_TIMEOUT` on `read` and `accept` (2.4ms before). A `TimeUnit`
+  finer than a millisecond is kept rather than truncated:
+  `(.poll q 500 TimeUnit/MICROSECONDS)` returned at once, and a
+  `ScheduledExecutorService` delay of 1500us was 1ms. A timed `tryLock` throws
+  InterruptedException on an interrupted thread, free lock or not, as the
+  JDK's does; it used to ignore the flag. A wait that answers at once (a settled
+  `deref`, a free `tryLock`) no longer reads the clock, so those calls are
+  ~40% cheaper.
+
 - **The Gambit host has the rest of the library value seams.**
   `__register-compare!`, `__register-class!`, `__register-class-ctor!` and
   `__register-class-statics!` were bound only on Chez, so a library that models
@@ -132,8 +150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TimeUnit` finer than a millisecond included: `(Thread/sleep 1)` takes
   ~1.25ms on macOS (the OS's own wake latency), `(Thread/sleep 0 100000)`
   ~0.13ms, and `(Thread/sleep 0)` yields, throwing first if the thread is
-  interrupted, as the JDK's does. Other timed waits keep whole-millisecond
-  deadlines, rounded up, but no longer overshoot them. `Thread/sleep` also
+  interrupted, as the JDK's does. `Thread/sleep` also
   refuses a negative timeout and nanos outside 0..999999 with
   IllegalArgumentException, as the JDK does, and `TimeUnit.sleep` of zero or
   less returns at once without checking the interrupt flag. A zero timeout is
