@@ -9,6 +9,11 @@
 (defn walk
   [inner outer form]
   (cond
+    ; a map entry is also vector?, so it goes first and is rebuilt as an entry,
+    ; as Clojure's IMapEntry branch does: outer sees (map-entry? x) true, and
+    ; a walk that tells an entry from a 2-vector (to rewrite the vectors in a
+    ; map's values, say) doesn't take the entry for one of them
+    (map-entry? form) (outer (jolt.host/map-entry (inner (key form)) (inner (val form))))
     ; vectors/maps first so seq? can't swallow them (a vector is not seq? on
     ; jolt, but keep the concrete branches authoritative). Re-attach the form's
     ; metadata to the rebuilt collection, as Clojure does — a metadata-driven walk
