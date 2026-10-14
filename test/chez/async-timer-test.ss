@@ -40,6 +40,71 @@
     (jolt-async-take ch)
     (- (mono-millis) t0)))
 
+(define (mono-ns) (let ((t (current-time 'time-monotonic))) (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
+(define (ns->ms ns) (/ (round (/ ns 10000)) 100.))
+
+;; How the on-time rows are judged. EARLY is a bug whatever the load: a timeout
+;; must not close before its deadline. Deadlines are exact (mono-deadline), and
+;; elapsed is read in nanoseconds on the same monotonic clock from BEFORE the
+;; timeout is made, so the lower bound needs no allowance at all.
+;; LATE is what the ceilings are for, and the lateness they exist to catch is
+;; gross: a lost wakeup closes a (timeout 100) at the 60000ms deadline pending
+;; behind it. Load only ever adds to a wake, by tens of ms and now and then more,
+;; so a reading over its ceiling is measured again, and fails only when it is
+;; over in every round -- a lost wakeup is late every time.
+;; A take that never returns would hang the gate rather than fail it, so each
+;; one runs under a watchdog (a plain Chez timed wait, not this timer) that
+;; fails the gate by name and exits.
+(define watchdog-secs 20)
+(define (watched name thunk)
+  (let ((mu (make-mutex)) (cv (make-condition)) (done #f))
+    (fork-thread
+      (lambda ()
+        (with-mutex mu
+          (let wait ((left watchdog-secs))
+            (unless done
+              (if (<= left 0)
+                  (begin
+                    (printf "  FAIL: ~a -- no close after ~as (timer never fired, or a lost wakeup)\n"
+                            name watchdog-secs)
+                    (jolt-exit-process 1))
+                  (begin
+                    (condition-wait cv mu (make-time 'time-duration 0 1))
+                    (wait (- left 1)))))))))
+    (let ((v (thunk)))
+      (with-mutex mu (set! done #t) (condition-signal cv))
+      v)))
+
+;; (timeout ms) made and taken: nanoseconds from just before it was made to the
+;; take's return.
+(define (timeout-ns name ms)
+  (let* ((t0 (mono-ns)) (ch (jolt-async-timeout ms)))
+    (watched name (lambda () (jolt-async-take ch)))
+    (- (mono-ns) t0)))
+
+;; One reading of (measure) against [floor-ms, ceiling-ms): early fails at once,
+;; late is measured again, up to late-rounds readings in all.
+(define late-rounds 3)
+(define (on-time? name floor-ms ceiling-ms measure)
+  (let round ((k 1))
+    (let ((ns (measure)))
+      (cond ((< ns (* floor-ms 1000000))
+             (printf "    ~a closed EARLY: ~ams, deadline ~ams\n" name (ns->ms ns) floor-ms) #f)
+            ((< ns (* ceiling-ms 1000000)) #t)
+            ((< k late-rounds) (round (+ k 1)))
+            (else (printf "    ~a: over ~ams in all ~a rounds, last ~ams\n"
+                          name ceiling-ms late-rounds (ns->ms ns)) #f)))))
+
+;; A structural property shows in every round; a noisy one can lose one. So a
+;; row of paired medians passes on any of late-rounds rounds. (trial) answers
+;; #t, or a diagnostic string for the round it lost.
+(define (in-some-round? trial)
+  (let round ((k 1))
+    (let ((r (trial)))
+      (cond ((eq? r #t) #t)
+            ((< k late-rounds) (round (+ k 1)))
+            (else (printf "    ~a (all ~a rounds)\n" r late-rounds) #f)))))
+
 ;; Read the timer's state the way the timer writes it. The entry for a closed
 ;; channel is removed under timeout-mu BEFORE the mutex drops, so by the time a
 ;; take has returned and this can acquire it, a fired timeout is already gone.
@@ -53,8 +118,8 @@
 ;; --- 1. a lone timeout, and the drain to empty --------------------------------
 (printf "\n== 1. one timeout: fires on time, leaves nothing pending ==\n")
 (ok "1a. no timer thread before the first (timeout ms)" (not timeout-running?))
-(let ((ms (take-ms (jolt-async-timeout 100))))
-  (ok "1b. (timeout 100) closes at ~100ms" (and (>= ms 90) (< ms 1000))))
+(ok "1b. (timeout 100) closes at ~100ms, never before"
+    (on-time? "1b" 100 1000 (lambda () (timeout-ns "1b" 100))))
 (ok "1c. the fired entry is off the pending list" (= 0 (pending-count)))
 ;; THE NO-LEAK CHECK: the list just drained to empty, so the timer is parked on
 ;; timeout-cv with nothing pending — the exact state in which it used to declare
@@ -68,31 +133,52 @@
 (printf "\n== 2. a nearer deadline arriving behind a far one ==\n")
 (define far (jolt-async-timeout 60000))
 (ok "2a. the far timeout is pending" (= 1 (pending-count)))
-(let ((ms (take-ms (jolt-async-timeout 100))))
-  (ok "2b. (timeout 100) behind a pending (timeout 60000) closes at ~100ms"
-      (and (>= ms 90) (< ms 2000))))
+(ok "2b. (timeout 100) behind a pending (timeout 60000) closes at ~100ms"
+    (on-time? "2b" 100 2000 (lambda () (timeout-ns "2b" 100))))
 (ok "2c. the far timeout is still pending, untouched" (= 1 (pending-count)))
 ;; Twice in a row: the second insert is a head insert against a timer that has
 ;; just been woken, which is where a lost signal would show up as ONE late one.
-(let ((ms (take-ms (jolt-async-timeout 100))))
-  (ok "2d. and again" (and (>= ms 90) (< ms 2000))))
+(ok "2d. and again" (on-time? "2d" 100 2000 (lambda () (timeout-ns "2d" 100))))
 
 ;; --- 3. many deadlines, inserted out of order ---------------------------------
 ;; Inserted farthest-first, so every insert after the first is a head insert and
 ;; each one has to displace the deadline the timer is already waiting for.
 (printf "\n== 3. deadlines inserted out of order all fire on time ==\n")
-(define t300 (jolt-async-timeout 300))
-(define t200 (jolt-async-timeout 200))
-(define t100 (jolt-async-timeout 100))
-(ok "3a. three more are pending, plus far" (= 4 (pending-count)))
-(let* ((m1 (take-ms t100))
-       (m2 (take-ms t200))
-       (m3 (take-ms t300)))
-  ;; Taken in deadline order, so each take's own wait is short; what is asserted
-  ;; is the SUM, which is the time from the first insert to the last close.
-  (ok "3b. all three closed within ~300ms of the first insert"
-      (< (+ m1 m2 m3) 2000))
-  (ok "3c. the 100ms one closed first" (< m1 250)))
+;; One round arms 300, 200, 100, takes them in deadline order, and answers when
+;; each take returned, in ns from before the first insert. Each is held to its
+;; own deadline for early, in every round. 3b and 3c judge lateness, and a round
+;; that misses either is run again, by on-time?'s rule. 3c is the row that sees a
+;; PARTIAL loss -- the 300 insert signalled, the 200 and 100 ones dropped -- which
+;; closes the 100ms timeout at 300ms: late in every round, as load is not.
+(define section-3-early #f)
+(define (section-3-round first?)
+  (let* ((t0 (mono-ns))
+         (t300 (jolt-async-timeout 300))
+         (t200 (jolt-async-timeout 200))
+         (t100 (jolt-async-timeout 100)))
+    (when first? (ok "3a. three more are pending, plus far" (= 4 (pending-count))))
+    (let* ((e1 (begin (watched "3 (timeout 100)" (lambda () (jolt-async-take t100))) (- (mono-ns) t0)))
+           (e2 (begin (watched "3 (timeout 200)" (lambda () (jolt-async-take t200))) (- (mono-ns) t0)))
+           (e3 (begin (watched "3 (timeout 300)" (lambda () (jolt-async-take t300))) (- (mono-ns) t0))))
+      (when (or (< e1 100000000) (< e2 200000000) (< e3 300000000))
+        (printf "    3 closed EARLY: ~ams ~ams ~ams for 100/200/300\n"
+                (ns->ms e1) (ns->ms e2) (ns->ms e3))
+        (set! section-3-early #t))
+      (list e1 e2 e3))))
+(let round ((k 1))
+  (let* ((es (section-3-round (= k 1)))
+         (e1 (car es)) (e3 (caddr es))
+         (b (< e3 2000000000))    ; all three closed within ~300ms of the first insert
+         (c (< e1 250000000)))    ; the 100ms one did not wait for a later deadline
+    (if (or section-3-early (and b c) (= k late-rounds))
+        (begin
+          (unless (and b c)
+            (printf "    3: ~ams ~ams ~ams for 100/200/300 (over in all ~a rounds)\n"
+                    (ns->ms e1) (ns->ms (cadr es)) (ns->ms e3) late-rounds))
+          (ok "3b. all three closed within ~300ms of the first insert, none early"
+              (and b (not section-3-early)))
+          (ok "3c. the 100ms one closed at ~100ms, not at a later deadline" c))
+        (round (+ k 1)))))
 (ok "3d. only the far one is left" (= 1 (pending-count)))
 
 ;; --- 4. the sequential shape that leaked a thread per call --------------------
@@ -110,8 +196,8 @@
 
 ;; --- 5. a deadline already in the past ----------------------------------------
 (printf "\n== 5. a deadline in the past closes immediately ==\n")
-(let ((ms (take-ms (jolt-async-timeout 0))))
-  (ok "5a. (timeout 0) closes at once" (< ms 1000)))
+(ok "5a. (timeout 0) closes at once"
+    (on-time? "5a" 0 1000 (lambda () (timeout-ns "5a" 0))))
 
 ;; --- 6. cancelling a pending deadline ----------------------------------------
 ;; A wait that ends before its deadline takes the entry out (jolt-timer-cancel!),
@@ -196,7 +282,6 @@
 ;; wake-up latency out, which otherwise hides the shortfall; the elapsed time is
 ;; read in nanoseconds on the same monotonic clock.
 (printf "\n== 9. a deadline is never due early ==\n")
-(define (mono-ns) (let ((t (current-time 'time-monotonic))) (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
 (let loop ((i 0) (short 0))
   (if (= i 50)
       (ok "9a. no 2ms deadline came due before 2ms had passed" (= short 0))
@@ -233,11 +318,13 @@
 ;; sleep(0) is a yield, so it costs what a yield costs; waiting for the next tick
 ;; of the millisecond clock cost ~1ms more than that.
 (ok "10b. sleep(0) costs a yield, not a clock tick"
-    (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms 0))
-                             (lambda () (unless (jolt-fiber-wait-turn! 0) (thread-yield!)))
-                             51)))
-      (or (<= (car m) (+ (* 4 (cdr m)) 200000))
-          (begin (printf "    sleep(0) ~ans vs yield ~ans\n" (car m) (cdr m)) #f))))
+    (in-some-round?
+      (lambda ()
+        (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms 0))
+                                 (lambda () (unless (jolt-fiber-wait-turn! 0) (thread-yield!)))
+                                 51)))
+          (or (<= (car m) (+ (* 4 (cdr m)) 200000))
+              (format "sleep(0) ~ans vs yield ~ans" (car m) (cdr m)))))))
 (ok "10c. sleep(0, 100000) is not cut to nothing"
     (let loop ((i 0))
       (or (= i 20)
@@ -247,11 +334,13 @@
 ;; and not rounded up to a whole millisecond, which would make it cost what
 ;; sleep(1) costs
 (ok "10d. and not stretched to a millisecond either"
-    (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms+ns 0 100000))
-                             (lambda () (jolt-thread-sleep-ms 1))
-                             31)))
-      (or (< (car m) (* 3/4 (cdr m)))
-          (begin (printf "    sleep(0, 100000) ~ans vs sleep(1) ~ans\n" (car m) (cdr m)) #f))))
+    (in-some-round?
+      (lambda ()
+        (let ((m (paired-medians (lambda () (jolt-thread-sleep-ms+ns 0 100000))
+                                 (lambda () (jolt-thread-sleep-ms 1))
+                                 31)))
+          (or (< (car m) (* 3/4 (cdr m)))
+              (format "sleep(0, 100000) ~ans vs sleep(1) ~ans" (car m) (cdr m)))))))
 
 ;; A timeout of zero or less is already due: rounding now up made (.poll q 0 ms)
 ;; and (deref p 0 nil) wait for the next tick of the clock, ~1ms a call, where
@@ -340,12 +429,14 @@
         (or (= i 10)
             (and (>= (time-ns (lambda () (jolt-invoke f))) 500000) (loop (+ i 1)))))))
 (ok "11d. and is not stretched to a millisecond"
-    (let* ((f (ev "(fn [] (.poll tw-q 250 TimeUnit/MICROSECONDS))"))
-           (m (paired-medians (lambda () (jolt-invoke f))
-                              (lambda () (jolt-thread-sleep-ms 1))
-                              21)))
-      (or (< (car m) (* 3/4 (cdr m)))
-          (begin (printf "    poll(250us) ~ans vs sleep(1) ~ans\n" (car m) (cdr m)) #f))))
+    (let ((f (ev "(fn [] (.poll tw-q 250 TimeUnit/MICROSECONDS))")))
+      (in-some-round?
+        (lambda ()
+          (let ((m (paired-medians (lambda () (jolt-invoke f))
+                                   (lambda () (jolt-thread-sleep-ms 1))
+                                   21)))
+            (or (< (car m) (* 3/4 (cdr m)))
+                (format "poll(250us) ~ans vs sleep(1) ~ans" (car m) (cdr m))))))))
 ;; a one-shot timeout starts when the wait first waits, so the zero and negative
 ;; ones are due on the first decide, and a positive one only after it
 (ok "11e. a timeout not yet started is due exactly when it is zero or less"
