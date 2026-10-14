@@ -342,11 +342,16 @@
 ;; (mono-deadline ms) — the deadline ms from now, the one way to build one. Now is
 ;; rounded UP: a wait ends once (mono-millis), which truncates, reaches the
 ;; deadline, so a deadline off the truncated now came due up to 1ms early, and a
-;; timed wait could return before its timeout, which the JDK's never do.
+;; timed wait could return before its timeout, which the JDK's never do. A
+;; timeout of zero or less is due already, off the truncated now: rounded up, a
+;; (.poll q 0 ms) or (deref p 0 nil) waited for the next tick, ~1ms a call.
 (define (mono-deadline ms)
   (let ((t (current-time 'time-monotonic)))
-    (+ (* 1000 (time-second t)) (quotient (+ (time-nanosecond t) 999999) 1000000)
-       (exact (floor ms)))))
+    (if (<= ms 0)
+        (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000)
+           (exact (floor ms)))
+        (+ (* 1000 (time-second t)) (quotient (+ (time-nanosecond t) 999999) 1000000)
+           (exact (floor ms))))))
 
 ;; A deadline is a whole number of mono-millis everywhere except Thread/sleep,
 ;; whose deadline is EXACT (mono-deadline-exact): a rational millisecond, so a

@@ -253,6 +253,15 @@
       (or (< (car m) (* 3/4 (cdr m)))
           (begin (printf "    sleep(0, 100000) ~ans vs sleep(1) ~ans\n" (car m) (cdr m)) #f))))
 
+;; A timeout of zero or less is already due: rounding now up made (.poll q 0 ms)
+;; and (deref p 0 nil) wait for the next tick of the clock, ~1ms a call, where
+;; the JDK's return at once.
+(ok "10e. a zero or negative timeout is due as it is made"
+    (let loop ((i 0))
+      (or (= i 50)
+          (and (mono-due? (mono-deadline 0)) (mono-due? (mono-deadline -5))
+               (loop (+ i 1))))))
+
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
 (printf "async-timer gate: PASS\n")

@@ -100,7 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadlines, rounded up, but no longer overshoot them. `Thread/sleep` also
   refuses a negative timeout and nanos outside 0..999999 with
   IllegalArgumentException, as the JDK does, and `TimeUnit.sleep` of zero or
-  less returns at once without checking the interrupt flag.
+  less returns at once without checking the interrupt flag. A zero timeout is
+  due at once: `(.poll q 0 TimeUnit/MILLISECONDS)` and `(deref p 0 nil)` waited
+  for the next clock tick, ~1.25ms a call, and now return in well under a
+  microsecond.
 
 - **`clojure.walk` hands `outer` a map entry, not a vector.** A map entry is
   also `vector?`, and `walk` met it in its vector branch, so `postwalk` rebuilt
