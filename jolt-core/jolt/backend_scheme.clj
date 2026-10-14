@@ -321,6 +321,7 @@
 (defn reset-clone-prepass! [unit]
   (reset! (:clone-impl-keys unit) #{}) (reset! (:clone-sites unit) nil)
   (types/reset-clone-double-ret! unit))
+(declare register-impl-invoke)
 (defn contagion-prepass! [unit nodes ns]
   (letfn [(walk [n]
             (when-some [[type-name proto method fc] (register-impl-invoke n)]
@@ -602,6 +603,7 @@
 ;; reports; :local — a known procedure (self / an enclosing named fn): the site
 ;; its frame carries (*known-procs*), or the enclosing fn's *trace-site* for a
 ;; self-call; :keyword / :coll / computed callees — nil.
+(declare munge-name chez-str-lit)
 (defn- static-callee [fnode]
   (case (:op fnode)
     ;; The registered name must be the SAME form the callee's own *trace-site*
@@ -1320,6 +1322,7 @@
 ;; when two or more operands could have observable effects, so a literal over
 ;; locals/consts stays un-wrapped. `nodes` are the item IR nodes (for the
 ;; side-effect check); each is emitted once here.
+(declare ordered-call)
 (defn- emit-ordered [ctor nodes]
   (ordered-call nodes (mapv emit nodes)
     (fn [strs] (str "(" ctor (if (empty? strs) "" (str " " (str/join " " strs))) ")"))))

@@ -354,7 +354,9 @@
                    ;; macro kind hands proc (fn-form . meta-pmap-or-#f) — the
                    ;; derived :doc/:arglists ride along to the def emission.
                    (let-values (((nm fn-form mmap) (ce-defmacro->fn f)))
-                     (proc ns-name 'macro nm (cons fn-form mmap))))
+                     (hc-mint-walked! ns-name nm)
+                     (hc-mint-ungated
+                       (lambda () (proc ns-name 'macro nm (cons fn-form mmap))))))
                   (else
                    (when (ei-flag-set-form? f)
                      (jolt-compile-eval-form f ns-name))
@@ -386,6 +388,19 @@
              #t)
             (else (loop (fx+ i 1)))))))
 
+;; What a mint report calls a form: the macro's name, else the name a
+;; (def… name …) form defines, else <top-level-form>.
+(define (ei-form-label nm form)
+  (or nm
+      (and (cseq? form)
+           (let ((items (seq->list form)))
+             (and (pair? items) (pair? (cdr items))
+                  (symbol-t? (car items)) (symbol-t? (cadr items))
+                  (let ((h (symbol-t-name (car items))))
+                    (and (fx>= (string-length h) 3) (string=? (substring h 0 3) "def")))
+                  (symbol-t-name (cadr items)))))
+      "<top-level-form>"))
+
 (define (ei-emit-ns* ns-name src optimize? guard?)
   (let ((acc '()))
     (ei-for-each-form ns-name src
@@ -401,7 +416,7 @@
                ;; that stays failing at convergence.
                (scm (if guard?
                         (guard (e (#t (when (getenv "JOLT_MINT_DEBUG")
-                                        (fprintf (current-error-port) "mint: ~a/~a raised: ~a\n" ns (or nm "<top-level-form>")
+                                        (fprintf (current-error-port) "mint: ~a/~a raised: ~a\n" ns (ei-form-label nm form)
                                                  (if (and (condition? e) (message-condition? e))
                                                      (apply format (condition-message e) (if (irritants-condition? e) (condition-irritants e) '()))
                                                      (guard (_ (#t "?")) (jolt-repl-str (jolt-unwrap-throw e))))))
@@ -413,7 +428,7 @@
               (begin
                 (set! ei-skipped-count (+ ei-skipped-count 1))
                 (fprintf (current-error-port) "mint: skipped ~a/~a (failed to compile)\n"
-                         ns (or nm "<top-level-form>")))
+                         ns (ei-form-label nm form)))
               (set! acc
                     (cons (if (eq? kind 'macro)
                               (ei-macro-string ns nm scm (ei-emit-meta ns (cdr f) guard?) guard?)
@@ -466,21 +481,24 @@
 (define (ei-bytes-lit s)
   (string-append "(string->utf8 " (ei-str-lit s) ")"))
 
-;; The compiler namespaces, in load order. The passes (fold/inline/types + the
-;; jolt.passes façade) load after ir so run-passes is available to the back end;
-;; fold/inline/types come before the façade that :refers them.
+;; The compiler namespaces, in load order: each after every namespace it
+;; requires, which the mint's in-order visibility gate holds it to. The passes
+;; (fold/inline/types + the jolt.passes façade) load after ir so run-passes is
+;; available to the back end; fold/inline/types come before the façade that
+;; :refers them, and the back end, which requires jolt.passes.types and
+;; jolt.passes.numeric, comes last.
 (define ei-compiler-ns-files
   (list (cons "jolt.op-registry" "jolt-core/jolt/op_registry.clj")
         (cons "jolt.ir" "jolt-core/jolt/ir.clj")
         (cons "jolt.analyzer" "jolt-core/jolt/analyzer.clj")
-        (cons "jolt.backend-scheme" "jolt-core/jolt/backend_scheme.clj")
         (cons "jolt.passes.fold" "jolt-core/jolt/passes/fold.clj")
         (cons "jolt.passes.numeric" "jolt-core/jolt/passes/numeric.clj")
         (cons "jolt.passes.inline" "jolt-core/jolt/passes/inline.clj")
         (cons "jolt.passes.types.lattice" "jolt-core/jolt/passes/types/lattice.clj")
         (cons "jolt.passes.types.check" "jolt-core/jolt/passes/types/check.clj")
         (cons "jolt.passes.types" "jolt-core/jolt/passes/types.clj")
-        (cons "jolt.passes" "jolt-core/jolt/passes.clj")))
+        (cons "jolt.passes" "jolt-core/jolt/passes.clj")
+        (cons "jolt.backend-scheme" "jolt-core/jolt/backend_scheme.clj")))
 
 ;; The clojure.core tiers + stdlib namespaces, in load order.
 ;; Re-emitting these on Chez is the
@@ -513,9 +531,16 @@
       (else (join (cdr fs) (string-append out "\n" (car fs)))))))
 
 ;; Re-emit the whole list of (ns . file) pairs ON CHEZ as one Scheme string.
+;; Walked in list order, which is load order: Chez's `map` applies its procedure
+;; in no fixed order (right to left in practice), and the mint's in-order
+;; visibility gate (host-contract.ss hc-mint-unwalked) needs each namespace
+;; compiled after the ones it loads after.
 (define (ei-emit-ns-files nfs)
-  (ei-join (apply append
-             (map (lambda (nf) (ei-emit-ns (car nf) (read-file-string (cdr nf)))) nfs))))
+  (let loop ((nfs nfs) (acc '()))
+    (if (null? nfs)
+        (ei-join (apply append (reverse acc)))
+        (loop (cdr nfs)
+              (cons (ei-emit-ns (car (car nfs)) (read-file-string (cdr (car nfs)))) acc)))))
 
 ;; Emit the compiler image (jolt.ir + jolt.analyzer + jolt.backend-scheme) on Chez.
 (define (jolt-emit-image) (ei-emit-ns-files ei-compiler-ns-files))

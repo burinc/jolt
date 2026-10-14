@@ -1,0 +1,1 @@
+(binding [*undefined-thing* 1] 2)

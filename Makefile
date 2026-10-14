@@ -119,7 +119,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
-  devbootsmoke devirt directlink ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
+  devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
   deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
@@ -184,11 +184,11 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke \
   transient sortedcoll rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret accfix pic narrow directlink directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
+  protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
-  systemstreams userdirpaths utf8decode \
+  systemstreams closedstdout userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
 TEST-GATES := submodules selfhost ci
 
@@ -1162,6 +1162,13 @@ largefxgc:
 directlink:
 	@$(CHEZ) --script test/chez/directlink-test.ss
 
+# The seed mint's in-order visibility gate: a form that names a var defined
+# below it (a binding, a #', a call, a qualified ref) is refused on every remint
+# pass, as an in-order load refuses it, instead of compiling against the
+# previous seed's copy of the var.
+mintgate:
+	@$(CHEZ) --script test/chez/mint-gate-test.ss
+
 # Unique anon-fn letrec names + source-form registration (R1): a user-ns anon
 # literal registers jfn$<ns>/<def>$<n> -> {form, ns, free-names} and the live
 # closure's inspector name must agree; system-ns closures stay unregistered.
@@ -1902,6 +1909,12 @@ aotcachesmoke: testbin
 # corpus row.
 systemstreams:
 	@sh test/chez/system-streams-smoke.sh
+
+# A process stream whose reader has gone away drops writes instead of raising,
+# and checkError says so, as the JVM's PrintStream does (#1331). Runs the CLI
+# through $(CHEZ), so the windows-deps job runs it too.
+closedstdout:
+	@sh test/chez/closed-stdout-smoke.sh $(CHEZ)
 
 # Relative paths under bin/jolt resolve against the caller's directory, not the
 # checkout the launcher cd's to: the jolt.host filesystem functions, load-file,
