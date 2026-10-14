@@ -741,7 +741,11 @@
 ;; form boundary every BLD-SEGMENT-SOURCE-BYTES of emitted source. Collections
 ;; clear the buffer (mkgc.ss), Chez compacts before each segment, and an
 ;; oversize chunk is freed once it empties (chez-patches/0002), so the peak is
-;; one segment's buffer.
+;; one segment's buffer. On a stock kernel that buffer is a heap bytevector,
+;; freed by the compaction before the next segment, and the static image placed
+;; around it keeps the holes: a closed-world hello's boot held some 700 empty
+;; segments (11MB) on bionic. jolt's kernel uncompresses a boot entry outside
+;; the heap instead (chez-patches/0003), which took 5.4MB off that boot's peak.
 ;;
 ;; A segment's image is placed as ONE contiguous block. At 1MB of source that
 ;; block was 289 segments (4.6MB), more than a standard 129-segment (2MB) chunk,
