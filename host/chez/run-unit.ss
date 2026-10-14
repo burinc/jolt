@@ -35,6 +35,8 @@
 ;; autoload is covered per-process by the smoke gate.)
 (load-namespace "jolt.time.base")
 
+(load "host/chez/gate-private-tmpdir.ss")
+
 (define (slurp path)
   (call-with-input-file path
     (lambda (p)
