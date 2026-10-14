@@ -746,10 +746,13 @@
   "Pretty print object. With one arg, prints to *out* (captured by with-out-str).
   The 2-arg form writes to the supplied pretty-writer."
   ([object]
+   ;; print after the binding ends, so the text goes to the caller's *out*.
+   ;; clojure.core/print can't write into a StringBufferWriter: it has -write
+   ;; but no write method, so the text would fall through to stdout.
    (let [sb (StringBuilder.)]
      (binding [*out* (->StringBufferWriter sb)]
-       (pprint object *out*)
-       (clojure.core/print (str sb)))))
+       (pprint object *out*))
+     (clojure.core/print (str sb))))
   ([object writer]
    (with-pretty-writer writer
      (binding [*print-pretty* true]
@@ -2040,11 +2043,12 @@
          (execute-format format args)
          (finally
            (if-not (identical? real-stream wrapped-stream)
-             (-pflush wrapped-stream))))
-       (cond
-         (not stream) (str sb)
-         (true? stream) (clojure.core/print (str sb))
-         :else nil))))
+             (-pflush wrapped-stream)))))
+     ;; outside the binding, for the same reason as pprint's one-arg form
+     (cond
+       (not stream) (str sb)
+       (true? stream) (clojure.core/print (str sb))
+       :else nil)))
   ([format args]
    (map-passing-context
      (fn [element context]
