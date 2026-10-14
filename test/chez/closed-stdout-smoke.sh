@@ -60,18 +60,18 @@ expect "checkError is false on a healthy stream" \
   "$(jolt '(println "x") (println (.checkError System/out))' | tail -1 | tr -d '\r')" "false"
 
 # --- a line reaches the reader when it is written, not at exit ----------------
-# The program prints, then waits 3 s. The reader times its first line against a
-# run that only prints, so startup cancels out: held back until exit, the line
-# would arrive 3 s late.
-base_start="$(date +%s)"; jolt '(println "x")' >/dev/null; base=$(( $(date +%s) - base_start ))
-start="$(date +%s)"
-jolt '(println "early") (Thread/sleep 3000) (println "late")' | { IFS= read -r line; printf '%s %s' "$line" "$(( $(date +%s) - start ))" > "$dir/took"; cat >/dev/null; }
-read -r first_line first_line_at < "$dir/took"
+# The program prints, waits 3 s, and prints again. The reader stamps both lines
+# as they arrive: held back until exit, they would arrive together. One run, so
+# a slow startup on a loaded machine moves both stamps and not the gap between.
+jolt '(println "early") (Thread/sleep 3000) (println "late")' | {
+  IFS= read -r line; t1="$(date +%s)"; IFS= read -r _late; t2="$(date +%s)"; cat >/dev/null
+  printf '%s %s' "$line" "$(( t2 - t1 ))" > "$dir/took"; }
+read -r first_line first_line_gap < "$dir/took"
 expect "the first line is the first println" "$(printf '%s' "$first_line" | tr -d '\r')" "early"
-if [ "$first_line_at" -le $((base + 2)) ]; then
+if [ "$first_line_gap" -ge 2 ]; then
   expect "the first line arrives without waiting for the sleep" "ok" "ok"
 else
-  expect "the first line arrives without waiting for the sleep" "after ${first_line_at}s (startup ${base}s)" "ok"
+  expect "the first line arrives without waiting for the sleep" "${first_line_gap}s before the second (want >= 2s)" "ok"
 fi
 
 # --- stdout and stderr into one file keep their order ------------------------

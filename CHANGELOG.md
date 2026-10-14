@@ -57,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arena-first one; a pointer and an arena differ in type, so neither order can
   be read as the other.
 
+- **`jolt.deps/resolve-deps` takes `:jvm-deps? true`.** A Maven jar with no
+  Clojure source has always been a leaf: it stays on the roots, but the
+  dependencies its POM declares are left alone, since jolt can't run them. A
+  caller that runs JVM bytecode itself can now ask for those dependencies too.
+  With the option, such a jar's POM is walked the same way a Clojure jar's is:
+  compile and runtime scope only, optional deps skipped, and exclusions
+  honoured when the effective POM can be built (the `pom.xml` fallback inside
+  the jar carries none). Classifiers and `<type>` are not modelled. Without
+  the option nothing changes. A nested `resolve-deps` that doesn't pass the key
+  inherits the outer value.
+
 ### Changed
 
 - **nREPL eval no longer accepts undefined names; use `declare`.** It bound
@@ -96,6 +107,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first miss. The cache is now off for that process, and namespaces compile in
   memory as with `JOLT_AOT_CACHE=0` (`JOLT_DEBUG` says why). A cache that exists
   but is read-only still serves its hits, and a miss runs without caching.
+
+- **stderr is its own stream on Windows (#1331).** Chez's check for whether
+  stdout and stderr are the same file compared stdout's file with itself, so
+  with both streams redirected to files, everything written to `System/err`,
+  `*err*`, uncaught-exception reports and the runtime's own diagnostics went to
+  stdout and the `2>` file stayed empty. jolt's Chez build carries the fix
+  (`host/chez/chez-patches/0005`); a jolt built against a stock Chez on Windows
+  still merges them.
+
+- **Threads starting their first child processes together on Windows all
+  start (#1331).** The kernel32 entry points behind a spawn are looked up on
+  first use, and the lookup (and the kernel32 load under it) marked itself
+  done before it had an answer, so the other threads read nothing there and
+  failed with "ProcessBuilder: no Windows spawn path". Six threads spawning at
+  once lost five.
 
 - **`clojure.walk` hands `outer` a map entry, not a vector.** A map entry is
   also `vector?`, and `walk` met it in its vector branch, so `postwalk` rebuilt
@@ -159,6 +185,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as its innermost frame. With jolt-lang/time loaded, every nREPL error's trace
   started with `jolt.time.impl/jt?`. The site is now put back when a seam fn
   returns.
+
+- **`jolt build` with a C++ `:static` archive loads on Linux.** The build
+  preloads the archives as one shared object so the app's natives resolve
+  while it compiles. That object did not depend on the C++ runtime, and the
+  build process has none, so the loader refused it on a C++ class's typeinfo
+  (`undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE`). On ELF the
+  object now links the project's `{:lib …}` natives (`stdc++`) as its own
+  dependencies. A lib with no shared form falls back to the old link.
+
+- **`jolt build` no longer fails on an `:optional` native's missing archive.**
+  Every `:static` archive went to the linker, optional or not, so a project
+  that declares an optional native with a `:static {:archive …}` and never
+  built it (a GPU backend on a host without the GPU) could not build at all:
+  `clang: error: no such file or directory: '…/libfoo.a'`. An optional
+  native whose archive is not on disk is now loaded at runtime like any other
+  optional native, and the build's report of runtime-loaded natives names it.
 
 - **A failed file delete answers that it failed.** Deleting a file the process
   cannot unlink, such as one in a read-only directory, reported success while
@@ -305,6 +347,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrays as before. A vector passed to `write-array`, or a `long-array`
   holding a value past the fixnum range, still takes the element loop. Not on
   Gambit.
+- **A built program's boot peaks about 5MB lower** with jolt's Chez kernel
+  patches. Each boot image segment was uncompressed into a heap buffer that the
+  static image was then placed around, and the holes it left behind stayed
+  held: a closed-world hello peaked at 49MB for 33MB live on Android. The
+  buffer lives outside the heap now and the same program peaks at 44MB. A
+  kernel without the patches (Homebrew, a distro Chez) boots as before.
 - **`System/arraycopy` between two `double`, `float`, `long`, `int` or `short`
   arrays is a block move**, as it already was for byte arrays: 6000 doubles
   went from 97 to 0.8 µs, and no longer allocate a flonum each.
