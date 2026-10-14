@@ -192,6 +192,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native whose archive is not on disk is now loaded at runtime like any other
   optional native, and the build's report of runtime-loaded natives names it.
 
+- **Nor on an `:optional` native whose `:static {:lib …}` does not resolve.**
+  The `-l` flag went to the linker unconditionally, so a host without the
+  library failed the whole build (`ld: library 'foo' not found`). The build
+  now try-links the flag for an optional native, once per library, and loads
+  the native at runtime when it does not resolve, with the same
+  "(optional)" line in the build's report. A build with no optional `{:lib}`
+  native runs no probe.
+
 - **A failed file delete answers that it failed.** Deleting a file the process
   cannot unlink, such as one in a read-only directory, reported success while
   the file stayed on disk. `jolt.host/delete-file!` and
