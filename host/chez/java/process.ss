@@ -2164,7 +2164,9 @@
   (let ((step 10)
         (deadline (mono-deadline ms)))
     (let loop ()
-      (let ((remaining (- deadline (mono-millis))))
+      ;; what is left measured at full precision, so the last pause ends at the
+      ;; deadline rather than the millisecond after it
+      (let ((remaining (mono-ms-until deadline)))
         (cond ((not (proc-alive? st)) #t)
               ((<= remaining 0) #f)
               ;; a fiber parks for the step rather than sleeping its carrier

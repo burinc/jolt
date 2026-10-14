@@ -262,6 +262,98 @@
           (and (mono-due? (mono-deadline 0)) (mono-due? (mono-deadline -5))
                (loop (+ i 1))))))
 
+;; --- 11. every timed wait ends at its deadline, not a millisecond tick ----
+;; Thread/sleep got an exact deadline in 10; the other timed waits still built
+;; theirs as a whole millisecond rounded up from now, so with the wake latency on
+;; top a 1ms wait took ~2ms where the JDK's take ~1.1-1.3ms, and a TimeUnit finer
+;; than a millisecond was truncated to no wait at all. Each site's 1ms wait is
+;; timed interleaved with a sleep(1) from this run -- the same timed condition
+;; wait, so load stretches both alike -- and must cost about what it does, and
+;; never less than the 1ms it was asked for.
+(printf "\n== 11. every timed wait ends at its deadline ==\n")
+(define (ev s) (jolt-compile-eval s "user"))
+(ev "(import '[java.util.concurrent TimeUnit LinkedBlockingQueue ArrayBlockingQueue CountDownLatch Executors CompletableFuture FutureTask] '[java.util.concurrent.locks ReentrantLock])")
+(ev "(def tw-ms TimeUnit/MILLISECONDS)")
+(ev "(def tw-p (promise))")
+(ev "(def tw-fut (future (Thread/sleep 600000)))")
+(ev "(def tw-q (LinkedBlockingQueue.))")
+(ev "(def tw-fq (doto (ArrayBlockingQueue. 1) (.offer 1)))")
+(ev "(def tw-latch (CountDownLatch. 1))")
+(ev "(def tw-lk (ReentrantLock.))")
+(ev "(let [held (CountDownLatch. 1)] (doto (Thread. (fn [] (.lock tw-lk) (.countDown held) (Thread/sleep 600000))) (.setDaemon true) .start) (.await held))")
+(ev "(def tw-ex (Executors/newFixedThreadPool 1))")
+(ev "(.submit tw-ex ^Runnable (fn [] (Thread/sleep 600000)))")
+(ev "(def tw-jf (.submit tw-ex ^Callable (fn [] 1)))")
+(ev "(def tw-cf (CompletableFuture.))")
+(ev "(def tw-ft (FutureTask. (fn [] 1)))")
+(ev "(def tw-th (doto (Thread. (fn [] (Thread/sleep 600000))) (.setDaemon true) .start))")
+(ev "(def tw-o (Object.))")
+(ev "(def tw-proc (.start (ProcessBuilder. [\"sleep\" \"600\"])))")
+(ev "(def tw-ag (agent 0))")
+(ev "(send-off tw-ag (fn [x] (Thread/sleep 600000) x))")
+(define tw-sites
+  '(("deref promise" . "(deref tw-p 1 nil)")
+    ("deref future" . "(deref tw-fut 1 nil)")
+    ("LinkedBlockingQueue.poll" . "(.poll tw-q 1 tw-ms)")
+    ("ArrayBlockingQueue.offer" . "(.offer tw-fq 2 1 tw-ms)")
+    ("CountDownLatch.await" . "(.await tw-latch 1 tw-ms)")
+    ("ReentrantLock.tryLock" . "(.tryLock tw-lk 1 tw-ms)")
+    ("awaitTermination" . "(.awaitTermination tw-ex 1 tw-ms)")
+    ("executor Future.get" . "(try (.get tw-jf 1 tw-ms) (catch Exception _ nil))")
+    ("CompletableFuture.get" . "(try (.get tw-cf 1 tw-ms) (catch Exception _ nil))")
+    ("FutureTask.get" . "(try (.get tw-ft 1 tw-ms) (catch Exception _ nil))")
+    ("Thread.join" . "(.join tw-th 1)")
+    ("Object.wait" . "(locking tw-o (.wait tw-o 1))")
+    ("Process.waitFor" . "(.waitFor tw-proc 1 tw-ms)")
+    ("await-for" . "(await-for 1 tw-ag)")
+    ("async timeout" . "(clojure.core.async/<!! (clojure.core.async/timeout 1))")))
+;; Load only ever adds to a wait, and a noisy round can leave one median above
+;; the other by more than the margin; the rounding this row is about is structural
+;; and shows in every round. So a site passes on any of a few rounds, and fails
+;; only when every round puts it a fraction of a tick behind sleep(1).
+(define (tw-like-sleep1? name wait sleep1)
+  (let round ((k 0))
+    (let ((m (paired-medians wait sleep1 21)))
+      (cond ((<= (car m) (+ (* 5/4 (cdr m)) 100000)) #t)
+            ((< k 3) (round (+ k 1)))
+            (else (printf "    ~a ~ans vs sleep(1) ~ans\n" name (car m) (cdr m)) #f)))))
+(for-each
+  (lambda (site)
+    (let* ((f (ev (string-append "(fn [] " (cdr site) ")")))
+           (wait (lambda () (jolt-invoke f)))
+           (sleep1 (lambda () (jolt-thread-sleep-ms 1)))
+           (early 0))
+      (wait) (sleep1)
+      (let loop ((i 0))
+        (when (< i 5)
+          (when (< (time-ns wait) 1000000) (set! early (+ early 1)))
+          (loop (+ i 1))))
+      (ok (format "11a. ~a(1ms) never returns early" (car site)) (= early 0))
+      (ok (format "11b. ~a(1ms) costs a sleep(1), not two ticks" (car site))
+          (tw-like-sleep1? (car site) wait sleep1))))
+  tw-sites)
+;; a TimeUnit finer than a millisecond was truncated to whole milliseconds: 500us
+;; was no wait at all
+(ok "11c. poll(500, MICROSECONDS) waits its half millisecond"
+    (let ((f (ev "(fn [] (.poll tw-q 500 TimeUnit/MICROSECONDS))")))
+      (let loop ((i 0))
+        (or (= i 10)
+            (and (>= (time-ns (lambda () (jolt-invoke f))) 500000) (loop (+ i 1)))))))
+(ok "11d. and is not stretched to a millisecond"
+    (let* ((f (ev "(fn [] (.poll tw-q 250 TimeUnit/MICROSECONDS))"))
+           (m (paired-medians (lambda () (jolt-invoke f))
+                              (lambda () (jolt-thread-sleep-ms 1))
+                              21)))
+      (or (< (car m) (* 3/4 (cdr m)))
+          (begin (printf "    poll(250us) ~ans vs sleep(1) ~ans\n" (car m) (cdr m)) #f))))
+;; a one-shot timeout starts when the wait first waits, so the zero and negative
+;; ones are due on the first decide, and a positive one only after it
+(ok "11e. a timeout not yet started is due exactly when it is zero or less"
+    (and (jolt-deadline-due? (jolt-timeout 0)) (jolt-deadline-due? (jolt-timeout -1))
+         (not (jolt-deadline-due? (jolt-timeout 1/1000)))
+         (not (mono-due? (jolt-deadline-start (jolt-timeout 1000))))))
+(ev "(.destroy tw-proc)")
+
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
 (printf "async-timer gate: PASS\n")

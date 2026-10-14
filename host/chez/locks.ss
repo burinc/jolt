@@ -477,7 +477,8 @@
 ;;
 ;; decide runs with mu HELD and is passed one argument, whether the deadline has
 ;; passed. It answers jolt-cv-again to wait for a change, or any other value to
-;; finish. deadline is in mono-millis, or #f for an unbounded wait.
+;; finish. deadline is in mono-millis, or a timeout not yet started (jolt-timeout
+;; below), or #f for an unbounded wait.
 ;;
 ;; This is jolt-lock-wait with the two waiter kinds filled in, so it inherits the
 ;; properties that primitive exists for: the switch happens with mu released, the
@@ -597,6 +598,21 @@
 (define (jolt-deadline->timeout deadline)
   (mono-duration-until deadline))
 
+;; (jolt-timeout ms) — a timeout of ms (exact, maybe fractional) that starts when
+;; the wait first has to wait: the deadline argument of a one-shot timed wait. A
+;; wait that answers on its first decide -- a settled deref, a non-empty poll --
+;; never reads the clock: its timeout cannot have run out before it started, so
+;; that decide is told timed-out? exactly when ms is zero or less. An exact
+;; deadline costs a rational division to build and another to test, which the
+;; non-blocking path would otherwise pay on every call. A wait that keeps one
+;; deadline over several waits (await-for over many agents, invokeAll) builds it
+;; up front with mono-deadline instead.
+(define (jolt-timeout ms) (box ms))
+(define (jolt-deadline-start deadline)
+  (if (box? deadline) (mono-deadline (unbox deadline)) deadline))
+(define (jolt-deadline-due? deadline)
+  (if (box? deadline) (<= (unbox deadline) 0) (mono-due? deadline)))
+
 ;; (jolt-pause-ms ms) — pause THIS execution context for ms, whatever it is: a
 ;; thread sleeps, and a fiber parks until the deadline and gives its carrier up in
 ;; the meantime.
@@ -658,7 +674,8 @@
   ;; wants it in jolt-cv-wait/park, next to the commit) runs after arming; when it
   ;; refuses, its raise passes through the handler and the wake is cancelled.
   (if (and deadline (jolt-current-fiber))
-      (let* ((arm (lambda ()
+      (let* ((deadline (jolt-deadline-start deadline))
+             (arm (lambda ()
                     (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv))))))
              (timer (arm))
              (r (with-exception-handler
@@ -718,12 +735,12 @@
                        ;; the report would name this wait instead.
                        (with-exception-handler
                          (lambda (e) (jolt-interrupt-wait-remove! ibox entry) (raise-continuable e))
-                         (lambda () (decide (and deadline (mono-due? deadline)))))
+                         (lambda () (decide (and deadline (jolt-deadline-due? deadline)))))
                        ;; NOT REGISTERED — nothing to clean up, so decide runs with
                        ;; nothing wrapped around it. This is the arm every
                        ;; non-interruptible wait takes, and the one a wait that
                        ;; answers on its first run takes.
-                       (decide (and deadline (mono-due? deadline))))))
+                       (decide (and deadline (jolt-deadline-due? deadline))))))
             (cond
               ((not (eq? r jolt-cv-again))
                (when entry (jolt-interrupt-wait-remove! ibox entry) (set! entry #f))
@@ -753,7 +770,10 @@
                        jolt-lock-parked))
                  (else
                   (if deadline
-                      (jolt-condition-wait cv mu (jolt-deadline->timeout deadline))
+                      (begin
+                        ;; the timeout starts here, at the first wait
+                        (set! deadline (jolt-deadline-start deadline))
+                        (jolt-condition-wait cv mu (jolt-deadline->timeout deadline)))
                       (jolt-condition-wait cv mu))
                   (loop)))))))))
       #t)))
