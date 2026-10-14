@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`clojure.walk` hands `outer` a map entry, not a vector.** A map entry is
+  also `vector?`, and `walk` met it in its vector branch, so `postwalk` rebuilt
+  each entry as a plain 2-vector and its function saw `(map-entry? x)` false
+  where Clojure's sees true. A walk that tells the two apart, rewriting the
+  vectors in a map's values but not its entries, took each entry for one of
+  those vectors, and a rewritten entry that was no longer a pair failed the
+  map's rebuild with `Vector arg to map conj must be a pair`. `walk` now
+  checks for a map entry first and rebuilds it as one, as Clojure's
+  `IMapEntry` branch does.
+
 - **A negative array length throws `NegativeArraySizeException`**, with the
   length as its message, as on the JVM. `(double-array -1)`, the other typed
   constructors, `make-array` and `jolt.ffi/read-array` raised a
