@@ -34,9 +34,6 @@
         v (f)]
     [(/ (- (System/nanoTime) t) 1e6) v]))
 
-(defn- best-of [k f]
-  (reduce min (map first (repeatedly k #(timed f)))))
-
 (def ^:private failures (atom 0))
 
 (defn- judge [label t1 t4 ceiling detail]
@@ -62,10 +59,14 @@
 ;; against its linear 4, and a CI run read 8.37 and then 8.38 against the 8.0
 ;; ceiling. After a collect neither arm reaches the nursery floor, and the row
 ;; reads 3.8-4.2 at every nursery size from 4MB up.
-(defn- judge-thunks [label fa fb ceiling detail]
-  (let [sample (fn [f] (System/gc) (first (timed f)))
+;;
+;; judge-staged takes each arm as a STAGE: a fn run untimed before every sample
+;; that puts the image in that arm's state and returns the thunk to time. It is
+;; what lets an arm be a state of the whole image (ns-shape) and still alternate.
+(defn- judge-staged [label sa sb ceiling detail]
+  (let [sample (fn [stage] (let [f (stage)] (System/gc) (first (timed f))))
         measure (fn []
-                  (let [ts (doall (repeatedly 5 #(vector (sample fa) (sample fb))))]
+                  (let [ts (doall (repeatedly 5 #(vector (sample sa) (sample sb))))]
                     [(reduce min (map first ts)) (reduce min (map second ts))]))
         [ta tb] (measure)
         ratio (double (/ tb (max 0.05 ta)))]
@@ -74,6 +75,9 @@
       (do (println (format "hotpath %-9s %7.1fms vs %7.1fms, ratio %6.2f — over %.1f, measuring again"
                            label ta tb ratio (double ceiling)))
           (let [[ua ub] (measure)] (judge label ua ub ceiling detail))))))
+
+(defn- judge-thunks [label fa fb ceiling detail]
+  (judge-staged label (constantly fa) (constantly fb) ceiling detail))
 
 ;; A scaling row: f1 drains the base size, f4 four times it. The arms are
 ;; balanced to the SAME wall time for a linear implementation — f1 runs 4×reps
@@ -143,17 +147,24 @@
            "timeout-insert! is walking the pending list per arm again (async.ss)"))
 
   ;; ns-publics shape independence: a tiny namespace's ns-publics must not get
-  ;; slower because unrelated vars exist. R repetitions beat the clock floor.
+  ;; slower because unrelated vars exist. The two arms are the same probe in two
+  ;; states of the image, without and with 30k unrelated vars, and remove-ns
+  ;; takes the image back, so the states alternate like every other row's arms.
+  ;; This was one reading of each, taken before and after the interning, with
+  ;; 300 reps that took 0.1ms: a loaded machine read 3.02 against the 3.0
+  ;; ceiling. A regressed scan costs O(every var in the image) per call, which
+  ;; is 10x and more here, so the ceiling has room either way.
   (let [_ (eval '(do (ns tiny-probe-ns) (def a 1) (def b 2) (def c 3) (ns hotpath-scaling-test)))
-        reps 300
-        probe #(dotimes [_ reps] (ns-publics 'tiny-probe-ns))
-        t-before (best-of 3 probe)
-        _ (doseq [i (range 30)]
-            (let [n (create-ns (symbol (str "bulk-ns-" i)))]
-              (dotimes [j 1000] (intern n (symbol (str "v" j)) 1))))
-        t-after (best-of 3 probe)]
-    (judge "ns-shape" t-before t-after 3.0
-           "ns-publics is scanning the whole var table again (ns.ss) — 30k unrelated vars changed a 3-var namespace's cost"))
+        reps 3000
+        bulk (mapv #(symbol (str "bulk-ns-" %)) (range 30))
+        without (fn [] (doseq [s bulk] (remove-ns s)))
+        with (fn [] (doseq [s bulk]
+                      (let [n (create-ns s)]
+                        (dotimes [j 1000] (intern n (symbol (str "v" j)) 1)))))
+        probe (fn [enter] (fn [] (enter) #(dotimes [_ reps] (ns-publics 'tiny-probe-ns))))]
+    (judge-staged "ns-shape" (probe without) (probe with) 3.0
+                  "ns-publics is scanning the whole var table again (ns.ss) — 30k unrelated vars changed a 3-var namespace's cost")
+    (without))
 
   ;; intersection shape independence: big ∩ small vs small ∩ big.
   (let [big (set (range 100000))
