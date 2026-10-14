@@ -35,7 +35,7 @@
     (random-seed (+ 1 (mod (+ (time-nanosecond now) (time-second now)) 4294967000)))
     (let try ((k 0))
       (let ((d (format "~a/jolt-gatetmp-~a" base (random 1000000000))))
-        (cond ((guard (_ (#t #f)) (mkdir d) #t) (putenv "TMPDIR" d) d)
+        (cond ((guard (_ (#t #f)) (mkdir d) #t) (sa-setenv! "TMPDIR" d) d)
               ((< k 20) (try (+ k 1)))
               (else #f))))))                       ; none made: the shared dir, as before
 

@@ -31,6 +31,7 @@ host/chez/scheme-adapter-runtime.ss machine-type
 host/chez/scheme-adapter-runtime.ss make-boot-file
 host/chez/scheme-adapter-runtime.ss maximum-memory-bytes
 host/chez/scheme-adapter-runtime.ss open-process-ports
+host/chez/scheme-adapter-runtime.ss putenv
 host/chez/scheme-adapter-runtime.ss real-time
 host/chez/scheme-adapter-runtime.ss statistics
 host/chez/scheme-adapter-runtime.ss string-copy!

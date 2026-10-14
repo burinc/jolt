@@ -1288,6 +1288,11 @@
 (define (sa-monotonic-ns)
   (let ((t (current-time 'time-monotonic)))
     (+ (* (time-second t) 1000000000) (time-nanosecond t))))
+;; (sa-setenv! name value) -> void
+;; Set NAME in this process's environment, which getenv reads back and a child
+;; process inherits. Used by the gate runners to give themselves a private
+;; TMPDIR (gate-private-tmpdir.ss).
+(define (sa-setenv! name value) (putenv name value))
 ;; (sa-gc-install-stall-watch! seconds on-stall) -> boolean
 ;; Make a stalled collection observable. Chez stops the world by rendezvous:
 ;; the thread whose allocation tripped runs $collect-rendezvous, and unless it
