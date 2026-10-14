@@ -81,6 +81,13 @@
           (jolt-exit-process 2)))
       (loop))))
 
+;; What a row raised, rendered: "raised" alone left a failure that happened only
+;; under load with nothing to go on.
+(define (raised-msg e)
+  (string-append "raised "
+    (guard (_ (#t "(unprintable)"))
+      (jolt-repl-str (jolt-unwrap-throw e)))))
+
 (let loop ((i 0))
   (when (< i (pvec-count cases))
     (let* ((row (pvec-nth-d cases i jolt-nil))
@@ -93,7 +100,7 @@
       (set! row-in-flight (list i expr (time-second (current-time))))
       (guard (e (#t (if throws?
                         (begin (set! pass (+ pass 1)) (bump! suite-pass suite))
-                        (set! fails (cons (list suite expr "raised") fails)))))
+                        (set! fails (cons (list suite expr (raised-msg e)) fails)))))
         (let ((got (jolt-repl-str
                      (parameterize ((current-output-port sink))
                        (jolt-compile-eval (string-append "(do " expr ")") "user")))))

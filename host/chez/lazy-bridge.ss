@@ -356,6 +356,10 @@
                       (lambda () #f)
                       thunk
                       (lambda ()
+                        ;; live-threads first, the exit hook after: Thread.start
+                        ;; registers a handle only while jolt-started-thread?
+                        ;; holds, so a hook that ran first could see its entries
+                        ;; re-added by a late parent and kept forever
                         (jolt-with-mutex live-threads-mutex
                           (if (hashtable-contains? live-threads id)
                               (hashtable-delete! live-threads id)

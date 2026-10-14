@@ -216,6 +216,7 @@
     ((dropping) (when (< (ac-qlen ch) (async-chan-cap ch)) (ac-qpush! ch (cons v #f))))
     ((sliding)  (when (>= (ac-qlen ch) (async-chan-cap ch)) (ac-qdrop-oldest! ch))
                 (ac-qpush! ch (cons v #f)))
+    ((promise)  (when (ac-qempty? ch) (ac-qpush! ch (cons v #f))))  ; first value stays
     (else       (ac-qpush! ch (cons v #f))))      ; fixed: caller ensured room
   (ac-notify! ch))
 
@@ -402,6 +403,16 @@
 ;; A transducer is a jolt fn (xform); (xform add-rf) yields the channel's reducing
 ;; fn. add-rf: 0-arg init, 1-arg completion, 2-arg step (enqueue the output). A
 ;; `reduced` step result closes the channel.
+;; Whether a put waits for room when the buffer is full: only a fixed buffer's
+;; does. A dropping, sliding or promise buffer never fills from a put's point
+;; of view, with or without a transducer; treating one with a transducer as
+;; fixed made (chan (sliding-buffer 1) xf) keep its OLDEST value, with each
+;; later put queued behind it, where the JVM slides. Named positively so a new
+;; buffer kind is unbounded until it says otherwise.
+(define (ac-bounded? ch)
+  (and (> (async-chan-cap ch) 0)
+       (eq? (async-chan-kind ch) 'fixed)))
+
 (define (ac-make-add-rf ch)
   (lambda args
     (cond ((null? args) ch)                                   ; init
@@ -474,7 +485,7 @@
     (cond
       ((async-chan-closed? ch) #f)
       ((async-chan-xrf ch)
-       (if (> (async-chan-cap ch) 0)
+       (if (ac-bounded? ch)
            ;; Fixed buffered with xform: wait for room, then apply xform.
            ;; The xform step may overfill transiently (e.g. mapcat); the NEXT put
            ;; will wait again.
@@ -487,7 +498,9 @@
                       #t))
                    ((ac-wait! ch intr? reg) => loop)
                    (else (jolt-interrupted-throw! ">!!"))))
-           ;; Unbuffered with xform: apply immediately (output goes to rendezvous queue)
+           ;; Unbuffered with xform: apply immediately (output goes to rendezvous
+           ;; queue). A dropping or sliding buffer too: ac-buf-give! drops or
+           ;; slides what the xform yields, so a put never waits.
            (let ((r (ac-xrf-apply ch v)))
              (when (jolt-reduced? r) (ac-close! ch))
              #t)))
@@ -616,7 +629,7 @@
   (async-check-put! v)
   (cond
     ((async-chan-closed? ch) 'closed)
-    ((async-chan-xrf ch) (if (and (> (async-chan-cap ch) 0)
+    ((async-chan-xrf ch) (if (and (ac-bounded? ch)
                             (>= (ac-qlen ch) (async-chan-cap ch)))
                        'full
                        (let ((r (ac-xrf-apply ch v)))
@@ -1218,7 +1231,11 @@
                                   (jolt-with-mutex (async-chan-mu ch)
                                     (let ((ready?
                                            (or (async-chan-closed? ch)
-                                               (async-chan-xrf ch)
+                                               ;; a full fixed buffer with a
+                                               ;; transducer still waits, as
+                                               ;; ac-try-give!/locked says
+                                               (and (async-chan-xrf ch)
+                                                    (not (ac-bounded? ch)))
                                                (memq (async-chan-kind ch) '(dropping sliding promise))
                                                (and (> (async-chan-cap ch) 0)
                                                     (< (ac-qlen ch) (async-chan-cap ch)))
@@ -1236,7 +1253,10 @@
                                          ;; give cannot return 'full here.
                                          (case (ac-try-give!/locked ch v)
                                            ((closed) (cons #f ch))
-                                           (else (cons #t ch))))
+                                           ((ok) (cons #t ch))
+                                           (else (jolt-throw
+                                                  (jolt-ex-info "alts put judged ready but the channel was full"
+                                                                (jolt-hash-map))))))
                                         (else 'lost))))))
                             (cond
                               ((eq? res 'registered) (reg-loop (fx+ j 1)))
@@ -1287,7 +1307,10 @@
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
 (cca-def! "chan" jolt-async-chan)
-(cca-def! "promise-chan" (lambda args (ac-make 1 'promise #f)))
+;; (promise-chan) | (promise-chan xform) | (promise-chan xform ex-handler): the
+;; transducer and handler go through chan, as on the JVM; they were dropped.
+(cca-def! "promise-chan"
+  (lambda args (apply jolt-async-chan (make-async-buffer 1 'promise) args)))
 (cca-def! "chan?" async-chan?)
 (cca-def! "buffer" jolt-async-buffer)
 (cca-def! "dropping-buffer" jolt-async-dropping-buffer)

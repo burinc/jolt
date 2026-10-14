@@ -98,6 +98,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sliding or dropping buffer with a transducer slides or drops.** A
+  channel with a transducer and a buffer was handled as a fixed buffer
+  whatever the buffer's kind, so `(chan (sliding-buffer 1) xf)` kept the
+  first value put and queued each later one behind it: `offer!` answered
+  nil, `>!!` blocked, and a taker got the oldest value rather than the
+  newest. A put on a sliding or dropping buffer now never waits, with a
+  transducer as without one, as on the JVM.
+- **`promise-chan` takes a transducer and an ex-handler.** Both were
+  dropped, so `(promise-chan (map inc))` delivered the value as put. A put
+  after the first never waits, with a transducer as without one.
+- **An `alts!`/`alts!!` put on a full buffered channel with a transducer
+  waits.** It counted as ready because the channel had a transducer, so the
+  put was reported done while the value was dropped, and a timeout in the
+  same `alts` never won. It now waits for room, as on the JVM.
+- **`@` on a settled promise or future answers at once, even on a fiber
+  holding a lock.** Deref went straight into the wait, which begins by
+  checking that the caller may park, so a fiber holding a counted lock
+  could not read a promise delivered long before. That is where a
+  transducer's completion runs when a fiber closes its channel (as
+  ring-chez-adapter's fiber server does when a client goes away): it threw
+  `a fiber cannot leave the CPU while its carrier holds a counted lock`.
+  Deref, timed or not, now checks under the value's own mutex whether it
+  has settled, and waits only when it hasn't.
 - **`jolt build` refuses a `:static {:lib …}` native that cannot supply what
   the app binds.** A `{:lib}` is linked like any `-l` library, so the linker
   keeps only the archive members other linked code references, and a `defcfn`

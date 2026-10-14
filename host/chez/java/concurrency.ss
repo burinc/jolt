@@ -192,25 +192,37 @@
 ;; it was itself a fiber on that carrier the two deadlocked (jolt-x1no). A fiber
 ;; parks now and the settle resumes it; a thread still blocks, which is what a
 ;; thread should do.
+;;
+;; A settled one answers without the wait. The wait begins by checking that the
+;; caller may park (jolt-fiber-may-park!, which must precede the commit), and a
+;; fiber holding a counted lock may not, so @ on a future or promise that had
+;; long since settled threw there, from inside a channel's close! (a
+;; transducer's completion) say, although nothing would wait. The settled
+;; check takes only the value's own mutex, which never parks.
+(define (jolt-future-settled? f)
+  (jolt-with-mutex (jolt-future-mu f) (jolt-future-done? f)))
+
 (define (jolt-future-deref f)
-  (jolt-cv-wait-interruptibly "future deref" (jolt-future-mu f) (jolt-future-cv f) #f
-    (lambda (_timed-out?)
-      (if (jolt-future-done? f) #t jolt-cv-again)))
+  (unless (jolt-future-settled? f)
+    (jolt-cv-wait-interruptibly "future deref" (jolt-future-mu f) (jolt-future-cv f) #f
+      (lambda (_timed-out?)
+        (if (jolt-future-done? f) #t jolt-cv-again))))
   (jolt-future-finish f))
 
 ;; (deref f timeout-ms timeout-val): wait up to timeout-ms; return timeout-val if
 ;; it has not settled by the absolute deadline.
 (define (jolt-future-deref-timed f ms timeout-val)
-  (let ((settled (jolt-cv-wait-interruptibly "future deref"
-                               (jolt-future-mu f) (jolt-future-cv f)
-                               (ms->timeout ms)
-                   (lambda (timed-out?)
-                     ;; done? FIRST on both paths: a future that settled as the
-                     ;; deadline passed is not a timeout, which is the re-check the
-                     ;; old (else (jolt-future-done? f)) arm was there for.
-                     (cond ((jolt-future-done? f) #t)
-                           (timed-out? #f)
-                           (else jolt-cv-again))))))
+  (let ((settled (or (jolt-future-settled? f)
+                     (jolt-cv-wait-interruptibly "future deref"
+                                                 (jolt-future-mu f) (jolt-future-cv f)
+                                                 (ms->timeout ms)
+                       (lambda (timed-out?)
+                         ;; done? FIRST on both paths: a future that settled as the
+                         ;; deadline passed is not a timeout, which is the re-check the
+                         ;; old (else (jolt-future-done? f)) arm was there for.
+                         (cond ((jolt-future-done? f) #t)
+                               (timed-out? #f)
+                               (else jolt-cv-again)))))))
     (if settled (jolt-future-finish f) timeout-val)))
 
 ;; future-cancel: mark the future cancelled+done if it has not settled — so derefs
@@ -308,20 +320,27 @@
         (if won p jolt-nil))
       (jolt-throw (jolt-ex-info "deliver requires a promise" (jolt-hash-map)))))
 
+;; A delivered promise answers without the wait, as a settled future does
+;; (jolt-future-settled?, above).
+(define (jolt-promise-settled? p)
+  (jolt-with-mutex (jolt-promise-mu p) (jolt-promise-delivered? p)))
+
 (define (jolt-promise-deref p)
-  (jolt-cv-wait-interruptibly "promise deref" (jolt-promise-mu p) (jolt-promise-cv p) #f
-    (lambda (_timed-out?)
-      (if (jolt-promise-delivered? p) #t jolt-cv-again)))
+  (unless (jolt-promise-settled? p)
+    (jolt-cv-wait-interruptibly "promise deref" (jolt-promise-mu p) (jolt-promise-cv p) #f
+      (lambda (_timed-out?)
+        (if (jolt-promise-delivered? p) #t jolt-cv-again))))
   (jolt-promise-value p))
 
 (define (jolt-promise-deref-timed p ms timeout-val)
-  (let ((got (jolt-cv-wait-interruptibly "promise deref"
-                           (jolt-promise-mu p) (jolt-promise-cv p)
-                           (ms->timeout ms)
-               (lambda (timed-out?)
-                 (cond ((jolt-promise-delivered? p) #t)
-                       (timed-out? #f)
-                       (else jolt-cv-again))))))
+  (let ((got (or (jolt-promise-settled? p)
+                 (jolt-cv-wait-interruptibly "promise deref"
+                                             (jolt-promise-mu p) (jolt-promise-cv p)
+                                             (ms->timeout ms)
+                   (lambda (timed-out?)
+                     (cond ((jolt-promise-delivered? p) #t)
+                           (timed-out? #f)
+                           (else jolt-cv-again)))))))
     (if got (jolt-promise-value p) timeout-val)))
 
 ;; --- agents (async, per-agent serialized dispatch) --------------------------
