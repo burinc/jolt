@@ -131,6 +131,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while other redirections worked. The probe now counts down from above the
   payload and never leaves the object.
 
+- **A host-called seam no longer shows up in later stack traces.** The fns a
+  library registers with `__register-eq!`, `__register-hash!`, `__register-str!`
+  and the other value seams run inside the host's `=`, `hash` and `str` of any
+  value. A tail call in one stored the site of an erased frame that nothing
+  cleared on return, so the next error thrown from host code named the seam fn
+  as its innermost frame. With jolt-lang/time loaded, every nREPL error's trace
+  started with `jolt.time.impl/jt?`. The site is now put back when a seam fn
+  returns.
+
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search
