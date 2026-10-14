@@ -35,6 +35,19 @@ fetch_expr='(require (quote [jolt.mvn-http]))
               (println (str (:outcome r) (char 9) (:crypto libs) (char 9) (:ssl libs)
                             (char 9) (name (:outcome r)) ": " why)))'
 
+# lib_from_expected PATH: whether PATH lies under one of JOLT_HTTPS_EXPECT_LIBDIR's
+# ;-separated directories, either separator spelling.
+lib_from_expected () {
+  have="$(printf '%s\n' "$1" | tr '\\' '/')"
+  old_ifs=$IFS; IFS=';'
+  for alt in $JOLT_HTTPS_EXPECT_LIBDIR; do
+    want="$(printf '%s\n' "$alt" | tr '\\' '/')"
+    case "$have" in *"$want"*) IFS=$old_ifs; return 0 ;; esac
+  done
+  IFS=$old_ifs
+  return 1
+}
+
 # fetch URL -> tmp; assert the file is non-empty and its first line looks like a
 # Maven pom (<?xml ...> or <project ...>). $1 = label, $2 = url.
 check_pom () {
@@ -63,15 +76,16 @@ check_pom () {
     head -c 60 "$tmp"; echo
     fails=$((fails + 1)); rm -f "$tmp"; return
   fi
+  # JOLT_HTTPS_EXPECT_LIBDIR: ;-separated alternatives, since which directory
+  # Git for Windows uses depends on its version (ucrt64/bin from 2.56,
+  # mingw64/bin before).
   if [ -n "${JOLT_HTTPS_EXPECT_LIBDIR:-}" ]; then
-    want="$(printf '%s\n' "$JOLT_HTTPS_EXPECT_LIBDIR" | tr '\\' '/')"
     for lib in "$crypto" "$ssl"; do
-      case "$(printf '%s\n' "$lib" | tr '\\' '/')" in
-        *"$want"*) ;;
-        *) # printf: a backslash path must not be read as escapes by echo
-           printf '%s\n' "https-fetch: FAIL $label — $lib did not come from $JOLT_HTTPS_EXPECT_LIBDIR"
-           fails=$((fails + 1)); rm -f "$tmp"; return ;;
-      esac
+      if ! lib_from_expected "$lib"; then
+        # printf: a backslash path must not be read as escapes by echo
+        printf '%s\n' "https-fetch: FAIL $label — $lib did not come from $JOLT_HTTPS_EXPECT_LIBDIR"
+        fails=$((fails + 1)); rm -f "$tmp"; return
+      fi
     done
   fi
   printf '%s\n' "https-fetch: PASS $label ($(wc -c < "$tmp" | tr -d ' ') bytes; $crypto, $ssl)"
