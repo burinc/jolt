@@ -150,6 +150,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started with `jolt.time.impl/jt?`. The site is now put back when a seam fn
   returns.
 
+- **`jolt build` with a C++ `:static` archive loads on Linux.** The build
+  preloads the archives as one shared object so the app's natives resolve
+  while it compiles. That object did not depend on the C++ runtime, and the
+  build process has none, so the loader refused it on a C++ class's typeinfo
+  (`undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE`). On ELF the
+  object now links the project's `{:lib …}` natives (`stdc++`) as its own
+  dependencies. A lib with no shared form falls back to the old link.
+
 - **`jolt build` no longer fails on an `:optional` native's missing archive.**
   Every `:static` archive went to the linker, optional or not, so a project
   that declares an optional native with a `:static {:archive …}` and never
