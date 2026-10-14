@@ -1,18 +1,16 @@
 ;; chunk-append must cost O(1) amortized per item, not O(items-buffered).
 ;;
 ;; The chunk-builder API (clojure.core/chunk-buffer + chunk-append + chunk,
-;; jolt-chunkbuf in host/chez/java/natives-array.ss) buffered items as a plain
+;; jolt-chunkbuf in host/chez/natives-transduce.ss) buffered items as a plain
 ;; list re-copied per append ((append items (list x))), so filling a buffer of n
 ;; cost O(n^2) — and the cap argument was silently ignored. The fix stores a
 ;; vector + count (growing when appends outrun the declared cap), which also
 ;; makes cap mean something.
 ;;
 ;; Same judgment as read_scaling_test.clj: the SHAPE, in one run. Quadrupling
-;; the buffer size must not quadruple the per-item cost — linear lands near 4,
-;; quadratic near 16, only the in-process ratio is judged. Both arms run
-;; best-of-3 because the linear times are small (~ms) and a stray GC pause in
-;; one run must not decide the gate. Sealed-chunk contents are verified per
-;; build here, and the JVM-portable behavior rows live in the corpus
+;; the buffer size must not quadruple the per-item cost; only the in-process
+;; ratio of two balanced arms is judged (below). Sealed-chunk contents are
+;; verified per build here, and the JVM-portable behavior rows live in the corpus
 ;; ("chunk-builder API"); cap overflow (a jolt superset — the JVM throws) is
 ;; pinned in test/chez/unit.edn.
 
@@ -27,35 +25,51 @@
       (and (= (count c) n) (= (nth c 0) 0) (= (nth c (dec n)) (dec n))))))
 
 (defn- timed [f]
-  (let [t (System/currentTimeMillis)
-        v (f)]
-    [(- (System/currentTimeMillis) t) v]))
+  (let [t (System/nanoTime)]
+    (f)
+    (/ (- (System/nanoTime) t) 1e6)))
 
-(defn- best-of [k f]
-  (reduce min (map first (repeatedly k #(timed f)))))
+;; Best of 3 per arm, the samples ALTERNATING arms and each from a fresh
+;; collection, as hotpath_scaling_test.clj's judge-staged does, so a burst on a
+;; shared runner lands on both arms. Milliseconds from the nanosecond clock.
+(defn- best-pair [f1 f4]
+  (let [ps (doall (repeatedly 3 #(vector (do (System/gc) (timed f1))
+                                         (do (System/gc) (timed f4)))))]
+    [(max 0.05 (reduce min (map first ps))) (reduce min (map second ps))]))
 
-;; Small enough that the REGRESSED quadratic (~128M conses in the 4x arm)
-;; finishes and fails rather than hanging. The linear implementation runs both
-;; arms near the timer floor, where the (max 1) floor makes the ratio land well
-;; under the ceiling.
+;; The arms are balanced to the same wall time for a linear implementation, as
+;; hotpath_scaling_test.clj's judge-scaling: 4*reps builds of n1 against reps
+;; builds of 4*n1, so linear reads ~1 and quadratic ~4. A single build of 4000
+;; is ~0.06ms, which the millisecond clock this gate used read as 0 on both
+;; arms; repeated, each arm is ~1ms. Small enough that the REGRESSED quadratic
+;; (~128M conses per 4x build) still finishes and fails rather than hanging.
 (def ^:private n1 4000)
 (def ^:private factor 4)
-(def ^:private max-ratio 8.0)
+(def ^:private reps 4)
+(def ^:private max-ratio 2.0)
 
 (defn -main [& _]
   (when-not (and (build n1) (build (* factor n1)))
     (println "FAIL chunk-scaling: sealed chunk has wrong count or contents")
     (System/exit 1))
-  (let [t1 (max 1 (best-of 3 #(build n1)))
-        t4 (best-of 3 #(build (* factor n1)))
-        ratio (double (/ t4 t1))]
-    (println (format "chunk-scaling: %d appends %dms, %d appends %dms, ratio %.2f (linear ~%.1f, quadratic ~%.1f, ceiling %.1f)"
-                     n1 t1 (* factor n1) t4 ratio
-                     (double factor) (double (* factor factor)) max-ratio))
+  (let [report (fn [[t1 t4] note]
+                 (let [ratio (/ t4 t1)]
+                   (println (format "chunk-scaling: %dx%d appends %.2fms, %dx%d appends %.2fms, ratio %.2f (linear ~1.0, quadratic ~%.1f, ceiling %.1f)%s"
+                                    (* factor reps) n1 t1 reps (* factor n1) t4 ratio
+                                    (double factor) max-ratio note))
+                   ratio))
+        measure #(best-pair (fn [] (dotimes [_ (* factor reps)] (build n1)))
+                            (fn [] (dotimes [_ reps] (build (* factor n1)))))
+        m (measure)
+        ;; a miss is measured once more before it counts
+        ratio (if (<= (/ (second m) (first m)) max-ratio)
+                (report m "")
+                (do (report m " — over the ceiling, measuring again")
+                    (report (measure) "")))]
     (if (> ratio max-ratio)
       (do (println (str "FAIL chunk-scaling: chunk-append scaled worse than linearly in the buffer size. "
                         "na-chunk-append is re-copying the buffered items per append "
-                        "(jolt-chunkbuf in host/chez/java/natives-array.ss)."))
+                        "(jolt-chunkbuf in host/chez/natives-transduce.ss)."))
           (System/exit 1))
       (println "chunk-scaling: passed"))))
 

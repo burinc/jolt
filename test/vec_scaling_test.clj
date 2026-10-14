@@ -18,34 +18,62 @@
 
 (defn- vec-of [n] (into [] (range n)))
 
-(defn- timed-best
-  "Best of 5 batches of `reps` calls to f, in ms — the minimum is the least
-  noise-contaminated sample."
-  [reps f]
-  (reduce min
-          (for [_ (range 5)]
-            (let [t (System/currentTimeMillis)]
-              (dotimes [_ reps] (f))
-              (- (System/currentTimeMillis) t)))))
+(defn- timed [b f]
+  (let [t (System/nanoTime)]
+    (dotimes [_ b] (f))
+    (- (System/nanoTime) t)))
+
+;; Timed the way test/complexity_test.clj times its rows. A fixed rep count
+;; cannot serve both states: 15000 reps put the fixed arms at ~18ms, and put a
+;; regressed linear into at 20s and 84s per sample, so the regression this gate
+;; exists for took ~10 minutes to report. Instead each arm runs in batches
+;; sized to clear 1ms, its cost is its fastest batch (interference only ever
+;; slows one), the arms alternate order over 5 rounds that each start from a
+;; full collection, and a batch is nanosecond-timed.
+(defn- batch-size [f]
+  (loop [b 1]
+    (if (or (>= (timed b f) 1000000) (>= b 1048576)) b (recur (* 2 b)))))
+
+(defn- per-call-ns
+  "ns per call of the fastest b-call batch within a 20ms budget, at least five."
+  [b f]
+  (loop [spent 0 best Long/MAX_VALUE k 0]
+    (if (and (>= spent 20000000) (>= k 5))
+      (/ (double best) b)
+      (let [t (timed b f)]
+        (recur (+ spent t) (min best t) (inc k))))))
+
+(defn- best-pair [f1 f4]
+  (f1) (f4)
+  (let [b1 (batch-size f1) b4 (batch-size f4)]
+    (reduce (fn [[x1 x4] i]
+              (System/gc)
+              (if (even? i)
+                (let [y1 (per-call-ns b1 f1) y4 (per-call-ns b4 f4)] [(min x1 y1) (min x4 y4)])
+                (let [y4 (per-call-ns b4 f4) y1 (per-call-ns b1 f1)] [(min x1 y1) (min x4 y4)])))
+            [Double/MAX_VALUE Double/MAX_VALUE]
+            (range 5))))
 
 (def ^:private n1 50000)
 (def ^:private factor 4)
-;; enough calls that the structural op's batch sits above the ms-timer floor —
-;; at 1ms both sides clamp and the ratio measures nothing. 15000, not 5000:
-;; the catvec arms measured 6ms/4ms, the same sub-noise-floor size that made
-;; three sibling gates flake a hair over their ceilings on shared runners
-;; (allocating arms + one GC pause moves a small ratio). ~18ms/12ms now.
-(def ^:private reps 15000)
-
 ;; Logarithmic measures ~1 and a linear rebuild ~4, so the line goes between
 ;; them, with room for a loaded machine.
 (def ^:private max-ratio 2.5)
 
-(defn- judge [label t1 t4]
-  (let [t1 (max 1 t1)
-        ratio (double (/ t4 t1))]
-    (println (format "vec-scaling %s: %dms vs %dms (x%d size) ratio %.2f (ceiling %.1f)"
-                     label t1 t4 factor ratio max-ratio))
+(defn- report [label [t1 t4] note]
+  (let [ratio (/ t4 (max 1.0 t1))]
+    (println (format "vec-scaling %s: %.0fns vs %.0fns per call (x%d size) ratio %.2f (ceiling %.1f)%s"
+                     label t1 t4 factor ratio max-ratio note))
+    ratio))
+
+;; A miss is measured once more before it counts: a linear rebuild reads ~4
+;; on both measurements, a burst rarely spoils two in a row.
+(defn- judge [label f1 f4]
+  (let [m (best-pair f1 f4)
+        ratio (if (<= (/ (second m) (max 1.0 (first m))) max-ratio)
+                (report label m "")
+                (do (report label m " — over the ceiling, measuring again")
+                    (report label (best-pair f1 f4) "")))]
     (when (> ratio max-ratio)
       (println (str "FAIL vec-scaling: " label " scales with the vector size — "
                     "core is rebuilding element by element instead of using the "
@@ -64,15 +92,11 @@
       (println "FAIL vec-scaling: wrong values before any timing — fix that first")
       (System/exit 1))
     (into a1 b1) (into a4 b4)          ; warm both sizes
-    (judge "into vec+vec"
-           (timed-best reps #(into a1 b1))
-           (timed-best reps #(into a4 b4)))
+    (judge "into vec+vec" #(into a1 b1) #(into a4 b4))
     (let [s1 (quot n1 3) e1 (* 2 s1)
           s4 (quot (* factor n1) 3) e4 (* 2 s4)]
       (subvec a1 s1 e1) (subvec a4 s4 e4)
-      (judge "subvec"
-             (timed-best reps #(subvec a1 s1 e1))
-             (timed-best reps #(subvec a4 s4 e4))))
+      (judge "subvec" #(subvec a1 s1 e1) #(subvec a4 s4 e4)))
     (println "vec-scaling: passed")))
 
 (-main)

@@ -17,16 +17,22 @@
 ;; and does not depend on absolute timings, which differ per machine and flake
 ;; under parallel CI.
 ;;
-;; What is compared is THROUGHPUT over a fixed time budget, not the time for a
-;; fixed number of reps, because a fixed rep count cannot serve both ends of this
-;; gate at once. The ops here are ~40ns when correct and ~20ms when broken — a
-;; 500,000x spread. A rep count small enough to keep the BROKEN case from running
-;; for an hour leaves the correct one measuring tens of microseconds, which is
-;; under the noise floor of a shared CI runner: `rseq vector` failed on main at
-;; ratio 3.22 with both arms reading 0ms, on a build where rseq is O(1).
-;; Measuring how many ops fit in a budget instead makes every arm cost the same
-;; wall time whatever its speed, and the batch self-calibrates past the ~1us
-;; timer granularity, so neither end needs a hand-tuned constant.
+;; What is compared is THROUGHPUT, not the time for a fixed number of reps,
+;; because a fixed rep count cannot serve both ends of this gate at once. The
+;; ops here are ~40ns when correct and ~20ms when broken — a 500,000x spread. A
+;; rep count small enough to keep the BROKEN case from running for an hour
+;; leaves the correct one measuring tens of microseconds, which is under the
+;; noise floor of a shared CI runner: `rseq vector` failed on main at ratio 3.22
+;; with both arms reading 0ms, on a build where rseq is O(1). So each op is
+;; timed in batches sized to clear 1ms, and an arm spends the same wall time
+;; whatever its speed.
+;;
+;; An arm's rate is its FASTEST batch, not the mean over its budget.
+;; Interference — a neighbour's burst, a preemption, a collection — only ever
+;; makes a batch slower, so the minimum is the estimate of what the op costs.
+;; The mean took in every interrupt the budget overlapped, and a loaded runner
+;; read the write-few row 2.04 against 2.0 (fixed ~1.1) with the mean in place.
+;; A genuinely linear op is linear in every batch, so the minimum masks nothing.
 
 (ns complexity-test
   (:require [clojure.set]))
@@ -34,7 +40,7 @@
 (def ^:private n1 50000)
 (def ^:private n2 200000)
 (def ^:private max-ratio 2.0)
-(def ^:private budget-ns 30000000)        ; 30ms of measurement per arm
+(def ^:private budget-ns 20000000)        ; 20ms of batches per arm per round
 (def ^:private floor-ns   1000000)        ; a batch must clear 1ms to be timed
 
 (defn- timed [f]
@@ -53,51 +59,87 @@
       (recur (* 2 b)))))
 
 (defn- rate
-  "Operations per second, measured over at least budget-ns of wall time."
-  [f]
-  (let [b (batch-size f)]
-    (loop [n 0 elapsed 0]
-      (if (>= elapsed budget-ns)
-        (/ (* (double n) 1e9) (double (max 1 elapsed)))
-        (recur (+ n b) (+ elapsed (timed #(dotimes [_ b] (f)))))))))
+  "Operations per second of the fastest b-call batch run within budget-ns, and
+  of at least five batches: a broken op is one ~20ms batch, and the fastest of
+  two filters nothing."
+  [f b]
+  (loop [spent 0 best Long/MAX_VALUE k 0]
+    (if (and (>= spent budget-ns) (>= k 5))
+      (/ (* (double b) 1e9) (double (max 1 best)))
+      (let [t (timed #(dotimes [_ b] (f)))]
+        (recur (+ spent t) (min best t) (inc k))))))
 
-(def ^:private rounds 3)
+(def ^:private rounds 5)
 
 (defn- paired
-  "Measure both arms in the SAME round, k times, and keep the round whose ratio
-  is smallest — that is, the least contaminated pairing. Returns [ratio r1 r4].
+  "Measure both arms in alternation, `rounds` rounds of each, and judge each
+  arm by its fastest batch over all of them. Returns [ratio r1 r4].
 
-  Measuring the arms separately and dividing their bests is not equivalent, and
-  the difference is not academic: the two bests can come from different moments,
-  and a loaded runner does not slow the arms equally. The 4n arm holds a working
-  set four times larger, so it loses more to cache pressure and to GC — one CI
-  run read n only 1.2x slower than a quiet machine while 4n was 2.2x slower, and
-  the row failed at 2.15 against a 2.0 ceiling on a build where the operation is
-  flat. Pairing cancels whatever both arms share in a round; what survives is the
-  part that scales with n, which is the whole question. A genuinely linear
-  operation still reads ~4.0 in every round, so nothing is masked."
+  The arms run in the SAME rounds, back to back, so a loaded stretch of a shared
+  runner lands on both, and they swap order every round, so neither always runs
+  first (the first arm of a round read systematically slower: 0.55-0.67 on rows
+  whose two arms do identical work). Each round starts from a full collection,
+  so a collection owed by the previous row or round is not billed to whichever
+  arm trips it. Batch sizes are fixed once per arm.
+
+  This used to keep the round with the smallest ratio, which cancels what both
+  arms share within a round — but it can only ever err toward PASSING, and
+  under load it does: with every core busy, the linear control row below read
+  0.14 and 0.73 that way (one round's n arm starved for its whole budget, the 4n
+  arm not), and a regressed catvec in test/chez/rrb-scaling-test.ss read 1.45.
+  The fastest batch per arm needs only one clean batch per arm in ~50, which a
+  loaded machine still yields, and a linear op is linear in every batch."
   [f1 f4]
   (f1) (f4)                               ; warm both
-  (reduce (fn [a b] (if (< (first b) (first a)) b a))
-          (map (fn [_]
-                 (let [r1 (rate f1)
-                       r4 (rate f4)]
-                   [(/ r1 (max 1.0 r4)) r1 r4]))
-               (range rounds))))
+  (let [b1 (batch-size f1) b4 (batch-size f4)
+        [r1 r4] (reduce (fn [[x1 x4] i]
+                          (System/gc)
+                          (if (even? i)
+                            (let [y1 (rate f1 b1) y4 (rate f4 b4)] [(max x1 y1) (max x4 y4)])
+                            (let [y4 (rate f4 b4) y1 (rate f1 b1)] [(max x1 y1) (max x4 y4)])))
+                        [0.0 0.0]
+                        (range rounds))]
+    [(/ r1 (max 1.0 r4)) r1 r4]))
 
 (def ^:private failures (atom 0))
 
-;; Takes the two arms as THUNKS, not as rates: the pairing above is the point,
-;; and a caller that measured them itself could hand over two numbers from
-;; different moments without it being visible here.
+(defn- report [label [ratio r1 r4] note]
+  (println (format "complexity %-22s %10.0f ops/s at n, %10.0f at 4n, ratio %5.2f (flat ~1.0, linear ~4.0, ceiling %.1f)%s"
+                   label r1 r4 ratio max-ratio note)))
+
+;; Takes the two arms as THUNKS, not as rates: the alternation above is the
+;; point, and a caller that measured them itself could hand over two numbers
+;; from different moments without it being visible here.
+;;
+;; A miss is measured once more before it counts, as hotpath_scaling_test's
+;; judge-staged does. That costs no power: a linear op reads ~4.0 in every
+;; round of both measurements, while a burst long enough to spoil all five
+;; rounds of one rarely spoils the next five too.
 (defn- judge [label f1 f4 detail]
   ;; Rates, so the SLOWER arm is the smaller number and the ratio keeps the same
   ;; sense it always had: flat ~1.0, linear ~4.0.
-  (let [[ratio r1 r4] (paired f1 f4)]
-    (println (format "complexity %-22s %10.0f ops/s at n, %10.0f at 4n, ratio %5.2f (flat ~1.0, linear ~4.0, ceiling %.1f)"
-                     label r1 r4 ratio max-ratio))
-    (when (> ratio max-ratio)
+  (let [m (paired f1 f4)
+        m (if (<= (first m) max-ratio)
+            m
+            (do (report label m " — over the ceiling, measuring again")
+                (paired f1 f4)))]
+    (report label m "")
+    (when (> (first m) max-ratio)
       (println (str "FAIL complexity " label ": " detail))
+      (swap! failures inc))))
+
+;; The harness's own power, checked every run: an op that IS linear must read
+;; over the ceiling. Every row below fails by turning linear, so if the
+;; estimator ever stopped seeing a linear op (a batch that stops scaling, a
+;; min that picks a broken sample) this row says so rather than every row
+;; passing vacuously. Re-measured on a miss, as judge is.
+(defn- judge-control [label f1 f4]
+  (let [m (paired f1 f4)
+        m (if (> (first m) max-ratio) m (paired f1 f4))]
+    (report label m " (control: must read OVER the ceiling)")
+    (when-not (> (first m) max-ratio)
+      (println (str "FAIL complexity " label ": a linear op read under the ceiling, so this "
+                    "harness cannot see the regressions the rows below exist to catch"))
       (swap! failures inc))))
 
 ;; A fn over a `case` of n string constants ("s0" -> 0 ...), default -1: the
@@ -146,6 +188,8 @@
                    (= (clojure.string/last-index-of src1 "(foo" (- (count src1) 1)) (- (count src1) 9)))
       (println "FAIL complexity: wrong values before timing")
       (System/exit 1))
+
+    (judge-control "control: reduce vector" #(reduce + v1) #(reduce + v2))
 
     ;; mapcat and (apply concat ...) hand back their LAST collection as it is, as
     ;; clojure.lang's concat does, instead of copying it one cell per element.
@@ -337,8 +381,14 @@
       ;; against the 2.0 ceiling; the arms are sized by TIME now. Then, still,
       ;; a loaded runner read 2.15, because the bigger arm loses more to a busy
       ;; machine than the smaller one and the arms were measured at different
-      ;; moments; `paired` above measures them together. Fixed sits ~1.1 (~0.8
-      ;; unloaded), broken ~4.0.
+      ;; moments; `paired` above measures them together. Then a loaded runner
+      ;; read 2.04 (PR #1350's CI, nothing touched transients), because an arm's
+      ;; rate was the mean over its budget and took in every interrupt; it is
+      ;; each arm's fastest batch now, over rounds that swap order. Fixed sits
+      ;; ~1.05-1.16. Broken by enode-freeze copying every hnode, it reads ~3.0
+      ;; (2.85 under the old mean): node count, not entry count, is what grows
+      ;; 50k -> 200k at this depth. Folding every entry back, as the hashtable
+      ;; transient did, read ~4.0.
       (judge "transient write-few"
              #(touch m1)
              #(touch m2)

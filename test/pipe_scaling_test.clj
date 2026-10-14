@@ -36,14 +36,18 @@
           (recur (+ total r) (if (= probe -2) (aget buf 0) probe)))))))
 
 (defn- timed [f]
-  (let [t (System/currentTimeMillis)
-        v (f)]
-    [(- (System/currentTimeMillis) t) v]))
+  (let [t (System/nanoTime)]
+    (f)
+    (/ (- (System/nanoTime) t) 1e6)))
 
-(defn- best-of
-  "Minimum elapsed over k runs — robust to a GC pause landing in one arm."
-  [k f]
-  (reduce min (map first (repeatedly k #(timed f)))))
+;; Best of 3 per arm, the samples ALTERNATING arms (hotpath_scaling_test.clj's
+;; judge-staged), so a burst on a shared runner lands on both arms rather than
+;; on the 4x arm's whole block. Three, not five, because a regressed quadratic
+;; 4x arm costs seconds per sample. No collection before each sample, unlike
+;; the sibling gates: here it moved the 4x arm from ~4.6 to 5.1-6.1.
+(defn- best-pair [f1 f4]
+  (let [ps (doall (repeatedly 3 #(vector (timed f1) (timed f4))))]
+    [(max 0.05 (reduce min (map first ps))) (reduce min (map second ps))]))
 
 ;; n1 is big enough that the linear implementation still measures above timer
 ;; noise (~10ms of writes+reads) and small enough that the REGRESSED quadratic
@@ -60,12 +64,20 @@
       (println (str "FAIL pipe-scaling: wrong bytes through the pipe — got "
                     [c1 p1] " and " [c4 p4]))
       (System/exit 1))
-    (let [t1 (max 1 (best-of 3 #(pump n1)))
-          t4 (best-of 3 #(pump (* factor n1)))
-          ratio (double (/ t4 t1))]
-      (println (format "pipe-scaling: %d chunks %dms, %d chunks %dms, ratio %.2f (linear ~%.1f, quadratic ~%.1f, ceiling %.1f)"
-                       n1 t1 (* factor n1) t4 ratio
-                       (double factor) (double (* factor factor)) max-ratio))
+    (let [report (fn [[t1 t4] note]
+                   (let [ratio (/ t4 t1)]
+                     (println (format "pipe-scaling: %d chunks %.2fms, %d chunks %.2fms, ratio %.2f (linear ~%.1f, quadratic ~%.1f, ceiling %.1f)%s"
+                                      n1 t1 (* factor n1) t4 ratio
+                                      (double factor) (double (* factor factor)) max-ratio note))
+                     ratio))
+          measure #(best-pair (fn [] (pump n1)) (fn [] (pump (* factor n1))))
+          m (measure)
+          ;; a miss is measured once more before it counts: quadratic reads
+          ;; ~16 both times, a burst rarely spoils two measurements in a row
+          ratio (if (<= (/ (second m) (first m)) max-ratio)
+                  (report m "")
+                  (do (report m " — over the ceiling, measuring again")
+                      (report (measure) "")))]
       (if (> ratio max-ratio)
         (do (println (str "FAIL pipe-scaling: piping scaled worse than linearly in the chunk count. "
                           "pipe-write! is re-copying the queued chunk list per write "
