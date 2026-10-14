@@ -93,6 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ClassCastException` carrying Chez's "make-flvector: -1 is not a valid
   flvector length" (or the fxvector, bytevector or vector constructor's).
 
+- **A program keeps running after its output's reader goes away (#1331).**
+  `jolt app | head -1`, or a backgrounded `jolt build` whose parent stopped
+  reading, died with "broken pipe" on its next print. As on the JVM, whose
+  `System.out` is a `PrintStream`, a write that fails is now dropped,
+  `checkError` answers true, and the program carries on. This applies to
+  stdout and stderr when they are not a terminal.
+
 - **The seed mint refuses a reference above its def.** `make remint` compiles
   each source form in a process that already holds the previous seed, so a
   `(binding [*x* …])` above `(def ^:dynamic *x* …)` failed on the first pass

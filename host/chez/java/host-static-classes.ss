@@ -378,7 +378,8 @@
          (bp (pw-byte-port port)))
     (and bp
          (begin (flush-output-port port)
-                (put-bytevector bp bv)
+                ;; past the textual port, so under its failure rule by hand
+                (jolt-process-stream-write port (lambda () (put-bytevector bp bv)))
                 #t))))
 ;; print / println / printf are PrintStream's, and System/out is a port-writer, so
 ;; ported code writing (.println System/out …) lands here. println with no argument
@@ -398,6 +399,12 @@
                           jolt-nil))
         (cons "flush" (lambda (self) (flush-output-port (port-writer-port self)) jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
+        ;; PrintStream/PrintWriter.checkError: flush, then whether the stream has
+        ;; failed — only a process stream can, the others raise
+        (cons "checkError" (lambda (self)
+                             (let ((p (port-writer-port self)))
+                               (flush-output-port p)
+                               (jolt-process-stream-failed? p))))
         (cons "toString" (lambda (self) ""))))
 (def-dynvar! "clojure.core" "*out*" (make-jhost "port-writer" (vector 'out)))
 (def-dynvar! "clojure.core" "*err*" (make-jhost "port-writer" (vector 'err)))

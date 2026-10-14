@@ -291,7 +291,7 @@ jobs:
       # (spawn, PushbackReader close, file: URLs, directory mtimes) through the
       # CLI on this runner's filesystem.
       - name: Gate the Windows path, PATH and process rows
-        run: make CHEZ=./chez-install/bin/chez winplatform winpath winparity
+        run: make CHEZ=./chez-install/bin/chez winplatform winpath winparity closedstdout
 
       # #1337: the flonum payload probe read bytes in front of 2.5, and with no
       # fault handler in a MinGW scheme.exe that killed the process at load

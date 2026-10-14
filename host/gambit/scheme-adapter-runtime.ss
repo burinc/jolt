@@ -650,6 +650,9 @@
 ;; ---- terminal tier (capability: terminal) -----------------------------------
 ;; No terminal on this target, the contract's permitted degradation: the
 ;; terminal is never claimed, and the REPL reads lines as it does from a pipe.
+;; (sa-make-output-port name put! put-some! flush! clear! close!) -> #f: no
+;; handler-backed ports here, so the process streams stay Gambit's own.
+(define (sa-make-output-port . _) #f)
 (define (sa-term-open) #f)
 (define (sa-term-closed . _) (error "sa-term: no terminal on this target"))
 (define sa-term-raw! sa-term-closed)

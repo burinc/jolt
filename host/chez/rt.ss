@@ -140,6 +140,141 @@
                         (sa-foreign-procedure-blocking name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
+;; --- the process's output streams ---------------------------------------------
+;; On the JVM, System.out and System.err are PrintStreams, and a PrintStream never
+;; throws: when the descriptor stops taking output (the reader of the pipe went
+;; away, the disk filled) the write fails quietly, checkError() starts answering
+;; true, and the program carries on. Chez's console ports raise instead, so
+;; `jolt app | head -1` died with "broken pipe" on its next print, and a
+;; backgrounded `jolt build` whose parent stopped reading died partway (#1331).
+;;
+;; So where stdout or stderr is not a terminal, jolt replaces Chez's console port
+;; with its own, at load, before anything captures (current-output-port). It
+;; behaves like the console port it replaces — one lock per write, output to the
+;; descriptor at each newline, explicit flushes reaching it — and a failure is
+;; caught where the bytes leave: only a write that can reach the descriptor (one
+;; with a newline, or one that does not fit the buffer) and a flush pay for the
+;; handler, so the common write costs what it did. After the first failure the
+;; stream drops everything written to it. A terminal keeps Chez's port: it cannot
+;; fail this way, and the REPL's line editor works with that port.
+(define jolt-c-isatty
+  (and (not (eq? (sa-os-family) 'windows))
+       (jolt-foreign-proc-safe "isatty" '(int) 'int)))
+;; Is descriptor FD (1 or 2) a terminal? #t when it cannot tell, which keeps the
+;; port the process started with. Windows asks the standard handle rather than
+;; the C runtime's descriptor table, whose owner is whichever CRT answers.
+(define (jolt-std-fd-terminal? fd)
+  (guard (e (#t #t))
+    (if (eq? (sa-os-family) 'windows)
+        (begin
+          (sa-load-shared-object "kernel32.dll")
+          (let ((get-std (sa-foreign-procedure-runtime "GetStdHandle" '(int) 'void* #f))
+                (file-type (sa-foreign-procedure-runtime "GetFileType" '(void*) 'unsigned-32 #f)))
+            ;; FILE_TYPE_CHAR: a console, or a device such as NUL
+            (= 2 (file-type (get-std (if (= fd 1) -11 -12))))))
+        (if jolt-c-isatty (= 1 (jolt-c-isatty fd)) #t))))
+;; (jolt-swallow-io on-fail body ...): BODY's value, or (ON-FAIL) when BODY
+;; raises an i/o error; anything else propagates. The light form of R6RS guard —
+;; a one-shot escape rather than a full continuation — since a line written to a
+;; process stream pays it on every newline.
+(define-syntax jolt-swallow-io
+  (syntax-rules ()
+    ((_ on-fail body ...)
+     (call/1cc
+       (lambda (k)
+         (with-exception-handler
+           (lambda (e) (if (i/o-error? e) (k (on-fail)) (raise e)))
+           (lambda () body ...)))))))
+;; A port over INNER (a block-buffered textual port on the descriptor) that never
+;; raises an i/o error. Answers the port, a thunk that says whether a write has
+;; failed, and one that marks it failed (the byte path writes past the port), or
+;; three #f where the adapter cannot build one.
+(define (jolt-make-failsafe-port name inner)
+  (let ((mu (make-mutex)) (failed? #f))
+    (define (fail!)
+      (set! failed? #t)
+      (guard (e (#t #f)) (clear-output-port inner)))
+    (define (flush-inner!)
+      (jolt-swallow-io fail! (flush-output-port inner)))
+    (define (put-some! s start count)
+      (unless failed?
+        (let ((end (fx+ start count)))
+          (let scan ((i start))
+            (cond
+              ((fx= i end)
+               (if (fx< (fx+ (textual-port-output-index inner) count) (textual-port-output-size inner))
+                   (put-string inner s start count)       ; fits: nothing reaches the descriptor
+                   (jolt-swallow-io fail! (put-string inner s start count))))
+              ((char=? (string-ref s i) #\newline)
+               (jolt-swallow-io fail!
+                 (put-string inner s start count)
+                 (flush-output-port inner)))
+              (else (scan (fx+ i 1))))))))
+    (define (put! c)
+      (unless failed?
+        (if (and (not (char=? c #\newline))
+                 (fx< (fx+ (textual-port-output-index inner) 1) (textual-port-output-size inner)))
+            (write-char c inner)
+            (jolt-swallow-io fail!
+              (write-char c inner)
+              (when (char=? c #\newline) (flush-output-port inner))))))
+    (let ((p (sa-make-output-port name
+               (lambda (c) (jolt-with-mutex mu (put! c)))
+               (lambda (s start count) (jolt-with-mutex mu (put-some! s start count)) count)
+               (lambda () (jolt-with-mutex mu (unless failed? (flush-inner!))))
+               (lambda () (jolt-with-mutex mu (clear-output-port inner)))
+               ;; a process stream is never really closed: close flushes, as
+               ;; Chez's console ports do
+               (lambda () (jolt-with-mutex mu (unless failed? (flush-inner!)))))))
+      (if p
+          (values p (lambda () failed?) (lambda () (jolt-with-mutex mu (fail!))))
+          (values #f #f #f)))))
+;; #(port failed? fail!) for each stream once installed, else #f
+(define jolt-stdout-failsafe #f)
+(define jolt-stderr-failsafe #f)
+(define (jolt-process-stream-cell port)
+  (cond ((and jolt-stdout-failsafe (eq? port (vector-ref jolt-stdout-failsafe 0))) jolt-stdout-failsafe)
+        ((and jolt-stderr-failsafe (eq? port (vector-ref jolt-stderr-failsafe 0))) jolt-stderr-failsafe)
+        (else #f)))
+;; Whether the process stream behind PORT has failed; #f for any other port.
+(define (jolt-process-stream-failed? port)
+  (let ((cell (jolt-process-stream-cell port)))
+    (and cell ((vector-ref cell 1)))))
+;; Run WRITE!, a write that goes to PORT's descriptor some other way (raw bytes),
+;; under the same rule: a process stream that has failed drops it, and one that
+;; fails now is marked. Any other port raises as before.
+(define (jolt-process-stream-write port write!)
+  (let ((cell (jolt-process-stream-cell port)))
+    (cond ((not cell) (write!))
+          (((vector-ref cell 1)) #f)
+          (else (jolt-swallow-io (vector-ref cell 2) (write!))))))
+(define (jolt-install-process-streams!)
+  (let* ((out0 (current-output-port))
+         (err0 (current-error-port))
+         (merged? (eq? out0 err0))       ; Chez found fd 1 and fd 2 the same file
+         (tx (current-transcoder)))
+    (define (install! name fd open set-port!)
+      (and (not (jolt-std-fd-terminal? fd))
+           (let-values (((p failed? fail!) (jolt-make-failsafe-port name (open (buffer-mode block) tx))))
+             (and p
+                  (begin
+                    (guard (e (#t #f)) (flush-output-port (if (= fd 1) out0 err0)))
+                    (set-port! p)
+                    (vector p failed? fail!))))))
+    (let ((out (install! "stdout" 1 standard-output-port
+                         (lambda (p) (current-output-port p) (console-output-port p)))))
+      (when out (set! jolt-stdout-failsafe out))
+      (cond
+        ((and merged? out)
+         (current-error-port (vector-ref out 0))
+         (console-error-port (vector-ref out 0))
+         (set! jolt-stderr-failsafe out))
+        ((not merged?)
+         (let ((err (install! "stderr" 2 standard-error-port
+                              (lambda (p) (current-error-port p) (console-error-port p)))))
+           (when err (set! jolt-stderr-failsafe err))))))))
+(jolt-install-process-streams!)
+
 ;; --- process-wide exit --------------------------------------------------------
 ;; System.exit halts the VM from ANY thread on the JVM. Chez's exit unwinds only
 ;; the CALLING thread, so off the main thread it was a silent no-op as far as the

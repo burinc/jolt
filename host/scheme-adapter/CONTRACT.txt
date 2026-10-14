@@ -162,6 +162,10 @@ system
 # sa-gc-install-after-rendezvous! and sa-current-stack-bytes may both answer #f
 # (no per-thread post-collection hook, or no cheap measure of a thread's
 # stack): the stack depth limit is then not enforced and reads back as none.
+# sa-make-output-port may answer #f (no handler-backed ports, or a Chez whose
+# port-handler record it has not been compared against): the process streams
+# then stay the target's own, and a write after their reader has gone away
+# raises instead of being dropped.
 sa-run-process
 sa-environment-pairs
 sa-os-release
@@ -184,6 +188,7 @@ sa-gc-install-after-collect!
 sa-gc-install-stall-watch!
 sa-gc-install-after-rendezvous!
 sa-current-stack-bytes
+sa-make-output-port
 #
 # tier: capability-introspect
 # OUR definitions in host/chez/scheme-adapter-runtime.ss for the blocklist's
