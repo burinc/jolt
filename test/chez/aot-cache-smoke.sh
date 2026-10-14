@@ -1066,6 +1066,63 @@ for ae_mode in truncate unmark; do
   rm -rf "$cache_ae"
 done
 
+# --- Phase 8: a cache the process cannot write --------------------------------
+# The cache is an optimisation, so a cache directory the process may not create
+# or write (a sandbox that denies ~/.jolt, a read-only mount) must cost the cache
+# and nothing else. A root that could not be created killed the process at its
+# first require ("mkdir: cannot create ..."), and so did a read-only generation
+# missing its v1 directory, on the first miss. Built binary, like (k): that is
+# what runs under a sandbox.
+ro_bin="target/release/jolt"
+if [ ! -x "$ro_bin" ]; then
+  echo "SKIP: (af)/(ag) need $ro_bin (make testbin)"
+else
+  ro="$(mktemp -d)"; mkdir -p "$ro/proj/src/mylib" "$ro/locked" "$ro/cache"
+  printf '(ns mylib.core)\n(defn answer [] 42)\n' > "$ro/proj/src/mylib/core.clj"
+  roprog="(require 'jolt.deps) (jolt.deps/add-deps {:deps {'mylib/mylib {:local/root \"$ro/proj\"}}}) (require 'mylib.core) (println (mylib.core/answer))"
+  rorun() {  # $1: cache dir. Prints the program's last line and its exit status.
+    rc=0
+    o="$(JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$1" JOLT_QUIET=1 JOLT_DEBUG=1 \
+      "$ro_bin" -e "$roprog" 2>"$ro/err")" || rc=$?
+    echo "$(echo "$o" | tail -1) $rc"
+  }
+  chmod 555 "$ro/locked"
+  if [ -w "$ro/locked" ]; then
+    echo "SKIP: (af)/(ag) chmod does not restrict this user (root?)"
+  else
+    # (af) the root cannot be created: the program runs with the cache off
+    af="$(rorun "$ro/locked/aot-cache")"
+    if [ "$af" = "42 0" ] && [ ! -e "$ro/locked/aot-cache" ] \
+       && grep -q 'cache off' "$ro/err"; then
+      echo "PASS: (af) uncreatable cache root: output=42, cache off"; pass=$((pass+1))
+    else
+      echo "FAIL: (af) uncreatable cache root: got '$af' (expected '42 0'); stderr:"
+      sed 's/^/  /' "$ro/err" | head -8; fails=$((fails+1))
+    fi
+    # (ag) a populated cache made read-only: a hit is still served, a miss
+    # (edited source) still runs, and so does a generation with no v1 at all
+    ag_cold="$(rorun "$ro/cache")"
+    chmod -R a-w "$ro/cache"
+    ag_hit="$(rorun "$ro/cache")"
+    if grep -q 'hit mylib.core' "$ro/err"; then ag_hit_seen=1; else ag_hit_seen=0; fi
+    printf '(ns mylib.core)\n(defn answer [] 43)\n' > "$ro/proj/src/mylib/core.clj"
+    ag_miss="$(rorun "$ro/cache")"
+    chmod -R u+w "$ro/cache"
+    for g in "$ro/cache"/*/; do rm -rf "${g}v1"; done
+    chmod -R a-w "$ro/cache"
+    ag_nov1="$(rorun "$ro/cache")"
+    if [ "$ag_cold" = "42 0" ] && [ "$ag_hit" = "42 0" ] && [ "$ag_hit_seen" = 1 ] \
+       && [ "$ag_miss" = "43 0" ] && [ "$ag_nov1" = "43 0" ]; then
+      echo "PASS: (ag) read-only cache: hit served, a miss and an empty generation still run"; pass=$((pass+1))
+    else
+      echo "FAIL: (ag) read-only cache: cold='$ag_cold' hit='$ag_hit' (seen=$ag_hit_seen) miss='$ag_miss' no-v1='$ag_nov1' (expected 42/42/43/43, status 0); last stderr:"
+      sed 's/^/  /' "$ro/err" | head -8; fails=$((fails+1))
+    fi
+  fi
+  chmod -R u+w "$ro"
+  rm -rf "$ro"
+fi
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 
