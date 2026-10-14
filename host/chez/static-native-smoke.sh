@@ -417,6 +417,24 @@ extern "C" int jolt_static_answer(void) { Shape *s = new Shape(); int n = s->sid
 EOF2
   c++ -fPIC -c "$work/shape.cpp" -o "$work/shape.o"
   ar rcs "$work/libshape.a" "$work/shape.o"
+  # The C++ runtime's name is the toolchain's: stdc++ (GNU), c++ (macOS, LLVM).
+  # Take the first one both links take: the binary's, which links a {:lib}
+  # statically off macOS (build.ss bld-one-static-link), and the preload's,
+  # which depends on its shared form. Termux has no static C++ runtime, so
+  # there is nothing for a :static {:lib} to name and the case is skipped.
+  printf 'int jolt_static_answer(void);\nint main(void) { return jolt_static_answer() != 42; }\n' > "$work/cxxmain.c"
+  cxxlib=
+  for l in stdc++ c++; do
+    if [ "$(uname -s)" = Darwin ]; then bin_l="-l$l"; else bin_l="-Wl,-Bstatic -l$l -Wl,-Bdynamic"; fi
+    if cc "$work/cxxmain.c" "$work/libshape.a" $bin_l -o "$work/cxxprobe" >/dev/null 2>&1 \
+       && cc -shared "$work/libshape.a" -l"$l" -o "$work/cxxprobe.so" >/dev/null 2>&1; then
+      cxxlib=$l; break
+    fi
+  done
+fi
+if [ -z "${cxxlib:-}" ]; then
+  echo "static-native smoke: skipped the C++ archive case (no c++, or no C++ runtime cc can link)"
+else
   cat > "$cxx/src/app/core.clj" <<'EOF2'
 (ns app.core
   (:require [jolt.ffi :as ffi]))
@@ -427,7 +445,7 @@ EOF2
   cat > "$cxx/deps.edn" <<EOF2
 {:paths ["src"]
  :jolt/native [{:name "shape" :static {:archive "$work/libshape.a"}}
-               {:name "cxx" :optional true :static {:darwin {:lib "c++"} :linux {:lib "stdc++"}}}]}
+               {:name "cxx" :optional true :static {:lib "$cxxlib"}}]}
 EOF2
   echo "static-native smoke: building (a C++ archive that needs the C++ runtime)"
   if ! (cd / && JOLT_PWD="$cxx" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
@@ -437,6 +455,31 @@ EOF2
   if [ "$got" != "answer: 42" ]; then
     echo "  FAIL: C++ static archive binary output mismatch"
     echo "--- got ----"; echo "$got"; exit 1
+  fi
+  # Beside a non-PIC archive the preload is rebuilt without it, and the C++
+  # archive still needs its runtime in that rebuild. Linux only, as above.
+  if [ "$(uname -s)" = Linux ] && cc -no-pie -E -x c /dev/null -o /dev/null 2>/dev/null; then
+    cat > "$work/nopic2.c" <<'EOF2'
+const char jolt_nopic2_data[] = "static";
+const char *jolt_nopic2(void) { return jolt_nopic2_data; }
+EOF2
+    cc -fno-pie -fno-PIC -c "$work/nopic2.c" -o "$work/nopic2.o"
+    ar rcs "$work/libnopic2.a" "$work/nopic2.o"
+    cat > "$cxx/deps.edn" <<EOF2
+{:paths ["src"]
+ :jolt/native [{:name "shape" :static {:archive "$work/libshape.a"}}
+               {:name "nopic2" :static {:archive "$work/libnopic2.a"}}
+               {:name "cxx" :optional true :static {:lib "$cxxlib"}}]}
+EOF2
+    echo "static-native smoke: building (a C++ archive beside a non-PIC one)"
+    if ! (cd / && JOLT_PWD="$cxx" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+      echo "  FAIL: jolt build with a C++ archive beside a non-PIC one exited non-zero"; cat "$work/build.log"; exit 1
+    fi
+    got="$(cd / && "$out" 2>&1)"
+    if [ "$got" != "answer: 42" ]; then
+      echo "  FAIL: C++ archive beside a non-PIC one: binary output mismatch"
+      echo "--- got ----"; echo "$got"; exit 1
+    fi
   fi
 fi
 

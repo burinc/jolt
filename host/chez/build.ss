@@ -1479,9 +1479,10 @@
              "  the binary). Compile it with -fPIC if the build itself has to call it.\n")))
 
 (define (bld-preload-static-natives! natives builddir)
+  (define all-libs (filter (lambda (f) (string=? (car f) "lib")) (bld-static-forms natives)))
   (let loop ((archives (map cadr (filter (lambda (f) (string=? (car f) "archive"))
                                          (bld-static-forms natives))))
-             (libs (filter (lambda (f) (string=? (car f) "lib")) (bld-static-forms natives))))
+             (libs all-libs))
     (unless (null? archives)
       (let* ((so (bld-preload-so builddir "native-static"))
              (log (string-append so ".log"))
@@ -1504,7 +1505,10 @@
              (when (null? not-pic)
                (bld-echo-log log) (bld-command-failed rc cmd))
              (for-each bld-warn-not-pic not-pic)
-             (loop (filter (lambda (a) (not (member a not-pic))) archives) libs)))
+             ;; the libs were dropped to get here (the retry above), but it was
+             ;; an archive that failed: the rest still need them, a C++ one for
+             ;; its runtime
+             (loop (filter (lambda (a) (not (member a not-pic))) archives) all-libs)))
           (else (bld-echo-log log) (bld-command-failed rc cmd)))))))
 
 (define (bld-one-static-link form)
