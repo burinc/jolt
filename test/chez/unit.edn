@@ -409,6 +409,11 @@
   ;; give answered 'full and alts reported the put as done, losing the value.
   ;; JVM, as above: [nil true 2 true 6].
   {:suite "core.async / alts put xform" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan 1 (map inc)) t (a/timeout 100)] (a/>!! c 1) (let [[v p] (a/alts!! [[c 2] t]) f (future (first (a/alts!! [[c 5]])))] [v (= p t) (a/<!! c) (deref f 2000 :hung) (a/<!! c)])))" :expected "[nil true 2 true 6]"}
+  ;; promise-chan takes a transducer, and a put after the first never waits,
+  ;; with a transducer as without one. The transducer used to be dropped (1, not
+  ;; 2), and a promise buffer with one counted as a full fixed buffer.
+  ;; JVM, as above: [true true :done true 2 2].
+  {:suite "core.async / promise-chan xform" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/promise-chan (map inc)) t (a/timeout 200)] [(a/offer! c 1) (a/offer! c 2) (deref (future (a/>!! c 3) :done) 1000 :blocked) (first (a/alts!! [[c 4] t])) (a/poll! c) (a/<!! c)]))" :expected "[true true :done true 2 2]"}
   ;; @ on a promise or future that has settled answers at once, even on a fiber
   ;; holding a lock, as a transducer's completion does inside close! from an
   ;; io-thread: it used to begin a wait, whose may-park check refused it.

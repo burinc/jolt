@@ -216,6 +216,7 @@
     ((dropping) (when (< (ac-qlen ch) (async-chan-cap ch)) (ac-qpush! ch (cons v #f))))
     ((sliding)  (when (>= (ac-qlen ch) (async-chan-cap ch)) (ac-qdrop-oldest! ch))
                 (ac-qpush! ch (cons v #f)))
+    ((promise)  (when (ac-qempty? ch) (ac-qpush! ch (cons v #f))))  ; first value stays
     (else       (ac-qpush! ch (cons v #f))))      ; fixed: caller ensured room
   (ac-notify! ch))
 
@@ -402,14 +403,15 @@
 ;; A transducer is a jolt fn (xform); (xform add-rf) yields the channel's reducing
 ;; fn. add-rf: 0-arg init, 1-arg completion, 2-arg step (enqueue the output). A
 ;; `reduced` step result closes the channel.
-;; Whether a put waits for room when the buffer is full: a fixed buffer's
-;; does. A dropping or sliding buffer never fills from a put's point of view,
-;; with or without a transducer; treating one with a transducer as fixed made
-;; (chan (sliding-buffer 1) xf) keep its OLDEST value, with each later put
-;; queued behind it, where the JVM slides.
+;; Whether a put waits for room when the buffer is full: only a fixed buffer's
+;; does. A dropping, sliding or promise buffer never fills from a put's point
+;; of view, with or without a transducer; treating one with a transducer as
+;; fixed made (chan (sliding-buffer 1) xf) keep its OLDEST value, with each
+;; later put queued behind it, where the JVM slides. Named positively so a new
+;; buffer kind is unbounded until it says otherwise.
 (define (ac-bounded? ch)
   (and (> (async-chan-cap ch) 0)
-       (not (memq (async-chan-kind ch) '(dropping sliding)))))
+       (eq? (async-chan-kind ch) 'fixed)))
 
 (define (ac-make-add-rf ch)
   (lambda args
@@ -1305,7 +1307,10 @@
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
 (cca-def! "chan" jolt-async-chan)
-(cca-def! "promise-chan" (lambda args (ac-make 1 'promise #f)))
+;; (promise-chan) | (promise-chan xform) | (promise-chan xform ex-handler): the
+;; transducer and handler go through chan, as on the JVM; they were dropped.
+(cca-def! "promise-chan"
+  (lambda args (apply jolt-async-chan (make-async-buffer 1 'promise) args)))
 (cca-def! "chan?" async-chan?)
 (cca-def! "buffer" jolt-async-buffer)
 (cca-def! "dropping-buffer" jolt-async-dropping-buffer)

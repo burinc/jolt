@@ -105,6 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nil, `>!!` blocked, and a taker got the oldest value rather than the
   newest. A put on a sliding or dropping buffer now never waits, with a
   transducer as without one, as on the JVM.
+- **`promise-chan` takes a transducer and an ex-handler.** Both were
+  dropped, so `(promise-chan (map inc))` delivered the value as put. A put
+  after the first never waits, with a transducer as without one.
 - **An `alts!`/`alts!!` put on a full buffered channel with a transducer
   waits.** It counted as ready because the channel had a transducer, so the
   put was reported done while the value was dropped, and a timeout in the
