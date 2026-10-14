@@ -254,48 +254,36 @@ check s3 "$(run '(let [p (java.io.PushbackInputStream. System/in)] (.unread p 12
 # tailed log or a device blocked until EOF. The JVM hands back a BufferedReader
 # over a FileReader; io-streams.ss now builds a char-reader over the file's port.
 #
-# The witness is a FIFO whose writer holds it open, writes one line, sleeps, then
-# writes another. A streaming reader returns the first line immediately; a
-# slurping one cannot return until the writer closes. The test cannot hang: if
-# the reader blocks, the writer finishes on its own and the assertion fails on
-# the elapsed time instead.
-#
-# The writer's open blocks until a reader opens, so the clock is anchored to the
-# reader and does not depend on how long jolt takes to start.
+# The witness is a FIFO whose writer holds it open after one line until the
+# reader says it has that line: jolt makes an ack file once .readLine returns,
+# and the writer then sends "line2" and closes. A streaming reader gets line1
+# while the writer still waits, so its next line is line2. A slurping one cannot
+# return line1 until the writer closes, which it does only after giving up on the
+# ack (20 s) with "gave-up" as its last line. No clock is read, so a loaded
+# machine moves nothing that is asserted; the 20 s only bounds the failing case.
 if command -v mkfifo >/dev/null 2>&1; then
   fifo_dir="$(mktemp -d)"
   fifo="$fifo_dir/pipe"
-  # elapsed_first_line <expr-building-the-reader>: ms until the first line lands.
-  elapsed_first_line() {
-    rm -f "$fifo"; mkfifo "$fifo"
-    ( exec 3> "$fifo"; printf 'line1\n' >&3; sleep 3; printf 'line2\n' >&3; exec 3>&- ) &
+  ack="$fifo_dir/ack"
+  # first_two_lines <expr-building-the-reader>: "<line> <line>" as read.
+  first_two_lines() {
+    rm -f "$fifo" "$ack"; mkfifo "$fifo"
+    ( exec 3> "$fifo"; printf 'line1\n' >&3
+      i=0; while [ ! -e "$ack" ] && [ "$i" -lt 200 ]; do sleep 0.1; i=$((i+1)); done
+      if [ -e "$ack" ]; then printf 'line2\n' >&3; else printf 'gave-up\n' >&3; fi ) &
     writer=$!
-    sleep 0.2
-    JOLT_QUIET=1 "$jolt" -e "(let [t0 (System/currentTimeMillis)
-                                   r  $1
-                                   l  (.readLine r)]
-                               (println (str l \" \" (- (System/currentTimeMillis) t0))))" \
+    JOLT_QUIET=1 "$jolt" -e "(let [r $1
+                                   l (.readLine r)]
+                               (spit \"$ack\" \"\")
+                               (println (str l \" \" (.readLine r))))" \
       </dev/null 2>/dev/null | tail -1
     wait "$writer" 2>/dev/null || true
   }
-  # "line1 <ms>" -- the line must be right AND must not have waited for the close.
-  got="$(elapsed_first_line "(clojure.java.io/reader \"$fifo\")")"
-  line="${got% *}"; ms="${got##* }"
-  check "io/reader path is incremental (line)" "$line" "line1"
-  if [ -n "$ms" ] && [ "$ms" -lt 1000 ] 2>/dev/null; then
-    check "io/reader path is incremental (no wait)" "ok" "ok"
-  else
-    check "io/reader path is incremental (no wait)" "waited ${ms}ms for a writer holding the pipe open 3s" "ok"
-  fi
+  check "io/reader path is incremental" \
+    "$(first_two_lines "(clojure.java.io/reader \"$fifo\")")" "line1 line2"
   # The same through io/file, which is the other door into the same arm.
-  got="$(elapsed_first_line "(clojure.java.io/reader (clojure.java.io/file \"$fifo\"))")"
-  line="${got% *}"; ms="${got##* }"
-  check "io/reader io/file is incremental (line)" "$line" "line1"
-  if [ -n "$ms" ] && [ "$ms" -lt 1000 ] 2>/dev/null; then
-    check "io/reader io/file is incremental (no wait)" "ok" "ok"
-  else
-    check "io/reader io/file is incremental (no wait)" "waited ${ms}ms" "ok"
-  fi
+  check "io/reader io/file is incremental" \
+    "$(first_two_lines "(clojure.java.io/reader (clojure.java.io/file \"$fifo\"))")" "line1 line2"
   rm -rf "$fifo_dir"
 fi
 

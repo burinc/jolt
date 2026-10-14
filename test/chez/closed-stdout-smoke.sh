@@ -60,19 +60,23 @@ expect "checkError is false on a healthy stream" \
   "$(jolt '(println "x") (println (.checkError System/out))' | tail -1 | tr -d '\r')" "false"
 
 # --- a line reaches the reader when it is written, not at exit ----------------
-# The program prints, waits 3 s, and prints again. The reader stamps both lines
-# as they arrive: held back until exit, they would arrive together. One run, so
-# a slow startup on a loaded machine moves both stamps and not the gap between.
-jolt '(println "early") (Thread/sleep 3000) (println "late")' | {
-  IFS= read -r line; t1="$(date +%s)"; IFS= read -r _late; t2="$(date +%s)"; cat >/dev/null
-  printf '%s %s' "$line" "$(( t2 - t1 ))" > "$dir/took"; }
-read -r first_line first_line_gap < "$dir/took"
-expect "the first line is the first println" "$(printf '%s' "$first_line" | tr -d '\r')" "early"
-if [ "$first_line_gap" -ge 2 ]; then
-  expect "the first line arrives without waiting for the sleep" "ok" "ok"
-else
-  expect "the first line arrives without waiting for the sleep" "${first_line_gap}s before the second (want >= 2s)" "ok"
-fi
+# The program prints a line and then waits for the reader to say it has it: the
+# reader makes a file once it reads the first line, and the program prints
+# "late" when it sees that file, or "held" if 20 s pass without it. Held back
+# until exit, the first line cannot reach the reader while the program waits, so
+# the program gives up and says so. Nothing here reads a clock, so a slow start
+# or a busy machine moves nothing that is asserted; the 20 s only bounds the
+# failing case.
+rm -f "$dir/ack"
+jolt '(println "early")
+(let [ack (java.io.File. "'"$jdir/ack"'") give-up (+ (System/nanoTime) 20000000000)]
+  (loop [] (cond (.exists ack) (println "late")
+                 (> (System/nanoTime) give-up) (println "held")
+                 :else (do (Thread/sleep 10) (recur)))))' | {
+  IFS= read -r line; : > "$dir/ack"; IFS= read -r second; cat >/dev/null
+  printf '%s\n%s\n' "$line" "$second" > "$dir/took"; }
+expect "the first line is the first println" "$(sed -n 1p "$dir/took" | tr -d '\r')" "early"
+expect "the first line arrives while the program is still running" "$(sed -n 2p "$dir/took" | tr -d '\r')" "late"
 
 # --- stdout and stderr into one file keep their order ------------------------
 jolt '(println "o1") (binding [*out* *err*] (println "e1")) (println "o2") (.println System/err "e2") (println "o3")' >"$dir/both.txt" 2>&1

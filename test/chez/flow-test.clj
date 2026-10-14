@@ -24,6 +24,20 @@
        (when-not (= g# w#)
          (swap! failures conj (str ~label ": want " (pr-str w#) " got " (pr-str g#)))))))
 
+;; Wait for the event a check is about instead of sleeping a fixed time and
+;; hoping it has happened: poll until (pred) is truthy or cap-ms has passed, and
+;; answer its last value. A pass returns as soon as the event lands; the cap is
+;; only there so a lost message or a process that never runs fails the check
+;; rather than hanging the gate, so it is generous -- a loaded machine delays an
+;; event by tens of ms, a regression delays it forever.
+(defn await-until [cap-ms pred]
+  (let [deadline (+ (System/nanoTime) (* cap-ms 1000000))]
+    (loop []
+      (or (pred)
+          (if (>= (System/nanoTime) deadline)
+            (pred)
+            (do (Thread/sleep 5) (recur)))))))
+
 ;; --- the j.u.c seams --------------------------------------------------------
 
 (def pool (Executors/newCachedThreadPool))
@@ -39,13 +53,13 @@
 (check-eq "deref a submitted Future" @(.submit pool (fn [] 42)) 42)
 (check-eq "deref a FutureTask"
           (let [ft (FutureTask. (fn [] 7))] (.execute pool ft) @ft) 7)
-(check-eq "timed deref that completes" (deref (.submit pool (fn [] :v)) 2000 :timeout) :v)
+(check-eq "timed deref that completes" (deref (.submit pool (fn [] :v)) 10000 :timeout) :v)
 (check-eq "timed deref that expires"
-          (deref (.submit pool (fn [] (Thread/sleep 3000) :late)) 100 :timeout) :timeout)
+          (deref (.submit pool (fn [] (Thread/sleep 60000) :late)) 100 :timeout) :timeout)
 
 ;; a task's throw comes back as ExecutionException wrapping it (ASYNC-275)
 (check-eq "get wraps a throw in ExecutionException"
-          (try (.get (.submit pool (fn [] (throw (ex-info "boom" {})))) 2000 TimeUnit/MILLISECONDS)
+          (try (.get (.submit pool (fn [] (throw (ex-info "boom" {})))) 10000 TimeUnit/MILLISECONDS)
                :no-throw
                (catch ExecutionException e (ex-message (ex-cause e))))
           "boom")
@@ -77,13 +91,13 @@
           (let [p (promise)]
             (.execute (dispatch/executor-for :io)
                       (fn [] (deliver p (fib/in-fiber?))))
-            (deref p 2000 :timeout))
+            (deref p 10000 :timeout))
           true)
 (check-eq ":mixed runs its task on a thread, not a fiber"
           (let [p (promise)]
             (.execute (dispatch/executor-for :mixed)
                       (fn [] (deliver p (fib/in-fiber?))))
-            (deref p 2000 :timeout))
+            (deref p 10000 :timeout))
           false)
 
 ;; --- a flow, end to end -----------------------------------------------------
@@ -124,12 +138,14 @@
 (check-eq "start returns the report and error channels"
           (every? some? [(:report-chan chans) (:error-chan chans)]) true)
 (flow/resume g)
-(Thread/sleep 800)
 
-;; 3 throws, so 1 2 4 5 double through and 3 goes to the error channel
-(check-eq "messages flow through the graph" (sort @collected) [2 4 8 10])
+;; 3 throws, so 1 2 4 5 double through and 3 goes to the error channel. Any four
+;; that arrive are the answer: a wrong one (3 doubled, say) shows in the sort.
+(check-eq "messages flow through the graph"
+          (do (await-until 10000 #(<= 4 (count @collected))) (sort @collected))
+          [2 4 8 10])
 (check-eq "a throwing step reports on the error channel"
-          (let [[v _] (async/alts!! [(:error-chan chans) (async/timeout 500)])]
+          (let [[v _] (async/alts!! [(:error-chan chans) (async/timeout 10000)])]
             [(::flow/pid v) (ex-message (::flow/ex v))])
           [:dbl "boom on 3"])
 (check-eq "the process survived its step throwing"
@@ -146,13 +162,11 @@
 ;; inject returns a Future, which deref waits on
 (check-eq "inject puts a message on an input"
           (do @(flow/inject g [:dbl :in] [100])
-              (Thread/sleep 300)
-              (some #{200} @collected))
+              (await-until 10000 #(some #{200} @collected)))
           200)
 (check-eq "inject casts to a signal-selecting process"
           (do @(flow/inject g [::flow/cast :tick] [:ping])
-              (Thread/sleep 300)
-              (some #{[:tick :ping]} @collected))
+              (await-until 10000 #(some #{[:tick :ping]} @collected)))
           [:tick :ping])
 
 (check-eq "the flow datafies" (map? (clojure.datafy/datafy g)) true)
@@ -180,9 +194,12 @@
             :conns []})]
   (flow/start big)
   (flow/resume big)
-  (doseq [p pids] @(flow/inject big [p :in] [1]))
-  (Thread/sleep 2000)
-  (check-eq "200 :io processes all ran" (count @reached) n)
+  ;; not deref'd one by one: an inject that never runs would hang the gate there,
+  ;; and the count below is the answer either way
+  (doseq [p pids] (flow/inject big [p :in] [1]))
+  (check-eq "200 :io processes all ran"
+            (do (await-until 20000 #(= n (count @reached))) (count @reached))
+            n)
   (flow/stop big))
 
 (if (empty? @failures)
