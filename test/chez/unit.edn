@@ -404,6 +404,11 @@
   ;; value stayed, offer! answered nil after it and >!! blocked. Probed on JVM
   ;; Clojure 1.12.5 + core.async 1.8.741: [[true true true 4] [true true true 2] [:done 3]].
   {:suite "core.async / buffers" :expr "(do (require (quote [clojure.core.async :as a])) [(let [c (a/chan (a/sliding-buffer 1) (map inc))] [(a/offer! c 1) (a/offer! c 2) (a/offer! c 3) (a/poll! c)]) (let [c (a/chan (a/dropping-buffer 1) (map inc))] [(a/offer! c 1) (a/offer! c 2) (a/offer! c 3) (a/poll! c)]) (let [c (a/chan (a/sliding-buffer 1) (map inc))] [(deref (future (a/>!! c 1) (a/>!! c 2) :done) 2000 :blocked) (a/poll! c)])])" :expected "[[true true true 4] [true true true 2] [:done 3]]"}
+  ;; An alts put on a FULL fixed buffer with a transducer is not ready: it used
+  ;; to count as ready because the channel had a transducer, then the locked
+  ;; give answered 'full and alts reported the put as done, losing the value.
+  ;; JVM, as above: [nil true 2 true 6].
+  {:suite "core.async / alts put xform" :expr "(do (require (quote [clojure.core.async :as a])) (let [c (a/chan 1 (map inc)) t (a/timeout 100)] (a/>!! c 1) (let [[v p] (a/alts!! [[c 2] t]) f (future (first (a/alts!! [[c 5]])))] [v (= p t) (a/<!! c) (deref f 2000 :hung) (a/<!! c)])))" :expected "[nil true 2 true 6]"}
   ;; @ on a promise or future that has settled answers at once, even on a fiber
   ;; holding a lock, as a transducer's completion does inside close! from an
   ;; io-thread: it used to begin a wait, whose may-park check refused it.

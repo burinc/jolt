@@ -1229,7 +1229,11 @@
                                   (jolt-with-mutex (async-chan-mu ch)
                                     (let ((ready?
                                            (or (async-chan-closed? ch)
-                                               (async-chan-xrf ch)
+                                               ;; a full fixed buffer with a
+                                               ;; transducer still waits, as
+                                               ;; ac-try-give!/locked says
+                                               (and (async-chan-xrf ch)
+                                                    (not (ac-bounded? ch)))
                                                (memq (async-chan-kind ch) '(dropping sliding promise))
                                                (and (> (async-chan-cap ch) 0)
                                                     (< (ac-qlen ch) (async-chan-cap ch)))
@@ -1247,7 +1251,10 @@
                                          ;; give cannot return 'full here.
                                          (case (ac-try-give!/locked ch v)
                                            ((closed) (cons #f ch))
-                                           (else (cons #t ch))))
+                                           ((ok) (cons #t ch))
+                                           (else (jolt-throw
+                                                  (jolt-ex-info "alts put judged ready but the channel was full"
+                                                                (jolt-hash-map))))))
                                         (else 'lost))))))
                             (cond
                               ((eq? res 'registered) (reg-loop (fx+ j 1)))
