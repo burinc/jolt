@@ -339,6 +339,19 @@ sa-ufx>=?
 sa-ufx=?
 sa-uvector-ref
 sa-uvector-set!
+#   The flonum family, for the typed foreign-array copies (java/ffi.ss): an
+#   flvector element and an IEEE single or double in a bytevector at a byte
+#   offset. Same contract: on an index within the flvector and an offset whose
+#   element lies within the bytevector, each is the checked primitive. Beyond
+#   the bounds check, the unchecked single-float pair is what keeps a :float
+#   element from boxing a flonum on its way between the two (16 bytes an
+#   element through the checked pair at optimize-level 2).
+sa-uflvector-ref
+sa-uflvector-set!
+sa-ubytevector-ieee-single-native-ref
+sa-ubytevector-ieee-single-native-set!
+sa-ubytevector-ieee-double-native-ref
+sa-ubytevector-ieee-double-native-set!
 #   (sa-vector-copy-range! to at from start end) -> unspecified: copy FROM's
 #     elements start..end-1 into TO at index at, the R7RS vector-copy! shape.
 #     Chez's vector-copy! takes (from from-start to to-start count), so its

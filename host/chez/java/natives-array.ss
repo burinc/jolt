@@ -371,8 +371,15 @@
 ;; An init value the kind's unboxed backing cannot hold — a bignum for an
 ;; fxvector, anything non-numeric — starts the array boxed rather than raising:
 ;; same rule as promotion, decided once at construction.
+;; A negative length is the JVM's NegativeArraySizeException with the length as
+;; its message, as (double-array -1) raises there, rather than the Chez
+;; constructor's "-1 is not a valid flvector length" surfacing as a
+;; ClassCastException.
+(define (na-check-length n)
+  (when (< n 0) (throw-jvm 'NegativeArraySizeException (number->string n))))
 (define (na-make-backing n kind init)
   (let ((n (exact n)) (init (na-elem-of kind init)))
+    (na-check-length n)
     (cond ((na-fl-kind? kind) (make-flvector n init))
           ((na-fx-kind? kind) (if (fixnum? init) (make-fxvector n init) (make-vector n init)))
           ((eq? kind 'byte) (na-new-bytes n (na-byte-of init)))
@@ -416,6 +423,15 @@
   (let ((sv (jolt-array-vec src)) (dv (jolt-array-vec dst)))
     (cond
       ((and (bytevector? sv) (bytevector? dv)) (bytevector-copy! sv soff dv doff n))
+      ;; Two unboxed backings of one kind are a block move too: no element is
+      ;; converted between them, and flvector-copy! / fxvector-copy! handle an
+      ;; overlap as memmove does. Element by element through ja-ref/ja-set! a
+      ;; double cost ~15ns and a boxed flonum. Different kinds (a long-array
+      ;; into an int-array) still take the walk, which narrows.
+      ((and (flvector? sv) (flvector? dv) (eq? (jolt-array-kind src) (jolt-array-kind dst)))
+       (flvector-copy! sv soff dv doff n))
+      ((and (fxvector? sv) (fxvector? dv) (eq? (jolt-array-kind src) (jolt-array-kind dst)))
+       (fxvector-copy! sv soff dv doff n))
       ;; string-copy! is specified to act as if through a temporary, so an
       ;; overlapping region inside one char array is correct without the
       ;; descending walk below — the same reason the bytevector arm is here.
@@ -528,7 +544,7 @@
 ;; A nil init seqs to nothing, which lands on an all-default array: that is the
 ;; JVM's answer too (RT.seq(null) is null, so its fill loop runs zero times).
 (define (na-init-prefix-backing n kind init default)
-  (let* ((n (exact n))
+  (let* ((n (let ((n (exact n))) (na-check-length n) n))
          (taken (let loop ((i 0) (l (seq->list (jolt-seq init))) (acc '()))
                   (if (or (fx=? i n) (null? l))
                       (reverse acc)
@@ -691,7 +707,7 @@
     (let build ((kind kind) (dims dims))
       (if (null? (cdr dims))
           (make-jolt-array (na-make-backing (exact (na-idx (car dims))) kind (na-zero-of kind)) kind)
-          (let* ((n (exact (na-idx (car dims)))) (v (make-vector n)))
+          (let* ((n (exact (na-idx (car dims)))) (v (begin (na-check-length n) (make-vector n))))
             (do ((i 0 (fx+ i 1))) ((fx=? i n))
               (vector-set! v i (build kind (cdr dims))))
             (make-jolt-array v (let wrap ((k kind) (n (length (cdr dims))))

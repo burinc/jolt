@@ -187,6 +187,11 @@
 ;;   sa-uvector-ref sa-uvector-set!       UNIMPLEMENTED  Guile: vector-ref /
 ;;                                        vector-set! (degradation), or the
 ;;                                        unchecked accessors when the port is tuned.
+;;   sa-uflvector-ref sa-uflvector-set!   UNIMPLEMENTED  Guile: f64vector-ref /
+;;                                        f64vector-set! (SRFI 4) as the degradation.
+;;   sa-ubytevector-ieee-{single,double}-native-{ref,set!}
+;;                                        UNIMPLEMENTED  Guile: the R6RS
+;;                                        bytevector-ieee-*-native accessors.
 ;;   sa-vector-copy-range!                UNIMPLEMENTED  Guile: R7RS vector-copy!
 ;;                                        has the contract's argument order.
 ;;   sa-vector-copy                       UNIMPLEMENTED  Guile: vector-copy.

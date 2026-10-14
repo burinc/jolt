@@ -1775,6 +1775,16 @@
 (define-syntax sa-ufx=? (syntax-rules () ((_ a b) (#3%fx=? a b))))
 (define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (#3%vector-ref v i))))
 (define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (#3%vector-set! v i x))))
+(define-syntax sa-uflvector-ref (syntax-rules () ((_ v i) (#3%flvector-ref v i))))
+(define-syntax sa-uflvector-set! (syntax-rules () ((_ v i x) (#3%flvector-set! v i x))))
+(define-syntax sa-ubytevector-ieee-single-native-ref
+  (syntax-rules () ((_ bv at) (#3%bytevector-ieee-single-native-ref bv at))))
+(define-syntax sa-ubytevector-ieee-single-native-set!
+  (syntax-rules () ((_ bv at x) (#3%bytevector-ieee-single-native-set! bv at x))))
+(define-syntax sa-ubytevector-ieee-double-native-ref
+  (syntax-rules () ((_ bv at) (#3%bytevector-ieee-double-native-ref bv at))))
+(define-syntax sa-ubytevector-ieee-double-native-set!
+  (syntax-rules () ((_ bv at x) (#3%bytevector-ieee-double-native-set! bv at x))))
 ;; (sa-vector-copy-range! to at from start end): the R7RS shape over Chez's
 ;; (vector-copy! from from-start to to-start count).
 (define (sa-vector-copy-range! to at from start end)

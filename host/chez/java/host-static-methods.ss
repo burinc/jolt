@@ -405,7 +405,7 @@
       (jolt-throw (jolt-host-throwable "java.lang.ArrayIndexOutOfBoundsException"
                                        "arraycopy: last source index out of bounds")))
     ;; ja-copy-range! (natives-array.ss) owns the move: a block copy between two
-    ;; bytevector backings, and the descending walk when the regions overlap
+    ;; bytevector, flvector or fxvector backings, and the descending walk when the regions overlap
     ;; forwards inside one array — which is what gives the JVM's "as if the source
     ;; were copied to a temporary first" without the temporary.
     (ja-copy-range! src sp dst dp n)
