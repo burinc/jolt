@@ -402,6 +402,15 @@
 ;; A transducer is a jolt fn (xform); (xform add-rf) yields the channel's reducing
 ;; fn. add-rf: 0-arg init, 1-arg completion, 2-arg step (enqueue the output). A
 ;; `reduced` step result closes the channel.
+;; Whether a put waits for room when the buffer is full: a fixed buffer's
+;; does. A dropping or sliding buffer never fills from a put's point of view,
+;; with or without a transducer; treating one with a transducer as fixed made
+;; (chan (sliding-buffer 1) xf) keep its OLDEST value, with each later put
+;; queued behind it, where the JVM slides.
+(define (ac-bounded? ch)
+  (and (> (async-chan-cap ch) 0)
+       (not (memq (async-chan-kind ch) '(dropping sliding)))))
+
 (define (ac-make-add-rf ch)
   (lambda args
     (cond ((null? args) ch)                                   ; init
@@ -474,7 +483,7 @@
     (cond
       ((async-chan-closed? ch) #f)
       ((async-chan-xrf ch)
-       (if (> (async-chan-cap ch) 0)
+       (if (ac-bounded? ch)
            ;; Fixed buffered with xform: wait for room, then apply xform.
            ;; The xform step may overfill transiently (e.g. mapcat); the NEXT put
            ;; will wait again.
@@ -487,7 +496,9 @@
                       #t))
                    ((ac-wait! ch intr? reg) => loop)
                    (else (jolt-interrupted-throw! ">!!"))))
-           ;; Unbuffered with xform: apply immediately (output goes to rendezvous queue)
+           ;; Unbuffered with xform: apply immediately (output goes to rendezvous
+           ;; queue). A dropping or sliding buffer too: ac-buf-give! drops or
+           ;; slides what the xform yields, so a put never waits.
            (let ((r (ac-xrf-apply ch v)))
              (when (jolt-reduced? r) (ac-close! ch))
              #t)))
@@ -616,7 +627,7 @@
   (async-check-put! v)
   (cond
     ((async-chan-closed? ch) 'closed)
-    ((async-chan-xrf ch) (if (and (> (async-chan-cap ch) 0)
+    ((async-chan-xrf ch) (if (and (ac-bounded? ch)
                             (>= (ac-qlen ch) (async-chan-cap ch)))
                        'full
                        (let ((r (ac-xrf-apply ch v)))
