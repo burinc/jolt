@@ -130,6 +130,9 @@
 ;; print fns that route through *out*
 ;;======================================================================
 
+;; -write is IPrettyWriter's method, defined below.
+(declare -write)
+
 (defn- print [& more]
   (-write *out* (apply print-str more)))
 
@@ -1215,6 +1218,8 @@
         (re-find #"[a-zA-Z]" (subs s i (inc i)))
         (str (subs s 0 i) (clojure.string/upper-case (subs s i (inc i))) (subs s (inc i)))
         :else (recur (inc i))))))
+
+(declare execute-sub-format)
 
 (defn- modify-case [transform params navigator offsets]
   (let [clause (first (:clauses params))

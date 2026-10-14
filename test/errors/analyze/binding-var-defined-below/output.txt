@@ -1,0 +1,9 @@
+error[analyze/unresolved-var]: Unable to resolve var: *later* in this context
+  --> ./test/errors/analyze/binding-var-defined-below/input.clj:4:3
+   |
+ 2 | 
+ 3 | (defn f []
+ 4 |   (binding [*later* 5] *later*))
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: raised while expanding the `binding` macro
+exit: 1

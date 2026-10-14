@@ -246,6 +246,43 @@
 (define (hc-current-ns ctx) (chez-actx-cns ctx))
 (define (hc-late-bind? ctx) #t)            ; Chez has no interpreter to punt to
 
+;; In-order visibility for the seed mint (bootstrap.ss). The mint compiles every
+;; source form in a process that already holds the PREVIOUS seed, so every var
+;; the seed defines is live before the walk reaches its def. Without a gate, a
+;; reference above its def -- (binding [*x* ...]) or a call, in the same file or
+;; a namespace walked later -- fails only on the first pass, where the old seed
+;; lacks the var, then resolves against the old seed on every later pass, so the
+;; fixpoint converges on code no in-order load could have compiled: the JVM's
+;; "Unable to resolve var", silently accepted. #f outside the mint; during it, a
+;; table of the "ns/name" keys the seed loads defined that the walk has not yet
+;; interned (hc-intern! at def analysis, or a top-level defmacro), each
+;; invisible until then. Vars the host runtime defines are never in it: they
+;; precede every form.
+(define hc-mint-unwalked #f)
+(define (hc-mint-gate! tbl) (set! hc-mint-unwalked tbl))
+(define (hc-mint-walked! ns nm)
+  (let ((t hc-mint-unwalked))
+    (when t (hashtable-delete! t (string-append ns "/" nm)))))
+;; A defmacro's expander runs only when a later form expands it, long after the
+;; seed has every tier loaded, so the core tiers let expander bodies name what a
+;; later tier defines (ns uses let, defn uses subvec); the mint lowers them with
+;; the gate off. Its own (clojure.core/fn …) head, which 00-syntax defines below
+;; its first macros, is covered by the same rule.
+(define (hc-mint-ungated thunk)
+  (let ((t hc-mint-unwalked))
+    (if t
+        (dynamic-wind
+          (lambda () (set! hc-mint-unwalked #f))
+          thunk
+          (lambda () (set! hc-mint-unwalked t)))
+        (thunk))))
+(define (hc-mint-visible c)
+  (let ((t hc-mint-unwalked))
+    (and c
+         (or (not t)
+             (not (hashtable-contains? t (string-append (var-cell-ns c) "/" (var-cell-name c)))))
+         c)))
+
 ;; Resolve a global symbol to its var cell against the compile ns then clojure.core
 ;; (a qualified ns wins). Shared by resolve-global / form-macro? / form-expand-1.
 ;; Normalizes the reader's unqualified-ns sentinel (#f / '() / jolt-nil) like
@@ -256,8 +293,16 @@
          (qualified (and sns (not (jolt-nil? sns)) (not (null? sns)) sns)))
     (if qualified
         ;; a qualified ns may be a require :as alias (s/split -> clojure.string/split)
-        (let ((target (or (chez-resolve-alias (chez-actx-cns ctx) qualified) qualified)))
-          (var-cell-lookup target nm))
+        (let* ((target (or (chez-resolve-alias (chez-actx-cns ctx) qualified) qualified))
+               (c (var-cell-lookup target nm)))
+          ;; a qualified miss is not an error -- the analyzer takes it for a
+          ;; late-bound host static -- so one the gate hides would compile to a
+          ;; call on a class named after the alias. Refuse it here instead.
+          (when (and c (not (hc-mint-visible c)))
+            (jolt-throw (jolt-ex-info (string-append "No such var: " qualified "/" nm
+                                                     " (its def is below this form)")
+                                      (jolt-hash-map))))
+          c)
         (or ;; an unqualified ns / in-ns is clojure.core's whatever the compile ns
             ;; maps, as in the JVM's Compiler.lookupVar: a file's ns form is read
             ;; in its REQUIRER's namespace, and sci.core (which excludes `ns` and
@@ -265,7 +310,7 @@
             ;; (ns ...) as a call to sci.core/ns.
             (and (or (string=? nm "ns") (string=? nm "in-ns"))
                  (var-cell-lookup "clojure.core" nm))
-            (let ((c (var-cell-lookup (chez-actx-cns ctx) nm)))
+            (let ((c (hc-mint-visible (var-cell-lookup (chez-actx-cns ctx) nm))))
               ;; an undefined forward-intern must not shadow a real referred
               ;; or clojure.core var — e.g. the compiler ns referencing `set`,
               ;; which late-binds (interns `jolt.backend-scheme/set` undefined)
@@ -286,14 +331,14 @@
                    c))
             ;; a :refer'd name resolves to its source ns
             (let ((ref (chez-resolve-refer (chez-actx-cns ctx) nm)))
-              (and ref (var-cell-lookup (car ref) (cdr ref))))
+              (and ref (hc-mint-visible (var-cell-lookup (car ref) (cdr ref)))))
             ;; clojure.core last — unless (:refer-clojure :exclude [nm]) or
             ;; ns-unmap took the name out of this ns. The JVM has no core
             ;; mapping to fall back on then, so a use ABOVE the ns's own
             ;; (defn nm …) is "Unable to resolve symbol", not clojure.core/nm
             ;; (jolt#1095). The same guard jsq-resolve-symbol applies.
             ;; Public vars only, as the JVM's refer maps them.
-            (chez-core-refer-cell (chez-actx-cns ctx) nm)))))
+            (hc-mint-visible (chez-core-refer-cell (chez-actx-cns ctx) nm))))))
 
 ;; Runtime macros: a defmacro is emitted into the prelude as a
 ;; def-var! of its cross-compiled expander fn plus (mark-macro! ns name), so the
@@ -623,7 +668,10 @@
       (var-table-cells))
     (list->cseq acc)))
 
-(define (hc-intern! ctx ns-name nm) (declare-var! ns-name nm) jolt-nil)
+(define (hc-intern! ctx ns-name nm)
+  (hc-mint-walked! ns-name nm)
+  (declare-var! ns-name nm)
+  jolt-nil)
 
 ;; --- syntax-quote lowering ---------------------------------------------------
 ;; Lowers a `form
