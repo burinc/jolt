@@ -932,16 +932,24 @@
 ;; like any other optional native, rather than handed to the linker, which fails
 ;; the whole build on the missing file: optional means the app runs without it,
 ;; and a tree that never built the optional archive is the common case.
-(defn- missing-optional-archive? [spec static]
+;; The same holds for a :static {:lib "name"}: the linker resolves -lname, and
+;; a host without that library fails the link just as surely. The build probes
+;; it (jolt.host/build-lib-links?, a try-link cached per lib) for optional specs
+;; only, so a build with no optional {:lib} native never runs the probe.
+(defn- unlinkable-optional-static? [spec static target target-pack]
   (and (:optional spec)
-       (= "archive" (first static))
-       (not (jolt.host/file-exists? (second static)))))
+       (case (first static)
+         "archive" (not (jolt.host/file-exists? (second static)))
+         "lib"     (not (jolt.host/build-lib-links? (nth static 1) (nth static 2)
+                                                    target target-pack))
+         false)))
 
-(defn- encode-natives [natives dynamic? base]
+(defn- encode-natives [natives dynamic? base target target-pack]
   (let [plat (current-platform)]
     (vec (for [spec natives]
            (let [static (and (not dynamic?) (static-link-spec spec plat base))
-                 static (when-not (missing-optional-archive? spec static) static)]
+                 static (when-not (unlinkable-optional-static? spec static target target-pack)
+                          static)]
              (cond
                (:process spec) ["process"]
                static          (into ["static"] static)
@@ -1038,7 +1046,9 @@
             ;; true}) keeps the old behavior — load a shared object at runtime.
             dynamic-natives? (boolean (or (some #{"--dynamic"} flag-args) (:dynamic-natives build)))
             natives (encode-natives (:natives resolved) dynamic-natives?
-                                    (or (:project-dir resolved) pdir))
+                                    (or (:project-dir resolved) pdir)
+                                    (:target opts)
+                                    (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK")))
             _ (report-runtime-natives! natives (:natives resolved) dynamic-natives?)
             ;; closed-world direct-linking is the release default: ON for release and
             ;; optimized (the throughput lever), OFF for --dev. --no-direct-link (or
