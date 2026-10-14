@@ -150,6 +150,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started with `jolt.time.impl/jt?`. The site is now put back when a seam fn
   returns.
 
+- **A failed file delete answers that it failed.** Deleting a file the process
+  cannot unlink, such as one in a read-only directory, reported success while
+  the file stayed on disk. `jolt.host/delete-file!` and
+  `java.io.File#delete` answered true where they should answer false, and
+  `clojure.java.io/delete-file` returned instead of throwing
+  `IOException "Couldn't delete ..."`. Without its `error?` argument, Chez's
+  `delete-file` answers `#f` on failure and raises nothing, and the host
+  threw that answer away. A directory delete was already right.
+  `clojure.java.io/delete-file` also answers what the JVM's does now: true
+  on success and the `silently` value on a quiet failure, not nil, and a
+  relative path deletes the file in the caller's directory rather than the
+  checkout's. A symbolic link, dangling or to a directory, is deleted itself
+  by all three, as `File#delete` does, where it used to stay on disk.
+
 - **A regex match late in a string no longer costs ~60 ns per preceding
   character (#1327).** A group-free pattern compiled to a DFA found the start of
   its match by re-running the anchored match at every position from the search
