@@ -707,14 +707,19 @@ else
   echo "    got \`$(printf '%s' "$dm_out" | tr '\n' '|')\`"
   fails=$((fails + 1))
 fi
-printf '(doto (Thread. (fn [] (Thread/sleep 5000) (println "DAEMON STILL ALIVE"))) (.setDaemon true) (.start))\n(println "main done")\n' > "$dm_dir/d.clj"
-dm_t0=$(date +%s)
+# Timed in milliseconds (date +%s is whole seconds, so "< 4" meant anywhere from
+# 3 to 4 s) against a daemon that sleeps 20 s: a run that waited for it takes
+# 20 s, one that did not takes well under a second, so a 10 s cap sits far from
+# both and a loaded machine slowing jolt's startup cannot reach it.
+printf '(doto (Thread. (fn [] (Thread/sleep 20000) (println "DAEMON STILL ALIVE"))) (.setDaemon true) (.start))\n(println "main done")\n' > "$dm_dir/d.clj"
+dm_now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+dm_t0=$(dm_now_ms)
 dm_out="$($jolt run "$dm_dir/d.clj" 2>&1)"
-dm_dt=$(( $(date +%s) - dm_t0 ))
-if [ "$dm_out" = "main done" ] && [ "$dm_dt" -lt 4 ]; then
+dm_dt=$(( $(dm_now_ms) - dm_t0 ))
+if [ "$dm_out" = "main done" ] && [ "$dm_dt" -lt 10000 ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: a daemon thread should not keep the process alive (took ${dm_dt}s, got \`$(printf '%s' "$dm_out" | tr '\n' '|')\`)"
+  echo "  FAIL: a daemon thread should not keep the process alive (took ${dm_dt}ms, got \`$(printf '%s' "$dm_out" | tr '\n' '|')\`)"
   fails=$((fails + 1))
 fi
 rm -rf "$dm_dir"
