@@ -1533,6 +1533,37 @@
              (string-append (if (> (string-length dir) 0) (string-append "-L" (bld-sh-quote dir) " ") "") "-Wl,-Bstatic -l" lib " -Wl,-Bdynamic"))))
       (else ""))))
 
+;; Does a ("lib" name libdir) static form resolve for the link that will use it?
+;; An :optional native given as :static {:lib …} is only handed to the linker
+;; when it does (jolt.main/encode-natives asks), so a host without the library
+;; builds and loads it at runtime instead of failing the whole link. The probe
+;; links a trivial program with the same fragment bld-one-static-link emits —
+;; -Bstatic included on ELF, so a lib with only a .so is a miss there too, as it
+;; would be in the real link. Cached per machine + lib + dir; only optional
+;; {:lib} natives ever reach it.
+(define bld-lib-probe-cache (make-hashtable string-hash string=?))
+(define (bld-static-lib-links? name dir)
+  (let ((key (string-append (bld-eff-machine) "\x0;" (bld-cc) "\x0;" name "\x0;" dir)))
+    (let ((hit (hashtable-ref bld-lib-probe-cache key 'none)))
+      (if (not (eq? hit 'none))
+          hit
+          (let ((ok (string=?
+                      "0"
+                      (bld-sh-capture
+                        (string-append
+                          "d=$(mktemp -d) && printf 'int main(void){return 0;}\\n' > \"$d/p.c\" && "
+                          (bld-cc) " " (bld-arch-flag) " \"$d/p.c\" "
+                          (bld-one-static-link (list "lib" name dir))
+                          " -o \"$d/p\" >/dev/null 2>&1; rc=$?; rm -rf \"$d\"; echo $rc")))))
+            (hashtable-set! bld-lib-probe-cache key ok)
+            ok)))))
+(def-var! "jolt.host" "build-lib-links?"
+  (lambda (name dir target target-pack)
+    (parameterize ((bld-target (if (string? target) target #f))
+                   (bld-target-pack (if (string? target-pack) target-pack #f)))
+      (bld-static-lib-links? (jolt-str-render-one name)
+                             (if (string? dir) dir "")))))
+
 ;; Walk an embed root recursively; return (resource-name . abspath) pairs, where
 ;; resource-name is the "/"-joined path under the root (what io/resource is asked for).
 (define (bld-walk-files root rel acc)

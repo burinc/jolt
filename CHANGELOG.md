@@ -116,6 +116,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `deref`, a free `tryLock`) no longer reads the clock, so those calls are
   ~40% cheaper.
 
+- **The Gambit host has the rest of the library value seams.**
+  `__register-compare!`, `__register-class!`, `__register-class-ctor!` and
+  `__register-class-statics!` were bound only on Chez, so a library that models
+  its own host values (jolt-lang/time) failed to load on Gambit at the first
+  one it called. They are bound there now, with Chez's semantics: values order
+  through the compare arm, answer `(class x)`, and dispatch a protocol extended
+  to a class their tags name.
+
+- **A protocol extended to a library's dotted class name dispatches when
+  another class shares its last segment.** `(extend-protocol P my.Shape …)`
+  for a class declared through `__register-class!` was filed under `Shape` as
+  soon as any modeled class or protocol interface named `Shape` existed, so a
+  value whose tags said `my.Shape` never found the method. A dotted name now
+  has to be modeled under that exact spelling to be shortened.
+
+- **A cache directory jolt cannot write no longer stops a program.** The first
+  require of a library namespace created the AOT cache generation and re-raised
+  a failed mkdir, so a process whose `~/.jolt/aot-cache` (or `JOLT_CACHE_DIR`)
+  could not be created — under a sandbox that denies writing `~/.jolt`, once
+  something had deleted the directory — died with "mkdir: cannot create …".
+  A read-only generation without its `v1` directory failed the same way on its
+  first miss. The cache is now off for that process, and namespaces compile in
+  memory as with `JOLT_AOT_CACHE=0` (`JOLT_DEBUG` says why). A cache that exists
+  but is read-only still serves its hits, and a miss runs without caching.
+
 - **`Thread/sleep` sleeps for what it is asked.** Since 0.8.21 a timed wait
   on a thread counted its timeout from the truncated millisecond, so it ran up
   to 1ms past its deadline, and `(Thread/sleep 1)` took 2.5ms. `(Thread/sleep
@@ -239,6 +264,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `clang: error: no such file or directory: '…/libfoo.a'`. An optional
   native whose archive is not on disk is now loaded at runtime like any other
   optional native, and the build's report of runtime-loaded natives names it.
+
+- **Nor on an `:optional` native whose `:static {:lib …}` does not resolve.**
+  The `-l` flag went to the linker unconditionally, so a host without the
+  library failed the whole build (`ld: library 'foo' not found`). The build
+  now try-links the flag for an optional native, once per library, and loads
+  the native at runtime when it does not resolve, with the same
+  "(optional)" line in the build's report. A build with no optional `{:lib}`
+  native runs no probe.
 
 - **A failed file delete answers that it failed.** Deleting a file the process
   cannot unlink, such as one in a read-only directory, reported success while
@@ -381,6 +414,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Starting a subprocess no longer starts a shell first.** Every
+  `ProcessBuilder.start` (and so `jolt.process`, `clojure.java.shell` and
+  babashka.process) ran `/bin/sh -c "cd DIR && exec PROG ARGS"`, and on macOS
+  that shell is bash, whose startup was most of the cost of a spawn: 5.4 ms
+  against 1.8 ms for the program alone. The program is now spawned directly,
+  as the JDK does, with the directory as a chdir file action and a merged
+  stderr as a dup2. 500 spawns of `sh -c 'echo $$'` went from 3.7 s and 3.3 s
+  of CPU to 2.1 s and 1.9 s. The shell is still used for a file redirect, for
+  a directory where `posix_spawn_file_actions_addchdir_np` is missing (glibc
+  before 2.29), and for a program that is not an ELF/Mach-O image or `#!`
+  script (an executable script with no `#!` line runs with `/bin/sh`, as on
+  the JVM). A program named without a path is looked up on jolt's own PATH,
+  as the JDK does, rather than on the child's. `JOLT_SPAWN_VIA_SHELL=1` keeps
+  the old path.
 - **`jolt.ffi/read-array` and `write-array` with a numeric type are 20 to 120
   times faster.** `(ffi/read-array p :double n)` read one element at a time,
   through a var call that converted the type keyword and unboxed the pointer at

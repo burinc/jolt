@@ -158,6 +158,35 @@
                       (lambda (x) (seam-invoke1 render x)))
     jolt-nil))
 
+(def-var! "clojure.core" "__register-compare!"
+  (lambda (pred handler)
+    (register-compare-arm! (lambda (a b) (jolt-truthy? (seam-invoke2 pred a b)))
+                           (lambda (a b) (seam-invoke2 handler a b)))
+    jolt-nil))
+
+;; (class x)/(type x) and protocol dispatch for a library's own values, the same
+;; contract as Chez's host-static-classes.ss: class-fn names the class, tags-fn
+;; lists the class/interface names value-host-tags feeds protocol dispatch.
+(define jt-user-value-tags-arms '())
+(let ((prev value-host-tags))
+  (set! value-host-tags
+    (lambda (obj)
+      (let loop ((as jt-user-value-tags-arms))
+        (cond ((null? as) (prev obj))
+              (((caar as) obj) ((cdar as) obj))
+              (else (loop (cdr as))))))))
+(define (jt-jolt-strs->list v)
+  (let loop ((s (jolt-seq v)) (acc '()))
+    (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
+(def-var! "clojure.core" "__register-class!"
+  (lambda (pred class-fn tags-fn)
+    (let ((p (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))))
+      (register-class-arm-checked! p (lambda (x) (seam-invoke1 class-fn x)))
+      (set! jt-user-value-tags-arms
+            (append jt-user-value-tags-arms
+                    (list (cons p (lambda (x) (jt-jolt-strs->list (seam-invoke1 tags-fn x))))))))
+    jolt-nil))
+
 ;; The library seam for instance?, the same contract as Chez's
 ;; (host-static-classes.ss, excluded here): each fn answers nil to pass, so ONE
 ;; arm asks them in order and passes when none decides. Registering each as its
@@ -187,6 +216,22 @@
 (def-var! "clojure.core" "__register-class-methods!"
   (lambda (tag members)
     (register-class-methods! tag members)
+    jolt-nil))
+
+;; The ctor and statics halves (host-static-classes.ss on Chez), into the same
+;; registries host-new and host-static-call read here. jolt/time/*.clj and
+;; jolt.socket call them at the top level. There is no library-provider registry
+;; on this boot, so a registration simply lands, as Chez's does when no provider
+;; has claimed the class.
+(def-var! "clojure.core" "__register-class-ctor!"
+  (lambda (name proc) (register-class-ctor! name proc) jolt-nil))
+(def-var! "clojure.core" "__register-class-statics!"
+  (lambda (name members)
+    (register-class-statics! name
+      (let loop ((s (jolt-seq members)) (acc '()))
+        (if (jolt-nil? s) acc
+            (let ((e (jolt-first s)))
+              (loop (jolt-seq (jolt-rest s)) (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
     jolt-nil))
 
 ;; ---- queries answer, they do not raise -------------------------------------
