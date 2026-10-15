@@ -3334,6 +3334,7 @@
   {:suite "numbers / promoting & unchecked aliases" :label "num passes a number through" :expected "5" :actual "(num 5)" :portability :common}
   {:suite "numbers / promoting & unchecked aliases" :label "num on a double" :expected "5.5" :actual "(num 5.5)" :portability :common}
   {:suite "numbers / promoting & unchecked aliases" :label "num throws on non-number" :expected :throws :actual "(num \"x\")" :portability :common}
+  {:suite "numbers / promoting & unchecked aliases" :label "num passes nil through" :expected "nil" :actual "(num nil)" :portability :common}
   {:suite "numbers / == numeric equality" :label "== single arg" :expected "true" :actual "(== :a)" :portability :common}
   {:suite "numbers / == numeric equality" :label "== equal" :expected "true" :actual "(== 2 2)" :portability :common}
   {:suite "numbers / == numeric equality" :label "== unequal" :expected "false" :actual "(== 2 3)" :portability :common}

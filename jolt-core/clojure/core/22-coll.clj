@@ -249,9 +249,10 @@
 ;; arbitrary-precision integers coincide.
 (defn int? [x] (integer? x))
 
-;; num: Clojure coerces to java.lang.Number; jolt just checks.
+;; num: Clojure casts to java.lang.Number; jolt just checks. A cast lets nil
+;; through, so this does too.
 (defn num [x]
-  (if (number? x) x (throw (ClassCastException. (str "num requires a number, got: " x)))))
+  (if (or (nil? x) (number? x)) x (throw (ClassCastException. (str "num requires a number, got: " x)))))
 
 ;; == numeric equality: 1-arity is trivially true without inspecting the value
 ;; (Clojure's shape); 2+ args must be numbers, as Numbers.equiv throws.

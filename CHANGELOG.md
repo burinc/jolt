@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte at a time; they move it as one block now. Draining 64 MB of a child's
   stdout went from about 2 s to 17 ms, and a `line-seq` over it costs what the
   same `line-seq` over stdin does.
+- **`(num nil)` answers nil** like Clojure, where `num` is a cast to
+  `Number`, instead of throwing `ClassCastException`.
 
 ## [0.8.22] - 2026-10-15
 
