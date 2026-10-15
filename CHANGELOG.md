@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.22] - 2026-10-15
+
+Regular expressions follow java.util.regex where they parted ways: a loop over
+a body that can match empty compiles and ends like the JDK's, alternation
+takes the first branch rather than the longest, and nested quantifiers the JDK
+runs in linear time no longer go exponential. `java.net` speaks IPv6, runaway
+recursion throws `StackOverflowError`, and a `Reader` over a pipe returns what
+has arrived instead of waiting for a full buffer. Starting a subprocess no
+longer starts a shell first. The rest is fixes from a review of the window:
+`FileWriter` char arrays, `Files/delete` failures, `PrintWriter` errors,
+`InetSocketAddress`, `bigint` of a double, and error traces.
+
 ### Added
+
+- **`SequenceInputStream`, `Collections/enumeration` and `Collections/list`.**
+  A `SequenceInputStream` over two streams or an `Enumeration` of them reads
+  each to its end and closes it, and reads after `close` are the end of input.
 
 - **IPv6 in `java.net`.** `InetAddress/getByName` and `getAllByName` take
   v6 literals, bracketed or not and with a `%zone`, and names that resolve to
@@ -24,9 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the heap, so a non-tail recursion that never ends used to allocate until
   the heap ceiling raised `OutOfMemoryError` (a minute and a half and ~18 GB
   later on a 64 GB machine) or, with no ceiling, until the kernel killed the
-  process. Each thread's stack now has a limit, 80% of the heap ceiling, or
-  with no ceiling (`JOLT_MAX_HEAP=off`) of `RLIMIT_AS`, else `RLIMIT_DATA`,
-  else physical RAM. Past it the recursion throws
+  process. Each thread's stack now has a limit, 80% of the heap ceiling (in
+  source mode, the ceiling a built program would get), or with the ceiling
+  off (`JOLT_MAX_HEAP=off`) of `RLIMIT_AS`, else `RLIMIT_DATA`, else physical
+  RAM. Past it the recursion throws
   `java.lang.StackOverflowError`, an `Error` that `(catch Exception e)` lets
   through, with a message naming the limit (the JVM's is nil). On the same
   machine the runaway now ends in `StackOverflowError` after ~38 s.
@@ -108,6 +125,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a loopback peer went from 1.7 s to 0.18 s.
 
 ### Fixed
+
+- **Locals and defs can be named after Scheme procedures.** A local named
+  `fx+`, `fx-` or `fx>` broke any `try`/`finally` in its scope, and `jolt
+  build` failed on a program defining `vector` or `fx+`, because the compiler
+  emitted those names bare and the user's binding shadowed them. Every name the
+  compiler emits bare is now renamed away from user bindings, and a gate keeps
+  the list complete.
+
+- **Regular expressions match as java.util.regex does.**
+  - A repetition over a body that can match empty compiles and ends when an
+    iteration consumes nothing: `(re-find #"(?:c?)*" "c")` threw
+    `invalid sre: empty *` and is `"c"`, and shapes such as `(?:.*?|a)+` that
+    used to loop forever return.
+  - Alternation takes the first branch that matches, not the longest:
+    `(re-find #"[ab]|c*.+" "bb")` was `"bb"` and is `"b"`; some lazy
+    quantifiers started a match too late.
+  - Nested quantifiers the JDK runs in linear time no longer take
+    exponential time: one pattern took 15 s on 32 characters and takes
+    milliseconds, as the JDK's loop remembers where another iteration
+    already failed.
+  - `(re-find #"[^a]|\s" "A")` was nil, a char set union having lost
+    members; `(re-seq #"(?s).*" "c")` lost its trailing `""`; a matcher's
+    second `find` reported the first match's start; and `(re-find #"|a" "a")`
+    is `""`.
+
+- **`Reader.read(char[])` returns what has arrived.** Over a pipe, a socket or
+  a terminal it waited until the buffer was full or the source closed; it now
+  blocks for the first character and returns what is there, as the JDK does,
+  in `PushbackReader` and a `BufferedReader` over a user `Reader` too. `ready`
+  answers from the reader's buffer and source instead of always `true`, and
+  `read(CharBuffer)` works. A reader in UTF-16, UTF-32 or an iconv charset
+  decodes as bytes arrive instead of reading its source to the end first;
+  `UTF-16BE`/`LE` keep a leading BOM, and malformed input becomes U+FFFD by
+  the JDK's rules instead of throwing.
+
+- **`pprint` and `(cl-format true ...)` print to a Writer bound to `*out*`**,
+  as on the JVM, instead of to stdout.
 
 - **`FileWriter` and `OutputStreamWriter` write `char[]` regions and
   `append` subsequences.** `(.write w buf 0 n)` wrote the text `#object[...]`
@@ -408,7 +462,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error's own, cut where the eval began; a reader error used to carry whatever
   the thread had run last (`jolt.nrepl/chunk-writer`, or a middleware fn).
   `evaluate` also returns `:ex`, `:err-msg`, `:ex-class` and `:root-ex-class`,
-  and `jolt.nrepl/err->msg` renders the `err` text, for middleware.
+  and `jolt.nrepl/err->msg` renders the `err` text, for middleware. A runtime
+  error in a top-level form names its own location rather than the session
+  worker that ran it (`nrepl.middleware.session/run-eval`).
 - **A stray closing delimiter is a read error in `load-string` and `-e`.**
   `(load-string "(+ 1 2))")` and `jolt -e '(+ 1 2))'` returned 3. They now run
   the forms before it and then raise "Unmatched delimiter: )", as the JVM
