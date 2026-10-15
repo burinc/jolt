@@ -1021,6 +1021,29 @@
           (cons "unmodifiableList" ident) (cons "unmodifiableSet" ident)
           (cons "emptyList" (lambda _ (jolt-vector))) (cons "emptyMap" (lambda _ (jolt-hash-map))))))
 
+;; Collections/enumeration: an Enumeration over a collection's elements, which
+;; enumeration-seq and SequenceInputStream drive. Collections/list drains any
+;; Enumeration (a StringTokenizer, a reify) into a fresh ArrayList. Running
+;; past the end is NoSuchElementException with no message, as the JDK's.
+(define (seq-enum-rest self) (vector-ref (jhost-state self) 0))
+(register-host-methods! "seq-enumeration"
+  (list (cons "hasMoreElements" (lambda (self) (not (jolt-nil? (seq-enum-rest self)))))
+        (cons "nextElement"
+              (lambda (self)
+                (let ((s (seq-enum-rest self)))
+                  (when (jolt-nil? s) (throw-jvm 'NoSuchElementException jolt-nil))
+                  (vector-set! (jhost-state self) 0 (jolt-next s))
+                  (jolt-first s))))))
+(register-class-statics! "java.util.Collections"
+  (list (cons "enumeration"
+              (lambda (c) (make-jhost "seq-enumeration" (vector (jolt-seq c)))))
+        (cons "list"
+              (lambda (e)
+                (let loop ((acc '()))
+                  (if (jolt-truthy? (record-method-dispatch e "hasMoreElements" jolt-nil))
+                      (loop (cons (record-method-dispatch e "nextElement" jolt-nil) acc))
+                      (make-arraylist (reverse acc))))))))
+
 ;; A mutable set over the same value-keyed hashtable (element -> #t).
 ;; Constructors: () | (capacity) [ignored] | (coll) [copy].
 (define (hs-hashset? x) (and (jhost? x) (string=? (jhost-tag x) "hashset")))
