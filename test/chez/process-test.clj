@@ -77,6 +77,29 @@
 (check-eq "check throws"
           (try (check (process ["false"])) :no-throw (catch Exception _ :threw)) :threw)
 
+;; every byte value through a child's pipes both ways, written from an offset into
+;; the source array and read into an offset of the destination, in chunks that
+;; straddle the port's 32 KB buffer: the pipe ports copy blocks between their
+;; foreign buffer and the bytevector, and an offset goes through a scratch
+(let [n 100000
+      src (byte-array (map #(unchecked-byte %) (range (+ n 7))))
+      p (.start (ProcessBuilder. ["cat"]))
+      w (future (with-open [out (.getOutputStream p)]
+                  (.write out src 7 50000)
+                  (.write out src 50007 (- n 50000))))
+      dst (byte-array (+ n 3))
+      got (with-open [in (.getInputStream p)]
+            (loop [off 3]
+              (let [r (.read in dst off (min 40000 (- (+ n 3) off)))]
+                (if (or (neg? r) (= off (+ n 3))) (- off 3) (recur (+ off r))))))]
+  @w
+  (.waitFor p)
+  (check-eq "binary pipe round trip count" got n)
+  (check-eq "binary pipe round trip bytes"
+            (= (seq (java.util.Arrays/copyOfRange dst 3 (+ n 3)))
+               (seq (java.util.Arrays/copyOfRange src 7 (+ n 7))))
+            true))
+
 ;; pipelines via threading and via pipeline
 (check-eq "pipe ->" (-> (process ["printf" "a\nb\nc\n"]) (process ["grep" "b"]) :out slurp) "b\n")
 (check-eq "pipeline count" (count (pipeline (-> (process ["echo" "x"]) (process ["cat"])))) 2)
