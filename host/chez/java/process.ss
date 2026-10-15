@@ -842,10 +842,37 @@
 (define (proc-fd-life-of port)
   (jolt-with-mutex proc-fd-lives-mutex (hashtable-ref proc-fd-lives port #f)))
 
+;; Moving a chunk between a port's foreign buffer and the bytevector Chez hands
+;; the port is one block copy each way. A byte at a time through sa-foreign-ref
+;; costs ~30 ns a byte, which made draining a child's stdout ~400x slower than
+;; reading the same file (ffi.ss's buffer I/O notes the same cost for sockets).
+;; The block copies start at index 0 of the bytevector, so a chunk bound for an
+;; offset goes through a scratch the port keeps for that; Chez fills its own
+;; buffer from 0, so the scratch is rarely made.
+(define (proc-scratch-copier)
+  (let ((scratch #f))
+    (lambda (n)
+      (unless (and scratch (fx>= (bytevector-length scratch) n))
+        (set! scratch (make-bytevector (max n proc-fd-buf-size))))
+      scratch)))
+(define (proc-buf->bv! buf bv start n scratch)
+  (if (fx= start 0)
+      (sa-foreign-bytes-ref! buf bv n)
+      (let ((tmp (scratch n)))
+        (sa-foreign-bytes-ref! buf tmp n)
+        (bytevector-copy! tmp 0 bv start n))))
+(define (proc-bv->buf! buf bv start n scratch)
+  (if (fx= start 0)
+      (sa-foreign-bytes-set! buf bv n)
+      (let ((tmp (scratch n)))
+        (bytevector-copy! bv start tmp 0 n)
+        (sa-foreign-bytes-set! buf tmp n))))
+
 (define (proc-fd-input-port fd)
   (proc-fd-collect-released!)
   (let* ((l (proc-fd-life-new fd))
-         (buf (proc-fd-life-buf l)))
+         (buf (proc-fd-life-buf l))
+         (scratch (proc-scratch-copier)))
     (proc-fd-register!
       (make-custom-binary-input-port
         (string-append "process-fd-" (number->string fd))
@@ -860,10 +887,7 @@
                       (let ((got (proc-c-read fd buf want)))
                         (cond
                           ((> got 0)
-                           (let loop ((i 0))
-                             (when (< i got)
-                               (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
-                               (loop (+ i 1))))
+                           (proc-buf->bv! buf bv start got scratch)
                            got)
                           ;; the write end is gone and nothing more can arrive: let
                           ;; go of the descriptor now (released when this read leaves)
@@ -884,6 +908,7 @@
   (proc-fd-collect-released!)
   (let* ((l (proc-fd-life-new fd))
          (buf (proc-fd-life-buf l))
+         (scratch (proc-scratch-copier))
          (shut-write (lambda () (error 'process "write to closed pipe" fd))))
     (proc-fd-register!
       (make-custom-binary-output-port
@@ -892,10 +917,7 @@
           (proc-fd-op l shut-write
             (lambda ()
               (let ((want (min n proc-fd-buf-size)))
-                (let loop ((i 0))
-                  (when (< i want)
-                    (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
-                    (loop (+ i 1))))
+                (proc-bv->buf! buf bv start want scratch)
                 (let retry ()
                   ;; the read side's twin, and the branch a fiber woken by a shut
                   ;; lands on
@@ -1751,7 +1773,8 @@
 (define (proc-win-input-port h)
   (proc-fd-collect-released!)
   (let*-values (((l nread) (proc-win-life h))
-                ((buf) (proc-fd-life-buf l)))
+                ((buf) (proc-fd-life-buf l))
+                ((scratch) (proc-scratch-copier)))
     (proc-fd-register!
       (make-custom-binary-input-port
         (string-append "process-handle-" (number->string h))
@@ -1768,10 +1791,7 @@
                   (if (or (= ok 0) (proc-fd-shut-now? l))
                       0
                       (let ((got (sa-foreign-ref 'unsigned-32 nread 0)))
-                        (let loop ((i 0))
-                          (when (< i got)
-                            (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
-                            (loop (+ i 1))))
+                        (proc-buf->bv! buf bv start got scratch)
                         got)))))))
         #f #f
         (lambda () (proc-fd-shut! l)))
@@ -1781,6 +1801,7 @@
   (proc-fd-collect-released!)
   (let*-values (((l nwrote) (proc-win-life h))
                 ((buf) (proc-fd-life-buf l))
+                ((scratch) (proc-scratch-copier))
                 ((shut-write) (lambda () (error 'process "write to closed pipe" h))))
     (proc-fd-register!
       (make-custom-binary-output-port
@@ -1789,10 +1810,7 @@
           (proc-fd-op l shut-write
             (lambda ()
               (let ((want (min n proc-fd-buf-size)))
-                (let loop ((i 0))
-                  (when (< i want)
-                    (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
-                    (loop (+ i 1))))
+                (proc-bv->buf! buf bv start want scratch)
                 (let ((ok ((proc-win-write-file) h buf want nwrote 0)))
                   (if (= ok 0)
                       (error 'process "write to child failed" h)

@@ -145,6 +145,15 @@
 ;;                      re-interned on every call. The reference is the same fn
 ;;                      built under a def, which always had one (2.38 -> 1.02).
 ;;
+;;   pipe-read          a child's stdout pipe copied each chunk out of its foreign
+;;   pipe-write         read buffer into the port's bytevector one byte at a time
+;;                      through sa-foreign-ref (and stdin the same way in), ~30 ns
+;;                      a byte: draining `cat` of a 64 MB file took 2 s against
+;;                      5 ms for the same file read directly, ~5x through a
+;;                      line-seq. The reference arm spawns the same child and
+;;                      reads (or writes) the same bytes through a file, so the
+;;                      ratio is the pipe transfer alone (read ~45 -> ~1).
+;;
 ;; Only the ratios are judged, never the absolute times — a slow shared runner
 ;; moves both arms together. Sampling follows io_scaling_test.clj: best-of-N
 ;; (minimum, not mean — interference only ever adds time), a ceiling, a
@@ -296,6 +305,46 @@
 (defn- slurp-many-small-by-path []
   (reduce (fn [a p] (+ a (count (slurp p)))) 0 small-paths))
 
+;; Through a child process: the pipe arms drain `cat FILE` from its stdout, and
+;; feed the same bytes to `cat > /dev/null` on its stdin. Each reference spawns
+;; the same program with the pipe out of the transfer (stdout discarded, stdin
+;; from the file) and moves the bytes through a FileInputStream/FileOutputStream,
+;; so spawning and waiting cancel and what is left is the pipe copy.
+(def ^:private pipe-path (str tmpdir "/jolt-fastpath-pipe.bin"))
+(def ^:private pipe-out-path (str tmpdir "/jolt-fastpath-pipe-out.bin"))
+(def ^:private pipe-bytes (* 8 1024 1024))
+(def ^:private pipe-payload (byte-array pipe-bytes (byte 65)))
+
+(defn- drain-stream [^java.io.InputStream in]
+  (let [buf (byte-array 65536)]
+    (loop [total 0]
+      (let [n (.read in buf)]
+        (if (neg? n) total (recur (+ total n)))))))
+
+(defn- spawn ^Process [cmd redirect-out?]
+  (let [pb (ProcessBuilder. ^java.util.List cmd)]
+    (when redirect-out? (.redirectOutput pb (java.io.File. "/dev/null")))
+    (.start pb)))
+
+(defn- pipe-read-arm []
+  (let [p (spawn ["cat" pipe-path] false)
+        n (with-open [in (.getInputStream p)] (drain-stream in))]
+    (.waitFor p)
+    n))
+(defn- pipe-read-ref []
+  (let [p (spawn ["cat" pipe-path] true)
+        n (with-open [in (java.io.FileInputStream. pipe-path)] (drain-stream in))]
+    (.waitFor p)
+    n))
+(defn- pipe-write-arm []
+  (let [p (spawn ["cat"] true)]
+    (with-open [out (.getOutputStream p)] (.write out ^bytes pipe-payload))
+    (.waitFor p)))
+(defn- pipe-write-ref []
+  (let [p (spawn ["cat" pipe-path] true)]
+    (with-open [out (java.io.FileOutputStream. pipe-out-path)] (.write out ^bytes pipe-payload))
+    (.waitFor p)))
+
 ;; a clean string at two lengths, for the trim scaling arm
 (def ^:private clean-short (apply str (repeat 64 "x")))
 (def ^:private clean-long (apply str (repeat (* 64 64) "x")))
@@ -349,6 +398,7 @@
   (spit src-path source-text)
   (spit data-path payload)
   (doseq [p small-paths] (spit p small-text))
+  (with-open [o (java.io.FileOutputStream. pipe-path)] (.write o ^bytes pipe-payload))
   (println "fastpath ratio gate")
 
   ;; Reading a form off a stream must cost about what reading it off a string
@@ -383,6 +433,13 @@
   ;; from one file. Guards per-file overhead — a scratch sized to the block
   ;; rather than the input, an eager buffer, a per-open allocation.
   (judge! "small-file-drain" slurp-many-small-by-path drain-many-small 4.0 9.0)
+
+  ;; Moving bytes through a child's pipe must cost about what moving them through
+  ;; a file costs, with the same child spawned on both sides.
+  (when-not (= pipe-bytes (pipe-read-arm))
+    (swap! failures conj "pipe-read: drained the wrong number of bytes"))
+  (judge! "pipe-read" pipe-read-ref pipe-read-arm 3.0 6.0)
+  (judge! "pipe-write" pipe-write-ref pipe-write-arm 3.0 6.0)
 
   ;; A char array is backed by a string, so building one from a string and
   ;; reading one back out are block moves — each must cost about what copying
@@ -480,6 +537,8 @@
   (.delete (java.io.File. src-path))
   (.delete (java.io.File. data-path))
   (doseq [p small-paths] (.delete (java.io.File. p)))
+  (.delete (java.io.File. pipe-path))
+  (.delete (java.io.File. pipe-out-path))
 
   (if (seq @failures)
     (do (println "\nFAIL — fast paths regressed:")
