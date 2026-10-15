@@ -493,23 +493,28 @@
 ;; surrogate code point, which the JDK hands back as a lone char, is U+FFFD
 ;; here: a Chez string cannot hold one.
 ;;
-;; A step is fast where the input is well formed: it scans for the longest
-;; run with nothing malformed in it and hands that to Chez's own
-;; utf16->string / utf32->string (with the byte order mandatory, so a FEFF in
-;; the middle stays a character). Only a malformed unit is decoded here, one
-;; U+FFFD at a time.
-(define jdec-fffd (string #\xFFFD))
-;; The text of PIECES (newest first) and NEXT, as a step answers them.
-(define (jdec-answer pieces next)
-  (values (if (and (pair? pieces) (null? (cdr pieces))) (car pieces) (apply string-append (reverse pieces)))
-          next))
-(define (jdec-run->string decode bv from to big?)
-  (let ((order (if big? (endianness big) (endianness little))))
-    (if (and (fx=? from 0) (fx=? to (bytevector-length bv)))
-        (decode bv order #t)                            ; all of it: no copy
-        (let ((slice (make-bytevector (fx- to from))))
-          (bytevector-copy! bv from slice 0 (fx- to from))
-          (decode slice order #t)))))
+;; Chez's own utf16->string and utf32->string already follow those rules
+;; (s/prims.ss: a high surrogate and a non-low unit are one U+FFFD over both,
+;; a lone low one or an out-of-range unit is one, a short tail at the end is
+;; one), so a step hands Chez every byte that is complete and holds back only
+;; a tail that later bytes could still complete. It used to scan each unit in
+;; Scheme for a malformed one first; that scan cost as much as the decode and
+;; made (String. bytes "UTF-32") 4x slower than handing the buffer over.
+;; The text of bv[from,to) in the order BIG?. The whole buffer goes over as it
+;; is. So does one whose only skipped prefix is a byte-order mark the decoder
+;; read at 0: Chez drops a leading mark itself when the order is not
+;; mandatory, and it is the same mark, so it cannot pick another order.
+;; Anything else is copied out first, as utf16->string takes no range.
+(define (jdec-run->string decode bv from to big? marked?)
+  (let ((order (if big? (endianness big) (endianness little)))
+        (n (bytevector-length bv)))
+    (cond ((fx=? from to) "")
+          ((and (fx=? from 0) (fx=? to n)) (decode bv order #t))
+          ((and marked? (fx=? to n)) (decode bv order #f))
+          (else
+           (let ((slice (make-bytevector (fx- to from))))
+             (bytevector-copy! bv from slice 0 (fx- to from))
+             (decode slice order #t))))))
 
 ;; UTF-16, UTF-16BE, UTF-16LE. Only "UTF-16" reads a byte-order mark, and only
 ;; at the start: it picks the order and is dropped. The BE and LE forms hand a
@@ -517,46 +522,32 @@
 (define (make-utf16-decoder cs)
   (let ((big? (not (string=? cs "utf-16le")))
         (sniff? (string=? cs "utf-16")))
-    (define (top bv i) (bytevector-u8-ref bv (if big? i (fx+ i 1))))
-    ;; where the well-formed run from I ends: at HI, at a lone surrogate, or at
-    ;; a high one whose low one is missing or not all here
-    (define (clean-end bv i hi)
-      (let scan ((i i))
-        (if (fx>? (fx+ i 2) hi)
-            i
-            (let ((t (top bv i)))
-              (cond ((or (fx<? t #xD8) (fx>? t #xDF)) (scan (fx+ i 2)))
-                    ((and (fx<=? t #xDB) (fx<=? (fx+ i 4) hi)
-                          (fx<=? #xDC (top bv (fx+ i 2)) #xDF))
-                     (scan (fx+ i 4)))
-                    (else i))))))
+    (define (high? bv i) (fx=? (fxand (bytevector-u8-ref bv (if big? i (fx+ i 1))) #xFC) #xD8))
+    ;; Where the text that is decidable now ends, short of HI: an odd byte is
+    ;; held, and so is a high surrogate whose next unit is not here yet. A
+    ;; high one followed by another high one is malformed as a PAIR, so
+    ;; whether the last high unit waits depends on the parity of the run of
+    ;; high units it ends: even, they all pair off among themselves.
+    (define (decidable-end bv lo hi)
+      (let ((c (fx- hi (fxand (fx- hi lo) 1))))
+        (let count ((i c) (k 0))
+          (if (and (fx>=? (fx- i 2) lo) (high? bv (fx- i 2)))
+              (count (fx- i 2) (fx+ k 1))
+              (if (fxodd? k) (fx- c 2) c)))))
     (define (step bv lo hi eof?)
+      (define marked? #f)
       (when (and sniff? (or eof? (fx>=? (fx- hi lo) 2)))
         (set! sniff? #f)
         (when (fx>=? (fx- hi lo) 2)
           (let ((a (bytevector-u8-ref bv lo)) (b (bytevector-u8-ref bv (fx+ lo 1))))
-            (cond ((and (fx=? a #xFE) (fx=? b #xFF)) (set! big? #t) (set! lo (fx+ lo 2)))
-                  ((and (fx=? a #xFF) (fx=? b #xFE)) (set! big? #f) (set! lo (fx+ lo 2)))))))
+            (cond ((and (fx=? a #xFE) (fx=? b #xFF))
+                   (set! big? #t) (set! marked? (fx=? lo 0)) (set! lo (fx+ lo 2)))
+                  ((and (fx=? a #xFF) (fx=? b #xFE))
+                   (set! big? #f) (set! marked? (fx=? lo 0)) (set! lo (fx+ lo 2)))))))
       (if sniff?
           (values "" lo)                                ; the mark is not all here yet
-          (let loop ((i lo) (pieces '()))
-            (let* ((j (clean-end bv i hi))
-                   (pieces (if (fx>? j i)
-                               (cons (jdec-run->string utf16->string bv i j big?) pieces)
-                               pieces))
-                   (avail (fx- hi j)))
-              (cond
-                ((fx<? avail 2)
-                 (if (and eof? (fx>? avail 0))
-                     (jdec-answer (cons jdec-fffd pieces) hi)
-                     (jdec-answer pieces j)))
-                ;; a lone low surrogate
-                ((fx>=? (top bv j) #xDC) (loop (fx+ j 2) (cons jdec-fffd pieces)))
-                ;; a high one and a unit that is not low: one malformed unit
-                ((fx>=? avail 4) (loop (fx+ j 4) (cons jdec-fffd pieces)))
-                ;; a high one at the end of what is here
-                (eof? (jdec-answer (cons jdec-fffd pieces) hi))
-                (else (jdec-answer pieces j)))))))
+          (let ((end (if eof? hi (decidable-end bv lo hi))))
+            (values (jdec-run->string utf16->string bv lo end big? marked?) end))))
     (cons step void)))
 
 ;; UTF-32, UTF-32BE, UTF-32LE. Every form drops a leading U+FEFF in its own
@@ -570,33 +561,20 @@
         (if big?
             (+ (* b0 #x1000000) (fxsll b1 16) (fxsll b2 8) b3)
             (+ (* b3 #x1000000) (fxsll b2 16) (fxsll b1 8) b0))))
-    (define (clean-end bv i hi)
-      (let scan ((i i))
-        (if (fx>? (fx+ i 4) hi)
-            i
-            (let ((cp (unit bv i)))
-              (if (or (> cp #x10FFFF) (<= #xD800 cp #xDFFF)) i (scan (fx+ i 4)))))))
     (define (step bv lo hi eof?)
+      (define marked? #f)
       (when (and sniff? (or eof? (fx>=? (fx- hi lo) 4)))
         (set! sniff? #f)
         (when (fx>=? (fx- hi lo) 4)
-          (cond ((eqv? (unit bv lo) #xFEFF) (set! lo (fx+ lo 4)))
+          (cond ((eqv? (unit bv lo) #xFEFF) (set! marked? (fx=? lo 0)) (set! lo (fx+ lo 4)))
                 ((and (string=? cs "utf-32")
                       (begin (set! big? #f) (eqv? (unit bv lo) #xFEFF)))
-                 (set! lo (fx+ lo 4)))
+                 (set! marked? (fx=? lo 0)) (set! lo (fx+ lo 4)))
                 (else (set! big? (not (string=? cs "utf-32le")))))))
       (if sniff?
           (values "" lo)
-          (let loop ((i lo) (pieces '()))
-            (let* ((j (clean-end bv i hi))
-                   (pieces (if (fx>? j i)
-                               (cons (jdec-run->string utf32->string bv i j big?) pieces)
-                               pieces))
-                   (avail (fx- hi j)))
-              (cond
-                ((fx>=? avail 4) (loop (fx+ j 4) (cons jdec-fffd pieces)))   ; out of range
-                ((and eof? (fx>? avail 0)) (jdec-answer (cons jdec-fffd pieces) hi))
-                (else (jdec-answer pieces j)))))))
+          (let ((end (if eof? hi (fx- hi (fxand (fx- hi lo) 3)))))
+            (values (jdec-run->string utf32->string bv lo end big? marked?) end))))
     (cons step void)))
 
 ;; Everything else through the system iconv, with ONE descriptor for the life
