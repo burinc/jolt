@@ -1036,6 +1036,11 @@
                   ;; :fl-coerce contagion widening, whose fixnum->flonum has been
                   ;; emitted bare since before this set existed.
                   "fixnum?" "flonum?" "fixnum->flonum"
+                  ;; the trace site-restore around a non-tail call (site-restore,
+                  ;; lookup-restore): it reads and writes the site slots and
+                  ;; tests the slot's pair. honeysql's (let [pair? ...]) turned
+                  ;; that test into a call to its boolean.
+                  "pair?" "virtual-register" "set-virtual-register!"
                   "fxand" "fxior" "fxxor" "fxnot"
                   "jolt-register-source!" "jolt-proto-epoch"
                   ;; --- bare heads emitted at sites the registry doesn't cover ---
