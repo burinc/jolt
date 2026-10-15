@@ -1384,6 +1384,12 @@
       ;; the same message the class-with-statics path already gives (jolt#983).
       ((runtime-provides-class? (or (imported-class-fqn class) class))
        (string-append "No matching field or method: " class "/" member))
+      ;; and so is one a library or a deftype gave a constructor: the class is
+      ;; there, only this static is not. (InetSocketAddress/createUnresolved)
+      ;; before jolt.socket had it said "No dependency provides
+      ;; java.net.InetSocketAddress" with InetSocketAddress loaded and working.
+      ((lookup-class class-ctors-tbl (or (imported-class-fqn class) class))
+       (string-append "No matching field or method: " class "/" member))
       (else (unknown-class-message class)))))
 
 ;; A member the class does not have is a miss, including a java.lang.Class

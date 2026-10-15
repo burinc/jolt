@@ -119,6 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unresolved address raises `UnknownHostException`, binding to one
   `SocketException`, and `(str (InetAddress/getByName "127.0.0.1"))` is
   `/127.0.0.1`.
+- **`PrintWriter` no longer throws its target's `IOException`.** A write,
+  flush or close that failed in the writer underneath raised; it is recorded
+  and `checkError` answers `true`, as on the JVM. Other exceptions still
+  propagate.
 - **`PrintWriter.checkError` reports the stream it wraps.** Over `System/out`
   with the reader gone it answered `false`; it now answers `true`, as
   `PrintStream.checkError` already did.
