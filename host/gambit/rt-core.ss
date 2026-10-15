@@ -247,6 +247,17 @@
 ;; (jolt-throw-sitep), and the reporter still validates it against the callsite
 ;; table before splicing: code compiled untraced (the seed) restores nothing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
+;; A non-tail call moves the slot's pair to jolt-vreg-outer-site and clears the
+;; slot while it runs (backend_scheme site-restore); a throw keeps the slot's
+;; pair, else that outer pair wrapped as an outer-site (rt.ss on Chez, whose
+;; reporter is the one that reads it).
+(define-record-type outer-site (fields pair) (nongenerative jolt-outer-site-v1))
+(define (jolt-site-snapshot)
+  (let ((s (virtual-register jolt-vreg-site)))
+    (if (pair? s)
+        s
+        (let ((o (virtual-register jolt-vreg-outer-site)))
+          (and (pair? o) (make-outer-site o))))))
 ;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
 ;; when one starts is a returned call's residue — the reporter's validator cannot
 ;; tell it from a live pair when the innermost live frame is a host fn (the
@@ -265,7 +276,7 @@
     (if (pair? c)
         c
         (let ((s (jolt-throw-sitep)))
-          (and (pair? s) s)))))
+          (and (or (pair? s) (outer-site? s)) s)))))
 ;; Emitted around a catch clause's body: snapshot the throwing site and return the
 ;; previous snapshot, which the paired leave restores. Save/restore rather than a
 ;; bare set so a nested catch cannot leave an inner throw's site behind for an
