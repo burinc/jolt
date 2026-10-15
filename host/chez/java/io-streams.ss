@@ -143,15 +143,39 @@
       ;; a piped stream holds its bytes in two places: what the writer has queued
       ;; and what an earlier read already pulled into the port's buffer
       (p (+ (port-buffered port) (pipe-available p)))
-      ((port-remaining port) => values)
-      ;; the kernel's count plus whatever was already pulled out of it into the
-      ;; port's buffer — the bytes live in two places, as they do for a pipe
-      ((port-fionread port) => (lambda (n) (+ (port-buffered port) n)))
-      ((fx>? (port-buffered port) 0) (port-buffered port))
-      ((guard (_ (#t #f)) (input-port-ready? port))
-       (lookahead-u8 port)
-       (port-buffered port))
-      (else 0))))
+      (else (port-available port)))))
+;; The same count for a bare byte port, whatever stream (if any) owns it.
+(define (port-available port)
+  (cond
+    ((port-remaining port) => values)
+    ;; the kernel's count plus whatever was already pulled out of it into the
+    ;; port's buffer — the bytes live in two places, as they do for a pipe
+    ((port-fionread port) => (lambda (n) (+ (port-buffered port) n)))
+    ((fx>? (port-buffered port) 0) (port-buffered port))
+    ((guard (_ (#t #f)) (input-port-ready? port))
+     (lookahead-u8 port)
+     (port-buffered port))
+    (else 0)))
+
+;; --- will a read block? -------------------------------------------------------
+;; Reader.ready() has to see through the layers a Reader is made of: the
+;; decoder's own read-ahead, the byte port under it, and — for InputStreamReader
+;; — the java.io stream under THAT. A custom Chez port keeps that state in a
+;; closure nothing outside can ask (input-port-ready? on one raises), so each
+;; custom port jolt builds for a Reader registers how to ask it here.
+(define port-ready-probes (make-weak-eq-hashtable))
+(define port-ready-probes-mu (make-mutex))
+(define (port-ready-probe! port probe)
+  (jolt-with-mutex port-ready-probes-mu (hashtable-set! port-ready-probes port probe))
+  port)
+(define (port-ready-probe port)
+  (jolt-with-mutex port-ready-probes-mu (hashtable-ref port-ready-probes port #f)))
+;; Would reading a byte from BP answer without blocking?
+(define (byte-port-ready? bp)
+  (guard (_ (#t #f))
+    (cond ((fx>? (port-buffered bp) 0) #t)
+          ((port-ready-probe bp) => (lambda (probe) (probe)))
+          (else (> (port-available bp) 0)))))
 
 (register-host-methods! "in-stream"
   (list
@@ -459,11 +483,18 @@
     (define (set-pos! p)
       (set-port-position! bp p)
       (set! lo 0) (set! hi 0) (set! src-eof? #f))
-    (make-custom-textual-input-port
-     id read!
-     (and (port-has-port-position? bp) get-pos)
-     (and (port-has-set-port-position!? bp) set-pos!)
-     (lambda () (close-port bp)))))
+    ;; Ready when a whole character already sits in lo..hi (or the source is
+    ;; finished, and the tail is answered as it stands), or when the byte
+    ;; source itself has more.
+    (port-ready-probe!
+     (make-custom-textual-input-port
+      id read!
+      (and (port-has-port-position? bp) get-pos)
+      (and (port-has-set-port-position!? bp) set-pos!)
+      (lambda () (close-port bp)))
+     (lambda ()
+       (or (and (fx<? lo hi) (or src-eof? (fx>? (%utf8-chunk-boundary buf lo hi) lo)))
+           (byte-port-ready? bp))))))
 
 ;; --- char input (Reader) ----------------------------------------------------
 ;; state #(port pending-lf? scratch mark replay): pending-lf? is the \n owed by
@@ -587,130 +618,92 @@
           (vector-set! (jhost-state self) 2 s)
           s))))
 
+;; Will the next read answer without blocking? Something reset() put back, a
+;; character Chez already holds, or whatever the decoder under the port says
+;; (port-ready-probe!) — a string port answers for itself. A \r that ended the
+;; last line owes a \n that is skipped rather than returned, so a buffered \n
+;; standing behind it is dropped first and the question asked again, as
+;; java.io.BufferedReader's ready does.
+(define (char-reader-ready? self)
+  (let ((port (char-reader-port self)))
+    (when (port-closed? port) (io-throw "Stream closed"))
+    (when (and (char-reader-pending-lf? self)
+               (not (char-reader-buffered? self))
+               (fx>? (port-buffered port) 0))
+      (when (eqv? (lookahead-char port) #\newline) (get-char port))
+      (char-reader-pending-lf! self #f))
+    (or (pair? (char-reader-replay self))
+        (fx>? (port-buffered port) 0)
+        (cond ((port-ready-probe port) => (lambda (probe) (probe)))
+              (else (guard (_ (#t #f)) (input-port-ready? port)))))))
+
 ;; One character at a time, through the generic array setter — the shape every
-;; unusual call keeps: a backing that is not a plain vector, or a range the
-;; caller got wrong, where ja-set! raises the JVM's own
-;; ArrayIndexOutOfBoundsException at the offending index.
+;; unusual call keeps: a mark or a replay in force (each unit has to be
+;; recorded or replayed), a \n owed by the last readLine, a backing that is not
+;; a plain string or vector, or a range the caller got wrong, where ja-set!
+;; raises the JVM's own ArrayIndexOutOfBoundsException at the offending index.
 (define (char-reader-read-elementwise! self buf off len)
-  (let loop ((i 0))
-    (if (>= i len) (->num i)
-        (let ((c (char-reader-get-char self)))
-          (if (eof-object? c)
-              (if (= i 0) -1 (->num i))
-              (begin (ja-set! buf (+ off i) c) (loop (+ i 1))))))))
+  (reader-fill-available! buf off len
+                          (lambda () (char-reader-get-char self))
+                          (lambda () (char-reader-ready? self))))
 
-;; Fill a char array from the port in ONE port operation instead of one
-;; get-char per character.
+;; read(char[], off, len) in ONE port operation instead of one get-char per
+;; character, and with the JVM's contract: block until at least one character
+;; is there, then answer what is — not "until the buffer is full". That is
+;; get-string-some!, the textual twin of the get-bytevector-some! in-stream's
+;; read is built on. Filling the buffer with get-string-n! instead hung a
+;; read over a pipe, a socket or a terminal until the sender had said LEN
+;; characters' worth, so an SSE stream delivering a few dozen bytes at a time
+;; looked dead (jolt-lang/jolt#1364).
 ;;
-;; read(char[]) is the documented way to stream a large input without
-;; materializing it, and the per-char loop made it the SLOWEST way to read:
-;; a megabyte of input cost a million get-char calls plus a million ja-set!
-;; calls, each of which is a checked record accessor, a bounds test that
-;; re-reads the backing length, and a cond over the backing type. Measured
-;; against babashka on an 8.7 MB file, jolt spent ~31 ms per MB where bb
-;; spent ~1 ms — 30x — and buffer size made no difference, because the cost
-;; was per character and not per chunk. It was slower than slurping the whole
-;; file (2.4x), so the memory-bounded read cost time instead of saving it.
-;;
-;; A char array's backing IS a Chez string (natives-array.ss), so get-string-n!
-;; fills the caller's buffer IN PLACE: no scratch, no copy, one port operation
-;; per call. That is what char-reader-fill-string! below does, and it is the
-;; whole read now. The vector arm after it is the same block read against the
-;; older boxed backing — a char array that was promoted by a store no character
-;; can hold, or one restored from an image written before the string backing —
-;; which still has to go through a scratch and copy out of it.
-;;
-;; BLOCKING IS UNCHANGED. get-string-n! blocks until the count is available or
-;; the port hits eof, which is exactly what the per-char loop did — it ran to
-;; len or eof too. So a pipe, socket or terminal behaves as it did before; this
-;; is not the JVM's "return what is available" reader, and it never was.
-;;
-;; The pending-\r flag char-reader-line leaves behind sits ABOVE the port, so
-;; it is resolved with one ordinary get-char before the block starts. Without
-;; that, a readLine that stopped on \r followed by a read(char[]) would hand
-;; back the \n that readLine had already accounted for.
-;; The string-backed read: get-string-n! writes straight into the array's own
-;; backing, so nothing is copied and nothing is allocated per call.
-(define (char-reader-fill-string! self v off len)
-  (let* ((pending? (and (char-reader-pending-lf? self) (fx>? len 0)))
-         (first-c (and pending? (char-reader-get-char self))))
-    (if (and pending? (eof-object? first-c))
-        -1
-        (let ((base (if pending? 1 0)))
-          (when pending? (string-set! v off first-c))
-          (let ((want (fx- len base)))
-            (if (fx=? want 0)
-                (->num base)
-                (let ((got (get-string-n! (char-reader-port self) v (fx+ off base) want)))
-                  (cond
-                    ((or (eof-object? got) (fx=? got 0))
-                     (if (fx=? base 0) -1 (->num base)))
-                    ;; a short read is eof, exactly as in the scratch arm below
-                    (else (->num (fx+ base got)))))))))))
-
+;; The per-char loop this replaced was the SLOWEST way to read: a megabyte cost
+;; a million get-char and ja-set! calls, ~31 ms per MB against babashka's ~1.
+;; A char array's backing IS a Chez string (natives-array.ss), so the read goes
+;; straight into it: no scratch, no copy. An array on the older boxed backing —
+;; promoted by a store no character can hold, or restored from an image written
+;; before the string backing — reads through a reused scratch and copies out.
 (define (char-reader-read-block! self buf off len)
   (let ((v (and (jolt-array? buf) (jolt-array-vec buf))))
     (cond
       ((not (and (fixnum? off) (fixnum? len) (fx>=? off 0) (fx>=? len 0)))
        (char-reader-read-elementwise! self buf off len))
-      ;; a mark or a replay in force: one unit at a time, so it is recorded
-      ;; or replayed (see the state note above)
-      ((char-reader-buffered? self)
+      ((fx=? len 0) (->num 0))
+      ;; the pending \n sits ABOVE the port: without resolving it first, a
+      ;; readLine that stopped on \r followed by a read(char[]) would hand back
+      ;; the \n that readLine had already accounted for
+      ((or (char-reader-buffered? self) (char-reader-pending-lf? self))
        (char-reader-read-elementwise! self buf off len))
       ((and (string? v) (fx<=? (fx+ off len) (string-length v)))
-       (char-reader-fill-string! self v off len))
-      ((not (and (vector? v) (fx<=? (fx+ off len) (vector-length v))))
-       (char-reader-read-elementwise! self buf off len))
-      (else
-        (let* ((pending? (and (char-reader-pending-lf? self) (fx>? len 0)))
-               (first-c (and pending? (char-reader-get-char self))))
-          (if (and pending? (eof-object? first-c))
-              -1
-              (let ((base (if pending? 1 0)))
-                (when pending? (vector-set! v off first-c))
-                (let ((want (fx- len base)))
-                  (if (fx=? want 0)
-                      (->num base)
-                      ;; Chunked against a REUSED scratch rather than one
-                      ;; make-string the size of the request: a 1 MB buffer
-                      ;; allocated per call cost more than the copy it fed
-                      ;; (2679 ms vs 1563 ms for the same bytes at 64 KB), so
-                      ;; a caller who sized its buffer generously paid for it.
-                      (let ((s (char-reader-scratch self (fxmin want char-reader-block-size)))
-                            (port (char-reader-port self)))
-                        (let loop ((done 0))
-                          (if (fx=? done want)
-                              (->num (fx+ base done))
-                              (let* ((n (fxmin (fx- want done) (string-length s)))
-                                     (got (get-string-n! port s 0 n)))
-                                (if (or (eof-object? got) (fx=? got 0))
-                                    (if (fx=? (fx+ base done) 0) -1 (->num (fx+ base done)))
-                                    (let ((start (fx+ (fx+ off base) done)))
-                                      (let copy ((i 0))
-                                        (if (fx=? i got)
-                                            (if (fx<? got n)
-                                                ;; short read means eof
-                                                (->num (fx+ base (fx+ done got)))
-                                                (loop (fx+ done got)))
-                                            (begin (vector-set! v (fx+ start i) (string-ref s i))
-                                                   (copy (fx+ i 1))))))))))))))))))))
+       (let ((got (get-string-some! (char-reader-port self) v off len)))
+         (if (eof-object? got) -1 (->num got))))
+      ((and (vector? v) (fx<=? (fx+ off len) (vector-length v)))
+       ;; a REUSED scratch rather than one the size of the request: a 1 MB
+       ;; buffer allocated per call cost more than the copy it fed
+       (let* ((s (char-reader-scratch self (fxmin len char-reader-block-size)))
+              (got (get-string-some! (char-reader-port self) s 0 (fxmin len (string-length s)))))
+         (if (eof-object? got)
+             -1
+             (do ((i 0 (fx+ i 1))) ((fx=? i got) (->num got))
+               (vector-set! v (fx+ off i) (string-ref s i))))))
+      (else (char-reader-read-elementwise! self buf off len)))))
 
 (register-host-methods! "char-reader"
   (list
    (cons "read"
+         (with-charbuffer-read
          (lambda (self . rest)
            (if (null? rest)
                (let ((c (char-reader-get-char self))) (if (eof-object? c) -1 (->num (char->integer c))))
                (let* ((buf (car rest))
                       (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
                       (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (ja-len buf))))
-                 (char-reader-read-block! self buf off len)))))
+                 (char-reader-read-block! self buf off len))))))
    (cons "readLine" (lambda (self) (let ((l (char-reader-line self))) (if (eof-object? l) jolt-nil l))))
    (cons "lines" (lambda (self)
                    (let loop ((acc '()))
                      (let ((l (char-reader-line self)))
                        (if (eof-object? l) (list->cseq (reverse acc)) (loop (cons l acc)))))))
-   (cons "ready" (lambda (self) #t))
+   (cons "ready" char-reader-ready?)
    (cons "skip" (lambda (self n) (let loop ((i 0) (k (jnum->exact n)))
                                    (if (or (>= i k) (eof-object? (char-reader-get-char self))) (->num i)
                                        (loop (+ i 1) k)))))
@@ -837,18 +830,27 @@
 (register-host-methods! "reader-adapter"
   (list
    (cons "read"
+         (with-charbuffer-read
          (lambda (self . rest)
            (if (null? rest)
                (->num (reader-adapter-read1 self))
-               (let* ((buf (car rest))
+               (let* ((inner (reader-adapter-inner self))
+                      (buf (car rest))
                       (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
                       (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (ja-len buf))))
-                 (let loop ((i 0))
-                   (if (>= i len) (->num i)
-                       (let ((c (reader-adapter-get-char self)))
-                         (if (eof-object? c)
-                             (if (= i 0) -1 (->num i))
-                             (begin (ja-set! buf (+ off i) c) (loop (+ i 1)))))))))))
+                 (if (and (not (vector-ref (jhost-state self) 1)) (obj-has-method? inner "read" 3))
+                     ;; ONE read of the wrapped reader, whatever it answers —
+                     ;; what java.io.BufferedReader does with a request this
+                     ;; size, and the only way to return what is available
+                     ;; without asking a reader for more than it has
+                     (let ((n (record-method-dispatch inner "read"
+                                (list->cseq (list buf (->num off) (->num len))))))
+                       (if (jolt-nil? n) -1 n))
+                     ;; a \n owed by the last readLine, or a reader with only
+                     ;; read(): a character at a time, the rest while it is ready
+                     (reader-fill-available! buf off len
+                                             (lambda () (reader-adapter-get-char self))
+                                             (lambda () (reader-ready? inner)))))))))
    (cons "readLine" (lambda (self) (let ((l (reader-adapter-line self))) (if (eof-object? l) jolt-nil l))))
    (cons "lines" (lambda (self)
                    (let loop ((acc '()))
@@ -857,7 +859,8 @@
    (cons "skip" (lambda (self n) (let loop ((i 0) (k (jnum->exact n)))
                                    (if (or (>= i k) (eof-object? (reader-adapter-get-char self))) (->num i)
                                        (loop (+ i 1) k)))))
-   (cons "ready" (lambda (self) (reader-adapter-relay self "ready" #t)))
+   ;; java.io.Reader's own ready says no, so a reader without one is not ready
+   (cons "ready" (lambda (self) (reader-adapter-relay self "ready" #f)))
    (cons "mark" (lambda (self . _) (reader-adapter-relay self "mark" jolt-nil)))
    (cons "reset" (lambda (self) (reader-adapter-relay self "reset" jolt-nil)))
    (cons "close" (lambda (self) (reader-adapter-relay self "close" jolt-nil) jolt-nil))
@@ -1109,7 +1112,8 @@
       ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
        (let ((top (if (string=? cs "us-ascii") 127 255))
              (buf (make-bytevector 4096)))
-         (make-custom-textual-input-port id
+         (port-ready-probe!
+          (make-custom-textual-input-port id
            (lambda (str start count)
              (let ((n (get-bytevector-some! bp buf 0 (fxmin count 4096))))
                (if (eof-object? n)
@@ -1119,21 +1123,57 @@
                        ;; past 127 is not ASCII: U+FFFD, as decode-bytevector answers
                        (string-set! str (fx+ start i) (if (fx<=? b top) (integer->char b) #\xFFFD)))))))
            #f #f
-           (lambda () (close-port bp)))))
+           (lambda () (close-port bp)))
+          (lambda () (byte-port-ready? bp)))))
       (else
-       (let ((text #f) (pos 0))
-         (make-custom-textual-input-port id
+       ;; Decoded as the bytes arrive (make-java-decoder, natives-str.ss): a
+       ;; read blocks only while nothing at all is decoded, so a reader over a
+       ;; pipe or a socket answers as soon as a character is complete.
+       (let* ((dec (or (make-java-decoder cs name) (unsupported-encoding-throw name)))
+              (step (car dec))
+              (finish (cdr dec))
+              (buf (make-bytevector 4096))
+              (lo 0) (hi 0) (src-eof? #f) (done? #f)
+              (text "") (pos 0))
+         ;; what is buffered, as text; #t when any came out
+         (define (decode!)
+           (let-values (((s next) (step buf lo hi src-eof?)))
+             (set! lo next)
+             (when src-eof? (set! done? #t) (finish))
+             (set! text s)
+             (set! pos 0)
+             (fx>? (string-length s) 0)))
+         (define (refill!)
+           (when (fx>? lo 0)
+             (bytevector-copy! buf lo buf 0 (fx- hi lo))
+             (set! hi (fx- hi lo))
+             (set! lo 0))
+           (when (fx=? hi (bytevector-length buf))
+             (let ((big (make-bytevector (fx* 2 hi))))
+               (bytevector-copy! buf 0 big 0 hi)
+               (set! buf big)))
+           (let ((got (get-bytevector-some! bp buf hi (fx- (bytevector-length buf) hi))))
+             (if (eof-object? got) (set! src-eof? #t) (set! hi (fx+ hi got)))))
+         (port-ready-probe!
+          (make-custom-textual-input-port id
            (lambda (str start count)
-             (unless text
-               (set! text (decode-bytevector
-                           (let ((bv (get-bytevector-all bp))) (if (eof-object? bv) (make-bytevector 0) bv))
-                           (list name))))
-             (let ((n (fxmin count (fx- (string-length text) pos))))
-               (sa-string-copy-range! str start text pos (fx+ pos n))
-               (set! pos (fx+ pos n))
-               n))
+             (let loop ()
+               (cond
+                 ((fx<? pos (string-length text))
+                  (let ((n (fxmin count (fx- (string-length text) pos))))
+                    (sa-string-copy-range! str start text pos (fx+ pos n))
+                    (set! pos (fx+ pos n))
+                    n))
+                 (done? 0)
+                 ((and (or (fx<? lo hi) src-eof?) (decode!)) (loop))
+                 (done? 0)
+                 (else (refill!) (loop)))))
            #f #f
-           (lambda () (close-port bp))))))))
+           (lambda () (finish) (close-port bp)))
+          (lambda ()
+            (or (fx<? pos (string-length text))
+                (and src-eof? (not done?))
+                (byte-port-ready? bp)))))))))
 ;; The byte port a stream's text is read from: jolt's own stream is its port; a
 ;; reify/proxy one is read through its own read method.
 (define (stream-byte-port s)
@@ -1547,6 +1587,9 @@
 (define stream-source-initial 4096)
 (define (in-stream-source-port in)
   (let ((arr #f) (cap 0) (pos 0) (lim 0))
+   ;; ready when a block is still here, or when the stream's own available says
+   ;; more is — a PipedInputStream's queue, a socket's kernel count
+   (port-ready-probe!
     (make-custom-binary-input-port
      "stream-source"
      (lambda (bv start count)
@@ -1573,7 +1616,10 @@
      ;; reader over a pipe that stopped here left the pipe open for good. Nothing
      ;; closes this port except a caller that owns the stream -- a copy or a
      ;; drain through it leaves it open.
-     (lambda () (record-method-dispatch in "close" jolt-nil)))))
+     (lambda () (record-method-dispatch in "close" jolt-nil)))
+    (lambda ()
+      (or (fx<? pos lim)
+          (> (jnum->exact (record-method-dispatch in "available" jolt-nil)) 0))))))
 ;; …and one dispatch that fills a caller-supplied range, for the pushback
 ;; port below, which asks the wrapped stream for exactly what its own buffer
 ;; wants rather than reading ahead of it.

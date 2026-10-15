@@ -1126,6 +1126,48 @@
         (values cbuf (jnum->exact (cadr rest)) (jnum->exact (caddr rest)))
         (values cbuf 0 (ja-len cbuf)))))
 
+;; read(cbuf, off, len) for a reader that hands out one character at a time:
+;; GET1 answers a char or the eof object, MORE? whether another GET1 would
+;; answer without blocking. The JVM's contract is "block until SOME input is
+;; available" and then hand back what is there, not "fill the buffer": a read
+;; that waits for LEN characters over a pipe, a socket or a terminal stalls
+;; until the sender has said more, which an SSE stream or an interactive
+;; protocol never does. So only the first character may block. The byte side
+;; is the same rule (in-stream's read, io-streams.ss).
+(define (reader-fill-available! buf off len get1 more?)
+  (let loop ((i 0))
+    (if (or (>= i len) (and (> i 0) (not (more?))))
+        (->num i)
+        (let ((c (get1)))
+          (if (eof-object? c)
+              (if (= i 0) -1 (->num i))
+              (begin (ja-set! buf (+ off i) c) (loop (+ i 1))))))))
+
+;; Does reader R say its next read would not block? A reader that cannot
+;; answer — a reify with no ready, one whose ready throws — says no, which is
+;; java.io.Reader's own default.
+(define (reader-ready? r)
+  (guard (_ (#t #f))
+    (jolt-truthy? (record-method-dispatch r "ready" jolt-nil))))
+
+;; Reader.read(CharBuffer), which every java.io.Reader inherits: the buffer's
+;; remaining room is read through the reader's own read(char[],int,int) and put
+;; at its position, which advances by what was read. The JDK's own body for a
+;; buffer with no array, and the same answer for one with an array; a read-only
+;; buffer raises the JDK's ReadOnlyBufferException from the put.
+(define (reader-read-charbuffer self cb)
+  (let* ((rem (nb-remaining cb))
+         (tmp (na-char-array rem))
+         (n (jnum->exact (record-method-dispatch self "read" (jolt-list tmp 0 rem)))))
+    (when (> n 0) (nb-put cb tmp 0 n))
+    (->num n)))
+;; A reader's "read" method with the CharBuffer overload in front of it.
+(define (with-charbuffer-read read)
+  (lambda (self . rest)
+    (if (and (pair? rest) (null? (cdr rest)) (nb? (car rest)))
+        (reader-read-charbuffer self (car rest))
+        (apply read self rest))))
+
 ;; close drops the string; every read reaches it through sr-s, which then
 ;; raises what a closed java.io.StringReader does.
 (define (sr-s self)
@@ -1134,7 +1176,7 @@
 (define (sr-pos self) (vector-ref (jhost-state self) 1))
 (define (sr-pos! self p) (vector-set! (jhost-state self) 1 p))
 (register-host-methods! "string-reader"
-  (list (cons "read" (lambda (self . rest)
+  (list (cons "read" (with-charbuffer-read (lambda (self . rest)
                        (let ((s (sr-s self)) (p (sr-pos self)))
                          (cond
                            ;; .read() -> one char code, -1 at EOF
@@ -1148,7 +1190,7 @@
                                   (let-values (((cbuf off len) (reader-read-buf-args rest)))
                                     (let ((n (min len (- slen p))))
                                       (let loop ((i 0)) (when (< i n) (ja-set! cbuf (+ off i) (string-ref s (+ p i))) (loop (+ i 1))))
-                                      (sr-pos! self (+ p n)) (->num n))))))))))
+                                      (sr-pos! self (+ p n)) (->num n)))))))))))
         (cons "mark" (lambda (self . _) (sr-s self) (vector-set! (jhost-state self) 2 (sr-pos self)) jolt-nil))
         (cons "reset" (lambda (self) (sr-s self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
         (cons "skip" (lambda (self n) (let ((n (jnum->exact n)))
@@ -1263,8 +1305,12 @@
   (if (or (jrec? rdr) (jreify? rdr))
       (and (iface-method rdr "close" #f) #t)
       #t))
+(define (pbr-ready? self)
+  (let ((st (jhost-state self)))
+    (or (pair? (vector-ref st 1)) (reader-ready? (vector-ref st 0)))))
 (register-host-methods! "pushback-reader"
   (list (cons "read"
+          (with-charbuffer-read
           (lambda (self . rest)
             (define (read1)
               (let* ((st (jhost-state self)) (pushed (vector-ref st 1))
@@ -1283,14 +1329,19 @@
                 c))
             (if (null? rest)
                 (read1)
-                ;; .read(cbuf, off, len) -> read one code unit at a time into cbuf,
-                ;; return count or -1 at immediate EOF.
+                ;; .read(cbuf, off, len) -> one code unit at a time into cbuf, the
+                ;; first blocking and the rest only while the pushback or the
+                ;; wrapped reader has them; count, or -1 at immediate EOF.
                 (let-values (((cbuf off len) (reader-read-buf-args rest)))
-                  (let loop ((i 0))
-                    (if (>= i len) (->num i)
-                        (let ((c (jnum->exact (read1))))
-                          (if (= c -1) (if (= i 0) -1 (->num i))
-                              (begin (ja-set! cbuf (+ off i) (integer->char c)) (loop (+ i 1)))))))))))
+                  (reader-fill-available! cbuf off len
+                    (lambda ()
+                      (let ((u (read1)))
+                        (if (or (jolt-nil? u) (< (jnum->exact u) 0))
+                            (eof-object)
+                            (integer->char (jnum->exact u)))))
+                    (lambda () (pbr-ready? self))))))))
+        ;; PushbackReader.ready: something pushed back, or the wrapped reader ready
+        (cons "ready" pbr-ready?)
         (cons "unread"
           (lambda (self ch . rest)
             (vector-set! (jhost-state self) 6 (vector-ref (jhost-state self) 7))
@@ -1428,20 +1479,12 @@
       ((string=? cs "us-ascii")
        (list->string (map (lambda (b) (if (fx<? b 128) (integer->char b) #\xFFFD))
                           (bytevector->u8-list bv))))
-      ((or (string=? cs "utf-16") (string=? cs "utf-16be"))
-       (utf16->string bv (endianness big)))   ; respects a leading BOM
-      ((string=? cs "utf-16le") (utf16->string bv (endianness little)))
-      ((or (string=? cs "utf-32") (string=? cs "utf-32be"))
-       (utf32->string bv (endianness big)))
-      ((string=? cs "utf-32le") (utf32->string bv (endianness little)))
-      ;; anything else through the system iconv (natives-str.ss); a charset the
-      ;; host does not have is the JVM's UnsupportedEncodingException rather than
-      ;; a silent reinterpretation of the bytes as UTF-8.
-      (else (let ((u8 (iconv-bytes bv name "UTF-8")))
-              (if u8
-                  (guard (e (#t (list->string (map integer->char (bytevector->u8-list u8)))))
-                    (utf8-bytes->string u8))
-                  (unsupported-encoding-throw name)))))))
+      ;; UTF-16, UTF-32 and everything iconv knows: the same incremental
+      ;; decoders an InputStreamReader streams through (natives-str.ss), run
+      ;; over the whole buffer at once. A charset the host does not have is the
+      ;; JVM's UnsupportedEncodingException rather than a silent
+      ;; reinterpretation of the bytes as UTF-8.
+      (else (java-decode-all bv cs name)))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.
 (define (bytes-slice-for-string bv rest)
