@@ -22,11 +22,12 @@
   c-poll. Each answers [result error]; the error is only meaningful when result
   is negative. On Windows c-close is closesocket and c-poll is WSAPoll.
 
-  Helpers: new-socket, set-listener-reuse!, set-int-option!, set-timeout!, pending-error, close-on-exec!,
-  set-blocking!, available, make-sockaddr, alloc-sockaddr, sockaddr-family,
-  sockaddr-ip, sockaddr-port, local-address, peer-address, resolve-addrs, pollfd
+  Helpers: new-socket, set-listener-reuse!, set-dual-stack!, set-int-option!,
+  set-timeout!, pending-error, close-on-exec!, set-blocking!, available,
+  make-sockaddr, alloc-sockaddr, sockaddr-family, sockaddr-ip, sockaddr-port,
+  sockaddr-scope-id, local-address, peer-address, resolve-addrs, pollfd
   helpers and poll-one, error classification and messages, host-name,
-  reverse-lookup, interface-addresses.
+  numeric-address?, reverse-lookup, interface-index, interface-addresses.
 
   Constants are plain defs (af-inet, sol-socket, pollin, eaddrinuse, ...) for
   this host; consts-for answers the table for any of :macos :linux :windows."
@@ -178,7 +179,11 @@
 (ffi/load-library)
 (when windows?
   (ffi/load-library ["ws2_32.dll" "ws2_32"])
-  (ffi/load-library ["kernel32.dll" "kernel32"]))
+  (ffi/load-library ["kernel32.dll" "kernel32"])
+  ;; if_nametoindex only — a scope zone named by interface (fe80::1%eth0) is
+  ;; the one thing that asks, so a host without it answers no index rather
+  ;; than failing the namespace
+  (try (ffi/load-library ["iphlpapi.dll" "iphlpapi"]) (catch Throwable _ nil)))
 
 ;; accept/connect/recv/send/poll may block — :blocking emits them collect-safe,
 ;; so a thread parked in one never holds up the collector.
@@ -203,6 +208,8 @@
 (ffi/defcfn c-gethostname  "gethostname"  [:pointer :size_t] :int)
 (ffi/defcfn c-getnameinfo  "getnameinfo"
   [:pointer :uint :pointer :uint :pointer :uint :int] :int :blocking)
+;; libc on POSIX; iphlpapi on Windows (loaded below). 0 for an unknown name.
+(ffi/defcfn c-if-nametoindex "if_nametoindex" [:pointer] :uint)
 
 ;; The rest differ by platform in signature or name, not only in value, so they
 ;; live in the taken branch — a symbol one OS lacks (closesocket, getifaddrs) can
@@ -431,6 +438,14 @@
     (when so-nosigpipe (set-int-option! fd sol-socket so-nosigpipe 1))
     fd))
 
+(defn set-dual-stack!
+  "Clear IPV6_V6ONLY on a v6 socket, so it also carries IPv4 traffic as mapped
+  addresses (::ffff:a.b.c.d) — the JDK's sockets are dual-stack. Linux's
+  default is a sysctl and Windows's is v6-only, so it is set either way.
+  Answers [result error]."
+  [fd]
+  (set-int-option! fd ipproto-ipv6 ipv6-v6only 0))
+
 (defn guard-accepted!
   "What an accepted fd needs before use: close-on-exec, and SO_NOSIGPIPE on
   macOS — an accepted socket does not reliably inherit either."
@@ -482,26 +497,36 @@
             (when-not (or (nil? p) (ffi/null? p)) (ffi/ptr->string out)))
           (finally (ffi/free out)))))))
 
+(defn sockaddr-scope-id
+  "sin6_scope_id of a v6 sockaddr (the interface a link-local address is on),
+  0 for none or for a v4 sockaddr."
+  [sa]
+  (if (= (sockaddr-family sa) af-inet6) (ffi/read sa :uint 24) 0))
+
 (defn sockaddr-length
   "The length bind/connect want for a sockaddr of family."
   [family]
   (if (= family af-inet6) 28 16))
 
 (defn make-sockaddr
-  "A freshly allocated sockaddr for the numeric address ip (a v4 or v6 literal)
-  and port, as [sa len], or nil when ip is not a literal of family. The caller
-  frees sa."
-  [family ip port]
-  (let [len (sockaddr-length family)
-        sa  (ffi/alloc len)
-        src (ffi/string->ptr (str ip))]
-    (try
-      (write-header! sa family len)
-      (set-sockaddr-port! sa port)
-      (if (= 1 (c-inet-pton family src (+ sa (if (= family af-inet6) 8 4))))
-        [sa len]
-        (do (ffi/free sa) nil))
-      (finally (ffi/free src)))))
+  "A freshly allocated sockaddr for the numeric address ip (a v4 or v6 literal,
+  no scope zone) and port, as [sa len], or nil when ip is not a literal of
+  family. scope-id, for a v6 address, is its sin6_scope_id. The caller frees
+  sa."
+  ([family ip port] (make-sockaddr family ip port 0))
+  ([family ip port scope-id]
+   (let [len (sockaddr-length family)
+         sa  (ffi/alloc len)
+         src (ffi/string->ptr (str ip))]
+     (try
+       (write-header! sa family len)
+       (set-sockaddr-port! sa port)
+       (if (= 1 (c-inet-pton family src (+ sa (if (= family af-inet6) 8 4))))
+         (do (when (and (= family af-inet6) scope-id)
+               (ffi/write sa :uint scope-id 24))
+             [sa len])
+         (do (ffi/free sa) nil))
+       (finally (ffi/free src))))))
 
 (defn alloc-sockaddr
   "A zeroed sockaddr_storage and its in/out length cell, as [sa lenp], ready for
@@ -516,15 +541,16 @@
     (try
       (let [[r _] (f fd sa lenp)]
         (when-not (neg? r)
-          {:family (sockaddr-family sa) :ip (sockaddr-ip sa) :port (sockaddr-port sa)}))
+          {:family (sockaddr-family sa) :ip (sockaddr-ip sa) :port (sockaddr-port sa)
+           :scope-id (sockaddr-scope-id sa)}))
       (finally (ffi/free sa) (ffi/free lenp)))))
 
 (defn local-address
-  "{:family :ip :port} fd is bound to, or nil when getsockname fails."
+  "{:family :ip :port :scope-id} fd is bound to, or nil when getsockname fails."
   [fd] (named-address c-getsockname fd))
 
 (defn peer-address
-  "{:family :ip :port} of fd's peer, or nil when getpeername fails."
+  "{:family :ip :port :scope-id} of fd's peer, or nil when getpeername fails."
   [fd] (named-address c-getpeername fd))
 
 (defn local-port
@@ -544,7 +570,7 @@
   (some (fn [fam]
           (when (or (nil? family) (= family fam))
             (when-let [[sa len] (make-sockaddr fam host port)]
-              {:family fam :addr sa :addrlen len :ip (sockaddr-ip sa)})))
+              {:family fam :addr sa :addrlen len :ip (sockaddr-ip sa) :scope-id 0})))
         [af-inet af-inet6]))
 
 (declare getaddrinfo-addrs free-addrs!)
@@ -564,7 +590,8 @@
           [first-off (if (= 24 first-off) 32 24)])))
 
 (defn resolve-addrs
-  "The addresses host names, as data: {:addrs [{:family :addr :addrlen :ip} ...]}
+  "The addresses host names, as data:
+  {:addrs [{:family :addr :addrlen :ip :scope-id} ...]}
   or {:error code :message text}. Numeric literals and names, v4 and v6.
 
   A literal is parsed with inet_pton and never reaches the resolver, as the
@@ -623,7 +650,8 @@
                                    (vswap! copied conj {:addr sa})
                                    (set-sockaddr-port! sa port)
                                    {:family fam :addr sa :addrlen addrlen
-                                    :ip (sockaddr-ip sa)}))]
+                                    :ip (sockaddr-ip sa)
+                                    :scope-id (sockaddr-scope-id sa)}))]
                      (recur (ffi/read ai :pointer 40)
                             (if entry (conj out entry) out)
                             (if k (conj seen k) seen)))))
@@ -646,6 +674,23 @@
       (if (neg? (c-gethostname buf n)) "localhost" (ffi/ptr->string buf))
       (finally (ffi/free buf)))))
 
+(defn interface-index
+  "The index of the network interface named nm (if_nametoindex), or nil when
+  there is no such interface."
+  [nm]
+  (winsock/ensure!)
+  (let [p (ffi/string->ptr (str nm))]
+    (try
+      (let [i (try (c-if-nametoindex p) (catch Throwable _ 0))]
+        (when (pos? i) i))
+      (finally (ffi/free p)))))
+
+(defn numeric-address?
+  "Whether s is a v4 or v6 address literal, as inet_pton reads them."
+  [s]
+  (boolean (some (fn [fam] (when-let [[sa _] (make-sockaddr fam s 0)] (ffi/free sa) true))
+                 [af-inet af-inet6])))
+
 (defn reverse-lookup
   "The name DNS gives back for the numeric address ip, or nil. getnameinfo with
   no flags falls back to the numeric form itself, so an answer equal to ip means
@@ -658,7 +703,9 @@
         (try
           (when (zero? (c-getnameinfo sa len buf n ffi/null 0 0))
             (let [nm (ffi/ptr->string buf)]
-              (when-not (or (str/blank? nm) (= nm ip)) nm)))
+              ;; the numeric fallback comes back in inet_ntop's form, which
+              ;; need not be ip's (0:0:0:0:0:0:0:2 is answered as ::2)
+              (when-not (or (str/blank? nm) (= nm ip) (numeric-address? nm)) nm)))
           (finally (ffi/free buf) (ffi/free sa)))))))
 
 ;; -- loopback pair ----------------------------------------------------------------
@@ -763,7 +810,9 @@
 ;; -- interfaces ---------------------------------------------------------------------
 ;; getifaddrs(3) reports one entry per address, so an interface with an IPv4
 ;; address and a MAC appears twice. struct ifaddrs is laid out the same on macOS
-;; and Linux for the fields read here: ifa_next 0, ifa_name 8, ifa_addr 24.
+;; and Linux for the fields read here: ifa_next 0, ifa_name 8, ifa_flags 16,
+;; ifa_addr 24, ifa_netmask 32, ifa_broadaddr 40 (valid under IFF_BROADCAST,
+;; which is 0x2 on both).
 
 ;; The link-layer family a MAC is reported under, and where it sits in that
 ;; entry's sockaddr: BSD's sockaddr_dl carries the interface name (sdl_nlen at 5)
@@ -780,9 +829,23 @@
         ;; all zero is what an interface without hardware reports
         (when (some pos? bs) (byte-array bs))))))
 
+(def ^:private iff-broadcast 0x2)
+
+(defn- prefix-length
+  "The bits set in a netmask sockaddr, read where family's address sits. A
+  macOS netmask can be cut short — its sa_len stops at the last nonzero byte —
+  so nothing past that length is read there."
+  [sa family]
+  (if (or (nil? sa) (ffi/null? sa))
+    0
+    (let [[off n] (if (= family af-inet6) [8 16] [4 4])
+          n (if macos? (max 0 (min n (- (ffi/read sa :uint8 0) off))) n)]
+      (reduce + (map (fn [i] (Long/bitCount (ffi/read sa :uint8 (+ off i)))) (range n))))))
+
 (defn interface-addresses
-  "One map per getifaddrs entry, {:name} plus :ip for an IPv4 or IPv6 address
-  (with :family) or :mac for a link-layer one. Empty on Windows, which has no
+  "One map per getifaddrs entry, {:name} plus, for an IPv4 or IPv6 address,
+  :family :ip :scope-id :prefix (the netmask's length) and, for a v4 address on
+  a broadcast interface, :broadcast; or :mac for a link-layer one. Empty on Windows, which has no
   getifaddrs: enumerating adapters there is a GetAdaptersAddresses walk, not
   written here. Throws IOException when getifaddrs fails."
   []
@@ -799,11 +862,19 @@
                 acc
                 (let [nm  (ffi/ptr->string (ffi/read cur :pointer 8))
                       sa  (ffi/read cur :pointer 24)
-                      fam (when-not (ffi/null? sa) (sockaddr-family sa))]
+                      fam (when-not (ffi/null? sa) (sockaddr-family sa))
+                      flags (ffi/read cur :uint 16)
+                      bsa (ffi/read cur :pointer 40)]
                   (recur (ffi/read cur :pointer 0)
                          (conj acc (cond-> {:name nm}
                                      (or (= fam af-inet) (= fam af-inet6))
-                                     (assoc :family fam :ip (sockaddr-ip sa))
+                                     (assoc :family fam :ip (sockaddr-ip sa)
+                                            :scope-id (sockaddr-scope-id sa)
+                                            :prefix (prefix-length (ffi/read cur :pointer 32) fam))
+                                     (and (= fam af-inet)
+                                          (pos? (bit-and flags iff-broadcast))
+                                          bsa (not (ffi/null? bsa)))
+                                     (assoc :broadcast (sockaddr-ip bsa))
                                      (= fam af-link) (assoc :mac (mac-bytes sa))))))))
             (finally (c-freeifaddrs head))))
         (finally (ffi/free pp))))))

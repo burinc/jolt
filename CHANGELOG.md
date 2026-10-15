@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **IPv6 in `java.net`.** `InetAddress/getByName` and `getAllByName` take
+  v6 literals, bracketed or not and with a `%zone`, and names that resolve to
+  v6, answering `Inet6Address` in the JDK's form (`/0:0:0:0:0:0:0:1`) with its
+  `equals`, `hashCode` and address predicates; a name with both families lists
+  IPv4 first. `InetSocketAddress` prints a v6 address in brackets. A socket's
+  family follows the address it connects or binds to, `ServerSocket(port)` is
+  dual-stack as the JDK's is, and `NetworkInterface` lists v6 addresses and
+  `getInterfaceAddresses`. Also new: `Socket.getLocalAddress`,
+  `getLocalSocketAddress`, `ServerSocket.getInetAddress`,
+  `InetAddress/getByAddress`. `ServerSocket` prints its bind address as the
+  JDK does (`addr=/127.0.0.1`), and `127.0.0.2` is a loopback address.
 - **Runaway recursion throws `StackOverflowError`.** Chez keeps a deep stack
   on the heap, so a non-tail recursion that never ends used to allocate until
   the heap ceiling raised `OutOfMemoryError` (a minute and a half and ~18 GB
