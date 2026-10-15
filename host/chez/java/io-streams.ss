@@ -986,9 +986,8 @@
                        (begin (put-string (port!) cb start (fx- i start)) (get-output-string out))
                        (substring cb start i)))
                   (else (scan (fx+ i 1)))))))))))
-;; What is left, as a string: the buffered rest, then -- over one of jolt's own
-;; readers -- that reader's own drain, so slurp keeps its fast path; a user
-;; Reader drains through read, as before.
+;; What is left, as a string: the buffered rest, then the wrapped reader's own
+;; drain -- only over one of jolt's readers, so slurp keeps its fast path.
 (define (ra-drain self drain-inner)
   (ra-open! self)
   (let ((st (jhost-state self)) (inner (reader-adapter-inner self)))
