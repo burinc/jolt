@@ -48,7 +48,9 @@
 (define (in-stream? x) (and (jhost? x) (string=? (jhost-tag x) "in-stream")))
 ;; Two optional slots follow, each #f or absent on an ordinary stream: slot 3 is
 ;; a piped stream's shared pipe (piped-cell, below), slot 4 a
-;; PushbackInputStream's pushback state (in-stream-pushback, below).
+;; PushbackInputStream's pushback state (in-stream-pushback, below). Slot 5 is
+;; a zip stream's record (zip-in-streams.ss); slot 6, on a SequenceInputStream
+;; only, closes its streams (in-stream-sequence-close).
 
 ;; The port behind a stream, or the JVM's IOException when it has been closed.
 ;; Reading a closed Chez port raises a classless host error instead, which no
@@ -242,9 +244,13 @@
    ;; A piped stream marks its shared pipe instead of closing the Chez port: a
    ;; read after close has to raise the JVM's IOException, and a closed Chez port
    ;; raises a classless host error before the port's own reader is consulted.
+   ;; A SequenceInputStream closes its streams and leaves its own port open:
+   ;; a read after close is the end of input on the JVM, not an IOException.
    (cons "close" (lambda (self)
-                   (let ((p (piped-pipe self)))
-                     (if p (pipe-close-read! p) (close-port (in-stream-port self))))
+                   (let ((p (piped-pipe self)) (sq (in-stream-sequence-close self)))
+                     (cond (p (pipe-close-read! p))
+                           (sq (sq))
+                           (else (close-port (in-stream-port self)))))
                    jolt-nil))
    (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
    ;; readNBytes(len) reads UP TO len bytes and answers what it got — unlike
@@ -1787,6 +1793,43 @@
       (make-jhost "in-stream" (vector port #f 0 #f pb)))))
 (reg-ctor! '("PushbackInputStream" "java.io.PushbackInputStream") make-pushback-in-stream)
 
+;; SequenceInputStream over two streams or an Enumeration of them: each is read
+;; to its end, then closed and the next one taken, as the JDK's nextStream
+;; does, so an empty stream in the middle is skipped rather than ending the
+;; whole. close closes the current stream and every one not reached yet.
+(define (make-sequence-in-stream . args)
+  (let* ((two? (fx=? (length args) 2))
+         (later (if two? (cdr args) '()))
+         (e (if two? #f (car args)))
+         (next (lambda ()
+                 (cond (two? (if (null? later) #f
+                                 (let ((s (car later))) (set! later '()) s)))
+                       ((jolt-truthy? (record-method-dispatch e "hasMoreElements" jolt-nil))
+                        (let ((s (record-method-dispatch e "nextElement" jolt-nil)))
+                          (when (jolt-nil? s) (throw-jvm 'NullPointerException jolt-nil))
+                          s))
+                       (else #f))))
+         (cur (if two? (car args) (next))))
+    (define (advance!)
+      (record-method-dispatch cur "close" jolt-nil)
+      (set! cur (next)))
+    (define (close-all!) (let loop () (when cur (advance!) (loop))))
+    (make-jhost "in-stream"
+      (vector (make-custom-binary-input-port
+               "sequence-source"
+               (lambda (bv start count)
+                 (let loop ()
+                   (if (not cur)
+                       0
+                       (let ((n (stream-read-into! cur bv start count)))
+                         (if (fx>? n 0) n (begin (advance!) (loop)))))))
+               #f #f close-all!)
+              #f 0 #f #f #f close-all!))))
+(define (in-stream-sequence-close x)
+  (let ((st (and (jhost? x) (jhost-state x))))
+    (and (vector? st) (fx>? (vector-length st) 6) (vector-ref st 6))))
+(reg-ctor! '("SequenceInputStream" "java.io.SequenceInputStream") make-sequence-in-stream)
+
 ;; unread(int) | unread(byte[]) | unread(byte[] off len). The int is the byte's
 ;; low 8 bits — bencode hands back the SIGNED value read-byte narrowed to — and
 ;; a byte[]'s elements are signed too, so both go in as their u8 view.
@@ -2298,7 +2341,9 @@
 
 ;; --- instance? for the java.io stream taxonomy ------------------------------
 (register-class-arm! in-stream?
-  (lambda (x) (if (in-stream-pushback x) "java.io.PushbackInputStream" "java.io.InputStream")))
+  (lambda (x) (cond ((in-stream-pushback x) "java.io.PushbackInputStream")
+                    ((in-stream-sequence-close x) "java.io.SequenceInputStream")
+                    (else "java.io.InputStream"))))
 (register-class-arm! out-stream? (lambda (x) "java.io.OutputStream"))
 (register-class-arm! char-reader? (lambda (x) "java.io.Reader"))
 (register-class-arm! reader-adapter? (lambda (x) "java.io.BufferedReader"))
@@ -2311,6 +2356,7 @@
         ;; a PushbackInputStream is the one in-stream that IS one; every other
         ;; in-stream answers false to it, as a ByteArrayInputStream does
         ((and (string=? short "PushbackInputStream") (in-stream? val)) (and (in-stream-pushback val) #t))
+        ((and (string=? short "SequenceInputStream") (in-stream? val)) (and (in-stream-sequence-close val) #t))
         ((and (in-stream? val) (member short '("InputStream" "FileInputStream" "ByteArrayInputStream"
                                                "BufferedInputStream" "FilterInputStream" "Closeable" "AutoCloseable"))) #t)
         ((and (out-stream? val) (member short '("OutputStream" "FileOutputStream" "ByteArrayOutputStream"

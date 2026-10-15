@@ -837,6 +837,7 @@
 (jch-register-supers! "java.io.FilterInputStream" '("java.io.InputStream"))
 (jch-register-supers! "java.io.BufferedInputStream" '("java.io.FilterInputStream"))
 (jch-register-supers! "java.io.PushbackInputStream" '("java.io.FilterInputStream"))
+(jch-register-supers! "java.io.SequenceInputStream" '("java.io.InputStream"))
 (jch-register-supers! "java.io.FileOutputStream" '("java.io.OutputStream"))
 (jch-register-supers! "java.io.ByteArrayOutputStream" '("java.io.OutputStream"))
 (jch-register-supers! "java.io.PipedOutputStream" '("java.io.OutputStream"))
@@ -1293,6 +1294,7 @@
 (jch-register-supers! "java.util.Enumeration" '())
 (jch-mark-interface! "java.util.Enumeration")
 (jch-register-supers! "java.util.StringTokenizer" '("java.util.Enumeration"))
+(jch-register-supers! "java.util.Collections$3" '("java.util.Enumeration"))
 (jch-register-supers! "java.util.Optional" '())
 ;; java.util.stream: each pipeline head is its stream interface, and every
 ;; stream a BaseStream, which is AutoCloseable.
@@ -1524,6 +1526,8 @@
     ("double-summary-stats" . "java.util.DoubleSummaryStatistics")
     ("stream-sink" . "java.util.stream.SpinedBuffer")
     ("string-tokenizer" . "java.util.StringTokenizer")
+    ;; Collections/enumeration's anonymous class, as the JDK names it
+    ("seq-enumeration" . "java.util.Collections$3")
     ("b64-encoder" . "java.util.Base64$Encoder")
     ("b64-decoder" . "java.util.Base64$Decoder")
     ("jolt-runtime" . "java.lang.Runtime")
