@@ -456,18 +456,26 @@
     ;; A large `case` dispatches through one lookup in a constant map, not a chain
     ;; of = tests, one per arm. The chain made a dispatch to the last of 400
     ;; string constants ~8 us; the reference's case is a hashed tableswitch.
-    ;; Fixed sits ~1.4, not 1.0 — the 200-key map lookup measures ~105 ns
-    ;; against ~70 at 50 keys (deeper trie), and the index search is two
-    ;; compares longer; the chain reads ~4.0.
+    ;; Each arm dispatches 200 times over ALL its keys (the 50-constant case
+    ;; cycles its 50 four times), so the chain reads ~4.0 on the mean arm index,
+    ;; 24.5 against 99.5. It used to time one key per case, "s49" against "s199",
+    ;; and one key's cost is where its hash lands in the constant map's trie:
+    ;; "s199" shares its low 10 bits with another key, so it sits a level deeper
+    ;; than its siblings (~41 ns against ~33), and the row read 1.35-1.6, once
+    ;; 1.98 against the 2.0 ceiling, with nothing scanned.
     (let [c1 (string-case-fn 50) c4 (string-case-fn 200)
-          k1 (str "s" 49) k4 (str "s" 199)]
-      (when-not (and (= 49 (c1 k1)) (= 199 (c4 k4)) (= 0 (c4 (str "s" 0)))
-                     (= -1 (c4 "s200")) (= -1 (c4 nil)) (= -1 (c4 'x)) (= -1 (c1 k4)))
+          ks1 (vec (take 200 (cycle (map #(str "s" %) (range 50)))))
+          ks4 (vec (map #(str "s" %) (range 200)))
+          dispatch-all (fn [c ks] (reduce (fn [acc k] (+ acc (c k))) 0 ks))]
+      (when-not (and (= 49 (c1 "s49")) (= 199 (c4 "s199")) (= 0 (c4 (str "s" 0)))
+                     (= -1 (c4 "s200")) (= -1 (c4 nil)) (= -1 (c4 'x)) (= -1 (c1 "s199"))
+                     (= (* 4 (reduce + (range 50))) (dispatch-all c1 ks1))
+                     (= (reduce + (range 200)) (dispatch-all c4 ks4)))
         (println "FAIL complexity case-dispatch: wrong values before timing")
         (System/exit 1))
-      (judge "case last arm"
-             #(c1 k1)
-             #(c4 k4)
+      (judge "case every arm"
+             #(dispatch-all c1 ks1)
+             #(dispatch-all c4 ks4)
              "case is testing its constants one = at a time instead of looking the value up (00-syntax.clj case)"))
 
     (if (pos? @failures)
