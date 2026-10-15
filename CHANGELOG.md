@@ -123,6 +123,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flush or close that failed in the writer underneath raised; it is recorded
   and `checkError` answers `true`, as on the JVM. Other exceptions still
   propagate.
+- **A process's `:shutdown` hook is registered before it starts.** A SIGTERM
+  that reached jolt between the spawn and the registration ended it with no
+  hook to run, so `:shutdown destroy-tree` left the child tree running. The
+  hook is now in place first and waits for the process if the spawn has not
+  returned yet.
 - **`PrintWriter.checkError` reports the stream it wraps.** Over `System/out`
   with the reader gone it answered `false`; it now answers `true`, as
   `PrintStream.checkError` already did.
