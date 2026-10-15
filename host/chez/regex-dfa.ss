@@ -44,7 +44,10 @@
 ;; EVERYTHING ELSE IS THE VENDORED ALGORITHM, COPIED. host/chez/regex-dfa-check.ss
 ;; (make regexdfacheck) pins the upstream definition this was derived from, so
 ;; bumping the irregex submodule cannot leave this silently stale. The same goes
-;; for the search procedures at the end of the file (#1327).
+;; for the search procedures at the end of the file (#1327), whose anchored match
+;; is now the backtracker regex.ss attaches rather than dfa-match/longest
+;; (jolt-6gkc, see jolt-dfa-anchored-match), and whose searcher path records
+;; where its match starts.
 
 ;; ~74ms on the #945 pattern before it gives up, measured on the dev box against
 ;; a compile that then takes 0ms to build the backtracking matcher. Raising it
@@ -131,7 +134,7 @@
 ;; The retry now asks a cheaper question first: can a match START here at all?
 ;; jolt-dfa-viable? steps the anchored DFA without tags or allocation and answers
 ;; as soon as it reaches an accepting state or dies. Only a position that passes
-;; pays for dfa-match/longest, and a position that passes always matches, so the
+;; pays for the anchored match, and a position that passes always matches, so the
 ;; anchored match runs at most twice per search: once at the origin, which is
 ;; tried directly so an early match costs what it did, and once where the match
 ;; is. Most rejected positions never get as far as the probe: their first
@@ -171,13 +174,31 @@
             (let ((next (get-next src)))
               (and next (lp1 next (get-start next) state))))))))))
 
+;; jolt-6gkc: the match that STARTS at i, once the DFA has said one does.
+;; irregex's DFA is POSIX leftmost-longest, and java.util.regex is leftmost-first:
+;; the two agree on where the first match starts — that is just the earliest
+;; position from which the pattern matches at all — but not on where it ends.
+;; (re-find #"[ab]|c*.+" "bb") is "b" on the JVM, the first alternative that
+;; works, and dfa-match/longest made it "bb". So the DFA keeps the part it is
+;; good at, rejecting positions in linear time (the #".*z" scan regex.ss keeps
+;; it for), and the backtracking matcher regex.ss attaches as the irregex's nfa
+;; decides the end, exactly as the JVM would, from the one start that matters.
+;; An irregex without one (built outside regex.ss) keeps the longest match.
+(define (jolt-dfa-anchored-match irx cnk init src i matches)
+  (let ((matcher (irregex-nfa irx)))
+    (if matcher
+        (let ((m (matcher cnk init src ((chunker-get-str cnk) src) i
+                          ((chunker-get-end cnk) src) matches (lambda () #f))))
+          (and m (begin (%irregex-match-fail-set! m #f) #t)))
+        (dfa-match/longest (irregex-dfa irx) cnk src i #f #f matches 0))))
+
 (define (irregex-search/matches irx cnk init src i matches)
   (cond
    ((irregex-dfa irx)
     (cond
      ((flag-set? (irregex-flags irx) ~searcher?)
       (cond
-       ((dfa-match/longest (irregex-dfa irx) cnk src i #f #f matches 0)
+       ((jolt-dfa-anchored-match irx cnk init src i matches)
         (irregex-match-start-chunk-set! matches 0 src)
         (irregex-match-start-index-set! matches 0 i)
         matches)
@@ -214,7 +235,7 @@
                                         (jolt-dfa-viable? dfa (dfa-next-state dfa cell)
                                                           cnk src (+ i 1)))))
                              (jolt-dfa-viable? dfa start-state cnk src i)))
-                     (dfa-match/longest dfa cnk src i #f #f matches 0))
+                     (jolt-dfa-anchored-match irx cnk init src i matches))
                 (irregex-match-start-chunk-set! matches 0 src)
                 (irregex-match-start-index-set! matches 0 i)
                 matches)
@@ -228,6 +249,13 @@
    (else
     (let ((res (irregex-search/backtrack irx cnk init src i matches)))
       (if res (%irregex-match-fail-set! res #f))
+      ;; jolt: a searcher (a pattern led by `.*`) is tried at i alone, and the
+      ;; backtracker records the match as starting at (cdr init), the search
+      ;; ORIGIN. A matcher's second find over #"(?s).*" therefore reported the
+      ;; first match's start again; the match starts at i.
+      (when (and res (flag-set? (irregex-flags irx) ~searcher?))
+        (irregex-match-start-chunk-set! res 0 src)
+        (irregex-match-start-index-set! res 0 i))
       res))))
 
 (define (dfa-match/shortest dfa cnk src start matches index)

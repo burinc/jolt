@@ -9,9 +9,10 @@
 ;; `look-behind` arm gains an O(1) fast path for single-character bodies and a
 ;; width-bounded rescan for wider ones; the symbol arm gains the zero-width
 ;; `%look-behind-end` assertion that bounded rescan needs, and a direct compilation
-;; of the java.util.regex line anchors (host/chez/java/regex-anchors.ss); and the
-;; three "empty repetition" guards ask `%sre-empty?`, which knows those anchors are
-;; zero-width, rather than the vendored `sre-empty?`, which does not.
+;; of the java.util.regex line anchors (host/chez/java/regex-anchors.ss).  The
+;; repetition arms (`*`, `*?`, `+`, `**`, `**?`) are marked "jolt-0e5k": a body
+;; that can match empty no longer raises "invalid sre: empty *" or loops forever,
+;; it runs under java.util.regex's zero-length-iteration rule (see %iterate below).
 ;;
 ;; Why: the vendored `look-behind` compiles its body as `(* any) X eos` against a
 ;; chunk wrapped to end at the current position, so it rescans from the chunk
@@ -240,6 +241,67 @@
 ;; the identifier at its underscore, against the JVM's (0 3).  jolt-406.
 (define (%word-char? c) (or (char-alphanumeric? c) (eqv? c #\_)))
 
+;; jolt-0e5k: a repetition over a body that can match empty — (?:c?)*, (x?)*y,
+;; (?:.*?|a)+ — is legal Java and common, and irregex either refused it ("invalid
+;; sre: empty *") or, where its `sre-empty?` missed the body, compiled a loop that
+;; re-entered the body at the same position forever.  java.util.regex's Loop and
+;; LazyLoop run such a body under one rule: an iteration that consumed nothing ENDS
+;; the repetition, and the match carries on with what follows it.
+;;
+;; That needs the position the current iteration started at, and the body's
+;; continuation is compiled once, so it is kept in a per-repetition cell: %iterate
+;; records (src . i) before entering the body and puts the previous value back
+;; when the body fails, so a backtrack into an earlier iteration finds that
+;; iteration's start again.  The cell is a THREAD parameter because a compiled
+;; pattern is cached and shared, and two threads matching it at once must not see
+;; each other's positions.  Only a body %sre-nullable? says can be empty pays any
+;; of this; every other repetition compiles exactly as irregex wrote it.
+(define (%iterate cell body cnk init src str i end matches fail)
+  (let ((old (cell)))
+    (cell (cons src i))
+    (body cnk init src str i end matches
+          (lambda () (cell old) (fail)))))
+
+;; Did the iteration whose body just matched up to (src, i) consume nothing?
+(define (%iteration-empty? cell src i)
+  (let ((start (cell)))
+    (and (eq? (car start) src) (eqv? (cdr start) i))))
+
+;; jolt-0e5k: java.util.regex compiles a capturing group whose body always
+;; matches exactly nothing — (^), (), (\b), ((?=x)) — and is quantified greedily
+;; from zero as a GroupCurly, which runs the body once and, finding it consumed
+;; nothing, ends the loop WITHOUT recording the group: (re-find #"(^)*x" "x") is
+;; ["x" nil]. Groups inside the body keep what they captured. So `(* (submatch X))`
+;; over such an X is `(? X)` with the group's number reserved but never set,
+;; which is what `(dsm 1 0 X)` says. This answers X's sequence, or #f.
+;;
+;; "Always nothing" is Java's deterministic zero length: assertions and empty
+;; groups, but no alternation of real branches — ((?=x)|(?=y))* runs as a Loop and
+;; does capture. Java's \b is one node, so the (or bow eow) it translates to counts.
+(define (%zero-width-group-body sre)
+  (define (assertion? x)
+    (or (memq x '(bos eos bol eol bow eow nwb epsilon
+                  %java-bol %java-eol %java-final-eol
+                  %java-bol-unix %java-final-eol-unix))
+        (equal? x "")))
+  (define (det-empty? x)
+    (cond ((assertion? x) #t)
+          ((pair? x)
+           (case (car x)
+             ((look-ahead look-behind neg-look-ahead neg-look-behind) #t)
+             ((or) (let lp ((xs (cdr x)))
+                     (or (null? xs) (and (assertion? (car xs)) (lp (cdr xs))))))
+             ((seq : submatch $) (all? (cdr x)))
+             ((=> submatch-named) (all? (cddr x)))
+             (else #f)))
+          (else #f)))
+  (define (all? xs) (or (null? xs) (and (det-empty? (car xs)) (all? (cdr xs)))))
+  (and (pair? sre)
+       (case (car sre)
+         ((submatch $) (and (all? (cdr sre)) (cdr sre)))
+         ((=> submatch-named) (and (all? (cddr sre)) (cddr sre)))
+         (else #f))))
+
 (define (sre->procedure sre . o)
   (define names
     (if (and (pair? o) (pair? (cdr o))) (cadr o) (sre-names sre 1 '())))
@@ -325,8 +387,26 @@
                        (lambda () (body cnk init src str i end matches fail))))))
             ((*)
              (cond
-              ((%sre-empty? (sre-sequence (cdr sre)))
-               (error "invalid sre: empty *" sre))
+              ((%zero-width-group-body (sre-sequence (cdr sre)))
+               => (lambda (body) (rec `(? (dsm 1 0 ,@body)))))
+              ((%sre-nullable? (sre-sequence (cdr sre)))
+               ;; jolt-0e5k: greedy, and an empty iteration ends the loop.
+               (letrec
+                   ((cell (make-thread-parameter #f))
+                    (body
+                     (lp (sre-sequence (cdr sre))
+                         n
+                         flags
+                         (lambda (cnk init src str i end matches fail)
+                           (if (%iteration-empty? cell src i)
+                               (next cnk init src str i end matches fail)
+                               (%iterate cell body cnk init src str i end matches
+                                         (lambda ()
+                                           (next cnk init src str i end matches fail))))))))
+                 (lambda (cnk init src str i end matches fail)
+                   (%iterate cell body cnk init src str i end matches
+                             (lambda ()
+                               (next cnk init src str i end matches fail))))))
               (else
                (let ((body (rec (list '+ (sre-sequence (cdr sre))))))
                  (lambda (cnk init src str i end matches fail)
@@ -335,8 +415,25 @@
                            (next cnk init src str i end matches fail))))))))
             ((*?)
              (cond
-              ((%sre-empty? (sre-sequence (cdr sre)))
-               (error "invalid sre: empty *?" sre))
+              ((%sre-nullable? (sre-sequence (cdr sre)))
+               ;; jolt-0e5k: lazy — what follows first, then one more
+               ;; iteration — and an empty iteration ends the loop.
+               (letrec
+                   ((cell (make-thread-parameter #f))
+                    (try
+                     (lambda (cnk init src str i end matches fail)
+                       (next cnk init src str i end matches
+                             (lambda ()
+                               (%iterate cell body cnk init src str i end matches fail)))))
+                    (body
+                     (lp (sre-sequence (cdr sre))
+                         n
+                         flags
+                         (lambda (cnk init src str i end matches fail)
+                           (if (%iteration-empty? cell src i)
+                               (next cnk init src str i end matches fail)
+                               (try cnk init src str i end matches fail))))))
+                 try))
               (else
                (letrec
                    ((body
@@ -354,8 +451,23 @@
                            (body cnk init src str i end matches fail))))))))
             ((+)
              (cond
-              ((%sre-empty? (sre-sequence (cdr sre)))
-               (error "invalid sre: empty +" sre))
+              ((%sre-nullable? (sre-sequence (cdr sre)))
+               ;; jolt-0e5k: the first iteration is required, an empty one
+               ;; ends the loop.
+               (letrec
+                   ((cell (make-thread-parameter #f))
+                    (body
+                     (lp (sre-sequence (cdr sre))
+                         n
+                         flags
+                         (lambda (cnk init src str i end matches fail)
+                           (if (%iteration-empty? cell src i)
+                               (next cnk init src str i end matches fail)
+                               (%iterate cell body cnk init src str i end matches
+                                         (lambda ()
+                                           (next cnk init src str i end matches fail))))))))
+                 (lambda (cnk init src str i end matches fail)
+                   (%iterate cell body cnk init src str i end matches fail))))
               (else
                (letrec
                    ((body
@@ -374,6 +486,11 @@
              (rec `(** ,(cadr sre) #f ,@(cddr sre))))
             ((**)
              (cond
+              ((and (eqv? (cadr sre) 0)
+                    (not (eqv? (caddr sre) 0))
+                    (%zero-width-group-body (sre-sequence (cdddr sre))))
+               ;; jolt-0e5k: {0,n} over a zero-width group, as `*` above.
+               => (lambda (body) (rec `(? (dsm 1 0 ,@body)))))
               ((or (and (number? (cadr sre))
                         (number? (caddr sre))
                         (> (cadr sre) (caddr sre)))
@@ -384,15 +501,25 @@
                    ((from (cadr sre))
                     (to (caddr sre))
                     (body-contents (sre-sequence (cdddr sre)))
+                    ;; jolt-0e5k: a body that can match empty runs each
+                    ;; iteration through %iterate, and an empty one ends the loop.
+                    (nullable? (%sre-nullable? (sre-sequence (cdddr sre))))
+                    (cell (make-thread-parameter #f))
+                    (enter
+                     (lambda (b cnk init src str i end matches fail)
+                       (if nullable?
+                           (%iterate cell b cnk init src str i end matches fail)
+                           (b cnk init src str i end matches fail))))
                     (body
                      (lambda (count)
                        (lp body-contents
                            n
                            flags
                            (lambda (cnk init src str i end matches fail)
-                             (if (and to (= count to))
+                             (if (or (and to (= count to))
+                                     (and nullable? (%iteration-empty? cell src i)))
                                  (next cnk init src str i end matches fail)
-                                 ((body (+ 1 count))
+                                 (enter (body (+ 1 count))
                                   cnk init src str i end matches
                                   (lambda ()
                                     (if (>= count from)
@@ -401,7 +528,7 @@
                  (if (and (zero? from) to (zero? to))
                      next
                      (lambda (cnk init src str i end matches fail)
-                       ((body 1) cnk init src str i end matches
+                       (enter (body 1) cnk init src str i end matches
                         (lambda ()
                           (if (zero? from)
                               (next cnk init src str i end matches fail)
@@ -418,29 +545,42 @@
                    ((from (cadr sre))
                     (to (caddr sre))
                     (body-contents (sre-sequence (cdddr sre)))
+                    ;; jolt-0e5k: a body that can match empty runs each
+                    ;; iteration through %iterate, and an empty one ends the loop.
+                    (nullable? (%sre-nullable? (sre-sequence (cdddr sre))))
+                    (cell (make-thread-parameter #f))
+                    (enter
+                     (lambda (b cnk init src str i end matches fail)
+                       (if nullable?
+                           (%iterate cell b cnk init src str i end matches fail)
+                           (b cnk init src str i end matches fail))))
                     (body
                      (lambda (count)
                        (lp body-contents
                            n
                            flags
                            (lambda (cnk init src str i end matches fail)
-                             (if (< count from)
-                                 ((body (+ 1 count)) cnk init
-                                  src str i end matches fail)
-                                 (next cnk init src str i end matches
-                                       (lambda ()
-                                         (if (and to (= count to))
-                                             (fail)
-                                             ((body (+ 1 count)) cnk init
-                                              src str i end matches fail))))))))))
+                             (cond
+                              ((and nullable? (%iteration-empty? cell src i))
+                               (next cnk init src str i end matches fail))
+                              ((< count from)
+                               (enter (body (+ 1 count)) cnk init
+                                      src str i end matches fail))
+                              (else
+                               (next cnk init src str i end matches
+                                     (lambda ()
+                                       (if (and to (= count to))
+                                           (fail)
+                                           (enter (body (+ 1 count)) cnk init
+                                                  src str i end matches fail)))))))))))
                  (if (and (zero? from) to (zero? to))
                      next
                      (lambda (cnk init src str i end matches fail)
                        (if (zero? from)
                            (next cnk init src str i end matches
                                  (lambda ()
-                                   ((body 1) cnk init src str i end matches fail)))
-                           ((body 1) cnk init src str i end matches fail))))))))
+                                   (enter (body 1) cnk init src str i end matches fail)))
+                           (enter (body 1) cnk init src str i end matches fail))))))))
             ((word)
              (rec `(seq bow ,@(cdr sre) eow)))
             ((word+)

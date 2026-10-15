@@ -151,23 +151,39 @@
        (and cell (not (procedure? (cdr cell))) (%sre-cset-able? (cdr cell)))))
     (else #f)))
 
-;; Zero-width, every one of them: a `*` or `+` over one is the "empty repetition"
-;; irregex rejects, and it has to keep rejecting it — the vendored `sre-empty?`
-;; answers #f for a symbol it does not know, which would compile `$*` into a loop
-;; that never advances.  regex-anchor-sre.scm asks THIS instead.
-(define (%sre-empty? sre)
-  (if (pair? sre)
-      (case (car sre)
-        ((* ? look-ahead look-behind neg-look-ahead neg-look-behind) #t)
-        ((**) (or (not (number? (cadr sre))) (zero? (cadr sre))))
-        ((or) (let lp ((xs (cdr sre)))
-                (and (pair? xs) (or (%sre-empty? (car xs)) (lp (cdr xs))))))
-        ((: seq $ submatch => submatch-named + atomic)
-         (let lp ((xs (cdr sre)))
-           (or (null? xs) (and (%sre-empty? (car xs)) (lp (cdr xs))))))
-        (else #f))
-      (or (and (%java-anchor-proc sre) #t)
-          (and (memq sre '(epsilon bos eos bol eol bow eow commit)) #t))))
+;; Can SRE match the empty string?  A repetition over a body that can is the
+;; java.util.regex zero-length-iteration case: (?:c?)*, (x?)*y, (?:.*?|a)+.
+;; irregex refuses some of these outright ("invalid sre: empty *") and, worse,
+;; compiles the ones its own `sre-empty?` misses — a lazy body, a `{0,n}` body —
+;; into a loop that never advances.  regex-anchor-sre.scm instead compiles every
+;; repetition this answers #t for with the JVM's rule: an iteration that consumed
+;; nothing ends the loop (jolt-0e5k).
+;;
+;; It only has to be SAFE: a #t for a body that cannot really match empty costs
+;; the guard's bookkeeping and nothing else, so anything not modelled answers #t.
+;; A #f has to be right, or the loop it guards is the unguarded one.
+(define (%sre-nullable? sre)
+  (define (all? xs) (or (null? xs) (and (%sre-nullable? (car xs)) (all? (cdr xs)))))
+  (define (any? xs) (and (pair? xs) (or (%sre-nullable? (car xs)) (any? (cdr xs)))))
+  (cond
+    ((char? sre) #f)
+    ((string? sre) (zero? (string-length sre)))
+    ((symbol? sre)
+     (not (or (memq sre '(any nonl)) (%sre-cset-able? sre))))
+    ((pair? sre)
+     (if (string? (car sre))
+         #f                                    ; ("abc"), an enumerated char set
+         (case (car sre)
+           ((~ - & /) #f)                      ; a char set: exactly one unit
+           ((seq : submatch $ atomic w/case w/nocase w/utf8 w/noutf8)
+            (all? (cdr sre)))
+           ((=> submatch-named) (all? (cddr sre)))
+           ((or) (any? (cdr sre)))
+           ((+ +?) (all? (cdr sre)))
+           ((= >=) (or (eqv? (cadr sre) 0) (all? (cddr sre))))
+           ((** **?) (or (eqv? (cadr sre) 0) (all? (cdddr sre))))
+           (else #t))))                        ; * *? ? ?? look-around backref ...
+    (else #t)))
 
 ;; Nothing above reaches the matcher until the translator emits the primitives,
 ;; and it only does that once this says the host can compile them — a host that

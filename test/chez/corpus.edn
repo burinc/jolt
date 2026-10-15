@@ -6105,6 +6105,31 @@
   ;; looking: a lookahead match ahead of the search start was re-found and
   ;; emitted a spurious empty segment (#940)
   {:suite "regex / re-seq zero-width" :label "a zero-width lookahead split resumes after the match (#940)" :expected "[\"a\" \"Xb\" \"X\" \"Xc\" \"Xd\"]" :actual "(clojure.string/split \"aXbXXcXd\" #\"(?=X)\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a nullable body under * compiles" :expected "\"cc\"" :actual "(re-find #\"(?:c?)*\" \"ccd\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a capturing nullable body under *" :expected "[\"xxy\" \"\"]" :actual "(re-find #\"(x?)*y\" \"xxy\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a nullable body under +" :expected "[\"\" \"\"]" :actual "(re-find #\"(a*)+\" \"b\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a lazy nullable body terminates" :expected "\"\"" :actual "(re-find #\"(?:.*?|a)+\" \"abcbb\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a lazy body under a lazy loop" :expected "\"c\"" :actual "(re-find #\"(?:a??)+?.\" \"caaaba\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a nullable body under {2,}" :expected "[\"a\" \"\"]" :actual "(re-find #\"(a?){2,}\" \"ab\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a nullable body under {0,2}?" :expected "[\"abc\" \"b\"]" :actual "(re-find #\"[ab](b??){0,2}?c\" \"abc\")" :portability :common}
+  {:suite "regex / empty repetition" :label "re-seq over an empty-iteration loop" :expected "[\"aa\" \"\" \"\"]" :actual "(vec (re-seq #\"(?:a|)*\" \"aab\"))" :portability :common}
+  {:suite "regex / empty repetition" :label "a zero-width group under * is not captured" :expected "[\"x\" nil]" :actual "(re-find #\"(^)*x\" \"x\")" :portability :common}
+  {:suite "regex / empty repetition" :label "an empty group under * is not captured" :expected "[\"\" nil]" :actual "(re-find #\"()*\" \"x\")" :portability :common}
+  {:suite "regex / empty repetition" :label "an empty group under {0,2} is not captured" :expected "[\"\" nil]" :actual "(re-find #\"(){0,2}\" \"x\")" :portability :common}
+  {:suite "regex / empty repetition" :label "a zero-width group under + is captured" :expected "[\"\" \"\"]" :actual "(re-find #\"((?=x))+\" \"x\")" :portability :common}
+  {:suite "regex / empty repetition" :label "an alternation of look-aheads under * is captured" :expected "[\"\" \"\"]" :actual "(re-find #\"((?=x)|(?=y))*\" \"x\")" :portability :common}
+  {:suite "regex / empty repetition" :label "an inner group of a zero-width group keeps its capture" :expected "[\"\" nil \"\"]" :actual "(re-find #\"((^))*\" \"x\")" :portability :common}
+  {:suite "regex / leftmost-first" :label "alternation before an unbounded repetition" :expected "\"b\"" :actual "(re-find #\"[ab]|c*.+\" \"bb\")" :portability :common}
+  {:suite "regex / leftmost-first" :label "a single unit before a repetition with a tail" :expected "\"c\"" :actual "(re-find #\".|.[ab]+c\" \"cbacac\")" :portability :common}
+  {:suite "regex / leftmost-first" :label "an empty first branch wins" :expected "\"\"" :actual "(re-find #\"c*|a+c|[ab].\" \"abb\")" :portability :common}
+  {:suite "regex / leftmost-first" :label "re-seq takes the first branch each time" :expected "[\"b\" \"ca\"]" :actual "(vec (re-seq #\"b|.+.\" \"bca\"))" :portability :common}
+  {:suite "regex / leftmost-first" :label "(?:a*b)* scans like the JVM" :expected "[\"\" \"\" \"\" \"b\" \"\" \"ab\" \"\" \"\" \"\"]" :actual "(vec (re-seq #\"(?:a*b)*\" \"aXXb ab a\"))" :portability :common}
+  {:suite "regex / leftmost-first" :label "an empty leading alternative" :expected "\"\"" :actual "(re-find #\"|a\" \"a\")" :portability :common}
+  {:suite "regex / leftmost-first" :label "lookingAt takes the first branch" :expected "\"a\"" :actual "(let [m (re-matcher #\"a|.*b\" \"ab\")] (when (.lookingAt m) (.group m)))" :portability :common}
+  {:suite "regex / anchored global scan" :label "a trailing .* still finds the empty match at the end" :expected "[\"c\" \"\"]" :actual "(vec (re-seq #\"(?s).*\" \"c\"))" :portability :common}
+  {:suite "regex / anchored global scan" :label ".find(int) past the start on a trailing-.* pattern" :expected "\"b\"" :actual "(let [m (re-matcher #\"(?s)b.*\" \"ab\")] (when (.find m 1) (.group m)))" :portability :common}
+  {:suite "regex / anchored global scan" :label "a matcher's second find on a leading-.* pattern starts where it resumes" :expected "[2 2]" :actual "(let [m (re-matcher #\"(?s).*(?:a)??\" \"bc\")] (.find m) (.find m) [(.start m) (.end m)])" :portability :common}
+  {:suite "regex / anchored global scan" :label "^ still anchors a re-seq scan" :expected "[\"abc\"]" :actual "(vec (re-seq #\"^abc\" \"abcabc\"))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a rest-derived seq prepends" :expected "true" :actual "(= [9 2 3] (vec (conj (rest [1 2 3]) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a lazy-seq prepends" :expected "true" :actual "(= [9 1 2] (vec (conj (lazy-seq (list 1 2)) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "into over a conj'd rest-seq" :expected "true" :actual "(= [0 2 3] (into [] (conj (rest [1 2 3]) 0)))" :portability :common}
