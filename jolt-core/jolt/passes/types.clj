@@ -16,7 +16,7 @@
               join-t join type-depth cap struct-safe? field-type type-shape
               mark-struct truthy-type? num-ret-fns vector-ret-fns
               str-ret-fns string-ns-ret-fns nilable? strip-nilable
-              interop-ret-type]]))
+              interop-ret-type decl decl-of erase-decl]]))
 
 ;; --- engine state ------------------------------------------------------------
 ;; The walk threads an immutable `env` (mk-env) instead of reading scattered
@@ -209,17 +209,17 @@
 ;; The scalar tags arrive already normalized by chez-resolve-field-tag
 ;; (host/chez/records.ss): "double", "num" (which is also where ^long lands),
 ;; "str" and "kw". A tag that is none of those is a record type name to recurse
-;; into. The point of "str"/"kw" is that a field read now PROVES its receiver for
-;; the interop path — (.length (:nm p)) on a ^String field emits the string native
-;; with no runtime string? test — and feeds the same success checking a ^String
-;; parameter already gets.
+;; into. The point of "str"/"kw" is that a field read now carries its declared
+;; type to the interop path — (.length (:nm p)) on a ^String field emits the
+;; string native with no runtime string? test. Declared, not proven: the
+;; constructor doesn't check the value, so nothing else trusts it (lattice decl).
 (defn- field-type-from-tag [tag depth shapes ctor-key field-kw]
   (cond
     (<= depth 0) :any
     (= tag "double") :double
     (= tag "num") :num
-    (= tag "str") :str
-    (= tag "kw") :kw
+    (= tag "str") (decl :str)
+    (= tag "kw") (decl :kw)
     (some? tag) (let [e (get shapes tag)]
                   (if e (record-type-from-entry e tag depth shapes) :any))
     :else (let [box *field-type-box*
@@ -318,6 +318,8 @@
 (defn- pred-on [pname t]
   (cond
     (or (= t :any) (= t :truthy)) nil
+    ;; a declared ^String/^Keyword proves nothing: the value may be anything
+    (some? (decl-of t)) nil
     ;; a nilable struct might be nil — nil?/some?/record? can't be proven, so the
     ;; runtime guard must stay (this is what makes the narrowing sound).
     (nilable? t) nil
@@ -400,7 +402,7 @@
             (if (and self-params (< i (count self-params))
                      (= :local (get a :op)) (= (get a :name) (nth self-params i)))
               nil
-              (ty (nth ares i)))))
+              (erase-decl (ty (nth ares i))))))
         (range (count ares))))
 
 ;; arithmetic core ops that yield a flonum when their operands are flonums, used
@@ -461,7 +463,7 @@
                                  (let [existing (into {} (get a :nhints))]
                                    (if (= ret-ty :double) (merge nh existing) existing)))]))
                   (get node :arities))
-        rets (mapv (fn [r] (ty r)) res)
+        rets (mapv (fn [r] (erase-decl (ty r))) res)
         ret (if (empty? rets) :any (reduce join (first rets) (rest rets)))]
     [ret (assoc node :arities (mapv (fn [r] (nd r)) res))]))
 
@@ -596,7 +598,7 @@
         shapes (get env :record-shapes)
         entry (get shapes vk)
         n (count args)
-        ats (mapv ty ares)]
+        ats (mapv (fn [r] (erase-decl (ty r))) ares)]
     (cond
       ;; direct positional ctor ->Name with matching arity. Skip the auto-generated
       ;; map->Name template body (:map->-ctor-key / a specializable map-> self-name):
@@ -688,7 +690,7 @@
                  [(var-key fnode)
                   (if self?
                     (self-rec-argtys args ares (get env :self-params))
-                    (mapv (fn [r] (ty r)) ares))]))))
+                    (mapv (fn [r] (erase-decl (ty r))) ares))]))))
     ;; a named fn calling itself binds its name as a :local, so the recursion is
     ;; invisible to the var-call collection above — yet it constrains the fn's own
     ;; params. Collect it under the fn's var-key so the whole-program fixpoint joins
@@ -837,17 +839,18 @@
                     ent (record-type-from-entry ent ck type-depth (get env :record-shapes))
                     ;; a DECLARED ^String / ^Keyword hint, which the analyzer put on
                     ;; this reference (hint-of). The interop emit has always trusted
-                    ;; it — it is what stamps :target-type — so the lattice trusts it
-                    ;; too, which is what lets a hinted binding reach the type-directed
-                    ;; emit sites (count/str over proven strings) and the success
-                    ;; checker, not just the `.method` path. Fills in only where
+                    ;; it — it is what stamps :target-type — and the lattice carries
+                    ;; it as declared, so a let-bound copy reaches the `.method` path
+                    ;; too. Not as :str/:kw: a hint proves nothing about the value,
+                    ;; so string?/nil? mustn't fold on it, nor count/str lower to
+                    ;; the string natives (lattice decl). Fills in only where
                     ;; inference has nothing, exactly as :rec-hint above does.
                     ;;
                     ;; :struct and :sb are deliberately absent: a :struct hint is
                     ;; consumed by mark-struct/:shape at the lookup sites and has no
                     ;; scalar to name here, and the lattice has no StringBuilder type.
-                    (= :str (get node :hint)) :str
-                    (= :kw (get node :hint)) :kw
+                    (= :str (get node :hint)) (decl :str)
+                    (= :kw (get node :hint)) (decl :kw)
                     :else (if t0 t0 :any)))
                 t0)]
         [t
@@ -1021,8 +1024,8 @@
             tt (nth tr 0)
             n (if (some? (get n :target-type))
                 n
-                (cond (= :str tt) (assoc n :target-type :str)
-                      (= :kw tt) (assoc n :target-type :kw)
+                (cond (or (= :str tt) (= :str (decl-of tt))) (assoc n :target-type :str)
+                      (or (= :kw tt) (= :kw (decl-of tt))) (assoc n :target-type :kw)
                       :else n))
             rt (interop-ret-type (get n :target-type) (get n :method))]
         [(if rt rt :any) n])
@@ -1191,7 +1194,7 @@
      (let [env (assoc (mk-env unit false false)
                       :self-name self-name :self-key self-key :self-params self-params)
            r (infer body tenv env)]
-       [(nth r 0) (nth r 1) @(get env :calls)]))))
+       [(erase-decl (nth r 0)) (nth r 1) @(get env :calls)]))))
 
 ;; --- protocol-method return types -------------------------------------------
 ;; An impl is emitted as (register-(inline-)method TAG "Proto" "method" (fn ...)).

@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and over a Reader the program wrote it read one character at a time. `mark` and `reset` are the buffer's own, a line ending in
   `\r\n` no longer leaves the `\n` for the next `read`, and a closed reader
   answers `Stream closed`.
+- **A type hint no longer stands in for the value in a built binary.** In a
+  `jolt build`, a `^String` or `^Keyword` on a parameter, a local or a record
+  field was taken as proof of what it held: `string?` folded true and `nil?`
+  false on it, `count` and `str` went straight to the string primitives, and
+  the "proof" travelled into the unhinted functions it was passed to. So a
+  wrong or nil hinted value answered wrongly or crashed, where Clojure only
+  uses the hint to pick the interop method. ring-codec's `form-encode`, whose
+  `^String` encoding is a `Charset`, threw `IllegalCharsetNameException` in
+  every build but `--dev`. A hint now types the value as declared: `.method` calls
+  still dispatch on it directly, and nothing else trusts it.
 
 ## [0.8.22] - 2026-10-15
 

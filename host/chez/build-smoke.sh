@@ -809,6 +809,24 @@ if [ "$nil_fold_got" != "$nil_fold_want" ]; then
   echo "  FAIL: nil?/some? fold inverted — got \`$nil_fold_got\`, want \`$nil_fold_want\`"; exit 1
 fi
 
+# A ^String/^Keyword hint is a contract for interop, not a proof of the value.
+# Inference trusted it as one, so under --opt a hinted parameter folded string?
+# true and nil? false, carried the "proof" into the unhinted helper it called,
+# and lowered count/str to the string natives: ring-codec's form-encode* (whose
+# ^String encoding is a Charset) called Charset/forName on a Charset, and this
+# app printed [:named :utf-8] / true / false and crashed in string-length. The
+# hint still drives interop, directly and through a let.
+hint_proof_app="$root/test/chez/hint-proof-app"
+hint_proof_out="$(dirname "$out")/hint-proof-bin"
+if ! JOLT_PWD="$hint_proof_app" "$jolt" build -m app.core -o "$hint_proof_out" --opt >/dev/null 2>&1; then
+  echo "  FAIL: hint-proof --opt build exited non-zero"; exit 1
+fi
+hint_proof_got="$(cd "$hint_proof_app" && "$hint_proof_out" 2>&1)"
+hint_proof_want="$(printf ':utf-8\n:utf-8\nfalse\ntrue\nfalse\n3\n12\ntrue\nAB\n3')"
+if [ "$hint_proof_got" != "$hint_proof_want" ]; then
+  echo "  FAIL: a type hint taken as proof of the value — got \`$hint_proof_got\`, want \`$hint_proof_want\`"; exit 1
+fi
+
 # The accumulator of a reduce closure is the init only on the FIRST call; after
 # that it is whatever the closure returned. Inference seeded it from the init
 # alone, so under --opt a nil init proved acc :nil (nil?/some? folded to constants)
