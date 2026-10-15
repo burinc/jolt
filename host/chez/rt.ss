@@ -550,12 +550,17 @@
          (let ((pct (or (env-number "JOLT_MAX_RAM_PERCENTAGE" 0.01 100 "a percentage of RAM, 0-100") 25)))
            (exact (floor (* base (/ (inexact pct) 100))))))))
 (define jolt-heap-ceiling-bytes #f)      ; #f until installed; #f = unbounded
+(define jolt-gc-policy-installed? #f)
 (define (jolt-heap-max-bytes) jolt-heap-ceiling-bytes)
+;; The ceiling JOLT_MAX_HEAP asks for, else the default; #f for none.
+(define (heap-ceiling-wanted)
+  (let ((env (heap-from-env)))
+    (cond ((eq? env 'off) #f)
+          ((and env (number? env)) env)
+          (else (heap-default-ceiling)))))
 (define (jolt-install-gc-policy!)
-  (let* ((env (heap-from-env))
-         (ceiling (cond ((eq? env 'off) #f)
-                        ((and env (number? env)) env)
-                        (else (heap-default-ceiling)))))
+  (set! jolt-gc-policy-installed? #t)
+  (let* ((ceiling (heap-ceiling-wanted)))
     ;; A ceiling under the runtime's own live heap cannot be satisfied: the
     ;; program would raise before reaching its entry point, from inside
     ;; namespace initialization, which reads as a mysterious failure rather
@@ -630,10 +635,13 @@
 ;; segments are heap objects and count against the heap ceiling, so that is the
 ;; heap ceiling when one is in force (JOLT_MAX_HEAP, 25% of RAM or of a cgroup
 ;; limit by default): a limit above it would never be reached, the recursion
-;; meeting the ceiling first as an OutOfMemoryError. With no ceiling
-;; (JOLT_MAX_HEAP=off, or source mode, which installs no collector policy) it is
-;; 80% of RLIMIT_AS if that is finite, else of RLIMIT_DATA, else of physical
-;; RAM. Applied to each thread's stack separately, as Guile's is per thread.
+;; meeting the ceiling first as an OutOfMemoryError. Source mode installs no
+;; collector policy, so there the base is the ceiling a built program would get
+;; (heap-ceiling-wanted): with RAM as the base instead, each thread could grow a
+;; stack to most of the machine before overflowing. With no ceiling at all
+;; (JOLT_MAX_HEAP=off) it is 80% of RLIMIT_AS if that is finite, else of
+;; RLIMIT_DATA, else of physical RAM. Applied to each thread's stack
+;; separately, as Guile's is per thread.
 ;;
 ;; The default follows the ceiling actually in force whichever is installed
 ;; first: jolt-install-gc-policy! tells the stack limit when it sets or drops
@@ -726,7 +734,9 @@
 ;; The default, from the heap ceiling in force now.
 (define (jolt-stack-limit-install-default!)
   (jolt-stack-limit-set!
-    (jolt-stack-limit-default jolt-heap-ceiling-bytes
+    (jolt-stack-limit-default (if jolt-gc-policy-installed?
+                                  jolt-heap-ceiling-bytes
+                                  (heap-ceiling-wanted))
                               (jolt-rlimit-bytes 'as)
                               (jolt-rlimit-bytes 'data)
                               ;; a container's limit under its host's RAM, as

@@ -54,6 +54,15 @@
 ;; is installed first: the stack limit's default is recomputed when the
 ;; collector policy installs or drops its ceiling.
 (define saved-ceiling jolt-heap-ceiling-bytes)
+(define saved-installed jolt-gc-policy-installed?)
+;; no collector policy (source mode): the base is the ceiling a built program
+;; would get, never physical RAM
+(set! jolt-gc-policy-installed? #f)
+(jolt-stack-limit-install-default!)
+(ok (format "2l. no policy installed: 80% of the default ceiling (~a)" (jolt-stack-limit))
+    (equal? (jolt-stack-limit)
+            (let ((c (heap-ceiling-wanted))) (and c (quotient (* c 4) 5)))))
+(set! jolt-gc-policy-installed? #t)
 (set! jolt-heap-ceiling-bytes #f)
 (jolt-stack-limit-install-default!)
 (define no-ceiling-default (jolt-stack-limit))
@@ -71,6 +80,7 @@
 (ok "2k. an explicit limit is not replaced by the ceiling's default"
     (= (jolt-stack-limit) (* 64 1024 1024)))
 (set! jolt-heap-ceiling-bytes saved-ceiling)
+(set! jolt-gc-policy-installed? saved-installed)
 
 ;; The real readings on this host: each an exact positive integer or #f.
 (define (reading? x) (or (not x) (and (exact? x) (integer? x) (> x 0))))
