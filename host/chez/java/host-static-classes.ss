@@ -1268,8 +1268,13 @@
                             (let ((slen (string-length s)))
                               (if (>= p slen) -1
                                   (let-values (((cbuf off len) (reader-read-buf-args rest)))
-                                    (let ((n (min len (- slen p))))
-                                      (let loop ((i 0)) (when (< i n) (ja-set! cbuf (+ off i) (string-ref s (+ p i))) (loop (+ i 1))))
+                                    (let ((n (min len (- slen p)))
+                                          (v (and (jolt-array? cbuf) (jolt-array-vec cbuf))))
+                                      ;; a char[] is backed by a string: one block copy
+                                      (if (and (string? v) (fixnum? off) (fx>=? off 0) (fx>=? n 0)
+                                               (fx<=? (fx+ off n) (string-length v)))
+                                          (string-copy! s p v off n)
+                                          (let loop ((i 0)) (when (< i n) (ja-set! cbuf (+ off i) (string-ref s (+ p i))) (loop (+ i 1)))))
                                       (sr-pos! self (+ p n)) (->num n)))))))))))
         (cons "mark" (lambda (self . _) (sr-s self) (vector-set! (jhost-state self) 2 (sr-pos self)) jolt-nil))
         (cons "reset" (lambda (self) (sr-s self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
