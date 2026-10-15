@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a Reader`, and `.read`, `.readLine` and `.unread` on `*in*` did not exist.
   Both the stdin reader and the one `with-in-str` binds answer them now, off
   the same cursor `read-line` and `read` use, and `.close` closes it (#1380).
+- **`BufferedReader` over a Reader jolt did not build reads ahead** like the
+  JDK's: it fills its own buffer with one `read` of 8192 characters (or the
+  size passed in), so `read-line` on `*in*` after `(io/reader *in*)` sees what
+  the JVM does. `mark` and `reset` are the buffer's own, a line ending in
+  `\r\n` no longer leaves the `\n` for the next `read`, and a closed reader
+  answers `Stream closed`.
 
 ## [0.8.22] - 2026-10-15
 

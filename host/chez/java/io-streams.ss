@@ -777,14 +777,23 @@
 ;; whose API accepts "any java.io.Reader" (an SSE body, a decorating wrapper)
 ;; cannot be ported without those two.
 ;;
-;; So: a delegating jhost. It holds the wrapped object and drives its .read —
-;; the one method java.io.Reader leaves abstract — and supplies readLine / lines
-;; / skip / ready / close on top, exactly as java.io.BufferedReader does over an
-;; arbitrary Reader. state #(inner pending-lf?), with pending-lf? the same \n-owed
-;; flag char-reader keeps.
+;; So: java.io.BufferedReader, ported from the JDK's. It fills a char buffer of
+;; its own from the wrapped object's .read -- the one method java.io.Reader
+;; leaves abstract -- asking for the whole buffer in one call, so what it has
+;; read ahead is gone from the wrapped reader, as on the JVM: (io/reader *in*)
+;; then read-line on *in* finds the lines the BufferedReader already holds.
+;; read / readLine / skip / ready / mark / reset work off that buffer.
+;;
+;; state #(inner skip-lf? cb next n mark limit mark-skip-lf?): cb is the char
+;; array (#f once closed), cb[next..n) the unread chars, mark the marked index,
+;; -1 unmarked or -2 invalidated, and skip-lf? that a readLine ended on \r so a
+;; \n next is the same line end.
 (define (reader-adapter? x) (and (jhost? x) (string=? (jhost-tag x) "reader-adapter")))
 (define (reader-adapter-inner self) (vector-ref (jhost-state self) 0))
-(define (make-reader-adapter inner) (make-jhost "reader-adapter" (vector inner #f)))
+(define (make-reader-adapter inner . size)
+  (let ((sz (if (pair? size) (car size) 8192)))
+    (when (<= sz 0) (throw-jvm (quote IllegalArgumentException) "Buffer size <= 0"))
+    (make-jhost "reader-adapter" (vector inner #f (na-char-array sz) 0 0 -1 0 #f))))
 ;; Does obj implement `name` at n arguments? A reify's method table is keyed by
 ;; NAME alone, so iface-method cannot answer the arity question for one; the
 ;; stored method is a plain procedure whose arity mask includes its own `self`,
@@ -843,79 +852,198 @@
   (and (not (jhost? x))
        (or (obj-has-method? x "read" 3) (obj-has-method? x "read" 0))
        (not (user-in-stream? x))))
-;; One character code from the wrapped reader, -1 at end of input. read() is a
-;; CONCRETE method on java.io.Reader and read(char[],int,int) the abstract one,
-;; so a hand-written Reader commonly has only the latter; drive whichever it has.
-(define (reader-adapter-read1 self)
-  (let ((inner (reader-adapter-inner self)))
-    (if (obj-has-method? inner "read" 0)
-        (let ((c (record-method-dispatch inner "read" jolt-nil)))
-          (if (jolt-nil? c) -1 (jnum->exact c)))
-        (let* ((buf (na-char-array 1))
-               (n (record-method-dispatch inner "read" (jolt-list buf 0 1))))
-          (if (or (jolt-nil? n) (< (jnum->exact n) 1))
-              -1
-              (char->integer (ja-ref buf 0)))))))
-(define (reader-adapter-get-char self)
-  (let ((c (reader-adapter-read1 self)))
-    (cond ((< c 0) (eof-object))
-          ((and (vector-ref (jhost-state self) 1) (= c 10))
-           (vector-set! (jhost-state self) 1 #f)
-           (reader-adapter-get-char self))
-          (else (vector-set! (jhost-state self) 1 #f) (integer->char c)))))
-(define (reader-adapter-line self)
-  (let ((out (open-output-string)))
-    (let loop ((any? #f))
-      (let ((c (reader-adapter-get-char self)))
-        (cond
-          ((eof-object? c) (if any? (get-output-string out) c))
-          ((char=? c #\newline) (get-output-string out))
-          ((char=? c #\return) (vector-set! (jhost-state self) 1 #t) (get-output-string out))
-          (else (write-char c out) (loop #t)))))))
-;; close / ready / mark / reset reach the wrapped reader when it has them. A
-;; Reader that implements none of them is still a legal argument here — the JVM's
-;; Reader gives close no default, but refusing to construct over one would be a
-;; worse answer than a wrapper whose close does nothing.
-(define (reader-adapter-relay self name default)
-  (let ((inner (reader-adapter-inner self)))
-    (if (obj-has-method? inner name 0) (record-method-dispatch inner name jolt-nil) default)))
+;; One read of the wrapped reader into buf: the count, or -1 at end of input.
+;; read(char[],int,int) is the abstract method, so a Reader has it; a reify that
+;; wrote only read() gets a character and then the rest while it says it is
+;; ready, which is how java.io.Reader's own read(char[],int,int) would drive it.
+(define (reader-adapter-inner-read inner buf off len)
+  (if (obj-has-method? inner "read" 3)
+      (let ((n (record-method-dispatch inner "read" (list->cseq (list buf (->num off) (->num len))))))
+        (if (jolt-nil? n) -1 (jnum->exact n)))
+      (jnum->exact
+       (reader-fill-available! buf off len
+         (lambda ()
+           (let ((c (record-method-dispatch inner "read" jolt-nil)))
+             (if (or (jolt-nil? c) (< (jnum->exact c) 0)) (eof-object) (integer->char (jnum->exact c)))))
+         (lambda () (reader-ready? inner))))))
+(define (ra-open! self)
+  (or (vector-ref (jhost-state self) 2) (throw-jvm 'java.io.IOException "Stream closed")))
+(define (ra-avail st) (- (vector-ref st 4) (vector-ref st 3)))
+(define (ra-peek st) (ja-ref (vector-ref st 2) (vector-ref st 3)))
+(define (ra-advance! st k) (vector-set! st 3 (+ k (vector-ref st 3))))
+;; BufferedReader.fill: keep what a live mark still covers, then one read of the
+;; wrapped reader for the rest of the buffer (again while it answers 0).
+(define (ra-fill! self)
+  (let* ((st (jhost-state self))
+         (mark (vector-ref st 5))
+         (dst (if (< mark 0)
+                  0
+                  (let ((delta (- (vector-ref st 3) mark))
+                        (limit (vector-ref st 6)))
+                    (if (>= delta limit)
+                        (begin (vector-set! st 5 -2) (vector-set! st 6 0) 0)
+                        (let* ((cb (vector-ref st 2))
+                               (to (if (<= limit (ja-len cb))
+                                       cb
+                                       (let ((b (na-char-array limit))) (vector-set! st 2 b) b))))
+                          (do ((i 0 (+ i 1))) ((= i delta))
+                            (ja-set! to i (ja-ref cb (+ mark i))))
+                          (vector-set! st 5 0)
+                          (vector-set! st 3 delta)
+                          (vector-set! st 4 delta)
+                          delta)))))
+         (cb (vector-ref st 2))
+         (n (let loop ()
+              (let ((n (reader-adapter-inner-read (vector-ref st 0) cb dst (- (ja-len cb) dst))))
+                (if (= n 0) (loop) n)))))
+    (when (> n 0)
+      (vector-set! st 4 (+ dst n))
+      (vector-set! st 3 dst))))
+;; read(): one character code, -1 at end of input
+(define (ra-read-char self)
+  (ra-open! self)
+  (let ((st (jhost-state self)))
+    (let loop ()
+      (when (<= (ra-avail st) 0) (ra-fill! self))
+      (if (<= (ra-avail st) 0)
+          -1
+          (let ((c (char->integer (ra-peek st))))
+            (ra-advance! st 1)
+            (cond ((not (vector-ref st 1)) c)
+                  (else (vector-set! st 1 #f) (if (= c 10) (loop) c))))))))
+;; BufferedReader.read1: from the buffer, or straight into buf when the request
+;; is at least a buffer's worth and nothing (a mark, an owed \n) needs the buffer
+(define (ra-read1-into self buf off len)
+  (let ((st (jhost-state self)))
+    (define (copy)
+      (if (<= (ra-avail st) 0)
+          -1
+          (let ((k (min len (ra-avail st))) (cb (vector-ref st 2)) (nx (vector-ref st 3)))
+            (do ((i 0 (+ i 1))) ((= i k)) (ja-set! buf (+ off i) (ja-ref cb (+ nx i))))
+            (ra-advance! st k)
+            k)))
+    (define (after-fill)
+      (when (and (vector-ref st 1) (> (ra-avail st) 0))
+        (vector-set! st 1 #f)
+        (when (char=? (ra-peek st) #\newline)
+          (ra-advance! st 1)
+          (when (<= (ra-avail st) 0) (ra-fill! self))))
+      (copy))
+    (cond ((> (ra-avail st) 0) (after-fill))
+          ((and (>= len (ja-len (vector-ref st 2))) (< (vector-ref st 5) 0) (not (vector-ref st 1)))
+           (reader-adapter-inner-read (vector-ref st 0) buf off len))
+          (else (ra-fill! self) (after-fill)))))
+;; read(cbuf, off, len): what the buffer has, then more only while the wrapped
+;; reader says the next read would not block
+(define (ra-read-into self buf off len)
+  (ra-open! self)
+  (if (= len 0)
+      0
+      (let ((n (ra-read1-into self buf off len)))
+        (if (<= n 0)
+            n
+            (let loop ((n n))
+              (if (and (< n len) (reader-ready? (reader-adapter-inner self)))
+                  (let ((n1 (ra-read1-into self buf (+ off n) (- len n))))
+                    (if (<= n1 0) n (loop (+ n n1))))
+                  n))))))
+;; readLine: \n, \r and \r\n end a line; a \r leaves skip-lf? set so the \n of
+;; the pair is not the next line. The line, or #f at end of input.
+(define (ra-read-line self)
+  (ra-open! self)
+  (let ((st (jhost-state self)) (out (open-output-string)))
+    (let loop ((omit-lf? (vector-ref st 1)) (any? #f))
+      (when (<= (ra-avail st) 0) (ra-fill! self))
+      (if (<= (ra-avail st) 0)
+          (and any? (let ((s (get-output-string out))) (and (> (string-length s) 0) s)))
+          (begin
+            (when (and omit-lf? (char=? (ra-peek st) #\newline)) (ra-advance! st 1))
+            (vector-set! st 1 #f)
+            (let ((cb (vector-ref st 2)) (start (vector-ref st 3)) (end (vector-ref st 4)))
+              (let scan ((i start))
+                (cond
+                  ((= i end)
+                   (do ((k start (+ k 1))) ((= k end)) (write-char (ja-ref cb k) out))
+                   (vector-set! st 3 end)
+                   (loop #f #t))
+                  ((memv (ja-ref cb i) '(#\newline #\return))
+                   (do ((k start (+ k 1))) ((= k i)) (write-char (ja-ref cb k) out))
+                   (vector-set! st 3 (+ i 1))
+                   (when (char=? (ja-ref cb i) #\return) (vector-set! st 1 #t))
+                   (get-output-string out))
+                  (else (scan (+ i 1)))))))))))
+(define (ra-skip self n)
+  (when (< n 0) (throw-jvm (quote IllegalArgumentException) "skip value is negative"))
+  (ra-open! self)
+  (let ((st (jhost-state self)))
+    (let loop ((r n))
+      (if (<= r 0)
+          n
+          (begin
+            (when (<= (ra-avail st) 0) (ra-fill! self))
+            (if (<= (ra-avail st) 0)
+                (- n r)
+                (begin
+                  (when (vector-ref st 1)
+                    (vector-set! st 1 #f)
+                    (when (char=? (ra-peek st) #\newline) (ra-advance! st 1)))
+                  (let ((d (ra-avail st)))
+                    (if (<= r d)
+                        (begin (ra-advance! st r) n)
+                        (begin (ra-advance! st d) (loop (- r d))))))))))))
+(define (ra-ready? self)
+  (ra-open! self)
+  (let ((st (jhost-state self)) (inner (reader-adapter-inner self)))
+    (when (vector-ref st 1)
+      (when (and (<= (ra-avail st) 0) (reader-ready? inner)) (ra-fill! self))
+      (when (> (ra-avail st) 0)
+        (when (char=? (ra-peek st) #\newline) (ra-advance! st 1))
+        (vector-set! st 1 #f)))
+    (or (> (ra-avail st) 0) (reader-ready? inner))))
 (register-host-methods! "reader-adapter"
   (list
    (cons "read"
          (with-charbuffer-read
          (lambda (self . rest)
            (if (null? rest)
-               (->num (reader-adapter-read1 self))
-               (let* ((inner (reader-adapter-inner self))
-                      (buf (car rest))
-                      (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
-                      (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (ja-len buf))))
-                 (if (and (not (vector-ref (jhost-state self) 1)) (obj-has-method? inner "read" 3))
-                     ;; ONE read of the wrapped reader, whatever it answers —
-                     ;; what java.io.BufferedReader does with a request this
-                     ;; size, and the only way to return what is available
-                     ;; without asking a reader for more than it has
-                     (let ((n (record-method-dispatch inner "read"
-                                (list->cseq (list buf (->num off) (->num len))))))
-                       (if (jolt-nil? n) -1 n))
-                     ;; a \n owed by the last readLine, or a reader with only
-                     ;; read(): a character at a time, the rest while it is ready
-                     (reader-fill-available! buf off len
-                                             (lambda () (reader-adapter-get-char self))
-                                             (lambda () (reader-ready? inner)))))))))
-   (cons "readLine" (lambda (self) (let ((l (reader-adapter-line self))) (if (eof-object? l) jolt-nil l))))
+               (->num (ra-read-char self))
+               (let-values (((buf off len) (reader-read-buf-args rest)))
+                 (->num (ra-read-into self buf off len)))))))
+   (cons "readLine" (lambda (self) (or (ra-read-line self) jolt-nil)))
    (cons "lines" (lambda (self)
                    (let loop ((acc '()))
-                     (let ((l (reader-adapter-line self)))
-                       (if (eof-object? l) (list->cseq (reverse acc)) (loop (cons l acc)))))))
-   (cons "skip" (lambda (self n) (let loop ((i 0) (k (jnum->exact n)))
-                                   (if (or (>= i k) (eof-object? (reader-adapter-get-char self))) (->num i)
-                                       (loop (+ i 1) k)))))
-   ;; java.io.Reader's own ready says no, so a reader without one is not ready
-   (cons "ready" (lambda (self) (reader-adapter-relay self "ready" #f)))
-   (cons "mark" (lambda (self . _) (reader-adapter-relay self "mark" jolt-nil)))
-   (cons "reset" (lambda (self) (reader-adapter-relay self "reset" jolt-nil)))
-   (cons "close" (lambda (self) (reader-adapter-relay self "close" jolt-nil) jolt-nil))
+                     (let ((l (ra-read-line self)))
+                       (if l (loop (cons l acc)) (list->cseq (reverse acc)))))))
+   (cons "skip" (lambda (self n) (->num (ra-skip self (jnum->exact n)))))
+   (cons "ready" (lambda (self) (ra-ready? self)))
+   (cons "markSupported" (lambda (self) #t))
+   (cons "mark" (lambda (self limit)
+                  (let ((limit (jnum->exact limit)) (st (jhost-state self)))
+                    (when (< limit 0) (throw-jvm (quote IllegalArgumentException) "Read-ahead limit < 0"))
+                    (ra-open! self)
+                    (vector-set! st 6 limit)
+                    (vector-set! st 5 (vector-ref st 3))
+                    (vector-set! st 7 (vector-ref st 1))
+                    jolt-nil)))
+   (cons "reset" (lambda (self)
+                   (ra-open! self)
+                   (let* ((st (jhost-state self)) (mark (vector-ref st 5)))
+                     (when (< mark 0)
+                       (throw-jvm 'java.io.IOException (if (= mark -2) "Mark invalid" "Stream not marked")))
+                     (vector-set! st 3 mark)
+                     (vector-set! st 1 (vector-ref st 7))
+                     jolt-nil)))
+   ;; the wrapped reader's close, when it has one -- a Reader that implements
+   ;; none is still a legal argument here, and closing it does nothing
+   (cons "close" (lambda (self)
+                   (let ((st (jhost-state self)) (inner (reader-adapter-inner self)))
+                     (when (vector-ref st 2)
+                       (dynamic-wind
+                         void
+                         (lambda () (when (obj-has-method? inner "close" 0)
+                                      (record-method-dispatch inner "close" jolt-nil)))
+                         (lambda () (vector-set! st 2 #f)))))
+                   jolt-nil))
    (cons "toString" (lambda (self) "#<BufferedReader>"))))
 
 ;; --- the java.io classes a reify/proxy extends ------------------------------
@@ -1907,8 +2035,11 @@
 ;; adapter above; jolt's own readers keep the identity wrapper.
 (for-each (lambda (n)
             (register-class-ctor! n
-              (lambda (inner . _)
-                (if (user-reader? inner) (make-reader-adapter inner) inner))))
+              (lambda (inner . size)
+                (let ((size (map jnum->exact size)))
+                  (when (and (pair? size) (<= (car size) 0))
+                    (throw-jvm (quote IllegalArgumentException) "Buffer size <= 0"))
+                  (if (user-reader? inner) (apply make-reader-adapter inner size) inner)))))
           '("BufferedReader" "java.io.BufferedReader"))
 ;; BufferedInputStream is the JVM's mark/reset provider: wrapping ANY stream
 ;; makes markSupported true there. jolt honours that when the underlying port
