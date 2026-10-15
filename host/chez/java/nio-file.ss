@@ -529,14 +529,37 @@
                             "" (seq->list (jolt-seq data)))))
        (string->utf8 body)))))
 
+(define nio-ENOTEMPTY (if (eq? (sa-os-family) 'macos) 66 39))
+;; A failed unlink/rmdir named the JDK's way (UnixFileSystemProvider.implDelete):
+;; EEXIST or ENOTEMPTY on a directory is DirectoryNotEmpty, then EACCES
+;; AccessDenied, ENOENT NoSuchFile, and any other errno a FileSystemException
+;; carrying strerror's text. Windows sets no errno, so a refused delete there
+;; reads as AccessDenied, which is what the JDK reports for its usual causes
+;; (read-only attribute, sharing violation on an open file).
+(define (nio-delete-failed fp m err dir?)
+  (cond ((not (and err (> err 0)))
+         (if (and dir? (pair? (guard (e (#t '())) (directory-list fp))))
+             (nio-fs-throw "java.nio.file.DirectoryNotEmptyException" m)
+             (nio-fs-throw "java.nio.file.AccessDeniedException" m)))
+        ((and dir? (or (= err nio-ENOTEMPTY) (= err nio-EEXIST)))
+         (nio-fs-throw "java.nio.file.DirectoryNotEmptyException" m))
+        ((= err nio-EACCES) (nio-fs-throw "java.nio.file.AccessDeniedException" m))
+        ((= err nio-ENOENT) (nio-no-such-file m))
+        (else (nio-fs-detail m (and c-strerror (c-strerror err))))))
+
+;; delete-file and delete-directory answer #f on failure rather than raising,
+;; so the answer is checked here and the errno read straight after it.
 (define (nio-delete1 fp missing-ok? . shown)
   (let ((m (if (pair? shown) (car shown) fp)))
-    (cond ((nio-is-symlink? fp) (delete-file fp) #t)   ; the link itself, even if dangling
+    (define (attempt del dir?)
+      (if (del fp) #t
+          (let ((err (io-errno)))   ; before anything else can set it
+            (nio-delete-failed fp m err dir?))))
+    (cond ((nio-is-symlink? fp) (attempt delete-file #f))   ; the link itself, even if dangling
           ((not (file-exists? fp))
            (if missing-ok? #f (nio-no-such-file m)))
-          ((file-directory? fp) (if (delete-directory fp) #t
-                                  (nio-fs-throw "java.nio.file.DirectoryNotEmptyException" m)))
-          (else (delete-file fp) #t))))
+          ((file-directory? fp) (attempt delete-directory #t))
+          (else (attempt delete-file #f)))))
 
 (define nio-temp-counter 0)
 (define nio-temp-mutex (make-mutex))
@@ -1408,17 +1431,12 @@
                             (nio-already-exists (nio-shown dst)))
                            (else
                             ;; The JDK removes the target first and reports a
-                            ;; target it cannot remove as AccessDeniedException
-                            ;; naming the TARGET. nio-delete1's delete-file fails
-                            ;; silently, so a held target (Windows AV, a handle
-                            ;; without share-delete) or an unwritable directory
-                            ;; reached rename-file still in place, and came back as
-                            ;; "File exists" on Windows and a FileSystemException
-                            ;; naming the source on POSIX (jolt-lang/jolt#1263).
+                            ;; target it cannot remove naming the TARGET
+                            ;; (AccessDeniedException for a held file or an
+                            ;; unwritable directory), never the source
+                            ;; (jolt-lang/jolt#1263). nio-delete1 raises that.
                             (when (nio-dest-present? d)
-                              (nio-delete1 d #t (nio-shown dst))
-                              (when (nio-dest-present? d)
-                                (nio-fs-throw "java.nio.file.AccessDeniedException" (nio-shown dst))))
+                              (nio-delete1 d #t (nio-shown dst)))
                             (nio-fs-call s (lambda () (rename-file s d)) (nio-shown src)) (->path dst)))))))))
   (set! files-accum-chunks (cons files-create+move files-accum-chunks)))
 

@@ -523,7 +523,14 @@
         (cons "format" (lambda (self a . rest) (jvm-format-pieces a rest (lambda (piece) (pw-text! self piece))) self))
         (cons "flush" (lambda (self) (pw-pass! self "flush")))
         (cons "close" (lambda (self) (pw-pass! self "close")))
-        (cons "checkError" (lambda (self) (pw-pass! self "flush") #f))
+        ;; flush, then the target's own answer when it has one: a PrintWriter
+        ;; over System/out reports the process stream failing, as the JDK's
+        ;; delegates to the PrintStream it wraps
+        (cons "checkError" (lambda (self)
+                             (pw-pass! self "flush")
+                             (let ((t (pw-target self)))
+                               (and (jhost? t) (host-method-ref (jhost-tag t) "checkError")
+                                    (jolt-truthy? (record-method-dispatch t "checkError" jolt-nil))))))
         (cons "toString" (lambda (self) ""))))
 
 ;; PrintWriter-on — a writer that accumulates writes and, on flush, hands the

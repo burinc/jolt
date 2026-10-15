@@ -98,6 +98,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`FileWriter` and `OutputStreamWriter` write `char[]` regions and
+  `append` subsequences.** `(.write w buf 0 n)` wrote the text `#object[...]`
+  and `(.append w "abc" 1 2)` wrote all of `"abc"`. `(.append w nil)` now
+  writes `"null"`.
+- **`Files/delete` and `Files/deleteIfExists` raise when the delete fails.**
+  A file in a read-only directory stayed on disk while the call returned
+  normally (`deleteIfExists` answered `true`). They now raise
+  `AccessDeniedException`, `DirectoryNotEmptyException` or a
+  `FileSystemException` with the system's reason, as the JDK does.
+- **`PrintWriter.checkError` reports the stream it wraps.** Over `System/out`
+  with the reader gone it answered `false`; it now answers `true`, as
+  `PrintStream.checkError` already did.
+
 - **The Windows HTTPS transport finds Git for Windows 2.56's OpenSSL.** Git
   2.56 moved from MINGW64 to UCRT64 and has no `mingw64` directory any more, so
   the resolver found no OpenSSL of Git's and loaded whatever `libcrypto-3-x64.dll`
