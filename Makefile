@@ -122,7 +122,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
-  deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax \
+  deadhost recordshadow mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax regexbacktrack \
   hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   hasheq narrowhash \
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety cas flow
@@ -1410,6 +1410,14 @@ regexanchor:
 # position. Also pins the `or`-to-char-set fold, and what it must refuse.
 regexanchorprims:
 	@$(CHEZ) --script test/chez/regex-anchor-prims-test.ss
+
+# The backtracking matcher (host/chez/java/regex-anchor-sre.scm) against JDK 21
+# answers on the shapes it refused, hung on, or took exponential time over: a
+# repetition whose body can match empty, nested quantifiers the JVM's loop memo
+# keeps linear, and char-set unions. The exponential rows run under a fixed
+# engine-tick budget, so there is no clock.
+regexbacktrack:
+	@$(CHEZ) --script test/chez/regex-backtrack-test.ss
 
 # clojure.string/replace must emit the replacement for a ZERO-WIDTH match —
 # #"" , (?=x), (?m)^/(?m)$ — then advance one char past it, the same rule re-seq

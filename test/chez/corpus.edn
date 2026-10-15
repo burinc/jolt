@@ -6130,6 +6130,8 @@
   {:suite "regex / anchored global scan" :label ".find(int) past the start on a trailing-.* pattern" :expected "\"b\"" :actual "(let [m (re-matcher #\"(?s)b.*\" \"ab\")] (when (.find m 1) (.group m)))" :portability :common}
   {:suite "regex / anchored global scan" :label "a matcher's second find on a leading-.* pattern starts where it resumes" :expected "[2 2]" :actual "(let [m (re-matcher #\"(?s).*(?:a)??\" \"bc\")] (.find m) (.find m) [(.start m) (.end m)])" :portability :common}
   {:suite "regex / anchored global scan" :label "^ still anchors a re-seq scan" :expected "[\"abc\"]" :actual "(vec (re-seq #\"^abc\" \"abcabc\"))" :portability :common}
+  {:suite "regex / char-class union" :label "a negated class unioned with \\s keeps every member" :expected "[\"c\" \"A\" \"b\" \"\\n\" \" \"]" :actual "(vec (re-seq #\"[^a]|\\s\" \"acAb\\n \"))" :portability :common}
+  {:suite "regex / nested quantifier" :label "an alternation of overlapping branches under * fails in linear time" :expected "nil" :actual "(re-find #\"(a|aa)*b\" (apply str (repeat 40 \\a)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a rest-derived seq prepends" :expected "true" :actual "(= [9 2 3] (vec (conj (rest [1 2 3]) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a lazy-seq prepends" :expected "true" :actual "(= [9 1 2] (vec (conj (lazy-seq (list 1 2)) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "into over a conj'd rest-seq" :expected "true" :actual "(= [0 2 3] (into [] (conj (rest [1 2 3]) 0)))" :portability :common}

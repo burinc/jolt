@@ -2,9 +2,9 @@
 ;; Code from irregex, Copyright (c) 2005-2024 Alex Shinn, BSD-style license
 ;; (licenses/BSD-irregex.txt).
 ;;
-;; irregex's own sre->procedure, as of the currently checked-out
-;; vendor/irregex. host/chez/java/regex-anchor-sre.scm is jolt's
-;; replacement for it, and `make regexanchorcheck` fails when the two
+;; irregex's own sre->procedure and cset-union, as of the currently
+;; checked-out vendor/irregex. host/chez/java/regex-anchor-sre.scm holds
+;; jolt's replacements, and `make regexanchorcheck` fails when the two
 ;; stop agreeing — see host/chez/regex-anchor-check.ss. Nothing loads
 ;; this file.
 ;;
@@ -548,3 +548,31 @@
                      (fail)))))]
       [(string? sre) (rec (sre-sequence (string->list sre)))]
       [else (error "unknown regexp" sre)])))
+(define (cset-union a b)
+  (let union-range ([a (vector->list a)]
+                    [b (vector->list b)]
+                    [res '()])
+    (cond
+      [(null? a)
+       (list->vector (reverse (append (reverse b) res)))]
+      [(null? b)
+       (list->vector (reverse (append (reverse a) res)))]
+      [else
+       (let ([a-range (car a)] [b-range (car b)])
+         (cond
+           [(< (+ (char->integer (cdr a-range)) 1)
+               (char->integer (car b-range)))
+            (union-range (cdr a) b (cons a-range res))]
+           [(> (char->integer (car a-range))
+               (+ (char->integer (cdr b-range)) 1))
+            (union-range (cdr b) a (cons b-range res))]
+           [(char>=? (cdr a-range) (car b-range))
+            (union-range
+              (cons (char-ranges-union a-range b-range) (cdr a))
+              (cdr b)
+              res)]
+           [else
+            (union-range
+              (cdr a)
+              (cons (char-ranges-union a-range b-range) (cdr b))
+              res)]))])))
