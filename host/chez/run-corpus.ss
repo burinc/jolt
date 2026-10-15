@@ -17,6 +17,7 @@
 (import (chezscheme))
 
 (load "host/chez/run-gate-harness.ss")
+(load "host/chez/gate-private-tmpdir.ss")
 
 (define (slurp path)
   (call-with-input-file path

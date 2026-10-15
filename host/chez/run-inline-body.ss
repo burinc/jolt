@@ -6,6 +6,7 @@
 ;;   chez --script host/chez/run-inline-body.ss
 (import (chezscheme))
 (load "host/chez/run-gate-harness.ss")
+(load "host/chez/gate-private-tmpdir.ss")
 
 (define set-record-shapes! (var-deref "jolt.passes.types" "set-record-shapes!"))
 (define set-protocol-methods! (var-deref "jolt.passes.types" "set-protocol-methods!"))
