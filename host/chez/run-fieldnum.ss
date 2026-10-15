@@ -45,12 +45,17 @@
 ;; a ^V param hint types the param with no inferable caller (open-world / cross-fn:
 ;; the receiver isn't a ctor return). This is the record-ctor-key path — without it
 ;; the hint is dead and the reads fall back to generic jolt-get + boxed arithmetic.
+;; The hint is a declaration, though: (hyp {:x 3 :y 4}) is 25 on the JVM. So the
+;; body runs under a test of v's record type (guard-declared-records); the proven
+;; branch keeps the direct reads and the unboxed arithmetic, and any other value
+;; takes the generic lookup.
 (define hinted (anode "(def hyp (fn [^V v] (+ (* (:x v) (:x v)) (* (:y v) (:y v)))))"))
 (define hint-emit (emit (run-passes hinted (make-analyze-ctx "user") U)))
 (gate-check "^V param hint direct-accesses field reads" (gate-sub? hint-emit "jrec2-f0") #t)
 (gate-check "^V param hint unboxes arithmetic" (gate-sub? hint-emit "fl*") #t)
-(gate-check "^V param hint leaves no generic lookup (jolt-get or the keyword site)"
-            (or (gate-sub? hint-emit "jolt-get") (gate-sub? hint-emit "jolt-kw-get-site")) #f)
+(gate-check "...under a test of the param's record type" (gate-sub? hint-emit "jrec-pic-desc") #t)
+(gate-check "...with the generic lookup for any other value"
+            (or (gate-sub? hint-emit "jolt-get") (gate-sub? hint-emit "jolt-kw-get-site")) #t)
 
 ;; an UNTAGGED field whose every ctor site passes a flonum now unboxes too —
 ;; whole-program field-type inference (run-fieldjoin) derives :double from the ctor
