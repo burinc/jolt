@@ -69,6 +69,11 @@
 ;; answer. sre-linear-backtrack? below is the test, and it is a WHITELIST: a shape
 ;; it does not model keeps the DFA.
 ;;
+;; Even there the DFA only answers WHERE the first match starts, which both
+;; semantics agree on; the backtracking matcher irx-finish! attaches runs from
+;; that start and decides where the match ends (jolt-6gkc). Keeping the DFA's own
+;; end made #"[ab]|c*.+" answer "bb" on "bb" where the JVM answers "b".
+;;
 ;; Which engine a pattern needs is read off its SRE, so each pattern builds
 ;; exactly one engine, at first use.
 
@@ -267,6 +272,27 @@
                   entry)))
           (lambda () (jolt-unlock! regex-cache-mutex))))))
 
+;; Two adjustments to a freshly built irregex, made before it is cached.
+;;
+;; A DFA-compiled pattern also gets the BACKTRACKING matcher, in the irregex's
+;; otherwise empty nfa slot. The DFA is POSIX leftmost-longest and only finds
+;; where a match starts; regex-dfa.ss's search runs this matcher from there, so
+;; the match ends where java.util.regex's would (jolt-6gkc: #"[ab]|c*.+" on "bb"
+;; is "b", the first alternative, not the DFA's "bb"). Building it is cheap: the
+;; matcher is closures over the SRE, not an automaton.
+;;
+;; And ~consumer? is kept only on a pattern anchored at the start of input.
+;; irregex also sets it on one that ENDS in `.*`, on the reasoning that a match
+;; runs to the end of the input so there is nothing left to find — but #"(?s).*"
+;; finds "" at the end after "c", and (.find m 1) on #"(?s)b.*" over "ab" finds
+;; "b". The scan loops below stop at a consumer, so both came back nil.
+(define (irx-finish! sre irx opts)
+  (when (irregex-dfa irx)
+    (vector-set! irx 3 (irregex-nfa (apply irregex sre 'backtrack opts))))
+  (when (and (flag-set? (irregex-flags irx) ~consumer?) (not (sre-bos? sre)))
+    (vector-set! irx 4 (flag-clear (irregex-flags irx) ~consumer?)))
+  irx)
+
 ;; the built engine for source, compiling once on first demand. A capturing
 ;; pattern gets irregex's BACKTRACKING matcher (see the engine note above); a
 ;; group-free one keeps the fast DFA. An engine-build failure on an SRE the
@@ -285,9 +311,12 @@
                     (vector-ref entry 1)
                     (let* ((sre (vector-ref entry 1)) (opts (vector-ref entry 2))
                            (irx (guard (e (#t (regex-syntax-error source e)))
-                                  (if (vector-ref entry 3)
-                                      (apply irregex sre 'backtrack opts)
-                                      (apply irregex sre opts)))))
+                                  (irx-finish!
+                                   sre
+                                   (if (vector-ref entry 3)
+                                       (apply irregex sre 'backtrack opts)
+                                       (apply irregex sre opts))
+                                   opts))))
                       (hashtable-set! regex-cache source (vector 'irx irx))
                       irx))))
             (lambda () (jolt-unlock! regex-cache-mutex)))))))

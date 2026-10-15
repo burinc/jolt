@@ -29,10 +29,10 @@ irregex (vendor/irregex)
   https://github.com/ashinn/irregex
   Copyright (c) 2005-2024 Alex Shinn
   BSD-style license: licenses/BSD-irregex.txt
-  jolt replaces four irregex procedures with modified copies:
+  jolt replaces five irregex procedures with modified copies:
   host/chez/regex-dfa.ss (nfa->dfa, irregex-search/matches,
   dfa-match/shortest) and host/chez/java/regex-anchor-sre.scm
-  (sre->procedure); host/chez/regex-dfa-upstream.scm and
+  (sre->procedure, cset-union); host/chez/regex-dfa-upstream.scm and
   host/chez/regex-anchor-sre-upstream.scm pin the originals.
 
 babashka.fs (vendor/fs) - the implementation behind jolt.fs

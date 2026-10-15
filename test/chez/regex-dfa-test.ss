@@ -157,8 +157,10 @@
 (define late-esc (string-append (make-string 400 #\b) (string #\esc) "[0m"))
 (ok "the escape pattern gets a DFA" (eq? (engine-of esc-pattern) 'dfa))
 (define longest-calls 0)
-(define real-longest dfa-match/longest)
-(set! dfa-match/longest
+;; Since jolt-6gkc the anchored match is jolt-dfa-anchored-match (the backtracker
+;; from the start the DFA found), so that is what is counted.
+(define real-longest jolt-dfa-anchored-match)
+(set! jolt-dfa-anchored-match
   (lambda args (set! longest-calls (+ longest-calls 1)) (apply real-longest args)))
 (ok "a late escape is found where it is" (equal? (all-matches esc-pattern late-esc) '((400 . 404))))
 (set! longest-calls 0)
@@ -170,7 +172,24 @@
 (irx-search-from (regex-t-irx (jolt-regex esc-pattern))
                  (string-append (string #\esc) "x" late-esc) 0)
 (ok "…and two when the origin is a near miss" (= longest-calls 2))
-(set! dfa-match/longest real-longest)
+(set! jolt-dfa-anchored-match real-longest)
+
+;; 7. leftmost-FIRST on a pattern that DOES get the DFA (jolt-6gkc). The DFA only
+;; says where the first match starts; the backtracking matcher regex.ss attaches
+;; decides where it ends, as the JVM's would. These answers are java.util.regex's
+;; (JDK 21); the DFA alone answered the longest match instead.
+(fresh!)
+(ok "[ab]|c*.+ gets a DFA" (eq? (engine-of "[ab]|c*.+") 'dfa))
+(ok "[ab]|c*.+ takes the first alternative" (equal? (all-matches "[ab]|c*.+" "bb") '((0 . 1) (1 . 2))))
+(ok ".|(?:.)*a takes the first alternative"
+    (equal? (all-matches ".|(?:.)*a" "bba") '((0 . 1) (1 . 2) (2 . 3))))
+(ok "a?ba|[ab]c|a*[ab]+ takes the first alternative that matches"
+    (equal? (all-matches "a?ba|[ab]c|a*[ab]+" "babbba") '((0 . 2) (2 . 6))))
+(ok "(?:a*b)* scans like the JVM"
+    (equal? (all-matches "(?:a*b)*" "aXXb ab a")
+            '((0 . 0) (1 . 1) (2 . 2) (3 . 4) (4 . 4) (5 . 7) (7 . 7) (8 . 8) (9 . 9))))
+(ok "a DFA re-matches is still a whole-input test"
+    (equal? (jolt-re-matches (jolt-regex "[ab]|c*.+") "bb") "bb"))
 
 ;; …and the copy answers exactly what the vendored search answered. The pinned
 ;; upstream procedures are the oracle: evaluate them, run every pattern over
@@ -185,8 +204,21 @@
         "ababc abc abababc" late-esc "bbbbxbx" "Rate Limit TIMED OUT" "zzzz"
         (string-append "\x1b;[1;31mred" (string #\esc) "[0m plain \x1b;[K")))
 (for-each (lambda (p) (ok (format "~s gets a DFA" p) (eq? (engine-of p) 'dfa))) search-patterns)
+;; The vendored search ends a match where dfa-match/longest does, and jolt's runs
+;; the attached backtracker instead (section 7), so the comparison is made with
+;; the backtracker detached: what it pins is the probe and the scan, which are
+;; the same code either way.
+(define (with-longest thunk)
+  (let* ((irxs (map (lambda (p) (regex-t-irx (jolt-regex p))) search-patterns))
+         (saved (map (lambda (irx) (vector-ref irx 3)) irxs)))
+    (for-each (lambda (irx) (vector-set! irx 3 #f)) irxs)
+    (let ((r (thunk)))
+      (for-each (lambda (irx m) (vector-set! irx 3 m)) irxs saved)
+      r)))
 (define (search-matrix)
-  (map (lambda (p) (map (lambda (s) (all-matches p s)) search-inputs)) search-patterns))
+  (with-longest
+    (lambda ()
+      (map (lambda (p) (map (lambda (s) (all-matches p s)) search-inputs)) search-patterns))))
 (define jolt-search (search-matrix))
 (define jolt-procs (list irregex-search/matches dfa-match/shortest))
 (define (pinned name)
@@ -214,7 +246,9 @@
          (m (and (pair? chunks) (irregex-search/chunked (regex-t-irx (jolt-regex p)) cnk chunks))))
     (and m (irregex-match-substring m 0))))
 (define (chunked-matrix)
-  (map (lambda (p) (map (lambda (s) (chunked-search p s)) search-inputs)) search-patterns))
+  (with-longest
+    (lambda ()
+      (map (lambda (p) (map (lambda (s) (chunked-search p s)) search-inputs)) search-patterns))))
 (define jolt-chunked (chunked-matrix))
 (eval (pinned 'irregex-search/matches))
 (eval (pinned 'dfa-match/shortest))
@@ -226,6 +260,7 @@
     (for-each (lambda (s x y) (ok (format "~s on chunked ~s matches the vendored search" p s) (equal? x y)))
               search-inputs a b))
   search-patterns jolt-chunked vendored-chunked)
+(ok "a chunked DFA match ends where the JVM's does" (equal? (chunked-search "[ab]|c*.+" "bbbbbb") "b"))
 (ok "a chunked late escape is found" (equal? (chunked-search esc-pattern late-esc) "\x1b;[0m"))
 
 (printf "regex-dfa: ~a/~a passed\n" (- total fails) total)

@@ -113,7 +113,7 @@
     (find "foo|bar" "baz" nil)
     (find "a|b|c" "b" "b")
     (find "|a" "" "")
-    (find "|a" "a" "a")   ;; known: JVM returns "" (leftmost empty alt), Jolt prefers "a"
+    (find "|a" "a" "")    ;; the leftmost alternative, empty, as the JVM answers
     (find "a|" "a" "a")
     (find "a|" "" "")
 

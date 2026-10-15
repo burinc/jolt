@@ -9,9 +9,15 @@
 ;; `look-behind` arm gains an O(1) fast path for single-character bodies and a
 ;; width-bounded rescan for wider ones; the symbol arm gains the zero-width
 ;; `%look-behind-end` assertion that bounded rescan needs, and a direct compilation
-;; of the java.util.regex line anchors (host/chez/java/regex-anchors.ss); and the
-;; three "empty repetition" guards ask `%sre-empty?`, which knows those anchors are
-;; zero-width, rather than the vendored `sre-empty?`, which does not.
+;; of the java.util.regex line anchors (host/chez/java/regex-anchors.ss).  The
+;; repetition arms (`*`, `*?`, `+`, `**`, `**?`) are marked "jolt-0e5k": a body
+;; that can match empty no longer raises "invalid sre: empty *" or loops forever,
+;; it runs under java.util.regex's zero-length-iteration rule (see %iterate below).
+;; Those arms also memoize failed loop decisions, as the JVM's Loop does, so
+;; nested quantifiers stop taking exponential time (jolt-yqr, %loop-memo-plan),
+;; and compile a counted body once rather than on every iteration. The file
+;; ends with a copy of irregex's `cset-union` whose merge keeps a char set
+;; sorted (jolt-t16).
 ;;
 ;; Why: the vendored `look-behind` compiles its body as `(* any) X eos` against a
 ;; chunk wrapped to end at the current position, so it rescans from the chunk
@@ -240,9 +246,234 @@
 ;; the identifier at its underscore, against the JVM's (0 3).  jolt-406.
 (define (%word-char? c) (or (char-alphanumeric? c) (eqv? c #\_)))
 
+;; jolt-0e5k: a repetition over a body that can match empty — (?:c?)*, (x?)*y,
+;; (?:.*?|a)+ — is legal Java and common, and irregex either refused it ("invalid
+;; sre: empty *") or, where its `sre-empty?` missed the body, compiled a loop that
+;; re-entered the body at the same position forever.  java.util.regex's Loop and
+;; LazyLoop run such a body under one rule: an iteration that consumed nothing ENDS
+;; the repetition, and the match carries on with what follows it.
+;;
+;; That needs the position the current iteration started at, and the body's
+;; continuation is compiled once, so it is kept in a per-repetition cell: %iterate
+;; records (src . i) before entering the body and puts the previous value back
+;; when the body fails, so a backtrack into an earlier iteration finds that
+;; iteration's start again.  Only a body %sre-nullable? says can be empty pays
+;; any of this; every other repetition compiles exactly as irregex wrote it.
+;;
+;; Per-attempt state lives in the match vector, never in anything shared. A
+;; compiled pattern is cached and run by many threads at once, and a fiber can be
+;; preempted mid-match and resume after another fiber has matched on the same
+;; carrier, or on another carrier: a thread parameter is shared by the threads
+;; forked after it was set (they inherit the same object) and by the fibers of
+;; one carrier. The match vector is made for each search by its caller and
+;; reaches every step as `matches`. irregex sizes it for one group more than the
+;; pattern has and uses only that group's last slot (the backtrack fail), so the
+;; three before it are free: one holds the memo state below, one the cells.
+;; irregex clears them with the groups between attempts.
+(define (%memo-slot matches) (fx- (vector-length matches) 4))
+(define (%cells-slot matches) (fx- (vector-length matches) 3))
+
+;; A cell is an index into the attempt's cell vector, numbered when the pattern
+;; is compiled (%new-cell!); the vector grows to take a cell compiled later (a
+;; counted body is compiled on first use).
+(define (%cell-ref matches k)
+  (let ((v (vector-ref matches (%cells-slot matches))))
+    (and (vector? v) (fx< k (vector-length v)) (vector-ref v k))))
+(define (%cell-set! matches k x)
+  (let* ((slot (%cells-slot matches))
+         (v (vector-ref matches slot)))
+    (if (and (vector? v) (fx< k (vector-length v)))
+        (vector-set! v k x)
+        (let ((w (make-vector (fxmax (fx+ k 1) (fx* 2 (if (vector? v) (vector-length v) 4))) #f)))
+          (when (vector? v)
+            (do ((j 0 (fx+ j 1))) ((fx= j (vector-length v))) (vector-set! w j (vector-ref v j))))
+          (vector-set! w k x)
+          (vector-set! matches slot w)))))
+
+(define %cell-counter 0)
+(define %cell-mutex (make-mutex))
+(define (%new-cell!)
+  (with-mutex %cell-mutex
+    (let ((k %cell-counter)) (set! %cell-counter (fx+ k 1)) k)))
+
+(define (%iterate cell body cnk init src str i end matches fail)
+  (let ((old (%cell-ref matches cell)))
+    (%cell-set! matches cell (cons src i))
+    (body cnk init src str i end matches
+          (lambda () (%cell-set! matches cell old) (fail)))))
+
+;; Did the iteration whose body just matched up to (src, i) consume nothing?
+(define (%iteration-empty? cell matches src i)
+  (let ((start (%cell-ref matches cell)))
+    (and (pair? start) (eq? (car start) src) (eqv? (cdr start) i))))
+
+;; jolt-0e5k: java.util.regex compiles a capturing group whose body always
+;; matches exactly nothing — (^), (), (\b), ((?=x)) — and is quantified greedily
+;; from zero as a GroupCurly, which runs the body once and, finding it consumed
+;; nothing, ends the loop WITHOUT recording the group: (re-find #"(^)*x" "x") is
+;; ["x" nil]. Groups inside the body keep what they captured. So `(* (submatch X))`
+;; over such an X is `(? X)` with the group's number reserved but never set,
+;; which is what `(dsm 1 0 X)` says. This answers X's sequence, or #f.
+;;
+;; "Always nothing" is Java's deterministic zero length: assertions and empty
+;; groups, but no alternation of real branches — ((?=x)|(?=y))* runs as a Loop and
+;; does capture. Java's \b is one node, so the (or bow eow) it translates to counts.
+(define (%zero-width-group-body sre)
+  (define (assertion? x)
+    (or (memq x '(bos eos bol eol bow eow nwb epsilon
+                  %java-bol %java-eol %java-final-eol
+                  %java-bol-unix %java-final-eol-unix))
+        (equal? x "")))
+  (define (det-empty? x)
+    (cond ((assertion? x) #t)
+          ((pair? x)
+           (case (car x)
+             ((look-ahead look-behind neg-look-ahead neg-look-behind) #t)
+             ((or) (let lp ((xs (cdr x)))
+                     (or (null? xs) (and (assertion? (car xs)) (lp (cdr xs))))))
+             ((seq : submatch $) (all? (cdr x)))
+             ((=> submatch-named) (all? (cddr x)))
+             (else #f)))
+          (else #f)))
+  (define (all? xs) (or (null? xs) (and (det-empty? (car xs)) (all? (cdr xs)))))
+  (and (pair? sre)
+       (case (car sre)
+         ((submatch $) (and (all? (cdr sre)) (cdr sre)))
+         ((=> submatch-named) (and (all? (cddr sre)) (cddr sre)))
+         (else #f))))
+
+;; What a repetition's body continues with once an iteration has matched: `more`
+;; (the next decision), unless the body can be empty and this iteration was —
+;; then the loop ends (jolt-0e5k).
+(define (%after-iteration nullable? cell next more)
+  (if nullable?
+      (lambda (cnk init src str i end matches fail)
+        (if (%iteration-empty? cell matches src i)
+            (next cnk init src str i end matches fail)
+            (more cnk init src str i end matches fail)))
+      more))
+
+;; Iteration `count`'s compiled body for a counted repetition, built on first use
+;; and kept. irregex built a fresh closure tree for every iteration of every
+;; match, which made each pass through a {0,2}? or {2,} cost a compile. Counts
+;; past `from` with no upper bound behave alike, so at most from+1 are ever
+;; asked for; a bound past the cache's size compiles beyond it on demand, as
+;; before. Filling a slot from two threads at once builds two equivalent bodies
+;; and keeps either.
+(define %iteration-cache-limit 256)
+(define (%iteration-bodies from to compile)
+  (let ((cache (make-vector (+ 1 (min %iteration-cache-limit (or to (+ from 1)))) #f)))
+    (lambda (count)
+      (if (< count (vector-length cache))
+          (or (vector-ref cache count)
+              (let ((b (compile count)))
+                (vector-set! cache count b)
+                b))
+          (compile count)))))
+
+;; jolt-yqr: java.util.regex runs nested quantifiers like
+;;   (.{0,2}?c|b+[ab]c*?|(?:(c{0,2}?|ab|ba)*?(a*|b*c*)(c??|aaa|a{1,3}?)+?|.??b.)*a[ab]
+;; in linear time, and the backtracker took seconds on eight characters, about 8x
+;; for each one more. The JVM's Loop remembers the positions at which another
+;; iteration has already failed and goes straight on from there (posIndex,
+;; JDK-6328855); without it every way of splitting the input among the inner
+;; quantifiers is tried again on every return to the same position.
+;;
+;; Here the memoized step is a loop's whole decision at position i — one more
+;; iteration, else what follows — and what is remembered is that it FAILED, every
+;; path through it exhausted. A later arrival at i fails at once. That is sound
+;; only where the decision's outcome depends on i and nothing else, so a loop is
+;; memoized only when
+;;   - its count no longer matters: past its minimum, with no upper bound;
+;;   - it is not inside another repetition, whose own count and iteration start
+;;     are part of what follows it, nor inside a look-around or atomic group,
+;;     whose body ends somewhere that varies per evaluation;
+;;   - the pattern has no backreference, which would make captures part of the
+;;     outcome. Captures otherwise only decide WHAT a match returns, never
+;;     whether one exists, and the memo only prunes subtrees with no match.
+;; A loop whose body matches one way only (a char set, a literal) cannot cause
+;; the blowup and is left alone, so #"\w*" and #"[^,]*," pay nothing.
+;;
+;; The memo lives for one match attempt from one start position — %memo-root
+;; resets it — and only positions in the starting chunk are recorded. It stays
+;; dormant until the attempt has made %memo-threshold loop decisions: an ordinary
+;; match never gets there, so it pays a counter and no table, while a search that
+;; is going exponential passes it almost at once. Remembering only some failures
+;; is as sound as remembering all of them. The state is #(chunk decisions table),
+;; made fresh for each attempt in the match vector's memo slot (%memo-slot).
+;; Answers #f when no loop qualifies, else
+;;   #(loop-node->id  number-of-ids).
+(define (%loop-memo-plan sre)
+  (define ids (make-eq-hashtable))
+  (define count 0)
+  (define backref? #f)
+  (define (ambiguous? x)
+    (and (pair? x)
+         (case (car x)
+           ((? ?? * *? + +? ** **? = >= backref backref-ci) #t)
+           ((or) (not (%sre-cset-able? x)))
+           ((=> submatch-named) (exists ambiguous? (cddr x)))
+           (else (and (list? x) (exists ambiguous? (cdr x)))))))
+  (define (note! x body)
+    (when (exists ambiguous? body)
+      (hashtable-set! ids x count)
+      (set! count (+ count 1))))
+  (define (walk* xs top?) (when (list? xs) (for-each (lambda (x) (walk x top?)) xs)))
+  (define (walk x top?)
+    (when (pair? x)
+      (case (car x)
+        ((backref backref-ci) (set! backref? #t))
+        ((* *? +) (when top? (note! x (cdr x))) (walk* (cdr x) #f))
+        ((** **?) (when (and top? (not (caddr x))) (note! x (cdddr x)))
+                  (walk* (cdddr x) #f))
+        ((+? = >= look-ahead look-behind neg-look-ahead neg-look-behind atomic)
+         (walk* (cdr x) #f))
+        ((=> submatch-named) (walk* (cddr x) top?))
+        ((dsm) (walk* (cdddr x) top?))
+        (else (walk* (cdr x) top?)))))
+  (walk sre #t)
+  (and (not backref?) (> count 0)
+       (vector ids count)))
+
+(define %memo-threshold 512)
+
+(define (%memo-wrap plan id decide)
+  (let ((width (vector-ref plan 1)))
+    (lambda (cnk init src str i end matches fail)
+      (let* ((st (vector-ref matches (%memo-slot matches)))
+             (n (fx+ (vector-ref st 1) 1)))
+        (vector-set! st 1 n)
+        (if (or (fx< n %memo-threshold) (not (eq? src (vector-ref st 0))))
+            (decide cnk init src str i end matches fail)
+            (let ((key (+ (* i width) id))
+                  (t (vector-ref st 2)))
+              (if (and t (hashtable-ref t key #f))
+                  (fail)
+                  (decide cnk init src str i end matches
+                          (lambda ()
+                            (let ((t (or (vector-ref st 2)
+                                         (let ((t (make-eqv-hashtable)))
+                                           (vector-set! st 2 t)
+                                           t))))
+                              (hashtable-set! t key #t))
+                            (fail))))))))))
+
+;; The compiled pattern, behind a fresh memo for each attempt.
+(define (%memo-root plan root)
+  (lambda (cnk init src str i end matches fail)
+    (vector-set! matches (%memo-slot matches) (vector src 0 #f))
+    (root cnk init src str i end matches fail)))
+
 (define (sre->procedure sre . o)
   (define names
     (if (and (pair? o) (pair? (cdr o))) (cadr o) (sre-names sre 1 '())))
+  ;; jolt-yqr: which loops may remember failed positions, and the wrapper that
+  ;; does it for one of them (see %loop-memo-plan).
+  (define plan (%loop-memo-plan sre))
+  (define (memoize node decide)
+    (let ((id (and plan (hashtable-ref (vector-ref plan 0) node #f))))
+      (if id (%memo-wrap plan id decide) decide)))
+  (define root
   (let lp ((sre sre)
            (n 1)
            (flags (if (pair? o) (car o) ~none))
@@ -325,87 +556,123 @@
                        (lambda () (body cnk init src str i end matches fail))))))
             ((*)
              (cond
-              ((%sre-empty? (sre-sequence (cdr sre)))
-               (error "invalid sre: empty *" sre))
+              ((%zero-width-group-body (sre-sequence (cdr sre)))
+               => (lambda (body) (rec `(? (dsm 1 0 ,@body)))))
               (else
-               (let ((body (rec (list '+ (sre-sequence (cdr sre))))))
-                 (lambda (cnk init src str i end matches fail)
-                   (body cnk init src str i end matches
-                         (lambda ()
-                           (next cnk init src str i end matches fail))))))))
+               ;; `more` is the decision at i: one more iteration, else what
+               ;; follows. jolt-0e5k: a nullable body runs each iteration through
+               ;; %iterate, and an empty one ends the loop. jolt-yqr: `more` is
+               ;; memoized when %loop-memo-plan says it may be.
+               (let* ((x (sre-sequence (cdr sre)))
+                      (nullable? (%sre-nullable? x))
+                      (cell (%new-cell!)))
+                 (letrec*
+                     ((more
+                       (memoize sre
+                        (lambda (cnk init src str i end matches fail)
+                          (let ((retreat (lambda () (next cnk init src str i end matches fail))))
+                            (if nullable?
+                                (%iterate cell body cnk init src str i end matches retreat)
+                                (body cnk init src str i end matches retreat))))))
+                      (body (lp x n flags (%after-iteration nullable? cell next more))))
+                   more)))))
             ((*?)
-             (cond
-              ((%sre-empty? (sre-sequence (cdr sre)))
-               (error "invalid sre: empty *?" sre))
-              (else
-               (letrec
-                   ((body
-                     (lp (sre-sequence (cdr sre))
-                         n
-                         flags
-                         (lambda (cnk init src str i end matches fail)
-                           (next cnk init src str i end matches
-                                 (lambda ()
-                                   (body cnk init src str i end matches fail)
-                                   ))))))
-                 (lambda (cnk init src str i end matches fail)
-                   (next cnk init src str i end matches
-                         (lambda ()
-                           (body cnk init src str i end matches fail))))))))
+             (let* ((x (sre-sequence (cdr sre)))
+                    (nullable? (%sre-nullable? x))
+                    (cell (%new-cell!)))
+               ;; lazy: what follows first, then one more iteration.
+               (letrec*
+                   ((try
+                     (memoize sre
+                      (lambda (cnk init src str i end matches fail)
+                        (next cnk init src str i end matches
+                              (lambda ()
+                                (if nullable?
+                                    (%iterate cell body cnk init src str i end matches fail)
+                                    (body cnk init src str i end matches fail)))))))
+                    (body (lp x n flags (%after-iteration nullable? cell next try))))
+                 try)))
             ((+)
-             (cond
-              ((%sre-empty? (sre-sequence (cdr sre)))
-               (error "invalid sre: empty +" sre))
-              (else
-               (letrec
-                   ((body
-                     (lp (sre-sequence (cdr sre))
-                         n
-                         flags
-                         (lambda (cnk init src str i end matches fail)
-                           (body cnk init src str i end matches
-                                 (lambda ()
-                                   (next cnk init src str i end matches fail)
-                                   ))))))
-                 body))))
+             (let* ((x (sre-sequence (cdr sre)))
+                    (nullable? (%sre-nullable? x))
+                    (cell (%new-cell!)))
+               ;; the first iteration is required; after it, `more` as for `*`.
+               (letrec*
+                   ((more
+                     (memoize sre
+                      (lambda (cnk init src str i end matches fail)
+                        (let ((retreat (lambda () (next cnk init src str i end matches fail))))
+                          (if nullable?
+                              (%iterate cell body cnk init src str i end matches retreat)
+                              (body cnk init src str i end matches retreat))))))
+                    (body (lp x n flags (%after-iteration nullable? cell next more))))
+                 (if nullable?
+                     (lambda (cnk init src str i end matches fail)
+                       (%iterate cell body cnk init src str i end matches fail))
+                     body))))
             ((=)
              (rec `(** ,(cadr sre) ,(cadr sre) ,@(cddr sre))))
             ((>=)
              (rec `(** ,(cadr sre) #f ,@(cddr sre))))
             ((**)
              (cond
+              ((and (eqv? (cadr sre) 0)
+                    (not (eqv? (caddr sre) 0))
+                    (%zero-width-group-body (sre-sequence (cdddr sre))))
+               ;; jolt-0e5k: {0,n} over a zero-width group, as `*` above.
+               => (lambda (body) (rec `(? (dsm 1 0 ,@body)))))
               ((or (and (number? (cadr sre))
                         (number? (caddr sre))
                         (> (cadr sre) (caddr sre)))
                    (and (not (cadr sre)) (caddr sre)))
                (lambda (cnk init src str i end matches fail) (fail)))
+              ((and (eqv? (cadr sre) 0) (eqv? (caddr sre) 0))
+               next)
               (else
-               (letrec
-                   ((from (cadr sre))
-                    (to (caddr sre))
-                    (body-contents (sre-sequence (cdddr sre)))
-                    (body
-                     (lambda (count)
-                       (lp body-contents
-                           n
-                           flags
-                           (lambda (cnk init src str i end matches fail)
-                             (if (and to (= count to))
-                                 (next cnk init src str i end matches fail)
-                                 ((body (+ 1 count))
-                                  cnk init src str i end matches
-                                  (lambda ()
-                                    (if (>= count from)
-                                        (next cnk init src str i end matches fail)
-                                        (fail))))))))))
-                 (if (and (zero? from) to (zero? to))
-                     next
-                     (lambda (cnk init src str i end matches fail)
-                       ((body 1) cnk init src str i end matches
-                        (lambda ()
-                          (if (zero? from)
-                              (next cnk init src str i end matches fail)
-                              (fail))))))))))
+               (let* ((from (cadr sre))
+                      (to (caddr sre))
+                      (x (sre-sequence (cdddr sre)))
+                      (nullable? (%sre-nullable? x))
+                      (cell (%new-cell!)))
+                 (define (enter b cnk init src str i end matches fail)
+                   (if nullable?
+                       (%iterate cell b cnk init src str i end matches fail)
+                       (b cnk init src str i end matches fail)))
+                 (letrec*
+                     ;; iteration `count` (1-based). Past `from` with no upper
+                     ;; bound every count behaves alike, so all of them share
+                     ;; one body and one memoizable `more`.
+                     ((body
+                       (%iteration-bodies from to
+                        (lambda (count)
+                          (lp x n flags
+                              (lambda (cnk init src str i end matches fail)
+                                (cond
+                                 ((or (and to (= count to))
+                                      (and nullable? (%iteration-empty? cell matches src i)))
+                                  (next cnk init src str i end matches fail))
+                                 ((and (not to) (>= count from))
+                                  (more cnk init src str i end matches fail))
+                                 (else
+                                  (enter (body (+ 1 count))
+                                         cnk init src str i end matches
+                                         (lambda ()
+                                           (if (>= count from)
+                                               (next cnk init src str i end matches fail)
+                                               (fail)))))))))))
+                      (more
+                       (memoize sre
+                        (lambda (cnk init src str i end matches fail)
+                          (enter (body (+ 1 from)) cnk init src str i end matches
+                                 (lambda () (next cnk init src str i end matches fail)))))))
+                   (if (and (zero? from) (not to))
+                       more
+                       (lambda (cnk init src str i end matches fail)
+                         (enter (body 1) cnk init src str i end matches
+                                (lambda ()
+                                  (if (zero? from)
+                                      (next cnk init src str i end matches fail)
+                                      (fail)))))))))))
             ((**?)
              (cond
               ((or (and (number? (cadr sre))
@@ -413,34 +680,58 @@
                         (> (cadr sre) (caddr sre)))
                    (and (not (cadr sre)) (caddr sre)))
                (lambda (cnk init src str i end matches fail) (fail)))
+              ((and (eqv? (cadr sre) 0) (eqv? (caddr sre) 0))
+               next)
               (else
-               (letrec
-                   ((from (cadr sre))
-                    (to (caddr sre))
-                    (body-contents (sre-sequence (cdddr sre)))
-                    (body
-                     (lambda (count)
-                       (lp body-contents
-                           n
-                           flags
-                           (lambda (cnk init src str i end matches fail)
-                             (if (< count from)
-                                 ((body (+ 1 count)) cnk init
-                                  src str i end matches fail)
-                                 (next cnk init src str i end matches
-                                       (lambda ()
-                                         (if (and to (= count to))
-                                             (fail)
-                                             ((body (+ 1 count)) cnk init
-                                              src str i end matches fail))))))))))
-                 (if (and (zero? from) to (zero? to))
-                     next
+               (let* ((from (cadr sre))
+                      (to (caddr sre))
+                      (x (sre-sequence (cdddr sre)))
+                      (nullable? (%sre-nullable? x))
+                      (cell (%new-cell!)))
+                 (define (enter b cnk init src str i end matches fail)
+                   (if nullable?
+                       (%iterate cell b cnk init src str i end matches fail)
+                       (b cnk init src str i end matches fail)))
+                 (letrec*
+                     ((body
+                       (%iteration-bodies from to
+                        (lambda (count)
+                          (lp x n flags
+                              (lambda (cnk init src str i end matches fail)
+                                (cond
+                                 ((and nullable? (%iteration-empty? cell matches src i))
+                                  (next cnk init src str i end matches fail))
+                                 ((< count from)
+                                  (enter (body (+ 1 count)) cnk init
+                                         src str i end matches fail))
+                                 ((not to)
+                                  (try cnk init src str i end matches fail))
+                                 (else
+                                  (next cnk init src str i end matches
+                                        (lambda ()
+                                          (if (= count to)
+                                              (fail)
+                                              (enter (body (+ 1 count)) cnk init
+                                                     src str i end matches fail)))))))))))
+                      ;; lazy, past `from` with no upper bound: what follows
+                      ;; first, then one more iteration.
+                      (try
+                       (memoize sre
+                        (lambda (cnk init src str i end matches fail)
+                          (next cnk init src str i end matches
+                                (lambda ()
+                                  (enter (body (+ 1 from)) cnk init src str i end
+                                         matches fail)))))))
+                   (cond
+                    ((and (zero? from) (not to)) try)
+                    ((zero? from)
                      (lambda (cnk init src str i end matches fail)
-                       (if (zero? from)
-                           (next cnk init src str i end matches
-                                 (lambda ()
-                                   ((body 1) cnk init src str i end matches fail)))
-                           ((body 1) cnk init src str i end matches fail))))))))
+                       (next cnk init src str i end matches
+                             (lambda ()
+                               (enter (body 1) cnk init src str i end matches fail)))))
+                    (else
+                     (lambda (cnk init src str i end matches fail)
+                       (enter (body 1) cnk init src str i end matches fail)))))))))
             ((word)
              (rec `(seq bow ,@(cdr sre) eow)))
             ((word+)
@@ -864,3 +1155,43 @@
       )
      (else
       (error "unknown regexp" sre)))))
+  (if plan (%memo-root plan root) root))
+
+;; jolt-t16: irregex's cset-union, with its merge fixed. Two char sets are sorted
+;; range lists, walked in step; when the heads overlap (or touch) they are merged.
+;; The vendored version always put the merged range back at the head of the FIRST
+;; list, even when the second list's range reached further, so the first list's
+;; later ranges were left behind INSIDE the merged one and the result came out
+;; unsorted: (or (~ #\a) whitespace) built
+;;   ((#\nul . #\`) (#\space . #\space) (#\b . ...) ...)
+;; and the binary search over it lost characters — (re-find #"[^a]|\s" "A") was
+;; nil. Every java.util.regex class with a negated or multi-range part unioned
+;; with another can hit it. The merged range now goes back into whichever list
+;; its high end came from, so the other list's remainder is still compared
+;; against it. The `cset-union` below is otherwise the vendored procedure; `make
+;; regexanchorcheck` pins the original.
+(define (cset-union a b)
+  (let union-range ((a (vector->list a))
+                    (b (vector->list b))
+                    (res '()))
+    (cond
+     ((null? a) (list->vector (reverse (append (reverse b) res))))
+     ((null? b) (list->vector (reverse (append (reverse a) res))))
+     (else
+      (let ((a-range (car a))
+            (b-range (car b)))
+        (cond
+         ;; Can't use next-char here since it will cause an error if we are
+         ;; comparing a cset with the maximum character as high char.
+         ((< (+ (char->integer (cdr a-range)) 1) (char->integer (car b-range)))
+          (union-range (cdr a) b (cons a-range res)))
+         ((> (char->integer (car a-range)) (+ (char->integer (cdr b-range)) 1))
+          (union-range (cdr b) a (cons b-range res)))
+         ;; jolt-t16: keep the merged range in the list it ends in.
+         ((char>=? (cdr a-range) (cdr b-range))
+          (union-range (cons (char-ranges-union a-range b-range) (cdr a))
+                       (cdr b)
+                       res))
+         (else (union-range (cdr a)
+                            (cons (char-ranges-union a-range b-range) (cdr b))
+                            res))))))))
