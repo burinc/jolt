@@ -179,6 +179,31 @@
           ((port-ready-probe bp) => (lambda (probe) (probe)))
           (else (> (port-available bp) 0)))))
 
+;; InputStream.skip over a file moves the position instead of reading the bytes
+;; through: to the end of a 20MB file that is one lseek, where reading took 12ms.
+;; FileInputStream.skip is lseek(cur + n) and answers n, whether or not that is
+;; past the end (the next read then answers -1), and a target before the start
+;; of the file is IOException "Invalid argument", the errno text (JDK 25).
+;;
+;; Only a plain file stream takes this path: a port with no descriptor
+;; (ByteArrayInputStream, a pipe's or a zip entry's custom port) or one that
+;; cannot say where it is (a pipe or terminal on fd 0, which raises ESPIPE from
+;; port-position) answers #f and keeps the reading loop. A stream that supports
+;; mark (ByteArrayInputStream) and a pushback stream, which has bytes of its own
+;; ahead of the port, have different rules, so they stay on it too.
+;; #f when the stream is not seekable, else the count skipped.
+(define (in-stream-skip-by-seek! self port n)
+  (and (not (in-stream-markable? self))
+       (not (in-stream-pushback self))
+       (not (piped-pipe self))
+       (let ((pos (guard (_ (#t #f))
+                    (and (port-file-descriptor port) (port-position port)))))
+         (and pos
+              (let ((target (+ pos n)))
+                (when (< target 0) (io-throw "Invalid argument"))
+                (and (guard (_ (#t #f)) (set-port-position! port target) #t)
+                     (->num n)))))))
+
 (register-host-methods! "in-stream"
   (list
    (cons "read"
@@ -232,8 +257,11 @@
                             (begin (ja-bv->bytes! tmp 0 buf off n) (->num n)))))))))))
    (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
-   (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-live-port self) (jnum->exact n))))
-                                   (->num (if (eof-object? bv) 0 (bytevector-length bv))))))
+   (cons "skip" (lambda (self n)
+                  (let ((port (in-stream-live-port self)) (n (jnum->exact n)))
+                    (or (in-stream-skip-by-seek! self port n)
+                        (let ((bv (get-bytevector-n port n)))
+                          (->num (if (eof-object? bv) 0 (bytevector-length bv))))))))
    (cons "available" (lambda (self) (->num (in-stream-available self))))
    ;; PushbackInputStream.unread — see the pushback section below. Any other
    ;; stream has no such method, and says so the way every missing method does.
