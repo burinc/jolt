@@ -515,8 +515,9 @@
 ;; stream cannot, and those run the body straight, with no guard and no closure
 ;; (both cost ~25% of a print into a StringWriter).
 (define-syntax pw-guarded
-  (syntax-rules (lambda)
-    ((_ self (lambda () body ...))
+  (syntax-rules ()
+    ;; the body arrives as (lambda () body ...), written so to read as a thunk
+    ((_ self (_lambda () body ...))
      (let ((s self))
        (if (pw-writer? s)
            (pw-guarded* s (lambda () body ...))
