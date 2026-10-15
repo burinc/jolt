@@ -10,8 +10,13 @@
   stream classes with the host class registry.
 
   Deliberate divergences from the JVM (test/conformance/known-divergences.edn):
-  a recv error reads as EOF (-1) rather than throwing, and toString formats are
-  approximate. IPv4 only.
+  a recv error reads as EOF (-1) rather than throwing.
+
+  IPv4 and IPv6, as the JDK has them: Inet4Address and Inet6Address, v6
+  literals with or without brackets and with a scope zone, IPv4 answered
+  first for a name with both. A socket's family follows the address it
+  connects or binds to, and a listener on the wildcard address is dual-stack,
+  taking IPv4 peers as mapped addresses that read back as Inet4Address.
 
   Sockets are non-blocking on every platform and wait on jolt.io-poller — kqueue,
   epoll, or WSAPoll on Windows — so a fiber parks rather than holding its
@@ -29,21 +34,221 @@
 ;; Linux's numbers on Windows cost). What is left here is the java.net object
 ;; model over it.
 
-;; -- sockaddr helpers ---------------------------------------------------------
+;; -- tagged-table constructors ------------------------------------------------
+;; a "class" entry makes (class x) report the mirrored class name; instance?
+;; and str rendering are registered at the bottom of the file.
 
-(defn- resolve-host
-  "The IPv4 address host names, as a dotted quad — a numeric literal answers
-  itself without a lookup."
+(defn- tt [tag class]
+  (doto (jolt.host/tagged-table tag)
+    (jolt.host/ref-put! :class class)))
+
+;; -- addresses ------------------------------------------------------------------
+;; An InetAddress is its bytes — 4 for an Inet4Address, 16 for an Inet6Address —
+;; with the host name it was looked up by ("" until one is known) and, for v6,
+;; its scope: the zone number (:scope-id, nil when none was given) and the
+;; interface it was named by (:scope-ifname). :address is getHostAddress, the
+;; JDK's text: a dotted quad, or eight uncompressed lowercase hex groups
+;; ("0:0:0:0:0:0:0:1", never "::1") followed by %interface or %number.
+
+(defn- v4-text [bs] (str/join "." bs))
+
+(defn- v6-text [bs]
+  (str/join ":" (map (fn [i] (Integer/toHexString (+ (* 256 (nth bs i)) (nth bs (inc i)))))
+                     (range 0 16 2))))
+
+(defn- make-inet
+  ([host bs] (make-inet host bs nil nil))
+  ([host bs scope-id ifname]
+   (let [bs (vec bs) v6? (= 16 (count bs))]
+     (doto (tt :inet-address (if v6? "java.net.Inet6Address" "java.net.Inet4Address"))
+       (jolt.host/ref-put! :host host)
+       (jolt.host/ref-put! :bytes bs)
+       (jolt.host/ref-put! :scope-id scope-id)
+       (jolt.host/ref-put! :scope-ifname ifname)
+       (jolt.host/ref-put! :address
+                           (if v6?
+                             (str (v6-text bs) (cond ifname (str "%" ifname)
+                                                     scope-id (str "%" scope-id)
+                                                     :else ""))
+                             (v4-text bs)))))))
+
+(defn- inet? [x] (= :inet-address (jolt.host/ref-get x :jolt/type)))
+(defn- inet-bytes [a] (jolt.host/ref-get a :bytes))
+(defn- inet6? [a] (= 16 (count (inet-bytes a))))
+
+;; InetAddress.anyLocalAddress — what an unbound socket reports and a wildcard
+;; bind means. With java.net.preferIPv6Addresses false, the JDK's default, it is
+;; the Inet4Address 0.0.0.0, named "0.0.0.0".
+(defn- any-local [] (make-inet "0.0.0.0" [0 0 0 0]))
+(defn- loopback [] (make-inet "localhost" [127 0 0 1]))
+
+;; -- literals (the JDK's IPAddressUtil) --
+(defn- parse-v4
+  "The four bytes of an IPv4 literal, or nil: decimal, one to four parts, the
+  last filling the bytes the others leave (127.1 is 127.0.0.1, 2130706433 is
+  too), at most 15 characters — textToNumericFormatV4."
+  [s]
+  (when (<= 1 (count s) 15)
+    (let [parts (str/split s #"\." -1)
+          n (count parts)]
+      (when (and (<= n 4) (every? (fn [p] (re-matches #"\d+" p)) parts))
+        (let [vs (mapv (fn [p] (Long/parseLong p)) parts)
+              lead (pop vs)
+              lst (peek vs)
+              room (- 5 n)]
+          (when (and (every? (fn [v] (<= v 255)) lead)
+                     (< lst (bit-shift-left 1 (* 8 room))))
+            (into lead (map (fn [i] (bit-and (bit-shift-right lst (* 8 i)) 0xff))
+                            (range (dec room) -1 -1)))))))))
+
+(defn- bsd-v4?
+  "Whether s is an IPv4 literal only as inet_aton reads one — a hex or octal
+  part — which the JDK refuses as ambiguous (jdk.net.allowAmbiguousIPAddressLiterals
+  is false by default) rather than resolve."
+  [s]
+  (let [parts (str/split s #"\." -1)
+        n (count parts)
+        field (fn [p]
+                (cond
+                  (re-matches #"0[xX][0-9a-fA-F]*" p)
+                  (if (= 2 (count p)) 0 (reduce (fn [a c] (+ (* a 16) (Character/digit c 16))) 0 (subs p 2)))
+                  (re-matches #"0[0-7]*" p) (reduce (fn [a c] (+ (* a 8) (Character/digit c 8))) 0 p)
+                  (re-matches #"[1-9]\d*" p) (reduce (fn [a c] (+ (* a 10) (Character/digit c 10))) 0 p)))]
+    (and (<= 1 n 4) (<= (count s) 64)
+         (let [vs (map field parts)]
+           (and (every? some? vs)
+                (every? (fn [v] (<= v 255)) (butlast vs))
+                (< (last vs) (bit-shift-left 1 (* 8 (- 5 n)))))))))
+
+(defn- hex-group
+  "One IPv6 group's value. Any number of hex digits, as the JDK takes them, so
+  long as the value fits in 16 bits."
+  [g]
+  (when (seq g)
+    (reduce (fn [acc c]
+              (let [d (Character/digit c 16)]
+                (if (neg? d)
+                  (reduced nil)
+                  (let [v (+ (* acc 16) d)]
+                    (if (> v 0xffff) (reduced nil) v)))))
+            0 g)))
+
+(defn- v6-part
+  "The bytes of one side of a literal's ::, or nil. TAIL? is the side that ends
+  the literal, whose last group may be an embedded dotted quad."
+  [part tail?]
+  (if (= "" part)
+    []
+    (let [gs (str/split part #":" -1) n (count gs)]
+      (loop [i 0 out []]
+        (if (= i n)
+          out
+          (let [g (nth gs i)]
+            (if (and tail? (= i (dec n)) (str/includes? g "."))
+              (when-let [q (when (= 3 (count (filter #{\.} g))) (parse-v4 g))] (into out q))
+              (when-let [v (hex-group g)]
+                (recur (inc i) (conj out (bit-shift-right v 8) (bit-and v 0xff)))))))))))
+
+(defn- parse-v6
+  "The 16 bytes of an IPv6 literal without brackets or zone, or nil."
+  [s]
+  (let [d (str/index-of s "::")]
+    (if (nil? d)
+      (let [bs (v6-part s true)] (when (= 16 (count bs)) bs))
+      (when-not (str/index-of s "::" (inc d))
+        (let [hd (v6-part (subs s 0 d) false)
+              tl (v6-part (subs s (+ d 2)) true)]
+          (when (and hd tl (< (+ (count hd) (count tl)) 16))
+            (vec (concat hd (repeat (- 16 (count hd) (count tl)) 0) tl))))))))
+
+(defn- unmap
+  "An IPv4-mapped address (::ffff:a.b.c.d) as the IPv4 address it is — the JDK
+  hands those back as Inet4Address wherever they come from."
+  [bs]
+  (if (and (= 16 (count bs)) (every? zero? (subvec bs 0 10))
+           (= 0xff (nth bs 10)) (= 0xff (nth bs 11)))
+    (subvec bs 12)
+    bs))
+
+(defn- invalid-v6! [host]
+  (throw (java.net.UnknownHostException. (str host ": invalid IPv6 address literal"))))
+
+(defn- literal-inet
+  "host as an address literal, nameless, or nil when it is a name to resolve.
+  As InetAddress.getAllByName reads it: brackets or a colon make it an IPv6
+  literal, which must then parse; a zone after % is a number or an interface
+  name, which must exist."
   [host]
-  (let [{:keys [addrs]} (native/resolve-addrs (str host) 0 {:family native/af-inet})]
-    (native/free-addrs! addrs)
-    (or (:ip (first addrs))
-        (throw (java.net.UnknownHostException. (str host))))))
+  (let [bracketed? (str/starts-with? host "[")
+        h (if bracketed?
+            (if (and (> (count host) 2) (str/ends-with? host "]"))
+              (subs host 1 (dec (count host)))
+              (invalid-v6! host))
+            host)]
+    (if (or bracketed? (str/includes? h ":"))
+      (let [pct  (str/index-of h "%")
+            zone (when pct (subs h (inc pct)))
+            bs   (when-not (= "" zone) (parse-v6 (if pct (subs h 0 pct) h)))]
+        (when-not bs (invalid-v6! host))
+        (let [bs (unmap bs)]
+          (cond
+            (or (nil? zone) (= 4 (count bs))) (make-inet "" bs)
+            (re-matches #"\d{1,9}" zone) (make-inet "" bs (Integer/parseInt zone) nil)
+            :else (if-let [i (native/interface-index zone)]
+                    (make-inet "" bs i zone)
+                    (throw (java.net.UnknownHostException. (str "no such interface " zone)))))))
+      (if-let [bs (parse-v4 h)]
+        (make-inet "" bs)
+        (when (bsd-v4? h) (throw (java.net.UnknownHostException. h)))))))
 
-(defn- make-sockaddr-in
-  "[sa len] for host:port, IPv4. The caller frees sa."
-  [host port]
-  (native/make-sockaddr native/af-inet (resolve-host host) port))
+;; -- resolution --
+(defn- entry->inet
+  "The InetAddress for a native address map {:ip :scope-id}, named host."
+  [host {:keys [ip scope-id]}]
+  (let [bs (unmap (if (str/includes? ip ":") (parse-v6 ip) (parse-v4 ip)))]
+    (make-inet host bs (when (and (= 16 (count bs)) scope-id (pos? scope-id)) scope-id) nil)))
+
+(defn- all-inets
+  "Every InetAddress host names, IPv4 before IPv6 as the JDK orders them while
+  java.net.preferIPv6Addresses is false, its default. A literal is itself, with
+  no name; nil or \"\" is the loopback. Throws UnknownHostException."
+  [host]
+  (let [h (when (some? host) (str host))]
+    (if (or (nil? h) (= "" h))
+      [(loopback)]
+      (if-let [lit (literal-inet h)]
+        [lit]
+        (let [{:keys [addrs message]} (native/resolve-addrs h 0)
+              _ (native/free-addrs! addrs)
+              inets (mapv (fn [e] (entry->inet h e)) addrs)]
+          (when (empty? inets)
+            (throw (java.net.UnknownHostException. (if message (str h ": " message) h))))
+          (into (filterv (fn [a] (not (inet6? a))) inets) (filter inet6? inets)))))))
+
+(defn- inet-by-name [host] (first (all-inets host)))
+
+(defn- host-arg->inet
+  "An InetAddress argument as it is, anything else resolved as a host name."
+  [h]
+  (if (inet? h) h (inet-by-name h)))
+
+;; -- sockaddr --
+(defn- inet-family [a] (if (inet6? a) native/af-inet6 native/af-inet))
+
+(defn- inet-sockaddr
+  "[sa len] for a:port, scope included. The caller frees sa."
+  [a port]
+  (let [bs (inet-bytes a)]
+    (native/make-sockaddr (inet-family a) (if (inet6? a) (v6-text bs) (v4-text bs))
+                          port (or (jolt.host/ref-get a :scope-id) 0))))
+
+(defn- sockaddr->inet [sa]
+  (entry->inet "" {:ip (native/sockaddr-ip sa) :scope-id (native/sockaddr-scope-id sa)}))
+
+(defn- local-inet
+  "The address fd is bound to, nameless, or nil when getsockname fails."
+  [fd]
+  (when-let [m (native/local-address fd)] (entry->inet "" m)))
 
 (defn- local-port [fd]
   (max 0 (native/local-port fd)))
@@ -57,34 +262,16 @@
   (native/guard-accepted! fd)
   (poller/nonblock! fd))
 
-(defn- new-fd! []
-  (let [fd (native/new-socket native/af-inet)]
+(defn- new-fd! [family]
+  (let [fd (native/new-socket family)]
     ;; SO_REUSEADDR on POSIX, as the JDK sets it; nothing on Windows, where the
     ;; option means sharing a live listener and the JDK binds exclusively, so a
     ;; busy port is a BindException there (native/set-listener-reuse!)
     (native/set-listener-reuse! fd)
+    ;; every v6 socket is dual-stack, as the JDK's are
+    (when (= family native/af-inet6) (native/set-dual-stack! fd))
     (poller/nonblock! fd)
     fd))
-
-;; -- tagged-table constructors ------------------------------------------------
-;; a "class" entry makes (class x) report the mirrored class name; instance?
-;; and str rendering are registered at the bottom of the file.
-
-(defn- tt [tag class]
-  (doto (jolt.host/tagged-table tag)
-    (jolt.host/ref-put! :class class)))
-
-(defn- make-inet-address [host addr]
-  (doto (tt :inet-address "java.net.Inet4Address")
-    (jolt.host/ref-put! :host host)
-    (jolt.host/ref-put! :address addr)))
-
-(defn- host-arg->str [h]
-  ;; Socket(InetAddress, port) / ServerSocket(..., bindAddr) pass the
-  ;; InetAddress table; take its literal before falling back to str.
-  (if (= :inet-address (jolt.host/ref-get h :jolt/type))
-    (str (or (jolt.host/ref-get h :address) (jolt.host/ref-get h :host)))
-    (str h)))
 
 ;; -- fd lifetime ---------------------------------------------------------------
 ;; A socket's fd is live while any operation is using it. Closing marks the
@@ -143,16 +330,15 @@
   (when (jolt.host/ref-get owner :closed?)
     (throw (java.net.SocketException. msg))))
 
-(defn- connect-fd! [owner fd host port deadline]
-  ;; resolve + connect; frees the sockaddr either way. Returns the resolved ip.
+(defn- connect-fd! [owner fd inet port deadline]
+  ;; connect fd to the InetAddress inet; frees the sockaddr either way.
   ;; The fd is O_NONBLOCK (fibers R8), so connect answers EINPROGRESS; wait for
   ;; writability (parking on a fiber, blocking kevent on a thread — the same
   ;; dispatch every other IO path uses), then read SO_ERROR for the verdict.
   ;; DEADLINE (poller/deadline-ms, or nil for none) bounds that wait: connect(endpoint,
   ;; timeout). Windows answers WSAEWOULDBLOCK where POSIX says EINPROGRESS, and
   ;; native/connect-pending? knows both.
-  (let [ip (resolve-host host)
-        [sa len] (native/make-sockaddr native/af-inet ip port)
+  (let [[sa len] (inet-sockaddr inet port)
         ;; 0 when connected, else the failure's errno (-1 when there is none)
         e  (try
              (loop []
@@ -171,34 +357,64 @@
                    :else (if (pos? e) e -1))))
              (finally (ffi/free sa)))]
     (cond
-      (zero? e) ip
+      (zero? e) nil
       (= e native/econnrefused) (throw (java.net.ConnectException. "Connection refused"))
-      :else (throw (java.io.IOException. (str "connect failed: " host ":" port))))))
+      :else (throw (java.io.IOException.
+                    (str "connect failed: "
+                         (let [h (jolt.host/ref-get inet :host)]
+                           (if (str/blank? h) (jolt.host/ref-get inet :address) h))
+                         ":" port))))))
 
 ;; -- Socket ------------------------------------------------------------------
-(declare make-isa ipv4-literal? inet-address->str)
+(declare make-isa inet-address->str)
 
-;; The peer's InetAddress: the host name it was reached by, none for a literal
-(defn- peer-address [self]
-  (let [h (jolt.host/ref-get self :host)]
-    (make-inet-address (if (ipv4-literal? h) "" h) (jolt.host/ref-get self :remote-addr))))
+;; The peer's InetAddress: the one connected to, named as it was looked up —
+;; none for a literal or an accepted peer
+(defn- peer-address [self] (jolt.host/ref-get self :remote-inet))
+
+(defn- mark-connected! [self fd inet port]
+  (jolt.host/ref-put! self :connected? true)
+  (jolt.host/ref-put! self :remote-inet inet)
+  (jolt.host/ref-put! self :port port)
+  (jolt.host/ref-put! self :local-port (local-port fd))
+  ;; read now: once the socket closes, its fd number may be another socket's
+  (jolt.host/ref-put! self :local-inet (local-inet fd)))
+
+;; The JDK picks a socket's family when it connects or binds, from the address;
+;; an unconnected Socket or unbound ServerSocket starts with an IPv4 fd here and
+;; trades it for one of the address's family when that is different. Nothing
+;; has been set on the fd that the swap would lose: socket options this class
+;; has are kept on the object and applied per call.
+(defn- ensure-family! [self family]
+  (when-not (= family (jolt.host/ref-get self :family))
+    (let [nfd (new-fd! family)
+          old (locking self
+                (when-not (jolt.host/ref-get self :closed?)
+                  (let [o (jolt.host/ref-get self :fd)]
+                    (jolt.host/ref-put! self :fd nfd)
+                    (jolt.host/ref-put! self :family family)
+                    o)))]
+      (if old
+        (fd-release! old)
+        (do (native/c-close nfd)
+            (throw (java.net.SocketException. "Socket is closed")))))))
 
 (defn- socket-ctor [& args]
-  (let [fd   (new-fd!)
-        inst (tt :socket "java.net.Socket")]
-    (jolt.host/ref-put! inst :fd fd)
+  (let [inst (tt :socket "java.net.Socket")]
     (jolt.host/ref-put! inst :closed? false)
     (jolt.host/ref-put! inst :connected? false)
-    (when (= 2 (count args))
-      (let [h  (host-arg->str (first args))
-            p  (int (second args))
-            ip (try (connect-fd! inst fd h p nil)
-                    (catch java.io.IOException e (fd-release! fd) (throw e)))]
-        (jolt.host/ref-put! inst :connected? true)
-        (jolt.host/ref-put! inst :host h)
-        (jolt.host/ref-put! inst :remote-addr ip)
-        (jolt.host/ref-put! inst :port p)
-        (jolt.host/ref-put! inst :local-port (local-port fd))))
+    (if (= 2 (count args))
+      (let [inet (host-arg->inet (first args))
+            p    (int (second args))
+            fam  (inet-family inet)
+            fd   (new-fd! fam)]
+        (jolt.host/ref-put! inst :fd fd)
+        (jolt.host/ref-put! inst :family fam)
+        (try (connect-fd! inst fd inet p nil)
+             (catch java.io.IOException e (fd-release! fd) (throw e)))
+        (mark-connected! inst fd inet p))
+      (do (jolt.host/ref-put! inst :fd (new-fd! native/af-inet))
+          (jolt.host/ref-put! inst :family native/af-inet)))
     inst))
 
 (defn- socket-close! [self] (close-owner! self))
@@ -252,19 +468,17 @@
   ;; timed-out socket is not left half-connected for the caller to reuse.
   (try
     (with-op self
-      (when (and (= :inet-socket-address (jolt.host/ref-get endpoint :jolt/type))
-                 (nil? (jolt.host/ref-get endpoint :addr)))
+      (when-not (= :inet-socket-address (jolt.host/ref-get endpoint :jolt/type))
+        (throw (IllegalArgumentException. "Unsupported address type")))
+      (when (nil? (jolt.host/ref-get endpoint :addr))
         (throw (java.net.UnknownHostException. (str (jolt.host/ref-get endpoint :host)))))
-      (let [h  (str (jolt.host/ref-get endpoint :host))
-            p  (jolt.host/ref-get endpoint :port)
-            fd (jolt.host/ref-get self :fd)
-            ip (connect-fd! self fd h p (when (pos? timeout)
-                                          (poller/deadline-ms timeout)))]
-        (jolt.host/ref-put! self :connected? true)
-        (jolt.host/ref-put! self :host h)
-        (jolt.host/ref-put! self :remote-addr ip)
-        (jolt.host/ref-put! self :port p)
-        (jolt.host/ref-put! self :local-port (local-port fd))))
+      (let [inet (jolt.host/ref-get endpoint :addr)
+            p    (jolt.host/ref-get endpoint :port)
+            _    (ensure-family! self (inet-family inet))
+            fd   (jolt.host/ref-get self :fd)]
+        (connect-fd! self fd inet p (when (pos? timeout)
+                                      (poller/deadline-ms timeout)))
+        (mark-connected! self fd inet p)))
     (catch java.io.IOException e
       (close-owner! self)
       (throw e)))
@@ -295,6 +509,14 @@
          ",port=" (or (jolt.host/ref-get self :port) 0)
          ",localport=" (or (jolt.host/ref-get self :local-port) 0) "]")
     "Socket[unconnected]"))
+
+;; Socket.getLocalAddress: the wildcard until connected, and again once closed,
+;; when the JDK can no longer ask the socket
+(defn- socket-local-address [self]
+  (or (when (and (jolt.host/ref-get self :connected?)
+                 (not (jolt.host/ref-get self :closed?)))
+        (jolt.host/ref-get self :local-inet))
+      (any-local)))
 
 (def ^:private socket-methods
   {"connect"
@@ -350,8 +572,15 @@
    "getRemoteSocketAddress"
    (fn [self]
      (when (jolt.host/ref-get self :connected?)
-       (make-isa (jolt.host/ref-get self :host) (peer-address self)
-                 (jolt.host/ref-get self :port))))})
+       (make-isa nil (peer-address self) (jolt.host/ref-get self :port))))
+
+   "getLocalAddress" socket-local-address
+
+   "getLocalSocketAddress"
+   (fn [self]
+     (when (jolt.host/ref-get self :connected?)
+       (make-isa nil (socket-local-address self)
+                 (or (jolt.host/ref-get self :local-port) 0))))})
 
 ;; -- SocketInputStream -------------------------------------------------------
 (defn- io-call
@@ -532,25 +761,48 @@
    "close" (fn [self] (socket-close! (jolt.host/ref-get self :socket)))})
 
 ;; -- ServerSocket ------------------------------------------------------------
-;; Bind fd to bind-host:port and start listening, or throw. Shared by the ctor
-;; forms that bind on construction and by the bind method, which is the only way
-;; a no-arg socket ever becomes bound.
-;;
-;; close-on-failure? is the difference between the two callers, not a knob. The
-;; ctor owns its fd and no caller has seen it yet, so a failed bind must close it
-;; or it leaks. bind must NOT close, because Java leaves a failed bind's socket
-;; open — the caller still holds it and is the one who closes or retries.
-(defn- bind-listen! [fd bind-host port backlog close-on-failure?]
-  ;; any failure closes fd when asked, an unknown bind host included
-  (try
-    (let [[sa len] (make-sockaddr-in bind-host port)]
-      (when (neg? (first (try (native/c-bind fd sa len) (finally (ffi/free sa)))))
+;; A new fd of family bound to ip:port and listening, or throw having closed it.
+(defn- open-listener! [family sa len port backlog]
+  (let [fd (new-fd! family)]
+    (try
+      (when (neg? (first (native/c-bind fd sa len)))
         (throw (java.io.IOException. (str "bind failed on port " port))))
       (when (neg? (first (native/c-listen fd backlog)))
-        (throw (java.io.IOException. "listen() failed"))))
-    (catch :default e
-      (when close-on-failure? (native/c-close fd))
-      (throw e))))
+        (throw (java.io.IOException. "listen() failed")))
+      fd
+      (catch :default e
+        (native/c-close fd)
+        (throw e)))))
+
+(defn- listen-on! [family ip port backlog]
+  (let [[sa len] (native/make-sockaddr family ip port)]
+    (try (open-listener! family sa len port backlog)
+         (finally (ffi/free sa)))))
+
+(defn- any-local? [inet] (every? zero? (inet-bytes inet)))
+
+;; A listening fd for inet:port: one of inet's family, or for the IPv4 wildcard
+;; — what ServerSocket(port) and a null or port-only bind address mean — a
+;; dual-stack IPv6 socket on ::, as the JDK opens, so IPv6 clients reach it too.
+;; A host without IPv6 gets the IPv4 wildcard instead. Answers [fd family].
+(defn- bind-listen! [inet port backlog]
+  (if (and (not (inet6? inet)) (any-local? inet))
+    (if-let [fd (try (listen-on! native/af-inet6 "::" port backlog)
+                     (catch java.io.IOException _ nil))]
+      [fd native/af-inet6]
+      [(listen-on! native/af-inet "0.0.0.0" port backlog) native/af-inet])
+    (let [[sa len] (inet-sockaddr inet port)
+          fam (inet-family inet)]
+      (try [(open-listener! fam sa len port backlog) fam]
+           (finally (ffi/free sa))))))
+
+(defn- mark-bound! [self fd family inet port]
+  (jolt.host/ref-put! self :fd fd)
+  (jolt.host/ref-put! self :family family)
+  (jolt.host/ref-put! self :bound? true)
+  ;; the address as given, name and all: getInetAddress and toString answer it
+  (jolt.host/ref-put! self :bind-inet inet)
+  (jolt.host/ref-put! self :port (if (zero? port) (local-port fd) port)))
 
 (defn- server-ctor [& args]
   ;; [] [port] [port backlog] [port backlog bindAddr]. The arg'd forms bind the
@@ -564,50 +816,53 @@
   ;; port the caller never asked for.
   (if (zero? (count args))
     (doto (tt :server-socket "java.net.ServerSocket")
-      (jolt.host/ref-put! :fd (new-fd!))
+      (jolt.host/ref-put! :fd (new-fd! native/af-inet))
+      (jolt.host/ref-put! :family native/af-inet)
       (jolt.host/ref-put! :closed? false)
       (jolt.host/ref-put! :bound? false))
-    (let [port      (int (first args))
-          backlog   (if (>= (count args) 2) (int (second args)) 50)
-          bind-host (if (>= (count args) 3) (host-arg->str (nth args 2)) "0.0.0.0")
-          fd        (new-fd!)]
-      (bind-listen! fd bind-host port backlog true)
+    (let [port    (int (first args))
+          backlog (if (>= (count args) 2) (int (second args)) 50)
+          inet    (if (and (>= (count args) 3) (some? (nth args 2)))
+                    (host-arg->inet (nth args 2))
+                    (any-local))
+          [fd fam] (bind-listen! inet port backlog)]
       (doto (tt :server-socket "java.net.ServerSocket")
-        (jolt.host/ref-put! :fd fd)
         (jolt.host/ref-put! :closed? false)
-        (jolt.host/ref-put! :bound? true)
-        (jolt.host/ref-put! :bind-addr bind-host)
-        (jolt.host/ref-put! :port (if (zero? port) (local-port fd) port))))))
+        (mark-bound! fd fam inet port)))))
 
 ;; (.bind ss endpoint) / (.bind ss endpoint backlog), the two overloads
 ;; ServerSocket declares. Java's default backlog is 50, the same one the
 ;; [port backlog] ctor form defaults to.
+;;
+;; A failed bind leaves the socket open and unbound, as Java's does: the
+;; listener is a fresh fd, and only a successful one replaces the socket's.
 (defn- server-bind! [self endpoint backlog]
   (when (jolt.host/ref-get self :closed?)
     (throw (java.net.SocketException. "Socket is closed")))
   (when (jolt.host/ref-get self :bound?)
     (throw (java.net.SocketException. "Already bound")))
-  (when (and endpoint (= :inet-socket-address (jolt.host/ref-get endpoint :jolt/type))
-             (nil? (jolt.host/ref-get endpoint :addr)))
+  (when (and endpoint (not= :inet-socket-address (jolt.host/ref-get endpoint :jolt/type)))
+    (throw (IllegalArgumentException. "Unsupported address type")))
+  (when (and endpoint (nil? (jolt.host/ref-get endpoint :addr)))
     (throw (java.net.SocketException. "Unresolved address")))
-  (let [h  (str (or (when endpoint
-                      (let [a (jolt.host/ref-get endpoint :addr)]
-                        (or (and a (jolt.host/ref-get a :address))
-                            (jolt.host/ref-get endpoint :host))))
-                    "0.0.0.0"))
-        p  (int (or (and endpoint (jolt.host/ref-get endpoint :port)) 0))
-        fd (jolt.host/ref-get self :fd)]
-    (bind-listen! fd h p backlog false)
-    (jolt.host/ref-put! self :bound? true)
-    (jolt.host/ref-put! self :bind-addr h)
-    (jolt.host/ref-put! self :port (if (zero? p) (local-port fd) p)))
+  (let [inet (if endpoint (jolt.host/ref-get endpoint :addr) (any-local))
+        p    (int (if endpoint (jolt.host/ref-get endpoint :port) 0))
+        [fd fam] (bind-listen! inet p backlog)
+        old  (locking self
+               (when-not (jolt.host/ref-get self :closed?)
+                 (let [o (jolt.host/ref-get self :fd)]
+                   (mark-bound! self fd fam inet p)
+                   o)))]
+    (if old
+      (fd-release! old)
+      (do (native/c-close fd)
+          (throw (java.net.SocketException. "Socket is closed")))))
   nil)
 
 (defn- server->str [self]
   (if (jolt.host/ref-get self :bound?)
-    (let [ba (or (jolt.host/ref-get self :bind-addr) "0.0.0.0")]
-      (str "ServerSocket[addr=" ba "/" ba
-           ",localport=" (or (jolt.host/ref-get self :port) 0) "]"))
+    (str "ServerSocket[addr=" (inet-address->str (jolt.host/ref-get self :bind-inet))
+         ",localport=" (or (jolt.host/ref-get self :port) 0) "]")
     "ServerSocket[unbound]"))
 
 (def ^:private server-socket-methods
@@ -626,14 +881,13 @@
                             (so-timeout self) "Accept timed out")]
            (when (neg? cfd) (throw (java.io.IOException. "accept() failed")))
            (guard-fd! cfd)
+           ;; a dual-stack listener's IPv4 peer arrives as ::ffff:a.b.c.d,
+           ;; which sockaddr->inet reads back as the Inet4Address it is
            (doto (tt :socket "java.net.Socket")
              (jolt.host/ref-put! :fd cfd)
+             (jolt.host/ref-put! :family (jolt.host/ref-get self :family))
              (jolt.host/ref-put! :closed? false)
-             (jolt.host/ref-put! :connected? true)
-             (jolt.host/ref-put! :host (native/sockaddr-ip sa))
-             (jolt.host/ref-put! :remote-addr (native/sockaddr-ip sa))
-             (jolt.host/ref-put! :port (native/sockaddr-port sa))
-             (jolt.host/ref-put! :local-port (local-port cfd))))
+             (mark-connected! cfd (sockaddr->inet sa) (native/sockaddr-port sa))))
          (finally (ffi/free sa) (ffi/free lenp)))))
 
    "close"
@@ -649,6 +903,12 @@
      ([self endpoint backlog] (server-bind! self endpoint (int backlog))))
 
    "isClosed"     (fn [self] (boolean (jolt.host/ref-get self :closed?)))
+   "getInetAddress"
+   (fn [self] (when (jolt.host/ref-get self :bound?) (jolt.host/ref-get self :bind-inet)))
+   "getLocalSocketAddress"
+   (fn [self]
+     (when (jolt.host/ref-get self :bound?)
+       (make-isa nil (jolt.host/ref-get self :bind-inet) (jolt.host/ref-get self :port))))
    ;; Java's isBound asks "was this ever bound", not "is it usable now": it stays
    ;; true after close, and it is false on a fresh no-arg socket. Answering
    ;; (not closed?) had it backwards at both ends.
@@ -663,61 +923,80 @@
 ;; -- host identity: local host + network interfaces ---------------------------
 
 (defn- ifaddr-entries
-  "One map per getifaddrs entry: {:name :ip :mac}. java.net here is IPv4 only,
-  so a v6 entry keeps only its name — an interface with no IPv4 address (utun,
-  wg, a v6-only link) still exists and getByName still finds it.
+  "One map per getifaddrs entry that carries an IPv4 or IPv6 address, with the
+  InetAddress built (:inet). A v6 address is scoped to its interface, by name
+  and index, as the JDK reports it (/0:0:0:0:0:0:0:1%lo0).
 
   Empty on Windows, which has no getifaddrs (native/interface-addresses).
   getLocalHost answers from gethostname plus the resolver, which is the primary
   path on every platform and the one the JDK's own Windows getLocalHost uses;
   NetworkInterface enumerates nothing there, recorded in
   test/conformance/known-divergences.edn (jolt-lang/jolt#1107)."
-  []
-  (map (fn [{:keys [family] :as e}]
-         (if (= family native/af-inet)
-           (dissoc e :family)
-           (dissoc e :family :ip)))
-       (native/interface-addresses)))
+  [entries]
+  (keep (fn [{:keys [name ip] :as e}]
+          (when ip
+            (let [bs (inet-bytes (entry->inet "" e))]
+              (assoc e :inet
+                     (if (= 16 (count bs))
+                       (make-inet "" bs (or (native/interface-index name) (:scope-id e)) name)
+                       (make-inet "" bs))))))
+        entries))
 
 ;; -- InetAddress --------------------------------------------------------------
-(def ^:private ipv4-literal #"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})")
-
-(defn- ipv4-literal? [h]
-  (boolean (when-let [m (re-matches ipv4-literal (str h))]
-             (every? #(<= (Integer/parseInt %) 255) (rest m)))))
-
-(defn- ip-hash [ip]
-  (unchecked-int
-   (reduce (fn [acc o] (bit-or (bit-shift-left acc 8) (Integer/parseInt o)))
-           0
-           (str/split ip #"\."))))
-
-(defn- inet-address-ctor [& _]
-  (make-inet-address "localhost" "127.0.0.1"))
+(defn- inet-address-ctor [& _] (loopback))
 
 (defn- inet-address->str [self]
   (str (or (jolt.host/ref-get self :host) "")
        "/" (or (jolt.host/ref-get self :address) "")))
 
-;; Inet4Address.equals and hashCode go by the address alone: the host name it
-;; was looked up by plays no part, and the hash is the four octets as one int.
+;; equals and hashCode go by the address alone: the host name it was looked up
+;; by plays no part, and neither does a v6 scope. Inet4Address's hash is the four
+;; octets as one int; Inet6AddressHolder's is the sum of the address read as four
+;; big-endian ints of SIGNED bytes.
 (defn- inet-address= [a b]
-  (boolean (and (= :inet-address (jolt.host/ref-get b :jolt/type))
-                (= (jolt.host/ref-get a :address) (jolt.host/ref-get b :address)))))
+  (boolean (and (inet? b) (= (inet-bytes a) (inet-bytes b)))))
+
+(defn- signed-byte [b] (if (> b 127) (- b 256) b))
 
 (defn- inet-address-hash [self]
-  (ip-hash (or (jolt.host/ref-get self :address) "0.0.0.0")))
+  (let [bs (inet-bytes self)]
+    (if (= 4 (count bs))
+      (unchecked-int (reduce (fn [acc o] (bit-or (bit-shift-left acc 8) o)) 0 bs))
+      (reduce (fn [h k]
+                (unchecked-int
+                 (+ h (reduce (fn [c b]
+                                (unchecked-int (+ (unchecked-int (bit-shift-left c 8))
+                                                  (signed-byte b))))
+                              0 (subvec bs k (+ k 4))))))
+              0 [0 4 8 12]))))
+
+(defn- inet-plain-text
+  "The address with no zone: what the resolver's reverse lookup takes."
+  [self]
+  (let [bs (inet-bytes self)] (if (= 16 (count bs)) (v6-text bs) (v4-text bs))))
+
+(defn- loopback-address? [self]
+  (let [bs (inet-bytes self)]
+    (if (= 4 (count bs))
+      (= 127 (first bs))
+      (= bs (conj (vec (repeat 15 0)) 1)))))
+
+;; The address-class predicates, by the same prefixes the JDK tests.
+(defn- inet-pred [v4 v6]
+  (fn [self]
+    (let [bs (inet-bytes self)]
+      (boolean (if (= 4 (count bs)) (v4 bs) (v6 bs))))))
 
 (def ^:private inet-address-methods
-  {"getHostAddress" (fn [self] (or (jolt.host/ref-get self :address) "127.0.0.1"))
+  {"getHostAddress" (fn [self] (jolt.host/ref-get self :address))
    ;; Resolves on first call and caches, as the JVM does — an address built
    ;; from a literal or read off an interface carries no name until asked.
    "getHostName"
    (fn [self]
      (let [h (jolt.host/ref-get self :host)]
        (if (str/blank? h)
-         (let [addr (jolt.host/ref-get self :address)
-               nm (or (and addr (native/reverse-lookup addr)) addr)]
+         (let [nm (or (native/reverse-lookup (inet-plain-text self))
+                      (jolt.host/ref-get self :address))]
            (jolt.host/ref-put! self :host nm)
            nm)
          h)))
@@ -726,42 +1005,48 @@
    "getCanonicalHostName"
    (fn [self]
      (or (jolt.host/ref-get self :canonical)
-         (let [addr (jolt.host/ref-get self :address)
-               nm (or (and addr (native/reverse-lookup addr))
-                      (jolt.host/ref-get self :host)
-                      addr)]
+         (let [nm (or (native/reverse-lookup (inet-plain-text self))
+                      (let [h (jolt.host/ref-get self :host)] (when-not (str/blank? h) h))
+                      (jolt.host/ref-get self :address))]
            (jolt.host/ref-put! self :canonical nm)
            nm)))
-   ;; the four address octets, network order — the JVM's byte[].
-   "getAddress"
-   (fn [self]
-     (byte-array (mapv (fn [o] (Integer/parseInt o))
-                       (str/split (or (jolt.host/ref-get self :address) "127.0.0.1") #"\."))))
+   ;; the address bytes, network order — the JVM's byte[] of 4 or 16
+   "getAddress" (fn [self] (byte-array (map unchecked-byte (inet-bytes self))))
    "equals"   (fn [self other] (inet-address= self other))
    "hashCode" inet-address-hash
-   "isLoopbackAddress" (fn [self] (= "127.0.0.1" (jolt.host/ref-get self :address)))
+   "isLoopbackAddress" loopback-address?
+   "isAnyLocalAddress" (inet-pred (fn [bs] (every? zero? bs)) (fn [bs] (every? zero? bs)))
+   "isLinkLocalAddress"
+   (inet-pred (fn [[a b]] (and (= a 169) (= b 254)))
+              (fn [[a b]] (and (= a 0xfe) (= 0x80 (bit-and b 0xc0)))))
+   "isSiteLocalAddress"
+   (inet-pred (fn [[a b]] (or (= a 10) (and (= a 172) (= 16 (bit-and b 0xf0)))
+                              (and (= a 192) (= b 168))))
+              (fn [[a b]] (and (= a 0xfe) (= 0xc0 (bit-and b 0xc0)))))
+   "isMulticastAddress"
+   (inet-pred (fn [[a]] (= 0xe0 (bit-and a 0xf0))) (fn [[a]] (= a 0xff)))
+   ;; Inet6Address only, as on the JVM, where Inet4Address has no such method
+   "getScopeId" (fn [self] (or (jolt.host/ref-get self :scope-id) 0))
+   "isIPv4CompatibleAddress"
+   (fn [self] (boolean (and (inet6? self) (every? zero? (subvec (inet-bytes self) 0 12)))))
    "toString"       inet-address->str})
 
-(defn- all-addresses-of
-  "Every IPv4 address the resolver has for host; a numeric literal resolves to
-  itself without a lookup."
-  [host]
-  (let [{:keys [addrs]} (native/resolve-addrs (str host) 0 {:family native/af-inet})]
-    (native/free-addrs! addrs)
-    (when (empty? addrs)
-      (throw (java.io.IOException. (str "unknown host: " host))))
-    (mapv :ip addrs)))
+(defn- inet-by-address
+  "InetAddress.getByAddress: 4 bytes or 16, a mapped v6 address being v4."
+  [host addr]
+  (let [bs (unmap (mapv (fn [b] (bit-and b 0xff)) addr))]
+    (when-not (#{4 16} (count bs))
+      (throw (java.net.UnknownHostException. "addr is of illegal length")))
+    (make-inet (or host "") bs)))
 
 (def ^:private inet-address-statics
-  {"getByName"
-   ;; a literal carries no name until getHostName asks: (str) is /127.0.0.1
-   (fn [h] (make-inet-address (if (ipv4-literal? h) "" (str h)) (resolve-host h)))
-   "getAllByName"
+  {"getByName" inet-by-name
    ;; an array, as on the JVM, so alength and aget hold on the result.
-   (fn [h] (object-array (mapv (fn [ip] (make-inet-address (str h) ip))
-                               (all-addresses-of h))))
-   "getLoopbackAddress"
-   (fn [] (make-inet-address "localhost" "127.0.0.1"))
+   "getAllByName" (fn [h] (object-array (all-inets h)))
+   "getByAddress"
+   (fn ([addr] (inet-by-address nil addr))
+       ([host addr] (inet-by-address host addr)))
+   "getLoopbackAddress" loopback
    ;; gethostname(2) plus whatever the resolver says that name is. A machine
    ;; whose own name does not resolve — a laptop off any DNS that knows it — is
    ;; answered from its own interfaces rather than by throwing
@@ -769,19 +1054,22 @@
    "getLocalHost"
    (fn []
      (let [nm (native/host-name)]
-       (make-inet-address
-         nm
-         (or (try (resolve-host nm) (catch java.io.IOException _ nil))
-             (first (remove (fn [ip] (= "127.0.0.1" ip))
-                            (keep :ip (ifaddr-entries))))
-             "127.0.0.1"))))})
+       (or (try (let [a (inet-by-name nm)] (jolt.host/ref-put! a :host nm) a)
+                (catch java.io.IOException _ nil))
+           (make-inet nm (or (some (fn [{:keys [inet]}]
+                                     (when (and (not (inet6? inet)) (not (loopback-address? inet)))
+                                       (inet-bytes inet)))
+                                   (ifaddr-entries (native/interface-addresses)))
+                             [127 0 0 1])))))})
 
 ;; -- InetSocketAddress -------------------------------------------------------
 ;; As the JDK's: (InetSocketAddress. host port) resolves host when it is built and
 ;; keeps the InetAddress (:addr), or none when the lookup failed; createUnresolved
-;; never looks. :host is the host string as given (getHostString), :port the port.
+;; never looks. :host is the host string as given, :port the port. getHostString
+;; is the address's name when it has one, else its text, else the host as given.
 ;; A literal host carries no name until getHostName asks for one, so it prints
-;; /127.0.0.1:80, and an unresolved one prints host/<unresolved>:80.
+;; /127.0.0.1:80 — or /[0:0:0:0:0:0:0:1]:80, a v6 address bracketed — and an
+;; unresolved one prints host/<unresolved>:80.
 (defn- make-isa [host addr port]
   (doto (tt :inet-socket-address "java.net.InetSocketAddress")
     (jolt.host/ref-put! :host host)
@@ -796,24 +1084,19 @@
 (defn- inet-address-of
   "The InetAddress host names, or nil when it does not resolve."
   [host]
-  (if (ipv4-literal? host)
-    (make-inet-address "" (str host))
-    (try (make-inet-address (str host) (resolve-host host))
-         (catch java.io.IOException _ nil))))
+  (try (inet-by-name host)
+       (catch java.io.IOException _ nil)))
 
 (defn- isa-ctor [& args]
   (case (count args)
     ;; (InetSocketAddress. port): the wildcard address, like Java
-    1 (make-isa "0.0.0.0" (make-inet-address "0.0.0.0" "0.0.0.0") (check-port! (int (first args))))
+    1 (make-isa "0.0.0.0" (any-local) (check-port! (int (first args))))
     (let [[h p] args
           p (check-port! (int p))]
       (cond
-        (= :inet-address (jolt.host/ref-get h :jolt/type))
-        (make-isa (let [n (jolt.host/ref-get h :host)]
-                    (if (str/blank? n) (jolt.host/ref-get h :address) n))
-                  h p)
-        (nil? h) (make-isa "0.0.0.0" (make-inet-address "0.0.0.0" "0.0.0.0") p)
-        :else (make-isa (str h) (inet-address-of h) p)))))
+        (inet? h) (make-isa nil h p)
+        (nil? h) (make-isa "0.0.0.0" (any-local) p)
+        :else (make-isa (str h) (inet-address-of (str h)) p)))))
 
 (defn- isa-unresolved [host port]
   (when (nil? host) (throw (IllegalArgumentException. "hostname can't be null")))
@@ -821,11 +1104,18 @@
 
 (defn- isa-addr [self] (jolt.host/ref-get self :addr))
 
+(defn- isa-host-string [self]
+  (if-let [a (isa-addr self)]
+    (let [h (jolt.host/ref-get a :host)]
+      (if (str/blank? h) (jolt.host/ref-get a :address) h))
+    (jolt.host/ref-get self :host)))
+
 (defn- isa->str [self]
   (let [a (isa-addr self)]
-    (str (if a
-           (inet-address->str a)
-           (str (jolt.host/ref-get self :host) "/<unresolved>"))
+    (str (cond
+           (nil? a) (str (jolt.host/ref-get self :host) "/<unresolved>")
+           (inet6? a) (str (jolt.host/ref-get a :host) "/[" (jolt.host/ref-get a :address) "]")
+           :else (inet-address->str a))
          ":" (or (jolt.host/ref-get self :port) 0))))
 
 ;; InetSocketAddressHolder.equals/hashCode: by address and port when resolved,
@@ -853,7 +1143,7 @@
   {"getHostName"   (fn [self] (if-let [a (isa-addr self)]
                                 ((get inet-address-methods "getHostName") a)
                                 (jolt.host/ref-get self :host)))
-   "getHostString" (fn [self] (jolt.host/ref-get self :host))
+   "getHostString" isa-host-string
    "getPort"       (fn [self] (or (jolt.host/ref-get self :port) 0))
    "isUnresolved"  (fn [self] (nil? (isa-addr self)))
    "equals"        (fn [self other] (isa= self other))
@@ -886,27 +1176,59 @@
 ;; A snapshot, as on the JVM: the addresses and hardware address are read when
 ;; the interface is looked up, not on each call.
 
-(defn- make-network-interface [nm addresses mac]
+(defn- make-interface-address [inet prefix broadcast]
+  (doto (tt :interface-address "java.net.InterfaceAddress")
+    (jolt.host/ref-put! :inet inet)
+    (jolt.host/ref-put! :prefix prefix)
+    (jolt.host/ref-put! :broadcast broadcast)))
+
+(defn- ia->str [self]
+  (str (inet-address->str (jolt.host/ref-get self :inet))
+       "/" (jolt.host/ref-get self :prefix)
+       " [" (if-let [b (jolt.host/ref-get self :broadcast)] (inet-address->str b) "null") "]"))
+
+(def ^:private interface-address-methods
+  {"getAddress"             (fn [self] (jolt.host/ref-get self :inet))
+   "getBroadcast"           (fn [self] (jolt.host/ref-get self :broadcast))
+   "getNetworkPrefixLength" (fn [self] (short (jolt.host/ref-get self :prefix)))
+   "toString"               ia->str})
+
+(defn- make-network-interface [nm entries mac]
   (doto (tt :network-interface "java.net.NetworkInterface")
     (jolt.host/ref-put! :name nm)
-    (jolt.host/ref-put! :addresses addresses)
+    ;; No hostname: an address read off an interface is unresolved on the JVM
+    ;; too (its toString is "/1.2.3.4"), and resolving every one of them
+    ;; eagerly would put a DNS round trip per address in the way of enumerating
+    ;; interfaces. .getHostName resolves on demand.
+    (jolt.host/ref-put! :addresses (mapv :inet entries))
+    (jolt.host/ref-put! :interface-addresses
+                        (mapv (fn [{:keys [inet prefix broadcast]}]
+                                (make-interface-address
+                                 inet (or prefix 0)
+                                 (when broadcast (make-inet "" (parse-v4 broadcast)))))
+                              entries))
     (jolt.host/ref-put! :mac mac)))
 
 (defn- network-interfaces []
-  ;; Preserve the order getifaddrs reports, one interface per distinct name.
-  (let [entries (ifaddr-entries)
-        names (distinct (map :name entries))]
+  ;; One per name that carries an address, as the JDK lists them — an interface
+  ;; with only a link-layer entry is not one it knows — and in its order: it
+  ;; walks the IPv4 addresses and then the IPv6 ones, putting each new interface
+  ;; at the front of the list and each address at the front of its interface's.
+  (let [raw     (native/interface-addresses)
+        entries (ifaddr-entries raw)
+        [names by-name]
+        (reduce (fn [[names by-name] e]
+                  (let [nm (:name e)]
+                    [(if (contains? by-name nm) names (cons nm names))
+                     (update by-name nm (fn [es] (cons e es)))]))
+                [() {}]
+                (concat (remove (fn [e] (inet6? (:inet e))) entries)
+                        (filter (fn [e] (inet6? (:inet e))) entries)))]
     (mapv (fn [nm]
-            (let [mine (filter (fn [e] (= nm (:name e))) entries)]
-              (make-network-interface
-                nm
-                ;; No hostname: an address read off an interface is unresolved
-                ;; on the JVM too (its toString is "/1.2.3.4"), and resolving
-                ;; every one of them eagerly would put a DNS round trip per
-                ;; address in the way of enumerating interfaces. .getHostName
-                ;; resolves on demand.
-                (mapv (fn [e] (make-inet-address "" (:ip e))) (filter :ip mine))
-                (first (keep :mac mine)))))
+            (make-network-interface
+              nm
+              (vec (by-name nm))
+              (some (fn [e] (when (= nm (:name e)) (:mac e))) raw)))
           names)))
 
 (defn- ni->str [self]
@@ -918,10 +1240,11 @@
    ;; jolt has no separate friendly name for an interface, as Linux does not
    ;; either — the JVM reports the name for both there.
    "getDisplayName" (fn [self] (jolt.host/ref-get self :name))
+   "getIndex"       (fn [self] (or (native/interface-index (jolt.host/ref-get self :name)) -1))
    "getInetAddresses" (fn [self] (make-enumeration (jolt.host/ref-get self :addresses)))
+   "getInterfaceAddresses" (fn [self] (jolt.host/ref-get self :interface-addresses))
    "getHardwareAddress" (fn [self] (jolt.host/ref-get self :mac))
-   "isLoopback"     (fn [self] (boolean (some (fn [a] (= "127.0.0.1" (jolt.host/ref-get a :address)))
-                                              (jolt.host/ref-get self :addresses))))
+   "isLoopback"     (fn [self] (boolean (some loopback-address? (jolt.host/ref-get self :addresses))))
    "toString"       ni->str})
 
 (def ^:private network-interface-statics
@@ -931,9 +1254,9 @@
                             nil))
    "getByInetAddress"
    (fn [addr]
-     (let [want (host-arg->str addr)]
+     (let [want (host-arg->inet addr)]
        (or (first (filter (fn [ni]
-                            (some (fn [a] (= want (jolt.host/ref-get a :address)))
+                            (some (fn [a] (inet-address= want a))
                                   (jolt.host/ref-get ni :addresses)))
                           (network-interfaces)))
            nil)))})
@@ -947,8 +1270,9 @@
    :socket-output-stream #{"OutputStream" "java.io.OutputStream"}
    :inet-socket-address  #{"InetSocketAddress" "java.net.InetSocketAddress"
                            "SocketAddress" "java.net.SocketAddress"}
-   :inet-address         #{"InetAddress" "java.net.InetAddress"
-                           "Inet4Address" "java.net.Inet4Address"}
+   ;; and Inet4Address or Inet6Address by the object's own :class
+   :inet-address         #{"InetAddress" "java.net.InetAddress"}
+   :interface-address    #{"InterfaceAddress" "java.net.InterfaceAddress"}
    :network-interface    #{"NetworkInterface" "java.net.NetworkInterface"}
    :enumeration          #{"Enumeration" "java.util.Enumeration"}})
 
@@ -957,6 +1281,7 @@
    :server-socket       server->str
    :inet-socket-address isa->str
    :inet-address        inet-address->str
+   :interface-address   ia->str
    :network-interface   ni->str})
 
 (def ^:private registered? (atom false))
@@ -970,6 +1295,7 @@
     (clojure.core/__register-class-methods! :inet-socket-address inet-socket-address-methods)
     (clojure.core/__register-class-methods! :inet-address inet-address-methods)
     (clojure.core/__register-class-methods! :network-interface network-interface-methods)
+    (clojure.core/__register-class-methods! :interface-address interface-address-methods)
     (clojure.core/__register-class-methods! :enumeration enumeration-methods)
 
     (clojure.core/__register-class-ctor! "InetSocketAddress" isa-ctor)
@@ -995,8 +1321,13 @@
     ;; else defers to the next check and the built-ins.
     (clojure.core/__register-instance-check!
       (fn [cn val]
-        (let [cs (tag->classes (jolt.host/ref-get val :jolt/type))]
-          (when (and cs (contains? cs cn)) true))))
+        (let [tag (jolt.host/ref-get val :jolt/type)
+              cs  (tag->classes tag)]
+          (when (and cs (or (contains? cs cn)
+                            (and (= tag :inet-address)
+                                 (let [c (jolt.host/ref-get val :class)]
+                                   (or (= cn c) (= cn (subs c (count "java.net."))))))))
+            true))))
 
     ;; = and hash on an InetAddress or InetSocketAddress are by value, as
     ;; their equals/hashCode are.

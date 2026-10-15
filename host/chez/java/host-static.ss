@@ -972,6 +972,7 @@
    (vector "jolt.socket" #f
            (class-spellings
             '("java.net.InetAddress" "java.net.Inet4Address"
+              "java.net.Inet6Address" "java.net.InterfaceAddress"
               "java.net.NetworkInterface" "java.net.Socket"
               "java.net.ServerSocket" "java.net.InetSocketAddress"))
            (box #f))))

@@ -314,7 +314,8 @@
 
 ;; ServerSocket(port, backlog, bindAddr) restricts the bind
 (let [lb (java.net.ServerSocket. 0 5 (java.net.InetAddress/getByName "127.0.0.1"))]
-  (check-eq "bindAddr honored" (str/includes? (str lb) "addr=127.0.0.1") true)
+  ;; the JDK prints the bind address as given: a literal has no name
+  (check-eq "bindAddr honored" (str/includes? (str lb) "addr=/127.0.0.1,") true)
   (.close lb))
 
 ;; closing a stream closes the socket, like Java
@@ -1053,6 +1054,213 @@
            (= (java.net.InetSocketAddress. "no-such-host.invalid" 80)
               (java.net.InetSocketAddress. "NO-SUCH-HOST.invalid" 80))]
           [true 2130706513 2130706513 true -1080077125 true])
+
+;; -- IPv6 ------------------------------------------------------------------------
+;; Every expected value below is what JDK 21 answers for the same expression.
+
+(defn- by-name [h] (java.net.InetAddress/getByName h))
+(defn- thrown-msg [f]
+  (try (f) :no-throw
+       (catch java.net.UnknownHostException e (ex-message e))))
+
+;; literals: brackets or not, printed as eight uncompressed groups
+(check-eq "v6 literal prints uncompressed"
+          (mapv (fn [h] (str (by-name h)))
+                ["::1" "[::1]" "::" "2001:DB8:0:0:0:0:0:1" "1:2:3:4:5:6:1.2.3.4"
+                 "01234::1" "::1.2.3.4"])
+          ["/0:0:0:0:0:0:0:1" "/0:0:0:0:0:0:0:1" "/0:0:0:0:0:0:0:0" "/2001:db8:0:0:0:0:0:1"
+           "/1:2:3:4:5:6:102:304" "/1234:0:0:0:0:0:0:1" "/0:0:0:0:0:0:102:304"])
+(check-eq "v6 getHostAddress"
+          (.getHostAddress (by-name "2001:db8::ff00:42:8329")) "2001:db8:0:0:0:ff00:42:8329")
+(check-eq "v6 class and instance?"
+          (let [a (by-name "::1")]
+            [(.getName (class a)) (instance? java.net.Inet6Address a)
+             (instance? java.net.InetAddress a) (instance? java.net.Inet4Address a)
+             (instance? java.net.Inet6Address (by-name "127.0.0.1"))])
+          ["java.net.Inet6Address" true true false false])
+(check-eq "a mapped address is an Inet4Address"
+          (let [a (by-name "::ffff:1.2.3.4")] [(str a) (.getName (class a))])
+          ["/1.2.3.4" "java.net.Inet4Address"])
+(check-eq "v6 getAddress is 16 bytes"
+          [(vec (.getAddress (by-name "::1")))
+           (vec (.getAddress (by-name "2001:db8::ff00:42:8329")))]
+          [[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1]
+           [32 1 13 -72 0 0 0 0 0 0 -1 0 0 66 -125 41]])
+;; Inet6Address.hashCode sums the address as four ints of signed bytes
+(check-eq "v6 hashCode"
+          (mapv (fn [h] (.hashCode (by-name h)))
+                ["::1" "2001:db8::ff00:42:8329" "fe80::1" "ffff:ffff::80ff"])
+          [1 541232865 -41943039 -16875778])
+(check-eq "v6 equality by address, scope aside"
+          [(= (by-name "::1") (by-name "0:0::1"))
+           (= (by-name "::1") (by-name "127.0.0.1"))
+           (= (by-name "fe80::1%1") (by-name "fe80::1"))
+           (hash (by-name "::1"))
+           (count (hash-set (by-name "::1") (by-name "0::1")))]
+          [true false true 1 1])
+(check-eq "address predicates"
+          (mapv (fn [[m h]] (m (by-name h)))
+                [[#(.isLoopbackAddress %) "::1"] [#(.isLoopbackAddress %) "::2"]
+                 [#(.isLoopbackAddress %) "127.0.0.2"] [#(.isAnyLocalAddress %) "::"]
+                 [#(.isLinkLocalAddress %) "fe80::1"] [#(.isSiteLocalAddress %) "fec0::1"]
+                 [#(.isMulticastAddress %) "ff02::1"] [#(.isSiteLocalAddress %) "192.168.1.1"]])
+          [true false true true true true true true])
+(check-eq "numeric scope zone"
+          (let [a (by-name "fe80::1%1")] [(str a) (.getScopeId a) (str (by-name "[fe80::1%1]"))])
+          ["/fe80:0:0:0:0:0:0:1%1" 1 "/fe80:0:0:0:0:0:0:1%1"])
+(check-eq "malformed v6 literals"
+          (mapv (fn [h] (thrown-msg #(by-name h)))
+                ["1::2::3" "[::1" "[127.0.0.1]" "1:2:3:4:5:6:7:8:9" "::12345" "::1%" "[]"
+                 "::1%jolt-no-such-if0"])
+          ["1::2::3: invalid IPv6 address literal" "[::1: invalid IPv6 address literal"
+           "[127.0.0.1]: invalid IPv6 address literal"
+           "1:2:3:4:5:6:7:8:9: invalid IPv6 address literal" "::12345: invalid IPv6 address literal"
+           "::1%: invalid IPv6 address literal" "[]: invalid IPv6 address literal"
+           "no such interface jolt-no-such-if0"])
+;; textToNumericFormatV4's forms, and the hex one it refuses as ambiguous
+(check-eq "v4 literal forms"
+          [(str (by-name "127.1")) (str (by-name "1.2.3")) (str (by-name "2130706433"))
+           (thrown-msg #(by-name "0x7f.0.0.1"))]
+          ["/127.0.0.1" "/1.2.0.3" "/127.0.0.1" "0x7f.0.0.1"])
+(check-eq "getByAddress"
+          [(str (java.net.InetAddress/getByAddress (byte-array (concat (repeat 15 0) [1]))))
+           (str (java.net.InetAddress/getByAddress "foo" (byte-array [127 0 0 1])))
+           (thrown-msg #(java.net.InetAddress/getByAddress (byte-array 5)))]
+          ["/0:0:0:0:0:0:0:1" "foo/127.0.0.1" "addr is of illegal length"])
+(check-eq "getAllByName of a v6 literal"
+          (mapv str (java.net.InetAddress/getAllByName "[::1]")) ["/0:0:0:0:0:0:0:1"])
+;; IPv4 first for a name with both, java.net.preferIPv6Addresses being false
+(check-eq "getAllByName puts IPv4 first"
+          (let [as (map (fn [a] (instance? java.net.Inet6Address a))
+                        (java.net.InetAddress/getAllByName "localhost"))]
+            [(false? (first as)) (= as (sort as))])
+          [true true])
+
+;; InetSocketAddress brackets a v6 address in toString, not in getHostString
+(check-eq "v6 InetSocketAddress"
+          (let [isa (java.net.InetSocketAddress. "::1" 80)]
+            [(str isa) (str (java.net.InetSocketAddress. "[::1]" 80)) (.getHostString isa)
+             (.hashCode isa) (= isa (java.net.InetSocketAddress. "0::1" 80))
+             (str (java.net.InetSocketAddress. "fe80::1%1" 80))
+             (str (java.net.InetSocketAddress/createUnresolved "::1" 80))
+             (str (java.net.InetSocketAddress. "[::1" 80))])
+          ["/[0:0:0:0:0:0:0:1]:80" "/[0:0:0:0:0:0:0:1]:80" "0:0:0:0:0:0:0:1" 81 true
+           "/[fe80:0:0:0:0:0:0:1%1]:80" "::1/<unresolved>:80" "[::1/<unresolved>:80"])
+
+;; Over the wire. A host with no IPv6 loopback (a container with IPv6 off) cannot
+;; bind ::1; that is said, not counted as a failure, and the rest still runs.
+(def v6-loopback?
+  (try (.close (java.net.ServerSocket. 0 50 (by-name "::1"))) true
+       (catch java.io.IOException _
+         (println "  (no IPv6 loopback here: the [::1] socket checks are skipped)")
+         false)))
+
+(defn- port-free [s port] (str/replace s (str port) "P"))
+
+(when v6-loopback?
+  (let [ss   (java.net.ServerSocket. 0 50 (by-name "::1"))
+        port (.getLocalPort ss)
+        c    (java.net.Socket. "::1" port)
+        a    (.accept ss)]
+    (try
+      (check-eq "ServerSocket on ::1"
+                [(port-free (str ss) port) (str (.getInetAddress ss))
+                 (port-free (str (.getLocalSocketAddress ss)) port)]
+                ["ServerSocket[addr=/0:0:0:0:0:0:0:1,localport=P]" "/0:0:0:0:0:0:0:1"
+                 "/[0:0:0:0:0:0:0:1]:P"])
+      (check-eq "v6 client addresses"
+                [(str/replace (port-free (str c) port) #"localport=\d+" "localport=L")
+                 (str (.getInetAddress c)) (port-free (str (.getRemoteSocketAddress c)) port)
+                 (str (.getLocalAddress c))
+                 (str/replace (str (.getLocalSocketAddress c)) #":\d+$" ":L")]
+                ["Socket[addr=/0:0:0:0:0:0:0:1,port=P,localport=L]" "/0:0:0:0:0:0:0:1"
+                 "/[0:0:0:0:0:0:0:1]:P" "/0:0:0:0:0:0:0:1" "/[0:0:0:0:0:0:0:1]:L"])
+      (check-eq "v6 accepted addresses"
+                [(str/replace (port-free (str a) port) #"port=\d+," "port=R,")
+                 (str (.getInetAddress a)) (str (.getLocalAddress a))
+                 (str/replace (str (.getRemoteSocketAddress a)) #":\d+$" ":R")]
+                ["Socket[addr=/0:0:0:0:0:0:0:1,port=R,localport=P]" "/0:0:0:0:0:0:0:1"
+                 "/0:0:0:0:0:0:0:1" "/[0:0:0:0:0:0:0:1]:R"])
+      (let [msg (.getBytes "hello over v6" "UTF-8")]
+        (.write (.getOutputStream c) msg 0 (alength msg)))
+      (let [buf (byte-array 64) n (.read (.getInputStream a) buf 0 64)]
+        (check-eq "v6 roundtrip client->server" (String. buf 0 n "UTF-8") "hello over v6"))
+      (.write (.getOutputStream a) 33)
+      (check-eq "v6 roundtrip server->client" (.read (.getInputStream c)) 33)
+      ;; a ::1 listener takes no IPv4 peer, as on the JDK
+      (check-eq "a ::1 listener refuses 127.0.0.1"
+                (try (.close (java.net.Socket. "127.0.0.1" port)) :connected
+                     (catch java.net.ConnectException e (ex-message e)))
+                "Connection refused")
+      (finally (.close a) (.close c) (.close ss))))
+
+  ;; ServerSocket(port) is dual-stack: a [::1] client and a 127.0.0.1 one both
+  ;; reach it, and the IPv4 peer reads back as an Inet4Address
+  (let [ss   (java.net.ServerSocket. 0)
+        port (.getLocalPort ss)
+        c6   (java.net.Socket. "::1" port)
+        a6   (.accept ss)
+        c4   (java.net.Socket. "127.0.0.1" port)
+        a4   (.accept ss)]
+    (try
+      (check-eq "wildcard listener takes both families"
+                [(port-free (str ss) port)
+                 (str (.getInetAddress a6)) (str (.getLocalAddress a6))
+                 (str (.getInetAddress a4)) (str (.getLocalAddress a4))
+                 (.getName (class (.getInetAddress a4)))]
+                ["ServerSocket[addr=0.0.0.0/0.0.0.0,localport=P]"
+                 "/0:0:0:0:0:0:0:1" "/0:0:0:0:0:0:0:1" "/127.0.0.1" "/127.0.0.1"
+                 "java.net.Inet4Address"])
+      (finally (.close a6) (.close c6) (.close a4) (.close c4) (.close ss))))
+
+  ;; no-arg sockets take their family from the address they are given
+  (let [ss (java.net.ServerSocket.)]
+    (.bind ss (java.net.InetSocketAddress. "::" 0))
+    (let [port (.getLocalPort ss)
+          c (java.net.Socket.)]
+      (check-eq "unconnected getLocalAddress is the wildcard"
+                [(str (.getLocalAddress c)) (.getLocalSocketAddress c)] ["0.0.0.0/0.0.0.0" nil])
+      (.connect c (java.net.InetSocketAddress. "::1" port))
+      (let [a (.accept ss)]
+        (try
+          (check-eq "bind :: then connect [::1]"
+                    [(str/replace (str ss) #"localport=\d+" "localport=P")
+                     (str/replace (str c) #"port=\d+" "port=P")
+                     (str (.getInetAddress a))]
+                    ["ServerSocket[addr=/0:0:0:0:0:0:0:0,localport=P]"
+                     "Socket[addr=/0:0:0:0:0:0:0:1,port=P,localport=P]" "/0:0:0:0:0:0:0:1"])
+          (.write (.getOutputStream c) 7)
+          (check-eq "no-arg v6 socket carries bytes" (.read (.getInputStream a)) 7)
+          (finally (.close a) (.close c) (.close ss)))))))
+
+;; ServerSocket toString shows the bind address as given, name and all
+(let [ss (java.net.ServerSocket. 0 50 (by-name "localhost"))]
+  (check-eq "ServerSocket toString keeps the bind name"
+            (str/replace (str ss) #"localport=\d+" "localport=P")
+            "ServerSocket[addr=localhost/127.0.0.1,localport=P]")
+  (.close ss))
+
+;; NetworkInterface: v6 addresses are listed, scoped to their interface by name
+(let [lo6 (filter (fn [a] (instance? java.net.Inet6Address a))
+                  (enumeration-seq (.getInetAddresses loopback-ni)))]
+  (check-eq "loopback v6 addresses are scoped to the interface"
+            (every? (fn [a] (str/ends-with? (.getHostAddress a) (str "%" (.getName loopback-ni)))) lo6)
+            true)
+  (when v6-loopback?
+    (check-eq "the loopback interface lists ::1"
+              (boolean (some (fn [a] (= a (by-name "::1"))) lo6)) true)
+    (check-eq "getByInetAddress finds ::1 on the loopback"
+              (.getName (java.net.NetworkInterface/getByInetAddress (by-name "::1")))
+              (.getName loopback-ni))))
+(check-eq "getInterfaceAddresses carries the prefix"
+          (some (fn [ia] (when (= "127.0.0.1" (.getHostAddress (.getAddress ia)))
+                           ;; the same InetAddress getInetAddresses handed out,
+                           ;; as on the JDK, so a name resolved above shows here
+                           [(str/replace (str ia) #"^[^/]*" "") (.getNetworkPrefixLength ia)]))
+                (.getInterfaceAddresses loopback-ni))
+          ["/127.0.0.1/8 [null]" 8])
+(check-eq "every listed interface has an address"
+          (every? (fn [ni] (.hasMoreElements (.getInetAddresses ni))) interfaces) true)
 
 (if (empty? @failures)
   (println "SOCKET-TEST OK")

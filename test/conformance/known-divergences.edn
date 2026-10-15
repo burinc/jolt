@@ -1036,6 +1036,19 @@
    :check :prose
    :why "needs a live TCP peer that resets the connection"
    :note "errno IS captured atomically per syscall; io-call just consumes it for retry classification instead of returning it, so error and orderly shutdown collapse to EOF. Writes DO throw (send's return distinguishes); only the read side is permissive."}
+  ;; java.net's address-family preferences are fixed at the JDK's defaults. The
+  ;; JVM reads java.net.preferIPv6Addresses and java.net.preferIPv4Stack once, at
+  ;; startup, from -D flags; jolt has no such flags to read them from, and answers
+  ;; as the defaults do: IPv4 listed first for a name with both families, the
+  ;; wildcard address 0.0.0.0, and dual-stack IPv6 sockets wherever the host has
+  ;; IPv6.
+  {:category :host-model
+   :behavior "java.net.preferIPv6Addresses / java.net.preferIPv4Stack set on the command line — requires (require 'jolt.socket)"
+   :jvm "honored: preferIPv6Addresses=true (or system) reorders getAllByName and makes :: the wildcard; preferIPv4Stack=true keeps every socket IPv4"
+   :jolt "ignored; java.net always answers as both defaults (false) do"
+   :check :prose
+   :why "the properties take effect only as JVM launch flags, which a single expression cannot set"
+   :note "Code that sets them with System/setProperty after startup sees no effect on the JVM either."}
   ;; Interruption now reaches a PARKED thread as well as the flag: promise/future
   ;; deref, agent await, Thread.sleep/join, CountDownLatch.await, a task Future's
   ;; get, a blocking queue take/put, awaitTermination and Process.waitFor all throw
