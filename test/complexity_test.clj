@@ -248,9 +248,13 @@
            #(nthnext v2 (- n2 5))
            "nthnext is stepping instead of handing the vector the count (jolt-nthnext, seq.ss)")
 
+    ;; To the middle, not to n-5: the last block of (range n1) holds 16 elements
+    ;; and of (range n2) 32, so the arms realized different-sized chunks and the
+    ;; row read ~1.25 with nothing walked (2.2 on one CI runner, failing a PR).
+    ;; Mid-range both arms build a full block; a walking drop still reads ~4.0.
     (judge "drop range"
-           #(first (drop (- n1 5) (range n1)))
-           #(first (drop (- n2 5) (range n2)))
+           #(first (drop (quot n1 2) (range n1)))
+           #(first (drop (quot n2 2) (range n2)))
            "drop on a bounded range is walking its blocks instead of computing the target's (range-skip, seq.ss)")
 
     (judge "drop unbounded range"
