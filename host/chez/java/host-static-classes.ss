@@ -1479,20 +1479,12 @@
       ((string=? cs "us-ascii")
        (list->string (map (lambda (b) (if (fx<? b 128) (integer->char b) #\xFFFD))
                           (bytevector->u8-list bv))))
-      ((or (string=? cs "utf-16") (string=? cs "utf-16be"))
-       (utf16->string bv (endianness big)))   ; respects a leading BOM
-      ((string=? cs "utf-16le") (utf16->string bv (endianness little)))
-      ((or (string=? cs "utf-32") (string=? cs "utf-32be"))
-       (utf32->string bv (endianness big)))
-      ((string=? cs "utf-32le") (utf32->string bv (endianness little)))
-      ;; anything else through the system iconv (natives-str.ss); a charset the
-      ;; host does not have is the JVM's UnsupportedEncodingException rather than
-      ;; a silent reinterpretation of the bytes as UTF-8.
-      (else (let ((u8 (iconv-bytes bv name "UTF-8")))
-              (if u8
-                  (guard (e (#t (list->string (map integer->char (bytevector->u8-list u8)))))
-                    (utf8-bytes->string u8))
-                  (unsupported-encoding-throw name)))))))
+      ;; UTF-16, UTF-32 and everything iconv knows: the same incremental
+      ;; decoders an InputStreamReader streams through (natives-str.ss), run
+      ;; over the whole buffer at once. A charset the host does not have is the
+      ;; JVM's UnsupportedEncodingException rather than a silent
+      ;; reinterpretation of the bytes as UTF-8.
+      (else (java-decode-all bv cs name)))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.
 (define (bytes-slice-for-string bv rest)

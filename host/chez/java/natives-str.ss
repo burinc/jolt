@@ -473,6 +473,243 @@
 (define (unsupported-encoding-throw name)
   (jolt-throw (jolt-host-throwable "java.io.UnsupportedEncodingException" name)))
 
+;; --- incremental decoding, for the charsets that are not UTF-8 or Latin-1 -----
+;; A decoder is (step . finish). (step bv lo hi eof?) decodes everything in
+;; bv[lo,hi) that can be decoded and answers (values text next): NEXT is where
+;; the undecoded tail starts, a sequence that may still be completed by bytes
+;; not read yet. With eof? there are none, so the tail is malformed and comes
+;; out as U+FFFD. (finish) releases whatever the decoder holds; it may be
+;; called more than once.
+;;
+;; Being incremental is what lets an InputStreamReader in one of these charsets
+;; hand back text as it arrives: decoding the whole source on the first read
+;; blocked a reader over a pipe or a socket until the writer closed it. The
+;; same decoders serve (String. bytes cs), so the two answer alike.
+;;
+;; The malformed-input rules are the JDK's (sun.nio.cs.UnicodeDecoder and
+;; UTF_32Coder): a high surrogate followed by anything but a low one is ONE
+;; malformed unit of four bytes; a lone low surrogate, a code point past
+;; U+10FFFF, and a short tail at end of input are each one U+FFFD. A UTF-32
+;; surrogate code point, which the JDK hands back as a lone char, is U+FFFD
+;; here: a Chez string cannot hold one.
+;;
+;; A step is fast where the input is well formed: it scans for the longest
+;; run with nothing malformed in it and hands that to Chez's own
+;; utf16->string / utf32->string (with the byte order mandatory, so a FEFF in
+;; the middle stays a character). Only a malformed unit is decoded here, one
+;; U+FFFD at a time.
+(define jdec-fffd (string #\xFFFD))
+;; The text of PIECES (newest first) and NEXT, as a step answers them.
+(define (jdec-answer pieces next)
+  (values (if (and (pair? pieces) (null? (cdr pieces))) (car pieces) (apply string-append (reverse pieces)))
+          next))
+(define (jdec-run->string decode bv from to big?)
+  (let ((order (if big? (endianness big) (endianness little))))
+    (if (and (fx=? from 0) (fx=? to (bytevector-length bv)))
+        (decode bv order #t)                            ; all of it: no copy
+        (let ((slice (make-bytevector (fx- to from))))
+          (bytevector-copy! bv from slice 0 (fx- to from))
+          (decode slice order #t)))))
+
+;; UTF-16, UTF-16BE, UTF-16LE. Only "UTF-16" reads a byte-order mark, and only
+;; at the start: it picks the order and is dropped. The BE and LE forms hand a
+;; leading FEFF back as a character, as the JDK's do.
+(define (make-utf16-decoder cs)
+  (let ((big? (not (string=? cs "utf-16le")))
+        (sniff? (string=? cs "utf-16")))
+    (define (top bv i) (bytevector-u8-ref bv (if big? i (fx+ i 1))))
+    ;; where the well-formed run from I ends: at HI, at a lone surrogate, or at
+    ;; a high one whose low one is missing or not all here
+    (define (clean-end bv i hi)
+      (let scan ((i i))
+        (if (fx>? (fx+ i 2) hi)
+            i
+            (let ((t (top bv i)))
+              (cond ((or (fx<? t #xD8) (fx>? t #xDF)) (scan (fx+ i 2)))
+                    ((and (fx<=? t #xDB) (fx<=? (fx+ i 4) hi)
+                          (fx<=? #xDC (top bv (fx+ i 2)) #xDF))
+                     (scan (fx+ i 4)))
+                    (else i))))))
+    (define (step bv lo hi eof?)
+      (when (and sniff? (or eof? (fx>=? (fx- hi lo) 2)))
+        (set! sniff? #f)
+        (when (fx>=? (fx- hi lo) 2)
+          (let ((a (bytevector-u8-ref bv lo)) (b (bytevector-u8-ref bv (fx+ lo 1))))
+            (cond ((and (fx=? a #xFE) (fx=? b #xFF)) (set! big? #t) (set! lo (fx+ lo 2)))
+                  ((and (fx=? a #xFF) (fx=? b #xFE)) (set! big? #f) (set! lo (fx+ lo 2)))))))
+      (if sniff?
+          (values "" lo)                                ; the mark is not all here yet
+          (let loop ((i lo) (pieces '()))
+            (let* ((j (clean-end bv i hi))
+                   (pieces (if (fx>? j i)
+                               (cons (jdec-run->string utf16->string bv i j big?) pieces)
+                               pieces))
+                   (avail (fx- hi j)))
+              (cond
+                ((fx<? avail 2)
+                 (if (and eof? (fx>? avail 0))
+                     (jdec-answer (cons jdec-fffd pieces) hi)
+                     (jdec-answer pieces j)))
+                ;; a lone low surrogate
+                ((fx>=? (top bv j) #xDC) (loop (fx+ j 2) (cons jdec-fffd pieces)))
+                ;; a high one and a unit that is not low: one malformed unit
+                ((fx>=? avail 4) (loop (fx+ j 4) (cons jdec-fffd pieces)))
+                ;; a high one at the end of what is here
+                (eof? (jdec-answer (cons jdec-fffd pieces) hi))
+                (else (jdec-answer pieces j)))))))
+    (cons step void)))
+
+;; UTF-32, UTF-32BE, UTF-32LE. Every form drops a leading U+FEFF in its own
+;; order; "UTF-32" also reads a little-endian mark as one and switches.
+(define (make-utf32-decoder cs)
+  (let ((big? (not (string=? cs "utf-32le")))
+        (sniff? #t))
+    (define (unit bv i)
+      (let ((b0 (bytevector-u8-ref bv i)) (b1 (bytevector-u8-ref bv (fx+ i 1)))
+            (b2 (bytevector-u8-ref bv (fx+ i 2))) (b3 (bytevector-u8-ref bv (fx+ i 3))))
+        (if big?
+            (+ (* b0 #x1000000) (fxsll b1 16) (fxsll b2 8) b3)
+            (+ (* b3 #x1000000) (fxsll b2 16) (fxsll b1 8) b0))))
+    (define (clean-end bv i hi)
+      (let scan ((i i))
+        (if (fx>? (fx+ i 4) hi)
+            i
+            (let ((cp (unit bv i)))
+              (if (or (> cp #x10FFFF) (<= #xD800 cp #xDFFF)) i (scan (fx+ i 4)))))))
+    (define (step bv lo hi eof?)
+      (when (and sniff? (or eof? (fx>=? (fx- hi lo) 4)))
+        (set! sniff? #f)
+        (when (fx>=? (fx- hi lo) 4)
+          (cond ((eqv? (unit bv lo) #xFEFF) (set! lo (fx+ lo 4)))
+                ((and (string=? cs "utf-32")
+                      (begin (set! big? #f) (eqv? (unit bv lo) #xFEFF)))
+                 (set! lo (fx+ lo 4)))
+                (else (set! big? (not (string=? cs "utf-32le")))))))
+      (if sniff?
+          (values "" lo)
+          (let loop ((i lo) (pieces '()))
+            (let* ((j (clean-end bv i hi))
+                   (pieces (if (fx>? j i)
+                               (cons (jdec-run->string utf32->string bv i j big?) pieces)
+                               pieces))
+                   (avail (fx- hi j)))
+              (cond
+                ((fx>=? avail 4) (loop (fx+ j 4) (cons jdec-fffd pieces)))   ; out of range
+                ((and eof? (fx>? avail 0)) (jdec-answer (cons jdec-fffd pieces) hi))
+                (else (jdec-answer pieces j)))))))
+    (cons step void)))
+
+;; Everything else through the system iconv, with ONE descriptor for the life
+;; of the stream: iconv carries a stateful charset's shift state (ISO-2022-JP)
+;; from one call to the next, and stops short of a sequence the input cut off
+;; (EINVAL), which is exactly the undecoded tail a step answers. A byte iconv
+;; cannot decode (EILSEQ) is one U+FFFD and decoding goes on past it, where
+;; the whole-buffer decode raised UnsupportedEncodingException over the lot.
+;; The JDK sizes some malformed runs by charset (EUC-JP takes two bytes where
+;; this takes one); GBK, Shift_JIS and the windows code pages agree.
+(define iconv-E2BIG 7)
+(define iconv-EINVAL 22)
+(define iconv-EILSEQ (if (eq? (sa-os-family) 'macos) 92 84))
+;; A reader dropped without close would keep its descriptor; the guardian hands
+;; those back, and they are closed the next time a decoder is opened.
+(define iconv-guardian (make-guardian))
+(define iconv-guardian-mu (make-mutex))
+(define (iconv-state-close! st)
+  (when (vector-ref st 1)
+    ((vector-ref (vector-ref st 0) 2) (vector-ref st 1))
+    (vector-set! st 1 #f)))
+(define (iconv-drain!)
+  (for-each iconv-state-close!
+            (jolt-with-mutex iconv-guardian-mu
+              (let loop ((acc '()))
+                (let ((st (iconv-guardian)))
+                  (if st (loop (cons st acc)) acc))))))
+(define (make-iconv-decoder name)
+  (iconv-drain!)
+  (let ((pcd (iconv-open-cd name "UTF-8")))
+    (and pcd
+         (let ((st (vector (car pcd) (cdr pcd))))
+           (jolt-with-mutex iconv-guardian-mu (iconv-guardian st))
+           (cons (lambda (bv lo hi eof?) (iconv-step st bv lo hi eof?))
+                 (lambda () (iconv-state-close! st)))))))
+(define (iconv-step st bv lo hi eof?)
+  (let* ((conv (vector-ref (vector-ref st 0) 1))
+         (cd (vector-ref st 1))
+         (n (fx- hi lo))
+         (outcap (+ 64 (* 4 n)))
+         (inbuf (sa-foreign-alloc (max n 1)))
+         (outbuf (sa-foreign-alloc outcap))
+         (cells (sa-foreign-alloc 32))
+         ;; R6RS: the port and the procedure that extracts what it collected
+         (acc+ (call-with-values open-bytevector-output-port cons))
+         (acc (car acc+)))
+    (define (in-left) (sa-foreign-ref 'unsigned-64 cells 8))
+    (define (drain-out!)              ; move what iconv wrote into ACC
+      (let* ((k (- outcap (sa-foreign-ref 'unsigned-64 cells 24)))
+             (chunk (make-bytevector k)))
+        (sa-foreign-bytes-ref! outbuf chunk k)
+        (put-bytevector acc chunk)
+        (sa-foreign-set! 'void* cells 16 outbuf)
+        (sa-foreign-set! 'unsigned-64 cells 24 outcap)))
+    (define (replace!) (put-bytevector acc #vu8(#xEF #xBF #xBD)))
+    (let ((r (dynamic-wind
+      void
+      (lambda ()
+        (let ((slice (make-bytevector n)))
+          (bytevector-copy! bv lo slice 0 n)
+          (sa-foreign-bytes-set! inbuf slice n))
+        (sa-foreign-set! 'void* cells 0 inbuf)
+        (sa-foreign-set! 'unsigned-64 cells 8 n)
+        (sa-foreign-set! 'void* cells 16 outbuf)
+        (sa-foreign-set! 'unsigned-64 cells 24 outcap)
+        (let loop ()
+          (if (fx=? (in-left) 0)
+              (drain-out!)
+              (let ((r (if cd (conv cd cells (+ cells 8) (+ cells 16) (+ cells 24)) iconv-size-max)))
+                (if (not (= r iconv-size-max))
+                    (begin (drain-out!) (loop))
+                    (let ((err (io-errno)))
+                      (drain-out!)
+                      (cond
+                        ((= err iconv-E2BIG) (loop))
+                        ;; cut off: wait for the rest, unless there is no rest
+                        ((and (= err iconv-EINVAL) (not eof?)) #f)
+                        ((= err iconv-EINVAL)
+                         (replace!)
+                         (sa-foreign-set! 'unsigned-64 cells 8 0))
+                        ;; EILSEQ, or an errno this host would not give: one
+                        ;; replacement for the byte, and on past it
+                        (else
+                         (replace!)
+                         (sa-foreign-set! 'void* cells 0 (+ (sa-foreign-ref 'void* cells 0) 1))
+                         (sa-foreign-set! 'unsigned-64 cells 8 (- (in-left) 1))
+                         (loop))))))))
+        ;; at end of input, back to the initial shift state (a decoder writes
+        ;; nothing doing it, but the descriptor is then ready to be closed)
+        (when (and eof? cd)
+          (conv cd 0 0 (+ cells 16) (+ cells 24))
+          (drain-out!))
+        (cons (utf8-bytes->string ((cdr acc+)))
+              (fx+ lo (fx- n (in-left)))))
+      (lambda ()
+        (sa-foreign-free inbuf) (sa-foreign-free outbuf) (sa-foreign-free cells)))))
+      (values (car r) (cdr r)))))
+
+;; The decoder for canonical charset CS (named NAME by the caller), or #f when
+;; the host has none.
+(define (make-java-decoder cs name)
+  (cond
+    ((member cs '("utf-16" "utf-16be" "utf-16le")) (make-utf16-decoder cs))
+    ((member cs '("utf-32" "utf-32be" "utf-32le")) (make-utf32-decoder cs))
+    (else (make-iconv-decoder name))))
+;; All of BV at once, as (String. bytes cs) wants it.
+(define (java-decode-all bv cs name)
+  (let ((dec (or (make-java-decoder cs name) (unsupported-encoding-throw name))))
+    (dynamic-wind
+      void
+      (lambda () (let-values (((s next) ((car dec) bv 0 (bytevector-length bv) #t))) s))
+      (cdr dec))))
+
 ;; --- UTF-8 -> string, the way java.nio's decoder does it ---------------------
 ;;
 ;; Chez's utf8->string and Java's CharsetDecoder agree on every well-formed

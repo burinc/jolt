@@ -1653,12 +1653,12 @@
    :note "JDK 21 answers by the call's hint: ^String nil is \"name\" as here, ^ZipEntry nil is \"entry\", and an unhinted nil is IllegalArgumentException \"More than one matching method found: java.util.zip.ZipEntry\". jolt reads values, not hints, so all three are \"name\"."}
   ;; A ZipInputStream name in a charset other than UTF-8, US-ASCII and ISO-8859-1
   ;; decodes as (String. bytes charset) does (zip-entries.ss zip-decode-charset).
-  ;; jolt has the windows-1252 decoder; one byte it cannot map refuses the whole
-  ;; name, where the JDK's decoder reports only that byte.
+  ;; jolt has the windows-1252 decoder, which replaces a byte it cannot map with
+  ;; U+FFFD (natives-str.ss make-iconv-decoder), where the JDK's refuses it.
   {:category :host-model
    :behavior "getNextEntry on a name with byte 0x81 through a windows-1252 ZipInputStream"
    :jvm "IllegalArgumentException \"java.nio.charset.UnmappableCharacterException: Input length = 1\" on JDK 21; ZipException \"invalid LOC header (bad entry name)\" on JDK 26"
-   :jolt "UnsupportedEncodingException \"windows-1252\""
+   :jolt "the name, with the byte as U+FFFD"
    :check :prose
    :why "The JVM side is not the same on every JDK: 21 raises IllegalArgumentException wrapping UnmappableCharacterException, and 26 raises ZipException \"invalid LOC header (bad entry name)\" before it decodes the name. An entry cannot name a JDK, so a machine check would pin the oracle to one version."
    :note "UTF-8 names, and names with flag bit 11, decode as JDK 21 decodes them, including the refusal of malformed UTF-8 (corpus java.util.zip / ZipInputStream)."}
@@ -1672,6 +1672,29 @@
    :check :prose
    :why "The JVM side is not the same on every JDK: 21 raises IllegalArgumentException wrapping MalformedInputException, and 26 raises ZipException \"invalid LOC header (bad entry name)\" before it decodes the name. An entry cannot name a JDK, so a machine check would pin the oracle to one version."
    :note "UTF-8, US-ASCII and ISO-8859-1 names refuse bad bytes as JDK 21 does (corpus java.util.zip / ZipInputStream); only a charset decoded through (String. bytes charset) replaces them."}
+  ;; A UTF-32 code point in the surrogate range decodes to a lone char on the JDK.
+  ;; A jolt string is a Chez string, which cannot hold one, so the decoder
+  ;; (natives-str.ss make-utf32-decoder) answers U+FFFD for it.
+  {:category :host-model
+   :behavior "(String. bytes \"UTF-32BE\") over a surrogate code point"
+   :jvm "the lone surrogate char"
+   :jolt "U+FFFD"
+   :check {:expr "(mapv int (String. (byte-array [0 0 -40 0]) \"UTF-32BE\"))"
+           :jvm "[55296]"
+           :jolt "[65533]"}
+   :note "Surrogates in UTF-16 input are decoded as the JDK decodes them: a pair is one character, and a lone or unpaired one is U+FFFD."}
+  ;; A charset decoded through the system iconv learns only WHERE a malformed
+  ;; sequence starts, not how long the JDK's decoder for that charset says it is,
+  ;; so it replaces one byte and goes on (natives-str.ss make-iconv-decoder).
+  ;; EUC-JP's decoder takes the byte after an invalid lead with it.
+  {:category :host-model
+   :behavior "(String. bytes \"EUC-JP\") over an invalid lead byte"
+   :jvm "one U+FFFD for the invalid lead and the byte after it"
+   :jolt "one U+FFFD for the invalid lead, then the byte after it decoded"
+   :check {:expr "(mapv int (String. (byte-array (map unchecked-byte [0xA4 0xA2 0xFF 0x41])) \"EUC-JP\"))"
+           :jvm "[12354 65533]"
+           :jolt "[12354 65533 65]"}
+   :note "GBK, Shift_JIS and the windows code pages replace one byte where the JDK does (corpus io / Reader charsets)."}
   ;; Jolt's java.nio.charset.StandardCharsets constants are strings, so
   ;; ZipInputStream(in, charset) takes a string where JDK 21 casts the argument to
   ;; Charset and refuses one (zip-entries.ss make-zip-input-stream). Refusing

@@ -1126,23 +1126,54 @@
            (lambda () (close-port bp)))
           (lambda () (byte-port-ready? bp)))))
       (else
-       ;; The whole source is decoded on the first read, so until then a read
-       ;; blocks to end of input and nothing is ready.
-       (let ((text #f) (pos 0))
+       ;; Decoded as the bytes arrive (make-java-decoder, natives-str.ss): a
+       ;; read blocks only while nothing at all is decoded, so a reader over a
+       ;; pipe or a socket answers as soon as a character is complete.
+       (let* ((dec (or (make-java-decoder cs name) (unsupported-encoding-throw name)))
+              (step (car dec))
+              (finish (cdr dec))
+              (buf (make-bytevector 4096))
+              (lo 0) (hi 0) (src-eof? #f) (done? #f)
+              (text "") (pos 0))
+         ;; what is buffered, as text; #t when any came out
+         (define (decode!)
+           (let-values (((s next) (step buf lo hi src-eof?)))
+             (set! lo next)
+             (when src-eof? (set! done? #t) (finish))
+             (set! text s)
+             (set! pos 0)
+             (fx>? (string-length s) 0)))
+         (define (refill!)
+           (when (fx>? lo 0)
+             (bytevector-copy! buf lo buf 0 (fx- hi lo))
+             (set! hi (fx- hi lo))
+             (set! lo 0))
+           (when (fx=? hi (bytevector-length buf))
+             (let ((big (make-bytevector (fx* 2 hi))))
+               (bytevector-copy! buf 0 big 0 hi)
+               (set! buf big)))
+           (let ((got (get-bytevector-some! bp buf hi (fx- (bytevector-length buf) hi))))
+             (if (eof-object? got) (set! src-eof? #t) (set! hi (fx+ hi got)))))
          (port-ready-probe!
           (make-custom-textual-input-port id
            (lambda (str start count)
-             (unless text
-               (set! text (decode-bytevector
-                           (let ((bv (get-bytevector-all bp))) (if (eof-object? bv) (make-bytevector 0) bv))
-                           (list name))))
-             (let ((n (fxmin count (fx- (string-length text) pos))))
-               (sa-string-copy-range! str start text pos (fx+ pos n))
-               (set! pos (fx+ pos n))
-               n))
+             (let loop ()
+               (cond
+                 ((fx<? pos (string-length text))
+                  (let ((n (fxmin count (fx- (string-length text) pos))))
+                    (sa-string-copy-range! str start text pos (fx+ pos n))
+                    (set! pos (fx+ pos n))
+                    n))
+                 (done? 0)
+                 ((and (or (fx<? lo hi) src-eof?) (decode!)) (loop))
+                 (done? 0)
+                 (else (refill!) (loop)))))
            #f #f
-           (lambda () (close-port bp)))
-          (lambda () (and text (fx<? pos (string-length text))))))))))
+           (lambda () (finish) (close-port bp)))
+          (lambda ()
+            (or (fx<? pos (string-length text))
+                (and src-eof? (not done?))
+                (byte-port-ready? bp)))))))))
 ;; The byte port a stream's text is read from: jolt's own stream is its port; a
 ;; reify/proxy one is read through its own read method.
 (define (stream-byte-port s)
