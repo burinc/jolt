@@ -256,6 +256,21 @@
        ["stack_trace_test$live_callee" "stack_trace_test$mid_caller"
         "stack_trace_test$erases_into_mid" "stack_trace_test$calls_erases_mid"]
        "...and below the live frame it called, further out"))
+;; a lookup the back end open-codes runs jolt code too: a deftype's valAt, a
+;; sorted map's comparator. The fn it ran returned, so it is not a frame.
+(deftype LookupRuns [] clojure.lang.ILookup
+  (valAt [_ k] (ret-f 2)) (valAt [_ k d] (ret-f 3)))
+(defn- kw-then-throw [t] (let [v (:k t)] (+ v (nth [] 3))))
+(defn- get-then-throw [t] (let [v (get t :k)] (+ v (nth [] 3))))
+(defn- coll-then-throw [m] (let [v (m 5)] (+ v (nth [] 3))))
+(doseq [[label f arg] [["keyword lookup" kw-then-throw (LookupRuns.)]
+                       ["get" get-then-throw (LookupRuns.)]
+                       ["collection call" coll-then-throw
+                        (sorted-map-by (fn [a b] (ret-f 1) (compare a b)) 5 1)]]]
+  (let [e (try (f arg) (catch Exception x x))]
+    (ok= (some #{"stack_trace_test$ret_f" "stack_trace_test$ret_g"} (frame-names e))
+         nil
+         (str "a " label " that ran a jolt fn leaves no returned frame"))))
 ;; a value-semantics seam is jolt code the HOST runs from inside hash/=/str of any
 ;; value. Its tail call (to boolean) stored a site pair that outlived it, and the
 ;; next throw from host code reported the predicate as its innermost frame:
