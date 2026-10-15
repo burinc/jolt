@@ -98,6 +98,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Windows HTTPS transport finds Git for Windows 2.56's OpenSSL.** Git
+  2.56 moved from MINGW64 to UCRT64 and has no `mingw64` directory any more, so
+  the resolver found no OpenSSL of Git's and loaded whatever `libcrypto-3-x64.dll`
+  was on PATH, or none. `Git\ucrt64\bin` is now tried before `Git\mingw64\bin`
+  under each install root.
 - **A sliding or dropping buffer with a transducer slides or drops.** A
   channel with a transducer and a buffer was handled as a fixed buffer
   whatever the buffer's kind, so `(chan (sliding-buffer 1) xf)` kept the
