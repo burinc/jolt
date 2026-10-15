@@ -379,7 +379,15 @@
 ;; (- deadline (mono-millis)) ms starts from the truncated millisecond and so
 ;; overshoots by however far into that millisecond now was.
 (define (mono-duration-until deadline)
-  (let ((ns (max 0 (- (exact (ceiling (* 1000000 deadline))) (mono-nanos)))))
+  (wait-ns->duration (- (exact (ceiling (* 1000000 deadline))) (mono-nanos))))
+;; A relative wait of NS nanoseconds (clamped at 0) as a time-duration. Chez on
+;; Windows rounds a timed wait to the NEAREST millisecond, so a tail under half
+;; a millisecond waited 0 ms and the caller's loop spun until its deadline; there
+;; the wait rounds up to whole milliseconds, the platform's own granularity.
+(define wait-round-to-ms? (eq? (sa-os-family) 'windows))
+(define (wait-ns->duration ns)
+  (let* ((ns (max 0 ns))
+         (ns (if wait-round-to-ms? (* 1000000 (div (+ ns 999999) 1000000)) ns)))
     (make-time 'time-duration (mod ns 1000000000) (div ns 1000000000))))
 
 ;; clojure.core/current-time-ms — epoch milliseconds.

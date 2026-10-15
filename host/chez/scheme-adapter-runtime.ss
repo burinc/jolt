@@ -684,16 +684,15 @@
 ;; The high word is read straight out of the flonum, without a buffer, which is
 ;; most of a bit cast's cost (fdlibm's cbrt makes four). The payload's offset
 ;; from the tagged pointer is found once at load by probing 2.5 for its own
-;; bytes. The probe counts DOWN from 8: a flonum's storage starts at its payload
-;; (6 bytes past the pointer on 64-bit Chez) and runs 16 bytes, so a probe above
-;; the payload stays inside the object, while one below it reads the bytes in
-;; front of the object — unmapped memory when the flonum is the first object in
-;; a fresh segment, which killed scheme.exe at load on Windows (#1337). 2.5's
-;; pattern has six zero bytes under a nonzero top byte, so no probe above the
-;; payload can match it. The high word is the payload's upper half in the
-;; machine's byte order.
+;; bytes. Every probe has to stay inside the object: one below the payload reads
+;; the bytes in front of it, and one above reads past its end, either of which is
+;; unmapped memory when the flonum sits at the edge of a segment (a probe from
+;; below killed scheme.exe at load on Windows, #1337). On 64-bit Chez the 8-byte
+;; payload is the object's last 8 bytes, 6 past the tagged pointer, so the probe
+;; starts there and only counts down if that misses. The high word is the
+;; payload's upper half in the machine's byte order.
 (define (sa-flonum-payload-disp x)
-  (let loop ((d 8))
+  (let loop ((d (if (fx> (fixnum-width) 32) 6 8)))
     (cond ((fx< d 0) (error 'sa-flonum-disp "no flonum payload"))
           ((eqv? (#%$object-ref 'double x d) x) d)
           (else (loop (fx- d 1))))))

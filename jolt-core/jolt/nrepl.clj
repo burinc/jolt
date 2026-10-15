@@ -420,8 +420,7 @@
     :root-ex-class  the `root-ex` string, the class of the root cause"
   ([code ns-str] (evaluate code ns-str nil))
   ([code ns-str {on-out :out on-err :err}]
-   (let [outer (outer-frames)
-         result (atom nil) evaluated (atom false) printed (atom nil)
+   (let [result (atom nil) evaluated (atom false) printed (atom nil)
          err (atom nil) exc (atom nil) failure (atom nil)
          run (fn []
                (binding [*capturing-thread* (Thread/currentThread)]
@@ -439,7 +438,11 @@
                         (catch :default e
                           ;; read here, while the thread still says which form
                           ;; of the eval'd text was running
-                          (let [frames (eval-frames e (= @phase :print-eval-result) outer)
+                          ;; and the stack below this handler is evaluate's own
+                          ;; and its caller's: taken here, only when an eval fails,
+                          ;; since a stack walk per eval was most of its cost
+                          (let [outer (outer-frames)
+                                frames (eval-frames e (= @phase :print-eval-result) outer)
                                 bt (when (seq frames)
                                      (str "  trace:\n" (str/join "\n" frames) "\n"))
                                 pos (jolt.host/current-source-position)]

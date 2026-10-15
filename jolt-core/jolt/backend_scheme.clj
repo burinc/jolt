@@ -3176,11 +3176,31 @@
 ;; cache gate recompiles one with a bare Chez), and the literal slot compiles to a
 ;; load and a store. rd / wr are the read form and the write head; a self-call
 ;; passes placeholders emit-fn fills in later (*self-wrap*).
+;; The one-argument form also hands the slot's pair to the outer slot (vreg 12,
+;; rt.ss jolt-vreg-outer-site) and clears the slot for the call's duration:
+;; nothing the call runs is the tail call that pair describes, so a throw inside
+;; it must not splice the pair innermost -- a pair a callback left behind when it
+;; returned to untraced code (a core HOF) was reported as the innermost frame of
+;; the next callback's throw. The pair is still the nearest erased caller from
+;; further out, which the reporter reads from the outer slot as a gap bridge.
 (defn- site-restore
-  ([call] (site-restore call "(virtual-register 2)" "set-virtual-register! 2"))
+  ([call]
+   (let [sv (fresh-label "_ss$") so (fresh-label "_so$") rv (fresh-label "_sr$")]
+     (str "(let ((" sv " (virtual-register 2)) (" so " (virtual-register 12)))"
+          " (if (pair? " sv ") (set-virtual-register! 12 " sv "))"
+          " (set-virtual-register! 2 0)"
+          " (let ((" rv " " call ")) (set-virtual-register! 2 " sv ")"
+          " (set-virtual-register! 12 " so ") " rv "))")))
   ([call rd wr]
    (let [sv (fresh-label "_ss$") rv (fresh-label "_sr$")]
      (str "(let ((" sv " " rd ")) (let ((" rv " " call ")) (" wr " " sv ") " rv "))"))))
+;; A lookup the back end open-codes (jolt-get, a keyword or a collection in call
+;; position) can still run jolt code: a deftype's valAt, a sorted map's
+;; comparator, a key's equals. Not in tail position with tracing on, it restores
+;; the site slot the way emit-call's non-tail calls do, or the callee that ran
+;; inside it and returned was reported as the innermost frame of a later throw.
+(defn- lookup-restore [tail? call]
+  (if (and (trace-frames?) (not tail?)) (site-restore call) call))
 ;; Emit a call. In tail position with tracing on, a call to a DIFFERENT fn than
 ;; the enclosing one stores its site pair (sited-tail-call), and a non-tail call
 ;; restores the slot when it returns (returning-call?). Everything else —
@@ -3437,7 +3457,7 @@
           dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
           idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
           :else (do (note-tail-call! tail?)
-                    (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")"))))))
+                    (order-args (fn [as] (lookup-restore tail? (str "(jolt-get " (str/join " " as) ")")))))))
       ;; bit-and/or/xor/not: open-code the fixnum case, helper as the slow arm.
       ;; These moved off the raw Chez bitwise primitives — which Chez inlines to
       ;; native code — onto jolt-bit-* helpers so a bad operand raises a CLASSED
@@ -3498,8 +3518,8 @@
           ;; jolt-get rather than allocate a cell per evaluation.
           *const-pool*
           (let [site (hoist-const-per-site "(jolt-kw-site)")]
-            (order-args (fn [as] (str "(jolt-kw-get-site " (first as) " " (emit fnode) " " site (defstr as) ")"))))
-          :else (order-args (fn [as] (str "(jolt-get " (first as) " " (emit fnode) (defstr as) ")")))))
+            (order-args (fn [as] (lookup-restore tail? (str "(jolt-kw-get-site " (first as) " " (emit fnode) " " site (defstr as) ")")))))
+          :else (order-args (fn [as] (lookup-restore tail? (str "(jolt-get " (first as) " " (emit fnode) (defstr as) ")"))))))
       ;; (coll k [default]) -> lookup — coll (fnode) is the callee, evaluated
       ;; before the key/default args. A VECTOR literal invokes as nth (a bad
       ;; index throws, IPersistentVector.invoke); maps/sets invoke as get.
@@ -3508,10 +3528,11 @@
        (note-tail-call! tail?)
        (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
                     (fn [[c & as]]
-                      (str (if (= :vector (:op fnode))
-                             "(jolt-nth "
-                             "(jolt-get ")
-                           c " " (str/join " " as) ")"))))
+                      (lookup-restore tail?
+                        (str (if (= :vector (:op fnode))
+                               "(jolt-nth "
+                               "(jolt-get ")
+                             c " " (str/join " " as) ")")))))
       (and (stdlib-var? fnode) (not (prelude-mode?)))
       (throw (ex-info (str "emit: unsupported stdlib fn `" (:ns fnode) "/" (:name fnode)
                            "` (no core on Chez yet)") {}))

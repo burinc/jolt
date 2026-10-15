@@ -451,6 +451,11 @@
 ;; proxy receives is observable: a java.io.Writer proxy need only define the
 ;; abstract write(cbuf, off, len), and one that does must work.
 (define (pw-target self) (vector-ref (jhost-state self) 0))
+;; Whether the target is a Writer of its own, decided once: it never changes.
+;; State is #(target trouble? writer?); an image from before has #(target).
+(define (pw-writer? self)
+  (let ((st (jhost-state self)))
+    (if (fx> (vector-length st) 2) (vector-ref st 2) (pw-writer-target? (vector-ref st 0)))))
 (define (pw-writer-target? t)
   (or (and (jhost? t)
            (not (string=? (jhost-tag t) "port-writer"))
@@ -470,17 +475,17 @@
     (else (jolt-invoke (var-deref "clojure.pprint" "-write") t s))))
 (define (pw-text! self s)
   (let ((t (pw-target self)))
-    (if (pw-writer-target? t)
+    (if (pw-writer? self)
         (record-method-dispatch t "write" (jolt-list s (->num 0) (->num (string-length s))))
         (pw-emit-text t s))))
 (define (pw-char! self c)                 ; c: the char's code
   (let ((t (pw-target self)))
-    (if (pw-writer-target? t)
+    (if (pw-writer? self)
         (record-method-dispatch t "write" (jolt-list (->num c)))
         (pw-emit-text t (string (integer->char c))))))
 (define (pw-newline! self)
   (let ((t (pw-target self)))
-    (if (pw-writer-target? t)
+    (if (pw-writer? self)
         (record-method-dispatch t "write" (jolt-list "\n"))
         (pw-emit-text t "\n"))))
 (define (pw-print! self x)              ; print(char) too is text: write(s, 0, 1)
@@ -493,37 +498,89 @@
               (and (not (jhost? t)) (iface-method t name #f)))
       (record-method-dispatch t name jolt-nil))
     jolt-nil))
-(register-class-ctor! "PrintWriter"
-  (lambda args (make-jhost "print-writer" (vector (if (pair? args) (car args) jolt-nil)))))
-(register-class-ctor! "java.io.PrintWriter"
-  (lambda args (make-jhost "print-writer" (vector (if (pair? args) (car args) jolt-nil)))))
+;; A PrintWriter never throws an IOException from its target: it records it,
+;; checkError reports it, and the call returns as if it had written. An
+;; InterruptedIOException re-asserts the thread's interrupt instead, and
+;; anything that is not an IOException propagates, as in the JDK's PrintWriter.
+(define (pw-trouble? self)
+  (let ((st (jhost-state self))) (and (fx> (vector-length st) 1) (vector-ref st 1))))
+(define (pw-trouble! self)
+  (let ((st (jhost-state self)))
+    (if (fx> (vector-length st) 1)
+        (vector-set! st 1 #t)
+        (jhost-state-set! self (vector (vector-ref st 0) #t (pw-writer-target? (vector-ref st 0)))))))
+(define pw-ioexception (jolt-symbol #f "java.io.IOException"))
+(define pw-interrupted-io (jolt-symbol #f "java.io.InterruptedIOException"))
+;; Only a Writer target can raise one: a StringWriter, StringBuilder or process
+;; stream cannot, and those run the body straight, with no guard and no closure
+;; (both cost ~25% of a print into a StringWriter).
+(define-syntax pw-guarded
+  (syntax-rules ()
+    ;; the body arrives as (lambda () body ...), written so to read as a thunk
+    ((_ self (_lambda () body ...))
+     (let ((s self))
+       (if (pw-writer? s)
+           (pw-guarded* s (lambda () body ...))
+           (begin body ...))))))
+(define (pw-guarded* self thunk)
+  (guard (e ((let ((v (jolt-unwrap-throw e)))
+               (and (jolt-truthy? (instance-check pw-ioexception v)) v))
+             => (lambda (v)
+                  (if (jolt-truthy? (instance-check pw-interrupted-io v))
+                      (record-method-dispatch (host-static-call "Thread" "currentThread") "interrupt" jolt-nil)
+                      (pw-trouble! self))
+                  jolt-nil)))
+    (thunk)))
+(define (make-print-writer args)
+  (let ((t (if (pair? args) (car args) jolt-nil)))
+    (make-jhost "print-writer" (vector t #f (pw-writer-target? t)))))
+(register-class-ctor! "PrintWriter" (lambda args (make-print-writer args)))
+(register-class-ctor! "java.io.PrintWriter" (lambda args (make-print-writer args)))
 (register-host-methods! "print-writer"
   ;; write takes (buf off len) and renders an int as its character; append takes
   ;; (csq start end) and renders everything as text. Sharing append-text between
   ;; them read the 3-arg write's LENGTH as an end index and printed (.write w 65)
   ;; as "65" rather than "A".
   (list (cons "write" (lambda (self x . rest)
-                        (if (and (null? rest) (number? x))
-                            (pw-char! self (jnum->exact x))
-                            (pw-text! self (writer-piece-range x rest)))
+                        (pw-guarded self
+                          (lambda ()
+                            (if (and (null? rest) (number? x))
+                                (pw-char! self (jnum->exact x))
+                                (pw-text! self (writer-piece-range x rest)))))
                         jolt-nil))
-        (cons "print" (lambda (self x) (pw-print! self x) jolt-nil))
+        (cons "print" (lambda (self x) (pw-guarded self (lambda () (pw-print! self x))) jolt-nil))
         (cons "println" (lambda (self . xs)
-                          (unless (null? xs) (pw-print! self (car xs)))
-                          (pw-newline! self)
+                          (pw-guarded self
+                            (lambda ()
+                              (unless (null? xs) (pw-print! self (car xs)))
+                              (pw-newline! self)))
                           jolt-nil))
         (cons "append" (lambda (self x . rest)
-                         (if (and (null? rest) (char? x))
-                             (pw-char! self (char->integer x))
-                             (pw-text! self (append-text x rest)))
+                         (pw-guarded self
+                           (lambda ()
+                             (if (and (null? rest) (char? x))
+                                 (pw-char! self (char->integer x))
+                                 (pw-text! self (append-text x rest)))))
                          self))
         (cons "printf" (lambda (self a . rest)
-                         (jvm-format-pieces a rest (lambda (piece) (pw-text! self piece)))
+                         (jvm-format-pieces a rest
+                           (lambda (piece) (pw-guarded self (lambda () (pw-text! self piece)))))
                          self))
-        (cons "format" (lambda (self a . rest) (jvm-format-pieces a rest (lambda (piece) (pw-text! self piece))) self))
-        (cons "flush" (lambda (self) (pw-pass! self "flush")))
-        (cons "close" (lambda (self) (pw-pass! self "close")))
-        (cons "checkError" (lambda (self) (pw-pass! self "flush") #f))
+        (cons "format" (lambda (self a . rest)
+                         (jvm-format-pieces a rest
+                           (lambda (piece) (pw-guarded self (lambda () (pw-text! self piece)))))
+                         self))
+        (cons "flush" (lambda (self) (pw-guarded self (lambda () (pw-pass! self "flush")))))
+        (cons "close" (lambda (self) (pw-guarded self (lambda () (pw-pass! self "close")))))
+        ;; flush, then its own flag, then the target's answer when it has one: a
+        ;; PrintWriter over System/out reports the process stream failing, as
+        ;; the JDK's delegates to the PrintStream it wraps
+        (cons "checkError" (lambda (self)
+                             (pw-guarded self (lambda () (pw-pass! self "flush")))
+                             (or (pw-trouble? self)
+                                 (let ((t (pw-target self)))
+                                   (and (jhost? t) (host-method-ref (jhost-tag t) "checkError")
+                                        (jolt-truthy? (record-method-dispatch t "checkError" jolt-nil)))))))
         (cons "toString" (lambda (self) ""))))
 
 ;; PrintWriter-on — a writer that accumulates writes and, on flush, hands the

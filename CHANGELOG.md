@@ -98,6 +98,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`FileWriter` and `OutputStreamWriter` write `char[]` regions and
+  `append` subsequences.** `(.write w buf 0 n)` wrote the text `#object[...]`
+  and `(.append w "abc" 1 2)` wrote all of `"abc"`. `(.append w nil)` now
+  writes `"null"`.
+- **`Files/delete` and `Files/deleteIfExists` raise when the delete fails.**
+  A file in a read-only directory stayed on disk while the call returned
+  normally (`deleteIfExists` answered `true`). They now raise
+  `AccessDeniedException`, `DirectoryNotEmptyException` or a
+  `FileSystemException` with the system's reason, as the JDK does.
+- **`bigint` and `biginteger` of a double take its decimal value.**
+  `(bigint 1e30)` was `1000000000000000019884624838656N`, the double's exact
+  binary value; it is `1000000000000000000000000000000N`, as on the JVM, which
+  goes through `BigDecimal.valueOf`.
+- **`InetSocketAddress` resolves when it is built, as on the JVM.** It prints
+  `localhost/127.0.0.1:80`, `/127.0.0.1:80` for a literal and
+  `host/<unresolved>:80` when the lookup failed (it printed `host:port`);
+  `getAddress` of an unresolved one is `nil`; `getHostName` reverse-resolves a
+  literal; and `InetSocketAddress/createUnresolved` exists. Connecting to an
+  unresolved address raises `UnknownHostException`, binding to one
+  `SocketException`, and `(str (InetAddress/getByName "127.0.0.1"))` is
+  `/127.0.0.1`.
+- **`PrintWriter` no longer throws its target's `IOException`.** A write,
+  flush or close that failed in the writer underneath raised; it is recorded
+  and `checkError` answers `true`, as on the JVM. Other exceptions still
+  propagate.
+- **A process's `:shutdown` hook is registered before it starts.** A SIGTERM
+  that reached jolt between the spawn and the registration ended it with no
+  hook to run, so `:shutdown destroy-tree` left the child tree running. The
+  hook is now in place first and waits for the process if the spawn has not
+  returned yet.
+- **`PrintWriter.checkError` reports the stream it wraps.** Over `System/out`
+  with the reader gone it answered `false`; it now answers `true`, as
+  `PrintStream.checkError` already did.
+
 - **The Windows HTTPS transport finds Git for Windows 2.56's OpenSSL.** Git
   2.56 moved from MINGW64 to UCRT64 and has no `mingw64` directory any more, so
   the resolver found no OpenSSL of Git's and loaded whatever `libcrypto-3-x64.dll`
@@ -347,7 +381,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   puts the site back when a non-tail call returns; a fn's calls to itself skip
   that when nothing it tail-calls can run jolt code, so `fib` and `tak` cost
   what they did. A throw's erased caller of a fn still running is also placed
-  below that fn, where it was the innermost frame.
+  below that fn, where it was the innermost frame. The same holds when the
+  call that returned was a keyword or `get` lookup running a deftype's
+  `valAt`, or a callback that core (`mapv`, `juxt`, ...) called and that
+  ended in a tail call: the next callback's throw named the returned fn.
 
 - **nREPL eval output, errors and traces match JVM nREPL.** The value was
   printed after the eval's `*out*` binding had ended, so what a lazy result

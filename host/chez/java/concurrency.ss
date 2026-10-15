@@ -21,8 +21,7 @@
 ;; left of an exact deadline, a TimeUnit finer than a millisecond), and flooring it
 ;; turned a pause of 0.4ms into none at all and a poll loop into a spin.
 (define (ms->duration ms)
-  (let ((ns (max 0 (exact (ceiling (* ms 1000000))))))
-    (make-time 'time-duration (remainder ns 1000000000) (quotient ns 1000000000))))
+  (wait-ns->duration (exact (ceiling (* ms 1000000)))))
 ;; ms from now as a deadline on mono-millis, the form jolt-cv-wait and the timer
 ;; take: a fiber's deadline has to be comparable against the clock and against the
 ;; entries in the shared timer, and a thread's wait is converted from it. One

@@ -47,6 +47,14 @@ first="$(jolt "(dotimes [i 6] (println (str \"line \" i (apply str (repeat 2000 
 expect "the reader got the first line" "$first" "line 0"
 expect "the program ran to its end, and checkError says the stream failed" "$(cat "$marker" 2>/dev/null)" "[:end true]"
 
+# --- a PrintWriter over System/out asks the stream it wraps -------------------
+rm -f "$marker"
+first="$(jolt "(let [w (java.io.PrintWriter. System/out true)]
+  (dotimes [i 6] (.println w (str \"pw \" i (apply str (repeat 2000 \\x)))) (Thread/sleep 200))
+  (spit \"$(m)\" (pr-str [:end (.checkError w)])))" | head -1 | cut -c1-4)"
+expect "the PrintWriter reader got the first line" "$first" "pw 0"
+expect "PrintWriter.checkError reports the failed stream under it" "$(cat "$marker" 2>/dev/null)" "[:end true]"
+
 # --- stderr: the same, through *err* and System/err ---------------------------
 rm -f "$marker"
 first="$(jolt "(dotimes [i 6] (binding [*out* *err*] (println (str \"err \" i (apply str (repeat 2000 \\y))))) (Thread/sleep 200))

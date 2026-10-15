@@ -128,6 +128,14 @@
           n   (.read (.getInputStream conn) buf 1 2)]
       (check-eq "offset read" [n (String. buf 0 4 "UTF-8")] [2 "-ab-"]))))
 
+;; a region outside the array is IndexOutOfBoundsException, checked before the write
+(with-pair
+  (fn [server client conn]
+    (check-eq "out-of-range write region"
+              (try (.write (.getOutputStream client) (byte-array 3) 1 10) :wrote
+                   (catch IndexOutOfBoundsException e (.getMessage e)))
+              "Range [1, 1 + 10) out of bounds for length 3")))
+
 ;; EOF after peer close
 (with-pair
   (fn [server client conn]
@@ -269,11 +277,33 @@
 (check-eq "getByName class" (.getName (class (java.net.InetAddress/getByName "localhost"))) "java.net.Inet4Address")
 (let [isa (java.net.InetSocketAddress. "127.0.0.1" 8080)]
   (check-eq "isa port" (.getPort isa) 8080)
-  ;; getHostString, not getHostName: the JVM reverse-resolves a literal to
-  ;; "localhost" (nameservice-dependent); getHostString answers the literal
-  ;; on both. jolt's getHostName skips the reverse lookup — known divergence.
+  ;; getHostString, not getHostName: getHostName reverse-resolves a literal,
+  ;; so its answer depends on the machine's nameservice
   (check-eq "isa host" (.getHostString isa) "127.0.0.1")
-  (check-eq "isa getAddress" (.getHostAddress (.getAddress isa)) "127.0.0.1"))
+  (check-eq "isa getAddress" (.getHostAddress (.getAddress isa)) "127.0.0.1")
+  ;; resolved when built: a literal has no name, a host name keeps its own
+  (check-eq "isa literal toString" (str isa) "/127.0.0.1:8080")
+  (check-eq "isa name toString" (str (java.net.InetSocketAddress. "localhost" 80)) "localhost/127.0.0.1:80")
+  (check-eq "isa wildcard toString" (str (java.net.InetSocketAddress. 80)) "0.0.0.0/0.0.0.0:80"))
+(let [u (java.net.InetSocketAddress/createUnresolved "localhost" 80)
+      bad (java.net.InetSocketAddress. "no-such-host.invalid" 80)]
+  (check-eq "unresolved toString" [(str u) (str bad)]
+            ["localhost/<unresolved>:80" "no-such-host.invalid/<unresolved>:80"])
+  (check-eq "unresolved getAddress" [(.isUnresolved u) (.getAddress u) (.isUnresolved bad)] [true nil true])
+  (check-eq "unresolved is never = a resolved one"
+            [(= u (java.net.InetSocketAddress. "localhost" 80))
+             (= u (java.net.InetSocketAddress/createUnresolved "LocalHost" 80))]
+            [false true])
+  (check-eq "connect to an unresolved address"
+            (try (.connect (java.net.Socket.) u) :connected
+                 (catch java.net.UnknownHostException e (ex-message e)))
+            "localhost")
+  (check-eq "bind to an unresolved address"
+            (try (.bind (java.net.ServerSocket.) u) :bound
+                 (catch java.net.SocketException e (ex-message e)))
+            "Unresolved address"))
+(check-eq "getByName of a literal carries no name"
+          (str (java.net.InetAddress/getByName "127.0.0.1")) "/127.0.0.1")
 
 ;; no-arg Socket + .connect(endpoint)
 (let [server (java.net.ServerSocket. 0)

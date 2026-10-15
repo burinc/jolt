@@ -1021,17 +1021,18 @@
 (define (char-writer-live-port self)
   (let ((port (char-writer-port self)))
     (if (port-closed? port) (io-throw "Stream closed") port)))
-(define (cw-text x) (if (number? x) (string (integer->char (jnum->exact x))) (jolt-str-render-one x)))
+;; write and append take what every other Writer here takes (writer-piece-range,
+;; append-text): an int as its character, a char[] or String with an (off len)
+;; region, and append's (csq start end) subsequence with nil as "null".
 (register-host-methods! "char-writer"
   (list
    (cons "write" (lambda (self x . rest)
-                   ;; (write str) | (write int) | (write str off len)
-                   (let ((s (cw-text x)))
-                     (put-string (char-writer-live-port self)
-                                 (if (>= (length rest) 2) (substring s (jnum->exact (car rest))
-                                                                     (+ (jnum->exact (car rest)) (jnum->exact (cadr rest)))) s)))
+                   (put-string (char-writer-live-port self) (writer-piece-range x rest))
                    jolt-nil))
-   (cons "append" (lambda (self x . rest) (put-string (char-writer-live-port self) (cw-text x)) self))
+   (cons "append" (lambda (self x . rest)
+                    (put-string (char-writer-live-port self)
+                                (if (and (null? rest) (char? x)) (string x) (append-text x rest)))
+                    self))
    (cons "newLine" (lambda (self) (put-char (char-writer-live-port self) #\newline) jolt-nil))
    (cons "flush" (lambda (self)
                    (flush-output-port (char-writer-live-port self))
