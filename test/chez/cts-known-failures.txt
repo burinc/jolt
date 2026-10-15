@@ -2,7 +2,7 @@
 # The gate fails on any per-namespace change, worse OR better; regenerate
 # with: JOLT_CTS_WRITE_BASELINE=1 host/chez/cts.sh
 clojure.core-test.abs 1 0
-clojure.core-test.bigint 3 0
+clojure.core-test.bigint 2 0
 clojure.core-test.byte 1 0
 # char: the suite's "4+ byte characters" case is host-dependent — it expects a
 # throw on the JVM but the character itself on jank and basilisp, which index
