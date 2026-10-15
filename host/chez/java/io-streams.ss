@@ -185,15 +185,19 @@
 ;; past the end (the next read then answers -1), and a target before the start
 ;; of the file is IOException "Invalid argument", the errno text (JDK 25).
 ;;
-;; Only a plain file stream takes this path: a port with no descriptor
+;; A target the file system will not take (Long/MAX_VALUE on ext4, past its
+;; s_maxbytes) is the same IOException there; macOS takes it.
+;;
+;; Only a file stream takes this path: a port with no descriptor
 ;; (ByteArrayInputStream, a pipe's or a zip entry's custom port) or one that
 ;; cannot say where it is (a pipe or terminal on fd 0, which raises ESPIPE from
-;; port-position) answers #f and keeps the reading loop. A stream that supports
-;; mark (ByteArrayInputStream) and a pushback stream, which has bytes of its own
-;; ahead of the port, have different rules, so they stay on it too.
+;; port-position) answers #f and keeps the reading loop. A pushback stream has
+;; bytes of its own ahead of the port, so it stays on the loop too. A
+;; BufferedInputStream over a file (the markable stream) hands a forward skip to
+;; the file the way the JDK's does, and answers 0 for n <= 0.
 ;; #f when the stream is not seekable, else the count skipped.
 (define (in-stream-skip-by-seek! self port n)
-  (and (not (in-stream-markable? self))
+  (and (not (and (in-stream-markable? self) (<= n 0)))
        (not (in-stream-pushback self))
        (not (piped-pipe self))
        (let ((pos (guard (_ (#t #f))
@@ -201,8 +205,23 @@
          (and pos
               (let ((target (+ pos n)))
                 (when (< target 0) (io-throw "Invalid argument"))
-                (and (guard (_ (#t #f)) (set-port-position! port target) #t)
-                     (->num n)))))))
+                (guard (_ (#t (io-throw "Invalid argument")))
+                  (set-port-position! port target))
+                (->num n))))))
+
+;; InputStream.skip by reading: n <= 0 is 0, and the bytes go through a bounded
+;; buffer, so a count past the end (Long/MAX_VALUE) stops at end of stream.
+(define (in-stream-skip-by-reading! port n)
+  (if (<= n 0)
+      0
+      (let ((buf (make-bytevector (min n 8192))))
+        (let loop ((left n) (done 0))
+          (if (zero? left)
+              done
+              (let ((k (get-bytevector-n! port buf 0 (min left 8192))))
+                (if (eof-object? k)
+                    done
+                    (loop (- left k) (+ done k)))))))))
 
 (register-host-methods! "in-stream"
   (list
@@ -260,8 +279,7 @@
    (cons "skip" (lambda (self n)
                   (let ((port (in-stream-live-port self)) (n (jnum->exact n)))
                     (or (in-stream-skip-by-seek! self port n)
-                        (let ((bv (get-bytevector-n port n)))
-                          (->num (if (eof-object? bv) 0 (bytevector-length bv))))))))
+                        (->num (in-stream-skip-by-reading! port n))))))
    (cons "available" (lambda (self) (->num (in-stream-available self))))
    ;; PushbackInputStream.unread — see the pushback section below. Any other
    ;; stream has no such method, and says so the way every missing method does.
