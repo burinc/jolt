@@ -59,6 +59,21 @@ c
 check d "$(run '(println [(.read System/in) (.read System/in)])' 'AB')" "[65 66]"
 check d2 "$(run '(println (.read System/in))')" "-1"
 
+# *in* over real stdin is a java.io.Reader, as the JVM's is (#1380): io/reader
+# takes it, and .read / .readLine share the cursor read-line uses.
+check in1 "$(run '(println (.readLine (clojure.java.io/reader *in*)))' 'line1
+')" "line1"
+check in2 "$(run '(println (pr-str (vec (line-seq (clojure.java.io/reader *in*)))))' 'a
+b
+')" "[\"a\" \"b\"]"
+check in3 "$(run '(println [(.read *in*) (.readLine *in*) (read-line) (.readLine *in*)])' 'xy
+z
+')" "[120 y z nil]"
+# a bulk read and read-line share one cursor: nothing is lost or read twice
+check in4 "$(run '(let [b (char-array 64) n (.read *in* b 0 64)] (println (pr-str (str (String. b 0 n) (some-> (read-line) (str \|))))))' 'ab
+cd
+')" "\"ab\\ncd|\""
+
 # --- (e) io/copy System/in -> System/out (the babashka.process wd.clj echo) ---
 check e "$(run '(clojure.java.io/copy System/in System/out) (flush)' 'echoed')" "echoed"
 

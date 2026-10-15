@@ -2373,8 +2373,10 @@
           ;; wrapped in one, and a byte stream is encoded into by one.
           (cond ((buffered-char-writer? x) x)
                 ((char-writer? x) (make-buffered-writer x))
+                ;; x is what flush and close reach, as OutputStreamWriter's are:
+                ;; with #f the encoded bytes stopped in x's port buffer (#1379)
                 ((out-stream? x)
-                 (make-charset-writer (out-stream-sink-port x) enc #f #f "java.io.BufferedWriter"))
+                 (make-charset-writer (out-stream-sink-port x) enc x #f "java.io.BufferedWriter"))
                 ((and (jhost? x) (text-sink-tag? (jhost-tag x))) (make-buffered-writer x))
                 ;; a java.io.OutputStream the caller wrote is encoded into, the
                 ;; way jolt's is
