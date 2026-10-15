@@ -1167,8 +1167,9 @@
   {:suite "winsock" :expr "(do (require (quote jolt.socket.native)) (mapv #(:sock-cloexec (jolt.socket.native/consts-for %)) [:linux :macos :windows]))" :expected "[524288 nil nil]"}
   ;; a nil host with :passive? is getaddrinfo's NULL node: the wildcard to bind
   {:suite "winsock" :expr "(do (require (quote [jolt.socket.native :as n])) (let [{:keys [addrs]} (n/resolve-addrs nil 80 {:passive? true :family n/af-inet})] (try (mapv :ip addrs) (finally (n/free-addrs! addrs)))))" :expected "[\"0.0.0.0\"]"}
-  ;; every interface getifaddrs names is a NetworkInterface, v6-only ones too
-  {:suite "winsock" :expr "(do (require (quote jolt.socket.native)) (= (set (map :name (jolt.socket.native/interface-addresses))) (set (map #(.getName %) (enumeration-seq (java.net.NetworkInterface/getNetworkInterfaces))))))" :expected "true"}
+  ;; every interface getifaddrs gives an address is a NetworkInterface, v6-only
+  ;; ones too; one with only a link-layer entry is not, as on the JDK
+  {:suite "winsock" :expr "(do (require (quote jolt.socket.native)) (= (set (map :name (filter :ip (jolt.socket.native/interface-addresses)))) (set (map #(.getName %) (enumeration-seq (java.net.NetworkInterface/getNetworkInterfaces))))))" :expected "true"}
   ;; A numeric literal is parsed, never resolved: getaddrinfo goes through a
   ;; resolver daemon on bionic, and a container without one failed "0.0.0.0".
   {:suite "winsock" :expr "(do (require (quote jolt.socket.native)) (let [r (jolt.socket.native/resolve-addrs \"0.0.0.0\" 80 {:family jolt.socket.native/af-inet}) a (first (:addrs r))] (jolt.socket.native/free-addrs! (:addrs r)) [(:ip a) (:addrlen a) (count (:addrs r))]))" :expected "[\"0.0.0.0\" 16 1]"}
