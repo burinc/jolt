@@ -376,7 +376,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   puts the site back when a non-tail call returns; a fn's calls to itself skip
   that when nothing it tail-calls can run jolt code, so `fib` and `tak` cost
   what they did. A throw's erased caller of a fn still running is also placed
-  below that fn, where it was the innermost frame.
+  below that fn, where it was the innermost frame. The same holds when the
+  call that returned was a keyword or `get` lookup running a deftype's
+  `valAt`, or a callback that core (`mapv`, `juxt`, ...) called and that
+  ended in a tail call: the next callback's throw named the returned fn.
 
 - **nREPL eval output, errors and traces match JVM nREPL.** The value was
   printed after the eval's `*out*` binding had ended, so what a lazy result

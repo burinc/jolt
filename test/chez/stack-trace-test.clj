@@ -256,6 +256,13 @@
        ["stack_trace_test$live_callee" "stack_trace_test$mid_caller"
         "stack_trace_test$erases_into_mid" "stack_trace_test$calls_erases_mid"]
        "...and below the live frame it called, further out"))
+;; a callback that ended in a tail call and returned to untraced code (a core
+;; HOF) leaves its pair in the slot; the next callback's throw must not report it
+(defn- cb-tail [x] (ret-f x))
+(defn- cb-throws [x] (let [v (ret-g x)] (+ v (nth [] 3))))
+(let [e (try (let [r ((juxt cb-tail cb-throws) 1)] r) (catch Exception x x))]
+  (ok= (first (frame-names e)) "stack_trace_test$cb_throws"
+       "a returned callback's tail call is not the next callback's innermost frame"))
 ;; a lookup the back end open-codes runs jolt code too: a deftype's valAt, a
 ;; sorted map's comparator. The fn it ran returned, so it is not a frame.
 (deftype LookupRuns [] clojure.lang.ILookup

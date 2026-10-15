@@ -871,18 +871,26 @@
     ;; a throw reads the raise-time snapshot; a live read takes the slot as
     ;; it stands, the most recent tail call made on this thread
     (if live?
-        (let ((s (virtual-register jolt-vreg-site))) (and (pair? s) s))
+        (jolt-site-snapshot)
         (jolt-throw-site))))
 ;; ...with the site pair given: a caught throwable's own (jolt-throwable-recs).
+;; SITE0 may be an outer-site (rt.ss jolt-site-snapshot): the pair a non-tail
+;; call moved aside, an erased caller somewhere below the live frames. It never
+;; goes innermost. It bridges a gap like a live read's pair, or lands below the
+;; live frame its tail call went to, and is dropped when no live frame confirms
+;; it -- a pair a callback left in the slot when it returned to untraced code
+;; has none.
 (define (jolt-continuation-recs/site k live? site0)
-  (let* ((cont (jolt-frame-records k))
+  (let* ((outer? (outer-site? site0))
+         (site0 (if outer? (outer-site-pair site0) site0))
+         (cont (jolt-frame-records k))
          (cont-names (let ((h (make-hashtable string-hash string=?)))
                        (for-each (lambda (f)
                                    (hashtable-set! h (srcreg-frame-nm f) #t))
                                  cont)
                        h))
          (site (and (pair? site0) (not (hashtable-ref cont-names (car site0) #f)) site0)))
-    (call-with-values (lambda () (jolt-fill-gaps cont (and live? site)))
+    (call-with-values (lambda () (jolt-fill-gaps cont (and (or live? outer?) site)))
       (lambda (body used?)
         ;; At a throw the pair is the innermost call, so it splices in innermost
         ;; unless registered evidence contradicts it. A live read's pair can be
@@ -893,15 +901,21 @@
         (if (and site (not used?))
             (call-with-values (lambda () (jolt-backwalk site cont-names))
               (lambda (path connected?)
-                (if (if live?
-                        (and (not (jolt-site-exited? site))
-                             (jolt-site-evidenced? path connected? cont))
-                        (jolt-site-valid? site path connected? cont cont-names))
-                    (let ((frames (srcreg-site-frames path)))
-                      (if live?
-                          (append frames body)
-                          (jolt-splice-at body (jolt-site-landing site path body) frames)))
-                    body)))
+                (cond
+                  (outer?
+                   (let ((at (jolt-site-landing site path body)))
+                     (if (and (fx>? at 0) (jolt-site-evidenced? path connected? cont))
+                         (jolt-splice-at body at (srcreg-site-frames path))
+                         body)))
+                  ((if live?
+                       (and (not (jolt-site-exited? site))
+                            (jolt-site-evidenced? path connected? cont))
+                       (jolt-site-valid? site path connected? cont cont-names))
+                   (let ((frames (srcreg-site-frames path)))
+                     (if live?
+                         (append frames body)
+                         (jolt-splice-at body (jolt-site-landing site path body) frames))))
+                  (else body))))
             body)))))
 
 ;; Where a throw's erased chain goes among the live frames: how many of them stay

@@ -215,6 +215,7 @@
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
+(define jolt-vreg-outer-site 12) ; the pair a non-tail call moved out of jolt-vreg-site
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
@@ -252,7 +253,9 @@
 ;; loader, the eval loop), which registers no callees. compile-eval.ss clears the
 ;; slot when a form starts to compile and again when its compiled code starts to
 ;; run, since macroexpansion runs user code in between.
-(define (jolt-site-reset!) (set-virtual-register! jolt-vreg-site 0))
+(define (jolt-site-reset!)
+  (set-virtual-register! jolt-vreg-site 0)
+  (set-virtual-register! jolt-vreg-outer-site 0))
 ;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
 ;; catch-line snapshot when a handler is running, else the raise-time stash.
 ;; #f when unset. The reporter must validate this against the callsite table

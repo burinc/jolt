@@ -780,7 +780,7 @@
                " bytes was exceeded. Raise or disable it with"
                " JOLT_STACK_LIMIT=<n>[k|m|g] or JOLT_STACK_LIMIT=-1.")
              jolt-nil jolt-nil 0))
-        (site (let ((s (virtual-register jolt-vreg-site))) (and (pair? s) s))))
+        (site (jolt-site-snapshot)))
     (jolt-stack-overflowing #t)
     (call/cc
       (lambda (k)
@@ -1463,11 +1463,12 @@
 ;; the 3.4M switches/sec design point (R0(c)); the fibers define re-defines the
 ;; value in fibers.ss so the standalone gate can load it without rt.ss. Slot 1
 ;; was freed by R3 (jolt-230w), which moved the R1 ring/mark vregs onto the
-;; continuation, and re-claimed by fibers.ss for park-unwinding; the next free
-;; slot is 12. The surviving slots keep their R2 numbers.
+;; continuation, and re-claimed by fibers.ss for park-unwinding; slot 12 is
+;; the outer site (below), and the next free slot is 13. The surviving slots keep their R2 numbers.
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
+(define jolt-vreg-outer-site 12) ; the pair a non-tail call moved out of jolt-vreg-site
 (define jolt-vreg-current-fiber 0)  ; fibers.ss: the running fiber record, or 0 (fixnum) when not on a fiber
 ;; slot 1: fibers.ss jolt-vreg-park-unwinding — a park escape is unwinding this carrier
 ;; slot 5: hasheq.ss jolt-vreg-hasheq-caches — this thread's (symbol . string) hasheq tables
@@ -1523,13 +1524,28 @@
 ;; (jolt-throw-sitep), and the reporter still validates it against the callsite
 ;; table before splicing: code compiled untraced (the seed) restores nothing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
+;; A non-tail call moves the slot's pair to jolt-vreg-outer-site and clears the
+;; slot while it runs (backend_scheme site-restore): a throw inside it has no
+;; innermost pair, only the nearest erased caller from further out. The snapshot
+;; a throw keeps is the slot's pair, else that outer pair wrapped as an
+;; outer-site, which only the continuation walk unwraps and only as a gap bridge:
+;; every other reader tests pair? and ignores it.
+(define-record-type outer-site (fields pair) (nongenerative jolt-outer-site-v1))
+(define (jolt-site-snapshot)
+  (let ((s (virtual-register jolt-vreg-site)))
+    (if (pair? s)
+        s
+        (let ((o (virtual-register jolt-vreg-outer-site)))
+          (and (pair? o) (make-outer-site o))))))
 ;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
 ;; when one starts is a returned call's residue — the reporter's validator cannot
 ;; tell it from a live pair when the innermost live frame is a host fn (the
 ;; loader, the eval loop), which registers no callees. compile-eval.ss clears the
 ;; slot when a form starts to compile and again when its compiled code starts to
 ;; run, since macroexpansion runs user code in between.
-(define (jolt-site-reset!) (set-virtual-register! jolt-vreg-site 0))
+(define (jolt-site-reset!)
+  (set-virtual-register! jolt-vreg-site 0)
+  (set-virtual-register! jolt-vreg-outer-site 0))
 ;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
 ;; catch-line snapshot when a handler is running, else the raise-time stash.
 ;; #f when unset. The reporter must validate this against the callsite table
@@ -1539,7 +1555,7 @@
     (if (pair? c)
         c
         (let ((s (jolt-throw-sitep)))
-          (and (pair? s) s)))))
+          (and (or (pair? s) (outer-site? s)) s)))))
 ;; Emitted around a catch clause's body: snapshot the throwing site and return the
 ;; previous snapshot, which the paired leave restores. Save/restore rather than a
 ;; bare set so a nested catch cannot leave an inner throw's site behind for an
@@ -1701,8 +1717,7 @@
   ;; what the JVM's getStackTrace answers with.
   (call/cc (lambda (k)
              (jolt-throw-cont (cons v k))
-             (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
-                                 (and (pair? s) s)))
+             (jolt-throw-sitep (jolt-site-snapshot))
              (jolt-remember-throw! v k (jolt-throw-sitep))
              (jolt-raise-thrown v))))
 (define (jolt-raise-thrown v)
@@ -1714,8 +1729,7 @@
 ;; stack trace too.
 (define (jolt-capture-throwable! v)
   (call/cc (lambda (k)
-             (jolt-remember-throw! v k (let ((s (virtual-register jolt-vreg-site)))
-                                         (and (pair? s) s)))))
+             (jolt-remember-throw! v k (jolt-site-snapshot))))
   v)
 ;; The same capture for a HOST condition (a fault raised outside jolt-throw:
 ;; car of a non-pair, a bad flvector index). Installed by the cli's run wrapper
@@ -1740,9 +1754,7 @@
     (jolt-fault-captured c)
     (jolt-throw-sitep (jolt-live-site))))
 ;; The site pair the vreg holds now, or #f.
-(define (jolt-live-site)
-  (let ((s (virtual-register jolt-vreg-site)))
-    (and (pair? s) s)))
+(define (jolt-live-site) (jolt-site-snapshot))
 ;; The value a raise carries, as jolt code sees it. A &jolt-throw condition
 ;; unwraps to the value it wraps. A raw Chez condition — a fault the host itself
 ;; raised, such as a primitive handed nil — becomes a typed jolt throwable, so a
