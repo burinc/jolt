@@ -63,23 +63,54 @@
 (defn- line-start! [a v] (swap! a (fn [st] [v (nth st 0)])) nil)
 (defn- line-start-undo! [a] (swap! a (fn [st] [(nth st 1) (nth st 1)])) nil)
 
+;; *in* is also a java.io.Reader, as the JVM's LineNumberingPushbackReader is,
+;; so io/reader, (.read *in*), (.readLine *in*) and (BufferedReader. *in*) take
+;; it (#1380). The Reader methods go through the same cursor the IReader ops
+;; read, so the two interleave. close is real: a read after it is the JVM's
+;; "Stream closed".
+(defn- reader-open! [closed]
+  (when @closed (throw (java.io.IOException. "Stream closed"))))
+
+;; read(cbuf, off, len): the first character blocks as .read does, the rest
+;; come while more? says the reader already holds them, so over stdin this
+;; answers what has arrived instead of waiting on the next line. The count, or
+;; -1 at end of input.
+(defn- read-chars [rdr more? buf off len]
+  (if (zero? len)
+    0
+    (let [c (-read-char rdr)]
+      (if (neg? c)
+        -1
+        (do (aset buf off (char c))
+            (loop [i 1]
+              (if (and (< i len) (more?))
+                (let [c (-read-char rdr)]
+                  (if (neg? c)
+                    i
+                    (do (aset buf (+ off i) (char c)) (recur (inc i)))))
+                i)))))))
+
 (defn __string-reader
   "A reader over string s (the with-in-str expansion calls this)."
   [s]
   (let [pos (atom 0)
         line-start (atom [true true])
+        closed (atom false)
+        more? (fn [] (< @pos (count s)))
         numbering (__numbering)]
     (reify IReader
       (-read-line [_]
         ;; \n, \r and \r\n all end a line, and none of them is part of it —
         ;; java.io.BufferedReader's rule, which the host seam owns so this
         ;; reader and the port-backed ones cannot disagree about CRLF input.
+        (reader-open! closed)
         (line-start! line-start true)
         (let [r (__string-line-from s @pos)]
           (when-not (nil? r)
             (reset! pos (nth r 1))
             (nth r 0))))
       (-read-form [_]
+        (reader-open! closed)
         (let [r (__parse-next-numbered s @pos numbering #(reset! pos %))]
           (if (nil? r)
             (do (line-start! line-start true) reader-eof)
@@ -87,6 +118,7 @@
                 (line-start! line-start false)
                 (nth r 0)))))
       (-read+string [_ eof-error? eof-value]
+        (reader-open! closed)
         (let [p @pos
               r (__parse-next-numbered s p numbering #(reset! pos %))]
           (if (nil? r)
@@ -100,6 +132,7 @@
                 [(nth r 0) (__jtrim (subs s p (nth r 1)))]))))
       (-read-eof [_] (__read-eof s numbering))
       (-read-char [_]
+        (reader-open! closed)
         (let [p @pos]
           (if (< p (count s))
             (let [c (int (get s p))]
@@ -111,7 +144,17 @@
         (swap! pos (fn [p] (if (pos? p) (dec p) p)))
         (line-start-undo! line-start)
         nil)
-      (-at-line-start? [_] (nth @line-start 0)))))
+      (-at-line-start? [_] (nth @line-start 0))
+      java.io.Reader
+      (read [this] (-read-char this))
+      (read [this buf] (read-chars this more? buf 0 (alength buf)))
+      (read [this buf off len] (read-chars this more? buf off len))
+      (readLine [this] (-read-line this))
+      (unread [this c] (reader-open! closed) (-unread-char this c))
+      (atLineStart [this] (-at-line-start? this))
+      ;; StringReader.ready: true until it is closed, even at the end
+      (ready [_] (reader-open! closed) true)
+      (close [_] (reset! closed true) nil))))
 
 ;; Real stdin: a leftover [buffer cursor] shared by read and read-line. When a
 ;; parse needs another line, the consumed prefix is dropped as the line is
@@ -123,6 +166,10 @@
 ;; the counters index 0 of stdin-buf stands at: whatever the buffer drops, and
 ;; every line read around it, moves them on
 (def ^:private stdin-numbering (__numbering))
+(def ^:private stdin-closed (atom false))
+;; characters of the current line still unread
+(defn- stdin-more? []
+  (let [sp @stdin-buf] (< (nth sp 1) (count (nth sp 0)))))
 (defn- stdin-drop! [s p] (__numbering-advance! stdin-numbering s 0 p))
 (defn- stdin-line! [line]
   (when-not (nil? line)
@@ -132,6 +179,7 @@
 (def ^:dynamic *in*
   (reify IReader
     (-read-line [_]
+      (reader-open! stdin-closed)
       (line-start! stdin-line-start true)
       (let [sp @stdin-buf
             s (nth sp 0)
@@ -145,6 +193,7 @@
               (reset! stdin-buf ["" 0])
               (stdin-line! (__stdin-read-line))))))
     (-read-form [_]
+      (reader-open! stdin-closed)
       (loop []
         (let [sp @stdin-buf
               s (nth sp 0)
@@ -160,6 +209,7 @@
                 (line-start! stdin-line-start false)
                 (nth r 0))))))
     (-read+string [_ eof-error? eof-value]
+      (reader-open! stdin-closed)
       (loop []
         (let [sp @stdin-buf
               s (nth sp 0)
@@ -184,6 +234,7 @@
     ;; from the very next position. The pull when the buffer runs dry blocks on
     ;; a line, as .read on the JVM's stdin reader blocks on input.
     (-read-char [_]
+      (reader-open! stdin-closed)
       (loop []
         (let [sp @stdin-buf
               s (nth sp 0)
@@ -205,7 +256,17 @@
           (reset! stdin-buf [(nth sp 0) (dec p)])))
       (line-start-undo! stdin-line-start)
       nil)
-    (-at-line-start? [_] (nth @stdin-line-start 0))))
+    (-at-line-start? [_] (nth @stdin-line-start 0))
+    java.io.Reader
+    (read [this] (-read-char this))
+    (read [this buf] (read-chars this stdin-more? buf 0 (alength buf)))
+    (read [this buf off len] (read-chars this stdin-more? buf off len))
+    (readLine [this] (-read-line this))
+    (unread [this c] (reader-open! stdin-closed) (-unread-char this c))
+    (atLineStart [this] (-at-line-start? this))
+    ;; only what is already buffered is known to be there
+    (ready [_] (reader-open! stdin-closed) (stdin-more?))
+    (close [_] (reset! stdin-closed true) nil)))
 
 (defn read-line
   "Reads the next line from the stream that is the current value of *in*.

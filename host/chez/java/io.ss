@@ -2153,6 +2153,12 @@
             (rest (drain-reader (vector-ref st 0))))
        (vector-set! st 1 '())
        (string-append pushed (if (vector-ref st 2) (pbr-fold-and-count! st rest) rest))))
+    ;; a BufferedReader over one of jolt's readers: its buffered rest, then that
+    ;; reader's own drain (io-streams.ss ra-drain). Over a Reader the program
+    ;; wrote it drains through its own read, which drives whichever read the
+    ;; Reader implements.
+    ((and (reader-adapter? r) (jhost? (reader-adapter-inner r)))
+     (ra-drain r drain-reader))
     (else (drain-reader-by-dispatch r))))
 
 (define (reader-jhost? x)
@@ -2287,8 +2293,11 @@
 ;; char-reader drain is the fast path loading a file depends on.
 (define (pushback-over-user-reader? r)
   (and (jhost? r) (pushback-reader-tag? (jhost-tag r))
-       (let ((w (vector-ref (jhost-state r) 0)))
-         (or (not (jhost? w)) (string=? (jhost-tag w) "reader-adapter")))))
+       (let loop ((w (vector-ref (jhost-state r) 0)))
+         ;; a BufferedReader is as interactive as the reader it wraps
+         (cond ((not (jhost? w)) #t)
+               ((string=? (jhost-tag w) "reader-adapter") (loop (reader-adapter-inner w)))
+               (else #f)))))
 
 ;; Read ONE form from a pushback reader through its own read/unread, taking
 ;; only as much input as the form needs. Characters go into a buffer while a

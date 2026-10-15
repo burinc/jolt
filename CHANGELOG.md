@@ -16,6 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same `line-seq` over stdin does.
 - **`(num nil)` answers nil** like Clojure, where `num` is a cast to
   `Number`, instead of throwing `ClassCastException`.
+- **`io/writer` over an `OutputStream` flushes and closes it.** A writer
+  made from a byte stream encoded into the stream's buffer but never flushed
+  or closed the stream itself, so `(with-open [w (io/writer os)] ...)` and a
+  writer over a child process's stdin lost what was written (#1379).
+- **`*in*` is a `java.io.Reader`.** `(io/reader *in*)` threw `Cannot open ...
+  as a Reader`, and `.read`, `.readLine` and `.unread` on `*in*` did not exist.
+  Both the stdin reader and the one `with-in-str` binds answer them now, off
+  the same cursor `read-line` and `read` use, and `.close` closes it (#1380).
+- **`BufferedReader` reads ahead** like the JDK's: it fills its own buffer
+  with one `read` of 8192 characters (or the size passed in), so what it has
+  buffered is gone from the reader it wraps, and `read-line` on `*in*` after
+  `(io/reader *in*)` sees what the JVM does. Over jolt's own readers it used to
+  be the reader itself (so `(class (BufferedReader. sr))` was `StringReader`),
+  and over a Reader the program wrote it read one character at a time. `mark` and `reset` are the buffer's own, a line ending in
+  `\r\n` no longer leaves the `\n` for the next `read`, and a closed reader
+  answers `Stream closed`.
 
 ## [0.8.22] - 2026-10-15
 
