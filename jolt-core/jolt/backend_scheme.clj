@@ -1100,7 +1100,27 @@
                   ;; ftype-pointer-address answered ITS value as the layout's
                   ;; :alignment; the other four broke the compile.
                   "define-ftype" "make-ftype-pointer" "ftype-sizeof"
-                  "ftype-&ref" "ftype-pointer-address"}]
+                  "ftype-&ref" "ftype-pointer-address"
+                  ;; ftype and foreign-procedure syntax keywords, matched by
+                  ;; binding, so a local of the same name breaks the form.
+                  "array" "struct" "foreign-procedure" "__varargs_after"
+                  ;; Scheme procedures emitted bare: the try/finally fiber mask
+                  ;; (fx+ fx- fx>), the PIC and record-ctor caches, string and
+                  ;; keyword interop, symbol hashing, and the unsafe-prefixed ops
+                  ;; (fx= fl+ fl- vector-ref) on a target with no unsafe prefix.
+                  ;; (let [fx+ 1] (try 1 (finally nil))) called the local.
+                  "+" "=" "not" "eq?" "null?" "procedure?" "string?"
+                  "car" "cdr" "cons" "vector" "vector-ref" "vector-set!"
+                  "string-append" "string-length" "string-downcase" "string-upcase"
+                  "fx+" "fx-" "fx>" "fx=" "fx=?" "fx>=?" "fl+" "fl-"
+                  "flsingle" "flvector-ref" "flvector-set!"
+                  ;; runtime helpers emitted bare at boxed-float, record-field,
+                  ;; PIC, ffi, def, and image sites.
+                  "make-jfloat" "jfloat?" "jfloat-fl" "jfloat-unbox" "jnum->exact"
+                  "jrec-field-site-make" "jrec-field-site-ref" "jrec-pic-desc"
+                  "keyword-t?" "mark-macro!" "set-var-meta!" "throw-jvm"
+                  "def-var-linked!" "amap-slots->pmap"
+                  "image-fn-form-maker!" "image-fn-form-src" "image-register-fn-form!"}]
     (into from-registry helpers)))
 
 ;; A munged name both Scheme readers would take for a NUMBER rather than an
