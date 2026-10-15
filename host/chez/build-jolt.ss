@@ -737,7 +737,11 @@
                        (reverse order))
              (close-port out)
              (when (file-exists? build-boot-inputs) (delete-file build-boot-inputs))
-             (rename-file tmp build-boot-inputs)))
+             ;; make -j runs release and debug builds at once, and on Windows a
+             ;; rename onto a name the other just wrote raises (MoveFile does not
+             ;; replace). Both hashed the same sources, so its file stands.
+             (guard (e (#t (when (file-exists? tmp) (delete-file tmp))))
+               (rename-file tmp build-boot-inputs))))
          (let ((out (open-output-file src 'replace)))
            (for-each (lambda (l) (bld-inline-line l out 0)) lines)
            (close-port out))
@@ -753,7 +757,9 @@
                "(debug-on-exception #f)\n"
                "(fasl-compressed #t)\n"
                "(compile-file " (ei-str-lit src) " " (ei-str-lit so-tmp) ")\n"
-               "(rename-file " (ei-str-lit so-tmp) " " (ei-str-lit build-boot-so) ")\n"
+               ;; as for the inputs above: the other build's image stands
+               "(guard (e (#t (delete-file " (ei-str-lit so-tmp) ")))"
+               " (rename-file " (ei-str-lit so-tmp) " " (ei-str-lit build-boot-so) "))\n"
                "(delete-file " (ei-str-lit src) ")\n"
                "(delete-file " (ei-str-lit cs) ")\n"))
            (close-port p))
