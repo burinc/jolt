@@ -179,6 +179,50 @@
           ((port-ready-probe bp) => (lambda (probe) (probe)))
           (else (> (port-available bp) 0)))))
 
+;; InputStream.skip over a file moves the position instead of reading the bytes
+;; through: to the end of a 20MB file that is one lseek, where reading took 12ms.
+;; FileInputStream.skip is lseek(cur + n) and answers n, whether or not that is
+;; past the end (the next read then answers -1), and a target before the start
+;; of the file is IOException "Invalid argument", the errno text (JDK 25).
+;;
+;; A target the file system will not take (Long/MAX_VALUE on ext4, past its
+;; s_maxbytes) is the same IOException there; macOS takes it.
+;;
+;; Only a file stream takes this path: a port with no descriptor
+;; (ByteArrayInputStream, a pipe's or a zip entry's custom port) or one that
+;; cannot say where it is (a pipe or terminal on fd 0, which raises ESPIPE from
+;; port-position) answers #f and keeps the reading loop. A pushback stream has
+;; bytes of its own ahead of the port, so it stays on the loop too. A
+;; BufferedInputStream over a file (the markable stream) hands a forward skip to
+;; the file the way the JDK's does, and answers 0 for n <= 0.
+;; #f when the stream is not seekable, else the count skipped.
+(define (in-stream-skip-by-seek! self port n)
+  (and (not (and (in-stream-markable? self) (<= n 0)))
+       (not (in-stream-pushback self))
+       (not (piped-pipe self))
+       (let ((pos (guard (_ (#t #f))
+                    (and (port-file-descriptor port) (port-position port)))))
+         (and pos
+              (let ((target (+ pos n)))
+                (when (< target 0) (io-throw "Invalid argument"))
+                (guard (_ (#t (io-throw "Invalid argument")))
+                  (set-port-position! port target))
+                (->num n))))))
+
+;; InputStream.skip by reading: n <= 0 is 0, and the bytes go through a bounded
+;; buffer, so a count past the end (Long/MAX_VALUE) stops at end of stream.
+(define (in-stream-skip-by-reading! port n)
+  (if (<= n 0)
+      0
+      (let ((buf (make-bytevector (min n 8192))))
+        (let loop ((left n) (done 0))
+          (if (zero? left)
+              done
+              (let ((k (get-bytevector-n! port buf 0 (min left 8192))))
+                (if (eof-object? k)
+                    done
+                    (loop (- left k) (+ done k)))))))))
+
 (register-host-methods! "in-stream"
   (list
    (cons "read"
@@ -232,8 +276,10 @@
                             (begin (ja-bv->bytes! tmp 0 buf off n) (->num n)))))))))))
    (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
-   (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-live-port self) (jnum->exact n))))
-                                   (->num (if (eof-object? bv) 0 (bytevector-length bv))))))
+   (cons "skip" (lambda (self n)
+                  (let ((port (in-stream-live-port self)) (n (jnum->exact n)))
+                    (or (in-stream-skip-by-seek! self port n)
+                        (->num (in-stream-skip-by-reading! port n))))))
    (cons "available" (lambda (self) (->num (in-stream-available self))))
    ;; PushbackInputStream.unread — see the pushback section below. Any other
    ;; stream has no such method, and says so the way every missing method does.
@@ -1237,6 +1283,143 @@
                            (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
                              (let ((sub (make-bytevector len))) (bytevector-copy! bv off sub 0 len) sub))
                            bv))))))
+;; --- java.io.RandomAccessFile -------------------------------------------------
+;; state #(port writable?). One Chez file port serves both directions: "r" opens
+;; an input port, "rw" (and "rws"/"rwd", which differ only in how eagerly the JDK
+;; syncs) an input/output port that creates a missing file and keeps an existing
+;; one's contents. The port is unbuffered because the JDK's every read and write
+;; is a system call: a second handle on the file, or another process, sees a
+;; write the moment it returns, and a read sees what is on disk now.
+;;
+;; Messages are the JDK 25 ones, taken from a Java probe against the same cases.
+;; Every method on a closed file raises IOException "Stream Closed", including
+;; getFilePointer and length. A write on an "r" file is "Bad file descriptor" and
+;; its setLength "Invalid argument", the errno text of the system call that fails.
+(define (raf-port self)
+  (let ((p (vector-ref (jhost-state self) 0)))
+    (if (port-closed? p) (io-throw "Stream Closed") p)))
+(define (raf-writable? self) (vector-ref (jhost-state self) 1))
+(define (raf-writable-port self)
+  (let ((p (raf-port self)))
+    (unless (raf-writable? self) (io-throw "Bad file descriptor"))
+    p))
+(define (raf-mode mode)
+  (cond ((jolt-nil? mode)
+         (throw-jvm 'NullPointerException
+                    "Cannot invoke \"String.equals(Object)\" because \"mode\" is null"))
+        ((and (string? mode) (string=? mode "r")) 'r)
+        ((and (string? mode) (member mode '("rw" "rws" "rwd"))) 'rw)
+        (else (throw-jvm 'IllegalArgumentException
+                         (string-append "Illegal mode \"" (jolt-str-render-one mode)
+                                        "\" must be one of \"r\", \"rw\", \"rws\", or \"rwd\"")))))
+(define (raf-null-array!)
+  (throw-jvm 'NullPointerException "Cannot read the array length because \"b\" is null"))
+;; (buf) or (buf off len) -> buf, off, len; a range outside the array is the
+;; JDK's IndexOutOfBoundsException, which carries no message
+(define (raf-buffer-args who args)
+  (cond ((and (pair? args) (null? (cdr args)))
+         (when (jolt-nil? (car args)) (raf-null-array!))
+         (values (car args) 0 (ja-len (car args))))
+        ((and (pair? args) (pair? (cdr args)) (pair? (cddr args)) (null? (cdddr args)))
+         (when (jolt-nil? (car args)) (raf-null-array!))
+         (let ((off (jnum->exact (cadr args))) (len (jnum->exact (caddr args))))
+           (when (or (< off 0) (< len 0) (> (+ off len) (ja-len (car args))))
+             (throw-jvm 'IndexOutOfBoundsException jolt-nil))
+           (values (car args) off len)))
+        (else (throw-jvm 'IllegalArgumentException
+                         (string-append "No matching method " who " found taking "
+                                        (number->string (length args)) " args for class java.io.RandomAccessFile")))))
+;; Read up to LEN bytes into BUF at OFF, as many as the file has. The count, or
+;; #f at end of file; LEN 0 is 0 even there.
+(define (raf-read-into! self buf off len)
+  (let ((port (raf-port self)))
+    (if (fx=? len 0)
+        0
+        (let* ((tmp (make-bytevector len))
+               (n (get-bytevector-n! port tmp 0 len)))
+          (if (or (eof-object? n) (fx=? n 0))
+              #f
+              (begin (ja-bv->bytes! tmp 0 buf off n) n))))))
+(define (raf-length self)
+  (let ((port (raf-port self)))
+    (when (raf-writable? self) (flush-output-port port))
+    (port-length port)))
+
+(hashtable-set! jhost-tag->fqn "random-access-file" "java.io.RandomAccessFile")
+(register-host-methods! "random-access-file"
+  (list
+   (cons "read"
+         (lambda (self . args)
+           (if (null? args)
+               (let ((b (get-u8 (raf-port self)))) (if (eof-object? b) -1 (->num b)))
+               (let-values (((buf off len) (raf-buffer-args "read" args)))
+                 (->num (or (raf-read-into! self buf off len) -1))))))
+   (cons "readFully"
+         (lambda (self . args)
+           (let-values (((buf off len) (raf-buffer-args "readFully" args)))
+             (let ((n (raf-read-into! self buf off len)))
+               (when (and (fx>? len 0) (or (not n) (fx<? n len)))
+                 (throw-jvm 'EOFException jolt-nil))
+               jolt-nil))))
+   (cons "write"
+         (lambda (self x . rest)
+           (let ((port (raf-writable-port self)))
+             (if (number? x)
+                 (put-u8 port (bitwise-and (jnum->exact x) #xff))
+                 (let-values (((buf off len) (raf-buffer-args "write" (cons x rest))))
+                   (put-bytevector port (na-bytearray->bv buf) off len)))
+             (flush-output-port port)
+             jolt-nil)))
+   (cons "seek"
+         (lambda (self pos)
+           (let ((port (raf-port self)) (pos (jnum->exact pos)))
+             (when (< pos 0) (io-throw "Negative seek offset"))
+             (set-port-position! port pos)
+             jolt-nil)))
+   (cons "getFilePointer" (lambda (self) (->num (port-position (raf-port self)))))
+   (cons "length" (lambda (self) (->num (raf-length self))))
+   (cons "setLength"
+         (lambda (self new-len)
+           (let ((port (raf-port self)) (n (jnum->exact new-len)))
+             (when (or (< n 0) (not (raf-writable? self)))
+               (io-throw "Invalid argument"))
+             (let ((pos (port-position port)))
+               (set-port-length! port n)
+               ;; a pointer past the new end moves back to it, as the JDK does
+               (when (> pos n) (set-port-position! port n)))
+             jolt-nil)))
+   (cons "skipBytes"
+         (lambda (self n)
+           (let* ((len (raf-length self)) (port (raf-port self)) (n (jnum->exact n)))
+             (if (<= n 0)
+                 (->num 0)
+                 ;; the JDK's arithmetic: from a pointer past the end this
+                 ;; moves back to the end and answers a negative count
+                 (let* ((pos (port-position port))
+                        (new (min (+ pos n) len)))
+                   (set-port-position! port new)
+                   (->num (- new pos)))))))
+   (cons "close"
+         (lambda (self)
+           (let ((p (vector-ref (jhost-state self) 0)))
+             (unless (port-closed? p) (close-port p)))
+           jolt-nil))))
+(jch-register-supers! "java.io.RandomAccessFile" '("java.io.Closeable"))
+(reg-ctor! '("RandomAccessFile" "java.io.RandomAccessFile")
+  (lambda args
+    (unless (= (length args) 2)
+      (throw-jvm 'IllegalArgumentException "No matching ctor found for class java.io.RandomAccessFile"))
+    (let ((mode (raf-mode (cadr args))))
+      (when (jolt-nil? (car args)) (throw-jvm 'NullPointerException jolt-nil))
+      (open-file-guarded (car args)
+        (lambda (p)
+          (if (eq? mode 'r)
+              (make-jhost "random-access-file"
+                          (vector (open-file-input-port p (file-options) (buffer-mode none)) #f))
+              (make-jhost "random-access-file"
+                          (vector (open-file-input/output-port p (file-options no-fail no-truncate) (buffer-mode none))
+                                  #t))))))))
+
 ;; --- java.io.PrintStream ------------------------------------------------------
 ;; A byte stream that renders values as text. state #(target autoflush): the target
 ;; is anything answering write/flush — an out-stream, a port-writer, or a PROXY
