@@ -111,6 +111,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(bigint 1e30)` was `1000000000000000019884624838656N`, the double's exact
   binary value; it is `1000000000000000000000000000000N`, as on the JVM, which
   goes through `BigDecimal.valueOf`.
+- **`InetSocketAddress` resolves when it is built, as on the JVM.** It prints
+  `localhost/127.0.0.1:80`, `/127.0.0.1:80` for a literal and
+  `host/<unresolved>:80` when the lookup failed (it printed `host:port`);
+  `getAddress` of an unresolved one is `nil`; `getHostName` reverse-resolves a
+  literal; and `InetSocketAddress/createUnresolved` exists. Connecting to an
+  unresolved address raises `UnknownHostException`, binding to one
+  `SocketException`, and `(str (InetAddress/getByName "127.0.0.1"))` is
+  `/127.0.0.1`.
 - **`PrintWriter.checkError` reports the stream it wraps.** Over `System/out`
   with the reader gone it answered `false`; it now answers `true`, as
   `PrintStream.checkError` already did.

@@ -1036,18 +1036,6 @@
    :check :prose
    :why "needs a live TCP peer that resets the connection"
    :note "errno IS captured atomically per syscall; io-call just consumes it for retry classification instead of returning it, so error and orderly shutdown collapse to EOF. Writes DO throw (send's return distinguishes); only the read side is permissive."}
-  ;; getHostName does no reverse lookup. The JVM reverse-resolves a
-  ;; literal-address InetSocketAddress ("127.0.0.1" answers "localhost" when
-  ;; the nameservice maps it), which makes its value machine-dependent —
-  ;; the same reason the locale rows are uncertifiable. getHostString answers
-  ;; the literal on both and is the portable accessor.
-  {:category :host-model
-   :behavior "(.getHostName (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
-   :jvm "\"localhost\" — reverse lookup through the nameservice (machine-dependent)"
-   :jolt "\"127.0.0.1\" — the literal; no reverse lookup"
-   :check :prose
-   :why "the JVM answer is a reverse DNS lookup, so it is machine-dependent"
-   :note "Reverse DNS would need getnameinfo and makes the answer environment-dependent; the JVM's own javadoc flags the lookup. Use .getHostString for the literal on both. Caught certifying test/chez/socket-test.clj against the JVM."}
   ;; Interruption now reaches a PARKED thread as well as the flag: promise/future
   ;; deref, agent await, Thread.sleep/join, CountDownLatch.await, a task Future's
   ;; get, a blocking queue take/put, awaitTermination and Process.waitFor all throw
@@ -1223,14 +1211,6 @@
    :check :prose
    :why "needs process stdin, which the gate does not control"
    :note "A superset: on the JVM with-in-str is the only way to feed read-line. Reading the static per line costs one vector-ref."}
-  ;; InetSocketAddress.toString is host:port; the JVM renders hostname/ip:port.
-  {:category :host-model
-   :behavior "(str (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
-   :jvm "\"/127.0.0.1:80\" (hostname null for a literal; \"localhost/127.0.0.1:80\" for a name)"
-   :jolt "\"127.0.0.1:80\""
-   :check :prose
-   :why "needs (require 'jolt.socket), and the JVM rendering embeds a reverse-lookup hostname"
-   :note "jolt does not resolve in the InetSocketAddress constructor (the JVM does), so the hostname/ip split doesn't exist to render. Socket/ServerSocket toString follow the JVM shape."}
   ;; Process lifetime is Chez's, not the JVM's. A java.lang.Thread is a real OS
   ;; thread over fork-thread, but Chez exits when the main thread returns and does
   ;; not wait for the others — so every jolt thread behaves as a JVM DAEMON thread,

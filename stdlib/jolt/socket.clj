@@ -176,6 +176,12 @@
       :else (throw (java.io.IOException. (str "connect failed: " host ":" port))))))
 
 ;; -- Socket ------------------------------------------------------------------
+(declare make-isa ipv4-literal? inet-address->str)
+
+;; The peer's InetAddress: the host name it was reached by, none for a literal
+(defn- peer-address [self]
+  (let [h (jolt.host/ref-get self :host)]
+    (make-inet-address (if (ipv4-literal? h) "" h) (jolt.host/ref-get self :remote-addr))))
 
 (defn- socket-ctor [& args]
   (let [fd   (new-fd!)
@@ -246,6 +252,9 @@
   ;; timed-out socket is not left half-connected for the caller to reuse.
   (try
     (with-op self
+      (when (and (= :inet-socket-address (jolt.host/ref-get endpoint :jolt/type))
+                 (nil? (jolt.host/ref-get endpoint :addr)))
+        (throw (java.net.UnknownHostException. (str (jolt.host/ref-get endpoint :host)))))
       (let [h  (str (jolt.host/ref-get endpoint :host))
             p  (jolt.host/ref-get endpoint :port)
             fd (jolt.host/ref-get self :fd)
@@ -282,8 +291,7 @@
 
 (defn- socket->str [self]
   (if (jolt.host/ref-get self :connected?)
-    (str "Socket[addr=" (or (jolt.host/ref-get self :host) "")
-         "/" (or (jolt.host/ref-get self :remote-addr) "")
+    (str "Socket[addr=" (inet-address->str (peer-address self))
          ",port=" (or (jolt.host/ref-get self :port) 0)
          ",localport=" (or (jolt.host/ref-get self :local-port) 0) "]")
     "Socket[unconnected]"))
@@ -337,15 +345,13 @@
 
    "getInetAddress"
    (fn [self]
-     (make-inet-address (jolt.host/ref-get self :host)
-                        (jolt.host/ref-get self :remote-addr)))
+     (when (jolt.host/ref-get self :connected?) (peer-address self)))
 
    "getRemoteSocketAddress"
    (fn [self]
-     (doto (tt :inet-socket-address "java.net.InetSocketAddress")
-       (jolt.host/ref-put! :host (or (jolt.host/ref-get self :remote-addr)
-                                     (jolt.host/ref-get self :host)))
-       (jolt.host/ref-put! :port (jolt.host/ref-get self :port))))})
+     (when (jolt.host/ref-get self :connected?)
+       (make-isa (jolt.host/ref-get self :host) (peer-address self)
+                 (jolt.host/ref-get self :port))))})
 
 ;; -- SocketInputStream -------------------------------------------------------
 (defn- io-call
@@ -581,8 +587,15 @@
     (throw (java.net.SocketException. "Socket is closed")))
   (when (jolt.host/ref-get self :bound?)
     (throw (java.net.SocketException. "Already bound")))
-  (let [h  (str (or (jolt.host/ref-get endpoint :host) "0.0.0.0"))
-        p  (int (or (jolt.host/ref-get endpoint :port) 0))
+  (when (and endpoint (= :inet-socket-address (jolt.host/ref-get endpoint :jolt/type))
+             (nil? (jolt.host/ref-get endpoint :addr)))
+    (throw (java.net.SocketException. "Unresolved address")))
+  (let [h  (str (or (when endpoint
+                      (let [a (jolt.host/ref-get endpoint :addr)]
+                        (or (and a (jolt.host/ref-get a :address))
+                            (jolt.host/ref-get endpoint :host))))
+                    "0.0.0.0"))
+        p  (int (or (and endpoint (jolt.host/ref-get endpoint :port)) 0))
         fd (jolt.host/ref-get self :fd)]
     (bind-listen! fd h p backlog false)
     (jolt.host/ref-put! self :bound? true)
@@ -647,70 +660,6 @@
                       -1))
    "toString"     server->str})
 
-;; -- InetSocketAddress -------------------------------------------------------
-(defn- isa-ctor [& args]
-  ;; (InetSocketAddress. port) is the wildcard address, like Java.
-  (let [h (if (= 1 (count args)) "0.0.0.0" (host-arg->str (first args)))
-        p (int (if (= 1 (count args)) (first args) (second args)))]
-    (doto (tt :inet-socket-address "java.net.InetSocketAddress")
-      (jolt.host/ref-put! :host h)
-      (jolt.host/ref-put! :port p))))
-
-(defn- isa->str [self]
-  (str (or (jolt.host/ref-get self :host) "0.0.0.0")
-       ":" (or (jolt.host/ref-get self :port) 0)))
-
-(defn- ip-hash [ip]
-  (unchecked-int
-   (reduce (fn [acc o] (bit-or (bit-shift-left acc 8) (Integer/parseInt o)))
-           0
-           (str/split ip #"\."))))
-
-;; The JVM's InetSocketAddress(host, port) resolves the host when it is built and
-;; compares and hashes by that address and the port; one whose host did not
-;; resolve compares by host name ignoring case. This resolves on first need
-;; and caches the answer (:ip, or :unresolved).
-(defn- isa-ip [self]
-  (let [c (jolt.host/ref-get self :ip)]
-    (if (some? c)
-      (when-not (= :unresolved c) c)
-      (let [ip (try (resolve-host (or (jolt.host/ref-get self :host) "0.0.0.0"))
-                    (catch java.io.IOException _ nil))]
-        (jolt.host/ref-put! self :ip (or ip :unresolved))
-        ip))))
-
-(defn- isa= [a b]
-  (boolean
-   (and (= :inet-socket-address (jolt.host/ref-get b :jolt/type))
-        (= (jolt.host/ref-get a :port) (jolt.host/ref-get b :port))
-        (let [ia (isa-ip a) ib (isa-ip b)]
-          (if ia
-            (= ia ib)
-            (and (nil? ib)
-                 (= (str/lower-case (str (jolt.host/ref-get a :host)))
-                    (str/lower-case (str (jolt.host/ref-get b :host))))))))))
-
-(defn- isa-hash [self]
-  (unchecked-int
-   (+ (if-let [ip (isa-ip self)]
-        (ip-hash ip)
-        (.hashCode (str/lower-case (str (jolt.host/ref-get self :host)))))
-      (or (jolt.host/ref-get self :port) 0))))
-
-(def ^:private inet-socket-address-methods
-  {"getHostName"   (fn [self] (or (jolt.host/ref-get self :host) "0.0.0.0"))
-   "getHostString" (fn [self] (or (jolt.host/ref-get self :host) "0.0.0.0"))
-   "getPort"       (fn [self] (or (jolt.host/ref-get self :port) 0))
-   "isUnresolved"  (fn [self] (nil? (isa-ip self)))
-   "equals"        (fn [self other] (isa= self other))
-   "hashCode"      (fn [self] (isa-hash self))
-   "getAddress"
-   (fn [self]
-     (let [h (or (jolt.host/ref-get self :host) "0.0.0.0")]
-       (make-inet-address h (try (resolve-host h)
-                                 (catch java.io.IOException _ nil)))))
-   "toString"      isa->str})
-
 ;; -- host identity: local host + network interfaces ---------------------------
 
 (defn- ifaddr-entries
@@ -731,6 +680,18 @@
        (native/interface-addresses)))
 
 ;; -- InetAddress --------------------------------------------------------------
+(def ^:private ipv4-literal #"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})")
+
+(defn- ipv4-literal? [h]
+  (boolean (when-let [m (re-matches ipv4-literal (str h))]
+             (every? #(<= (Integer/parseInt %) 255) (rest m)))))
+
+(defn- ip-hash [ip]
+  (unchecked-int
+   (reduce (fn [acc o] (bit-or (bit-shift-left acc 8) (Integer/parseInt o)))
+           0
+           (str/split ip #"\."))))
+
 (defn- inet-address-ctor [& _]
   (make-inet-address "localhost" "127.0.0.1"))
 
@@ -793,7 +754,8 @@
 
 (def ^:private inet-address-statics
   {"getByName"
-   (fn [h] (make-inet-address (str h) (resolve-host h)))
+   ;; a literal carries no name until getHostName asks: (str) is /127.0.0.1
+   (fn [h] (make-inet-address (if (ipv4-literal? h) "" (str h)) (resolve-host h)))
    "getAllByName"
    ;; an array, as on the JVM, so alength and aget hold on the result.
    (fn [h] (object-array (mapv (fn [ip] (make-inet-address (str h) ip))
@@ -813,6 +775,94 @@
              (first (remove (fn [ip] (= "127.0.0.1" ip))
                             (keep :ip (ifaddr-entries))))
              "127.0.0.1"))))})
+
+;; -- InetSocketAddress -------------------------------------------------------
+;; As the JDK's: (InetSocketAddress. host port) resolves host when it is built and
+;; keeps the InetAddress (:addr), or none when the lookup failed; createUnresolved
+;; never looks. :host is the host string as given (getHostString), :port the port.
+;; A literal host carries no name until getHostName asks for one, so it prints
+;; /127.0.0.1:80, and an unresolved one prints host/<unresolved>:80.
+(defn- make-isa [host addr port]
+  (doto (tt :inet-socket-address "java.net.InetSocketAddress")
+    (jolt.host/ref-put! :host host)
+    (jolt.host/ref-put! :addr addr)
+    (jolt.host/ref-put! :port (int port))))
+
+(defn- check-port! [p]
+  (when-not (<= 0 p 65535)
+    (throw (IllegalArgumentException. (str "port out of range:" p))))
+  p)
+
+(defn- inet-address-of
+  "The InetAddress host names, or nil when it does not resolve."
+  [host]
+  (if (ipv4-literal? host)
+    (make-inet-address "" (str host))
+    (try (make-inet-address (str host) (resolve-host host))
+         (catch java.io.IOException _ nil))))
+
+(defn- isa-ctor [& args]
+  (case (count args)
+    ;; (InetSocketAddress. port): the wildcard address, like Java
+    1 (make-isa "0.0.0.0" (make-inet-address "0.0.0.0" "0.0.0.0") (check-port! (int (first args))))
+    (let [[h p] args
+          p (check-port! (int p))]
+      (cond
+        (= :inet-address (jolt.host/ref-get h :jolt/type))
+        (make-isa (let [n (jolt.host/ref-get h :host)]
+                    (if (str/blank? n) (jolt.host/ref-get h :address) n))
+                  h p)
+        (nil? h) (make-isa "0.0.0.0" (make-inet-address "0.0.0.0" "0.0.0.0") p)
+        :else (make-isa (str h) (inet-address-of h) p)))))
+
+(defn- isa-unresolved [host port]
+  (when (nil? host) (throw (IllegalArgumentException. "hostname can't be null")))
+  (make-isa (str host) nil (check-port! (int port))))
+
+(defn- isa-addr [self] (jolt.host/ref-get self :addr))
+
+(defn- isa->str [self]
+  (let [a (isa-addr self)]
+    (str (if a
+           (inet-address->str a)
+           (str (jolt.host/ref-get self :host) "/<unresolved>"))
+         ":" (or (jolt.host/ref-get self :port) 0))))
+
+;; InetSocketAddressHolder.equals/hashCode: by address and port when resolved,
+;; by host name ignoring case when not, and a resolved one never equals an
+;; unresolved one.
+(defn- isa= [a b]
+  (boolean
+   (and (= :inet-socket-address (jolt.host/ref-get b :jolt/type))
+        (= (jolt.host/ref-get a :port) (jolt.host/ref-get b :port))
+        (let [ia (isa-addr a) ib (isa-addr b)]
+          (if ia
+            (and ib (inet-address= ia ib))
+            (and (nil? ib)
+                 (= (str/lower-case (str (jolt.host/ref-get a :host)))
+                    (str/lower-case (str (jolt.host/ref-get b :host))))))))))
+
+(defn- isa-hash [self]
+  (unchecked-int
+   (+ (if-let [a (isa-addr self)]
+        (inet-address-hash a)
+        (.hashCode (str/lower-case (str (jolt.host/ref-get self :host)))))
+      (or (jolt.host/ref-get self :port) 0))))
+
+(def ^:private inet-socket-address-methods
+  {"getHostName"   (fn [self] (if-let [a (isa-addr self)]
+                                ((get inet-address-methods "getHostName") a)
+                                (jolt.host/ref-get self :host)))
+   "getHostString" (fn [self] (jolt.host/ref-get self :host))
+   "getPort"       (fn [self] (or (jolt.host/ref-get self :port) 0))
+   "isUnresolved"  (fn [self] (nil? (isa-addr self)))
+   "equals"        (fn [self other] (isa= self other))
+   "hashCode"      (fn [self] (isa-hash self))
+   "getAddress"    (fn [self] (isa-addr self))
+   "toString"      isa->str})
+
+(def ^:private inet-socket-address-statics
+  {"createUnresolved" isa-unresolved})
 
 ;; -- java.util.Enumeration ----------------------------------------------------
 ;; NetworkInterface hands back Enumerations, which enumeration-seq drives
@@ -924,6 +974,8 @@
 
     (clojure.core/__register-class-ctor! "InetSocketAddress" isa-ctor)
     (clojure.core/__register-class-ctor! "java.net.InetSocketAddress" isa-ctor)
+    (clojure.core/__register-class-statics! "InetSocketAddress" inet-socket-address-statics)
+    (clojure.core/__register-class-statics! "java.net.InetSocketAddress" inet-socket-address-statics)
 
     (clojure.core/__register-class-ctor! "InetAddress" inet-address-ctor)
     (clojure.core/__register-class-ctor! "java.net.InetAddress" inet-address-ctor)
