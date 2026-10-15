@@ -624,15 +624,71 @@
               (let loop ((acc '()))
                 (let ((st (iconv-guardian)))
                   (if st (loop (cons st acc)) acc))))))
+;; The ISO-2022 charsets switch between single- and double-byte runs. When a
+;; read ends inside a double-byte character, glibc's iconv stops before it
+;; (EINVAL), but Apple's decodes the dangling byte as ASCII and loses the shift
+;; state, so the next read comes out wrong. A step on these charsets therefore
+;; hands iconv only whole characters and keeps the shift state itself: ESC $ ...
+;; (JP) or SO (KR/CN) starts a double-byte run, ESC ( ... or SI ends it, and in
+;; one, bytes 0x21-0x7E pair up while a control byte stands alone.
+(define (iso2022-family name)
+  (let ((n (string-downcase name)))
+    (cond ((iconv-name-has? n "2022-jp") 'jp)
+          ((or (iconv-name-has? n "2022-kr") (iconv-name-has? n "2022-cn")) 'so)
+          (else #f))))
+(define (iconv-name-has? s sub)
+  (let ((n (string-length s)) (k (string-length sub)))
+    (let loop ((i 0))
+      (and (<= (+ i k) n)
+           (or (string=? (substring s i (+ i k)) sub) (loop (+ i 1)))))))
+;; Scan BV[lo,hi) from shift state DOUBLE? (#t inside a double-byte run): the
+;; last position that ends a whole character or escape, and the state there.
+(define (iso2022-scan family bv lo hi double?)
+  (let loop ((i lo) (dbl double?) (safe lo) (safe-dbl double?))
+    (if (fx>=? i hi)
+        (values safe safe-dbl)
+        (let ((b (bytevector-u8-ref bv i)))
+          (cond
+            ((fx=? b 27)                          ; ESC intermediates* final
+             (let esc ((j (fx+ i 1)))
+               (cond ((fx>=? j hi) (values safe safe-dbl))
+                     ((fx<=? #x20 (bytevector-u8-ref bv j) #x2f) (esc (fx+ j 1)))
+                     (else
+                      (let ((d (if (and (eq? family 'jp) (fx>? j (fx+ i 1)))
+                                   (case (integer->char (bytevector-u8-ref bv (fx+ i 1)))
+                                     ((#\$) #t) ((#\() #f) (else dbl))
+                                   dbl)))
+                        (loop (fx+ j 1) d (fx+ j 1) d))))))
+            ((and (eq? family 'so) (fx=? b 14)) (loop (fx+ i 1) #t (fx+ i 1) #t))
+            ((and (eq? family 'so) (fx=? b 15)) (loop (fx+ i 1) #f (fx+ i 1) #f))
+            ((and dbl (fx<=? #x21 b #x7e))
+             (if (fx<? (fx+ i 1) hi)
+                 (loop (fx+ i 2) dbl (fx+ i 2) dbl)
+                 (values safe safe-dbl)))
+            (else
+             ;; a newline ends a KR/CN double-byte run
+             (let ((d (if (and (eq? family 'so) (fx=? b 10)) #f dbl)))
+               (loop (fx+ i 1) d (fx+ i 1) d))))))))
 (define (make-iconv-decoder name)
   (iconv-drain!)
   (let ((pcd (iconv-open-cd name "UTF-8")))
     (and pcd
-         (let ((st (vector (car pcd) (cdr pcd))))
+         (let ((st (vector (car pcd) (cdr pcd) (iso2022-family name) #f)))
            (jolt-with-mutex iconv-guardian-mu (iconv-guardian st))
            (cons (lambda (bv lo hi eof?) (iconv-step st bv lo hi eof?))
                  (lambda () (iconv-state-close! st)))))))
 (define (iconv-step st bv lo hi eof?)
+  (let ((family (vector-ref st 2)))
+    (if (not family)
+        (iconv-step* st bv lo hi eof?)
+        (let-values (((safe d) (if eof? (values hi #f)
+                                   (iso2022-scan family bv lo hi (vector-ref st 3)))))
+          (let-values (((str next) (iconv-step* st bv lo safe eof?)))
+            ;; the state where iconv stopped, which is SAFE unless it stopped short
+            (vector-set! st 3 (if (fx=? next safe) d
+                                  (let-values (((p d2) (iso2022-scan family bv lo next (vector-ref st 3)))) d2)))
+            (values str next))))))
+(define (iconv-step* st bv lo hi eof?)
   (let* ((conv (vector-ref (vector-ref st 0) 1))
          (cd (vector-ref st 1))
          (n (fx- hi lo))
