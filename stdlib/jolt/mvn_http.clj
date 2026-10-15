@@ -54,19 +54,22 @@
      "/usr/local/opt/openssl@3/lib/libssl.dylib"]
     ssl-names))
 
-;; Windows has no OpenSSL of its own, but Git for Windows ships OpenSSL 3 under
-;; mingw64/bin: the machine-wide install under ProgramFiles (ProgramW6432 is the
-;; same directory as a 32-bit process sees it) and the per-user one under
+;; Windows has no OpenSSL of its own, but Git for Windows ships OpenSSL 3: under
+;; ucrt64/bin from 2.56 (its MINGW64 -> UCRT64 move left no mingw64 directory),
+;; under mingw64/bin before that. Both are tried, the current layout first, in
+;; the machine-wide install under ProgramFiles (ProgramW6432 is the same
+;; directory as a 32-bit process sees it) and the per-user one under
 ;; LOCALAPPDATA/Programs. Pure over its three roots so the gate can pin the
 ;; list. One entry per directory: Windows compares paths without case, and a
 ;; root may arrive with a trailing separator.
 (defn- windows-openssl-libdirs-for [program-files program-w6432 local-app-data]
   (let [trimmed (fn [root] (str/replace root #"[\\/]+$" ""))
-        dirs (for [[root suffix] [[program-files "Git\\mingw64\\bin"]
-                                  [program-w6432 "Git\\mingw64\\bin"]
-                                  [local-app-data "Programs\\Git\\mingw64\\bin"]]
-                   :when (not (str/blank? root))]
-               (str (trimmed root) "\\" suffix))]
+        dirs (for [[root git] [[program-files "Git"]
+                               [program-w6432 "Git"]
+                               [local-app-data "Programs\\Git"]]
+                   :when (not (str/blank? root))
+                   env ["ucrt64" "mingw64"]]
+               (str (trimmed root) "\\" git "\\" env "\\bin"))]
     (loop [dirs dirs seen #{} acc []]
       (if-let [[d & more] (seq dirs)]
         (let [k (str/lower-case d)]

@@ -130,11 +130,14 @@
        (lib-candidates ["C:\\Git\\mingw64\\bin" "C:/ssl/bin"] ["libssl-3-x64.dll"] ["libssl-3-x64.dll"])
        "lib-candidates: each candidate keeps its directory's separator")
 
-  ;; Git for Windows' mingw64/bin, from the three roots that place it, with
-  ;; native separators; the machine-wide root usually arrives twice (ProgramFiles
-  ;; and ProgramW6432 name the same directory, and Windows compares paths
-  ;; without case), a trailing separator on a root adds nothing.
-  (ok= ["C:\\Program Files\\Git\\mingw64\\bin"
+  ;; Git for Windows' ucrt64/bin (2.56 on) then mingw64/bin (before 2.56), from
+  ;; the three roots that place it, with native separators; the machine-wide
+  ;; root usually arrives twice (ProgramFiles and ProgramW6432 name the same
+  ;; directory, and Windows compares paths without case), a trailing separator
+  ;; on a root adds nothing.
+  (ok= ["C:\\Program Files\\Git\\ucrt64\\bin"
+        "C:\\Program Files\\Git\\mingw64\\bin"
+        "C:\\Users\\me\\AppData\\Local\\Programs\\Git\\ucrt64\\bin"
         "C:\\Users\\me\\AppData\\Local\\Programs\\Git\\mingw64\\bin"]
        (windows-libdirs "C:\\Program Files" "c:\\program files\\"
                         "C:\\Users\\me\\AppData\\Local")
@@ -146,10 +149,10 @@
   ;; The directory list ensure-native! builds: JOLT_OPENSSL_LIBDIR first when
   ;; set, then (Windows only) the Git for Windows directories, so the bare
   ;; names the loader searches PATH for come last.
-  (ok= ["/nix/lib" "C:\\Program Files\\Git\\mingw64\\bin"]
+  (ok= ["/nix/lib" "C:\\Program Files\\Git\\ucrt64\\bin" "C:\\Program Files\\Git\\mingw64\\bin"]
        (openssl-libdirs "/nix/lib" true "C:\\Program Files" nil nil)
        "openssl-libdirs: the explicit directory precedes the Git ones")
-  (ok= ["C:\\Program Files\\Git\\mingw64\\bin"]
+  (ok= ["C:\\Program Files\\Git\\ucrt64\\bin" "C:\\Program Files\\Git\\mingw64\\bin"]
        (openssl-libdirs "  " true "C:\\Program Files" nil nil)
        "openssl-libdirs: a blank JOLT_OPENSSL_LIBDIR is unset")
   (ok= []
