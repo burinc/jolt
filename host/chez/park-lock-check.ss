@@ -187,8 +187,10 @@
     (walk-forms body in-lock? emit)))
 
 (define (walk-lambda-body d in-lock? emit)
-  ;; (lambda formals body …) — formals are names, never calls
-  (walk-forms (cddr d) in-lock? emit))
+  ;; (lambda formals body …) — formals are names, never calls. A bare (lambda)
+  ;; is no form: it is the literals list of a (syntax-rules (lambda) …), data.
+  (when (pair? (cdr d))
+    (walk-forms (cddr d) in-lock? emit)))
 
 (define (walk-case-lambda d in-lock? emit)
   (for-each (lambda (cl) (when (pair? cl) (walk-forms (cdr cl) in-lock? emit)))
