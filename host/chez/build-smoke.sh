@@ -1955,4 +1955,28 @@ if [ "$got_dr" != "$want_dr" ]; then
 fi
 rm -rf "$dr"
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include + dep-resources)"
+# --- defs named after heads the back end emits bare ----------------------------
+# A def is a Scheme define in the app unit, so one named vector shadowed the
+# (vector ...) the record ctor emits, and 0.8.21 failed to compile it.
+sh_d="$(mktemp -d)"; mkdir -p "$sh_d/src/sh"
+cat > "$sh_d/src/sh/core.clj" <<'SH_EOF'
+(ns sh.core)
+(defrecord P [a b])
+(defn vector [x] [:mine x])
+(defn cons [x] (list :mine x))
+(defn not [x] (if x :no :yes))
+(defn fx+ [x] (try (inc x) (finally nil)))
+(defn -main [& _] (println (vector 1) (cons 2) (not nil) (fx+ 3) (:b (->P 4 5))))
+SH_EOF
+for dl in "" "--direct-link"; do
+  if ! JOLT_PWD="$sh_d" "$jolt" build -m sh.core -o "$sh_d/bin" $dl >"$sh_d/build.log" 2>&1; then
+    echo "  FAIL: a def named after an emitted head broke the build $dl"; tail -5 "$sh_d/build.log"; exit 1
+  fi
+  got_sh="$("$sh_d/bin" 2>&1)"
+  if [ "$got_sh" != "[:mine 1] (:mine 2) :yes 4 5" ]; then
+    echo "  FAIL: defs named after emitted heads $dl: got $got_sh"; exit 1
+  fi
+done
+rm -rf "$sh_d"
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include + dep-resources + emitted-head-defs)"
