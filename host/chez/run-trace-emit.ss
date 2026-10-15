@@ -194,8 +194,9 @@
   ;; under its bare munged name (the direct-link-build form); with it on (dev,
   ;; open-world build) the same site registers "clojure.core/+". The trailing
   ;; #t is the tail? flag (R4) — chain reconstruction follows tail edges only.
+  ;; + is $R+: munge-name renames it, as the back end emits + bare.
   (gate-check "(10b) callsite registered with its static callee"
-              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"+\" #t)") #t))
+              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"$R+\" #t)") #t))
 (set-trace-frames! #f)
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) tracing off: no site store" (gate-sub? e "(jolt-site! ") #f)
