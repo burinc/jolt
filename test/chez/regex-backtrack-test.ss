@@ -112,6 +112,27 @@
   (with-mutex m (let wait () (unless (= done 4) (condition-wait c m) (wait))))
   (ok "concurrent matches of one pattern agree with a lone one" (= bad 0)))
 
+;; A thread forked after this one has run a memoized match inherits every thread
+;; parameter it set, as the same object, so per-attempt state kept in one was
+;; shared: each thread's attempt reset the memo the others were using, and the
+;; exponential rows went exponential again. Each thread here must finish its
+;; matches within the budget while the others run the same ones.
+(let* ((p "(a|aa)*b")
+       (s (make-string 30 #\a))
+       (_ (budgeted-finds p s))
+       (m (make-mutex)) (c (make-condition)) (done 0) (bad 0))
+  (do ((t 0 (+ t 1))) ((= t 4))
+    (fork-thread
+      (lambda ()
+        ;; each thread its own string: another thread's attempt pointed the
+        ;; shared memo at its string, which switched it off for this one
+        (do ((k 0 (+ k 1)) (s (string-copy s))) ((= k 20))
+          (unless (equal? (budgeted-finds p s) '())
+            (with-mutex m (set! bad (+ bad 1)))))
+        (with-mutex m (set! done (+ done 1)) (condition-broadcast c)))))
+  (with-mutex m (let wait () (unless (= done 4) (condition-wait c m) (wait))))
+  (ok "threads forked after a memoized match keep their own memo" (= bad 0)))
+
 ;; jolt-t16: a union of char sets is a sorted, disjoint range list, whatever the
 ;; order its parts overlap in. Checked against membership over random sets.
 (define (members cs) (filter (lambda (i) (cset-contains? cs (integer->char i))) (iota 130)))

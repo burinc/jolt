@@ -257,20 +257,55 @@
 ;; continuation is compiled once, so it is kept in a per-repetition cell: %iterate
 ;; records (src . i) before entering the body and puts the previous value back
 ;; when the body fails, so a backtrack into an earlier iteration finds that
-;; iteration's start again.  The cell is a THREAD parameter because a compiled
-;; pattern is cached and shared, and two threads matching it at once must not see
-;; each other's positions.  Only a body %sre-nullable? says can be empty pays any
-;; of this; every other repetition compiles exactly as irregex wrote it.
+;; iteration's start again.  Only a body %sre-nullable? says can be empty pays
+;; any of this; every other repetition compiles exactly as irregex wrote it.
+;;
+;; Per-attempt state lives in the match vector, never in anything shared. A
+;; compiled pattern is cached and run by many threads at once, and a fiber can be
+;; preempted mid-match and resume after another fiber has matched on the same
+;; carrier, or on another carrier: a thread parameter is shared by the threads
+;; forked after it was set (they inherit the same object) and by the fibers of
+;; one carrier. The match vector is made for each search by its caller and
+;; reaches every step as `matches`. irregex sizes it for one group more than the
+;; pattern has and uses only that group's last slot (the backtrack fail), so the
+;; three before it are free: one holds the memo state below, one the cells.
+;; irregex clears them with the groups between attempts.
+(define (%memo-slot matches) (fx- (vector-length matches) 4))
+(define (%cells-slot matches) (fx- (vector-length matches) 3))
+
+;; A cell is an index into the attempt's cell vector, numbered when the pattern
+;; is compiled (%new-cell!); the vector grows to take a cell compiled later (a
+;; counted body is compiled on first use).
+(define (%cell-ref matches k)
+  (let ((v (vector-ref matches (%cells-slot matches))))
+    (and (vector? v) (fx< k (vector-length v)) (vector-ref v k))))
+(define (%cell-set! matches k x)
+  (let* ((slot (%cells-slot matches))
+         (v (vector-ref matches slot)))
+    (if (and (vector? v) (fx< k (vector-length v)))
+        (vector-set! v k x)
+        (let ((w (make-vector (fxmax (fx+ k 1) (fx* 2 (if (vector? v) (vector-length v) 4))) #f)))
+          (when (vector? v)
+            (do ((j 0 (fx+ j 1))) ((fx= j (vector-length v))) (vector-set! w j (vector-ref v j))))
+          (vector-set! w k x)
+          (vector-set! matches slot w)))))
+
+(define %cell-counter 0)
+(define %cell-mutex (make-mutex))
+(define (%new-cell!)
+  (with-mutex %cell-mutex
+    (let ((k %cell-counter)) (set! %cell-counter (fx+ k 1)) k)))
+
 (define (%iterate cell body cnk init src str i end matches fail)
-  (let ((old (cell)))
-    (cell (cons src i))
+  (let ((old (%cell-ref matches cell)))
+    (%cell-set! matches cell (cons src i))
     (body cnk init src str i end matches
-          (lambda () (cell old) (fail)))))
+          (lambda () (%cell-set! matches cell old) (fail)))))
 
 ;; Did the iteration whose body just matched up to (src, i) consume nothing?
-(define (%iteration-empty? cell src i)
-  (let ((start (cell)))
-    (and (eq? (car start) src) (eqv? (cdr start) i))))
+(define (%iteration-empty? cell matches src i)
+  (let ((start (%cell-ref matches cell)))
+    (and (pair? start) (eq? (car start) src) (eqv? (cdr start) i))))
 
 ;; jolt-0e5k: java.util.regex compiles a capturing group whose body always
 ;; matches exactly nothing — (^), (), (\b), ((?=x)) — and is quantified greedily
@@ -313,7 +348,7 @@
 (define (%after-iteration nullable? cell next more)
   (if nullable?
       (lambda (cnk init src str i end matches fail)
-        (if (%iteration-empty? cell src i)
+        (if (%iteration-empty? cell matches src i)
             (next cnk init src str i end matches fail)
             (more cnk init src str i end matches fail)))
       more))
@@ -364,11 +399,10 @@
 ;; dormant until the attempt has made %memo-threshold loop decisions: an ordinary
 ;; match never gets there, so it pays a counter and no table, while a search that
 ;; is going exponential passes it almost at once. Remembering only some failures
-;; is as sound as remembering all of them. The state is a per-thread vector, like
-;; the %iterate cell a thread parameter because a compiled pattern is shared, and
-;; reused across attempts:  #(chunk decisions table).
+;; is as sound as remembering all of them. The state is #(chunk decisions table),
+;; made fresh for each attempt in the match vector's memo slot (%memo-slot).
 ;; Answers #f when no loop qualifies, else
-;;   #(loop-node->id  number-of-ids  state-param).
+;;   #(loop-node->id  number-of-ids).
 (define (%loop-memo-plan sre)
   (define ids (make-eq-hashtable))
   (define count 0)
@@ -399,15 +433,14 @@
         (else (walk* (cdr x) top?)))))
   (walk sre #t)
   (and (not backref?) (> count 0)
-       (vector ids count (make-thread-parameter #f))))
+       (vector ids count)))
 
 (define %memo-threshold 512)
 
 (define (%memo-wrap plan id decide)
-  (let ((width (vector-ref plan 1))
-        (state (vector-ref plan 2)))
+  (let ((width (vector-ref plan 1)))
     (lambda (cnk init src str i end matches fail)
-      (let* ((st (state))
+      (let* ((st (vector-ref matches (%memo-slot matches)))
              (n (fx+ (vector-ref st 1) 1)))
         (vector-set! st 1 n)
         (if (or (fx< n %memo-threshold) (not (eq? src (vector-ref st 0))))
@@ -427,13 +460,9 @@
 
 ;; The compiled pattern, behind a fresh memo for each attempt.
 (define (%memo-root plan root)
-  (let ((state (vector-ref plan 2)))
-    (lambda (cnk init src str i end matches fail)
-      (let ((st (state)))
-        (if st
-            (begin (vector-set! st 0 src) (vector-set! st 1 0) (vector-set! st 2 #f))
-            (state (vector src 0 #f))))
-      (root cnk init src str i end matches fail))))
+  (lambda (cnk init src str i end matches fail)
+    (vector-set! matches (%memo-slot matches) (vector src 0 #f))
+    (root cnk init src str i end matches fail)))
 
 (define (sre->procedure sre . o)
   (define names
@@ -536,7 +565,7 @@
                ;; memoized when %loop-memo-plan says it may be.
                (let* ((x (sre-sequence (cdr sre)))
                       (nullable? (%sre-nullable? x))
-                      (cell (make-thread-parameter #f)))
+                      (cell (%new-cell!)))
                  (letrec*
                      ((more
                        (memoize sre
@@ -550,7 +579,7 @@
             ((*?)
              (let* ((x (sre-sequence (cdr sre)))
                     (nullable? (%sre-nullable? x))
-                    (cell (make-thread-parameter #f)))
+                    (cell (%new-cell!)))
                ;; lazy: what follows first, then one more iteration.
                (letrec*
                    ((try
@@ -566,7 +595,7 @@
             ((+)
              (let* ((x (sre-sequence (cdr sre)))
                     (nullable? (%sre-nullable? x))
-                    (cell (make-thread-parameter #f)))
+                    (cell (%new-cell!)))
                ;; the first iteration is required; after it, `more` as for `*`.
                (letrec*
                    ((more
@@ -604,7 +633,7 @@
                       (to (caddr sre))
                       (x (sre-sequence (cdddr sre)))
                       (nullable? (%sre-nullable? x))
-                      (cell (make-thread-parameter #f)))
+                      (cell (%new-cell!)))
                  (define (enter b cnk init src str i end matches fail)
                    (if nullable?
                        (%iterate cell b cnk init src str i end matches fail)
@@ -620,7 +649,7 @@
                               (lambda (cnk init src str i end matches fail)
                                 (cond
                                  ((or (and to (= count to))
-                                      (and nullable? (%iteration-empty? cell src i)))
+                                      (and nullable? (%iteration-empty? cell matches src i)))
                                   (next cnk init src str i end matches fail))
                                  ((and (not to) (>= count from))
                                   (more cnk init src str i end matches fail))
@@ -658,7 +687,7 @@
                       (to (caddr sre))
                       (x (sre-sequence (cdddr sre)))
                       (nullable? (%sre-nullable? x))
-                      (cell (make-thread-parameter #f)))
+                      (cell (%new-cell!)))
                  (define (enter b cnk init src str i end matches fail)
                    (if nullable?
                        (%iterate cell b cnk init src str i end matches fail)
@@ -670,7 +699,7 @@
                           (lp x n flags
                               (lambda (cnk init src str i end matches fail)
                                 (cond
-                                 ((and nullable? (%iteration-empty? cell src i))
+                                 ((and nullable? (%iteration-empty? cell matches src i))
                                   (next cnk init src str i end matches fail))
                                  ((< count from)
                                   (enter (body (+ 1 count)) cnk init
