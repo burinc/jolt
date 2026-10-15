@@ -1393,8 +1393,10 @@
            (let* ((len (raf-length self)) (port (raf-port self)) (n (jnum->exact n)))
              (if (<= n 0)
                  (->num 0)
+                 ;; the JDK's arithmetic: from a pointer past the end this
+                 ;; moves back to the end and answers a negative count
                  (let* ((pos (port-position port))
-                        (new (max pos (min (+ pos n) len))))
+                        (new (min (+ pos n) len)))
                    (set-port-position! port new)
                    (->num (- new pos)))))))
    (cons "close"
