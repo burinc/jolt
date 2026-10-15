@@ -69,6 +69,27 @@
       (> (count flat) union-cap) :any
       :else {:union flat})))
 
+;; Declared scalars. A ^String or ^Keyword hint, on a binding or a record field,
+;; is a contract for interop, not a proof of the value: Clojure dispatches a
+;; hinted .method on it, but string?, nil?, count and str still look at the value
+;; at run time, and a hint is wrong whenever a caller passes something else (a
+;; Charset where ^String was written, or nil). So a hint types {:decl T}, never T.
+;; The interop emit honours it (it stamps :target-type as a proven T does) and
+;; nothing else reads it: it is no scalar, so it joins anything else to :any,
+;; folds no predicate and isn't truthy. It is erased where a type leaves its
+;; function (call arguments, returns, constructor arguments), since an unhinted
+;; callee isn't bound by its caller's hint.
+(defn decl [t] {:decl t})
+(defn decl-of [t] (get t :decl))
+(defn erase-decl
+  "`t` with a declared type, at the top or as a collection's elements, widened
+  to :any. A record's declared field types are its own and stay."
+  [t]
+  (cond (some? (decl-of t)) :any
+        (vec-type? t) (mk-vec (erase-decl (velem t)))
+        (set-type? t) (mk-set (erase-decl (selem t)))
+        :else t))
+
 (declare join-t)
 (defn merge-fields
   "Per-field join of two field maps (a key in only one side joins with :any)."
