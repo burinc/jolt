@@ -201,6 +201,7 @@ proxy-super-call
 rational-type?
 read-all-stdin
 real-nanos
+rec-type?
 record-ctor-key
 record-shapes
 record-type?

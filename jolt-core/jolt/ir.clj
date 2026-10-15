@@ -197,6 +197,12 @@
 ;;   :num-ret-guard          :double/:float on an :invoke typed from its var's
 ;;                           :num-ret: the back end checks what the call answered.
 ;;   :phints :nhints         per-arity ^Record / ^double param hints (analyzer).
+;;                           :phints are PROVEN record types (defrecord's `this`).
+;;   :uphints                per-arity ^Record hints the program wrote: declared,
+;;                           not proven. guard-declared-records (jolt.passes.types)
+;;                           replaces them with a type test around the body.
+;;   :rec-guard              on that test's :invoke: [[local ctor-key] ...], what
+;;                           its then-branch proves (if-narrow).
 ;;   :dead-hints             per-arity params carrying a primitive tag jolt acts
 ;;                           on nowhere. Read ONLY by the JOLT_CHECK lint
 ;;                           (jolt.passes.types report-dead-hints!); nothing in

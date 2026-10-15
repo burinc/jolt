@@ -1302,6 +1302,17 @@
 ;; ns-publics / ns-interns / ns-map / resolve all filter on var-cell-defined?
 ;; (ns.ss ns-vars-pmap-when), so a hoisted reference to a var nothing ever defines
 ;; stays invisible exactly as it does today.
+;; A record type's descriptor, by its tag, as an expression: inside a def, read
+;; once into a per-site cell (a later read is one variable load); at top level,
+;; the table lookup itself. #f while the type is not yet defined.
+(defn- cached-tag-desc [tag]
+  (let [lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
+        cells *cache-cells*]
+    (if cells
+      (let [c (fresh-label "_cdesc$")]
+        (swap! cells conj c)
+        (str "(or " c " (let ((_d " lookup ")) (set! " c " _d) _d))"))
+      lookup)))
 (defn- hoist-var-cell [ns nm]
   (str "(var-cell-deref " (hoist-const (str "(jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) ")")) ")"))
 ;; A direct-linked SEED var: the def binds the var's root procedure once, at
@@ -3590,6 +3601,19 @@
               st (when-let [cc (:clear-caps fnode)] (once-clear-stmts cc))]
           (if st (str "(begin " st " " call ")") call))
         (invoke))
+      ;; the type test guard-declared-records (jolt.passes.types) puts around a
+      ;; body whose param carries a ^Record hint the program wrote: one cached
+      ;; descriptor eq? per value. jrec-pic-desc answers #f for a non-record, and
+      ;; the descriptor is #f until the type is defined, hence the `d` test.
+      (and (= :var (:op fnode)) (= "jolt.host" (:ns fnode)) (= "rec-type?" (:name fnode))
+           (some? (:rec-guard node)) (even? (count arg-nodes)))
+      (order-args (fn [as]
+                    (str "(and"
+                         (str/join "" (map (fn [i]
+                                             (str " (let ((_d " (cached-tag-desc (:val (nth arg-nodes (inc (* 2 i))))) "))"
+                                                  " (and _d (eq? (jrec-pic-desc " (nth as (* 2 i)) ") _d)))"))
+                                           (range (quot (count as) 2))))
+                         ")")))
       ;; closed-world direct call: the callee var is an app fn def already emitted
       ;; with a Scheme binding — apply it directly, no var lookup, no jolt-invoke.
       ;; Only fn-valued defs qualify; a non-fn invokable value (a map/set/keyword
@@ -3634,7 +3658,6 @@
               (<= (count args) 6)))
        (let [s (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode)))
              tag (:type s)
-             cells *cache-cells*
              ;; A ^double field is widened on the way in, exactly as the dispatched
              ;; ctor does it (make-deftype-ctor's build calls the same jolt-rec-dbl).
              ;; This used to disqualify the whole inline path — which meant a
@@ -3675,12 +3698,7 @@
              coerce-arg (fn [field-tag nd a]
                           (if (and (= "double" field-tag) (not (proven-double? nd)))
                             (str "(jolt-rec-dbl " a ")") a))
-             desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
-             cached-desc (if cells
-                           (let [c (fresh-label "_cdesc$")]
-                             (swap! cells conj c)
-                             (str "(or " c " (let ((_d " desc-lookup ")) (set! " c " _d) _d))"))
-                           desc-lookup)]
+             cached-desc (cached-tag-desc tag)]
          (order-args (fn [as]
                        (let [n (count as)
                              as (vec (map coerce-arg arg-tags arg-nodes as))]

@@ -419,9 +419,16 @@
 ;; so the inference can seed the param's type and read its fields shaped/typed,
 ;; not just :any (the lever for a typed multi-namespace program without whole-
 ;; program inference).
+;; A ^Record tag on a parameter -> the record's ctor key, else nil.
 (defn- phint-of [ctx sym]
   (let [m (form-sym-meta sym)]
     (when m (let [t (get m :tag)] (when t (record-ctor-key ctx t))))))
+;; ...and whether that hint is a PROOF: only the `this` defrecord puts on an
+;; inline method is (dispatch reaches the method with nothing else). A hint the
+;; program wrote is a declaration -- Clojure's (:x p) answers a map's :x whatever
+;; p is hinted -- so it must not type the param on its own.
+(defn- phint-proven? [sym]
+  (let [m (form-sym-meta sym)] (and m (true? (get m :jolt/proven)))))
 
 ;; A ^long / ^double tag -> :long / :double, else nil. The tag is a string on the
 ;; data reader; tolerate a symbol from macroexpansion too.
@@ -713,9 +720,11 @@
 (defn- parse-params [ctx pvec]
   ;; :hints is a vector of [name hint] pairs (vector, not a map, so the caller
   ;; folds it with a plain reduce — no reduce-over-map in the kernel subset).
-  ;; :phints is the parallel vector of [name ctor-key] for record param hints,
-  ;; carrying the specific type for the inference to seed.
-  (loop [i 0 fixed [] rest-name nil hints [] phints [] nhints [] ahints [] dhints []]
+  ;; :phints is the parallel vector of [name ctor-key] for PROVEN record param
+  ;; hints, carrying the specific type for the inference to seed; :uphints is the
+  ;; same for the hints a program wrote, which the optimizing passes turn into a
+  ;; type test on the param (jolt.passes.types guard-declared-records).
+  (loop [i 0 fixed [] rest-name nil hints [] phints [] uphints [] nhints [] ahints [] dhints []]
     (if (< i (count pvec))
       (let [p (nth pvec i)]
         (when-not (form-sym? p)
@@ -726,16 +735,17 @@
             (when-not (form-sym? r)
               (analysis-error :analyze/invalid-fn-parameters
                               "Bad rest parameter, expected symbol"))
-            (recur (+ i 2) fixed (form-sym-name r) hints phints nhints ahints dhints))
+            (recur (+ i 2) fixed (form-sym-name r) hints phints uphints nhints ahints dhints))
           (let [nm (form-sym-name p) h (hint-of ctx p) ph (phint-of ctx p)
                 nh (nhint-of ctx p) ah (ahint-of ctx p) dh (dead-hint-of ctx p)]
             (recur (inc i) (conj fixed nm) rest-name
                    (if h (conj hints [nm h]) hints)
-                   (if ph (conj phints [nm ph]) phints)
+                   (if (and ph (phint-proven? p)) (conj phints [nm ph]) phints)
+                   (if (and ph (not (phint-proven? p))) (conj uphints [nm ph]) uphints)
                    (if nh (conj nhints [nm nh]) nhints)
                    (if ah (conj ahints [nm ah]) ahints)
                    (if dh (conj dhints [nm dh]) dhints)))))
-      {:fixed fixed :rest rest-name :hints hints :phints phints :nhints nhints
+      {:fixed fixed :rest rest-name :hints hints :phints phints :uphints uphints :nhints nhints
        :ahints ahints :dhints dhints})))
 
 ;; Clojure lets a later param shadow an earlier same-named one (a macro expander
@@ -857,6 +867,9 @@
         ;; carry record param hints (name -> ctor-key) for the inference to seed
         ;; the param type; only when present so a hintless arity stays a struct.
         arity (if (seq (:phints pp)) (assoc arity :phints (:phints pp)) arity)
+        ;; a ^Record hint the program wrote: a declaration, guarded by the
+        ;; optimizing passes rather than trusted (jolt.passes.types)
+        arity (if (seq (:uphints pp)) (assoc arity :uphints (:uphints pp)) arity)
         ;; numeric param hints (name -> :long/:double) for jolt.passes.numeric.
         arity (if (seq (:nhints pp)) (assoc arity :nhints (:nhints pp)) arity)
         ;; array param hints (name -> :doubles/:longs/:ints/:bytes/:objects) for
