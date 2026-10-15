@@ -1628,8 +1628,10 @@
             (else (loop (cdr ts)))))))
 
 ;; `nm -g -P` of FILE: (defined . undefined), two hashtables of C names. Mach-O
-;; names carry a leading underscore the C name does not; an archive's member
-;; headers ("libx.a[x.o]:") have one field and drop out. #f when nm fails.
+;; names carry a leading underscore the C name does not, and GNU nm prints an
+;; ELF symbol bound to a version as name@VERSION (memcpy@GLIBC_2.14,
+;; uuid_generate@UUID_1.0), so both are cut back to the C name; an archive's
+;; member headers ("libx.a[x.o]:") have one field and drop out. #f when nm fails.
 (define (bld-nm-symbols nm file builddir)
   (let* ((log (string-append builddir "/nm.out"))
          (rc (jolt-with-empty-sigmask
@@ -1650,9 +1652,13 @@
                         (name (and sp (substring l 0 sp)))
                         (type (and sp (< (+ sp 1) (string-length l)) (string-ref l (+ sp 1)))))
                    (when (and name type (> (string-length name) 0))
-                     (let ((c (if (and (bld-tgt-osx?) (char=? (string-ref name 0) #\_))
-                                  (substring name 1 (string-length name))
-                                  name)))
+                     (let* ((c (if (and (bld-tgt-osx?) (char=? (string-ref name 0) #\_))
+                                   (substring name 1 (string-length name))
+                                   name))
+                            (c (let at ((i 0))
+                                 (cond ((>= i (string-length c)) c)
+                                       ((and (> i 0) (char=? (string-ref c i) #\@)) (substring c 0 i))
+                                       (else (at (+ i 1)))))))
                        (hashtable-set! (if (memv type '(#\U #\w #\v)) undefined defined) c #t))))
                  (loop))))
            (close-port ip)

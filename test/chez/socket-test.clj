@@ -128,6 +128,14 @@
           n   (.read (.getInputStream conn) buf 1 2)]
       (check-eq "offset read" [n (String. buf 0 4 "UTF-8")] [2 "-ab-"]))))
 
+;; a region outside the array is IndexOutOfBoundsException, checked before the write
+(with-pair
+  (fn [server client conn]
+    (check-eq "out-of-range write region"
+              (try (.write (.getOutputStream client) (byte-array 3) 1 10) :wrote
+                   (catch IndexOutOfBoundsException e (.getMessage e)))
+              "Range [1, 1 + 10) out of bounds for length 3")))
+
 ;; EOF after peer close
 (with-pair
   (fn [server client conn]

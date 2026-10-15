@@ -107,6 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   normally (`deleteIfExists` answered `true`). They now raise
   `AccessDeniedException`, `DirectoryNotEmptyException` or a
   `FileSystemException` with the system's reason, as the JDK does.
+- **`bigint` and `biginteger` of a double take its decimal value.**
+  `(bigint 1e30)` was `1000000000000000019884624838656N`, the double's exact
+  binary value; it is `1000000000000000000000000000000N`, as on the JVM, which
+  goes through `BigDecimal.valueOf`.
 - **`PrintWriter.checkError` reports the stream it wraps.** Over `System/out`
   with the reader gone it answered `false`; it now answers `true`, as
   `PrintStream.checkError` already did.

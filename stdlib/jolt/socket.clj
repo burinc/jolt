@@ -487,6 +487,11 @@
         (recur (+ off s))))))
 
 (defn- write-bytes! [self bytes off len]
+  ;; Objects.checkFromIndexSize, before anything else, as the JDK's socket stream
+  (let [n (alength bytes)]
+    (when (or (neg? off) (neg? len) (> off (- n len)))
+      (throw (IndexOutOfBoundsException.
+              (str "Range [" off ", " off " + " len ") out of bounds for length " n)))))
   (when (pos? len)
     (ensure-open! self)
     (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]

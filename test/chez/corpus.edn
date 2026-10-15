@@ -2256,6 +2256,8 @@
   {:suite "io / print family (overlay)" :label "print of a bigint keeps the N suffix like pr" :expected "\"9223372036854775808N\"" :actual "(with-out-str (print 9223372036854775808))" :portability :common}
   {:suite "io / print family (overlay)" :label "pr of a bigint keeps the N suffix" :expected "\"9223372036854775808N\"" :actual "(with-out-str (pr 9223372036854775808))" :portability :common}
   {:suite "io / print family (overlay)" :label "str of a bigint drops the N suffix" :expected "\"9223372036854775808\"" :actual "(str 9223372036854775808)" :portability :common}
+  {:suite "numbers / bigint of a double" :label "bigint of a double is its decimal value" :expected "[\"1000000000000000000000000000000\" \"-250000000000000000000\" \"123\"]" :actual "[(str (bigint 1e30)) (str (bigint -2.5e20)) (str (bigint 123.9))]" :portability :common}
+  {:suite "numbers / bigint of a double" :label "biginteger of a double is its decimal value" :expected "\"1000000000000000000000000000000\"" :actual "(str (biginteger 1e30))" :portability :common}
   {:suite "io / print family (overlay)" :label "print of a bigint nested in a coll keeps the N" :expected "\"[9223372036854775808N]\"" :actual "(with-out-str (print [9223372036854775808]))" :portability :common}
   {:suite "io / print-method multimethod" :label "records print canonically" :expected "\"#user.Pt{:x 1, :y 2}\"" :actual "(do (defrecord Pt [x y]) (pr-str (->Pt 1 2)))" :portability :common}
   {:suite "io / print-method multimethod" :label "records nested in colls" :expected "\"[#user.Pt{:x 1, :y 2}]\"" :actual "(do (defrecord Pt [x y]) (pr-str [(->Pt 1 2)]))" :portability :common}

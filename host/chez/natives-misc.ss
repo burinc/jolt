@@ -112,13 +112,16 @@
 
 ;; --- bigint / biginteger -----------------------------------------------------
 ;; JVM bigint/biginteger coerce: string → parsed integer, double/float →
-;; truncated integer, ratio → quotient, integer → exact integer.
+;; truncated integer, ratio → quotient, integer → exact integer. A double goes
+;; through BigDecimal.valueOf, i.e. its shortest decimal string, not its binary
+;; value: (bigint 1e30) is 10^30, not 1000000000000000019884624838656. Chez's
+;; number->string is the shortest round-trip form, as Double.toString is.
 (define (jolt-bigint x)
   (cond ((string? x) (parse-int-or-throw x 10 "big"))
         ((jfloat? x) (jolt-bigint (jfloat-fl x)))
         ((flonum? x)
          (if (or (finite? x) (zero? x))
-             (inexact->exact (truncate x))
+             (truncate (string->number (string-append "#e" (number->string x)) 10))
              (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
                            (string-append "For input string: \""
                                           (jolt-str-render-one x) "\"")))))
