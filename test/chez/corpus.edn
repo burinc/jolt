@@ -746,6 +746,9 @@
   {:suite "interop / Fn vs IFn" :label "a keyword is IFn but not Fn" :expected "[true false]" :actual "[(instance? clojure.lang.IFn :a) (instance? clojure.lang.Fn :a)]" :portability :jvm}
   {:suite "interop / Fn vs IFn" :label "a var is IFn but not Fn" :expected "[true false]" :actual "[(instance? clojure.lang.IFn (var map)) (instance? clojure.lang.Fn (var map))]" :portability :jvm}
   {:suite "interop / Fn vs IFn" :label "a string is neither Fn nor IFn" :expected "[false false]" :actual "[(instance? clojure.lang.Fn \"s\") (instance? clojure.lang.IFn \"s\")]" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "fn? is true of a deftype that declares Fn, as instance? is" :expected "[true true]" :actual "(do (deftype FnMark1 [] clojure.lang.Fn clojure.lang.IFn (invoke [_ a] a)) (let [x (FnMark1.)] [(fn? x) (instance? clojure.lang.Fn x)]))" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "fn? is false of a deftype that is only IFn" :expected "[false true]" :actual "(do (deftype FnMark2 [] clojure.lang.IFn (invoke [_ a] a)) [(fn? (FnMark2.)) (ifn? (FnMark2.))])" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "fn? on a reify follows the Fn marker" :expected "[true false]" :actual "[(fn? (reify clojure.lang.Fn clojure.lang.IFn (invoke [_ a] a))) (fn? (reify clojure.lang.IFn (invoke [_ a] a)))]" :portability :jvm}
   {:suite "interop / MapEntry" :label "MapEntry/create makes an entry" :expected "[:a 1]" :actual "(clojure.lang.MapEntry/create :a 1)" :portability :jvm}
   {:suite "interop / Thread" :label "Thread with no target" :expected "[false nil nil]" :actual "(let [t (Thread.)] [(.isAlive t) (.run t) (do (.start t) (.join t) nil)])" :portability :jvm}
   {:suite "interop / Thread" :label "class of a Thread instance" :expected "java.lang.Thread" :actual "(class (Thread.))" :portability :jvm}
