@@ -171,6 +171,13 @@
                   (hashtable-ref methods (jolt-multifn-default obj) #f)
                   jolt-nil)))
            (else 'pass)))
+        ;; (.invoke f a ...): IFn's own method, for the IFn receivers this arm
+        ;; admits (fns, maps, sets, vectors). A deftype that forwards through a
+        ;; ^clojure.lang.IFn field calls it this way (yaml-parser's Rule). A
+        ;; deftype's own invoke is answered further down.
+        ((and (string=? mname "invoke")
+              (or (procedure? obj) (jolt-map? obj) (jolt-set? obj) (jolt-vector? obj)))
+         (apply jolt-invoke obj rest))
         ;; (.applyTo f args): apply a fn to a seq of args (clojure.spec instrument).
         ((and (procedure? obj) (string=? mname "applyTo"))
          (apply jolt-invoke obj (seq->list (jolt-seq (car rest)))))
