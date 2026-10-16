@@ -2097,7 +2097,14 @@
 ;; single-key reads are unlocked for the reasons set out there.
 (define var-linked-tbl (make-eq-hashtable))
 (define var-linked-mu (make-mutex))
+;; Called with the cell on every root write once something installs it: the
+;; inline stash (host-contract.ss) drops a body stashed by a direct-linked REPL
+;; form when its var is written again, since a caller compiled after that must
+;; not splice the old body. #f until then, so a root write pays one test.
+(define var-root-write-hook #f)
+(define (set-var-root-write-hook! f) (set! var-root-write-hook f))
 (define (var-root-set! c v)
+  (when var-root-write-hook (var-root-write-hook c))
   (let ((l (hashtable-ref var-linked-tbl c #f)))
     (if l
         ;; The cell and the binding are ONE value, so the two writes are one

@@ -597,7 +597,11 @@
 ;; funnel is mirrored so a def-var-linked! form loads if one ever arrives.
 (define var-linked-tbl (make-eq-hashtable))
 (define var-linked-mu (make-mutex))      ; ns.ss's remove-ns sweep takes it
+;; the root-write hook host-contract.ss installs (chez rt.ss var-root-write-hook)
+(define var-root-write-hook #f)
+(define (set-var-root-write-hook! f) (set! var-root-write-hook f))
 (define (var-root-set! c v)
+  (if var-root-write-hook (var-root-write-hook c))
   (var-cell-root-set! c v)
   (let ((l (hashtable-ref var-linked-tbl c #f)))
     (when l ((cdr l) v))))

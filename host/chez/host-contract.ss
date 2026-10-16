@@ -887,7 +887,18 @@
 ;; inline gate below read "--opt" when it meant "closed world".
 (define hc-optimize? #f)
 (define (set-optimize! on) (set! hc-optimize? on))
-(define (hc-inference-enabled? ctx) hc-optimize?)
+;; ...or for the one form the runtime compile spine is compiling under
+;; (binding [*compiler-options* {:direct-linking true}] ...), JVM Clojure's opt-in
+;; to the same closed-world commitment (#1377). A thread parameter, not a global:
+;; *compiler-options* is a dynamic var, so two threads loading code can ask for
+;; different linkage, and the build flags above must not leak into either.
+(define hc-form-direct-link (make-thread-parameter #f))
+;; Does the current thread's *compiler-options* ask for direct linking?
+(define hc-kw-direct-linking (keyword #f "direct-linking"))
+(define (hc-compiler-direct-linking?)
+  (let ((o (guard (e (#t jolt-nil)) (var-deref "clojure.core" "*compiler-options*"))))
+    (and (pmap? o) (jolt-truthy? (jolt-get o hc-kw-direct-linking jolt-nil)))))
+(define (hc-inference-enabled? ctx) (or hc-optimize? (hc-form-direct-link)))
 ;; Inline requires direct-link, and that is the WHOLE condition: splicing a defn
 ;; body at a call site is sound exactly when the callee's var cannot be redefined
 ;; out from under the copy, which is the closed world direct-linking commits to.
@@ -903,7 +914,7 @@
 ;; at the same linkage, so there is no reason to keep a second path to test.
 (define hc-direct-link? #f)
 (define (set-direct-link-flag! on) (set! hc-direct-link? on))
-(define (hc-inline-enabled? ctx) hc-direct-link?)
+(define (hc-inline-enabled? ctx) (or hc-direct-link? (hc-form-direct-link)))
 ;; Inline-body registry: jolt.passes stashes an inline-eligible defn's
 ;; {:params :body :nhints :ret} here (keyed ns/name) as its form is optimized;
 ;; jolt.passes.inline fetches it to splice the body at a call site. The stash is an
@@ -943,14 +954,93 @@
   jolt-nil)
 (define (inline-spliced-fqns)
   (jolt-with-mutex inline-stash-mu (vector->list (hashtable-keys inline-spliced-set))))
+;; Is the var's live cell linked to its jv$ binding (rt.ss def-var-linked!)? A
+;; form the runtime spine compiles direct-linked may apply a var's binding only
+;; then: remove-ns or ns-unmap drop the cell and leave the binding behind, and a
+;; later def interns a fresh, unlinked cell the binding never hears about.
+(define (hc-var-linked? ctx ns-name nm)
+  (let ((c (var-cell-lookup ns-name nm)))
+    (if (and c (var-linked-symbol c)) #t jolt-nil)))
+;; Is the var still the method defprotocol made? The method def puts the
+;; protocol's var under :protocol in its metadata, and any later def of the
+;; name -- a defmulti or defn over it, or a fresh var after ns-unmap -- replaces
+;; that metadata, so the inference's protocol-method registry entry is only good
+;; while this holds.
+(define hc-kw-protocol (keyword #f "protocol"))
+(define (hc-protocol-method-var? ctx ns-name nm)
+  (let ((c (var-cell-lookup ns-name nm)))
+    (if (and c
+             (let ((m (var-cell-meta c)))
+               (and (pmap? m) (jolt-truthy? (jolt-get m hc-kw-protocol jolt-nil)))))
+        #t jolt-nil)))
+;; Is the var dynamic NOW? A direct-linked def can be made dynamic after it ran
+;; (.setDynamic), and a form compiled after that must read it through the var
+;; so a binding reaches it -- the JVM asks the Var the same question when it
+;; compiles each reference.
+(define (hc-var-dynamic? ctx ns-name nm)
+  (let ((c (var-cell-lookup ns-name nm)))
+    (if (and c (var-cell-dynamic? c)) #t jolt-nil)))
+;; Is the var's root, right now, a procedure that takes NARGS arguments? A
+;; direct-linked call applies the var's jv$ binding as a Scheme procedure, which
+;; is only right while the root is one and admits that arity. A later defmulti
+;; or (def f {:a 1}) over a fn makes it something jolt-invoke must dispatch, and
+;; a wrong-arity call must reach jolt-invoke to raise the ArityException that
+;; names the fn instead of Chez's bare "incorrect number of arguments". A build
+;; has loaded the whole program before it emits, so the root it sees is the
+;; one the binary runs with.
+(define (hc-var-root-callable? ctx ns-name nm nargs)
+  (let ((c (var-cell-lookup ns-name nm)))
+    (if (and c (fixnum? nargs)
+             (let ((r (var-cell-root c)))
+               (and (procedure? r) (fxlogbit? nargs (procedure-arity-mask r)))))
+        #t jolt-nil)))
 (define (hc-var-redefined? ctx ns-name nm)
   (if (var-redefined? ns-name nm) #t jolt-nil))
 (define (hc-stash-inline! ctx ns-name nm m)
-  (jolt-with-mutex inline-stash-mu
-    (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m))
+  (let ((fqn (string-append ns-name "/" nm)))
+    (jolt-with-mutex inline-stash-mu
+      (hashtable-set! inline-stash-table fqn m)
+      (if (and (hc-form-direct-link) (not (jolt-nil? m)))
+          (let ((c (jolt-var ns-name nm)))
+            (hashtable-set! inline-stash-pending c #t)
+            (hashtable-set! inline-stash-owner fqn c))
+          (hashtable-delete! inline-stash-owner fqn))))
   jolt-nil)
+;; A body stashed by a form the runtime spine compiled direct-linked is good
+;; only until its var is written again. `jolt build` loads the whole program
+;; before it compiles any of it, so var-redefined? already knows every later
+;; def at stash time; a REPL does not, and a later (defn f …), (defmulti f …),
+;; alter-var-root or with-redefs must stop callers compiled after it splicing
+;; the body f had before. The stash is taken while the def COMPILES, so the
+;; first root write after it is that def running: it moves the cell from
+;; pending to live, and the next write drops the stash.
+(define inline-stash-pending (make-eq-hashtable))
+(define inline-stash-live (make-eq-hashtable))
+;; fqn -> the cell a runtime stash was taken for. remove-ns / ns-unmap drop the
+;; cell without writing it, and the next (defn f …) interns a fresh one, so a
+;; stash is spliced only while the var resolves to the cell it was taken for
+;; and that cell's def has run (hc-inline-ir).
+(define inline-stash-owner (make-hashtable string-hash string=?))
+(define (inline-stash-root-written! c)
+  (unless (and (fx= 0 (hashtable-size inline-stash-pending))
+               (fx= 0 (hashtable-size inline-stash-live)))
+    (jolt-with-mutex inline-stash-mu
+      (cond ((hashtable-contains? inline-stash-pending c)
+             (hashtable-delete! inline-stash-pending c)
+             (hashtable-set! inline-stash-live c #t))
+            ((hashtable-contains? inline-stash-live c)
+             (hashtable-delete! inline-stash-live c)
+             (hashtable-delete! inline-stash-table
+                                (string-append (var-cell-ns c) "/" (var-cell-name c))))))))
+(set-var-root-write-hook! inline-stash-root-written!)
 (define (hc-inline-ir ctx ns-name nm)
-  (or (hashtable-ref inline-stash-table (string-append ns-name "/" nm) #f) jolt-nil))
+  (let* ((fqn (string-append ns-name "/" nm))
+         (owner (hashtable-ref inline-stash-owner fqn #f)))
+    (if (and owner
+             (not (and (eq? owner (var-cell-lookup ns-name nm))
+                       (hashtable-contains? inline-stash-live owner))))
+        jolt-nil
+        (or (hashtable-ref inline-stash-table fqn #f) jolt-nil))))
 
 ;; --- direct-link of a seed var --------------------------------------------------
 ;; The back end asks this before emitting a call to a var it did not define in
@@ -1118,6 +1208,10 @@
   (def-var! "jolt.host" "protocol-methods" hc-protocol-methods)
   (def-var! "jolt.host" "inline-enabled?" hc-inline-enabled?)
   (def-var! "jolt.host" "inference-enabled?" hc-inference-enabled?)
+  (def-var! "jolt.host" "var-dynamic?" hc-var-dynamic?)
+  (def-var! "jolt.host" "protocol-method-var?" hc-protocol-method-var?)
+  (def-var! "jolt.host" "var-linked?" hc-var-linked?)
+  (def-var! "jolt.host" "var-root-callable?" hc-var-root-callable?)
   (def-var! "jolt.host" "inline-ir" hc-inline-ir)
   (def-var! "jolt.host" "stash-inline!" hc-stash-inline!)
   (def-var! "jolt.host" "var-redefined?" hc-var-redefined?)

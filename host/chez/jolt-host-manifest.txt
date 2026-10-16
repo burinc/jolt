@@ -257,7 +257,11 @@ type-satisfies?
 tz-backend
 tz-offset-seconds
 unchecked-math?
+var-dynamic?
+protocol-method-var?
+var-linked?
 var-redefined?
+var-root-callable?
 wall-nanos
 with-monitor
 jar-entry-string

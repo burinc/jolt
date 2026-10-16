@@ -8,7 +8,7 @@
   portable jolt.host form-* contract, the same seam the analyzer uses, so the
   emitter never touches a concrete host representation directly."
   (:require [clojure.string :as str]
-            [jolt.host :refer [form-sym? form-sym-name form-sym-ns form-sym-meta seed-callable?
+            [jolt.host :refer [form-sym? form-sym-name form-sym-ns form-sym-meta seed-callable? inline-enabled? var-dynamic? var-root-callable? var-linked?
                                form-list? form-vec? form-map? form-set? form-char?
                                form-literal? form-elements form-vec-items
                                form-map-pairs form-set-items form-char-code
@@ -246,7 +246,12 @@
 ;; def is emitted linked, so a root write still reaches the binding (see
 ;; emit-def-cached); what the closed world freezes is an inlined body.
 (defn set-direct-link! [on] (reset! (:direct-link? (cur)) (boolean on)))
-(defn- direct-link? [] @(:direct-link? (cur)))
+;; ...or the runtime compile spine is compiling one form under
+;; *compiler-options* {:direct-linking true} (compile-eval.ss
+;; jolt-direct-link-emit). That is a per-thread host flag, and the host's
+;; inline-enabled? answers it: inlining follows linkage, so the two are the same
+;; question there, and the unit flag stays what a build or the seed mint set.
+(defn- direct-link? [] (or @(:direct-link? (cur)) (inline-enabled? nil)))
 
 ;; SEED-MINT MODE. bootstrap.ss mints clojure.core and the compiler with
 ;; direct-link ON — a core->core call applies the callee's jv$ binding, one
@@ -473,12 +478,37 @@
 ;; dce.ss / the jv$ shadow guard test only the prefix.
 (defn- dl-fqn [ns nm] (str ns "/" nm))
 (defn- dl-name [ns nm] (str "jv$" (munge-chars (dl-fqn ns nm))))
+;; The def whose init is being emitted, as [fqn fn-node]. Its own root is not
+;; this fn yet while it compiles (unbound, or the previous definition), so a
+;; call to it from its body is checked against the arities it declares.
+(def ^:dynamic *dl-self* nil)
 (defn- direct-linkable? [ns nm]
-  (and (direct-link?) (contains? @(:direct-link-defined (cur)) (dl-fqn ns nm))))
+  (and (direct-link?) (contains? @(:direct-link-defined (cur)) (dl-fqn ns nm))
+       ;; A form the runtime spine compiles direct-linked (the unit flag is off)
+       ;; sees vars that live on after it: remove-ns / ns-unmap can drop the
+       ;; cell the binding was linked to, so the live cell has to be linked now
+       ;; -- or be the def being compiled, which links when it runs.
+       (or @(:direct-link? (cur))
+           (= (dl-fqn ns nm) (first *dl-self*))
+           (some? (var-linked? nil ns nm)))
+       ;; .setDynamic after the def: a binding has to reach this reference
+       (not (var-dynamic? nil ns nm))))
 ;; A direct-linked var whose value is a fn literal — its binding is a Scheme
 ;; procedure, so a call site can apply it directly.
 (defn- direct-link-fn? [ns nm]
   (contains? @(:direct-link-fns (cur)) (dl-fqn ns nm)))
+(defn- arities-admit? [f n]
+  (some (fn [a] (if (:rest a) (>= n (count (:params a))) (= n (count (:params a)))))
+        (:arities f)))
+;; May a call with n args apply the var's jv$ binding as a procedure? Being a fn
+;; when it was defined is not enough: the root can since have become a
+;; multimethod or a map (a later def), and a call of the wrong arity has to go
+;; through jolt-invoke, which raises the ArityException naming the fn.
+(defn- direct-link-callable? [ns nm n]
+  (let [self *dl-self*]
+    (if (and self (= (nth self 0) (dl-fqn ns nm)))
+      (boolean (arities-admit? (nth self 1) n))
+      (some? (var-root-callable? nil ns nm n)))))
 
 ;; recur-target and the munged local names known to hold a procedure (a named
 ;; fn's self-recursion name) are lexically scoped — dynamic vars so the
@@ -3641,7 +3671,8 @@
       ;; held in a var) isn't a Scheme procedure, so it falls through to jolt-invoke
       ;; below (which still uses the direct binding as the invoke target).
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
-           (direct-link-fn? (:ns fnode) (:name fnode)))
+           (direct-link-fn? (:ns fnode) (:name fnode))
+           (direct-link-callable? (:ns fnode) (:name fnode) (count args)))
       (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl ich)))
       ;; closed-world direct call to a SEED var — clojure.core and the other
       ;; namespaces the runtime image boots with. Such a var is preloaded ahead
@@ -4323,7 +4354,8 @@
         ;; built trace showed the erased fn but never its erased callers.
         ;; The fnsrc context rides the same binding: the init's anon literals
         ;; collect into *fnsrc-regs* and flush before the binding returns.
-        init+creg (binding [*variadic-reg-suppressed?* (boolean anon-variadic)
+        init+creg (binding [*dl-self* (when (and dl? fn?) [(dl-fqn ns nm) (:init node)])
+                            *variadic-reg-suppressed?* (boolean anon-variadic)
                             *callsites* (when (trace-frames?) (atom {}))
                             *fnsrc-ns* ns
                             *fnsrc-def* nm
