@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **An array built by `double-array`, `long-array`, `int-array`, `float-array`,
+  `byte-array` or `object-array` is typed without a hint.** A local bound to one
+  used to read and write through the generic `aget`/`aset` and generic
+  arithmetic; it now takes the same unboxed path a `^doubles` (or `^longs`, ...)
+  hint gives, and a `bit-and`/`bit-or`/`bit-xor` of longs indexes it inline. A
+  masked `double[]` update loop went from 29.6 to 2.9 ns an access, and the
+  `arrays-unhinted` benchmark from 58 to 14 ms.
+
 ### Fixed
 
 - **Reading and writing a subprocess's pipes is as fast as a file.** The pipe
@@ -51,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folds away when the argument is already proven), anything else answers what
   `jolt run` does. `defrecord`'s own `this` is still trusted, since dispatch
   guarantees it.
+- **An out-of-bounds read or write on a hinted or constructed primitive array
+  says `Index 5 out of bounds for length 3`**, as the JVM does, instead of
+  Chez's `flvector-ref: 5 is not a valid index for #vfl(...)`.
 
 ## [0.8.22] - 2026-10-15
 

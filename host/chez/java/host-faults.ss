@@ -85,11 +85,27 @@
       ((has? "is not ") (nil-or-cast))
       (else "java.lang.RuntimeException"))))
 
+;; An array backing's own range check (array-index-whos) carries the index and
+;; the backing as irritants; the JVM's message for it is "Index 5 out of bounds
+;; for length 3", which is what the generic array path already throws.
+(define (array-index-fault-message c)
+  (and (who-condition? c) (memq (condition-who c) array-index-whos)
+       (irritants-condition? c)
+       (let ((irr (condition-irritants c)))
+         (and (list? irr) (= (length irr) 2) (fixnum? (car irr))
+              (let* ((b (cadr irr))
+                     (n (cond ((flvector? b) (flvector-length b))
+                              ((fxvector? b) (fxvector-length b))
+                              ((bytevector? b) (bytevector-length b))
+                              (else #f))))
+                (and n (string-append "Index " (number->string (car irr))
+                                      " out of bounds for length " (number->string n))))))))
 (define (fault-message c)
   ;; a message that fails to render must not raise inside the handler that is
   ;; unwrapping the fault
   (guard (e (#t "host fault"))
-    (condition->message-string c)))
+    (or (array-index-fault-message c)
+        (condition->message-string c))))
 
 ;; First sight of a condition is also where its throw site is stashed, unless
 ;; the uncaught-path handler (jolt-capture-fault!, which runs before the stack
