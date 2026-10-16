@@ -51,7 +51,11 @@
 ;; jolt.host tower tests. decimal? stays native: the optional bigdec module
 ;; (java/bigdec.ss) re-binds it to jbigdec?, so it can't be a static overlay const.
 (define (jolt-decimal? x) #f)
-(define (jolt-fn? x) (procedure? x))
+;; fn? is (instance? clojure.lang.Fn x) on the JVM, so a deftype or reify that
+;; declares the Fn marker answers true too, as instance? already does here.
+;; own-type-declares? is records-interop.ss's, loaded later; it is reached at
+;; call time, and only for a value that is not already a procedure.
+(define (jolt-fn? x) (or (procedure? x) (own-type-declares? "clojure.lang.Fn" x)))
 (define (jolt-boolean-pred? x) (boolean? x))
 
 ;; (boolean x) coerces truthiness (nil/false -> false, else true). MUST stay native:
