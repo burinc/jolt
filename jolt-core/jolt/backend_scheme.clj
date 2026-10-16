@@ -826,6 +826,15 @@
 ;; sites — each site keeps its own object, which is the reference compiler's
 ;; behavior (a quoted form is a ConstantExpr in the class constant pool; one site
 ;; evaluated twice yields the identical object).
+;; A literal the inline pass stamped with a site id (jolt.passes
+;; stamp-site-consts) comes from the process-wide table, so every spliced copy
+;; and the fn itself hand back one object; the hoist makes it one lookup per def
+;; load. Unstamped, the construction is the site's own.
+(defn- site-const [node s]
+  (if-let [id (:site-id node)]
+    (str "(jolt-site-const " (chez-str-lit id) " (lambda () " s "))")
+    s))
+
 (defn- const-coll-node? [n]
   (and (map? n)
        (case (:op n)
@@ -4083,12 +4092,12 @@
      ;; non-constant element (a local, a call) still constructs per evaluation,
      ;; since its value is not fixed at emit time.
      :vector (let [s (emit-ordered "jolt-vector" (:items node))]
-               (if (const-coll-node? node) (hoist-const-per-site s) s))
+               (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s))
      :set (let [s (emit-ordered (if (distinct-const-keys? (:items node))
                                   "jolt-hash-set"
                                   "jolt-hash-set-checked")
                                 (:items node))]
-            (if (const-coll-node? node) (hoist-const-per-site s) s))
+            (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s))
      ;; A map literal whose keys are all constant keywords hands its slots to the
      ;; array map as one vector: the reader has already refused a repeated
      ;; literal key, so there is nothing for jolt-hash-map's duplicate scan over
@@ -4105,7 +4114,7 @@
                                     "jolt-hash-map"
                                     "jolt-hash-map-checked")
                                   kvs))]
-            (if (const-coll-node? node) (hoist-const-per-site s) s))
+            (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s))
     ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
     ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,
     ;; vector, map, set, regex/inst/uuid/tagged) is a CONSTRUCTION rebuilt per
@@ -4120,7 +4129,7 @@
                  s (emit-quoted f)]
              (if (or (form-char? f) (form-literal? f))
                s
-               (hoist-const-for f s)))
+               (hoist-const-for f (site-const node s))))
     ;; the thrown value is an operand (emitted non-tail); the throw itself goes
     ;; through emit-call with marks?=#f, so a TAIL throw gets the site-vreg pair
     ;; (sited-tail-call — stored after the operand is bound, so the operand's own
@@ -4177,7 +4186,7 @@
                  (str "(" (:cast-fn node) "->flonum " e ")")
                  (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
                      (= :double (:kind node)) (emit-nhint-coerce :double e)
-                     (= :long (:kind node)) (emit-nhint-coerce :long e)
+                     (= :long (:kind node)) (emit-nhint-coerce :long e (boolean (:return? node)))
                      :else e))
     :try (emit-try node)
     ;; regex literal #"…" -> a jolt-regex value (regex.ss, vendored irregex),
@@ -4187,7 +4196,7 @@
     ;; regex-t every time the literal was reached — measured 320 ns of a 350
     ;; ns `(re-find #"^\\(defn" s)` with the engine already compiled. Per
     ;; site, not per form, for the reason the collection literals are.
-    :regex (hoist-const-per-site (str "(jolt-regex " (chez-str-lit (:source node)) ")"))
+    :regex (hoist-const-per-site (site-const node (str "(jolt-regex " (chez-str-lit (:source node)) ")")))
     ;; #inst / #uuid literals -> runtime inst / uuid values.
     :inst (str "(jolt-inst-from-string " (chez-str-lit (:source node)) ")")
     :uuid (str "(jolt-uuid-from-string " (chez-str-lit (:source node)) ")")

@@ -256,6 +256,7 @@ transient-associative?
 type-satisfies?
 tz-backend
 tz-offset-seconds
+site-const-salt
 unchecked-math?
 var-dynamic?
 protocol-method-var?

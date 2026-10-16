@@ -13,7 +13,8 @@
   :refer, so jolt.passes stays the only namespace the back end imports.
 
   Portable Clojure: kernel-tier fns + seed primitives only."
-  (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline! var-redefined?]]
+  (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline! var-redefined?
+                               site-const-salt form-char? form-literal?]]
             [jolt.passes.fold :refer [const-fold]]
             [jolt.passes.numeric :as numeric]
             [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace direct-call-edges
@@ -67,6 +68,33 @@
        ;; (declare x) emits declare-var!, not def-var!, so a forward declaration
        ;; ahead of its real defn is not a redefinition and stays spliceable.
        (not (var-redefined? ctx (:ns node) (:name node)))))
+
+;; Literals whose value has identity: one object per source site on the JVM, so
+;; every copy of a stashed body must hand back the same one (rt.ss
+;; jolt-site-const). A constant collection literal is one construction --
+;; its elements are part of it, not sites of their own.
+(defn- const-elem? [n]
+  (let [op (:op n)]
+    (cond (or (= op :const) (= op :quote) (= op :regex)) true
+          (or (= op :vector) (= op :set)) (every? const-elem? (:items n))
+          (= op :map) (every? const-elem? (apply concat (:pairs n)))
+          :else false)))
+(defn- site-const? [n]
+  (let [op (:op n)]
+    (cond (= op :quote) (let [f (:form n)] (not (or (form-char? f) (form-literal? f))))
+          (= op :regex) true
+          (or (= op :vector) (= op :set) (= op :map)) (const-elem? n)
+          :else false)))
+(defn- stamp-site-consts* [n prefix counter]
+  (cond (not (map? n)) n
+        (site-const? n) (assoc n :site-id (str prefix (let [k @counter] (swap! counter inc) k)))
+        :else (jolt.ir/map-ir-children (fn [c] (stamp-site-consts* c prefix counter)) n)))
+;; Stamp each identity-carrying literal in a def that is about to be stashed for
+;; splicing. The def's own emission takes the stamped node too, so a call that
+;; runs the fn and one that runs a spliced copy see the same object.
+(defn- stamp-site-consts [ctx node]
+  (stamp-site-consts* node (str (:ns node) "/" (:name node) "#" (site-const-salt ctx) ":")
+                      (atom 0)))
 
 (defn- stash-of [node]
   (let [a (first (:arities (:init node)))]
@@ -193,6 +221,9 @@
   ;; test with it. The dev path never types a hint, so it keeps the plain body.
   (let [node (if (or (inline-enabled? ctx) (inference-enabled? ctx))
                (guard-declared-records node (record-shapes ctx))
+               node)
+        node (if (and (inline-enabled? ctx) (= :def (:op node)) (inline-eligible? ctx node))
+               (stamp-site-consts ctx node)
                node)]
   ;; stash an inline-eligible defn so later call sites can splice it (closed-world
   ;; optimization only). Done before optimizing, from the analyzed node.

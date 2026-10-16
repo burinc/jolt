@@ -533,8 +533,11 @@
                                                 (get node :inline-chain))
                                   env
                                   (get f :ns))
-                    ;; preserve the fn's ^double/^long return coercion.
-                    rbody (if ret (coerce-node ret rbody0) rbody0)]
+                    ;; preserve the fn's ^double/^long return coercion -- as a
+                    ;; RETURN coercion, which for ^long truncates a bignum to its
+                    ;; low 64 bits and saturates a flonum where a param's raises
+                    ;; (emit-arity-clause, jolt->fx-ret).
+                    rbody (if ret (assoc (coerce-node ret rbody0) :return? true) rbody0)]
                 (mark!)
                 (charge-growth! (growth-of body args))
                 ;; Tell the host this callee's body was actually copied somewhere.

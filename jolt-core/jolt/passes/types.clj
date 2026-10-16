@@ -1082,7 +1082,17 @@
       ;; into that def's param key.
       (let [fenv (assoc env :self-name nil :self-key nil :self-params nil :in-loop? false
                         :loop-recurs nil)
-            self (get node :name)]
+            self (get node :name)
+            ;; A ^:once fn (a lazy-seq thunk) gives up its captures as it runs --
+            ;; the JVM nulls them, and the back end empties the closure's box --
+            ;; so a body that threw and runs again sees them nil. Whatever their
+            ;; type outside, inside they may be nil, or (nil? v) folds to false
+            ;; and the rerun takes the wrong branch. :free-names absent (a node a
+            ;; pass built) widens every enclosing local.
+            tenv (if (get node :once)
+                   (reduce (fn [e k] (if (contains? e k) (assoc e k (join-t :nil (get e k))) e))
+                           tenv (or (get node :free-names) (keys tenv)))
+                   tenv)]
         [:any (assoc node :arities
                      (mapv (fn [a]
                              (let [shapes (get env :record-shapes)

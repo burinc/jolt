@@ -77,6 +77,26 @@
   (defn total [xs] (reduce + (map area xs))))
 (chk "records + protocols under direct-linking" (= 13 (total [(->Sq 2) (->Sq 3)])))
 
+;; A spliced body keeps its fn's semantics: one object per literal site, a
+;; ^long return that truncates, and a lazy-seq thunk whose captures read nil
+;; when it runs again.
+(with-dl
+  (defn lit-rx [] #"a+")
+  (defn lit-v [] [:k 'a])
+  (defn ^long lret [x] x)
+  (defn use-lits [] [(identical? (lit-rx) (lit-rx)) (identical? (lit-v) (lit-v))])
+  (defn use-lret [] (lret 18446744073709551621N))
+  (defn cleared []
+    (let [s (let [v [1 2 3]]
+              (lazy-seq (if (nil? v) (list :cleared) (throw (ex-info "boom" {})))))]
+      [(try (seq s) (catch Exception e (ex-message e)))
+       (try (seq s) (catch Exception e (ex-message e)))])))
+(chk "one object per literal site across splices" (= [true true] (use-lits)))
+(with-dl (defn rx-via [] (lit-rx)))
+(chk "a spliced literal is the fn's own" (identical? (lit-rx) (rx-via)))
+(chk "a spliced ^long return truncates" (= 5 (use-lret)))
+(chk "a lazy-seq's captures read nil on a rerun" (= ["boom" '(:cleared)] (cleared)))
+
 ;; The default is open world.
 (defn o [] 1)
 (defn use-o [] (o))
