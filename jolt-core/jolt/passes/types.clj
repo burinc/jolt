@@ -6,6 +6,7 @@
   propagate param types across a unit / the whole program. Weakly coupled to the
   IR-rewriting passes — shares the const-shape predicates (jolt.passes.fold)."
   (:require [jolt.ir :refer [reduce-ir-children map-ir-children coerce-node]]
+            [jolt.host :refer [protocol-method-var?]]
             [jolt.op-registry :as op-registry]
             [jolt.passes.fold :refer [scalar-const? kw-callee? get-callee?]]
             [jolt.passes.types.check :refer
@@ -245,6 +246,14 @@
 (declare inline-impl-receiver-type)
 
 (defn- var-key [fnode] (str (get fnode :ns) "/" (get fnode :name)))
+;; The protocol-method registry entry for a call through fnode's var, or nil.
+;; The registry records what defprotocol declared, but the var can since have
+;; been redefined -- a defmulti or defn over the name, or a fresh var after
+;; ns-unmap -- and a call through it is then no protocol call at all.
+(defn- protocol-method-of [env fnode]
+  (let [pm (get (get env :protocol-methods) (var-key fnode))]
+    (when (and pm (some? (protocol-method-var? nil (get fnode :ns) (get fnode :name))))
+      pm)))
 
 (defn- call-ret-type [fnode env]
   (let [op (get fnode :op)
@@ -262,7 +271,7 @@
                         (if r r
                           ;; a protocol-method call types as its impls' joined return
                           ;; (monomorphic): so (:ray (scatter m ..)) reads off a Ray.
-                          (let [pm (get (get env :protocol-methods) (var-key fnode))
+                          (let [pm (protocol-method-of env fnode)
                                 pmr (when pm (get @(:pm-rets (:unit env)) (str (nth pm 0) "/" (nth pm 1))))]
                             (if (and pmr (not= pmr :any))
                               pmr
@@ -842,7 +851,7 @@
         (when (and (get env :strict?) iscall-var)
           (let [k (var-key fnode) usig (get @(get env :user-sigs) k)]
             (when usig (check-user-call k usig ats pos env))))))
-       (let [pm (and iscall-var (get (get env :protocol-methods) (var-key fnode)))
+       (let [pm (and iscall-var (protocol-method-of env fnode))
             ;; Only a PROVEN-NON-NIL receiver devirtualizes. devirt resolves the impl
             ;; by the static tag and a direct-link site caches it, so a nilable receiver
             ;; would apply the record's impl to nil — where the JVM raises

@@ -502,7 +502,27 @@
   (let* ((ctx (make-analyze-ctx ns))
          (node (jolt-ce-analyze ctx form)))
     (jolt-lint-node! node)
-    (jolt-ce-emit (jolt-ce-run-passes node ctx))))
+    (if (hc-compiler-direct-linking?)
+        (jolt-direct-link-emit node ctx)
+        (jolt-ce-emit (jolt-ce-run-passes node ctx)))))
+
+;; A form compiled under (binding [*compiler-options* {:direct-linking true}] ...)
+;; gets what `jolt build` gives every app form: calls to the vars defined this
+;; way bind their jv$ binding, small fns splice into their callers, and record
+;; and protocol types are inferred (#1377). It is the JVM's direct-linking
+;; contract: a caller compiled now keeps the body it saw when the callee is
+;; redefined later, and ^:dynamic / ^:redef opt a var out. Off that binding the
+;; spine stays open-world, exactly as before.
+;;
+;; The 3-arg run-passes takes the unit the back end emits with, which is the
+;; unit the passes' inline/record-shape state must land on (run-passes'
+;; invariant). The runtime spine's unit lives for the process, so the set of
+;; direct-linked defs accumulates across forms the way a build's does across
+;; namespaces.
+(define jolt-ce-current-unit (var-deref "jolt.backend-scheme" "current-unit"))
+(define (jolt-direct-link-emit node ctx)
+  (parameterize ((hc-form-direct-link #t))
+    (jolt-ce-emit (jolt-ce-run-passes node ctx (jolt-ce-current-unit)))))
 
 ;; --- runtime defmacro -------------------------------------------------------
 ;; Shared with emit-image.ss (loaded after this). A defmacro lowers to a def of

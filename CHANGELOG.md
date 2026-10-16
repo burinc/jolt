@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`*compiler-options*` `{:direct-linking true}` optimizes REPL and `jolt run`
+  code (#1377).** Code compiled at runtime used to get none of the passes a
+  `jolt build` runs, so the same namespace ran 2-6x slower loaded than built.
+  Bind or `alter-var-root` `*compiler-options*` with `:direct-linking true`, as
+  on the JVM, and forms compiled under it get direct calls, inlining and
+  record/protocol inference. Loaded that way, `dispatch` went from 2365 to
+  1044 ms, `mono-dispatch` from 1920 to 968 ms, `binary-trees` from 259 to
+  137 ms, `typed-records` from 6.5 to 1.9 ms and `keyed-lookup` from 107 to
+  70 ms; the last two now match a built binary. The JVM contract applies: a
+  caller keeps the body it compiled against when a small callee is redefined,
+  `^:dynamic` and `^:redef` opt a var out, and `with-redefs` does not reach a
+  direct-linked caller. A later `defmulti`, `ns-unmap` or `.setDynamic` on the
+  var is still honored by code compiled after it. Off by default.
+
 ### Changed
 
 - **An array built by `double-array`, `long-array`, `int-array`, `float-array`,
@@ -31,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a four-field particle update (the JVM: 9.2).
 
 ### Fixed
+
+- **A wrong-arity call to a direct-linked fn in a built binary raises the
+  JVM's `ArityException`.** It used to apply the fn directly and fail with
+  Chez's "incorrect number of arguments 1 to #object[...]", which a
+  `(catch clojure.lang.ArityException ...)` did not catch. A direct call is now
+  made only when the fn takes that many arguments, which also covers a fn later
+  redefined as a multimethod or a map.
 
 - **Reading and writing a subprocess's pipes is as fast as a file.** The pipe
   ports copied each chunk between their foreign buffer and Chez's bytevector a

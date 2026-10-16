@@ -1182,6 +1182,18 @@ else
   fails=$((fails + 1))
 fi
 
+# *compiler-options* {:direct-linking true} on the runtime compile spine
+# (#1377): direct calls, inlining and inference for the forms compiled under
+# it, and every way a later def can invalidate what they assumed.
+dl_out="$($jolt run test/chez/repl-direct-link-test.clj 2>&1)"
+if printf '%s' "$dl_out" | grep -q 'REPL-DL OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: direct-linking on the runtime spine"
+  printf '%s\n' "$dl_out" | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # context-bound dynamic vars: *file*/*source-path* during a load,
 # *command-line-args*, *agent* inside an action, ns-map/ns-refers visibility.
 ctx_out="$($jolt run test/chez/ctxvars-test.clj a1 a2 2>/dev/null)"

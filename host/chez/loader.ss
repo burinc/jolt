@@ -1000,6 +1000,9 @@
   (and (not (aot-env-off? "JOLT_AOT_NARROW"))
        (not hc-direct-link?)
        (not hc-optimize?)
+       ;; a direct-linked load splices its deps' bodies, so a dep's surface is
+       ;; not all of it the artifact depends on
+       (not (hc-compiler-direct-linking?))
        (not (ldr-build-aot-cache?))))
 (define (aot-ct-sidecar base) (string-append base ".ct"))
 ;; The var names a namespace interns, with the private flag (a consumer's
@@ -1559,8 +1562,16 @@
         (let-values (((k bv stamp) (aot-read-own-key name file)))
           (aot-remember-own-key! name k file stamp)
           (values k (delay (cons k (ldr-source-bytes->string file (or bv (ldr-read-source-bytes file))))))))))
+;; A namespace loaded under *compiler-options* {:direct-linking true} compiles to
+;; different code (spliced bodies, direct jv$ calls) than the same source loaded
+;; open-world, so the two are different artifacts: replaying the linked one in an
+;; open-world load would freeze bodies nobody asked to freeze, and the reverse
+;; would silently drop the optimization.
+(define (aot-linkage-tag) (if (hc-compiler-direct-linking?) "-dl" ""))
 (define (aot-base-for-own name own) (string-append (aot-cache-subdir) "/"
-                                                   (aot-cache-sanitize name) "-" own))
+                                                   (aot-cache-sanitize name)
+                                                   (aot-linkage-tag)
+                                                   "-" own))
 ;; Fold the dep keys into one integer. Sorted, so the digest doesn't depend on the
 ;; order requires happened to be recorded in.
 (define aot-dep-digest-memo (make-hashtable string-hash string=?))
