@@ -170,6 +170,14 @@
 (define (sa-real-time-ms)
   (inexact->exact (floor (* (real-time) 1000))))
 
+;; (sa-epoch-ms) -> exact integer
+;; Wall-clock milliseconds since the Unix epoch. Contract: differs between two
+;; processes started at different times, which sa-real-time-ms (measured from
+;; process start on Chez) does not -- used to salt ids that code compiled in one
+;; process must not share with code another emitted. Degradation: none.
+(define (sa-epoch-ms)
+  (inexact->exact (floor (* (time->seconds (current-time)) 1000))))
+
 ;; ---- R5: io remainder (mtime) + the last GC hook -----------------------------
 
 ;; (sa-file-mtime-ms path) -> exact integer

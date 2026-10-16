@@ -1006,10 +1006,7 @@
   (if (hc-form-direct-link)
       (jolt-with-mutex inline-stash-mu
         (unless hc-site-const-nonce
-          (let ((t (current-time)))
-            (set! hc-site-const-nonce
-                  (string-append (number->string (time-second t)) "."
-                                 (number->string (time-nanosecond t))))))
+          (set! hc-site-const-nonce (number->string (sa-epoch-ms))))
         (set! hc-site-const-count (fx+ hc-site-const-count 1))
         (string-append "@" hc-site-const-nonce "." (number->string hc-site-const-count)))
       ""))
