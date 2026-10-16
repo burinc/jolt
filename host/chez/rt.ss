@@ -2078,6 +2078,25 @@
     (hashtable-contains? var-redefined-set (string-append ns "/" name))))
 (define (var-redefined-clear!)
   (jolt-with-mutex var-table-mu (hashtable-clear! var-redefined-set)))
+;; --- one object per literal site, however many copies of it run ------------------
+;; A literal that builds an object with identity -- a quoted list or symbol, a
+;; regex, a constant collection literal -- is ONE object per source site on the
+;; JVM (a class constant): (identical? (f) (f)) holds for (defn f [] #"a+"). The
+;; inline pass copies a fn's body into its callers, and each copy hoisting its
+;; own construction made one object per copy. So the pass stamps such a literal
+;; in a body it stashes with a site id (jolt.passes stamp-site-consts), and every
+;; copy -- the fn's own emission included -- asks this table for the object. The
+;; back end hoists the call, so it runs once per def load, not per evaluation.
+;; Reads are unlocked (a single-key read of a strong table, as var-table).
+(define site-const-tbl (make-hashtable string-hash string=?))
+(define site-const-mu (make-mutex))
+(define (jolt-site-const id make)
+  (or (hashtable-ref site-const-tbl id #f)
+      (let ((v (make)))
+        (jolt-with-mutex site-const-mu
+          (or (hashtable-ref site-const-tbl id #f)
+              (begin (hashtable-set! site-const-tbl id v) v))))))
+
 ;; --- linked vars: a root that is also a top-level Scheme binding --------------
 ;; The seed is minted direct-linked (bootstrap.ss): a core def is emitted as
 ;;   (define jv$ns/name <init>)

@@ -177,6 +177,15 @@
 (define (sa-real-time-ms)
   (real-time))
 
+;; (sa-epoch-ms) -> exact integer
+;; Wall-clock milliseconds since the Unix epoch. Contract: differs between two
+;; processes started at different times, which sa-real-time-ms (measured from
+;; process start on Chez) does not -- used to salt ids that code compiled in one
+;; process must not share with code another emitted. Degradation: none.
+(define (sa-epoch-ms)
+  (let ((t (current-time 'time-utc)))
+    (+ (* (time-second t) 1000) (quotient (time-nanosecond t) 1000000))))
+
 ;; ---- records: open-coded predicates, accessors, mutators, constructors -------
 ;;
 ;; A nongenerative type's rtd is a compile-time constant in Chez, and cp0

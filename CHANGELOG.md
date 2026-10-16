@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A body the inline pass copies into its callers behaves like the fn it came
+  from.** In a built binary (and under `:direct-linking` at the REPL), a regex,
+  quoted form or constant collection literal became a separate object at every
+  call site it was copied to, so `(identical? (f) (f))` was false where the JVM
+  says true; each literal is now one object however many copies run. A copied
+  `^long` return raised "Value out of range for long" on a bignum or infinity
+  instead of truncating and saturating as the fn itself does. And a lazy-seq
+  thunk whose body threw saw its captured locals still set when realized again,
+  because the inference folded `(nil? v)` on them; the JVM clears them, and so
+  does jolt now.
+
 - **A wrong-arity call to a direct-linked fn in a built binary raises the
   JVM's `ArityException`.** It used to apply the fn directly and fail with
   Chez's "incorrect number of arguments 1 to #object[...]", which a

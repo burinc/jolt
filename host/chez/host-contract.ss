@@ -994,6 +994,22 @@
              (let ((r (var-cell-root c)))
                (and (procedure? r) (fxlogbit? nargs (procedure-arity-mask r)))))
         #t jolt-nil)))
+;; The salt in a literal's site id (rt.ss jolt-site-const). A build emits each
+;; def once and caches a namespace's compiled unit on its text, so its ids are
+;; the def's name and the literal's position: "". The runtime spine can compile
+;; the same def again in one process (a REPL re-eval) and replays AOT-cached
+;; code a previous process emitted, so each stash it takes gets a salt unique to
+;; this process and this stash.
+(define hc-site-const-nonce #f)
+(define hc-site-const-count 0)
+(define (hc-site-const-salt ctx)
+  (if (hc-form-direct-link)
+      (jolt-with-mutex inline-stash-mu
+        (unless hc-site-const-nonce
+          (set! hc-site-const-nonce (number->string (sa-epoch-ms))))
+        (set! hc-site-const-count (fx+ hc-site-const-count 1))
+        (string-append "@" hc-site-const-nonce "." (number->string hc-site-const-count)))
+      ""))
 (define (hc-var-redefined? ctx ns-name nm)
   (if (var-redefined? ns-name nm) #t jolt-nil))
 (define (hc-stash-inline! ctx ns-name nm m)
@@ -1209,6 +1225,7 @@
   (def-var! "jolt.host" "inline-enabled?" hc-inline-enabled?)
   (def-var! "jolt.host" "inference-enabled?" hc-inference-enabled?)
   (def-var! "jolt.host" "var-dynamic?" hc-var-dynamic?)
+  (def-var! "jolt.host" "site-const-salt" hc-site-const-salt)
   (def-var! "jolt.host" "protocol-method-var?" hc-protocol-method-var?)
   (def-var! "jolt.host" "var-linked?" hc-var-linked?)
   (def-var! "jolt.host" "var-root-callable?" hc-var-root-callable?)

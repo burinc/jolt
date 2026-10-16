@@ -844,6 +844,22 @@ if [ "$rec_hint_got" != "$rec_hint_want" ]; then
   echo "  FAIL: a ^Record hint taken as proof of the value — got \`$rec_hint_got\`, want \`$rec_hint_want\`"; exit 1
 fi
 
+# A body the inline pass splices into its callers keeps what the fn it came
+# from does: one object per literal site (a quoted form, a regex, a constant
+# collection), a ^long return that truncates rather than raises, a lazy-seq
+# thunk whose captures read nil on a rerun, and an ArityException for a
+# wrong-arity direct call. The expected lines are the JVM's.
+splice_app="$root/test/chez/splice-semantics-app"
+splice_out="$(dirname "$out")/splice-semantics-bin"
+if ! JOLT_PWD="$splice_app" "$jolt" build -m app.core -o "$splice_out" --opt >/dev/null 2>&1; then
+  echo "  FAIL: splice-semantics --opt build exited non-zero"; exit 1
+fi
+splice_got="$(cd "$splice_app" && "$splice_out" 2>&1)"
+splice_want="$(printf 'true true true true true true\n[0 5 -9223372036854775808 0]\n[9223372036854775807 -9223372036854775808 0 9223372036854775807 3]\n[0 0 3]\n[boom2 (:locals-cleared) true]\nWrong number of args (1) passed to: app.core/f2')"
+if [ "$splice_got" != "$splice_want" ]; then
+  echo "  FAIL: a spliced body diverged from its fn — got \`$splice_got\`, want \`$splice_want\`"; exit 1
+fi
+
 # The accumulator of a reduce closure is the init only on the FIRST call; after
 # that it is whatever the closure returned. Inference seeded it from the init
 # alone, so under --opt a nil init proved acc :nil (nil?/some? folded to constants)

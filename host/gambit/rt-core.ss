@@ -595,6 +595,15 @@
 ;; Linked vars — see host/chez/rt.ss var-root-set!. The Gambit seed is minted
 ;; var-routed (gen-seed.ss sets no mint flags), so nothing links here yet; the
 ;; funnel is mirrored so a def-var-linked! form loads if one ever arrives.
+;; One object per literal site across spliced copies (chez rt.ss jolt-site-const).
+(define site-const-tbl (make-hashtable string-hash string=?))
+(define site-const-mu (make-mutex))
+(define (jolt-site-const id make)
+  (or (hashtable-ref site-const-tbl id #f)
+      (let ((v (make)))
+        (jolt-with-mutex site-const-mu
+          (or (hashtable-ref site-const-tbl id #f)
+              (begin (hashtable-set! site-const-tbl id v) v))))))
 (define var-linked-tbl (make-eq-hashtable))
 (define var-linked-mu (make-mutex))      ; ns.ss's remove-ns sweep takes it
 ;; the root-write hook host-contract.ss installs (chez rt.ss var-root-write-hook)
