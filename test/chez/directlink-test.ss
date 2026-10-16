@@ -58,6 +58,8 @@
 (jolt-compile-eval "(def hof (fn* ([] a)))" "app")
 (jolt-compile-eval "(def ^:dynamic d 5)" "app")
 (jolt-compile-eval "(def usesd (fn* ([] (d))))" "app")
+;; a direct call needs the callee's loaded root to take that arity
+(jolt-compile-eval "(def ||| (fn* ([] 7)))" "app")
 (jolt-compile-eval "(def ^:redef r 5)" "app")
 (jolt-compile-eval "(def usesr (fn* ([] (r))))" "app")
 (jolt-compile-eval "(def cfg {:a 1 :b 2})" "app")
