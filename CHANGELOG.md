@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hint gives, and a `bit-and`/`bit-or`/`bit-xor` of longs indexes it inline. A
   masked `double[]` update loop went from 29.6 to 2.9 ns an access, and the
   `arrays-unhinted` benchmark from 58 to 14 ms.
+- **`(reduce + ...)` and `(reduce * ...)` over a vector no longer allocate per
+  element.** `+` passed as a value is the variadic core fn, so each step built a
+  rest list to add two numbers. A vector reduction with `+` or `*` now steps
+  with the same open-coded add a compiled `(+ acc x)` uses: 12.5 to 4.4 ns an
+  element over doubles (the JVM: 4.2), and the `vecops` benchmark from 26 to
+  15 ms. Results and errors are unchanged.
 
 ### Fixed
 

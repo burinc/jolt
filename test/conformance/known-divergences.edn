@@ -373,6 +373,18 @@
   ;; whatever it is handed and ex-data reads it back. A superset: portable code
   ;; passing a map behaves identically. (nil data DOES match — it reads back as
   ;; {} on both, as of the fix for #771.)
+  ;; reduce honours a `reduced` INIT: it unwraps and stops before the first step.
+  ;; The JVM's vector and seq reductions hand the Reduced box to f, so (reduce +
+  ;; (reduced 5) [1 2]) is a ClassCastException there (and (reduce + (reduced 5)
+  ;; []) answers the box itself). A superset: an ordinary init behaves the same.
+  {:category :permissive
+   :behavior "(reduce + (reduced 5) [1 2])"
+   :jvm "throws ClassCastException (Reduced cannot be cast to Number)"
+   :jolt "5"
+   :check {:expr "(reduce + (reduced 5) [1 2])"
+           :jvm "throws ClassCastException"
+           :jolt "5"}
+   :note "Found while adding the (reduce + ...) vector fast path; that path keeps the entry check. Verified against Clojure 1.12.6."}
   {:category :permissive
    :behavior "(ex-data (ex-info \"m\" 5))"
    :jvm "throws ClassCastException"

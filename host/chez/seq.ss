@@ -1807,8 +1807,34 @@
 ;; Reduce a chunk pvec from index i. Returns the accumulator RAW — a `reduced` box
 ;; is returned unwrapped-by reduce-seq, not here — so a ChunkedCons continuation can
 ;; see early termination instead of folding it back into the running value.
+;; (reduce + init v) / (reduce * init v): f is the core var's own procedure, a
+;; variadic lambda, so every step built a rest list to add two numbers -- 12 ns an
+;; element. Step with the open-coded two-operand form a compiled (+ acc x) uses
+;; instead; it falls to jolt-add2 / jolt-mul2 for anything that isn't a number, so
+;; the answers and the errors are the same. Neither can return a `reduced`, so
+;; only the entry checks for one.
+(define-syntax vec-reduce-arith
+  (syntax-rules ()
+    ((_ op acc v start n)
+     (if (jolt-reduced? acc)
+         acc
+         (let outer ((i start) (acc acc))
+           (if (fx>=? i n)
+               acc
+               (let*-values (((chunk offset) (pv-leaf-for v i))
+                             ((clen) (vector-length chunk)))
+                 (let inner ((j offset) (k i) (acc acc))
+                   (if (fx>=? j clen)
+                       (outer k acc)
+                       (inner (fx+ j 1) (fx+ k 1) (op acc (vector-ref chunk j))))))))))))
 (define (vec-reduce f acc v start)
   (let ((n (pvec-count v)))
+    (cond
+      ((eq? f jolt-add) (vec-reduce-arith jolt-n+ acc v start n))
+      ((eq? f jolt-mul) (vec-reduce-arith jolt-n* acc v start n))
+      (else (vec-reduce-general f acc v start n)))))
+(define (vec-reduce-general f acc v start n)
+  (begin
     (if (procedure? f)
         (let outer ((i start) (acc acc))
           (cond ((jolt-reduced? acc) acc)

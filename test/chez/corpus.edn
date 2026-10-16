@@ -558,6 +558,17 @@
   ;; spit rendered a java.net.URL as its spec and wrote to <cwd>/file:/…; io/writer
   ;; and io/output-stream refused it. The JVM writes through a file: URL and
   ;; refuses any other protocol with IllegalArgumentException.
+  ;; (reduce + ...) / (reduce * ...) step with the open-coded two-operand add over a
+  ;; vector; the answers and the errors are what the variadic fn gave.
+  {:suite "reduce / + and * over a vector" :label "doubles" :expected "3.5" :actual "(reduce + 0.0 [1.0 2.5])" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "ratios" :expected "5/6" :actual "(reduce + [1/2 1/3])" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "a keyword element is a ClassCastException" :expected "\"java.lang.ClassCastException\"" :actual "(try (reduce + [1 :a]) (catch Exception e (.getName (class e))))" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "a nil element is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :actual "(try (reduce + 0 [1 nil]) (catch Exception e (.getName (class e))))" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "empty, no init" :expected "0" :actual "(reduce + [])" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "* with no init" :expected "24" :actual "(reduce * [2 3 4])" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "* over doubles" :expected "6.0" :actual "(reduce * 1.5 [2 2])" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "a vector longer than one chunk" :expected "4950" :actual "(reduce + 0 (vec (range 100)))" :portability :common}
+  {:suite "reduce / + and * over a vector" :label "a subvec starts mid-chunk" :expected "[4950 1820]" :actual "[(reduce + 0 (subvec (vec (range 100)) 1)) (reduce + (subvec (vec (range 100)) 35 70))]" :portability :common}
   {:suite "io / spit and writer on a URL" :label "spit through a file: URL writes its path" :expected "[\"via-url\" \"via-url\" \"file\"]" :actual "(let [f (java.io.File/createTempFile \"spiturl\" \".txt\") u (.toURL f)] (spit u \"via-url\") [(slurp f) (slurp u) (.getProtocol u)])" :portability :common}
   {:suite "io / spit and writer on a URL" :label "io/writer and io/output-stream through a file: URL" :expected "[\"ww\" \"oo\"]" :actual "(let [f (java.io.File/createTempFile \"writerurl\" \".txt\") u (.toURL f) g (java.io.File/createTempFile \"ostreamurl\" \".txt\") v (.toURL g)] (with-open [w (clojure.java.io/writer u)] (.write w \"ww\")) (with-open [o (clojure.java.io/output-stream v)] (.write o (.getBytes \"oo\"))) [(slurp f) (slurp g)])" :portability :common}
   {:suite "io / spit and writer on a URL" :label "spit :append through a URL" :expected "\"ab\"" :actual "(let [f (java.io.File/createTempFile \"spitappend\" \".txt\") u (.toURL f)] (spit u \"a\") (spit u \"b\" :append true) (slurp f))" :portability :common}
