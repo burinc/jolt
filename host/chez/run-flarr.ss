@@ -162,6 +162,21 @@
 (gate-check "(8) byte-array aset OOB throws AIOOBE"
             (ev "(try (aset (byte-array 2) 5 (byte 1)) (catch ArrayIndexOutOfBoundsException e :aioobe))")
             (keyword #f "aioobe"))
+;; ...and the unboxed paths, whose bounds check is the backing primitive's own:
+;; the condition is classed AIOOBE in host-faults.ss, and its message has to be
+;; the JVM's too, not Chez's "flvector-ref: 5 is not a valid index for #vfl(...)".
+(gate-check "(8) ^doubles read OOB carries the JVM message"
+            (ev "(try (let [^doubles a (double-array 3)] (aget a 5)) (catch ArrayIndexOutOfBoundsException e (ex-message e)))")
+            "Index 5 out of bounds for length 3")
+(gate-check "(8) ^doubles write OOB carries the JVM message"
+            (ev "(try (let [^doubles a (double-array 3)] (aset a 7 1.0)) (catch ArrayIndexOutOfBoundsException e (ex-message e)))")
+            "Index 7 out of bounds for length 3")
+(gate-check "(8) ^longs read OOB carries the JVM message"
+            (ev "(try (let [^longs a (long-array 2)] (aget a 4)) (catch ArrayIndexOutOfBoundsException e (ex-message e)))")
+            "Index 4 out of bounds for length 2")
+(gate-check "(8) ^bytes read OOB carries the JVM message"
+            (ev "(try (let [^bytes a (byte-array 4)] (aget a 9)) (catch ArrayIndexOutOfBoundsException e (ex-message e)))")
+            "Index 9 out of bounds for length 4")
 (gate-check "(8) get on an array stays non-throwing OOB (returns default)"
             (ev "(get (int-array 3) 99 :d)") (keyword #f "d"))
 ;; --- the array kind survives the optimizing passes ---------------------------
@@ -201,6 +216,48 @@
   (gate-check "(9d) ...not jolt-nth" (gate-sub? e "jolt-nth") #f))
 (gate-check "(9e) the spliced copy answers what the call did"
             (ev "(let [a (double-array [1.0 2.0 3.0])] (flarr-dot a a 3))") 14.0)
+;; (10) An array a constructor made is that kind of array with no hint: the
+;; local bound to (double-array n) read through jolt-nth / jolt-aset3 / jolt-n+,
+;; 30 ns an access where the hinted copy is 2.
+(let ((e (emit-num "(def _ (fn [^long n ^long i] (let [a (double-array n)] (aset a i 1.5) (+ 1.0 (aget a i)))))")))
+  (gate-check "(10) unhinted (double-array n) local: unboxed read" (gate-sub? e "flvector-ref") #t)
+  (gate-check "(10) ...and unboxed write" (gate-sub? e "flvector-set!") #t)
+  (gate-check "(10) ...no jolt-nth" (gate-sub? e "jolt-nth") #f)
+  (gate-check "(10) ...no generic aset" (gate-sub? e "jolt-aset") #f))
+(let ((e (emit-num "(def _ (fn [^long n ^long i] (let [a (float-array n)] (aget a i))))")))
+  (gate-check "(10a) float-array local: the flvector read" (gate-sub? e "flvector-ref") #t))
+(let ((e (emit-num "(def _ (fn [n i] (let [a (long-array n)] (aget a i))))")))
+  (gate-check "(10b) long-array local: jolt-vaget" (gate-sub? e "(jolt-vaget a i)") #t))
+(let ((e (emit-num "(def _ (fn [n i] (let [a (int-array n)] (aget a i))))")))
+  (gate-check "(10c) int-array local: jolt-vaget" (gate-sub? e "(jolt-vaget a i)") #t))
+(let ((e (emit-num "(def _ (fn [n i] (let [a (object-array n)] (aget a i))))")))
+  (gate-check "(10d) object-array local: jolt-vaget" (gate-sub? e "(jolt-vaget a i)") #t))
+(let ((e (emit-num "(def _ (fn [n i v] (let [a (byte-array n)] (aset a i v))))")))
+  (gate-check "(10e) byte-array local: the narrowing store" (gate-sub? e "jolt-baset") #t))
+(let ((e (emit-num "(def _ (fn [xs i] (let [a (double-array xs)] (+ 1.0 (aget a i)))))")))
+  (gate-check "(10f) (double-array coll) is the same kind" (gate-sub? e "jolt-nth") #f))
+;; a local of the same name that is NOT the constructor's result stays generic
+(let ((e (emit-num "(def _ (fn [n i] (let [a (double-array n) a (vec a)] (aget a i))))")))
+  (gate-check "(10g) a rebound local is not the array" (gate-sub? e "flvector-ref") #f))
+;; ...and a loop that carries the array keeps the kind while every recur passes one
+(let ((e (emit-num "(def _ (fn [^long n] (loop [a (double-array n) i 0] (if (< i n) (do (aset a i 2.0) (recur a (inc i))) (aget a 0)))))")))
+  (gate-check "(10h) a loop-carried array local stays unboxed" (gate-sub? e "flvector-set!") #t))
+;; a masked index -- (bit-and i 1023) over a :long i -- is a :long, so the access
+;; is the inline flvector-ref rather than the jolt-flaget call
+(let ((e (emit-num "(def _ (fn [^long n ^long i] (let [a (double-array n) j (bit-and i 1023)] (aset a j (+ (aget a j) 1.5)))))")))
+  (gate-check "(10m) a bit-and of longs indexes inline" (gate-sub? e "jolt-flaget") #f)
+  (gate-check "(10m) ...and stores inline" (gate-sub? e "jolt-flaset") #f))
+(gate-check "(10n) values: bit-and index"
+            (ev "(let [a (double-array 8) j (bit-and 13 7)] (aset a j 2.5) (aget a 5))") 2.5)
+(gate-check "(10i) values: int stored, double read back"
+            (ev "(let [a (double-array 3)] (aset a 1 2) (aget a 1))") 2.0)
+(gate-check "(10j) values: long-array"
+            (ev "(let [a (long-array 3)] (aset a 2 7) (aget a 2))") 7)
+(gate-check "(10k) values: byte-array narrows"
+            (ev "(let [a (byte-array 2)] (aset a 0 (unchecked-byte 200)) (aget a 0))") -56)
+(let ((e (emit-opt "(def _ (fn [^long n] (let [a (double-array 1024)] (loop [i 0] (when (< i n) (let [j (bit-and i 1023)] (aset a j (+ (aget a j) 1.5))) (recur (inc i)))) (aget a 7))))")))
+  (gate-check "(10l) the --opt pipeline keeps the constructed kind" (gate-sub? e "flvector-ref") #t)
+  (gate-check "(10l) ...no jolt-nth" (gate-sub? e "jolt-nth") #f))
 (set-direct-link-flag! #f)
 (set-optimize! #f)
 

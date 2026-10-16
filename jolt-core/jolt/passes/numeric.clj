@@ -94,6 +94,15 @@
 ;; aset clauses in an-invoke).
 (def ^:private boxed-akinds #{:longs :ints :bytes :objects})
 (def ^:private boxed-aset-kinds #{:longs :ints :objects})
+;; The array a core constructor answers is that kind of array, hint or not:
+;; (let [a (double-array n)] (aget a i)) read through jolt-nth / jolt-aset3 and
+;; generic arithmetic, 30 ns an access where ^doubles a costs 2. The kind is what
+;; a ^doubles/^longs/... hint would give the local, so every array path below
+;; applies; arities are the constructors' own (size, or size/init or a coll).
+(def ^:private array-ctor-kinds
+  {"double-array" [:doubles #{1 2}] "float-array" [:floats #{1 2}]
+   "long-array" [:longs #{1 2}] "int-array" [:ints #{1 2}]
+   "byte-array" [:bytes #{1 2}] "object-array" [:objects #{1}]})
 
 ;; --- operand classification -------------------------------------------------
 (defn- int-lit? [n]
@@ -337,6 +346,17 @@
                    (assoc :fl-val-double true)
                    (= vkind :float)
                    (update :args (fn [as] (assoc as 2 (assoc (nth as 2) :fl-unbox true)))))])
+      ;; a bitwise and/or/xor of :long operands is a long: (bit-and i 1023)
+      ;; indexes an array inline. Only the KIND; the back end keeps its own
+      ;; fixnum fast path, since a :long may still be past the fixnum range.
+      (and nm (contains? #{"bit-and" "bit-or" "bit-xor"} nm) (>= n 2)
+           (every? (fn [r] (or (= :long (nth r 0))
+                               (and (int-lit? (nth r 1)) (fixnum-lit? (get (nth r 1) :val)))))
+                   ars))
+      [:long node1]
+      (and nm (contains? array-ctor-kinds nm)
+           (contains? (nth (get array-ctor-kinds nm) 1) n))
+      [(nth (get array-ctor-kinds nm) 0) node1]
       (nil? nm) [nil node1]
       :else
        (let [;; per-operand class: :double / :long / :bigdec (typed), :wild (a
