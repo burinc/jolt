@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the same open-coded add a compiled `(+ acc x)` uses: 12.5 to 4.4 ns an
   element over doubles (the JVM: 4.2), and the `vecops` benchmark from 26 to
   15 ms. Results and errors are unchanged.
+- **A record carried through `loop`/`recur` keeps its type in a built
+  binary.** A loop variable was always untyped, so a loop that rebuilt a
+  `^double` record each iteration read its fields through the generic lookup and
+  did generic arithmetic on them. A loop variable is now the join of its initial
+  value and every `recur` that targets the loop, so one that stays a record
+  reads fields directly and unboxes `^double` math: 131 to 7.5 ns an iteration
+  on a four-field particle update (the JVM: 9.2).
 
 ### Fixed
 

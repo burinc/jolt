@@ -563,6 +563,53 @@
       [:any {:op :const :val true}]
       [:any node])))
 
+;; A loop var holds its init on the first pass and whatever a recur passed on
+;; every later one, so its type is the JOIN of the init's type and every recur
+;; arg type at its position. Inferring the body yields the recur types, which
+;; can widen the vars, so iterate from the init types to a fixpoint (joins only
+;; widen and types are depth-capped, so it settles; if it is still moving at the
+;; cap every var is :any). Trial passes run on scratch :diags/:calls so nothing is
+;; reported twice; the final pass runs on the real env. Inits bind in order, as
+;; let's do: a later init sees the earlier loop var at its init type.
+;;
+;; The vars shadow any same-named outer local: a loop that rebinds a
+;; record-typed p must not keep the outer type (a bare slot read would
+;; miscompile). numeric.clj's loop-kinds runs the same fixpoint for kinds.
+(def ^:private loop-fixpoint-cap 4)
+(defn- infer-loop [node tenv env]
+  (let [binds (get node :bindings)
+        names (mapv (fn [b] (nth b 0)) binds)
+        ;; inits in order, each seeing the loop vars bound before it
+        inits (loop [i 0 te tenv acc []]
+                (if (< i (count binds))
+                  (let [r (infer (nth (nth binds i) 1) te env)]
+                    (recur (inc i) (assoc te (nth names i) (ty r)) (conj acc r)))
+                  acc))
+        init-tys (mapv (fn [r] (ty r)) inits)
+        body-env (fn [tys] (reduce (fn [t i] (assoc t (nth names i) (nth tys i))) tenv (range (count names))))
+        recur-tys (fn [tys]
+                    (let [rs (atom [])
+                          tenv' (assoc env :in-loop? true :loop-recurs rs
+                                       :diags (atom []) :calls (atom []) :checking? false)]
+                      (infer (get node :body) (body-env tys) tenv')
+                      @rs))
+        widen (fn [tys rts]
+                (mapv (fn [i]
+                        (reduce (fn [t rt] (if (< i (count rt)) (join t (nth rt i)) :any))
+                                (nth tys i) rts))
+                      (range (count tys))))
+        final-tys (loop [k 0 tys init-tys]
+                    (let [nxt (widen tys (recur-tys tys))]
+                      (cond (= nxt tys) tys
+                            ;; still moving at the cap: a var that held still may
+                            ;; depend on one that didn't, so give up on all of them
+                            (>= k loop-fixpoint-cap) (mapv (fn [_] :any) tys)
+                            :else (recur (inc k) nxt))))
+        lenv (assoc env :in-loop? true :loop-recurs nil)]
+    [:any (assoc node
+                 :bindings (mapv (fn [i] [(nth names i) (nd (nth inits i))]) (range (count names)))
+                 :body (nth (infer (get node :body) (body-env final-tys) lenv) 1))]))
+
 (defn- infer-kw-lookup
   "(:k m) / (:k m default): the result is m's field type, and if m is a struct the
   subject is tagged so the back end drops the guard — this types nested access end
@@ -1000,22 +1047,13 @@
             br (infer (get node :body) (nth res 0) env)]
         [(nth br 0) (assoc node :bindings (nth res 1) :body (nth br 1))])
       (= op :loop)
-      ;; conservative + sound: loop bindings join across recur, which we don't
-      ;; track here, so they stay :any. Still descend to annotate any
-      ;; known-type lookups inside the body. A recur inside this body targets the
-      ;; loop, not the enclosing fn, so mark :in-loop? to suppress self-collection.
-      ;; The loop vars MUST shadow any same-named outer local — a loop that rebinds
-      ;; a record-typed p would otherwise keep the record type and miscompile a bare
-      ;; slot read under --opt. Bind each to :any in the body env (numeric.clj's
-      ;; loop-kinds does the same); inits still infer in the outer tenv.
-      (let [lenv (assoc env :in-loop? true)
-            names (mapv (fn [b] (nth b 0)) (get node :bindings))
-            btenv (reduce (fn [t nm] (assoc t nm :any)) tenv names)]
-        [:any (assoc node
-                     :bindings (mapv (fn [b] [(nth b 0) (nth (infer (nth b 1) tenv env) 1)]) (get node :bindings))
-                     :body (nth (infer (get node :body) btenv lenv) 1))])
+      (infer-loop node tenv env)
       (= op :recur)
       (let [ares (mapv (fn [a] (infer a tenv env)) (get node :args))]
+        ;; a recur that targets the enclosing loop hands its arg types to that
+        ;; loop's fixpoint (infer-loop)
+        (when (and (get env :in-loop?) (get env :loop-recurs))
+          (swap! (get env :loop-recurs) conj (mapv (fn [r] (ty r)) ares)))
         ;; a fn-level recur (not inside a loop) rebinds the enclosing fn's params,
         ;; so its args constrain them like a self-call — collect under the fn key.
         (when (and *collect-self-rec?* (not (get env :in-loop?)) (get env :self-key))
@@ -1033,7 +1071,8 @@
       ;; a nested closure resets the self/loop context: its own recur/self-call
       ;; targets IT, not the enclosing whole-program def, so it must not collect
       ;; into that def's param key.
-      (let [fenv (assoc env :self-name nil :self-key nil :self-params nil :in-loop? false)
+      (let [fenv (assoc env :self-name nil :self-key nil :self-params nil :in-loop? false
+                        :loop-recurs nil)
             self (get node :name)]
         [:any (assoc node :arities
                      (mapv (fn [a]
