@@ -53,7 +53,7 @@
 (define hint-emit (emit (run-passes hinted (make-analyze-ctx "user") U)))
 (gate-check "^V param hint direct-accesses field reads" (gate-sub? hint-emit "jrec2-f0") #t)
 (gate-check "^V param hint unboxes arithmetic" (gate-sub? hint-emit "fl*") #t)
-(gate-check "...under a test of the param's record type" (gate-sub? hint-emit "jrec-pic-desc") #t)
+(gate-check "...under a test of the param's record type" (gate-sub? hint-emit "(eq? (jrec-desc") #t)
 (gate-check "...with the generic lookup for any other value"
             (or (gate-sub? hint-emit "jolt-get") (gate-sub? hint-emit "jolt-kw-get-site")) #t)
 

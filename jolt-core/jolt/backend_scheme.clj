@@ -1117,7 +1117,8 @@
                   ;; runtime helpers emitted bare at boxed-float, record-field,
                   ;; PIC, ffi, def, and image sites.
                   "make-jfloat" "jfloat?" "jfloat-fl" "jfloat-unbox" "jnum->exact"
-                  "jrec-field-site-make" "jrec-field-site-ref" "jrec-pic-desc"
+                  "jrec-field-site-make" "jrec-field-site-ref" "jrec-pic-desc" "jrec?" "jrec-desc"
+                  "jrec1?" "jrec2?" "jrec3?" "jrec4?" "jrec5?" "jrec6?" "jrec7?" "jrec8?"
                   "keyword-t?" "mark-macro!" "set-var-meta!" "throw-jvm"
                   "def-var-linked!" "amap-slots->pmap"
                   "image-fn-form-maker!" "image-fn-form-src" "image-register-fn-form!"}]
@@ -3602,16 +3603,26 @@
           (if st (str "(begin " st " " call ")") call))
         (invoke))
       ;; the type test guard-declared-records (jolt.passes.types) puts around a
-      ;; body whose param carries a ^Record hint the program wrote: one cached
-      ;; descriptor eq? per value. jrec-pic-desc answers #f for a non-record, and
-      ;; the descriptor is #f until the type is defined, hence the `d` test.
+      ;; body whose param carries a ^Record hint the program wrote: per value, the
+      ;; type's descriptor from a per-site cell, then jrec? and jrec-desc, which
+      ;; the adapter open-codes (record ops are syntax on their constant rtd), so
+      ;; the test is a few loads with no call. The descriptor is #f until the type
+      ;; is defined, and then nothing matches.
       (and (= :var (:op fnode)) (= "jolt.host" (:ns fnode)) (= "rec-type?" (:name fnode))
            (some? (:rec-guard node)) (even? (count arg-nodes)))
       (order-args (fn [as]
                     (str "(and"
                          (str/join "" (map (fn [i]
-                                             (str " (let ((_d " (cached-tag-desc (:val (nth arg-nodes (inc (* 2 i))))) "))"
-                                                  " (and _d (eq? (jrec-pic-desc " (nth as (* 2 i)) ") _d)))"))
+                                             (let [shape (get (ctor-shapes) (nth (:rec-guard node) i))
+                                                   nf (count (:fields shape))
+                                                   ;; the per-arity layout's own predicate: the
+                                                   ;; proven branch reads with that layout's
+                                                   ;; accessors, and cp0 folds their type tests
+                                                   ;; into this one
+                                                   pred (if (<= 1 nf 8) (str "jrec" nf "?") "jrec?")]
+                                               (str " (let ((_d " (cached-tag-desc (:val (nth arg-nodes (inc (* 2 i))))) ")"
+                                                    " (_x " (nth as (* 2 i)) "))"
+                                                    " (and _d (" pred " _x) (eq? (jrec-desc _x) _d)))")))
                                            (range (quot (count as) 2))))
                          ")")))
       ;; closed-world direct call: the callee var is an app fn def already emitted
@@ -3809,6 +3820,8 @@
   ([node bools]
    (cond
      (and (= :const (:op node)) (boolean? (:val node))) true
+     ;; the declared-^Record guard emits an (and ...) of jrec-desc-is? tests
+     (and (= :invoke (:op node)) (some? (:rec-guard node))) true
      (= :invoke (:op node))
      (let [nop (native-op (:fn node) (count (:args node)))]
        (boolean (and nop (bool-returning-ops nop))))
