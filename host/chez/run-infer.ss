@@ -190,10 +190,28 @@
                                 (keyword #f "type")   "user.P")))
 (gate-check "record local still num-op diag (unshadowed)"
        (diags "(let [p (->P 1.0 2.0)] (+ p 1))" #f) 1)
+;; (the loop's p is a number: a leaked outer record type would be the diag. A
+;; vector init is no longer a clean control -- the loop var is typed now, and
+;; (+ [3 4] 1) is a genuine diag.)
 (gate-check "loop var shadows record local (no diag)"
-       (diags "(let [p (->P 1.0 2.0)] (loop [p [3 4]] (+ p 1)))" #f) 0)
+       (diags "(let [p (->P 1.0 2.0)] (loop [p 3] (+ p 1)))" #f) 0)
 (gate-check "fn self-name shadows record local (no diag)"
        (diags "(let [f (->P 1.0 2.0)] ((fn f [] (+ f 1))))" #f) 0)
+;; A loop var is the JOIN of its init and every recur that targets the loop: a
+;; record every recur passes stays that record (so (+ p 1) is the record diag),
+;; and one recur passing something else widens it (no diag).
+(gate-check "loop var that stays a record is typed (diag)"
+       (diags "(loop [p (->P 1.0 2.0) i 0] (if (< i 3) (recur (->P 2.0 3.0) (inc i)) (+ p 1)))" #f) 1)
+(gate-check "loop var a recur widens is not (no diag)"
+       (diags "(loop [p (->P 1.0 2.0) i 0] (if (< i 3) (recur [i] (inc i)) (+ p 1)))" #f) 0)
+(gate-check "a recur in a nested loop does not feed the outer one"
+       (diags "(loop [p (->P 1.0 2.0) i 0] (if (< i 3) (do (loop [p [1] j 0] (if (< j 1) (recur [2] (inc j)) p)) (recur (->P 2.0 3.0) (inc i))) (+ p 1)))" #f) 1)
+(gate-check "a recur in a nested fn does not feed the outer loop"
+       (diags "(loop [p (->P 1.0 2.0) i 0] (if (< i 3) (do ((fn [p] (if p (recur nil) p)) 1) (recur (->P 2.0 3.0) (inc i))) (+ p 1)))" #f) 1)
+;; Loop inits bind in order, as let's do: q's init reads the loop's p, not an
+;; outer p. Inferring every init in the outer env typed it from the wrong local.
+(gate-check "a loop init sees the earlier loop binding"
+       (diags "(let [p 1] (loop [p (->P 1.0 2.0) q (+ p 1)] q))" #f) 1)
 (set-record-shapes! U (jolt-hash-map))
 
 (gate-summary "infer")
