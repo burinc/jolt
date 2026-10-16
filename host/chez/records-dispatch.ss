@@ -476,6 +476,10 @@
        => (lambda (f) (apply f obj rest)))
       ((and (jolt-ref? obj) (rd-ref-method method-name (length rest)))
        => (lambda (f) (apply f obj rest)))
+      ;; clojure.lang.Volatile declares reset beside deref, and answers the new
+      ;; value as vreset! does. yaml-parser's :clj macros write through it.
+      ((and (jvol? obj) (string=? method-name "reset") (fx=? (length rest) 1))
+       (jolt-vreset! obj (car rest)))
       ((and (rd-derefable? obj) (rd-ideref-method obj method-name (length rest)))
        => (lambda (f) (apply f obj rest)))
       ;; clojure.lang.Var: ns -> its Namespace, sym -> the simple-name Symbol.

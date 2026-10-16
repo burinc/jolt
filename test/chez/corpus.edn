@@ -4570,6 +4570,8 @@
   {:suite "state / volatiles & delays" :label "volatile! deref" :expected "0" :actual "(let [v (volatile! 0)] @v)" :portability :common}
   {:suite "state / volatiles & delays" :label "vreset!" :expected "5" :actual "(let [v (volatile! 0)] (vreset! v 5) @v)" :portability :common}
   {:suite "state / volatiles & delays" :label "vswap!" :expected "1" :actual "(let [v (volatile! 0)] (vswap! v inc) @v)" :portability :common}
+  {:suite "state / volatiles & delays" :label ".reset on a volatile answers the new value" :expected "[5 5]" :actual "(let [v (volatile! 0)] [(.reset v 5) @v])" :portability :jvm}
+  {:suite "state / volatiles & delays" :label ".reset and .deref through a Volatile hint" :expected "2" :actual "(let [^clojure.lang.Volatile v (volatile! 1)] (.reset v (inc (.deref v))) @v)" :portability :jvm}
   {:suite "state / volatiles & delays" :label "delay not forced" :expected "0" :actual "(let [c (atom 0) d (delay (swap! c inc))] @c)" :portability :common}
   {:suite "state / volatiles & delays" :label "delay force once" :expected "1" :actual "(let [c (atom 0) d (delay (swap! c inc))] (force d) (force d) @c)" :portability :common}
   {:suite "state / volatiles & delays" :label "delay value" :expected "5" :actual "(let [d (delay 5)] @d)" :portability :common}
