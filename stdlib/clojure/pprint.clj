@@ -123,8 +123,9 @@
      ~@body))
 
 (defmacro pp
-  "Pretty print the last REPL result. (jolt has no *1, so this is a no-op stub.)"
-  [] `nil)
+  "A convenience macro that pretty prints the last thing output. This is
+exactly equivalent to (pprint *1)."
+  [] `(pprint *1))
 
 ;;======================================================================
 ;; print fns that route through *out*
