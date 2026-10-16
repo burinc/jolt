@@ -2841,6 +2841,10 @@
       ((and (jolt-ref? obj)
             (rd-ref-method method-name (length rest))) =>
        (lambda (f) (apply f obj rest)))
+      ((and (jvol? obj)
+            (string=? method-name "reset")
+            (fx=? (length rest) 1))
+       (jolt-vreset! obj (car rest)))
       ((and (rd-derefable? obj)
             (rd-ideref-method obj method-name (length rest))) =>
        (lambda (f) (apply f obj rest)))
