@@ -3775,6 +3775,17 @@
 
 (def-var!
   "jolt.host"
+  "rec-type?"
+  (lambda args
+    (let loop ((as args))
+      (or (null? as)
+          (let ((d (jrec-pic-desc (car as))))
+            (and d
+                 (string=? (jrdesc-tag d) (cadr as))
+                 (loop (cddr as))))))))
+
+(def-var!
+  "jolt.host"
   "protocol-key-of"
   (lambda (sym)
     (or (and (symbol-t? sym)

@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `^String` encoding is a `Charset`, threw `IllegalCharsetNameException` in
   every build but `--dev`. A hint now types the value as declared: `.method` calls
   still dispatch on it directly, and nothing else trusts it.
+- **A `^Record` hint on a parameter no longer crashes a built binary when the
+  value is something else.** `(defn px [^Point p] (:x p))` read a fixed slot
+  with no check, so passing a map, nil or another record aborted with a
+  `$record-oops` error, and `record?`/`nil?` folded on the hint. Clojure's
+  keyword lookup ignores the hint. The hinted body now runs under a test of the
+  parameter's record type: a `Point` keeps the direct slot reads (and the test
+  folds away when the argument is already proven), anything else answers what
+  `jolt run` does. `defrecord`'s own `this` is still trusted, since dispatch
+  guarantees it.
 
 ## [0.8.22] - 2026-10-15
 

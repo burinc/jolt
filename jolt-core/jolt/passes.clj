@@ -25,7 +25,8 @@
                                         reset-escapes! collected-escapes
                                         wp-infer! param-seeds-for param-num-seeds-for
                                         set-check-mode! take-diags!
-                                        reinfer-inline-method-bodies]]))
+                                        reinfer-inline-method-bodies
+                                        guard-declared-records]]))
 
 ;; Cap on inline -> flatten -> scalar-replace -> const-fold iterations. Each pass
 ;; sets `dirty` when it rewrote something; the loop stops at a clean pass or here.
@@ -186,6 +187,13 @@
   ;; they must be the same object, or the record fold + inline fixpoint silently
   ;; degrade. build/emit-image and the gates all publish then pass the same unit.
   (when ir-validate? (report-ir! "analyze" node))
+  ;; A ^Record hint the program wrote becomes a type test around the hinted
+  ;; body (types.clj guard-declared-records): the inference that follows trusts
+  ;; only what the test proves. Before the stash, so a spliced copy carries the
+  ;; test with it. The dev path never types a hint, so it keeps the plain body.
+  (let [node (if (or (inline-enabled? ctx) (inference-enabled? ctx))
+               (guard-declared-records node (record-shapes ctx))
+               node)]
   ;; stash an inline-eligible defn so later call sites can splice it (closed-world
   ;; optimization only). Done before optimizing, from the analyzed node.
   ;;
@@ -244,4 +252,4 @@
       (pt :fold (fn [] (const-fold node))))
         result (pt :numeric (fn [] (numeric/annotate ir)))]
     (when ir-validate? (report-ir! "passes" result))
-    result)))
+    result))))

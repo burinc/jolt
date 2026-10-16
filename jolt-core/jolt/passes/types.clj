@@ -358,14 +358,79 @@
         (get (nth args 0) :name)))))
 (defn- narrow-nonnil [tenv nm]
   (let [t (get tenv nm)] (if (nilable? t) (assoc tenv nm (strip-nilable t)) tenv)))
-;; [then-tenv else-tenv] for an `if` whose test narrows a nilable local.
-(defn- if-narrow [test tenv]
+;; --- declared ^Record params ------------------------------------------------
+;; A ^Record hint the program wrote (:uphints) is a declaration, not a proof:
+;; Clojure's (:x p), record? and nil? look at the value whatever p is hinted, and
+;; a caller may pass a map, nil or another record. Seeding the param with the
+;; record type made (:x p) a fixed-slot read with no check, which crashed the
+;; binary on anything else. So the optimizing passes wrap a hinted arity's body
+;; in a test of the param's record type:
+;;
+;;   (if (jolt.host/rec-type? p "app.core.Point") body body)
+;;
+;; The then-branch PROVES p is that record (if-narrow), so it keeps the bare slot
+;; reads, devirtualized protocol calls and ^double field arithmetic the hint was
+;; there for; the else-branch is the same body over an untyped p. When inference
+;; already proves the argument (a whole-program seed, a spliced call with a
+;; constructed record), the test folds to true and const-fold drops the copy.
+;; The guard args are [local tag ...]; :rec-guard holds the ctor key of each pair
+;; by position. Names are read from the args, not stored, because the inline
+;; splicer substitutes them.
+(def ^:private rec-guard-var {:op :var :ns "jolt.host" :name "rec-type?"})
+(defn- rec-guard-pairs [test]
+  (when (and (= :invoke (get test :op)) (some? (get test :rec-guard)))
+    (let [args (get test :args) cks (get test :rec-guard)]
+      (mapv (fn [i] [(nth args (* 2 i)) (get (nth args (inc (* 2 i))) :val) (nth cks i)])
+            (range (count cks))))))
+(defn guard-declared-records
+  "Replace each arity's :uphints with a record-type test around its body (see
+  above). `shapes` is the ctor-key -> record shape registry; a hint whose record
+  the build doesn't know is dropped, leaving the param untyped."
+  [node shapes]
+  (let [node (map-ir-children (fn [c] (guard-declared-records c shapes)) node)]
+    (if (= :fn (get node :op))
+      (assoc node :arities
+             (mapv (fn [a]
+                     (let [uh (get a :uphints)]
+                       (if (nil? uh)
+                         a
+                         (let [pairs (reduce (fn [acc pr] (if (some? (get shapes (nth pr 1))) (conj acc pr) acc))
+                                             [] uh)
+                               a (dissoc a :uphints)]
+                           (if (empty? pairs)
+                             a
+                             (assoc a :body
+                                    {:op :if
+                                     :test {:op :invoke :fn rec-guard-var
+                                            :args (reduce (fn [acc pr]
+                                                            (conj acc {:op :local :name (nth pr 0)}
+                                                                  {:op :const :val (get (get shapes (nth pr 1)) :type)}))
+                                                          [] pairs)
+                                            :rec-guard (mapv (fn [pr] (nth pr 1)) pairs)}
+                                     :then (get a :body)
+                                     :else (get a :body)}))))))
+                   (get node :arities)))
+      node)))
+
+(declare record-type-from-entry)
+;; [then-tenv else-tenv] for an `if` whose test narrows a nilable local, or is a
+;; declared-record guard (each tested local is that record in the then-branch).
+(defn- if-narrow [test tenv env]
   (let [somev (test-local test "some?")
-        nilv (test-local test "nil?")]
+        nilv (test-local test "nil?")
+        rg (rec-guard-pairs test)]
     (cond
       (= :local (get test :op)) [(narrow-nonnil tenv (get test :name)) tenv]
       somev [(narrow-nonnil tenv somev) tenv]
       nilv [tenv (narrow-nonnil tenv nilv)]
+      rg (let [shapes (get env :record-shapes)]
+           [(reduce (fn [te g]
+                      (let [x (nth g 0) ck (nth g 2) ent (get shapes ck)]
+                        (if (and ent (= :local (get x :op)))
+                          (assoc te (get x :name) (record-type-from-entry ent ck type-depth shapes))
+                          te)))
+                    tenv rg)
+            tenv])
       :else [tenv tenv])))
 
 (declare infer)
@@ -482,6 +547,21 @@
     (if (and (not (nil? v)) (pure-node? (nd ar)))
       [:any {:op :const :val v}]
       [(call-ret-type fnode env) (assoc node :args [(nd ar)])])))
+
+;; A declared-record guard whose every tested value inference already proves is
+;; that record answers true at compile time; const-fold then keeps only the
+;; proven branch. Anything else stays a runtime test.
+(defn- infer-rec-guard [node tenv env]
+  (let [ars (mapv (fn [a] (infer a tenv env)) (get node :args))
+        node (assoc node :args (mapv (fn [r] (nd r)) ars))
+        proven? (fn [g]
+                  (let [t (ty (nth ars (* 2 (nth g 0)))) tag (nth g 1)]
+                    (and (record-t? t) (not (nilable? t)) (= tag (get t :type)))))
+        gs (mapv (fn [i] [i (get (nth (get node :args) (inc (* 2 i))) :val)])
+                 (range (count (get node :rec-guard))))]
+    (if (and (seq gs) (every? proven? gs) (every? (fn [r] (pure-node? (nd r))) ars))
+      [:any {:op :const :val true}]
+      [:any node])))
 
 (defn- infer-kw-lookup
   "(:k m) / (:k m default): the result is m's field type, and if m is a struct the
@@ -784,6 +864,9 @@
       (and iscall-var (contains? fold-preds cn) (= n 1))
       (infer-pred-fold node fnode cn args tenv env)
 
+      (some? (get node :rec-guard))
+      (infer-rec-guard node tenv env)
+
       (and (kw-callee? fnode) (>= n 1) (<= n 2))
       (infer-kw-lookup node fnode args n tenv env)
 
@@ -890,7 +973,7 @@
       (= op :if)
       (let [test (get node :test)
             tr (infer test tenv env)
-            nr (if-narrow test tenv)   ; narrow a nilable local in the proven branch
+            nr (if-narrow test tenv env)   ; narrow a local in the proven branch
             thn (infer (get node :then) (nth nr 0) env)
             els (infer (get node :else) (nth nr 1) env)]
         [(join (nth thn 0) (nth els 0))

@@ -827,6 +827,23 @@ if [ "$hint_proof_got" != "$hint_proof_want" ]; then
   echo "  FAIL: a type hint taken as proof of the value — got \`$hint_proof_got\`, want \`$hint_proof_want\`"; exit 1
 fi
 
+# A ^Record hint on a parameter is the same kind of declaration: (:x p),
+# record? and nil? look at the value whatever the hint says. Inference seeded the
+# param with the record type, so (:x p) read a fixed slot with no check and a
+# map, nil or another record crashed the binary ($record-oops ... not of type
+# jrec2). The hinted body now runs under a type test on the parameter, and only
+# its proven branch reads slots directly.
+rec_hint_app="$root/test/chez/rec-hint-app"
+rec_hint_out="$(dirname "$out")/rec-hint-bin"
+if ! JOLT_PWD="$rec_hint_app" "$jolt" build -m app.core -o "$rec_hint_out" --opt >/dev/null 2>&1; then
+  echo "  FAIL: rec-hint --opt build exited non-zero"; exit 1
+fi
+rec_hint_got="$(cd "$rec_hint_app" && "$rec_hint_out" 2>&1)"
+rec_hint_want="$(printf '1\nnil\nnil\n9\nfalse\ntrue\n25\n[:a 2.0]\n:fn\n:sp\n7 25.0')"
+if [ "$rec_hint_got" != "$rec_hint_want" ]; then
+  echo "  FAIL: a ^Record hint taken as proof of the value — got \`$rec_hint_got\`, want \`$rec_hint_want\`"; exit 1
+fi
+
 # The accumulator of a reduce closure is the init only on the FIRST call; after
 # that it is whatever the closure returned. Inference seeded it from the init
 # alone, so under --opt a nil init proved acc :nil (nil?/some? folded to constants)

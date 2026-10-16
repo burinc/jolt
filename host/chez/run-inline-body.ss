@@ -234,12 +234,28 @@
 
 (evals "(defn ilg-hinted [^ILGPt p] (:x p))")
 (ilg-emit "(defn ilg-hinted [^ILGPt p] (:x p))")
-(gate-check "the hinted callee bare-indexes its own field read"
-            (gate-sub? (ilg-emit "(defn ilg-hinted [^ILGPt p] (:x p))") "jrec2-f0") #t)
+;; ...but a declaration is not a proof: Clojure's (:x p) answers a map's :x, or
+;; nil, whatever p is hinted. So the hinted body runs under a type test on p --
+;; the proven branch bare-indexes, anything else takes the generic lookup.
+(let ((e (ilg-emit "(defn ilg-hinted [^ILGPt p] (:x p))")))
+  (gate-check "the hinted callee bare-indexes its own field read" (gate-sub? e "jrec2-f0") #t)
+  (gate-check "...under a type test on the param" (gate-sub? e "(eq? (jrec-desc") #t)
+  (gate-check "...with the generic lookup for any other value" (gate-sub? e "jolt-kw-get-site") #t))
+(gate-check "a map passed to the hinted fn reads as a map"
+            (ilg-call "(fn [] (ilg-hinted {:x 42}))") "42")
+(gate-check "...and nil reads nil" (ilg-call "(fn [] (ilg-hinted nil))") "nil")
 (let ((e (ilg-emit "(defn ilg-uses-hinted [] (ilg-hinted ilg-pt))")))
   (gate-check "the hinted callee is spliced" (gate-sub? e "ilg-hinted") #f)
   (gate-check "a spliced ^Record param still bare-indexes" (gate-sub? e "jrec2-f0") #t)
-  (gate-check "and leaves no generic lookup behind" (or (gate-sub? e "jolt-get") (gate-sub? e "jolt-kw-get-site")) #f))
+  (gate-check "...under the same test" (gate-sub? e "(eq? (jrec-desc") #t))
+;; an argument inference PROVES is that record answers the test at compile time:
+;; the guard folds away and only the bare-index read is left. p escapes into the
+;; result so scalar-replace keeps the record (and the read) rather than folding
+;; (:x (->ILGPt a 2)) to a.
+(let ((e (ilg-emit "(defn ilg-uses-proven [a] (let [p (->ILGPt a 2)] [p (ilg-hinted p)]))")))
+  (gate-check "a proven argument folds the test" (gate-sub? e "(eq? (jrec-desc") #f)
+  (gate-check "...and bare-indexes" (gate-sub? e "jrec2-f0") #t)
+  (gate-check "...with no generic lookup left" (or (gate-sub? e "jolt-get") (gate-sub? e "jolt-kw-get-site")) #f))
 
 ;; control: the SAME code without the hint. Nothing types the local, so the
 ;; spliced read is generic -- which is what the rows above measure.

@@ -973,7 +973,10 @@
         ;; protocol (the JVM compiles them into the class) — register-inline-method,
         ;; not extend-type.
         ;; one clause from a spec; `this` is hinted with the record type so the
-        ;; inference reads its fields bare-index. Clause as DATA (see deftype).
+        ;; inference reads its fields bare-index. Unlike a hint a user writes, this
+        ;; one is a proof -- dispatch only reaches the method with an instance of
+        ;; the record -- and :jolt/proven says so (analyzer parse-params).
+        ;; Clause as DATA (see deftype).
         mk-clause (fn [spec]
                     ;; rename each _ parameter to a fresh symbol so two _ params
                     ;; (the common (m [_ _] …) on a 1-arg protocol method) don't
@@ -984,7 +987,7 @@
                           argv (nth dp 0)
                           dlets (nth dp 1)
                           inst (first argv)
-                          hinted (assoc argv 0 (vary-meta inst assoc :tag (name name-sym)))
+                          hinted (assoc argv 0 (vary-meta inst assoc :tag (name name-sym) :jolt/proven true))
                           ;; a method param shadows a same-named field (Clojure
                           ;; semantics), so don't rebind a field the param provides —
                           ;; including a name a destructured param binds, whose let

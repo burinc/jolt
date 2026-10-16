@@ -1509,6 +1509,17 @@
 (def-var! "jolt.host" "type-satisfies?"
   (lambda (type-tag proto)
     (type-satisfies? (or (deftype-tag-for-jvm-name type-tag) type-tag) proto)))
+;; The test the optimizing passes put around a body whose param carries a
+;; ^Record hint the program wrote (jolt.passes.types guard-declared-records):
+;; args are value/record-tag pairs, true when every value is a record of that
+;; type. The Chez back end open-codes it as a cached descriptor eq?; this is the
+;; same answer by tag for anything that calls it as a function.
+(def-var! "jolt.host" "rec-type?"
+  (lambda args
+    (let loop ((as args))
+      (or (null? as)
+          (let ((d (jrec-pic-desc (car as))))
+            (and d (string=? (jrdesc-tag d) (cadr as)) (loop (cddr as))))))))
 ;; The dispatch key for the protocol SYM names — resolved the way any other
 ;; reference resolves, through :refer and :as — or nil when the symbol names no
 ;; protocol (a host class or interface, which keeps its bare name). deftype /
