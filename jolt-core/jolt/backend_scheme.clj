@@ -3620,9 +3620,12 @@
                                                    ;; accessors, and cp0 folds their type tests
                                                    ;; into this one
                                                    pred (if (<= 1 nf 8) (str "jrec" nf "?") "jrec?")]
-                                               (str " (let ((_d " (cached-tag-desc (:val (nth arg-nodes (inc (* 2 i))))) ")"
-                                                    " (_x " (nth as (* 2 i)) "))"
-                                                    " (and _d (" pred " _x) (eq? (jrec-desc _x) _d)))")))
+                                               ;; fresh binders: a fixed name would shadow
+                                               ;; a user local the value expression reads
+                                               (let [d (fresh-label "_rgd$") x (fresh-label "_rgx$")]
+                                                 (str " (let ((" d " " (cached-tag-desc (:val (nth arg-nodes (inc (* 2 i))))) ")"
+                                                      " (" x " " (nth as (* 2 i)) "))"
+                                                      " (and " d " (" pred " " x ") (eq? (jrec-desc " x ") " d ")))"))))
                                            (range (quot (count as) 2))))
                          ")")))
       ;; closed-world direct call: the callee var is an app fn def already emitted
