@@ -40,7 +40,10 @@
 (def ^:private no-jolt-call-procs
   (let [preds #{"nil?" "some?" "identical?" "not" "zero?" "pos?" "neg?" "even?" "odd?"
                 "chunked-seq?" "identity"}]
-    (into #{"jolt-throw"}
+    ;; the array access helpers: each coerces a number or throws, and reads or
+    ;; writes the backing -- nothing a jolt fn can run under
+    (into #{"jolt-throw" "jolt-flaget" "jolt-flaset" "jolt-flaset-float"
+            "jolt-vaget" "jolt-vaset" "jolt-baset"}
           (for [[op spec] op-registry/op-registry
                 :when (and (not= op "=")
                            (or (:num-args? spec) (:dbl spec) (:lng spec) (contains? preds op)))
@@ -3421,10 +3424,13 @@
             hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
         (order-args
          (fn [as]
-           (let [r (if (:fl-idx-long node)
+           (let [wrap? (and (:fl-float node) (not (:fl-unbox node)))
+                 r (if (:fl-idx-long node)
                      (str "(flvector-ref " (or hv (str "(jolt-array-vec " (first as) ")")) " " (second as) ")")
-                     (str "(jolt-flaget " (str/join " " as) ")"))]
-             (if (and (:fl-float node) (not (:fl-unbox node))) (str "(make-jfloat " r ")") r)))))
+                     ;; a call, sited like any other: in tail position its frame
+                     ;; is gone, and a bad index faults inside the helper
+                     (emit-call (and tail? (not wrap?)) "jolt-flaget" as tl ich))]
+             (if wrap? (str "(make-jfloat " r ")") r)))))
       ;; (aset ^doubles a i v): proven index AND :double value (:fl-idx-long +
       ;; :fl-val-double) store inline — (let ((v V)) (flvector-set! (jolt-array-vec A)
       ;; I v) v) — and return the stored value (JVM contract; the let evaluates V once).
@@ -3437,22 +3443,23 @@
             fl? (:fl-float node)]
         (order-args
          (fn [as]
-           (let [r (if (and (:fl-idx-long node) (:fl-val-double node))
+           (let [wrap? (and fl? (not (:fl-unbox node)))
+                 r (if (and (:fl-idx-long node) (:fl-val-double node))
                      (let [v (fresh-label "_v$")]
                        (str "(let ((" v " " (if fl? (str "(flsingle " (nth as 2) ")") (nth as 2)) ")) (flvector-set! "
                             (or hv (str "(jolt-array-vec " (first as) ")"))
                             " " (second as) " " v ") " v ")"))
-                     (str "(" (if fl? "jolt-flaset-float" "jolt-flaset") " " (str/join " " as) ")"))]
-             (if (and fl? (not (:fl-unbox node))) (str "(make-jfloat " r ")") r)))))
+                     (emit-call (and tail? (not wrap?)) (if fl? "jolt-flaset-float" "jolt-flaset") as tl ich))]
+             (if wrap? (str "(make-jfloat " r ")") r)))))
       ;; (aget ^longs/^ints/^bytes/^objects a i) and its aset twin. A boxed backing
       ;; cannot unbox, so there is no inline form and no hoisted vector — the win is
       ;; skipping jolt-nth's dispatch walk, which the call already gets.
-      (:v-aget node) (order-args (fn [as] (str "(jolt-vaget " (str/join " " as) ")")))
-      (:v-aset node) (order-args (fn [as] (str "(jolt-vaset " (str/join " " as) ")")))
+      (:v-aget node) (order-args (fn [as] (emit-call tail? "jolt-vaget" as tl ich)))
+      (:v-aset node) (order-args (fn [as] (emit-call tail? "jolt-vaset" as tl ich)))
       ;; (aset ^bytes a i v): the store's own helper, because the byte kind narrows
       ;; to signed 8 bits and must answer what it stored — jolt-vaset answers its
       ;; argument. No inline form: there is nothing to unbox on the way out.
-      (:b-aset node) (order-args (fn [as] (str "(jolt-baset " (str/join " " as) ")")))
+      (:b-aset node) (order-args (fn [as] (emit-call tail? "jolt-baset" as tl ich)))
       (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
       ;; the integer twin of :fl-op — a java.lang.Math member over proven fixnum
       ;; operands, lowered to its jolt-l-* macro (jolt.passes.numeric math-lng-ops).

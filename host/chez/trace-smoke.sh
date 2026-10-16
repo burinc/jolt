@@ -314,6 +314,19 @@ echo "trace smoke: a host fault still maps fn and line"
 out_hf="$(run_app app.hostfault)"
 expect_match "hostfault: the faulting fn is named at its line" "$out_hf" 'app\.hostfault/kaboom (.*src/app/hostfault\.clj:3)'
 expect_match "hostfault: the caller is present" "$out_hf" 'app\.hostfault/-main'
+# ...and the same fault through the boxed kinds' helper (jolt-vaget): an array
+# a constructor made is typed, so its read is a helper call in tail position,
+# which has to be sited like any other call or the fn's frame is gone.
+cat > "$work/src/app/hostfault2.clj" <<'EOF'
+(ns app.hostfault2)
+(defn kaboom [n]
+  (aget (long-array 3) n))
+(defn -main [& _]
+  (println "before")
+  (println (kaboom 10)))
+EOF
+out_hf2="$(run_app app.hostfault2)"
+expect_match "hostfault: a long-array read names the fn at its line" "$out_hf2" 'app\.hostfault2/kaboom (.*src/app/hostfault2\.clj:3)'
 
 # R3 (bead jolt-230w): a chain at EVERY spine level, not just the innermost.
 # dive tail-calls mid (rib on -main's callee frame), mid calls hop non-tail
