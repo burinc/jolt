@@ -85,6 +85,13 @@ is new.
   must be integer". A string or array takes any number, so `(contains? "ab"
   1.5)` is true. `contains?` works on arrays, and a fractional index truncates
   toward zero: `(nth v -0.5)` is the first element.
+- **A fiber parking while another thread held a runtime lock no longer hangs
+  the process.** A park takes its locks with interrupts disabled, and Chez
+  keeps a thread blocked that way counted as running, so a garbage collection
+  requested while the lock's holder was inside it waited forever on the
+  parking thread. With fibers parked on sockets or channels, the whole program
+  stopped; the fibers-io gate hit it about once in 150 runs. Such a lock now
+  waits in a call the collector can run through.
 - **`clojure.pprint/pp` prints `*1` (#1388).** It expanded to nil; it is
   `(pprint *1)` now, as in Clojure.
 - **`.invoke` and `.applyTo` work on every `IFn`.** `(.invoke f x)` raised "No

@@ -1652,6 +1652,21 @@
 ;; What #3% gives up is argument checking, and both arguments here are literal.
 (define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
 
+;; (sa-collect-safe-pause) -> unspecified
+;; A __collect_safe call that returns at once: sched_yield, or SwitchToThread on
+;; Windows. A collect-safe call deactivates the thread whatever its interrupt
+;; disable count, which a blocking mutex-acquire, condition-wait or sleep does
+;; not, so locks.ss waits in this between tries of a mutex it cannot block on.
+;; Contract: return promptly and let a collection run meanwhile. Degradation: a
+;; target with no such entry, or whose collector never stops other threads,
+;; may answer a plain no-op.
+(define sa-collect-safe-pause
+  (begin
+    (guard (e (#t #f)) (load-shared-object #f))
+    (or (guard (e (#t #f)) (foreign-procedure __collect_safe "sched_yield" () int))
+        (guard (e (#t #f)) (foreign-procedure __collect_safe "SwitchToThread" () int))
+        (lambda () 0))))
+
 
 ;; ---- handler-backed output ports ---------------------------------------------
 ;; (sa-make-output-port name put! put-some! flush! clear! close!) -> port | #f
