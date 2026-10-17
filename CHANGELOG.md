@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.23] - 2026-10-17
+
+Code loaded at the REPL or by `jolt run` can opt into the optimizations a
+`jolt build` makes, by binding `*compiler-options*` to `{:direct-linking
+true}` as on the JVM. Built binaries type more without hints: arrays from the
+array constructors, records carried through `loop`, and `reduce` with `+` or
+`*`. Type hints stop counting as proof of a value's type. `compare` and `sort`
+take any `Comparable`, `*in*` is a real `Reader`, and `java.io.RandomAccessFile`
+is new.
+
 ### Added
 
 - **`*compiler-options*` `{:direct-linking true}` optimizes REPL and `jolt run`
@@ -22,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `^:dynamic` and `^:redef` opt a var out, and `with-redefs` does not reach a
   direct-linked caller. A later `defmulti`, `ns-unmap` or `.setDynamic` on the
   var is still honored by code compiled after it. Off by default.
+- **`java.io.RandomAccessFile` (#1376).** It opens a String or File in mode
+  `"r"`, `"rw"`, `"rws"` or `"rwd"`, and answers `read`, `readFully`, `write`,
+  `seek`, `getFilePointer`, `length`, `setLength`, `skipBytes` and `close`,
+  with the JDK's exceptions. The `DataInput`/`DataOutput` methods (`readInt`,
+  `writeLong`, ...) are not there yet. `FileInputStream.skip` now seeks instead
+  of reading the bytes it skips, and can move backwards as the JDK's does;
+  skipping to the end of a 20 MB file went from 22 ms to 0.2 ms.
 
 ### Changed
 
@@ -47,6 +64,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a four-field particle update (the JVM: 9.2).
 
 ### Fixed
+
+- **`clojure.pprint/pp` prints `*1` (#1388).** It expanded to nil; it is
+  `(pprint *1)` now, as in Clojure.
+- **`.invoke` and `.applyTo` work on every `IFn`.** `(.invoke f x)` raised "No
+  matching method" on fns, keywords, symbols, vars and multimethods, and on a
+  map it read nil; `(.applyTo {:a 1} '(:a))` answered nil and `.applyTo` on a
+  set raised. All of them call the receiver now, as on the JVM.
+  `(.reset v x)` on a volatile sets it and returns `x`, and `fn?` is true of a
+  deftype or reify that declares `clojure.lang.Fn`, as `instance?` already
+  was. Together these let yamlstar's parser run.
+- **`io/input-stream` over a file or bytes supports `mark` and `reset`.** On
+  the JVM it hands back a `BufferedInputStream`; jolt's stream answered
+  `markSupported` false and `reset` threw.
 
 - **`compare` and `sort` take any `Comparable` host value (#1395).** A
   `java.nio.file.Path`, `java.io.File`, `StringBuilder` or `TimeUnit` had a
@@ -113,7 +143,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BufferedReader` reads ahead** like the JDK's: it fills its own buffer
   with one `read` of 8192 characters (or the size passed in), so what it has
   buffered is gone from the reader it wraps, and `read-line` on `*in*` after
-  `(io/reader *in*)` sees what the JVM does. Over jolt's own readers it used to
+  `(io/reader *in*)` sees what the JVM does on a terminal. (Over a pipe, the
+  JVM's buffer can take lines that have already arrived; jolt's `*in*` still
+  hands over one line per read.) Over jolt's own readers it used to
   be the reader itself (so `(class (BufferedReader. sr))` was `StringReader`),
   and over a Reader the program wrote it read one character at a time. `mark` and `reset` are the buffer's own, a line ending in
   `\r\n` no longer leaves the `\n` for the next `read`, and a closed reader
