@@ -47,7 +47,7 @@
   (let loop ((i 0) (ts +inf.0) (tb +inf.0))
     (if (= i rounds)
         (/ tb (max 1.0 ts))
-        (let* ((one (lambda (f) (collect) (let ((t (now-ns))) (f) (- (now-ns) t))))
+        (let* ((one (lambda (f) (let ((t (now-ns))) (f) (- (now-ns) t))))
                (a (if (even? i) (one small) #f))
                (b (one big))
                (a (or a (one small))))
