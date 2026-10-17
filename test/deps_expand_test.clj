@@ -448,6 +448,40 @@
   (is= "delete-tree! removes a tree holding a read-only file" true (jolt.host/delete-tree! root))
   (is= "and nothing of it is left" false (jolt.host/file-exists? root)))
 
+;; A :local/root names a directory, not a spelling of one. In a multi-module
+;; project agent reaches libs as "../libs" and again through tui as
+;; "../tui/../libs"; both are the same directory, so they are the same
+;; coordinate (tools.deps canonicalizes the root) and there is no version
+;; conflict to warn about (jolt-lang/jolt#1394).
+(let [root (str (System/getProperty "java.io.tmpdir") "/local-diamond-" (System/currentTimeMillis))
+      mod (fn [m deps] (jolt.host/mkdirs! (str root "/modules/" m "/src"))
+            (spit (str root "/modules/" m "/deps.edn") (pr-str {:paths ["src"] :deps deps})))
+      _ (do (mod "libs" {})
+            (mod "tui" {'k/libs {:local/root "../libs"}})
+            (mod "agent" {'k/libs {:local/root "../libs"} 'k/tui {:local/root "../tui"}}))
+      err (java.io.StringWriter.)
+      result (binding [*err* err]
+               (deps/resolve-deps {'k/agent {:local/root "modules/agent"}} root nil))]
+  (is= "the same local dir reached by two spellings is one coordinate, not a conflict"
+       "" (str err))
+  (is= "and every local lib resolves once"
+       '#{k/agent k/tui k/libs} (set (keys (:libs result))))
+  (jolt.host/delete-tree! root))
+
+;; The cache key's walk over local deps is bounded by the dirs it has seen. Seen
+;; as spellings, a "../" cycle (a -> ../b -> ../a) never repeats one — every hop
+;; grows the path — so the walk never ended.
+(let [root (str (System/getProperty "java.io.tmpdir") "/local-cycle-" (System/currentTimeMillis))
+      mod (fn [m deps] (jolt.host/mkdirs! (str root "/" m))
+            (spit (str root "/" m "/deps.edn") (pr-str {:deps deps})))
+      _ (do (mod "a" {'k/b {:local/root "../b"}})
+            (mod "b" {'k/a {:local/root "../a"}}))
+      walk (var jolt.deps/local-deps-edn-paths)
+      paths (deref (future (walk {'k/a {:local/root "a"}} root)) 10000 :timed-out)]
+  (is= "a ../ local cycle visits each deps.edn once"
+       2 (if (= :timed-out paths) paths (count paths)))
+  (jolt.host/delete-tree! root))
+
 (println (str "deps-expand: " (- @checks @failures) "/" @checks " passed"))
 (when (pos? @failures)
   (System/exit 1))

@@ -448,6 +448,7 @@
           '(
             "java.time.DayOfWeek" "java.time.Month" "java.time.temporal.ChronoField"
             "java.time.temporal.ChronoUnit" "java.lang.Thread$State"
+            "java.util.concurrent.TimeUnit"
             ))
 ;; the package-private classes the graph models (all nested; probed): the four
 ;; transient classes and three of clojure.lang's seq classes
@@ -845,7 +846,7 @@
 (jch-register-supers! "java.io.Reader" '("java.io.Closeable" "java.lang.Readable"))
 (jch-register-supers! "java.lang.Readable" '())
 (jch-register-supers! "java.io.Writer" '("java.io.Closeable" "java.io.Flushable" "java.lang.Appendable"))
-(jch-register-supers! "java.io.File" '())
+(jch-register-supers! "java.io.File" '("java.io.Serializable" "java.lang.Comparable"))
 (jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
 (jch-register-supers! "java.io.PushbackReader" '("java.io.Reader"))
 (jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
@@ -884,7 +885,8 @@
 (jch-register-supers! "java.io.StringWriter" '("java.io.Writer"))
 ;; StringBuilder is a CharSequence and an Appendable, which is what lets count/seq/
 ;; nth and the regex entry points take one the way they take a String.
-(jch-register-supers! "java.lang.StringBuilder" '("java.lang.CharSequence" "java.lang.Appendable"))
+;; Comparable<StringBuilder> since JDK 11, like StringBuffer below
+(jch-register-supers! "java.lang.StringBuilder" '("java.lang.CharSequence" "java.lang.Appendable" "java.lang.Comparable"))
 (jch-register-supers! "java.lang.Appendable" '())
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
@@ -1328,6 +1330,7 @@
 ;; Normalizer.Form is an enum, so it carries java.lang.Enum's supers the way the
 ;; other modeled enums here do.
 (jch-register-supers! "java.text.Normalizer$Form" '("java.lang.Enum"))
+(jch-register-supers! "java.util.concurrent.TimeUnit" '("java.lang.Enum"))
 (jch-register-supers! "java.util.GregorianCalendar" '())
 (jch-register-supers! "java.util.Locale" '())
 (jch-register-supers! "java.util.TimeZone" '())

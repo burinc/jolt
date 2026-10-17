@@ -49,6 +49,9 @@
 (define (make-time-unit nm nanos) (make-jhost "time-unit" (vector nm nanos)))
 (define (time-unit? x) (and (jhost? x) (string=? (jhost-tag x) "time-unit")))
 (define (time-unit-scale u) (vector-ref (jhost-state u) 1))
+(define (time-unit-ordinal u)
+  (let loop ((us time-unit-nanos) (i 0))
+    (if (string=? (caar us) (vector-ref (jhost-state u) 0)) i (loop (cdr us) (+ i 1)))))
 
 ;; JVM conversions TRUNCATE toward zero (SECONDS.toMinutes(90) is 1).
 (define (tu-convert self n per)
@@ -100,7 +103,16 @@
                                         n))
                                   jolt-nil))))
         (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))))
+        (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))
+        ;; TimeUnit is an enum: declared NANOSECONDS..DAYS, ordered by that
+        ;; ordinal, and Enum.compareTo is the ordinal difference
+        (cons "ordinal"   (lambda (self) (time-unit-ordinal self)))
+        (cons "compareTo" (lambda (self other)
+                            (unless (time-unit? other)
+                              (throw-jvm 'ClassCastException
+                                         (string-append "class " (jolt-class-name other)
+                                                        " cannot be cast to class java.util.concurrent.TimeUnit")))
+                            (- (time-unit-ordinal self) (time-unit-ordinal other))))))
 ;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its
 ;; name on the JVM, where the generic host-object fallback prints #object[…].
 (register-str-render! time-unit? (lambda (u) (vector-ref (jhost-state u) 0)))

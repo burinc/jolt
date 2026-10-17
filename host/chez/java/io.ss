@@ -916,6 +916,12 @@
 ;; and every later foreign-entry walks it, so each library is loaded at most once.
 (define win32? (lambda () (eq? (sa-os-family) 'windows)))
 
+;; File.compareTo is the file system's compare on the two paths: String.compareTo
+;; on Unix, compareToIgnoreCase on Windows, where names are case-insensitive. Its
+;; argument is cast to a File, so the caller refuses anything else first.
+(define (jfile-compare-for windows? a b)
+  (if windows? (jvm-string-ci-compare a b) (jvm-string-compare a b)))
+
 (define win32-loaded-libs '())
 ;; Load first, mark after: marking first let a second thread skip the load and
 ;; ask foreign-entry? before the library was there, then remember its #f (the
@@ -1840,8 +1846,12 @@
       ((string=? name "toPath")           (list (make-nio-path p)))  ; -> java.nio.file.Path (nio-file.ss)
       ((string=? name "getAbsoluteFile")  (list (make-jfile (jfile-abs fp))))
       ((string=? name "getCanonicalFile") (list (make-jfile (jfile-canonical fp))))
-      ((string=? name "compareTo")      (list (->num (let ((o (file-path-of (car args))))
-                                                       (cond ((string<? p o) -1) ((string>? p o) 1) (else 0))))))
+      ((string=? name "compareTo")
+       (unless (jfile? (car args))
+         (throw-jvm 'ClassCastException
+                    (string-append "class " (jolt-class-name (car args))
+                                   " cannot be cast to class java.io.File")))
+       (list (->num (jfile-compare-for (win32?) p (jfile-path (car args))))))
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
       ((string=? name "hashCode")       (list (jfile-hashcode f)))
       ((string=? name "getParent")

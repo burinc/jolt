@@ -58,6 +58,13 @@
 (defn- mv! [from to] (jolt.host/rename-file! from to))
 (defn- touch! [p] (spit p ""))                ; the markers are all empty files
 
+;; The directory a path names, as File.getCanonicalPath answers it: "." and ".."
+;; folded and symlinks resolved. A :local/root is identified by this, not by its
+;; spelling — tools.deps canonicalizes the root the same way — so a multi-module
+;; project that reaches one module as "../libs" and again as "../tui/../libs"
+;; holds one coordinate, not two that cannot be compared.
+(defn- canonical-path [p] (.getCanonicalPath (java.io.File. p)))
+
 (defn- find-file
   "Walk `dir` for the first entry whose NAME satisfies `pred`, returning its
   full path, or nil. Every name at a level is checked before any subdirectory
@@ -844,7 +851,7 @@
 
 (defmethod ext/dep-id :mvn [_ coord] (select-keys coord [:mvn/version]))
 (defmethod ext/dep-id :git [_ coord] (select-keys (git-coord coord) [:git/url :git/sha :git/tag]))
-(defmethod ext/dep-id :local [_ coord] (select-keys coord [:local/root]))
+(defmethod ext/dep-id :local [_ coord] {:local/root (canonical-path (:local/root coord))})
 
 ;; What names a version in the dependency tree: the Maven version, the git tag
 ;; if the coordinate is pinned by one (else the sha, shortened the way git
@@ -1356,9 +1363,9 @@
           (walk [queue seen acc]
             (lazy-seq
               (if-let [dir (first queue)]
-                (if (contains? seen dir)
+                (if (contains? seen (canonical-path dir))
                   (walk (rest queue) seen acc)
-                  (let [seen (conj seen dir)
+                  (let [seen (conj seen (canonical-path dir))
                         dep-edn (str dir "/deps.edn")
                         ;; a local dep without a deps.edn (bare source dir, a jar)
                         ;; contributes nothing to the key — its roots are its own.

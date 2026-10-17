@@ -226,6 +226,26 @@
 (define (npath-ends-with self other)
   (npath-ends-with-for (nio-windows?) (nio-path-str self) (npath-string-of other)))
 
+;; Path.compareTo. UnixPath compares the paths' bytes, unsigned: the first
+;; difference, else the length difference -- a magnitude, not a sign. WindowsPath
+;; ignores case, as the file system does. Its argument is cast to a Path, so a
+;; File (or a string) is a ClassCastException, not a comparison.
+(define (npath-compare-for windows? s o)
+  (if windows?
+      (jvm-string-ci-compare s o)
+      (let* ((x (string->utf8 s)) (y (string->utf8 o))
+             (nx (bytevector-length x)) (ny (bytevector-length y)))
+        (let loop ((i 0))
+          (cond ((or (fx=? i nx) (fx=? i ny)) (fx- nx ny))
+                ((fx=? (bytevector-u8-ref x i) (bytevector-u8-ref y i)) (loop (fx+ i 1)))
+                (else (fx- (bytevector-u8-ref x i) (bytevector-u8-ref y i))))))))
+(define (npath-compare s other)
+  (unless (nio-path? other)
+    (throw-jvm 'ClassCastException
+               (string-append "class " (jolt-class-name other)
+                              " cannot be cast to class java.nio.file.Path")))
+  (npath-compare-for (nio-windows?) s (nio-path-str other)))
+
 (define (nio-path-method self name rest)   ; -> boxed result, or #f to fall through
   (let ((s (nio-path-str self)))
     (cond
@@ -261,8 +281,7 @@
                                                    (b (exact (truncate (car rest))))
                                                    (e (exact (truncate (cadr rest)))))
                                                (make-nio-path (npath-rebuild "" (list-head (list-tail segs b) (- e b)))))))
-      ((string=? name "compareTo")     (list (let ((o (npath-string-of (car rest))))
-                                               (cond ((string<? s o) -1) ((string>? s o) 1) (else 0)))))
+      ((string=? name "compareTo")     (list (npath-compare s (car rest))))
       ((string=? name "equals")        (list (and (nio-path? (car rest)) (string=? s (nio-path-str (car rest))))))
       ((string=? name "hashCode")      (list (string-hash s)))
       ((string=? name "iterator")      (list (list->cseq (map make-nio-path (npath-segs s)))))

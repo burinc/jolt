@@ -117,11 +117,12 @@
   (__register-compare!
    (fn [a b] (or (jt? a) (jt? b)))
    (fn [a b]
-     (when-not (same-type? a b)
-       (throw (ex-info "compare: incomparable time values" {:a a :b b})))
+     ;; compareTo's cast refuses a value of another type, and a type with no
+     ;; order is not Comparable at all: both are ClassCastExceptions on the JVM
      (let [cmp (:cmp (spec-of a))]
-       (when-not cmp
-         (throw (ex-info "compare: unordered time type" {:type (type-of a)})))
+       (when-not (and cmp (same-type? a b))
+         (throw (jolt.host/throwable "java.lang.ClassCastException"
+                                     (str (pr-str a) " cannot be compared to " (pr-str b)))))
        (cmp a b))))
   ;; java.lang.Object is answered here too, not just by the host's root rule: an
   ;; arm returns a DEFINITIVE false for any class the value's set does not list,

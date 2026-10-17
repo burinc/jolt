@@ -305,6 +305,13 @@
                            (compare-fast-probes)
                            "the jolt-compare same-type fast path"))
 (define jolt-compare-arms '())
+;; What compare does once no arm answers: Util.compare's own last step, which on
+;; this host is the ClassCastException until host-class.ss can ask the class
+;; model whether the value is Comparable (it installs that answer here, over
+;; jolt-compare-incomparable, which stays the refusal it falls back to).
+(define (jolt-compare-incomparable a b)
+  (throw-jvm (quote ClassCastException) (string-append (jolt-final-str a) " cannot be compared to " (jolt-final-str b))))
+(define jolt-compare-miss jolt-compare-incomparable)
 (define (register-compare-arm! pred handler)
   (compare-arm-reject-fast-type! 'register-compare-arm! pred)
   (set! jolt-compare-arms (cons (cons pred handler) jolt-compare-arms)))
@@ -345,7 +352,7 @@
                  (let ((r (jolt-compare (pvec-nth-d a i jolt-nil) (pvec-nth-d b i jolt-nil))))
                    (if (= r 0) (loop (+ i 1)) r)))))))
     (else (let loop ((as jolt-compare-arms))
-            (cond ((null? as) (throw-jvm (quote ClassCastException) (string-append (jolt-final-str a) " cannot be compared to " (jolt-final-str b))))
+            (cond ((null? as) (jolt-compare-miss a b))
                   (((caar as) a b) ((cdar as) a b))
                   (else (loop (cdr as))))))))
 
