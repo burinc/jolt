@@ -84,6 +84,36 @@
      loop-ceiling)
   #t)
 
+;; --- nested reduce closures -------------------------------------------------
+;; A fn-literal reduce's accumulator type is a fixpoint too (reduce-acc-type):
+;; the closure is probed under each seed until its return stops widening, then
+;; inferred once more for real. Every probe of an outer closure re-ran the
+;; nested reduce's whole fixpoint, so each level doubled the work. Two shapes:
+;; levels independent of each other, and each level's accumulator starting from
+;; (and adding) the enclosing one's, so the inner fixpoint really does see a
+;; different context on every outer probe.
+(define (reduce-src d capture?)
+  (let build ((k 0))
+    (if (= k d)
+        (if (> k 0) (format "x~a" (- k 1)) "0")
+        (let ((outer (if (and capture? (> k 0)) (format "acc~a" (- k 1)) #f)))
+          (format "(reduce (fn [acc~a x~a] (+ acc~a ~a~a)) ~a [1 2 3])"
+                  k k k (if outer (string-append outer " ") "") (build (+ k 1))
+                  (or outer "0"))))))
+(define reduce-n 5)
+(define (reduce-row label capture?)
+  (let ((small (anode (string-append "(fn [] " (reduce-src reduce-n capture?) ")")))
+        (big (anode (string-append "(fn [] " (reduce-src (+ reduce-n 3) capture?) ")"))))
+    ;; linear reads ~1.6; doubling per level read 8 or more
+    (gate-check label
+      (< (report (string-append label ": run-inference depth n+3 / n")
+                 (ratio (lambda () (run-inference U small))
+                        (lambda () (run-inference U big)) 5))
+         loop-ceiling)
+      #t)))
+(reduce-row "nested reduce closures" #f)
+(reduce-row "nested reduce closures over the outer accumulator" #t)
+
 ;; --- nested ^Record-hinted fns ----------------------------------------------
 (evals "(defrecord P [x y])")
 (set-record-shapes! U (chez-record-shapes-map))
