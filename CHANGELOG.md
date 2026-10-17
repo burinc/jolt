@@ -63,6 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a value of another type, raises ClassCastException instead of
   ExceptionInfo, a NullPointerException or a made-up answer.
 
+- **`compare` on strings, symbols, keywords and chars answers what the JVM
+  does.** It returned only the sign, so `(compare "ab" "abcd")` was -1 where
+  `String.compareTo` answers -2, and a comparator that reads the magnitude
+  disagreed with the JVM. Strings now compare by UTF-16 unit as Java's do, so
+  a character outside the BMP sorts before `￿` instead of after it, in
+  `.compareTo` as well as `compare`. String sorting is also about 15% faster.
+
 - **A `:local/root` reached by two spellings is one dependency (#1394).** In a
   multi-module project, `../libs` and `../tui/../libs` name the same directory,
   but jolt compared them as strings and warned about a version conflict on

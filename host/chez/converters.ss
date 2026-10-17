@@ -281,10 +281,43 @@
 
 ;; compare: 3-way, returns an EXACT integer (= JVM compare -> int).
 (define (jolt-cmp3 x y) (cond ((< x y) -1) ((> x y) 1) (else 0)))
-(define (jolt-strcmp a b) (cond ((string<? a b) -1) ((string>? a b) 1) (else 0)))
-(define (jolt-sym-ns-string s)
-  (let ((n (symbol-t-ns s))) (if (or (jolt-nil? n) (not n) (eq? n '())) "" n)))
-;; compare returns an EXACT integer -1/0/1 (= JVM compare -> int).
+;; String.compareTo: the difference of the first UTF-16 units that differ, else
+;; the difference of the lengths in UTF-16 units -- a magnitude, which compare
+;; hands back as is ((compare "ab" "abcd") is -2). A Chez char is a code point,
+;; so a supplementary one compares as its surrogate pair: "\uD83D\uDE00" sorts
+;; before "\uFFFF" on the JVM, where code-point order puts it after.
+(define (utf16-hi n) (if (fx<? n #x10000) n (fx+ #xD800 (fxsra (fx- n #x10000) 10))))
+(define (utf16-lo n) (fx+ #xDC00 (fxand (fx- n #x10000) #x3FF)))
+;; the UTF-16 length of s[i..n); i and n are within s
+(define (utf16-units-from s i n)
+  (let loop ((i i) (k 0))
+    (if (sa-ufx=? i n) k
+        (loop (sa-ufx+ i 1) (if (fx<? (char->integer (sa-ustring-ref s i)) #x10000) (sa-ufx+ k 1) (sa-ufx+ k 2))))))
+;; The scan is unchecked: i only climbs from 0 while it is below both lengths.
+;; It is compare's hottest string loop, and Chez's string<? -- which it replaced
+;; -- is compiled unchecked too.
+(define (jolt-strcmp a b)
+  (let ((la (string-length a)) (lb (string-length b)))
+    (let loop ((i 0))
+      (if (or (sa-ufx=? i la) (sa-ufx=? i lb))
+          (sa-ufx- (utf16-units-from a i la) (utf16-units-from b i lb))
+          (let ((x (char->integer (sa-ustring-ref a i))) (y (char->integer (sa-ustring-ref b i))))
+            (cond ((sa-ufx=? x y) (loop (sa-ufx+ i 1)))
+                  ;; below the supplementary range a char is its one UTF-16 unit
+                  ((and (fx<? x #x10000) (fx<? y #x10000)) (sa-ufx- x y))
+                  ;; two distinct chars share a high unit only as surrogate pairs
+                  ((fx=? (utf16-hi x) (utf16-hi y)) (fx- (utf16-lo x) (utf16-lo y)))
+                  (else (fx- (utf16-hi x) (utf16-hi y)))))))))
+(define (jolt-ns-or-f n) (if (or (jolt-nil? n) (not n) (eq? n '())) #f n))
+;; Symbol.compareTo (Keyword.compareTo is its symbol's): no namespace sorts
+;; before any namespace, then the namespaces' String.compareTo, then the names'
+(define (jolt-named-cmp ans aname bns bname)
+  (cond ((not ans) (if bns -1 (jolt-strcmp aname bname)))
+        ((not bns) 1)
+        (else (let ((r (jolt-strcmp ans bns))) (if (fx=? r 0) (jolt-strcmp aname bname) r)))))
+;; compare returns an EXACT integer, what the JVM's compare answers: -1/0/1 for
+;; numbers, booleans and a vector length, and the compareTo difference for
+;; strings, symbols, keywords and chars.
 ;; A host shim registers a type's ordering via register-compare-arm! (cf.
 ;; register-eq-arm!): an arm is (pred . handler) on (a b); the arm applies when
 ;; pred holds (typically either arg is the type) and handler returns -1/0/1.
@@ -332,16 +365,14 @@
     ((jolt-nil? b) 1)
     ((and (number? a) (number? b)) (jolt-cmp3 a b))
     ((and (string? a) (string? b)) (jolt-strcmp a b))
-    ;; keywords order like symbols: a nil namespace sorts before any namespace,
-    ;; then by namespace, then by name (Keyword.compareTo -> Symbol.compareTo)
+    ;; keywords order like symbols (Keyword.compareTo -> Symbol.compareTo)
     ((and (keyword? a) (keyword? b))
-     (let ((r (jolt-strcmp (or (keyword-t-ns a) "") (or (keyword-t-ns b) ""))))
-       (if (= r 0) (jolt-strcmp (keyword-t-name a) (keyword-t-name b)) r)))
+     (jolt-named-cmp (jolt-ns-or-f (keyword-t-ns a)) (keyword-t-name a) (jolt-ns-or-f (keyword-t-ns b)) (keyword-t-name b)))
     ((and (jolt-symbol? a) (jolt-symbol? b))
-     (let ((r (jolt-strcmp (jolt-sym-ns-string a) (jolt-sym-ns-string b))))
-       (if (= r 0) (jolt-strcmp (symbol-t-name a) (symbol-t-name b)) r)))
+     (jolt-named-cmp (jolt-ns-or-f (symbol-t-ns a)) (symbol-t-name a) (jolt-ns-or-f (symbol-t-ns b)) (symbol-t-name b)))
     ((and (boolean? a) (boolean? b)) (cond ((eq? a b) 0) ((eq? a #f) -1) (else 1)))
-    ((and (char? a) (char? b)) (jolt-cmp3 (char->integer a) (char->integer b)))
+    ;; Character.compareTo is the difference of the two chars
+    ((and (char? a) (char? b)) (fx- (char->integer a) (char->integer b)))
     ((and (pvec? a) (pvec? b))
      (let ((la (pvec-count a)) (lb (pvec-count b)))
        (if (not (= la lb))

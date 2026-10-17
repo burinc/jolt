@@ -339,6 +339,7 @@ sa-ufx>=?
 sa-ufx=?
 sa-uvector-ref
 sa-uvector-set!
+sa-ustring-ref
 #   The flonum family, for the typed foreign-array copies (java/ffi.ss): an
 #   flvector element and an IEEE single or double in a bytevector at a byte
 #   offset. Same contract: on an index within the flvector and an offset whose
