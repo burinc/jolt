@@ -196,6 +196,16 @@ is new.
   folds away when the argument is already proven), anything else answers what
   `jolt run` does. `defrecord`'s own `this` is still trusted, since dispatch
   guarantees it.
+- **Nested loops no longer make a built binary's compile time grow
+  exponentially.** Each pass of an outer loop's fixpoint (the numeric pass's
+  loop-variable kinds, and the loop-variable types above) re-ran the fixpoint of
+  every loop nested in it, so each level of nesting doubled or tripled the
+  work: ten nested loops took 444 ms in the numeric pass and 20 ms in type
+  inference. Both take 0.2 ms now, and emit the same code. Hinted fns nested in
+  hinted fns no longer double the emitted code per level either, and neither do
+  `reduce` closures nested in `reduce` closures: each probe of the outer
+  closure's accumulator type re-ran the inner one's from scratch, so ten levels
+  took 13 ms to infer, now 0.13 ms.
 - **An out-of-bounds read or write on a hinted or constructed primitive array
   says `Index 5 out of bounds for length 3`**, as the JVM does, instead of
   Chez's `flvector-ref: 5 is not a valid index for #vfl(...)`.
