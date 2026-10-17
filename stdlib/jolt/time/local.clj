@@ -58,11 +58,16 @@
       :day   (local-date (days-from-civil y m v))
       :doy   (local-date (+ (days-from-civil y 1 1) (dec v))))))
 
+;; LocalDate.compareTo0: the year difference, then the month's, then the day's
+(defn ld-cmp [ea eb]
+  (let [[ya ma da] (civil-from-days ea) [yb mb db] (civil-from-days eb)]
+    (impl/first-nonzero (- ya yb) (- ma mb) (- da db))))
+
 (impl/register-type! :jolt.time/local-date
   {:eq   (fn [a b] (= (ld-epoch-day a) (ld-epoch-day b)))
    :hash (fn [d] (ld-epoch-day d))
    :str  (fn [d] (iso-date-str (ld-epoch-day d)))
-   :cmp  (fn [a b] (compare (ld-epoch-day a) (ld-epoch-day b)))
+   :cmp  (fn [a b] (ld-cmp (ld-epoch-day a) (ld-epoch-day b)))
    :classes #{"java.time.LocalDate" "LocalDate"
               "java.time.chrono.ChronoLocalDate" "ChronoLocalDate"
               "java.time.temporal.Temporal" "Temporal"
@@ -99,7 +104,7 @@
    "isBefore"       (fn [d o] (< (ld-epoch-day d) (ld-epoch-day o)))
    "isAfter"        (fn [d o] (> (ld-epoch-day d) (ld-epoch-day o)))
    "isEqual"        (fn [d o] (= (ld-epoch-day d) (ld-epoch-day o)))
-   "compareTo"      (fn [d o] (compare (ld-epoch-day d) (ld-epoch-day o)))
+   "compareTo"      compare
    "equals"         (fn [d o] (boolean (and (impl/jt? o) (ld? o) (= (ld-epoch-day d) (ld-epoch-day o)))))
    "hashCode"       (fn [d] (ld-epoch-day d))
    "atStartOfDay"   (fn [d & _] (local-dt (ld-epoch-day d) 0))
@@ -188,7 +193,7 @@
    "truncatedTo" (fn [t u] (local-time (lt-truncate (lt-nano-of-day t) u)))
    "isBefore"    (fn [t o] (< (lt-nano-of-day t) (lt-nano-of-day o)))
    "isAfter"     (fn [t o] (> (lt-nano-of-day t) (lt-nano-of-day o)))
-   "compareTo"   (fn [t o] (compare (lt-nano-of-day t) (lt-nano-of-day o)))
+   "compareTo"   compare
    "equals"      (fn [t o] (boolean (and (impl/jt? o) (lt? o) (= (lt-nano-of-day t) (lt-nano-of-day o)))))
    "hashCode"    (fn [t] (lt-nano-of-day t))
    "atDate"      (fn [t d] (local-dt (ld-epoch-day d) (lt-nano-of-day t)))
@@ -217,7 +222,9 @@
 (defn ldt-nod [x] (impl/field x :nod))
 (defn ldt? [x] (= :jolt.time/local-date-time (impl/type-of x)))
 (defn- ldt-key [x] [(ldt-epoch-day x) (ldt-nod x)])
-(defn- ldt-cmp [a b] (compare (ldt-key a) (ldt-key b)))
+;; the date's compareTo, then LocalTime's, which is Integer.compare field by field
+(defn- ldt-cmp [a b]
+  (impl/first-nonzero (ld-cmp (ldt-epoch-day a) (ldt-epoch-day b)) (compare (ldt-nod a) (ldt-nod b))))
 
 (defn ldt-date [x] (local-date (ldt-epoch-day x)))
 (defn ldt-time [x] (local-time (ldt-nod x)))
@@ -282,7 +289,7 @@
    "isBefore"      (fn [x o] (neg? (ldt-cmp x o)))
    "isAfter"       (fn [x o] (pos? (ldt-cmp x o)))
    "isEqual"       (fn [x o] (= (ldt-key x) (ldt-key o)))
-   "compareTo"     ldt-cmp
+   "compareTo"     compare
    "equals"        (fn [x o] (boolean (and (impl/jt? o) (ldt? o) (= (ldt-key x) (ldt-key o)))))
    "hashCode"      (fn [x] (+ (* (ldt-epoch-day x) 31) (ldt-nod x)))
    "toString"      (fn [x] (iso-datetime-str (ldt-epoch-day x) (ldt-nod x)))})

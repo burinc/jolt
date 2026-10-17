@@ -72,6 +72,17 @@
       (System/currentTimeMillis))
     (System/currentTimeMillis)))
 
+;; java.time's compareTo answers the first field difference, a magnitude, not
+;; its sign: LocalDate's is the year difference, then the month's, then the
+;; day's. The :cmp fns build that from the per-field differences in order.
+(defn first-nonzero [& cs] (or (some #(when-not (zero? %) %) cs) 0))
+
+;; Instant and Duration: Long.compare on the seconds, then the nano difference.
+(defn secs-nanos-cmp [a b]
+  (let [na (mod a 1000000000) nb (mod b 1000000000)
+        sa (quot (- a na) 1000000000) sb (quot (- b nb) 1000000000)]
+    (if (= sa sb) (- na nb) (compare sa sb))))
+
 (defn jt?
   "Is v one of our java.time values?"
   [v]

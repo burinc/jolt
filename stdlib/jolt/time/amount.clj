@@ -102,7 +102,7 @@
   {:eq   (fn [a b] (= (dur-total-nanos a) (dur-total-nanos b)))
    :hash (fn [d] (hash (dur-total-nanos d)))
    :str  (fn [d] (dur->string (dur-secs d) (dur-nanos d)))
-   :cmp  (fn [a b] (compare (dur-total-nanos a) (dur-total-nanos b)))
+   :cmp  (fn [a b] (impl/secs-nanos-cmp (dur-total-nanos a) (dur-total-nanos b)))
    :classes #{"java.time.Duration" "Duration"
               "java.time.temporal.TemporalAmount" "TemporalAmount"
               "java.lang.Comparable" "Comparable"}})
@@ -136,7 +136,7 @@
    "withNanos" (fn [d na] (normalize (dur-secs d) (u/->long na)))
    "isZero" (fn [d] (and (zero? (dur-secs d)) (zero? (dur-nanos d))))
    "isNegative" (fn [d] (neg? (dur-total-nanos d)))
-   "compareTo" (fn [d o] (compare (dur-total-nanos d) (dur-total-nanos o)))
+   "compareTo" compare
    "equals" (fn [d o] (boolean (and (impl/jt? o) (dur? o) (= (dur-total-nanos d) (dur-total-nanos o)))))
    "hashCode" (fn [d] (hash (dur-total-nanos d)))
    "toString" (fn [d] (dur->string (dur-secs d) (dur-nanos d)))})

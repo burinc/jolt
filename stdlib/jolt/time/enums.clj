@@ -43,7 +43,7 @@
    "minLength" (fn [e] (if (= 2 (month-val e)) 28 (u/len-of-month 1 (month-val e))))
    "maxLength" (fn [e] (if (= 2 (month-val e)) 29 (u/len-of-month 1 (month-val e))))
    "firstMonthOfQuarter" (fn [e] (month (inc (* 3 (quot (dec (month-val e)) 3)))))
-   "compareTo" (fn [e o] (- (month-val e) (month-val o)))
+   "compareTo" compare
    "equals"    (fn [e o] (boolean (and (impl/jt? o) (= :jolt.time/month (impl/type-of o))
                                         (= (month-val e) (month-val o)))))
    "hashCode"  (fn [e] (month-val e))})
@@ -82,7 +82,7 @@
    "getDisplayName" (fn [e & _] (dow-name e))
    "plus"      (fn [e n] (dow (inc (u/floor-mod (+ (dec (dow-val e)) (u/->long n)) 7))))
    "minus"     (fn [e n] (dow (inc (u/floor-mod (- (dec (dow-val e)) (u/->long n)) 7))))
-   "compareTo" (fn [e o] (- (dow-val e) (dow-val o)))
+   "compareTo" compare
    "equals"    (fn [e o] (boolean (and (impl/jt? o) (= :jolt.time/day-of-week (impl/type-of o))
                                         (= (dow-val e) (dow-val o)))))
    "hashCode"  (fn [e] (dow-val e))})
@@ -119,7 +119,7 @@
   {"name"       cu-name
    "toString"   cu-name
    "ordinal"    (fn [u] (u/chrono-unit-index (cu-name u)))
-   "compareTo"  (fn [u o] (- (u/chrono-unit-index (cu-name u)) (u/chrono-unit-index (cu-name o))))
+   "compareTo"  compare
    "isTimeBased" (fn [u] (contains? time-based-units (cu-name u)))
    "isDateBased" (fn [u] (contains? #{"DAYS" "WEEKS" "MONTHS" "YEARS" "DECADES"
                                       "CENTURIES" "MILLENNIA" "ERAS"} (cu-name u)))
@@ -152,7 +152,7 @@
   {"name"      cf-name
    "toString"  cf-name
    "ordinal"   (fn [f] (u/chrono-field-index (cf-name f)))
-   "compareTo" (fn [f o] (- (u/chrono-field-index (cf-name f)) (u/chrono-field-index (cf-name o))))
+   "compareTo" compare
    "getDisplayName" (fn [f & _] (cf-name f))
    "isDateBased" (fn [f] (contains? u/date-based-fields (cf-name f)))
    "isTimeBased" (fn [f] (not (or (contains? u/date-based-fields (cf-name f))

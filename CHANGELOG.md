@@ -56,9 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StringBuilder` and `TimeUnit` also answer `(instance? Comparable x)` true
   now, `TimeUnit` is an `Enum` with `ordinal`, and `Path`/`File` `.compareTo`
   return the JDK's magnitudes and refuse each other with a ClassCastException.
-  The `java.time` enums compare by ordinal difference, as `Enum.compareTo`
-  does, and comparing two different time types raises ClassCastException
-  instead of ExceptionInfo.
+  The `java.time` types compare as their `compareTo` does: the enums by
+  ordinal difference, `LocalDate`, `Year`, `YearMonth` and `MonthDay` by the
+  first field difference, `Instant` and `Duration` by seconds then the nano
+  difference. Comparing two different time types, or calling `.compareTo`
+  with a value of another type, raises ClassCastException instead of
+  ExceptionInfo, a NullPointerException or a made-up answer.
 
 - **A `:local/root` reached by two spellings is one dependency (#1394).** In a
   multi-module project, `../libs` and `../tui/../libs` name the same directory,
