@@ -92,7 +92,7 @@
   (and (who-condition? c) (memq (condition-who c) array-index-whos)
        (irritants-condition? c)
        (let ((irr (condition-irritants c)))
-         (and (list? irr) (= (length irr) 2) (fixnum? (car irr))
+         (and (list? irr) (= (length irr) 2) (and (integer? (car irr)) (exact? (car irr)))
               (let* ((b (cadr irr))
                      (n (cond ((flvector? b) (flvector-length b))
                               ((fxvector? b) (fxvector-length b))
