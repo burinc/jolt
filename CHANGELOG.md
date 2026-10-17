@@ -73,6 +73,18 @@ is new.
   against an equal freshly built one; the restore walk maps every instance
   back to the one nil, in values, collection slots, record fields and map
   keys alike.
+- **Indexes outside the int range behave as on the JVM.** `nth` (with or
+  without a default), `aget`, `aset`, `subs`, `subvec` and `.charAt` take their
+  index through `RT.intCast`, so `(nth v 4294967296)` raises
+  `ArithmeticException` "integer overflow", and a bignum past the long range
+  raises "Value out of range for long". jolt raised an out-of-bounds error, or
+  leaked Chez's `fx>=?: ... is not a fixnum`. `get`, `contains?`, `find`,
+  `assoc`, `assoc!` and a vector called as a fn read the key's `intValue` as
+  the JVM does, so `(get [:a :b] 4294967297)` is `:b`. A vector takes only an
+  integer key, so `(get [:a :b] 1.0)` is nil and `([:a :b] 1.0)` raises "Key
+  must be integer". A string or array takes any number, so `(contains? "ab"
+  1.5)` is true. `contains?` works on arrays, and a fractional index truncates
+  toward zero: `(nth v -0.5)` is the first element.
 - **`clojure.pprint/pp` prints `*1` (#1388).** It expanded to nil; it is
   `(pprint *1)` now, as in Clojure.
 - **`.invoke` and `.applyTo` work on every `IFn`.** `(.invoke f x)` raised "No
