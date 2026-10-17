@@ -195,17 +195,14 @@
 ;; foreign call between tries, which deactivates the thread whatever its
 ;; disable count, so the collection finishes and the holder can release.
 ;;
-;; Both are read here rather than through the adapter: the fibers gates load
-;; this file on its own.
-(define (jolt-locks-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
-;; A collect-safe call that returns at once: sched_yield, or SwitchToThread on
-;; Windows. With neither entry it is a plain spin, which is the old behavior.
+;; Both come from the adapter (sa-disable-count, sa-collect-safe-pause). The
+;; fibers gates load this file without one, and get the derived count and a
+;; plain spin, as fibers.ss's jolt-current-disable-count does.
+(define jolt-locks-disable-count
+  (guard (e (#t (lambda () (let ((n (disable-interrupts))) (enable-interrupts) (fx- n 1)))))
+    sa-disable-count))
 (define jolt-collect-safe-pause
-  (begin
-    (guard (e (#t #f)) (load-shared-object #f))
-    (or (guard (e (#t #f)) (foreign-procedure __collect_safe "sched_yield" () int))
-        (guard (e (#t #f)) (foreign-procedure __collect_safe "SwitchToThread" () int))
-        (lambda () 0))))
+  (guard (e (#t (lambda () 0))) sa-collect-safe-pause))
 (define-syntax jolt-mutex-acquire!
   (syntax-rules ()
     ((_ m) (let ((jma-mu m))
