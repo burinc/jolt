@@ -688,14 +688,45 @@
 ;; The probes run under a sub-env with their own diags/calls cells (the
 ;; isolated-diag-count pattern) so only the final inference reports and feeds the
 ;; whole-program param joins.
+;;
+;; A probe of an outer closure re-infers every reduce nested in it, and each of
+;; those ran its own fixpoint from scratch, so nested reduce closures cost
+;; (probes per level)^depth. Two things keep it polynomial, both scoped to the
+;; outermost reduce (its :acc-memo cell, made by infer-reduce-hof):
+;;
+;; - The memo remembers, per closure, the context it last converged in (init,
+;;   element type, tenv) and the answer. The same context answers without a
+;;   probe. A context at least as wide as the remembered one restarts from the
+;;   remembered answer instead of the init: inference is monotone, so the old
+;;   answer is at or below the new least fixpoint, and iterating up from there
+;;   reaches the same one. Inside one outer fixpoint the contexts only widen.
+;; - A probe only needs a nested reduce's TYPE, which is its accumulator type
+;;   (the closure's return under a converged seed is within it), so under
+;;   :acc-probe? the nested reduce skips its final, node-producing inference.
 (def ^:private reduce-acc-rounds 4)
+(defn- type-le? [a b] (= (join a b) b))
+(defn- tenv-le? [a b]
+  (and (= (count a) (count b))
+       (every? (fn [e] (and (contains? a (key e)) (type-le? (get a (key e)) (val e)))) b)))
 (defn- reduce-acc-type [fnode init-t et tenv env]
-  (let [sub (assoc env :diags (atom []) :calls (atom []))]
-    (loop [seed init-t rounds reduce-acc-rounds]
-      (if (or (= seed :any) (= rounds 0))
-        :any
-        (let [next (join seed (ty (infer-fn-seeded fnode {0 seed 1 et} tenv sub)))]
-          (if (= next seed) seed (recur next (- rounds 1))))))))
+  (let [memo (get env :acc-memo)
+        prev (when memo (get @memo fnode))
+        ctx [init-t et tenv]]
+    (if (and prev (= (nth prev 0) ctx))
+      (nth prev 1)
+      (let [sub (assoc env :diags (atom []) :calls (atom []) :acc-probe? true)
+            pc (when prev (nth prev 0))
+            start (if (and pc (type-le? (nth pc 0) init-t) (type-le? (nth pc 1) et)
+                           (tenv-le? (nth pc 2) tenv))
+                    (join init-t (nth prev 1))
+                    init-t)
+            r (loop [seed start rounds reduce-acc-rounds]
+                (if (or (= seed :any) (= rounds 0))
+                  :any
+                  (let [next (join seed (ty (infer-fn-seeded fnode {0 seed 1 et} tenv sub)))]
+                    (if (= next seed) seed (recur next (- rounds 1))))))]
+        (when memo (swap! memo assoc fnode [ctx r]))
+        r))))
 
 (defn- infer-reduce-hof
   "reduce over a typed vector with a fn-literal: seed the closure's accumulator
@@ -703,17 +734,20 @@
   (param 1) to the vector's element type, so its body — and any calls it makes —
   see those types."
   [node args n tenv env]
-  (let [three (>= n 3)
+  (let [env (if (get env :acc-memo) env (assoc env :acc-memo (atom {})))
+        three (>= n 3)
         coll-r (infer (nth args (if three 2 1)) tenv env)
         init-r (when three (infer (nth args 1) tenv env))
         et (let [ct (ty coll-r)] (if (vec-type? ct) (velem ct) :any))
         init-t (if init-r (ty init-r) :any)
-        acc-t (reduce-acc-type (nth args 0) init-t et tenv env)
-        fn-r (infer-fn-seeded (nth args 0) {0 acc-t 1 et} tenv env)]
-    [(join acc-t (ty fn-r))
-     (assoc node :args (if three
-                         [(nd fn-r) (nd init-r) (nd coll-r)]
-                         [(nd fn-r) (nd coll-r)]))]))
+        acc-t (reduce-acc-type (nth args 0) init-t et tenv env)]
+    (if (get env :acc-probe?)
+      [acc-t node]
+      (let [fn-r (infer-fn-seeded (nth args 0) {0 acc-t 1 et} tenv env)]
+        [(join acc-t (ty fn-r))
+         (assoc node :args (if three
+                             [(nd fn-r) (nd init-r) (nd coll-r)]
+                             [(nd fn-r) (nd coll-r)]))]))))
 
 (defn- infer-seq-hof
   "map/mapv/filter/... over a typed vector with a fn-literal: seed the fn's element

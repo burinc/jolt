@@ -175,7 +175,10 @@ is new.
   every loop nested in it, so each level of nesting doubled or tripled the
   work: ten nested loops took 444 ms in the numeric pass and 20 ms in type
   inference. Both take 0.2 ms now, and emit the same code. Hinted fns nested in
-  hinted fns no longer double the emitted code per level either.
+  hinted fns no longer double the emitted code per level either, and neither do
+  `reduce` closures nested in `reduce` closures: each probe of the outer
+  closure's accumulator type re-ran the inner one's from scratch, so ten levels
+  took 13 ms to infer, now 0.13 ms.
 - **An out-of-bounds read or write on a hinted or constructed primitive array
   says `Index 5 out of bounds for length 3`**, as the JVM does, instead of
   Chez's `flvector-ref: 5 is not a valid index for #vfl(...)`.
