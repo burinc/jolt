@@ -1660,12 +1660,19 @@
 ;; Contract: return promptly and let a collection run meanwhile. Degradation: a
 ;; target with no such entry, or whose collector never stops other threads,
 ;; may answer a plain no-op.
+;; Windows builds it at run time: a compiled foreign reference there is a load
+;; relocation that aborts the boot when the entry is missing, before any guard
+;; runs (see sa-foreign-procedure-runtime), which is how a literal sched_yield
+;; stopped every Windows binary from starting.
 (define sa-collect-safe-pause
-  (begin
-    (guard (e (#t #f)) (load-shared-object #f))
-    (or (guard (e (#t #f)) (foreign-procedure __collect_safe "sched_yield" () int))
-        (guard (e (#t #f)) (foreign-procedure __collect_safe "SwitchToThread" () int))
-        (lambda () 0))))
+  (or (guard (e (#t #f))
+        (sa-load-shared-object #f)
+        (if (eq? (sa-os-family) 'windows)
+            (and (sa-foreign-entry? "SwitchToThread")
+                 (sa-foreign-procedure-runtime "SwitchToThread" '() 'int #t))
+            (and (sa-foreign-entry? "sched_yield")
+                 (foreign-procedure __collect_safe "sched_yield" () int))))
+      (lambda () 0)))
 
 
 ;; ---- handler-backed output ports ---------------------------------------------
