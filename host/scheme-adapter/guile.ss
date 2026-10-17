@@ -185,7 +185,7 @@
 ;;                                        the permitted degradation; a tuned port may
 ;;                                        expand to the unchecked variants.
 ;;   sa-uvector-ref sa-uvector-set!       UNIMPLEMENTED  Guile: vector-ref /
-;;                                        vector-set! (degradation), or the
+;;   sa-ustring-ref                       vector-set! / string-ref (degradation), or the
 ;;                                        unchecked accessors when the port is tuned.
 ;;   sa-uflvector-ref sa-uflvector-set!   UNIMPLEMENTED  Guile: f64vector-ref /
 ;;                                        f64vector-set! (SRFI 4) as the degradation.

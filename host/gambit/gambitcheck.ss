@@ -146,7 +146,7 @@
     sa-foreign-procedure-blocking
     sa-foreign-callable sa-foreign-callable-collect-safe
     ;; capability-unchecked: expand to the checked primitives here
-    sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=? sa-uvector-ref sa-uvector-set!
+    sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=? sa-uvector-ref sa-uvector-set! sa-ustring-ref
     sa-uflvector-ref sa-uflvector-set!
     sa-ubytevector-ieee-single-native-ref sa-ubytevector-ieee-single-native-set!
     sa-ubytevector-ieee-double-native-ref sa-ubytevector-ieee-double-native-set!))
@@ -242,6 +242,7 @@
   (check "sa-ufx=?" (sa-ufx=? 3 3) #t)
   (check "sa-uvector-ref" (sa-uvector-ref (vector 1 2 3) 1) 2)
   (check "sa-uvector-set!" (let ((v (vector 1 2 3))) (sa-uvector-set! v 1 9) (vector-ref v 1)) 9)
+  (check "sa-ustring-ref" (sa-ustring-ref "abc" 1) #\b)
   (check "sa-uflvector-set!/-ref" (let ((v (make-f64vector 3 0.))) (sa-uflvector-set! v 1 2.5) (sa-uflvector-ref v 1)) 2.5)
   ;; native (little-endian) IEEE patterns: 1.5 is #x3fc00000 single, #x3ff8000000000000 double
   (check "sa-ubytevector-ieee-single-native-set!"

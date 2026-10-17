@@ -48,6 +48,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`compare` and `sort` take any `Comparable` host value (#1395).** A
+  `java.nio.file.Path`, `java.io.File`, `StringBuilder` or `TimeUnit` had a
+  working `.compareTo` that `compare` never asked, so `(sort (fs/list-dir d))`
+  raised a ClassCastException. `compare` now falls back to the value's own
+  `compareTo` when the class is Comparable and both values share it. `File`,
+  `StringBuilder` and `TimeUnit` also answer `(instance? Comparable x)` true
+  now, `TimeUnit` is an `Enum` with `ordinal`, and `Path`/`File` `.compareTo`
+  return the JDK's magnitudes and refuse each other with a ClassCastException.
+  The `java.time` types compare as their `compareTo` does: the enums by
+  ordinal difference, `LocalDate`, `Year`, `YearMonth` and `MonthDay` by the
+  first field difference, `Instant` and `Duration` by seconds then the nano
+  difference. Comparing two different time types, or calling `.compareTo`
+  with a value of another type, raises ClassCastException instead of
+  ExceptionInfo, a NullPointerException or a made-up answer.
+
+- **`compare` on strings, symbols, keywords and chars answers what the JVM
+  does.** It returned only the sign, so `(compare "ab" "abcd")` was -1 where
+  `String.compareTo` answers -2, and a comparator that reads the magnitude
+  disagreed with the JVM. Strings now compare by UTF-16 unit as Java's do, so
+  a character outside the BMP sorts before `￿` instead of after it, in
+  `.compareTo` as well as `compare`. String sorting is also about 15% faster.
+
+- **A `:local/root` reached by two spellings is one dependency (#1394).** In a
+  multi-module project, `../libs` and `../tui/../libs` name the same directory,
+  but jolt compared them as strings and warned about a version conflict on
+  every start. Local roots are now identified by their canonical path, as
+  tools.deps does. The same fix bounds the cache key's walk over local deps,
+  which followed a `../` cycle until the path grew past the OS limit.
+
 - **A body the inline pass copies into its callers behaves like the fn it came
   from.** In a built binary (and under `:direct-linking` at the REPL), a regex,
   quoted form or constant collection literal became a separate object at every

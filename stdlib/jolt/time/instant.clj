@@ -56,7 +56,7 @@
   {:eq   (fn [a b] (= (inst-nanos a) (inst-nanos b)))
    :hash (fn [x] (inst-nanos x))
    :str  (fn [x] (iso-instant-str (inst-nanos x)))
-   :cmp  (fn [a b] (compare (inst-nanos a) (inst-nanos b)))
+   :cmp  (fn [a b] (impl/secs-nanos-cmp (inst-nanos a) (inst-nanos b)))
    :classes #{"java.time.Instant" "Instant"
               "java.time.temporal.Temporal" "Temporal"
               "java.time.temporal.TemporalAccessor" "TemporalAccessor"
@@ -82,7 +82,7 @@
      "minusNanos"  (fn [x n] (instant (- (inst-nanos x) (u/->long n))))
      "isBefore"    (fn [x o] (< (inst-nanos x) (o-nanos o)))
      "isAfter"     (fn [x o] (> (inst-nanos x) (o-nanos o)))
-     "compareTo"   (fn [x o] (compare (inst-nanos x) (o-nanos o)))
+     "compareTo"   (fn [x o] (impl/secs-nanos-cmp (inst-nanos x) (o-nanos o)))
      "equals"      (fn [x o] (= (inst-nanos x) (o-nanos o)))
      "hashCode"    (fn [x] (inst-nanos x))
      "truncatedTo" (fn [x unit] (let [d (unit-nanos unit)] (instant (* (u/floor-div (inst-nanos x) d) d))))

@@ -83,15 +83,9 @@
 ;; not decoration — (.compareTo "a" "c") is -2 and (.compareTo "abcd" "ab") is 2 —
 ;; and a sign-only answer beside a compareToIgnoreCase that reports the real
 ;; difference is two contracts for one pair of methods.
-(define (jvm-string-compare a b)
-  (let ((la (string-length a)) (lb (string-length b)))
-    (let loop ((i 0))
-      (if (or (fx=? i la) (fx=? i lb))
-          (fx- la lb)
-          (let ((ca (string-ref a i)) (cb (string-ref b i)))
-            (if (char=? ca cb)
-                (loop (fx+ i 1))
-                (fx- (char->integer ca) (char->integer cb))))))))
+;; It is compare's own string order (jolt-strcmp, converters.ss), which also
+;; walks a supplementary char as its UTF-16 surrogate pair.
+(define (jvm-string-compare a b) (jolt-strcmp a b))
 
 ;; Two different notions of whitespace, and the JVM uses both. String.trim drops
 ;; anything at or below the space character; clojure.string/trim drops whatever

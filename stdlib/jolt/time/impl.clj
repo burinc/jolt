@@ -72,6 +72,17 @@
       (System/currentTimeMillis))
     (System/currentTimeMillis)))
 
+;; java.time's compareTo answers the first field difference, a magnitude, not
+;; its sign: LocalDate's is the year difference, then the month's, then the
+;; day's. The :cmp fns build that from the per-field differences in order.
+(defn first-nonzero [& cs] (or (some #(when-not (zero? %) %) cs) 0))
+
+;; Instant and Duration: Long.compare on the seconds, then the nano difference.
+(defn secs-nanos-cmp [a b]
+  (let [na (mod a 1000000000) nb (mod b 1000000000)
+        sa (quot (- a na) 1000000000) sb (quot (- b nb) 1000000000)]
+    (if (= sa sb) (- na nb) (compare sa sb))))
+
 (defn jt?
   "Is v one of our java.time values?"
   [v]
@@ -117,11 +128,12 @@
   (__register-compare!
    (fn [a b] (or (jt? a) (jt? b)))
    (fn [a b]
-     (when-not (same-type? a b)
-       (throw (ex-info "compare: incomparable time values" {:a a :b b})))
+     ;; compareTo's cast refuses a value of another type, and a type with no
+     ;; order is not Comparable at all: both are ClassCastExceptions on the JVM
      (let [cmp (:cmp (spec-of a))]
-       (when-not cmp
-         (throw (ex-info "compare: unordered time type" {:type (type-of a)})))
+       (when-not (and cmp (same-type? a b))
+         (throw (jolt.host/throwable "java.lang.ClassCastException"
+                                     (str (pr-str a) " cannot be compared to " (pr-str b)))))
        (cmp a b))))
   ;; java.lang.Object is answered here too, not just by the host's root rule: an
   ;; arm returns a DEFINITIVE false for any class the value's set does not list,

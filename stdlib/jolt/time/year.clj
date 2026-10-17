@@ -18,7 +18,7 @@
   {:eq   (fn [a b] (= (year-val a) (year-val b)))
    :hash (fn [y] (year-val y))
    :str  (fn [y] (str (year-val y)))
-   :cmp  (fn [a b] (compare (year-val a) (year-val b)))
+   :cmp  (fn [a b] (- (year-val a) (year-val b)))
    :classes #{"java.time.Year" "Year"
               "java.time.temporal.Temporal" "Temporal"
               "java.time.temporal.TemporalAccessor" "TemporalAccessor"
@@ -37,7 +37,7 @@
    "atDay"      (fn [y doy] (l/local-date (+ (days-from-civil (year-val y) 1 1) (dec (u/->long doy)))))
    "isBefore"   (fn [y o] (< (year-val y) (year-val o)))
    "isAfter"    (fn [y o] (> (year-val y) (year-val o)))
-   "compareTo"  (fn [y o] (compare (year-val y) (year-val o)))
+   "compareTo"  compare
    "equals"     (fn [y o] (boolean (and (impl/jt? o) (year? o) (= (year-val y) (year-val o)))))
    "hashCode"   year-val
    "toString"   (fn [y] (str (year-val y)))})
@@ -61,7 +61,7 @@
 (defn ym-month [x] (impl/field x :month))
 (defn ym? [x] (= :jolt.time/year-month (impl/type-of x)))
 (defn- ym-key [x] [(ym-year x) (ym-month x)])
-(defn- ym-cmp [a b] (compare (ym-key a) (ym-key b)))
+(defn- ym-cmp [a b] (impl/first-nonzero (- (ym-year a) (ym-year b)) (- (ym-month a) (ym-month b))))
 (defn- ym-plus-months [x n]
   (let [tm (+ (* (ym-year x) 12) (dec (ym-month x)) n)]
     (impl/value :jolt.time/year-month {:year (u/floor-div tm 12) :month (inc (u/floor-mod tm 12))})))
@@ -96,7 +96,7 @@
    "isValidDay"    (fn [x d] (let [dd (u/->long d)] (and (>= dd 1) (<= dd (u/len-of-month (ym-year x) (ym-month x))))))
    "isBefore"      (fn [x o] (neg? (ym-cmp x o)))
    "isAfter"       (fn [x o] (pos? (ym-cmp x o)))
-   "compareTo"     ym-cmp
+   "compareTo"     compare
    "equals"        (fn [x o] (boolean (and (impl/jt? o) (ym? o) (= (ym-key x) (ym-key o)))))
    "hashCode"      (fn [x] (+ (* (ym-year x) 13) (ym-month x)))
    "toString"      ym->string})
@@ -119,7 +119,7 @@
 (impl/register-type! :jolt.time/month-day
   {:eq (fn [a b] (= [(md-month a) (md-day a)] [(md-month b) (md-day b)]))
    :hash (fn [x] (+ (* (md-month x) 100) (md-day x)))
-   :str md->string :cmp (fn [a b] (compare [(md-month a) (md-day a)] [(md-month b) (md-day b)]))
+   :str md->string :cmp (fn [a b] (impl/first-nonzero (- (md-month a) (md-month b)) (- (md-day a) (md-day b))))
    :classes #{"java.time.MonthDay" "MonthDay" "java.time.temporal.TemporalAccessor" "TemporalAccessor"
               "java.time.temporal.TemporalAdjuster" "TemporalAdjuster" "java.lang.Comparable" "Comparable"}})
 
@@ -127,7 +127,7 @@
   {"getMonthValue" md-month "getDayOfMonth" md-day "getMonth" (fn [x] (e/month (md-month x)))
    "atYear" (fn [x y] (l/local-date (days-from-civil (u/->long y) (md-month x) (md-day x))))
    "isValidYear" (fn [x y] (<= (md-day x) (u/len-of-month (u/->long y) (md-month x))))
-   "compareTo" (fn [x o] (compare [(md-month x) (md-day x)] [(md-month o) (md-day o)]))
+   "compareTo" compare
    "equals" (fn [x o] (boolean (and (impl/jt? o) (md? o) (= (md-month x) (md-month o)) (= (md-day x) (md-day o)))))
    "hashCode" (fn [x] (+ (* (md-month x) 100) (md-day x))) "toString" md->string})
 

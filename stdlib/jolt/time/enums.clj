@@ -19,11 +19,13 @@
 (defn month-num [m]
   (if (= :jolt.time/month (impl/type-of m)) (month-val m) (u/->long m)))
 
+;; The four enums below order as Enum.compareTo does: by the ordinal
+;; DIFFERENCE, not its sign, so compare and .compareTo answer the same number.
 (impl/register-type! :jolt.time/month
   {:eq   (fn [a b] (= (month-val a) (month-val b)))
    :hash (fn [e] (month-val e))
    :str  month-name
-   :cmp  (fn [a b] (compare (month-val a) (month-val b)))
+   :cmp  (fn [a b] (- (month-val a) (month-val b)))
    :classes #{"java.time.Month" "Month"
               "java.time.temporal.TemporalAccessor" "TemporalAccessor"
               "java.time.temporal.TemporalAdjuster" "TemporalAdjuster"
@@ -41,7 +43,7 @@
    "minLength" (fn [e] (if (= 2 (month-val e)) 28 (u/len-of-month 1 (month-val e))))
    "maxLength" (fn [e] (if (= 2 (month-val e)) 29 (u/len-of-month 1 (month-val e))))
    "firstMonthOfQuarter" (fn [e] (month (inc (* 3 (quot (dec (month-val e)) 3)))))
-   "compareTo" (fn [e o] (- (month-val e) (month-val o)))
+   "compareTo" compare
    "equals"    (fn [e o] (boolean (and (impl/jt? o) (= :jolt.time/month (impl/type-of o))
                                         (= (month-val e) (month-val o)))))
    "hashCode"  (fn [e] (month-val e))})
@@ -66,7 +68,7 @@
   {:eq   (fn [a b] (= (dow-val a) (dow-val b)))
    :hash (fn [e] (dow-val e))
    :str  dow-name
-   :cmp  (fn [a b] (compare (dow-val a) (dow-val b)))
+   :cmp  (fn [a b] (- (dow-val a) (dow-val b)))
    :classes #{"java.time.DayOfWeek" "DayOfWeek"
               "java.time.temporal.TemporalAccessor" "TemporalAccessor"
               "java.time.temporal.TemporalAdjuster" "TemporalAdjuster"
@@ -80,7 +82,7 @@
    "getDisplayName" (fn [e & _] (dow-name e))
    "plus"      (fn [e n] (dow (inc (u/floor-mod (+ (dec (dow-val e)) (u/->long n)) 7))))
    "minus"     (fn [e n] (dow (inc (u/floor-mod (- (dec (dow-val e)) (u/->long n)) 7))))
-   "compareTo" (fn [e o] (- (dow-val e) (dow-val o)))
+   "compareTo" compare
    "equals"    (fn [e o] (boolean (and (impl/jt? o) (= :jolt.time/day-of-week (impl/type-of o))
                                         (= (dow-val e) (dow-val o)))))
    "hashCode"  (fn [e] (dow-val e))})
@@ -104,8 +106,8 @@
   {:eq   (fn [a b] (= (cu-name a) (cu-name b)))
    :hash (fn [u] (hash (cu-name u)))
    :str  cu-name
-   :cmp  (fn [a b] (compare (u/chrono-unit-index (cu-name a))
-                            (u/chrono-unit-index (cu-name b))))
+   :cmp  (fn [a b] (- (u/chrono-unit-index (cu-name a))
+                      (u/chrono-unit-index (cu-name b))))
    :classes #{"java.time.temporal.ChronoUnit" "ChronoUnit"
               "java.time.temporal.TemporalUnit" "TemporalUnit"
               "java.lang.Comparable" "Comparable" "java.lang.Enum" "Enum"}})
@@ -117,6 +119,7 @@
   {"name"       cu-name
    "toString"   cu-name
    "ordinal"    (fn [u] (u/chrono-unit-index (cu-name u)))
+   "compareTo"  compare
    "isTimeBased" (fn [u] (contains? time-based-units (cu-name u)))
    "isDateBased" (fn [u] (contains? #{"DAYS" "WEEKS" "MONTHS" "YEARS" "DECADES"
                                       "CENTURIES" "MILLENNIA" "ERAS"} (cu-name u)))
@@ -139,8 +142,8 @@
   {:eq   (fn [a b] (= (cf-name a) (cf-name b)))
    :hash (fn [f] (hash (cf-name f)))
    :str  cf-name
-   :cmp  (fn [a b] (compare (u/chrono-field-index (cf-name a))
-                            (u/chrono-field-index (cf-name b))))
+   :cmp  (fn [a b] (- (u/chrono-field-index (cf-name a))
+                      (u/chrono-field-index (cf-name b))))
    :classes #{"java.time.temporal.ChronoField" "ChronoField"
               "java.time.temporal.TemporalField" "TemporalField"
               "java.lang.Comparable" "Comparable" "java.lang.Enum" "Enum"}})
@@ -148,6 +151,8 @@
 (__register-class-methods! :jolt.time/chrono-field
   {"name"      cf-name
    "toString"  cf-name
+   "ordinal"   (fn [f] (u/chrono-field-index (cf-name f)))
+   "compareTo" compare
    "getDisplayName" (fn [f & _] (cf-name f))
    "isDateBased" (fn [f] (contains? u/date-based-fields (cf-name f)))
    "isTimeBased" (fn [f] (not (or (contains? u/date-based-fields (cf-name f))

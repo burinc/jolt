@@ -282,6 +282,25 @@
 
 (def-var! "clojure.core" "class" jolt-class)
 
+;; Util.compare's last step is ((Comparable) a).compareTo(b), so compare and sort
+;; take every Comparable class, not only the ones that registered a compare arm:
+;; a value the class model says is Comparable answers through its own compareTo.
+;; Without this a java.nio.file.Path (babashka.fs/list-dir's elements), a File,
+;; a StringBuilder or an enum constant had a working .compareTo that compare
+;; never asked, and (sort (fs/list-dir d)) raised (jolt-lang/jolt#1395).
+;; The two values must share a class. On the JVM a mismatched pair is refused by
+;; compareTo's own cast; here the runtime's own types (a keyword against a
+;; symbol, a vector against a map) have no compareTo to refuse it, so the class
+;; check stands in for that cast and the refusal stays the ClassCastException.
+(set! jolt-compare-miss
+  (lambda (a b)
+    (let ((ca (jolt-class-name a)))
+      (if (and (string? ca)
+               (equal? ca (jolt-class-name b))
+               (jch-isa? ca "java.lang.Comparable"))
+          (jnum->exact (record-method-dispatch a "compareTo" (jolt-list b)))
+          (jolt-compare-incomparable a b)))))
+
 ;; The PUBLIC clojure.core/type — Clojure's (or (:type meta) (class x)). This is the
 ;; java host layer's job: the core taxonomy (natives-meta.ss jolt-type, kept under
 ;; __type-tag for print-method) is JVM-free, and the JVM class mapping lives HERE,

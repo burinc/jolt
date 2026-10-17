@@ -1788,6 +1788,7 @@
 (define-syntax sa-ufx=? (syntax-rules () ((_ a b) (#3%fx=? a b))))
 (define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (#3%vector-ref v i))))
 (define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (#3%vector-set! v i x))))
+(define-syntax sa-ustring-ref (syntax-rules () ((_ s i) (#3%string-ref s i))))
 (define-syntax sa-uflvector-ref (syntax-rules () ((_ v i) (#3%flvector-ref v i))))
 (define-syntax sa-uflvector-set! (syntax-rules () ((_ v i x) (#3%flvector-set! v i x))))
 (define-syntax sa-ubytevector-ieee-single-native-ref
