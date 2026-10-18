@@ -1398,7 +1398,13 @@
 
 ;; A file path the way a report shows it (compile-eval.ss's diagnostics);
 ;; mirrors host/chez/rt.ss jolt-display-path.
-(define (jolt-display-path p)
+;; Where the source a position NAMES can be opened (host/chez/rt.ss). Gambit has
+;; no loader to install the classpath lookup, so a name is its own location.
+(define jolt-source-location (lambda (name) name))
+(define (set-jolt-source-location! proc) (set! jolt-source-location proc))
+
+(define (jolt-display-path name)
+  (define p (if (string? name) (jolt-source-location name) name))
   (define (under? p dir)
     (and (string? dir) (> (string-length dir) 0)
          (> (string-length p) (string-length dir))
