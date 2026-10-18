@@ -1497,17 +1497,29 @@
 ;; read, so a write racing the read leaves a stamp that no longer matches.
 ;; An entry of a release jar whose key is already stored answers without a read,
 ;; and #f in place of the bytes.
+;;
+;; The key folds in FILE as well as the bytes, because the artifact bakes FILE in:
+;; it is the var :file metadata, the source registry's frame file, and *file* to a
+;; macro expanding there. FILE is spelled the way the root is, so :paths ["src"]
+;; gives ./src/a/b.clj and an absolute root an absolute path. Keyed on content
+;; alone, the same source reached through another root, or from another working
+;; directory, replayed the first load's spelling, and a ./ path from somewhere
+;; else names a file that is not there. Folded into the own key rather than the
+;; artifact name, so a consumer whose macro expansion carried this path moves too.
 (define (aot-read-own-key name file)
   (let* ((stamp (aot-source-stamp file))
-         (known (aot-release-entry-lookup file stamp)))
+         (known (aot-release-entry-lookup file stamp))
+         (at (lambda (len hash)
+               (string-append (aot-cache-key-of len hash) "-"
+                              (number->string (aot-bytes-hash (string->utf8 file)) 16)))))
     (if known
-        (values (aot-cache-key-of (car known) (cdr known)) #f stamp)
+        (values (at (car known) (cdr known)) #f stamp)
         (begin
           (aot-info (string-append "hash " name))
           (let* ((bv (ldr-read-source-bytes file))
                  (lh (cons (bytevector-length bv) (aot-bytes-hash bv))))
             (aot-release-entry-record! file stamp lh)
-            (values (aot-cache-key-of (car lh) (cdr lh)) bv stamp))))))
+            (values (at (car lh) (cdr lh)) bv stamp))))))
 ;; Record NAME's key. A key that MOVED within this process (the source was edited
 ;; and reloaded) leaves every digest folded from the old one stale, so those memos
 ;; go with it and the next consult recomputes them.
