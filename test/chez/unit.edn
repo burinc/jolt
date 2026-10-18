@@ -883,6 +883,11 @@
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/resource \"clojure/string.clj\")))" :expected "\"string.clj\""}
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io]) (quote [clojure.string :as s])) (s/ends-with? (.getPath (io/resource \"clojure/string.clj\")) \"clojure/string.clj\"))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
+  ;; A read the OS refuses is IOException with the errno text, as the JDK's is
+  ;; (JNU_ThrowIOExceptionWithLastError). Chez's condition renders
+  ;; "get-u8: failed on #<port>: is a directory", lower-cased by its ~( directive.
+  ;; A directory opened as a port fails its first read with EISDIR on Linux and macOS.
+  {:suite "ioreader" :expr "(do (require (quote jolt.scheme)) (try (jolt.scheme/scheme (get-u8 (open-file-input-port \"/tmp\"))) (catch java.io.IOException e (ex-message e))))" :expected "\"Is a directory\""}
   ;; io/resource returns a java.net.URL, like the JVM, and its content reads back.
   ;; Not a corpus row: what RESOLVES differs by model — the JVM answers from the
   ;; classpath (clojure/string.clj lives in a jar), jolt from its source roots, and

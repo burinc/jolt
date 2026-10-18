@@ -120,12 +120,27 @@
                               (else #f))))
                 (and n (string-append "Index " (number->string (car irr))
                                       " out of bounds for length " (number->string n))))))))
+;; A read or write the OS refused raises "failed on ~s: ~(~a~)" with the port and
+;; libc's strerror text as irritants, and the ~( directive lower-cases that text
+;; as it renders: "get-u8: failed on #<binary input port f>: invalid argument".
+;; The JDK's IOException for the same failure is the strerror text alone
+;; (JNU_ThrowIOExceptionWithLastError), "Invalid argument", so that is the
+;; message. On a tmpfs /tmp, FileInputStream.skip(Long/MAX_VALUE) is taken and
+;; the next read is EINVAL, and that read's message is what a caller sees.
+(define (io-errno-fault-message c)
+  (and (i/o-error? c) (message-condition? c)
+       (equal? (condition-message c) "failed on ~s: ~(~a~)")
+       (irritants-condition? c)
+       (let ((irr (condition-irritants c)))
+         (and (list? irr) (= (length irr) 2) (string? (cadr irr))
+              (cadr irr)))))
 (define (fault-message c)
   ;; a message that fails to render must not raise inside the handler that is
   ;; unwrapping the fault
   (guard (e (#t "host fault"))
     (or (let ((r (array-index-int-refusal c))) (and r (cdr r)))
         (array-index-fault-message c)
+        (io-errno-fault-message c)
         (condition->message-string c))))
 
 ;; First sight of a condition is also where its throw site is stashed, unless
