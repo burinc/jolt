@@ -1,0 +1,65 @@
+name: skip-probe
+
+# Fork-only probe: why the corpus row "FileInputStream.skip by Long/MAX_VALUE"
+# fails on ubuntu-26.04. Not for upstream.
+on:
+  push:
+    branches: [ci/skip-probe]
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev openjdk-21-jdk-headless
+      - name: Cache Chez Scheme
+        id: cache-chez
+        uses: actions/cache@v5
+        with:
+          path: /opt/chez
+          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off-pic-${{ hashFiles('host/chez/chez-patches/*.patch') }}
+      - name: Build Chez Scheme from source
+        if: steps.cache-chez.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" /tmp/chez-src
+          cd /tmp/chez-src
+          ./configure --installprefix=/opt/chez --threads --disable-x11 CFLAGS+=-fPIC
+          make -j"$(nproc)"
+          sudo make install
+          sudo chown -R "$USER" /opt/chez
+      - name: Put chez on PATH
+        run: |
+          printf '#!/bin/sh\nexec /opt/chez/bin/scheme "$@"\n' > /opt/chez/bin/chez
+          chmod +x /opt/chez/bin/chez
+          echo '/opt/chez/bin' >> "$GITHUB_PATH"
+      - name: Environment
+        run: |
+          uname -a
+          ldd --version | head -1
+          df -T /tmp "$RUNNER_TEMP" .
+          findmnt -no FSTYPE,OPTIONS /tmp || true
+          java -XshowSettings:properties -version 2>&1 | grep -E 'java.io.tmpdir|java.version ='
+      - name: C lseek/read on /tmp and on the workspace disk
+        run: |
+          cc -O0 -o skipc ci/skip-probe/skip.c
+          printf 0123456789 > /tmp/skipc.bin && echo "== /tmp" && ./skipc /tmp/skipc.bin
+          printf 0123456789 > skipc.bin && echo "== workspace" && ./skipc skipc.bin
+      - name: JVM (JDK 21)
+        run: |
+          J=/usr/lib/jvm/java-21-openjdk-$(dpkg --print-architecture)/bin/java
+          echo "== /tmp"; $J ci/skip-probe/Skip.java
+          echo "== workspace"; $J -Djava.io.tmpdir="$PWD" ci/skip-probe/Skip.java
+      - name: jolt (bin/jolt, source mode)
+        run: |
+          echo "== /tmp"; bin/jolt ci/skip-probe/skip.clj
+          echo "== workspace"; mkdir -p wstmp; JDK_JAVA_OPTIONS= bin/jolt -e "(System/setProperty \"java.io.tmpdir\" \"$PWD/wstmp\") (load-file \"ci/skip-probe/skip.clj\")"
