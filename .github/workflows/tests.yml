@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
         with:
@@ -184,7 +184,7 @@ jobs:
   # so origin/main..HEAD is not there to scan — and needs no Chez.
   attribution:
     name: No AI attribution in commits
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
