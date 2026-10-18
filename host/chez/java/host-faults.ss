@@ -120,12 +120,22 @@
                               (else #f))))
                 (and n (string-append "Index " (number->string (car irr))
                                       " out of bounds for length " (number->string n))))))))
+;; A read or write on a port that the OS refused: Chez raises "failed on ~s:
+;; ~(~a~)" with the port and the errno's text, and the JDK's IOException message
+;; is that text alone ("Invalid argument", "Is a directory"), with no port in it.
+(define (port-errno-fault-message c)
+  (and (i/o-error? c) (message-condition? c) (irritants-condition? c)
+       (let ((m (condition-message c)) (irr (condition-irritants c)))
+         (and (string? m) (fault-template-has? m "failed on ~s: ")
+              (list? irr) (= (length irr) 2) (port? (car irr)) (string? (cadr irr))
+              (cadr irr)))))
 (define (fault-message c)
   ;; a message that fails to render must not raise inside the handler that is
   ;; unwrapping the fault
   (guard (e (#t "host fault"))
     (or (let ((r (array-index-int-refusal c))) (and r (cdr r)))
         (array-index-fault-message c)
+        (port-errno-fault-message c)
         (condition->message-string c))))
 
 ;; First sight of a condition is also where its throw site is stashed, unless

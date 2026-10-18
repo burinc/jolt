@@ -133,7 +133,10 @@ jobs:
           # (ci/apply-chez-patches.sh); a kernel without them is a stale cache
           # or a patch that stopped applying, not a stock install to tolerate.
           JOLT_REQUIRE_LOCKFREE_CHEZ: "1"
-        run: make CHEZ=/opt/chez/bin/chez GAMBIT_PREFIX=/opt/gambit -j"$(nproc)" -Oline test
+        # TMPDIR on the runner's disk: from ubuntu-26.04, /tmp is a tmpfs with a
+        # size limit, and the build gates' mktemp dirs (shakelocal keeps two
+        # binaries per app until it exits) ran it out with EDQUOT.
+        run: TMPDIR="$RUNNER_TEMP" make CHEZ=/opt/chez/bin/chez GAMBIT_PREFIX=/opt/gambit -j"$(nproc)" -Oline test
 
   # The gate on bionic (Android/Termux, #943): jolt and its pinned Chez build in
   # termux/termux-docker on an arm64 runner, the release smokes run there

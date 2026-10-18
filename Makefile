@@ -126,7 +126,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
-  threadsafety maskedacquire values wp ci
+  threadsafety maskedacquire ioerrno values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck noticecheck monitormodel \
@@ -189,7 +189,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire cas flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -1015,6 +1015,11 @@ threadsafety:
 # of the whole process, so the script runs the gate under an outside deadline.
 maskedacquire:
 	@sh host/chez/masked-acquire-gate.sh $(CHEZ)
+
+# A read or write the OS refuses is an IOException carrying the errno's text
+# ("Invalid argument"), as on the JDK, not Chez's rendering with the port in it.
+ioerrno:
+	@$(CHEZ) --script test/chez/io-errno-message-test.ss
 
 # compare-and-swap is strong. Chez's $record-cas! is one ldxr/stxr attempt on
 # AArch64 and answers #f with the field still holding the expected value when
