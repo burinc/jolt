@@ -188,7 +188,7 @@
   ;; location printed here, an unreadable file silently took the FILENAME down
   ;; with it and the report named nothing at all.
   (guard (e (#t (void)))
-    (let* ((src (read-file-string file))
+    (let* ((src (read-file-string (jolt-source-location file)))
            (lines (diag-source-lines src))
            (count (vector-length lines)))
       (when (and (fx>=? line 1) (fx<=? line count))
@@ -223,7 +223,7 @@
 ;; be an enormous collection or an infinite seq.
 (define (diag-token-at file line col arg)
   (guard (e (#t #f))
-    (let* ((lines (diag-source-lines (read-file-string file)))
+    (let* ((lines (diag-source-lines (read-file-string (jolt-source-location file))))
            (n (vector-length lines)))
       (and (fx>=? line 1) (fx<=? line n)
            (let* ((text (vector-ref lines (fx- line 1)))
@@ -239,7 +239,7 @@
 ;; second read of the file to see the code the report is about.
 (define (diag-source-window file line)
   (guard (e (#t #f))
-    (let* ((lines (diag-source-lines (read-file-string file)))
+    (let* ((lines (diag-source-lines (read-file-string (jolt-source-location file))))
            (n (vector-length lines)))
       (and (fx>=? line 1) (fx<=? line n)
            (let loop ((i (fxmax 1 (fx- line diag-context-lines))) (acc '()))

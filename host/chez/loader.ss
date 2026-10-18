@@ -399,7 +399,65 @@
 ;; root-relative path ("clojure/string.clj"); those are checked first, so a
 ;; `require` resolves with no source on disk. The dev bin/jolt has an empty
 ;; source store, so the hashtable probes miss and it falls straight to disk.
+;; --- classpath names ---------------------------------------------------------
+;; A namespace found on a root is NAMED by its path under that root, the way the
+;; JVM names a resource ("mylib/where.clj"), not by the location it was read from
+;; ("./src/mylib/where.clj", "/abs/proj/src/…", "jar:file:…!/…"). The name is what
+;; its defs carry as :file, what *file* is while it loads, and what a diagnostic
+;; names, so none of them depends on where the project sits or on how a root is
+;; spelled, and an AOT artifact that bakes the name in is good from anywhere.
+;;
+;; Every location resolve-on-roots answers is recorded with its name here, so a
+;; file read from that location is named without the reader knowing about roots
+;; (reader.ss rdr-file-name-of), and a report can find the file again to show it
+;; (rt.ss jolt-source-location). A location nothing resolved, such as load-file's
+;; path, is its own name. Two roots holding the same name (a vendored copy and a
+;; jar copy) map back to the location resolved last.
+(define ldr-names-mu (make-mutex))
+(define ldr-location->name (make-hashtable string-hash string=?))
+(define ldr-name->location (make-hashtable string-hash string=?))
+(define (ldr-note-name! loc name)
+  (jolt-with-mutex ldr-names-mu
+    (hashtable-set! ldr-location->name loc name)
+    (hashtable-set! ldr-name->location name loc))
+  loc)
+;; LOC was found for REL, so it ends in REL plus the extension that matched, and
+;; that tail is its name.
+(define (ldr-note-rel-location! loc rel)
+  (let loop ((es ldr-source-exts))
+    (if (null? es)
+        loc
+        (let* ((name (string-append rel (car es)))
+               (n (string-length name)) (m (string-length loc)))
+          (if (and (fx>=? m n) (string=? (substring loc (fx- m n) m) name)
+                   (or (fx=? m n) (memv (string-ref loc (fx- m n 1)) '(#\/ #\\))))
+              (ldr-note-name! loc name)
+              (loop (cdr es)))))))
+;; load-file names the file by its absolute path, as Compiler.loadFile does, even
+;; when a root also resolves that location.
+(define ldr-file-load-path (make-thread-parameter #f))
+;; The reader asks once per form, so the last answer is kept: one pair, replaced
+;; whole, so a racing reader sees an old answer or a new one, never half of each.
+(define ldr-last-name (cons "" ""))
+(define (ldr-source-name loc)
+  (cond ((equal? loc (ldr-file-load-path)) loc)
+        ((let ((last ldr-last-name)) (and (string=? (car last) loc) last)) => cdr)
+        (else
+         (let ((name (or (jolt-with-mutex ldr-names-mu
+                           (hashtable-ref ldr-location->name loc #f))
+                         loc)))
+           (set! ldr-last-name (cons loc name))
+           name))))
+(define (ldr-source-location name)
+  (or (jolt-with-mutex ldr-names-mu (hashtable-ref ldr-name->location name #f))
+      name))
+(set-rdr-file-name-of! ldr-source-name)
+(set-jolt-source-location! ldr-source-location)
+
 (define (resolve-on-roots rel)
+  (let ((loc (resolve-on-roots* rel)))
+    (and loc (ldr-note-rel-location! loc rel))))
+(define (resolve-on-roots* rel)
   (define (embedded-key? k) (embedded-resource-has? k))
   (define (on-roots roots)
     (let loop ((roots roots))
@@ -595,7 +653,7 @@
                            (substring path (+ i 1) (string-length path)))
                           (else (loop (- i 1)))))))
         (dyn-with-frame
-          (list (cons ldr-file-cell path)
+          (list (cons ldr-file-cell (ldr-source-name path))
                 (cons ldr-spath-cell name)
                 (cons ldr-warn-cell (var-cell-deref ldr-warn-cell))
                 (cons ldr-assert-cell (var-cell-deref ldr-assert-cell))
@@ -1498,20 +1556,21 @@
 ;; An entry of a release jar whose key is already stored answers without a read,
 ;; and #f in place of the bytes.
 ;;
-;; The key folds in FILE as well as the bytes, because the artifact bakes FILE in:
-;; it is the var :file metadata, the source registry's frame file, and *file* to a
-;; macro expanding there. FILE is spelled the way the root is, so :paths ["src"]
-;; gives ./src/a/b.clj and an absolute root an absolute path. Keyed on content
-;; alone, the same source reached through another root, or from another working
-;; directory, replayed the first load's spelling, and a ./ path from somewhere
-;; else names a file that is not there. Folded into the own key rather than the
-;; artifact name, so a consumer whose macro expansion carried this path moves too.
+;; The key folds in FILE's NAME as well as the bytes, because the artifact bakes
+;; the name in: it is the var :file metadata, the source registry's frame file,
+;; and *file* to a macro expanding there. That is the classpath name
+;; (ldr-source-name), so the same source under the same name is the same artifact
+;; from any root and any directory, and a project that moves keeps its cache. The
+;; name still has to be in the key: the same bytes as a.clj and as a.cljc, or as
+;; the classpath name and as a load-file's absolute path, bake different names.
+;; Folded into the own key rather than the artifact name, so a consumer whose
+;; macro expansion carried the name moves with it.
 (define (aot-read-own-key name file)
   (let* ((stamp (aot-source-stamp file))
          (known (aot-release-entry-lookup file stamp))
          (at (lambda (len hash)
                (string-append (aot-cache-key-of len hash) "-"
-                              (number->string (aot-bytes-hash (string->utf8 file)) 16)))))
+                              (number->string (aot-bytes-hash (string->utf8 (ldr-source-name file))) 16)))))
     (if known
         (values (at (car known) (cdr known)) #f stamp)
         (begin
@@ -2957,8 +3016,11 @@
     (jolt-wind* (lambda () #f) #f (lambda () (load-jolt-file path)) (set-chez-ns! saved))))
 
 ;; load-file: load an explicit path, in the current ns.
+;; The path is absolute, as Compiler.loadFile's is (File.getAbsolutePath), and is
+;; the file's name too (ldr-source-name).
 (define (jolt-load-file path)
-  (load-jolt-file/restoring-ns path)
+  (parameterize ((ldr-file-load-path path))
+    (load-jolt-file/restoring-ns path))
   jolt-nil)
 
 ;; expand-spec: the shared prefix-list expansion (expand-libspec, ns.ss) —
@@ -2993,7 +3055,14 @@
           (parameterize ((ldr-verbose? verbose?))
             (k (and (member "reload" flags) #t)))))))
 
-(def-var! "clojure.core" "load-file" (lambda (p) (jolt-load-file (host-user-path p))))
+;; A leading ./ is dropped before the path is made absolute: "./x.clj" from /proj
+;; is /proj/x.clj, not /proj/./x.clj.
+(define (ldr-strip-dot-slash p)
+  (if (and (fx>? (string-length p) 2) (string=? (substring p 0 2) "./"))
+      (ldr-strip-dot-slash (substring p 2 (string-length p)))
+      p))
+(def-var! "clojure.core" "load-file"
+  (lambda (p) (jolt-load-file (host-fs-path (project-relative (ldr-strip-dot-slash p))))))
 
 ;; The directory of a namespace's resource path: "clojure.tools.reader-test" ->
 ;; "clojure/tools" (drop the last segment of ns-name->rel). "" for a top-level ns.

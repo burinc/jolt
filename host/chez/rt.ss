@@ -1972,13 +1972,22 @@
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))
 
+;; Where the source a position NAMES can be opened. A namespace loaded off a
+;; root is named by its classpath name ("mylib/where.clj", reader.ss
+;; rdr-file-name-of), which is not a path from anywhere in particular; the loader
+;; installs the lookup back to where it found it (loader.ss ldr-source-location),
+;; and anything else is already a location.
+(define jolt-source-location (lambda (name) name))
+(define (set-jolt-source-location! proc) (set! jolt-source-location proc))
+
 ;; A file path the way a report shows it: relative to the directory the program
 ;; was started from as ./…, under the home directory as ~/…, else as it is --
-;; jank's rule. The started-from directory is JOLT_PWD when the launcher cd'd
+;; jank's rule. A classpath name shows as the location it was loaded from. The started-from directory is JOLT_PWD when the launcher cd'd
 ;; away from it (bin/jolt) and the process directory otherwise. A path that
 ;; already starts with ./ is only tidied (a project-relative argument used to
 ;; arrive as ././x.clj).
-(define (jolt-display-path p)
+(define (jolt-display-path name)
+  (define p (if (string? name) (jolt-source-location name) name))
   (define (under? p dir)
     (and (string? dir) (> (string-length dir) 0)
          (> (string-length p) (string-length dir))

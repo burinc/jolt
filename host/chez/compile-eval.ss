@@ -225,6 +225,11 @@
          (not (jolt-nil? (jolt-get data diag-kw-err-kind jolt-nil)))
          data)))
 
+;; The location a report prints for FILE: where a classpath name was loaded from
+;; (rt.ss jolt-source-location), anything else as it is.
+(define (jolt-source-location-of file)
+  (if (string? file) (jolt-source-location file) file))
+
 ;; "file:line:col" for a diagnostic that carries its own position, else #f — so a
 ;; report can name the offending expression rather than the enclosing top-level
 ;; form. Same shape jolt-source-position-string renders, so the two are
@@ -235,7 +240,7 @@
         (file (jolt-get err diag-kw-err-file jolt-nil)))
     (and (not (jolt-nil? line))
          (string-append
-           (if (jolt-nil? file) "" (string-append (jolt-str-render-one file) ":"))
+           (if (jolt-nil? file) "" (string-append (jolt-str-render-one (jolt-source-location-of file)) ":"))
            (number->string (jnum->exact line)) ":"
            (if (jolt-nil? col) "?" (number->string (jnum->exact col)))))))
 
@@ -472,7 +477,7 @@
                (col  (jolt-get p hc-kw-column jolt-nil))
                (file (jolt-get p hc-kw-file jolt-nil)))
            (string-append
-             (if (jolt-nil? file) "" (string-append (jolt-str-render-one file) ":"))
+             (if (jolt-nil? file) "" (string-append (jolt-str-render-one (jolt-source-location-of file)) ":"))
              (if (jolt-nil? line) "?" (number->string line)) ":"
              (if (jolt-nil? col) "?" (number->string col)))))))
 
