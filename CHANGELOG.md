@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A required namespace's `:file` is its classpath name (#1410).** A def,
+  `*file*`, `:clojure.error/source` and trace frames used to carry the path as
+  the root spelled it: `./src/mylib/where.clj`, an absolute path, or a
+  `jar:file:` URL. They now carry `mylib/where.clj`, as on the JVM, and
+  `io/resource` opens it. The name no longer depends on where the project sits.
+  `load-file` names a file by its absolute path, also as on the JVM. Error
+  reports and traces still show the file's location in source mode, and the AOT
+  cache keys on the name, so a project that moves keeps its cache.
+
+### Fixed
+
+- **A warm AOT cache replayed the first load's source path (#1404, #1405).** The
+  same source reached through another root, or from another directory, reported
+  the `:file` and `*file*` of the load that filled the cache, which could name a
+  file that doesn't exist from there.
+- **Vars built into the image carry `:file` (#1406, #1407).** `clojure.string`,
+  `clojure.set` and the other stdlib namespaces, plus the core overlay defns,
+  had `:line` and no `:file`. They now name their classpath file
+  (`"clojure/string.clj"`).
+- **An OS read or write failure is an IOException with the errno text (#1409).**
+  The message was Chez's rendering with the port in it ("get-u8: failed on
+  #<binary input port …>: invalid argument"). It is now the JDK's
+  ("Invalid argument"). This showed up as a `FileInputStream.skip` past the end
+  on tmpfs, which ubuntu-26.04 runners use for `/tmp`. The test job also runs
+  with `TMPDIR` on the runner's disk, because 26.04's `/tmp` is too small for the
+  build gates.
+
 ## [0.8.23] - 2026-10-17
 
 Code loaded at the REPL or by `jolt run` can opt into the optimizations a
