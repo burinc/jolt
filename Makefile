@@ -117,7 +117,7 @@ endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
-  aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
+  aotcachepathsmoke aotcachesourcepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire cas flow
 TEST-GATES := submodules selfhost ci
@@ -1976,6 +1976,13 @@ aotfingerprint:
 # offsets against.
 aotcachepathsmoke: testbin
 	@sh test/chez/aot-cache-path-smoke.sh
+
+# A cache hit must report the source path THIS load found the namespace at. The
+# artifact bakes that path in (var :file, *file* in a macro), and the cache used to
+# be keyed on content alone, so the same source reached through another root or
+# from another directory replayed the first load's ./src/... spelling.
+aotcachesourcepathsmoke: testbin
+	@sh test/chez/aot-cache-source-path-smoke.sh
 
 # Perf measurement: cold (recompile) vs warm (cache hit) for a multi-library
 # require. Needs Maven jars locally; NOT in the default ci gate (timing budget).
