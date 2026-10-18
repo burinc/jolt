@@ -186,7 +186,9 @@
 ;; of the file is IOException "Invalid argument", the errno text (JDK 25).
 ;;
 ;; A target the file system will not take (Long/MAX_VALUE on ext4, past its
-;; s_maxbytes) is the same IOException there; macOS takes it.
+;; s_maxbytes) is the same IOException there; macOS takes it. tmpfs and xfs on
+;; Linux take it too, and the next read is then EINVAL, which reaches the caller
+;; as the same "Invalid argument" (host-faults.ss port-errno-fault-message).
 ;;
 ;; Only a file stream takes this path: a port with no descriptor
 ;; (ByteArrayInputStream, a pipe's or a zip entry's custom port) or one that
