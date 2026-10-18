@@ -77,8 +77,8 @@ EOF
 out1="$(PATH="$empty" JOLT_PWD="$tmp/proj" JOLT_QUIET=1 JOLT_MAVEN_REPOSITORY="$m2" "$JOLT" run -m app.core 2>&1)"
 yn "1: resolves and loads with an empty PATH" \
    "$(printf '%s\n' "$out1" | grep -qx 'answer 42' && echo yes || echo no)"
-yn "1: *file* names the entry inside the jar" \
-   "$(printf '%s\n' "$out1" | grep -qx "file jar:file:$jar1!/nounzip/core.clj" && echo yes || echo no)"
+yn "1: *file* is the entry's classpath name, as on the JVM" \
+   "$(printf '%s\n' "$out1" | grep -qx "file nounzip/core.clj" && echo yes || echo no)"
 yn "1: a resource in the jar resolves to its jar:file: URL" \
    "$(printf '%s\n' "$out1" | grep -qx "url jar:file:$jar1!/nounzip/data.edn" && echo yes || echo no)"
 yn "1: the resource slurps through its URL" \
@@ -183,8 +183,8 @@ EOF2
 out6="$(PATH="$empty" JOLT_PWD="$tmp/proj6" JOLT_QUIET=1 "$JOLT" run -m app6.core 2>&1)"
 yn "6: a stub-prefixed jar on :paths loads in place" \
    "$(printf '%s\n' "$out6" | grep -qx 'pathjar 9' && echo yes || echo no)"
-yn "6: *file* is the absolute jar: path with no ./ segment" \
-   "$(printf '%s\n' "$out6" | grep -qx "file jar:file:$tmp/proj6/lib.jar!/pathjar/core.clj" && echo yes || echo no)"
+yn "6: *file* is the entry's classpath name, whatever the root's spelling" \
+   "$(printf '%s\n' "$out6" | grep -qx "file pathjar/core.clj" && echo yes || echo no)"
 yn "6: the resource URL is the absolute jar: URL with no ./ segment" \
    "$(printf '%s\n' "$out6" | grep -qx "url jar:file:$tmp/proj6/lib.jar!/pathjar/res.edn" && echo yes || echo no)"
 

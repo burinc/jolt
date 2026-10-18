@@ -781,6 +781,15 @@
 ;; this back via jolt.host/form-position to stamp :pos on call nodes; macros and
 ;; (meta (read-string "(…)")) see it too.
 (define rdr-source-file (make-thread-parameter #f))
+;; The NAME a position carries for the file being read, which is not always its
+;; path. A namespace a require found on a root is named by its classpath name
+;; ("mylib/where.clj"), as on the JVM, whatever the root's spelling ("./src",
+;; an absolute path, a jar), so the :file a def carries is the same wherever the
+;; project sits. The path stays the reader's file: what identifies the file being
+;; walked (rt.ss var-def-ordinal-key) is where it is. The loader installs the
+;; mapping (loader.ss ldr-source-name); without a loader the name is the path.
+(define rdr-file-name-of (lambda (f) f))
+(define (set-rdr-file-name-of! proc) (set! rdr-file-name-of proc))
 (define rdr-kw-line   (keyword #f "line"))
 (define rdr-kw-column (keyword #f "column"))
 (define rdr-kw-file   (keyword #f "file"))
@@ -804,7 +813,7 @@
               (loop (fx+ k 1) line (fx+ col 1)))))))
 
 (define (rdr-pos-meta line col)
-  (let ((f (rdr-source-file)))
+  (let ((f (let ((p (rdr-source-file))) (and p (rdr-file-name-of p)))))
     (if f
         (jolt-hash-map rdr-kw-line line rdr-kw-column col rdr-kw-file f)
         (jolt-hash-map rdr-kw-line line rdr-kw-column col))))
@@ -867,7 +876,7 @@
 ;; step with the first. The reference spells its own the same way
 ;; (:clojure.error/line) — and those keys ride along, see above.
 (define (rdr-diagnostic-data kind line col)
-  (let* ((f (rdr-source-file))
+  (let* ((f (let ((p (rdr-source-file))) (and p (rdr-file-name-of p))))
          (m (rdr-phase-keys
              (jolt-hash-map rdr-kw-err-kind kind
                             rdr-kw-err-type rdr-kw-read-error
