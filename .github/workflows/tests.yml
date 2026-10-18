@@ -91,7 +91,11 @@ jobs:
 
       - name: Install JDK + Clojure (certify oracle)
         run: |
-          sudo apt-get install -y default-jdk rlwrap
+          # openjdk-21 by name, not default-jdk: the corpus is measured on JDK 21
+          # (test/conformance/profile.edn :oracle-jdk), and default-jdk follows
+          # the image, so it is 25 on ubuntu-26.04 and certify refuses the oracle.
+          sudo apt-get install -y openjdk-21-jdk-headless rlwrap
+          jdk=/usr/lib/jvm/java-21-openjdk-$(dpkg --print-architecture)
           # --retry + --fail so a transient CDN error retries instead of handing
           # bash an HTML error page (a 2min timeout page flaked a run)
           curl --fail --retry 5 --retry-delay 10 --retry-all-errors -L -O \
@@ -104,10 +108,10 @@ jobs:
           # at the JDK just installed (the corpus is measured on the JDK
           # test/conformance/profile.edn pins as :oracle-jdk, and certify.clj
           # refuses any other).
-          echo "JAVA_CMD=/usr/lib/jvm/default-java/bin/java" >> "$GITHUB_ENV"
-          echo "JAVA_HOME=/usr/lib/jvm/default-java" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$jdk/bin/java" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$jdk" >> "$GITHUB_ENV"
           clojure --version
-          JAVA_CMD=/usr/lib/jvm/default-java/bin/java clojure -M -e '(println "oracle JDK" (System/getProperty "java.runtime.version"))'
+          JAVA_CMD=$jdk/bin/java clojure -M -e '(println "oracle JDK" (System/getProperty "java.runtime.version"))'
 
       - name: Gate
         # `make test` = the self-host byte-fixpoint (the rebuilt seed must equal
