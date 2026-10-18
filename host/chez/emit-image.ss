@@ -535,12 +535,27 @@
 ;; in no fixed order (right to left in practice), and the mint's in-order
 ;; visibility gate (host-contract.ss hc-mint-unwalked) needs each namespace
 ;; compiled after the ones it loads after.
+;;
+;; Each file is read with its CLASSPATH name as the reader's file, so a def in it
+;; carries :file the way the reference's does ("clojure/string.clj", resolvable
+;; with io/resource) instead of :line alone. The checkout prefix is what makes a
+;; path depend on where the tree sits, so it is the part dropped: the name is the
+;; same on every machine, and the seed stays a byte-fixpoint.
+(define (ei-classpath-name file)
+  (let loop ((ps '("jolt-core/" "stdlib/")))
+    (cond ((null? ps) file)
+          ((and (>= (string-length file) (string-length (car ps)))
+                (string=? (substring file 0 (string-length (car ps))) (car ps)))
+           (substring file (string-length (car ps)) (string-length file)))
+          (else (loop (cdr ps))))))
 (define (ei-emit-ns-files nfs)
   (let loop ((nfs nfs) (acc '()))
     (if (null? nfs)
         (ei-join (apply append (reverse acc)))
         (loop (cdr nfs)
-              (cons (ei-emit-ns (car (car nfs)) (read-file-string (cdr (car nfs)))) acc)))))
+              (cons (parameterize ((rdr-source-file (ei-classpath-name (cdr (car nfs)))))
+                      (ei-emit-ns (car (car nfs)) (read-file-string (cdr (car nfs)))))
+                    acc)))))
 
 ;; Emit the compiler image (jolt.ir + jolt.analyzer + jolt.backend-scheme) on Chez.
 (define (jolt-emit-image) (ei-emit-ns-files ei-compiler-ns-files))

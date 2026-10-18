@@ -699,10 +699,13 @@
            :jvm "throws RuntimeException"
            :jolt "true"}}
   ;; a def/defn carries source position (:line/:column/:file) in its var meta, like
-  ;; the JVM Compiler, for user code and loaded files. A clojure.core var built
-  ;; during the seed mint (native-op or overlay defn) has no reader position, so it
-  ;; carries no :line/:file. Introspection tooling (spec instrument, expound) reads
-  ;; these off USER vars, which have them. jolt-ox7c.29
+  ;; the JVM Compiler, for user code and loaded files. A var the seed mint builds
+  ;; from Clojure source (a core overlay defn, a stdlib namespace in the image)
+  ;; carries :line/:column and its classpath :file ("clojure/string.clj",
+  ;; "clojure/core/40-lazy.clj" where the reference says "clojure/core.clj"). A
+  ;; native op such as reduce has no Clojure source, so it carries no :line/:file.
+  ;; Introspection tooling (spec instrument, expound) reads these off USER vars,
+  ;; which have them. jolt-ox7c.29
   {:category :impl-detail
    :behavior "(:line (meta #'clojure.core/reduce))"
    :jvm "an int (source line in clojure/core.clj)"
@@ -710,7 +713,7 @@
    :check {:expr "(integer? (:line (meta #'clojure.core/reduce)))"
            :jvm "true"
            :jolt "false"}
-   :note "core vars are minted without reader positions; user + loaded-file defns carry :line/:column/:file."}
+   :note "native core ops have no Clojure source and so no position; overlay and stdlib defns carry :line/:column/:file, as do user + loaded-file defns."}
   ;; (:refer-clojure :exclude/:only now withhold the name from the compiler,
   ;;  resolve and ns-map, and a ^:private var of another namespace is refused
   ;;  as on the JVM — jolt#1095 — so both of those divergences are gone.)
