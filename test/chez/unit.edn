@@ -883,6 +883,9 @@
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/resource \"clojure/string.clj\")))" :expected "\"string.clj\""}
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io]) (quote [clojure.string :as s])) (s/ends-with? (.getPath (io/resource \"clojure/string.clj\")) \"clojure/string.clj\"))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
+  ;; A var built into the image names its classpath file in :file, so a tool can
+  ;; open the definition through io/resource as it would on the JVM.
+  {:suite "ioreader" :expr "(do (require (quote clojure.set) (quote clojure.walk) (quote clojure.java.io)) (every? (fn [s] (some? (clojure.java.io/resource (:file (meta (resolve s)))))) (quote [clojure.core/map-indexed clojure.core/pmap clojure.string/join clojure.set/union clojure.walk/postwalk])))" :expected "true"}
   ;; io/resource returns a java.net.URL, like the JVM, and its content reads back.
   ;; Not a corpus row: what RESOLVES differs by model — the JVM answers from the
   ;; classpath (clojure/string.clj lives in a jar), jolt from its source roots, and
