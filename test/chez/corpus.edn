@@ -3487,6 +3487,11 @@
   ;; byte VALUES too, since byte[] elements are signed like the JVM's
   ;; (`arrays / signed byte elements`).
   {:suite "host-interop / Charset aliases" :label "getBytes/String. round-trip through a Charset object" :expected "\"sõme ßÒññÝ\"" :actual "(let [cs (java.nio.charset.Charset/forName \"ISO-8859-1\")] (String. (.getBytes \"sõme ßÒññÝ\" cs) cs))" :portability :jvm}
+  ;; (String. bytes offset length [charset]) copies only the slice (it used to
+  ;; copy a whole byte array first) and checks the range as String does.
+  {:suite "host-interop / String byte slice" :label "a UTF-8 slice decodes only its bytes" :expected "[\"éll\" \"éll\" \"héllo wörld\" \"\"]" :actual "(let [b (.getBytes \"héllo wörld\" \"UTF-8\")] [(String. b 1 4 \"UTF-8\") (String. b 1 4) (String. b 0 (alength b) \"UTF-8\") (String. b 13 0 \"UTF-8\")])" :portability :jvm}
+  {:suite "host-interop / String byte slice" :label "a slice of a byte-array literal, in another charset" :expected "\"Ã©l\"" :actual "(String. (byte-array [104 -61 -87 108 108 111]) 1 3 \"ISO-8859-1\")" :portability :jvm}
+  {:suite "host-interop / String byte slice" :label "a slice out of range is String's StringIndexOutOfBoundsException" :expected "[\"Range [-1, -1 + 2) out of bounds for length 13\" \"Range [1, 1 + -2) out of bounds for length 13\" \"Range [10, 10 + 5) out of bounds for length 13\" \"Range [14, 14 + 0) out of bounds for length 13\"]" :actual "(let [b (.getBytes \"héllo wörld\" \"UTF-8\")] (mapv (fn [[o n]] (try (String. b (int o) (int n) \"UTF-8\") (catch StringIndexOutOfBoundsException e (ex-message e)))) [[-1 2] [1 -2] [10 5] [14 0]]))" :portability :jvm}
   {:suite "host-interop / Charset aliases" :label "a Charset object encodes one byte per char, not UTF-8" :expected "1" :actual "(alength (.getBytes \"õ\" (java.nio.charset.Charset/forName \"ISO-8859-1\")))" :portability :jvm}
   {:suite "host-interop / Charset aliases" :label "a Charset object encodes the latin-1 byte, not the UTF-8 pair" :expected "[-11]" :actual "(vec (.getBytes \"õ\" (java.nio.charset.Charset/forName \"ISO-8859-1\")))" :portability :jvm}
   {:suite "host-interop / Charset aliases" :label "an aliased Charset object still selects its canonical encoding" :expected "1" :actual "(alength (.getBytes \"õ\" (java.nio.charset.Charset/forName \"l1\")))" :portability :jvm}

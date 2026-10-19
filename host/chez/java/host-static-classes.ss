@@ -1572,18 +1572,35 @@
       (else (java-decode-all bv cs name)))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.
-(define (bytes-slice-for-string bv rest)
+;; N is the source's length, COPY! copies a span of it into a fresh bytevector,
+;; WHOLE gives the unsliced bytes. Only the slice is copied: a jolt byte array
+;; used to become a bytevector in full before the slice was cut, so taking 30
+;; bytes out of a 1.5 MB array cost the 1.5 MB. The range is String's own check
+;; (checkBoundsOffCount), with its exception and message.
+(define (bytes-slice-for-string n copy! whole rest)
   (if (and (pair? rest) (number? (car rest)) (pair? (cdr rest)) (number? (cadr rest)))
-      (let* ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest)))
-             (out (make-bytevector len)))
-        (bytevector-copy! bv off out 0 len)
-        (cons out (cddr rest)))
-      (cons bv rest)))
+      (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
+        (unless (and (>= off 0) (>= len 0) (<= off (- n len)))
+          (throw-jvm 'StringIndexOutOfBoundsException
+                     (string-append "Range [" (number->string off) ", " (number->string off)
+                                    " + " (number->string len) ") out of bounds for length "
+                                    (number->string n))))
+        (let ((out (make-bytevector len)))
+          (copy! off out len)
+          (cons out (cddr rest))))
+      (cons (whole) rest)))
 (register-class-ctor! "String"
   (lambda (x . rest)
-    (cond ((bytevector? x) (let ((p (bytes-slice-for-string x rest))) (decode-bytevector (car p) (cdr p))))
+    (cond ((bytevector? x)
+           (let ((p (bytes-slice-for-string (bytevector-length x)
+                                            (lambda (off out len) (bytevector-copy! x off out 0 len))
+                                            (lambda () x) rest)))
+             (decode-bytevector (car p) (cdr p))))
           ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte))
-           (let ((p (bytes-slice-for-string (na-bytearray->bv x) rest))) (decode-bytevector (car p) (cdr p))))
+           (let ((p (bytes-slice-for-string (ja-len x)
+                                            (lambda (off out len) (ja-bytes->bv! x off out 0 len))
+                                            (lambda () (na-bytearray->bv x)) rest)))
+             (decode-bytevector (car p) (cdr p))))
           ;; (String. char[] [offset count]) — the whole array or a slice. Buffered
           ;; readers (data.json) build a string from a fill buffer this way.
           ;; The whole array went through (list->string (ja->list x)) — a cons per
