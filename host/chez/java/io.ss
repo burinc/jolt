@@ -2876,12 +2876,24 @@
 ;; carries no "./" segment, so a leading one is dropped before the cwd is put in
 ;; front. Directory and jar roots alike (resource-jar-url, loader.ss
 ;; ldr-root-file, whose spelling is *file* and the AOT cache's key).
+;; A relative root is relative to the process directory: that is where
+;; resource-candidate and ldr-root-file found the file. bin/jolt cd's to the
+;; checkout and keeps jolt's own install roots ("stdlib", "jolt-core")
+;; relative, so resolving them against user.dir (the caller's directory) named
+;; a file that isn't there, and (slurp (io/resource "clojure/string.clj"))
+;; threw from anywhere but the checkout. When the two directories agree (a
+;; built binary) jfile-abs answers the same path, so nothing changes there.
 (define (root-path-abs p)
-  (jfile-abs (if (and (>= (string-length p) 2)
-                      (char=? (string-ref p 0) #\.)
-                      (char=? (string-ref p 1) #\/))
-                 (substring p 2 (string-length p))
-                 p)))
+  (let ((p (if (and (>= (string-length p) 2)
+                    (char=? (string-ref p 0) #\.)
+                    (char=? (string-ref p 1) #\/))
+               (substring p 2 (string-length p))
+               p)))
+    (if (or (string=? (jolt-user-dir) (current-directory))
+            (= (string-length p) 0) (jfile-path-absolute? p) (jar-path? p)
+            (windows-root-relative? p))
+        (jfile-abs p)
+        (string-append (current-directory) "/" p))))
 ;; The jar: URL for `nm` inside the jar at root JAR, absolute like the file: one.
 (define (resource-jar-url jar nm)
   (make-url (make-jar-path (root-path-abs jar) nm)))
