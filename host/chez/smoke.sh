@@ -599,6 +599,52 @@ for c in run repl nrepl-server path tasks completions build; do
   fi
 done
 rm -rf "$help_dir"
+# nrepl-server --no-port-file writes no .nrepl-port, and --port-file PATH writes
+# the bound port there (relative to the caller's directory) and deletes it on
+# the way out. The PATH is not read as the port: `--port-file p.txt 0` binds 0.
+nr_dir="$(mktemp -d)"
+mkdir -p "$nr_dir/sub"
+nr_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+nr_start() {
+  (cd "$nr_dir" && JOLT_PWD="$nr_dir" exec "$nr_jolt" nrepl-server "$@" </dev/null >"$nr_dir/out" 2>&1) &
+  nr_pid=$!
+  nr_i=0
+  while [ $nr_i -lt 120 ] && ! grep -q 'started on port' "$nr_dir/out" 2>/dev/null; do
+    sleep 0.5; nr_i=$((nr_i + 1))
+  done
+}
+nr_stop() { kill "$nr_pid" 2>/dev/null; wait "$nr_pid" 2>/dev/null; }
+nr_start 0 --no-port-file
+if grep -q 'started on port' "$nr_dir/out" && [ ! -e "$nr_dir/.nrepl-port" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --no-port-file should start and write no .nrepl-port: $(head -2 "$nr_dir/out")"
+  fails=$((fails + 1))
+fi
+nr_stop
+nr_start --port-file sub/p.txt 0
+nr_port="$(sed -n 's/.*started on port \([0-9]*\).*/\1/p' "$nr_dir/out")"
+if [ -n "$nr_port" ] && [ "$nr_port" != 0 ] && [ "$(cat "$nr_dir/sub/p.txt" 2>/dev/null)" = "$nr_port" ] \
+   && [ ! -e "$nr_dir/.nrepl-port" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --port-file sub/p.txt 0 should write the bound port there: $(head -2 "$nr_dir/out")"
+  fails=$((fails + 1))
+fi
+nr_stop
+if [ ! -e "$nr_dir/sub/p.txt" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server should delete its --port-file on the way out"
+  fails=$((fails + 1))
+fi
+if (cd "$nr_dir" && JOLT_PWD="$nr_dir" $jolt_timeout "$nr_jolt" nrepl-server --port-file </dev/null 2>&1) | grep -q -- '--port-file needs a path'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --port-file with no PATH should say so"
+  fails=$((fails + 1))
+fi
+rm -rf "$nr_dir"
 # version / --version are synonyms and name the version.
 if $jolt version 2>/dev/null | grep -q '^jolt ' \
    && [ "$($jolt version 2>/dev/null)" = "$($jolt --version 2>/dev/null)" ]; then
