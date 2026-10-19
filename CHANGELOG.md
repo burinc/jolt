@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Math` and `clojure.math` take exact arguments as doubles.** The argument
+  went to the Chez op as given and only the result became a double, so the poles
+  raised: `(Math/atan2 0 0)`, `(Math/log 0)` and `(Math/pow 0 -1)` (and their
+  `clojure.math` twins) threw `ArithmeticException` where the JVM answers `0.0`,
+  `##-Inf` and `##Inf`. The double-parameter methods now convert first, as a
+  `double` parameter does on the JVM.
+
 - **`(String. bytes offset length)` copies only the slice (#1413).** A byte
   array was copied whole before the slice was cut, so decoding 30 bytes out of a
   1.5 MB array cost the 1.5 MB. An out-of-range offset or length now throws
