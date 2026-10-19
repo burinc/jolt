@@ -5727,6 +5727,8 @@
   {:suite "conformance / numbers / math" :label "Math/sqrt" :expected "3.0" :actual "(Math/sqrt 9)" :portability :jvm}
   {:suite "conformance / numbers / math" :label "Math/pow" :expected "8.0" :actual "(Math/pow 2 3)" :portability :jvm}
   {:suite "conformance / numbers / math" :label "Math/atan2" :expected "0.0" :actual "(Math/atan2 0.0 1.0)" :portability :jvm}
+  {:suite "conformance / numbers / math" :label "Math double-param fns take exact args as doubles (atan2/log/pow at their poles)" :expected "[0.0 ##-Inf ##Inf 0.0 ##-Inf ##Inf]" :actual "[(Math/atan2 0 0) (Math/log 0) (Math/pow 0 -1) (clojure.math/atan2 0 0) (clojure.math/log 0) (clojure.math/pow 0 -1)]" :portability :jvm}
+  {:suite "conformance / numbers / math" :label "Math/pow over exact args is double arithmetic" :expected "[1.2157665459056929E19 1.5707963267948966]" :actual "[(Math/pow 3 40) (Math/atan2 1/2 0)]" :portability :jvm}
   {:suite "conformance / numbers / math" :label "Math/sinh" :expected "0.0" :actual "(Math/sinh 0.0)" :portability :jvm}
   {:suite "conformance / numbers / math" :label "Math/cosh" :expected "1.0" :actual "(Math/cosh 0.0)" :portability :jvm}
   {:suite "conformance / numbers / math" :label "Math/tanh" :expected "0.0" :actual "(Math/tanh 0.0)" :portability :jvm}
