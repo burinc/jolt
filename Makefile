@@ -129,7 +129,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   threadsafety maskedacquire ioerrno values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck noticecheck monitormodel \
+.PHONY: build install test ci bionic-ci ci-shard ci-shard-list gate-run-test gate-run-ci gate-run-bionic-ci gate-run-ci-shard gate-status hooks attributioncheck noticecheck monitormodel \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
         gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
@@ -216,7 +216,7 @@ GATE-SHA = $$(command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "sh
 # ("ik"); long options stay separate words. Read the first word only when it is
 # that group, or --no-print-directory matches a search for "i".
 MAKE-SHORT-FLAGS := $(filter-out -%,$(firstword $(MAKEFLAGS)))
-ifneq (,$(filter test ci gate-run-test gate-run-ci,$(MAKECMDGOALS)))
+ifneq (,$(filter test ci ci-shard gate-run-test gate-run-ci gate-run-ci-shard,$(MAKECMDGOALS)))
 ifneq (,$(findstring i,$(MAKE-SHORT-FLAGS)))
 $(error make -i ignores failures, so the gate cannot fail — drop -i)
 endif
@@ -271,6 +271,35 @@ bionic-ci:
 gate-run-test: $(TEST-GATES)
 gate-run-ci: $(CI-GATES)
 gate-run-bionic-ci: $(CI-GATES)
+
+# One shard of a gate, so CI can run a gate as parallel jobs. SHARD-SET is test
+# (selfhost plus CI-GATES) or ci (CI-GATES alone, what bionic-ci runs), and
+# SHARD of SHARDS takes every SHARDS-th gate of that set's sorted list, so the
+# shards between them run every gate exactly once and a gate added to CI-GATES
+# lands in some shard without anyone listing it. `make ci-shard-list` prints a
+# shard's gates. A shard is not the gate: it leaves no receipt, and gate-status
+# keeps saying NOT GATED.
+SHARD ?= 1
+SHARDS ?= 1
+SHARD-SET ?= test
+SHARD-POOL = $(sort $(filter-out ci,$(if $(filter ci,$(SHARD-SET)),$(CI-GATES),$(TEST-GATES) $(CI-GATES))))
+SHARD-GATES = $(shell printf '%s\n' $(SHARD-POOL) | awk -v i='$(SHARD)' -v n='$(SHARDS)' '(NR - 1) % n == i - 1')
+ci-shard:
+	@case '$(SHARD-SET)' in test|ci) ;; *) echo "ci-shard: SHARD-SET must be test or ci, not '$(SHARD-SET)'"; exit 2;; esac
+	@if ! [ '$(SHARDS)' -ge 1 ] 2>/dev/null || ! [ '$(SHARD)' -ge 1 ] 2>/dev/null || [ '$(SHARD)' -gt '$(SHARDS)' ]; then \
+	  echo "ci-shard: need 1 <= SHARD <= SHARDS, got SHARD=$(SHARD) SHARDS=$(SHARDS)"; exit 2; fi
+	@echo "ci-shard: $(SHARD-SET) shard $(SHARD)/$(SHARDS), $(words $(SHARD-GATES)) of $(words $(SHARD-POOL)) gates"
+	+@if $(MAKE) --no-print-directory gate-run-ci-shard; then \
+	  echo "OK: $(SHARD-SET) shard $(SHARD)/$(SHARDS) passed ($(words $(SHARD-GATES)) targets)"; \
+	else \
+	  st=$$?; \
+	  echo "FAILED: $(SHARD-SET) shard $(SHARD)/$(SHARDS) did not complete — targets after the failure never ran,"; \
+	  echo "        so nothing here is evidence the rest of the shard passes."; \
+	  exit $$st; \
+	fi
+gate-run-ci-shard: $(SHARD-GATES)
+ci-shard-list:
+	@printf '%s\n' $(SHARD-GATES)
 
 # Is THIS working tree covered by a complete gate run? A subset run leaves the
 # receipt absent (the wrapper clears it) and any edit since changes the tree hash.
