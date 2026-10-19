@@ -9,8 +9,11 @@ description: >-
 runs:
   using: composite
   steps:
-    # The runner image's OS id, for the cache keys: ImageOS is a runner env var
-    # and the env context isn't reliably there in a composite action's with:.
+    # The runner image's OS id (ubuntu24), for the cache keys. ImageOS is a
+    # process env var, not one the workflow set, so ${{ env.ImageOS }} was
+    # always empty and the keys read chez-Linux--v10.4.1-…: a cache built on
+    # ubuntu-24.04 would have been restored on 26.04. Read from the shell, it
+    # is there, so the first run on each image builds Chez and Gambit once.
     - id: image
       shell: bash
       run: echo "os=$ImageOS" >> "$GITHUB_OUTPUT"
