@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`(String. bytes offset length)` copies only the slice (#1413).** A byte
+  array was copied whole before the slice was cut, so decoding 30 bytes out of a
+  1.5 MB array cost the 1.5 MB. An out-of-range offset or length now throws
+  `StringIndexOutOfBoundsException` with the JVM's message, where it used to
+  surface a Chez error.
+- **`io/resource` of a stdlib file names a file that exists (#1411, #1412).**
+  Under `bin/jolt`, run from a project directory, jolt's own relative install
+  roots were absolutized against the caller's directory instead of the checkout,
+  so `(slurp (io/resource "clojure/string.clj"))` threw.
 - **A warm AOT cache replayed the first load's source path (#1404, #1405).** The
   same source reached through another root, or from another directory, reported
   the `:file` and `*file*` of the load that filled the cache, which could name a
