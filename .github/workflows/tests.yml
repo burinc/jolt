@@ -8,9 +8,12 @@ on:
 
 # A newer push to the same branch or PR makes the run in flight moot, so it is
 # cancelled rather than left to hold runners for half an hour. main keeps
-# every run: each commit there is one someone may bisect to.
+# every run: each commit there is one someone may bisect to. A PR's runs are
+# grouped by its number, not its branch name: head_ref is the bare branch name,
+# so two PRs from different forks that both use, say, fix/typo would share a
+# group and cancel each other. A push groups by its ref.
 concurrency:
-  group: tests-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  group: tests-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
