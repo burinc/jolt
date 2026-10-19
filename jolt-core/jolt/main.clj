@@ -1167,7 +1167,21 @@
   ;; built-in handler — sessions / interruptible-eval / completion etc.
   (let [resolved (resolve-current)]
     (apply-project! resolved)
-    (let [raw-port (first (filter #(not (str/starts-with? % "-")) more))
+    ;; --no-port-file / --port-file PATH become start's :port-file (nil writes
+    ;; none), for a tool that picks the port itself and has no use for a
+    ;; .nrepl-port that another client would take as the project's server. The
+    ;; PATH is consumed here so it isn't read as the port.
+    (let [[raw-port opts] (loop [as more raw nil opts {}]
+                            (if-let [a (first as)]
+                              (cond
+                                (= a "--no-port-file") (recur (rest as) raw (assoc opts :port-file nil))
+                                (= a "--port-file")
+                                (if-let [p (second as)]
+                                  (recur (nnext as) raw (assoc opts :port-file p))
+                                  (throw (ex-info "--port-file needs a path" {})))
+                                (str/starts-with? a "-") (recur (rest as) raw opts)
+                                :else (recur (rest as) (or raw a) opts))
+                              [raw opts]))
           parsed (some-> raw-port parse-long)
           default (parse-long (or (jolt.host/getenv "JOLT_NREPL_PORT") "7888"))
           port (or parsed default)]
@@ -1192,9 +1206,9 @@
       ;; (park-until-interrupt keeps SIGINT blocked while that watcher is running,
       ;; and only unblocks it for its own ^C handler when nothing armed one.)
       (jolt.host/block-sigint)
-      (let [stop ((resolve 'jolt.nrepl/start) port (:nrepl-middleware resolved))]
+      (let [stop ((resolve 'jolt.nrepl/start) port (:nrepl-middleware resolved) opts)]
         ;; register stop so ^C (handled by park-until-interrupt) closes the socket
-        ;; and drops .nrepl-port on the way out.
+        ;; and drops the port file it wrote on the way out.
         (jolt.host/add-shutdown-hook stop)
         ;; park here until ^C (handled by park-until-interrupt's keyboard-interrupt-
         ;; handler, which runs the shutdown hooks and exits). The accept loop
@@ -1209,7 +1223,9 @@
   [["repl"
     ["  repl                   start a REPL"]]
    ["nrepl-server"
-    ["  nrepl-server [port]    start an nREPL server (default 7888) for editors"]]
+    ["  nrepl-server [port]    start an nREPL server (default 7888) for editors"
+     "    [--no-port-file | --port-file PATH]"
+     "                         write no .nrepl-port, or write the port to PATH"]]
    ["run"
     ["  run -m NS [args]       resolve deps.edn, load NS, call its -main"
      "  run FILE [args]        load a Clojure file"]]
