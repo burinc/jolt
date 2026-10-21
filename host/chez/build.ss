@@ -2738,6 +2738,10 @@
           ;; arm; its host process owns both of these.
           (unless library? (put-string out "    (jolt-install-exit-handler!)\n"))
           (unless library? (put-string out "    (jolt-arm-shutdown!)\n"))
+          ;; JOLT_PROFILE=sample: the sampler needs only the runtime, so a built
+          ;; app can be profiled as it ships (sampler.ss). After the exit handler,
+          ;; since the report is a shutdown hook.
+          (unless library? (put-string out "    (jolt-sample-init-from-env!)\n"))
           ;; The prologue (optional native loads + source-root setup) and the -main
           ;; call (or library export publish) run under one guard so a throw in
           ;; either surfaces as jolt-report-throwable + a non-zero exit/return

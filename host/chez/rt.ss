@@ -3185,6 +3185,10 @@
 ;; uncaught-throwable renderer. After the printers/equality it relies on.
 (load "host/chez/source-registry.ss")
 
+;; The sampling profiler (jolt.profile/sample!): the sample client of the tick
+;; scheduler (ticks.ss). After source-registry.ss, which resolves its frames.
+(load "host/chez/sampler.ss")
+
 ;; Unique anon-fn names -> {source form, ns, free locals} for the image write
 ;; side. Plain defines (no def-var! / manifest lines): only emitted code and the
 ;; image writer call them, never Clojure.

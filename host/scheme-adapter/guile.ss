@@ -188,6 +188,15 @@
 ;;   sa-profile-clear!      UNIMPLEMENTED  no-op.
 
 ;; ---------------------------------------------------------------------------
+;; tier: capability-sample
+;; ---------------------------------------------------------------------------
+;;   sa-stack-walk          UNIMPLEMENTED  ?? Guile's stack API (make-stack) walks
+;;                                        frames, and setitimer could drive it; degrade (#f).
+;;   sa-frame-source-pair   UNIMPLEMENTED  #f.
+;;   sa-code-name           UNIMPLEMENTED  #f.
+;;   sa-thread-cpu-nanos    UNIMPLEMENTED  0.
+
+;; ---------------------------------------------------------------------------
 ;; tier: capability-unchecked
 ;; ---------------------------------------------------------------------------
 ;;   sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=?  UNIMPLEMENTED  Guile: the

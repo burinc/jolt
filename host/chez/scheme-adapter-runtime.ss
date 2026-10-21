@@ -777,6 +777,59 @@
               (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
         '())))
 
+;; ---- stack sampling (capability: sample) -----------------------------------
+;; (sa-stack-walk k cap proc) -> frames walked | #f
+;; Calls (proc code offset frame) on each frame of continuation k, innermost
+;; first, at most cap of them. code is the frame's code object and offset its
+;; return offset: together they identify where the frame is stopped, the same
+;; pair for every visit to that call. frame is a continuation holding just that
+;; frame, for sa-frame-source-pair. Built for a timer handler: it splits one
+;; frame at a time off the continuation (the inspector does the same) and keeps
+;; nothing, so a sampled stack is not retained. Contract: the walk, innermost
+;; first. Degradation: #f — there are no stacks to sample, and jolt.profile
+;; reports sampling unsupported.
+(define (sa-stack-walk k cap proc)
+  (let loop ((k k) (n 0))
+    (if (or (fx>=? n cap) (not (#%$continuation? k)) (eq? k #%$null-continuation))
+        n
+        (let ((k1 (#%$split-continuation k 0)))
+          (if (not (#%$continuation? k1))
+              n
+              (begin
+                (proc (#%$continuation-return-code k1) (#%$continuation-return-offset k1) k1)
+                (loop (#%$continuation-link k1) (fx+ n 1))))))))
+
+;; (sa-frame-source-pair frame) -> (source-name . byte-offset) | #f
+;; Where a frame from sa-stack-walk is stopped, as the source object of its call
+;; site: the file (or eval source name) and the byte offset in it. Contract: the
+;; pair. Degradation: #f — the sampler then names frames without lines.
+(define (sa-frame-source-pair frame)
+  (guard (e (#t #f))
+    (and (sa-introspect-enabled?)
+         (call-with-values (lambda () ((inspect/object frame) 'source-object))
+           (case-lambda
+             ((so) (and so
+                        (let ((path (source-file-descriptor-path (source-object-sfd so)))
+                              (bfp (source-object-bfp so)))
+                          (and (string? path) (fixnum? bfp) (cons path bfp)))))
+             (_ #f))))))
+
+;; (sa-code-name code) -> string | #f: the name a code object from sa-stack-walk
+;; carries, the variable its lambda was bound under. Contract: the name.
+;; Degradation: #f.
+(define (sa-code-name code)
+  (let ((n (#%$code-name code)))
+    (cond ((string? n) n)
+          ((symbol? n) (symbol->string n))
+          (else #f))))
+
+;; (sa-thread-cpu-nanos) -> exact integer: CPU time the calling thread has used.
+;; A sampler weighs each sample by it, so time a thread spent blocked counts for
+;; nothing. Contract: monotonic per thread, nanoseconds. Degradation: 0.
+(define (sa-thread-cpu-nanos)
+  (let ((t (current-time 'time-thread)))
+    (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
+
 ;; (sa-procedure-info x) -> (name . ((free-name . value) ...)) | #f
 ;; A procedure's inspector name and live free-variable captures, in
 ;; registration order — what the image graph needs to serialize closures

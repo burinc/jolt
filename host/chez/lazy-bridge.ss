@@ -351,6 +351,8 @@
                   (*txn* #f)
                   (rdr-default-modes!)
                   (thread-daemon-record! (get-thread-id) d)
+                  ;; a thread forked while the sampler runs is sampled from its start
+                  (when jolt-tick-sampling? (jolt-tick-join-sampling!))
                   (let ((id (get-thread-id)))
                     (dynamic-wind
                       (lambda () #f)
