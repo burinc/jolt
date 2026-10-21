@@ -870,27 +870,74 @@
 ;; rather than in java/dot-forms.ss because record-method-dispatch below reaches
 ;; it for a deftype built on the clojure.lang interfaces, and this file is
 ;; shared with the Gambit boot while the java/ tree is not.
+;;
+;; Which JVM class a builtin collection is decides which of these methods it
+;; has at all: a seq is an ISeq and a java.util.List but not Associative, a set
+;; has no valAt, a map is no Collection. dot-coll-kind names the class family,
+;; and a method only some families have checks it (dot-coll-has!), raising the
+;; JVM's own "No matching method" for the rest -- where answering anyway was
+;; jolt saying yes to a call the JVM rejects. #f is a value whose methods are
+;; its own business (a deftype built on these interfaces), so nothing is gated.
+;; A host collection outside this file (the queue) registers its family.
+(define dot-coll-kind-arms '())
+(define (register-dot-coll-kind! pred kind)
+  (set! dot-coll-kind-arms (cons (cons pred kind) dot-coll-kind-arms)))
+(define (dot-coll-kind obj)
+  (cond ((jrec? obj) #f)
+        ((jolt-vector? obj) 'vec)
+        ((pmap? obj) 'map)
+        ((pset? obj) 'set)
+        ((empty-list-t? obj) 'empty-list)
+        ((cseq? obj) (if (cseq-list? obj) 'list 'seq))
+        ((jolt-lazyseq? obj) 'lazy)
+        ((htable-sorted-map? obj) 'smap)
+        ((htable-sorted-set? obj) 'sset)
+        (else (let loop ((as dot-coll-kind-arms))
+                (cond ((null? as) #f)
+                      (((caar as) obj) (cdar as))
+                      (else (loop (cdr as))))))))
+;; the families, by the interface that brings the methods
+(define dck-seq '(list empty-list seq lazy))                     ; ISeq
+(define dck-list '(vec list empty-list seq lazy))                ; java.util.List
+(define dck-stack '(vec list empty-list queue))                  ; IPersistentStack
+(define dck-assoc '(vec map smap))                               ; Associative
+(define dck-coll '(vec set sset list empty-list seq lazy queue)) ; java.util.Collection
+;; Inline, with the three common records tested first: this runs on every gated
+;; interop call, and a call out to the full classifier was a measured 15-40 ns
+;; on (.peek v).
+(define-syntax dot-coll-kind-fast
+  (syntax-rules ()
+    ((_ obj) (cond ((pvec? obj) 'vec) ((pmap? obj) 'map) ((pset? obj) 'set) (else (dot-coll-kind obj))))))
+(define-syntax dot-coll-has!
+  (syntax-rules ()
+    ((_ obj name args kinds)
+     (let ((k (dot-coll-kind-fast obj)))
+       (when (and k (not (memq k kinds))) (no-method-throw name obj (length args)))))))
+(define (dot-coll-core name . args) (apply jolt-invoke (var-deref "clojure.core" name) args))
+
 ;; Mirror coll-interop: return a one-element list boxing the result (so a jolt-nil
 ;; result is still distinguishable from "not a collection method"), or #f.
 (define (dot-coll-method obj name args)
   (cond
     ((string=? name "count") (list (jolt-count obj)))
     ((string=? name "seq")   (list (jolt-seq obj)))
-    ((string=? name "nth")   (list (apply jolt-nth obj args)))
-    ((or (string=? name "get") (string=? name "valAt"))
-     (list (apply jolt-get obj args)))
-    ((string=? name "containsKey") (list (jolt-contains? obj (car args))))
+    ((string=? name "nth")   (dot-coll-has! obj name args '(vec)) (list (apply jolt-nth obj args)))
+    ;; List.get(int) indexes; a set's or map's get looks up
+    ((string=? name "get")
+     (let ((k (dot-coll-kind-fast obj)))
+       (cond ((eq? k 'queue) (no-method-throw name obj (length args)))
+             ((memq k dck-seq) (list (jolt-nth obj (car args))))
+             (else (list (apply jolt-get obj args))))))
+    ((string=? name "valAt") (dot-coll-has! obj name args dck-assoc) (list (apply jolt-get obj args)))
+    ((string=? name "containsKey") (dot-coll-has! obj name args dck-assoc) (list (jolt-contains? obj (car args))))
     ;; java.util.Collection.contains(o): VALUE membership (a set is O(1) via
     ;; contains?; a list/vector/seq is a linear scan — contains? on a vector tests
     ;; an index, so it is wrong here).
     ((string=? name "contains")
-     (list (if (pset? obj)
+     (dot-coll-has! obj name args dck-coll)
+     (list (if (or (pset? obj) (htable-sorted-set? obj))
                (jolt-contains? obj (car args))
-               (let ((x (car args)))
-                 (let loop ((s (jolt-seq obj)))
-                   (cond ((jolt-nil? s) #f)
-                         ((jolt=2 (seq-first s) x) #t)
-                         (else (loop (jolt-seq (seq-more s))))))))))
+               (if (dot-coll-index-of obj (car args)) #t #f))))
     ((string=? name "size")    (list (jolt-count obj)))
     ((string=? name "isEmpty") (list (jolt-empty? obj)))
     ;; Iterable.forEach(Consumer): every element in seq order. A map is both an
@@ -930,11 +977,12 @@
     ;; map/vector/set. Each maps to the persistent op of the same meaning.
     ((string=? name "cons")    (list (jolt-conj obj (car args))))
     ((or (string=? name "assoc") (string=? name "assocN"))
+     (dot-coll-has! obj name args (if (string=? name "assoc") dck-assoc '(vec)))
      (list (jolt-assoc obj (car args) (cadr args))))
-    ((string=? name "without") (list (jolt-dissoc obj (car args))))
-    ((string=? name "disjoin") (list (jolt-disj obj (car args))))
-    ((string=? name "pop")     (list (jolt-pop obj)))
-    ((string=? name "peek")    (list (jolt-peek obj)))
+    ((string=? name "without") (dot-coll-has! obj name args '(map smap)) (list (jolt-dissoc obj (car args))))
+    ((string=? name "disjoin") (dot-coll-has! obj name args '(set sset)) (list (jolt-disj obj (car args))))
+    ((string=? name "pop")     (dot-coll-has! obj name args dck-stack) (list (jolt-pop obj)))
+    ((string=? name "peek")    (dot-coll-has! obj name args dck-stack) (list (jolt-peek obj)))
     ((string=? name "equiv")   (list (if (jolt= obj (car args)) #t #f)))
     ;; IEditableCollection.asTransient — hand back a transient over this coll.
     ((string=? name "asTransient") (list (jolt-transient-new obj)))
@@ -960,10 +1008,30 @@
     ;; (.reduce coll f) / (.reduce coll f init): clojure.lang.IReduce — every
     ;; persistent collection reduces itself on the JVM.
     ((string=? name "reduce")
+     (dot-coll-has! obj name args '(vec list seq))
      (list (if (pair? (cdr args))
                (jolt-reduce (car args) (cadr args) obj)
                (jolt-reduce (car args) obj))))
+    ;; methods jolt had no interop for, after every older clause so this
+    ;; string=? chain costs the earlier methods what it always did
+    ((string=? name "entryAt") (dot-coll-has! obj name args dck-assoc) (list (dot-coll-core "find" obj (car args))))
+    ((string=? name "indexOf")
+     (dot-coll-has! obj name args dck-list)
+     (list (or (dot-coll-index-of obj (car args)) -1)))
+    ((string=? name "toArray") (dot-coll-has! obj name args dck-coll) (list (dot-coll-core "to-array" obj)))
+    ((string=? name "empty")   (list (dot-coll-core "empty" obj)))
+    ((string=? name "hasheq")  (list (jolt-hasheq obj)))
+    ((string=? name "first")   (dot-coll-has! obj name args dck-seq) (list (jolt-first obj)))
+    ((string=? name "next")    (dot-coll-has! obj name args dck-seq) (list (jolt-next obj)))
+    ((string=? name "more")    (dot-coll-has! obj name args dck-seq) (list (jolt-rest obj)))
+    ((string=? name "rseq")    (dot-coll-has! obj name args '(vec sset smap)) (list (jolt-rseq obj)))
     (else #f)))
+;; index of the first element = x in coll's seq order, or #f
+(define (dot-coll-index-of coll x)
+  (let loop ((s (jolt-seq coll)) (i 0))
+    (cond ((jolt-nil? s) #f)
+          ((jolt=2 (seq-first s) x) i)
+          (else (loop (jolt-seq (seq-more s)) (fx+ i 1))))))
 
 ;; ---- method-dispatch arm registry ------------------------------------------
 ;; A .method call (record-method-dispatch) is resolved by an ordered list of arms

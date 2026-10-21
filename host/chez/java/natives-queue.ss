@@ -113,6 +113,7 @@
               c))
         (%q-with-meta x m))))
 (def-var! "clojure.core" "with-meta" jolt-with-meta)
+(register-dot-coll-kind! jolt-queue? 'queue)
 ;; with-meta, not meta-carry: carry would key the meta onto the shared EMPTY
 (register-empty-coll-arm! jolt-queue? (lambda (q) (jolt-with-meta jolt-queue-empty (jolt-meta q))))
 
