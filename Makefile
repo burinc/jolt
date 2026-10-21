@@ -189,7 +189,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -411,6 +411,12 @@ fibers:
 # cleared before an idle wait forked a second immortal timer per call.
 asynctimer:
 	@$(CHEZ) --script test/chez/async-timer-test.ss
+
+# The per-thread tick scheduler (host/chez/ticks.ss): clients keep their own
+# cadence on one engine timer, a lone preemption stays a bare set-timer, and the
+# state is per thread.
+ticks:
+	@$(CHEZ) --script test/chez/ticks-test.ss
 
 # A nested run-interruptible extent restores the enclosing polling timer after
 # normal return, exception, or interruption, without sharing ownership between
