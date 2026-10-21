@@ -518,6 +518,10 @@
 (define (sa-frame-source-pair frame) #f)
 (define (sa-code-name code) #f)
 (define (sa-thread-cpu-nanos) 0)
+;; The shared lazy-bridge.ss fork wrapper asks the Chez tick scheduler whether a
+;; new thread should join the sampler (host/chez/ticks.ss). Never, here.
+(define jolt-tick-sampling? #f)
+(define (jolt-tick-join-sampling!) (if #f #f))
 
 
 ;; ---- continuations tier (capability: continuations) -------------------------
