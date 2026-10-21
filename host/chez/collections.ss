@@ -1439,7 +1439,10 @@
 ;; sets are ALWAYS hash-ordered (JVM PersistentHashSet), backed by pmap in hash mode.
 (define empty-pset (make-pset empty-pmap-hash))   ; sets are ALWAYS hash-ordered (JVM PersistentHashSet)
 (define (pset-conj s e) (if (pmap-contains? (pset-m s) e) s (make-pset (pmap-assoc (pset-m s) e e))))
-(define (pset-disj s e) (make-pset (pmap-dissoc (pset-m s) e)))
+;; a miss answers s itself, as PersistentHashSet.disjoin does (and pset-conj on a
+;; hit): no allocation, and (identical? s (disj s x)) is how a caller sees the miss
+(define (pset-disj s e)
+  (let* ((m (pset-m s)) (m2 (pmap-dissoc m e))) (if (eq? m2 m) s (make-pset m2))))
 (define (pset-contains? s e) (pmap-contains? (pset-m s) e))
 ;; A lookup answers with the element the set HOLDS, not with the equal probe key
 ;; it was handed — only the stored one carries the element's metadata, and callers

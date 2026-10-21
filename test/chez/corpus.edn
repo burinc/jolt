@@ -2604,6 +2604,20 @@
   {:suite "maps / group-by NaN keys" :label "a NaN key gets its own bucket" :expected "\"{##NaN [##NaN], 1.0 [1.0]}\"" :actual "(pr-str (group-by identity [##NaN 1.0]))" :portability :common}
   {:suite "maps / group-by NaN keys" :label "each NaN is a separate entry beside grown buckets" :expected "\"{##NaN [##NaN], 1 [1 1], ##NaN [##NaN], 2 [2]}\"" :actual "(pr-str (group-by identity [##NaN 1 ##NaN 2 1]))" :portability :common}
   {:suite "maps / group-by NaN keys" :label "NaN keys in a hash-map-sized grouping" :expected "[42 true 2 [39 39]]" :actual "(let [g (group-by identity (concat (range 40) [##NaN ##NaN] (range 40)))] [(count g) (every? vector? (vals g)) (count (filter #(and (double? %) (NaN? %)) (keys g))) (get g 39)])" :portability :common}
+  ;; intersection and select drop an item by disj-ing it out of the set it came
+  ;; from. A ##NaN never finds itself, so it stayed; the JVM's disj hits it by
+  ;; reference identity and drops it.
+  {:suite "sets / removing NaN members" :label "intersection drops a NaN the other set lacks" :expected "\"#{1}\"" :actual "(pr-str (clojure.set/intersection #{##NaN 1} #{1 2}))" :portability :common}
+  {:suite "sets / removing NaN members" :label "select drops a NaN that fails the predicate" :expected "\"#{1 2}\"" :actual "(pr-str (clojure.set/select #(== % %) #{##NaN 1 2}))" :portability :common}
+  {:suite "sets / removing NaN members" :label "select on a hash-set-sized set" :expected "40" :actual "(count (clojure.set/select #(== % %) (into #{##NaN} (range 40))))" :portability :common}
+  {:suite "sets / removing NaN members" :label "the rebuilt select keeps meta" :expected "\"{:m 1}\"" :actual "(pr-str (meta (clojure.set/select #(== % %) (with-meta #{##NaN 1} {:m 1}))))" :portability :common}
+  ;; meta through into-with-a-transducer, empty and a PersistentQueue, all as the
+  ;; JVM threads it
+  {:suite "meta / into, empty, queue" :label "into with a transducer keeps the target's meta" :expected "[{:m 1} {:m 1} {:m 1} {:m 1} {:m 1}]" :actual "(mapv (fn [to] (meta (into (with-meta to {:m 1}) (map identity) [[1 2]]))) [[] #{} {} (sorted-set) (list)])" :portability :common}
+  {:suite "meta / into, empty, queue" :label "empty keeps a sorted coll's meta" :expected "[{:m 1} {:m 1}]" :actual "[(meta (empty (with-meta (sorted-set 1) {:m 1}))) (meta (empty (with-meta (sorted-map 1 1) {:m 1})))]" :portability :common}
+  {:suite "meta / into, empty, queue" :label "empty keeps a list's meta, not a seq's" :expected "[{:m 1} {:m 1} nil nil nil nil]" :actual "(mapv (fn [c] (meta (empty (with-meta c {:m 1})))) [(list 1) (cons 1 nil) (seq [1 2]) (lazy-seq [1]) (range 3) (map inc [1])])" :portability :common}
+  {:suite "meta / into, empty, queue" :label "a queue carries meta through conj, pop and empty" :expected "[{:m 1} {:m 1} {:m 1} {:m 1} clojure.lang.PersistentQueue nil [1 2]]" :actual "(let [q (with-meta (conj clojure.lang.PersistentQueue/EMPTY 1 2) {:m 1})] [(meta q) (meta (conj q 3)) (meta (pop q)) (meta (empty q)) (class (empty q)) (meta clojure.lang.PersistentQueue/EMPTY) (vec q)])" :portability :jvm}
+  {:suite "sets / removing NaN members" :label "disj of an absent member answers the set itself" :expected "[true true true true]" :actual "(mapv (fn [s] (identical? s (disj s 99))) [#{1 2} (set (range 40)) (with-meta #{1} {:m 1}) #{}])" :portability :common}
   {:suite "clojure.math" :label "sqrt" :expected "true" :actual "(< 1.4142 (clojure.math/sqrt 2) 1.4143)" :portability :common}
   {:suite "clojure.math" :label "pow" :expected "1024" :actual "(long (clojure.math/pow 2 10))" :portability :common}
   {:suite "clojure.math" :label "tan of 0" :expected "0" :actual "(long (clojure.math/tan 0))" :portability :common}
