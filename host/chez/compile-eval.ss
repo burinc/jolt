@@ -353,9 +353,11 @@
 ;; get-datum/annotations a TEXTUAL one, so the text is opened twice over the
 ;; same bytes. The registered marker table is all that survives this call — the
 ;; text itself is transient. Tracing must be on (markers present) when called.
+;; The eval is the compile jolt.profile instruments (sa-profile-compile), and the
+;; form's position goes with the table so a counter can name the file it is in.
 (define (jolt-eval-with-source scm)
   (let* ((bv (string->utf8 scm))
-         (name (jolt-register-eval-marker-table! scm))
+         (name (jolt-register-eval-marker-table! scm (jolt-current-source)))
          (sfd (make-source-file-descriptor name (open-bytevector-input-port bv)))
          (ann (call-with-values
                (lambda ()
@@ -363,7 +365,7 @@
                   (transcoded-port (open-bytevector-input-port bv) (native-transcoder))
                   sfd 0))
                (lambda (a p) a))))
-    (eval ann (interaction-environment))))
+    (sa-profile-compile (lambda () (eval ann (interaction-environment))))))
 
 ;; (with-meta sym m) -> sym, else x — an (ns ^:no-doc name …) yields the name with
 ;; reader metadata as a with-meta form; strip it to read the bare ns symbol.

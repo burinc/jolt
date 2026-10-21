@@ -2158,6 +2158,10 @@
          ;; embedded fasl registered but failed to load: fall back to source.
          (load-jolt-file file))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
+          ;; jolt.profile counts code it compiled itself: a cached fasl carries no
+          ;; counters, and what an instrumented compile would write to the cache
+          ;; is the slower code every later run would load
+          (not (sa-profile-instrumenting?))
           (or (not (ldr-source-only?)) (ldr-build-aot-cache?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so

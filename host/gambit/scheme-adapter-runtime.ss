@@ -274,13 +274,14 @@
   'little)
 
 ;; (sa-stats) -> #(cpu-nanos real-nanos gc-count gc-cpu-nanos gc-real-nanos
-;;                gc-bytes)
-;; One statistics snapshot as the six exact-integer fields rt.ss reads into
-;; the jolt.host telemetry vars (time fields pre-converted to nanos). Contract:
-;; the six fields in this order. Degradation: a zero vector — the OTel layer
-;; maps zeros to absent metrics.
+;;                gc-bytes allocated-bytes)
+;; One statistics snapshot as the seven exact-integer fields rt.ss reads into
+;; the jolt.host telemetry vars (time fields pre-converted to nanos).
+;; allocated-bytes is every byte allocated since the process started, freed or
+;; not. Contract: the seven fields in this order. Degradation: a zero vector —
+;; the OTel layer maps zeros to absent metrics.
 (define (sa-stats)
-  (vector 0 0 0 0 0 0))
+  (vector 0 0 0 0 0 0 0))
 
 ;; (sa-continuation-frames k) -> list of frame inspectors | '()
 ;; The continuation's frames, innermost first. Contract: stepping a throw
@@ -499,6 +500,17 @@
 ;; sa-fasl-write wrote. Degradation: raise — same story as sa-fasl-write.
 (define (sa-fasl-read port . rest)
   (error 'sa-fasl-read "fasl serialization is unsupported on the gambit target"))
+
+;; ---- execution-count profiling (capability: profile) -----------------------
+;; Gambit's compiler has no per-expression counters to read back, so this tier
+;; takes the contract's degradation throughout: jolt.profile reports profiling
+;; as unsupported and every reading is empty.
+(define (sa-profile-instrument! on?) (not on?))
+(define (sa-profile-instrumenting?) #f)
+(define (sa-profile-compile thunk) (thunk))
+(define (sa-profile-counts) '())
+(define (sa-profile-clear!) (if #f #f))
+
 
 ;; ---- continuations tier (capability: continuations) -------------------------
 

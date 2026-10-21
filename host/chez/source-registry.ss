@@ -326,6 +326,11 @@
 
 ;; Forward scan -> sorted vector of (start . line) pairs, one per real marker.
 (define (jolt-marker-table text)
+  (jolt-marker-scan text (lambda (start end entry) (cons start entry))))
+
+;; The scan itself: (keep start end entry) for each real marker, in text order,
+;; into a vector. end is the offset just past the marker's closing |#.
+(define (jolt-marker-scan text keep)
   (define n (string-length text))
   (define (digit? c) (char<=? #\0 c #\9))
   (define (alpha? c) (or (char<=? #\a c #\z) (char<=? #\A c #\Z)))
@@ -428,7 +433,7 @@
             (char=? (string-ref text (+ i 1)) #\|))
        (let ((m (marker-at? i)))
          (if m
-             (scan (cdr m) (cons (cons i (car m)) out))
+             (scan (cdr m) (cons (keep i (cdr m) (car m)) out))
              (let skip ((j (+ i 2)) (depth 1))
                (cond
                  ((>= j n) (scan n out))
@@ -528,16 +533,22 @@
       name)))
 ;; Register the marker table for one eval'd Scheme text; returns the synthetic
 ;; source name to pass make-source-file-descriptor. Once per top-level form.
-(define (jolt-register-eval-marker-table! scm)
+;; pos is the form's {:line :column :file?} position (or #f / nil); only the
+;; profiler keeps it (jolt-profile-note-source!).
+(define (jolt-register-eval-marker-table! scm . pos)
   (jolt-lock! jolt-eval-source-mutex)
   (let ((name (string-append "jolt-eval-src-"
-                             (number->string jolt-eval-source-counter))))
+                             (number->string jolt-eval-source-counter)))
+        (table (jolt-marker-table scm)))
     (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
     (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
       (let ((old (jolt-eval-queue-pop!)))
         (when old (hashtable-delete! jolt-eval-marker-registry old))))
-    (hashtable-set! jolt-eval-marker-registry name (jolt-marker-table scm))
+    (hashtable-set! jolt-eval-marker-registry name table)
     (jolt-eval-queue-push! name)
+    (when (sa-profile-instrumenting?)
+      (jolt-profile-note-source! name (jolt-profile-marker-table scm)
+                                 (and (pair? pos) (car pos))))
     (jolt-unlock! jolt-eval-source-mutex)
     name))
 ;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
@@ -560,6 +571,183 @@
                 (or (fx>=? i n)
                     (and (char<=? #\0 (string-ref name i) #\9)
                          (loop (fx+ i 1)))))))))
+
+;; --- jolt.profile: execution counts by clj line --------------------------------
+;; Code compiled while instrumentation is on (sa-profile-instrument!) carries a
+;; Chez counter per source-annotated expression. A counter names the eval source
+;; its code was read under and a byte offset into that text, which is the same
+;; (source-name . offset) pair a backtrace frame carries, so it resolves to a clj
+;; line through the same marker table. The eval registry above evicts its oldest
+;; tables, and a counter outlives that, so a form compiled under instrumentation
+;; also keeps its table here, with the file and line of the form it came from:
+;; the marker table holds lines but not the file, and the form's own line is the
+;; answer for code with no marker in or before it.
+;; Never evicted: it grows with the instrumented code, which is resident anyway.
+;;
+;; A counter is resolved by its own SPAN, not by the marker nearest before it.
+;; Markers sit in front of call sites only, and Chez counts every expression,
+;; variable references and constants included. An expression that is not a call
+;; has, before it, the marker of whatever call came last — often on an earlier
+;; line, in code that may never run (the void of a `when` after the throw in its
+;; body). So a counter takes, in order: the marker of the call it is; else the
+;; first marker inside it, the first call it runs, provided that call ran as often
+;; as it did; else the line of the innermost counted expression around it, which
+;; it is a part of; else the form's line.
+;;
+;; The count test is what keeps load-time code out of a fn. A defn's outer
+;; expressions run once, when the form loads, and the first marker inside them is
+;; the first call in the fn's BODY, under a lambda: it runs when the fn is called,
+;; however often that is, which is not as part of the def. A call that is really
+;; the expression's first step (an if's test, a let's first init) runs exactly as
+;; often as the expression does. A counter that resolves to no marker at all is
+;; top-level code, and the caller keeps it out of every fn.
+;; Hence the profile's own table: #(start code-start entry) per marker,
+;; code-start being where the marked call's text begins, so a counter whose span
+;; begins there is that call's own.
+(define jolt-profile-sources (make-hashtable string-hash string=?))   ; name -> #(table file line)
+(define (jolt-profile-marker-table text)
+  (let ((n (string-length text)))
+    (jolt-marker-scan text
+      (lambda (start end entry)
+        (let skip ((j end))
+          (if (and (fx<? j n) (char-whitespace? (string-ref text j)))
+              (skip (fx+ j 1))
+              (vector start j entry)))))))
+;; The entry of the marker a counter spanning [bfp, efp) with count k carries
+;; itself — its own, or the first inside it when that call's count (from
+;; call-count, offset -> count) is k — or #f.
+(define (jolt-profile-own-entry table bfp efp k call-count)
+  (let* ((n (vector-length table))
+         ;; i = how many markers start before bfp
+         (i (let loop ((lo 0) (hi n))
+              (if (fx>=? lo hi)
+                  lo
+                  (let ((mid (fxsrl (fx+ lo hi) 1)))
+                    (if (< (vector-ref (vector-ref table mid) 0) bfp)
+                        (loop (fx+ mid 1) hi)
+                        (loop lo mid))))))
+         (before (and (fx>? i 0) (vector-ref table (fx- i 1))))
+         (inside (and (fx<? i n) (vector-ref table i))))
+    (cond
+      ((and before (= (vector-ref before 1) bfp)) (vector-ref before 2))
+      ((and inside (< (vector-ref inside 0) efp)
+            (eqv? (call-count (vector-ref inside 1)) k))
+       (vector-ref inside 2))
+      (else #f))))
+
+(define jolt-profile-kw-file (keyword #f "file"))
+(define jolt-profile-kw-line (keyword #f "line"))
+;; Called under jolt-eval-source-mutex (jolt-register-eval-marker-table!).
+(define (jolt-profile-note-source! name table pos)
+  (let ((field (lambda (kw)
+                 (let ((v (if (pmap? pos) (jolt-get pos kw jolt-nil) jolt-nil)))
+                   (if (jolt-nil? v) #f v)))))
+    (hashtable-set! jolt-profile-sources name
+                    (vector table (field jolt-profile-kw-file) (field jolt-profile-kw-line)))))
+
+;; Switch instrumentation for code compiled from now on. Turning it on also turns
+;; trace frames on, whatever JOLT_TRACE says: the markers they emit are what a
+;; counter's offset resolves against, and without them nothing could be mapped.
+;; #f when the target cannot instrument.
+(define (jolt-profile-instrument! on?)
+  (let ((on? (jolt-truthy? on?)))
+    (and (sa-profile-instrument! on?)
+         (begin
+           (when on?
+             (let ((stf (var-deref "jolt.backend-scheme" "set-trace-frames!")))
+               (when (procedure? stf) (stf #t)))
+             (jolt-trace-enable!))
+           #t))))
+
+;; Every counter in instrumented code as [file line count owner source
+;; form-line top?], one per expression: file and line are where the expression's
+;; code was written, owner the "ns/name" of the fn an inlined copy came from
+;; (else nil, and the caller attributes the line to a def of the form it came
+;; from), source the eval source the counter belongs to (copies of one line in
+;; different forms are different code), form-line the line that top-level form
+;; starts on, top? true for top-level code, which belongs to no fn.
+;; Counters of code compiled with instrumentation off, or by the runtime itself,
+;; have no table here and are left out.
+(define (jolt-profile-sites)
+  (let ((by-source (make-hashtable string-hash string=?)))
+    (for-each (lambda (c)
+                (let ((name (vector-ref c 0)))
+                  (when (hashtable-contains? jolt-profile-sources name)
+                    (hashtable-update! by-source name (lambda (l) (cons c l)) '()))))
+              (sa-profile-counts))
+    (let-values (((names groups) (hashtable-entries by-source)))
+      (let ((acc '()))
+        (vector-for-each
+          (lambda (name cs)
+            (let* ((src (hashtable-ref jolt-profile-sources name #f))
+                   (table (vector-ref src 0))
+                   (form-line (let ((fl (vector-ref src 2))) (if (fixnum? fl) fl jolt-nil)))
+                   (counts (let ((h (make-eqv-hashtable)))
+                             (for-each (lambda (c) (hashtable-set! h (vector-ref c 1) (vector-ref c 3))) cs)
+                             h))
+                   (call-count (lambda (offset) (hashtable-ref counts offset #f)))
+                   ;; outermost first: by start, and the longer span first on a tie
+                   (sorted (list-sort (lambda (a b)
+                                        (or (< (vector-ref a 1) (vector-ref b 1))
+                                            (and (= (vector-ref a 1) (vector-ref b 1))
+                                                 (> (vector-ref a 2) (vector-ref b 2)))))
+                                      cs)))
+              ;; a stack of the spans still open, as (end . entry): spans nest, so
+              ;; the innermost one still open at a counter's start encloses it
+              (let loop ((cs sorted) (open '()))
+                (unless (null? cs)
+                  (let* ((c (car cs))
+                         (bfp (vector-ref c 1))
+                         (open (let pop ((o open))
+                                 (if (and (pair? o) (<= (car (car o)) bfp)) (pop (cdr o)) o)))
+                         (e (or (jolt-profile-own-entry table bfp (vector-ref c 2)
+                                                        (vector-ref c 3) call-count)
+                                (and (pair? open) (cdr (car open)))))
+                         (chain (jolt-marker-entry-chain e))
+                         (owner (and (pair? chain) (car (car chain))))
+                         (rec (and owner (srcreg-record-for-fqn owner)))
+                         (file (if rec (vector-ref rec 2) (vector-ref src 1)))
+                         (line (jolt-marker-entry-line e)))
+                    (set! acc (cons (jolt-vector (if (string? file) file jolt-nil)
+                                                 (if (fixnum? line) line form-line)
+                                                 (vector-ref c 3)
+                                                 (or owner jolt-nil)
+                                                 name
+                                                 form-line
+                                                 (not e))
+                                    acc))
+                    (loop (cdr cs) (cons (cons (vector-ref c 2) e) open)))))))
+          names groups)
+        (apply jolt-vector acc)))))
+
+;; The registered defs in FILES (a jolt collection of file strings) as [fqn file
+;; line], for attributing a line to the def it falls in.
+(define (jolt-profile-defs files)
+  (let ((want (make-hashtable string-hash string=?)))
+    (for-each (lambda (f) (when (string? f) (hashtable-set! want f #t))) (seq->list files))
+    (let-values (((ks vs) (jolt-with-mutex source-registry-mu
+                            (hashtable-entries source-registry-by-fqn))))
+      (let loop ((i 0) (acc '()))
+        (if (fx=? i (vector-length ks))
+            (apply jolt-vector acc)
+            (let ((rec (vector-ref vs i)))
+              (loop (fx+ i 1)
+                    (if (and (string? (vector-ref rec 2))
+                             (hashtable-ref want (vector-ref rec 2) #f)
+                             (fixnum? (vector-ref rec 3)))
+                        (cons (jolt-vector (vector-ref ks i) (vector-ref rec 2) (vector-ref rec 3))
+                              acc)
+                        acc))))))))
+
+(def-var! "jolt.host" "profile-instrument!" jolt-profile-instrument!)
+(def-var! "jolt.host" "profile-instrumenting?" (lambda () (sa-profile-instrumenting?)))
+(def-var! "jolt.host" "profile-clear!" (lambda () (sa-profile-clear!) jolt-nil))
+(def-var! "jolt.host" "profile-sites" jolt-profile-sites)
+(def-var! "jolt.host" "profile-defs" jolt-profile-defs)
+;; One statistics snapshot (sa-stats) as a jolt vector, for jolt.profile/measure:
+;; a single reading per side keeps the two sides consistent with each other.
+(def-var! "jolt.host" "profile-stats"
+  (lambda () (apply jolt-vector (vector->list (sa-stats)))))
 
 ;; Convenience wrapper for a generated file on disk. Cached per path+mtime: the
 ;; same .scm serves every frame of a backtrace, so read+scan it once. Whole-

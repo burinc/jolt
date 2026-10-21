@@ -1330,6 +1330,37 @@ else
 fi
 rm -rf "$bbshadow"
 
+# jolt.profile — execution counts from the compile-profile counters, mapped back
+# to the fixture's lines and fns. The file self-checks and prints one marker.
+profile_out="$($jolt run test/chez/profile-test.clj 2>/dev/null)"
+if printf '%s' "$profile_out" | grep -q 'PROFILE-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.profile"
+  printf '%s\n' "$profile_out" | grep FAIL | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# JOLT_PROFILE instruments the whole run and prints the report on stderr at exit:
+# fib(10) is 177 calls, so the fixture's fn row carries that count. The fixture
+# is required, and a first run without the profiler leaves its fasl in the AOT
+# cache (synchronously, so it is there): the profiled run has to compile it
+# again with counters instead of loading that.
+profile_cache="$(mktemp -d)"
+profile_roots='{:paths ["test/chez/fixtures"]}'
+JOLT_CACHE_DIR="$profile_cache" JOLT_AOT_ASYNC=0 \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/profile_env_main.clj >/dev/null 2>&1
+profile_env_err="$(JOLT_CACHE_DIR="$profile_cache" JOLT_PROFILE=1 \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/profile_env_main.clj 2>&1 >/dev/null)"
+rm -rf "$profile_cache"
+if printf '%s' "$profile_env_err" | grep 'profile-fixture/fib' | grep -q '177'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE report at exit"
+  printf '%s\n' "$profile_env_err" | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,
 # move, mtime round-trip, which). The file self-checks and prints one marker.
 fs_out="$($jolt run test/chez/fs-test.clj 2>/dev/null)"
