@@ -21,14 +21,11 @@
 ;; (records.ss makes it so) and a collection, so its protocol method (no dash,
 ;; not a coll method) lands in the base.
 
-;; Vectors / maps / sets only (records are jolt-map? here). Raw seqs are excluded:
-;; coll-interop accepts some seq representations and not others (a
-;; plain (seq v) returns nil from .count, a lazy-seq returns the count), an
-;; inconsistency Chez's normalized cseq can't mirror — so a raw seq target falls
-;; through to the base dispatcher rather than risk a divergence the corpus would
-;; never exercise but a future case might.
+;; Every builtin collection (records are jolt-map? here): dot-coll-method answers
+;; the methods its JVM class has and raises the JVM's error for the ones it lacks
+;; (records-dispatch.ss, dot-coll-kind).
 (define (dot-coll? obj)
-  (or (jolt-vector? obj) (jolt-map? obj) (pset? obj)))
+  (or (jolt-vector? obj) (jolt-map? obj) (pset? obj) (and (dot-coll-kind obj) #t)))
 
 ;; (jolt-java-hashcode — Java .hashCode() for a collection — lives in
 ;; natives-misc.ss beside the hash API, where hash-combine reads it;
