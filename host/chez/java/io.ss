@@ -1539,13 +1539,6 @@
          (rename-file from to))
        (lambda (e) (and (file-exists? from) (not (file-directory? to)))))
       (rename-file from to)))
-;; Delete a file a failed publish left behind. The same AV handle that blocked the
-;; rename blocks this delete, so it waits it out too. Never raises.
-(define (delete-file-retrying! p)
-  (guard (_ (#t #f))
-    (call-with-fs-retry (lambda () (delete-file p #t))
-                        (lambda (e) (and (eq? (sa-os-family) 'windows) (file-exists? p))))))
-
 ;; --- java.net.URL (a jhost "url", state #(spec handler)) --------------------
 ;; A File.toURL value: .toString / .toExternalForm give the spec, .getPath /
 ;; .getFile strip the "file:" scheme.
