@@ -44,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A built binary no longer moves a dropped record's fields out of scope.**
+  When `jolt build` dropped a `(let [p (->P a b)] …)` whose only uses were field
+  reads, it moved `a` and `b` to each `(:x p)`. Moved into a fn literal, the
+  closure's site still passed `p` to its image maker, so the binary died with
+  `variable p is not bound` (the ray tracer's typed variant crashed this way on
+  every build). Moved under a `let`, `loop`, fn param or `catch` that rebinds
+  `a`, the read picked up the inner `a` and returned a wrong value. Such a
+  binding now keeps its allocation; source mode was never affected.
+
 - **`Math` and `clojure.math` take exact arguments as doubles.** The argument
   went to the Chez op as given and only the result became a double, so the poles
   raised: `(Math/atan2 0 0)`, `(Math/log 0)` and `(Math/pow 0 -1)` (and their
