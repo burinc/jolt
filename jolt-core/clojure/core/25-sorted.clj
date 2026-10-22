@@ -20,13 +20,11 @@
 ;; key. ALL the semantics live here in Clojure; the host keeps only its
 ;; dispatch branches (conj/assoc/get/seq/count/…), each a one-line call through
 ;; the value's own :ops table, so the ops travel WITH the value (correct across
-;; contexts, forks, and AOT images). The wrapper is minted/read through the host
-;; value primitives jolt.host/tagged-table + ref-put! + ref-get.
-
-;; Raw field read on the wrapper (host primitive). Plain `get` on a sorted coll
-;; IS the comparator lookup — it dispatches back into these ops, so reading
-;; :tree/:cmp/:ops with it would recurse forever.
-(defn- sfield [sc k] (jolt.host/ref-get sc k))
+;; contexts, forks, and AOT images). The wrapper is the host's sorted record
+;; (host-table.ss), minted by jolt.host/make-sorted and read field by field
+;; through jolt.host/sorted-tree, -cnt, -cmp, -cmp-fn and -ops. Plain `get` on a
+;; sorted coll IS the comparator lookup — it dispatches back into these ops, so
+;; reading a field with it would recurse forever.
 
 ;; Clojure's fn->comparator: a comparator fn may return a number (3-way) or a
 ;; boolean less-than predicate. The value may also be a reify/deftype Comparator,
@@ -40,7 +38,7 @@
           r
           (if r -1 (if (f b a) 1 0)))))))
 
-(defn- the-cmp [sc] (or (sfield sc :cmp) compare))
+(defn- the-cmp [sc] (or (jolt.host/sorted-cmp sc) compare))
 
 ;; --- the red-black tree -----------------------------------------------------
 ;; The tree is the host's (host-table.ss, "the red-black tree"): Scheme-vector
@@ -48,22 +46,17 @@
 ;; walks over them. What stays here is what each op does with the result. The
 ;; comparator handed to them is the collection's own :cmp, nil for natural
 ;; order (Util.compare, as PersistentTreeMap's default comparator is).
-(defn- tree-cmp [sc] (sfield sc :cmp))
+(defn- tree-cmp [sc] (jolt.host/sorted-cmp sc))
 
 (defn- make-sorted [tag tree cnt cmp cmp-fn ops]
-  (-> (jolt.host/tagged-table tag)
-      (jolt.host/ref-put! :tree tree)
-      (jolt.host/ref-put! :cnt cnt)
-      (jolt.host/ref-put! :cmp cmp)
-      (jolt.host/ref-put! :cmp-fn cmp-fn)
-      (jolt.host/ref-put! :ops ops)))
+  (jolt.host/make-sorted tag tree cnt cmp cmp-fn ops))
 
 ;; --- sorted-map ops ---------------------------------------------------------
 ;; a real map-entry (map-entry? true), so key/val/seq destructuring work like a
 ;; regular map's entries.
 (defn- map-entry [t] (jolt.host/map-entry (jolt.host/rbt-key t) (jolt.host/rbt-val t)))
 
-(defn- lookup [sc k] (jolt.host/rbt-lookup (sfield sc :tree) (tree-cmp sc) k))
+(defn- lookup [sc k] (jolt.host/rbt-lookup (jolt.host/sorted-tree sc) (tree-cmp sc) k))
 
 (defn- sm-get [sm k not-found]
   (let [n (lookup sm k)]
@@ -80,15 +73,15 @@
 ;; kept only when it is the IDENTICAL object, as there (found.val() == val):
 ;; `=` kept [1] where the JVM stores the '(1) it was handed.
 (defn- sm-assoc-1 [sm k v]
-  (let [cmp (tree-cmp sm) tree (sfield sm :tree)
+  (let [cmp (tree-cmp sm) tree (jolt.host/sorted-tree sm)
         t (jolt.host/rbt-insert tree cmp k v)
         found (jolt.host/rbt-found t)]
     (if (nil? found)
-      (make-sorted :jolt/sorted-map t (inc (sfield sm :cnt)) cmp (sfield sm :cmp-fn) (sfield sm :ops))
+      (jolt.host/sorted-with sm t (inc (jolt.host/sorted-cnt sm)))
       ;; the key is present: keep its first-inserted key, replace the value
       (if (identical? v (jolt.host/rbt-val found))
         sm
-        (make-sorted :jolt/sorted-map (jolt.host/rbt-replace tree cmp k v) (sfield sm :cnt) cmp (sfield sm :cmp-fn) (sfield sm :ops))))))
+        (jolt.host/sorted-with sm (jolt.host/rbt-replace tree cmp k v) (jolt.host/sorted-cnt sm))))))
 
 (defn- sm-assoc-many [sm kvs]
   (let [n (count kvs)]
@@ -102,8 +95,8 @@
 (defn- sm-dissoc-1 [sm k]
   (if (nil? (lookup sm k))
     sm
-    (make-sorted :jolt/sorted-map (jolt.host/rbt-delete (sfield sm :tree) (tree-cmp sm) k)
-                 (dec (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops))))
+    (jolt.host/sorted-with sm (jolt.host/rbt-delete (jolt.host/sorted-tree sm) (tree-cmp sm) k)
+                           (dec (jolt.host/sorted-cnt sm)))))
 
 (defn- sm-dissoc-many [sm ks] (reduce sm-dissoc-1 sm ks))
 
@@ -129,9 +122,9 @@
 ;; counting comparator sees fewer calls here than on the JVM; the set is not
 ;; pinned in the corpus for that reason, the map is.
 (defn- ss-conj-1 [ss x]
-  (let [t (jolt.host/rbt-insert (sfield ss :tree) (tree-cmp ss) x nil)]
+  (let [t (jolt.host/rbt-insert (jolt.host/sorted-tree ss) (tree-cmp ss) x nil)]
     (if (nil? (jolt.host/rbt-found t))
-      (make-sorted :jolt/sorted-set t (inc (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops))
+      (jolt.host/sorted-with ss t (inc (jolt.host/sorted-cnt ss)))
       ss)))
 
 (defn- ss-conj-many [ss xs] (reduce ss-conj-1 ss xs))
@@ -139,36 +132,41 @@
 (defn- ss-disj-1 [ss x]
   (if (nil? (lookup ss x))
     ss
-    (make-sorted :jolt/sorted-set (jolt.host/rbt-delete (sfield ss :tree) (tree-cmp ss) x)
-                 (dec (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops))))
+    (jolt.host/sorted-with ss (jolt.host/rbt-delete (jolt.host/sorted-tree ss) (tree-cmp ss) x)
+                           (dec (jolt.host/sorted-cnt ss)))))
 
 (defn- ss-disj-many [ss xs] (reduce ss-disj-1 ss xs))
 
 ;; --- the ops tables the host dispatches through ------------------------
 
 (def ^:private sm-ops
-  {:count    (fn [sm] (sfield sm :cnt))
-   :seq      (fn [sm] (jolt.host/sorted-seq (sfield sm :tree) true 0))
-   :rseq     (fn [sm] (jolt.host/sorted-seq (sfield sm :tree) false 0))
-   :first    (fn [sm] (when-let [t (sfield sm :tree)] (map-entry (jolt.host/rbt-leftmost t))))
+  {:count    (fn [sm] (jolt.host/sorted-cnt sm))
+   :seq      (fn [sm] (jolt.host/sorted-seq (jolt.host/sorted-tree sm) true 0))
+   :rseq     (fn [sm] (jolt.host/sorted-seq (jolt.host/sorted-tree sm) false 0))
+   :first    (fn [sm] (when-let [t (jolt.host/sorted-tree sm)] (map-entry (jolt.host/rbt-leftmost t))))
    :get      sm-get
    :entry-at sm-entry-at
    :contains (fn [sm k] (not (nil? (lookup sm k))))
    :assoc    sm-assoc-many
+   :assoc1   sm-assoc-1
    :dissoc   sm-dissoc-many
+   :dissoc1  sm-dissoc-1
    :conj     sm-conj-many
-   :empty    (fn [sm] (make-sorted :jolt/sorted-map nil 0 (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))})
+   :conj1    sm-conj-1
+   :empty    (fn [sm] (jolt.host/sorted-with sm nil 0))})
 
 (def ^:private ss-ops
-  {:count    (fn [ss] (sfield ss :cnt))
-   :seq      (fn [ss] (jolt.host/sorted-seq (sfield ss :tree) true 1))
-   :rseq     (fn [ss] (jolt.host/sorted-seq (sfield ss :tree) false 1))
-   :first    (fn [ss] (when-let [t (sfield ss :tree)] (jolt.host/rbt-key (jolt.host/rbt-leftmost t))))
+  {:count    (fn [ss] (jolt.host/sorted-cnt ss))
+   :seq      (fn [ss] (jolt.host/sorted-seq (jolt.host/sorted-tree ss) true 1))
+   :rseq     (fn [ss] (jolt.host/sorted-seq (jolt.host/sorted-tree ss) false 1))
+   :first    (fn [ss] (when-let [t (jolt.host/sorted-tree ss)] (jolt.host/rbt-key (jolt.host/rbt-leftmost t))))
    :get      ss-get
    :contains (fn [ss x] (not (nil? (lookup ss x))))
    :conj     ss-conj-many
+   :conj1    ss-conj-1
    :disj     ss-disj-many
-   :empty    (fn [ss] (make-sorted :jolt/sorted-set nil 0 (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops)))})
+   :disj1    ss-disj-1
+   :empty    (fn [ss] (jolt.host/sorted-with ss nil 0))})
 
 ;; --- constructors + predicates -----------------------------------------------
 
@@ -184,8 +182,8 @@
 (defn sorted-set-by [comparator & xs]
   (ss-conj-many (make-sorted :jolt/sorted-set nil 0 (fn->cmp comparator) comparator ss-ops) (vec xs)))
 
-(defn sorted-map? [x] (= :jolt/sorted-map (sfield x :jolt/type)))
-(defn sorted-set? [x] (= :jolt/sorted-set (sfield x :jolt/type)))
+(defn sorted-map? [x] (= :map (jolt.host/sorted-kind x)))
+(defn sorted-set? [x] (= :set (jolt.host/sorted-kind x)))
 (defn sorted? [x] (or (sorted-map? x) (sorted-set? x)))
 
 ;; --- subseq / rsubseq ---------------------------------------------------------
@@ -205,10 +203,10 @@
     (fn [e] (test (cmp (if map? (key e) e) k) 0))))
 
 (defn- seq-from [sc k asc?]
-  (jolt.host/sorted-seq-from (sfield sc :tree) asc? (sc-mode sc) (the-cmp sc) k))
+  (jolt.host/sorted-seq-from (jolt.host/sorted-tree sc) asc? (sc-mode sc) (the-cmp sc) k))
 
 (defn- sc-seq [sc asc?]
-  (jolt.host/sorted-seq (sfield sc :tree) asc? (sc-mode sc)))
+  (jolt.host/sorted-seq (jolt.host/sorted-tree sc) asc? (sc-mode sc)))
 
 (defn- assert-sorted [sc]
   (when-not (sorted? sc)

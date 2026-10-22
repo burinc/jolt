@@ -178,6 +178,7 @@ load-namespace
 locale-name
 machine-type
 make-interrupt
+make-sorted
 make-thread-local
 map-entry
 mark-spliced!
@@ -258,8 +259,15 @@ set-var!
 sh
 sh-out
 slice
+sorted-cmp
+sorted-cmp-fn
+sorted-cnt
+sorted-kind
+sorted-ops
 sorted-seq
 sorted-seq-from
+sorted-tree
+sorted-with
 source-roots
 stack-limit
 stash-inline!
