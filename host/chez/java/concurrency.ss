@@ -452,14 +452,17 @@
 ;; every worker is one. Made on first use, after jolt.main has settled that.
 (define solo-pool #f)
 (define solo-pool-mu (make-mutex))
+;; Built OUTSIDE the mutex and published under it, so nothing that may park runs
+;; with the lock held (park-lock-check.ss); a pool that loses the race to publish
+;; is dropped, and with no core workers it has forked nothing.
 (define (solo-pool-state)
   (or solo-pool
-      (jolt-with-mutex solo-pool-mu
-        (unless solo-pool
-          (set! solo-pool (make-executor* "executor-service" 0 executor-unbounded-workers
-                                          solo-pool-keep-alive-ms #f
-                                          agent-threads-daemon? #f)))
-        solo-pool)))
+      (let ((p (make-executor* "executor-service" 0 executor-unbounded-workers
+                               solo-pool-keep-alive-ms #f
+                               agent-threads-daemon? #f)))
+        (jolt-with-mutex solo-pool-mu
+          (unless solo-pool (set! solo-pool p))
+          solo-pool))))
 (define (solo-pool-run! job)
   (executor-enqueue! (solo-pool-state) job))
 (define (solo-pool-shutdown!)
@@ -3009,9 +3012,9 @@
 (define (executor-idle-spin! st)
   (let ((mu (vector-ref st 2)))
     (vector-set! st 9 (fx+ (vector-ref st 9) 1))
-    (mutex-release mu)
+    (jolt-unlock! mu)
     (let ((found (task-spin-until (lambda () (or (fx>? (vector-ref st 10) 0) (vector-ref st 0))))))
-      (jolt-mutex-acquire! mu)
+      (jolt-lock! mu)
       (vector-set! st 9 (fx- (vector-ref st 9) 1))
       found)))
 ;; A worker that dies must not take the pool's accounting with it. Everything a
