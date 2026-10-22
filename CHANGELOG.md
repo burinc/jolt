@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jolt build` binaries are back near their 0.8.21 size (#1423).** 0.8.22
+  made every non-tail call in a traced build restore the trace site slot
+  inline, and with inspector information on Chez keeps each fn's expanded body
+  as data, so the restore was stored again for every call site: a 4,000-fn app
+  grew from 40.3 MB to 53.2 MB. The restore is now spelled once per fn clause
+  and the compiler inlines it back at each site, so the code that runs is the
+  same; the same app builds to 45.7 MB.
 - **`Math` and `clojure.math` take exact arguments as doubles.** The argument
   went to the Chez op as given and only the result became a double, so the poles
   raised: `(Math/atan2 0 0)`, `(Math/log 0)` and `(Math/pow 0 -1)` (and their
