@@ -2521,6 +2521,15 @@
   {:suite "getenv" :expr "(= (get (System/getenv) \"HOME\") (System/getenv \"HOME\"))" :expected "true"}
   ;; Stage C — setProperty visible in getProperties
   {:suite "sysprops" :expr "(do (System/setProperty \"zz.k\" \"v\") (get (System/getProperties) \"zz.k\"))" :expected "\"v\""}
+  ;; PersistentTreeMap.assoc keeps the map only when the value is the IDENTICAL
+  ;; object (found.val() == val); an `=` one is stored. Comparing with `=` kept
+  ;; [1] where the JVM stores the list it was handed.
+  {:suite "sorted / assoc identity" :expr "(let [m (assoc (sorted-map :a [1]) :a (list 1))] [(list? (get m :a)) (vec (get m :a))])" :expected "[true [1]]"}
+  {:suite "sorted / assoc identity" :expr "(let [v [1] m (sorted-map :a v)] [(identical? m (assoc m :a v)) (identical? m (assoc m :a [1]))])" :expected "[true false]"}
+  ;; the tree under a few thousand scrambled inserts and removals: order, count
+  ;; and membership agree with a plain set at every size (host-table.ss's tree)
+  {:suite "sorted / tree" :expr "(let [xs (map (fn [i] (mod (* i 7919) 5003)) (range 5003)) s (into (sorted-set) xs) d (reduce disj s (range 0 5003 3)) r (set (remove (fn [x] (zero? (mod x 3))) (range 5003)))] [(= (seq s) (range 5003)) (= (set d) r) (count d) (= (seq d) (sort r)) (= (rseq d) (reverse (sort r)))])" :expected "[true true 3335 true true]"}
+  {:suite "sorted / tree" :expr "(let [m (into (sorted-map-by (fn [a b] (compare b a))) (map (fn [i] [(str i) i]) (range 300))) m2 (reduce dissoc m (map str (range 0 300 2)))] [(first (keys m)) (count m2) (get m2 \"7\") (get m2 \"8\" :gone) (first (subseq m2 < \"5\"))])" :expected "[\"99\" 150 7 :gone [\"99\" 99]]"}
   {:suite "sorted / subseq laziness" :expr "(first (subseq (into (sorted-map) (map (fn [i] [i i]) (range 100000))) > 50000))" :expected "[50001 50001]"}
   ;; Stage B — nio Files consolidation: members from 6 original blocks (files-statics,
   ;; files-nofollow-time, files-throwing-setters, files-create+move, files-final, files-nofollow)

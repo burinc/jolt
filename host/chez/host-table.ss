@@ -1,3 +1,8 @@
+;;   Portions of this file are from ClojureScript's src/main/cljs/cljs/core.cljs,
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for that software are covered by the
+;;   Eclipse Public License 1.0 (licenses/EPL-1.0.txt).
+
 ;; host tables + sorted collections — the jolt.host value primitives and the
 ;; 25-sorted tier's runtime.
 ;;
@@ -130,9 +135,221 @@
 (define (sc-op sc op-kw) (jolt-get (jolt-ref-get sc kw-ops) op-kw jolt-nil))
 (define (sc-call sc op-kw . args) (apply jolt-invoke (sc-op sc op-kw) sc args))
 
+;; --- the red-black tree --------------------------------------------------------
+;; Rich Hickey's PersistentTreeMap algorithm (via cljs.core's port: tree-map-add,
+;; balance-left/right, tree-map-append, balance-*-del), which 25-sorted.clj
+;; carries the semantics around. A node is a 5-slot Scheme vector
+;; #(red? key val left right), red? a boolean and an absent child jolt-nil. It
+;; lived in 25-sorted.clj as a jolt vector [:red k v l r], where every field read
+;; was a generic nth and every node a persistent vector: ~200ns a tree level
+;; against the JVM's ~25ns, and a sorted-set build 4.5x the JVM's. Here a field
+;; read is a vector-ref.
+;;
+;; Not image surface: an image writes a sorted collection out as its entries and
+;; rebuilds it (state-image.ss walk-sorted), so the node layout never travels.
+;;
+;; CMP is the collection's comparator as 25-sorted.clj holds it, or jolt-nil for
+;; natural order, which is Util.compare (jolt-compare) and not the clojure.core
+;; var: the JVM's PersistentTreeMap orders by RT.DEFAULT_COMPARATOR, which a
+;; rebinding of #'compare does not reach. Every comparison is (cmp k node-key),
+;; once per level, as the reference makes it; the corpus pins the counts.
+(define (rb-red? n) (and (not (jolt-nil? n)) (vector-ref n 0)))
+(define (rb-black? n) (and (not (jolt-nil? n)) (not (vector-ref n 0))))
+(define (rb-red k v l r) (vector #t k v l r))
+(define (rb-black k v l r) (vector #f k v l r))
+(define (sc-nd-key n) (vector-ref n 1))
+(define (sc-nd-val n) (vector-ref n 2))
+(define (sc-nd-left n) (vector-ref n 3))
+(define (sc-nd-right n) (vector-ref n 4))
+;; BlackNode.blacken is the node itself; RedNode.blacken a black copy. redden is
+;; only ever applied to a known-black node.
+(define (rb-blacken n)
+  (if (rb-red? n) (rb-black (sc-nd-key n) (sc-nd-val n) (sc-nd-left n) (sc-nd-right n)) n))
+(define (rb-redden n) (rb-red (sc-nd-key n) (sc-nd-val n) (sc-nd-left n) (sc-nd-right n)))
+(define (rb-compare cmp a b)
+  (if (jolt-nil? cmp)
+      (if (and (fixnum? a) (fixnum? b))
+          (cond ((fx<? a b) -1) ((fx=? a b) 0) (else 1))
+          (jolt-compare a b))
+      (jolt-invoke cmp a b)))
+
+;; insert balancing: RedNode/BlackNode .balanceLeft/.balanceRight
+(define (rb-ins-balance-left ins p)
+  (if (rb-red? ins)
+      (let ((l (sc-nd-left ins)) (r (sc-nd-right ins)))
+        (cond
+          ((rb-red? l) (rb-red (sc-nd-key ins) (sc-nd-val ins)
+                               (rb-blacken l)
+                               (rb-black (sc-nd-key p) (sc-nd-val p) r (sc-nd-right p))))
+          ((rb-red? r) (rb-red (sc-nd-key r) (sc-nd-val r)
+                               (rb-black (sc-nd-key ins) (sc-nd-val ins) l (sc-nd-left r))
+                               (rb-black (sc-nd-key p) (sc-nd-val p) (sc-nd-right r) (sc-nd-right p))))
+          (else (rb-black (sc-nd-key p) (sc-nd-val p) ins (sc-nd-right p)))))
+      (rb-black (sc-nd-key p) (sc-nd-val p) ins (sc-nd-right p))))
+(define (rb-ins-balance-right ins p)
+  (if (rb-red? ins)
+      (let ((l (sc-nd-left ins)) (r (sc-nd-right ins)))
+        (cond
+          ((rb-red? r) (rb-red (sc-nd-key ins) (sc-nd-val ins)
+                               (rb-black (sc-nd-key p) (sc-nd-val p) (sc-nd-left p) l)
+                               (rb-blacken r)))
+          ((rb-red? l) (rb-red (sc-nd-key l) (sc-nd-val l)
+                               (rb-black (sc-nd-key p) (sc-nd-val p) (sc-nd-left p) (sc-nd-left l))
+                               (rb-black (sc-nd-key ins) (sc-nd-val ins) (sc-nd-right l) r)))
+          (else (rb-black (sc-nd-key p) (sc-nd-val p) (sc-nd-left p) ins))))
+      (rb-black (sc-nd-key p) (sc-nd-val p) (sc-nd-left p) ins)))
+(define (rb-add-left p ins)
+  (if (rb-red? p)
+      (rb-red (sc-nd-key p) (sc-nd-val p) ins (sc-nd-right p))
+      (rb-ins-balance-left ins p)))
+(define (rb-add-right p ins)
+  (if (rb-red? p)
+      (rb-red (sc-nd-key p) (sc-nd-val p) (sc-nd-left p) ins)
+      (rb-ins-balance-right ins p)))
+
+;; Insert in ONE walk: the new subtree, or #f when k is present, with that node
+;; left in FOUND (PersistentTreeMap.add answers null and fills its box the same
+;; way).
+(define (rb-ins cmp t k v found)
+  (if (jolt-nil? t)
+      (rb-red k v jolt-nil jolt-nil)
+      (let ((c (rb-compare cmp k (sc-nd-key t))))
+        (cond
+          ((zero? c) (set-box! found t) #f)
+          ((negative? c)
+           (let ((ins (rb-ins cmp (sc-nd-left t) k v found)))
+             (and ins (rb-add-left t ins))))
+          (else
+           (let ((ins (rb-ins cmp (sc-nd-right t) k v found)))
+             (and ins (rb-add-right t ins))))))))
+
+;; Replace the value at a present key, keeping the tree's shape and the node's
+;; own (first-inserted) key, as PersistentTreeMap.replace does.
+(define (rb-replace cmp t k v)
+  (let ((c (rb-compare cmp k (sc-nd-key t))))
+    (vector (vector-ref t 0) (sc-nd-key t)
+            (if (zero? c) v (sc-nd-val t))
+            (if (negative? c) (rb-replace cmp (sc-nd-left t) k v) (sc-nd-left t))
+            (if (positive? c) (rb-replace cmp (sc-nd-right t) k v) (sc-nd-right t)))))
+
+(define (rb-lookup cmp t k)
+  (let loop ((t t))
+    (if (jolt-nil? t)
+        jolt-nil
+        (let ((c (rb-compare cmp k (sc-nd-key t))))
+          (cond ((zero? c) t)
+                ((negative? c) (loop (sc-nd-left t)))
+                (else (loop (sc-nd-right t))))))))
+
+;; delete balancing: cljs's standalone balance-left/-right and *-del
+(define (rb-balance-left k v ins right)
+  (if (rb-red? ins)
+      (let ((il (sc-nd-left ins)) (ir (sc-nd-right ins)))
+        (cond
+          ((rb-red? il) (rb-red (sc-nd-key ins) (sc-nd-val ins) (rb-blacken il) (rb-black k v ir right)))
+          ((rb-red? ir) (rb-red (sc-nd-key ir) (sc-nd-val ir)
+                                (rb-black (sc-nd-key ins) (sc-nd-val ins) il (sc-nd-left ir))
+                                (rb-black k v (sc-nd-right ir) right)))
+          (else (rb-black k v ins right))))
+      (rb-black k v ins right)))
+(define (rb-balance-right k v left ins)
+  (if (rb-red? ins)
+      (let ((il (sc-nd-left ins)) (ir (sc-nd-right ins)))
+        (cond
+          ((rb-red? ir) (rb-red (sc-nd-key ins) (sc-nd-val ins) (rb-black k v left il) (rb-blacken ir)))
+          ((rb-red? il) (rb-red (sc-nd-key il) (sc-nd-val il)
+                                (rb-black k v left (sc-nd-left il))
+                                (rb-black (sc-nd-key ins) (sc-nd-val ins) (sc-nd-right il) ir)))
+          (else (rb-black k v left ins))))
+      (rb-black k v left ins)))
+(define (rb-invariant-violation)
+  (jolt-throw (jolt-ex-info "red-black tree invariant violation" (jolt-hash-map))))
+(define (rb-balance-left-del k v del right)
+  (cond
+    ((rb-red? del) (rb-red k v (rb-blacken del) right))
+    ((rb-black? right) (rb-balance-right k v del (rb-redden right)))
+    ((and (rb-red? right) (rb-black? (sc-nd-left right)))
+     (let ((rl (sc-nd-left right)))
+       (rb-red (sc-nd-key rl) (sc-nd-val rl)
+               (rb-black k v del (sc-nd-left rl))
+               (rb-balance-right (sc-nd-key right) (sc-nd-val right) (sc-nd-right rl)
+                                 (rb-redden (sc-nd-right right))))))
+    (else (rb-invariant-violation))))
+(define (rb-balance-right-del k v left del)
+  (cond
+    ((rb-red? del) (rb-red k v left (rb-blacken del)))
+    ((rb-black? left) (rb-balance-left k v (rb-redden left) del))
+    ((and (rb-red? left) (rb-black? (sc-nd-right left)))
+     (let ((lr (sc-nd-right left)))
+       (rb-red (sc-nd-key lr) (sc-nd-val lr)
+               (rb-balance-left (sc-nd-key left) (sc-nd-val left) (rb-redden (sc-nd-left left))
+                                (sc-nd-left lr))
+               (rb-black k v (sc-nd-right lr) del))))
+    (else (rb-invariant-violation))))
+;; merge the two subtrees of a removed node
+(define (rb-append left right)
+  (cond
+    ((jolt-nil? left) right)
+    ((jolt-nil? right) left)
+    ((rb-red? left)
+     (if (rb-red? right)
+         (let ((app (rb-append (sc-nd-right left) (sc-nd-left right))))
+           (if (rb-red? app)
+               (rb-red (sc-nd-key app) (sc-nd-val app)
+                       (rb-red (sc-nd-key left) (sc-nd-val left) (sc-nd-left left) (sc-nd-left app))
+                       (rb-red (sc-nd-key right) (sc-nd-val right) (sc-nd-right app) (sc-nd-right right)))
+               (rb-red (sc-nd-key left) (sc-nd-val left) (sc-nd-left left)
+                       (rb-red (sc-nd-key right) (sc-nd-val right) app (sc-nd-right right)))))
+         (rb-red (sc-nd-key left) (sc-nd-val left) (sc-nd-left left) (rb-append (sc-nd-right left) right))))
+    ((rb-red? right)
+     (rb-red (sc-nd-key right) (sc-nd-val right) (rb-append left (sc-nd-left right)) (sc-nd-right right)))
+    (else
+     (let ((app (rb-append (sc-nd-right left) (sc-nd-left right))))
+       (if (rb-red? app)
+           (rb-red (sc-nd-key app) (sc-nd-val app)
+                   (rb-black (sc-nd-key left) (sc-nd-val left) (sc-nd-left left) (sc-nd-left app))
+                   (rb-black (sc-nd-key right) (sc-nd-val right) (sc-nd-right app) (sc-nd-right right)))
+           (rb-balance-left-del (sc-nd-key left) (sc-nd-val left) (sc-nd-left left)
+                                (rb-black (sc-nd-key right) (sc-nd-val right) app (sc-nd-right right))))))))
+;; remove k, which the caller has found present
+(define (rb-del cmp t k)
+  (let ((c (rb-compare cmp k (sc-nd-key t))))
+    (cond
+      ((zero? c) (rb-append (sc-nd-left t) (sc-nd-right t)))
+      ((negative? c)
+       (let ((del (rb-del cmp (sc-nd-left t) k)))
+         (if (rb-black? (sc-nd-left t))
+             (rb-balance-left-del (sc-nd-key t) (sc-nd-val t) del (sc-nd-right t))
+             (rb-red (sc-nd-key t) (sc-nd-val t) del (sc-nd-right t)))))
+      (else
+       (let ((del (rb-del cmp (sc-nd-right t) k)))
+         (if (rb-black? (sc-nd-right t))
+             (rb-balance-right-del (sc-nd-key t) (sc-nd-val t) (sc-nd-left t) del)
+             (rb-red (sc-nd-key t) (sc-nd-val t) (sc-nd-left t) del)))))))
+
+;; The ops 25-sorted.clj calls. A FOUND answer from rbt-insert is a pair holding
+;; the present node, which rbt-found unwraps; a tree is always a node (a vector)
+;; or nil, so the two cannot be confused.
+(def-var! "jolt.host" "rbt-insert"
+  (lambda (tree cmp k v)
+    (let* ((found (box #f)) (t (rb-ins cmp tree k v found)))
+      (if t (rb-blacken t) (cons 'rbt-found (unbox found))))))
+(def-var! "jolt.host" "rbt-found"
+  (lambda (r) (if (pair? r) (cdr r) jolt-nil)))
+(def-var! "jolt.host" "rbt-replace" (lambda (tree cmp k v) (rb-replace cmp tree k v)))
+(def-var! "jolt.host" "rbt-lookup" (lambda (tree cmp k) (rb-lookup cmp tree k)))
+(def-var! "jolt.host" "rbt-delete"
+  (lambda (tree cmp k) (let ((t (rb-del cmp tree k))) (if (jolt-nil? t) t (rb-blacken t)))))
+(def-var! "jolt.host" "rbt-key" (lambda (n) (sc-nd-key n)))
+(def-var! "jolt.host" "rbt-val" (lambda (n) (sc-nd-val n)))
+;; the leftmost and rightmost nodes, one spine each: PersistentTreeMap.min/max
+(def-var! "jolt.host" "rbt-leftmost"
+  (lambda (n) (let loop ((n n)) (let ((l (sc-nd-left n))) (if (jolt-nil? l) n (loop l))))))
+(def-var! "jolt.host" "rbt-rightmost"
+  (lambda (n) (let loop ((n n)) (let ((r (sc-nd-right n))) (if (jolt-nil? r) n (loop r))))))
+
 ;; --- the in-order walk over the red-black tree -------------------------------
-;; A node is the 5-slot vector [color key val left right] 25-sorted.clj builds;
-;; nil children are jolt-nil. The walk is Clojure's PersistentTreeMap$Seq: a stack
+;; Over the nodes above; nil children are jolt-nil. The walk is Clojure's PersistentTreeMap$Seq: a stack
 ;; of the nodes still to visit, whose top is the next one out, so the head is
 ;; O(log n) away and every later step is amortized O(1). It is done here rather
 ;; than in 25-sorted.clj because a per-node lazy cell written in Clojure cost
@@ -142,10 +359,6 @@
 (define kw-tree (keyword #f "tree"))
 (define kw-cnt (keyword #f "cnt"))
 (define kw-cmp (keyword #f "cmp"))
-(define (sc-nd-key n) (pvec-nth-in-range n 1))
-(define (sc-nd-val n) (pvec-nth-in-range n 2))
-(define (sc-nd-left n) (pvec-nth-in-range n 3))
-(define (sc-nd-right n) (pvec-nth-in-range n 4))
 ;; push n and its whole near-side spine: the left one walking up, the right one down
 (define (sc-push-spine n asc? stack)
   (if (jolt-nil? n)
