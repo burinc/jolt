@@ -2617,12 +2617,9 @@
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
 (define io-counter-mutex (make-mutex))
-(define spit-tmp-counter 0)
 (define (jolt-spit path content . opts)
   ;; Render BEFORE any file is touched — a throwing toString used to leave the
-  ;; target truncated. The non-append write goes to a temp file in the same
-  ;; directory and renames over the target, so a mid-write failure (disk full)
-  ;; never destroys the original. Append keeps writing in place.
+  ;; target truncated. Both writes then go to the target in place (below).
   ;; Only a path, a File or a host stream names a target; anything else is the
   ;; coercion error io/writer raises. nil used to render as "" and write a temp
   ;; file into the working directory before failing to rename it.
@@ -2659,18 +2656,17 @@
                      (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate append)
                                                          (buffer-mode block))))
           (lambda (port) (put-bytevector port bytes)))
-        (let ((tmp (string-append p ".spit-tmp-"
-                                   (number->string (sa-real-time-ms)) "-"
-                                   (number->string (jolt-with-mutex io-counter-mutex
-                                                     (begin (set! spit-tmp-counter (+ spit-tmp-counter 1))
-                                                            spit-tmp-counter))))))
-          ;; the temp file is this function's business, but a failure to open it
-          ;; is the caller's target failing, so report the target
-          (with-port (guard (e ((i/o-error? e) (file-open-error given p e)))
-                       (open-file-output-port tmp (file-options no-fail) (buffer-mode block)))
-            (lambda (port) (put-bytevector port bytes)))
-          (guard (e (#t (delete-file-retrying! tmp) (raise e)))
-            (rename-replace! tmp p))))
+        ;; In place, truncating, as the JVM's FileOutputStream does. This used
+        ;; to stage a temp file and rename it over the target, which REPLACED
+        ;; the file rather than writing it: a spit through a symlink turned the
+        ;; link into a regular file and left its target alone, a hard link
+        ;; stopped sharing the data, and the mode was reset from the umask (a
+        ;; 0600 file came back 0644). It also cost four syscalls more than the
+        ;; write, ~250us a spit against ~25us on the JVM.
+        (with-port (open-path-guarded given p
+                     (lambda (rp) (open-file-output-port rp (file-options no-fail)
+                                                         (buffer-mode block))))
+          (lambda (port) (put-bytevector port bytes))))
     jolt-nil))
 
 ;; (flush) is (.flush *out*) on the JVM. When *out* holds a real writer — a

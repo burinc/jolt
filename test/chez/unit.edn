@@ -821,12 +821,18 @@
   {:suite "io" :label "slurp accepts the IReader used by *in*" :expr "(with-in-str \"one\\ntwo\" (slurp *in*))" :expected "\"one\\ntwo\""}
   {:suite "io" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-test.txt\")] (do (spit p \"hello\") (slurp p)))" :expected "\"hello\""}
   {:suite "io" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-test.txt\")] (do (spit p \"a\") (spit p \"b\" :append true) (slurp p)))" :expected "\"ab\""}
-  ;; spit stages into a temp file and renames over the target, so OVERWRITING is
-  ;; the case that broke on Windows, where a rename onto an existing destination
-  ;; is refused (#1074): the second spit to any path failed, as did the first
-  ;; spit to a File/createTempFile target. The Windows half needs that platform
-  ;; (.github/workflows/tests.yml); these rows keep the POSIX half honest.
+  ;; OVERWRITING is the case that broke on Windows while spit staged into a temp
+  ;; file and renamed it over the target, a rename onto an existing destination
+  ;; being refused there (#1074). spit writes in place now, as the JVM does; the
+  ;; rows stay because overwriting is still the case worth pinning.
   {:suite "io" :label "spit overwrites an existing file" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-overwrite.txt\")] (do (spit p \"first\") (spit p \"second\") (slurp p)))" :expected "\"second\""}
+  ;; spit WRITES the file it is given, as FileOutputStream does: through a
+  ;; symlink to its target, into the data a hard link shares, keeping the mode.
+  ;; The temp-and-rename it used to do replaced the file instead — the link came
+  ;; back a regular file, the hard link split, and a 0600 file came back 0644.
+  {:suite "io" :label "spit writes through a symlink" :expr "(do (require (quote [babashka.fs :as fs])) (let [d (str (fs/create-temp-dir)) t (str d \"/target.txt\") l (str d \"/link.txt\")] (spit t \"old\") (fs/create-sym-link l t) (spit l \"new\") [(fs/sym-link? l) (slurp t)]))" :expected "[true \"new\"]"}
+  {:suite "io" :label "spit writes into the data a hard link shares" :expr "(do (require (quote [babashka.fs :as fs])) (let [d (str (fs/create-temp-dir)) t (str d \"/target.txt\") h (str d \"/hard.txt\")] (spit t \"old\") (fs/create-link h t) (spit h \"new\") (slurp t)))" :expected "\"new\""}
+  {:suite "io" :label "spit keeps the file's mode" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (fs/create-temp-dir) \"/secret.txt\")] (spit p \"old\") (fs/set-posix-file-permissions p (fs/str->posix \"rw-------\")) (spit p \"new\") [(fs/posix->str (fs/posix-file-permissions p)) (slurp p)]))" :expected "[\"rw-------\" \"new\"]"}
   {:suite "io" :label "spit overwrites a file the runtime just created" :expr "(let [f (java.io.File/createTempFile \"jolt-spit\" \".txt\")] (spit f \"written\") (let [v (slurp f)] (.delete f) v))" :expected "\"written\""}
   ;; The PATH-LIST separator is not the file separator. It is ":" here and ";" on
   ;; Windows, where ":" is the drive suffix — babashka.fs/split-paths and
