@@ -2530,6 +2530,10 @@
   ;; and membership agree with a plain set at every size (host-table.ss's tree)
   {:suite "sorted / tree" :expr "(let [xs (map (fn [i] (mod (* i 7919) 5003)) (range 5003)) s (into (sorted-set) xs) d (reduce disj s (range 0 5003 3)) r (set (remove (fn [x] (zero? (mod x 3))) (range 5003)))] [(= (seq s) (range 5003)) (= (set d) r) (count d) (= (seq d) (sort r)) (= (rseq d) (reverse (sort r)))])" :expected "[true true 3335 true true]"}
   {:suite "sorted / tree" :expr "(let [m (into (sorted-map-by (fn [a b] (compare b a))) (map (fn [i] [(str i) i]) (range 300))) m2 (reduce dissoc m (map str (range 0 300 2)))] [(first (keys m)) (count m2) (get m2 \"7\") (get m2 \"8\" :gone) (first (subseq m2 < \"5\"))])" :expected "[\"99\" 150 7 :gone [\"99\" 99]]"}
+  ;; a range of fixnums fills each chunk in place (seq.ss range-fx-chunk); one
+  ;; crossing the fixnum limit, a negative step and a short last chunk agree with
+  ;; the general path
+  {:suite "range / fixnum chunks" :expr "[(vec (range 1152921504606846970 1152921504606846990 4)) (vec (range 10 -70 -7)) (count (range 0 1000 33)) (last (range 0 1000 33)) (vec (range -5 5 3))]" :expected "[[1152921504606846970 1152921504606846974 1152921504606846978 1152921504606846982 1152921504606846986] [10 3 -4 -11 -18 -25 -32 -39 -46 -53 -60 -67] 31 990 [-5 -2 1 4]]"}
   {:suite "sorted / subseq laziness" :expr "(first (subseq (into (sorted-map) (map (fn [i] [i i]) (range 100000))) > 50000))" :expected "[50001 50001]"}
   ;; Stage B — nio Files consolidation: members from 6 original blocks (files-statics,
   ;; files-nofollow-time, files-throwing-setters, files-create+move, files-final, files-nofollow)
