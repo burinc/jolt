@@ -611,10 +611,10 @@
 ;; 4,000-fn app's binary grew 32% with it (#1423). Outside any fn there is no
 ;; clause to bind the helper in, and the site keeps the inline form.
 (def ^:private site-call-helper
-  (str "(lambda (th) (let ((ss (virtual-register 2)) (so (virtual-register 12)))"
-       " (if (pair? ss) (set-virtual-register! 12 ss))"
+  (str "(lambda (_th$) (let ((_ss$ (virtual-register 2)) (_so$ (virtual-register 12)))"
+       " (if (pair? _ss$) (set-virtual-register! 12 _ss$))"
        " (set-virtual-register! 2 0)"
-       " (let ((r (th))) (set-virtual-register! 2 ss) (set-virtual-register! 12 so) r)))"))
+       " (let ((_sr$ (_th$))) (set-virtual-register! 2 _ss$) (set-virtual-register! 12 _so$) _sr$)))"))
 ;; A tail call that may run a jolt fn disqualifies the enclosing fn.
 (defn- note-tail-call! [tail?]
   (when (and tail? *self-wrap*) (reset! (:unsafe *self-wrap*) true)))
