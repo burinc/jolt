@@ -130,13 +130,17 @@ while read -r name dir ns arg; do
       fail "$name $mode: the --profile-gen run wrote no profile"; tail -5 "$w.train.log"; continue; fi
     if ! buse="$(build "$dir" "$ns" "$w.use" $flags --profile-use "$w.jpd")"; then
       fail "$name $mode: the --profile-use build failed"; sed -n '1,15p' "$w.use.log"; continue; fi
-    # the warm-up runs, discarded as timings: the two must agree on everything
-    # else they print
+    # the warm-up runs, discarded as timings: the profiled binary must print
+    # every line the plain one prints the same way twice. A line that moves
+    # between two plain runs (gc-arrays' collection counts) is a measurement,
+    # not an answer, so it is not compared.
     answer "$dir" "$w.plain" "$arg" > "$w.plain.out"
+    answer "$dir" "$w.plain" "$arg" > "$w.plain2.out"
     answer "$dir" "$w.use" "$arg" > "$w.use.out"
-    if ! cmp -s "$w.plain.out" "$w.use.out"; then
-      fail "$name $mode: the profiled binary prints something the plain one does not"
-      diff "$w.plain.out" "$w.use.out" | sed -n '1,10p'; continue; fi
+    grep -Fxf "$w.plain2.out" "$w.plain.out" > "$w.stable.out" || true
+    if grep -Fxvf "$w.use.out" "$w.stable.out" > "$w.missing.out"; then
+      fail "$name $mode: the profiled binary does not print what the plain one does"
+      sed -n '1,10p' "$w.missing.out" | sed 's/^/    missing: /'; continue; fi
     pmin=""; umin=""; i=0
     while [ "$i" -lt "$rounds" ]; do
       i=$((i + 1))
