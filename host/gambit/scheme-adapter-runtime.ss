@@ -512,6 +512,18 @@
 (define (sa-profile-release!) '())
 (define (sa-profile-clear!) (if #f #f))
 
+;; ---- stack sampling (capability: sample) ------------------------------------
+;; No engine timer per thread to drive a sampler from, so this tier degrades:
+;; jolt.profile reports sampling as unsupported.
+(define (sa-stack-walk k cap proc) #f)
+(define (sa-frame-source-pair frame) #f)
+(define (sa-code-name code) #f)
+(define (sa-thread-cpu-nanos) 0)
+;; The shared lazy-bridge.ss fork wrapper asks the Chez tick scheduler whether a
+;; new thread should join the sampler (host/chez/ticks.ss). Never, here.
+(define jolt-tick-sampling? #f)
+(define (jolt-tick-join-sampling!) (if #f #f))
+
 
 ;; ---- continuations tier (capability: continuations) -------------------------
 

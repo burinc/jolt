@@ -1900,52 +1900,28 @@
 ;; sleep) only sees the interrupt when it returns to Scheme — like the JVM not
 ;; killing native code.
 ;;
-;; This BORROWS the timer, and on a fiber the timer belongs to the scheduler: it
-;; is what preempts a compute-bound fiber so the ones queued behind it on the same
-;; carrier are not starved. So both halves have to go back, the handler and the
-;; tick. It used to end with a bare (set-timer 0), which returns the handler and
-;; keeps the tick, and only the fiber's NEXT dispatch arms again — so a fiber that
-;; borrowed the timer once and then never parked pinned its carrier (jolt-ly62).
-;; jolt-fiber-rearm-preempt! puts it back, and does nothing off a fiber, where
-;; there was never anything armed to restore.
+;; The timer is shared with fiber preemption and the sampler, so this does not
+;; own it: it is the POLL client of the tick scheduler (ticks.ss), which keeps
+;; one demand per client and charges them all the same ticks. The borrow
+;; registers a poll every interrupt-check-ticks and cancels it on the way out;
+;; the quantum of a fiber it runs on keeps falling due as it would without the
+;; borrow, and is taken by the preempt client. It used to install its own
+;; handler and count what it borrowed so the quantum still fell due, and three
+;; bugs were found in that hand-off (jolt-ly62, jolt-1rod, jolt-449m).
 ;;
-;; It lives in fibers.ss, which rt.ss loads AFTER this file; the reference resolves
-;; at call time, the same forward reference async.ss makes to jolt-fiber-go-spawn
-;; and for the same reason. No fiber can exist before the boot finishes loading.
+;; Borrows nest. The poll client runs the INNERMOST borrow's check, kept on
+;; interrupt-poll-stack, and an inner borrow's exit leaves the poll registered
+;; when an outer one is still live, so the outer token keeps being polled.
 ;;
-;; WHY THE BORROW IS A dynamic-wind AND NOT THREE HAND-WRITTEN EXITS (jolt-1rod).
-;;
-;; It was three: a normal return, a guard for a raise, and the call/cc for its own
-;; interrupt escape. A fiber PARK is a fourth way out and it was none of them — it
-;; escapes through the carrier's sched-k, and timer-interrupt-handler is a setter
-;; write on a per-thread parameter, so a continuation escape does not undo it.
-;; jolt-fiber-install-preempt-handler! runs once per DRAIN rather than per
-;; dispatch, so the borrower's handler then stayed live over every later fiber on
-;; that carrier, and it failed two ways at once:
-;;
-;;   - that handler answers a quantum by re-arming its own tick and returning, so
-;;     nothing on the carrier was preempted again. Measured at a 20,000 tick
-;;     quantum: 0 preemptions in 0.5s behind a fiber parked inside a borrow. That
-;;     is the unbounded starvation window the head of fibers.ss says no setting can
-;;     open, reachable from ordinary jolt code.
-;;   - the handler closes over the call/cc continuation captured in the PARKED
-;;     fiber's stack. A later interrupt! fired it under whichever fiber owned the
-;;     carrier and invoked that continuation: the parked fiber returned from a park
-;;     it never came back from, and the running fiber was abandoned mid-computation
-;;     — 'running for the life of the process, its go channel never closed, every
-;;     reader of it waiting, and no error naming any of it.
-;;
-;; A wind is the answer the rest of the runtime already gives for state that must
-;; survive a park: the after-thunk hands the timer back on the way out and the
-;; before-thunk re-takes it on the way in, so the borrow is SUSPENDED across a park
-;; rather than leaking past it. It is jolt-with-mutex's rule and the opposite of
-;; jolt-with-monitor's, and the difference is what each thing is: a monitor must
-;; still be held when the fiber comes back, the carrier's timer must not.
-;;
-;; The other three exits come out of the same after-thunk, so they are no longer
-;; written separately. And an interrupt raised while the borrower is parked is not
-;; lost — the resume re-arms the borrowed tick, so it lands on the fiber that asked
-;; for it, on its own carrier time.
+;; WHY THE BORROW IS STILL A dynamic-wind (jolt-1rod). A fiber PARK is a way
+;; out of the body too, through the carrier's sched-k, and the poll must not
+;; outlive the extent: a poll left registered over the next fiber on the carrier
+;; would run this borrow's check there, and its escape would invoke a
+;; continuation captured in the PARKED fiber's stack under whichever fiber owned
+;; the carrier. The after-thunk cancels the poll on every way out, the park
+;; included, and the before-thunk re-registers it on resume, so an interrupt
+;; raised while the borrower is parked still lands on the fiber that asked for
+;; it.
 ;;
 ;; WHAT THIS RESTS ON, the same thing jolt-with-monitor's after-thunk rests on: a
 ;; CHEAP park (java/sm.ss) never rewinds, so it would fire this after-thunk and
@@ -1959,134 +1935,69 @@
 (define (jolt-make-interrupt) (box #f))
 (define (jolt-interrupt! token) (when (box? token) (set-box! token #t)) jolt-nil)
 (define (jolt-interrupted? token) (and (box? token) (unbox token) #t))
-;; Active timer borrows form a dynamic stack per application thread. Chez child
+;; Active borrows form a dynamic stack per application thread. Chez child
 ;; threads inherit thread-parameter values, so owner-tag it: an inherited stack
 ;; is empty in the child and cannot make the child poll a parent's token.
 (define interrupt-poll-stack (make-thread-parameter (cons #f '())))
 (define (current-interrupt-poll-stack)
   (let ((state (interrupt-poll-stack)) (owner (get-thread-id)))
     (if (and (pair? state) (eqv? (car state) owner)) (cdr state) '())))
+;; The poll client: the innermost borrow's check. With no borrow live (one that
+;; exited between the fire and this read) there is nothing to poll, and the
+;; demand stays cancelled.
+(jolt-tick-client-set! jolt-tick-slot-poll
+  (lambda ()
+    (let ((st (current-interrupt-poll-stack)))
+      (when (pair? st) ((car st))))))
 (define (jolt-run-interruptible token thunk)
-  ;; Captured ONCE, outside the wind: a before-thunk that re-read it would, on a
-  ;; resume, save the handler the SCHEDULER had put back and restore that on the
-  ;; real exit — the borrow would hand the carrier its own handler a second time
-  ;; and lose whatever an enclosing borrow had installed.
-  (let* ((prev-handler (timer-interrupt-handler))
-         (outer-bindings (dyn-binding-stack))
-         ;; Captured once, like prev-handler. On a real off-fiber exit from a
-         ;; nested borrow the restored outer handler needs a fresh poll tick.
+  (let* ((outer-bindings (dyn-binding-stack))
+         ;; Captured once, outside the wind: the stack this borrow sits on, the
+         ;; same on the way in after a resume as on the first entry.
          (owner (get-thread-id))
          (outer-stack (current-interrupt-poll-stack))
-         ;; --- handing the quantum back DURING the borrow (jolt-449m) -----------
-         ;; jolt-ly62 stopped the borrow outliving itself. What was still open is
-         ;; the extent of the borrow: the handler below answered a quantum by
-         ;; re-arming its own tick and RETURNING, so nothing on the carrier was
-         ;; preempted for as long as the body ran. Measured, one carrier and a
-         ;; 20,000 tick quantum: a spinning fiber inside a borrow managed
-         ;; 36,983,637 iterations and 0 preemptions while a sibling queued behind
-         ;; it never ran; the same spin outside a borrow was preempted 46 times.
-         ;; That is the unbounded starvation window the head of fibers.ss says no
-         ;; setting can open, and the body reached through jolt.host/run-interruptible
-         ;; is arbitrary user code — a whole eval, in the interrupt use it exists for.
-         ;;
-         ;; The borrow polls far more often than the quantum, so the fix is to
-         ;; COUNT what it consumes and let the scheduler decide once it adds up.
-         ;; `borrowed` is ticks since the fiber last had the CPU handed to it; the
-         ;; before-thunk zeroes it, because a rewind means the fiber has just been
-         ;; dispatched and its quantum restarts.
-         (borrowed 0)
-         ;; What the borrow last armed, so the accounting adds real ticks. It arms
-         ;; the TIGHTER of the two demands, so a quantum shorter than the poll
-         ;; interval is still honoured instead of being rounded up to it.
-         (armed interrupt-check-ticks)
-         (arm!
-          (lambda ()
-            (let ((n (if (jolt-current-fiber)
-                         (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
-                         interrupt-check-ticks)))
-              (set! armed n)
-              (set-timer n))))
          ;; This wind's own edges are masked (jolt-wind*, locks.ss). A deferred
          ;; interrupt re-arms a short retry, and when the body returned normally
          ;; that retry could land at this after-thunk's entry, the winder already
-         ;; popped: the escape then left this handler installed and armed, and the
-         ;; next tick jumped back into an extent that had already returned.
+         ;; popped: the escape then jumped back into an extent that had already
+         ;; returned.
          (lv (jolt-locks-held))
          (r (call/cc
               (lambda (k)
                 (jolt-locks-enter!)
                 (dynamic-wind
                   (lambda ()
-                    (set! borrowed 0)
-                    (let ((handler
+                    (let ((check
                            (lambda ()
-                        (cond
-                          ((and (box? token) (unbox token))
-                           ;; Not while this thread holds a counted lock. The
-                           ;; escape skips any cleanup that has not started, and
-                           ;; jolt-with-mutex's edges are the place that costs: an
-                           ;; escape between the count and the wind left the count
-                           ;; up for good (no preemption on that carrier again, every
-                           ;; park refused), and one at the after-thunk's entry —
-                           ;; the winder already popped — left the mutex held. The
-                           ;; count goes up first and comes down last
-                           ;; (host/chez/locks.ss), so a zero count is outside both
-                           ;; edges. The preempt handler refuses on the same test
-                           ;; and retries the same way.
-                           (if (fx=? 0 (jolt-locks-held))
-                               (k interrupt-sentinel)
-                               (begin (set! armed (jolt-fiber-preempt-retry-ticks))
-                                      (set-timer armed))))
-                          (else
-                           (set! borrowed (fx+ borrowed armed))
-                           (cond
-                             ;; The quantum has fallen due. Hand it to the
-                             ;; scheduler's handler, which either escapes through
-                             ;; sched-k — and the after-thunk below gives the timer
-                             ;; back, the before-thunk re-takes it on resume — or
-                             ;; refuses (a lock held, a transition committed) and
-                             ;; re-arms short to retry. When it refuses, `armed`
-                             ;; still names the old tick, so the next count is high
-                             ;; and the retry lands early. That is the only safe
-                             ;; direction: the guarantee is an upper bound on the
-                             ;; window, and early only tightens it.
-                             ;;
-                             ;; The jolt-current-fiber test is load-bearing, not a
-                             ;; nicety: off a fiber the scheduler's handler does
-                             ;; nothing AND does not re-arm, so calling it there
-                             ;; would leave the borrow with no timer and stop the
-                             ;; interrupt from ever being noticed.
-                              ((and (jolt-current-fiber)
-                                    (fx>=? borrowed (jolt-fiber-preempt-ticks)))
-                               (set! borrowed 0)
-                               (jolt-fiber-preempt-handler))
-                              (else (arm!) (void))))))))
-                      ;; Push is the timer-frame ownership linearization point.
-                      (interrupt-poll-stack (cons owner (cons handler outer-stack)))
-                      (timer-interrupt-handler handler)
-                      (arm!)))
+                             (cond
+                               ((not (and (box? token) (unbox token)))
+                                (jolt-tick-set! jolt-tick-slot-poll interrupt-check-ticks))
+                               ;; Not while this thread holds a counted lock. The
+                               ;; escape skips any cleanup that has not started, and
+                               ;; jolt-with-mutex's edges are the place that costs: an
+                               ;; escape between the count and the wind left the count
+                               ;; up for good (no preemption on that carrier again,
+                               ;; every park refused), and one at the after-thunk's
+                               ;; entry — the winder already popped — left the mutex
+                               ;; held. The count goes up first and comes down last
+                               ;; (host/chez/locks.ss), so a zero count is outside
+                               ;; both edges. The preempt handler refuses on the same
+                               ;; test and retries the same way.
+                               ((fx=? 0 (jolt-locks-held)) (k interrupt-sentinel))
+                               (else (jolt-tick-set! jolt-tick-slot-poll
+                                                     (jolt-fiber-preempt-retry-ticks)))))))
+                      ;; Push is the poll-ownership linearization point.
+                      (interrupt-poll-stack (cons owner (cons check outer-stack)))
+                      (jolt-tick-set! jolt-tick-slot-poll interrupt-check-ticks)))
                   (jolt-masked-body thunk)
-                  ;; Runs on every way out of the body, the park included. Disarm
-                  ;; BEFORE restoring the handler: the other order leaves a window
-                  ;; where the borrowed tick can fall due on the scheduler's
-                  ;; handler, which answers it by preempting.
+                  ;; Runs on every way out of the body, the park included. Pop,
+                  ;; then poll for the enclosing borrow if there is one: a poll
+                  ;; that fires between the two runs the enclosing check, which
+                  ;; is the right one either way. On a park the enclosing
+                  ;; borrow's own after-thunk runs next and cancels it.
                   (lambda ()
-                    (set-timer 0)
-                    ;; Pop before restoring the enclosing handler. Every terminal
-                    ;; path (return, throw, interrupt, and park unwind) comes here.
                     (interrupt-poll-stack (cons owner outer-stack))
-                    (timer-interrupt-handler prev-handler)
-                    ;; Off a fiber, and on a park (the current-fiber vreg is
-                    ;; already cleared by then), this is a plain disarm — which is
-                    ;; what the scheduler wants for the carrier it is about to take
-                    ;; back. On a real exit from a fiber it re-arms the quantum.
-                    ;; On a park, enclosing winds immediately disarm this tick;
-                    ;; on a real off-fiber nested exit it keeps the outer token
-                    ;; polling. Fiber exits retain the scheduler rearm behavior.
-                    (cond
-                      ((jolt-current-fiber) (jolt-fiber-rearm-preempt!))
-                      ((pair? outer-stack) (set-timer interrupt-check-ticks))
-                      (else (jolt-fiber-rearm-preempt!)))
+                    (jolt-tick-set! jolt-tick-slot-poll
+                                    (if (pair? outer-stack) interrupt-check-ticks 0))
                     (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))))
     (if (eq? r interrupt-sentinel)
         (begin

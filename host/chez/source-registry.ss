@@ -193,15 +193,32 @@
 ;; eval registry (jolt-eval-source-line). #f when the frame carries no source or
 ;; no marker precedes its offset — the renderer then falls back to the defn line.
 ;; Exception-proof: the reporter runs while an error is being reported.
-(define (srcreg-frame-entry-from-source-pair io ns)
+(define (srcreg-source-pair-entry pair ns)
   (guard (e (#t #f))
-    (let ((pair (srcreg-frame-source-pair io)))
-      (and pair
-           (let ((name (car pair)) (offset (cdr pair)))
-             (cond
-               ((jolt-eval-source-name? name) (jolt-eval-source-entry name offset))
-               ((jolt-baked-marker-table ns) => (lambda (t) (jolt-marker-line-from-table t offset)))
-               (else (jolt-marker-entry-in-file name offset))))))))
+    (and pair
+         (let ((name (car pair)) (offset (cdr pair)))
+           (cond
+             ((jolt-eval-source-name? name) (jolt-eval-source-entry name offset))
+             ((jolt-baked-marker-table ns) => (lambda (t) (jolt-marker-line-from-table t offset)))
+             (else (jolt-marker-entry-in-file name offset)))))))
+
+;; The logical frames one physical frame stands for, innermost first, or '() for
+;; a frame a trace leaves out: unnamed, or plumbing that maps to no jolt fn. nm
+;; is the frame's procedure name and source-pair a thunk answering its
+;; (source-name . offset); only a mapped frame reads it, since only a mapped
+;; frame prints a line. Error traces and the sampler both resolve through this.
+(define (srcreg-logical-frames nm source-pair)
+  (let ((src (and nm (hashtable-ref source-registry nm #f))))
+    (if (not (and nm (or src (not (srcreg-plumbing-name? nm)))))
+        '()
+        (let* ((parts (and (not src) (srcreg-jfn-parts nm)))
+               (entry (and (or src parts)
+                           (srcreg-source-pair-entry
+                             (source-pair)
+                             (cond ((vector? src) (vector-ref src 0))
+                                   ((pair? parts) (car parts))
+                                   (else #f))))))
+          (srcreg-entry-frames nm src entry)))))
 
 ;; --- marker tables a built binary carries ------------------------------------
 ;; A built binary's app code was compiled from unit files in its build directory,
@@ -266,33 +283,21 @@
           (reverse acc)
           (let* ((io (car ios))
                  (nm (srcreg-frame-name io))
-                 (src (and nm (hashtable-ref source-registry nm #f)))
-                 ;; keep a frame that maps, or any named frame that isn't plumbing
-                 (keep? (and nm (or src (not (srcreg-plumbing-name? nm)))))
-                 ;; the marker entry at the offset this frame is stopped at (only
-                 ;; a mapped frame prints a line, so only it pays the lookup)
-                 (parts (and nm (not src) (srcreg-jfn-parts nm)))
-                 (entry (and nm (or src parts)
-                             (srcreg-frame-entry-from-source-pair
-                               io (cond ((vector? src) (vector-ref src 0))
-                                        ((pair? parts) (car parts))
-                                        (else #f)))))
-                 (line (jolt-marker-entry-line entry)))
+                 (fs (srcreg-logical-frames nm (lambda () (srcreg-frame-source-pair io)))))
             (when (and debug? nm)
-              (display (string-append "  [frame] " nm (if src " *MAPPED*"
-                                                          (if keep? "" " (skipped)"))
+              (display (string-append "  [frame] " nm
+                                      (cond ((hashtable-ref source-registry nm #f) " *MAPPED*")
+                                            ((null? fs) " (skipped)")
+                                            (else ""))
                                       (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
+            ;; One PHYSICAL frame can stand for several logical ones when code
+            ;; was spliced into it. They come back innermost first, and acc is
+            ;; reversed on return, so each is consed IN ORDER — a left fold, not
+            ;; a recursive cons, which would put them on backwards.
             (loop (cdr ios)
-                  (if (not keep?)
-                      acc
-                      ;; One PHYSICAL frame can stand for several logical ones
-                      ;; when code was spliced into it. srcreg-entry-frames hands
-                      ;; them back innermost first, and acc is reversed on return,
-                      ;; so each is consed IN ORDER — a left fold, not a recursive
-                      ;; cons, which would put them on backwards.
-                      (let add ((fs (srcreg-entry-frames nm src entry)) (a acc))
-                        (if (null? fs) a (add (cdr fs) (cons (car fs) a))))))))))))
+                  (let add ((fs fs) (a acc))
+                    (if (null? fs) a (add (cdr fs) (cons (car fs) a)))))))))))
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
 ;;

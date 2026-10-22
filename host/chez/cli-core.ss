@@ -394,15 +394,19 @@
 ;; itself is loaded first, uninstrumented, so its own code never shows up in the
 ;; report. The internal worker modes are copies of this process the environment
 ;; reaches too; they compile nothing of the user's and must not print a report.
+;; JOLT_PROFILE=sample runs the sampler instead (sampler.ss), which needs no
+;; compilation, so a built binary's launcher starts it the same way.
 (define (jolt-profile-init-from-env! cli-args)
   (let ((e (getenv "JOLT_PROFILE")))
     (when (and (string? e) (not (string=? e "")) (not (jolt-trace-env-off? e))
                (not (and (pair? cli-args)
                          (member (car cli-args) '("--aot-worker" "--build-worker")))))
       (load-namespace "jolt.profile")
-      (let ((at-exit (var-deref "jolt.profile" "report-at-exit")))
-        (when (jolt-profile-instrument! #t)
-          (jolt-add-shutdown-hook (lambda () (jolt-invoke at-exit))))))))
+      (if (string=? e "sample")
+          (jolt-sample-init-from-env!)
+          (let ((at-exit (var-deref "jolt.profile" "report-at-exit")))
+            (when (jolt-profile-instrument! #t)
+              (jolt-add-shutdown-hook (lambda () (jolt-invoke at-exit)))))))))
 
 (define (jolt-cli-run cli-args prepare-build!)
   ;; Every entry starts in user, as clojure.main's does. The image bakes jolt.main

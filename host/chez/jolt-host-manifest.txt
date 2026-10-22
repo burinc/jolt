@@ -203,6 +203,10 @@ profile-instrumenting?
 profile-retired
 profile-sites
 profile-stats
+sample-read
+sample-start!
+sample-stop!
+sampling?
 protocol-key-of
 protocol-methods
 proxy-super-call

@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   margin. `JOLT_PROFILE=1` instruments a whole run and prints the report on
   stderr at exit. `(prof/measure body)` gives a body's real and cpu time, bytes
   allocated and collector work.
+- **A sampling profiler in `jolt.profile`.** `(prof/sample!)` interrupts every
+  thread that runs jolt code at an interval of its own CPU time (1 ms by
+  default) and records its stack, so it needs no recompilation and sees the
+  runtime, `clojure.core`, AOT-cached code and built binaries. `sample-report`
+  lists fns by self and total time and lines by self time, `sample-counts` and
+  `sample-lines` return the rows, and `write-folded` writes collapsed stacks
+  for flame graph tools. `JOLT_PROFILE=sample` samples a whole run, in a built
+  binary too, and prints the report at exit. Overhead measured 1–3%. Fiber
+  preemption and `run-interruptible` now share each thread's engine timer
+  through one scheduler instead of borrowing it from each other.
 
 ### Changed
 

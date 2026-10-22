@@ -340,6 +340,20 @@ sa-profile-counts
 sa-profile-release!
 sa-profile-clear!
 #
+# tier: capability-sample
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss — what the sampling
+# profiler (host/chez/sampler.ss) reads from a timer handler. (sa-stack-walk k
+# cap proc) calls (proc code offset frame) on each of k's frames innermost first,
+# at most cap, and answers how many it walked; (sa-frame-source-pair frame) is the
+# frame's (source-name . byte-offset); (sa-code-name code) the code object's name;
+# (sa-thread-cpu-nanos) the calling thread's CPU time. Permitted degradation:
+# sa-stack-walk answers #f — jolt.profile then reports sampling as unsupported —
+# sa-frame-source-pair and sa-code-name #f, sa-thread-cpu-nanos 0.
+sa-stack-walk
+sa-frame-source-pair
+sa-code-name
+sa-thread-cpu-nanos
+#
 # tier: capability-unchecked
 # OUR OWN definitions in the adapter runtime file, SYNTAX. The unchecked
 # fixnum / vector primitives for the runtime's hot loops: the linear scan of a

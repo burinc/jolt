@@ -332,6 +332,12 @@
 (def-var! "jolt.host" "profile-defs" (lambda (files) (jolt-vector)))
 (def-var! "jolt.host" "profile-stats"
   (lambda () (apply jolt-vector (vector->list (sa-stats)))))
+;; The sampler's half (sampler.ss on Chez, also left out): no timer to drive
+;; it, so sample! throws {:host :unsupported} and there is nothing to read.
+(def-var! "jolt.host" "sample-start!" (lambda (interval depth) #f))
+(def-var! "jolt.host" "sample-stop!" (lambda () jolt-nil))
+(def-var! "jolt.host" "sampling?" (lambda () #f))
+(def-var! "jolt.host" "sample-read" (lambda () (jolt-vector 0 (jolt-vector))))
 ;; Per-object identity for the back end's constant pool (rt.ss on Chez).
 (def-var! "jolt.host" "identity-hash" (lambda (x) (jolt-identity-hasheq x)))
 

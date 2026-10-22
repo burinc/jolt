@@ -42,7 +42,24 @@
             thing to how much work it did.
 
   `measure` is separate from the counters: it reports the time, allocation and
-  collector work of evaluating its body."
+  collector work of evaluating its body.
+
+  The sampler measures time instead of counts, and needs no recompilation, so
+  it sees all code: the runtime, clojure.core, AOT-cached namespaces and built
+  binaries. Every thread running jolt code is interrupted at an interval of its
+  own CPU time and its stack is recorded:
+
+    (prof/sample! {:interval-ms 1})
+    (my.app/run)
+    (prof/stop-sampling!)
+    (prof/sample-report)
+    (prof/write-folded \"app.folded\")   ; for flame graph tools
+
+  or for a whole run, JOLT_PROFILE=sample. A thread that was already running
+  when sampling started joins at its next timer event (a fiber quantum, an
+  interruptible eval); one started while sampling is on is sampled from its
+  start. Frames erased by tail calls are not on the stack, and a thread blocked
+  in a wait uses no CPU and is not sampled."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [jolt.host :as host]))
@@ -269,3 +286,163 @@
   :gc-ms of collector cpu time that ran meanwhile."
   [& body]
   `(measure* (fn [] ~@body)))
+
+;; --- sampling -------------------------------------------------------------------
+
+(defn sample!
+  "Start sampling every thread that runs jolt code, dropping the samples of any
+  earlier run. Options:
+
+    :interval-ms  thread CPU time between samples (default 1)
+    :depth        frames kept per stack, innermost first (default 64)
+
+  Returns true; throws when the host cannot sample."
+  ([] (sample! {}))
+  ([{:keys [interval-ms depth] :or {interval-ms 1 depth 64}}]
+   (if (host/sample-start! (long (* interval-ms 1000000)) (long depth))
+     true
+     (throw (ex-info "jolt.profile: this host cannot sample stacks"
+                     {:host :unsupported})))))
+
+(defn stop-sampling!
+  "Stop sampling. The samples stay readable until the next sample!."
+  []
+  (host/sample-stop!)
+  nil)
+
+(defn sampling?
+  "True while the sampler runs."
+  []
+  (boolean (host/sampling?)))
+
+(defn- sample-frame [[name file line def-line]]
+  {:fn (symbol name) :file file :line line :def-line def-line})
+
+(def ^:private runtime-frame {:fn '[runtime] :file nil :line nil :def-line nil})
+
+(defn samples
+  "Every distinct stack the sampler recorded, as maps of :thread (its id),
+  :count (samples of that stack), :ms (thread CPU time they stand for) and
+  :stack, root first, a vector of {:fn :file :line}, where :line is the line the
+  frame was at. A stack whose every frame is runtime plumbing reads as [runtime]."
+  []
+  (let [[_ rows] (host/sample-read)]
+    (for [[thread n nanos frames] rows]
+      {:thread thread :count n :ms (ms nanos)
+       :stack (if (seq frames) (mapv sample-frame frames) [runtime-frame])})))
+
+(defn- by-fn [acc f ms n]
+  (update acc (:fn f)
+          (fn [r]
+            (-> (or r {:fn (:fn f) :file (:file f) :line (:def-line f)
+                       :self-ms 0.0 :total-ms 0.0 :samples 0})
+                (update :total-ms + ms)
+                (update :samples + n)))))
+
+(defn sample-counts
+  "Time per fn, most self time first, as maps of :fn, :file, :line (where it is
+  defined), :self-ms (in the fn itself), :total-ms (in it and what it called)
+  and :samples (samples it was on the stack for). A recursive fn counts once per
+  stack."
+  []
+  (->> (samples)
+       (reduce (fn [acc {:keys [stack ms count]}]
+                 (let [fns (vals (into {} (map (juxt :fn identity)) stack))
+                       acc (reduce #(by-fn %1 %2 ms count) acc fns)]
+                   (update-in acc [(:fn (peek stack)) :self-ms] + ms)))
+               {})
+       vals
+       (sort-by (juxt (comp - :self-ms) (comp - :total-ms) (comp str :fn)))))
+
+(defn sample-lines
+  "Self time per line, most first, as maps of :file, :line, :fn, :self-ms and
+  :samples. A sample is charged to its innermost frame that has a source line."
+  []
+  (->> (samples)
+       (reduce (fn [acc {:keys [stack ms count]}]
+                 (if-let [f (last (filter :line stack))]
+                   (update acc [(:file f) (:line f)]
+                           (fn [r]
+                             (-> (or r {:file (:file f) :line (:line f) :fn (:fn f)
+                                        :self-ms 0.0 :samples 0})
+                                 (update :self-ms + ms)
+                                 (update :samples + count))))
+                   acc))
+               {})
+       vals
+       (sort-by (juxt (comp - :self-ms) (comp str :file) :line))))
+
+(defn write-folded
+  "Write the stacks in the collapsed format flame graph tools read (flamegraph.pl,
+  speedscope, inferno): one line per stack, root first and separated by ;, then
+  its weight in microseconds of CPU time. dest is a path or a writer."
+  [dest]
+  (let [stacks (reduce (fn [acc {:keys [stack ms]}]
+                         (update acc (str/join ";" (map :fn stack)) (fnil + 0.0) ms))
+                       {} (samples))
+        write (fn [w]
+                (doseq [[k v] (sort-by key stacks)]
+                  (.write w (str k " " (Math/round (* 1000.0 (double v))) "\n")))
+                (.flush w))]
+    (if (string? dest)
+      (with-open [w (io/writer dest)] (write w))
+      (write dest))
+    nil))
+
+(defn- fmt-ms [x] (format "%.1f" (double x)))
+
+(defn sample-report
+  "Print the fns by self time, the fns by total time and the lines by self time.
+  Options:
+
+    :limit  how many rows of each table (default 20)"
+  ([] (sample-report {}))
+  ([{:keys [limit] :or {limit 20}}]
+   (let [[gc rows] (host/sample-read)
+         counts (sample-counts)
+         total (reduce + 0.0 (map :self-ms counts))
+         n (reduce + 0 (map second rows))
+         sources (memoize source-lines)
+         pct (fn [x] (str (format "%.1f" (if (pos? total) (* 100.0 (/ x total)) 0.0)) "%"))]
+     (if (zero? n)
+       (println "jolt.profile: no samples")
+       (do
+         (println (str "jolt.profile: " n " samples, " (fmt-ms total) " ms of CPU time, "
+                       (fmt-ms (ms gc)) " ms in the collector"))
+         (println)
+         (println "fns by self time")
+         (println (str (pad-left "self ms" 12) (pad-left "self" 8) (pad-left "total ms" 12) "  fn"))
+         (doseq [r (take limit counts)]
+           (println (str (pad-left (fmt-ms (:self-ms r)) 12) (pad-left (pct (:self-ms r)) 8)
+                         (pad-left (fmt-ms (:total-ms r)) 12) "  " (pad-right (:fn r) 32)
+                         (when (:file r) (str " " (location r))))))
+         (println)
+         (println "fns by total time")
+         (println (str (pad-left "total ms" 12) (pad-left "total" 8) "  fn"))
+         (doseq [r (take limit (sort-by (comp - :total-ms) counts))]
+           (println (str (pad-left (fmt-ms (:total-ms r)) 12) (pad-left (pct (:total-ms r)) 8)
+                         "  " (pad-right (:fn r) 32)
+                         (when (:file r) (str " " (location r))))))
+         (println)
+         (println "lines by self time")
+         (println (str (pad-left "self ms" 12) "  line"))
+         (doseq [{:keys [file line] :as r} (take limit (sample-lines))]
+           (let [text (when (and file line) (get (sources file) (dec line)))]
+             (println (str (pad-left (fmt-ms (:self-ms r)) 12) "  " (pad-right (location r) 40)
+                           (when text (str "  " (str/trim text))))))))))))
+
+(defmacro with-sampling
+  "Sample while body runs, and return a map of its :result and the
+  sample-counts rows of what it did as :counts. opts as for sample!."
+  [opts & body]
+  `(do (sample! ~opts)
+       (let [r# (try (do ~@body) (finally (stop-sampling!)))]
+         {:result r# :counts (sample-counts)})))
+
+(defn sample-report-at-exit
+  "The JOLT_PROFILE=sample exit hook: the sample report, on stderr."
+  []
+  (stop-sampling!)
+  (binding [*out* *err*]
+    (sample-report)
+    (flush)))
