@@ -1625,30 +1625,54 @@
 (define (sa-profile-instrumenting?) sa-profile-on?)
 
 ;; (sa-profile-compile thunk) -> thunk's values
-;; Run THUNK, which compiles code (the eval of an emitted form), with
-;; instrumentation on when the flag is. Contract: THUNK's result either way.
-;; Degradation: call THUNK.
+;; Run THUNK, which compiles code (the eval of an emitted form), instrumented when
+;; the flag is on and not when it is off. Bound both ways: the parameter is the
+;; thread's, and an instrumented form that turns the flag off, then compiles
+;; more, must not hand those compiles its own setting. Contract: THUNK's result
+;; either way. Degradation: call THUNK.
 (define (sa-profile-compile thunk)
-  (if sa-profile-on?
-      (parameterize ((compile-profile 'source)) (thunk))
-      (thunk)))
+  (parameterize ((compile-profile (and sa-profile-on? 'source))) (thunk)))
+
+;; One profile-dump entry as #(source-name start end count), or #f for a counter
+;; on code that was never annotated (it carries no name).
+(define (sa-profile-entry p)
+  (let* ((so (car p))
+         (path (guard (e (#t #f)) (source-file-descriptor-path (source-object-sfd so)))))
+    (and (string? path)
+         (vector path (source-object-bfp so) (source-object-efp so) (cdr p)))))
 
 ;; (sa-profile-counts) -> list of #(source-name start end count)
 ;; Every counter in the process, by the source object it was attached to: the
 ;; source-name is the sfd path the code was read under, start and end the byte
-;; span of the expression the counter is on. Counters of code that
-;; was never annotated carry no name and are dropped. Contract: one entry per
-;; live counter. Degradation: '().
+;; span of the expression the counter is on. Contract: one entry per live
+;; counter. Degradation: '().
 (define (sa-profile-counts)
-  (fold-left
-    (lambda (acc p)
-      (let* ((so (car p))
-             (path (guard (e (#t #f)) (source-file-descriptor-path (source-object-sfd so)))))
-        (if (string? path)
-            (cons (vector path (source-object-bfp so) (source-object-efp so) (cdr p)) acc)
-            acc)))
-    '()
-    (profile-dump)))
+  (fold-left (lambda (acc p) (let ((v (sa-profile-entry p))) (if v (cons v acc) acc)))
+             '()
+             (profile-dump)))
+
+;; (sa-profile-release!) -> list of #(source-name start end count)
+;; Give back the counters of code the collector has reclaimed, and answer them
+;; with their final counts. Chez keeps a counter until it is released, so code
+;; compiled and dropped (an eval in a loop) would otherwise hold its counters,
+;; and their source objects, for the life of the process. The released ones are
+;; the dump before the release less the dump after: a source object is the same
+;; object in both, and two counters can share one (an inlined copy), so it is a
+;; multiset difference. Contract: each released counter once, with the count it
+;; ended with. Degradation: '().
+(define (sa-profile-release!)
+  (let* ((before (profile-dump))
+         (after (begin (profile-release-counters) (profile-dump)))
+         (live (make-eq-hashtable)))
+    (for-each (lambda (p) (hashtable-update! live (car p) fx1+ 0)) after)
+    (fold-left
+      (lambda (acc p)
+        (let ((k (hashtable-ref live (car p) 0)))
+          (if (fx>? k 0)
+              (begin (hashtable-set! live (car p) (fx1- k)) acc)
+              (let ((v (sa-profile-entry p))) (if v (cons v acc) acc)))))
+      '()
+      before)))
 
 ;; (sa-profile-clear!) -> void
 ;; Zero every counter. Contract: a later sa-profile-counts reads 0 for code that

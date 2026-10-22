@@ -417,6 +417,7 @@
   (check "sa-profile-instrumenting? fixed #f" (sa-profile-instrumenting?) #f)
   (check "sa-profile-compile calls its thunk" (sa-profile-compile (lambda () 7)) 7)
   (check "sa-profile-counts -> '()" (sa-profile-counts) '())
+  (check "sa-profile-release! -> '()" (sa-profile-release!) '())
   (check "sa-stack-walk -> #f" (sa-stack-walk #f 1 (lambda (c o f) #t)) #f)
   (check "sa-frame-source-pair -> #f" (sa-frame-source-pair #f) #f)
   (check "sa-code-name -> #f" (sa-code-name #f) #f)

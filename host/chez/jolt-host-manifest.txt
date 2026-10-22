@@ -200,6 +200,7 @@ profile-clear!
 profile-defs
 profile-instrument!
 profile-instrumenting?
+profile-retired
 profile-sites
 profile-stats
 sample-read

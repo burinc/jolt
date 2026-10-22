@@ -1384,6 +1384,27 @@ else
   fails=$((fails + 1))
 fi
 
+# Code from -e has no file to find its defs by; its fns are named from the
+# def forms themselves.
+profile_e_err="$(JOLT_PROFILE=1 $jolt -e '(defn f [n] (if (< n 2) n (+ (f (- n 1)) (f (- n 2))))) (f 10)' 2>&1 >/dev/null)"
+if printf '%s' "$profile_e_err" | grep -q 'user/f  '; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE names fns from -e"
+  printf '%s\n' "$profile_e_err" | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# Instrumenting turns trace frames on, which its counters resolve against;
+# turning it off puts JOLT_TRACE=0's setting back.
+profile_tf="$(JOLT_TRACE=0 $jolt -e "(require 'jolt.profile) (jolt.profile/instrument!) (jolt.profile/instrument! false) (prn (#'jolt.backend-scheme/trace-frames?))" 2>&1)"
+if [ "$profile_tf" = "false" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: instrument! false restores trace frames (got $profile_tf)"
+  fails=$((fails + 1))
+fi
+
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,
 # move, mtime round-trip, which). The file self-checks and prints one marker.
 fs_out="$($jolt run test/chez/fs-test.clj 2>/dev/null)"

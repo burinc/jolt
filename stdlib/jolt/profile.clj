@@ -4,7 +4,7 @@
   Code compiled while instrumentation is on carries a counter on every
   expression, and the counters are read back here by Clojure file, line and
   function. The counts are exact, not sampled: a line that ran 1973 times says
-  1973.
+  1973, as long as only one thread runs it.
 
   Instrumentation is a compile-time switch. It applies to code compiled AFTER it
   is turned on, so turn it on and then load (or reload) what you want to
@@ -29,7 +29,10 @@
   one evaluation of the calling expression. While instrumentation is on,
   namespaces load from source rather than from the AOT cache, and the code it
   compiles is slower than uninstrumented code. Counters are not atomic: code
-  running on several threads at once may lose increments.
+  running on several threads at once loses increments, often most of them.
+
+  A method of a defrecord, deftype, extend-type or extend-protocol is named
+  ns/Type.method, and a defmethod's body ns/multi[dispatch-value].
 
   Two numbers describe a line or a fn:
 
@@ -87,37 +90,52 @@
   (and (string? a) (string? b)
        (or (= a b) (str/ends-with? a (str "/" b)) (str/ends-with? b (str "/" a)))))
 
-;; [file line] -> {:hits :evals :fn-hits :fn-evals :owner :form-line}. A counter
-;; is one expression of one compiled copy of a line: within a copy the line ran
-;; as often as its most-run expression, and copies of the same line in different
-;; forms (an inlined call, a redefinition) ran separately, so they add up. The
-;; :fn- pair leaves out top-level code — what a form does as it loads, a defn's
-;; own included — which ran on that line but belongs to no fn.
-(defn- line-table [sites]
+;; [file line] -> {:hits :evals :fn-hits :fn-evals :owner :form-line :label
+;; :wins?}. A counter is one expression of one compiled copy of a line: within
+;; a copy the line ran as often as its most-run expression, and copies of the
+;; same line in different forms (an inlined call, a redefinition) ran
+;; separately, so they add up. The :fn- pair leaves out top-level code — what a
+;; form does as it loads, a defn's own included — which ran on that line but
+;; belongs to no fn. RETIRED are the lines of code that is gone, merged the
+;; same way already.
+(defn- line-table [sites retired]
   (let [merge-copy (fn [r n top?]
                      (cond-> (-> r
                                  (update :max (fnil max 0) n)
                                  (update :sum (fnil + 0) n))
                        (not top?) (-> (update :fn-max (fnil max 0) n)
                                       (update :fn-sum (fnil + 0) n))))
-        per-copy (reduce (fn [acc [file line n owner source form-line top?]]
+        per-copy (reduce (fn [acc [file line n owner source form-line top? label wins?]]
                            (update acc [source file line]
                                    (fn [r]
                                      (-> (merge-copy r n top?)
                                          (assoc :owner (or owner (:owner r))
-                                                :form-line form-line)))))
+                                                :form-line form-line
+                                                :label (or label (:label r))
+                                                :wins? wins?)))))
                          {} sites)
-        add (fnil + 0)]
-    (reduce-kv (fn [acc [_ file line] r]
-                 (update acc [file line]
-                         (fn [t]
-                           {:hits (add (:hits t) (:max r))
-                            :evals (add (:evals t) (:sum r))
-                            :fn-hits (add (:fn-hits t) (:fn-max r 0))
-                            :fn-evals (add (:fn-evals t) (:fn-sum r 0))
-                            :owner (or (:owner r) (:owner t))
-                            :form-line (or (:form-line r) (:form-line t))})))
-               {} per-copy)))
+        add (fnil + 0)
+        merge-line (fn [acc k r]
+                     (update acc k
+                             (fn [t]
+                               {:hits (add (:hits t) (:hits r))
+                                :evals (add (:evals t) (:evals r))
+                                :fn-hits (add (:fn-hits t) (:fn-hits r))
+                                :fn-evals (add (:fn-evals t) (:fn-evals r))
+                                :owner (or (:owner r) (:owner t))
+                                :form-line (or (:form-line r) (:form-line t))
+                                :label (or (:label r) (:label t))
+                                :wins? (or (:wins? r) (:wins? t))})))]
+    (reduce (fn [acc [file line hits evals fn-hits fn-evals owner form-line label wins?]]
+              (merge-line acc [file line]
+                          {:hits hits :evals evals :fn-hits fn-hits :fn-evals fn-evals
+                           :owner owner :form-line form-line :label label :wins? wins?}))
+            (reduce-kv (fn [acc [_ file line] r]
+                         (merge-line acc [file line]
+                                     (assoc r :hits (:max r) :evals (:sum r)
+                                            :fn-hits (:fn-max r 0) :fn-evals (:fn-sum r 0))))
+                       {} per-copy)
+            retired)))
 
 ;; file -> defs sorted by line, each [fqn line]
 (defn- defs-by-file [files]
@@ -132,14 +150,18 @@
   (when (and form-line line)
     (last (filter (fn [[_ l]] (<= form-line l line)) defs))))
 
+;; A line's fn: the fn an inlined copy came from, else the method its form
+;; names (a record's, a defmethod's), else the def it falls in, else the def its
+;; form names, which is how code from -e or the REPL, with no file to find its
+;; defs by, gets one.
 (defn- rows []
-  (let [table (line-table (host/profile-sites))
+  (let [table (line-table (host/profile-sites) (host/profile-retired))
         defs (defs-by-file (distinct (keep first (keys table))))]
-    (for [[[file line] {:keys [hits evals fn-hits fn-evals owner form-line]}] table
+    (for [[[file line] {:keys [hits evals fn-hits fn-evals owner form-line label wins?]}] table
           :when (pos? evals)]
-      (let [d (when (and (pos? fn-evals) (not owner))
+      (let [d (when (and (pos? fn-evals) (not owner) (not wins?))
                 (owning-def (get defs file) form-line line))
-            f (when (pos? fn-evals) (or owner (first d)))]
+            f (when (pos? fn-evals) (or owner (when wins? label) (first d) label))]
         {:file file :line line :hits hits :evals evals
          :fn (some-> f symbol)
          :fn-hits fn-hits :fn-evals fn-evals

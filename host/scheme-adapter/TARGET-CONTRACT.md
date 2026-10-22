@@ -94,7 +94,7 @@ misbehavior, not a crash.
   but note the format contract: raw-traveling nongenerative record layouts
   are image-format surface.
 - **profile**: `sa-profile-instrument!` answers #f for on → `jolt.profile`
-  reports unsupported; the counts are empty and `sa-profile-compile` just
+  reports unsupported; the counts and releases are empty and `sa-profile-compile` just
   calls its thunk.
 - **sample**: `sa-stack-walk` answers #f → `jolt.profile/sample!` reports
   unsupported; frame sources and code names are #f, the thread clock 0.

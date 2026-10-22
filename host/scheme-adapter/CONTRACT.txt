@@ -327,14 +327,17 @@ sa-fasl-read
 # then on, process-wide; sa-profile-compile wraps each runtime compile so the
 # switch reaches every thread; (sa-profile-counts) answers every counter as
 # #(source-name start end count), the counted expression's byte span in the
-# text it was read from; sa-profile-clear! zeroes them. Permitted
+# text it was read from; (sa-profile-release!) gives back the counters of code
+# the collector reclaimed and answers them, in the same shape, with their final
+# counts; sa-profile-clear! zeroes them. Permitted
 # degradation: sa-profile-instrument! answers #f when asked to turn on, and the
-# rest answer nothing (counts '(), compile just calls its thunk) — jolt.profile
+# rest answer nothing (counts and release '(), compile just calls its thunk) — jolt.profile
 # then reports profiling as unsupported on the target.
 sa-profile-instrument!
 sa-profile-instrumenting?
 sa-profile-compile
 sa-profile-counts
+sa-profile-release!
 sa-profile-clear!
 #
 # tier: capability-sample
