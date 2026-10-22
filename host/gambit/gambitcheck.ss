@@ -417,6 +417,7 @@
   (check "sa-profile-instrumenting? fixed #f" (sa-profile-instrumenting?) #f)
   (check "sa-profile-compile calls its thunk" (sa-profile-compile (lambda () 7)) 7)
   (check "sa-profile-counts -> '()" (sa-profile-counts) '())
+  (check "sa-profile-release! -> '()" (sa-profile-release!) '())
   (check "sa-baked-global -> #f always" (sa-baked-global 'jolt-baked-version-early) #f)
   (check "sa-gc-collect no-ops" (sa-gc-collect) #f)
   (check "sa-gc-max-generation 0" (sa-gc-max-generation) 0)

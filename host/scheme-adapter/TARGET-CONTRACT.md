@@ -94,7 +94,7 @@ misbehavior, not a crash.
   but note the format contract: raw-traveling nongenerative record layouts
   are image-format surface.
 - **profile**: `sa-profile-instrument!` answers #f for on → `jolt.profile`
-  reports unsupported; the counts are empty and `sa-profile-compile` just
+  reports unsupported; the counts and releases are empty and `sa-profile-compile` just
   calls its thunk.
 - **threads**: absence is a designed mode, not a raise — THREADS.md specifies
   synchronous agents/futures per construct: what stays observably honest,

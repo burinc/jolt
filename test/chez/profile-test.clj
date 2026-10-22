@@ -70,6 +70,44 @@
 ((resolve 'profile-fixture/fib) 15)
 (check "recompiled uninstrumented" (hits-at (prof/line-counts) 4) nil)
 
+;; Records' and multimethods' methods register no def of their own; they are
+;; named after the form that defines them.
+(prof/instrument!)
+(load-file fixture)
+(prof/clear!)
+;; an eval'd form with no position of its own counts under no file, not under
+;; whatever top-level form ran last (this file's, which is uninstrumented)
+((resolve 'profile-fixture/eval-loop))
+(prof/instrument! false)
+(dotimes [_ 50] ((resolve 'profile-fixture/area) ((resolve 'profile-fixture/->Square) 3)))
+(dotimes [_ 7] ((resolve 'profile-fixture/describe) {:kind :dot :n 1}))
+(def fns2 (prof/fn-counts))
+(check "record method row" (:hits (fn-row fns2 'profile-fixture/Square.area)) 50)
+(check "record method line" (:line (fn-row fns2 'profile-fixture/Square.area)) 18)
+(check "defmethod row" (:hits (fn-row fns2 (symbol "profile-fixture/describe[:dot]"))) 7)
+(def lines2 (prof/line-counts))
+(check "eval'd code is not charged to the caller's form"
+       (some #(and (str/ends-with? (str (:file %)) "profile-test.clj") (> (:hits %) 1)) lines2)
+       nil)
+(check "eval'd code counts under no file"
+       (boolean (some #(and (nil? (:file %)) (= 1001 (:hits %))) lines2)) true)
+
+;; Code that is compiled and dropped gives its counters back, and what they
+;; counted is kept: the defn forms' load-time code is gone after a collection.
+(prof/instrument!)
+(load-file fixture)
+(def before-gc (hits-at (prof/line-counts) 3))
+(dotimes [_ 300] (eval (list 'fn [] (list 'inc 1))))
+(System/gc)
+(def n1 (count (jolt.host/profile-sites)))
+(dotimes [_ 3000] (eval (list 'fn [] (list 'inc 1))))
+(System/gc)
+(def n2 (count (jolt.host/profile-sites)))
+(prof/instrument! false)
+(check "load-time counts survive the collection" (hits-at (prof/line-counts) 3) before-gc)
+(check "dropped code's counters are released" (< n2 (+ n1 100)) true)
+(prof/clear!)
+
 (let [m (prof/measure (reduce + (range 100000)))]
   (check "measure result" (:result m) 4999950000)
   (check "measure fields"

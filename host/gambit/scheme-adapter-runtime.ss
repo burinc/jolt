@@ -509,6 +509,7 @@
 (define (sa-profile-instrumenting?) #f)
 (define (sa-profile-compile thunk) (thunk))
 (define (sa-profile-counts) '())
+(define (sa-profile-release!) '())
 (define (sa-profile-clear!) (if #f #f))
 
 

@@ -353,11 +353,14 @@
 ;; get-datum/annotations a TEXTUAL one, so the text is opened twice over the
 ;; same bytes. The registered marker table is all that survives this call — the
 ;; text itself is transient. Tracing must be on (markers present) when called.
-;; The eval is the compile jolt.profile instruments (sa-profile-compile), and the
-;; form's position goes with the table so a counter can name the file it is in.
-(define (jolt-eval-with-source scm)
+;; The eval is the compile jolt.profile instruments (sa-profile-compile). FORM's
+;; own position goes with the table so a counter can name its file — never the
+;; sticky jolt-current-source, which for a form built at run time is whatever
+;; top-level form ran last — and WRITTEN, the form the user wrote (FORM, or the
+;; macro call it was unrolled from), to name its fn by.
+(define (jolt-eval-with-source scm form written ns)
   (let* ((bv (string->utf8 scm))
-         (name (jolt-register-eval-marker-table! scm (jolt-current-source)))
+         (name (jolt-register-eval-marker-table! scm (hc-form-position form) written ns))
          (sfd (make-source-file-descriptor name (open-bytevector-input-port bv)))
          (ann (call-with-values
                (lambda ()
@@ -720,12 +723,16 @@
 ;; opaque host objects (a #inst Date, a #uuid, a regex, a record, a function) —
 ;; evaluates to itself, as eval does on the JVM. (read-string builds those host
 ;; values eagerly, so eval must accept them without trying to analyze them.)
-(define (jolt-compile-eval-form form ns)
+;; OUTER is the form the user wrote that FORM was unrolled from, a macro call
+;; whose (do ...) expansion it is a child of, or #f. jolt.profile names a form's
+;; code after it: a defrecord's methods are in its children.
+(define (jolt-compile-eval-form form ns) (jolt-compile-eval-form/outer form ns #f))
+(define (jolt-compile-eval-form/outer form ns outer)
   (if (or (cseq? form) (jolt-lazyseq? form) (empty-list-t? form) (symbol-t? form)
           (pvec? form) (pmap? form) (pset? form))
-      (jolt-compile-eval-form* form ns)
+      (jolt-compile-eval-form* form ns outer)
       form))
-(define (jolt-compile-eval-form* form ns)
+(define (jolt-compile-eval-form* form ns outer)
   ;; Written with set-chez-ns! and guarded by a difference test, so this is
   ;; exactly what an (in-ns …) in the form itself would do — including the one
   ;; case where it does nothing: under a (binding [*ns* …]) the current ns
@@ -740,7 +747,7 @@
      (let loop ((fs (cdr (seq->list form))) (result jolt-nil) (cur ns))
        (if (null? fs)
            result
-           (let ((r (jolt-compile-eval-form (car fs) cur)))
+           (let ((r (jolt-compile-eval-form/outer (car fs) cur outer)))
              (loop (cdr fs) r (chez-current-ns))))))
     ;; a macro call whose expansion is a (do ...): unroll the expansion the same
     ;; way (each child re-enters, so nested macro-to-do chains unroll too). The
@@ -749,12 +756,12 @@
     ;; failing :require, say) must still point at the form in the source file.
     ((ce-expand-to-top-do form ns)
      => (lambda (expansion)
-          (jolt-compile-eval-form
+          (jolt-compile-eval-form/outer
             (apply jolt-list
                    (cons (seq-first expansion)
                          (map (lambda (c) (hc-propagate-pos form c))
                               (cdr (seq->list expansion)))))
-            ns)))
+            ns (or outer form))))
     ;; defmacro is compiled like any other form — the analyzer lowers it to a def
     ;; of the expander fn + (mark-macro! …) so subsequent forms expand it. One
     ;; macro-expansion path (no separate spine interception).
@@ -769,7 +776,7 @@
        ;; macros, whose tail sites would otherwise be what a throw here reports.
        (jolt-site-reset!)
        (if (jolt-ce-trace-frames?)
-           (jolt-eval-with-source scm)
+           (jolt-eval-with-source scm form (or outer form) ns)
            (eval (read (open-input-string scm)) (interaction-environment)))))))
 
 ;; Source string -> value (read one form, compile + eval on Chez, in the

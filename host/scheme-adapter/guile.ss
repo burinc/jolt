@@ -185,6 +185,7 @@
 ;;   sa-profile-instrumenting? UNIMPLEMENTED  #f.
 ;;   sa-profile-compile     UNIMPLEMENTED  call the thunk.
 ;;   sa-profile-counts      UNIMPLEMENTED  '().
+;;   sa-profile-release!    UNIMPLEMENTED  '().
 ;;   sa-profile-clear!      UNIMPLEMENTED  no-op.
 
 ;; ---------------------------------------------------------------------------
