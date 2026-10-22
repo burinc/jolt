@@ -128,5 +128,28 @@
 (jolt-tick-set! jolt-tick-slot-poll 0)
 (restore-clients!)
 
+;; --- 8. a client that escapes ----------------------------------------------
+;; The sample client runs with interrupts on, and anything it does can raise: it
+;; allocates, and the collect-request handler raises OutOfMemoryError past the
+;; heap cap. An escape must not leave the dispatcher's firing flag set, which
+;; made every later demand on the thread a write nobody armed the timer for.
+(let ((raised #f) (polls 0))
+  (jolt-tick-client-set! jolt-tick-slot-sample
+    (lambda () (unless raised (set! raised #t) (error 'sampler "out of memory"))))
+  (guard (e (#t #t))
+    (jolt-tick-set! jolt-tick-slot-sample 1000)
+    (spin 1000000))
+  (ok "8. the escaping client ran" raised)
+  (jolt-tick-set! jolt-tick-slot-sample 0)
+  (jolt-tick-client-set! jolt-tick-slot-poll
+    (lambda ()
+      (set! polls (fx+ polls 1))
+      (jolt-tick-set! jolt-tick-slot-poll (if (fx<? polls 20) 1000 0))))
+  (jolt-tick-set! jolt-tick-slot-poll 1000)
+  (spin 2000000)
+  (ok "8. demands still fire after a client escaped" (fx=? polls 20))
+  (ok "8. and the thread settles back to solo" (eq? 0 (jolt-tick-state))))
+(restore-clients!)
+
 (printf "ticks-test: ~a checks, ~a failure(s)\n" total fails)
 (exit (if (fx=? fails 0) 0 1))

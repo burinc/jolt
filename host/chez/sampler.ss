@@ -110,10 +110,13 @@
                     (set! acc (cons (sample-site! r code offset frame) acc)))))
              (frames (let drop ((fs (reverse acc)))
                        (if (and (pair? fs) (sample-plumbing-site? (car fs))) (drop (cdr fs)) fs)))
+             ;; cut when the walk hit its cap, or when the frames left after the
+             ;; plumbing still run past the depth
+             (truncated? (or (fx>=? n cap) (fx>? (length frames) jolt-sample-depth)))
              (frames (if (fx>? (length frames) jolt-sample-depth)
                          (list-head frames jolt-sample-depth)
                          frames))
-             (key (list->vector (if (fx>=? n cap) (append frames (list 'truncated)) frames)))
+             (key (list->vector (if truncated? (append frames (list 'truncated)) frames)))
              (key (vector-map (lambda (s) (if (eq? s 'truncated) sample-truncated-site s)) key)))
         (jolt-with-mutex (sample-rec-mu r)
           (let ((cell (hashtable-ref (sample-rec-stacks r) key #f)))

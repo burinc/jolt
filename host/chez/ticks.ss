@@ -101,9 +101,14 @@
   (let ((s (jolt-tick-state)))
     (if (eq? s 0) #f (vector-ref s slot))))
 
-(define (jolt-tick-demand! s slot n)
+;; The state is read again once interrupts are off. The caller's read came
+;; before this call, which is a timer poll point, and a fire there can move the
+;; thread between solo and multi: a demand written into the vector it left would
+;; be lost, and a second go-multi! would drop the sampler's record.
+(define (jolt-tick-demand! s0 slot n)
   (disable-interrupts)
-  (let ((s (if (eq? s 0) (jolt-tick-go-multi!) s)))
+  (let* ((s (jolt-tick-state))
+         (s (if (eq? s 0) (jolt-tick-go-multi!) s)))
     (if (vector-ref s jolt-tick-firing)
         (vector-set! s slot (if (fx>? n 0) n #f))
         (begin
@@ -194,10 +199,26 @@
          (dp (or (jolt-tick-due? s jolt-tick-slot-poll)
                  (and dq (vector-ref s jolt-tick-slot-poll)
                       (begin (vector-set! s jolt-tick-slot-poll #f) #t)))))
+    ;; The sampler runs with interrupts on, and it can raise (it allocates, and
+    ;; the collect-request handler raises past the heap cap). An escape must not
+    ;; leave firing set, which turns every later demand into a write nobody arms
+    ;; for, nor take the poll and preemption this fire took off the books.
     (when ds
       (vector-set! s jolt-tick-firing #t)
       (enable-interrupts)
-      ((vector-ref jolt-tick-clients jolt-tick-slot-sample))
+      (let ((done #f))
+        (dynamic-wind
+          void
+          (lambda () ((vector-ref jolt-tick-clients jolt-tick-slot-sample)) (set! done #t))
+          (lambda ()
+            (unless done
+              (disable-interrupts)
+              (vector-set! s jolt-tick-firing #f)
+              (jolt-tick-account! s)
+              (when dp (vector-set! s jolt-tick-slot-poll 1))
+              (when dq (vector-set! s jolt-tick-slot-preempt 1))
+              (jolt-tick-arm! s)
+              (enable-interrupts)))))
       (disable-interrupts)
       (vector-set! s jolt-tick-firing #f))
     ;; Armed before the clients that may escape run, so an escape leaves the
@@ -209,5 +230,14 @@
     ;; is queued twice. The next change of demand settles the thread back to solo.
     (jolt-tick-arm*! s (not (or dp dq)))
     (enable-interrupts)
-    (when dp ((vector-ref jolt-tick-clients jolt-tick-slot-poll)))
+    ;; A poll that escapes (run-interruptible's token was set) skips the
+    ;; preemption after it, so with one due the escape puts it back, due at once.
+    (when dp
+      (if dq
+          (let ((done #f))
+            (dynamic-wind
+              void
+              (lambda () ((vector-ref jolt-tick-clients jolt-tick-slot-poll)) (set! done #t))
+              (lambda () (unless done (jolt-tick-preempt! 1)))))
+          ((vector-ref jolt-tick-clients jolt-tick-slot-poll))))
     (when dq ((vector-ref jolt-tick-clients jolt-tick-slot-preempt)))))

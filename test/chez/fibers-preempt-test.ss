@@ -721,6 +721,26 @@
 (ok "14. an interrupt inside a fiber still aborts the body" (unbox rb-aborted))
 (ok "14. and the fiber survives it" (eq? 'done (jolt-fiber-state rb-int)))
 
+;; An interrupt that escapes on a quantum's fire must leave the quantum behind.
+;; The token is set before the borrow, so its first check aborts, and with the
+;; quantum shorter than the poll interval that check runs riding the quantum's
+;; fire. The escape used to skip the preemption the fire had already taken off
+;; the books, and the borrow's exit then left the timer disarmed: the fiber ran
+;; on unpreempted until it next parked.
+(define rb-tok2 (jolt-make-interrupt))
+(define rb-after (box #f))
+(define rb-int2
+  (sa-fiber-spawn
+   (lambda ()
+     (jolt-interrupt! rb-tok2)
+     (guard (e (#t #t))
+       (jolt-run-interruptible rb-tok2 (lambda () (rb-spin RB-N))))
+     (set-box! rb-after (jolt-fiber-preempts))
+     (rb-spin RB-N))))
+(sa-fiber-run-all)
+(ok "14. a fiber is still preempted after an interrupt escaped its borrow"
+    (and (unbox rb-after) (> (jolt-fiber-preempts) (unbox rb-after))))
+
 ;; The poll is gone once the borrow is over, on the REAL exit as well as on a
 ;; park, and the handler is still the tick scheduler's.
 (ok "14. the borrow leaves no poll and the scheduler's handler on the real exit"
