@@ -418,6 +418,8 @@
   (check "sa-profile-compile calls its thunk" (sa-profile-compile (lambda () 7)) 7)
   (check "sa-profile-counts -> '()" (sa-profile-counts) '())
   (check "sa-profile-release! -> '()" (sa-profile-release!) '())
+  (check "sa-block-profile-dump! -> 0" (sa-block-profile-dump! "/nonexistent/p.jpd" "release") 0)
+  (check "sa-block-profile-load-unit! -> #f" (sa-block-profile-load-unit! '() "x.ss") #f)
   (check "sa-stack-walk -> #f" (sa-stack-walk #f 1 (lambda (c o f) #t)) #f)
   (check "sa-frame-source-pair -> #f" (sa-frame-source-pair #f) #f)
   (check "sa-code-name -> #f" (sa-code-name #f) #f)

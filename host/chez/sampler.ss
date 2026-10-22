@@ -265,6 +265,31 @@
                (jolt-sample-start! jolt-sample-interval jolt-sample-depth))
       (jolt-add-shutdown-hook jolt-sample-report-at-exit))))
 
+;; --- jolt build --profile-gen ------------------------------------------------------
+;; A binary built with --profile-gen carries Chez's block counters in every unit,
+;; and they reach a file as it exits, where `jolt build --profile-use` reads them
+;; (build.ss). Every binary's launcher calls this, since the launcher's text has
+;; to be the same in both builds; one with no counters writes nothing. The file
+;; is $JOLT_PROFILE_DATA, or NAME-PID.jpd in the current directory, NAME the
+;; binary's: one per run, so runs over several workloads each leave their own
+;; and the build averages them. TAG is the build mode, which --profile-use has
+;; to match.
+(define (jolt-block-profile-at-exit! tag)
+  (jolt-add-shutdown-hook
+    (lambda ()
+      (let ((path (let ((e (getenv "JOLT_PROFILE_DATA"))
+                        ;; asked of the OS (loader.ss): a binary's argv[0] is empty
+                        (exe (guard (e (#t #f)) (aot-self-exe))))
+                    (if (and (string? e) (not (string=? e "")))
+                        e
+                        (string-append (if (string? exe) (path-last exe) "jolt")
+                                       "-" (number->string (get-process-id)) ".jpd")))))
+        (guard (e (#t (fprintf (current-error-port) "jolt: could not write the block profile ~a: " path)
+                      (display-condition e (current-error-port))
+                      (newline (current-error-port))))
+          (when (fx>? (sa-block-profile-dump! path tag) 0)
+            (fprintf (current-error-port) "jolt: wrote the block profile ~a\n" path)))))))
+
 (define (jolt-sample-report-at-exit)
   (let ((cell (var-cell-lookup "jolt.profile" "sample-report-at-exit")))
     (if (and cell (var-cell-defined? cell))

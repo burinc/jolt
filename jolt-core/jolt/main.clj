@@ -985,6 +985,17 @@
                         (when (= "opt" (first e)) " (optional)")
                         " — " (str/join ", " (rest e)))))))))
 
+(defn- profile-use-files
+  "The files after each --profile-use in ARGS, up to the next flag."
+  [args]
+  (loop [a args, acc []]
+    (cond
+      (empty? a) acc
+      (= "--profile-use" (first a))
+      (let [[fs rest-a] (split-with #(not (str/starts-with? % "-")) (rest a))]
+        (recur rest-a (into acc fs)))
+      :else (recur (rest a) acc))))
+
 (defn- cmd-build [more]
   (let [{:keys [project-paths embed-dirs build] :as resolved}
         (resolve-current)]
@@ -1002,6 +1013,10 @@
                      ;; --boot takes a value; skip both so a bare `build --boot small`
                      ;; does not read `small` as the entry namespace.
                      (and (not end-opts?) (= "--boot" cur))        (recur (drop 2 a) entry out target tpack includes false)
+                     ;; --profile-use takes every file after it, so a shell glob
+                     ;; over several runs' dumps works (profile-use-files)
+                     (and (not end-opts?) (= "--profile-use" cur))
+                     (recur (drop-while #(not (str/starts-with? % "-")) (rest a)) entry out target tpack includes false)
                      ;; --include takes a value too, and repeats; deps.edn
                      ;; :jolt/build {:include [ns …]} is read alongside it below.
                      (and (not end-opts?) (= "--include" cur))
@@ -1151,14 +1166,32 @@
             ;; check (codesign --verify --strict on macOS) correctly refuses.
             ;; No effect on --library (build-shared is always signable) or on
             ;; a --target build (already forced onto this path).
-            signable? (boolean (some #{"--signable"} flag-args))]
+            signable? (boolean (some #{"--signable"} flag-args))
+            ;; --profile-gen builds a binary that writes Chez block counts as it
+            ;; exits; --profile-use FILE... builds with them (RFC 0015 part 2).
+            ;; Passed to the driver as "gen" or the files, resolved like -o.
+            profile-gen? (boolean (some #{"--profile-gen"} flag-args))
+            profile-files (mapv #(if (path-rooted? %) % (str pdir "/" %))
+                                (profile-use-files flag-args))
+            profile (cond
+                      (and profile-gen? (or (seq profile-files) (some #{"--profile-use"} flag-args)))
+                      (throw (ex-info "--profile-gen and --profile-use are two builds: generate first, then use" {}))
+                      profile-gen? "gen"
+                      (some #{"--profile-use"} flag-args)
+                      (do (when (empty? profile-files)
+                            (throw (ex-info "--profile-use needs the profile files a --profile-gen binary wrote" {})))
+                          (doseq [f profile-files]
+                            (when-not (.exists (java.io.File. f))
+                              (throw (ex-info (str "--profile-use: no profile file " f) {:file f}))))
+                          profile-files)
+                      :else nil)]
         (when (and target (nil? target-pack))
           (throw (ex-info "--target needs a target pack: --target-pack DIR (or $JOLT_TARGET_PACK)" {:target target})))
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic nil include-names exclude-resources)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable? include-names exclude-resources))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic nil include-names exclude-resources profile)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode allow-dynamic signable? include-names exclude-resources profile))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
@@ -1254,7 +1287,13 @@
      "                         --include NS bakes a namespace the require scan"
      "                         cannot see (one reached only by a runtime"
      "                         requiring-resolve); repeatable, and"
-     "                         :jolt/build {:include [ns …]} does the same"]]
+     "                         :jolt/build {:include [ns …]} does the same"
+     "              [--profile-gen | --profile-use FILE…]"
+     "                         --profile-gen builds a binary that writes its"
+     "                         block counts to NAME-PID.jpd (or"
+     "                         $JOLT_PROFILE_DATA) as it exits; --profile-use"
+     "                         builds the same sources with those counts, and"
+     "                         fails naming any unit whose code has changed"]]
    ["path"
     ["  path                   print the resolved source roots"]]
    ["tasks"

@@ -510,6 +510,10 @@
 (define (sa-profile-compile thunk) (thunk))
 (define (sa-profile-counts) '())
 (define (sa-profile-release!) '())
+;; no block counters, so no build here can be profile-guided
+(define (sa-block-profile-dump! path tag) 0)
+(define (sa-block-profile-tag path) (error 'sa-block-profile-tag "no block profiles on this target" path))
+(define (sa-block-profile-load-unit! paths src) #f)
 (define (sa-profile-clear!) (if #f #f))
 
 ;; ---- stack sampling (capability: sample) ------------------------------------
