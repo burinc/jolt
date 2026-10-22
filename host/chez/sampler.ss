@@ -126,6 +126,16 @@
                 (hashtable-set! (sample-rec-stacks r) key (vector 1 weight)))))))))
 (define sample-truncated-site (vector -1 "[truncated]" #f))
 
+;; The next tick demand, from the demand PREV just spent, the CPU nanoseconds
+;; SPENT doing it and the nanoseconds REMAINING to the next sample: ticks per
+;; nanosecond as measured, and at most twice PREV. One interval read short (a
+;; clock that did not move, a collection charged to the ticks) must not send the
+;; demand to the ceiling: the tail of a run became one long interval, lost when
+;; sampling stopped, and a 40 ms fn read as 25.
+(define (jolt-sample-next-demand prev remaining spent)
+  (let ((next (if (> spent 0) (quotient (* prev remaining) spent) (* 2 prev))))
+    (max jolt-sample-min-ticks (min jolt-sample-max-ticks (* 2 prev) next))))
+
 ;; The client. Runs on the sampled thread from the tick scheduler's dispatcher.
 (define (jolt-sample-tick)
   (let* ((s (jolt-tick-state))
@@ -145,11 +155,7 @@
                                     (vector-set! r 5 now)
                                     jolt-sample-interval)
                              (- jolt-sample-interval since)))
-              ;; ticks per nanosecond, measured over the demand just spent
-              (next (if (> spent 0)
-                        (quotient (* (vector-ref r 7) remaining) spent)
-                        jolt-sample-max-ticks))
-              (next (max jolt-sample-min-ticks (min jolt-sample-max-ticks next))))
+              (next (jolt-sample-next-demand (vector-ref r 7) remaining spent)))
          (vector-set! r 6 now)
          (vector-set! r 7 next)
          (jolt-tick-set! jolt-tick-slot-sample next))))))
