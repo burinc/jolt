@@ -196,6 +196,13 @@ ns-shaped-name?
 park-until-interrupt
 interrupt-on-sigint!
 pop
+profile-clear!
+profile-defs
+profile-instrument!
+profile-instrumenting?
+profile-retired
+profile-sites
+profile-stats
 protocol-key-of
 protocol-methods
 proxy-super-call

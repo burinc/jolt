@@ -744,11 +744,12 @@
         #f)))
 
 ;; (sa-stats) -> #(cpu-nanos real-nanos gc-count gc-cpu-nanos gc-real-nanos
-;;                gc-bytes)
-;; One statistics snapshot as the six exact-integer fields rt.ss reads into
-;; the jolt.host telemetry vars (time fields pre-converted to nanos). Contract:
-;; the six fields in this order. Degradation: a zero vector — the OTel layer
-;; maps zeros to absent metrics.
+;;                gc-bytes allocated-bytes)
+;; One statistics snapshot as the seven exact-integer fields rt.ss reads into
+;; the jolt.host telemetry vars (time fields pre-converted to nanos).
+;; allocated-bytes is every byte allocated since the process started, freed or
+;; not. Contract: the seven fields in this order. Degradation: a zero vector —
+;; the OTel layer maps zeros to absent metrics.
 (define (sa-stats)
   (let ((s (statistics)))
     (vector (time->nanos (sstats-cpu s))
@@ -756,7 +757,8 @@
             (sstats-gc-count s)
             (time->nanos (sstats-gc-cpu s))
             (time->nanos (sstats-gc-real s))
-            (sstats-gc-bytes s))))
+            (sstats-gc-bytes s)
+            (sstats-bytes s))))
 
 ;; (sa-continuation-frames k) -> list of frame inspectors | '()
 ;; The continuation's frames, innermost first, each an inspector object the
@@ -1550,6 +1552,84 @@
 ;; externals through EXTS. Degradation: raise — same story as sa-fasl-write.
 (define (sa-fasl-read port . rest)
   (apply fasl-read port rest))
+
+;; ---- execution-count profiling (capability: profile) -----------------------
+;; jolt.profile's counters are Chez's compile-profile instrumentation: code
+;; compiled while it is on carries a counter per source-annotated expression, and
+;; profile-dump reads every counter back as (source-object . count).
+;;
+;; (sa-profile-instrument! on?) -> #t | #f
+;; Instrument code compiled from now on (on? true) or stop (false), in every
+;; thread. compile-profile is a THREAD parameter, so setting it here would miss a
+;; loader or future thread forked earlier; the switch is a process-wide flag that
+;; sa-profile-compile reads at each compile instead. Contract: #t when the target
+;; did what was asked. Degradation: #f for on? true — jolt.profile then reports
+;; profiling as unsupported; turning it off always succeeds.
+(define sa-profile-on? #f)
+(define (sa-profile-instrument! on?)
+  (set! sa-profile-on? (and on? #t))
+  #t)
+(define (sa-profile-instrumenting?) sa-profile-on?)
+
+;; (sa-profile-compile thunk) -> thunk's values
+;; Run THUNK, which compiles code (the eval of an emitted form), instrumented when
+;; the flag is on and not when it is off. Bound both ways: the parameter is the
+;; thread's, and an instrumented form that turns the flag off, then compiles
+;; more, must not hand those compiles its own setting; with both off there is
+;; nothing to bind. Contract: THUNK's result
+;; either way. Degradation: call THUNK.
+(define (sa-profile-compile thunk)
+  (if (or sa-profile-on? (compile-profile))
+      (parameterize ((compile-profile (and sa-profile-on? 'source))) (thunk))
+      (thunk)))
+
+;; One profile-dump entry as #(source-name start end count), or #f for a counter
+;; on code that was never annotated (it carries no name).
+(define (sa-profile-entry p)
+  (let* ((so (car p))
+         (path (guard (e (#t #f)) (source-file-descriptor-path (source-object-sfd so)))))
+    (and (string? path)
+         (vector path (source-object-bfp so) (source-object-efp so) (cdr p)))))
+
+;; (sa-profile-counts) -> list of #(source-name start end count)
+;; Every counter in the process, by the source object it was attached to: the
+;; source-name is the sfd path the code was read under, start and end the byte
+;; span of the expression the counter is on. Contract: one entry per live
+;; counter. Degradation: '().
+(define (sa-profile-counts)
+  (fold-left (lambda (acc p) (let ((v (sa-profile-entry p))) (if v (cons v acc) acc)))
+             '()
+             (profile-dump)))
+
+;; (sa-profile-release!) -> list of #(source-name start end count)
+;; Give back the counters of code the collector has reclaimed, and answer them
+;; with their final counts. Chez keeps a counter until it is released, so code
+;; compiled and dropped (an eval in a loop) would otherwise hold its counters,
+;; and their source objects, for the life of the process. The released ones are
+;; the dump before the release less the dump after: a source object is the same
+;; object in both, and two counters can share one (an inlined copy), so it is a
+;; multiset difference. Contract: each released counter once, with the count it
+;; ended with. Degradation: '().
+(define (sa-profile-release!)
+  (let* ((before (profile-dump))
+         (after (begin (profile-release-counters) (profile-dump)))
+         (live (make-eq-hashtable)))
+    (for-each (lambda (p) (hashtable-update! live (car p) fx1+ 0)) after)
+    (fold-left
+      (lambda (acc p)
+        (let ((k (hashtable-ref live (car p) 0)))
+          (if (fx>? k 0)
+              (begin (hashtable-set! live (car p) (fx1- k)) acc)
+              (let ((v (sa-profile-entry p))) (if v (cons v acc) acc)))))
+      '()
+      before)))
+
+;; (sa-profile-clear!) -> void
+;; Zero every counter. Contract: a later sa-profile-counts reads 0 for code that
+;; has not run since. Degradation: no-op.
+(define (sa-profile-clear!)
+  (profile-clear))
+
 
 ;; ---- fibers R1: coroutines tier (capability: coroutines) --------------------
 ;; The fiber primitive + single-carrier scheduler (fibers epic, R1 jolt-nvpr.2).

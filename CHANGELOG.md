@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt.profile`, an execution-count profiler (#1421).** It reads Chez's
+  `compile-profile` counters back by Clojure file, line and fn: turn on
+  `(prof/instrument!)`, load the code, run it, and `(prof/report)` lists the
+  fns that did the most work and the lines that ran most. Counts are exact
+  for code running on one thread; the counters are not atomic, and code
+  running on several threads at once loses many increments.
+  Record, type and protocol-extension methods are named `ns/Type.method` and
+  defmethod bodies `ns/mm[dispatch]`. `(prof/annotate file)` prints the source with each line's count in the
+  margin. `JOLT_PROFILE=1` instruments a whole run and prints the report on
+  stderr at exit. `(prof/measure body)` gives a body's real and cpu time, bytes
+  allocated and collector work.
+
 ### Changed
 
 - **A required namespace's `:file` is its classpath name (#1410).** A def,
