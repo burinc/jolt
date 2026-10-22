@@ -342,11 +342,9 @@
   (lambda (tree cmp k) (let ((t (rb-del cmp tree k))) (if (jolt-nil? t) t (rb-blacken t)))))
 (def-var! "jolt.host" "rbt-key" (lambda (n) (sc-nd-key n)))
 (def-var! "jolt.host" "rbt-val" (lambda (n) (sc-nd-val n)))
-;; the leftmost and rightmost nodes, one spine each: PersistentTreeMap.min/max
+;; the leftmost node, down one spine: PersistentTreeMap.min
 (def-var! "jolt.host" "rbt-leftmost"
   (lambda (n) (let loop ((n n)) (let ((l (sc-nd-left n))) (if (jolt-nil? l) n (loop l))))))
-(def-var! "jolt.host" "rbt-rightmost"
-  (lambda (n) (let loop ((n n)) (let ((r (sc-nd-right n))) (if (jolt-nil? r) n (loop r))))))
 
 ;; --- the in-order walk over the red-black tree -------------------------------
 ;; Over the nodes above; nil children are jolt-nil. The walk is Clojure's PersistentTreeMap$Seq: a stack

@@ -182,6 +182,14 @@ make-thread-local
 map-entry
 mark-spliced!
 maximum-memory-bytes
+rbt-delete
+rbt-found
+rbt-insert
+rbt-key
+rbt-leftmost
+rbt-lookup
+rbt-replace
+rbt-val
 reset-maximum-memory-bytes!
 gc-trip-bytes
 gc-old-growth-bytes
