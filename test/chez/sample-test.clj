@@ -1,6 +1,7 @@
 ;; jolt.profile sampling gate — the sampler over the per-thread tick scheduler.
 ;; hot spins three times as long as cold, both under driver, so their shares of
-;; the samples are compared with each other rather than with a wall clock.
+;; the samples are compared with each other rather than with a wall clock. They
+;; alternate (sample_fixture.clj), so noise in the clock lands on both.
 ;; Run: bin/jolt run test/chez/sample-test.clj (smoke.sh greps "SAMPLE-TEST OK").
 (ns sample-test
   (:require [clojure.string :as str]
@@ -21,7 +22,7 @@
 (check "not sampling at start" (prof/sampling?) false)
 (check "sample! starts" (prof/sample! {:interval-ms 1}) true)
 (check "sampling after sample!" (prof/sampling?) true)
-(driver n)
+(driver (* 2 n))
 (prof/stop-sampling!)
 (check "stopped" (prof/sampling?) false)
 
@@ -96,3 +97,6 @@
   (println "SAMPLE-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
       (println "SAMPLE-TEST FAILED:" (count @failures))))
+;; the future above leaves a pool thread behind, which the exit waits on for its
+;; keep-alive, as the JVM's does
+(shutdown-agents)
