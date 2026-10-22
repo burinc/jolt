@@ -36,7 +36,9 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 echo "jvm-gap gate: jolt $("$jolt" --version 2>/dev/null || echo '?')"
-echo "jvm-gap gate: $(java -version 2>&1 | head -1)"
+# the JDK the clojure launcher runs, which is JAVA_CMD when set (setup-chez
+# points it at JDK 21 while an older java stays first on the runner's PATH)
+echo "jvm-gap gate: $("${JAVA_CMD:-java}" -version 2>&1 | head -1)"
 echo "jvm-gap gate: min of $rounds timed runs per side, fail above ${max}x the JVM"
 echo
 
