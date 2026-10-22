@@ -1575,10 +1575,13 @@
 ;; Run THUNK, which compiles code (the eval of an emitted form), instrumented when
 ;; the flag is on and not when it is off. Bound both ways: the parameter is the
 ;; thread's, and an instrumented form that turns the flag off, then compiles
-;; more, must not hand those compiles its own setting. Contract: THUNK's result
+;; more, must not hand those compiles its own setting; with both off there is
+;; nothing to bind. Contract: THUNK's result
 ;; either way. Degradation: call THUNK.
 (define (sa-profile-compile thunk)
-  (parameterize ((compile-profile (and sa-profile-on? 'source))) (thunk)))
+  (if (or sa-profile-on? (compile-profile))
+      (parameterize ((compile-profile (and sa-profile-on? 'source))) (thunk))
+      (thunk)))
 
 ;; One profile-dump entry as #(source-name start end count), or #f for a counter
 ;; on code that was never annotated (it carries no name).
