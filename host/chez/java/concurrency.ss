@@ -3009,14 +3009,25 @@
 ;; which is the spurious wake every waiter here already re-checks for. The depth is
 ;; read without the mutex, as a hint: whatever it says, the caller re-polls under
 ;; the mutex. Called and returning with the mutex HELD.
+;;
+;; NOT while delayed tasks are pending (a scheduled pool's st 13), and a schedule
+;; landing during the spin ends it. An idle worker is what times the delayed head
+;; (executor-idle-wait!'s leader), and executor-lead-handoff! / a schedule signal
+;; the condition for one when the idle count says one is parked: a spinner in
+;; that count is not parked, so the signal reached nobody and the head went
+;; untimed — periodic tasks skipped runs and missed their cancellation at
+;; shutdown (the corpus's scheduleAtFixedRate rows).
 (define (executor-idle-spin! st)
-  (let ((mu (vector-ref st 2)))
-    (vector-set! st 9 (fx+ (vector-ref st 9) 1))
-    (jolt-unlock! mu)
-    (let ((found (task-spin-until (lambda () (or (fx>? (vector-ref st 10) 0) (vector-ref st 0))))))
-      (jolt-lock! mu)
-      (vector-set! st 9 (fx- (vector-ref st 9) 1))
-      found)))
+  (and (null? (vector-ref st 13))
+       (let ((mu (vector-ref st 2)))
+         (vector-set! st 9 (fx+ (vector-ref st 9) 1))
+         (jolt-unlock! mu)
+         (let ((found (task-spin-until
+                        (lambda () (or (fx>? (vector-ref st 10) 0) (vector-ref st 0)
+                                       (pair? (vector-ref st 13)))))))
+           (jolt-lock! mu)
+           (vector-set! st 9 (fx- (vector-ref st 9) 1))
+           found))))
 ;; A worker that dies must not take the pool's accounting with it. Everything a
 ;; TASK can throw is already caught at the task (submit's future keeps it, execute
 ;; reports it), so reaching this handler means the queue mechanics threw — which
