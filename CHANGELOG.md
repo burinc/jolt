@@ -39,6 +39,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit's code, or comes from a build in another mode, fails the build naming
   the unit, rather than being ignored. Profiled units never share a build
   cache entry with plain ones.
+- **`java.util.EnumSet` and `java.util.EnumMap`.** `EnumSet/of`, `noneOf`,
+  `allOf`, `range`, `copyOf` and `complementOf` build a mutable set ordered by
+  ordinal (a `java.util.RegularEnumSet`, or `JumboEnumSet` past 64 constants),
+  and `(EnumMap. Class)` / `(EnumMap. map)` a mutable map ordered by its keys'
+  ordinals, with live `keySet`, `values` and `entrySet` views. Both refuse a
+  null or foreign element the way the JDK does, and print and compare as a set
+  and a map.
+- **`jolt.host/register-enum!` declares an enum class from a library.**
+  `(jolt.host/register-enum! "my.Color" [["RED" red] ["GREEN" green]])` gives
+  the class `values`, `valueOf`, `Class.isEnum`, `getEnumConstants`,
+  `Enum/valueOf`, `java.lang.Enum`'s instance methods for any method the values
+  do not answer themselves, and the JVM's print form. The java.time enums
+  (`Month`, `DayOfWeek`, `ChronoUnit`, `ChronoField`) are declared this way.
+- **`java.util.LinkedHashMap` and `java.util.LinkedHashSet`.** Both keep
+  insertion order. An access-ordered `LinkedHashMap` (the three-argument
+  constructor with `true`) raises `UnsupportedOperationException`.
 
 ### Changed
 
@@ -53,6 +69,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Enums have `values` and `valueOf` (#1433).** The JDK enums jolt provides
+  (`TimeUnit`, `Future$State`, `Thread$State`, `RoundingMode`,
+  `Normalizer$Form`, `StandardOpenOption`, `StandardCopyOption`, `LinkOption`,
+  `FileVisitOption`, `FileVisitResult`, `PosixFilePermission`) had their
+  constants and nothing else. Each now answers `values` (a fresh array of its
+  class), `valueOf` with the JVM's messages, `Class.isEnum` and
+  `getEnumConstants` (which every class answers now), `Enum/valueOf`, and
+  `name`, `ordinal`, `compareTo` (a `ClassCastException` for another enum's
+  constant), `getDeclaringClass`, `equals` and `hashCode`. Constants are
+  `Serializable`, carry the enum's modifiers, print as
+  `#object[java.util.concurrent.TimeUnit 0x1b2c3d4e "DAYS"]`, and survive a
+  `jolt.image` round trip as the same constant. The lists are the JDK's, in its
+  order: `StandardOpenOption` gains `DELETE_ON_CLOSE`, `SPARSE`, `SYNC` and
+  `DSYNC`, which the `Files` streams and `FileChannel/open` now honor, and
+  `newInputStream` refuses `WRITE` and `APPEND`. A `RoundingMode` constant was a
+  string, equal to `"HALF_UP"`.
+- **java.time's enums are enums.** `(DayOfWeek/values)` was a vector,
+  `(DayOfWeek/of 1)` a new object equal to `DayOfWeek/MONDAY` but not identical
+  to it, and a constant printed bare. Each constant is now one object, `values`
+  is an array, they print like the JVM's, `ChronoUnit` and `ChronoField` render
+  their JDK names (`HalfDays`, `AmPmOfDay`), and `Month/of` and `DayOfWeek/of`
+  refuse an out-of-range value with `DateTimeException`.
+- **`print` of a host object leaves its content unquoted**, as
+  `#object[java.io.File /tmp/x]`, where it printed the `pr` form.
+- **A `java.util.HashSet` has `.iterator` and answers `contains?`.**
 - **A transaction no longer holds a lock while its code runs.** Every `dosync`
   ran under one global lock, so a body that waited on another thread's
   transaction hung: `(dosync @(future (dosync (ref 1))))` never returned. The

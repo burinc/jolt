@@ -3049,9 +3049,15 @@
 (define (set-iface-default-hook! f)
   (set! iface-default-hook f))
 
+(define enum-method-hook #f)
+
+(define (set-enum-method-hook! f) (set! enum-method-hook f))
+
 (define (dispatch-miss obj method-name args)
-  (let ((d (and iface-default-hook
-                (iface-default-hook obj method-name (length args)))))
+  (let ((d (or (and enum-method-hook
+                    (enum-method-hook obj method-name (length args)))
+               (and iface-default-hook
+                    (iface-default-hook obj method-name (length args))))))
     (if d
         (apply d obj args)
         (let ((f (and class-ext-fallback-hook

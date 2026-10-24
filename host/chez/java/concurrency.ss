@@ -49,10 +49,6 @@
 (define (make-time-unit nm nanos) (make-jhost "time-unit" (vector nm nanos)))
 (define (time-unit? x) (and (jhost? x) (string=? (jhost-tag x) "time-unit")))
 (define (time-unit-scale u) (vector-ref (jhost-state u) 1))
-(define (time-unit-ordinal u)
-  (let loop ((us time-unit-nanos) (i 0))
-    (if (string=? (caar us) (vector-ref (jhost-state u) 0)) i (loop (cdr us) (+ i 1)))))
-
 ;; JVM conversions TRUNCATE toward zero (SECONDS.toMinutes(90) is 1).
 (define (tu-convert self n per)
   (quotient (* (jnum->exact n) (time-unit-scale self)) per))
@@ -79,8 +75,7 @@
 
 (define time-unit-constants
   (map (lambda (p) (cons (car p) (make-time-unit (car p) (cdr p)))) time-unit-nanos))
-(register-class-statics! "TimeUnit" time-unit-constants)
-(register-class-statics! "java.util.concurrent.TimeUnit" time-unit-constants)
+(register-enum-class! "java.util.concurrent.TimeUnit" time-unit-constants)
 (register-host-methods! "time-unit"
   (list (cons "toNanos"   (lambda (self n) (tu-convert self n 1)))
         (cons "toMicros"  (lambda (self n) (tu-convert self n 1000)))
@@ -102,20 +97,7 @@
                                         (/ (* n (time-unit-scale self)) 1000000)
                                         n))
                                   jolt-nil))))
-        (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))
-        ;; TimeUnit is an enum: declared NANOSECONDS..DAYS, ordered by that
-        ;; ordinal, and Enum.compareTo is the ordinal difference
-        (cons "ordinal"   (lambda (self) (time-unit-ordinal self)))
-        (cons "compareTo" (lambda (self other)
-                            (unless (time-unit? other)
-                              (throw-jvm 'ClassCastException
-                                         (string-append "class " (jolt-class-name other)
-                                                        " cannot be cast to class java.util.concurrent.TimeUnit")))
-                            (- (time-unit-ordinal self) (time-unit-ordinal other))))))
-;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its
-;; name on the JVM, where the generic host-object fallback prints #object[…].
-(register-str-render! time-unit? (lambda (u) (vector-ref (jhost-state u) 0)))
+        (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))))
 
 ;; --- futures ----------------------------------------------------------------
 ;; A future is a mutable cell guarded by `mu`; workers/derefs coordinate on `cv`.
@@ -2546,26 +2528,7 @@
 ;; the fiber layer answers its state name here ("WAITING" while it is parked, say),
 ;; or #f to fall through to the OS-thread answer.
 (define jolt-thread-state-hook (lambda (th) #f))
-(let ((statics (append thread-state-constants
-                       (list (cons "values" (lambda () (apply jolt-vector (map cdr thread-state-constants))))
-                             (cons "valueOf"
-                                   (lambda (nm)
-                                     (let ((hit (assoc (jolt-final-str nm) thread-state-constants)))
-                                       (if hit
-                                           (cdr hit)
-                                           (throw-jvm 'IllegalArgumentException
-                                                      (string-append "No enum constant java.lang.Thread.State."
-                                                                     (jolt-final-str nm)))))))))))
-  (register-class-statics! "java.lang.Thread$State" statics)
-  (register-class-statics! "Thread$State" statics))
-(register-host-methods! "thread-state"
-  (list (cons "name" (lambda (self) (jhost-state self)))
-        (cons "toString" (lambda (self) (jhost-state self)))
-        (cons "ordinal" (lambda (self)
-          (let loop ((ns thread-state-names) (i 0))
-            (if (string=? (car ns) (jhost-state self)) i (loop (cdr ns) (+ i 1))))))))
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "thread-state")))
-                      (lambda (x) (jhost-state x)))
+(register-enum-class! "java.lang.Thread$State" thread-state-constants)
 
 ;; --- java.lang.management.ThreadMXBean (the current thread's CPU clock) -----
 ;; ManagementFactory/getThreadMXBean, for what callers time with it: the CPU time
@@ -4435,13 +4398,7 @@
   (map (lambda (nm) (cons nm (make-jhost "future-state" nm)))
        '("RUNNING" "SUCCESS" "FAILED" "CANCELLED")))
 (define (future-state nm) (cdr (assoc nm future-state-constants)))
-(register-class-statics! "java.util.concurrent.Future$State" future-state-constants)
-(register-class-statics! "Future$State" future-state-constants)
-(register-host-methods! "future-state"
-  (list (cons "name" (lambda (self) (jhost-state self)))
-        (cons "toString" (lambda (self) (jhost-state self)))))
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "future-state")))
-                      (lambda (x) (jhost-state x)))
+(register-enum-class! "java.util.concurrent.Future$State" future-state-constants)
 
 (define (cf-to-string self)
   (let* ((st (jhost-state self))

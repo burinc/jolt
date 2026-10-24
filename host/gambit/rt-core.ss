@@ -897,10 +897,11 @@
 ;; (pr x) vs (print x) difference on the JVM. The identity hash is omitted, as
 ;; jolt omits it in the print arms it already has.
 (define (jolt-object-content x)
-  (let loop ((rs str-render-registry))
-    (cond ((null? rs) #f)
-          (((caar rs) x) ((cdar rs) x))
-          (else (loop (cdr rs))))))
+  (or (str-render-by-identity x)
+      (let loop ((rs str-render-registry))
+        (cond ((null? rs) #f)
+              (((caar rs) x) ((cdar rs) x))
+              (else (loop (cdr rs)))))))
 ;; The class a value reports. This host has no class model, so the answer is no
 ;; class: jolt-object-repr below prints the value plainly, and the last arm of
 ;; value-host-tags (records-gambit.ss, from host/chez/protocols.ss) leaves it a
@@ -910,13 +911,21 @@
 ;; Chez): the count of any array-like, nil refused — post-prelude names it.
 (define (jolt-alength a)
   (if (jolt-nil? a) (error 'alength "null") (jolt-count a)))
+;; A value whose print form carries its identity hash (rt.ss on Chez, where the
+;; enum model sets it); no value on this host asks.
+(define jolt-object-repr-hash? (lambda (x) #f))
 (define (jolt-object-repr x readable?)
-  (let ((cls (guard (e (#t #f)) (jolt-class-name x)))
-        (content (guard (e (#t #f)) (jolt-object-content x))))
-    (cond ((not (string? cls)) (format "~a" x))
-          ((not (string? content)) (string-append "#object[" cls "]"))
-          (readable? (string-append "#object[" cls " \"" (jolt-str-escape content) "\"]"))
-          (else (string-append "#object[" cls " " content "]")))))
+  (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
+         (content (guard (e (#t #f)) (jolt-object-content x)))
+         (head (and (string? cls)
+                    (if (jolt-object-repr-hash? x)
+                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
+                        (string-append "#object[" cls)))))
+    (cond ((not head) (format "~a" x))
+          ((not (string? content)) (string-append head "]"))
+          ((and readable? (jolt-pr-readable?))
+           (string-append head " \"" (jolt-str-escape content) "\"]"))
+          (else (string-append head " " content "]")))))
 
 (define (jolt-pr-str-base/readable x readable?)
   (cond

@@ -2684,21 +2684,30 @@
 ;; Content is the value's str rendering, taken STRAIGHT from the str registry
 ;; rather than through jolt-str-render-one, whose own fallback is this function —
 ;; going through it would recurse. Types with no str arm print bare, like the
-;; JVM's default Object.toString. readable? quotes the content, which is the
-;; (pr x) vs (print x) difference on the JVM. The identity hash is omitted, as
-;; jolt omits it in the print arms it already has.
+;; JVM's default Object.toString. readable? quotes the content unless
+;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The identity hash is included only
+;; where jolt-object-repr-hash? (below) asks for it.
 (define (jolt-object-content x)
-  (let loop ((rs str-render-registry))
-    (cond ((null? rs) #f)
-          (((caar rs) x) ((cdar rs) x))
-          (else (loop (cdr rs))))))
+  (or (str-render-by-identity x)
+      (let loop ((rs str-render-registry))
+        (cond ((null? rs) #f)
+              (((caar rs) x) ((cdar rs) x))
+              (else (loop (cdr rs)))))))
+;; A value whose print form carries its identity hash, as the JVM's always does:
+;; #object[cls 0xHASH content]. The java layer's enum model sets it.
+(define jolt-object-repr-hash? (lambda (x) #f))
 (define (jolt-object-repr x readable?)
-  (let ((cls (guard (e (#t #f)) (jolt-class-name x)))
-        (content (guard (e (#t #f)) (jolt-object-content x))))
-    (cond ((not (string? cls)) (format "~a" x))
-          ((not (string? content)) (string-append "#object[" cls "]"))
-          (readable? (string-append "#object[" cls " \"" (jolt-str-escape content) "\"]"))
-          (else (string-append "#object[" cls " " content "]")))))
+  (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
+         (content (guard (e (#t #f)) (jolt-object-content x)))
+         (head (and (string? cls)
+                    (if (jolt-object-repr-hash? x)
+                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
+                        (string-append "#object[" cls)))))
+    (cond ((not head) (format "~a" x))
+          ((not (string? content)) (string-append head "]"))
+          ((and readable? (jolt-pr-readable?))
+           (string-append head " \"" (jolt-str-escape content) "\"]"))
+          (else (string-append head " " content "]")))))
 
 (define (jolt-pr-str-base/readable x readable?)
   (cond
@@ -3002,12 +3011,14 @@
 ;; ascii-string-down, re-split, str-split-drop-trailing) + the regex-t accessors.
 (load "host/chez/java/java-parse.ss")           ; Long/parseLong & co: the NumberFormatException family (shared)
 (load "host/chez/java/host-static.ss")          ; registries + jhost + the emit entry points
+(load "host/chez/java/enums.ss")                ; the enum model every enum shim declares through
 (load "host/chez/java/string-builder.ss")       ; StringBuilder/StringBuffer over jhost (shared)
 (load "host/chez/java/text-normalize.ss")       ; java.text.Normalizer's quick-check fast paths
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
 (load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
 (load "host/chez/java/tree-map.ss")            ; TreeMap / TreeSet + Comparator objects (shared)
+(load "host/chez/java/enum-colls.ss")           ; EnumSet / EnumMap over the enum model
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
 ;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
 ;; Self-contained; ahead of byte-buffer.ss, which encodes floats with them.

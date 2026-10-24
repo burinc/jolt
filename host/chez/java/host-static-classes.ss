@@ -633,8 +633,15 @@
 ;; be map-like through one of them and opaque through another.
 (define (hm-hashmap? x)
   (and (jhost? x)
+       ;; by the tag's first character first: this answers every count, seq and
+       ;; get arm walk that passes over the family, so a miss costs one compare
        (let ((t (jhost-tag x)))
-         (or (string=? t "hashmap") (string=? t "properties")))))
+         (and (fx>? (string-length t) 0)
+              (case (string-ref t 0)
+                ((#\h) (string=? t "hashmap"))
+                ((#\l) (string=? t "linkedhashmap"))
+                ((#\p) (string=? t "properties"))
+                (else #f))))))
 (define (hm-copy-into-ordered! self src)  ; copy a jolt map or hashmap, keeping insertion order
   (if (hm-hashmap? src)
       (for-each (lambda (k)
@@ -742,6 +749,24 @@
                                (hm-keys-ordered self)))))
         (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))))
 (register-host-methods! "hashmap" hashmap-methods)
+;; java.util.LinkedHashMap: the HashMap shim already iterates in insertion order,
+;; so it differs only in the class it reports. An access-ordered one (the
+;; three-argument constructor with true) reorders on every read, which the shim
+;; does not do, so it is refused rather than built insertion-ordered.
+(alias-host-methods! "linkedhashmap" "hashmap")
+(let ((ctor (case-lambda
+              (() (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '())))
+              ((x)
+               (let ((self (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '()))))
+                 (unless (number? x) (hm-copy-into-ordered! self x))
+                 self))
+              ((cap lf) (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '())))
+              ((cap lf access-order?)
+               (when (jolt-truthy? access-order?)
+                 (throw-jvm 'UnsupportedOperationException "access-ordered LinkedHashMap"))
+               (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '()))))))
+  (register-class-ctor! "LinkedHashMap" ctor)
+  (register-class-ctor! "java.util.LinkedHashMap" ctor))
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
 ;; a DEFAULTS chain. The JVM is precise about which operations see that chain:
@@ -1046,19 +1071,31 @@
 
 ;; A mutable set over the same value-keyed hashtable (element -> #t).
 ;; Constructors: () | (capacity) [ignored] | (coll) [copy].
-(define (hs-hashset? x) (and (jhost? x) (string=? (jhost-tag x) "hashset")))
+(define (hs-hashset? x)
+  (and (jhost? x)
+       (let ((t (jhost-tag x)))
+         (and (fx>? (string-length t) 0)
+              (case (string-ref t 0)
+                ((#\h) (string=? t "hashset"))
+                ((#\l) (string=? t "linkedhashset"))
+                (else #f))))))
 (define (hs->list self) (hm-keys-ordered self))
-(let ((ctor (lambda args
-              (let* ((ht (make-hashtable hm-hash jolt=2))
-                     (self (make-jhost "hashset" (vector ht '()))))
-                (when (and (pair? args) (not (number? (car args))))
-                  (for-each (lambda (e)
-                              (hm-note-key! self e)
-                              (hashtable-set! ht e #t))
-                            (seq->list (jolt-seq (car args)))))
-                self))))
-  (register-class-ctor! "HashSet" ctor)
-  (register-class-ctor! "java.util.HashSet" ctor))
+;; LinkedHashSet is the same set under its own class: this one already iterates
+;; in insertion order.
+(define (hs-ctor tag)
+  (lambda args
+    (let* ((ht (make-hashtable hm-hash jolt=2))
+           (self (make-jhost tag (vector ht '()))))
+      (when (and (pair? args) (not (number? (car args))))
+        (for-each (lambda (e)
+                    (hm-note-key! self e)
+                    (hashtable-set! ht e #t))
+                  (seq->list (jolt-seq (car args)))))
+      self)))
+(register-class-ctor! "HashSet" (hs-ctor "hashset"))
+(register-class-ctor! "java.util.HashSet" (hs-ctor "hashset"))
+(register-class-ctor! "LinkedHashSet" (hs-ctor "linkedhashset"))
+(register-class-ctor! "java.util.LinkedHashSet" (hs-ctor "linkedhashset"))
 (register-host-methods! "hashset"
   (list (cons "add" (lambda (self x) (let ((had (hashtable-contains? (hm-tbl self) x)))
                                         (hm-note-key! self x)
@@ -1067,6 +1104,7 @@
                                            (hashtable-delete! (hm-tbl self) x)
                                            (hm-drop-key! self x) (if had #t #f))))
         (cons "contains" (lambda (self x) (if (hashtable-contains? (hm-tbl self) x) #t #f)))
+        (cons "iterator" (lambda (self) (make-jiterator (list->cseq (hs->list self)))))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
@@ -1084,6 +1122,7 @@
                                            (hm-drop-key! self x)))
                                        xs)
                              (not (fx=? (length keep) (length xs))))))))
+(alias-host-methods! "linkedhashset" "hashset")
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
 
 ;; the HashMap family and HashSet are a java.util.Map / Set to =, hash, pr, str
@@ -1096,8 +1135,10 @@
   (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
        (hm-keys-ordered self)))
 (register-jutil-coll! "hashmap" 'map hm-entries)
+(register-jutil-coll! "linkedhashmap" 'map hm-entries)
 (register-jutil-coll! "properties" 'map hm-entries)
 (register-jutil-coll! "hashset" 'set hs->list)
+(register-jutil-coll! "linkedhashset" 'set hs->list)
 (register-jutil-coll! "arraylist" 'ralist al->list)
 (register-jutil-coll! "linkedlist" 'list al->list)
 (register-jutil-coll! "arraydeque" 'coll al->list)
@@ -3258,6 +3299,8 @@
 ;; jolt-count that duplicated the hashmap arm.
 (register-count-arm! al-family? (lambda (c) (al-cnt c)))
 (register-count-arm! hs-hashset? (lambda (c) (hashtable-size (hm-tbl c))))
+;; contains? on a java.util.Set is Set.contains (RT.contains)
+(register-contains-arm! hs-hashset? (lambda (c k) (if (hashtable-contains? (hm-tbl c) k) #t #f)))
 ;; IEditableCollection / ITransient* answer from the representation: the
 ;; transient-able persistent collections are editable; a transient reports its
 ;; kind's interfaces. Widening only — anything else passes to the other arms.

@@ -178,6 +178,7 @@
     ("Compiler" "eval" 1 2)
     ("CompletableFuture" "allOf" varargs)
     ("CompletableFuture" "anyOf" varargs)
+    ("EnumSet" "of" varargs)
     ("Executors" "newCachedThreadPool" 0 1)
     ("Executors" "newFixedThreadPool" 1 2)
     ("Executors" "newScheduledThreadPool" 1 2)

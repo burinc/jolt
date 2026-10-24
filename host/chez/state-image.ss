@@ -108,7 +108,11 @@
       ;; is a two-predicate check and runs before the table lookup, so this costs
       ;; a walked value nothing it did not already pay (jolt-2cny).
       (jns? x)
-      (and (code-value? x) (proc-name-of x) #t)))
+      (and (code-value? x) (proc-name-of x) #t)
+      ;; An enum constant (java/enums.ss) is ONE object per name: a fasl copy is
+      ;; a value no table knows, equal to nothing. It travels as its class and
+      ;; name, like a keyword.
+      (enum-constant? x)))
 
 ;; A record's fields for image purposes: its own AND every parent's, root first —
 ;; the order record-constructor takes them in. record-type-field-names reports only
@@ -333,6 +337,7 @@
       ;; would be a SECOND `user` that merely = the live one, where find-ns is
       ;; identity-stable and a var round-trips to the identical var (jolt-ji1h)
       ((jns? x) (list 'ns (jns-name x)))
+      ((enum-constant? x) (list 'enum (enum-info-fqn (car (enum-of x))) (enum-name x)))
       ;; A named fn travels as its var's name. So does any other CODE value some
       ;; var roots -- a multimethod, a reify -- which is not a procedure but is
       ;; equally something the restoring build already has (rt.ss code-value?).
@@ -354,6 +359,13 @@
     ;; back through the intern table, so the restored keyword IS the live one
     ((kw) (keyword (cadr d) (caddr d)))
     ((ns) (intern-ns! (cadr d)))
+    ((enum)
+     (let ((info (enum-class-info (cadr d))))
+       (if info
+           (enum-value-of info (caddr d))
+           (jolt-throw (jolt-ex-info (string-append "image: no enum " (cadr d)
+                                                    " in this build to restore " (caddr d))
+                                     empty-pmap)))))
     ((fn-ref)
      (let ((c (var-cell-lookup (cadr d) (caddr d))))
        (if (and c (not (jolt-var-unbound? (var-cell-root c))))
@@ -1113,6 +1125,10 @@
                    (lambda (m) (if rebuild? m #t)))
                   (else
                    (cond
+                     ;; an enum constant stays in place and is written by name
+                     ;; (image-encode-external); restored, it is the live one
+                     ((enum-constant? x)
+                      (if rebuild? (begin (hashtable-set! memo x x) x) #t))
                      ;; R3 read side: image-owned records rebuild first, before
                      ;; user handlers could claim them. A stored fn source record
                      ;; becomes a live closure; a stored handler payload is handed
