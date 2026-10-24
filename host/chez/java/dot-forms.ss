@@ -82,6 +82,18 @@
 (define (sorted-comparator-of sc)
   (let ((f (jolt-ref-get sc sorted-cmp-fn-kw)))
     (if (jolt-nil? f) rt-default-comparator f)))
+;; Number.intValue of a comparator fn's answer, as AFunction.compare takes it: a
+;; double truncates toward zero and saturates (NaN is 0), an integer keeps its low
+;; 32 bits.
+(define (fn-compare-int r)
+  (define (low32 n)
+    (let ((m (modulo n 4294967296))) (if (>= m 2147483648) (- m 4294967296) m)))
+  (cond ((and (exact? r) (integer? r)) (low32 r))
+        ((exact? r) (low32 (truncate r)))
+        ((not (= r r)) 0)
+        ((>= r 2147483647.0) 2147483647)
+        ((<= r -2147483648.0) -2147483648)
+        (else (exact (truncate r)))))
 (define (sorted-iface-method? m)
   (or (string=? m "comparator") (string=? m "entryKey")
       (string=? m "seqFrom") (string=? m "seq")))
@@ -191,10 +203,9 @@
         ((and (procedure? obj) (string=? mname "compare") (pair? rest) (pair? (cdr rest)))
          (let ((a (car rest)) (b (cadr rest)))
            (let ((r (jolt-invoke obj a b)))
-             (cond ((not (boolean? r)) r)
-                   (r -1)
-                   ((jolt-truthy? (jolt-invoke obj b a)) 1)
-                   (else 0)))))
+             (cond ((boolean? r) (cond (r -1) ((jolt-truthy? (jolt-invoke obj b a)) 1) (else 0)))
+                   ((real? r) (fn-compare-int r))
+                   (else r)))))
         ;; (.run f) / (.call f): a fn is a Runnable and a Callable — AFn.run and
         ;; AFn.call invoke it with no arguments — so an Executor handed a fn as
         ;; its task runs it this way. run answers nil, call the fn's value.

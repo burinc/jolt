@@ -160,9 +160,11 @@
        ;; box, so .isInterrupted / Thread/interrupted inside the worker and the
        ;; cancel from outside are ONE flag (the shape jolt#727 fixed for Thread.).
        (adopt-interrupt-box! ibox)
-       (name-pool-thread! 'send-off)
        (dyn-binding-stack snap)
-       (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+       (let* ((slot (agent-pool-take! 'send-off))
+              (_ (jolt-thread-name-set! (get-thread-id) (agent-pool-thread-name 'send-off slot)))
+              (r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+         (agent-pool-give! 'send-off slot)
          (jolt-with-mutex (jolt-future-mu f)
            (unless (jolt-future-done? f)            ; not already cancelled
              (jolt-future-ok?-set! f (car r))
@@ -171,6 +173,21 @@
            (jolt-cv-wake! (jolt-future-cv f)))
          (exit-linger-after-task!))))
     f))
+
+;; The STM's waits (refs.ss): a transaction blocked by another one's claim waits
+;; on that one's latch, a mutex and a jolt-cv, for a bounded time; the owner
+;; releases it when it finishes or is killed. The clock times barging.
+(set! stm-now-ms (lambda () (quotient (mono-nanos) 1000000)))
+(set! stm-make-latch (lambda () (vector (make-mutex) (jolt-make-cv) #f)))
+(set! stm-latch-wait
+  (lambda (l ms)
+    (jolt-cv-wait (vector-ref l 0) (vector-ref l 1) (mono-deadline ms)
+      (lambda (timed-out?) (if (or timed-out? (vector-ref l 2)) #t jolt-cv-again)))))
+(set! stm-latch-release!
+  (lambda (l)
+    (jolt-with-mutex (vector-ref l 0)
+      (vector-set! l 2 #t)
+      (jolt-cv-wake! (vector-ref l 1)))))
 
 ;; Wrap a task's captured throw in an ExecutionException, the original as the
 ;; cause so ex-cause and .getCause both reach it. One helper for every place a
@@ -457,19 +474,27 @@
 
 ;; The agent system's pool threads carry the names the JVM's thread factories give
 ;; them: send runs on clojure-agent-send-pool-N, send-off and future on
-;; clojure-agent-send-off-pool-N, each pool numbering its own threads from 0.
-(define agent-pool-counts (vector 0 0))
+;; clojure-agent-send-off-pool-N, each pool numbering its own threads from 0. A
+;; worker takes the lowest number no running worker of its pool holds and gives
+;; it back when it ends, as a pool hands work to an idle thread, so the numbers
+;; stay as low as the pool's concurrency.
+(define agent-pool-slots (vector (vector 0 '()) (vector 0 '())))   ; #(next free)
 (define agent-pool-mu (make-mutex))
-(define (agent-pool-thread-name pool)
-  (let ((i (if (eq? pool 'send) 0 1)))
-    (string-append (if (eq? pool 'send) "clojure-agent-send-pool-" "clojure-agent-send-off-pool-")
-                   (number->string
-                    (jolt-with-mutex agent-pool-mu
-                      (let ((n (vector-ref agent-pool-counts i)))
-                        (vector-set! agent-pool-counts i (+ n 1))
-                        n))))))
-(define (name-pool-thread! pool)
-  (jolt-thread-name-set! (get-thread-id) (agent-pool-thread-name pool)))
+(define (agent-pool-of pool) (vector-ref agent-pool-slots (if (eq? pool 'send) 0 1)))
+(define (agent-pool-take! pool)
+  (jolt-with-mutex agent-pool-mu
+    (let* ((slot (agent-pool-of pool)) (free (vector-ref slot 1)))
+      (if (pair? free)
+          (begin (vector-set! slot 1 (cdr free)) (car free))
+          (let ((n (vector-ref slot 0))) (vector-set! slot 0 (+ n 1)) n)))))
+(define (agent-pool-give! pool n)
+  (jolt-with-mutex agent-pool-mu
+    (let ((slot (agent-pool-of pool)))
+      (vector-set! slot 1 (let ins ((l (vector-ref slot 1)))
+                            (if (or (null? l) (< n (car l))) (cons n l) (cons (car l) (ins (cdr l)))))))))
+(define (agent-pool-thread-name pool n)
+  (string-append (if (eq? pool 'send) "clojure-agent-send-pool-" "clojure-agent-send-off-pool-")
+                 (number->string n)))
 
 ;; Thread-local list of (agent pool f . args) sent from within the action currently
 ;; running on this thread (#f outside an action). Holds nested sends until the
@@ -577,8 +602,9 @@
 ;; sends it accumulated; a thrown action invokes the error-handler (if any, its
 ;; throws swallowed) and then either continues (:continue, state left untouched)
 ;; or fails the agent (:fail, error stored, queue halted).
-;; The worker takes the name of the pool each action was sent to, one name per
-;; pool for the worker's life (names: pool -> name, cur: the pool it is named for).
+;; The worker takes the name of the pool each action was sent to, one number per
+;; pool for the worker's life (names: pool -> number, cur: the pool it is named
+;; for), and gives the numbers back when it goes idle.
 (define (jolt-agent-worker a)
   (*txn* #f)                          ; agent worker must not inherit parent's txn
   (let loop ((names '()) (cur #f))
@@ -588,14 +614,16 @@
                             (jolt-cv-wake! (jolt-agent-cv a)) #f)
                      (jagent-q-pop! a)))))
       ;; idle: the pool worker this stands for would linger (exit wait, below)
-      (unless act (exit-linger-after-task!))
+      (unless act
+        (for-each (lambda (pn) (agent-pool-give! (car pn) (cdr pn))) names)
+        (exit-linger-after-task!))
       (when act
         (let* ((pool (car act))
                (names (if (or (not pool) (eq? pool cur) (assq pool names))
                           names
-                          (cons (cons pool (agent-pool-thread-name pool)) names))))
+                          (cons (cons pool (agent-pool-take! pool)) names))))
           (when (and pool (not (eq? pool cur)))
-            (jolt-thread-name-set! (get-thread-id) (cdr (assq pool names))))
+            (jolt-thread-name-set! (get-thread-id) (agent-pool-thread-name pool (cdr (assq pool names)))))
         (parameterize ((*agent-nested* (box '())))
           (let ((err #f))
             (guard (e (#t (set! err (jolt-unwrap-throw e))))

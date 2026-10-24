@@ -546,20 +546,10 @@
 ;; next require — the very bug the load protocol below exists to stop, reached
 ;; through the other table.
 ;;
-;; A LOAD NEVER ACQUIRES stm-lock. A commit holds stm-lock while it runs commute
-;; fns and validators (refs.ss), which are user code and may require a namespace
-;; that another thread is loading; a loader that needed stm-lock back would then
-;; wait on that commit while the commit waited on it:
-;;
-;;   stm-lock -> ns_load   the commit cannot release stm-lock until the load it is
-;;                         waiting for finishes
-;;   ns_load  -> stm-lock  the loader cannot finish without stm-lock
-;;
-;; The rollback path, where a failed load re-takes the mark's lock to unmark before
-;; releasing its claim, and the window between claiming a namespace and marking it
-;; are where that edge would sit. So the mark goes through a leaf mutex of our own
-;; that no transaction ever waits on, and the edge ns_load -> stm-lock does not
-;; exist.
+;; The mark goes through a leaf mutex of our own rather than a transaction, so a
+;; load never waits on the STM: the rollback path, where a failed load re-takes
+;; this lock to unmark before releasing its claim, and the window between claiming
+;; a namespace and marking it, take nothing a transaction holds.
 ;;
 ;; NOT through the ambient transaction's log when there is one, which is what this
 ;; did first. It looks like the better answer — transactional, and it takes no lock
@@ -575,9 +565,8 @@
 ;; reload. Narrow, one-directional, and the alternatives are a hang or the two bugs
 ;; above.
 ;;
-;; Call with NO loader mutex held either. A commit that requires reaches ldr-tbl-mu
-;; while holding stm-lock, so the loader taking these in the other order would be the
-;; same cycle by another route. Sequential, never nested, is what keeps them apart.
+;; Call with NO loader mutex held either. Sequential, never nested, is what keeps
+;; the loader's locks apart.
 (define ldr-libs-mu (make-mutex))
 (define (ldr-libs-update! f)
   (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
@@ -2233,7 +2222,7 @@
 ;; (dosync …) should force the reload from the next form onward, not from the
 ;; commit. Outside a transaction txn-read IS jolt-ref-val, so the ordinary path is
 ;; unchanged, and it acquires nothing, so this stays safe to call under ldr-load-mu
-;; (see ldr-libs-update!'s "a load never acquires stm-lock"). The loader's own
+;; (see ldr-libs-update!). The loader's own
 ;; marks are not in any log — ldr-libs-update! writes the ref directly, for the
 ;; reasons set out there — so this sees them whether a transaction is open or not.
 (define (ns-dedup-loaded? name)
@@ -2605,10 +2594,9 @@
 ;;                      its resume, which runs in the scheduler and puts every fiber
 ;;                      on that carrier behind it. That edge is gone rather than
 ;;                      argued about — the switch happens with the lock released, and
-;;                      locks.ss checks it at both switch points (jolt-04ee). The one
-;;                      edge that is not the loader's to remove is stm-lock -> the load
-;;                      a commit's commute fn or validator is waiting for. So no load
-;;                      may acquire stm-lock — see ldr-libs-update!.
+;;                      locks.ss checks it at both switch points (jolt-04ee). A
+;;                      transaction holds no lock while its code runs (refs.ss), so a
+;;                      dosync waiting on a load adds no edge.
 (define ldr-load-mu (make-mutex))
 (define ldr-load-cv (make-condition))
 (define ldr-loading (make-hashtable string-hash string=?))  ; ns -> the context loading it

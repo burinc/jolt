@@ -539,7 +539,7 @@
 ;; check holds; not a PersistentVector, so concrete-class dispatch doesn't
 (jch-register-supers! "clojure.lang.APersistentVector$SubVector"
                       '("clojure.lang.APersistentVector" "clojure.lang.IObj"
-                        "java.util.List" "java.lang.Comparable"))
+                        "java.util.List" "java.lang.Comparable" "clojure.lang.IKVReduce"))
 (jch-register-supers! "clojure.lang.APersistentMap" '("clojure.lang.IPersistentMap" "java.util.Map" "java.lang.Iterable" "java.io.Serializable"
                                                       "clojure.lang.MapEquivalence" "clojure.lang.AFn" "clojure.lang.IHashEq"))
 (jch-register-supers! "clojure.lang.PersistentArrayMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj" "clojure.lang.IKVReduce"))

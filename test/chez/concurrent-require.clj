@@ -43,9 +43,9 @@
 ;;   E. two threads entering one require cycle from opposite ends report it instead
 ;;      of hanging, and one of them still completes. This is where the JVM gives up
 ;;      and deadlocks; the loader walks its wait-for graph before blocking.
-;;   F. a (dosync (require ...)) that has to wait does not deadlock the loader, and
-;;      nothing a load does needs stm-lock: the cycle would be stm-lock -> the load
-;;      being waited on -> stm-lock.
+;;   F. a (dosync (require ...)) that has to wait does not deadlock the loader: the
+;;      transaction holds no lock while it waits, and a load takes nothing the STM
+;;      holds.
 ;;   G. a require inside a transaction dedups, and an aborted transaction does not
 ;;      un-load a namespace that really loaded. The mark is two tables and buffering
 ;;      one of them in the txn log split them apart in both directions.
