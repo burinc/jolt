@@ -1142,10 +1142,12 @@
 ;; Compile the Scheme source file SRC to the native object SO under PROFILE:
 ;; #f = target defaults, or an alist with TARGET-NEUTRAL keys
 ;; (optimize . 0..3), (inspector-info . bool), (source-info . bool),
-;; (compressed . bool). The Chez impl parameterizes optimize-level /
-;; generate-inspector-information / generate-procedure-source-information /
-;; fasl-compressed and calls compile-file; a target maps the keys it has and
-;; ignores the rest. Contract: native compilation of SRC to SO. Degradation:
+;; (compressed . bool), (block-profile . bool). The Chez impl parameterizes
+;; optimize-level / generate-inspector-information /
+;; generate-procedure-source-information / fasl-compressed, and compile-profile
+;; to 'block when block-profile is true (the counters --profile-gen builds
+;; carry), and calls compile-file; a target maps the keys it has and ignores the
+;; rest. Contract: native compilation of SRC to SO. Degradation:
 ;; raise a message-carrying condition ((error 'sa-compile-file "...")), never a
 ;; bare raise — the AOT cache (loader.ss) treats the raise as a cache disable
 ;; and falls back to loading from source (verified with the entry point forced
@@ -1157,9 +1159,143 @@
         (parameterize ((optimize-level (pv 'optimize))
                        (generate-inspector-information (pv 'inspector-info))
                        (generate-procedure-source-information (pv 'source-info))
-                       (fasl-compressed (pv 'compressed)))
+                       (fasl-compressed (pv 'compressed))
+                       (compile-profile (let ((b (assq 'block-profile profile)))
+                                          (and b (cdr b) 'block))))
           (compile-file src so)))
       (compile-file src so)))
+
+;; ---- block profiles (capability: profile) -----------------------------------
+;; A build compiled with (block-profile . #t) counts every basic block; the
+;; binary dumps the counts, and a later build loads them before compiling the
+;; same code, which lays out the hot blocks first and gives their variables the
+;; registers. Chez matches the data to code by source descriptor: the checksum
+;; of the text, its length and the last component of its file name. Text that
+;; changed matches nothing and Chez compiles it without the data, silently, so
+;; loading is per unit and says whether the unit had any.
+;;
+;; The dump is jolt's own format, not Chez's profile-dump-data: that one writes
+;; each block with its whole source descriptor, ~370 bytes a block, which for
+;; the runtime's 680,000 blocks is 255 MB a run, and it is a fasl-write, which a
+;; binary that dropped the compiler cannot do. Here a block is three numbers,
+;; and the build turns one unit's worth into Chez's format just before compiling
+;; that unit. A block's source is a pseudo source object: bfp is the block's
+;; number, negative, and efp a checksum of its shape.
+;;
+;;   (jolt-block-profile 1 TAG)
+;;   ("app-0.ss" CHECKSUM #(BFP EFP COUNT  BFP EFP COUNT ...))   ; one per source
+;;
+;; TAG is the caller's: jolt's says which build mode compiled the code.
+
+;; (sa-block-profile-dump! path tag) -> count
+;; Write this process's block counters to PATH, under TAG, and answer how many
+;; there were.
+;; With none, no file is written: code compiled without counters has nothing to
+;; say. Contract: PATH holds what sa-block-profile-load-unit! reads.
+;; Degradation: 0.
+(define (sa-block-profile-dump! path tag)
+  ;; by name and checksum, not by descriptor: one unit's code carries several
+  ;; descriptor objects that are equal but not eq
+  (let ((by-sfd (make-hashtable equal-hash equal?)) (n 0))
+    (for-each
+      (lambda (p)
+        (let ((so (car p)))
+          (when (fx<? (source-object-bfp so) 0)   ; a block, not an expression
+            (set! n (fx+ n 1))
+            (let ((sfd (source-object-sfd so)))
+              (hashtable-update! by-sfd
+                (cons (path-last (source-file-descriptor-path sfd)) (source-file-descriptor-checksum sfd))
+                (lambda (l) (cons (cdr p) (cons (source-object-efp so) (cons (source-object-bfp so) l))))
+                '())))))
+      (profile-dump))
+    (when (fx>? n 0)
+      (let ((op (open-file-output-port path (file-options no-fail) (buffer-mode block) (native-transcoder))))
+        (put-datum op (list 'jolt-block-profile 1 tag))
+        (newline op)
+        (let-values (((keys lists) (hashtable-entries by-sfd)))
+          (vector-for-each
+            (lambda (k l)
+              (put-datum op (list (car k) (cdr k) (list->vector (reverse l))))
+              (newline op))
+            keys lists))
+        (close-port op)))
+    n))
+
+;; Each dump in PATHS read once per process: path -> (tag . hashtable of
+;; (name . checksum) -> flat vector).
+(define sa-block-profile-cache (make-hashtable string-hash string=?))
+(define (sa-block-profile-file path)
+  (or (hashtable-ref sa-block-profile-cache path #f)
+      (let* ((ip (open-input-file path))
+             (head (read ip))
+             (h (make-hashtable equal-hash equal?)))
+        (unless (and (list? head) (= (length head) 3) (equal? (list-head head 2) '(jolt-block-profile 1)))
+          (close-port ip)
+          (error 'sa-block-profile "not a jolt block profile" path))
+        (let loop ()
+          (let ((x (read ip)))
+            (unless (eof-object? x)
+              (hashtable-update! h (cons (car x) (cadr x))
+                (lambda (v) (if v (vector-append v (caddr x)) (caddr x)))
+                #f)
+              (loop))))
+        (close-port ip)
+        (let ((r (cons (caddr head) h)))
+          (hashtable-set! sa-block-profile-cache path r)
+          r))))
+(define (sa-block-profile-read path) (cdr (sa-block-profile-file path)))
+;; (sa-block-profile-tag path) -> the TAG the dump at PATH was written under.
+;; Contract: what sa-block-profile-dump! was given. Degradation: raise.
+(define (sa-block-profile-tag path) (car (sa-block-profile-file path)))
+
+;; (sa-block-profile-load-unit! paths src) -> #t | #f
+;; Load the data PATHS hold for the source file SRC, for the compile of SRC that
+;; follows: #f when no dump covers SRC's current text, which is the caller's to
+;; report. Runs are merged the way Chez merges its own dumps: each run's counts
+;; as a fraction of its largest, averaged over the runs that saw the block. The
+;; largest is the unit's rather than the whole run's, which changes nothing:
+;; Chez weighs a block against the others of its own lambda. Contract: a later
+;; sa-compile-file of SRC uses the data. Degradation: #f.
+(define (sa-block-profile-load-unit! paths src)
+  (let* ((ip (open-file-input-port src))
+         (sfd (make-source-file-descriptor src ip))
+         (key (cons (path-last src) (source-file-descriptor-checksum sfd)))
+         (runs (filter values (map (lambda (p) (hashtable-ref (sa-block-profile-read p) key #f)) paths))))
+    (close-port ip)
+    (and (pair? runs)
+         ;; bfp -> #(efp weight-sum runs): a block's number is unique in its unit
+         (let ((merged (make-eqv-hashtable)))
+           (for-each
+             (lambda (v)
+               (let ((top (fixnum->flonum
+                            (let loop ((i 2) (m 1))
+                              (if (fx>=? i (vector-length v)) m (loop (fx+ i 3) (max m (vector-ref v i))))))))
+                 (do ((i 0 (fx+ i 3))) ((fx>=? i (vector-length v)))
+                   (let ((a (or (hashtable-ref merged (vector-ref v i) #f)
+                                (let ((a (vector (vector-ref v (fx+ i 1)) 0.0 0)))
+                                  (hashtable-set! merged (vector-ref v i) a)
+                                  a))))
+                     (vector-set! a 1 (fl+ (vector-ref a 1)
+                                           (fl/ (inexact (vector-ref v (fx+ i 2))) top)))
+                     (vector-set! a 2 (fx+ (vector-ref a 2) 1))))))
+             runs)
+           ;; A block's source object: Chez's own record, built through its type
+           ;; because make-source-object refuses the negative position a block's
+           ;; number is.
+           (let* ((make-block-source (record-constructor (record-rtd (make-source-object sfd 0 0))))
+                  (dump (let-values (((ks as) (hashtable-entries merged)))
+                          (map (lambda (bfp a)
+                                 (cons (make-block-source sfd bfp (vector-ref a 0))
+                                       ;; profile-dump-data takes exact counts
+                                       (exact (round (fl* 1073741824.0
+                                                          (fl/ (vector-ref a 1)
+                                                               (fixnum->flonum (vector-ref a 2))))))))
+                               (vector->list ks) (vector->list as))))
+                  (tmp (string-append src ".chez-profile")))
+             (profile-dump-data tmp dump)
+             (profile-load-data tmp)
+             (delete-file tmp)
+             #t)))))
 
 ;; (sa-make-boot-file out base-boots) -> void
 ;; Assemble the boot file OUT from the base boot files BASE-BOOTS — exactly the

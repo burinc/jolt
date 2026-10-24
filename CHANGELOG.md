@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary too, and prints the report at exit. Overhead measured 1–3%. Fiber
   preemption and `run-interruptible` now share each thread's engine timer
   through one scheduler instead of borrowing it from each other.
+- **Profile-guided builds: `jolt build --profile-gen` and `--profile-use`.**
+  A `--profile-gen` binary counts every basic block of the app and the
+  runtime, and writes the counts to `NAME-PID.jpd` (or `$JOLT_PROFILE_DATA`)
+  as it exits. `jolt build --profile-use run1.jpd run2.jpd …` compiles the
+  same sources with them, so Chez lays each function's hot blocks out first
+  and gives their variables the registers. A profile that no longer fits a
+  unit's code, or comes from a build in another mode, fails the build naming
+  the unit, rather than being ignored. Profiled units never share a build
+  cache entry with plain ones.
 
 ### Changed
 

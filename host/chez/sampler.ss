@@ -126,6 +126,16 @@
                 (hashtable-set! (sample-rec-stacks r) key (vector 1 weight)))))))))
 (define sample-truncated-site (vector -1 "[truncated]" #f))
 
+;; The next tick demand, from the demand PREV just spent, the CPU nanoseconds
+;; SPENT doing it and the nanoseconds REMAINING to the next sample: ticks per
+;; nanosecond as measured, and at most twice PREV. One interval read short (a
+;; clock that did not move, a collection charged to the ticks) must not send the
+;; demand to the ceiling: the tail of a run became one long interval, lost when
+;; sampling stopped, and a 40 ms fn read as 25.
+(define (jolt-sample-next-demand prev remaining spent)
+  (let ((next (if (> spent 0) (quotient (* prev remaining) spent) (* 2 prev))))
+    (max jolt-sample-min-ticks (min jolt-sample-max-ticks (* 2 prev) next))))
+
 ;; The client. Runs on the sampled thread from the tick scheduler's dispatcher.
 (define (jolt-sample-tick)
   (let* ((s (jolt-tick-state))
@@ -145,11 +155,7 @@
                                     (vector-set! r 5 now)
                                     jolt-sample-interval)
                              (- jolt-sample-interval since)))
-              ;; ticks per nanosecond, measured over the demand just spent
-              (next (if (> spent 0)
-                        (quotient (* (vector-ref r 7) remaining) spent)
-                        jolt-sample-max-ticks))
-              (next (max jolt-sample-min-ticks (min jolt-sample-max-ticks next))))
+              (next (jolt-sample-next-demand (vector-ref r 7) remaining spent)))
          (vector-set! r 6 now)
          (vector-set! r 7 next)
          (jolt-tick-set! jolt-tick-slot-sample next))))))
@@ -264,6 +270,31 @@
     (when (and (string? e) (string=? e "sample")
                (jolt-sample-start! jolt-sample-interval jolt-sample-depth))
       (jolt-add-shutdown-hook jolt-sample-report-at-exit))))
+
+;; --- jolt build --profile-gen ------------------------------------------------------
+;; A binary built with --profile-gen carries Chez's block counters in every unit,
+;; and they reach a file as it exits, where `jolt build --profile-use` reads them
+;; (build.ss). Every binary's launcher calls this, since the launcher's text has
+;; to be the same in both builds; one with no counters writes nothing. The file
+;; is $JOLT_PROFILE_DATA, or NAME-PID.jpd in the current directory, NAME the
+;; binary's: one per run, so runs over several workloads each leave their own
+;; and the build averages them. TAG is the build mode, which --profile-use has
+;; to match.
+(define (jolt-block-profile-at-exit! tag)
+  (jolt-add-shutdown-hook
+    (lambda ()
+      (let ((path (let ((e (getenv "JOLT_PROFILE_DATA"))
+                        ;; asked of the OS (loader.ss): a binary's argv[0] is empty
+                        (exe (guard (e (#t #f)) (aot-self-exe))))
+                    (if (and (string? e) (not (string=? e "")))
+                        e
+                        (string-append (if (string? exe) (path-last exe) "jolt")
+                                       "-" (number->string (get-process-id)) ".jpd")))))
+        (guard (e (#t (fprintf (current-error-port) "jolt: could not write the block profile ~a: " path)
+                      (display-condition e (current-error-port))
+                      (newline (current-error-port))))
+          (when (fx>? (sa-block-profile-dump! path tag) 0)
+            (fprintf (current-error-port) "jolt: wrote the block profile ~a\n" path)))))))
 
 (define (jolt-sample-report-at-exit)
   (let ((cell (var-cell-lookup "jolt.profile" "sample-report-at-exit")))
