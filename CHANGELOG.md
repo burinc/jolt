@@ -78,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sorted-map-by` / `sorted-set-by`, or `clojure.lang.RT$DefaultComparator`.
   `.compare` on a fn answers -1, 1 or 0 for a boolean result and the `intValue`
   of a number, as `AFunction.compare` does.
+- **Refs, atoms, agents, volatiles, delays, futures and promises print like the
+  JVM's.** They printed as a bare `#object[clojure.lang.Atom]`; they now print
+  `#object[clojure.lang.Atom 0x1b2c3d4e {:status :ready, :val 1}]`, with the
+  identity hash, `:pending` for an unrealized delay, future or promise, and
+  `:failed` for a failed agent or future.
 - **Futures and agent actions run on threads named like the JVM's.** A future or
   `send-off` action runs on `clojure-agent-send-off-pool-N` and a `send` action on
   `clojure-agent-send-pool-N`, where they were `Thread-N`. A pool reuses the

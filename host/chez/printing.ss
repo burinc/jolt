@@ -37,6 +37,21 @@
   (register-pr-str-arm! pred render)
   (register-pr-readable-arm! pred render))
 
+;; An IDeref value prints as the JVM's print-tagged-object over deref-as-map:
+;; #object[cls 0xHASH {:status :ready, :val v}], the value printed the way the
+;; enclosing pr or print prints. state answers (status . val), status one of
+;; "ready", "pending" or "failed".
+(define (register-deref-print! pred state)
+  (define (form render)
+    (lambda (x)
+      (let ((sv (state x)))
+        (string-append "#object[" (jolt-class-name x) " 0x" (jolt-identity-hex x)
+                       " {:status :" (car sv) ", :val " (render (cdr sv)) "}]"))))
+  (register-pr-str-arm! pred (form (lambda (v) (jolt-pr-str v))))
+  (register-pr-readable-arm! pred (form (lambda (v) (jolt-pr-readable v)))))
+(register-deref-print! jolt-atom? (lambda (a) (cons "ready" (jolt-atom-val a))))
+(register-deref-print! jolt-ref? (lambda (r) (cons "ready" (jolt-ref-val r))))
+
 ;; A user's (defmethod print-method T …) IS the printer for T, as on the JVM — it
 ;; outranks every built-in rendering, including an arm a library registered for
 ;; its own host class. So the user method is consulted BEFORE the arm list rather

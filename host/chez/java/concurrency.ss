@@ -1002,6 +1002,26 @@
 (define-record-type jolt-delay (fields thunk (mutable realized?) (mutable value) (mutable exn))
   (nongenerative jolt-delay-v2))
 (define (jolt-make-delay thunk) (make-jolt-delay thunk #f jolt-nil #f))
+
+;; How futures, promises, delays and agents print (printing.ss register-deref-print!):
+;; pending until realized, failed with the throwable a deref would raise, else
+;; ready with the value. A failed agent prints its state.
+(register-deref-print! jolt-future?
+  (lambda (f)
+    (cond ((not (jolt-future-done? f)) (cons "pending" jolt-nil))
+          ((jolt-future-cancelled? f)
+           (cons "failed" (jolt-host-throwable "java.util.concurrent.CancellationException" jolt-nil)))
+          ((jolt-future-ok? f) (cons "ready" (jolt-future-payload f)))
+          (else (cons "failed" (task-execution-exception (jolt-future-payload f)))))))
+(register-deref-print! jolt-promise?
+  (lambda (p) (if (jolt-promise-delivered? p) (cons "ready" (jolt-promise-value p)) (cons "pending" jolt-nil))))
+(register-deref-print! jolt-delay?
+  (lambda (d)
+    (cond ((not (jolt-delay-realized? d)) (cons "pending" jolt-nil))
+          ((jolt-delay-exn d) (cons "failed" (jolt-unwrap-throw (jolt-delay-exn d))))
+          (else (cons "ready" (jolt-delay-value d))))))
+(register-deref-print! jolt-agent?
+  (lambda (a) (cons (if (jolt-nil? (jolt-agent-err a)) "ready" "failed") (jolt-agent-state a))))
 ;; run the thunk once, like Clojure's Delay: if it throws, cache the exception
 ;; (the delay IS realized) and re-throw it on every deref — do NOT re-run the
 ;; body (so value-fns memoize and there is no cache-stampede / retried side
