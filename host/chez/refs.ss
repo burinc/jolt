@@ -396,9 +396,12 @@
        (list notes)))))
 
 ;; Returns the (ref old new) notifications, or throws the retry.
+;; Runs inside the transaction's extent, so a commute fn or validator reads the
+;; transaction's values, and a dosync in one joins it. One that writes a ref the
+;; transaction had not touched starts the round again over the larger table.
 (define (txn-commit! txn)
-  (let-values (((refs cells) (hashtable-entries (jolt-txn-vals txn))))
-    (let again ((k 0))
+  (let again ((k 0))
+    (let-values (((refs cells) (hashtable-entries (jolt-txn-vals txn))))
       ;; commutes over the newest values, then every validator: user code, so no
       ;; lock is held
       (let ((seen
@@ -418,7 +421,9 @@
                            (loop (cdr cs) (cons (cons ref tv) acc)))))))))
         (do ((i 0 (fx+ i 1))) ((fx= i (vector-length refs)))
           (iref-validate (vector-ref refs i) (car (vector-ref cells i))))
-        (let ((r (jolt-with-mutex stm-mu (txn-publish!/locked txn refs cells seen))))
+        (let ((r (if (fx= (hashtable-size (jolt-txn-vals txn)) (vector-length refs))
+                     (jolt-with-mutex stm-mu (txn-publish!/locked txn refs cells seen))
+                     'again)))
           (cond
             ((pair? r)
              (txn-release! txn)
@@ -530,15 +535,23 @@
         (let ((rp stm-clock))
           (when jolt-mt? (memory-order-acquire))
           ;; outcome: (result . notifications), #f to retry, or #(raised)
+          ;; The attempt lets go of its claims in a finally-marked winder: a
+          ;; fiber's park leaves it in place, and a kill, which escapes past every
+          ;; guard, runs it. A commit has already let go.
           (let* ((txn (make-txn rp age))
                  (outcome
-                  (guard (e (#t (if (stm-retry? e) #f (vector e))))
-                    (let ((result (dyn-with-txn txn (lambda () (jolt-invoke thunk)))))
-                      (cons result (if (txn-writes? txn) (txn-commit! txn) '()))))))
-            ;; a commit lets go of its claims itself; any other end lets go here
-            (unless (or (pair? outcome)
-                        (and (null? (jolt-txn-claims txn)) (null? (jolt-txn-ensures txn))))
-              (txn-release! txn))
+                  (dynamic-wind
+                    jolt-finally-in
+                    (lambda ()
+                      (guard (e (#t (if (stm-retry? e) #f (vector e))))
+                        (dyn-with-txn txn
+                          (lambda ()
+                            (let ((result (jolt-invoke thunk)))
+                              (cons result (if (txn-writes? txn) (txn-commit! txn) '())))))))
+                    (lambda ()
+                      (unless (or (eq? (jolt-txn-status txn) 'done)
+                                  (and (null? (jolt-txn-claims txn)) (null? (jolt-txn-ensures txn))))
+                        (txn-release! txn))))))
             (cond
               ((not outcome)
                (let ((w (jolt-txn-wait-on txn))) (when w (txn-wait-for! w)))

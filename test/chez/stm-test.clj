@@ -188,6 +188,19 @@
   (chk "atomic-reentrant-update: updateAndGet fn may re-enter the same atomic"
        (= 11 (deref t 5000 :hang))))
 
+;; --- a fiber killed inside dosync lets go of its claims: a kill escapes past
+;; every guard and runs only finally winders, so the release has to be one
+(require '[jolt.fibers :as fibers])
+(let [r (ref 0)
+      started (promise)
+      f (fibers/spawn (fn [] (dosync (alter r inc) (deliver started true) (Thread/sleep 5000) (alter r inc))))]
+  (deref started 5000 :timeout)
+  (fibers/kill! f (ex-info "die" {}))
+  (try (fibers/join f) (catch Throwable _))
+  (chk "fiber-kill-claim: a writer after the kill commits"
+       (= 10 (deref (future (dosync (alter r + 10))) 5000 :timeout)))
+  (chk "fiber-kill-claim: the killed transaction committed nothing" (= 10 @r)))
+
 (if (empty? @failures)
   (println "STM OK")
   (doseq [f @failures] (println "FAIL:" f)))

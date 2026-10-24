@@ -41,16 +41,47 @@
 ;; #object[cls 0xHASH {:status :ready, :val v}], the value printed the way the
 ;; enclosing pr or print prints. state answers (status . val), status one of
 ;; "ready", "pending" or "failed".
+;;
+;; One port takes the whole of a chain of them (an atom holding an atom …): each
+;; level writes its prefix, the next level, then its suffix, so the text is built
+;; once rather than copied at every level. The recursion is real, as the JVM's
+;; is, so a value that holds itself runs into the stack limit and raises
+;; StackOverflowError like any runaway recursion.
+(define deref-print-arms '())
+(define (deref-print-state x)
+  (let loop ((as deref-print-arms))
+    (cond ((null? as) #f)
+          (((caar as) x) (cdar as))
+          (else (loop (cdr as))))))
+(define (display-to port s) (display s port))
+(define (deref-print-to! port x state readable?)
+  (let ((sv (state x)))
+    (display-to port "#object[")
+    (display-to port (jolt-class-name x))
+    (display-to port " 0x")
+    (display-to port (jolt-identity-hex x))
+    (display-to port " {:status :")
+    (display-to port (car sv))
+    (display-to port ", :val ")
+    (let* ((v (cdr sv))
+           (user (and readable? pr-user-method-render (pr-user-method-render v)))
+           (inner (and (not user) (deref-print-state v))))
+      (cond (user (display-to port user))
+            (inner (deref-print-to! port v inner readable?))
+            (else (display-to port (if readable? (jolt-pr-readable v) (jolt-pr-str v))))))
+    (display-to port "}]")))
 (define (register-deref-print! pred state)
-  (define (form render)
+  (define (form readable?)
     (lambda (x)
-      (let ((sv (state x)))
-        (string-append "#object[" (jolt-class-name x) " 0x" (jolt-identity-hex x)
-                       " {:status :" (car sv) ", :val " (render (cdr sv)) "}]"))))
-  (register-pr-str-arm! pred (form (lambda (v) (jolt-pr-str v))))
-  (register-pr-readable-arm! pred (form (lambda (v) (jolt-pr-readable v)))))
+      (let ((port (open-output-string)))
+        (deref-print-to! port x state readable?)
+        (get-output-string port))))
+  (set! deref-print-arms (cons (cons pred state) deref-print-arms))
+  (register-pr-str-arm! pred (form #f))
+  (register-pr-readable-arm! pred (form #t)))
 (register-deref-print! jolt-atom? (lambda (a) (cons "ready" (jolt-atom-val a))))
-(register-deref-print! jolt-ref? (lambda (r) (cons "ready" (jolt-ref-val r))))
+;; inside a transaction a ref prints its in-transaction value
+(register-deref-print! jolt-ref? (lambda (r) (cons "ready" (txn-read r))))
 
 ;; A user's (defmethod print-method T …) IS the printer for T, as on the JVM — it
 ;; outranks every built-in rendering, including an arm a library registered for
