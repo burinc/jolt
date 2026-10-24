@@ -378,6 +378,12 @@
   {:suite "interrupt" :expr "(do (Thread/yield) :ok)" :expected ":ok"}
   {:suite "interrupt" :expr "(nil? (Thread/yield))" :expected "true"}
   {:suite "threads / id" :expr "(let [t (Thread/currentThread) a (.getId t) b (.getId t)] (and (integer? a) (= a b)))" :expected "true"}
+;; A pooled worker runs many futures: each gets the caller's namespace, and an
+;; in-ns inside one does not reach the next.
+  {:suite "threads / future ns" :expr "(let [before (str *ns*) _ (deref (future (in-ns (quote unit-future-zz)) nil)) after (deref (future (str *ns*)))] [(= before after) (= before (str *ns*))])" :expected "[true true]"}
+;; A task enqueued while the solo pool's only worker is between its spin and its
+;; park must still be taken: back-to-back futures with uneven gaps between them.
+  {:suite "threads / future handoff" :expr "(loop [i 0] (cond (= i 20000) :ok (= :stall (deref (future i) 2000 :stall)) [:stall i] :else (do (loop [j (rand-int 3000)] (when (pos? j) (recur (dec j)))) (recur (inc i)))))" :expected ":ok"}
   {:suite "threads / id" :expr "(let [current-id (.getId (Thread/currentThread)) ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) f (future (let [id (.getId (Thread/currentThread))] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS) id))] (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (.countDown release) (let [child-id (deref f)] (and (integer? child-id) (not= current-id child-id))))" :expected "true"}
   ;; A handle asks about the thread it STANDS FOR, not the thread doing the
   ;; asking — the distinction only shows through a handle for someone else, which

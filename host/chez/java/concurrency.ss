@@ -138,7 +138,9 @@
   (nongenerative jolt-future-v2))
 
 ;; (future-call thunk): run (thunk) on the solo pool (below). The dynamic
-;; bindings in effect now are conveyed into the task as a snapshot. The result —
+;; bindings and current namespace in effect now are conveyed into the task as a
+;; snapshot, and the worker gets its own back afterwards, so an in-ns inside one
+;; future does not leak into the next task the pooled thread runs. The result —
 ;; value or thrown condition — is latched and broadcast; a cancel that already
 ;; finalized the future makes the late result a no-op, and a cancel that lands
 ;; before a worker takes the task keeps the body from running at all, as a
@@ -150,7 +152,8 @@
     (jolt-throw (jolt-host-throwable "java.util.concurrent.RejectedExecutionException" jolt-nil)))
   (let* ((ibox (box #f))
          (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (jolt-make-cv) ibox))
-         (snap (dyn-binding-stack)))
+         (snap (dyn-binding-stack))
+         (ns (chez-current-ns-param)))
     (solo-pool-run!
      (lambda ()
        (unless (jolt-future-settled? f)              ; cancelled before it started
@@ -162,11 +165,14 @@
          ;; Thread/interrupted inside the worker and the cancel from outside are
          ;; ONE flag (the shape jolt#727 fixed for Thread.). The worker takes its
          ;; own flag back when the body is done.
-         (let ((own (current-os-thread-box)))
+         (let ((own (current-os-thread-box))
+               (own-ns (chez-current-ns-param)))
            (adopt-interrupt-box! ibox)
            (dyn-binding-stack snap)
+           (chez-current-ns-param ns)
            (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
              (dyn-binding-stack '())
+             (chez-current-ns-param own-ns)
              (adopt-interrupt-box! own)
              (jolt-with-mutex (jolt-future-mu f)
                (unless (jolt-future-done? f)            ; not already cancelled
@@ -3019,15 +3025,18 @@
 ;; shutdown (the corpus's scheduleAtFixedRate rows).
 (define (executor-idle-spin! st)
   (and (null? (vector-ref st 13))
-       (let ((mu (vector-ref st 2)))
+       (let ((mu (vector-ref st 2))
+             (ready? (lambda () (or (fx>? (vector-ref st 10) 0) (vector-ref st 0)
+                                    (pair? (vector-ref st 13))))))
          (vector-set! st 9 (fx+ (vector-ref st 9) 1))
          (jolt-unlock! mu)
-         (let ((found (task-spin-until
-                        (lambda () (or (fx>? (vector-ref st 10) 0) (vector-ref st 0)
-                                       (pair? (vector-ref st 13)))))))
+         (let ((found (task-spin-until ready?)))
            (jolt-lock! mu)
            (vector-set! st 9 (fx- (vector-ref st 9) 1))
-           found))))
+           ;; Asked again under the mutex: an enqueue between the spin's last look
+           ;; and the lock counted this worker idle, so it neither grew the pool
+           ;; nor reached a parked waiter, and parking now would strand its task.
+           (or found (ready?))))))
 ;; A worker that dies must not take the pool's accounting with it. Everything a
 ;; TASK can throw is already caught at the task (submit's future keeps it, execute
 ;; reports it), so reaching this handler means the queue mechanics threw — which
