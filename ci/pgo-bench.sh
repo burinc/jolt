@@ -164,6 +164,10 @@ done < "$work/workloads"
 
 echo
 if [ "$rows" -eq 0 ] && [ "$fails" -eq 0 ]; then
+  # named workloads land in one shard; the others have nothing to do
+  if [ -n "$only" ] && [ "$shard_n" -gt 1 ]; then
+    echo "pgo bench: none of the named workloads is in shard $shard"; exit 0
+  fi
   echo "pgo bench: FAILED — nothing was measured"; exit 1
 fi
 for mode in $modes; do

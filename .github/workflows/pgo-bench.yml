@@ -6,6 +6,13 @@ name: pgo-bench
 # gate, so it runs on demand and when the harness itself changes.
 on:
   workflow_dispatch:
+    inputs:
+      workloads:
+        description: space-separated workload names (empty for all)
+        default: ""
+      rounds:
+        description: timed runs per side
+        default: "3"
   pull_request:
     paths:
       - ci/pgo-bench.sh
@@ -47,7 +54,10 @@ jobs:
           PGO_EXAMPLES: ${{ github.workspace }}/examples
           PGO_REQUIRE_ALL: "1"
           PGO_OUT: ${{ runner.temp }}/rows-${{ matrix.shard }}.txt
-        run: TMPDIR="$RUNNER_TEMP" ci/pgo-bench.sh target/release/jolt
+          PGO_ROUNDS: ${{ inputs.rounds || '3' }}
+          WORKLOADS: ${{ inputs.workloads }}
+        # $WORKLOADS is deliberately unquoted: it is a list of names
+        run: TMPDIR="$RUNNER_TEMP" ci/pgo-bench.sh target/release/jolt 1.10 $WORKLOADS
       - uses: actions/upload-artifact@v6
         if: always()
         with:
