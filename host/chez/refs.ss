@@ -40,15 +40,15 @@
 ;;   faults      — reads that found no version old enough since the last commit
 ;;                 that kept one more; a fault lets the next commit grow the history
 ;;   min-hist / max-hist — the history the ref keeps (ref-min-history)
-;;   claim       — the transaction that wrote the ref and has not finished, or #f
-;;   ensurers    — the transactions that ensured the ref and have not finished
-;; claim and ensurers change only under stm-mu.
+;;   owner       — #f, the transaction that claimed the ref for a write, or the
+;;                 list of transactions that ensured it; changed only by a swap
 (define-record-type (jolt-ref %make-jolt-ref jolt-ref?)
   (fields (mutable tvals) (mutable faults) (mutable min-hist) (mutable max-hist)
-          (mutable claim) (mutable ensurers))
+          (mutable owner))
   (nongenerative jolt-ref-v3))
+(define ref-owner-slot 4)
 
-(define (make-jolt-ref v) (%make-jolt-ref (list (cons 0 v)) 0 0 10 #f '()))
+(define (make-jolt-ref v) (%make-jolt-ref (list (cons 0 v)) 0 0 10 #f))
 ;; the newest committed value
 (define (jolt-ref-val ref) (cdar (jolt-ref-tvals ref)))
 ;; A write outside any transaction (the loader's *loaded-libs* mark, an image
@@ -76,14 +76,16 @@
 ;;   age           — (start . blocked-ms), one pair for the dosync's every attempt:
 ;;                   start is its first read point, so a lower start is older, and
 ;;                   blocked-ms is when it first found a younger owner in its way
-;;   latch         — what transactions waiting on this one block on, made by the
-;;                   first of them
+;;   latch         — what transactions waiting on this one block on, swapped in
+;;                   by the first of them; 'closed once the attempt has finished
 ;;   wait-on       — the transaction this attempt retries to wait for, or #f
-;; status, claims, age and latch change only under stm-mu.
+;; Another thread changes status (running -> killed) and latch only by a swap.
 (define-record-type jolt-txn
   (fields read-point vals (mutable commutes) (mutable ensures) (mutable pending-sends)
           (mutable status) (mutable claims) (mutable age) (mutable latch) (mutable wait-on))
   (nongenerative jolt-txn-v2))
+(define txn-status-slot 5)
+(define txn-latch-slot 8)
 
 (define (make-txn rp age)
   (make-jolt-txn rp (make-eq-hashtable) '() '() '() 'running '() (or age (cons rp #f)) #f #f))
@@ -93,8 +95,8 @@
 ;; stm-mu, and it advances AFTER the commit's refs are written: a transaction
 ;; that reads point c then sees every ref commit c wrote.
 ;;
-;; stm-mu guards claims, ensurers, statuses and the publish. It is held for
-;; bookkeeping only — never across user code or a wait — so it is a leaf.
+;; stm-mu serializes the publish. It is held for the checks and the writes only —
+;; never across user code or a wait — so it is a leaf.
 (define stm-clock 0)
 (define stm-mu (make-mutex))
 (define *txn* (make-thread-parameter #f))
@@ -144,6 +146,8 @@
 ;; A clojure.lang.LockingTransaction$RetryEx, which is an Error on the JVM, so a
 ;; body's (catch Exception e) does not swallow it. One instance serves every retry,
 ;; made on first use under a mutex so every thread raises and recognizes the same one.
+;; It is raised without jolt-throw's stack capture: a retry is caught by jolt-sync
+;; and never reported, and under contention the capture was most of a retry's cost.
 (define stm-retry-ex #f)
 (define stm-retry-mu (make-mutex))
 (define (stm-retry!)
@@ -151,7 +155,7 @@
     (jolt-with-mutex stm-retry-mu
       (unless stm-retry-ex
         (set! stm-retry-ex (jolt-host-throwable "clojure.lang.LockingTransaction$RetryEx" jolt-nil)))))
-  (jolt-throw stm-retry-ex))
+  (jolt-raise-thrown stm-retry-ex))
 (define (stm-retry? e)
   (and stm-retry-ex (eq? (jolt-unwrap-throw e) stm-retry-ex)))
 
@@ -190,95 +194,120 @@
   (let ((txn (*txn*)))
     (if txn (txn-get txn ref) (jolt-ref-val ref))))
 
-;; --- claims, under stm-mu ------------------------------------------------------
-;; The claim steps answer #t, 'retry, or the live transaction to wait for.
+;; --- claims ---------------------------------------------------------------------
+;; A ref's owner slot is #f, the one live-or-finished transaction that claimed it
+;; for a write, or a list of the transactions that ensured it. Every change is
+;; one compare-and-swap on the slot, so a writer and an ensurer cannot both take
+;; it; a finished or killed transaction in the slot is free for the taking. The
+;; claim steps answer #t, 'retry, or the live transaction to wait for.
 
 (define (changed-since? ref txn)
   (> (caar (jolt-ref-tvals ref)) (jolt-txn-read-point txn)))
 
-;; Kill a running, younger owner once this transaction has been held up by
-;; younger ones for stm-barge-ms.
-(define (txn-barge!/locked txn other)
+;; Kill a running, younger transaction once this one has been held up by younger
+;; ones for stm-barge-ms. The kill is a swap on the victim's status, so it cannot
+;; land on a transaction that has begun its commit.
+(define (txn-barge! txn other)
   (let ((mine (jolt-txn-age txn)))
     (and (< (car mine) (car (jolt-txn-age other)))
          (eq? (jolt-txn-status other) 'running)
          (let ((now (stm-now-ms)))
            (unless (cdr mine) (set-cdr! mine now))
            (> (- now (cdr mine)) stm-barge-ms))
+         (sa-record-cas! other txn-status-slot 'running 'killed)
          (begin
-           (jolt-txn-status-set! other 'killed)
-           (let ((l (jolt-txn-latch other))) (when l (stm-latch-release! l)))
+           (let ((l (jolt-txn-latch other)))
+             (when (and l (not (eq? l 'closed))) (stm-latch-release! l)))
            #t))))
 
-;; another live transaction holding ref ensured, or #f
-(define (ref-other-ensurer ref txn)
-  (let loop ((es (jolt-ref-ensurers ref)))
-    (cond ((null? es) #f)
-          ((and (not (eq? (car es) txn)) (txn-live? (car es))) (car es))
-          (else (loop (cdr es))))))
+;; The first live transaction other than txn in an ensurer list, or #f.
+(define (live-other es txn)
+  (cond ((null? es) #f)
+        ((and (not (eq? (car es) txn)) (txn-live? (car es))) (car es))
+        (else (live-other (cdr es) txn))))
 
-;; ref's owner when it is another live transaction txn cannot barge, or #f
-(define (ref-blocking-owner ref txn)
-  (let ((owner (jolt-ref-claim ref)))
-    (and owner (not (eq? owner txn)) (txn-live? owner)
-         (not (txn-barge!/locked txn owner))
-         owner)))
+;; What holds ref against a writer txn: a live owner it cannot barge or a live
+;; ensurer, else #f.
+(define (ref-held-against ref txn)
+  (let ((o (jolt-ref-owner ref)))
+    (cond ((not o) #f)
+          ((pair? o) (live-other o txn))
+          ((eq? o txn) #f)
+          ((and (txn-live? o) (not (txn-barge! txn o))) o)
+          (else #f))))
 
-(define (txn-claim!/locked txn ref)
-  (cond
-    ((not (eq? (jolt-txn-status txn) 'running)) 'retry)
-    ((changed-since? ref txn) 'retry)
-    (else
-     (or (ref-blocking-owner ref txn)
-         (ref-other-ensurer ref txn)
-         (begin
-           (jolt-ref-claim-set! ref txn)
-           (jolt-txn-claims-set! txn (cons ref (jolt-txn-claims txn)))
-           #t)))))
+(define (txn-claim! txn ref)
+  (let loop ()
+    (cond
+      ((not (eq? (jolt-txn-status txn) 'running)) 'retry)
+      ((changed-since? ref txn) 'retry)
+      (else
+       (let ((o (jolt-ref-owner ref)))
+         (cond
+           ((eq? o txn) #t)
+           ((ref-held-against ref txn) => values)
+           ((sa-record-cas! ref ref-owner-slot o txn)
+            (jolt-txn-claims-set! txn (cons ref (jolt-txn-claims txn)))
+            ;; a commit that landed between the check and the swap
+            (if (changed-since? ref txn) 'retry #t))
+           (else (loop))))))))
 
-(define (txn-ensure!/locked txn ref)
-  (cond
-    ((not (eq? (jolt-txn-status txn) 'running)) 'retry)
-    ((changed-since? ref txn) 'retry)
-    (else
-     (let ((owner (jolt-ref-claim ref)))
-       (cond
-         ((and owner (txn-live? owner)) (if (eq? owner txn) #t owner))
-         (else
-          (jolt-ref-ensurers-set! ref (cons txn (jolt-ref-ensurers ref)))
-          (jolt-txn-ensures-set! txn (cons ref (jolt-txn-ensures txn)))
-          #t))))))
+(define (txn-ensure! txn ref)
+  (let loop ()
+    (cond
+      ((not (eq? (jolt-txn-status txn) 'running)) 'retry)
+      ((changed-since? ref txn) 'retry)
+      (else
+       (let ((o (jolt-ref-owner ref)))
+         (cond
+           ((eq? o txn) #t)
+           ((and o (not (pair? o)) (txn-live? o)) o)
+           ((sa-record-cas! ref ref-owner-slot o
+                            (cons txn (if (pair? o) (filter txn-live? o) '())))
+            (jolt-txn-ensures-set! txn (cons ref (jolt-txn-ensures txn)))
+            (if (changed-since? ref txn) 'retry #t))
+           (else (loop))))))))
 
-;; Act on a claim step's answer, outside stm-mu. A transaction to wait for is
-;; waited for once this attempt has let go of its own claims (jolt-sync).
+;; Act on a claim step's answer. A transaction to wait for is waited for once this
+;; attempt has let go of its own claims (jolt-sync).
 (define (txn-blocked! txn r)
   (cond ((eq? r #t) #t)
         ((eq? r 'retry) (stm-retry!))
         (else (jolt-txn-wait-on-set! txn r) (stm-retry!))))
 
-;; End an attempt: it is no longer live and its claims and ensures go. Answers
-;; the latch to release once stm-mu is let go.
-(define (txn-finish!/locked txn)
-  (jolt-txn-status-set! txn 'done)
-  (for-each (lambda (ref) (when (eq? (jolt-ref-claim ref) txn) (jolt-ref-claim-set! ref #f)))
-            (jolt-txn-claims txn))
-  (for-each (lambda (ref) (jolt-ref-ensurers-set! ref (remq txn (jolt-ref-ensurers ref))))
-            (jolt-txn-ensures txn))
-  (jolt-txn-latch txn))
-
+;; End an attempt: it is no longer live, its slots are given back, and whatever
+;; waits on it wakes.
 (define (txn-release! txn)
-  (when (or (pair? (jolt-txn-claims txn)) (pair? (jolt-txn-ensures txn)) (jolt-txn-latch txn))
-    (let ((l (jolt-with-mutex stm-mu (txn-finish!/locked txn))))
-      (when l (stm-latch-release! l)))))
+  (jolt-txn-status-set! txn 'done)
+  (for-each (lambda (ref) (sa-record-cas! ref ref-owner-slot txn #f)) (jolt-txn-claims txn))
+  (for-each (lambda (ref)
+              (let loop ()
+                (let ((o (jolt-ref-owner ref)))
+                  (when (and (pair? o) (memq txn o))
+                    (let ((rest (filter (lambda (t) (not (eq? t txn))) o)))
+                      (unless (sa-record-cas! ref ref-owner-slot o (if (null? rest) #f rest))
+                        (loop)))))))
+            (jolt-txn-ensures txn))
+  ;; close the latch slot, so no waiter can arrive after the wake
+  (let loop ()
+    (let ((l (jolt-txn-latch txn)))
+      (if (sa-record-cas! txn txn-latch-slot l 'closed)
+          (when (and l (not (eq? l 'closed))) (stm-latch-release! l))
+          (loop)))))
 
-;; Wait, a bounded time, for a transaction this one found in its way.
+;; Wait, a bounded time, for a transaction this one found in its way. The first
+;; waiter swaps a latch into the owner's slot; a closed slot means the owner has
+;; finished.
 (define (txn-wait-for! owner)
-  (let ((l (jolt-with-mutex stm-mu
-             (and (txn-live? owner)
-                  (or (jolt-txn-latch owner)
-                      (let ((l (stm-make-latch)))
-                        (jolt-txn-latch-set! owner l)
-                        l))))))
+  (let ((l (let ((cur (jolt-txn-latch owner)))
+             (cond ((eq? cur 'closed) #f)
+                   (cur cur)
+                   (else
+                    (let ((new (stm-make-latch)))
+                      (cond ((not new) #f)
+                            ((sa-record-cas! owner txn-latch-slot #f new) new)
+                            (else (let ((cur (jolt-txn-latch owner)))
+                                    (and (not (eq? cur 'closed)) cur))))))))))
     (when l (stm-latch-wait l stm-wait-ms))))
 
 ;; ref-set / alter: a commuted ref cannot be set; the first set claims the ref.
@@ -290,7 +319,7 @@
     (if cell
         (set-car! cell v)
         (begin
-          (txn-blocked! txn (jolt-with-mutex stm-mu (txn-claim!/locked txn ref)))
+          (txn-blocked! txn (txn-claim! txn ref))
           (hashtable-set! (jolt-txn-vals txn) ref (cons v #t)))))
   v)
 
@@ -331,19 +360,19 @@
            (if (null? ss)
                #f
                (let ((ref (caar ss)))
-                 (cond ((ref-blocking-owner ref txn) => values)
-                       ((ref-other-ensurer ref txn) => values)
+                 (cond ((ref-held-against ref txn) => values)
                        ((not (eq? (car (jolt-ref-tvals ref)) (cdar ss))) 'again)
                        (else (cloop (cdr ss))))))))))))
 
-;; Under stm-mu, no user code: check, then publish. Answers (notes . latch) on
-;; success, else what txn-commit-conflict/locked found.
+;; Under stm-mu, no user code: check, then publish. Answers (notes) on success,
+;; else what txn-commit-conflict/locked found. Past the checks the status swaps
+;; to committing, which a barger can no longer undo.
 (define (txn-publish!/locked txn refs cells seen)
   (cond
     ((not (eq? (jolt-txn-status txn) 'running)) 'retry)
     ((txn-commit-conflict/locked txn refs cells seen) => values)
+    ((not (sa-record-cas! txn txn-status-slot 'running 'committing)) 'retry)
     (else
-     (jolt-txn-status-set! txn 'committing)
      (let* ((n (vector-length refs))
             (point (+ stm-clock 1))
             (notes (if (iref-any?)
@@ -362,7 +391,7 @@
          (jolt-ref-tvals-set! (vector-ref refs i) (vector-ref ntvs i)))
        (when jolt-mt? (memory-order-release))
        (set! stm-clock point)
-       (cons notes (txn-finish!/locked txn))))))
+       (list notes)))))
 
 ;; Returns the (ref old new) notifications, or throws the retry.
 (define (txn-commit! txn)
@@ -390,7 +419,7 @@
         (let ((r (jolt-with-mutex stm-mu (txn-publish!/locked txn refs cells seen))))
           (cond
             ((pair? r)
-             (when (cdr r) (stm-latch-release! (cdr r)))
+             (txn-release! txn)
              (car r))
             ((and (eq? r 'again) (fx< k stm-again-limit)) (again (fx+ k 1)))
             ((eq? r 'again) (stm-retry!))
@@ -477,7 +506,7 @@
   (let ((txn (jolt-ref-ensure-txn)))
     (txn-check-running! txn)
     (unless (memq ref (jolt-txn-ensures txn))
-      (txn-blocked! txn (jolt-with-mutex stm-mu (txn-ensure!/locked txn ref))))
+      (txn-blocked! txn (txn-ensure! txn ref)))
     (txn-get txn ref)))
 
 ;; __sync-call: run a thunk inside a transaction — the seam the sync/dosync
@@ -505,7 +534,9 @@
                     (let ((result (dyn-with-txn txn (lambda () (jolt-invoke thunk)))))
                       (cons result (if (txn-writes? txn) (txn-commit! txn) '()))))))
             ;; a commit lets go of its claims itself; any other end lets go here
-            (unless (pair? outcome) (txn-release! txn))
+            (unless (or (pair? outcome)
+                        (and (null? (jolt-txn-claims txn)) (null? (jolt-txn-ensures txn))))
+              (txn-release! txn))
             (cond
               ((not outcome)
                (let ((w (jolt-txn-wait-on txn))) (when w (txn-wait-for! w)))
