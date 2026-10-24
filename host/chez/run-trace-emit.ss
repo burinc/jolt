@@ -357,6 +357,16 @@
   (gate-check "(14) cp0 inlines the helper at every site" (gate-sub? opt "jolt-site-call") #f)
   (gate-check "(14) ...leaving no thunk behind" (gate-sub? opt "(lambda ()") #f)
   (gate-check "(14) ...and the restore inline" (count-sub opt "virtual-register) 12)") 4))
+;; also where the helper is free in a nested fn, and bound in several arities
+(for-each
+  (lambda (src)
+    (let ((opt (format "~s" (expand/optimize (read (open-input-string (emit-num src)))))))
+      (gate-check (string-append "(14) cp0 inlines every helper call: " src)
+                  (gate-sub? opt "jolt-site-call") #f)
+      (gate-check (string-append "(14) ...and every thunk: " src)
+                  (gate-sub? opt "(lambda ()") #f)))
+  '("(def _ (fn rt14e [g xs] (g (map (fn [x] (+ 1 (g x))) xs))))"
+    "(def _ (fn rt14f ([g] (+ 1 (g 1))) ([g x] (+ 1 (g x) (g x))) ([g x y] x)))"))
 ;; and it still runs
 (ev "(defn rt14d [g h m xs] (let [a (g m) b (h xs)] (if (g a) (h b) (g (h a)))))")
 (gate-check "(14) a fn with helper sites runs" (ev "(rt14d identity identity 3 7)") 7)
