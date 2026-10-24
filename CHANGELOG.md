@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary too, and prints the report at exit. Overhead measured 1–3%. Fiber
   preemption and `run-interruptible` now share each thread's engine timer
   through one scheduler instead of borrowing it from each other.
+- **Profile-guided builds: `jolt build --profile-gen` and `--profile-use`.**
+  A `--profile-gen` binary counts every basic block of the app and the
+  runtime, and writes the counts to `NAME-PID.jpd` (or `$JOLT_PROFILE_DATA`)
+  as it exits. `jolt build --profile-use run1.jpd run2.jpd …` compiles the
+  same sources with them, so Chez lays each function's hot blocks out first
+  and gives their variables the registers. A profile that no longer fits a
+  unit's code, or comes from a build in another mode, fails the build naming
+  the unit, rather than being ignored. Profiled units never share a build
+  cache entry with plain ones.
 
 ### Changed
 
@@ -67,6 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Futures and agent actions run on threads named like the JVM's.** A future or
   `send-off` action runs on `clojure-agent-send-off-pool-N` and a `send` action on
   `clojure-agent-send-pool-N`, where they were `Thread-N`.
+- **`jolt build` binaries are back near their 0.8.21 size (#1423).** 0.8.22
+  made every non-tail call in a traced build restore the trace site slot
+  inline, and with inspector information on Chez keeps each fn's expanded body
+  as data, so the restore was stored again for every call site: a 4,000-fn app
+  grew from 40.3 MB to 53.2 MB. The restore is now spelled once per fn clause
+  and the compiler inlines it back at each site, so the code that runs is the
+  same; the same app builds to 45.7 MB.
 
 - **A built binary no longer moves a dropped record's fields out of scope.**
   When `jolt build` dropped a `(let [p (->P a b)] …)` whose only uses were field

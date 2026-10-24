@@ -334,6 +334,17 @@ sa-fasl-read
 # degradation: sa-profile-instrument! answers #f when asked to turn on, and the
 # rest answer nothing (counts and release '(), compile just calls its thunk) — jolt.profile
 # then reports profiling as unsupported on the target.
+# Block profiles for `jolt build --profile-gen/--profile-use`: sa-compile-file's
+# (block-profile . #t) compiles with block counters; (sa-block-profile-dump!
+# path tag) writes them and answers how many (0 writes nothing);
+# (sa-block-profile-tag path) answers the tag a dump was written under; and
+# (sa-block-profile-load-unit! paths src) loads the dumps' data for one source
+# file before it compiles, #f when none covers its current text. Permitted
+# degradation: dump answers 0 and load-unit #f, which the build reports as a
+# profile that does not fit.
+sa-block-profile-dump!
+sa-block-profile-tag
+sa-block-profile-load-unit!
 sa-profile-instrument!
 sa-profile-instrumenting?
 sa-profile-compile
