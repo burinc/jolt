@@ -1493,6 +1493,9 @@
 ;; slot 11: java/async.ss jolt-vreg-chan-wait — (box . cell): the cell a thread
 ;;   blocked in <!! / >!! / alts!! points at the channel it waits on, so the one
 ;;   interrupt wake registered for its box can find it
+;; slot 13: ticks.ss jolt-vreg-ticks
+;; slot 14: printing.ss jolt-vreg-deref-printing — the cycle check's state for
+;;   the IDeref values this thread is printing
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
