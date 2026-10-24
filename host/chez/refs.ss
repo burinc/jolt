@@ -112,6 +112,7 @@
 (define stm-make-latch (lambda () #f))
 (define stm-latch-wait (lambda (latch ms) (void)))
 (define stm-latch-release! (lambda (latch) (void)))
+(define stm-raise (lambda (v) (jolt-throw v)))
 
 ;; (dyn-with-txn txn thunk) — scope *txn* over a dynamic extent.
 ;;
@@ -146,8 +147,9 @@
 ;; A clojure.lang.LockingTransaction$RetryEx, which is an Error on the JVM, so a
 ;; body's (catch Exception e) does not swallow it. One instance serves every retry,
 ;; made on first use under a mutex so every thread raises and recognizes the same one.
-;; It is raised without jolt-throw's stack capture: a retry is caught by jolt-sync
-;; and never reported, and under contention the capture was most of a retry's cost.
+;; The threaded host raises it without jolt-throw's stack capture (stm-raise): a
+;; retry is caught by jolt-sync and never reported, and under contention the
+;; capture was most of a retry's cost.
 (define stm-retry-ex #f)
 (define stm-retry-mu (make-mutex))
 (define (stm-retry!)
@@ -155,7 +157,7 @@
     (jolt-with-mutex stm-retry-mu
       (unless stm-retry-ex
         (set! stm-retry-ex (jolt-host-throwable "clojure.lang.LockingTransaction$RetryEx" jolt-nil)))))
-  (jolt-raise-thrown stm-retry-ex))
+  (stm-raise stm-retry-ex))
 (define (stm-retry? e)
   (and stm-retry-ex (eq? (jolt-unwrap-throw e) stm-retry-ex)))
 

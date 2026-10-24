@@ -178,6 +178,7 @@
 ;; on that one's latch, a mutex and a jolt-cv, for a bounded time; the owner
 ;; releases it when it finishes or is killed. The clock times barging.
 (set! stm-now-ms (lambda () (quotient (mono-nanos) 1000000)))
+(set! stm-raise jolt-raise-thrown)
 (set! stm-make-latch (lambda () (vector (make-mutex) (jolt-make-cv) #f)))
 (set! stm-latch-wait
   (lambda (l ms)
