@@ -44,9 +44,21 @@
 ;;
 ;; One port takes the whole of a chain of them (an atom holding an atom …): each
 ;; level writes its prefix, the next level, then its suffix, so the text is built
-;; once rather than copied at every level. The recursion is real, as the JVM's
-;; is, so a value that holds itself runs into the stack limit and raises
-;; StackOverflowError like any runaway recursion.
+;; once rather than copied at every level.
+;;
+;; A value that holds itself, directly or through collections and other IDeref
+;; values, recurses forever, and the JVM raises StackOverflowError for it. Here
+;; the stack limit is sized from the heap, so the heap would fill first; instead
+;; the nesting is checked for a cycle as it goes, with Brent's method: vreg 14
+;; holds #(saved depth power) for this thread's innermost IDeref being printed.
+;; Each level compares itself with saved, and when its depth reaches power it
+;; becomes saved and power doubles. Printing walks one path at a time and takes
+;; the same step from the same value, so a cycle on that path repeats and meets
+;; saved within about twice its length; a value seen again by eq? is the only
+;; trigger, so a deep chain without a cycle never raises, and the check is one
+;; comparison and three words a level. The state is restored in a masked
+;; winder, so a throw or an interrupt cannot leave a stale saved value behind.
+(define jolt-vreg-deref-printing 14)   ; #(saved depth power), or 0 outside a print
 (define deref-print-arms '())
 (define (deref-print-state x)
   (let loop ((as deref-print-arms))
@@ -55,6 +67,22 @@
           (else (loop (cdr as))))))
 (define (display-to port s) (display s port))
 (define (deref-print-to! port x state readable?)
+  (let* ((st (virtual-register jolt-vreg-deref-printing))
+         (saved (if (vector? st) (vector-ref st 0) #f))
+         (depth (if (vector? st) (fx+ (vector-ref st 1) 1) 1))
+         (power (if (vector? st) (vector-ref st 2) 1))
+         (next (if (fx=? depth power)
+                   (vector x depth (fx* power 2))
+                   (vector saved depth power)))
+         (lv (jolt-locks-held)))
+    (when (eq? x saved)
+      (jolt-throw (jolt-host-throwable "java.lang.StackOverflowError" jolt-nil)))
+    (jolt-locks-enter!)
+    (dynamic-wind
+      (lambda () (set-virtual-register! jolt-vreg-deref-printing next))
+      (jolt-masked-body (lambda () (deref-print-body! port x state readable?)))
+      (jolt-masked-after lv (set-virtual-register! jolt-vreg-deref-printing st)))))
+(define (deref-print-body! port x state readable?)
   (let ((sv (state x)))
     (display-to port "#object[")
     (display-to port (jolt-class-name x))
@@ -78,7 +106,11 @@
         (get-output-string port))))
   (set! deref-print-arms (cons (cons pred state) deref-print-arms))
   (register-pr-str-arm! pred (form #f))
-  (register-pr-readable-arm! pred (form #t)))
+  (register-pr-readable-arm! pred (form #t))
+  ;; str is toString, which an IDeref does not override: Class@hash, the value
+  ;; never visited
+  (register-str-render! pred
+    (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x)))))
 (register-deref-print! jolt-atom? (lambda (a) (cons "ready" (jolt-atom-val a))))
 ;; inside a transaction a ref prints its in-transaction value
 (register-deref-print! jolt-ref? (lambda (r) (cons "ready" (txn-read r))))
