@@ -10,4 +10,12 @@
 
 (defn cold [n] (inc (spin n)))
 
-(defn driver [n] (+ (hot n) (cold n)))
+;; hot and cold take turns, in rounds much longer than a 1 ms interval, so a
+;; stretch of noise in the CPU clock (a CI runner's) lands on both of them
+;; rather than on whichever ran through it
+(defn driver [n]
+  (let [m (quot n 8)]
+    (loop [r 0 acc 0]
+      (if (< r 8)
+        (recur (inc r) (+ acc (hot m) (cold m)))
+        acc))))

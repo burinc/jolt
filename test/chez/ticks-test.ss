@@ -151,5 +151,14 @@
   (ok "8. and the thread settles back to solo" (eq? 0 (jolt-tick-state))))
 (restore-clients!)
 
+;; --- 9. the sampler's demand ------------------------------------------------
+;; Ticks per nanosecond as measured, bounded: a short reading may double the
+;; demand but not jump it to the ceiling.
+(ok "9. a steady rate keeps the demand" (= 10000 (jolt-sample-next-demand 10000 1000000 1000000)))
+(ok "9. half the time left halves it" (= 5000 (jolt-sample-next-demand 10000 500000 1000000)))
+(ok "9. a clock that did not move doubles it" (= 20000 (jolt-sample-next-demand 10000 1000000 0)))
+(ok "9. a reading 100x short doubles it, no more" (= 20000 (jolt-sample-next-demand 10000 1000000 10000)))
+(ok "9. never under the floor" (= jolt-sample-min-ticks (jolt-sample-next-demand 1000 1 1000000)))
+
 (printf "ticks-test: ~a checks, ~a failure(s)\n" total fails)
 (exit (if (fx=? fails 0) 0 1))

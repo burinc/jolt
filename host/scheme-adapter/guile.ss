@@ -186,6 +186,9 @@
 ;;   sa-profile-compile     UNIMPLEMENTED  call the thunk.
 ;;   sa-profile-counts      UNIMPLEMENTED  '().
 ;;   sa-profile-release!    UNIMPLEMENTED  '().
+;;   sa-block-profile-dump! UNIMPLEMENTED  0 (no block counters).
+;;   sa-block-profile-tag   UNIMPLEMENTED  raise.
+;;   sa-block-profile-load-unit! UNIMPLEMENTED  #f.
 ;;   sa-profile-clear!      UNIMPLEMENTED  no-op.
 
 ;; ---------------------------------------------------------------------------
