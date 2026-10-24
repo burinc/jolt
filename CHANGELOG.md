@@ -53,6 +53,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A transaction no longer holds a lock while its code runs.** Every `dosync`
+  ran under one global lock, so a body that waited on another thread's
+  transaction hung: `(dosync @(future (dosync (ref 1))))` never returned. The
+  STM now works like the JVM's: a transaction reads the refs as of its start,
+  claims each ref it writes, and commits under a short lock that no user code
+  runs under, so a body, a commute fn or a validator can wait on another
+  transaction. A transaction blocked by another one's claim waits for it and
+  retries; an older one that has been held up barges past younger ones instead
+  of starving, and `ensure` holds writers off until the ensuring transaction
+  ends. `commute` reapplies at commit, `ref-set` after `commute` throws,
+  validators run on the committed value, refs keep history (`ref-history-count`,
+  `:min-history`, `:max-history`), and a body that keeps conflicting stops after
+  10000 tries with `Transaction failed after reaching retry limit`. A `(ref x
+  :validator f)` validator also runs now; it was skipped until something else
+  installed a watch or validator.
+- **Collections report the JVM's class ancestry.** Maps, sets and vectors are
+  `AFn`, `IFn` and `IHashEq`, maps are `MapEquivalence`, maps and vectors are
+  `IKVReduce` (subvecs too), and seqs and lists are `IHashEq`, in `ancestors`
+  and `instance?`. `(.kvreduce m f init)` works on maps and vectors, where a map
+  answered nil.
+- **`(.comparator sorted-coll)` is the comparator it was built with.** It was an
+  unclassed object that printed as `#object[:object]`; it is now the fn given to
+  `sorted-map-by` / `sorted-set-by`, or `clojure.lang.RT$DefaultComparator`.
+  `.compare` on a fn answers -1, 1 or 0 for a boolean result and the `intValue`
+  of a number, as `AFunction.compare` does.
+- **Refs, atoms, agents, volatiles, delays, futures and promises print like the
+  JVM's.** They printed as a bare `#object[clojure.lang.Atom]`; they now print
+  `#object[clojure.lang.Atom 0x1b2c3d4e {:status :ready, :val 1}]`, with the
+  identity hash, `:pending` for an unrealized delay, future or promise, and
+  `:failed` for a failed agent or future.
+- **Futures and agent actions run on threads named like the JVM's.** A future or
+  `send-off` action runs on `clojure-agent-send-off-pool-N` and a `send` action on
+  `clojure-agent-send-pool-N`, where they were `Thread-N`. A pool reuses the
+  numbers of its finished workers.
 - **`jolt build` binaries are back near their 0.8.21 size (#1423).** 0.8.22
   made every non-tail call in a traced build restore the trace site slot
   inline, and with inspector information on Chez keeps each fn's expanded body

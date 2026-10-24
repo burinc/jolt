@@ -170,7 +170,10 @@
            (adopt-interrupt-box! ibox)
            (dyn-binding-stack snap)
            (chez-current-ns-param ns)
-           (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+           (let* ((slot (agent-pool-take! 'send-off))
+                  (_ (jolt-thread-name-set! (get-thread-id) (agent-pool-thread-name 'send-off slot)))
+                  (r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+             (agent-pool-give! 'send-off slot)
              (dyn-binding-stack '())
              (chez-current-ns-param own-ns)
              (adopt-interrupt-box! own)
@@ -181,6 +184,22 @@
                  (jolt-future-done?-set! f #t))
                (jolt-cv-wake! (jolt-future-cv f))))))))
     f))
+
+;; The STM's waits (refs.ss): a transaction blocked by another one's claim waits
+;; on that one's latch, a mutex and a jolt-cv, for a bounded time; the owner
+;; releases it when it finishes or is killed. The clock times barging.
+(set! stm-now-ms (lambda () (quotient (mono-nanos) 1000000)))
+(set! stm-raise jolt-raise-thrown)
+(set! stm-make-latch (lambda () (vector (make-mutex) (jolt-make-cv) #f)))
+(set! stm-latch-wait
+  (lambda (l ms)
+    (jolt-cv-wait (vector-ref l 0) (vector-ref l 1) (mono-deadline ms)
+      (lambda (timed-out?) (if (or timed-out? (vector-ref l 2)) #t jolt-cv-again)))))
+(set! stm-latch-release!
+  (lambda (l)
+    (jolt-with-mutex (vector-ref l 0)
+      (vector-set! l 2 #t)
+      (jolt-cv-wake! (vector-ref l 1)))))
 
 ;; Wrap a task's captured throw in an ExecutionException, the original as the
 ;; cause so ex-cause and .getCause both reach it. One helper for every place a
@@ -516,7 +535,31 @@
          (loop))
         (else (void))))))
 
-;; Thread-local list of (agent f . args) sent from within the action currently
+;; The agent system's pool threads carry the names the JVM's thread factories give
+;; them: send runs on clojure-agent-send-pool-N, send-off and future on
+;; clojure-agent-send-off-pool-N, each pool numbering its own threads from 0. A
+;; worker takes the lowest number no running worker of its pool holds and gives
+;; it back when it ends, as a pool hands work to an idle thread, so the numbers
+;; stay as low as the pool's concurrency.
+(define agent-pool-slots (vector (vector 0 '()) (vector 0 '())))   ; #(next free)
+(define agent-pool-mu (make-mutex))
+(define (agent-pool-of pool) (vector-ref agent-pool-slots (if (eq? pool 'send) 0 1)))
+(define (agent-pool-take! pool)
+  (jolt-with-mutex agent-pool-mu
+    (let* ((slot (agent-pool-of pool)) (free (vector-ref slot 1)))
+      (if (pair? free)
+          (begin (vector-set! slot 1 (cdr free)) (car free))
+          (let ((n (vector-ref slot 0))) (vector-set! slot 0 (+ n 1)) n)))))
+(define (agent-pool-give! pool n)
+  (jolt-with-mutex agent-pool-mu
+    (let ((slot (agent-pool-of pool)))
+      (vector-set! slot 1 (let ins ((l (vector-ref slot 1)))
+                            (if (or (null? l) (< n (car l))) (cons n l) (cons (car l) (ins (cdr l)))))))))
+(define (agent-pool-thread-name pool n)
+  (string-append (if (eq? pool 'send) "clojure-agent-send-pool-" "clojure-agent-send-off-pool-")
+                 (number->string n)))
+
+;; Thread-local list of (agent pool f . args) sent from within the action currently
 ;; running on this thread (#f outside an action). Holds nested sends until the
 ;; action completes, like the JVM's ThreadLocal `nested`. Its box-ness is also
 ;; the signal that *agent* is bound (an action is in flight on this thread).
@@ -590,10 +633,14 @@
 
 ;; Enqueue an action and start the worker if the agent is idle. No precondition
 ;; checks — used by the direct send path (after checks), by nested-send release,
-;; and by restart resuming a held queue.
-(define (jolt-agent-enqueue! a f args)
+;; and by restart resuming a held queue. A queue entry is (pool f . args): pool is
+;; send, send-off, or #f for an executor of the caller's (send-via). An action
+;; that reaches send's fixed pool holds the process up for good, as that pool's
+;; worker does.
+(define (jolt-agent-enqueue! a pool f args)
+  (when (eq? pool 'send) (exit-hold-pooled!))
   (jolt-with-mutex (jolt-agent-mu a)
-    (jagent-q-push! a (cons f args))
+    (jagent-q-push! a (cons* pool f args))
     (unless (jolt-agent-running? a)
       (jolt-agent-running?-set! a #t)
       (fork-agent-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
@@ -609,7 +656,7 @@
         0
         (let ((sends (unbox nested)))
           (set-box! nested '())
-          (for-each (lambda (e) (jolt-agent-enqueue! (car e) (cadr e) (cddr e)))
+          (for-each (lambda (e) (jolt-agent-enqueue! (car e) (cadr e) (caddr e) (cdddr e)))
                     (reverse sends))
           (length sends)))))
 
@@ -618,23 +665,34 @@
 ;; sends it accumulated; a thrown action invokes the error-handler (if any, its
 ;; throws swallowed) and then either continues (:continue, state left untouched)
 ;; or fails the agent (:fail, error stored, queue halted).
+;; The worker takes the name of the pool each action was sent to, one number per
+;; pool for the worker's life (names: pool -> number, cur: the pool it is named
+;; for), and gives the numbers back when it goes idle.
 (define (jolt-agent-worker a)
   (*txn* #f)                          ; agent worker must not inherit parent's txn
-  (let loop ()
+  (let loop ((names '()) (cur #f))
     (let ((act (jolt-with-mutex (jolt-agent-mu a)
                  (if (or (not (jolt-nil? (jolt-agent-err a))) (jagent-q-empty? a))
                      (begin (jolt-agent-running?-set! a #f)
                             (jolt-cv-wake! (jolt-agent-cv a)) #f)
                      (jagent-q-pop! a)))))
       ;; idle: the pool worker this stands for would linger (exit wait, below)
-      (unless act (exit-linger-after-task!))
+      (unless act
+        (for-each (lambda (pn) (agent-pool-give! (car pn) (cdr pn))) names)
+        (exit-linger-after-task!))
       (when act
+        (let* ((pool (car act))
+               (names (if (or (not pool) (eq? pool cur) (assq pool names))
+                          names
+                          (cons (cons pool (agent-pool-take! pool)) names))))
+          (when (and pool (not (eq? pool cur)))
+            (jolt-thread-name-set! (get-thread-id) (agent-pool-thread-name pool (cdr (assq pool names)))))
         (parameterize ((*agent-nested* (box '())))
           (let ((err #f))
             (guard (e (#t (set! err (jolt-unwrap-throw e))))
               (let* ((old (jolt-agent-state a))
                      (nv (with-agent-binding a
-                           (lambda () (apply jolt-invoke (car act) old (cdr act))))))
+                           (lambda () (apply jolt-invoke (cadr act) old (cddr act))))))
                 (let ((vf (jolt-agent-validator a)))
                   (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf nv)))
                     (jolt-iref-state-throw)))
@@ -653,11 +711,11 @@
                       (jolt-agent-err-set! a err)
                       (jolt-cv-wake! (jolt-agent-cv a)))))
                 (jolt-release-pending-sends))))   ; success: flush nested sends
-        (loop)))))
+        (loop names (or pool cur)))))))
 
-;; send / send-off: enqueue the action, start the worker if idle. (jolt treats
-;; them identically — one serialized worker per agent — observably a superset of
-;; the JVM fixed/cached pool split.) A send after shutdown-agents, to a failed
+;; send / send-off: enqueue the action, start the worker if idle. (One serialized
+;; worker per agent runs both, observably a superset of the JVM fixed/cached pool
+;; split; the pool names the worker's thread.) A send after shutdown-agents, to a failed
 ;; agent, inside a transaction, or from within an action is handled specially.
 ;; A send after shutdown-agents is the pool REJECTING the action, which the JVM's
 ;; Agent catches and hands to the agent's error handler: the send itself returns
@@ -668,15 +726,14 @@
 ;; what keeps the process up after it: send's fixed pool for good, send-off's cached
 ;; pool for its keep-alive (the exit wait, below). send-via takes the caller's
 ;; executor and holds nothing of the agent system's.
-;; The fixed pool gains a worker only once an action reaches it: a send that
-;; throws (a failed agent) or is rejected holds nothing up.
+;; The fixed pool gains a worker only once an action reaches it (jolt-agent-enqueue!):
+;; a send that throws (a failed agent) or is rejected holds nothing up.
 (define (jolt-agent-send a f . args)
-  (apply jolt-agent-dispatch a f args)
-  (unless (jolt-agents-shutdown?) (exit-hold-pooled!))
-  a)
+  (apply jolt-agent-dispatch 'send a f args))
 (define (jolt-agent-send-off a f . args)
-  (apply jolt-agent-dispatch a f args))
-(define (jolt-agent-dispatch a f . args)
+  (apply jolt-agent-dispatch 'send-off a f args))
+;; A send inside a transaction is held as a thunk the commit runs (refs.ss).
+(define (jolt-agent-dispatch pool a f . args)
   (cond
     ((jolt-agents-shutdown?)
      (let ((handler (jolt-agent-err-handler a)))
@@ -690,11 +747,12 @@
     ((*txn*)
      (let ((txn (*txn*)))
        (jolt-txn-pending-sends-set! txn
-         (cons (apply list a f args) (jolt-txn-pending-sends txn)))))
+         (cons (lambda () (apply jolt-agent-dispatch pool a f args))
+               (jolt-txn-pending-sends txn)))))
     ((jolt-in-agent-action?)
      (let ((nested (*agent-nested*)))
-       (set-box! nested (cons (cons* a f args) (unbox nested)))))
-    (else (jolt-agent-enqueue! a f args)))
+       (set-box! nested (cons (cons* a pool f args) (unbox nested)))))
+    (else (jolt-agent-enqueue! a pool f args)))
   a)
 
 ;; (await & agents) / (await-for ms & agents): block until each agent's queue has
@@ -803,7 +861,7 @@
 ;; The action runs on jolt's agent worker whatever executor is named; it holds
 ;; the exit as that worker does (the 60s linger), not as the fixed send pool.
 (define (jagent-dispatch-3 a f args _exec)
-  (apply jolt-agent-dispatch a f (rd-args->list args)))
+  (apply jolt-agent-dispatch #f a f (rd-args->list args)))
 (define (jagent-method name argc)
   (cond ((string=? name "getError")        (and (fx=? argc 0) jolt-agent-error))
         ((string=? name "getErrorMode")    (and (fx=? argc 0) jolt-agent-get-error-mode))
@@ -1007,6 +1065,26 @@
 (define-record-type jolt-delay (fields thunk (mutable realized?) (mutable value) (mutable exn))
   (nongenerative jolt-delay-v2))
 (define (jolt-make-delay thunk) (make-jolt-delay thunk #f jolt-nil #f))
+
+;; How futures, promises, delays and agents print (printing.ss register-deref-print!):
+;; pending until realized, failed with the throwable a deref would raise, else
+;; ready with the value. A failed agent prints its state.
+(register-deref-print! jolt-future?
+  (lambda (f)
+    (cond ((not (jolt-future-done? f)) (cons "pending" jolt-nil))
+          ((jolt-future-cancelled? f)
+           (cons "failed" (jolt-host-throwable "java.util.concurrent.CancellationException" jolt-nil)))
+          ((jolt-future-ok? f) (cons "ready" (jolt-future-payload f)))
+          (else (cons "failed" (task-execution-exception (jolt-future-payload f)))))))
+(register-deref-print! jolt-promise?
+  (lambda (p) (if (jolt-promise-delivered? p) (cons "ready" (jolt-promise-value p)) (cons "pending" jolt-nil))))
+(register-deref-print! jolt-delay?
+  (lambda (d)
+    (cond ((not (jolt-delay-realized? d)) (cons "pending" jolt-nil))
+          ((jolt-delay-exn d) (cons "failed" (jolt-unwrap-throw (jolt-delay-exn d))))
+          (else (cons "ready" (jolt-delay-value d))))))
+(register-deref-print! jolt-agent?
+  (lambda (a) (cons (if (jolt-nil? (jolt-agent-err a)) "ready" "failed") (jolt-agent-state a))))
 ;; run the thunk once, like Clojure's Delay: if it throws, cache the exception
 ;; (the delay IS realized) and re-throw it on every deref — do NOT re-run the
 ;; body (so value-fns memoize and there is no cache-stampede / retried side
@@ -1176,7 +1254,7 @@
 (def-var! "clojure.core" "send-off" jolt-agent-send-off)
 ;; send-via takes an executor jolt has no model for; behave as send and ignore it.
 (def-var! "clojure.core" "send-via"
-  (lambda (_exec a f . args) (apply jolt-agent-dispatch a f args)))
+  (lambda (_exec a f . args) (apply jolt-agent-dispatch #f a f args)))
 ;; Documented superset no-ops: jolt has no executor pool, so these accept and
 ;; ignore their argument, returning nil (as the JVM setters would).
 (def-var! "clojure.core" "set-agent-send-executor!" (lambda (_e) jolt-nil))

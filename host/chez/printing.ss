@@ -37,6 +37,52 @@
   (register-pr-str-arm! pred render)
   (register-pr-readable-arm! pred render))
 
+;; An IDeref value prints as the JVM's print-tagged-object over deref-as-map:
+;; #object[cls 0xHASH {:status :ready, :val v}], the value printed the way the
+;; enclosing pr or print prints. state answers (status . val), status one of
+;; "ready", "pending" or "failed".
+;;
+;; One port takes the whole of a chain of them (an atom holding an atom …): each
+;; level writes its prefix, the next level, then its suffix, so the text is built
+;; once rather than copied at every level. The recursion is real, as the JVM's
+;; is, so a value that holds itself runs into the stack limit and raises
+;; StackOverflowError like any runaway recursion.
+(define deref-print-arms '())
+(define (deref-print-state x)
+  (let loop ((as deref-print-arms))
+    (cond ((null? as) #f)
+          (((caar as) x) (cdar as))
+          (else (loop (cdr as))))))
+(define (display-to port s) (display s port))
+(define (deref-print-to! port x state readable?)
+  (let ((sv (state x)))
+    (display-to port "#object[")
+    (display-to port (jolt-class-name x))
+    (display-to port " 0x")
+    (display-to port (jolt-identity-hex x))
+    (display-to port " {:status :")
+    (display-to port (car sv))
+    (display-to port ", :val ")
+    (let* ((v (cdr sv))
+           (user (and readable? pr-user-method-render (pr-user-method-render v)))
+           (inner (and (not user) (deref-print-state v))))
+      (cond (user (display-to port user))
+            (inner (deref-print-to! port v inner readable?))
+            (else (display-to port (if readable? (jolt-pr-readable v) (jolt-pr-str v))))))
+    (display-to port "}]")))
+(define (register-deref-print! pred state)
+  (define (form readable?)
+    (lambda (x)
+      (let ((port (open-output-string)))
+        (deref-print-to! port x state readable?)
+        (get-output-string port))))
+  (set! deref-print-arms (cons (cons pred state) deref-print-arms))
+  (register-pr-str-arm! pred (form #f))
+  (register-pr-readable-arm! pred (form #t)))
+(register-deref-print! jolt-atom? (lambda (a) (cons "ready" (jolt-atom-val a))))
+;; inside a transaction a ref prints its in-transaction value
+(register-deref-print! jolt-ref? (lambda (r) (cons "ready" (txn-read r))))
+
 ;; A user's (defmethod print-method T …) IS the printer for T, as on the JVM — it
 ;; outranks every built-in rendering, including an arm a library registered for
 ;; its own host class. So the user method is consulted BEFORE the arm list rather

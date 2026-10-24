@@ -886,7 +886,7 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "\"#object[java.net.URI \\\"file:/tmp/x\\\"]\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
-  {:suite "ioreader" :expr "(pr-str (atom 1))" :expected "\"#object[clojure.lang.Atom]\""}
+  {:suite "ioreader" :expr "(clojure.string/replace (pr-str (atom 1)) #\" 0x[0-9a-f]+ \" \" \")" :expected "\"#object[clojure.lang.Atom {:status :ready, :val 1}]\""}
  ;; io/resource has two branches — a source root (a jfile) and an embedded resource
  ;; baked into the image by make-devboot / jolt build. Which one serves a stdlib
  ;; path depends on whether target/dev/flat.so is fresh, so these assert only what
