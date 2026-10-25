@@ -66,6 +66,17 @@
                          (string-append "No enum constant "
                                         (hsc-canonical-name (enum-info-fqn info)) "." nm)))))
 
+;; Enum.valueOf(Class, String): the class must be an enum before the name is
+;; looked at.
+(define (enum-valueof-class cls nm)
+  (when (jolt-nil? cls) (throw-jvm 'NullPointerException jolt-nil))
+  (let ((info (enum-class-info cls)))
+    (unless info
+      (throw-jvm 'IllegalArgumentException
+                 (string-append (if (jclass? cls) (jclass-jvm-name cls) (jolt-final-str cls))
+                                " is not an enum class")))
+    (enum-value-of info nm)))
+
 ;; ---- Enum's instance methods ---------------------------------------------------
 (define (enum-self-info self)
   (or (enum-of self)
@@ -80,7 +91,9 @@
         (cons "compareTo"
               (lambda (self other)
                 (let ((a (enum-self-info self)))
-                  (when (jolt-nil? other) (throw-jvm 'NullPointerException jolt-nil))
+                  (when (jolt-nil? other)
+                    (throw-jvm 'NullPointerException
+                               "Cannot invoke \"Object.getClass()\" because \"other\" is null"))
                   (let ((b (enum-of other)))
                     (unless (and b (eq? (car a) (car b)))
                       (throw-jvm 'ClassCastException jolt-nil))
@@ -93,6 +106,17 @@
   (let ((h (make-hashtable string-hash string=?)))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) enum-instance-methods)
     h))
+
+;; compare and sort reach a constant's compareTo through jolt-compare-miss
+;; (host-class.ss), which asks it only of a pair of one class; a constant is
+;; asked whatever it is compared with, so another enum's constant is refused by
+;; compareTo's own bare ClassCastException.
+(set! jolt-compare-miss
+  (let ((prior jolt-compare-miss))
+    (lambda (a b)
+      (if (enum-of a)
+          (jnum->exact (record-method-dispatch a "compareTo" (jolt-list b)))
+          (prior a b)))))
 
 ;; The end of the dispatch chain for a constant that is not a jhost (a library's
 ;; value): the method, or #f.
@@ -142,21 +166,8 @@
          (and enum-jrec-declared? (jrec? x) (enum-jrec-render x)))))
 (set-jrec-enum-constant-test! (lambda (x) (and enum-jrec-declared? (enum-of x) #t)))
 
-;; pr of any constant: #object[<fqn> 0xHASH "<toString>"] (rt.ss jolt-object-repr).
-;; Asked of every value that reaches the #object fallback, so a jhost is first
-;; matched by its tag object and any other value only once a constant that is no
-;; jhost has been declared.
-(define enum-other-declared? #f)
-(set! jolt-object-repr-hash?
-  (lambda (x)
-    (if (jhost? x)
-        (let ((t (jhost-tag x)))
-          (and (exists (lambda (e) (eq? (vector-ref e 0) t)) enum-jhost-tags)
-               (enum-constant? x)))
-        (and enum-other-declared? (enum-constant? x)))))
-
 ;; ---- registration ---------------------------------------------------------------
-(define (enum-register! fqn constants statics!)
+(define (enum-register! fqn constants statics! value-of-other)
   (let* ((names (list->vector (map car constants)))
          (consts (list->vector (map cdr constants)))
          (by-name (make-hashtable string-hash string=?))
@@ -188,11 +199,19 @@
         (when (fx<? i (vector-length consts))
           (hashtable-set! enum-const-tbl (vector-ref consts i) (cons info i))
           (when (jrec? (vector-ref consts i)) (set! enum-jrec-declared? #t))
-          (unless (jhost? (vector-ref consts i)) (set! enum-other-declared? #t))
           (loop (fx+ i 1)))))
+    ;; valueOf(String) is the class's own; valueOf(Class, String) is Enum's,
+    ;; which every enum class inherits. A class with a further overload of its
+    ;; own (RoundingMode.valueOf(int)) hands it in as VALUE-OF-OTHER, called for
+    ;; a one-argument call that is no String.
     (statics! fqn (append constants
                           (list (cons "values" (lambda () (enum-values-array info)))
-                                (cons "valueOf" (lambda (nm) (enum-value-of info nm))))))
+                                (cons "valueOf"
+                                      (case-lambda
+                                        ((nm) (if (and value-of-other (not (string? nm)) (not (jolt-nil? nm)))
+                                                  (value-of-other nm)
+                                                  (enum-value-of info nm)))
+                                        ((cls nm) (enum-valueof-class cls nm)))))))
     (jch-register-supers! fqn '("java.lang.Enum"))
     (jch-mark-enum! fqn)
     (jch-mark-final! fqn)
@@ -218,8 +237,10 @@
     info))
 
 ;; The host's own enums: their statics are the runtime's (register-class-statics!).
-(define (register-enum-class! fqn constants)
-  (enum-register! fqn constants register-class-statics!))
+(define register-enum-class!
+  (case-lambda
+    ((fqn constants) (enum-register! fqn constants register-class-statics! #f))
+    ((fqn constants value-of-other) (enum-register! fqn constants register-class-statics! value-of-other))))
 
 ;; A library's enum: its statics go through the provider guard like any other
 ;; library registration (register-class-statics-user!).
@@ -228,7 +249,7 @@
     (enum-register! fqn
                     (map (lambda (p) (cons (jolt-final-str (jolt-nth p 0)) (jolt-nth p 1)))
                          (seq->list (jolt-seq constants)))
-                    register-class-statics-user!)
+                    register-class-statics-user! #f)
     jolt-nil))
 
 ;; ---- Class and java.lang.Enum --------------------------------------------------
@@ -239,15 +260,5 @@
                 (let ((info (enum-class-info self)))
                   (if info (enum-values-array info) jolt-nil))))))
 
-;; Enum.valueOf(Class, String): the class must be an enum before the name is
-;; looked at.
-(register-class-statics! "java.lang.Enum"
-  (list (cons "valueOf"
-              (lambda (cls nm)
-                (when (jolt-nil? cls) (throw-jvm 'NullPointerException jolt-nil))
-                (let ((info (enum-class-info cls)))
-                  (unless info
-                    (throw-jvm 'IllegalArgumentException
-                               (string-append (if (jclass? cls) (jclass-jvm-name cls) (jolt-final-str cls))
-                                              " is not an enum class")))
-                  (enum-value-of info nm))))))
+;; java.lang.Enum's one static
+(register-class-statics! "java.lang.Enum" (list (cons "valueOf" enum-valueof-class)))

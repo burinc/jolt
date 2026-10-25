@@ -528,8 +528,15 @@
 (define jbd-rounding-mode-names
   '("UP" "DOWN" "CEILING" "FLOOR" "HALF_UP" "HALF_DOWN" "HALF_EVEN" "UNNECESSARY"))
 (define (jbd-rounding-mode-constant? x) (and (jhost? x) (string=? (jhost-tag x) "rounding-mode")))
-(register-enum-class! "java.math.RoundingMode"
+(define jbd-rounding-mode-constants
   (map (lambda (n) (cons n (make-jhost "rounding-mode" n))) jbd-rounding-mode-names))
+;; RoundingMode.valueOf(int): the legacy BigDecimal.ROUND_* number
+(register-enum-class! "java.math.RoundingMode" jbd-rounding-mode-constants
+  (lambda (n)
+    (let ((i (and (number? n) (exact? n) (integer? n) n)))
+      (if (and i (<= 0 i 7))
+          (cdr (list-ref jbd-rounding-mode-constants i))
+          (throw-jvm 'IllegalArgumentException "argument out of range")))))
 (class-statics-merge! "java.math.BigDecimal"
   (let loop ((ns jbd-rounding-mode-names) (i 0) (acc '()))
     (if (null? ns) (reverse acc)

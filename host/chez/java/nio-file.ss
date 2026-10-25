@@ -1140,9 +1140,11 @@
                      "unsupported output option"))))
      syms)
     ;; SPARSE is a hint the JDK may ignore, and does on most filesystems; the
-    ;; three others act on the port (nio-open-output-port)
-    (let* ((syms (filter (lambda (s) (not (memq s '(delete-on-close sparse sync dsync)))) syms))
-           (defaults? (null? syms))
+    ;; three others act on the port (nio-open-output-port). Any option at all,
+    ;; one of these four included, replaces the CREATE + TRUNCATE_EXISTING +
+    ;; WRITE default.
+    (let* ((defaults? (null? syms))
+           (syms (filter (lambda (s) (not (memq s '(delete-on-close sparse sync dsync)))) syms))
            (append? (memq 'append syms))
            (truncate? (or defaults? (memq 'truncate-existing syms)))
            (create-new? (memq 'create-new syms))
@@ -1586,25 +1588,29 @@
 
 ;; java.nio.channels.FileChannel/open — babashka.fs/touch uses it only to create
 ;; a file (CREATE + WRITE) inside with-open, so support open+close of a channel.
-;; State: #(path delete-on-close?); DELETE_ON_CLOSE removes the file at close.
-(define (fc-close! self)
-  (let ((st (jhost-state self)))
-    (when (vector-ref st 1)
-      (vector-set! st 1 #f)
-      (guard (_ (#t #f)) (delete-file (vector-ref st 0))))
-    jolt-nil))
+;; State: #(path size-at-open|#f). DELETE_ON_CLOSE unlinks the file as the
+;; channel opens, as the stream opens do (nio-delete-on-close!); nothing writes
+;; through this channel, so the size it had then is its size.
+(define (fc-close! self) jolt-nil)
 (let ((fc-statics
        (list (cons "open" (lambda (path . opts)
                             (let ((fp (nfp path)))
                               (when (and (nio-opts-have? opts oopt-sym 'create) (not (file-exists? fp)))
                                 (close-port (open-file-output-port fp (file-options no-fail))))
-                              (make-jhost "file-channel"
-                                          (vector fp (nio-opts-have? opts oopt-sym 'delete-on-close)))))))))
+                              (if (nio-opts-have? opts oopt-sym 'delete-on-close)
+                                  (begin
+                                    (when (nio-windows?)
+                                      (throw-jvm 'UnsupportedOperationException "DELETE_ON_CLOSE not supported"))
+                                    (let ((size (nio-size fp (nio-shown path))))
+                                      (guard (_ (#t #f)) (delete-file fp))
+                                      (make-jhost "file-channel" (vector fp size))))
+                                  (make-jhost "file-channel" (vector fp #f)))))))))
   (register-class-statics! "FileChannel" fc-statics)
   (register-class-statics! "java.nio.channels.FileChannel" fc-statics))
 (register-host-methods! "file-channel"
   (list (cons "close" fc-close!)
-        (cons "size" (lambda (self) (nio-size (vector-ref (jhost-state self) 0))))))
+        (cons "size" (lambda (self) (or (vector-ref (jhost-state self) 1)
+                                        (nio-size (vector-ref (jhost-state self) 0)))))))
 (let ((prev jolt-close))
   (set! jolt-close (lambda (x) (if (and (jhost? x) (string=? (jhost-tag x) "file-channel")) (fc-close! x) (prev x))))
   (def-var! "clojure.core" "__close" jolt-close))

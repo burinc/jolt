@@ -1475,6 +1475,7 @@
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")
     ("linkedhashset" . "java.util.LinkedHashSet")
+    ("hashset-iterator" . "java.util.HashMap$KeyIterator")
     ;; tree-map.ss: a TreeMap, its views, a TreeSet, and the Comparator objects
     ("treemap" . "java.util.TreeMap")
     ("treemap-asc-sub" . "java.util.TreeMap$AscendingSubMap")

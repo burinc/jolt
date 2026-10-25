@@ -911,16 +911,10 @@
 ;; Chez): the count of any array-like, nil refused — post-prelude names it.
 (define (jolt-alength a)
   (if (jolt-nil? a) (error 'alength "null") (jolt-count a)))
-;; A value whose print form carries its identity hash (rt.ss on Chez, where the
-;; enum model sets it); no value on this host asks.
-(define jolt-object-repr-hash? (lambda (x) #f))
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
          (content (guard (e (#t #f)) (jolt-object-content x)))
-         (head (and (string? cls)
-                    (if (jolt-object-repr-hash? x)
-                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
-                        (string-append "#object[" cls)))))
+         (head (and (string? cls) (string-append "#object[" cls " 0x" (jolt-identity-hex x)))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))

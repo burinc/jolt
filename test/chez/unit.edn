@@ -885,7 +885,7 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "\"#object[java.net.URI \\\"file:/tmp/x\\\"]\""}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (clojure.string/replace (pr-str (io/file \"/tmp/x\")) #\" 0x[0-9a-f]+\" \"\"))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
   {:suite "ioreader" :expr "(clojure.string/replace (pr-str (atom 1)) #\" 0x[0-9a-f]+ \" \" \")" :expected "\"#object[clojure.lang.Atom {:status :ready, :val 1}]\""}
  ;; io/resource has two branches — a source root (a jfile) and an embedded resource
  ;; baked into the image by make-devboot / jolt build. Which one serves a stdlib
@@ -3359,7 +3359,7 @@
   {:suite "repl-printer" :expr "[\"hi\" \\c 1]" :expected "[\"hi\" \\c 1]"}
   {:suite "repl-printer" :expr "\"hi\"" :expected "\"hi\""}
   {:suite "repl-printer" :expr "{:a \"x\" :b \\y}" :expected "{:a \"x\", :b \\y}"}
-  {:suite "repl-printer" :expr "(java.io.File. \"/tmp/x\")" :expected "#object[java.io.File \"/tmp/x\"]"}
+  {:suite "repl-printer" :expr "(symbol (clojure.string/replace (pr-str (java.io.File. \"/tmp/x\")) #\" 0x[0-9a-f]+\" \"\"))" :expected "#object[java.io.File \"/tmp/x\"]"}
   {:suite "repl-printer" :expr "(str \"hi\" \\c)" :expected "\"hic\""}
   {:suite "repl-printer" :expr "(with-out-str (print [\"hi\" 1]))" :expected "\"[hi 1]\""}
   {:suite "repl-printer" :expr "(with-out-str (println \"hi\"))" :expected "\"hi\\n\""}
@@ -3864,4 +3864,5 @@
   {:suite "enum model / java.time" :expr "(mapv #(if (string? %) (clojure.string/replace % #\"0x[0-9a-f]+\" \"0xH\") %) [(pr-str java.time.DayOfWeek/MONDAY) (str java.time.DayOfWeek/MONDAY) (str java.time.temporal.ChronoUnit/HALF_DAYS) (.name java.time.temporal.ChronoUnit/HALF_DAYS) (.name java.time.temporal.ChronoField/AMPM_OF_DAY) (pr-str java.time.temporal.ChronoUnit/DAYS) (try (java.time.Month/valueOf \"Jan\") (catch IllegalArgumentException e (.getMessage e))) (.ordinal java.time.DayOfWeek/SUNDAY)])" :expected "[\"#object[java.time.DayOfWeek 0xH \\\"MONDAY\\\"]\" \"MONDAY\" \"HalfDays\" \"HALF_DAYS\" \"AMPM_OF_DAY\" \"#object[java.time.temporal.ChronoUnit 0xH \\\"Days\\\"]\" \"No enum constant java.time.Month.Jan\" 6]"}
   {:suite "enum model / java.time" :expr "[(identical? (Enum/valueOf java.time.DayOfWeek \"FRIDAY\") java.time.DayOfWeek/FRIDAY) (.isEnum java.time.temporal.ChronoField)]" :expected "[true true]"}
   {:suite "enum model / java.time" :expr "(try (java.time.Month/of 13) (catch Exception e [(.getName (class e)) (.getMessage e)]))" :expected "[\"java.time.DateTimeException\" \"Invalid value for MonthOfYear: 13\"]"}
+  {:suite "enum model / java.time" :expr "[(.convert java.util.concurrent.TimeUnit/SECONDS 3000 java.util.concurrent.TimeUnit/MILLISECONDS) (.convert java.util.concurrent.TimeUnit/SECONDS (java.time.Duration/ofMillis 2500)) (.name (java.util.concurrent.TimeUnit/of java.time.temporal.ChronoUnit/MILLIS)) (.name (.toChronoUnit java.util.concurrent.TimeUnit/SECONDS))]" :expected "[3 2 \"MILLISECONDS\" \"SECONDS\"]"}
 ]

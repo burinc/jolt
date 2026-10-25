@@ -76,6 +76,25 @@
 (define time-unit-constants
   (map (lambda (p) (cons (car p) (make-time-unit (car p) (cdr p)))) time-unit-nanos))
 (register-enum-class! "java.util.concurrent.TimeUnit" time-unit-constants)
+;; TimeUnit <-> java.time.temporal.ChronoUnit (the java.time base, autoloaded)
+(define time-unit-chrono-names
+  '(("NANOSECONDS" . "NANOS") ("MICROSECONDS" . "MICROS") ("MILLISECONDS" . "MILLIS")
+    ("SECONDS" . "SECONDS") ("MINUTES" . "MINUTES") ("HOURS" . "HOURS") ("DAYS" . "DAYS")))
+(define (time-unit-of-chrono cu)
+  (when (jolt-nil? cu) (throw-jvm 'NullPointerException "chronoUnit"))
+  (let* ((nm (jolt-final-str (record-method-dispatch cu "name" jolt-nil)))
+         (hit (find (lambda (p) (string=? (cdr p) nm)) time-unit-chrono-names)))
+    (if hit
+        (cdr (assoc (car hit) time-unit-constants))
+        (throw-jvm 'IllegalArgumentException (string-append "No TimeUnit equivalent for " nm)))))
+;; convert(duration, unit) and convert(Duration): truncated toward zero and
+;; saturated at Long's range, as TimeUnit.convert is
+(define (tu-saturate n)
+  (cond ((> n 9223372036854775807) 9223372036854775807)
+        ((< n -9223372036854775808) -9223372036854775808)
+        (else n)))
+(define (tu-from-nanos self nanos) (tu-saturate (truncate (/ nanos (time-unit-scale self)))))
+(register-class-statics! "java.util.concurrent.TimeUnit" (list (cons "of" time-unit-of-chrono)))
 (register-host-methods! "time-unit"
   (list (cons "toNanos"   (lambda (self n) (tu-convert self n 1)))
         (cons "toMicros"  (lambda (self n) (tu-convert self n 1000)))
@@ -97,7 +116,19 @@
                                         (/ (* n (time-unit-scale self)) 1000000)
                                         n))
                                   jolt-nil))))
-        (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))))
+        (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
+        (cons "convert"
+              (case-lambda
+                ((self d)
+                 (let ((secs (jnum->exact (record-method-dispatch d "getSeconds" jolt-nil)))
+                       (nano (jnum->exact (record-method-dispatch d "getNano" jolt-nil))))
+                   (tu-from-nanos self (+ (* secs 1000000000) nano))))
+                ((self n unit)
+                 (tu-from-nanos self (* (jnum->exact n) (time-unit-scale unit))))))
+        (cons "toChronoUnit"
+              (lambda (self)
+                (host-static-ref "java.time.temporal.ChronoUnit"
+                                 (cdr (assoc (vector-ref (jhost-state self) 0) time-unit-chrono-names)))))))
 
 ;; --- futures ----------------------------------------------------------------
 ;; A future is a mutable cell guarded by `mu`; workers/derefs coordinate on `cv`.

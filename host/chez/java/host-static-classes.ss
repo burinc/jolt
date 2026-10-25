@@ -1104,7 +1104,10 @@
                                            (hashtable-delete! (hm-tbl self) x)
                                            (hm-drop-key! self x) (if had #t #f))))
         (cons "contains" (lambda (self x) (if (hashtable-contains? (hm-tbl self) x) #t #f)))
-        (cons "iterator" (lambda (self) (make-jiterator (list->cseq (hs->list self)))))
+        (cons "iterator" (lambda (self)
+                           (make-jutil-iterator "hashset-iterator" (hs->list self)
+                                                (lambda (x) (hashtable-delete! (hm-tbl self) x)
+                                                            (hm-drop-key! self x)))))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
@@ -1123,6 +1126,7 @@
                                        xs)
                              (not (fx=? (length keep) (length xs))))))))
 (alias-host-methods! "linkedhashset" "hashset")
+(register-jutil-iterator! "hashset-iterator")
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
 
 ;; the HashMap family and HashSet are a java.util.Map / Set to =, hash, pr, str

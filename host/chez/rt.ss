@@ -2688,24 +2688,18 @@
 ;; rather than through jolt-str-render-one, whose own fallback is this function —
 ;; going through it would recurse. Types with no str arm print bare, like the
 ;; JVM's default Object.toString. readable? quotes the content unless
-;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The identity hash is included only
-;; where jolt-object-repr-hash? (below) asks for it.
+;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The class is
+;; followed by the identity hash, as Object.toString's is.
 (define (jolt-object-content x)
   (or (str-render-by-identity x)
       (let loop ((rs str-render-registry))
         (cond ((null? rs) #f)
               (((caar rs) x) ((cdar rs) x))
               (else (loop (cdr rs)))))))
-;; A value whose print form carries its identity hash, as the JVM's always does:
-;; #object[cls 0xHASH content]. The java layer's enum model sets it.
-(define jolt-object-repr-hash? (lambda (x) #f))
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
          (content (guard (e (#t #f)) (jolt-object-content x)))
-         (head (and (string? cls)
-                    (if (jolt-object-repr-hash? x)
-                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
-                        (string-append "#object[" cls)))))
+         (head (and (string? cls) (string-append "#object[" cls " 0x" (jolt-identity-hex x)))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))
