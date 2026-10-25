@@ -167,6 +167,16 @@
 (set-jrec-enum-constant-test! (lambda (x) (and enum-jrec-declared? (enum-of x) #t)))
 
 ;; ---- registration ---------------------------------------------------------------
+;; What a value shared by every equal value is, for the refusal below, or #f.
+(define (enum-shared-value-kind c)
+  (cond ((jolt-nil? c) "nil")
+        ((boolean? c) "a boolean")
+        ((number? c) "a number")
+        ((char? c) "a character")
+        ((string? c) "a string")
+        ((keyword? c) "a keyword")
+        ((jolt-symbol? c) "a symbol")
+        (else #f)))
 (define (enum-register! fqn constants statics! value-of-other)
   (let* ((names (list->vector (map car constants)))
          (consts (list->vector (map cdr constants)))
@@ -179,6 +189,14 @@
           (error 'register-enum-class! "a constant's name must be a string" fqn nm))
         (when (hashtable-ref by-name nm #f)
           (error 'register-enum-class! "duplicate constant name" fqn nm))
+        ;; a constant is ONE object that answers for the enum: an immediate or
+        ;; interned value (a keyword, a number) would make every equal value
+        ;; everywhere one of its constants
+        (let ((kind (enum-shared-value-kind c)))
+          (when kind
+            (throw-jvm 'IllegalArgumentException
+                       (string-append fqn "." nm " is " kind
+                                      ": an enum constant must be an object of its own"))))
         (hashtable-set! by-name nm c)
         (let ((prior (enum-of c)))
           (when (and prior (not (string=? (enum-info-fqn (car prior)) fqn)))
