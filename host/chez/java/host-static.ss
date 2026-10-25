@@ -693,6 +693,52 @@
           (else (loop (cdr tags))))))
 (set-abstract-class-method-hook! abstract-class-method)
 
+;; ---- how a host value travels in a state image -------------------------------
+;; A host value whose state is a Chez structure an image cannot write as it is —
+;; a hashtable keyed through jolt's hash, a chain of nodes, a port — registers a
+;; CODEC: (register-image-codec! kind tags dump make fill!). DUMP answers a
+;; vector #(header items) of plain data the image writes like any other value
+;; (nested values travel by their own rules, enum constants and keywords by
+;; name); MAKE builds an empty value from the restored header and FILL! puts the
+;; restored items in, after the value exists, so a collection that holds itself
+;; restores as one. KIND names the codec in the image. TAGS are the jhost tags
+;; it answers for; register-image-codec-pred! takes a predicate instead, for a
+;; value that is no jhost.
+;;
+;; A value that cannot travel at all — a thread, an open stream, an executor —
+;; is REFUSED with (register-image-refusal! tags reason): the image names the
+;; class and the reason instead of descending into state it cannot carry.
+;; state-image.ss reads both registries; test/chez/image-coverage-test.ss
+;; (make imagecoverage) holds every java.util collection shim to one or the other.
+(define image-codec-by-tag (make-hashtable string-hash string=?))
+(define image-codec-by-kind (make-hashtable string-hash string=?))
+(define image-codec-preds '())
+(define image-refusal-by-tag (make-hashtable string-hash string=?))
+(define (make-image-codec kind dump make fill!) (vector kind dump make fill!))
+(define (image-codec-kind c) (vector-ref c 0))
+(define (image-codec-dump c) (vector-ref c 1))
+(define (image-codec-make c) (vector-ref c 2))
+(define (image-codec-fill! c) (vector-ref c 3))
+(define (register-image-codec! kind tags dump make fill!)
+  (let ((c (make-image-codec kind dump make fill!)))
+    (hashtable-set! image-codec-by-kind kind c)
+    (for-each (lambda (t) (hashtable-set! image-codec-by-tag t c)) tags)))
+(define (register-image-codec-pred! kind pred dump make fill!)
+  (let ((c (make-image-codec kind dump make fill!)))
+    (hashtable-set! image-codec-by-kind kind c)
+    (set! image-codec-preds (cons (cons pred c) image-codec-preds))))
+(define (register-image-refusal! tags reason)
+  (for-each (lambda (t) (hashtable-set! image-refusal-by-tag t reason)) tags))
+(define (image-codec-for x)
+  (if (jhost? x)
+      (hashtable-ref image-codec-by-tag (jhost-tag x) #f)
+      (let loop ((ps image-codec-preds))
+        (cond ((null? ps) #f)
+              (((caar ps) x) (cdar ps))
+              (else (loop (cdr ps)))))))
+(define (image-refusal-for x)
+  (and (jhost? x) (hashtable-ref image-refusal-by-tag (jhost-tag x) #f)))
+
 ;; ---- host object ------------------------------------------------------------
 (define-record-type jhost (fields tag (mutable state)) (nongenerative chez-jhost-v1))
 

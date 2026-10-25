@@ -3206,6 +3206,7 @@
 ;; State images: dump the value graph to a file and read it back. Loads LAST —
 ;; walks jolt collections, var cells and atoms, prints paths through the printers,
 ;; and reads proc-name-tbl to write a fn as its var's name.
+(load "host/chez/java/image-codecs.ss")         ; how the host's values travel in an image
 (load "host/chez/state-image.ss")
 
 ;; The stall watch (see "a stalled collection says so" above): after every

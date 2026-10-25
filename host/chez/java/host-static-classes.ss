@@ -870,7 +870,7 @@
 (define (make-hashmap-jhost . args)
   (let* ((ht (make-hashtable hm-hash jolt=2))
          (self (make-jhost "hashmap" (vector ht '()))))
-    (when (and (pair? args) (or (pmap? (car args)) (hm-hashmap? (car args))))
+    (when (and (pair? args) (not (number? (car args))))
       (hm-copy-into-ordered! self (car args)))
     self))
 (register-class-ctor! "ConcurrentHashMap" make-hashmap-jhost)

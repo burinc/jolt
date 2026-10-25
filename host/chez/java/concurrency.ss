@@ -3688,6 +3688,10 @@
         ;; AbstractCollection.toString: the elements, head first
         (cons "toString" (lambda (self) (host-elems-tostring self (abq-snapshot self))))))
 (alias-host-methods! "lbq" "abq")
+;; a blocking queue is a java.util Collection: str, seq and the image see its
+;; elements (jutil-colls.ss)
+(register-jutil-coll! "abq" 'coll abq-snapshot)
+(register-jutil-coll! "lbq" 'coll abq-snapshot)
 ;; (seq q), (vec q) over a queue: the same snapshot, head first; (count q) is
 ;; the size, without one.
 (register-seq-arm! abq? (lambda (q) (list->cseq (abq-snapshot q))))
