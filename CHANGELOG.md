@@ -54,8 +54,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prints as `#object[my.Color 0x… "RED"]` and stringifies to its name). The java.time enums
   (`Month`, `DayOfWeek`, `ChronoUnit`, `ChronoField`) are declared this way.
 - **`java.util.LinkedHashMap` and `java.util.LinkedHashSet`.** Both keep
-  insertion order. An access-ordered `LinkedHashMap` (the three-argument
-  constructor with `true`) raises `UnsupportedOperationException`.
+  insertion order, with O(1) operations. An access-ordered `LinkedHashMap`
+  (`(LinkedHashMap. 16 0.75 true)`) moves what `get`, `put`, `compute`,
+  `merge` and the rest reach to the tail, and `removeEldestEntry` is asked
+  after each new mapping, so the LRU idiom `(proxy [LinkedHashMap] [16 0.75
+  true] (removeEldestEntry [e] …))` evicts. JDK 21's sequenced methods are
+  there (`putFirst`, `putLast`, `firstEntry`, `pollLastEntry`, `reversed`,
+  `sequencedKeySet`, `addFirst`, `removeLast`, …) and the key, value and entry
+  views are live.
+- **Every java.util collection shim travels in a `jolt.image`.** `HashMap`,
+  `HashSet`, `Properties`, `LinkedHashMap` (access order kept), `TreeMap` and
+  `TreeSet` (comparator kept), `EnumSet`, `EnumMap`, `StringBuilder`,
+  `StringBuffer` and the java.time values used to fail to write; they
+  round-trip with their contents in order and their class, and one that holds
+  itself restores as one. A view or entry of another collection, an iterator,
+  a thread, pool or task and an open stream are refused naming their class.
+  `make imagecoverage` fails on a collection shim that does neither.
 
 ### Changed
 
@@ -85,20 +99,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order: `StandardOpenOption` gains `DELETE_ON_CLOSE`, `SPARSE`, `SYNC` and
   `DSYNC`, which the `Files` streams and `FileChannel/open` now honor, and
   `newInputStream` refuses `WRITE` and `APPEND`. A `RoundingMode` constant was a
-  string, equal to `"HALF_UP"`.
+  string, equal to `"HALF_UP"`; `RoundingMode/valueOf` takes the legacy int too,
+  every enum answers `(X/valueOf Class name)`, and `TimeUnit` gains `convert`,
+  `of`, `toChronoUnit`, `timedJoin` and `timedWait`. Iterators over an EnumSet
+  or an EnumMap's views remove through them, and EnumMap's entries are live.
 - **java.time's enums are enums.** `(DayOfWeek/values)` was a vector,
   `(DayOfWeek/of 1)` a new object equal to `DayOfWeek/MONDAY` but not identical
   to it, and a constant printed bare. Each constant is now one object, `values`
   is an array, they print like the JVM's, `ChronoUnit` renders its JDK names
   (`HalfDays`), and `Month/of` and `DayOfWeek/of`
   refuse an out-of-range value with `DateTimeException`.
-- **`print` of a host object leaves its content unquoted**, as
-  `#object[java.io.File /tmp/x]`, where it printed the `pr` form.
-- **A `java.util.HashSet` has `.iterator` and answers `contains?`.**
-- **`str` of a host object is its `toString`.** A shim object with a
-  `toString` and no printer of its own rendered as `#object[…]`.
-  `ProcessBuilder$Redirect` answers its JDK `toString`, and `.type` is the
+- **Host objects print and stringify as the JVM's.** `pr` of one is
+  `#object[java.io.File 0x1b2c3d4e "/tmp/x"]` with the identity hash, and
+  `print` leaves the content unquoted. `str` is its `toString`: Object's
+  `class@hash` for one with no `toString` of its own, where several shims
+  answered placeholders (`#<BufferedReader>`, `""` for a PrintWriter,
+  `LinkedBlockingQueue(1)`), and the JDK's for a queue (`[1, a]`), a
+  FutureTask, a Process and a `ProcessBuilder$Redirect`, whose `.type` is the
   `ProcessBuilder$Redirect$Type` enum where it was a string.
+- **A `java.util.HashSet` has `.iterator` (with `remove`), `contains?`,
+  `addAll`, `containsAll`, `removeAll`, `retainAll` and `clone`; a `HashMap`
+  `remove(key, value)` and `clone`, and copies any map it is built from.**
+- **`count`, `seq`, `get` and `contains?` work on a proxy over a java.util
+  collection**, through the proxy's `size`, `containsKey` and `get`.
+- **`Files/write` with only `SYNC`, `SPARSE` or `DELETE_ON_CLOSE` no longer
+  truncates an existing file or creates a missing one**: any option replaces
+  the CREATE + TRUNCATE_EXISTING default, as on the JDK.
 - **An atom or ref that holds itself raises `StackOverflowError` when printed,
   at once.** Printing one recursed until the heap filled and ended in
   `OutOfMemoryError` some 30 seconds later, where the JVM overflows its stack.

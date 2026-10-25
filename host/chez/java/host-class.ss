@@ -17,6 +17,9 @@
 ;; register-class-arm! instead of set!-wrapping jolt-class (cf. register-hash-arm!).
 ;; The entry is stable, so the var cell bound below stays current as arms register.
 (define jolt-class-arms '())
+;; the last class name the arm walk answered (jolt-class-name, below); a new arm
+;; may change an answer, so it clears
+(define jolt-class-name-last (cons #f #f))
 (define (register-class-arm! pred handler)
   (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
   (set! jolt-class-name-last (cons #f #f))
@@ -266,7 +269,6 @@
 ;; several times (the print-method lookup, #object[cls … "cls@hash"]). The pair
 ;; holds its value WEAKLY where the host has weak pairs (host-static.ss installs
 ;; weak-cons), so the memo keeps nothing alive; with no such pair it is off.
-(define jolt-class-name-last (cons #f #f))
 (define class-name-memo-cons (lambda (x n) #f))
 (define (set-class-name-memo-cons! f) (set! class-name-memo-cons f))
 (define (jolt-class-name x)
