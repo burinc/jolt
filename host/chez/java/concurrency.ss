@@ -125,6 +125,18 @@
                    (tu-from-nanos self (+ (* secs 1000000000) nano))))
                 ((self n unit)
                  (tu-from-nanos self (* (jnum->exact n) (time-unit-scale unit))))))
+        ;; timedJoin / timedWait: Thread.join / Object.wait for a timeout in
+        ;; this unit; one of zero or less does nothing, as the JDK's guard has it
+        (cons "timedJoin" (lambda (self th n)
+                            (let ((ms (tu-convert self n 1000000)))
+                              (when (positive? (jnum->exact n))
+                                (record-method-dispatch th "join" (jolt-list (max ms 1))))
+                              jolt-nil)))
+        (cons "timedWait" (lambda (self o n)
+                            (let ((ms (tu-convert self n 1000000)))
+                              (when (positive? (jnum->exact n))
+                                (record-method-dispatch o "wait" (jolt-list (max ms 1))))
+                              jolt-nil)))
         (cons "toChronoUnit"
               (lambda (self)
                 (host-static-ref "java.time.temporal.ChronoUnit"

@@ -24,10 +24,15 @@
 ;; Loaded from rt.ss after host-static.ss (the statics tables, jhost) and before
 ;; the first shim that declares an enum.
 
+;; The two tables readers consult with no lock. A Chez hashtable is not safe to
+;; read while another thread resizes it, so neither published table is ever
+;; written: a declaration copies both under enum-mu, fills the copies and
+;; publishes each with one store (tools/enum-registry-model.pl checks the
+;; protocol: no torn read, no lost declaration).
 (define enum-mu (make-mutex))
 ;; class name (FQN and short) -> #(fqn names consts by-name)
 (define enum-class-tbl (make-hashtable string-hash string=?))
-;; constant -> (info . ordinal). Written under enum-mu; reads are lock-free.
+;; constant -> (info . ordinal)
 (define enum-const-tbl (make-eq-hashtable))
 
 (define (enum-info-fqn i) (vector-ref i 0))
@@ -209,15 +214,21 @@
                      fqn (jhost-tag c) reported)))))
       names consts)
     (jolt-with-mutex enum-mu
-      (hashtable-set! enum-class-tbl fqn info)
-      (unless (and (hashtable-ref enum-class-tbl short #f)
-                   (not (string=? (enum-info-fqn (hashtable-ref enum-class-tbl short #f)) fqn)))
-        (hashtable-set! enum-class-tbl short info))
-      (let loop ((i 0))
-        (when (fx<? i (vector-length consts))
-          (hashtable-set! enum-const-tbl (vector-ref consts i) (cons info i))
-          (when (jrec? (vector-ref consts i)) (set! enum-jrec-declared? #t))
-          (loop (fx+ i 1)))))
+      (let ((classes (hashtable-copy enum-class-tbl #t))
+            (consts-tbl (hashtable-copy enum-const-tbl #t)))
+        (hashtable-set! classes fqn info)
+        (unless (and (hashtable-ref classes short #f)
+                     (not (string=? (enum-info-fqn (hashtable-ref classes short #f)) fqn)))
+          (hashtable-set! classes short info))
+        (let loop ((i 0))
+          (when (fx<? i (vector-length consts))
+            (hashtable-set! consts-tbl (vector-ref consts i) (cons info i))
+            (when (jrec? (vector-ref consts i)) (set! enum-jrec-declared? #t))
+            (loop (fx+ i 1))))
+        ;; the copies are complete before either becomes visible
+        (memory-order-release)
+        (set! enum-class-tbl (hashtable-copy classes #f))
+        (set! enum-const-tbl (hashtable-copy consts-tbl #f))))
     ;; valueOf(String) is the class's own; valueOf(Class, String) is Enum's,
     ;; which every enum class inherits. A class with a further overload of its
     ;; own (RoundingMode.valueOf(int)) hands it in as VALUE-OF-OTHER, called for
@@ -248,7 +259,7 @@
                   tags))
       (for-each
         (lambda (tag)
-          (hashtable-set! jhost-tag->fqn tag fqn)
+          (host-registry-write! (lambda () (hashtable-set! jhost-tag->fqn tag fqn)))
           (register-host-methods! tag
             (filter (lambda (p) (not (host-method-ref tag (car p)))) enum-instance-methods)))
         tags))

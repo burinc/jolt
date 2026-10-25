@@ -561,7 +561,15 @@
 ;; was filled under tables that have since moved.
 (define host-methods-epoch 0)
 (define (host-methods-changed!) (set! host-methods-epoch (fx+ host-methods-epoch 1)))
+;; A write to a host registry a library can reach at run time (an enum declared
+;; by a namespace load, which may be on another thread) is serialized with every
+;; other: readers stay lock-free, and a Chez hashtable survives a reader racing
+;; one writer, never two writers.
+(define host-registry-mu (make-mutex))
+(define (host-registry-write! thunk) (jolt-with-mutex host-registry-mu (thunk)))
 (define (register-host-methods! tag members)
+  (jolt-with-mutex host-registry-mu (register-host-methods!/locked tag members)))
+(define (register-host-methods!/locked tag members)
   (host-methods-changed!)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
                (let ((h (make-hashtable string-hash string=?)))
