@@ -89,8 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **java.time's enums are enums.** `(DayOfWeek/values)` was a vector,
   `(DayOfWeek/of 1)` a new object equal to `DayOfWeek/MONDAY` but not identical
   to it, and a constant printed bare. Each constant is now one object, `values`
-  is an array, they print like the JVM's, `ChronoUnit` and `ChronoField` render
-  their JDK names (`HalfDays`, `AmPmOfDay`), and `Month/of` and `DayOfWeek/of`
+  is an array, they print like the JVM's, `ChronoUnit` renders its JDK names
+  (`HalfDays`), and `Month/of` and `DayOfWeek/of`
   refuse an out-of-range value with `DateTimeException`.
 - **`print` of a host object leaves its content unquoted**, as
   `#object[java.io.File /tmp/x]`, where it printed the `pr` form.

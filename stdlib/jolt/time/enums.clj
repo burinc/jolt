@@ -16,13 +16,11 @@
 (defn- enum! [fqn names consts]
   (jolt.host/register-enum! fqn (mapv vector names consts)))
 
-;; A ChronoUnit or ChronoField's toString: its name in camel case (HALF_DAYS is
-;; HalfDays, AMPM_OF_DAY AmPmOfDay), as the JDK declares it.
+;; A ChronoUnit's toString: its name in camel case (HALF_DAYS is HalfDays), as
+;; the JDK declares it.
 (defn- display-name [nm]
   (apply str (map (fn [part]
-                    (if (= part "AMPM")
-                      "AmPm"
-                      (str (subs part 0 1) (.toLowerCase (subs part 1)))))
+                    (str (subs part 0 1) (.toLowerCase (subs part 1))))
                   (.split nm "_"))))
 
 ;; ---- Month ------------------------------------------------------------------
@@ -161,7 +159,10 @@
 (impl/register-type! :jolt.time/chrono-field
   {:eq   (fn [a b] (= (cf-name a) (cf-name b)))
    :hash (fn [f] (hash (cf-name f)))
-   :str  (fn [f] (display-name (cf-name f)))
+   ;; the JDK's toString is the camel-case name (AmPmOfDay); jolt-lang/time's
+   ;; DateTimeFormatterBuilder reads a field's name through str, so it stays the
+   ;; constant name until that reads .name
+   :str  cf-name
    :enum? true
    :cmp  (fn [a b] (- (u/chrono-field-index (cf-name a))
                       (u/chrono-field-index (cf-name b))))
@@ -171,7 +172,7 @@
 
 (__register-class-methods! :jolt.time/chrono-field
   {"name"      cf-name
-   "toString"  (fn [f] (display-name (cf-name f)))
+   "toString"  cf-name
    "ordinal"   (fn [f] (u/chrono-field-index (cf-name f)))
    "compareTo" compare
    "getDisplayName" (fn [f & _] (cf-name f))
