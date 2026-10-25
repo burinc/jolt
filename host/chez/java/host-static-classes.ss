@@ -405,7 +405,7 @@
                              (let ((p (port-writer-port self)))
                                (flush-output-port p)
                                (jolt-process-stream-failed? p))))
-        (cons "toString" (lambda (self) ""))))
+        (cons "toString" host-object-tostring)))
 (def-dynvar! "clojure.core" "*out*" (make-jhost "port-writer" (vector 'out)))
 (def-dynvar! "clojure.core" "*err*" (make-jhost "port-writer" (vector 'err)))
 
@@ -581,7 +581,7 @@
                                  (let ((t (pw-target self)))
                                    (and (jhost? t) (host-method-ref (jhost-tag t) "checkError")
                                         (jolt-truthy? (record-method-dispatch t "checkError" jolt-nil)))))))
-        (cons "toString" (lambda (self) ""))))
+        (cons "toString" host-object-tostring)))
 
 ;; PrintWriter-on — a writer that accumulates writes and, on flush, hands the
 ;; accumulated string to flush-fn and clears it; close calls close-fn if given.

@@ -3685,9 +3685,8 @@
         (cons "toArray" (lambda (self . _) (na-to-array (list->cseq (abq-snapshot self)))))
         ;; the tag, not a literal: "lbq" shares this table and must not print as
         ;; an ArrayBlockingQueue.
-        (cons "toString" (lambda (self)
-          (string-append (if (string=? (jhost-tag self) "lbq") "LinkedBlockingQueue" "ArrayBlockingQueue")
-                         "(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+        ;; AbstractCollection.toString: the elements, head first
+        (cons "toString" (lambda (self) (host-elems-tostring self (abq-snapshot self))))))
 (alias-host-methods! "lbq" "abq")
 ;; (seq q), (vec q) over a queue: the same snapshot, head first; (count q) is
 ;; the size, without one.
@@ -3703,7 +3702,7 @@
               ;; a reified Callable or Runnable is called through its method, as
               ;; submit calls one (it was invoked as a fn and failed the task)
               (vector 'new override-flag override jolt-nil #f (make-mutex) (jolt-make-cv)
-                      (runnable->thunk thunk))))
+                      (runnable->thunk thunk) thunk)))
 (define (future-task? x) (and (jhost? x) (string=? (jhost-tag x) "future-task")))
 (define (future-task-run! self)
   (let ((st (jhost-state self)))
@@ -3771,8 +3770,19 @@
                           #f))))
             (when (box? r) (task-interrupt-runner! r))
             (and r #t))))
+        ;; FutureTask.toString: Object's, then the state
         (cons "toString" (lambda (self)
-          (string-append "FutureTask[" (symbol->string (vector-ref (jhost-state self) 0)) "]")))))
+          (let ((st (jhost-state self)))
+            (string-append (host-object-tostring self) "["
+                           (case (vector-ref st 0)
+                             ((done) (if (vector-ref st 4)
+                                         (string-append "Completed exceptionally: "
+                                                        (jolt-str-render-one (vector-ref st 4)))
+                                         "Completed normally"))
+                             ((cancelled) "Cancelled")
+                             (else (string-append "Not completed, task = "
+                                                  (jolt-str-render-one (vector-ref st 8)))))
+                           "]"))))))
 ;; submit/execute above route a FutureTask through its own run (a Runnable on
 ;; the JVM), and a reify or deftype implementing Callable or Runnable through its
 ;; call or run — invoking one directly was "cannot be cast to clojure.lang.IFn",
@@ -3825,7 +3835,13 @@
           (let* ((ex (vector-ref (jhost-state self) 0))
                  (cap (vector-ref (jhost-state ex) 5)))
             (if cap (max 0 (- cap (executor-queue-depth ex))) 2147483647))))
-        (cons "toString" (lambda (self) "ExecutorQueueView"))))
+        ;; the work queue's tasks, head first, as the queue's own toString lists them
+        (cons "toString" (lambda (self)
+                           (let* ((st (jhost-state (vector-ref (jhost-state self) 0)))
+                                  (q (jolt-with-mutex (vector-ref st 2)
+                                       (let ((p (unbox (vector-ref st 1))))
+                                         (append (car p) (reverse (cdr p)))))))
+                             (host-elems-tostring self q))))))
 (register-host-methods! "executor-service"
   (list (cons "getQueue" (lambda (self) (make-jhost "executor-queue-view" (vector self))))
         ;; ThreadPoolExecutor's size accessors, which are how a caller (and the
@@ -4421,7 +4437,7 @@
             (jolt-timer-at! (ms->deadline-millis (vector-ref st 0))
               (lambda () (cf-execute! (vector-ref st 1) (lambda () (cf-fn-call r "run"))))))
           jolt-nil))
-        (cons "toString" (lambda (self) "java.util.concurrent.CompletableFuture$DelayedExecutor"))))
+        (cons "toString" host-object-tostring)))
 
 ;; java.util.concurrent.Future.State, what state() answers: an enum, so each
 ;; constant is one object and = compares them by identity.

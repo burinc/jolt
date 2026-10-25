@@ -2312,7 +2312,11 @@
                           (else (throw-jvm (quote IllegalThreadStateException) "process has not exited")))))))))
         (cons "toHandle" (lambda (self) (make-proc-handle (proc-p-pid self))))
         (cons "onExit"   (lambda (self) (make-proc-completable self)))
-        (cons "toString" (lambda (self) (string-append "#<Process pid=" (number->string (proc-p-pid self)) ">")))))
+        (cons "toString"
+              (lambda (self)
+                (let ((code (unbox (proc-p-exit-box self))))
+                  (string-append "Process[pid=" (number->string (proc-p-pid self)) ", exitValue="
+                                 (if (number? code) (number->string code) "\"not exited\"") "]"))))))
 
 ;; timed waitFor -> #t if exited within `ms`, else #f (polls at ~10ms).
 ;; Against a deadline, not a count of steps: each pause runs a little past its

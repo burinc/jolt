@@ -749,12 +749,46 @@
       (else 'pass))))
 (register-method-arm! arm-priority-host-type host-type-arm)
 
+;; the class-name memo holds its value weakly (host-class.ss)
+(set-class-name-memo-cons! weak-cons)
+
+;; Object.toString: the class name and the identity hash, for a shim whose JDK
+;; class does not override it.
+(define (host-object-tostring x)
+  (string-append (jolt-class-name x) "@" (jolt-identity-hex x)))
+
+;; AbstractCollection.toString over ELEMS: [a, b]
+(define (host-elems-tostring self elems)
+  (string-append "["
+                 (let loop ((xs elems) (acc "") (first? #t))
+                   (if (null? xs)
+                       acc
+                       (loop (cdr xs)
+                             (string-append acc (if first? "" ", ")
+                                            (cond ((eq? (car xs) self) "(this Collection)")
+                                                  ((jolt-nil? (car xs)) "null")
+                                                  (else (jolt-str-render-one (car xs)))))
+                             #f)))
+                 "]"))
+
 ;; str of a host object is its toString, as on the JVM. A shim with a str arm of
 ;; its own answers first; registered here, ahead of every shim, this arm sits at
 ;; the END of the str registry and only sees a host object nothing else claimed.
+;; The tag's toString is remembered for the last tag asked, as one #(tag epoch
+;; proc|#f) replaced whole: the walk reaches here for every unclaimed host object,
+;; usually many of one class in a row.
+(define host-tostring-last (vector #f -1 #f))
+(define (host-tostring-of x)
+  (let ((c host-tostring-last) (t (jhost-tag x)))
+    (if (and (eq? (vector-ref c 0) t) (fx=? (vector-ref c 1) host-methods-epoch))
+        (vector-ref c 2)
+        (let ((f (host-method-ref t "toString")))
+          (set! host-tostring-last (vector t host-methods-epoch f))
+          f))))
+;; One with no toString of its own answers Object's, as on the JVM.
 (register-str-render!
-  (lambda (x) (and (jhost? x) (host-method-ref (jhost-tag x) "toString") #t))
-  (lambda (x) ((host-method-ref (jhost-tag x) "toString") x)))
+  jhost?
+  (lambda (x) (let ((f (host-tostring-of x))) (if f (f x) (host-object-tostring x)))))
 
 ;; ---- a method call site on a host object ------------------------------------
 ;; An unhinted (.size q) on a jhost walked every arm ahead of host-type-arm, each
