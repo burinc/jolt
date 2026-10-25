@@ -639,7 +639,6 @@
          (and (fx>? (string-length t) 0)
               (case (string-ref t 0)
                 ((#\h) (string=? t "hashmap"))
-                ((#\l) (string=? t "linkedhashmap"))
                 ((#\p) (string=? t "properties"))
                 (else #f))))))
 (define (hm-copy-into-ordered! self src)  ; copy a jolt map or hashmap, keeping insertion order
@@ -656,7 +655,7 @@
   (lambda args
     (let* ((ht (make-hashtable hm-hash jolt=2))
            (self (make-jhost "hashmap" (vector ht '()))))
-      (when (and (pair? args) (or (pmap? (car args)) (hm-hashmap? (car args))))
+      (when (and (pair? args) (not (number? (car args))))
         (hm-copy-into-ordered! self (car args)))
       self)))
 (define (hm->pmap self)
@@ -738,9 +737,19 @@
                              (hashtable-keys (hm-tbl self))) found)))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
-        (cons "remove" (lambda (self k) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
-                                           (hashtable-delete! (hm-tbl self) k)
-                                           (hm-drop-key! self k) old)))
+        (cons "remove" (case-lambda
+                         ((self k) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                     (hashtable-delete! (hm-tbl self) k)
+                                     (hm-drop-key! self k) old))
+                         ;; remove(key, value): only when mapped to exactly that
+                         ((self k v) (if (and (hashtable-contains? (hm-tbl self) k)
+                                              (jolt=2 v (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                         (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) #t)
+                                         #f))))
+        (cons "clone" (lambda (self)
+                        (let ((m (make-jhost (jhost-tag self) (vector (make-hashtable hm-hash jolt=2) '()))))
+                          (hm-copy-into-ordered! m self)
+                          m)))
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
         (cons "putAll" (lambda (self m) (hm-copy-into-ordered! self m) jolt-nil))
         (cons "keySet" (lambda (self) (apply jolt-hash-set (hm-keys-ordered self))))
@@ -749,24 +758,6 @@
                                (hm-keys-ordered self)))))
         (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))))
 (register-host-methods! "hashmap" hashmap-methods)
-;; java.util.LinkedHashMap: the HashMap shim already iterates in insertion order,
-;; so it differs only in the class it reports. An access-ordered one (the
-;; three-argument constructor with true) reorders on every read, which the shim
-;; does not do, so it is refused rather than built insertion-ordered.
-(alias-host-methods! "linkedhashmap" "hashmap")
-(let ((ctor (case-lambda
-              (() (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '())))
-              ((x)
-               (let ((self (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '()))))
-                 (unless (number? x) (hm-copy-into-ordered! self x))
-                 self))
-              ((cap lf) (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '())))
-              ((cap lf access-order?)
-               (when (jolt-truthy? access-order?)
-                 (throw-jvm 'UnsupportedOperationException "access-ordered LinkedHashMap"))
-               (make-jhost "linkedhashmap" (vector (make-hashtable hm-hash jolt=2) '()))))))
-  (register-class-ctor! "LinkedHashMap" ctor)
-  (register-class-ctor! "java.util.LinkedHashMap" ctor))
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
 ;; a DEFAULTS chain. The JVM is precise about which operations see that chain:
@@ -1077,11 +1068,8 @@
          (and (fx>? (string-length t) 0)
               (case (string-ref t 0)
                 ((#\h) (string=? t "hashset"))
-                ((#\l) (string=? t "linkedhashset"))
                 (else #f))))))
 (define (hs->list self) (hm-keys-ordered self))
-;; LinkedHashSet is the same set under its own class: this one already iterates
-;; in insertion order.
 (define (hs-ctor tag)
   (lambda args
     (let* ((ht (make-hashtable hm-hash jolt=2))
@@ -1094,8 +1082,7 @@
       self)))
 (register-class-ctor! "HashSet" (hs-ctor "hashset"))
 (register-class-ctor! "java.util.HashSet" (hs-ctor "hashset"))
-(register-class-ctor! "LinkedHashSet" (hs-ctor "linkedhashset"))
-(register-class-ctor! "java.util.LinkedHashSet" (hs-ctor "linkedhashset"))
+
 (register-host-methods! "hashset"
   (list (cons "add" (lambda (self x) (let ((had (hashtable-contains? (hm-tbl self) x)))
                                         (hm-note-key! self x)
@@ -1104,6 +1091,28 @@
                                            (hashtable-delete! (hm-tbl self) x)
                                            (hm-drop-key! self x) (if had #t #f))))
         (cons "contains" (lambda (self x) (if (hashtable-contains? (hm-tbl self) x) #t #f)))
+        (cons "addAll" (lambda (self c)
+                         (fold-left (lambda (ch x)
+                                      (if (hashtable-contains? (hm-tbl self) x)
+                                          ch
+                                          (begin (hm-note-key! self x) (hashtable-set! (hm-tbl self) x #t) #t)))
+                                    #f (seq->list (jolt-seq c)))))
+        (cons "containsAll" (lambda (self c)
+                              (for-all (lambda (x) (hashtable-contains? (hm-tbl self) x)) (seq->list (jolt-seq c)))))
+        (cons "removeAll" (lambda (self c)
+                            (fold-left (lambda (ch x)
+                                         (if (hashtable-contains? (hm-tbl self) x)
+                                             (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)
+                                             ch))
+                                       #f (seq->list (jolt-seq c)))))
+        (cons "retainAll" (lambda (self c)
+                            (let ((keep (seq->list (jolt-seq c))))
+                              (fold-left (lambda (ch x)
+                                           (if (exists (lambda (k) (jolt=2 k x)) keep)
+                                               ch
+                                               (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)))
+                                         #f (hs->list self)))))
+        (cons "clone" (lambda (self) ((hs-ctor (jhost-tag self)) (list->cseq (hs->list self)))))
         (cons "iterator" (lambda (self)
                            (make-jutil-iterator "hashset-iterator" (hs->list self)
                                                 (lambda (x) (hashtable-delete! (hm-tbl self) x)
@@ -1125,7 +1134,6 @@
                                            (hm-drop-key! self x)))
                                        xs)
                              (not (fx=? (length keep) (length xs))))))))
-(alias-host-methods! "linkedhashset" "hashset")
 (register-jutil-iterator! "hashset-iterator")
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
 
@@ -1139,10 +1147,8 @@
   (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
        (hm-keys-ordered self)))
 (register-jutil-coll! "hashmap" 'map hm-entries)
-(register-jutil-coll! "linkedhashmap" 'map hm-entries)
 (register-jutil-coll! "properties" 'map hm-entries)
 (register-jutil-coll! "hashset" 'set hs->list)
-(register-jutil-coll! "linkedhashset" 'set hs->list)
 (register-jutil-coll! "arraylist" 'ralist al->list)
 (register-jutil-coll! "linkedlist" 'list al->list)
 (register-jutil-coll! "arraydeque" 'coll al->list)

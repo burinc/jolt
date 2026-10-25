@@ -3122,6 +3122,7 @@
 ;; (host-new + the ctor table it probes), records-interop.ss (instance-check) and
 ;; io-streams.ss, so a proxy over a stream class finds its constructor.
 (load "host/chez/java/proxy.ss")
+(load "host/chez/java/linked-hash.ss")          ; LinkedHashMap / LinkedHashSet (after proxy.ss)
 (load "host/chez/java/process.ss")
 
 ;; clojure.lang.PersistentQueue: a functional queue + EMPTY static.

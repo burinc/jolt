@@ -13,8 +13,9 @@
 ;; Delegation is not inheritance in one respect, and it is the respect worth
 ;; stating: the base instance holds no reference back to the proxy, so a base
 ;; method that calls an overridden method reaches the BASE's version, where the
-;; JVM's virtual dispatch would re-enter the override. Overriding a method the
-;; base calls internally is the case this does not model.
+;; JVM's virtual dispatch would re-enter the override — unless the base's shim
+;; asks to be told its proxy (proxy-attach-hook!, below), as LinkedHashMap does
+;; for removeEldestEntry.
 
 ;; A class is constructible when something registered a constructor for it. Probe
 ;; rather than calling host-new, so a genuine error raised INSIDE a real
@@ -51,8 +52,34 @@
                    (seq->list (jolt-seq ctor-args))))
          (base (and (pair? names)
                     (proxy-class-constructible? (car names))
-                    (apply host-new (car names) args))))
-    (make-reified-delegating methods-map base names)))
+                    (apply host-new (car names) args)))
+         (p (make-reified-delegating methods-map base names)))
+    (proxy-attach! base p)
+    p))
+
+;; A proxy over a java.util collection is that collection to count, seq, get and
+;; contains?, which reach it through the methods the JVM's RT does — size,
+;; containsKey / contains, get — so an override in the proxy body answers.
+(define (proxy-coll-kind x)
+  (let ((d (and (jreify? x) (jreify-delegate x))))
+    (and d (jutil-coll-kind d))))
+(define (proxy-call x m . args) (record-method-dispatch x m (if (null? args) jolt-nil (list->cseq args))))
+(register-count-arm! proxy-coll-kind (lambda (x) (jnum->exact (proxy-call x "size"))))
+(register-seq-arm! proxy-coll-kind (lambda (x) (jolt-seq (jreify-delegate x))))
+(register-get-arm! (lambda (x) (eq? (proxy-coll-kind x) 'map))
+  (lambda (x k d) (if (jolt-truthy? (proxy-call x "containsKey" k)) (proxy-call x "get" k) d)))
+(register-contains-arm! (lambda (x) (memq (proxy-coll-kind x) '(map set)))
+  (lambda (x k) (jolt-truthy? (proxy-call x (if (eq? (proxy-coll-kind x) 'map) "containsKey" "contains") k))))
+
+;; A base whose own methods call one a subclass overrides — LinkedHashMap's put
+;; asking removeEldestEntry — is told which proxy stands over it, so that call
+;; reaches the override as the JVM's virtual dispatch would. tag -> (base proxy)
+(define proxy-attach-hooks '())
+(define (proxy-attach-hook! tag f) (set! proxy-attach-hooks (cons (cons tag f) proxy-attach-hooks)))
+(define (proxy-attach! base p)
+  (when (jhost? base)
+    (let ((h (assoc (jhost-tag base) proxy-attach-hooks)))
+      (when h ((cdr h) base p)))))
 (def-var! "clojure.core" "make-proxy" jolt-make-proxy)
 
 ;; (proxy-super meth args...) inside a proxy body: the base's own implementation,

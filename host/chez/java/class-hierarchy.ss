@@ -967,6 +967,20 @@
 (jch-register-supers! "java.util.Properties" '("java.util.Hashtable"))
 (jch-register-supers! "java.util.HashSet" '("java.util.Set"))
 (jch-register-supers! "java.util.LinkedHashSet" '("java.util.HashSet" "java.util.SequencedSet"))
+;; the LinkedHashMap / LinkedHashSet views and entries (linked-hash.ss)
+(jch-register-supers! "java.util.LinkedHashMap$ReversedLinkedHashMapView" '("java.util.AbstractMap" "java.util.SequencedMap"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedKeySet" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedValues" '("java.util.AbstractCollection" "java.util.SequencedCollection"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedEntrySet" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.LinkedHashMap$Entry" '("java.util.Map$Entry"))
+(jch-register-supers! "jdk.internal.util.NullableKeyValueHolder" '("java.util.Map$Entry"))
+(jch-register-supers! "java.util.LinkedHashSet$1ReverseLinkedHashSetView" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(for-each (lambda (c) (jch-register-supers! c '("java.util.Iterator")))
+          '("java.util.LinkedHashMap$LinkedKeyIterator" "java.util.LinkedHashMap$LinkedValueIterator"
+            "java.util.LinkedHashMap$LinkedEntryIterator" "java.util.HashMap$KeyIterator"
+            "java.util.RegularEnumSet$EnumSetIterator" "java.util.JumboEnumSet$EnumSetIterator"
+            "java.util.EnumMap$KeyIterator" "java.util.EnumMap$ValueIterator" "java.util.EnumMap$EntryIterator"))
+(jch-register-supers! "java.util.EnumMap$EntryIterator$Entry" '("java.util.Map$Entry"))
 ;; java.util.TreeMap / TreeSet and the views they hand out (tree-map.ss), with
 ;; the sorted/navigable/sequenced interfaces between them and Map / Set, and
 ;; the Comparator objects Comparator/reverseOrder and naturalOrder return.
