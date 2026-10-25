@@ -94,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`print` of a host object leaves its content unquoted**, as
   `#object[java.io.File /tmp/x]`, where it printed the `pr` form.
 - **A `java.util.HashSet` has `.iterator` and answers `contains?`.**
+- **An atom or ref that holds itself raises `StackOverflowError` when printed,
+  at once.** Printing one recursed until the heap filled and ended in
+  `OutOfMemoryError` some 30 seconds later, where the JVM overflows its stack.
+  The printer now notices when it meets the same atom, ref, volatile or other
+  IDeref value again along the path it is printing, directly or through
+  collections. `(str a)` of one is `clojure.lang.Atom@hash`, its `toString` on
+  the JVM, instead of the printed form.
 - **A transaction no longer holds a lock while its code runs.** Every `dosync`
   ran under one global lock, so a body that waited on another thread's
   transaction hung: `(dosync @(future (dosync (ref 1))))` never returned. The
