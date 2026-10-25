@@ -749,6 +749,13 @@
       (else 'pass))))
 (register-method-arm! arm-priority-host-type host-type-arm)
 
+;; str of a host object is its toString, as on the JVM. A shim with a str arm of
+;; its own answers first; registered here, ahead of every shim, this arm sits at
+;; the END of the str registry and only sees a host object nothing else claimed.
+(register-str-render!
+  (lambda (x) (and (jhost? x) (host-method-ref (jhost-tag x) "toString") #t))
+  (lambda (x) ((host-method-ref (jhost-tag x) "toString") x)))
+
 ;; ---- a method call site on a host object ------------------------------------
 ;; An unhinted (.size q) on a jhost walked every arm ahead of host-type-arm, each
 ;; answering 'pass, then hashed the tag and the name in host-method-ref: ~120 ns

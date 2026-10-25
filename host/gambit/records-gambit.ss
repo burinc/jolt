@@ -1452,7 +1452,14 @@
       ((jrec-cl coll "pop") => (lambda (m) (jolt-invoke m coll)))
       (else (%r-jolt-pop coll)))))
 
-(register-pr-arm! jrec? jrec-pr)
+(define jrec-enum-constant? (lambda (x) #f))
+
+(define (set-jrec-enum-constant-test! f)
+  (set! jrec-enum-constant? f))
+
+(register-pr-arm!
+  (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x))))
+  jrec-pr)
 
 (register-map-pred-arm! jrec-maplike?)
 

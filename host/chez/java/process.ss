@@ -449,9 +449,27 @@
 ;; register-class-statics! mirrors the FQN table to the short name, so a single
 ;; call serves both java.lang.ProcessBuilder$Redirect/… and ProcessBuilder$Redirect/….
 (register-class-statics! "java.lang.ProcessBuilder$Redirect" proc-redirect-statics)
+;; Redirect.Type, what type() answers: DISCARD is a write to the null file.
+(define proc-redirect-types
+  (map (lambda (nm) (cons nm (make-jhost "process-redirect-type" nm)))
+       '("PIPE" "INHERIT" "READ" "WRITE" "APPEND")))
+(register-enum-class! "java.lang.ProcessBuilder$Redirect$Type" proc-redirect-types)
+(define (proc-redirect-type r)
+  (cdr (assoc (case (proc-redirect-kind r)
+                ((pipe) "PIPE") ((inherit) "INHERIT") ((read) "READ") ((append) "APPEND")
+                (else "WRITE"))
+              proc-redirect-types)))
+;; toString: a constant redirect prints its type, a file one names the file
 (register-host-methods! "process-redirect"
-  (list (cons "type" (lambda (self) (symbol->string (proc-redirect-kind self))))
-        (cons "toString" (lambda (self) (string-append "Redirect." (symbol->string (proc-redirect-kind self)))))))
+  (list (cons "type" proc-redirect-type)
+        (cons "toString"
+              (lambda (self)
+                (case (proc-redirect-kind self)
+                  ((pipe inherit discard) (enum-name (proc-redirect-type self)))
+                  (else (string-append "redirect to "
+                                       (case (proc-redirect-kind self)
+                                         ((read) "read from") ((append) "append to") (else "write to"))
+                                       " file \"" (proc-redirect-file self) "\"")))))))
 
 ;; JDK 9 gave every redirect setter a File overload — redirectInput(File) is
 ;; defined as redirectInput(Redirect.from(file)), redirectOutput/redirectError as

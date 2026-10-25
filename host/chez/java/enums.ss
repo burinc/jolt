@@ -117,9 +117,17 @@
         (let ((f (host-method-ref (vector-ref entry 0) "toString")))
           (vector-set! entry 1 (cons epoch f))
           f))))
+;; A record constant (a library's deftype) renders its own toString, else its
+;; name; records pay nothing for this until one is declared.
+(define enum-jrec-declared? #f)
+(define (enum-jrec-render x)
+  (let ((e (enum-of x)))
+    (and e
+         (let ((f (find-protocol-method (jrec-tag x) "Object" "toString")))
+           (if f (jolt-invoke f x) (enum-entry-name e))))))
 (set-str-render-by-identity!
   (lambda (x)
-    (and (jhost? x)
+    (if (jhost? x)
          (let ((t (jhost-tag x)))
            (let find ((es enum-jhost-tags))
              (and (pair? es)
@@ -130,10 +138,22 @@
                                (if (or (not f) (eq? f enum-generic-tostring))
                                    (enum-entry-name e)
                                    (f x)))))
-                      (find (cdr es)))))))))
+                      (find (cdr es))))))
+         (and enum-jrec-declared? (jrec? x) (enum-jrec-render x)))))
+(set-jrec-enum-constant-test! (lambda (x) (and enum-jrec-declared? (enum-of x) #t)))
 
-;; pr of any constant: #object[<fqn> 0xHASH "<toString>"] (rt.ss jolt-object-repr)
-(set! jolt-object-repr-hash? enum-constant?)
+;; pr of any constant: #object[<fqn> 0xHASH "<toString>"] (rt.ss jolt-object-repr).
+;; Asked of every value that reaches the #object fallback, so a jhost is first
+;; matched by its tag object and any other value only once a constant that is no
+;; jhost has been declared.
+(define enum-other-declared? #f)
+(set! jolt-object-repr-hash?
+  (lambda (x)
+    (if (jhost? x)
+        (let ((t (jhost-tag x)))
+          (and (exists (lambda (e) (eq? (vector-ref e 0) t)) enum-jhost-tags)
+               (enum-constant? x)))
+        (and enum-other-declared? (enum-constant? x)))))
 
 ;; ---- registration ---------------------------------------------------------------
 (define (enum-register! fqn constants statics!)
@@ -167,6 +187,8 @@
       (let loop ((i 0))
         (when (fx<? i (vector-length consts))
           (hashtable-set! enum-const-tbl (vector-ref consts i) (cons info i))
+          (when (jrec? (vector-ref consts i)) (set! enum-jrec-declared? #t))
+          (unless (jhost? (vector-ref consts i)) (set! enum-other-declared? #t))
           (loop (fx+ i 1)))))
     (statics! fqn (append constants
                           (list (cons "values" (lambda () (enum-values-array info)))

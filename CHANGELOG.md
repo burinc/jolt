@@ -50,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(jolt.host/register-enum! "my.Color" [["RED" red] ["GREEN" green]])` gives
   the class `values`, `valueOf`, `Class.isEnum`, `getEnumConstants`,
   `Enum/valueOf`, `java.lang.Enum`'s instance methods for any method the values
-  do not answer themselves, and the JVM's print form. The java.time enums
+  do not answer themselves, and the JVM's print form (a `deftype` constant
+  prints as `#object[my.Color 0x… "RED"]` and stringifies to its name). The java.time enums
   (`Month`, `DayOfWeek`, `ChronoUnit`, `ChronoField`) are declared this way.
 - **`java.util.LinkedHashMap` and `java.util.LinkedHashSet`.** Both keep
   insertion order. An access-ordered `LinkedHashMap` (the three-argument
@@ -94,6 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`print` of a host object leaves its content unquoted**, as
   `#object[java.io.File /tmp/x]`, where it printed the `pr` form.
 - **A `java.util.HashSet` has `.iterator` and answers `contains?`.**
+- **`str` of a host object is its `toString`.** A shim object with a
+  `toString` and no printer of its own rendered as `#object[…]`.
+  `ProcessBuilder$Redirect` answers its JDK `toString`, and `.type` is the
+  `ProcessBuilder$Redirect$Type` enum where it was a string.
 - **An atom or ref that holds itself raises `StackOverflowError` when printed,
   at once.** Printing one recursed until the heap filled and ended in
   `OutOfMemoryError` some 30 seconds later, where the JVM overflows its stack.

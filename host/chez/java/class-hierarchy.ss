@@ -1164,6 +1164,7 @@
 ;; the redirect shim's class had a tag row but no graph row, so it was not a
 ;; known class: no token, no nested-static modifier bit
 (jch-register-supers! "java.lang.ProcessBuilder$Redirect" '())
+(jch-register-supers! "java.lang.ProcessBuilder$Redirect$Type" '("java.lang.Enum"))
 (jch-register-supers! "java.lang.Runtime" '())
 (jch-register-supers! "java.lang.RuntimePermission" '())
 (jch-register-supers! "java.lang.SecurityManager" '())
