@@ -34,6 +34,9 @@
   "  (jolt.host/image-write! \"" tmp "\" v)"
   "  (let [r (jolt.host/image-read \"" tmp "\")]"
   "    (and (= (class v) (class r)) (= (image-content v) (image-content r)))))"
+  "(defn image-refuses-naming? [v cls]"
+  "  (try (jolt.host/image-write! \"" tmp "\" v) false"
+  "       (catch Exception e (clojure.string/includes? (ex-message e) cls))))"
   "(defn image-refuses? [v]"
   "  (try (jolt.host/image-write! \"" tmp "\" v) false"
   "       (catch Exception e (clojure.string/includes? (ex-message e) (.getName (class v))))))"))
@@ -57,7 +60,46 @@
     ("enum-set-regular" . "(java.util.EnumSet/of java.util.concurrent.TimeUnit/DAYS java.util.concurrent.TimeUnit/SECONDS)")
     ("enum-map" . "(doto (java.util.EnumMap. java.util.concurrent.TimeUnit) (.put java.util.concurrent.TimeUnit/HOURS [1]))")
     ("immutable-entry" . "(.firstEntry (java.util.TreeMap. {:k 1}))")
-    ("lhm-snapshot-entry" . "(.firstEntry (doto (java.util.LinkedHashMap.) (.put :a 1)))")))
+    ("lhm-snapshot-entry" . "(.firstEntry (doto (java.util.LinkedHashMap.) (.put :a 1)))")
+    ("jx-unmod-coll" . "(java.util.Collections/unmodifiableCollection (java.util.ArrayList. [1 2]))")
+    ("jx-unmod-seqcoll" . "(java.util.Collections/unmodifiableSequencedCollection (java.util.ArrayList. [1 2]))")
+    ("jx-unmod-set" . "(java.util.Collections/unmodifiableSet (java.util.HashSet. [1 2]))")
+    ("jx-unmod-seqset" . "(java.util.Collections/unmodifiableSequencedSet (java.util.LinkedHashSet. [1 2]))")
+    ("jx-unmod-sortedset" . "(java.util.Collections/unmodifiableSortedSet (java.util.TreeSet. [2 1]))")
+    ("jx-unmod-navset" . "(java.util.Collections/unmodifiableNavigableSet (java.util.TreeSet. [2 1]))")
+    ("jx-unmod-list" . "(java.util.Collections/unmodifiableList (java.util.LinkedList. [1 2]))")
+    ("jx-unmod-ralist" . "(java.util.Collections/unmodifiableList (java.util.ArrayList. [1 2]))")
+    ("jx-unmod-map" . "(java.util.Collections/unmodifiableMap (doto (java.util.HashMap.) (.put :a 1)))")
+    ("jx-unmod-seqmap" . "(java.util.Collections/unmodifiableSequencedMap (doto (java.util.LinkedHashMap.) (.put :a 1)))")
+    ("jx-unmod-sortedmap" . "(java.util.Collections/unmodifiableSortedMap (java.util.TreeMap. {1 :a}))")
+    ("jx-unmod-navmap" . "(java.util.Collections/unmodifiableNavigableMap (java.util.TreeMap. {1 :a}))")
+    ("jx-sync-coll" . "(java.util.Collections/synchronizedCollection (java.util.ArrayList. [1 2]))")
+    ("jx-sync-set" . "(java.util.Collections/synchronizedSet (java.util.HashSet. [1 2]))")
+    ("jx-sync-sortedset" . "(java.util.Collections/synchronizedSortedSet (java.util.TreeSet. [2 1]))")
+    ("jx-sync-navset" . "(java.util.Collections/synchronizedNavigableSet (java.util.TreeSet. [2 1]))")
+    ("jx-sync-list" . "(java.util.Collections/synchronizedList (java.util.LinkedList. [1 2]))")
+    ("jx-sync-ralist" . "(java.util.Collections/synchronizedList (java.util.ArrayList. [1 2]))")
+    ("jx-sync-map" . "(java.util.Collections/synchronizedMap (doto (java.util.HashMap.) (.put :a 1)))")
+    ("jx-sync-sortedmap" . "(java.util.Collections/synchronizedSortedMap (java.util.TreeMap. {1 :a}))")
+    ("jx-sync-navmap" . "(java.util.Collections/synchronizedNavigableMap (java.util.TreeMap. {1 :a}))")
+    ("jx-listn" . "(java.util.List/of 1 2 3)")
+    ("jx-list12" . "(java.util.List/of 1 2)")
+    ("jx-imm-sublist" . "(.subList (java.util.List/of 1 2 3) 0 2)")
+    ("jx-setn" . "(java.util.Set/of 1 2 3)")
+    ("jx-set12" . "(java.util.Set/of 1)")
+    ("jx-mapn" . "(java.util.Map/of :a 1 :b 2)")
+    ("jx-map1" . "(java.util.Map/of :a 1)")
+    ("jx-kvholder" . "(java.util.Map/entry :k 1)")
+    ("jx-vector" . "(doto (java.util.Vector. 3 2) (.add :a) (.add 1) (.add 2) (.add 3))")
+    ("jx-stack" . "(doto (java.util.Stack.) (.push 1) (.push :b))")
+    ("jx-hashtable" . "(let [h (java.util.Hashtable. 5)] (doseq [i (range 12)] (.put h (str \"k\" i) i)) h)")
+    ("jx-priority-queue" . "(doto (java.util.PriorityQueue. (java.util.Collections/reverseOrder)) (.addAll [3 9 1 4]))")
+    ("jx-clq" . "(java.util.concurrent.ConcurrentLinkedQueue. [1 :a 2])")
+    ("jx-cld" . "(doto (java.util.concurrent.ConcurrentLinkedDeque. [2 3]) (.addFirst 1))")
+    ("jx-cow-list" . "(java.util.concurrent.CopyOnWriteArrayList. [3 1 3])")
+    ("jx-cow-set" . "(java.util.concurrent.CopyOnWriteArraySet. [3 1 2])")
+    ("jx-cslm" . "(doto (java.util.concurrent.ConcurrentSkipListMap. (java.util.Collections/reverseOrder)) (.put 1 :a) (.put 2 :b))")
+    ("jx-csls" . "(java.util.concurrent.ConcurrentSkipListSet. [3 1 2])")))
 ;; a JumboEnumSet needs an enum of more than 64 constants, which the host has
 ;; none of; its codec is the RegularEnumSet's (one registration, both tags)
 (define same-codec '(("enum-set-jumbo" . "enum-set-regular")))
@@ -82,7 +124,42 @@
     ("treemap-entryset" . "(.entrySet (java.util.TreeMap. {1 1}))")
     ("treemap-asc-entryset" . "(.entrySet (.headMap (java.util.TreeMap. {1 1 2 2}) 2))")
     ("treemap-desc-entryset" . "(.entrySet (.descendingMap (java.util.TreeMap. {1 1})))")
-    ("treemap-entry" . "(first (.entrySet (java.util.TreeMap. {1 1})))")))
+    ("treemap-entry" . "(first (.entrySet (java.util.TreeMap. {1 1})))")
+    ("jx-unmod-entryset" . "(.entrySet (java.util.Collections/unmodifiableMap (doto (java.util.HashMap.) (.put :a 1))))")
+    ("jx-unmod-entry" . "(first (.entrySet (java.util.Collections/unmodifiableMap (doto (java.util.HashMap.) (.put :a 1)))))")
+    ("jx-absmap-keyset" . "(.keySet (java.util.Map/of :a 1))")
+    ("jx-absmap-values" . "(.values (java.util.Map/of :a 1))")
+    ("jx-imm-mapn-entryset" . "(.entrySet (java.util.Map/of :a 1 :b 2))")
+    ("cd-arraylist-sublist" . "(.subList (java.util.ArrayList. [1 2 3]) 0 2)")
+    ("cd-ra-sublist" . "(.subList (java.util.Arrays/asList (object-array [1 2 3])) 0 2)")
+    ("cd-sublist" . "(.subList (java.util.LinkedList. [1 2 3]) 0 2)")
+    ("jx-reverse-list" . "(.reversed (java.util.Vector. [1 2]))")
+    ("jx-hashtable-entry" . "(first (.entrySet (java.util.Hashtable. {:a 1})))")
+    ("jx-reverse-deque" . "(.reversed (java.util.concurrent.ConcurrentLinkedDeque. [1 2]))")
+    ("jx-cow-sublist" . "(.subList (java.util.concurrent.CopyOnWriteArrayList. [1 2 3]) 0 2)")
+    ("jx-cslm-sub" . "(.headMap (java.util.concurrent.ConcurrentSkipListMap. {1 1 2 2}) 2)")
+    ("jx-cslm-dsub" . "(.descendingMap (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-keyset" . "(.keySet (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-values" . "(.values (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-subvalues" . "(.values (.headMap (java.util.concurrent.ConcurrentSkipListMap. {1 1 2 2}) 2))")
+    ("jx-cslm-entryset" . "(.entrySet (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-subentryset" . "(.entrySet (.headMap (java.util.concurrent.ConcurrentSkipListMap. {1 1 2 2}) 2))")
+    ("jx-cslm-dsubentryset" . "(.entrySet (.descendingMap (java.util.concurrent.ConcurrentSkipListMap. {1 1})))")
+    ("jx-seq-keyset" . "(.sequencedKeySet (java.util.TreeMap. {1 1}))")
+    ("jx-seq-values" . "(.sequencedValues (java.util.TreeMap. {1 1}))")
+    ("jx-seq-entryset" . "(.sequencedEntrySet (java.util.TreeMap. {1 1}))")
+    ("jx-reverse-linkedlist" . "(.reversed (java.util.LinkedList. [1 2]))")
+    ("jx-cow-reversed" . "(.reversed (java.util.concurrent.CopyOnWriteArrayList. [1 2]))")
+    ("jx-rev-sortedmap" . "(.reversed (java.util.Collections/unmodifiableSortedMap (java.util.TreeMap. {1 1})))")
+    ("jx-rev-sortedset" . "(.reversed (java.util.Collections/unmodifiableSortedSet (java.util.TreeSet. [1])))")))
+;; tag -> a Clojure expression whose value WRAPS a value with that tag, which a
+;; program only ever reaches through the wrapper (a Hashtable's keySet is a
+;; Collections$SynchronizedSet over Hashtable$KeySet): the wrapper's dump is
+;; refused naming the inner class, as the JDK's NotSerializableException does
+(define wrapped-refused
+  '(("jx-hashtable-keyset" . "(.keySet (java.util.Hashtable. {:a 1}))")
+    ("jx-hashtable-values" . "(.values (java.util.Hashtable. {:a 1}))")
+    ("jx-hashtable-entryset" . "(.entrySet (java.util.Hashtable. {:a 1}))")))
 
 (define (tag-of v) (and (jhost? v) (jhost-tag v)))
 
@@ -91,7 +168,7 @@
   (vector-for-each
     (lambda (t)
       (ok (format "java.util shim tag ~a has no image sample: add one to image-coverage-test.ss that round-trips (with a codec in java/image-codecs.ss if its state cannot travel), or a refused sample" t)
-          (or (assoc t samples) (assoc t refused) (assoc t same-codec))))
+          (or (assoc t samples) (assoc t refused) (assoc t same-codec) (assoc t wrapped-refused))))
     ks))
 
 ;; the samples round-trip
@@ -113,6 +190,17 @@
           (jolt-truthy? (jolt-invoke (var-deref "user" "image-refuses?") v)))))
   refused)
 
+;; the wrapped ones: the wrapper holds a value with the tag, and is refused naming its class
+(for-each
+  (lambda (p)
+    (let ((v (ev (cdr p))))
+      (ok (format "wrapped refused sample for ~a holds that tag" (car p))
+          (and (jhost? v) (equal? (tag-of (vector-ref (jhost-state v) 0)) (car p))))
+      (ok (format "~a is refused naming its class" (car p))
+          (jolt-truthy? (jolt-invoke (var-deref "user" "image-refuses-naming?") v
+                                     (jolt-class-name (vector-ref (jhost-state v) 0)))))))
+  wrapped-refused)
+
 ;; every codec and refusal registered is one this file knows about
 (let-values (((ks vs) (hashtable-entries image-codec-by-tag)))
   (vector-for-each
@@ -123,7 +211,7 @@
 (let-values (((ks vs) (hashtable-entries image-refusal-by-tag)))
   (ok "every refused collection view or entry has a refused sample"
       (for-all (lambda (t)
-                 (or (assoc t refused) (not (hashtable-ref jutil-colls-tbl t #f))))
+                 (or (assoc t refused) (assoc t wrapped-refused) (not (hashtable-ref jutil-colls-tbl t #f))))
                (vector->list ks))))
 
 ;; the values that are not collections but carry host state
@@ -131,7 +219,7 @@
   (lambda (s)
     (ok (format "~a round-trips" s)
         (jolt-truthy? (jolt-invoke (var-deref "user" "image-round-trips?") (ev s)))))
-  '("(StringBuilder. \"ab\")" "(StringBuffer. \"cd\")"))
+  '("(StringBuilder. \"ab\")" "(StringBuffer. \"cd\")" "(doto (java.util.BitSet. 10) (.set 3) (.set 70))"))
 (ok "a thread is refused naming its class"
     (jolt-truthy? (jolt-invoke (var-deref "user" "image-refuses?") (ev "(Thread. (fn []))"))))
 (ok "a collection holding itself restores as one"

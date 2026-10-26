@@ -432,6 +432,10 @@
            ;; other forcer of the cell waited on it for good.
            (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
              (jolt-locks-enter!)
+             ;; the claim is a fresh pair: release its stores before the CAS
+             ;; publishes it, or a reader can see the pointer before the token
+             ;; and take a live claim for a stale one
+             (memory-order-release)
              (if (sa-record-cas! cell L #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire
                  ;; makes every store the previous holder released visible to this
@@ -534,6 +538,8 @@
            ;; returns, so the far edge needs nothing.
            (let ((claim (make-tail-claim w me force-claim-token)))
              (jolt-locks-enter!)
+             ;; a fresh record, published by the CAS: release its fields first
+             (memory-order-release)
              (if (sa-record-cas! s cseq-tail-index w claim)
                  (let ((done #f))
                    (memory-order-acquire)
@@ -663,6 +669,10 @@
 (define (register-seq-arm! pred handler)
   (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-seq-arm-last! pred handler)
+  (seq-arm-reject-fast-type! 'register-seq-arm-last! pred)
+  (set! jolt-seq-arms (append jolt-seq-arms (list (cons pred handler)))))
 
 ;; A map's entries, keys or vals, and a set's elements, as a seq of the given
 ;; flavor. MODE picks what each element is: 0 the entry, 1 the key, 2 the value.

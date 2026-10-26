@@ -81,8 +81,10 @@
                       " (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v)))"
                       " (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil)"
                       " (cons [_ o] (cons o (seq v))))"
-                      " [(pr-str (->Psq [1 2 3])) (str (->Psq [1 2 3]))])")
-       "[\"(1 2 3)\" \"(1 2 3)\"]")
+                      " [(pr-str (->Psq [1 2 3])) (clojure.string/replace (str (->Psq [1 2 3])) #\"@[0-9a-f]+\" \"@H\")])")
+       ;; str is toString, which a deftype implementing ISeq does not override:
+       ;; Object's Class@hash, as on the JVM
+       "[\"(1 2 3)\" \"user.Psq@H\"]")
 ;; the runtime target must never emit chez unsafe spellings
 (check "(count \"gambit\")" "6")
 

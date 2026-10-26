@@ -657,7 +657,7 @@
                                   (io-note-file-read! fp)
                                   (let ((port (nio-open-input-port fp (nio-shown p))))
                                     (nio-delete-on-close! fp port opts)
-                                    (make-in-stream port)))))
+                                    (stream-classed! (make-in-stream port) "sun.nio.ch.ChannelInputStream")))))
         (cons "createTempFile"      (lambda args (nio-files-create-temp args #f)))
         (cons "createTempDirectory" (lambda args (nio-files-create-temp args #t))))))
   (set! files-accum-chunks (cons files-statics files-accum-chunks)))
@@ -1213,9 +1213,11 @@
                                (close-port port)
                                (->path p))))
              (cons "newOutputStream" (lambda (p . opts)
-                                      (make-out-stream
-                                       (nio-open-output-port
-                                        (nfp p) (nio-output-file-options opts) opts (nio-shown p))))))))
+                                      (stream-classed!
+                                       (make-out-stream
+                                        (nio-open-output-port
+                                         (nfp p) (nio-output-file-options opts) opts (nio-shown p)))
+                                       "sun.nio.ch.ChannelOutputStream"))))))
   (set! files-accum-chunks (cons files-opt files-accum-chunks)))
 
 ;; ---- stat-backed perms + real path (increment: what the fs suite exercises) --

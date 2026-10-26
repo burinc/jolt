@@ -176,9 +176,17 @@
                     (al-set! self idx x) old)))
     (cons "size" (lambda (self) (->num (al-cnt self))))
     (cons "isEmpty" (lambda (self) (fx=? 0 (al-cnt self))))
+    ;; remove(int) for an integer, remove(Object) — the first equal element,
+    ;; answering whether there was one — for anything else, the overload
+    ;; Clojure's reflector picks for a long and for any other argument
     (cons "remove" (lambda (self i)
-                     (let* ((idx (jnum->exact i)) (old (al-ref self idx)))
-                       (al-remove-at! self idx) old)))
+                     (if (and (number? i) (exact? i) (integer? i))
+                         (let* ((idx (jnum->exact i)) (old (begin (al-check-index! self idx) (al-ref self idx))))
+                           (al-remove-at! self idx) old)
+                         (let loop ((k 0))
+                           (cond ((fx=? k (al-cnt self)) #f)
+                                 ((objects-equals? i (al-ref self k)) (al-remove-at! self k) #t)
+                                 (else (loop (fx+ k 1))))))))
     (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
@@ -253,10 +261,18 @@
   (let ((al (make-arraylist xs))) (make-jhost "arraydeque" (jhost-state al))))
 ;; An ArrayDeque is only a Collection: it keeps Object's identity equals and
 ;; hashCode, where the List shims compare element-wise.
+;; It has no remove(int): remove(Object) takes an integer as the element, and
+;; remove() is removeFirst.
 (register-host-methods! "arraydeque"
-  (append (list (cons "equals" (lambda (self o) (eq? self o)))
-                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self)))))
-          (filter (lambda (p) (not (member (car p) '("equals" "hashCode")))) linkedlist-methods)))
+  (append (filter (lambda (p) (not (member (car p) '("equals" "hashCode" "remove")))) linkedlist-methods)
+          (list (cons "equals" (lambda (self o) (eq? self o)))
+                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self))))
+                (cons "remove" (case-lambda
+                                 ((self) (al-first self) (let ((o (al-first self))) (al-remove-at! self 0) o))
+                                 ((self x) (let loop ((k 0))
+                                             (cond ((fx=? k (al-cnt self)) #f)
+                                                   ((objects-equals? x (al-ref self k)) (al-remove-at! self k) #t)
+                                                   (else (loop (fx+ k 1)))))))))))
 (let ((ctor (lambda args
               (cond ((null? args) (make-arraydeque '()))
                     ((number? (car args)) (make-arraydeque '()))
@@ -781,7 +797,9 @@
         (cons "values" (lambda (self) (apply jolt-vector
                           (map (lambda (k) (hashtable-ref (hm-tbl self) k jolt-nil))
                                (hm-keys-ordered self)))))
-        (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))))
+        ;; a snapshot of the entries (jolt-5u4jz: the JDK's is a live view); never
+        ;; nil, which an empty map's seq would be
+        (cons "entrySet" (lambda (self) (let ((s (jolt-seq (hm->pmap self)))) (if (jolt-nil? s) jolt-empty-list s))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
@@ -1010,6 +1028,9 @@
         ;; here while ensuring conversion completes before state changes.
         (cons "set" (lambda (self v)
           (let ((next (atomic-convert self v)))
+            ;; set is a volatile write: what was built before it is visible to
+            ;; a get on another thread
+            (memory-order-release)
             (set-box! (atomic-box self) next)
             jolt-nil)))
         (cons "getAndSet" (lambda (self v)
@@ -1051,16 +1072,10 @@
         (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self))))))))
   (for-each (lambda (t) (register-host-methods! t atomic-methods))
             (cons atomic-legacy-tag atomic-tags)))
-;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
-;; thread-safe access. The shared-heap HashMap/ArrayList shims already serialize
-;; individual ops adequately for these uses, so the wrapper returns its argument.
-(let ((ident (lambda (c . _) c)))
-  ;; registering under the FQN also registers the short name (shared table)
-  (register-class-statics! "java.util.Collections"
-    (list (cons "synchronizedMap" ident) (cons "synchronizedList" ident)
-          (cons "synchronizedSet" ident) (cons "unmodifiableMap" ident)
-          (cons "unmodifiableList" ident) (cons "unmodifiableSet" ident)
-          (cons "emptyList" (lambda _ (jolt-vector))) (cons "emptyMap" (lambda _ (jolt-hash-map))))))
+;; java.util.Collections/unmodifiable* and synchronized* are views over their
+;; argument (jutil-views.ss); they used to answer the argument itself.
+(register-class-statics! "java.util.Collections"
+  (list (cons "emptyList" (lambda _ (jolt-vector))) (cons "emptyMap" (lambda _ (jolt-hash-map)))))
 
 ;; Collections/enumeration: an Enumeration over a collection's elements, which
 ;; enumeration-seq and SequenceInputStream drive. Collections/list drains any
@@ -1285,7 +1300,15 @@
       (vector (cond ((string? src) src)
                     ((jolt-array? src) (apply string-append (map jolt-str-render-one (seq->list (jolt-seq src)))))
                     (else (jolt-str-render-one src)))
-              0 0))))
+              0 0 #f))))
+;; Slot 3 is set on the string-reader io/reader hands back over an in-memory
+;; source (a jar entry, a baked resource): that one is a BufferedReader on the
+;; JVM, to class and instance? alike, where a constructed StringReader is not.
+(define (string-reader-buffered? x)
+  (let ((st (jhost-state x))) (and (fx>? (vector-length st) 3) (vector-ref st 3))))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "string-reader")
+                                      (string-reader-buffered? x)))
+                     (lambda (x) "java.io.BufferedReader"))
 ;; Reader.read(char[]) and Reader.read(char[], int, int) are BOTH overloads on
 ;; java.io.Reader, and the one-argument form means "fill the whole array". Only
 ;; the three-argument form was destructured here, so `(.read r cbuf)` — the
@@ -2498,7 +2521,8 @@
                    ((string=? iface "PushbackReader")
                     (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))
                    ((string=? iface "StringReader")
-                    (and (jhost? val) (string=? (jhost-tag val) "string-reader")))
+                    (and (jhost? val) (string=? (jhost-tag val) "string-reader")
+                         (not (string-reader-buffered? val))))
                    ((string=? iface "Reader") (reader-jhost? val))
                    ;; ...but a PushbackReader is NOT a BufferedReader: on the JVM
                    ;; it extends FilterReader, and library code branches on the
@@ -2508,9 +2532,16 @@
                    ;; BufferedReader on the JVM, so the string-reader tag keeps
                    ;; answering true; a bare (java.io.StringReader. s) shares that
                    ;; tag and answers with it (known-divergences, :host-model).
+                   ;; what io/reader made is one (a string-reader it marked, a
+                   ;; char-reader classed BufferedReader); a StringReader, a
+                   ;; FileReader or an InputStreamReader is not
                    ((string=? iface "BufferedReader")
-                    (and (reader-jhost? val)
-                         (not (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))))
+                    (cond ((and (jhost? val) (string=? (jhost-tag val) "char-reader") (stream-class val))
+                           => (lambda (c) (jch-isa? c "java.io.BufferedReader")))
+                          ((not (reader-jhost? val)) #f)
+                          ((pushback-reader-tag? (jhost-tag val)) #f)
+                          ((string=? (jhost-tag val) "string-reader") (string-reader-buffered? val))
+                          (else #t)))
                    (else 'none))))
         (if (eq? hit 'none) 'pass (if hit #t #f)))))))
 

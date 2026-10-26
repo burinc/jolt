@@ -1048,8 +1048,11 @@
     (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
         (begin
           (io-opts-check! opts)
-          (host-new "StringReader"
-                    (apply string-append (map jolt-str-render-one (seq->list (jolt-seq x))))))
+          ;; a BufferedReader over the chars on the JVM
+          (let ((r (host-new "StringReader"
+                             (apply string-append (map jolt-str-render-one (seq->list (jolt-seq x)))))))
+            (vector-set! (jhost-state r) 3 #t)
+            r))
         (apply jolt-io-reader x opts))))
 
 ;; --- bind into clojure.core -------------------------------------------------

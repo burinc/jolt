@@ -1617,6 +1617,11 @@
 (define (register-get-arm! pred handler)
   (get-arm-reject-fast-type! 'register-get-arm! pred)
   (set! jolt-get-arms (cons (cons pred handler) jolt-get-arms)))
+;; At the END of the walk: for a family of rare values whose arm should not add
+;; its predicate to every common one's lookup (the arms run newest first).
+(define (register-get-arm-last! pred handler)
+  (get-arm-reject-fast-type! 'register-get-arm-last! pred)
+  (set! jolt-get-arms (append jolt-get-arms (list (cons pred handler)))))
 (define (jolt-get-base coll k d)
   (cond ((pmap? coll) (pmap-get coll k d))
         ((pset? coll) (pset-get coll k d))
@@ -1766,6 +1771,11 @@
 (define (register-count-arm! pred handler)
   (count-arm-reject-fast-type! 'register-count-arm! pred)
   (set! jolt-count-arms (cons (cons pred handler) jolt-count-arms)))
+;; At the END of the walk: for a family of rare values whose arm should not add
+;; its predicate to every common one's lookup (the arms run newest first).
+(define (register-count-arm-last! pred handler)
+  (count-arm-reject-fast-type! 'register-count-arm-last! pred)
+  (set! jolt-count-arms (append jolt-count-arms (list (cons pred handler)))))
 (define (jolt-count-base coll)
   ;; arms exhausted: a deftype/record counts through its declared method.
   (cond ((rec-coll-method coll "count") => (lambda (m) (jolt-invoke m coll)))
@@ -1892,6 +1902,11 @@
 (define (register-contains-arm! pred handler)
   (contains-arm-reject-fast-type! 'register-contains-arm! pred)
   (set! jolt-contains-arms (cons (cons pred handler) jolt-contains-arms)))
+;; At the END of the walk: for a family of rare values whose arm should not add
+;; its predicate to every common one's lookup (the arms run newest first).
+(define (register-contains-arm-last! pred handler)
+  (contains-arm-reject-fast-type! 'register-contains-arm-last! pred)
+  (set! jolt-contains-arms (append jolt-contains-arms (list (cons pred handler)))))
 
 ;; ---- empty? arms: host types register here instead of set!-wrapping jolt-empty? ---
 ;; Arms dispatch newest-registration-first, matching the set!-chain precedence.

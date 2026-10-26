@@ -663,6 +663,19 @@
             (jolt-seq (seq-more s))
             (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
 
+(define (jrec-entry-pairs r)
+  (let ((fkeys (jrdesc-fkeys (jrec-desc r)))
+        (ext (jrec-ext r)))
+    (let loop ((i (fx- (jrec-nfields r) 1))
+               (acc (if (jolt-nil? ext) '() (jrec-ext-pairs ext))))
+      (if (fx<? i 0)
+          acc
+          (loop
+            (fx- i 1)
+            (cons
+              (cons (vector-ref fkeys i) (jrec-field-ref r i))
+              acc))))))
+
 (define (jrec-lookup r k d)
   (if (eq? k jolt-deftype-kw)
       (jrec-tag r)
@@ -816,7 +829,7 @@
   (if (jolt-print-hash?)
       "#"
       (with-deeper-print
-        (if (eq? shape 'map)
+        (if (memq shape '(map jmap))
             (string-append
               "{"
               (jolt-str-join-comma
@@ -826,7 +839,14 @@
                            (jolt-pr-readable (jolt-nth e 0))
                            " "
                            (jolt-pr-readable (jolt-nth e 1))))
-                       (seq->list r))))
+                       (if (eq? shape 'jmap)
+                           (seq->list
+                             (jolt-seq
+                               (record-method-dispatch
+                                 r
+                                 "entrySet"
+                                 jolt-nil)))
+                           (seq->list r)))))
               "}")
             (let ((body (jolt-str-join
                           (jolt-limited-seq-strs
@@ -837,11 +857,28 @@
                 ((vec) (string-append "[" body "]"))
                 (else (string-append "#{" body "}"))))))))
 
-(define (jrec-pr r)
+(define (jrec-pr r readable?)
   (cond
     ((jrec-coll-print-shape r) =>
      (lambda (shape) (jrec-coll-pr r shape)))
-    (else (jrec-field-pr r))))
+    ((or (jrec-record? r)
+         (not (hashtable-ref chez-deftype-tag-set (jrec-tag r) #f)))
+     (jrec-field-pr r))
+    ((rec-coll-method r "deref")
+     (let ((port (open-output-string)))
+       (deref-print-to! port r jrec-deref-print-state readable?)
+       (get-output-string port)))
+    (else (jolt-object-repr r readable?))))
+
+(define (jrec-deref-print-state r)
+  (let ((realized (rec-coll-method r "isRealized")))
+    (if (and realized
+             (not (jolt-truthy? (jolt-invoke realized r))))
+        (cons "pending" jolt-nil)
+        (guard (e (#t (cons "failed" (jolt-unwrap-throw e))))
+          (cons
+            "ready"
+            (jolt-invoke (rec-coll-method r "deref") r))))))
 
 (define (jrec-field-pr r)
   (string-append
@@ -990,6 +1027,7 @@
              ((jch-isa? tag "clojure.lang.IPersistentVector") 'vec)
              ((jch-isa? tag "clojure.lang.IPersistentSet") 'set)
              ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
+             ((jch-isa? tag "java.util.Map") 'jmap)
              (else #f)))
       (jch-isa? tag "java.lang.CharSequence") record?
       (and (not record?) (tag-declares-coll-iface? tag))
@@ -1457,9 +1495,12 @@
 (define (set-jrec-enum-constant-test! f)
   (set! jrec-enum-constant? f))
 
-(register-pr-arm!
-  (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x))))
-  jrec-pr)
+(let ((pred (lambda (x)
+              (and (jrec? x) (not (jrec-enum-constant? x))))))
+  (register-pr-str-arm! pred (lambda (x) (jrec-pr x #f)))
+  (register-pr-readable-arm!
+    pred
+    (lambda (x) (jrec-pr x #t))))
 
 (register-map-pred-arm! jrec-maplike?)
 
@@ -3787,17 +3828,15 @@
 (register-str-render!
   jrec?
   (lambda (v)
-    (let ((f (find-protocol-method
+    (let ((f (find-method-any-protocol
                (jrec-tag v)
-               "Object"
                "toString")))
-      (cond
-        (f (jolt-invoke f v))
-        ((jrec-coll-print-shape v) =>
-         (lambda (shape) (jrec-coll-pr v shape)))
-        (else
-         (let ((s (jrec-field-pr v)))
-           (substring s 1 (string-length s))))))))
+      (if f
+          (jolt-invoke f v)
+          (string-append
+            (jolt-class-name v)
+            "@"
+            (jolt-hex32 (jolt-java-hashcode v)))))))
 
 (register-str-render!
   (lambda (v) (and (reify-method-ref v "toString") #t))

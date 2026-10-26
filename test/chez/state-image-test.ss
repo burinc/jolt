@@ -1390,6 +1390,11 @@
 (is "v0.6.8 fixture: imgrec8/plain" "imgrec8/plain" "7")
 (is "v0.6.8 fixture: a defrecord instance prints" "(pr-str imgrec8/box)" "#imgrec8.Box{:a 1, :b \"two\"}")
 (is "v0.6.8 fixture: its fields read" "[(:a imgrec8/box) (:b imgrec8/box) (count imgrec8/box)]" "[1 two 2]")
+;; This process never defined imgrec8's types: the instances came in raw with
+;; their descriptors, but defrecord and deftype never ran here, so nothing says
+;; which of the two Pt was. An instance of a type the process does not know keeps
+;; the field form; once the code is loaded (the world-restore workflow), a
+;; deftype prints as the JVM's #object (jolt-jon4).
 (is "v0.6.8 fixture: a deftype instance prints" "(pr-str imgrec8/pt)" "#imgrec8.Pt{:x 3, :y 4}")
 
 ;; --- the same proof for the COLLECTION records and their metadata. Format 7

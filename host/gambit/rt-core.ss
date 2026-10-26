@@ -911,18 +911,13 @@
 ;; Chez): the count of any array-like, nil refused — post-prelude names it.
 (define (jolt-alength a)
   (if (jolt-nil? a) (error 'alength "null") (jolt-count a)))
-;; Which values print their identity hash, as the JVM's #object form does:
-;; a host shim object and, once the enum model has said so, an enum constant.
-;; Naming one costs an insert into the identity-hash table, which a record
-;; printed in bulk (a java.io.File) would pay per object; those print without it.
-(define jolt-object-repr-hash? (lambda (x) (jhost? x)))
+;; Every value printed this way carries its identity hash, as the JVM's
+;; print-object writes (System/identityHashCode o) for any object (jolt-28we).
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
          (content (guard (e (#t #f)) (jolt-object-content x)))
          (head (and (string? cls)
-                    (if (jolt-object-repr-hash? x)
-                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
-                        (string-append "#object[" cls)))))
+                    (string-append "#object[" cls " 0x" (jolt-identity-hex x)))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))

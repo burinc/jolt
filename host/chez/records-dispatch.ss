@@ -1505,17 +1505,16 @@
 ;; jolt exception values (ex-info + host-constructed throwables) are ex-info-shaped
 ;; maps tagged :jolt/type :jolt/ex-info; (class …)/instance? read the JVM class off
 ;; the optional :jolt/class key, defaulting to clojure.lang.ExceptionInfo.
-;; str of a jrec with no toString of its own is its print form. The JVM answers
-;; Object.toString there ("user.Rec@3c6f0c28"); jolt has no identity hash to
-;; print, so it renders the value and drops the leading # of the record marker.
-;; A COLLECTION deftype prints in its collection's shape, which carries no such
-;; marker — dropping a character there turned "(1 2 3)" into "1 2 3)".
+;; str of a jrec with no toString of its own is Object.toString, as on the JVM:
+;; the class name, @, and the hex of its hashCode — a record's is its map hash,
+;; a deftype's its declared hashCode or else its identity hash (jolt-jon4). It
+;; used to be the record's print form with the # dropped.
 (register-str-render! jrec?
   (lambda (v)
-    (let ((f (find-protocol-method (jrec-tag v) "Object" "toString")))
-      (cond (f (jolt-invoke f v))
-            ((jrec-coll-print-shape v) => (lambda (shape) (jrec-coll-pr v shape)))
-            (else (let ((s (jrec-field-pr v))) (substring s 1 (string-length s))))))))
+    (let ((f (find-method-any-protocol (jrec-tag v) "toString")))
+      (if f
+          (jolt-invoke f v)
+          (string-append (jolt-class-name v) "@" (jolt-hex32 (jolt-java-hashcode v)))))))
 
 ;; a reify with a toString method renders through it, like the JVM.
 (register-str-render! (lambda (v) (and (reify-method-ref v "toString") #t))
