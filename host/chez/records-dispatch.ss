@@ -1295,9 +1295,13 @@
         (when (vector-ref layout 2) (reify-class-graph-hook (vector-ref layout 2) protos))
         (jolt-with-mutex reify-shape-mu (hashtable-set! reify-shape-memo shape layout))
         layout)))
-;; A reify form's generated class name, or #f
+;; A reify form's or a proxy's generated class name, or #f. A proxy's is worked
+;; out on first ask by the host (proxy-class-name-hook, java/proxy.ss on Chez).
+(define proxy-class-name-hook (lambda (x) #f))
 (define (reify-class-name x)
-  (and (jreify? x) (let ((c (jreify-cname x))) (and (string? c) c))))
+  (and (jreify? x)
+       (let ((c (jreify-cname x)))
+         (cond ((string? c) c) ((vector? c) (proxy-class-name-hook x)) (else #f)))))
 ;; A persistent collection's java.util.Spliterator, or #f on a host that models none.
 (define persistent-spliterator-hook #f)
 ;; Placing a reify form's class in the class graph is the host's (the Chez half

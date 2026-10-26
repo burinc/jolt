@@ -80,16 +80,19 @@
 (define proxy-class-names (make-hashtable equal-hash equal?))
 (define proxy-class-names-mu (make-mutex))
 (define (proxy-fqn n) (if (memv #\. (string->list n)) n (jch-fqn-of-simple n)))
-(define (proxy-class-name ns names)
+;; CLASS? is whether the first name is the superclass: one jolt could construct
+;; (the proxy got a base), or one the class graph knows that is no interface (an
+;; abstract class such as java.util.AbstractList). Decided when the proxy is
+;; built, so naming it never loads anything.
+(define (proxy-first-is-class? p names)
+  (and (pair? names)
+       (or (and (reify-delegate p) #t)
+           (let ((f (proxy-fqn (car names))))
+             (and (not (jch-interface? f)) (pair? (jch-direct-supers f)))))))
+(define (proxy-class-name ns names class?)
   (let ((key (cons ns names)))
     (or (hashtable-ref proxy-class-names key #f)
-        ;; the first name is the superclass when it is a class: one jolt can
-        ;; construct, or one the class graph knows that is no interface (an
-        ;; abstract class such as java.util.AbstractList)
-        (let* ((class? (and (pair? names)
-                            (or (proxy-class-constructible? (car names))
-                                (let ((f (proxy-fqn (car names))))
-                                  (and (not (jch-interface? f)) (pair? (jch-direct-supers f)))))))
+        (let* (
                (super (if class? (proxy-fqn (car names)) "java.lang.Object"))
                (ifaces (map proxy-fqn (if class? (cdr names) names)))
                ;; Clojure hashes the sorted set of the names; a set's hash is
@@ -114,7 +117,7 @@
 (define proxy-lazy-names (make-weak-eq-hashtable))   ; interned supers list -> ((ns . name) ...)
 (define (jolt-make-proxy-in ns methods-map ctor-args . proto-names)
   (let ((p (jolt-make-proxy* methods-map ctor-args proto-names)))
-    (jreify-cname-set! p (vector ns))
+    (jreify-cname-set! p (vector ns #f))
     p))
 (define (proxy-class-name-of p)
   (let ((c (jreify-cname p)))
@@ -123,13 +126,14 @@
            (let* ((ns (vector-ref c 0)) (ps (jreify-protos p))
                   (hit (assoc ns (hashtable-ref proxy-lazy-names ps '())))
                   (name (if hit (cdr hit)
-                            (let ((name (proxy-class-name ns ps)))
+                            (let ((name (proxy-class-name ns ps (proxy-first-is-class? p ps))))
                               (jolt-with-mutex proxy-class-names-mu
                                 (hashtable-set! proxy-lazy-names ps (cons (cons ns name) (hashtable-ref proxy-lazy-names ps '()))))
                               name))))
              (jreify-cname-set! p name)
              name))
           (else #f))))
+(set! proxy-class-name-hook proxy-class-name-of)
 (def-var! "jolt.host" "make-proxy-in" jolt-make-proxy-in)
 
 ;; (proxy-super meth args...) inside a proxy body: the base's own implementation,
@@ -155,11 +159,11 @@
     (if (proxy-value? val)
         (let ((tname (if (symbol-t? type-sym) (symbol-t-name type-sym) type-sym)))
           (if (and (string? tname) (or (reify-declares-class? (jreify-protos val) tname)
-                                       (equal? tname (proxy-class-name-of val))))
+                                       (equal? tname (reify-class-name val))))
               #t
               (if (jolt-truthy? (instance-check type-sym (reify-delegate val))) #t #f)))
         (quote pass))))
-(register-class-arm! proxy-value? (lambda (v) (or (proxy-class-name-of v) (jolt-class-name (reify-delegate v)))))
+(register-class-arm! proxy-value? (lambda (v) (or (reify-class-name v) (jolt-class-name (reify-delegate v)))))
 (let ((prev value-host-tags))
   (set! value-host-tags
     (lambda (obj)

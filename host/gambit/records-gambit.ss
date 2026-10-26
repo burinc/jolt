@@ -3652,9 +3652,15 @@
           (hashtable-set! reify-shape-memo shape layout))
         layout)))
 
+(define proxy-class-name-hook (lambda (x) #f))
+
 (define (reify-class-name x)
   (and (jreify? x)
-       (let ((c (jreify-cname x))) (and (string? c) c))))
+       (let ((c (jreify-cname x)))
+         (cond
+           ((string? c) c)
+           ((vector? c) (proxy-class-name-hook x))
+           (else #f)))))
 
 (define persistent-spliterator-hook #f)
 
