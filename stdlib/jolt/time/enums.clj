@@ -23,6 +23,33 @@
                     (str (subs part 0 1) (.toLowerCase (subs part 1))))
                   (.split nm "_"))))
 
+;; ---- localized names -----------------------------------------------------------
+;; Month / DayOfWeek .getDisplayName(TextStyle, Locale) and ChronoField
+;; .getDisplayName(Locale), from the :date-names and :field-names extension
+;; points: core carries ROOT, jolt-lang/time the other locales (RFC 0008). A
+;; Locale renders as its id. A provider without narrow forms gets the format
+;; name's first letter, which is CLDR's narrow form in every locale measured;
+;; one without standalone forms gets the format forms.
+(defn- locale-id [l]
+  (when (nil? l) (throw (jolt.host/throwable "java.lang.NullPointerException" "locale")))
+  ;; the data's key is the BCP-47-style id; a Locale prints the JDK's en_US
+  (.replace (str l) "_" "-"))
+(defn- text-name [kind i style l]
+  (when (nil? style) (throw (jolt.host/throwable "java.lang.NullPointerException" "style")))
+  (let [id (locale-id l)
+        d (jolt.host/extension-value :date-names id)
+        st (str style)
+        standalone? (.endsWith st "_STANDALONE")
+        k (fn [suffix] (keyword (str (name kind) suffix)))
+        pick (fn [ks] (some (fn [key] (let [v (get d key)] (when v (nth v i nil)))) ks))]
+    (cond
+      (.startsWith st "FULL") (pick (if standalone? [(k "-standalone") kind] [kind]))
+      (.startsWith st "SHORT") (pick (if standalone? [(k "-short-standalone") (k "-short")] [(k "-short")]))
+      :else (or (pick [(k "-narrow")])
+                (if (and (= id "") (= kind :months))
+                  (str (inc i))
+                  (let [full (pick [kind])] (.toUpperCase (subs full 0 1))))))))
+
 ;; ---- Month ------------------------------------------------------------------
 
 (def ^:private months (mapv #(impl/value :jolt.time/month {:value %}) (range 1 13)))
@@ -55,7 +82,7 @@
    "ordinal"   (fn [e] (dec (month-val e)))
    "name"      month-name
    "toString"  month-name
-   "getDisplayName" (fn [e & _] (month-name e))
+   "getDisplayName" (fn [e style l] (text-name :months (dec (month-val e)) style l))
    "plus"      (fn [e n] (month (inc (u/floor-mod (+ (dec (month-val e)) (u/->long n)) 12))))
    "minus"     (fn [e n] (month (inc (u/floor-mod (- (dec (month-val e)) (u/->long n)) 12))))
    "length"    (fn [e leap] (u/len-of-month (if leap 4 1) (month-val e)))
@@ -96,7 +123,7 @@
    "ordinal"   (fn [e] (dec (dow-val e)))
    "name"      dow-name
    "toString"  dow-name
-   "getDisplayName" (fn [e & _] (dow-name e))
+   "getDisplayName" (fn [e style l] (text-name :days (dec (dow-val e)) style l))
    "plus"      (fn [e n] (dow (inc (u/floor-mod (+ (dec (dow-val e)) (u/->long n)) 7))))
    "minus"     (fn [e n] (dow (inc (u/floor-mod (- (dec (dow-val e)) (u/->long n)) 7))))
    "compareTo" compare
@@ -174,9 +201,10 @@
    "toString"  cf-display
    "ordinal"   (fn [f] (u/chrono-field-index (cf-name f)))
    "compareTo" compare
-   ;; the JDK localizes eight fields' names (DAY_OF_WEEK, MONTH_OF_YEAR, …) and
-   ;; gives the rest their toString in every locale
-   "getDisplayName" (fn [f & _] (cf-display f))
+   ;; CLDR names some fields per locale (DAY_OF_WEEK, MONTH_OF_YEAR, …); the
+   ;; rest are their toString in every locale
+   "getDisplayName" (fn [f l] (get (:names (jolt.host/extension-value :field-names (locale-id l)))
+                                   (cf-name f) (cf-display f)))
    "isDateBased" (fn [f] (contains? u/date-based-fields (cf-name f)))
    "isTimeBased" (fn [f] (not (or (contains? u/date-based-fields (cf-name f))
                                   (contains? #{"INSTANT_SECONDS" "OFFSET_SECONDS"} (cf-name f)))))

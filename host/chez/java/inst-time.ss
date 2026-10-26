@@ -872,16 +872,45 @@
     (jolt-hash-map
       (kw "key") (kw "string")
       (kw "root") ""
+      ;; the narrow and standalone forms (TextStyle's NARROW and *_STANDALONE)
+      ;; are optional: no default, so a provider without them reads its own
+      ;; format forms (java.time's getDisplayName, java/../enums.clj)
       (kw "fields") (jolt-hash-map (kw "months") (kw "any")
                                    (kw "months-short") (kw "any")
                                    (kw "days") (kw "any")
-                                   (kw "days-short") (kw "any"))
+                                   (kw "days-short") (kw "any")
+                                   (kw "months-narrow") (kw "any")
+                                   (kw "days-narrow") (kw "any")
+                                   (kw "months-standalone") (kw "any")
+                                   (kw "months-short-standalone") (kw "any")
+                                   (kw "days-standalone") (kw "any")
+                                   (kw "days-short-standalone") (kw "any"))
       (kw "default") (jolt-hash-map (kw "months") (apply jolt-vector (vector->list sdf-root-months))
                                     (kw "months-short") (apply jolt-vector (vector->list sdf-root-months))
                                     (kw "days") (apply jolt-vector (vector->list sdf-root-days))
-                                    (kw "days-short") (apply jolt-vector (vector->list sdf-root-days)))
+                                    (kw "days-short") (apply jolt-vector (vector->list sdf-root-days))
+                                    ;; nil: no narrow or standalone table, the
+                                    ;; reader derives from the format forms
+                                    (kw "months-narrow") jolt-nil (kw "days-narrow") jolt-nil
+                                    (kw "months-standalone") jolt-nil (kw "months-short-standalone") jolt-nil
+                                    (kw "days-standalone") jolt-nil (kw "days-short-standalone") jolt-nil)
       (kw "fallback") (kw "default")
       (kw "hint") "The jolt-lang/time library carries per-locale month and day names.")))
+
+;; :field-names — ChronoField.getDisplayName(locale): the names CLDR gives the
+;; fields it names (DAY_OF_WEEK, MONTH_OF_YEAR, …), keyed by the field's constant
+;; name. A field with no entry is its toString in every locale. ROOT names six.
+(let ((kw (lambda (n) (keyword #f n))))
+  (jolt-register-extension-point! (kw "field-names")
+    (jolt-hash-map
+      (kw "key") (kw "string")
+      (kw "root") ""
+      (kw "fields") (jolt-hash-map (kw "names") (kw "any"))
+      (kw "default") (jolt-hash-map (kw "names")
+                       (jolt-hash-map "SECOND_OF_MINUTE" "Second" "MINUTE_OF_HOUR" "Minute" "HOUR_OF_DAY" "Hour"
+                                      "AMPM_OF_DAY" "Dayperiod" "DAY_OF_WEEK" "Day of the Week" "MONTH_OF_YEAR" "Month"))
+      (kw "fallback") (kw "default")
+      (kw "hint") "The jolt-lang/time library carries per-locale field names.")))
 
 ;; Project the point's map for a locale id to format-ms' names vector. A field a
 ;; provider set to nil (the field type is :any, so it can) falls back to ROOT's.
@@ -993,7 +1022,7 @@
 ;; that zone's clock and parse reads a zone-less input on it.
 (define (sdf-ctor pat . rest)
   (make-jhost "sdf" (vector (if (string? pat) pat (jolt-str-render-one pat))
-                            (and (pair? rest) (jolt-str-render-one (car rest)))
+                            (and (pair? rest) (jolt-locale-key (car rest)))
                             (default-timezone))))
 (register-class-ctor! "SimpleDateFormat" sdf-ctor)
 (register-class-ctor! "java.text.SimpleDateFormat" sdf-ctor)

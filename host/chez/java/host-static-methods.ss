@@ -773,6 +773,11 @@
       (kw "default") (jolt-hash-map (kw "decimal-sep") "." (kw "grouping-sep") ",")
       (kw "fallback") (kw "default")
       (kw "hint") "The jolt-lang/time library carries per-locale number symbols.")))
+;; The key a Locale's locale data is registered under: its BCP-47-style id
+;; ("en-US"), from the Locale's rendering, which prints the JDK's toString
+;; ("en_US"). Core has no Locale class, so it reads the rendering (RFC 0008).
+(define (jolt-locale-key l)
+  (list->string (map (lambda (c) (if (char=? c #\_) #\- c)) (string->list (jolt-str-render-one l)))))
 (define (number-symbol id name dflt)
   (let* ((data (jolt-extension-value (keyword #f "number-symbols") id))
          (v (jolt-get-dispatch data (keyword #f name) jolt-nil)))
@@ -843,7 +848,7 @@
                    args)))
     (if locale?
         (parameterize ((format-decimal-sep
-                        (number-symbol (jolt-str-render-one a) "decimal-sep" ".")))
+                        (number-symbol (jolt-locale-key a) "decimal-sep" ".")))
           (jolt-format* sink fmt args))
         (jolt-format* sink fmt args))))
 
@@ -939,7 +944,7 @@
 ;; default the JVM would use — core has no notion of a default locale. Documented
 ;; in known-divergences.
 (define (nf-currency-instance . args)
-  (let* ((key (if (null? args) "" (jolt-str-render-one (car args))))
+  (let* ((key (if (null? args) "" (jolt-locale-key (car args))))
          (data (jolt-extension-value (keyword #f "currency-data") key))
          (frac (let ((f (jolt-get-dispatch data (keyword #f "frac-digits") jolt-nil)))
                  (if (jolt-nil? f) 2 f))))
