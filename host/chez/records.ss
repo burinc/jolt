@@ -785,7 +785,10 @@
 (define (jrec-pr r readable?)
   (cond
     ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
-    ((jrec-record? r) (jrec-field-pr r))
+    ;; a type this process never defined (an instance that came in through an
+    ;; image, its code not loaded) cannot say whether it was a defrecord or a
+    ;; deftype; it keeps the field form rather than guess
+    ((or (jrec-record? r) (not (hashtable-ref chez-deftype-tag-set (jrec-tag r) #f))) (jrec-field-pr r))
     ((rec-coll-method r "deref")
      (let ((port (open-output-string)))
        (deref-print-to! port r jrec-deref-print-state readable?)

@@ -854,7 +854,9 @@
   (cond
     ((jrec-coll-print-shape r) =>
      (lambda (shape) (jrec-coll-pr r shape)))
-    ((jrec-record? r) (jrec-field-pr r))
+    ((or (jrec-record? r)
+         (not (hashtable-ref chez-deftype-tag-set (jrec-tag r) #f)))
+     (jrec-field-pr r))
     ((rec-coll-method r "deref")
      (let ((port (open-output-string)))
        (deref-print-to! port r jrec-deref-print-state readable?)
