@@ -1551,7 +1551,7 @@
     (list (cons "add" jx-uoe) (cons "addAll" jx-uoe) (cons "addFirst" jx-uoe) (cons "addLast" jx-uoe)
           (cons "reversed" (lambda (self) (jx-call (jx-call (sqv-map self) "reversed" '()) reversed-method '())))
           (cons "getFirst" (lambda (self) (let ((xs (jxc-elems (sqv-view self)))) (if (null? xs) (throw-jvm 'NoSuchElementException jolt-nil) (car xs)))))
-          (cons "getLast" (lambda (self) (let ((xs (jxc-elems (sqv-view self)))) (if (null? xs) (throw-jvm 'NoSuchElementException jolt-nil) (car (last-pair xs))))))
+          (cons "getLast" (lambda (self) (let ((xs (jxc-elems (sqv-view self)))) (if (null? xs) (throw-jvm 'NoSuchElementException jolt-nil) (list-ref xs (fx- (length xs) 1))))))
           (cons "removeFirst" (lambda (self) (let ((it (jx-call (sqv-view self) "iterator" '())))
                                                (unless (jolt-truthy? (jx-call it "hasNext" '())) (throw-jvm 'NoSuchElementException jolt-nil))
                                                (let ((x (jx-call it "next" '()))) (jx-call it "remove" '()) x))))
