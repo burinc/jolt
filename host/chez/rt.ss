@@ -2705,8 +2705,10 @@
          (hex (and (string? cls) (jolt-identity-hex x)))
          ;; a deftype with no toString of its own is Object.toString: the class
          ;; and hex already in hand, rather than a second class-name lookup and
-         ;; a walk of the str registry to reach them
-         (content (if (and hex (jrec? x) (not (find-protocol-method (jrec-tag x) "Object" "toString")))
+         ;; a walk of the str registry to reach them. An enum constant's is its
+         ;; name, which the registry answers.
+         (content (if (and hex (jrec? x) (not (find-protocol-method (jrec-tag x) "Object" "toString"))
+                           (not (enum-constant? x)))
                       (string-append cls "@" (if (find-protocol-method (jrec-tag x) "Object" "hashCode")
                                                  (jolt-hex32 (jolt-java-hashcode x))
                                                  hex))
