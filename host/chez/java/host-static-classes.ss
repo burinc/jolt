@@ -1082,6 +1082,18 @@
       self)))
 (register-class-ctor! "HashSet" (hs-ctor "hashset"))
 (register-class-ctor! "java.util.HashSet" (hs-ctor "hashset"))
+;; HashMap.newHashMap / HashSet.newHashSet (JDK 19): sized for N mappings, which
+;; this table needs no hint for
+(define (hm-sized-new what make)
+  (lambda (n)
+    (when (< (jnum->exact n) 0)
+      (throw-jvm 'IllegalArgumentException
+                 (string-append "Negative number of " what ": " (jolt-str-render-one n))))
+    (make)))
+(register-class-statics! "java.util.HashMap"
+  (list (cons "newHashMap" (hm-sized-new "mappings" (lambda () (make-jhost "hashmap" (vector (make-hashtable hm-hash jolt=2) '())))))))
+(register-class-statics! "java.util.HashSet"
+  (list (cons "newHashSet" (hm-sized-new "elements" (lambda () ((hs-ctor "hashset")))))))
 
 (register-host-methods! "hashset"
   (list (cons "add" (lambda (self x) (let ((had (hashtable-contains? (hm-tbl self) x)))

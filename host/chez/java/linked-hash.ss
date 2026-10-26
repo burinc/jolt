@@ -126,7 +126,9 @@
 (register-class-ctor! "LinkedHashMap" lhm-ctor)
 (register-class-ctor! "java.util.LinkedHashMap" lhm-ctor)
 (register-class-statics! "java.util.LinkedHashMap"
-  (list (cons "newLinkedHashMap"
+  ;; newHashMap is HashMap's static, which the subclass inherits
+  (list (cons "newHashMap" (host-static-ref "java.util.HashMap" "newHashMap"))
+        (cons "newLinkedHashMap"
               (lambda (n)
                 (when (< (jnum->exact n) 0)
                   (throw-jvm 'IllegalArgumentException
@@ -329,7 +331,8 @@
 (register-class-ctor! "LinkedHashSet" lhs-ctor)
 (register-class-ctor! "java.util.LinkedHashSet" lhs-ctor)
 (register-class-statics! "java.util.LinkedHashSet"
-  (list (cons "newLinkedHashSet"
+  (list (cons "newHashSet" (host-static-ref "java.util.HashSet" "newHashSet"))
+        (cons "newLinkedHashSet"
               (lambda (n)
                 (when (< (jnum->exact n) 0)
                   (throw-jvm 'IllegalArgumentException
