@@ -155,14 +155,13 @@
       (throw (jolt.host/throwable "java.lang.IllegalArgumentException"
                                   (str "No enum constant java.time.temporal.ChronoField." name)))))
 (defn cf-name [f] (impl/field f :name))
+;; the JDK's toString: the camel-case name, AM/PM spelled AmPm (AmPmOfDay)
+(defn- cf-display [f] (.replace (display-name (cf-name f)) "Ampm" "AmPm"))
 
 (impl/register-type! :jolt.time/chrono-field
   {:eq   (fn [a b] (= (cf-name a) (cf-name b)))
    :hash (fn [f] (hash (cf-name f)))
-   ;; the JDK's toString is the camel-case name (AmPmOfDay); jolt-lang/time's
-   ;; DateTimeFormatterBuilder reads a field's name through str, so it stays the
-   ;; constant name until that reads .name
-   :str  cf-name
+   :str  cf-display
    :enum? true
    :cmp  (fn [a b] (- (u/chrono-field-index (cf-name a))
                       (u/chrono-field-index (cf-name b))))
@@ -172,10 +171,12 @@
 
 (__register-class-methods! :jolt.time/chrono-field
   {"name"      cf-name
-   "toString"  cf-name
+   "toString"  cf-display
    "ordinal"   (fn [f] (u/chrono-field-index (cf-name f)))
    "compareTo" compare
-   "getDisplayName" (fn [f & _] (cf-name f))
+   ;; the JDK localizes eight fields' names (DAY_OF_WEEK, MONTH_OF_YEAR, …) and
+   ;; gives the rest their toString in every locale
+   "getDisplayName" (fn [f & _] (cf-display f))
    "isDateBased" (fn [f] (contains? u/date-based-fields (cf-name f)))
    "isTimeBased" (fn [f] (not (or (contains? u/date-based-fields (cf-name f))
                                   (contains? #{"INSTANT_SECONDS" "OFFSET_SECONDS"} (cf-name f)))))
