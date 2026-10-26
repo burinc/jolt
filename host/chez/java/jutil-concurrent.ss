@@ -233,7 +233,7 @@
          (cons (car m) (host-arity-of (list (cdr m)) #t
                          (lambda (self . args) (with-vec (vit-vec self) (jx-call (vit-inner self) (car m) args))))))
        '(("hasNext" . 0) ("next" . 0) ("remove" . 0) ("forEachRemaining" . 1))))
-(register-seq-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "jx-vector-itr")))
+(register-seq-arm-last! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "jx-vector-itr")))
   (lambda (it) (jolt-seq (vit-inner it))))
 ;; elements(): Vector$1, an Enumeration over the live vector
 (jx-class! "jx-vector-enum" "java.util.Vector$1" '("java.util.Enumeration"))
@@ -529,7 +529,7 @@
                                        (jolt-fi-call f "accept" (hten-next! self))
                                        (loop)))
                                    jolt-nil))))
-(register-seq-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "jx-hashtable-enumerator")))
+(register-seq-arm-last! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "jx-hashtable-enumerator")))
   (lambda (it) (let ((es (vector-ref (jhost-state it) 1)))
                  (if (null? es) jolt-nil (list->cseq (map (lambda (e) (hten-project it e)) es))))))
 ;; the three views, which the synchronized wrappers above hold the table's lock

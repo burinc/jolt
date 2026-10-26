@@ -669,6 +669,10 @@
 (define (register-seq-arm! pred handler)
   (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-seq-arm-last! pred handler)
+  (seq-arm-reject-fast-type! 'register-seq-arm-last! pred)
+  (set! jolt-seq-arms (append jolt-seq-arms (list (cons pred handler)))))
 
 ;; A map's entries, keys or vals, and a set's elements, as a seq of the given
 ;; flavor. MODE picks what each element is: 0 the entry, 1 the key, 2 the value.

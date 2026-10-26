@@ -41,11 +41,13 @@
   (hashtable-set! jhost-tag->fqn tag fqn)
   (when (pair? supers) (jch-register-supers! fqn (car supers))))
 (define (jx-op x i) (let ((o (jx-ops x))) (and o (vector-ref o i))))
-(register-seq-arm! (lambda (x) (and (jx-op x 2) #t))
+;; last in each walk: these are rare, and HashMap / ArrayList lookups should not
+;; pay their predicate
+(register-seq-arm-last! (lambda (x) (and (jx-op x 2) #t))
   (lambda (x) (let ((xs ((jx-op x 2) x))) (if (null? xs) jolt-nil (list->cseq xs)))))
-(register-count-arm! (lambda (x) (and (jx-op x 1) #t)) (lambda (x) ((jx-op x 1) x)))
-(register-contains-arm! (lambda (x) (and (jx-op x 3) #t)) (lambda (x k) (and ((jx-op x 3) x k) #t)))
-(register-get-arm! (lambda (x) (and (jx-op x 4) #t)) (lambda (x k d) ((jx-op x 4) x k d)))
+(register-count-arm-last! (lambda (x) (and (jx-op x 1) #t)) (lambda (x) ((jx-op x 1) x)))
+(register-contains-arm-last! (lambda (x) (and (jx-op x 3) #t)) (lambda (x k) (and ((jx-op x 3) x k) #t)))
+(register-get-arm-last! (lambda (x) (and (jx-op x 4) #t)) (lambda (x k d) ((jx-op x 4) x k d)))
 ;; nth over a RandomAccess one, as RT.nth reads a java.util.List by get
 (let ((prior shim-nth-target))
   (set! shim-nth-target
