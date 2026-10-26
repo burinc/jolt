@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`java.util.Spliterator`.** Every collection answers `spliterator()` with
+  the JDK's class, characteristics, size and comparator: array-backed ones split
+  at the midpoint, iterator-backed ones by batches, and `spliteratorUnknownSize`
+  over an endless iterator stays lazy. `Spliterators` (`spliterator`,
+  `spliteratorUnknownSize`, `emptySpliterator`, `iterator`) and
+  `StreamSupport/stream` are there too. A hash or tree collection splits at the
+  midpoint rather than where the JDK's table or tree would.
+- **A proxy over java.util's abstract collection classes inherits them.**
+  `(proxy [java.util.AbstractList] [] (get [i] …) (size [] …))` gets the
+  class's iterator, contains, indexOf, subList, equality, hashing and printing,
+  and so do proxies over `AbstractSet`, `AbstractCollection`, `AbstractQueue`
+  and `AbstractMap` (whose lookups run over the proxy's `entrySet`).
+- **`Month`, `DayOfWeek` and `ChronoField` `getDisplayName` answer in the
+  locale**, by `TextStyle` for the first two, from the `:date-names` point and a
+  new `:field-names` point. jolt-lang/time supplies the locales and `TextStyle`;
+  core carries ROOT.
 - **The rest of java.util and java.util.concurrent's collections.** `Vector`,
   `Stack`, `Hashtable`, `BitSet`, `PriorityQueue`, `ConcurrentLinkedQueue`,
   `ConcurrentLinkedDeque`, `CopyOnWriteArrayList`, `CopyOnWriteArraySet`,
@@ -90,6 +106,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A HashMap's `keySet`, `values` and `entrySet` are live views**
+  (`HashMap$KeySet` / `$Values` / `$EntrySet`): removing through one removes
+  from the map, a later put shows through, an entry's `setValue` writes the map
+  and their iterators are fail-fast. They were copies. Adds
+  `AbstractMap$SimpleEntry`.
+- **A proxy's class is the JVM's generated name**
+  (`user.proxy$java.lang.Object$ff19274a`), and each `reify` form has a class
+  of its own (`user$reify__N`) rather than one shared placeholder.
+- **Images are format 13**: they name the defrecord and deftype types they
+  hold, so a process that restores one without having loaded the code knows a
+  record from a deftype. Older images read as before.
+- **Locale data is found by a Locale's id whichever way it prints**, so
+  jolt-lang/time's Locale can print as the JDK's `en_US`.
 - **Every `#object` print carries the identity hash, and a plain deftype prints
   as one**, `#object[user.T 0x1b2c3d4e "user.T@1b2c3d4e"]`, as on the JVM; a
   defrecord keeps its `#ns.R{…}` form, and a deftype that is a `java.util.Map`
