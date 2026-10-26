@@ -2703,15 +2703,15 @@
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
          (hex (and (string? cls) (jolt-identity-hex x)))
-         ;; a deftype with no toString of its own is Object.toString: the class
-         ;; and hex already in hand, rather than a second class-name lookup and
-         ;; a walk of the str registry to reach them. An enum constant's is its
-         ;; name, which the registry answers.
-         (content (if (and hex (jrec? x) (not (find-protocol-method (jrec-tag x) "Object" "toString"))
-                           (not (enum-constant? x)))
-                      (string-append cls "@" (if (find-protocol-method (jrec-tag x) "Object" "hashCode")
-                                                 (jolt-hex32 (jolt-java-hashcode x))
-                                                 hex))
+         ;; a deftype with neither toString nor hashCode of its own is
+         ;; Object.toString over its identity hash: the class and hex already in
+         ;; hand, rather than a second class-name lookup and a walk of the str
+         ;; registry to reach them. One that declares either (user code, which may
+         ;; do anything), and an enum constant (its name), go through the registry.
+         (content (if (and hex (jrec? x) (not (enum-constant? x))
+                           (not (find-protocol-method (jrec-tag x) "Object" "toString"))
+                           (not (find-protocol-method (jrec-tag x) "Object" "hashCode")))
+                      (string-append cls "@" hex)
                       (guard (e (#t #f)) (jolt-object-content x))))
          (head (and hex (string-append "#object[" cls " 0x" hex))))
     (cond ((not head) (format "~a" x))

@@ -151,9 +151,16 @@
 (define (jx-wrap-unmod family x)
   (when (jolt-nil? x) (jx-npe))
   (make-jhost (jx-unmod-tag family) (vector x)))
+;; LOCK is the monitor every method holds: the wrapper's own when LOCK is #f, as
+;; Collections.synchronized*'s mutex is the wrapper itself, so (locking w …) around
+;; an iteration excludes the wrapper's methods (the JDK's documented idiom); a
+;; view's is its backing collection's. A monitor and not a mutex: the wrapped
+;; collection's methods may run user code, which may park a fiber.
 (define (jx-wrap-sync family x lock)
   (when (jolt-nil? x) (jx-npe))
-  (make-jhost (jx-sync-tag family) (vector x lock)))
+  (let ((w (make-jhost (jx-sync-tag family) (vector x lock))))
+    (unless lock (vector-set! (jhost-state w) 1 (object-monitor w)))
+    w))
 (define (jx-random-access? x)
   (let ((c (guard (e (#t #f)) (jolt-class-name x))))
     (and (string? c) (jch-isa? c "java.util.RandomAccess"))))
@@ -215,7 +222,7 @@
 (define (jx-sync-method family name arities)
   (host-arity-of arities #t
     (lambda (self . args)
-      (let ((r (jolt-with-mutex (jxw-lock self) (jx-call (jxw-inner self) name args))))
+      (let ((r (jolt-call-with-monitor (jxw-lock self) (lambda () (jx-call (jxw-inner self) name args)))))
         (jx-sync-result family name r (jxw-lock self))))))
 
 ;; reads through the wrapped collection, for the jx arms and the registry
@@ -225,10 +232,10 @@
 (define (jxw-entry-elems w) (map jx-unmod-entry (jxw-elems w)))
 (define (jxw-contains w k) (jolt-contains? (jxw-inner w) k))
 (define (jxw-get w k d) (jolt-get (jxw-inner w) k d))
-(define (jxw-sync-elems w) (jolt-with-mutex (jxw-lock w) (jxw-elems w)))
-(define (jxw-sync-count w) (jolt-with-mutex (jxw-lock w) (jxw-count w)))
-(define (jxw-sync-contains w k) (jolt-with-mutex (jxw-lock w) (jxw-contains w k)))
-(define (jxw-sync-get w k d) (jolt-with-mutex (jxw-lock w) (jxw-get w k d)))
+(define (jxw-sync-elems w) (jolt-call-with-monitor (jxw-lock w) (lambda () (jxw-elems w))))
+(define (jxw-sync-count w) (jolt-call-with-monitor (jxw-lock w) (lambda () (jxw-count w))))
+(define (jxw-sync-contains w k) (jolt-call-with-monitor (jxw-lock w) (lambda () (jxw-contains w k))))
+(define (jxw-sync-get w k d) (jolt-call-with-monitor (jxw-lock w) (lambda () (jxw-get w k d))))
 
 (for-each
   (lambda (fam)
@@ -341,14 +348,14 @@
         (cons "unmodifiableSequencedMap" (jx-unmod-static 'seqmap))
         (cons "unmodifiableSortedMap" (jx-unmod-static 'sortedmap))
         (cons "unmodifiableNavigableMap" (jx-unmod-static 'navmap))
-        (cons "synchronizedCollection" (lambda (x) (jx-wrap-sync 'coll x (make-mutex))))
-        (cons "synchronizedSet" (lambda (x) (jx-wrap-sync 'set x (make-mutex))))
-        (cons "synchronizedSortedSet" (lambda (x) (jx-wrap-sync 'sortedset x (make-mutex))))
-        (cons "synchronizedNavigableSet" (lambda (x) (jx-wrap-sync 'navset x (make-mutex))))
-        (cons "synchronizedList" (lambda (x) (jx-wrap-sync (jx-list-family x) x (make-mutex))))
-        (cons "synchronizedMap" (lambda (x) (jx-wrap-sync 'map x (make-mutex))))
-        (cons "synchronizedSortedMap" (lambda (x) (jx-wrap-sync 'sortedmap x (make-mutex))))
-        (cons "synchronizedNavigableMap" (lambda (x) (jx-wrap-sync 'navmap x (make-mutex))))))
+        (cons "synchronizedCollection" (lambda (x) (jx-wrap-sync 'coll x #f)))
+        (cons "synchronizedSet" (lambda (x) (jx-wrap-sync 'set x #f)))
+        (cons "synchronizedSortedSet" (lambda (x) (jx-wrap-sync 'sortedset x #f)))
+        (cons "synchronizedNavigableSet" (lambda (x) (jx-wrap-sync 'navset x #f)))
+        (cons "synchronizedList" (lambda (x) (jx-wrap-sync (jx-list-family x) x #f)))
+        (cons "synchronizedMap" (lambda (x) (jx-wrap-sync 'map x #f)))
+        (cons "synchronizedSortedMap" (lambda (x) (jx-wrap-sync 'sortedmap x #f)))
+        (cons "synchronizedNavigableMap" (lambda (x) (jx-wrap-sync 'navmap x #f)))))
 
 ;; ---- List.of / Set.of / Map.of ---------------------------------------------------------------
 ;; java.util.ImmutableCollections: ListN for none or three and more elements,

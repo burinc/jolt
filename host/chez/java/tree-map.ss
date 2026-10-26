@@ -124,7 +124,7 @@
 (define (tmr-cmpf r) (vector-ref r 2))
 (define (tmr-natural? r) (jolt-nil? (vector-ref r 1)))
 ;; A ConcurrentSkipListMap / Set (jutil-concurrent.ss, Chez only) is this same
-;; root with a mutex in a fourth slot. Every write to it runs under that mutex
+;; root with a lock in a fourth slot. Every write to it runs under that lock
 ;; (tmr-write), so two writers never build from the same tree and lose one's
 ;; change, and publishes the new tree with one store behind a release fence;
 ;; a read takes the published tree with no lock, and since the tree is

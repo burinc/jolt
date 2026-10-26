@@ -8,23 +8,40 @@
 ;; get / contains? / nth where the JVM gives them, and a jolt.image codec
 ;; (image-codecs.ss).
 ;;
-;; Thread safety, by class:
-;;   - Vector, Stack and Hashtable hold one mutex for every method, as their
-;;     synchronized methods do; their iterators take it per step.
-;;   - ConcurrentLinkedQueue / Deque hold a mutex for every change and every
-;;     step of an iterator; an iterator is weakly consistent: it walks the live
-;;     node chain, skipping what was removed, and a node it stands on keeps its
-;;     link onward after removal.
+;; Thread safety, by class. Every lock here is a MONITOR, not a mutex: their
+;; methods run user code (equals, hashCode, a comparator, a compute function),
+;; which may park a fiber, and a fiber may hold a monitor across a park where a
+;; held mutex would wedge its carrier (host/chez/locks.ss).
+;;   - Vector, Stack and Hashtable hold their OWN monitor for every method, as
+;;     their methods are synchronized on themselves, so (locking v …) around a
+;;     walk excludes them as on the JVM; their iterators take it per step.
+;;   - ConcurrentLinkedQueue / Deque hold a private monitor for every change and
+;;     every step of an iterator; an iterator is weakly consistent: it walks the
+;;     live node chain, skipping what was removed, and a node it stands on keeps
+;;     its link onward after removal.
 ;;   - CopyOnWriteArrayList / Set and ConcurrentSkipListMap / Set are copy on
 ;;     write: a reader takes the published (immutable) array or tree with no
-;;     lock; a writer, under the mutex, builds the new one and publishes it with
-;;     one store after a release fence. tools/cow-publish-model.pl checks that
-;;     protocol (make cowpublishmodel).
+;;     lock; a writer, under a private monitor, builds the new one and publishes
+;;     it with one store after a release fence. tools/cow-publish-model.pl checks
+;;     that protocol (make cowpublishmodel).
 ;;   - PriorityQueue and BitSet are not thread-safe on the JVM either.
 ;;
 ;; Tags start "jx-", so they register through jutil-views.ss's jx table.
 ;; Loaded after jutil-views.ss and tree-map.ss.
 
+;; the JDK arities of the Collection / Deque members the delegating views below
+;; answer through one variadic procedure each
+(define jxc-arities
+  '(("iterator" 0) ("size" 0) ("isEmpty" 0) ("contains" 1) ("containsAll" 1) ("remove" 1) ("removeAll" 1)
+    ("removeIf" 1) ("retainAll" 1) ("clear" 0) ("toArray" 0 1) ("forEach" 1) ("toString" 0) ("add" 1)
+    ("addAll" 1) ("addFirst" 1) ("addLast" 1) ("offerFirst" 1) ("offerLast" 1) ("pollFirst" 0) ("pollLast" 0)
+    ("peekFirst" 0) ("peekLast" 0) ("getFirst" 0) ("getLast" 0) ("removeFirst" 0) ("removeLast" 0)
+    ("removeFirstOccurrence" 1) ("removeLastOccurrence" 1) ("push" 1) ("pop" 0) ("poll" 0) ("peek" 0)
+    ("element" 0) ("offer" 1) ("descendingIterator" 0)))
+(define (jxc-arity-of name f)
+  (let ((a (assoc name jxc-arities)))
+    (unless a (error 'jxc-arity-of "no arity for" name))
+    (host-arity-of (cdr a) #t f)))
 (define (jxc-npe-if-nil! . xs) (for-each (lambda (x) (when (jolt-nil? x) (jx-npe))) xs))
 (define (jxc-elems c) (seq->list (jolt-seq c)))
 (define (jxc-to-array elems)
@@ -33,9 +50,9 @@
 ;; ======================================================================================
 ;; Vector and Stack
 ;; ======================================================================================
-;; State #(arraylist mutex capacity increment). The elements live in an ArrayList
+;; State #(arraylist monitor capacity increment). The elements live in an ArrayList
 ;; of their own (host-static-classes.ss), which every method reaches under the
-;; mutex, so Vector is ArrayList's representation and behavior with Vector's
+;; monitor, so Vector is ArrayList's representation and behavior with Vector's
 ;; lock, legacy methods and capacity accounting on top. capacity() follows the
 ;; JDK's growth rule (double, or grow by capacityIncrement), since programs
 ;; print it.
@@ -45,15 +62,17 @@
 (define (vec-cap! v c) (vector-set! (jhost-state v) 2 c))
 (define (vec-incr v) (vector-ref (jhost-state v) 3))
 (define (vec-size v) (al-cnt (vec-al v)))
-(define (vec-list v) (jolt-with-mutex (vec-mu v) (al->list (vec-al v))))
-(define (make-jx-vector tag xs cap incr) (make-jhost tag (vector (make-arraylist xs) (make-mutex) cap incr)))
+;; the vector's own monitor, as Vector's methods are synchronized on it
+(define (jx-own-monitor! h i) (vector-set! (jhost-state h) i (object-monitor h)) h)
+(define (vec-list v) (jolt-call-with-monitor (vec-mu v) (lambda () (al->list (vec-al v)))))
+(define (make-jx-vector tag xs cap incr) (jx-own-monitor! (make-jhost tag (vector (make-arraylist xs) #f cap incr)) 1))
 (define (vec-grow! v min)
   (let ((old (vec-cap v)))
     (when (> min old)
       (vec-cap! v (+ old (max (- min old) (if (> (vec-incr v) 0) (vec-incr v) old)))))))
 (define (vec-call v m . args) (jx-call (vec-al v) m args))
 (define-syntax with-vec
-  (syntax-rules () ((_ v e ...) (jolt-with-mutex (vec-mu v) e ...))))
+  (syntax-rules () ((_ v e ...) (jolt-call-with-monitor (vec-mu v) (lambda () e ...)))))
 ;; the ArrayList members a Vector answers as they are, under its lock
 (define vec-plain
   '(("size" 0) ("isEmpty" 0) ("contains" 1) ("indexOf" 1) ("lastIndexOf" 1) ("toArray" 0 1) ("get" 1)
@@ -285,9 +304,9 @@
 ;; 2n+1 buckets at the load factor's threshold, iteration from the last bucket
 ;; to the first. That is what makes (str ht) print in the JVM's order, which
 ;; programs show. Keys and values are never null. Every method holds the
-;; table's mutex; keySet / values / entrySet are Collections.synchronized*
+;; table's monitor; keySet / values / entrySet are Collections.synchronized*
 ;; views over it on the same lock, as the JDK's are.
-;; State #(buckets count threshold load-factor mutex modcount); an entry is a
+;; State #(buckets count threshold load-factor monitor modcount); an entry is a
 ;; mutable #(hash key value next).
 (define (ht-buckets h) (vector-ref (jhost-state h) 0))
 (define (ht-count h) (vector-ref (jhost-state h) 1))
@@ -297,12 +316,12 @@
 (define (ht-mu h) (vector-ref (jhost-state h) 4))
 (define (ht-mod! h) (vector-set! (jhost-state h) 5 (fx+ 1 (vector-ref (jhost-state h) 5))))
 (define-syntax with-ht
-  (syntax-rules () ((_ h e ...) (jolt-with-mutex (ht-mu h) e ...))))
+  (syntax-rules () ((_ h e ...) (jolt-call-with-monitor (ht-mu h) (lambda () e ...)))))
 (define ht-max-array 2147483639)   ; Integer.MAX_VALUE - 8
 (define (ht-threshold-for cap lf) (exact (floor (min (* cap lf) (+ ht-max-array 1)))))
 (define (make-jx-hashtable cap lf)
   (let ((cap (if (eqv? cap 0) 1 cap)))
-    (make-jhost "jx-hashtable" (vector (make-vector cap #f) 0 (ht-threshold-for cap lf) lf (make-mutex) 0))))
+    (jx-own-monitor! (make-jhost "jx-hashtable" (vector (make-vector cap #f) 0 (ht-threshold-for cap lf) lf #f 0)) 4)))
 (define (ht-hash k) (jolt-java-hashcode k))
 (define (ht-index hash n) (modulo (bitwise-and hash #x7FFFFFFF) n))
 (define (he-hash e) (vector-ref e 0))
@@ -958,13 +977,13 @@
 ;; ConcurrentLinkedQueue and ConcurrentLinkedDeque
 ;; ======================================================================================
 ;; A doubly linked chain between two sentinels, every change and every read
-;; under the queue's mutex. A node is #(item next prev); removing one marks its
+;; under the queue's monitor. A node is #(item next prev); removing one marks its
 ;; item dead and unlinks it from its neighbours but leaves its own links, so an
 ;; iterator standing on it walks on to what follows. That, and an iterator that
 ;; reads the next item ahead as the JDK's Itr does (nextNode / nextItem), is the
 ;; JDK's weak consistency: an element removed after the iterator read it ahead is
 ;; still handed out. Nothing is nil: an element may be false, so death is a
-;; marker. State #(head-sentinel tail-sentinel mutex).
+;; marker. State #(head-sentinel tail-sentinel monitor).
 (define cl-dead (list 'cl-dead))
 (define (cl-node item next prev) (vector item next prev))
 (define (cln-item n) (vector-ref n 0))
@@ -974,11 +993,11 @@
 (define (cl-tail q) (vector-ref (jhost-state q) 1))
 (define (cl-mu q) (vector-ref (jhost-state q) 2))
 (define-syntax with-cl
-  (syntax-rules () ((_ q e ...) (jolt-with-mutex (cl-mu q) e ...))))
+  (syntax-rules () ((_ q e ...) (jolt-call-with-monitor (cl-mu q) (lambda () e ...)))))
 (define (make-jx-clq tag xs)
   (let* ((h (cl-node cl-dead #f #f)) (t (cl-node cl-dead #f h)))
     (vector-set! h 1 t)
-    (let ((q (make-jhost tag (vector h t (make-mutex)))))
+    (let ((q (make-jhost tag (vector h t (make-monitor)))))
       (for-each (lambda (x) (cl-link-last! q x)) xs)
       q)))
 (define (cl-sentinel? q n) (or (eq? n (cl-head q)) (eq? n (cl-tail q))))
@@ -1148,9 +1167,10 @@
 (register-host-methods! "jx-reverse-deque"
   (append
     (map (lambda (s)
-           (cons (car s) (lambda (self . args)
-                           (let ((r (jx-call (rvd-d self) (cdr s) args)))
-                             (if (string=? (car s) "add") #t r)))))
+           (cons (car s) (jxc-arity-of (car s)
+                           (lambda (self . args)
+                             (let ((r (jx-call (rvd-d self) (cdr s) args)))
+                               (if (string=? (car s) "add") #t r))))))
          rvd-swaps)
     (list (cons "size" (lambda (self) (jx-call (rvd-d self) "size" '())))
           (cons "isEmpty" (lambda (self) (jx-call (rvd-d self) "isEmpty" '())))
@@ -1165,17 +1185,17 @@
 ;; ======================================================================================
 ;; The elements are a Scheme vector that is never changed once published. A
 ;; reader takes the published vector with no lock; a writer, under the list's
-;; mutex, builds a new vector from the published one and publishes it with one
+;; monitor, builds a new vector from the published one and publishes it with one
 ;; store behind a release fence (tools/cow-publish-model.pl, make
 ;; cowpublishmodel). An iterator is the vector it started from (COWIterator), so
-;; it never sees a later write and refuses remove. State #(vector mutex).
+;; it never sees a later write and refuses remove. State #(vector monitor).
 (define (cow-vec l) (vector-ref (jhost-state l) 0))
 (define (cow-list l) (vector->list (cow-vec l)))
 (define (cow-n l) (vector-length (cow-vec l)))
 (define (cow-publish! l v) (memory-order-release) (vector-set! (jhost-state l) 0 v))
 (define-syntax with-cow
-  (syntax-rules () ((_ l e ...) (jolt-with-mutex (vector-ref (jhost-state l) 1) e ...))))
-(define (make-jx-cow tag xs) (make-jhost tag (vector (list->vector xs) (make-mutex))))
+  (syntax-rules () ((_ l e ...) (jolt-call-with-monitor (vector-ref (jhost-state l) 1) (lambda () e ...)))))
+(define (make-jx-cow tag xs) (make-jhost tag (vector (list->vector xs) (make-monitor))))
 (define (cow-index-of v x from to)
   (let loop ((i from)) (cond ((fx>=? i to) -1) ((objects-equals? x (vector-ref v i)) i) (else (loop (fx+ i 1))))))
 (define (cow-last-index-of v x from)
@@ -1289,7 +1309,7 @@
     (cons "addFirst" (lambda (self x) (with-cow self (cow-publish! self (cow-insert (cow-vec self) 0 (list x)))) jolt-nil))
     (cons "addLast" (lambda (self x) (with-cow self (cow-publish! self (cow-insert (cow-vec self) (cow-n self) (list x)))) jolt-nil))
     (cons "reversed" (lambda (self) (make-jhost "jx-reverse-list" (vector self))))
-    (cons "clone" (lambda (self) (make-jhost "jx-cow-list" (vector (cow-vec self) (make-mutex)))))))
+    (cons "clone" (lambda (self) (make-jhost "jx-cow-list" (vector (cow-vec self) (make-monitor)))))))
 (jx-class! "jx-cow-list" "java.util.concurrent.CopyOnWriteArrayList" '("java.util.List" "java.util.RandomAccess" "java.lang.Cloneable" "java.io.Serializable"))
 (register-host-methods! "jx-cow-list" cow-list-methods)
 (jx-register! "jx-cow-list" 'ralist cow-list cow-n #f #f)
@@ -1313,7 +1333,7 @@
                                           (cowi-i! self i) (vector-ref (cowi-v self) i))))
         (cons "nextIndex" (lambda (self) (->num (cowi-i self))))
         (cons "previousIndex" (lambda (self) (->num (fx- (cowi-i self) 1))))
-        (cons "remove" jx-uoe) (cons "set" jx-uoe) (cons "add" jx-uoe)
+        (cons "remove" (lambda (self) (jx-uoe))) (cons "set" (lambda (self x) (jx-uoe))) (cons "add" (lambda (self x) (jx-uoe)))
         (cons "forEachRemaining" (lambda (self f)
                                    (let loop () (when (fx<? (cowi-i self) (vector-length (cowi-v self)))
                                                   (let ((x (vector-ref (cowi-v self) (cowi-i self))))
@@ -1389,10 +1409,10 @@
 ;; ======================================================================================
 ;; ConcurrentSkipListMap and ConcurrentSkipListSet
 ;; ======================================================================================
-;; tree-map.ss's TreeMap with a mutex in its root (tmr-concurrent?): the same
+;; tree-map.ss's TreeMap with a monitor in its root (tmr-concurrent?): the same
 ;; persistent tree, views and navigation, under the JDK's classes. A write — a
 ;; put, a remove, an iterator's remove, and every compound method whole
-;; (putIfAbsent, compute, merge, pollFirstEntry, …) — holds the root's mutex and
+;; (putIfAbsent, compute, merge, pollFirstEntry, …) — holds the root's monitor and
 ;; publishes the new tree with one store behind a release fence; a read takes the
 ;; published tree with no lock (tools/cow-publish-model.pl). Iteration walks a
 ;; snapshot, which the JDK's weak consistency allows, and hands out
@@ -1450,13 +1470,13 @@
         (lambda (self . args)
           (cs-check-args! name args)
           (cs-out (if (member name cs-writers)
-                      (jolt-with-mutex (vector-ref (cs-root self) 3) (apply proc (cs-base self) args))
+                      (jolt-call-with-monitor (vector-ref (cs-root self) 3) (lambda () (apply proc (cs-base self) args)))
                       (apply proc (cs-base self) args)))))))
 (define (cs-new-root cmp)
-  (let ((r (tm-make-root cmp))) (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (make-mutex))))
+  (let ((r (tm-make-root cmp))) (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (make-monitor))))
 (define (make-cs tag root) (make-jhost tag (vector root tm-unbounded #f tm-unbounded #f #f #f)))
 (define (cs-clone x) ; the same persistent tree under a root of its own
-  (let ((r (cs-root x))) (make-cs (jhost-tag x) (vector (tmr-sm r) (tmr-cmp-obj r) (tmr-cmpf r) (make-mutex)))))
+  (let ((r (cs-root x))) (make-cs (jhost-tag x) (vector (tmr-sm r) (tmr-cmp-obj r) (tmr-cmpf r) (make-monitor)))))
 (for-each
   (lambda (r)
     (let ((base (car r)) (tag (cadr r)) (kind (cadddr r)))
@@ -1502,7 +1522,7 @@
             "ConcurrentSkipListMap$SubMap$SubMapEntryIterator" "ConcurrentSkipListMap$SubMap$SubMapKeyIterator"
             "ConcurrentSkipListMap$SubMap$SubMapValueIterator"))
 (set! tm-publish-fence (lambda () (memory-order-release)))
-(set! tm-root-write (lambda (r thunk) (jolt-with-mutex (vector-ref r 3) (thunk))))
+(set! tm-root-write (lambda (r thunk) (jolt-call-with-monitor (vector-ref r 3) thunk)))
 (set! tm-foreign-view (lambda (x) (and (jhost? x) (hashtable-ref cs-to-base (jhost-tag x) #f) (cs-base x))))
 (define (cs-sorted-comparator x) (if (or (jx-isa? x "java.util.SortedMap") (jx-isa? x "java.util.SortedSet")) (jx-call x "comparator" '()) #f))
 (register-class-ctor! "java.util.concurrent.ConcurrentSkipListMap"
@@ -1537,13 +1557,14 @@
                               '()))
 (define (sqv-methods reversed-method identity?)
   (append
-    (map (lambda (m) (cons m (lambda (self . args) (jx-call (sqv-view self) m args))))
+    (map (lambda (m) (cons m (jxc-arity-of m (lambda (self . args) (jx-call (sqv-view self) m args)))))
          '("iterator" "size" "isEmpty" "contains" "containsAll" "remove" "removeAll" "removeIf" "retainAll"
            "clear" "toArray" "forEach" "toString"))
     (if identity? '()
         (list (cons "equals" (lambda (self o) (jx-call (sqv-view self) "equals" (list o))))
               (cons "hashCode" (lambda (self) (jx-call (sqv-view self) "hashCode" '())))))
-    (list (cons "add" jx-uoe) (cons "addAll" jx-uoe) (cons "addFirst" jx-uoe) (cons "addLast" jx-uoe)
+    (list (cons "add" (lambda (self x) (jx-uoe))) (cons "addAll" (lambda (self c) (jx-uoe)))
+          (cons "addFirst" (lambda (self x) (jx-uoe))) (cons "addLast" (lambda (self x) (jx-uoe)))
           (cons "reversed" (lambda (self) (jx-call (jx-call (sqv-map self) "reversed" '()) reversed-method '())))
           (cons "getFirst" (lambda (self) (let ((xs (jxc-elems (sqv-view self)))) (if (null? xs) (throw-jvm 'NoSuchElementException jolt-nil) (car xs)))))
           (cons "getLast" (lambda (self) (let ((xs (jxc-elems (sqv-view self)))) (if (null? xs) (throw-jvm 'NoSuchElementException jolt-nil) (list-ref xs (fx- (length xs) 1))))))

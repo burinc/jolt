@@ -98,7 +98,7 @@
 
 ;; ---- Collections.unmodifiable* / synchronized* (jutil-views.ss) -------------------
 ;; A wrapper travels with the collection it wraps, as the JDK serializes one; a
-;; synchronized one gets a fresh lock, which no image can carry.
+;; synchronized one gets its own monitor afresh, which no image can carry.
 (define codec-unmod-tags (filter values (map (lambda (f) (list-ref f 1)) jx-families)))
 (define codec-sync-tags (filter values (map (lambda (f) (list-ref f 2)) jx-families)))
 (register-image-codec! "java.util.Collections$UnmodifiableCollection"
@@ -108,7 +108,7 @@
   (lambda (w items) (vector-set! (jhost-state w) 0 (car items))))
 (register-image-codec! "java.util.Collections$SynchronizedCollection" codec-sync-tags
   (lambda (w) (vector (jhost-tag w) (list (jxw-inner w))))
-  (lambda (tag) (make-jhost tag (vector #f (make-mutex))))
+  (lambda (tag) (let ((w (make-jhost tag (vector #f #f)))) (vector-set! (jhost-state w) 1 (object-monitor w)) w))
   (lambda (w items) (vector-set! (jhost-state w) 0 (car items))))
 ;; ---- List.of / Set.of / Map.of and Map.entry ------------------------------------------
 (register-image-codec! "java.util.ImmutableCollections$ListN" '("jx-listn" "jx-list12" "jx-imm-sublist")

@@ -30,7 +30,7 @@
       (if (fx=? i n)
           (get-output-string p)
           (let* ((c (string-ref s i)) (e (str-escape-for c)))
-            (if e (put-string p e) (put-char p c))
+            (if e (put-string p e) (write-char c p))
             (loop (fx+ i 1)))))))
 
 ;; A host shim registers a type's readable rendering via register-pr-readable-arm!,
