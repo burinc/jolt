@@ -117,31 +117,49 @@
   (let ((cmpf (if (jolt-nil? cmp-obj) tm-natural-compare (tm-comparator->cmpf cmp-obj))))
     (vector (jolt-invoke (var-deref "clojure.core" "sorted-map-by") cmpf) cmp-obj cmpf)))
 (define (tmr-sm r) (vector-ref r 0))
-(define (tmr-sm! r sm) (vector-set! r 0 sm))
+(define (tmr-sm! r sm)
+  (when (tmr-concurrent? r) (tm-publish-fence))
+  (vector-set! r 0 sm))
 (define (tmr-cmp-obj r) (vector-ref r 1))
 (define (tmr-cmpf r) (vector-ref r 2))
 (define (tmr-natural? r) (jolt-nil? (vector-ref r 1)))
+;; A ConcurrentSkipListMap / Set (jutil-concurrent.ss, Chez only) is this same
+;; root with a mutex in a fourth slot. Every write to it runs under that mutex
+;; (tmr-write), so two writers never build from the same tree and lose one's
+;; change, and publishes the new tree with one store behind a release fence;
+;; a read takes the published tree with no lock, and since the tree is
+;; persistent it is never seen half built. It refuses nil keys and values. A
+;; TreeMap's root has three slots and takes none of this.
+(define (tmr-concurrent? r) (> (vector-length r) 3))
+(define tm-publish-fence (lambda () #f))
+(define tm-root-write (lambda (r thunk) (thunk)))
+(define (tmr-write r thunk) (if (tmr-concurrent? r) (tm-root-write r thunk) (thunk)))
 (define tm-absent (list 'tm-absent))
 (define (tmr-count r) (sc-call (tmr-sm r) kw-op-count))
 ;; getEntry's Objects.requireNonNull: natural ordering refuses a nil key even
 ;; when there is nothing to compare it with.
 (define (tmr-check-key r k)
-  (when (and (jolt-nil? k) (tmr-natural? r)) (throw-jvm 'NullPointerException jolt-nil)))
+  (when (and (jolt-nil? k) (or (tmr-natural? r) (tmr-concurrent? r))) (throw-jvm 'NullPointerException jolt-nil)))
 (define (tmr-ref r k)
   (tmr-check-key r k)
   (sc-call (tmr-sm r) kw-op-get k tm-absent))
 (define (tmr-put! r k v)
-  ;; put on an empty map compares the key with itself: the JDK's type (and null)
-  ;; check, so (.put (TreeMap.) {:a 1} 1) fails before anything is stored.
-  (when (eqv? 0 (tmr-count r)) ((tmr-cmpf r) k k))
-  (let ((old (tmr-ref r k)))
-    (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k v)))
-    (if (eq? old tm-absent) jolt-nil old)))
+  (when (and (jolt-nil? v) (tmr-concurrent? r)) (throw-jvm 'NullPointerException jolt-nil))
+  (tmr-write r
+    (lambda ()
+      ;; put on an empty map compares the key with itself: the JDK's type (and
+      ;; null) check, so (.put (TreeMap.) {:a 1} 1) fails before anything is stored.
+      (when (eqv? 0 (tmr-count r)) ((tmr-cmpf r) k k))
+      (let ((old (tmr-ref r k)))
+        (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k v)))
+        (if (eq? old tm-absent) jolt-nil old)))))
 (define (tmr-remove! r k)
-  (let ((old (tmr-ref r k)))
-    (unless (eq? old tm-absent)
-      (tmr-sm! r (sc-call (tmr-sm r) kw-op-dissoc (jolt-vector k))))
-    old))
+  (tmr-write r
+    (lambda ()
+      (let ((old (tmr-ref r k)))
+        (unless (eq? old tm-absent)
+          (tmr-sm! r (sc-call (tmr-sm r) kw-op-dissoc (jolt-vector k))))
+        old))))
 (define (tm-seq-head s)
   (let ((s (jolt-seq s))) (if (jolt-nil? s) #f (seq-first s))))
 (define (tm-always c z) #t)
@@ -258,9 +276,11 @@
 (define (v-remove-present! v k)
   (if (v-in-range? v k) (not (eq? (tmr-remove! (v-root v) k) tm-absent)) #f))
 (define (v-clear! v)
-  (if (v-unbounded? v)
-      (tmr-sm! (v-root v) (sc-call (tmr-sm (v-root v)) (keyword #f "empty")))
-      (for-each (lambda (k) (tmr-remove! (v-root v) k)) (v-keys v)))
+  (tmr-write (v-root v)
+    (lambda ()
+      (if (v-unbounded? v)
+          (tmr-sm! (v-root v) (sc-call (tmr-sm (v-root v)) (keyword #f "empty")))
+          (for-each (lambda (k) (tmr-remove! (v-root v) k)) (v-keys v)))))
   jolt-nil)
 (define (v-poll! v e)
   (if e (begin (tmr-remove! (v-root v) (e-key e)) e) #f))
@@ -353,8 +373,10 @@
               (lambda (self x)
                 (let* ((st (jhost-state self)) (r (vector-ref st 0)) (k (vector-ref st 1))
                        (old (tm-live-entry-value self)))
-                  (unless (eq? (sc-call (tmr-sm r) kw-op-get k tm-absent) tm-absent)
-                    (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k x))))
+                  (tmr-write r
+                    (lambda ()
+                      (unless (eq? (sc-call (tmr-sm r) kw-op-get k tm-absent) tm-absent)
+                        (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k x))))))
                   (vector-set! st 2 x)
                   old)))))
 (define (tm-snapshot-entry e)
@@ -393,10 +415,15 @@
 ;; (TreeMap.) | (TreeMap. Comparator) | (TreeMap. SortedMap) | (TreeMap. Map).
 ;; A SortedMap keeps its comparator; any other Map — a Clojure sorted-map is
 ;; not a java.util.SortedMap — is copied under natural ordering.
+;; A ConcurrentSkipListMap / Set is a SortedMap / SortedSet with a view's state
+;; under a tag of its own; tm-foreign-view answers that view, so the copy
+;; constructors keep its comparator and share its tree. Set by jutil-concurrent.ss.
+(define tm-foreign-view (lambda (x) #f))
 (define tm-ctor
   (case-lambda
     (() (tm-new-map jolt-nil))
-    ((x)
+    ((x0)
+     (define x (or (tm-foreign-view x0) x0))
      (cond
        ((and (tm-map? x) (v-unbounded? x) (not (v-desc? x))) (tm-copy-root-view x "treemap"))
        ((tm-map? x) (let ((v (tm-new-map (v-comparator x)))) (tm-fill-map! v x) v))
@@ -417,7 +444,8 @@
 (define ts-ctor
   (case-lambda
     (() (make-tm-view "treeset" (tm-make-root jolt-nil) tm-unbounded #f tm-unbounded #f #f))
-    ((x)
+    ((x0)
+     (define x (or (tm-foreign-view x0) x0))
      (cond
        ((and (tm-set? x) (v-unbounded? x) (not (v-desc? x))) (tm-copy-root-view x "treeset"))
        ((tm-set? x)

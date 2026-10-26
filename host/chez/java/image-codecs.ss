@@ -143,6 +143,56 @@
     "cd-arraylist-listitr" "cd-vector-listitr" "cd-abstractlist-listitr")
   "an iterator is a position in a walk this process is making; write the collection instead")
 
+;; ---- the legacy and concurrent collections (jutil-concurrent.ss) ---------------------
+;; A Vector keeps its capacity and increment, a Hashtable its bucket count and
+;; load factor (refilled newest-last so each chain, and so the iteration order,
+;; comes back as it was), a PriorityQueue its heap array as it stands, a skip
+;; list its comparator. Each gets a fresh lock.
+(register-image-codec! "java.util.Vector" '("jx-vector" "jx-stack")
+  (lambda (v) (vector (vector (jhost-tag v) (vec-cap v) (vec-incr v)) (vec-list v)))
+  (lambda (h) (make-jx-vector (vector-ref h 0) '() (vector-ref h 1) (vector-ref h 2)))
+  (lambda (v items) (for-each (lambda (x) (al-push! (vec-al v) x)) items)))
+(register-image-codec! "java.util.Hashtable" '("jx-hashtable")
+  (lambda (h) (vector (vector (vector-length (ht-buckets h)) (ht-lf h))
+                      (codec-kvs (map (lambda (e) (cons (he-key e) (he-val e))) (with-ht h (ht-entry-list h))))))
+  (lambda (hd) (make-jx-hashtable (vector-ref hd 0) (vector-ref hd 1)))
+  (lambda (h items)
+    (let loop ((xs items) (acc '()))
+      (if (null? xs)
+          (for-each (lambda (p) (ht-put! h (car p) (cdr p))) acc)
+          (loop (cddr xs) (cons (cons (car xs) (cadr xs)) acc))))))
+(register-image-codec! "java.util.PriorityQueue" '("jx-priority-queue")
+  (lambda (p) (vector (pq-cmp-obj p) (pq-list p)))
+  (lambda (cmp) (make-jx-pq cmp 1))
+  (lambda (p items) (pq-fill! p items)))
+(register-image-codec! "java.util.concurrent.ConcurrentLinkedQueue" '("jx-clq" "jx-cld")
+  (lambda (q) (vector (jhost-tag q) (cl-list q)))
+  (lambda (tag) (make-jx-clq tag '()))
+  (lambda (q items) (for-each (lambda (x) (cl-link-last! q x)) items)))
+(register-image-codec! "java.util.concurrent.CopyOnWriteArrayList" '("jx-cow-list" "jx-cow-set")
+  (lambda (l) (vector (jhost-tag l) (cow-list l)))
+  (lambda (tag) (make-jx-cow tag '()))
+  (lambda (l items) (vector-set! (jhost-state l) 0 (list->vector items))))
+(register-image-codec! "java.util.concurrent.ConcurrentSkipListMap" '("jx-cslm")
+  (lambda (m) (vector (tmr-cmp-obj (cs-root m)) (codec-kvs (map (lambda (e) (cons (e-key e) (e-val e))) (v-entries (cs-base m))))))
+  (lambda (cmp) (make-cs "jx-cslm" (cs-new-root cmp)))
+  (lambda (m items) (codec-each-kv! items (lambda (k v) (tmr-put! (cs-root m) k v)))))
+(register-image-codec! "java.util.concurrent.ConcurrentSkipListSet" '("jx-csls")
+  (lambda (s) (vector (tmr-cmp-obj (cs-root s)) (v-keys (cs-base s))))
+  (lambda (cmp) (make-cs "jx-csls" (cs-new-root cmp)))
+  (lambda (s items) (for-each (lambda (k) (tmr-put! (cs-root s) k #t)) items)))
+(register-image-refusal!
+  '("jx-reverse-list" "jx-hashtable-keyset" "jx-hashtable-values" "jx-hashtable-entryset" "jx-hashtable-entry"
+    "jx-reverse-deque" "jx-cow-sublist" "jx-cslm-sub" "jx-cslm-dsub" "jx-cslm-keyset" "jx-cslm-values"
+    "jx-cslm-subvalues" "jx-cslm-entryset" "jx-cslm-subentryset" "jx-cslm-dsubentryset")
+  "it is a view of another collection, which the image would have to share; write the collection itself")
+(register-image-refusal!
+  '("jx-vector-itr" "jx-vector-enum" "jx-enum-iterator" "jx-reverse-list-itr" "jx-hashtable-enumerator"
+    "jx-pq-itr" "jx-clq-itr" "jx-cld-itr" "jx-cld-desc-itr" "jx-cow-itr" "jx-cow-sublist-itr"
+    "jx-cslm-entry-itr" "jx-cslm-key-itr" "jx-cslm-value-itr" "jx-cslm-sub-entry-itr" "jx-cslm-sub-key-itr"
+    "jx-cslm-dsub-entry-itr" "jx-cslm-dsub-key-itr" "jx-cslm-sub-value-itr")
+  "an iterator is a position in a walk this process is making; write the collection instead")
+
 ;; ---- what cannot travel -----------------------------------------------------------
 (register-image-refusal!
   '("lhm-keyset" "lhm-values" "lhm-entryset" "lhm-reversed" "lhs-reversed" "lhm-entry"

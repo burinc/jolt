@@ -34,6 +34,9 @@
   "  (jolt.host/image-write! \"" tmp "\" v)"
   "  (let [r (jolt.host/image-read \"" tmp "\")]"
   "    (and (= (class v) (class r)) (= (image-content v) (image-content r)))))"
+  "(defn image-refuses-naming? [v cls]"
+  "  (try (jolt.host/image-write! \"" tmp "\" v) false"
+  "       (catch Exception e (clojure.string/includes? (ex-message e) cls))))"
   "(defn image-refuses? [v]"
   "  (try (jolt.host/image-write! \"" tmp "\" v) false"
   "       (catch Exception e (clojure.string/includes? (ex-message e) (.getName (class v))))))"))
@@ -86,7 +89,17 @@
     ("jx-set12" . "(java.util.Set/of 1)")
     ("jx-mapn" . "(java.util.Map/of :a 1 :b 2)")
     ("jx-map1" . "(java.util.Map/of :a 1)")
-    ("jx-kvholder" . "(java.util.Map/entry :k 1)")))
+    ("jx-kvholder" . "(java.util.Map/entry :k 1)")
+    ("jx-vector" . "(doto (java.util.Vector. 3 2) (.add :a) (.add 1) (.add 2) (.add 3))")
+    ("jx-stack" . "(doto (java.util.Stack.) (.push 1) (.push :b))")
+    ("jx-hashtable" . "(let [h (java.util.Hashtable. 5)] (doseq [i (range 12)] (.put h (str \"k\" i) i)) h)")
+    ("jx-priority-queue" . "(doto (java.util.PriorityQueue. (java.util.Collections/reverseOrder)) (.addAll [3 9 1 4]))")
+    ("jx-clq" . "(java.util.concurrent.ConcurrentLinkedQueue. [1 :a 2])")
+    ("jx-cld" . "(doto (java.util.concurrent.ConcurrentLinkedDeque. [2 3]) (.addFirst 1))")
+    ("jx-cow-list" . "(java.util.concurrent.CopyOnWriteArrayList. [3 1 3])")
+    ("jx-cow-set" . "(java.util.concurrent.CopyOnWriteArraySet. [3 1 2])")
+    ("jx-cslm" . "(doto (java.util.concurrent.ConcurrentSkipListMap. (java.util.Collections/reverseOrder)) (.put 1 :a) (.put 2 :b))")
+    ("jx-csls" . "(java.util.concurrent.ConcurrentSkipListSet. [3 1 2])")))
 ;; a JumboEnumSet needs an enum of more than 64 constants, which the host has
 ;; none of; its codec is the RegularEnumSet's (one registration, both tags)
 (define same-codec '(("enum-set-jumbo" . "enum-set-regular")))
@@ -119,7 +132,27 @@
     ("jx-imm-mapn-entryset" . "(.entrySet (java.util.Map/of :a 1 :b 2))")
     ("cd-arraylist-sublist" . "(.subList (java.util.ArrayList. [1 2 3]) 0 2)")
     ("cd-ra-sublist" . "(.subList (java.util.Arrays/asList (object-array [1 2 3])) 0 2)")
-    ("cd-sublist" . "(.subList (java.util.LinkedList. [1 2 3]) 0 2)")))
+    ("cd-sublist" . "(.subList (java.util.LinkedList. [1 2 3]) 0 2)")
+    ("jx-reverse-list" . "(.reversed (java.util.Vector. [1 2]))")
+    ("jx-hashtable-entry" . "(first (.entrySet (java.util.Hashtable. {:a 1})))")
+    ("jx-reverse-deque" . "(.reversed (java.util.concurrent.ConcurrentLinkedDeque. [1 2]))")
+    ("jx-cow-sublist" . "(.subList (java.util.concurrent.CopyOnWriteArrayList. [1 2 3]) 0 2)")
+    ("jx-cslm-sub" . "(.headMap (java.util.concurrent.ConcurrentSkipListMap. {1 1 2 2}) 2)")
+    ("jx-cslm-dsub" . "(.descendingMap (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-keyset" . "(.keySet (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-values" . "(.values (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-subvalues" . "(.values (.headMap (java.util.concurrent.ConcurrentSkipListMap. {1 1 2 2}) 2))")
+    ("jx-cslm-entryset" . "(.entrySet (java.util.concurrent.ConcurrentSkipListMap. {1 1}))")
+    ("jx-cslm-subentryset" . "(.entrySet (.headMap (java.util.concurrent.ConcurrentSkipListMap. {1 1 2 2}) 2))")
+    ("jx-cslm-dsubentryset" . "(.entrySet (.descendingMap (java.util.concurrent.ConcurrentSkipListMap. {1 1})))")))
+;; tag -> a Clojure expression whose value WRAPS a value with that tag, which a
+;; program only ever reaches through the wrapper (a Hashtable's keySet is a
+;; Collections$SynchronizedSet over Hashtable$KeySet): the wrapper's dump is
+;; refused naming the inner class, as the JDK's NotSerializableException does
+(define wrapped-refused
+  '(("jx-hashtable-keyset" . "(.keySet (java.util.Hashtable. {:a 1}))")
+    ("jx-hashtable-values" . "(.values (java.util.Hashtable. {:a 1}))")
+    ("jx-hashtable-entryset" . "(.entrySet (java.util.Hashtable. {:a 1}))")))
 
 (define (tag-of v) (and (jhost? v) (jhost-tag v)))
 
@@ -128,7 +161,7 @@
   (vector-for-each
     (lambda (t)
       (ok (format "java.util shim tag ~a has no image sample: add one to image-coverage-test.ss that round-trips (with a codec in java/image-codecs.ss if its state cannot travel), or a refused sample" t)
-          (or (assoc t samples) (assoc t refused) (assoc t same-codec))))
+          (or (assoc t samples) (assoc t refused) (assoc t same-codec) (assoc t wrapped-refused))))
     ks))
 
 ;; the samples round-trip
@@ -150,6 +183,17 @@
           (jolt-truthy? (jolt-invoke (var-deref "user" "image-refuses?") v)))))
   refused)
 
+;; the wrapped ones: the wrapper holds a value with the tag, and is refused naming its class
+(for-each
+  (lambda (p)
+    (let ((v (ev (cdr p))))
+      (ok (format "wrapped refused sample for ~a holds that tag" (car p))
+          (and (jhost? v) (equal? (tag-of (vector-ref (jhost-state v) 0)) (car p))))
+      (ok (format "~a is refused naming its class" (car p))
+          (jolt-truthy? (jolt-invoke (var-deref "user" "image-refuses-naming?") v
+                                     (jolt-class-name (vector-ref (jhost-state v) 0)))))))
+  wrapped-refused)
+
 ;; every codec and refusal registered is one this file knows about
 (let-values (((ks vs) (hashtable-entries image-codec-by-tag)))
   (vector-for-each
@@ -160,7 +204,7 @@
 (let-values (((ks vs) (hashtable-entries image-refusal-by-tag)))
   (ok "every refused collection view or entry has a refused sample"
       (for-all (lambda (t)
-                 (or (assoc t refused) (not (hashtable-ref jutil-colls-tbl t #f))))
+                 (or (assoc t refused) (assoc t wrapped-refused) (not (hashtable-ref jutil-colls-tbl t #f))))
                (vector->list ks))))
 
 ;; the values that are not collections but carry host state
@@ -168,7 +212,7 @@
   (lambda (s)
     (ok (format "~a round-trips" s)
         (jolt-truthy? (jolt-invoke (var-deref "user" "image-round-trips?") (ev s)))))
-  '("(StringBuilder. \"ab\")" "(StringBuffer. \"cd\")"))
+  '("(StringBuilder. \"ab\")" "(StringBuffer. \"cd\")" "(doto (java.util.BitSet. 10) (.set 3) (.set 70))"))
 (ok "a thread is refused naming its class"
     (jolt-truthy? (jolt-invoke (var-deref "user" "image-refuses?") (ev "(Thread. (fn []))"))))
 (ok "a collection holding itself restores as one"
