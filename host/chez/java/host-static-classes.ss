@@ -176,9 +176,17 @@
                     (al-set! self idx x) old)))
     (cons "size" (lambda (self) (->num (al-cnt self))))
     (cons "isEmpty" (lambda (self) (fx=? 0 (al-cnt self))))
+    ;; remove(int) for an integer, remove(Object) — the first equal element,
+    ;; answering whether there was one — for anything else, the overload
+    ;; Clojure's reflector picks for a long and for any other argument
     (cons "remove" (lambda (self i)
-                     (let* ((idx (jnum->exact i)) (old (al-ref self idx)))
-                       (al-remove-at! self idx) old)))
+                     (if (and (number? i) (exact? i) (integer? i))
+                         (let* ((idx (jnum->exact i)) (old (begin (al-check-index! self idx) (al-ref self idx))))
+                           (al-remove-at! self idx) old)
+                         (let loop ((k 0))
+                           (cond ((fx=? k (al-cnt self)) #f)
+                                 ((objects-equals? i (al-ref self k)) (al-remove-at! self k) #t)
+                                 (else (loop (fx+ k 1))))))))
     (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
@@ -253,10 +261,18 @@
   (let ((al (make-arraylist xs))) (make-jhost "arraydeque" (jhost-state al))))
 ;; An ArrayDeque is only a Collection: it keeps Object's identity equals and
 ;; hashCode, where the List shims compare element-wise.
+;; It has no remove(int): remove(Object) takes an integer as the element, and
+;; remove() is removeFirst.
 (register-host-methods! "arraydeque"
-  (append (list (cons "equals" (lambda (self o) (eq? self o)))
-                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self)))))
-          (filter (lambda (p) (not (member (car p) '("equals" "hashCode")))) linkedlist-methods)))
+  (append (filter (lambda (p) (not (member (car p) '("equals" "hashCode" "remove")))) linkedlist-methods)
+          (list (cons "equals" (lambda (self o) (eq? self o)))
+                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self))))
+                (cons "remove" (case-lambda
+                                 ((self) (al-first self) (let ((o (al-first self))) (al-remove-at! self 0) o))
+                                 ((self x) (let loop ((k 0))
+                                             (cond ((fx=? k (al-cnt self)) #f)
+                                                   ((objects-equals? x (al-ref self k)) (al-remove-at! self k) #t)
+                                                   (else (loop (fx+ k 1)))))))))))
 (let ((ctor (lambda args
               (cond ((null? args) (make-arraydeque '()))
                     ((number? (car args)) (make-arraydeque '()))

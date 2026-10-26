@@ -56,6 +56,8 @@
 (define cd-collection-defaults
   (list
     (list "isEmpty" 0 (lambda (self) (fx=? 0 (cd-size self))))
+    ;; AbstractCollection.add: a collection that defines no add refuses one
+    (list "add" 1 (lambda (self x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
     (list "contains" 1 (lambda (self x) (and (exists (lambda (e) (objects-equals? x e)) (cd-elems self)) #t)))
     (list "containsAll" 1 (lambda (self c) (for-all (lambda (x) (cd-truthy? (cd-call self "contains" x))) (cd-elems c))))
     (list "addAll" 1 (lambda (self c)

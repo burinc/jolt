@@ -3088,6 +3088,9 @@
 ;; Collections.unmodifiable* / synchronized* views and List/Set/Map.of — after
 ;; coll-defaults.ss, whose inherited members the views reach through.
 (load "host/chez/java/jutil-views.ss")
+;; Vector, Stack, Hashtable, BitSet, PriorityQueue and the java.util.concurrent
+;; collections, over the jx registry jutil-views.ss keeps.
+(load "host/chez/java/jutil-concurrent.ss")
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and
