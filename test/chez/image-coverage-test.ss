@@ -99,7 +99,8 @@
     ("jx-cow-list" . "(java.util.concurrent.CopyOnWriteArrayList. [3 1 3])")
     ("jx-cow-set" . "(java.util.concurrent.CopyOnWriteArraySet. [3 1 2])")
     ("jx-cslm" . "(doto (java.util.concurrent.ConcurrentSkipListMap. (java.util.Collections/reverseOrder)) (.put 1 :a) (.put 2 :b))")
-    ("jx-csls" . "(java.util.concurrent.ConcurrentSkipListSet. [3 1 2])")))
+    ("jx-csls" . "(java.util.concurrent.ConcurrentSkipListSet. [3 1 2])")
+    ("jx-simple-entry" . "(java.util.AbstractMap$SimpleEntry. :k [1])")))
 ;; a JumboEnumSet needs an enum of more than 64 constants, which the host has
 ;; none of; its codec is the RegularEnumSet's (one registration, both tags)
 (define same-codec '(("enum-set-jumbo" . "enum-set-regular")))
@@ -151,7 +152,11 @@
     ("jx-reverse-linkedlist" . "(.reversed (java.util.LinkedList. [1 2]))")
     ("jx-cow-reversed" . "(.reversed (java.util.concurrent.CopyOnWriteArrayList. [1 2]))")
     ("jx-rev-sortedmap" . "(.reversed (java.util.Collections/unmodifiableSortedMap (java.util.TreeMap. {1 1})))")
-    ("jx-rev-sortedset" . "(.reversed (java.util.Collections/unmodifiableSortedSet (java.util.TreeSet. [1])))")))
+    ("jx-rev-sortedset" . "(.reversed (java.util.Collections/unmodifiableSortedSet (java.util.TreeSet. [1])))")
+    ("jx-hm-keyset" . "(.keySet (doto (java.util.HashMap.) (.put :a 1)))")
+    ("jx-hm-values" . "(.values (doto (java.util.HashMap.) (.put :a 1)))")
+    ("jx-hm-entryset" . "(.entrySet (doto (java.util.HashMap.) (.put :a 1)))")
+    ("jx-hm-node" . "(first (.entrySet (doto (java.util.HashMap.) (.put :a 1))))")))
 ;; tag -> a Clojure expression whose value WRAPS a value with that tag, which a
 ;; program only ever reaches through the wrapper (a Hashtable's keySet is a
 ;; Collections$SynchronizedSet over Hashtable$KeySet): the wrapper's dump is

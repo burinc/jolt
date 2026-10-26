@@ -779,9 +779,13 @@
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
         (cons "remove" (case-lambda
-                         ((self k) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
-                                     (hashtable-delete! (hm-tbl self) k)
-                                     (hm-drop-key! self k) old))
+                         ;; a key that is not there changes nothing, so the
+                         ;; key order (what a view's iterator checks) is untouched
+                         ((self k) (if (hashtable-contains? (hm-tbl self) k)
+                                       (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                         (hashtable-delete! (hm-tbl self) k)
+                                         (hm-drop-key! self k) old)
+                                       jolt-nil))
                          ;; remove(key, value): only when mapped to exactly that
                          ((self k v) (if (and (hashtable-contains? (hm-tbl self) k)
                                               (jolt=2 v (hashtable-ref (hm-tbl self) k jolt-nil)))
@@ -793,13 +797,11 @@
                           m)))
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
         (cons "putAll" (lambda (self m) (hm-copy-into-ordered! self m) jolt-nil))
-        (cons "keySet" (lambda (self) (apply jolt-hash-set (hm-keys-ordered self))))
-        (cons "values" (lambda (self) (apply jolt-vector
-                          (map (lambda (k) (hashtable-ref (hm-tbl self) k jolt-nil))
-                               (hm-keys-ordered self)))))
-        ;; a snapshot of the entries (jolt-5u4jz: the JDK's is a live view); never
-        ;; nil, which an empty map's seq would be
-        (cons "entrySet" (lambda (self) (let ((s (jolt-seq (hm->pmap self)))) (if (jolt-nil? s) jolt-empty-list s))))))
+        ;; keySet / values / entrySet are live views (jutil-concurrent.ss), as
+        ;; the JDK's HashMap$KeySet / $Values / $EntrySet are
+        (cons "keySet" (lambda (self) (make-jhost "jx-hm-keyset" (vector self))))
+        (cons "values" (lambda (self) (make-jhost "jx-hm-values" (vector self))))
+        (cons "entrySet" (lambda (self) (make-jhost "jx-hm-entryset" (vector self))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and

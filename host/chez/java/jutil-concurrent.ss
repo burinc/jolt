@@ -1714,3 +1714,113 @@
                 (list (cons "reversed" (lambda (self) (make-jhost tag (vector (jx-call (jxw-inner self) (list-ref r 4) '())))))))))
           '(("jx-rev-sortedmap" "jx-unmod-sortedmap" "java.util.ReverseOrderSortedMapView" "java.util.SortedMap" "descendingMap" map)
             ("jx-rev-sortedset" "jx-unmod-sortedset" "java.util.ReverseOrderSortedSetView" "java.util.SortedSet" "descendingSet" set)))
+
+;; ======================================================================================
+;; HashMap's views
+;; ======================================================================================
+;; keySet / values / entrySet of a HashMap: live views of the map, as the JDK's
+;; HashMap$KeySet / $Values / $EntrySet are. Removing through one removes from
+;; the map, a later put shows through, and an entry is a HashMap$Node whose
+;; getValue reads the map and whose setValue writes it. Their iterators are
+;; fail-fast: the map replaces its key-order list on every structural change
+;; (host-static-classes.ss hm-note-key! / hm-drop-key!), so an iterator holds the
+;; list it started from and throws ConcurrentModificationException when the
+;; map's is another. State #(map); an iterator's #(map remaining last kind expected).
+(define (hmv-map v) (vector-ref (jhost-state v) 0))
+(define (hmv-ref m k) (hashtable-ref (hm-tbl m) k jolt-nil))
+(define (hm-node m k) (make-jhost "jx-hm-node" (vector m k (hmv-ref m k))))
+(define (hmn-value n)
+  (let* ((st (jhost-state n)) (m (vector-ref st 0)) (k (vector-ref st 1)))
+    (if (hashtable-contains? (hm-tbl m) k)
+        (let ((v (hmv-ref m k))) (vector-set! st 2 v) v)
+        (vector-ref st 2))))
+(jx-class! "jx-hm-node" "java.util.HashMap$Node" '("java.util.Map$Entry"))
+(register-jutil-entry! "jx-hm-node" (lambda (n) (cons (vector-ref (jhost-state n) 1) (hmn-value n))))
+(register-host-methods! "jx-hm-node"
+  (list (cons "setValue" (lambda (self v)
+                           (let* ((st (jhost-state self)) (m (vector-ref st 0)) (k (vector-ref st 1)) (old (hmn-value self)))
+                             (when (hashtable-contains? (hm-tbl m) k) (hashtable-set! (hm-tbl m) k v))
+                             (vector-set! st 2 v)
+                             old)))))
+(define (hmv-project kind m k) (case kind ((key) k) ((value) (hmv-ref m k)) (else (hm-node m k))))
+(define (hmv-elems kind) (lambda (v) (let ((m (hmv-map v))) (map (lambda (k) (hmv-project kind m k)) (hm-keys-ordered m)))))
+(define (hmv-entry-kv e)
+  (or (jolt-host-entry e) (and (jolt-map-entry? e) (cons (jolt-nth e 0) (jolt-nth e 1)))))
+(define (hmv-has-entry? m e)
+  (let ((kv (hmv-entry-kv e)))
+    (and kv (hashtable-contains? (hm-tbl m) (car kv)) (jolt=2 (cdr kv) (hmv-ref m (car kv))) #t)))
+(define (hmv-remove-key! m k) (jx-call m "remove" (list k)))
+(define (hmv-iterator kind tag)
+  (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind (hm-ord m))))))
+(define (hmi-comod! it)
+  (let ((st (jhost-state it)))
+    (unless (eq? (vector-ref st 4) (hm-ord (vector-ref st 0))) (throw-jvm 'ConcurrentModificationException jolt-nil))))
+(define hm-iterator-methods
+  (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 1))))
+        (cons "next" (lambda (self)
+                       (hmi-comod! self)
+                       (let* ((st (jhost-state self)) (ks (vector-ref st 1)))
+                         (when (null? ks) (throw-jvm 'NoSuchElementException jolt-nil))
+                         (vector-set! st 1 (cdr ks))
+                         (vector-set! st 2 (car ks))
+                         (hmv-project (vector-ref st 3) (vector-ref st 0) (car ks)))))
+        (cons "remove" (lambda (self)
+                         (let ((st (jhost-state self)))
+                           (when (eq? (vector-ref st 2) jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
+                           (hmi-comod! self)
+                           (hmv-remove-key! (vector-ref st 0) (vector-ref st 2))
+                           (vector-set! st 2 jutil-iterator-none)
+                           (vector-set! st 4 (hm-ord (vector-ref st 0)))
+                           jolt-nil)))
+        (cons "forEachRemaining" (lambda (self f)
+                                   (let loop () (when (pair? (vector-ref (jhost-state self) 1))
+                                                  (jolt-fi-call f "accept" (jx-call self "next" '())) (loop)))
+                                   jolt-nil))))
+(for-each (lambda (r)
+            (jx-class! (car r) (cadr r) '("java.util.Iterator"))
+            (register-host-methods! (car r) hm-iterator-methods)
+            (jx-register! (car r) 'iter
+                          (lambda (it) (let ((st (jhost-state it)))
+                                         (map (lambda (k) (hmv-project (vector-ref st 3) (vector-ref st 0) k)) (vector-ref st 1))))
+                          #f #f #f))
+          '(("jx-hm-key-itr" "java.util.HashMap$KeyIterator") ("jx-hm-value-itr" "java.util.HashMap$ValueIterator")
+            ("jx-hm-entry-itr" "java.util.HashMap$EntryIterator")))
+(define (hmv-common kind itr-tag has? remove!)
+  (list (cons "size" (lambda (self) (hashtable-size (hm-tbl (hmv-map self)))))
+        (cons "isEmpty" (lambda (self) (fx=? 0 (hashtable-size (hm-tbl (hmv-map self))))))
+        (cons "contains" (lambda (self x) (and (has? (hmv-map self) x) #t)))
+        (cons "remove" (lambda (self x) (remove! (hmv-map self) x)))
+        (cons "clear" (lambda (self) (jx-call (hmv-map self) "clear" '())))
+        (cons "iterator" (hmv-iterator kind itr-tag))
+        (cons "add" (lambda (self x) (jx-uoe)))
+        (cons "addAll" (lambda (self c) (jx-uoe)))
+        (cons "toArray" (jxc-to-array (hmv-elems kind)))
+        (cons "forEach" (lambda (self f) (for-each (lambda (x) (jolt-fi-call f "accept" x)) ((hmv-elems kind) self)) jolt-nil))))
+(define (hmv-has-value? m v) (exists (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m)))
+(jx-class! "jx-hm-keyset" "java.util.HashMap$KeySet" '("java.util.AbstractSet"))
+(register-host-methods! "jx-hm-keyset"
+  (hmv-common 'key "jx-hm-key-itr"
+              (lambda (m k) (hashtable-contains? (hm-tbl m) k))
+              (lambda (m k) (and (hashtable-contains? (hm-tbl m) k) (begin (hmv-remove-key! m k) #t)))))
+(jx-register! "jx-hm-keyset" 'set (hmv-elems 'key) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
+              (lambda (v k) (hashtable-contains? (hm-tbl (hmv-map v)) k)) #f)
+(jx-class! "jx-hm-values" "java.util.HashMap$Values" '("java.util.AbstractCollection"))
+(register-host-methods! "jx-hm-values"
+  (hmv-common 'value "jx-hm-value-itr" hmv-has-value?
+              (lambda (m v) (let ((k (find (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m))))
+                              (if k (begin (hmv-remove-key! m k) #t) #f)))))
+(jx-register! "jx-hm-values" 'coll (hmv-elems 'value) (lambda (v) (hashtable-size (hm-tbl (hmv-map v)))) #f #f)
+(jx-class! "jx-hm-entryset" "java.util.HashMap$EntrySet" '("java.util.AbstractSet"))
+(register-host-methods! "jx-hm-entryset"
+  (hmv-common 'entry "jx-hm-entry-itr" hmv-has-entry?
+              (lambda (m e) (if (hmv-has-entry? m e) (begin (hmv-remove-key! m (car (hmv-entry-kv e))) #t) #f))))
+(jx-register! "jx-hm-entryset" 'entries (hmv-elems 'entry) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
+              (lambda (v e) (hmv-has-entry? (hmv-map v) e)) #f)
+;; AbstractMap$SimpleEntry: a mutable Map.Entry anyone can build. State #(key value)
+(jx-class! "jx-simple-entry" "java.util.AbstractMap$SimpleEntry" '("java.util.Map$Entry" "java.io.Serializable"))
+(register-jutil-entry! "jx-simple-entry" (lambda (e) (cons (vector-ref (jhost-state e) 0) (vector-ref (jhost-state e) 1))))
+(register-host-methods! "jx-simple-entry"
+  (list (cons "setValue" (lambda (self v) (let ((old (vector-ref (jhost-state self) 1))) (vector-set! (jhost-state self) 1 v) old)))))
+(register-class-ctor! "java.util.AbstractMap$SimpleEntry"
+  (case-lambda ((k v) (make-jhost "jx-simple-entry" (vector k v)))
+               ((e) (let ((kv (hmv-entry-kv e))) (make-jhost "jx-simple-entry" (vector (car kv) (cdr kv)))))))
