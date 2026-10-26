@@ -979,7 +979,9 @@
           '("java.util.LinkedHashMap$LinkedKeyIterator" "java.util.LinkedHashMap$LinkedValueIterator"
             "java.util.LinkedHashMap$LinkedEntryIterator" "java.util.HashMap$KeyIterator"
             "java.util.RegularEnumSet$EnumSetIterator" "java.util.JumboEnumSet$EnumSetIterator"
-            "java.util.EnumMap$KeyIterator" "java.util.EnumMap$ValueIterator" "java.util.EnumMap$EntryIterator"))
+            "java.util.EnumMap$KeyIterator" "java.util.EnumMap$ValueIterator" "java.util.EnumMap$EntryIterator"
+            "java.util.ArrayList$Itr" "java.util.LinkedList$ListItr" "java.util.ArrayDeque$DeqIterator"
+            "java.util.Arrays$ArrayItr" "java.util.ImmutableCollections$ListItr"))
 (jch-register-supers! "java.util.EnumMap$EntryIterator$Entry" '("java.util.Map$Entry"))
 ;; java.util.TreeMap / TreeSet and the views they hand out (tree-map.ss), with
 ;; the sorted/navigable/sequenced interfaces between them and Map / Set, and

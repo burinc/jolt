@@ -182,7 +182,32 @@
     (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
-    (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))))
+    (cons "iterator" (lambda (self) (al-iterator self)))))
+;; iterator(): a walk over the elements as they are now, whose remove takes the
+;; last one handed out from the list (the JDK's Itr: the next index shifts back
+;; by one). An unmodifiable list's refuses, as Arrays$ArrayItr and the
+;; ImmutableCollections iterator do. One iterator class per list class.
+(define al-iterator-tags
+  '(("arraylist" . "arraylist-iterator") ("linkedlist" . "linkedlist-iterator")
+    ("arraydeque" . "arraydeque-iterator") ("arrays-aslist" . "arrays-aslist-iterator")
+    ("immutable-list" . "immutable-list-iterator")))
+(define (al-iterator self)
+  (let* ((xs (al->list self)) (n (length xs)) (removed 0)
+         (tag (cdr (or (assoc (jhost-tag self) al-iterator-tags) '(#f . "arraylist-iterator"))))
+         (fixed? (member (jhost-tag self) '("arrays-aslist" "immutable-list"))))
+    (make-jutil-iterator tag (iota n)
+      (lambda (i)
+        (when fixed? (throw-jvm 'UnsupportedOperationException "remove"))
+        (al-remove-at! self (fx- i removed))
+        (set! removed (fx+ removed 1)))
+      (let ((v (list->vector xs))) (lambda (i) (vector-ref v i))))))
+(for-each (lambda (p fqn)
+            (hashtable-set! jhost-tag->fqn (cdr p) fqn)
+            (register-jutil-iterator! (cdr p)))
+          al-iterator-tags
+          '("java.util.ArrayList$Itr" "java.util.LinkedList$ListItr" "java.util.ArrayDeque$DeqIterator"
+            "java.util.Arrays$ArrayItr" "java.util.ImmutableCollections$ListItr"))
+
 ;; java.util.SequencedCollection (JDK 21): List and Deque both have it, so the
 ;; first/last accessors and mutators sit on the shared ArrayList table and
 ;; LinkedList / ArrayDeque inherit them. On an empty list the accessors raise
@@ -1094,6 +1119,11 @@
   (list (cons "newHashMap" (hm-sized-new "mappings" (lambda () (make-jhost "hashmap" (vector (make-hashtable hm-hash jolt=2) '())))))))
 (register-class-statics! "java.util.HashSet"
   (list (cons "newHashSet" (hm-sized-new "elements" (lambda () ((hs-ctor "hashset")))))))
+;; the linked subclasses inherit them
+(register-class-statics! "java.util.LinkedHashMap"
+  (list (cons "newHashMap" (host-static-ref "java.util.HashMap" "newHashMap"))))
+(register-class-statics! "java.util.LinkedHashSet"
+  (list (cons "newHashSet" (host-static-ref "java.util.HashSet" "newHashSet"))))
 
 (register-host-methods! "hashset"
   (list (cons "add" (lambda (self x) (let ((had (hashtable-contains? (hm-tbl self) x)))

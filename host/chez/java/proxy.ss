@@ -57,29 +57,7 @@
     (proxy-attach! base p)
     p))
 
-;; A proxy over a java.util collection is that collection to count, seq, get and
-;; contains?, which reach it through the methods the JVM's RT does — size,
-;; containsKey / contains, get — so an override in the proxy body answers.
-(define (proxy-coll-kind x)
-  (let ((d (and (jreify? x) (jreify-delegate x))))
-    (and d (jutil-coll-kind d))))
-(define (proxy-call x m . args) (record-method-dispatch x m (if (null? args) jolt-nil (list->cseq args))))
-(register-count-arm! proxy-coll-kind (lambda (x) (jnum->exact (proxy-call x "size"))))
-(register-seq-arm! proxy-coll-kind (lambda (x) (jolt-seq (jreify-delegate x))))
-(register-get-arm! (lambda (x) (eq? (proxy-coll-kind x) 'map))
-  (lambda (x k d) (if (jolt-truthy? (proxy-call x "containsKey" k)) (proxy-call x "get" k) d)))
-(register-contains-arm! (lambda (x) (memq (proxy-coll-kind x) '(map set)))
-  (lambda (x k) (jolt-truthy? (proxy-call x (if (eq? (proxy-coll-kind x) 'map) "containsKey" "contains") k))))
 
-;; A base whose own methods call one a subclass overrides — LinkedHashMap's put
-;; asking removeEldestEntry — is told which proxy stands over it, so that call
-;; reaches the override as the JVM's virtual dispatch would. tag -> (base proxy)
-(define proxy-attach-hooks '())
-(define (proxy-attach-hook! tag f) (set! proxy-attach-hooks (cons (cons tag f) proxy-attach-hooks)))
-(define (proxy-attach! base p)
-  (when (jhost? base)
-    (let ((h (assoc (jhost-tag base) proxy-attach-hooks)))
-      (when h ((cdr h) base p)))))
 (def-var! "clojure.core" "make-proxy" jolt-make-proxy)
 
 ;; (proxy-super meth args...) inside a proxy body: the base's own implementation,

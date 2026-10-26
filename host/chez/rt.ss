@@ -2689,17 +2689,25 @@
 ;; going through it would recurse. Types with no str arm print bare, like the
 ;; JVM's default Object.toString. readable? quotes the content unless
 ;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The class is
-;; followed by the identity hash, as Object.toString's is.
+;; followed by the identity hash where jolt-object-repr-hash? (below) says so.
 (define (jolt-object-content x)
   (or (str-render-by-identity x)
       (let loop ((rs str-render-registry))
         (cond ((null? rs) #f)
               (((caar rs) x) ((cdar rs) x))
               (else (loop (cdr rs)))))))
+;; Which values print their identity hash, as the JVM's #object form does:
+;; a host shim object and, once the enum model has said so, an enum constant.
+;; Naming one costs an insert into the identity-hash table, which a record
+;; printed in bulk (a java.io.File) would pay per object; those print without it.
+(define jolt-object-repr-hash? (lambda (x) (jhost? x)))
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
          (content (guard (e (#t #f)) (jolt-object-content x)))
-         (head (and (string? cls) (string-append "#object[" cls " 0x" (jolt-identity-hex x)))))
+         (head (and (string? cls)
+                    (if (jolt-object-repr-hash? x)
+                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
+                        (string-append "#object[" cls)))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))
@@ -3016,6 +3024,7 @@
 (load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
 (load "host/chez/java/tree-map.ss")            ; TreeMap / TreeSet + Comparator objects (shared)
 (load "host/chez/java/enum-colls.ss")           ; EnumSet / EnumMap over the enum model
+(load "host/chez/java/linked-hash.ss")          ; LinkedHashMap / LinkedHashSet
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
 ;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
 ;; Self-contained; ahead of byte-buffer.ss, which encodes floats with them.
@@ -3122,7 +3131,6 @@
 ;; (host-new + the ctor table it probes), records-interop.ss (instance-check) and
 ;; io-streams.ss, so a proxy over a stream class finds its constructor.
 (load "host/chez/java/proxy.ss")
-(load "host/chez/java/linked-hash.ss")          ; LinkedHashMap / LinkedHashSet (after proxy.ss)
 (load "host/chez/java/process.ss")
 
 ;; clojure.lang.PersistentQueue: a functional queue + EMPTY static.

@@ -18,7 +18,8 @@
 ;;
 ;; A map or set is a jhost over a chain; keySet, values, entrySet and their
 ;; sequenced spellings are live views #(chain reversed?); an entry is its node.
-;; Loaded after proxy.ss (proxy-attach-hook!) and jutil-colls.ss.
+;; Loaded after jutil-colls.ss (proxy-attach-hook!, the java.util registry) and
+;; before host-static-classes.ss, so its arms are walked after the HashMap family's.
 
 ;; ---- the chain -------------------------------------------------------------------
 (define (lh-new access?) (vector (make-hashtable hm-hash jolt=2) #f #f access? #f))
@@ -126,9 +127,7 @@
 (register-class-ctor! "LinkedHashMap" lhm-ctor)
 (register-class-ctor! "java.util.LinkedHashMap" lhm-ctor)
 (register-class-statics! "java.util.LinkedHashMap"
-  ;; newHashMap is HashMap's static, which the subclass inherits
-  (list (cons "newHashMap" (host-static-ref "java.util.HashMap" "newHashMap"))
-        (cons "newLinkedHashMap"
+  (list (cons "newLinkedHashMap"
               (lambda (n)
                 (when (< (jnum->exact n) 0)
                   (throw-jvm 'IllegalArgumentException
@@ -331,8 +330,7 @@
 (register-class-ctor! "LinkedHashSet" lhs-ctor)
 (register-class-ctor! "java.util.LinkedHashSet" lhs-ctor)
 (register-class-statics! "java.util.LinkedHashSet"
-  (list (cons "newHashSet" (host-static-ref "java.util.HashSet" "newHashSet"))
-        (cons "newLinkedHashSet"
+  (list (cons "newLinkedHashSet"
               (lambda (n)
                 (when (< (jnum->exact n) 0)
                   (throw-jvm 'IllegalArgumentException

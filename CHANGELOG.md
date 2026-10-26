@@ -109,14 +109,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is an array, they print like the JVM's, `ChronoUnit` renders its JDK names
   (`HalfDays`), and `Month/of` and `DayOfWeek/of`
   refuse an out-of-range value with `DateTimeException`.
-- **Host objects print and stringify as the JVM's.** `pr` of one is
-  `#object[java.io.File 0x1b2c3d4e "/tmp/x"]` with the identity hash, and
+- **Host objects print and stringify as the JVM's.** `pr` of a host shim
+  object or an enum constant carries the identity hash
+  (`#object[java.util.Random 0x1b2c3d4e "java.util.Random@1b2c3d4e"]`), and
   `print` leaves the content unquoted. `str` is its `toString`: Object's
   `class@hash` for one with no `toString` of its own, where several shims
   answered placeholders (`#<BufferedReader>`, `""` for a PrintWriter,
   `LinkedBlockingQueue(1)`), and the JDK's for a queue (`[1, a]`), a
   FutureTask, a Process and a `ProcessBuilder$Redirect`, whose `.type` is the
   `ProcessBuilder$Redirect$Type` enum where it was a string.
+- **The ArrayList, LinkedList and ArrayDeque iterators support `remove`**, taking
+  the last element handed out; an `Arrays/asList` list's refuses it, as on the JDK.
 - **A `java.util.HashSet` has `.iterator` (with `remove`), `contains?`,
   `addAll`, `containsAll`, `removeAll`, `retainAll` and `clone`; a `HashMap`
   `remove(key, value)` and `clone`, and copies any map it is built from.**
