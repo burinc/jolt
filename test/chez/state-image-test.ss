@@ -1397,6 +1397,21 @@
 ;; deftype prints as the JVM's #object (jolt-jon4).
 (is "v0.6.8 fixture: a deftype instance prints" "(pr-str imgrec8/pt)" "#imgrec8.Pt{:x 3, :y 4}")
 
+;; From format 13 an image names the defrecord and deftype types it holds, so a
+;; process that restores it without having loaded the code still knows a record
+;; from a deftype (jolt-yrrzq). The stand-in for "never loaded the code": write
+;; the image, then forget the types the way a fresh process would not know them.
+(ev "(defrecord ImgRec13 [a b]) (deftype ImgTyp13 [x])")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [(->ImgRec13 1 2) (ImgTyp13. 3)])"))
+(for-each (lambda (tag)
+            (hashtable-delete! chez-record-type-tbl tag)
+            (hashtable-delete! chez-deftype-tag-set tag)
+            (jch-set-supers! tag '()))
+          '("user.ImgRec13" "user.ImgTyp13"))
+(is "format 13: a restored record of a forgotten type is a record and a map"
+    (string-append "(let [[r t] (jolt.host/image-read \"" tmp "\")] [(record? r) (map? r) (vec (keys r)) (pr-str r) (record? t) (contains? (supers (class t)) clojure.lang.IType) (clojure.string/replace (pr-str t) #\"(0x|@)[0-9a-f]+\" \"$1H\")])")
+    "[true true [:a :b] #user.ImgRec13{:a 1, :b 2} false true #object[user.ImgTyp13 0xH \"user.ImgTyp13@H\"]]")
+
 ;; --- the same proof for the COLLECTION records and their metadata. Format 7
 ;; carried a vector/map/set/list/lazy-seq/() as the slotless records
 ;; (chez-pvec-v3, chez-pmap-v5, chez-pset-v2, chez-cseq-v6, jolt-lazyseq-v2,

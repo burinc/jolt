@@ -3882,6 +3882,22 @@
   "make-deftype-ctor"
   make-deftype-ctor)
 
+(define (register-record-tag! tag)
+  (jolt-with-mutex
+    rec-tbl-mu
+    (hashtable-set! chez-record-type-tbl tag #t))
+  (chez-infer-registry-bump!)
+  (let ((protos (filter
+                  (lambda (s) (not (string=? s "clojure.lang.IType")))
+                  (jch-direct-supers tag))))
+    (jch-set-supers!
+      tag
+      (append
+        protos
+        '("clojure.lang.IRecord" "clojure.lang.IObj" "clojure.lang.IPersistentMap"
+           "java.util.Map" "clojure.lang.IHashEq"
+           "java.io.Serializable")))))
+
 (define (register-record-type! name-sym)
   (let ((tag (string-append
                (chez-current-ns)

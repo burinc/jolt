@@ -72,8 +72,8 @@
 ;; Version 12: a host collection shim travels as an image-hosted record (its
 ;; codec's kind and plain data, host-static.ss register-image-codec!) and an
 ;; enum constant as its class and name; formats 11 and older carry neither.
-(define jolt-image-format-version 12)
-(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11 12))
+(define jolt-image-format-version 13)
+(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11 12 13))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -2169,9 +2169,15 @@
 ;; ride on the object, so it rides in the SAME fasl stream instead: fasl
 ;; preserves sharing within one stream, so the objects in this alist come back
 ;; eq? to the ones in the graph and the meta can be re-attached.
+;; Answers (meta-pairs . types): types is every defrecord / deftype the graph
+;; holds an instance of, as #(tag record?), which the reader registers when its
+;; process never ran the form (image-register-types!).
 (define (image-collect-meta v)
-  (let ((acc '()))
+  (let ((acc '()) (types '()) (seen (make-hashtable string-hash string=?)))
     (image-walk v (lambda (x path)
+                    (when (and (jrec? x) (not (hashtable-ref seen (jrec-tag x) #f)))
+                      (hashtable-set! seen (jrec-tag x) #t)
+                      (set! types (cons (vector (jrec-tag x) (and (jrec-record? x) #t)) types)))
                     ;; Same write-side walk, second job: drop cached hasheqs so
                     ;; no cache lands in the fasl. A content-derived hash would
                     ;; be stable across processes, but a collection holding a
@@ -2196,7 +2202,7 @@
                                  (with-exception-handler (lambda (e) (k jolt-nil))
                                    (lambda () (jolt-meta x)))))))
                         (unless (jolt-nil? m) (set! acc (cons (cons x m) acc)))))))
-    acc))
+    (cons acc types)))
 
 ;; Runs on the restored graph, after the restore walk has been over the pairs
 ;; together with the body (jolt-image-read), so each pair keys the object that
@@ -2239,7 +2245,7 @@
     ;; cannot be written ahead of the body.
     (let ((body (call-with-bytevector-output-port
                   (lambda (p)
-                    (sa-fasl-write (vector v* (image-collect-meta v*)) p
+                    (sa-fasl-write (let ((mt (image-collect-meta v*))) (vector v* (car mt) (cdr mt))) p
                       (lambda (x)
                         (and (image-external? x)
                              (begin
@@ -2286,6 +2292,21 @@
                        (apply jolt-vector (map image-stub-info stubs)))
         jolt-nil)))
 
+;; Format 13 names the defrecord and deftype types an image holds instances of.
+;; An instance travels with its descriptor, but whether its type was a record —
+;; what record?, map?, keys and printing ask — lives in tables defrecord and
+;; deftype fill when they run, and a process that restores the image without
+;; having loaded the code never ran them. A type this process does not know is
+;; registered here as what it was; one it does know is left alone.
+(define (image-register-types! types)
+  (for-each
+    (lambda (t)
+      (let ((tag (vector-ref t 0)) (record? (vector-ref t 1)))
+        (unless (hashtable-ref chez-deftype-tag-set tag #f)
+          (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-deftype-tag-set tag #t))
+          (when (null? (jch-direct-supers tag)) (jch-set-supers! tag '("clojure.lang.IType")))
+          (when record? (register-record-tag! tag)))))
+    types))
 (define (jolt-image-read path)
   (unless (file-exists? path)
     (jolt-throw (jolt-ex-info (string-append "image: no such file: " path) empty-pmap)))
@@ -2296,8 +2317,10 @@
            (exts (list->vector (map image-decode-external descs)))
            (b (sa-fasl-read port 'load exts)))
       (close-port port)
-      (unless (and (vector? b) (fx=? (vector-length b) 2))
+      ;; #(value meta) to format 12, #(value meta types) from 13
+      (unless (and (vector? b) (or (fx=? (vector-length b) 2) (fx=? (vector-length b) 3)))
         (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) empty-pmap)))
+      (when (fx=? (vector-length b) 3) (image-register-types! (vector-ref b 2)))
       ;; R3: rebuild what the write side substituted — fn source records become
       ;; live closures, handler payloads go back through their restore fns. The
       ;; meta sidecar rides through the same walk (one memo, so a pair's object
