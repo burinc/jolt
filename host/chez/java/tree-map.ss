@@ -563,6 +563,11 @@
                      ((self from fi to ti)
                       (v-sub self (tm-map-tag (v-desc? self)) from (jolt-truthy? fi) to (jolt-truthy? ti)))))
     (cons "descendingMap" (lambda (self) (v-flip self (tm-map-tag (not (v-desc? self))))))
+    ;; SequencedMap, as NavigableMap answers it: reversed is the descending map,
+    ;; and a sorted map has no first or last place to put a key
+    (cons "reversed" (lambda (self) (v-flip self (tm-map-tag (not (v-desc? self))))))
+    (cons "putFirst" (lambda (self k val) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+    (cons "putLast" (lambda (self k val) (throw-jvm 'UnsupportedOperationException jolt-nil)))
     (cons "comparator" (lambda (self) (v-comparator self)))
     (cons "clone" (lambda (self) (tm-ctor self)))))
 (for-each (lambda (t) (register-host-methods! t treemap-methods)) tm-map-tags)
@@ -664,6 +669,14 @@
                      ((self from fi to ti)
                       (v-sub self (jhost-tag self) from (jolt-truthy? fi) to (jolt-truthy? ti)))))
     (cons "descendingSet" (lambda (self) (v-flip self (jhost-tag self))))
+    ;; SequencedCollection, as NavigableSet answers it
+    (cons "reversed" (lambda (self) (v-flip self (jhost-tag self))))
+    (cons "getFirst" (lambda (self) (tm-key-or-throw (v-lowest self))))
+    (cons "getLast" (lambda (self) (tm-key-or-throw (v-highest self))))
+    (cons "removeFirst" (lambda (self) (tm-key-or-throw (v-poll! self (v-lowest self)))))
+    (cons "removeLast" (lambda (self) (tm-key-or-throw (v-poll! self (v-highest self)))))
+    (cons "addFirst" (lambda (self x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+    (cons "addLast" (lambda (self x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
     (cons "comparator" (lambda (self) (v-comparator self)))))
 (register-host-methods! "treeset"
   (append navigable-set-methods

@@ -1442,7 +1442,7 @@
 (define (cs-root x) (vector-ref (jhost-state x) 0))
 (define cs-writers
   '("put" "putAll" "putIfAbsent" "remove" "clear" "compute" "computeIfAbsent" "computeIfPresent" "merge"
-    "replace" "replaceAll" "pollFirstEntry" "pollLastEntry" "pollFirst" "pollLast" "add" "addAll"
+    "replace" "replaceAll" "pollFirstEntry" "pollLastEntry" "pollFirst" "pollLast" "removeFirst" "removeLast" "add" "addAll"
     "removeAll" "retainAll" "removeIf"))
 (define (cs-check-args! name args)
   (cond ((string=? name "equals") #f)
@@ -1528,3 +1528,51 @@
                (for-each (lambda (k) (when (jolt-nil? k) (jx-npe)) (unless (v-contains? (cs-base s) k) (tmr-put! (cs-root s) k #t))) (jxc-elems x))
                s)))))
 (register-class-ctor! "ConcurrentSkipListSet" (lookup-class class-ctors-tbl "java.util.concurrent.ConcurrentSkipListSet"))
+
+;; ======================================================================================
+;; SequencedMap's default views
+;; ======================================================================================
+;; sequencedKeySet / sequencedValues / sequencedEntrySet on a map that does not
+;; override them (TreeMap, ConcurrentSkipListMap): SequencedMap's own views,
+;; each the map's keySet / values / entrySet behind AbstractMap.ViewCollection,
+;; whose reversed is the reversed map's. State #(map).
+(define (sqv-map v) (vector-ref (jhost-state v) 0))
+(define (sqv-view v) (jx-call (sqv-map v) (case (string->symbol (jhost-tag v))
+                                            ((jx-seq-keyset) "keySet") ((jx-seq-values) "values") (else "entrySet"))
+                              '()))
+(define (sqv-methods reversed-method identity?)
+  (append
+    (map (lambda (m) (cons m (lambda (self . args) (jx-call (sqv-view self) m args))))
+         '("iterator" "size" "isEmpty" "contains" "containsAll" "remove" "removeAll" "removeIf" "retainAll"
+           "clear" "toArray" "forEach" "toString"))
+    (if identity? '()
+        (list (cons "equals" (lambda (self o) (jx-call (sqv-view self) "equals" (list o))))
+              (cons "hashCode" (lambda (self) (jx-call (sqv-view self) "hashCode" '())))))
+    (list (cons "add" jx-uoe) (cons "addAll" jx-uoe) (cons "addFirst" jx-uoe) (cons "addLast" jx-uoe)
+          (cons "reversed" (lambda (self) (jx-call (jx-call (sqv-map self) "reversed" '()) reversed-method '())))
+          (cons "getFirst" (lambda (self) (let ((xs (jxc-elems (sqv-view self)))) (if (null? xs) (throw-jvm 'NoSuchElementException jolt-nil) (car xs)))))
+          (cons "getLast" (lambda (self) (let ((xs (jxc-elems (sqv-view self)))) (if (null? xs) (throw-jvm 'NoSuchElementException jolt-nil) (car (last-pair xs))))))
+          (cons "removeFirst" (lambda (self) (let ((it (jx-call (sqv-view self) "iterator" '())))
+                                               (unless (jolt-truthy? (jx-call it "hasNext" '())) (throw-jvm 'NoSuchElementException jolt-nil))
+                                               (let ((x (jx-call it "next" '()))) (jx-call it "remove" '()) x))))
+          (cons "removeLast" (lambda (self) (let ((it (jx-call (jx-call (sqv-map self) "reversed" '()) reversed-method '())))
+                                              (jx-call it "removeFirst" '())))))))
+(for-each (lambda (r)
+            (jx-class! (car r) (cadr r) (caddr r))
+            (register-host-methods! (car r) (sqv-methods (cadddr r) (eq? (list-ref r 4) 'identity))))
+          '(("jx-seq-keyset" "java.util.SequencedMap$1SeqKeySet" ("java.util.AbstractMap$ViewCollection" "java.util.SequencedSet") "sequencedKeySet" eq)
+            ("jx-seq-values" "java.util.SequencedMap$1SeqValues" ("java.util.AbstractMap$ViewCollection" "java.util.SequencedCollection") "sequencedValues" identity)
+            ("jx-seq-entryset" "java.util.SequencedMap$1SeqEntrySet" ("java.util.AbstractMap$ViewCollection" "java.util.SequencedSet") "sequencedEntrySet" eq)))
+(jch-register-supers! "java.util.AbstractMap$ViewCollection" '("java.util.Collection"))
+(jch-register-supers! "java.util.SequencedSet" '("java.util.SequencedCollection" "java.util.Set"))
+(define (sqv-elems v) (jxc-elems (sqv-view v)))
+(define (sqv-count v) (jolt-count (sqv-view v)))
+(jx-register! "jx-seq-keyset" 'set sqv-elems sqv-count (lambda (v x) (jolt-contains? (sqv-view v) x)) #f)
+(jx-register! "jx-seq-values" 'coll sqv-elems sqv-count #f #f)
+(jx-register! "jx-seq-entryset" 'entries sqv-elems sqv-count (lambda (v x) (jolt-truthy? (jx-call (sqv-view v) "contains" (list x)))) #f)
+(let ((seq-view-methods
+        (list (cons "sequencedKeySet" (lambda (self) (make-jhost "jx-seq-keyset" (vector self))))
+              (cons "sequencedValues" (lambda (self) (make-jhost "jx-seq-values" (vector self))))
+              (cons "sequencedEntrySet" (lambda (self) (make-jhost "jx-seq-entryset" (vector self)))))))
+  (for-each (lambda (t) (register-host-methods! t seq-view-methods))
+            (append tm-map-tags '("jx-cslm" "jx-cslm-sub" "jx-cslm-dsub"))))

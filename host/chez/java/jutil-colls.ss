@@ -175,8 +175,11 @@
 ;; ---- the Object methods every registered shim answers --------------------------
 (define (jutil-object-methods kind)
   (cons (cons "toString" (lambda (self) (jutil-to-string self)))
+        ;; a Collection that is neither a List, a Set nor a Map keeps Object's
+        ;; identity equals and hashCode, as AbstractCollection does
         (if (eq? kind 'coll)
-            '()
+            (list (cons "equals" (lambda (self o) (eq? self o)))
+                  (cons "hashCode" (lambda (self) (jolt-identity-hasheq self))))
             (list (cons "equals" (lambda (self o) (jutil-equals? self o)))
                   (cons "hashCode" (lambda (self) (jutil-hash-code self)))))))
 

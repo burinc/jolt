@@ -184,7 +184,8 @@
 (register-image-refusal!
   '("jx-reverse-list" "jx-hashtable-keyset" "jx-hashtable-values" "jx-hashtable-entryset" "jx-hashtable-entry"
     "jx-reverse-deque" "jx-cow-sublist" "jx-cslm-sub" "jx-cslm-dsub" "jx-cslm-keyset" "jx-cslm-values"
-    "jx-cslm-subvalues" "jx-cslm-entryset" "jx-cslm-subentryset" "jx-cslm-dsubentryset")
+    "jx-cslm-subvalues" "jx-cslm-entryset" "jx-cslm-subentryset" "jx-cslm-dsubentryset"
+    "jx-seq-keyset" "jx-seq-values" "jx-seq-entryset")
   "it is a view of another collection, which the image would have to share; write the collection itself")
 (register-image-refusal!
   '("jx-vector-itr" "jx-vector-enum" "jx-enum-iterator" "jx-reverse-list-itr" "jx-hashtable-enumerator"
