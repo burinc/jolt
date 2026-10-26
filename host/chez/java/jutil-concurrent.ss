@@ -26,10 +26,6 @@
 ;; Loaded after jutil-views.ss and tree-map.ss.
 
 (define (jxc-npe-if-nil! . xs) (for-each (lambda (x) (when (jolt-nil? x) (jx-npe))) xs))
-(define (jxc-index! i n)
-  (unless (and (fx>=? i 0) (fx<? i n))
-    (throw-jvm 'ArrayIndexOutOfBoundsException
-               (string-append "Index " (number->string i) " out of bounds for length " (number->string n)))))
 (define (jxc-elems c) (seq->list (jolt-seq c)))
 (define (jxc-to-array elems)
   (case-lambda ((self) (cd-to-array (elems self) '())) ((self a) (cd-to-array (elems self) (list a)))))
@@ -1104,7 +1100,6 @@
           (list (cons "remove" (case-lambda
                                  ((self) (cl-or-throw (cl-take! self #t)))
                                  ((self x) (and (not (jolt-nil? x)) (cl-remove-occurrence! self x #t))))))))
-(define (cld-void f) (lambda args (apply f args) jolt-nil))
 (define cld-methods
   (append (cl-common-methods "jx-cld-itr")
           (list

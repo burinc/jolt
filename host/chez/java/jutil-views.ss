@@ -142,7 +142,6 @@
             "Collections$UnmodifiableNavigableMap" "Collections$SynchronizedNavigableMap")
     (entryset "jx-unmod-entryset" #f entries ,jx-collection-ifaces "Collections$UnmodifiableMap$UnmodifiableEntrySet" #f)))
 (define (jx-family f) (or (assq f jx-families) (error 'jx-family "unknown family" f)))
-(define (jx-family-kind f) (list-ref (jx-family f) 3))
 (define (jx-unmod-tag f) (list-ref (jx-family f) 1))
 (define (jx-sync-tag f) (list-ref (jx-family f) 2))
 
