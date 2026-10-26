@@ -1885,6 +1885,16 @@
                  (else acc2))))
         (else (rec (if direct? (f acc (seq-first s)) (jolt-invoke f acc (seq-first s)))
                    (jolt-seq (seq-more s))))))))
+;; A host collection that hands its elements out as a list (the java.util views,
+;; jutil-views.ss) reduces over that list directly rather than through a seq of
+;; it, as a Java Iterable reduces over its iterator. #f until a host sets it.
+(define jolt-reduce-elems-hook #f)
+(define (reduce-list f acc xs)
+  (let ((direct? (procedure? f)))
+    (let rec ((acc acc) (xs xs))
+      (cond ((jolt-reduced? acc) (jolt-reduced-val acc))
+            ((null? xs) acc)
+            (else (rec (if direct? (f acc (car xs)) (jolt-invoke f acc (car xs))) (cdr xs)))))))
 (define jolt-reduce
   (case-lambda
     ((f coll)
@@ -1897,6 +1907,8 @@
        ((and (declares-ireduce? coll) (iface-method coll "reduce" 2))
         => (lambda (m) (let ((r (jolt-invoke m coll f)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll))
+        => (lambda (xs) (if (null? xs) (jolt-invoke f) (reduce-list f (car xs) (cdr xs)))))
        (else (let ((s (jolt-seq coll)))
                (if (jolt-nil? s) (jolt-invoke f)          ; (reduce f []) -> (f)
                    (reduce-seq f (seq-first s) (jolt-seq (seq-more s))))))))
@@ -1908,6 +1920,7 @@
        ((iface-method coll "reduce" 3)
         => (lambda (m) (let ((r (jolt-invoke m coll f init)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll)) => (lambda (xs) (reduce-list f init xs)))
        (else (reduce-seq f init (jolt-seq coll)))))))
 
 ;; Fold through a transient so a pvec/pmap/pset target is built in O(n): a

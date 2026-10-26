@@ -1194,7 +1194,10 @@
 ;; A reify may carry a DELEGATE: an object that answers any method the reify's own
 ;; table does not. clojure.core/proxy over a concrete class builds one that way —
 ;; see java/proxy.ss. A plain reify has no delegate and a method miss still throws.
-(define-record-type jreify (fields methods protos delegate) (nongenerative chez-jreify-v2))
+;; cname: the generated class's name (a reify form's), a #(ns) a proxy's is
+;; worked out from on first ask (java/proxy.ss), or #f. A reify is a code value,
+;; refused by images, so this layout is not image surface.
+(define-record-type jreify (fields methods protos delegate (mutable cname)) (nongenerative chez-jreify-v3))
 ;; likewise a reify: (def r (reify ...)) is code the restoring build already has.
 (register-code-value! jreify?)
 ;; A reify's methods are a LAYOUT and a vector of fns: (slots . fns), where SLOTS
@@ -1268,7 +1271,7 @@
           (hashtable-set! slots (if (keyword? p) (keyword-t-name p) p) i)
           (vector-set! fns i (jolt-get methods-map p jolt-nil))
           (loop (cdr ks) (fx+ i 1)))))
-    (make-jreify (cons slots fns) (reify-proto-names proto-names) delegate)))
+    (make-jreify (cons slots fns) (reify-proto-names proto-names) delegate #f)))
 ;; The reify macro's entry: SHAPE is the site's literal [[method-name …]
 ;; [protocol …]], a constant the site's pool binds once, so it is the same object
 ;; for every instance the site builds and its layout is computed once, keyed eq?
@@ -1279,34 +1282,30 @@
   (or (hashtable-ref reify-shape-memo shape #f)
       (let* ((names (seq->list (jolt-nth shape 0)))
              (slots (make-hashtable string-hash string=?))
-             (layout (cons slots (reify-proto-names (seq->list (jolt-nth shape 1))))))
+             (protos (reify-proto-names (seq->list (jolt-nth shape 1))))
+             ;; #(slots protos class-name)
+             (layout (vector slots protos (and (fx>? (jolt-count shape) 2) (jolt-nth shape 2)))))
         (let loop ((ns names) (i 0))
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
-        ;; a site compiled with its class name (the macro's third element) keeps
-        ;; it in the slot table every instance shares; code compiled before that
-        ;; reports the shared placeholder
-        (when (fx>? (jolt-count shape) 2)
-          (reify-name-class! slots (jolt-nth shape 2) (cdr layout)))
+        ;; a site compiled with its class name (the macro's third element) hands
+        ;; it to every instance; code compiled before that reports the shared
+        ;; placeholder
+        (when (vector-ref layout 2) (reify-class-graph-hook (vector-ref layout 2) protos))
         (jolt-with-mutex reify-shape-mu (hashtable-set! reify-shape-memo shape layout))
         layout)))
-;; The generated class's name, kept in its slot table under a key no method
-;; name can be, and its place in the class graph: what the reify implements.
-(define reify-class-key " class")
+;; A reify form's generated class name, or #f
 (define (reify-class-name x)
-  (and (jreify? x) (hashtable-ref (car (jreify-methods x)) reify-class-key #f)))
+  (and (jreify? x) (let ((c (jreify-cname x))) (and (string? c) c))))
 ;; A persistent collection's java.util.Spliterator, or #f on a host that models none.
 (define persistent-spliterator-hook #f)
-;; Placing the class in the class graph is the host's (the Chez half installs it
-;; with the graph, proxy.ss); a host without one keeps just the name.
+;; Placing a reify form's class in the class graph is the host's (the Chez half
+;; installs it with the graph, proxy.ss); a host without one keeps just the name.
 (define reify-class-graph-hook (lambda (name ifaces) #f))
-(define (reify-name-class! slots name ifaces)
-  (hashtable-set! slots reify-class-key name)
-  (reify-class-graph-hook name ifaces))
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))
-    (make-jreify (cons (car layout) (list->vector fns)) (cdr layout) #f)))
+    (make-jreify (cons (vector-ref layout 0) (list->vector fns)) (vector-ref layout 1) #f (vector-ref layout 2))))
 ;; Every reify from one site declares the same protocols, but the names arrive
 ;; as rest args, so each instance got its own fresh list. The questions asked of
 ;; that list — its dispatch tags (jreify-host-tags), instance? against a class

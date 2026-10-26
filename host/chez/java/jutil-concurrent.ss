@@ -1729,11 +1729,11 @@
 (define (hmv-map v) (vector-ref (jhost-state v) 0))
 (define (hmv-ref m k) (hashtable-ref (hm-tbl m) k jolt-nil))
 (define (hm-node m k) (make-jhost "jx-hm-node" (vector m k (hmv-ref m k))))
+(define hmn-absent (list 'absent))
 (define (hmn-value n)
-  (let* ((st (jhost-state n)) (m (vector-ref st 0)) (k (vector-ref st 1)))
-    (if (hashtable-contains? (hm-tbl m) k)
-        (let ((v (hmv-ref m k))) (vector-set! st 2 v) v)
-        (vector-ref st 2))))
+  ;; the map's value while the key is in it, else the last one seen
+  (let* ((st (jhost-state n)) (v (hashtable-ref (hm-tbl (vector-ref st 0)) (vector-ref st 1) hmn-absent)))
+    (if (eq? v hmn-absent) (vector-ref st 2) (begin (vector-set! st 2 v) v))))
 (jx-class! "jx-hm-node" "java.util.HashMap$Node" '("java.util.Map$Entry"))
 (register-jutil-entry! "jx-hm-node" (lambda (n) (cons (vector-ref (jhost-state n) 1) (hmn-value n))))
 (register-host-methods! "jx-hm-node"
@@ -1743,7 +1743,14 @@
                              (vector-set! st 2 v)
                              old)))))
 (define (hmv-project kind m k) (case kind ((key) k) ((value) (hmv-ref m k)) (else (hm-node m k))))
-(define (hmv-elems kind) (lambda (v) (let ((m (hmv-map v))) (map (lambda (k) (hmv-project kind m k)) (hm-keys-ordered m)))))
+(define (hmv-elems kind)
+  ;; one pass over the key order, which the map keeps newest first, the
+  ;; projection chosen once
+  (case kind
+    ((key) (lambda (v) (reverse (hm-ord (hmv-map v)))))
+    ((value) (lambda (v) (let ((t (hm-tbl (hmv-map v))))
+                           (fold-left (lambda (acc k) (cons (hashtable-ref t k jolt-nil) acc)) '() (hm-ord (hmv-map v))))))
+    (else (lambda (v) (let ((m (hmv-map v))) (fold-left (lambda (acc k) (cons (hm-node m k) acc)) '() (hm-ord m)))))))
 (define (hmv-entry-kv e)
   (or (jolt-host-entry e) (and (jolt-map-entry? e) (cons (jolt-nth e 0) (jolt-nth e 1)))))
 (define (hmv-has-entry? m e)

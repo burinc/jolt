@@ -37,6 +37,8 @@
 ;; proxy macro expands to. The base is built from the FIRST super when that names
 ;; a constructible class, matching the JVM, where only the first may be a class.
 (define (jolt-make-proxy methods-map ctor-args . proto-names)
+  (jolt-make-proxy* methods-map ctor-args proto-names))
+(define (jolt-make-proxy* methods-map ctor-args proto-names)
   (let* (;; a lone argument may be a COLLECTION of names rather than one name;
          ;; a string is seqable, so exclude it or a single class name unravels
          ;; into its characters
@@ -105,18 +107,28 @@
           (jch-register-supers! name (cons super (append ifaces '("clojure.lang.IProxy"))))
           (jolt-with-mutex proxy-class-names-mu (hashtable-set! proxy-class-names key name))
           name))))
+;; A proxy records the ns its form is in (as #(ns) in its cname field); the class
+;; name is worked out the first time it is asked for, per (ns, supers), and kept
+;; in the field, so building one pays a single field store.
+(define proxy-lazy-names (make-weak-eq-hashtable))   ; interned supers list -> ((ns . name) ...)
 (define (jolt-make-proxy-in ns methods-map ctor-args . proto-names)
-  (let* ((p (apply jolt-make-proxy methods-map ctor-args proto-names))
-         (names (seq->list (jolt-seq (jolt-invoke (var-deref "clojure.core" "map")
-                                                  (lambda (x) (proxy-name->string x))
-                                                  (if (and (pair? proto-names) (null? (cdr proto-names))
-                                                           (not (string? (car proto-names)))
-                                                           (not (symbol-t? (car proto-names)))
-                                                           (jolt-coll-pred? (car proto-names)))
-                                                      (car proto-names)
-                                                      (list->cseq proto-names)))))))
-    (hashtable-set! (car (jreify-methods p)) reify-class-key (proxy-class-name ns names))
+  (let ((p (jolt-make-proxy* methods-map ctor-args proto-names)))
+    (jreify-cname-set! p (vector ns))
     p))
+(define (proxy-class-name-of p)
+  (let ((c (jreify-cname p)))
+    (cond ((string? c) c)
+          ((vector? c)
+           (let* ((ns (vector-ref c 0)) (ps (jreify-protos p))
+                  (hit (assoc ns (hashtable-ref proxy-lazy-names ps '())))
+                  (name (if hit (cdr hit)
+                            (let ((name (proxy-class-name ns ps)))
+                              (jolt-with-mutex proxy-class-names-mu
+                                (hashtable-set! proxy-lazy-names ps (cons (cons ns name) (hashtable-ref proxy-lazy-names ps '()))))
+                              name))))
+             (jreify-cname-set! p name)
+             name))
+          (else #f))))
 (def-var! "jolt.host" "make-proxy-in" jolt-make-proxy-in)
 
 ;; (proxy-super meth args...) inside a proxy body: the base's own implementation,
@@ -142,11 +154,11 @@
     (if (proxy-value? val)
         (let ((tname (if (symbol-t? type-sym) (symbol-t-name type-sym) type-sym)))
           (if (and (string? tname) (or (reify-declares-class? (jreify-protos val) tname)
-                                       (equal? tname (reify-class-name val))))
+                                       (equal? tname (proxy-class-name-of val))))
               #t
               (if (jolt-truthy? (instance-check type-sym (reify-delegate val))) #t #f)))
         (quote pass))))
-(register-class-arm! proxy-value? (lambda (v) (or (reify-class-name v) (jolt-class-name (reify-delegate v)))))
+(register-class-arm! proxy-value? (lambda (v) (or (proxy-class-name-of v) (jolt-class-name (reify-delegate v)))))
 (let ((prev value-host-tags))
   (set! value-host-tags
     (lambda (obj)

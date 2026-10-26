@@ -3538,8 +3538,8 @@
       (apply jolt-invoke f obj rest)))
 
 (define-record-type jreify
-  (fields methods protos delegate)
-  (nongenerative chez-jreify-v2))
+  (fields methods protos delegate (mutable cname))
+  (nongenerative chez-jreify-v3))
 
 (register-code-value! jreify?)
 
@@ -3624,7 +3624,8 @@
     (make-jreify
       (cons slots fns)
       (reify-proto-names proto-names)
-      delegate)))
+      delegate
+      #f)))
 
 (define reify-shape-memo (make-weak-eq-hashtable))
 
@@ -3634,44 +3635,38 @@
   (or (hashtable-ref reify-shape-memo shape #f)
       (let* ((names (seq->list (jolt-nth shape 0)))
              (slots (make-hashtable string-hash string=?))
-             (layout (cons
+             (protos (reify-proto-names (seq->list (jolt-nth shape 1))))
+             (layout (vector
                        slots
-                       (reify-proto-names
-                         (seq->list (jolt-nth shape 1))))))
+                       protos
+                       (and (fx>? (jolt-count shape) 2)
+                            (jolt-nth shape 2)))))
         (let loop ((ns names) (i 0))
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
-        (when (fx>? (jolt-count shape) 2)
-          (reify-name-class! slots (jolt-nth shape 2) (cdr layout)))
+        (when (vector-ref layout 2)
+          (reify-class-graph-hook (vector-ref layout 2) protos))
         (jolt-with-mutex
           reify-shape-mu
           (hashtable-set! reify-shape-memo shape layout))
         layout)))
 
-(define reify-class-key " class")
-
 (define (reify-class-name x)
   (and (jreify? x)
-       (hashtable-ref
-         (car (jreify-methods x))
-         reify-class-key
-         #f)))
+       (let ((c (jreify-cname x))) (and (string? c) c))))
 
 (define persistent-spliterator-hook #f)
 
 (define reify-class-graph-hook (lambda (name ifaces) #f))
 
-(define (reify-name-class! slots name ifaces)
-  (hashtable-set! slots reify-class-key name)
-  (reify-class-graph-hook name ifaces))
-
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))
     (make-jreify
-      (cons (car layout) (list->vector fns))
-      (cdr layout)
-      #f)))
+      (cons (vector-ref layout 0) (list->vector fns))
+      (vector-ref layout 1)
+      #f
+      (vector-ref layout 2))))
 
 (define reify-protos-table
   (make-hashtable equal-hash equal?))
