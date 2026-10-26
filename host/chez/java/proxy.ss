@@ -92,9 +92,10 @@
                                   (and (not (jch-interface? f)) (pair? (jch-direct-supers f)))))))
                (super (if class? (proxy-fqn (car names)) "java.lang.Object"))
                (ifaces (map proxy-fqn (if class? (cdr names) names)))
-               (inames (jolt-invoke (var-deref "clojure.core" "apply") (var-deref "clojure.core" "sorted-set")
-                                    (list->cseq ifaces)))
-               (sorted (seq->list (jolt-seq inames)))
+               ;; Clojure hashes the sorted set of the names; a set's hash is
+               ;; the same whatever its order, so a hash-set's is that hash
+               (sorted (list-sort string<? (fold-left (lambda (acc n) (if (member n acc) acc (cons n acc))) '() ifaces)))
+               (inames (apply jolt-hash-set sorted))
                (simple (lambda (n) (let loop ((i (fx- (string-length n) 1)))
                                      (cond ((fx<? i 0) n)
                                            ((char=? (string-ref n i) #\.) (substring n (fx+ i 1) (string-length n)))
