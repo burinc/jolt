@@ -60,6 +60,65 @@
 
 (def-var! "clojure.core" "make-proxy" jolt-make-proxy)
 
+;; a reify form's class in the class graph: the interfaces it implements by their
+;; full names (a protocol's key is ns/Name, not a class) and IObj
+(set! reify-class-graph-hook
+  (lambda (name ifaces)
+    (jch-register-supers! name (append (map (lambda (i) (if (memv #\. (string->list i)) i (jch-fqn-of-simple i)))
+                                            (filter (lambda (i) (not (memv #\/ (string->list i)))) ifaces))
+                                       '("clojure.lang.IObj")))))
+
+;; The class the JVM generates for a proxy, named as clojure.core/proxy-name
+;; names it: the defining ns ('-' as '_'), "proxy", the superclass, each
+;; interface's simple name in sorted order, and the hex of the hash of the sorted
+;; interface names — so (proxy [Object] []) in user is
+;; user.proxy$java.lang.Object$ff19274a. The super is the first name when it is a
+;; class, else Object with every name an interface. One name per (ns, supers),
+;; memoized; its place in the class graph is the super, the interfaces and IProxy.
+(define proxy-class-names (make-hashtable equal-hash equal?))
+(define proxy-class-names-mu (make-mutex))
+(define (proxy-fqn n) (if (memv #\. (string->list n)) n (jch-fqn-of-simple n)))
+(define (proxy-class-name ns names)
+  (let ((key (cons ns names)))
+    (or (hashtable-ref proxy-class-names key #f)
+        ;; the first name is the superclass when it is a class: one jolt can
+        ;; construct, or one the class graph knows that is no interface (an
+        ;; abstract class such as java.util.AbstractList)
+        (let* ((class? (and (pair? names)
+                            (or (proxy-class-constructible? (car names))
+                                (let ((f (proxy-fqn (car names))))
+                                  (and (not (jch-interface? f)) (pair? (jch-direct-supers f)))))))
+               (super (if class? (proxy-fqn (car names)) "java.lang.Object"))
+               (ifaces (map proxy-fqn (if class? (cdr names) names)))
+               (inames (jolt-invoke (var-deref "clojure.core" "apply") (var-deref "clojure.core" "sorted-set")
+                                    (list->cseq ifaces)))
+               (sorted (seq->list (jolt-seq inames)))
+               (simple (lambda (n) (let loop ((i (fx- (string-length n) 1)))
+                                     (cond ((fx<? i 0) n)
+                                           ((char=? (string-ref n i) #\.) (substring n (fx+ i 1) (string-length n)))
+                                           (else (loop (fx- i 1)))))))
+               (name (apply string-append
+                            (append (list (list->string (map (lambda (c) (if (char=? c #\-) #\_ c)) (string->list ns)))
+                                          ".proxy$" super)
+                                    (map (lambda (n) (string-append "$" (simple n))) sorted)
+                                    (list "$" (jolt-hex32 (jolt-hash inames)))))))
+          (jch-register-supers! name (cons super (append ifaces '("clojure.lang.IProxy"))))
+          (jolt-with-mutex proxy-class-names-mu (hashtable-set! proxy-class-names key name))
+          name))))
+(define (jolt-make-proxy-in ns methods-map ctor-args . proto-names)
+  (let* ((p (apply jolt-make-proxy methods-map ctor-args proto-names))
+         (names (seq->list (jolt-seq (jolt-invoke (var-deref "clojure.core" "map")
+                                                  (lambda (x) (proxy-name->string x))
+                                                  (if (and (pair? proto-names) (null? (cdr proto-names))
+                                                           (not (string? (car proto-names)))
+                                                           (not (symbol-t? (car proto-names)))
+                                                           (jolt-coll-pred? (car proto-names)))
+                                                      (car proto-names)
+                                                      (list->cseq proto-names)))))))
+    (hashtable-set! (car (jreify-methods p)) reify-class-key (proxy-class-name ns names))
+    p))
+(def-var! "jolt.host" "make-proxy-in" jolt-make-proxy-in)
+
 ;; (proxy-super meth args...) inside a proxy body: the base's own implementation,
 ;; bypassing the override that is currently running.
 (def-var! "jolt.host" "proxy-super-call"
@@ -82,11 +141,12 @@
   (lambda (type-sym val)
     (if (proxy-value? val)
         (let ((tname (if (symbol-t? type-sym) (symbol-t-name type-sym) type-sym)))
-          (if (and (string? tname) (reify-declares-class? (jreify-protos val) tname))
+          (if (and (string? tname) (or (reify-declares-class? (jreify-protos val) tname)
+                                       (equal? tname (reify-class-name val))))
               #t
               (if (jolt-truthy? (instance-check type-sym (reify-delegate val))) #t #f)))
         (quote pass))))
-(register-class-arm! proxy-value? (lambda (v) (jolt-class-name (reify-delegate v))))
+(register-class-arm! proxy-value? (lambda (v) (or (reify-class-name v) (jolt-class-name (reify-delegate v)))))
 (let ((prev value-host-tags))
   (set! value-host-tags
     (lambda (obj)

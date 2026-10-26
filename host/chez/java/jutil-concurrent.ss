@@ -1824,3 +1824,156 @@
 (register-class-ctor! "java.util.AbstractMap$SimpleEntry"
   (case-lambda ((k v) (make-jhost "jx-simple-entry" (vector k v)))
                ((e) (let ((kv (hmv-entry-kv e))) (make-jhost "jx-simple-entry" (vector (car kv) (cdr kv)))))))
+;; ======================================================================================
+;; A proxy over java.util's abstract collection classes
+;; ======================================================================================
+;; (proxy [java.util.AbstractList] [] (get [i] …) (size [] …)) extends the class
+;; on the JVM and inherits everything it does not write. jolt has no constructor
+;; for an abstract class, so the proxy is a reify of the class's name, and these
+;; tables (host-static.ss register-abstract-methods!) are the inheritance: each
+;; method runs against the proxy, so its calls back into get / size / iterator /
+;; entrySet reach the proxy's own. coll-defaults.ss holds most of them already;
+;; added here are what the abstract classes write themselves: toString, equality
+;; and hashing by kind, remove(Object), the stubs an abstract method raises, and
+;; AbstractMap's lookups over entrySet.
+(define (abs-by-arity rows)
+  ;; (name argc proc) rows -> (name . proc), the proc choosing by argument count
+  (let ((names (fold-left (lambda (acc r) (if (member (car r) acc) acc (append acc (list (car r))))) '() rows)))
+    (map (lambda (n)
+           (let ((by (filter (lambda (r) (string=? (car r) n)) rows)))
+             (cons n (lambda (self . args)
+                       (let ((r (find (lambda (r) (fx=? (cadr r) (length args))) by)))
+                         (if r (apply (caddr r) self args)
+                             (throw-jvm 'IllegalArgumentException
+                                        (string-append "No matching method " n " found taking "
+                                                       (number->string (length args)) " args"))))))))
+         names)))
+(define (abs-stub name) (list name 0 (lambda (self) (throw-jvm 'UnsupportedOperationException name))))
+(define (abs-elems self) (seq->list (jolt-seq (record-method-dispatch self "iterator" jolt-nil))))
+(define (abs-elem-str self x map?)
+  (cond ((eq? x self) (if map? "(this Map)" "(this Collection)")) ((jolt-nil? x) "null") (else (jolt-str-render-one x))))
+(define (abs-coll-string self)
+  (let loop ((xs (abs-elems self)) (acc '()))
+    (if (null? xs) (string-append "[" (apply string-append (reverse acc)) "]")
+        (loop (cdr xs) (cons (string-append (if (null? acc) "" ", ") (abs-elem-str self (car xs) #f)) acc)))))
+(define (abs-remove-first! self x)
+  (let ((it (record-method-dispatch self "iterator" jolt-nil)))
+    (let loop ()
+      (if (jolt-truthy? (record-method-dispatch it "hasNext" jolt-nil))
+          (if (objects-equals? x (record-method-dispatch it "next" jolt-nil))
+              (begin (record-method-dispatch it "remove" jolt-nil) #t)
+              (loop))
+          #f))))
+;; the persistent collection a proxy equals, by kind
+(define (abs-as-list self) (apply jolt-vector (abs-elems self)))
+(define (abs-as-set self) (apply jolt-hash-set (abs-elems self)))
+(define (abs-map-entries self) (seq->list (jolt-seq (record-method-dispatch self "entrySet" jolt-nil))))
+(define (abs-as-map self)
+  (fold-left (lambda (m e) (jolt-assoc m (jolt-nth e 0) (jolt-nth e 1))) (jolt-hash-map) (abs-map-entries self)))
+(define abs-collection-rows
+  (append cd-collection-defaults
+          (list (abs-stub "iterator") (abs-stub "size")
+                (list "remove" 1 (lambda (self x) (abs-remove-first! self x)))
+                (list "toString" 0 abs-coll-string))))
+(define abs-list-rows
+  (append (filter (lambda (r) (not (and (string=? (car r) "add") (fx=? (cadr r) 1)))) cd-list-defaults)
+          (list (abs-stub "get")
+                (list "add" 1 (lambda (self x) (record-method-dispatch self "add" (list->cseq (list (->num (cd-size self)) x))) #t))
+                (list "add" 2 (lambda (self i x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+                (list "set" 2 (lambda (self i x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+                (list "remove" 1 (lambda (self x)
+                                   (if (and (fixnum? x) (not (jfloat? x)))
+                                       (throw-jvm 'UnsupportedOperationException jolt-nil)
+                                       (abs-remove-first! self x))))
+                (list "equals" 1 (lambda (self o) (or (eq? self o) (jolt=2 (abs-as-list self) o))))
+                (list "hashCode" 0 (lambda (self) (->num (jolt-java-hashcode (abs-as-list self))))))
+          abs-collection-rows))
+(define abs-set-rows
+  (append (list (list "equals" 1 (lambda (self o) (or (eq? self o) (jolt=2 (abs-as-set self) o))))
+                (list "hashCode" 0 (lambda (self) (->num (jolt-java-hashcode (abs-as-set self))))))
+          abs-collection-rows))
+(define abs-map-rows
+  (append
+    (list (abs-stub "entrySet")
+          (list "size" 0 (lambda (self) (->num (length (abs-map-entries self)))))
+          (list "isEmpty" 0 (lambda (self) (null? (abs-map-entries self))))
+          (list "containsKey" 1 (lambda (self k) (and (exists (lambda (e) (objects-equals? k (jolt-nth e 0))) (abs-map-entries self)) #t)))
+          (list "get" 1 (lambda (self k) (let ((e (find (lambda (e) (objects-equals? k (jolt-nth e 0))) (abs-map-entries self))))
+                                         (if e (jolt-nth e 1) jolt-nil))))
+          (list "put" 2 (lambda (self k v) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+          (list "remove" 1 (lambda (self k)
+                             (let ((it (record-method-dispatch (record-method-dispatch self "entrySet" jolt-nil) "iterator" jolt-nil)))
+                               (let loop ()
+                                 (if (jolt-truthy? (record-method-dispatch it "hasNext" jolt-nil))
+                                     (let ((e (record-method-dispatch it "next" jolt-nil)))
+                                       (if (objects-equals? k (jolt-nth e 0))
+                                           (begin (record-method-dispatch it "remove" jolt-nil) (jolt-nth e 1))
+                                           (loop)))
+                                     jolt-nil)))))
+          (list "clear" 0 (lambda (self) (record-method-dispatch (record-method-dispatch self "entrySet" jolt-nil) "clear" jolt-nil) jolt-nil))
+          ;; snapshots of the keys and values (AbstractMap's are live views over entrySet)
+          (list "keySet" 0 (lambda (self) (apply jolt-hash-set (map (lambda (e) (jolt-nth e 0)) (abs-map-entries self)))))
+          (list "values" 0 (lambda (self) (list->cseq (map (lambda (e) (jolt-nth e 1)) (abs-map-entries self)))))
+          (list "equals" 1 (lambda (self o) (or (eq? self o) (jolt=2 (abs-as-map self) o))))
+          (list "hashCode" 0 (lambda (self) (->num (jolt-java-hashcode (abs-as-map self)))))
+          (list "toString" 0 (lambda (self)
+                               (let loop ((es (abs-map-entries self)) (acc '()))
+                                 (if (null? es) (string-append "{" (apply string-append (reverse acc)) "}")
+                                     (loop (cdr es) (cons (string-append (if (null? acc) "" ", ")
+                                                                         (abs-elem-str self (jolt-nth (car es) 0) #t) "="
+                                                                         (abs-elem-str self (jolt-nth (car es) 1) #t))
+                                                          acc)))))))
+    cd-map-defaults))
+(register-abstract-methods! "java.util.AbstractCollection" (abs-by-arity abs-collection-rows))
+(register-abstract-methods! "java.util.AbstractList" (abs-by-arity abs-list-rows))
+(register-abstract-methods! "java.util.AbstractSet" (abs-by-arity abs-set-rows))
+(register-abstract-methods! "java.util.AbstractQueue" (abs-by-arity (append cd-queue-defaults abs-collection-rows)))
+(register-abstract-methods! "java.util.AbstractMap" (abs-by-arity abs-map-rows))
+;; …and such a proxy is that collection to count, seq, get, contains?, =, hash,
+;; str and pr, by the kind its declared class gives (a proxy with a delegate is
+;; the delegate's, jutil-colls.ss). Last in each walk: they are rare.
+(define abs-kind-memo (make-weak-eq-hashtable))
+(define abs-kind-mu (make-mutex))
+(define (abs-proxy-kind x)
+  (and (jreify? x) (not (jreify-delegate x))
+       (let ((ps (jreify-protos x)))
+         (let ((k (hashtable-ref abs-kind-memo ps 'none)))
+           (if (eq? k 'none)
+               (let* ((tags (jreify-host-tags x))
+                      (has? (lambda (c) (and (member c tags) #t)))
+                      (k (and (exists (lambda (t) (hashtable-ref abstract-methods-tbl t #f)) tags)
+                              (cond ((has? "java.util.Map") 'map)
+                                    ((has? "java.util.Set") 'set)
+                                    ((has? "java.util.List") (if (has? "java.util.RandomAccess") 'ralist 'list))
+                                    ((has? "java.util.Collection") 'coll)
+                                    (else #f)))))
+                 (jolt-with-mutex abs-kind-mu (hashtable-set! abs-kind-memo ps k))
+                 k)
+               k)))))
+(define (abs-plain x)
+  (case (abs-proxy-kind x)
+    ((map) (abs-as-map x)) ((set) (abs-as-set x)) ((list ralist) (abs-as-list x)) (else x)))
+(register-count-arm-last! abs-proxy-kind (lambda (x) (jnum->exact (record-method-dispatch x "size" jolt-nil))))
+(register-seq-arm-last! abs-proxy-kind
+  (lambda (x) (if (eq? (abs-proxy-kind x) 'map)
+                  (jolt-seq (record-method-dispatch x "entrySet" jolt-nil))
+                  (jolt-seq (iterator-cursor->seq (record-method-dispatch x "iterator" jolt-nil))))))
+(register-get-arm-last! (lambda (x) (eq? (abs-proxy-kind x) 'map))
+  (lambda (x k d) (if (jolt-truthy? (record-method-dispatch x "containsKey" (list->cseq (list k))))
+                      (record-method-dispatch x "get" (list->cseq (list k))) d)))
+(register-contains-arm-last! (lambda (x) (memq (abs-proxy-kind x) '(map set)))
+  (lambda (x k) (jolt-truthy? (record-method-dispatch x (if (eq? (abs-proxy-kind x) 'map) "containsKey" "contains")
+                                                      (list->cseq (list k))))))
+(define (abs-equiv-kind x) (let ((k (abs-proxy-kind x))) (and k (not (eq? k 'coll)) k)))
+(register-eq-arm-last! (lambda (a b) (or (abs-equiv-kind a) (abs-equiv-kind b)))
+  (lambda (a b) (jolt=2 (abs-plain a) (abs-plain b))))
+(register-hash-arm-last! abs-equiv-kind (lambda (x) (jnum->exact (record-method-dispatch x "hashCode" jolt-nil))))
+(register-str-render! abs-proxy-kind (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
+;; print-method's java.util arms: a List as (…), a RandomAccess one as […], a Set
+;; as #{…}, a Map as {…}; any other Collection as #object
+(register-pr-readable-arm! abs-equiv-kind
+  (lambda (x) (if (jolt-pr-readable?)
+                  (jolt-pr-readable (case (abs-proxy-kind x)
+                                      ((list) (list->cseq (abs-elems x)))
+                                      (else (abs-plain x))))
+                  (jolt-object-repr x #f))))

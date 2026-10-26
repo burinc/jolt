@@ -1203,7 +1203,11 @@
      (if nargs
          (jrec-method-arity v method nargs)
          (jrec-method v method)))
-    ((jreify? v) (reify-method-ref v method))
+    ((jreify? v)
+     (or (reify-method-ref v method)
+         (and abstract-class-method-hook
+              (string=? method "iterator")
+              (abstract-class-method-hook v method))))
     (else #f)))
 
 (define (jrec-field-count coll)
@@ -3581,7 +3585,15 @@
   jreify?
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
-      (if m (jolt-invoke m coll k d) d))))
+      (cond
+        (m (jolt-invoke m coll k d))
+        ((and abstract-class-method-hook
+              (abstract-class-method-hook coll "containsKey")) =>
+         (lambda (ck)
+           (if (jolt-truthy? (ck coll k))
+               (record-method-dispatch coll "get" (list->cseq (list k)))
+               d)))
+        (else d)))))
 
 (define (reify-proto-names proto-names)
   (intern-reify-protos
@@ -3627,10 +3639,27 @@
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
+        (when (fx>? (jolt-count shape) 2)
+          (reify-name-class! slots (jolt-nth shape 2) (cdr layout)))
         (jolt-with-mutex
           reify-shape-mu
           (hashtable-set! reify-shape-memo shape layout))
         layout)))
+
+(define reify-class-key " class")
+
+(define (reify-class-name x)
+  (and (jreify? x)
+       (hashtable-ref
+         (car (jreify-methods x))
+         reify-class-key
+         #f)))
+
+(define reify-class-graph-hook (lambda (name ifaces) #f))
+
+(define (reify-name-class! slots name ifaces)
+  (hashtable-set! slots reify-class-key name)
+  (reify-class-graph-hook name ifaces))
 
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))

@@ -1240,7 +1240,14 @@
 (register-get-arm! jreify?
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
-      (if m (jolt-invoke m coll k d) d))))
+      (cond (m (jolt-invoke m coll k d))
+            ;; a java.util.Map by an abstract class it declares (a proxy over
+            ;; AbstractMap): RT.get reads it through Map.get
+            ((and abstract-class-method-hook (abstract-class-method-hook coll "containsKey"))
+             => (lambda (ck) (if (jolt-truthy? (ck coll k))
+                                 (record-method-dispatch coll "get" (list->cseq (list k)))
+                                 d)))
+            (else d)))))
 (define (reify-proto-names proto-names)
   (intern-reify-protos
    (map (lambda (p) (if (symbol-t? p) (symbol-t-name p) p))
@@ -1275,8 +1282,24 @@
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
+        ;; a site compiled with its class name (the macro's third element) keeps
+        ;; it in the slot table every instance shares; code compiled before that
+        ;; reports the shared placeholder
+        (when (fx>? (jolt-count shape) 2)
+          (reify-name-class! slots (jolt-nth shape 2) (cdr layout)))
         (jolt-with-mutex reify-shape-mu (hashtable-set! reify-shape-memo shape layout))
         layout)))
+;; The generated class's name, kept in its slot table under a key no method
+;; name can be, and its place in the class graph: what the reify implements.
+(define reify-class-key " class")
+(define (reify-class-name x)
+  (and (jreify? x) (hashtable-ref (car (jreify-methods x)) reify-class-key #f)))
+;; Placing the class in the class graph is the host's (the Chez half installs it
+;; with the graph, proxy.ss); a host without one keeps just the name.
+(define reify-class-graph-hook (lambda (name ifaces) #f))
+(define (reify-name-class! slots name ifaces)
+  (hashtable-set! slots reify-class-key name)
+  (reify-class-graph-hook name ifaces))
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))
     (make-jreify (cons (car layout) (list->vector fns)) (cdr layout) #f)))

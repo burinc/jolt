@@ -63,7 +63,7 @@
              (empty-list-t? x) (jolt-lazyseq? x))
          (jolt-class-base x))
         ((jrec? x) (jrec-tag x))
-        ((and (jreify? x) (not (jreify-delegate x))) "clojure.lang.IObj$reify__0")
+        ((and (jreify? x) (not (jreify-delegate x))) (or (reify-class-name x) "clojure.lang.IObj$reify__0"))
         (else #f)))
 (define (class-fast-probes)
   (append (list jolt-nil #t #f 0 1.5 (expt 2 70) 1/3 "s" #\a
