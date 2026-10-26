@@ -205,9 +205,9 @@
 (define (proxy-equiv-kind x)
   (let ((k (proxy-coll-kind x))) (and k (not (eq? k 'coll)) k)))
 (define (proxy-plain x) (if (proxy-equiv-kind x) (jreify-delegate x) x))
-(register-eq-arm! (lambda (a b) (or (proxy-equiv-kind a) (proxy-equiv-kind b)))
+(register-eq-arm-last! (lambda (a b) (or (proxy-equiv-kind a) (proxy-equiv-kind b)))
   (lambda (a b) (jutil-equals? (proxy-plain a) (proxy-plain b))))
-(register-hash-arm! proxy-equiv-kind
+(register-hash-arm-last! proxy-equiv-kind
   (lambda (x) (jnum->exact (proxy-call x "hashCode"))))
 (register-str-render! proxy-coll-kind (lambda (x) (proxy-call x "toString")))
 (register-pr-readable-arm! proxy-equiv-kind

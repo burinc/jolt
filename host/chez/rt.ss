@@ -2709,11 +2709,15 @@
          ;; registry to reach them. One that declares either (user code, which may
          ;; do anything), and an enum constant (its name), go through the registry.
          (content (if (and hex (jrec? x) (not (enum-constant? x))
-                           (not (find-protocol-method (jrec-tag x) "Object" "toString"))
-                           (not (find-protocol-method (jrec-tag x) "Object" "hashCode")))
+                           ;; under whatever name it was declared: Object or java.lang.Object
+                           (not (find-method-any-protocol (jrec-tag x) "toString"))
+                           (not (find-method-any-protocol (jrec-tag x) "hashCode")))
                       (string-append cls "@" hex)
                       (guard (e (#t #f)) (jolt-object-content x))))
-         (head (and hex (string-append "#object[" cls " 0x" hex))))
+         ;; an array's class name is quoted, as Clojure's print-method writes it
+         (array? (and hex (fx>? (string-length cls) 0) (char=? (string-ref cls 0) #\[)))
+         (content (if (and array? (not (string? content))) (string-append cls "@" hex) content))
+         (head (and hex (string-append "#object[" (if array? (string-append "\"" cls "\"") cls) " 0x" hex))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))

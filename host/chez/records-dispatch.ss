@@ -1511,7 +1511,7 @@
 ;; used to be the record's print form with the # dropped.
 (register-str-render! jrec?
   (lambda (v)
-    (let ((f (find-protocol-method (jrec-tag v) "Object" "toString")))
+    (let ((f (find-method-any-protocol (jrec-tag v) "toString")))
       (if f
           (jolt-invoke f v)
           (string-append (jolt-class-name v) "@" (jolt-hex32 (jolt-java-hashcode v)))))))

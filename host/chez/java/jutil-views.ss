@@ -245,13 +245,21 @@
            (map? (eq? kind 'map)) (set? (memq kind '(set entries))))
       (jx-class! ut ucls)
       (register-host-methods! ut (map (lambda (m) (cons (car m) (jx-unmod-method family (car m) (cdr m)))) methods))
-      (jx-register! ut kind (if (eq? family 'entryset) jxw-entry-elems jxw-elems) jxw-count (and (or map? set?) jxw-contains) (and map? jxw-get))
+      ;; a map's entries, and an entry set's, are UnmodifiableEntry wrappers
+      ;; wherever they are handed out — seq, reduce, into — not only through
+      ;; the iterator
+      (jx-register! ut kind (if (or map? (eq? family 'entryset)) jxw-entry-elems jxw-elems) jxw-count (and (or map? set?) jxw-contains) (and map? jxw-get))
       (when st
         (jx-class! st (string-append "java.util." (list-ref fam 6)))
         (register-host-methods! st (map (lambda (m) (cons (car m) (jx-sync-method family (car m) (cdr m)))) methods))
         (jx-register! st kind jxw-sync-elems jxw-sync-count (and (or map? set?) jxw-sync-contains)
                       (and map? jxw-sync-get)))))
   jx-families)
+;; the unmodifiable entry set's toArray and forEach hand out wrapped entries too
+(register-host-methods! "jx-unmod-entryset"
+  (list (cons "toArray" (case-lambda ((self) (cd-to-array (jxw-entry-elems self) '()))
+                                     ((self a) (cd-to-array (jxw-entry-elems self) (list a)))))
+        (cons "forEach" (lambda (self f) (for-each (lambda (e) (jolt-fi-call f "accept" e)) (jxw-entry-elems self)) jolt-nil))))
 (for-each (lambda (r) (jch-register-supers! (string-append "java.util." (car r))
                                             (map (lambda (s) (if (string=? s "java.io.Serializable") s
                                                                  (if (char=? (string-ref s 0) #\C) (string-append "java.util." s) s)))
@@ -314,7 +322,7 @@
 (define (jx-unmod-iter-rest it)
   (let loop ((acc '()))
     (if (jolt-truthy? (jx-call it "hasNext" '())) (loop (cons (jx-call it "next" '()) acc)) (reverse acc))))
-(register-seq-arm! (lambda (x) (and (jhost? x) (member (jhost-tag x) '("jx-unmod-iter" "jx-unmod-entry-iter" "jx-unmod-listiter")) #t))
+(register-seq-arm-last! (lambda (x) (and (jhost? x) (member (jhost-tag x) '("jx-unmod-iter" "jx-unmod-entry-iter" "jx-unmod-listiter")) #t))
   (lambda (x) (let ((xs (jx-unmod-iter-rest (jx-it x))))
                 (if (null? xs) jolt-nil
                     (list->cseq (if (string=? (jhost-tag x) "jx-unmod-entry-iter") (map jx-unmod-entry xs) xs))))))
@@ -381,8 +389,13 @@
 (define (jxl-ref l i)
   (let ((i (jnum->exact i)) (v (jxl-vec l)))
     (unless (and (fx>=? i 0) (fx<? i (vector-length v)))
-      (throw-jvm 'IndexOutOfBoundsException
-                 (string-append "Index " (number->string i) " out of bounds for length " (number->string (vector-length v)))))
+      ;; each class fails its own way: ListN indexes its array, List12 checks by
+      ;; hand, the SubList through Objects.checkIndex
+      (let ((n (number->string (vector-length v))) (is (number->string i)))
+        (case (string->symbol (jhost-tag l))
+          ((jx-listn) (throw-jvm 'ArrayIndexOutOfBoundsException (string-append "Index " is " out of bounds for length " n)))
+          ((jx-list12) (throw-jvm 'IndexOutOfBoundsException (string-append "Index: " is " Size: " n)))
+          (else (throw-jvm 'IndexOutOfBoundsException (string-append "Index " is " out of bounds for length " n))))))
     (vector-ref v i)))
 (define (jx-index-of xs x)
   (when (jolt-nil? x) (jx-npe))
@@ -418,7 +431,8 @@
       (cons "getFirst" (lambda (self) (if (fx=? 0 (vector-length (jxl-vec self))) (throw-jvm 'NoSuchElementException jolt-nil) (vector-ref (jxl-vec self) 0))))
       (cons "getLast" (lambda (self) (let ((n (vector-length (jxl-vec self))))
                                        (if (fx=? 0 n) (throw-jvm 'NoSuchElementException jolt-nil) (vector-ref (jxl-vec self) (fx- n 1))))))
-      (cons "reversed" (lambda (self) (make-jhost "jx-imm-sublist" (vector (list->vector (reverse (jxl-list self))))))))))
+      ;; List.reversed: ReverseOrderListView over it, whose writes the list refuses
+      (cons "reversed" (lambda (self) (make-jhost "jx-reverse-list" (vector self)))))))
 (for-each (lambda (p)
             (jx-class! (car p) (cdr p))
             (register-host-methods! (car p) jx-imm-list-methods)
@@ -460,7 +474,7 @@
                                          (loop))))
                                    jolt-nil))))
 (define (jx-iter-from-list tag xs) (make-jhost tag (vector (list->vector xs) 0)))
-(register-seq-arm! (lambda (x) (and (jhost? x) (member (jhost-tag x) jx-imm-iter-tags) #t))
+(register-seq-arm-last! (lambda (x) (and (jhost? x) (member (jhost-tag x) jx-imm-iter-tags) #t))
   (lambda (it) (let ((rest (list-tail (vector->list (jxi-v it)) (jxi-i it))))
                  (if (null? rest) jolt-nil (list->cseq rest)))))
 ;; sets and maps iterate the same way, read-only, each its JDK iterator class
@@ -507,7 +521,8 @@
             (jx-class! (car p) (cdr p) '("java.util.ImmutableCollections$AbstractImmutableSet" "java.io.Serializable"))
             (register-host-methods! (car p) jx-imm-set-methods)
             (jx-register! (car p) 'set jxs-list (lambda (s) (vector-length (jxs-vec s)))
-                          (lambda (s x) (and (not (jolt-nil? x)) (jxs-has? s x))) #f))
+                          ;; contains? / get of nil is the JDK's NullPointerException
+                          (lambda (s x) (jxs-has? s x)) #f))
           '(("jx-setn" . "java.util.ImmutableCollections$SetN") ("jx-set12" . "java.util.ImmutableCollections$Set12")))
 (jch-register-supers! "java.util.ImmutableCollections$AbstractImmutableSet"
                       '("java.util.ImmutableCollections$AbstractImmutableCollection" "java.util.Set"))
@@ -562,8 +577,8 @@
             (jx-class! (car p) (cdr p) '("java.util.ImmutableCollections$AbstractImmutableMap" "java.io.Serializable"))
             (register-host-methods! (car p) jx-imm-map-methods)
             (jx-register! (car p) 'map jxm-entries (lambda (m) (vector-length (vector-ref (jhost-state m) 0)))
-                          (lambda (m k) (and (not (jolt-nil? k)) (not (eq? (jxm-ref m k) cd-absent))))
-                          (lambda (m k d) (if (jolt-nil? k) d (let ((v (jxm-ref m k))) (if (eq? v cd-absent) d v))))))
+                          (lambda (m k) (not (eq? (jxm-ref m k) cd-absent)))
+                          (lambda (m k d) (let ((v (jxm-ref m k))) (if (eq? v cd-absent) d v)))))
           '(("jx-mapn" . "java.util.ImmutableCollections$MapN") ("jx-map1" . "java.util.ImmutableCollections$Map1")))
 (jch-register-supers! "java.util.ImmutableCollections$AbstractImmutableMap" '("java.util.AbstractMap"))
 ;; the three views over an immutable map: AbstractMap's key set and values, and

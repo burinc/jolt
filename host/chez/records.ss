@@ -761,16 +761,20 @@
   (if (jolt-print-hash?)
       "#"
       (with-deeper-print
-        (if (eq? shape 'map)
+        (if (memq shape '(map jmap))
             ;; a map's seq yields entries; render each as "k v" and comma-join, in
             ;; the order the type's own seq produced them (the JVM prints an
-            ;; insertion-ordered map-like deftype in that order too).
+            ;; insertion-ordered map-like deftype in that order too). A
+            ;; java.util.Map that is not a Clojure map is seq'd through its
+            ;; entrySet, as RT.seq does.
             (string-append "{"
               (jolt-str-join-comma
                 (jolt-limited-list-strs
                   (map (lambda (e) (string-append (jolt-pr-readable (jolt-nth e 0)) " "
                                                   (jolt-pr-readable (jolt-nth e 1))))
-                       (seq->list r))))
+                       (if (eq? shape 'jmap)
+                           (seq->list (jolt-seq (record-method-dispatch r "entrySet" jolt-nil)))
+                           (seq->list r)))))
               "}")
             (let ((body (jolt-str-join (jolt-limited-seq-strs (jolt-seq r) jolt-pr-readable))))
               (case shape

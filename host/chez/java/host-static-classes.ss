@@ -797,7 +797,9 @@
         (cons "values" (lambda (self) (apply jolt-vector
                           (map (lambda (k) (hashtable-ref (hm-tbl self) k jolt-nil))
                                (hm-keys-ordered self)))))
-        (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))))
+        ;; a snapshot of the entries (jolt-5u4jz: the JDK's is a live view); never
+        ;; nil, which an empty map's seq would be
+        (cons "entrySet" (lambda (self) (let ((s (jolt-seq (hm->pmap self)))) (if (jolt-nil? s) jolt-empty-list s))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and

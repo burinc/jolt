@@ -65,18 +65,26 @@
 ;; the vector's own monitor, as Vector's methods are synchronized on it
 (define (jx-own-monitor! h i) (vector-set! (jhost-state h) i (object-monitor h)) h)
 (define (vec-list v) (jolt-call-with-monitor (vec-mu v) (lambda () (al->list (vec-al v)))))
-(define (make-jx-vector tag xs cap incr) (jx-own-monitor! (make-jhost tag (vector (make-arraylist xs) #f cap incr)) 1))
+;; slot 4 is modCount: every structural change bumps it, and an iterator that
+;; sees it move throws ConcurrentModificationException, as Vector$Itr does
+(define (make-jx-vector tag xs cap incr) (jx-own-monitor! (make-jhost tag (vector (make-arraylist xs) #f cap incr 0)) 1))
+(define (vec-mod v) (vector-ref (jhost-state v) 4))
+(define (vec-mod! v) (vector-set! (jhost-state v) 4 (fx+ 1 (vec-mod v))))
+(define vec-structural '("add" "addAll" "remove" "clear" "removeAll" "retainAll" "removeIf" "replaceAll" "sort"
+                         "removeFirst" "removeLast"))
 (define (vec-grow! v min)
   (let ((old (vec-cap v)))
     (when (> min old)
       (vec-cap! v (+ old (max (- min old) (if (> (vec-incr v) 0) (vec-incr v) old)))))))
-(define (vec-call v m . args) (jx-call (vec-al v) m args))
+(define (vec-call v m . args)
+  (when (member m vec-structural) (vec-mod! v))
+  (jx-call (vec-al v) m args))
 (define-syntax with-vec
   (syntax-rules () ((_ v e ...) (jolt-call-with-monitor (vec-mu v) (lambda () e ...)))))
 ;; the ArrayList members a Vector answers as they are, under its lock
 (define vec-plain
-  '(("size" 0) ("isEmpty" 0) ("contains" 1) ("indexOf" 1) ("lastIndexOf" 1) ("toArray" 0 1) ("get" 1)
-    ("set" 2) ("remove" 1) ("clear" 0) ("containsAll" 1) ("removeAll" 1) ("retainAll" 1) ("removeIf" 1)
+  '(("size" 0) ("isEmpty" 0) ("contains" 1) ("indexOf" 1) ("lastIndexOf" 1) ("toArray" 0 1)
+    ("clear" 0) ("containsAll" 1) ("removeAll" 1) ("retainAll" 1) ("removeIf" 1)
     ("forEach" 1) ("replaceAll" 1) ("sort" 1) ("getFirst" 0) ("getLast" 0) ("removeFirst" 0) ("removeLast" 0)))
 (define (vec-index-from xs x from step)
   ;; indexOf(o, index) / lastIndexOf(o, index): from INDEX in direction STEP
@@ -85,13 +93,17 @@
       (cond ((or (fx<? i 0) (fx>=? i (vector-length v))) -1)
             ((objects-equals? x (vector-ref v i)) i)
             (else (loop (fx+ i step)))))))
+(define (vec-index! v i)
+  (cond ((fx>=? i (vec-size v)) (throw-jvm 'ArrayIndexOutOfBoundsException (string-append "Array index out of range: " (number->string i))))
+        ((fx<? i 0) (throw-jvm 'ArrayIndexOutOfBoundsException
+                               (string-append "Index " (number->string i) " out of bounds for length " (number->string (vec-cap v)))))))
 (define (vec-enumeration v) (make-jhost "jx-vector-enum" (vector v 0)))
 (define vector-methods
   (append
     (map (lambda (m)
            (cons (car m)
                  (host-arity-of (cdr m) #t
-                   (lambda (self . args) (with-vec self (jx-call (vec-al self) (car m) args))))))
+                   (lambda (self . args) (with-vec self (apply vec-call self (car m) args))))))
          vec-plain)
     (list
       (cons "add" (case-lambda
@@ -122,6 +134,18 @@
                                     (vec-grow! self (fx+ 1 (vec-size self)))
                                     (vec-call self "add" (->num i) x)
                                     jolt-nil))))
+      ;; get / set / remove(int) check the index themselves: past the end is
+      ;; Vector's "Array index out of range", a negative one the array's own
+      (cons "get" (lambda (self i) (with-vec self (let ((i (jnum->exact i))) (vec-index! self i) (al-ref (vec-al self) i)))))
+      (cons "set" (lambda (self i x) (with-vec self (let ((i (jnum->exact i))) (vec-index! self i)
+                                                      (let ((old (al-ref (vec-al self) i))) (al-set! (vec-al self) i x) old)))))
+      (cons "remove" (lambda (self x)
+                       (with-vec self
+                         (if (and (fixnum? x) (not (jfloat? x)))
+                             (begin (vec-index! self x) (vec-mod! self)
+                                    (let ((old (al-ref (vec-al self) x))) (al-remove-at! (vec-al self) x) old))
+                             (let ((i (vec-index-from (al->list (vec-al self)) x 0 1)))
+                               (if (fx<? i 0) #f (begin (vec-mod! self) (al-remove-at! (vec-al self) i) #t)))))))
       (cons "elementAt" (lambda (self i)
                           (with-vec self
                             (let ((i (jnum->exact i)))
@@ -147,11 +171,11 @@
                                            (throw-jvm 'ArrayIndexOutOfBoundsException
                                                       (string-append (number->string i) " >= " (number->string (vec-size self)))))
                                           ((fx<? i 0) (throw-jvm 'ArrayIndexOutOfBoundsException (number->string i))))
-                                    (al-remove-at! (vec-al self) i) jolt-nil))))
+                                    (vec-mod! self) (al-remove-at! (vec-al self) i) jolt-nil))))
       (cons "removeElement" (lambda (self x)
                               (with-vec self
                                 (let ((i (vec-index-from (al->list (vec-al self)) x 0 1)))
-                                  (if (fx<? i 0) #f (begin (al-remove-at! (vec-al self) i) #t))))))
+                                  (if (fx<? i 0) #f (begin (vec-mod! self) (al-remove-at! (vec-al self) i) #t))))))
       (cons "removeAllElements" (lambda (self) (with-vec self (vec-call self "clear")) jolt-nil))
       (cons "indexOf" (case-lambda
                         ((self x) (with-vec self (->num (vec-index-from (al->list (vec-al self)) x 0 1))))
@@ -173,6 +197,7 @@
                           (let ((n (jnum->exact n)))
                             (when (fx<? n 0) (throw-jvm 'ArrayIndexOutOfBoundsException (number->string n)))
                             (vec-grow! self n)
+                            (vec-mod! self)
                             (let loop () (when (fx>? (vec-size self) n) (al-remove-at! (vec-al self) (fx- (vec-size self) 1)) (loop)))
                             (let loop () (when (fx<? (vec-size self) n) (al-push! (vec-al self) jolt-nil) (loop)))
                             jolt-nil))))
@@ -188,7 +213,7 @@
                                (ja-set! arr i (car xs)) (loop (cdr xs) (fx+ i 1))))
                            jolt-nil)))
       (cons "elements" (lambda (self) (vec-enumeration self)))
-      (cons "iterator" (lambda (self) (with-vec self (make-jhost "jx-vector-itr" (vector self (vec-call self "iterator"))))))
+      (cons "iterator" (lambda (self) (with-vec self (make-jhost "jx-vector-itr" (vector self 0 -1 (vec-mod self))))))
       (cons "listIterator" (case-lambda
                              ((self) (make-cd-list-iterator self 0))
                              ((self i) (let ((i (jnum->exact i)))
@@ -207,7 +232,7 @@
                   (with-vec self
                     (when (fx=? 0 (vec-size self)) (throw-jvm 'EmptyStackException jolt-nil))
                     (let ((x (al-ref (vec-al self) (fx- (vec-size self) 1))))
-                      (al-remove-at! (vec-al self) (fx- (vec-size self) 1)) x))))
+                      (vec-mod! self) (al-remove-at! (vec-al self) (fx- (vec-size self) 1)) x))))
     (cons "peek" (lambda (self)
                    (with-vec self
                      (when (fx=? 0 (vec-size self)) (throw-jvm 'EmptyStackException jolt-nil))
@@ -238,18 +263,44 @@
 (register-class-ctor! "Vector" (lookup-class class-ctors-tbl "java.util.Vector"))
 (register-class-ctor! "java.util.Stack" (lambda () (make-jx-vector "jx-stack" '() 10 0)))
 (register-class-ctor! "Stack" (lookup-class class-ctors-tbl "java.util.Stack"))
-;; Vector$Itr: the ArrayList iterator over the same elements, each step under
-;; the vector's lock; remove takes the last element it returned.
+;; Vector$Itr, as the JDK writes it: a cursor, the last index handed out, and the
+;; modCount it expects, each step under the vector's monitor.
+;; State #(vector cursor last-returned expected-modcount)
 (define (vit-vec it) (vector-ref (jhost-state it) 0))
-(define (vit-inner it) (vector-ref (jhost-state it) 1))
+(define (vit-ref it i) (vector-ref (jhost-state it) i))
+(define (vit-set! it i x) (vector-set! (jhost-state it) i x))
+(define (vit-comod! it) (unless (fx=? (vit-ref it 3) (vec-mod (vit-vec it))) (throw-jvm 'ConcurrentModificationException jolt-nil)))
+(define (vit-next! it)
+  (let ((v (vit-vec it)))
+    (with-vec v
+      (vit-comod! it)
+      (let ((i (vit-ref it 1)))
+        (unless (fx<? i (vec-size v)) (throw-jvm 'NoSuchElementException jolt-nil))
+        (vit-set! it 1 (fx+ i 1))
+        (vit-set! it 2 i)
+        (al-ref (vec-al v) i)))))
 (jx-class! "jx-vector-itr" "java.util.Vector$Itr" '("java.util.Iterator"))
 (register-host-methods! "jx-vector-itr"
-  (map (lambda (m)
-         (cons (car m) (host-arity-of (list (cdr m)) #t
-                         (lambda (self . args) (with-vec (vit-vec self) (jx-call (vit-inner self) (car m) args))))))
-       '(("hasNext" . 0) ("next" . 0) ("remove" . 0) ("forEachRemaining" . 1))))
+  (list (cons "hasNext" (lambda (self) (not (fx=? (vit-ref self 1) (vec-size (vit-vec self))))))
+        (cons "next" (lambda (self) (vit-next! self)))
+        (cons "remove" (lambda (self)
+                         (when (fx=? -1 (vit-ref self 2)) (throw-jvm 'IllegalStateException jolt-nil))
+                         (let ((v (vit-vec self)))
+                           (with-vec v
+                             (vit-comod! self)
+                             (vec-mod! v)
+                             (al-remove-at! (vec-al v) (vit-ref self 2))
+                             (vit-set! self 3 (vec-mod v))
+                             (vit-set! self 1 (vit-ref self 2))
+                             (vit-set! self 2 -1)))
+                         jolt-nil))
+        (cons "forEachRemaining" (lambda (self f)
+                                   (let loop () (when (fx<? (vit-ref self 1) (vec-size (vit-vec self)))
+                                                  (jolt-fi-call f "accept" (vit-next! self)) (loop)))
+                                   jolt-nil))))
 (register-seq-arm-last! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "jx-vector-itr")))
-  (lambda (it) (jolt-seq (vit-inner it))))
+  (lambda (it) (let ((xs (list-tail (vec-list (vit-vec it)) (fxmin (vit-ref it 1) (vec-size (vit-vec it))))))
+                 (if (null? xs) jolt-nil (list->cseq xs)))))
 ;; elements(): Vector$1, an Enumeration over the live vector
 (jx-class! "jx-vector-enum" "java.util.Vector$1" '("java.util.Enumeration"))
 (register-host-methods! "jx-vector-enum"
@@ -395,7 +446,8 @@
     (cons "put" (lambda (self k v) (with-ht self (ht-put! self k v))))
     (cons "remove" (case-lambda
                      ((self k) (with-ht self (let ((v (ht-remove! self k))) (if (eq? v cd-absent) jolt-nil v))))
-                     ((self k v) (with-ht self
+                     ((self k v) (jxc-npe-if-nil! v)
+                                 (with-ht self
                                    (let ((cur (ht-ref self k)))
                                      (if (and (not (eq? cur cd-absent)) (objects-equals? cur v))
                                          (begin (ht-remove! self k) #t) #f))))))
@@ -425,10 +477,10 @@
                           (jxc-npe-if-nil! v)
                           (with-ht self (let ((cur (ht-ref self k))) (if (eq? cur cd-absent) (ht-put! self k v) cur)))))
     (cons "replace" (case-lambda
-                      ((self k v) (jxc-npe-if-nil! v)
+                      ((self k v) (jxc-npe-if-nil! k v)
                                   (with-ht self (let ((e (ht-find self k)))
                                                   (if e (let ((old (he-val e))) (vector-set! e 2 v) old) jolt-nil))))
-                      ((self k old v) (jxc-npe-if-nil! old v)
+                      ((self k old v) (jxc-npe-if-nil! k old v)
                                       (with-ht self (let ((e (ht-find self k)))
                                                       (if (and e (objects-equals? (he-val e) old))
                                                           (begin (vector-set! e 2 v) #t) #f))))))
@@ -464,8 +516,10 @@
                             (begin (ht-remove! self k) jolt-nil)
                             (begin (ht-put! self k nv) nv))))))
     (cons "forEach" (lambda (self f)
-                      (for-each (lambda (e) (jolt-fi-call f "accept" (he-key e) (he-val e)))
-                                (with-ht self (ht-entry-list self)))
+                      (with-ht self
+                        (let ((m (ht-mod self)))
+                          (for-each (lambda (e) (jolt-fi-call f "accept" (he-key e) (he-val e))) (ht-entry-list self))
+                          (unless (fx=? m (ht-mod self)) (throw-jvm 'ConcurrentModificationException jolt-nil))))
                       jolt-nil))
     (cons "replaceAll" (lambda (self f)
                          (with-ht self
@@ -479,8 +533,9 @@
 (jch-register-supers! "java.util.Dictionary" '())
 (register-host-methods! "jx-hashtable" hashtable-methods)
 (jx-register! "jx-hashtable" 'map ht-pairs (lambda (h) (with-ht h (ht-count h)))
-              (lambda (h k) (and (not (jolt-nil? k)) (with-ht h (not (eq? (ht-ref h k) cd-absent)))))
-              (lambda (h k d) (if (jolt-nil? k) d (with-ht h (let ((v (ht-ref h k))) (if (eq? v cd-absent) d v))))))
+              ;; ht-ref refuses a nil key: (get ht nil) is NullPointerException, as Map.get is
+              (lambda (h k) (with-ht h (not (eq? (ht-ref h k) cd-absent))))
+              (lambda (h k d) (with-ht h (let ((v (ht-ref h k))) (if (eq? v cd-absent) d v)))))
 (define (ht-ctor . args)
   (cond ((null? args) (make-jx-hashtable 11 0.75))
         ((and (number? (car args)) (null? (cdr args)))
@@ -490,7 +545,7 @@
         ((number? (car args))
          (let ((c (jnum->exact (car args))) (lf (inexact (cadr args))))
            (when (< c 0) (throw-jvm 'IllegalArgumentException (string-append "Illegal Capacity: " (number->string c))))
-           (when (or (<= lf 0) (nan? lf)) (throw-jvm 'IllegalArgumentException (string-append "Illegal Load: " (jolt-str-render-one (cadr args)))))
+           (when (or (<= lf 0) (nan? lf)) (throw-jvm 'IllegalArgumentException (string-append "Illegal Load: " (jolt-str-render-one (inexact (cadr args))))))
            (make-jx-hashtable c lf)))
         (else
          (let* ((es (jxc-elems (car args)))
@@ -512,13 +567,22 @@
 ;; Iterator of the three views. It walks a snapshot of the chain nodes; remove
 ;; takes the last one it returned out of the table, by key. State
 ;; #(table remaining last kind iterator?) with kind key / value / entry.
+;; slot 5: the modCount an Iterator (not an Enumeration) expects, as the JDK's
+;; Enumerator checks it only when it is one
+(define (ht-mod h) (vector-ref (jhost-state h) 5))
 (define (make-ht-enumerator h kind . iter?)
-  (make-jhost "jx-hashtable-enumerator"
-              (vector h (with-ht h (ht-entry-list h)) #f kind (and (pair? iter?) (car iter?)))))
+  (with-ht h
+    (make-jhost "jx-hashtable-enumerator"
+                (vector h (ht-entry-list h) #f kind (and (pair? iter?) (car iter?)) (ht-mod h)))))
+(define (hten-comod! it)
+  (let ((st (jhost-state it)))
+    (when (and (vector-ref st 4) (not (fx=? (vector-ref st 5) (ht-mod (vector-ref st 0)))))
+      (throw-jvm 'ConcurrentModificationException jolt-nil))))
 (define (hten-project it e)
   (case (vector-ref (jhost-state it) 3)
     ((key) (he-key e)) ((value) (he-val e)) (else (ht-live-entry (vector-ref (jhost-state it) 0) e))))
 (define (hten-next! it)
+  (hten-comod! it)
   (let* ((st (jhost-state it)) (es (vector-ref st 1)))
     (when (null? es) (throw-jvm 'NoSuchElementException "Hashtable Enumerator"))
     (vector-set! st 1 (cdr es))
@@ -535,7 +599,9 @@
                          (let* ((st (jhost-state self)) (e (vector-ref st 2)))
                            (unless (vector-ref st 4) (throw-jvm 'UnsupportedOperationException jolt-nil))
                            (unless e (throw-jvm 'IllegalStateException "Hashtable Enumerator"))
-                           (with-ht (vector-ref st 0) (ht-remove! (vector-ref st 0) (he-key e)))
+                           (hten-comod! self)
+                           (with-ht (vector-ref st 0) (ht-remove! (vector-ref st 0) (he-key e))
+                             (vector-set! st 5 (ht-mod (vector-ref st 0))))
                            (vector-set! st 2 #f)
                            jolt-nil)))
         (cons "forEachRemaining" (lambda (self f)
@@ -749,9 +815,9 @@
 (register-class-ctor! "BitSet" (lookup-class class-ctors-tbl "java.util.BitSet"))
 ;; = and hash are BitSet.equals / hashCode: a BitSet is a value on the JVM
 (define (jx-bitset? x) (and (jhost? x) (string=? (jhost-tag x) "jx-bitset")))
-(register-eq-arm! (lambda (a b) (or (jx-bitset? a) (jx-bitset? b)))
+(register-eq-arm-last! (lambda (a b) (or (jx-bitset? a) (jx-bitset? b)))
   (lambda (a b) (and (jx-bitset? a) (jx-bitset? b) (= (bs-bits a) (bs-bits b)))))
-(register-hash-arm! jx-bitset? bs-hash)
+(register-hash-arm-last! jx-bitset? bs-hash)
 (define (bs-from-words ws) ; valueOf: the words as given, trailing zero words dropped
   (let* ((ws (let loop ((ws (reverse ws))) (if (and (pair? ws) (zero? (car ws))) (loop (cdr ws)) (reverse ws))))
          (n (let loop ((ws ws) (i 0) (n 0))
@@ -1036,12 +1102,18 @@
 (define (cl-remove-occurrence! q x forward?)
   (with-cl q (let ((n (cl-find q x forward?))) (if n (begin (cl-unlink! n) #t) #f))))
 (define (cl-bulk-remove! q doomed?)
-  ;; each element tested outside the lock, then removed if it is still there
-  (fold-left (lambda (changed n)
-               (if (jolt-truthy? (doomed? (cln-item n))) (begin (with-cl q (cl-unlink! n)) #t) changed))
+  ;; the live (node . item) pairs, read under the lock; each item is tested
+  ;; outside it, so the test only ever sees an element, and its node is unlinked
+  ;; if it is still there
+  (fold-left (lambda (changed p)
+               (if (jolt-truthy? (doomed? (cdr p)))
+                   (or (with-cl q (and (not (eq? (cln-item (car p)) cl-dead)) (begin (cl-unlink! (car p)) #t))) changed)
+                   changed))
              #f
              (with-cl q (let loop ((n (cln-prev (cl-tail q))) (acc '()))
-                          (if (eq? n (cl-head q)) acc (loop (cln-prev n) (cons n acc)))))))
+                          (cond ((eq? n (cl-head q)) acc)
+                                ((eq? (cln-item n) cl-dead) (loop (cln-prev n) acc))
+                                (else (loop (cln-prev n) (cons (cons n (cln-item n)) acc))))))))
 ;; Itr / DescendingItr: #(queue next-node next-item last-node forward?)
 (define (make-cl-itr tag q forward?)
   (let ((it (make-jhost tag (vector q #f #f #f forward?))))
@@ -1212,6 +1284,8 @@
     (do ((j (fx+ i 1) (fx+ j 1))) ((fx=? j n)) (vector-set! new (fx- j 1) (vector-ref v j)))
     new))
 (define (cow-index! i n) (unless (and (fx>=? i 0) (fx<? i n)) (throw-jvm 'IndexOutOfBoundsException (string-append "Index " (number->string i) " out of bounds for length " (number->string n)))))
+;; the list itself indexes its array, so a bad index is the array's exception
+(define (cow-aindex! i n) (unless (and (fx>=? i 0) (fx<? i n)) (throw-jvm 'ArrayIndexOutOfBoundsException (string-append "Index " (number->string i) " out of bounds for length " (number->string n)))))
 (define (cow-add-index! i n) (unless (and (fx>=? i 0) (fx<=? i n)) (throw-jvm 'IndexOutOfBoundsException (string-append "Index: " (number->string i) ", Size: " (number->string n)))))
 (define (cow-remove-if! l doomed?)
   ;; the test runs on a snapshot outside the lock; the write publishes only if
@@ -1230,13 +1304,16 @@
   (list
     (cons "size" (lambda (self) (->num (cow-n self))))
     (cons "isEmpty" (lambda (self) (fx=? 0 (cow-n self))))
-    (cons "get" (lambda (self i) (let ((v (cow-vec self)) (i (jnum->exact i))) (cow-index! i (vector-length v)) (vector-ref v i))))
+    (cons "get" (lambda (self i) (let ((v (cow-vec self)) (i (jnum->exact i))) (cow-aindex! i (vector-length v)) (vector-ref v i))))
     (cons "set" (lambda (self i x)
                   (with-cow self
                     (let* ((v (cow-vec self)) (i (jnum->exact i)))
-                      (cow-index! i (vector-length v))
-                      (let ((old (vector-ref v i)) (new (vector-copy v)))
-                        (vector-set! new i x) (cow-publish! self new) old)))))
+                      (cow-aindex! i (vector-length v))
+                      ;; setting an element to itself keeps the array, so a subList stays valid
+                      (let ((old (vector-ref v i)))
+                        (unless (eq? old x)
+                          (let ((new (vector-copy v))) (vector-set! new i x) (cow-publish! self new)))
+                        old)))))
     (cons "add" (case-lambda
                   ((self x) (with-cow self (cow-publish! self (cow-insert (cow-vec self) (cow-n self) (list x)))) #t)
                   ((self i x) (with-cow self (let ((i (jnum->exact i))) (cow-add-index! i (cow-n self))
@@ -1259,7 +1336,7 @@
                                  (->num (length new)))))))
     (cons "remove" (lambda (self x)
                      (if (and (fixnum? x) (not (jfloat? x)))
-                         (with-cow self (let ((v (cow-vec self))) (cow-index! x (vector-length v))
+                         (with-cow self (let ((v (cow-vec self))) (cow-aindex! x (vector-length v))
                                           (let ((old (vector-ref v x))) (cow-publish! self (cow-delete v x)) old)))
                          (with-cow self (let* ((v (cow-vec self)) (i (cow-index-of v x 0 (vector-length v))))
                                           (if (fx<? i 0) #f (begin (cow-publish! self (cow-delete v i)) #t)))))))
@@ -1267,11 +1344,13 @@
     (cons "contains" (lambda (self x) (let ((v (cow-vec self))) (fx>=? (cow-index-of v x 0 (vector-length v)) 0))))
     (cons "indexOf" (case-lambda
                       ((self x) (let ((v (cow-vec self))) (->num (cow-index-of v x 0 (vector-length v)))))
-                      ((self x i) (let ((v (cow-vec self))) (->num (cow-index-of v x (jnum->exact i) (vector-length v)))))))
+                      ((self x i) (let ((v (cow-vec self)) (i (jnum->exact i)))
+                                    (when (and (fx<? i 0) (fx>? (vector-length v) 0)) (cow-aindex! i (vector-length v)))
+                                    (->num (cow-index-of v x (fxmax i 0) (vector-length v)))))))
     (cons "lastIndexOf" (case-lambda
                           ((self x) (let ((v (cow-vec self))) (->num (cow-last-index-of v x (fx- (vector-length v) 1)))))
                           ((self x i) (let ((v (cow-vec self)) (i (jnum->exact i)))
-                                        (when (fx>=? i (vector-length v)) (cow-index! i (vector-length v)))
+                                        (when (fx>=? i (vector-length v)) (cow-aindex! i (vector-length v)))
                                         (->num (cow-last-index-of v x i))))))
     (cons "removeIf" (lambda (self f) (when (jolt-nil? f) (jx-npe)) (cow-remove-if! self (lambda (x) (jolt-fi-call f "test" x)))))
     (cons "removeAll" (lambda (self c) (when (jolt-nil? c) (jx-npe)) (cow-remove-if! self (lambda (x) (cd-truthy? (cd-call c "contains" x))))))
@@ -1291,7 +1370,7 @@
                            ((self) (make-jhost "jx-cow-itr" (vector (cow-vec self) 0)))
                            ((self i) (let ((v (cow-vec self)) (i (jnum->exact i)))
                                        (unless (and (fx>=? i 0) (fx<=? i (vector-length v)))
-                                         (throw-jvm 'IndexOutOfBoundsException (string-append "Index: " (number->string i))))
+                                         (throw-jvm 'IndexOutOfBoundsException (string-append "Index: " (number->string i) ", Size: " (number->string (vector-length v)))))
                                        (make-jhost "jx-cow-itr" (vector v i))))))
     (cons "subList" (lambda (self from to)
                       (let ((from (jnum->exact from)) (to (jnum->exact to)) (v (cow-vec self)))
@@ -1461,6 +1540,9 @@
     "removeAll" "retainAll" "removeIf"))
 (define (cs-check-args! name args)
   (cond ((string=? name "equals") #f)
+        ;; remove(key, value): a nil value matches nothing, and is not an error
+        ((and (string=? name "remove") (pair? (cdr args)))
+         (when (jolt-nil? (car args)) (jx-npe)))
         ((string=? name "getOrDefault") (when (jolt-nil? (car args)) (jx-npe)))
         (else (for-each (lambda (a) (when (jolt-nil? a) (jx-npe))) args))))
 (define (cs-wrap kind name proc)
@@ -1496,7 +1578,8 @@
         ((eq? kind 'iter)
          (jx-register! tag 'iter (lambda (it) (map cs-out (map (tmi-ref it 3) (tmi-ref it 1)))) #f #f #f))
         ((member base tm-map-tags)
-         (jx-register! tag 'map (cs-base-call v-entries) (cs-base-call v-size) (cs-base-call v-contains?)
+         ;; seq / first / reduce hand out the JDK's SimpleImmutableEntry snapshots
+         (jx-register! tag 'map (lambda (m) (map tm-snapshot-entry (v-entries (cs-base m)))) (cs-base-call v-size) (cs-base-call v-contains?)
                        (lambda (m k d) (let ((x (v-ref (cs-base m) k))) (if (eq? x tm-absent) d x)))))
         ((member base tm-set-tags)
          (jx-register! tag 'set (cs-base-call v-keys) (cs-base-call v-size) (cs-base-call v-contains?) #f))
@@ -1592,3 +1675,42 @@
               (cons "sequencedEntrySet" (lambda (self) (make-jhost "jx-seq-entryset" (vector self)))))))
   (for-each (lambda (t) (register-host-methods! t seq-view-methods))
             (append tm-map-tags '("jx-cslm" "jx-cslm-sub" "jx-cslm-dsub"))))
+
+;; ======================================================================================
+;; reversed() views
+;; ======================================================================================
+;; List.reversed is ReverseOrderListView over the list (jx-reverse-list above),
+;; except where a class overrides it: LinkedList's own view, CopyOnWriteArrayList's
+;; Reversed. Deque.reversed is ReverseOrderDequeView. Each reads and writes the
+;; list it reverses, so an unmodifiable or immutable list refuses the writes.
+(for-each (lambda (r)
+            (jx-class! (car r) (cadr r) (caddr r))
+            (register-host-methods! (car r) (host-method-entries "jx-reverse-list"))
+            (jx-register! (car r) (cadddr r) rev-elems rev-n #f #f))
+          '(("jx-reverse-linkedlist" "java.util.LinkedList$ReverseOrderLinkedListView" ("java.util.LinkedList") list)
+            ("jx-cow-reversed" "java.util.concurrent.CopyOnWriteArrayList$Reversed" ("java.util.List" "java.util.RandomAccess") ralist)))
+(define (jx-reversed-by tag) (list (cons "reversed" (lambda (self) (make-jhost tag (vector self))))))
+(for-each (lambda (t) (register-host-methods! t (jx-reversed-by "jx-reverse-list")))
+          '("arraylist" "arrays-aslist" "immutable-list" "jx-unmod-list" "jx-unmod-ralist" "jx-sync-list" "jx-sync-ralist"))
+(register-host-methods! "linkedlist" (jx-reversed-by "jx-reverse-linkedlist"))
+(register-host-methods! "arraydeque" (jx-reversed-by "jx-reverse-deque"))
+(register-host-methods! "jx-cow-list" (jx-reversed-by "jx-cow-reversed"))
+;; an unmodifiable navigable map or set reverses to its unmodifiable descending
+;; view; a merely sorted one to ReverseOrderSortedMapView / SetView, here the
+;; unmodifiable view of the backing descending map or set under that class
+(register-host-methods! "jx-unmod-navmap"
+  (list (cons "reversed" (lambda (self) (jx-wrap-unmod 'navmap (jx-call (jxw-inner self) "descendingMap" '()))))))
+(register-host-methods! "jx-unmod-navset"
+  (list (cons "reversed" (lambda (self) (jx-wrap-unmod 'navset (jx-call (jxw-inner self) "descendingSet" '()))))))
+(for-each (lambda (r)
+            (let ((tag (car r)) (from (cadr r)))
+              (jx-class! tag (caddr r) (list (cadddr r)))
+              (register-host-methods! tag (host-method-entries from))
+              (register-host-methods! tag
+                (list (cons "reversed" (lambda (self) (make-jhost from (vector (jx-call (jxw-inner self) (list-ref r 4) '())))))))
+              (jx-register! tag (list-ref r 5) (if (eq? (list-ref r 5) 'map) jxw-entry-elems jxw-elems) jxw-count jxw-contains
+                            (and (eq? (list-ref r 5) 'map) jxw-get))
+              (register-host-methods! from
+                (list (cons "reversed" (lambda (self) (make-jhost tag (vector (jx-call (jxw-inner self) (list-ref r 4) '())))))))))
+          '(("jx-rev-sortedmap" "jx-unmod-sortedmap" "java.util.ReverseOrderSortedMapView" "java.util.SortedMap" "descendingMap" map)
+            ("jx-rev-sortedset" "jx-unmod-sortedset" "java.util.ReverseOrderSortedSetView" "java.util.SortedSet" "descendingSet" set)))

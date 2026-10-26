@@ -829,7 +829,7 @@
   (if (jolt-print-hash?)
       "#"
       (with-deeper-print
-        (if (eq? shape 'map)
+        (if (memq shape '(map jmap))
             (string-append
               "{"
               (jolt-str-join-comma
@@ -839,7 +839,14 @@
                            (jolt-pr-readable (jolt-nth e 0))
                            " "
                            (jolt-pr-readable (jolt-nth e 1))))
-                       (seq->list r))))
+                       (if (eq? shape 'jmap)
+                           (seq->list
+                             (jolt-seq
+                               (record-method-dispatch
+                                 r
+                                 "entrySet"
+                                 jolt-nil)))
+                           (seq->list r)))))
               "}")
             (let ((body (jolt-str-join
                           (jolt-limited-seq-strs
@@ -1020,6 +1027,7 @@
              ((jch-isa? tag "clojure.lang.IPersistentVector") 'vec)
              ((jch-isa? tag "clojure.lang.IPersistentSet") 'set)
              ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
+             ((jch-isa? tag "java.util.Map") 'jmap)
              (else #f)))
       (jch-isa? tag "java.lang.CharSequence") record?
       (and (not record?) (tag-declares-coll-iface? tag))
@@ -3820,9 +3828,8 @@
 (register-str-render!
   jrec?
   (lambda (v)
-    (let ((f (find-protocol-method
+    (let ((f (find-method-any-protocol
                (jrec-tag v)
-               "Object"
                "toString")))
       (if f
           (jolt-invoke f v)

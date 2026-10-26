@@ -184,6 +184,9 @@
                        ((jch-isa? tag "clojure.lang.IPersistentVector") 'vec)
                        ((jch-isa? tag "clojure.lang.IPersistentSet") 'set)
                        ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
+                       ;; print-method's java.util.Map arm: a deftype that is a
+                       ;; java.util.Map prints as a map, over its entrySet
+                       ((jch-isa? tag "java.util.Map") 'jmap)
                        (else #f)))
             (jch-isa? tag "java.lang.CharSequence")
             record?

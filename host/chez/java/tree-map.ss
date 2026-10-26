@@ -44,7 +44,9 @@
 ;; order.
 (define (tm-comparable? x)
   (not (or (pmap? x) (pset? x) (cseq? x) (empty-list-t? x) (jolt-lazyseq? x)
-           (procedure? x) (htable-sorted? x) (jutil-coll-kind x))))
+           (procedure? x) (htable-sorted? x) (jutil-coll-kind x)
+           ;; a bare (Object.), which is no Comparable
+           (and (jhost? x) (string=? (jhost-tag x) "object")))))
 (define (tm-number-class x)
   (cond ((flonum? x) "java.lang.Double")
         ((and (exact? x) (integer? x)) "java.lang.Long")

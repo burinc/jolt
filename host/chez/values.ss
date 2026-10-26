@@ -525,6 +525,10 @@
 (define (register-eq-arm! pred handler)
   (eq-arm-reject-fast-type! 'register-eq-arm! pred)
   (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-eq-arm-last! pred handler)
+  (eq-arm-reject-fast-type! 'register-eq-arm-last! pred)
+  (set! jolt-eq-arms (append jolt-eq-arms (list (cons pred handler)))))
 (define (jolt=2-base a b)
   (cond
     ((and (jolt-nil? a) (jolt-nil? b)) #t)
@@ -676,6 +680,10 @@
 (define (register-hash-arm! pred handler)
   (hash-arm-reject-fast-type! 'register-hash-arm! pred)
   (set! jolt-hash-arms (cons (cons pred handler) jolt-hash-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-hash-arm-last! pred handler)
+  (hash-arm-reject-fast-type! 'register-hash-arm-last! pred)
+  (set! jolt-hash-arms (append jolt-hash-arms (list (cons pred handler)))))
 (define (jolt-hash-base x)
   ;; Delegate to jolt-hasheq for all scalars; sequential/coll handled by
   ;; seq-hash / jolt-coll-hash which now use the Murmur3 mixers from hasheq.ss.

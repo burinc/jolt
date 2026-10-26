@@ -147,7 +147,11 @@
     ("jx-cslm-dsubentryset" . "(.entrySet (.descendingMap (java.util.concurrent.ConcurrentSkipListMap. {1 1})))")
     ("jx-seq-keyset" . "(.sequencedKeySet (java.util.TreeMap. {1 1}))")
     ("jx-seq-values" . "(.sequencedValues (java.util.TreeMap. {1 1}))")
-    ("jx-seq-entryset" . "(.sequencedEntrySet (java.util.TreeMap. {1 1}))")))
+    ("jx-seq-entryset" . "(.sequencedEntrySet (java.util.TreeMap. {1 1}))")
+    ("jx-reverse-linkedlist" . "(.reversed (java.util.LinkedList. [1 2]))")
+    ("jx-cow-reversed" . "(.reversed (java.util.concurrent.CopyOnWriteArrayList. [1 2]))")
+    ("jx-rev-sortedmap" . "(.reversed (java.util.Collections/unmodifiableSortedMap (java.util.TreeMap. {1 1})))")
+    ("jx-rev-sortedset" . "(.reversed (java.util.Collections/unmodifiableSortedSet (java.util.TreeSet. [1])))")))
 ;; tag -> a Clojure expression whose value WRAPS a value with that tag, which a
 ;; program only ever reaches through the wrapper (a Hashtable's keySet is a
 ;; Collections$SynchronizedSet over Hashtable$KeySet): the wrapper's dump is

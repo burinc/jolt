@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The rest of java.util and java.util.concurrent's collections.** `Vector`,
+  `Stack`, `Hashtable`, `BitSet`, `PriorityQueue`, `ConcurrentLinkedQueue`,
+  `ConcurrentLinkedDeque`, `CopyOnWriteArrayList`, `CopyOnWriteArraySet`,
+  `ConcurrentSkipListMap` and `ConcurrentSkipListSet`, with JDK 21's API and
+  classes. Iteration follows the JDK: a `PriorityQueue` walks its heap array, a
+  `Hashtable` its buckets, the linked queues are weakly consistent, the
+  copy-on-write iterators are snapshots, and the `Vector`/`Hashtable` iterators
+  are fail-fast. `Vector`, `Hashtable` and `Collections.synchronized*` hold
+  their own object's monitor, so `(locking v …)` around a walk excludes their
+  methods. Each round-trips through `jolt.image` or is refused naming its class.
+- **`Collections.unmodifiable*` and `synchronized*` are views, and `List/of`,
+  `Set/of`, `Map/of` and `copyOf` immutable collections.** A write through an
+  unmodifiable view, its iterators, entries or sub-views is
+  UnsupportedOperationException; a change to the backing collection shows
+  through. TreeMap, TreeSet and their key sets answer `SequencedMap` and
+  `SequencedCollection` (`reversed`, `getFirst`, `pollLastEntry`, the
+  sequenced views), and ArrayList, LinkedList and ArrayDeque answer `reversed`.
 - **`jolt.profile`, an execution-count profiler (#1421).** It reads Chez's
   `compile-profile` counters back by Clojure file, line and fn: turn on
   `(prof/instrument!)`, load the code, run it, and `(prof/report)` lists the
@@ -73,6 +90,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every `#object` print carries the identity hash, and a plain deftype prints
+  as one**, `#object[user.T 0x1b2c3d4e "user.T@1b2c3d4e"]`, as on the JVM; a
+  defrecord keeps its `#ns.R{…}` form, and a deftype that is a `java.util.Map`
+  prints as a map. `str` of a deftype, a reify or a proxy with no `toString` is
+  `Class@hash`. An array prints with its class quoted. A deftype from an image
+  whose code this process never loaded keeps the field form.
+- **`str` of a `ChronoField` is the JDK's display name** (`NanoOfSecond`,
+  `AmPmOfDay`). A project pinned to a jolt-lang/time older than 28d55d62 needs
+  that pin bumped: its `appendFraction` read field names through `str`.
+- **The java.io stream shims report their own class** (`InputStreamReader`,
+  `ByteArrayInputStream`, `System/in` is a `BufferedInputStream`), and a proxy
+  over a java.util collection prints and compares as the collection.
 - **A required namespace's `:file` is its classpath name (#1410).** A def,
   `*file*`, `:clojure.error/source` and trace frames used to carry the path as
   the root spelled it: `./src/mylib/where.clj`, an absolute path, or a
@@ -84,6 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A HashMap's `entrySet` is empty, not nil, when the map is**, so `.size` on
+  it, and on an unmodifiable or synchronized view of it, no longer throws.
+- **The nrepl `--port-file` smoke row and a `jolt.process` timing row no longer
+  race their deadlines** under CI load.
 - **Enums have `values` and `valueOf` (#1433).** The JDK enums jolt provides
   (`TimeUnit`, `Future$State`, `Thread$State`, `RoundingMode`,
   `Normalizer$Form`, `StandardOpenOption`, `StandardCopyOption`, `LinkOption`,

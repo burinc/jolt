@@ -180,7 +180,7 @@
             ("cd-vector-listitr" . "java.util.Vector$ListItr")
             ("cd-abstractlist-listitr" . "java.util.AbstractList$ListItr")))
 (jch-register-supers! "java.util.ListIterator" '("java.util.Iterator"))
-(register-seq-arm! (lambda (x) (and (jhost? x) (member (jhost-tag x) '("cd-arraylist-listitr" "cd-vector-listitr"
+(register-seq-arm-last! (lambda (x) (and (jhost? x) (member (jhost-tag x) '("cd-arraylist-listitr" "cd-vector-listitr"
                                                                        "cd-abstractlist-listitr")) #t))
   (lambda (it)
     (let ((lst (cdi-list it)))
@@ -259,8 +259,8 @@
 (jch-register-supers! "java.util.ArrayList$SubList" '("java.util.AbstractList" "java.util.RandomAccess"))
 (define (cd-sublist? x)
   (and (jhost? x) (member (jhost-tag x) '("cd-arraylist-sublist" "cd-ra-sublist" "cd-sublist")) #t))
-(register-seq-arm! cd-sublist? (lambda (x) (let ((xs (cds-elems x))) (if (null? xs) jolt-nil (list->cseq xs)))))
-(register-count-arm! cd-sublist? (lambda (x) (cds-n x)))
+(register-seq-arm-last! cd-sublist? (lambda (x) (let ((xs (cds-elems x))) (if (null? xs) jolt-nil (list->cseq xs)))))
+(register-count-arm-last! cd-sublist? (lambda (x) (cds-n x)))
 
 ;; ---- Map -------------------------------------------------------------------------------
 (define cd-absent (list 'cd-absent))

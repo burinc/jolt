@@ -403,6 +403,13 @@
 (register-str-render!
   (lambda (x) (procedure? x))
   (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
+;; str of a reify or a proxy that declares no toString is Object.toString,
+;; Class@hash, as on the JVM (a proxy over a java.util collection renders as the
+;; collection through its own arm). Without this it fell through to the printer
+;; and came back as the whole #object[...] form.
+(register-str-render!
+  (lambda (x) (and (jreify? x) (not (reify-method-ref x "toString")) (not (proxy-coll-kind x))))
+  (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
 ;; pr/print of a fn uses the JVM object form — #object[ns$name 0xHASH
 ;; "ns$name@HASH"] — which fn-identity parsers (lasertag's resolve-fn-name)
 ;; read the class name out of.
