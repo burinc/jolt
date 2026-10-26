@@ -444,12 +444,7 @@
             "java.nio.ByteBuffer" "java.nio.charset.Charset" "java.nio.file.FileSystem"
             "java.time.Clock" "java.time.ZoneId" "java.util.TimeZone"
             ))
-(for-each jch-mark-enum!
-          '(
-            "java.time.DayOfWeek" "java.time.Month" "java.time.temporal.ChronoField"
-            "java.time.temporal.ChronoUnit" "java.lang.Thread$State"
-            "java.util.concurrent.TimeUnit"
-            ))
+;; the ENUM bit is set by java/enums.ss as each enum is declared
 ;; the package-private classes the graph models (all nested; probed): the four
 ;; transient classes and three of clojure.lang's seq classes
 (for-each jch-mark-package-private!
@@ -965,11 +960,29 @@
 (jch-register-supers! "java.util.LinkedList" '("java.util.List" "java.util.Deque"))
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
 (jch-register-supers! "java.util.HashMap" '("java.util.Map"))
+(jch-register-supers! "java.util.LinkedHashMap" '("java.util.HashMap" "java.util.SequencedMap"))
 ;; Properties is a Hashtable, which is a Map — System/getProperties answers
 ;; (instance? java.util.Map …) as well as (instance? java.util.Properties …).
 (jch-register-supers! "java.util.Hashtable" '("java.util.Map"))
 (jch-register-supers! "java.util.Properties" '("java.util.Hashtable"))
 (jch-register-supers! "java.util.HashSet" '("java.util.Set"))
+(jch-register-supers! "java.util.LinkedHashSet" '("java.util.HashSet" "java.util.SequencedSet"))
+;; the LinkedHashMap / LinkedHashSet views and entries (linked-hash.ss)
+(jch-register-supers! "java.util.LinkedHashMap$ReversedLinkedHashMapView" '("java.util.AbstractMap" "java.util.SequencedMap"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedKeySet" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedValues" '("java.util.AbstractCollection" "java.util.SequencedCollection"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedEntrySet" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.LinkedHashMap$Entry" '("java.util.Map$Entry"))
+(jch-register-supers! "jdk.internal.util.NullableKeyValueHolder" '("java.util.Map$Entry"))
+(jch-register-supers! "java.util.LinkedHashSet$1ReverseLinkedHashSetView" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(for-each (lambda (c) (jch-register-supers! c '("java.util.Iterator")))
+          '("java.util.LinkedHashMap$LinkedKeyIterator" "java.util.LinkedHashMap$LinkedValueIterator"
+            "java.util.LinkedHashMap$LinkedEntryIterator" "java.util.HashMap$KeyIterator"
+            "java.util.RegularEnumSet$EnumSetIterator" "java.util.JumboEnumSet$EnumSetIterator"
+            "java.util.EnumMap$KeyIterator" "java.util.EnumMap$ValueIterator" "java.util.EnumMap$EntryIterator"
+            "java.util.ArrayList$Itr" "java.util.LinkedList$ListItr" "java.util.ArrayDeque$DeqIterator"
+            "java.util.Arrays$ArrayItr" "java.util.ImmutableCollections$ListItr"))
+(jch-register-supers! "java.util.EnumMap$EntryIterator$Entry" '("java.util.Map$Entry"))
 ;; java.util.TreeMap / TreeSet and the views they hand out (tree-map.ss), with
 ;; the sorted/navigable/sequenced interfaces between them and Map / Set, and
 ;; the Comparator objects Comparator/reverseOrder and naturalOrder return.
@@ -1045,6 +1058,19 @@
 (jch-register-supers! "java.util.AbstractMap$SimpleImmutableEntry" '("java.util.Map$Entry" "java.io.Serializable"))
 (jch-register-supers! "java.util.TreeSet"
   '("java.util.AbstractSet" "java.util.NavigableSet" "java.lang.Cloneable" "java.io.Serializable"))
+;; EnumSet / EnumMap (enum-colls.ss): the two concrete EnumSet classes the JDK
+;; picks between by the universe's size, and EnumMap with its three views
+(jch-register-supers! "java.util.EnumSet" '("java.util.AbstractSet" "java.lang.Cloneable" "java.io.Serializable"))
+(jch-register-supers! "java.util.RegularEnumSet" '("java.util.EnumSet"))
+(jch-register-supers! "java.util.JumboEnumSet" '("java.util.EnumSet"))
+(jch-register-supers! "java.util.EnumMap" '("java.util.AbstractMap" "java.io.Serializable" "java.lang.Cloneable"))
+(jch-register-supers! "java.util.EnumMap$KeySet" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.EnumMap$Values" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.EnumMap$EntrySet" '("java.util.AbstractSet"))
+(jch-mark-abstract! "java.util.EnumSet")
+(for-each jch-mark-final! '("java.util.RegularEnumSet" "java.util.JumboEnumSet"))
+(for-each jch-mark-package-private! '("java.util.RegularEnumSet" "java.util.JumboEnumSet"))
+(for-each jch-mark-private! '("java.util.EnumMap$KeySet" "java.util.EnumMap$Values" "java.util.EnumMap$EntrySet"))
 (jch-register-supers! "java.util.Collections$ReverseComparator" '("java.util.Comparator" "java.io.Serializable"))
 (jch-register-supers! "java.util.Collections$ReverseComparator2" '("java.util.Comparator" "java.io.Serializable"))
 (jch-register-supers! "java.util.Comparators$NaturalOrderComparator" '("java.lang.Enum" "java.util.Comparator"))
@@ -1064,7 +1090,6 @@
             "clojure.lang.RT$DefaultComparator"))
 (for-each jch-mark-private!
           '("java.util.Collections$ReverseComparator" "java.util.Collections$ReverseComparator2"))
-(jch-mark-enum! "java.util.Comparators$NaturalOrderComparator")
 
 ;; ---- the rows typed.clojure's annotation corpus names ------------------------
 ;; typed.ann.clojure.base's override-classes resolves every class it annotates
@@ -1140,7 +1165,11 @@
 (jch-register-supers! "java.lang.NoSuchMethodError" '("java.lang.IncompatibleClassChangeError"))
 (jch-register-supers! "java.lang.UnknownError" '("java.lang.VirtualMachineError"))
 (jch-register-supers! "java.lang.ClassLoader" '())
-(jch-register-supers! "java.lang.Enum" '("java.lang.Comparable"))
+;; every enum's superclass (java/enums.ss registers each enum under it)
+(jch-register-supers! "java.lang.Enum" '("java.lang.constant.Constable" "java.lang.Comparable" "java.io.Serializable"))
+(jch-mark-abstract! "java.lang.Enum")
+(jch-register-supers! "java.lang.constant.Constable" '())
+(jch-mark-interface! "java.lang.constant.Constable")
 (jch-register-supers! "java.lang.Package" '())
 (jch-register-supers! "java.lang.Process" '())
 ;; the handle shim's class had the same gap the redirect's did below — a tag row
@@ -1151,6 +1180,7 @@
 ;; the redirect shim's class had a tag row but no graph row, so it was not a
 ;; known class: no token, no nested-static modifier bit
 (jch-register-supers! "java.lang.ProcessBuilder$Redirect" '())
+(jch-register-supers! "java.lang.ProcessBuilder$Redirect$Type" '("java.lang.Enum"))
 (jch-register-supers! "java.lang.Runtime" '())
 (jch-register-supers! "java.lang.RuntimePermission" '())
 (jch-register-supers! "java.lang.SecurityManager" '())
@@ -1348,10 +1378,13 @@
 (jch-register-supers! "java.text.NumberFormat" '("java.text.Format"))
 (jch-register-supers! "java.text.DecimalFormat" '("java.text.NumberFormat"))
 (jch-register-supers! "java.text.Normalizer" '())
-;; Normalizer.Form is an enum, so it carries java.lang.Enum's supers the way the
-;; other modeled enums here do.
-(jch-register-supers! "java.text.Normalizer$Form" '("java.lang.Enum"))
-(jch-register-supers! "java.util.concurrent.TimeUnit" '("java.lang.Enum"))
+;; The JDK enums the shims model. Each is declared through java/enums.ss, which
+;; gives it the enum surface; the rows are here because the class graph is read
+;; at boot before the shims load (the auto-import table, class tokens).
+(for-each (lambda (c) (jch-register-supers! c '("java.lang.Enum")))
+          '("java.text.Normalizer$Form" "java.util.concurrent.TimeUnit" "java.math.RoundingMode"
+            "java.nio.file.FileVisitResult" "java.nio.file.FileVisitOption"
+            "java.nio.file.attribute.PosixFilePermission"))
 (jch-register-supers! "java.util.GregorianCalendar" '())
 (jch-register-supers! "java.util.Locale" '())
 (jch-register-supers! "java.util.TimeZone" '())
@@ -1371,6 +1404,14 @@
 (jch-register-supers! "java.nio.file.Watchable" '())
 (jch-register-supers! "java.nio.file.FileSystem" '())
 (jch-register-supers! "java.nio.file.PathMatcher" '())
+;; the option interfaces, and the option enums that implement them (declared
+;; through java/enums.ss)
+(jch-register-supers! "java.nio.file.OpenOption" '())
+(jch-register-supers! "java.nio.file.CopyOption" '())
+(for-each jch-mark-interface! '("java.nio.file.OpenOption" "java.nio.file.CopyOption"))
+(jch-register-supers! "java.nio.file.StandardOpenOption" '("java.lang.Enum" "java.nio.file.OpenOption"))
+(jch-register-supers! "java.nio.file.StandardCopyOption" '("java.lang.Enum" "java.nio.file.CopyOption"))
+(jch-register-supers! "java.nio.file.LinkOption" '("java.lang.Enum" "java.nio.file.OpenOption" "java.nio.file.CopyOption"))
 
 ;; ---- jhost value tag -> FQN (single value-discriminator registry) --------------
 ;; A value-layer shim value (make-jhost tag …) reports its JVM class by this map;
@@ -1446,8 +1487,11 @@
     ("linkedlist" . "java.util.LinkedList")
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
+    ("linkedhashmap" . "java.util.LinkedHashMap")
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")
+    ("linkedhashset" . "java.util.LinkedHashSet")
+    ("hashset-iterator" . "java.util.HashMap$KeyIterator")
     ;; tree-map.ss: a TreeMap, its views, a TreeSet, and the Comparator objects
     ("treemap" . "java.util.TreeMap")
     ("treemap-asc-sub" . "java.util.TreeMap$AscendingSubMap")

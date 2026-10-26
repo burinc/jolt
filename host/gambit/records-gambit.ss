@@ -1452,7 +1452,14 @@
       ((jrec-cl coll "pop") => (lambda (m) (jolt-invoke m coll)))
       (else (%r-jolt-pop coll)))))
 
-(register-pr-arm! jrec? jrec-pr)
+(define jrec-enum-constant? (lambda (x) #f))
+
+(define (set-jrec-enum-constant-test! f)
+  (set! jrec-enum-constant? f))
+
+(register-pr-arm!
+  (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x))))
+  jrec-pr)
 
 (register-map-pred-arm! jrec-maplike?)
 
@@ -3049,9 +3056,15 @@
 (define (set-iface-default-hook! f)
   (set! iface-default-hook f))
 
+(define enum-method-hook #f)
+
+(define (set-enum-method-hook! f) (set! enum-method-hook f))
+
 (define (dispatch-miss obj method-name args)
-  (let ((d (and iface-default-hook
-                (iface-default-hook obj method-name (length args)))))
+  (let ((d (or (and enum-method-hook
+                    (enum-method-hook obj method-name (length args)))
+               (and iface-default-hook
+                    (iface-default-hook obj method-name (length args))))))
     (if d
         (apply d obj args)
         (let ((f (and class-ext-fallback-hook

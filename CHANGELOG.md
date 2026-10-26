@@ -39,6 +39,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit's code, or comes from a build in another mode, fails the build naming
   the unit, rather than being ignored. Profiled units never share a build
   cache entry with plain ones.
+- **`java.util.EnumSet` and `java.util.EnumMap`.** `EnumSet/of`, `noneOf`,
+  `allOf`, `range`, `copyOf` and `complementOf` build a mutable set ordered by
+  ordinal (a `java.util.RegularEnumSet`, or `JumboEnumSet` past 64 constants),
+  and `(EnumMap. Class)` / `(EnumMap. map)` a mutable map ordered by its keys'
+  ordinals, with live `keySet`, `values` and `entrySet` views. Both refuse a
+  null or foreign element the way the JDK does, and print and compare as a set
+  and a map.
+- **`jolt.host/register-enum!` declares an enum class from a library.**
+  `(jolt.host/register-enum! "my.Color" [["RED" red] ["GREEN" green]])` gives
+  the class `values`, `valueOf`, `Class.isEnum`, `getEnumConstants`,
+  `Enum/valueOf`, `java.lang.Enum`'s instance methods for any method the values
+  do not answer themselves, and the JVM's print form (a `deftype` constant
+  prints as `#object[my.Color 0x… "RED"]` and stringifies to its name). The java.time enums
+  (`Month`, `DayOfWeek`, `ChronoUnit`, `ChronoField`) are declared this way.
+- **`java.util.LinkedHashMap` and `java.util.LinkedHashSet`.** Both keep
+  insertion order, with O(1) operations. An access-ordered `LinkedHashMap`
+  (`(LinkedHashMap. 16 0.75 true)`) moves what `get`, `put`, `compute`,
+  `merge` and the rest reach to the tail, and `removeEldestEntry` is asked
+  after each new mapping, so the LRU idiom `(proxy [LinkedHashMap] [16 0.75
+  true] (removeEldestEntry [e] …))` evicts. JDK 21's sequenced methods are
+  there (`putFirst`, `putLast`, `firstEntry`, `pollLastEntry`, `reversed`,
+  `sequencedKeySet`, `addFirst`, `removeLast`, …) and the key, value and entry
+  views are live.
+- **Every java.util collection shim travels in a `jolt.image`.** `HashMap`,
+  `HashSet`, `Properties`, `LinkedHashMap` (access order kept), `TreeMap` and
+  `TreeSet` (comparator kept), `EnumSet`, `EnumMap`, `StringBuilder`,
+  `StringBuffer` and the java.time values used to fail to write; they
+  round-trip with their contents in order and their class, and one that holds
+  itself restores as one. A view or entry of another collection, an iterator,
+  a thread, pool or task and an open stream are refused naming their class.
+  `make imagecoverage` fails on a collection shim that does neither.
 
 ### Changed
 
@@ -53,6 +84,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Enums have `values` and `valueOf` (#1433).** The JDK enums jolt provides
+  (`TimeUnit`, `Future$State`, `Thread$State`, `RoundingMode`,
+  `Normalizer$Form`, `StandardOpenOption`, `StandardCopyOption`, `LinkOption`,
+  `FileVisitOption`, `FileVisitResult`, `PosixFilePermission`) had their
+  constants and nothing else. Each now answers `values` (a fresh array of its
+  class), `valueOf` with the JVM's messages, `Class.isEnum` and
+  `getEnumConstants` (which every class answers now), `Enum/valueOf`, and
+  `name`, `ordinal`, `compareTo` (a `ClassCastException` for another enum's
+  constant), `getDeclaringClass`, `equals` and `hashCode`. Constants are
+  `Serializable`, carry the enum's modifiers, print as
+  `#object[java.util.concurrent.TimeUnit 0x1b2c3d4e "DAYS"]`, and survive a
+  `jolt.image` round trip as the same constant. The lists are the JDK's, in its
+  order: `StandardOpenOption` gains `DELETE_ON_CLOSE`, `SPARSE`, `SYNC` and
+  `DSYNC`, which the `Files` streams and `FileChannel/open` now honor, and
+  `newInputStream` refuses `WRITE` and `APPEND`. A `RoundingMode` constant was a
+  string, equal to `"HALF_UP"`; `RoundingMode/valueOf` takes the legacy int too,
+  every enum answers `(X/valueOf Class name)`, and `TimeUnit` gains `convert`,
+  `of`, `toChronoUnit`, `timedJoin` and `timedWait`. Iterators over an EnumSet
+  or an EnumMap's views remove through them, and EnumMap's entries are live.
+- **java.time's enums are enums.** `(DayOfWeek/values)` was a vector,
+  `(DayOfWeek/of 1)` a new object equal to `DayOfWeek/MONDAY` but not identical
+  to it, and a constant printed bare. Each constant is now one object, `values`
+  is an array, they print like the JVM's, `ChronoUnit` renders its JDK names
+  (`HalfDays`), and `Month/of` and `DayOfWeek/of`
+  refuse an out-of-range value with `DateTimeException`.
+- **Host objects print and stringify as the JVM's.** `pr` of a host shim
+  object or an enum constant carries the identity hash
+  (`#object[java.util.Random 0x1b2c3d4e "java.util.Random@1b2c3d4e"]`), and
+  `print` leaves the content unquoted. `str` is its `toString`: Object's
+  `class@hash` for one with no `toString` of its own, where several shims
+  answered placeholders (`#<BufferedReader>`, `""` for a PrintWriter,
+  `LinkedBlockingQueue(1)`), and the JDK's for a queue (`[1, a]`), a
+  FutureTask, a Process and a `ProcessBuilder$Redirect`, whose `.type` is the
+  `ProcessBuilder$Redirect$Type` enum where it was a string.
+- **The ArrayList, LinkedList and ArrayDeque iterators support `remove`**, taking
+  the last element handed out; an `Arrays/asList` list's refuses it, as on the JDK.
+- **A `java.util.HashSet` has `.iterator` (with `remove`), `contains?`,
+  `addAll`, `containsAll`, `removeAll`, `retainAll` and `clone`; a `HashMap`
+  `remove(key, value)` and `clone`, and copies any map it is built from.**
+- **`count`, `seq`, `get` and `contains?` work on a proxy over a java.util
+  collection**, through the proxy's `size`, `containsKey` and `get`.
+- **`Files/write` with only `SYNC`, `SPARSE` or `DELETE_ON_CLOSE` no longer
+  truncates an existing file or creates a missing one**: any option replaces
+  the CREATE + TRUNCATE_EXISTING default, as on the JDK.
 - **A heap at its `JOLT_MAX_HEAP` ceiling no longer peaks 10% over it in a
   young collection.** Near the ceiling, Chez's own schedule still copied
   generation 1 every fourth collection, and with the heap already at the
@@ -70,7 +145,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   IDeref value again along the path it is printing, directly or through
   collections. `(str a)` of one is `clojure.lang.Atom@hash`, its `toString` on
   the JVM, instead of the printed form.
-
 - **A transaction no longer holds a lock while its code runs.** Every `dosync`
   ran under one global lock, so a body that waited on another thread's
   transaction hung: `(dosync @(future (dosync (ref 1))))` never returned. The

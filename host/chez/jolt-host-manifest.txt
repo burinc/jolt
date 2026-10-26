@@ -232,6 +232,7 @@ refine-extension!
 regex-compiled?
 register-class-provider!
 register-class-supers!
+register-enum!
 register-extension!
 register-extension-point!
 register-source!

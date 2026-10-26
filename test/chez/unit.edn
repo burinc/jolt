@@ -885,7 +885,7 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "\"#object[java.net.URI \\\"file:/tmp/x\\\"]\""}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (clojure.string/replace (pr-str (io/file \"/tmp/x\")) #\" 0x[0-9a-f]+\" \"\"))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
   {:suite "ioreader" :expr "(clojure.string/replace (pr-str (atom 1)) #\" 0x[0-9a-f]+ \" \" \")" :expected "\"#object[clojure.lang.Atom {:status :ready, :val 1}]\""}
  ;; io/resource has two branches — a source root (a jfile) and an embedded resource
  ;; baked into the image by make-devboot / jolt build. Which one serves a stdlib
@@ -3037,8 +3037,8 @@
   ;; RoundingMode's constants are the enum NAMES, which is what the rounding
   ;; helpers already dispatch on; BigDecimal's pre-Java-5 ROUND_* ints work too.
   {:suite "bigdec-members" :label "RoundingMode constants and the legacy ints"
-   :expr "[java.math.RoundingMode/HALF_UP RoundingMode/CEILING BigDecimal/ROUND_HALF_UP (.setScale (BigDecimal. \"1.55\") 1 BigDecimal/ROUND_HALF_UP)]"
-   :expected "[\"HALF_UP\" \"CEILING\" 4 1.6M]"}
+   :expr "[(str java.math.RoundingMode/HALF_UP) (class RoundingMode/CEILING) BigDecimal/ROUND_HALF_UP (.setScale (BigDecimal. \"1.55\") 1 BigDecimal/ROUND_HALF_UP)]"
+   :expected "[\"HALF_UP\" java.math.RoundingMode 4 1.6M]"}
   {:suite "bigdec-members" :label "round takes a MathContext map, and with-precision still rounds divide"
    :expr "[(.round (BigDecimal. \"123.456\") {:precision 4 :rounding :half-up}) (with-precision 3 (.divide (BigDecimal. \"10\") (BigDecimal. \"3\")))]"
    :expected "[123.5M 3.33M]"}
@@ -3359,7 +3359,7 @@
   {:suite "repl-printer" :expr "[\"hi\" \\c 1]" :expected "[\"hi\" \\c 1]"}
   {:suite "repl-printer" :expr "\"hi\"" :expected "\"hi\""}
   {:suite "repl-printer" :expr "{:a \"x\" :b \\y}" :expected "{:a \"x\", :b \\y}"}
-  {:suite "repl-printer" :expr "(java.io.File. \"/tmp/x\")" :expected "#object[java.io.File \"/tmp/x\"]"}
+  {:suite "repl-printer" :expr "(symbol (clojure.string/replace (pr-str (java.io.File. \"/tmp/x\")) #\" 0x[0-9a-f]+\" \"\"))" :expected "#object[java.io.File \"/tmp/x\"]"}
   {:suite "repl-printer" :expr "(str \"hi\" \\c)" :expected "\"hic\""}
   {:suite "repl-printer" :expr "(with-out-str (print [\"hi\" 1]))" :expected "\"[hi 1]\""}
   {:suite "repl-printer" :expr "(with-out-str (println \"hi\"))" :expected "\"hi\\n\""}
@@ -3859,4 +3859,12 @@
   {:suite "idrop" :expr "[(try (nthrest (range 10) 2147483648) (catch ArithmeticException _ :overflow)) (drop 2147483648 (map inc (range 10))) (nthrest (map inc (range 10)) ##Inf)]" :expected "[:overflow () ()]"}
   {:suite "idrop" :expr "(let [n (atom 0) s (map (fn [x] (swap! n inc) x) (take 10 (iterate inc 0)))] [(nthrest s 3) @n (nthnext s 3) @n])" :expected "[(3 4 5 6 7 8 9) 4 (3 4 5 6 7 8 9) 4]"}
   {:suite "idrop" :expr "[(nthrest (range 10) 10) (drop 10 (range 10)) (drop 32 (range 32)) (nthnext (range 32) 32) (drop 3 (map inc [1 2 3])) (nthrest (range 64) 32) (drop 5 (seq \"hello\")) (nil? (seq (drop 10 (range 10)))) (class (drop 10 (range 10)))]" :expected "[() () () nil () (32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63) () true clojure.lang.PersistentList$EmptyList]"}
+  {:suite "enum model" :expr "(do (deftype UnitColor [n]) (def ucr (->UnitColor 1)) (def ucg (->UnitColor 2)) (jolt.host/register-enum! \"user.UnitColor\" [[\"RED\" ucr] [\"GREEN\" ucg]]) [(.name ucr) (.ordinal ucg) (identical? (user.UnitColor/valueOf \"GREEN\") ucg) (mapv #(.name %) (user.UnitColor/values)) (.isEnum (class ucr)) (identical? (Enum/valueOf (class ucr) \"RED\") ucr) (instance? Enum ucr) (.compareTo ucr ucg) (.getName (.getDeclaringClass ucr)) (count (java.util.EnumSet/allOf (class ucr))) (try (user.UnitColor/valueOf \"BLUE\") (catch IllegalArgumentException e (.getMessage e))) (str ucr) (clojure.string/replace (pr-str ucg) #\"0x[0-9a-f]+\" \"0xH\")])" :expected "[\"RED\" 1 true [\"RED\" \"GREEN\"] true true true -1 \"user.UnitColor\" 2 \"No enum constant user.UnitColor.BLUE\" \"RED\" \"#object[user.UnitColor 0xH \\\"GREEN\\\"]\"]"}
+  {:suite "enum model / java.time" :expr "(let [v (java.time.DayOfWeek/values)] [(.getName (class v)) (count v) (.isEnum java.time.DayOfWeek) (identical? (Enum/valueOf java.time.DayOfWeek \"MONDAY\") java.time.DayOfWeek/MONDAY) (identical? (java.time.DayOfWeek/of 1) java.time.DayOfWeek/MONDAY) (identical? (.getMonth (java.time.LocalDate/of 2024 3 1)) java.time.Month/MARCH) (count (java.time.temporal.ChronoUnit/values)) (count (java.time.temporal.ChronoField/values)) (.isEnum java.time.Month) (instance? Enum java.time.Month/MAY) (count (.getEnumConstants java.time.Month))])" :expected "[\"[Ljava.time.DayOfWeek;\" 7 true true true true 16 30 true true 12]"}
+  {:suite "enum model / java.time" :expr "(mapv #(if (string? %) (clojure.string/replace % #\"0x[0-9a-f]+\" \"0xH\") %) [(pr-str java.time.DayOfWeek/MONDAY) (str java.time.DayOfWeek/MONDAY) (str java.time.temporal.ChronoUnit/HALF_DAYS) (.name java.time.temporal.ChronoUnit/HALF_DAYS) (.name java.time.temporal.ChronoField/AMPM_OF_DAY) (pr-str java.time.temporal.ChronoUnit/DAYS) (try (java.time.Month/valueOf \"Jan\") (catch IllegalArgumentException e (.getMessage e))) (.ordinal java.time.DayOfWeek/SUNDAY)])" :expected "[\"#object[java.time.DayOfWeek 0xH \\\"MONDAY\\\"]\" \"MONDAY\" \"HalfDays\" \"HALF_DAYS\" \"AMPM_OF_DAY\" \"#object[java.time.temporal.ChronoUnit 0xH \\\"Days\\\"]\" \"No enum constant java.time.Month.Jan\" 6]"}
+  {:suite "enum model / java.time" :expr "[(identical? (Enum/valueOf java.time.DayOfWeek \"FRIDAY\") java.time.DayOfWeek/FRIDAY) (.isEnum java.time.temporal.ChronoField)]" :expected "[true true]"}
+  {:suite "enum model / java.time" :expr "(try (java.time.Month/of 13) (catch Exception e [(.getName (class e)) (.getMessage e)]))" :expected "[\"java.time.DateTimeException\" \"Invalid value for MonthOfYear: 13\"]"}
+  {:suite "enum model / java.time" :expr "[(.convert java.util.concurrent.TimeUnit/SECONDS 3000 java.util.concurrent.TimeUnit/MILLISECONDS) (.convert java.util.concurrent.TimeUnit/SECONDS (java.time.Duration/ofMillis 2500)) (.name (java.util.concurrent.TimeUnit/of java.time.temporal.ChronoUnit/MILLIS)) (.name (.toChronoUnit java.util.concurrent.TimeUnit/SECONDS))]" :expected "[3 2 \"MILLISECONDS\" \"SECONDS\"]"}
+  {:suite "enum model" :expr "(mapv (fn [v] (try (jolt.host/register-enum! \"user.BadEnum\" [[\"A\" v]]) :registered (catch IllegalArgumentException e (.getMessage e)))) [:a \"s\" 1 nil true \\c (quote sym)])" :expected "[\"user.BadEnum.A is a keyword: an enum constant must be an object of its own\" \"user.BadEnum.A is a string: an enum constant must be an object of its own\" \"user.BadEnum.A is a number: an enum constant must be an object of its own\" \"user.BadEnum.A is nil: an enum constant must be an object of its own\" \"user.BadEnum.A is a boolean: an enum constant must be an object of its own\" \"user.BadEnum.A is a character: an enum constant must be an object of its own\" \"user.BadEnum.A is a symbol: an enum constant must be an object of its own\"]"}
+  {:suite "enum model" :expr "(do (deftype ConcE [n]) (let [fs (doall (for [i (range 16)] (future (jolt.host/register-enum! (str \"user.ConcE\" i) [[\"A\" (->ConcE i)] [\"B\" (->ConcE (- i))]]) (.isEnum (class (->ConcE 0))))))] (run! deref fs) (count (filter (fn [i] (= [\"A\" \"B\"] (mapv (fn [c] (.name c)) (.getEnumConstants (Class/forName (str \"user.ConcE\" i)))))) (range 16)))))" :expected "16"}
 ]

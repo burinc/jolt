@@ -49,10 +49,6 @@
 (define (make-time-unit nm nanos) (make-jhost "time-unit" (vector nm nanos)))
 (define (time-unit? x) (and (jhost? x) (string=? (jhost-tag x) "time-unit")))
 (define (time-unit-scale u) (vector-ref (jhost-state u) 1))
-(define (time-unit-ordinal u)
-  (let loop ((us time-unit-nanos) (i 0))
-    (if (string=? (caar us) (vector-ref (jhost-state u) 0)) i (loop (cdr us) (+ i 1)))))
-
 ;; JVM conversions TRUNCATE toward zero (SECONDS.toMinutes(90) is 1).
 (define (tu-convert self n per)
   (quotient (* (jnum->exact n) (time-unit-scale self)) per))
@@ -79,8 +75,26 @@
 
 (define time-unit-constants
   (map (lambda (p) (cons (car p) (make-time-unit (car p) (cdr p)))) time-unit-nanos))
-(register-class-statics! "TimeUnit" time-unit-constants)
-(register-class-statics! "java.util.concurrent.TimeUnit" time-unit-constants)
+(register-enum-class! "java.util.concurrent.TimeUnit" time-unit-constants)
+;; TimeUnit <-> java.time.temporal.ChronoUnit (the java.time base, autoloaded)
+(define time-unit-chrono-names
+  '(("NANOSECONDS" . "NANOS") ("MICROSECONDS" . "MICROS") ("MILLISECONDS" . "MILLIS")
+    ("SECONDS" . "SECONDS") ("MINUTES" . "MINUTES") ("HOURS" . "HOURS") ("DAYS" . "DAYS")))
+(define (time-unit-of-chrono cu)
+  (when (jolt-nil? cu) (throw-jvm 'NullPointerException "chronoUnit"))
+  (let* ((nm (jolt-final-str (record-method-dispatch cu "name" jolt-nil)))
+         (hit (find (lambda (p) (string=? (cdr p) nm)) time-unit-chrono-names)))
+    (if hit
+        (cdr (assoc (car hit) time-unit-constants))
+        (throw-jvm 'IllegalArgumentException (string-append "No TimeUnit equivalent for " nm)))))
+;; convert(duration, unit) and convert(Duration): truncated toward zero and
+;; saturated at Long's range, as TimeUnit.convert is
+(define (tu-saturate n)
+  (cond ((> n 9223372036854775807) 9223372036854775807)
+        ((< n -9223372036854775808) -9223372036854775808)
+        (else n)))
+(define (tu-from-nanos self nanos) (tu-saturate (truncate (/ nanos (time-unit-scale self)))))
+(register-class-statics! "java.util.concurrent.TimeUnit" (list (cons "of" time-unit-of-chrono)))
 (register-host-methods! "time-unit"
   (list (cons "toNanos"   (lambda (self n) (tu-convert self n 1)))
         (cons "toMicros"  (lambda (self n) (tu-convert self n 1000)))
@@ -103,19 +117,30 @@
                                         n))
                                   jolt-nil))))
         (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))
-        ;; TimeUnit is an enum: declared NANOSECONDS..DAYS, ordered by that
-        ;; ordinal, and Enum.compareTo is the ordinal difference
-        (cons "ordinal"   (lambda (self) (time-unit-ordinal self)))
-        (cons "compareTo" (lambda (self other)
-                            (unless (time-unit? other)
-                              (throw-jvm 'ClassCastException
-                                         (string-append "class " (jolt-class-name other)
-                                                        " cannot be cast to class java.util.concurrent.TimeUnit")))
-                            (- (time-unit-ordinal self) (time-unit-ordinal other))))))
-;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its
-;; name on the JVM, where the generic host-object fallback prints #object[…].
-(register-str-render! time-unit? (lambda (u) (vector-ref (jhost-state u) 0)))
+        (cons "convert"
+              (case-lambda
+                ((self d)
+                 (let ((secs (jnum->exact (record-method-dispatch d "getSeconds" jolt-nil)))
+                       (nano (jnum->exact (record-method-dispatch d "getNano" jolt-nil))))
+                   (tu-from-nanos self (+ (* secs 1000000000) nano))))
+                ((self n unit)
+                 (tu-from-nanos self (* (jnum->exact n) (time-unit-scale unit))))))
+        ;; timedJoin / timedWait: Thread.join / Object.wait for a timeout in
+        ;; this unit; one of zero or less does nothing, as the JDK's guard has it
+        (cons "timedJoin" (lambda (self th n)
+                            (let ((ms (tu-convert self n 1000000)))
+                              (when (positive? (jnum->exact n))
+                                (record-method-dispatch th "join" (jolt-list (max ms 1))))
+                              jolt-nil)))
+        (cons "timedWait" (lambda (self o n)
+                            (let ((ms (tu-convert self n 1000000)))
+                              (when (positive? (jnum->exact n))
+                                (record-method-dispatch o "wait" (jolt-list (max ms 1))))
+                              jolt-nil)))
+        (cons "toChronoUnit"
+              (lambda (self)
+                (host-static-ref "java.time.temporal.ChronoUnit"
+                                 (cdr (assoc (vector-ref (jhost-state self) 0) time-unit-chrono-names)))))))
 
 ;; --- futures ----------------------------------------------------------------
 ;; A future is a mutable cell guarded by `mu`; workers/derefs coordinate on `cv`.
@@ -2546,26 +2571,7 @@
 ;; the fiber layer answers its state name here ("WAITING" while it is parked, say),
 ;; or #f to fall through to the OS-thread answer.
 (define jolt-thread-state-hook (lambda (th) #f))
-(let ((statics (append thread-state-constants
-                       (list (cons "values" (lambda () (apply jolt-vector (map cdr thread-state-constants))))
-                             (cons "valueOf"
-                                   (lambda (nm)
-                                     (let ((hit (assoc (jolt-final-str nm) thread-state-constants)))
-                                       (if hit
-                                           (cdr hit)
-                                           (throw-jvm 'IllegalArgumentException
-                                                      (string-append "No enum constant java.lang.Thread.State."
-                                                                     (jolt-final-str nm)))))))))))
-  (register-class-statics! "java.lang.Thread$State" statics)
-  (register-class-statics! "Thread$State" statics))
-(register-host-methods! "thread-state"
-  (list (cons "name" (lambda (self) (jhost-state self)))
-        (cons "toString" (lambda (self) (jhost-state self)))
-        (cons "ordinal" (lambda (self)
-          (let loop ((ns thread-state-names) (i 0))
-            (if (string=? (car ns) (jhost-state self)) i (loop (cdr ns) (+ i 1))))))))
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "thread-state")))
-                      (lambda (x) (jhost-state x)))
+(register-enum-class! "java.lang.Thread$State" thread-state-constants)
 
 ;; --- java.lang.management.ThreadMXBean (the current thread's CPU clock) -----
 ;; ManagementFactory/getThreadMXBean, for what callers time with it: the CPU time
@@ -3691,10 +3697,13 @@
         (cons "toArray" (lambda (self . _) (na-to-array (list->cseq (abq-snapshot self)))))
         ;; the tag, not a literal: "lbq" shares this table and must not print as
         ;; an ArrayBlockingQueue.
-        (cons "toString" (lambda (self)
-          (string-append (if (string=? (jhost-tag self) "lbq") "LinkedBlockingQueue" "ArrayBlockingQueue")
-                         "(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+        ;; AbstractCollection.toString: the elements, head first
+        (cons "toString" (lambda (self) (host-elems-tostring self (abq-snapshot self))))))
 (alias-host-methods! "lbq" "abq")
+;; a blocking queue is a java.util Collection: str, seq and the image see its
+;; elements (jutil-colls.ss)
+(register-jutil-coll! "abq" 'coll abq-snapshot)
+(register-jutil-coll! "lbq" 'coll abq-snapshot)
 ;; (seq q), (vec q) over a queue: the same snapshot, head first; (count q) is
 ;; the size, without one.
 (register-seq-arm! abq? (lambda (q) (list->cseq (abq-snapshot q))))
@@ -3709,7 +3718,7 @@
               ;; a reified Callable or Runnable is called through its method, as
               ;; submit calls one (it was invoked as a fn and failed the task)
               (vector 'new override-flag override jolt-nil #f (make-mutex) (jolt-make-cv)
-                      (runnable->thunk thunk))))
+                      (runnable->thunk thunk) thunk)))
 (define (future-task? x) (and (jhost? x) (string=? (jhost-tag x) "future-task")))
 (define (future-task-run! self)
   (let ((st (jhost-state self)))
@@ -3777,8 +3786,19 @@
                           #f))))
             (when (box? r) (task-interrupt-runner! r))
             (and r #t))))
+        ;; FutureTask.toString: Object's, then the state
         (cons "toString" (lambda (self)
-          (string-append "FutureTask[" (symbol->string (vector-ref (jhost-state self) 0)) "]")))))
+          (let ((st (jhost-state self)))
+            (string-append (host-object-tostring self) "["
+                           (case (vector-ref st 0)
+                             ((done) (if (vector-ref st 4)
+                                         (string-append "Completed exceptionally: "
+                                                        (jolt-str-render-one (vector-ref st 4)))
+                                         "Completed normally"))
+                             ((cancelled) "Cancelled")
+                             (else (string-append "Not completed, task = "
+                                                  (jolt-str-render-one (vector-ref st 8)))))
+                           "]"))))))
 ;; submit/execute above route a FutureTask through its own run (a Runnable on
 ;; the JVM), and a reify or deftype implementing Callable or Runnable through its
 ;; call or run — invoking one directly was "cannot be cast to clojure.lang.IFn",
@@ -3831,7 +3851,13 @@
           (let* ((ex (vector-ref (jhost-state self) 0))
                  (cap (vector-ref (jhost-state ex) 5)))
             (if cap (max 0 (- cap (executor-queue-depth ex))) 2147483647))))
-        (cons "toString" (lambda (self) "ExecutorQueueView"))))
+        ;; the work queue's tasks, head first, as the queue's own toString lists them
+        (cons "toString" (lambda (self)
+                           (let* ((st (jhost-state (vector-ref (jhost-state self) 0)))
+                                  (q (jolt-with-mutex (vector-ref st 2)
+                                       (let ((p (unbox (vector-ref st 1))))
+                                         (append (car p) (reverse (cdr p)))))))
+                             (host-elems-tostring self q))))))
 (register-host-methods! "executor-service"
   (list (cons "getQueue" (lambda (self) (make-jhost "executor-queue-view" (vector self))))
         ;; ThreadPoolExecutor's size accessors, which are how a caller (and the
@@ -4427,7 +4453,7 @@
             (jolt-timer-at! (ms->deadline-millis (vector-ref st 0))
               (lambda () (cf-execute! (vector-ref st 1) (lambda () (cf-fn-call r "run"))))))
           jolt-nil))
-        (cons "toString" (lambda (self) "java.util.concurrent.CompletableFuture$DelayedExecutor"))))
+        (cons "toString" host-object-tostring)))
 
 ;; java.util.concurrent.Future.State, what state() answers: an enum, so each
 ;; constant is one object and = compares them by identity.
@@ -4435,13 +4461,7 @@
   (map (lambda (nm) (cons nm (make-jhost "future-state" nm)))
        '("RUNNING" "SUCCESS" "FAILED" "CANCELLED")))
 (define (future-state nm) (cdr (assoc nm future-state-constants)))
-(register-class-statics! "java.util.concurrent.Future$State" future-state-constants)
-(register-class-statics! "Future$State" future-state-constants)
-(register-host-methods! "future-state"
-  (list (cons "name" (lambda (self) (jhost-state self)))
-        (cons "toString" (lambda (self) (jhost-state self)))))
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "future-state")))
-                      (lambda (x) (jhost-state x)))
+(register-enum-class! "java.util.concurrent.Future$State" future-state-constants)
 
 (define (cf-to-string self)
   (let* ((st (jhost-state self))
