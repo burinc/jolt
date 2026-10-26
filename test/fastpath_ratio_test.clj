@@ -164,8 +164,9 @@
 
 ;;   hashmap-get        get on a java.util.HashMap walks the get arms to the
 ;;                      HashMap family's; a shim registering its arm AHEAD of it
-;;                      adds a predicate to every such get (measured 4.9-5.0
-;;                      against get on a persistent map, 2026-10).
+;;                      adds a predicate to every such get (measured against
+;;                      get on a persistent map, 2026-10: 4.6 on x86_64 Linux,
+;;                      5.0 on macOS arm64, 6.1 on bionic arm64).
 ;;
 ;;   host-object-pr     pr-str of a java.io.File is the #object fallback: the
 ;;                      print arms, the class name, the str registry. Against a
@@ -549,7 +550,7 @@
     (judge! "hashmap-get"
             #(dotimes [_ 200000] (get pm 3))
             #(dotimes [_ 200000] (get hm 3))
-            5.5 7.0))
+            7.0 9.0))
 
   ;; pr-str of a host record (java.io.File) is the #object fallback: the print
   ;; arms, the class name and the str registry, against a vector that prints
