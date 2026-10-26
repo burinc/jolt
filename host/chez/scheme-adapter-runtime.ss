@@ -113,8 +113,9 @@
 (define (sa-gc-reserve-ratio! r)
   (heap-reserve-ratio (inexact r)))
 
-;; (sa-gc-tight! on?) -> void
-;; Collect TIGHT while ON?: objects already in the older generations are marked
+;; (sa-gc-tight! limit) -> void
+;; Collect TIGHT while LIMIT is a byte count (#f: not): objects already in the
+;; older generations are marked
 ;; where they are rather than copied, so a collection needs little memory beyond
 ;; what the heap already holds. Copying needs a second copy's worth of room for
 ;; everything it moves -- a 100MB structure promoted by a scheduled collection
@@ -123,12 +124,14 @@
 ;; 2.8GB with it on throughout), so the heap ceiling turns it on only near the
 ;; limit. Chez's in-place-minimum-generation at 2 (1 fragmented worse: 380MB for
 ;; that program against 343MB), and back to the maximum generation, its default.
-;; Degradation: a target without the choice ignores it.
+;; LIMIT is the total heap the young collections keep their copies within
+;; (sa-collect-young!): the heap ceiling. Degradation: a target without the
+;; choice ignores it.
 (define sa-gc-tight-generation 2)
-(define (sa-gc-tight! on?)
-  (set! sa-young-tight? on?)
+(define (sa-gc-tight! limit)
+  (set! sa-young-tight? limit)
   (in-place-minimum-generation
-    (if on? (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
+    (if limit (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
 
 ;; (sa-make-large-bytevector n) -> bytevector
 ;; A fresh zero-filled bytevector of N bytes that the collector marks where it is
@@ -1468,15 +1471,25 @@
 ;; and 404MB -> 320MB). The maximum generation is never on this schedule: the
 ;; policy's own full collections take it (rt.ss, heap growth and the ceiling).
 ;;
-;; Near a heap ceiling (sa-gc-tight!) the collection copies only generation 0,
-;; Chez's own: copying generation 1 as well needs room the ceiling may not have
-;; (the gcpolicy gate peaked 30% over a 256MB ceiling that way).
+;; Near a heap ceiling (sa-gc-tight!) the collection is Chez's own, which takes
+;; generation 1 only every fourth time: copying it at every one needs room the
+;; ceiling may not have (the gcpolicy gate peaked 30% over a 256MB ceiling that
+;; way). Generation 1 is copied (in-place marking starts at 2), and a collection
+;; peaks at the total plus what it copies, since sources are freed only when it
+;; ends; so when generations 0 and 1 together would carry the total past the
+;; limit, only generation 0 is collected, and generation 1 waits for the ceiling's
+;; full collection, which marks it in place (sa-collect-tight). Chez's schedule
+;; had copied a 24MB generation 1 into a 251MB total under a 256MB ceiling, one
+;; collection before that full one: 282MB, and on which collection it fell
+;; depended on a few hundred KB of boot live set (jolt-exoj).
 (define sa-young-count 0)
 (define sa-young-tight? #f)
 (define (sa-collect-young!)
   (set! sa-young-count (fx+ sa-young-count 1))
   (if sa-young-tight?
-      (collect)
+      (if (> (+ (current-memory-bytes) (bytes-allocated 0) (bytes-allocated 1)) sa-young-tight?)
+          (collect 0 1 1)
+          (collect))
       (let* ((cmg (collect-maximum-generation))
              (radix (collect-generation-radix))
              (g (let loop ((g (fx- cmg 1)))

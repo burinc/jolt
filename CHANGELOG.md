@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A heap at its `JOLT_MAX_HEAP` ceiling no longer peaks 10% over it in a
+  young collection.** Near the ceiling, Chez's own schedule still copied
+  generation 1 every fourth collection, and with the heap already at the
+  limit those copies sat beside their sources: a program holding ~100MB under
+  a 256MB ceiling peaked at 282MB, and whether that collection landed at the
+  worst moment moved with a few hundred KB of boot live set. A young collection
+  now leaves generation 1 to the ceiling's full collection, which marks it in
+  place, when copying it would not fit under the ceiling. The same program
+  peaks at 261-265MB.
+
 - **An atom or ref that holds itself raises `StackOverflowError` when printed,
   at once.** Printing one recursed until the heap filled and ended in
   `OutOfMemoryError` some 30 seconds later, where the JVM overflows its stack.
