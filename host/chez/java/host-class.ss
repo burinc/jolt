@@ -410,7 +410,15 @@
 ;; and came back as the whole #object[...] form.
 (register-str-render!
   (lambda (x) (and (jreify? x) (not (reify-method-ref x "toString")) (not (proxy-coll-kind x))))
-  (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
+  (lambda (x)
+    (if (and (jreify-delegate x) (jolt-ex-info-record? (jreify-delegate x)))
+        ;; a proxy over a Throwable class: Throwable.toString, the proxy's class
+        ;; and its (possibly overridden) message
+        ;; getLocalizedMessage is getMessage unless the proxy writes its own, so
+        ;; an overridden getMessage shows through
+        (let ((m (record-method-dispatch x (if (reify-method-ref x "getLocalizedMessage") "getLocalizedMessage" "getMessage") jolt-nil)))
+          (if (jolt-nil? m) (jolt-class-name x) (string-append (jolt-class-name x) ": " (jolt-str-render-one m))))
+        (string-append (jolt-class-name x) "@" (jolt-identity-hex x)))))
 ;; pr/print of a fn uses the JVM object form — #object[ns$name 0xHASH
 ;; "ns$name@HASH"] — which fn-identity parsers (lasertag's resolve-fn-name)
 ;; read the class name out of.

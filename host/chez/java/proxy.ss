@@ -108,7 +108,8 @@
                                           ".proxy$" super)
                                     (map (lambda (n) (string-append "$" (simple n))) sorted)
                                     (list "$" (jolt-hex32 (jolt-hash inames)))))))
-          (jch-register-supers! name (cons super (append ifaces '("clojure.lang.IProxy"))))
+          ;; the JDK lists IProxy first among the interfaces
+          (jch-register-supers! name (cons super (cons "clojure.lang.IProxy" ifaces)))
           (jolt-with-mutex proxy-class-names-mu (hashtable-set! proxy-class-names key name))
           name))))
 ;; A proxy records the ns its form is in (as #(ns) in its cname field); the class
@@ -159,7 +160,7 @@
     (if (proxy-value? val)
         (let ((tname (if (symbol-t? type-sym) (symbol-t-name type-sym) type-sym)))
           (if (and (string? tname) (or (reify-declares-class? (jreify-protos val) tname)
-                                       (equal? tname (reify-class-name val))))
+                                       (reify-class-isa? val tname)))
               #t
               (if (jolt-truthy? (instance-check type-sym (reify-delegate val))) #t #f)))
         (quote pass))))

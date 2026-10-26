@@ -3,7 +3,8 @@
   ValueRange. Requiring the namespace registers the classes. The temporal-coupled
   operations (Month/from, ChronoUnit.between, ChronoField.getFrom, …) are added by
   the temporal namespaces, which own the receiver types."
-  (:require [jolt.time.impl :as impl]
+  (:require [clojure.string :as str]
+            [jolt.time.impl :as impl]
             [jolt.time.util :as u]))
 
 (defn- statics! [names members]
@@ -32,8 +33,13 @@
 ;; one without standalone forms gets the format forms.
 (defn- locale-id [l]
   (when (nil? l) (throw (jolt.host/throwable "java.lang.NullPointerException" "locale")))
-  ;; the data's key is the BCP-47-style id; a Locale prints the JDK's en_US
-  (.replace (str l) "_" "-"))
+  ;; the data's key is the BCP-47-style id (language-Script-COUNTRY-variant); a
+  ;; Locale prints the JDK's toString (en_US, zh_TW_#Hant)
+  (let [s (str l) h (.indexOf s "_#")
+        base (if (neg? h) s (subs s 0 h))
+        script (if (neg? h) "" (subs s (+ h 2)))
+        [lang & more] (str/split base #"_" -1)]
+    (str/join "-" (remove empty? (concat [lang script] more)))))
 (defn- text-name [kind i style l]
   (when (nil? style) (throw (jolt.host/throwable "java.lang.NullPointerException" "style")))
   (let [id (locale-id l)

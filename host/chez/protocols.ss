@@ -396,7 +396,12 @@
 ;; per list (interned by make-reified-delegating, so one per reify site) and
 ;; stamped with jch-graph-epoch, which is what changes an interface's ancestry.
 (define jreify-tags-memo (make-weak-eq-hashtable))
+;; A reify form's or proxy's own generated class leads, so (extend (class r) P …)
+;; reaches its instances.
 (define (jreify-host-tags obj)
+  (let ((tags (jreify-protos-host-tags obj)) (c (reify-class-name obj)))
+    (if c (cons c tags) tags)))
+(define (jreify-protos-host-tags obj)
   (let* ((ps (jreify-protos obj))
          (e (hashtable-ref jreify-tags-memo ps #f)))
     (if (and e (fx= (car e) jch-graph-epoch))

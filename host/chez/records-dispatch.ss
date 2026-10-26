@@ -1245,7 +1245,18 @@
 (register-get-arm! jreify?
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
-      (cond (m (jolt-invoke m coll k d))
+      (cond ;; RT.get calls valAt(k) for (get x k): a nil default takes the
+            ;; 2-arity when there is one (records.ss jrec-call-valat, same rule)
+            (m (if (and (jolt-nil? d) (proc-accepts? m 2)) (jolt-invoke m coll k) (jolt-invoke m coll k d)))
+            ;; a reify of java.util.Map: RT.get reads it through its get, the
+            ;; default when containsKey says the key is absent
+            ((and (reify-method-ref coll "get") (reify-declares-class? (jreify-protos coll) "java.util.Map"))
+             (let ((g (reify-method-ref coll "get"))
+                   (ck (or (reify-method-ref coll "containsKey")
+                           (and abstract-class-method-hook (abstract-class-method-hook coll "containsKey")))))
+               (if ck
+                   (if (jolt-truthy? (jolt-invoke ck coll k)) (jolt-invoke g coll k) d)
+                   (let ((v (jolt-invoke g coll k))) (if (jolt-nil? v) d v)))))
             ;; a java.util.Map by an abstract class it declares (a proxy over
             ;; AbstractMap): RT.get reads it through Map.get
             ((and abstract-class-method-hook (abstract-class-method-hook coll "containsKey"))

@@ -52,6 +52,7 @@
     ("lbq" . "(doto (java.util.concurrent.LinkedBlockingQueue.) (.add :x))")
     ("hashmap" . "(doto (java.util.HashMap.) (.put :b 1) (.put \"a\" [2]) (.put nil 3))")
     ("properties" . "(doto (java.util.Properties. (doto (java.util.Properties.) (.setProperty \"d\" \"0\"))) (.setProperty \"a\" \"1\"))")
+    ("chm" . "(doto (java.util.concurrent.ConcurrentHashMap.) (.put :b 1) (.put \"a\" [2]))")
     ("hashset" . "(java.util.HashSet. [3 1 :k])")
     ("linkedhashmap" . "(doto (java.util.LinkedHashMap. 16 0.75 true) (.put :b 1) (.put :a 2) (.get :b))")
     ("linkedhashset" . "(java.util.LinkedHashSet. [3 1 2])")
@@ -100,7 +101,8 @@
     ("jx-cow-set" . "(java.util.concurrent.CopyOnWriteArraySet. [3 1 2])")
     ("jx-cslm" . "(doto (java.util.concurrent.ConcurrentSkipListMap. (java.util.Collections/reverseOrder)) (.put 1 :a) (.put 2 :b))")
     ("jx-csls" . "(java.util.concurrent.ConcurrentSkipListSet. [3 1 2])")
-    ("jx-simple-entry" . "(java.util.AbstractMap$SimpleEntry. :k [1])")))
+    ("jx-simple-entry" . "(java.util.AbstractMap$SimpleEntry. :k [1])")
+    ("jx-simple-imm-entry" . "(java.util.AbstractMap$SimpleImmutableEntry. :k [1])")))
 ;; a JumboEnumSet needs an enum of more than 64 constants, which the host has
 ;; none of; its codec is the RegularEnumSet's (one registration, both tags)
 (define same-codec '(("enum-set-jumbo" . "enum-set-regular")))
@@ -156,7 +158,14 @@
     ("jx-hm-keyset" . "(.keySet (doto (java.util.HashMap.) (.put :a 1)))")
     ("jx-hm-values" . "(.values (doto (java.util.HashMap.) (.put :a 1)))")
     ("jx-hm-entryset" . "(.entrySet (doto (java.util.HashMap.) (.put :a 1)))")
-    ("jx-hm-node" . "(first (.entrySet (doto (java.util.HashMap.) (.put :a 1))))")))
+    ("jx-hm-node" . "(first (.entrySet (doto (java.util.HashMap.) (.put :a 1))))")
+    ("jx-chm-keyset" . "(.keySet (doto (java.util.concurrent.ConcurrentHashMap.) (.put :a 1)))")
+    ("jx-chm-values" . "(.values (doto (java.util.concurrent.ConcurrentHashMap.) (.put :a 1)))")
+    ("jx-chm-entryset" . "(.entrySet (doto (java.util.concurrent.ConcurrentHashMap.) (.put :a 1)))")
+    ("jx-chm-entry" . "(first (.entrySet (doto (java.util.concurrent.ConcurrentHashMap.) (.put :a 1))))")
+    ("jx-props-keyset" . "(.keySet (doto (java.util.Properties.) (.setProperty \"a\" \"1\")))")
+    ("jx-props-values" . "(.values (doto (java.util.Properties.) (.setProperty \"a\" \"1\")))")
+    ("jx-props-entryset" . "(.entrySet (doto (java.util.Properties.) (.setProperty \"a\" \"1\")))")))
 ;; tag -> a Clojure expression whose value WRAPS a value with that tag, which a
 ;; program only ever reaches through the wrapper (a Hashtable's keySet is a
 ;; Collections$SynchronizedSet over Hashtable$KeySet): the wrapper's dump is

@@ -53,6 +53,8 @@
 ;; the JVM formats 123.045 as "123,045" under de. Bound rather than passed so
 ;; every directive path picks it up without threading an argument through.
 (define format-decimal-sep (make-parameter "."))
+;; …and the , flag's grouping separator, "," but for the locale's ("1.234,5" under de)
+(define format-grouping-sep (make-parameter ","))
 ;; --- the decimal digits of a number ---------------------------------------------
 ;; (num-digits x) -> (values digits expo) for a finite x >= 0: digits are the
 ;; significant decimal digits with no leading or trailing zeros ("0" for zero),
@@ -165,7 +167,7 @@
     (let loop ((i (string-length int)) (acc '()))
       (if (fx<=? i 3)
           (apply string-append (substring int 0 i) (append acc (list rest)))
-          (loop (fx- i 3) (cons (string-append "," (substring int (fx- i 3) i)) acc))))))
+          (loop (fx- i 3) (cons (string-append (format-grouping-sep) (substring int (fx- i 3) i)) acc))))))
 
 ;; --- %a: the hexadecimal-float conversion ----------------------------------------
 ;; With NO precision %a is Double.toHexString's spelling: 0x1.<13 hex mantissa

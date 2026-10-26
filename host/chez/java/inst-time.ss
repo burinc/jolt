@@ -895,6 +895,7 @@
                                     (kw "months-standalone") jolt-nil (kw "months-short-standalone") jolt-nil
                                     (kw "days-standalone") jolt-nil (kw "days-short-standalone") jolt-nil)
       (kw "fallback") (kw "default")
+      (kw "parent") "-"
       (kw "hint") "The jolt-lang/time library carries per-locale month and day names.")))
 
 ;; :field-names — ChronoField.getDisplayName(locale): the names CLDR gives the
@@ -910,6 +911,7 @@
                        (jolt-hash-map "SECOND_OF_MINUTE" "Second" "MINUTE_OF_HOUR" "Minute" "HOUR_OF_DAY" "Hour"
                                       "AMPM_OF_DAY" "Dayperiod" "DAY_OF_WEEK" "Day of the Week" "MONTH_OF_YEAR" "Month"))
       (kw "fallback") (kw "default")
+      (kw "parent") "-"
       (kw "hint") "The jolt-lang/time library carries per-locale field names.")))
 
 ;; Project the point's map for a locale id to format-ms' names vector. A field a

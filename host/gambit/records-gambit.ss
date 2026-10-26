@@ -1793,6 +1793,11 @@
 (define jreify-tags-memo (make-weak-eq-hashtable))
 
 (define (jreify-host-tags obj)
+  (let ((tags (jreify-protos-host-tags obj))
+        (c (reify-class-name obj)))
+    (if c (cons c tags) tags)))
+
+(define (jreify-protos-host-tags obj)
   (let* ((ps (jreify-protos obj))
          (e (hashtable-ref jreify-tags-memo ps #f)))
     (if (and e (fx= (car e) jch-graph-epoch))
@@ -3589,7 +3594,25 @@
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
       (cond
-        (m (jolt-invoke m coll k d))
+        (m
+         (if (and (jolt-nil? d) (proc-accepts? m 2))
+             (jolt-invoke m coll k)
+             (jolt-invoke m coll k d)))
+        ((and (reify-method-ref coll "get")
+              (reify-declares-class?
+                (jreify-protos coll)
+                "java.util.Map"))
+         (let ((g (reify-method-ref coll "get"))
+               (ck (or (reify-method-ref coll "containsKey")
+                       (and abstract-class-method-hook
+                            (abstract-class-method-hook
+                              coll
+                              "containsKey")))))
+           (if ck
+               (if (jolt-truthy? (jolt-invoke ck coll k))
+                   (jolt-invoke g coll k)
+                   d)
+               (let ((v (jolt-invoke g coll k))) (if (jolt-nil? v) d v)))))
         ((and abstract-class-method-hook
               (abstract-class-method-hook coll "containsKey")) =>
          (lambda (ck)

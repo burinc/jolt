@@ -19,7 +19,7 @@
 
 ;; ---- HashMap, its look-alikes, Properties and HashSet ---------------------------
 ;; header #(tag defaults); a Properties keeps its defaults, not System's writethrough
-(register-image-codec! "java.util.HashMap" '("hashmap" "properties")
+(register-image-codec! "java.util.HashMap" '("hashmap" "properties" "chm")
   (lambda (m)
     (vector (vector (jhost-tag m) (or (and (string=? (jhost-tag m) "properties") (props-defaults m)) jolt-nil))
             (codec-kvs (map (lambda (k) (cons k (hashtable-ref (hm-tbl m) k jolt-nil))) (hm-keys-ordered m)))))
