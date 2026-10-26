@@ -3362,6 +3362,9 @@
      (list (jolt-seq obj)))
     ((string=? name "iterator")
      (list (make-jiterator (jolt-seq obj))))
+    ((and (string=? name "spliterator")
+          persistent-spliterator-hook)
+     (list (persistent-spliterator-hook obj)))
     ((string=? name "reduce")
      (let ((k (dot-coll-kind-fast obj)))
        (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
@@ -3654,6 +3657,8 @@
          (car (jreify-methods x))
          reify-class-key
          #f)))
+
+(define persistent-spliterator-hook #f)
 
 (define reify-class-graph-hook (lambda (name ifaces) #f))
 

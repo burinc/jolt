@@ -1977,3 +1977,231 @@
                                       ((list) (list->cseq (abs-elems x)))
                                       (else (abs-plain x))))
                   (jolt-object-repr x #f))))
+;; ======================================================================================
+;; java.util.Spliterator
+;; ======================================================================================
+;; One object for every JDK spliterator class: its class name, characteristics
+;; and comparator are the JDK's for the source, and it is backed one of two ways.
+;;   vec   a snapshot of the elements, split at the midpoint as an array-backed
+;;         spliterator is (ArrayList's, an array's, a Vector's, …): the prefix goes
+;;         to a new one of the same class
+;;   iter  a live iterator, split by batches as IteratorSpliterator and the
+;;         linked collections' are: the batch comes back as an ArraySpliterator.
+;;         It stays lazy, so a spliteratorUnknownSize over an endless iterator
+;;         works
+;; A hash or tree spliterator splits where its table or tree does on the JDK,
+;; which jolt's do not share; those split at the midpoint here, with the same
+;; contents in the same order overall. State #(kind src lo hi chars cmp batch class)
+(define spl-ORDERED 16) (define spl-DISTINCT 1) (define spl-SORTED 4) (define spl-SIZED 64)
+(define spl-NONNULL 256) (define spl-IMMUTABLE 1024) (define spl-CONCURRENT 4096) (define spl-SUBSIZED 16384)
+(define spl-long-max 9223372036854775807)
+(define spl-classes
+  '("java.util.ArrayList$ArrayListSpliterator" "java.util.LinkedList$LLSpliterator" "java.util.ArrayDeque$DeqSpliterator"
+    "java.util.HashMap$KeySpliterator" "java.util.HashMap$ValueSpliterator" "java.util.HashMap$EntrySpliterator"
+    "java.util.Spliterators$IteratorSpliterator" "java.util.Spliterators$ArraySpliterator"
+    "java.util.TreeMap$KeySpliterator" "java.util.TreeMap$ValueSpliterator" "java.util.TreeMap$EntrySpliterator"
+    "java.util.AbstractList$RandomAccessSpliterator" "java.util.concurrent.ConcurrentLinkedQueue$CLQSpliterator"
+    "java.util.concurrent.ConcurrentLinkedDeque$CLDSpliterator" "java.util.concurrent.ConcurrentSkipListMap$KeySpliterator"
+    "java.util.concurrent.ConcurrentSkipListMap$ValueSpliterator" "java.util.concurrent.ConcurrentSkipListMap$EntrySpliterator"
+    "java.util.PriorityQueue$PriorityQueueSpliterator" "java.util.Vector$VectorSpliterator" "clojure.lang.PersistentVector$3"
+    "java.util.ArrayList$SubList$2" "java.util.Spliterators$EmptySpliterator$OfRef"))
+(define spl-tag-of (make-hashtable string-hash string=?))
+(jch-register-supers! "java.util.Spliterator" '())
+(define (spl-ref x i) (vector-ref (jhost-state x) i))
+(define (spl-set! x i v) (vector-set! (jhost-state x) i v))
+(define (spl-sized? x) (not (fx=? 0 (fxand (spl-ref x 4) spl-SIZED))))
+(define (make-spl cls kind src lo hi chars cmp)
+  (make-jhost (hashtable-ref spl-tag-of cls #f) (vector kind src lo hi chars cmp 0 cls)))
+(define (make-vec-spl cls chars elems . cmp)
+  (let ((v (list->vector elems))) (make-spl cls 'vec v 0 (vector-length v) chars (if (pair? cmp) (car cmp) jolt-nil))))
+(define (make-iter-spl cls chars it est . cmp)
+  (make-spl cls 'iter it 0 est chars (if (pair? cmp) (car cmp) jolt-nil)))
+(define (spl-advance! x)
+  ;; the next element, or the spl-none marker
+  (case (spl-ref x 0)
+    ((vec) (let ((lo (spl-ref x 2)))
+             (if (fx<? lo (spl-ref x 3)) (begin (spl-set! x 2 (fx+ lo 1)) (vector-ref (spl-ref x 1) lo)) spl-none)))
+    (else (let ((it (spl-ref x 1)))
+            (if (jolt-truthy? (jx-call it "hasNext" '()))
+                (let ((v (jx-call it "next" '())))
+                  (when (and (spl-sized? x) (< (spl-ref x 3) spl-long-max) (> (spl-ref x 3) 0)) (spl-set! x 3 (- (spl-ref x 3) 1)))
+                  v)
+                spl-none)))))
+(define spl-none (list 'spl-none))
+(define (spl-split! x)
+  (case (spl-ref x 0)
+    ((vec) (let* ((lo (spl-ref x 2)) (mid (fxsrl (fx+ lo (spl-ref x 3)) 1)))
+             (if (fx>=? lo mid) jolt-nil
+                 (begin (spl-set! x 2 mid)
+                        (make-spl (spl-ref x 7) 'vec (spl-ref x 1) lo mid (spl-ref x 4) (spl-ref x 5))))))
+    (else
+     ;; IteratorSpliterator / LLSpliterator take batches of 1024 more each time;
+     ;; the concurrent linked queues start at one and grow by one
+     (let* ((it (spl-ref x 1)) (est (spl-ref x 3))
+            (clq? (not (fx=? 0 (fxand (spl-ref x 4) spl-CONCURRENT)))))
+       (if (and (or clq? (> est 1)) (jolt-truthy? (jx-call it "hasNext" '())))
+           (let* ((b (spl-ref x 6))
+                  (n (if clq? (if (fx<=? b 0) 1 (fxmin (fx+ b 1) 33554432)) (min (fx+ b 1024) est 33554432))))
+             (let loop ((j 0) (acc '()))
+               (if (and (fx<? j n) (jolt-truthy? (jx-call it "hasNext" '())))
+                   (loop (fx+ j 1) (cons (jx-call it "next" '()) acc))
+                   (begin
+                     (spl-set! x 6 j)
+                     (when (< est spl-long-max) (spl-set! x 3 (- est j)))
+                     (make-vec-spl "java.util.Spliterators$ArraySpliterator"
+                                   (fxior (if clq? (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT) (spl-ref x 4)) spl-SIZED spl-SUBSIZED)
+                                   (reverse acc))))))
+           jolt-nil)))))
+(define spliterator-methods
+  (list (cons "tryAdvance" (lambda (self f)
+                             (when (jolt-nil? f) (jx-npe))
+                             (let ((v (spl-advance! self))) (if (eq? v spl-none) #f (begin (jolt-fi-call f "accept" v) #t)))))
+        (cons "forEachRemaining" (lambda (self f)
+                                   (when (jolt-nil? f) (jx-npe))
+                                   (let loop () (let ((v (spl-advance! self))) (unless (eq? v spl-none) (jolt-fi-call f "accept" v) (loop))))
+                                   jolt-nil))
+        (cons "trySplit" (lambda (self) (spl-split! self)))
+        (cons "estimateSize" (lambda (self) (->num (if (eq? (spl-ref self 0) 'vec) (fx- (spl-ref self 3) (spl-ref self 2)) (spl-ref self 3)))))
+        (cons "getExactSizeIfKnown" (lambda (self) (if (spl-sized? self) (jx-call self "estimateSize" '()) (->num -1))))
+        (cons "characteristics" (lambda (self) (->num (spl-ref self 4))))
+        (cons "hasCharacteristics" (lambda (self c) (fx=? (fxand (spl-ref self 4) (jnum->exact c)) (jnum->exact c))))
+        (cons "getComparator" (lambda (self) (if (fx=? 0 (fxand (spl-ref self 4) spl-SORTED)) (throw-jvm 'IllegalStateException jolt-nil) (spl-ref self 5))))))
+(for-each (lambda (cls)
+            (let ((tag (string-append "jx-spl:" cls)))
+              (hashtable-set! spl-tag-of cls tag)
+              (jx-class! tag cls '("java.util.Spliterator"))
+              (register-host-methods! tag spliterator-methods)
+              (register-image-refusal! (list tag) "a spliterator is a position in a walk this process is making; write the collection instead")))
+          spl-classes)
+(register-class-statics! "java.util.Spliterator"
+  (list (cons "ORDERED" (->num spl-ORDERED)) (cons "DISTINCT" (->num spl-DISTINCT)) (cons "SORTED" (->num spl-SORTED))
+        (cons "SIZED" (->num spl-SIZED)) (cons "NONNULL" (->num spl-NONNULL)) (cons "IMMUTABLE" (->num spl-IMMUTABLE))
+        (cons "CONCURRENT" (->num spl-CONCURRENT)) (cons "SUBSIZED" (->num spl-SUBSIZED))))
+;; ---- the sources ---------------------------------------------------------------------
+(define (spl-it c) (jx-call c "iterator" '()))
+(define (spl-n c) (jnum->exact (jx-call c "size" '())))
+(define (spl-vec-of cls chars . cmp) (lambda (self) (apply make-vec-spl cls chars (jxc-elems self) cmp)))
+(define (spl-iter-of cls chars) (lambda (self) (make-iter-spl cls chars (spl-it self) (spl-n self))))
+(define spl-OSS (fxior spl-ORDERED spl-SIZED spl-SUBSIZED))                    ; 16464
+(define (spl-entry-cmp cmp)
+  ;; TreeMap's EntrySpliterator orders entries by key, under the map's comparator
+  (let ((kc (if (jolt-nil? cmp) tm-natural-compare (tm-comparator->cmpf cmp))))
+    (lambda (a b) (kc (jolt-nth a 0) (jolt-nth b 0)))))
+(for-each (lambda (r) (register-host-methods! (car r) (list (cons "spliterator" (cdr r)))))
+  (list
+    (cons "arraylist" (spl-vec-of "java.util.ArrayList$ArrayListSpliterator" spl-OSS))
+    (cons "cd-arraylist-sublist" (spl-vec-of "java.util.ArrayList$SubList$2" spl-OSS))
+    (cons "linkedlist" (spl-iter-of "java.util.LinkedList$LLSpliterator" spl-OSS))
+    (cons "arraydeque" (spl-vec-of "java.util.ArrayDeque$DeqSpliterator" (fxior spl-OSS spl-NONNULL)))
+    (cons "hashset" (spl-vec-of "java.util.HashMap$KeySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "jx-hm-keyset" (spl-vec-of "java.util.HashMap$KeySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "jx-hm-values" (spl-vec-of "java.util.HashMap$ValueSpliterator" spl-SIZED))
+    (cons "jx-hm-entryset" (spl-vec-of "java.util.HashMap$EntrySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "linkedhashset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
+    (cons "lhm-keyset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
+    (cons "lhm-values" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" spl-OSS))
+    (cons "lhm-entryset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
+    (cons "treeset" (lambda (self) (make-vec-spl "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                 (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "treemap-keyset" (lambda (self) (make-vec-spl "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                        (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "treemap-values" (spl-vec-of "java.util.TreeMap$ValueSpliterator" (fxior spl-ORDERED spl-SIZED)))
+    (cons "treemap-entryset" (lambda (self) (make-vec-spl "java.util.TreeMap$EntrySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                          (jxc-elems self) (spl-entry-cmp (tmr-cmp-obj (v-root self))))))
+    (cons "arrays-aslist" (spl-vec-of "java.util.Spliterators$ArraySpliterator" spl-OSS))
+    (cons "jx-listn" (spl-vec-of "java.util.AbstractList$RandomAccessSpliterator" spl-OSS))
+    (cons "jx-list12" (spl-vec-of "java.util.AbstractList$RandomAccessSpliterator" spl-OSS))
+    (cons "jx-setn" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)))
+    (cons "jx-set12" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)))
+    (cons "jx-cow-list" (spl-vec-of "java.util.Spliterators$ArraySpliterator" (fxior spl-OSS spl-IMMUTABLE)))
+    (cons "jx-cow-set" (spl-vec-of "java.util.Spliterators$ArraySpliterator" (fxior spl-SIZED spl-SUBSIZED spl-IMMUTABLE spl-DISTINCT)))
+    (cons "jx-clq" (lambda (self) (make-iter-spl "java.util.concurrent.ConcurrentLinkedQueue$CLQSpliterator"
+                                                 (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT) (spl-it self) spl-long-max)))
+    (cons "jx-cld" (lambda (self) (make-iter-spl "java.util.concurrent.ConcurrentLinkedDeque$CLDSpliterator"
+                                                 (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT) (spl-it self) spl-long-max)))
+    (cons "jx-csls" (lambda (self) (make-vec-spl "java.util.concurrent.ConcurrentSkipListMap$KeySpliterator"
+                                                 (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-NONNULL spl-CONCURRENT)
+                                                 (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "jx-cslm-keyset" (lambda (self) (make-vec-spl "java.util.concurrent.ConcurrentSkipListMap$KeySpliterator"
+                                                        (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-NONNULL spl-CONCURRENT)
+                                                        (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "jx-cslm-values" (spl-vec-of "java.util.concurrent.ConcurrentSkipListMap$ValueSpliterator"
+                                       (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT)))
+    (cons "jx-cslm-entryset" (lambda (self) (make-vec-spl "java.util.concurrent.ConcurrentSkipListMap$EntrySpliterator"
+                                                          (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-NONNULL spl-CONCURRENT)
+                                                          (jxc-elems self) (spl-entry-cmp (tmr-cmp-obj (cs-root self))))))
+    (cons "jx-priority-queue" (spl-vec-of "java.util.PriorityQueue$PriorityQueueSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-NONNULL)))
+    (cons "jx-vector" (spl-vec-of "java.util.Vector$VectorSpliterator" spl-OSS))
+    (cons "jx-stack" (spl-vec-of "java.util.Vector$VectorSpliterator" spl-OSS))))
+;; the unmodifiable and synchronized wrappers hand back the collection's own
+(define (spl-of-inner self) (jx-call (jxw-inner self) "spliterator" '()))
+(for-each (lambda (f)
+            (for-each (lambda (t) (when t (register-host-methods! t (list (cons "spliterator" spl-of-inner)))))
+                      (list (list-ref f 1) (list-ref f 2))))
+          jx-families)
+;; any other Collection: the interface's default — a RandomAccess List's
+;; RandomAccessSpliterator, otherwise an IteratorSpliterator, ORDERED for a List
+;; and DISTINCT for a Set
+(define (spl-default self)
+  (cond ((and (jx-isa? self "java.util.List") (jx-isa? self "java.util.RandomAccess"))
+         (make-vec-spl "java.util.AbstractList$RandomAccessSpliterator" spl-OSS (jxc-elems self)))
+        ((jx-isa? self "java.util.List") (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-OSS (spl-it self) (spl-n self)))
+        ((jx-isa? self "java.util.Set") (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT) (spl-it self) (spl-n self)))
+        (else (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED) (spl-it self) (spl-n self)))))
+(hashtable-set! cd-default-tbl "java.util.Collection"
+                (append (hashtable-ref cd-default-tbl "java.util.Collection" '()) (list (list "spliterator" 0 spl-default))))
+;; a persistent collection: a vector's own (PersistentVector$3), a map's
+;; Iterable default (no size, no characteristics), a set's and any seq's the
+;; Collection one
+(set! persistent-spliterator-hook
+  (lambda (obj)
+    (cond ((pvec? obj) (make-vec-spl "clojure.lang.PersistentVector$3" (fxior spl-OSS spl-IMMUTABLE) (seq->list (jolt-seq obj))))
+          ((jolt-map? obj) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" 0 (make-jiterator (jolt-seq obj)) spl-long-max))
+          ((jolt-set? obj) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)
+                                          (make-jiterator (jolt-seq obj)) (jolt-count obj)))
+          (else (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-OSS (make-jiterator (jolt-seq obj)) (jolt-count obj))))))
+;; Stream.spliterator: the source collection's own when the stream came straight
+;; from one (a head stream, as the JDK's pipeline head answers), else one over
+;; the elements; either way it consumes the stream
+(register-host-methods! "stream"
+  (list (cons "spliterator"
+              (lambda (self)
+                (let ((src (stream-source self)) (xs (stream-take! self)))
+                  (if src
+                      (jx-call src "spliterator" '())
+                      (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-ORDERED (make-jiterator xs) spl-long-max)))))))
+;; Spliterators and StreamSupport
+(define (spl-chars c) (jnum->exact c))
+(register-class-statics! "java.util.Spliterators"
+  (list (cons "spliterator"
+              (case-lambda
+                ((src c) (if (jolt-array? src)
+                             (make-vec-spl "java.util.Spliterators$ArraySpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED) (ja->list src))
+                             (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED)
+                                            (spl-it src) (spl-n src))))
+                ((it size c) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED) it (jnum->exact size)))
+                ((arr from to c) (make-vec-spl "java.util.Spliterators$ArraySpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED)
+                                               (list-head (list-tail (ja->list arr) (jnum->exact from)) (- (jnum->exact to) (jnum->exact from)))))))
+        (cons "spliteratorUnknownSize" (lambda (it c) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (spl-chars c) it spl-long-max)))
+        (cons "emptySpliterator" (lambda () (make-vec-spl "java.util.Spliterators$EmptySpliterator$OfRef" (fxior spl-SIZED spl-SUBSIZED) '())))
+        (cons "iterator" (lambda (spl) (make-jhost "jx-spl-adapter" (vector spl spl-none))))))
+;; Spliterators.iterator(spliterator): Spliterators$1Adapter, a one-element lookahead
+(define (spla-fill! a)
+  (let ((st (jhost-state a)))
+    (when (eq? (vector-ref st 1) spl-none) (vector-set! st 1 (spl-advance! (vector-ref st 0))))))
+(jx-class! "jx-spl-adapter" "java.util.Spliterators$1Adapter" '("java.util.Iterator"))
+(register-host-methods! "jx-spl-adapter"
+  (list (cons "hasNext" (lambda (self) (spla-fill! self) (not (eq? (vector-ref (jhost-state self) 1) spl-none))))
+        (cons "next" (lambda (self) (spla-fill! self)
+                       (let ((v (vector-ref (jhost-state self) 1)))
+                         (when (eq? v spl-none) (throw-jvm 'NoSuchElementException jolt-nil))
+                         (vector-set! (jhost-state self) 1 spl-none) v)))))
+(jx-register! "jx-spl-adapter" 'iter
+  (lambda (a) (let loop ((acc '())) (if (jolt-truthy? (jx-call a "hasNext" '())) (loop (cons (jx-call a "next" '()) acc)) (reverse acc))))
+  #f #f #f)
+(register-image-refusal! '("jx-spl-adapter") "an iterator is a position in a walk this process is making; write the collection instead")
+(register-class-statics! "java.util.stream.StreamSupport"
+  (list (cons "stream" (lambda (spl parallel?)
+                         (make-stream 'ref (let loop ()
+                                             (jolt-make-lazy-seq
+                                               (lambda () (let ((v (spl-advance! spl))) (if (eq? v spl-none) jolt-nil (jolt-cons v (loop))))))))))))

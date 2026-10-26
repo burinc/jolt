@@ -999,6 +999,8 @@
     ;; branch and is mis-read as a missing :iterator key (nil). Some libraries
     ;; (e.g. malli's -vmap) iterate a map this way.
     ((string=? name "iterator") (list (make-jiterator (jolt-seq obj))))
+    ;; (.spliterator coll): the host builds it (jutil-concurrent.ss on Chez)
+    ((and (string=? name "spliterator") persistent-spliterator-hook) (list (persistent-spliterator-hook obj)))
     ;; (.reduce coll f) / (.reduce coll f init): clojure.lang.IReduce — every
     ;; persistent collection reduces itself on the JVM.
     ((string=? name "reduce")
@@ -1294,6 +1296,8 @@
 (define reify-class-key " class")
 (define (reify-class-name x)
   (and (jreify? x) (hashtable-ref (car (jreify-methods x)) reify-class-key #f)))
+;; A persistent collection's java.util.Spliterator, or #f on a host that models none.
+(define persistent-spliterator-hook #f)
 ;; Placing the class in the class graph is the host's (the Chez half installs it
 ;; with the graph, proxy.ss); a host without one keeps just the name.
 (define reify-class-graph-hook (lambda (name ifaces) #f))
