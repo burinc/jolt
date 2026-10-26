@@ -194,6 +194,21 @@
   (lambda (x k d) (if (jolt-truthy? (proxy-call x "containsKey" k)) (proxy-call x "get" k) d)))
 (register-contains-arm! (lambda (x) (memq (proxy-coll-kind x) '(map set)))
   (lambda (x k) (jolt-truthy? (proxy-call x (if (eq? (proxy-coll-kind x) 'map) "containsKey" "contains") k))))
+;; …and to =, hash, str and pr, which on the JVM reach it through the
+;; collection's own equals / hashCode / toString and print-method's
+;; java.util.Map / Set / List arms (jolt-iad8f). hash and str call the proxy's
+;; method, so an override answers; = and pr read the elements the proxy's seq
+;; hands out. A Collection that is none of those (ArrayDeque) keeps identity.
+(define (proxy-equiv-kind x)
+  (let ((k (proxy-coll-kind x))) (and k (not (eq? k 'coll)) k)))
+(define (proxy-plain x) (if (proxy-equiv-kind x) (jreify-delegate x) x))
+(register-eq-arm! (lambda (a b) (or (proxy-equiv-kind a) (proxy-equiv-kind b)))
+  (lambda (a b) (jutil-equals? (proxy-plain a) (proxy-plain b))))
+(register-hash-arm! proxy-equiv-kind
+  (lambda (x) (jnum->exact (proxy-call x "hashCode"))))
+(register-str-render! proxy-coll-kind (lambda (x) (proxy-call x "toString")))
+(register-pr-readable-arm! proxy-equiv-kind
+  (lambda (x) (if (jolt-pr-readable?) (jutil-pr (jreify-delegate x)) (jolt-object-repr x #f))))
 
 ;; A base whose own methods call one a subclass overrides — LinkedHashMap's put
 ;; asking removeEldestEntry — is told which proxy stands over it, so that call

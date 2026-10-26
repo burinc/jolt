@@ -1285,7 +1285,15 @@
       (vector (cond ((string? src) src)
                     ((jolt-array? src) (apply string-append (map jolt-str-render-one (seq->list (jolt-seq src)))))
                     (else (jolt-str-render-one src)))
-              0 0))))
+              0 0 #f))))
+;; Slot 3 is set on the string-reader io/reader hands back over an in-memory
+;; source (a jar entry, a baked resource): that one is a BufferedReader on the
+;; JVM, to class and instance? alike, where a constructed StringReader is not.
+(define (string-reader-buffered? x)
+  (let ((st (jhost-state x))) (and (fx>? (vector-length st) 3) (vector-ref st 3))))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "string-reader")
+                                      (string-reader-buffered? x)))
+                     (lambda (x) "java.io.BufferedReader"))
 ;; Reader.read(char[]) and Reader.read(char[], int, int) are BOTH overloads on
 ;; java.io.Reader, and the one-argument form means "fill the whole array". Only
 ;; the three-argument form was destructured here, so `(.read r cbuf)` — the
@@ -2498,7 +2506,8 @@
                    ((string=? iface "PushbackReader")
                     (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))
                    ((string=? iface "StringReader")
-                    (and (jhost? val) (string=? (jhost-tag val) "string-reader")))
+                    (and (jhost? val) (string=? (jhost-tag val) "string-reader")
+                         (not (string-reader-buffered? val))))
                    ((string=? iface "Reader") (reader-jhost? val))
                    ;; ...but a PushbackReader is NOT a BufferedReader: on the JVM
                    ;; it extends FilterReader, and library code branches on the
@@ -2508,9 +2517,16 @@
                    ;; BufferedReader on the JVM, so the string-reader tag keeps
                    ;; answering true; a bare (java.io.StringReader. s) shares that
                    ;; tag and answers with it (known-divergences, :host-model).
+                   ;; what io/reader made is one (a string-reader it marked, a
+                   ;; char-reader classed BufferedReader); a StringReader, a
+                   ;; FileReader or an InputStreamReader is not
                    ((string=? iface "BufferedReader")
-                    (and (reader-jhost? val)
-                         (not (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))))
+                    (cond ((and (jhost? val) (string=? (jhost-tag val) "char-reader") (stream-class val))
+                           => (lambda (c) (jch-isa? c "java.io.BufferedReader")))
+                          ((not (reader-jhost? val)) #f)
+                          ((pushback-reader-tag? (jhost-tag val)) #f)
+                          ((string=? (jhost-tag val) "string-reader") (string-reader-buffered? val))
+                          (else #t)))
                    (else 'none))))
         (if (eq? hit 'none) 'pass (if hit #t #f)))))))
 

@@ -862,7 +862,16 @@
 (jch-register-supers! "java.io.Writer" '("java.io.Closeable" "java.io.Flushable" "java.lang.Appendable"))
 (jch-register-supers! "java.io.File" '("java.io.Serializable" "java.lang.Comparable"))
 (jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
-(jch-register-supers! "java.io.PushbackReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.FilterReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.PushbackReader" '("java.io.FilterReader"))
+;; the classes Files.newInputStream/newOutputStream and Process's streams are
+;; (JDK 21; the Windows ProcessImpl answers buffered streams over its pipes)
+(jch-register-supers! "sun.nio.ch.ChannelInputStream" '("java.io.InputStream"))
+(jch-register-supers! "sun.nio.ch.ChannelOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeInputStream" '("java.io.BufferedInputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeOutputStream" '("java.io.BufferedOutputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullOutputStream" '("java.io.OutputStream"))
 (jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
 (jch-register-supers! "java.io.PrintWriter" '("java.io.Writer"))
 ;; System/out and System/err are PrintStreams — byte streams, not the PrintWriter
