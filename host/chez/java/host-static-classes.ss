@@ -1054,16 +1054,10 @@
         (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self))))))))
   (for-each (lambda (t) (register-host-methods! t atomic-methods))
             (cons atomic-legacy-tag atomic-tags)))
-;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
-;; thread-safe access. The shared-heap HashMap/ArrayList shims already serialize
-;; individual ops adequately for these uses, so the wrapper returns its argument.
-(let ((ident (lambda (c . _) c)))
-  ;; registering under the FQN also registers the short name (shared table)
-  (register-class-statics! "java.util.Collections"
-    (list (cons "synchronizedMap" ident) (cons "synchronizedList" ident)
-          (cons "synchronizedSet" ident) (cons "unmodifiableMap" ident)
-          (cons "unmodifiableList" ident) (cons "unmodifiableSet" ident)
-          (cons "emptyList" (lambda _ (jolt-vector))) (cons "emptyMap" (lambda _ (jolt-hash-map))))))
+;; java.util.Collections/unmodifiable* and synchronized* are views over their
+;; argument (jutil-views.ss); they used to answer the argument itself.
+(register-class-statics! "java.util.Collections"
+  (list (cons "emptyList" (lambda _ (jolt-vector))) (cons "emptyMap" (lambda _ (jolt-hash-map)))))
 
 ;; Collections/enumeration: an Enumeration over a collection's elements, which
 ;; enumeration-seq and SequenceInputStream drive. Collections/list drains any

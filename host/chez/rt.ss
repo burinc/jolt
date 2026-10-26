@@ -3081,6 +3081,13 @@
 ;; java.util.function default methods (negate/andThen/…) for every implementer,
 ;; the lambdas they answer, and Function/identity & co. After streams.ss.
 (load "host/chez/java/fi-defaults.ss")
+;; AbstractCollection / AbstractList / Map / Queue defaults every java.util shim
+;; inherits (containsAll, indexOf, subList, getOrDefault, …), at the end of the
+;; dispatch chain behind fi-defaults.ss's.
+(load "host/chez/java/coll-defaults.ss")
+;; Collections.unmodifiable* / synchronized* views and List/Set/Map.of — after
+;; coll-defaults.ss, whose inherited members the views reach through.
+(load "host/chez/java/jutil-views.ss")
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and

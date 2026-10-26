@@ -96,6 +96,53 @@
   (lambda (h) (make-htable (make-hashtable string-hash string=?)))
   (lambda (t items) (codec-each-kv! items (lambda (k v) (hashtable-set! (htable-h t) k v)))))
 
+;; ---- Collections.unmodifiable* / synchronized* (jutil-views.ss) -------------------
+;; A wrapper travels with the collection it wraps, as the JDK serializes one; a
+;; synchronized one gets a fresh lock, which no image can carry.
+(define codec-unmod-tags (filter values (map (lambda (f) (list-ref f 1)) jx-families)))
+(define codec-sync-tags (filter values (map (lambda (f) (list-ref f 2)) jx-families)))
+(register-image-codec! "java.util.Collections$UnmodifiableCollection"
+  (filter (lambda (t) (not (string=? t "jx-unmod-entryset"))) codec-unmod-tags)
+  (lambda (w) (vector (jhost-tag w) (list (jxw-inner w))))
+  (lambda (tag) (make-jhost tag (vector #f)))
+  (lambda (w items) (vector-set! (jhost-state w) 0 (car items))))
+(register-image-codec! "java.util.Collections$SynchronizedCollection" codec-sync-tags
+  (lambda (w) (vector (jhost-tag w) (list (jxw-inner w))))
+  (lambda (tag) (make-jhost tag (vector #f (make-mutex))))
+  (lambda (w items) (vector-set! (jhost-state w) 0 (car items))))
+;; ---- List.of / Set.of / Map.of and Map.entry ------------------------------------------
+(register-image-codec! "java.util.ImmutableCollections$ListN" '("jx-listn" "jx-list12" "jx-imm-sublist")
+  (lambda (l) (vector (jhost-tag l) (jxl-list l)))
+  (lambda (tag) (make-jhost tag (vector #f)))
+  (lambda (l items) (vector-set! (jhost-state l) 0 (list->vector items))))
+(register-image-codec! "java.util.ImmutableCollections$SetN" '("jx-setn" "jx-set12")
+  (lambda (s) (vector (jhost-tag s) (jxs-list s)))
+  (lambda (tag) (make-jhost tag (vector (vector) (make-hashtable hm-hash jolt=2))))
+  (lambda (s items)
+    (vector-set! (jhost-state s) 0 (list->vector items))
+    (for-each (lambda (x) (hashtable-set! (vector-ref (jhost-state s) 1) x #t)) items)))
+(register-image-codec! "java.util.ImmutableCollections$MapN" '("jx-mapn" "jx-map1")
+  (lambda (m) (vector (jhost-tag m) (codec-kvs (map (lambda (k) (cons k (hashtable-ref (jxm-tbl m) k jolt-nil))) (jxm-keys m)))))
+  (lambda (tag) (make-jhost tag (vector (vector) (make-hashtable hm-hash jolt=2))))
+  (lambda (m items)
+    (let loop ((xs items) (ks '()))
+      (if (null? xs)
+          (vector-set! (jhost-state m) 0 (list->vector (reverse ks)))
+          (begin (hashtable-set! (jxm-tbl m) (car xs) (cadr xs)) (loop (cddr xs) (cons (car xs) ks)))))))
+(register-image-codec! "java.util.KeyValueHolder" '("jx-kvholder")
+  (lambda (e) (vector jolt-nil (list (vector-ref (jhost-state e) 0) (vector-ref (jhost-state e) 1))))
+  (lambda (h) (make-jhost "jx-kvholder" (vector #f #f)))
+  (lambda (e items) (vector-set! (jhost-state e) 0 (car items)) (vector-set! (jhost-state e) 1 (cadr items))))
+(register-image-refusal!
+  '("jx-unmod-entryset" "jx-unmod-entry" "jx-absmap-keyset" "jx-absmap-values" "jx-imm-mapn-entryset"
+    "cd-arraylist-sublist" "cd-ra-sublist" "cd-sublist")
+  "it is a view of another collection, which the image would have to share; write the collection itself")
+(register-image-refusal!
+  '("jx-unmod-iter" "jx-unmod-entry-iter" "jx-unmod-listiter" "jx-imm-listitr" "jx-imm-setn-iter"
+    "jx-imm-set12-iter" "jx-imm-mapn-iter" "jx-absmap-keys-iter" "jx-absmap-values-iter"
+    "cd-arraylist-listitr" "cd-vector-listitr" "cd-abstractlist-listitr")
+  "an iterator is a position in a walk this process is making; write the collection instead")
+
 ;; ---- what cannot travel -----------------------------------------------------------
 (register-image-refusal!
   '("lhm-keyset" "lhm-values" "lhm-entryset" "lhm-reversed" "lhs-reversed" "lhm-entry"
