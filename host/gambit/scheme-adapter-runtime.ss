@@ -194,10 +194,10 @@
         (inexact->exact (floor (* t 1000)))
         (inexact->exact (floor (* (time->seconds t) 1000))))))
 
-;; (sa-gc-tight! on?) -> void
+;; (sa-gc-tight! limit) -> void
 ;; Permitted degradation: Gambit has no in-place collection mode, so this is
 ;; ignored.
-(define (sa-gc-tight! on?) (if #f #f))
+(define (sa-gc-tight! limit) (if #f #f))
 
 ;; (sa-make-large-bytevector n) -> bytevector
 ;; Permitted degradation: an ordinary bytevector; Gambit has no immobile
