@@ -605,20 +605,50 @@ rm -rf "$help_dir"
 nr_dir="$(mktemp -d)"
 mkdir -p "$nr_dir/sub"
 nr_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+# nr_start waits for the banner while the server is alive, and stops waiting
+# the moment it dies, keeping its exit status. A row that fails says which of
+# the three it was — the server exited (with what), it was still running with
+# no banner, or the banner came — and shows the server's whole output, which
+# is stdout and stderr together. CI once saw an empty output with nothing else
+# to go on (jolt-qr7o5).
 nr_start() {
+  rm -f "$nr_dir/out"
   (cd "$nr_dir" && JOLT_PWD="$nr_dir" exec "$nr_jolt" nrepl-server "$@" </dev/null >"$nr_dir/out" 2>&1) &
   nr_pid=$!
+  nr_status=""
   nr_i=0
-  while [ $nr_i -lt 120 ] && ! grep -q 'started on port' "$nr_dir/out" 2>/dev/null; do
+  while [ $nr_i -lt 240 ] && ! grep -q 'started on port' "$nr_dir/out" 2>/dev/null; do
+    if ! kill -0 "$nr_pid" 2>/dev/null; then
+      wait "$nr_pid" 2>/dev/null; nr_status=$?
+      break
+    fi
     sleep 0.5; nr_i=$((nr_i + 1))
   done
 }
-nr_stop() { kill "$nr_pid" 2>/dev/null; wait "$nr_pid" 2>/dev/null; }
+nr_why() {
+  if [ -n "$nr_status" ]; then
+    printf 'server exited %s after %s polls' "$nr_status" "$nr_i"
+  elif kill -0 "$nr_pid" 2>/dev/null; then
+    printf 'server still running after %s polls' "$nr_i"
+  else
+    printf 'server gone after %s polls' "$nr_i"
+  fi
+  printf '; output: [%s]' "$(cat "$nr_dir/out" 2>/dev/null)"
+}
+# a server that hung before its banner may not answer TERM either; KILL it
+# rather than let the wait wedge the gate
+nr_stop() {
+  kill "$nr_pid" 2>/dev/null
+  nr_j=0
+  while [ $nr_j -lt 40 ] && kill -0 "$nr_pid" 2>/dev/null; do sleep 0.5; nr_j=$((nr_j + 1)); done
+  kill -9 "$nr_pid" 2>/dev/null
+  wait "$nr_pid" 2>/dev/null
+}
 nr_start 0 --no-port-file
 if grep -q 'started on port' "$nr_dir/out" && [ ! -e "$nr_dir/.nrepl-port" ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: nrepl-server --no-port-file should start and write no .nrepl-port: $(head -2 "$nr_dir/out")"
+  echo "  FAIL: nrepl-server --no-port-file should start and write no .nrepl-port: $(nr_why)"
   fails=$((fails + 1))
 fi
 nr_stop
@@ -628,7 +658,7 @@ if [ -n "$nr_port" ] && [ "$nr_port" != 0 ] && [ "$(cat "$nr_dir/sub/p.txt" 2>/d
    && [ ! -e "$nr_dir/.nrepl-port" ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: nrepl-server --port-file sub/p.txt 0 should write the bound port there: $(head -2 "$nr_dir/out")"
+  echo "  FAIL: nrepl-server --port-file sub/p.txt 0 should write the bound port there: $(nr_why); sub/p.txt: [$(cat "$nr_dir/sub/p.txt" 2>/dev/null)]"
   fails=$((fails + 1))
 fi
 nr_stop

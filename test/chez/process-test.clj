@@ -646,17 +646,26 @@
 ;; rest of the program has to keep running. A future stopped ticking the moment a
 ;; prompt was reached, which is not what a JVM does with a thread in
 ;; System.in.read() (jolt-p9ua).
+;;
+;; The future APPENDS a line per tick and the row counts lines. It used to spit
+;; the tick number over the file, and a read landing between spit's truncate and
+;; its write saw an empty file, which counted as tick 0 and failed "keeps
+;; running" on a loaded runner (jolt-nb5ng); so did a fixed 400ms window that a
+;; starved future could miss. The file only grows now, and each wait polls for
+;; progress under a deadline far past anything a running future needs, so only
+;; a future that has really stopped can fail the row.
 (let [tickf (str (fs/create-temp-file {:prefix "jp-ticks-" :suffix ".txt"}))
-      nested (str "(future (dotimes [i 100] (Thread/sleep 50) (spit \"" tickf "\" (str i))))"
+      nested (str "(future (dotimes [i 600] (Thread/sleep 50) (spit \"" tickf "\" \"t\\n\" :append true)))"
                   " (read-line)")
       proc (process [jolt-bin "-e" nested])
-      tick (fn [] (let [s (str/trim (slurp tickf))] (when-not (str/blank? s) (parse-long s))))]
-  (loop [n 0] (when (and (< n 200) (nil? (tick))) (Thread/sleep 50) (recur (inc n))))
-  (check-eq "a future runs while the main thread waits on stdin" (some? (tick)) true)
+      ticks (fn [] (count (re-seq #"t\n" (slurp tickf))))
+      wait-past (fn [n] (loop [i 0]
+                          (when (and (< i 400) (<= (ticks) n)) (Thread/sleep 50) (recur (inc i))))
+                  (ticks))]
+  (check-eq "a future runs while the main thread waits on stdin" (pos? (wait-past 0)) true)
   ;; and keeps running, rather than getting one tick in before the read parks
-  (let [before (or (tick) 0)]
-    (Thread/sleep 400)
-    (check-eq "and keeps running" (> (or (tick) 0) before) true))
+  (let [before (ticks)]
+    (check-eq "and keeps running" (> (wait-past (+ before 2)) (+ before 2)) true))
   (.destroyForcibly (:proc proc))
   (fs/delete-if-exists tickf))
 
