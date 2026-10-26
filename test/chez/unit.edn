@@ -2879,7 +2879,7 @@
   {:suite "shadow-emitted" :expr "(let [case-lambda 5] ((fn ([x] x) ([x y] y)) 1))" :expected "1"}
   {:suite "shadow-emitted" :expr "(let [dynamic-wind 5] (binding [*print-length* 3] 1))" :expected "1"}
   {:suite "shadow-emitted" :expr "(let [host-new 5] (.size (java.util.ArrayList.)))" :expected "0"}
-  {:suite "shadow-emitted" :expr "(do (defrecord Rd [x]) (let [record-method-dispatch 5] (.toString (->Rd 1))))" :expected "\"user.Rd{:x 1}\""}
+  {:suite "shadow-emitted" :expr "(do (defrecord Rd [x]) (let [record-method-dispatch 5] (.toString (->Rd 1))))" :expected "\"user.Rd@3c6f1169\""}
   {:suite "shadow-emitted" :expr "(let [host-static-call 5] (String/valueOf 42))" :expected "\"42\""}
   {:suite "shadow-emitted" :expr "(let [host-static-ref 5] (pos? Long/MAX_VALUE))" :expected "true"}
   ;; hashtable-ref is emitted by the devirt ctor-inlining path; reproduces only
@@ -3360,6 +3360,11 @@
   {:suite "repl-printer" :expr "\"hi\"" :expected "\"hi\""}
   {:suite "repl-printer" :expr "{:a \"x\" :b \\y}" :expected "{:a \"x\", :b \\y}"}
   {:suite "repl-printer" :expr "(symbol (clojure.string/replace (pr-str (java.io.File. \"/tmp/x\")) #\" 0x[0-9a-f]+\" \"\"))" :expected "#object[java.io.File \"/tmp/x\"]"}
+  ;; Identity hashes are minted under a CAS spin lock (hasheq.ss); without its
+  ;; acquire/release fences a second thread minted a second id for an object on
+  ;; arm64. Eight threads hash the same fresh objects in opposite orders and
+  ;; must agree on every one.
+  {:suite "identity-hash" :expr "(let [objs (vec (repeatedly 100000 #(java.io.File. \"x\"))) rs (mapv deref (doall (for [k (range 8)] (future (let [v (if (even? k) objs (vec (rseq objs))) hs (mapv #(System/identityHashCode %) v)] (if (even? k) hs (vec (rseq hs))))))))] [(apply = rs) (> (count (set (first rs))) 99000)])" :expected "[true true]"}
   {:suite "repl-printer" :expr "(str \"hi\" \\c)" :expected "\"hic\""}
   {:suite "repl-printer" :expr "(with-out-str (print [\"hi\" 1]))" :expected "\"[hi 1]\""}
   {:suite "repl-printer" :expr "(with-out-str (println \"hi\"))" :expected "\"hi\\n\""}
@@ -3466,13 +3471,12 @@
   ;; here, which is why a parser test that expects a lone surrogate to be rejected
   ;; cannot pass — see the :string-model entry in known-divergences.edn.
   {:suite "string / surrogate halves" :expr "(let [c (str (char 128169))] [(count c) (int (first c)) (nil? (second c)) (= c (str (first c)))])" :expected "[1 128169 true true]"}
-  ;; str of a deftype/record with no toString is its print form: the JVM answers
-  ;; Object.toString there ("user.Rec@3c6f0c28"), which jolt has no identity hash
-  ;; for, so it renders the value instead and drops the leading # of the record
-  ;; marker. A COLLECTION deftype prints in its collection's shape, which has no
-  ;; such marker — dropping a character there produced "1 2 3)".
-  {:suite "printing / str of a deftype" :expr "(do (deftype Sq [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v)))) [(str (->Sq [1 2 3])) (format \"%s\" (->Sq [1 2 3])) (str \"x=\" (->Sq [1 2]))])" :expected "[\"(1 2 3)\" \"(1 2 3)\" \"x=(1 2)\"]"}
-  {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) [(str (->Rc 1)) (str (->Dt 1))])" :expected "[\"user.Rc{:a 1}\" \"user.Dt{:a 1}\"]"}
+  ;; str of a deftype/record with no toString is Object.toString, as on the
+  ;; JVM: "user.Rec@" and the hex of its hashCode, the map hash for a record and
+  ;; the identity hash for a deftype. A COLLECTION deftype too: only pr prints it
+  ;; in its collection's shape.
+  {:suite "printing / str of a deftype" :expr "(do (deftype Sq [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v)))) [(mapv (fn [s] (boolean (re-matches #\"(x=)?user\\.Sq@[0-9a-f]+\" s))) [(str (->Sq [1 2 3])) (format \"%s\" (->Sq [1 2 3])) (str \"x=\" (->Sq [1 2]))]) (pr-str (->Sq [1 2 3]))])" :expected "[[true true true] \"(1 2 3)\"]"}
+  {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) (let [d (->Dt 1)] [(str (->Rc 1)) (= (str d) (str \"user.Dt@\" (Integer/toHexString (System/identityHashCode d))))]))" :expected "[\"user.Rc@3c6f0c28\" true]"}
   ;; a declared toString still wins, collection shape or not
   {:suite "printing / str of a deftype" :expr "(do (deftype Sqt [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v))) Object (toString [_] \"MINE\")) (str (->Sqt [1 2])))" :expected "\"MINE\""}
 

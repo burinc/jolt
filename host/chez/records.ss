@@ -577,6 +577,14 @@
         (let ((e (seq-first s)))
           (loop (jolt-seq (seq-more s)) (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
 
+;; every entry, fields then extension map, as an (k . v) alist
+(define (jrec-entry-pairs r)
+  (let ((fkeys (jrdesc-fkeys (jrec-desc r))) (ext (jrec-ext r)))
+    (let loop ((i (fx- (jrec-nfields r) 1))
+               (acc (if (jolt-nil? ext) '() (jrec-ext-pairs ext))))
+      (if (fx<? i 0) acc
+          (loop (fx- i 1) (cons (cons (vector-ref fkeys i) (jrec-field-ref r i)) acc))))))
+
 ;; lookup with default d: a declared field reads index+vector-ref (a present nil
 ;; returns nil), then the extension map, then d.
 (define (jrec-lookup r k d)
@@ -769,10 +777,28 @@
                 ((seq) (string-append "(" body ")"))
                 ((vec) (string-append "[" body "]"))
                 (else (string-append "#{" body "}"))))))))
-(define (jrec-pr r)                      ; #ns.Name{:k v, :k v}
+;; A defrecord prints #ns.Name{:k v, :k v}. A plain deftype is an Object to
+;; print-method on the JVM, so it prints the #object form over its toString,
+;; identity hash included, and one that implements IDeref prints its
+;; deref-as-map the way an atom does (jolt-jon4). READABLE? is pr's against
+;; print's, which only the #object content's quoting depends on.
+(define (jrec-pr r readable?)
   (cond
     ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
-    (else (jrec-field-pr r))))
+    ((jrec-record? r) (jrec-field-pr r))
+    ((rec-coll-method r "deref")
+     (let ((port (open-output-string)))
+       (deref-print-to! port r jrec-deref-print-state readable?)
+       (get-output-string port)))
+    (else (jolt-object-repr r readable?))))
+;; clojure.core/deref-as-map: an IPending that is not realized is :pending with
+;; no value; a deref that throws is :failed with the throwable.
+(define (jrec-deref-print-state r)
+  (let ((realized (rec-coll-method r "isRealized")))
+    (if (and realized (not (jolt-truthy? (jolt-invoke realized r))))
+        (cons "pending" jolt-nil)
+        (guard (e (#t (cons "failed" (jolt-unwrap-throw e))))
+          (cons "ready" (jolt-invoke (rec-coll-method r "deref") r))))))
 (define (jrec-field-pr r)
   ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
   ;; what the JVM's reader resolves a record literal by, and what its own

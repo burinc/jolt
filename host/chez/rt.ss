@@ -2691,25 +2691,20 @@
 ;; going through it would recurse. Types with no str arm print bare, like the
 ;; JVM's default Object.toString. readable? quotes the content unless
 ;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The class is
-;; followed by the identity hash where jolt-object-repr-hash? (below) says so.
+;; followed by the identity hash.
 (define (jolt-object-content x)
   (or (str-render-by-identity x)
       (let loop ((rs str-render-registry))
         (cond ((null? rs) #f)
               (((caar rs) x) ((cdar rs) x))
               (else (loop (cdr rs)))))))
-;; Which values print their identity hash, as the JVM's #object form does:
-;; a host shim object and, once the enum model has said so, an enum constant.
-;; Naming one costs an insert into the identity-hash table, which a record
-;; printed in bulk (a java.io.File) would pay per object; those print without it.
-(define jolt-object-repr-hash? (lambda (x) (jhost? x)))
+;; Every value printed this way carries its identity hash, as the JVM's
+;; print-object writes (System/identityHashCode o) for any object (jolt-28we).
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
          (content (guard (e (#t #f)) (jolt-object-content x)))
          (head (and (string? cls)
-                    (if (jolt-object-repr-hash? x)
-                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
-                        (string-append "#object[" cls)))))
+                    (string-append "#object[" cls " 0x" (jolt-identity-hex x)))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))

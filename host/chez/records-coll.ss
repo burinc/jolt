@@ -624,7 +624,9 @@
 ;; installs the test, which answers #f until a record constant is declared.
 (define jrec-enum-constant? (lambda (x) #f))
 (define (set-jrec-enum-constant-test! f) (set! jrec-enum-constant? f))
-(register-pr-arm! (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x)))) jrec-pr)
+(let ((pred (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x))))))
+  (register-pr-str-arm! pred (lambda (x) (jrec-pr x #f)))
+  (register-pr-readable-arm! pred (lambda (x) (jrec-pr x #t))))
 
 ;; records are map? and coll? (Clojure: a record IS an associative map). The
 ;; predicates.ss vars hold a snapshot, so re-def-var! after extending. record? is

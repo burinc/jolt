@@ -11,20 +11,27 @@
 
 ;; inner string escape (no surrounding quotes): " \ newline tab return backspace formfeed.
 (define (jolt-str-escape s)
-  (let loop ((cs (string->list s)) (acc '()))
-    (if (null? cs)
-        (list->string (reverse acc))
-        (loop (cdr cs)
-              (let ((c (car cs)))
-                (case c
-                  ((#\") (cons #\" (cons #\\ acc)))
-                  ((#\\) (cons #\\ (cons #\\ acc)))
-                  ((#\newline) (cons #\n (cons #\\ acc)))
-                  ((#\tab) (cons #\t (cons #\\ acc)))
-                  ((#\return) (cons #\r (cons #\\ acc)))
-                  ((#\backspace) (cons #\b (cons #\\ acc)))
-                  ((#\page) (cons #\f (cons #\\ acc)))
-                  (else (cons c acc))))))))
+  ;; most strings need nothing escaped: answer them as they are after one scan,
+  ;; and build a copy only from the first character that does
+  (let ((n (string-length s)))
+    (let scan ((i 0))
+      (cond ((fx=? i n) s)
+            ((str-escape-for (string-ref s i)) (str-escape-from s i n))
+            (else (scan (fx+ i 1)))))))
+(define (str-escape-for c)
+  (case c
+    ((#\") "\\\"") ((#\\) "\\\\") ((#\newline) "\\n") ((#\tab) "\\t")
+    ((#\return) "\\r") ((#\backspace) "\\b") ((#\page) "\\f")
+    (else #f)))
+(define (str-escape-from s start n)
+  (let ((p (open-output-string)))
+    (put-string p (substring s 0 start))
+    (let loop ((i start))
+      (if (fx=? i n)
+          (get-output-string p)
+          (let* ((c (string-ref s i)) (e (str-escape-for c)))
+            (if e (put-string p e) (put-char p c))
+            (loop (fx+ i 1)))))))
 
 ;; A host shim registers a type's readable rendering via register-pr-readable-arm!,
 ;; or register-pr-arm! for types whose str and readable forms match (most host types:

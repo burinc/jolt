@@ -387,11 +387,16 @@
 ;; (hash f) already reports — the same number the JVM prints. Rendering it
 ;; unsigned over 32 bits is what Integer.toHexString does; the old (abs …)
 ;; collapsed h and -h onto one string.
-(define (jolt-identity-hex x)
-  (let loop ((n (bitwise-and (jolt-identity-hasheq x) #xffffffff)) (acc '()))
-    (let ((acc (cons (string-ref "0123456789abcdef" (fxremainder n 16)) acc))
-          (m (fxquotient n 16)))
-      (if (fx=? m 0) (list->string acc) (loop m acc)))))
+(define (jolt-identity-hex x) (jolt-hex32 (jolt-identity-hasheq x)))
+;; Integer.toHexString: N's low 32 bits unsigned, lowercase, no leading zeros.
+;; Filled from the right into one string, which #object printing pays per value.
+(define (jolt-hex32 h)
+  (let ((buf (make-string 8)))
+    (let loop ((n (bitwise-and h #xffffffff)) (i 8))
+      (let ((i (fx- i 1)))
+        (string-set! buf i (string-ref "0123456789abcdef" (fxremainder n 16)))
+        (let ((m (fxquotient n 16)))
+          (if (fx=? m 0) (substring buf i 8) (loop m i)))))))
 ;; (str f) of a fn renders JVM-style — "ns$name@hexhash" — so code that parses
 ;; fn identity out of the string (expound's pprint-fn) finds the $-separated
 ;; class name instead of a raw Chez #<procedure> form.

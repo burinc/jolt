@@ -1010,6 +1010,9 @@
         ;; here while ensuring conversion completes before state changes.
         (cons "set" (lambda (self v)
           (let ((next (atomic-convert self v)))
+            ;; set is a volatile write: what was built before it is visible to
+            ;; a get on another thread
+            (memory-order-release)
             (set-box! (atomic-box self) next)
             jolt-nil)))
         (cons "getAndSet" (lambda (self v)

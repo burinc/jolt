@@ -432,6 +432,10 @@
            ;; other forcer of the cell waited on it for good.
            (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
              (jolt-locks-enter!)
+             ;; the claim is a fresh pair: release its stores before the CAS
+             ;; publishes it, or a reader can see the pointer before the token
+             ;; and take a live claim for a stale one
+             (memory-order-release)
              (if (sa-record-cas! cell L #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire
                  ;; makes every store the previous holder released visible to this
@@ -534,6 +538,8 @@
            ;; returns, so the far edge needs nothing.
            (let ((claim (make-tail-claim w me force-claim-token)))
              (jolt-locks-enter!)
+             ;; a fresh record, published by the CAS: release its fields first
+             (memory-order-release)
              (if (sa-record-cas! s cseq-tail-index w claim)
                  (let ((done #f))
                    (memory-order-acquire)
