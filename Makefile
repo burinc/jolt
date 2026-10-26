@@ -705,9 +705,11 @@ gcpolicy: testbin
 	 [ -n "$$after" ] && [ $$((after * 1048576 * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: a collection left the total heap at $${after}MB, more than 10% over JOLT_MAX_HEAP=256m: the ceiling bounds the TOTAL heap, as -Xmx does, within the collector's working room"; exit 1; }; \
 	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the total heap peaked at $$pk during collections, more than 10% over JOLT_MAX_HEAP=256m (v0.8.12 peaked 23% over)"; exit 1; }; \
 	 fdir=$$(mktemp -d); \
-	 set -- $$(cd "$$fdir" && JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m "$(CURDIR)/$$j" run "$(CURDIR)/test/gc_ceiling_forced_test.clj" 2>&1 | sed -n 's/^peak //p'); pk=$$1; mx=$$3; rmdir "$$fdir"; \
-	 echo "gcpolicy: a ceiling-forced full collection with ~140MB spread over the older generations -> peak $$(($${pk:-0} / 1048576))MB"; \
-	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the heap peaked at $${pk:-?} in a ceiling-forced full collection, more than 10% over JOLT_MAX_HEAP=256m: one collection of every generation holds its copies beside their sources (collect it a generation at a time; jolt-exoj)"; exit 1; }; \
+	 for pad in 0 1024 4096 8192; do \
+	   set -- $$(cd "$$fdir" && JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m "$(CURDIR)/$$j" run "$(CURDIR)/test/gc_ceiling_forced_test.clj" $$pad 2>&1 | sed -n 's/^peak //p'); pk=$$1; mx=$$3; \
+	   echo "gcpolicy: a ceiling-forced full collection with ~140MB spread over the older generations, $${pad}KB more at boot -> peak $$(($${pk:-0} / 1048576))MB"; \
+	   [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { rmdir "$$fdir"; echo "FAIL gcpolicy: the heap peaked at $${pk:-?} near the ceiling with $${pad}KB more at boot, more than 10% over JOLT_MAX_HEAP=256m: a collection under the ceiling copied more than the room left (a whole generation beside its sources; sa-collect-young!, sa-collect-tight; jolt-exoj)"; exit 1; }; \
+	 done; rmdir "$$fdir"; \
 	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
 	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
 	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -ge 67108864 ] && [ $$(($$2 * 2)) -lt "$$1" ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \

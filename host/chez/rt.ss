@@ -803,8 +803,10 @@
 ;;     the OS, with the same back-off as below;
 ;;   - under pressure -- the total plus the data in use, roughly what the next
 ;;     collection may copy, over the limit -- collections mark the older
-;;     generations in place instead of copying them (sa-gc-tight!), and go back
-;;     to copying once that is under three quarters of the limit.
+;;     generations in place instead of copying them (sa-gc-tight!), and a young
+;;     collection whose copies would not fit under the limit leaves generation 1
+;;     for the full one; both go back to copying once that is under three
+;;     quarters of the limit.
 ;; The out-of-memory error is unchanged: only live data that cannot fit raises.
 ;;
 ;; Above SOFT after a collection, force the FULL one a generational collector
@@ -861,7 +863,7 @@
   (gc-fit-reserve! hard)
   (let ((pressure (+ (sa-total-memory-bytes) (sa-bytes-allocated))))
     (cond ((and (not gc-tight?) (> pressure hard))
-           (set! gc-tight? #t) (sa-gc-tight! #t))
+           (set! gc-tight? #t) (sa-gc-tight! hard))
           ((and gc-tight? (< pressure (quotient (* 3 hard) 4)))
            (set! gc-tight? #f) (sa-gc-tight! #f)))))
 ;; --- the GC overhead limit ----------------------------------------------------
