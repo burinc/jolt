@@ -75,9 +75,10 @@
 (defn audit-coverage []
   (let [version (System/getProperty "java.specification.version")
         feature (Integer/parseInt (if (str/starts-with? version "1.") (subs version 2) version))
-        coverage (filter #(<= (or (nth % 5 nil) 21) feature)
-                         (edn/read-string (slurp "test/chez/embedded-resource-api-coverage.edn")))
+        all-rows (edn/read-string (slurp "test/chez/embedded-resource-api-coverage.edn"))
+        coverage (filter #(<= (or (nth % 5 nil) 21) feature) all-rows)
         covered (set (map #(subvec % 0 4) coverage))
+        newer-covered (set (map #(subvec % 0 4) (remove #(<= (or (nth % 5 nil) 21) feature) all-rows)))
         actual (set (concat (mapcat #(javap-rows % false) audited-classes)
                             (javap-rows "java.nio.file.Files" true)
                             [["java.util.jar.JarFile" "baseVersion" "" 0]
@@ -87,7 +88,7 @@
         missing-labels (distinct (keep (fn [[_ _ _ _ label]]
                                          (when-not (str/includes? test-source (str "\"" label "\"")) label))
                                        coverage))
-        missing (sort (remove covered actual))
+        missing (sort (remove (into covered newer-covered) actual))
         extra (when (= feature 21) (sort (remove actual covered)))]
     (when (or (seq missing-labels) (seq missing) (seq extra))
       (let [report {:missing-test-labels (vec missing-labels)
