@@ -2,6 +2,10 @@
 set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+if ! command -v jar >/dev/null 2>&1 || ! command -v javap >/dev/null 2>&1 || ! command -v clojure >/dev/null 2>&1; then
+  printf 'embedded resource JDK/oracle skipped: jar, javap, and clojure are required\n'
+  exit 0
+fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 resources="test/chez/embedded-java-app/resources"
