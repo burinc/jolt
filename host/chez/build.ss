@@ -1767,7 +1767,7 @@
 
 (define (bld-emit-embedded-resource out name bv)
   (put-string out (string-append
-                    "(register-embedded-resource! " (ei-str-lit name)
+                    "(register-public-embedded-resource! " (ei-str-lit name)
                     " " (bld-bytes-lit bv) ")\n")))
 
 ;; --- dependency roots, packed like an uberjar (#1232) ------------------------

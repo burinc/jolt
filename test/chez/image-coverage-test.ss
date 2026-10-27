@@ -74,6 +74,7 @@
     ("enum-map-values" . "(.values (doto (java.util.EnumMap. java.util.concurrent.TimeUnit) (.put java.util.concurrent.TimeUnit/DAYS 1)))")
     ("enum-map-entryset" . "(.entrySet (doto (java.util.EnumMap. java.util.concurrent.TimeUnit) (.put java.util.concurrent.TimeUnit/DAYS 1)))")
     ("enum-map-entry" . "(first (.entrySet (doto (java.util.EnumMap. java.util.concurrent.TimeUnit) (.put java.util.concurrent.TimeUnit/DAYS 1))))")
+    ("jar-attributes-view" . "(.keySet (doto (java.util.jar.Attributes.) (.putValue \"A\" \"one\")))")
     ("treemap-asc-sub" . "(.headMap (java.util.TreeMap. {1 1 2 2}) 2)")
     ("treemap-desc-sub" . "(.descendingMap (java.util.TreeMap. {1 1}))")
     ("treemap-keyset" . "(.keySet (java.util.TreeMap. {1 1}))")

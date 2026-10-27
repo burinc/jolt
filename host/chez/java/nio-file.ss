@@ -3,7 +3,7 @@
 ;; File<->Path bridge. babashka.fs is built entirely on java.nio.file, so this
 ;; is the substrate it runs on.
 ;;
-;; A Path is a jhost tagged "nio-path" whose state is the path string,
+;; A Path is a jhost tagged "nio-path" whose state is (filesystem . path-string),
 ;; normalized as the JDK's path parsers do at construction: runs of separators
 ;; collapse and a trailing one is dropped, and on Windows it is held with "/" and
 ;; rendered with "\" (java/io.ss jolt-path-normalize, path-native). Like
@@ -44,13 +44,10 @@
 ;; neither absolute, because neither names a file by itself. getRoot answers for
 ;; both, which is why the two questions stay separate here.
 (define (npath-absolute-for? windows? s) (jfile-path-absolute-for? windows? s))
-(define (npath-absolute? s) (npath-absolute-for? (nio-windows?) s))
 
 (define (npath-root-for windows? s) (path-root windows? s))
-(define (npath-root s) (npath-root-for (nio-windows?) s))
 
 (define (npath-segs-for windows? s) (path-segments windows? s))
-(define (npath-segs s) (npath-segs-for (nio-windows?) s))
 
 ;; path-rebuild answers "." for a rootless path with no segments, which is what
 ;; a canonical path wants; java.nio.file's empty path is "".
@@ -83,7 +80,6 @@
 (define (npath-normalize-for windows? s)
   (let ((pp (path-parse windows? s)))
     (npath-render pp (npath-fold-dots (ppath-rooted? pp) (ppath-segs pp)))))
-(define (npath-normalize s) (npath-normalize-for (nio-windows?) s))
 
 ;; Paths.get(first, more...) — join with the separator, no normalization. The
 ;; varargs `more` arrives as a jolt String[] (from into-array); spread it.
@@ -106,9 +102,11 @@
       (make-nio-path (npath-join-for (nio-windows?) (list (nio-uri->path first))))
       (npath-get-strings first more)))
 (define (npath-get-strings first more)
-  (make-nio-path (npath-join-for (nio-windows?)
-                                 (cons (npath-string-of first)
-                                       (map npath-string-of (npath-spread-args more))))))
+  (npath-get-strings-on default-nio-filesystem first more))
+(define (npath-get-strings-on fs first more)
+  (make-nio-path-on fs (npath-join-for (if (embedded-nio-filesystem? fs) #f (nio-windows?))
+                                       (cons (npath-string-of first)
+                                             (map npath-string-of (npath-spread-args more))))))
 
 ;; Path.resolve(other): an absolute other replaces this; else concatenate.
 ;; A Windows other that is ROOTED but not absolute ("\b") is neither: it names
@@ -133,9 +131,15 @@
          ((string=? a "") b)
          ((path-sep-for? windows? (string-ref a (- (string-length a) 1))) (string-append a b))
          (else (string-append a (path-join-sep windows? a) b)))))))
+(define (npath-same-provider! self other)
+  (unless (nio-path? other)
+    (throw-jvm 'ClassCastException "argument is not java.nio.file.Path"))
+  (unless (eq? (nio-path-filesystem self) (nio-path-filesystem other))
+    (throw-jvm 'ProviderMismatchException "paths belong to different filesystems")))
 (define (npath-resolve self other)
-  (make-nio-path (npath-resolve-for (nio-windows?)
-                                    (nio-path-str self) (npath-string-of other))))
+  (when (nio-path? other) (npath-same-provider! self other))
+  (npath-like self (npath-resolve-for (nio-path-windows? self)
+                                      (nio-path-str self) (npath-string-of other))))
 
 ;; Path.relativize(other): the path from self to other. The JVM demands both be
 ;; rooted the same way and throws IllegalArgumentException otherwise; this
@@ -147,8 +151,9 @@
         (loop (cdr x) (cdr y))
         (npath-rebuild "" (append (map (lambda (_) "..") x) y)))))
 (define (npath-relativize self other)
-  (make-nio-path (npath-relativize-for (nio-windows?)
-                                       (nio-path-str self) (npath-string-of other))))
+  (npath-same-provider! self other)
+  (npath-like self (npath-relativize-for (nio-path-windows? self)
+                                         (nio-path-str self) (npath-string-of other))))
 
 ;; The parent of the last segment under a root is the ROOT ("C:/a" -> "C:/"),
 ;; and a root has no parent. This answered "/" for every rooted path, so on
@@ -159,13 +164,14 @@
       ((null? segs) jolt-nil)
       ((null? (cdr segs)) (if (ppath-rooted? pp) (ppath-root pp) jolt-nil))
       (else (npath-render pp (reverse (cdr (reverse segs))))))))
-(define (npath-parent s)
-  (let ((r (npath-parent-for (nio-windows?) s)))
-    (if (string? r) (make-nio-path r) r)))
+(define (npath-parent-on fs s)
+  (let ((r (npath-parent-for (if (embedded-nio-filesystem? fs) #f (nio-windows?)) s)))
+    (if (string? r) (make-nio-path-on fs r) r)))
 
-(define (npath-file-name s)
-  (let ((segs (npath-segs s)))
-    (if (null? segs) jolt-nil (make-nio-path (car (reverse segs))))))
+(define (npath-file-name-on fs s)
+  (let ((segs (npath-segs-for (if (embedded-nio-filesystem? fs) #f (nio-windows?)) s)))
+    (if (null? segs) jolt-nil (make-nio-path-on fs (car (reverse segs))))))
+(define (npath-file-name s) (npath-file-name-on default-nio-filesystem s))
 
 ;; ---- the Path jhost ---------------------------------------------------------
 ;; Paths.get("a//b/") is "a/b" on the JDK, as new File("a//b/") already was here;
@@ -181,11 +187,20 @@
         (let ((pp (path-parse #t n)))
           (if (null? (ppath-segs pp)) (ppath-root pp) n))
         n)))
-(define (make-nio-path s)
-  (make-jhost "nio-path" (npath-held-for (nio-windows?) (if (string? s) s (npath-string-of s)))))
-(define (nio-path? x) (and (jhost? x) (string=? (jhost-tag x) "nio-path")))
-(define (nio-path-str p) (jhost-state p))
 (define default-nio-filesystem (make-jhost "nio-filesystem" #f))
+(define (embedded-nio-filesystem? fs)
+  (and (jhost? fs) (string=? (jhost-tag fs) "embedded-nio-filesystem")))
+(define (make-nio-path-on fs s)
+  (make-jhost "nio-path"
+              (cons fs (npath-held-for (if (embedded-nio-filesystem? fs) #f (nio-windows?))
+                                       (if (string? s) s (npath-string-of s))))))
+(define (make-nio-path s) (make-nio-path-on default-nio-filesystem s))
+(define (nio-path? x) (and (jhost? x) (string=? (jhost-tag x) "nio-path")))
+(define (nio-path-str p) (cdr (jhost-state p)))
+(define (nio-path-filesystem p) (car (jhost-state p)))
+(define (nio-path-windows? p) (if (embedded-nio-filesystem? (nio-path-filesystem p)) #f (nio-windows?)))
+(define (embedded-nio-path? p) (and (nio-path? p) (embedded-nio-filesystem? (nio-path-filesystem p))))
+(define (npath-like self s) (make-nio-path-on (nio-path-filesystem self) s))
 
 ;; A path string of any value: a Path -> its string, a File -> its path, else str.
 (define (npath-string-of x)
@@ -208,7 +223,9 @@
                      ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
                      (else #f)))))))
 (define (npath-starts-with self other)
-  (npath-starts-with-for (nio-windows?) (nio-path-str self) (npath-string-of other)))
+  (and (or (not (nio-path? other))
+           (eq? (nio-path-filesystem self) (nio-path-filesystem other)))
+       (npath-starts-with-for (nio-path-windows? self) (nio-path-str self) (npath-string-of other))))
 
 (define (npath-ends-with-for windows? a b)
   ;; b is parsed once and serves both branches -- the rooted one normalizes it
@@ -224,7 +241,9 @@
                 ((string=? (car sa) (car sb)) (loop (cdr sa) (cdr sb)))
                 (else #f))))))
 (define (npath-ends-with self other)
-  (npath-ends-with-for (nio-windows?) (nio-path-str self) (npath-string-of other)))
+  (and (or (not (nio-path? other))
+           (eq? (nio-path-filesystem self) (nio-path-filesystem other)))
+       (npath-ends-with-for (nio-path-windows? self) (nio-path-str self) (npath-string-of other))))
 
 ;; Path.compareTo. UnixPath compares the paths' bytes, unsigned: the first
 ;; difference, else the length difference -- a magnitude, not a sign. WindowsPath
@@ -239,52 +258,65 @@
           (cond ((or (fx=? i nx) (fx=? i ny)) (fx- nx ny))
                 ((fx=? (bytevector-u8-ref x i) (bytevector-u8-ref y i)) (loop (fx+ i 1)))
                 (else (fx- (bytevector-u8-ref x i) (bytevector-u8-ref y i))))))))
-(define (npath-compare s other)
-  (unless (nio-path? other)
-    (throw-jvm 'ClassCastException
-               (string-append "class " (jolt-class-name other)
-                              " cannot be cast to class java.nio.file.Path")))
-  (npath-compare-for (nio-windows?) s (nio-path-str other)))
 
 (define (nio-path-method self name rest)   ; -> boxed result, or #f to fall through
-  (let ((s (nio-path-str self)))
+  (let ((s (nio-path-str self))
+        (windows? (nio-path-windows? self))
+        (embedded? (embedded-nio-path? self)))
     (cond
-      ((string=? name "toString")      (list (path-native s)))
-      ((string=? name "getFileName")   (list (npath-file-name s)))
-      ((string=? name "getParent")     (list (npath-parent s)))
-      ((string=? name "getName")       (list (let ((segs (npath-segs s)) (i (exact (truncate (car rest)))))
-                                               (make-nio-path (list-ref segs i)))))
-      ((string=? name "getNameCount")  (list (length (npath-segs s))))
-      ((string=? name "getRoot")       (list (let ((r (npath-root s)))
-                                               (if (string=? r "") jolt-nil (make-nio-path r)))))
-      ((string=? name "getFileSystem") (list default-nio-filesystem))
-      ((string=? name "normalize")     (list (make-nio-path (npath-normalize s))))
-      ((string=? name "resolve")       (list (npath-resolve self (car rest))))
-      ((string=? name "resolveSibling")(list (let ((par (npath-parent s)))
-                                               (npath-resolve (if (jolt-nil? par) (make-nio-path "") par) (car rest)))))
+      ((string=? name "toString")      (list (if embedded? s (path-native s))))
+      ((string=? name "getFileName")   (list (npath-file-name-on (nio-path-filesystem self) s)))
+      ((string=? name "getParent")     (list (npath-parent-on (nio-path-filesystem self) s)))
+      ((string=? name "getName")       (list (let ((segs (npath-segs-for windows? s)) (i (exact (truncate (car rest)))))
+                                               (npath-like self (list-ref segs i)))))
+      ((string=? name "getNameCount")  (list (length (npath-segs-for windows? s))))
+      ((string=? name "getRoot")       (list (let ((r (npath-root-for windows? s)))
+                                               (if (string=? r "") jolt-nil (npath-like self r)))))
+      ((string=? name "getFileSystem") (list (nio-path-filesystem self)))
+      ((string=? name "normalize")     (list (npath-like self (npath-normalize-for windows? s))))
+      ((string=? name "resolve")       (list (fold-left npath-resolve self (npath-spread-args rest))))
+      ((string=? name "resolveSibling")(list (let ((par (npath-parent-on (nio-path-filesystem self) s)))
+                                               (npath-resolve (if (jolt-nil? par) (npath-like self "") par) (car rest)))))
       ((string=? name "relativize")    (list (npath-relativize self (car rest))))
-      ((string=? name "toAbsolutePath")(list (make-nio-path (if (npath-absolute? s) s (jfile-abs s)))))
-      ((string=? name "toRealPath")    (list (let* ((abs (if (npath-absolute? s) s (jfile-abs s)))
-                                                    (fp (project-relative abs))
-                                                    (rp (nio-realpath fp)))
-                                               (cond (rp (make-nio-path rp))
-                                                     ((file-exists? fp) (make-nio-path (npath-normalize abs)))
-                                                     (else (jolt-throw (jolt-ex-info abs empty-pmap)))))))  ; missing path throws
-      ((string=? name "toFile")        (list (make-jfile s)))
-      ;; a java.net.URI, as File.toURI answers (io.ss jfile->uri) — this was a
-      ;; bare string, with no .getPath, no encoding and no directory slash
-      ((string=? name "toUri")         (list (jfile->uri s)))
+      ((string=? name "toAbsolutePath")(list (if embedded?
+                                               (begin
+                                                 (embedded-file-system-ensure-open (nio-path-filesystem self))
+                                                 (npath-like self (embedded-nio-key self)))
+                                               (npath-like self (if (npath-absolute-for? windows? s) s (jfile-abs s))))))
+      ((string=? name "toRealPath")    (list (if embedded?
+                                               (begin
+                                                 (embedded-file-system-ensure-open (nio-path-filesystem self))
+                                                 (embedded-nio-require self)
+                                                 (npath-like self (embedded-nio-key self)))
+                                               (let* ((abs (if (npath-absolute-for? windows? s) s (jfile-abs s)))
+                                                      (fp (project-relative abs))
+                                                      (rp (nio-realpath fp)))
+                                                 (cond (rp (npath-like self rp))
+                                                       ((file-exists? fp) (npath-like self (npath-normalize-for windows? abs)))
+                                                       (else (jolt-throw (jolt-ex-info abs empty-pmap))))))))  ; missing path throws
+      ((string=? name "toFile")        (list (if embedded?
+                                               (throw-jvm 'UnsupportedOperationException "embedded paths have no File")
+                                               (make-jfile s))))
+      ((string=? name "toUri")         (list (if embedded? (embedded-nio-path-uri self) (jfile->uri s))))
+      ((string=? name "register")      (list (if embedded?
+                                               (embedded-nio-path-register self (car rest))
+                                               (throw-jvm 'UnsupportedOperationException "watch service is not supported"))))
       ((string=? name "startsWith")    (list (npath-starts-with self (car rest))))
       ((string=? name "endsWith")      (list (npath-ends-with self (car rest))))
-      ((string=? name "isAbsolute")    (list (npath-absolute? s)))
-      ((string=? name "subpath")       (list (let ((segs (npath-segs s))
+      ((string=? name "isAbsolute")    (list (npath-absolute-for? windows? s)))
+      ((string=? name "subpath")       (list (let ((segs (npath-segs-for windows? s))
                                                    (b (exact (truncate (car rest))))
                                                    (e (exact (truncate (cadr rest)))))
-                                               (make-nio-path (npath-rebuild "" (list-head (list-tail segs b) (- e b)))))))
-      ((string=? name "compareTo")     (list (npath-compare s (car rest))))
-      ((string=? name "equals")        (list (and (nio-path? (car rest)) (string=? s (nio-path-str (car rest))))))
-      ((string=? name "hashCode")      (list (string-hash s)))
-      ((string=? name "iterator")      (list (list->cseq (map make-nio-path (npath-segs s)))))
+                                               (npath-like self (npath-rebuild "" (list-head (list-tail segs b) (- e b)))))))
+      ((string=? name "compareTo")     (list (begin
+                                               (npath-same-provider! self (car rest))
+                                               (npath-compare-for windows? s (nio-path-str (car rest))))))
+      ((string=? name "equals")        (list (and (nio-path? (car rest))
+                                                 (eq? (nio-path-filesystem self) (nio-path-filesystem (car rest)))
+                                                 (string=? s (nio-path-str (car rest))))))
+      ((string=? name "hashCode")      (list (equal-hash (jhost-state self))))
+      ((string=? name "iterator")      (list (list->cseq (map (lambda (segment) (npath-like self segment))
+                                                              (npath-segs-for windows? s)))))
       (else #f))))
 
 ;; ---- glob / regex PathMatcher -----------------------------------------------
@@ -357,22 +389,27 @@
 
 ;; getPathMatcher("glob:..."|"regex:...") -> a matcher jhost; .matches(path) is
 ;; a whole-string match of the compiled pattern against the path's string form.
-(define (npath-make-matcher syntax-and-pattern)
+(define (npath-make-matcher-on windows? syntax-and-pattern)
   (let* ((idx (let loop ((i 0)) (cond ((>= i (string-length syntax-and-pattern)) #f)
                                       ((char=? (string-ref syntax-and-pattern i) #\:) i)
                                       (else (loop (+ i 1))))))
          (syntax (if idx (substring syntax-and-pattern 0 idx) "glob"))
          (pat (if idx (substring syntax-and-pattern (+ idx 1) (string-length syntax-and-pattern)) syntax-and-pattern))
-         (rx (jolt-re-pattern (cond ((string=? syntax "glob") (npath-glob->regex pat))
+         (rx (jolt-re-pattern (cond ((string=? syntax "glob") (npath-glob->regex-for windows? pat))
                                     ((string=? syntax "regex") pat)
                                     (else (throw-jvm (quote UnsupportedOperationException) (string-append "unrecognized path-matcher syntax: " (jolt-final-str syntax))))))))
     (make-jhost "nio-path-matcher" rx)))
+(define (npath-make-matcher syntax-and-pattern)
+  (npath-make-matcher-on (nio-windows?) syntax-and-pattern))
 
 (register-host-methods! "nio-path-matcher"
   (list (cons "matches" (lambda (self p)
-                          ;; the JDK matches the path's rendered string: a
-                          ;; regex: pattern on Windows is written against "\\"
-                          (and (jolt-truthy? (jolt-re-matches (jhost-state self) (path-native (npath-string-of p)))) #t)))))
+                          (and (jolt-truthy?
+                                (jolt-re-matches (jhost-state self)
+                                                 (if (embedded-nio-path? p)
+                                                     (npath-string-of p)
+                                                     (path-native (npath-string-of p)))))
+                               #t)))))
 
 (register-host-methods! "nio-filesystem"
   (list (cons "getPathMatcher" (lambda (self spec) (npath-make-matcher (npath-string-of spec))))
@@ -382,7 +419,9 @@
 ;; ---- construction statics + File bridge -------------------------------------
 (let ((paths-statics (list (cons "get" npath-get)))
       (path-statics  (list (cons "of" npath-get)))
-      (fs-statics    (list (cons "getDefault" (lambda () default-nio-filesystem)))))
+      (fs-statics    (list (cons "getDefault" (lambda () default-nio-filesystem))
+                           (cons "newFileSystem" (lambda args (apply embedded-file-system-new args)))
+                           (cons "getFileSystem" (lambda (uri) (embedded-file-system-get uri))))))
   (register-class-statics! "Paths" paths-statics)
   (register-class-statics! "java.nio.file.Paths" paths-statics)
   (register-class-statics! "Path" path-statics)
@@ -406,10 +445,12 @@
 ;; instance? and class but NOT value-host-tags, which is exactly the drift the
 ;; registry exists to prevent: (extend-protocol P java.nio.file.Path …) then
 ;; threw "No method" on a value whose (class …) said java.nio.file.Path.
-(register-str-render! nio-path? (lambda (p) (path-native (nio-path-str p))))
+(register-str-render! nio-path?
+                      (lambda (p) (if (embedded-nio-path? p) (nio-path-str p) (path-native (nio-path-str p)))))
 (register-eq-arm! (lambda (a b) (and (nio-path? a) (nio-path? b)))
-                  (lambda (a b) (string=? (nio-path-str a) (nio-path-str b))))
-(register-hash-arm! nio-path? (lambda (p) (string-hash (nio-path-str p))))
+                  (lambda (a b) (and (eq? (nio-path-filesystem a) (nio-path-filesystem b))
+                                     (string=? (nio-path-str a) (nio-path-str b)))))
+(register-hash-arm! nio-path? (lambda (p) (equal-hash (jhost-state p))))
 
 ;; ---- Files statics ----------------------------------------------------------
 ;; Each Files op takes Path / File / String args plus trailing varargs (options /
@@ -791,9 +832,10 @@
 (register-seq-arm! dir-stream? (lambda (x) (list->cseq (jhost-state x))))
 (register-seq-arm! nio-path?
   (lambda (x)
-    (let ((segs (npath-segs (nio-path-str x))))
+    (let ((segs (npath-segs-for (nio-path-windows? x) (nio-path-str x))))
       ;; the empty path iterates as one empty component (java parity)
-      (list->cseq (map make-nio-path (if (null? segs) '("") segs))))))
+      (list->cseq (map (lambda (segment) (npath-like x segment))
+                       (if (null? segs) '("") segs))))))
 (let ((prev jolt-close))
   (set! jolt-close (lambda (x) (if (dir-stream? x) jolt-nil (prev x))))
   (def-var! "clojure.core" "__close" jolt-close))
@@ -1594,17 +1636,19 @@
 (define (fc-close! self) jolt-nil)
 (let ((fc-statics
        (list (cons "open" (lambda (path . opts)
-                            (let ((fp (nfp path)))
-                              (when (and (nio-opts-have? opts oopt-sym 'create) (not (file-exists? fp)))
-                                (close-port (open-file-output-port fp (file-options no-fail))))
-                              (if (nio-opts-have? opts oopt-sym 'delete-on-close)
-                                  (begin
-                                    (when (nio-windows?)
-                                      (throw-jvm 'UnsupportedOperationException "DELETE_ON_CLOSE not supported"))
-                                    (let ((size (nio-size fp (nio-shown path))))
-                                      (guard (_ (#t #f)) (delete-file fp))
-                                      (make-jhost "file-channel" (vector fp size))))
-                                  (make-jhost "file-channel" (vector fp #f)))))))))
+                            (if (embedded-nio-path? path)
+                                (embedded-nio-dispatch "FileChannel/open" path (cons path opts))
+                                (let ((fp (nfp path)))
+                                  (when (and (nio-opts-have? opts oopt-sym 'create) (not (file-exists? fp)))
+                                    (close-port (open-file-output-port fp (file-options no-fail))))
+                                  (if (nio-opts-have? opts oopt-sym 'delete-on-close)
+                                      (begin
+                                        (when (nio-windows?)
+                                          (throw-jvm 'UnsupportedOperationException "DELETE_ON_CLOSE not supported"))
+                                        (let ((size (nio-size fp (nio-shown path))))
+                                          (guard (_ (#t #f)) (delete-file fp))
+                                          (make-jhost "file-channel" (vector fp size))))
+                                      (make-jhost "file-channel" (vector fp #f))))))))))
   (register-class-statics! "FileChannel" fc-statics)
   (register-class-statics! "java.nio.channels.FileChannel" fc-statics))
 (register-host-methods! "file-channel"
@@ -1781,11 +1825,30 @@
                                               (or (and uid (nio-uid->name uid)) (getenv "USER") ""))))))))
   (set! files-accum-chunks (cons files-owner2 files-accum-chunks)))
 
+(define (nio-files-embedded-only operation)
+  (lambda args
+    (throw-jvm 'UnsupportedOperationException
+               (string-append "default filesystem operation is not supported: " operation))))
+(set! files-accum-chunks
+      (cons
+       (map (lambda (name) (cons name (nio-files-embedded-only name)))
+            '("newByteChannel" "newBufferedReader" "newBufferedWriter" "readString"
+              "writeString" "setOwner" "list" "walk" "find" "lines" "mismatch"
+              "probeContentType" "getFileStore" "getFileAttributeView"))
+       files-accum-chunks))
+
+(define (nio-files-provider-wrap operation f)
+  (lambda args
+    (let ((embedded (exists (lambda (arg) (and (embedded-nio-path? arg) arg)) args)))
+      (if embedded
+          (embedded-nio-dispatch operation embedded args)
+          (apply f args)))))
+
 ;; One-shot Files registration: deduplicate the accumulated alist (last wins)
 ;; and register the live member set under both the short and FQN class name.
 (let ((seen (make-hashtable string-hash string=?))
       (live '()))
-  (for-each (lambda (p) (hashtable-set! seen (car p) (cdr p)))
+  (for-each (lambda (p) (hashtable-set! seen (car p) (nio-files-provider-wrap (car p) (cdr p))))
             (apply append (reverse files-accum-chunks)))
   (for-each (lambda (k) (set! live (cons (cons k (hashtable-ref seen k #f)) live)))
             (vector->list (hashtable-keys seen)))

@@ -3124,6 +3124,18 @@
 ;; ZipFile, and the central-directory index the loader's jar roots share.
 (load "host/chez/java/zip-file.ss")
 
+;; The application image's resources as a read-only NIO filesystem.
+(load "host/chez/java/embedded-archive.ss")
+
+;; Read-only channels and Files stream producers over those resources.
+(load "host/chez/java/embedded-channels.ss")
+
+;; Manifest and Attributes values used by archives and connections.
+(load "host/chez/java/embedded-manifest.ss")
+
+;; URLConnection and JarURLConnection over those resources.
+(load "host/chez/java/embedded-url.ss")
+
 ;; ZipOutputStream on the out-stream frame.
 (load "host/chez/java/zip-out-entries.ss")
 

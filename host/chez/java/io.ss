@@ -141,13 +141,38 @@
 (define (file-path-of x) (if (jfile? x) (jfile-path x) (jolt-str-render-one x)))
 
 ;; Resources baked into a standalone binary by `jolt build` (deps.edn
-;; :jolt/build :embed). The build emits a register-embedded-resource! per file at
-;; heap-build time, so the contents live in the boot image — io/resource serves
+;; :jolt/build :embed). The build emits a register-public-embedded-resource! per
+;; file at heap-build time, so the contents live in the boot image — io/resource serves
 ;; them with no file on disk. An embedded hit reads through slurp/reader exactly
 ;; like a jfile would.
 (define embedded-resources (make-hashtable equal-hash equal?))
+(define public-embedded-resources (make-hashtable string-hash string=?))
 (define (register-embedded-resource! name content)
   (hashtable-set! embedded-resources name content))
+(define (register-public-embedded-resource! name content)
+  (register-embedded-resource! name content)
+  (hashtable-set! public-embedded-resources name #t))
+(define (embedded-resource-names)
+  (vector->list (hashtable-keys public-embedded-resources)))
+(define embedded-archive-name "jolt-embedded-resources.jar")
+(define embedded-archive-prefix "jar:file:jolt-embedded-resources.jar!/")
+(define (embedded-directory-name name)
+  (let* ((n (string-length name))
+         (prefix (if (or (= n 0) (not (char=? (string-ref name (- n 1)) #\/)))
+                     (string-append name "/") name)))
+    (and (or (= n 0)
+             (exists (lambda (resource)
+                       (and (> (string-length resource) (string-length prefix))
+                            (string=? (substring resource 0 (string-length prefix)) prefix)))
+                     (embedded-resource-names)))
+         prefix)))
+(define (embedded-directory? name) (and (embedded-directory-name name) #t))
+(define (embedded-archive-url name)
+  (let ((dir (embedded-directory-name name)))
+    (and dir (make-embedded-res (string-append embedded-archive-prefix dir) #f))))
+(define (embedded-resource-url name)
+  (let ((content (embedded-resource-ref name)))
+    (if content (make-embedded-res name content) (embedded-archive-url name))))
 (define-record-type embedded-res (fields name content) (nongenerative jolt-embres-v1))
 ;; io/resource returns a java.net.URL from BOTH branches: a file: URL (a jhost
 ;; "url") for a hit on a source root, and this embedded-res (class java.net.URL,
@@ -158,26 +183,47 @@
 ;; it. Registered below (after record-method-dispatch's arm registry exists)
 ;; rather than inline, so both branches stay in one place.
 (define (embedded-res-method obj name args)
-  (let ((nm (embedded-res-name obj)))
+  (let* ((nm (embedded-res-name obj))
+         (directory? (not (embedded-res-content obj)))
+         (file (if directory? (substring nm 4 (string-length nm)) nm)))
     (cond
-      ((string=? name "getPath")     (list nm))
-      ((string=? name "getFile")     (list nm))
-      ((string=? name "getName")     (list (path-last-segment nm)))
+      ((string=? name "getPath")     (list file))
+      ((string=? name "getFile")     (list file))
+      ((string=? name "getName")     (list (path-last-segment file)))
       ((string=? name "toString")    (list nm))
       ;; embedded content has no file on disk; the JVM would report a jar: URL for
       ;; a resource inside an artifact, so "jar" is the honest protocol here.
       ((string=? name "getProtocol") (list "jar"))
       ((string=? name "exists")      (list #t))
-      ((string=? name "isDirectory") (list #f))
-      ((string=? name "isFile")      (list #t))
+      ((string=? name "isDirectory") (list directory?))
+      ((string=? name "isFile")      (list (not directory?)))
+      ((string=? name "equals")
+       (list (and (embedded-res? (car args)) (string=? nm (embedded-res-name (car args))))))
+      ((string=? name "hashCode")    (list (string-hash nm)))
+      ((string=? name "getHost")     (list ""))
+      ((string=? name "getAuthority") (list jolt-nil))
+      ((or (string=? name "getPort") (string=? name "getDefaultPort")) (list -1))
+      ((or (string=? name "getQuery") (string=? name "getUserInfo") (string=? name "getRef")) (list jolt-nil))
+      ((string=? name "toExternalForm") (list nm))
+      ((string=? name "sameFile")
+       (list (and (embedded-res? (car args)) (string=? nm (embedded-res-name (car args))))))
+      ((string=? name "toURI")      (list (uri-ctor nm)))
+      ((string=? name "openConnection")
+       (begin
+         (when (pair? args)
+           (cond ((jolt-nil? (car args))
+                  (throw-jvm 'IllegalArgumentException "proxy can not be null"))
+                 ((not (and (jhost? (car args)) (string=? (jhost-tag (car args)) "proxy")))
+                  (throw-jvm 'ClassCastException "argument is not java.net.Proxy"))))
+         (list (embedded-url-open-connection obj))))
+      ((string=? name "getContent")
+       (embedded-jar-connection-method (embedded-url-open-connection obj) "getContent" args))
       ((string=? name "openStream")
        ;; A byte stream, not a reader: a URL's openStream is byte-level on the
        ;; JVM, and a baked resource can be binary (the same StringReader ->
        ;; InputStream fix url-open-stream records for file: URLs). io/reader
        ;; still decodes whatever it is handed.
-       (let ((c (embedded-res-content obj)))
-         (list (make-in-stream (open-bytevector-input-port
-                                (if (bytevector? c) c (string->utf8 c)))))))
+       (list (embedded-connection-stream (embedded-url-open-connection obj))))
       (else #f))))
 
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
@@ -1871,6 +1917,9 @@
 ;; (str resource) is the resource name, like URL.toString — which also gives the
 ;; printer's #object[…] fallback its content.
 (register-str-render! embedded-res? (lambda (x) (embedded-res-name x)))
+(register-eq-arm! (lambda (a b) (and (embedded-res? a) (embedded-res? b)))
+                  (lambda (a b) (string=? (embedded-res-name a) (embedded-res-name b))))
+(register-hash-arm! embedded-res? (lambda (x) (string-hash (embedded-res-name x))))
 
 ;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch, not the
 ;; string-path shims in the base jolt-host-call. Route through
@@ -2931,8 +2980,8 @@
 ;; contributes nothing here.
 (define (resolve-resource name)
   (let* ((nm (resource-name-arg name))
-         (emb (embedded-resource-ref nm)))
-    (if emb (make-embedded-res nm emb)
+         (emb (embedded-resource-url nm)))
+    (if emb emb
         (let loop ((roots (get-source-roots)))
           (if (null? roots)
               jolt-nil
@@ -3038,9 +3087,9 @@
 ;; and every candidate is announced for the reason resolve-resource announces.
 (define (cl-get-resources self name)
   (let* ((nm (resource-name-arg name))
-         (emb (embedded-resource-ref nm)))
+         (emb (embedded-resource-url nm)))
     (let loop ((roots (get-source-roots))
-               (acc (if emb (list (make-embedded-res nm emb)) '())))
+               (acc (if emb (list emb) '())))
       (cond ((null? roots) (list->cseq (reverse acc)))
             (else
              (let ((cand (resource-candidate (car roots) nm)))

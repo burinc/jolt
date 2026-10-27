@@ -100,6 +100,7 @@
 (register-image-refusal!
   '("lhm-keyset" "lhm-values" "lhm-entryset" "lhm-reversed" "lhs-reversed" "lhm-entry"
     "enum-map-keyset" "enum-map-values" "enum-map-entryset" "enum-map-entry"
+    "jar-attributes-view"
     "treemap-asc-sub" "treemap-desc-sub" "treemap-keyset" "treemap-values"
     "treemap-submap-values" "treemap-entryset" "treemap-asc-entryset" "treemap-desc-entryset"
     "treemap-entry")
@@ -108,7 +109,7 @@
   '("arraylist-iterator" "linkedlist-iterator" "arraydeque-iterator" "arrays-aslist-iterator"
     "immutable-list-iterator" "hashset-iterator" "lhs-iterator" "lhm-keyset-iterator" "lhm-values-iterator" "lhm-entryset-iterator"
     "enum-set-regular-iterator" "enum-set-jumbo-iterator" "enum-map-keyset-iterator"
-    "enum-map-values-iterator" "enum-map-entryset-iterator"
+    "enum-map-values-iterator" "enum-map-entryset-iterator" "jar-attributes-view-iterator"
     "treemap-entry-iterator" "treemap-key-iterator" "treemap-value-iterator"
     "treemap-submap-entry-iterator" "treemap-submap-key-iterator"
     "treemap-desc-submap-entry-iterator" "treemap-desc-submap-key-iterator"

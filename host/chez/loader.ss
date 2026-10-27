@@ -3263,6 +3263,8 @@
 ;; resolver instead of opening the key as a filesystem path.
 (def-var! "jolt.host" "embedded-resource?"
   (lambda (name) (if (embedded-resource-has? name) #t #f)))
+(def-var! "jolt.host" "embedded-resource-names"
+  (lambda () (make-pvec (list->vector (sort string<? (embedded-resource-names))))))
 
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".
