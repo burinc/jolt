@@ -46,6 +46,8 @@
 (register-seq-arm-last! (lambda (x) (and (jx-op x 2) #t))
   (lambda (x) (let ((xs ((jx-op x 2) x))) (if (null? xs) jolt-nil (list->cseq xs)))))
 (register-count-arm-last! (lambda (x) (and (jx-op x 1) #t)) (lambda (x) ((jx-op x 1) x)))
+;; reduce folds the element list itself (seq.ss jolt-reduce-elems-hook)
+(set! jolt-reduce-elems-hook (lambda (x) (let ((el (jx-op x 2))) (and el (el x)))))
 (register-contains-arm-last! (lambda (x) (and (jx-op x 3) #t)) (lambda (x k) (and ((jx-op x 3) x k) #t)))
 (register-get-arm-last! (lambda (x) (and (jx-op x 4) #t)) (lambda (x k d) ((jx-op x 4) x k d)))
 ;; nth over a RandomAccess one, as RT.nth reads a java.util.List by get

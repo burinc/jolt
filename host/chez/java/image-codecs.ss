@@ -19,7 +19,7 @@
 
 ;; ---- HashMap, its look-alikes, Properties and HashSet ---------------------------
 ;; header #(tag defaults); a Properties keeps its defaults, not System's writethrough
-(register-image-codec! "java.util.HashMap" '("hashmap" "properties")
+(register-image-codec! "java.util.HashMap" '("hashmap" "properties" "chm")
   (lambda (m)
     (vector (vector (jhost-tag m) (or (and (string=? (jhost-tag m) "properties") (props-defaults m)) jolt-nil))
             (codec-kvs (map (lambda (k) (cons k (hashtable-ref (hm-tbl m) k jolt-nil))) (hm-keys-ordered m)))))
@@ -186,13 +186,15 @@
     "jx-reverse-deque" "jx-cow-sublist" "jx-cslm-sub" "jx-cslm-dsub" "jx-cslm-keyset" "jx-cslm-values"
     "jx-cslm-subvalues" "jx-cslm-entryset" "jx-cslm-subentryset" "jx-cslm-dsubentryset"
     "jx-seq-keyset" "jx-seq-values" "jx-seq-entryset"
-    "jx-reverse-linkedlist" "jx-cow-reversed" "jx-rev-sortedmap" "jx-rev-sortedset")
+    "jx-reverse-linkedlist" "jx-cow-reversed" "jx-rev-sortedmap" "jx-rev-sortedset"
+    "jx-hm-keyset" "jx-hm-values" "jx-hm-entryset" "jx-hm-node")
   "it is a view of another collection, which the image would have to share; write the collection itself")
 (register-image-refusal!
   '("jx-vector-itr" "jx-vector-enum" "jx-enum-iterator" "jx-reverse-list-itr" "jx-hashtable-enumerator"
     "jx-pq-itr" "jx-clq-itr" "jx-cld-itr" "jx-cld-desc-itr" "jx-cow-itr" "jx-cow-sublist-itr"
     "jx-cslm-entry-itr" "jx-cslm-key-itr" "jx-cslm-value-itr" "jx-cslm-sub-entry-itr" "jx-cslm-sub-key-itr"
-    "jx-cslm-dsub-entry-itr" "jx-cslm-dsub-key-itr" "jx-cslm-sub-value-itr")
+    "jx-cslm-dsub-entry-itr" "jx-cslm-dsub-key-itr" "jx-cslm-sub-value-itr"
+    "jx-hm-key-itr" "jx-hm-value-itr" "jx-hm-entry-itr")
   "an iterator is a position in a walk this process is making; write the collection instead")
 
 ;; ---- what cannot travel -----------------------------------------------------------

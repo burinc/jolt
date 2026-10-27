@@ -410,7 +410,14 @@
 (define (iface-method v method nargs)
   (cond ((jrec? v)
          (if nargs (jrec-method-arity v method nargs) (jrec-method v method)))
-        ((jreify? v) (reify-method-ref v method))
+        ;; a reify answers the methods it writes. Its iterator may also be one an
+        ;; abstract class it declares supplies (a proxy over java.util.AbstractList
+        ;; inherits one), which is what the seqable check asks; any other
+        ;; inherited member is asked for by calling it (an abstract class's table
+        ;; also holds stubs for what it leaves abstract, which are no answer here)
+        ((jreify? v) (or (reify-method-ref v method)
+                         (and abstract-class-method-hook (string=? method "iterator")
+                              (abstract-class-method-hook v method))))
         (else #f)))
 ;; a record counts its declared fields plus anything assoc'd on beyond them
 (define (jrec-field-count coll)

@@ -1714,3 +1714,709 @@
                 (list (cons "reversed" (lambda (self) (make-jhost tag (vector (jx-call (jxw-inner self) (list-ref r 4) '())))))))))
           '(("jx-rev-sortedmap" "jx-unmod-sortedmap" "java.util.ReverseOrderSortedMapView" "java.util.SortedMap" "descendingMap" map)
             ("jx-rev-sortedset" "jx-unmod-sortedset" "java.util.ReverseOrderSortedSetView" "java.util.SortedSet" "descendingSet" set)))
+
+;; ======================================================================================
+;; HashMap's views
+;; ======================================================================================
+;; keySet / values / entrySet of a HashMap: live views of the map, as the JDK's
+;; HashMap$KeySet / $Values / $EntrySet are. Removing through one removes from
+;; the map, a later put shows through, and an entry is a HashMap$Node whose
+;; getValue reads the map and whose setValue writes it. Their iterators are
+;; fail-fast: the map replaces its key-order list on every structural change
+;; (host-static-classes.ss hm-note-key! / hm-drop-key!), so an iterator holds the
+;; list it started from and throws ConcurrentModificationException when the
+;; map's is another. State #(map); an iterator's #(map remaining last kind expected).
+(define (hmv-map v) (vector-ref (jhost-state v) 0))
+(define (hmv-ref m k) (hashtable-ref (hm-tbl m) k jolt-nil))
+;; A node is the map's entry until its key is removed (or the map cleared):
+;; then it is detached, keeping the value it last saw even if the key comes
+;; back. Each map that has handed out nodes keeps a generation per removed key
+;; and one for clears, which a node compares with the ones it was made under.
+;; State #(map key last generation map-generations).
+(define hmn-gens (make-weak-eq-hashtable))   ; map -> #(clear-gen key-table)
+(define hmn-gens-mu (make-mutex))
+(define (hmn-gen* g k)
+  ;; most maps remove nothing between handing out nodes: skip the key probe then
+  (let ((kt (vector-ref g 1)))
+    (if (fx=? 0 (hashtable-size kt)) (vector-ref g 0) (+ (vector-ref g 0) (hashtable-ref kt k 0)))))
+(define (hmn-track! m)
+  ;; this map's generations, made on its first node
+  (or (hashtable-ref hmn-gens m #f)
+      (jolt-with-mutex hmn-gens-mu
+        (or (hashtable-ref hmn-gens m #f)
+            (let ((g (vector 0 (make-hashtable hm-hash jolt=2)))) (hashtable-set! hmn-gens m g) g)))))
+(set! hm-detach-hook
+  (lambda (m k)
+    (let ((g (hashtable-ref hmn-gens m #f)))
+      (when g
+        (jolt-with-mutex hmn-gens-mu
+          (if (eq? k hm-detach-hook)
+              (vector-set! g 0 (+ 1 (vector-ref g 0)))
+              (hashtable-update! (vector-ref g 1) k (lambda (n) (+ n 1)) 0)))))))
+(define (hm-node* m k g) (make-jhost "jx-hm-node" (vector m k (hmv-ref m k) (hmn-gen* g k) g)))
+(define (hm-node m k) (hm-node* m k (hmn-track! m)))
+(define hmn-absent (list 'absent))
+(define (hmn-attached? st) (= (vector-ref st 3) (hmn-gen* (vector-ref st 4) (vector-ref st 1))))
+(define (hmn-value n)
+  ;; the map's value while the node is attached, else the last one seen
+  (let ((st (jhost-state n)))
+    (if (hmn-attached? st)
+        (let ((v (hashtable-ref (hm-tbl (vector-ref st 0)) (vector-ref st 1) hmn-absent)))
+          (if (eq? v hmn-absent) (vector-ref st 2) (begin (vector-set! st 2 v) v)))
+        (vector-ref st 2))))
+(jx-class! "jx-hm-node" "java.util.HashMap$Node" '("java.util.Map$Entry"))
+(register-jutil-entry! "jx-hm-node" (lambda (n) (cons (vector-ref (jhost-state n) 1) (hmn-value n))))
+(register-host-methods! "jx-hm-node"
+  (list (cons "setValue" (lambda (self v)
+                           (let* ((st (jhost-state self)) (m (vector-ref st 0)) (k (vector-ref st 1)) (old (hmn-value self)))
+                             (when (and (hmn-attached? st) (hashtable-contains? (hm-tbl m) k)) (hashtable-set! (hm-tbl m) k v))
+                             (vector-set! st 2 v)
+                             old)))))
+(define (hmv-project kind m k) (case kind ((key) k) ((value) (hmv-ref m k)) (else (hm-node m k))))
+(define (hmv-elems kind)
+  ;; one pass over the key order, which the map keeps newest first, the
+  ;; projection chosen once
+  (case kind
+    ((key) (lambda (v) (reverse (hm-ord (hmv-map v)))))
+    ((value) (lambda (v) (let ((t (hm-tbl (hmv-map v))))
+                           (fold-left (lambda (acc k) (cons (hashtable-ref t k jolt-nil) acc)) '() (hm-ord (hmv-map v))))))
+    (else (lambda (v) (let* ((m (hmv-map v)) (g (hmn-track! m)))
+                        (fold-left (lambda (acc k) (cons (hm-node* m k g) acc)) '() (hm-ord m)))))))
+(define (hmv-entry-kv e)
+  (or (jolt-host-entry e) (and (jolt-map-entry? e) (cons (jolt-nth e 0) (jolt-nth e 1)))))
+(define (hmv-has-entry? m e)
+  (let ((kv (hmv-entry-kv e)))
+    (and kv (hashtable-contains? (hm-tbl m) (car kv)) (jolt=2 (cdr kv) (hmv-ref m (car kv))) #t)))
+(define (hmv-remove-key! m k) (jx-call m "remove" (list k)))
+(define (hmv-iterator kind tag)
+  (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind (hm-ord m))))))
+(define (hmi-comod! it)
+  (let ((st (jhost-state it)))
+    (unless (eq? (vector-ref st 4) (hm-ord (vector-ref st 0))) (throw-jvm 'ConcurrentModificationException jolt-nil))))
+(define hm-iterator-methods
+  (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 1))))
+        (cons "next" (lambda (self)
+                       (hmi-comod! self)
+                       (let* ((st (jhost-state self)) (ks (vector-ref st 1)))
+                         (when (null? ks) (throw-jvm 'NoSuchElementException jolt-nil))
+                         (vector-set! st 1 (cdr ks))
+                         (vector-set! st 2 (car ks))
+                         (hmv-project (vector-ref st 3) (vector-ref st 0) (car ks)))))
+        (cons "remove" (lambda (self)
+                         (let ((st (jhost-state self)))
+                           (when (eq? (vector-ref st 2) jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
+                           (hmi-comod! self)
+                           (hmv-remove-key! (vector-ref st 0) (vector-ref st 2))
+                           (vector-set! st 2 jutil-iterator-none)
+                           (vector-set! st 4 (hm-ord (vector-ref st 0)))
+                           jolt-nil)))
+        (cons "forEachRemaining" (lambda (self f)
+                                   (let loop () (when (pair? (vector-ref (jhost-state self) 1))
+                                                  (jolt-fi-call f "accept" (jx-call self "next" '())) (loop)))
+                                   jolt-nil))))
+(for-each (lambda (r)
+            (jx-class! (car r) (cadr r) '("java.util.Iterator"))
+            (register-host-methods! (car r) hm-iterator-methods)
+            (jx-register! (car r) 'iter
+                          (lambda (it) (let ((st (jhost-state it)))
+                                         (if (eq? (vector-ref st 3) 'entry)
+                                             (let* ((m (vector-ref st 0)) (g (hmn-track! m)))
+                                               (map (lambda (k) (hm-node* m k g)) (vector-ref st 1)))
+                                             (map (lambda (k) (hmv-project (vector-ref st 3) (vector-ref st 0) k)) (vector-ref st 1)))))
+                          #f #f #f))
+          '(("jx-hm-key-itr" "java.util.HashMap$KeyIterator") ("jx-hm-value-itr" "java.util.HashMap$ValueIterator")
+            ("jx-hm-entry-itr" "java.util.HashMap$EntryIterator")))
+(define (hmv-common kind itr-tag has? remove!)
+  (list (cons "size" (lambda (self) (hashtable-size (hm-tbl (hmv-map self)))))
+        (cons "isEmpty" (lambda (self) (fx=? 0 (hashtable-size (hm-tbl (hmv-map self))))))
+        (cons "contains" (lambda (self x) (and (has? (hmv-map self) x) #t)))
+        (cons "remove" (lambda (self x) (remove! (hmv-map self) x)))
+        (cons "clear" (lambda (self) (jx-call (hmv-map self) "clear" '())))
+        (cons "iterator" (hmv-iterator kind itr-tag))
+        (cons "add" (lambda (self x) (jx-uoe)))
+        (cons "addAll" (lambda (self c) (jx-uoe)))
+        (cons "toArray" (jxc-to-array (hmv-elems kind)))
+        ;; HashMap's view forEach checks for a structural change once the walk ends
+        (cons "forEach" (lambda (self f)
+                          (let ((ord (hm-ord (hmv-map self))))
+                            (for-each (lambda (x) (jolt-fi-call f "accept" x)) ((hmv-elems kind) self))
+                            (unless (eq? ord (hm-ord (hmv-map self))) (throw-jvm 'ConcurrentModificationException jolt-nil))
+                            jolt-nil)))))
+(define (hmv-has-value? m v) (exists (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m)))
+(jx-class! "jx-hm-keyset" "java.util.HashMap$KeySet" '("java.util.AbstractSet"))
+(register-host-methods! "jx-hm-keyset"
+  (hmv-common 'key "jx-hm-key-itr"
+              (lambda (m k) (hashtable-contains? (hm-tbl m) k))
+              (lambda (m k) (and (hashtable-contains? (hm-tbl m) k) (begin (hmv-remove-key! m k) #t)))))
+(jx-register! "jx-hm-keyset" 'set (hmv-elems 'key) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
+              (lambda (v k) (hashtable-contains? (hm-tbl (hmv-map v)) k)) #f)
+(jx-class! "jx-hm-values" "java.util.HashMap$Values" '("java.util.AbstractCollection"))
+(register-host-methods! "jx-hm-values"
+  (hmv-common 'value "jx-hm-value-itr" hmv-has-value?
+              (lambda (m v) (let ((k (find (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m))))
+                              (if k (begin (hmv-remove-key! m k) #t) #f)))))
+(jx-register! "jx-hm-values" 'coll (hmv-elems 'value) (lambda (v) (hashtable-size (hm-tbl (hmv-map v)))) #f #f)
+(jx-class! "jx-hm-entryset" "java.util.HashMap$EntrySet" '("java.util.AbstractSet"))
+(register-host-methods! "jx-hm-entryset"
+  (hmv-common 'entry "jx-hm-entry-itr" hmv-has-entry?
+              (lambda (m e) (if (hmv-has-entry? m e) (begin (hmv-remove-key! m (car (hmv-entry-kv e))) #t) #f))))
+(jx-register! "jx-hm-entryset" 'entries (hmv-elems 'entry) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
+              (lambda (v e) (hmv-has-entry? (hmv-map v) e)) #f)
+;; ConcurrentHashMap's views, and Properties' (a Properties is a ConcurrentHashMap
+;; inside since JDK 9, its views that map's wrapped in Collections.synchronized*).
+;; The same live views, but WEAKLY CONSISTENT, as the JDK's: an iterator never
+;; throws ConcurrentModificationException; it walks the keys present when it
+;; started, skipping any removed since. keySet(default) is a view whose add puts
+;; the key mapped to that default. State #(map default); an iterator's
+;; #(map remaining last kind).
+(define (wv-live! st)
+  ;; drop the leading keys the map no longer holds
+  (let ((t (hm-tbl (vector-ref st 0))))
+    (let loop ()
+      (let ((ks (vector-ref st 1)))
+        (when (and (pair? ks) (not (hashtable-contains? t (car ks))))
+          (vector-set! st 1 (cdr ks)) (loop))))))
+(define (wv-node m k) (make-jhost "jx-chm-entry" (vector m k (hmv-ref m k))))
+(define (wv-project kind m k) (case kind ((key) k) ((value) (hmv-ref m k)) (else (wv-node m k))))
+(define (wv-elems kind)
+  (case kind
+    ((entry) (lambda (v) (let ((m (hmv-map v))) (map (lambda (k) (wv-node m k)) (hm-keys-ordered m)))))
+    (else (hmv-elems kind))))
+(define wv-iterator-methods
+  (list (cons "hasNext" (lambda (self) (let ((st (jhost-state self))) (wv-live! st) (pair? (vector-ref st 1)))))
+        (cons "next" (lambda (self)
+                       (let ((st (jhost-state self)))
+                         (wv-live! st)
+                         (let ((ks (vector-ref st 1)))
+                           (when (null? ks) (throw-jvm 'NoSuchElementException jolt-nil))
+                           (vector-set! st 1 (cdr ks))
+                           (vector-set! st 2 (car ks))
+                           (wv-project (vector-ref st 3) (vector-ref st 0) (car ks))))))
+        (cons "remove" (lambda (self)
+                         (let ((st (jhost-state self)))
+                           (when (eq? (vector-ref st 2) jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
+                           (hmv-remove-key! (vector-ref st 0) (vector-ref st 2))
+                           (vector-set! st 2 jutil-iterator-none)
+                           jolt-nil)))
+        (cons "forEachRemaining" (lambda (self f)
+                                   (let loop () (when (jx-call self "hasNext" '())
+                                                  (jolt-fi-call f "accept" (jx-call self "next" '())) (loop)))
+                                   jolt-nil))))
+(for-each (lambda (r)
+            (jx-class! (car r) (cadr r) '("java.util.Iterator"))
+            (register-host-methods! (car r) wv-iterator-methods)
+            (jx-register! (car r) 'iter
+                          (lambda (it) (let ((st (jhost-state it)))
+                                         (wv-live! st)
+                                         (map (lambda (k) (wv-project (vector-ref st 3) (vector-ref st 0) k))
+                                              (filter (lambda (k) (hashtable-contains? (hm-tbl (vector-ref st 0)) k)) (vector-ref st 1)))))
+                          #f #f #f))
+          '(("jx-chm-key-itr" "java.util.concurrent.ConcurrentHashMap$KeyIterator")
+            ("jx-chm-value-itr" "java.util.concurrent.ConcurrentHashMap$ValueIterator")
+            ("jx-chm-entry-itr" "java.util.concurrent.ConcurrentHashMap$EntryIterator")))
+(jx-class! "jx-chm-entry" "java.util.concurrent.ConcurrentHashMap$MapEntry" '("java.util.Map$Entry"))
+;; a ConcurrentHashMap$MapEntry holds the value it was read with (setValue
+;; writes through to the map and to the entry)
+(register-jutil-entry! "jx-chm-entry" (lambda (n) (cons (vector-ref (jhost-state n) 1) (vector-ref (jhost-state n) 2))))
+(register-host-methods! "jx-chm-entry"
+  (list (cons "setValue" (lambda (self v)
+                           (when (jolt-nil? v) (throw-jvm 'NullPointerException jolt-nil))
+                           (let* ((st (jhost-state self)) (m (vector-ref st 0)) (k (vector-ref st 1)) (old (vector-ref st 2)))
+                             (jx-call m "put" (list k v))
+                             (vector-set! st 2 v)
+                             old)))))
+(define (wv-iterator kind tag)
+  (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind)))))
+(define (wv-common kind itr-tag has? remove!)
+  ;; hmv-common's view methods over a weakly consistent iterator (later wins)
+  (append (hmv-common kind itr-tag has? remove!)
+          (list (cons "iterator" (wv-iterator kind itr-tag))
+                (cons "toArray" (jxc-to-array (wv-elems kind)))
+                (cons "forEach" (lambda (self f) (for-each (lambda (x) (jolt-fi-call f "accept" x)) ((wv-elems kind) self)) jolt-nil)))))
+(define (wv-keyset-add self k)
+  (let ((d (vector-ref (jhost-state self) 1)))
+    (if (jolt-nil? d) (jx-uoe)
+        (let ((m (hmv-map self)))
+          (if (hashtable-contains? (hm-tbl m) k) #f (begin (jx-call m "put" (list k d)) #t))))))
+(define wv-key-has (lambda (m k) (hashtable-contains? (hm-tbl m) k)))
+(define wv-key-remove (lambda (m k) (and (hashtable-contains? (hm-tbl m) k) (begin (hmv-remove-key! m k) #t))))
+(define wv-value-remove (lambda (m v) (let ((k (find (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m))))
+                                        (if k (begin (hmv-remove-key! m k) #t) #f))))
+(define wv-entry-remove (lambda (m e) (if (hmv-has-entry? m e) (begin (hmv-remove-key! m (car (hmv-entry-kv e))) #t) #f)))
+(for-each
+  (lambda (r)
+    (let ((tag (car r)) (cls (cadr r)) (kind (caddr r)) (supers (cadddr r)))
+      (jx-class! tag cls supers)
+      (register-host-methods! tag
+        (append (wv-common kind (case kind ((key) "jx-chm-key-itr") ((value) "jx-chm-value-itr") (else "jx-chm-entry-itr"))
+                           (case kind ((key) wv-key-has) ((value) hmv-has-value?) (else hmv-has-entry?))
+                           (case kind ((key) wv-key-remove) ((value) wv-value-remove) (else wv-entry-remove)))
+                (if (eq? kind 'key)
+                    (list (cons "add" wv-keyset-add)
+                          (cons "getMappedValue" (lambda (self) (vector-ref (jhost-state self) 1))))
+                    '())))
+      (jx-register! tag (case kind ((key) 'set) ((value) 'coll) (else 'entries)) (wv-elems kind)
+                    (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
+                    (case kind
+                      ((key) (lambda (v k) (hashtable-contains? (hm-tbl (hmv-map v)) k)))
+                      ((entry) (lambda (v e) (hmv-has-entry? (hmv-map v) e)))
+                      (else #f))
+                    #f)
+      (register-image-refusal! (list tag) "a view is a window onto a map this process holds; write the map instead")))
+  '(("jx-chm-keyset" "java.util.concurrent.ConcurrentHashMap$KeySetView" key ("java.util.Set" "java.io.Serializable"))
+    ("jx-chm-values" "java.util.concurrent.ConcurrentHashMap$ValuesView" value ("java.util.Collection" "java.io.Serializable"))
+    ("jx-chm-entryset" "java.util.concurrent.ConcurrentHashMap$EntrySetView" entry ("java.util.Set" "java.io.Serializable"))
+    ("jx-props-keyset" "java.util.Collections$SynchronizedSet" key ("java.util.Set" "java.io.Serializable"))
+    ("jx-props-values" "java.util.Collections$SynchronizedCollection" value ("java.util.Collection" "java.io.Serializable"))
+    ("jx-props-entryset" "java.util.Collections$SynchronizedSet" entry ("java.util.Set" "java.io.Serializable"))))
+(register-image-refusal! '("jx-chm-key-itr" "jx-chm-value-itr" "jx-chm-entry-itr" "jx-chm-entry")
+                         "an iterator or entry is a position in a map this process holds; write the map instead")
+(register-host-methods! "chm"
+  (list (cons "keySet" (case-lambda
+                         ((self) (make-jhost "jx-chm-keyset" (vector self jolt-nil)))
+                         ((self d) (when (jolt-nil? d) (throw-jvm 'NullPointerException jolt-nil))
+                                   (make-jhost "jx-chm-keyset" (vector self d)))))
+        (cons "values" (lambda (self) (make-jhost "jx-chm-values" (vector self))))
+        (cons "entrySet" (lambda (self) (make-jhost "jx-chm-entryset" (vector self))))))
+(register-host-methods! "properties"
+  (list (cons "keySet" (lambda (self) (make-jhost "jx-props-keyset" (vector self jolt-nil))))
+        (cons "values" (lambda (self) (make-jhost "jx-props-values" (vector self))))
+        (cons "entrySet" (lambda (self) (make-jhost "jx-props-entryset" (vector self))))))
+
+;; AbstractMap$SimpleEntry: a mutable Map.Entry anyone can build. State #(key value)
+(jx-class! "jx-simple-entry" "java.util.AbstractMap$SimpleEntry" '("java.util.Map$Entry" "java.io.Serializable"))
+(register-jutil-entry! "jx-simple-entry" (lambda (e) (cons (vector-ref (jhost-state e) 0) (vector-ref (jhost-state e) 1))))
+(register-host-methods! "jx-simple-entry"
+  (list (cons "setValue" (lambda (self v) (let ((old (vector-ref (jhost-state self) 1))) (vector-set! (jhost-state self) 1 v) old)))))
+;; …and AbstractMap$SimpleImmutableEntry, whose setValue refuses. Both by the
+;; simple name an import gives too, as every java.util class is.
+(jx-class! "jx-simple-imm-entry" "java.util.AbstractMap$SimpleImmutableEntry" '("java.util.Map$Entry" "java.io.Serializable"))
+(register-jutil-entry! "jx-simple-imm-entry" (lambda (e) (cons (vector-ref (jhost-state e) 0) (vector-ref (jhost-state e) 1))))
+(register-host-methods! "jx-simple-imm-entry" (list (cons "setValue" (lambda (self v) (jx-uoe)))))
+(for-each
+  (lambda (r)
+    (let ((ctor (let ((tag (cadr r)))
+                  (case-lambda ((k v) (make-jhost tag (vector k v)))
+                               ((e) (let ((kv (hmv-entry-kv e)))
+                                      (unless kv (throw-jvm 'ClassCastException "not a Map.Entry"))
+                                      (make-jhost tag (vector (car kv) (cdr kv)))))))))
+      (register-class-ctor! (string-append "java.util." (car r)) ctor)
+      (register-class-ctor! (car r) ctor)))
+  '(("AbstractMap$SimpleEntry" "jx-simple-entry") ("AbstractMap$SimpleImmutableEntry" "jx-simple-imm-entry")))
+;; ======================================================================================
+;; A proxy over java.util's abstract collection classes
+;; ======================================================================================
+;; (proxy [java.util.AbstractList] [] (get [i] …) (size [] …)) extends the class
+;; on the JVM and inherits everything it does not write. jolt has no constructor
+;; for an abstract class, so the proxy is a reify of the class's name, and these
+;; tables (host-static.ss register-abstract-methods!) are the inheritance: each
+;; method runs against the proxy, so its calls back into get / size / iterator /
+;; entrySet reach the proxy's own. coll-defaults.ss holds most of them already;
+;; added here are what the abstract classes write themselves: toString, equality
+;; and hashing by kind, remove(Object), the stubs an abstract method raises, and
+;; AbstractMap's lookups over entrySet.
+(define (abs-by-arity rows)
+  ;; (name argc proc) rows -> (name . proc), the proc choosing by argument count
+  (let ((names (fold-left (lambda (acc r) (if (member (car r) acc) acc (append acc (list (car r))))) '() rows)))
+    (map (lambda (n)
+           (let ((by (filter (lambda (r) (string=? (car r) n)) rows)))
+             (cons n (lambda (self . args)
+                       (let ((r (find (lambda (r) (fx=? (cadr r) (length args))) by)))
+                         (if r (apply (caddr r) self args)
+                             (throw-jvm 'IllegalArgumentException
+                                        (string-append "No matching method " n " found taking "
+                                                       (number->string (length args)) " args"))))))))
+         names)))
+(define (abs-stub name argc)
+  ;; an abstract method the proxy does not write: Clojure's proxy raises UOE
+  (list name argc (lambda (self . _) (throw-jvm 'UnsupportedOperationException name))))
+(define (abs-elems self) (seq->list (jolt-seq (record-method-dispatch self "iterator" jolt-nil))))
+(define (abs-elem-str self x map?)
+  (cond ((eq? x self) (if map? "(this Map)" "(this Collection)")) ((jolt-nil? x) "null") (else (jolt-str-render-one x))))
+(define (abs-coll-string self)
+  (let loop ((xs (abs-elems self)) (acc '()))
+    (if (null? xs) (string-append "[" (apply string-append (reverse acc)) "]")
+        (loop (cdr xs) (cons (string-append (if (null? acc) "" ", ") (abs-elem-str self (car xs) #f)) acc)))))
+(define (abs-remove-first! self x)
+  (let ((it (record-method-dispatch self "iterator" jolt-nil)))
+    (let loop ()
+      (if (jolt-truthy? (record-method-dispatch it "hasNext" jolt-nil))
+          (if (objects-equals? x (record-method-dispatch it "next" jolt-nil))
+              (begin (record-method-dispatch it "remove" jolt-nil) #t)
+              (loop))
+          #f))))
+;; the persistent collection a proxy equals, by kind
+(define (abs-as-list self) (apply jolt-vector (abs-elems self)))
+(define (abs-as-set self) (apply jolt-hash-set (abs-elems self)))
+(define (abs-map-entries self) (seq->list (jolt-seq (record-method-dispatch self "entrySet" jolt-nil))))
+(define (abs-as-map self)
+  (fold-left (lambda (m e) (jolt-assoc m (jolt-nth e 0) (jolt-nth e 1))) (jolt-hash-map) (abs-map-entries self)))
+(define abs-collection-rows
+  (append cd-collection-defaults
+          (list (abs-stub "iterator" 0) (abs-stub "size" 0)
+                ;; Collection's defaults over the iterator
+                (list "stream" 0 (lambda (self) (make-stream 'ref (list->cseq (abs-elems self)))))
+                (list "parallelStream" 0 (lambda (self) (make-stream 'ref (list->cseq (abs-elems self)))))
+                (list "spliterator" 0 (lambda (self) (spl-default self)))
+                (list "remove" 1 (lambda (self x) (abs-remove-first! self x)))
+                (list "toString" 0 abs-coll-string))))
+(define abs-list-rows
+  (append (filter (lambda (r) (not (and (string=? (car r) "add") (fx=? (cadr r) 1)))) cd-list-defaults)
+          (list (abs-stub "get" 1)
+                (list "add" 1 (lambda (self x) (record-method-dispatch self "add" (list->cseq (list (->num (cd-size self)) x))) #t))
+                (list "add" 2 (lambda (self i x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+                (list "set" 2 (lambda (self i x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+                (list "remove" 1 (lambda (self x)
+                                   (if (and (fixnum? x) (not (jfloat? x)))
+                                       (throw-jvm 'UnsupportedOperationException jolt-nil)
+                                       (abs-remove-first! self x))))
+                (list "equals" 1 (lambda (self o) (or (eq? self o) (jolt=2 (abs-as-list self) o))))
+                (list "hashCode" 0 (lambda (self) (->num (jolt-java-hashcode (abs-as-list self))))))
+          abs-collection-rows))
+(define abs-set-rows
+  (append (list (list "equals" 1 (lambda (self o) (or (eq? self o) (jolt=2 (abs-as-set self) o))))
+                (list "hashCode" 0 (lambda (self) (->num (jolt-java-hashcode (abs-as-set self))))))
+          abs-collection-rows))
+(define abs-map-rows
+  (append
+    (list (abs-stub "entrySet" 0)
+          (list "size" 0 (lambda (self) (->num (length (abs-map-entries self)))))
+          (list "isEmpty" 0 (lambda (self) (null? (abs-map-entries self))))
+          (list "containsKey" 1 (lambda (self k) (and (exists (lambda (e) (objects-equals? k (jolt-nth e 0))) (abs-map-entries self)) #t)))
+          (list "get" 1 (lambda (self k) (let ((e (find (lambda (e) (objects-equals? k (jolt-nth e 0))) (abs-map-entries self))))
+                                         (if e (jolt-nth e 1) jolt-nil))))
+          (list "put" 2 (lambda (self k v) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+          (list "remove" 1 (lambda (self k)
+                             (let ((it (record-method-dispatch (record-method-dispatch self "entrySet" jolt-nil) "iterator" jolt-nil)))
+                               (let loop ()
+                                 (if (jolt-truthy? (record-method-dispatch it "hasNext" jolt-nil))
+                                     (let ((e (record-method-dispatch it "next" jolt-nil)))
+                                       (if (objects-equals? k (jolt-nth e 0))
+                                           (begin (record-method-dispatch it "remove" jolt-nil) (jolt-nth e 1))
+                                           (loop)))
+                                     jolt-nil)))))
+          (list "clear" 0 (lambda (self) (record-method-dispatch (record-method-dispatch self "entrySet" jolt-nil) "clear" jolt-nil) jolt-nil))
+          ;; snapshots of the keys and values (AbstractMap's are live views over entrySet)
+          (list "keySet" 0 (lambda (self) (apply jolt-hash-set (map (lambda (e) (jolt-nth e 0)) (abs-map-entries self)))))
+          (list "values" 0 (lambda (self) (list->cseq (map (lambda (e) (jolt-nth e 1)) (abs-map-entries self)))))
+          (list "equals" 1 (lambda (self o) (or (eq? self o) (jolt=2 (abs-as-map self) o))))
+          (list "hashCode" 0 (lambda (self) (->num (jolt-java-hashcode (abs-as-map self)))))
+          (list "toString" 0 (lambda (self)
+                               (let loop ((es (abs-map-entries self)) (acc '()))
+                                 (if (null? es) (string-append "{" (apply string-append (reverse acc)) "}")
+                                     (loop (cdr es) (cons (string-append (if (null? acc) "" ", ")
+                                                                         (abs-elem-str self (jolt-nth (car es) 0) #t) "="
+                                                                         (abs-elem-str self (jolt-nth (car es) 1) #t))
+                                                          acc)))))))
+    cd-map-defaults))
+(register-abstract-methods! "java.util.AbstractCollection" (abs-by-arity abs-collection-rows))
+(register-abstract-methods! "java.util.AbstractList" (abs-by-arity abs-list-rows))
+(register-abstract-methods! "java.util.AbstractSet" (abs-by-arity abs-set-rows))
+(register-abstract-methods! "java.util.AbstractQueue" (abs-by-arity (append cd-queue-defaults abs-collection-rows)))
+(register-abstract-methods! "java.util.AbstractMap" (abs-by-arity abs-map-rows))
+;; …and such a proxy is that collection to count, seq, get, contains?, =, hash,
+;; str and pr, by the kind its declared class gives (a proxy with a delegate is
+;; the delegate's, jutil-colls.ss). Last in each walk: they are rare.
+(define abs-kind-memo (make-weak-eq-hashtable))
+(define abs-kind-mu (make-mutex))
+(define (abs-proxy-kind x)
+  (and (jreify? x) (not (jreify-delegate x))
+       (let ((ps (jreify-protos x)))
+         (let ((k (hashtable-ref abs-kind-memo ps 'none)))
+           (if (eq? k 'none)
+               (let* ((tags (jreify-host-tags x))
+                      (has? (lambda (c) (and (member c tags) #t)))
+                      (k (and (exists (lambda (t) (hashtable-ref abstract-methods-tbl t #f)) tags)
+                              (cond ((has? "java.util.Map") 'map)
+                                    ((has? "java.util.Set") 'set)
+                                    ((has? "java.util.List") (if (has? "java.util.RandomAccess") 'ralist 'list))
+                                    ((has? "java.util.Collection") 'coll)
+                                    (else #f)))))
+                 (jolt-with-mutex abs-kind-mu (hashtable-set! abs-kind-memo ps k))
+                 k)
+               k)))))
+(define (abs-plain x)
+  (case (abs-proxy-kind x)
+    ((map) (abs-as-map x)) ((set) (abs-as-set x)) ((list ralist) (abs-as-list x)) (else x)))
+(register-count-arm-last! abs-proxy-kind (lambda (x) (jnum->exact (record-method-dispatch x "size" jolt-nil))))
+(register-seq-arm-last! abs-proxy-kind
+  (lambda (x) (if (eq? (abs-proxy-kind x) 'map)
+                  (jolt-seq (record-method-dispatch x "entrySet" jolt-nil))
+                  (jolt-seq (iterator-cursor->seq (record-method-dispatch x "iterator" jolt-nil))))))
+(register-get-arm-last! (lambda (x) (eq? (abs-proxy-kind x) 'map))
+  (lambda (x k d) (if (jolt-truthy? (record-method-dispatch x "containsKey" (list->cseq (list k))))
+                      (record-method-dispatch x "get" (list->cseq (list k))) d)))
+(register-contains-arm-last! (lambda (x) (memq (abs-proxy-kind x) '(map set)))
+  (lambda (x k) (jolt-truthy? (record-method-dispatch x (if (eq? (abs-proxy-kind x) 'map) "containsKey" "contains")
+                                                      (list->cseq (list k))))))
+(define (abs-equiv-kind x) (let ((k (abs-proxy-kind x))) (and k (not (eq? k 'coll)) k)))
+(register-eq-arm-last! (lambda (a b) (or (abs-equiv-kind a) (abs-equiv-kind b)))
+  (lambda (a b) (jolt=2 (abs-plain a) (abs-plain b))))
+(register-hash-arm-last! abs-equiv-kind (lambda (x) (jnum->exact (record-method-dispatch x "hashCode" jolt-nil))))
+(register-str-render! abs-proxy-kind (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
+;; print-method's java.util arms: a List as (…), a RandomAccess one as […], a Set
+;; as #{…}, a Map as {…}; any other Collection as #object
+(register-pr-readable-arm! abs-equiv-kind
+  (lambda (x) (if (jolt-pr-readable?)
+                  (jolt-pr-readable (case (abs-proxy-kind x)
+                                      ((list) (list->cseq (abs-elems x)))
+                                      (else (abs-plain x))))
+                  (jolt-object-repr x #f))))
+;; ======================================================================================
+;; java.util.Spliterator
+;; ======================================================================================
+;; One object for every JDK spliterator class: its class name, characteristics
+;; and comparator are the JDK's for the source, and it is backed one of two ways.
+;;   vec   a snapshot of the elements, split at the midpoint as an array-backed
+;;         spliterator is (ArrayList's, an array's, a Vector's, …): the prefix goes
+;;         to a new one of the same class
+;;   iter  a live iterator, split by batches as IteratorSpliterator and the
+;;         linked collections' are: the batch comes back as an ArraySpliterator.
+;;         It stays lazy, so a spliteratorUnknownSize over an endless iterator
+;;         works
+;; A hash or tree spliterator splits where its table or tree does on the JDK,
+;; which jolt's do not share; those split at the midpoint here, with the same
+;; contents in the same order overall. State #(kind src lo hi chars cmp batch class)
+(define spl-ORDERED 16) (define spl-DISTINCT 1) (define spl-SORTED 4) (define spl-SIZED 64)
+(define spl-NONNULL 256) (define spl-IMMUTABLE 1024) (define spl-CONCURRENT 4096) (define spl-SUBSIZED 16384)
+(define spl-long-max 9223372036854775807)
+(define spl-classes
+  '("java.util.ArrayList$ArrayListSpliterator" "java.util.LinkedList$LLSpliterator" "java.util.ArrayDeque$DeqSpliterator"
+    "java.util.HashMap$KeySpliterator" "java.util.HashMap$ValueSpliterator" "java.util.HashMap$EntrySpliterator"
+    "java.util.Spliterators$IteratorSpliterator" "java.util.Spliterators$ArraySpliterator"
+    "java.util.TreeMap$KeySpliterator" "java.util.TreeMap$ValueSpliterator" "java.util.TreeMap$EntrySpliterator"
+    "java.util.AbstractList$RandomAccessSpliterator" "java.util.concurrent.ConcurrentLinkedQueue$CLQSpliterator"
+    "java.util.concurrent.ConcurrentLinkedDeque$CLDSpliterator" "java.util.concurrent.ConcurrentSkipListMap$KeySpliterator"
+    "java.util.concurrent.ConcurrentSkipListMap$ValueSpliterator" "java.util.concurrent.ConcurrentSkipListMap$EntrySpliterator"
+    "java.util.PriorityQueue$PriorityQueueSpliterator" "java.util.Vector$VectorSpliterator" "clojure.lang.PersistentVector$3"
+    "java.util.ArrayList$SubList$2" "java.util.Spliterators$EmptySpliterator$OfRef"
+    "java.util.concurrent.ConcurrentHashMap$KeySpliterator" "java.util.concurrent.ConcurrentHashMap$ValueSpliterator"
+    "java.util.concurrent.ConcurrentHashMap$EntrySpliterator"))
+(define spl-tag-of (make-hashtable string-hash string=?))
+(jch-register-supers! "java.util.Spliterator" '())
+(define (spl-ref x i) (vector-ref (jhost-state x) i))
+(define (spl-set! x i v) (vector-set! (jhost-state x) i v))
+(define (spl-sized? x) (not (fx=? 0 (fxand (spl-ref x 4) spl-SIZED))))
+(define (make-spl cls kind src lo hi chars cmp)
+  (make-jhost (hashtable-ref spl-tag-of cls #f) (vector kind src lo hi chars cmp 0 cls)))
+(define (make-vec-spl cls chars elems . cmp)
+  (let ((v (list->vector elems))) (make-spl cls 'vec v 0 (vector-length v) chars (if (pair? cmp) (car cmp) jolt-nil))))
+(define (make-iter-spl cls chars it est . cmp)
+  (make-spl cls 'iter it 0 est chars (if (pair? cmp) (car cmp) jolt-nil)))
+(define (spl-force! x)
+  ;; a late-binding one takes its elements at its first use, as the JDK's
+  ;; collection spliterators bind to the source then rather than at creation
+  (when (eq? (spl-ref x 0) 'lazy)
+    (let ((v (list->vector ((spl-ref x 1)))))
+      (spl-set! x 0 'vec) (spl-set! x 1 v) (spl-set! x 3 (vector-length v)))))
+(define (spl-advance! x)
+  ;; the next element, or the spl-none marker
+  (spl-force! x)
+  (case (spl-ref x 0)
+    ((vec) (let ((lo (spl-ref x 2)))
+             (if (fx<? lo (spl-ref x 3)) (begin (spl-set! x 2 (fx+ lo 1)) (vector-ref (spl-ref x 1) lo)) spl-none)))
+    (else (let ((it (spl-ref x 1)))
+            (if (jolt-truthy? (jx-call it "hasNext" '()))
+                (let ((v (jx-call it "next" '())))
+                  (when (and (spl-sized? x) (< (spl-ref x 3) spl-long-max) (> (spl-ref x 3) 0)) (spl-set! x 3 (- (spl-ref x 3) 1)))
+                  v)
+                spl-none)))))
+(define spl-none (list 'spl-none))
+(define (spl-split! x)
+  (spl-force! x)
+  (case (spl-ref x 0)
+    ((vec) (let* ((lo (spl-ref x 2)) (mid (fxsrl (fx+ lo (spl-ref x 3)) 1)))
+             (if (fx>=? lo mid) jolt-nil
+                 (begin (spl-set! x 2 mid)
+                        (make-spl (spl-ref x 7) 'vec (spl-ref x 1) lo mid (spl-ref x 4) (spl-ref x 5))))))
+    (else
+     ;; IteratorSpliterator / LLSpliterator take batches of 1024 more each time;
+     ;; the concurrent linked queues start at one and grow by one
+     (let* ((it (spl-ref x 1)) (est (spl-ref x 3))
+            (clq? (not (fx=? 0 (fxand (spl-ref x 4) spl-CONCURRENT)))))
+       (if (and (or clq? (> est 1)) (jolt-truthy? (jx-call it "hasNext" '())))
+           (let* ((b (spl-ref x 6))
+                  (n (if clq? (if (fx<=? b 0) 1 (fxmin (fx+ b 1) 33554432)) (min (fx+ b 1024) est 33554432))))
+             (let loop ((j 0) (acc '()))
+               (if (and (fx<? j n) (jolt-truthy? (jx-call it "hasNext" '())))
+                   (loop (fx+ j 1) (cons (jx-call it "next" '()) acc))
+                   (begin
+                     (spl-set! x 6 j)
+                     (when (< est spl-long-max) (spl-set! x 3 (- est j)))
+                     (if (and (not clq?) (= est spl-long-max))
+                         ;; an unsized one's batch keeps its characteristics and
+                         ;; reports half the unknown size, as the JDK's does
+                         (let ((b (make-vec-spl "java.util.Spliterators$ArraySpliterator" (spl-ref x 4) (reverse acc))))
+                           (spl-set! b 6 (quotient spl-long-max 2))
+                           b)
+                         (make-vec-spl "java.util.Spliterators$ArraySpliterator"
+                                       (fxior (if clq? (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT) (spl-ref x 4)) spl-SIZED spl-SUBSIZED)
+                                       (reverse acc)))))))
+           jolt-nil)))))
+(define spliterator-methods
+  (list (cons "tryAdvance" (lambda (self f)
+                             (when (jolt-nil? f) (jx-npe))
+                             (let ((v (spl-advance! self))) (if (eq? v spl-none) #f (begin (jolt-fi-call f "accept" v) #t)))))
+        (cons "forEachRemaining" (lambda (self f)
+                                   (when (jolt-nil? f) (jx-npe))
+                                   (let loop () (let ((v (spl-advance! self))) (unless (eq? v spl-none) (jolt-fi-call f "accept" v) (loop))))
+                                   jolt-nil))
+        (cons "trySplit" (lambda (self) (spl-split! self)))
+        (cons "estimateSize" (lambda (self)
+                               (spl-force! self)
+                               (->num (cond ((not (eq? (spl-ref self 0) 'vec)) (spl-ref self 3))
+                                            ((and (not (spl-sized? self)) (> (spl-ref self 6) 0)) (spl-ref self 6))
+                                            (else (fx- (spl-ref self 3) (spl-ref self 2)))))))
+        (cons "getExactSizeIfKnown" (lambda (self) (if (spl-sized? self) (jx-call self "estimateSize" '()) (->num -1))))
+        (cons "characteristics" (lambda (self) (->num (spl-ref self 4))))
+        (cons "hasCharacteristics" (lambda (self c) (fx=? (fxand (spl-ref self 4) (jnum->exact c)) (jnum->exact c))))
+        (cons "getComparator" (lambda (self) (if (fx=? 0 (fxand (spl-ref self 4) spl-SORTED)) (throw-jvm 'IllegalStateException jolt-nil) (spl-ref self 5))))))
+(for-each (lambda (cls)
+            (let ((tag (string-append "jx-spl:" cls)))
+              (hashtable-set! spl-tag-of cls tag)
+              (jx-class! tag cls '("java.util.Spliterator"))
+              (register-host-methods! tag spliterator-methods)
+              (register-image-refusal! (list tag) "a spliterator is a position in a walk this process is making; write the collection instead")))
+          spl-classes)
+(register-class-statics! "java.util.Spliterator"
+  (list (cons "ORDERED" (->num spl-ORDERED)) (cons "DISTINCT" (->num spl-DISTINCT)) (cons "SORTED" (->num spl-SORTED))
+        (cons "SIZED" (->num spl-SIZED)) (cons "NONNULL" (->num spl-NONNULL)) (cons "IMMUTABLE" (->num spl-IMMUTABLE))
+        (cons "CONCURRENT" (->num spl-CONCURRENT)) (cons "SUBSIZED" (->num spl-SUBSIZED))))
+;; ---- the sources ---------------------------------------------------------------------
+(define (spl-it c) (jx-call c "iterator" '()))
+(define (spl-n c) (jnum->exact (jx-call c "size" '())))
+(define (spl-vec-of cls chars . cmp)
+  ;; late-binding: the elements are read at the spliterator's first use
+  (lambda (self) (make-spl cls 'lazy (lambda () (jxc-elems self)) 0 0 chars (if (pair? cmp) (car cmp) jolt-nil))))
+(define (spl-snapshot-of cls chars) (lambda (self) (make-vec-spl cls chars (jxc-elems self))))
+(define (spl-iter-of cls chars) (lambda (self) (make-iter-spl cls chars (spl-it self) (spl-n self))))
+(define spl-OSS (fxior spl-ORDERED spl-SIZED spl-SUBSIZED))                    ; 16464
+(define (spl-entry-cmp cmp)
+  ;; TreeMap's EntrySpliterator orders entries by key, under the map's comparator
+  (let ((kc (if (jolt-nil? cmp) tm-natural-compare (tm-comparator->cmpf cmp))))
+    (lambda (a b) (kc (jolt-nth a 0) (jolt-nth b 0)))))
+(for-each (lambda (r) (register-host-methods! (car r) (list (cons "spliterator" (cdr r)))))
+  (list
+    (cons "arraylist" (spl-vec-of "java.util.ArrayList$ArrayListSpliterator" spl-OSS))
+    (cons "cd-arraylist-sublist" (spl-vec-of "java.util.ArrayList$SubList$2" spl-OSS))
+    (cons "linkedlist" (spl-iter-of "java.util.LinkedList$LLSpliterator" spl-OSS))
+    (cons "arraydeque" (spl-vec-of "java.util.ArrayDeque$DeqSpliterator" (fxior spl-OSS spl-NONNULL)))
+    (cons "hashset" (spl-vec-of "java.util.HashMap$KeySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "jx-hm-keyset" (spl-vec-of "java.util.HashMap$KeySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "jx-chm-keyset" (spl-vec-of "java.util.concurrent.ConcurrentHashMap$KeySpliterator" (fxior spl-DISTINCT spl-NONNULL spl-CONCURRENT)))
+    (cons "jx-chm-values" (spl-vec-of "java.util.concurrent.ConcurrentHashMap$ValueSpliterator" (fxior spl-NONNULL spl-CONCURRENT)))
+    (cons "jx-chm-entryset" (spl-vec-of "java.util.concurrent.ConcurrentHashMap$EntrySpliterator" (fxior spl-DISTINCT spl-NONNULL spl-CONCURRENT)))
+    (cons "jx-props-keyset" (spl-vec-of "java.util.concurrent.ConcurrentHashMap$KeySpliterator" (fxior spl-DISTINCT spl-NONNULL spl-CONCURRENT)))
+    (cons "jx-props-values" (spl-vec-of "java.util.concurrent.ConcurrentHashMap$ValueSpliterator" (fxior spl-NONNULL spl-CONCURRENT)))
+    (cons "jx-props-entryset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)))
+    (cons "jx-hm-values" (spl-vec-of "java.util.HashMap$ValueSpliterator" spl-SIZED))
+    (cons "jx-hm-entryset" (spl-vec-of "java.util.HashMap$EntrySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "linkedhashset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
+    (cons "lhm-keyset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
+    (cons "lhm-values" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" spl-OSS))
+    (cons "lhm-entryset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
+    (cons "treeset" (lambda (self) (make-vec-spl "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                 (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "treemap-keyset" (lambda (self) (make-vec-spl "java.util.TreeMap$KeySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                        (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "treemap-values" (spl-vec-of "java.util.TreeMap$ValueSpliterator" (fxior spl-ORDERED spl-SIZED)))
+    (cons "treemap-entryset" (lambda (self) (make-vec-spl "java.util.TreeMap$EntrySpliterator" (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-SIZED)
+                                                          (jxc-elems self) (spl-entry-cmp (tmr-cmp-obj (v-root self))))))
+    (cons "arrays-aslist" (spl-vec-of "java.util.Spliterators$ArraySpliterator" spl-OSS))
+    (cons "jx-listn" (spl-vec-of "java.util.AbstractList$RandomAccessSpliterator" spl-OSS))
+    (cons "jx-list12" (spl-vec-of "java.util.AbstractList$RandomAccessSpliterator" spl-OSS))
+    (cons "jx-setn" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)))
+    (cons "jx-set12" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)))
+    ;; a copy-on-write collection's is a snapshot of the array at creation
+    (cons "jx-cow-list" (spl-snapshot-of "java.util.Spliterators$ArraySpliterator" (fxior spl-OSS spl-IMMUTABLE)))
+    (cons "jx-cow-set" (spl-snapshot-of "java.util.Spliterators$ArraySpliterator" (fxior spl-SIZED spl-SUBSIZED spl-IMMUTABLE spl-DISTINCT)))
+    (cons "jx-clq" (lambda (self) (make-iter-spl "java.util.concurrent.ConcurrentLinkedQueue$CLQSpliterator"
+                                                 (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT) (spl-it self) spl-long-max)))
+    (cons "jx-cld" (lambda (self) (make-iter-spl "java.util.concurrent.ConcurrentLinkedDeque$CLDSpliterator"
+                                                 (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT) (spl-it self) spl-long-max)))
+    (cons "jx-csls" (lambda (self) (make-vec-spl "java.util.concurrent.ConcurrentSkipListMap$KeySpliterator"
+                                                 (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-NONNULL spl-CONCURRENT)
+                                                 (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "jx-cslm-keyset" (lambda (self) (make-vec-spl "java.util.concurrent.ConcurrentSkipListMap$KeySpliterator"
+                                                        (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-NONNULL spl-CONCURRENT)
+                                                        (jxc-elems self) (jx-call self "comparator" '()))))
+    (cons "jx-cslm-values" (spl-vec-of "java.util.concurrent.ConcurrentSkipListMap$ValueSpliterator"
+                                       (fxior spl-ORDERED spl-NONNULL spl-CONCURRENT)))
+    (cons "jx-cslm-entryset" (lambda (self) (make-vec-spl "java.util.concurrent.ConcurrentSkipListMap$EntrySpliterator"
+                                                          (fxior spl-DISTINCT spl-SORTED spl-ORDERED spl-NONNULL spl-CONCURRENT)
+                                                          (jxc-elems self) (spl-entry-cmp (tmr-cmp-obj (cs-root self))))))
+    (cons "jx-priority-queue" (spl-vec-of "java.util.PriorityQueue$PriorityQueueSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-NONNULL)))
+    (cons "jx-vector" (spl-vec-of "java.util.Vector$VectorSpliterator" spl-OSS))
+    (cons "jx-stack" (spl-vec-of "java.util.Vector$VectorSpliterator" spl-OSS))))
+;; the unmodifiable and synchronized wrappers hand back the collection's own
+(define (spl-of-inner self) (jx-call (jxw-inner self) "spliterator" '()))
+(for-each (lambda (f)
+            (for-each (lambda (t) (when t (register-host-methods! t (list (cons "spliterator" spl-of-inner)))))
+                      (list (list-ref f 1) (list-ref f 2))))
+          jx-families)
+;; any other Collection: the interface's default — a RandomAccess List's
+;; RandomAccessSpliterator, otherwise an IteratorSpliterator, ORDERED for a List
+;; and DISTINCT for a Set
+(define (spl-default self)
+  (cond ((and (jx-isa? self "java.util.List") (jx-isa? self "java.util.RandomAccess"))
+         (make-vec-spl "java.util.AbstractList$RandomAccessSpliterator" spl-OSS (jxc-elems self)))
+        ((jx-isa? self "java.util.List") (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-OSS (spl-it self) (spl-n self)))
+        ((jx-isa? self "java.util.Set") (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT) (spl-it self) (spl-n self)))
+        (else (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED) (spl-it self) (spl-n self)))))
+(hashtable-set! cd-default-tbl "java.util.Collection"
+                (append (hashtable-ref cd-default-tbl "java.util.Collection" '()) (list (list "spliterator" 0 spl-default))))
+;; a persistent collection: a vector's own (PersistentVector$3), a map's
+;; Iterable default (no size, no characteristics), a set's and any seq's the
+;; Collection one
+(set! persistent-spliterator-hook
+  (lambda (obj)
+    (cond ((pvec? obj) (make-vec-spl "clojure.lang.PersistentVector$3" (fxior spl-OSS spl-IMMUTABLE) (seq->list (jolt-seq obj))))
+          ((jolt-map? obj) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" 0 (make-jiterator (jolt-seq obj)) spl-long-max))
+          ((jolt-set? obj) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)
+                                          (make-jiterator (jolt-seq obj)) (jolt-count obj)))
+          (else (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-OSS (make-jiterator (jolt-seq obj)) (jolt-count obj))))))
+;; Stream.spliterator: the source collection's own when the stream came straight
+;; from one (a head stream, as the JDK's pipeline head answers), else one over
+;; the elements; either way it consumes the stream
+(register-host-methods! "stream"
+  (list (cons "spliterator"
+              (lambda (self)
+                (let ((src (stream-source self)) (xs (stream-take! self)))
+                  (if src
+                      (jx-call src "spliterator" '())
+                      (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-ORDERED (make-jiterator xs) spl-long-max)))))))
+;; Spliterators and StreamSupport
+(define (spl-chars c) (jnum->exact c))
+(register-class-statics! "java.util.Spliterators"
+  (list (cons "spliterator"
+              (case-lambda
+                ((src c) (if (jolt-array? src)
+                             (make-vec-spl "java.util.Spliterators$ArraySpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED) (ja->list src))
+                             (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED)
+                                            (spl-it src) (spl-n src))))
+                ((it size c) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED) it (jnum->exact size)))
+                ((arr from to c) (make-vec-spl "java.util.Spliterators$ArraySpliterator" (fxior (spl-chars c) spl-SIZED spl-SUBSIZED)
+                                               (list-head (list-tail (ja->list arr) (jnum->exact from)) (- (jnum->exact to) (jnum->exact from)))))))
+        (cons "spliteratorUnknownSize" (lambda (it c) (make-iter-spl "java.util.Spliterators$IteratorSpliterator" (spl-chars c) it spl-long-max)))
+        (cons "emptySpliterator" (lambda () (make-vec-spl "java.util.Spliterators$EmptySpliterator$OfRef" (fxior spl-SIZED spl-SUBSIZED) '())))
+        (cons "iterator" (lambda (spl) (make-jhost "jx-spl-adapter" (vector spl spl-none))))))
+;; Spliterators.iterator(spliterator): Spliterators$1Adapter, a one-element lookahead
+(define (spla-fill! a)
+  (let ((st (jhost-state a)))
+    (when (eq? (vector-ref st 1) spl-none) (vector-set! st 1 (spl-advance! (vector-ref st 0))))))
+(jx-class! "jx-spl-adapter" "java.util.Spliterators$1Adapter" '("java.util.Iterator"))
+(register-host-methods! "jx-spl-adapter"
+  (list (cons "hasNext" (lambda (self) (spla-fill! self) (not (eq? (vector-ref (jhost-state self) 1) spl-none))))
+        (cons "next" (lambda (self) (spla-fill! self)
+                       (let ((v (vector-ref (jhost-state self) 1)))
+                         (when (eq? v spl-none) (throw-jvm 'NoSuchElementException jolt-nil))
+                         (vector-set! (jhost-state self) 1 spl-none) v)))))
+(jx-register! "jx-spl-adapter" 'iter
+  (lambda (a) (let loop ((acc '())) (if (jolt-truthy? (jx-call a "hasNext" '())) (loop (cons (jx-call a "next" '()) acc)) (reverse acc))))
+  #f #f #f)
+(register-image-refusal! '("jx-spl-adapter") "an iterator is a position in a walk this process is making; write the collection instead")
+(register-class-statics! "java.util.stream.StreamSupport"
+  (list (cons "stream" (lambda (spl parallel?)
+                         (make-stream 'ref (let loop ()
+                                             (jolt-make-lazy-seq
+                                               (lambda () (let ((v (spl-advance! spl))) (if (eq? v spl-none) jolt-nil (jolt-cons v (loop))))))))))))

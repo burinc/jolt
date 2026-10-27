@@ -107,8 +107,12 @@
                  ans)
                hit)))
         ((and (jreify? val) (not (jreify-delegate val)))
-         (reify-declares-class? (jreify-protos val) tname))
+         (or (reify-declares-class? (jreify-protos val) tname) (reify-class-isa? val tname)))
         (else #f)))
+;; a reify form's or proxy's generated class and what the class graph puts above
+;; it (a proxy is an IProxy, and is its abstract superclass)
+(define (reify-class-isa? val tname)
+  (let ((c (reify-class-name val))) (and c (jch-isa? c tname) #t)))
 
 (define (instance-check-base type-sym val)
   (let ((tname (symbol-t-name type-sym)))
@@ -119,7 +123,7 @@
              ;; the class graph: a declared interface's own ancestry answers too
              ;; (IPersistentMap is an Associative is an IPersistentCollection).
              (jch-isa? tag tname))))
-      ((jreify? val) (reify-declares-class? (jreify-protos val) tname))
+      ((jreify? val) (or (reify-declares-class? (jreify-protos val) tname) (reify-class-isa? val tname)))
       ((ex-info-map? val) (exception-isa? (last-dot (ex-info-class val)) (last-dot tname)))
       (else (case-string tname val)))))
 

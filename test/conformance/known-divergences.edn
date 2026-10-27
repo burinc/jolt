@@ -1679,6 +1679,14 @@
            :jvm "\"class java.lang.String cannot be cast to class java.nio.charset.Charset (java.lang.String and java.nio.charset.Charset are in module java.base of loader 'bootstrap')\""
            :jolt "\"class java.util.zip.ZipInputStream\""}
    :note "A Charset object is taken on both. Corpus rows (java.util.zip / ZipInputStream) pin the charsets a name decodes with."}
+  {:category :host-model
+   :behavior "where a hash or tree collection's spliterator splits"
+   :jvm "HashMap's splits at its table's halves, TreeMap's at its root, a skip list's at an index level"
+   :jolt "the midpoint of the elements"
+   :check {:expr "(let [s (.spliterator (java.util.HashSet. (range 10))) p (.trySplit s) n (atom 0)] (.forEachRemaining p (reify java.util.function.Consumer (accept [_ _] (swap! n inc)))) @n)"
+           :jvm "8"
+           :jolt "5"}
+   :note "jolt's hash and tree collections do not share the JDK's table and tree layout, so a split falls elsewhere; every element is handed out once, in the same order overall. Class, characteristics, sizes and comparators match (corpus java.util / Spliterator)."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than

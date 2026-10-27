@@ -373,6 +373,9 @@
 ;; The interop entry points (host-new, host-static-call / -ref, static-member)
 ;; and the shims behind them are host-statics.ss.
 (degrade-core-vars! '("make-proxy") "there are no JVM class shims on this target")
+;; the proxy macro's entry point (it passes the form's ns, for the class name)
+(def-var! "jolt.host" "make-proxy-in"
+  (gambit-unsupported-fn "make-proxy-in" "there are no JVM class shims on this target"))
 ;; The fn-form registry (fn-form-registry.ss) is the image's; the back end asks
 ;; it inside a try and falls back to constructing the form.
 (def-var! "jolt.host" "fn-form-parse"

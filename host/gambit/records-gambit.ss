@@ -1203,7 +1203,11 @@
      (if nargs
          (jrec-method-arity v method nargs)
          (jrec-method v method)))
-    ((jreify? v) (reify-method-ref v method))
+    ((jreify? v)
+     (or (reify-method-ref v method)
+         (and abstract-class-method-hook
+              (string=? method "iterator")
+              (abstract-class-method-hook v method))))
     (else #f)))
 
 (define (jrec-field-count coll)
@@ -1789,6 +1793,11 @@
 (define jreify-tags-memo (make-weak-eq-hashtable))
 
 (define (jreify-host-tags obj)
+  (let ((tags (jreify-protos-host-tags obj))
+        (c (reify-class-name obj)))
+    (if c (cons c tags) tags)))
+
+(define (jreify-protos-host-tags obj)
   (let* ((ps (jreify-protos obj))
          (e (hashtable-ref jreify-tags-memo ps #f)))
     (if (and e (fx= (car e) jch-graph-epoch))
@@ -3358,6 +3367,9 @@
      (list (jolt-seq obj)))
     ((string=? name "iterator")
      (list (make-jiterator (jolt-seq obj))))
+    ((and (string=? name "spliterator")
+          persistent-spliterator-hook)
+     (list (persistent-spliterator-hook obj)))
     ((string=? name "reduce")
      (let ((k (dot-coll-kind-fast obj)))
        (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
@@ -3531,8 +3543,8 @@
       (apply jolt-invoke f obj rest)))
 
 (define-record-type jreify
-  (fields methods protos delegate)
-  (nongenerative chez-jreify-v2))
+  (fields methods protos delegate (mutable cname))
+  (nongenerative chez-jreify-v3))
 
 (register-code-value! jreify?)
 
@@ -3581,7 +3593,33 @@
   jreify?
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
-      (if m (jolt-invoke m coll k d) d))))
+      (cond
+        (m
+         (if (and (jolt-nil? d) (proc-accepts? m 2))
+             (jolt-invoke m coll k)
+             (jolt-invoke m coll k d)))
+        ((and (reify-method-ref coll "get")
+              (reify-declares-class?
+                (jreify-protos coll)
+                "java.util.Map"))
+         (let ((g (reify-method-ref coll "get"))
+               (ck (or (reify-method-ref coll "containsKey")
+                       (and abstract-class-method-hook
+                            (abstract-class-method-hook
+                              coll
+                              "containsKey")))))
+           (if ck
+               (if (jolt-truthy? (jolt-invoke ck coll k))
+                   (jolt-invoke g coll k)
+                   d)
+               (let ((v (jolt-invoke g coll k))) (if (jolt-nil? v) d v)))))
+        ((and abstract-class-method-hook
+              (abstract-class-method-hook coll "containsKey")) =>
+         (lambda (ck)
+           (if (jolt-truthy? (ck coll k))
+               (record-method-dispatch coll "get" (list->cseq (list k)))
+               d)))
+        (else d)))))
 
 (define (reify-proto-names proto-names)
   (intern-reify-protos
@@ -3609,7 +3647,8 @@
     (make-jreify
       (cons slots fns)
       (reify-proto-names proto-names)
-      delegate)))
+      delegate
+      #f)))
 
 (define reify-shape-memo (make-weak-eq-hashtable))
 
@@ -3619,25 +3658,44 @@
   (or (hashtable-ref reify-shape-memo shape #f)
       (let* ((names (seq->list (jolt-nth shape 0)))
              (slots (make-hashtable string-hash string=?))
-             (layout (cons
+             (protos (reify-proto-names (seq->list (jolt-nth shape 1))))
+             (layout (vector
                        slots
-                       (reify-proto-names
-                         (seq->list (jolt-nth shape 1))))))
+                       protos
+                       (and (fx>? (jolt-count shape) 2)
+                            (jolt-nth shape 2)))))
         (let loop ((ns names) (i 0))
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
+        (when (vector-ref layout 2)
+          (reify-class-graph-hook (vector-ref layout 2) protos))
         (jolt-with-mutex
           reify-shape-mu
           (hashtable-set! reify-shape-memo shape layout))
         layout)))
 
+(define proxy-class-name-hook (lambda (x) #f))
+
+(define (reify-class-name x)
+  (and (jreify? x)
+       (let ((c (jreify-cname x)))
+         (cond
+           ((string? c) c)
+           ((vector? c) (proxy-class-name-hook x))
+           (else #f)))))
+
+(define persistent-spliterator-hook #f)
+
+(define reify-class-graph-hook (lambda (name ifaces) #f))
+
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))
     (make-jreify
-      (cons (car layout) (list->vector fns))
-      (cdr layout)
-      #f)))
+      (cons (vector-ref layout 0) (list->vector fns))
+      (vector-ref layout 1)
+      #f
+      (vector-ref layout 2))))
 
 (define reify-protos-table
   (make-hashtable equal-hash equal?))
@@ -3847,6 +3905,22 @@
   "clojure.core"
   "make-deftype-ctor"
   make-deftype-ctor)
+
+(define (register-record-tag! tag)
+  (jolt-with-mutex
+    rec-tbl-mu
+    (hashtable-set! chez-record-type-tbl tag #t))
+  (chez-infer-registry-bump!)
+  (let ((protos (filter
+                  (lambda (s) (not (string=? s "clojure.lang.IType")))
+                  (jch-direct-supers tag))))
+    (jch-set-supers!
+      tag
+      (append
+        protos
+        '("clojure.lang.IRecord" "clojure.lang.IObj" "clojure.lang.IPersistentMap"
+           "java.util.Map" "clojure.lang.IHashEq"
+           "java.io.Serializable")))))
 
 (define (register-record-type! name-sym)
   (let ((tag (string-append

@@ -999,6 +999,8 @@
     ;; branch and is mis-read as a missing :iterator key (nil). Some libraries
     ;; (e.g. malli's -vmap) iterate a map this way.
     ((string=? name "iterator") (list (make-jiterator (jolt-seq obj))))
+    ;; (.spliterator coll): the host builds it (jutil-concurrent.ss on Chez)
+    ((and (string=? name "spliterator") persistent-spliterator-hook) (list (persistent-spliterator-hook obj)))
     ;; (.reduce coll f) / (.reduce coll f init): clojure.lang.IReduce — every
     ;; persistent collection reduces itself on the JVM.
     ((string=? name "reduce")
@@ -1192,7 +1194,10 @@
 ;; A reify may carry a DELEGATE: an object that answers any method the reify's own
 ;; table does not. clojure.core/proxy over a concrete class builds one that way —
 ;; see java/proxy.ss. A plain reify has no delegate and a method miss still throws.
-(define-record-type jreify (fields methods protos delegate) (nongenerative chez-jreify-v2))
+;; cname: the generated class's name (a reify form's), a #(ns) a proxy's is
+;; worked out from on first ask (java/proxy.ss), or #f. A reify is a code value,
+;; refused by images, so this layout is not image surface.
+(define-record-type jreify (fields methods protos delegate (mutable cname)) (nongenerative chez-jreify-v3))
 ;; likewise a reify: (def r (reify ...)) is code the restoring build already has.
 (register-code-value! jreify?)
 ;; A reify's methods are a LAYOUT and a vector of fns: (slots . fns), where SLOTS
@@ -1240,7 +1245,25 @@
 (register-get-arm! jreify?
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
-      (if m (jolt-invoke m coll k d) d))))
+      (cond ;; RT.get calls valAt(k) for (get x k): a nil default takes the
+            ;; 2-arity when there is one (records.ss jrec-call-valat, same rule)
+            (m (if (and (jolt-nil? d) (proc-accepts? m 2)) (jolt-invoke m coll k) (jolt-invoke m coll k d)))
+            ;; a reify of java.util.Map: RT.get reads it through its get, the
+            ;; default when containsKey says the key is absent
+            ((and (reify-method-ref coll "get") (reify-declares-class? (jreify-protos coll) "java.util.Map"))
+             (let ((g (reify-method-ref coll "get"))
+                   (ck (or (reify-method-ref coll "containsKey")
+                           (and abstract-class-method-hook (abstract-class-method-hook coll "containsKey")))))
+               (if ck
+                   (if (jolt-truthy? (jolt-invoke ck coll k)) (jolt-invoke g coll k) d)
+                   (let ((v (jolt-invoke g coll k))) (if (jolt-nil? v) d v)))))
+            ;; a java.util.Map by an abstract class it declares (a proxy over
+            ;; AbstractMap): RT.get reads it through Map.get
+            ((and abstract-class-method-hook (abstract-class-method-hook coll "containsKey"))
+             => (lambda (ck) (if (jolt-truthy? (ck coll k))
+                                 (record-method-dispatch coll "get" (list->cseq (list k)))
+                                 d)))
+            (else d)))))
 (define (reify-proto-names proto-names)
   (intern-reify-protos
    (map (lambda (p) (if (symbol-t? p) (symbol-t-name p) p))
@@ -1259,7 +1282,7 @@
           (hashtable-set! slots (if (keyword? p) (keyword-t-name p) p) i)
           (vector-set! fns i (jolt-get methods-map p jolt-nil))
           (loop (cdr ks) (fx+ i 1)))))
-    (make-jreify (cons slots fns) (reify-proto-names proto-names) delegate)))
+    (make-jreify (cons slots fns) (reify-proto-names proto-names) delegate #f)))
 ;; The reify macro's entry: SHAPE is the site's literal [[method-name …]
 ;; [protocol …]], a constant the site's pool binds once, so it is the same object
 ;; for every instance the site builds and its layout is computed once, keyed eq?
@@ -1270,16 +1293,34 @@
   (or (hashtable-ref reify-shape-memo shape #f)
       (let* ((names (seq->list (jolt-nth shape 0)))
              (slots (make-hashtable string-hash string=?))
-             (layout (cons slots (reify-proto-names (seq->list (jolt-nth shape 1))))))
+             (protos (reify-proto-names (seq->list (jolt-nth shape 1))))
+             ;; #(slots protos class-name)
+             (layout (vector slots protos (and (fx>? (jolt-count shape) 2) (jolt-nth shape 2)))))
         (let loop ((ns names) (i 0))
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
+        ;; a site compiled with its class name (the macro's third element) hands
+        ;; it to every instance; code compiled before that reports the shared
+        ;; placeholder
+        (when (vector-ref layout 2) (reify-class-graph-hook (vector-ref layout 2) protos))
         (jolt-with-mutex reify-shape-mu (hashtable-set! reify-shape-memo shape layout))
         layout)))
+;; A reify form's or a proxy's generated class name, or #f. A proxy's is worked
+;; out on first ask by the host (proxy-class-name-hook, java/proxy.ss on Chez).
+(define proxy-class-name-hook (lambda (x) #f))
+(define (reify-class-name x)
+  (and (jreify? x)
+       (let ((c (jreify-cname x)))
+         (cond ((string? c) c) ((vector? c) (proxy-class-name-hook x)) (else #f)))))
+;; A persistent collection's java.util.Spliterator, or #f on a host that models none.
+(define persistent-spliterator-hook #f)
+;; Placing a reify form's class in the class graph is the host's (the Chez half
+;; installs it with the graph, proxy.ss); a host without one keeps just the name.
+(define reify-class-graph-hook (lambda (name ifaces) #f))
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))
-    (make-jreify (cons (car layout) (list->vector fns)) (cdr layout) #f)))
+    (make-jreify (cons (vector-ref layout 0) (list->vector fns)) (vector-ref layout 1) #f (vector-ref layout 2))))
 ;; Every reify from one site declares the same protocols, but the names arrive
 ;; as rest args, so each instance got its own fresh list. The questions asked of
 ;; that list — its dispatch tags (jreify-host-tags), instance? against a class
@@ -1528,6 +1569,17 @@
 
 ;; defrecord marks its type a record (deftype does not), keyed by the same
 ;; "ns.Name" tag make-deftype-ctor bakes — so jrec-record? distinguishes the two.
+;; The tag-keyed half, which an image restore also calls for a record type whose
+;; defrecord never ran in this process (state-image.ss image-register-types!).
+(define (register-record-tag! tag)
+  (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl tag #t))
+  (chez-infer-registry-bump!)
+  (let ((protos (filter (lambda (s) (not (string=? s "clojure.lang.IType")))
+                        (jch-direct-supers tag))))
+    (jch-set-supers! tag (append protos
+                                 '("clojure.lang.IRecord" "clojure.lang.IObj"
+                                   "clojure.lang.IPersistentMap" "java.util.Map"
+                                   "clojure.lang.IHashEq" "java.io.Serializable")))))
 (define (register-record-type! name-sym)
   (let ((tag (string-append (chez-current-ns) "." (symbol-t-name name-sym))))
     (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl tag #t))

@@ -242,10 +242,17 @@
   (lambda (e) e))
 (def-var! "clojure.core" "ex-data"
   (lambda (e) (if (jolt-ex-info-record? e) (jolt-ex-info-record-data e) jolt-nil)))
+;; a proxy over a Throwable class is one too: its getMessage / getCause answer,
+;; the proxy's own when it writes them (ex-message is Throwable.getMessage)
+(define (throwable-proxy? e) (and (jreify? e) (jreify-delegate e) (jolt-ex-info-record? (jreify-delegate e))))
 (def-var! "clojure.core" "ex-message"
-  (lambda (e) (if (jolt-ex-info-record? e) (jolt-ex-info-record-message e) jolt-nil)))
+  (lambda (e) (cond ((jolt-ex-info-record? e) (jolt-ex-info-record-message e))
+                    ((throwable-proxy? e) (record-method-dispatch e "getMessage" jolt-nil))
+                    (else jolt-nil))))
 (def-var! "clojure.core" "ex-cause"
-  (lambda (e) (if (jolt-ex-info-record? e) (jolt-ex-info-record-cause e) jolt-nil)))
+  (lambda (e) (cond ((jolt-ex-info-record? e) (jolt-ex-info-record-cause e))
+                    ((throwable-proxy? e) (record-method-dispatch e "getCause" jolt-nil))
+                    (else jolt-nil))))
 ;; Throwable->map: the seed prelude version reads ex-data/ex-message/ex-cause
 ;; through the old var-deref chain; re-assert with the native versions.
 ;; seqable? additionally covers the iterable java.util shims (Iterable on the JVM)

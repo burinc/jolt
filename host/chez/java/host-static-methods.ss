@@ -772,7 +772,29 @@
                                    (kw "grouping-sep") (kw "string"))
       (kw "default") (jolt-hash-map (kw "decimal-sep") "." (kw "grouping-sep") ",")
       (kw "fallback") (kw "default")
+      (kw "parent") "-"
       (kw "hint") "The jolt-lang/time library carries per-locale number symbols.")))
+;; The key a Locale's locale data is registered under: its BCP-47-style id
+;; (language-Script-COUNTRY-variant, "en-US", "zh-Hant-TW"), from the Locale's
+;; rendering, which prints the JDK's toString (en_US, zh_TW_#Hant, sr__#Latn).
+;; Core has no Locale class, so it reads the rendering (RFC 0008); the points
+;; narrow a missed key to its language.
+(define (jolt-locale-key l)
+  (let* ((s (jolt-str-render-one l))
+         (h (let loop ((i 0)) (cond ((fx>=? (fx+ i 1) (string-length s)) #f)
+                                    ((and (char=? (string-ref s i) #\_) (char=? (string-ref s (fx+ i 1)) #\#)) i)
+                                    (else (loop (fx+ i 1))))))
+         (base (if h (substring s 0 h) s))
+         (script (if h (substring s (fx+ h 2) (string-length s)) ""))
+         (parts (let split ((cs (string->list base)) (cur '()) (acc '()))
+                  (cond ((null? cs) (reverse (cons (list->string (reverse cur)) acc)))
+                        ((char=? (car cs) #\_) (split (cdr cs) '() (cons (list->string (reverse cur)) acc)))
+                        (else (split (cdr cs) (cons (car cs) cur) acc)))))
+         (keyed (append (list (car parts) script) (cdr parts))))
+    (let join ((xs (filter (lambda (x) (fx>? (string-length x) 0)) keyed)) (acc ""))
+      (cond ((null? xs) acc)
+            ((string=? acc "") (join (cdr xs) (car xs)))
+            (else (join (cdr xs) (string-append acc "-" (car xs))))))))
 (define (number-symbol id name dflt)
   (let* ((data (jolt-extension-value (keyword #f "number-symbols") id))
          (v (jolt-get-dispatch data (keyword #f name) jolt-nil)))
@@ -842,8 +864,8 @@
                    (ja->list (car args))
                    args)))
     (if locale?
-        (parameterize ((format-decimal-sep
-                        (number-symbol (jolt-str-render-one a) "decimal-sep" ".")))
+        (parameterize ((format-decimal-sep (number-symbol (jolt-locale-key a) "decimal-sep" "."))
+                       (format-grouping-sep (number-symbol (jolt-locale-key a) "grouping-sep" ",")))
           (jolt-format* sink fmt args))
         (jolt-format* sink fmt args))))
 
@@ -939,7 +961,7 @@
 ;; default the JVM would use — core has no notion of a default locale. Documented
 ;; in known-divergences.
 (define (nf-currency-instance . args)
-  (let* ((key (if (null? args) "" (jolt-str-render-one (car args))))
+  (let* ((key (if (null? args) "" (jolt-locale-key (car args))))
          (data (jolt-extension-value (keyword #f "currency-data") key))
          (frac (let ((f (jolt-get-dispatch data (keyword #f "frac-digits") jolt-nil)))
                  (if (jolt-nil? f) 2 f))))
