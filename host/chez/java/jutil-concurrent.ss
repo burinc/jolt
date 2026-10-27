@@ -1732,17 +1732,19 @@
 ;; then it is detached, keeping the value it last saw even if the key comes
 ;; back. Each map that has handed out nodes keeps a generation per removed key
 ;; and one for clears, which a node compares with the ones it was made under.
-;; State #(map key last generation).
+;; State #(map key last generation map-generations).
 (define hmn-gens (make-weak-eq-hashtable))   ; map -> #(clear-gen key-table)
 (define hmn-gens-mu (make-mutex))
-(define (hmn-gen m k)
-  (let ((g (hashtable-ref hmn-gens m #f)))
-    (if g (+ (vector-ref g 0) (hashtable-ref (vector-ref g 1) k 0)) 0)))
+(define (hmn-gen* g k)
+  ;; most maps remove nothing between handing out nodes: skip the key probe then
+  (let ((kt (vector-ref g 1)))
+    (if (fx=? 0 (hashtable-size kt)) (vector-ref g 0) (+ (vector-ref g 0) (hashtable-ref kt k 0)))))
 (define (hmn-track! m)
-  (unless (hashtable-ref hmn-gens m #f)
-    (jolt-with-mutex hmn-gens-mu
-      (unless (hashtable-ref hmn-gens m #f)
-        (hashtable-set! hmn-gens m (vector 0 (make-hashtable hm-hash jolt=2)))))))
+  ;; this map's generations, made on its first node
+  (or (hashtable-ref hmn-gens m #f)
+      (jolt-with-mutex hmn-gens-mu
+        (or (hashtable-ref hmn-gens m #f)
+            (let ((g (vector 0 (make-hashtable hm-hash jolt=2)))) (hashtable-set! hmn-gens m g) g)))))
 (set! hm-detach-hook
   (lambda (m k)
     (let ((g (hashtable-ref hmn-gens m #f)))
@@ -1751,9 +1753,10 @@
           (if (eq? k hm-detach-hook)
               (vector-set! g 0 (+ 1 (vector-ref g 0)))
               (hashtable-update! (vector-ref g 1) k (lambda (n) (+ n 1)) 0)))))))
-(define (hm-node m k) (hmn-track! m) (make-jhost "jx-hm-node" (vector m k (hmv-ref m k) (hmn-gen m k))))
+(define (hm-node* m k g) (make-jhost "jx-hm-node" (vector m k (hmv-ref m k) (hmn-gen* g k) g)))
+(define (hm-node m k) (hm-node* m k (hmn-track! m)))
 (define hmn-absent (list 'absent))
-(define (hmn-attached? st) (= (vector-ref st 3) (hmn-gen (vector-ref st 0) (vector-ref st 1))))
+(define (hmn-attached? st) (= (vector-ref st 3) (hmn-gen* (vector-ref st 4) (vector-ref st 1))))
 (define (hmn-value n)
   ;; the map's value while the node is attached, else the last one seen
   (let ((st (jhost-state n)))
@@ -1777,7 +1780,8 @@
     ((key) (lambda (v) (reverse (hm-ord (hmv-map v)))))
     ((value) (lambda (v) (let ((t (hm-tbl (hmv-map v))))
                            (fold-left (lambda (acc k) (cons (hashtable-ref t k jolt-nil) acc)) '() (hm-ord (hmv-map v))))))
-    (else (lambda (v) (let ((m (hmv-map v))) (fold-left (lambda (acc k) (cons (hm-node m k) acc)) '() (hm-ord m)))))))
+    (else (lambda (v) (let* ((m (hmv-map v)) (g (hmn-track! m)))
+                        (fold-left (lambda (acc k) (cons (hm-node* m k g) acc)) '() (hm-ord m)))))))
 (define (hmv-entry-kv e)
   (or (jolt-host-entry e) (and (jolt-map-entry? e) (cons (jolt-nth e 0) (jolt-nth e 1)))))
 (define (hmv-has-entry? m e)
@@ -1815,7 +1819,10 @@
             (register-host-methods! (car r) hm-iterator-methods)
             (jx-register! (car r) 'iter
                           (lambda (it) (let ((st (jhost-state it)))
-                                         (map (lambda (k) (hmv-project (vector-ref st 3) (vector-ref st 0) k)) (vector-ref st 1))))
+                                         (if (eq? (vector-ref st 3) 'entry)
+                                             (let* ((m (vector-ref st 0)) (g (hmn-track! m)))
+                                               (map (lambda (k) (hm-node* m k g)) (vector-ref st 1)))
+                                             (map (lambda (k) (hmv-project (vector-ref st 3) (vector-ref st 0) k)) (vector-ref st 1)))))
                           #f #f #f))
           '(("jx-hm-key-itr" "java.util.HashMap$KeyIterator") ("jx-hm-value-itr" "java.util.HashMap$ValueIterator")
             ("jx-hm-entry-itr" "java.util.HashMap$EntryIterator")))

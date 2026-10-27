@@ -943,17 +943,22 @@
     self))
 (register-class-ctor! "ConcurrentHashMap" make-chm-jhost)
 (register-class-ctor! "java.util.concurrent.ConcurrentHashMap" make-chm-jhost)
-(define (chm-npe! . xs) (when (exists (lambda (x) (jolt-nil? x)) xs) (throw-jvm 'NullPointerException jolt-nil)))
-(define (chm-guard name check)
-  ;; hashmap's NAME, refusing a null where CHECK says
-  (let ((f (cdr (assoc name hashmap-methods))))
-    (cons name (lambda (self . args) (apply check args) (apply f self args)))))
+(define (chm-npe!) (throw-jvm 'NullPointerException jolt-nil))
+(define (chm-method name) (cdr (assoc name hashmap-methods)))
+;; hashmap's methods, refusing a null key or value as ConcurrentHashMap does;
+;; fixed arities, so a call allocates nothing for the check
 (register-host-methods! "chm"
   (append hashmap-methods
-          (list (chm-guard "put" chm-npe!) (chm-guard "putIfAbsent" chm-npe!)
-                (chm-guard "get" chm-npe!) (chm-guard "containsKey" chm-npe!)
-                (chm-guard "containsValue" chm-npe!)
-                (chm-guard "remove" (lambda (k . r) (chm-npe! k))))))
+          (let ((put (chm-method "put")) (pia (chm-method "putIfAbsent")) (cv (chm-method "containsValue"))
+                (rm (chm-method "remove")))
+            (list (cons "put" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (put self k v)))
+                  (cons "putIfAbsent" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (pia self k v)))
+                  (cons "get" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (hashtable-ref (hm-tbl self) k jolt-nil)))
+                  (cons "containsKey" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
+                  (cons "containsValue" (lambda (self v) (when (jolt-nil? v) (chm-npe!)) (cv self v)))
+                  (cons "remove" (case-lambda
+                                   ((self k) (when (jolt-nil? k) (chm-npe!)) (rm self k))
+                                   ((self k v) (when (jolt-nil? k) (chm-npe!)) (rm self k v))))))))
 ;; WeakHashMap: a HashMap shim. Chez has no weak-value hashtable, so entries are
 ;; not GC-evicted — a cache backed by it never shrinks (correct, just unbounded),
 ;; the same trade-off as SoftReference on this host.
