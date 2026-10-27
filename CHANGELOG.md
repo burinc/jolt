@@ -117,6 +117,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Images are format 13**: they name the defrecord and deftype types they
   hold, so a process that restores one without having loaded the code knows a
   record from a deftype. Older images read as before.
+- **`ConcurrentHashMap` is its own class**: a `ConcurrentMap` that refuses
+  null keys and values, whose `keySet`/`values`/`entrySet` are the JDK's
+  weakly consistent views (`ConcurrentHashMap$KeySetView` …, and
+  `keySet(default)`). It used to be a `java.util.HashMap`. `Properties`' views
+  are the synchronized ones over the same weakly consistent walk.
+- **Locale-keyed extension points narrow a missed key to its language** (a
+  point's new `:parent` separator), so `de-DE` reads `de`'s data rather than
+  ROOT's; `String/format` uses the locale's grouping separator too.
+- **A reify form's class name comes from where it sits** (file, line, column),
+  so a form from the AOT cache and one expanded later never share a class. A
+  proxy is an `IProxy` with the JDK's superclass, interfaces and simple name,
+  and `extend` on a reify's or proxy's class reaches its instances.
 - **Locale data is found by a Locale's id whichever way it prints**, so
   jolt-lang/time's Locale can print as the JDK's `en_US`.
 - **Every `#object` print carries the identity hash, and a plain deftype prints
@@ -142,6 +154,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `get` on a reify calls the 1-arity `valAt` for `(get r k)` and reads a
+  `java.util.Map` reify through its `get`; `ex-message` and `str` of a proxy
+  over an Exception carry its (possibly overridden) message.
+- Two namespaces' records of the same name are two classes to `instance?`.
+- `HashMap.compute`/`merge` returning nil remove a key mapped to nil; a
+  removed key's entry keeps the value it had; a view's `forEach` throws
+  `ConcurrentModificationException` when the map changes under it;
+  `Properties.remove` of an absent key no longer disturbs iteration.
+- `AbstractMap$SimpleImmutableEntry` exists, and both entry classes construct
+  by the name an `import` gives them.
 - **A HashMap's `entrySet` is empty, not nil, when the map is**, so `.size` on
   it, and on an unmodifiable or synchronized view of it, no longer throws.
 - **The nrepl `--port-file` smoke row and a `jolt.process` timing row no longer
