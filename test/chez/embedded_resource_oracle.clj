@@ -73,7 +73,10 @@
           (str/split-lines (:out result)))))
 
 (defn audit-coverage []
-  (let [coverage (edn/read-string (slurp "test/chez/embedded-resource-api-coverage.edn"))
+  (let [version (System/getProperty "java.specification.version")
+        feature (Integer/parseInt (if (str/starts-with? version "1.") (subs version 2) version))
+        coverage (filter #(<= (or (nth % 5 nil) 21) feature)
+                         (edn/read-string (slurp "test/chez/embedded-resource-api-coverage.edn")))
         covered (set (map #(subvec % 0 4) coverage))
         actual (set (concat (mapcat #(javap-rows % false) audited-classes)
                             (javap-rows "java.nio.file.Files" true)
@@ -85,14 +88,15 @@
                                          (when-not (str/includes? test-source (str "\"" label "\"")) label))
                                        coverage))
         missing (sort (remove covered actual))
-        extra (sort (remove actual covered))]
+        extra (when (= feature 21) (sort (remove actual covered)))]
     (when (or (seq missing-labels) (seq missing) (seq extra))
-      (throw (ex-info "embedded resource API coverage audit failed"
-                      {:missing-test-labels (vec missing-labels)
-                       :uncovered-signatures (vec missing)
-                       :stale-coverage-rows (vec extra)})))
+      (let [report {:missing-test-labels (vec missing-labels)
+                    :uncovered-signatures (vec missing)
+                    :stale-coverage-rows (vec extra)}]
+        (binding [*out* *err*] (prn report))
+        (throw (ex-info "embedded resource API coverage audit failed" report))))
     (binding [*out* *err*]
-      (println "API AUDIT OK" (count covered) "signatures"))))
+      (println "API AUDIT OK" (count covered) "signatures on JDK" feature))))
 
 (defn -main [jar-path]
   (prn (oracle-data jar-path))
