@@ -165,16 +165,6 @@ tasks work — but nothing is expanded, so a shared library declared by a
 `-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: no classpath
 cache to force, serial fetching, no JVM to pass options to.
 
-
-## Run with Nix
-
-```sh
-nix run 'git+https://github.com/jolt-lang/jolt.git?submodules=1'
-```
-
-The Git URL and `submodules=1` are required to include vendored dependencies.
-Pass Jolt arguments after `--`.
-
 ## Differences from Clojure
 
 Jolt targets Clojure semantics but runs on Chez, not the JVM. Most portable
@@ -241,6 +231,15 @@ The tracked, gated list of value-level divergences is
 [test/conformance/known-divergences.edn](test/conformance/known-divergences.edn);
 the prose version is [Differences from Clojure](https://jolt-lang.github.io/docs/differences.html)
 on the docs site.
+
+## Run with Nix
+
+```sh
+nix run 'git+https://github.com/jolt-lang/jolt.git?submodules=1'
+```
+
+The Git URL and `submodules=1` are required to include vendored dependencies.
+Pass Jolt arguments after `--`.
 
 ## Scripts
 
