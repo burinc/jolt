@@ -942,6 +942,18 @@
 ;; which allocated a lazy cell per iteration and held the seq head): :let binds,
 ;; :when skips one element, :while stops the coll — same source-order semantics
 ;; as for.
+;;
+;; The innermost group walks a chunked seq (a vector's, a range's, a chunked
+;; map's) as the reference's doseq does: a chunk at a time, stepping the seq once
+;; per chunk, where first/next made a new cell for every element (3.5x a list's
+;; walk over a vector; make doseqperf). The block is read where the seq holds it
+;; (__chunk-vec and friends, natives-transduce.ss, lowered by the compiler), not
+;; copied out. A seq that starts unchunked takes the plain first/next loop it
+;; always took. In the chunk loop the block is the mode: cv a vector is the block
+;; [iv, ev) of it and sv what follows, unrealized until the block is done; cv nil
+;; is a first/next walk of a rest that turned out unchunked (a concat). Outer
+;; groups keep the plain loop: the inner body is written out three times, and
+;; doing the same at every level would multiply it by the nesting depth.
 (defmacro doseq [bindings & body]
   (let [build (fn build [idx groups]
                 (let [g (nth groups idx)
@@ -950,14 +962,36 @@
                       my-mods (nth g 2)
                       is-last (= idx (dec (count groups)))
                       k-form (if is-last `(do ~@body nil) (build (inc idx) groups))
-                      sv (fresh-sym)]
-                  `(loop [~sv (seq ~my-coll)]
-                     (when ~sv
-                       (let [~my-bind (first ~sv)]
-                         ~(comprehension-chain my-mods
-                                 `(do ~k-form (recur (next ~sv)))
-                                 `(recur (next ~sv))
-                                 nil))))))]
+                      sv (fresh-sym) cv (fresh-sym) iv (fresh-sym) ev (fresh-sym) s0 (fresh-sym) v0 (fresh-sym)
+                      plain-loop (fn [start]
+                                   `(loop [~sv ~start]
+                                      (when ~sv
+                                        (let [~my-bind (first ~sv)]
+                                          ~(comprehension-chain my-mods
+                                                                `(do ~k-form (recur (next ~sv)))
+                                                                `(recur (next ~sv))
+                                                                nil)))))
+                      in-chunk `(recur ~sv ~cv (unchecked-inc ~iv) ~ev)
+                      plain-next `(recur (next ~sv) nil 0 0)]
+                  (if (not is-last)
+                    (plain-loop `(seq ~my-coll))
+                    `(when-let [~s0 (seq ~my-coll)]
+                       (let [~v0 (__chunk-vec ~s0)]
+                         (if (nil? ~v0)
+                           ~(plain-loop s0)
+                           (loop [~sv (__chunk-after ~s0) ~cv ~v0 ~iv (__chunk-start ~s0) ~ev (__chunk-end ~s0)]
+                             (if ~cv
+                               (if (< ~iv ~ev)
+                                 (let [~my-bind (__chunk-nth ~cv ~iv)]
+                                   ~(comprehension-chain my-mods `(do ~k-form ~in-chunk) in-chunk nil))
+                                 (when-let [~sv (seq ~sv)]
+                                   (let [v# (__chunk-vec ~sv)]
+                                     (if v#
+                                       (recur (__chunk-after ~sv) v# (__chunk-start ~sv) (__chunk-end ~sv))
+                                       (recur ~sv nil 0 0)))))
+                               (when ~sv
+                                 (let [~my-bind (first ~sv)]
+                                   ~(comprehension-chain my-mods `(do ~k-form ~plain-next) plain-next nil)))))))))))]
     (if (>= (count bindings) 2)
       `(do ~(build 0 (for-parse-groups bindings 0 [])) nil)
       `(do ~@body nil))))

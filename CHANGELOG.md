@@ -106,6 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`doseq` walks a chunked seq a chunk at a time**, reading each block where
+  the vector holds it, as Clojure's `doseq` does. Over a vector it ran 3.5x a
+  list of the same elements; it is now 0.54x what it was (a range 0.63x,
+  `:when` 0.47x), and a list or a short collection costs the same as before.
+  `make doseqperf` holds the vector walk to a list's.
 - **A HashMap's `keySet`, `values` and `entrySet` are live views**
   (`HashMap$KeySet` / `$Values` / `$EntrySet`): removing through one removes
   from the map, a later put shows through, an entry's `setValue` writes the map
@@ -154,6 +159,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `chunk-rest` realized the seq after the chunk; it hands it back unrealized,
+  as `ChunkedCons.chunkedMore` does.
 - `get` on a reify calls the 1-arity `valAt` for `(get r k)` and reads a
   `java.util.Map` reify through its `get`; `ex-message` and `str` of a proxy
   over an Exception carry its (possibly overridden) message.

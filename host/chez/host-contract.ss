@@ -1150,6 +1150,8 @@
     "__deftype-field"
     ;; the `lazy-seq` macro's two halves (lazy-bridge.ss): internal names too
     "make-lazy-seq" "coll->cells" "chunked-seq?"
+    ;; doseq's chunk walk (natives-transduce.ss): internal names too
+    "__chunk-vec" "__chunk-start" "__chunk-end" "__chunk-after" "__chunk-nth"
     "aget" "aset" "alength"
     "bit-and" "bit-or" "bit-xor" "bit-not"
     "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"

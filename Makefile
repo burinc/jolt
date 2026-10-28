@@ -123,7 +123,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
   deadhost recordshadow emittedheads mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax regexbacktrack \
-  hostarity enummodel enumregistrymodel cowpublishmodel imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  hostarity enummodel enumregistrymodel cowpublishmodel doseqperf imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety maskedacquire ioerrno values wp ci
@@ -2081,3 +2081,8 @@ printperf:
 # the default gate free of timing. See the script header.
 sbperf:
 	@$(CHEZ) --script test/chez/string-builder-perf.ss
+
+# doseq over a chunked seq (a vector, a range) must cost no more than 1.5x a list
+# of the same elements, measured as a ratio in one process. Manual, like sbperf.
+doseqperf:
+	@$(CHEZ) --script test/chez/doseq-perf.ss
