@@ -259,6 +259,8 @@
 (define (jolt-atom-watches-update! a f)
   (let retry ()
     (let* ((ws (jolt-atom-watches a)) (nws (f ws)))
+      ;; NWS is a fresh alist that a swap! on another thread walks
+      (memory-order-release)
       (unless (sa-record-cas! a jolt-atom-watches-slot ws nws) (retry)))))
 (define (jolt-add-watch a key f)
   (cond

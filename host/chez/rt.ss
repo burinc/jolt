@@ -2691,25 +2691,33 @@
 ;; going through it would recurse. Types with no str arm print bare, like the
 ;; JVM's default Object.toString. readable? quotes the content unless
 ;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The class is
-;; followed by the identity hash where jolt-object-repr-hash? (below) says so.
+;; followed by the identity hash.
 (define (jolt-object-content x)
   (or (str-render-by-identity x)
       (let loop ((rs str-render-registry))
         (cond ((null? rs) #f)
               (((caar rs) x) ((cdar rs) x))
               (else (loop (cdr rs)))))))
-;; Which values print their identity hash, as the JVM's #object form does:
-;; a host shim object and, once the enum model has said so, an enum constant.
-;; Naming one costs an insert into the identity-hash table, which a record
-;; printed in bulk (a java.io.File) would pay per object; those print without it.
-(define jolt-object-repr-hash? (lambda (x) (jhost? x)))
+;; Every value printed this way carries its identity hash, as the JVM's
+;; print-object writes (System/identityHashCode o) for any object (jolt-28we).
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
-         (content (guard (e (#t #f)) (jolt-object-content x)))
-         (head (and (string? cls)
-                    (if (jolt-object-repr-hash? x)
-                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
-                        (string-append "#object[" cls)))))
+         (hex (and (string? cls) (jolt-identity-hex x)))
+         ;; a deftype with neither toString nor hashCode of its own is
+         ;; Object.toString over its identity hash: the class and hex already in
+         ;; hand, rather than a second class-name lookup and a walk of the str
+         ;; registry to reach them. One that declares either (user code, which may
+         ;; do anything), and an enum constant (its name), go through the registry.
+         (content (if (and hex (jrec? x) (not (enum-constant? x))
+                           ;; under whatever name it was declared: Object or java.lang.Object
+                           (not (find-method-any-protocol (jrec-tag x) "toString"))
+                           (not (find-method-any-protocol (jrec-tag x) "hashCode")))
+                      (string-append cls "@" hex)
+                      (guard (e (#t #f)) (jolt-object-content x))))
+         ;; an array's class name is quoted, as Clojure's print-method writes it
+         (array? (and hex (fx>? (string-length cls) 0) (char=? (string-ref cls 0) #\[)))
+         (content (if (and array? (not (string? content))) (string-append cls "@" hex) content))
+         (head (and hex (string-append "#object[" (if array? (string-append "\"" cls "\"") cls) " 0x" hex))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))
@@ -3086,6 +3094,16 @@
 ;; java.util.function default methods (negate/andThen/…) for every implementer,
 ;; the lambdas they answer, and Function/identity & co. After streams.ss.
 (load "host/chez/java/fi-defaults.ss")
+;; AbstractCollection / AbstractList / Map / Queue defaults every java.util shim
+;; inherits (containsAll, indexOf, subList, getOrDefault, …), at the end of the
+;; dispatch chain behind fi-defaults.ss's.
+(load "host/chez/java/coll-defaults.ss")
+;; Collections.unmodifiable* / synchronized* views and List/Set/Map.of — after
+;; coll-defaults.ss, whose inherited members the views reach through.
+(load "host/chez/java/jutil-views.ss")
+;; Vector, Stack, Hashtable, BitSet, PriorityQueue and the java.util.concurrent
+;; collections, over the jx registry jutil-views.ss keeps.
+(load "host/chez/java/jutil-concurrent.ss")
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and

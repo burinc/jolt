@@ -232,6 +232,15 @@ The tracked, gated list of value-level divergences is
 the prose version is [Differences from Clojure](https://jolt-lang.github.io/docs/differences.html)
 on the docs site.
 
+## Run with Nix
+
+```sh
+nix run 'git+https://github.com/jolt-lang/jolt.git?submodules=1'
+```
+
+The Git URL and `submodules=1` are required to include vendored dependencies.
+Pass Jolt arguments after `--`.
+
 ## Scripts
 
 A file runs with `run` or without it, and needs no extension and no build step:

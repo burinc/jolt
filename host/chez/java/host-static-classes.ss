@@ -176,9 +176,17 @@
                     (al-set! self idx x) old)))
     (cons "size" (lambda (self) (->num (al-cnt self))))
     (cons "isEmpty" (lambda (self) (fx=? 0 (al-cnt self))))
+    ;; remove(int) for an integer, remove(Object) — the first equal element,
+    ;; answering whether there was one — for anything else, the overload
+    ;; Clojure's reflector picks for a long and for any other argument
     (cons "remove" (lambda (self i)
-                     (let* ((idx (jnum->exact i)) (old (al-ref self idx)))
-                       (al-remove-at! self idx) old)))
+                     (if (and (number? i) (exact? i) (integer? i))
+                         (let* ((idx (jnum->exact i)) (old (begin (al-check-index! self idx) (al-ref self idx))))
+                           (al-remove-at! self idx) old)
+                         (let loop ((k 0))
+                           (cond ((fx=? k (al-cnt self)) #f)
+                                 ((objects-equals? i (al-ref self k)) (al-remove-at! self k) #t)
+                                 (else (loop (fx+ k 1))))))))
     (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
@@ -253,10 +261,18 @@
   (let ((al (make-arraylist xs))) (make-jhost "arraydeque" (jhost-state al))))
 ;; An ArrayDeque is only a Collection: it keeps Object's identity equals and
 ;; hashCode, where the List shims compare element-wise.
+;; It has no remove(int): remove(Object) takes an integer as the element, and
+;; remove() is removeFirst.
 (register-host-methods! "arraydeque"
-  (append (list (cons "equals" (lambda (self o) (eq? self o)))
-                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self)))))
-          (filter (lambda (p) (not (member (car p) '("equals" "hashCode")))) linkedlist-methods)))
+  (append (filter (lambda (p) (not (member (car p) '("equals" "hashCode" "remove")))) linkedlist-methods)
+          (list (cons "equals" (lambda (self o) (eq? self o)))
+                (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self))))
+                (cons "remove" (case-lambda
+                                 ((self) (al-first self) (let ((o (al-first self))) (al-remove-at! self 0) o))
+                                 ((self x) (let loop ((k 0))
+                                             (cond ((fx=? k (al-cnt self)) #f)
+                                                   ((objects-equals? x (al-ref self k)) (al-remove-at! self k) #t)
+                                                   (else (loop (fx+ k 1)))))))))))
 (let ((ctor (lambda args
               (cond ((null? args) (make-arraydeque '()))
                     ((number? (car args)) (make-arraydeque '()))
@@ -648,8 +664,17 @@
 (define (hm-note-key! self k)
   (when (not (hashtable-contains? (hm-tbl self) k))
     (hm-ord! self (cons k (hm-ord self)))))
+;; A removal detaches what was handed out for the key (an entrySet node keeps
+;; the value it last saw, as the JDK's removed Node does); jutil-concurrent.ss
+;; installs the hook once a map has handed one out.
+(define hm-detach-hook #f)
 (define (hm-drop-key! self k)
+  (when hm-detach-hook (hm-detach-hook self k))
   (hm-ord! self (remove (lambda (e) (jolt=2 e k)) (hm-ord self))))
+(define (hm-clear! self)
+  (when hm-detach-hook (hm-detach-hook self hm-detach-hook))
+  (hashtable-clear! (hm-tbl self))
+  (hm-ord! self '()))
 (define (hm-keys-ordered self) (reverse (hm-ord self)))
 ;; A hashmap-shaped jhost: the HashMap family and java.util.Properties, which is
 ;; a Hashtable with two string-typed accessors on top and so carries the same
@@ -665,6 +690,7 @@
               (case (string-ref t 0)
                 ((#\h) (string=? t "hashmap"))
                 ((#\p) (string=? t "properties"))
+                ((#\c) (string=? t "chm"))
                 (else #f))))))
 (define (hm-copy-into-ordered! self src)  ; copy a jolt map or hashmap, keeping insertion order
   (if (hm-hashmap? src)
@@ -728,14 +754,16 @@
                  (v (jolt-fi-call f "apply" k old)))
             (cond ((not (jolt-nil? v))
                    (hm-note-key! self k) (hashtable-set! (hm-tbl self) k v) v)
-                  ((jolt-nil? old) jolt-nil)
+                  ;; a nil result removes a key that is present, mapped to nil included
+                  ((not (hashtable-contains? (hm-tbl self) k)) jolt-nil)
                   (else (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)))))
         (cons "merge" (lambda (self k v f)
           (let* ((old (hashtable-ref (hm-tbl self) k jolt-nil))
                  (v (if (jolt-nil? old) v (jolt-fi-call f "apply" old v))))
-            (if (jolt-nil? v)
-                (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)
-                (begin (hm-note-key! self k) (hashtable-set! (hm-tbl self) k v) v)))))
+            (cond ((not (jolt-nil? v)) (hm-note-key! self k) (hashtable-set! (hm-tbl self) k v) v)
+                  ;; an absent key stays absent, the key order untouched
+                  ((not (hashtable-contains? (hm-tbl self) k)) jolt-nil)
+                  (else (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) jolt-nil)))))
         ;; replace only touches a key that is already mapped — including one
         ;; mapped to nil, which is why this asks containsKey rather than reading
         ;; the value like putIfAbsent does.
@@ -763,9 +791,13 @@
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
         (cons "remove" (case-lambda
-                         ((self k) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
-                                     (hashtable-delete! (hm-tbl self) k)
-                                     (hm-drop-key! self k) old))
+                         ;; a key that is not there changes nothing, so the
+                         ;; key order (what a view's iterator checks) is untouched
+                         ((self k) (if (hashtable-contains? (hm-tbl self) k)
+                                       (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                         (hashtable-delete! (hm-tbl self) k)
+                                         (hm-drop-key! self k) old)
+                                       jolt-nil))
                          ;; remove(key, value): only when mapped to exactly that
                          ((self k v) (if (and (hashtable-contains? (hm-tbl self) k)
                                               (jolt=2 v (hashtable-ref (hm-tbl self) k jolt-nil)))
@@ -775,13 +807,13 @@
                         (let ((m (make-jhost (jhost-tag self) (vector (make-hashtable hm-hash jolt=2) '()))))
                           (hm-copy-into-ordered! m self)
                           m)))
-        (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
+        (cons "clear" (lambda (self) (hm-clear! self) jolt-nil))
         (cons "putAll" (lambda (self m) (hm-copy-into-ordered! self m) jolt-nil))
-        (cons "keySet" (lambda (self) (apply jolt-hash-set (hm-keys-ordered self))))
-        (cons "values" (lambda (self) (apply jolt-vector
-                          (map (lambda (k) (hashtable-ref (hm-tbl self) k jolt-nil))
-                               (hm-keys-ordered self)))))
-        (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))))
+        ;; keySet / values / entrySet are live views (jutil-concurrent.ss), as
+        ;; the JDK's HashMap$KeySet / $Values / $EntrySet are
+        (cons "keySet" (lambda (self) (make-jhost "jx-hm-keyset" (vector self))))
+        (cons "values" (lambda (self) (make-jhost "jx-hm-values" (vector self))))
+        (cons "entrySet" (lambda (self) (make-jhost "jx-hm-entryset" (vector self))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
@@ -858,13 +890,15 @@
                       (props-put! self k v) old)))
       (cons "remove" (lambda (self k)
                        (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
-                         (hashtable-delete! (hm-tbl self) k)
-                         (hm-drop-key! self k)
+                         ;; an absent key changes nothing, the key order included
+                         (when (hashtable-contains? (hm-tbl self) k)
+                           (hashtable-delete! (hm-tbl self) k)
+                           (hm-drop-key! self k))
                          (let ((wt (props-writethrough self)))
                            (when wt (hashtable-delete! wt k)))
                          old)))
       (cons "clear" (lambda (self)
-                      (hashtable-clear! (hm-tbl self)) (hm-ord! self (quote ()))
+                      (hm-clear! self)
                       (let ((wt (props-writethrough self)))
                         (when wt (hashtable-clear! wt)))
                       jolt-nil))
@@ -890,16 +924,41 @@
               (seq->list (jolt-seq m)))
     self))
 
-;; java.util.concurrent.ConcurrentHashMap — one shared heap, so the mutable
-;; HashMap shim serves. (get a-hashmap k) reads the map (clojure.core/get).
+;; java.util.concurrent.ConcurrentHashMap — the HashMap shim's storage and
+;; methods under a tag of its own, so it is its own class: a ConcurrentMap,
+;; refusing null keys and values, whose views are weakly consistent
+;; (jutil-concurrent.ss). (get a-chm k) reads the map (clojure.core/get).
+;; a HashMap shim, for the look-alikes below
 (define (make-hashmap-jhost . args)
   (let* ((ht (make-hashtable hm-hash jolt=2))
          (self (make-jhost "hashmap" (vector ht '()))))
     (when (and (pair? args) (not (number? (car args))))
       (hm-copy-into-ordered! self (car args)))
     self))
-(register-class-ctor! "ConcurrentHashMap" make-hashmap-jhost)
-(register-class-ctor! "java.util.concurrent.ConcurrentHashMap" make-hashmap-jhost)
+(define (make-chm-jhost . args)
+  (let* ((ht (make-hashtable hm-hash jolt=2))
+         (self (make-jhost "chm" (vector ht '()))))
+    (when (and (pair? args) (not (number? (car args))))
+      (hm-copy-into-ordered! self (car args)))
+    self))
+(register-class-ctor! "ConcurrentHashMap" make-chm-jhost)
+(register-class-ctor! "java.util.concurrent.ConcurrentHashMap" make-chm-jhost)
+(define (chm-npe!) (throw-jvm 'NullPointerException jolt-nil))
+(define (chm-method name) (cdr (assoc name hashmap-methods)))
+;; hashmap's methods, refusing a null key or value as ConcurrentHashMap does;
+;; fixed arities, so a call allocates nothing for the check
+(register-host-methods! "chm"
+  (append hashmap-methods
+          (let ((put (chm-method "put")) (pia (chm-method "putIfAbsent")) (cv (chm-method "containsValue"))
+                (rm (chm-method "remove")))
+            (list (cons "put" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (put self k v)))
+                  (cons "putIfAbsent" (lambda (self k v) (when (or (jolt-nil? k) (jolt-nil? v)) (chm-npe!)) (pia self k v)))
+                  (cons "get" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (hashtable-ref (hm-tbl self) k jolt-nil)))
+                  (cons "containsKey" (lambda (self k) (when (jolt-nil? k) (chm-npe!)) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
+                  (cons "containsValue" (lambda (self v) (when (jolt-nil? v) (chm-npe!)) (cv self v)))
+                  (cons "remove" (case-lambda
+                                   ((self k) (when (jolt-nil? k) (chm-npe!)) (rm self k))
+                                   ((self k v) (when (jolt-nil? k) (chm-npe!)) (rm self k v))))))))
 ;; WeakHashMap: a HashMap shim. Chez has no weak-value hashtable, so entries are
 ;; not GC-evicted — a cache backed by it never shrinks (correct, just unbounded),
 ;; the same trade-off as SoftReference on this host.
@@ -1010,6 +1069,9 @@
         ;; here while ensuring conversion completes before state changes.
         (cons "set" (lambda (self v)
           (let ((next (atomic-convert self v)))
+            ;; set is a volatile write: what was built before it is visible to
+            ;; a get on another thread
+            (memory-order-release)
             (set-box! (atomic-box self) next)
             jolt-nil)))
         (cons "getAndSet" (lambda (self v)
@@ -1051,16 +1113,10 @@
         (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self))))))))
   (for-each (lambda (t) (register-host-methods! t atomic-methods))
             (cons atomic-legacy-tag atomic-tags)))
-;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
-;; thread-safe access. The shared-heap HashMap/ArrayList shims already serialize
-;; individual ops adequately for these uses, so the wrapper returns its argument.
-(let ((ident (lambda (c . _) c)))
-  ;; registering under the FQN also registers the short name (shared table)
-  (register-class-statics! "java.util.Collections"
-    (list (cons "synchronizedMap" ident) (cons "synchronizedList" ident)
-          (cons "synchronizedSet" ident) (cons "unmodifiableMap" ident)
-          (cons "unmodifiableList" ident) (cons "unmodifiableSet" ident)
-          (cons "emptyList" (lambda _ (jolt-vector))) (cons "emptyMap" (lambda _ (jolt-hash-map))))))
+;; java.util.Collections/unmodifiable* and synchronized* are views over their
+;; argument (jutil-views.ss); they used to answer the argument itself.
+(register-class-statics! "java.util.Collections"
+  (list (cons "emptyList" (lambda _ (jolt-vector))) (cons "emptyMap" (lambda _ (jolt-hash-map)))))
 
 ;; Collections/enumeration: an Enumeration over a collection's elements, which
 ;; enumeration-seq and SequenceInputStream drive. Collections/list drains any
@@ -1161,7 +1217,7 @@
                                                             (hm-drop-key! self x)))))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
-        (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
+        (cons "clear" (lambda (self) (hm-clear! self) jolt-nil))
         ;; The Collection method, not a List one — a HashSet answers it on the
         ;; JVM and had none here at all, so (.toArray h) was "No matching field
         ;; found: toArray for class java.util.HashSet". Same jcoll-to-array the
@@ -1189,6 +1245,7 @@
   (map (lambda (k) (make-map-entry k (hashtable-ref (hm-tbl self) k jolt-nil)))
        (hm-keys-ordered self)))
 (register-jutil-coll! "hashmap" 'map hm-entries)
+(register-jutil-coll! "chm" 'map hm-entries)
 (register-jutil-coll! "properties" 'map hm-entries)
 (register-jutil-coll! "hashset" 'set hs->list)
 (register-jutil-coll! "arraylist" 'ralist al->list)
@@ -1285,7 +1342,15 @@
       (vector (cond ((string? src) src)
                     ((jolt-array? src) (apply string-append (map jolt-str-render-one (seq->list (jolt-seq src)))))
                     (else (jolt-str-render-one src)))
-              0 0))))
+              0 0 #f))))
+;; Slot 3 is set on the string-reader io/reader hands back over an in-memory
+;; source (a jar entry, a baked resource): that one is a BufferedReader on the
+;; JVM, to class and instance? alike, where a constructed StringReader is not.
+(define (string-reader-buffered? x)
+  (let ((st (jhost-state x))) (and (fx>? (vector-length st) 3) (vector-ref st 3))))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "string-reader")
+                                      (string-reader-buffered? x)))
+                     (lambda (x) "java.io.BufferedReader"))
 ;; Reader.read(char[]) and Reader.read(char[], int, int) are BOTH overloads on
 ;; java.io.Reader, and the one-argument form means "fill the whole array". Only
 ;; the three-argument form was destructured here, so `(.read r cbuf)` — the
@@ -2498,7 +2563,8 @@
                    ((string=? iface "PushbackReader")
                     (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))
                    ((string=? iface "StringReader")
-                    (and (jhost? val) (string=? (jhost-tag val) "string-reader")))
+                    (and (jhost? val) (string=? (jhost-tag val) "string-reader")
+                         (not (string-reader-buffered? val))))
                    ((string=? iface "Reader") (reader-jhost? val))
                    ;; ...but a PushbackReader is NOT a BufferedReader: on the JVM
                    ;; it extends FilterReader, and library code branches on the
@@ -2508,9 +2574,16 @@
                    ;; BufferedReader on the JVM, so the string-reader tag keeps
                    ;; answering true; a bare (java.io.StringReader. s) shares that
                    ;; tag and answers with it (known-divergences, :host-model).
+                   ;; what io/reader made is one (a string-reader it marked, a
+                   ;; char-reader classed BufferedReader); a StringReader, a
+                   ;; FileReader or an InputStreamReader is not
                    ((string=? iface "BufferedReader")
-                    (and (reader-jhost? val)
-                         (not (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))))
+                    (cond ((and (jhost? val) (string=? (jhost-tag val) "char-reader") (stream-class val))
+                           => (lambda (c) (jch-isa? c "java.io.BufferedReader")))
+                          ((not (reader-jhost? val)) #f)
+                          ((pushback-reader-tag? (jhost-tag val)) #f)
+                          ((string=? (jhost-tag val) "string-reader") (string-reader-buffered? val))
+                          (else #t)))
                    (else 'none))))
         (if (eq? hit 'none) 'pass (if hit #t #f)))))))
 

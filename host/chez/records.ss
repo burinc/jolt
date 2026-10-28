@@ -577,6 +577,14 @@
         (let ((e (seq-first s)))
           (loop (jolt-seq (seq-more s)) (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
 
+;; every entry, fields then extension map, as an (k . v) alist
+(define (jrec-entry-pairs r)
+  (let ((fkeys (jrdesc-fkeys (jrec-desc r))) (ext (jrec-ext r)))
+    (let loop ((i (fx- (jrec-nfields r) 1))
+               (acc (if (jolt-nil? ext) '() (jrec-ext-pairs ext))))
+      (if (fx<? i 0) acc
+          (loop (fx- i 1) (cons (cons (vector-ref fkeys i) (jrec-field-ref r i)) acc))))))
+
 ;; lookup with default d: a declared field reads index+vector-ref (a present nil
 ;; returns nil), then the extension map, then d.
 (define (jrec-lookup r k d)
@@ -753,26 +761,51 @@
   (if (jolt-print-hash?)
       "#"
       (with-deeper-print
-        (if (eq? shape 'map)
+        (if (memq shape '(map jmap))
             ;; a map's seq yields entries; render each as "k v" and comma-join, in
             ;; the order the type's own seq produced them (the JVM prints an
-            ;; insertion-ordered map-like deftype in that order too).
+            ;; insertion-ordered map-like deftype in that order too). A
+            ;; java.util.Map that is not a Clojure map is seq'd through its
+            ;; entrySet, as RT.seq does.
             (string-append "{"
               (jolt-str-join-comma
                 (jolt-limited-list-strs
                   (map (lambda (e) (string-append (jolt-pr-readable (jolt-nth e 0)) " "
                                                   (jolt-pr-readable (jolt-nth e 1))))
-                       (seq->list r))))
+                       (if (eq? shape 'jmap)
+                           (seq->list (jolt-seq (record-method-dispatch r "entrySet" jolt-nil)))
+                           (seq->list r)))))
               "}")
             (let ((body (jolt-str-join (jolt-limited-seq-strs (jolt-seq r) jolt-pr-readable))))
               (case shape
                 ((seq) (string-append "(" body ")"))
                 ((vec) (string-append "[" body "]"))
                 (else (string-append "#{" body "}"))))))))
-(define (jrec-pr r)                      ; #ns.Name{:k v, :k v}
+;; A defrecord prints #ns.Name{:k v, :k v}. A plain deftype is an Object to
+;; print-method on the JVM, so it prints the #object form over its toString,
+;; identity hash included, and one that implements IDeref prints its
+;; deref-as-map the way an atom does (jolt-jon4). READABLE? is pr's against
+;; print's, which only the #object content's quoting depends on.
+(define (jrec-pr r readable?)
   (cond
     ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
-    (else (jrec-field-pr r))))
+    ;; a type this process never defined (an instance that came in through an
+    ;; image, its code not loaded) cannot say whether it was a defrecord or a
+    ;; deftype; it keeps the field form rather than guess
+    ((or (jrec-record? r) (not (hashtable-ref chez-deftype-tag-set (jrec-tag r) #f))) (jrec-field-pr r))
+    ((rec-coll-method r "deref")
+     (let ((port (open-output-string)))
+       (deref-print-to! port r jrec-deref-print-state readable?)
+       (get-output-string port)))
+    (else (jolt-object-repr r readable?))))
+;; clojure.core/deref-as-map: an IPending that is not realized is :pending with
+;; no value; a deref that throws is :failed with the throwable.
+(define (jrec-deref-print-state r)
+  (let ((realized (rec-coll-method r "isRealized")))
+    (if (and realized (not (jolt-truthy? (jolt-invoke realized r))))
+        (cons "pending" jolt-nil)
+        (guard (e (#t (cons "failed" (jolt-unwrap-throw e))))
+          (cons "ready" (jolt-invoke (rec-coll-method r "deref") r))))))
 (define (jrec-field-pr r)
   ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
   ;; what the JVM's reader resolves a record literal by, and what its own

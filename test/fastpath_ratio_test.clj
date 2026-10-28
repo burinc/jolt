@@ -169,8 +169,12 @@
 ;;                      5.0 on macOS arm64, 6.1 on bionic arm64).
 ;;
 ;;   host-object-pr     pr-str of a java.io.File is the #object fallback: the
-;;                      print arms, the class name, the str registry. Against a
-;;                      small vector's print (measured 1.24-1.40, 2026-10).
+;;                      print arms, the class name, the str registry, and the
+;;                      identity hash minted for each fresh object. Against a
+;;                      small vector's print (measured 1.24-1.40, 2026-10; then
+;;                      1.53-1.60 once every #object carried its identity hash and
+;;                      the vector print got ~12% faster, the File side itself
+;;                      within 1.1x of before).
 ;;
 (ns fastpath-ratio-test
   (:require [clojure.string :as str]))
@@ -558,7 +562,7 @@
   (judge! "host-object-pr"
           #(dotimes [_ 20000] (pr-str [1 "a"]))
           #(dotimes [_ 20000] (pr-str (java.io.File. "/tmp")))
-          1.6 2.0)
+          1.9 2.3)
 
   (.delete (java.io.File. src-path))
   (.delete (java.io.File. data-path))

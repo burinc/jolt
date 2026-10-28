@@ -432,6 +432,10 @@
            ;; other forcer of the cell waited on it for good.
            (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
              (jolt-locks-enter!)
+             ;; the claim is a fresh pair: release its stores before the CAS
+             ;; publishes it, or a reader can see the pointer before the token
+             ;; and take a live claim for a stale one
+             (memory-order-release)
              (if (sa-record-cas! cell L #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire
                  ;; makes every store the previous holder released visible to this
@@ -534,6 +538,8 @@
            ;; returns, so the far edge needs nothing.
            (let ((claim (make-tail-claim w me force-claim-token)))
              (jolt-locks-enter!)
+             ;; a fresh record, published by the CAS: release its fields first
+             (memory-order-release)
              (if (sa-record-cas! s cseq-tail-index w claim)
                  (let ((done #f))
                    (memory-order-acquire)
@@ -663,6 +669,10 @@
 (define (register-seq-arm! pred handler)
   (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-seq-arm-last! pred handler)
+  (seq-arm-reject-fast-type! 'register-seq-arm-last! pred)
+  (set! jolt-seq-arms (append jolt-seq-arms (list (cons pred handler)))))
 
 ;; A map's entries, keys or vals, and a set's elements, as a seq of the given
 ;; flavor. MODE picks what each element is: 0 the entry, 1 the key, 2 the value.
@@ -1875,6 +1885,16 @@
                  (else acc2))))
         (else (rec (if direct? (f acc (seq-first s)) (jolt-invoke f acc (seq-first s)))
                    (jolt-seq (seq-more s))))))))
+;; A host collection that hands its elements out as a list (the java.util views,
+;; jutil-views.ss) reduces over that list directly rather than through a seq of
+;; it, as a Java Iterable reduces over its iterator. #f until a host sets it.
+(define jolt-reduce-elems-hook #f)
+(define (reduce-list f acc xs)
+  (let ((direct? (procedure? f)))
+    (let rec ((acc acc) (xs xs))
+      (cond ((jolt-reduced? acc) (jolt-reduced-val acc))
+            ((null? xs) acc)
+            (else (rec (if direct? (f acc (car xs)) (jolt-invoke f acc (car xs))) (cdr xs)))))))
 (define jolt-reduce
   (case-lambda
     ((f coll)
@@ -1887,6 +1907,8 @@
        ((and (declares-ireduce? coll) (iface-method coll "reduce" 2))
         => (lambda (m) (let ((r (jolt-invoke m coll f)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll))
+        => (lambda (xs) (if (null? xs) (jolt-invoke f) (reduce-list f (car xs) (cdr xs)))))
        (else (let ((s (jolt-seq coll)))
                (if (jolt-nil? s) (jolt-invoke f)          ; (reduce f []) -> (f)
                    (reduce-seq f (seq-first s) (jolt-seq (seq-more s))))))))
@@ -1898,6 +1920,7 @@
        ((iface-method coll "reduce" 3)
         => (lambda (m) (let ((r (jolt-invoke m coll f init)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll)) => (lambda (xs) (reduce-list f init xs)))
        (else (reduce-seq f init (jolt-seq coll)))))))
 
 ;; Fold through a transient so a pvec/pmap/pset target is built in O(n): a

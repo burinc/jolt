@@ -123,7 +123,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
   deadhost recordshadow emittedheads mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax regexbacktrack \
-  hostarity enummodel enumregistrymodel imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  hostarity enummodel enumregistrymodel cowpublishmodel imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety maskedacquire ioerrno values wp ci
@@ -1681,6 +1681,13 @@ monitormodel:
 enumregistrymodel:
 	@command -v swipl >/dev/null || { echo "enumregistrymodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
 	@swipl -q -g main -t halt tools/enum-registry-model.pl
+
+# Copy-on-write publication (CopyOnWriteArrayList/Set, ConcurrentSkipListMap/Set):
+# no torn read, no deadlock, no lost update over every interleaving, and four
+# broken protocols caught. Manual, like monitormodel: needs swipl.
+cowpublishmodel:
+	@command -v swipl >/dev/null || { echo "cowpublishmodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
+	@swipl -q -g main -t halt tools/cow-publish-model.pl
 
 # Install the repository's git hooks into .git/hooks (copies, so a clone that
 # never runs this is unaffected; re-run after a hook changes).

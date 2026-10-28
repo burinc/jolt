@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`java.util.Spliterator`.** Every collection answers `spliterator()` with
+  the JDK's class, characteristics, size and comparator: array-backed ones split
+  at the midpoint, iterator-backed ones by batches, and `spliteratorUnknownSize`
+  over an endless iterator stays lazy. `Spliterators` (`spliterator`,
+  `spliteratorUnknownSize`, `emptySpliterator`, `iterator`) and
+  `StreamSupport/stream` are there too. A hash or tree collection splits at the
+  midpoint rather than where the JDK's table or tree would.
+- **A proxy over java.util's abstract collection classes inherits them.**
+  `(proxy [java.util.AbstractList] [] (get [i] …) (size [] …))` gets the
+  class's iterator, contains, indexOf, subList, equality, hashing and printing,
+  and so do proxies over `AbstractSet`, `AbstractCollection`, `AbstractQueue`
+  and `AbstractMap` (whose lookups run over the proxy's `entrySet`).
+- **`Month`, `DayOfWeek` and `ChronoField` `getDisplayName` answer in the
+  locale**, by `TextStyle` for the first two, from the `:date-names` point and a
+  new `:field-names` point. jolt-lang/time supplies the locales and `TextStyle`;
+  core carries ROOT.
+- **The rest of java.util and java.util.concurrent's collections.** `Vector`,
+  `Stack`, `Hashtable`, `BitSet`, `PriorityQueue`, `ConcurrentLinkedQueue`,
+  `ConcurrentLinkedDeque`, `CopyOnWriteArrayList`, `CopyOnWriteArraySet`,
+  `ConcurrentSkipListMap` and `ConcurrentSkipListSet`, with JDK 21's API and
+  classes. Iteration follows the JDK: a `PriorityQueue` walks its heap array, a
+  `Hashtable` its buckets, the linked queues are weakly consistent, the
+  copy-on-write iterators are snapshots, and the `Vector`/`Hashtable` iterators
+  are fail-fast. `Vector`, `Hashtable` and `Collections.synchronized*` hold
+  their own object's monitor, so `(locking v …)` around a walk excludes their
+  methods. Each round-trips through `jolt.image` or is refused naming its class.
+- **`Collections.unmodifiable*` and `synchronized*` are views, and `List/of`,
+  `Set/of`, `Map/of` and `copyOf` immutable collections.** A write through an
+  unmodifiable view, its iterators, entries or sub-views is
+  UnsupportedOperationException; a change to the backing collection shows
+  through. TreeMap, TreeSet and their key sets answer `SequencedMap` and
+  `SequencedCollection` (`reversed`, `getFirst`, `pollLastEntry`, the
+  sequenced views), and ArrayList, LinkedList and ArrayDeque answer `reversed`.
 - **`jolt.profile`, an execution-count profiler (#1421).** It reads Chez's
   `compile-profile` counters back by Clojure file, line and fn: turn on
   `(prof/instrument!)`, load the code, run it, and `(prof/report)` lists the
@@ -73,6 +106,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A HashMap's `keySet`, `values` and `entrySet` are live views**
+  (`HashMap$KeySet` / `$Values` / `$EntrySet`): removing through one removes
+  from the map, a later put shows through, an entry's `setValue` writes the map
+  and their iterators are fail-fast. They were copies. Adds
+  `AbstractMap$SimpleEntry`.
+- **A proxy's class is the JVM's generated name**
+  (`user.proxy$java.lang.Object$ff19274a`), and each `reify` form has a class
+  of its own (`user$reify__N`) rather than one shared placeholder.
+- **Images are format 13**: they name the defrecord and deftype types they
+  hold, so a process that restores one without having loaded the code knows a
+  record from a deftype. Older images read as before.
+- **`ConcurrentHashMap` is its own class**: a `ConcurrentMap` that refuses
+  null keys and values, whose `keySet`/`values`/`entrySet` are the JDK's
+  weakly consistent views (`ConcurrentHashMap$KeySetView` …, and
+  `keySet(default)`). It used to be a `java.util.HashMap`. `Properties`' views
+  are the synchronized ones over the same weakly consistent walk.
+- **Locale-keyed extension points narrow a missed key to its language** (a
+  point's new `:parent` separator), so `de-DE` reads `de`'s data rather than
+  ROOT's; `String/format` uses the locale's grouping separator too.
+- **A reify form's class name comes from where it sits** (file, line, column),
+  so a form from the AOT cache and one expanded later never share a class. A
+  proxy is an `IProxy` with the JDK's superclass, interfaces and simple name,
+  and `extend` on a reify's or proxy's class reaches its instances.
+- **Locale data is found by a Locale's id whichever way it prints**, so
+  jolt-lang/time's Locale can print as the JDK's `en_US`.
+- **Every `#object` print carries the identity hash, and a plain deftype prints
+  as one**, `#object[user.T 0x1b2c3d4e "user.T@1b2c3d4e"]`, as on the JVM; a
+  defrecord keeps its `#ns.R{…}` form, and a deftype that is a `java.util.Map`
+  prints as a map. `str` of a deftype, a reify or a proxy with no `toString` is
+  `Class@hash`. An array prints with its class quoted. A deftype from an image
+  whose code this process never loaded keeps the field form.
+- **`str` of a `ChronoField` is the JDK's display name** (`NanoOfSecond`,
+  `AmPmOfDay`). A project pinned to a jolt-lang/time older than 28d55d62 needs
+  that pin bumped: its `appendFraction` read field names through `str`.
+- **The java.io stream shims report their own class** (`InputStreamReader`,
+  `ByteArrayInputStream`, `System/in` is a `BufferedInputStream`), and a proxy
+  over a java.util collection prints and compares as the collection.
 - **A required namespace's `:file` is its classpath name (#1410).** A def,
   `*file*`, `:clojure.error/source` and trace frames used to carry the path as
   the root spelled it: `./src/mylib/where.clj`, an absolute path, or a
@@ -84,6 +154,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `get` on a reify calls the 1-arity `valAt` for `(get r k)` and reads a
+  `java.util.Map` reify through its `get`; `ex-message` and `str` of a proxy
+  over an Exception carry its (possibly overridden) message.
+- Two namespaces' records of the same name are two classes to `instance?`.
+- `HashMap.compute`/`merge` returning nil remove a key mapped to nil; a
+  removed key's entry keeps the value it had; a view's `forEach` throws
+  `ConcurrentModificationException` when the map changes under it;
+  `Properties.remove` of an absent key no longer disturbs iteration.
+- `AbstractMap$SimpleImmutableEntry` exists, and both entry classes construct
+  by the name an `import` gives them.
+- **A HashMap's `entrySet` is empty, not nil, when the map is**, so `.size` on
+  it, and on an unmodifiable or synchronized view of it, no longer throws.
+- **The nrepl `--port-file` smoke row and a `jolt.process` timing row no longer
+  race their deadlines** under CI load.
 - **Enums have `values` and `valueOf` (#1433).** The JDK enums jolt provides
   (`TimeUnit`, `Future$State`, `Thread$State`, `RoundingMode`,
   `Normalizer$Form`, `StandardOpenOption`, `StandardCopyOption`, `LinkOption`,

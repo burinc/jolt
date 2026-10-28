@@ -255,9 +255,17 @@
     ;; a jrec is jolt-map? (so dot-coll?) — route it here directly, NOT through
     ;; record-method-dispatch, which would re-enter the .hashCode arm and loop. A
     ;; declared hashCode governs (flatland's types via APersistentMap/mapHash);
-    ;; else the structural record hash.
+    ;; else a record's is APersistentMap.mapHash over its entries, as defrecord's
+    ;; hashCode is, and a deftype's is Object.hashCode, its identity. Both used
+    ;; to answer the record hasheq.
     ((jrec? x) (let ((m (find-method-any-protocol (jrec-tag x) "hashCode")))
-                 (if m (call-declared-hash m x) (jrec-hash x))))
+                 (cond (m (call-declared-hash m x))
+                       ((jrec-record? x)
+                        (fold-left (lambda (a e)
+                                     (i32 (+ a (bitwise-xor (jolt-java-hashcode (car e))
+                                                            (jolt-java-hashcode (cdr e))))))
+                                   0 (jrec-entry-pairs x)))
+                       (else (jolt-identity-hasheq x)))))
     ;; any other sequential coll (a PersistentQueue) is a java.util.List
     ((jolt-sequential? x)
      (let loop ((s (jolt-seq x)) (h 1))

@@ -24,8 +24,10 @@
 (define (stream? x) (and (jhost? x) (assoc (jhost-tag x) stream-tags) #t))
 (define (stream-kind s) (cdr (assoc (jhost-tag s) stream-tags)))
 (define (kind-tag k) (car (find (lambda (p) (eq? (cdr p) k)) stream-tags)))
-;; state: #(seq consumed? close-handlers)
-(define (make-stream kind seq) (make-jhost (kind-tag kind) (vector seq #f '())))
+;; state: #(seq consumed? close-handlers source): source is the collection a
+;; Collection.stream() came from, whose own spliterator the stream hands back
+(define (make-stream kind seq) (make-jhost (kind-tag kind) (vector seq #f '() #f)))
+(define (stream-source s) (vector-ref (jhost-state s) 3))
 
 ;; Take a stream's elements, marking it used: every op, intermediate or
 ;; terminal, links or consumes the stream it is called on exactly once.
@@ -516,10 +518,12 @@
     (if (and (or (string=? name "stream") (string=? name "parallelStream"))
              (stream-source? obj))
         (if (null? (method-rest-args->list rest))
-            (make-stream 'ref (if (or (al-family? obj) (hs-hashset? obj) (jutil-collection? obj))
-                                  ;; a mutable source is snapshotted, as the JDK's
-                                  ;; late-binding spliterator is by the time it runs
-                                  (list->cseq (seq->list (jolt-seq obj)))
-                                  obj))
+            (let ((st (make-stream 'ref (if (or (al-family? obj) (hs-hashset? obj) (jutil-collection? obj))
+                                            ;; a mutable source is snapshotted, as the JDK's
+                                            ;; late-binding spliterator is by the time it runs
+                                            (list->cseq (seq->list (jolt-seq obj)))
+                                            obj))))
+              (vector-set! (jhost-state st) 3 obj)
+              st)
             (dispatch-miss obj name (method-rest-args->list rest)))
         'pass)))

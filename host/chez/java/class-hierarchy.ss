@@ -168,12 +168,15 @@
 ;; ancestors? Object is every class's root. Matched by full name or last segment so
 ;; "IOException" and "java.io.IOException" both hit.
 (define (jch-isa? child wanted)
-  (let ((wseg (jch-last-segment wanted)))
+  ;; by simple name only when one side is a simple name: two dotted names are
+  ;; two classes unless they are the same name (a.R is not b.R)
+  (let ((wseg (jch-last-segment wanted)) (wdot? (memv #\. (string->list wanted))))
     (or (string=? wanted "java.lang.Object") (string=? wanted "Object")
         (let loop ((names (cons child (jch-closure child))))
           (cond ((null? names) #f)
                 ((or (string=? wanted (car names))
-                     (string=? wseg (jch-last-segment (car names)))) #t)
+                     (and (not (and wdot? (memv #\. (string->list (car names)))))
+                          (string=? wseg (jch-last-segment (car names))))) #t)
                 (else (loop (cdr names))))))))
 
 ;; Does the graph model WANTED at all (as a class or as any class's ancestor)? Used
@@ -327,7 +330,7 @@
             "clojure.lang.Associative" "clojure.lang.ILookup"
             "clojure.lang.IPersistentStack" "clojure.lang.IPersistentVector"
             "clojure.lang.IPersistentMap" "clojure.lang.IPersistentSet"
-            "clojure.lang.IPersistentList" "clojure.lang.IObj" "clojure.lang.IMeta"
+            "clojure.lang.IPersistentList" "clojure.lang.IObj" "clojure.lang.IMeta" "clojure.lang.IProxy"
             "clojure.lang.IDeref" "clojure.lang.IRecord" "clojure.lang.IType"
             "clojure.lang.IHashEq" "clojure.lang.IEditableCollection"
             "clojure.lang.IReference"
@@ -873,7 +876,16 @@
 (jch-register-supers! "java.io.Writer" '("java.io.Closeable" "java.io.Flushable" "java.lang.Appendable"))
 (jch-register-supers! "java.io.File" '("java.io.Serializable" "java.lang.Comparable"))
 (jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
-(jch-register-supers! "java.io.PushbackReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.FilterReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.PushbackReader" '("java.io.FilterReader"))
+;; the classes Files.newInputStream/newOutputStream and Process's streams are
+;; (JDK 21; the Windows ProcessImpl answers buffered streams over its pipes)
+(jch-register-supers! "sun.nio.ch.ChannelInputStream" '("java.io.InputStream"))
+(jch-register-supers! "sun.nio.ch.ChannelOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeInputStream" '("java.io.BufferedInputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeOutputStream" '("java.io.BufferedOutputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullOutputStream" '("java.io.OutputStream"))
 (jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
 (jch-register-supers! "java.io.PrintWriter" '("java.io.Writer"))
 ;; System/out and System/err are PrintStreams — byte streams, not the PrintWriter
@@ -975,6 +987,9 @@
 (jch-register-supers! "java.util.LinkedList" '("java.util.List" "java.util.Deque"))
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
 (jch-register-supers! "java.util.HashMap" '("java.util.Map"))
+(jch-register-supers! "java.util.concurrent.ConcurrentMap" '("java.util.Map"))
+(jch-register-supers! "java.util.concurrent.ConcurrentHashMap"
+                      '("java.util.AbstractMap" "java.util.concurrent.ConcurrentMap" "java.io.Serializable"))
 (jch-register-supers! "java.util.LinkedHashMap" '("java.util.HashMap" "java.util.SequencedMap"))
 ;; Properties is a Hashtable, which is a Map — System/getProperties answers
 ;; (instance? java.util.Map …) as well as (instance? java.util.Properties …).
@@ -1502,6 +1517,7 @@
     ("linkedlist" . "java.util.LinkedList")
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
+    ("chm" . "java.util.concurrent.ConcurrentHashMap")
     ("linkedhashmap" . "java.util.LinkedHashMap")
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")

@@ -921,7 +921,9 @@
     (loop [specs (seq (apply concat (map proxy-arity-specs methods)))
            clauses {} order []]
       (if (empty? specs)
-        `(make-proxy
+        ;; the defining ns names the generated class (proxy-name), as on the JVM
+        `(jolt.host/make-proxy-in
+           ~(str *ns*)
            ~(reduce (fn [m k] (assoc m k `(fn ~@(get clauses k)))) {} order)
            [~@ctor-args]
            ~@(vec (map protocol-key supers)))
@@ -949,8 +951,19 @@
   ;; fn so dispatch picks the clause by arg count.
   (loop [items (seq forms) protos [] methods {} order []]
     (if (empty? items)
+      ;; the third element names the class: ns$reify__N, one per reify form, as
+      ;; the JVM generates one class per form (its name also carries the
+      ;; enclosing fn and an eval counter, which jolt cannot reproduce). N comes
+      ;; from where the form sits (file, line, column), so a form compiled into
+      ;; the AOT cache and one expanded fresh in a later process can never share
+      ;; a name; a form with no position takes a gensym, below the position range
       `(make-reified-at
-         [[~@(map name order)] [~@(map protocol-key protos)]]
+         [[~@(map name order)] [~@(map protocol-key protos)]
+          ~(str (apply str (map (fn [c] (if (= c \-) \_ c)) (str *ns*))) "$"
+                (let [{:keys [line column]} (meta &form)]
+                  (if line
+                    (str "reify__" (+ 1000000000 (mod (hash [*file* line column]) 1000000000)))
+                    (gensym "reify__"))))]
          ~@(map (fn [k] `(fn ~@(get methods k))) order))
       (let [x (first items)]
         (if (symbol? x)
