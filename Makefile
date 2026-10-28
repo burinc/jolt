@@ -550,11 +550,10 @@ buildsmoke: testbin
 
 embeddedresources: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/embedded-resource-smoke.sh
-	@set -e; for mode in --url --jar-full --jar-base --fs-full --files-full --archive-lifecycle; do \
+	@set -e; for mode in --url --resource-url --jar-full --jar-base --fs-full --files-full --archive-lifecycle; do \
 		JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/embedded-java-smoke.sh "$$mode"; \
 	done
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh test/chez/embedded-resource-oracle.sh
-	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/embedded-migratus-upstream-smoke.sh
 
 # Building the same sources twice gives every compiled unit identical text, the
 # ground profile-guided builds stand on (RFC 0015 P1).
@@ -619,6 +618,7 @@ httpsfetch:
 libconformance: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" \
 	 JOLT_NO_USER_DEPS=1 target/release/jolt run test/conformance/libs/run.clj $(LIBS)
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/embedded-migratus-upstream-smoke.sh
 
 # OPT-IN: time the same library suites per test on jolt and on JVM Clojure, and
 # list the tests more than JOLT_LIBPERF_THRESHOLD (default 5) times slower on

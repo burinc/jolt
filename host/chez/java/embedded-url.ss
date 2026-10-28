@@ -1,10 +1,7 @@
 ;; URLConnection and JarURLConnection over resources baked into the image.
 
-(define (embedded-jar-url-entry-name resource)
-  (let ((name (embedded-res-name resource)))
-    (if (embedded-res-content resource)
-        name
-        (substring name (string-length embedded-archive-prefix) (string-length name)))))
+;; The entry a resource URL names, as JarURLConnection.getEntryName answers it.
+(define (embedded-jar-url-entry-name resource) (embedded-res-name resource))
 (define (embedded-jar-file-url) (make-url "file:jolt-embedded-resources.jar"))
 
 (define (embedded-connection-state self) (jhost-state self))
@@ -22,38 +19,15 @@
   jolt-nil)
 (define (embedded-connection-get self index) (vector-ref (embedded-connection-state self) index))
 
+;; A jar: URL connection opens its jar at the runtime version, as the JDK's
+;; does; the URL already names the entry that version selected.
 (define (embedded-connection-archive self)
-  (make-embedded-jar-file embedded-archive-name))
-(define (embedded-connection-bytes self)
-  (let* ((archive (embedded-connection-archive self))
-         (name (embedded-jar-selected-resource-name archive
-                                                 (embedded-jar-url-entry-name (embedded-connection-resource self))))
-         (content (embedded-resource-ref name)))
-    (cond ((bytevector? content) content)
-          ((string? content) (string->utf8 content))
-          (else (make-bytevector 0)))))
+  (make-embedded-jar-file embedded-archive-name (jolt-runtime-version)))
+(define (embedded-connection-bytes self) (embedded-res-bytes (embedded-connection-resource self)))
 (define (embedded-connection-stream self)
   (make-in-stream (open-bytevector-input-port (embedded-connection-bytes self))))
-(define (embedded-resource-content-type name)
-  (let* ((dot (let loop ((i (- (string-length name) 1)))
-                (cond ((< i 0) -1)
-                      ((char=? (string-ref name i) #\.) i)
-                      ((char=? (string-ref name i) #\/) -1)
-                      (else (loop (- i 1))))))
-         (ext (if (< dot 0) "" (string-downcase (substring name dot (string-length name))))))
-    (cond ((member ext '(".txt" ".sql" ".clj" ".cljc" ".edn" ".ss" ".md")) "text/plain")
-          ((member ext '(".html" ".htm")) "text/html")
-          ((string=? ext ".json") "application/json")
-          ((string=? ext ".xml") "application/xml")
-          ((string=? ext ".png") "image/png")
-          ((member ext '(".jpg" ".jpeg")) "image/jpeg")
-          ((string=? ext ".gif") "image/gif")
-          ((string=? ext ".pdf") "application/pdf")
-          ((string=? ext ".zip") "application/zip")
-          ((string=? ext ".jar") "application/java-archive")
-          (else jolt-nil))))
 (define (embedded-connection-content-type self)
-  (embedded-resource-content-type (embedded-jar-url-entry-name (embedded-connection-resource self))))
+  (nio-content-type-of (embedded-jar-url-entry-name (embedded-connection-resource self))))
 
 (define (embedded-connection-typed-content self classes)
   (let ((classes (if (jolt-array? classes) (ja->list classes) '())))

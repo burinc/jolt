@@ -5,8 +5,15 @@
             [clojure.edn :as edn])
   (:import [java.lang Runtime$Version]))
 
+(def encoded-name "encoded/001 my café;v=1.sql")
+
+(defn url-entry [url]
+  (when url
+    (let [s (str url)] [(subs s (+ 2 (.indexOf s "!/"))) (slurp url)])))
+
 (defn oracle-data [jar-path]
-  (with-open [jar (java.util.jar.JarFile. jar-path)]
+  (with-open [jar (java.util.jar.JarFile. jar-path)
+              loader (java.net.URLClassLoader. (into-array java.net.URL [(.toURL (io/file jar-path))]) nil)]
     (let [manifest (.getManifest jar)
           versions (mapv (fn [version]
                            (with-open [versioned (java.util.jar.JarFile. (io/file jar-path) true 1
@@ -16,9 +23,14 @@
                               (.getRealName (.getJarEntry versioned "greeting.txt"))
                               (some-> (.getJarEntry versioned "only.txt")
                                       (#(slurp (.getInputStream versioned %))))
-                              (some? (.getJarEntry versioned "below.txt"))]))
+                              (some? (.getJarEntry versioned "below.txt"))
+                              (some? (.getJarEntry versioned "below7.txt"))
+                              (mapv #(.getName %) (iterator-seq (.iterator (.versionedStream versioned))))]))
                          ["8" "9" "17" "22"])]
       {:default-content (slurp (.getInputStream jar (.getJarEntry jar "greeting.txt")))
+       :manifest-cached (identical? manifest (.getManifest jar))
+       :resources (mapv #(url-entry (.getResource loader %))
+                        ["greeting.txt" "only.txt" "below.txt" "below7.txt" "plain.txt" encoded-name "encoded/"])
        :base-version (str (java.util.jar.JarFile/baseVersion))
        :multi-release (.isMultiRelease jar)
        :versioned-names (mapv #(.getName %) (iterator-seq (.iterator (.versionedStream jar))))

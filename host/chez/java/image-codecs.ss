@@ -49,6 +49,13 @@
   (lambda (h) (make-lhs))
   (lambda (s items) (for-each (lambda (x) (lh-insert! (jhost-state s) #f x #t #f)) items)))
 
+;; java.util.jar.Attributes is a LinkedHashMap chain under its own class
+;; (embedded-manifest.ss); its keys are Attributes.Name values.
+(register-image-codec! "java.util.jar.Attributes" '("jar-attributes")
+  (lambda (a) (vector jolt-nil (codec-kvs (jar-attributes-pairs a))))
+  (lambda (h) (make-manifest-attributes))
+  (lambda (a items) (codec-each-kv! items (lambda (k v) (jar-attributes-put! a k v)))))
+
 ;; ---- TreeMap / TreeSet: the comparator object (nil for natural order) ------------
 ;; The treemap and treeset tags are a whole map or set; a sub-map or a key set
 ;; has a tag of its own and is a view of one, refused below.
@@ -100,7 +107,6 @@
 (register-image-refusal!
   '("lhm-keyset" "lhm-values" "lhm-entryset" "lhm-reversed" "lhs-reversed" "lhm-entry"
     "enum-map-keyset" "enum-map-values" "enum-map-entryset" "enum-map-entry"
-    "jar-attributes-view"
     "treemap-asc-sub" "treemap-desc-sub" "treemap-keyset" "treemap-values"
     "treemap-submap-values" "treemap-entryset" "treemap-asc-entryset" "treemap-desc-entryset"
     "treemap-entry")
@@ -109,7 +115,7 @@
   '("arraylist-iterator" "linkedlist-iterator" "arraydeque-iterator" "arrays-aslist-iterator"
     "immutable-list-iterator" "hashset-iterator" "lhs-iterator" "lhm-keyset-iterator" "lhm-values-iterator" "lhm-entryset-iterator"
     "enum-set-regular-iterator" "enum-set-jumbo-iterator" "enum-map-keyset-iterator"
-    "enum-map-values-iterator" "enum-map-entryset-iterator" "jar-attributes-view-iterator"
+    "enum-map-values-iterator" "enum-map-entryset-iterator"
     "treemap-entry-iterator" "treemap-key-iterator" "treemap-value-iterator"
     "treemap-submap-entry-iterator" "treemap-submap-key-iterator"
     "treemap-desc-submap-entry-iterator" "treemap-desc-submap-key-iterator"

@@ -633,13 +633,11 @@ discover a directory such as a set of migrations:
         (jolt.host/embedded-resource-names))
 ```
 
-JVM-style discovery works too. `ClassLoader.getResource` and `getResources`
-resolve embedded directories to `jar:` URLs, `java.util.jar.JarFile` enumerates
-the entries and reads their streams, and `java.nio.file.FileSystems` opens a
-read-only filesystem over the same resources. This supports migration scanners
-such as Migratus without extracting files to disk. See the
-[embedded resource compatibility matrix](docs/embedded-resource-compatibility.md)
-for the full URL, JAR, and NIO API coverage and deliberate failure behavior.
+JVM-style discovery works too: the resources read as a jar, so resource URLs
+are `jar:` URLs, `java.util.jar.JarFile` enumerates them, and
+`java.nio.file.FileSystems` opens a read-only filesystem over them. Migration
+scanners such as Migratus work without extracting files to disk. See
+[Embedded Resources](https://jolt-lang.github.io/docs/embedded-resources.html).
 
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the

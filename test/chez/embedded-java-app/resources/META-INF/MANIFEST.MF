@@ -7,3 +7,6 @@ X-Unicode: café
 
 Name: greeting.txt
 X-Entry: yes
+
+Name: plain.txt
+X-Entry: yes

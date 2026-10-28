@@ -698,19 +698,29 @@
 (reg-ctor! '("ZipFile" "java.util.zip.ZipFile") make-zip-file)
 
 ;; --- the application image as a read-only JarFile -----------------------------
+;; The public embedded resources (io.ss) read as the entries of a jar named
+;; "jolt-embedded-resources.jar": every resource, and a directory entry for each
+;; directory holding one, in name order. Computed once per resource index.
+(define embedded-archive-entries-cache (cons #f '()))
 (define (embedded-archive-entry-names)
-  (let ((entries (make-hashtable string-hash string=?)))
-    (for-each
-     (lambda (name)
-       (hashtable-set! entries name #t)
-       (let ((n (string-length name)))
-         (let loop ((i 0))
-           (when (< i n)
-             (when (char=? (string-ref name i) #\/)
-               (hashtable-set! entries (substring name 0 (+ i 1)) #t))
-             (loop (+ i 1))))))
-     (embedded-resource-names))
-    (sort string<? (vector->list (hashtable-keys entries)))))
+  (let ((index (embedded-resource-sorted))
+        (cache embedded-archive-entries-cache))
+    (if (eq? (car cache) index)
+        (cdr cache)
+        (let ((entries (make-hashtable string-hash string=?)))
+          (vector-for-each
+           (lambda (name)
+             (hashtable-set! entries name #t)
+             (let ((n (string-length name)))
+               (let loop ((i 0))
+                 (when (< i n)
+                   (when (char=? (string-ref name i) #\/)
+                     (hashtable-set! entries (substring name 0 (+ i 1)) #t))
+                   (loop (+ i 1))))))
+           index)
+          (let ((names (sort string<? (vector->list (hashtable-keys entries)))))
+            (set! embedded-archive-entries-cache (cons index names))
+            names)))))
 
 (define (jar-entry? x) (and (jhost? x) (string=? (jhost-tag x) "jar-entry")))
 (define (make-embedded-jar-entry name directory? . source)
@@ -723,6 +733,10 @@
     (hashtable-set! zentry-real-names (zentry-of entry) source)
     entry))
 
+;; java.lang.Runtime.Version. jolt answers for one Java version, the one its
+;; JVM oracle certifies against (host-static-methods.ss jolt-java-feature-version),
+;; and Runtime.version(), JarFile.runtimeVersion() and the java.version property
+;; all report it.
 (define (make-runtime-version version)
   (make-jhost "runtime-version" version))
 (define (runtime-version-feature self) (car (jhost-state self)))
@@ -742,8 +756,10 @@
             (throw-jvm 'IllegalArgumentException (string-append "invalid runtime version: " s)))
           (let ((next (cons (string->number part) acc)))
             (if dot (loop (+ dot 1) next) (make-runtime-version (reverse next)))))))))
+(define (jolt-runtime-version) (make-runtime-version (list jolt-java-feature-version)))
 (register-class-statics! "Runtime$Version" (list (cons "parse" runtime-version-parse)))
 (register-class-statics! "java.lang.Runtime$Version" (list (cons "parse" runtime-version-parse)))
+(register-class-statics! "java.lang.Runtime" (list (cons "version" jolt-runtime-version)))
 (register-host-methods! "runtime-version"
   (list (cons "feature" runtime-version-feature)
         (cons "toString" runtime-version-string)))
@@ -751,13 +767,14 @@
                       runtime-version-string)
 (hashtable-set! jhost-tag->fqn "runtime-version" "java.lang.Runtime$Version")
 
+;; --- multi-release ------------------------------------------------------------
+;; JarFile.BASE_VERSION_FEATURE: a jar opened at this version, or below, reads
+;; only its base entries, and META-INF/versions/N for N under it is never read.
+(define embedded-jar-base-feature 8)
 (define (embedded-jar-version self) (vector-ref (jhost-state self) 4))
 (define (embedded-jar-version-feature self) (runtime-version-feature (embedded-jar-version self)))
-(define (embedded-jar-multi-release? self)
-  (let ((attrs (embedded-jar-main-attributes self)))
-    (and (not (jolt-nil? attrs))
-         (let ((hit (manifest-assoc "Multi-Release" (jhost-state attrs))))
-           (and hit (string-ci=? (cdr hit) "true") #t)))))
+(define (embedded-jar-multi-release? self) (embedded-archive-multi-release?))
+;; META-INF/versions/N/rest -> (N . rest), #f for anything else
 (define (embedded-jar-versioned-part name)
   (and (>= (string-length name) 18)
        (string=? (substring name 0 18) "META-INF/versions/")
@@ -769,22 +786,32 @@
               (version (and slash (string->number (substring tail 0 slash)))))
          (and version (exact? version) (integer? version) (>= version 0)
               (cons version (substring tail (+ slash 1) (string-length tail)))))))
-(define (embedded-jar-selected-resource-name version name)
-  (if (or (embedded-jar-versioned-part name)
-          (not (embedded-jar-multi-release? version))
-          (<= (embedded-jar-version-feature version) 8))
+;; The entry a lookup of NAME reads at FEATURE (JarFile.getVersionedEntry): the
+;; highest META-INF/versions/N/NAME with BASE <= N <= FEATURE, else NAME itself.
+(define (embedded-select-resource-name feature name)
+  (if (or (<= feature embedded-jar-base-feature)
+          (embedded-jar-versioned-part name)
+          (embedded-string-prefix? "META-INF/" name)
+          (not (embedded-archive-multi-release?)))
       name
-      (let loop ((candidate (embedded-jar-version-feature version)))
-        (if (< candidate 0)
+      (let loop ((candidate feature))
+        (if (< candidate embedded-jar-base-feature)
             name
             (let ((versioned (string-append "META-INF/versions/" (number->string candidate) "/" name)))
-              (if (hashtable-ref public-embedded-resources versioned #f)
+              (if (embedded-public-resource? versioned)
                   versioned
                   (loop (- candidate 1))))))))
+(define (embedded-jar-selected-resource-name archive name)
+  (embedded-select-resource-name (embedded-jar-version-feature archive) name))
+;; A class loader opens a multi-release jar at the runtime version, so a
+;; resource URL names the entry that version selects.
+(define (embedded-runtime-resource-name name)
+  (embedded-select-resource-name jolt-java-feature-version name))
+
 (define (embedded-jar-entry name . archive)
   (let* ((archive (if (pair? archive) (car archive) #f))
          (source (if archive (embedded-jar-selected-resource-name archive name) name)))
-    (cond ((hashtable-ref public-embedded-resources source #f)
+    (cond ((embedded-public-resource? source)
            (make-embedded-jar-entry name #f source))
           ((embedded-directory-name name) =>
            (lambda (dir) (make-embedded-jar-entry dir #t)))
@@ -834,26 +861,32 @@
   (make-stream 'ref
     (st-lazy (lambda ()
                (embedded-jar-ensure-open self)
-               (jolt-seq (list->cseq (embedded-jar-entry-list self names)))))))
+               (jolt-seq (list->cseq (filter (lambda (e) (not (jolt-nil? e)))
+                                             (embedded-jar-entry-list self (names)))))))))
 (define (embedded-jar-stream self)
-  (embedded-jar-lazy-stream self (embedded-archive-entry-names)))
+  (embedded-jar-lazy-stream self embedded-archive-entry-names))
+;; JarFile.versionedStream: each entry's base name (a versioned entry above the
+;; jar's version, a malformed version or a bare version directory is dropped),
+;; first occurrence kept, then looked up at the jar's version -- which drops a
+;; name only a version the lookup never reads holds.
 (define (embedded-jar-versioned-names self)
   (let ((feature (embedded-jar-version-feature self))
-        (names (make-hashtable string-hash string=?)))
-    (for-each
-     (lambda (name)
-       (let ((part (embedded-jar-versioned-part name))
-             (versioned? (and (>= (string-length name) 18)
-                              (string=? (substring name 0 18) "META-INF/versions/"))))
-         (cond (versioned?
-                (when (and part (hashtable-ref public-embedded-resources name #f)
-                           (>= feature 9) (<= (car part) feature))
-                  (hashtable-set! names (cdr part) #t)))
-               (else (hashtable-set! names name #t)))))
-     (embedded-archive-entry-names))
-    (sort string<? (vector->list (hashtable-keys names)))))
+        (seen (make-hashtable string-hash string=?)))
+    (let loop ((names (embedded-archive-entry-names)) (acc '()))
+      (if (null? names)
+          (reverse acc)
+          (let* ((name (car names))
+                 (base (if (embedded-string-prefix? "META-INF/versions/" name)
+                           (let ((part (embedded-jar-versioned-part name)))
+                             (and part (not (string=? (cdr part) "")) (<= (car part) feature) (cdr part)))
+                           name)))
+            (if (and base (not (hashtable-ref seen base #f)))
+                (begin (hashtable-set! seen base #t) (loop (cdr names) (cons base acc)))
+                (loop (cdr names) acc)))))))
 (define (embedded-jar-versioned-stream self)
-  (embedded-jar-lazy-stream self (embedded-jar-versioned-names self)))
+  (if (embedded-jar-multi-release? self)
+      (embedded-jar-lazy-stream self (lambda () (embedded-jar-versioned-names self)))
+      (embedded-jar-stream self)))
 
 (register-host-methods! "embedded-jar-enumeration"
   (list
@@ -889,8 +922,7 @@
 (define (make-embedded-jar-file name . version)
   (make-jhost "embedded-jar-file"
               (vector name #f (make-weak-eq-hashtable) (make-mutex)
-                      (if (pair? version) (car version) (make-runtime-version '(8))))))
-
+                      (if (pair? version) (car version) (make-runtime-version (list embedded-jar-base-feature))))))
 (define (embedded-jar-file-arg x)
   (cond ((string? x) x)
         ((jfile? x) (jfile-path x))
@@ -920,13 +952,20 @@
     (else (throw-jvm 'IllegalArgumentException
                      "No matching ctor found for class java.util.jar.JarFile"))))
 
+;; The version a JarFile opens at: a feature at or below the base reads as the
+;; base, any other as that feature alone (JarFile's constructor).
+(define (embedded-jar-open-version version)
+  (let ((feature (runtime-version-feature version)))
+    (make-runtime-version (list (if (<= feature embedded-jar-base-feature) embedded-jar-base-feature feature)))))
 (define (make-jar-file . args)
   (if (and (pair? args) (string=? (or (embedded-jar-file-arg (car args)) "")
                                   embedded-archive-name))
       (begin
         (embedded-jar-validate-args args)
         (make-embedded-jar-file embedded-archive-name
-                                (if (= (length args) 4) (cadddr args) (make-runtime-version '(8)))))
+                                (if (= (length args) 4)
+                                    (embedded-jar-open-version (cadddr args))
+                                    (make-runtime-version (list embedded-jar-base-feature)))))
       (let ((file (apply make-zip-file args)))
         (make-jhost "jar-file" (jhost-state file)))))
 
@@ -981,7 +1020,7 @@
    (cons "close" (zip-method "close" '(0) embedded-jar-close))))
 (register-class-statics! "java.util.jar.JarFile"
   (list (cons "MANIFEST_NAME" "META-INF/MANIFEST.MF")
-        (cons "baseVersion" (lambda () (make-runtime-version '(8))))
-        (cons "runtimeVersion" (lambda () (make-runtime-version '(21))))))
+        (cons "baseVersion" (lambda () (make-runtime-version (list embedded-jar-base-feature))))
+        (cons "runtimeVersion" jolt-runtime-version)))
 (reg-ctor! '("JarFile" "java.util.jar.JarFile") make-jar-file)
 (reg-ctor! '("JarEntry" "java.util.jar.JarEntry") make-jar-entry)

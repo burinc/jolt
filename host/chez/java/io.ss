@@ -145,35 +145,135 @@
 ;; file at heap-build time, so the contents live in the boot image — io/resource serves
 ;; them with no file on disk. An embedded hit reads through slurp/reader exactly
 ;; like a jfile would.
+;;
+;; The PUBLIC ones -- the project's and its dependencies' resources, not jolt's
+;; own runtime files -- are also an archive, the way an uberjar's are: a JarFile,
+;; a read-only NIO filesystem and jar: URLs over "jolt-embedded-resources.jar"
+;; (zip-file.ss, embedded-archive.ss, embedded-url.ss). Their names are kept as
+;; one sorted vector, built once, which is what directory questions search.
 (define embedded-resources (make-hashtable equal-hash equal?))
 (define public-embedded-resources (make-hashtable string-hash string=?))
+(define embedded-resource-index #f)
 (define (register-embedded-resource! name content)
   (hashtable-set! embedded-resources name content))
 (define (register-public-embedded-resource! name content)
   (register-embedded-resource! name content)
-  (hashtable-set! public-embedded-resources name #t))
-(define (embedded-resource-names)
-  (vector->list (hashtable-keys public-embedded-resources)))
+  (hashtable-set! public-embedded-resources name #t)
+  (set! embedded-resource-index #f))
+(define (embedded-resource-sorted)
+  (or embedded-resource-index
+      (let ((v (hashtable-keys public-embedded-resources)))
+        (vector-sort! string<? v)
+        (set! embedded-resource-index v)
+        v)))
+(define (embedded-resource-names) (vector->list (embedded-resource-sorted)))
+(define (embedded-public-resource? name) (hashtable-ref public-embedded-resources name #f))
+;; The first index whose name is not below KEY.
+(define (embedded-resource-lower-bound key)
+  (let ((v (embedded-resource-sorted)))
+    (let loop ((lo 0) (hi (vector-length v)))
+      (if (fx>=? lo hi)
+          lo
+          (let ((mid (fxsrl (fx+ lo hi) 1)))
+            (if (string<? (vector-ref v mid) key) (loop (fx+ mid 1) hi) (loop lo mid)))))))
+(define (embedded-string-prefix? prefix s)
+  (and (fx>=? (string-length s) (string-length prefix))
+       (string=? (substring s 0 (string-length prefix)) prefix)))
+;; The names under directory PREFIX (which ends in "/"), in order.
+(define (embedded-resources-under prefix)
+  (let ((v (embedded-resource-sorted)))
+    (let loop ((i (embedded-resource-lower-bound prefix)) (acc '()))
+      (if (and (fx<? i (vector-length v)) (embedded-string-prefix? prefix (vector-ref v i)))
+          (loop (fx+ i 1) (cons (vector-ref v i) acc))
+          (reverse acc)))))
+;; The directory NAME names, spelled with its trailing "/", when some public
+;; resource lives under it. A directory exists only by holding something, as in
+;; a jar written by the jar tool, so with nothing embedded there is none -- not
+;; even the root, which a jar has no entry for.
+(define (embedded-directory-name name)
+  (let ((n (string-length name)))
+    (and (fx>? n 0)
+         (let* ((prefix (if (char=? (string-ref name (fx- n 1)) #\/) name (string-append name "/")))
+                (v (embedded-resource-sorted))
+                (i (embedded-resource-lower-bound prefix)))
+           (and (fx<? i (vector-length v))
+                (embedded-string-prefix? prefix (vector-ref v i))
+                prefix)))))
+(define (embedded-directory? name) (and (embedded-directory-name name) #t))
+
 (define embedded-archive-name "jolt-embedded-resources.jar")
 (define embedded-archive-prefix "jar:file:jolt-embedded-resources.jar!/")
-(define (embedded-directory-name name)
-  (let* ((n (string-length name))
-         (prefix (if (or (= n 0) (not (char=? (string-ref name (- n 1)) #\/)))
-                     (string-append name "/") name)))
-    (and (or (= n 0)
-             (exists (lambda (resource)
-                       (and (> (string-length resource) (string-length prefix))
-                            (string=? (substring resource 0 (string-length prefix)) prefix)))
-                     (embedded-resource-names)))
-         prefix)))
-(define (embedded-directory? name) (and (embedded-directory-name name) #t))
-(define (embedded-archive-url name)
-  (let ((dir (embedded-directory-name name)))
-    (and dir (make-embedded-res (string-append embedded-archive-prefix dir) #f))))
-(define (embedded-resource-url name)
-  (let ((content (embedded-resource-ref name)))
-    (if content (make-embedded-res name content) (embedded-archive-url name))))
+
+;; Percent-encoding, the JDK's two ways. A class loader's resource URL is
+;; built by ParseUtil.encodePath: lowercase escapes, and ";" "=" "[" "]" are
+;; escaped too. A zipfs Path's toUri goes through the multi-argument URI
+;; constructor, which escapes only what a URI cannot hold, in uppercase, and
+;; leaves other non-ASCII characters as they are.
+(define (embedded-percent-encode s escape? upper?)
+  (let ((out (open-output-string))
+        (hex (if upper? "0123456789ABCDEF" "0123456789abcdef")))
+    (string-for-each
+     (lambda (c)
+       (if (escape? c)
+           (embedded-bytes-for-each
+            (lambda (b)
+              (write-char #\% out)
+              (write-char (string-ref hex (fxsrl b 4)) out)
+              (write-char (string-ref hex (fxand b 15)) out))
+            (string->utf8 (string c)))
+           (write-char c out)))
+     s)
+    (get-output-string out)))
+(define (embedded-bytes-for-each f bv)
+  (let loop ((i 0))
+    (when (fx<? i (bytevector-length bv))
+      (f (bytevector-u8-ref bv i))
+      (loop (fx+ i 1)))))
+(define (embedded-url-escape? c)
+  (let ((n (char->integer c)))
+    (or (fx<=? n #x20) (fx>=? n #x7F)
+        (memv c '(#\" #\# #\% #\; #\< #\= #\> #\? #\[ #\\ #\] #\^ #\` #\{ #\| #\})))))
+(define (embedded-uri-escape? c)
+  (let ((n (char->integer c)))
+    (if (fx<? n #x80)
+        (or (fx<=? n #x20) (fx=? n #x7F)
+            (memv c '(#\" #\# #\% #\< #\> #\\ #\^ #\` #\{ #\| #\})))
+        (or (char-whitespace? c) (eq? (char-general-category c) 'Cc)))))
+(define (embedded-url-encode name) (embedded-percent-encode name embedded-url-escape? #f))
+(define (embedded-uri-encode name) (embedded-percent-encode name embedded-uri-escape? #t))
+;; %XX sequences back to the UTF-8 text they spell.
+(define (embedded-percent-decode s)
+  (let ((n (string-length s)))
+    (if (not (exists (lambda (c) (char=? c #\%)) (string->list s)))
+        s
+        (let-values (((out collect) (open-bytevector-output-port)))
+          (let loop ((i 0))
+            (cond ((fx>=? i n)
+                   (utf8->string (collect)))
+                  ((and (char=? (string-ref s i) #\%) (fx<=? (fx+ i 3) n)
+                        (string->number (substring s (fx+ i 1) (fx+ i 3)) 16))
+                   => (lambda (b) (put-u8 out b) (loop (fx+ i 3))))
+                  (else (put-bytevector out (string->utf8 (string (string-ref s i))))
+                        (loop (fx+ i 1)))))))))
+
+;; A resource URL in the archive: the entry NAME (as asked for, or the
+;; multi-release entry the runtime version selects) and its bytes, or #f for a
+;; directory. Its text is the jar: URL a class loader would answer.
 (define-record-type embedded-res (fields name content) (nongenerative jolt-embres-v1))
+(define (embedded-res-url r) (string-append embedded-archive-prefix (embedded-url-encode (embedded-res-name r))))
+;; Its bytes; a directory entry has none, as a jar's directory entry has none.
+(define (embedded-res-bytes r)
+  (let ((c (embedded-res-content r)))
+    (cond ((bytevector? c) c) ((string? c) (string->utf8 c)) (else (make-bytevector 0)))))
+(define (embedded-resource-url name)
+  (cond
+    ((fx=? (string-length name) 0) #f)
+    ((let ((source (embedded-runtime-resource-name name)))
+       (and (embedded-public-resource? source) source))
+     => (lambda (source) (make-embedded-res source (embedded-resource-ref source))))
+    ((embedded-resource-ref name) => (lambda (content) (make-embedded-res name content)))
+    ((embedded-directory-name name) (make-embedded-res name #f))
+    (else #f)))
 ;; io/resource returns a java.net.URL from BOTH branches: a file: URL (a jhost
 ;; "url") for a hit on a source root, and this embedded-res (class java.net.URL,
 ;; protocol "jar") for a resource baked into a built binary. The two must answer the
@@ -183,31 +283,28 @@
 ;; it. Registered below (after record-method-dispatch's arm registry exists)
 ;; rather than inline, so both branches stay in one place.
 (define (embedded-res-method obj name args)
-  (let* ((nm (embedded-res-name obj))
+  (let* ((url (embedded-res-url obj))
          (directory? (not (embedded-res-content obj)))
-         (file (if directory? (substring nm 4 (string-length nm)) nm)))
+         (file (substring url 4 (string-length url))))
     (cond
       ((string=? name "getPath")     (list file))
       ((string=? name "getFile")     (list file))
-      ((string=? name "getName")     (list (path-last-segment file)))
-      ((string=? name "toString")    (list nm))
-      ;; embedded content has no file on disk; the JVM would report a jar: URL for
-      ;; a resource inside an artifact, so "jar" is the honest protocol here.
+      ((string=? name "getName")     (list (path-last-segment (embedded-res-name obj))))
+      ((string=? name "toString")    (list url))
       ((string=? name "getProtocol") (list "jar"))
       ((string=? name "exists")      (list #t))
       ((string=? name "isDirectory") (list directory?))
       ((string=? name "isFile")      (list (not directory?)))
-      ((string=? name "equals")
-       (list (and (embedded-res? (car args)) (string=? nm (embedded-res-name (car args))))))
-      ((string=? name "hashCode")    (list (string-hash nm)))
+      ((or (string=? name "equals") (string=? name "sameFile"))
+       (list (and (embedded-res? (car args))
+                  (string=? (embedded-res-name obj) (embedded-res-name (car args))))))
+      ((string=? name "hashCode")    (list (string-hash url)))
       ((string=? name "getHost")     (list ""))
       ((string=? name "getAuthority") (list jolt-nil))
       ((or (string=? name "getPort") (string=? name "getDefaultPort")) (list -1))
       ((or (string=? name "getQuery") (string=? name "getUserInfo") (string=? name "getRef")) (list jolt-nil))
-      ((string=? name "toExternalForm") (list nm))
-      ((string=? name "sameFile")
-       (list (and (embedded-res? (car args)) (string=? nm (embedded-res-name (car args))))))
-      ((string=? name "toURI")      (list (uri-ctor nm)))
+      ((string=? name "toExternalForm") (list url))
+      ((string=? name "toURI")      (list (uri-ctor url)))
       ((string=? name "openConnection")
        (begin
          (when (pair? args)
@@ -225,7 +322,6 @@
        ;; still decodes whatever it is handed.
        (list (embedded-connection-stream (embedded-url-open-connection obj))))
       (else #f))))
-
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
 ;; A toolchain-free `jolt build` (the distributed jolt) carries the Chez
 ;; petite/scheme boots and a prebuilt launcher stub baked into its own boot image.
@@ -1914,12 +2010,12 @@
           (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
 (register-class-arm! embedded-res? (lambda (x) "java.net.URL"))
-;; (str resource) is the resource name, like URL.toString — which also gives the
+;; (str resource) is its jar: URL, like URL.toString — which also gives the
 ;; printer's #object[…] fallback its content.
-(register-str-render! embedded-res? (lambda (x) (embedded-res-name x)))
+(register-str-render! embedded-res? embedded-res-url)
 (register-eq-arm! (lambda (a b) (and (embedded-res? a) (embedded-res? b)))
                   (lambda (a b) (string=? (embedded-res-name a) (embedded-res-name b))))
-(register-hash-arm! embedded-res? (lambda (x) (string-hash (embedded-res-name x))))
+(register-hash-arm! embedded-res? (lambda (x) (string-hash (embedded-res-url x))))
 
 ;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch, not the
 ;; string-path shims in the base jolt-host-call. Route through
@@ -2636,9 +2732,7 @@
        (jolt-close r)
        text))
     ((jfile? src) (slurp-path (jfile-fs src) (jfile-path src)))
-    ((embedded-res? src)
-     (let ((c (embedded-res-content src)))
-       (if (bytevector? c) (utf8->string c) c)))
+    ((embedded-res? src) (utf8->string (embedded-res-bytes src)))
     ((reader-jhost? src) (drain-reader src))
     ((reify-method-ref src "-read-line")
      (drain-ireader src))
@@ -2807,9 +2901,7 @@
     ((reader-jhost? x) x)
     ((jfile? x) (io-note-file-read! (jfile-fs x))
                 (host-new "StringReader" (read-file-string (jfile-fs x) (jfile-path x))))
-    ((embedded-res? x)
-     (let ((c (embedded-res-content x)))
-       (host-new "StringReader" (if (bytevector? c) (utf8->string c) c))))
+    ((embedded-res? x) (host-new "StringReader" (utf8->string (embedded-res-bytes x))))
     ((url-jhost? x) (host-new "StringReader" (url-content x)))
     ((string? x) (let ((p (project-relative x)))
                    (io-note-file-read! p)

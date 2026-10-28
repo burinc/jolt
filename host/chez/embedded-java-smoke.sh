@@ -20,6 +20,7 @@ fi
 got="$(cd "$run_dir" && "$out" "$mode")"
 case "$mode" in
   --url) want=':url-ok' ;;
+  --resource-url) want=':resource-url-ok' ;;
   --jar-full) want=':jar-full-ok' ;;
   --jar-base) want=':jar-base-ok' ;;
   --fs-full) want=':fs-full-ok' ;;

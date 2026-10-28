@@ -2431,9 +2431,7 @@
         ;; while the same call on a file: URL worked. The content is the source
         ;; string or a bytevector, whichever the embed stored.
         ((embedded-res? x)
-         (let ((c (embedded-res-content x)))
-           (make-in-stream (open-bytevector-input-port
-                            (if (bytevector? c) c (string->utf8 c))))))
+         (make-in-stream (open-bytevector-input-port (embedded-res-bytes x))))
         ;; an entry inside a jar on the roots streams out of the archive (io.ss)
         ((jar-path? x) (jar-path-stream x))
         ((string? x) (jio-open-in-file-buffered (io-source-path x) (if (file-url-string? x) (file-url->path x) x)))

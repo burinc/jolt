@@ -1,43 +1,42 @@
 ;; The read-only java.nio.file view of the application resources baked into an
-;; image. The archive name is a sentinel, never a host path.
+;; image: a FileSystem over the archive (zip-file.ss embedded-archive-entry-names)
+;; and the provider nio-file.ss dispatches its paths through. The archive name is
+;; a sentinel, never a host path.
 
 (define embedded-file-system-uri "jar:file:jolt-embedded-resources.jar")
 (define embedded-open-file-systems (make-hashtable string-hash string=?))
 (define embedded-file-systems-mutex (make-mutex))
 
+;; "jar:file:jolt-embedded-resources.jar" with or without a "!/..." tail names it;
+;; any other URI is another archive, which no provider here serves.
 (define (embedded-file-system-key uri)
   (let ((s (jolt-str-render-one uri)))
     (and (or (string=? s embedded-file-system-uri)
-             (and (>= (string-length s) (+ (string-length embedded-file-system-uri) 2))
-                  (string=? (substring s 0 (+ (string-length embedded-file-system-uri) 2))
-                            (string-append embedded-file-system-uri "!/"))))
+             (embedded-string-prefix? (string-append embedded-file-system-uri "!/") s))
          embedded-file-system-uri)))
+(define (embedded-file-system-key! uri)
+  (or (embedded-file-system-key uri)
+      (zip-throw "java.nio.file.ProviderNotFoundException"
+                 (string-append "Provider not installed for " (jolt-str-render-one uri)))))
 
 (define (embedded-file-system-ensure-open fs)
   (unless (vector-ref (jhost-state fs) 0)
     (zip-throw "java.nio.file.ClosedFileSystemException" "embedded resource filesystem is closed")))
 
+;; #(open? file-store provider-object)
 (define (embedded-file-system-new uri . env)
-  (let ((key (embedded-file-system-key uri)))
-    (unless key
-      (zip-throw "java.nio.file.ProviderNotFoundException"
-                 (string-append "Provider not installed for " (jolt-str-render-one uri))))
+  (let ((key (embedded-file-system-key! uri)))
     (jolt-with-mutex embedded-file-systems-mutex
       (when (hashtable-ref embedded-open-file-systems key #f)
         (zip-throw "java.nio.file.FileSystemAlreadyExistsException" key))
-      (let ((fs (make-jhost "embedded-nio-filesystem" (vector #t #f #f #f))))
+      (let ((fs (make-jhost "embedded-nio-filesystem" (vector #t #f #f))))
         (hashtable-set! embedded-open-file-systems key fs)
         fs))))
-
 (define (embedded-file-system-get uri)
-  (let ((key (embedded-file-system-key uri)))
-    (unless key
-      (zip-throw "java.nio.file.ProviderNotFoundException"
-                 (string-append "Provider not installed for " (jolt-str-render-one uri))))
+  (let ((key (embedded-file-system-key! uri)))
     (or (jolt-with-mutex embedded-file-systems-mutex
           (hashtable-ref embedded-open-file-systems key #f))
         (zip-throw "java.nio.file.FileSystemNotFoundException" key))))
-
 (define (embedded-file-system-close fs)
   (when (vector-ref (jhost-state fs) 0)
     (vector-set! (jhost-state fs) 0 #f)
@@ -49,80 +48,85 @@
 (define (embedded-file-system-path fs first . more)
   (embedded-file-system-ensure-open fs)
   (npath-get-strings-on fs first more))
-
 (define (embedded-file-system-roots fs)
   (embedded-file-system-ensure-open fs)
   (list->cseq (list (make-nio-path-on fs "/"))))
-
 (define (embedded-file-system-matcher fs spec)
   (embedded-file-system-ensure-open fs)
   (npath-make-matcher-on #f (npath-string-of spec)))
 
-(define (embedded-nio-path-uri path)
-  (let ((s (nio-path-str path)))
-    (uri-ctor
-     (string-append embedded-archive-prefix
-                    (if (and (> (string-length s) 0) (char=? (string-ref s 0) #\/))
-                        (substring s 1 (string-length s)) s)))))
-
+;; ---- paths and what they name ---------------------------------------------------
+;; A path's key is its normalized absolute spelling; the resource it names drops
+;; the leading "/".
 (define (embedded-nio-key path)
   (let ((s (npath-normalize-for #f (nio-path-str path))))
     (cond ((or (string=? s "") (string=? s "/")) "/")
           ((char=? (string-ref s 0) #\/) s)
           (else (string-append "/" s)))))
-
 (define (embedded-nio-resource-name path)
   (let ((key (embedded-nio-key path)))
     (if (string=? key "/") "" (substring key 1 (string-length key)))))
-
 (define (embedded-nio-kind path)
   (let ((name (embedded-nio-resource-name path)))
-    (cond ((hashtable-ref public-embedded-resources name #f) 'file)
+    (cond ((string=? name "") 'directory)
+          ((embedded-public-resource? name) 'file)
           ((embedded-directory? name) 'directory)
           (else #f))))
-
 (define (embedded-nio-require path)
   (or (embedded-nio-kind path) (nio-no-such-file (nio-path-str path))))
-
 (define (embedded-nio-bytes path)
-  (let ((kind (embedded-nio-require path)))
-    (if (eq? kind 'directory)
-        (nio-fs-detail (nio-path-str path) "Is a directory")
-        (let* ((archive (make-embedded-jar-file embedded-archive-name))
-               (name (embedded-jar-selected-resource-name archive (embedded-nio-resource-name path)))
-               (content (embedded-resource-ref name)))
-          (if (bytevector? content) content (string->utf8 content))))))
+  (embedded-file-system-ensure-open (nio-path-filesystem path))
+  (if (eq? (embedded-nio-require path) 'directory)
+      (nio-fs-detail (nio-path-str path) "Is a directory")
+      ;; the base entry: a zip filesystem reads versioned entries only when it
+      ;; is opened with a releaseVersion, which this one never is
+      (let ((content (embedded-resource-ref (embedded-nio-resource-name path))))
+        (if (bytevector? content) content (string->utf8 content)))))
 
+;; Path.toUri: the archive's URI, "!", and the absolute path quoted the way the
+;; multi-argument URI constructor quotes it; Path.of(URI) reads it back.
+(define (embedded-nio-path-uri path)
+  (embedded-file-system-ensure-open (nio-path-filesystem path))
+  (uri-ctor (string-append embedded-file-system-uri "!" (embedded-uri-encode (embedded-nio-key path)))))
+(define (embedded-uri->path uri)
+  (let* ((fs (embedded-file-system-get uri))
+         (s (jolt-str-render-one uri))
+         (bang (let find ((i 0))
+                 (cond ((>= i (string-length s)) #f)
+                       ((char=? (string-ref s i) #\!) i)
+                       (else (find (+ i 1)))))))
+    (make-nio-path-on fs (if bang (embedded-percent-decode (substring s (+ bang 1) (string-length s))) "/"))))
+
+;; The children of a directory, in name order, each spelled under the
+;; directory's own spelling (absolute or not).
 (define (embedded-nio-children path)
   (unless (eq? (embedded-nio-require path) 'directory)
     (nio-fs-throw "java.nio.file.NotDirectoryException" (nio-path-str path)))
   (let* ((key (embedded-nio-key path))
          (raw (npath-normalize-for #f (nio-path-str path)))
-         (prefix (if (string=? key "/") ""
-                     (string-append (substring key 1 (string-length key)) "/")))
+         (prefix (if (string=? key "/") "" (string-append (substring key 1 (string-length key)) "/")))
          (base-path (if (npath-absolute-for? #f raw) key raw))
          (base (cond ((string=? base-path "") "")
                      ((string=? base-path "/") "/")
-                     (else (string-append base-path "/")))))
-    (let loop ((entries (embedded-archive-entry-names)) (acc '()))
-      (if (null? entries)
+                     (else (string-append base-path "/"))))
+         (seen (make-hashtable string-hash string=?)))
+    (let loop ((names (if (string=? prefix "") (embedded-resource-names) (embedded-resources-under prefix)))
+               (acc '()))
+      (if (null? names)
           (reverse acc)
-          (let* ((entry (car entries))
-                 (rest (and (>= (string-length entry) (string-length prefix))
-                            (string=? (substring entry 0 (string-length prefix)) prefix)
-                            (substring entry (string-length prefix) (string-length entry)))))
-            (if (or (not rest) (string=? rest ""))
-                (loop (cdr entries) acc)
-                (let* ((n (string-length rest))
-                       (slash (let find ((i 0))
-                                (cond ((>= i n) #f)
-                                      ((char=? (string-ref rest i) #\/) i)
-                                      (else (find (+ i 1)))))))
-                  (if (or (not slash) (= slash (- n 1)))
-                      (let ((name (if slash (substring rest 0 slash) rest)))
-                        (loop (cdr entries) (cons (npath-like path (string-append base name)) acc)))
-                      (loop (cdr entries) acc)))))))))
+          (let* ((rest (substring (car names) (string-length prefix) (string-length (car names))))
+                 (slash (let find ((i 0))
+                          (cond ((>= i (string-length rest)) #f)
+                                ((char=? (string-ref rest i) #\/) i)
+                                (else (find (+ i 1))))))
+                 (child (if slash (substring rest 0 slash) rest)))
+            (if (hashtable-ref seen child #f)
+                (loop (cdr names) acc)
+                (begin
+                  (hashtable-set! seen child #t)
+                  (loop (cdr names) (cons (npath-like path (string-append base child)) acc)))))))))
 
+;; ---- attributes -------------------------------------------------------------------
 (define (embedded-nio-attribute path name)
   (let ((kind (embedded-nio-require path)))
     (cond
@@ -132,9 +136,7 @@
       ((string=? name "isRegularFile") (eq? kind 'file))
       ((string=? name "isSymbolicLink") #f)
       ((string=? name "isOther") #f)
-      ((string=? name "fileKey") jolt-nil)
       (else jolt-nil))))
-
 (define (make-embedded-basic-attrs path)
   (make-jhost "embedded-basic-attrs" path))
 (register-host-methods! "embedded-basic-attrs"
@@ -142,7 +144,9 @@
          (cons name (lambda (self) (embedded-nio-attribute (jhost-state self) name))))
        '("isDirectory" "isRegularFile" "isSymbolicLink" "isOther" "size"
          "lastModifiedTime" "lastAccessTime" "creationTime" "fileKey")))
+(hashtable-set! jhost-tag->fqn "embedded-basic-attrs" "java.nio.file.attribute.BasicFileAttributes")
 
+;; Only the "basic" view: any other view or attribute name is refused.
 (define (embedded-nio-view! what)
   (let* ((text (npath-string-of what))
          (colon (let find ((i 0))
@@ -156,40 +160,23 @@
   (unless (member name nio-basic-attr-names)
     (throw-jvm 'IllegalArgumentException (string-append "unknown basic attribute: " name)))
   (embedded-nio-attribute path name))
-(define (embedded-nio-read-attributes path what)
+(define (embedded-nio-read-attributes path what . opts)
   (embedded-nio-require path)
-  (cond
-    ((jclass? what)
-     (if (string=? (jclass-name what) "java.nio.file.attribute.BasicFileAttributes")
-         (make-embedded-basic-attrs path)
-         (throw-jvm 'UnsupportedOperationException
-                    (string-append "unsupported attributes class: " (jclass-name what)))))
-    (else
-     (let ((w (npath-string-of what)))
-       (embedded-nio-view! w)
-       (let* ((part (nio-attr-name w))
-              (names (if (string=? part "*") nio-basic-attr-names (nio-split-commas part))))
-         (fold-left (lambda (m name) (jolt-assoc m name (embedded-nio-attribute! path name)))
-                    empty-pmap names))))))
+  (if (jclass? what)
+      (if (string=? (jclass-name what) "java.nio.file.attribute.BasicFileAttributes")
+          (make-embedded-basic-attrs path)
+          (throw-jvm 'UnsupportedOperationException
+                     (string-append "unsupported attributes class: " (jclass-name what))))
+      (let ((w (npath-string-of what)))
+        (embedded-nio-view! w)
+        (let* ((part (nio-attr-name w))
+               (names (if (string=? part "*") nio-basic-attr-names (nio-split-commas part))))
+          (fold-left (lambda (m name) (jolt-assoc m name (embedded-nio-attribute! path name)))
+                     empty-pmap names)))))
 
-(define (embedded-nio-read-lines path args)
-  (let* ((s (embedded-nio-decode path args))
-         (n (string-length s)))
-    (let loop ((i 0) (start 0) (acc '()))
-      (cond
-        ((= i n)
-         (make-pvec (list->vector (reverse (if (> i start) (cons (substring s start i) acc) acc)))))
-        ((char=? (string-ref s i) #\newline)
-         (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
-        ((char=? (string-ref s i) #\return)
-         (loop (+ i (if (and (< (+ i 1) n) (char=? (string-ref s (+ i 1)) #\newline)) 2 1))
-               (+ i (if (and (< (+ i 1) n) (char=? (string-ref s (+ i 1)) #\newline)) 2 1))
-               (cons (substring s start i) acc)))
-        (else (loop (+ i 1) start acc))))))
-
-(define (embedded-nio-directory-stream path args)
-  (let* ((arg (and (pair? args) (car args)))
-         (paths (embedded-nio-children path)))
+(define (embedded-nio-directory-stream path . filter-arg)
+  (let ((arg (and (pair? filter-arg) (car filter-arg)))
+        (paths (embedded-nio-children path)))
     (make-dir-stream
      (cond
        ((string? arg)
@@ -203,8 +190,10 @@
         => (lambda (m) (filter (lambda (child) (jolt-truthy? (jolt-invoke m arg child))) paths)))
        (else paths)))))
 
-(define (embedded-nio-walk start opts max-depth visitor)
-  (let ((md (if (number? max-depth) (exact (truncate max-depth)) 2147483647)))
+(define (embedded-nio-walk start . args)
+  (let* ((visitor (car (last-pair args)))
+         (max-depth (if (= (length args) 3) (cadr args) 2147483647))
+         (md (if (number? max-depth) (exact (truncate max-depth)) 2147483647)))
     (call/cc
      (lambda (stop)
        (define (walk path depth)
@@ -229,95 +218,65 @@
        (walk start 0)))
     start))
 
-(define embedded-nio-mutations
-  '("delete" "deleteIfExists" "write" "writeString" "newOutputStream" "newBufferedWriter"
-    "createDirectory" "createDirectories" "createFile" "createTempFile" "createTempDirectory"
-    "createSymbolicLink" "createLink" "move" "setOwner"
-    "setLastModifiedTime" "setAttribute" "setPosixFilePermissions"))
+;; ---- channels ---------------------------------------------------------------------
+;; A read-only SeekableByteChannel over a resource's bytes. State: #(bytes position open?)
+(define (embedded-channel-ensure-open self)
+  (unless (vector-ref (jhost-state self) 2)
+    (throw-jvm 'java.nio.channels.ClosedChannelException "embedded channel is closed")))
+(define (embedded-channel-position self) (vector-ref (jhost-state self) 1))
+(define (embedded-channel-position-set! self position)
+  (embedded-channel-ensure-open self)
+  (let ((position (jnum->exact position)))
+    (when (< position 0)
+      (throw-jvm 'IllegalArgumentException "negative channel position"))
+    (vector-set! (jhost-state self) 1 position)
+    self))
+(define (embedded-channel-read self buffer)
+  (embedded-channel-ensure-open self)
+  (let* ((bytes (vector-ref (jhost-state self) 0))
+         (position (embedded-channel-position self))
+         (n (min (- (bytevector-length bytes) position) (nb-remaining buffer))))
+    (cond ((= (nb-remaining buffer) 0) (->num 0))
+          ((<= n 0) (->num -1))
+          (else
+           (let ((slice (make-bytevector n)))
+             (bytevector-copy! bytes position slice 0 n)
+             (nb-put buffer (na-byte-array slice) 0 n)
+             (embedded-channel-position-set! self (+ position n))
+             (->num n))))))
+(register-host-methods! "embedded-byte-channel"
+  (list
+   (cons "read" embedded-channel-read)
+   (cons "write" (lambda (self buffer)
+                   (embedded-channel-ensure-open self)
+                   (zip-throw "java.nio.file.ReadOnlyFileSystemException" "write")))
+   (cons "position" (lambda (self . position)
+                      (embedded-channel-ensure-open self)
+                      (if (pair? position)
+                          (embedded-channel-position-set! self (car position))
+                          (embedded-channel-position self))))
+   (cons "size" (lambda (self)
+                  (embedded-channel-ensure-open self)
+                  (->num (bytevector-length (vector-ref (jhost-state self) 0)))))
+   (cons "truncate" (lambda (self size)
+                      (embedded-channel-ensure-open self)
+                      (zip-throw "java.nio.file.ReadOnlyFileSystemException" "truncate")))
+   (cons "isOpen" (lambda (self) (vector-ref (jhost-state self) 2)))
+   (cons "close" (lambda (self) (vector-set! (jhost-state self) 2 #f) jolt-nil))))
+(hashtable-set! jhost-tag->fqn "embedded-byte-channel" "java.nio.channels.SeekableByteChannel")
+(hashtable-set! jhost-tag->fqn "embedded-file-channel" "java.nio.channels.FileChannel")
+(alias-host-methods! "embedded-file-channel" "embedded-byte-channel")
+(define (embedded-channel tag)
+  (lambda (path . options)
+    (when (exists (lambda (option)
+                    (and (jhost? option)
+                         (member (enum-name option)
+                                 '("WRITE" "APPEND" "TRUNCATE_EXISTING" "CREATE" "CREATE_NEW" "DELETE_ON_CLOSE"))))
+                  (npath-spread-args options))
+      (zip-throw "java.nio.file.ReadOnlyFileSystemException" "open for writing"))
+    (make-jhost tag (vector (embedded-nio-bytes path) 0 #t))))
 
-(define (embedded-nio-dispatch operation path args)
-  (embedded-file-system-ensure-open (nio-path-filesystem path))
-  (cond
-    ((member operation embedded-nio-mutations)
-     (zip-throw "java.nio.file.ReadOnlyFileSystemException" operation))
-    ((string=? operation "exists") (and (embedded-nio-kind path) #t))
-    ((string=? operation "notExists") (not (embedded-nio-kind path)))
-    ((string=? operation "isDirectory") (eq? (embedded-nio-kind path) 'directory))
-    ((string=? operation "isRegularFile") (eq? (embedded-nio-kind path) 'file))
-    ((string=? operation "isSymbolicLink") #f)
-    ((string=? operation "isReadable") (and (embedded-nio-kind path) #t))
-    ((or (string=? operation "isWritable") (string=? operation "isExecutable")) #f)
-    ((string=? operation "isHidden")
-     (let ((name (npath-string-of (npath-file-name-on (nio-path-filesystem path) (nio-path-str path)))))
-       (and (> (string-length name) 0) (char=? (string-ref name 0) #\.))))
-    ((string=? operation "size") (embedded-nio-attribute path "size"))
-    ((string=? operation "readAllBytes") (na-bv->bytearray (embedded-nio-bytes path)))
-    ((string=? operation "readAllLines") (embedded-nio-read-lines path (cdr args)))
-    ((string=? operation "newInputStream")
-     (make-in-stream (open-bytevector-input-port (embedded-nio-bytes path))))
-    ((string=? operation "newByteChannel") (apply embedded-byte-channel path (cdr args)))
-    ((string=? operation "FileChannel/open") (apply embedded-file-channel path (cdr args)))
-    ((string=? operation "newBufferedReader") (embedded-nio-buffered-reader path (cdr args)))
-    ((string=? operation "readString") (embedded-nio-decode path (cdr args)))
-    ((or (string=? operation "list") (string=? operation "walk")
-         (string=? operation "find") (string=? operation "lines"))
-     (embedded-path-stream operation path (cdr args)))
-    ((string=? operation "mismatch") (embedded-mismatch (car args) (cadr args)))
-    ((string=? operation "probeContentType") (embedded-nio-content-type path))
-    ((string=? operation "getFileStore")
-     (embedded-nio-require path)
-     (embedded-file-store (nio-path-filesystem path)))
-    ((string=? operation "getFileAttributeView")
-     (if (and (jclass? (cadr args))
-              (string=? (jclass-name (cadr args)) "java.nio.file.attribute.BasicFileAttributeView"))
-         (embedded-basic-attribute-view path)
-         jolt-nil))
-    ((string=? operation "readAttributes") (embedded-nio-read-attributes path (cadr args)))
-    ((string=? operation "getAttribute")
-     (let ((what (npath-string-of (cadr args))))
-       (embedded-nio-view! what)
-       (embedded-nio-attribute! path (nio-attr-name what))))
-    ((string=? operation "getLastModifiedTime") (embedded-nio-attribute path "lastModifiedTime"))
-    ((string=? operation "newDirectoryStream") (embedded-nio-directory-stream path (cdr args)))
-    ((string=? operation "walkFileTree")
-     (let ((rest (cdr args)))
-       (if (= (length rest) 1)
-           (embedded-nio-walk path '() 2147483647 (car rest))
-           (embedded-nio-walk path (car rest) (cadr rest) (caddr rest)))))
-    ((string=? operation "isSameFile")
-     (let ((first (car args))
-           (other (cadr args)))
-       (and (embedded-nio-path? first)
-            (embedded-nio-path? other)
-            (eq? (nio-path-filesystem first) (nio-path-filesystem other))
-            (if (string=? (embedded-nio-key first) (embedded-nio-key other))
-                #t
-                (begin
-                  (embedded-nio-require first)
-                  (embedded-nio-require other)
-                  #f)))))
-    ((string=? operation "copy")
-     (let ((destination (cadr args)))
-       (when (embedded-nio-path? destination)
-         (zip-throw "java.nio.file.ReadOnlyFileSystemException" operation))
-       (let ((bytes (embedded-nio-bytes path)))
-         (cond
-           ((or (out-stream? destination) (user-out-stream? destination))
-            (record-method-dispatch destination "write"
-              (list->cseq (list (na-byte-array bytes) (->num 0) (->num (bytevector-length bytes)))))
-            (->num (bytevector-length bytes)))
-           (else
-            (let ((host-path (nfp destination)))
-              (when (and (nio-dest-present? host-path)
-                         (not (nio-opts-have? (cddr args) copt-sym 'replace-existing)))
-                (nio-already-exists (nio-shown destination)))
-              (when (nio-dest-present? host-path) (nio-delete1 host-path #t))
-              (nio-write-bv! host-path bytes)
-              (->path destination)))))))
-    (else
-     (throw-jvm 'UnsupportedOperationException
-                (string-append "embedded resource operation is not supported: " operation)))))
-
+;; ---- stores, views, principals and watch services ------------------------------------
 (define (embedded-file-system-cache! fs index value)
   (or (vector-ref (jhost-state fs) index)
       (let ((created (value)))
@@ -327,7 +286,6 @@
   (embedded-file-system-cache! fs 1 (lambda () (make-jhost "embedded-file-store" fs))))
 (define (embedded-file-system-provider fs)
   (embedded-file-system-cache! fs 2 (lambda () (make-jhost "embedded-file-system-provider" fs))))
-
 (register-host-methods! "embedded-file-store"
   (list
    (cons "name" (lambda (self) "jolt-embedded-resources"))
@@ -340,115 +298,15 @@
    (cons "getBlockCount" (lambda (self) 0))
    (cons "getFreeBlocks" (lambda (self) 0))
    (cons "getAvailableBlocks" (lambda (self) 0))
-   (cons "supportsFileAttributeView"
-         (lambda (self view)
-           (if (jclass? view)
-               (string=? (jclass-name view) "java.nio.file.attribute.BasicFileAttributeView")
-               (string=? view "basic"))))
+   (cons "supportsFileAttributeView" (lambda (self view) (string=? (nio-view-name view) "basic")))
    (cons "getAttribute" (lambda (self attribute) jolt-nil))
    (cons "getFileStoreAttributeView" (lambda (self view) jolt-nil))))
-
-(define (embedded-basic-attribute-view path)
-  (make-jhost "embedded-basic-attribute-view" path))
-(register-host-methods! "embedded-basic-attribute-view"
-  (list
-   (cons "name" (lambda (self) "basic"))
-   (cons "readAttributes" (lambda (self) (make-embedded-basic-attrs (jhost-state self))))
-   (cons "setTimes" (lambda (self modified access create)
-                      (zip-throw "java.nio.file.ReadOnlyFileSystemException" "setTimes")))))
-
-(define (embedded-provider-check-access self path args)
-  (embedded-nio-require path)
-  (let ((modes (npath-spread-args args)))
-    (when (exists (lambda (mode)
-                    (and (jhost? mode)
-                         (member (enum-name mode) '("WRITE" "EXECUTE"))))
-                  modes)
-      (nio-fs-throw "java.nio.file.AccessDeniedException" (nio-path-str path))))
-  jolt-nil)
-
-(define (embedded-provider-new-file-system self first . rest)
-  (cond
-    ((uri-jhost? first) (embedded-file-system-new first))
-    ((embedded-nio-path? first) (nio-path-filesystem first))
-    (else (throw-jvm 'UnsupportedOperationException "unsupported filesystem argument"))))
-(define (embedded-provider-get-path self uri)
-  (let ((fs (embedded-file-system-get uri)))
-    (make-nio-path-on fs "/")))
-(define (embedded-provider-call self name . args)
-  (let ((path (car args)))
-    (cond
-      ((string=? name "getScheme") "jar")
-      ((string=? name "newFileSystem") (apply embedded-provider-new-file-system self args))
-      ((string=? name "getFileSystem") (embedded-file-system-get path))
-      ((string=? name "getPath") (embedded-provider-get-path self path))
-      ((member name '("copy" "move"))
-       (let ((destination (cadr args)))
-         (if (or (and (string=? name "move")
-                      (or (embedded-nio-path? path) (embedded-nio-path? destination)))
-                 (embedded-nio-path? destination))
-             (zip-throw "java.nio.file.ReadOnlyFileSystemException" name)
-             (if (embedded-nio-path? path)
-                 (embedded-nio-dispatch name path args)
-                 (throw-jvm 'ProviderMismatchException "both paths must use the embedded provider")))))
-      ((string=? name "newInputStream") (embedded-nio-dispatch "newInputStream" path args))
-      ((string=? name "newOutputStream") (embedded-nio-dispatch "newOutputStream" path args))
-      ((or (string=? name "newFileChannel") (string=? name "newByteChannel"))
-       (embedded-nio-dispatch "newByteChannel" path args))
-      ((string=? name "newAsynchronousFileChannel")
-       (embedded-nio-dispatch "newAsynchronousFileChannel" path args))
-      ((string=? name "newDirectoryStream") (embedded-nio-directory-stream path (cdr args)))
-      ((string=? name "checkAccess") (embedded-provider-check-access self path (cdr args)))
-      ((string=? name "getFileAttributeView")
-       (if (and (jclass? (cadr args))
-                (string=? (jclass-name (cadr args)) "java.nio.file.attribute.BasicFileAttributeView"))
-           (embedded-basic-attribute-view path)
-           jolt-nil))
-      ((string=? name "readAttributes") (embedded-nio-read-attributes path (cadr args)))
-      ((string=? name "readAttributesIfExists")
-       (if (embedded-nio-kind path) (embedded-nio-read-attributes path (cadr args)) jolt-nil))
-      ((string=? name "getFileStore")
-       (embedded-nio-require path)
-       (embedded-file-store (nio-path-filesystem path)))
-      (else (embedded-nio-dispatch name path args)))))
-
-(define (embedded-provider-method name)
-  (lambda (self . args) (apply embedded-provider-call self name args)))
-(register-host-methods! "embedded-file-system-provider"
-  (list
-   (cons "getScheme" (lambda (self) "jar"))
-   (cons "newFileSystem" embedded-provider-new-file-system)
-   (cons "getFileSystem" (lambda (self uri) (embedded-file-system-get uri)))
-   (cons "getPath" embedded-provider-get-path)
-   (cons "newInputStream" (embedded-provider-method "newInputStream"))
-   (cons "newOutputStream" (embedded-provider-method "newOutputStream"))
-   (cons "newFileChannel" (embedded-provider-method "newFileChannel"))
-   (cons "newAsynchronousFileChannel" (embedded-provider-method "newAsynchronousFileChannel"))
-   (cons "newByteChannel" (embedded-provider-method "newByteChannel"))
-   (cons "newDirectoryStream" (embedded-provider-method "newDirectoryStream"))
-   (cons "createDirectory" (embedded-provider-method "createDirectory"))
-   (cons "createSymbolicLink" (embedded-provider-method "createSymbolicLink"))
-   (cons "createLink" (embedded-provider-method "createLink"))
-   (cons "delete" (embedded-provider-method "delete"))
-   (cons "deleteIfExists" (embedded-provider-method "deleteIfExists"))
-   (cons "readSymbolicLink" (embedded-provider-method "readSymbolicLink"))
-   (cons "copy" (embedded-provider-method "copy"))
-   (cons "move" (embedded-provider-method "move"))
-   (cons "isSameFile" (embedded-provider-method "isSameFile"))
-   (cons "isHidden" (embedded-provider-method "isHidden"))
-   (cons "getFileStore" (embedded-provider-method "getFileStore"))
-   (cons "checkAccess" (embedded-provider-method "checkAccess"))
-   (cons "getFileAttributeView" (embedded-provider-method "getFileAttributeView"))
-   (cons "readAttributes" (embedded-provider-method "readAttributes"))
-   (cons "readAttributesIfExists" (embedded-provider-method "readAttributesIfExists"))
-   (cons "setAttribute" (embedded-provider-method "setAttribute"))
-   (cons "exists" (embedded-provider-method "exists"))))
 
 (define (embedded-principal-lookup self name)
   (throw-jvm 'UnsupportedOperationException "embedded resources have no user principals"))
 (register-host-methods! "embedded-principal-lookup"
-  (list (cons "lookupUserPrincipalByName" embedded-principal-lookup)
-        (cons "lookupUserPrincipalByGroupName" embedded-principal-lookup)))
+  (list (cons "lookupPrincipalByName" embedded-principal-lookup)
+        (cons "lookupPrincipalByGroupName" embedded-principal-lookup)))
 
 (define (embedded-watch-key path)
   (make-jhost "embedded-watch-key" (vector path #t)))
@@ -456,9 +314,7 @@
   (list
    (cons "watchable" (lambda (self) (vector-ref (jhost-state self) 0)))
    (cons "pollEvents" (lambda (self) (make-pvec (vector))))
-   (cons "reset" (lambda (self)
-                   (and (vector-ref (jhost-state self) 1)
-                        (begin (vector-set! (jhost-state self) 1 #t) #t))))
+   (cons "reset" (lambda (self) (vector-ref (jhost-state self) 1)))
    (cons "cancel" (lambda (self) (vector-set! (jhost-state self) 1 #f) jolt-nil))
    (cons "isValid" (lambda (self) (vector-ref (jhost-state self) 1)))))
 (define (embedded-watch-service fs)
@@ -476,12 +332,140 @@
    (cons "poll" (lambda (self . timeout) (embedded-watch-service-poll self)))
    (cons "take" (lambda (self) (embedded-watch-service-poll self)))
    (cons "close" (lambda (self) (vector-set! (jhost-state self) 1 #f) jolt-nil))))
-(define (embedded-nio-path-register path service)
+(define (embedded-nio-path-register path service . events)
   (unless (and (jhost? service) (string=? (jhost-tag service) "embedded-watch-service"))
     (throw-jvm 'IllegalArgumentException "embedded paths require an embedded watch service"))
   (embedded-watch-service-ensure-open service)
   (embedded-nio-require path)
   (embedded-watch-key path))
+
+;; ---- the provider ------------------------------------------------------------------
+;; Its Files table holds the primitives; text, path streams, comparison and
+;; copies to other filesystems come from nio-file.ss's shared operations over
+;; them. Every write is ReadOnlyFileSystemException, and every operation first
+;; refuses a closed filesystem.
+(define (embedded-read-only operation)
+  (lambda args (zip-throw "java.nio.file.ReadOnlyFileSystemException" operation)))
+(define (embedded-same-file? a b)
+  (and (nio-path? b)
+       (eq? (nio-path-filesystem a) (nio-path-filesystem b))
+       (or (string=? (embedded-nio-key a) (embedded-nio-key b))
+           (begin (embedded-nio-require a) (embedded-nio-require b) #f))))
+(define (embedded-copy source destination . opts)
+  (cond
+    ((nio-path? destination) (zip-throw "java.nio.file.ReadOnlyFileSystemException" "copy"))
+    ((not (nio-path? source)) (zip-throw "java.nio.file.ReadOnlyFileSystemException" "copy"))
+    (else
+     (let ((bytes (embedded-nio-bytes source)))
+       (record-method-dispatch destination "write"
+         (list->cseq (list (na-byte-array bytes) (->num 0) (->num (bytevector-length bytes)))))
+       (->num (bytevector-length bytes))))))
+(define embedded-files-ops
+  (append
+   (map (lambda (op) (cons op (embedded-read-only op)))
+        '("delete" "deleteIfExists" "write" "newOutputStream"
+          "createDirectory" "createDirectories" "createFile" "createTempFile" "createTempDirectory"
+          "createSymbolicLink" "createLink" "move" "setOwner"
+          "setLastModifiedTime" "setAttribute" "setPosixFilePermissions"))
+   (list
+    (cons "exists" (lambda (path . opts) (and (embedded-nio-kind path) #t)))
+    (cons "notExists" (lambda (path . opts) (not (embedded-nio-kind path))))
+    (cons "isDirectory" (lambda (path . opts) (eq? (embedded-nio-kind path) 'directory)))
+    (cons "isRegularFile" (lambda (path . opts) (eq? (embedded-nio-kind path) 'file)))
+    (cons "isSymbolicLink" (lambda (path) #f))
+    (cons "isReadable" (lambda (path) (and (embedded-nio-kind path) #t)))
+    (cons "isWritable" (lambda (path) #f))
+    (cons "isExecutable" (lambda (path) #f))
+    (cons "isHidden"
+          (lambda (path)
+            (let ((name (npath-string-of (npath-file-name-on (nio-path-filesystem path) (nio-path-str path)))))
+              (and (> (string-length name) 0) (char=? (string-ref name 0) #\.)))))
+    (cons "size" (lambda (path) (embedded-nio-attribute path "size")))
+    (cons "readAllBytes" (lambda (path) (na-bv->bytearray (embedded-nio-bytes path))))
+    (cons "newInputStream" (lambda (path . opts) (make-in-stream (open-bytevector-input-port (embedded-nio-bytes path)))))
+    (cons "newByteChannel" (embedded-channel "embedded-byte-channel"))
+    (cons "newDirectoryStream" embedded-nio-directory-stream)
+    (cons "readAttributes" embedded-nio-read-attributes)
+    (cons "getAttribute" (lambda (path what . opts)
+                           (let ((w (npath-string-of what)))
+                             (embedded-nio-view! w)
+                             (embedded-nio-attribute! path (nio-attr-name w)))))
+    (cons "getLastModifiedTime" (lambda (path . opts) (embedded-nio-attribute path "lastModifiedTime")))
+    (cons "getFileAttributeView"
+          (nio-attribute-view '("basic") (lambda (what) (zip-throw "java.nio.file.ReadOnlyFileSystemException" what))))
+    (cons "getFileStore" (lambda (path)
+                           (embedded-nio-require path)
+                           (embedded-file-store (nio-path-filesystem path))))
+    (cons "walkFileTree" embedded-nio-walk)
+    (cons "isSameFile" embedded-same-file?)
+    (cons "copy" embedded-copy))))
+(define (embedded-open-checked f)
+  (lambda args
+    (let ((path (find nio-path? (if (and (pair? args) (pair? (cdr args))) (list (car args) (cadr args)) args))))
+      (when (and path (jhost? (nio-path-filesystem path))
+                 (string=? (jhost-tag (nio-path-filesystem path)) "embedded-nio-filesystem"))
+        (embedded-file-system-ensure-open (nio-path-filesystem path))))
+    (apply f args)))
+(define embedded-nio-provider
+  (make-nio-provider
+   "jar"
+   (lambda () #f)
+   (lambda (s) s)
+   (nio-alist->table (map (lambda (p) (cons (car p) (embedded-open-checked (cdr p)))) embedded-files-ops))
+   (nio-alist->table
+    (list
+     (cons "toAbsolutePath" (lambda (path)
+                              (embedded-file-system-ensure-open (nio-path-filesystem path))
+                              (npath-like path (embedded-nio-key path))))
+     (cons "toRealPath" (lambda (path . opts)
+                          (embedded-file-system-ensure-open (nio-path-filesystem path))
+                          (embedded-nio-require path)
+                          (npath-like path (embedded-nio-key path))))
+     (cons "toFile" (lambda (path) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+     (cons "toUri" embedded-nio-path-uri)
+     (cons "register" embedded-nio-path-register)
+     (cons "newFileChannel" (embedded-open-checked (embedded-channel "embedded-file-channel")))))
+   embedded-uri->path
+   embedded-file-system-new
+   embedded-file-system-get
+   embedded-nio-bytes))
+(register-nio-provider! "embedded-nio-filesystem" embedded-nio-provider)
+
+;; FileSystem.provider(): the FileSystemProvider object, whose members are the
+;; same operations Files dispatches to.
+(define (embedded-provider-check-access self path . modes)
+  (embedded-nio-require path)
+  (when (exists (lambda (mode) (and (jhost? mode) (member (enum-name mode) '("WRITE" "EXECUTE"))))
+                (npath-spread-args modes))
+    (nio-fs-throw "java.nio.file.AccessDeniedException" (nio-path-str path)))
+  jolt-nil)
+(define (embedded-provider-new-file-system self first . rest)
+  (cond
+    ((uri-jhost? first) (embedded-file-system-new first))
+    ((nio-path? first) (nio-path-filesystem first))
+    (else (throw-jvm 'UnsupportedOperationException "unsupported filesystem argument"))))
+(define (embedded-provider-files op)
+  (lambda (self . args) (apply nio-files-call op args)))
+(register-host-methods! "embedded-file-system-provider"
+  (append
+   (list
+    (cons "getScheme" (lambda (self) "jar"))
+    (cons "newFileSystem" embedded-provider-new-file-system)
+    (cons "getFileSystem" (lambda (self uri) (embedded-file-system-get uri)))
+    (cons "getPath" (lambda (self uri) (embedded-uri->path uri)))
+    (cons "newFileChannel" (lambda (self path . opts) (apply (nio-path-op path "newFileChannel") path opts)))
+    (cons "newAsynchronousFileChannel" (lambda (self path . opts)
+                                         (throw-jvm 'UnsupportedOperationException jolt-nil)))
+    (cons "checkAccess" embedded-provider-check-access)
+    (cons "readAttributesIfExists"
+          (lambda (self path what . opts)
+            (if (embedded-nio-kind path) (apply embedded-nio-read-attributes path what opts) jolt-nil)))
+    (cons "exists" (lambda (self path . opts) (and (embedded-nio-kind path) #t))))
+   (map (lambda (op) (cons op (embedded-provider-files op)))
+        '("newInputStream" "newOutputStream" "newByteChannel" "newDirectoryStream" "createDirectory"
+          "createSymbolicLink" "createLink" "delete" "deleteIfExists" "readSymbolicLink" "copy"
+          "move" "isSameFile" "isHidden" "getFileStore" "getFileAttributeView" "readAttributes"
+          "setAttribute"))))
 
 (register-enum-class! "java.nio.file.AccessMode"
   (list (cons "READ" (make-jhost "access-mode" 'read))
@@ -489,7 +473,6 @@
         (cons "EXECUTE" (make-jhost "access-mode" 'execute))))
 (hashtable-set! jhost-tag->fqn "embedded-file-store" "java.nio.file.FileStore")
 (hashtable-set! jhost-tag->fqn "embedded-file-system-provider" "java.nio.file.spi.FileSystemProvider")
-(hashtable-set! jhost-tag->fqn "embedded-basic-attribute-view" "java.nio.file.attribute.BasicFileAttributeView")
 (hashtable-set! jhost-tag->fqn "embedded-principal-lookup" "java.nio.file.attribute.UserPrincipalLookupService")
 (hashtable-set! jhost-tag->fqn "embedded-watch-service" "java.nio.file.WatchService")
 (hashtable-set! jhost-tag->fqn "embedded-watch-key" "java.nio.file.WatchKey")

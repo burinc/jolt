@@ -13,8 +13,8 @@
          :thrown))
 
 (defn url-test []
-  (let [resource (io/resource "greeting.txt")
-        other (io/resource "greeting.txt")
+  (let [resource (io/resource "plain.txt")
+        other (io/resource "plain.txt")
         connection (.openConnection resource)
         proxy-connection (.openConnection resource java.net.Proxy/NO_PROXY)
         content "embedded resource ok\n"]
@@ -24,10 +24,10 @@
     (expect-throw "wrong proxy rejected" java.lang.ClassCastException #(.openConnection resource "not-a-proxy"))
     (expect-throw "negative connect timeout" java.lang.IllegalArgumentException #(.setConnectTimeout connection -1))
     (expect-throw "negative read timeout" java.lang.IllegalArgumentException #(.setReadTimeout connection -1))
-    (check "entry name" (.getEntryName connection) "greeting.txt")
+    (check "entry name" (.getEntryName connection) "plain.txt")
     (check "jar file URL" (str (.getJarFileURL connection)) "file:jolt-embedded-resources.jar")
     (check "jar file" (instance? java.util.jar.JarFile (.getJarFile connection)) true)
-    (check "jar entry" (.getName (.getJarEntry connection)) "greeting.txt")
+    (check "jar entry" (.getName (.getJarEntry connection)) "plain.txt")
     (check "manifest present" (some? (.getManifest connection)) true)
     (check "entry attributes" (.getValue (.getAttributes connection) "X-Entry") "yes")
     (check "main attributes" (.getValue (.getMainAttributes connection) "Multi-Release") "true")
@@ -84,8 +84,9 @@
            :rejected)
     (check "connection string" (string? (str connection)) true)
     (check "URL protocol" (.getProtocol resource) "jar")
-    (check "URL path" (.getPath resource) "greeting.txt")
-    (check "URL file" (.getFile resource) "greeting.txt")
+    (check "URL string" (str resource) "jar:file:jolt-embedded-resources.jar!/plain.txt")
+    (check "URL path" (.getPath resource) "file:jolt-embedded-resources.jar!/plain.txt")
+    (check "URL file" (.getFile resource) "file:jolt-embedded-resources.jar!/plain.txt")
     (check "URL host" (.getHost resource) "")
     (check "URL authority" (.getAuthority resource) nil)
     (check "URL port" (.getPort resource) -1)
@@ -93,13 +94,51 @@
     (check "URL query" (.getQuery resource) nil)
     (check "URL user info" (.getUserInfo resource) nil)
     (check "URL ref" (.getRef resource) nil)
-    (check "URL external form" (.toExternalForm resource) "greeting.txt")
-    (check "URL URI" (str (.toURI resource)) "greeting.txt")
+    (check "URL external form" (.toExternalForm resource) "jar:file:jolt-embedded-resources.jar!/plain.txt")
+    (check "URL URI" (str (.toURI resource)) "jar:file:jolt-embedded-resources.jar!/plain.txt")
     (check "URL same file" (.sameFile resource other) true)
     (check "URL stream" (slurp (.openStream resource)) content)
     (check "URL content" (slurp (.getContent resource)) content)
     (check "URL typed content" (slurp (.getContent resource (into-array Class [java.io.InputStream]))) content)
     (prn :url-ok)))
+
+(defn resource-url-test []
+  ;; A class loader opens a multi-release jar at the runtime version, so the
+  ;; resource it answers is the entry that version selects.
+  (let [greeting (io/resource "greeting.txt")]
+    (check "multi-release resource URL" (str greeting)
+           "jar:file:jolt-embedded-resources.jar!/META-INF/versions/17/greeting.txt")
+    (check "multi-release resource content" (slurp greeting) "version 17\n")
+    (check "multi-release entry name" (.getEntryName (.openConnection greeting))
+           "META-INF/versions/17/greeting.txt"))
+  (check "below base version never selected" (io/resource "below7.txt") nil)
+  (check "empty resource name" (io/resource "") nil)
+  (check "runtime version is the reported Java version"
+         [(str (java.util.jar.JarFile/runtimeVersion)) (str (.feature (Runtime/version)))]
+         [(System/getProperty "java.specification.version") (System/getProperty "java.version")])
+  ;; ParseUtil.encodePath: lowercase escapes, ";" and "=" escaped too
+  (let [name "encoded/001 my café;v=1.sql"
+        url (io/resource name)]
+    (check "encoded URL" (str url)
+           "jar:file:jolt-embedded-resources.jar!/encoded/001%20my%20caf%c3%a9%3bv%3d1.sql")
+    (check "encoded URL content" (slurp url) "encoded\n")
+    (check "encoded URL entry" (.getEntryName (.openConnection url)) name)
+    (check "encoded URL URI" (str (.toURI url))
+           "jar:file:jolt-embedded-resources.jar!/encoded/001%20my%20caf%c3%a9%3bv%3d1.sql")
+    (check "encoded directory URL" (str (io/resource "encoded"))
+           "jar:file:jolt-embedded-resources.jar!/encoded"))
+  ;; a zipfs Path.toUri quotes only what a URI cannot hold, uppercase, and keeps
+  ;; other non-ASCII; Path.of(URI) reads it back
+  (let [fs (java.nio.file.FileSystems/newFileSystem (java.net.URI. "jar:file:jolt-embedded-resources.jar") {})
+        path (.getPath fs "/encoded/001 my café;v=1.sql" (make-array String 0))
+        uri (.toUri path)]
+    (check "encoded path URI" (str uri)
+           "jar:file:jolt-embedded-resources.jar!/encoded/001%20my%20café;v=1.sql")
+    (check "encoded path URI round trip" (= path (java.nio.file.Path/of uri)) true)
+    (check "encoded path read" (java.nio.file.Files/readString (java.nio.file.Path/of uri)) "encoded\n")
+    (check "provider path from URI" (str (.getPath (.provider fs) uri)) "/encoded/001 my café;v=1.sql")
+    (.close fs))
+  (prn :resource-url-ok))
 
 (defn jar-full-test []
   (let [jar (java.util.jar.JarFile. "jolt-embedded-resources.jar")
@@ -107,7 +146,7 @@
         manifest (.getManifest jar)
         main (.getMainAttributes manifest)]
     (check "archive comment" (.getComment jar) nil)
-    (check "archive size" (.size jar) 16)
+    (check "archive size" (.size jar) 21)
     (check "archive string" (.toString jar) "jolt-embedded-resources.jar")
     (check "entry constructors"
            (mapv #(.getName %)
@@ -120,7 +159,8 @@
     (check "multi release" (.isMultiRelease jar) true)
     (check "runtime version" (str (.getVersion jar)) "8")
     (check "base version" (str (java.util.jar.JarFile/baseVersion)) "8")
-    (check "current version" (str (java.util.jar.JarFile/runtimeVersion)) "21")
+    (check "current version" (str (java.util.jar.JarFile/runtimeVersion)) (System/getProperty "java.specification.version"))
+    (check "manifest cached" (identical? manifest (.getManifest jar)) true)
     (check "default selected content" (slurp (.getInputStream jar entry)) "embedded resource ok\n")
     (check "entry real name" (.getRealName entry) "greeting.txt")
     (check "entry attributes" (.getValue (.getAttributes entry) "X-Entry") "yes")
@@ -131,13 +171,14 @@
                  (filter #(.startsWith (.getName %) "META-INF/versions/")
                          (iterator-seq (.iterator (.stream jar)))))
            ["META-INF/versions/" "META-INF/versions/17/" "META-INF/versions/17/greeting.txt"
+            "META-INF/versions/7/" "META-INF/versions/7/below7.txt"
             "META-INF/versions/8/" "META-INF/versions/8/below.txt"
             "META-INF/versions/9/" "META-INF/versions/9/greeting.txt"
             "META-INF/versions/9/notgreeting.txt" "META-INF/versions/9/only.txt"])
     (check "versioned stream"
            (mapv #(.getName %) (iterator-seq (.iterator (.versionedStream jar))))
-           ["META-INF/" "META-INF/MANIFEST.MF" "data.bin" "greeting.txt" "latin1-lines.bin"
-            "migrations/" "migrations/001-create-users.up.sql"])
+           ["META-INF/" "META-INF/MANIFEST.MF" "data.bin" "encoded/" "encoded/001 my café;v=1.sql"
+            "greeting.txt" "latin1-lines.bin" "migrations/" "migrations/001-create-users.up.sql" "plain.txt"])
     (doseq [[version expected] [["8" "embedded resource ok\n"]
                                 ["9" "version 9\n"]
                                 ["17" "version 17\n"]
@@ -153,9 +194,10 @@
         (check (str "version only " version)
                (some-> (.getJarEntry versioned "only.txt") (#(slurp (.getInputStream versioned %))))
                (when-not (= version "8") "version only\n"))
-        (check (str "below nine selection " version)
+        (check (str "base version selection " version)
                (some-> (.getJarEntry versioned "below.txt") (#(slurp (.getInputStream versioned %))))
                (when-not (= version "8") "below nine\n"))
+        (check (str "below base version ignored " version) (.getJarEntry versioned "below7.txt") nil)
         (check (str "version value " version) (str (.getVersion versioned)) version)
         (.close versioned)))
     (doseq [archive [(java.util.jar.JarFile. "jolt-embedded-resources.jar" true)
@@ -201,9 +243,11 @@
     (let [attrs (java.util.jar.Attributes.)]
       (check "empty attributes" (.isEmpty attrs) true)
       (.putValue attrs "A" "one")
-      (.put attrs "B" "two")
-      (check "attribute get" (.get attrs "A") "one")
-      (check "attribute contains key" (.containsKey attrs "A") true)
+      (.put attrs (java.util.jar.Attributes$Name. "B") "two")
+      (expect-throw "attribute put needs a Name" java.lang.ClassCastException #(.put attrs "B" "two"))
+      (check "attribute get by string" (.get attrs "A") nil)
+      (check "attribute get" (.get attrs (java.util.jar.Attributes$Name. "a")) "one")
+      (check "attribute contains key" (.containsKey attrs (java.util.jar.Attributes$Name. "A")) true)
       (check "attribute contains value" (.containsValue attrs "one") true)
       (check "attribute size" (.size attrs) 2)
       (check "attribute keys" (count (.keySet attrs)) 2)
@@ -214,14 +258,14 @@
             a-name (java.util.jar.Attributes$Name. "A")]
         (check "attribute key type" (every? #(instance? java.util.jar.Attributes$Name %) (seq keys)) true)
         (check "attribute backed key view" (.remove keys a-name) true)
-        (check "attribute view removed from map" (.get attrs "A") nil)
+        (check "attribute view removed from map" (.getValue attrs "A") nil)
         (check "attribute backed key size" (.size keys) 1))
       (let [copy (.clone attrs)]
-        (.putAll copy {"C" "three"})
+        (.putAll copy (doto (java.util.jar.Attributes.) (.putValue "C" "three")))
         (check "attribute putAll" (.getValue copy "C") "three")
         (check "attribute clone equality" (= copy attrs) false)
-        (.remove copy "B")
-        (check "attribute remove" (.get copy "B") nil)
+        (.remove copy (java.util.jar.Attributes$Name. "B"))
+        (check "attribute remove" (.getValue copy "B") nil)
         (.clear copy)
         (check "attribute clear" (.isEmpty copy) true))
       (.clear attrs))
@@ -381,7 +425,7 @@
            :read-only)
     (let [principals (.getUserPrincipalLookupService fs)]
       (check "principal lookup"
-             (try (.lookupUserPrincipalByName principals "nobody") :not-rejected
+             (try (.lookupPrincipalByName principals "nobody") :not-rejected
                   (catch java.lang.UnsupportedOperationException _ :unsupported))
              :unsupported))
     (let [key (.register path watch (make-array java.nio.file.WatchEvent$Kind 0))]
@@ -514,7 +558,8 @@
            :read-only)
     (expect-throw "host to embedded destination" java.nio.file.ReadOnlyFileSystemException
                   #(java.nio.file.Files/copy host-destination missing))
-    (expect-throw "host to existing embedded destination" java.nio.file.ReadOnlyFileSystemException
+    ;; a copy across providers checks the target first (CopyMoveHelper)
+    (expect-throw "host to existing embedded destination" java.nio.file.FileAlreadyExistsException
                   #(java.nio.file.Files/copy host-destination path))
     (expect-throw "stream to embedded destination" java.nio.file.ReadOnlyFileSystemException
                   #(java.nio.file.Files/copy (java.io.ByteArrayInputStream. (.getBytes "x" "UTF-8")) missing))
@@ -592,9 +637,16 @@
                                 (.getRealName (.getJarEntry versioned "greeting.txt"))
                                 (some-> (.getJarEntry versioned "only.txt")
                                         (#(slurp (.getInputStream versioned %))))
-                                (some? (.getJarEntry versioned "below.txt"))]))
+                                (some? (.getJarEntry versioned "below.txt"))
+                                (some? (.getJarEntry versioned "below7.txt"))
+                                (mapv #(.getName %) (iterator-seq (.iterator (.versionedStream versioned))))]))
                            ["8" "9" "17" "22"])]
         (prn {:default-content (slurp (.getInputStream jar (.getJarEntry jar "greeting.txt")))
+              :manifest-cached (identical? manifest (.getManifest jar))
+              :resources (mapv #(when-let [url (io/resource %)]
+                                  (let [s (str url)] [(subs s (+ 2 (.indexOf s "!/"))) (slurp url)]))
+                               ["greeting.txt" "only.txt" "below.txt" "below7.txt" "plain.txt"
+                                "encoded/001 my café;v=1.sql" "encoded/"])
               :base-version (str (java.util.jar.JarFile/baseVersion))
               :multi-release (.isMultiRelease jar)
               :versioned-names (mapv #(.getName %) (iterator-seq (.iterator (.versionedStream jar))))
@@ -607,6 +659,7 @@
 (defn -main [& args]
   (case (first args)
     "--url" (url-test)
+    "--resource-url" (resource-url-test)
     "--jar-full" (jar-full-test)
     "--fs-full" (fs-full-test)
     "--files-full" (files-full-test)
