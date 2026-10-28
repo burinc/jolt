@@ -119,15 +119,21 @@
                              (begin (cd-call self "add" (->num k) (car xs)) (loop (cdr xs) (fx+ k 1)))))))))
 
 ;; A ListIterator over any List, through its get / set / add / remove, so it is
-;; live as AbstractList's is. State #(list cursor last-returned); last-returned
-;; is -1 when nothing may be removed or set. Each tag is one JDK class.
+;; live as AbstractList's is. State #(list cursor last-returned expected);
+;; last-returned is -1 when nothing may be removed or set, and expected is the
+;; list's modCount when it keeps one (jutil-modcount), checked as
+;; AbstractList.ListItr checks it. Each tag is one JDK class.
 (define (cd-list-iterator-tag lst)
   (let ((c (guard (e (#t #f)) (jolt-class-name lst))))
     (cond ((equal? c "java.util.ArrayList") "cd-arraylist-listitr")
           ((member c '("java.util.Vector" "java.util.Stack")) "cd-vector-listitr")
           (else "cd-abstractlist-listitr"))))
 (define (make-cd-list-iterator lst i)
-  (make-jhost (cd-list-iterator-tag lst) (vector lst i -1)))
+  (make-jhost (cd-list-iterator-tag lst) (vector lst i -1 (jutil-modcount lst))))
+(define (cdi-check! it)
+  (let ((e (vector-ref (jhost-state it) 3)))
+    (when (and e (not (eqv? e (jutil-modcount (cdi-list it))))) (jutil-cme!))))
+(define (cdi-resync! it) (vector-set! (jhost-state it) 3 (jutil-modcount (cdi-list it))))
 (define (cdi-list it) (vector-ref (jhost-state it) 0))
 (define (cdi-cursor it) (vector-ref (jhost-state it) 1))
 (define (cdi-cursor! it i) (vector-set! (jhost-state it) 1 i))
@@ -139,12 +145,14 @@
   (list
     (cons "hasNext" (lambda (self) (fx<? (cdi-cursor self) (cd-size (cdi-list self)))))
     (cons "next" (lambda (self)
+                   (cdi-check! self)
                    (let ((i (cdi-cursor self)))
                      (unless (fx<? i (cd-size (cdi-list self))) (throw-jvm 'NoSuchElementException jolt-nil))
                      (cdi-cursor! self (fx+ i 1)) (cdi-last! self i)
                      (cd-get (cdi-list self) i))))
     (cons "hasPrevious" (lambda (self) (fx>? (cdi-cursor self) 0)))
     (cons "previous" (lambda (self)
+                       (cdi-check! self)
                        (let ((i (fx- (cdi-cursor self) 1)))
                          (when (fx<? i 0) (throw-jvm 'NoSuchElementException jolt-nil))
                          (cdi-cursor! self i) (cdi-last! self i)
@@ -153,16 +161,21 @@
     (cons "previousIndex" (lambda (self) (->num (fx- (cdi-cursor self) 1))))
     (cons "remove" (lambda (self)
                      (cdi-need-last self)
+                     (cdi-check! self)
                      (cd-call (cdi-list self) "remove" (->num (cdi-last self)))
                      (when (fx<? (cdi-last self) (cdi-cursor self)) (cdi-cursor! self (fx- (cdi-cursor self) 1)))
                      (cdi-last! self -1)
+                     (cdi-resync! self)
                      jolt-nil))
     (cons "set" (lambda (self x)
                   (cdi-need-last self)
+                  (cdi-check! self)
                   (cd-call (cdi-list self) "set" (->num (cdi-last self)) x)
                   jolt-nil))
     (cons "add" (lambda (self x)
+                  (cdi-check! self)
                   (cd-call (cdi-list self) "add" (->num (cdi-cursor self)) x)
+                  (cdi-resync! self)
                   (cdi-cursor! self (fx+ (cdi-cursor self) 1))
                   (cdi-last! self -1)
                   jolt-nil))
@@ -191,8 +204,13 @@
 
 ;; subList: a live window onto its list, as AbstractList's SubList is — reads and
 ;; writes go through the parent at the offset, and a structural change made
-;; through it moves its end. State #(parent offset size). Each tag is one JDK
-;; class, by the parent's.
+;; through it moves its end. When the root list keeps a modCount the window
+;; remembers it: a structural change made to the root any other way makes
+;; every use of the window a ConcurrentModificationException, and one made
+;; through the window (or a window inside it) carries the new count and size up
+;; to each window it sits in, as the JDK's updateSizeAndModCount does.
+;; State #(root offset size expected outer-window). Each tag is one JDK class,
+;; by the root's.
 (define (cd-sublist-tag lst)
   (let ((c (guard (e (#t #f)) (jolt-class-name lst))))
     (cond ((equal? c "java.util.ArrayList") "cd-arraylist-sublist")
@@ -200,52 +218,75 @@
           (else "cd-sublist"))))
 (define (make-cd-sublist lst from to)
   (cd-range-check! from to (cd-size lst))
-  (make-jhost (cd-sublist-tag lst) (vector lst from (fx- to from))))
+  (make-jhost (cd-sublist-tag lst) (vector lst from (fx- to from) (jutil-modcount lst) #f)))
 (define (cds-parent s) (vector-ref (jhost-state s) 0))
 (define (cds-off s) (vector-ref (jhost-state s) 1))
 (define (cds-n s) (vector-ref (jhost-state s) 2))
 (define (cds-n! s n) (vector-set! (jhost-state s) 2 n))
+(define (cds-st s) (jhost-state s))
+(define (cds-expected s) (let ((st (cds-st s))) (and (fx>? (vector-length st) 3) (vector-ref st 3))))
+(define (cds-outer s) (let ((st (cds-st s))) (and (fx>? (vector-length st) 4) (vector-ref st 4))))
+(define (cds-check! s)
+  (let ((e (cds-expected s)))
+    (when (and e (not (eqv? e (jutil-modcount (cds-parent s))))) (jutil-cme!))))
+;; after a structural change made through S: S and each window holding it take
+;; the size change and the root's new count
+(define (cds-moved! s delta)
+  (let loop ((w s))
+    (when w
+      (cds-n! w (fx+ (cds-n w) delta))
+      (when (cds-expected w) (vector-set! (cds-st w) 3 (jutil-modcount (cds-parent w))))
+      (loop (cds-outer w)))))
 (define (cds-elems s)
+  (cds-check! s)
   (let ((p (cds-parent s)) (o (cds-off s)))
     (let loop ((i (fx- (cds-n s) 1)) (acc '()))
       (if (fx<? i 0) acc (loop (fx- i 1) (cons (cd-get p (fx+ o i)) acc))))))
 (define cd-sublist-methods
   (list
-    (cons "size" (lambda (self) (->num (cds-n self))))
+    (cons "size" (lambda (self) (cds-check! self) (->num (cds-n self))))
     (cons "get" (lambda (self i)
-                  (let ((i (jnum->exact i))) (cd-index-check! i (cds-n self))
+                  (let ((i (jnum->exact i))) (cd-index-check! i (cds-n self)) (cds-check! self)
                     (cd-get (cds-parent self) (fx+ (cds-off self) i)))))
     (cons "set" (lambda (self i x)
-                  (let ((i (jnum->exact i))) (cd-index-check! i (cds-n self))
+                  (let ((i (jnum->exact i))) (cd-index-check! i (cds-n self)) (cds-check! self)
                     (cd-call (cds-parent self) "set" (->num (fx+ (cds-off self) i)) x))))
     (cons "add" (case-lambda
-                  ((self x) (cd-call (cds-parent self) "add" (->num (fx+ (cds-off self) (cds-n self))) x)
-                            (cds-n! self (fx+ (cds-n self) 1)) #t)
+                  ((self x) (cds-check! self)
+                            (cd-call (cds-parent self) "add" (->num (fx+ (cds-off self) (cds-n self))) x)
+                            (cds-moved! self 1) #t)
                   ((self i x)
                    (let ((i (jnum->exact i)))
                      (unless (and (fx>=? i 0) (fx<=? i (cds-n self)))
                        (throw-jvm 'IndexOutOfBoundsException (string-append "Index: " (number->string i))))
+                     (cds-check! self)
                      (cd-call (cds-parent self) "add" (->num (fx+ (cds-off self) i)) x)
-                     (cds-n! self (fx+ (cds-n self) 1))
+                     (cds-moved! self 1)
                      jolt-nil))))
     (cons "remove" (lambda (self x)
-                     ;; remove(int) by position; remove(Object) is the first equal
+                     ;; remove(int) by position (the index is checked before the
+                     ;; count, as SubList checks it); remove(Object) is the first equal
                      (if (and (fixnum? x) (not (jfloat? x)))
-                         (let ((i x)) (cd-index-check! i (cds-n self))
+                         (let ((i x)) (cd-index-check! i (cds-n self)) (cds-check! self)
                            (let ((old (cd-call (cds-parent self) "remove" (->num (fx+ (cds-off self) i)))))
-                             (cds-n! self (fx- (cds-n self) 1)) old))
-                         (let ((i (cd-index-of self x)))
+                             (cds-moved! self -1) old))
+                         (let ((i (begin (cds-check! self) (cd-index-of self x))))
                            (if (fx<? i 0) #f
                                (begin (cd-call (cds-parent self) "remove" (->num (fx+ (cds-off self) i)))
-                                      (cds-n! self (fx- (cds-n self) 1)) #t))))))
+                                      (cds-moved! self -1) #t))))))
     (cons "clear" (lambda (self)
-                    (do ((k 0 (fx+ k 1))) ((fx=? k (cds-n self)))
-                      (cd-call (cds-parent self) "remove" (->num (cds-off self))))
-                    (cds-n! self 0) jolt-nil))
+                    (cds-check! self)
+                    (let ((n (cds-n self)))
+                      (do ((k 0 (fx+ k 1))) ((fx=? k n))
+                        (cd-call (cds-parent self) "remove" (->num (cds-off self))))
+                      (cds-moved! self (fx- 0 n)))
+                    jolt-nil))
+    ;; made without a check: the window inside reports a change on first use
     (cons "subList" (lambda (self from to)
                       (let ((from (jnum->exact from)) (to (jnum->exact to)))
                         (cd-range-check! from to (cds-n self))
-                        (make-jhost (jhost-tag self) (vector (cds-parent self) (fx+ (cds-off self) from) (fx- to from))))))))
+                        (make-jhost (jhost-tag self) (vector (cds-parent self) (fx+ (cds-off self) from) (fx- to from)
+                                                             (cds-expected self) self)))))))
 (for-each (lambda (p)
             (hashtable-set! jhost-tag->fqn (car p) (cadr p))
             (register-host-methods! (car p) cd-sublist-methods)
@@ -261,6 +302,10 @@
   (and (jhost? x) (member (jhost-tag x) '("cd-arraylist-sublist" "cd-ra-sublist" "cd-sublist")) #t))
 (register-seq-arm-last! cd-sublist? (lambda (x) (let ((xs (cds-elems x))) (if (null? xs) jolt-nil (list->cseq xs)))))
 (register-count-arm-last! cd-sublist? (lambda (x) (cds-n x)))
+;; a window's modCount is its root's: an iterator over it sees a change made
+;; through the window or to the root
+(for-each (lambda (t) (register-modcount! t (lambda (s) (jutil-modcount (cds-parent s)))))
+          '("cd-arraylist-sublist" "cd-ra-sublist" "cd-sublist"))
 
 ;; ---- Map -------------------------------------------------------------------------------
 (define cd-absent (list 'cd-absent))

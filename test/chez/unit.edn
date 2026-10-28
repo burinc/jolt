@@ -3881,4 +3881,8 @@
   ;; (jolt-lang/time fills them in); core carries ROOT's, and no narrow or
   ;; standalone table of its own (jolt-3iw73)
   {:suite "enum model / java.time" :expr "(let [d (jolt.host/extension-value :date-names \"\") f (jolt.host/extension-value :field-names \"\")] [(:months-narrow d) (:days-short-standalone d) (get (:names f) \"DAY_OF_WEEK\") (get (:names f) \"YEAR\") (count (:names f))])" :expected "[nil nil \"Day of the Week\" nil 6]"}
+  ;; (seq an-iterator) is a jolt superset (the JVM throws); every registered
+  ;; iterator answers it, ArrayDeque's included (their tags lacked the jx- prefix
+  ;; the registry looks for, so seq and iterator-seq over them threw)
+  {:suite "java.util / iterators" :expr "[(seq (.iterator (java.util.ArrayDeque. [1 2]))) (seq (.descendingIterator (java.util.ArrayDeque. [1 2 3]))) (seq (.iterator (java.util.ArrayDeque.))) (let [it (.iterator (java.util.ArrayDeque. [1 2 3]))] (.next it) (seq it))]" :expected "[(1 2) (3 2 1) nil (2 3)]"}
 ]

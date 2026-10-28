@@ -82,8 +82,12 @@
     ((ralist list) (apply jolt-vector (jutil-coll-elems x)))
     (else x)))
 (define (jutil-plain x) (if (jutil-equiv-coll? x) (jutil-coll->persistent x) x))
+;; An IdentityHashMap compares by reference, which the plain copies below would
+;; lose: its own rule answers (jutil-concurrent.ss sets this).
+(define jutil-identity-map? (lambda (x) #f))
 (define (jutil-equals? a b)
-  (cond ((or (eq? (jutil-any-kind a) 'entry) (eq? (jutil-any-kind b) 'entry))
+  (cond ((or (jutil-identity-map? a) (jutil-identity-map? b)) (jolt=2 a b))
+        ((or (eq? (jutil-any-kind a) 'entry) (eq? (jutil-any-kind b) 'entry))
          (jutil-entry-equals? a b))
         ((jolt=2 (jutil-plain a) (jutil-plain b)) #t)
         (else #f)))
@@ -232,17 +236,29 @@
 ;; class (classes follow tags); register-jutil-iterator! declares one.
 ;; State: #(remaining last remove! project)
 (define jutil-iterator-none (list 'none))
+;; ---- modCount ----------------------------------------------------------------
+;; The lists that count structural changes (ArrayList, LinkedList, Vector)
+;; register how to read the count, so the code they share — subList, the
+;; spliterators, a stream's source — can watch any of them the same way.
+;; jutil-modcount answers the count, or #f for a list that keeps none.
+(define jutil-modcount-tbl (make-hashtable string-hash string=?))
+(define (register-modcount! tag f) (hashtable-set! jutil-modcount-tbl tag f))
+(define (jutil-modcount x)
+  (and (jhost? x) (let ((f (hashtable-ref jutil-modcount-tbl (jhost-tag x) #f))) (and f (f x)))))
+(define (jutil-cme!) (throw-jvm 'ConcurrentModificationException jolt-nil))
+
 (define (make-jutil-iterator tag items remove! . project)
   (make-jhost tag (vector items jutil-iterator-none remove!
                           (if (pair? project) (car project) (lambda (x) x)))))
+(define (jutil-iterator-next self)
+  (let* ((st (jhost-state self)) (xs (vector-ref st 0)))
+    (when (null? xs) (throw-jvm 'NoSuchElementException jolt-nil))
+    (vector-set! st 0 (cdr xs))
+    (vector-set! st 1 (car xs))
+    ((vector-ref st 3) (car xs))))
 (define jutil-iterator-methods
   (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 0))))
-        (cons "next" (lambda (self)
-                       (let* ((st (jhost-state self)) (xs (vector-ref st 0)))
-                         (when (null? xs) (throw-jvm 'NoSuchElementException jolt-nil))
-                         (vector-set! st 0 (cdr xs))
-                         (vector-set! st 1 (car xs))
-                         ((vector-ref st 3) (car xs)))))
+        (cons "next" jutil-iterator-next)
         (cons "remove" (lambda (self)
                          (let* ((st (jhost-state self)) (x (vector-ref st 1)))
                            (when (eq? x jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
@@ -257,9 +273,17 @@
                                      jolt-nil)))))
 (define jutil-iterator-tags '())
 (define (jutil-iterator? x) (and (jhost? x) (member (jhost-tag x) jutil-iterator-tags) #t))
+(define (jutil-iterator-fill it buf)
+  (let* ((st (jhost-state it)) (project (vector-ref st 3)))
+    (let loop ((j 0) (xs (vector-ref st 0)) (last (vector-ref st 1)))
+      (if (or (fx=? j 32) (null? xs))
+          (begin (vector-set! st 0 xs) (vector-set! st 1 last) j)
+          (begin (vector-set! buf j (project (car xs)))
+                 (loop (fx+ j 1) (cdr xs) (car xs)))))))
 (define (register-jutil-iterator! tag)
   (set! jutil-iterator-tags (cons tag jutil-iterator-tags))
-  (register-host-methods! tag jutil-iterator-methods))
+  (register-host-methods! tag jutil-iterator-methods)
+  (register-iterator-seq-fill! (list tag) jutil-iterator-fill jutil-iterator-next))
 ;; (iterator-seq it) / (seq it): what the iterator has not handed out yet
 (register-seq-arm! jutil-iterator?
   (lambda (it)

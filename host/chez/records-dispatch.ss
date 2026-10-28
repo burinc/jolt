@@ -17,6 +17,62 @@
 ;; cur, so seq just yields it — clojure.test's (iterator-seq (.iterator coll)).
 (register-seq-arm! jiterator? jiterator-cur)
 
+;; iterator-seq is RT.chunkIteratorSeq: hasNext is asked when the seq is made,
+;; and each realization pulls up to 32 through next() — hasNext before the
+;; count, as the JDK loop reads them — then asks hasNext again for the rest. So
+;; a fail-fast iterator throws when the seq is walked after a change, not when
+;; it is made. A jhost iterator's two methods are looked up once per seq; any
+;; other goes through the dispatcher. A SeqIterator walks an immutable seq, so
+;; it hands that seq over as it stands: the same elements, no copy.
+;;
+;; A host iterator whose hasNext / next run no code of the caller's can fill a
+;; chunk in one step (register-iterator-seq-fill!): (fill it buf) does what up
+;; to 32 rounds of the loop would, answering the count, or #f when its state is
+;; one only the loop itself answers right (a change under it, a cursor past the
+;; end), and the loop runs instead. NEXT is the next method the fill stands for:
+;; a tag whose next is some other method by now (a subclass's) gets the loop.
+(define iterator-seq-fills '())
+(define (register-iterator-seq-fill! tags fill next)
+  (for-each (lambda (t) (set! iterator-seq-fills (cons (list t fill next) iterator-seq-fills))) tags))
+(define (iterator-seq-method it name)
+  (or (and (jhost? it) (host-method-ref (jhost-tag it) name))
+      (lambda (self) (record-method-dispatch self name (jolt-vector)))))
+;; A chunk's cells, each already linked to the next as list->cseq's are: the
+;; elements are in hand, so a walk has nothing to compute until the chunk ends,
+;; where the last cell's tail follows from its fields into MORE.
+(define (iterator-seq-chunk v more)
+  (let ((chunk (make-pvec v)))
+    (let loop ((i (fx- (vector-length v) 1)) (next #f))
+      (let ((c (make-cseqv (vector-ref v i) next sk-chunked-cons jolt-nil chunk i more)))
+        (if (fx=? i 0) c (loop (fx- i 1) c))))))
+(define (jolt-iterator-seq it)
+  (cond
+    ((jiterator? it) (jolt-seq (jiterator-cur it)))
+    ;; anything that cannot be an Iterator — a jolt collection, nil — seqs as
+    ;; itself: the documented superset (the JVM raises ClassCastException)
+    ((not (or (jhost? it) (jreify? it) (jrec? it))) (jolt-seq it))
+    (else
+      (let* ((has-next? (iterator-seq-method it "hasNext"))
+             (next (iterator-seq-method it "next"))
+            (fill (let ((e (and (jhost? it) (assoc (jhost-tag it) iterator-seq-fills))))
+                    (and e (eq? (caddr e) next) (cadr e)))))
+        (let chunks ()
+          (if (jolt-truthy? (has-next? it))
+              (jolt-make-lazy-seq
+                (lambda ()
+                  (let* ((buf (make-vector 32))
+                         (n (or (and fill (fill it buf))
+                                (let loop ((n 0))
+                                  (if (and (jolt-truthy? (has-next? it)) (fx<? n 32))
+                                      (begin (vector-set! buf n (next it)) (loop (fx+ n 1)))
+                                      n))))
+                         (more (chunks)))
+                    (if (fx=? n 0)
+                        more
+                        (iterator-seq-chunk (if (fx=? n 32) buf (sa-subvector buf 0 n)) more)))))
+              jolt-nil))))))
+(def-var! "clojure.core" "iterator-seq" jolt-iterator-seq)
+
 ;; A Chez condition's message: "who: text", where text is the &message template
 ;; with each ~s / ~a directive filled by the matching irritant printed as a jolt
 ;; value — "string-append: nil is not a string", not "#[jolt-nil-v1] is not a

@@ -27,14 +27,19 @@
 ;; for an iterator; count / contains / get are #f where Clojure's fn does not
 ;; apply (a List has no contains?, a Set no get).
 (define jx-ops-tbl (make-hashtable string-hash string=?))
+(define (jx-tag? t)
+  (and (fx>? (string-length t) 3)
+       (char=? (string-ref t 0) #\j) (char=? (string-ref t 1) #\x) (char=? (string-ref t 2) #\-)))
 (define (jx-ops x)
   (and (jhost? x)
        (let ((t (jhost-tag x)))
-         (and (fx>? (string-length t) 3)
-              (char=? (string-ref t 0) #\j) (char=? (string-ref t 1) #\x) (char=? (string-ref t 2) #\-)
-              (hashtable-ref jx-ops-tbl t #f)))))
+         (and (jx-tag? t) (hashtable-ref jx-ops-tbl t #f)))))
 (define (jx-kind x) (let ((o (jx-ops x))) (and o (vector-ref o 0))))
+;; jx-ops only looks a tag up when it starts "jx-", so a tag without the prefix
+;; would register and then never answer (ArrayDeque's iterators did, and
+;; iterator-seq over one threw). Refuse it here, at load.
 (define (jx-register! tag kind elems count contains get)
+  (unless (jx-tag? tag) (error 'jx-register! "a jx tag must start \"jx-\"" tag))
   (hashtable-set! jx-ops-tbl tag (vector kind count elems contains get))
   (unless (eq? kind 'iter) (register-jutil-coll! tag kind elems)))
 (define (jx-class! tag fqn . supers)

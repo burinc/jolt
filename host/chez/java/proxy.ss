@@ -66,7 +66,7 @@
 ;; full names (a protocol's key is ns/Name, not a class) and IObj
 (set! reify-class-graph-hook
   (lambda (name ifaces)
-    (jch-register-supers! name (append (map (lambda (i) (if (memv #\. (string->list i)) i (jch-fqn-of-simple i)))
+    (jch-register-leaf! name (append (map (lambda (i) (if (memv #\. (string->list i)) i (jch-fqn-of-simple i)))
                                             (filter (lambda (i) (not (memv #\/ (string->list i)))) ifaces))
                                        '("clojure.lang.IObj")))))
 
@@ -88,7 +88,7 @@
   (and (pair? names)
        (or (and (reify-delegate p) #t)
            (let ((f (proxy-fqn (car names))))
-             (and (not (jch-interface? f)) (pair? (jch-direct-supers f)))))))
+             (and (not (jch-interface? f)) (or (pair? (jch-direct-supers f)) (jch-jdk-class? f)))))))
 (define (proxy-class-name ns names class?)
   (let ((key (cons ns names)))
     (or (hashtable-ref proxy-class-names key #f)
@@ -109,7 +109,7 @@
                                     (map (lambda (n) (string-append "$" (simple n))) sorted)
                                     (list "$" (jolt-hex32 (jolt-hash inames)))))))
           ;; the JDK lists IProxy first among the interfaces
-          (jch-register-supers! name (cons super (cons "clojure.lang.IProxy" ifaces)))
+          (jch-register-leaf! name (cons super (cons "clojure.lang.IProxy" ifaces)))
           (jolt-with-mutex proxy-class-names-mu (hashtable-set! proxy-class-names key name))
           name))))
 ;; A proxy records the ns its form is in (as #(ns) in its cname field); the class

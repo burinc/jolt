@@ -578,7 +578,9 @@
 (define (hasheq-caches)
   (let ((c (virtual-register jolt-vreg-hasheq-caches)))
     (if (eq? c 0)
-        (let ((v (cons (make-weak-eq-hashtable) (make-eq-hashtable))))
+        ;; both weak: the string cache must not keep a string alive (a
+        ;; WeakHashMap keyed by a string would never lose the entry)
+        (let ((v (cons (make-weak-eq-hashtable) (make-weak-eq-hashtable))))
           (set-virtual-register! jolt-vreg-hasheq-caches v)
           v)
         c)))

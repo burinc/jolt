@@ -2433,6 +2433,63 @@
 
 (register-seq-arm! jiterator? jiterator-cur)
 
+(define iterator-seq-fills '())
+
+(define (register-iterator-seq-fill! tags fill next)
+  (for-each
+    (lambda (t)
+      (set! iterator-seq-fills
+        (cons (list t fill next) iterator-seq-fills)))
+    tags))
+
+(define (iterator-seq-method it name)
+  (or (and (jhost? it) (host-method-ref (jhost-tag it) name))
+      (lambda (self)
+        (record-method-dispatch self name (jolt-vector)))))
+
+(define (iterator-seq-chunk v more)
+  (let ((chunk (make-pvec v)))
+    (let loop ((i (fx- (vector-length v) 1)) (next #f))
+      (let ((c (make-cseqv (vector-ref v i) next sk-chunked-cons
+                 jolt-nil chunk i more)))
+        (if (fx=? i 0) c (loop (fx- i 1) c))))))
+
+(define (jolt-iterator-seq it)
+  (cond
+    ((jiterator? it) (jolt-seq (jiterator-cur it)))
+    ((not (or (jhost? it) (jreify? it) (jrec? it)))
+     (jolt-seq it))
+    (else
+     (let* ((has-next? (iterator-seq-method it "hasNext"))
+            (next (iterator-seq-method it "next"))
+            (fill (let ((e (and (jhost? it)
+                                (assoc
+                                  (jhost-tag it)
+                                  iterator-seq-fills))))
+                    (and e (eq? (caddr e) next) (cadr e)))))
+       (let chunks ()
+         (if (jolt-truthy? (has-next? it))
+             (jolt-make-lazy-seq
+               (lambda ()
+                 (let* ((buf (make-vector 32))
+                        (n (or (and fill (fill it buf))
+                               (let loop ((n 0))
+                                 (if (and (jolt-truthy? (has-next? it))
+                                          (fx<? n 32))
+                                     (begin
+                                       (vector-set! buf n (next it))
+                                       (loop (fx+ n 1)))
+                                     n))))
+                        (more (chunks)))
+                   (if (fx=? n 0)
+                       more
+                       (iterator-seq-chunk
+                         (if (fx=? n 32) buf (sa-subvector buf 0 n))
+                         more)))))
+             jolt-nil))))))
+
+(def-var! "clojure.core" "iterator-seq" jolt-iterator-seq)
+
 (define (condition->message-string c)
   (if (message-condition? c)
       (let* ((m (condition-message c))

@@ -19,7 +19,7 @@
 
 ;; ---- HashMap, its look-alikes, Properties and HashSet ---------------------------
 ;; header #(tag defaults); a Properties keeps its defaults, not System's writethrough
-(register-image-codec! "java.util.HashMap" '("hashmap" "properties" "chm")
+(register-image-codec! "java.util.HashMap" '("hashmap" "properties" "chm" "jx-weak-hashmap" "jx-identity-hashmap")
   (lambda (m)
     (vector (vector (jhost-tag m) (or (and (string=? (jhost-tag m) "properties") (props-defaults m)) jolt-nil))
             (codec-kvs (map (lambda (k) (cons k (hashtable-ref (hm-tbl m) k jolt-nil))) (hm-keys-ordered m)))))
@@ -27,7 +27,11 @@
     (if (string=? (vector-ref h 0) "properties")
         (make-jhost "properties" (vector (make-hashtable hm-hash jolt=2) '()
                                          (if (jolt-nil? (vector-ref h 1)) #f (vector-ref h 1)) #f))
-        (make-jhost (vector-ref h 0) (vector (make-hashtable hm-hash jolt=2) '()))))
+        ;; each map's own kind of table: weak keys, identity keys, or equality
+        (let ((tag (vector-ref h 0)))
+          (cond ((string=? tag "jx-weak-hashmap") (make-jhost tag (vector (make-weak-hashtable hm-hash jolt=2) (list 'v))))
+                ((string=? tag "jx-identity-hashmap") (make-jhost tag (vector (make-eq-hashtable) '())))
+                (else (make-jhost tag (vector (make-hashtable hm-hash jolt=2) '())))))))
   (lambda (m items)
     (codec-each-kv! items (lambda (k v) (hm-note-key! m k) (hashtable-set! (hm-tbl m) k v)))))
 (register-image-codec! "java.util.HashSet" '("hashset")
@@ -206,7 +210,7 @@
     "treemap-entry")
   "it is a view of another collection, which the image would have to share; write the collection itself")
 (register-image-refusal!
-  '("arraylist-iterator" "linkedlist-iterator" "arraydeque-iterator" "arrays-aslist-iterator"
+  '("arraylist-iterator" "arraylist-listitr" "linkedlist-iterator" "linkedlist-desc-iterator" "arrays-aslist-iterator"
     "immutable-list-iterator" "hashset-iterator" "lhs-iterator" "lhm-keyset-iterator" "lhm-values-iterator" "lhm-entryset-iterator"
     "enum-set-regular-iterator" "enum-set-jumbo-iterator" "enum-map-keyset-iterator"
     "enum-map-values-iterator" "enum-map-entryset-iterator"
