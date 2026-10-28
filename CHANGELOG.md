@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A built binary's resources read as a jar (#1438).** `io/resource` and
+  `ClassLoader.getResource(s)` answer `jar:file:jolt-embedded-resources.jar!/…`
+  URLs for files and directories, with the JDK's percent-encoding and, in a
+  multi-release archive, the entry the runtime version selects.
+  `java.util.jar.JarFile` lists, reads and version-selects the entries,
+  `FileSystems/newFileSystem` opens them as a read-only `jar` file system, and
+  `(jolt.host/embedded-resource-names)` lists them, so migration scanners such
+  as Migratus work inside a binary. `java.util.jar.Manifest`, `Attributes` and
+  `Attributes.Name` read and write as the JDK's do.
+- **`java.nio.file.Files` dispatches to the path's file system provider.** The
+  host file system now answers `readString`, `lines`, `list`, `walk`, `find`,
+  `newBufferedReader`, `newBufferedWriter`, `writeString`, `newByteChannel`,
+  `mismatch`, `probeContentType`, `getFileStore`, `getFileAttributeView` and
+  `setOwner`; text reads decode strictly, as the JDK's do.
 - **`java.util.Spliterator`.** Every collection answers `spliterator()` with
   the JDK's class, characteristics, size and comparator: array-backed ones split
   at the midpoint, iterator-backed ones by batches, and `spliteratorUnknownSize`
@@ -106,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`java.version` and `java.specification.version` report 21**, the JDK jolt's
+  oracle certifies against, and so do `Runtime/version` and
+  `JarFile/runtimeVersion`. They answered `nil` before.
+- `Files/readAllLines` splits on `\r` as well as `\n` and `\r\n`, and raises
+  `MalformedInputException` on bytes its charset cannot decode.
 - **A HashMap's `keySet`, `values` and `entrySet` are live views**
   (`HashMap$KeySet` / `$Values` / `$EntrySet`): removing through one removes
   from the map, a later put shows through, an entry's `setValue` writes the map
