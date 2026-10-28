@@ -112,7 +112,8 @@
     (check "multi-release entry name" (.getEntryName (.openConnection greeting))
            "META-INF/versions/17/greeting.txt"))
   (check "below base version never selected" (io/resource "below7.txt") nil)
-  (check "empty resource name" (io/resource "") nil)
+  ;; nothing in the archive answers the empty name (a source root on disk may)
+  (check "empty resource name" (= "jar" (some-> (io/resource "") .getProtocol)) false)
   (check "runtime version is the reported Java version"
          [(str (java.util.jar.JarFile/runtimeVersion)) (str (.feature (Runtime/version)))]
          [(System/getProperty "java.specification.version") (System/getProperty "java.version")])

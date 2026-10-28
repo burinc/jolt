@@ -657,6 +657,14 @@
 (define (jfile-path-absolute? p)
   (jfile-path-absolute-for? (eq? (sa-os-family) 'windows) p))
 
+;; BASE joined to the relative P with one separator: a base that already ends in
+;; one -- the root directory "/" -- does not get a second, which made "/src" into
+;; "//src" and its URL file://src/, a host named "src".
+(define (path-under base p)
+  (let ((n (string-length base)))
+    (if (and (> n 0) (memv (string-ref base (- n 1)) '(#\/ #\\)))
+        (string-append base p)
+        (string-append base "/" p))))
 (define (project-relative p)
   (cond
     ((or (= (string-length p) 0) (jfile-path-absolute? p)) p)
@@ -686,7 +694,7 @@
      (let ((base (jolt-user-dir)))
        ;; "." adds nothing the OS won't do itself when it resolves a relative
        ;; path — leave it alone rather than prefixing "./".
-       (if (string=? base ".") p (string-append base "/" p))))))
+       (if (string=? base ".") p (path-under base p))))))
 
 ;; (io/file path) / (io/file parent child) — join children with "/". The File
 ;; keeps the path AS GIVEN (like the JVM: new File("rel").getPath() is "rel");
@@ -3023,7 +3031,7 @@
             (= (string-length p) 0) (jfile-path-absolute? p) (jar-path? p)
             (windows-root-relative? p))
         (jfile-abs p)
-        (string-append (current-directory) "/" p))))
+        (path-under (current-directory) p))))
 ;; The jar: URL for `nm` inside the jar at root JAR, absolute like the file: one.
 (define (resource-jar-url jar nm)
   (make-url (make-jar-path (root-path-abs jar) nm)))
