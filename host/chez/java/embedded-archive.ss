@@ -191,7 +191,7 @@
        (else paths)))))
 
 (define (embedded-nio-walk start . args)
-  (let* ((visitor (car (last-pair args)))
+  (let* ((visitor (list-ref args (- (length args) 1)))
          (max-depth (if (= (length args) 3) (cadr args) 2147483647))
          (md (if (number? max-depth) (exact (truncate max-depth)) 2147483647)))
     (call/cc

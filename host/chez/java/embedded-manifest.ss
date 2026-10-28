@@ -235,7 +235,7 @@
 (define (manifest-println72 out text)
   (let*-values (((bytes) (string->utf8 text))
                 ((n) (bytevector-length bytes))
-                ((acc collect) (open-bytevector-output-port)))
+                ((acc extract) (open-bytevector-output-port)))
     (define (boundary? i) (or (>= i n) (not (= #x80 (bitwise-and (bytevector-u8-ref bytes i) #xC0)))))
     (when (> n 0)
       (put-u8 acc (bytevector-u8-ref bytes 0))
@@ -247,7 +247,7 @@
               (loop brk))
             (put-bytevector acc bytes pos (- n pos)))))
     (put-bytevector acc (string->utf8 "\r\n"))
-    (manifest-write-raw out (collect))))
+    (manifest-write-raw out (extract))))
 (define (manifest-write-attributes out attrs skip)
   (for-each (lambda (p)
               (unless (and skip (string-ci=? (jhost-state (car p)) skip))
@@ -296,21 +296,25 @@
 ;; archive is multi-release is read from it once.
 (define embedded-archive-manifest-cache #f)
 (define embedded-archive-manifest-mutex (make-mutex))
+(define (embedded-archive-manifest-parse)
+  (let* ((content (and (embedded-public-resource? "META-INF/MANIFEST.MF")
+                       (embedded-resource-ref "META-INF/MANIFEST.MF")))
+         (manifest (if content
+                       (manifest-ctor (make-in-stream (open-bytevector-input-port
+                                                       (if (bytevector? content) content (string->utf8 content)))))
+                       jolt-nil))
+         (multi-release? (and (jar-manifest? manifest)
+                              (let ((v (jar-attributes-value (manifest-main manifest) "Multi-Release")))
+                                (and (string? v) (string-ci=? v "true"))))))
+    (cons manifest multi-release?)))
+;; Parsed outside the lock (reading a stream may park); the first parse
+;; published wins, so every caller sees the one Manifest.
 (define (embedded-archive-manifest)
   (or embedded-archive-manifest-cache
-      (jolt-with-mutex embedded-archive-manifest-mutex
-        (or embedded-archive-manifest-cache
-            (let* ((content (and (embedded-public-resource? "META-INF/MANIFEST.MF")
-                                 (embedded-resource-ref "META-INF/MANIFEST.MF")))
-                   (manifest (if content
-                                 (manifest-ctor (make-in-stream (open-bytevector-input-port
-                                                                 (if (bytevector? content) content (string->utf8 content)))))
-                                 jolt-nil))
-                   (multi-release? (and (jar-manifest? manifest)
-                                        (let ((v (jar-attributes-value (manifest-main manifest) "Multi-Release")))
-                                          (and (string? v) (string-ci=? v "true"))))))
-              (set! embedded-archive-manifest-cache (cons manifest multi-release?))
-              embedded-archive-manifest-cache)))))
+      (let ((parsed (embedded-archive-manifest-parse)))
+        (jolt-with-mutex embedded-archive-manifest-mutex
+          (or embedded-archive-manifest-cache
+              (begin (set! embedded-archive-manifest-cache parsed) parsed))))))
 (define (embedded-archive-multi-release?) (cdr (embedded-archive-manifest)))
 (define (embedded-jar-manifest archive) (car (embedded-archive-manifest)))
 (define (embedded-jar-main-attributes archive)

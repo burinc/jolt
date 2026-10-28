@@ -246,10 +246,10 @@
   (let ((n (string-length s)))
     (if (not (exists (lambda (c) (char=? c #\%)) (string->list s)))
         s
-        (let-values (((out collect) (open-bytevector-output-port)))
+        (let-values (((out extract) (open-bytevector-output-port)))
           (let loop ((i 0))
             (cond ((fx>=? i n)
-                   (utf8->string (collect)))
+                   (utf8->string (extract)))
                   ((and (char=? (string-ref s i) #\%) (fx<=? (fx+ i 3) n)
                         (string->number (substring s (fx+ i 1) (fx+ i 3)) 16))
                    => (lambda (b) (put-u8 out b) (loop (fx+ i 3))))
