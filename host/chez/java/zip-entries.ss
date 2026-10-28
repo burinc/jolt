@@ -107,6 +107,16 @@
         n
         (loop (fx+ i 1) (fx+ n (if (fx>= (char->integer (string-ref s i)) #x10000) 2 1))))))
 
+(define zentry-local-times (make-weak-eq-hashtable))
+(define zentry-access-times (make-weak-eq-hashtable))
+(define zentry-creation-times (make-weak-eq-hashtable))
+(define zentry-real-names (make-weak-eq-hashtable))
+(define (zentry-copy-side-data! source target)
+  (for-each (lambda (table)
+              (let ((value (hashtable-ref table source #f)))
+                (when value (hashtable-set! table target value))))
+            (list zentry-local-times zentry-access-times zentry-creation-times zentry-real-names)))
+
 ;; ZipEntry(String name): lines 105-111.
 (define (make-zip-entry-named name)
   (when (jolt-nil? name) (zip-throw "java.lang.NullPointerException" "name"))
@@ -123,12 +133,14 @@
   (unless (= (length args) 1) (no-ctor))
   (let ((x (car args)))
     (cond
-      ((zip-entry? x)
-       (let ((e (zentry-of x)))
-         (make-jhost "zip-entry"
-                     (make-zentry (zentry-name e) (zentry-xdostime e) (zentry-crc e)
-                                  (zentry-size e) (zentry-csize e) (zentry-method e)
-                                  (zentry-extra e) (zentry-comment e) (zentry-mtime e)))))
+      ((and (jhost? x) (member (jhost-tag x) '("zip-entry" "jar-entry")))
+       (let* ((e (zentry-of x))
+              (copy (make-jhost "zip-entry"
+                                (make-zentry (zentry-name e) (zentry-xdostime e) (zentry-crc e)
+                                             (zentry-size e) (zentry-csize e) (zentry-method e)
+                                             (zentry-extra e) (zentry-comment e) (zentry-mtime e)))))
+         (zentry-copy-side-data! e (zentry-of copy))
+         copy))
       ((or (string? x) (jolt-nil? x)) (make-zip-entry-named x))
       (else (no-ctor)))))
 
@@ -158,11 +170,72 @@
     (zentry-mtime-set! e (if (and (not (= x zip-dostime-before-1980)) (<= ms zip-upper-dostime-bound))
                              #f
                              ms))))
+(define (embedded-local-date-time-ms ms)
+  (if (= ms -1)
+      jolt-nil
+      (let ((fields (inst-fields ms)))
+        (make-jhost "local-date-time"
+                    (vector (list-ref fields 0) (list-ref fields 1) (list-ref fields 2)
+                            (list-ref fields 3) (list-ref fields 4) (list-ref fields 5)
+                            (* (list-ref fields 6) 1000000))))))
+(register-host-methods! "local-date-time"
+  (list
+   (cons "getYear" (lambda (self) (vector-ref (jhost-state self) 0)))
+   (cons "getMonthValue" (lambda (self) (vector-ref (jhost-state self) 1)))
+   (cons "getDayOfMonth" (lambda (self) (vector-ref (jhost-state self) 2)))
+   (cons "getHour" (lambda (self) (vector-ref (jhost-state self) 3)))
+   (cons "getMinute" (lambda (self) (vector-ref (jhost-state self) 4)))
+   (cons "getSecond" (lambda (self) (vector-ref (jhost-state self) 5)))
+   (cons "getNano" (lambda (self) (vector-ref (jhost-state self) 6)))
+   (cons "toString"
+         (lambda (self)
+           (let ((v (jhost-state self)))
+             (string-append (number->string (vector-ref v 0)) "-"
+                            (string-pad (number->string (vector-ref v 1)) 2 #\0) "-"
+                            (string-pad (number->string (vector-ref v 2)) 2 #\0) "T"
+                            (string-pad (number->string (vector-ref v 3)) 2 #\0) ":"
+                            (string-pad (number->string (vector-ref v 4)) 2 #\0) ":"
+                            (string-pad (number->string (vector-ref v 5)) 2 #\0)))))))
+(define (zentry-local-ms value)
+  (let* ((year (record-method-dispatch value "getYear" jolt-nil))
+         (month (record-method-dispatch value "getMonthValue" jolt-nil))
+         (day (record-method-dispatch value "getDayOfMonth" jolt-nil))
+         (hour (record-method-dispatch value "getHour" jolt-nil))
+         (minute (record-method-dispatch value "getMinute" jolt-nil))
+         (second (record-method-dispatch value "getSecond" jolt-nil))
+         (nano (record-method-dispatch value "getNano" jolt-nil)))
+    (cal-ms (make-jhost "calendar"
+                        (vector #f (vector year (- month 1) day hour minute second nano)
+                                (calendar-arg-zone '()))))))
+(define (zentry-set-local-time! e value)
+  (let ((ms (zentry-local-ms value)))
+    (hashtable-set! zentry-local-times e value)
+    (zentry-xdostime-set! e (zip-java->xdostime ms))
+    (zentry-mtime-set! e ms)))
 (register-host-methods! "zip-entry"
   (list
    (zentry-member "getName" (lambda (self) (zentry-name (zentry-of self))))
    (zentry-member "getTime" (lambda (self) (->num (zentry-time (zentry-of self)))))
    (zentry-setter "setTime" (lambda (e x) (zentry-set-time! e (zentry-long-arg x))))
+   (zentry-member "getTimeLocal"
+                  (lambda (self)
+                    (or (hashtable-ref zentry-local-times (zentry-of self) #f)
+                        (embedded-local-date-time-ms (zentry-time (zentry-of self))))))
+   (zentry-setter "setTimeLocal" zentry-set-local-time!)
+   (zentry-member "getLastAccessTime"
+                  (lambda (self) (or (hashtable-ref zentry-access-times (zentry-of self) #f) jolt-nil)))
+   (zentry-setter "setLastAccessTime"
+                  (lambda (e value)
+                    (if (file-time? value)
+                        (hashtable-set! zentry-access-times e value)
+                        (zip-class-cast value "java.nio.file.attribute.FileTime"))))
+   (zentry-member "getCreationTime"
+                  (lambda (self) (or (hashtable-ref zentry-creation-times (zentry-of self) #f) jolt-nil)))
+   (zentry-setter "setCreationTime"
+                  (lambda (e value)
+                    (if (file-time? value)
+                        (hashtable-set! zentry-creation-times e value)
+                        (zip-class-cast value "java.nio.file.attribute.FileTime"))))
    ;; getLastModifiedTime / setLastModifiedTime (lines 211-240): a FileTime, or
    ;; null when no time is set
    (zentry-member "getLastModifiedTime"
@@ -238,7 +311,7 @@
    ;; a copy whose extra field is a copy (lines 696-705)
    (zentry-member "clone"
                   (lambda (self)
-                    (let* ((copy (make-zip-entry self))
+                    (let* ((copy (make-jhost (jhost-tag self) (jhost-state (make-zip-entry self))))
                            (e (zentry-of copy))
                            (x (zentry-extra e)))
                       (unless (jolt-nil? x)

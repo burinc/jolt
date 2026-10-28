@@ -58,6 +58,7 @@
     ("hashset" . "(java.util.HashSet. [3 1 :k])")
     ("linkedhashmap" . "(doto (java.util.LinkedHashMap. 16 0.75 true) (.put :b 1) (.put :a 2) (.get :b))")
     ("linkedhashset" . "(java.util.LinkedHashSet. [3 1 2])")
+    ("jar-attributes" . "(doto (java.util.jar.Attributes.) (.putValue \"B\" \"two\") (.putValue \"A\" \"one\"))")
     ("treemap" . "(doto (java.util.TreeMap. (java.util.Collections/reverseOrder)) (.put 1 :a) (.put 2 :b))")
     ("treeset" . "(java.util.TreeSet. [3 1 2])")
     ("enum-set-regular" . "(java.util.EnumSet/of java.util.concurrent.TimeUnit/DAYS java.util.concurrent.TimeUnit/SECONDS)")

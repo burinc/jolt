@@ -48,6 +48,7 @@ delete-tree!
 directory?
 dispatch-macros
 embed-plan
+embedded-resource-names
 embedded-resource?
 empty-coll-arm
 enable-trace!

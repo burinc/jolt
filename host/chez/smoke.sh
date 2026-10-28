@@ -225,6 +225,10 @@ check '(require [clojure.java.io :as io] [clojure.string :as s])
 # is asserted in deps-alias-smoke.sh, which has fixture projects with real roots.
 # Here jolt-core/stdlib are baked into the binary, so this takes the embedded-
 # resource branch instead and never builds a file: URL at all.)
+# With nothing embedded there is no archive, so the empty resource name is never
+# a jar: URL -- the archive's root is not an entry a lookup can find.
+check '(let [u (clojure.java.io/resource "")] (or (nil? u) (= "file" (.getProtocol u))))' 'true'
+check '(every? #(= "file" (.getProtocol %)) (enumeration-seq (.getResources (clojure.lang.RT/baseLoader) "")))' 'true'
 check '(eval (quote (+ 1 2)))' '3'
 check '(load-string "(def y 5) (* y y)")' '25'
 check '(defmacro add1 [x] (list (quote +) x 1)) (add1 10)' '11'

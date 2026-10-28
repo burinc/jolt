@@ -53,6 +53,13 @@
   (lambda (h) (make-lhs))
   (lambda (s items) (for-each (lambda (x) (lh-insert! (jhost-state s) #f x #t #f)) items)))
 
+;; java.util.jar.Attributes is a LinkedHashMap chain under its own class
+;; (embedded-manifest.ss); its keys are Attributes.Name values.
+(register-image-codec! "java.util.jar.Attributes" '("jar-attributes")
+  (lambda (a) (vector jolt-nil (codec-kvs (jar-attributes-pairs a))))
+  (lambda (h) (make-manifest-attributes))
+  (lambda (a items) (codec-each-kv! items (lambda (k v) (jar-attributes-put! a k v)))))
+
 ;; ---- TreeMap / TreeSet: the comparator object (nil for natural order) ------------
 ;; The treemap and treeset tags are a whole map or set; a sub-map or a key set
 ;; has a tag of its own and is a view of one, refused below.

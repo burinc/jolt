@@ -630,6 +630,24 @@ directories, and a trailing `/` covers everything under that directory:
 An excluded file is gone from the binary, and `io/resource` answers `nil` for
 it. Only the project's own `deps.edn` is read for this key.
 
+At runtime, `(jolt.host/embedded-resource-names)` returns a sorted vector of the
+project and dependency resource names baked into the image, excluding Jolt's own
+runtime internals. Each name can be passed to `io/resource`; filter the vector to
+discover a directory such as a set of migrations:
+
+```clojure
+(require '[clojure.string :as str])
+
+(filter #(str/starts-with? % "migrations/")
+        (jolt.host/embedded-resource-names))
+```
+
+JVM-style discovery works too: the resources read as a jar, so resource URLs
+are `jar:` URLs, `java.util.jar.JarFile` enumerates them, and
+`java.nio.file.FileSystems` opens a read-only filesystem over them. Migration
+scanners such as Migratus work without extracting files to disk. See
+[Embedded Resources](https://jolt-lang.github.io/docs/embedded-resources.html).
+
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the
 image but compresses it with gzip, and `--boot plain` drops it altogether:

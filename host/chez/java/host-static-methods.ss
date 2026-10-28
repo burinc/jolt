@@ -1255,6 +1255,13 @@
             ((string=? acc "") (loop (cdr roots) (car roots)))
             (else (loop (cdr roots) (string-append acc sep (car roots))))))))
 
+;; The Java version jolt models: the JDK its JVM oracle certifies against
+;; (test/conformance/profile.edn :oracle-jdk). Runtime.version() and
+;; JarFile.runtimeVersion() (zip-file.ss) report it, and it picks a
+;; multi-release jar's entries. The java.version and java.specification.version
+;; PROPERTIES stay nil on purpose (sysprops-test.clj): libraries parse them to
+;; switch on JVM-only code paths, and there is no JDK under jolt to switch to.
+(define jolt-java-feature-version 21)
 (define (sys-get-property k . dflt)
   (let* ((k (jolt-need-string k))
          (set-val (hashtable-ref sys-prop-table k #f)))
