@@ -873,21 +873,45 @@
 ;; deterministic superset jolt's small maps already use).
 (define (hm-ord self) (vector-ref (jhost-state self) 1))
 (define (hm-ord! self v) (vector-set! (jhost-state self) 1 v))
+;; A WeakHashMap's table is weak, so it cannot keep its keys in a list: its slot
+;; holds a version token instead, a fresh one per structural change (what a
+;; view's iterator checks), and its keys come from the table, in the table's
+;; order, as the JDK's come in hash order.
+(define (hm-weak? self) (hashtable-weak? (hm-tbl self)))
 (define (hm-note-key! self k)
   (when (not (hashtable-contains? (hm-tbl self) k))
-    (hm-ord! self (cons k (hm-ord self)))))
+    (hm-ord! self (if (hm-weak? self) (list 'v) (cons k (hm-ord self))))))
+;; values compare as the map's keys do: by identity in an IdentityHashMap
+(define (hm-veq? self a b)
+  (if (eq? (hashtable-equivalence-function (hm-tbl self)) eq?) (eq? a b) (jolt=2 a b)))
+;; an empty table of this map's kind (weak, identity, or equality-keyed)
+(define (hm-like-table self)
+  (let* ((t (hm-tbl self)) (id? (eq? (hashtable-equivalence-function t) eq?)))
+    (cond ((hashtable-weak? t) (if id? (make-weak-eq-hashtable) (make-weak-hashtable hm-hash jolt=2)))
+          (id? (make-eq-hashtable))
+          (else (make-hashtable hm-hash jolt=2)))))
 ;; A removal detaches what was handed out for the key (an entrySet node keeps
 ;; the value it last saw, as the JDK's removed Node does); jutil-concurrent.ss
 ;; installs the hook once a map has handed one out.
 (define hm-detach-hook #f)
 (define (hm-drop-key! self k)
   (when hm-detach-hook (hm-detach-hook self k))
-  (hm-ord! self (remove (lambda (e) (jolt=2 e k)) (hm-ord self))))
+  ;; by the table's own key equivalence: two equal keys are two keys in an IdentityHashMap
+  (hm-ord! self (if (hm-weak? self) (list 'v)
+                    (let ((same? (hashtable-equivalence-function (hm-tbl self))))
+                      (remove (lambda (e) (same? e k)) (hm-ord self))))))
 (define (hm-clear! self)
   (when hm-detach-hook (hm-detach-hook self hm-detach-hook))
   (hashtable-clear! (hm-tbl self))
-  (hm-ord! self '()))
-(define (hm-keys-ordered self) (reverse (hm-ord self)))
+  (hm-ord! self (if (hm-weak? self) (list 'v) '())))
+(define (hm-keys-ordered self)
+  (if (hm-weak? self)
+      ;; by hash, as the JDK's walk its table in hash order: the same keys come
+      ;; out in the same order whatever the history of the table (an image
+      ;; restore included)
+      (map cdr (list-sort (lambda (a b) (< (car a) (car b)))
+                          (map (lambda (k) (cons (hm-hash k) k)) (vector->list (hashtable-keys (hm-tbl self))))))
+      (reverse (hm-ord self))))
 ;; A hashmap-shaped jhost: the HashMap family and java.util.Properties, which is
 ;; a Hashtable with two string-typed accessors on top and so carries the same
 ;; #(table key-order) state. One predicate for every question about that shape —
@@ -903,6 +927,7 @@
                 ((#\h) (string=? t "hashmap"))
                 ((#\p) (string=? t "properties"))
                 ((#\c) (string=? t "chm"))
+                ((#\j) (or (string=? t "jx-weak-hashmap") (string=? t "jx-identity-hashmap")))
                 (else #f))))))
 (define (hm-copy-into-ordered! self src)  ; copy a jolt map or hashmap, keeping insertion order
   (if (hm-hashmap? src)
@@ -998,7 +1023,7 @@
         (cons "containsKey" (lambda (self k) (if (hashtable-contains? (hm-tbl self) k) #t #f)))
         (cons "containsValue" (lambda (self v)
           (let ((found #f))
-            (vector-for-each (lambda (k) (when (jolt=2 v (hashtable-ref (hm-tbl self) k jolt-nil)) (set! found #t)))
+            (vector-for-each (lambda (k) (when (hm-veq? self v (hashtable-ref (hm-tbl self) k jolt-nil)) (set! found #t)))
                              (hashtable-keys (hm-tbl self))) found)))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
@@ -1012,11 +1037,11 @@
                                        jolt-nil))
                          ;; remove(key, value): only when mapped to exactly that
                          ((self k v) (if (and (hashtable-contains? (hm-tbl self) k)
-                                              (jolt=2 v (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                              (hm-veq? self v (hashtable-ref (hm-tbl self) k jolt-nil)))
                                          (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) #t)
                                          #f))))
         (cons "clone" (lambda (self)
-                        (let ((m (make-jhost (jhost-tag self) (vector (make-hashtable hm-hash jolt=2) '()))))
+                        (let ((m (make-jhost (jhost-tag self) (vector (hm-like-table self) (if (hm-weak? self) (list 'v) '())))))
                           (hm-copy-into-ordered! m self)
                           m)))
         (cons "clear" (lambda (self) (hm-clear! self) jolt-nil))
@@ -1027,6 +1052,8 @@
         (cons "values" (lambda (self) (make-jhost "jx-hm-values" (vector self))))
         (cons "entrySet" (lambda (self) (make-jhost "jx-hm-entryset" (vector self))))))
 (register-host-methods! "hashmap" hashmap-methods)
+(register-host-methods! "jx-weak-hashmap" hashmap-methods)
+(register-host-methods! "jx-identity-hashmap" hashmap-methods)
 
 ;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
 ;; a DEFAULTS chain. The JVM is precise about which operations see that chain:
@@ -1140,13 +1167,6 @@
 ;; methods under a tag of its own, so it is its own class: a ConcurrentMap,
 ;; refusing null keys and values, whose views are weakly consistent
 ;; (jutil-concurrent.ss). (get a-chm k) reads the map (clojure.core/get).
-;; a HashMap shim, for the look-alikes below
-(define (make-hashmap-jhost . args)
-  (let* ((ht (make-hashtable hm-hash jolt=2))
-         (self (make-jhost "hashmap" (vector ht '()))))
-    (when (and (pair? args) (not (number? (car args))))
-      (hm-copy-into-ordered! self (car args)))
-    self))
 (define (make-chm-jhost . args)
   (let* ((ht (make-hashtable hm-hash jolt=2))
          (self (make-jhost "chm" (vector ht '()))))
@@ -1171,16 +1191,24 @@
                   (cons "remove" (case-lambda
                                    ((self k) (when (jolt-nil? k) (chm-npe!)) (rm self k))
                                    ((self k v) (when (jolt-nil? k) (chm-npe!)) (rm self k v))))))))
-;; WeakHashMap: a HashMap shim. Chez has no weak-value hashtable, so entries are
-;; not GC-evicted — a cache backed by it never shrinks (correct, just unbounded),
-;; the same trade-off as SoftReference on this host.
-(register-class-ctor! "WeakHashMap" make-hashmap-jhost)
-(register-class-ctor! "java.util.WeakHashMap" make-hashmap-jhost)
-;; IdentityHashMap keys on reference identity; the HashMap shim keys on value
-;; equality. Close enough for its usual role (tracking visited nodes during a
-;; walk — schema/clojure.walk cycle detection), where the tracked values differ.
-(register-class-ctor! "IdentityHashMap" make-hashmap-jhost)
-(register-class-ctor! "java.util.IdentityHashMap" make-hashmap-jhost)
+;; WeakHashMap: the HashMap shim over a weak table (Chez's generic weak
+;; hashtables hold their keys weakly under jolt's own hash and equality), so an
+;; entry whose key nothing else holds goes at the next collection, as on the JDK.
+(define (make-weak-hashmap-jhost . args)
+  (let ((self (make-jhost "jx-weak-hashmap" (vector (make-weak-hashtable hm-hash jolt=2) (list 'v)))))
+    (when (and (pair? args) (not (number? (car args)))) (hm-copy-into-ordered! self (car args)))
+    self))
+(register-class-ctor! "WeakHashMap" make-weak-hashmap-jhost)
+(register-class-ctor! "java.util.WeakHashMap" make-weak-hashmap-jhost)
+;; IdentityHashMap: the HashMap shim over an eq? table, so a key — and a value
+;; where the JDK compares one (containsValue, remove(k, v)) — is matched by
+;; reference, as == matches it.
+(define (make-identity-hashmap-jhost . args)
+  (let ((self (make-jhost "jx-identity-hashmap" (vector (make-eq-hashtable) '()))))
+    (when (and (pair? args) (not (number? (car args)))) (hm-copy-into-ordered! self (car args)))
+    self))
+(register-class-ctor! "IdentityHashMap" make-identity-hashmap-jhost)
+(register-class-ctor! "java.util.IdentityHashMap" make-identity-hashmap-jhost)
 ;; java.util.concurrent.atomic.Atomic{Reference,Integer,Long,Boolean}: a
 ;; thread-safe mutable cell (mutex-guarded, shared heap). One "atomic" jhost
 ;; serves all four; the numeric ops are meaningful only on Integer/Long.
@@ -1458,6 +1486,8 @@
        (hm-keys-ordered self)))
 (register-jutil-coll! "hashmap" 'map hm-entries)
 (register-jutil-coll! "chm" 'map hm-entries)
+(register-jutil-coll! "jx-weak-hashmap" 'map hm-entries)
+(register-jutil-coll! "jx-identity-hashmap" 'map hm-entries)
 (register-jutil-coll! "properties" 'map hm-entries)
 (register-jutil-coll! "hashset" 'set hs->list)
 (register-jutil-coll! "arraylist" 'ralist al->list)
@@ -1958,8 +1988,7 @@
           (copy! off out len)
           (cons out (cddr rest))))
       (cons (whole) rest)))
-(register-class-ctor! "String"
-  (lambda (x . rest)
+(define (jolt-new-string x . rest)
     (cond ((bytevector? x)
            (let ((p (bytes-slice-for-string (bytevector-length x)
                                             (lambda (off out len) (bytevector-copy! x off out 0 len))
@@ -2020,8 +2049,12 @@
                     (if (fx=? i cnt) out
                         (begin (string-set! out i (ja-ref x (fx+ off i)))
                                (loop (fx+ i 1))))))))))
-          ((string? x) x)
-          (else (jolt-str-render-one x)))))
+          ;; new String(s) is a new object, never s itself (identical? tells them
+          ;; apart, and a WeakHashMap keyed by it must not be kept by a literal)
+          ((string? x) (string-copy x))
+          (else (jolt-str-render-one x))))
+;; new String() is the empty string
+(register-class-ctor! "String" (case-lambda (() (make-string 0)) ((x . rest) (apply jolt-new-string x rest))))
 ;; (BigInteger. s) | (BigInteger. s radix) — parse a string in the given radix
 ;; (default 10). tools.reader's integer parser builds (BigInteger. digits radix).
 ;; (BigInteger. signum magnitude-bytes) is the other JVM constructor: an unsigned

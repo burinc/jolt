@@ -973,6 +973,8 @@
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
 (jch-register-supers! "java.util.HashMap" '("java.util.Map"))
 (jch-register-supers! "java.util.concurrent.ConcurrentMap" '("java.util.Map"))
+(jch-register-supers! "java.util.WeakHashMap" '("java.util.AbstractMap" "java.util.Map"))
+(jch-register-supers! "java.util.IdentityHashMap" '("java.util.AbstractMap" "java.util.Map" "java.io.Serializable" "java.lang.Cloneable"))
 (jch-register-supers! "java.util.concurrent.ConcurrentHashMap"
                       '("java.util.AbstractMap" "java.util.concurrent.ConcurrentMap" "java.io.Serializable"))
 (jch-register-supers! "java.util.LinkedHashMap" '("java.util.HashMap" "java.util.SequencedMap"))
@@ -1503,6 +1505,8 @@
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
     ("chm" . "java.util.concurrent.ConcurrentHashMap")
+    ("jx-weak-hashmap" . "java.util.WeakHashMap")
+    ("jx-identity-hashmap" . "java.util.IdentityHashMap")
     ("linkedhashmap" . "java.util.LinkedHashMap")
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")

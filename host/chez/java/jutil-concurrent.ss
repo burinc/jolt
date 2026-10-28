@@ -1761,7 +1761,16 @@
           (if (eq? k hm-detach-hook)
               (vector-set! g 0 (+ 1 (vector-ref g 0)))
               (hashtable-update! (vector-ref g 1) k (lambda (n) (+ n 1)) 0)))))))
-(define (hm-node* m k g) (make-jhost "jx-hm-node" (vector m k (hmv-ref m k) (hmn-gen* g k) g)))
+;; HashMap, WeakHashMap and IdentityHashMap share these views, iterators and
+;; entries; each family's carry its own JDK class names, by the map's tag.
+(define hm-families
+  '(("jx-hm" "java.util.HashMap" "java.util.HashMap$Node")
+    ("jx-whm" "java.util.WeakHashMap" "java.util.WeakHashMap$Entry")
+    ("jx-ihm" "java.util.IdentityHashMap" "java.util.IdentityHashMap$EntryIterator$Entry")))
+(define (hm-node-tag m)
+  (let ((t (jhost-tag m)))
+    (cond ((string=? t "jx-weak-hashmap") "jx-whm-node") ((string=? t "jx-identity-hashmap") "jx-ihm-node") (else "jx-hm-node"))))
+(define (hm-node* m k g) (make-jhost (hm-node-tag m) (vector m k (hmv-ref m k) (hmn-gen* g k) g)))
 (define (hm-node m k) (hm-node* m k (hmn-track! m)))
 (define hmn-absent (list 'absent))
 (define (hmn-attached? st) (= (vector-ref st 3) (hmn-gen* (vector-ref st 4) (vector-ref st 1))))
@@ -1772,29 +1781,33 @@
         (let ((v (hashtable-ref (hm-tbl (vector-ref st 0)) (vector-ref st 1) hmn-absent)))
           (if (eq? v hmn-absent) (vector-ref st 2) (begin (vector-set! st 2 v) v)))
         (vector-ref st 2))))
-(jx-class! "jx-hm-node" "java.util.HashMap$Node" '("java.util.Map$Entry"))
-(register-jutil-entry! "jx-hm-node" (lambda (n) (cons (vector-ref (jhost-state n) 1) (hmn-value n))))
-(register-host-methods! "jx-hm-node"
+(define hm-node-methods
   (list (cons "setValue" (lambda (self v)
                            (let* ((st (jhost-state self)) (m (vector-ref st 0)) (k (vector-ref st 1)) (old (hmn-value self)))
                              (when (and (hmn-attached? st) (hashtable-contains? (hm-tbl m) k)) (hashtable-set! (hm-tbl m) k v))
                              (vector-set! st 2 v)
                              old)))))
+(for-each (lambda (f)
+            (let ((tag (string-append (car f) "-node")))
+              (jx-class! tag (caddr f) '("java.util.Map$Entry"))
+              (register-jutil-entry! tag (lambda (n) (cons (vector-ref (jhost-state n) 1) (hmn-value n))))
+              (register-host-methods! tag hm-node-methods)))
+          hm-families)
 (define (hmv-project kind m k) (case kind ((key) k) ((value) (hmv-ref m k)) (else (hm-node m k))))
 (define (hmv-elems kind)
   ;; one pass over the key order, which the map keeps newest first, the
   ;; projection chosen once
   (case kind
-    ((key) (lambda (v) (reverse (hm-ord (hmv-map v)))))
+    ((key) (lambda (v) (hm-keys-ordered (hmv-map v))))
     ((value) (lambda (v) (let ((t (hm-tbl (hmv-map v))))
-                           (fold-left (lambda (acc k) (cons (hashtable-ref t k jolt-nil) acc)) '() (hm-ord (hmv-map v))))))
+                           (map (lambda (k) (hashtable-ref t k jolt-nil)) (hm-keys-ordered (hmv-map v))))))
     (else (lambda (v) (let* ((m (hmv-map v)) (g (hmn-track! m)))
-                        (fold-left (lambda (acc k) (cons (hm-node* m k g) acc)) '() (hm-ord m)))))))
+                        (map (lambda (k) (hm-node* m k g)) (hm-keys-ordered m)))))))
 (define (hmv-entry-kv e)
   (or (jolt-host-entry e) (and (jolt-map-entry? e) (cons (jolt-nth e 0) (jolt-nth e 1)))))
 (define (hmv-has-entry? m e)
   (let ((kv (hmv-entry-kv e)))
-    (and kv (hashtable-contains? (hm-tbl m) (car kv)) (jolt=2 (cdr kv) (hmv-ref m (car kv))) #t)))
+    (and kv (hashtable-contains? (hm-tbl m) (car kv)) (hm-veq? m (cdr kv) (hmv-ref m (car kv))) #t)))
 (define (hmv-remove-key! m k) (jx-call m "remove" (list k)))
 (define (hmv-iterator kind tag)
   (lambda (self) (let ((m (hmv-map self))) (make-jhost tag (vector m (hm-keys-ordered m) jutil-iterator-none kind (hm-ord m))))))
@@ -1832,8 +1845,11 @@
                                                (map (lambda (k) (hm-node* m k g)) (vector-ref st 1)))
                                              (map (lambda (k) (hmv-project (vector-ref st 3) (vector-ref st 0) k)) (vector-ref st 1)))))
                           #f #f #f))
-          '(("jx-hm-key-itr" "java.util.HashMap$KeyIterator") ("jx-hm-value-itr" "java.util.HashMap$ValueIterator")
-            ("jx-hm-entry-itr" "java.util.HashMap$EntryIterator")))
+          (apply append
+                 (map (lambda (f)
+                        (map (lambda (k) (list (string-append (car f) "-" (car k) "-itr") (string-append (cadr f) "$" (cadr k) "Iterator")))
+                             '(("key" "Key") ("value" "Value") ("entry" "Entry"))))
+                      hm-families)))
 (define (hmv-common kind itr-tag has? remove!)
   (list (cons "size" (lambda (self) (hashtable-size (hm-tbl (hmv-map self)))))
         (cons "isEmpty" (lambda (self) (fx=? 0 (hashtable-size (hm-tbl (hmv-map self))))))
@@ -1850,26 +1866,41 @@
                             (for-each (lambda (x) (jolt-fi-call f "accept" x)) ((hmv-elems kind) self))
                             (unless (eq? ord (hm-ord (hmv-map self))) (throw-jvm 'ConcurrentModificationException jolt-nil))
                             jolt-nil)))))
-(define (hmv-has-value? m v) (exists (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m)))
-(jx-class! "jx-hm-keyset" "java.util.HashMap$KeySet" '("java.util.AbstractSet"))
-(register-host-methods! "jx-hm-keyset"
-  (hmv-common 'key "jx-hm-key-itr"
-              (lambda (m k) (hashtable-contains? (hm-tbl m) k))
-              (lambda (m k) (and (hashtable-contains? (hm-tbl m) k) (begin (hmv-remove-key! m k) #t)))))
-(jx-register! "jx-hm-keyset" 'set (hmv-elems 'key) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
-              (lambda (v k) (hashtable-contains? (hm-tbl (hmv-map v)) k)) #f)
-(jx-class! "jx-hm-values" "java.util.HashMap$Values" '("java.util.AbstractCollection"))
-(register-host-methods! "jx-hm-values"
-  (hmv-common 'value "jx-hm-value-itr" hmv-has-value?
-              (lambda (m v) (let ((k (find (lambda (k) (jolt=2 v (hmv-ref m k))) (hm-keys-ordered m))))
-                              (if k (begin (hmv-remove-key! m k) #t) #f)))))
-(jx-register! "jx-hm-values" 'coll (hmv-elems 'value) (lambda (v) (hashtable-size (hm-tbl (hmv-map v)))) #f #f)
-(jx-class! "jx-hm-entryset" "java.util.HashMap$EntrySet" '("java.util.AbstractSet"))
-(register-host-methods! "jx-hm-entryset"
-  (hmv-common 'entry "jx-hm-entry-itr" hmv-has-entry?
-              (lambda (m e) (if (hmv-has-entry? m e) (begin (hmv-remove-key! m (car (hmv-entry-kv e))) #t) #f))))
-(jx-register! "jx-hm-entryset" 'entries (hmv-elems 'entry) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
-              (lambda (v e) (hmv-has-entry? (hmv-map v) e)) #f)
+(define (hmv-has-value? m v) (exists (lambda (k) (hm-veq? m v (hmv-ref m k))) (hm-keys-ordered m)))
+(for-each
+  (lambda (f)
+    (let* ((p (car f)) (owner (cadr f)) (t (lambda (sfx) (string-append p sfx))))
+      (jx-class! (t "-keyset") (string-append owner "$KeySet") '("java.util.AbstractSet"))
+      (register-host-methods! (t "-keyset")
+        (hmv-common 'key (t "-key-itr")
+                    (lambda (m k) (hashtable-contains? (hm-tbl m) k))
+                    (lambda (m k) (and (hashtable-contains? (hm-tbl m) k) (begin (hmv-remove-key! m k) #t)))))
+      (jx-register! (t "-keyset") 'set (hmv-elems 'key) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
+                    (lambda (v k) (hashtable-contains? (hm-tbl (hmv-map v)) k)) #f)
+      (jx-class! (t "-values") (string-append owner "$Values") '("java.util.AbstractCollection"))
+      (register-host-methods! (t "-values")
+        (hmv-common 'value (t "-value-itr") hmv-has-value?
+                    (lambda (m v) (let ((k (find (lambda (k) (hm-veq? m v (hmv-ref m k))) (hm-keys-ordered m))))
+                                    (if k (begin (hmv-remove-key! m k) #t) #f)))))
+      (jx-register! (t "-values") 'coll (hmv-elems 'value) (lambda (v) (hashtable-size (hm-tbl (hmv-map v)))) #f #f)
+      (jx-class! (t "-entryset") (string-append owner "$EntrySet") '("java.util.AbstractSet"))
+      (register-host-methods! (t "-entryset")
+        (hmv-common 'entry (t "-entry-itr") hmv-has-entry?
+                    (lambda (m e) (if (hmv-has-entry? m e) (begin (hmv-remove-key! m (car (hmv-entry-kv e))) #t) #f))))
+      (jx-register! (t "-entryset") 'entries (hmv-elems 'entry) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
+                    (lambda (v e) (hmv-has-entry? (hmv-map v) e)) #f)))
+  hm-families)
+;; the weak and identity maps' own views
+(for-each (lambda (r)
+            (register-host-methods! (car r)
+              (list (cons "keySet" (lambda (self) (make-jhost (string-append (cadr r) "-keyset") (vector self))))
+                    (cons "values" (lambda (self) (make-jhost (string-append (cadr r) "-values") (vector self))))
+                    (cons "entrySet" (lambda (self) (make-jhost (string-append (cadr r) "-entryset") (vector self)))))))
+          '(("jx-weak-hashmap" "jx-whm") ("jx-identity-hashmap" "jx-ihm")))
+(register-image-refusal! (apply append (map (lambda (f) (map (lambda (sfx) (string-append (car f) sfx))
+                                                             '("-keyset" "-values" "-entryset" "-node" "-key-itr" "-value-itr" "-entry-itr")))
+                                            (cdr hm-families)))
+                         "a view, an entry or an iterator is a window onto a map this process holds; write the map instead")
 ;; ConcurrentHashMap's views, and Properties' (a Properties is a ConcurrentHashMap
 ;; inside since JDK 9, its views that map's wrapped in Collections.synchronized*).
 ;; The same live views, but WEAKLY CONSISTENT, as the JDK's: an iterator never
@@ -2199,7 +2230,9 @@
     "java.util.PriorityQueue$PriorityQueueSpliterator" "java.util.Vector$VectorSpliterator" "clojure.lang.PersistentVector$3"
     "java.util.ArrayList$SubList$2" "java.util.Spliterators$EmptySpliterator$OfRef"
     "java.util.concurrent.ConcurrentHashMap$KeySpliterator" "java.util.concurrent.ConcurrentHashMap$ValueSpliterator"
-    "java.util.concurrent.ConcurrentHashMap$EntrySpliterator"))
+    "java.util.concurrent.ConcurrentHashMap$EntrySpliterator"
+    "java.util.WeakHashMap$KeySpliterator" "java.util.WeakHashMap$ValueSpliterator" "java.util.WeakHashMap$EntrySpliterator"
+    "java.util.IdentityHashMap$KeySpliterator" "java.util.IdentityHashMap$ValueSpliterator" "java.util.IdentityHashMap$EntrySpliterator"))
 (define spl-tag-of (make-hashtable string-hash string=?))
 (jch-register-supers! "java.util.Spliterator" '())
 (define (spl-ref x i) (vector-ref (jhost-state x) i))
@@ -2367,6 +2400,12 @@
     (cons "jx-props-entryset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-SIZED spl-SUBSIZED spl-DISTINCT)))
     (cons "jx-hm-values" (spl-vec-of "java.util.HashMap$ValueSpliterator" spl-SIZED))
     (cons "jx-hm-entryset" (spl-vec-of "java.util.HashMap$EntrySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "jx-whm-keyset" (spl-vec-of "java.util.WeakHashMap$KeySpliterator" spl-DISTINCT))
+    (cons "jx-whm-values" (spl-vec-of "java.util.WeakHashMap$ValueSpliterator" 0))
+    (cons "jx-whm-entryset" (spl-vec-of "java.util.WeakHashMap$EntrySpliterator" spl-DISTINCT))
+    (cons "jx-ihm-keyset" (spl-vec-of "java.util.IdentityHashMap$KeySpliterator" (fxior spl-SIZED spl-DISTINCT)))
+    (cons "jx-ihm-values" (spl-vec-of "java.util.IdentityHashMap$ValueSpliterator" spl-SIZED))
+    (cons "jx-ihm-entryset" (spl-vec-of "java.util.IdentityHashMap$EntrySpliterator" (fxior spl-SIZED spl-DISTINCT)))
     (cons "linkedhashset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
     (cons "lhm-keyset" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" (fxior spl-OSS spl-DISTINCT)))
     (cons "lhm-values" (spl-iter-of "java.util.Spliterators$IteratorSpliterator" spl-OSS))

@@ -53,6 +53,8 @@
     ("hashmap" . "(doto (java.util.HashMap.) (.put :b 1) (.put \"a\" [2]) (.put nil 3))")
     ("properties" . "(doto (java.util.Properties. (doto (java.util.Properties.) (.setProperty \"d\" \"0\"))) (.setProperty \"a\" \"1\"))")
     ("chm" . "(doto (java.util.concurrent.ConcurrentHashMap.) (.put :b 1) (.put \"a\" [2]))")
+    ("jx-weak-hashmap" . "(doto (java.util.WeakHashMap.) (.put :b 1) (.put :a [2]))")
+    ("jx-identity-hashmap" . "(doto (java.util.IdentityHashMap.) (.put :b 1) (.put :a [2]))")
     ("hashset" . "(java.util.HashSet. [3 1 :k])")
     ("linkedhashmap" . "(doto (java.util.LinkedHashMap. 16 0.75 true) (.put :b 1) (.put :a 2) (.get :b))")
     ("linkedhashset" . "(java.util.LinkedHashSet. [3 1 2])")
@@ -165,7 +167,15 @@
     ("jx-chm-entry" . "(first (.entrySet (doto (java.util.concurrent.ConcurrentHashMap.) (.put :a 1))))")
     ("jx-props-keyset" . "(.keySet (doto (java.util.Properties.) (.setProperty \"a\" \"1\")))")
     ("jx-props-values" . "(.values (doto (java.util.Properties.) (.setProperty \"a\" \"1\")))")
-    ("jx-props-entryset" . "(.entrySet (doto (java.util.Properties.) (.setProperty \"a\" \"1\")))")))
+    ("jx-props-entryset" . "(.entrySet (doto (java.util.Properties.) (.setProperty \"a\" \"1\")))")
+    ("jx-whm-keyset" . "(.keySet (doto (java.util.WeakHashMap.) (.put :a 1)))")
+    ("jx-whm-values" . "(.values (doto (java.util.WeakHashMap.) (.put :a 1)))")
+    ("jx-whm-entryset" . "(.entrySet (doto (java.util.WeakHashMap.) (.put :a 1)))")
+    ("jx-whm-node" . "(first (.entrySet (doto (java.util.WeakHashMap.) (.put :a 1))))")
+    ("jx-ihm-keyset" . "(.keySet (doto (java.util.IdentityHashMap.) (.put :a 1)))")
+    ("jx-ihm-values" . "(.values (doto (java.util.IdentityHashMap.) (.put :a 1)))")
+    ("jx-ihm-entryset" . "(.entrySet (doto (java.util.IdentityHashMap.) (.put :a 1)))")
+    ("jx-ihm-node" . "(first (.entrySet (doto (java.util.IdentityHashMap.) (.put :a 1))))")))
 ;; tag -> a Clojure expression whose value WRAPS a value with that tag, which a
 ;; program only ever reaches through the wrapper (a Hashtable's keySet is a
 ;; Collections$SynchronizedSet over Hashtable$KeySet): the wrapper's dump is
