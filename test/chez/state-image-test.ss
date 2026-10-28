@@ -1429,7 +1429,7 @@
 (ev (string-append "(jolt.host/image-write! \"" tmp "\" [legacy-dq-nil])"))
 (is "format 14: an old-layout ArrayDeque holding nil is refused on read"
     (string-append "(try (jolt.host/image-read \"" tmp "\") :read (catch Exception e (ex-message e)))")
-    "\"image: cannot read a java.util.ArrayDeque at [0]: it holds nil, which an ArrayDeque cannot (an image written before format 14 let one in)\"")
+    "image: cannot read a java.util.ArrayDeque at 0 -> 0: it holds nil, which an ArrayDeque cannot (an image written before format 14 let one in)")
 
 ;; --- the same proof for the COLLECTION records and their metadata. Format 7
 ;; carried a vector/map/set/list/lazy-seq/() as the slotless records
