@@ -106,9 +106,12 @@
 
 ;; the live elements, head to tail
 (define (dq-elems self)
-  (let* ((st (dq-st self)) (es (vector-ref st 0)) (n (vector-length es)) (t (vector-ref st 2)))
-    (let loop ((i (dq-dec t n)) (k (dq-sub t (vector-ref st 1) n)) (acc '()))
-      (if (fx=? k 0) acc (loop (dq-dec i n) (fx- k 1) (cons (vector-ref es i) acc))))))
+  ;; backward from tail, consing, so the list comes out head first; the wrap is
+  ;; two straight runs rather than a modulus per element
+  (let* ((st (dq-st self)) (es (vector-ref st 0)) (h (vector-ref st 1)) (t (vector-ref st 2)))
+    (define (run from to acc) ; elements [from, to) consed in front of acc
+      (let loop ((i (fx- to 1)) (acc acc)) (if (fx<? i from) acc (loop (fx- i 1) (cons (vector-ref es i) acc)))))
+    (if (fx<=? h t) (run h t '()) (run h (vector-length es) (run 0 t '())))))
 
 ;; Walk physical indices FROM up to END over ES, wrapping, as the JDK's loops do
 (define (dq-each-index es from end f)
@@ -180,13 +183,17 @@
 (define (dqi-ref it i) (vector-ref (jhost-state it) i))
 (define (dqi-set! it i v) (vector-set! (jhost-state it) i v))
 (define (dqi-next it)
-  (when (fx<=? (dqi-ref it 2) 0) (throw-jvm 'NoSuchElementException jolt-nil))
-  (let* ((d (dqi-ref it 0)) (es (dq-es d)) (c (dqi-ref it 1)) (x (vector-ref es c)))
-    (when (jolt-nil? x) (throw-jvm 'ConcurrentModificationException jolt-nil))
-    (dqi-set! it 3 c)
-    (dqi-set! it 1 (if (dqi-ref it 4) (dq-dec c (vector-length es)) (dq-inc c (vector-length es))))
-    (dqi-set! it 2 (fx- (dqi-ref it 2) 1))
-    x))
+  ;; the hot step: one read of the iterator's state and of the deque's
+  (let ((st (jhost-state it)))
+    (when (fx<=? (vector-ref st 2) 0) (throw-jvm 'NoSuchElementException jolt-nil))
+    (let* ((es (vector-ref (dq-st (vector-ref st 0)) 0)) (n (vector-length es)) (c (vector-ref st 1)) (x (vector-ref es c)))
+      (when (jolt-nil? x) (throw-jvm 'ConcurrentModificationException jolt-nil))
+      (vector-set! st 3 c)
+      (vector-set! st 1 (if (vector-ref st 4)
+                            (if (fx=? c 0) (fx- n 1) (fx- c 1))
+                            (let ((j (fx+ c 1))) (if (fx=? j n) 0 j))))
+      (vector-set! st 2 (fx- (vector-ref st 2) 1))
+      x)))
 (define (dqi-remove it)
   (when (fx<? (dqi-ref it 3) 0) (throw-jvm 'IllegalStateException jolt-nil))
   (let* ((d (dqi-ref it 0)) (left? (dq-delete! d (dqi-ref it 3))) (n (vector-length (dq-es d))))
@@ -219,7 +226,7 @@
               (dqi-set! it 3 (dq-dec end n))))))
     jolt-nil))
 (define dq-iterator-methods
-  (list (cons "hasNext" (lambda (self) (fx>? (dqi-ref self 2) 0)))
+  (list (cons "hasNext" (lambda (self) (fx>? (vector-ref (jhost-state self) 2) 0)))
         (cons "next" dqi-next)
         (cons "remove" dqi-remove)
         (cons "forEachRemaining" dqi-for-each-remaining)))
@@ -327,8 +334,8 @@
     (cons "clear" dq-clear!)
     (cons "addAll" dq-add-all!)
     (cons "removeIf" (lambda (self p) (dq-bulk-remove! self (lambda (x) (jolt-fi-call p "test" x)))))
-    (cons "removeAll" (lambda (self c) (dq-bulk-remove! self (lambda (x) (cd-has? c x)))))
-    (cons "retainAll" (lambda (self c) (dq-bulk-remove! self (lambda (x) (not (cd-has? c x))))))
+    (cons "removeAll" (lambda (self c) (dq-npe-if-nil c) (dq-bulk-remove! self (lambda (x) (cd-has? c x)))))
+    (cons "retainAll" (lambda (self c) (dq-npe-if-nil c) (dq-bulk-remove! self (lambda (x) (not (cd-has? c x))))))
     (cons "forEach" dq-for-each)
     (cons "iterator" (lambda (self) (make-dq-iterator self #f)))
     (cons "descendingIterator" (lambda (self) (make-dq-iterator self #t)))
@@ -339,6 +346,7 @@
     (cons "equals" (lambda (self o) (eq? self o)))
     (cons "hashCode" (lambda (self) (->num (jolt-identity-hasheq self))))))
 (register-jutil-coll! "arraydeque" 'coll dq-elems)
+(jch-register-supers! "java.util.ArrayDeque" '("java.util.AbstractCollection" "java.util.Deque" "java.lang.Cloneable" "java.io.Serializable"))
 (define (array-deque? x) (and (jhost? x) (string=? (jhost-tag x) "arraydeque")))
 (register-seq-arm! array-deque? (lambda (x) (let ((xs (dq-elems x))) (if (null? xs) jolt-nil (list->cseq xs)))))
 (register-count-arm! array-deque? dq-size)

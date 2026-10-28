@@ -1752,7 +1752,9 @@
   (or (hashtable-ref hmn-gens m #f)
       (jolt-with-mutex hmn-gens-mu
         (or (hashtable-ref hmn-gens m #f)
-            (let ((g (vector 0 (make-hashtable hm-hash jolt=2)))) (hashtable-set! hmn-gens m g) g)))))
+            ;; keyed as the map is: by identity in an IdentityHashMap, weakly
+            ;; in a WeakHashMap (a removed key must not be kept here)
+            (let ((g (vector 0 (hm-like-table m)))) (hashtable-set! hmn-gens m g) g)))))
 (set! hm-detach-hook
   (lambda (m k)
     (let ((g (hashtable-ref hmn-gens m #f)))
@@ -1890,6 +1892,49 @@
       (jx-register! (t "-entryset") 'entries (hmv-elems 'entry) (lambda (v) (hashtable-size (hm-tbl (hmv-map v))))
                     (lambda (v e) (hmv-has-entry? (hmv-map v) e)) #f)))
   hm-families)
+;; IdentityHashMap compares by reference wherever the JDK's uses ==: replace's
+;; old value, and equals, which holds a map whose mappings are the same objects
+;; (an IdentityHashMap's, or any map's entries matched by identity on both key
+;; and value); hashCode sums identityHashCode(key) ^ identityHashCode(value).
+;; Clojure's = asks the left operand, so a persistent or HashMap on the left
+;; compares as they do, through the identity map's own get.
+(define (ihm? x) (and (jhost? x) (string=? (jhost-tag x) "jx-identity-hashmap")))
+(set! jutil-identity-map? ihm?)
+(define (ihm-contains-mapping? m k v)
+  (let ((t (hm-tbl m))) (and (hashtable-contains? t k) (eq? v (hashtable-ref t k jolt-nil)))))
+(define (map-entries-of x)
+  ;; (k . v) pairs of any map value
+  (if (hm-hashmap? x)
+      (map (lambda (k) (cons k (hashtable-ref (hm-tbl x) k jolt-nil))) (hm-keys-ordered x))
+      (map (lambda (e) (cons (jolt-nth e 0) (jolt-nth e 1))) (seq->list (jolt-seq x)))))
+(define (map-value? x) (or (hm-hashmap? x) (jolt-map? x) (eq? (jutil-coll-kind x) 'map)))
+(define (ihm-equals? m o)
+  (or (eq? m o)
+      (and (map-value? o)
+           (let ((es (map-entries-of o)))
+             (and (fx=? (length es) (hashtable-size (hm-tbl m)))
+                  (for-all (lambda (e) (ihm-contains-mapping? m (car e) (cdr e))) es))))))
+(define (ihm-hash m)
+  (fold-left (lambda (h k)
+               (+ h (bitwise-xor (if (jolt-nil? k) 0 (jolt-identity-hasheq k))
+                                 (let ((v (hashtable-ref (hm-tbl m) k jolt-nil))) (if (jolt-nil? v) 0 (jolt-identity-hasheq v))))))
+             0 (hm-keys-ordered m)))
+(register-host-methods! "jx-identity-hashmap"
+  (list (cons "replace" (case-lambda
+                          ((self k v) ((cdr (assoc "replace" hashmap-methods)) self k v))
+                          ((self k old v) (if (ihm-contains-mapping? self k old) (begin (hashtable-set! (hm-tbl self) k v) #t) #f))))
+        (cons "equals" ihm-equals?)
+        (cons "hashCode" (lambda (self) (->num (int32-low (ihm-hash self)))))))
+(register-eq-arm! (lambda (a b) (or (ihm? a) (ihm? b)))
+  (lambda (a b)
+    (cond ((ihm? a) (ihm-equals? a b))
+          ;; another map on the left: its entries, looked up in the identity map
+          ((map-value? a)
+           (let ((es (map-entries-of a)) (t (hm-tbl b)))
+             (and (fx=? (length es) (hashtable-size t))
+                  (for-all (lambda (e) (and (hashtable-contains? t (car e)) (jolt=2 (cdr e) (hashtable-ref t (car e) jolt-nil)))) es))))
+          (else #f))))
+(register-hash-arm! ihm? (lambda (m) (int32-low (ihm-hash m))))
 ;; the weak and identity maps' own views
 (for-each (lambda (r)
             (register-host-methods! (car r)
@@ -2232,7 +2277,12 @@
     "java.util.concurrent.ConcurrentHashMap$KeySpliterator" "java.util.concurrent.ConcurrentHashMap$ValueSpliterator"
     "java.util.concurrent.ConcurrentHashMap$EntrySpliterator"
     "java.util.WeakHashMap$KeySpliterator" "java.util.WeakHashMap$ValueSpliterator" "java.util.WeakHashMap$EntrySpliterator"
-    "java.util.stream.StreamSpliterators$WrappingSpliterator"
+    "java.util.stream.StreamSpliterators$WrappingSpliterator" "java.util.stream.StreamSpliterators$IntWrappingSpliterator"
+    "java.util.stream.StreamSpliterators$LongWrappingSpliterator" "java.util.stream.StreamSpliterators$DoubleWrappingSpliterator"
+    "java.util.stream.Streams$RangeIntSpliterator" "java.util.stream.Streams$RangeLongSpliterator"
+    "java.util.Spliterators$EmptySpliterator$OfInt" "java.util.Spliterators$EmptySpliterator$OfLong"
+    "java.util.Spliterators$EmptySpliterator$OfDouble"
+    "java.util.Spliterators$IntArraySpliterator" "java.util.Spliterators$LongArraySpliterator" "java.util.Spliterators$DoubleArraySpliterator"
     "java.util.IdentityHashMap$KeySpliterator" "java.util.IdentityHashMap$ValueSpliterator" "java.util.IdentityHashMap$EntrySpliterator"))
 (define spl-tag-of (make-hashtable string-hash string=?))
 (jch-register-supers! "java.util.Spliterator" '())
@@ -2291,15 +2341,18 @@
 (define spl-none (list 'spl-none))
 (define (spl-split! x)
   (spl-force! x)
-  (case (if (string=? (spl-ref x 7) "java.util.stream.StreamSpliterators$WrappingSpliterator") 'none (spl-ref x 0))
+  (case (if (member (spl-ref x 7) '("java.util.stream.StreamSpliterators$WrappingSpliterator" "java.util.stream.StreamSpliterators$IntWrappingSpliterator"
+                                     "java.util.stream.StreamSpliterators$LongWrappingSpliterator" "java.util.stream.StreamSpliterators$DoubleWrappingSpliterator"))
+            'none (spl-ref x 0))
     ;; a sequential pipeline's does not split
     ((none) jolt-nil)
     ((live)
      (let* ((lo (spl-ref x 2)) (hi (spl-ref x 3)) (l (spl-ref x 1)))
        (if (string=? (spl-ref x 7) "java.util.LinkedList$LLSpliterator")
            ;; LLSpliterator: a batch, 1024 more each time, as an ArraySpliterator
+           ;; it splits only with more than one element left
            (let* ((b (spl-batch x)) (take (fxmin (fx+ b 1024) (fx- hi lo))))
-             (if (fx<=? take 0) jolt-nil
+             (if (fx<=? (fx- hi lo) 1) jolt-nil
                  (let loop ((j 0) (acc '()))
                    (if (and (fx<? j take) (fx<? (fx+ lo j) (spl-live-size l)))
                        (loop (fx+ j 1) (cons (spl-live-get l (fx+ lo j)) acc))
@@ -2350,7 +2403,20 @@
                                           #t)))))
         (cons "forEachRemaining" (lambda (self f)
                                    (when (jolt-nil? f) (jx-npe))
-                                   (let loop () (let ((v (spl-advance! self))) (unless (eq? v spl-none) (jolt-fi-call f "accept" v) (loop))))
+                                   (if (and (eq? (spl-ref self 0) 'live) (al-family? (spl-ref self 1))
+                                            (not (string=? (spl-ref self 7) "java.util.LinkedList$LLSpliterator")))
+                                       ;; ArrayListSpliterator walks its backing array to the fence,
+                                       ;; whatever the action does to the list: index i as the array
+                                       ;; holds it then, and nothing (null) past the list's end
+                                       (begin
+                                         (spl-force! self)
+                                         (let* ((l (spl-ref self 1)) (hi (spl-ref self 3)))
+                                           (let loop ((i (spl-ref self 2)))
+                                             (when (fx<? i hi)
+                                               (spl-set! self 2 (fx+ i 1))
+                                               (jolt-fi-call f "accept" (if (fx<? i (al-cnt l)) (al-ref l i) jolt-nil))
+                                               (loop (fx+ i 1))))))
+                                       (let loop () (let ((v (spl-advance! self))) (unless (eq? v spl-none) (jolt-fi-call f "accept" v) (loop)))))
                                    (when (eq? (spl-ref self 0) 'live) (spl-live-check! self))
                                    jolt-nil))
         (cons "trySplit" (lambda (self) (spl-split! self)))
@@ -2489,6 +2555,7 @@
     ((array) (cons (fxior spl-ORDERED spl-SIZED spl-SUBSIZED) (cdr origin)))
     ((range) (cons (fxior spl-ORDERED spl-DISTINCT spl-SORTED spl-SIZED spl-SUBSIZED) (cdr origin)))
     ((generate) (cons 0 spl-long-max))
+    ((empty) (cons (fxior spl-SIZED spl-SUBSIZED) 0))
     (else (cons spl-ORDERED spl-long-max))))
 (define (spl-pipeline-shape origin ops)
   (let ((keep (fxior spl-ORDERED spl-DISTINCT spl-SORTED spl-SIZED spl-SUBSIZED))
@@ -2512,14 +2579,28 @@
               ((skip) (loop (cdr ops) f (if (sized? f) (max 0 (- n (cdr op))) n)))
               (else (loop (cdr ops) f n))))))))
 (define (stream-spliterator self)
-  (let* ((src (stream-source self)) (ops (stream-ops self)) (origin (stream-origin self)) (xs (stream-take! self)))
+  (let* ((src (stream-source self)) (ops (stream-ops self)) (origin (stream-origin self))
+         (kind (stream-kind self)) (xs (stream-take! self))
+         ;; the JDK's class for this element kind: Int / Long / Double or plain
+         (by-kind (lambda (int long double ref) (case kind ((int) int) ((long) long) ((double) double) (else ref))))
+         (what (and (pair? origin) (car origin))))
     (cond ((pair? ops)
            (let ((shape (spl-pipeline-shape origin ops)))
-             (make-spl "java.util.stream.StreamSpliterators$WrappingSpliterator" 'iter (make-jiterator xs)
-                       0 (cdr shape) (car shape) jolt-nil)))
+             (make-spl (string-append "java.util.stream.StreamSpliterators$"
+                                      (by-kind "Int" "Long" "Double" "") "WrappingSpliterator")
+                       'iter (make-jiterator xs) 0 (cdr shape) (car shape) jolt-nil)))
           (src (jx-call src "spliterator" '()))
-          ((and (pair? origin) (eq? (car origin) 'array))
-           (make-vec-spl "java.util.Spliterators$ArraySpliterator" (fxior spl-ORDERED spl-SIZED spl-SUBSIZED spl-IMMUTABLE)
+          ((or (eq? what 'empty) (and (memq what '(range)) (eqv? (cdr origin) 0)))
+           (make-vec-spl (string-append "java.util.Spliterators$EmptySpliterator$Of" (by-kind "Int" "Long" "Double" "Ref"))
+                         (fxior spl-SIZED spl-SUBSIZED) '()))
+          ((eq? what 'range)
+           (make-vec-spl (by-kind "java.util.stream.Streams$RangeIntSpliterator" "java.util.stream.Streams$RangeLongSpliterator"
+                                  "java.util.stream.Streams$RangeLongSpliterator" "java.util.stream.Streams$RangeIntSpliterator")
+                         (fxior spl-ORDERED spl-DISTINCT spl-SORTED spl-SIZED spl-SUBSIZED spl-NONNULL spl-IMMUTABLE)
+                         (seq->list (jolt-seq xs))))
+          ((eq? what 'array)
+           (make-vec-spl (string-append "java.util.Spliterators$" (by-kind "Int" "Long" "Double" "") "ArraySpliterator")
+                         (fxior spl-ORDERED spl-SIZED spl-SUBSIZED spl-IMMUTABLE)
                          (seq->list (jolt-seq xs))))
           (else (make-iter-spl "java.util.Spliterators$IteratorSpliterator" spl-ORDERED (make-jiterator xs) spl-long-max)))))
 (for-each (lambda (t) (register-host-methods! t (list (cons "spliterator" stream-spliterator))))

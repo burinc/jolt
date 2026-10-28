@@ -82,8 +82,12 @@
     ((ralist list) (apply jolt-vector (jutil-coll-elems x)))
     (else x)))
 (define (jutil-plain x) (if (jutil-equiv-coll? x) (jutil-coll->persistent x) x))
+;; An IdentityHashMap compares by reference, which the plain copies below would
+;; lose: its own rule answers (jutil-concurrent.ss sets this).
+(define jutil-identity-map? (lambda (x) #f))
 (define (jutil-equals? a b)
-  (cond ((or (eq? (jutil-any-kind a) 'entry) (eq? (jutil-any-kind b) 'entry))
+  (cond ((or (jutil-identity-map? a) (jutil-identity-map? b)) (jolt=2 a b))
+        ((or (eq? (jutil-any-kind a) 'entry) (eq? (jutil-any-kind b) 'entry))
          (jutil-entry-equals? a b))
         ((jolt=2 (jutil-plain a) (jutil-plain b)) #t)
         (else #f)))

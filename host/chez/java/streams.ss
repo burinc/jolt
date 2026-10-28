@@ -368,7 +368,8 @@
    (cons "mapToDouble" (lambda (s f) ((stream-map s "applyAsDouble" 'double) f)))
    (cons "boxed" (lambda (s) (stream-derive s 'ref (lambda (xs) xs))))
    (cons "asLongStream" (lambda (s) (stream-derive s 'long (lambda (xs) xs))))
-   (cons "asDoubleStream" (lambda (s) (stream-derive s 'double (lambda (xs) (st-map inexact xs)) 'map)))
+   ;; a widening keeps every flag (the JDK's asDoubleStream / asLongStream)
+   (cons "asDoubleStream" (lambda (s) (stream-derive s 'double (lambda (xs) (st-map inexact xs)) 'same)))
    (cons "filter" (lambda (s p) (stream-derive s (stream-kind s) (lambda (xs) (st-filter (st-test p) xs)) 'filter)))
    (cons "flatMap" (lambda (s f)
                      (stream-derive s (stream-kind s)
@@ -487,7 +488,7 @@
 (define (stream-statics kind)
   (append
    (list (cons "of" (stream-of kind))
-         (cons "empty" (lambda () (make-stream kind jolt-nil)))
+         (cons "empty" (lambda () (make-stream-from kind jolt-nil '(empty))))
          (cons "iterate" (stream-iterate kind))
          (cons "generate" (lambda (f)
                             (make-stream-from kind (jolt-invoke1 (clj "repeatedly")

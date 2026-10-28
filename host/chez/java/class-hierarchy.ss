@@ -96,10 +96,14 @@
                        (hashtable-set! jvm-class-parents name supers)
                        (hashtable-delete! jch-closure-cache name)
                        (hashtable-delete! jch-tags-cache name)
+                       ;; the known-name table is published whole and read with no
+                       ;; lock: add to a copy and publish that
                        (let ((k jch-known-cache))
                          (when k
-                           (for-each (lambda (n) (hashtable-set! k n #t) (hashtable-set! k (jch-last-segment n) #t))
-                                     (cons name supers))))
+                           (let ((c (hashtable-copy k #t)))
+                             (for-each (lambda (n) (hashtable-set! c n #t) (hashtable-set! c (jch-last-segment n) #t))
+                                       (cons name supers))
+                             (set! jch-known-cache c))))
                        (set! jch-simple->fqn-cache #f)
                        (set! jch-jvm-name-cache #f)
                        #t)))))

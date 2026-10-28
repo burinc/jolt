@@ -1695,6 +1695,38 @@
            :jvm ":cme"
            :jolt ":ok"}
    :note "jolt does not keep the JDK's capacity, which nothing else observes; trimToSize, which always counts one, matches. The fail-fast rows in the corpus pin the rest."}
+  {:category :host-model
+   :behavior "the order a WeakHashMap walks its keys"
+   :jvm "its table's buckets, last to first, by the spread hashCode and the capacity it has grown to"
+   :jolt "jolt's hash order"
+   :check {:expr "(let [m (java.util.WeakHashMap.)] (doseq [k [5 3 100 1 17 2]] (.put m k 1)) (vec (keys m)))"
+           :jvm "[5 3 2 100 1 17]"
+           :jolt "[1 3 5 17 100 2]"}
+   :note "A weak table cannot keep its keys in an insertion list without holding them, so the order comes from the hashes; it is the same whatever the table's history. The JDK's order is unspecified by the Map contract."}
+  {:category :string-model
+   :behavior "an empty string made by new String"
+   :jvm "a new object each time"
+   :jolt "Chez's one empty string"
+   :check {:expr "(identical? (String. \"\") (String.))"
+           :jvm "false"
+           :jolt "true"}
+   :note "A non-empty (String. s) is a fresh copy on both."}
+  {:category :host-model
+   :behavior "when seq of an ArrayList reads its first chunk"
+   :jvm "at first use (RT.seq answers an unrealized LazySeq)"
+   :jolt "when seq is called"
+   :check {:expr "(let [l (java.util.ArrayList. [1 2 3]) s (seq l)] (.add l 4) (try (vec s) (catch java.util.ConcurrentModificationException _ :cme)))"
+           :jvm ":cme"
+           :jolt "[1 2 3]"}
+   :note "A jolt seq is realized at its head. Later chunks are read when the walk reaches them, as on the JVM, so a list changed under doseq or reduce raises the same way."}
+  {:category :integer-box-model
+   :behavior "an IdentityHashMap keyed by equal longs"
+   :jvm "two keys when they are distinct boxes (outside the Long cache)"
+   :jolt "one key: an integer has no box to tell apart"
+   :check {:expr "(let [m (java.util.IdentityHashMap.)] (.put m (Long/valueOf 1000) 1) (.put m (Long/valueOf 1000) 2) (.size m))"
+           :jvm "2"
+           :jolt "1"}
+   :note "Distinct objects of every other kind stay distinct keys."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than

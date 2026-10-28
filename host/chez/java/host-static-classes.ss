@@ -194,11 +194,13 @@
 ;; and add refuse).
 (define (make-al-iterator self tag)
   (let ((t (jhost-tag self)))
+    ;; slot 5: where a forEachRemaining began
     (make-jhost tag (vector self 0 -1
                             (and (member t '("arraylist" "linkedlist")) (al-mc self))
                             (cond ((string=? t "linkedlist") 'lt)
                                   ((string=? t "arraylist") 'ne)
-                                  (else 'fixed))))))
+                                  (else 'fixed))
+                            0))))
 (define (ali-l it) (vector-ref (jhost-state it) 0))
 (define (ali-c it) (vector-ref (jhost-state it) 1))
 (define (ali-c! it v) (vector-set! (jhost-state it) 1 v))
@@ -232,8 +234,10 @@
     (al-remove-at! l lr)
     (ali-c! it lr) (ali-lr! it -1) (ali-exp! it (al-mc l))
     jolt-nil))
+(define (ali-c-start it) (vector-ref (jhost-state it) 5))
 (define (ali-for-each-remaining it f)
   (when (jolt-nil? f) (throw-jvm 'NullPointerException jolt-nil))
+  (vector-set! (jhost-state it) 5 (ali-c it))
   (let* ((l (ali-l it)) (e (ali-exp it)) (n0 (al-cnt l)))
     ;; run while nothing changed, then check once (ArrayList reads up to the size
     ;; it started with, LinkedList up to the size as it goes)
@@ -243,7 +247,8 @@
           (ali-c! it (fx+ i 1)) (ali-lr! it i)
           (jolt-fi-call f "accept" (al-ref l i))
           (loop))))
-    (ali-check! it)
+    ;; ArrayList's checks only when it had elements left to walk; LinkedList's always
+    (when (or (eq? (ali-kind it) 'lt) (fx<? (ali-c-start it) n0)) (ali-check! it))
     jolt-nil))
 (define (ali-previous it)
   (ali-check! it)
@@ -300,7 +305,8 @@
 (define (al-list-iterator self i)
   (let ((n (al-cnt self)))
     (unless (and (fixnum? i) (fx>=? i 0) (fx<=? i n))
-      (throw-jvm 'IndexOutOfBoundsException (string-append "Index: " (number->string i)))))
+      (throw-jvm 'IndexOutOfBoundsException
+                 (string-append "Index: " (if (number? i) (number->string i) "?") ", Size: " (number->string n)))))
   (let ((it (make-al-iterator self (cond ((string=? (jhost-tag self) "linkedlist") "linkedlist-iterator")
                                          ((string=? (jhost-tag self) "immutable-list") "immutable-list-iterator")
                                          (else "arraylist-listitr")))))
@@ -425,10 +431,11 @@
 ;; first/last accessors and mutators sit on the shared ArrayList table and
 ;; LinkedList inherits them. On an empty list the accessors raise
 ;; NoSuchElementException, as on the JVM.
+;; the JDK raises these with no message
 (define (al-first self)
-  (if (fx=? 0 (al-cnt self)) (throw-jvm 'NoSuchElementException "") (al-ref self 0)))
+  (if (fx=? 0 (al-cnt self)) (throw-jvm 'NoSuchElementException jolt-nil) (al-ref self 0)))
 (define (al-last self)
-  (if (fx=? 0 (al-cnt self)) (throw-jvm 'NoSuchElementException "") (al-ref self (fx- (al-cnt self) 1))))
+  (if (fx=? 0 (al-cnt self)) (throw-jvm 'NoSuchElementException jolt-nil) (al-ref self (fx- (al-cnt self) 1))))
 (define sequenced-list-methods
   (list
     (cons "addFirst" (lambda (self x) (al-insert-at! self 0 x) jolt-nil))
@@ -500,7 +507,35 @@
                        (string=? (jhost-tag x) "linkedlist")
                        (string=? (jhost-tag x) "arrays-aslist")
                        (string=? (jhost-tag x) "immutable-list"))))
-(register-seq-arm! al-family? (lambda (x) (list->cseq (al->list x))))
+;; …through its iterator, 32 elements to a chunk, as clojure.lang.RT seqs an
+;; Iterable (chunkIteratorSeq): the chunks after the first are read when the walk
+;; reaches them, so a change made meanwhile is a ConcurrentModificationException,
+;; as it is on the JVM, where doseq or reduce over a list they change raises one.
+(define (al-chunked-seq it)
+  ;; a chunk is up to 32 of the iterator's next elements, copied from the
+  ;; backing in one step: its next would check the count before each, and
+  ;; nothing runs between them, so one check answers for the chunk
+  (if (not (ali-has-next? it))
+      jolt-nil
+      (let* ((st (jhost-state it)) (l (vector-ref st 0)) (c (vector-ref st 1))
+             (k (fxmin 32 (fx- (al-cnt l) c))))
+        (when (fx<=? k 0) (ali-next it))               ; past the end: next says what
+        (ali-check! it)
+        (let ((bv (al-vec l)) (h (al-head l)))
+          (vector-set! st 1 (fx+ c k)) (vector-set! st 2 (fx+ c k -1))
+          ;; whether more follow is asked as the chunk is made, as the JDK's
+          ;; chunkIteratorSeq asks it: a list of 32 or fewer is settled then.
+          ;; The chunk goes out as plain cells ending in that tail, the shape
+          ;; first/next (doseq) walks fastest
+          (let ((tail (if (ali-has-next? it) (jolt-make-lazy-seq (lambda () (al-chunked-seq it))) jolt-nil)))
+            (let loop ((i (fx- k 1)) (rest tail))
+              (if (fx<? i 0) rest
+                  (loop (fx- i 1) (make-cseq (vector-ref bv (fx+ h c i)) rest sk-cons jolt-nil)))))))))
+(register-seq-arm! al-family?
+  (lambda (x)
+    (if (member (jhost-tag x) '("arraylist" "linkedlist"))
+        (al-chunked-seq (al-iterator x))
+        (list->cseq (al->list x)))))
 
 ;; ---- StringWriter -----------------------------------------------------------
 ;; Writer.write(int) writes the CHAR for that code; append(char) appends the char.
@@ -906,9 +941,9 @@
   (hm-ord! self (if (hm-weak? self) (list 'v) '())))
 (define (hm-keys-ordered self)
   (if (hm-weak? self)
-      ;; by hash, as the JDK's walk its table in hash order: the same keys come
-      ;; out in the same order whatever the history of the table (an image
-      ;; restore included)
+      ;; by hash: the same keys come out in the same order whatever the
+      ;; history of the table (an image restore included). Not the JDK's bucket
+      ;; order (known-divergences); the Map contract leaves it unspecified
       (map cdr (list-sort (lambda (a b) (< (car a) (car b)))
                           (map (lambda (k) (cons (hm-hash k) k)) (vector->list (hashtable-keys (hm-tbl self))))))
       (reverse (hm-ord self))))

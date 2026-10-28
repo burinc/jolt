@@ -125,9 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`WeakHashMap` and `IdentityHashMap` are their own classes**: a
   `WeakHashMap` drops an entry whose key nothing else holds, and an
   `IdentityHashMap` matches keys and values by reference.
-- **java.base's interfaces are known**, so a proxy over a JDK class jolt does
-  not model (`java.util.TimerTask`) extends it, and `isInterface` answers for
-  every java.base type.
+- **The JDK's interfaces are known** (every public interface in its java.* and
+  javax.* packages, annotation types included), so a proxy over a JDK class
+  jolt does not model (`java.util.TimerTask`) extends it, and `isInterface`
+  answers for those types.
 - **Images are format 14**: an `ArrayDeque` travels as its ring buffer and a
   list carries its modCount; older images still read.
 - **A HashMap's `keySet`, `values` and `entrySet` are live views**
