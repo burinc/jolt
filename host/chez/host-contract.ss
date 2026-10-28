@@ -625,7 +625,9 @@
           ;; refuses to reference ("var: a/hidden is not public"), as the JVM's
           ;; Compiler.resolveIn / isMacro do. (var a/hidden) still takes it.
           (if (and (not (string=? (var-cell-ns cell) (chez-actx-cns ctx)))
-                   (var-private? cell))
+                   (var-private? cell)
+                   (not (and (string=? (var-cell-ns cell) "clojure.core")
+                             (hashtable-ref hc-native-op-name-table (var-cell-name cell) #f))))
               (jolt-assoc base hc-kw-private #t)
               base))
         (cond
@@ -1137,7 +1139,7 @@
 ;; clojure.core names. The emitter lowers each of these inline, so the declared
 ;; cell's unbound root is never deref'd. host/chez/manifest-check.sh fails CI if
 ;; this list drifts from native-ops.
-(for-each (lambda (nm) (declare-var! "clojure.core" nm))
+(define hc-native-op-names
   '("+" "-" "*" "/" "<" ">" "<=" ">=" "=" "inc" "dec" "not" "min" "max"
     "mod" "rem" "quot" "vector" "hash-map" "hash-set" "conj" "get" "nth" "count"
     "assoc" "dissoc" "contains?" "find" "empty?" "peek" "pop" "first" "rest" "next" "seq"
@@ -1150,11 +1152,22 @@
     "__deftype-field"
     ;; the `lazy-seq` macro's two halves (lazy-bridge.ss): internal names too
     "make-lazy-seq" "coll->cells" "chunked-seq?"
+    ;; doseq's chunk walk (natives-transduce.ss): internal names too
+    "__chunk-vec" "__chunk-start" "__chunk-end" "__chunk-after" "__chunk-nth"
     "aget" "aset" "alength"
     "bit-and" "bit-or" "bit-xor" "bit-not"
     "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"
     "unchecked-add" "unchecked-subtract" "unchecked-multiply"
     "unchecked-inc" "unchecked-dec" "unchecked-negate"))
+(for-each (lambda (nm) (declare-var! "clojure.core" nm)) hc-native-op-names)
+;; A ^:private one of these (doseq's __chunk-* walk helpers) is plumbing a core
+;; macro's expansion calls from the user's namespace: the back end lowers the
+;; call to its procedure and never reads the var, so the not-public check that
+;; guards a var reference does not apply to it (hc-resolve-global).
+(define hc-native-op-name-table
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (nm) (hashtable-set! t nm #t)) hc-native-op-names)
+    t))
 
 
 ;; --- install: bind the contract into the jolt.host namespace -----------------

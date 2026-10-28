@@ -1677,8 +1677,11 @@
 ;; crest (the after-chunk seq); for a vector seq it is the seq at the next block.
 (define (na-chunk-rest s)
   (cond
+    ;; the rest as it stands, unrealized, as ChunkedCons.chunkedMore hands it
+    ;; back: realizing it here read the NEXT chunk before the walk reached it
+    ;; (a doseq stopped by :while realized a chunk the JVM never touches)
     ((and (cseq? s) (cseq-crest s))
-     (let ((r (jolt-seq (cseq-crest s)))) (if (jolt-nil? r) jolt-empty-list r)))
+     (let ((r (cseq-crest s))) (if (jolt-nil? r) jolt-empty-list r)))
     ((na-vblock s) => (lambda (vb)
        (if (fx>=? (cdr vb) (pvec-count (car vb))) jolt-empty-list
            (vec->seq/k (car vb) (cdr vb) (cseq-kind s)))))
